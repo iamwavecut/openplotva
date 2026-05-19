@@ -1,6 +1,7 @@
 //! Composition root for the OpenPlotva application shell.
 
 pub mod pending_ops;
+pub mod rate_limits;
 mod reference_snapshot;
 pub mod updates;
 pub mod virtual_messages;
@@ -17,9 +18,10 @@ use axum::{
 };
 use openplotva_config::AppConfig;
 use openplotva_server::{ReadinessCheck, ReadinessResponse};
-use openplotva_storage::{PostgresVirtualMessageStore, ServiceClients};
+use openplotva_storage::{PostgresVirtualMessageStore, RedisRateLimitStore, ServiceClients};
 use serde::Deserialize;
 use thiserror::Error;
+use time::OffsetDateTime;
 use tokio::{sync::watch, task::JoinHandle, time::timeout};
 
 const GO_DISPATCHER_MAX_QUEUE_SIZE: usize = 10_000;
@@ -675,6 +677,9 @@ async fn start_runtime_workers(
     let dispatcher_limiters = Arc::new(openplotva_telegram::ChatLimiters::new(
         openplotva_telegram::DEFAULT_DISPATCH_INTERVAL,
     ));
+    let rate_limit_policy = Arc::new(rate_limits::ChatRateLimitPolicy::new(
+        service_clients.redis.rate_limit_store(),
+    ));
 
     let (stop, _) = watch::channel(false);
     let mut workers = RuntimeWorkers {
@@ -712,12 +717,18 @@ async fn start_runtime_workers(
 
     let immediate_store = store.clone();
     let immediate_telegram = telegram.clone();
+    let immediate_rate_limits = Arc::clone(&rate_limit_policy);
     let immediate_queue = Arc::clone(&dispatcher_queue);
     let immediate_stop = stop.subscribe();
     let immediate_worker = tokio::spawn(async move {
         let outcome = immediate_queue
             .run_immediate_worker_until(wait_for_runtime_stop(immediate_stop), |item| {
-                send_dispatcher_work_item(immediate_store.clone(), immediate_telegram.clone(), item)
+                send_dispatcher_work_item(
+                    immediate_store.clone(),
+                    immediate_telegram.clone(),
+                    Arc::clone(&immediate_rate_limits),
+                    item,
+                )
             })
             .await;
 
@@ -813,6 +824,7 @@ async fn start_runtime_workers(
 
     let regular_store = store;
     let regular_telegram = telegram;
+    let regular_rate_limits = Arc::clone(&rate_limit_policy);
     let regular_queue = Arc::clone(&dispatcher_queue);
     let regular_limiters = Arc::clone(&dispatcher_limiters);
     let regular_stop = stop.subscribe();
@@ -822,7 +834,12 @@ async fn start_runtime_workers(
                 &regular_limiters,
                 wait_for_runtime_stop(regular_stop),
                 |item| {
-                    send_dispatcher_work_item(regular_store.clone(), regular_telegram.clone(), item)
+                    send_dispatcher_work_item(
+                        regular_store.clone(),
+                        regular_telegram.clone(),
+                        Arc::clone(&regular_rate_limits),
+                        item,
+                    )
                 },
             )
             .await;
@@ -949,11 +966,53 @@ async fn wait_for_runtime_stop(mut stop: watch::Receiver<bool>) {
 async fn send_dispatcher_work_item(
     store: PostgresVirtualMessageStore,
     telegram: openplotva_telegram::TelegramClient,
+    rate_limits: Arc<rate_limits::ChatRateLimitPolicy<RedisRateLimitStore>>,
     item: openplotva_telegram::DispatcherWorkItem,
 ) -> openplotva_telegram::DispatcherSendStatus {
+    let chat_id = item.metadata().chat_id;
+    if chat_id != 0 {
+        let check = rate_limits
+            .is_rate_limited_at(chat_id, OffsetDateTime::now_utc())
+            .await;
+        if let Some(load_error) = check.load_error.as_deref() {
+            tracing::debug!(
+                chat_id,
+                %load_error,
+                "failed to load persisted Telegram rate-limit state"
+            );
+        }
+        if check.rate_limited {
+            tracing::debug!(chat_id, "skipping Telegram send for rate-limited chat");
+            return openplotva_telegram::DispatcherSendStatus::Failed;
+        }
+    }
+
     let report = virtual_messages::send_work_item_and_resolve(&store, item, |method| {
         let telegram = telegram.clone();
-        async move { openplotva_telegram::execute_telegram_method(&telegram, method).await }
+        let rate_limits = Arc::clone(&rate_limits);
+        async move {
+            match openplotva_telegram::execute_telegram_method(&telegram, method).await {
+                Ok(response) => Ok(response),
+                Err(error) => {
+                    if let Some(retry_after) =
+                        rate_limits::telegram_retry_after_from_execute_error(&error)
+                    {
+                        let report = rate_limits
+                            .set_rate_limit_at(chat_id, retry_after, OffsetDateTime::now_utc())
+                            .await;
+                        if let Some(save_error) = report.save_error.as_deref() {
+                            tracing::warn!(
+                                chat_id,
+                                retry_after_seconds = retry_after.as_secs(),
+                                %save_error,
+                                "failed to persist Telegram rate-limit state"
+                            );
+                        }
+                    }
+                    Err(error)
+                }
+            }
+        }
     })
     .await;
     if report.resolve_error.is_some() {
