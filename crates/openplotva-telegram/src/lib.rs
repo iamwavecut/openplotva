@@ -12,9 +12,9 @@ pub use dedup::{DEFAULT_DEBOUNCE_CACHE_SIZE, DEFAULT_DEBOUNCE_WINDOW, Debouncer,
 pub use dispatcher::{
     DEFAULT_DISPATCHER_CLEANUP_INTERVAL, DispatcherConfig, DispatcherDrain, DispatcherMessage,
     DispatcherPersistencePayload, DispatcherQueue, DispatcherQueuedMessage,
-    DispatcherRuntimeConfig, DispatcherSendStatus, DispatcherStats, DispatcherWorkItem,
-    DispatcherWorkerLoopOutcome, DispatcherWorkerOutcome, EnqueueOutcome, QueueSnapshot,
-    RegularDequeueOutcome, run_limiter_cleanup_until,
+    DispatcherRestoredMessage, DispatcherRuntimeConfig, DispatcherSendStatus, DispatcherStats,
+    DispatcherWorkItem, DispatcherWorkerLoopOutcome, DispatcherWorkerOutcome, EnqueueOutcome,
+    QueueSnapshot, RegularDequeueOutcome, run_limiter_cleanup_until,
 };
 pub use html::{
     TELEGRAM_PARSE_MODE_HTML, clean_unicode_non_printables, ensure_telegram_safe_text,
@@ -37,7 +37,9 @@ pub use outbound::{
 };
 pub use persistence::{
     DEFAULT_DISPATCHER_QUEUE_KEY, DEFAULT_DISPATCHER_SHUTDOWN_TIMEOUT, DispatcherPersistenceError,
-    PersistentDispatcherItem, PersistentDispatcherQueue, persistent_queue_from_drain,
+    PersistentDispatcherItem, PersistentDispatcherQueue, PersistentDispatcherReplay,
+    persistent_queue_from_drain, persistent_queue_replay_from_items,
+    persistent_queue_replay_from_json,
 };
 pub use rate_limit::{ChatLimiters, DEFAULT_DISPATCH_INTERVAL, DEFAULT_RATE_LIMITER_MAX_IDLE};
 pub use transport::{

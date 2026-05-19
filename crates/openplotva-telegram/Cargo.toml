@@ -15,7 +15,7 @@ html5ever.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 thiserror.workspace = true
-time = { workspace = true, features = ["formatting"] }
+time = { workspace = true, features = ["formatting", "parsing"] }
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 url.workspace = true
 

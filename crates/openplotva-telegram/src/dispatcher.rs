@@ -235,6 +235,23 @@ impl DispatcherWorkItem {
     }
 }
 
+#[derive(Debug)]
+pub struct DispatcherRestoredMessage {
+    /// Fingerprint used to re-apply Go startup deduplication.
+    pub fingerprint: MessageFingerprint,
+    /// Persisted dedupe key string to keep future shutdown snapshots stable.
+    pub fingerprint_key: String,
+    /// Virtual message ID used for cancellation and future real-ID mapping.
+    pub virtual_id: String,
+    /// Whether the item belongs to the immediate queue.
+    pub immediate: bool,
+    /// Original enqueue wall-clock time from persistent storage.
+    pub enqueued_at: SystemTime,
+    /// Concrete Telegram method to replay.
+    pub method: TelegramOutboundMethod,
+    pub persistence_payload: Option<DispatcherPersistencePayload>,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct QueueSnapshot {
     /// Regular outbound queue, oldest first.
@@ -331,6 +348,11 @@ impl DispatcherQueue {
     /// Enqueue an outbound message in the regular or immediate queue.
     pub fn enqueue(&self, message: DispatcherMessage, immediate: bool) -> EnqueueOutcome {
         self.enqueue_at_inner(message, immediate, Instant::now())
+    }
+
+    /// Restore a message loaded from persistent queue storage.
+    pub fn restore(&self, message: DispatcherRestoredMessage) -> EnqueueOutcome {
+        self.restore_at_inner(message, Instant::now(), SystemTime::now())
     }
 
     /// Remove queued messages by virtual ID from both queues.
@@ -697,6 +719,72 @@ impl DispatcherQueue {
         EnqueueOutcome::Enqueued
     }
 
+    fn restore_at_inner(
+        &self,
+        message: DispatcherRestoredMessage,
+        now: Instant,
+        wall_now: SystemTime,
+    ) -> EnqueueOutcome {
+        let DispatcherRestoredMessage {
+            fingerprint,
+            fingerprint_key,
+            virtual_id,
+            immediate,
+            enqueued_at,
+            method,
+            persistence_payload,
+        } = message;
+
+        if !immediate && !self.debouncer.should_process_at(&fingerprint, now) {
+            self.state().deduped_total += 1;
+            return EnqueueOutcome::Deduped;
+        }
+
+        let queued = DispatcherQueueItem {
+            metadata: DispatcherQueuedMessage {
+                chat_id: fingerprint.chat_id,
+                fingerprint_key: if fingerprint_key.is_empty() {
+                    fingerprint.to_string()
+                } else {
+                    fingerprint_key
+                },
+                virtual_id,
+                immediate,
+                added_at: added_instant_for_enqueued_at(enqueued_at, now, wall_now),
+                enqueued_at,
+            },
+            method: Some(method),
+            persistence_payload,
+        };
+
+        self.push_queue_item(queued);
+
+        if !immediate {
+            self.debouncer.record_sent_at(&fingerprint, now);
+        }
+        EnqueueOutcome::Enqueued
+    }
+
+    fn push_queue_item(&self, queued: DispatcherQueueItem) {
+        let immediate = queued.metadata.immediate;
+        {
+            let mut state = self.state();
+            if immediate {
+                state.immediate.push_back(queued);
+                trim_queue(&mut state.immediate, self.config.max_queue_size);
+            } else {
+                state.regular.push_back(queued);
+                trim_queue(&mut state.regular, self.config.max_queue_size);
+            }
+        }
+
+        if immediate {
+            self.immediate_notify.notify_one();
+        } else {
+            self.regular_notify.notify_one();
+        }
+    }
+
     pub(crate) fn dequeue_regular_with_limiter_at(
         &self,
         limiters: &ChatLimiters,
@@ -842,6 +930,17 @@ fn oldest_age(queue: &VecDeque<DispatcherQueueItem>, now: Instant) -> Duration {
         .front()
         .map(|item| now.saturating_duration_since(item.metadata.added_at))
         .unwrap_or_default()
+}
+
+fn added_instant_for_enqueued_at(
+    enqueued_at: SystemTime,
+    now: Instant,
+    wall_now: SystemTime,
+) -> Instant {
+    match wall_now.duration_since(enqueued_at) {
+        Ok(age) => now.checked_sub(age).unwrap_or(now),
+        Err(_) => now,
+    }
 }
 
 async fn send_work_item_method_status<F, Fut>(
