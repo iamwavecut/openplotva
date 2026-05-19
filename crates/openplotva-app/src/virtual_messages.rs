@@ -5,15 +5,18 @@ use std::{fmt, future::Future, pin::Pin};
 use openplotva_core::{MessageIdMapping, ReadyPendingOp};
 use openplotva_telegram::{
     AudioMessageRequest, DispatcherMessage, DispatcherQueue, DispatcherSendStatus,
-    DispatcherWorkItem, EnqueueOutcome, OutboundBuildError, PENDING_OP_DELETE, PENDING_OP_EDIT,
-    PendingOpBuildError, PhotoMessageRequest, ReplyMessageRef, StickerMessageRequest,
-    TELEGRAM_TEXT_MAX_BYTES, TelegramOutboundMethod, TelegramOutboundResponse, TextMessageRequest,
-    build_audio_message_method, build_audio_message_plan, build_pending_op_method,
+    DispatcherWorkItem, EditMediaMessageRequest, EnqueueOutcome, MediaGroupMessageRequest,
+    MediaGroupPhotoItem, MessageFingerprint, OutboundBuildError, PENDING_OP_DELETE,
+    PENDING_OP_EDIT, PendingOpBuildError, PhotoMessageRequest, ReplyMessageRef,
+    StickerMessageRequest, TELEGRAM_TEXT_MAX_BYTES, TelegramOutboundMethod,
+    TelegramOutboundResponse, TextMessageRequest, build_audio_message_method,
+    build_audio_message_plan, build_edit_media_message_method, build_edit_media_message_plan,
+    build_media_group_message_method, build_media_group_message_plan, build_pending_op_method,
     build_photo_message_method, build_photo_message_plan, build_sticker_message_method,
     build_sticker_message_plan, build_text_message_method, fingerprint_audio_message_plan,
     fingerprint_photo_message_plan, fingerprint_sticker_message_plan,
-    fingerprint_text_message_part, forum_thread_id, message_target_chat, split_telegram_text,
-    validate_text_message_text,
+    fingerprint_text_message_part, forum_thread_id, hash_content, message_target_chat,
+    split_telegram_text, validate_text_message_text,
 };
 use serde_json::json;
 use thiserror::Error;
@@ -244,6 +247,22 @@ pub struct QueueAudioRequest<'a> {
     pub immediate: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct QueueMediaGroupRequest<'a> {
+    /// Telegram media-group request fields.
+    pub message: &'a MediaGroupMessageRequest,
+    /// Whether the media group should enter the immediate queue.
+    pub immediate: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct QueueEditMediaRequest<'a> {
+    /// Telegram edit-media request fields.
+    pub message: &'a EditMediaMessageRequest,
+    /// Whether the edit should enter the immediate queue.
+    pub immediate: bool,
+}
+
 /// One queued text part and its virtual-message bookkeeping.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueuedTextPartReport {
@@ -290,6 +309,22 @@ pub struct QueuePhotoReport {
 pub struct QueueAudioReport {
     pub enqueue_outcome: EnqueueOutcome,
     /// Whether this audio went to the immediate queue.
+    pub immediate: bool,
+}
+
+/// Summary of queueing one Go direct `sendMediaGroup` call.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QueueMediaGroupReport {
+    pub enqueue_outcome: EnqueueOutcome,
+    /// Whether this media group went to the immediate queue.
+    pub immediate: bool,
+}
+
+/// Summary of queueing one Go direct `editMessageMedia` call.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QueueEditMediaReport {
+    pub enqueue_outcome: EnqueueOutcome,
+    /// Whether this edit went to the immediate queue.
     pub immediate: bool,
 }
 
@@ -476,6 +511,81 @@ pub fn queue_audio_message(
         enqueue_outcome,
         immediate: req.immediate,
     })
+}
+
+/// Queue one media group like a Go direct `SendMediaGroup(api.MediaGroupConfig)` path.
+pub fn queue_media_group_message(
+    queue: &DispatcherQueue,
+    req: QueueMediaGroupRequest<'_>,
+) -> Result<QueueMediaGroupReport, OutboundBuildError> {
+    let plan = build_media_group_message_plan(req.message);
+    let method = build_media_group_message_method(req.message)?;
+    let persistence_payload = plan
+        .to_persistence_payload()
+        .map_err(|error| OutboundBuildError::PersistencePayload(error.to_string()))?;
+    let dispatcher_message =
+        DispatcherMessage::new(media_group_identity_fingerprint(req.message), "")
+            .with_method(TelegramOutboundMethod::from(method))
+            .with_persistence_payload(persistence_payload);
+    let enqueue_outcome = queue.enqueue(dispatcher_message, req.immediate);
+
+    Ok(QueueMediaGroupReport {
+        enqueue_outcome,
+        immediate: req.immediate,
+    })
+}
+
+/// Queue one edit-media call like a Go direct `EditMessageMediaWithContext` path.
+pub fn queue_edit_media_message(
+    queue: &DispatcherQueue,
+    req: QueueEditMediaRequest<'_>,
+) -> Result<QueueEditMediaReport, OutboundBuildError> {
+    let plan = build_edit_media_message_plan(req.message);
+    let method = build_edit_media_message_method(req.message)?;
+    let persistence_payload = plan
+        .to_persistence_payload()
+        .map_err(|error| OutboundBuildError::PersistencePayload(error.to_string()))?;
+    let dispatcher_message =
+        DispatcherMessage::new(edit_media_identity_fingerprint(req.message), "")
+            .with_method(TelegramOutboundMethod::from(method))
+            .with_persistence_payload(persistence_payload);
+    let enqueue_outcome = queue.enqueue(dispatcher_message, req.immediate);
+
+    Ok(QueueEditMediaReport {
+        enqueue_outcome,
+        immediate: req.immediate,
+    })
+}
+
+fn media_group_identity_fingerprint(req: &MediaGroupMessageRequest) -> MessageFingerprint {
+    let mut content = format!(
+        "chat={};thread={};notify={};reply={:?};items=",
+        req.chat.id, req.message_thread_id, req.disable_notification, req.reply_parameters
+    );
+    for item in &req.items {
+        content.push_str(&format!("{:p};", item as *const MediaGroupPhotoItem));
+    }
+    MessageFingerprint {
+        chat_id: req.chat.id,
+        message_type: "media_group".to_owned(),
+        content_hash: hash_content(&content),
+        debounce_key: None,
+    }
+}
+
+fn edit_media_identity_fingerprint(req: &EditMediaMessageRequest) -> MessageFingerprint {
+    let content = format!(
+        "{}:{}:{:p}",
+        std::any::type_name::<EditMediaMessageRequest>(),
+        req.message_id,
+        &req.media as *const MediaGroupPhotoItem
+    );
+    MessageFingerprint {
+        chat_id: req.chat.id,
+        message_type: "unknown".to_owned(),
+        content_hash: hash_content(&content),
+        debounce_key: None,
+    }
 }
 
 /// Send one dispatcher item and resolve its virtual-message mapping from the Telegram response.
@@ -746,7 +856,8 @@ mod tests {
     use openplotva_core::MessageIdMapping;
     use openplotva_telegram::{
         AudioMessageRequest, AudioSource, ChatRef, DispatcherConfig, DispatcherMessage,
-        DispatcherQueue, DispatcherSendStatus, EnqueueOutcome, PhotoMessageRequest, PhotoSource,
+        DispatcherQueue, DispatcherSendStatus, EditMediaMessageRequest, EnqueueOutcome,
+        MediaGroupMessageRequest, MediaGroupPhotoItem, PhotoMessageRequest, PhotoSource,
         ReplyMessageRef, TELEGRAM_PARSE_MODE_HTML, TelegramMessage, TelegramOutboundMethod,
         TelegramOutboundMethodKind, TelegramOutboundResponse, TextMessageRequest,
         build_text_message_method, fingerprint_text_message_part, persistent_queue_from_drain,
@@ -756,11 +867,13 @@ mod tests {
     use crate::pending_ops::PendingOpHistory;
 
     use super::{
-        PENDING_OP_DELETE, PENDING_OP_EDIT, QueueAudioRequest, QueuePhotoRequest,
-        QueueStickerRequest, QueueTextRequest, VirtualDeleteRequest, VirtualEditRequest,
-        VirtualMessageAction, VirtualMessageError, VirtualMessageReport, VirtualMessageStore,
-        delete_message_virtual, edit_text_virtual, queue_audio_message, queue_photo_message,
-        queue_sticker_message, queue_text_message_parts, send_work_item_and_resolve,
+        PENDING_OP_DELETE, PENDING_OP_EDIT, QueueAudioRequest, QueueEditMediaRequest,
+        QueueMediaGroupRequest, QueuePhotoRequest, QueueStickerRequest, QueueTextRequest,
+        VirtualDeleteRequest, VirtualEditRequest, VirtualMessageAction, VirtualMessageError,
+        VirtualMessageReport, VirtualMessageStore, delete_message_virtual, edit_text_virtual,
+        queue_audio_message, queue_edit_media_message, queue_media_group_message,
+        queue_photo_message, queue_sticker_message, queue_text_message_parts,
+        send_work_item_and_resolve,
     };
 
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1216,6 +1329,140 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn queue_media_group_message_uses_go_identity_fingerprint_and_keeps_persistence()
+    -> Result<(), Box<dyn Error>> {
+        let queue = DispatcherQueue::new(DispatcherConfig {
+            dedupe_config: openplotva_telegram::DebouncerConfig {
+                enabled: true,
+                ..openplotva_telegram::DebouncerConfig::default()
+            },
+            ..DispatcherConfig::default()
+        });
+        let request = media_group_request();
+        let same_content = media_group_request();
+
+        let first = queue_media_group_message(
+            &queue,
+            QueueMediaGroupRequest {
+                message: &request,
+                immediate: false,
+            },
+        )?;
+        let second = queue_media_group_message(
+            &queue,
+            QueueMediaGroupRequest {
+                message: &same_content,
+                immediate: false,
+            },
+        )?;
+        let duplicate = queue_media_group_message(
+            &queue,
+            QueueMediaGroupRequest {
+                message: &request,
+                immediate: false,
+            },
+        )?;
+
+        assert_eq!(first.enqueue_outcome, EnqueueOutcome::Enqueued);
+        assert_eq!(second.enqueue_outcome, EnqueueOutcome::Enqueued);
+        assert_eq!(duplicate.enqueue_outcome, EnqueueOutcome::Deduped);
+        let snapshot = queue.snapshot();
+        assert!(snapshot.immediate.is_empty());
+        assert_eq!(snapshot.regular.len(), 2);
+        assert_eq!(snapshot.regular[0].virtual_id, "");
+        assert_eq!(snapshot.regular[1].virtual_id, "");
+        assert!(
+            snapshot.regular[0]
+                .fingerprint_key
+                .starts_with("42:media_group:")
+        );
+        assert!(
+            snapshot.regular[1]
+                .fingerprint_key
+                .starts_with("42:media_group:")
+        );
+        assert_ne!(
+            snapshot.regular[0].fingerprint_key,
+            snapshot.regular[1].fingerprint_key
+        );
+
+        let persisted = persistent_queue_from_drain(queue.drain_for_shutdown(), 100)?;
+        assert_eq!(persisted.skipped, 0);
+        assert_eq!(persisted.items.len(), 2);
+        let item = &persisted.items[0];
+        assert_eq!(item.message_type, "*api.MediaGroupConfig");
+        assert_eq!(item.virtual_id, "");
+        assert_eq!(item.chat_id, 42);
+        let payload: serde_json::Value = serde_json::from_slice(&item.message)?;
+        assert_eq!(payload["ChatID"], 42);
+        assert_eq!(payload["MessageThreadID"], 7);
+        assert_eq!(payload["DisableNotification"], true);
+        assert_eq!(payload["Media"][0]["media"], "first-photo");
+        assert_eq!(payload["Media"][0]["caption"], "<b>album</b>");
+        assert_eq!(payload["Media"][0]["parse_mode"], TELEGRAM_PARSE_MODE_HTML);
+        assert_eq!(payload["Media"][1]["media"], "second-photo");
+        assert_eq!(payload["Media"][1]["has_spoiler"], true);
+
+        Ok(())
+    }
+
+    #[test]
+    fn queue_edit_media_message_enqueues_direct_edit_without_virtual_mapping_and_keeps_persistence()
+    -> Result<(), Box<dyn Error>> {
+        let queue = DispatcherQueue::new(DispatcherConfig::default());
+        let request = EditMediaMessageRequest {
+            chat: ChatRef {
+                id: 42,
+                is_forum: true,
+            },
+            message_id: 99,
+            media: MediaGroupPhotoItem {
+                photo: PhotoSource::FileId("replacement-photo".to_owned()),
+                caption: "<b>done</b>".to_owned(),
+                render_as: TELEGRAM_PARSE_MODE_HTML.to_owned(),
+                has_spoiler: true,
+            },
+        };
+
+        let report = queue_edit_media_message(
+            &queue,
+            QueueEditMediaRequest {
+                message: &request,
+                immediate: true,
+            },
+        )?;
+
+        assert_eq!(report.enqueue_outcome, EnqueueOutcome::Enqueued);
+        assert!(report.immediate);
+        let snapshot = queue.snapshot();
+        assert_eq!(snapshot.immediate.len(), 1);
+        assert_eq!(snapshot.immediate[0].virtual_id, "");
+        assert!(
+            snapshot.immediate[0]
+                .fingerprint_key
+                .starts_with("42:unknown:")
+        );
+        assert!(snapshot.regular.is_empty());
+
+        let persisted = persistent_queue_from_drain(queue.drain_for_shutdown(), 100)?;
+        assert_eq!(persisted.skipped, 0);
+        assert_eq!(persisted.items.len(), 1);
+        let item = &persisted.items[0];
+        assert_eq!(item.message_type, "*api.EditMessageMediaConfig");
+        assert_eq!(item.virtual_id, "");
+        assert_eq!(item.chat_id, 42);
+        let payload: serde_json::Value = serde_json::from_slice(&item.message)?;
+        assert_eq!(payload["ChatID"], 42);
+        assert_eq!(payload["MessageID"], 99);
+        assert_eq!(payload["Media"]["media"], "replacement-photo");
+        assert_eq!(payload["Media"]["caption"], "<b>done</b>");
+        assert_eq!(payload["Media"]["parse_mode"], TELEGRAM_PARSE_MODE_HTML);
+        assert_eq!(payload["Media"]["has_spoiler"], true);
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn send_work_item_and_resolve_records_mapping_from_successful_message_response()
     -> Result<(), Box<dyn Error>> {
@@ -1630,6 +1877,36 @@ mod tests {
             text: text.to_owned(),
             render_as: String::new(),
             reply_markup: None,
+        }
+    }
+
+    fn media_group_request() -> MediaGroupMessageRequest {
+        MediaGroupMessageRequest {
+            chat: ChatRef {
+                id: 42,
+                is_forum: true,
+            },
+            message_thread_id: 7,
+            disable_notification: true,
+            items: vec![
+                MediaGroupPhotoItem {
+                    photo: PhotoSource::FileId("first-photo".to_owned()),
+                    caption: "<b>album</b>".to_owned(),
+                    render_as: TELEGRAM_PARSE_MODE_HTML.to_owned(),
+                    has_spoiler: false,
+                },
+                MediaGroupPhotoItem {
+                    photo: PhotoSource::FileId("second-photo".to_owned()),
+                    caption: String::new(),
+                    render_as: String::new(),
+                    has_spoiler: true,
+                },
+            ],
+            reply_parameters: Some(openplotva_telegram::ReplyParametersPlan {
+                message_id: 99,
+                chat_id: 42,
+                allow_sending_without_reply: true,
+            }),
         }
     }
 
