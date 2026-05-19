@@ -1,6 +1,6 @@
 //! Outbound Telegram request builders ported from the Go server send path.
 
-use std::io::Cursor;
+use std::{borrow::Cow, fmt, io::Cursor};
 
 use carapax::types::{
     EditMessageMedia, EditMessageText, InlineKeyboardMarkup, InputFile, InputFileReader,
@@ -8,12 +8,48 @@ use carapax::types::{
     ParseMode, ReplyMarkup, ReplyParameters, ReplyParametersError, SendAudio, SendMediaGroup,
     SendMessage, SendPhoto, SendSticker,
 };
+use crc::{CRC_32_ISCSI, Crc};
 use thiserror::Error;
 
 use crate::{TELEGRAM_PARSE_MODE_HTML, extract_visible_text, split_telegram_text};
 
 /// Telegram text message limit used by the Go outbound server.
 pub const TELEGRAM_TEXT_MAX_BYTES: usize = 4096;
+
+/// Go message type string for outbound text fingerprints.
+pub const MESSAGE_TYPE_TEXT: &str = "text";
+
+const MESSAGE_TYPE_STICKER: &str = "sticker";
+const MESSAGE_TYPE_PHOTO: &str = "photo";
+const MESSAGE_TYPE_AUDIO: &str = "audio";
+const CRC32_CASTAGNOLI: Crc<u32> = Crc::<u32>::new(&CRC_32_ISCSI);
+
+/// Deduplication fingerprint key material used by the Go dispatcher.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MessageFingerprint {
+    /// Telegram chat ID.
+    pub chat_id: i64,
+    /// Go message type string, such as `text`, `photo`, or `audio`.
+    pub message_type: String,
+    /// CRC32-Castagnoli hash of the outbound content.
+    pub content_hash: u32,
+    /// Optional debounce namespace appended to the key.
+    pub debounce_key: Option<String>,
+}
+
+impl fmt::Display for MessageFingerprint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}:{}:{:x}",
+            self.chat_id, self.message_type, self.content_hash
+        )?;
+        if let Some(debounce_key) = &self.debounce_key {
+            write!(f, ":{debounce_key}")?;
+        }
+        Ok(())
+    }
+}
 
 /// Minimal chat fields needed by the outbound builder.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -509,6 +545,40 @@ pub fn build_edit_media_message_plan(req: &EditMediaMessageRequest) -> EditMedia
     }
 }
 
+/// Hash outbound content with Go's CRC32-Castagnoli deduplication algorithm.
+pub fn hash_content(content: &str) -> u32 {
+    CRC32_CASTAGNOLI.checksum(content.as_bytes())
+}
+
+/// Build the Go-equivalent fingerprint for a sticker send plan.
+pub fn fingerprint_sticker_message_plan(plan: &StickerMessagePlan) -> MessageFingerprint {
+    message_fingerprint(
+        plan.chat_id,
+        MESSAGE_TYPE_STICKER,
+        hash_content(&plan.file_id),
+    )
+}
+
+/// Build the Go-equivalent fingerprint for a photo send plan.
+pub fn fingerprint_photo_message_plan(plan: &PhotoMessagePlan) -> MessageFingerprint {
+    let content = plan.photo.fingerprint_content();
+    message_fingerprint(
+        plan.chat_id,
+        MESSAGE_TYPE_PHOTO,
+        hash_content(content.as_ref()),
+    )
+}
+
+/// Build the Go-equivalent fingerprint for an audio send plan.
+pub fn fingerprint_audio_message_plan(plan: &AudioMessagePlan) -> MessageFingerprint {
+    let content = plan.audio.fingerprint_content();
+    message_fingerprint(
+        plan.chat_id,
+        MESSAGE_TYPE_AUDIO,
+        hash_content(content.as_ref()),
+    )
+}
+
 /// Validate text exactly like Go before send/edit.
 pub fn validate_text_message_text(text: &str, render_as: &str) -> Result<(), OutboundBuildError> {
     if text.is_empty() {
@@ -615,6 +685,13 @@ impl PhotoSource {
                 .into(),
         }
     }
+
+    fn fingerprint_content(&self) -> Cow<'_, str> {
+        match self {
+            Self::FileId(file_id) | Self::Url(file_id) => Cow::Borrowed(file_id),
+            Self::Bytes { file_name, bytes } => Cow::Owned(format_go_file_bytes(file_name, bytes)),
+        }
+    }
 }
 
 impl AudioMessagePlan {
@@ -648,6 +725,13 @@ impl AudioSource {
             Self::Bytes { file_name, bytes } => InputFileReader::new(Cursor::new(bytes.clone()))
                 .with_file_name(file_name.clone())
                 .into(),
+        }
+    }
+
+    fn fingerprint_content(&self) -> Cow<'_, str> {
+        match self {
+            Self::FileId(file_id) | Self::Url(file_id) => Cow::Borrowed(file_id),
+            Self::Bytes { file_name, bytes } => Cow::Owned(format_go_file_bytes(file_name, bytes)),
         }
     }
 }
@@ -750,20 +834,46 @@ fn reply_thread_id(reply: &ReplyMessageRef) -> Option<i64> {
     (reply.chat.is_forum && reply.is_topic_message).then_some(reply.message_thread_id)
 }
 
+fn message_fingerprint(chat_id: i64, message_type: &str, content_hash: u32) -> MessageFingerprint {
+    MessageFingerprint {
+        chat_id,
+        message_type: message_type.to_owned(),
+        content_hash,
+        debounce_key: None,
+    }
+}
+
+fn format_go_file_bytes(file_name: &str, bytes: &[u8]) -> String {
+    let mut formatted = String::new();
+    formatted.push('{');
+    formatted.push_str(file_name);
+    formatted.push_str(" [");
+    for (idx, byte) in bytes.iter().enumerate() {
+        if idx > 0 {
+            formatted.push(' ');
+        }
+        formatted.push_str(&byte.to_string());
+    }
+    formatted.push_str("]}");
+    formatted
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
     use super::{
-        AudioMessageRequest, AudioSource, ChatRef, EditMediaMessageRequest, EditTextMessageRequest,
-        MediaGroupMessageRequest, MediaGroupPhotoItem, OutboundBuildError, PhotoMessageRequest,
-        PhotoSource, ReplyMessageRef, ReplyParametersPlan, StickerMessageRequest,
+        AudioMessagePlan, AudioMessageRequest, AudioSource, ChatRef, EditMediaMessageRequest,
+        EditTextMessageRequest, MESSAGE_TYPE_TEXT, MediaGroupMessageRequest, MediaGroupPhotoItem,
+        MessageFingerprint, OutboundBuildError, PhotoMessagePlan, PhotoMessageRequest, PhotoSource,
+        ReplyMessageRef, ReplyParametersPlan, StickerMessagePlan, StickerMessageRequest,
         TextMessageRequest, allow_sending_without_reply, build_audio_message_method,
         build_audio_message_plan, build_edit_media_message_method, build_edit_media_message_plan,
         build_edit_text_message_method, build_media_group_message_method,
         build_media_group_message_plan, build_photo_message_method, build_photo_message_plan,
         build_sticker_message_method, build_sticker_message_plan, build_text_message_method,
-        build_text_message_methods, forum_thread_id, message_target_chat,
+        build_text_message_methods, fingerprint_audio_message_plan, fingerprint_photo_message_plan,
+        fingerprint_sticker_message_plan, forum_thread_id, hash_content, message_target_chat,
         validate_text_message_text,
     };
     use crate::{
@@ -838,6 +948,96 @@ mod tests {
     fn allow_sending_without_reply_defaults_to_true() {
         assert!(allow_sending_without_reply(None));
         assert!(!allow_sending_without_reply(Some(false)));
+    }
+
+    #[test]
+    fn message_fingerprint_key_matches_go_hot_path_format() {
+        let fp = MessageFingerprint {
+            chat_id: -100123,
+            message_type: MESSAGE_TYPE_TEXT.to_owned(),
+            content_hash: 0x1a2b3c,
+            debounce_key: Some("reply".to_owned()),
+        };
+
+        assert_eq!(fp.to_string(), "-100123:text:1a2b3c:reply");
+    }
+
+    #[test]
+    fn hash_content_matches_go_castagnoli_crc32() {
+        assert_eq!(hash_content("same outbound payload"), 0x32c39d97);
+        assert_eq!(hash_content(""), 0);
+    }
+
+    #[test]
+    fn fingerprint_photo_plan_hashes_reusable_file_id_without_formatting() {
+        let plan = PhotoMessagePlan {
+            chat_id: 42,
+            photo: PhotoSource::FileId("photo-file-id".to_owned()),
+            message_thread_id: None,
+            disable_notification: false,
+            caption: String::new(),
+            render_as: String::new(),
+            has_spoiler: false,
+            reply_parameters: None,
+        };
+
+        let fingerprint = fingerprint_photo_message_plan(&plan);
+
+        assert_eq!(fingerprint.chat_id, 42);
+        assert_eq!(fingerprint.message_type, "photo");
+        assert_eq!(fingerprint.content_hash, 0xa2fb5546);
+        assert_eq!(fingerprint.debounce_key, None);
+    }
+
+    #[test]
+    fn fingerprint_photo_plan_hashes_uploaded_file_like_go_file_bytes() {
+        let plan = PhotoMessagePlan {
+            chat_id: 42,
+            photo: PhotoSource::Bytes {
+                file_name: "plotva_image_provider_1.jpg".to_owned(),
+                bytes: vec![1, 2, 3],
+            },
+            message_thread_id: None,
+            disable_notification: false,
+            caption: String::new(),
+            render_as: String::new(),
+            has_spoiler: false,
+            reply_parameters: None,
+        };
+
+        let fingerprint = fingerprint_photo_message_plan(&plan);
+
+        assert_eq!(fingerprint.message_type, "photo");
+        assert_eq!(fingerprint.content_hash, 0x23e4d9b6);
+    }
+
+    #[test]
+    fn fingerprint_media_plans_use_go_message_type_names() {
+        let sticker = StickerMessagePlan {
+            chat_id: 42,
+            file_id: "sticker-file".to_owned(),
+            message_thread_id: None,
+            disable_notification: false,
+            reply_parameters: None,
+        };
+        let audio = AudioMessagePlan {
+            chat_id: 7,
+            audio: AudioSource::FileId("song-file-id".to_owned()),
+            message_thread_id: None,
+            disable_notification: false,
+            caption: String::new(),
+            render_as: String::new(),
+            reply_parameters: None,
+        };
+
+        let sticker = fingerprint_sticker_message_plan(&sticker);
+        let audio = fingerprint_audio_message_plan(&audio);
+
+        assert_eq!(sticker.message_type, "sticker");
+        assert_eq!(sticker.content_hash, 0xee082665);
+        assert_eq!(audio.chat_id, 7);
+        assert_eq!(audio.message_type, "audio");
+        assert_eq!(audio.content_hash, 0x18202a3a);
     }
 
     #[test]

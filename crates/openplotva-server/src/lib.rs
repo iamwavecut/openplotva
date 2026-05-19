@@ -36,6 +36,30 @@ pub struct ReadinessCheck {
     pub detail: String,
 }
 
+/// Go Redis key prefix for persisted rate-limited chat expiry timestamps.
+pub const RATE_LIMITED_CHAT_KEY_PREFIX: &str = "plotva:rate_limited_chat:";
+
+/// Go permission action for sending text messages.
+pub const ACTION_SEND_TEXT: &str = "send_text";
+/// Go permission action for sending images.
+pub const ACTION_SEND_IMAGE: &str = "send_image";
+/// Go permission action for sending stickers.
+pub const ACTION_SEND_STICKER: &str = "send_sticker";
+/// Go permission action for sending videos.
+pub const ACTION_SEND_VIDEO: &str = "send_video";
+/// Go permission action for sending audio.
+pub const ACTION_SEND_AUDIO: &str = "send_audio";
+/// Go permission action for sending files.
+pub const ACTION_SEND_FILE: &str = "send_file";
+/// Go permission action for sending polls.
+pub const ACTION_SEND_POLL: &str = "send_poll";
+/// Go permission action for generic message sends.
+pub const ACTION_SEND_MESSAGE: &str = "send_message";
+/// Go permission action for pinning messages.
+pub const ACTION_PIN_MESSAGE: &str = "pin_message";
+/// Go permission action for editing messages.
+pub const ACTION_EDIT_MESSAGE: &str = "edit_message";
+
 #[derive(Clone, Debug)]
 struct AppState {
     readiness: ReadinessResponse,
@@ -60,6 +84,26 @@ pub fn health_response() -> HealthResponse {
         status: "ok",
         service: openplotva_core::PROJECT_NAME,
     }
+}
+
+/// Build the in-memory Go rate-limit cache key for a chat.
+pub fn rate_limit_key(chat_id: i64) -> String {
+    format!("rate_limit:{chat_id}")
+}
+
+/// Build the persisted Go rate-limited-chat key for a chat.
+pub fn rate_limited_chat_key(chat_id: i64) -> String {
+    format!("{RATE_LIMITED_CHAT_KEY_PREFIX}{chat_id}")
+}
+
+/// Build the Go permission cache key for a chat/action pair.
+pub fn permission_cache_key(chat_id: i64, action: &str) -> String {
+    format!("perm_check:{chat_id}:{action}")
+}
+
+/// Build the Go VIP cache key for a user.
+pub fn vip_cache_key(user_id: i64) -> String {
+    format!("vip:{user_id}")
 }
 
 impl ReadinessResponse {
@@ -103,7 +147,10 @@ async fn ready(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Readines
 
 #[cfg(test)]
 mod tests {
-    use super::{HealthResponse, ReadinessCheck, ReadinessResponse, health_response};
+    use super::{
+        ACTION_SEND_TEXT, HealthResponse, ReadinessCheck, ReadinessResponse, health_response,
+        permission_cache_key, rate_limit_key, rate_limited_chat_key, vip_cache_key,
+    };
 
     #[test]
     fn health_payload_names_the_service() {
@@ -126,5 +173,20 @@ mod tests {
         assert_eq!(response.status, "ok");
         assert_eq!(response.service, "openplotva");
         assert_eq!(response.checks.len(), 2);
+    }
+
+    #[test]
+    fn rate_limit_keys_match_go_policy_cache_keys() {
+        assert_eq!(rate_limit_key(42), "rate_limit:42");
+        assert_eq!(rate_limited_chat_key(42), "plotva:rate_limited_chat:42");
+    }
+
+    #[test]
+    fn permission_and_vip_keys_match_go_policy_cache_keys() {
+        assert_eq!(
+            permission_cache_key(42, ACTION_SEND_TEXT),
+            "perm_check:42:send_text"
+        );
+        assert_eq!(vip_cache_key(42), "vip:42");
     }
 }

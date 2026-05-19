@@ -1587,6 +1587,7 @@ name = "openplotva-telegram"
 version = "0.1.0"
 dependencies = [
  "carapax",
+ "crc",
  "html5ever",
  "serde",
  "serde_json",

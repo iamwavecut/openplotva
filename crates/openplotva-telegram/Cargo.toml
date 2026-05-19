@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 carapax.workspace = true
+crc.workspace = true
 html5ever.workspace = true
 thiserror.workspace = true
 url.workspace = true
