@@ -67,8 +67,8 @@ The app loads `.env` like the Go implementation. The current service-spine env v
 | `BOT_WEBHOOK_ENABLED` | `false` | When `true`, the update producer uses Telegram webhook mode instead of long polling. |
 | `BOT_WEBHOOK_URL` | empty | Public webhook URL passed to `setWebhook`; required when webhook mode is enabled. |
 | `BOT_WEBHOOK_SECRET_TOKEN` | empty | Secret token checked against `X-Telegram-Bot-Api-Secret-Token` on `/telegram/webhook`. |
-| `BOT_WEBHOOK_CERT_FILE` | empty | Loaded for config contract; custom certificate upload is not yet wired. |
-| `BOT_WEBHOOK_KEY_FILE` | empty | Loaded for config contract; mirrors Go's certificate/key gate. |
+| `BOT_WEBHOOK_CERT_FILE` | empty | When set together with `BOT_WEBHOOK_KEY_FILE`, uploaded to Telegram as custom webhook certificate file `cert.pem`, matching Go's certificate/key gate. |
+| `BOT_WEBHOOK_KEY_FILE` | empty | Used as Go-compatible gate for custom webhook certificate upload; only the certificate file bytes are sent to Telegram. |
 | `BOT_DEBUG` | `false` | Go-compatible bot debug flag, currently loaded for config contract. |
 | `OPENPLOTVA_REFERENCE_SOURCE_REPOSITORY` | `/Users/Shared/src/github.com/iamwavecut/reference-app` | Read-only Go source used for lock checks. |
 | `OPENPLOTVA_RUNTIME_CONTRACT_PATH` | `docs/contract/reference-snapshot.json` | Reference-snapshot JSON file. |
@@ -129,9 +129,11 @@ Keep these unchanged unless an approved deviation is recorded:
 
 Approved deviations must be written in `docs/contract/deviations.md`.
 
-Current approved deviation: the Rust Telegram update queue keeps the Go Redis
-key and FIFO operations, but stores zstd-compressed serde JSON envelopes over
-`carapax::types::Update` instead of Go gob payloads.
+Current approved deviation: Redis/runtime payload codecs do not preserve Go
+`encoding/gob` bit layouts. The Rust implementation keeps the Go keys, ordering, and
+lifecycle semantics, but stores Rust-native serde payloads: Telegram updates use
+zstd-compressed serde JSON envelopes over `carapax::types::Update`, and
+dispatcher shutdown snapshots store persistent-item JSON directly.
 
 ## Migrations
 
@@ -142,7 +144,7 @@ The Rust repo carries a SQLx-compatible conversion of the frozen Go migrations u
 - Conversion: each Go `sql-migrate` file is split into reversible SQLx `.up.sql` and `.down.sql` files.
 - Runtime execution: `OPENPLOTVA_CONNECT_SERVICES=true OPENPLOTVA_RUN_MIGRATIONS=true BOT_KEY=... cargo run -p openplotva-app`
 
-With `BOT_KEY` set, the current runtime shell deletes and re-registers scoped Telegram bot commands, then starts Telegram update ingestion into `plotva:updates:queue`. The default path deletes any existing webhook and long-polls; `BOT_WEBHOOK_ENABLED=true` with `BOT_WEBHOOK_URL` installs `/telegram/webhook`, calls `setWebhook`, and feeds accepted webhook updates through the same producer queue. It does not yet install the real fetcher update consumer route, so queued updates are preserved rather than drained by a placeholder handler.
+With `BOT_KEY` set, the current runtime shell deletes and re-registers scoped Telegram bot commands, then starts Telegram update ingestion into `plotva:updates:queue`. The default path deletes any existing webhook and long-polls; `BOT_WEBHOOK_ENABLED=true` with `BOT_WEBHOOK_URL` installs `/telegram/webhook`, calls `setWebhook`, uploads `BOT_WEBHOOK_CERT_FILE` as `cert.pem` when both certificate and key paths are set, and feeds accepted webhook updates through the same producer queue. It does not yet install the real fetcher update consumer route, so queued updates are preserved rather than drained by a placeholder handler.
 
 Current caveat: SQLx records migration state in `_sqlx_migrations`, while the Go app uses `rubenv/sql-migrate`. Use the Rust migration runner on fresh or scratch databases until the existing production DB compatibility path is explicitly ported and tested.
 

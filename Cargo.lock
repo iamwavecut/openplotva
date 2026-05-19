@@ -1518,6 +1518,7 @@ dependencies = [
  "openplotva-storage",
  "openplotva-telegram",
  "openplotva-updates",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror",

@@ -18,6 +18,7 @@ use axum::{
 use openplotva_config::AppConfig;
 use openplotva_server::{ReadinessCheck, ReadinessResponse};
 use openplotva_storage::{PostgresVirtualMessageStore, ServiceClients};
+use serde::Deserialize;
 use thiserror::Error;
 use tokio::{sync::watch, task::JoinHandle, time::timeout};
 
@@ -76,19 +77,132 @@ pub trait SetWebhookExecutor {
     /// Execute Go's startup `setWebhook` request.
     fn set_webhook<'a>(
         &'a self,
-        method: openplotva_telegram::SetWebhook,
+        setup: &'a openplotva_telegram::WebhookSetup,
     ) -> SetWebhookFuture<'a, Self::Error>;
 }
 
-impl SetWebhookExecutor for openplotva_telegram::TelegramClient {
-    type Error = carapax::api::ExecuteError;
+/// Telegram webhook setup client that uses raw multipart only for custom certificate uploads.
+#[derive(Clone)]
+struct TelegramWebhookSetupClient {
+    json: openplotva_telegram::TelegramClient,
+    multipart: TelegramWebhookMultipartClient,
+}
+
+impl TelegramWebhookSetupClient {
+    fn new(token: impl Into<String>, json: openplotva_telegram::TelegramClient) -> Self {
+        Self {
+            json,
+            multipart: TelegramWebhookMultipartClient::new(token),
+        }
+    }
+}
+
+impl SetWebhookExecutor for TelegramWebhookSetupClient {
+    type Error = TelegramWebhookSetupError;
 
     fn set_webhook<'a>(
         &'a self,
-        method: openplotva_telegram::SetWebhook,
+        setup: &'a openplotva_telegram::WebhookSetup,
     ) -> SetWebhookFuture<'a, Self::Error> {
-        Box::pin(async move { self.execute(method).await.map(|_: bool| ()) })
+        Box::pin(async move {
+            if setup.certificate.is_some() {
+                self.multipart.set_webhook(setup).await
+            } else {
+                self.json
+                    .execute(openplotva_telegram::build_set_webhook_method(setup))
+                    .await
+                    .map(|_: bool| ())
+                    .map_err(TelegramWebhookSetupError::Carapax)
+            }
+        })
     }
+}
+
+#[derive(Clone)]
+struct TelegramWebhookMultipartClient {
+    http: reqwest::Client,
+    token: String,
+    base_url: String,
+}
+
+impl TelegramWebhookMultipartClient {
+    fn new(token: impl Into<String>) -> Self {
+        Self {
+            http: reqwest::Client::new(),
+            token: token.into(),
+            base_url: "https://api.telegram.org".to_owned(),
+        }
+    }
+
+    async fn set_webhook(
+        &self,
+        setup: &openplotva_telegram::WebhookSetup,
+    ) -> Result<(), TelegramWebhookSetupError> {
+        let plan = telegram_webhook_multipart_plan(setup)?;
+        let mut form = reqwest::multipart::Form::new();
+        for (name, value) in plan.fields {
+            form = form.text(name, value);
+        }
+        form = form.part(
+            "certificate",
+            reqwest::multipart::Part::bytes(plan.certificate_bytes)
+                .file_name(plan.certificate_name),
+        );
+
+        let response = self
+            .http
+            .post(format!("{}/bot{}/setWebhook", self.base_url, self.token))
+            .multipart(form)
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<TelegramApiResponse>()
+            .await?;
+
+        if response.ok && response.result.unwrap_or(false) {
+            return Ok(());
+        }
+
+        Err(TelegramWebhookSetupError::Telegram(
+            response
+                .description
+                .unwrap_or_else(|| "Telegram setWebhook returned ok=false".to_owned()),
+        ))
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum TelegramWebhookSetupError {
+    #[error("set webhook through carapax: {0}")]
+    Carapax(#[source] carapax::api::ExecuteError),
+    #[error("build webhook multipart payload: {0}")]
+    MultipartPlan(#[from] TelegramWebhookMultipartPlanError),
+    #[error("send webhook multipart request: {0}")]
+    Request(#[from] reqwest::Error),
+    #[error("Telegram setWebhook failed: {0}")]
+    Telegram(String),
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramApiResponse {
+    ok: bool,
+    result: Option<bool>,
+    description: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TelegramWebhookMultipartPlan {
+    pub fields: Vec<(String, String)>,
+    pub certificate_name: String,
+    pub certificate_bytes: Vec<u8>,
+}
+
+#[derive(Debug, Error)]
+pub enum TelegramWebhookMultipartPlanError {
+    #[error("webhook certificate is missing")]
+    MissingCertificate,
+    #[error("serialize allowed updates: {0}")]
+    AllowedUpdatesJson(#[from] serde_json::Error),
 }
 
 /// Minimal Telegram command setup capability used during app startup.
@@ -332,10 +446,7 @@ where
     Queue: openplotva_updates::UpdateProducerQueue + Sync,
     Stop: Future<Output = ()>,
 {
-    if let Err(error) = startup
-        .set_webhook(openplotva_telegram::build_set_webhook_method(setup))
-        .await
-    {
+    if let Err(error) = startup.set_webhook(setup).await {
         return TelegramUpdateProducerStartupReport {
             delete_webhook_error: None,
             set_webhook_error: Some(error.to_string()),
@@ -424,6 +535,54 @@ pub async fn telegram_webhook_response(
             }
         }
     }
+}
+
+pub fn webhook_setup_from_config(
+    config: &openplotva_config::BotWebhookConfig,
+) -> std::io::Result<openplotva_telegram::WebhookSetup> {
+    let mut setup = openplotva_telegram::WebhookSetup::new(
+        config.url.clone(),
+        Some(config.secret_token.clone()).filter(|secret_token| !secret_token.is_empty()),
+    );
+
+    if !config.cert_file.is_empty() && !config.key_file.is_empty() {
+        let bytes = std::fs::read(&config.cert_file)?;
+        setup = setup.with_certificate(openplotva_telegram::WebhookCertificate::new(
+            "cert.pem", bytes,
+        ));
+    }
+
+    Ok(setup)
+}
+
+pub fn telegram_webhook_multipart_plan(
+    setup: &openplotva_telegram::WebhookSetup,
+) -> Result<TelegramWebhookMultipartPlan, TelegramWebhookMultipartPlanError> {
+    let certificate = setup
+        .certificate
+        .clone()
+        .ok_or(TelegramWebhookMultipartPlanError::MissingCertificate)?;
+    let mut fields = vec![
+        (
+            "allowed_updates".to_owned(),
+            serde_json::to_string(openplotva_updates::GO_ALLOWED_UPDATE_NAMES)?,
+        ),
+        ("url".to_owned(), setup.url.clone()),
+    ];
+    if let Some(secret_token) = setup
+        .secret_token
+        .as_deref()
+        .filter(|secret_token| !secret_token.is_empty())
+    {
+        fields.push(("secret_token".to_owned(), secret_token.to_owned()));
+    }
+    fields.sort_by(|a, b| a.0.cmp(&b.0));
+
+    Ok(TelegramWebhookMultipartPlan {
+        fields,
+        certificate_name: certificate.name,
+        certificate_bytes: certificate.bytes,
+    })
 }
 
 async fn start_runtime_workers(
@@ -576,43 +735,53 @@ async fn start_runtime_workers(
             let (webhook_sender, webhook_source) = openplotva_telegram::webhook_update_channel(
                 openplotva_telegram::GO_WEBHOOK_UPDATE_BUFFER_SIZE,
             );
-            let webhook_setup = openplotva_telegram::WebhookSetup::new(
-                config.bot.webhook.url.clone(),
-                Some(config.bot.webhook.secret_token.clone())
-                    .filter(|secret_token| !secret_token.is_empty()),
-            );
-            let webhook_startup = telegram.clone();
-            let update_queue =
-                openplotva_updates::RedisUpdateQueue::new(service_clients.redis.client().clone());
-            let update_stop = stop.subscribe();
-            let update_producer_worker = tokio::spawn(async move {
-                let report = run_webhook_update_producer_after_set_webhook(
-                    &webhook_startup,
-                    &webhook_setup,
-                    &webhook_source,
-                    &update_queue,
-                    wait_for_runtime_stop(update_stop),
-                )
-                .await;
-
-                if let Some(error) = report.set_webhook_error.as_deref() {
-                    tracing::warn!(
-                        %error,
-                        "Telegram webhook update producer stopped before accepting updates"
-                    );
-                } else {
-                    tracing::info!(?report, "Telegram webhook update producer stopped");
+            let webhook_setup = match webhook_setup_from_config(&config.bot.webhook) {
+                Ok(setup) => Some(setup),
+                Err(error) => {
+                    tracing::warn!(%error, "failed to load Telegram webhook certificate");
+                    readiness_checks.push(ReadinessCheck::skipped(
+                        "telegram_update_producer",
+                        "failed to load BOT_WEBHOOK_CERT_FILE",
+                    ));
+                    None
                 }
-            });
-            workers.webhook_route = Some(TelegramWebhookRoute {
-                sender: webhook_sender,
-                secret_token: Arc::from(config.bot.webhook.secret_token.clone()),
-            });
-            workers.handles.push(update_producer_worker);
-            readiness_checks.push(ReadinessCheck::ok(
-                "telegram_update_producer",
-                "Telegram webhook update producer worker started",
-            ));
+            };
+            if let Some(webhook_setup) = webhook_setup {
+                let webhook_startup =
+                    TelegramWebhookSetupClient::new(bot_key.to_owned(), telegram.clone());
+                let update_queue = openplotva_updates::RedisUpdateQueue::new(
+                    service_clients.redis.client().clone(),
+                );
+                let update_stop = stop.subscribe();
+                let update_producer_worker = tokio::spawn(async move {
+                    let report = run_webhook_update_producer_after_set_webhook(
+                        &webhook_startup,
+                        &webhook_setup,
+                        &webhook_source,
+                        &update_queue,
+                        wait_for_runtime_stop(update_stop),
+                    )
+                    .await;
+
+                    if let Some(error) = report.set_webhook_error.as_deref() {
+                        tracing::warn!(
+                            %error,
+                            "Telegram webhook update producer stopped before accepting updates"
+                        );
+                    } else {
+                        tracing::info!(?report, "Telegram webhook update producer stopped");
+                    }
+                });
+                workers.webhook_route = Some(TelegramWebhookRoute {
+                    sender: webhook_sender,
+                    secret_token: Arc::from(config.bot.webhook.secret_token.clone()),
+                });
+                workers.handles.push(update_producer_worker);
+                readiness_checks.push(ReadinessCheck::ok(
+                    "telegram_update_producer",
+                    "Telegram webhook update producer worker started",
+                ));
+            }
         }
     } else {
         let update_startup = telegram.clone();
@@ -1067,6 +1236,84 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn webhook_setup_from_config_reads_certificate_when_cert_and_key_are_set_like_go()
+    -> Result<(), Box<dyn Error>> {
+        let cert_path = unique_temp_file("openplotva-webhook-cert.pem");
+        std::fs::write(&cert_path, b"cert-bytes")?;
+        let config = openplotva_config::BotWebhookConfig {
+            enabled: true,
+            url: "https://example.test/telegram/webhook".to_owned(),
+            cert_file: cert_path.to_string_lossy().into_owned(),
+            key_file: "/unused-key.pem".to_owned(),
+            secret_token: "secret".to_owned(),
+        };
+
+        let setup = super::webhook_setup_from_config(&config)?;
+
+        assert_eq!(setup.url, "https://example.test/telegram/webhook");
+        assert_eq!(setup.secret_token.as_deref(), Some("secret"));
+        let certificate = setup.certificate.expect("certificate bytes");
+        assert_eq!(certificate.name, "cert.pem");
+        assert_eq!(certificate.bytes, b"cert-bytes");
+        let _ = std::fs::remove_file(cert_path);
+        Ok(())
+    }
+
+    #[test]
+    fn webhook_setup_from_config_ignores_cert_file_without_key_file_like_go()
+    -> Result<(), Box<dyn Error>> {
+        let cert_path = unique_temp_file("openplotva-webhook-cert-no-key.pem");
+        std::fs::write(&cert_path, b"cert-bytes")?;
+        let config = openplotva_config::BotWebhookConfig {
+            enabled: true,
+            url: "https://example.test/telegram/webhook".to_owned(),
+            cert_file: cert_path.to_string_lossy().into_owned(),
+            key_file: String::new(),
+            secret_token: String::new(),
+        };
+
+        let setup = super::webhook_setup_from_config(&config)?;
+
+        assert!(setup.secret_token.is_none());
+        assert!(setup.certificate.is_none());
+        let _ = std::fs::remove_file(cert_path);
+        Ok(())
+    }
+
+    #[test]
+    fn webhook_multipart_plan_contains_go_set_webhook_fields_and_certificate()
+    -> Result<(), Box<dyn Error>> {
+        let setup = openplotva_telegram::WebhookSetup::new(
+            "https://example.test/telegram/webhook",
+            Some("secret".to_owned()),
+        )
+        .with_certificate(openplotva_telegram::WebhookCertificate::new(
+            "cert.pem",
+            b"cert-bytes".to_vec(),
+        ));
+
+        let plan = super::telegram_webhook_multipart_plan(&setup)?;
+
+        assert_eq!(plan.certificate_name, "cert.pem");
+        assert_eq!(plan.certificate_bytes, b"cert-bytes");
+        assert_eq!(
+            plan.fields,
+            vec![
+                (
+                    "allowed_updates".to_owned(),
+                    serde_json::to_string(openplotva_updates::GO_ALLOWED_UPDATE_NAMES)?
+                ),
+                ("secret_token".to_owned(), "secret".to_owned()),
+                (
+                    "url".to_owned(),
+                    "https://example.test/telegram/webhook".to_owned()
+                ),
+            ]
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn telegram_bot_command_setup_deletes_then_sets_go_scopes() -> Result<(), Box<dyn Error>>
     {
@@ -1187,8 +1434,9 @@ mod tests {
 
         fn set_webhook<'a>(
             &'a self,
-            method: openplotva_telegram::SetWebhook,
+            setup: &'a openplotva_telegram::WebhookSetup,
         ) -> super::SetWebhookFuture<'a, Self::Error> {
+            let method = openplotva_telegram::build_set_webhook_method(setup);
             self.requests
                 .lock()
                 .expect("setWebhook requests")
@@ -1387,5 +1635,18 @@ mod tests {
                 "text": "/start hello"
             }
         }))
+    }
+
+    fn unique_temp_file(name: &str) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("current time after epoch")
+                .as_nanos()
+        ));
+        path
     }
 }

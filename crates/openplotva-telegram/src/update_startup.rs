@@ -278,6 +278,27 @@ pub struct WebhookSetup {
     pub url: String,
     /// Optional `X-Telegram-Bot-Api-Secret-Token` value.
     pub secret_token: Option<String>,
+    /// Optional custom certificate uploaded as `cert.pem` like Go `api.FileBytes`.
+    pub certificate: Option<WebhookCertificate>,
+}
+
+/// Custom Telegram webhook certificate payload.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WebhookCertificate {
+    /// Multipart filename sent to Telegram.
+    pub name: String,
+    /// Certificate bytes read from `BOT_WEBHOOK_CERT_FILE`.
+    pub bytes: Vec<u8>,
+}
+
+impl WebhookCertificate {
+    /// Build a custom webhook certificate payload.
+    pub fn new(name: impl Into<String>, bytes: Vec<u8>) -> Self {
+        Self {
+            name: name.into(),
+            bytes,
+        }
+    }
 }
 
 impl WebhookSetup {
@@ -286,7 +307,14 @@ impl WebhookSetup {
         Self {
             url: url.into(),
             secret_token,
+            certificate: None,
         }
+    }
+
+    /// Attach a custom certificate payload.
+    pub fn with_certificate(mut self, certificate: WebhookCertificate) -> Self {
+        self.certificate = Some(certificate);
+        self
     }
 }
 
