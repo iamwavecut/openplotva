@@ -76,6 +76,7 @@ Do not spend time polishing broad abstractions until the relevant contract inven
 - Approved deviation: do not maintain bitwise compatibility with Go `encoding/gob` update payloads. Use the Rust-native `openplotva.update.v1+carapax-json.zstd` serde envelope around `carapax::types::Update`, and treat mixed Go/Rust in-flight update queues as unsupported during cutover.
 - Telegram update consumer work should preserve Go `internal/processor` timing semantics: `5s` dequeue pop timeout, `10s` state timeout, `45s` handle timeout, `1m` stale-update side-effect cutoff with the strict Go `!date.Add(maxAge).After(now)` boundary, and a `4 * available_parallelism` worker limit.
 - Keep Telegram update state extraction in `openplotva-updates` and Postgres persistence in `openplotva-storage`; shared chat/user state structs belong in `openplotva-core` so storage does not depend on `carapax`.
+- App-level update consumer glue belongs in `openplotva-app::updates`: it may combine extracted state persistence with an injected handler, but must not start a default no-op handler that drains real queued updates before fetcher routing is ported.
 - LLM: define Plotva-owned provider traits. Implement with `genai`, `async-openai`, and raw `reqwest` only for provider gaps.
 - Prompts: keep `.prompt` files and use Rust `handlebars` first. Do not implementation prompt language before contract is proven.
 - Runtime API: use `async-graphql` for existing diagnostics. Use `utoipa` only for documentation until contract is complete.

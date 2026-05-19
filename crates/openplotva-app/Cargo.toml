@@ -10,12 +10,14 @@ publish = false
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
+carapax.workspace = true
 openplotva-config = { path = "../openplotva-config" }
 openplotva-core = { path = "../openplotva-core" }
 openplotva-observability = { path = "../openplotva-observability" }
 openplotva-server = { path = "../openplotva-server" }
 openplotva-storage = { path = "../openplotva-storage" }
 openplotva-telegram = { path = "../openplotva-telegram" }
+openplotva-updates = { path = "../openplotva-updates" }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 thiserror.workspace = true

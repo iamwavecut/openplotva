@@ -2,6 +2,7 @@
 
 pub mod pending_ops;
 mod reference_snapshot;
+pub mod updates;
 pub mod virtual_messages;
 
 use std::{sync::Arc, time::Duration};
