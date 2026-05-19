@@ -9,10 +9,11 @@ pub use html::{
     sanitize_telegram_html, split_telegram_text, strip_telegram_html,
 };
 pub use outbound::{
-    ChatRef, EditTextMessageRequest, MediaGroupMessagePlan, MediaGroupMessageRequest,
-    MediaGroupPhotoItem, OutboundBuildError, PhotoMessagePlan, PhotoMessageRequest, PhotoSource,
-    ReplyMessageRef, ReplyParametersPlan, StickerMessagePlan, StickerMessageRequest,
-    TELEGRAM_TEXT_MAX_BYTES, TextMessageRequest, allow_sending_without_reply,
+    AudioMessagePlan, AudioMessageRequest, AudioSource, ChatRef, EditTextMessageRequest,
+    MediaGroupMessagePlan, MediaGroupMessageRequest, MediaGroupPhotoItem, OutboundBuildError,
+    PhotoMessagePlan, PhotoMessageRequest, PhotoSource, ReplyMessageRef, ReplyParametersPlan,
+    StickerMessagePlan, StickerMessageRequest, TELEGRAM_TEXT_MAX_BYTES, TextMessageRequest,
+    allow_sending_without_reply, build_audio_message_method, build_audio_message_plan,
     build_edit_text_message_method, build_media_group_message_method,
     build_media_group_message_plan, build_photo_message_method, build_photo_message_plan,
     build_sticker_message_method, build_sticker_message_plan, build_text_message_method,
@@ -57,6 +58,9 @@ pub type SendPhoto = carapax::types::SendPhoto;
 
 /// Telegram sendMediaGroup method from `carapax`.
 pub type SendMediaGroup = carapax::types::SendMediaGroup;
+
+/// Telegram sendAudio method from `carapax`.
+pub type SendAudio = carapax::types::SendAudio;
 
 /// Telegram editMessageText method from `carapax`.
 pub type EditMessageText = carapax::types::EditMessageText;

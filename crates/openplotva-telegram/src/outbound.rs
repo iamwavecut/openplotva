@@ -5,7 +5,7 @@ use std::io::Cursor;
 use carapax::types::{
     EditMessageText, InlineKeyboardMarkup, InputFile, InputFileReader, InputMediaPhoto, MediaGroup,
     MediaGroupError, MediaGroupItem, ParseMode, ReplyMarkup, ReplyParameters, ReplyParametersError,
-    SendMediaGroup, SendMessage, SendPhoto, SendSticker,
+    SendAudio, SendMediaGroup, SendMessage, SendPhoto, SendSticker,
 };
 use thiserror::Error;
 
@@ -163,6 +163,60 @@ pub struct PhotoMessagePlan {
     pub render_as: String,
     /// Whether Telegram should cover the media with a spoiler.
     pub has_spoiler: bool,
+    /// Reply parameters, when sending as a reply.
+    pub reply_parameters: Option<ReplyParametersPlan>,
+}
+
+/// Telegram audio source variants used by Go `api.NewAudio` call sites.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AudioSource {
+    /// Existing Telegram file ID.
+    FileId(String),
+    /// Public URL for Telegram to fetch.
+    Url(String),
+    /// Uploaded audio bytes with the multipart file name Go attaches.
+    Bytes {
+        /// Multipart file name.
+        file_name: String,
+        /// File bytes.
+        bytes: Vec<u8>,
+    },
+}
+
+/// Audio send request fields assembled by the Go song generation path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AudioMessageRequest {
+    /// Target chat.
+    pub chat: ChatRef,
+    /// Target topic ID when present in the music job.
+    pub message_thread_id: i64,
+    /// Whether Telegram should suppress user notification sound.
+    pub disable_notification: bool,
+    /// Audio file, URL, or upload bytes.
+    pub audio: AudioSource,
+    /// Optional Telegram caption.
+    pub caption: String,
+    /// Go `ParseMode` string for the caption.
+    pub render_as: String,
+    /// Explicit reply parameters overlaid by the Go caller.
+    pub reply_parameters: Option<ReplyParametersPlan>,
+}
+
+/// Public audio payload mirror for asserting form-only `carapax` methods.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AudioMessagePlan {
+    /// Telegram target chat ID.
+    pub chat_id: i64,
+    /// Audio file, URL, or upload bytes.
+    pub audio: AudioSource,
+    /// Forum topic ID, when Go would set it on the outbound config.
+    pub message_thread_id: Option<i64>,
+    /// Whether Telegram should suppress user notification sound.
+    pub disable_notification: bool,
+    /// Optional Telegram caption.
+    pub caption: String,
+    /// Go `ParseMode` string for the caption.
+    pub render_as: String,
     /// Reply parameters, when sending as a reply.
     pub reply_parameters: Option<ReplyParametersPlan>,
 }
@@ -375,6 +429,26 @@ pub fn build_photo_message_plan(
     })
 }
 
+/// Build an outbound `sendAudio` method.
+pub fn build_audio_message_method(
+    req: &AudioMessageRequest,
+) -> Result<SendAudio, OutboundBuildError> {
+    build_audio_message_plan(req).to_carapax()
+}
+
+/// Build an inspectable audio payload plan matching Go `api.NewAudio` overlays.
+pub fn build_audio_message_plan(req: &AudioMessageRequest) -> AudioMessagePlan {
+    AudioMessagePlan {
+        chat_id: req.chat.id,
+        audio: req.audio.clone(),
+        message_thread_id: (req.message_thread_id != 0).then_some(req.message_thread_id),
+        disable_notification: req.disable_notification,
+        caption: req.caption.clone(),
+        render_as: req.render_as.clone(),
+        reply_parameters: req.reply_parameters,
+    }
+}
+
 /// Build an outbound `sendMediaGroup` method.
 pub fn build_media_group_message_method(
     req: &MediaGroupMessageRequest,
@@ -501,6 +575,41 @@ impl PhotoSource {
     }
 }
 
+impl AudioMessagePlan {
+    /// Convert the inspectable plan into the `carapax` form-backed method.
+    pub fn to_carapax(&self) -> Result<SendAudio, OutboundBuildError> {
+        let mut method = SendAudio::new(self.chat_id, self.audio.to_input_file());
+        if let Some(thread_id) = self.message_thread_id {
+            method = method.with_message_thread_id(thread_id);
+        }
+        if self.disable_notification {
+            method = method.with_disable_notification(true);
+        }
+        if !self.caption.is_empty() {
+            method = method.with_caption(self.caption.clone());
+        }
+        if let Some(parse_mode) = parse_mode_from_go(&self.render_as)? {
+            method = method.with_caption_parse_mode(parse_mode);
+        }
+        if let Some(reply) = self.reply_parameters {
+            method = method.with_reply_parameters(reply.into_carapax())?;
+        }
+        Ok(method)
+    }
+}
+
+impl AudioSource {
+    fn to_input_file(&self) -> InputFile {
+        match self {
+            Self::FileId(file_id) => InputFile::file_id(file_id.clone()),
+            Self::Url(url) => InputFile::url(url.clone()),
+            Self::Bytes { file_name, bytes } => InputFileReader::new(Cursor::new(bytes.clone()))
+                .with_file_name(file_name.clone())
+                .into(),
+        }
+    }
+}
+
 impl MediaGroupMessagePlan {
     /// Convert the inspectable plan into the `carapax` form-backed method.
     pub fn to_carapax(&self) -> Result<SendMediaGroup, OutboundBuildError> {
@@ -576,10 +685,11 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ChatRef, EditTextMessageRequest, MediaGroupMessageRequest, MediaGroupPhotoItem,
-        OutboundBuildError, PhotoMessageRequest, PhotoSource, ReplyMessageRef, ReplyParametersPlan,
-        StickerMessageRequest, TextMessageRequest, allow_sending_without_reply,
-        build_edit_text_message_method, build_media_group_message_method,
+        AudioMessageRequest, AudioSource, ChatRef, EditTextMessageRequest,
+        MediaGroupMessageRequest, MediaGroupPhotoItem, OutboundBuildError, PhotoMessageRequest,
+        PhotoSource, ReplyMessageRef, ReplyParametersPlan, StickerMessageRequest,
+        TextMessageRequest, allow_sending_without_reply, build_audio_message_method,
+        build_audio_message_plan, build_edit_text_message_method, build_media_group_message_method,
         build_media_group_message_plan, build_photo_message_method, build_photo_message_plan,
         build_sticker_message_method, build_sticker_message_plan, build_text_message_method,
         build_text_message_methods, forum_thread_id, message_target_chat,
@@ -1040,6 +1150,57 @@ mod tests {
         let err = build_media_group_message_method(&req).err();
 
         assert!(matches!(err, Some(OutboundBuildError::MediaGroup(_))));
+    }
+
+    #[test]
+    fn build_audio_message_plan_keeps_song_caption_reply_and_thread() {
+        let source = AudioSource::Bytes {
+            file_name: "song.mp3".to_owned(),
+            bytes: vec![1, 2, 3],
+        };
+        let req = AudioMessageRequest {
+            chat: private_chat(42),
+            message_thread_id: 77,
+            disable_notification: false,
+            audio: source.clone(),
+            caption: "<code>song</code>".to_owned(),
+            render_as: TELEGRAM_PARSE_MODE_HTML.to_owned(),
+            reply_parameters: Some(ReplyParametersPlan {
+                message_id: 9,
+                chat_id: 42,
+                allow_sending_without_reply: true,
+            }),
+        };
+
+        let plan = build_audio_message_plan(&req);
+
+        assert_eq!(plan.chat_id, 42);
+        assert_eq!(plan.message_thread_id, Some(77));
+        assert_eq!(plan.audio, source);
+        assert_eq!(plan.caption, "<code>song</code>");
+        assert_eq!(plan.render_as, TELEGRAM_PARSE_MODE_HTML);
+        assert_eq!(plan.reply_parameters, req.reply_parameters);
+    }
+
+    #[test]
+    fn build_audio_message_method_builds_carapax_method() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let req = AudioMessageRequest {
+            chat: private_chat(42),
+            message_thread_id: 0,
+            disable_notification: false,
+            audio: AudioSource::Bytes {
+                file_name: "song.mp3".to_owned(),
+                bytes: vec![1, 2, 3],
+            },
+            caption: String::new(),
+            render_as: String::new(),
+            reply_parameters: None,
+        };
+
+        let _method = build_audio_message_method(&req)?;
+
+        Ok(())
     }
 
     #[test]
