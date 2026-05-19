@@ -1,5 +1,6 @@
 //! Composition root for the OpenPlotva application shell.
 
+pub mod pending_ops;
 mod reference_snapshot;
 
 use anyhow::Context as _;

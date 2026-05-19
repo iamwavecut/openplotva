@@ -11,9 +11,11 @@ publish = false
 anyhow.workspace = true
 axum.workspace = true
 openplotva-config = { path = "../openplotva-config" }
+openplotva-core = { path = "../openplotva-core" }
 openplotva-observability = { path = "../openplotva-observability" }
 openplotva-server = { path = "../openplotva-server" }
 openplotva-storage = { path = "../openplotva-storage" }
+openplotva-telegram = { path = "../openplotva-telegram" }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal"] }
