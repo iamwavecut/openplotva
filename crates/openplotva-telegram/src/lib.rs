@@ -1,11 +1,18 @@
 //! Telegram Bot API boundary for OpenPlotva.
 
 mod html;
+mod outbound;
 
 pub use html::{
     TELEGRAM_PARSE_MODE_HTML, clean_unicode_non_printables, ensure_telegram_safe_text,
     escape_telegram_html_text, extract_visible_text, is_valid_telegram_html,
     sanitize_telegram_html, split_telegram_text, strip_telegram_html,
+};
+pub use outbound::{
+    ChatRef, EditTextMessageRequest, OutboundBuildError, ReplyMessageRef, TELEGRAM_TEXT_MAX_BYTES,
+    TextMessageRequest, allow_sending_without_reply, build_edit_text_message_method,
+    build_text_message_method, build_text_message_methods, forum_thread_id, message_target_chat,
+    parse_mode_from_go, validate_text_message_text,
 };
 
 pub const INTEGRATION_CRATE: &str = "carapax";
@@ -33,6 +40,24 @@ pub type SetBotCommands = carapax::types::SetBotCommands;
 
 /// Error returned by `carapax` when a Bot API command is invalid.
 pub type BotCommandError = carapax::types::BotCommandError;
+
+/// Telegram sendMessage method from `carapax`.
+pub type SendMessage = carapax::types::SendMessage;
+
+/// Telegram editMessageText method from `carapax`.
+pub type EditMessageText = carapax::types::EditMessageText;
+
+/// Telegram reply markup type from `carapax`.
+pub type ReplyMarkup = carapax::types::ReplyMarkup;
+
+/// Telegram inline keyboard markup type from `carapax`.
+pub type InlineKeyboardMarkup = carapax::types::InlineKeyboardMarkup;
+
+/// Telegram inline keyboard button type from `carapax`.
+pub type InlineKeyboardButton = carapax::types::InlineKeyboardButton;
+
+/// Telegram parse mode type from `carapax`.
+pub type ParseMode = carapax::types::ParseMode;
 
 /// Create an empty Telegram integration context.
 pub fn empty_context() -> CarapaxContext {
