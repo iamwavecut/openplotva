@@ -11,7 +11,7 @@ publish = false
 axum.workspace = true
 openplotva-core = { path = "../openplotva-core" }
 serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
 
 [lints]
 workspace = true
-

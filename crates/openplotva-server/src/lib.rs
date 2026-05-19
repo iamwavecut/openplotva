@@ -1,9 +1,12 @@
 //! HTTP server surfaces for OpenPlotva.
 
-use std::sync::Arc;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Health response returned by `/api/health`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -59,6 +62,200 @@ pub const ACTION_SEND_MESSAGE: &str = "send_message";
 pub const ACTION_PIN_MESSAGE: &str = "pin_message";
 /// Go permission action for editing messages.
 pub const ACTION_EDIT_MESSAGE: &str = "edit_message";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingOp {
+    /// Pending operation ID.
+    pub id: i64,
+    /// Virtual message ID the operation targets.
+    pub vmsg_id: String,
+    /// Telegram chat ID.
+    pub chat_id: i64,
+    /// Operation kind, currently `edit` or `delete` in Go.
+    pub op: String,
+    /// Operation payload, if any.
+    pub payload: Vec<u8>,
+    /// Number of attempts recorded by Go storage.
+    pub attempts: i32,
+}
+
+impl PendingOp {
+    /// Build a pending op with the fields used by the Go mapping helpers.
+    pub fn new(id: i64, vmsg_id: impl Into<String>, chat_id: i64, op: impl Into<String>) -> Self {
+        Self {
+            id,
+            vmsg_id: vmsg_id.into(),
+            chat_id,
+            op: op.into(),
+            payload: Vec::new(),
+            attempts: 0,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MessageIdMapping {
+    /// Virtual message ID.
+    pub vmsg_id: String,
+    /// Telegram chat ID.
+    pub chat_id: i64,
+    /// Telegram forum thread ID, when present.
+    pub thread_id: Option<i32>,
+    /// Resolved real Telegram message ID, when the send finished.
+    pub real_message_id: Option<i32>,
+}
+
+impl MessageIdMapping {
+    /// Build an unresolved virtual-message mapping.
+    pub fn unresolved(vmsg_id: impl Into<String>, chat_id: i64) -> Self {
+        Self {
+            vmsg_id: vmsg_id.into(),
+            chat_id,
+            thread_id: None,
+            real_message_id: None,
+        }
+    }
+
+    /// Build a resolved virtual-message mapping.
+    pub fn resolved(vmsg_id: impl Into<String>, chat_id: i64, real_message_id: i32) -> Self {
+        Self {
+            vmsg_id: vmsg_id.into(),
+            chat_id,
+            thread_id: None,
+            real_message_id: Some(real_message_id),
+        }
+    }
+}
+
+/// Pending operation that has a resolved real Telegram message ID.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReadyPendingOp {
+    /// Pending operation ID.
+    pub id: i64,
+    /// Virtual message ID the operation targets.
+    pub vmsg_id: String,
+    /// Telegram chat ID.
+    pub chat_id: i64,
+    /// Operation kind, currently `edit` or `delete` in Go.
+    pub op: String,
+    /// Operation payload, if any.
+    pub payload: Vec<u8>,
+    /// Real Telegram message ID from `message_id_map`.
+    pub real_message_id: i32,
+}
+
+/// Decoded Go pending edit payload.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+pub struct PendingEditPayload {
+    /// Edited text.
+    #[serde(default)]
+    pub text: String,
+    /// Telegram parse mode, such as `HTML`.
+    #[serde(default)]
+    pub parse_mode: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PendingOpMappingError {
+    /// Batch lookup failed.
+    BatchLookup,
+    /// Single virtual-message lookup failed.
+    SingleLookup,
+}
+
+/// Store boundary used by Go pending-op mapping recovery.
+pub trait PendingOpMappingStore {
+    /// Batch-load virtual-message mappings.
+    fn list_mappings_by_virtual_ids(
+        &mut self,
+        vmsg_ids: &[String],
+    ) -> Result<Vec<MessageIdMapping>, PendingOpMappingError>;
+
+    /// Load one virtual-message mapping.
+    fn get_mapping_by_virtual(
+        &mut self,
+        vmsg_id: &str,
+    ) -> Result<Option<MessageIdMapping>, PendingOpMappingError>;
+}
+
+/// Return unique non-empty virtual IDs from pending ops, preserving Go row order.
+pub fn pending_op_virtual_ids(rows: &[PendingOp]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut ids = Vec::new();
+    for row in rows {
+        if row.vmsg_id.is_empty() || !seen.insert(row.vmsg_id.clone()) {
+            continue;
+        }
+        ids.push(row.vmsg_id.clone());
+    }
+    ids
+}
+
+/// Index mappings by virtual ID, skipping empty IDs like Go.
+pub fn index_mappings_by_virtual_id(
+    mappings: &[MessageIdMapping],
+) -> HashMap<String, MessageIdMapping> {
+    let mut index = HashMap::with_capacity(mappings.len());
+    for mapping in mappings {
+        if mapping.vmsg_id.is_empty() {
+            continue;
+        }
+        index.insert(mapping.vmsg_id.clone(), mapping.clone());
+    }
+    index
+}
+
+/// Load mappings for pending ops using Go's batch-first, single-lookup fallback.
+pub fn load_pending_op_mappings(
+    store: &mut impl PendingOpMappingStore,
+    rows: &[PendingOp],
+) -> HashMap<String, MessageIdMapping> {
+    let ids = pending_op_virtual_ids(rows);
+    if ids.is_empty() {
+        return HashMap::new();
+    }
+
+    match store.list_mappings_by_virtual_ids(&ids) {
+        Ok(mappings) => index_mappings_by_virtual_id(&mappings),
+        Err(_) => {
+            let mut index = HashMap::with_capacity(ids.len());
+            for id in ids {
+                if let Ok(Some(mapping)) = store.get_mapping_by_virtual(&id)
+                    && !mapping.vmsg_id.is_empty()
+                {
+                    index.insert(mapping.vmsg_id.clone(), mapping);
+                }
+            }
+            index
+        }
+    }
+}
+
+/// Return pending ops whose virtual message has a resolved real Telegram message ID.
+pub fn pending_ops_ready_for_execution(
+    rows: &[PendingOp],
+    mappings: &HashMap<String, MessageIdMapping>,
+) -> Vec<ReadyPendingOp> {
+    rows.iter()
+        .filter_map(|row| {
+            let mapping = mappings.get(&row.vmsg_id)?;
+            let real_message_id = mapping.real_message_id?;
+            Some(ReadyPendingOp {
+                id: row.id,
+                vmsg_id: row.vmsg_id.clone(),
+                chat_id: row.chat_id,
+                op: row.op.clone(),
+                payload: row.payload.clone(),
+                real_message_id,
+            })
+        })
+        .collect()
+}
+
+/// Decode Go's pending edit payload, returning zero-values on malformed JSON.
+pub fn pending_edit_payload(payload: &[u8]) -> PendingEditPayload {
+    serde_json::from_slice(payload).unwrap_or_default()
+}
 
 #[derive(Clone, Debug)]
 struct AppState {
@@ -148,7 +345,10 @@ async fn ready(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Readines
 #[cfg(test)]
 mod tests {
     use super::{
-        ACTION_SEND_TEXT, HealthResponse, ReadinessCheck, ReadinessResponse, health_response,
+        ACTION_SEND_TEXT, HealthResponse, MessageIdMapping, PendingEditPayload, PendingOp,
+        PendingOpMappingError, PendingOpMappingStore, ReadinessCheck, ReadinessResponse,
+        health_response, index_mappings_by_virtual_id, load_pending_op_mappings,
+        pending_edit_payload, pending_op_virtual_ids, pending_ops_ready_for_execution,
         permission_cache_key, rate_limit_key, rate_limited_chat_key, vip_cache_key,
     };
 
@@ -188,5 +388,135 @@ mod tests {
             "perm_check:42:send_text"
         );
         assert_eq!(vip_cache_key(42), "vip:42");
+    }
+
+    #[derive(Default)]
+    struct PendingOpMappingStoreStub {
+        batch_calls: usize,
+        batch_ids: Vec<String>,
+        batch_rows: Vec<MessageIdMapping>,
+        batch_error: bool,
+        single_calls: Vec<String>,
+        single_rows: Vec<MessageIdMapping>,
+    }
+
+    impl PendingOpMappingStore for PendingOpMappingStoreStub {
+        fn list_mappings_by_virtual_ids(
+            &mut self,
+            vmsg_ids: &[String],
+        ) -> Result<Vec<MessageIdMapping>, PendingOpMappingError> {
+            self.batch_calls += 1;
+            self.batch_ids = vmsg_ids.to_vec();
+            if self.batch_error {
+                return Err(PendingOpMappingError::BatchLookup);
+            }
+            Ok(self.batch_rows.clone())
+        }
+
+        fn get_mapping_by_virtual(
+            &mut self,
+            vmsg_id: &str,
+        ) -> Result<Option<MessageIdMapping>, PendingOpMappingError> {
+            self.single_calls.push(vmsg_id.to_owned());
+            Ok(self
+                .single_rows
+                .iter()
+                .find(|mapping| mapping.vmsg_id == vmsg_id)
+                .cloned())
+        }
+    }
+
+    #[test]
+    fn pending_op_virtual_ids_batch_unique_non_empty_values_like_go() {
+        let rows = vec![
+            PendingOp::new(1, "v1", 42, "edit"),
+            PendingOp::new(2, "v2", 42, "delete"),
+            PendingOp::new(3, "v1", 42, "edit"),
+            PendingOp::new(4, "", 42, "delete"),
+        ];
+
+        assert_eq!(pending_op_virtual_ids(&rows), vec!["v1", "v2"]);
+    }
+
+    #[test]
+    fn load_pending_op_mappings_batches_unique_virtual_ids() {
+        let mut store = PendingOpMappingStoreStub {
+            batch_rows: vec![
+                MessageIdMapping::unresolved("v1", 42),
+                MessageIdMapping::unresolved("v2", 42),
+            ],
+            ..PendingOpMappingStoreStub::default()
+        };
+        let rows = vec![
+            PendingOp::new(1, "v1", 42, "edit"),
+            PendingOp::new(2, "v2", 42, "delete"),
+            PendingOp::new(3, "v1", 42, "edit"),
+            PendingOp::new(4, "", 42, "delete"),
+        ];
+
+        let index = load_pending_op_mappings(&mut store, &rows);
+
+        assert_eq!(store.batch_calls, 1);
+        assert_eq!(store.batch_ids, vec!["v1", "v2"]);
+        assert!(store.single_calls.is_empty());
+        assert!(index.contains_key("v1"));
+        assert!(index.contains_key("v2"));
+    }
+
+    #[test]
+    fn load_pending_op_mappings_falls_back_to_single_lookups() {
+        let mut store = PendingOpMappingStoreStub {
+            batch_error: true,
+            single_rows: vec![MessageIdMapping::unresolved("v1", 42)],
+            ..PendingOpMappingStoreStub::default()
+        };
+        let rows = vec![
+            PendingOp::new(1, "v1", 42, "edit"),
+            PendingOp::new(2, "v2", 42, "delete"),
+        ];
+
+        let index = load_pending_op_mappings(&mut store, &rows);
+
+        assert_eq!(store.batch_calls, 1);
+        assert_eq!(store.single_calls, vec!["v1", "v2"]);
+        assert!(index.contains_key("v1"));
+        assert!(!index.contains_key("v2"));
+    }
+
+    #[test]
+    fn pending_ops_ready_for_execution_skips_unresolved_mappings_like_go() {
+        let rows = vec![
+            PendingOp::new(1, "v1", 42, "edit"),
+            PendingOp::new(2, "v2", 42, "delete"),
+            PendingOp::new(3, "missing", 42, "delete"),
+        ];
+        let mappings = index_mappings_by_virtual_id(&[
+            MessageIdMapping::resolved("v1", 42, 77),
+            MessageIdMapping::unresolved("v2", 42),
+            MessageIdMapping::unresolved("", 42),
+        ]);
+
+        let ready = pending_ops_ready_for_execution(&rows, &mappings);
+
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].id, 1);
+        assert_eq!(ready[0].real_message_id, 77);
+    }
+
+    #[test]
+    fn pending_edit_payload_decodes_text_and_parse_mode_like_go() {
+        let payload = br#"{"text":"<b>edited</b>","parse_mode":"HTML"}"#;
+
+        assert_eq!(
+            pending_edit_payload(payload),
+            PendingEditPayload {
+                text: "<b>edited</b>".to_owned(),
+                parse_mode: "HTML".to_owned(),
+            }
+        );
+        assert_eq!(
+            pending_edit_payload(b"not-json"),
+            PendingEditPayload::default()
+        );
     }
 }

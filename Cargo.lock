@@ -1575,6 +1575,7 @@ dependencies = [
  "axum",
  "openplotva-core",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
