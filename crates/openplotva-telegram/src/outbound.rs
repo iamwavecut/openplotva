@@ -367,6 +367,8 @@ pub enum OutboundBuildError {
     /// `carapax` rejected Telegram input media.
     #[error("failed to build Telegram input media: {0}")]
     InputMedia(String),
+    #[error("failed to serialize Telegram persistence payload: {0}")]
+    PersistencePayload(String),
 }
 
 /// Build all outbound `sendMessage` methods for a text request.

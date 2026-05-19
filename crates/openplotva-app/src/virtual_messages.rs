@@ -5,10 +5,11 @@ use std::{fmt, future::Future, pin::Pin};
 use openplotva_core::{MessageIdMapping, ReadyPendingOp};
 use openplotva_telegram::{
     DispatcherMessage, DispatcherQueue, DispatcherSendStatus, DispatcherWorkItem, EnqueueOutcome,
-    OutboundBuildError, PENDING_OP_DELETE, PENDING_OP_EDIT, PendingOpBuildError, ReplyMessageRef,
-    StickerMessageRequest, TELEGRAM_TEXT_MAX_BYTES, TelegramOutboundMethod,
-    TelegramOutboundResponse, TextMessageRequest, build_pending_op_method,
-    build_sticker_message_method, build_sticker_message_plan, build_text_message_method,
+    OutboundBuildError, PENDING_OP_DELETE, PENDING_OP_EDIT, PendingOpBuildError,
+    PhotoMessageRequest, ReplyMessageRef, StickerMessageRequest, TELEGRAM_TEXT_MAX_BYTES,
+    TelegramOutboundMethod, TelegramOutboundResponse, TextMessageRequest, build_pending_op_method,
+    build_photo_message_method, build_photo_message_plan, build_sticker_message_method,
+    build_sticker_message_plan, build_text_message_method, fingerprint_photo_message_plan,
     fingerprint_sticker_message_plan, fingerprint_text_message_part, forum_thread_id,
     message_target_chat, split_telegram_text, validate_text_message_text,
 };
@@ -225,6 +226,14 @@ pub struct QueueStickerRequest<'a> {
     pub immediate: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct QueuePhotoRequest<'a> {
+    /// Telegram photo request fields.
+    pub message: &'a PhotoMessageRequest,
+    /// Whether the photo should enter the immediate queue.
+    pub immediate: bool,
+}
+
 /// One queued text part and its virtual-message bookkeeping.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueuedTextPartReport {
@@ -256,6 +265,14 @@ pub struct QueueStickerReport {
     pub immediate: bool,
     /// Storage error ignored by Go when inserting the virtual ID row.
     pub insert_error: Option<String>,
+}
+
+/// Summary of queueing one Go direct `sendPhoto` chattable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QueuePhotoReport {
+    pub enqueue_outcome: EnqueueOutcome,
+    /// Whether this photo went to the immediate queue.
+    pub immediate: bool,
 }
 
 impl QueueTextReport {
@@ -384,9 +401,13 @@ where
         .map(|error| error.to_string());
     let plan = build_sticker_message_plan(req.message, req.reply_to)?;
     let method = build_sticker_message_method(req.message, req.reply_to)?;
+    let persistence_payload = plan
+        .to_persistence_payload()
+        .map_err(|error| OutboundBuildError::PersistencePayload(error.to_string()))?;
     let dispatcher_message =
         DispatcherMessage::new(fingerprint_sticker_message_plan(&plan), &virtual_id)
-            .with_method(TelegramOutboundMethod::from(method));
+            .with_method(TelegramOutboundMethod::from(method))
+            .with_persistence_payload(persistence_payload);
     let enqueue_outcome = queue.enqueue(dispatcher_message, req.immediate);
 
     Ok(QueueStickerReport {
@@ -394,6 +415,27 @@ where
         enqueue_outcome,
         immediate: req.immediate,
         insert_error,
+    })
+}
+
+/// Queue one photo like a Go direct `SendChattable(api.PhotoConfig)` path.
+pub fn queue_photo_message(
+    queue: &DispatcherQueue,
+    req: QueuePhotoRequest<'_>,
+) -> Result<QueuePhotoReport, OutboundBuildError> {
+    let plan = build_photo_message_plan(req.message)?;
+    let method = build_photo_message_method(req.message)?;
+    let persistence_payload = plan
+        .to_persistence_payload()
+        .map_err(|error| OutboundBuildError::PersistencePayload(error.to_string()))?;
+    let dispatcher_message = DispatcherMessage::new(fingerprint_photo_message_plan(&plan), "")
+        .with_method(TelegramOutboundMethod::from(method))
+        .with_persistence_payload(persistence_payload);
+    let enqueue_outcome = queue.enqueue(dispatcher_message, req.immediate);
+
+    Ok(QueuePhotoReport {
+        enqueue_outcome,
+        immediate: req.immediate,
     })
 }
 
@@ -665,19 +707,21 @@ mod tests {
     use openplotva_core::MessageIdMapping;
     use openplotva_telegram::{
         ChatRef, DispatcherConfig, DispatcherMessage, DispatcherQueue, DispatcherSendStatus,
-        EnqueueOutcome, ReplyMessageRef, TelegramMessage, TelegramOutboundMethod,
+        EnqueueOutcome, PhotoMessageRequest, PhotoSource, ReplyMessageRef,
+        TELEGRAM_PARSE_MODE_HTML, TelegramMessage, TelegramOutboundMethod,
         TelegramOutboundMethodKind, TelegramOutboundResponse, TextMessageRequest,
-        build_text_message_method, fingerprint_text_message_part,
+        build_text_message_method, fingerprint_text_message_part, persistent_queue_from_drain,
     };
     use serde_json::json;
 
     use crate::pending_ops::PendingOpHistory;
 
     use super::{
-        PENDING_OP_DELETE, PENDING_OP_EDIT, QueueStickerRequest, QueueTextRequest,
-        VirtualDeleteRequest, VirtualEditRequest, VirtualMessageAction, VirtualMessageError,
-        VirtualMessageReport, VirtualMessageStore, delete_message_virtual, edit_text_virtual,
-        queue_sticker_message, queue_text_message_parts, send_work_item_and_resolve,
+        PENDING_OP_DELETE, PENDING_OP_EDIT, QueuePhotoRequest, QueueStickerRequest,
+        QueueTextRequest, VirtualDeleteRequest, VirtualEditRequest, VirtualMessageAction,
+        VirtualMessageError, VirtualMessageReport, VirtualMessageStore, delete_message_virtual,
+        edit_text_virtual, queue_photo_message, queue_sticker_message, queue_text_message_parts,
+        send_work_item_and_resolve,
     };
 
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -960,6 +1004,18 @@ mod tests {
         assert_eq!(snapshot.immediate[0].fingerprint_key, "42:sticker:abbb8dc3");
         assert!(snapshot.regular.is_empty());
 
+        let persisted = persistent_queue_from_drain(queue.drain_for_shutdown(), 100)?;
+        assert_eq!(persisted.skipped, 0);
+        assert_eq!(persisted.items.len(), 1);
+        let item = &persisted.items[0];
+        assert_eq!(item.message_type, "*api.StickerConfig");
+        assert_eq!(item.virtual_id, "sticker-v1");
+        assert_eq!(item.chat_id, 42);
+        let payload: serde_json::Value = serde_json::from_slice(&item.message)?;
+        assert_eq!(payload["ChatID"], 42);
+        assert_eq!(payload["MessageThreadID"], 7);
+        assert_eq!(payload["File"], "sticker-file-id");
+
         Ok(())
     }
 
@@ -1012,6 +1068,58 @@ mod tests {
         assert!(snapshot.immediate.is_empty());
         assert_eq!(snapshot.regular.len(), 1);
         assert_eq!(snapshot.regular[0].virtual_id, "sticker-v2");
+
+        Ok(())
+    }
+
+    #[test]
+    fn queue_photo_message_enqueues_direct_chattable_without_virtual_mapping_and_keeps_persistence()
+    -> Result<(), Box<dyn Error>> {
+        let queue = DispatcherQueue::new(DispatcherConfig::default());
+        let request = PhotoMessageRequest {
+            chat: ChatRef {
+                id: 42,
+                is_forum: true,
+            },
+            message_thread_id: 7,
+            disable_notification: true,
+            photo: PhotoSource::FileId("photo-file-id".to_owned()),
+            caption: "<b>done</b>".to_owned(),
+            render_as: TELEGRAM_PARSE_MODE_HTML.to_owned(),
+            has_spoiler: true,
+            reply_parameters: None,
+        };
+
+        let report = queue_photo_message(
+            &queue,
+            QueuePhotoRequest {
+                message: &request,
+                immediate: false,
+            },
+        )?;
+
+        assert_eq!(report.enqueue_outcome, EnqueueOutcome::Enqueued);
+        assert!(!report.immediate);
+        let snapshot = queue.snapshot();
+        assert!(snapshot.immediate.is_empty());
+        assert_eq!(snapshot.regular.len(), 1);
+        assert_eq!(snapshot.regular[0].virtual_id, "");
+        assert_eq!(snapshot.regular[0].fingerprint_key, "42:photo:a2fb5546");
+
+        let persisted = persistent_queue_from_drain(queue.drain_for_shutdown(), 100)?;
+        assert_eq!(persisted.skipped, 0);
+        assert_eq!(persisted.items.len(), 1);
+        let item = &persisted.items[0];
+        assert_eq!(item.message_type, "*api.PhotoConfig");
+        assert_eq!(item.virtual_id, "");
+        assert_eq!(item.chat_id, 42);
+        let payload: serde_json::Value = serde_json::from_slice(&item.message)?;
+        assert_eq!(payload["ChatID"], 42);
+        assert_eq!(payload["MessageThreadID"], 7);
+        assert_eq!(payload["File"], "photo-file-id");
+        assert_eq!(payload["Caption"], "<b>done</b>");
+        assert_eq!(payload["ParseMode"], TELEGRAM_PARSE_MODE_HTML);
+        assert_eq!(payload["HasSpoiler"], true);
 
         Ok(())
     }
