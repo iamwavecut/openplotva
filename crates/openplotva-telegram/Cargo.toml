@@ -20,6 +20,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 time = { workspace = true, features = ["formatting", "parsing"] }
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+tracing.workspace = true
 url.workspace = true
 
 [dev-dependencies]
