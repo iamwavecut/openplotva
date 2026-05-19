@@ -2,11 +2,14 @@
 
 use std::{fmt, future::Future, pin::Pin, time::Duration};
 
-use openplotva_core::{MessageIdMapping, PendingOp};
+use openplotva_core::{MessageIdMapping, PendingOp, ReadyPendingOp, pending_edit_payload};
 use openplotva_server::{
     index_mappings_by_virtual_id, pending_op_virtual_ids, pending_ops_ready_for_execution,
 };
-use openplotva_telegram::{PendingOpBuildError, TelegramOutboundMethod, build_pending_op_method};
+use openplotva_telegram::{
+    PENDING_OP_DELETE, PENDING_OP_EDIT, PendingOpBuildError, TelegramOutboundMethod,
+    build_pending_op_method,
+};
 
 /// Go pending-operation poll batch size.
 pub const PENDING_OP_BATCH_LIMIT: i32 = 50;
@@ -87,6 +90,25 @@ impl PendingOpStore for openplotva_storage::PostgresVirtualMessageStore {
     }
 }
 
+/// History side effects triggered after successful pending edits/deletes.
+pub trait PendingOpHistory {
+    /// Record a successful pending edit in chat history.
+    fn update_text(&self, chat_id: i64, message_id: i32, text: &str, parse_mode: &str);
+
+    /// Record a successful pending delete in chat history.
+    fn delete_message(&self, chat_id: i64, message_id: i32);
+}
+
+/// History side-effect sink used until the storage-backed history service is ported.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NoopPendingOpHistory;
+
+impl PendingOpHistory for NoopPendingOpHistory {
+    fn update_text(&self, _chat_id: i64, _message_id: i32, _text: &str, _parse_mode: &str) {}
+
+    fn delete_message(&self, _chat_id: i64, _message_id: i32) {}
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PendingOpProcessReport {
     /// Number of rows returned by `ListPendingOps`.
@@ -103,6 +125,10 @@ pub struct PendingOpProcessReport {
     pub ready: usize,
     /// Number of Telegram methods sent successfully.
     pub sent: usize,
+    /// Number of successful pending edits reflected into history.
+    pub history_updated: usize,
+    /// Number of successful pending deletes reflected into history.
+    pub history_deleted: usize,
     /// Number of successful operations marked done.
     pub marked_done: usize,
     /// Number of operations marked failed.
@@ -130,6 +156,10 @@ pub struct PendingOpWorkerReport {
     pub skipped_unresolved: usize,
     /// Total Telegram methods sent successfully.
     pub sent: usize,
+    /// Total successful pending edits reflected into history.
+    pub history_updated: usize,
+    /// Total successful pending deletes reflected into history.
+    pub history_deleted: usize,
     /// Total successful operations marked done.
     pub marked_done: usize,
     /// Total operations marked failed.
@@ -155,6 +185,8 @@ impl PendingOpWorkerReport {
         self.ready += tick.ready;
         self.skipped_unresolved += tick.skipped_unresolved;
         self.sent += tick.sent;
+        self.history_updated += tick.history_updated;
+        self.history_deleted += tick.history_deleted;
         self.marked_done += tick.marked_done;
         self.marked_failed += tick.marked_failed;
         self.build_failed += tick.build_failed;
@@ -168,10 +200,25 @@ impl PendingOpWorkerReport {
 
 pub async fn process_pending_ops<S, Send, SendFuture, SendError>(
     store: &S,
+    send: Send,
+) -> PendingOpProcessReport
+where
+    S: PendingOpStore + Sync,
+    Send: FnMut(TelegramOutboundMethod) -> SendFuture,
+    SendFuture: Future<Output = Result<(), SendError>>,
+    SendError: fmt::Display,
+{
+    process_pending_ops_with_history(store, &NoopPendingOpHistory, send).await
+}
+
+pub async fn process_pending_ops_with_history<S, H, Send, SendFuture, SendError>(
+    store: &S,
+    history: &H,
     mut send: Send,
 ) -> PendingOpProcessReport
 where
     S: PendingOpStore + Sync,
+    H: PendingOpHistory,
     Send: FnMut(TelegramOutboundMethod) -> SendFuture,
     SendFuture: Future<Output = Result<(), SendError>>,
     SendError: fmt::Display,
@@ -210,6 +257,7 @@ where
         match send(method).await {
             Ok(()) => {
                 report.sent += 1;
+                record_history_side_effect(history, &op, &mut report);
                 match store.mark_op_done(op.id).await {
                     Ok(()) => report.marked_done += 1,
                     Err(_) => report.status_write_failed += 1,
@@ -223,6 +271,32 @@ where
     }
 
     report
+}
+
+fn record_history_side_effect<H>(
+    history: &H,
+    op: &ReadyPendingOp,
+    report: &mut PendingOpProcessReport,
+) where
+    H: PendingOpHistory,
+{
+    match op.op.as_str() {
+        PENDING_OP_DELETE => {
+            history.delete_message(op.chat_id, op.real_message_id);
+            report.history_deleted += 1;
+        }
+        PENDING_OP_EDIT => {
+            let payload = pending_edit_payload(&op.payload);
+            history.update_text(
+                op.chat_id,
+                op.real_message_id,
+                &payload.text,
+                &payload.parse_mode,
+            );
+            report.history_updated += 1;
+        }
+        _ => {}
+    }
 }
 
 pub async fn run_pending_op_worker_until<S, Send, SendFuture, SendError, Stop>(
@@ -280,6 +354,8 @@ fn trace_pending_op_tick(tick: &PendingOpProcessReport) {
         ready = tick.ready,
         skipped_unresolved = tick.skipped_unresolved,
         sent = tick.sent,
+        history_updated = tick.history_updated,
+        history_deleted = tick.history_deleted,
         marked_done = tick.marked_done,
         marked_failed = tick.marked_failed,
         build_failed = tick.build_failed,
@@ -351,8 +427,9 @@ mod tests {
     use openplotva_telegram::TelegramOutboundMethodKind;
 
     use super::{
-        PENDING_OP_BATCH_LIMIT, PendingOpProcessReport, PendingOpStore, PendingOpWorkerReport,
-        process_pending_ops, run_pending_op_worker_every_until,
+        PENDING_OP_BATCH_LIMIT, PendingOpHistory, PendingOpProcessReport, PendingOpStore,
+        PendingOpWorkerReport, process_pending_ops, process_pending_ops_with_history,
+        run_pending_op_worker_every_until,
     };
 
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -378,6 +455,7 @@ mod tests {
         single_calls: Vec<String>,
         done: Vec<i64>,
         failed: Vec<(i64, String)>,
+        events: Vec<String>,
     }
 
     #[derive(Clone, Default)]
@@ -395,6 +473,33 @@ mod tests {
         fn snapshot<T>(&self, inspect: impl FnOnce(&StoreState) -> T) -> T {
             let state = self.state.lock().expect("store state");
             inspect(&state)
+        }
+
+        fn history(&self) -> HistoryStub {
+            HistoryStub {
+                state: Arc::clone(&self.state),
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct HistoryStub {
+        state: Arc<Mutex<StoreState>>,
+    }
+
+    impl PendingOpHistory for HistoryStub {
+        fn update_text(&self, chat_id: i64, message_id: i32, text: &str, parse_mode: &str) {
+            self.state.lock().expect("store state").events.push(format!(
+                "history:update:{chat_id}:{message_id}:{text}:{parse_mode}"
+            ));
+        }
+
+        fn delete_message(&self, chat_id: i64, message_id: i32) {
+            self.state
+                .lock()
+                .expect("store state")
+                .events
+                .push(format!("history:delete:{chat_id}:{message_id}"));
         }
     }
 
@@ -453,6 +558,7 @@ mod tests {
             {
                 let mut state = self.state.lock().expect("store state");
                 state.done.push(id);
+                state.events.push(format!("done:{id}"));
             }
             Box::pin(async { Ok(()) })
         }
@@ -501,6 +607,8 @@ mod tests {
                 ready: 2,
                 skipped_unresolved: 1,
                 sent: 2,
+                history_updated: 1,
+                history_deleted: 1,
                 marked_done: 2,
                 ..PendingOpProcessReport::default()
             }
@@ -589,6 +697,7 @@ mod tests {
                 skipped_unresolved: 1,
                 ready: 1,
                 sent: 1,
+                history_deleted: 1,
                 marked_done: 1,
                 ..PendingOpProcessReport::default()
             }
@@ -632,6 +741,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn processor_records_history_side_effects_before_marking_done() {
+        let store = StoreStub::with_state(StoreState {
+            rows: vec![
+                pending_op(1, "v1", "edit", br#"{"text":"edited","parse_mode":"HTML"}"#),
+                pending_op(2, "v2", "delete", b""),
+            ],
+            batch_rows: vec![
+                MessageIdMapping::resolved("v1", 42, 77),
+                MessageIdMapping::resolved("v2", 42, 78),
+            ],
+            ..StoreState::default()
+        });
+        let history = store.history();
+
+        let report = process_pending_ops_with_history(&store, &history, |_| async {
+            Ok::<(), StubError>(())
+        })
+        .await;
+
+        assert_eq!(
+            report,
+            PendingOpProcessReport {
+                listed: 2,
+                mapping_ids: 2,
+                ready: 2,
+                sent: 2,
+                history_updated: 1,
+                history_deleted: 1,
+                marked_done: 2,
+                ..PendingOpProcessReport::default()
+            }
+        );
+        store.snapshot(|state| {
+            assert_eq!(
+                state.events,
+                vec![
+                    "history:update:42:77:edited:HTML",
+                    "done:1",
+                    "history:delete:42:78",
+                    "done:2",
+                ]
+            );
+        });
+    }
+
+    #[tokio::test]
     async fn worker_ticks_until_stop_and_accumulates_tick_reports() {
         let store = StoreStub::with_state(StoreState {
             rows: vec![pending_op(1, "v1", "delete", b"")],
@@ -665,6 +820,7 @@ mod tests {
                 listed: 1,
                 ready: 1,
                 sent: 1,
+                history_deleted: 1,
                 marked_done: 1,
                 ..PendingOpWorkerReport::default()
             }
