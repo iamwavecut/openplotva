@@ -11,9 +11,10 @@ mod transport;
 pub use dedup::{DEFAULT_DEBOUNCE_CACHE_SIZE, DEFAULT_DEBOUNCE_WINDOW, Debouncer, DebouncerConfig};
 pub use dispatcher::{
     DEFAULT_DISPATCHER_CLEANUP_INTERVAL, DispatcherConfig, DispatcherDrain, DispatcherMessage,
-    DispatcherQueue, DispatcherQueuedMessage, DispatcherRuntimeConfig, DispatcherSendStatus,
-    DispatcherStats, DispatcherWorkItem, DispatcherWorkerLoopOutcome, DispatcherWorkerOutcome,
-    EnqueueOutcome, QueueSnapshot, RegularDequeueOutcome, run_limiter_cleanup_until,
+    DispatcherPersistencePayload, DispatcherQueue, DispatcherQueuedMessage,
+    DispatcherRuntimeConfig, DispatcherSendStatus, DispatcherStats, DispatcherWorkItem,
+    DispatcherWorkerLoopOutcome, DispatcherWorkerOutcome, EnqueueOutcome, QueueSnapshot,
+    RegularDequeueOutcome, run_limiter_cleanup_until,
 };
 pub use html::{
     TELEGRAM_PARSE_MODE_HTML, clean_unicode_non_printables, ensure_telegram_safe_text,

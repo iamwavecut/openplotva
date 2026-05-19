@@ -72,6 +72,7 @@ pub struct DispatcherMessage {
     /// Virtual message ID used for cancellation and future real-ID mapping.
     pub virtual_id: String,
     method: Option<TelegramOutboundMethod>,
+    persistence_payload: Option<DispatcherPersistencePayload>,
 }
 
 impl DispatcherMessage {
@@ -81,6 +82,7 @@ impl DispatcherMessage {
             fingerprint,
             virtual_id: virtual_id.into(),
             method: None,
+            persistence_payload: None,
         }
     }
 
@@ -88,6 +90,37 @@ impl DispatcherMessage {
     pub fn with_method(mut self, method: TelegramOutboundMethod) -> Self {
         self.method = Some(method);
         self
+    }
+
+    pub fn with_persistence_payload(mut self, payload: DispatcherPersistencePayload) -> Self {
+        self.persistence_payload = Some(payload);
+        self
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DispatcherPersistencePayload {
+    /// Go message config type string used by the queue loader.
+    pub message_type: String,
+    /// JSON-encoded Telegram message/method payload.
+    pub message: Vec<u8>,
+}
+
+impl DispatcherPersistencePayload {
+    /// Build a persistence payload from raw JSON bytes.
+    pub fn new(message_type: impl Into<String>, message: impl Into<Vec<u8>>) -> Self {
+        Self {
+            message_type: message_type.into(),
+            message: message.into(),
+        }
+    }
+
+    /// Build a persistence payload from a JSON value.
+    pub fn from_json_value(
+        message_type: impl Into<String>,
+        value: serde_json::Value,
+    ) -> Result<Self, serde_json::Error> {
+        Ok(Self::new(message_type, serde_json::to_vec(&value)?))
     }
 }
 
@@ -167,6 +200,7 @@ pub struct DispatcherQueuedMessage {
 pub struct DispatcherWorkItem {
     metadata: DispatcherQueuedMessage,
     method: Option<TelegramOutboundMethod>,
+    persistence_payload: Option<DispatcherPersistencePayload>,
 }
 
 impl DispatcherWorkItem {
@@ -187,6 +221,17 @@ impl DispatcherWorkItem {
     /// Consume the worker item and return both metadata and the concrete payload.
     pub fn into_parts(self) -> (DispatcherQueuedMessage, Option<TelegramOutboundMethod>) {
         (self.metadata, self.method)
+    }
+
+    /// Consume the worker item and return metadata, payload, and persistence payload.
+    pub fn into_persistence_parts(
+        self,
+    ) -> (
+        DispatcherQueuedMessage,
+        Option<TelegramOutboundMethod>,
+        Option<DispatcherPersistencePayload>,
+    ) {
+        (self.metadata, self.method, self.persistence_payload)
     }
 }
 
@@ -257,6 +302,7 @@ struct DispatcherQueueState {
 struct DispatcherQueueItem {
     metadata: DispatcherQueuedMessage,
     method: Option<TelegramOutboundMethod>,
+    persistence_payload: Option<DispatcherPersistencePayload>,
 }
 
 impl DispatcherQueueItem {
@@ -264,6 +310,7 @@ impl DispatcherQueueItem {
         DispatcherWorkItem {
             metadata: self.metadata,
             method: self.method,
+            persistence_payload: self.persistence_payload,
         }
     }
 }
@@ -546,6 +593,7 @@ impl DispatcherQueue {
         self.state().regular.push_front(DispatcherQueueItem {
             metadata: message.metadata,
             method: message.method,
+            persistence_payload: message.persistence_payload,
         });
         self.regular_notify.notify_one();
     }
@@ -605,6 +653,7 @@ impl DispatcherQueue {
             fingerprint,
             virtual_id,
             method,
+            persistence_payload,
         } = message;
 
         if !immediate && !self.debouncer.should_process_at(&fingerprint, now) {
@@ -622,6 +671,7 @@ impl DispatcherQueue {
                 enqueued_at: SystemTime::now(),
             },
             method,
+            persistence_payload,
         };
 
         {

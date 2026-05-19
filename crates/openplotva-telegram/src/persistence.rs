@@ -54,18 +54,23 @@ impl PersistentDispatcherItem {
     fn from_work_item(
         item: DispatcherWorkItem,
     ) -> Result<Option<Self>, DispatcherPersistenceError> {
-        let (metadata, method) = item.into_parts();
+        let (metadata, method, persistence_payload) = item.into_persistence_parts();
         let Some(method) = method else {
             return Ok(None);
         };
         let method_kind = method.kind();
-        let Some(message) = serialize_outbound_method(&method)? else {
-            return Ok(None);
+        let (message_type, message) = if let Some(payload) = persistence_payload {
+            (payload.message_type, payload.message)
+        } else {
+            let Some(message) = serialize_outbound_method(&method)? else {
+                return Ok(None);
+            };
+            (go_message_type(method_kind).to_owned(), message)
         };
 
         Ok(Some(Self {
             message,
-            message_type: go_message_type(method_kind).to_owned(),
+            message_type,
             immediate: metadata.immediate,
             enqueued_at: format_system_time(metadata.enqueued_at)?,
             fingerprint: metadata.fingerprint_key,
@@ -196,9 +201,9 @@ mod tests {
 
     use crate::{
         DEFAULT_DISPATCHER_QUEUE_KEY, DEFAULT_DISPATCHER_SHUTDOWN_TIMEOUT, DispatcherConfig,
-        DispatcherMessage, DispatcherQueue, MESSAGE_TYPE_TEXT, MessageFingerprint,
-        PersistentDispatcherItem, TelegramOutboundMethod, TelegramOutboundMethodKind, hash_content,
-        persistent_queue_from_drain,
+        DispatcherMessage, DispatcherPersistencePayload, DispatcherQueue, MESSAGE_TYPE_TEXT,
+        MessageFingerprint, PersistentDispatcherItem, TelegramOutboundMethod,
+        TelegramOutboundMethodKind, hash_content, persistent_queue_from_drain,
     };
 
     fn text_message(chat_id: i64, text: &str, virtual_id: &str) -> DispatcherMessage {
@@ -215,6 +220,13 @@ mod tests {
 
     fn text_method(chat_id: i64, text: &str) -> TelegramOutboundMethod {
         TelegramOutboundMethod::from(carapax::types::SendMessage::new(chat_id, text))
+    }
+
+    fn sticker_method(chat_id: i64, file_id: &str) -> TelegramOutboundMethod {
+        TelegramOutboundMethod::from(carapax::types::SendSticker::new(
+            chat_id,
+            carapax::types::InputFile::file_id(file_id),
+        ))
     }
 
     #[test]
@@ -313,6 +325,49 @@ mod tests {
         assert_eq!(
             persisted.items[0].method_kind(),
             Some(TelegramOutboundMethodKind::SendMessage)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_persistence_payload_keeps_form_backed_methods()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let queue = DispatcherQueue::new(DispatcherConfig::default());
+        queue.enqueue(
+            text_message(42, "sticker", "sticker-1")
+                .with_method(sticker_method(42, "sticker-file-id"))
+                .with_persistence_payload(DispatcherPersistencePayload::from_json_value(
+                    "*api.StickerConfig",
+                    json!({
+                        "chat_id": 42,
+                        "sticker": "sticker-file-id",
+                        "disable_notification": true,
+                        "reply_parameters": {
+                            "message_id": 7,
+                            "chat_id": 42,
+                            "allow_sending_without_reply": true
+                        }
+                    }),
+                )?),
+            false,
+        );
+
+        let persisted = persistent_queue_from_drain(queue.drain_for_shutdown(), 100)?;
+
+        assert_eq!(persisted.skipped, 0);
+        assert_eq!(persisted.items.len(), 1);
+        assert_eq!(persisted.items[0].message_type, "*api.StickerConfig");
+        assert_eq!(
+            persisted.items[0].method_kind(),
+            Some(TelegramOutboundMethodKind::SendSticker)
+        );
+        let payload: Value = serde_json::from_slice(&persisted.items[0].message)?;
+        assert_eq!(payload["chat_id"], json!(42));
+        assert_eq!(payload["sticker"], json!("sticker-file-id"));
+        assert_eq!(payload["disable_notification"], json!(true));
+        assert_eq!(
+            payload["reply_parameters"]["allow_sending_without_reply"],
+            json!(true)
         );
         Ok(())
     }
