@@ -735,8 +735,7 @@ impl DispatcherQueue {
             persistence_payload,
         } = message;
 
-        if !immediate && !self.debouncer.should_process_at(&fingerprint, now) {
-            self.state().deduped_total += 1;
+        if !self.debouncer.should_process_at(&fingerprint, now) {
             return EnqueueOutcome::Deduped;
         }
 
@@ -759,9 +758,6 @@ impl DispatcherQueue {
 
         self.push_queue_item(queued);
 
-        if !immediate {
-            self.debouncer.record_sent_at(&fingerprint, now);
-        }
         EnqueueOutcome::Enqueued
     }
 
@@ -989,9 +985,9 @@ mod tests {
 
     use super::{
         DEFAULT_DISPATCHER_CLEANUP_INTERVAL, DispatcherConfig, DispatcherMessage, DispatcherQueue,
-        DispatcherRuntimeConfig, DispatcherSendStatus, DispatcherWorkerLoopOutcome,
-        DispatcherWorkerOutcome, EnqueueOutcome, QueueSnapshot, RegularDequeueOutcome,
-        run_limiter_cleanup_until,
+        DispatcherRestoredMessage, DispatcherRuntimeConfig, DispatcherSendStatus,
+        DispatcherWorkerLoopOutcome, DispatcherWorkerOutcome, EnqueueOutcome, QueueSnapshot,
+        RegularDequeueOutcome, run_limiter_cleanup_until,
     };
     use crate::{
         ChatLimiters, DebouncerConfig, MESSAGE_TYPE_TEXT, MessageFingerprint,
@@ -1012,6 +1008,29 @@ mod tests {
 
     fn text_method(chat_id: i64, text: &str) -> TelegramOutboundMethod {
         TelegramOutboundMethod::from(carapax::types::SendMessage::new(chat_id, text))
+    }
+
+    fn restored_text(
+        chat_id: i64,
+        text: &str,
+        virtual_id: &str,
+        immediate: bool,
+    ) -> DispatcherRestoredMessage {
+        let fingerprint = MessageFingerprint {
+            chat_id,
+            message_type: MESSAGE_TYPE_TEXT.to_owned(),
+            content_hash: hash_content(text),
+            debounce_key: None,
+        };
+        DispatcherRestoredMessage {
+            fingerprint: fingerprint.clone(),
+            fingerprint_key: fingerprint.to_string(),
+            virtual_id: virtual_id.to_owned(),
+            immediate,
+            enqueued_at: std::time::SystemTime::now(),
+            method: text_method(chat_id, text),
+            persistence_payload: None,
+        }
     }
 
     fn virtual_ids(snapshot: QueueSnapshot) -> (Vec<String>, Vec<String>) {
@@ -1816,6 +1835,72 @@ mod tests {
         assert_eq!(
             virtual_ids(queue.snapshot()),
             (vec!["regular-1".to_owned()], vec!["immediate-1".to_owned()])
+        );
+    }
+
+    #[test]
+    fn restore_checks_existing_debouncer_for_immediate_items_like_go_start() {
+        let queue = DispatcherQueue::new(DispatcherConfig {
+            max_queue_size: 0,
+            dedupe_config: DebouncerConfig {
+                enabled: true,
+                default_window: Duration::from_secs(30),
+                max_cache_size: 1000,
+                per_chat_settings: HashMap::new(),
+            },
+        });
+        let now = std::time::Instant::now();
+
+        assert_eq!(
+            queue.enqueue_at(text_message(42, "same", "regular-1"), false, now),
+            EnqueueOutcome::Enqueued
+        );
+        assert_eq!(
+            queue.restore(restored_text(42, "same", "immediate-2", true)),
+            EnqueueOutcome::Deduped
+        );
+
+        let stats = queue.stats();
+        assert_eq!(stats.regular_queue_size, 1);
+        assert_eq!(stats.immediate_queue_size, 0);
+        assert_eq!(stats.deduped_total, 1);
+        assert_eq!(
+            virtual_ids(queue.snapshot()),
+            (vec!["regular-1".to_owned()], Vec::new())
+        );
+    }
+
+    #[test]
+    fn restore_does_not_record_loaded_items_into_debouncer_like_go_start() {
+        let queue = DispatcherQueue::new(DispatcherConfig {
+            max_queue_size: 0,
+            dedupe_config: DebouncerConfig {
+                enabled: true,
+                default_window: Duration::from_secs(30),
+                max_cache_size: 1000,
+                per_chat_settings: HashMap::new(),
+            },
+        });
+
+        assert_eq!(
+            queue.restore(restored_text(42, "same", "regular-1", false)),
+            EnqueueOutcome::Enqueued
+        );
+        assert_eq!(
+            queue.restore(restored_text(42, "same", "regular-2", false)),
+            EnqueueOutcome::Enqueued
+        );
+
+        let stats = queue.stats();
+        assert_eq!(stats.regular_queue_size, 2);
+        assert_eq!(stats.immediate_queue_size, 0);
+        assert_eq!(stats.deduped_total, 0);
+        assert_eq!(
+            virtual_ids(queue.snapshot()),
+            (
+                vec!["regular-1".to_owned(), "regular-2".to_owned()],
+                Vec::new()
+            )
         );
     }
 
