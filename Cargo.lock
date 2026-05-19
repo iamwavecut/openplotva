@@ -1618,6 +1618,7 @@ dependencies = [
  "crc",
  "html5ever",
  "openplotva-core",
+ "openplotva-updates",
  "redis",
  "serde",
  "serde_json",

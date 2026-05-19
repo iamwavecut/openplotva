@@ -8,6 +8,7 @@ mod pending_ops;
 mod persistence;
 mod rate_limit;
 mod transport;
+mod update_startup;
 
 pub use dedup::{DEFAULT_DEBOUNCE_CACHE_SIZE, DEFAULT_DEBOUNCE_WINDOW, Debouncer, DebouncerConfig};
 pub use dispatcher::{
@@ -54,6 +55,10 @@ pub use transport::{
     TelegramOutboundMethod, TelegramOutboundMethodKind, TelegramOutboundResponse,
     TelegramOutboundResponseKind, execute_telegram_method, send_telegram_method_status,
 };
+pub use update_startup::{
+    GO_LONG_POLL_TIMEOUT, TELEGRAM_WEBHOOK_PATH, WebhookSetup, build_delete_webhook_method,
+    build_get_updates_method, build_set_webhook_method, go_allowed_update_set,
+};
 
 pub const INTEGRATION_CRATE: &str = "carapax";
 
@@ -77,6 +82,15 @@ pub type DeleteBotCommands = carapax::types::DeleteBotCommands;
 
 /// Telegram method that sets configured bot commands.
 pub type SetBotCommands = carapax::types::SetBotCommands;
+
+/// Telegram getUpdates method from `carapax`.
+pub type GetUpdates = carapax::types::GetUpdates;
+
+/// Telegram setWebhook method from `carapax`.
+pub type SetWebhook = carapax::types::SetWebhook;
+
+/// Telegram deleteWebhook method from `carapax`.
+pub type DeleteWebhook = carapax::types::DeleteWebhook;
 
 /// Error returned by `carapax` when a Bot API command is invalid.
 pub type BotCommandError = carapax::types::BotCommandError;
