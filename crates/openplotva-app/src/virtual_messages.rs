@@ -1,11 +1,14 @@
-//! Composition-root virtual-message edit/delete behavior.
+//! Composition-root virtual-message send/edit/delete behavior.
 
 use std::{fmt, future::Future, pin::Pin};
 
 use openplotva_core::{MessageIdMapping, ReadyPendingOp};
 use openplotva_telegram::{
-    PENDING_OP_DELETE, PENDING_OP_EDIT, PendingOpBuildError, TelegramOutboundMethod,
-    build_pending_op_method,
+    DispatcherMessage, DispatcherQueue, DispatcherSendStatus, DispatcherWorkItem, EnqueueOutcome,
+    OutboundBuildError, PENDING_OP_DELETE, PENDING_OP_EDIT, PendingOpBuildError, ReplyMessageRef,
+    TELEGRAM_TEXT_MAX_BYTES, TelegramOutboundMethod, TelegramOutboundResponse, TextMessageRequest,
+    build_pending_op_method, build_text_message_method, fingerprint_text_message_part,
+    forum_thread_id, message_target_chat, split_telegram_text, validate_text_message_text,
 };
 use serde_json::json;
 use thiserror::Error;
@@ -14,7 +17,7 @@ use crate::pending_ops::PendingOpHistory;
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// Storage operations used by Go's virtual edit/delete paths.
+/// Storage operations used by Go's virtual send/edit/delete paths.
 pub trait VirtualMessageStore {
     /// Store error type.
     type Error: fmt::Display + Send + Sync + 'static;
@@ -24,6 +27,21 @@ pub trait VirtualMessageStore {
         &'a self,
         vmsg_id: String,
     ) -> BoxFuture<'a, Result<Option<MessageIdMapping>, Self::Error>>;
+
+    /// Insert an unresolved virtual-message mapping before queueing a send.
+    fn insert_virtual_message<'a>(
+        &'a self,
+        vmsg_id: String,
+        chat_id: i64,
+        thread_id: Option<i32>,
+    ) -> BoxFuture<'a, Result<(), Self::Error>>;
+
+    /// Resolve a virtual message to the real Telegram message ID after send success.
+    fn resolve_virtual_message<'a>(
+        &'a self,
+        vmsg_id: String,
+        real_message_id: i32,
+    ) -> BoxFuture<'a, Result<(), Self::Error>>;
 
     /// Enqueue a pending virtual-message operation.
     fn enqueue_message_op<'a>(
@@ -49,6 +67,29 @@ impl VirtualMessageStore for openplotva_storage::PostgresVirtualMessageStore {
         vmsg_id: String,
     ) -> BoxFuture<'a, Result<Option<MessageIdMapping>, Self::Error>> {
         Box::pin(async move { self.get_mapping_by_virtual(&vmsg_id).await })
+    }
+
+    fn insert_virtual_message<'a>(
+        &'a self,
+        vmsg_id: String,
+        chat_id: i64,
+        thread_id: Option<i32>,
+    ) -> BoxFuture<'a, Result<(), Self::Error>> {
+        Box::pin(async move {
+            self.insert_virtual_message(&vmsg_id, chat_id, thread_id)
+                .await
+        })
+    }
+
+    fn resolve_virtual_message<'a>(
+        &'a self,
+        vmsg_id: String,
+        real_message_id: i32,
+    ) -> BoxFuture<'a, Result<(), Self::Error>> {
+        Box::pin(async move {
+            self.resolve_virtual_message(&vmsg_id, real_message_id, None)
+                .await
+        })
     }
 
     fn enqueue_message_op<'a>(
@@ -162,6 +203,71 @@ pub struct VirtualDeleteRequest<'a> {
     pub vmsg_id: &'a str,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct QueueTextRequest<'a> {
+    /// Telegram text request fields.
+    pub message: &'a TextMessageRequest,
+    /// Optional replied-to message fields.
+    pub reply_to: Option<&'a ReplyMessageRef>,
+    /// Whether Go would enqueue the first split part in the immediate queue.
+    pub immediate_first: bool,
+}
+
+/// One queued text part and its virtual-message bookkeeping.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueuedTextPartReport {
+    /// Zero-based split part index.
+    pub index: usize,
+    /// Virtual message ID generated before queueing.
+    pub virtual_id: String,
+    pub enqueue_outcome: EnqueueOutcome,
+    /// Whether this part went to the immediate queue.
+    pub immediate: bool,
+    /// Storage error ignored by Go when inserting the virtual ID row.
+    pub insert_error: Option<String>,
+}
+
+/// Summary of queueing one Go `SendText` request.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct QueueTextReport {
+    /// Split text parts that were queued or deduped.
+    pub parts: Vec<QueuedTextPartReport>,
+}
+
+impl QueueTextReport {
+    /// Number of split parts accepted into a dispatcher queue.
+    pub fn enqueued_count(&self) -> usize {
+        self.parts
+            .iter()
+            .filter(|part| part.enqueue_outcome == EnqueueOutcome::Enqueued)
+            .count()
+    }
+
+    /// Number of split parts suppressed by dispatcher deduplication.
+    pub fn deduped_count(&self) -> usize {
+        self.parts
+            .iter()
+            .filter(|part| part.enqueue_outcome == EnqueueOutcome::Deduped)
+            .count()
+    }
+}
+
+/// Report from sending one dispatcher work item and applying Go post-send mapping resolution.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DispatchResolveReport {
+    pub status: DispatcherSendStatus,
+    /// Virtual message ID carried by the dispatcher item.
+    pub virtual_id: String,
+    /// Real Telegram message ID extracted from a successful send response.
+    pub resolved_message_id: Option<i32>,
+    /// Whether the dispatcher item had no Telegram method payload to send.
+    pub missing_method: bool,
+    /// Telegram send error returned by the transport callback.
+    pub send_error: Option<String>,
+    /// Mapping-resolution error ignored by Go after send success.
+    pub resolve_error: Option<String>,
+}
+
 /// Recoverable errors from immediate virtual-message handling.
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum VirtualMessageError {
@@ -174,6 +280,122 @@ pub enum VirtualMessageError {
     /// Telegram rejected the immediate operation.
     #[error("Telegram send failed: {0}")]
     Send(String),
+}
+
+/// Queue text parts like Go `SendText`, creating virtual-message rows before dispatcher enqueue.
+pub async fn queue_text_message_parts<S, NextId>(
+    store: &S,
+    queue: &DispatcherQueue,
+    req: QueueTextRequest<'_>,
+    mut next_virtual_id: NextId,
+) -> Result<QueueTextReport, OutboundBuildError>
+where
+    S: VirtualMessageStore + Sync,
+    NextId: FnMut() -> String,
+{
+    validate_text_message_text(&req.message.text, &req.message.render_as)?;
+    let chat = message_target_chat(req.message.chat.as_ref(), req.reply_to)?;
+    let parts = split_telegram_text(
+        &req.message.text,
+        &req.message.render_as,
+        TELEGRAM_TEXT_MAX_BYTES,
+    );
+    if parts.is_empty() {
+        return Err(OutboundBuildError::NoParts);
+    }
+
+    let mut report = QueueTextReport::default();
+    let total_parts = parts.len();
+    for (index, part) in parts.into_iter().enumerate() {
+        let virtual_id = next_virtual_id();
+        let thread_id = forum_thread_id(chat, req.message.message_thread_id).map(|id| id as i32);
+        let insert_error = store
+            .insert_virtual_message(virtual_id.clone(), chat.id, thread_id)
+            .await
+            .err()
+            .map(|error| error.to_string());
+        let method = build_text_message_method(
+            req.message,
+            chat,
+            req.reply_to,
+            part.clone(),
+            index + 1 == total_parts,
+        )?;
+        let dispatcher_message =
+            DispatcherMessage::new(fingerprint_text_message_part(chat.id, &part), &virtual_id)
+                .with_method(TelegramOutboundMethod::from(method));
+        let immediate = req.immediate_first && index == 0;
+        let enqueue_outcome = queue.enqueue(dispatcher_message, immediate);
+        report.parts.push(QueuedTextPartReport {
+            index,
+            virtual_id,
+            enqueue_outcome,
+            immediate,
+            insert_error,
+        });
+    }
+
+    Ok(report)
+}
+
+/// Send one dispatcher item and resolve its virtual-message mapping from the Telegram response.
+pub async fn send_work_item_and_resolve<S, Send, SendFuture, SendError>(
+    store: &S,
+    item: DispatcherWorkItem,
+    send: Send,
+) -> DispatchResolveReport
+where
+    S: VirtualMessageStore + Sync,
+    Send: FnOnce(TelegramOutboundMethod) -> SendFuture,
+    SendFuture: Future<Output = Result<TelegramOutboundResponse, SendError>>,
+    SendError: fmt::Display,
+{
+    let (metadata, method) = item.into_parts();
+    let Some(method) = method else {
+        return DispatchResolveReport {
+            status: DispatcherSendStatus::Failed,
+            virtual_id: metadata.virtual_id,
+            resolved_message_id: None,
+            missing_method: true,
+            send_error: None,
+            resolve_error: None,
+        };
+    };
+
+    let response = match send(method).await {
+        Ok(response) => response,
+        Err(error) => {
+            return DispatchResolveReport {
+                status: DispatcherSendStatus::Failed,
+                virtual_id: metadata.virtual_id,
+                resolved_message_id: None,
+                missing_method: false,
+                send_error: Some(error.to_string()),
+                resolve_error: None,
+            };
+        }
+    };
+
+    let mut report = DispatchResolveReport {
+        status: DispatcherSendStatus::Sent,
+        virtual_id: metadata.virtual_id,
+        resolved_message_id: response_message_id(&response),
+        missing_method: false,
+        send_error: None,
+        resolve_error: None,
+    };
+
+    if !report.virtual_id.is_empty()
+        && let Some(message_id) = report.resolved_message_id
+    {
+        report.resolve_error = store
+            .resolve_virtual_message(report.virtual_id.clone(), message_id)
+            .await
+            .err()
+            .map(|error| error.to_string());
+    }
+
+    report
 }
 
 pub async fn edit_text_virtual<S, H, Send, SendFuture, SendError, Cancel>(
@@ -291,6 +513,15 @@ fn resolved_message_id<E>(mapping: &Result<Option<MessageIdMapping>, E>) -> Opti
         .and_then(|mapping| mapping.real_message_id)
 }
 
+fn response_message_id(response: &TelegramOutboundResponse) -> Option<i32> {
+    let raw = match response {
+        TelegramOutboundResponse::Message(message) => Some(message.id),
+        TelegramOutboundResponse::Messages(messages) => messages.first().map(|message| message.id),
+        TelegramOutboundResponse::EditMessage(_) | TelegramOutboundResponse::Boolean(_) => None,
+    }?;
+    i32::try_from(raw).ok()
+}
+
 async fn queue_virtual_message_op<S, Cancel>(
     store: &S,
     vmsg_id: &str,
@@ -373,15 +604,21 @@ mod tests {
     };
 
     use openplotva_core::MessageIdMapping;
-    use openplotva_telegram::{TelegramOutboundMethod, TelegramOutboundMethodKind};
+    use openplotva_telegram::{
+        ChatRef, DispatcherConfig, DispatcherMessage, DispatcherQueue, DispatcherSendStatus,
+        EnqueueOutcome, TelegramMessage, TelegramOutboundMethod, TelegramOutboundMethodKind,
+        TelegramOutboundResponse, TextMessageRequest, build_text_message_method,
+        fingerprint_text_message_part,
+    };
     use serde_json::json;
 
     use crate::pending_ops::PendingOpHistory;
 
     use super::{
-        PENDING_OP_DELETE, PENDING_OP_EDIT, VirtualDeleteRequest, VirtualEditRequest,
-        VirtualMessageAction, VirtualMessageError, VirtualMessageReport, VirtualMessageStore,
-        delete_message_virtual, edit_text_virtual,
+        PENDING_OP_DELETE, PENDING_OP_EDIT, QueueTextRequest, VirtualDeleteRequest,
+        VirtualEditRequest, VirtualMessageAction, VirtualMessageError, VirtualMessageReport,
+        VirtualMessageStore, delete_message_virtual, edit_text_virtual, queue_text_message_parts,
+        send_work_item_and_resolve,
     };
 
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -399,9 +636,13 @@ mod tests {
     struct StoreState {
         mapping: Option<MessageIdMapping>,
         lookup_error: Option<StubError>,
+        insert_error: Option<StubError>,
         enqueue_error: Option<StubError>,
+        resolve_error: Option<StubError>,
         delete_mapping_error: Option<StubError>,
         lookup_calls: Vec<String>,
+        inserted: Vec<(String, i64, Option<i32>)>,
+        resolved: Vec<(String, i32)>,
         enqueued: Vec<(String, i64, &'static str, Option<String>)>,
         deleted_mappings: Vec<String>,
         events: Vec<String>,
@@ -471,6 +712,41 @@ mod tests {
             Box::pin(async move { result })
         }
 
+        fn insert_virtual_message<'a>(
+            &'a self,
+            vmsg_id: String,
+            chat_id: i64,
+            thread_id: Option<i32>,
+        ) -> super::BoxFuture<'a, Result<(), Self::Error>> {
+            let result = {
+                let mut state = self.state.lock().expect("store state");
+                state.inserted.push((vmsg_id, chat_id, thread_id));
+                if let Some(error) = &state.insert_error {
+                    Err(error.clone())
+                } else {
+                    Ok(())
+                }
+            };
+            Box::pin(async move { result })
+        }
+
+        fn resolve_virtual_message<'a>(
+            &'a self,
+            vmsg_id: String,
+            real_message_id: i32,
+        ) -> super::BoxFuture<'a, Result<(), Self::Error>> {
+            let result = {
+                let mut state = self.state.lock().expect("store state");
+                state.resolved.push((vmsg_id, real_message_id));
+                if let Some(error) = &state.resolve_error {
+                    Err(error.clone())
+                } else {
+                    Ok(())
+                }
+            };
+            Box::pin(async move { result })
+        }
+
         fn enqueue_message_op<'a>(
             &'a self,
             vmsg_id: String,
@@ -505,6 +781,152 @@ mod tests {
             };
             Box::pin(async move { result })
         }
+    }
+
+    #[tokio::test]
+    async fn queue_text_message_parts_inserts_virtual_ids_before_dispatch_enqueue()
+    -> Result<(), Box<dyn Error>> {
+        let store = StoreStub::default();
+        let queue = DispatcherQueue::new(DispatcherConfig::default());
+        let text = format!("{}b", "a".repeat(4096));
+        let request = text_request(&text);
+        let mut ids = ["v1".to_owned(), "v2".to_owned()].into_iter();
+
+        let report = queue_text_message_parts(
+            &store,
+            &queue,
+            QueueTextRequest {
+                message: &request,
+                reply_to: None,
+                immediate_first: true,
+            },
+            || ids.next().expect("virtual id"),
+        )
+        .await?;
+
+        assert_eq!(report.enqueued_count(), 2);
+        assert_eq!(report.deduped_count(), 0);
+        assert_eq!(report.parts.len(), 2);
+        assert_eq!(report.parts[0].virtual_id, "v1");
+        assert!(report.parts[0].immediate);
+        assert_eq!(report.parts[1].virtual_id, "v2");
+        assert!(!report.parts[1].immediate);
+        store.snapshot(|state| {
+            assert_eq!(
+                state.inserted,
+                vec![("v1".to_owned(), 42, None), ("v2".to_owned(), 42, None)]
+            );
+        });
+        let snapshot = queue.snapshot();
+        assert_eq!(snapshot.immediate.len(), 1);
+        assert_eq!(snapshot.immediate[0].virtual_id, "v1");
+        assert_eq!(snapshot.regular.len(), 1);
+        assert_eq!(snapshot.regular[0].virtual_id, "v2");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn queue_text_message_parts_reports_insert_errors_but_still_queues()
+    -> Result<(), Box<dyn Error>> {
+        let store = StoreStub::with_state(StoreState {
+            insert_error: Some(StubError("insert failed")),
+            ..StoreState::default()
+        });
+        let queue = DispatcherQueue::new(DispatcherConfig::default());
+        let request = text_request("hello");
+
+        let report = queue_text_message_parts(
+            &store,
+            &queue,
+            QueueTextRequest {
+                message: &request,
+                reply_to: None,
+                immediate_first: false,
+            },
+            || "v1".to_owned(),
+        )
+        .await?;
+
+        assert_eq!(report.enqueued_count(), 1);
+        assert_eq!(
+            report.parts[0].insert_error,
+            Some("insert failed".to_owned())
+        );
+        assert_eq!(queue.snapshot().regular[0].virtual_id, "v1");
+        store.snapshot(|state| {
+            assert_eq!(state.inserted, vec![("v1".to_owned(), 42, None)]);
+        });
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn send_work_item_and_resolve_records_mapping_from_successful_message_response()
+    -> Result<(), Box<dyn Error>> {
+        let store = StoreStub::default();
+        let item = queued_text_item("v1");
+
+        let report = send_work_item_and_resolve(&store, item, |_| async {
+            Ok::<_, StubError>(TelegramOutboundResponse::Message(Box::new(
+                telegram_message(42, 77),
+            )))
+        })
+        .await;
+
+        assert_eq!(report.status, DispatcherSendStatus::Sent);
+        assert_eq!(report.virtual_id, "v1");
+        assert_eq!(report.resolved_message_id, Some(77));
+        assert_eq!(report.resolve_error, None);
+        store.snapshot(|state| {
+            assert_eq!(state.resolved, vec![("v1".to_owned(), 77)]);
+        });
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn send_work_item_and_resolve_keeps_send_success_when_mapping_resolution_fails()
+    -> Result<(), Box<dyn Error>> {
+        let store = StoreStub::with_state(StoreState {
+            resolve_error: Some(StubError("resolve failed")),
+            ..StoreState::default()
+        });
+        let item = queued_text_item("v1");
+
+        let report = send_work_item_and_resolve(&store, item, |_| async {
+            Ok::<_, StubError>(TelegramOutboundResponse::Message(Box::new(
+                telegram_message(42, 77),
+            )))
+        })
+        .await;
+
+        assert_eq!(report.status, DispatcherSendStatus::Sent);
+        assert_eq!(report.resolved_message_id, Some(77));
+        assert_eq!(report.resolve_error, Some("resolve failed".to_owned()));
+        store.snapshot(|state| {
+            assert_eq!(state.resolved, vec![("v1".to_owned(), 77)]);
+        });
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn send_work_item_and_resolve_does_not_resolve_after_send_failure() {
+        let store = StoreStub::default();
+        let item = queued_text_item("v1");
+
+        let report = send_work_item_and_resolve(&store, item, |_| async {
+            Err::<TelegramOutboundResponse, _>(StubError("telegram failed"))
+        })
+        .await;
+
+        assert_eq!(report.status, DispatcherSendStatus::Failed);
+        assert_eq!(report.send_error, Some("telegram failed".to_owned()));
+        assert_eq!(report.resolved_message_id, None);
+        store.snapshot(|state| {
+            assert!(state.resolved.is_empty());
+        });
     }
 
     #[tokio::test]
@@ -839,5 +1261,62 @@ mod tests {
             other => panic!("unexpected method kind: {:?}", other.kind()),
         };
         (kind, payload)
+    }
+
+    fn text_request(text: &str) -> TextMessageRequest {
+        TextMessageRequest {
+            chat: Some(ChatRef {
+                id: 42,
+                is_forum: false,
+            }),
+            message_thread_id: 0,
+            disable_notification: false,
+            allow_sending_without_reply: None,
+            text: text.to_owned(),
+            render_as: String::new(),
+            reply_markup: None,
+        }
+    }
+
+    fn queued_text_item(virtual_id: &str) -> openplotva_telegram::DispatcherWorkItem {
+        let queue = DispatcherQueue::new(DispatcherConfig::default());
+        let method = build_text_message_method(
+            &text_request("hello"),
+            ChatRef {
+                id: 42,
+                is_forum: false,
+            },
+            None,
+            "hello",
+            true,
+        )
+        .expect("text method");
+        assert_eq!(
+            queue.enqueue(
+                DispatcherMessage::new(fingerprint_text_message_part(42, "hello"), virtual_id)
+                    .with_method(TelegramOutboundMethod::from(method)),
+                false,
+            ),
+            EnqueueOutcome::Enqueued
+        );
+        queue.dequeue_regular().expect("queued work item")
+    }
+
+    fn telegram_message(chat_id: i64, message_id: i64) -> TelegramMessage {
+        serde_json::from_value(json!({
+            "message_id": message_id,
+            "date": 0,
+            "chat": {
+                "type": "private",
+                "id": chat_id,
+                "first_name": "Plotva",
+            },
+            "from": {
+                "id": 1,
+                "is_bot": true,
+                "first_name": "Plotva",
+            },
+        }))
+        .expect("telegram message")
     }
 }

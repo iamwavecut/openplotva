@@ -34,8 +34,9 @@ pub use outbound::{
     build_media_group_message_method, build_media_group_message_plan, build_photo_message_method,
     build_photo_message_plan, build_sticker_message_method, build_sticker_message_plan,
     build_text_message_method, build_text_message_methods, fingerprint_audio_message_plan,
-    fingerprint_photo_message_plan, fingerprint_sticker_message_plan, forum_thread_id,
-    hash_content, message_target_chat, parse_mode_from_go, validate_text_message_text,
+    fingerprint_photo_message_plan, fingerprint_sticker_message_plan,
+    fingerprint_text_message_part, forum_thread_id, hash_content, message_target_chat,
+    parse_mode_from_go, validate_text_message_text,
 };
 pub use pending_ops::{
     PENDING_OP_DELETE, PENDING_OP_EDIT, PendingOpBuildError, build_pending_op_method,
@@ -136,6 +137,9 @@ pub type InputMedia = carapax::types::InputMedia;
 
 /// Telegram Bot API client from `carapax`.
 pub type TelegramClient = carapax::api::Client;
+
+/// Telegram message type returned by outbound send methods.
+pub type TelegramMessage = carapax::types::Message;
 
 /// Telegram Bot API client construction error from `carapax`.
 pub type TelegramClientError = carapax::api::ClientError;

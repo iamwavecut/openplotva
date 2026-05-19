@@ -574,6 +574,11 @@ pub fn hash_content(content: &str) -> u32 {
     CRC32_CASTAGNOLI.checksum(content.as_bytes())
 }
 
+/// Build the Go-equivalent fingerprint for one outbound text message part.
+pub fn fingerprint_text_message_part(chat_id: i64, part: &str) -> MessageFingerprint {
+    message_fingerprint(chat_id, MESSAGE_TYPE_TEXT, hash_content(part))
+}
+
 /// Build the Go-equivalent fingerprint for a sticker send plan.
 pub fn fingerprint_sticker_message_plan(plan: &StickerMessagePlan) -> MessageFingerprint {
     message_fingerprint(
@@ -1130,8 +1135,8 @@ mod tests {
         build_photo_message_method, build_photo_message_plan, build_sticker_message_method,
         build_sticker_message_plan, build_text_message_method, build_text_message_methods,
         fingerprint_audio_message_plan, fingerprint_photo_message_plan,
-        fingerprint_sticker_message_plan, forum_thread_id, hash_content, message_target_chat,
-        validate_text_message_text,
+        fingerprint_sticker_message_plan, fingerprint_text_message_part, forum_thread_id,
+        hash_content, message_target_chat, validate_text_message_text,
     };
     use crate::{
         InlineKeyboardButton, InlineKeyboardMarkup, ReplyMarkup, TELEGRAM_PARSE_MODE_HTML,
@@ -1229,6 +1234,16 @@ mod tests {
     fn hash_content_matches_go_castagnoli_crc32() {
         assert_eq!(hash_content("same outbound payload"), 0x32c39d97);
         assert_eq!(hash_content(""), 0);
+    }
+
+    #[test]
+    fn fingerprint_text_part_hashes_split_part_like_go_message_config() {
+        let fingerprint = fingerprint_text_message_part(42, "hello");
+
+        assert_eq!(fingerprint.chat_id, 42);
+        assert_eq!(fingerprint.message_type, MESSAGE_TYPE_TEXT);
+        assert_eq!(fingerprint.content_hash, 0x9a71bb4c);
+        assert_eq!(fingerprint.debounce_key, None);
     }
 
     #[test]
