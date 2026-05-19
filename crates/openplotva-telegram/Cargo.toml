@@ -9,6 +9,8 @@ publish = false
 
 [dependencies]
 carapax.workspace = true
+html5ever.workspace = true
+url.workspace = true
 
 [dev-dependencies]
 serde = { workspace = true, features = ["derive"] }

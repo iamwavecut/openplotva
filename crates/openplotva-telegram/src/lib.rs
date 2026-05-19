@@ -1,5 +1,13 @@
 //! Telegram Bot API boundary for OpenPlotva.
 
+mod html;
+
+pub use html::{
+    TELEGRAM_PARSE_MODE_HTML, clean_unicode_non_printables, ensure_telegram_safe_text,
+    escape_telegram_html_text, extract_visible_text, is_valid_telegram_html,
+    sanitize_telegram_html, split_telegram_text, strip_telegram_html,
+};
+
 pub const INTEGRATION_CRATE: &str = "carapax";
 
 /// `/help` command constant from the Go runtime.
