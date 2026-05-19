@@ -100,11 +100,19 @@ fn start_runtime_workers(
             "pending_ops",
             "OPENPLOTVA_CONNECT_SERVICES=false",
         ));
+        readiness_checks.push(ReadinessCheck::skipped(
+            "outbound_dispatcher",
+            "OPENPLOTVA_CONNECT_SERVICES=false",
+        ));
         return Ok(Vec::new());
     };
 
     let Some(bot_key) = config.bot.key.as_deref() else {
         readiness_checks.push(ReadinessCheck::skipped("pending_ops", "BOT_KEY is not set"));
+        readiness_checks.push(ReadinessCheck::skipped(
+            "outbound_dispatcher",
+            "BOT_KEY is not set",
+        ));
         return Ok(Vec::new());
     };
 
@@ -112,11 +120,13 @@ fn start_runtime_workers(
         .context("create Telegram Bot API client")?;
     let store = PostgresVirtualMessageStore::new(service_clients.postgres.clone());
 
-    let worker = tokio::spawn(async move {
+    let pending_store = store.clone();
+    let pending_telegram = telegram.clone();
+    let pending_worker = tokio::spawn(async move {
         let report = pending_ops::run_pending_op_worker_until(
-            &store,
+            &pending_store,
             |method| {
-                let telegram = telegram.clone();
+                let telegram = pending_telegram.clone();
                 async move {
                     openplotva_telegram::execute_telegram_method(&telegram, method)
                         .await
@@ -134,7 +144,48 @@ fn start_runtime_workers(
         "Telegram pending-operation worker started",
     ));
 
-    Ok(vec![worker])
+    let dispatcher_store = store.clone();
+    let dispatcher_telegram = telegram.clone();
+    let dispatcher_queue =
+        openplotva_telegram::DispatcherQueue::new(openplotva_telegram::DispatcherConfig::default());
+    let dispatcher_limiters =
+        openplotva_telegram::ChatLimiters::new(openplotva_telegram::DEFAULT_DISPATCH_INTERVAL);
+    let dispatcher_worker = tokio::spawn(async move {
+        let outcome = dispatcher_queue
+            .run_workers_until(&dispatcher_limiters, std::future::pending::<()>(), |item| {
+                let store = dispatcher_store.clone();
+                let telegram = dispatcher_telegram.clone();
+                async move {
+                    let report =
+                        virtual_messages::send_work_item_and_resolve(&store, item, |method| {
+                            let telegram = telegram.clone();
+                            async move {
+                                openplotva_telegram::execute_telegram_method(&telegram, method)
+                                    .await
+                            }
+                        })
+                        .await;
+                    if report.resolve_error.is_some() {
+                        tracing::warn!(
+                            virtual_id = report.virtual_id,
+                            real_message_id = ?report.resolved_message_id,
+                            resolve_error = ?report.resolve_error,
+                            "failed to resolve outbound virtual message"
+                        );
+                    }
+                    report.status
+                }
+            })
+            .await;
+
+        tracing::info!(?outcome, "outbound dispatcher worker stopped");
+    });
+    readiness_checks.push(ReadinessCheck::ok(
+        "outbound_dispatcher",
+        "Telegram outbound dispatcher worker started",
+    ));
+
+    Ok(vec![pending_worker, dispatcher_worker])
 }
 
 async fn shutdown_runtime_workers(workers: Vec<JoinHandle<()>>) {
