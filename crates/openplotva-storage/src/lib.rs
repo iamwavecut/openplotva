@@ -3,15 +3,17 @@
 use std::time::Duration;
 
 use openplotva_config::{PostgresConfig, RedisConfig};
+use openplotva_core::{MessageIdMapping, PendingOp};
 use redis::{
     Client as RedisClient, ConnectionAddr, ConnectionInfo, IntoConnectionInfo, RedisConnectionInfo,
 };
 use sqlx::{
-    PgPool,
+    PgPool, Row,
     migrate::{MigrateError, Migrator},
-    postgres::PgPoolOptions,
+    postgres::{PgPoolOptions, PgRow},
 };
 use thiserror::Error;
+use time::OffsetDateTime;
 
 /// Human-readable crate purpose used by scaffold tests and docs.
 pub const PURPOSE: &str = "storage";
@@ -19,6 +21,40 @@ pub const PURPOSE: &str = "storage";
 const POSTGRES_MAX_CONNECTIONS: u32 = 50;
 const POSTGRES_MIN_CONNECTIONS: u32 = 10;
 const POSTGRES_MAX_CONNECTION_LIFETIME: Duration = Duration::from_secs(45 * 60);
+
+/// Go `InsertVirtualMessage` SQL with SQLC name/comment removed.
+pub const SQL_INSERT_VIRTUAL_MESSAGE: &str =
+    "INSERT INTO message_id_map (vmsg_id, chat_id, thread_id) VALUES ($1, $2, $3)";
+
+/// Go `ResolveVirtualMessage` SQL with SQLC name/comment removed.
+pub const SQL_RESOLVE_VIRTUAL_MESSAGE: &str = "UPDATE message_id_map SET real_message_id = $1, resolved_at = COALESCE($2, NOW()) WHERE vmsg_id = $3";
+
+/// Go `GetMappingByVirtual` SQL narrowed to fields currently ported.
+pub const SQL_GET_MAPPING_BY_VIRTUAL: &str =
+    "SELECT vmsg_id, chat_id, thread_id, real_message_id FROM message_id_map WHERE vmsg_id = $1";
+
+/// Go `ListMappingsByVirtualIDs` SQL narrowed to fields currently ported.
+pub const SQL_LIST_MAPPINGS_BY_VIRTUAL_IDS: &str = "SELECT vmsg_id, chat_id, thread_id, real_message_id FROM message_id_map WHERE vmsg_id = ANY($1::text[])";
+
+/// Go `GetMappingByReal` SQL narrowed to fields currently ported.
+pub const SQL_GET_MAPPING_BY_REAL: &str = "SELECT vmsg_id, chat_id, thread_id, real_message_id FROM message_id_map WHERE chat_id = $1 AND real_message_id = $2";
+
+/// Go `DeleteMappingByVirtual` SQL.
+pub const SQL_DELETE_MAPPING_BY_VIRTUAL: &str = "DELETE FROM message_id_map WHERE vmsg_id = $1";
+
+/// Go `EnqueueMessageOp` SQL with explicit JSONB cast for runtime binding.
+pub const SQL_ENQUEUE_MESSAGE_OP: &str = "INSERT INTO message_ops_queue (vmsg_id, chat_id, op, payload) VALUES ($1, $2, $3, $4::jsonb) RETURNING id";
+
+/// Go `ListPendingOps` SQL narrowed to fields currently ported.
+pub const SQL_LIST_PENDING_OPS: &str = "SELECT id, vmsg_id, chat_id, op, COALESCE(payload::text, '') AS payload, attempts FROM message_ops_queue WHERE status = 'pending' ORDER BY created_at ASC LIMIT $1";
+
+/// Go `MarkOpDone` SQL.
+pub const SQL_MARK_OP_DONE: &str =
+    "UPDATE message_ops_queue SET status = 'done', executed_at = NOW() WHERE id = $1";
+
+/// Go `MarkOpFailed` SQL.
+pub const SQL_MARK_OP_FAILED: &str =
+    "UPDATE message_ops_queue SET attempts = attempts + 1, last_error = $2 WHERE id = $1";
 
 /// SQLx migrator for the converted Go schema migrations.
 pub static MIGRATOR: Migrator = sqlx::migrate!("../../migrations");
@@ -44,6 +80,155 @@ impl RedisStore {
     /// Access the underlying Redis client.
     pub fn client(&self) -> &RedisClient {
         &self.client
+    }
+}
+
+/// SQLx-backed storage for Go virtual message mappings and pending message ops.
+#[derive(Clone, Debug)]
+pub struct PostgresVirtualMessageStore {
+    pool: PgPool,
+}
+
+impl PostgresVirtualMessageStore {
+    /// Build a virtual-message store on an existing Postgres pool.
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
+    /// Access the underlying Postgres pool.
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
+    /// Insert a Go `message_id_map` virtual message row.
+    pub async fn insert_virtual_message(
+        &self,
+        vmsg_id: &str,
+        chat_id: i64,
+        thread_id: Option<i32>,
+    ) -> Result<(), StorageError> {
+        sqlx::query(SQL_INSERT_VIRTUAL_MESSAGE)
+            .bind(vmsg_id)
+            .bind(chat_id)
+            .bind(thread_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Resolve a virtual message to its real Telegram message ID.
+    pub async fn resolve_virtual_message(
+        &self,
+        vmsg_id: &str,
+        real_message_id: i32,
+        resolved_at: Option<OffsetDateTime>,
+    ) -> Result<(), StorageError> {
+        sqlx::query(SQL_RESOLVE_VIRTUAL_MESSAGE)
+            .bind(real_message_id)
+            .bind(resolved_at)
+            .bind(vmsg_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Get a virtual-message mapping by virtual ID.
+    pub async fn get_mapping_by_virtual(
+        &self,
+        vmsg_id: &str,
+    ) -> Result<Option<MessageIdMapping>, StorageError> {
+        let row = sqlx::query(SQL_GET_MAPPING_BY_VIRTUAL)
+            .bind(vmsg_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(message_id_mapping_from_row).transpose()?)
+    }
+
+    /// List virtual-message mappings by virtual IDs.
+    pub async fn list_mappings_by_virtual_ids(
+        &self,
+        vmsg_ids: &[String],
+    ) -> Result<Vec<MessageIdMapping>, StorageError> {
+        let rows = sqlx::query(SQL_LIST_MAPPINGS_BY_VIRTUAL_IDS)
+            .bind(vmsg_ids)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter()
+            .map(message_id_mapping_from_row)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
+    }
+
+    /// Get a virtual-message mapping by real Telegram message ID.
+    pub async fn get_mapping_by_real(
+        &self,
+        chat_id: i64,
+        real_message_id: i32,
+    ) -> Result<Option<MessageIdMapping>, StorageError> {
+        let row = sqlx::query(SQL_GET_MAPPING_BY_REAL)
+            .bind(chat_id)
+            .bind(real_message_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(message_id_mapping_from_row).transpose()?)
+    }
+
+    /// Delete a virtual-message mapping by virtual ID.
+    pub async fn delete_mapping_by_virtual(&self, vmsg_id: &str) -> Result<(), StorageError> {
+        sqlx::query(SQL_DELETE_MAPPING_BY_VIRTUAL)
+            .bind(vmsg_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Enqueue a pending operation for a virtual message.
+    pub async fn enqueue_message_op(
+        &self,
+        vmsg_id: &str,
+        chat_id: i64,
+        op: &str,
+        payload_json: Option<&str>,
+    ) -> Result<i64, StorageError> {
+        let row = sqlx::query(SQL_ENQUEUE_MESSAGE_OP)
+            .bind(vmsg_id)
+            .bind(chat_id)
+            .bind(op)
+            .bind(payload_json)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.try_get::<i64, _>("id")?)
+    }
+
+    /// List pending virtual-message operations in Go execution order.
+    pub async fn list_pending_ops(&self, limit: i32) -> Result<Vec<PendingOp>, StorageError> {
+        let rows = sqlx::query(SQL_LIST_PENDING_OPS)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter()
+            .map(pending_op_from_row)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
+    }
+
+    /// Mark a pending operation as done.
+    pub async fn mark_op_done(&self, id: i64) -> Result<(), StorageError> {
+        sqlx::query(SQL_MARK_OP_DONE)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Record a failed pending operation attempt.
+    pub async fn mark_op_failed(&self, id: i64, message: &str) -> Result<(), StorageError> {
+        sqlx::query(SQL_MARK_OP_FAILED)
+            .bind(id)
+            .bind(message)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 }
 
@@ -144,13 +329,41 @@ fn redis_connection_info(config: &RedisConfig) -> redis::RedisResult<ConnectionI
         .map(|info| info.set_redis_settings(redis_settings))
 }
 
+fn message_id_mapping_from_row(row: PgRow) -> Result<MessageIdMapping, sqlx::Error> {
+    Ok(MessageIdMapping {
+        vmsg_id: row.try_get("vmsg_id")?,
+        chat_id: row.try_get("chat_id")?,
+        thread_id: row.try_get("thread_id")?,
+        real_message_id: row.try_get("real_message_id")?,
+    })
+}
+
+fn pending_op_from_row(row: PgRow) -> Result<PendingOp, sqlx::Error> {
+    let payload: String = row.try_get("payload")?;
+    Ok(PendingOp {
+        id: row.try_get("id")?,
+        vmsg_id: row.try_get("vmsg_id")?,
+        chat_id: row.try_get("chat_id")?,
+        op: row.try_get("op")?,
+        payload: payload.into_bytes(),
+        attempts: row.try_get("attempts")?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use std::{error::Error, fs, path::Path};
+    use std::{
+        env,
+        error::Error,
+        fs,
+        path::Path,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     use openplotva_config::{DEFAULT_REDIS_DB, RedisConfig};
     use redis::ConnectionAddr;
     use serde::Deserialize;
+    use sqlx::postgres::PgPoolOptions;
 
     #[derive(Deserialize)]
     struct MigrationInventoryEntry {
@@ -216,6 +429,146 @@ mod tests {
         );
         assert_eq!(info.redis_settings().db(), 0);
         assert_eq!(info.redis_settings().password(), None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn virtual_message_sql_matches_go_query_contracts() {
+        let _mapping = openplotva_core::MessageIdMapping::resolved("v1", 42, 77);
+
+        assert_eq!(
+            super::SQL_INSERT_VIRTUAL_MESSAGE,
+            "INSERT INTO message_id_map (vmsg_id, chat_id, thread_id) VALUES ($1, $2, $3)"
+        );
+        assert_eq!(
+            super::SQL_RESOLVE_VIRTUAL_MESSAGE,
+            "UPDATE message_id_map SET real_message_id = $1, resolved_at = COALESCE($2, NOW()) WHERE vmsg_id = $3"
+        );
+        assert_eq!(
+            super::SQL_GET_MAPPING_BY_VIRTUAL,
+            "SELECT vmsg_id, chat_id, thread_id, real_message_id FROM message_id_map WHERE vmsg_id = $1"
+        );
+        assert_eq!(
+            super::SQL_LIST_MAPPINGS_BY_VIRTUAL_IDS,
+            "SELECT vmsg_id, chat_id, thread_id, real_message_id FROM message_id_map WHERE vmsg_id = ANY($1::text[])"
+        );
+        assert_eq!(
+            super::SQL_GET_MAPPING_BY_REAL,
+            "SELECT vmsg_id, chat_id, thread_id, real_message_id FROM message_id_map WHERE chat_id = $1 AND real_message_id = $2"
+        );
+        assert_eq!(
+            super::SQL_DELETE_MAPPING_BY_VIRTUAL,
+            "DELETE FROM message_id_map WHERE vmsg_id = $1"
+        );
+    }
+
+    #[test]
+    fn pending_message_op_sql_matches_go_query_contracts() {
+        let _op = openplotva_core::PendingOp::new(1, "v1", 42, "edit");
+
+        assert_eq!(
+            super::SQL_ENQUEUE_MESSAGE_OP,
+            "INSERT INTO message_ops_queue (vmsg_id, chat_id, op, payload) VALUES ($1, $2, $3, $4::jsonb) RETURNING id"
+        );
+        assert_eq!(
+            super::SQL_LIST_PENDING_OPS,
+            "SELECT id, vmsg_id, chat_id, op, COALESCE(payload::text, '') AS payload, attempts FROM message_ops_queue WHERE status = 'pending' ORDER BY created_at ASC LIMIT $1"
+        );
+        assert_eq!(
+            super::SQL_MARK_OP_DONE,
+            "UPDATE message_ops_queue SET status = 'done', executed_at = NOW() WHERE id = $1"
+        );
+        assert_eq!(
+            super::SQL_MARK_OP_FAILED,
+            "UPDATE message_ops_queue SET attempts = attempts + 1, last_error = $2 WHERE id = $1"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_virtual_message_store_round_trips_when_postgres_dsn_is_set()
+    -> Result<(), Box<dyn Error>> {
+        let Ok(dsn) = env::var("OPENPLOTVA_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&dsn)
+            .await?;
+        let store = super::PostgresVirtualMessageStore::new(pool);
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let vmsg_id = format!("t{suffix}");
+        let chat_id = -9_001_234_567_890_i64;
+        let real_message_id = 321_987_i32;
+        let _ = store.delete_mapping_by_virtual(&vmsg_id).await;
+
+        let result: Result<(), Box<dyn Error>> = async {
+            store
+                .insert_virtual_message(&vmsg_id, chat_id, Some(77))
+                .await?;
+            let mapping = store
+                .get_mapping_by_virtual(&vmsg_id)
+                .await?
+                .ok_or_else(|| std::io::Error::other("inserted mapping was not readable"))?;
+            assert_eq!(mapping.vmsg_id, vmsg_id);
+            assert_eq!(mapping.chat_id, chat_id);
+            assert_eq!(mapping.thread_id, Some(77));
+            assert_eq!(mapping.real_message_id, None);
+
+            let op_id = store
+                .enqueue_message_op(
+                    &vmsg_id,
+                    chat_id,
+                    "edit",
+                    Some(r#"{"text":"edited","parse_mode":"HTML"}"#),
+                )
+                .await?;
+            let pending = store.list_pending_ops(1_000).await?;
+            let op = pending
+                .iter()
+                .find(|row| row.id == op_id)
+                .ok_or_else(|| std::io::Error::other("enqueued op was not listed as pending"))?;
+            assert_eq!(op.vmsg_id, vmsg_id);
+            assert_eq!(op.chat_id, chat_id);
+            assert_eq!(op.op, "edit");
+            let payload: serde_json::Value = serde_json::from_slice(&op.payload)?;
+            assert_eq!(
+                payload,
+                serde_json::json!({"text": "edited", "parse_mode": "HTML"})
+            );
+            assert_eq!(op.attempts, 0);
+
+            store.mark_op_failed(op_id, "temporary failure").await?;
+            let pending = store.list_pending_ops(1_000).await?;
+            let op = pending
+                .iter()
+                .find(|row| row.id == op_id)
+                .ok_or_else(|| std::io::Error::other("failed op was not still pending"))?;
+            assert_eq!(op.attempts, 1);
+
+            store
+                .resolve_virtual_message(&vmsg_id, real_message_id, None)
+                .await?;
+            let mapping = store
+                .get_mapping_by_real(chat_id, real_message_id)
+                .await?
+                .ok_or_else(|| std::io::Error::other("resolved mapping was not readable"))?;
+            assert_eq!(mapping.vmsg_id, vmsg_id);
+            assert_eq!(mapping.real_message_id, Some(real_message_id));
+
+            store.mark_op_done(op_id).await?;
+            let pending = store.list_pending_ops(1_000).await?;
+            assert!(pending.iter().all(|row| row.id != op_id));
+
+            Ok(())
+        }
+        .await;
+
+        let cleanup = store.delete_mapping_by_virtual(&vmsg_id).await;
+        result?;
+        cleanup?;
+        assert!(store.get_mapping_by_virtual(&vmsg_id).await?.is_none());
 
         Ok(())
     }
