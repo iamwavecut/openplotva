@@ -6,9 +6,11 @@ use openplotva_core::{MessageIdMapping, ReadyPendingOp};
 use openplotva_telegram::{
     DispatcherMessage, DispatcherQueue, DispatcherSendStatus, DispatcherWorkItem, EnqueueOutcome,
     OutboundBuildError, PENDING_OP_DELETE, PENDING_OP_EDIT, PendingOpBuildError, ReplyMessageRef,
-    TELEGRAM_TEXT_MAX_BYTES, TelegramOutboundMethod, TelegramOutboundResponse, TextMessageRequest,
-    build_pending_op_method, build_text_message_method, fingerprint_text_message_part,
-    forum_thread_id, message_target_chat, split_telegram_text, validate_text_message_text,
+    StickerMessageRequest, TELEGRAM_TEXT_MAX_BYTES, TelegramOutboundMethod,
+    TelegramOutboundResponse, TextMessageRequest, build_pending_op_method,
+    build_sticker_message_method, build_sticker_message_plan, build_text_message_method,
+    fingerprint_sticker_message_plan, fingerprint_text_message_part, forum_thread_id,
+    message_target_chat, split_telegram_text, validate_text_message_text,
 };
 use serde_json::json;
 use thiserror::Error;
@@ -213,6 +215,16 @@ pub struct QueueTextRequest<'a> {
     pub immediate_first: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct QueueStickerRequest<'a> {
+    /// Telegram sticker request fields.
+    pub message: &'a StickerMessageRequest,
+    /// Optional replied-to message fields.
+    pub reply_to: Option<&'a ReplyMessageRef>,
+    /// Whether Go would enqueue the sticker in the immediate queue.
+    pub immediate: bool,
+}
+
 /// One queued text part and its virtual-message bookkeeping.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueuedTextPartReport {
@@ -232,6 +244,18 @@ pub struct QueuedTextPartReport {
 pub struct QueueTextReport {
     /// Split text parts that were queued or deduped.
     pub parts: Vec<QueuedTextPartReport>,
+}
+
+/// Summary of queueing one Go `SendSticker` request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueueStickerReport {
+    /// Virtual message ID generated before queueing.
+    pub virtual_id: String,
+    pub enqueue_outcome: EnqueueOutcome,
+    /// Whether this sticker went to the immediate queue.
+    pub immediate: bool,
+    /// Storage error ignored by Go when inserting the virtual ID row.
+    pub insert_error: Option<String>,
 }
 
 impl QueueTextReport {
@@ -336,6 +360,41 @@ where
     }
 
     Ok(report)
+}
+
+/// Queue one sticker like Go `SendSticker`, creating a virtual-message row before dispatcher enqueue.
+pub async fn queue_sticker_message<S, NextId>(
+    store: &S,
+    queue: &DispatcherQueue,
+    req: QueueStickerRequest<'_>,
+    mut next_virtual_id: NextId,
+) -> Result<QueueStickerReport, OutboundBuildError>
+where
+    S: VirtualMessageStore + Sync,
+    NextId: FnMut() -> String,
+{
+    let chat = message_target_chat(req.message.chat.as_ref(), req.reply_to)?;
+    let virtual_id = next_virtual_id();
+    let thread_id =
+        forum_thread_id(chat, req.message.message_thread_id).map(|thread_id| thread_id as i32);
+    let insert_error = store
+        .insert_virtual_message(virtual_id.clone(), chat.id, thread_id)
+        .await
+        .err()
+        .map(|error| error.to_string());
+    let plan = build_sticker_message_plan(req.message, req.reply_to)?;
+    let method = build_sticker_message_method(req.message, req.reply_to)?;
+    let dispatcher_message =
+        DispatcherMessage::new(fingerprint_sticker_message_plan(&plan), &virtual_id)
+            .with_method(TelegramOutboundMethod::from(method));
+    let enqueue_outcome = queue.enqueue(dispatcher_message, req.immediate);
+
+    Ok(QueueStickerReport {
+        virtual_id,
+        enqueue_outcome,
+        immediate: req.immediate,
+        insert_error,
+    })
 }
 
 /// Send one dispatcher item and resolve its virtual-message mapping from the Telegram response.
@@ -606,19 +665,19 @@ mod tests {
     use openplotva_core::MessageIdMapping;
     use openplotva_telegram::{
         ChatRef, DispatcherConfig, DispatcherMessage, DispatcherQueue, DispatcherSendStatus,
-        EnqueueOutcome, TelegramMessage, TelegramOutboundMethod, TelegramOutboundMethodKind,
-        TelegramOutboundResponse, TextMessageRequest, build_text_message_method,
-        fingerprint_text_message_part,
+        EnqueueOutcome, ReplyMessageRef, TelegramMessage, TelegramOutboundMethod,
+        TelegramOutboundMethodKind, TelegramOutboundResponse, TextMessageRequest,
+        build_text_message_method, fingerprint_text_message_part,
     };
     use serde_json::json;
 
     use crate::pending_ops::PendingOpHistory;
 
     use super::{
-        PENDING_OP_DELETE, PENDING_OP_EDIT, QueueTextRequest, VirtualDeleteRequest,
-        VirtualEditRequest, VirtualMessageAction, VirtualMessageError, VirtualMessageReport,
-        VirtualMessageStore, delete_message_virtual, edit_text_virtual, queue_text_message_parts,
-        send_work_item_and_resolve,
+        PENDING_OP_DELETE, PENDING_OP_EDIT, QueueStickerRequest, QueueTextRequest,
+        VirtualDeleteRequest, VirtualEditRequest, VirtualMessageAction, VirtualMessageError,
+        VirtualMessageReport, VirtualMessageStore, delete_message_virtual, edit_text_virtual,
+        queue_sticker_message, queue_text_message_parts, send_work_item_and_resolve,
     };
 
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -857,6 +916,102 @@ mod tests {
         store.snapshot(|state| {
             assert_eq!(state.inserted, vec![("v1".to_owned(), 42, None)]);
         });
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn queue_sticker_message_inserts_virtual_id_and_enqueues_immediate_like_go()
+    -> Result<(), Box<dyn Error>> {
+        let store = StoreStub::default();
+        let queue = DispatcherQueue::new(DispatcherConfig::default());
+        let request = openplotva_telegram::StickerMessageRequest {
+            chat: Some(ChatRef {
+                id: 42,
+                is_forum: true,
+            }),
+            message_thread_id: 7,
+            disable_notification: true,
+            file_id: "sticker-file-id".to_owned(),
+        };
+
+        let report = queue_sticker_message(
+            &store,
+            &queue,
+            QueueStickerRequest {
+                message: &request,
+                reply_to: None,
+                immediate: true,
+            },
+            || "sticker-v1".to_owned(),
+        )
+        .await?;
+
+        assert_eq!(report.virtual_id, "sticker-v1");
+        assert_eq!(report.enqueue_outcome, EnqueueOutcome::Enqueued);
+        assert!(report.immediate);
+        assert_eq!(report.insert_error, None);
+        store.snapshot(|state| {
+            assert_eq!(state.inserted, vec![("sticker-v1".to_owned(), 42, Some(7))]);
+        });
+        let snapshot = queue.snapshot();
+        assert_eq!(snapshot.immediate.len(), 1);
+        assert_eq!(snapshot.immediate[0].virtual_id, "sticker-v1");
+        assert_eq!(snapshot.immediate[0].fingerprint_key, "42:sticker:abbb8dc3");
+        assert!(snapshot.regular.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn queue_sticker_message_reports_insert_errors_but_still_queues()
+    -> Result<(), Box<dyn Error>> {
+        let store = StoreStub::with_state(StoreState {
+            insert_error: Some(StubError("insert failed")),
+            ..StoreState::default()
+        });
+        let queue = DispatcherQueue::new(DispatcherConfig::default());
+        let reply = ReplyMessageRef {
+            chat: ChatRef {
+                id: -100,
+                is_forum: true,
+            },
+            message_id: 99,
+            is_topic_message: true,
+            message_thread_id: 11,
+        };
+        let request = openplotva_telegram::StickerMessageRequest {
+            chat: None,
+            message_thread_id: 0,
+            disable_notification: false,
+            file_id: "reply-sticker".to_owned(),
+        };
+
+        let report = queue_sticker_message(
+            &store,
+            &queue,
+            QueueStickerRequest {
+                message: &request,
+                reply_to: Some(&reply),
+                immediate: false,
+            },
+            || "sticker-v2".to_owned(),
+        )
+        .await?;
+
+        assert_eq!(report.enqueue_outcome, EnqueueOutcome::Enqueued);
+        assert!(!report.immediate);
+        assert_eq!(report.insert_error, Some("insert failed".to_owned()));
+        store.snapshot(|state| {
+            assert_eq!(
+                state.inserted,
+                vec![("sticker-v2".to_owned(), -100, Some(0))]
+            );
+        });
+        let snapshot = queue.snapshot();
+        assert!(snapshot.immediate.is_empty());
+        assert_eq!(snapshot.regular.len(), 1);
+        assert_eq!(snapshot.regular[0].virtual_id, "sticker-v2");
 
         Ok(())
     }
