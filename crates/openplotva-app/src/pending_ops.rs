@@ -93,20 +93,70 @@ impl PendingOpStore for openplotva_storage::PostgresVirtualMessageStore {
 /// History side effects triggered after successful pending edits/deletes.
 pub trait PendingOpHistory {
     /// Record a successful pending edit in chat history.
-    fn update_text(&self, chat_id: i64, message_id: i32, text: &str, parse_mode: &str);
+    fn update_text<'a>(
+        &'a self,
+        chat_id: i64,
+        message_id: i32,
+        text: &'a str,
+        parse_mode: &'a str,
+    ) -> BoxFuture<'a, ()>;
 
     /// Record a successful pending delete in chat history.
-    fn delete_message(&self, chat_id: i64, message_id: i32);
+    fn delete_message<'a>(&'a self, chat_id: i64, message_id: i32) -> BoxFuture<'a, ()>;
 }
 
-/// History side-effect sink used until the storage-backed history service is ported.
+/// No-op history side-effect sink for tests and call sites that intentionally skip persistence.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct NoopPendingOpHistory;
 
 impl PendingOpHistory for NoopPendingOpHistory {
-    fn update_text(&self, _chat_id: i64, _message_id: i32, _text: &str, _parse_mode: &str) {}
+    fn update_text<'a>(
+        &'a self,
+        _chat_id: i64,
+        _message_id: i32,
+        _text: &'a str,
+        _parse_mode: &'a str,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
 
-    fn delete_message(&self, _chat_id: i64, _message_id: i32) {}
+    fn delete_message<'a>(&'a self, _chat_id: i64, _message_id: i32) -> BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
+}
+
+impl PendingOpHistory for openplotva_storage::PostgresHistoryStore {
+    fn update_text<'a>(
+        &'a self,
+        chat_id: i64,
+        message_id: i32,
+        text: &'a str,
+        _parse_mode: &'a str,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            if let Err(error) = self.update_text_entry(chat_id, message_id, text).await {
+                tracing::warn!(
+                    chat_id,
+                    message_id,
+                    %error,
+                    "failed to update chat history entry after Telegram edit"
+                );
+            }
+        })
+    }
+
+    fn delete_message<'a>(&'a self, chat_id: i64, message_id: i32) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            if let Err(error) = self.delete_message_entries(chat_id, message_id).await {
+                tracing::warn!(
+                    chat_id,
+                    message_id,
+                    %error,
+                    "failed to delete chat history entries after Telegram delete"
+                );
+            }
+        })
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -257,7 +307,7 @@ where
         match send(method).await {
             Ok(()) => {
                 report.sent += 1;
-                record_history_side_effect(history, &op, &mut report);
+                record_history_side_effect(history, &op, &mut report).await;
                 match store.mark_op_done(op.id).await {
                     Ok(()) => report.marked_done += 1,
                     Err(_) => report.status_write_failed += 1,
@@ -273,7 +323,7 @@ where
     report
 }
 
-fn record_history_side_effect<H>(
+async fn record_history_side_effect<H>(
     history: &H,
     op: &ReadyPendingOp,
     report: &mut PendingOpProcessReport,
@@ -282,17 +332,19 @@ fn record_history_side_effect<H>(
 {
     match op.op.as_str() {
         PENDING_OP_DELETE => {
-            history.delete_message(op.chat_id, op.real_message_id);
+            history.delete_message(op.chat_id, op.real_message_id).await;
             report.history_deleted += 1;
         }
         PENDING_OP_EDIT => {
             let payload = pending_edit_payload(&op.payload);
-            history.update_text(
-                op.chat_id,
-                op.real_message_id,
-                &payload.text,
-                &payload.parse_mode,
-            );
+            history
+                .update_text(
+                    op.chat_id,
+                    op.real_message_id,
+                    &payload.text,
+                    &payload.parse_mode,
+                )
+                .await;
             report.history_updated += 1;
         }
         _ => {}
@@ -314,14 +366,63 @@ where
     run_pending_op_worker_every_until(store, send, PENDING_OP_POLL_INTERVAL, stop).await
 }
 
+pub async fn run_pending_op_worker_with_history_until<S, H, Send, SendFuture, SendError, Stop>(
+    store: &S,
+    history: &H,
+    send: Send,
+    stop: Stop,
+) -> PendingOpWorkerReport
+where
+    S: PendingOpStore + Sync,
+    H: PendingOpHistory + Sync,
+    Send: FnMut(TelegramOutboundMethod) -> SendFuture,
+    SendFuture: Future<Output = Result<(), SendError>>,
+    SendError: fmt::Display,
+    Stop: Future<Output = ()>,
+{
+    run_pending_op_worker_with_history_every_until(
+        store,
+        history,
+        send,
+        PENDING_OP_POLL_INTERVAL,
+        stop,
+    )
+    .await
+}
+
 async fn run_pending_op_worker_every_until<S, Send, SendFuture, SendError, Stop>(
     store: &S,
+    send: Send,
+    interval: Duration,
+    stop: Stop,
+) -> PendingOpWorkerReport
+where
+    S: PendingOpStore + Sync,
+    Send: FnMut(TelegramOutboundMethod) -> SendFuture,
+    SendFuture: Future<Output = Result<(), SendError>>,
+    SendError: fmt::Display,
+    Stop: Future<Output = ()>,
+{
+    run_pending_op_worker_with_history_every_until(
+        store,
+        &NoopPendingOpHistory,
+        send,
+        interval,
+        stop,
+    )
+    .await
+}
+
+async fn run_pending_op_worker_with_history_every_until<S, H, Send, SendFuture, SendError, Stop>(
+    store: &S,
+    history: &H,
     mut send: Send,
     interval: Duration,
     stop: Stop,
 ) -> PendingOpWorkerReport
 where
     S: PendingOpStore + Sync,
+    H: PendingOpHistory + Sync,
     Send: FnMut(TelegramOutboundMethod) -> SendFuture,
     SendFuture: Future<Output = Result<(), SendError>>,
     SendError: fmt::Display,
@@ -334,7 +435,7 @@ where
         tokio::select! {
             () = &mut stop => break,
             () = tokio::time::sleep(interval) => {
-                let tick = process_pending_ops(store, &mut send).await;
+                let tick = process_pending_ops_with_history(store, history, &mut send).await;
                 trace_pending_op_tick(&tick);
                 report.record_tick(&tick);
             }
@@ -429,7 +530,7 @@ mod tests {
     use super::{
         PENDING_OP_BATCH_LIMIT, PendingOpHistory, PendingOpProcessReport, PendingOpStore,
         PendingOpWorkerReport, process_pending_ops, process_pending_ops_with_history,
-        run_pending_op_worker_every_until,
+        run_pending_op_worker_every_until, run_pending_op_worker_with_history_every_until,
     };
 
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -488,18 +589,26 @@ mod tests {
     }
 
     impl PendingOpHistory for HistoryStub {
-        fn update_text(&self, chat_id: i64, message_id: i32, text: &str, parse_mode: &str) {
+        fn update_text<'a>(
+            &'a self,
+            chat_id: i64,
+            message_id: i32,
+            text: &'a str,
+            parse_mode: &'a str,
+        ) -> super::BoxFuture<'a, ()> {
             self.state.lock().expect("store state").events.push(format!(
                 "history:update:{chat_id}:{message_id}:{text}:{parse_mode}"
             ));
+            Box::pin(async {})
         }
 
-        fn delete_message(&self, chat_id: i64, message_id: i32) {
+        fn delete_message<'a>(&'a self, chat_id: i64, message_id: i32) -> super::BoxFuture<'a, ()> {
             self.state
                 .lock()
                 .expect("store state")
                 .events
                 .push(format!("history:delete:{chat_id}:{message_id}"));
+            Box::pin(async {})
         }
     }
 
@@ -829,6 +938,52 @@ mod tests {
         store.snapshot(|state| {
             assert_eq!(state.done, vec![1]);
             assert!(state.failed.is_empty());
+        });
+    }
+
+    #[tokio::test]
+    async fn worker_can_use_injected_history_sink() {
+        let store = StoreStub::with_state(StoreState {
+            rows: vec![pending_op(1, "v1", "edit", br#"{"text":"edited"}"#)],
+            batch_rows: vec![MessageIdMapping::resolved("v1", 42, 77)],
+            ..StoreState::default()
+        });
+        let history = store.history();
+        let (stop_send, stop_recv) = tokio::sync::oneshot::channel();
+        let mut stop_send = Some(stop_send);
+
+        let report = run_pending_op_worker_with_history_every_until(
+            &store,
+            &history,
+            |method| {
+                assert_eq!(method.kind(), TelegramOutboundMethodKind::EditMessageText);
+                if let Some(stop_send) = stop_send.take() {
+                    let _ = stop_send.send(());
+                }
+                async { Ok::<(), StubError>(()) }
+            },
+            std::time::Duration::from_millis(1),
+            async {
+                let _ = stop_recv.await;
+            },
+        )
+        .await;
+
+        assert_eq!(
+            report,
+            PendingOpWorkerReport {
+                ticks: 1,
+                listed: 1,
+                ready: 1,
+                sent: 1,
+                history_updated: 1,
+                marked_done: 1,
+                ..PendingOpWorkerReport::default()
+            }
+        );
+        store.snapshot(|state| {
+            assert_eq!(state.events, vec!["history:update:42:77:edited:", "done:1"]);
+            assert_eq!(state.done, vec![1]);
         });
     }
 

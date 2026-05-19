@@ -18,7 +18,9 @@ use axum::{
 };
 use openplotva_config::AppConfig;
 use openplotva_server::{ReadinessCheck, ReadinessResponse};
-use openplotva_storage::{PostgresVirtualMessageStore, RedisRateLimitStore, ServiceClients};
+use openplotva_storage::{
+    PostgresHistoryStore, PostgresVirtualMessageStore, RedisRateLimitStore, ServiceClients,
+};
 use serde::Deserialize;
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -650,6 +652,8 @@ async fn start_runtime_workers(
         ),
     ));
     let store = PostgresVirtualMessageStore::new(service_clients.postgres.clone());
+    let history_store = PostgresHistoryStore::new(service_clients.postgres.clone())
+        .with_redis_client(service_clients.redis.client().clone());
 
     let dispatcher_persistence = openplotva_telegram::RedisDispatcherQueueStore::new(
         service_clients.redis.client().clone(),
@@ -690,11 +694,13 @@ async fn start_runtime_workers(
     };
 
     let pending_store = store.clone();
+    let pending_history = history_store.clone();
     let pending_telegram = telegram.clone();
     let pending_stop = stop.subscribe();
     let pending_worker = tokio::spawn(async move {
-        let report = pending_ops::run_pending_op_worker_until(
+        let report = pending_ops::run_pending_op_worker_with_history_until(
             &pending_store,
+            &pending_history,
             |method| {
                 let telegram = pending_telegram.clone();
                 async move {

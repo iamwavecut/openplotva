@@ -63,8 +63,21 @@ pub const SQL_MARK_OP_DONE: &str =
 pub const SQL_MARK_OP_FAILED: &str =
     "UPDATE message_ops_queue SET attempts = attempts + 1, last_error = $2 WHERE id = $1";
 
+/// Go `SelectTextHistoryEntryPayload` plus the conflict keys needed for Rust-native updates.
+pub const SQL_SELECT_TEXT_HISTORY_ENTRY: &str = "SELECT bucket_day, entry_id, payload::text AS payload FROM chat_history_entries WHERE chat_id = $1 AND message_id = $2 AND kind = 'text' ORDER BY occurred_at DESC LIMIT 1";
+
+/// Rust-native history payload update that preserves Go's existing row identity.
+pub const SQL_UPDATE_HISTORY_ENTRY_PAYLOAD: &str = "UPDATE chat_history_entries SET payload = $4::jsonb, updated_at = CURRENT_TIMESTAMP WHERE bucket_day = $1 AND chat_id = $2 AND entry_id = $3";
+
+/// Go `DeleteHistoryMessageEntries` SQL.
+pub const SQL_DELETE_HISTORY_MESSAGE_ENTRIES: &str =
+    "DELETE FROM chat_history_entries WHERE chat_id = $1 AND message_id = $2";
+
 /// Go Redis key prefix for persisted rate-limited chat expiry timestamps.
 pub const RATE_LIMITED_CHAT_KEY_PREFIX: &str = "plotva:rate_limited_chat:";
+
+/// Go Redis key prefix for chat history read-through cache.
+pub const CHAT_HISTORY_CACHE_KEY_PREFIX: &str = "plotva:chat_history_cache:v2:";
 
 /// SQLx migrator for the converted Go schema migrations.
 pub static MIGRATOR: Migrator = sqlx::migrate!("../../migrations");
@@ -381,6 +394,105 @@ impl PostgresVirtualMessageStore {
     }
 }
 
+/// SQLx-backed storage for Go chat-history edit/delete side effects.
+#[derive(Clone, Debug)]
+pub struct PostgresHistoryStore {
+    pool: PgPool,
+    redis: Option<RedisClient>,
+}
+
+impl PostgresHistoryStore {
+    /// Build a history store on an existing Postgres pool.
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool, redis: None }
+    }
+
+    /// Attach Redis cache invalidation using Go's chat-history cache key.
+    pub fn with_redis_client(mut self, redis: RedisClient) -> Self {
+        self.redis = Some(redis);
+        self
+    }
+
+    /// Access the underlying Postgres pool.
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
+    /// Update the stored text payload for one Go chat-history message entry.
+    ///
+    /// Returns `false` when Go would silently no-op because the service is missing
+    /// required IDs or no text history row exists.
+    pub async fn update_text_entry(
+        &self,
+        chat_id: i64,
+        message_id: i32,
+        new_text: &str,
+    ) -> Result<bool, StorageError> {
+        if chat_id == 0 || message_id == 0 {
+            return Ok(false);
+        }
+
+        let row = sqlx::query(SQL_SELECT_TEXT_HISTORY_ENTRY)
+            .bind(chat_id)
+            .bind(message_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        let Some(row) = row else {
+            return Ok(false);
+        };
+
+        let bucket_day: time::Date = row.try_get("bucket_day")?;
+        let entry_id: String = row.try_get("entry_id")?;
+        let payload: String = row.try_get("payload")?;
+        let updated_payload = history_text_payload_with_text(&payload, new_text)?;
+
+        sqlx::query(SQL_UPDATE_HISTORY_ENTRY_PAYLOAD)
+            .bind(bucket_day)
+            .bind(chat_id)
+            .bind(&entry_id)
+            .bind(&updated_payload)
+            .execute(&self.pool)
+            .await?;
+        self.invalidate_history_cache(chat_id).await?;
+        Ok(true)
+    }
+
+    /// Delete stored history entries for one Telegram message ID.
+    pub async fn delete_message_entries(
+        &self,
+        chat_id: i64,
+        message_id: i32,
+    ) -> Result<u64, StorageError> {
+        if chat_id == 0 || message_id == 0 {
+            return Ok(0);
+        }
+
+        let result = sqlx::query(SQL_DELETE_HISTORY_MESSAGE_ENTRIES)
+            .bind(chat_id)
+            .bind(message_id)
+            .execute(&self.pool)
+            .await?;
+        self.invalidate_history_cache(chat_id).await?;
+        Ok(result.rows_affected())
+    }
+
+    async fn invalidate_history_cache(&self, chat_id: i64) -> Result<(), StorageError> {
+        let Some(redis) = &self.redis else {
+            return Ok(());
+        };
+        let mut connection = redis
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|source| StorageError::Redis { source })?;
+        let _: i64 = redis::cmd("DEL")
+            .arg(history_cache_key(chat_id))
+            .query_async(&mut connection)
+            .await
+            .map_err(|source| StorageError::Redis { source })?;
+        Ok(())
+    }
+}
+
 /// Storage connection failures.
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -422,11 +534,46 @@ pub enum StorageError {
         /// Timestamp range error.
         source: time::error::ComponentRange,
     },
+    /// Chat history payload JSON codec failed.
+    #[error("decode chat history payload: {source}")]
+    HistoryPayloadCodec {
+        /// JSON codec error.
+        source: serde_json::Error,
+    },
+    /// Chat history payload was not an object shaped like Go `MessageEntry`.
+    #[error("chat history payload is not a JSON object")]
+    HistoryPayloadShape,
 }
 
 /// Build the persisted Go rate-limited-chat key for a chat.
 pub fn rate_limited_chat_key(chat_id: i64) -> String {
     format!("{RATE_LIMITED_CHAT_KEY_PREFIX}{chat_id}")
+}
+
+/// Build the persisted Go chat-history cache key for a chat.
+pub fn history_cache_key(chat_id: i64) -> String {
+    format!("{CHAT_HISTORY_CACHE_KEY_PREFIX}{chat_id}")
+}
+
+/// Mutate a stored Go history payload the same way `Service.Update` changes `api.Message.Text`.
+pub fn history_text_payload_with_text(
+    payload: impl AsRef<[u8]>,
+    new_text: &str,
+) -> Result<String, StorageError> {
+    let mut payload: serde_json::Value = serde_json::from_slice(payload.as_ref())
+        .map_err(|source| StorageError::HistoryPayloadCodec { source })?;
+    let object = payload
+        .as_object_mut()
+        .ok_or(StorageError::HistoryPayloadShape)?;
+    if new_text.is_empty() {
+        object.remove("text");
+    } else {
+        object.insert(
+            "text".to_owned(),
+            serde_json::Value::String(new_text.to_owned()),
+        );
+    }
+    serde_json::to_string(&payload).map_err(|source| StorageError::HistoryPayloadCodec { source })
 }
 
 /// Encode a rate-limit expiry as the approved Rust-native Redis JSON value.
@@ -732,6 +879,48 @@ mod tests {
     }
 
     #[test]
+    fn history_edit_delete_storage_contract_matches_go_side_effects() -> Result<(), Box<dyn Error>>
+    {
+        let updated_payload = super::history_text_payload_with_text(
+            br#"{"entry_id":"msg:77","message_id":77,"text":"old","meta":{}}"#,
+            "new text",
+        )?;
+        let empty_text_payload = super::history_text_payload_with_text(
+            br#"{"entry_id":"msg:77","message_id":77,"text":"old","meta":{}}"#,
+            "",
+        )?;
+
+        assert_eq!(
+            super::SQL_SELECT_TEXT_HISTORY_ENTRY,
+            "SELECT bucket_day, entry_id, payload::text AS payload FROM chat_history_entries WHERE chat_id = $1 AND message_id = $2 AND kind = 'text' ORDER BY occurred_at DESC LIMIT 1"
+        );
+        assert_eq!(
+            super::SQL_UPDATE_HISTORY_ENTRY_PAYLOAD,
+            "UPDATE chat_history_entries SET payload = $4::jsonb, updated_at = CURRENT_TIMESTAMP WHERE bucket_day = $1 AND chat_id = $2 AND entry_id = $3"
+        );
+        assert_eq!(
+            super::SQL_DELETE_HISTORY_MESSAGE_ENTRIES,
+            "DELETE FROM chat_history_entries WHERE chat_id = $1 AND message_id = $2"
+        );
+        assert_eq!(
+            super::history_cache_key(42),
+            "plotva:chat_history_cache:v2:42"
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&updated_payload)?["text"],
+            "new text"
+        );
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&empty_text_payload)?
+                .get("text")
+                .is_none(),
+            "Go marshals api.Message.Text with omitempty, so empty edits remove the JSON text field"
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn user_and_chat_state_sql_matches_go_query_contracts() {
         let _user = openplotva_core::UserState {
             id: 500,
@@ -847,6 +1036,89 @@ mod tests {
         assert!(store.get_mapping_by_virtual(&vmsg_id).await?.is_none());
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_history_store_updates_and_deletes_when_postgres_dsn_is_set()
+    -> Result<(), Box<dyn Error>> {
+        let Ok(dsn) = env::var("OPENPLOTVA_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&dsn)
+            .await?;
+        let store = super::PostgresHistoryStore::new(pool.clone());
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
+        let chat_id = -9_001_222_333_444_i64;
+        let message_id = i32::try_from(suffix % 1_000_000_000)?;
+        let entry_id = format!("msg:{message_id}");
+        let occurred_at = time::OffsetDateTime::now_utc();
+        let bucket_day = occurred_at.date();
+        let payload = serde_json::json!({
+            "entry_id": entry_id,
+            "role": "user",
+            "kind": "text",
+            "timestamp": "2026-05-20T00:00:00Z",
+            "message_id": message_id,
+            "date": occurred_at.unix_timestamp(),
+            "chat": {"id": chat_id, "type": "private"},
+            "text": "old text",
+            "meta": {}
+        })
+        .to_string();
+
+        sqlx::query("SELECT ensure_chat_history_partition($1::date)")
+            .bind(bucket_day)
+            .execute(&pool)
+            .await?;
+        let _ = store.delete_message_entries(chat_id, message_id).await;
+
+        let result: Result<(), Box<dyn Error>> = async {
+            sqlx::query(
+                "INSERT INTO chat_history_entries (bucket_day, chat_id, thread_id, message_id, entry_id, kind, role, occurred_at, sender_id, payload) VALUES ($1, $2, 0, $3, $4, 'text', 'user', $5, 100, $6::jsonb)",
+            )
+            .bind(bucket_day)
+            .bind(chat_id)
+            .bind(message_id)
+            .bind(&entry_id)
+            .bind(occurred_at)
+            .bind(&payload)
+            .execute(&pool)
+            .await?;
+
+            assert!(store
+                .update_text_entry(chat_id, message_id, "new text")
+                .await?);
+            let updated_payload: String = sqlx::query_scalar(
+                "SELECT payload::text FROM chat_history_entries WHERE chat_id = $1 AND message_id = $2 AND kind = 'text'",
+            )
+            .bind(chat_id)
+            .bind(message_id)
+            .fetch_one(&pool)
+            .await?;
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&updated_payload)?["text"],
+                "new text"
+            );
+
+            assert_eq!(store.delete_message_entries(chat_id, message_id).await?, 1);
+            let count: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM chat_history_entries WHERE chat_id = $1 AND message_id = $2",
+            )
+            .bind(chat_id)
+            .bind(message_id)
+            .fetch_one(&pool)
+            .await?;
+            assert_eq!(count, 0);
+
+            Ok(())
+        }
+        .await;
+
+        let _ = store.delete_message_entries(chat_id, message_id).await;
+        result
     }
 
     #[tokio::test]

@@ -690,7 +690,9 @@ where
         real_message_id,
     );
     send_ready_virtual_op(&op, send).await?;
-    history.update_text(req.chat_id, real_message_id, req.text, req.parse_mode);
+    history
+        .update_text(req.chat_id, real_message_id, req.text, req.parse_mode)
+        .await;
 
     let mut report = VirtualMessageReport::sent_now(real_message_id);
     report.history_updated = true;
@@ -734,7 +736,7 @@ where
         real_message_id,
     );
     send_ready_virtual_op(&op, send).await?;
-    history.delete_message(req.chat_id, real_message_id);
+    history.delete_message(req.chat_id, real_message_id).await;
 
     let delete_mapping_result = store
         .delete_mapping_by_virtual(req.vmsg_id.to_owned())
@@ -933,18 +935,26 @@ mod tests {
     }
 
     impl PendingOpHistory for HistoryStub {
-        fn update_text(&self, chat_id: i64, message_id: i32, text: &str, parse_mode: &str) {
+        fn update_text<'a>(
+            &'a self,
+            chat_id: i64,
+            message_id: i32,
+            text: &'a str,
+            parse_mode: &'a str,
+        ) -> super::BoxFuture<'a, ()> {
             self.state.lock().expect("store state").events.push(format!(
                 "history:update:{chat_id}:{message_id}:{text}:{parse_mode}"
             ));
+            Box::pin(async {})
         }
 
-        fn delete_message(&self, chat_id: i64, message_id: i32) {
+        fn delete_message<'a>(&'a self, chat_id: i64, message_id: i32) -> super::BoxFuture<'a, ()> {
             self.state
                 .lock()
                 .expect("store state")
                 .events
                 .push(format!("history:delete:{chat_id}:{message_id}"));
+            Box::pin(async {})
         }
     }
 
