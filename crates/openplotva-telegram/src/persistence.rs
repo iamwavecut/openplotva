@@ -9,11 +9,11 @@ use thiserror::Error;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::{
-    AudioMessagePlan, AudioSource, DispatcherDrain, DispatcherPersistencePayload,
-    DispatcherRestoredMessage, DispatcherWorkItem, EditMediaMessagePlan, MediaGroupMessagePlan,
-    MediaGroupPhotoItem, MessageFingerprint, PhotoMessagePlan, PhotoSource, ReplyParametersPlan,
-    StickerMessagePlan, TelegramOutboundMethod, TelegramOutboundMethodKind, hash_content,
-    parse_mode_from_go,
+    AudioMessagePlan, AudioSource, DispatcherDrain, DispatcherPersistencePayload, DispatcherQueue,
+    DispatcherRestoredMessage, DispatcherWorkItem, EditMediaMessagePlan, EnqueueOutcome,
+    MediaGroupMessagePlan, MediaGroupPhotoItem, MessageFingerprint, PhotoMessagePlan, PhotoSource,
+    ReplyParametersPlan, StickerMessagePlan, TelegramOutboundMethod, TelegramOutboundMethodKind,
+    hash_content, parse_mode_from_go,
 };
 
 /// Go Redis key used for dispatcher shutdown queue persistence.
@@ -114,6 +114,18 @@ pub struct PersistentDispatcherReplay {
     pub skipped: usize,
 }
 
+/// Result of applying a persistent replay to a dispatcher queue.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PersistentDispatcherRestoreReport {
+    /// Number of decoded replay items considered for restore.
+    pub loaded: usize,
+    /// Number of replay items inserted into the dispatcher queue.
+    pub restored: usize,
+    pub deduped: usize,
+    /// Number of stored items skipped during replay decode.
+    pub skipped: usize,
+}
+
 /// Redis-backed store for the Go dispatcher queue persistence key.
 #[derive(Clone, Debug)]
 pub struct RedisDispatcherQueueStore {
@@ -137,6 +149,17 @@ impl RedisDispatcherQueueStore {
         &self.key
     }
 
+    /// Load Redis replay data into the dispatcher queue using Go startup semantics.
+    pub async fn load_into_queue(
+        &self,
+        queue: &DispatcherQueue,
+    ) -> Result<PersistentDispatcherRestoreReport, DispatcherPersistenceError> {
+        let Some(replay) = self.load_replay().await? else {
+            return Ok(PersistentDispatcherRestoreReport::default());
+        };
+        Ok(restore_persistent_queue_replay(queue, replay))
+    }
+
     pub async fn save_drain(
         &self,
         drain: DispatcherDrain,
@@ -147,6 +170,14 @@ impl RedisDispatcherQueueStore {
         let queue = persistent_queue_from_drain(drain, self.max_messages)?;
         self.save_queue(&queue).await?;
         Ok(queue)
+    }
+
+    /// Drain the dispatcher queue and persist it with Go graceful-shutdown semantics.
+    pub async fn save_queue_on_shutdown(
+        &self,
+        queue: &DispatcherQueue,
+    ) -> Result<PersistentDispatcherQueue, DispatcherPersistenceError> {
+        self.save_drain(queue.drain_for_shutdown()).await
     }
 
     /// Persist already converted queue items to Redis using the Go `cache.RDB` wire format.
@@ -234,6 +265,28 @@ pub fn persistent_queue_replay_from_redis_value(
 ) -> Result<PersistentDispatcherReplay, DispatcherPersistenceError> {
     let json = decode_go_rdb_byte_slice(value)?;
     persistent_queue_replay_from_json(&json)
+}
+
+/// Apply decoded replay items to a dispatcher queue like Go `Dispatcher.Start`.
+pub fn restore_persistent_queue_replay(
+    queue: &DispatcherQueue,
+    replay: PersistentDispatcherReplay,
+) -> PersistentDispatcherRestoreReport {
+    let loaded = replay.items.len();
+    let mut report = PersistentDispatcherRestoreReport {
+        loaded,
+        skipped: replay.skipped,
+        ..PersistentDispatcherRestoreReport::default()
+    };
+
+    for item in replay.items {
+        match queue.restore(item) {
+            EnqueueOutcome::Enqueued => report.restored += 1,
+            EnqueueOutcome::Deduped => report.deduped += 1,
+        }
+    }
+
+    report
 }
 
 /// Convert decoded persistent items into replayable dispatcher items.
@@ -809,13 +862,14 @@ mod tests {
     use super::{decode_go_rdb_byte_slice, persistent_queue_redis_value_from_json};
     use crate::{
         AudioMessagePlan, AudioSource, DEFAULT_DISPATCHER_QUEUE_KEY,
-        DEFAULT_DISPATCHER_SHUTDOWN_TIMEOUT, DispatcherConfig, DispatcherMessage, DispatcherQueue,
-        EditMediaMessagePlan, MESSAGE_TYPE_TEXT, MediaGroupMessagePlan, MediaGroupPhotoItem,
-        MessageFingerprint, PersistentDispatcherItem, PhotoMessagePlan, PhotoSource,
+        DEFAULT_DISPATCHER_SHUTDOWN_TIMEOUT, DebouncerConfig, DispatcherConfig, DispatcherMessage,
+        DispatcherQueue, DispatcherRestoredMessage, EditMediaMessagePlan, EnqueueOutcome,
+        MESSAGE_TYPE_TEXT, MediaGroupMessagePlan, MediaGroupPhotoItem, MessageFingerprint,
+        PersistentDispatcherItem, PersistentDispatcherReplay, PhotoMessagePlan, PhotoSource,
         ReplyParametersPlan, StickerMessagePlan, TELEGRAM_PARSE_MODE_HTML, TelegramOutboundMethod,
         TelegramOutboundMethodKind, hash_content, persistent_queue_from_drain,
         persistent_queue_redis_value_from_items, persistent_queue_replay_from_json,
-        persistent_queue_replay_from_redis_value,
+        persistent_queue_replay_from_redis_value, restore_persistent_queue_replay,
     };
 
     fn text_message(chat_id: i64, text: &str, virtual_id: &str) -> DispatcherMessage {
@@ -832,6 +886,29 @@ mod tests {
 
     fn text_method(chat_id: i64, text: &str) -> TelegramOutboundMethod {
         TelegramOutboundMethod::from(carapax::types::SendMessage::new(chat_id, text))
+    }
+
+    fn restored_text(
+        chat_id: i64,
+        text: &str,
+        virtual_id: &str,
+        immediate: bool,
+    ) -> DispatcherRestoredMessage {
+        let fingerprint = MessageFingerprint {
+            chat_id,
+            message_type: MESSAGE_TYPE_TEXT.to_owned(),
+            content_hash: hash_content(text),
+            debounce_key: None,
+        };
+        DispatcherRestoredMessage {
+            fingerprint: fingerprint.clone(),
+            fingerprint_key: fingerprint.to_string(),
+            virtual_id: virtual_id.to_owned(),
+            immediate,
+            enqueued_at: std::time::SystemTime::now(),
+            method: text_method(chat_id, text),
+            persistence_payload: None,
+        }
     }
 
     fn sticker_method(chat_id: i64, file_id: &str) -> TelegramOutboundMethod {
@@ -1258,5 +1335,44 @@ mod tests {
         assert_eq!(replay.skipped, 1);
         assert_eq!(replay.items[0].virtual_id, "kept");
         Ok(())
+    }
+
+    #[test]
+    fn restore_replay_into_queue_reports_go_startup_counts() {
+        let queue = DispatcherQueue::new(DispatcherConfig {
+            max_queue_size: 0,
+            dedupe_config: DebouncerConfig {
+                enabled: true,
+                default_window: std::time::Duration::from_secs(30),
+                max_cache_size: 1000,
+                per_chat_settings: Default::default(),
+            },
+        });
+        assert_eq!(
+            queue.enqueue(
+                text_message(42, "already-sent", "existing")
+                    .with_method(text_method(42, "already-sent")),
+                false,
+            ),
+            EnqueueOutcome::Enqueued
+        );
+        let replay = PersistentDispatcherReplay {
+            items: vec![
+                restored_text(42, "already-sent", "deduped-immediate", true),
+                restored_text(42, "new", "restored-regular", false),
+            ],
+            skipped: 2,
+        };
+
+        let report = restore_persistent_queue_replay(&queue, replay);
+
+        assert_eq!(report.loaded, 2);
+        assert_eq!(report.restored, 1);
+        assert_eq!(report.deduped, 1);
+        assert_eq!(report.skipped, 2);
+        let snapshot = queue.snapshot();
+        assert_eq!(snapshot.regular.len(), 2);
+        assert_eq!(snapshot.regular[1].virtual_id, "restored-regular");
+        assert!(snapshot.immediate.is_empty());
     }
 }

@@ -38,9 +38,10 @@ pub use outbound::{
 pub use persistence::{
     DEFAULT_DISPATCHER_QUEUE_KEY, DEFAULT_DISPATCHER_SHUTDOWN_TIMEOUT, DispatcherPersistenceError,
     PersistentDispatcherItem, PersistentDispatcherQueue, PersistentDispatcherReplay,
-    RedisDispatcherQueueStore, persistent_queue_from_drain,
+    PersistentDispatcherRestoreReport, RedisDispatcherQueueStore, persistent_queue_from_drain,
     persistent_queue_redis_value_from_items, persistent_queue_replay_from_items,
     persistent_queue_replay_from_json, persistent_queue_replay_from_redis_value,
+    restore_persistent_queue_replay,
 };
 pub use rate_limit::{ChatLimiters, DEFAULT_DISPATCH_INTERVAL, DEFAULT_RATE_LIMITER_MAX_IDLE};
 pub use transport::{
