@@ -7,6 +7,11 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+[dependencies]
+openplotva-config = { path = "../openplotva-config" }
+redis = { workspace = true, features = ["tokio-comp"] }
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio"] }
+thiserror.workspace = true
+
 [lints]
 workspace = true
-

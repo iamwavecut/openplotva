@@ -9,7 +9,8 @@ The repository is private while the implementation is in progress. The code and 
 - Rust workspace scaffolded with Rust 2024, Cargo resolver 3, and Rust `1.95.0`.
 - Initial Go reference snapshot recorded in `docs/contract/reference-snapshot.json`.
 - The Go repository is read-only reference material for this implementation.
-- The first runnable Rust shell exposes `/api/health`; behavior contract work is still ahead.
+- The first runnable Rust shell exposes `/api/health` and `/api/ready`.
+- App startup enforces the Go reference snapshot by default and can optionally probe Postgres plus Redis/Dragonfly.
 
 ## Local Setup
 
@@ -38,9 +39,36 @@ cargo run -p openplotva-tool-contract-inventory
 Run the current app shell:
 
 ```sh
-OPENPLOTVA_BIND_ADDR=127.0.0.1:8080 cargo run -p openplotva-app
+WEBAPP_HOST=127.0.0.1 WEBAPP_PORT=8080 cargo run -p openplotva-app
 curl -fsS http://127.0.0.1:8080/api/health
+curl -fsS http://127.0.0.1:8080/api/ready
 ```
+
+The app loads `.env` like the Go implementation. The current service-spine env vars are:
+
+| Env | Default | Notes |
+| --- | --- | --- |
+| `LOG_LEVEL` | `info` | Go-compatible log level; mapped into the Rust tracing filter. |
+| `OPENPLOTVA_LOG_FILTER` | `openplotva=info,tower_http=info` | Rust-only tracing filter override. |
+| `WEBAPP_HOST` | `0.0.0.0` | Go-compatible HTTP bind host. |
+| `WEBAPP_PORT` | `8080` | Go-compatible HTTP bind port. |
+| `WEBAPP_URL` | `http://127.0.0.1:8080` | Public WebApp URL. |
+| `DB_POSTGRES_HOST` | `127.0.0.1` | Postgres host. |
+| `DB_POSTGRES_PORT` | `5432` | Postgres port. |
+| `DB_POSTGRES_USER` | `plotva` | Postgres user. |
+| `DB_POSTGRES_PASSWORD` | `plotva` | Postgres password. |
+| `DB_POSTGRES_DB` | `plotva` | Postgres database. |
+| `DB_POSTGRES_SSL_MODE` | `disable` | Loaded for config contract; current Go startup still hardcodes `sslmode=disable`. |
+| `REDIS_HOST` | `127.0.0.1` | Redis/Dragonfly host. |
+| `REDIS_PORT` | `6379` | Redis/Dragonfly port. |
+| `REDIS_PASSWORD` | empty | Redis/Dragonfly password. |
+| `REDIS_DB` | `0` | Redis/Dragonfly DB. |
+| `OPENPLOTVA_REFERENCE_SOURCE_REPOSITORY` | `/Users/Shared/src/github.com/iamwavecut/reference-app` | Read-only Go source used for lock checks. |
+| `OPENPLOTVA_RUNTIME_CONTRACT_PATH` | `docs/contract/reference-snapshot.json` | Reference-snapshot JSON file. |
+| `OPENPLOTVA_DISABLED_LEGACY_LOCK` | `true` | Fails startup when Go `HEAD` differs from the lock. |
+| `OPENPLOTVA_CONNECT_SERVICES` | `false` | When `true`, startup connects to Postgres and Redis/Dragonfly and `/api/ready` reports them as `ok`. |
+
+`OPENPLOTVA_BIND_ADDR` is still accepted as a Rust-only local override for the assembled bind address. Prefer `WEBAPP_HOST` and `WEBAPP_PORT` for contract work.
 
 ## Reference Snapshot
 
@@ -52,6 +80,8 @@ The frozen Go behavior starts at:
 - Subject: `Refactor everything`
 
 Before each major milestone, compare the Go `HEAD` with `docs/contract/reference-snapshot.json`. If it changed, classify and port the diff before advancing the lock.
+
+The Rust app performs this check on startup unless `OPENPLOTVA_DISABLED_LEGACY_LOCK=false` is set. Use that override only for isolated development where the Go source checkout is intentionally unavailable.
 
 ## Architecture Map
 

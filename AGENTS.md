@@ -38,6 +38,7 @@ Do not spend time polishing broad abstractions until the relevant contract inven
   - Subject: `Refactor everything`
 - Store the active lock in `docs/contract/reference-snapshot.json`.
 - Before every major milestone, compare `/Users/Shared/src/github.com/iamwavecut/reference-app` `HEAD` to the stored lock.
+- The Rust app enforces this check on startup by default through `OPENPLOTVA_DISABLED_LEGACY_LOCK=true`.
 - If Go `HEAD` changed, classify the diff, update inventories/tests, port the behavior, write a catch-up note, then advance the lock.
 - Keep `docs/contract/deviations.md` empty unless the user explicitly approves a deviation.
 - Preserve user-facing strings, prompts, Telegram payload shapes, HTML sanitization, callback data, payment behavior, DB schema meaning, HTTP routes, GraphQL schema, and admin/settings assets unless a deviation is approved.
@@ -66,6 +67,7 @@ Do not spend time polishing broad abstractions until the relevant contract inven
 - Runtime/web: `tokio`, `axum`, `tower-http`, `tracing`, OpenTelemetry.
 - Database: `sqlx` for async Postgres, runtime/embedded migrations where appropriate, `pgvector` with SQLx support for memory/shield embeddings.
 - Redis/Dragonfly: `redis` with Tokio support; add `deadpool-redis` only when pooling or isolation is genuinely needed.
+- Current service-spine probes are gated by `OPENPLOTVA_CONNECT_SERVICES=false` by default. Do not treat skipped probes as storage contract; enable them when working on live Postgres/Redis behavior.
 - Telegram Bot API: use `tg-rs/carapax` as the integration base. Do not use `frankenstein` unless the user reverses this decision.
 - LLM: define Plotva-owned provider traits. Implement with `genai`, `async-openai`, and raw `reqwest` only for provider gaps.
 - Prompts: keep `.prompt` files and use Rust `handlebars` first. Do not implementation prompt language before contract is proven.

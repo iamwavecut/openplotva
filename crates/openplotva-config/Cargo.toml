@@ -8,9 +8,9 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+dotenvy.workspace = true
 serde = { workspace = true, features = ["derive"] }
 thiserror.workspace = true
 
 [lints]
 workspace = true
-
