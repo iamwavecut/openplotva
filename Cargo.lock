@@ -1650,7 +1650,10 @@ version = "0.1.0"
 name = "openplotva-updates"
 version = "0.1.0"
 dependencies = [
+ "carapax",
  "redis",
+ "serde",
+ "serde_json",
  "thiserror",
  "tokio",
  "zstd",

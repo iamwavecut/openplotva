@@ -2,7 +2,9 @@
 
 use std::{io, time::Duration};
 
+use carapax::types::Update as TelegramUpdate;
 use redis::Client as RedisClient;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Human-readable crate purpose used by scaffold tests and docs.
@@ -11,50 +13,93 @@ pub const PURPOSE: &str = "updates";
 /// Go `internal/updates.QueueKey` Redis list used for Telegram update ingestion.
 pub const DEFAULT_UPDATE_QUEUE_KEY: &str = "plotva:updates:queue";
 
-/// A queued Telegram update in the Go wire format.
+/// Rust-native update payload format stored inside the Redis update queue.
+pub const NATIVE_UPDATE_CODEC: &str = "openplotva.update.v1+carapax-json.zstd";
+
+pub const NATIVE_UPDATE_FORMAT_VERSION: u16 = 1;
+
 ///
-/// The Go runtime stores each update as zstd-compressed `encoding/gob`
-/// bytes and pushes the bytes as a binary-safe Redis string. The typed
-/// `api.Update` gob schema is still Go-owned; this wrapper keeps the
-/// queue representation byte-compatible while the Rust update processor
-/// is being ported.
+/// The Go runtime stored each update as zstd-compressed `encoding/gob`
+/// envelope around `carapax::types::Update`, then compresses that envelope
+/// with zstd before pushing it as a binary-safe Redis string.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EncodedUpdate {
-    compressed_gob: Vec<u8>,
+    compressed_payload: Vec<u8>,
 }
 
 impl EncodedUpdate {
-    /// Build an encoded update from the raw Redis list value written by Go.
-    pub fn from_go_queue_value(value: impl Into<Vec<u8>>) -> Self {
+    /// Build an encoded update from the raw Redis list value.
+    pub fn from_queue_value(value: impl Into<Vec<u8>>) -> Self {
         Self {
-            compressed_gob: value.into(),
+            compressed_payload: value.into(),
         }
     }
 
-    /// Build an encoded update from already-gob-encoded `api.Update` bytes.
-    pub fn from_gob_bytes(gob_bytes: &[u8]) -> Result<Self, UpdateCodecError> {
+    /// Build an encoded update from an uncompressed native JSON envelope.
+    pub fn from_native_json_bytes(json_bytes: &[u8]) -> Result<Self, UpdateCodecError> {
         Ok(Self {
-            compressed_gob: zstd::encode_all(gob_bytes, 1)?,
+            compressed_payload: zstd::encode_all(json_bytes, 1)?,
         })
     }
 
-    /// Return the binary Redis value expected by Go `RPushStringContext`.
-    pub fn as_go_queue_value(&self) -> &[u8] {
-        &self.compressed_gob
+    /// Build an encoded update from a typed `carapax` update.
+    pub fn from_update(update: &TelegramUpdate) -> Result<Self, UpdateCodecError> {
+        let envelope = NativeUpdateEnvelopeRef {
+            version: NATIVE_UPDATE_FORMAT_VERSION,
+            codec: NATIVE_UPDATE_CODEC,
+            update,
+        };
+        let payload = serde_json::to_vec(&envelope)?;
+        Self::from_native_json_bytes(&payload)
+    }
+
+    /// Return the binary Redis value stored in the update queue.
+    pub fn as_queue_value(&self) -> &[u8] {
+        &self.compressed_payload
     }
 
     /// Consume this wrapper and return the binary Redis value.
-    pub fn into_go_queue_value(self) -> Vec<u8> {
-        self.compressed_gob
+    pub fn into_queue_value(self) -> Vec<u8> {
+        self.compressed_payload
     }
 
-    /// Decompress this queued update into Go gob bytes.
-    pub fn decompress_gob(&self) -> Result<Vec<u8>, UpdateCodecError> {
-        Ok(zstd::decode_all(self.compressed_gob.as_slice())?)
+    /// Decompress this queued update into the native JSON envelope bytes.
+    pub fn decompress_native_json(&self) -> Result<Vec<u8>, UpdateCodecError> {
+        Ok(zstd::decode_all(self.compressed_payload.as_slice())?)
+    }
+
+    /// Decode this queued update into a typed `carapax` update.
+    pub fn decode_update(&self) -> Result<TelegramUpdate, UpdateCodecError> {
+        let payload = self.decompress_native_json()?;
+        let envelope: NativeUpdateEnvelope = serde_json::from_slice(&payload)?;
+
+        if envelope.version != NATIVE_UPDATE_FORMAT_VERSION || envelope.codec != NATIVE_UPDATE_CODEC
+        {
+            return Err(UpdateCodecError::UnsupportedFormat {
+                version: envelope.version,
+                codec: envelope.codec,
+            });
+        }
+
+        Ok(serde_json::from_value(envelope.update)?)
     }
 }
 
-/// Redis-backed Telegram update queue matching Go `internal/updates.Queue`.
+#[derive(Debug, Deserialize)]
+struct NativeUpdateEnvelope {
+    version: u16,
+    codec: String,
+    update: serde_json::Value,
+}
+
+#[derive(Serialize)]
+struct NativeUpdateEnvelopeRef<'a> {
+    version: u16,
+    codec: &'static str,
+    update: &'a TelegramUpdate,
+}
+
+/// Redis-backed Telegram update queue.
 #[derive(Clone, Debug)]
 pub struct RedisUpdateQueue {
     client: RedisClient,
@@ -85,15 +130,15 @@ impl RedisUpdateQueue {
         let mut connection = self.client.get_multiplexed_async_connection().await?;
         let _: i64 = redis::cmd("RPUSH")
             .arg(&self.key)
-            .arg(update.as_go_queue_value())
+            .arg(update.as_queue_value())
             .query_async(&mut connection)
             .await?;
         Ok(())
     }
 
-    /// Compress gob bytes and enqueue them with Go `RPUSH` semantics.
-    pub async fn enqueue_gob_bytes(&self, gob_bytes: &[u8]) -> Result<(), UpdateQueueError> {
-        let update = EncodedUpdate::from_gob_bytes(gob_bytes)?;
+    /// Encode and enqueue a typed `carapax` update with `RPUSH` semantics.
+    pub async fn enqueue_update(&self, update: &TelegramUpdate) -> Result<(), UpdateQueueError> {
+        let update = EncodedUpdate::from_update(update)?;
         self.enqueue_encoded(&update).await
     }
 
@@ -110,7 +155,7 @@ impl RedisUpdateQueue {
             .arg(blpop_timeout_arg(timeout))
             .query_async(&mut connection)
             .await?;
-        Ok(result.map(|(_, value)| EncodedUpdate::from_go_queue_value(value)))
+        Ok(result.map(|(_, value)| EncodedUpdate::from_queue_value(value)))
     }
 
     /// Return the Redis list length using Go `LLEN` semantics.
@@ -135,12 +180,23 @@ pub enum UpdateCodecError {
     /// zstd compression or decompression failed.
     #[error("failed to process zstd update payload: {0}")]
     Zstd(#[from] io::Error),
+    /// JSON serialization or deserialization failed.
+    #[error("failed to process native update JSON payload: {0}")]
+    Json(#[from] serde_json::Error),
+    /// The decoded envelope is not a supported Rust update queue format.
+    #[error("unsupported native update frame {codec} version {version}")]
+    UnsupportedFormat {
+        /// Decoded format version.
+        version: u16,
+        /// Decoded codec string.
+        codec: String,
+    },
 }
 
 /// Errors returned by the Redis-backed update queue.
 #[derive(Debug, Error)]
 pub enum UpdateQueueError {
-    /// The zstd/gob payload could not be prepared.
+    /// The zstd/native JSON payload could not be prepared.
     #[error(transparent)]
     Codec(#[from] UpdateCodecError),
     /// Redis command failed.
@@ -175,7 +231,13 @@ mod tests {
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
-    use super::{DEFAULT_UPDATE_QUEUE_KEY, EncodedUpdate, RedisUpdateQueue, blpop_timeout_arg};
+    use serde_json::json;
+
+    use super::{
+        DEFAULT_UPDATE_QUEUE_KEY, EncodedUpdate, RedisUpdateQueue, UpdateCodecError,
+        blpop_timeout_arg,
+    };
+    use carapax::types::Update as TelegramUpdate;
 
     #[test]
     fn queue_key_matches_go_update_queue() {
@@ -183,30 +245,72 @@ mod tests {
     }
 
     #[test]
-    fn encoded_update_preserves_go_queue_value_bytes() {
+    fn encoded_update_preserves_queue_value_bytes() {
         let value = vec![0x28, 0xb5, 0x2f, 0xfd, 0x00];
-        let update = EncodedUpdate::from_go_queue_value(value.clone());
+        let update = EncodedUpdate::from_queue_value(value.clone());
 
-        assert_eq!(update.as_go_queue_value(), value.as_slice());
-        assert_eq!(update.into_go_queue_value(), value);
+        assert_eq!(update.as_queue_value(), value.as_slice());
+        assert_eq!(update.into_queue_value(), value);
     }
 
     #[test]
-    fn zstd_update_frame_round_trips_gob_bytes() -> Result<(), Box<dyn Error>> {
-        let gob_bytes = b"go gob api.Update bytes stay opaque for now";
-        let update = EncodedUpdate::from_gob_bytes(gob_bytes)?;
+    fn zstd_update_frame_round_trips_native_json_bytes() -> Result<(), Box<dyn Error>> {
+        let json_bytes = br#"{"version":1,"codec":"openplotva.update.v1+carapax-json.zstd"}"#;
+        let update = EncodedUpdate::from_native_json_bytes(json_bytes)?;
 
-        assert_ne!(update.as_go_queue_value(), gob_bytes);
-        assert_eq!(update.decompress_gob()?, gob_bytes);
+        assert_ne!(update.as_queue_value(), json_bytes);
+        assert_eq!(update.decompress_native_json()?, json_bytes);
+
+        Ok(())
+    }
+
+    #[test]
+    fn native_update_frame_round_trips_carapax_update() -> Result<(), Box<dyn Error>> {
+        let update = sample_message_update()?;
+        let encoded = EncodedUpdate::from_update(&update)?;
+        let decoded = encoded.decode_update()?;
+
+        assert_eq!(decoded.id, update.id);
+        assert_eq!(
+            serde_json::to_value(&decoded)?,
+            serde_json::to_value(&update)?
+        );
+        let text = decoded
+            .get_message()
+            .and_then(|message| message.get_text())
+            .ok_or_else(|| io::Error::other("expected decoded message text"))?;
+        assert_eq!(text.as_ref(), "/start hello");
+
+        Ok(())
+    }
+
+    #[test]
+    fn unsupported_native_update_frame_is_rejected() -> Result<(), Box<dyn Error>> {
+        let payload = serde_json::to_vec(&json!({
+            "version": 2,
+            "codec": "unsupported",
+            "update": {
+                "future_update_shape": true
+            }
+        }))?;
+        let encoded = EncodedUpdate::from_native_json_bytes(&payload)?;
+
+        assert!(matches!(
+            encoded.decode_update(),
+            Err(UpdateCodecError::UnsupportedFormat {
+                version: 2,
+                ref codec,
+            }) if codec == "unsupported"
+        ));
 
         Ok(())
     }
 
     #[test]
     fn invalid_zstd_update_frame_is_rejected() {
-        let update = EncodedUpdate::from_go_queue_value(b"not zstd".to_vec());
+        let update = EncodedUpdate::from_queue_value(b"not zstd".to_vec());
 
-        assert!(update.decompress_gob().is_err());
+        assert!(update.decompress_native_json().is_err());
     }
 
     #[test]
@@ -234,10 +338,29 @@ mod tests {
             .query_async(&mut connection)
             .await?;
 
-        let first = EncodedUpdate::from_gob_bytes(b"first gob update")?;
-        let second = EncodedUpdate::from_gob_bytes(b"second gob update")?;
-        queue.enqueue_encoded(&first).await?;
-        queue.enqueue_encoded(&second).await?;
+        let first = sample_message_update()?;
+        let second = serde_json::from_value(json!({
+            "update_id": 12346,
+            "message": {
+                "message_id": 78,
+                "date": 1710000001,
+                "chat": {
+                    "id": 42,
+                    "type": "private",
+                    "first_name": "Ada",
+                    "username": "ada_l"
+                },
+                "from": {
+                    "id": 99,
+                    "is_bot": false,
+                    "first_name": "Ada",
+                    "username": "ada_l"
+                },
+                "text": "second update"
+            }
+        }))?;
+        queue.enqueue_update(&first).await?;
+        queue.enqueue_update(&second).await?;
         assert_eq!(queue.len().await?, 2);
         assert!(!queue.is_empty().await?);
 
@@ -245,14 +368,14 @@ mod tests {
             .dequeue_encoded(Duration::from_secs(1))
             .await?
             .ok_or_else(|| io::Error::other("expected queued update"))?;
-        assert_eq!(dequeued.decompress_gob()?, b"first gob update");
+        assert_eq!(dequeued.decode_update()?.id, 12345);
         assert_eq!(queue.len().await?, 1);
 
         let dequeued = queue
             .dequeue_encoded(Duration::from_secs(1))
             .await?
             .ok_or_else(|| io::Error::other("expected queued update"))?;
-        assert_eq!(dequeued.decompress_gob()?, b"second gob update");
+        assert_eq!(dequeued.decode_update()?.id, 12346);
         assert!(queue.is_empty().await?);
 
         let _: i64 = redis::cmd("DEL")
@@ -260,5 +383,28 @@ mod tests {
             .query_async(&mut connection)
             .await?;
         Ok(())
+    }
+
+    fn sample_message_update() -> Result<TelegramUpdate, serde_json::Error> {
+        serde_json::from_value(json!({
+            "update_id": 12345,
+            "message": {
+                "message_id": 77,
+                "date": 1710000000,
+                "chat": {
+                    "id": 42,
+                    "type": "private",
+                    "first_name": "Ada",
+                    "username": "ada_l"
+                },
+                "from": {
+                    "id": 99,
+                    "is_bot": false,
+                    "first_name": "Ada",
+                    "username": "ada_l"
+                },
+                "text": "/start hello"
+            }
+        }))
     }
 }

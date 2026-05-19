@@ -124,6 +124,10 @@ Keep these unchanged unless an approved deviation is recorded:
 
 Approved deviations must be written in `docs/contract/deviations.md`.
 
+Current approved deviation: the Rust Telegram update queue keeps the Go Redis
+key and FIFO operations, but stores zstd-compressed serde JSON envelopes over
+`carapax::types::Update` instead of Go gob payloads.
+
 ## Migrations
 
 The Rust repo carries a SQLx-compatible conversion of the frozen Go migrations under `migrations/`.
