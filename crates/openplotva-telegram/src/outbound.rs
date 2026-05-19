@@ -3,8 +3,9 @@
 use std::io::Cursor;
 
 use carapax::types::{
-    EditMessageText, InlineKeyboardMarkup, InputFile, InputFileReader, ParseMode, ReplyMarkup,
-    ReplyParameters, ReplyParametersError, SendMessage, SendPhoto, SendSticker,
+    EditMessageText, InlineKeyboardMarkup, InputFile, InputFileReader, InputMediaPhoto, MediaGroup,
+    MediaGroupError, MediaGroupItem, ParseMode, ReplyMarkup, ReplyParameters, ReplyParametersError,
+    SendMediaGroup, SendMessage, SendPhoto, SendSticker,
 };
 use thiserror::Error;
 
@@ -166,6 +167,49 @@ pub struct PhotoMessagePlan {
     pub reply_parameters: Option<ReplyParametersPlan>,
 }
 
+/// Photo item in a Telegram media group, matching Go `api.InputMediaPhoto`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MediaGroupPhotoItem {
+    /// Photo file, URL, or upload bytes.
+    pub photo: PhotoSource,
+    /// Optional Telegram caption.
+    pub caption: String,
+    /// Go `ParseMode` string for the caption.
+    pub render_as: String,
+    /// Whether Telegram should cover the media with a spoiler.
+    pub has_spoiler: bool,
+}
+
+/// Media group send request fields assembled by the Go image workflow.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MediaGroupMessageRequest {
+    /// Target chat.
+    pub chat: ChatRef,
+    /// Target topic ID when present in the draw request.
+    pub message_thread_id: i64,
+    /// Whether Telegram should suppress user notification sound.
+    pub disable_notification: bool,
+    /// Ordered album items.
+    pub items: Vec<MediaGroupPhotoItem>,
+    /// Explicit reply parameters overlaid by the Go caller.
+    pub reply_parameters: Option<ReplyParametersPlan>,
+}
+
+/// Public media-group payload mirror for asserting form-only `carapax` methods.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MediaGroupMessagePlan {
+    /// Telegram target chat ID.
+    pub chat_id: i64,
+    /// Forum topic ID, when Go would set it on the outbound config.
+    pub message_thread_id: Option<i64>,
+    /// Whether Telegram should suppress user notification sound.
+    pub disable_notification: bool,
+    /// Ordered album items.
+    pub items: Vec<MediaGroupPhotoItem>,
+    /// Reply parameters, when sending as a reply.
+    pub reply_parameters: Option<ReplyParametersPlan>,
+}
+
 /// Outbound builder error matching Go validation failures where possible.
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum OutboundBuildError {
@@ -190,6 +234,9 @@ pub enum OutboundBuildError {
     /// `carapax` failed to serialize reply parameters for a form method.
     #[error("failed to serialize Telegram reply parameters: {0}")]
     ReplyParameters(String),
+    /// `carapax` rejected a Telegram media group.
+    #[error("failed to build Telegram media group: {0}")]
+    MediaGroup(String),
 }
 
 /// Build all outbound `sendMessage` methods for a text request.
@@ -328,6 +375,24 @@ pub fn build_photo_message_plan(
     })
 }
 
+/// Build an outbound `sendMediaGroup` method.
+pub fn build_media_group_message_method(
+    req: &MediaGroupMessageRequest,
+) -> Result<SendMediaGroup, OutboundBuildError> {
+    build_media_group_message_plan(req).to_carapax()
+}
+
+/// Build an inspectable media-group payload plan matching Go `api.NewMediaGroup` overlays.
+pub fn build_media_group_message_plan(req: &MediaGroupMessageRequest) -> MediaGroupMessagePlan {
+    MediaGroupMessagePlan {
+        chat_id: req.chat.id,
+        message_thread_id: (req.message_thread_id != 0).then_some(req.message_thread_id),
+        disable_notification: req.disable_notification,
+        items: req.items.clone(),
+        reply_parameters: req.reply_parameters,
+    }
+}
+
 /// Validate text exactly like Go before send/edit.
 pub fn validate_text_message_text(text: &str, render_as: &str) -> Result<(), OutboundBuildError> {
     if text.is_empty() {
@@ -436,9 +501,57 @@ impl PhotoSource {
     }
 }
 
+impl MediaGroupMessagePlan {
+    /// Convert the inspectable plan into the `carapax` form-backed method.
+    pub fn to_carapax(&self) -> Result<SendMediaGroup, OutboundBuildError> {
+        let items = self
+            .items
+            .iter()
+            .map(MediaGroupPhotoItem::to_carapax)
+            .collect::<Result<Vec<_>, _>>()?;
+        let group = MediaGroup::new(items)?;
+        let mut method = SendMediaGroup::new(self.chat_id, group);
+        if let Some(thread_id) = self.message_thread_id {
+            method = method.with_message_thread_id(thread_id);
+        }
+        if self.disable_notification {
+            method = method.with_disable_notification(true);
+        }
+        if let Some(reply) = self.reply_parameters {
+            method = method.with_reply_parameters(reply.into_carapax())?;
+        }
+        Ok(method)
+    }
+}
+
+impl MediaGroupPhotoItem {
+    fn to_carapax(&self) -> Result<MediaGroupItem, OutboundBuildError> {
+        let mut metadata = InputMediaPhoto::default();
+        if !self.caption.is_empty() {
+            metadata = metadata.with_caption(self.caption.clone());
+        }
+        if let Some(parse_mode) = parse_mode_from_go(&self.render_as)? {
+            metadata = metadata.with_caption_parse_mode(parse_mode);
+        }
+        if self.has_spoiler {
+            metadata = metadata.with_has_spoiler(true);
+        }
+        Ok(MediaGroupItem::for_photo(
+            self.photo.to_input_file(),
+            metadata,
+        ))
+    }
+}
+
 impl From<ReplyParametersError> for OutboundBuildError {
     fn from(value: ReplyParametersError) -> Self {
         Self::ReplyParameters(value.to_string())
+    }
+}
+
+impl From<MediaGroupError> for OutboundBuildError {
+    fn from(value: MediaGroupError) -> Self {
+        Self::MediaGroup(value.to_string())
     }
 }
 
@@ -463,12 +576,14 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ChatRef, EditTextMessageRequest, OutboundBuildError, PhotoMessageRequest, PhotoSource,
-        ReplyMessageRef, ReplyParametersPlan, StickerMessageRequest, TextMessageRequest,
-        allow_sending_without_reply, build_edit_text_message_method, build_photo_message_method,
-        build_photo_message_plan, build_sticker_message_method, build_sticker_message_plan,
-        build_text_message_method, build_text_message_methods, forum_thread_id,
-        message_target_chat, validate_text_message_text,
+        ChatRef, EditTextMessageRequest, MediaGroupMessageRequest, MediaGroupPhotoItem,
+        OutboundBuildError, PhotoMessageRequest, PhotoSource, ReplyMessageRef, ReplyParametersPlan,
+        StickerMessageRequest, TextMessageRequest, allow_sending_without_reply,
+        build_edit_text_message_method, build_media_group_message_method,
+        build_media_group_message_plan, build_photo_message_method, build_photo_message_plan,
+        build_sticker_message_method, build_sticker_message_plan, build_text_message_method,
+        build_text_message_methods, forum_thread_id, message_target_chat,
+        validate_text_message_text,
     };
     use crate::{
         InlineKeyboardButton, InlineKeyboardMarkup, ReplyMarkup, TELEGRAM_PARSE_MODE_HTML,
@@ -842,6 +957,89 @@ mod tests {
         let _method = build_photo_message_method(&req)?;
 
         Ok(())
+    }
+
+    #[test]
+    fn build_media_group_message_plan_keeps_placeholder_reply_thread_and_first_caption() {
+        let first = MediaGroupPhotoItem {
+            photo: PhotoSource::FileId("placeholder-file".to_owned()),
+            caption: "<b>caption</b>".to_owned(),
+            render_as: TELEGRAM_PARSE_MODE_HTML.to_owned(),
+            has_spoiler: false,
+        };
+        let second = MediaGroupPhotoItem {
+            photo: PhotoSource::FileId("placeholder-file".to_owned()),
+            caption: String::new(),
+            render_as: String::new(),
+            has_spoiler: false,
+        };
+        let req = MediaGroupMessageRequest {
+            chat: private_chat(42),
+            message_thread_id: 77,
+            disable_notification: false,
+            items: vec![first.clone(), second.clone()],
+            reply_parameters: Some(ReplyParametersPlan {
+                message_id: 9,
+                chat_id: 42,
+                allow_sending_without_reply: true,
+            }),
+        };
+
+        let plan = build_media_group_message_plan(&req);
+
+        assert_eq!(plan.chat_id, 42);
+        assert_eq!(plan.message_thread_id, Some(77));
+        assert_eq!(plan.items, vec![first, second]);
+        assert_eq!(plan.reply_parameters, req.reply_parameters);
+    }
+
+    #[test]
+    fn build_media_group_message_method_builds_carapax_method()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let req = MediaGroupMessageRequest {
+            chat: private_chat(42),
+            message_thread_id: 0,
+            disable_notification: false,
+            items: vec![
+                MediaGroupPhotoItem {
+                    photo: PhotoSource::FileId("first-photo".to_owned()),
+                    caption: String::new(),
+                    render_as: String::new(),
+                    has_spoiler: false,
+                },
+                MediaGroupPhotoItem {
+                    photo: PhotoSource::Url("https://example.test/second.png".to_owned()),
+                    caption: String::new(),
+                    render_as: String::new(),
+                    has_spoiler: false,
+                },
+            ],
+            reply_parameters: None,
+        };
+
+        let _method = build_media_group_message_method(&req)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn build_media_group_message_method_rejects_single_photo_album() {
+        let req = MediaGroupMessageRequest {
+            chat: private_chat(42),
+            message_thread_id: 0,
+            disable_notification: false,
+            items: vec![MediaGroupPhotoItem {
+                photo: PhotoSource::FileId("only-photo".to_owned()),
+                caption: String::new(),
+                render_as: String::new(),
+                has_spoiler: false,
+            }],
+            reply_parameters: None,
+        };
+
+        let err = build_media_group_message_method(&req).err();
+
+        assert!(matches!(err, Some(OutboundBuildError::MediaGroup(_))));
     }
 
     #[test]

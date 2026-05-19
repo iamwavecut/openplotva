@@ -9,10 +9,12 @@ pub use html::{
     sanitize_telegram_html, split_telegram_text, strip_telegram_html,
 };
 pub use outbound::{
-    ChatRef, EditTextMessageRequest, OutboundBuildError, PhotoMessagePlan, PhotoMessageRequest,
-    PhotoSource, ReplyMessageRef, ReplyParametersPlan, StickerMessagePlan, StickerMessageRequest,
+    ChatRef, EditTextMessageRequest, MediaGroupMessagePlan, MediaGroupMessageRequest,
+    MediaGroupPhotoItem, OutboundBuildError, PhotoMessagePlan, PhotoMessageRequest, PhotoSource,
+    ReplyMessageRef, ReplyParametersPlan, StickerMessagePlan, StickerMessageRequest,
     TELEGRAM_TEXT_MAX_BYTES, TextMessageRequest, allow_sending_without_reply,
-    build_edit_text_message_method, build_photo_message_method, build_photo_message_plan,
+    build_edit_text_message_method, build_media_group_message_method,
+    build_media_group_message_plan, build_photo_message_method, build_photo_message_plan,
     build_sticker_message_method, build_sticker_message_plan, build_text_message_method,
     build_text_message_methods, forum_thread_id, message_target_chat, parse_mode_from_go,
     validate_text_message_text,
@@ -53,6 +55,9 @@ pub type SendSticker = carapax::types::SendSticker;
 /// Telegram sendPhoto method from `carapax`.
 pub type SendPhoto = carapax::types::SendPhoto;
 
+/// Telegram sendMediaGroup method from `carapax`.
+pub type SendMediaGroup = carapax::types::SendMediaGroup;
+
 /// Telegram editMessageText method from `carapax`.
 pub type EditMessageText = carapax::types::EditMessageText;
 
@@ -73,6 +78,15 @@ pub type InputFile = carapax::types::InputFile;
 
 /// Telegram input-file reader type from `carapax`.
 pub type InputFileReader = carapax::types::InputFileReader;
+
+/// Telegram media group type from `carapax`.
+pub type MediaGroup = carapax::types::MediaGroup;
+
+/// Telegram media group item type from `carapax`.
+pub type MediaGroupItem = carapax::types::MediaGroupItem;
+
+/// Telegram input media photo metadata type from `carapax`.
+pub type InputMediaPhoto = carapax::types::InputMediaPhoto;
 
 /// Create an empty Telegram integration context.
 pub fn empty_context() -> CarapaxContext {
