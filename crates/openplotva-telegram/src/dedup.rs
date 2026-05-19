@@ -93,7 +93,7 @@ impl Debouncer {
         self.state().deduped_count
     }
 
-    fn should_process_at(&self, fingerprint: &MessageFingerprint, now: Instant) -> bool {
+    pub(crate) fn should_process_at(&self, fingerprint: &MessageFingerprint, now: Instant) -> bool {
         if !self.config.enabled {
             return true;
         }
@@ -124,7 +124,7 @@ impl Debouncer {
         false
     }
 
-    fn record_sent_at(&self, fingerprint: &MessageFingerprint, now: Instant) {
+    pub(crate) fn record_sent_at(&self, fingerprint: &MessageFingerprint, now: Instant) {
         if !self.config.enabled {
             return;
         }
