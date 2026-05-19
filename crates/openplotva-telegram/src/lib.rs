@@ -4,6 +4,7 @@ mod dedup;
 mod dispatcher;
 mod html;
 mod outbound;
+mod persistence;
 mod rate_limit;
 mod transport;
 
@@ -32,6 +33,10 @@ pub use outbound::{
     build_text_message_method, build_text_message_methods, fingerprint_audio_message_plan,
     fingerprint_photo_message_plan, fingerprint_sticker_message_plan, forum_thread_id,
     hash_content, message_target_chat, parse_mode_from_go, validate_text_message_text,
+};
+pub use persistence::{
+    DEFAULT_DISPATCHER_QUEUE_KEY, DEFAULT_DISPATCHER_SHUTDOWN_TIMEOUT, DispatcherPersistenceError,
+    PersistentDispatcherItem, PersistentDispatcherQueue, persistent_queue_from_drain,
 };
 pub use rate_limit::{ChatLimiters, DEFAULT_DISPATCH_INTERVAL, DEFAULT_RATE_LIMITER_MAX_IDLE};
 pub use transport::{

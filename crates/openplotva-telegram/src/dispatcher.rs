@@ -2,7 +2,7 @@ use std::{
     collections::VecDeque,
     future::Future,
     sync::{Mutex, MutexGuard},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use carapax::api::Client;
@@ -159,6 +159,7 @@ pub struct DispatcherQueuedMessage {
     pub immediate: bool,
     /// Enqueue time used for oldest-age statistics.
     pub added_at: Instant,
+    pub enqueued_at: SystemTime,
 }
 
 /// Worker-owned queue item containing cloneable metadata plus the send payload.
@@ -618,6 +619,7 @@ impl DispatcherQueue {
                 virtual_id,
                 immediate,
                 added_at: now,
+                enqueued_at: SystemTime::now(),
             },
             method,
         };
