@@ -56,10 +56,12 @@ pub use transport::{
     TelegramOutboundResponseKind, execute_telegram_method, send_telegram_method_status,
 };
 pub use update_startup::{
-    GO_LONG_POLL_RETRY_DELAY, GO_LONG_POLL_TIMEOUT, GetUpdatesExecutor, GetUpdatesFuture,
-    LongPollUpdateSource, TELEGRAM_WEBHOOK_PATH, WebhookSetup, build_delete_webhook_method,
+    GO_LONG_POLL_RETRY_DELAY, GO_LONG_POLL_TIMEOUT, GO_WEBHOOK_UPDATE_BUFFER_SIZE,
+    GO_WEBHOOK_UPDATE_SEND_TIMEOUT, GetUpdatesExecutor, GetUpdatesFuture, LongPollUpdateSource,
+    TELEGRAM_WEBHOOK_PATH, TELEGRAM_WEBHOOK_SECRET_HEADER, WebhookSetup, WebhookUpdateRequestError,
+    WebhookUpdateSendError, WebhookUpdateSender, WebhookUpdateSource, build_delete_webhook_method,
     build_get_updates_method, build_get_updates_method_with_offset, build_set_webhook_method,
-    go_allowed_update_set,
+    go_allowed_update_set, webhook_update_channel,
 };
 
 pub const INTEGRATION_CRATE: &str = "carapax";

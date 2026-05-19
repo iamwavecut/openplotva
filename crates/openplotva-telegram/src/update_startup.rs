@@ -12,7 +12,11 @@ use carapax::types::{
     AllowedUpdate, DeleteWebhook, GetUpdates, SetWebhook, Update as TelegramUpdate,
 };
 use openplotva_updates::{UpdateProducerSource, UpdateProducerSourceFuture};
-use tokio::{sync::Mutex, time::sleep};
+use thiserror::Error;
+use tokio::{
+    sync::{Mutex, mpsc},
+    time::{sleep, timeout},
+};
 
 /// Go `StartUpdateLoop` long-poll timeout.
 pub const GO_LONG_POLL_TIMEOUT: Duration = Duration::from_secs(60);
@@ -22,6 +26,15 @@ pub const GO_LONG_POLL_RETRY_DELAY: Duration = Duration::from_secs(3);
 
 /// Go webhook route registered by `ListenForUpdates`.
 pub const TELEGRAM_WEBHOOK_PATH: &str = "/telegram/webhook";
+
+/// Go webhook secret-token header checked by `ListenForUpdates`.
+pub const TELEGRAM_WEBHOOK_SECRET_HEADER: &str = "X-Telegram-Bot-Api-Secret-Token";
+
+/// Go `botAPI.Buffer` value set in `cmd/main.go`.
+pub const GO_WEBHOOK_UPDATE_BUFFER_SIZE: usize = 1_000_000;
+
+/// Go timeout for accepting one webhook update into the update channel.
+pub const GO_WEBHOOK_UPDATE_SEND_TIMEOUT: Duration = Duration::from_millis(1_500);
 
 /// Boxed future returned by Telegram `getUpdates` executors.
 pub type GetUpdatesFuture<'a, E> =
@@ -128,6 +141,136 @@ where
     }
 }
 
+/// Source side of Go's webhook update channel.
+pub struct WebhookUpdateSource {
+    receiver: Mutex<mpsc::Receiver<TelegramUpdate>>,
+}
+
+/// Sender side of Go's webhook update channel.
+#[derive(Clone, Debug)]
+pub struct WebhookUpdateSender {
+    sender: mpsc::Sender<TelegramUpdate>,
+    send_timeout: Duration,
+}
+
+/// Error returned while accepting a webhook update into the in-memory channel.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum WebhookUpdateSendError {
+    /// The receiver side has been closed.
+    #[error("webhook update receiver is closed")]
+    Closed,
+    /// The update channel stayed full until the Go timeout elapsed.
+    #[error("webhook update channel is full")]
+    Timeout,
+}
+
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum WebhookUpdateRequestError {
+    /// Only POST is accepted.
+    #[error("method not allowed")]
+    MethodNotAllowed,
+    /// The Telegram secret-token header did not match configured webhook secret.
+    #[error("unauthorized")]
+    Unauthorized,
+    /// Request body could not be parsed as a Telegram update.
+    #[error("invalid update")]
+    InvalidUpdate,
+    /// The update channel stayed full until the Go timeout elapsed.
+    #[error("service unavailable")]
+    ServiceUnavailable,
+}
+
+impl WebhookUpdateRequestError {
+    /// HTTP status code returned by Go `ListenForUpdates`.
+    pub const fn http_status(self) -> u16 {
+        match self {
+            Self::MethodNotAllowed => 405,
+            Self::Unauthorized => 401,
+            Self::InvalidUpdate => 400,
+            Self::ServiceUnavailable => 503,
+        }
+    }
+
+    /// Error body returned by Go for invalid update payloads.
+    pub const fn error_body(self) -> Option<&'static str> {
+        match self {
+            Self::InvalidUpdate => Some(r#"{"error":"invalid update"}"#),
+            Self::MethodNotAllowed | Self::Unauthorized | Self::ServiceUnavailable => None,
+        }
+    }
+}
+
+/// Build Go's webhook update channel pair.
+pub fn webhook_update_channel(buffer_size: usize) -> (WebhookUpdateSender, WebhookUpdateSource) {
+    let (sender, receiver) = mpsc::channel(buffer_size);
+    (
+        WebhookUpdateSender {
+            sender,
+            send_timeout: GO_WEBHOOK_UPDATE_SEND_TIMEOUT,
+        },
+        WebhookUpdateSource {
+            receiver: Mutex::new(receiver),
+        },
+    )
+}
+
+impl WebhookUpdateSender {
+    pub fn with_send_timeout(mut self, send_timeout: Duration) -> Self {
+        self.send_timeout = send_timeout;
+        self
+    }
+
+    /// Accept one parsed Telegram update into the webhook channel.
+    pub async fn accept_update(
+        &self,
+        update: TelegramUpdate,
+    ) -> Result<(), WebhookUpdateSendError> {
+        timeout(self.send_timeout, self.sender.send(update))
+            .await
+            .map_err(|_| WebhookUpdateSendError::Timeout)?
+            .map_err(|_| WebhookUpdateSendError::Closed)
+    }
+
+    /// Validate and accept one Telegram webhook request like Go `ListenForUpdates`.
+    pub async fn handle_webhook_request(
+        &self,
+        method: &str,
+        provided_secret: Option<&str>,
+        secret_token: &str,
+        body: &[u8],
+    ) -> Result<(), WebhookUpdateRequestError> {
+        if method != "POST" {
+            return Err(WebhookUpdateRequestError::MethodNotAllowed);
+        }
+        if provided_secret.unwrap_or_default() != secret_token {
+            return Err(WebhookUpdateRequestError::Unauthorized);
+        }
+
+        let update: TelegramUpdate =
+            serde_json::from_slice(body).map_err(|_| WebhookUpdateRequestError::InvalidUpdate)?;
+        self.accept_update(update)
+            .await
+            .map_err(|_| WebhookUpdateRequestError::ServiceUnavailable)
+    }
+}
+
+impl WebhookUpdateSource {
+    async fn next_update_inner(&self) -> Option<TelegramUpdate> {
+        self.receiver.lock().await.recv().await
+    }
+
+    /// Return the next buffered update without waiting.
+    pub async fn next_update_now(&self) -> Option<TelegramUpdate> {
+        self.receiver.lock().await.try_recv().ok()
+    }
+}
+
+impl UpdateProducerSource for WebhookUpdateSource {
+    fn next_update<'a>(&'a self) -> UpdateProducerSourceFuture<'a> {
+        Box::pin(self.next_update_inner())
+    }
+}
+
 /// Minimal webhook setup inputs used by Go `StartWebhookServer`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WebhookSetup {
@@ -204,8 +347,10 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        GO_LONG_POLL_TIMEOUT, LongPollUpdateSource, TELEGRAM_WEBHOOK_PATH, WebhookSetup,
-        build_delete_webhook_method, build_get_updates_method, build_set_webhook_method,
+        GO_LONG_POLL_TIMEOUT, GO_WEBHOOK_UPDATE_BUFFER_SIZE, GO_WEBHOOK_UPDATE_SEND_TIMEOUT,
+        LongPollUpdateSource, TELEGRAM_WEBHOOK_PATH, TELEGRAM_WEBHOOK_SECRET_HEADER, WebhookSetup,
+        WebhookUpdateRequestError, build_delete_webhook_method, build_get_updates_method,
+        build_set_webhook_method, webhook_update_channel,
     };
 
     #[test]
@@ -325,6 +470,92 @@ mod tests {
 
         assert_eq!(update.id, 10);
         assert_eq!(request_offsets(&client.requests()), vec![0, 0]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn webhook_update_source_yields_accepted_updates_in_fifo_order()
+    -> Result<(), Box<dyn Error>> {
+        let (sender, source) = webhook_update_channel(2);
+
+        sender.accept_update(sample_message_update(10)?).await?;
+        sender.accept_update(sample_message_update(11)?).await?;
+
+        let first = source.next_update().await.ok_or("expected first update")?;
+        let second = source.next_update().await.ok_or("expected second update")?;
+
+        assert_eq!([first.id, second.id], [10, 11]);
+        assert_eq!(GO_WEBHOOK_UPDATE_BUFFER_SIZE, 1_000_000);
+        assert_eq!(GO_WEBHOOK_UPDATE_SEND_TIMEOUT.as_millis(), 1_500);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn webhook_request_rejects_non_post_and_wrong_secret_like_go()
+    -> Result<(), Box<dyn Error>> {
+        let (sender, source) = webhook_update_channel(1);
+        let body = serde_json::to_vec(&sample_message_update(10)?)?;
+
+        let wrong_method = sender
+            .handle_webhook_request("GET", Some("secret"), "secret", &body)
+            .await
+            .expect_err("method rejected");
+        let wrong_secret = sender
+            .handle_webhook_request("POST", Some("wrong"), "secret", &body)
+            .await
+            .expect_err("secret rejected");
+
+        assert_eq!(wrong_method, WebhookUpdateRequestError::MethodNotAllowed);
+        assert_eq!(wrong_method.http_status(), 405);
+        assert_eq!(wrong_secret, WebhookUpdateRequestError::Unauthorized);
+        assert_eq!(wrong_secret.http_status(), 401);
+        assert!(source.next_update_now().await.is_none());
+        assert_eq!(
+            TELEGRAM_WEBHOOK_SECRET_HEADER,
+            "X-Telegram-Bot-Api-Secret-Token"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn webhook_request_accepts_empty_secret_and_valid_json_like_go()
+    -> Result<(), Box<dyn Error>> {
+        let (sender, source) = webhook_update_channel(1);
+        let body = serde_json::to_vec(&sample_message_update(10)?)?;
+
+        sender
+            .handle_webhook_request("POST", None, "", &body)
+            .await?;
+
+        let update = source.next_update().await.ok_or("expected update")?;
+        assert_eq!(update.id, 10);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn webhook_request_reports_invalid_update_and_full_channel_like_go()
+    -> Result<(), Box<dyn Error>> {
+        let (sender, source) = webhook_update_channel(1);
+        let sender = sender.with_send_timeout(Duration::from_millis(1));
+        let body = serde_json::to_vec(&sample_message_update(10)?)?;
+
+        sender
+            .handle_webhook_request("POST", Some("secret"), "secret", &body)
+            .await?;
+        let invalid = sender
+            .handle_webhook_request("POST", Some("secret"), "secret", b"not-json")
+            .await
+            .expect_err("invalid update rejected");
+        let full = sender
+            .handle_webhook_request("POST", Some("secret"), "secret", &body)
+            .await
+            .expect_err("full channel rejected");
+
+        assert_eq!(invalid.http_status(), 400);
+        assert_eq!(invalid.error_body(), Some(r#"{"error":"invalid update"}"#));
+        assert_eq!(full, WebhookUpdateRequestError::ServiceUnavailable);
+        assert_eq!(full.http_status(), 503);
+        assert_eq!(source.next_update().await.ok_or("queued update")?.id, 10);
         Ok(())
     }
 
