@@ -410,6 +410,45 @@ impl DispatcherQueue {
         }
     }
 
+    /// Run immediate and regular method workers together until `stop` completes.
+    pub async fn run_method_workers_until<F, Fut, Stop>(
+        &self,
+        limiters: &ChatLimiters,
+        stop: Stop,
+        send_method: F,
+    ) -> DispatcherWorkerLoopOutcome
+    where
+        F: Fn(TelegramOutboundMethod) -> Fut,
+        Fut: Future<Output = DispatcherSendStatus>,
+        Stop: Future<Output = ()>,
+    {
+        tokio::select! {
+            () = stop => DispatcherWorkerLoopOutcome::Stopped,
+            _ = async {
+                tokio::join!(
+                    self.run_immediate_method_worker_until(std::future::pending::<()>(), &send_method),
+                    self.run_regular_method_worker_until(limiters, std::future::pending::<()>(), &send_method),
+                );
+            } => DispatcherWorkerLoopOutcome::Stopped,
+        }
+    }
+
+    /// Run both method workers against a real `carapax` client until `stop` completes.
+    pub async fn run_telegram_workers_until<Stop>(
+        &self,
+        limiters: &ChatLimiters,
+        client: &Client,
+        stop: Stop,
+    ) -> DispatcherWorkerLoopOutcome
+    where
+        Stop: Future<Output = ()>,
+    {
+        self.run_method_workers_until(limiters, stop, |method| {
+            send_telegram_method_status(client, method)
+        })
+        .await
+    }
+
     /// Put a deferred regular item back at the front, matching Go wait-error handling.
     pub fn requeue_regular_front(&self, message: DispatcherWorkItem) {
         self.state().regular.push_front(DispatcherQueueItem {
@@ -1015,6 +1054,69 @@ mod tests {
             ]
         );
         assert_eq!(queue.stats().processed_total, 2);
+
+        stop_tx.send(()).expect("stop signal sent");
+        let outcome = tokio::time::timeout(Duration::from_secs(1), worker)
+            .await
+            .expect("worker stopped")
+            .expect("worker task");
+        assert_eq!(outcome, DispatcherWorkerLoopOutcome::Stopped);
+    }
+
+    #[tokio::test]
+    async fn combined_worker_runner_processes_regular_and_immediate_until_stop() {
+        let queue = Arc::new(DispatcherQueue::new(DispatcherConfig::default()));
+        let limiters = Arc::new(ChatLimiters::new(crate::DEFAULT_DISPATCH_INTERVAL));
+        let sent_methods = Arc::new(Mutex::new(Vec::new()));
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let worker = tokio::spawn({
+            let queue = Arc::clone(&queue);
+            let limiters = Arc::clone(&limiters);
+            let sent_methods = Arc::clone(&sent_methods);
+            async move {
+                queue
+                    .run_method_workers_until(
+                        &limiters,
+                        async {
+                            let _ = stop_rx.await;
+                        },
+                        move |method| {
+                            let sent_methods = Arc::clone(&sent_methods);
+                            async move {
+                                sent_methods
+                                    .lock()
+                                    .expect("sent methods lock")
+                                    .push(method.kind());
+                                DispatcherSendStatus::Sent
+                            }
+                        },
+                    )
+                    .await
+            }
+        });
+
+        tokio::task::yield_now().await;
+        queue.enqueue(
+            text_message(42, "regular", "regular-1").with_method(text_method(42, "regular body")),
+            false,
+        );
+        queue.enqueue(
+            text_message(43, "immediate", "immediate-1")
+                .with_method(text_method(43, "immediate body")),
+            true,
+        );
+
+        wait_until(|| sent_methods.lock().expect("sent methods lock").len() == 2).await;
+        assert_eq!(
+            *sent_methods.lock().expect("sent methods lock"),
+            vec![
+                TelegramOutboundMethodKind::SendMessage,
+                TelegramOutboundMethodKind::SendMessage
+            ]
+        );
+        assert_eq!(queue.stats().processed_total, 2);
+        assert_eq!(virtual_ids(queue.snapshot()), (vec![], vec![]));
 
         stop_tx.send(()).expect("stop signal sent");
         let outcome = tokio::time::timeout(Duration::from_secs(1), worker)
