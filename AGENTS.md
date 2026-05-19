@@ -18,6 +18,18 @@ Done means:
 - The original Go repository remains unchanged.
 - README and developer docs are suitable for future open-source release.
 
+## Current Critical Path
+
+The objective is still the full behavior-preserving Rust implementation, but day-to-day work should focus on the highest-leverage sequence:
+
+1. Keep the Go reference snapshot and generated contract inventories current.
+2. Build a runnable Rust service spine: config, lifecycle, observability, HTTP health/static serving, Postgres, Dragonfly/Redis, and reference-snapshot enforcement.
+3. Port the behavior-critical Telegram boundary around `carapax`: update ingestion, outbound payload model, command/callback contract, HTML sanitization, splitting, rate limits, deduplication, and virtual message IDs.
+4. Port storage and migrations with SQL behavior contract before higher-level business features.
+5. Port taskman, dialog, LLM, memory, media, and web features in tested vertical slices.
+
+Do not spend time polishing broad abstractions until the relevant contract inventory or vertical slice exists.
+
 ## Reference Snapshot And Contract
 
 - Initial observed Go reference snapshot:
@@ -93,6 +105,7 @@ prompts/
 web/admin/
 web/settings/
 tools/embedder/
+tools/contract-inventory/
 tools/token-estimator/
 tests/contract/
 ```
@@ -128,6 +141,7 @@ tests/contract/
 - Keep `README.md` current with local setup, required services, env vars, compose run, tests, architecture map, and future deployment notes.
 - Keep architecture notes under `docs/architecture/`.
 - Keep contract inventories, reference-snapshot material, baseline results, and approved deviations under `docs/contract/`.
+- Regenerate machine-built contract inventories with `cargo run -p openplotva-tool-contract-inventory`; do not edit files under `docs/contract/generated/` by hand.
 - Prefer concise docs that name source-of-truth files and commands over broad architecture tours.
 
 ## Working Style

@@ -29,6 +29,12 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
+Regenerate contract inventories from the locked Go source:
+
+```sh
+cargo run -p openplotva-tool-contract-inventory
+```
+
 Run the current app shell:
 
 ```sh
@@ -68,6 +74,7 @@ The intended crate layout mirrors the Go ownership map. The current navigation s
 - `openplotva-shield`: protective retrieval.
 - `openplotva-media`: image, vision, music, and file/media providers.
 - `openplotva-web`: admin/settings WebApp assets and backend helpers.
+- `openplotva-tool-contract-inventory`: deterministic inventory generator for the locked Go source.
 
 More detail belongs under `docs/architecture/` as behavior is ported.
 
