@@ -1,0 +1,17 @@
+[package]
+name = "openplotva-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+axum.workspace = true
+openplotva-core = { path = "../openplotva-core" }
+serde = { workspace = true, features = ["derive"] }
+
+[lints]
+workspace = true
+

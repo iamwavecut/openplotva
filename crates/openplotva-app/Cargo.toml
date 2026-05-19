@@ -1,0 +1,21 @@
+[package]
+name = "openplotva-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+openplotva-config = { path = "../openplotva-config" }
+openplotva-observability = { path = "../openplotva-observability" }
+openplotva-server = { path = "../openplotva-server" }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
+tracing.workspace = true
+
+[lints]
+workspace = true
+

@@ -1,0 +1,65 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/openplotva-app",
+    "crates/openplotva-config",
+    "crates/openplotva-core",
+    "crates/openplotva-observability",
+    "crates/openplotva-storage",
+    "crates/openplotva-telegram",
+    "crates/openplotva-server",
+    "crates/openplotva-updates",
+    "crates/openplotva-taskman",
+    "crates/openplotva-dialog",
+    "crates/openplotva-llm",
+    "crates/openplotva-prompts",
+    "crates/openplotva-history",
+    "crates/openplotva-memory",
+    "crates/openplotva-shield",
+    "crates/openplotva-media",
+    "crates/openplotva-web",
+    "tools/embedder",
+    "tools/token-estimator",
+]
+default-members = ["crates/openplotva-app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95.0"
+license = "MIT"
+repository = "https://github.com/iamwavecut/openplotva"
+
+[workspace.dependencies]
+anyhow = "1.0.102"
+async-graphql = "8.0.0-rc.5"
+async-openai = "0.38.2"
+axum = "0.8.9"
+carapax = "0.37.0"
+clap = "4.6.1"
+genai = "0.6.0-beta.20"
+handlebars = "6.4.1"
+opentelemetry = "0.32.0"
+pgvector = "0.4.1"
+redis = "1.2.1"
+reqwest = "0.13.3"
+serde = "1.0.228"
+serde_json = "1.0"
+sqlx = "0.9.0-alpha.1"
+thiserror = "2.0.18"
+tokio = "1.52.3"
+tower-http = "0.6.11"
+tracing = "0.1"
+tracing-opentelemetry = "0.33.0"
+tracing-subscriber = "0.3.23"
+utoipa = "5.5.0"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unwrap_used = "deny"
+

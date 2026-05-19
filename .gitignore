@@ -1,0 +1,8 @@
+/target/
+/.reference/
+/.env
+/.env.*
+!.env.example
+*.log
+.DS_Store
+
