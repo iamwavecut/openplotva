@@ -25,15 +25,12 @@ pub const DEFAULT_DISPATCHER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10
 /// Error returned while saving, loading, or converting dispatcher queue persistence.
 #[derive(Debug, Error)]
 pub enum DispatcherPersistenceError {
-    /// A concrete Telegram method failed to serialize to JSON.
-    #[error("failed to serialize outbound Telegram method: {0}")]
-    SerializeMethod(#[from] serde_json::Error),
+    /// A persistence payload failed to serialize to JSON.
+    #[error("failed to serialize dispatcher queue JSON: {0}")]
+    SerializeJson(#[from] serde_json::Error),
     /// Persistent queue JSON could not be decoded.
     #[error("failed to decode persistent dispatcher queue: {0}")]
     DeserializeQueue(serde_json::Error),
-    /// Persistent queue Redis value could not be decoded as Go's gob-wrapped `[]byte`.
-    #[error("failed to decode Go Redis byte slice value: {0}")]
-    DecodeRedisValue(&'static str),
     /// Redis command failed.
     #[error("dispatcher queue Redis operation failed: {0}")]
     Redis(#[from] redis::RedisError),
@@ -180,7 +177,7 @@ impl RedisDispatcherQueueStore {
         self.save_drain(queue.drain_for_shutdown()).await
     }
 
-    /// Persist already converted queue items to Redis using the Go `cache.RDB` wire format.
+    /// Persist already converted queue items to Redis using the Rust-native JSON wire value.
     pub async fn save_queue(
         &self,
         queue: &PersistentDispatcherQueue,
@@ -246,25 +243,18 @@ pub fn persistent_queue_replay_from_json(
     Ok(persistent_queue_replay_from_items(items))
 }
 
-/// Encode converted persistent items as the Go `cache.RDB.Set` Redis value.
+/// Encode converted persistent items as the Rust-native Redis JSON value.
 pub fn persistent_queue_redis_value_from_items(
     items: &[PersistentDispatcherItem],
 ) -> Result<Vec<u8>, DispatcherPersistenceError> {
-    let json = serde_json::to_vec(items)?;
-    Ok(persistent_queue_redis_value_from_json(&json))
+    Ok(serde_json::to_vec(items)?)
 }
 
-/// Encode queue JSON bytes as Go's gob-wrapped `[]byte` Redis value.
-fn persistent_queue_redis_value_from_json(json: &[u8]) -> Vec<u8> {
-    encode_go_rdb_byte_slice(json)
-}
-
-/// Decode a Go `cache.RDB` Redis value and replay it as persistent dispatcher items.
+/// Decode a Rust-native Redis JSON value and replay it as persistent dispatcher items.
 pub fn persistent_queue_replay_from_redis_value(
     value: &[u8],
 ) -> Result<PersistentDispatcherReplay, DispatcherPersistenceError> {
-    let json = decode_go_rdb_byte_slice(value)?;
-    persistent_queue_replay_from_json(&json)
+    persistent_queue_replay_from_json(value)
 }
 
 /// Apply decoded replay items to a dispatcher queue like Go `Dispatcher.Start`.
@@ -678,107 +668,6 @@ fn format_go_file_bytes(file_name: &str, bytes: &[u8]) -> String {
     formatted
 }
 
-fn encode_go_rdb_byte_slice(value: &[u8]) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(value.len() + 8);
-    payload.extend_from_slice(&[0x0a, 0x00]);
-    encode_gob_uint(value.len() as u64, &mut payload);
-    payload.extend_from_slice(value);
-
-    let mut encoded = Vec::with_capacity(payload.len() + 8);
-    encode_gob_uint(payload.len() as u64, &mut encoded);
-    encoded.extend_from_slice(&payload);
-    encoded
-}
-
-fn decode_go_rdb_byte_slice(value: &[u8]) -> Result<Vec<u8>, DispatcherPersistenceError> {
-    let (payload_len, mut offset) = decode_gob_uint(value)?;
-    let payload_len = usize::try_from(payload_len)
-        .map_err(|_| DispatcherPersistenceError::DecodeRedisValue("payload length is too large"))?;
-    if value.len().saturating_sub(offset) != payload_len {
-        return Err(DispatcherPersistenceError::DecodeRedisValue(
-            "payload length does not match input",
-        ));
-    }
-    let header_end = offset
-        .checked_add(2)
-        .ok_or(DispatcherPersistenceError::DecodeRedisValue(
-            "payload header length overflowed",
-        ))?;
-    if value.get(offset..header_end) != Some(&[0x0a, 0x00]) {
-        return Err(DispatcherPersistenceError::DecodeRedisValue(
-            "payload is not a gob byte slice",
-        ));
-    }
-    offset = header_end;
-
-    let (byte_len, byte_offset) = decode_gob_uint(&value[offset..])?;
-    offset += byte_offset;
-    let byte_len = usize::try_from(byte_len)
-        .map_err(|_| DispatcherPersistenceError::DecodeRedisValue("byte length is too large"))?;
-    let bytes_end =
-        offset
-            .checked_add(byte_len)
-            .ok_or(DispatcherPersistenceError::DecodeRedisValue(
-                "byte slice length overflowed",
-            ))?;
-    let bytes =
-        value
-            .get(offset..bytes_end)
-            .ok_or(DispatcherPersistenceError::DecodeRedisValue(
-                "byte slice length exceeds payload",
-            ))?;
-    if bytes_end != value.len() {
-        return Err(DispatcherPersistenceError::DecodeRedisValue(
-            "trailing bytes after gob byte slice",
-        ));
-    }
-    Ok(bytes.to_vec())
-}
-
-fn encode_gob_uint(value: u64, output: &mut Vec<u8>) {
-    if value < 0x80 {
-        output.push(value as u8);
-        return;
-    }
-
-    let bytes = value.to_be_bytes();
-    let first = bytes
-        .iter()
-        .position(|byte| *byte != 0)
-        .unwrap_or(bytes.len() - 1);
-    let width = bytes.len() - first;
-    output.push((256 - width) as u8);
-    output.extend_from_slice(&bytes[first..]);
-}
-
-fn decode_gob_uint(value: &[u8]) -> Result<(u64, usize), DispatcherPersistenceError> {
-    let Some(first) = value.first().copied() else {
-        return Err(DispatcherPersistenceError::DecodeRedisValue(
-            "missing gob integer",
-        ));
-    };
-    if first < 0x80 {
-        return Ok((u64::from(first), 1));
-    }
-
-    let width = 256usize - usize::from(first);
-    if width == 0 || width > 8 {
-        return Err(DispatcherPersistenceError::DecodeRedisValue(
-            "invalid gob integer width",
-        ));
-    }
-    let bytes = value
-        .get(1..1 + width)
-        .ok_or(DispatcherPersistenceError::DecodeRedisValue(
-            "truncated gob integer",
-        ))?;
-    let mut decoded = 0u64;
-    for byte in bytes {
-        decoded = (decoded << 8) | u64::from(*byte);
-    }
-    Ok((decoded, 1 + width))
-}
-
 fn serialize_outbound_method(
     method: &TelegramOutboundMethod,
 ) -> Result<Option<Vec<u8>>, serde_json::Error> {
@@ -875,14 +764,14 @@ mod go_byte_slice {
 mod tests {
     use serde_json::{Value, json};
 
-    use super::{decode_go_rdb_byte_slice, persistent_queue_redis_value_from_json};
     use crate::{
         AudioMessagePlan, AudioSource, DEFAULT_DISPATCHER_QUEUE_KEY,
         DEFAULT_DISPATCHER_SHUTDOWN_TIMEOUT, DebouncerConfig, DispatcherConfig, DispatcherMessage,
-        DispatcherQueue, DispatcherRestoredMessage, EditMediaMessagePlan, EnqueueOutcome,
-        MESSAGE_TYPE_TEXT, MediaGroupMessagePlan, MediaGroupPhotoItem, MessageFingerprint,
-        PersistentDispatcherItem, PersistentDispatcherReplay, PhotoMessagePlan, PhotoSource,
-        ReplyParametersPlan, StickerMessagePlan, TELEGRAM_PARSE_MODE_HTML, TelegramOutboundMethod,
+        DispatcherPersistenceError, DispatcherQueue, DispatcherRestoredMessage,
+        EditMediaMessagePlan, EnqueueOutcome, MESSAGE_TYPE_TEXT, MediaGroupMessagePlan,
+        MediaGroupPhotoItem, MessageFingerprint, PersistentDispatcherItem,
+        PersistentDispatcherReplay, PhotoMessagePlan, PhotoSource, ReplyParametersPlan,
+        StickerMessagePlan, TELEGRAM_PARSE_MODE_HTML, TelegramOutboundMethod,
         TelegramOutboundMethodKind, hash_content, persistent_queue_from_drain,
         persistent_queue_redis_value_from_items, persistent_queue_replay_from_json,
         persistent_queue_replay_from_redis_value, restore_persistent_queue_replay,
@@ -1341,20 +1230,27 @@ mod tests {
     }
 
     #[test]
-    fn redis_value_codec_matches_go_rdb_gob_wrapped_byte_slice()
+    fn redis_value_codec_uses_rust_native_json_without_go_gob_wrapper()
     -> Result<(), Box<dyn std::error::Error>> {
-        let json = br#"[{"message":"x"}]"#;
+        let persisted = vec![PersistentDispatcherItem {
+            message: br#"{"ChatID":42,"Text":"kept"}"#.to_vec(),
+            message_type: "*api.MessageConfig".to_owned(),
+            immediate: false,
+            enqueued_at: "2026-05-19T17:00:00Z".to_owned(),
+            fingerprint: String::new(),
+            chat_id: 42,
+            virtual_id: "kept".to_owned(),
+        }];
+        let expected = serde_json::to_vec(&persisted)?;
 
-        let encoded = persistent_queue_redis_value_from_json(json);
+        let encoded = persistent_queue_redis_value_from_items(&persisted)?;
 
-        assert_eq!(encoded[0..4], [0x14, 0x0a, 0x00, 0x11]);
-        assert_eq!(&encoded[4..], json);
-        assert_eq!(decode_go_rdb_byte_slice(&encoded)?, json);
+        assert_eq!(encoded, expected);
         Ok(())
     }
 
     #[test]
-    fn redis_value_replay_decodes_go_rdb_payload_and_skips_bad_items()
+    fn redis_value_replay_decodes_rust_native_json_and_skips_bad_items()
     -> Result<(), Box<dyn std::error::Error>> {
         let persisted = vec![
             PersistentDispatcherItem {
@@ -1384,6 +1280,33 @@ mod tests {
         assert_eq!(replay.skipped, 1);
         assert_eq!(replay.items[0].virtual_id, "kept");
         Ok(())
+    }
+
+    #[test]
+    fn redis_value_replay_rejects_legacy_go_gob_wrapped_payload() {
+        let persisted = vec![PersistentDispatcherItem {
+            message: br#"{"ChatID":42,"Text":"kept"}"#.to_vec(),
+            message_type: "*api.MessageConfig".to_owned(),
+            immediate: false,
+            enqueued_at: "2026-05-19T17:00:00Z".to_owned(),
+            fingerprint: String::new(),
+            chat_id: 42,
+            virtual_id: "kept".to_owned(),
+        }];
+        let legacy_json = serde_json::to_vec(&persisted).expect("fixture should serialize");
+        assert_eq!(legacy_json.len(), 176);
+
+        let mut legacy_gob_wrapped = Vec::from([0xff, 0xb4, 0x0a, 0x00, 0xff, 0xb0]);
+        legacy_gob_wrapped.extend_from_slice(&legacy_json);
+
+        let error = persistent_queue_replay_from_redis_value(&legacy_gob_wrapped).expect_err(
+            "legacy gob-wrapped values must not be accepted after the approved cutover",
+        );
+
+        assert!(matches!(
+            error,
+            DispatcherPersistenceError::DeserializeQueue(_)
+        ));
     }
 
     #[test]
