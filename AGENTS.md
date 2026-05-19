@@ -70,6 +70,7 @@ Do not spend time polishing broad abstractions until the relevant contract inven
 - Current service-spine probes are gated by `OPENPLOTVA_CONNECT_SERVICES=false` by default. Do not treat skipped probes as storage contract; enable them when working on live Postgres/Redis behavior.
 - Converted SQLx migrations are gated by `OPENPLOTVA_RUN_MIGRATIONS=false` by default. Run them on fresh/scratch databases until the existing Go `sql-migrate` table compatibility path is handled.
 - Telegram Bot API: use `tg-rs/carapax` as the integration base. Do not use `frankenstein` unless the user reverses this decision.
+- Telegram Bot API objects currently come from `carapax::types`; keep command/callback/API constructor catalog tests in `openplotva-telegram` aligned with `docs/contract/generated/telegram.json`.
 - LLM: define Plotva-owned provider traits. Implement with `genai`, `async-openai`, and raw `reqwest` only for provider gaps.
 - Prompts: keep `.prompt` files and use Rust `handlebars` first. Do not implementation prompt language before contract is proven.
 - Runtime API: use `async-graphql` for existing diagnostics. Use `utoipa` only for documentation until contract is complete.
@@ -144,6 +145,7 @@ tests/contract/
 - Keep `README.md` current with local setup, required services, env vars, compose run, tests, architecture map, and future deployment notes.
 - Keep architecture notes under `docs/architecture/`.
 - Keep contract inventories, reference-snapshot material, baseline results, and approved deviations under `docs/contract/`.
+- Keep Telegram-specific port notes in `docs/contract/telegram-port.md`.
 - Regenerate machine-built contract inventories with `cargo run -p openplotva-tool-contract-inventory`; do not edit files under `docs/contract/generated/` by hand.
 - Keep `migrations/` aligned with the frozen Go files in `internal/db/sql/migrations`; if the reference snapshot advances, reconvert the affected migrations and preserve source SHA comments.
 - Prefer concise docs that name source-of-truth files and commands over broad architecture tours.
