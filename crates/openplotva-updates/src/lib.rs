@@ -8,8 +8,9 @@ use std::{
 };
 
 use carapax::types::{
-    Chat as TelegramChat, MaybeInaccessibleMessage, PollAnswerVoter, Update as TelegramUpdate,
-    UpdateType as TelegramUpdateType, User as TelegramUser,
+    AllowedUpdate as TelegramAllowedUpdate, Chat as TelegramChat, MaybeInaccessibleMessage,
+    PollAnswerVoter, Update as TelegramUpdate, UpdateType as TelegramUpdateType,
+    User as TelegramUser,
 };
 use openplotva_core::{ChatState, UpdateState, UserState};
 use redis::Client as RedisClient;
@@ -30,6 +31,34 @@ pub const NATIVE_UPDATE_FORMAT_VERSION: u16 = 1;
 /// Go `internal/processor` dequeue timeout for the update consumer loop.
 pub const DEFAULT_UPDATE_DEQUEUE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Go `internal/fetcher.allowedUpdates` names passed to Telegram startup.
+pub const GO_ALLOWED_UPDATE_NAMES: &[&str] = &[
+    "message",
+    "edited_message",
+    "guest_message",
+    "inline_query",
+    "chosen_inline_result",
+    "callback_query",
+    "my_chat_member",
+    "chat_member",
+    "chat_join_request",
+    "pre_checkout_query",
+];
+
+/// Go `internal/fetcher.allowedUpdates` represented as native `carapax` values.
+pub const GO_ALLOWED_UPDATES: &[TelegramAllowedUpdate] = &[
+    TelegramAllowedUpdate::Message,
+    TelegramAllowedUpdate::EditedMessage,
+    TelegramAllowedUpdate::GuestMessage,
+    TelegramAllowedUpdate::InlineQuery,
+    TelegramAllowedUpdate::ChosenInlineResult,
+    TelegramAllowedUpdate::CallbackQuery,
+    TelegramAllowedUpdate::BotStatus,
+    TelegramAllowedUpdate::UserStatus,
+    TelegramAllowedUpdate::ChatJoinRequest,
+    TelegramAllowedUpdate::PreCheckoutQuery,
+];
+
 /// Go `internal/processor.updateStateTimeout`.
 pub const UPDATE_STATE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -44,6 +73,92 @@ pub const UPDATE_STALL_AGE: Duration = Duration::from_secs(120);
 
 /// Go update consumer worker limit multiplier over available CPUs.
 pub const UPDATE_WORKER_LIMIT_PER_CPU: usize = 4;
+
+/// Go update classifier names used by the fetcher before enqueueing updates.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GoUpdateType {
+    /// No Go-known update payload is present.
+    Unknown,
+    /// `message`.
+    Message,
+    /// `edited_message`.
+    EditedMessage,
+    /// `guest_message`.
+    GuestMessage,
+    /// `channel_post`.
+    ChannelPost,
+    /// `edited_channel_post`.
+    EditedChannelPost,
+    /// `inline_query`.
+    InlineQuery,
+    /// `chosen_inline_result`.
+    ChosenInlineResult,
+    /// `callback_query`.
+    CallbackQuery,
+    /// `shipping_query`.
+    ShippingQuery,
+    /// `pre_checkout_query`.
+    PreCheckoutQuery,
+    /// `poll`.
+    Poll,
+    /// `poll_answer`.
+    PollAnswer,
+    /// `my_chat_member`.
+    MyChatMember,
+    /// `chat_member`.
+    ChatMember,
+    /// `chat_join_request`.
+    ChatJoinRequest,
+    /// `message_reaction`.
+    MessageReaction,
+    /// `message_reaction_count`.
+    MessageReactionCount,
+}
+
+impl GoUpdateType {
+    /// Return the Go string form for this update classifier value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Message => "message",
+            Self::EditedMessage => "edited_message",
+            Self::GuestMessage => "guest_message",
+            Self::ChannelPost => "channel_post",
+            Self::EditedChannelPost => "edited_channel_post",
+            Self::InlineQuery => "inline_query",
+            Self::ChosenInlineResult => "chosen_inline_result",
+            Self::CallbackQuery => "callback_query",
+            Self::ShippingQuery => "shipping_query",
+            Self::PreCheckoutQuery => "pre_checkout_query",
+            Self::Poll => "poll",
+            Self::PollAnswer => "poll_answer",
+            Self::MyChatMember => "my_chat_member",
+            Self::ChatMember => "chat_member",
+            Self::ChatJoinRequest => "chat_join_request",
+            Self::MessageReaction => "message_reaction",
+            Self::MessageReactionCount => "message_reaction_count",
+        }
+    }
+
+    /// Return whether Go's fetcher enqueues this update type.
+    #[must_use]
+    pub const fn is_allowed(self) -> bool {
+        matches!(
+            self,
+            Self::Message
+                | Self::EditedMessage
+                | Self::GuestMessage
+                | Self::InlineQuery
+                | Self::ChosenInlineResult
+                | Self::CallbackQuery
+                | Self::PreCheckoutQuery
+                | Self::MyChatMember
+                | Self::ChatMember
+                | Self::ChatJoinRequest
+        )
+    }
+}
 
 ///
 /// The Go runtime stored each update as zstd-compressed `encoding/gob`
@@ -167,6 +282,21 @@ impl RedisUpdateQueue {
     pub async fn enqueue_update(&self, update: &TelegramUpdate) -> Result<(), UpdateQueueError> {
         let update = EncodedUpdate::from_update(update)?;
         self.enqueue_encoded(&update).await
+    }
+
+    /// Encode and enqueue only updates Go's fetcher would pass through.
+    ///
+    /// Returns `Ok(true)` when the update was pushed and `Ok(false)` when the
+    /// update type is intentionally ignored.
+    pub async fn enqueue_allowed_update(
+        &self,
+        update: &TelegramUpdate,
+    ) -> Result<bool, UpdateQueueError> {
+        if !is_allowed_producer_update(update) {
+            return Ok(false);
+        }
+        self.enqueue_update(update).await?;
+        Ok(true)
     }
 
     /// Dequeue one encoded update with Go `BLPOP` semantics.
@@ -401,6 +531,43 @@ pub fn update_name(update: &TelegramUpdate) -> &'static str {
     }
 }
 
+/// Return the Go fetcher classification for an update before enqueueing.
+#[must_use]
+pub fn producer_update_type(update: &TelegramUpdate) -> GoUpdateType {
+    match &update.update_type {
+        TelegramUpdateType::Message(_) => GoUpdateType::Message,
+        TelegramUpdateType::EditedMessage(_) => GoUpdateType::EditedMessage,
+        TelegramUpdateType::GuestMessage(_) => GoUpdateType::GuestMessage,
+        TelegramUpdateType::ChannelPost(_) => GoUpdateType::ChannelPost,
+        TelegramUpdateType::EditedChannelPost(_) => GoUpdateType::EditedChannelPost,
+        TelegramUpdateType::InlineQuery(_) => GoUpdateType::InlineQuery,
+        TelegramUpdateType::ChosenInlineResult(_) => GoUpdateType::ChosenInlineResult,
+        TelegramUpdateType::CallbackQuery(_) => GoUpdateType::CallbackQuery,
+        TelegramUpdateType::ShippingQuery(_) => GoUpdateType::ShippingQuery,
+        TelegramUpdateType::PreCheckoutQuery(_) => GoUpdateType::PreCheckoutQuery,
+        TelegramUpdateType::Poll(_) => GoUpdateType::Poll,
+        TelegramUpdateType::PollAnswer(_) => GoUpdateType::PollAnswer,
+        TelegramUpdateType::BotStatus(_) => GoUpdateType::MyChatMember,
+        TelegramUpdateType::UserStatus(_) => GoUpdateType::ChatMember,
+        TelegramUpdateType::ChatJoinRequest(_) => GoUpdateType::ChatJoinRequest,
+        TelegramUpdateType::MessageReaction(_) => GoUpdateType::MessageReaction,
+        TelegramUpdateType::MessageReactionCount(_) => GoUpdateType::MessageReactionCount,
+        _ => GoUpdateType::Unknown,
+    }
+}
+
+/// Return the Go fetcher classification name for an update before enqueueing.
+#[must_use]
+pub fn producer_update_name(update: &TelegramUpdate) -> &'static str {
+    producer_update_type(update).as_str()
+}
+
+/// Return whether Go's fetcher would enqueue this update.
+#[must_use]
+pub fn is_allowed_producer_update(update: &TelegramUpdate) -> bool {
+    producer_update_type(update).is_allowed()
+}
+
 /// Extract the chat/user state Go persists before update side effects.
 pub fn extract_update_state(update: &TelegramUpdate) -> Option<UpdateState> {
     if matches!(update.update_type, TelegramUpdateType::GuestMessage(_)) {
@@ -602,9 +769,10 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        DEFAULT_UPDATE_QUEUE_KEY, EncodedUpdate, RedisUpdateQueue, UpdateCodecError,
-        UpdateConsumerConfig, UpdateStageOutcome, blpop_timeout_arg, extract_update_state,
-        process_update_at, update_name,
+        DEFAULT_UPDATE_QUEUE_KEY, EncodedUpdate, GO_ALLOWED_UPDATE_NAMES, GO_ALLOWED_UPDATES,
+        GoUpdateType, RedisUpdateQueue, UpdateCodecError, UpdateConsumerConfig, UpdateStageOutcome,
+        blpop_timeout_arg, extract_update_state, is_allowed_producer_update, process_update_at,
+        producer_update_name, producer_update_type, update_name,
     };
     use carapax::types::Update as TelegramUpdate;
 
@@ -688,6 +856,322 @@ mod tests {
         assert_eq!(blpop_timeout_arg(Duration::from_secs(5)), "5");
         assert_eq!(blpop_timeout_arg(Duration::from_millis(1500)), "1.5");
         assert_eq!(blpop_timeout_arg(Duration::from_millis(1)), "0.001");
+    }
+
+    #[test]
+    fn allowed_update_names_match_go_fetcher_startup_contract() -> Result<(), Box<dyn Error>> {
+        assert_eq!(
+            GO_ALLOWED_UPDATE_NAMES,
+            &[
+                "message",
+                "edited_message",
+                "guest_message",
+                "inline_query",
+                "chosen_inline_result",
+                "callback_query",
+                "my_chat_member",
+                "chat_member",
+                "chat_join_request",
+                "pre_checkout_query",
+            ]
+        );
+
+        let serialized_updates: Vec<String> = GO_ALLOWED_UPDATES
+            .iter()
+            .map(|update| serde_json::from_value(serde_json::to_value(update)?))
+            .collect::<Result<_, _>>()?;
+
+        assert_eq!(serialized_updates, GO_ALLOWED_UPDATE_NAMES);
+        Ok(())
+    }
+
+    #[test]
+    fn producer_update_type_matches_go_fetcher_classification() -> Result<(), Box<dyn Error>> {
+        let cases = [
+            (
+                "message",
+                sample_message_update()?,
+                GoUpdateType::Message,
+                true,
+            ),
+            (
+                "edited_message",
+                sample_update_json(json!({
+                    "update_id": 1,
+                    "edited_message": sample_message_json(2, 1_710_000_000, "edited")
+                }))?,
+                GoUpdateType::EditedMessage,
+                true,
+            ),
+            (
+                "guest_message",
+                sample_update_json(json!({
+                    "update_id": 2,
+                    "guest_message": {
+                        "message_id": 3,
+                        "date": 1_710_000_000,
+                        "chat": {
+                            "id": -100,
+                            "type": "supergroup",
+                            "title": "Team",
+                            "is_forum": true
+                        },
+                        "guest_query_id": "guest-query",
+                        "text": "hello"
+                    }
+                }))?,
+                GoUpdateType::GuestMessage,
+                true,
+            ),
+            (
+                "channel_post",
+                sample_update_json(json!({
+                    "update_id": 3,
+                    "channel_post": sample_channel_message_json(4, 1_710_000_000, "post")
+                }))?,
+                GoUpdateType::ChannelPost,
+                false,
+            ),
+            (
+                "edited_channel_post",
+                sample_update_json(json!({
+                    "update_id": 4,
+                    "edited_channel_post": sample_channel_message_json(5, 1_710_000_000, "post")
+                }))?,
+                GoUpdateType::EditedChannelPost,
+                false,
+            ),
+            (
+                "inline_query",
+                sample_update_json(json!({
+                    "update_id": 5,
+                    "inline_query": {
+                        "from": sample_user_json(),
+                        "id": "query-id",
+                        "offset": "query offset",
+                        "query": "query query"
+                    }
+                }))?,
+                GoUpdateType::InlineQuery,
+                true,
+            ),
+            (
+                "chosen_inline_result",
+                sample_update_json(json!({
+                    "update_id": 6,
+                    "chosen_inline_result": {
+                        "from": sample_user_json(),
+                        "query": "q",
+                        "result_id": "chosen-inline-result-id"
+                    }
+                }))?,
+                GoUpdateType::ChosenInlineResult,
+                true,
+            ),
+            (
+                "callback_query",
+                sample_update_json(json!({
+                    "update_id": 7,
+                    "callback_query": {
+                        "id": "callback-id",
+                        "from": sample_user_json(),
+                        "message": sample_message_json(8, 1_710_000_000, "callback")
+                    }
+                }))?,
+                GoUpdateType::CallbackQuery,
+                true,
+            ),
+            (
+                "shipping_query",
+                sample_update_json(json!({
+                    "update_id": 8,
+                    "shipping_query": {
+                        "id": "query-id",
+                        "from": sample_user_json(),
+                        "invoice_payload": "payload",
+                        "shipping_address": {
+                            "city": "Gudermes",
+                            "country_code": "RU",
+                            "post_code": "366200",
+                            "state": "Chechen Republic",
+                            "street_line1": "Nuradilov st., 12",
+                            "street_line2": ""
+                        }
+                    }
+                }))?,
+                GoUpdateType::ShippingQuery,
+                false,
+            ),
+            (
+                "pre_checkout_query",
+                sample_update_json(json!({
+                    "update_id": 9,
+                    "pre_checkout_query": {
+                        "currency": "GEL",
+                        "from": sample_user_json(),
+                        "id": "query-id",
+                        "invoice_payload": "invoice payload",
+                        "total_amount": 100
+                    }
+                }))?,
+                GoUpdateType::PreCheckoutQuery,
+                true,
+            ),
+            (
+                "poll",
+                sample_update_json(json!({
+                    "update_id": 10,
+                    "poll": {
+                        "type": "regular",
+                        "allows_multiple_answers": false,
+                        "allows_revoting": false,
+                        "id": "poll-id",
+                        "is_anonymous": true,
+                        "is_closed": true,
+                        "members_only": false,
+                        "options": [
+                            {
+                                "persistent_id": "1",
+                                "text": "Yes",
+                                "voter_count": 1000
+                            },
+                            {
+                                "persistent_id": "2",
+                                "text": "No",
+                                "voter_count": 0
+                            }
+                        ],
+                        "question": "Rust?",
+                        "total_voter_count": 1000
+                    }
+                }))?,
+                GoUpdateType::Poll,
+                false,
+            ),
+            (
+                "poll_answer",
+                sample_update_json(json!({
+                    "update_id": 11,
+                    "poll_answer": {
+                        "option_ids": [0],
+                        "option_persistent_ids": [],
+                        "poll_id": "poll-id",
+                        "user": sample_user_json()
+                    }
+                }))?,
+                GoUpdateType::PollAnswer,
+                false,
+            ),
+            (
+                "my_chat_member",
+                sample_update_json(json!({
+                    "update_id": 12,
+                    "my_chat_member": sample_chat_member_updated_json(true)
+                }))?,
+                GoUpdateType::MyChatMember,
+                true,
+            ),
+            (
+                "chat_member",
+                sample_update_json(json!({
+                    "update_id": 13,
+                    "chat_member": sample_chat_member_updated_json(false)
+                }))?,
+                GoUpdateType::ChatMember,
+                true,
+            ),
+            (
+                "chat_join_request",
+                sample_update_json(json!({
+                    "update_id": 14,
+                    "chat_join_request": {
+                        "chat": {
+                            "type": "group",
+                            "id": 1,
+                            "title": "Group"
+                        },
+                        "date": 0,
+                        "from": sample_user_json()
+                    }
+                }))?,
+                GoUpdateType::ChatJoinRequest,
+                true,
+            ),
+            (
+                "message_reaction",
+                sample_update_json(json!({
+                    "update_id": 15,
+                    "message_reaction": {
+                        "chat": {
+                            "type": "private",
+                            "id": 1,
+                            "first_name": "Ada"
+                        },
+                        "date": 0,
+                        "message_id": 1,
+                        "new_reaction": [
+                            {
+                                "type": "emoji",
+                                "emoji": "\u{1f44d}"
+                            }
+                        ],
+                        "old_reaction": [
+                            {
+                                "type": "emoji",
+                                "emoji": "\u{1f44e}"
+                            }
+                        ]
+                    }
+                }))?,
+                GoUpdateType::MessageReaction,
+                false,
+            ),
+            (
+                "message_reaction_count",
+                sample_update_json(json!({
+                    "update_id": 16,
+                    "message_reaction_count": {
+                        "chat": {
+                            "type": "private",
+                            "id": 1,
+                            "first_name": "Ada"
+                        },
+                        "date": 0,
+                        "message_id": 1,
+                        "reactions": [
+                            {
+                                "type": {
+                                    "type": "emoji",
+                                    "emoji": "\u{1f44d}"
+                                },
+                                "total_count": 1
+                            }
+                        ]
+                    }
+                }))?,
+                GoUpdateType::MessageReactionCount,
+                false,
+            ),
+            (
+                "unknown",
+                sample_update_json(json!({
+                    "update_id": 17,
+                    "future_update_shape": {
+                        "value": true
+                    }
+                }))?,
+                GoUpdateType::Unknown,
+                false,
+            ),
+        ];
+
+        for (name, update, want_type, want_allowed) in cases {
+            assert_eq!(producer_update_type(&update), want_type, "{name}");
+            assert_eq!(producer_update_name(&update), want_type.as_str(), "{name}");
+            assert_eq!(is_allowed_producer_update(&update), want_allowed, "{name}");
+        }
+
+        Ok(())
     }
 
     #[test]
@@ -1042,6 +1526,10 @@ mod tests {
         }))
     }
 
+    fn sample_update_json(value: serde_json::Value) -> Result<TelegramUpdate, serde_json::Error> {
+        serde_json::from_value(value)
+    }
+
     fn sample_message_json(message_id: i64, date: i64, text: &str) -> serde_json::Value {
         json!({
             "message_id": message_id,
@@ -1054,6 +1542,55 @@ mod tests {
             },
             "from": sample_user_json(),
             "text": text
+        })
+    }
+
+    fn sample_channel_message_json(message_id: i64, date: i64, text: &str) -> serde_json::Value {
+        json!({
+            "message_id": message_id,
+            "date": date,
+            "chat": {
+                "id": -100,
+                "type": "channel",
+                "title": "Channel",
+                "username": "channel_name"
+            },
+            "sender_chat": {
+                "id": -100,
+                "type": "channel",
+                "title": "Channel",
+                "username": "channel_name"
+            },
+            "text": text
+        })
+    }
+
+    fn sample_chat_member_updated_json(is_bot_member: bool) -> serde_json::Value {
+        json!({
+            "chat": {
+                "type": "group",
+                "id": 1,
+                "title": "Group"
+            },
+            "date": 0,
+            "from": sample_user_json(),
+            "new_chat_member": {
+                "status": "kicked",
+                "until_date": 0,
+                "user": {
+                    "first_name": "Bot",
+                    "id": 2,
+                    "is_bot": is_bot_member
+                }
+            },
+            "old_chat_member": {
+                "status": "member",
+                "user": {
+                    "first_name": "Bot",
+                    "id": 2,
+                    "is_bot": is_bot_member
+                }
+            }
         })
     }
 
