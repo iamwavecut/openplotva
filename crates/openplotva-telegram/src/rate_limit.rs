@@ -56,6 +56,10 @@ impl BurstOneRateLimiter {
         true
     }
 
+    fn retry_after_at(self, now: Instant) -> Duration {
+        self.next_available_at.saturating_duration_since(now)
+    }
+
     fn reserve_delay_at(&mut self, now: Instant, interval: Duration) -> Duration {
         if interval.is_zero() {
             self.next_available_at = now;
@@ -112,6 +116,14 @@ impl ChatLimiters {
             .or_insert_with(|| RateLimiterInfo::new(now));
         info.last_access = now;
         info.limiter.reserve_delay_at(now, self.base_interval)
+    }
+
+    pub(crate) fn retry_after_at(&self, chat_id: i64, now: Instant) -> Duration {
+        let state = self.state();
+        state
+            .get(&chat_id)
+            .map(|info| info.limiter.retry_after_at(now))
+            .unwrap_or_default()
     }
 
     pub(crate) fn cleanup_at(&self, max_idle_duration: Duration, now: Instant) -> usize {

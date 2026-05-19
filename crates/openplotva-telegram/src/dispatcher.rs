@@ -4,7 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{Debouncer, DebouncerConfig, MessageFingerprint};
+use crate::{ChatLimiters, Debouncer, DebouncerConfig, MessageFingerprint};
 
 /// Go outbound dispatcher queue settings currently ported to Rust.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -43,9 +43,22 @@ pub enum EnqueueOutcome {
     Deduped,
 }
 
+/// Result of taking a regular queue item for worker processing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RegularDequeueOutcome {
+    /// The regular queue was empty.
+    Empty,
+    /// The item is ready to send.
+    Ready(DispatcherQueuedMessage),
+    /// The item was requeued at the front because the chat limiter is not ready.
+    RateLimited { retry_after: Duration },
+}
+
 /// Inspectable queue item matching the Go dispatcher's persisted item metadata.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DispatcherQueuedMessage {
+    /// Telegram chat ID used by the regular dispatch rate limiter.
+    pub chat_id: i64,
     /// The dedupe key string captured when the item was enqueued.
     pub fingerprint_key: String,
     /// Virtual message ID used for cancellation and future real-ID mapping.
@@ -127,10 +140,37 @@ impl DispatcherQueue {
         (regular_before - state.regular.len()) + (immediate_before - state.immediate.len())
     }
 
+    /// Remove and return the oldest immediate item.
+    pub fn dequeue_immediate(&self) -> Option<DispatcherQueuedMessage> {
+        self.state().immediate.pop_front()
+    }
+
+    /// Remove and return the oldest regular item.
+    pub fn dequeue_regular(&self) -> Option<DispatcherQueuedMessage> {
+        self.state().regular.pop_front()
+    }
+
+    /// Take the oldest regular item if its chat limiter is ready.
+    pub fn dequeue_regular_with_limiter(&self, limiters: &ChatLimiters) -> RegularDequeueOutcome {
+        self.dequeue_regular_with_limiter_at(limiters, Instant::now())
+    }
+
+    /// Put a deferred regular item back at the front, matching Go wait-error handling.
+    pub fn requeue_regular_front(&self, message: DispatcherQueuedMessage) {
+        self.state().regular.push_front(message);
+    }
+
     /// Record one successfully sent queue item.
     pub fn record_processed(&self) {
         let mut state = self.state();
         state.processed_total += 1;
+    }
+
+    /// Record a send attempt, incrementing processed stats only on success like Go.
+    pub fn record_send_result(&self, sent: bool) {
+        if sent {
+            self.record_processed();
+        }
     }
 
     /// Return current queue statistics.
@@ -169,6 +209,7 @@ impl DispatcherQueue {
         }
 
         let queued = DispatcherQueuedMessage {
+            chat_id: message.fingerprint.chat_id,
             fingerprint_key: message.fingerprint.to_string(),
             virtual_id: message.virtual_id,
             immediate,
@@ -190,6 +231,22 @@ impl DispatcherQueue {
             self.debouncer.record_sent_at(&message.fingerprint, now);
         }
         EnqueueOutcome::Enqueued
+    }
+
+    pub(crate) fn dequeue_regular_with_limiter_at(
+        &self,
+        limiters: &ChatLimiters,
+        now: Instant,
+    ) -> RegularDequeueOutcome {
+        let Some(item) = self.dequeue_regular() else {
+            return RegularDequeueOutcome::Empty;
+        };
+        if item.chat_id != 0 && !limiters.allow_at(item.chat_id, now) {
+            let retry_after = limiters.retry_after_at(item.chat_id, now);
+            self.requeue_regular_front(item);
+            return RegularDequeueOutcome::RateLimited { retry_after };
+        }
+        RegularDequeueOutcome::Ready(item)
     }
 
     #[cfg(test)]
@@ -239,8 +296,11 @@ mod tests {
 
     use super::{
         DispatcherConfig, DispatcherMessage, DispatcherQueue, EnqueueOutcome, QueueSnapshot,
+        RegularDequeueOutcome,
     };
-    use crate::{DebouncerConfig, MESSAGE_TYPE_TEXT, MessageFingerprint, hash_content};
+    use crate::{
+        ChatLimiters, DebouncerConfig, MESSAGE_TYPE_TEXT, MessageFingerprint, hash_content,
+    };
 
     fn text_message(chat_id: i64, text: &str, virtual_id: &str) -> DispatcherMessage {
         DispatcherMessage::new(
@@ -267,6 +327,93 @@ mod tests {
                 .map(|item| item.virtual_id)
                 .collect(),
         )
+    }
+
+    #[test]
+    fn dequeue_immediate_and_regular_remove_oldest_items() {
+        let queue = DispatcherQueue::new(DispatcherConfig::default());
+        let now = std::time::Instant::now();
+
+        queue.enqueue_at(text_message(42, "regular", "regular-1"), false, now);
+        queue.enqueue_at(text_message(42, "immediate", "immediate-1"), true, now);
+
+        let immediate = queue.dequeue_immediate().expect("immediate item");
+        assert_eq!(immediate.virtual_id, "immediate-1");
+        assert_eq!(immediate.chat_id, 42);
+
+        let regular = queue.dequeue_regular().expect("regular item");
+        assert_eq!(regular.virtual_id, "regular-1");
+        assert_eq!(regular.chat_id, 42);
+
+        assert_eq!(queue.dequeue_immediate(), None);
+        assert_eq!(queue.dequeue_regular(), None);
+        assert_eq!(queue.stats_at(now).regular_queue_size, 0);
+        assert_eq!(queue.stats_at(now).immediate_queue_size, 0);
+    }
+
+    #[test]
+    fn requeue_regular_front_preserves_go_wait_error_order() {
+        let queue = DispatcherQueue::new(DispatcherConfig::default());
+        let now = std::time::Instant::now();
+
+        queue.enqueue_at(text_message(42, "first", "regular-1"), false, now);
+        queue.enqueue_at(
+            text_message(42, "second", "regular-2"),
+            false,
+            now + Duration::from_secs(1),
+        );
+
+        let first = queue.dequeue_regular().expect("regular item");
+        queue.requeue_regular_front(first);
+
+        assert_eq!(
+            virtual_ids(queue.snapshot()).0,
+            vec!["regular-1".to_owned(), "regular-2".to_owned()]
+        );
+    }
+
+    #[test]
+    fn regular_dequeue_with_limiter_requeues_front_until_chat_is_ready() {
+        let queue = DispatcherQueue::new(DispatcherConfig::default());
+        let limiters = ChatLimiters::new(crate::DEFAULT_DISPATCH_INTERVAL);
+        let now = std::time::Instant::now();
+
+        queue.enqueue_at(text_message(42, "first", "regular-1"), false, now);
+        queue.enqueue_at(
+            text_message(42, "second", "regular-2"),
+            false,
+            now + Duration::from_secs(1),
+        );
+
+        assert!(matches!(
+            queue.dequeue_regular_with_limiter_at(&limiters, now),
+            RegularDequeueOutcome::Ready(item) if item.virtual_id == "regular-1"
+        ));
+        assert!(matches!(
+            queue.dequeue_regular_with_limiter_at(&limiters, now),
+            RegularDequeueOutcome::RateLimited { retry_after }
+                if retry_after == crate::DEFAULT_DISPATCH_INTERVAL
+        ));
+        assert_eq!(
+            virtual_ids(queue.snapshot()).0,
+            vec!["regular-2".to_owned()]
+        );
+        assert!(matches!(
+            queue.dequeue_regular_with_limiter_at(&limiters, now + crate::DEFAULT_DISPATCH_INTERVAL),
+            RegularDequeueOutcome::Ready(item) if item.virtual_id == "regular-2"
+        ));
+    }
+
+    #[test]
+    fn send_result_stats_match_go_success_only_dequeued_count() {
+        let queue = DispatcherQueue::new(DispatcherConfig::default());
+        let now = std::time::Instant::now();
+
+        queue.record_send_result(false);
+        assert_eq!(queue.stats_at(now).processed_total, 0);
+
+        queue.record_send_result(true);
+        assert_eq!(queue.stats_at(now).processed_total, 1);
     }
 
     #[test]
