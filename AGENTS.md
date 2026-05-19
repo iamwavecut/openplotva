@@ -71,6 +71,7 @@ Do not spend time polishing broad abstractions until the relevant contract inven
 - Converted SQLx migrations are gated by `OPENPLOTVA_RUN_MIGRATIONS=false` by default. Run them on fresh/scratch databases until the existing Go `sql-migrate` table compatibility path is handled.
 - Telegram Bot API: use `tg-rs/carapax` as the integration base. Do not use `frankenstein` unless the user reverses this decision.
 - Telegram Bot API objects currently come from `carapax::types`; keep command/callback/API constructor catalog tests in `openplotva-telegram` aligned with `docs/contract/generated/telegram.json`.
+- The live outbound dispatcher in `openplotva-app` should keep the Go server runtime defaults: `plotva:message_queue`, max queue/persisted items `10000`, dedupe enabled with a `3s` window and `1000` cache entries, `50ms` dispatch interval, `10m` limiter cleanup cadence, `30m` limiter max idle, and `10s` shutdown persistence timeout.
 - LLM: define Plotva-owned provider traits. Implement with `genai`, `async-openai`, and raw `reqwest` only for provider gaps.
 - Prompts: keep `.prompt` files and use Rust `handlebars` first. Do not implementation prompt language before contract is proven.
 - Runtime API: use `async-graphql` for existing diagnostics. Use `utoipa` only for documentation until contract is complete.
