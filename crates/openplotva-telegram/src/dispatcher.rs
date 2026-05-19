@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{ChatLimiters, Debouncer, DebouncerConfig, MessageFingerprint};
+use crate::{ChatLimiters, Debouncer, DebouncerConfig, MessageFingerprint, TelegramOutboundMethod};
 
 /// Go outbound dispatcher queue settings currently ported to Rust.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -17,12 +17,13 @@ pub struct DispatcherConfig {
 }
 
 /// Outbound message metadata needed by the queue layer.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub struct DispatcherMessage {
     /// Fingerprint used for regular-queue deduplication.
     pub fingerprint: MessageFingerprint,
     /// Virtual message ID used for cancellation and future real-ID mapping.
     pub virtual_id: String,
+    method: Option<TelegramOutboundMethod>,
 }
 
 impl DispatcherMessage {
@@ -31,7 +32,14 @@ impl DispatcherMessage {
         Self {
             fingerprint,
             virtual_id: virtual_id.into(),
+            method: None,
         }
+    }
+
+    /// Attach the concrete Telegram method that the worker should send.
+    pub fn with_method(mut self, method: TelegramOutboundMethod) -> Self {
+        self.method = Some(method);
+        self
     }
 }
 
@@ -45,12 +53,12 @@ pub enum EnqueueOutcome {
 }
 
 /// Result of taking a regular queue item for worker processing.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub enum RegularDequeueOutcome {
     /// The regular queue was empty.
     Empty,
     /// The item is ready to send.
-    Ready(DispatcherQueuedMessage),
+    Ready(DispatcherWorkItem),
     /// The item was requeued at the front because the chat limiter is not ready.
     RateLimited { retry_after: Duration },
 }
@@ -98,6 +106,29 @@ pub struct DispatcherQueuedMessage {
     pub added_at: Instant,
 }
 
+/// Worker-owned queue item containing cloneable metadata plus the send payload.
+#[derive(Debug)]
+pub struct DispatcherWorkItem {
+    metadata: DispatcherQueuedMessage,
+    method: Option<TelegramOutboundMethod>,
+}
+
+impl DispatcherWorkItem {
+    pub fn metadata(&self) -> &DispatcherQueuedMessage {
+        &self.metadata
+    }
+
+    /// Consume the worker item and return only the concrete Telegram method payload.
+    pub fn into_method(self) -> Option<TelegramOutboundMethod> {
+        self.method
+    }
+
+    /// Consume the worker item and return both metadata and the concrete payload.
+    pub fn into_parts(self) -> (DispatcherQueuedMessage, Option<TelegramOutboundMethod>) {
+        (self.metadata, self.method)
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct QueueSnapshot {
     /// Regular outbound queue, oldest first.
@@ -132,10 +163,25 @@ pub struct DispatcherQueue {
 
 #[derive(Debug, Default)]
 struct DispatcherQueueState {
-    regular: VecDeque<DispatcherQueuedMessage>,
-    immediate: VecDeque<DispatcherQueuedMessage>,
+    regular: VecDeque<DispatcherQueueItem>,
+    immediate: VecDeque<DispatcherQueueItem>,
     processed_total: i64,
     deduped_total: i64,
+}
+
+#[derive(Debug)]
+struct DispatcherQueueItem {
+    metadata: DispatcherQueuedMessage,
+    method: Option<TelegramOutboundMethod>,
+}
+
+impl DispatcherQueueItem {
+    fn into_work_item(self) -> DispatcherWorkItem {
+        DispatcherWorkItem {
+            metadata: self.metadata,
+            method: self.method,
+        }
+    }
 }
 
 impl DispatcherQueue {
@@ -162,21 +208,31 @@ impl DispatcherQueue {
 
         let mut state = self.state();
         let regular_before = state.regular.len();
-        state.regular.retain(|item| item.virtual_id != virtual_id);
+        state
+            .regular
+            .retain(|item| item.metadata.virtual_id != virtual_id);
         let immediate_before = state.immediate.len();
-        state.immediate.retain(|item| item.virtual_id != virtual_id);
+        state
+            .immediate
+            .retain(|item| item.metadata.virtual_id != virtual_id);
 
         (regular_before - state.regular.len()) + (immediate_before - state.immediate.len())
     }
 
     /// Remove and return the oldest immediate item.
-    pub fn dequeue_immediate(&self) -> Option<DispatcherQueuedMessage> {
-        self.state().immediate.pop_front()
+    pub fn dequeue_immediate(&self) -> Option<DispatcherWorkItem> {
+        self.state()
+            .immediate
+            .pop_front()
+            .map(DispatcherQueueItem::into_work_item)
     }
 
     /// Remove and return the oldest regular item.
-    pub fn dequeue_regular(&self) -> Option<DispatcherQueuedMessage> {
-        self.state().regular.pop_front()
+    pub fn dequeue_regular(&self) -> Option<DispatcherWorkItem> {
+        self.state()
+            .regular
+            .pop_front()
+            .map(DispatcherQueueItem::into_work_item)
     }
 
     /// Take the oldest regular item if its chat limiter is ready.
@@ -187,7 +243,7 @@ impl DispatcherQueue {
     /// Process one immediate queue item with an async transport callback.
     pub async fn process_immediate_once<F, Fut>(&self, send: F) -> DispatcherWorkerOutcome
     where
-        F: FnOnce(DispatcherQueuedMessage) -> Fut,
+        F: FnOnce(DispatcherWorkItem) -> Fut,
         Fut: Future<Output = DispatcherSendStatus>,
     {
         let Some(item) = self.dequeue_immediate() else {
@@ -203,7 +259,7 @@ impl DispatcherQueue {
         send: F,
     ) -> DispatcherWorkerOutcome
     where
-        F: FnOnce(DispatcherQueuedMessage) -> Fut,
+        F: FnOnce(DispatcherWorkItem) -> Fut,
         Fut: Future<Output = DispatcherSendStatus>,
     {
         self.process_regular_once_at(limiters, Instant::now(), send)
@@ -211,8 +267,11 @@ impl DispatcherQueue {
     }
 
     /// Put a deferred regular item back at the front, matching Go wait-error handling.
-    pub fn requeue_regular_front(&self, message: DispatcherQueuedMessage) {
-        self.state().regular.push_front(message);
+    pub fn requeue_regular_front(&self, message: DispatcherWorkItem) {
+        self.state().regular.push_front(DispatcherQueueItem {
+            metadata: message.metadata,
+            method: message.method,
+        });
     }
 
     /// Record one successfully sent queue item.
@@ -237,8 +296,16 @@ impl DispatcherQueue {
     pub fn snapshot(&self) -> QueueSnapshot {
         let state = self.state();
         QueueSnapshot {
-            regular: state.regular.iter().cloned().collect(),
-            immediate: state.immediate.iter().cloned().collect(),
+            regular: state
+                .regular
+                .iter()
+                .map(|item| item.metadata.clone())
+                .collect(),
+            immediate: state
+                .immediate
+                .iter()
+                .map(|item| item.metadata.clone())
+                .collect(),
         }
     }
 
@@ -258,17 +325,26 @@ impl DispatcherQueue {
         immediate: bool,
         now: Instant,
     ) -> EnqueueOutcome {
-        if !immediate && !self.debouncer.should_process_at(&message.fingerprint, now) {
+        let DispatcherMessage {
+            fingerprint,
+            virtual_id,
+            method,
+        } = message;
+
+        if !immediate && !self.debouncer.should_process_at(&fingerprint, now) {
             self.state().deduped_total += 1;
             return EnqueueOutcome::Deduped;
         }
 
-        let queued = DispatcherQueuedMessage {
-            chat_id: message.fingerprint.chat_id,
-            fingerprint_key: message.fingerprint.to_string(),
-            virtual_id: message.virtual_id,
-            immediate,
-            added_at: now,
+        let queued = DispatcherQueueItem {
+            metadata: DispatcherQueuedMessage {
+                chat_id: fingerprint.chat_id,
+                fingerprint_key: fingerprint.to_string(),
+                virtual_id,
+                immediate,
+                added_at: now,
+            },
+            method,
         };
 
         {
@@ -283,7 +359,7 @@ impl DispatcherQueue {
         }
 
         if !immediate {
-            self.debouncer.record_sent_at(&message.fingerprint, now);
+            self.debouncer.record_sent_at(&fingerprint, now);
         }
         EnqueueOutcome::Enqueued
     }
@@ -296,8 +372,9 @@ impl DispatcherQueue {
         let Some(item) = self.dequeue_regular() else {
             return RegularDequeueOutcome::Empty;
         };
-        if item.chat_id != 0 && !limiters.allow_at(item.chat_id, now) {
-            let retry_after = limiters.retry_after_at(item.chat_id, now);
+        let chat_id = item.metadata().chat_id;
+        if chat_id != 0 && !limiters.allow_at(chat_id, now) {
+            let retry_after = limiters.retry_after_at(chat_id, now);
             self.requeue_regular_front(item);
             return RegularDequeueOutcome::RateLimited { retry_after };
         }
@@ -311,7 +388,7 @@ impl DispatcherQueue {
         send: F,
     ) -> DispatcherWorkerOutcome
     where
-        F: FnOnce(DispatcherQueuedMessage) -> Fut,
+        F: FnOnce(DispatcherWorkItem) -> Fut,
         Fut: Future<Output = DispatcherSendStatus>,
     {
         match self.dequeue_regular_with_limiter_at(limiters, now) {
@@ -325,15 +402,15 @@ impl DispatcherQueue {
 
     async fn process_ready_item<F, Fut>(
         &self,
-        item: DispatcherQueuedMessage,
+        item: DispatcherWorkItem,
         send: F,
     ) -> DispatcherWorkerOutcome
     where
-        F: FnOnce(DispatcherQueuedMessage) -> Fut,
+        F: FnOnce(DispatcherWorkItem) -> Fut,
         Fut: Future<Output = DispatcherSendStatus>,
     {
-        let virtual_id = item.virtual_id.clone();
-        let immediate = item.immediate;
+        let virtual_id = item.metadata().virtual_id.clone();
+        let immediate = item.metadata().immediate;
         let status = send(item).await;
         self.record_send_result(status.is_sent());
         if status.is_sent() {
@@ -374,7 +451,7 @@ impl DispatcherQueue {
     }
 }
 
-fn trim_queue(queue: &mut VecDeque<DispatcherQueuedMessage>, max_queue_size: usize) {
+fn trim_queue(queue: &mut VecDeque<DispatcherQueueItem>, max_queue_size: usize) {
     if max_queue_size == 0 {
         return;
     }
@@ -383,10 +460,10 @@ fn trim_queue(queue: &mut VecDeque<DispatcherQueuedMessage>, max_queue_size: usi
     }
 }
 
-fn oldest_age(queue: &VecDeque<DispatcherQueuedMessage>, now: Instant) -> Duration {
+fn oldest_age(queue: &VecDeque<DispatcherQueueItem>, now: Instant) -> Duration {
     queue
         .front()
-        .map(|item| now.saturating_duration_since(item.added_at))
+        .map(|item| now.saturating_duration_since(item.metadata.added_at))
         .unwrap_or_default()
 }
 
@@ -403,7 +480,8 @@ mod tests {
         DispatcherWorkerOutcome, EnqueueOutcome, QueueSnapshot, RegularDequeueOutcome,
     };
     use crate::{
-        ChatLimiters, DebouncerConfig, MESSAGE_TYPE_TEXT, MessageFingerprint, hash_content,
+        ChatLimiters, DebouncerConfig, MESSAGE_TYPE_TEXT, MessageFingerprint,
+        TelegramOutboundMethod, TelegramOutboundMethodKind, hash_content,
     };
 
     fn text_message(chat_id: i64, text: &str, virtual_id: &str) -> DispatcherMessage {
@@ -416,6 +494,10 @@ mod tests {
             },
             virtual_id,
         )
+    }
+
+    fn text_method(chat_id: i64, text: &str) -> TelegramOutboundMethod {
+        TelegramOutboundMethod::from(carapax::types::SendMessage::new(chat_id, text))
     }
 
     fn virtual_ids(snapshot: QueueSnapshot) -> (Vec<String>, Vec<String>) {
@@ -434,6 +516,72 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_remains_metadata_only_when_queue_carries_method_payloads() {
+        let queue = DispatcherQueue::new(DispatcherConfig::default());
+        let now = std::time::Instant::now();
+
+        queue.enqueue_at(
+            text_message(42, "regular", "regular-1").with_method(text_method(42, "payload body")),
+            false,
+            now,
+        );
+
+        let snapshot = queue.snapshot();
+        assert_eq!(snapshot.regular.len(), 1);
+        assert_eq!(snapshot.regular[0].virtual_id, "regular-1");
+        assert_eq!(snapshot.regular[0].chat_id, 42);
+
+        let item = queue.dequeue_regular().expect("regular item");
+        assert_eq!(item.metadata().virtual_id, "regular-1");
+        assert_eq!(
+            item.into_method().map(|method| method.kind()),
+            Some(TelegramOutboundMethodKind::SendMessage)
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_receives_owned_method_payload_once() {
+        let queue = DispatcherQueue::new(DispatcherConfig::default());
+        let now = std::time::Instant::now();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+
+        queue.enqueue_at(
+            text_message(42, "immediate", "immediate-1")
+                .with_method(text_method(42, "payload body")),
+            true,
+            now,
+        );
+
+        let outcome = queue
+            .process_immediate_once({
+                let seen = Arc::clone(&seen);
+                move |item| async move {
+                    let virtual_id = item.metadata().virtual_id.clone();
+                    let kind = item.into_method().map(|method| method.kind());
+                    seen.lock().expect("seen lock").push((virtual_id, kind));
+                    DispatcherSendStatus::Sent
+                }
+            })
+            .await;
+
+        assert_eq!(
+            outcome,
+            DispatcherWorkerOutcome::Sent {
+                virtual_id: "immediate-1".to_owned(),
+                immediate: true,
+            }
+        );
+        assert_eq!(
+            *seen.lock().expect("seen lock"),
+            vec![(
+                "immediate-1".to_owned(),
+                Some(TelegramOutboundMethodKind::SendMessage)
+            )]
+        );
+        assert!(queue.dequeue_immediate().is_none());
+    }
+
+    #[test]
     fn dequeue_immediate_and_regular_remove_oldest_items() {
         let queue = DispatcherQueue::new(DispatcherConfig::default());
         let now = std::time::Instant::now();
@@ -442,15 +590,15 @@ mod tests {
         queue.enqueue_at(text_message(42, "immediate", "immediate-1"), true, now);
 
         let immediate = queue.dequeue_immediate().expect("immediate item");
-        assert_eq!(immediate.virtual_id, "immediate-1");
-        assert_eq!(immediate.chat_id, 42);
+        assert_eq!(immediate.metadata().virtual_id, "immediate-1");
+        assert_eq!(immediate.metadata().chat_id, 42);
 
         let regular = queue.dequeue_regular().expect("regular item");
-        assert_eq!(regular.virtual_id, "regular-1");
-        assert_eq!(regular.chat_id, 42);
+        assert_eq!(regular.metadata().virtual_id, "regular-1");
+        assert_eq!(regular.metadata().chat_id, 42);
 
-        assert_eq!(queue.dequeue_immediate(), None);
-        assert_eq!(queue.dequeue_regular(), None);
+        assert!(queue.dequeue_immediate().is_none());
+        assert!(queue.dequeue_regular().is_none());
         assert_eq!(queue.stats_at(now).regular_queue_size, 0);
         assert_eq!(queue.stats_at(now).immediate_queue_size, 0);
     }
@@ -491,7 +639,7 @@ mod tests {
 
         assert!(matches!(
             queue.dequeue_regular_with_limiter_at(&limiters, now),
-            RegularDequeueOutcome::Ready(item) if item.virtual_id == "regular-1"
+            RegularDequeueOutcome::Ready(item) if item.metadata().virtual_id == "regular-1"
         ));
         assert!(matches!(
             queue.dequeue_regular_with_limiter_at(&limiters, now),
@@ -504,7 +652,7 @@ mod tests {
         );
         assert!(matches!(
             queue.dequeue_regular_with_limiter_at(&limiters, now + crate::DEFAULT_DISPATCH_INTERVAL),
-            RegularDequeueOutcome::Ready(item) if item.virtual_id == "regular-2"
+            RegularDequeueOutcome::Ready(item) if item.metadata().virtual_id == "regular-2"
         ));
     }
 
@@ -532,7 +680,9 @@ mod tests {
             .process_immediate_once({
                 let seen = Arc::clone(&seen);
                 move |item| async move {
-                    seen.lock().expect("seen lock").push(item.virtual_id);
+                    seen.lock()
+                        .expect("seen lock")
+                        .push(item.metadata().virtual_id.clone());
                     DispatcherSendStatus::Sent
                 }
             })
