@@ -1,5 +1,6 @@
 use std::{
     collections::VecDeque,
+    future::Future,
     sync::{Mutex, MutexGuard},
     time::{Duration, Instant},
 };
@@ -52,6 +53,34 @@ pub enum RegularDequeueOutcome {
     Ready(DispatcherQueuedMessage),
     /// The item was requeued at the front because the chat limiter is not ready.
     RateLimited { retry_after: Duration },
+}
+
+/// Result returned by an outbound transport after trying to send a queued item.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DispatcherSendStatus {
+    /// Transport accepted the message and Go would increment processed stats.
+    Sent,
+    /// Transport returned an error and Go would leave processed stats unchanged.
+    Failed,
+}
+
+impl DispatcherSendStatus {
+    fn is_sent(self) -> bool {
+        matches!(self, Self::Sent)
+    }
+}
+
+/// Result of one async dispatcher worker step.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DispatcherWorkerOutcome {
+    /// No item was available in the worker's queue.
+    Empty,
+    /// Regular worker deferred the front item until the per-chat limiter is ready.
+    RateLimited { retry_after: Duration },
+    /// The transport reported success for a queued item.
+    Sent { virtual_id: String, immediate: bool },
+    /// The transport reported failure for a queued item.
+    SendFailed { virtual_id: String, immediate: bool },
 }
 
 /// Inspectable queue item matching the Go dispatcher's persisted item metadata.
@@ -155,6 +184,32 @@ impl DispatcherQueue {
         self.dequeue_regular_with_limiter_at(limiters, Instant::now())
     }
 
+    /// Process one immediate queue item with an async transport callback.
+    pub async fn process_immediate_once<F, Fut>(&self, send: F) -> DispatcherWorkerOutcome
+    where
+        F: FnOnce(DispatcherQueuedMessage) -> Fut,
+        Fut: Future<Output = DispatcherSendStatus>,
+    {
+        let Some(item) = self.dequeue_immediate() else {
+            return DispatcherWorkerOutcome::Empty;
+        };
+        self.process_ready_item(item, send).await
+    }
+
+    /// Process one regular queue item with limiter checks and an async transport callback.
+    pub async fn process_regular_once<F, Fut>(
+        &self,
+        limiters: &ChatLimiters,
+        send: F,
+    ) -> DispatcherWorkerOutcome
+    where
+        F: FnOnce(DispatcherQueuedMessage) -> Fut,
+        Fut: Future<Output = DispatcherSendStatus>,
+    {
+        self.process_regular_once_at(limiters, Instant::now(), send)
+            .await
+    }
+
     /// Put a deferred regular item back at the front, matching Go wait-error handling.
     pub fn requeue_regular_front(&self, message: DispatcherQueuedMessage) {
         self.state().regular.push_front(message);
@@ -249,6 +304,51 @@ impl DispatcherQueue {
         RegularDequeueOutcome::Ready(item)
     }
 
+    pub(crate) async fn process_regular_once_at<F, Fut>(
+        &self,
+        limiters: &ChatLimiters,
+        now: Instant,
+        send: F,
+    ) -> DispatcherWorkerOutcome
+    where
+        F: FnOnce(DispatcherQueuedMessage) -> Fut,
+        Fut: Future<Output = DispatcherSendStatus>,
+    {
+        match self.dequeue_regular_with_limiter_at(limiters, now) {
+            RegularDequeueOutcome::Empty => DispatcherWorkerOutcome::Empty,
+            RegularDequeueOutcome::RateLimited { retry_after } => {
+                DispatcherWorkerOutcome::RateLimited { retry_after }
+            }
+            RegularDequeueOutcome::Ready(item) => self.process_ready_item(item, send).await,
+        }
+    }
+
+    async fn process_ready_item<F, Fut>(
+        &self,
+        item: DispatcherQueuedMessage,
+        send: F,
+    ) -> DispatcherWorkerOutcome
+    where
+        F: FnOnce(DispatcherQueuedMessage) -> Fut,
+        Fut: Future<Output = DispatcherSendStatus>,
+    {
+        let virtual_id = item.virtual_id.clone();
+        let immediate = item.immediate;
+        let status = send(item).await;
+        self.record_send_result(status.is_sent());
+        if status.is_sent() {
+            DispatcherWorkerOutcome::Sent {
+                virtual_id,
+                immediate,
+            }
+        } else {
+            DispatcherWorkerOutcome::SendFailed {
+                virtual_id,
+                immediate,
+            }
+        }
+    }
+
     #[cfg(test)]
     fn stats_at(&self, now: Instant) -> DispatcherStats {
         self.stats_at_inner(now)
@@ -292,11 +392,15 @@ fn oldest_age(queue: &VecDeque<DispatcherQueuedMessage>, now: Instant) -> Durati
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, time::Duration};
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
 
     use super::{
-        DispatcherConfig, DispatcherMessage, DispatcherQueue, EnqueueOutcome, QueueSnapshot,
-        RegularDequeueOutcome,
+        DispatcherConfig, DispatcherMessage, DispatcherQueue, DispatcherSendStatus,
+        DispatcherWorkerOutcome, EnqueueOutcome, QueueSnapshot, RegularDequeueOutcome,
     };
     use crate::{
         ChatLimiters, DebouncerConfig, MESSAGE_TYPE_TEXT, MessageFingerprint, hash_content,
@@ -414,6 +518,116 @@ mod tests {
 
         queue.record_send_result(true);
         assert_eq!(queue.stats_at(now).processed_total, 1);
+    }
+
+    #[tokio::test]
+    async fn immediate_worker_awaits_sender_and_records_success() {
+        let queue = DispatcherQueue::new(DispatcherConfig::default());
+        let now = std::time::Instant::now();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+
+        queue.enqueue_at(text_message(42, "immediate", "immediate-1"), true, now);
+
+        let outcome = queue
+            .process_immediate_once({
+                let seen = Arc::clone(&seen);
+                move |item| async move {
+                    seen.lock().expect("seen lock").push(item.virtual_id);
+                    DispatcherSendStatus::Sent
+                }
+            })
+            .await;
+
+        assert_eq!(
+            outcome,
+            DispatcherWorkerOutcome::Sent {
+                virtual_id: "immediate-1".to_owned(),
+                immediate: true,
+            }
+        );
+        assert_eq!(
+            *seen.lock().expect("seen lock"),
+            vec!["immediate-1".to_owned()]
+        );
+        assert_eq!(queue.stats_at(now).processed_total, 1);
+        assert_eq!(queue.stats_at(now).immediate_queue_size, 0);
+    }
+
+    #[tokio::test]
+    async fn regular_worker_requeues_rate_limited_item_without_calling_sender() {
+        let queue = DispatcherQueue::new(DispatcherConfig::default());
+        let limiters = ChatLimiters::new(crate::DEFAULT_DISPATCH_INTERVAL);
+        let now = std::time::Instant::now();
+        let sends = Arc::new(Mutex::new(0usize));
+
+        queue.enqueue_at(text_message(42, "first", "regular-1"), false, now);
+        queue.enqueue_at(
+            text_message(42, "second", "regular-2"),
+            false,
+            now + Duration::from_secs(1),
+        );
+
+        let sent = queue
+            .process_regular_once_at(&limiters, now, {
+                let sends = Arc::clone(&sends);
+                move |_| async move {
+                    *sends.lock().expect("send count lock") += 1;
+                    DispatcherSendStatus::Sent
+                }
+            })
+            .await;
+        assert!(matches!(
+            sent,
+            DispatcherWorkerOutcome::Sent {
+                virtual_id,
+                immediate: false
+            } if virtual_id == "regular-1"
+        ));
+
+        let limited = queue
+            .process_regular_once_at(&limiters, now, {
+                let sends = Arc::clone(&sends);
+                move |_| async move {
+                    *sends.lock().expect("send count lock") += 1;
+                    DispatcherSendStatus::Sent
+                }
+            })
+            .await;
+
+        assert_eq!(
+            limited,
+            DispatcherWorkerOutcome::RateLimited {
+                retry_after: crate::DEFAULT_DISPATCH_INTERVAL,
+            }
+        );
+        assert_eq!(*sends.lock().expect("send count lock"), 1);
+        assert_eq!(
+            virtual_ids(queue.snapshot()).0,
+            vec!["regular-2".to_owned()]
+        );
+        assert_eq!(queue.stats_at(now).processed_total, 1);
+    }
+
+    #[tokio::test]
+    async fn worker_send_failure_does_not_increment_processed_total() {
+        let queue = DispatcherQueue::new(DispatcherConfig::default());
+        let now = std::time::Instant::now();
+
+        queue.enqueue_at(text_message(42, "immediate", "immediate-1"), true, now);
+
+        let outcome = queue
+            .process_immediate_once(|_| async { DispatcherSendStatus::Failed })
+            .await;
+
+        assert_eq!(
+            outcome,
+            DispatcherWorkerOutcome::SendFailed {
+                virtual_id: "immediate-1".to_owned(),
+                immediate: true,
+            }
+        );
+        assert_eq!(queue.stats_at(now).processed_total, 0);
+        assert_eq!(queue.stats_at(now).immediate_queue_size, 0);
     }
 
     #[test]
