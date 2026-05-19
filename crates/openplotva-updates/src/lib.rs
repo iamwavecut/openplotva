@@ -4,6 +4,7 @@ use std::{
     fmt,
     future::Future,
     io,
+    pin::Pin,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -368,6 +369,106 @@ impl RedisUpdateQueue {
     pub async fn is_empty(&self) -> Result<bool, UpdateQueueError> {
         Ok(self.len().await? == 0)
     }
+}
+
+/// Boxed future returned by update producer sources.
+pub type UpdateProducerSourceFuture<'a> =
+    Pin<Box<dyn Future<Output = Option<TelegramUpdate>> + Send + 'a>>;
+
+/// Boxed future returned by update producer queue sinks.
+pub type UpdateProducerQueueFuture<'a, E> =
+    Pin<Box<dyn Future<Output = Result<(), E>> + Send + 'a>>;
+
+pub trait UpdateProducerSource {
+    /// Receive the next update, or `None` when the source is closed.
+    fn next_update<'a>(&'a self) -> UpdateProducerSourceFuture<'a>;
+}
+
+/// Queue sink used by the update producer after filtering allowed updates.
+pub trait UpdateProducerQueue {
+    /// Error returned by the concrete queue.
+    type Error: fmt::Display;
+
+    /// Enqueue one already-approved Telegram update.
+    fn enqueue_update<'a>(
+        &'a self,
+        update: &'a TelegramUpdate,
+    ) -> UpdateProducerQueueFuture<'a, Self::Error>;
+}
+
+impl UpdateProducerQueue for RedisUpdateQueue {
+    type Error = UpdateQueueError;
+
+    fn enqueue_update<'a>(
+        &'a self,
+        update: &'a TelegramUpdate,
+    ) -> UpdateProducerQueueFuture<'a, Self::Error> {
+        Box::pin(RedisUpdateQueue::enqueue_update(self, update))
+    }
+}
+
+/// Summary for one Go-style update producer run.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct UpdateProducerRunReport {
+    /// Updates received from the source.
+    pub received: usize,
+    /// Updates accepted by the Go producer filter and successfully enqueued.
+    pub enqueued: usize,
+    /// Updates rejected by the Go producer filter.
+    pub skipped: usize,
+    /// Enqueue errors observed; the producer continues after these like Go logs and continues.
+    pub enqueue_errors: Vec<String>,
+    /// Whether the source closed before shutdown was requested.
+    pub source_closed: bool,
+}
+
+/// Run Go's update producer loop over an abstract source and queue.
+pub async fn run_update_producer_until<S, Q, Stop>(
+    source: &S,
+    queue: &Q,
+    stop: Stop,
+) -> UpdateProducerRunReport
+where
+    S: UpdateProducerSource + Sync,
+    Q: UpdateProducerQueue + Sync,
+    Stop: Future<Output = ()>,
+{
+    let mut report = UpdateProducerRunReport::default();
+    tokio::pin!(stop);
+
+    loop {
+        tokio::select! {
+            biased;
+
+            _ = &mut stop => break,
+            update = source.next_update() => {
+                let Some(update) = update else {
+                    report.source_closed = true;
+                    break;
+                };
+
+                report.received += 1;
+                if !is_allowed_producer_update(&update) {
+                    report.skipped += 1;
+                    continue;
+                }
+
+                let queued = queue.enqueue_update(&update);
+                tokio::pin!(queued);
+                tokio::select! {
+                    biased;
+
+                    _ = &mut stop => break,
+                    result = &mut queued => match result {
+                        Ok(()) => report.enqueued += 1,
+                        Err(error) => report.enqueue_errors.push(error.to_string()),
+                    },
+                }
+            }
+        }
+    }
+
+    report
 }
 
 /// Runtime knobs matching the Go update consumer defaults.
@@ -759,6 +860,7 @@ fn blpop_timeout_arg(timeout: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::VecDeque,
         env,
         error::Error,
         io,
@@ -770,9 +872,11 @@ mod tests {
 
     use super::{
         DEFAULT_UPDATE_QUEUE_KEY, EncodedUpdate, GO_ALLOWED_UPDATE_NAMES, GO_ALLOWED_UPDATES,
-        GoUpdateType, RedisUpdateQueue, UpdateCodecError, UpdateConsumerConfig, UpdateStageOutcome,
-        blpop_timeout_arg, extract_update_state, is_allowed_producer_update, process_update_at,
-        producer_update_name, producer_update_type, update_name,
+        GoUpdateType, RedisUpdateQueue, UpdateCodecError, UpdateConsumerConfig,
+        UpdateProducerQueue, UpdateProducerQueueFuture, UpdateProducerSource,
+        UpdateProducerSourceFuture, UpdateStageOutcome, blpop_timeout_arg, extract_update_state,
+        is_allowed_producer_update, process_update_at, producer_update_name, producer_update_type,
+        run_update_producer_until, update_name,
     };
     use carapax::types::Update as TelegramUpdate;
 
@@ -1174,6 +1278,63 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn update_producer_enqueues_allowed_updates_and_skips_disallowed()
+    -> Result<(), Box<dyn Error>> {
+        let source = ProducerSourceStub::new(vec![
+            sample_message_update_with_id(100)?,
+            sample_poll_update_with_id(101)?,
+            sample_callback_update_with_id(102)?,
+        ]);
+        let queue = ProducerQueueStub::default();
+
+        let report = run_update_producer_until(&source, &queue, std::future::pending()).await;
+
+        assert_eq!(report.received, 3);
+        assert_eq!(report.enqueued, 2);
+        assert_eq!(report.skipped, 1);
+        assert!(report.source_closed);
+        assert!(report.enqueue_errors.is_empty());
+        assert_eq!(queue.enqueued_ids(), vec![100, 102]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_producer_continues_after_enqueue_errors_like_go() -> Result<(), Box<dyn Error>>
+    {
+        let source = ProducerSourceStub::new(vec![
+            sample_message_update_with_id(100)?,
+            sample_callback_update_with_id(101)?,
+        ]);
+        let queue = ProducerQueueStub::default().with_failures(vec!["redis unavailable"]);
+
+        let report = run_update_producer_until(&source, &queue, std::future::pending()).await;
+
+        assert_eq!(report.received, 2);
+        assert_eq!(report.enqueued, 1);
+        assert_eq!(report.skipped, 0);
+        assert!(report.source_closed);
+        assert_eq!(report.enqueue_errors, vec!["redis unavailable".to_owned()]);
+        assert_eq!(queue.enqueued_ids(), vec![101]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_producer_stop_signal_exits_without_draining_source()
+    -> Result<(), Box<dyn Error>> {
+        let source = ProducerSourceStub::new(vec![sample_message_update_with_id(100)?]);
+        let queue = ProducerQueueStub::default();
+
+        let report = run_update_producer_until(&source, &queue, async {}).await;
+
+        assert_eq!(report.received, 0);
+        assert_eq!(report.enqueued, 0);
+        assert_eq!(report.skipped, 0);
+        assert!(!report.source_closed);
+        assert!(queue.enqueued_ids().is_empty());
+        Ok(())
+    }
+
     #[test]
     fn update_name_matches_go_consumer_stats_names() -> Result<(), Box<dyn Error>> {
         assert_eq!(update_name(&sample_message_update()?), "message");
@@ -1515,8 +1676,122 @@ mod tests {
         Ok(())
     }
 
+    #[derive(Clone)]
+    struct ProducerSourceStub {
+        updates: Arc<Mutex<VecDeque<TelegramUpdate>>>,
+    }
+
+    impl ProducerSourceStub {
+        fn new(updates: Vec<TelegramUpdate>) -> Self {
+            Self {
+                updates: Arc::new(Mutex::new(updates.into())),
+            }
+        }
+    }
+
+    impl UpdateProducerSource for ProducerSourceStub {
+        fn next_update<'a>(&'a self) -> UpdateProducerSourceFuture<'a> {
+            Box::pin(async move {
+                self.updates
+                    .lock()
+                    .expect("producer source updates")
+                    .pop_front()
+            })
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct ProducerQueueStub {
+        enqueued: Arc<Mutex<Vec<i64>>>,
+        failures: Arc<Mutex<VecDeque<&'static str>>>,
+    }
+
+    impl ProducerQueueStub {
+        fn with_failures(self, failures: Vec<&'static str>) -> Self {
+            *self.failures.lock().expect("producer queue failures") = failures.into();
+            self
+        }
+
+        fn enqueued_ids(&self) -> Vec<i64> {
+            self.enqueued.lock().expect("producer queue ids").clone()
+        }
+    }
+
+    impl UpdateProducerQueue for ProducerQueueStub {
+        type Error = io::Error;
+
+        fn enqueue_update<'a>(
+            &'a self,
+            update: &'a TelegramUpdate,
+        ) -> UpdateProducerQueueFuture<'a, Self::Error> {
+            Box::pin(async move {
+                if let Some(message) = self
+                    .failures
+                    .lock()
+                    .map_err(|err| io::Error::other(err.to_string()))?
+                    .pop_front()
+                {
+                    return Err(io::Error::other(message));
+                }
+
+                self.enqueued
+                    .lock()
+                    .map_err(|err| io::Error::other(err.to_string()))?
+                    .push(update.id);
+                Ok(())
+            })
+        }
+    }
+
     fn sample_message_update() -> Result<TelegramUpdate, serde_json::Error> {
         sample_message_update_with_date(1_710_000_000)
+    }
+
+    fn sample_message_update_with_id(update_id: i64) -> Result<TelegramUpdate, serde_json::Error> {
+        serde_json::from_value(json!({
+            "update_id": update_id,
+            "message": sample_message_json(77, 1_710_000_000, "/start hello")
+        }))
+    }
+
+    fn sample_callback_update_with_id(update_id: i64) -> Result<TelegramUpdate, serde_json::Error> {
+        serde_json::from_value(json!({
+            "update_id": update_id,
+            "callback_query": {
+                "id": "callback-id",
+                "from": sample_user_json(),
+                "message": sample_message_json(8, 1_710_000_000, "callback")
+            }
+        }))
+    }
+
+    fn sample_poll_update_with_id(update_id: i64) -> Result<TelegramUpdate, serde_json::Error> {
+        serde_json::from_value(json!({
+            "update_id": update_id,
+            "poll": {
+                "type": "regular",
+                "allows_multiple_answers": false,
+                "allows_revoting": false,
+                "id": "poll-id",
+                "is_anonymous": true,
+                "is_closed": true,
+                "members_only": false,
+                "options": [
+                    {
+                        "persistent_id": "1",
+                        "text": "Yes",
+                        "voter_count": 1000
+                    },
+                    {
+                        "persistent_id": "2",
+                        "text": "No",
+                        "voter_count": 0
+                    }
+                ],
+                "question": "Rust?",
+                "total_voter_count": 1000
+            }
+        }))
     }
 
     fn sample_message_update_with_date(date: i64) -> Result<TelegramUpdate, serde_json::Error> {
