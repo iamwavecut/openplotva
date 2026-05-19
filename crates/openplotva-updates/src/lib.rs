@@ -1,8 +1,15 @@
 //! Telegram update ingestion, classification, and replay.
 
-use std::{io, time::Duration};
+use std::{
+    fmt,
+    future::Future,
+    io,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 
-use carapax::types::Update as TelegramUpdate;
+use carapax::types::{
+    MaybeInaccessibleMessage, Update as TelegramUpdate, UpdateType as TelegramUpdateType,
+};
 use redis::Client as RedisClient;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -17,6 +24,24 @@ pub const DEFAULT_UPDATE_QUEUE_KEY: &str = "plotva:updates:queue";
 pub const NATIVE_UPDATE_CODEC: &str = "openplotva.update.v1+carapax-json.zstd";
 
 pub const NATIVE_UPDATE_FORMAT_VERSION: u16 = 1;
+
+/// Go `internal/processor` dequeue timeout for the update consumer loop.
+pub const DEFAULT_UPDATE_DEQUEUE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Go `internal/processor.updateStateTimeout`.
+pub const UPDATE_STATE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Go `internal/processor.updateHandleTimeout`.
+pub const UPDATE_HANDLE_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// Go `shouldSkipSideEffects` max age.
+pub const UPDATE_SIDE_EFFECT_MAX_AGE: Duration = Duration::from_secs(60);
+
+/// Go `internal/processor.updateStallAge`.
+pub const UPDATE_STALL_AGE: Duration = Duration::from_secs(120);
+
+/// Go update consumer worker limit multiplier over available CPUs.
+pub const UPDATE_WORKER_LIMIT_PER_CPU: usize = 4;
 
 ///
 /// The Go runtime stored each update as zstd-compressed `encoding/gob`
@@ -158,6 +183,45 @@ impl RedisUpdateQueue {
         Ok(result.map(|(_, value)| EncodedUpdate::from_queue_value(value)))
     }
 
+    /// Dequeue and decode one typed Telegram update.
+    pub async fn dequeue_update(
+        &self,
+        timeout: Duration,
+    ) -> Result<Option<TelegramUpdate>, UpdateQueueError> {
+        let Some(update) = self.dequeue_encoded(timeout).await? else {
+            return Ok(None);
+        };
+        Ok(Some(update.decode_update()?))
+    }
+
+    /// Dequeue and process one update using the Rust-native consumer primitive.
+    pub async fn process_next_update<
+        StateFn,
+        StateFuture,
+        StateError,
+        HandleFn,
+        HandleFuture,
+        HandleError,
+    >(
+        &self,
+        config: UpdateConsumerConfig,
+        state: StateFn,
+        handle: HandleFn,
+    ) -> Result<Option<UpdateProcessReport>, UpdateQueueError>
+    where
+        StateFn: FnOnce(TelegramUpdate) -> StateFuture,
+        StateFuture: Future<Output = Result<(), StateError>>,
+        StateError: fmt::Display,
+        HandleFn: FnOnce(TelegramUpdate) -> HandleFuture,
+        HandleFuture: Future<Output = Result<(), HandleError>>,
+        HandleError: fmt::Display,
+    {
+        let Some(update) = self.dequeue_update(config.dequeue_timeout).await? else {
+            return Ok(None);
+        };
+        Ok(Some(process_update(update, config, state, handle).await))
+    }
+
     /// Return the Redis list length using Go `LLEN` semantics.
     pub async fn len(&self) -> Result<i64, UpdateQueueError> {
         let mut connection = self.client.get_multiplexed_async_connection().await?;
@@ -171,6 +235,234 @@ impl RedisUpdateQueue {
     /// Return whether the Redis list is empty.
     pub async fn is_empty(&self) -> Result<bool, UpdateQueueError> {
         Ok(self.len().await? == 0)
+    }
+}
+
+/// Runtime knobs matching the Go update consumer defaults.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UpdateConsumerConfig {
+    /// Blocking pop timeout for one queue read.
+    pub dequeue_timeout: Duration,
+    /// Timeout for chat/user state updates.
+    pub state_timeout: Duration,
+    /// Timeout for user-visible update handling.
+    pub handle_timeout: Duration,
+    /// Maximum update age before skipping side effects.
+    pub side_effect_max_age: Duration,
+    /// Maximum number of concurrently active tasks.
+    pub worker_limit: usize,
+}
+
+impl Default for UpdateConsumerConfig {
+    fn default() -> Self {
+        let cpus = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1);
+        Self {
+            dequeue_timeout: DEFAULT_UPDATE_DEQUEUE_TIMEOUT,
+            state_timeout: UPDATE_STATE_TIMEOUT,
+            handle_timeout: UPDATE_HANDLE_TIMEOUT,
+            side_effect_max_age: UPDATE_SIDE_EFFECT_MAX_AGE,
+            worker_limit: UPDATE_WORKER_LIMIT_PER_CPU * cpus,
+        }
+    }
+}
+
+/// Update consumer task stage.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UpdateStage {
+    /// Chat/user state persistence stage.
+    State,
+    /// User-visible update handler stage.
+    Handle,
+}
+
+/// Outcome of one update consumer stage.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UpdateStageOutcome {
+    /// Stage completed without returning an error.
+    Completed,
+    /// Stage returned an error. Go logs these and keeps the consumer alive.
+    Failed(String),
+    /// Stage exceeded its configured timeout.
+    TimedOut,
+}
+
+/// Report for one update consumer stage.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpdateStageReport {
+    /// Stage that ran.
+    pub stage: UpdateStage,
+    /// Stage result.
+    pub outcome: UpdateStageOutcome,
+    /// Wall-clock time spent in the stage.
+    pub elapsed: Duration,
+}
+
+/// Report for one decoded update.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpdateProcessReport {
+    /// Telegram update id.
+    pub update_id: i64,
+    pub update_name: &'static str,
+    /// Chat/user state stage report.
+    pub state: UpdateStageReport,
+    /// User-visible handle stage report, absent when skipped as stale.
+    pub handle: Option<UpdateStageReport>,
+    /// Whether user-visible side effects were skipped because the update is stale.
+    pub skipped_handle: bool,
+}
+
+/// Process one update using Go consumer stage ordering and timeouts.
+pub async fn process_update<StateFn, StateFuture, StateError, HandleFn, HandleFuture, HandleError>(
+    update: TelegramUpdate,
+    config: UpdateConsumerConfig,
+    state: StateFn,
+    handle: HandleFn,
+) -> UpdateProcessReport
+where
+    StateFn: FnOnce(TelegramUpdate) -> StateFuture,
+    StateFuture: Future<Output = Result<(), StateError>>,
+    StateError: fmt::Display,
+    HandleFn: FnOnce(TelegramUpdate) -> HandleFuture,
+    HandleFuture: Future<Output = Result<(), HandleError>>,
+    HandleError: fmt::Display,
+{
+    process_update_at(update, config, SystemTime::now(), state, handle).await
+}
+
+pub async fn process_update_at<
+    StateFn,
+    StateFuture,
+    StateError,
+    HandleFn,
+    HandleFuture,
+    HandleError,
+>(
+    update: TelegramUpdate,
+    config: UpdateConsumerConfig,
+    now: SystemTime,
+    state: StateFn,
+    handle: HandleFn,
+) -> UpdateProcessReport
+where
+    StateFn: FnOnce(TelegramUpdate) -> StateFuture,
+    StateFuture: Future<Output = Result<(), StateError>>,
+    StateError: fmt::Display,
+    HandleFn: FnOnce(TelegramUpdate) -> HandleFuture,
+    HandleFuture: Future<Output = Result<(), HandleError>>,
+    HandleError: fmt::Display,
+{
+    let update_id = update.id;
+    let name = update_name(&update);
+    let skip_handle = should_skip_side_effects_at(&update, config.side_effect_max_age, now);
+    let state_task = run_stage(
+        UpdateStage::State,
+        config.state_timeout,
+        state(update.clone()),
+    );
+
+    if skip_handle {
+        return UpdateProcessReport {
+            update_id,
+            update_name: name,
+            state: state_task.await,
+            handle: None,
+            skipped_handle: true,
+        };
+    }
+
+    let handle_task = run_stage(UpdateStage::Handle, config.handle_timeout, handle(update));
+    let (state, handle) = tokio::join!(state_task, handle_task);
+
+    UpdateProcessReport {
+        update_id,
+        update_name: name,
+        state,
+        handle: Some(handle),
+        skipped_handle: false,
+    }
+}
+
+/// Return the Go consumer stats name for an update.
+pub fn update_name(update: &TelegramUpdate) -> &'static str {
+    match &update.update_type {
+        TelegramUpdateType::Message(_) => "message",
+        TelegramUpdateType::EditedMessage(_) => "edited_message",
+        TelegramUpdateType::GuestMessage(_) => "guest_message",
+        TelegramUpdateType::CallbackQuery(_) => "callback_query",
+        TelegramUpdateType::PreCheckoutQuery(_) => "pre_checkout_query",
+        TelegramUpdateType::BotStatus(_) => "my_chat_member",
+        TelegramUpdateType::UserStatus(_) => "chat_member",
+        TelegramUpdateType::ChatJoinRequest(_) => "chat_join_request",
+        _ => "unknown",
+    }
+}
+
+/// Return whether Go would skip user-visible side effects for this update age.
+pub fn should_skip_side_effects_at(
+    update: &TelegramUpdate,
+    max_age: Duration,
+    now: SystemTime,
+) -> bool {
+    let Some(update_date) = side_effect_message_unix_date(update) else {
+        return false;
+    };
+    let now_secs = unix_timestamp_seconds(now);
+    i128::from(update_date) + i128::from(max_age.as_secs()) <= now_secs
+}
+
+async fn run_stage<Fut, E>(stage: UpdateStage, timeout: Duration, task: Fut) -> UpdateStageReport
+where
+    Fut: Future<Output = Result<(), E>>,
+    E: fmt::Display,
+{
+    let started = Instant::now();
+    let outcome = if timeout.is_zero() {
+        stage_outcome(task.await)
+    } else {
+        match tokio::time::timeout(timeout, task).await {
+            Ok(result) => stage_outcome(result),
+            Err(_) => UpdateStageOutcome::TimedOut,
+        }
+    };
+
+    UpdateStageReport {
+        stage,
+        outcome,
+        elapsed: started.elapsed(),
+    }
+}
+
+fn stage_outcome<E>(result: Result<(), E>) -> UpdateStageOutcome
+where
+    E: fmt::Display,
+{
+    match result {
+        Ok(()) => UpdateStageOutcome::Completed,
+        Err(error) => UpdateStageOutcome::Failed(error.to_string()),
+    }
+}
+
+fn side_effect_message_unix_date(update: &TelegramUpdate) -> Option<i64> {
+    match &update.update_type {
+        TelegramUpdateType::Message(message) | TelegramUpdateType::GuestMessage(message) => {
+            Some(message.date)
+        }
+        TelegramUpdateType::CallbackQuery(query) => {
+            query.message.as_ref().map(|message| match message {
+                MaybeInaccessibleMessage::Message(message) => message.date,
+                MaybeInaccessibleMessage::InaccessibleMessage(_) => 0,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn unix_timestamp_seconds(time: SystemTime) -> i128 {
+    match time.duration_since(UNIX_EPOCH) {
+        Ok(duration) => i128::from(duration.as_secs()),
+        Err(error) => -i128::from(error.duration().as_secs()),
     }
 }
 
@@ -228,6 +520,7 @@ mod tests {
         env,
         error::Error,
         io,
+        sync::{Arc, Mutex},
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
@@ -235,7 +528,8 @@ mod tests {
 
     use super::{
         DEFAULT_UPDATE_QUEUE_KEY, EncodedUpdate, RedisUpdateQueue, UpdateCodecError,
-        blpop_timeout_arg,
+        UpdateConsumerConfig, UpdateStageOutcome, blpop_timeout_arg, process_update_at,
+        update_name,
     };
     use carapax::types::Update as TelegramUpdate;
 
@@ -321,6 +615,156 @@ mod tests {
         assert_eq!(blpop_timeout_arg(Duration::from_millis(1)), "0.001");
     }
 
+    #[test]
+    fn update_name_matches_go_consumer_stats_names() -> Result<(), Box<dyn Error>> {
+        assert_eq!(update_name(&sample_message_update()?), "message");
+        assert_eq!(
+            update_name(&serde_json::from_value(json!({
+                "update_id": 1,
+                "edited_message": sample_message_json(2, 1_710_000_000, "edited")
+            }))?),
+            "edited_message"
+        );
+        assert_eq!(
+            update_name(&serde_json::from_value(json!({
+                "update_id": 2,
+                "callback_query": {
+                    "id": "callback-id",
+                    "from": sample_user_json(),
+                    "message": sample_message_json(3, 1_710_000_000, "callback")
+                }
+            }))?),
+            "callback_query"
+        );
+        assert_eq!(
+            update_name(&serde_json::from_value(json!({
+                "update_id": 3,
+                "message_reaction": {
+                    "chat": {
+                        "id": 42,
+                        "type": "private",
+                        "first_name": "Ada"
+                    },
+                    "message_id": 99,
+                    "date": 1_710_000_000,
+                    "old_reaction": [],
+                    "new_reaction": []
+                }
+            }))?),
+            "unknown"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_consumer_runs_state_and_handle_for_fresh_update() -> Result<(), Box<dyn Error>>
+    {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let state_calls = calls.clone();
+        let handle_calls = calls.clone();
+        let update = sample_message_update_with_date(1_710_000_000)?;
+        let now = UNIX_EPOCH + Duration::from_secs(1_710_000_030);
+
+        let report = process_update_at(
+            update,
+            UpdateConsumerConfig::default(),
+            now,
+            move |_| async move {
+                push_call(&state_calls, "state")?;
+                Ok::<_, io::Error>(())
+            },
+            move |_| async move {
+                push_call(&handle_calls, "handle")?;
+                Ok::<_, io::Error>(())
+            },
+        )
+        .await;
+
+        assert_eq!(
+            calls
+                .lock()
+                .map_err(|err| io::Error::other(err.to_string()))?
+                .as_slice(),
+            ["state", "handle"]
+        );
+        assert_eq!(report.update_name, "message");
+        assert_eq!(report.state.outcome, UpdateStageOutcome::Completed);
+        assert_eq!(
+            report.handle.as_ref().map(|stage| &stage.outcome),
+            Some(&UpdateStageOutcome::Completed)
+        );
+        assert!(!report.skipped_handle);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_consumer_skips_handle_at_go_stale_boundary() -> Result<(), Box<dyn Error>> {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let state_calls = calls.clone();
+        let handle_calls = calls.clone();
+        let update = sample_message_update_with_date(1_710_000_000)?;
+        let now = UNIX_EPOCH + Duration::from_secs(1_710_000_060);
+
+        let report = process_update_at(
+            update,
+            UpdateConsumerConfig::default(),
+            now,
+            move |_| async move {
+                push_call(&state_calls, "state")?;
+                Ok::<_, io::Error>(())
+            },
+            move |_| async move {
+                push_call(&handle_calls, "handle")?;
+                Ok::<_, io::Error>(())
+            },
+        )
+        .await;
+
+        assert_eq!(
+            calls
+                .lock()
+                .map_err(|err| io::Error::other(err.to_string()))?
+                .as_slice(),
+            ["state"]
+        );
+        assert_eq!(report.state.outcome, UpdateStageOutcome::Completed);
+        assert!(report.handle.is_none());
+        assert!(report.skipped_handle);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_consumer_reports_stage_timeouts() -> Result<(), Box<dyn Error>> {
+        let update = sample_message_update()?;
+        let config = UpdateConsumerConfig {
+            handle_timeout: Duration::from_millis(1),
+            ..UpdateConsumerConfig::default()
+        };
+
+        let report = process_update_at(
+            update,
+            config,
+            UNIX_EPOCH + Duration::from_secs(1_710_000_030),
+            |_| async { Ok::<_, io::Error>(()) },
+            |_| async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                Ok::<_, io::Error>(())
+            },
+        )
+        .await;
+
+        assert_eq!(report.state.outcome, UpdateStageOutcome::Completed);
+        assert_eq!(
+            report.handle.as_ref().map(|stage| &stage.outcome),
+            Some(&UpdateStageOutcome::TimedOut)
+        );
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn live_redis_queue_round_trips_encoded_updates_when_url_is_set()
     -> Result<(), Box<dyn Error>> {
@@ -378,6 +822,31 @@ mod tests {
         assert_eq!(dequeued.decode_update()?.id, 12346);
         assert!(queue.is_empty().await?);
 
+        queue.enqueue_update(&first).await?;
+        let dequeued = queue
+            .dequeue_update(Duration::from_secs(1))
+            .await?
+            .ok_or_else(|| io::Error::other("expected queued update"))?;
+        assert_eq!(dequeued.id, 12345);
+
+        let fresh_date = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+        let fresh = sample_message_update_with_date(fresh_date)?;
+        queue.enqueue_update(&fresh).await?;
+        let processed = queue
+            .process_next_update(
+                UpdateConsumerConfig::default(),
+                |_| async { Ok::<_, io::Error>(()) },
+                |_| async { Ok::<_, io::Error>(()) },
+            )
+            .await?
+            .ok_or_else(|| io::Error::other("expected processed update"))?;
+        assert_eq!(processed.update_id, 12345);
+        assert_eq!(processed.state.outcome, UpdateStageOutcome::Completed);
+        assert_eq!(
+            processed.handle.as_ref().map(|stage| &stage.outcome),
+            Some(&UpdateStageOutcome::Completed)
+        );
+
         let _: i64 = redis::cmd("DEL")
             .arg(&key)
             .query_async(&mut connection)
@@ -385,26 +854,46 @@ mod tests {
         Ok(())
     }
 
+    fn push_call(calls: &Mutex<Vec<&'static str>>, name: &'static str) -> Result<(), io::Error> {
+        calls
+            .lock()
+            .map_err(|err| io::Error::other(err.to_string()))?
+            .push(name);
+        Ok(())
+    }
+
     fn sample_message_update() -> Result<TelegramUpdate, serde_json::Error> {
+        sample_message_update_with_date(1_710_000_000)
+    }
+
+    fn sample_message_update_with_date(date: i64) -> Result<TelegramUpdate, serde_json::Error> {
         serde_json::from_value(json!({
             "update_id": 12345,
-            "message": {
-                "message_id": 77,
-                "date": 1710000000,
-                "chat": {
-                    "id": 42,
-                    "type": "private",
-                    "first_name": "Ada",
-                    "username": "ada_l"
-                },
-                "from": {
-                    "id": 99,
-                    "is_bot": false,
-                    "first_name": "Ada",
-                    "username": "ada_l"
-                },
-                "text": "/start hello"
-            }
+            "message": sample_message_json(77, date, "/start hello")
         }))
+    }
+
+    fn sample_message_json(message_id: i64, date: i64, text: &str) -> serde_json::Value {
+        json!({
+            "message_id": message_id,
+            "date": date,
+            "chat": {
+                "id": 42,
+                "type": "private",
+                "first_name": "Ada",
+                "username": "ada_l"
+            },
+            "from": sample_user_json(),
+            "text": text
+        })
+    }
+
+    fn sample_user_json() -> serde_json::Value {
+        json!({
+            "id": 99,
+            "is_bot": false,
+            "first_name": "Ada",
+            "username": "ada_l"
+        })
     }
 }
