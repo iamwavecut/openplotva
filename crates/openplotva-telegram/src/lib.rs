@@ -134,9 +134,20 @@ pub type InputMediaPhoto = carapax::types::InputMediaPhoto;
 /// Telegram input media type from `carapax`.
 pub type InputMedia = carapax::types::InputMedia;
 
+/// Telegram Bot API client from `carapax`.
+pub type TelegramClient = carapax::api::Client;
+
+/// Telegram Bot API client construction error from `carapax`.
+pub type TelegramClientError = carapax::api::ClientError;
+
 /// Create an empty Telegram integration context.
 pub fn empty_context() -> CarapaxContext {
     CarapaxContext::default()
+}
+
+/// Create a Telegram Bot API client through the mandated `carapax` integration.
+pub fn telegram_client(token: impl Into<String>) -> Result<TelegramClient, TelegramClientError> {
+    TelegramClient::new(token)
 }
 
 /// Bot command scope used by the Go command setup.

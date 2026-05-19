@@ -65,6 +65,9 @@ pub const DEFAULT_CONNECT_SERVICES: bool = false;
 /// SQLx migration execution is opt-in until existing Go DB compatibility is handled.
 pub const DEFAULT_RUN_MIGRATIONS: bool = false;
 
+/// Go default for `BOT_DEBUG`.
+pub const DEFAULT_BOT_DEBUG: bool = false;
+
 /// Top-level application configuration.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -76,6 +79,8 @@ pub struct AppConfig {
     pub database: DatabaseConfig,
     /// Redis/Dragonfly configuration.
     pub redis: RedisConfig,
+    /// Telegram bot configuration.
+    pub bot: BotConfig,
     pub reference_snapshot: ReferenceSnapshotConfig,
     /// Runtime service-probe configuration.
     pub service_probe: ServiceProbeConfig,
@@ -154,6 +159,13 @@ pub struct RedisConfig {
     pub db: i64,
 }
 
+/// Telegram bot configuration.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BotConfig {
+    pub key: Option<String>,
+    pub debug: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ReferenceSnapshotConfig {
     pub repository: PathBuf,
@@ -206,6 +218,10 @@ pub struct RawConfig {
     pub redis_password: Option<String>,
     /// `REDIS_DB`.
     pub redis_db: Option<String>,
+    /// `BOT_KEY`.
+    pub bot_key: Option<String>,
+    /// `BOT_DEBUG`.
+    pub bot_debug: Option<String>,
     /// `OPENPLOTVA_REFERENCE_SOURCE_REPOSITORY`.
     pub openplotva_reference_source_repository: Option<String>,
     /// `OPENPLOTVA_RUNTIME_CONTRACT_PATH`.
@@ -344,6 +360,10 @@ impl AppConfig {
                 password: raw.redis_password.unwrap_or_default(),
                 db: parse_i64("REDIS_DB", raw.redis_db, DEFAULT_REDIS_DB)?,
             },
+            bot: BotConfig {
+                key: raw.bot_key.filter(|value| !value.is_empty()),
+                debug: parse_bool("BOT_DEBUG", raw.bot_debug, DEFAULT_BOT_DEBUG)?,
+            },
             reference_snapshot: ReferenceSnapshotConfig {
                 repository: raw
                     .openplotva_reference_source_repository
@@ -395,6 +415,8 @@ impl RawConfig {
             redis_port: env("REDIS_PORT"),
             redis_password: env("REDIS_PASSWORD"),
             redis_db: env("REDIS_DB"),
+            bot_key: env("BOT_KEY"),
+            bot_debug: env("BOT_DEBUG"),
             openplotva_reference_source_repository: env("OPENPLOTVA_REFERENCE_SOURCE_REPOSITORY"),
             openplotva_reference_snapshot_path: env("OPENPLOTVA_RUNTIME_CONTRACT_PATH"),
             openplotva_enforce_reference_snapshot: env("OPENPLOTVA_DISABLED_LEGACY_LOCK"),
@@ -488,6 +510,8 @@ mod tests {
         assert_eq!(config.redis.port, 6379);
         assert_eq!(config.redis.password, "");
         assert_eq!(config.redis.db, 0);
+        assert_eq!(config.bot.key, None);
+        assert!(!config.bot.debug);
         assert_eq!(
             config.reference_snapshot.repository.to_string_lossy(),
             DEFAULT_REFERENCE_SOURCE_REPOSITORY
@@ -548,5 +572,19 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn bot_config_loads_go_bot_env_values() -> Result<(), super::ConfigError> {
+        let config = AppConfig::from_raw(RawConfig {
+            bot_key: Some("123:secret".to_owned()),
+            bot_debug: Some("true".to_owned()),
+            ..RawConfig::default()
+        })?;
+
+        assert_eq!(config.bot.key.as_deref(), Some("123:secret"));
+        assert!(config.bot.debug);
+
+        Ok(())
     }
 }

@@ -1,6 +1,6 @@
 //! Composition-root processing for resolved pending virtual-message operations.
 
-use std::{fmt, future::Future, pin::Pin};
+use std::{fmt, future::Future, pin::Pin, time::Duration};
 
 use openplotva_core::{MessageIdMapping, PendingOp};
 use openplotva_server::{
@@ -10,6 +10,9 @@ use openplotva_telegram::{PendingOpBuildError, TelegramOutboundMethod, build_pen
 
 /// Go pending-operation poll batch size.
 pub const PENDING_OP_BATCH_LIMIT: i32 = 50;
+
+/// Go pending-operation worker tick interval.
+pub const PENDING_OP_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -114,6 +117,55 @@ pub struct PendingOpProcessReport {
     pub list_error: Option<String>,
 }
 
+/// Accumulated summary for a pending-op worker run.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PendingOpWorkerReport {
+    /// Number of polling ticks processed.
+    pub ticks: usize,
+    /// Total rows returned by `ListPendingOps`.
+    pub listed: usize,
+    /// Total rows ready for Telegram execution.
+    pub ready: usize,
+    /// Total rows skipped because no resolved real message ID was available.
+    pub skipped_unresolved: usize,
+    /// Total Telegram methods sent successfully.
+    pub sent: usize,
+    /// Total successful operations marked done.
+    pub marked_done: usize,
+    /// Total operations marked failed.
+    pub marked_failed: usize,
+    /// Total rows that failed before sending because the operation was unknown or invalid.
+    pub build_failed: usize,
+    /// Total Telegram send failures.
+    pub send_failed: usize,
+    /// Total failed attempts to write a done/failed status back to storage.
+    pub status_write_failed: usize,
+    /// Number of ticks where pending-op listing failed.
+    pub list_failures: usize,
+    /// Number of ticks that used single-lookup fallback after batch mapping lookup failed.
+    pub batch_lookup_failures: usize,
+    /// Total single mapping lookups attempted after batch failures.
+    pub single_lookup_attempts: usize,
+}
+
+impl PendingOpWorkerReport {
+    fn record_tick(&mut self, tick: &PendingOpProcessReport) {
+        self.ticks += 1;
+        self.listed += tick.listed;
+        self.ready += tick.ready;
+        self.skipped_unresolved += tick.skipped_unresolved;
+        self.sent += tick.sent;
+        self.marked_done += tick.marked_done;
+        self.marked_failed += tick.marked_failed;
+        self.build_failed += tick.build_failed;
+        self.send_failed += tick.send_failed;
+        self.status_write_failed += tick.status_write_failed;
+        self.list_failures += usize::from(tick.list_error.is_some());
+        self.batch_lookup_failures += usize::from(tick.batch_lookup_failed);
+        self.single_lookup_attempts += tick.single_lookup_attempts;
+    }
+}
+
 pub async fn process_pending_ops<S, Send, SendFuture, SendError>(
     store: &S,
     mut send: Send,
@@ -171,6 +223,71 @@ where
     }
 
     report
+}
+
+pub async fn run_pending_op_worker_until<S, Send, SendFuture, SendError, Stop>(
+    store: &S,
+    send: Send,
+    stop: Stop,
+) -> PendingOpWorkerReport
+where
+    S: PendingOpStore + Sync,
+    Send: FnMut(TelegramOutboundMethod) -> SendFuture,
+    SendFuture: Future<Output = Result<(), SendError>>,
+    SendError: fmt::Display,
+    Stop: Future<Output = ()>,
+{
+    run_pending_op_worker_every_until(store, send, PENDING_OP_POLL_INTERVAL, stop).await
+}
+
+async fn run_pending_op_worker_every_until<S, Send, SendFuture, SendError, Stop>(
+    store: &S,
+    mut send: Send,
+    interval: Duration,
+    stop: Stop,
+) -> PendingOpWorkerReport
+where
+    S: PendingOpStore + Sync,
+    Send: FnMut(TelegramOutboundMethod) -> SendFuture,
+    SendFuture: Future<Output = Result<(), SendError>>,
+    SendError: fmt::Display,
+    Stop: Future<Output = ()>,
+{
+    let mut report = PendingOpWorkerReport::default();
+    let mut stop = std::pin::pin!(stop);
+
+    loop {
+        tokio::select! {
+            () = &mut stop => break,
+            () = tokio::time::sleep(interval) => {
+                let tick = process_pending_ops(store, &mut send).await;
+                trace_pending_op_tick(&tick);
+                report.record_tick(&tick);
+            }
+        }
+    }
+
+    report
+}
+
+fn trace_pending_op_tick(tick: &PendingOpProcessReport) {
+    if tick.listed == 0 && tick.list_error.is_none() {
+        return;
+    }
+
+    tracing::debug!(
+        listed = tick.listed,
+        ready = tick.ready,
+        skipped_unresolved = tick.skipped_unresolved,
+        sent = tick.sent,
+        marked_done = tick.marked_done,
+        marked_failed = tick.marked_failed,
+        build_failed = tick.build_failed,
+        send_failed = tick.send_failed,
+        status_write_failed = tick.status_write_failed,
+        list_error = tick.list_error.as_deref(),
+        "processed pending Telegram operations"
+    );
 }
 
 async fn load_pending_op_mappings<S>(
@@ -234,7 +351,8 @@ mod tests {
     use openplotva_telegram::TelegramOutboundMethodKind;
 
     use super::{
-        PENDING_OP_BATCH_LIMIT, PendingOpProcessReport, PendingOpStore, process_pending_ops,
+        PENDING_OP_BATCH_LIMIT, PendingOpProcessReport, PendingOpStore, PendingOpWorkerReport,
+        process_pending_ops, run_pending_op_worker_every_until,
     };
 
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -509,6 +627,51 @@ mod tests {
             assert!(state.batch_ids.is_empty());
             assert!(state.single_calls.is_empty());
             assert!(state.done.is_empty());
+            assert!(state.failed.is_empty());
+        });
+    }
+
+    #[tokio::test]
+    async fn worker_ticks_until_stop_and_accumulates_tick_reports() {
+        let store = StoreStub::with_state(StoreState {
+            rows: vec![pending_op(1, "v1", "delete", b"")],
+            batch_rows: vec![MessageIdMapping::resolved("v1", 42, 77)],
+            ..StoreState::default()
+        });
+        let (stop_send, stop_recv) = tokio::sync::oneshot::channel();
+        let mut stop_send = Some(stop_send);
+        let mut sent = Vec::new();
+
+        let report = run_pending_op_worker_every_until(
+            &store,
+            |method| {
+                sent.push(method.kind());
+                if let Some(stop_send) = stop_send.take() {
+                    let _ = stop_send.send(());
+                }
+                async { Ok::<(), StubError>(()) }
+            },
+            std::time::Duration::from_millis(1),
+            async {
+                let _ = stop_recv.await;
+            },
+        )
+        .await;
+
+        assert_eq!(
+            report,
+            PendingOpWorkerReport {
+                ticks: 1,
+                listed: 1,
+                ready: 1,
+                sent: 1,
+                marked_done: 1,
+                ..PendingOpWorkerReport::default()
+            }
+        );
+        assert_eq!(sent, vec![TelegramOutboundMethodKind::DeleteMessage]);
+        store.snapshot(|state| {
+            assert_eq!(state.done, vec![1]);
             assert!(state.failed.is_empty());
         });
     }

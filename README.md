@@ -63,6 +63,8 @@ The app loads `.env` like the Go implementation. The current service-spine env v
 | `REDIS_PORT` | `6379` | Redis/Dragonfly port. |
 | `REDIS_PASSWORD` | empty | Redis/Dragonfly password. |
 | `REDIS_DB` | `0` | Redis/Dragonfly DB. |
+| `BOT_KEY` | empty | Go-compatible Telegram Bot API token. When set with `OPENPLOTVA_CONNECT_SERVICES=true`, the Rust shell starts the pending-operation worker. |
+| `BOT_DEBUG` | `false` | Go-compatible bot debug flag, currently loaded for config contract. |
 | `OPENPLOTVA_REFERENCE_SOURCE_REPOSITORY` | `/Users/Shared/src/github.com/iamwavecut/reference-app` | Read-only Go source used for lock checks. |
 | `OPENPLOTVA_RUNTIME_CONTRACT_PATH` | `docs/contract/reference-snapshot.json` | Reference-snapshot JSON file. |
 | `OPENPLOTVA_DISABLED_LEGACY_LOCK` | `true` | Fails startup when Go `HEAD` differs from the lock. |
@@ -129,7 +131,7 @@ The Rust repo carries a SQLx-compatible conversion of the frozen Go migrations u
 - Source of truth: `/Users/Shared/src/github.com/iamwavecut/reference-app/internal/db/sql/migrations`
 - Frozen inventory: `docs/contract/generated/migrations.json`
 - Conversion: each Go `sql-migrate` file is split into reversible SQLx `.up.sql` and `.down.sql` files.
-- Runtime execution: `OPENPLOTVA_CONNECT_SERVICES=true OPENPLOTVA_RUN_MIGRATIONS=true cargo run -p openplotva-app`
+- Runtime execution: `OPENPLOTVA_CONNECT_SERVICES=true OPENPLOTVA_RUN_MIGRATIONS=true BOT_KEY=... cargo run -p openplotva-app`
 
 Current caveat: SQLx records migration state in `_sqlx_migrations`, while the Go app uses `rubenv/sql-migrate`. Use the Rust migration runner on fresh or scratch databases until the existing production DB compatibility path is explicitly ported and tested.
 
