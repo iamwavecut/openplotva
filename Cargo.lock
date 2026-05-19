@@ -1605,6 +1605,7 @@ dependencies = [
  "carapax",
  "crc",
  "html5ever",
+ "redis",
  "serde",
  "serde_json",
  "thiserror",
