@@ -1539,6 +1539,8 @@ version = "0.1.0"
 dependencies = [
  "openplotva-config",
  "redis",
+ "serde",
+ "serde_json",
  "sqlx",
  "thiserror",
 ]

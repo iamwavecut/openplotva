@@ -56,14 +56,28 @@ async fn connect_services(
         return Ok(None);
     }
 
-    let clients =
-        openplotva_storage::connect_service_clients(&config.database.postgres, &config.redis)
-            .await
-            .context("connect Postgres and Redis")?;
+    let clients = openplotva_storage::connect_service_clients(
+        &config.database.postgres,
+        &config.redis,
+        config.service_probe.run_migrations,
+    )
+    .await
+    .context("connect Postgres and Redis")?;
     readiness_checks.push(ReadinessCheck::ok(
         "postgres",
         "startup connection established",
     ));
+    if clients.migrations_applied {
+        readiness_checks.push(ReadinessCheck::ok(
+            "migrations",
+            "pending SQLx migrations applied",
+        ));
+    } else {
+        readiness_checks.push(ReadinessCheck::skipped(
+            "migrations",
+            "OPENPLOTVA_RUN_MIGRATIONS=false",
+        ));
+    }
     readiness_checks.push(ReadinessCheck::ok("redis", "startup ping succeeded"));
     Ok(Some(clients))
 }

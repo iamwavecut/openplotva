@@ -62,6 +62,9 @@ pub const DEFAULT_RUNTIME_CONTRACT_ENFORCE: bool = true;
 
 pub const DEFAULT_CONNECT_SERVICES: bool = false;
 
+/// SQLx migration execution is opt-in until existing Go DB compatibility is handled.
+pub const DEFAULT_RUN_MIGRATIONS: bool = false;
+
 /// Top-level application configuration.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -164,6 +167,8 @@ pub struct ReferenceSnapshotConfig {
 pub struct ServiceProbeConfig {
     /// Whether startup should connect to Postgres and Redis.
     pub connect_services: bool,
+    /// Whether startup should apply SQLx migrations after connecting to Postgres.
+    pub run_migrations: bool,
 }
 
 /// Raw optional config values used by tests and environment loading.
@@ -209,6 +214,8 @@ pub struct RawConfig {
     pub openplotva_enforce_reference_snapshot: Option<String>,
     /// `OPENPLOTVA_CONNECT_SERVICES`.
     pub openplotva_connect_services: Option<String>,
+    /// `OPENPLOTVA_RUN_MIGRATIONS`.
+    pub openplotva_run_migrations: Option<String>,
 }
 
 /// Configuration loading failures.
@@ -358,6 +365,11 @@ impl AppConfig {
                     raw.openplotva_connect_services,
                     DEFAULT_CONNECT_SERVICES,
                 )?,
+                run_migrations: parse_bool(
+                    "OPENPLOTVA_RUN_MIGRATIONS",
+                    raw.openplotva_run_migrations,
+                    DEFAULT_RUN_MIGRATIONS,
+                )?,
             },
         })
     }
@@ -387,6 +399,7 @@ impl RawConfig {
             openplotva_reference_snapshot_path: env("OPENPLOTVA_RUNTIME_CONTRACT_PATH"),
             openplotva_enforce_reference_snapshot: env("OPENPLOTVA_DISABLED_LEGACY_LOCK"),
             openplotva_connect_services: env("OPENPLOTVA_CONNECT_SERVICES"),
+            openplotva_run_migrations: env("OPENPLOTVA_RUN_MIGRATIONS"),
         }
     }
 }
@@ -485,6 +498,7 @@ mod tests {
         );
         assert!(config.reference_snapshot.enforce);
         assert!(!config.service_probe.connect_services);
+        assert!(!config.service_probe.run_migrations);
 
         Ok(())
     }

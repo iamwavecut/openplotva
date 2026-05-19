@@ -1,0 +1,7 @@
+-- Source SHA-256: a3da358b608318c767ddfd8c54e006e93eb81d68104acb4a4184b9d31fbdfc50
+
+ALTER TABLE job_queue ADD COLUMN IF NOT EXISTS retry_count INT NOT NULL DEFAULT 0;
+ALTER TABLE job_queue ADD COLUMN IF NOT EXISTS max_retries INT NOT NULL DEFAULT 3;
+ALTER TABLE job_queue ADD COLUMN IF NOT EXISTS next_retry_at TIMESTAMP;
+ALTER TABLE job_queue ADD COLUMN IF NOT EXISTS original_job_id INT;
+CREATE INDEX IF NOT EXISTS idx_job_queue_next_retry ON job_queue (next_retry_at);

@@ -1,0 +1,7 @@
+-- Source SHA-256: 01ceb779cdd9f427eaa9281d2dac2cd6dd631afe72bc8f483a596106a6acea9f
+
+CREATE TABLE IF NOT EXISTS user_settings (
+    user_id BIGINT PRIMARY KEY,
+    disable_random_reactivity BOOLEAN NOT NULL DEFAULT FALSE,
+    updated TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);

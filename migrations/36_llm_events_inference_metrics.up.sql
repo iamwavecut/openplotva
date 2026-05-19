@@ -1,0 +1,33 @@
+-- Source SHA-256: 83189e9ddfbb7772843013c726f64ea7e5add6dbcdc85cfec66836378c82152a
+
+ALTER TABLE llm_request_events
+	ADD COLUMN IF NOT EXISTS provider TEXT,
+	ADD COLUMN IF NOT EXISTS request_kind TEXT,
+	ADD COLUMN IF NOT EXISTS input_tokens INTEGER,
+	ADD COLUMN IF NOT EXISTS output_tokens INTEGER,
+	ADD COLUMN IF NOT EXISTS total_tokens INTEGER,
+	ADD COLUMN IF NOT EXISTS cached_tokens INTEGER,
+	ADD COLUMN IF NOT EXISTS thoughts_tokens INTEGER,
+	ADD COLUMN IF NOT EXISTS tool_use_prompt_tokens INTEGER,
+	ADD COLUMN IF NOT EXISTS prompt_eval_tokens INTEGER,
+	ADD COLUMN IF NOT EXISTS prompt_eval_ms DOUBLE PRECISION,
+	ADD COLUMN IF NOT EXISTS prompt_tps DOUBLE PRECISION,
+	ADD COLUMN IF NOT EXISTS generation_tokens INTEGER,
+	ADD COLUMN IF NOT EXISTS generation_ms DOUBLE PRECISION,
+	ADD COLUMN IF NOT EXISTS generation_tps DOUBLE PRECISION,
+	ADD COLUMN IF NOT EXISTS effective_output_tps DOUBLE PRECISION,
+	ADD COLUMN IF NOT EXISTS effective_total_tps DOUBLE PRECISION,
+	ADD COLUMN IF NOT EXISTS max_tokens INTEGER,
+	ADD COLUMN IF NOT EXISTS temperature DOUBLE PRECISION,
+	ADD COLUMN IF NOT EXISTS top_p DOUBLE PRECISION,
+	ADD COLUMN IF NOT EXISTS top_k DOUBLE PRECISION,
+	ADD COLUMN IF NOT EXISTS candidate_count INTEGER,
+	ADD COLUMN IF NOT EXISTS tool_mode TEXT,
+	ADD COLUMN IF NOT EXISTS response_format TEXT,
+	ADD COLUMN IF NOT EXISTS inference_params JSONB NOT NULL DEFAULT '{}'::jsonb;
+
+CREATE INDEX IF NOT EXISTS idx_llm_request_events_provider_created_at
+	ON llm_request_events (provider, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_llm_request_events_model_bucket
+	ON llm_request_events (model, created_at DESC);

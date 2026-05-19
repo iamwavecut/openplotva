@@ -6,7 +6,11 @@ use openplotva_config::{PostgresConfig, RedisConfig};
 use redis::{
     Client as RedisClient, ConnectionAddr, ConnectionInfo, IntoConnectionInfo, RedisConnectionInfo,
 };
-use sqlx::{PgPool, postgres::PgPoolOptions};
+use sqlx::{
+    PgPool,
+    migrate::{MigrateError, Migrator},
+    postgres::PgPoolOptions,
+};
 use thiserror::Error;
 
 /// Human-readable crate purpose used by scaffold tests and docs.
@@ -16,6 +20,9 @@ const POSTGRES_MAX_CONNECTIONS: u32 = 50;
 const POSTGRES_MIN_CONNECTIONS: u32 = 10;
 const POSTGRES_MAX_CONNECTION_LIFETIME: Duration = Duration::from_secs(45 * 60);
 
+/// SQLx migrator for the converted Go schema migrations.
+pub static MIGRATOR: Migrator = sqlx::migrate!("../../migrations");
+
 /// Connected service clients kept alive by the application shell.
 #[derive(Clone, Debug)]
 pub struct ServiceClients {
@@ -23,6 +30,8 @@ pub struct ServiceClients {
     pub postgres: PgPool,
     /// Redis client that has passed a startup ping.
     pub redis: RedisStore,
+    /// Whether SQLx migrations were applied during startup.
+    pub migrations_applied: bool,
 }
 
 /// Redis client wrapper.
@@ -60,17 +69,32 @@ pub enum StorageError {
         /// Redis connection error.
         source: redis::RedisError,
     },
+    /// SQLx migration execution failed.
+    #[error("failed to apply SQL migrations: {source}")]
+    Migrate {
+        /// SQLx migration error.
+        #[from]
+        source: MigrateError,
+    },
 }
 
 /// Connect to Postgres and Redis using the current service-spine settings.
 pub async fn connect_service_clients(
     postgres: &PostgresConfig,
     redis: &RedisConfig,
+    run_migrations: bool,
 ) -> Result<ServiceClients, StorageError> {
     let postgres = connect_postgres(postgres).await?;
+    if run_migrations {
+        run_migrations_on(&postgres).await?;
+    }
     let redis = connect_redis(redis).await?;
 
-    Ok(ServiceClients { postgres, redis })
+    Ok(ServiceClients {
+        postgres,
+        redis,
+        migrations_applied: run_migrations,
+    })
 }
 
 pub async fn connect_postgres(config: &PostgresConfig) -> Result<PgPool, StorageError> {
@@ -81,6 +105,11 @@ pub async fn connect_postgres(config: &PostgresConfig) -> Result<PgPool, Storage
         .connect(&config.go_startup_dsn())
         .await
         .map_err(StorageError::from)
+}
+
+/// Apply all pending SQLx migrations to an already connected Postgres pool.
+pub async fn run_migrations_on(pool: &PgPool) -> Result<(), StorageError> {
+    MIGRATOR.run(pool).await.map_err(StorageError::from)
 }
 
 /// Connect to Redis/Dragonfly and verify the selected DB with `PING`.
@@ -117,8 +146,58 @@ fn redis_connection_info(config: &RedisConfig) -> redis::RedisResult<ConnectionI
 
 #[cfg(test)]
 mod tests {
+    use std::{error::Error, fs, path::Path};
+
     use openplotva_config::{DEFAULT_REDIS_DB, RedisConfig};
     use redis::ConnectionAddr;
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    struct MigrationInventoryEntry {
+        path: String,
+        sha256: String,
+    }
+
+    #[test]
+    fn converted_migration_corpus_is_embedded() {
+        assert_eq!(super::MIGRATOR.iter().count(), 96);
+    }
+
+    #[test]
+    fn converted_migrations_reference_frozen_go_inventory() -> Result<(), Box<dyn Error>> {
+        let inventory = include_str!("../../../docs/contract/generated/migrations.json");
+        let entries: Vec<MigrationInventoryEntry> = serde_json::from_str(inventory)?;
+        assert_eq!(entries.len(), 48);
+
+        for entry in entries {
+            let source_file = Path::new(&entry.path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or("migration inventory path has no file name")?;
+            let stem = source_file
+                .strip_suffix(".sql")
+                .ok_or("migration inventory path is not a SQL file")?;
+            let up_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(format!("../../migrations/{stem}.up.sql"));
+            let down_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(format!("../../migrations/{stem}.down.sql"));
+
+            let up = fs::read_to_string(up_path)?;
+            let down = fs::read_to_string(down_path)?;
+            let source_header =
+                format!("-- Converted from reference-app/internal/db/sql/migrations/{source_file}");
+            let hash_header = format!("-- Source SHA-256: {}", entry.sha256);
+
+            assert!(up.contains(&source_header));
+            assert!(up.contains(&hash_header));
+            assert!(down.contains(&source_header));
+            assert!(down.contains(&hash_header));
+            assert!(!up.contains("+migrate"));
+            assert!(!down.contains("+migrate"));
+        }
+
+        Ok(())
+    }
 
     #[test]
     fn redis_connection_info_matches_go_cache_defaults() -> Result<(), redis::RedisError> {

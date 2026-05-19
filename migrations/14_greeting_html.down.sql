@@ -1,0 +1,3 @@
+-- Source SHA-256: b35401d5bfe3606f8412a91e5f233d763637832fdf80dc5447d2ce24661b5dba
+
+ALTER TABLE chat_settings DROP COLUMN IF EXISTS greeting_html;

@@ -67,6 +67,7 @@ The app loads `.env` like the Go implementation. The current service-spine env v
 | `OPENPLOTVA_RUNTIME_CONTRACT_PATH` | `docs/contract/reference-snapshot.json` | Reference-snapshot JSON file. |
 | `OPENPLOTVA_DISABLED_LEGACY_LOCK` | `true` | Fails startup when Go `HEAD` differs from the lock. |
 | `OPENPLOTVA_CONNECT_SERVICES` | `false` | When `true`, startup connects to Postgres and Redis/Dragonfly and `/api/ready` reports them as `ok`. |
+| `OPENPLOTVA_RUN_MIGRATIONS` | `false` | When `true` with `OPENPLOTVA_CONNECT_SERVICES=true`, startup applies the converted SQLx migrations. Use fresh/scratch DBs until existing Go DB migration-table compatibility is complete. |
 
 `OPENPLOTVA_BIND_ADDR` is still accepted as a Rust-only local override for the assembled bind address. Prefer `WEBAPP_HOST` and `WEBAPP_PORT` for contract work.
 
@@ -120,6 +121,17 @@ Keep these unchanged unless an approved deviation is recorded:
 - Admin/settings UI assets, translations, and static file hashes.
 
 Approved deviations must be written in `docs/contract/deviations.md`.
+
+## Migrations
+
+The Rust repo carries a SQLx-compatible conversion of the frozen Go migrations under `migrations/`.
+
+- Source of truth: `/Users/Shared/src/github.com/iamwavecut/reference-app/internal/db/sql/migrations`
+- Frozen inventory: `docs/contract/generated/migrations.json`
+- Conversion: each Go `sql-migrate` file is split into reversible SQLx `.up.sql` and `.down.sql` files.
+- Runtime execution: `OPENPLOTVA_CONNECT_SERVICES=true OPENPLOTVA_RUN_MIGRATIONS=true cargo run -p openplotva-app`
+
+Current caveat: SQLx records migration state in `_sqlx_migrations`, while the Go app uses `rubenv/sql-migrate`. Use the Rust migration runner on fresh or scratch databases until the existing production DB compatibility path is explicitly ported and tested.
 
 ## Baseline Checks
 

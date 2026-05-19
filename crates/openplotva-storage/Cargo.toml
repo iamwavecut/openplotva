@@ -10,8 +10,12 @@ publish = false
 [dependencies]
 openplotva-config = { path = "../openplotva-config" }
 redis = { workspace = true, features = ["tokio-comp"] }
-sqlx = { workspace = true, features = ["postgres", "runtime-tokio"] }
+sqlx = { workspace = true, features = ["migrate", "postgres", "runtime-tokio"] }
 thiserror.workspace = true
+
+[dev-dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
 
 [lints]
 workspace = true
