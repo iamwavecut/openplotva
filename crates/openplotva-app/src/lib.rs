@@ -11,6 +11,7 @@ use anyhow::Context as _;
 use openplotva_config::AppConfig;
 use openplotva_server::{ReadinessCheck, ReadinessResponse};
 use openplotva_storage::{PostgresVirtualMessageStore, ServiceClients};
+use thiserror::Error;
 use tokio::{sync::watch, task::JoinHandle, time::timeout};
 
 const GO_DISPATCHER_MAX_QUEUE_SIZE: usize = 10_000;
@@ -32,6 +33,9 @@ struct DispatcherRuntime {
 /// Boxed future returned by Telegram startup method executors.
 pub type DeleteWebhookFuture<'a, E> = Pin<Box<dyn Future<Output = Result<(), E>> + Send + 'a>>;
 
+/// Boxed future returned by Telegram bot command setup executors.
+pub type BotCommandSetupFuture<'a, E> = Pin<Box<dyn Future<Output = Result<(), E>> + Send + 'a>>;
+
 /// Minimal Telegram startup capability needed before long polling.
 pub trait DeleteWebhookExecutor {
     /// Error returned by the concrete Telegram client.
@@ -51,6 +55,77 @@ impl DeleteWebhookExecutor for openplotva_telegram::TelegramClient {
                 .map(|_: bool| ())
         })
     }
+}
+
+/// Minimal Telegram command setup capability used during app startup.
+pub trait BotCommandSetupExecutor {
+    /// Error returned by the concrete Telegram client.
+    type Error: fmt::Display + Send;
+
+    /// Execute Go's startup `deleteMyCommands` request.
+    fn delete_my_commands<'a>(
+        &'a self,
+        method: openplotva_telegram::DeleteBotCommands,
+    ) -> BotCommandSetupFuture<'a, Self::Error>;
+
+    /// Execute one Go startup `setMyCommands` request for a named command set.
+    fn set_my_commands<'a>(
+        &'a self,
+        scope: &'static str,
+        method: openplotva_telegram::SetBotCommands,
+    ) -> BotCommandSetupFuture<'a, Self::Error>;
+}
+
+impl BotCommandSetupExecutor for openplotva_telegram::TelegramClient {
+    type Error = carapax::api::ExecuteError;
+
+    fn delete_my_commands<'a>(
+        &'a self,
+        method: openplotva_telegram::DeleteBotCommands,
+    ) -> BotCommandSetupFuture<'a, Self::Error> {
+        Box::pin(async move { self.execute(method).await.map(|_: bool| ()) })
+    }
+
+    fn set_my_commands<'a>(
+        &'a self,
+        _scope: &'static str,
+        method: openplotva_telegram::SetBotCommands,
+    ) -> BotCommandSetupFuture<'a, Self::Error> {
+        Box::pin(async move { self.execute(method).await.map(|_: bool| ()) })
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct BotCommandSetupReport {
+    /// Whether the global command list was deleted first.
+    pub deleted_existing: bool,
+    /// Go inventory names for command scopes successfully registered.
+    pub set_scopes: Vec<&'static str>,
+}
+
+/// Error returned while configuring Telegram bot commands.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum BotCommandSetupError {
+    /// Static command definitions failed to build into Telegram command objects.
+    #[error("build bot commands: {message}")]
+    Build {
+        /// Display form of the command-build error.
+        message: String,
+    },
+    /// The initial `deleteMyCommands` request failed.
+    #[error("delete bot commands: {message}")]
+    Delete {
+        /// Display form of the Telegram client error.
+        message: String,
+    },
+    /// A scoped `setMyCommands` request failed.
+    #[error("set {scope} bot commands: {message}")]
+    Set {
+        /// Go inventory name for the command scope.
+        scope: &'static str,
+        /// Display form of the Telegram client error.
+        message: String,
+    },
 }
 
 /// Report from the app-level long-polling update producer startup task.
@@ -168,6 +243,46 @@ where
     }
 }
 
+/// Configure Telegram bot commands in the same order as Go `initBot`.
+pub async fn configure_telegram_bot_commands<C>(
+    client: &C,
+) -> Result<BotCommandSetupReport, BotCommandSetupError>
+where
+    C: BotCommandSetupExecutor + Sync,
+{
+    client
+        .delete_my_commands(openplotva_telegram::delete_my_commands_method())
+        .await
+        .map_err(|error| BotCommandSetupError::Delete {
+            message: error.to_string(),
+        })?;
+
+    let methods = openplotva_telegram::set_my_commands_methods().map_err(|error| {
+        BotCommandSetupError::Build {
+            message: error.to_string(),
+        }
+    })?;
+
+    let mut report = BotCommandSetupReport {
+        deleted_existing: true,
+        set_scopes: Vec::with_capacity(methods.len()),
+    };
+
+    for (set, method) in openplotva_telegram::COMMAND_SETS.iter().zip(methods) {
+        let scope = set.scope.inventory_name();
+        client
+            .set_my_commands(scope, method)
+            .await
+            .map_err(|error| BotCommandSetupError::Set {
+                scope,
+                message: error.to_string(),
+            })?;
+        report.set_scopes.push(scope);
+    }
+
+    Ok(report)
+}
+
 async fn start_runtime_workers(
     config: &AppConfig,
     service_clients: Option<&ServiceClients>,
@@ -190,6 +305,10 @@ async fn start_runtime_workers(
             "telegram_update_producer",
             "OPENPLOTVA_CONNECT_SERVICES=false",
         ));
+        readiness_checks.push(ReadinessCheck::skipped(
+            "telegram_commands",
+            "OPENPLOTVA_CONNECT_SERVICES=false",
+        ));
         return Ok(RuntimeWorkers::default());
     };
 
@@ -207,11 +326,25 @@ async fn start_runtime_workers(
             "telegram_update_producer",
             "BOT_KEY is not set",
         ));
+        readiness_checks.push(ReadinessCheck::skipped(
+            "telegram_commands",
+            "BOT_KEY is not set",
+        ));
         return Ok(RuntimeWorkers::default());
     };
 
     let telegram = openplotva_telegram::telegram_client(bot_key.to_owned())
         .context("create Telegram Bot API client")?;
+    let command_report = configure_telegram_bot_commands(&telegram)
+        .await
+        .context("configure Telegram bot commands")?;
+    readiness_checks.push(ReadinessCheck::ok(
+        "telegram_commands",
+        format!(
+            "deleted existing commands and set {} scoped command lists",
+            command_report.set_scopes.len()
+        ),
+    ));
     let store = PostgresVirtualMessageStore::new(service_clients.postgres.clone());
 
     let dispatcher_persistence = openplotva_telegram::RedisDispatcherQueueStore::new(
@@ -531,7 +664,7 @@ mod tests {
 
     use super::{
         GO_DISPATCHER_DEBOUNCE_CACHE_SIZE, GO_DISPATCHER_DEBOUNCE_WINDOW,
-        GO_DISPATCHER_MAX_QUEUE_SIZE, go_dispatcher_config,
+        GO_DISPATCHER_MAX_QUEUE_SIZE, configure_telegram_bot_commands, go_dispatcher_config,
         run_long_poll_update_producer_after_delete_webhook,
     };
 
@@ -603,6 +736,67 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn telegram_bot_command_setup_deletes_then_sets_go_scopes() -> Result<(), Box<dyn Error>>
+    {
+        let executor = CommandSetupStub::default();
+
+        let report = configure_telegram_bot_commands(&executor).await?;
+
+        assert_eq!(
+            report.set_scopes,
+            vec!["privateCommands", "groupCommands", "groupAdminCommands"]
+        );
+        assert_eq!(
+            executor.request_kinds(),
+            vec![
+                "deleteMyCommands",
+                "setMyCommands",
+                "setMyCommands",
+                "setMyCommands"
+            ]
+        );
+        assert_eq!(
+            executor.scope_types(),
+            vec![
+                "all_private_chats",
+                "all_group_chats",
+                "all_chat_administrators"
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn telegram_bot_command_setup_stops_before_sets_when_delete_fails() {
+        let executor = CommandSetupStub::failing_delete("delete failed");
+
+        let error = configure_telegram_bot_commands(&executor)
+            .await
+            .expect_err("delete failure");
+
+        assert_eq!(error.to_string(), "delete bot commands: delete failed");
+        assert_eq!(executor.request_kinds(), vec!["deleteMyCommands"]);
+    }
+
+    #[tokio::test]
+    async fn telegram_bot_command_setup_reports_scope_when_set_fails() {
+        let executor = CommandSetupStub::failing_set("groupCommands", "set failed");
+
+        let error = configure_telegram_bot_commands(&executor)
+            .await
+            .expect_err("set failure");
+
+        assert_eq!(
+            error.to_string(),
+            "set groupCommands bot commands: set failed"
+        );
+        assert_eq!(
+            executor.request_kinds(),
+            vec!["deleteMyCommands", "setMyCommands", "setMyCommands"]
+        );
+    }
+
     #[derive(Clone, Default)]
     struct DeleteWebhookStub {
         calls: Arc<Mutex<usize>>,
@@ -640,6 +834,105 @@ mod tests {
     impl fmt::Display for StartupError {
         fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
             out.write_str(self.0)
+        }
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct CommandRequest {
+        kind: &'static str,
+        payload: serde_json::Value,
+    }
+
+    #[derive(Clone, Default)]
+    struct CommandSetupStub {
+        requests: Arc<Mutex<Vec<CommandRequest>>>,
+        delete_error: Option<&'static str>,
+        set_error_scope: Option<&'static str>,
+        set_error: Option<&'static str>,
+    }
+
+    impl CommandSetupStub {
+        fn failing_delete(error: &'static str) -> Self {
+            Self {
+                delete_error: Some(error),
+                ..Self::default()
+            }
+        }
+
+        fn failing_set(scope: &'static str, error: &'static str) -> Self {
+            Self {
+                set_error_scope: Some(scope),
+                set_error: Some(error),
+                ..Self::default()
+            }
+        }
+
+        fn request_kinds(&self) -> Vec<&'static str> {
+            self.requests
+                .lock()
+                .expect("command requests")
+                .iter()
+                .map(|request| request.kind)
+                .collect()
+        }
+
+        fn scope_types(&self) -> Vec<String> {
+            self.requests
+                .lock()
+                .expect("command requests")
+                .iter()
+                .filter(|request| request.kind == "setMyCommands")
+                .map(|request| {
+                    request
+                        .payload
+                        .get("scope")
+                        .and_then(|scope| scope.get("type"))
+                        .and_then(serde_json::Value::as_str)
+                        .expect("scope type")
+                        .to_owned()
+                })
+                .collect()
+        }
+    }
+
+    impl super::BotCommandSetupExecutor for CommandSetupStub {
+        type Error = StartupError;
+
+        fn delete_my_commands<'a>(
+            &'a self,
+            method: openplotva_telegram::DeleteBotCommands,
+        ) -> super::BotCommandSetupFuture<'a, Self::Error> {
+            self.requests
+                .lock()
+                .expect("command requests")
+                .push(CommandRequest {
+                    kind: "deleteMyCommands",
+                    payload: serde_json::to_value(method).expect("deleteMyCommands JSON"),
+                });
+            let result = self
+                .delete_error
+                .map_or(Ok(()), |message| Err(StartupError(message)));
+            Box::pin(async move { result })
+        }
+
+        fn set_my_commands<'a>(
+            &'a self,
+            scope: &'static str,
+            method: openplotva_telegram::SetBotCommands,
+        ) -> super::BotCommandSetupFuture<'a, Self::Error> {
+            self.requests
+                .lock()
+                .expect("command requests")
+                .push(CommandRequest {
+                    kind: "setMyCommands",
+                    payload: serde_json::to_value(method).expect("setMyCommands JSON"),
+                });
+            let result = if self.set_error_scope == Some(scope) {
+                Err(StartupError(self.set_error.expect("set error")))
+            } else {
+                Ok(())
+            };
+            Box::pin(async move { result })
         }
     }
 

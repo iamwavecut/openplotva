@@ -63,7 +63,7 @@ The app loads `.env` like the Go implementation. The current service-spine env v
 | `REDIS_PORT` | `6379` | Redis/Dragonfly port. |
 | `REDIS_PASSWORD` | empty | Redis/Dragonfly password. |
 | `REDIS_DB` | `0` | Redis/Dragonfly DB. |
-| `BOT_KEY` | empty | Go-compatible Telegram Bot API token. When set with `OPENPLOTVA_CONNECT_SERVICES=true`, the Rust shell starts pending-operation, outbound dispatcher, and long-poll update producer workers. |
+| `BOT_KEY` | empty | Go-compatible Telegram Bot API token. When set with `OPENPLOTVA_CONNECT_SERVICES=true`, the Rust shell configures bot commands and starts pending-operation, outbound dispatcher, and long-poll update producer workers. |
 | `BOT_DEBUG` | `false` | Go-compatible bot debug flag, currently loaded for config contract. |
 | `OPENPLOTVA_REFERENCE_SOURCE_REPOSITORY` | `/Users/Shared/src/github.com/iamwavecut/reference-app` | Read-only Go source used for lock checks. |
 | `OPENPLOTVA_RUNTIME_CONTRACT_PATH` | `docs/contract/reference-snapshot.json` | Reference-snapshot JSON file. |
@@ -137,7 +137,7 @@ The Rust repo carries a SQLx-compatible conversion of the frozen Go migrations u
 - Conversion: each Go `sql-migrate` file is split into reversible SQLx `.up.sql` and `.down.sql` files.
 - Runtime execution: `OPENPLOTVA_CONNECT_SERVICES=true OPENPLOTVA_RUN_MIGRATIONS=true BOT_KEY=... cargo run -p openplotva-app`
 
-With `BOT_KEY` set, the current runtime shell deletes any existing webhook and starts the long-poll update producer into `plotva:updates:queue`. It does not yet install the real fetcher update consumer route, so queued updates are preserved rather than drained by a placeholder handler.
+With `BOT_KEY` set, the current runtime shell deletes and re-registers scoped Telegram bot commands, deletes any existing webhook, and starts the long-poll update producer into `plotva:updates:queue`. It does not yet install the real fetcher update consumer route, so queued updates are preserved rather than drained by a placeholder handler.
 
 Current caveat: SQLx records migration state in `_sqlx_migrations`, while the Go app uses `rubenv/sql-migrate`. Use the Rust migration runner on fresh or scratch databases until the existing production DB compatibility path is explicitly ported and tested.
 
