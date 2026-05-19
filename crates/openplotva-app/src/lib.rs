@@ -5,7 +5,7 @@ mod reference_snapshot;
 pub mod updates;
 pub mod virtual_messages;
 
-use std::{sync::Arc, time::Duration};
+use std::{fmt, future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use anyhow::Context as _;
 use openplotva_config::AppConfig;
@@ -27,6 +27,39 @@ struct RuntimeWorkers {
 struct DispatcherRuntime {
     queue: Arc<openplotva_telegram::DispatcherQueue>,
     persistence: openplotva_telegram::RedisDispatcherQueueStore,
+}
+
+/// Boxed future returned by Telegram startup method executors.
+pub type DeleteWebhookFuture<'a, E> = Pin<Box<dyn Future<Output = Result<(), E>> + Send + 'a>>;
+
+/// Minimal Telegram startup capability needed before long polling.
+pub trait DeleteWebhookExecutor {
+    /// Error returned by the concrete Telegram client.
+    type Error: fmt::Display + Send;
+
+    /// Execute Go's startup `deleteWebhook` request.
+    fn delete_webhook<'a>(&'a self) -> DeleteWebhookFuture<'a, Self::Error>;
+}
+
+impl DeleteWebhookExecutor for openplotva_telegram::TelegramClient {
+    type Error = carapax::api::ExecuteError;
+
+    fn delete_webhook<'a>(&'a self) -> DeleteWebhookFuture<'a, Self::Error> {
+        Box::pin(async move {
+            self.execute(openplotva_telegram::build_delete_webhook_method())
+                .await
+                .map(|_: bool| ())
+        })
+    }
+}
+
+/// Report from the app-level long-polling update producer startup task.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TelegramUpdateProducerStartupReport {
+    /// `deleteWebhook` error that stopped the producer before polling.
+    pub delete_webhook_error: Option<String>,
+    /// Report from the producer loop when startup succeeded.
+    pub producer: Option<openplotva_updates::UpdateProducerRunReport>,
 }
 
 /// Build the HTTP router without binding a socket.
@@ -109,6 +142,32 @@ async fn connect_services(
     Ok(Some(clients))
 }
 
+/// Run Go's long-poll startup order: delete webhook, then produce updates.
+pub async fn run_long_poll_update_producer_after_delete_webhook<Startup, Source, Queue, Stop>(
+    startup: &Startup,
+    source: &Source,
+    queue: &Queue,
+    stop: Stop,
+) -> TelegramUpdateProducerStartupReport
+where
+    Startup: DeleteWebhookExecutor + Sync,
+    Source: openplotva_updates::UpdateProducerSource + Sync,
+    Queue: openplotva_updates::UpdateProducerQueue + Sync,
+    Stop: Future<Output = ()>,
+{
+    if let Err(error) = startup.delete_webhook().await {
+        return TelegramUpdateProducerStartupReport {
+            delete_webhook_error: Some(error.to_string()),
+            producer: None,
+        };
+    }
+
+    TelegramUpdateProducerStartupReport {
+        delete_webhook_error: None,
+        producer: Some(openplotva_updates::run_update_producer_until(source, queue, stop).await),
+    }
+}
+
 async fn start_runtime_workers(
     config: &AppConfig,
     service_clients: Option<&ServiceClients>,
@@ -127,6 +186,10 @@ async fn start_runtime_workers(
             "outbound_dispatcher",
             "OPENPLOTVA_CONNECT_SERVICES=false",
         ));
+        readiness_checks.push(ReadinessCheck::skipped(
+            "telegram_update_producer",
+            "OPENPLOTVA_CONNECT_SERVICES=false",
+        ));
         return Ok(RuntimeWorkers::default());
     };
 
@@ -138,6 +201,10 @@ async fn start_runtime_workers(
         ));
         readiness_checks.push(ReadinessCheck::skipped(
             "outbound_dispatcher",
+            "BOT_KEY is not set",
+        ));
+        readiness_checks.push(ReadinessCheck::skipped(
+            "telegram_update_producer",
             "BOT_KEY is not set",
         ));
         return Ok(RuntimeWorkers::default());
@@ -221,6 +288,27 @@ async fn start_runtime_workers(
         tracing::info!(?outcome, "outbound immediate dispatcher worker stopped");
     });
 
+    let update_startup = telegram.clone();
+    let update_source = openplotva_telegram::LongPollUpdateSource::new(telegram.clone());
+    let update_queue =
+        openplotva_updates::RedisUpdateQueue::new(service_clients.redis.client().clone());
+    let update_stop = stop.subscribe();
+    let update_producer_worker = tokio::spawn(async move {
+        let report = run_long_poll_update_producer_after_delete_webhook(
+            &update_startup,
+            &update_source,
+            &update_queue,
+            wait_for_runtime_stop(update_stop),
+        )
+        .await;
+
+        if let Some(error) = report.delete_webhook_error.as_deref() {
+            tracing::warn!(%error, "Telegram long-poll update producer stopped before polling");
+        } else {
+            tracing::info!(?report, "Telegram long-poll update producer stopped");
+        }
+    });
+
     let regular_store = store;
     let regular_telegram = telegram;
     let regular_queue = Arc::clone(&dispatcher_queue);
@@ -260,9 +348,14 @@ async fn start_runtime_workers(
         "outbound_dispatcher",
         "Telegram outbound dispatcher workers started",
     ));
+    readiness_checks.push(ReadinessCheck::ok(
+        "telegram_update_producer",
+        "Telegram long-poll update producer worker started",
+    ));
     workers.handles.push(immediate_worker);
     workers.handles.push(regular_worker);
     workers.handles.push(cleanup_worker);
+    workers.handles.push(update_producer_worker);
     workers.dispatcher = Some(DispatcherRuntime {
         queue: dispatcher_queue,
         persistence: dispatcher_persistence,
@@ -422,9 +515,24 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        collections::VecDeque,
+        error::Error,
+        fmt,
+        sync::{Arc, Mutex},
+    };
+
+    use carapax::types::Update as TelegramUpdate;
+    use openplotva_updates::{
+        UpdateProducerQueue, UpdateProducerQueueFuture, UpdateProducerSource,
+        UpdateProducerSourceFuture,
+    };
+    use serde_json::json;
+
     use super::{
         GO_DISPATCHER_DEBOUNCE_CACHE_SIZE, GO_DISPATCHER_DEBOUNCE_WINDOW,
         GO_DISPATCHER_MAX_QUEUE_SIZE, go_dispatcher_config,
+        run_long_poll_update_producer_after_delete_webhook,
     };
 
     #[test]
@@ -441,5 +549,178 @@ mod tests {
             config.dedupe_config.max_cache_size,
             GO_DISPATCHER_DEBOUNCE_CACHE_SIZE
         );
+    }
+
+    #[tokio::test]
+    async fn long_poll_update_startup_deletes_webhook_before_producing_updates_like_go()
+    -> Result<(), Box<dyn Error>> {
+        let startup = DeleteWebhookStub::default();
+        let source = ProducerSourceStub::new(vec![Some(sample_message_update(10)?), None]);
+        let queue = ProducerQueueStub::default();
+
+        let report = run_long_poll_update_producer_after_delete_webhook(
+            &startup,
+            &source,
+            &queue,
+            std::future::pending(),
+        )
+        .await;
+
+        assert_eq!(startup.calls(), 1);
+        assert!(report.delete_webhook_error.is_none());
+        let producer = report.producer.expect("producer report");
+        assert_eq!(producer.received, 1);
+        assert_eq!(producer.enqueued, 1);
+        assert!(producer.source_closed);
+        assert_eq!(queue.enqueued_ids(), vec![10]);
+        assert_eq!(source.calls(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn long_poll_update_startup_stops_before_producer_when_delete_webhook_fails_like_go()
+    -> Result<(), Box<dyn Error>> {
+        let startup = DeleteWebhookStub::failing("delete webhook failed");
+        let source = ProducerSourceStub::new(vec![Some(sample_message_update(10)?), None]);
+        let queue = ProducerQueueStub::default();
+
+        let report = run_long_poll_update_producer_after_delete_webhook(
+            &startup,
+            &source,
+            &queue,
+            std::future::pending(),
+        )
+        .await;
+
+        assert_eq!(startup.calls(), 1);
+        assert_eq!(
+            report.delete_webhook_error.as_deref(),
+            Some("delete webhook failed")
+        );
+        assert!(report.producer.is_none());
+        assert!(queue.enqueued_ids().is_empty());
+        assert_eq!(source.calls(), 0);
+        Ok(())
+    }
+
+    #[derive(Clone, Default)]
+    struct DeleteWebhookStub {
+        calls: Arc<Mutex<usize>>,
+        error: Option<&'static str>,
+    }
+
+    impl DeleteWebhookStub {
+        fn failing(error: &'static str) -> Self {
+            Self {
+                calls: Arc::new(Mutex::new(0)),
+                error: Some(error),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            *self.calls.lock().expect("delete webhook calls")
+        }
+    }
+
+    impl super::DeleteWebhookExecutor for DeleteWebhookStub {
+        type Error = StartupError;
+
+        fn delete_webhook<'a>(&'a self) -> super::DeleteWebhookFuture<'a, Self::Error> {
+            *self.calls.lock().expect("delete webhook calls") += 1;
+            let result = self
+                .error
+                .map_or(Ok(()), |message| Err(StartupError(message)));
+            Box::pin(async move { result })
+        }
+    }
+
+    #[derive(Debug)]
+    struct StartupError(&'static str);
+
+    impl fmt::Display for StartupError {
+        fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
+            out.write_str(self.0)
+        }
+    }
+
+    #[derive(Clone)]
+    struct ProducerSourceStub {
+        updates: Arc<Mutex<VecDeque<Option<TelegramUpdate>>>>,
+        calls: Arc<Mutex<usize>>,
+    }
+
+    impl ProducerSourceStub {
+        fn new(updates: Vec<Option<TelegramUpdate>>) -> Self {
+            Self {
+                updates: Arc::new(Mutex::new(updates.into())),
+                calls: Arc::new(Mutex::new(0)),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            *self.calls.lock().expect("source calls")
+        }
+    }
+
+    impl UpdateProducerSource for ProducerSourceStub {
+        fn next_update<'a>(&'a self) -> UpdateProducerSourceFuture<'a> {
+            *self.calls.lock().expect("source calls") += 1;
+            let update = self.updates.lock().expect("updates").pop_front().flatten();
+            Box::pin(async move { update })
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct ProducerQueueStub {
+        updates: Arc<Mutex<Vec<TelegramUpdate>>>,
+    }
+
+    impl ProducerQueueStub {
+        fn enqueued_ids(&self) -> Vec<i64> {
+            self.updates
+                .lock()
+                .expect("enqueued updates")
+                .iter()
+                .map(|update| update.id)
+                .collect()
+        }
+    }
+
+    impl UpdateProducerQueue for ProducerQueueStub {
+        type Error = StartupError;
+
+        fn enqueue_update<'a>(
+            &'a self,
+            update: &'a TelegramUpdate,
+        ) -> UpdateProducerQueueFuture<'a, Self::Error> {
+            self.updates
+                .lock()
+                .expect("enqueued updates")
+                .push(update.clone());
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    fn sample_message_update(update_id: i64) -> Result<TelegramUpdate, serde_json::Error> {
+        serde_json::from_value(json!({
+            "update_id": update_id,
+            "message": {
+                "message_id": 77,
+                "date": 1_710_000_000,
+                "chat": {
+                    "id": 42,
+                    "type": "private",
+                    "first_name": "Ada",
+                    "username": "ada_l"
+                },
+                "from": {
+                    "id": 99,
+                    "is_bot": false,
+                    "first_name": "Ada",
+                    "username": "ada_l"
+                },
+                "text": "/start hello"
+            }
+        }))
     }
 }
