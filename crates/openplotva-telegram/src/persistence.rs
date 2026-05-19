@@ -201,8 +201,8 @@ mod tests {
 
     use crate::{
         DEFAULT_DISPATCHER_QUEUE_KEY, DEFAULT_DISPATCHER_SHUTDOWN_TIMEOUT, DispatcherConfig,
-        DispatcherMessage, DispatcherPersistencePayload, DispatcherQueue, MESSAGE_TYPE_TEXT,
-        MessageFingerprint, PersistentDispatcherItem, TelegramOutboundMethod,
+        DispatcherMessage, DispatcherQueue, MESSAGE_TYPE_TEXT, MessageFingerprint,
+        PersistentDispatcherItem, ReplyParametersPlan, StickerMessagePlan, TelegramOutboundMethod,
         TelegramOutboundMethodKind, hash_content, persistent_queue_from_drain,
     };
 
@@ -336,19 +336,20 @@ mod tests {
         queue.enqueue(
             text_message(42, "sticker", "sticker-1")
                 .with_method(sticker_method(42, "sticker-file-id"))
-                .with_persistence_payload(DispatcherPersistencePayload::from_json_value(
-                    "*api.StickerConfig",
-                    json!({
-                        "chat_id": 42,
-                        "sticker": "sticker-file-id",
-                        "disable_notification": true,
-                        "reply_parameters": {
-                            "message_id": 7,
-                            "chat_id": 42,
-                            "allow_sending_without_reply": true
-                        }
-                    }),
-                )?),
+                .with_persistence_payload(
+                    StickerMessagePlan {
+                        chat_id: 42,
+                        file_id: "sticker-file-id".to_owned(),
+                        message_thread_id: None,
+                        disable_notification: true,
+                        reply_parameters: Some(ReplyParametersPlan {
+                            message_id: 7,
+                            chat_id: 42,
+                            allow_sending_without_reply: true,
+                        }),
+                    }
+                    .to_persistence_payload()?,
+                ),
             false,
         );
 
@@ -362,11 +363,11 @@ mod tests {
             Some(TelegramOutboundMethodKind::SendSticker)
         );
         let payload: Value = serde_json::from_slice(&persisted.items[0].message)?;
-        assert_eq!(payload["chat_id"], json!(42));
-        assert_eq!(payload["sticker"], json!("sticker-file-id"));
-        assert_eq!(payload["disable_notification"], json!(true));
+        assert_eq!(payload["ChatID"], json!(42));
+        assert_eq!(payload["File"], json!("sticker-file-id"));
+        assert_eq!(payload["DisableNotification"], json!(true));
         assert_eq!(
-            payload["reply_parameters"]["allow_sending_without_reply"],
+            payload["ReplyParameters"]["allow_sending_without_reply"],
             json!(true)
         );
         Ok(())

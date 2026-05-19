@@ -2,6 +2,7 @@
 
 use std::{borrow::Cow, fmt, io::Cursor};
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use carapax::types::{
     EditMessageMedia, EditMessageText, InlineKeyboardMarkup, InputFile, InputFileReader,
     InputMedia, InputMediaError, InputMediaPhoto, MediaGroup, MediaGroupError, MediaGroupItem,
@@ -9,9 +10,13 @@ use carapax::types::{
     SendMessage, SendPhoto, SendSticker,
 };
 use crc::{CRC_32_ISCSI, Crc};
+use serde_json::{Map, Value, json};
 use thiserror::Error;
 
-use crate::{TELEGRAM_PARSE_MODE_HTML, extract_visible_text, split_telegram_text};
+use crate::{
+    DispatcherPersistencePayload, TELEGRAM_PARSE_MODE_HTML, extract_visible_text,
+    split_telegram_text,
+};
 
 /// Telegram text message limit used by the Go outbound server.
 pub const TELEGRAM_TEXT_MAX_BYTES: usize = 4096;
@@ -623,6 +628,23 @@ pub fn parse_mode_from_go(value: &str) -> Result<Option<ParseMode>, OutboundBuil
 }
 
 impl StickerMessagePlan {
+    /// Build the Go `api.StickerConfig` JSON payload used by queue persistence.
+    pub fn to_persistence_payload(
+        &self,
+    ) -> Result<DispatcherPersistencePayload, serde_json::Error> {
+        let mut value = go_base_file_config_json(
+            self.chat_id,
+            self.message_thread_id,
+            self.disable_notification,
+            self.reply_parameters,
+            json!(self.file_id),
+        );
+        if let Value::Object(fields) = &mut value {
+            fields.insert("Emoji".to_owned(), json!(""));
+        }
+        go_persistence_payload("*api.StickerConfig", value)
+    }
+
     /// Convert the inspectable plan into the `carapax` form-backed method.
     pub fn to_carapax(&self) -> Result<SendSticker, OutboundBuildError> {
         let mut method = SendSticker::new(self.chat_id, InputFile::file_id(self.file_id.clone()));
@@ -650,6 +672,28 @@ impl ReplyParametersPlan {
 }
 
 impl PhotoMessagePlan {
+    /// Build the Go `api.PhotoConfig` JSON payload used by queue persistence.
+    pub fn to_persistence_payload(
+        &self,
+    ) -> Result<DispatcherPersistencePayload, serde_json::Error> {
+        let mut value = go_base_file_config_json(
+            self.chat_id,
+            self.message_thread_id,
+            self.disable_notification,
+            self.reply_parameters,
+            self.photo.go_file_value(),
+        );
+        if let Value::Object(fields) = &mut value {
+            fields.insert("HasSpoiler".to_owned(), json!(self.has_spoiler));
+            fields.insert("Thumb".to_owned(), Value::Null);
+            fields.insert("Caption".to_owned(), json!(self.caption));
+            fields.insert("ParseMode".to_owned(), json!(self.render_as));
+            fields.insert("CaptionEntities".to_owned(), Value::Null);
+            fields.insert("ShowCaptionAboveMedia".to_owned(), json!(false));
+        }
+        go_persistence_payload("*api.PhotoConfig", value)
+    }
+
     /// Convert the inspectable plan into the `carapax` form-backed method.
     pub fn to_carapax(&self) -> Result<SendPhoto, OutboundBuildError> {
         let mut method = SendPhoto::new(self.chat_id, self.photo.to_input_file());
@@ -676,6 +720,16 @@ impl PhotoMessagePlan {
 }
 
 impl PhotoSource {
+    fn go_file_value(&self) -> Value {
+        match self {
+            Self::FileId(file_id) | Self::Url(file_id) => json!(file_id),
+            Self::Bytes { file_name, bytes } => json!({
+                "Name": file_name,
+                "Bytes": BASE64_STANDARD.encode(bytes),
+            }),
+        }
+    }
+
     fn to_input_file(&self) -> InputFile {
         match self {
             Self::FileId(file_id) => InputFile::file_id(file_id.clone()),
@@ -695,6 +749,29 @@ impl PhotoSource {
 }
 
 impl AudioMessagePlan {
+    /// Build the Go `api.AudioConfig` JSON payload used by queue persistence.
+    pub fn to_persistence_payload(
+        &self,
+    ) -> Result<DispatcherPersistencePayload, serde_json::Error> {
+        let mut value = go_base_file_config_json(
+            self.chat_id,
+            self.message_thread_id,
+            self.disable_notification,
+            self.reply_parameters,
+            self.audio.go_file_value(),
+        );
+        if let Value::Object(fields) = &mut value {
+            fields.insert("Thumb".to_owned(), Value::Null);
+            fields.insert("Caption".to_owned(), json!(self.caption));
+            fields.insert("ParseMode".to_owned(), json!(self.render_as));
+            fields.insert("CaptionEntities".to_owned(), Value::Null);
+            fields.insert("Duration".to_owned(), json!(0));
+            fields.insert("Performer".to_owned(), json!(""));
+            fields.insert("Title".to_owned(), json!(""));
+        }
+        go_persistence_payload("*api.AudioConfig", value)
+    }
+
     /// Convert the inspectable plan into the `carapax` form-backed method.
     pub fn to_carapax(&self) -> Result<SendAudio, OutboundBuildError> {
         let mut method = SendAudio::new(self.chat_id, self.audio.to_input_file());
@@ -718,6 +795,16 @@ impl AudioMessagePlan {
 }
 
 impl AudioSource {
+    fn go_file_value(&self) -> Value {
+        match self {
+            Self::FileId(file_id) | Self::Url(file_id) => json!(file_id),
+            Self::Bytes { file_name, bytes } => json!({
+                "Name": file_name,
+                "Bytes": BASE64_STANDARD.encode(bytes),
+            }),
+        }
+    }
+
     fn to_input_file(&self) -> InputFile {
         match self {
             Self::FileId(file_id) => InputFile::file_id(file_id.clone()),
@@ -737,6 +824,28 @@ impl AudioSource {
 }
 
 impl MediaGroupMessagePlan {
+    /// Build the Go `api.MediaGroupConfig` JSON payload used by queue persistence.
+    pub fn to_persistence_payload(
+        &self,
+    ) -> Result<DispatcherPersistencePayload, serde_json::Error> {
+        let mut fields = go_base_chat_config_fields(
+            self.chat_id,
+            self.message_thread_id,
+            self.disable_notification,
+            self.reply_parameters,
+        );
+        fields.insert(
+            "Media".to_owned(),
+            Value::Array(
+                self.items
+                    .iter()
+                    .map(MediaGroupPhotoItem::go_input_media_photo_value)
+                    .collect(),
+            ),
+        );
+        go_persistence_payload("*api.MediaGroupConfig", Value::Object(fields))
+    }
+
     /// Convert the inspectable plan into the `carapax` form-backed method.
     pub fn to_carapax(&self) -> Result<SendMediaGroup, OutboundBuildError> {
         let items = self
@@ -760,6 +869,22 @@ impl MediaGroupMessagePlan {
 }
 
 impl MediaGroupPhotoItem {
+    fn go_input_media_photo_value(&self) -> Value {
+        let mut fields = Map::new();
+        fields.insert("type".to_owned(), json!("photo"));
+        fields.insert("media".to_owned(), self.photo.go_file_value());
+        if !self.caption.is_empty() {
+            fields.insert("caption".to_owned(), json!(self.caption));
+        }
+        if !self.render_as.is_empty() {
+            fields.insert("parse_mode".to_owned(), json!(self.render_as));
+        }
+        if self.has_spoiler {
+            fields.insert("has_spoiler".to_owned(), json!(true));
+        }
+        Value::Object(fields)
+    }
+
     fn to_carapax(&self) -> Result<MediaGroupItem, OutboundBuildError> {
         Ok(MediaGroupItem::for_photo(
             self.photo.to_input_file(),
@@ -790,6 +915,15 @@ impl MediaGroupPhotoItem {
 }
 
 impl EditMediaMessagePlan {
+    /// Build the Go `api.EditMessageMediaConfig` JSON payload used by queue persistence.
+    pub fn to_persistence_payload(
+        &self,
+    ) -> Result<DispatcherPersistencePayload, serde_json::Error> {
+        let mut fields = go_base_edit_config_fields(self.chat_id, self.message_id);
+        fields.insert("Media".to_owned(), self.media.go_input_media_photo_value());
+        go_persistence_payload("*api.EditMessageMediaConfig", Value::Object(fields))
+    }
+
     /// Convert the inspectable plan into the `carapax` form-backed method.
     pub fn to_carapax(&self) -> Result<EditMessageMedia, OutboundBuildError> {
         Ok(EditMessageMedia::for_chat_message(
@@ -816,6 +950,108 @@ impl From<InputMediaError> for OutboundBuildError {
     fn from(value: InputMediaError) -> Self {
         Self::InputMedia(value.to_string())
     }
+}
+
+fn go_persistence_payload(
+    message_type: &'static str,
+    value: Value,
+) -> Result<DispatcherPersistencePayload, serde_json::Error> {
+    let json = serde_json::to_string(&value)?;
+    Ok(DispatcherPersistencePayload::new(
+        message_type,
+        escape_go_json_html(&json).into_bytes(),
+    ))
+}
+
+fn go_base_file_config_json(
+    chat_id: i64,
+    message_thread_id: Option<i64>,
+    disable_notification: bool,
+    reply_parameters: Option<ReplyParametersPlan>,
+    file: Value,
+) -> Value {
+    let mut fields = go_base_chat_config_fields(
+        chat_id,
+        message_thread_id,
+        disable_notification,
+        reply_parameters,
+    );
+    fields.insert("File".to_owned(), file);
+    Value::Object(fields)
+}
+
+fn go_base_chat_config_fields(
+    chat_id: i64,
+    message_thread_id: Option<i64>,
+    disable_notification: bool,
+    reply_parameters: Option<ReplyParametersPlan>,
+) -> Map<String, Value> {
+    let mut fields = Map::new();
+    fields.insert("ChatID".to_owned(), json!(chat_id));
+    fields.insert("ChannelUsername".to_owned(), json!(""));
+    fields.insert("SuperGroupUsername".to_owned(), json!(""));
+    fields.insert("BusinessConnectionID".to_owned(), json!(""));
+    fields.insert(
+        "MessageThreadID".to_owned(),
+        json!(message_thread_id.unwrap_or_default()),
+    );
+    fields.insert("DirectMessagesTopicID".to_owned(), json!(0));
+    fields.insert("ProtectContent".to_owned(), json!(false));
+    fields.insert("ReplyMarkup".to_owned(), Value::Null);
+    fields.insert(
+        "DisableNotification".to_owned(),
+        json!(disable_notification),
+    );
+    fields.insert("AllowPaidBroadcast".to_owned(), json!(false));
+    fields.insert("MessageEffectID".to_owned(), json!(""));
+    fields.insert(
+        "ReplyParameters".to_owned(),
+        go_reply_parameters_value(reply_parameters),
+    );
+    fields.insert("SuggestedPostParameters".to_owned(), Value::Null);
+    fields
+}
+
+fn go_base_edit_config_fields(chat_id: i64, message_id: i64) -> Map<String, Value> {
+    let mut fields = Map::new();
+    fields.insert("ChatID".to_owned(), json!(chat_id));
+    fields.insert("ChannelUsername".to_owned(), json!(""));
+    fields.insert("SuperGroupUsername".to_owned(), json!(""));
+    fields.insert("MessageID".to_owned(), json!(message_id));
+    fields.insert("BusinessConnectionID".to_owned(), json!(""));
+    fields.insert("InlineMessageID".to_owned(), json!(""));
+    fields.insert("ReplyMarkup".to_owned(), Value::Null);
+    fields
+}
+
+fn go_reply_parameters_value(reply_parameters: Option<ReplyParametersPlan>) -> Value {
+    let mut fields = Map::new();
+    let Some(reply_parameters) = reply_parameters else {
+        fields.insert("message_id".to_owned(), json!(0));
+        return Value::Object(fields);
+    };
+
+    fields.insert("message_id".to_owned(), json!(reply_parameters.message_id));
+    fields.insert("chat_id".to_owned(), json!(reply_parameters.chat_id));
+    if reply_parameters.allow_sending_without_reply {
+        fields.insert("allow_sending_without_reply".to_owned(), json!(true));
+    }
+    Value::Object(fields)
+}
+
+fn escape_go_json_html(json: &str) -> String {
+    let mut escaped = String::with_capacity(json.len());
+    for ch in json.chars() {
+        match ch {
+            '<' => escaped.push_str("\\u003c"),
+            '>' => escaped.push_str("\\u003e"),
+            '&' => escaped.push_str("\\u0026"),
+            '\u{2028}' => escaped.push_str("\\u2028"),
+            '\u{2029}' => escaped.push_str("\\u2029"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
 }
 
 fn apply_reply_parameters(
@@ -860,19 +1096,20 @@ fn format_go_file_bytes(file_name: &str, bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     use super::{
-        AudioMessagePlan, AudioMessageRequest, AudioSource, ChatRef, EditMediaMessageRequest,
-        EditTextMessageRequest, MESSAGE_TYPE_TEXT, MediaGroupMessageRequest, MediaGroupPhotoItem,
-        MessageFingerprint, OutboundBuildError, PhotoMessagePlan, PhotoMessageRequest, PhotoSource,
-        ReplyMessageRef, ReplyParametersPlan, StickerMessagePlan, StickerMessageRequest,
-        TextMessageRequest, allow_sending_without_reply, build_audio_message_method,
-        build_audio_message_plan, build_edit_media_message_method, build_edit_media_message_plan,
-        build_edit_text_message_method, build_media_group_message_method,
-        build_media_group_message_plan, build_photo_message_method, build_photo_message_plan,
-        build_sticker_message_method, build_sticker_message_plan, build_text_message_method,
-        build_text_message_methods, fingerprint_audio_message_plan, fingerprint_photo_message_plan,
+        AudioMessagePlan, AudioMessageRequest, AudioSource, ChatRef, EditMediaMessagePlan,
+        EditMediaMessageRequest, EditTextMessageRequest, MESSAGE_TYPE_TEXT, MediaGroupMessagePlan,
+        MediaGroupMessageRequest, MediaGroupPhotoItem, MessageFingerprint, OutboundBuildError,
+        PhotoMessagePlan, PhotoMessageRequest, PhotoSource, ReplyMessageRef, ReplyParametersPlan,
+        StickerMessagePlan, StickerMessageRequest, TextMessageRequest, allow_sending_without_reply,
+        build_audio_message_method, build_audio_message_plan, build_edit_media_message_method,
+        build_edit_media_message_plan, build_edit_text_message_method,
+        build_media_group_message_method, build_media_group_message_plan,
+        build_photo_message_method, build_photo_message_plan, build_sticker_message_method,
+        build_sticker_message_plan, build_text_message_method, build_text_message_methods,
+        fingerprint_audio_message_plan, fingerprint_photo_message_plan,
         fingerprint_sticker_message_plan, forum_thread_id, hash_content, message_target_chat,
         validate_text_message_text,
     };
@@ -902,6 +1139,12 @@ mod tests {
             render_as: String::new(),
             reply_markup: None,
         }
+    }
+
+    fn persistence_payload_value(
+        payload: &crate::DispatcherPersistencePayload,
+    ) -> Result<Value, serde_json::Error> {
+        serde_json::from_slice(&payload.message)
     }
 
     #[test]
@@ -1259,6 +1502,39 @@ mod tests {
     }
 
     #[test]
+    fn sticker_plan_persistence_payload_matches_go_sticker_config()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let plan = StickerMessagePlan {
+            chat_id: 42,
+            file_id: "sticker-file".to_owned(),
+            message_thread_id: Some(77),
+            disable_notification: true,
+            reply_parameters: Some(ReplyParametersPlan {
+                message_id: 9,
+                chat_id: 42,
+                allow_sending_without_reply: true,
+            }),
+        };
+
+        let payload = plan.to_persistence_payload()?;
+        let value = persistence_payload_value(&payload)?;
+
+        assert_eq!(payload.message_type, "*api.StickerConfig");
+        assert_eq!(value["ChatID"], json!(42));
+        assert_eq!(value["MessageThreadID"], json!(77));
+        assert_eq!(value["DisableNotification"], json!(true));
+        assert_eq!(value["File"], json!("sticker-file"));
+        assert_eq!(value["ReplyParameters"]["message_id"], json!(9));
+        assert_eq!(value["ReplyParameters"]["chat_id"], json!(42));
+        assert_eq!(
+            value["ReplyParameters"]["allow_sending_without_reply"],
+            json!(true)
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn build_photo_message_plan_uses_caption_spoiler_reply_and_thread()
     -> Result<(), Box<dyn std::error::Error>> {
         let req = PhotoMessageRequest {
@@ -1341,6 +1617,69 @@ mod tests {
     }
 
     #[test]
+    fn photo_plan_persistence_payload_matches_go_photo_config()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let plan = PhotoMessagePlan {
+            chat_id: 42,
+            photo: PhotoSource::Url("https://example.test/image.png".to_owned()),
+            message_thread_id: Some(77),
+            disable_notification: true,
+            caption: "<b>caption</b>".to_owned(),
+            render_as: TELEGRAM_PARSE_MODE_HTML.to_owned(),
+            has_spoiler: true,
+            reply_parameters: Some(ReplyParametersPlan {
+                message_id: 9,
+                chat_id: 42,
+                allow_sending_without_reply: true,
+            }),
+        };
+
+        let payload = plan.to_persistence_payload()?;
+        let value = persistence_payload_value(&payload)?;
+
+        assert_eq!(payload.message_type, "*api.PhotoConfig");
+        assert_eq!(value["ChatID"], json!(42));
+        assert_eq!(value["MessageThreadID"], json!(77));
+        assert_eq!(value["DisableNotification"], json!(true));
+        assert_eq!(value["File"], json!("https://example.test/image.png"));
+        assert_eq!(value["Caption"], json!("<b>caption</b>"));
+        assert_eq!(value["ParseMode"], json!("HTML"));
+        assert_eq!(value["HasSpoiler"], json!(true));
+        assert!(
+            String::from_utf8(payload.message)?
+                .contains(r#""Caption":"\u003cb\u003ecaption\u003c/b\u003e""#)
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn photo_plan_persistence_payload_encodes_uploaded_bytes_like_go_file_bytes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let plan = PhotoMessagePlan {
+            chat_id: 42,
+            photo: PhotoSource::Bytes {
+                file_name: "image.png".to_owned(),
+                bytes: vec![1, 2, 3],
+            },
+            message_thread_id: None,
+            disable_notification: false,
+            caption: String::new(),
+            render_as: String::new(),
+            has_spoiler: false,
+            reply_parameters: None,
+        };
+
+        let payload = plan.to_persistence_payload()?;
+        let value = persistence_payload_value(&payload)?;
+
+        assert_eq!(value["File"]["Name"], json!("image.png"));
+        assert_eq!(value["File"]["Bytes"], json!("AQID"));
+
+        Ok(())
+    }
+
+    #[test]
     fn build_media_group_message_plan_keeps_placeholder_reply_thread_and_first_caption() {
         let first = MediaGroupPhotoItem {
             photo: PhotoSource::FileId("placeholder-file".to_owned()),
@@ -1399,6 +1738,42 @@ mod tests {
         };
 
         let _method = build_media_group_message_method(&req)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn media_group_plan_persistence_payload_matches_go_media_group_config()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let plan = MediaGroupMessagePlan {
+            chat_id: 42,
+            message_thread_id: Some(77),
+            disable_notification: true,
+            items: vec![MediaGroupPhotoItem {
+                photo: PhotoSource::FileId("first-photo".to_owned()),
+                caption: "<b>caption</b>".to_owned(),
+                render_as: TELEGRAM_PARSE_MODE_HTML.to_owned(),
+                has_spoiler: true,
+            }],
+            reply_parameters: Some(ReplyParametersPlan {
+                message_id: 9,
+                chat_id: 42,
+                allow_sending_without_reply: true,
+            }),
+        };
+
+        let payload = plan.to_persistence_payload()?;
+        let value = persistence_payload_value(&payload)?;
+
+        assert_eq!(payload.message_type, "*api.MediaGroupConfig");
+        assert_eq!(value["ChatID"], json!(42));
+        assert_eq!(value["MessageThreadID"], json!(77));
+        assert_eq!(value["DisableNotification"], json!(true));
+        assert_eq!(value["Media"][0]["type"], json!("photo"));
+        assert_eq!(value["Media"][0]["media"], json!("first-photo"));
+        assert_eq!(value["Media"][0]["caption"], json!("<b>caption</b>"));
+        assert_eq!(value["Media"][0]["parse_mode"], json!("HTML"));
+        assert_eq!(value["Media"][0]["has_spoiler"], json!(true));
 
         Ok(())
     }
@@ -1475,6 +1850,37 @@ mod tests {
     }
 
     #[test]
+    fn audio_plan_persistence_payload_matches_go_audio_config()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let plan = AudioMessagePlan {
+            chat_id: 42,
+            audio: AudioSource::FileId("song-file-id".to_owned()),
+            message_thread_id: Some(77),
+            disable_notification: true,
+            caption: "song".to_owned(),
+            render_as: TELEGRAM_PARSE_MODE_HTML.to_owned(),
+            reply_parameters: Some(ReplyParametersPlan {
+                message_id: 9,
+                chat_id: 42,
+                allow_sending_without_reply: true,
+            }),
+        };
+
+        let payload = plan.to_persistence_payload()?;
+        let value = persistence_payload_value(&payload)?;
+
+        assert_eq!(payload.message_type, "*api.AudioConfig");
+        assert_eq!(value["ChatID"], json!(42));
+        assert_eq!(value["MessageThreadID"], json!(77));
+        assert_eq!(value["DisableNotification"], json!(true));
+        assert_eq!(value["File"], json!("song-file-id"));
+        assert_eq!(value["Caption"], json!("song"));
+        assert_eq!(value["ParseMode"], json!("HTML"));
+
+        Ok(())
+    }
+
+    #[test]
     fn build_edit_media_message_plan_keeps_placeholder_target_and_prepared_photo() {
         let media = MediaGroupPhotoItem {
             photo: PhotoSource::Bytes {
@@ -1496,6 +1902,35 @@ mod tests {
         assert_eq!(plan.chat_id, 42);
         assert_eq!(plan.message_id, 77);
         assert_eq!(plan.media, media);
+    }
+
+    #[test]
+    fn edit_media_plan_persistence_payload_matches_go_edit_message_media_config()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let plan = EditMediaMessagePlan {
+            chat_id: 42,
+            message_id: 7,
+            media: MediaGroupPhotoItem {
+                photo: PhotoSource::FileId("first-photo".to_owned()),
+                caption: "<b>caption</b>".to_owned(),
+                render_as: TELEGRAM_PARSE_MODE_HTML.to_owned(),
+                has_spoiler: true,
+            },
+        };
+
+        let payload = plan.to_persistence_payload()?;
+        let value = persistence_payload_value(&payload)?;
+
+        assert_eq!(payload.message_type, "*api.EditMessageMediaConfig");
+        assert_eq!(value["ChatID"], json!(42));
+        assert_eq!(value["MessageID"], json!(7));
+        assert_eq!(value["Media"]["type"], json!("photo"));
+        assert_eq!(value["Media"]["media"], json!("first-photo"));
+        assert_eq!(value["Media"]["caption"], json!("<b>caption</b>"));
+        assert_eq!(value["Media"]["parse_mode"], json!("HTML"));
+        assert_eq!(value["Media"]["has_spoiler"], json!(true));
+
+        Ok(())
     }
 
     #[test]
