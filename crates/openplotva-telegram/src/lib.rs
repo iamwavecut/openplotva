@@ -4,6 +4,7 @@ mod dedup;
 mod dispatcher;
 mod html;
 mod outbound;
+mod rate_limit;
 
 pub use dedup::{DEFAULT_DEBOUNCE_CACHE_SIZE, DEFAULT_DEBOUNCE_WINDOW, Debouncer, DebouncerConfig};
 pub use dispatcher::{
@@ -29,6 +30,7 @@ pub use outbound::{
     fingerprint_photo_message_plan, fingerprint_sticker_message_plan, forum_thread_id,
     hash_content, message_target_chat, parse_mode_from_go, validate_text_message_text,
 };
+pub use rate_limit::{ChatLimiters, DEFAULT_DISPATCH_INTERVAL, DEFAULT_RATE_LIMITER_MAX_IDLE};
 
 pub const INTEGRATION_CRATE: &str = "carapax";
 
