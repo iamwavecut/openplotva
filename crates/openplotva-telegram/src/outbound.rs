@@ -1,7 +1,8 @@
 //! Outbound Telegram request builders ported from the Go server send path.
 
 use carapax::types::{
-    EditMessageText, InlineKeyboardMarkup, ParseMode, ReplyMarkup, ReplyParameters, SendMessage,
+    EditMessageText, InlineKeyboardMarkup, InputFile, ParseMode, ReplyMarkup, ReplyParameters,
+    ReplyParametersError, SendMessage, SendSticker,
 };
 use thiserror::Error;
 
@@ -66,6 +67,45 @@ pub struct EditTextMessageRequest {
     pub reply_markup: Option<InlineKeyboardMarkup>,
 }
 
+/// Sticker send request fields used by the Go `StickerMessage` builder.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StickerMessageRequest {
+    /// Target chat when not replying to an existing message.
+    pub chat: Option<ChatRef>,
+    /// Target topic ID for forum chats.
+    pub message_thread_id: i64,
+    /// Whether Telegram should suppress user notification sound.
+    pub disable_notification: bool,
+    /// Telegram file ID for the sticker.
+    pub file_id: String,
+}
+
+/// Public reply-parameter mirror for asserting form-only `carapax` methods.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReplyParametersPlan {
+    /// Message ID being replied to.
+    pub message_id: i64,
+    /// Chat ID of the replied-to message.
+    pub chat_id: i64,
+    /// Whether Telegram may send even if the reply target is gone.
+    pub allow_sending_without_reply: bool,
+}
+
+/// Public sticker payload mirror for asserting form-only `carapax` methods.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StickerMessagePlan {
+    /// Telegram target chat ID.
+    pub chat_id: i64,
+    /// Telegram sticker file ID.
+    pub file_id: String,
+    /// Forum topic ID, when Go would set it on the outbound config.
+    pub message_thread_id: Option<i64>,
+    /// Whether Telegram should suppress user notification sound.
+    pub disable_notification: bool,
+    /// Reply parameters, when sending as a reply.
+    pub reply_parameters: Option<ReplyParametersPlan>,
+}
+
 /// Outbound builder error matching Go validation failures where possible.
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum OutboundBuildError {
@@ -87,6 +127,9 @@ pub enum OutboundBuildError {
     /// Split text unexpectedly produced no outbound parts.
     #[error("no parts to send")]
     NoParts,
+    /// `carapax` failed to serialize reply parameters for a form method.
+    #[error("failed to serialize Telegram reply parameters: {0}")]
+    ReplyParameters(String),
 }
 
 /// Build all outbound `sendMessage` methods for a text request.
@@ -161,6 +204,47 @@ pub fn build_edit_text_message_method(
     Ok(method)
 }
 
+/// Build an outbound `sendSticker` method.
+pub fn build_sticker_message_method(
+    req: &StickerMessageRequest,
+    reply_to: Option<&ReplyMessageRef>,
+) -> Result<SendSticker, OutboundBuildError> {
+    build_sticker_message_plan(req, reply_to)?.to_carapax()
+}
+
+/// Build an inspectable sticker payload plan matching Go `buildStickerMessageConfig`.
+pub fn build_sticker_message_plan(
+    req: &StickerMessageRequest,
+    reply_to: Option<&ReplyMessageRef>,
+) -> Result<StickerMessagePlan, OutboundBuildError> {
+    let chat = message_target_chat(req.chat.as_ref(), reply_to)?;
+    let (message_thread_id, reply_parameters) = if let Some(reply) = reply_to {
+        (
+            reply_thread_id(reply).filter(|thread_id| *thread_id != 0),
+            Some(ReplyParametersPlan {
+                message_id: reply.message_id,
+                chat_id: reply.chat.id,
+                allow_sending_without_reply: true,
+            }),
+        )
+    } else {
+        (
+            chat.is_forum
+                .then_some(req.message_thread_id)
+                .filter(|thread_id| *thread_id != 0),
+            None,
+        )
+    };
+
+    Ok(StickerMessagePlan {
+        chat_id: chat.id,
+        file_id: req.file_id.clone(),
+        message_thread_id,
+        disable_notification: req.disable_notification,
+        reply_parameters,
+    })
+}
+
 /// Validate text exactly like Go before send/edit.
 pub fn validate_text_message_text(text: &str, render_as: &str) -> Result<(), OutboundBuildError> {
     if text.is_empty() {
@@ -204,6 +288,39 @@ pub fn parse_mode_from_go(value: &str) -> Result<Option<ParseMode>, OutboundBuil
     }
 }
 
+impl StickerMessagePlan {
+    /// Convert the inspectable plan into the `carapax` form-backed method.
+    pub fn to_carapax(&self) -> Result<SendSticker, OutboundBuildError> {
+        let mut method = SendSticker::new(self.chat_id, InputFile::file_id(self.file_id.clone()));
+        if let Some(thread_id) = self.message_thread_id {
+            method = method.with_message_thread_id(thread_id);
+        }
+        if self.disable_notification {
+            method = method.with_disable_notification(true);
+        }
+        if let Some(reply) = self.reply_parameters {
+            method = method.with_reply_parameters(reply.into_carapax())?;
+        }
+        Ok(method)
+    }
+}
+
+impl ReplyParametersPlan {
+    fn into_carapax(self) -> ReplyParameters {
+        let mut params = ReplyParameters::new(self.message_id).with_chat_id(self.chat_id);
+        if self.allow_sending_without_reply {
+            params = params.with_allow_sending_without_reply(true);
+        }
+        params
+    }
+}
+
+impl From<ReplyParametersError> for OutboundBuildError {
+    fn from(value: ReplyParametersError) -> Self {
+        Self::ReplyParameters(value.to_string())
+    }
+}
+
 fn apply_reply_parameters(
     method: SendMessage,
     reply: &ReplyMessageRef,
@@ -225,10 +342,11 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ChatRef, EditTextMessageRequest, OutboundBuildError, ReplyMessageRef, TextMessageRequest,
-        allow_sending_without_reply, build_edit_text_message_method, build_text_message_method,
-        build_text_message_methods, forum_thread_id, message_target_chat,
-        validate_text_message_text,
+        ChatRef, EditTextMessageRequest, OutboundBuildError, ReplyMessageRef, ReplyParametersPlan,
+        StickerMessageRequest, TextMessageRequest, allow_sending_without_reply,
+        build_edit_text_message_method, build_sticker_message_method, build_sticker_message_plan,
+        build_text_message_method, build_text_message_methods, forum_thread_id,
+        message_target_chat, validate_text_message_text,
     };
     use crate::{
         InlineKeyboardButton, InlineKeyboardMarkup, ReplyMarkup, TELEGRAM_PARSE_MODE_HTML,
@@ -418,6 +536,106 @@ mod tests {
         let payload = serde_json::to_value(method)?;
 
         assert_eq!(payload["message_thread_id"], json!(77));
+
+        Ok(())
+    }
+
+    #[test]
+    fn build_sticker_message_plan_uses_reply_message() -> Result<(), Box<dyn std::error::Error>> {
+        let req = StickerMessageRequest {
+            chat: Some(private_chat(1)),
+            message_thread_id: 0,
+            disable_notification: true,
+            file_id: "sticker-file".to_owned(),
+        };
+        let reply = ReplyMessageRef {
+            message_id: 9,
+            chat: private_chat(42),
+            is_topic_message: false,
+            message_thread_id: 0,
+        };
+
+        let plan = build_sticker_message_plan(&req, Some(&reply))?;
+
+        assert_eq!(plan.chat_id, 42);
+        assert_eq!(plan.file_id, "sticker-file");
+        assert!(plan.disable_notification);
+        assert_eq!(plan.message_thread_id, None);
+        assert_eq!(
+            plan.reply_parameters,
+            Some(ReplyParametersPlan {
+                message_id: 9,
+                chat_id: 42,
+                allow_sending_without_reply: true,
+            })
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn build_sticker_message_plan_uses_forum_thread_without_reply()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let req = StickerMessageRequest {
+            chat: Some(forum_chat(42)),
+            message_thread_id: 55,
+            disable_notification: false,
+            file_id: "sticker-file".to_owned(),
+        };
+
+        let plan = build_sticker_message_plan(&req, None)?;
+
+        assert_eq!(plan.chat_id, 42);
+        assert_eq!(plan.file_id, "sticker-file");
+        assert_eq!(plan.message_thread_id, Some(55));
+        assert_eq!(plan.reply_parameters, None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn build_sticker_message_plan_uses_reply_topic_thread() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let req = StickerMessageRequest {
+            chat: Some(private_chat(1)),
+            message_thread_id: 0,
+            disable_notification: false,
+            file_id: "sticker-file".to_owned(),
+        };
+        let reply = ReplyMessageRef {
+            message_id: 9,
+            chat: forum_chat(42),
+            is_topic_message: true,
+            message_thread_id: 77,
+        };
+
+        let plan = build_sticker_message_plan(&req, Some(&reply))?;
+
+        assert_eq!(plan.chat_id, 42);
+        assert_eq!(plan.message_thread_id, Some(77));
+        assert_eq!(
+            plan.reply_parameters,
+            Some(ReplyParametersPlan {
+                message_id: 9,
+                chat_id: 42,
+                allow_sending_without_reply: true,
+            })
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn build_sticker_message_method_builds_carapax_method() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let req = StickerMessageRequest {
+            chat: Some(private_chat(42)),
+            message_thread_id: 0,
+            disable_notification: false,
+            file_id: "sticker-file".to_owned(),
+        };
+
+        let _method = build_sticker_message_method(&req, None)?;
 
         Ok(())
     }

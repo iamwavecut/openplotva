@@ -9,10 +9,11 @@ pub use html::{
     sanitize_telegram_html, split_telegram_text, strip_telegram_html,
 };
 pub use outbound::{
-    ChatRef, EditTextMessageRequest, OutboundBuildError, ReplyMessageRef, TELEGRAM_TEXT_MAX_BYTES,
-    TextMessageRequest, allow_sending_without_reply, build_edit_text_message_method,
-    build_text_message_method, build_text_message_methods, forum_thread_id, message_target_chat,
-    parse_mode_from_go, validate_text_message_text,
+    ChatRef, EditTextMessageRequest, OutboundBuildError, ReplyMessageRef, ReplyParametersPlan,
+    StickerMessagePlan, StickerMessageRequest, TELEGRAM_TEXT_MAX_BYTES, TextMessageRequest,
+    allow_sending_without_reply, build_edit_text_message_method, build_sticker_message_method,
+    build_sticker_message_plan, build_text_message_method, build_text_message_methods,
+    forum_thread_id, message_target_chat, parse_mode_from_go, validate_text_message_text,
 };
 
 pub const INTEGRATION_CRATE: &str = "carapax";
@@ -44,6 +45,9 @@ pub type BotCommandError = carapax::types::BotCommandError;
 /// Telegram sendMessage method from `carapax`.
 pub type SendMessage = carapax::types::SendMessage;
 
+/// Telegram sendSticker method from `carapax`.
+pub type SendSticker = carapax::types::SendSticker;
+
 /// Telegram editMessageText method from `carapax`.
 pub type EditMessageText = carapax::types::EditMessageText;
 
@@ -58,6 +62,9 @@ pub type InlineKeyboardButton = carapax::types::InlineKeyboardButton;
 
 /// Telegram parse mode type from `carapax`.
 pub type ParseMode = carapax::types::ParseMode;
+
+/// Telegram input-file type from `carapax`.
+pub type InputFile = carapax::types::InputFile;
 
 /// Create an empty Telegram integration context.
 pub fn empty_context() -> CarapaxContext {
