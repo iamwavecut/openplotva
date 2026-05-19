@@ -2,6 +2,7 @@
 
 pub mod pending_ops;
 mod reference_snapshot;
+pub mod virtual_messages;
 
 use anyhow::Context as _;
 use openplotva_config::AppConfig;
