@@ -1,8 +1,10 @@
 //! Telegram Bot API boundary for OpenPlotva.
 
+mod dedup;
 mod html;
 mod outbound;
 
+pub use dedup::{DEFAULT_DEBOUNCE_CACHE_SIZE, DEFAULT_DEBOUNCE_WINDOW, Debouncer, DebouncerConfig};
 pub use html::{
     TELEGRAM_PARSE_MODE_HTML, clean_unicode_non_printables, ensure_telegram_safe_text,
     escape_telegram_html_text, extract_visible_text, is_valid_telegram_html,
