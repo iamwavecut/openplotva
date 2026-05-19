@@ -3,9 +3,10 @@
 use std::io::Cursor;
 
 use carapax::types::{
-    EditMessageText, InlineKeyboardMarkup, InputFile, InputFileReader, InputMediaPhoto, MediaGroup,
-    MediaGroupError, MediaGroupItem, ParseMode, ReplyMarkup, ReplyParameters, ReplyParametersError,
-    SendAudio, SendMediaGroup, SendMessage, SendPhoto, SendSticker,
+    EditMessageMedia, EditMessageText, InlineKeyboardMarkup, InputFile, InputFileReader,
+    InputMedia, InputMediaError, InputMediaPhoto, MediaGroup, MediaGroupError, MediaGroupItem,
+    ParseMode, ReplyMarkup, ReplyParameters, ReplyParametersError, SendAudio, SendMediaGroup,
+    SendMessage, SendPhoto, SendSticker,
 };
 use thiserror::Error;
 
@@ -264,6 +265,28 @@ pub struct MediaGroupMessagePlan {
     pub reply_parameters: Option<ReplyParametersPlan>,
 }
 
+/// Edit-media request fields used by the Go generated-image placeholder replacement path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EditMediaMessageRequest {
+    /// Target chat.
+    pub chat: ChatRef,
+    /// Existing placeholder message ID.
+    pub message_id: i64,
+    /// Prepared replacement media.
+    pub media: MediaGroupPhotoItem,
+}
+
+/// Public edit-media payload mirror for asserting form-only `carapax` methods.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EditMediaMessagePlan {
+    /// Telegram target chat ID.
+    pub chat_id: i64,
+    /// Existing placeholder message ID.
+    pub message_id: i64,
+    /// Prepared replacement media.
+    pub media: MediaGroupPhotoItem,
+}
+
 /// Outbound builder error matching Go validation failures where possible.
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum OutboundBuildError {
@@ -291,6 +314,9 @@ pub enum OutboundBuildError {
     /// `carapax` rejected a Telegram media group.
     #[error("failed to build Telegram media group: {0}")]
     MediaGroup(String),
+    /// `carapax` rejected Telegram input media.
+    #[error("failed to build Telegram input media: {0}")]
+    InputMedia(String),
 }
 
 /// Build all outbound `sendMessage` methods for a text request.
@@ -467,6 +493,22 @@ pub fn build_media_group_message_plan(req: &MediaGroupMessageRequest) -> MediaGr
     }
 }
 
+/// Build an outbound `editMessageMedia` method.
+pub fn build_edit_media_message_method(
+    req: &EditMediaMessageRequest,
+) -> Result<EditMessageMedia, OutboundBuildError> {
+    build_edit_media_message_plan(req).to_carapax()
+}
+
+/// Build an inspectable edit-media payload plan matching Go `editMessageMediaConfig`.
+pub fn build_edit_media_message_plan(req: &EditMediaMessageRequest) -> EditMediaMessagePlan {
+    EditMediaMessagePlan {
+        chat_id: req.chat.id,
+        message_id: req.message_id,
+        media: req.media.clone(),
+    }
+}
+
 /// Validate text exactly like Go before send/edit.
 pub fn validate_text_message_text(text: &str, render_as: &str) -> Result<(), OutboundBuildError> {
     if text.is_empty() {
@@ -635,6 +677,20 @@ impl MediaGroupMessagePlan {
 
 impl MediaGroupPhotoItem {
     fn to_carapax(&self) -> Result<MediaGroupItem, OutboundBuildError> {
+        Ok(MediaGroupItem::for_photo(
+            self.photo.to_input_file(),
+            self.photo_metadata()?,
+        ))
+    }
+
+    fn to_input_media(&self) -> Result<InputMedia, OutboundBuildError> {
+        Ok(InputMedia::for_photo(
+            self.photo.to_input_file(),
+            self.photo_metadata()?,
+        ))
+    }
+
+    fn photo_metadata(&self) -> Result<InputMediaPhoto, OutboundBuildError> {
         let mut metadata = InputMediaPhoto::default();
         if !self.caption.is_empty() {
             metadata = metadata.with_caption(self.caption.clone());
@@ -645,10 +701,18 @@ impl MediaGroupPhotoItem {
         if self.has_spoiler {
             metadata = metadata.with_has_spoiler(true);
         }
-        Ok(MediaGroupItem::for_photo(
-            self.photo.to_input_file(),
-            metadata,
-        ))
+        Ok(metadata)
+    }
+}
+
+impl EditMediaMessagePlan {
+    /// Convert the inspectable plan into the `carapax` form-backed method.
+    pub fn to_carapax(&self) -> Result<EditMessageMedia, OutboundBuildError> {
+        Ok(EditMessageMedia::for_chat_message(
+            self.chat_id,
+            self.message_id,
+            self.media.to_input_media()?,
+        )?)
     }
 }
 
@@ -661,6 +725,12 @@ impl From<ReplyParametersError> for OutboundBuildError {
 impl From<MediaGroupError> for OutboundBuildError {
     fn from(value: MediaGroupError) -> Self {
         Self::MediaGroup(value.to_string())
+    }
+}
+
+impl From<InputMediaError> for OutboundBuildError {
+    fn from(value: InputMediaError) -> Self {
+        Self::InputMedia(value.to_string())
     }
 }
 
@@ -685,11 +755,12 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        AudioMessageRequest, AudioSource, ChatRef, EditTextMessageRequest,
+        AudioMessageRequest, AudioSource, ChatRef, EditMediaMessageRequest, EditTextMessageRequest,
         MediaGroupMessageRequest, MediaGroupPhotoItem, OutboundBuildError, PhotoMessageRequest,
         PhotoSource, ReplyMessageRef, ReplyParametersPlan, StickerMessageRequest,
         TextMessageRequest, allow_sending_without_reply, build_audio_message_method,
-        build_audio_message_plan, build_edit_text_message_method, build_media_group_message_method,
+        build_audio_message_plan, build_edit_media_message_method, build_edit_media_message_plan,
+        build_edit_text_message_method, build_media_group_message_method,
         build_media_group_message_plan, build_photo_message_method, build_photo_message_plan,
         build_sticker_message_method, build_sticker_message_plan, build_text_message_method,
         build_text_message_methods, forum_thread_id, message_target_chat,
@@ -1199,6 +1270,49 @@ mod tests {
         };
 
         let _method = build_audio_message_method(&req)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn build_edit_media_message_plan_keeps_placeholder_target_and_prepared_photo() {
+        let media = MediaGroupPhotoItem {
+            photo: PhotoSource::Bytes {
+                file_name: "plotva_image_provider_1.jpg".to_owned(),
+                bytes: vec![1, 2, 3],
+            },
+            caption: "<b>caption</b>".to_owned(),
+            render_as: TELEGRAM_PARSE_MODE_HTML.to_owned(),
+            has_spoiler: true,
+        };
+        let req = EditMediaMessageRequest {
+            chat: private_chat(42),
+            message_id: 77,
+            media: media.clone(),
+        };
+
+        let plan = build_edit_media_message_plan(&req);
+
+        assert_eq!(plan.chat_id, 42);
+        assert_eq!(plan.message_id, 77);
+        assert_eq!(plan.media, media);
+    }
+
+    #[test]
+    fn build_edit_media_message_method_builds_carapax_method()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let req = EditMediaMessageRequest {
+            chat: private_chat(42),
+            message_id: 77,
+            media: MediaGroupPhotoItem {
+                photo: PhotoSource::Url("https://example.test/image.png".to_owned()),
+                caption: String::new(),
+                render_as: String::new(),
+                has_spoiler: false,
+            },
+        };
+
+        let _method = build_edit_media_message_method(&req)?;
 
         Ok(())
     }
