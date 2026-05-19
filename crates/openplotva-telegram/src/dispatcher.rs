@@ -5,7 +5,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{ChatLimiters, Debouncer, DebouncerConfig, MessageFingerprint, TelegramOutboundMethod};
+use carapax::api::Client;
+
+use crate::{
+    ChatLimiters, Debouncer, DebouncerConfig, MessageFingerprint, TelegramOutboundMethod,
+    send_telegram_method_status,
+};
 
 /// Go outbound dispatcher queue settings currently ported to Rust.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -252,6 +257,28 @@ impl DispatcherQueue {
         self.process_ready_item(item, send).await
     }
 
+    /// Process one immediate item by sending its concrete Telegram method payload.
+    pub async fn process_immediate_method_once<F, Fut>(
+        &self,
+        send_method: F,
+    ) -> DispatcherWorkerOutcome
+    where
+        F: FnOnce(TelegramOutboundMethod) -> Fut,
+        Fut: Future<Output = DispatcherSendStatus>,
+    {
+        self.process_immediate_once(|item| send_work_item_method_status(item, send_method))
+            .await
+    }
+
+    /// Process one immediate item through a real `carapax` client.
+    pub async fn process_immediate_telegram_once(
+        &self,
+        client: &Client,
+    ) -> DispatcherWorkerOutcome {
+        self.process_immediate_method_once(|method| send_telegram_method_status(client, method))
+            .await
+    }
+
     /// Process one regular queue item with limiter checks and an async transport callback.
     pub async fn process_regular_once<F, Fut>(
         &self,
@@ -264,6 +291,32 @@ impl DispatcherQueue {
     {
         self.process_regular_once_at(limiters, Instant::now(), send)
             .await
+    }
+
+    /// Process one regular item by sending its concrete Telegram method payload.
+    pub async fn process_regular_method_once<F, Fut>(
+        &self,
+        limiters: &ChatLimiters,
+        send_method: F,
+    ) -> DispatcherWorkerOutcome
+    where
+        F: FnOnce(TelegramOutboundMethod) -> Fut,
+        Fut: Future<Output = DispatcherSendStatus>,
+    {
+        self.process_regular_method_once_at(limiters, Instant::now(), send_method)
+            .await
+    }
+
+    /// Process one regular item through a real `carapax` client.
+    pub async fn process_regular_telegram_once(
+        &self,
+        limiters: &ChatLimiters,
+        client: &Client,
+    ) -> DispatcherWorkerOutcome {
+        self.process_regular_method_once(limiters, |method| {
+            send_telegram_method_status(client, method)
+        })
+        .await
     }
 
     /// Put a deferred regular item back at the front, matching Go wait-error handling.
@@ -400,6 +453,22 @@ impl DispatcherQueue {
         }
     }
 
+    pub(crate) async fn process_regular_method_once_at<F, Fut>(
+        &self,
+        limiters: &ChatLimiters,
+        now: Instant,
+        send_method: F,
+    ) -> DispatcherWorkerOutcome
+    where
+        F: FnOnce(TelegramOutboundMethod) -> Fut,
+        Fut: Future<Output = DispatcherSendStatus>,
+    {
+        self.process_regular_once_at(limiters, now, |item| {
+            send_work_item_method_status(item, send_method)
+        })
+        .await
+    }
+
     async fn process_ready_item<F, Fut>(
         &self,
         item: DispatcherWorkItem,
@@ -465,6 +534,20 @@ fn oldest_age(queue: &VecDeque<DispatcherQueueItem>, now: Instant) -> Duration {
         .front()
         .map(|item| now.saturating_duration_since(item.metadata.added_at))
         .unwrap_or_default()
+}
+
+async fn send_work_item_method_status<F, Fut>(
+    item: DispatcherWorkItem,
+    send_method: F,
+) -> DispatcherSendStatus
+where
+    F: FnOnce(TelegramOutboundMethod) -> Fut,
+    Fut: Future<Output = DispatcherSendStatus>,
+{
+    let Some(method) = item.into_method() else {
+        return DispatcherSendStatus::Failed;
+    };
+    send_method(method).await
 }
 
 #[cfg(test)]
@@ -579,6 +662,143 @@ mod tests {
             )]
         );
         assert!(queue.dequeue_immediate().is_none());
+    }
+
+    #[tokio::test]
+    async fn immediate_method_worker_sends_owned_payload_through_transport_callback() {
+        let queue = DispatcherQueue::new(DispatcherConfig::default());
+        let now = std::time::Instant::now();
+        let sent_methods = Arc::new(Mutex::new(Vec::new()));
+
+        queue.enqueue_at(
+            text_message(42, "immediate", "immediate-1")
+                .with_method(text_method(42, "payload body")),
+            true,
+            now,
+        );
+
+        let outcome = queue
+            .process_immediate_method_once({
+                let sent_methods = Arc::clone(&sent_methods);
+                move |method| async move {
+                    sent_methods
+                        .lock()
+                        .expect("sent methods lock")
+                        .push(method.kind());
+                    DispatcherSendStatus::Sent
+                }
+            })
+            .await;
+
+        assert_eq!(
+            outcome,
+            DispatcherWorkerOutcome::Sent {
+                virtual_id: "immediate-1".to_owned(),
+                immediate: true,
+            }
+        );
+        assert_eq!(
+            *sent_methods.lock().expect("sent methods lock"),
+            vec![TelegramOutboundMethodKind::SendMessage]
+        );
+        assert_eq!(queue.stats_at(now).processed_total, 1);
+    }
+
+    #[tokio::test]
+    async fn regular_method_worker_respects_limiter_before_transport_callback() {
+        let queue = DispatcherQueue::new(DispatcherConfig::default());
+        let limiters = ChatLimiters::new(crate::DEFAULT_DISPATCH_INTERVAL);
+        let now = std::time::Instant::now();
+        let sent_methods = Arc::new(Mutex::new(Vec::new()));
+
+        queue.enqueue_at(
+            text_message(42, "first", "regular-1").with_method(text_method(42, "first payload")),
+            false,
+            now,
+        );
+        queue.enqueue_at(
+            text_message(42, "second", "regular-2").with_method(text_method(42, "second payload")),
+            false,
+            now + Duration::from_secs(1),
+        );
+
+        let first = queue
+            .process_regular_method_once_at(&limiters, now, {
+                let sent_methods = Arc::clone(&sent_methods);
+                move |method| async move {
+                    sent_methods
+                        .lock()
+                        .expect("sent methods lock")
+                        .push(method.kind());
+                    DispatcherSendStatus::Sent
+                }
+            })
+            .await;
+        assert!(matches!(
+            first,
+            DispatcherWorkerOutcome::Sent {
+                virtual_id,
+                immediate: false
+            } if virtual_id == "regular-1"
+        ));
+
+        let limited = queue
+            .process_regular_method_once_at(&limiters, now, {
+                let sent_methods = Arc::clone(&sent_methods);
+                move |method| async move {
+                    sent_methods
+                        .lock()
+                        .expect("sent methods lock")
+                        .push(method.kind());
+                    DispatcherSendStatus::Sent
+                }
+            })
+            .await;
+
+        assert_eq!(
+            limited,
+            DispatcherWorkerOutcome::RateLimited {
+                retry_after: crate::DEFAULT_DISPATCH_INTERVAL,
+            }
+        );
+        assert_eq!(
+            *sent_methods.lock().expect("sent methods lock"),
+            vec![TelegramOutboundMethodKind::SendMessage]
+        );
+        assert_eq!(
+            virtual_ids(queue.snapshot()).0,
+            vec!["regular-2".to_owned()]
+        );
+        assert_eq!(queue.stats_at(now).processed_total, 1);
+    }
+
+    #[tokio::test]
+    async fn method_worker_fails_missing_payload_without_calling_transport() {
+        let queue = DispatcherQueue::new(DispatcherConfig::default());
+        let now = std::time::Instant::now();
+        let sends = Arc::new(Mutex::new(0usize));
+
+        queue.enqueue_at(text_message(42, "immediate", "immediate-1"), true, now);
+
+        let outcome = queue
+            .process_immediate_method_once({
+                let sends = Arc::clone(&sends);
+                move |_| async move {
+                    *sends.lock().expect("send count lock") += 1;
+                    DispatcherSendStatus::Sent
+                }
+            })
+            .await;
+
+        assert_eq!(
+            outcome,
+            DispatcherWorkerOutcome::SendFailed {
+                virtual_id: "immediate-1".to_owned(),
+                immediate: true,
+            }
+        );
+        assert_eq!(*sends.lock().expect("send count lock"), 0);
+        assert_eq!(queue.stats_at(now).processed_total, 0);
     }
 
     #[test]
