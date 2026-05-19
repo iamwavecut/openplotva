@@ -5,6 +5,7 @@ mod dispatcher;
 mod html;
 mod outbound;
 mod rate_limit;
+mod transport;
 
 pub use dedup::{DEFAULT_DEBOUNCE_CACHE_SIZE, DEFAULT_DEBOUNCE_WINDOW, Debouncer, DebouncerConfig};
 pub use dispatcher::{
@@ -32,6 +33,10 @@ pub use outbound::{
     hash_content, message_target_chat, parse_mode_from_go, validate_text_message_text,
 };
 pub use rate_limit::{ChatLimiters, DEFAULT_DISPATCH_INTERVAL, DEFAULT_RATE_LIMITER_MAX_IDLE};
+pub use transport::{
+    TelegramOutboundMethod, TelegramOutboundMethodKind, TelegramOutboundResponse,
+    TelegramOutboundResponseKind, execute_telegram_method, send_telegram_method_status,
+};
 
 pub const INTEGRATION_CRATE: &str = "carapax";
 
