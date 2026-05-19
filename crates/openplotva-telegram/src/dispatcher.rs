@@ -8,10 +8,14 @@ use std::{
 use carapax::api::Client;
 use tokio::{sync::Notify, time::sleep};
 
+use crate::rate_limit::DEFAULT_RATE_LIMITER_MAX_IDLE;
 use crate::{
     ChatLimiters, Debouncer, DebouncerConfig, MessageFingerprint, TelegramOutboundMethod,
-    send_telegram_method_status,
+    TelegramOutboundMethodKind, send_telegram_method_status,
 };
+
+/// Go default interval for dispatcher limiter cleanup ticks.
+pub const DEFAULT_DISPATCHER_CLEANUP_INTERVAL: Duration = Duration::from_secs(10 * 60);
 
 /// Go outbound dispatcher queue settings currently ported to Rust.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -20,6 +24,44 @@ pub struct DispatcherConfig {
     pub max_queue_size: usize,
     /// Regular-queue duplicate suppression settings.
     pub dedupe_config: DebouncerConfig,
+}
+
+/// Go outbound dispatcher runtime lifecycle settings ported to Rust.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DispatcherRuntimeConfig {
+    /// Interval between idle per-chat limiter cleanup passes.
+    pub cleanup_interval: Duration,
+    /// Idle age after which a per-chat limiter can be removed.
+    pub rate_limiter_max_idle: Duration,
+}
+
+impl Default for DispatcherRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            cleanup_interval: DEFAULT_DISPATCHER_CLEANUP_INTERVAL,
+            rate_limiter_max_idle: DEFAULT_RATE_LIMITER_MAX_IDLE,
+        }
+    }
+}
+
+impl DispatcherRuntimeConfig {
+    /// Cleanup interval with Go's zero-value default applied.
+    pub fn cleanup_interval(self) -> Duration {
+        if self.cleanup_interval.is_zero() {
+            DEFAULT_DISPATCHER_CLEANUP_INTERVAL
+        } else {
+            self.cleanup_interval
+        }
+    }
+
+    /// Per-chat limiter max idle duration with Go's zero-value default applied.
+    pub fn rate_limiter_max_idle(self) -> Duration {
+        if self.rate_limiter_max_idle.is_zero() {
+            DEFAULT_RATE_LIMITER_MAX_IDLE
+        } else {
+            self.rate_limiter_max_idle
+        }
+    }
 }
 
 /// Outbound message metadata needed by the queue layer.
@@ -131,6 +173,11 @@ impl DispatcherWorkItem {
         &self.metadata
     }
 
+    /// Return the Telegram method kind without consuming the queued payload.
+    pub fn method_kind(&self) -> Option<TelegramOutboundMethodKind> {
+        self.method.as_ref().map(TelegramOutboundMethod::kind)
+    }
+
     /// Consume the worker item and return only the concrete Telegram method payload.
     pub fn into_method(self) -> Option<TelegramOutboundMethod> {
         self.method
@@ -148,6 +195,27 @@ pub struct QueueSnapshot {
     pub regular: Vec<DispatcherQueuedMessage>,
     /// Immediate outbound queue, oldest first.
     pub immediate: Vec<DispatcherQueuedMessage>,
+}
+
+/// Work items drained during dispatcher shutdown, preserving Go persistence order.
+#[derive(Debug, Default)]
+pub struct DispatcherDrain {
+    /// Immediate queue items, oldest first. Go persists these before regular items.
+    pub immediate: Vec<DispatcherWorkItem>,
+    /// Regular queue items, oldest first.
+    pub regular: Vec<DispatcherWorkItem>,
+}
+
+impl DispatcherDrain {
+    /// Total number of drained queue items.
+    pub fn len(&self) -> usize {
+        self.immediate.len() + self.regular.len()
+    }
+
+    /// Return whether no items were drained.
+    pub fn is_empty(&self) -> bool {
+        self.immediate.is_empty() && self.regular.is_empty()
+    }
 }
 
 /// Go dispatcher statistics ported for the queue layer.
@@ -250,6 +318,29 @@ impl DispatcherQueue {
             .regular
             .pop_front()
             .map(DispatcherQueueItem::into_work_item)
+    }
+
+    /// Drain queued work for graceful shutdown persistence.
+    pub fn drain_for_shutdown(&self) -> DispatcherDrain {
+        let drained = {
+            let mut state = self.state();
+            DispatcherDrain {
+                immediate: state
+                    .immediate
+                    .drain(..)
+                    .map(DispatcherQueueItem::into_work_item)
+                    .collect(),
+                regular: state
+                    .regular
+                    .drain(..)
+                    .map(DispatcherQueueItem::into_work_item)
+                    .collect(),
+            }
+        };
+
+        self.immediate_notify.notify_waiters();
+        self.regular_notify.notify_waiters();
+        drained
     }
 
     /// Take the oldest regular item if its chat limiter is ready.
@@ -715,6 +806,28 @@ where
     send_method(method).await
 }
 
+pub async fn run_limiter_cleanup_until<Stop>(
+    limiters: &ChatLimiters,
+    config: DispatcherRuntimeConfig,
+    stop: Stop,
+) -> DispatcherWorkerLoopOutcome
+where
+    Stop: Future<Output = ()>,
+{
+    let cleanup_interval = config.cleanup_interval();
+    let rate_limiter_max_idle = config.rate_limiter_max_idle();
+    tokio::pin!(stop);
+
+    loop {
+        tokio::select! {
+            () = &mut stop => return DispatcherWorkerLoopOutcome::Stopped,
+            () = sleep(cleanup_interval) => {
+                limiters.cleanup(rate_limiter_max_idle);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -724,9 +837,10 @@ mod tests {
     };
 
     use super::{
-        DispatcherConfig, DispatcherMessage, DispatcherQueue, DispatcherSendStatus,
-        DispatcherWorkerLoopOutcome, DispatcherWorkerOutcome, EnqueueOutcome, QueueSnapshot,
-        RegularDequeueOutcome,
+        DEFAULT_DISPATCHER_CLEANUP_INTERVAL, DispatcherConfig, DispatcherMessage, DispatcherQueue,
+        DispatcherRuntimeConfig, DispatcherSendStatus, DispatcherWorkerLoopOutcome,
+        DispatcherWorkerOutcome, EnqueueOutcome, QueueSnapshot, RegularDequeueOutcome,
+        run_limiter_cleanup_until,
     };
     use crate::{
         ChatLimiters, DebouncerConfig, MESSAGE_TYPE_TEXT, MessageFingerprint,
@@ -772,6 +886,134 @@ mod tests {
         })
         .await
         .expect("condition became true");
+    }
+
+    #[test]
+    fn dispatcher_runtime_config_defaults_match_go_cleanup_settings() {
+        let config = DispatcherRuntimeConfig::default();
+
+        assert_eq!(
+            config.cleanup_interval(),
+            DEFAULT_DISPATCHER_CLEANUP_INTERVAL
+        );
+        assert_eq!(
+            config.rate_limiter_max_idle(),
+            crate::DEFAULT_RATE_LIMITER_MAX_IDLE
+        );
+        assert_eq!(
+            DispatcherRuntimeConfig {
+                cleanup_interval: Duration::ZERO,
+                rate_limiter_max_idle: Duration::ZERO,
+            }
+            .cleanup_interval(),
+            DEFAULT_DISPATCHER_CLEANUP_INTERVAL
+        );
+        assert_eq!(
+            DispatcherRuntimeConfig {
+                cleanup_interval: Duration::ZERO,
+                rate_limiter_max_idle: Duration::ZERO,
+            }
+            .rate_limiter_max_idle(),
+            crate::DEFAULT_RATE_LIMITER_MAX_IDLE
+        );
+    }
+
+    #[tokio::test]
+    async fn limiter_cleanup_loop_removes_idle_limiters_until_stop() {
+        let limiters = Arc::new(ChatLimiters::new(Duration::ZERO));
+        assert!(limiters.allow(42));
+        assert_eq!(limiters.active_len(), 1);
+
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let worker = tokio::spawn({
+            let limiters = Arc::clone(&limiters);
+            async move {
+                run_limiter_cleanup_until(
+                    &limiters,
+                    DispatcherRuntimeConfig {
+                        cleanup_interval: Duration::from_millis(5),
+                        rate_limiter_max_idle: Duration::from_millis(1),
+                    },
+                    async {
+                        let _ = stop_rx.await;
+                    },
+                )
+                .await
+            }
+        });
+
+        wait_until(|| limiters.active_len() == 0).await;
+
+        stop_tx.send(()).expect("stop signal sent");
+        let outcome = tokio::time::timeout(Duration::from_secs(1), worker)
+            .await
+            .expect("cleanup worker stopped")
+            .expect("cleanup worker task");
+        assert_eq!(outcome, DispatcherWorkerLoopOutcome::Stopped);
+    }
+
+    #[test]
+    fn drain_for_shutdown_preserves_go_queue_order_and_payloads() {
+        let queue = DispatcherQueue::new(DispatcherConfig::default());
+        let now = std::time::Instant::now();
+
+        queue.enqueue_at(
+            text_message(42, "regular first", "regular-1")
+                .with_method(text_method(42, "regular first payload")),
+            false,
+            now,
+        );
+        queue.enqueue_at(
+            text_message(43, "immediate first", "immediate-1")
+                .with_method(text_method(43, "immediate first payload")),
+            true,
+            now + Duration::from_secs(1),
+        );
+        queue.enqueue_at(
+            text_message(44, "regular second", "regular-2")
+                .with_method(text_method(44, "regular second payload")),
+            false,
+            now + Duration::from_secs(2),
+        );
+
+        let drained = queue.drain_for_shutdown();
+
+        assert_eq!(drained.len(), 3);
+        assert!(!drained.is_empty());
+        assert_eq!(drained.immediate.len(), 1);
+        assert_eq!(drained.regular.len(), 2);
+        assert_eq!(drained.immediate[0].metadata().virtual_id, "immediate-1");
+        assert_eq!(drained.regular[0].metadata().virtual_id, "regular-1");
+        assert_eq!(drained.regular[1].metadata().virtual_id, "regular-2");
+        assert_eq!(
+            drained.immediate[0]
+                .metadata()
+                .added_at
+                .saturating_duration_since(now),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            drained.regular[1]
+                .metadata()
+                .added_at
+                .saturating_duration_since(now),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            drained.immediate[0]
+                .method_kind()
+                .expect("immediate method kind"),
+            TelegramOutboundMethodKind::SendMessage
+        );
+        assert_eq!(
+            drained.regular[1]
+                .method_kind()
+                .expect("regular method kind"),
+            TelegramOutboundMethodKind::SendMessage
+        );
+        assert_eq!(queue.stats_at(now).regular_queue_size, 0);
+        assert_eq!(queue.stats_at(now).immediate_queue_size, 0);
+        assert_eq!(virtual_ids(queue.snapshot()), (vec![], vec![]));
     }
 
     #[test]
