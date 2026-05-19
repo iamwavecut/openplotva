@@ -10,8 +10,8 @@ mod transport;
 pub use dedup::{DEFAULT_DEBOUNCE_CACHE_SIZE, DEFAULT_DEBOUNCE_WINDOW, Debouncer, DebouncerConfig};
 pub use dispatcher::{
     DispatcherConfig, DispatcherMessage, DispatcherQueue, DispatcherQueuedMessage,
-    DispatcherSendStatus, DispatcherStats, DispatcherWorkItem, DispatcherWorkerOutcome,
-    EnqueueOutcome, QueueSnapshot, RegularDequeueOutcome,
+    DispatcherSendStatus, DispatcherStats, DispatcherWorkItem, DispatcherWorkerLoopOutcome,
+    DispatcherWorkerOutcome, EnqueueOutcome, QueueSnapshot, RegularDequeueOutcome,
 };
 pub use html::{
     TELEGRAM_PARSE_MODE_HTML, clean_unicode_non_printables, ensure_telegram_safe_text,
