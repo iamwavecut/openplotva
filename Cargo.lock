@@ -1651,6 +1651,7 @@ name = "openplotva-updates"
 version = "0.1.0"
 dependencies = [
  "carapax",
+ "openplotva-core",
  "redis",
  "serde",
  "serde_json",

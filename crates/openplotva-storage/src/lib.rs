@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use openplotva_config::{PostgresConfig, RedisConfig};
-use openplotva_core::{MessageIdMapping, PendingOp};
+use openplotva_core::{ChatState, MessageIdMapping, PendingOp, UserState};
 use redis::{
     Client as RedisClient, ConnectionAddr, ConnectionInfo, IntoConnectionInfo, RedisConnectionInfo,
 };
@@ -25,6 +25,12 @@ const POSTGRES_MAX_CONNECTION_LIFETIME: Duration = Duration::from_secs(45 * 60);
 /// Go `InsertVirtualMessage` SQL with SQLC name/comment removed.
 pub const SQL_INSERT_VIRTUAL_MESSAGE: &str =
     "INSERT INTO message_id_map (vmsg_id, chat_id, thread_id) VALUES ($1, $2, $3)";
+
+/// Go `UpsertUser` SQL narrowed to the state fields written by the update consumer.
+pub const SQL_UPSERT_USER: &str = "INSERT INTO users (id, first_name, last_name, username, language_code, is_premium, settings) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb) ON CONFLICT (id) DO UPDATE SET first_name = COALESCE(EXCLUDED.first_name, users.first_name), last_name = COALESCE(EXCLUDED.last_name, users.last_name), username = COALESCE(EXCLUDED.username, users.username), language_code = COALESCE(EXCLUDED.language_code, users.language_code), is_premium = COALESCE(EXCLUDED.is_premium, users.is_premium), settings = COALESCE(EXCLUDED.settings, users.settings), updated = CURRENT_TIMESTAMP";
+
+/// Go `UpsertChat` SQL for the full chat row shape, with non-state fields bound as null.
+pub const SQL_UPSERT_CHAT: &str = "INSERT INTO chats (id, type, title, username, first_name, last_name, is_forum, active_usernames, available_reactions, bio, has_private_forwards, has_restricted_voice_and_video_messages, join_to_send_messages, join_by_request, description, invite_link, pinned_message, permissions, slow_mode_delay, message_auto_delete_time, has_aggressive_anti_spam_enabled, has_hidden_members, has_protected_content, has_visible_history, sticker_set_name, can_set_sticker_set, linked_chat_id, location) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb, $10, $11, $12, $13, $14, $15, $16, $17::jsonb, $18::jsonb, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28::jsonb) ON CONFLICT (id) DO UPDATE SET type = COALESCE(EXCLUDED.type, chats.type), title = COALESCE(EXCLUDED.title, chats.title), username = COALESCE(EXCLUDED.username, chats.username), first_name = COALESCE(EXCLUDED.first_name, chats.first_name), last_name = COALESCE(EXCLUDED.last_name, chats.last_name), is_forum = COALESCE(EXCLUDED.is_forum, chats.is_forum), active_usernames = COALESCE(EXCLUDED.active_usernames, chats.active_usernames), available_reactions = COALESCE(EXCLUDED.available_reactions, chats.available_reactions), bio = COALESCE(EXCLUDED.bio, chats.bio), has_private_forwards = COALESCE(EXCLUDED.has_private_forwards, chats.has_private_forwards), has_restricted_voice_and_video_messages = COALESCE(EXCLUDED.has_restricted_voice_and_video_messages, chats.has_restricted_voice_and_video_messages), join_to_send_messages = COALESCE(EXCLUDED.join_to_send_messages, chats.join_to_send_messages), join_by_request = COALESCE(EXCLUDED.join_by_request, chats.join_by_request), description = COALESCE(EXCLUDED.description, chats.description), invite_link = COALESCE(EXCLUDED.invite_link, chats.invite_link), pinned_message = COALESCE(EXCLUDED.pinned_message, chats.pinned_message), permissions = COALESCE(EXCLUDED.permissions, chats.permissions), slow_mode_delay = COALESCE(EXCLUDED.slow_mode_delay, chats.slow_mode_delay), message_auto_delete_time = COALESCE(EXCLUDED.message_auto_delete_time, chats.message_auto_delete_time), has_aggressive_anti_spam_enabled = COALESCE(EXCLUDED.has_aggressive_anti_spam_enabled, chats.has_aggressive_anti_spam_enabled), has_hidden_members = COALESCE(EXCLUDED.has_hidden_members, chats.has_hidden_members), has_protected_content = COALESCE(EXCLUDED.has_protected_content, chats.has_protected_content), has_visible_history = COALESCE(EXCLUDED.has_visible_history, chats.has_visible_history), sticker_set_name = COALESCE(EXCLUDED.sticker_set_name, chats.sticker_set_name), can_set_sticker_set = COALESCE(EXCLUDED.can_set_sticker_set, chats.can_set_sticker_set), linked_chat_id = COALESCE(EXCLUDED.linked_chat_id, chats.linked_chat_id), location = COALESCE(EXCLUDED.location, chats.location), updated = CURRENT_TIMESTAMP";
 
 /// Go `ResolveVirtualMessage` SQL with SQLC name/comment removed.
 pub const SQL_RESOLVE_VIRTUAL_MESSAGE: &str = "UPDATE message_id_map SET real_message_id = $1, resolved_at = COALESCE($2, NOW()) WHERE vmsg_id = $3";
@@ -98,6 +104,57 @@ impl PostgresVirtualMessageStore {
     /// Access the underlying Postgres pool.
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// Upsert user state using Go `UpsertUser` semantics.
+    pub async fn upsert_user_state(&self, user: &UserState) -> Result<(), StorageError> {
+        sqlx::query(SQL_UPSERT_USER)
+            .bind(user.id)
+            .bind(&user.first_name)
+            .bind(user.last_name.as_deref())
+            .bind(user.username.as_deref())
+            .bind(user.language_code.as_deref())
+            .bind(user.is_premium)
+            .bind(Option::<&str>::None)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Upsert chat state using Go `UpsertChat` semantics.
+    pub async fn upsert_chat_state(&self, chat: &ChatState) -> Result<(), StorageError> {
+        sqlx::query(SQL_UPSERT_CHAT)
+            .bind(chat.id)
+            .bind(&chat.chat_type)
+            .bind(chat.title.as_deref())
+            .bind(chat.username.as_deref())
+            .bind(chat.first_name.as_deref())
+            .bind(chat.last_name.as_deref())
+            .bind(chat.is_forum)
+            .bind(Option::<&str>::None)
+            .bind(Option::<&str>::None)
+            .bind(Option::<&str>::None)
+            .bind(Option::<bool>::None)
+            .bind(Option::<bool>::None)
+            .bind(Option::<bool>::None)
+            .bind(Option::<bool>::None)
+            .bind(Option::<&str>::None)
+            .bind(Option::<&str>::None)
+            .bind(Option::<&str>::None)
+            .bind(Option::<&str>::None)
+            .bind(Option::<i64>::None)
+            .bind(Option::<i64>::None)
+            .bind(Option::<bool>::None)
+            .bind(Option::<bool>::None)
+            .bind(Option::<bool>::None)
+            .bind(Option::<bool>::None)
+            .bind(Option::<&str>::None)
+            .bind(Option::<bool>::None)
+            .bind(Option::<i64>::None)
+            .bind(Option::<&str>::None)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     /// Insert a Go `message_id_map` virtual message row.
@@ -482,6 +539,36 @@ mod tests {
         assert_eq!(
             super::SQL_MARK_OP_FAILED,
             "UPDATE message_ops_queue SET attempts = attempts + 1, last_error = $2 WHERE id = $1"
+        );
+    }
+
+    #[test]
+    fn user_and_chat_state_sql_matches_go_query_contracts() {
+        let _user = openplotva_core::UserState {
+            id: 500,
+            first_name: "Carol".to_owned(),
+            last_name: Some(String::new()),
+            username: Some("carol".to_owned()),
+            language_code: Some(" ru ".to_owned()),
+            is_premium: Some(true),
+        };
+        let _chat = openplotva_core::ChatState {
+            id: -300,
+            chat_type: "private".to_owned(),
+            title: Some(" Team ".to_owned()),
+            username: None,
+            first_name: Some("Alice".to_owned()),
+            last_name: None,
+            is_forum: Some(true),
+        };
+
+        assert_eq!(
+            super::SQL_UPSERT_USER,
+            "INSERT INTO users (id, first_name, last_name, username, language_code, is_premium, settings) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb) ON CONFLICT (id) DO UPDATE SET first_name = COALESCE(EXCLUDED.first_name, users.first_name), last_name = COALESCE(EXCLUDED.last_name, users.last_name), username = COALESCE(EXCLUDED.username, users.username), language_code = COALESCE(EXCLUDED.language_code, users.language_code), is_premium = COALESCE(EXCLUDED.is_premium, users.is_premium), settings = COALESCE(EXCLUDED.settings, users.settings), updated = CURRENT_TIMESTAMP"
+        );
+        assert_eq!(
+            super::SQL_UPSERT_CHAT,
+            "INSERT INTO chats (id, type, title, username, first_name, last_name, is_forum, active_usernames, available_reactions, bio, has_private_forwards, has_restricted_voice_and_video_messages, join_to_send_messages, join_by_request, description, invite_link, pinned_message, permissions, slow_mode_delay, message_auto_delete_time, has_aggressive_anti_spam_enabled, has_hidden_members, has_protected_content, has_visible_history, sticker_set_name, can_set_sticker_set, linked_chat_id, location) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb, $10, $11, $12, $13, $14, $15, $16, $17::jsonb, $18::jsonb, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28::jsonb) ON CONFLICT (id) DO UPDATE SET type = COALESCE(EXCLUDED.type, chats.type), title = COALESCE(EXCLUDED.title, chats.title), username = COALESCE(EXCLUDED.username, chats.username), first_name = COALESCE(EXCLUDED.first_name, chats.first_name), last_name = COALESCE(EXCLUDED.last_name, chats.last_name), is_forum = COALESCE(EXCLUDED.is_forum, chats.is_forum), active_usernames = COALESCE(EXCLUDED.active_usernames, chats.active_usernames), available_reactions = COALESCE(EXCLUDED.available_reactions, chats.available_reactions), bio = COALESCE(EXCLUDED.bio, chats.bio), has_private_forwards = COALESCE(EXCLUDED.has_private_forwards, chats.has_private_forwards), has_restricted_voice_and_video_messages = COALESCE(EXCLUDED.has_restricted_voice_and_video_messages, chats.has_restricted_voice_and_video_messages), join_to_send_messages = COALESCE(EXCLUDED.join_to_send_messages, chats.join_to_send_messages), join_by_request = COALESCE(EXCLUDED.join_by_request, chats.join_by_request), description = COALESCE(EXCLUDED.description, chats.description), invite_link = COALESCE(EXCLUDED.invite_link, chats.invite_link), pinned_message = COALESCE(EXCLUDED.pinned_message, chats.pinned_message), permissions = COALESCE(EXCLUDED.permissions, chats.permissions), slow_mode_delay = COALESCE(EXCLUDED.slow_mode_delay, chats.slow_mode_delay), message_auto_delete_time = COALESCE(EXCLUDED.message_auto_delete_time, chats.message_auto_delete_time), has_aggressive_anti_spam_enabled = COALESCE(EXCLUDED.has_aggressive_anti_spam_enabled, chats.has_aggressive_anti_spam_enabled), has_hidden_members = COALESCE(EXCLUDED.has_hidden_members, chats.has_hidden_members), has_protected_content = COALESCE(EXCLUDED.has_protected_content, chats.has_protected_content), has_visible_history = COALESCE(EXCLUDED.has_visible_history, chats.has_visible_history), sticker_set_name = COALESCE(EXCLUDED.sticker_set_name, chats.sticker_set_name), can_set_sticker_set = COALESCE(EXCLUDED.can_set_sticker_set, chats.can_set_sticker_set), linked_chat_id = COALESCE(EXCLUDED.linked_chat_id, chats.linked_chat_id), location = COALESCE(EXCLUDED.location, chats.location), updated = CURRENT_TIMESTAMP"
         );
     }
 

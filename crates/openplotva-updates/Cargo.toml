@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 carapax.workspace = true
+openplotva-core = { path = "../openplotva-core" }
 redis = { workspace = true, features = ["tokio-comp"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true

@@ -8,8 +8,10 @@ use std::{
 };
 
 use carapax::types::{
-    MaybeInaccessibleMessage, Update as TelegramUpdate, UpdateType as TelegramUpdateType,
+    Chat as TelegramChat, MaybeInaccessibleMessage, PollAnswerVoter, Update as TelegramUpdate,
+    UpdateType as TelegramUpdateType, User as TelegramUser,
 };
+use openplotva_core::{ChatState, UpdateState, UserState};
 use redis::Client as RedisClient;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -399,6 +401,17 @@ pub fn update_name(update: &TelegramUpdate) -> &'static str {
     }
 }
 
+/// Extract the chat/user state Go persists before update side effects.
+pub fn extract_update_state(update: &TelegramUpdate) -> Option<UpdateState> {
+    if matches!(update.update_type, TelegramUpdateType::GuestMessage(_)) {
+        return None;
+    }
+
+    let chat = extract_update_chat(update).map(chat_state);
+    let user = update.get_user().map(user_state);
+    UpdateState::new(chat, user)
+}
+
 /// Return whether Go would skip user-visible side effects for this update age.
 pub fn should_skip_side_effects_at(
     update: &TelegramUpdate,
@@ -410,6 +423,68 @@ pub fn should_skip_side_effects_at(
     };
     let now_secs = unix_timestamp_seconds(now);
     i128::from(update_date) + i128::from(max_age.as_secs()) <= now_secs
+}
+
+fn extract_update_chat(update: &TelegramUpdate) -> Option<&TelegramChat> {
+    update.get_chat().or(match &update.update_type {
+        TelegramUpdateType::PollAnswer(answer) => match &answer.voter {
+            PollAnswerVoter::Chat(chat) => Some(chat),
+            PollAnswerVoter::User(_) => None,
+        },
+        _ => None,
+    })
+}
+
+fn chat_state(chat: &TelegramChat) -> ChatState {
+    match chat {
+        TelegramChat::Channel(chat) => ChatState::new(
+            chat.id.into(),
+            "channel",
+            Some(chat.title.clone()),
+            chat.username.clone().map(String::from),
+            None,
+            None,
+            None,
+        ),
+        TelegramChat::Group(chat) => ChatState::new(
+            chat.id.into(),
+            "group",
+            Some(chat.title.clone()),
+            None,
+            None,
+            None,
+            None,
+        ),
+        TelegramChat::Private(chat) => ChatState::new(
+            chat.id.into(),
+            "private",
+            None,
+            chat.username.clone().map(String::from),
+            Some(chat.first_name.clone()),
+            chat.last_name.clone(),
+            None,
+        ),
+        TelegramChat::Supergroup(chat) => ChatState::new(
+            chat.id.into(),
+            "supergroup",
+            Some(chat.title.clone()),
+            chat.username.clone().map(String::from),
+            None,
+            None,
+            chat.is_forum,
+        ),
+    }
+}
+
+fn user_state(user: &TelegramUser) -> UserState {
+    UserState::new(
+        user.id.into(),
+        user.first_name.clone(),
+        user.last_name.clone(),
+        user.username.clone().map(String::from),
+        user.language_code.clone(),
+        Some(user.is_premium.unwrap_or(false)),
+    )
 }
 
 async fn run_stage<Fut, E>(stage: UpdateStage, timeout: Duration, task: Fut) -> UpdateStageReport
@@ -528,8 +603,8 @@ mod tests {
 
     use super::{
         DEFAULT_UPDATE_QUEUE_KEY, EncodedUpdate, RedisUpdateQueue, UpdateCodecError,
-        UpdateConsumerConfig, UpdateStageOutcome, blpop_timeout_arg, process_update_at,
-        update_name,
+        UpdateConsumerConfig, UpdateStageOutcome, blpop_timeout_arg, extract_update_state,
+        process_update_at, update_name,
     };
     use carapax::types::Update as TelegramUpdate;
 
@@ -652,6 +727,100 @@ mod tests {
                 }
             }))?),
             "unknown"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn extract_update_state_matches_go_message_chat_user_params() -> Result<(), Box<dyn Error>> {
+        let state = extract_update_state(&sample_message_update()?)
+            .ok_or_else(|| io::Error::other("message update should produce chat and user state"))?;
+
+        assert_eq!(
+            state.chat,
+            Some(openplotva_core::ChatState {
+                id: 42,
+                chat_type: "private".to_owned(),
+                title: None,
+                username: Some("ada_l".to_owned()),
+                first_name: Some("Ada".to_owned()),
+                last_name: None,
+                is_forum: None,
+            })
+        );
+        assert_eq!(
+            state.user,
+            Some(openplotva_core::UserState {
+                id: 99,
+                first_name: "Ada".to_owned(),
+                last_name: None,
+                username: Some("ada_l".to_owned()),
+                language_code: None,
+                is_premium: Some(false),
+            })
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn extract_update_state_keeps_go_guest_message_identity_empty() -> Result<(), Box<dyn Error>> {
+        let update = serde_json::from_value(json!({
+            "update_id": 123,
+            "guest_message": {
+                "message_id": 55,
+                "date": 1_710_000_000,
+                "chat": {
+                    "id": -100,
+                    "type": "supergroup",
+                    "title": "Team",
+                    "is_forum": true
+                },
+                "guest_query_id": "guest-query",
+                "text": "hello"
+            }
+        }))?;
+
+        assert_eq!(update_name(&update), "guest_message");
+        assert_eq!(extract_update_state(&update), None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn extract_update_state_preserves_go_supergroup_chat_fields() -> Result<(), Box<dyn Error>> {
+        let update = serde_json::from_value(json!({
+            "update_id": 124,
+            "message": {
+                "message_id": 56,
+                "date": 1_710_000_000,
+                "chat": {
+                    "id": -100,
+                    "type": "supergroup",
+                    "title": " Team ",
+                    "username": "team_chat",
+                    "is_forum": true
+                },
+                "from": sample_user_json(),
+                "text": "hello"
+            }
+        }))?;
+
+        let state = extract_update_state(&update)
+            .ok_or_else(|| io::Error::other("supergroup message should produce state"))?;
+
+        assert_eq!(
+            state.chat,
+            Some(openplotva_core::ChatState {
+                id: -100,
+                chat_type: "supergroup".to_owned(),
+                title: Some(" Team ".to_owned()),
+                username: Some("team_chat".to_owned()),
+                first_name: None,
+                last_name: None,
+                is_forum: Some(true),
+            })
         );
 
         Ok(())
