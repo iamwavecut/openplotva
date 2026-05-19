@@ -1,4 +1,6 @@
 
+use serde::Deserialize;
+
 /// Public project name used in diagnostics and health responses.
 pub const PROJECT_NAME: &str = "openplotva";
 
@@ -85,4 +87,42 @@ pub struct ReadyPendingOp {
     pub payload: Vec<u8>,
     /// Real Telegram message ID from `message_id_map`.
     pub real_message_id: i32,
+}
+
+/// Decoded Go pending edit payload.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+pub struct PendingEditPayload {
+    /// Edited text.
+    #[serde(default)]
+    pub text: String,
+    /// Telegram parse mode, such as `HTML`.
+    #[serde(default)]
+    pub parse_mode: String,
+}
+
+/// Decode Go's pending edit payload, returning zero-values on malformed JSON.
+pub fn pending_edit_payload(payload: &[u8]) -> PendingEditPayload {
+    serde_json::from_slice(payload).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PendingEditPayload, pending_edit_payload};
+
+    #[test]
+    fn pending_edit_payload_decodes_text_and_parse_mode_like_go() {
+        let payload = br#"{"text":"<b>edited</b>","parse_mode":"HTML"}"#;
+
+        assert_eq!(
+            pending_edit_payload(payload),
+            PendingEditPayload {
+                text: "<b>edited</b>".to_owned(),
+                parse_mode: "HTML".to_owned(),
+            }
+        );
+        assert_eq!(
+            pending_edit_payload(b"not-json"),
+            PendingEditPayload::default()
+        );
+    }
 }

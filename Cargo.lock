@@ -1532,6 +1532,10 @@ dependencies = [
 [[package]]
 name = "openplotva-core"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "openplotva-dialog"
@@ -1575,7 +1579,6 @@ dependencies = [
  "axum",
  "openplotva-core",
  "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -1609,6 +1612,7 @@ dependencies = [
  "carapax",
  "crc",
  "html5ever",
+ "openplotva-core",
  "redis",
  "serde",
  "serde_json",

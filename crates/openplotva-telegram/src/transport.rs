@@ -1,8 +1,8 @@
 use carapax::{
     api::{Client, ExecuteError},
     types::{
-        EditMessageMedia, EditMessageResult, EditMessageText, Message, SendAudio, SendMediaGroup,
-        SendMessage, SendPhoto, SendSticker,
+        DeleteMessage, EditMessageMedia, EditMessageResult, EditMessageText, Message, SendAudio,
+        SendMediaGroup, SendMessage, SendPhoto, SendSticker,
     },
 };
 
@@ -25,6 +25,8 @@ pub enum TelegramOutboundMethod {
     EditMessageText(Box<EditMessageText>),
     /// Telegram `editMessageMedia`.
     EditMessageMedia(Box<EditMessageMedia>),
+    /// Telegram `deleteMessage`.
+    DeleteMessage(Box<DeleteMessage>),
 }
 
 /// Stable method discriminator for tests, metrics, and future persistence metadata.
@@ -44,6 +46,8 @@ pub enum TelegramOutboundMethodKind {
     EditMessageText,
     /// Telegram `editMessageMedia`.
     EditMessageMedia,
+    /// Telegram `deleteMessage`.
+    DeleteMessage,
 }
 
 /// Response shape returned by a concrete Telegram outbound method.
@@ -55,6 +59,8 @@ pub enum TelegramOutboundResponseKind {
     Messages,
     /// Telegram edit methods returning either a message or `true`.
     EditMessage,
+    /// Methods returning a boolean success flag.
+    Boolean,
 }
 
 /// Concrete successful response from executing an outbound Telegram method.
@@ -66,6 +72,8 @@ pub enum TelegramOutboundResponse {
     Messages(Vec<Message>),
     /// Edit result from `editMessage*`.
     EditMessage(EditMessageResult),
+    /// Boolean success flag.
+    Boolean(bool),
 }
 
 impl TelegramOutboundMethod {
@@ -79,6 +87,7 @@ impl TelegramOutboundMethod {
             Self::SendMediaGroup(_) => TelegramOutboundMethodKind::SendMediaGroup,
             Self::EditMessageText(_) => TelegramOutboundMethodKind::EditMessageText,
             Self::EditMessageMedia(_) => TelegramOutboundMethodKind::EditMessageMedia,
+            Self::DeleteMessage(_) => TelegramOutboundMethodKind::DeleteMessage,
         }
     }
 
@@ -92,6 +101,7 @@ impl TelegramOutboundMethod {
             Self::SendMediaGroup(_) => "sendMediaGroup",
             Self::EditMessageText(_) => "editMessageText",
             Self::EditMessageMedia(_) => "editMessageMedia",
+            Self::DeleteMessage(_) => "deleteMessage",
         }
     }
 
@@ -106,6 +116,7 @@ impl TelegramOutboundMethod {
             Self::EditMessageText(_) | Self::EditMessageMedia(_) => {
                 TelegramOutboundResponseKind::EditMessage
             }
+            Self::DeleteMessage(_) => TelegramOutboundResponseKind::Boolean,
         }
     }
 
@@ -152,6 +163,10 @@ pub async fn execute_telegram_method(
             .execute(*method)
             .await
             .map(TelegramOutboundResponse::EditMessage),
+        TelegramOutboundMethod::DeleteMessage(method) => client
+            .execute(*method)
+            .await
+            .map(TelegramOutboundResponse::Boolean),
     }
 }
 
@@ -205,6 +220,12 @@ impl From<EditMessageText> for TelegramOutboundMethod {
 impl From<EditMessageMedia> for TelegramOutboundMethod {
     fn from(value: EditMessageMedia) -> Self {
         Self::EditMessageMedia(Box::new(value))
+    }
+}
+
+impl From<DeleteMessage> for TelegramOutboundMethod {
+    fn from(value: DeleteMessage) -> Self {
+        Self::DeleteMessage(Box::new(value))
     }
 }
 
@@ -321,6 +342,8 @@ mod tests {
             })
             .expect("edit media method"),
         );
+        let delete_message =
+            TelegramOutboundMethod::from(carapax::types::DeleteMessage::new(42, 7));
 
         let cases = [
             (
@@ -364,6 +387,12 @@ mod tests {
                 TelegramOutboundMethodKind::EditMessageMedia,
                 "editMessageMedia",
                 TelegramOutboundResponseKind::EditMessage,
+            ),
+            (
+                delete_message,
+                TelegramOutboundMethodKind::DeleteMessage,
+                "deleteMessage",
+                TelegramOutboundResponseKind::Boolean,
             ),
         ];
 

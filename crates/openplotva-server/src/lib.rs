@@ -6,8 +6,10 @@ use std::{
 };
 
 use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
-pub use openplotva_core::{MessageIdMapping, PendingOp, ReadyPendingOp};
-use serde::{Deserialize, Serialize};
+pub use openplotva_core::{
+    MessageIdMapping, PendingEditPayload, PendingOp, ReadyPendingOp, pending_edit_payload,
+};
+use serde::Serialize;
 
 /// Health response returned by `/api/health`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -63,17 +65,6 @@ pub const ACTION_SEND_MESSAGE: &str = "send_message";
 pub const ACTION_PIN_MESSAGE: &str = "pin_message";
 /// Go permission action for editing messages.
 pub const ACTION_EDIT_MESSAGE: &str = "edit_message";
-
-/// Decoded Go pending edit payload.
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
-pub struct PendingEditPayload {
-    /// Edited text.
-    #[serde(default)]
-    pub text: String,
-    /// Telegram parse mode, such as `HTML`.
-    #[serde(default)]
-    pub parse_mode: String,
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PendingOpMappingError {
@@ -170,11 +161,6 @@ pub fn pending_ops_ready_for_execution(
             })
         })
         .collect()
-}
-
-/// Decode Go's pending edit payload, returning zero-values on malformed JSON.
-pub fn pending_edit_payload(payload: &[u8]) -> PendingEditPayload {
-    serde_json::from_slice(payload).unwrap_or_default()
 }
 
 #[derive(Clone, Debug)]

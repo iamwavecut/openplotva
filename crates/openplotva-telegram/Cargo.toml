@@ -12,6 +12,7 @@ base64.workspace = true
 carapax.workspace = true
 crc.workspace = true
 html5ever.workspace = true
+openplotva-core = { path = "../openplotva-core" }
 redis = { workspace = true, features = ["tokio-comp"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true

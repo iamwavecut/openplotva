@@ -4,10 +4,10 @@ use std::{borrow::Cow, fmt, io::Cursor};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use carapax::types::{
-    EditMessageMedia, EditMessageText, InlineKeyboardMarkup, InputFile, InputFileReader,
-    InputMedia, InputMediaError, InputMediaPhoto, MediaGroup, MediaGroupError, MediaGroupItem,
-    ParseMode, ReplyMarkup, ReplyParameters, ReplyParametersError, SendAudio, SendMediaGroup,
-    SendMessage, SendPhoto, SendSticker,
+    DeleteMessage, EditMessageMedia, EditMessageText, InlineKeyboardMarkup, InputFile,
+    InputFileReader, InputMedia, InputMediaError, InputMediaPhoto, MediaGroup, MediaGroupError,
+    MediaGroupItem, ParseMode, ReplyMarkup, ReplyParameters, ReplyParametersError, SendAudio,
+    SendMediaGroup, SendMessage, SendPhoto, SendSticker,
 };
 use crc::{CRC_32_ISCSI, Crc};
 use serde_json::{Map, Value, json};
@@ -110,6 +110,15 @@ pub struct EditTextMessageRequest {
     pub render_as: String,
     /// Go edit path only applies inline keyboard markup.
     pub reply_markup: Option<InlineKeyboardMarkup>,
+}
+
+/// Delete request fields used by Go `api.NewDeleteMessage` call sites.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeleteMessageRequest {
+    /// Target chat ID.
+    pub chat_id: i64,
+    /// Message ID to delete.
+    pub message_id: i64,
 }
 
 /// Sticker send request fields used by the Go `StickerMessage` builder.
@@ -430,6 +439,16 @@ pub fn build_edit_text_message_method(
         method = method.with_reply_markup(markup);
     }
     Ok(method)
+}
+
+/// Build an outbound `deleteMessage` method.
+pub fn build_delete_message_method(
+    req: &DeleteMessageRequest,
+) -> Result<DeleteMessage, OutboundBuildError> {
+    if req.message_id == 0 {
+        return Err(OutboundBuildError::MessageIdRequired);
+    }
+    Ok(DeleteMessage::new(req.chat_id, req.message_id))
 }
 
 /// Build an outbound `sendSticker` method.
@@ -1099,12 +1118,13 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        AudioMessagePlan, AudioMessageRequest, AudioSource, ChatRef, EditMediaMessagePlan,
-        EditMediaMessageRequest, EditTextMessageRequest, MESSAGE_TYPE_TEXT, MediaGroupMessagePlan,
-        MediaGroupMessageRequest, MediaGroupPhotoItem, MessageFingerprint, OutboundBuildError,
-        PhotoMessagePlan, PhotoMessageRequest, PhotoSource, ReplyMessageRef, ReplyParametersPlan,
-        StickerMessagePlan, StickerMessageRequest, TextMessageRequest, allow_sending_without_reply,
-        build_audio_message_method, build_audio_message_plan, build_edit_media_message_method,
+        AudioMessagePlan, AudioMessageRequest, AudioSource, ChatRef, DeleteMessageRequest,
+        EditMediaMessagePlan, EditMediaMessageRequest, EditTextMessageRequest, MESSAGE_TYPE_TEXT,
+        MediaGroupMessagePlan, MediaGroupMessageRequest, MediaGroupPhotoItem, MessageFingerprint,
+        OutboundBuildError, PhotoMessagePlan, PhotoMessageRequest, PhotoSource, ReplyMessageRef,
+        ReplyParametersPlan, StickerMessagePlan, StickerMessageRequest, TextMessageRequest,
+        allow_sending_without_reply, build_audio_message_method, build_audio_message_plan,
+        build_delete_message_method, build_edit_media_message_method,
         build_edit_media_message_plan, build_edit_text_message_method,
         build_media_group_message_method, build_media_group_message_plan,
         build_photo_message_method, build_photo_message_plan, build_sticker_message_method,
@@ -1989,6 +2009,33 @@ mod tests {
 
         assert_eq!(
             build_edit_text_message_method(&req).err(),
+            Some(OutboundBuildError::MessageIdRequired)
+        );
+    }
+
+    #[test]
+    fn build_delete_message_method_builds_carapax_method() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let method = build_delete_message_method(&DeleteMessageRequest {
+            chat_id: 42,
+            message_id: 77,
+        })?;
+        let payload = serde_json::to_value(method)?;
+
+        assert_eq!(payload["chat_id"], json!(42));
+        assert_eq!(payload["message_id"], json!(77));
+
+        Ok(())
+    }
+
+    #[test]
+    fn build_delete_message_method_requires_message_id() {
+        assert_eq!(
+            build_delete_message_method(&DeleteMessageRequest {
+                chat_id: 42,
+                message_id: 0,
+            })
+            .err(),
             Some(OutboundBuildError::MessageIdRequired)
         );
     }

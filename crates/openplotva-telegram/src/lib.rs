@@ -4,6 +4,7 @@ mod dedup;
 mod dispatcher;
 mod html;
 mod outbound;
+mod pending_ops;
 mod persistence;
 mod rate_limit;
 mod transport;
@@ -22,18 +23,22 @@ pub use html::{
     sanitize_telegram_html, split_telegram_text, strip_telegram_html,
 };
 pub use outbound::{
-    AudioMessagePlan, AudioMessageRequest, AudioSource, ChatRef, EditMediaMessagePlan,
-    EditMediaMessageRequest, EditTextMessageRequest, MESSAGE_TYPE_TEXT, MediaGroupMessagePlan,
-    MediaGroupMessageRequest, MediaGroupPhotoItem, MessageFingerprint, OutboundBuildError,
-    PhotoMessagePlan, PhotoMessageRequest, PhotoSource, ReplyMessageRef, ReplyParametersPlan,
-    StickerMessagePlan, StickerMessageRequest, TELEGRAM_TEXT_MAX_BYTES, TextMessageRequest,
-    allow_sending_without_reply, build_audio_message_method, build_audio_message_plan,
-    build_edit_media_message_method, build_edit_media_message_plan, build_edit_text_message_method,
+    AudioMessagePlan, AudioMessageRequest, AudioSource, ChatRef, DeleteMessageRequest,
+    EditMediaMessagePlan, EditMediaMessageRequest, EditTextMessageRequest, MESSAGE_TYPE_TEXT,
+    MediaGroupMessagePlan, MediaGroupMessageRequest, MediaGroupPhotoItem, MessageFingerprint,
+    OutboundBuildError, PhotoMessagePlan, PhotoMessageRequest, PhotoSource, ReplyMessageRef,
+    ReplyParametersPlan, StickerMessagePlan, StickerMessageRequest, TELEGRAM_TEXT_MAX_BYTES,
+    TextMessageRequest, allow_sending_without_reply, build_audio_message_method,
+    build_audio_message_plan, build_delete_message_method, build_edit_media_message_method,
+    build_edit_media_message_plan, build_edit_text_message_method,
     build_media_group_message_method, build_media_group_message_plan, build_photo_message_method,
     build_photo_message_plan, build_sticker_message_method, build_sticker_message_plan,
     build_text_message_method, build_text_message_methods, fingerprint_audio_message_plan,
     fingerprint_photo_message_plan, fingerprint_sticker_message_plan, forum_thread_id,
     hash_content, message_target_chat, parse_mode_from_go, validate_text_message_text,
+};
+pub use pending_ops::{
+    PENDING_OP_DELETE, PENDING_OP_EDIT, PendingOpBuildError, build_pending_op_method,
 };
 pub use persistence::{
     DEFAULT_DISPATCHER_QUEUE_KEY, DEFAULT_DISPATCHER_SHUTDOWN_TIMEOUT, DispatcherPersistenceError,
@@ -95,6 +100,9 @@ pub type EditMessageText = carapax::types::EditMessageText;
 
 /// Telegram editMessageMedia method from `carapax`.
 pub type EditMessageMedia = carapax::types::EditMessageMedia;
+
+/// Telegram deleteMessage method from `carapax`.
+pub type DeleteMessage = carapax::types::DeleteMessage;
 
 /// Telegram reply markup type from `carapax`.
 pub type ReplyMarkup = carapax::types::ReplyMarkup;

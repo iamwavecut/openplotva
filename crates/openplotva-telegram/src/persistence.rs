@@ -1,7 +1,7 @@
 use std::time::{Duration, SystemTime};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use carapax::types::{EditMessageText, ReplyMarkup, ReplyParameters, SendMessage};
+use carapax::types::{DeleteMessage, EditMessageText, ReplyMarkup, ReplyParameters, SendMessage};
 use redis::Client as RedisClient;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -338,6 +338,7 @@ fn replay_method_from_value(
         TelegramOutboundMethodKind::SendMediaGroup => replay_media_group_method(value),
         TelegramOutboundMethodKind::EditMessageText => replay_edit_text_method(value),
         TelegramOutboundMethodKind::EditMessageMedia => replay_edit_media_method(value),
+        TelegramOutboundMethodKind::DeleteMessage => replay_delete_method(value),
     }
 }
 
@@ -380,6 +381,14 @@ fn replay_edit_text_method(value: &Value) -> Option<TelegramOutboundMethod> {
         method = method.with_parse_mode(parse_mode);
     }
     Some(TelegramOutboundMethod::from(method))
+}
+
+fn replay_delete_method(value: &Value) -> Option<TelegramOutboundMethod> {
+    let chat_id = field_i64(value, &["ChatID", "chat_id"])?;
+    let message_id = field_i64(value, &["MessageID", "message_id"])?;
+    Some(TelegramOutboundMethod::from(DeleteMessage::new(
+        chat_id, message_id,
+    )))
 }
 
 fn replay_sticker_method(value: &Value) -> Option<TelegramOutboundMethod> {
@@ -495,7 +504,8 @@ fn fingerprint_from_value(
             debounce_key: None,
         },
         TelegramOutboundMethodKind::EditMessageText
-        | TelegramOutboundMethodKind::EditMessageMedia => MessageFingerprint {
+        | TelegramOutboundMethodKind::EditMessageMedia
+        | TelegramOutboundMethodKind::DeleteMessage => MessageFingerprint {
             chat_id,
             message_type: "unknown".to_owned(),
             content_hash: hash_content(&value.to_string()),
@@ -783,7 +793,8 @@ fn serialize_outbound_method(
         | TelegramOutboundMethod::SendPhoto(_)
         | TelegramOutboundMethod::SendAudio(_)
         | TelegramOutboundMethod::SendMediaGroup(_)
-        | TelegramOutboundMethod::EditMessageMedia(_) => Ok(None),
+        | TelegramOutboundMethod::EditMessageMedia(_)
+        | TelegramOutboundMethod::DeleteMessage(_) => Ok(None),
     }
 }
 
@@ -796,6 +807,7 @@ fn go_message_type(kind: TelegramOutboundMethodKind) -> &'static str {
         TelegramOutboundMethodKind::SendMediaGroup => "*api.MediaGroupConfig",
         TelegramOutboundMethodKind::EditMessageText => "*api.EditMessageTextConfig",
         TelegramOutboundMethodKind::EditMessageMedia => "*api.EditMessageMediaConfig",
+        TelegramOutboundMethodKind::DeleteMessage => "*api.DeleteMessageConfig",
     }
 }
 
@@ -827,6 +839,10 @@ fn message_type_method_kind(message_type: &str) -> Option<TelegramOutboundMethod
         "*api.EditMessageMediaConfig" | "api.EditMessageMediaConfig" => {
             Some(TelegramOutboundMethodKind::EditMessageMedia)
         }
+        "*tgbotapi.DeleteMessageConfig"
+        | "*api.DeleteMessageConfig"
+        | "tgbotapi.DeleteMessageConfig"
+        | "api.DeleteMessageConfig" => Some(TelegramOutboundMethodKind::DeleteMessage),
         _ => None,
     }
 }
@@ -1136,6 +1152,39 @@ mod tests {
             payload.expect("sticker payload preserved").message_type,
             "*api.StickerConfig"
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn replay_reconstructs_delete_message_configs_when_present()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let persisted = vec![PersistentDispatcherItem {
+            message: br#"{"ChatID":42,"MessageID":77}"#.to_vec(),
+            message_type: "*api.DeleteMessageConfig".to_owned(),
+            immediate: true,
+            enqueued_at: "2026-05-19T17:00:01Z".to_owned(),
+            fingerprint: "delete".to_owned(),
+            chat_id: 42,
+            virtual_id: "delete-vmsg".to_owned(),
+        }];
+        let raw = serde_json::to_vec(&persisted)?;
+
+        let replay = persistent_queue_replay_from_json(&raw)?;
+
+        assert_eq!(replay.skipped, 0);
+        assert_eq!(replay.items.len(), 1);
+        assert_eq!(
+            replay.items[0].method.kind(),
+            TelegramOutboundMethodKind::DeleteMessage
+        );
+        let TelegramOutboundMethod::DeleteMessage(method) = &replay.items[0].method else {
+            panic!("expected deleteMessage method");
+        };
+        let payload = serde_json::to_value(method.as_ref())?;
+
+        assert_eq!(payload["chat_id"], json!(42));
+        assert_eq!(payload["message_id"], json!(77));
 
         Ok(())
     }
