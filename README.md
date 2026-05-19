@@ -133,7 +133,9 @@ Current approved deviation: Redis/runtime payload codecs do not preserve Go
 `encoding/gob` bit layouts. The Rust implementation keeps the Go keys, ordering, and
 lifecycle semantics, but stores Rust-native serde payloads: Telegram updates use
 zstd-compressed serde JSON envelopes over `carapax::types::Update`, and
-dispatcher shutdown snapshots store persistent-item JSON directly.
+dispatcher shutdown snapshots store persistent-item JSON directly. Persisted
+chat rate-limit expiries use JSON timestamp values under the original
+`plotva:rate_limited_chat:*` keys.
 
 ## Migrations
 
