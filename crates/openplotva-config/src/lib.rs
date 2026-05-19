@@ -68,6 +68,9 @@ pub const DEFAULT_RUN_MIGRATIONS: bool = false;
 /// Go default for `BOT_DEBUG`.
 pub const DEFAULT_BOT_DEBUG: bool = false;
 
+/// Go default for `BOT_WEBHOOK_ENABLED`.
+pub const DEFAULT_BOT_WEBHOOK_ENABLED: bool = false;
+
 /// Top-level application configuration.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -163,7 +166,23 @@ pub struct RedisConfig {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BotConfig {
     pub key: Option<String>,
+    pub webhook: BotWebhookConfig,
     pub debug: bool,
+}
+
+/// Telegram webhook configuration.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BotWebhookConfig {
+    /// Whether Telegram webhook mode is enabled, from `BOT_WEBHOOK_ENABLED`.
+    pub enabled: bool,
+    /// Public webhook URL, from `BOT_WEBHOOK_URL`.
+    pub url: String,
+    /// Certificate file path, from `BOT_WEBHOOK_CERT_FILE`.
+    pub cert_file: String,
+    /// Key file path, from `BOT_WEBHOOK_KEY_FILE`.
+    pub key_file: String,
+    /// Secret-token header value, from `BOT_WEBHOOK_SECRET_TOKEN`.
+    pub secret_token: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -220,6 +239,16 @@ pub struct RawConfig {
     pub redis_db: Option<String>,
     /// `BOT_KEY`.
     pub bot_key: Option<String>,
+    /// `BOT_WEBHOOK_ENABLED`.
+    pub bot_webhook_enabled: Option<String>,
+    /// `BOT_WEBHOOK_URL`.
+    pub bot_webhook_url: Option<String>,
+    /// `BOT_WEBHOOK_CERT_FILE`.
+    pub bot_webhook_cert_file: Option<String>,
+    /// `BOT_WEBHOOK_KEY_FILE`.
+    pub bot_webhook_key_file: Option<String>,
+    /// `BOT_WEBHOOK_SECRET_TOKEN`.
+    pub bot_webhook_secret_token: Option<String>,
     /// `BOT_DEBUG`.
     pub bot_debug: Option<String>,
     /// `OPENPLOTVA_REFERENCE_SOURCE_REPOSITORY`.
@@ -362,6 +391,17 @@ impl AppConfig {
             },
             bot: BotConfig {
                 key: raw.bot_key.filter(|value| !value.is_empty()),
+                webhook: BotWebhookConfig {
+                    enabled: parse_bool(
+                        "BOT_WEBHOOK_ENABLED",
+                        raw.bot_webhook_enabled,
+                        DEFAULT_BOT_WEBHOOK_ENABLED,
+                    )?,
+                    url: raw.bot_webhook_url.unwrap_or_default(),
+                    cert_file: raw.bot_webhook_cert_file.unwrap_or_default(),
+                    key_file: raw.bot_webhook_key_file.unwrap_or_default(),
+                    secret_token: raw.bot_webhook_secret_token.unwrap_or_default(),
+                },
                 debug: parse_bool("BOT_DEBUG", raw.bot_debug, DEFAULT_BOT_DEBUG)?,
             },
             reference_snapshot: ReferenceSnapshotConfig {
@@ -416,6 +456,11 @@ impl RawConfig {
             redis_password: env("REDIS_PASSWORD"),
             redis_db: env("REDIS_DB"),
             bot_key: env("BOT_KEY"),
+            bot_webhook_enabled: env("BOT_WEBHOOK_ENABLED"),
+            bot_webhook_url: env("BOT_WEBHOOK_URL"),
+            bot_webhook_cert_file: env("BOT_WEBHOOK_CERT_FILE"),
+            bot_webhook_key_file: env("BOT_WEBHOOK_KEY_FILE"),
+            bot_webhook_secret_token: env("BOT_WEBHOOK_SECRET_TOKEN"),
             bot_debug: env("BOT_DEBUG"),
             openplotva_reference_source_repository: env("OPENPLOTVA_REFERENCE_SOURCE_REPOSITORY"),
             openplotva_reference_snapshot_path: env("OPENPLOTVA_RUNTIME_CONTRACT_PATH"),
@@ -512,6 +557,11 @@ mod tests {
         assert_eq!(config.redis.db, 0);
         assert_eq!(config.bot.key, None);
         assert!(!config.bot.debug);
+        assert!(!config.bot.webhook.enabled);
+        assert_eq!(config.bot.webhook.url, "");
+        assert_eq!(config.bot.webhook.cert_file, "");
+        assert_eq!(config.bot.webhook.key_file, "");
+        assert_eq!(config.bot.webhook.secret_token, "");
         assert_eq!(
             config.reference_snapshot.repository.to_string_lossy(),
             DEFAULT_REFERENCE_SOURCE_REPOSITORY
@@ -579,11 +629,24 @@ mod tests {
         let config = AppConfig::from_raw(RawConfig {
             bot_key: Some("123:secret".to_owned()),
             bot_debug: Some("true".to_owned()),
+            bot_webhook_enabled: Some("true".to_owned()),
+            bot_webhook_url: Some("https://example.test/telegram/webhook".to_owned()),
+            bot_webhook_cert_file: Some("/cert.pem".to_owned()),
+            bot_webhook_key_file: Some("/key.pem".to_owned()),
+            bot_webhook_secret_token: Some("webhook-secret".to_owned()),
             ..RawConfig::default()
         })?;
 
         assert_eq!(config.bot.key.as_deref(), Some("123:secret"));
         assert!(config.bot.debug);
+        assert!(config.bot.webhook.enabled);
+        assert_eq!(
+            config.bot.webhook.url,
+            "https://example.test/telegram/webhook"
+        );
+        assert_eq!(config.bot.webhook.cert_file, "/cert.pem");
+        assert_eq!(config.bot.webhook.key_file, "/key.pem");
+        assert_eq!(config.bot.webhook.secret_token, "webhook-secret");
 
         Ok(())
     }

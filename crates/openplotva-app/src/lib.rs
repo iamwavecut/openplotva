@@ -8,6 +8,13 @@ pub mod virtual_messages;
 use std::{fmt, future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use anyhow::Context as _;
+use axum::{
+    body::Bytes,
+    extract::Extension,
+    http::{HeaderMap, Method, StatusCode},
+    response::{IntoResponse, Response},
+    routing::any,
+};
 use openplotva_config::AppConfig;
 use openplotva_server::{ReadinessCheck, ReadinessResponse};
 use openplotva_storage::{PostgresVirtualMessageStore, ServiceClients};
@@ -23,6 +30,7 @@ struct RuntimeWorkers {
     handles: Vec<JoinHandle<()>>,
     stop: Option<watch::Sender<bool>>,
     dispatcher: Option<DispatcherRuntime>,
+    webhook_route: Option<TelegramWebhookRoute>,
 }
 
 struct DispatcherRuntime {
@@ -32,6 +40,9 @@ struct DispatcherRuntime {
 
 /// Boxed future returned by Telegram startup method executors.
 pub type DeleteWebhookFuture<'a, E> = Pin<Box<dyn Future<Output = Result<(), E>> + Send + 'a>>;
+
+/// Boxed future returned by Telegram webhook setup executors.
+pub type SetWebhookFuture<'a, E> = Pin<Box<dyn Future<Output = Result<(), E>> + Send + 'a>>;
 
 /// Boxed future returned by Telegram bot command setup executors.
 pub type BotCommandSetupFuture<'a, E> = Pin<Box<dyn Future<Output = Result<(), E>> + Send + 'a>>;
@@ -54,6 +65,29 @@ impl DeleteWebhookExecutor for openplotva_telegram::TelegramClient {
                 .await
                 .map(|_: bool| ())
         })
+    }
+}
+
+/// Minimal Telegram startup capability needed before webhook update intake.
+pub trait SetWebhookExecutor {
+    /// Error returned by the concrete Telegram client.
+    type Error: fmt::Display + Send;
+
+    /// Execute Go's startup `setWebhook` request.
+    fn set_webhook<'a>(
+        &'a self,
+        method: openplotva_telegram::SetWebhook,
+    ) -> SetWebhookFuture<'a, Self::Error>;
+}
+
+impl SetWebhookExecutor for openplotva_telegram::TelegramClient {
+    type Error = carapax::api::ExecuteError;
+
+    fn set_webhook<'a>(
+        &'a self,
+        method: openplotva_telegram::SetWebhook,
+    ) -> SetWebhookFuture<'a, Self::Error> {
+        Box::pin(async move { self.execute(method).await.map(|_: bool| ()) })
     }
 }
 
@@ -133,13 +167,47 @@ pub enum BotCommandSetupError {
 pub struct TelegramUpdateProducerStartupReport {
     /// `deleteWebhook` error that stopped the producer before polling.
     pub delete_webhook_error: Option<String>,
+    /// `setWebhook` error that stopped the producer before accepting webhook updates.
+    pub set_webhook_error: Option<String>,
     /// Report from the producer loop when startup succeeded.
     pub producer: Option<openplotva_updates::UpdateProducerRunReport>,
+}
+
+#[derive(Clone)]
+struct TelegramWebhookRoute {
+    sender: openplotva_telegram::WebhookUpdateSender,
+    secret_token: Arc<str>,
 }
 
 /// Build the HTTP router without binding a socket.
 pub fn router() -> axum::Router {
     openplotva_server::router()
+}
+
+/// Build the HTTP router with a Telegram webhook intake route attached.
+pub fn router_with_readiness_and_telegram_webhook(
+    readiness: ReadinessResponse,
+    sender: openplotva_telegram::WebhookUpdateSender,
+    secret_token: impl Into<String>,
+) -> axum::Router {
+    let route = TelegramWebhookRoute {
+        sender,
+        secret_token: Arc::from(secret_token.into()),
+    };
+
+    router_with_readiness_and_telegram_webhook_route(readiness, route)
+}
+
+fn router_with_readiness_and_telegram_webhook_route(
+    readiness: ReadinessResponse,
+    route: TelegramWebhookRoute,
+) -> axum::Router {
+    openplotva_server::router_with_readiness(readiness)
+        .route(
+            openplotva_telegram::TELEGRAM_WEBHOOK_PATH,
+            any(telegram_webhook),
+        )
+        .layer(Extension(route))
 }
 
 /// Run the current OpenPlotva app shell.
@@ -162,7 +230,12 @@ pub async fn run() -> anyhow::Result<()> {
 
     tracing::info!(address = %local_addr, "openplotva listening");
 
-    let app = openplotva_server::router_with_readiness(ReadinessResponse::ready(readiness_checks));
+    let readiness = ReadinessResponse::ready(readiness_checks);
+    let app = if let Some(webhook_route) = runtime_workers.webhook_route.clone() {
+        router_with_readiness_and_telegram_webhook_route(readiness, webhook_route)
+    } else {
+        openplotva_server::router_with_readiness(readiness)
+    };
 
     let serve_result = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
@@ -233,12 +306,46 @@ where
     if let Err(error) = startup.delete_webhook().await {
         return TelegramUpdateProducerStartupReport {
             delete_webhook_error: Some(error.to_string()),
+            set_webhook_error: None,
             producer: None,
         };
     }
 
     TelegramUpdateProducerStartupReport {
         delete_webhook_error: None,
+        set_webhook_error: None,
+        producer: Some(openplotva_updates::run_update_producer_until(source, queue, stop).await),
+    }
+}
+
+/// Run Go's webhook startup order: set webhook, then produce updates from the webhook source.
+pub async fn run_webhook_update_producer_after_set_webhook<Startup, Source, Queue, Stop>(
+    startup: &Startup,
+    setup: &openplotva_telegram::WebhookSetup,
+    source: &Source,
+    queue: &Queue,
+    stop: Stop,
+) -> TelegramUpdateProducerStartupReport
+where
+    Startup: SetWebhookExecutor + Sync,
+    Source: openplotva_updates::UpdateProducerSource + Sync,
+    Queue: openplotva_updates::UpdateProducerQueue + Sync,
+    Stop: Future<Output = ()>,
+{
+    if let Err(error) = startup
+        .set_webhook(openplotva_telegram::build_set_webhook_method(setup))
+        .await
+    {
+        return TelegramUpdateProducerStartupReport {
+            delete_webhook_error: None,
+            set_webhook_error: Some(error.to_string()),
+            producer: None,
+        };
+    }
+
+    TelegramUpdateProducerStartupReport {
+        delete_webhook_error: None,
+        set_webhook_error: None,
         producer: Some(openplotva_updates::run_update_producer_until(source, queue, stop).await),
     }
 }
@@ -281,6 +388,42 @@ where
     }
 
     Ok(report)
+}
+
+async fn telegram_webhook(
+    Extension(route): Extension<TelegramWebhookRoute>,
+    method: Method,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    telegram_webhook_response(&route.sender, method, headers, &route.secret_token, body).await
+}
+
+pub async fn telegram_webhook_response(
+    sender: &openplotva_telegram::WebhookUpdateSender,
+    method: Method,
+    headers: HeaderMap,
+    secret_token: &str,
+    body: Bytes,
+) -> Response {
+    let provided_secret = headers
+        .get(openplotva_telegram::TELEGRAM_WEBHOOK_SECRET_HEADER)
+        .and_then(|value| value.to_str().ok());
+
+    match sender
+        .handle_webhook_request(method.as_str(), provided_secret, secret_token, &body)
+        .await
+    {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(error) => {
+            let status = StatusCode::from_u16(error.http_status())
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            match error.error_body() {
+                Some(body) => (status, body).into_response(),
+                None => status.into_response(),
+            }
+        }
+    }
 }
 
 async fn start_runtime_workers(
@@ -379,6 +522,7 @@ async fn start_runtime_workers(
         handles: Vec::new(),
         stop: Some(stop.clone()),
         dispatcher: None,
+        webhook_route: None,
     };
 
     let pending_store = store.clone();
@@ -421,26 +565,82 @@ async fn start_runtime_workers(
         tracing::info!(?outcome, "outbound immediate dispatcher worker stopped");
     });
 
-    let update_startup = telegram.clone();
-    let update_source = openplotva_telegram::LongPollUpdateSource::new(telegram.clone());
-    let update_queue =
-        openplotva_updates::RedisUpdateQueue::new(service_clients.redis.client().clone());
-    let update_stop = stop.subscribe();
-    let update_producer_worker = tokio::spawn(async move {
-        let report = run_long_poll_update_producer_after_delete_webhook(
-            &update_startup,
-            &update_source,
-            &update_queue,
-            wait_for_runtime_stop(update_stop),
-        )
-        .await;
-
-        if let Some(error) = report.delete_webhook_error.as_deref() {
-            tracing::warn!(%error, "Telegram long-poll update producer stopped before polling");
+    if config.bot.webhook.enabled {
+        if config.bot.webhook.url.is_empty() {
+            tracing::warn!("BOT_WEBHOOK_URL is required when webhook updates are enabled");
+            readiness_checks.push(ReadinessCheck::skipped(
+                "telegram_update_producer",
+                "BOT_WEBHOOK_URL is not set",
+            ));
         } else {
-            tracing::info!(?report, "Telegram long-poll update producer stopped");
+            let (webhook_sender, webhook_source) = openplotva_telegram::webhook_update_channel(
+                openplotva_telegram::GO_WEBHOOK_UPDATE_BUFFER_SIZE,
+            );
+            let webhook_setup = openplotva_telegram::WebhookSetup::new(
+                config.bot.webhook.url.clone(),
+                Some(config.bot.webhook.secret_token.clone())
+                    .filter(|secret_token| !secret_token.is_empty()),
+            );
+            let webhook_startup = telegram.clone();
+            let update_queue =
+                openplotva_updates::RedisUpdateQueue::new(service_clients.redis.client().clone());
+            let update_stop = stop.subscribe();
+            let update_producer_worker = tokio::spawn(async move {
+                let report = run_webhook_update_producer_after_set_webhook(
+                    &webhook_startup,
+                    &webhook_setup,
+                    &webhook_source,
+                    &update_queue,
+                    wait_for_runtime_stop(update_stop),
+                )
+                .await;
+
+                if let Some(error) = report.set_webhook_error.as_deref() {
+                    tracing::warn!(
+                        %error,
+                        "Telegram webhook update producer stopped before accepting updates"
+                    );
+                } else {
+                    tracing::info!(?report, "Telegram webhook update producer stopped");
+                }
+            });
+            workers.webhook_route = Some(TelegramWebhookRoute {
+                sender: webhook_sender,
+                secret_token: Arc::from(config.bot.webhook.secret_token.clone()),
+            });
+            workers.handles.push(update_producer_worker);
+            readiness_checks.push(ReadinessCheck::ok(
+                "telegram_update_producer",
+                "Telegram webhook update producer worker started",
+            ));
         }
-    });
+    } else {
+        let update_startup = telegram.clone();
+        let update_source = openplotva_telegram::LongPollUpdateSource::new(telegram.clone());
+        let update_queue =
+            openplotva_updates::RedisUpdateQueue::new(service_clients.redis.client().clone());
+        let update_stop = stop.subscribe();
+        let update_producer_worker = tokio::spawn(async move {
+            let report = run_long_poll_update_producer_after_delete_webhook(
+                &update_startup,
+                &update_source,
+                &update_queue,
+                wait_for_runtime_stop(update_stop),
+            )
+            .await;
+
+            if let Some(error) = report.delete_webhook_error.as_deref() {
+                tracing::warn!(%error, "Telegram long-poll update producer stopped before polling");
+            } else {
+                tracing::info!(?report, "Telegram long-poll update producer stopped");
+            }
+        });
+        workers.handles.push(update_producer_worker);
+        readiness_checks.push(ReadinessCheck::ok(
+            "telegram_update_producer",
+            "Telegram long-poll update producer worker started",
+        ));
+    }
 
     let regular_store = store;
     let regular_telegram = telegram;
@@ -481,14 +681,9 @@ async fn start_runtime_workers(
         "outbound_dispatcher",
         "Telegram outbound dispatcher workers started",
     ));
-    readiness_checks.push(ReadinessCheck::ok(
-        "telegram_update_producer",
-        "Telegram long-poll update producer worker started",
-    ));
     workers.handles.push(immediate_worker);
     workers.handles.push(regular_worker);
     workers.handles.push(cleanup_worker);
-    workers.handles.push(update_producer_worker);
     workers.dispatcher = Some(DispatcherRuntime {
         queue: dispatcher_queue,
         persistence: dispatcher_persistence,
@@ -502,6 +697,7 @@ async fn shutdown_runtime_workers(workers: RuntimeWorkers) {
         handles,
         stop,
         dispatcher,
+        webhook_route: _,
     } = workers;
 
     if let Some(stop) = stop {
@@ -655,6 +851,10 @@ mod tests {
         sync::{Arc, Mutex},
     };
 
+    use axum::{
+        body::{Bytes, to_bytes},
+        http::{HeaderMap, Method, StatusCode},
+    };
     use carapax::types::Update as TelegramUpdate;
     use openplotva_updates::{
         UpdateProducerQueue, UpdateProducerQueueFuture, UpdateProducerSource,
@@ -666,6 +866,7 @@ mod tests {
         GO_DISPATCHER_DEBOUNCE_CACHE_SIZE, GO_DISPATCHER_DEBOUNCE_WINDOW,
         GO_DISPATCHER_MAX_QUEUE_SIZE, configure_telegram_bot_commands, go_dispatcher_config,
         run_long_poll_update_producer_after_delete_webhook,
+        run_webhook_update_producer_after_set_webhook, telegram_webhook_response,
     };
 
     #[test]
@@ -733,6 +934,136 @@ mod tests {
         assert!(report.producer.is_none());
         assert!(queue.enqueued_ids().is_empty());
         assert_eq!(source.calls(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn webhook_update_startup_sets_webhook_before_producing_updates_like_go()
+    -> Result<(), Box<dyn Error>> {
+        let startup = SetWebhookStub::default();
+        let setup = openplotva_telegram::WebhookSetup::new(
+            "https://example.test/telegram/webhook",
+            Some("secret".to_owned()),
+        );
+        let source = ProducerSourceStub::new(vec![Some(sample_message_update(20)?), None]);
+        let queue = ProducerQueueStub::default();
+
+        let report = run_webhook_update_producer_after_set_webhook(
+            &startup,
+            &setup,
+            &source,
+            &queue,
+            std::future::pending(),
+        )
+        .await;
+
+        assert_eq!(startup.calls(), 1);
+        assert!(report.set_webhook_error.is_none());
+        let producer = report.producer.expect("producer report");
+        assert_eq!(producer.received, 1);
+        assert_eq!(producer.enqueued, 1);
+        assert_eq!(queue.enqueued_ids(), vec![20]);
+        let payload = startup.payloads().pop().expect("setWebhook payload");
+        assert_eq!(payload["url"], "https://example.test/telegram/webhook");
+        assert_eq!(payload["secret_token"], "secret");
+        assert!(
+            payload
+                .get("allowed_updates")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(
+                    |updates| updates.len() == openplotva_updates::GO_ALLOWED_UPDATE_NAMES.len()
+                )
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn webhook_update_startup_stops_before_producer_when_set_webhook_fails_like_go()
+    -> Result<(), Box<dyn Error>> {
+        let startup = SetWebhookStub::failing("set webhook failed");
+        let setup = openplotva_telegram::WebhookSetup::new(
+            "https://example.test/telegram/webhook",
+            Some("secret".to_owned()),
+        );
+        let source = ProducerSourceStub::new(vec![Some(sample_message_update(20)?), None]);
+        let queue = ProducerQueueStub::default();
+
+        let report = run_webhook_update_producer_after_set_webhook(
+            &startup,
+            &setup,
+            &source,
+            &queue,
+            std::future::pending(),
+        )
+        .await;
+
+        assert_eq!(startup.calls(), 1);
+        assert_eq!(
+            report.set_webhook_error.as_deref(),
+            Some("set webhook failed")
+        );
+        assert!(report.producer.is_none());
+        assert!(queue.enqueued_ids().is_empty());
+        assert_eq!(source.calls(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn telegram_webhook_response_accepts_update_and_maps_go_errors()
+    -> Result<(), Box<dyn Error>> {
+        let (sender, source) = openplotva_telegram::webhook_update_channel(1);
+        let body = serde_json::to_vec(&sample_message_update(30)?)?;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            openplotva_telegram::TELEGRAM_WEBHOOK_SECRET_HEADER,
+            "secret".parse()?,
+        );
+
+        let response = telegram_webhook_response(
+            &sender,
+            Method::POST,
+            headers.clone(),
+            "secret",
+            Bytes::from(body.clone()),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            source.next_update_now().await.expect("accepted update").id,
+            30
+        );
+
+        let response =
+            telegram_webhook_response(&sender, Method::GET, headers.clone(), "secret", body.into())
+                .await;
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+
+        headers.insert(
+            openplotva_telegram::TELEGRAM_WEBHOOK_SECRET_HEADER,
+            "wrong".parse()?,
+        );
+        let response = telegram_webhook_response(
+            &sender,
+            Method::POST,
+            headers,
+            "secret",
+            Bytes::from_static(b"{}"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = telegram_webhook_response(
+            &sender,
+            Method::POST,
+            HeaderMap::new(),
+            "",
+            Bytes::from_static(b"not-json"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await?;
+        assert_eq!(&body[..], br#"{"error":"invalid update"}"#);
         Ok(())
     }
 
@@ -821,6 +1152,47 @@ mod tests {
 
         fn delete_webhook<'a>(&'a self) -> super::DeleteWebhookFuture<'a, Self::Error> {
             *self.calls.lock().expect("delete webhook calls") += 1;
+            let result = self
+                .error
+                .map_or(Ok(()), |message| Err(StartupError(message)));
+            Box::pin(async move { result })
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct SetWebhookStub {
+        requests: Arc<Mutex<Vec<serde_json::Value>>>,
+        error: Option<&'static str>,
+    }
+
+    impl SetWebhookStub {
+        fn failing(error: &'static str) -> Self {
+            Self {
+                error: Some(error),
+                ..Self::default()
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.requests.lock().expect("setWebhook requests").len()
+        }
+
+        fn payloads(&self) -> Vec<serde_json::Value> {
+            self.requests.lock().expect("setWebhook requests").clone()
+        }
+    }
+
+    impl super::SetWebhookExecutor for SetWebhookStub {
+        type Error = StartupError;
+
+        fn set_webhook<'a>(
+            &'a self,
+            method: openplotva_telegram::SetWebhook,
+        ) -> super::SetWebhookFuture<'a, Self::Error> {
+            self.requests
+                .lock()
+                .expect("setWebhook requests")
+                .push(serde_json::to_value(method).expect("setWebhook JSON"));
             let result = self
                 .error
                 .map_or(Ok(()), |message| Err(StartupError(message)));
