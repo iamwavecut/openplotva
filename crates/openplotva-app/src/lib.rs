@@ -2,6 +2,7 @@
 
 pub mod callbacks;
 pub mod edited;
+pub mod guest;
 pub mod inline;
 pub mod members;
 pub mod payments;
