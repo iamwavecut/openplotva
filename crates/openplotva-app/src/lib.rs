@@ -727,6 +727,7 @@ async fn start_runtime_workers(
     workers.handles.push(pending_worker);
 
     let immediate_store = store.clone();
+    let immediate_history = history_store.clone();
     let immediate_telegram = telegram.clone();
     let immediate_rate_limits = Arc::clone(&rate_limit_policy);
     let immediate_permissions = Arc::clone(&permission_policy);
@@ -737,6 +738,7 @@ async fn start_runtime_workers(
             .run_immediate_worker_until(wait_for_runtime_stop(immediate_stop), |item| {
                 send_dispatcher_work_item(
                     immediate_store.clone(),
+                    immediate_history.clone(),
                     immediate_telegram.clone(),
                     Arc::clone(&immediate_rate_limits),
                     Arc::clone(&immediate_permissions),
@@ -836,6 +838,7 @@ async fn start_runtime_workers(
     }
 
     let regular_store = store;
+    let regular_history = history_store;
     let regular_telegram = telegram;
     let regular_rate_limits = Arc::clone(&rate_limit_policy);
     let regular_permissions = Arc::clone(&permission_policy);
@@ -850,6 +853,7 @@ async fn start_runtime_workers(
                 |item| {
                     send_dispatcher_work_item(
                         regular_store.clone(),
+                        regular_history.clone(),
                         regular_telegram.clone(),
                         Arc::clone(&regular_rate_limits),
                         Arc::clone(&regular_permissions),
@@ -980,13 +984,15 @@ async fn wait_for_runtime_stop(mut stop: watch::Receiver<bool>) {
 
 async fn send_dispatcher_work_item(
     store: PostgresVirtualMessageStore,
+    history: PostgresHistoryStore,
     telegram: openplotva_telegram::TelegramClient,
     rate_limits: Arc<rate_limits::ChatRateLimitPolicy<RedisRateLimitStore>>,
     permissions: Arc<permissions::ChatPermissionPolicy<PostgresChatSettingsStore>>,
     item: openplotva_telegram::DispatcherWorkItem,
 ) -> openplotva_telegram::DispatcherSendStatus {
-    send_dispatcher_work_item_with_transport(
+    send_dispatcher_work_item_with_transport_and_history(
         store,
+        history,
         rate_limits,
         permissions,
         item,
@@ -995,6 +1001,7 @@ async fn send_dispatcher_work_item(
     .await
 }
 
+#[cfg(test)]
 async fn send_dispatcher_work_item_with_transport<V, R, P, SendFn, SendFuture>(
     store: V,
     rate_limits: Arc<rate_limits::ChatRateLimitPolicy<R>>,
@@ -1004,6 +1011,35 @@ async fn send_dispatcher_work_item_with_transport<V, R, P, SendFn, SendFuture>(
 ) -> openplotva_telegram::DispatcherSendStatus
 where
     V: virtual_messages::VirtualMessageStore + Sync,
+    R: rate_limits::RateLimitStore + Send + Sync,
+    P: permissions::ChatPermissionStore + Send + Sync,
+    SendFn: FnOnce(openplotva_telegram::TelegramOutboundMethod) -> SendFuture,
+    SendFuture: Future<
+        Output = Result<openplotva_telegram::TelegramOutboundResponse, carapax::api::ExecuteError>,
+    >,
+{
+    send_dispatcher_work_item_with_transport_and_history(
+        store,
+        pending_ops::NoopPendingOpHistory,
+        rate_limits,
+        permissions,
+        item,
+        send,
+    )
+    .await
+}
+
+async fn send_dispatcher_work_item_with_transport_and_history<V, H, R, P, SendFn, SendFuture>(
+    store: V,
+    history: H,
+    rate_limits: Arc<rate_limits::ChatRateLimitPolicy<R>>,
+    permissions: Arc<permissions::ChatPermissionPolicy<P>>,
+    item: openplotva_telegram::DispatcherWorkItem,
+    send: SendFn,
+) -> openplotva_telegram::DispatcherSendStatus
+where
+    V: virtual_messages::VirtualMessageStore + Sync,
+    H: pending_ops::PendingOpHistory,
     R: rate_limits::RateLimitStore + Send + Sync,
     P: permissions::ChatPermissionStore + Send + Sync,
     SendFn: FnOnce(openplotva_telegram::TelegramOutboundMethod) -> SendFuture,
@@ -1056,57 +1092,62 @@ where
         }
     }
 
-    let report = virtual_messages::send_work_item_and_resolve(&store, item, |method| {
-        let rate_limits = Arc::clone(&rate_limits);
-        let permissions = Arc::clone(&permissions);
-        async move {
-            let method_kind = method.kind();
-            match send(method).await {
-                Ok(response) => Ok(response),
-                Err(error) => {
-                    if let Some(retry_after) =
-                        rate_limits::telegram_retry_after_from_execute_error(&error)
-                    {
-                        let report = rate_limits
-                            .set_rate_limit_at(chat_id, retry_after, OffsetDateTime::now_utc())
-                            .await;
-                        if let Some(save_error) = report.save_error.as_deref() {
-                            tracing::warn!(
-                                chat_id,
-                                retry_after_seconds = retry_after.as_secs(),
-                                %save_error,
-                                "failed to persist Telegram rate-limit state"
-                            );
+    let report = virtual_messages::send_work_item_and_resolve_with_history(
+        &store,
+        &history,
+        item,
+        |method| {
+            let rate_limits = Arc::clone(&rate_limits);
+            let permissions = Arc::clone(&permissions);
+            async move {
+                let method_kind = method.kind();
+                match send(method).await {
+                    Ok(response) => Ok(response),
+                    Err(error) => {
+                        if let Some(retry_after) =
+                            rate_limits::telegram_retry_after_from_execute_error(&error)
+                        {
+                            let report = rate_limits
+                                .set_rate_limit_at(chat_id, retry_after, OffsetDateTime::now_utc())
+                                .await;
+                            if let Some(save_error) = report.save_error.as_deref() {
+                                tracing::warn!(
+                                    chat_id,
+                                    retry_after_seconds = retry_after.as_secs(),
+                                    %save_error,
+                                    "failed to persist Telegram rate-limit state"
+                                );
+                            }
                         }
+                        if chat_id != 0
+                            && permissions::telegram_execute_error_is_permission_error(&error)
+                        {
+                            let report = permissions
+                                .record_send_permission_error(chat_id, method_kind)
+                                .await;
+                            if let Some(load_error) = report.load_error.as_deref() {
+                                tracing::warn!(
+                                    chat_id,
+                                    method = ?method_kind,
+                                    %load_error,
+                                    "failed to load chat permission state after Telegram permission error"
+                                );
+                            }
+                            if let Some(save_error) = report.save_error.as_deref() {
+                                tracing::warn!(
+                                    chat_id,
+                                    method = ?method_kind,
+                                    %save_error,
+                                    "failed to persist chat permission state after Telegram permission error"
+                                );
+                            }
+                        }
+                        Err(error)
                     }
-                    if chat_id != 0
-                        && permissions::telegram_execute_error_is_permission_error(&error)
-                    {
-                        let report = permissions
-                            .record_send_permission_error(chat_id, method_kind)
-                            .await;
-                        if let Some(load_error) = report.load_error.as_deref() {
-                            tracing::warn!(
-                                chat_id,
-                                method = ?method_kind,
-                                %load_error,
-                                "failed to load chat permission state after Telegram permission error"
-                            );
-                        }
-                        if let Some(save_error) = report.save_error.as_deref() {
-                            tracing::warn!(
-                                chat_id,
-                                method = ?method_kind,
-                                %save_error,
-                                "failed to persist chat permission state after Telegram permission error"
-                            );
-                        }
-                    }
-                    Err(error)
                 }
             }
-        }
-    })
+        },
+    )
     .await;
     if report.resolve_error.is_some() {
         tracing::warn!(

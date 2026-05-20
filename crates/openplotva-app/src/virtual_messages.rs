@@ -21,7 +21,7 @@ use openplotva_telegram::{
 use serde_json::json;
 use thiserror::Error;
 
-use crate::pending_ops::PendingOpHistory;
+use crate::pending_ops::{NoopPendingOpHistory, PendingOpHistory};
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -382,6 +382,8 @@ pub struct DispatchResolveReport {
     pub send_error: Option<String>,
     /// Mapping-resolution error ignored by Go after send success.
     pub resolve_error: Option<String>,
+    /// Whether a direct edit-text item was reflected into history after send success.
+    pub history_updated: bool,
 }
 
 /// Recoverable errors from immediate virtual-message handling.
@@ -659,6 +661,39 @@ where
     SendFuture: Future<Output = Result<TelegramOutboundResponse, SendError>>,
     SendError: fmt::Display,
 {
+    send_work_item_and_resolve_inner(store, None::<&NoopPendingOpHistory>, item, send).await
+}
+
+/// Send one dispatcher item, resolve virtual-message mappings, and apply direct edit history.
+pub async fn send_work_item_and_resolve_with_history<S, H, Send, SendFuture, SendError>(
+    store: &S,
+    history: &H,
+    item: DispatcherWorkItem,
+    send: Send,
+) -> DispatchResolveReport
+where
+    S: VirtualMessageStore + Sync,
+    H: PendingOpHistory,
+    Send: FnOnce(TelegramOutboundMethod) -> SendFuture,
+    SendFuture: Future<Output = Result<TelegramOutboundResponse, SendError>>,
+    SendError: fmt::Display,
+{
+    send_work_item_and_resolve_inner(store, Some(history), item, send).await
+}
+
+async fn send_work_item_and_resolve_inner<S, H, Send, SendFuture, SendError>(
+    store: &S,
+    history: Option<&H>,
+    item: DispatcherWorkItem,
+    send: Send,
+) -> DispatchResolveReport
+where
+    S: VirtualMessageStore + Sync,
+    H: PendingOpHistory,
+    Send: FnOnce(TelegramOutboundMethod) -> SendFuture,
+    SendFuture: Future<Output = Result<TelegramOutboundResponse, SendError>>,
+    SendError: fmt::Display,
+{
     let (metadata, method) = item.into_parts();
     let Some(method) = method else {
         return DispatchResolveReport {
@@ -668,8 +703,11 @@ where
             missing_method: true,
             send_error: None,
             resolve_error: None,
+            history_updated: false,
         };
     };
+    let direct_edit_history =
+        direct_edit_text_history_update(metadata.chat_id, &metadata.virtual_id, &method);
 
     let response = match send(method).await {
         Ok(response) => response,
@@ -681,6 +719,7 @@ where
                 missing_method: false,
                 send_error: Some(error.to_string()),
                 resolve_error: None,
+                history_updated: false,
             };
         }
     };
@@ -692,6 +731,7 @@ where
         missing_method: false,
         send_error: None,
         resolve_error: None,
+        history_updated: false,
     };
 
     if !report.virtual_id.is_empty()
@@ -704,7 +744,58 @@ where
             .map(|error| error.to_string());
     }
 
+    if let (Some(history), Some(edit)) = (history, direct_edit_history) {
+        history
+            .update_text(edit.chat_id, edit.message_id, &edit.text, &edit.parse_mode)
+            .await;
+        report.history_updated = true;
+    }
+
     report
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DirectEditTextHistoryUpdate {
+    chat_id: i64,
+    message_id: i32,
+    text: String,
+    parse_mode: String,
+}
+
+fn direct_edit_text_history_update(
+    chat_id: i64,
+    virtual_id: &str,
+    method: &TelegramOutboundMethod,
+) -> Option<DirectEditTextHistoryUpdate> {
+    if !virtual_id.is_empty() {
+        return None;
+    }
+    let TelegramOutboundMethod::EditMessageText(method) = method else {
+        return None;
+    };
+    let payload = serde_json::to_value(method.as_ref()).ok()?;
+    let chat_id = if chat_id == 0 {
+        payload.get("chat_id")?.as_i64()?
+    } else {
+        chat_id
+    };
+    let message_id = payload
+        .get("message_id")?
+        .as_i64()
+        .and_then(|value| i32::try_from(value).ok())?;
+    let text = payload.get("text")?.as_str()?.to_owned();
+    let parse_mode = payload
+        .get("parse_mode")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+
+    Some(DirectEditTextHistoryUpdate {
+        chat_id,
+        message_id,
+        text,
+        parse_mode,
+    })
 }
 
 pub async fn edit_text_virtual<S, H, Send, SendFuture, SendError, Cancel>(
@@ -914,6 +1005,7 @@ mod tests {
         sync::{Arc, Mutex},
     };
 
+    use carapax::types::EditMessageResult;
     use openplotva_core::MessageIdMapping;
     use openplotva_telegram::{
         AudioMessageRequest, AudioSource, ChatRef, DispatcherConfig, DispatcherMessage,
@@ -936,6 +1028,7 @@ mod tests {
         edit_text_virtual, queue_audio_message, queue_edit_media_message, queue_edit_text_message,
         queue_media_group_message, queue_photo_message, queue_sticker_message,
         queue_text_message_parts, send_work_item_and_resolve,
+        send_work_item_and_resolve_with_history,
     };
 
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1690,6 +1783,53 @@ mod tests {
         store.snapshot(|state| {
             assert!(state.resolved.is_empty());
         });
+    }
+
+    #[tokio::test]
+    async fn send_work_item_and_resolve_with_history_updates_direct_edit_text_after_success()
+    -> Result<(), Box<dyn Error>> {
+        let store = StoreStub::default();
+        let history = store.history();
+        let queue = DispatcherQueue::new(DispatcherConfig::default());
+        let request = EditTextMessageRequest {
+            chat: ChatRef {
+                id: 42,
+                is_forum: false,
+            },
+            message_id: 99,
+            text: "<b>updated</b>".to_owned(),
+            render_as: TELEGRAM_PARSE_MODE_HTML.to_owned(),
+            reply_markup: None,
+        };
+        queue_edit_text_message(
+            &queue,
+            QueueEditTextRequest {
+                message: &request,
+                immediate: false,
+                bypass_chat_restrictions: false,
+            },
+        )?;
+        let item = queue.dequeue_regular().expect("queued edit item");
+
+        let report = send_work_item_and_resolve_with_history(&store, &history, item, |_| async {
+            Ok::<_, StubError>(TelegramOutboundResponse::EditMessage(
+                EditMessageResult::Message(Box::new(telegram_message(42, 99))),
+            ))
+        })
+        .await;
+
+        assert_eq!(report.status, DispatcherSendStatus::Sent);
+        assert!(report.history_updated);
+        assert_eq!(report.resolved_message_id, None);
+        store.snapshot(|state| {
+            assert!(state.resolved.is_empty());
+            assert_eq!(
+                state.events,
+                vec!["history:update:42:99:<b>updated</b>:HTML"]
+            );
+        });
+
+        Ok(())
     }
 
     #[tokio::test]
