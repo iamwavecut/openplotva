@@ -74,6 +74,7 @@ pub struct DispatcherMessage {
     method: Option<TelegramOutboundMethod>,
     persistence_payload: Option<DispatcherPersistencePayload>,
     bypass_chat_restrictions: bool,
+    ephemeral_delete_after: Option<Duration>,
 }
 
 impl DispatcherMessage {
@@ -85,6 +86,7 @@ impl DispatcherMessage {
             method: None,
             persistence_payload: None,
             bypass_chat_restrictions: false,
+            ephemeral_delete_after: None,
         }
     }
 
@@ -102,6 +104,12 @@ impl DispatcherMessage {
     /// Preserve Go `BypassChatRestrictions` for Rust dispatcher-time permission checks.
     pub fn with_bypass_chat_restrictions(mut self, bypass: bool) -> Self {
         self.bypass_chat_restrictions = bypass;
+        self
+    }
+
+    /// Preserve Go `SendEphemeral*` delete timing for post-send tracking.
+    pub fn with_ephemeral_delete_after(mut self, duration: Duration) -> Self {
+        self.ephemeral_delete_after = Some(duration);
         self
     }
 }
@@ -201,6 +209,8 @@ pub struct DispatcherQueuedMessage {
     /// Enqueue time used for oldest-age statistics.
     pub added_at: Instant,
     pub enqueued_at: SystemTime,
+    /// Duration after successful send before Go-style ephemeral cleanup should delete it.
+    pub ephemeral_delete_after: Option<Duration>,
 }
 
 /// Worker-owned queue item containing cloneable metadata plus the send payload.
@@ -210,6 +220,7 @@ pub struct DispatcherWorkItem {
     method: Option<TelegramOutboundMethod>,
     persistence_payload: Option<DispatcherPersistencePayload>,
     bypass_chat_restrictions: bool,
+    ephemeral_delete_after: Option<Duration>,
 }
 
 impl DispatcherWorkItem {
@@ -225,6 +236,11 @@ impl DispatcherWorkItem {
     /// Return whether this queued item should skip chat permission settings.
     pub fn bypasses_chat_restrictions(&self) -> bool {
         self.bypass_chat_restrictions
+    }
+
+    /// Return the Go-style ephemeral delete timing carried by this queued item.
+    pub fn ephemeral_delete_after(&self) -> Option<Duration> {
+        self.ephemeral_delete_after
     }
 
     /// Consume the worker item and return only the concrete Telegram method payload.
@@ -244,8 +260,14 @@ impl DispatcherWorkItem {
         DispatcherQueuedMessage,
         Option<TelegramOutboundMethod>,
         Option<DispatcherPersistencePayload>,
+        Option<Duration>,
     ) {
-        (self.metadata, self.method, self.persistence_payload)
+        (
+            self.metadata,
+            self.method,
+            self.persistence_payload,
+            self.ephemeral_delete_after,
+        )
     }
 }
 
@@ -266,6 +288,8 @@ pub struct DispatcherRestoredMessage {
     pub persistence_payload: Option<DispatcherPersistencePayload>,
     /// Whether the original send path bypassed Go chat restriction checks.
     pub bypass_chat_restrictions: bool,
+    /// Duration after successful send before Go-style ephemeral cleanup should delete it.
+    pub ephemeral_delete_after: Option<Duration>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -337,6 +361,7 @@ struct DispatcherQueueItem {
     method: Option<TelegramOutboundMethod>,
     persistence_payload: Option<DispatcherPersistencePayload>,
     bypass_chat_restrictions: bool,
+    ephemeral_delete_after: Option<Duration>,
 }
 
 impl DispatcherQueueItem {
@@ -346,6 +371,7 @@ impl DispatcherQueueItem {
             method: self.method,
             persistence_payload: self.persistence_payload,
             bypass_chat_restrictions: self.bypass_chat_restrictions,
+            ephemeral_delete_after: self.ephemeral_delete_after,
         }
     }
 }
@@ -685,6 +711,7 @@ impl DispatcherQueue {
             method: message.method,
             persistence_payload: message.persistence_payload,
             bypass_chat_restrictions: message.bypass_chat_restrictions,
+            ephemeral_delete_after: message.ephemeral_delete_after,
         });
         self.regular_notify.notify_one();
     }
@@ -746,6 +773,7 @@ impl DispatcherQueue {
             method,
             persistence_payload,
             bypass_chat_restrictions,
+            ephemeral_delete_after,
         } = message;
 
         if !immediate && !self.debouncer.should_process_at(&fingerprint, now) {
@@ -761,10 +789,12 @@ impl DispatcherQueue {
                 immediate,
                 added_at: now,
                 enqueued_at: SystemTime::now(),
+                ephemeral_delete_after,
             },
             method,
             persistence_payload,
             bypass_chat_restrictions,
+            ephemeral_delete_after,
         };
 
         {
@@ -805,6 +835,7 @@ impl DispatcherQueue {
             method,
             persistence_payload,
             bypass_chat_restrictions,
+            ephemeral_delete_after,
         } = message;
 
         if !self.debouncer.should_process_at(&fingerprint, now) {
@@ -823,10 +854,12 @@ impl DispatcherQueue {
                 immediate,
                 added_at: added_instant_for_enqueued_at(enqueued_at, now, wall_now),
                 enqueued_at,
+                ephemeral_delete_after,
             },
             method: Some(method),
             persistence_payload,
             bypass_chat_restrictions,
+            ephemeral_delete_after,
         };
 
         self.push_queue_item(queued);
@@ -1104,6 +1137,7 @@ mod tests {
             method: text_method(chat_id, text),
             persistence_payload: None,
             bypass_chat_restrictions: false,
+            ephemeral_delete_after: None,
         }
     }
 

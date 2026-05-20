@@ -60,6 +60,9 @@ pub struct PersistentDispatcherItem {
     /// Rust-native preservation of Go `BypassChatRestrictions` after enqueue-time checks.
     #[serde(default, skip_serializing_if = "is_false")]
     pub bypass_chat_restrictions: bool,
+    /// Rust-native preservation of Go ephemeral delete timing after enqueue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ephemeral_delete_after_ms: Option<u64>,
 }
 
 impl PersistentDispatcherItem {
@@ -72,7 +75,8 @@ impl PersistentDispatcherItem {
         item: DispatcherWorkItem,
     ) -> Result<Option<Self>, DispatcherPersistenceError> {
         let bypass_chat_restrictions = item.bypasses_chat_restrictions();
-        let (metadata, method, persistence_payload) = item.into_persistence_parts();
+        let (metadata, method, persistence_payload, ephemeral_delete_after) =
+            item.into_persistence_parts();
         let Some(method) = method else {
             return Ok(None);
         };
@@ -95,6 +99,7 @@ impl PersistentDispatcherItem {
             chat_id: metadata.chat_id,
             virtual_id: metadata.virtual_id,
             bypass_chat_restrictions,
+            ephemeral_delete_after_ms: ephemeral_delete_after.map(duration_millis_u64),
         }))
     }
 }
@@ -319,6 +324,9 @@ fn replay_item_from_persistent(
         method,
         persistence_payload: Some(persistence_payload),
         bypass_chat_restrictions: item.bypass_chat_restrictions,
+        ephemeral_delete_after: item
+            .ephemeral_delete_after_ms
+            .map(std::time::Duration::from_millis),
     })
 }
 
@@ -812,6 +820,10 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+fn duration_millis_u64(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 mod go_byte_slice {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use serde::{Deserialize, Deserializer, Serializer, de::Error as _};
@@ -886,6 +898,7 @@ mod tests {
             method: text_method(chat_id, text),
             persistence_payload: None,
             bypass_chat_restrictions: false,
+            ephemeral_delete_after: None,
         }
     }
 
@@ -908,6 +921,7 @@ mod tests {
             chat_id: 42,
             virtual_id: "vmsg-1".to_owned(),
             bypass_chat_restrictions: false,
+            ephemeral_delete_after_ms: None,
         };
 
         let value = serde_json::to_value(vec![item])?;
@@ -1073,6 +1087,40 @@ mod tests {
     }
 
     #[test]
+    fn ephemeral_delete_after_survives_drain_and_replay() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let queue = DispatcherQueue::new(DispatcherConfig::default());
+        queue.enqueue(
+            text_message(42, "ephemeral", "ephemeral-1")
+                .with_method(text_method(42, "ephemeral"))
+                .with_ephemeral_delete_after(std::time::Duration::from_secs(60)),
+            true,
+        );
+
+        let persisted = persistent_queue_from_drain(queue.drain_for_shutdown(), 100)?;
+
+        assert_eq!(persisted.skipped, 0);
+        assert_eq!(persisted.items.len(), 1);
+        assert_eq!(persisted.items[0].ephemeral_delete_after_ms, Some(60_000));
+
+        let raw = serde_json::to_vec(&persisted.items)?;
+        let replay = persistent_queue_replay_from_json(&raw)?;
+        let restored_queue = DispatcherQueue::new(DispatcherConfig::default());
+        for item in replay.items {
+            restored_queue.restore(item);
+        }
+
+        let restored = restored_queue
+            .dequeue_immediate()
+            .expect("ephemeral item restored");
+        assert_eq!(
+            restored.metadata().ephemeral_delete_after,
+            Some(std::time::Duration::from_secs(60))
+        );
+        Ok(())
+    }
+
+    #[test]
     fn replay_from_persisted_json_reconstructs_go_text_and_sticker_items()
     -> Result<(), Box<dyn std::error::Error>> {
         let persisted = vec![
@@ -1085,6 +1133,7 @@ mod tests {
                 chat_id: 42,
                 virtual_id: "text-vmsg".to_owned(),
                 bypass_chat_restrictions: false,
+                ephemeral_delete_after_ms: None,
             },
             PersistentDispatcherItem {
                 message: br#"{"ChatID":43,"DisableNotification":true,"ReplyParameters":{"message_id":7,"chat_id":43,"allow_sending_without_reply":true},"File":"sticker-file-id"}"#.to_vec(),
@@ -1095,6 +1144,7 @@ mod tests {
                 chat_id: 43,
                 virtual_id: "sticker-vmsg".to_owned(),
                 bypass_chat_restrictions: false,
+                ephemeral_delete_after_ms: None,
             },
         ];
         let raw = serde_json::to_vec(&persisted)?;
@@ -1120,7 +1170,7 @@ mod tests {
             text.method_kind(),
             Some(TelegramOutboundMethodKind::SendMessage)
         );
-        let (_, method, payload) = text.into_persistence_parts();
+        let (_, method, payload, _) = text.into_persistence_parts();
         let Some(TelegramOutboundMethod::SendMessage(method)) = method else {
             panic!("expected sendMessage method");
         };
@@ -1143,7 +1193,7 @@ mod tests {
             sticker.method_kind(),
             Some(TelegramOutboundMethodKind::SendSticker)
         );
-        let (_, _, payload) = sticker.into_persistence_parts();
+        let (_, _, payload, _) = sticker.into_persistence_parts();
         assert_eq!(
             payload.expect("sticker payload preserved").message_type,
             "*api.StickerConfig"
@@ -1164,6 +1214,7 @@ mod tests {
             chat_id: 42,
             virtual_id: "delete-vmsg".to_owned(),
             bypass_chat_restrictions: false,
+            ephemeral_delete_after_ms: None,
         }];
         let raw = serde_json::to_vec(&persisted)?;
 
@@ -1199,6 +1250,7 @@ mod tests {
                 chat_id: 42,
                 virtual_id: "kept".to_owned(),
                 bypass_chat_restrictions: false,
+                ephemeral_delete_after_ms: None,
             },
             PersistentDispatcherItem {
                 message: br#"{"ChatID":42}"#.to_vec(),
@@ -1209,6 +1261,7 @@ mod tests {
                 chat_id: 42,
                 virtual_id: "unknown".to_owned(),
                 bypass_chat_restrictions: false,
+                ephemeral_delete_after_ms: None,
             },
             PersistentDispatcherItem {
                 message: b"not-json".to_vec(),
@@ -1219,6 +1272,7 @@ mod tests {
                 chat_id: 43,
                 virtual_id: "malformed".to_owned(),
                 bypass_chat_restrictions: false,
+                ephemeral_delete_after_ms: None,
             },
         ];
         let raw = serde_json::to_vec(&persisted)?;
@@ -1338,6 +1392,7 @@ mod tests {
             chat_id: 42,
             virtual_id: virtual_id.to_owned(),
             bypass_chat_restrictions: false,
+            ephemeral_delete_after_ms: None,
         }
     }
 
@@ -1353,6 +1408,7 @@ mod tests {
             chat_id: 42,
             virtual_id: "kept".to_owned(),
             bypass_chat_restrictions: false,
+            ephemeral_delete_after_ms: None,
         }];
         let expected = serde_json::to_vec(&persisted)?;
 
@@ -1375,6 +1431,7 @@ mod tests {
                 chat_id: 42,
                 virtual_id: "kept".to_owned(),
                 bypass_chat_restrictions: false,
+                ephemeral_delete_after_ms: None,
             },
             PersistentDispatcherItem {
                 message: b"not-json".to_vec(),
@@ -1385,6 +1442,7 @@ mod tests {
                 chat_id: 43,
                 virtual_id: "bad".to_owned(),
                 bypass_chat_restrictions: false,
+                ephemeral_delete_after_ms: None,
             },
         ];
 
@@ -1408,6 +1466,7 @@ mod tests {
             chat_id: 42,
             virtual_id: "kept".to_owned(),
             bypass_chat_restrictions: false,
+            ephemeral_delete_after_ms: None,
         }];
         let legacy_json = serde_json::to_vec(&persisted).expect("fixture should serialize");
         assert_eq!(legacy_json.len(), 176);

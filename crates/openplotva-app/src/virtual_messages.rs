@@ -1,6 +1,6 @@
 //! Composition-root virtual-message send/edit/delete behavior.
 
-use std::{fmt, future::Future, pin::Pin};
+use std::{fmt, future::Future, pin::Pin, time::Duration};
 
 use openplotva_core::{MessageIdMapping, ReadyPendingOp};
 use openplotva_telegram::{
@@ -20,6 +20,7 @@ use openplotva_telegram::{
 };
 use serde_json::json;
 use thiserror::Error;
+use time::OffsetDateTime;
 
 use crate::pending_ops::{NoopPendingOpHistory, PendingOpHistory};
 
@@ -118,6 +119,69 @@ impl VirtualMessageStore for openplotva_storage::PostgresVirtualMessageStore {
         vmsg_id: String,
     ) -> BoxFuture<'a, Result<(), Self::Error>> {
         Box::pin(async move { self.delete_mapping_by_virtual(&vmsg_id).await })
+    }
+}
+
+/// Store boundary for Go's ephemeral post-send message tracking.
+pub trait EphemeralMessageTracker {
+    /// Store error type.
+    type Error: fmt::Display + Send + Sync + 'static;
+
+    /// Track a real Telegram message for later deletion.
+    fn track_ephemeral_message<'a>(
+        &'a self,
+        chat_id: i64,
+        message_id: i32,
+        delete_after: Duration,
+        now: OffsetDateTime,
+    ) -> BoxFuture<'a, Result<(), Self::Error>>;
+}
+
+impl EphemeralMessageTracker for openplotva_storage::RedisEphemeralMessageStore {
+    type Error = openplotva_storage::StorageError;
+
+    fn track_ephemeral_message<'a>(
+        &'a self,
+        chat_id: i64,
+        message_id: i32,
+        delete_after: Duration,
+        now: OffsetDateTime,
+    ) -> BoxFuture<'a, Result<(), Self::Error>> {
+        Box::pin(async move {
+            let expires_at =
+                now + time::Duration::try_from(delete_after).unwrap_or(time::Duration::MAX);
+            let message = openplotva_storage::EphemeralMessage {
+                chat_id,
+                message_id: i64::from(message_id),
+                expires_at,
+            };
+            self.set_ephemeral_message(
+                &message,
+                openplotva_storage::ephemeral_redis_ttl(
+                    delete_after,
+                    openplotva_storage::EPHEMERAL_DEFAULT_CLEANUP_INTERVAL,
+                ),
+            )
+            .await
+        })
+    }
+}
+
+/// Ephemeral tracker for tests and runtime paths that do not own ephemeral sends.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoopEphemeralMessageTracker;
+
+impl EphemeralMessageTracker for NoopEphemeralMessageTracker {
+    type Error = std::convert::Infallible;
+
+    fn track_ephemeral_message<'a>(
+        &'a self,
+        _chat_id: i64,
+        _message_id: i32,
+        _delete_after: Duration,
+        _now: OffsetDateTime,
+    ) -> BoxFuture<'a, Result<(), Self::Error>> {
+        Box::pin(async { Ok(()) })
     }
 }
 
@@ -221,6 +285,8 @@ pub struct QueueTextRequest<'a> {
     pub immediate_first: bool,
     /// Whether Go `TextMessage.BypassChatRestrictions` was set at enqueue time.
     pub bypass_chat_restrictions: bool,
+    /// Go `SendEphemeralText` delete timing, attached only to the first split part.
+    pub ephemeral_delete_after: Option<Duration>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -233,6 +299,8 @@ pub struct QueueStickerRequest<'a> {
     pub immediate: bool,
     /// Whether Go `StickerMessage.BypassChatRestrictions` was set at enqueue time.
     pub bypass_chat_restrictions: bool,
+    /// Go `SendEphemeralSticker` delete timing.
+    pub ephemeral_delete_after: Option<Duration>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -382,6 +450,8 @@ pub struct DispatchResolveReport {
     pub send_error: Option<String>,
     /// Mapping-resolution error ignored by Go after send success.
     pub resolve_error: Option<String>,
+    /// Ephemeral tracking error ignored by Go after send success.
+    pub ephemeral_track_error: Option<String>,
     /// Whether a direct edit-text item was reflected into history after send success.
     pub history_updated: bool,
 }
@@ -439,10 +509,15 @@ where
             part.clone(),
             index + 1 == total_parts,
         )?;
-        let dispatcher_message =
+        let mut dispatcher_message =
             DispatcherMessage::new(fingerprint_text_message_part(chat.id, &part), &virtual_id)
                 .with_method(TelegramOutboundMethod::from(method))
                 .with_bypass_chat_restrictions(req.bypass_chat_restrictions);
+        if index == 0
+            && let Some(delete_after) = req.ephemeral_delete_after
+        {
+            dispatcher_message = dispatcher_message.with_ephemeral_delete_after(delete_after);
+        }
         let immediate = req.immediate_first && index == 0;
         let enqueue_outcome = queue.enqueue(dispatcher_message, immediate);
         report.parts.push(QueuedTextPartReport {
@@ -487,6 +562,11 @@ where
             .with_method(TelegramOutboundMethod::from(method))
             .with_persistence_payload(persistence_payload)
             .with_bypass_chat_restrictions(req.bypass_chat_restrictions);
+    let dispatcher_message = if let Some(delete_after) = req.ephemeral_delete_after {
+        dispatcher_message.with_ephemeral_delete_after(delete_after)
+    } else {
+        dispatcher_message
+    };
     let enqueue_outcome = queue.enqueue(dispatcher_message, req.immediate);
 
     Ok(QueueStickerReport {
@@ -661,7 +741,15 @@ where
     SendFuture: Future<Output = Result<TelegramOutboundResponse, SendError>>,
     SendError: fmt::Display,
 {
-    send_work_item_and_resolve_inner(store, None::<&NoopPendingOpHistory>, item, send).await
+    send_work_item_and_resolve_inner(
+        store,
+        None::<&NoopPendingOpHistory>,
+        None::<&NoopEphemeralMessageTracker>,
+        item,
+        OffsetDateTime::now_utc(),
+        send,
+    )
+    .await
 }
 
 /// Send one dispatcher item, resolve virtual-message mappings, and apply direct edit history.
@@ -678,23 +766,89 @@ where
     SendFuture: Future<Output = Result<TelegramOutboundResponse, SendError>>,
     SendError: fmt::Display,
 {
-    send_work_item_and_resolve_inner(store, Some(history), item, send).await
+    send_work_item_and_resolve_inner(
+        store,
+        Some(history),
+        None::<&NoopEphemeralMessageTracker>,
+        item,
+        OffsetDateTime::now_utc(),
+        send,
+    )
+    .await
 }
 
-async fn send_work_item_and_resolve_inner<S, H, Send, SendFuture, SendError>(
+/// Send one dispatcher item, resolve virtual-message mappings, and track ephemeral sends.
+pub async fn send_work_item_and_resolve_with_ephemeral<S, E, Send, SendFuture, SendError>(
     store: &S,
-    history: Option<&H>,
+    ephemeral: &E,
     item: DispatcherWorkItem,
+    now: OffsetDateTime,
+    send: Send,
+) -> DispatchResolveReport
+where
+    S: VirtualMessageStore + Sync,
+    E: EphemeralMessageTracker + Sync,
+    Send: FnOnce(TelegramOutboundMethod) -> SendFuture,
+    SendFuture: Future<Output = Result<TelegramOutboundResponse, SendError>>,
+    SendError: fmt::Display,
+{
+    send_work_item_and_resolve_inner(
+        store,
+        None::<&NoopPendingOpHistory>,
+        Some(ephemeral),
+        item,
+        now,
+        send,
+    )
+    .await
+}
+
+/// Send one dispatcher item, resolve mappings, update history, and track ephemeral sends.
+pub async fn send_work_item_and_resolve_with_history_and_ephemeral<
+    S,
+    H,
+    E,
+    Send,
+    SendFuture,
+    SendError,
+>(
+    store: &S,
+    history: &H,
+    ephemeral: &E,
+    item: DispatcherWorkItem,
+    now: OffsetDateTime,
     send: Send,
 ) -> DispatchResolveReport
 where
     S: VirtualMessageStore + Sync,
     H: PendingOpHistory,
+    E: EphemeralMessageTracker + Sync,
+    Send: FnOnce(TelegramOutboundMethod) -> SendFuture,
+    SendFuture: Future<Output = Result<TelegramOutboundResponse, SendError>>,
+    SendError: fmt::Display,
+{
+    send_work_item_and_resolve_inner(store, Some(history), Some(ephemeral), item, now, send).await
+}
+
+async fn send_work_item_and_resolve_inner<S, H, E, Send, SendFuture, SendError>(
+    store: &S,
+    history: Option<&H>,
+    ephemeral: Option<&E>,
+    item: DispatcherWorkItem,
+    now: OffsetDateTime,
+    send: Send,
+) -> DispatchResolveReport
+where
+    S: VirtualMessageStore + Sync,
+    H: PendingOpHistory,
+    E: EphemeralMessageTracker + Sync,
     Send: FnOnce(TelegramOutboundMethod) -> SendFuture,
     SendFuture: Future<Output = Result<TelegramOutboundResponse, SendError>>,
     SendError: fmt::Display,
 {
     let (metadata, method) = item.into_parts();
+    let ephemeral_delete_after = metadata.ephemeral_delete_after;
+    let chat_id = metadata.chat_id;
     let Some(method) = method else {
         return DispatchResolveReport {
             status: DispatcherSendStatus::Failed,
@@ -703,6 +857,7 @@ where
             missing_method: true,
             send_error: None,
             resolve_error: None,
+            ephemeral_track_error: None,
             history_updated: false,
         };
     };
@@ -719,6 +874,7 @@ where
                 missing_method: false,
                 send_error: Some(error.to_string()),
                 resolve_error: None,
+                ephemeral_track_error: None,
                 history_updated: false,
             };
         }
@@ -731,6 +887,7 @@ where
         missing_method: false,
         send_error: None,
         resolve_error: None,
+        ephemeral_track_error: None,
         history_updated: false,
     };
 
@@ -739,6 +896,18 @@ where
     {
         report.resolve_error = store
             .resolve_virtual_message(report.virtual_id.clone(), message_id)
+            .await
+            .err()
+            .map(|error| error.to_string());
+    }
+
+    if let (Some(ephemeral), Some(delete_after), Some(message_id)) = (
+        ephemeral,
+        ephemeral_delete_after,
+        report.resolved_message_id,
+    ) {
+        report.ephemeral_track_error = ephemeral
+            .track_ephemeral_message(chat_id, message_id, delete_after, now)
             .await
             .err()
             .map(|error| error.to_string());
@@ -1006,6 +1175,7 @@ mod tests {
         error::Error,
         fmt,
         sync::{Arc, Mutex},
+        time::Duration,
     };
 
     use carapax::types::EditMessageResult;
@@ -1020,6 +1190,7 @@ mod tests {
         persistent_queue_from_drain,
     };
     use serde_json::json;
+    use time::OffsetDateTime;
 
     use crate::pending_ops::PendingOpHistory;
 
@@ -1031,7 +1202,7 @@ mod tests {
         edit_text_virtual, queue_audio_message, queue_edit_media_message, queue_edit_text_message,
         queue_media_group_message, queue_photo_message, queue_sticker_message,
         queue_text_message_parts, send_work_item_and_resolve,
-        send_work_item_and_resolve_with_history,
+        send_work_item_and_resolve_with_ephemeral, send_work_item_and_resolve_with_history,
     };
 
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1052,10 +1223,12 @@ mod tests {
         insert_error: Option<StubError>,
         enqueue_error: Option<StubError>,
         resolve_error: Option<StubError>,
+        ephemeral_error: Option<StubError>,
         delete_mapping_error: Option<StubError>,
         lookup_calls: Vec<String>,
         inserted: Vec<(String, i64, Option<i32>)>,
         resolved: Vec<(String, i32)>,
+        ephemeral_tracked: Vec<(i64, i32, Duration, OffsetDateTime)>,
         enqueued: Vec<(String, i64, &'static str, Option<String>)>,
         deleted_mappings: Vec<String>,
         events: Vec<String>,
@@ -1204,6 +1377,31 @@ mod tests {
         }
     }
 
+    impl super::EphemeralMessageTracker for StoreStub {
+        type Error = StubError;
+
+        fn track_ephemeral_message<'a>(
+            &'a self,
+            chat_id: i64,
+            message_id: i32,
+            delete_after: Duration,
+            now: OffsetDateTime,
+        ) -> super::BoxFuture<'a, Result<(), Self::Error>> {
+            let result = {
+                let mut state = self.state.lock().expect("store state");
+                state
+                    .ephemeral_tracked
+                    .push((chat_id, message_id, delete_after, now));
+                if let Some(error) = &state.ephemeral_error {
+                    Err(error.clone())
+                } else {
+                    Ok(())
+                }
+            };
+            Box::pin(async move { result })
+        }
+    }
+
     #[tokio::test]
     async fn queue_text_message_parts_inserts_virtual_ids_before_dispatch_enqueue()
     -> Result<(), Box<dyn Error>> {
@@ -1221,6 +1419,7 @@ mod tests {
                 reply_to: None,
                 immediate_first: true,
                 bypass_chat_restrictions: false,
+                ephemeral_delete_after: None,
             },
             || ids.next().expect("virtual id"),
         )
@@ -1266,6 +1465,7 @@ mod tests {
                 reply_to: None,
                 immediate_first: false,
                 bypass_chat_restrictions: false,
+                ephemeral_delete_after: None,
             },
             || "v1".to_owned(),
         )
@@ -1299,6 +1499,7 @@ mod tests {
                 reply_to: None,
                 immediate_first: true,
                 bypass_chat_restrictions: true,
+                ephemeral_delete_after: None,
             },
             || "v1".to_owned(),
         )
@@ -1307,6 +1508,39 @@ mod tests {
         assert_eq!(report.enqueued_count(), 1);
         let item = queue.dequeue_immediate().expect("queued text item");
         assert!(item.bypasses_chat_restrictions());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn queue_text_message_parts_marks_only_first_part_ephemeral_like_go()
+    -> Result<(), Box<dyn Error>> {
+        let store = StoreStub::default();
+        let queue = DispatcherQueue::new(DispatcherConfig::default());
+        let text = format!("{}b", "a".repeat(4096));
+        let request = text_request(&text);
+        let mut ids = ["v1".to_owned(), "v2".to_owned()].into_iter();
+
+        let report = queue_text_message_parts(
+            &store,
+            &queue,
+            QueueTextRequest {
+                message: &request,
+                reply_to: None,
+                immediate_first: true,
+                bypass_chat_restrictions: false,
+                ephemeral_delete_after: Some(Duration::from_secs(60)),
+            },
+            || ids.next().expect("virtual id"),
+        )
+        .await?;
+
+        assert_eq!(report.enqueued_count(), 2);
+        let snapshot = queue.snapshot();
+        assert_eq!(
+            snapshot.immediate[0].ephemeral_delete_after,
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(snapshot.regular[0].ephemeral_delete_after, None);
         Ok(())
     }
 
@@ -1333,6 +1567,7 @@ mod tests {
                 reply_to: None,
                 immediate: true,
                 bypass_chat_restrictions: false,
+                ephemeral_delete_after: None,
             },
             || "sticker-v1".to_owned(),
         )
@@ -1398,6 +1633,7 @@ mod tests {
                 reply_to: Some(&reply),
                 immediate: false,
                 bypass_chat_restrictions: false,
+                ephemeral_delete_after: None,
             },
             || "sticker-v2".to_owned(),
         )
@@ -1689,7 +1925,7 @@ mod tests {
         assert_eq!(item.metadata().virtual_id, "");
         assert!(item.metadata().fingerprint_key.starts_with("42:unknown:"));
         assert!(item.bypasses_chat_restrictions());
-        let (_, method, _) = item.into_persistence_parts();
+        let (_, method, _, _) = item.into_persistence_parts();
         assert_eq!(
             method.as_ref().map(TelegramOutboundMethod::kind),
             Some(TelegramOutboundMethodKind::EditMessageText)
@@ -1739,6 +1975,57 @@ mod tests {
         assert_eq!(report.resolve_error, None);
         store.snapshot(|state| {
             assert_eq!(state.resolved, vec![("v1".to_owned(), 77)]);
+        });
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn send_work_item_and_resolve_tracks_ephemeral_after_successful_first_message()
+    -> Result<(), Box<dyn Error>> {
+        let store = StoreStub::default();
+        let now = OffsetDateTime::from_unix_timestamp(1_710_000_000)?;
+        let item = queued_ephemeral_text_item("v1", Duration::from_secs(60));
+
+        let report =
+            send_work_item_and_resolve_with_ephemeral(&store, &store, item, now, |_| async {
+                Ok::<_, StubError>(TelegramOutboundResponse::Message(Box::new(
+                    telegram_message(42, 77),
+                )))
+            })
+            .await;
+
+        assert_eq!(report.status, DispatcherSendStatus::Sent);
+        assert_eq!(report.resolved_message_id, Some(77));
+        assert_eq!(report.ephemeral_track_error, None);
+        store.snapshot(|state| {
+            assert_eq!(state.resolved, vec![("v1".to_owned(), 77)]);
+            assert_eq!(
+                state.ephemeral_tracked,
+                vec![(42, 77, Duration::from_secs(60), now)]
+            );
+        });
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn send_work_item_and_resolve_does_not_track_ephemeral_after_send_failure()
+    -> Result<(), Box<dyn Error>> {
+        let store = StoreStub::default();
+        let now = OffsetDateTime::from_unix_timestamp(1_710_000_000)?;
+        let item = queued_ephemeral_text_item("v1", Duration::from_secs(60));
+
+        let report =
+            send_work_item_and_resolve_with_ephemeral(&store, &store, item, now, |_| async {
+                Err::<TelegramOutboundResponse, _>(StubError("telegram failed"))
+            })
+            .await;
+
+        assert_eq!(report.status, DispatcherSendStatus::Failed);
+        store.snapshot(|state| {
+            assert!(state.resolved.is_empty());
+            assert!(state.ephemeral_tracked.is_empty());
         });
 
         Ok(())
@@ -2236,6 +2523,34 @@ mod tests {
             EnqueueOutcome::Enqueued
         );
         queue.dequeue_regular().expect("queued work item")
+    }
+
+    fn queued_ephemeral_text_item(
+        virtual_id: &str,
+        delete_after: Duration,
+    ) -> openplotva_telegram::DispatcherWorkItem {
+        let queue = DispatcherQueue::new(DispatcherConfig::default());
+        let method = build_text_message_method(
+            &text_request("hello"),
+            ChatRef {
+                id: 42,
+                is_forum: false,
+            },
+            None,
+            "hello",
+            true,
+        )
+        .expect("text method");
+        assert_eq!(
+            queue.enqueue(
+                DispatcherMessage::new(fingerprint_text_message_part(42, "hello"), virtual_id)
+                    .with_method(TelegramOutboundMethod::from(method))
+                    .with_ephemeral_delete_after(delete_after),
+                true,
+            ),
+            EnqueueOutcome::Enqueued
+        );
+        queue.dequeue_immediate().expect("queued work item")
     }
 
     fn telegram_message(chat_id: i64, message_id: i64) -> TelegramMessage {

@@ -338,6 +338,7 @@ where
             reply_to: Some(&reply_to),
             immediate_first: true,
             bypass_chat_restrictions: true,
+            ephemeral_delete_after: None,
         },
         next_virtual_id,
     )
@@ -468,6 +469,7 @@ where
                 message,
                 SETTINGS_SAME_CHAT_DECLINE_TEXT,
                 true,
+                None,
                 next_virtual_id,
             )
             .await?;
@@ -482,6 +484,7 @@ where
                 message,
                 SETTINGS_CHANNEL_DECLINE_TEXT,
                 true,
+                None,
                 next_virtual_id,
             )
             .await?;
@@ -507,6 +510,7 @@ where
                         message,
                         GROUP_SETTINGS_WAIT_NOTICE_TEXT,
                         true,
+                        Some(Duration::from_secs(60)),
                         next_virtual_id,
                     )
                     .await?;
@@ -520,6 +524,7 @@ where
                         message,
                         SETTINGS_QUEUE_ERROR_TEXT,
                         false,
+                        Some(Duration::from_secs(60)),
                         next_virtual_id,
                     )
                     .await?;
@@ -613,6 +618,7 @@ async fn queue_group_settings_notice<S, NextId>(
     message: &TelegramMessage,
     text: &str,
     bypass_chat_restrictions: bool,
+    ephemeral_delete_after: Option<Duration>,
     next_virtual_id: NextId,
 ) -> Result<QueueTextReport, OutboundBuildError>
 where
@@ -643,6 +649,7 @@ where
             reply_to: Some(&reply_to),
             immediate_first: true,
             bypass_chat_restrictions,
+            ephemeral_delete_after,
         },
         next_virtual_id,
     )
@@ -689,6 +696,7 @@ where
             reply_to: Some(&reply_to),
             immediate_first: true,
             bypass_chat_restrictions,
+            ephemeral_delete_after: None,
         },
         next_virtual_id,
     )
@@ -1286,6 +1294,7 @@ mod tests {
             .dequeue_immediate()
             .expect("private settings command should enqueue immediate text");
         assert!(item.bypasses_chat_restrictions());
+        assert_eq!(item.ephemeral_delete_after(), None);
         assert_eq!(
             item.method_kind(),
             Some(TelegramOutboundMethodKind::SendMessage)
@@ -1433,6 +1442,7 @@ mod tests {
             .dequeue_immediate()
             .expect("group settings wait notice should enqueue immediately");
         assert!(item.bypasses_chat_restrictions());
+        assert_eq!(item.ephemeral_delete_after(), Some(Duration::from_secs(60)));
         assert_eq!(
             item.method_kind(),
             Some(TelegramOutboundMethodKind::SendMessage)
@@ -1486,6 +1496,7 @@ mod tests {
             .dequeue_immediate()
             .expect("same-chat decline should enqueue immediately");
         assert!(item.bypasses_chat_restrictions());
+        assert_eq!(item.ephemeral_delete_after(), None);
         let method = item.into_method().expect("queued same-chat decline");
         let value = serde_json::to_value(method_as_value(method)?)?;
         assert_eq!(value["chat_id"], json!(-10042));
@@ -1530,6 +1541,7 @@ mod tests {
             .dequeue_immediate()
             .expect("queue failure notice should enqueue immediately");
         assert!(!item.bypasses_chat_restrictions());
+        assert_eq!(item.ephemeral_delete_after(), Some(Duration::from_secs(60)));
         let method = item.into_method().expect("queued failure notice");
         let value = serde_json::to_value(method_as_value(method)?)?;
         assert_eq!(value["chat_id"], json!(-10042));

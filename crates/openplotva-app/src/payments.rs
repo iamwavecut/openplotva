@@ -1767,6 +1767,7 @@ where
                     reply_to: Some(&reply_to),
                     immediate_first: false,
                     bypass_chat_restrictions: false,
+                    ephemeral_delete_after: None,
                 },
                 || (self.next_virtual_id)(),
             )

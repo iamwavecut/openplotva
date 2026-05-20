@@ -23,7 +23,7 @@ use openplotva_config::AppConfig;
 use openplotva_server::{ReadinessCheck, ReadinessResponse};
 use openplotva_storage::{
     PostgresChatSettingsStore, PostgresHistoryStore, PostgresPaymentStore, PostgresVipStore,
-    PostgresVirtualMessageStore, RedisRateLimitStore, ServiceClients,
+    PostgresVirtualMessageStore, RedisEphemeralMessageStore, RedisRateLimitStore, ServiceClients,
 };
 use serde::Deserialize;
 use thiserror::Error;
@@ -666,6 +666,7 @@ async fn start_runtime_workers(
     let store = PostgresVirtualMessageStore::new(service_clients.postgres.clone());
     let history_store = PostgresHistoryStore::new(service_clients.postgres.clone())
         .with_redis_client(service_clients.redis.client().clone());
+    let ephemeral_store = service_clients.redis.ephemeral_message_store();
 
     let dispatcher_persistence = openplotva_telegram::RedisDispatcherQueueStore::new(
         service_clients.redis.client().clone(),
@@ -798,6 +799,7 @@ async fn start_runtime_workers(
     let immediate_store = store.clone();
     let immediate_history = history_store.clone();
     let immediate_telegram = telegram.clone();
+    let immediate_ephemeral = ephemeral_store.clone();
     let immediate_rate_limits = Arc::clone(&rate_limit_policy);
     let immediate_permissions = Arc::clone(&permission_policy);
     let immediate_queue = Arc::clone(&dispatcher_queue);
@@ -809,6 +811,7 @@ async fn start_runtime_workers(
                     immediate_store.clone(),
                     immediate_history.clone(),
                     immediate_telegram.clone(),
+                    immediate_ephemeral.clone(),
                     Arc::clone(&immediate_rate_limits),
                     Arc::clone(&immediate_permissions),
                     item,
@@ -909,6 +912,7 @@ async fn start_runtime_workers(
     let regular_store = store;
     let regular_history = history_store;
     let regular_telegram = telegram;
+    let regular_ephemeral = ephemeral_store;
     let regular_rate_limits = Arc::clone(&rate_limit_policy);
     let regular_permissions = Arc::clone(&permission_policy);
     let regular_queue = Arc::clone(&dispatcher_queue);
@@ -924,6 +928,7 @@ async fn start_runtime_workers(
                         regular_store.clone(),
                         regular_history.clone(),
                         regular_telegram.clone(),
+                        regular_ephemeral.clone(),
                         Arc::clone(&regular_rate_limits),
                         Arc::clone(&regular_permissions),
                         item,
@@ -1055,6 +1060,7 @@ async fn send_dispatcher_work_item(
     store: PostgresVirtualMessageStore,
     history: PostgresHistoryStore,
     telegram: openplotva_telegram::TelegramClient,
+    ephemeral: RedisEphemeralMessageStore,
     rate_limits: Arc<rate_limits::ChatRateLimitPolicy<RedisRateLimitStore>>,
     permissions: Arc<permissions::ChatPermissionPolicy<PostgresChatSettingsStore>>,
     item: openplotva_telegram::DispatcherWorkItem,
@@ -1062,6 +1068,7 @@ async fn send_dispatcher_work_item(
     send_dispatcher_work_item_with_transport_and_history(
         store,
         history,
+        ephemeral,
         rate_limits,
         permissions,
         item,
@@ -1090,6 +1097,7 @@ where
     send_dispatcher_work_item_with_transport_and_history(
         store,
         pending_ops::NoopPendingOpHistory,
+        virtual_messages::NoopEphemeralMessageTracker,
         rate_limits,
         permissions,
         item,
@@ -1098,9 +1106,10 @@ where
     .await
 }
 
-async fn send_dispatcher_work_item_with_transport_and_history<V, H, R, P, SendFn, SendFuture>(
+async fn send_dispatcher_work_item_with_transport_and_history<V, H, E, R, P, SendFn, SendFuture>(
     store: V,
     history: H,
+    ephemeral: E,
     rate_limits: Arc<rate_limits::ChatRateLimitPolicy<R>>,
     permissions: Arc<permissions::ChatPermissionPolicy<P>>,
     item: openplotva_telegram::DispatcherWorkItem,
@@ -1109,6 +1118,7 @@ async fn send_dispatcher_work_item_with_transport_and_history<V, H, R, P, SendFn
 where
     V: virtual_messages::VirtualMessageStore + Sync,
     H: pending_ops::PendingOpHistory,
+    E: virtual_messages::EphemeralMessageTracker + Sync,
     R: rate_limits::RateLimitStore + Send + Sync,
     P: permissions::ChatPermissionStore + Send + Sync,
     SendFn: FnOnce(openplotva_telegram::TelegramOutboundMethod) -> SendFuture,
@@ -1161,10 +1171,12 @@ where
         }
     }
 
-    let report = virtual_messages::send_work_item_and_resolve_with_history(
+    let report = virtual_messages::send_work_item_and_resolve_with_history_and_ephemeral(
         &store,
         &history,
+        &ephemeral,
         item,
+        OffsetDateTime::now_utc(),
         |method| {
             let rate_limits = Arc::clone(&rate_limits);
             let permissions = Arc::clone(&permissions);
@@ -1224,6 +1236,14 @@ where
             real_message_id = ?report.resolved_message_id,
             resolve_error = ?report.resolve_error,
             "failed to resolve outbound virtual message"
+        );
+    }
+    if report.ephemeral_track_error.is_some() {
+        tracing::warn!(
+            virtual_id = report.virtual_id,
+            real_message_id = ?report.resolved_message_id,
+            ephemeral_track_error = ?report.ephemeral_track_error,
+            "failed to track outbound ephemeral message"
         );
     }
     report.status
