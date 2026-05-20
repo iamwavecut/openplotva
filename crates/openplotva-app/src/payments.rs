@@ -2,8 +2,8 @@ use std::{fmt, future::Future, pin::Pin};
 
 use carapax::types::{
     Message as TelegramMessage, MessageData as TelegramMessageData,
-    SuccessfulPayment as TelegramSuccessfulPayment, Update as TelegramUpdate,
-    UpdateType as TelegramUpdateType, User as TelegramUser,
+    PreCheckoutQuery as TelegramPreCheckoutQuery, SuccessfulPayment as TelegramSuccessfulPayment,
+    Update as TelegramUpdate, UpdateType as TelegramUpdateType, User as TelegramUser,
 };
 use openplotva_core::{UserState, VIP_EVENT_TYPE_PAYMENT, vip_days_to_seconds};
 use openplotva_storage::{
@@ -18,6 +18,9 @@ pub type PaymentStoreFuture<'a, T, E> = Pin<Box<dyn Future<Output = Result<T, E>
 
 /// Boxed future returned by payment side-effect calls.
 pub type PaymentEffectsFuture<'a, E> = Pin<Box<dyn Future<Output = Result<(), E>> + Send + 'a>>;
+
+/// Boxed future returned by direct pre-checkout acknowledgement calls.
+pub type PreCheckoutFuture<'a, E> = Pin<Box<dyn Future<Output = Result<(), E>> + Send + 'a>>;
 
 /// Telegram successful-payment payload captured from a message/control job.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -85,6 +88,24 @@ pub enum SuccessfulPaymentUpdateRoute {
     /// A Go successful-payment service message was processed.
     Processed(SuccessfulPaymentOutcome),
     /// The update was not a successful-payment service message and was delegated.
+    Delegated,
+}
+
+/// Pre-checkout acknowledgement result class.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PreCheckoutOutcome {
+    /// Telegram accepted the successful pre-checkout answer.
+    Acknowledged,
+    /// Telegram rejected the answer. Go logs this and still treats the update as handled.
+    AcknowledgementError,
+}
+
+/// Routing result for a decoded Telegram pre-checkout update.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PreCheckoutUpdateRoute {
+    /// A Go pre-checkout query was answered.
+    Processed(PreCheckoutOutcome),
+    /// The update was not a pre-checkout query and was delegated.
     Delegated,
 }
 
@@ -167,6 +188,35 @@ pub trait SuccessfulPaymentEffects {
 
     /// Invalidate cached VIP status after subscription activation.
     fn invalidate_vip_cache<'a>(&'a self, user_id: i64) -> PaymentEffectsFuture<'a, Self::Error>;
+}
+
+/// Side-effect boundary for Go `processPreCheckoutQuery`.
+pub trait PreCheckoutPaymentEffects {
+    /// Error returned by the concrete side-effect implementation.
+    type Error: fmt::Display + Send + Sync + 'static;
+
+    /// Answer a Telegram pre-checkout query with `ok=true`.
+    fn answer_pre_checkout_query<'a>(
+        &'a self,
+        pre_checkout_query_id: &'a str,
+    ) -> PreCheckoutFuture<'a, Self::Error>;
+}
+
+impl PreCheckoutPaymentEffects for openplotva_telegram::TelegramClient {
+    type Error = carapax::api::ExecuteError;
+
+    fn answer_pre_checkout_query<'a>(
+        &'a self,
+        pre_checkout_query_id: &'a str,
+    ) -> PreCheckoutFuture<'a, Self::Error> {
+        Box::pin(async move {
+            self.execute(openplotva_telegram::build_pre_checkout_ok_method(
+                pre_checkout_query_id.to_owned(),
+            ))
+            .await
+            .map(|_: bool| ())
+        })
+    }
 }
 
 /// Concrete storage bundle for successful-payment processing.
@@ -322,6 +372,55 @@ fn successful_payment_from_telegram(payment: &TelegramSuccessfulPayment) -> Succ
         invoice_payload: payment.invoice_payload.clone(),
         telegram_payment_charge_id: payment.telegram_payment_charge_id.clone(),
         provider_payment_charge_id: payment.provider_payment_charge_id.clone(),
+    }
+}
+
+/// Extract Go pre-checkout query ID from a decoded Telegram update.
+#[must_use]
+pub fn pre_checkout_query_id_from_update(update: &TelegramUpdate) -> Option<&str> {
+    let TelegramUpdateType::PreCheckoutQuery(query) = &update.update_type else {
+        return None;
+    };
+    Some(pre_checkout_query_id(query))
+}
+
+fn pre_checkout_query_id(query: &TelegramPreCheckoutQuery) -> &str {
+    &query.id
+}
+
+/// Handle only pre-checkout query updates and delegate all other updates to the caller.
+pub async fn handle_pre_checkout_update_or_else<Effects, HandleFn, HandleFuture, HandleError>(
+    effects: &Effects,
+    update: TelegramUpdate,
+    handle_other: HandleFn,
+) -> Result<PreCheckoutUpdateRoute, HandleError>
+where
+    Effects: PreCheckoutPaymentEffects + Sync,
+    HandleFn: FnOnce(TelegramUpdate) -> HandleFuture,
+    HandleFuture: Future<Output = Result<(), HandleError>>,
+{
+    let Some(pre_checkout_query_id) = pre_checkout_query_id_from_update(&update) else {
+        handle_other(update).await?;
+        return Ok(PreCheckoutUpdateRoute::Delegated);
+    };
+
+    match effects
+        .answer_pre_checkout_query(pre_checkout_query_id)
+        .await
+    {
+        Ok(()) => Ok(PreCheckoutUpdateRoute::Processed(
+            PreCheckoutOutcome::Acknowledged,
+        )),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                pre_checkout_query_id,
+                "failed to answer pre-checkout query"
+            );
+            Ok(PreCheckoutUpdateRoute::Processed(
+                PreCheckoutOutcome::AcknowledgementError,
+            ))
+        }
     }
 }
 
@@ -610,11 +709,12 @@ mod tests {
     use time::OffsetDateTime;
 
     use super::{
-        PaymentEffectsFuture, PaymentStoreFuture, SuccessfulPayment, SuccessfulPaymentEffects,
+        PaymentEffectsFuture, PaymentStoreFuture, PreCheckoutOutcome, PreCheckoutPaymentEffects,
+        PreCheckoutUpdateRoute, SuccessfulPayment, SuccessfulPaymentEffects,
         SuccessfulPaymentMessage, SuccessfulPaymentOutcome, SuccessfulPaymentStore,
-        SuccessfulPaymentUpdateRoute, handle_successful_payment_update_or_else_at,
-        process_successful_payment_at, subscription_success_text,
-        successful_payment_message_from_update,
+        SuccessfulPaymentUpdateRoute, handle_pre_checkout_update_or_else,
+        handle_successful_payment_update_or_else_at, process_successful_payment_at,
+        subscription_success_text, successful_payment_message_from_update,
     };
 
     #[tokio::test]
@@ -950,6 +1050,93 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn pre_checkout_update_wrapper_acknowledges_query_without_fallback()
+    -> Result<(), Box<dyn Error>> {
+        let effects = EffectsStub::default();
+        let fallback_calls = Arc::new(Mutex::new(Vec::new()));
+        let fallback_calls_for_handle = Arc::clone(&fallback_calls);
+
+        let route = handle_pre_checkout_update_or_else(
+            &effects,
+            sample_pre_checkout_update()?,
+            move |update| {
+                let fallback_calls = Arc::clone(&fallback_calls_for_handle);
+                async move {
+                    fallback_calls
+                        .lock()
+                        .map_err(|err| std::io::Error::other(err.to_string()))?
+                        .push(update.id);
+                    Ok::<(), std::io::Error>(())
+                }
+            },
+        )
+        .await?;
+
+        assert_eq!(
+            route,
+            PreCheckoutUpdateRoute::Processed(PreCheckoutOutcome::Acknowledged)
+        );
+        assert!(fallback_calls.lock().expect("fallback calls").is_empty());
+        assert_eq!(
+            effects.answered_pre_checkout_queries(),
+            vec!["pre-checkout-id".to_owned()]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pre_checkout_update_wrapper_keeps_ack_errors_nonfatal_like_go()
+    -> Result<(), Box<dyn Error>> {
+        let effects = EffectsStub::default().with_pre_checkout_error(StubError::Request);
+
+        let route = handle_pre_checkout_update_or_else(
+            &effects,
+            sample_pre_checkout_update()?,
+            |_update| async { Ok::<(), std::io::Error>(()) },
+        )
+        .await?;
+
+        assert_eq!(
+            route,
+            PreCheckoutUpdateRoute::Processed(PreCheckoutOutcome::AcknowledgementError)
+        );
+        assert_eq!(
+            effects.answered_pre_checkout_queries(),
+            vec!["pre-checkout-id".to_owned()]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pre_checkout_update_wrapper_delegates_non_pre_checkout_updates()
+    -> Result<(), Box<dyn Error>> {
+        let effects = EffectsStub::default();
+        let fallback_calls = Arc::new(Mutex::new(Vec::new()));
+        let fallback_calls_for_handle = Arc::clone(&fallback_calls);
+
+        let route =
+            handle_pre_checkout_update_or_else(&effects, sample_text_update()?, move |update| {
+                let fallback_calls = Arc::clone(&fallback_calls_for_handle);
+                async move {
+                    fallback_calls
+                        .lock()
+                        .map_err(|err| std::io::Error::other(err.to_string()))?
+                        .push(update.id);
+                    Ok::<(), std::io::Error>(())
+                }
+            })
+            .await?;
+
+        assert_eq!(route, PreCheckoutUpdateRoute::Delegated);
+        assert_eq!(
+            fallback_calls.lock().expect("fallback calls").as_slice(),
+            &[999]
+        );
+        assert!(effects.answered_pre_checkout_queries().is_empty());
+        Ok(())
+    }
+
     fn sample_message(payload: &str, total_amount: i64) -> SuccessfulPaymentMessage {
         SuccessfulPaymentMessage {
             chat_id: 42,
@@ -1026,6 +1213,24 @@ mod tests {
                     "username": "alice"
                 },
                 "text": "hello"
+            }
+        }))
+    }
+
+    fn sample_pre_checkout_update() -> Result<TelegramUpdate, serde_json::Error> {
+        serde_json::from_value(json!({
+            "update_id": 999,
+            "pre_checkout_query": {
+                "id": "pre-checkout-id",
+                "from": {
+                    "id": 42,
+                    "is_bot": false,
+                    "first_name": "Alice",
+                    "username": "alice"
+                },
+                "currency": "XTR",
+                "total_amount": 300,
+                "invoice_payload": "subscription_42"
             }
         }))
     }
@@ -1210,15 +1415,26 @@ mod tests {
     struct EffectsState {
         sent_texts: Vec<String>,
         invalidated_vip_users: Vec<i64>,
+        answered_pre_checkout_queries: Vec<String>,
+        next_pre_checkout_error: Option<StubError>,
     }
 
     impl EffectsStub {
+        fn with_pre_checkout_error(self, error: StubError) -> Self {
+            self.lock().next_pre_checkout_error = Some(error);
+            self
+        }
+
         fn sent_texts(&self) -> Vec<String> {
             self.lock().sent_texts.clone()
         }
 
         fn invalidated_vip_users(&self) -> Vec<i64> {
             self.lock().invalidated_vip_users.clone()
+        }
+
+        fn answered_pre_checkout_queries(&self) -> Vec<String> {
+            self.lock().answered_pre_checkout_queries.clone()
         }
 
         fn lock(&self) -> MutexGuard<'_, EffectsState> {
@@ -1254,15 +1470,37 @@ mod tests {
         }
     }
 
+    impl PreCheckoutPaymentEffects for EffectsStub {
+        type Error = StubError;
+
+        fn answer_pre_checkout_query<'a>(
+            &'a self,
+            pre_checkout_query_id: &'a str,
+        ) -> PaymentEffectsFuture<'a, Self::Error> {
+            Box::pin(async move {
+                let mut state = self.lock();
+                state
+                    .answered_pre_checkout_queries
+                    .push(pre_checkout_query_id.to_owned());
+                match state.next_pre_checkout_error.take() {
+                    Some(error) => Err(error),
+                    None => Ok(()),
+                }
+            })
+        }
+    }
+
     #[derive(Clone, Debug)]
     enum StubError {
         Duplicate,
+        Request,
     }
 
     impl fmt::Display for StubError {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             match self {
                 Self::Duplicate => f.write_str("duplicate"),
+                Self::Request => f.write_str("request"),
             }
         }
     }
