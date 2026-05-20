@@ -1517,6 +1517,7 @@ dependencies = [
  "openplotva-observability",
  "openplotva-server",
  "openplotva-storage",
+ "openplotva-taskman",
  "openplotva-telegram",
  "openplotva-updates",
  "reqwest",

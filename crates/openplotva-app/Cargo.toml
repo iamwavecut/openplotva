@@ -16,6 +16,7 @@ openplotva-core = { path = "../openplotva-core" }
 openplotva-observability = { path = "../openplotva-observability" }
 openplotva-server = { path = "../openplotva-server" }
 openplotva-storage = { path = "../openplotva-storage" }
+openplotva-taskman = { path = "../openplotva-taskman" }
 openplotva-telegram = { path = "../openplotva-telegram" }
 openplotva-updates = { path = "../openplotva-updates" }
 reqwest.workspace = true
