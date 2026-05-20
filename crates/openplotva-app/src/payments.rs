@@ -1735,16 +1735,26 @@ async fn send_vip_status_error_text<Effects>(
 }
 
 /// Handle the payment-owned subset of decoded updates, delegating everything else.
-pub async fn handle_payment_update_or_else_at<Queue, Effects, HandleFn, HandleFuture, HandleError>(
+pub async fn handle_payment_update_or_else_at<
+    Queue,
+    Vip,
+    Effects,
+    HandleFn,
+    HandleFuture,
+    HandleError,
+>(
     queue: &Queue,
+    vip: &Vip,
     effects: &Effects,
     update: TelegramUpdate,
     created: OffsetDateTime,
+    now: OffsetDateTime,
     handle_other: HandleFn,
 ) -> Result<PaymentUpdateRoute, HandleError>
 where
     Queue: PaymentControlJobQueue + Sync,
-    Effects: PreCheckoutPaymentEffects + Sync,
+    Vip: VipStatusChecker + VipStatusStore + Sync,
+    Effects: PreCheckoutPaymentEffects + VipStatusEffects + Sync,
     HandleFn: FnOnce(TelegramUpdate) -> HandleFuture,
     HandleFuture: Future<Output = Result<(), HandleError>>,
 {
@@ -1780,35 +1790,20 @@ where
         return Ok(PaymentUpdateRoute::SuccessfulPayment(route));
     }
 
-    match payment_invoice_control_job_from_update_at(&update, created) {
-        PaymentInvoiceControlJobBuild::Job(job) => {
-            let route = match queue
-                .assign_payment_control_job(CONTROL_QUEUE_NAME, *job)
-                .await
-            {
-                Ok(()) => PaymentInvoiceCommandUpdateRoute::Queued,
-                Err(error) => {
-                    tracing::warn!(%error, "failed to assign payment invoice control job");
-                    PaymentInvoiceCommandUpdateRoute::QueueError
-                }
-            };
-            Ok(PaymentUpdateRoute::InvoiceCommand(route))
-        }
-        PaymentInvoiceControlJobBuild::NonPrivateChat => Ok(PaymentUpdateRoute::InvoiceCommand(
-            PaymentInvoiceCommandUpdateRoute::NonPrivateChat,
-        )),
-        PaymentInvoiceControlJobBuild::MissingUser => Ok(PaymentUpdateRoute::InvoiceCommand(
-            PaymentInvoiceCommandUpdateRoute::MissingUser,
-        )),
-        PaymentInvoiceControlJobBuild::InvalidDonationAmount => {
-            Ok(PaymentUpdateRoute::InvoiceCommand(
-                PaymentInvoiceCommandUpdateRoute::InvalidDonationAmount,
-            ))
-        }
-        PaymentInvoiceControlJobBuild::NotPaymentCommand => {
-            handle_other(update).await?;
-            Ok(PaymentUpdateRoute::Delegated)
-        }
+    let route = enqueue_payment_invoice_command_update_with_vip_status_or_else_at(
+        queue,
+        vip,
+        effects,
+        update,
+        created,
+        now,
+        handle_other,
+    )
+    .await?;
+    if route == PaymentInvoiceCommandUpdateRoute::Delegated {
+        Ok(PaymentUpdateRoute::Delegated)
+    } else {
+        Ok(PaymentUpdateRoute::InvoiceCommand(route))
     }
 }
 
@@ -3404,16 +3399,22 @@ mod tests {
     async fn payment_update_wrapper_acknowledges_pre_checkout_before_fallback()
     -> Result<(), Box<dyn Error>> {
         let created = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let now = time::Date::from_calendar_date(2026, time::Month::June, 16)?
+            .with_hms(9, 30, 0)?
+            .assume_utc();
         let queue = PaymentControlJobQueueStub::default();
+        let store = VipStatusStoreStub::new().with_is_vip(true);
         let effects = EffectsStub::default();
         let fallback_calls = Arc::new(Mutex::new(Vec::new()));
         let fallback_calls_for_handle = Arc::clone(&fallback_calls);
 
         let route = handle_payment_update_or_else_at(
             &queue,
+            &store,
             &effects,
             sample_pre_checkout_update()?,
             created,
+            now,
             move |update| {
                 let fallback_calls = Arc::clone(&fallback_calls_for_handle);
                 async move {
@@ -3444,16 +3445,22 @@ mod tests {
     async fn payment_update_wrapper_queues_successful_payment_before_fallback()
     -> Result<(), Box<dyn Error>> {
         let created = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let now = time::Date::from_calendar_date(2026, time::Month::June, 16)?
+            .with_hms(9, 30, 0)?
+            .assume_utc();
         let queue = PaymentControlJobQueueStub::default();
+        let store = VipStatusStoreStub::new().with_is_vip(true);
         let effects = EffectsStub::default();
         let fallback_calls = Arc::new(Mutex::new(Vec::new()));
         let fallback_calls_for_handle = Arc::clone(&fallback_calls);
 
         let route = handle_payment_update_or_else_at(
             &queue,
+            &store,
             &effects,
             sample_successful_payment_update("subscription_42", 300)?,
             created,
+            now,
             move |update| {
                 let fallback_calls = Arc::clone(&fallback_calls_for_handle);
                 async move {
@@ -3494,16 +3501,22 @@ mod tests {
     async fn payment_update_wrapper_queues_invoice_command_before_fallback()
     -> Result<(), Box<dyn Error>> {
         let created = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let now = time::Date::from_calendar_date(2026, time::Month::June, 16)?
+            .with_hms(9, 30, 0)?
+            .assume_utc();
         let queue = PaymentControlJobQueueStub::default();
+        let store = VipStatusStoreStub::new().with_is_vip(false);
         let effects = EffectsStub::default();
         let fallback_calls = Arc::new(Mutex::new(Vec::new()));
         let fallback_calls_for_handle = Arc::clone(&fallback_calls);
 
         let route = handle_payment_update_or_else_at(
             &queue,
+            &store,
             &effects,
             sample_payment_command_update("/vip")?,
             created,
+            now,
             move |update| {
                 let fallback_calls = Arc::clone(&fallback_calls_for_handle);
                 async move {
@@ -3539,19 +3552,80 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn payment_update_wrapper_delegates_non_payment_updates_once()
+    async fn payment_update_wrapper_sends_existing_vip_status_before_invoice_queueing()
     -> Result<(), Box<dyn Error>> {
         let created = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let now = time::Date::from_calendar_date(2026, time::Month::June, 16)?
+            .with_hms(9, 30, 0)?
+            .assume_utc();
         let queue = PaymentControlJobQueueStub::default();
+        let store = VipStatusStoreStub::new()
+            .with_is_vip(true)
+            .with_summary(active_vip_summary(now, now + time::Duration::days(3)))
+            .with_active_subscription(active_subscription(now, now + time::Duration::days(3)));
         let effects = EffectsStub::default();
         let fallback_calls = Arc::new(Mutex::new(Vec::new()));
         let fallback_calls_for_handle = Arc::clone(&fallback_calls);
 
         let route = handle_payment_update_or_else_at(
             &queue,
+            &store,
+            &effects,
+            sample_payment_command_update("/vip")?,
+            created,
+            now,
+            move |update| {
+                let fallback_calls = Arc::clone(&fallback_calls_for_handle);
+                async move {
+                    fallback_calls
+                        .lock()
+                        .map_err(|err| std::io::Error::other(err.to_string()))?
+                        .push(update.id);
+                    Ok::<(), std::io::Error>(())
+                }
+            },
+        )
+        .await?;
+
+        assert_eq!(
+            route,
+            PaymentUpdateRoute::InvoiceCommand(
+                PaymentInvoiceCommandUpdateRoute::ExistingVipStatusSent
+            )
+        );
+        assert!(queue.assigned().is_empty());
+        assert!(fallback_calls.lock().expect("fallback calls").is_empty());
+        let status_messages = effects.vip_status_messages();
+        assert_eq!(status_messages.len(), 1);
+        assert!(
+            status_messages[0]
+                .text
+                .contains("У вас уже есть активный VIP статус")
+        );
+        assert!(status_messages[0].show_cancel_button);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn payment_update_wrapper_delegates_non_payment_updates_once()
+    -> Result<(), Box<dyn Error>> {
+        let created = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let now = time::Date::from_calendar_date(2026, time::Month::June, 16)?
+            .with_hms(9, 30, 0)?
+            .assume_utc();
+        let queue = PaymentControlJobQueueStub::default();
+        let store = VipStatusStoreStub::new().with_is_vip(true);
+        let effects = EffectsStub::default();
+        let fallback_calls = Arc::new(Mutex::new(Vec::new()));
+        let fallback_calls_for_handle = Arc::clone(&fallback_calls);
+
+        let route = handle_payment_update_or_else_at(
+            &queue,
+            &store,
             &effects,
             sample_text_update()?,
             created,
+            now,
             move |update| {
                 let fallback_calls = Arc::clone(&fallback_calls_for_handle);
                 async move {
