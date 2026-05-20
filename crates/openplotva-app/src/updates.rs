@@ -367,6 +367,43 @@ pub enum UpdateHandleWithHistoryError {
     },
 }
 
+/// Adapter that adds non-fatal history persistence to an existing update handler.
+#[derive(Clone, Debug)]
+pub struct UpdateHandlerWithHistory<History, Handler> {
+    history_store: Arc<History>,
+    handler: Arc<Handler>,
+    bot_id: i64,
+}
+
+impl<History, Handler> UpdateHandlerWithHistory<History, Handler> {
+    /// Wrap a concrete update handler with Go-style history side effects.
+    pub fn new(history_store: Arc<History>, handler: Arc<Handler>, bot_id: i64) -> Self {
+        Self {
+            history_store,
+            handler,
+            bot_id,
+        }
+    }
+}
+
+impl<History, Handler> UpdateHandler for UpdateHandlerWithHistory<History, Handler>
+where
+    History: InboundHistoryStore + EditedHistoryStore + Send + Sync,
+    Handler: UpdateHandler + Send + Sync,
+{
+    type Error = UpdateHandleWithHistoryError;
+
+    fn handle_update<'a>(&'a self, update: TelegramUpdate) -> UpdateHandlerFuture<'a, Self::Error> {
+        Box::pin(async move {
+            handle_update_with_history(self.history_store.as_ref(), update, self.bot_id, |update| {
+                self.handler.handle_update(update)
+            })
+            .await
+            .map(|_| ())
+        })
+    }
+}
+
 /// Build and persist the Go-shaped history entry for one inbound Telegram message update.
 pub async fn persist_inbound_message_history<S>(
     store: &S,
@@ -799,9 +836,10 @@ mod tests {
     use super::{
         EditedHistoryStore, EditedHistoryStoreFuture, InboundHistoryStore,
         InboundHistoryStoreFuture, InboundHistoryUpsert, UpdateHandler, UpdateHandlerFuture,
-        UpdateSource, UpdateSourceFuture, UpdateStateStore, UpdateStateStoreFuture,
-        persist_update_state, process_update_with_state_and_history_store_at,
-        process_update_with_state_store_at, run_update_consumer_until,
+        UpdateHandlerWithHistory, UpdateSource, UpdateSourceFuture, UpdateStateStore,
+        UpdateStateStoreFuture, persist_update_state,
+        process_update_with_state_and_history_store_at, process_update_with_state_store_at,
+        run_update_consumer_until,
     };
 
     #[tokio::test]
@@ -1156,6 +1194,46 @@ mod tests {
             vec!["temporary redis error".to_owned()]
         );
         assert_eq!(handler.calls(), vec![12345]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_update_consumer_until_can_wrap_handler_with_nonfatal_history()
+    -> Result<(), Box<dyn Error>> {
+        let source = Arc::new(SourceStub::new(vec![SourceAction::Update(Box::new(
+            sample_message_update()?,
+        ))]));
+        let store = Arc::new(StoreStub::default());
+        let history = Arc::new(HistoryStoreStub::with_inbound_failure(
+            "history unavailable",
+        ));
+        let inner_handler = Arc::new(HandlerStub::default());
+        let handler = Arc::new(UpdateHandlerWithHistory::new(
+            Arc::clone(&history),
+            Arc::clone(&inner_handler),
+            0,
+        ));
+
+        let report = run_update_consumer_until(
+            source,
+            UpdateConsumerConfig {
+                dequeue_timeout: Duration::from_millis(1),
+                state_timeout: Duration::from_secs(1),
+                handle_timeout: Duration::from_secs(1),
+                side_effect_max_age: Duration::from_secs(400_000_000),
+                worker_limit: 2,
+            },
+            store,
+            handler,
+            inner_handler.wait_for_calls(1),
+        )
+        .await;
+
+        assert_eq!(report.dequeued, 1);
+        assert_eq!(report.processed, 1);
+        assert_eq!(report.handle_failures, 0);
+        assert_eq!(inner_handler.calls(), vec![12345]);
+        assert!(history.entries().is_empty());
         Ok(())
     }
 
