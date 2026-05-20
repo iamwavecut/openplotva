@@ -485,6 +485,48 @@ impl RedisEphemeralMessageStore {
             .transpose()
     }
 
+    /// Load all persisted ephemeral-message records by the Go key pattern.
+    pub async fn ephemeral_messages(&self) -> Result<Vec<EphemeralMessage>, StorageError> {
+        let mut connection = self
+            .client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|source| StorageError::Redis { source })?;
+        let mut cursor = 0_u64;
+        let mut messages = Vec::new();
+        let pattern = format!("{}*", self.key_prefix);
+
+        loop {
+            let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg(&pattern)
+                .arg("COUNT")
+                .arg(100_u64)
+                .query_async(&mut connection)
+                .await
+                .map_err(|source| StorageError::Redis { source })?;
+
+            if !keys.is_empty() {
+                let values: Vec<Option<Vec<u8>>> = redis::cmd("MGET")
+                    .arg(&keys)
+                    .query_async(&mut connection)
+                    .await
+                    .map_err(|source| StorageError::Redis { source })?;
+                for value in values.into_iter().flatten() {
+                    messages.push(ephemeral_message_from_redis_value(&value)?);
+                }
+            }
+
+            if next_cursor == 0 {
+                break;
+            }
+            cursor = next_cursor;
+        }
+
+        Ok(messages)
+    }
+
     /// Delete persisted ephemeral-message records after Telegram delete attempts.
     pub async fn delete_ephemeral_messages(
         &self,
@@ -3566,6 +3608,10 @@ mod tests {
                     .ephemeral_message(message.chat_id, message.message_id)
                     .await?,
                 Some(message.clone())
+            );
+            assert!(
+                store.ephemeral_messages().await?.contains(&message),
+                "SCAN/MGET should load the same Rust-native ephemeral record"
             );
             store
                 .delete_ephemeral_messages(std::slice::from_ref(&message))

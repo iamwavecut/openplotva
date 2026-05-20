@@ -796,6 +796,32 @@ async fn start_runtime_workers(
     ));
     workers.handles.push(pending_worker);
 
+    let ephemeral_cleanup_store = ephemeral_store.clone();
+    let ephemeral_cleanup_telegram = telegram.clone();
+    let ephemeral_cleanup_stop = stop.subscribe();
+    let ephemeral_cleanup_worker = tokio::spawn(async move {
+        let report = virtual_messages::run_ephemeral_cleanup_worker_until(
+            &ephemeral_cleanup_store,
+            |method| {
+                let telegram = ephemeral_cleanup_telegram.clone();
+                async move {
+                    openplotva_telegram::execute_telegram_method(&telegram, method)
+                        .await
+                        .map(|_| ())
+                }
+            },
+            wait_for_runtime_stop(ephemeral_cleanup_stop),
+        )
+        .await;
+
+        tracing::info!(?report, "ephemeral message cleanup worker stopped");
+    });
+    readiness_checks.push(ReadinessCheck::ok(
+        "ephemeral_messages",
+        "Telegram ephemeral message cleanup worker started",
+    ));
+    workers.handles.push(ephemeral_cleanup_worker);
+
     let immediate_store = store.clone();
     let immediate_history = history_store.clone();
     let immediate_telegram = telegram.clone();

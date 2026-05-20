@@ -4,19 +4,20 @@ use std::{fmt, future::Future, pin::Pin, time::Duration};
 
 use openplotva_core::{MessageIdMapping, ReadyPendingOp};
 use openplotva_telegram::{
-    AudioMessageRequest, DispatcherMessage, DispatcherQueue, DispatcherSendStatus,
-    DispatcherWorkItem, EditMediaMessageRequest, EditTextMessageRequest, EnqueueOutcome,
-    MediaGroupMessageRequest, MediaGroupPhotoItem, MessageFingerprint, OutboundBuildError,
-    PENDING_OP_DELETE, PENDING_OP_EDIT, PendingOpBuildError, PhotoMessageRequest, ReplyMessageRef,
-    StickerMessageRequest, TELEGRAM_TEXT_MAX_BYTES, TelegramOutboundMethod,
-    TelegramOutboundResponse, TextMessageRequest, build_audio_message_method,
-    build_audio_message_plan, build_edit_media_message_method, build_edit_media_message_plan,
-    build_edit_text_message_method, build_media_group_message_method,
-    build_media_group_message_plan, build_pending_op_method, build_photo_message_method,
-    build_photo_message_plan, build_sticker_message_method, build_sticker_message_plan,
-    build_text_message_method, fingerprint_audio_message_plan, fingerprint_photo_message_plan,
-    fingerprint_sticker_message_plan, fingerprint_text_message_part, forum_thread_id, hash_content,
-    message_target_chat, split_telegram_text, validate_text_message_text,
+    AudioMessageRequest, DeleteMessageRequest, DispatcherMessage, DispatcherQueue,
+    DispatcherSendStatus, DispatcherWorkItem, EditMediaMessageRequest, EditTextMessageRequest,
+    EnqueueOutcome, MediaGroupMessageRequest, MediaGroupPhotoItem, MessageFingerprint,
+    OutboundBuildError, PENDING_OP_DELETE, PENDING_OP_EDIT, PendingOpBuildError,
+    PhotoMessageRequest, ReplyMessageRef, StickerMessageRequest, TELEGRAM_TEXT_MAX_BYTES,
+    TelegramOutboundMethod, TelegramOutboundResponse, TextMessageRequest,
+    build_audio_message_method, build_audio_message_plan, build_delete_message_method,
+    build_edit_media_message_method, build_edit_media_message_plan, build_edit_text_message_method,
+    build_media_group_message_method, build_media_group_message_plan, build_pending_op_method,
+    build_photo_message_method, build_photo_message_plan, build_sticker_message_method,
+    build_sticker_message_plan, build_text_message_method, fingerprint_audio_message_plan,
+    fingerprint_photo_message_plan, fingerprint_sticker_message_plan,
+    fingerprint_text_message_part, forum_thread_id, hash_content, message_target_chat,
+    split_telegram_text, validate_text_message_text,
 };
 use serde_json::json;
 use thiserror::Error;
@@ -164,6 +165,40 @@ impl EphemeralMessageTracker for openplotva_storage::RedisEphemeralMessageStore 
             )
             .await
         })
+    }
+}
+
+/// Store boundary for Go's periodic ephemeral-message cleanup.
+pub trait EphemeralCleanupStore {
+    /// Store error type.
+    type Error: fmt::Display + Send + Sync + 'static;
+
+    /// Load all tracked ephemeral messages.
+    fn ephemeral_messages<'a>(
+        &'a self,
+    ) -> BoxFuture<'a, Result<Vec<openplotva_storage::EphemeralMessage>, Self::Error>>;
+
+    /// Delete tracked ephemeral-message records after Telegram delete attempts.
+    fn delete_ephemeral_messages<'a>(
+        &'a self,
+        messages: &'a [openplotva_storage::EphemeralMessage],
+    ) -> BoxFuture<'a, Result<(), Self::Error>>;
+}
+
+impl EphemeralCleanupStore for openplotva_storage::RedisEphemeralMessageStore {
+    type Error = openplotva_storage::StorageError;
+
+    fn ephemeral_messages<'a>(
+        &'a self,
+    ) -> BoxFuture<'a, Result<Vec<openplotva_storage::EphemeralMessage>, Self::Error>> {
+        Box::pin(async move { self.ephemeral_messages().await })
+    }
+
+    fn delete_ephemeral_messages<'a>(
+        &'a self,
+        messages: &'a [openplotva_storage::EphemeralMessage],
+    ) -> BoxFuture<'a, Result<(), Self::Error>> {
+        Box::pin(async move { self.delete_ephemeral_messages(messages).await })
     }
 }
 
@@ -454,6 +489,208 @@ pub struct DispatchResolveReport {
     pub ephemeral_track_error: Option<String>,
     /// Whether a direct edit-text item was reflected into history after send success.
     pub history_updated: bool,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct EphemeralCleanupReport {
+    /// Number of tracked records loaded from the store.
+    pub loaded: usize,
+    /// Number of records expired at the strict Go `now > expires_at` boundary.
+    pub expired: usize,
+    /// Number of Telegram delete requests attempted.
+    pub telegram_delete_attempted: usize,
+    /// Number of Telegram delete requests that failed.
+    pub telegram_delete_failed: usize,
+    /// Last Telegram delete error observed in this tick.
+    pub telegram_delete_error: Option<String>,
+    /// Number of expired records removed from the store.
+    pub store_deleted: usize,
+    /// Number of cleanup batches whose store deletion failed.
+    pub store_delete_failed_batches: usize,
+    /// Store list error, if the tick could not load records.
+    pub list_error: Option<String>,
+    /// Last store deletion error, if any cleanup batch failed to delete records.
+    pub store_delete_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct EphemeralCleanupWorkerReport {
+    /// Number of cleanup ticks processed before stop.
+    pub ticks: usize,
+    /// Total records loaded from the store.
+    pub loaded: usize,
+    /// Total expired records found.
+    pub expired: usize,
+    /// Total Telegram delete requests attempted.
+    pub telegram_delete_attempted: usize,
+    /// Total Telegram delete requests that failed.
+    pub telegram_delete_failed: usize,
+    /// Last Telegram delete error observed by the worker.
+    pub last_telegram_delete_error: Option<String>,
+    /// Total expired records removed from the store.
+    pub store_deleted: usize,
+    /// Total store deletion batches that failed.
+    pub store_delete_failed_batches: usize,
+    /// Number of ticks that failed while listing store records.
+    pub list_errors: usize,
+    /// Last list error observed by the worker.
+    pub last_list_error: Option<String>,
+    /// Last store deletion error observed by the worker.
+    pub last_store_delete_error: Option<String>,
+}
+
+impl EphemeralCleanupWorkerReport {
+    fn record_tick(&mut self, tick: &EphemeralCleanupReport) {
+        self.ticks += 1;
+        self.loaded += tick.loaded;
+        self.expired += tick.expired;
+        self.telegram_delete_attempted += tick.telegram_delete_attempted;
+        self.telegram_delete_failed += tick.telegram_delete_failed;
+        if let Some(error) = &tick.telegram_delete_error {
+            self.last_telegram_delete_error = Some(error.clone());
+        }
+        self.store_deleted += tick.store_deleted;
+        self.store_delete_failed_batches += tick.store_delete_failed_batches;
+        if let Some(error) = &tick.list_error {
+            self.list_errors += 1;
+            self.last_list_error = Some(error.clone());
+        }
+        if let Some(error) = &tick.store_delete_error {
+            self.last_store_delete_error = Some(error.clone());
+        }
+    }
+}
+
+pub async fn process_ephemeral_cleanup_once_at<S, Send, SendFuture, SendError>(
+    store: &S,
+    now: OffsetDateTime,
+    mut send_delete: Send,
+) -> EphemeralCleanupReport
+where
+    S: EphemeralCleanupStore + Sync,
+    Send: FnMut(TelegramOutboundMethod) -> SendFuture,
+    SendFuture: Future<Output = Result<(), SendError>>,
+    SendError: fmt::Display,
+{
+    let messages = match store.ephemeral_messages().await {
+        Ok(messages) => messages,
+        Err(error) => {
+            return EphemeralCleanupReport {
+                list_error: Some(error.to_string()),
+                ..EphemeralCleanupReport::default()
+            };
+        }
+    };
+
+    let expired = openplotva_storage::expired_ephemeral_messages_at(&messages, now);
+    let mut report = EphemeralCleanupReport {
+        loaded: messages.len(),
+        expired: expired.len(),
+        ..EphemeralCleanupReport::default()
+    };
+
+    for batch in expired.chunks(openplotva_storage::EPHEMERAL_CLEANUP_BATCH_SIZE) {
+        for message in batch {
+            let Ok(method) = build_delete_message_method(&DeleteMessageRequest {
+                chat_id: message.chat_id,
+                message_id: message.message_id,
+            }) else {
+                continue;
+            };
+            report.telegram_delete_attempted += 1;
+            if let Err(error) = send_delete(TelegramOutboundMethod::from(method)).await {
+                report.telegram_delete_failed += 1;
+                report.telegram_delete_error = Some(error.to_string());
+            }
+        }
+
+        match store.delete_ephemeral_messages(batch).await {
+            Ok(()) => {
+                report.store_deleted += batch.len();
+            }
+            Err(error) => {
+                report.store_delete_failed_batches += 1;
+                report.store_delete_error = Some(error.to_string());
+            }
+        }
+    }
+
+    report
+}
+
+pub async fn run_ephemeral_cleanup_worker_until<S, Send, SendFuture, SendError, Stop>(
+    store: &S,
+    send_delete: Send,
+    stop: Stop,
+) -> EphemeralCleanupWorkerReport
+where
+    S: EphemeralCleanupStore + Sync,
+    Send: FnMut(TelegramOutboundMethod) -> SendFuture,
+    SendFuture: Future<Output = Result<(), SendError>>,
+    SendError: fmt::Display,
+    Stop: Future<Output = ()>,
+{
+    run_ephemeral_cleanup_worker_every_until(
+        store,
+        send_delete,
+        openplotva_storage::EPHEMERAL_DEFAULT_CLEANUP_INTERVAL,
+        stop,
+    )
+    .await
+}
+
+pub async fn run_ephemeral_cleanup_worker_every_until<S, Send, SendFuture, SendError, Stop>(
+    store: &S,
+    mut send_delete: Send,
+    interval: Duration,
+    stop: Stop,
+) -> EphemeralCleanupWorkerReport
+where
+    S: EphemeralCleanupStore + Sync,
+    Send: FnMut(TelegramOutboundMethod) -> SendFuture,
+    SendFuture: Future<Output = Result<(), SendError>>,
+    SendError: fmt::Display,
+    Stop: Future<Output = ()>,
+{
+    let mut report = EphemeralCleanupWorkerReport::default();
+    let mut stop = std::pin::pin!(stop);
+
+    loop {
+        tokio::select! {
+            () = &mut stop => break,
+            () = tokio::time::sleep(interval) => {
+                let tick = process_ephemeral_cleanup_once_at(
+                    store,
+                    OffsetDateTime::now_utc(),
+                    &mut send_delete,
+                )
+                .await;
+                trace_ephemeral_cleanup_tick(&tick);
+                report.record_tick(&tick);
+            }
+        }
+    }
+
+    report
+}
+
+fn trace_ephemeral_cleanup_tick(tick: &EphemeralCleanupReport) {
+    if tick.loaded == 0 && tick.list_error.is_none() {
+        return;
+    }
+
+    tracing::debug!(
+        loaded = tick.loaded,
+        expired = tick.expired,
+        telegram_delete_attempted = tick.telegram_delete_attempted,
+        telegram_delete_failed = tick.telegram_delete_failed,
+        telegram_delete_error = tick.telegram_delete_error.as_deref(),
+        store_deleted = tick.store_deleted,
+        store_delete_failed_batches = tick.store_delete_failed_batches,
+        list_error = tick.list_error.as_deref(),
+        store_delete_error = tick.store_delete_error.as_deref(),
+        "processed ephemeral message cleanup tick"
+    );
 }
 
 /// Recoverable errors from immediate virtual-message handling.
@@ -1180,6 +1417,7 @@ mod tests {
 
     use carapax::types::EditMessageResult;
     use openplotva_core::MessageIdMapping;
+    use openplotva_storage::EphemeralMessage;
     use openplotva_telegram::{
         AudioMessageRequest, AudioSource, ChatRef, DispatcherConfig, DispatcherMessage,
         DispatcherQueue, DispatcherSendStatus, EditMediaMessageRequest, EditTextMessageRequest,
@@ -1224,11 +1462,15 @@ mod tests {
         enqueue_error: Option<StubError>,
         resolve_error: Option<StubError>,
         ephemeral_error: Option<StubError>,
+        ephemeral_list_error: Option<StubError>,
+        ephemeral_delete_error: Option<StubError>,
         delete_mapping_error: Option<StubError>,
+        ephemeral_messages: Vec<EphemeralMessage>,
         lookup_calls: Vec<String>,
         inserted: Vec<(String, i64, Option<i32>)>,
         resolved: Vec<(String, i32)>,
         ephemeral_tracked: Vec<(i64, i32, Duration, OffsetDateTime)>,
+        ephemeral_deleted: Vec<Vec<EphemeralMessage>>,
         enqueued: Vec<(String, i64, &'static str, Option<String>)>,
         deleted_mappings: Vec<String>,
         events: Vec<String>,
@@ -1393,6 +1635,41 @@ mod tests {
                     .ephemeral_tracked
                     .push((chat_id, message_id, delete_after, now));
                 if let Some(error) = &state.ephemeral_error {
+                    Err(error.clone())
+                } else {
+                    Ok(())
+                }
+            };
+            Box::pin(async move { result })
+        }
+    }
+
+    impl super::EphemeralCleanupStore for StoreStub {
+        type Error = StubError;
+
+        fn ephemeral_messages<'a>(
+            &'a self,
+        ) -> super::BoxFuture<'a, Result<Vec<EphemeralMessage>, Self::Error>> {
+            let result = {
+                let state = self.state.lock().expect("store state");
+                if let Some(error) = &state.ephemeral_list_error {
+                    Err(error.clone())
+                } else {
+                    Ok(state.ephemeral_messages.clone())
+                }
+            };
+            Box::pin(async move { result })
+        }
+
+        fn delete_ephemeral_messages<'a>(
+            &'a self,
+            messages: &'a [EphemeralMessage],
+        ) -> super::BoxFuture<'a, Result<(), Self::Error>> {
+            let messages = messages.to_vec();
+            let result = {
+                let mut state = self.state.lock().expect("store state");
+                state.ephemeral_deleted.push(messages);
+                if let Some(error) = &state.ephemeral_delete_error {
                     Err(error.clone())
                 } else {
                     Ok(())
@@ -2028,6 +2305,134 @@ mod tests {
             assert!(state.ephemeral_tracked.is_empty());
         });
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ephemeral_cleanup_deletes_expired_messages_in_go_batches_and_removes_store_records()
+    -> Result<(), Box<dyn Error>> {
+        let now = OffsetDateTime::from_unix_timestamp(1_710_000_000)?;
+        let mut messages = (1..=11)
+            .map(|message_id| EphemeralMessage {
+                chat_id: -10042,
+                message_id,
+                expires_at: now - time::Duration::seconds(1),
+            })
+            .collect::<Vec<_>>();
+        messages.push(EphemeralMessage {
+            chat_id: -10042,
+            message_id: 12,
+            expires_at: now,
+        });
+        messages.push(EphemeralMessage {
+            chat_id: -10042,
+            message_id: 13,
+            expires_at: now + time::Duration::seconds(1),
+        });
+        let store = StoreStub::with_state(StoreState {
+            ephemeral_messages: messages,
+            ..StoreState::default()
+        });
+        let mut delete_payloads = Vec::new();
+
+        let report = super::process_ephemeral_cleanup_once_at(&store, now, |method| {
+            let (kind, payload) = method_payload(method);
+            assert_eq!(kind, TelegramOutboundMethodKind::DeleteMessage);
+            delete_payloads.push((payload["chat_id"].clone(), payload["message_id"].clone()));
+            async { Ok::<_, StubError>(()) }
+        })
+        .await;
+
+        assert_eq!(report.loaded, 13);
+        assert_eq!(report.expired, 11);
+        assert_eq!(report.telegram_delete_attempted, 11);
+        assert_eq!(report.telegram_delete_failed, 0);
+        assert_eq!(report.store_deleted, 11);
+        assert_eq!(report.store_delete_failed_batches, 0);
+        assert_eq!(report.list_error, None);
+        assert_eq!(delete_payloads.len(), 11);
+        assert_eq!(delete_payloads[0], (json!(-10042), json!(1)));
+        assert_eq!(delete_payloads[10], (json!(-10042), json!(11)));
+        store.snapshot(|state| {
+            assert_eq!(state.ephemeral_deleted.len(), 2);
+            assert_eq!(state.ephemeral_deleted[0].len(), 10);
+            assert_eq!(state.ephemeral_deleted[1].len(), 1);
+        });
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ephemeral_cleanup_removes_store_records_even_when_telegram_delete_fails()
+    -> Result<(), Box<dyn Error>> {
+        let now = OffsetDateTime::from_unix_timestamp(1_710_000_000)?;
+        let message = EphemeralMessage {
+            chat_id: 42,
+            message_id: 77,
+            expires_at: now - time::Duration::seconds(1),
+        };
+        let store = StoreStub::with_state(StoreState {
+            ephemeral_messages: vec![message.clone()],
+            ..StoreState::default()
+        });
+
+        let report = super::process_ephemeral_cleanup_once_at(&store, now, |_| async {
+            Err::<(), _>(StubError("telegram delete failed"))
+        })
+        .await;
+
+        assert_eq!(report.loaded, 1);
+        assert_eq!(report.expired, 1);
+        assert_eq!(report.telegram_delete_attempted, 1);
+        assert_eq!(report.telegram_delete_failed, 1);
+        assert_eq!(
+            report.telegram_delete_error,
+            Some("telegram delete failed".to_owned())
+        );
+        assert_eq!(report.store_deleted, 1);
+        assert_eq!(report.store_delete_failed_batches, 0);
+        store.snapshot(|state| {
+            assert_eq!(state.ephemeral_deleted, vec![vec![message]]);
+        });
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ephemeral_cleanup_worker_ticks_until_stop_and_accumulates_report()
+    -> Result<(), Box<dyn Error>> {
+        let now = OffsetDateTime::now_utc();
+        let store = StoreStub::with_state(StoreState {
+            ephemeral_messages: vec![EphemeralMessage {
+                chat_id: 42,
+                message_id: 77,
+                expires_at: now - time::Duration::seconds(1),
+            }],
+            ..StoreState::default()
+        });
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        let mut stop_tx = Some(stop_tx);
+
+        let report = super::run_ephemeral_cleanup_worker_every_until(
+            &store,
+            |_| {
+                if let Some(stop_tx) = stop_tx.take() {
+                    let _ = stop_tx.send(());
+                }
+                async { Ok::<_, StubError>(()) }
+            },
+            Duration::from_millis(5),
+            async {
+                let _ = stop_rx.await;
+            },
+        )
+        .await;
+
+        assert_eq!(report.ticks, 1);
+        assert_eq!(report.loaded, 1);
+        assert_eq!(report.expired, 1);
+        assert_eq!(report.telegram_delete_attempted, 1);
+        assert_eq!(report.store_deleted, 1);
         Ok(())
     }
 
