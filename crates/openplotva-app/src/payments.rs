@@ -198,6 +198,23 @@ pub struct InvoiceButtonMessage {
     pub parse_mode: String,
 }
 
+/// Direct group-chat redirect for payment commands that must be completed in private chat.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentRedirectMessage {
+    /// Telegram chat ID.
+    pub chat_id: i64,
+    /// Message ID to reply to.
+    pub reply_to_message_id: i32,
+    /// Forum topic ID when the source message belongs to a topic.
+    pub message_thread_id: Option<i32>,
+    /// Plain-text message body.
+    pub text: String,
+    /// Inline URL button text.
+    pub button_text: String,
+    /// Telegram deep link URL.
+    pub url: String,
+}
+
 /// Control-job invoice execution result class.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum InvoiceControlJobOutcome {
@@ -670,6 +687,148 @@ fn invoice_error_text_send_message_methods(
         message_thread_id: 0,
     };
     openplotva_telegram::build_text_message_methods(&req, Some(&reply_to))
+}
+
+/// Build Go `createVIPRedirectMessage` payload.
+#[must_use]
+pub fn vip_redirect_message(
+    bot_username: &str,
+    chat_id: i64,
+    reply_to_message_id: i32,
+    message_thread_id: Option<i32>,
+) -> PaymentRedirectMessage {
+    let url = if bot_username.is_empty() {
+        String::new()
+    } else {
+        format!("https://t.me/{bot_username}?start=vip")
+    };
+    PaymentRedirectMessage {
+        chat_id,
+        reply_to_message_id,
+        message_thread_id,
+        text: format!(
+            "✨ Для оформления VIP подписки на 30 дней, пожалуйста, перейдите в личные сообщения с ботом.\n\nVIP даёт вам:\n{VIP_BENEFITS_TEXT}"
+        ),
+        button_text: "💎 Оформить VIP подписку".to_owned(),
+        url,
+    }
+}
+
+/// Build Go `createDonationRedirectMessage` payload.
+#[must_use]
+pub fn donation_redirect_message(
+    bot_username: &str,
+    chat_id: i64,
+    reply_to_message_id: i32,
+    message_thread_id: Option<i32>,
+    command_arguments: &str,
+) -> PaymentRedirectMessage {
+    let start_param = donation_redirect_start_param(command_arguments);
+    PaymentRedirectMessage {
+        chat_id,
+        reply_to_message_id,
+        message_thread_id,
+        text: "💖 Для отправки доната, пожалуйста, перейдите в личные сообщения с ботом.\n\n\
+              Ваша поддержка:\n\
+              ❤️ Согреет сердце разработчика\n\
+              🚀 Поможет развивать бота\n\
+              ✨ Добавит мотивацию на создание новых функций"
+            .to_owned(),
+        button_text: "💝 Сделать донат".to_owned(),
+        url: format!("https://t.me/{bot_username}?start={start_param}"),
+    }
+}
+
+/// Build a Go payment redirect message from a decoded non-private `/vip` or `/donate` update.
+#[must_use]
+pub fn payment_redirect_message_from_update(
+    update: &TelegramUpdate,
+    bot_username: &str,
+) -> Option<PaymentRedirectMessage> {
+    let TelegramUpdateType::Message(message) = &update.update_type else {
+        return None;
+    };
+    payment_redirect_message_from_message(message, bot_username)
+}
+
+fn payment_redirect_message_from_message(
+    message: &TelegramMessage,
+    bot_username: &str,
+) -> Option<PaymentRedirectMessage> {
+    if matches!(message.chat, TelegramChat::Private(_)) {
+        return None;
+    }
+    let command = payment_command_from_message(message)?;
+    let chat_id = message.chat.get_id().into();
+    let reply_to_message_id = i32::try_from(message.id).ok()?;
+    let message_thread_id = message
+        .message_thread_id
+        .and_then(|thread_id| i32::try_from(thread_id).ok())
+        .filter(|thread_id| *thread_id != 0);
+    match command.name {
+        "vip" => Some(vip_redirect_message(
+            bot_username,
+            chat_id,
+            reply_to_message_id,
+            message_thread_id,
+        )),
+        "donate" => Some(donation_redirect_message(
+            bot_username,
+            chat_id,
+            reply_to_message_id,
+            message_thread_id,
+            command.arguments,
+        )),
+        _ => None,
+    }
+}
+
+fn donation_redirect_start_param(command_arguments: &str) -> String {
+    if command_arguments.is_empty() {
+        return "donate".to_owned();
+    }
+    match command_arguments.parse::<i64>() {
+        Ok(amount) if (MIN_DONATION_STARS..=MAX_DONATION_STARS).contains(&amount) => {
+            format!("donate_{amount}")
+        }
+        _ => "donate".to_owned(),
+    }
+}
+
+/// Build the direct `sendMessage` used by Go payment group redirect messages.
+pub fn payment_redirect_send_message_method(
+    message: &PaymentRedirectMessage,
+) -> Result<openplotva_telegram::SendMessage, openplotva_telegram::OutboundBuildError> {
+    openplotva_telegram::validate_text_message_text(&message.text, "")?;
+    let chat = openplotva_telegram::ChatRef {
+        id: message.chat_id,
+        is_forum: message.message_thread_id.is_some(),
+    };
+    let button =
+        openplotva_telegram::build_inline_keyboard_button_url(&message.button_text, &message.url);
+    let reply_markup = openplotva_telegram::ReplyMarkup::from([[button]]);
+    let req = openplotva_telegram::TextMessageRequest {
+        chat: Some(chat),
+        message_thread_id: 0,
+        disable_notification: false,
+        allow_sending_without_reply: Some(false),
+        text: message.text.clone(),
+        render_as: String::new(),
+        reply_markup: Some(reply_markup),
+    };
+    let reply_to = openplotva_telegram::ReplyMessageRef {
+        message_id: i64::from(message.reply_to_message_id),
+        chat,
+        is_topic_message: message.message_thread_id.is_some(),
+        message_thread_id: message.message_thread_id.map(i64::from).unwrap_or_default(),
+    };
+    openplotva_telegram::build_text_message_method(
+        &req,
+        chat,
+        Some(&reply_to),
+        message.text.clone(),
+        true,
+    )
 }
 
 /// Execute Go `executeVIPInvoiceControlJob`.
@@ -1995,6 +2154,11 @@ const SUBSCRIPTION_INVOICE_CREATE_ERROR_TEXT: &str =
 const DONATION_INVOICE_CREATE_ERROR_TEXT: &str =
     "❌ Не удалось создать счет для доната. Пожалуйста, попробуйте позже.";
 const SUBSCRIPTION_INVOICE_BUTTON_TEXT: &str = "💎 Оформить VIP подписку";
+const VIP_BENEFITS_TEXT: &str = "⚡ Приоритетное выполнение запросов вне очереди\n\
+                                🔄 Вдвое больше рисунков за то же время\n\
+                                🖼️ Изображения лучшего качества с меньшей цензурой\n\
+                                🎵 Генерация песен по теме через /song (с поддержкой audio reference)\n\
+                                🚀 Доступ к новым функциям и фичам (в разработке)";
 const VIP_BENEFITS_EXTENDED: &str = "⚡ Приоритетное выполнение запросов на рисование вне очереди\n\
                                     🔄 Вдвое увеличенные лимиты на рисование\n\
                                     🖼️ Изображения лучшего качества с меньшей цензурой\n\
@@ -2843,6 +3007,95 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn vip_redirect_message_method_matches_go_group_command_payload() -> Result<(), Box<dyn Error>>
+    {
+        let message = super::vip_redirect_message("PlotvaBot", -10042, 555, Some(77));
+
+        assert_eq!(message.chat_id, -10042);
+        assert_eq!(message.reply_to_message_id, 555);
+        assert_eq!(
+            message.text,
+            "✨ Для оформления VIP подписки на 30 дней, пожалуйста, перейдите в личные сообщения с ботом.\n\n\
+             VIP даёт вам:\n\
+             ⚡ Приоритетное выполнение запросов вне очереди\n\
+             🔄 Вдвое больше рисунков за то же время\n\
+             🖼️ Изображения лучшего качества с меньшей цензурой\n\
+             🎵 Генерация песен по теме через /song (с поддержкой audio reference)\n\
+             🚀 Доступ к новым функциям и фичам (в разработке)"
+        );
+        assert_eq!(message.button_text, "💎 Оформить VIP подписку");
+        assert_eq!(message.url, "https://t.me/PlotvaBot?start=vip");
+
+        let payload = serde_json::to_value(super::payment_redirect_send_message_method(&message)?)?;
+        assert_eq!(payload["chat_id"], json!(-10042));
+        assert_eq!(payload["message_thread_id"], json!(77));
+        assert_eq!(payload["reply_parameters"]["message_id"], json!(555));
+        assert_eq!(payload["reply_parameters"]["chat_id"], json!(-10042));
+        assert!(
+            payload["reply_parameters"]
+                .get("allow_sending_without_reply")
+                .is_none()
+        );
+        assert_eq!(
+            payload["reply_markup"]["inline_keyboard"][0][0]["text"],
+            json!("💎 Оформить VIP подписку")
+        );
+        assert_eq!(
+            payload["reply_markup"]["inline_keyboard"][0][0]["url"],
+            json!("https://t.me/PlotvaBot?start=vip")
+        );
+        assert!(payload.get("parse_mode").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn donation_redirect_message_preserves_valid_go_amount_start_param()
+    -> Result<(), Box<dyn Error>> {
+        let message = super::donation_redirect_message("PlotvaBot", -10042, 555, None, "777");
+
+        assert_eq!(message.button_text, "💝 Сделать донат");
+        assert_eq!(message.url, "https://t.me/PlotvaBot?start=donate_777");
+        assert_eq!(
+            message.text,
+            "💖 Для отправки доната, пожалуйста, перейдите в личные сообщения с ботом.\n\n\
+             Ваша поддержка:\n\
+             ❤️ Согреет сердце разработчика\n\
+             🚀 Поможет развивать бота\n\
+             ✨ Добавит мотивацию на создание новых функций"
+        );
+
+        let payload = serde_json::to_value(super::payment_redirect_send_message_method(&message)?)?;
+        assert_eq!(
+            payload["reply_markup"]["inline_keyboard"][0][0]["url"],
+            json!("https://t.me/PlotvaBot?start=donate_777")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn donation_redirect_message_ignores_invalid_amount_like_go_group_redirect() {
+        let message = super::donation_redirect_message("", -10042, 555, None, "10001");
+
+        assert_eq!(message.url, "https://t.me/?start=donate");
+    }
+
+    #[test]
+    fn payment_redirect_message_from_update_builds_non_private_command_redirect()
+    -> Result<(), Box<dyn Error>> {
+        let message = super::payment_redirect_message_from_update(
+            &sample_group_payment_command_update("/donate 777")?,
+            "PlotvaBot",
+        )
+        .expect("group donate command should build a redirect");
+
+        assert_eq!(message.chat_id, -10042);
+        assert_eq!(message.reply_to_message_id, 555);
+        assert_eq!(message.message_thread_id, Some(77));
+        assert_eq!(message.url, "https://t.me/PlotvaBot?start=donate_777");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn successful_payment_update_wrapper_delegates_non_payment_messages()
     -> Result<(), Box<dyn Error>> {
@@ -3563,6 +3816,40 @@ mod tests {
                     "first_name": "Alice",
                     "last_name": "Smith",
                     "username": username,
+                    "language_code": "en",
+                    "is_premium": true
+                },
+                "text": text,
+                "entities": [{
+                    "offset": 0,
+                    "length": command_len,
+                    "type": "bot_command"
+                }]
+            }
+        }))
+    }
+
+    fn sample_group_payment_command_update(
+        text: &str,
+    ) -> Result<TelegramUpdate, serde_json::Error> {
+        let command_len = text.split_whitespace().next().map_or(text.len(), str::len);
+        serde_json::from_value(json!({
+            "update_id": 999,
+            "message": {
+                "message_id": 555,
+                "message_thread_id": 77,
+                "date": 1_710_000_000,
+                "chat": {
+                    "id": -10042,
+                    "type": "supergroup",
+                    "title": "Plotva Group"
+                },
+                "from": {
+                    "id": 42,
+                    "is_bot": false,
+                    "first_name": "Alice",
+                    "last_name": "Smith",
+                    "username": "alice",
                     "language_code": "en",
                     "is_premium": true
                 },
