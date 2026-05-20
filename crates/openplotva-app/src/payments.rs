@@ -40,6 +40,9 @@ pub type PaymentControlJobQueueFuture<'a, E> =
 pub type PaymentControlJobWorkerFuture<'a, T, E> =
     Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'a>>;
 
+/// Boxed future returned by VIP status checks.
+pub type VipStatusCheckFuture<'a> = Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
+
 /// Telegram successful-payment payload captured from a message/control job.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SuccessfulPayment {
@@ -146,6 +149,14 @@ pub enum PaymentInvoiceCommandUpdateRoute {
     NonPrivateChat,
     /// VIP invoice command did not have a valid non-bot user.
     MissingUser,
+    /// Private `/vip` found an active VIP status and sent Go's status message instead of an invoice.
+    ExistingVipStatusSent,
+    /// Private `/vip` found an active VIP status but failed to send Go's status message.
+    ExistingVipStatusSendError,
+    /// Private `/vip` was VIP-positive, but the status lookup failed; Go sends an error instead of queueing.
+    ExistingVipStatusLookupError,
+    /// Private `/vip` was VIP-positive, but no displayable status view was found.
+    ExistingVipStatusUnavailable,
     /// Donation command had an invalid explicit amount.
     InvalidDonationAmount,
     /// The update was not a payment invoice command and was delegated.
@@ -496,6 +507,12 @@ pub trait VipStatusStore {
     ) -> PaymentStoreFuture<'a, Option<VipCacheRecord>, Self::Error>;
 }
 
+/// VIP predicate boundary matching Go `Fetcher.IsVIP` before existing-status rendering.
+pub trait VipStatusChecker {
+    /// Return whether this user should see existing VIP status instead of a new invoice.
+    fn is_vip_at<'a>(&'a self, user_id: i64, now: OffsetDateTime) -> VipStatusCheckFuture<'a>;
+}
+
 /// Side-effect boundary for Go successful-payment processing.
 pub trait SuccessfulPaymentEffects {
     /// Error returned by the concrete side-effect implementation.
@@ -523,6 +540,27 @@ pub trait PreCheckoutPaymentEffects {
         &'a self,
         pre_checkout_query_id: &'a str,
     ) -> PreCheckoutFuture<'a, Self::Error>;
+}
+
+/// Side-effect boundary for Go existing-VIP status replies.
+pub trait VipStatusEffects {
+    /// Error returned by the concrete side-effect implementation.
+    type Error: fmt::Display + Send + Sync + 'static;
+
+    /// Send Go's existing-VIP status reply.
+    fn send_vip_status_message<'a>(
+        &'a self,
+        message: VipStatusMessage,
+    ) -> PaymentEffectsFuture<'a, Self::Error>;
+
+    /// Send a Go `sendPaymentErrorMessage` equivalent for VIP status failures.
+    fn send_vip_status_error_text<'a>(
+        &'a self,
+        chat_id: i64,
+        reply_to_message_id: i32,
+        text: &'a str,
+        parse_mode: &'a str,
+    ) -> PaymentEffectsFuture<'a, Self::Error>;
 }
 
 /// Side-effect boundary for Go VIP/donation invoice control jobs.
@@ -655,6 +693,42 @@ impl PaymentInvoiceEffects for openplotva_telegram::TelegramClient {
     }
 
     fn send_invoice_error_text<'a>(
+        &'a self,
+        chat_id: i64,
+        reply_to_message_id: i32,
+        text: &'a str,
+        parse_mode: &'a str,
+    ) -> PaymentEffectsFuture<'a, Self::Error> {
+        Box::pin(async move {
+            let methods = invoice_error_text_send_message_methods(
+                chat_id,
+                reply_to_message_id,
+                text,
+                parse_mode,
+            )?;
+            for method in methods {
+                let _message: carapax::types::Message = self.execute(method).await?;
+            }
+            Ok(())
+        })
+    }
+}
+
+impl VipStatusEffects for openplotva_telegram::TelegramClient {
+    type Error = TelegramPaymentInvoiceEffectError;
+
+    fn send_vip_status_message<'a>(
+        &'a self,
+        message: VipStatusMessage,
+    ) -> PaymentEffectsFuture<'a, Self::Error> {
+        Box::pin(async move {
+            let method = vip_status_send_message_method(&message)?;
+            let _message: carapax::types::Message = self.execute(method).await?;
+            Ok(())
+        })
+    }
+
+    fn send_vip_status_error_text<'a>(
         &'a self,
         chat_id: i64,
         reply_to_message_id: i32,
@@ -1220,6 +1294,26 @@ impl VipStatusStore for PostgresSuccessfulPaymentStore {
     }
 }
 
+impl VipStatusChecker for PostgresSuccessfulPaymentStore {
+    fn is_vip_at<'a>(&'a self, user_id: i64, now: OffsetDateTime) -> VipStatusCheckFuture<'a> {
+        Box::pin(async move {
+            if user_id <= 0 {
+                return false;
+            }
+            if let Ok(Some(summary)) = self.vip.get_vip_summary_by_user(user_id).await
+                && summary.is_active
+                && now < summary.effective_expires_at
+            {
+                return true;
+            }
+            match self.vip.get_vip_cache(user_id).await {
+                Ok(Some(cache)) => cache.is_vip && now < cache.expires_at,
+                _ => false,
+            }
+        })
+    }
+}
+
 /// Process one Telegram successful-payment message with Go `processSuccessfulPaymentNow` semantics.
 pub async fn process_successful_payment_at<Store, Effects>(
     store: &Store,
@@ -1470,6 +1564,174 @@ where
             Ok(PaymentInvoiceCommandUpdateRoute::InvalidDonationAmount)
         }
     }
+}
+
+/// Queue private `/vip` and `/donate` updates, but send Go existing-VIP status before `/vip` invoices.
+pub async fn enqueue_payment_invoice_command_update_with_vip_status_or_else_at<
+    Queue,
+    Vip,
+    Effects,
+    HandleFn,
+    HandleFuture,
+    HandleError,
+>(
+    queue: &Queue,
+    vip: &Vip,
+    effects: &Effects,
+    update: TelegramUpdate,
+    created: OffsetDateTime,
+    now: OffsetDateTime,
+    handle_other: HandleFn,
+) -> Result<PaymentInvoiceCommandUpdateRoute, HandleError>
+where
+    Queue: PaymentControlJobQueue + Sync,
+    Vip: VipStatusChecker + VipStatusStore + Sync,
+    Effects: VipStatusEffects + Sync,
+    HandleFn: FnOnce(TelegramUpdate) -> HandleFuture,
+    HandleFuture: Future<Output = Result<(), HandleError>>,
+{
+    let TelegramUpdateType::Message(message) = &update.update_type else {
+        handle_other(update).await?;
+        return Ok(PaymentInvoiceCommandUpdateRoute::Delegated);
+    };
+    let Some(command) = payment_command_from_message(message) else {
+        handle_other(update).await?;
+        return Ok(PaymentInvoiceCommandUpdateRoute::Delegated);
+    };
+    if !matches!(message.chat, TelegramChat::Private(_)) {
+        return Ok(PaymentInvoiceCommandUpdateRoute::NonPrivateChat);
+    }
+
+    if command.name == "vip" {
+        let Some(user) = message.sender.get_user() else {
+            return Ok(PaymentInvoiceCommandUpdateRoute::MissingUser);
+        };
+        let user_id: i64 = user.id.into();
+        if user_id <= 0 || user.is_bot {
+            return Ok(PaymentInvoiceCommandUpdateRoute::MissingUser);
+        }
+        if vip.is_vip_at(user_id, now).await {
+            let chat_id = message.chat.get_id().into();
+            let reply_to_message_id = match i32::try_from(message.id) {
+                Ok(message_id) => message_id,
+                Err(_) => return Ok(PaymentInvoiceCommandUpdateRoute::MissingUser),
+            };
+            let message_thread_id = message
+                .message_thread_id
+                .and_then(|thread_id| i32::try_from(thread_id).ok())
+                .filter(|thread_id| *thread_id != 0);
+            return Ok(send_existing_vip_status_or_error(
+                vip,
+                effects,
+                user_id,
+                chat_id,
+                reply_to_message_id,
+                message_thread_id,
+                now,
+            )
+            .await);
+        }
+    }
+
+    match payment_invoice_control_job_from_message_at(message, created) {
+        PaymentInvoiceControlJobBuild::Job(job) => match queue
+            .assign_payment_control_job(CONTROL_QUEUE_NAME, *job)
+            .await
+        {
+            Ok(()) => Ok(PaymentInvoiceCommandUpdateRoute::Queued),
+            Err(error) => {
+                tracing::warn!(%error, "failed to assign payment invoice control job");
+                Ok(PaymentInvoiceCommandUpdateRoute::QueueError)
+            }
+        },
+        PaymentInvoiceControlJobBuild::MissingUser => {
+            Ok(PaymentInvoiceCommandUpdateRoute::MissingUser)
+        }
+        PaymentInvoiceControlJobBuild::InvalidDonationAmount => {
+            Ok(PaymentInvoiceCommandUpdateRoute::InvalidDonationAmount)
+        }
+        PaymentInvoiceControlJobBuild::NonPrivateChat => {
+            Ok(PaymentInvoiceCommandUpdateRoute::NonPrivateChat)
+        }
+        PaymentInvoiceControlJobBuild::NotPaymentCommand => {
+            handle_other(update).await?;
+            Ok(PaymentInvoiceCommandUpdateRoute::Delegated)
+        }
+    }
+}
+
+async fn send_existing_vip_status_or_error<Store, Effects>(
+    store: &Store,
+    effects: &Effects,
+    user_id: i64,
+    chat_id: i64,
+    reply_to_message_id: i32,
+    message_thread_id: Option<i32>,
+    now: OffsetDateTime,
+) -> PaymentInvoiceCommandUpdateRoute
+where
+    Store: VipStatusStore + Sync,
+    Effects: VipStatusEffects + Sync,
+{
+    let status = match build_vip_status_message_at(
+        store,
+        user_id,
+        chat_id,
+        reply_to_message_id,
+        message_thread_id,
+        now,
+    )
+    .await
+    {
+        Ok(Some(message)) => message,
+        Ok(None) => {
+            send_vip_status_error_text(
+                effects,
+                chat_id,
+                reply_to_message_id,
+                VIP_STATUS_DETAILS_ERROR_TEXT,
+            )
+            .await;
+            return PaymentInvoiceCommandUpdateRoute::ExistingVipStatusUnavailable;
+        }
+        Err(error) => {
+            tracing::warn!(%error, user_id, "failed to build VIP status view");
+            send_vip_status_error_text(
+                effects,
+                chat_id,
+                reply_to_message_id,
+                VIP_SUBSCRIPTION_DETAILS_ERROR_TEXT,
+            )
+            .await;
+            return PaymentInvoiceCommandUpdateRoute::ExistingVipStatusLookupError;
+        }
+    };
+
+    match effects.send_vip_status_message(status).await {
+        Ok(()) => PaymentInvoiceCommandUpdateRoute::ExistingVipStatusSent,
+        Err(error) => {
+            tracing::warn!(%error, user_id, "failed to send VIP status message");
+            PaymentInvoiceCommandUpdateRoute::ExistingVipStatusSendError
+        }
+    }
+}
+
+async fn send_vip_status_error_text<Effects>(
+    effects: &Effects,
+    chat_id: i64,
+    reply_to_message_id: i32,
+    text: &str,
+) where
+    Effects: VipStatusEffects + Sync,
+{
+    let _ = effects
+        .send_vip_status_error_text(
+            chat_id,
+            reply_to_message_id,
+            text,
+            openplotva_telegram::TELEGRAM_PARSE_MODE_HTML,
+        )
+        .await;
 }
 
 /// Handle the payment-owned subset of decoded updates, delegating everything else.
@@ -2354,6 +2616,10 @@ fn vip_display_days_left_at(expires_at: OffsetDateTime, now: OffsetDateTime) -> 
 const SUBSCRIPTION_SAVE_ERROR_TEXT: &str = "❌ Платеж прошел успешно, но возникла ошибка при активации подписки. Пожалуйста, обратитесь в [поддержку](https://t.me/WaveCut)";
 const SUBSCRIPTION_DETAILS_ERROR_TEXT: &str = "✅ Платеж успешно обработан, но возникла ошибка при получении деталей подписки. Пожалуйста, обратитесь в [поддержку](https://t.me/WaveCut)";
 const SUBSCRIPTION_LEDGER_ERROR_TEXT: &str = "❌ Платеж прошел успешно, но возникла ошибка при фиксации VIP периода. Пожалуйста, обратитесь в [поддержку](https://t.me/WaveCut)";
+const VIP_SUBSCRIPTION_DETAILS_ERROR_TEXT: &str =
+    "❌ Не удалось получить информацию о вашей подписке.";
+const VIP_STATUS_DETAILS_ERROR_TEXT: &str =
+    "❌ Не удалось получить информацию о вашем VIP статусе.";
 const DONATION_SAVE_ERROR_TEXT: &str = "❤️ Спасибо за донат! К сожалению, возникла ошибка при сохранении информации о платеже. Можете сообщить об этом в [поддержку](https://t.me/WaveCut)";
 const DONATION_DETAILS_ERROR_TEXT: &str = "❤️ Спасибо за ваш донат! Платеж успешно обработан, но возникла ошибка при получении деталей. Можете сообщить об этом в [поддержку](https://t.me/WaveCut)";
 const USER_IDENTIFICATION_ERROR_TEXT: &str = "❌ Не удалось определить пользователя.";
@@ -2405,6 +2671,7 @@ mod tests {
         SuccessfulPaymentControlJobUpdateRoute, SuccessfulPaymentEffects, SuccessfulPaymentMessage,
         SuccessfulPaymentOutcome, SuccessfulPaymentStore, SuccessfulPaymentUpdateRoute,
         enqueue_payment_invoice_command_update_or_else_at,
+        enqueue_payment_invoice_command_update_with_vip_status_or_else_at,
         enqueue_successful_payment_update_or_else_at, execute_donate_invoice_control_job,
         execute_payment_control_job_at, execute_vip_invoice_control_job,
         handle_payment_update_or_else_at, handle_pre_checkout_update_or_else,
@@ -3037,6 +3304,99 @@ mod tests {
         );
         assert!(fallback_calls.lock().expect("fallback calls").is_empty());
         assert!(queue.assigned().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn payment_invoice_command_with_vip_status_sends_existing_status_without_queue()
+    -> Result<(), Box<dyn Error>> {
+        let created = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let now = time::Date::from_calendar_date(2026, time::Month::June, 16)?
+            .with_hms(9, 30, 0)?
+            .assume_utc();
+        let queue = PaymentControlJobQueueStub::default();
+        let store = VipStatusStoreStub::new()
+            .with_is_vip(true)
+            .with_summary(active_vip_summary(now, now + time::Duration::days(3)))
+            .with_active_subscription(active_subscription(now, now + time::Duration::days(3)));
+        let effects = EffectsStub::default();
+        let fallback_calls = Arc::new(Mutex::new(Vec::new()));
+        let fallback_calls_for_handle = Arc::clone(&fallback_calls);
+
+        let route = enqueue_payment_invoice_command_update_with_vip_status_or_else_at(
+            &queue,
+            &store,
+            &effects,
+            sample_payment_command_update("/vip")?,
+            created,
+            now,
+            move |update| {
+                let fallback_calls = Arc::clone(&fallback_calls_for_handle);
+                async move {
+                    fallback_calls
+                        .lock()
+                        .map_err(|err| std::io::Error::other(err.to_string()))?
+                        .push(update.id);
+                    Ok::<(), std::io::Error>(())
+                }
+            },
+        )
+        .await?;
+
+        assert_eq!(
+            route,
+            PaymentInvoiceCommandUpdateRoute::ExistingVipStatusSent
+        );
+        assert!(queue.assigned().is_empty());
+        assert!(fallback_calls.lock().expect("fallback calls").is_empty());
+        let status_messages = effects.vip_status_messages();
+        assert_eq!(status_messages.len(), 1);
+        assert!(
+            status_messages[0]
+                .text
+                .contains("У вас уже есть активный VIP статус")
+        );
+        assert!(status_messages[0].show_cancel_button);
+        assert_eq!(
+            store.calls(),
+            vec![
+                "is_vip_at",
+                "get_vip_summary_by_user",
+                "get_active_subscription"
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn payment_invoice_command_with_vip_status_queues_invoice_when_user_is_not_vip()
+    -> Result<(), Box<dyn Error>> {
+        let created = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let now = time::Date::from_calendar_date(2026, time::Month::June, 16)?
+            .with_hms(9, 30, 0)?
+            .assume_utc();
+        let queue = PaymentControlJobQueueStub::default();
+        let store = VipStatusStoreStub::new()
+            .with_is_vip(false)
+            .with_cache(active_vip_cache(now, now + time::Duration::days(5)));
+        let effects = EffectsStub::default();
+
+        let route = enqueue_payment_invoice_command_update_with_vip_status_or_else_at(
+            &queue,
+            &store,
+            &effects,
+            sample_payment_command_update("/vip")?,
+            created,
+            now,
+            |_update| async { Ok::<(), std::io::Error>(()) },
+        )
+        .await?;
+
+        assert_eq!(route, PaymentInvoiceCommandUpdateRoute::Queued);
+        assert!(effects.vip_status_messages().is_empty());
+        assert_eq!(queue.assigned().len(), 1);
+        assert_eq!(queue.assigned()[0].1.title, "vip invoice");
+        assert_eq!(store.calls(), vec!["is_vip_at"]);
         Ok(())
     }
 
@@ -4315,6 +4675,7 @@ mod tests {
 
     #[derive(Default)]
     struct VipStatusStoreState {
+        is_vip: bool,
         summary: Option<VipSummaryRecord>,
         active_subscription: Option<SubscriptionRecord>,
         cache: Option<VipCacheRecord>,
@@ -4324,6 +4685,11 @@ mod tests {
     impl VipStatusStoreStub {
         fn new() -> Self {
             Self::default()
+        }
+
+        fn with_is_vip(self, is_vip: bool) -> Self {
+            self.lock().is_vip = is_vip;
+            self
         }
 
         fn with_summary(self, summary: VipSummaryRecord) -> Self {
@@ -4347,6 +4713,20 @@ mod tests {
 
         fn lock(&self) -> MutexGuard<'_, VipStatusStoreState> {
             self.state.lock().expect("VIP status stub lock poisoned")
+        }
+    }
+
+    impl super::VipStatusChecker for VipStatusStoreStub {
+        fn is_vip_at<'a>(
+            &'a self,
+            _user_id: i64,
+            _now: OffsetDateTime,
+        ) -> super::VipStatusCheckFuture<'a> {
+            Box::pin(async move {
+                let mut state = self.lock();
+                state.calls.push("is_vip_at");
+                state.is_vip
+            })
         }
     }
 
@@ -4574,6 +4954,8 @@ mod tests {
         next_invoice_urls: VecDeque<String>,
         invoice_messages: Vec<InvoiceButtonMessage>,
         invoice_error_texts: Vec<(i64, i32, String, String)>,
+        vip_status_messages: Vec<super::VipStatusMessage>,
+        vip_status_error_texts: Vec<(i64, i32, String, String)>,
     }
 
     impl EffectsStub {
@@ -4621,6 +5003,10 @@ mod tests {
             self.lock().invoice_error_texts.clone()
         }
 
+        fn vip_status_messages(&self) -> Vec<super::VipStatusMessage> {
+            self.lock().vip_status_messages.clone()
+        }
+
         fn lock(&self) -> MutexGuard<'_, EffectsState> {
             self.state
                 .lock()
@@ -4649,6 +5035,38 @@ mod tests {
         ) -> PaymentEffectsFuture<'a, Self::Error> {
             Box::pin(async move {
                 self.lock().invalidated_vip_users.push(user_id);
+                Ok(())
+            })
+        }
+    }
+
+    impl super::VipStatusEffects for EffectsStub {
+        type Error = StubError;
+
+        fn send_vip_status_message<'a>(
+            &'a self,
+            message: super::VipStatusMessage,
+        ) -> PaymentEffectsFuture<'a, Self::Error> {
+            Box::pin(async move {
+                self.lock().vip_status_messages.push(message);
+                Ok(())
+            })
+        }
+
+        fn send_vip_status_error_text<'a>(
+            &'a self,
+            chat_id: i64,
+            reply_to_message_id: i32,
+            text: &'a str,
+            parse_mode: &'a str,
+        ) -> PaymentEffectsFuture<'a, Self::Error> {
+            Box::pin(async move {
+                self.lock().vip_status_error_texts.push((
+                    chat_id,
+                    reply_to_message_id,
+                    text.to_owned(),
+                    parse_mode.to_owned(),
+                ));
                 Ok(())
             })
         }
