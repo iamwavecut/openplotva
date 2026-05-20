@@ -4,14 +4,14 @@ use std::{
     io::{self, Write},
     path::{Path, PathBuf},
     pin::Pin,
-    sync::{
-        Arc, Mutex, MutexGuard,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, Mutex, MutexGuard},
     time::Duration,
 };
 
-use crate::updates::{UpdateHandler, UpdateHandlerFuture};
+use crate::{
+    updates::{UpdateHandler, UpdateHandlerFuture},
+    virtual_messages::{VirtualIdFactory, monotonic_virtual_id_factory},
+};
 use carapax::types::{
     Chat as TelegramChat, Message as TelegramMessage, MessageData as TelegramMessageData,
     PreCheckoutQuery as TelegramPreCheckoutQuery, SuccessfulPayment as TelegramSuccessfulPayment,
@@ -1693,7 +1693,7 @@ impl VipStatusEffects for openplotva_telegram::TelegramClient {
 }
 
 /// Generator for virtual-message IDs used by successful-payment text replies.
-pub type PaymentVirtualIdFactory = Arc<dyn Fn() -> String + Send + Sync>;
+pub type PaymentVirtualIdFactory = VirtualIdFactory;
 
 /// Dispatcher-backed side effects for Go successful-payment processing.
 #[derive(Clone)]
@@ -1923,13 +1923,7 @@ where
 }
 
 fn monotonic_payment_virtual_id_factory() -> PaymentVirtualIdFactory {
-    let next_id = Arc::new(AtomicU64::new(1));
-    let process_id = std::process::id();
-    let started_at = OffsetDateTime::now_utc().unix_timestamp_nanos();
-    Arc::new(move || {
-        let id = next_id.fetch_add(1, Ordering::Relaxed);
-        format!("payment-vmsg-{process_id:x}-{started_at:x}-{id:x}")
-    })
+    monotonic_virtual_id_factory("payment-vmsg")
 }
 
 /// Build the direct `sendMessage` used for Go invoice button messages.

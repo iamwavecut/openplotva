@@ -1,6 +1,15 @@
 //! Composition-root virtual-message send/edit/delete behavior.
 
-use std::{fmt, future::Future, pin::Pin, time::Duration};
+use std::{
+    fmt,
+    future::Future,
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use openplotva_core::{MessageIdMapping, ReadyPendingOp};
 use openplotva_telegram::{
@@ -26,6 +35,21 @@ use time::OffsetDateTime;
 use crate::pending_ops::{NoopPendingOpHistory, PendingOpHistory};
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// Shared generator for virtual-message IDs used by app-level producers.
+pub type VirtualIdFactory = Arc<dyn Fn() -> String + Send + Sync>;
+
+/// Build a process-local monotonic virtual-message ID factory.
+#[must_use]
+pub fn monotonic_virtual_id_factory(prefix: &'static str) -> VirtualIdFactory {
+    let next_id = Arc::new(AtomicU64::new(1));
+    let process_id = std::process::id();
+    let started_at = OffsetDateTime::now_utc().unix_timestamp_nanos();
+    Arc::new(move || {
+        let id = next_id.fetch_add(1, Ordering::Relaxed);
+        format!("{prefix}-{process_id:x}-{started_at:x}-{id:x}")
+    })
+}
 
 /// Storage operations used by Go's virtual send/edit/delete paths.
 pub trait VirtualMessageStore {

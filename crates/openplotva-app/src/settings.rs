@@ -1,6 +1,6 @@
 //! App-level fetcher settings command behavior.
 
-use std::{fmt, future::Future, pin::Pin, time::Duration};
+use std::{fmt, future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use carapax::types::{
     Chat as TelegramChat, ChatMember as TelegramChatMember, ChatMemberRestricted,
@@ -19,8 +19,10 @@ use openplotva_telegram::{
 use thiserror::Error;
 use time::OffsetDateTime;
 
+use crate::updates::{UpdateHandler, UpdateHandlerFuture};
 use crate::virtual_messages::{
-    QueueTextReport, QueueTextRequest, VirtualMessageStore, queue_text_message_parts,
+    QueueTextReport, QueueTextRequest, VirtualIdFactory, VirtualMessageStore,
+    monotonic_virtual_id_factory, queue_text_message_parts,
 };
 
 const GROUP_SETTINGS_CONTROL_JOB_TITLE: &str = "group settings";
@@ -381,6 +383,171 @@ pub struct NewMembersFollowupUpdateInput<'a> {
     pub bot_id: i64,
     /// Task creation time.
     pub created: OffsetDateTime,
+}
+
+/// Borrowed ports used by the settings-owned decoded-update slice.
+#[derive(Clone, Copy, Debug)]
+pub struct SettingsUpdatePorts<'a, Store, Members, Queue> {
+    /// Virtual-message mapping store used by outbound text queueing.
+    pub store: &'a Store,
+    /// Dispatcher queue used for immediate/future sends.
+    pub dispatcher_queue: &'a DispatcherQueue,
+    /// Chat-member store used by new-member service messages.
+    pub member_store: &'a Members,
+    /// Taskman control queue used by settings-owned jobs.
+    pub control_queue: &'a Queue,
+}
+
+/// Runtime settings needed while handling one decoded update.
+#[derive(Clone, Copy, Debug)]
+pub struct SettingsUpdateContext<'a> {
+    /// Current bot username used for command targeting.
+    pub bot_username: &'a str,
+    /// Current bot Telegram user ID, or zero when unavailable.
+    pub bot_id: i64,
+    /// WebApp base URL used by private settings buttons.
+    pub web_app_url: &'a str,
+    /// Task creation time.
+    pub created: OffsetDateTime,
+}
+
+/// Route chosen by the settings-owned decoded-update wrapper.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SettingsUpdateRoute {
+    /// The update had no settings-owned behavior and was delegated.
+    Delegated,
+    /// A private `/settings` command was handled.
+    PrivateSettings(SettingsCommandOutcome),
+    /// A group `/settings` command was handled.
+    GroupSettings(GroupSettingsCommandOutcome),
+    /// A `new_chat_members` producer ran, then the update was delegated like Go.
+    NewMembersFollowup {
+        /// Producer outcome.
+        outcome: NewMembersFollowupUpdateOutcome,
+    },
+}
+
+/// Error returned by the settings-owned decoded-update wrapper.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum SettingsUpdateError {
+    /// Settings side effect failed before delegation.
+    #[error("settings outbound: {message}")]
+    Outbound {
+        /// Display form of the outbound error.
+        message: String,
+    },
+    /// Downstream handler failed after delegation.
+    #[error("downstream update handler: {message}")]
+    Downstream {
+        /// Display form of the downstream error.
+        message: String,
+    },
+}
+
+/// Long-lived config for the settings-owned update handler.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SettingsUpdateHandlerConfig {
+    /// Current bot username used for command targeting.
+    pub bot_username: String,
+    /// Current bot Telegram user ID, or zero when unavailable.
+    pub bot_id: i64,
+    /// WebApp base URL used by private settings buttons.
+    pub web_app_url: String,
+}
+
+impl SettingsUpdateHandlerConfig {
+    /// Build settings update-handler config.
+    pub fn new(
+        bot_username: impl Into<String>,
+        bot_id: i64,
+        web_app_url: impl Into<String>,
+    ) -> Self {
+        Self {
+            bot_username: bot_username.into(),
+            bot_id,
+            web_app_url: web_app_url.into(),
+        }
+    }
+}
+
+/// `UpdateHandler` adapter for settings-owned decoded update behavior.
+#[derive(Clone)]
+pub struct SettingsUpdateHandler<Store, Members, Queue, Next> {
+    store: Arc<Store>,
+    dispatcher_queue: Arc<DispatcherQueue>,
+    member_store: Arc<Members>,
+    control_queue: Arc<Queue>,
+    bot_username: String,
+    bot_id: i64,
+    web_app_url: String,
+    next_virtual_id: VirtualIdFactory,
+    next: Arc<Next>,
+}
+
+impl<Store, Members, Queue, Next> SettingsUpdateHandler<Store, Members, Queue, Next> {
+    /// Build a settings-aware handler around the real downstream update handler.
+    pub fn new(
+        store: Arc<Store>,
+        dispatcher_queue: Arc<DispatcherQueue>,
+        member_store: Arc<Members>,
+        control_queue: Arc<Queue>,
+        config: SettingsUpdateHandlerConfig,
+        next: Arc<Next>,
+    ) -> Self {
+        Self {
+            store,
+            dispatcher_queue,
+            member_store,
+            control_queue,
+            bot_username: config.bot_username,
+            bot_id: config.bot_id,
+            web_app_url: config.web_app_url,
+            next_virtual_id: monotonic_virtual_id_factory("settings-vmsg"),
+            next,
+        }
+    }
+
+    /// Override virtual-message ID generation for deterministic tests.
+    #[must_use]
+    pub fn with_virtual_id_factory(mut self, next_virtual_id: VirtualIdFactory) -> Self {
+        self.next_virtual_id = next_virtual_id;
+        self
+    }
+}
+
+impl<Store, Members, Queue, Next> UpdateHandler
+    for SettingsUpdateHandler<Store, Members, Queue, Next>
+where
+    Store: VirtualMessageStore + Send + Sync,
+    Members: NewMembersFollowupMemberStore + Send + Sync,
+    Queue: SettingsControlJobQueue + Send + Sync,
+    Next: UpdateHandler + Send + Sync,
+{
+    type Error = SettingsUpdateError;
+
+    fn handle_update<'a>(&'a self, update: TelegramUpdate) -> UpdateHandlerFuture<'a, Self::Error> {
+        Box::pin(async move {
+            handle_settings_update_or_else_at(
+                SettingsUpdatePorts {
+                    store: self.store.as_ref(),
+                    dispatcher_queue: self.dispatcher_queue.as_ref(),
+                    member_store: self.member_store.as_ref(),
+                    control_queue: self.control_queue.as_ref(),
+                },
+                update,
+                SettingsUpdateContext {
+                    bot_username: &self.bot_username,
+                    bot_id: self.bot_id,
+                    web_app_url: &self.web_app_url,
+                    created: OffsetDateTime::now_utc(),
+                },
+                || (self.next_virtual_id)(),
+                |update| self.next.handle_update(update),
+            )
+            .await
+            .map(|_| ())
+        })
+    }
 }
 
 /// Result of executing Go's group-settings control-job slice.
@@ -921,6 +1088,117 @@ where
     }
 }
 
+/// Handle settings-owned decoded-update behavior, delegating the rest.
+pub async fn handle_settings_update_or_else_at<
+    Store,
+    Members,
+    Queue,
+    NextId,
+    HandleFn,
+    HandleFuture,
+    HandleError,
+>(
+    ports: SettingsUpdatePorts<'_, Store, Members, Queue>,
+    update: TelegramUpdate,
+    context: SettingsUpdateContext<'_>,
+    next_virtual_id: NextId,
+    handle_other: HandleFn,
+) -> Result<SettingsUpdateRoute, SettingsUpdateError>
+where
+    Store: VirtualMessageStore + Sync,
+    Members: NewMembersFollowupMemberStore + Sync,
+    Queue: SettingsControlJobQueue + Sync,
+    NextId: Fn() -> String,
+    HandleFn: FnOnce(TelegramUpdate) -> HandleFuture,
+    HandleFuture: Future<Output = Result<(), HandleError>>,
+    HandleError: fmt::Display,
+{
+    let mut delegated_update = Some(update);
+    let update_ref = delegated_update
+        .as_ref()
+        .expect("delegated update should remain available until delegation");
+
+    let new_members = handle_new_members_followup_update_at(
+        ports.store,
+        ports.dispatcher_queue,
+        ports.member_store,
+        ports.control_queue,
+        NewMembersFollowupUpdateInput {
+            update: update_ref,
+            bot_id: context.bot_id,
+            created: context.created,
+        },
+        &next_virtual_id,
+    )
+    .await
+    .map_err(settings_outbound_error)?;
+
+    let ran_new_members = matches!(
+        new_members,
+        NewMembersFollowupUpdateOutcome::Queued { .. }
+            | NewMembersFollowupUpdateOutcome::QueueError { .. }
+    );
+
+    let private_settings = handle_private_settings_command_update(
+        ports.store,
+        ports.dispatcher_queue,
+        update_ref,
+        context.bot_username,
+        context.web_app_url,
+        &next_virtual_id,
+    )
+    .await
+    .map_err(settings_outbound_error)?;
+    match private_settings {
+        SettingsCommandOutcome::Queued(_) | SettingsCommandOutcome::WebAppUrlMissing => {
+            return Ok(SettingsUpdateRoute::PrivateSettings(private_settings));
+        }
+        SettingsCommandOutcome::NotSettingsCommand | SettingsCommandOutcome::NonPrivateChat => {}
+    }
+
+    let group_settings = handle_group_settings_command_update_at(
+        ports.store,
+        ports.dispatcher_queue,
+        ports.control_queue,
+        update_ref,
+        context.bot_username,
+        context.created,
+        &next_virtual_id,
+    )
+    .await
+    .map_err(settings_outbound_error)?;
+    match group_settings {
+        GroupSettingsCommandOutcome::NotSettingsCommand
+        | GroupSettingsCommandOutcome::PrivateChat => {}
+        GroupSettingsCommandOutcome::UnsupportedSameChatSender(_)
+        | GroupSettingsCommandOutcome::UnsupportedChannelSender(_)
+        | GroupSettingsCommandOutcome::MissingCaller
+        | GroupSettingsCommandOutcome::InvalidMessage
+        | GroupSettingsCommandOutcome::QueueError(_)
+        | GroupSettingsCommandOutcome::Queued { .. } => {
+            return Ok(SettingsUpdateRoute::GroupSettings(group_settings));
+        }
+    }
+
+    handle_other(
+        delegated_update
+            .take()
+            .expect("delegated update should be available"),
+    )
+    .await
+    .map_err(|error| SettingsUpdateError::Downstream {
+        message: error.to_string(),
+    })?;
+
+    if ran_new_members {
+        Ok(SettingsUpdateRoute::NewMembersFollowup {
+            outcome: new_members,
+        })
+    } else {
+        Ok(SettingsUpdateRoute::Delegated)
+    }
+}
+
 fn group_settings_control_job_from_message_at(
     message: &TelegramMessage,
     bot_username: &str,
@@ -1076,6 +1354,12 @@ where
         }
     }
     errors
+}
+
+fn settings_outbound_error(error: OutboundBuildError) -> SettingsUpdateError {
+    SettingsUpdateError::Outbound {
+        message: error.to_string(),
+    }
 }
 
 async fn queue_group_settings_notice<S, NextId>(
@@ -1958,16 +2242,19 @@ mod tests {
     use serde_json::{Value, json};
     use time::OffsetDateTime;
 
-    use crate::virtual_messages::VirtualMessageStore;
+    use crate::updates::{UpdateHandler, UpdateHandlerFuture};
+    use crate::virtual_messages::{VirtualIdFactory, VirtualMessageStore};
 
     use super::{
         GroupSettingsAdminSyncSource, GroupSettingsCommandOutcome, GroupSettingsControlJobBuild,
         SettingsCommandOutcome, SettingsControlJobQueue, SettingsControlJobQueueFuture,
-        admin_chat_member_upsert_from_telegram, can_open_group_settings_with_sources,
-        chat_member_upsert_from_telegram, execute_group_settings_control_job_at,
-        execute_new_members_followup_control_job_at, group_settings_control_job_from_update_at,
-        handle_group_settings_command_update_at, handle_new_members_followup_update_at,
-        handle_private_settings_command_update, new_members_followup_control_job_from_update_at,
+        SettingsUpdateContext, SettingsUpdateHandler, SettingsUpdateHandlerConfig,
+        SettingsUpdatePorts, SettingsUpdateRoute, admin_chat_member_upsert_from_telegram,
+        can_open_group_settings_with_sources, chat_member_upsert_from_telegram,
+        execute_group_settings_control_job_at, execute_new_members_followup_control_job_at,
+        group_settings_control_job_from_update_at, handle_group_settings_command_update_at,
+        handle_new_members_followup_update_at, handle_private_settings_command_update,
+        handle_settings_update_or_else_at, new_members_followup_control_job_from_update_at,
         sync_chat_admins_with_cache, sync_chat_admins_with_sources,
     };
 
@@ -2862,6 +3149,149 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn settings_update_wrapper_handles_private_settings_without_delegation()
+    -> Result<(), Box<dyn Error>> {
+        let store = StoreStub::default();
+        let dispatcher = DispatcherQueue::new(DispatcherConfig::default());
+        let member_store = GroupSettingsMemberStoreStub::default();
+        let control_queue = SettingsControlJobQueueStub::default();
+        let update = private_settings_update()?;
+        let fallback_calls = Arc::new(Mutex::new(Vec::new()));
+        let fallback_calls_for_handle = Arc::clone(&fallback_calls);
+
+        let route = handle_settings_update_or_else_at(
+            SettingsUpdatePorts {
+                store: &store,
+                dispatcher_queue: &dispatcher,
+                member_store: &member_store,
+                control_queue: &control_queue,
+            },
+            update,
+            SettingsUpdateContext {
+                bot_username: "PlotvaBot",
+                bot_id: 999,
+                web_app_url: "https://plotva.example",
+                created: OffsetDateTime::UNIX_EPOCH,
+            },
+            || "settings-wrapper-v1".to_owned(),
+            move |update| {
+                let fallback_calls = Arc::clone(&fallback_calls_for_handle);
+                async move {
+                    fallback_calls
+                        .lock()
+                        .map_err(|err| io::Error::other(err.to_string()))?
+                        .push(update.id);
+                    Ok::<(), io::Error>(())
+                }
+            },
+        )
+        .await?;
+
+        let SettingsUpdateRoute::PrivateSettings(SettingsCommandOutcome::Queued(report)) = route
+        else {
+            return Err(format!("expected private settings route, got {route:?}").into());
+        };
+        assert_eq!(report.parts[0].virtual_id, "settings-wrapper-v1");
+        assert!(fallback_calls.lock().expect("fallback calls").is_empty());
+        assert!(control_queue.assigned().is_empty());
+        assert!(member_store.upserts().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn settings_update_wrapper_runs_new_members_then_delegates_like_go()
+    -> Result<(), Box<dyn Error>> {
+        let store = StoreStub::default();
+        let dispatcher = DispatcherQueue::new(DispatcherConfig::default());
+        let member_store = GroupSettingsMemberStoreStub::default();
+        let control_queue = SettingsControlJobQueueStub::default();
+        let update = new_members_update()?;
+        let fallback_calls = Arc::new(Mutex::new(Vec::new()));
+        let fallback_calls_for_handle = Arc::clone(&fallback_calls);
+
+        let route = handle_settings_update_or_else_at(
+            SettingsUpdatePorts {
+                store: &store,
+                dispatcher_queue: &dispatcher,
+                member_store: &member_store,
+                control_queue: &control_queue,
+            },
+            update,
+            SettingsUpdateContext {
+                bot_username: "PlotvaBot",
+                bot_id: 999,
+                web_app_url: "https://plotva.example",
+                created: OffsetDateTime::UNIX_EPOCH,
+            },
+            || "unused-settings-wrapper-v1".to_owned(),
+            move |update| {
+                let fallback_calls = Arc::clone(&fallback_calls_for_handle);
+                async move {
+                    fallback_calls
+                        .lock()
+                        .map_err(|err| io::Error::other(err.to_string()))?
+                        .push(update.id);
+                    Ok::<(), io::Error>(())
+                }
+            },
+        )
+        .await?;
+
+        assert_eq!(
+            route,
+            SettingsUpdateRoute::NewMembersFollowup {
+                outcome: super::NewMembersFollowupUpdateOutcome::Queued {
+                    member_upsert_errors: 0
+                }
+            }
+        );
+        assert_eq!(
+            fallback_calls.lock().expect("fallback calls").as_slice(),
+            &[12350]
+        );
+        assert_eq!(member_store.upserts().len(), 2);
+        assert_eq!(control_queue.assigned().len(), 1);
+        assert!(store.inserted().is_empty());
+        assert!(dispatcher.snapshot().immediate.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn settings_update_handler_intercepts_group_settings_before_wrapped_handler()
+    -> Result<(), Box<dyn Error>> {
+        let store = Arc::new(StoreStub::default());
+        let dispatcher = Arc::new(DispatcherQueue::new(DispatcherConfig::default()));
+        let member_store = Arc::new(GroupSettingsMemberStoreStub::default());
+        let control_queue = Arc::new(SettingsControlJobQueueStub::default());
+        let next = Arc::new(UpdateHandlerStub::default());
+        let ids: VirtualIdFactory = Arc::new(|| "settings-handler-v1".to_owned());
+        let handler = SettingsUpdateHandler::new(
+            Arc::clone(&store),
+            Arc::clone(&dispatcher),
+            Arc::clone(&member_store),
+            Arc::clone(&control_queue),
+            SettingsUpdateHandlerConfig::new("PlotvaBot", 999, "https://plotva.example"),
+            Arc::clone(&next),
+        )
+        .with_virtual_id_factory(ids);
+
+        handler
+            .handle_update(group_settings_update()?)
+            .await
+            .map_err(|error| io::Error::other(error.to_string()))?;
+
+        assert!(next.calls().is_empty());
+        assert_eq!(control_queue.assigned().len(), 1);
+        assert_eq!(control_queue.assigned()[0].1.title, "group settings");
+        assert_eq!(
+            store.inserted(),
+            vec![("settings-handler-v1".to_owned(), -10042, Some(0))]
+        );
+        assert_eq!(dispatcher.snapshot().immediate.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn group_settings_permission_uses_stored_creator_without_telegram_call()
     -> Result<(), Box<dyn Error>> {
         let store = GroupSettingsMemberStoreStub::with_member(ChatMemberRecord {
@@ -3520,6 +3950,34 @@ mod tests {
                     return Err(StubError);
                 }
                 state.target.clone().ok_or(StubError)
+            })
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct UpdateHandlerStub {
+        calls: Arc<Mutex<Vec<i64>>>,
+    }
+
+    impl UpdateHandlerStub {
+        fn calls(&self) -> Vec<i64> {
+            self.calls.lock().expect("update handler calls").clone()
+        }
+    }
+
+    impl UpdateHandler for UpdateHandlerStub {
+        type Error = io::Error;
+
+        fn handle_update<'a>(
+            &'a self,
+            update: TelegramUpdate,
+        ) -> UpdateHandlerFuture<'a, Self::Error> {
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .map_err(|err| io::Error::other(err.to_string()))?
+                    .push(update.id);
+                Ok(())
             })
         }
     }
