@@ -1,4 +1,10 @@
-use std::{fmt, future::Future, pin::Pin, time::Duration};
+use std::{
+    fmt,
+    future::Future,
+    pin::Pin,
+    sync::{Arc, Mutex, MutexGuard},
+    time::Duration,
+};
 
 use carapax::types::{
     Chat as TelegramChat, Message as TelegramMessage, MessageData as TelegramMessageData,
@@ -633,6 +639,200 @@ pub trait PaymentControlJobWorkerQueue {
         job_id: i64,
         error: &'a str,
     ) -> PaymentControlJobWorkerFuture<'a, (), Self::Error>;
+}
+
+/// Rust-native in-memory control-job queue for the current payment vertical slice.
+///
+/// Go's current taskman repository is memory/WAL-backed, while the converted SQL corpus drops the
+/// old `job_queue` tables. This adapter gives runtime wiring a concrete queue with the same
+/// priority ordering for payment-owned control jobs; WAL/snapshot persistence remains a later
+/// taskman slice.
+#[derive(Clone, Debug)]
+pub struct InMemoryPaymentControlJobQueue {
+    state: Arc<Mutex<InMemoryPaymentControlJobQueueState>>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct InMemoryPaymentControlJobQueueState {
+    next_id: i64,
+    records: Vec<InMemoryPaymentControlJobRecord>,
+}
+
+/// In-memory taskman status used by the current payment queue adapter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InMemoryPaymentControlJobStatus {
+    /// Job is pending worker execution.
+    Pending,
+    /// Job has been dequeued by a worker.
+    Processing,
+    /// Job completed without a payment-worker failure.
+    Completed,
+    /// Job failed and carries an error string.
+    Failed,
+}
+
+/// Snapshot row for the in-memory payment taskman adapter.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InMemoryPaymentControlJobRecord {
+    /// Taskman job ID.
+    pub id: i64,
+    /// Queue name, usually Go's `control` queue.
+    pub queue_name: String,
+    /// Current in-memory status.
+    pub status: InMemoryPaymentControlJobStatus,
+    /// Go-shaped stateless job payload.
+    pub job: StatelessJobItem,
+    /// Completion report recorded by the payment worker.
+    pub completed_report: Option<PaymentControlJobReport>,
+    /// Failure string recorded by the payment worker.
+    pub error: Option<String>,
+}
+
+/// Error returned by the in-memory payment taskman adapter.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum InMemoryPaymentControlJobQueueError {
+    /// A status update targeted a job ID this queue has never assigned.
+    #[error("payment control job {0} not found")]
+    JobNotFound(i64),
+}
+
+impl InMemoryPaymentControlJobQueue {
+    /// Build an empty in-memory payment control-job queue.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(InMemoryPaymentControlJobQueueState {
+                next_id: 1,
+                records: Vec::new(),
+            })),
+        }
+    }
+
+    /// Return a stable ID-ordered snapshot of the queue state.
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<InMemoryPaymentControlJobRecord> {
+        self.lock().records.clone()
+    }
+
+    fn lock(&self) -> MutexGuard<'_, InMemoryPaymentControlJobQueueState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+impl Default for InMemoryPaymentControlJobQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PaymentControlJobQueue for InMemoryPaymentControlJobQueue {
+    type Error = InMemoryPaymentControlJobQueueError;
+
+    fn assign_payment_control_job<'a>(
+        &'a self,
+        queue_name: &'static str,
+        job: StatelessJobItem,
+    ) -> PaymentControlJobQueueFuture<'a, Self::Error> {
+        Box::pin(async move {
+            let mut state = self.lock();
+            let id = state.next_id;
+            state.next_id += 1;
+            state.records.push(InMemoryPaymentControlJobRecord {
+                id,
+                queue_name: queue_name.to_owned(),
+                status: InMemoryPaymentControlJobStatus::Pending,
+                job,
+                completed_report: None,
+                error: None,
+            });
+            Ok(())
+        })
+    }
+}
+
+impl PaymentControlJobWorkerQueue for InMemoryPaymentControlJobQueue {
+    type Error = InMemoryPaymentControlJobQueueError;
+
+    fn dequeue_payment_control_job<'a>(
+        &'a self,
+        queue_name: &'static str,
+    ) -> PaymentControlJobWorkerFuture<'a, Option<PaymentControlJobWorkItem>, Self::Error> {
+        Box::pin(async move {
+            let mut state = self.lock();
+            let Some(index) = next_in_memory_payment_control_job_index(&state.records, queue_name)
+            else {
+                return Ok(None);
+            };
+            let record = &mut state.records[index];
+            record.status = InMemoryPaymentControlJobStatus::Processing;
+            Ok(Some(PaymentControlJobWorkItem {
+                id: record.id,
+                job: record.job.clone(),
+            }))
+        })
+    }
+
+    fn complete_payment_control_job<'a>(
+        &'a self,
+        job_id: i64,
+        report: &'a PaymentControlJobReport,
+    ) -> PaymentControlJobWorkerFuture<'a, (), Self::Error> {
+        Box::pin(async move {
+            let mut state = self.lock();
+            let record = state
+                .records
+                .iter_mut()
+                .find(|record| record.id == job_id)
+                .ok_or(InMemoryPaymentControlJobQueueError::JobNotFound(job_id))?;
+            record.status = InMemoryPaymentControlJobStatus::Completed;
+            record.completed_report = Some(report.clone());
+            record.error = None;
+            Ok(())
+        })
+    }
+
+    fn fail_payment_control_job<'a>(
+        &'a self,
+        job_id: i64,
+        error: &'a str,
+    ) -> PaymentControlJobWorkerFuture<'a, (), Self::Error> {
+        Box::pin(async move {
+            let mut state = self.lock();
+            let record = state
+                .records
+                .iter_mut()
+                .find(|record| record.id == job_id)
+                .ok_or(InMemoryPaymentControlJobQueueError::JobNotFound(job_id))?;
+            record.status = InMemoryPaymentControlJobStatus::Failed;
+            record.completed_report = None;
+            record.error = Some(error.to_owned());
+            Ok(())
+        })
+    }
+}
+
+fn next_in_memory_payment_control_job_index(
+    records: &[InMemoryPaymentControlJobRecord],
+    queue_name: &str,
+) -> Option<usize> {
+    records
+        .iter()
+        .enumerate()
+        .filter(|(_index, record)| {
+            record.queue_name == queue_name
+                && record.status == InMemoryPaymentControlJobStatus::Pending
+        })
+        .min_by(|(_left_index, left), (_right_index, right)| {
+            right
+                .job
+                .priority
+                .cmp(&left.job.priority)
+                .then_with(|| left.job.created.cmp(&right.job.created))
+                .then_with(|| left.id.cmp(&right.id))
+        })
+        .map(|(index, _record)| index)
 }
 
 impl PreCheckoutPaymentEffects for openplotva_telegram::TelegramClient {
@@ -2651,7 +2851,7 @@ mod tests {
     };
     use openplotva_taskman::{
         CONTROL_QUEUE_NAME, ControlJobData, ControlJobParams, ControlKind, ControlPayment,
-        HIGH_PRIORITY, JobPayload, JobType, StatelessJobItem, new_control_job_at,
+        DEFAULT_PRIORITY, HIGH_PRIORITY, JobPayload, JobType, StatelessJobItem, new_control_job_at,
     };
     use serde_json::json;
     use time::OffsetDateTime;
@@ -4408,6 +4608,120 @@ mod tests {
             vec![(7, "missing control data for control job".to_owned())]
         );
         assert!(effects.subscription_invoice_requests().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn in_memory_payment_control_job_queue_dequeues_go_priority_then_fifo_order()
+    -> Result<(), Box<dyn Error>> {
+        let created = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let queue = super::InMemoryPaymentControlJobQueue::new();
+        let low_old = new_control_job_at(sample_invoice_job(ControlKind::DonateInvoice), created)
+            .with_name("low old")
+            .with_priority(DEFAULT_PRIORITY);
+        let high_new = new_control_job_at(
+            sample_invoice_job(ControlKind::SuccessfulPayment),
+            created + time::Duration::seconds(2),
+        )
+        .with_name("high new")
+        .with_priority(HIGH_PRIORITY);
+        let high_old = new_control_job_at(
+            sample_invoice_job(ControlKind::VipInvoice),
+            created + time::Duration::seconds(1),
+        )
+        .with_name("high old")
+        .with_priority(HIGH_PRIORITY);
+
+        queue
+            .assign_payment_control_job(CONTROL_QUEUE_NAME, low_old)
+            .await?;
+        queue
+            .assign_payment_control_job(CONTROL_QUEUE_NAME, high_new)
+            .await?;
+        queue
+            .assign_payment_control_job(CONTROL_QUEUE_NAME, high_old)
+            .await?;
+
+        let first = queue
+            .dequeue_payment_control_job(CONTROL_QUEUE_NAME)
+            .await?
+            .expect("first job");
+        let second = queue
+            .dequeue_payment_control_job(CONTROL_QUEUE_NAME)
+            .await?
+            .expect("second job");
+        let third = queue
+            .dequeue_payment_control_job(CONTROL_QUEUE_NAME)
+            .await?
+            .expect("third job");
+
+        assert_eq!(first.job.title, "high old");
+        assert_eq!(second.job.title, "high new");
+        assert_eq!(third.job.title, "low old");
+        assert!(
+            queue
+                .dequeue_payment_control_job(CONTROL_QUEUE_NAME)
+                .await?
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn in_memory_payment_control_job_queue_records_completion_and_failure_status()
+    -> Result<(), Box<dyn Error>> {
+        let created = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let queue = super::InMemoryPaymentControlJobQueue::new();
+        let complete_job = new_control_job_at(sample_invoice_job(ControlKind::VipInvoice), created)
+            .with_name("complete")
+            .with_priority(HIGH_PRIORITY);
+        let fail_job = new_control_job_at(
+            sample_invoice_job(ControlKind::DonateInvoice),
+            created + time::Duration::seconds(1),
+        )
+        .with_name("fail")
+        .with_priority(HIGH_PRIORITY);
+
+        queue
+            .assign_payment_control_job(CONTROL_QUEUE_NAME, complete_job)
+            .await?;
+        queue
+            .assign_payment_control_job(CONTROL_QUEUE_NAME, fail_job)
+            .await?;
+
+        let complete_item = queue
+            .dequeue_payment_control_job(CONTROL_QUEUE_NAME)
+            .await?
+            .expect("complete item");
+        let fail_item = queue
+            .dequeue_payment_control_job(CONTROL_QUEUE_NAME)
+            .await?
+            .expect("fail item");
+        let report = PaymentControlJobReport::new(PaymentControlJobOutcome::VipInvoice(
+            InvoiceControlJobOutcome::InvoiceSent,
+        ));
+
+        queue
+            .complete_payment_control_job(complete_item.id, &report)
+            .await?;
+        queue
+            .fail_payment_control_job(fail_item.id, "invoice failed")
+            .await?;
+
+        let snapshot = queue.snapshot();
+        assert_eq!(snapshot.len(), 2);
+        assert_eq!(
+            snapshot[0].status,
+            super::InMemoryPaymentControlJobStatus::Completed
+        );
+        assert_eq!(snapshot[0].completed_report, Some(report));
+        assert_eq!(snapshot[0].error, None);
+        assert_eq!(
+            snapshot[1].status,
+            super::InMemoryPaymentControlJobStatus::Failed
+        );
+        assert_eq!(snapshot[1].completed_report, None);
+        assert_eq!(snapshot[1].error.as_deref(), Some("invoice failed"));
         Ok(())
     }
 
