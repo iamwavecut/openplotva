@@ -719,7 +719,35 @@ async fn start_runtime_workers(
     );
     let payment_effects =
         payments::PaymentRuntimeEffects::new(telegram.clone(), payment_successful_effects);
-    let payment_queue = payments::InMemoryPaymentControlJobQueue::new();
+    let payment_snapshot_store = payments::PaymentControlJobSnapshotFileStore::new(
+        payments::default_payment_control_job_snapshot_path(),
+    );
+    let payment_snapshot_path = payment_snapshot_store.path().to_path_buf();
+    let (payment_queue, payment_readiness) =
+        match payments::PersistentPaymentControlJobQueue::load_or_new(
+            payment_snapshot_store.clone(),
+        ) {
+            Ok(queue) => (
+                queue,
+                format!(
+                    "payment control-job worker started with Rust-native snapshot persistence at {}",
+                    payment_snapshot_path.display()
+                ),
+            ),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    path = %payment_snapshot_path.display(),
+                    "failed to load payment control-job snapshot; starting empty"
+                );
+                (
+                    payments::PersistentPaymentControlJobQueue::new_empty(payment_snapshot_store),
+                    format!(
+                        "payment control-job worker started with an empty queue after snapshot load failure: {error}"
+                    ),
+                )
+            }
+        };
     let payment_stop = stop.subscribe();
     let payment_worker = tokio::spawn(async move {
         let report = payments::run_payment_control_job_worker_until(
@@ -734,7 +762,7 @@ async fn start_runtime_workers(
     });
     readiness_checks.push(ReadinessCheck::ok(
         "payment_control_jobs",
-        "payment control-job worker started",
+        payment_readiness,
     ));
     workers.handles.push(payment_worker);
 

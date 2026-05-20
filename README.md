@@ -139,8 +139,10 @@ Rust-native serde payloads. Current cases: Telegram updates use zstd-compressed
 serde JSON envelopes over `carapax::types::Update`; dispatcher shutdown
 snapshots store persistent-item JSON directly; persisted chat rate-limit
 expiries use JSON timestamp values under the original
-`plotva:rate_limited_chat:*` keys. Tests for these surfaces should assert
-decoded values and lifecycle behavior rather than gob bytes.
+`plotva:rate_limited_chat:*` keys; the payment control-job queue stores a
+Rust-native JSON snapshot at `~/.plotva/openplotva-payment-control-jobs.snap`.
+Tests for these surfaces should assert decoded values and lifecycle behavior
+rather than gob bytes.
 
 ## Migrations
 
@@ -151,7 +153,7 @@ The Rust repo carries a SQLx-compatible conversion of the frozen Go migrations u
 - Conversion: each Go `sql-migrate` file is split into reversible SQLx `.up.sql` and `.down.sql` files.
 - Runtime execution: `OPENPLOTVA_CONNECT_SERVICES=true OPENPLOTVA_RUN_MIGRATIONS=true BOT_KEY=... cargo run -p openplotva-app`
 
-With `BOT_KEY` set, the current runtime shell deletes and re-registers scoped Telegram bot commands, then starts Telegram update ingestion into `plotva:updates:queue`. The default path deletes any existing webhook and long-polls; `BOT_WEBHOOK_ENABLED=true` with `BOT_WEBHOOK_URL` installs `/telegram/webhook`, calls `setWebhook`, uploads `BOT_WEBHOOK_CERT_FILE` as `cert.pem` when both certificate and key paths are set, and feeds accepted webhook updates through the same producer queue. It does not yet install the real fetcher update consumer route, so queued updates are preserved rather than drained by a placeholder handler.
+With `BOT_KEY` set, the current runtime shell deletes and re-registers scoped Telegram bot commands, then starts Telegram update ingestion into `plotva:updates:queue`. The default path deletes any existing webhook and long-polls; `BOT_WEBHOOK_ENABLED=true` with `BOT_WEBHOOK_URL` installs `/telegram/webhook`, calls `setWebhook`, uploads `BOT_WEBHOOK_CERT_FILE` as `cert.pem` when both certificate and key paths are set, and feeds accepted webhook updates through the same producer queue. It also starts the payment-owned control-job worker with a Rust-native snapshot under `~/.plotva/openplotva-payment-control-jobs.snap`. It does not yet install the real fetcher update consumer route, so queued updates are preserved rather than drained by a placeholder handler.
 
 Current caveat: SQLx records migration state in `_sqlx_migrations`, while the Go app uses `rubenv/sql-migrate`. Use the Rust migration runner on fresh or scratch databases until the existing production DB compatibility path is explicitly ported and tested.
 

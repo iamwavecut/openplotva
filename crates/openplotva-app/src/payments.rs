@@ -1,6 +1,8 @@
 use std::{
-    fmt,
+    fmt, fs,
     future::Future,
+    io::{self, Write},
+    path::{Path, PathBuf},
     pin::Pin,
     sync::{
         Arc, Mutex, MutexGuard,
@@ -703,8 +705,7 @@ pub trait PaymentControlJobWorkerQueue {
 ///
 /// Go's current taskman repository is memory/WAL-backed, while the converted SQL corpus drops the
 /// old `job_queue` tables. This adapter gives runtime wiring a concrete queue with the same
-/// priority ordering for payment-owned control jobs; WAL/snapshot persistence remains a later
-/// taskman slice.
+/// priority ordering for payment-owned control jobs.
 #[derive(Clone, Debug)]
 pub struct InMemoryPaymentControlJobQueue {
     state: Arc<Mutex<InMemoryPaymentControlJobQueueState>>,
@@ -780,6 +781,9 @@ pub enum PaymentControlJobQueueSnapshotError {
     UnsupportedFormat(String),
 }
 
+/// Default Rust-native payment control-job snapshot name under Go's `~/.plotva` work directory.
+pub const DEFAULT_PAYMENT_CONTROL_JOB_SNAPSHOT_FILE: &str = "openplotva-payment-control-jobs.snap";
+
 impl InMemoryPaymentControlJobQueue {
     /// Build an empty in-memory payment control-job queue.
     #[must_use]
@@ -851,6 +855,326 @@ pub fn decode_payment_control_job_queue_snapshot(
         ));
     }
     Ok(snapshot)
+}
+
+/// Default Rust-native snapshot path for the payment control-job queue.
+#[must_use]
+pub fn default_payment_control_job_snapshot_path() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".plotva")
+        .join(DEFAULT_PAYMENT_CONTROL_JOB_SNAPSHOT_FILE)
+}
+
+/// File-backed store for Rust-native payment control-job queue snapshots.
+#[derive(Clone, Debug)]
+pub struct PaymentControlJobSnapshotFileStore {
+    path: PathBuf,
+}
+
+/// Error returned by the payment control-job snapshot file store.
+#[derive(Debug, Error)]
+pub enum PaymentControlJobSnapshotFileStoreError {
+    /// Reading the snapshot file failed.
+    #[error("read payment control-job queue snapshot {path}: {source}")]
+    Read {
+        /// Snapshot file path.
+        path: PathBuf,
+        /// Underlying filesystem error.
+        #[source]
+        source: io::Error,
+    },
+    /// Decoding a read snapshot failed.
+    #[error("decode payment control-job queue snapshot {path}: {source}")]
+    Decode {
+        /// Snapshot file path.
+        path: PathBuf,
+        /// Underlying snapshot decode error.
+        #[source]
+        source: PaymentControlJobQueueSnapshotError,
+    },
+    /// Creating the snapshot directory failed.
+    #[error("create payment control-job queue snapshot directory {path}: {source}")]
+    CreateDir {
+        /// Snapshot directory path.
+        path: PathBuf,
+        /// Underlying filesystem error.
+        #[source]
+        source: io::Error,
+    },
+    /// Encoding the snapshot failed.
+    #[error("encode payment control-job queue snapshot {path}: {source}")]
+    Encode {
+        /// Snapshot file path.
+        path: PathBuf,
+        /// Underlying JSON error.
+        #[source]
+        source: serde_json::Error,
+    },
+    /// Writing the temporary snapshot file failed.
+    #[error("write payment control-job queue snapshot {path}: {source}")]
+    Write {
+        /// Temporary snapshot file path.
+        path: PathBuf,
+        /// Underlying filesystem error.
+        #[source]
+        source: io::Error,
+    },
+    /// Syncing the temporary snapshot file failed.
+    #[error("sync payment control-job queue snapshot {path}: {source}")]
+    Sync {
+        /// Temporary snapshot file path.
+        path: PathBuf,
+        /// Underlying filesystem error.
+        #[source]
+        source: io::Error,
+    },
+    /// Installing the temporary snapshot file failed.
+    #[error("install payment control-job queue snapshot {from} -> {to}: {source}")]
+    Rename {
+        /// Temporary snapshot path.
+        from: PathBuf,
+        /// Final snapshot path.
+        to: PathBuf,
+        /// Underlying filesystem error.
+        #[source]
+        source: io::Error,
+    },
+}
+
+impl PaymentControlJobSnapshotFileStore {
+    /// Build a snapshot store for a concrete file path.
+    #[must_use]
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    /// Return the configured snapshot file path.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Load the Rust-native snapshot from disk, returning `None` when it does not exist yet.
+    pub fn load_snapshot(
+        &self,
+    ) -> Result<
+        Option<InMemoryPaymentControlJobQueueSnapshot>,
+        PaymentControlJobSnapshotFileStoreError,
+    > {
+        let bytes = match fs::read(&self.path) {
+            Ok(bytes) => bytes,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => {
+                return Err(PaymentControlJobSnapshotFileStoreError::Read {
+                    path: self.path.clone(),
+                    source,
+                });
+            }
+        };
+
+        decode_payment_control_job_queue_snapshot(&bytes)
+            .map(Some)
+            .map_err(|source| PaymentControlJobSnapshotFileStoreError::Decode {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    /// Save the Rust-native snapshot atomically through a sibling temporary file.
+    pub fn save_snapshot(
+        &self,
+        snapshot: &InMemoryPaymentControlJobQueueSnapshot,
+    ) -> Result<(), PaymentControlJobSnapshotFileStoreError> {
+        let bytes = encode_payment_control_job_queue_snapshot(snapshot).map_err(|source| {
+            PaymentControlJobSnapshotFileStoreError::Encode {
+                path: self.path.clone(),
+                source,
+            }
+        })?;
+        if let Some(parent) = self
+            .path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent).map_err(|source| {
+                PaymentControlJobSnapshotFileStoreError::CreateDir {
+                    path: parent.to_path_buf(),
+                    source,
+                }
+            })?;
+        }
+
+        let tmp_path = payment_control_job_snapshot_tmp_path(&self.path);
+        let mut file = fs::File::create(&tmp_path).map_err(|source| {
+            PaymentControlJobSnapshotFileStoreError::Write {
+                path: tmp_path.clone(),
+                source,
+            }
+        })?;
+        file.write_all(&bytes).map_err(|source| {
+            PaymentControlJobSnapshotFileStoreError::Write {
+                path: tmp_path.clone(),
+                source,
+            }
+        })?;
+        file.sync_all()
+            .map_err(|source| PaymentControlJobSnapshotFileStoreError::Sync {
+                path: tmp_path.clone(),
+                source,
+            })?;
+        drop(file);
+
+        fs::rename(&tmp_path, &self.path).map_err(|source| {
+            PaymentControlJobSnapshotFileStoreError::Rename {
+                from: tmp_path,
+                to: self.path.clone(),
+                source,
+            }
+        })
+    }
+}
+
+/// Error returned by the persistent payment taskman adapter.
+#[derive(Debug, Error)]
+pub enum PersistentPaymentControlJobQueueError {
+    /// The inner queue operation failed.
+    #[error(transparent)]
+    Queue(#[from] InMemoryPaymentControlJobQueueError),
+    /// Snapshot persistence failed.
+    #[error(transparent)]
+    Snapshot(#[from] PaymentControlJobSnapshotFileStoreError),
+}
+
+/// Payment control-job queue backed by Rust-native snapshots after every mutation.
+#[derive(Clone, Debug)]
+pub struct PersistentPaymentControlJobQueue {
+    queue: InMemoryPaymentControlJobQueue,
+    snapshots: PaymentControlJobSnapshotFileStore,
+}
+
+impl PersistentPaymentControlJobQueue {
+    /// Load a queue from the snapshot file, or start empty when no snapshot exists yet.
+    pub fn load_or_new(
+        snapshots: PaymentControlJobSnapshotFileStore,
+    ) -> Result<Self, PaymentControlJobSnapshotFileStoreError> {
+        let queue = match snapshots.load_snapshot()? {
+            Some(mut snapshot) => {
+                if requeue_processing_payment_control_jobs_for_startup(&mut snapshot) > 0 {
+                    snapshots.save_snapshot(&snapshot)?;
+                }
+                InMemoryPaymentControlJobQueue::from_persistence_snapshot(snapshot)
+            }
+            None => InMemoryPaymentControlJobQueue::new(),
+        };
+        Ok(Self { queue, snapshots })
+    }
+
+    /// Build an empty queue with the provided snapshot store.
+    #[must_use]
+    pub fn new_empty(snapshots: PaymentControlJobSnapshotFileStore) -> Self {
+        Self {
+            queue: InMemoryPaymentControlJobQueue::new(),
+            snapshots,
+        }
+    }
+
+    /// Return a stable ID-ordered snapshot of the queue state.
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<InMemoryPaymentControlJobRecord> {
+        self.queue.snapshot()
+    }
+
+    fn persist_snapshot(&self) -> Result<(), PaymentControlJobSnapshotFileStoreError> {
+        self.snapshots
+            .save_snapshot(&self.queue.persistence_snapshot())
+    }
+}
+
+impl PaymentControlJobQueue for PersistentPaymentControlJobQueue {
+    type Error = PersistentPaymentControlJobQueueError;
+
+    fn assign_payment_control_job<'a>(
+        &'a self,
+        queue_name: &'static str,
+        job: StatelessJobItem,
+    ) -> PaymentControlJobQueueFuture<'a, Self::Error> {
+        Box::pin(async move {
+            self.queue
+                .assign_payment_control_job(queue_name, job)
+                .await?;
+            self.persist_snapshot()?;
+            Ok(())
+        })
+    }
+}
+
+impl PaymentControlJobWorkerQueue for PersistentPaymentControlJobQueue {
+    type Error = PersistentPaymentControlJobQueueError;
+
+    fn dequeue_payment_control_job<'a>(
+        &'a self,
+        queue_name: &'static str,
+    ) -> PaymentControlJobWorkerFuture<'a, Option<PaymentControlJobWorkItem>, Self::Error> {
+        Box::pin(async move {
+            let work_item = self.queue.dequeue_payment_control_job(queue_name).await?;
+            if work_item.is_some() {
+                self.persist_snapshot()?;
+            }
+            Ok(work_item)
+        })
+    }
+
+    fn complete_payment_control_job<'a>(
+        &'a self,
+        job_id: i64,
+        report: &'a PaymentControlJobReport,
+    ) -> PaymentControlJobWorkerFuture<'a, (), Self::Error> {
+        Box::pin(async move {
+            self.queue
+                .complete_payment_control_job(job_id, report)
+                .await?;
+            self.persist_snapshot()?;
+            Ok(())
+        })
+    }
+
+    fn fail_payment_control_job<'a>(
+        &'a self,
+        job_id: i64,
+        error: &'a str,
+    ) -> PaymentControlJobWorkerFuture<'a, (), Self::Error> {
+        Box::pin(async move {
+            self.queue.fail_payment_control_job(job_id, error).await?;
+            self.persist_snapshot()?;
+            Ok(())
+        })
+    }
+}
+
+fn requeue_processing_payment_control_jobs_for_startup(
+    snapshot: &mut InMemoryPaymentControlJobQueueSnapshot,
+) -> usize {
+    let mut requeued = 0;
+    for record in &mut snapshot.records {
+        if record.status == InMemoryPaymentControlJobStatus::Processing {
+            record.status = InMemoryPaymentControlJobStatus::Pending;
+            record.completed_report = None;
+            record.error = None;
+            requeued += 1;
+        }
+    }
+    requeued
+}
+
+fn payment_control_job_snapshot_tmp_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| DEFAULT_PAYMENT_CONTROL_JOB_SNAPSHOT_FILE.into());
+    path.with_file_name(format!("{file_name}.tmp"))
 }
 
 impl Default for InMemoryPaymentControlJobQueue {
@@ -5427,6 +5751,74 @@ mod tests {
                 if format == "go-gob"
         ));
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn persistent_payment_control_job_queue_saves_mutations_and_requeues_processing_on_startup()
+    -> Result<(), Box<dyn Error>> {
+        let path = unique_payment_queue_snapshot_path("persistent-payment-control");
+        let _ = std::fs::remove_file(&path);
+        let store = super::PaymentControlJobSnapshotFileStore::new(path.clone());
+        let queue = super::PersistentPaymentControlJobQueue::load_or_new(store.clone())?;
+        let created = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let low_old = new_control_job_at(sample_invoice_job(ControlKind::DonateInvoice), created)
+            .with_name("donate invoice");
+        let high_new = new_control_job_at(
+            sample_invoice_job(ControlKind::SuccessfulPayment),
+            created + time::Duration::seconds(1),
+        )
+        .with_name("successful payment")
+        .with_priority(HIGH_PRIORITY);
+
+        queue
+            .assign_payment_control_job(CONTROL_QUEUE_NAME, low_old)
+            .await?;
+        queue
+            .assign_payment_control_job(CONTROL_QUEUE_NAME, high_new)
+            .await?;
+
+        let encoded_text = std::fs::read_to_string(&path)?;
+        assert!(encoded_text.starts_with('{'));
+        assert!(encoded_text.contains(super::PAYMENT_CONTROL_JOB_QUEUE_SNAPSHOT_FORMAT));
+
+        let processing = queue
+            .dequeue_payment_control_job(CONTROL_QUEUE_NAME)
+            .await?
+            .expect("high-priority job");
+        assert_eq!(processing.id, 2);
+
+        let restarted = super::PersistentPaymentControlJobQueue::load_or_new(store.clone())?;
+        let restarted_item = restarted
+            .dequeue_payment_control_job(CONTROL_QUEUE_NAME)
+            .await?
+            .expect("processing job requeued on startup");
+        assert_eq!(restarted_item.id, 2);
+
+        let report =
+            PaymentControlJobReport::new(super::PaymentControlJobOutcome::SuccessfulPayment(
+                SuccessfulPaymentOutcome::SubscriptionProcessed,
+            ));
+        restarted
+            .complete_payment_control_job(restarted_item.id, &report)
+            .await?;
+
+        let restored = super::PersistentPaymentControlJobQueue::load_or_new(store)?;
+        assert_eq!(
+            restored.snapshot()[1].status,
+            super::InMemoryPaymentControlJobStatus::Completed
+        );
+        assert_eq!(restored.snapshot()[1].completed_report, Some(report));
+
+        let _ = std::fs::remove_file(&path);
+        Ok(())
+    }
+
+    fn unique_payment_queue_snapshot_path(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "openplotva-{label}-{}-{}.json",
+            std::process::id(),
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ))
     }
 
     #[test]
