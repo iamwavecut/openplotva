@@ -228,3 +228,24 @@ pub fn checkin_theme_selection_alert(
         ("Только инициатор может выбрать тему", true)
     }
 }
+
+/// Build Go's check-in theme selection callback acknowledgement or alert.
+#[must_use]
+pub fn checkin_theme_selection_ack_method(
+    callback_query_id: impl Into<String>,
+    user_id: i64,
+    data: &CallbackActionData,
+) -> (TelegramOutboundMethod, bool) {
+    let (text, blocked) = checkin_theme_selection_alert(user_id, data);
+    let request = CallbackAnswerRequest {
+        callback_query_id: callback_query_id.into(),
+        text: text.to_owned(),
+        show_alert: blocked,
+        url: String::new(),
+        cache_time: 0,
+    };
+    (
+        TelegramOutboundMethod::from(build_callback_answer_method(&request)),
+        blocked,
+    )
+}
