@@ -1,5 +1,7 @@
 //! Observable and recoverable background task orchestration.
 
+use std::{error::Error, fmt};
+
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
@@ -134,6 +136,31 @@ pub struct StatelessJobItem {
     pub data: JobPayload,
 }
 
+/// Error returned when a queued job cannot be executed as a Go control job.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ControlJobPayloadError {
+    /// The payload is not a control job.
+    InvalidJobType { actual: JobType },
+    /// Go `ControlJobExecutor` requires Telegram routing metadata.
+    MissingTelegramData,
+    /// Go `ControlJobExecutor` requires control-job data.
+    MissingControlData,
+}
+
+impl fmt::Display for ControlJobPayloadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidJobType { actual } => {
+                write!(f, "invalid job type for control job executor: {actual:?}")
+            }
+            Self::MissingTelegramData => f.write_str("missing Telegram data for control job"),
+            Self::MissingControlData => f.write_str("missing control data for control job"),
+        }
+    }
+}
+
+impl Error for ControlJobPayloadError {}
+
 /// Build Go `NewControlJob` shape with an injected clock for tests/runtime determinism.
 #[must_use]
 pub fn new_control_job_at(params: ControlJobParams, created: OffsetDateTime) -> StatelessJobItem {
@@ -154,6 +181,41 @@ pub fn new_control_job_at(params: ControlJobParams, created: OffsetDateTime) -> 
             control_data: Some(params.data),
         },
     }
+}
+
+/// Decode the Go `ControlJobExecutor` input from a stateless queue item.
+pub fn control_job_params_from_stateless_job(
+    job: &StatelessJobItem,
+) -> Result<ControlJobParams, ControlJobPayloadError> {
+    control_job_params_from_payload(&job.data)
+}
+
+/// Decode the Go `ControlJobExecutor` input from a queued payload.
+pub fn control_job_params_from_payload(
+    payload: &JobPayload,
+) -> Result<ControlJobParams, ControlJobPayloadError> {
+    if payload.job_type != JobType::Control {
+        return Err(ControlJobPayloadError::InvalidJobType {
+            actual: payload.job_type,
+        });
+    }
+    let telegram_data = payload
+        .telegram_data
+        .as_ref()
+        .ok_or(ControlJobPayloadError::MissingTelegramData)?;
+    let control_data = payload
+        .control_data
+        .as_ref()
+        .ok_or(ControlJobPayloadError::MissingControlData)?;
+
+    Ok(ControlJobParams {
+        chat_id: telegram_data.chat_id,
+        message_id: telegram_data.message_id,
+        user_id: telegram_data.user_id,
+        user_full_name: telegram_data.user_full_name.clone(),
+        thread_id: telegram_data.thread_message_id,
+        data: control_data.clone(),
+    })
 }
 
 impl StatelessJobItem {
@@ -220,8 +282,8 @@ mod tests {
     use time::OffsetDateTime;
 
     use super::{
-        CONTROL_QUEUE_NAME, ControlJobData, ControlJobParams, ControlKind, HIGH_PRIORITY, JobType,
-        new_control_job_at,
+        CONTROL_QUEUE_NAME, ControlJobData, ControlJobParams, ControlJobPayloadError, ControlKind,
+        HIGH_PRIORITY, JobPayload, JobType, new_control_job_at,
     };
 
     #[test]
@@ -325,5 +387,78 @@ mod tests {
             })
         );
         Ok(())
+    }
+
+    #[test]
+    fn control_job_params_decode_go_executor_input_from_payload()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let created = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let job = new_control_job_at(
+            ControlJobParams {
+                chat_id: 10,
+                message_id: 20,
+                user_id: 30,
+                user_full_name: "Alice Smith".to_owned(),
+                thread_id: Some(40),
+                data: ControlJobData {
+                    kind: ControlKind::DonateInvoice,
+                    amount: 600,
+                    ..ControlJobData::default()
+                },
+            },
+            created,
+        );
+
+        let params = super::control_job_params_from_stateless_job(&job)?;
+
+        assert_eq!(
+            params,
+            ControlJobParams {
+                chat_id: 10,
+                message_id: 20,
+                user_id: 30,
+                user_full_name: "Alice Smith".to_owned(),
+                thread_id: Some(40),
+                data: ControlJobData {
+                    kind: ControlKind::DonateInvoice,
+                    amount: 600,
+                    ..ControlJobData::default()
+                },
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn control_job_params_reject_missing_go_required_payload_sections() {
+        let payload_without_telegram = JobPayload {
+            job_type: JobType::Control,
+            telegram_data: None,
+            control_data: Some(ControlJobData {
+                kind: ControlKind::VipInvoice,
+                ..ControlJobData::default()
+            }),
+        };
+        assert_eq!(
+            super::control_job_params_from_payload(&payload_without_telegram),
+            Err(ControlJobPayloadError::MissingTelegramData)
+        );
+
+        let payload_without_control = JobPayload {
+            job_type: JobType::Control,
+            telegram_data: Some(super::TelegramData {
+                chat_id: 10,
+                user_id: 30,
+                message_id: 20,
+                thread_message_id: None,
+                user_full_name: "Alice".to_owned(),
+                chat_title: String::new(),
+            }),
+            control_data: None,
+        };
+        assert_eq!(
+            super::control_job_params_from_payload(&payload_without_control),
+            Err(ControlJobPayloadError::MissingControlData)
+        );
     }
 }

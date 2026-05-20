@@ -1,4 +1,4 @@
-use std::{fmt, future::Future, pin::Pin};
+use std::{fmt, future::Future, pin::Pin, time::Duration};
 
 use carapax::types::{
     Chat as TelegramChat, Message as TelegramMessage, MessageData as TelegramMessageData,
@@ -14,7 +14,7 @@ use openplotva_storage::{
 };
 use openplotva_taskman::{
     CONTROL_QUEUE_NAME, ControlJobData, ControlJobParams, ControlKind, ControlPayment,
-    HIGH_PRIORITY, StatelessJobItem, new_control_job_at,
+    HIGH_PRIORITY, StatelessJobItem, control_job_params_from_stateless_job, new_control_job_at,
 };
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -35,6 +35,10 @@ pub type PaymentInvoiceLinkFuture<'a, E> =
 /// Boxed future returned by taskman control-job assignment calls.
 pub type PaymentControlJobQueueFuture<'a, E> =
     Pin<Box<dyn Future<Output = Result<(), E>> + Send + 'a>>;
+
+/// Boxed future returned by payment taskman worker queue calls.
+pub type PaymentControlJobWorkerFuture<'a, T, E> =
+    Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'a>>;
 
 /// Telegram successful-payment payload captured from a message/control job.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -244,6 +248,53 @@ pub struct PaymentControlJobReport {
     pub error: Option<String>,
 }
 
+/// A concrete taskman row ready for the payment-owned control-job worker.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentControlJobWorkItem {
+    /// Taskman job ID used for completion/failure writes.
+    pub id: i64,
+    /// Stateless Go-shaped task payload.
+    pub job: StatelessJobItem,
+}
+
+/// Result of one payment-owned taskman worker tick.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PaymentControlJobWorkerReport {
+    /// Whether a job was dequeued.
+    pub dequeued: bool,
+    /// Dequeued taskman job ID.
+    pub job_id: Option<i64>,
+    /// Payment dispatcher execution report, when payload decoding succeeded.
+    pub execution: Option<PaymentControlJobReport>,
+    /// The job was finalized as completed.
+    pub completed: bool,
+    /// The job was finalized as failed.
+    pub failed: bool,
+    /// Queue dequeue failed.
+    pub dequeue_error: Option<String>,
+    /// Queued task payload could not be decoded as Go control-job executor input.
+    pub decode_error: Option<String>,
+    /// Completion/failure status write failed.
+    pub status_error: Option<String>,
+}
+
+/// Aggregate report for a long-running payment-owned taskman worker.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PaymentControlJobWorkerRunReport {
+    /// Number of poll ticks.
+    pub ticks: u64,
+    /// Number of ticks that dequeued a job.
+    pub dequeued: u64,
+    /// Number of jobs completed.
+    pub completed: u64,
+    /// Number of jobs failed.
+    pub failed: u64,
+    /// Number of queue dequeue errors.
+    pub dequeue_errors: u64,
+    /// Number of completion/failure write errors.
+    pub status_errors: u64,
+}
+
 /// Concrete Telegram invoice-effect failure.
 #[derive(Debug, Error)]
 pub enum TelegramPaymentInvoiceEffectError {
@@ -316,6 +367,27 @@ impl PaymentControlJobReport {
         Self {
             outcome: PaymentControlJobOutcome::SuccessfulPayment(report.outcome),
             error: report.error,
+        }
+    }
+}
+
+impl PaymentControlJobWorkerRunReport {
+    fn record_tick(&mut self, tick: &PaymentControlJobWorkerReport) {
+        self.ticks += 1;
+        if tick.dequeued {
+            self.dequeued += 1;
+        }
+        if tick.completed {
+            self.completed += 1;
+        }
+        if tick.failed {
+            self.failed += 1;
+        }
+        if tick.dequeue_error.is_some() {
+            self.dequeue_errors += 1;
+        }
+        if tick.status_error.is_some() {
+            self.status_errors += 1;
         }
     }
 }
@@ -441,6 +513,32 @@ pub trait PaymentControlJobQueue {
         queue_name: &'static str,
         job: StatelessJobItem,
     ) -> PaymentControlJobQueueFuture<'a, Self::Error>;
+}
+
+/// Queue/status boundary for the payment-owned taskman worker.
+pub trait PaymentControlJobWorkerQueue {
+    /// Error returned by the concrete queue implementation.
+    type Error: fmt::Display + Send + Sync + 'static;
+
+    /// Dequeue the next pending payment control job from a named taskman queue.
+    fn dequeue_payment_control_job<'a>(
+        &'a self,
+        queue_name: &'static str,
+    ) -> PaymentControlJobWorkerFuture<'a, Option<PaymentControlJobWorkItem>, Self::Error>;
+
+    /// Finalize a payment control job as completed.
+    fn complete_payment_control_job<'a>(
+        &'a self,
+        job_id: i64,
+        report: &'a PaymentControlJobReport,
+    ) -> PaymentControlJobWorkerFuture<'a, (), Self::Error>;
+
+    /// Finalize a payment control job as failed.
+    fn fail_payment_control_job<'a>(
+        &'a self,
+        job_id: i64,
+        error: &'a str,
+    ) -> PaymentControlJobWorkerFuture<'a, (), Self::Error>;
 }
 
 impl PreCheckoutPaymentEffects for openplotva_telegram::TelegramClient {
@@ -1291,6 +1389,184 @@ where
     }
 }
 
+/// Go taskman control queue poll interval used by the payment-owned worker loop.
+pub const PAYMENT_CONTROL_JOB_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Process one payment-owned taskman control job, if available.
+pub async fn process_payment_control_job_once_at<Queue, Store, Effects>(
+    queue: &Queue,
+    store: &Store,
+    effects: &Effects,
+    now: OffsetDateTime,
+) -> PaymentControlJobWorkerReport
+where
+    Queue: PaymentControlJobWorkerQueue + Sync,
+    Store: SuccessfulPaymentStore + Sync,
+    Effects: PaymentInvoiceEffects + SuccessfulPaymentEffects + Sync,
+{
+    let mut report = PaymentControlJobWorkerReport::default();
+    let item = match queue.dequeue_payment_control_job(CONTROL_QUEUE_NAME).await {
+        Ok(item) => item,
+        Err(error) => {
+            report.dequeue_error = Some(error.to_string());
+            return report;
+        }
+    };
+
+    let Some(item) = item else {
+        return report;
+    };
+    report.dequeued = true;
+    report.job_id = Some(item.id);
+
+    let params = match control_job_params_from_stateless_job(&item.job) {
+        Ok(params) => params,
+        Err(error) => {
+            let error = error.to_string();
+            report.decode_error = Some(error.clone());
+            mark_payment_control_job_failed(queue, item.id, &error, &mut report).await;
+            return report;
+        }
+    };
+
+    let execution = execute_payment_control_job_at(store, effects, &params, now).await;
+    if let Some(error) = payment_control_job_failure_message(&execution) {
+        mark_payment_control_job_failed(queue, item.id, &error, &mut report).await;
+    } else {
+        match queue
+            .complete_payment_control_job(item.id, &execution)
+            .await
+        {
+            Ok(()) => report.completed = true,
+            Err(error) => report.status_error = Some(error.to_string()),
+        }
+    }
+    report.execution = Some(execution);
+    report
+}
+
+/// Run the payment-owned taskman control-job worker until the stop future resolves.
+pub async fn run_payment_control_job_worker_until<Queue, Store, Effects, Stop>(
+    queue: &Queue,
+    store: &Store,
+    effects: &Effects,
+    stop: Stop,
+) -> PaymentControlJobWorkerRunReport
+where
+    Queue: PaymentControlJobWorkerQueue + Sync,
+    Store: SuccessfulPaymentStore + Sync,
+    Effects: PaymentInvoiceEffects + SuccessfulPaymentEffects + Sync,
+    Stop: Future<Output = ()>,
+{
+    run_payment_control_job_worker_every_until(
+        queue,
+        store,
+        effects,
+        PAYMENT_CONTROL_JOB_POLL_INTERVAL,
+        stop,
+    )
+    .await
+}
+
+/// Run the payment-owned taskman control-job worker with an injected interval.
+pub async fn run_payment_control_job_worker_every_until<Queue, Store, Effects, Stop>(
+    queue: &Queue,
+    store: &Store,
+    effects: &Effects,
+    interval: Duration,
+    stop: Stop,
+) -> PaymentControlJobWorkerRunReport
+where
+    Queue: PaymentControlJobWorkerQueue + Sync,
+    Store: SuccessfulPaymentStore + Sync,
+    Effects: PaymentInvoiceEffects + SuccessfulPaymentEffects + Sync,
+    Stop: Future<Output = ()>,
+{
+    let mut report = PaymentControlJobWorkerRunReport::default();
+    let mut stop = std::pin::pin!(stop);
+
+    loop {
+        tokio::select! {
+            () = &mut stop => break,
+            () = tokio::time::sleep(interval) => {
+                let tick = process_payment_control_job_once_at(queue, store, effects, OffsetDateTime::now_utc()).await;
+                trace_payment_control_job_tick(&tick);
+                report.record_tick(&tick);
+            }
+        }
+    }
+
+    report
+}
+
+async fn mark_payment_control_job_failed<Queue>(
+    queue: &Queue,
+    job_id: i64,
+    error: &str,
+    report: &mut PaymentControlJobWorkerReport,
+) where
+    Queue: PaymentControlJobWorkerQueue + Sync,
+{
+    match queue.fail_payment_control_job(job_id, error).await {
+        Ok(()) => report.failed = true,
+        Err(error) => report.status_error = Some(error.to_string()),
+    }
+}
+
+fn payment_control_job_failure_message(report: &PaymentControlJobReport) -> Option<String> {
+    match &report.outcome {
+        PaymentControlJobOutcome::VipInvoice(
+            InvoiceControlJobOutcome::InvoiceLinkRequestError
+            | InvoiceControlJobOutcome::EmptyInvoiceLink
+            | InvoiceControlJobOutcome::SendError,
+        )
+        | PaymentControlJobOutcome::DonateInvoice(
+            InvoiceControlJobOutcome::InvoiceLinkRequestError
+            | InvoiceControlJobOutcome::EmptyInvoiceLink
+            | InvoiceControlJobOutcome::SendError,
+        ) => Some(
+            report
+                .error
+                .clone()
+                .unwrap_or_else(|| "payment invoice control job failed".to_owned()),
+        ),
+        PaymentControlJobOutcome::MissingSuccessfulPayment => Some(
+            report
+                .error
+                .clone()
+                .unwrap_or_else(|| "successful payment control job payment is required".to_owned()),
+        ),
+        PaymentControlJobOutcome::MissingSuccessfulPaymentUser => Some(
+            report
+                .error
+                .clone()
+                .unwrap_or_else(|| "successful payment control job user is required".to_owned()),
+        ),
+        PaymentControlJobOutcome::NotPaymentControlJob => {
+            Some("unsupported payment control job kind".to_owned())
+        }
+        _ => None,
+    }
+}
+
+fn trace_payment_control_job_tick(tick: &PaymentControlJobWorkerReport) {
+    if !tick.dequeued && tick.dequeue_error.is_none() {
+        return;
+    }
+
+    tracing::debug!(
+        dequeued = tick.dequeued,
+        job_id = tick.job_id,
+        completed = tick.completed,
+        failed = tick.failed,
+        outcome = ?tick.execution.as_ref().map(|report| &report.outcome),
+        dequeue_error = tick.dequeue_error.as_deref(),
+        decode_error = tick.decode_error.as_deref(),
+        status_error = tick.status_error.as_deref(),
+        "processed payment control job"
+    );
+}
+
 #[must_use]
 pub fn successful_payment_message_from_control_job(
     params: &ControlJobParams,
@@ -1742,17 +2018,18 @@ mod tests {
     };
     use openplotva_taskman::{
         CONTROL_QUEUE_NAME, ControlJobData, ControlJobParams, ControlKind, ControlPayment,
-        HIGH_PRIORITY, JobType, StatelessJobItem,
+        HIGH_PRIORITY, JobPayload, JobType, StatelessJobItem, new_control_job_at,
     };
     use serde_json::json;
     use time::OffsetDateTime;
 
     use super::{
         InvoiceButtonMessage, InvoiceControlJobOutcome, PaymentControlJobOutcome,
-        PaymentControlJobQueue, PaymentControlJobQueueFuture, PaymentEffectsFuture,
-        PaymentInvoiceCommandUpdateRoute, PaymentInvoiceControlJobBuild, PaymentInvoiceEffects,
-        PaymentInvoiceLinkFuture, PaymentStoreFuture, PaymentUpdateRoute, PreCheckoutOutcome,
-        PreCheckoutPaymentEffects, PreCheckoutUpdateRoute, SuccessfulPayment,
+        PaymentControlJobQueue, PaymentControlJobQueueFuture, PaymentControlJobReport,
+        PaymentControlJobWorkItem, PaymentControlJobWorkerFuture, PaymentControlJobWorkerQueue,
+        PaymentEffectsFuture, PaymentInvoiceCommandUpdateRoute, PaymentInvoiceControlJobBuild,
+        PaymentInvoiceEffects, PaymentInvoiceLinkFuture, PaymentStoreFuture, PaymentUpdateRoute,
+        PreCheckoutOutcome, PreCheckoutPaymentEffects, PreCheckoutUpdateRoute, SuccessfulPayment,
         SuccessfulPaymentControlJobUpdateRoute, SuccessfulPaymentEffects, SuccessfulPaymentMessage,
         SuccessfulPaymentOutcome, SuccessfulPaymentStore, SuccessfulPaymentUpdateRoute,
         enqueue_payment_invoice_command_update_or_else_at,
@@ -1760,10 +2037,10 @@ mod tests {
         execute_payment_control_job_at, execute_vip_invoice_control_job,
         handle_payment_update_or_else_at, handle_pre_checkout_update_or_else,
         handle_successful_payment_update_or_else_at, invoice_button_send_message_method,
-        payment_invoice_control_job_from_update_at, process_successful_payment_at,
-        subscription_invoice_message_text, subscription_success_text,
-        successful_payment_control_job_from_update_at, successful_payment_message_from_control_job,
-        successful_payment_message_from_update,
+        payment_invoice_control_job_from_update_at, process_payment_control_job_once_at,
+        process_successful_payment_at, subscription_invoice_message_text,
+        subscription_success_text, successful_payment_control_job_from_update_at,
+        successful_payment_message_from_control_job, successful_payment_message_from_update,
     };
 
     #[tokio::test]
@@ -2940,6 +3217,132 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn payment_control_job_worker_dequeues_executes_and_completes_invoice_job()
+    -> Result<(), Box<dyn Error>> {
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let queue = PaymentControlJobWorkerQueueStub::default().with_next_job(sample_work_item(
+            7,
+            sample_invoice_job(ControlKind::VipInvoice),
+            now,
+        ));
+        let store = StoreStub::new();
+        let effects = EffectsStub::default().with_next_invoice_url("https://t.me/invoice-vip");
+
+        let report = process_payment_control_job_once_at(&queue, &store, &effects, now).await;
+
+        assert!(report.dequeued);
+        assert_eq!(report.job_id, Some(7));
+        assert!(report.completed);
+        assert!(!report.failed);
+        assert_eq!(
+            report.execution.as_ref().map(|report| &report.outcome),
+            Some(&PaymentControlJobOutcome::VipInvoice(
+                InvoiceControlJobOutcome::InvoiceSent
+            ))
+        );
+        assert_eq!(queue.completed_ids(), vec![7]);
+        assert!(queue.failed().is_empty());
+        assert_eq!(
+            effects.subscription_invoice_requests(),
+            vec![openplotva_telegram::SubscriptionInvoiceLinkRequest {
+                user_id: 42,
+                user_name: "alice".to_owned(),
+                amount_stars: 300,
+            }]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn payment_control_job_worker_marks_invoice_executor_errors_failed()
+    -> Result<(), Box<dyn Error>> {
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let queue = PaymentControlJobWorkerQueueStub::default().with_next_job(sample_work_item(
+            7,
+            sample_invoice_job(ControlKind::DonateInvoice),
+            now,
+        ));
+        let store = StoreStub::new();
+        let effects = EffectsStub::default().with_next_invoice_url("   ");
+
+        let report = process_payment_control_job_once_at(&queue, &store, &effects, now).await;
+
+        assert!(report.failed);
+        assert!(!report.completed);
+        assert_eq!(
+            report.execution.as_ref().map(|report| &report.outcome),
+            Some(&PaymentControlJobOutcome::DonateInvoice(
+                InvoiceControlJobOutcome::EmptyInvoiceLink
+            ))
+        );
+        assert_eq!(
+            queue.failed(),
+            vec![(7, "failed to parse donation invoice link".to_owned())]
+        );
+        assert!(queue.completed_ids().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn payment_control_job_worker_fails_unsupported_control_kind()
+    -> Result<(), Box<dyn Error>> {
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let queue = PaymentControlJobWorkerQueueStub::default().with_next_job(sample_work_item(
+            7,
+            sample_invoice_job(ControlKind::Translate),
+            now,
+        ));
+        let store = StoreStub::new();
+        let effects = EffectsStub::default().with_next_invoice_url("https://t.me/unused");
+
+        let report = process_payment_control_job_once_at(&queue, &store, &effects, now).await;
+
+        assert!(report.failed);
+        assert!(!report.completed);
+        assert_eq!(
+            report.execution.as_ref().map(|report| &report.outcome),
+            Some(&PaymentControlJobOutcome::NotPaymentControlJob)
+        );
+        assert_eq!(
+            queue.failed(),
+            vec![(7, "unsupported payment control job kind".to_owned())]
+        );
+        assert!(effects.subscription_invoice_requests().is_empty());
+        assert!(effects.donation_invoice_requests().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn payment_control_job_worker_fails_malformed_control_payload_without_execution()
+    -> Result<(), Box<dyn Error>> {
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let mut item = sample_work_item(7, sample_invoice_job(ControlKind::VipInvoice), now);
+        item.job.data = JobPayload {
+            job_type: JobType::Control,
+            telegram_data: item.job.data.telegram_data.take(),
+            control_data: None,
+        };
+        let queue = PaymentControlJobWorkerQueueStub::default().with_next_job(item);
+        let store = StoreStub::new();
+        let effects = EffectsStub::default().with_next_invoice_url("https://t.me/unused");
+
+        let report = process_payment_control_job_once_at(&queue, &store, &effects, now).await;
+
+        assert!(report.failed);
+        assert!(report.execution.is_none());
+        assert_eq!(
+            report.decode_error.as_deref(),
+            Some("missing control data for control job")
+        );
+        assert_eq!(
+            queue.failed(),
+            vec![(7, "missing control data for control job".to_owned())]
+        );
+        assert!(effects.subscription_invoice_requests().is_empty());
+        Ok(())
+    }
+
     #[test]
     fn invoice_button_send_message_method_matches_go_direct_chattable_payload()
     -> Result<(), Box<dyn Error>> {
@@ -3032,6 +3435,17 @@ mod tests {
             provider_payment_charge_id: "provider-charge".to_owned(),
         });
         params
+    }
+
+    fn sample_work_item(
+        id: i64,
+        params: ControlJobParams,
+        created: OffsetDateTime,
+    ) -> PaymentControlJobWorkItem {
+        PaymentControlJobWorkItem {
+            id,
+            job: new_control_job_at(params, created),
+        }
     }
 
     fn expected_subscription_invoice_message_text() -> String {
@@ -3574,6 +3988,93 @@ mod tests {
                     Some(error) => Err(error),
                     None => Ok(()),
                 }
+            })
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct PaymentControlJobWorkerQueueStub {
+        state: Arc<Mutex<PaymentControlJobWorkerQueueState>>,
+    }
+
+    #[derive(Default)]
+    struct PaymentControlJobWorkerQueueState {
+        jobs: VecDeque<PaymentControlJobWorkItem>,
+        completed: Vec<(i64, PaymentControlJobReport)>,
+        failed: Vec<(i64, String)>,
+        dequeue_error: Option<StubError>,
+        status_error: Option<StubError>,
+    }
+
+    impl PaymentControlJobWorkerQueueStub {
+        fn with_next_job(self, job: PaymentControlJobWorkItem) -> Self {
+            self.lock().jobs.push_back(job);
+            self
+        }
+
+        fn completed_ids(&self) -> Vec<i64> {
+            self.lock()
+                .completed
+                .iter()
+                .map(|(id, _report)| *id)
+                .collect()
+        }
+
+        fn failed(&self) -> Vec<(i64, String)> {
+            self.lock().failed.clone()
+        }
+
+        fn lock(&self) -> MutexGuard<'_, PaymentControlJobWorkerQueueState> {
+            self.state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+    }
+
+    impl PaymentControlJobWorkerQueue for PaymentControlJobWorkerQueueStub {
+        type Error = StubError;
+
+        fn dequeue_payment_control_job<'a>(
+            &'a self,
+            _queue_name: &'static str,
+        ) -> PaymentControlJobWorkerFuture<'a, Option<PaymentControlJobWorkItem>, Self::Error>
+        {
+            Box::pin(async move {
+                let mut state = self.lock();
+                if let Some(error) = state.dequeue_error.take() {
+                    return Err(error);
+                }
+                Ok(state.jobs.pop_front())
+            })
+        }
+
+        fn complete_payment_control_job<'a>(
+            &'a self,
+            job_id: i64,
+            report: &'a PaymentControlJobReport,
+        ) -> PaymentControlJobWorkerFuture<'a, (), Self::Error> {
+            Box::pin(async move {
+                let mut state = self.lock();
+                if let Some(error) = state.status_error.take() {
+                    return Err(error);
+                }
+                state.completed.push((job_id, report.clone()));
+                Ok(())
+            })
+        }
+
+        fn fail_payment_control_job<'a>(
+            &'a self,
+            job_id: i64,
+            error: &'a str,
+        ) -> PaymentControlJobWorkerFuture<'a, (), Self::Error> {
+            Box::pin(async move {
+                let mut state = self.lock();
+                if let Some(status_error) = state.status_error.take() {
+                    return Err(status_error);
+                }
+                state.failed.push((job_id, error.to_owned()));
+                Ok(())
             })
         }
     }
