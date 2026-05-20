@@ -20,7 +20,9 @@ use openplotva_core::{
 };
 use redis::Client as RedisClient;
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use thiserror::Error;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 /// Human-readable crate purpose used by scaffold tests and docs.
 pub const PURPOSE: &str = "updates";
@@ -824,6 +826,101 @@ pub fn build_message_meta(
     meta
 }
 
+/// Go `dialog.MessageKindText` history kind.
+pub const HISTORY_MESSAGE_KIND_TEXT: &str = "text";
+
+/// Go `dialog.RoleUser` history role.
+pub const HISTORY_ROLE_USER: &str = "user";
+
+/// Go `dialog.RoleModel` history role.
+pub const HISTORY_ROLE_MODEL: &str = "model";
+
+/// Storage-ready Go text history entry extracted from a Telegram message.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HistoryTextEntry {
+    /// Go `MessageEntry.EntryID`, currently `msg:<message_id>` for text entries.
+    pub entry_id: String,
+    /// Go history kind.
+    pub kind: String,
+    /// Go dialog role.
+    pub role: String,
+    /// Telegram chat ID.
+    pub chat_id: i64,
+    /// Telegram forum/private thread ID, or zero when absent.
+    pub thread_id: i32,
+    /// Telegram message ID.
+    pub message_id: i32,
+    /// Resolved sender ID used by Go history indexes.
+    pub sender_id: i64,
+    /// UTC occurrence timestamp.
+    pub occurred_at: OffsetDateTime,
+    /// Go-shaped `history.MessageEntry` JSON payload.
+    pub payload: Vec<u8>,
+}
+
+/// Build the Go `history.messageEntryFromTelegramMessage` text-entry payload.
+#[must_use]
+pub fn build_history_text_entry(
+    message: &TelegramMessage,
+    original_text: &str,
+    meta: ChatMessageMeta,
+    bot_id: i64,
+) -> Option<HistoryTextEntry> {
+    if message.chat.get_id() == 0 {
+        return None;
+    }
+
+    let sender = resolve_message_sender(Some(message));
+    if sender.id == 0 {
+        return None;
+    }
+
+    let text = text_from_telegram_message(message);
+    let (text, original_text, meta) = normalize_history_text_payload(&text, original_text, meta);
+    if !history_text_entry_has_content(&text, &original_text, &meta) {
+        return None;
+    }
+
+    let meta = fill_history_sender_meta(meta, &sender);
+    let occurred_at = OffsetDateTime::from_unix_timestamp(message.date).ok()?;
+    let timestamp = occurred_at.format(&Rfc3339).ok()?;
+    let entry_id = format!("msg:{}", message.id);
+    let role = if bot_id != 0 && sender.id == bot_id {
+        HISTORY_ROLE_MODEL
+    } else {
+        HISTORY_ROLE_USER
+    };
+
+    let mut payload = Map::new();
+    payload.insert("entry_id".to_owned(), Value::String(entry_id.clone()));
+    payload.insert("role".to_owned(), Value::String(role.to_owned()));
+    payload.insert(
+        "kind".to_owned(),
+        Value::String(HISTORY_MESSAGE_KIND_TEXT.to_owned()),
+    );
+    payload.insert("timestamp".to_owned(), Value::String(timestamp));
+    merge_json_object(&mut payload, history_message_payload(message, &text)?);
+    if !original_text.is_empty() {
+        payload.insert("original_text".to_owned(), Value::String(original_text));
+    }
+    payload.insert("meta".to_owned(), serde_json::to_value(&meta).ok()?);
+
+    Some(HistoryTextEntry {
+        entry_id,
+        kind: HISTORY_MESSAGE_KIND_TEXT.to_owned(),
+        role: role.to_owned(),
+        chat_id: message.chat.get_id().into(),
+        thread_id: message
+            .message_thread_id
+            .and_then(|value| i32::try_from(value).ok())
+            .unwrap_or_default(),
+        message_id: i32::try_from(message.id).ok()?,
+        sender_id: history_entry_sender_id(&meta, message),
+        occurred_at,
+        payload: serde_json::to_vec(&Value::Object(payload)).ok()?,
+    })
+}
+
 /// Apply Go fetcher MIME-derived attachment-kind normalization.
 #[must_use]
 pub fn normalize_attachment_kind(mut attachment: ChatAttachment) -> ChatAttachment {
@@ -1218,6 +1315,138 @@ fn has_mime_prefix(mime_type: &str, prefix: &str) -> bool {
         .is_some_and(|value| value.eq_ignore_ascii_case(prefix))
 }
 
+fn text_from_telegram_message(message: &TelegramMessage) -> String {
+    message
+        .get_text()
+        .map(|text| text.as_ref().trim().to_owned())
+        .unwrap_or_default()
+}
+
+fn normalize_history_text_payload(
+    text: &str,
+    original_text: &str,
+    mut meta: ChatMessageMeta,
+) -> (String, String, ChatMessageMeta) {
+    let trimmed_text = text.trim().to_owned();
+    let mut trimmed_original = original_text.trim().to_owned();
+    if trimmed_original == trimmed_text {
+        trimmed_original.clear();
+    }
+
+    if !trimmed_text.is_empty() {
+        for attachment in &mut meta.attachments {
+            if attachment.source.trim() != "message" {
+                continue;
+            }
+            if !attachment.caption.trim().is_empty() {
+                attachment.caption.clear();
+            }
+            if attachment.content.trim() == trimmed_text {
+                attachment.content.clear();
+            }
+        }
+    }
+
+    (trimmed_text, trimmed_original, meta)
+}
+
+fn history_text_entry_has_content(text: &str, original_text: &str, meta: &ChatMessageMeta) -> bool {
+    !text.is_empty()
+        || !original_text.is_empty()
+        || !meta.message_type.trim().is_empty()
+        || !meta.annotation.trim().is_empty()
+        || !meta.vision_description.trim().is_empty()
+        || !meta.attachments.is_empty()
+}
+
+fn fill_history_sender_meta(mut meta: ChatMessageMeta, sender: &MessageSender) -> ChatMessageMeta {
+    if meta.sender_id == 0 {
+        meta.sender_id = sender.id;
+    }
+    if meta.sender_type.is_empty() {
+        meta.sender_type = sender.sender_type.clone();
+    }
+    if meta.sender_name.trim().is_empty() {
+        meta.sender_name = sender.display_name();
+    }
+    if meta.sender_username.trim().is_empty() {
+        meta.sender_username = sender.username.trim().to_owned();
+    }
+    meta
+}
+
+fn history_message_payload(message: &TelegramMessage, text: &str) -> Option<Value> {
+    let mut payload = Map::new();
+    payload.insert(
+        "message_id".to_owned(),
+        serde_json::to_value(message.id).ok()?,
+    );
+    payload.insert("chat".to_owned(), serde_json::to_value(&message.chat).ok()?);
+    payload.insert("date".to_owned(), serde_json::to_value(message.date).ok()?);
+    if !text.is_empty() {
+        payload.insert("text".to_owned(), Value::String(text.to_owned()));
+    }
+
+    merge_json_object(&mut payload, serde_json::to_value(&message.sender).ok()?);
+
+    if let Some(thread_id) = message.message_thread_id {
+        payload.insert(
+            "message_thread_id".to_owned(),
+            serde_json::to_value(thread_id).ok()?,
+        );
+    }
+    if let Some(origin) = message.forward_origin.as_ref() {
+        payload.insert(
+            "forward_origin".to_owned(),
+            serde_json::to_value(origin).ok()?,
+        );
+    }
+    if message.is_automatic_forward {
+        payload.insert("is_automatic_forward".to_owned(), Value::Bool(true));
+    }
+    if let Some(via_bot) = message.via_bot.as_ref() {
+        payload.insert("via_bot".to_owned(), serde_json::to_value(via_bot).ok()?);
+    }
+    if let Some(reply) = reply_message_stub_value(message) {
+        payload.insert("reply_to_message".to_owned(), reply);
+    }
+
+    Some(Value::Object(payload))
+}
+
+fn reply_message_stub_value(message: &TelegramMessage) -> Option<Value> {
+    let reply = message.reply_to.as_ref()?;
+    let carapax::types::ReplyTo::Message(reply) = reply else {
+        return None;
+    };
+
+    let mut stub = Map::new();
+    stub.insert(
+        "message_id".to_owned(),
+        serde_json::to_value(reply.id).ok()?,
+    );
+    merge_json_object(&mut stub, serde_json::to_value(&reply.sender).ok()?);
+    Some(Value::Object(stub))
+}
+
+fn history_entry_sender_id(meta: &ChatMessageMeta, message: &TelegramMessage) -> i64 {
+    if meta.sender_id != 0 {
+        return meta.sender_id;
+    }
+
+    match &message.sender {
+        carapax::types::MessageSender::Chat(chat) => chat.get_id().into(),
+        carapax::types::MessageSender::User(user) => user.id.into(),
+        carapax::types::MessageSender::Unknown => 0,
+    }
+}
+
+fn merge_json_object(target: &mut Map<String, Value>, source: Value) {
+    if let Value::Object(source) = source {
+        target.extend(source);
+    }
+}
+
 async fn run_stage<Fut, E>(stage: UpdateStage, timeout: Duration, task: Fut) -> UpdateStageReport
 where
     Fut: Future<Output = Result<(), E>>,
@@ -1331,7 +1560,8 @@ mod tests {
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
-    use serde_json::json;
+    use openplotva_core::{ChatMessageMeta, SENDER_TYPE_USER};
+    use serde_json::{Value, json};
 
     use super::{
         DEFAULT_UPDATE_QUEUE_KEY, EncodedUpdate, GO_ALLOWED_UPDATE_NAMES, GO_ALLOWED_UPDATES,
@@ -2511,6 +2741,86 @@ mod tests {
         assert_eq!(got.attachments[1].source, "message");
         assert_eq!(got.attachments[1].file_unique_id, "photo-1");
         assert_eq!(got.attachments[1].caption, "photo caption");
+
+        Ok(())
+    }
+
+    #[test]
+    fn build_history_text_entry_preserves_go_message_entry_payload() -> Result<(), Box<dyn Error>> {
+        let update = sample_update_json(json!({
+            "update_id": 1,
+            "message": {
+                "message_id": 10,
+                "date": 1_710_000_000,
+                "message_thread_id": 77,
+                "chat": {
+                    "id": -100,
+                    "type": "supergroup",
+                    "title": "Team",
+                    "is_forum": true
+                },
+                "from": {
+                    "id": 42,
+                    "is_bot": false,
+                    "first_name": "Alice"
+                },
+                "text": " forwarded text ",
+                "forward_origin": {
+                    "type": "channel",
+                    "date": 1_709_999_900,
+                    "message_id": 99,
+                    "chat": {
+                        "id": -200,
+                        "type": "channel",
+                        "title": "News"
+                    }
+                },
+                "is_automatic_forward": true,
+                "via_bot": {
+                    "id": 77,
+                    "is_bot": true,
+                    "first_name": "Inline",
+                    "username": "inline_bot"
+                }
+            }
+        }))?;
+        let message = update_message(&update)?;
+
+        let entry = super::build_history_text_entry(
+            message,
+            " forwarded text ",
+            ChatMessageMeta::default(),
+            0,
+        )
+        .ok_or_else(|| io::Error::other("expected a history entry"))?;
+
+        assert_eq!(entry.entry_id, "msg:10");
+        assert_eq!(entry.kind, "text");
+        assert_eq!(entry.role, "user");
+        assert_eq!(entry.chat_id, -100);
+        assert_eq!(entry.thread_id, 77);
+        assert_eq!(entry.message_id, 10);
+        assert_eq!(entry.sender_id, 42);
+        assert_eq!(entry.occurred_at.unix_timestamp(), 1_710_000_000);
+
+        let payload: Value = serde_json::from_slice(&entry.payload)?;
+        assert_eq!(payload["entry_id"], "msg:10");
+        assert_eq!(payload["role"], "user");
+        assert_eq!(payload["kind"], "text");
+        assert_eq!(payload["timestamp"], "2024-03-09T16:00:00Z");
+        assert_eq!(payload["message_id"], 10);
+        assert_eq!(payload["message_thread_id"], 77);
+        assert_eq!(payload["chat"]["id"], -100);
+        assert_eq!(payload["from"]["id"], 42);
+        assert_eq!(payload["text"], "forwarded text");
+        assert!(payload.get("original_text").is_none());
+        assert_eq!(payload["meta"]["sender_id"], 42);
+        assert_eq!(payload["meta"]["sender_type"], SENDER_TYPE_USER);
+        assert_eq!(payload["meta"]["sender_name"], "Alice");
+        assert_eq!(payload["forward_origin"]["type"], "channel");
+        assert_eq!(payload["forward_origin"]["message_id"], 99);
+        assert_eq!(payload["is_automatic_forward"], true);
+        assert_eq!(payload["via_bot"]["username"], "inline_bot");
 
         Ok(())
     }
