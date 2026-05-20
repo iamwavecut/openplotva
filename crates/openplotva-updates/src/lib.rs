@@ -83,6 +83,9 @@ pub const UPDATE_STALL_AGE: Duration = Duration::from_secs(120);
 /// Go update consumer worker limit multiplier over available CPUs.
 pub const UPDATE_WORKER_LIMIT_PER_CPU: usize = 4;
 
+/// Go guest inline chain max message count.
+pub const GUEST_CHAIN_MAX_MESSAGES: usize = 15;
+
 /// Go update classifier names used by the fetcher before enqueueing updates.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GoUpdateType {
@@ -1631,6 +1634,33 @@ impl GuestMessageRejectReason {
     }
 }
 
+/// Go guest-chain message role.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GuestChainRole {
+    User,
+    Assistant,
+}
+
+impl GuestChainRole {
+    /// Return Go's string form for this guest-chain role.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Assistant => "assistant",
+        }
+    }
+}
+
+/// One message in Go's in-memory guest inline chain cache.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GuestChainMessage {
+    pub role: GuestChainRole,
+    pub name: String,
+    pub text: String,
+    pub at: Option<OffsetDateTime>,
+}
+
 /// Return Go `guestVisibleText` for a Telegram message.
 #[must_use]
 pub fn guest_visible_text(message: Option<&TelegramMessage>) -> String {
@@ -1831,6 +1861,83 @@ pub fn normalize_guest_command_word(word: &str, bot_username: &str) -> String {
     word.to_owned()
 }
 
+/// Return Go `formatGuestChainForPrompt`.
+#[must_use]
+pub fn format_guest_chain_for_prompt(messages: &[GuestChainMessage]) -> String {
+    let messages = trim_guest_chain_messages(messages, GUEST_CHAIN_MAX_MESSAGES);
+    if messages.is_empty() {
+        return String::new();
+    }
+
+    messages
+        .iter()
+        .map(|message| format!("{}: {}", message.name, message.text))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Return Go `buildGuestDialogText`.
+#[must_use]
+pub fn build_guest_dialog_text(
+    message: Option<&TelegramMessage>,
+    bot_username: &str,
+    chain: &[GuestChainMessage],
+) -> String {
+    let current = guest_current_request_text(message, bot_username);
+    let reply = message
+        .and_then(reply_message)
+        .map_or_else(String::new, |reply| guest_visible_text(Some(reply)));
+    let current = current.trim();
+    let reply = reply.trim();
+
+    let text = match (current.is_empty(), reply.is_empty()) {
+        (false, false) => format!(
+            "Гостевой запрос пользователя:\n{current}\n\nКонтекст сообщения, на которое ответили:\n{reply}"
+        ),
+        (false, true) => current.to_owned(),
+        (true, false) => {
+            format!("Ответь на сообщение, на которое ссылается гостевой вызов:\n{reply}")
+        }
+        (true, true) => String::new(),
+    };
+
+    let chain_text = format_guest_chain_for_prompt(chain);
+    if chain_text.is_empty() {
+        return text;
+    }
+    if text.is_empty() {
+        return format!("Гостевая цепочка за последние сутки:\n{chain_text}");
+    }
+    format!("Гостевая цепочка за последние сутки:\n{chain_text}\n\n{text}")
+}
+
+/// Return Go `buildGuestShieldQueryText`.
+#[must_use]
+pub fn build_guest_shield_query_text(
+    message: Option<&TelegramMessage>,
+    max_chars: usize,
+    chain: &[GuestChainMessage],
+) -> String {
+    let mut parts = Vec::new();
+    append_shield_query_part(
+        &mut parts,
+        "current",
+        &guest_current_request_text(message, ""),
+    );
+    append_shield_query_part(&mut parts, "chain", &format_guest_chain_for_prompt(chain));
+    let reply = message
+        .and_then(reply_message)
+        .map_or_else(String::new, |reply| guest_visible_text(Some(reply)));
+    append_shield_query_part(&mut parts, "reply", &reply);
+
+    let query = parts.join("\n").trim().to_owned();
+    if max_chars == 0 {
+        return query;
+    }
+
+    query.chars().take(max_chars).collect()
+}
+
 fn message_text_before_fetcher_fallback(message: &TelegramMessage) -> String {
     match &message.data {
         TelegramMessageData::Text(text) => text.as_ref().to_owned(),
@@ -1939,6 +2046,61 @@ fn guest_bot_caller_user_is_bot(message: &TelegramMessage) -> bool {
                 .and_then(Value::as_bool)
         })
         .unwrap_or(false)
+}
+
+fn trim_guest_chain_messages(
+    messages: &[GuestChainMessage],
+    max_messages: usize,
+) -> Vec<GuestChainMessage> {
+    let max_messages = if max_messages == 0 {
+        GUEST_CHAIN_MAX_MESSAGES
+    } else {
+        max_messages
+    };
+    let mut out = Vec::with_capacity(messages.len().min(max_messages));
+    for message in messages {
+        if let Some(normalized) = normalize_guest_chain_message(message) {
+            out.push(normalized);
+        }
+    }
+    if out.len() <= max_messages {
+        return out;
+    }
+
+    out[out.len() - max_messages..].to_vec()
+}
+
+fn normalize_guest_chain_message(message: &GuestChainMessage) -> Option<GuestChainMessage> {
+    let text = message.text.trim();
+    if text.is_empty() {
+        return None;
+    }
+
+    let name = message.name.trim();
+    Some(GuestChainMessage {
+        role: message.role,
+        name: if name.is_empty() {
+            guest_chain_default_name(message.role).to_owned()
+        } else {
+            name.to_owned()
+        },
+        text: text.to_owned(),
+        at: message.at,
+    })
+}
+
+fn guest_chain_default_name(role: GuestChainRole) -> &'static str {
+    match role {
+        GuestChainRole::Assistant => "Plotva",
+        GuestChainRole::User => "Telegram",
+    }
+}
+
+fn append_shield_query_part(parts: &mut Vec<String>, label: &str, text: &str) {
+    let text = text.trim();
+    if !text.is_empty() {
+        parts.push(format!("{label}: {text}"));
+    }
 }
 
 fn is_edit_verb(word: &str) -> bool {
@@ -2490,10 +2652,12 @@ mod tests {
 
     use super::{
         DEFAULT_UPDATE_QUEUE_KEY, EncodedUpdate, GO_ALLOWED_UPDATE_NAMES, GO_ALLOWED_UPDATES,
-        GoUpdateType, RedisUpdateQueue, TelegramMessageAttachmentOptions, UpdateCodecError,
-        UpdateConsumerConfig, UpdateProducerQueue, UpdateProducerQueueFuture, UpdateProducerSource,
-        UpdateProducerSourceFuture, UpdateStageOutcome, blpop_timeout_arg, compose_image_prompt,
-        edited_image_prompt_update, extract_update_state, fetcher_message_text,
+        GoUpdateType, GuestChainMessage, GuestChainRole, RedisUpdateQueue,
+        TelegramMessageAttachmentOptions, UpdateCodecError, UpdateConsumerConfig,
+        UpdateProducerQueue, UpdateProducerQueueFuture, UpdateProducerSource,
+        UpdateProducerSourceFuture, UpdateStageOutcome, blpop_timeout_arg, build_guest_dialog_text,
+        build_guest_shield_query_text, compose_image_prompt, edited_image_prompt_update,
+        extract_update_state, fetcher_message_text, format_guest_chain_for_prompt,
         guest_current_request_text, guest_has_other_bot_mention, guest_message_reject_reason,
         guest_request_has_visible_text, guest_visible_text, is_allowed_producer_update,
         is_guest_unsupported_feature_request, is_settings_command_message,
@@ -3351,6 +3515,159 @@ mod tests {
             "перескажи",
             "личные новости"
         ));
+    }
+
+    #[test]
+    fn guest_chain_prompt_formatting_matches_go_normalization_and_limit() {
+        let mut chain = vec![
+            GuestChainMessage {
+                role: GuestChainRole::User,
+                name: "  ".to_owned(),
+                text: "  first  ".to_owned(),
+                at: None,
+            },
+            GuestChainMessage {
+                role: GuestChainRole::Assistant,
+                name: "".to_owned(),
+                text: " second ".to_owned(),
+                at: None,
+            },
+            GuestChainMessage {
+                role: GuestChainRole::User,
+                name: "Ignored".to_owned(),
+                text: "   ".to_owned(),
+                at: None,
+            },
+        ];
+        for idx in 0..16 {
+            chain.push(GuestChainMessage {
+                role: GuestChainRole::User,
+                name: format!("User{idx}"),
+                text: format!("message {idx}"),
+                at: None,
+            });
+        }
+
+        let formatted = format_guest_chain_for_prompt(&chain);
+        assert!(!formatted.contains("first"));
+        assert!(!formatted.contains("second"));
+        assert!(!formatted.contains("Ignored"));
+        assert!(formatted.starts_with("User1: message 1"));
+        assert!(formatted.ends_with("User15: message 15"));
+        assert_eq!(formatted.lines().count(), 15);
+
+        assert_eq!(
+            format_guest_chain_for_prompt(&[
+                GuestChainMessage {
+                    role: GuestChainRole::User,
+                    name: " ".to_owned(),
+                    text: " hi ".to_owned(),
+                    at: None,
+                },
+                GuestChainMessage {
+                    role: GuestChainRole::Assistant,
+                    name: " ".to_owned(),
+                    text: " hello ".to_owned(),
+                    at: None,
+                },
+            ]),
+            "Telegram: hi\nPlotva: hello"
+        );
+    }
+
+    #[test]
+    fn guest_dialog_text_matches_go_current_reply_and_chain_shapes() -> Result<(), Box<dyn Error>> {
+        let chain = vec![
+            GuestChainMessage {
+                role: GuestChainRole::User,
+                name: "Alice".to_owned(),
+                text: "старый вопрос".to_owned(),
+                at: None,
+            },
+            GuestChainMessage {
+                role: GuestChainRole::Assistant,
+                name: "Plotva".to_owned(),
+                text: "старый ответ".to_owned(),
+                at: None,
+            },
+        ];
+        let current_and_reply = sample_guest_message_from_value(json!({
+            "message_id": 530,
+            "date": 1_710_000_000,
+            "chat": sample_private_chat_json(),
+            "from": sample_user_json(),
+            "guest_query_id": "guest-query",
+            "text": " @PlotvaBot текущий вопрос ",
+            "reply_to_message": sample_message_json(420, 1_709_999_900, "  исходный контекст  ")
+        }))?;
+
+        assert_eq!(
+            build_guest_dialog_text(Some(&current_and_reply), "PlotvaBot", &[]),
+            "Гостевой запрос пользователя:\nтекущий вопрос\n\nКонтекст сообщения, на которое ответили:\nисходный контекст"
+        );
+        assert_eq!(
+            build_guest_dialog_text(Some(&current_and_reply), "PlotvaBot", &chain),
+            "Гостевая цепочка за последние сутки:\nAlice: старый вопрос\nPlotva: старый ответ\n\nГостевой запрос пользователя:\nтекущий вопрос\n\nКонтекст сообщения, на которое ответили:\nисходный контекст"
+        );
+
+        let reply_only = sample_guest_message_from_value(json!({
+            "message_id": 531,
+            "date": 1_710_000_000,
+            "chat": sample_private_chat_json(),
+            "from": sample_user_json(),
+            "guest_query_id": "guest-query",
+            "text": " @PlotvaBot ",
+            "reply_to_message": sample_message_json(421, 1_709_999_900, "  ответь на это  ")
+        }))?;
+        assert_eq!(
+            build_guest_dialog_text(Some(&reply_only), "PlotvaBot", &[]),
+            "Ответь на сообщение, на которое ссылается гостевой вызов:\nответь на это"
+        );
+
+        let empty =
+            sample_guest_message_from_value(sample_guest_message_json(532, " @PlotvaBot "))?;
+        assert_eq!(
+            build_guest_dialog_text(Some(&empty), "PlotvaBot", &chain),
+            "Гостевая цепочка за последние сутки:\nAlice: старый вопрос\nPlotva: старый ответ"
+        );
+        assert_eq!(build_guest_dialog_text(None, "PlotvaBot", &[]), "");
+
+        Ok(())
+    }
+
+    #[test]
+    fn guest_shield_query_text_matches_go_parts_and_rune_truncation() -> Result<(), Box<dyn Error>>
+    {
+        let message = sample_guest_message_from_value(json!({
+            "message_id": 533,
+            "date": 1_710_000_000,
+            "chat": sample_private_chat_json(),
+            "from": sample_user_json(),
+            "guest_query_id": "guest-query",
+            "text": " @PlotvaBot текущий риск ",
+            "reply_to_message": sample_message_json(422, 1_709_999_900, "  ответный риск  ")
+        }))?;
+        let chain = vec![GuestChainMessage {
+            role: GuestChainRole::User,
+            name: "Alice".to_owned(),
+            text: "предыдущий риск".to_owned(),
+            at: None,
+        }];
+
+        assert_eq!(
+            build_guest_shield_query_text(Some(&message), 0, &chain),
+            "current: @PlotvaBot текущий риск\nchain: Alice: предыдущий риск\nreply: ответный риск"
+        );
+        assert_eq!(
+            build_guest_shield_query_text(Some(&message), 18, &chain),
+            "current: @PlotvaBo"
+        );
+        assert_eq!(
+            build_guest_shield_query_text(None, 0, &chain),
+            "chain: Alice: предыдущий риск"
+        );
+
+        Ok(())
     }
 
     #[test]
