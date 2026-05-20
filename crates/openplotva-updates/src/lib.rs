@@ -982,6 +982,58 @@ pub fn draw_prompt_with_reply_context(text: &str, message: Option<&TelegramMessa
     .to_owned()
 }
 
+/// Result of Go `editedImagePromptUpdate` for pending image job updates.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EditedImagePromptUpdate {
+    /// Prompt with message metadata context composed for image generation.
+    pub prompt: String,
+    /// Trimmed prompt before metadata context is appended.
+    pub original_prompt: String,
+}
+
+/// Compose Go `editedImagePromptUpdate` semantics for edited draw messages.
+#[must_use]
+pub fn edited_image_prompt_update(
+    message: &TelegramMessage,
+    first_word: &str,
+    rest_text: &str,
+    meta: &ChatMessageMeta,
+) -> Option<EditedImagePromptUpdate> {
+    let first_word_lower = first_word.to_lowercase();
+    let base_prompt = resolve_draw_prompt_from_message(message, &first_word_lower, rest_text)?;
+    let original_prompt = base_prompt.trim().to_owned();
+    let mut prompt = compose_image_prompt(&original_prompt, meta);
+    if prompt.is_empty() {
+        prompt.clone_from(&original_prompt);
+    }
+
+    Some(EditedImagePromptUpdate {
+        prompt,
+        original_prompt,
+    })
+}
+
+/// Compose Go image prompt context from prompt, vision description, and attachments.
+#[must_use]
+pub fn compose_image_prompt(prompt: &str, meta: &ChatMessageMeta) -> String {
+    let mut parts = Vec::with_capacity(1 + meta.attachments.len());
+    let mut seen = HashSet::new();
+
+    add_image_prompt_part(&mut parts, &mut seen, prompt);
+    add_image_prompt_part(&mut parts, &mut seen, &meta.vision_description);
+    for attachment in &meta.attachments {
+        if !attachment.content.is_empty() {
+            add_image_prompt_part(&mut parts, &mut seen, &attachment.content);
+            continue;
+        }
+        if !attachment.caption.is_empty() {
+            add_image_prompt_part(&mut parts, &mut seen, &attachment.caption);
+        }
+    }
+
+    parts.join("\n\n")
+}
+
 /// Go `dialog.MessageKindText` history kind.
 pub const HISTORY_MESSAGE_KIND_TEXT: &str = "text";
 
@@ -1548,6 +1600,14 @@ fn first_draw_reply_prefix(text: &str) -> Option<&'static str> {
     })
 }
 
+fn add_image_prompt_part(parts: &mut Vec<String>, seen: &mut HashSet<String>, value: &str) {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || !seen.insert(trimmed.to_owned()) {
+        return;
+    }
+    parts.push(trimmed.to_owned());
+}
+
 const DRAW_VERB_ALIASES: &[&str] = &["нарисуй", "draw", "рисуй"];
 
 const DRAW_REPLY_PREFIXES: &[&str] = &["это", "this", "that", "these", "those"];
@@ -1996,18 +2056,19 @@ mod tests {
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
-    use openplotva_core::{ChatMessageMeta, SENDER_TYPE_USER};
+    use openplotva_core::{ChatAttachment, ChatMessageMeta, SENDER_TYPE_USER};
     use serde_json::{Value, json};
 
     use super::{
         DEFAULT_UPDATE_QUEUE_KEY, EncodedUpdate, GO_ALLOWED_UPDATE_NAMES, GO_ALLOWED_UPDATES,
         GoUpdateType, RedisUpdateQueue, TelegramMessageAttachmentOptions, UpdateCodecError,
         UpdateConsumerConfig, UpdateProducerQueue, UpdateProducerQueueFuture, UpdateProducerSource,
-        UpdateProducerSourceFuture, UpdateStageOutcome, blpop_timeout_arg, extract_update_state,
-        fetcher_message_text, is_allowed_producer_update, is_settings_command_message,
-        parse_edit_command, parse_if_addressed, process_update_at, producer_update_name,
-        producer_update_type, resolve_draw_prompt_from_message, run_update_producer_until,
-        telegram_message_attachments, update_name,
+        UpdateProducerSourceFuture, UpdateStageOutcome, blpop_timeout_arg, compose_image_prompt,
+        edited_image_prompt_update, extract_update_state, fetcher_message_text,
+        is_allowed_producer_update, is_settings_command_message, parse_edit_command,
+        parse_if_addressed, process_update_at, producer_update_name, producer_update_type,
+        resolve_draw_prompt_from_message, run_update_producer_until, telegram_message_attachments,
+        update_name,
     };
     use carapax::types::{
         Message as TelegramMessage, Update as TelegramUpdate, UpdateType as TelegramUpdateType,
@@ -3580,6 +3641,65 @@ mod tests {
         assert_eq!(
             resolve_draw_prompt_from_message(&text_reply, "song", "cat"),
             None
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn compose_image_prompt_matches_go_context_dedupe() {
+        let meta = ChatMessageMeta {
+            vision_description: " рыжий ".to_owned(),
+            attachments: vec![
+                ChatAttachment {
+                    content: " рыжий ".to_owned(),
+                    caption: "ignored caption".to_owned(),
+                    ..ChatAttachment::default()
+                },
+                ChatAttachment {
+                    caption: " на столе ".to_owned(),
+                    ..ChatAttachment::default()
+                },
+                ChatAttachment {
+                    content: "кота".to_owned(),
+                    ..ChatAttachment::default()
+                },
+            ],
+            ..ChatMessageMeta::default()
+        };
+
+        assert_eq!(
+            compose_image_prompt(" кота ", &meta),
+            "кота\n\nрыжий\n\nна столе"
+        );
+    }
+
+    #[test]
+    fn edited_image_prompt_update_matches_go_pending_image_prompt() -> Result<(), Box<dyn Error>> {
+        let message = sample_message_from_value(json!({
+            "message_id": 13,
+            "date": 1_710_000_000,
+            "chat": sample_private_chat_json(),
+            "from": sample_user_json(),
+            "text": "нарисуй кота"
+        }))?;
+
+        let update = edited_image_prompt_update(
+            &message,
+            "нарисуй",
+            "кота",
+            &ChatMessageMeta {
+                vision_description: "рыжий".to_owned(),
+                ..ChatMessageMeta::default()
+            },
+        )
+        .expect("draw command should produce image prompt update");
+
+        assert_eq!(update.original_prompt, "кота");
+        assert_eq!(update.prompt, "кота\n\nрыжий");
+        assert!(
+            edited_image_prompt_update(&message, "song", "кота", &ChatMessageMeta::default())
+                .is_none()
         );
 
         Ok(())
