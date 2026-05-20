@@ -925,6 +925,18 @@ pub fn is_settings_command_message(message: &TelegramMessage, bot_username: &str
         .is_none_or(|target| target.eq_ignore_ascii_case(bot_username))
 }
 
+/// Parse Go `parseEditCommand` semantics for image-edit intent text.
+#[must_use]
+pub fn parse_edit_command(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let (first_word, rest_text) = cut_first_word(trimmed);
+    is_edit_verb(&first_word).then(|| rest_text.trim().to_owned())
+}
+
 /// Go `dialog.MessageKindText` history kind.
 pub const HISTORY_MESSAGE_KIND_TEXT: &str = "text";
 
@@ -1474,6 +1486,56 @@ fn word_separator(ch: char) -> bool {
     matches!(ch, ' ' | ',' | '.' | '!' | '?' | ':' | '\r' | '\n' | '\t')
 }
 
+fn is_edit_verb(word: &str) -> bool {
+    let trimmed = word.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let lower = trimmed.to_lowercase();
+    EDIT_VERB_ALIASES.contains(&lower.as_str())
+}
+
+const EDIT_VERB_ALIASES: &[&str] = &[
+    "изменить",
+    "измени",
+    "измените",
+    "отредактируй",
+    "отредактируйте",
+    "редактируй",
+    "редактируйте",
+    "поправь",
+    "поправьте",
+    "исправь",
+    "исправьте",
+    "переделай",
+    "переделайте",
+    "перерисуй",
+    "перерисуйте",
+    "замени",
+    "замените",
+    "убери",
+    "уберите",
+    "добавь",
+    "добавьте",
+    "убавь",
+    "убавьте",
+    "усиль",
+    "усильте",
+    "edit",
+    "modify",
+    "change",
+    "alter",
+    "retouch",
+    "fix",
+    "replace",
+    "remove",
+    "delete",
+    "add",
+    "adjust",
+    "tweak",
+];
+
 fn telegram_chat_is_private(chat: &TelegramChat) -> bool {
     matches!(chat, TelegramChat::Private(_))
 }
@@ -1887,8 +1949,8 @@ mod tests {
         UpdateConsumerConfig, UpdateProducerQueue, UpdateProducerQueueFuture, UpdateProducerSource,
         UpdateProducerSourceFuture, UpdateStageOutcome, blpop_timeout_arg, extract_update_state,
         fetcher_message_text, is_allowed_producer_update, is_settings_command_message,
-        parse_if_addressed, process_update_at, producer_update_name, producer_update_type,
-        run_update_producer_until, telegram_message_attachments, update_name,
+        parse_edit_command, parse_if_addressed, process_update_at, producer_update_name,
+        producer_update_type, run_update_producer_until, telegram_message_attachments, update_name,
     };
     use carapax::types::{
         Message as TelegramMessage, Update as TelegramUpdate, UpdateType as TelegramUpdateType,
@@ -3385,6 +3447,20 @@ mod tests {
         assert!(is_settings_command_message(&group_settings, ""));
         assert!(!is_settings_command_message(&embedded_command, "plotvabot"));
         Ok(())
+    }
+
+    #[test]
+    fn parse_edit_command_matches_go_edit_verb_semantics() {
+        assert_eq!(parse_edit_command("измени фон"), Some("фон".to_owned()));
+        assert_eq!(parse_edit_command("поправь: цвет"), Some("цвет".to_owned()));
+        assert_eq!(
+            parse_edit_command("  FIX   contrast  "),
+            Some("contrast".to_owned())
+        );
+        assert_eq!(parse_edit_command("ИЗМЕНИ"), Some(String::new()));
+
+        assert_eq!(parse_edit_command("нарисуй кота"), None);
+        assert_eq!(parse_edit_command("  "), None);
     }
 
     #[tokio::test]
