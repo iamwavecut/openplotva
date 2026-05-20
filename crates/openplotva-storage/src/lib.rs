@@ -167,6 +167,12 @@ pub const SQL_CLEANUP_EXPIRED_VIP_CACHE: &str =
 /// Go Redis key prefix for persisted rate-limited chat expiry timestamps.
 pub const RATE_LIMITED_CHAT_KEY_PREFIX: &str = "plotva:rate_limited_chat:";
 
+/// Go Redis key prefix for cached chat administrator IDs.
+pub const CHAT_ADMINS_KEY_PREFIX: &str = "chat:";
+
+/// Go Redis key suffix for cached chat administrator IDs.
+pub const CHAT_ADMINS_KEY_SUFFIX: &str = ":admins";
+
 /// Go Redis key prefix for chat history read-through cache.
 pub const CHAT_HISTORY_CACHE_KEY_PREFIX: &str = "plotva:chat_history_cache:v2:";
 
@@ -214,6 +220,11 @@ impl RedisStore {
     /// Build the Redis-backed rate-limit store over this client.
     pub fn rate_limit_store(&self) -> RedisRateLimitStore {
         RedisRateLimitStore::new(self.client.clone())
+    }
+
+    /// Build the Redis-backed chat-admin cache store over this client.
+    pub fn chat_admin_cache_store(&self) -> RedisChatAdminCacheStore {
+        RedisChatAdminCacheStore::new(self.client.clone())
     }
 }
 
@@ -297,6 +308,78 @@ impl RedisRateLimitStore {
     ) -> Result<bool, StorageError> {
         let expiry = self.chat_rate_limit_expiry(chat_id).await?;
         Ok(rate_limit_is_active_at(expiry, now))
+    }
+}
+
+/// Redis-backed store for Go `chat:{id}:admins` admin-ID cache values.
+#[derive(Clone, Debug)]
+pub struct RedisChatAdminCacheStore {
+    client: RedisClient,
+    key_prefix: String,
+    key_suffix: String,
+}
+
+impl RedisChatAdminCacheStore {
+    /// Build a chat-admin cache store using Go's persisted key shape.
+    pub fn new(client: RedisClient) -> Self {
+        Self::with_key_prefix(client, CHAT_ADMINS_KEY_PREFIX)
+    }
+
+    /// Build a chat-admin cache store with an explicit prefix, useful for isolated tests.
+    pub fn with_key_prefix(client: RedisClient, key_prefix: impl Into<String>) -> Self {
+        Self {
+            client,
+            key_prefix: key_prefix.into(),
+            key_suffix: CHAT_ADMINS_KEY_SUFFIX.to_owned(),
+        }
+    }
+
+    /// Return the Redis key this store uses for one chat.
+    pub fn key_for_chat(&self, chat_id: i64) -> String {
+        format!("{}{chat_id}{}", self.key_prefix, self.key_suffix)
+    }
+
+    /// Persist the latest successful Telegram admin ID list with the Go TTL.
+    pub async fn set_chat_admin_ids(
+        &self,
+        chat_id: i64,
+        admin_ids: &[i64],
+        ttl: Duration,
+    ) -> Result<(), StorageError> {
+        let value = chat_admin_ids_redis_value(admin_ids)?;
+        let mut connection = self
+            .client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|source| StorageError::Redis { source })?;
+        let mut command = redis::cmd("SET");
+        command.arg(self.key_for_chat(chat_id)).arg(value);
+        if !ttl.is_zero() {
+            command.arg("PX").arg(redis_ttl_millis(ttl));
+        }
+        let _: String = command
+            .query_async(&mut connection)
+            .await
+            .map_err(|source| StorageError::Redis { source })?;
+        Ok(())
+    }
+
+    /// Load cached Telegram admin IDs for one chat.
+    pub async fn chat_admin_ids(&self, chat_id: i64) -> Result<Option<Vec<i64>>, StorageError> {
+        let mut connection = self
+            .client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|source| StorageError::Redis { source })?;
+        let value: Option<Vec<u8>> = redis::cmd("GET")
+            .arg(self.key_for_chat(chat_id))
+            .query_async(&mut connection)
+            .await
+            .map_err(|source| StorageError::Redis { source })?;
+        value
+            .as_deref()
+            .map(chat_admin_ids_from_redis_value)
+            .transpose()
     }
 }
 
@@ -1527,6 +1610,12 @@ pub enum StorageError {
         /// JSON codec error.
         source: serde_json::Error,
     },
+    /// Chat-admin ID list JSON codec failed.
+    #[error("decode chat admin ids: {source}")]
+    ChatAdminIdsCodec {
+        /// JSON codec error.
+        source: serde_json::Error,
+    },
     /// Rate-limit expiry timestamp could not be represented.
     #[error("invalid rate limit expiry timestamp: {source}")]
     RateLimitTimestamp {
@@ -1560,6 +1649,11 @@ impl StorageError {
 /// Build the persisted Go rate-limited-chat key for a chat.
 pub fn rate_limited_chat_key(chat_id: i64) -> String {
     format!("{RATE_LIMITED_CHAT_KEY_PREFIX}{chat_id}")
+}
+
+/// Build the Go cached-admin Redis key for a chat.
+pub fn chat_admins_key(chat_id: i64) -> String {
+    format!("{CHAT_ADMINS_KEY_PREFIX}{chat_id}{CHAT_ADMINS_KEY_SUFFIX}")
 }
 
 /// Build the persisted Go chat-history cache key for a chat.
@@ -1667,6 +1761,16 @@ pub fn rate_limit_expiry_from_redis_value(value: &[u8]) -> Result<OffsetDateTime
         serde_json::from_slice(value).map_err(|source| StorageError::RateLimitCodec { source })?;
     OffsetDateTime::from_unix_timestamp_nanos(value.unix_timestamp_nanos)
         .map_err(|source| StorageError::RateLimitTimestamp { source })
+}
+
+/// Encode cached chat administrator IDs as the approved Rust-native Redis JSON value.
+pub fn chat_admin_ids_redis_value(admin_ids: &[i64]) -> Result<Vec<u8>, StorageError> {
+    serde_json::to_vec(admin_ids).map_err(|source| StorageError::ChatAdminIdsCodec { source })
+}
+
+/// Decode cached chat administrator IDs from the Rust-native Redis JSON value.
+pub fn chat_admin_ids_from_redis_value(value: &[u8]) -> Result<Vec<i64>, StorageError> {
+    serde_json::from_slice(value).map_err(|source| StorageError::ChatAdminIdsCodec { source })
 }
 
 /// Return whether the loaded expiry is still active using Go's strict `time.Before` boundary.
@@ -2033,6 +2137,23 @@ mod tests {
                 .expect_err("legacy gob values should be rejected after the approved cutover");
 
         assert!(error.to_string().contains("decode rate limit expiry"));
+    }
+
+    #[test]
+    fn chat_admin_cache_key_and_codec_use_rust_native_json() -> Result<(), Box<dyn Error>> {
+        assert_eq!(super::chat_admins_key(-10042), "chat:-10042:admins");
+
+        let value = super::chat_admin_ids_redis_value(&[42, 43])?;
+        assert_eq!(serde_json::from_slice::<Vec<i64>>(&value)?, vec![42, 43]);
+        assert_eq!(
+            super::chat_admin_ids_from_redis_value(&value)?,
+            vec![42, 43]
+        );
+
+        let error = super::chat_admin_ids_from_redis_value(&[0xff, 0xb4, 0x0a, 0x00, 0xff, 0xb0])
+            .expect_err("legacy gob values should be rejected after the approved cutover");
+        assert!(error.to_string().contains("decode chat admin ids"));
+        Ok(())
     }
 
     #[test]
@@ -3096,6 +3217,38 @@ mod tests {
             assert!(store.chat_is_rate_limited_at(chat_id, now).await?);
             assert!(!store.chat_is_rate_limited_at(chat_id, expiry).await?);
 
+            Ok(())
+        }
+        .await;
+
+        let _: i64 = redis::cmd("DEL")
+            .arg(store.key_for_chat(chat_id))
+            .query_async(&mut connection)
+            .await?;
+        result
+    }
+
+    #[tokio::test]
+    async fn live_redis_chat_admin_cache_store_round_trips_when_url_is_set()
+    -> Result<(), Box<dyn Error>> {
+        let Ok(url) = env::var("OPENPLOTVA_TEST_REDIS_URL") else {
+            return Ok(());
+        };
+        let client = redis::Client::open(url)?;
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let store = super::RedisChatAdminCacheStore::with_key_prefix(
+            client.clone(),
+            format!("openplotva:test:chat_admins:{suffix}:"),
+        );
+        let chat_id = -900_124_i64;
+        let mut connection = client.get_multiplexed_async_connection().await?;
+
+        let result: Result<(), Box<dyn Error>> = async {
+            store
+                .set_chat_admin_ids(chat_id, &[42, 43], Duration::from_secs(30 * 60))
+                .await?;
+
+            assert_eq!(store.chat_admin_ids(chat_id).await?, Some(vec![42, 43]));
             Ok(())
         }
         .await;

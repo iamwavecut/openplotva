@@ -1,6 +1,6 @@
 //! App-level fetcher settings command behavior.
 
-use std::{fmt, future::Future, pin::Pin};
+use std::{fmt, future::Future, pin::Pin, time::Duration};
 
 use carapax::types::{
     Chat as TelegramChat, ChatMember as TelegramChatMember, ChatMemberRestricted,
@@ -33,6 +33,7 @@ const GROUP_SETTINGS_PERMISSION_DENIED_TEXT: &str =
 const GROUP_SETTINGS_OPEN_PRIVATE_TEXT: &str =
     "Откройте личный чат со мной, чтобы выбрать чат для настройки:";
 const GROUP_SETTINGS_OPEN_BUTTON_TEXT: &str = "⚙️ Открыть настройки";
+const CHAT_ADMINS_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
 
 /// Boxed future returned by settings taskman assignment calls.
 pub type SettingsControlJobQueueFuture<'a, E> =
@@ -134,6 +135,20 @@ pub trait GroupSettingsAdminSyncStore {
     ) -> GroupSettingsMemberFuture<'a, (), Self::Error>;
 }
 
+/// Redis cache boundary for Go `syncChatAdmins`.
+pub trait GroupSettingsAdminCache {
+    /// Error returned by concrete admin-cache storage.
+    type Error: fmt::Display + Send + Sync + 'static;
+
+    /// Persist the latest successful Telegram admin ID list.
+    fn save_chat_admin_ids<'a>(
+        &'a self,
+        chat_id: i64,
+        admin_ids: Vec<i64>,
+        ttl: Duration,
+    ) -> GroupSettingsMemberFuture<'a, (), Self::Error>;
+}
+
 /// Telegram boundary for Go `getChatAdministrators`.
 pub trait GroupSettingsAdminsApi {
     /// Error returned by concrete Telegram calls.
@@ -180,6 +195,8 @@ pub struct GroupSettingsAdminSyncReport {
     pub member_upsert_errors: usize,
     /// Best-effort user upsert failures.
     pub user_upsert_errors: usize,
+    /// Best-effort Redis admin-list cache write failures.
+    pub cache_errors: usize,
 }
 
 /// Error returned by the concrete Go `syncChatAdmins` port.
@@ -757,6 +774,21 @@ where
     Store: GroupSettingsAdminSyncStore + Sync,
     Api: GroupSettingsAdminsApi + Sync,
 {
+    sync_chat_admins_with_cache(store, telegram, &NoopGroupSettingsAdminCache, chat_id).await
+}
+
+/// Go `syncChatAdmins` and `getChatAdministrators` port with injectable Redis cache.
+pub async fn sync_chat_admins_with_cache<Store, Api, Cache>(
+    store: &Store,
+    telegram: &Api,
+    cache: &Cache,
+    chat_id: i64,
+) -> Result<GroupSettingsAdminSyncReport, GroupSettingsAdminSyncError>
+where
+    Store: GroupSettingsAdminSyncStore + Sync,
+    Api: GroupSettingsAdminsApi + Sync,
+    Cache: GroupSettingsAdminCache + Sync,
+{
     if chat_id == 0 {
         return Ok(GroupSettingsAdminSyncReport {
             source: GroupSettingsAdminSyncSource::Skipped,
@@ -765,7 +797,7 @@ where
     }
 
     match telegram.get_chat_administrators(chat_id).await {
-        Ok(admins) => sync_api_admins(store, chat_id, admins).await,
+        Ok(admins) => sync_api_admins(store, cache, chat_id, admins).await,
         Err(api_error) => {
             let api_error = api_error.to_string();
             let members = store
@@ -781,6 +813,22 @@ where
             }
             sync_stored_admins(store, admins).await
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct NoopGroupSettingsAdminCache;
+
+impl GroupSettingsAdminCache for NoopGroupSettingsAdminCache {
+    type Error = std::convert::Infallible;
+
+    fn save_chat_admin_ids<'a>(
+        &'a self,
+        _chat_id: i64,
+        _admin_ids: Vec<i64>,
+        _ttl: Duration,
+    ) -> GroupSettingsMemberFuture<'a, (), Self::Error> {
+        Box::pin(async { Ok(()) })
     }
 }
 
@@ -911,6 +959,19 @@ impl GroupSettingsAdminSyncStore for openplotva_storage::PostgresChatMemberStore
     }
 }
 
+impl GroupSettingsAdminCache for openplotva_storage::RedisChatAdminCacheStore {
+    type Error = openplotva_storage::StorageError;
+
+    fn save_chat_admin_ids<'a>(
+        &'a self,
+        chat_id: i64,
+        admin_ids: Vec<i64>,
+        ttl: Duration,
+    ) -> GroupSettingsMemberFuture<'a, (), Self::Error> {
+        Box::pin(async move { self.set_chat_admin_ids(chat_id, &admin_ids, ttl).await })
+    }
+}
+
 impl GroupSettingsAdminsApi for openplotva_telegram::TelegramClient {
     type Error = carapax::api::ExecuteError;
 
@@ -940,14 +1001,20 @@ struct AdminSyncPermissions {
     can_pin_messages: bool,
 }
 
-async fn sync_api_admins<Store>(
+async fn sync_api_admins<Store, Cache>(
     store: &Store,
+    cache: &Cache,
     chat_id: i64,
     admins: Vec<TelegramChatMember>,
 ) -> Result<GroupSettingsAdminSyncReport, GroupSettingsAdminSyncError>
 where
     Store: GroupSettingsAdminSyncStore + Sync,
+    Cache: GroupSettingsAdminCache + Sync,
 {
+    let admin_ids = admins
+        .iter()
+        .map(|admin| i64::from(admin.get_user().id))
+        .collect::<Vec<_>>();
     let mut report = GroupSettingsAdminSyncReport {
         source: GroupSettingsAdminSyncSource::Telegram,
         admin_count: admins.len(),
@@ -971,6 +1038,13 @@ where
         {
             report.user_upsert_errors += 1;
         }
+    }
+    if cache
+        .save_chat_admin_ids(chat_id, admin_ids, CHAT_ADMINS_CACHE_TTL)
+        .await
+        .is_err()
+    {
+        report.cache_errors += 1;
     }
 
     Ok(report)
@@ -1155,6 +1229,7 @@ mod tests {
         io,
         pin::Pin,
         sync::{Arc, Mutex},
+        time::Duration,
     };
 
     use carapax::types::{
@@ -1178,7 +1253,8 @@ mod tests {
         admin_chat_member_upsert_from_telegram, can_open_group_settings_with_sources,
         chat_member_upsert_from_telegram, execute_group_settings_control_job_at,
         group_settings_control_job_from_update_at, handle_group_settings_command_update_at,
-        handle_private_settings_command_update, sync_chat_admins_with_sources,
+        handle_private_settings_command_update, sync_chat_admins_with_cache,
+        sync_chat_admins_with_sources,
     };
 
     #[tokio::test]
@@ -1826,6 +1902,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn group_settings_admin_sync_caches_api_admin_ids_with_go_ttl()
+    -> Result<(), Box<dyn Error>> {
+        let store = GroupSettingsAdminSyncStoreStub::default();
+        let api = GroupSettingsAdminsApiStub::with_admins(vec![
+            promoting_admin_member(42),
+            creator_member(43),
+        ]);
+        let cache = GroupSettingsAdminCacheStub::default();
+
+        let report = sync_chat_admins_with_cache(&store, &api, &cache, -10042).await?;
+
+        assert_eq!(report.source, GroupSettingsAdminSyncSource::Telegram);
+        assert_eq!(report.cache_errors, 0);
+        assert_eq!(
+            cache.saves(),
+            vec![(-10042, vec![42, 43], Duration::from_secs(30 * 60))]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn group_settings_admin_sync_keeps_cache_failures_nonfatal_like_go()
+    -> Result<(), Box<dyn Error>> {
+        let store = GroupSettingsAdminSyncStoreStub::default();
+        let api = GroupSettingsAdminsApiStub::with_admins(vec![promoting_admin_member(42)]);
+        let cache = GroupSettingsAdminCacheStub::failing();
+
+        let report = sync_chat_admins_with_cache(&store, &api, &cache, -10042).await?;
+
+        assert_eq!(report.source, GroupSettingsAdminSyncSource::Telegram);
+        assert_eq!(report.admin_count, 1);
+        assert_eq!(report.cache_errors, 1);
+        assert_eq!(
+            cache.saves(),
+            vec![(-10042, vec![42], Duration::from_secs(30 * 60))]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn group_settings_admin_sync_falls_back_to_stored_admins_after_api_error()
     -> Result<(), Box<dyn Error>> {
         let store = GroupSettingsAdminSyncStoreStub::with_members(vec![
@@ -1852,6 +1968,21 @@ mod tests {
         assert_eq!(api.calls(), vec![-10042]);
         assert_eq!(store.list_calls(), vec![-10042]);
         assert!(store.upserts().is_empty());
+
+        let cache_store = GroupSettingsAdminSyncStoreStub::with_members(vec![ChatMemberRecord {
+            chat_id: -10042,
+            user_id: 42,
+            status: openplotva_storage::CHAT_MEMBER_STATUS_ADMINISTRATOR.to_owned(),
+            can_promote_members: Some(true),
+            ..ChatMemberRecord::default()
+        }]);
+        let cache_api = GroupSettingsAdminsApiStub::failing();
+        let cache = GroupSettingsAdminCacheStub::default();
+        let _ = sync_chat_admins_with_cache(&cache_store, &cache_api, &cache, -10042).await?;
+        assert!(
+            cache.saves().is_empty(),
+            "Go caches admin IDs only after an API success, not DB fallback"
+        );
 
         let users = store.users();
         assert_eq!(users.len(), 1);
@@ -2485,6 +2616,55 @@ mod tests {
                     .users
                     .push(user);
                 Ok(())
+            })
+        }
+    }
+
+    type AdminCacheSave = (i64, Vec<i64>, Duration);
+
+    #[derive(Clone, Default)]
+    struct GroupSettingsAdminCacheStub {
+        state: Arc<Mutex<GroupSettingsAdminCacheState>>,
+    }
+
+    #[derive(Default)]
+    struct GroupSettingsAdminCacheState {
+        fail: bool,
+        saves: Vec<AdminCacheSave>,
+    }
+
+    impl GroupSettingsAdminCacheStub {
+        fn failing() -> Self {
+            Self {
+                state: Arc::new(Mutex::new(GroupSettingsAdminCacheState {
+                    fail: true,
+                    ..GroupSettingsAdminCacheState::default()
+                })),
+            }
+        }
+
+        fn saves(&self) -> Vec<AdminCacheSave> {
+            self.state
+                .lock()
+                .expect("group settings admin cache state")
+                .saves
+                .clone()
+        }
+    }
+
+    impl super::GroupSettingsAdminCache for GroupSettingsAdminCacheStub {
+        type Error = StubError;
+
+        fn save_chat_admin_ids<'a>(
+            &'a self,
+            chat_id: i64,
+            admin_ids: Vec<i64>,
+            ttl: Duration,
+        ) -> super::GroupSettingsMemberFuture<'a, (), Self::Error> {
+            Box::pin(async move {
+                let mut state = self.state.lock().expect("group settings admin cache state");
+                state.saves.push((chat_id, admin_ids, ttl));
+                if state.fail { Err(StubError) } else { Ok(()) }
             })
         }
     }

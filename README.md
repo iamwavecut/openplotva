@@ -11,7 +11,7 @@ The repository is private while the implementation is in progress. The code and 
 - The Go repository is read-only reference material for this implementation.
 - The first runnable Rust shell exposes `/api/health` and `/api/ready`.
 - App startup enforces the Go reference snapshot by default and can optionally probe Postgres plus Redis/Dragonfly.
-- Current Telegram/payment/settings slices cover dispatcher/update-queue primitives, payment invoice/control-job paths, successful-payment VIP ledger writes, `/admin_grant_vip` admin-adjustment handling, `/admin_cancel_vip` revoke/refund handling, the private `/settings` WebApp button path, and group `/settings` control-job assignment plus executor link/decline behavior with concrete `canOpenGroupSettings` and `syncChatAdmins` storage/Telegram lookups ported.
+- Current Telegram/payment/settings slices cover dispatcher/update-queue primitives, payment invoice/control-job paths, successful-payment VIP ledger writes, `/admin_grant_vip` admin-adjustment handling, `/admin_cancel_vip` revoke/refund handling, the private `/settings` WebApp button path, and group `/settings` control-job assignment plus executor link/decline behavior with concrete `canOpenGroupSettings` and `syncChatAdmins` storage/Telegram/Redis lookups ported.
 
 ## Local Setup
 
@@ -140,7 +140,8 @@ Rust-native serde payloads. Current cases: Telegram updates use zstd-compressed
 serde JSON envelopes over `carapax::types::Update`; dispatcher shutdown
 snapshots store persistent-item JSON directly; persisted chat rate-limit
 expiries use JSON timestamp values under the original
-`plotva:rate_limited_chat:*` keys; the payment control-job queue stores a
+`plotva:rate_limited_chat:*` keys; cached group admin IDs use JSON integer
+arrays under `chat:{id}:admins`; the payment control-job queue stores a
 Rust-native JSON snapshot at `~/.plotva/openplotva-payment-control-jobs.snap`.
 Tests for these surfaces should assert decoded values and lifecycle behavior
 rather than gob bytes.
