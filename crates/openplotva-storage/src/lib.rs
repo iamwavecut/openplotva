@@ -1242,6 +1242,19 @@ pub enum StorageError {
     HistoryPayloadShape,
 }
 
+impl StorageError {
+    /// Whether this error is SQLx's no-row result, matching Go/SQLC duplicate no-row fallbacks.
+    #[must_use]
+    pub fn is_row_not_found(&self) -> bool {
+        matches!(
+            self,
+            Self::Postgres {
+                source: sqlx::Error::RowNotFound
+            }
+        )
+    }
+}
+
 /// Build the persisted Go rate-limited-chat key for a chat.
 pub fn rate_limited_chat_key(chat_id: i64) -> String {
     format!("{RATE_LIMITED_CHAT_KEY_PREFIX}{chat_id}")

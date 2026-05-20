@@ -1,5 +1,6 @@
 //! Composition root for the OpenPlotva application shell.
 
+pub mod payments;
 pub mod pending_ops;
 pub mod permissions;
 pub mod rate_limits;
