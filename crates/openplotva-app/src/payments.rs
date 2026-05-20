@@ -3,7 +3,8 @@ use std::{fmt, future::Future, pin::Pin};
 use carapax::types::{
     Chat as TelegramChat, Message as TelegramMessage, MessageData as TelegramMessageData,
     PreCheckoutQuery as TelegramPreCheckoutQuery, SuccessfulPayment as TelegramSuccessfulPayment,
-    Update as TelegramUpdate, UpdateType as TelegramUpdateType, User as TelegramUser,
+    TextEntity as TelegramTextEntity, Update as TelegramUpdate, UpdateType as TelegramUpdateType,
+    User as TelegramUser,
 };
 use openplotva_core::{UserState, VIP_EVENT_TYPE_PAYMENT, vip_days_to_seconds};
 use openplotva_storage::{
@@ -112,6 +113,38 @@ pub enum SuccessfulPaymentControlJobUpdateRoute {
     /// Control-job assignment failed. Go logs and keeps the update handled.
     QueueError,
     /// The update was not a successful-payment service message and was delegated.
+    Delegated,
+}
+
+/// Result of building the Go `/vip` or `/donate` invoice control job.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PaymentInvoiceControlJobBuild {
+    /// A high-priority payment invoice control job was built.
+    Job(Box<StatelessJobItem>),
+    /// The update was not a payment invoice command.
+    NotPaymentCommand,
+    /// The command was sent outside a private chat; Go sends a deep-link redirect instead.
+    NonPrivateChat,
+    /// Go cannot identify a valid non-bot VIP subscriber.
+    MissingUser,
+    /// `/donate` carried an amount outside the Go-supported Stars range or not an integer.
+    InvalidDonationAmount,
+}
+
+/// Routing result for queueing Go payment invoice command control jobs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PaymentInvoiceCommandUpdateRoute {
+    /// A VIP/donation invoice control job was assigned to the Go control queue.
+    Queued,
+    /// Control-job assignment failed. Go logs and keeps the command handled.
+    QueueError,
+    /// The command was sent outside a private chat; caller should send the Go redirect message.
+    NonPrivateChat,
+    /// VIP invoice command did not have a valid non-bot user.
+    MissingUser,
+    /// Donation command had an invalid explicit amount.
+    InvalidDonationAmount,
+    /// The update was not a payment invoice command and was delegated.
     Delegated,
 }
 
@@ -847,6 +880,261 @@ where
     }
 }
 
+/// Go default VIP subscription price in Telegram Stars.
+pub const SUBSCRIPTION_PRICE_STARS: i64 = 300;
+/// Go default donation amount in Telegram Stars.
+pub const DEFAULT_DONATION_STARS: i64 = 600;
+/// Minimum explicit donation amount accepted by Go.
+pub const MIN_DONATION_STARS: i64 = 10;
+/// Maximum explicit donation amount accepted by Go.
+pub const MAX_DONATION_STARS: i64 = 10_000;
+
+/// Build the Go taskman control job produced by private `/vip` and `/donate` commands.
+#[must_use]
+pub fn payment_invoice_control_job_from_update_at(
+    update: &TelegramUpdate,
+    created: OffsetDateTime,
+) -> PaymentInvoiceControlJobBuild {
+    let TelegramUpdateType::Message(message) = &update.update_type else {
+        return PaymentInvoiceControlJobBuild::NotPaymentCommand;
+    };
+    payment_invoice_control_job_from_message_at(message, created)
+}
+
+fn payment_invoice_control_job_from_message_at(
+    message: &TelegramMessage,
+    created: OffsetDateTime,
+) -> PaymentInvoiceControlJobBuild {
+    let Some(command) = payment_command_from_message(message) else {
+        return PaymentInvoiceControlJobBuild::NotPaymentCommand;
+    };
+    if !matches!(message.chat, TelegramChat::Private(_)) {
+        return PaymentInvoiceControlJobBuild::NonPrivateChat;
+    }
+
+    match command.name {
+        "vip" => vip_invoice_control_job_from_message_at(message, created),
+        "donate" => {
+            donation_invoice_control_job_from_message_at(message, command.arguments, created)
+        }
+        _ => PaymentInvoiceControlJobBuild::NotPaymentCommand,
+    }
+}
+
+fn vip_invoice_control_job_from_message_at(
+    message: &TelegramMessage,
+    created: OffsetDateTime,
+) -> PaymentInvoiceControlJobBuild {
+    let Some(user) = message.sender.get_user() else {
+        return PaymentInvoiceControlJobBuild::MissingUser;
+    };
+    let user_id: i64 = user.id.into();
+    if user_id <= 0 || user.is_bot {
+        return PaymentInvoiceControlJobBuild::MissingUser;
+    }
+
+    let data = payment_control_data_from_message(
+        message,
+        ControlKind::VipInvoice,
+        subscription_price_stars_for_user(user),
+    );
+    control_job_from_message_at(message, data, "vip invoice", created)
+        .map(Box::new)
+        .map(PaymentInvoiceControlJobBuild::Job)
+        .unwrap_or(PaymentInvoiceControlJobBuild::MissingUser)
+}
+
+fn donation_invoice_control_job_from_message_at(
+    message: &TelegramMessage,
+    command_arguments: &str,
+    created: OffsetDateTime,
+) -> PaymentInvoiceControlJobBuild {
+    let Ok(amount) = donation_amount_stars_from_command_arguments(command_arguments) else {
+        return PaymentInvoiceControlJobBuild::InvalidDonationAmount;
+    };
+
+    let data = payment_control_data_from_message(message, ControlKind::DonateInvoice, amount);
+    control_job_from_message_at(message, data, "donate invoice", created)
+        .map(Box::new)
+        .map(PaymentInvoiceControlJobBuild::Job)
+        .unwrap_or(PaymentInvoiceControlJobBuild::NotPaymentCommand)
+}
+
+/// Queue private `/vip` and `/donate` updates as Go taskman control jobs, delegating other updates.
+pub async fn enqueue_payment_invoice_command_update_or_else_at<
+    Queue,
+    HandleFn,
+    HandleFuture,
+    HandleError,
+>(
+    queue: &Queue,
+    update: TelegramUpdate,
+    created: OffsetDateTime,
+    handle_other: HandleFn,
+) -> Result<PaymentInvoiceCommandUpdateRoute, HandleError>
+where
+    Queue: PaymentControlJobQueue + Sync,
+    HandleFn: FnOnce(TelegramUpdate) -> HandleFuture,
+    HandleFuture: Future<Output = Result<(), HandleError>>,
+{
+    match payment_invoice_control_job_from_update_at(&update, created) {
+        PaymentInvoiceControlJobBuild::Job(job) => match queue
+            .assign_payment_control_job(CONTROL_QUEUE_NAME, *job)
+            .await
+        {
+            Ok(()) => Ok(PaymentInvoiceCommandUpdateRoute::Queued),
+            Err(error) => {
+                tracing::warn!(%error, "failed to assign payment invoice control job");
+                Ok(PaymentInvoiceCommandUpdateRoute::QueueError)
+            }
+        },
+        PaymentInvoiceControlJobBuild::NotPaymentCommand => {
+            handle_other(update).await?;
+            Ok(PaymentInvoiceCommandUpdateRoute::Delegated)
+        }
+        PaymentInvoiceControlJobBuild::NonPrivateChat => {
+            Ok(PaymentInvoiceCommandUpdateRoute::NonPrivateChat)
+        }
+        PaymentInvoiceControlJobBuild::MissingUser => {
+            Ok(PaymentInvoiceCommandUpdateRoute::MissingUser)
+        }
+        PaymentInvoiceControlJobBuild::InvalidDonationAmount => {
+            Ok(PaymentInvoiceCommandUpdateRoute::InvalidDonationAmount)
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PaymentCommand<'a> {
+    name: &'a str,
+    arguments: &'a str,
+}
+
+fn payment_command_from_message(message: &TelegramMessage) -> Option<PaymentCommand<'_>> {
+    let TelegramMessageData::Text(text) = &message.data else {
+        return None;
+    };
+    let mut entities = text.entities.as_ref()?.into_iter();
+    let TelegramTextEntity::BotCommand(position) = entities.next()? else {
+        return None;
+    };
+    if position.offset != 0 {
+        return None;
+    }
+
+    let command_end = utf16_index_to_byte_index(&text.data, position.length)?;
+    let command_with_slash = text.data.get(..command_end)?;
+    let command_with_at = command_with_slash.strip_prefix('/')?;
+    let name = command_with_at
+        .split_once('@')
+        .map_or(command_with_at, |(name, _)| name);
+    let arguments = command_arguments_after_command(&text.data, command_end)?;
+    Some(PaymentCommand { name, arguments })
+}
+
+fn command_arguments_after_command(text: &str, command_end: usize) -> Option<&str> {
+    let after_command = text.get(command_end..)?;
+    let Some(separator) = after_command.chars().next() else {
+        return Some("");
+    };
+    after_command.get(separator.len_utf8()..)
+}
+
+fn utf16_index_to_byte_index(text: &str, utf16_units: u32) -> Option<usize> {
+    let mut consumed = 0_u32;
+    for (byte_index, ch) in text.char_indices() {
+        if consumed == utf16_units {
+            return Some(byte_index);
+        }
+        consumed = consumed.checked_add(u32::try_from(ch.len_utf16()).ok()?)?;
+        if consumed > utf16_units {
+            return None;
+        }
+    }
+    if consumed == utf16_units {
+        Some(text.len())
+    } else {
+        None
+    }
+}
+
+fn subscription_price_stars_for_user(user: &TelegramUser) -> i64 {
+    if user
+        .username
+        .as_ref()
+        .is_some_and(|username| username == "WaveCut")
+    {
+        1
+    } else {
+        SUBSCRIPTION_PRICE_STARS
+    }
+}
+
+fn donation_amount_stars_from_command_arguments(arguments: &str) -> Result<i64, ()> {
+    if arguments.is_empty() {
+        return Ok(DEFAULT_DONATION_STARS);
+    }
+    let amount = arguments.parse::<i64>().map_err(|_| ())?;
+    if (MIN_DONATION_STARS..=MAX_DONATION_STARS).contains(&amount) {
+        Ok(amount)
+    } else {
+        Err(())
+    }
+}
+
+fn payment_control_data_from_message(
+    message: &TelegramMessage,
+    kind: ControlKind,
+    amount: i64,
+) -> ControlJobData {
+    let mut data = ControlJobData {
+        kind,
+        amount,
+        chat_type: chat_type_name(&message.chat).to_owned(),
+        ..ControlJobData::default()
+    };
+    if let Some(user) = message.sender.get_user() {
+        data.user_name = user
+            .username
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        data.first_name = user.first_name.clone();
+        data.last_name = user.last_name.clone().unwrap_or_default();
+        data.language_code = user.language_code.clone().unwrap_or_default();
+        data.is_premium = user.is_premium.unwrap_or_default();
+    }
+    data
+}
+
+fn control_job_from_message_at(
+    message: &TelegramMessage,
+    data: ControlJobData,
+    title: &str,
+    created: OffsetDateTime,
+) -> Option<StatelessJobItem> {
+    let user = message.sender.get_user();
+    let params = ControlJobParams {
+        chat_id: message.chat.get_id().into(),
+        message_id: i32::try_from(message.id).ok()?,
+        user_id: user.map(|user| user.id.into()).unwrap_or_default(),
+        user_full_name: user
+            .map(user_full_name)
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| "Telegram".to_owned()),
+        thread_id: message
+            .message_thread_id
+            .and_then(|thread_id| i32::try_from(thread_id).ok())
+            .filter(|thread_id| *thread_id != 0),
+        data,
+    };
+    Some(
+        new_control_job_at(params, created)
+            .with_name(title)
+            .with_priority(HIGH_PRIORITY),
+    )
+}
+
 fn chat_type_name(chat: &TelegramChat) -> &'static str {
     match chat {
         TelegramChat::Channel(_) => "channel",
@@ -1371,17 +1659,19 @@ mod tests {
     use super::{
         InvoiceButtonMessage, InvoiceControlJobOutcome, PaymentControlJobOutcome,
         PaymentControlJobQueue, PaymentControlJobQueueFuture, PaymentEffectsFuture,
-        PaymentInvoiceEffects, PaymentInvoiceLinkFuture, PaymentStoreFuture, PreCheckoutOutcome,
+        PaymentInvoiceCommandUpdateRoute, PaymentInvoiceControlJobBuild, PaymentInvoiceEffects,
+        PaymentInvoiceLinkFuture, PaymentStoreFuture, PreCheckoutOutcome,
         PreCheckoutPaymentEffects, PreCheckoutUpdateRoute, SuccessfulPayment,
         SuccessfulPaymentControlJobUpdateRoute, SuccessfulPaymentEffects, SuccessfulPaymentMessage,
         SuccessfulPaymentOutcome, SuccessfulPaymentStore, SuccessfulPaymentUpdateRoute,
+        enqueue_payment_invoice_command_update_or_else_at,
         enqueue_successful_payment_update_or_else_at, execute_donate_invoice_control_job,
         execute_payment_control_job_at, execute_vip_invoice_control_job,
         handle_pre_checkout_update_or_else, handle_successful_payment_update_or_else_at,
-        invoice_button_send_message_method, process_successful_payment_at,
-        subscription_invoice_message_text, subscription_success_text,
-        successful_payment_control_job_from_update_at, successful_payment_message_from_control_job,
-        successful_payment_message_from_update,
+        invoice_button_send_message_method, payment_invoice_control_job_from_update_at,
+        process_successful_payment_at, subscription_invoice_message_text,
+        subscription_success_text, successful_payment_control_job_from_update_at,
+        successful_payment_message_from_control_job, successful_payment_message_from_update,
     };
 
     #[tokio::test]
@@ -1815,6 +2105,197 @@ mod tests {
 
         assert_eq!(route, SuccessfulPaymentControlJobUpdateRoute::QueueError);
         assert_eq!(queue.assigned().len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn vip_invoice_command_builds_go_taskman_control_job() -> Result<(), Box<dyn Error>> {
+        let created = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+
+        let PaymentInvoiceControlJobBuild::Job(job) = payment_invoice_control_job_from_update_at(
+            &sample_payment_command_update("/vip")?,
+            created,
+        ) else {
+            panic!("VIP command should build a control job");
+        };
+
+        assert_eq!(job.title, "vip invoice");
+        assert_eq!(job.created, created);
+        assert_eq!(job.priority, HIGH_PRIORITY);
+        assert_eq!(job.data.job_type, JobType::Control);
+        let telegram_data = job.data.telegram_data.as_ref().expect("Telegram data");
+        assert_eq!(telegram_data.chat_id, 42);
+        assert_eq!(telegram_data.user_id, 42);
+        assert_eq!(telegram_data.message_id, 100);
+        assert_eq!(telegram_data.thread_message_id, Some(77));
+        assert_eq!(telegram_data.user_full_name, "Alice Smith");
+        let control_data = job.data.control_data.as_ref().expect("control data");
+        assert_eq!(control_data.kind, ControlKind::VipInvoice);
+        assert_eq!(control_data.amount, 300);
+        assert_eq!(control_data.chat_type, "private");
+        assert_eq!(control_data.user_name, "alice");
+        assert_eq!(control_data.first_name, "Alice");
+        assert_eq!(control_data.last_name, "Smith");
+        assert_eq!(control_data.language_code, "en");
+        assert!(control_data.is_premium);
+        Ok(())
+    }
+
+    #[test]
+    fn vip_invoice_command_preserves_wavecut_price_override() -> Result<(), Box<dyn Error>> {
+        let created = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+
+        let PaymentInvoiceControlJobBuild::Job(job) = payment_invoice_control_job_from_update_at(
+            &sample_payment_command_update_with_username("/vip", "WaveCut")?,
+            created,
+        ) else {
+            panic!("VIP command should build a control job");
+        };
+
+        let control_data = job.data.control_data.as_ref().expect("control data");
+        assert_eq!(control_data.kind, ControlKind::VipInvoice);
+        assert_eq!(control_data.amount, 1);
+        assert_eq!(control_data.user_name, "WaveCut");
+        Ok(())
+    }
+
+    #[test]
+    fn donation_invoice_command_defaults_and_parses_go_amounts() -> Result<(), Box<dyn Error>> {
+        let created = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+
+        let PaymentInvoiceControlJobBuild::Job(default_job) =
+            payment_invoice_control_job_from_update_at(
+                &sample_payment_command_update("/donate")?,
+                created,
+            )
+        else {
+            panic!("donation command should build a default invoice job");
+        };
+        let default_data = default_job
+            .data
+            .control_data
+            .as_ref()
+            .expect("control data");
+        assert_eq!(default_job.title, "donate invoice");
+        assert_eq!(default_data.kind, ControlKind::DonateInvoice);
+        assert_eq!(default_data.amount, 600);
+
+        let PaymentInvoiceControlJobBuild::Job(custom_job) =
+            payment_invoice_control_job_from_update_at(
+                &sample_payment_command_update("/donate 777")?,
+                created,
+            )
+        else {
+            panic!("donation command should build a custom invoice job");
+        };
+        let custom_data = custom_job.data.control_data.as_ref().expect("control data");
+        assert_eq!(custom_data.kind, ControlKind::DonateInvoice);
+        assert_eq!(custom_data.amount, 777);
+        Ok(())
+    }
+
+    #[test]
+    fn donation_invoice_command_rejects_go_invalid_amounts() -> Result<(), Box<dyn Error>> {
+        let created = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+
+        assert_eq!(
+            payment_invoice_control_job_from_update_at(
+                &sample_payment_command_update("/donate 9")?,
+                created
+            ),
+            PaymentInvoiceControlJobBuild::InvalidDonationAmount
+        );
+        assert_eq!(
+            payment_invoice_control_job_from_update_at(
+                &sample_payment_command_update("/donate 10001")?,
+                created
+            ),
+            PaymentInvoiceControlJobBuild::InvalidDonationAmount
+        );
+        assert_eq!(
+            payment_invoice_control_job_from_update_at(
+                &sample_payment_command_update("/donate abc")?,
+                created
+            ),
+            PaymentInvoiceControlJobBuild::InvalidDonationAmount
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn payment_invoice_command_queue_wrapper_assigns_control_job_without_fallback()
+    -> Result<(), Box<dyn Error>> {
+        let created = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let queue = PaymentControlJobQueueStub::default();
+        let fallback_calls = Arc::new(Mutex::new(Vec::new()));
+        let fallback_calls_for_handle = Arc::clone(&fallback_calls);
+
+        let route = enqueue_payment_invoice_command_update_or_else_at(
+            &queue,
+            sample_payment_command_update("/donate 777")?,
+            created,
+            move |update| {
+                let fallback_calls = Arc::clone(&fallback_calls_for_handle);
+                async move {
+                    fallback_calls
+                        .lock()
+                        .map_err(|err| std::io::Error::other(err.to_string()))?
+                        .push(update.id);
+                    Ok::<(), std::io::Error>(())
+                }
+            },
+        )
+        .await?;
+
+        assert_eq!(route, PaymentInvoiceCommandUpdateRoute::Queued);
+        assert!(fallback_calls.lock().expect("fallback calls").is_empty());
+        let assigned = queue.assigned();
+        assert_eq!(assigned.len(), 1);
+        assert_eq!(assigned[0].0, CONTROL_QUEUE_NAME);
+        assert_eq!(assigned[0].1.title, "donate invoice");
+        assert_eq!(assigned[0].1.priority, HIGH_PRIORITY);
+        let control_data = assigned[0]
+            .1
+            .data
+            .control_data
+            .as_ref()
+            .expect("control data");
+        assert_eq!(control_data.kind, ControlKind::DonateInvoice);
+        assert_eq!(control_data.amount, 777);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn payment_invoice_command_queue_wrapper_reports_invalid_amount_without_queue_or_fallback()
+    -> Result<(), Box<dyn Error>> {
+        let created = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let queue = PaymentControlJobQueueStub::default();
+        let fallback_calls = Arc::new(Mutex::new(Vec::new()));
+        let fallback_calls_for_handle = Arc::clone(&fallback_calls);
+
+        let route = enqueue_payment_invoice_command_update_or_else_at(
+            &queue,
+            sample_payment_command_update("/donate 10001")?,
+            created,
+            move |update| {
+                let fallback_calls = Arc::clone(&fallback_calls_for_handle);
+                async move {
+                    fallback_calls
+                        .lock()
+                        .map_err(|err| std::io::Error::other(err.to_string()))?
+                        .push(update.id);
+                    Ok::<(), std::io::Error>(())
+                }
+            },
+        )
+        .await?;
+
+        assert_eq!(
+            route,
+            PaymentInvoiceCommandUpdateRoute::InvalidDonationAmount
+        );
+        assert!(fallback_calls.lock().expect("fallback calls").is_empty());
+        assert!(queue.assigned().is_empty());
         Ok(())
     }
 
@@ -2370,6 +2851,46 @@ mod tests {
                     "username": "alice"
                 },
                 "text": "hello"
+            }
+        }))
+    }
+
+    fn sample_payment_command_update(text: &str) -> Result<TelegramUpdate, serde_json::Error> {
+        sample_payment_command_update_with_username(text, "alice")
+    }
+
+    fn sample_payment_command_update_with_username(
+        text: &str,
+        username: &str,
+    ) -> Result<TelegramUpdate, serde_json::Error> {
+        let command_len = text.split_whitespace().next().map_or(text.len(), str::len);
+        serde_json::from_value(json!({
+            "update_id": 999,
+            "message": {
+                "message_id": 100,
+                "message_thread_id": 77,
+                "date": 1_710_000_000,
+                "chat": {
+                    "id": 42,
+                    "type": "private",
+                    "first_name": "Alice",
+                    "username": username
+                },
+                "from": {
+                    "id": 42,
+                    "is_bot": false,
+                    "first_name": "Alice",
+                    "last_name": "Smith",
+                    "username": username,
+                    "language_code": "en",
+                    "is_premium": true
+                },
+                "text": text,
+                "entities": [{
+                    "offset": 0,
+                    "length": command_len,
+                    "type": "bot_command"
+                }]
             }
         }))
     }
