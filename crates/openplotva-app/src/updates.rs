@@ -8,13 +8,14 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use carapax::types::Update as TelegramUpdate;
-use openplotva_core::{ChatState, UserState};
+use carapax::types::{Update as TelegramUpdate, UpdateType as TelegramUpdateType};
+use openplotva_core::{ChatMessageMeta, ChatState, UserState};
 use openplotva_updates::{
-    UpdateConsumerConfig, UpdateProcessReport, UpdateStageOutcome, extract_update_state,
-    should_skip_side_effects_at,
+    HistoryTextEntry, UpdateConsumerConfig, UpdateProcessReport, UpdateStageOutcome,
+    build_history_text_entry, extract_update_state, should_skip_side_effects_at,
 };
 use thiserror::Error;
+use time::{Date, OffsetDateTime};
 use tokio::{sync::Semaphore, task::JoinSet};
 
 /// Boxed future returned by update sources.
@@ -26,6 +27,10 @@ pub type UpdateHandlerFuture<'a, E> = Pin<Box<dyn Future<Output = Result<(), E>>
 
 /// Boxed future returned by update state storage calls.
 pub type UpdateStateStoreFuture<'a, E> = Pin<Box<dyn Future<Output = Result<(), E>> + Send + 'a>>;
+
+/// Boxed future returned by inbound history storage calls.
+pub type InboundHistoryStoreFuture<'a, E> =
+    Pin<Box<dyn Future<Output = Result<(), E>> + Send + 'a>>;
 
 /// Source of decoded Telegram updates for the app-level consumer loop.
 pub trait UpdateSource {
@@ -91,6 +96,71 @@ impl UpdateStateStore for openplotva_storage::PostgresVirtualMessageStore {
     }
 }
 
+/// Storage-shaped inbound chat-history text entry.
+#[derive(Clone, Copy, Debug)]
+pub struct InboundHistoryUpsert<'payload> {
+    /// UTC bucket day partition.
+    pub bucket_day: Date,
+    /// Telegram chat ID.
+    pub chat_id: i64,
+    /// Telegram thread/topic ID.
+    pub thread_id: i32,
+    /// Telegram message ID.
+    pub message_id: i32,
+    /// Stable history entry ID, such as `msg:123`.
+    pub entry_id: &'payload str,
+    /// History message kind.
+    pub kind: &'payload str,
+    /// Dialog role.
+    pub role: &'payload str,
+    /// Message timestamp.
+    pub occurred_at: OffsetDateTime,
+    /// Sender ID.
+    pub sender_id: i64,
+    /// Serialized Go-shaped `MessageEntry` JSON payload.
+    pub payload: &'payload [u8],
+}
+
+/// Storage capability needed to persist inbound Telegram text history entries.
+pub trait InboundHistoryStore {
+    /// Error returned by the concrete history store.
+    type Error: fmt::Display;
+
+    /// Upsert one Go-shaped inbound history entry.
+    fn upsert_inbound_history<'a>(
+        &'a self,
+        entry: InboundHistoryUpsert<'a>,
+    ) -> InboundHistoryStoreFuture<'a, Self::Error>;
+}
+
+impl InboundHistoryStore for openplotva_storage::PostgresHistoryStore {
+    type Error = openplotva_storage::StorageError;
+
+    fn upsert_inbound_history<'a>(
+        &'a self,
+        entry: InboundHistoryUpsert<'a>,
+    ) -> InboundHistoryStoreFuture<'a, Self::Error> {
+        Box::pin(async move {
+            openplotva_storage::PostgresHistoryStore::upsert_history_entry(
+                self,
+                openplotva_storage::HistoryEntryUpsert {
+                    bucket_day: entry.bucket_day,
+                    chat_id: entry.chat_id,
+                    thread_id: entry.thread_id,
+                    message_id: entry.message_id,
+                    entry_id: entry.entry_id,
+                    kind: entry.kind,
+                    role: entry.role,
+                    occurred_at: entry.occurred_at,
+                    sender_id: entry.sender_id,
+                    payload: entry.payload,
+                },
+            )
+            .await
+        })
+    }
+}
+
 /// Report for the Go consumer state-persistence stage.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct UpdateStatePersistenceReport {
@@ -149,6 +219,54 @@ where
         report.user_persisted = true;
     }
     Ok(report)
+}
+
+/// Report for inbound Telegram history persistence.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct InboundMessageHistoryReport {
+    /// Whether a history entry was built and upserted.
+    pub entry_persisted: bool,
+}
+
+/// Error returned while persisting inbound message history.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum InboundMessageHistoryError {
+    /// History entry upsert failed.
+    #[error("upsert inbound history: {message}")]
+    Upsert {
+        /// Display form of the storage error.
+        message: String,
+    },
+}
+
+/// Build and persist the Go-shaped history entry for one inbound Telegram message update.
+pub async fn persist_inbound_message_history<S>(
+    store: &S,
+    update: &TelegramUpdate,
+    original_text: &str,
+    meta: ChatMessageMeta,
+    bot_id: i64,
+) -> Result<InboundMessageHistoryReport, InboundMessageHistoryError>
+where
+    S: InboundHistoryStore + Sync,
+{
+    let TelegramUpdateType::Message(message) = &update.update_type else {
+        return Ok(InboundMessageHistoryReport::default());
+    };
+    let Some(entry) = build_history_text_entry(message, original_text, meta, bot_id) else {
+        return Ok(InboundMessageHistoryReport::default());
+    };
+
+    store
+        .upsert_inbound_history(inbound_history_upsert(&entry))
+        .await
+        .map_err(|error| InboundMessageHistoryError::Upsert {
+            message: error.to_string(),
+        })?;
+
+    Ok(InboundMessageHistoryReport {
+        entry_persisted: true,
+    })
 }
 
 /// Process one decoded update with app-owned state persistence and an injected handler.
@@ -297,6 +415,21 @@ fn stage_permits_for_update(
     desired.min(worker_limit.max(1)) as u32
 }
 
+fn inbound_history_upsert(entry: &HistoryTextEntry) -> InboundHistoryUpsert<'_> {
+    InboundHistoryUpsert {
+        bucket_day: entry.occurred_at.date(),
+        chat_id: entry.chat_id,
+        thread_id: entry.thread_id,
+        message_id: entry.message_id,
+        entry_id: &entry.entry_id,
+        kind: &entry.kind,
+        role: &entry.role,
+        occurred_at: entry.occurred_at,
+        sender_id: entry.sender_id,
+        payload: &entry.payload,
+    }
+}
+
 fn record_worker_join(
     joined: Result<UpdateProcessReport, tokio::task::JoinError>,
     run: &mut UpdateConsumerRunReport,
@@ -341,13 +474,14 @@ mod tests {
     };
 
     use carapax::types::Update as TelegramUpdate;
-    use openplotva_core::{ChatState, UserState};
+    use openplotva_core::{ChatMessageMeta, ChatState, UserState};
     use openplotva_updates::{UpdateConsumerConfig, UpdateStageOutcome};
-    use serde_json::json;
+    use serde_json::{Value, json};
     use tokio::sync::Notify;
 
     use super::{
-        UpdateHandler, UpdateHandlerFuture, UpdateSource, UpdateSourceFuture, UpdateStateStore,
+        InboundHistoryStore, InboundHistoryStoreFuture, InboundHistoryUpsert, UpdateHandler,
+        UpdateHandlerFuture, UpdateSource, UpdateSourceFuture, UpdateStateStore,
         UpdateStateStoreFuture, persist_update_state, process_update_with_state_store_at,
         run_update_consumer_until,
     };
@@ -381,6 +515,43 @@ mod tests {
         assert!(!report.chat_persisted);
         assert!(!report.user_persisted);
         assert!(store.calls().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn persist_inbound_message_history_builds_and_upserts_go_entry()
+    -> Result<(), Box<dyn Error>> {
+        let store = HistoryStoreStub::default();
+
+        let report = super::persist_inbound_message_history(
+            &store,
+            &sample_message_update()?,
+            " /start hello ",
+            ChatMessageMeta::default(),
+            0,
+        )
+        .await?;
+
+        assert!(report.entry_persisted);
+        let entries = store.entries();
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry.bucket_day.to_string(), "2024-03-09");
+        assert_eq!(entry.chat_id, 42);
+        assert_eq!(entry.thread_id, 0);
+        assert_eq!(entry.message_id, 77);
+        assert_eq!(entry.entry_id, "msg:77");
+        assert_eq!(entry.kind, "text");
+        assert_eq!(entry.role, "user");
+        assert_eq!(entry.sender_id, 99);
+        assert_eq!(entry.occurred_at.unix_timestamp(), 1_710_000_000);
+
+        let payload: Value = serde_json::from_slice(&entry.payload)?;
+        assert_eq!(payload["entry_id"], "msg:77");
+        assert_eq!(payload["text"], "/start hello");
+        assert!(payload.get("original_text").is_none());
+        assert_eq!(payload["meta"]["sender_id"], 99);
+        assert_eq!(payload["meta"]["sender_name"], "Ada");
         Ok(())
     }
 
@@ -543,6 +714,59 @@ mod tests {
     impl StoreStub {
         fn calls(&self) -> Vec<String> {
             self.calls.lock().expect("store calls").clone()
+        }
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct RecordedHistoryUpsert {
+        bucket_day: time::Date,
+        chat_id: i64,
+        thread_id: i32,
+        message_id: i32,
+        entry_id: String,
+        kind: String,
+        role: String,
+        occurred_at: time::OffsetDateTime,
+        sender_id: i64,
+        payload: Vec<u8>,
+    }
+
+    #[derive(Clone, Default)]
+    struct HistoryStoreStub {
+        entries: Arc<Mutex<Vec<RecordedHistoryUpsert>>>,
+    }
+
+    impl HistoryStoreStub {
+        fn entries(&self) -> Vec<RecordedHistoryUpsert> {
+            self.entries.lock().expect("history entries").clone()
+        }
+    }
+
+    impl InboundHistoryStore for HistoryStoreStub {
+        type Error = io::Error;
+
+        fn upsert_inbound_history<'a>(
+            &'a self,
+            entry: InboundHistoryUpsert<'a>,
+        ) -> InboundHistoryStoreFuture<'a, Self::Error> {
+            Box::pin(async move {
+                self.entries
+                    .lock()
+                    .map_err(|err| io::Error::other(err.to_string()))?
+                    .push(RecordedHistoryUpsert {
+                        bucket_day: entry.bucket_day,
+                        chat_id: entry.chat_id,
+                        thread_id: entry.thread_id,
+                        message_id: entry.message_id,
+                        entry_id: entry.entry_id.to_owned(),
+                        kind: entry.kind.to_owned(),
+                        role: entry.role.to_owned(),
+                        occurred_at: entry.occurred_at,
+                        sender_id: entry.sender_id,
+                        payload: entry.payload.to_vec(),
+                    });
+                Ok(())
+            })
         }
     }
 
