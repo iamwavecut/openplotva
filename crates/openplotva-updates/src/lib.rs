@@ -875,7 +875,7 @@ pub fn build_history_text_entry(
         return None;
     }
 
-    let text = text_from_telegram_message(message);
+    let text = fetcher_message_text(message);
     let (text, original_text, meta) = normalize_history_text_payload(&text, original_text, meta);
     if !history_text_entry_has_content(&text, &original_text, &meta) {
         return None;
@@ -1315,11 +1315,38 @@ fn has_mime_prefix(mime_type: &str, prefix: &str) -> bool {
         .is_some_and(|value| value.eq_ignore_ascii_case(prefix))
 }
 
-fn text_from_telegram_message(message: &TelegramMessage) -> String {
-    message
-        .get_text()
-        .map(|text| text.as_ref().trim().to_owned())
-        .unwrap_or_default()
+/// Return the text Go fetcher would place into `Message.Text` before processing.
+#[must_use]
+pub fn fetcher_message_text(message: &TelegramMessage) -> String {
+    if let Some(text) = message.get_text() {
+        return text.as_ref().to_owned();
+    }
+
+    match &message.data {
+        TelegramMessageData::Sticker(sticker) => sticker.emoji.clone().unwrap_or_default(),
+        TelegramMessageData::Audio(audio) => audio_fallback_text(&audio.data),
+        TelegramMessageData::Video(video) => video.data.file_name.clone().unwrap_or_default(),
+        TelegramMessageData::Document(document) => {
+            document.data.file_name.clone().unwrap_or_default()
+        }
+        TelegramMessageData::Contact(contact) => format!(
+            "{} {}",
+            contact.first_name,
+            contact.last_name.as_deref().unwrap_or_default()
+        )
+        .trim()
+        .to_owned(),
+        _ => String::new(),
+    }
+}
+
+fn audio_fallback_text(audio: &carapax::types::Audio) -> String {
+    let performer = audio.performer.as_deref().unwrap_or_default();
+    let title = audio.title.as_deref().unwrap_or_default();
+    if !performer.is_empty() || !title.is_empty() {
+        return format!("{performer} {title}").trim().to_owned();
+    }
+    audio.file_name.clone().unwrap_or_default()
 }
 
 fn normalize_history_text_payload(
@@ -1568,8 +1595,8 @@ mod tests {
         GoUpdateType, RedisUpdateQueue, TelegramMessageAttachmentOptions, UpdateCodecError,
         UpdateConsumerConfig, UpdateProducerQueue, UpdateProducerQueueFuture, UpdateProducerSource,
         UpdateProducerSourceFuture, UpdateStageOutcome, blpop_timeout_arg, extract_update_state,
-        is_allowed_producer_update, process_update_at, producer_update_name, producer_update_type,
-        run_update_producer_until, telegram_message_attachments, update_name,
+        fetcher_message_text, is_allowed_producer_update, process_update_at, producer_update_name,
+        producer_update_type, run_update_producer_until, telegram_message_attachments, update_name,
     };
     use carapax::types::{
         Message as TelegramMessage, Update as TelegramUpdate, UpdateType as TelegramUpdateType,
@@ -2598,6 +2625,66 @@ mod tests {
         assert_eq!(got[0].file_unique_id, "voice-1");
         assert_eq!(got[0].duration_seconds, 7);
         assert_eq!(got[0].caption, "");
+        Ok(())
+    }
+
+    #[test]
+    fn fetcher_message_text_matches_go_fallback_order() -> Result<(), Box<dyn Error>> {
+        let caption_update = serde_json::from_value(json!({
+            "update_id": 1,
+            "message": {
+                "message_id": 77,
+                "date": 1_710_000_000,
+                "chat": sample_private_chat_json(),
+                "from": sample_user_json(),
+                "caption": " photo caption ",
+                "photo": [{"file_id": "small", "file_unique_id": "small-u", "width": 1, "height": 1}]
+            }
+        }))?;
+        assert_eq!(
+            fetcher_message_text(update_message(&caption_update)?),
+            " photo caption "
+        );
+
+        let audio_update = serde_json::from_value(json!({
+            "update_id": 2,
+            "message": {
+                "message_id": 78,
+                "date": 1_710_000_000,
+                "chat": sample_private_chat_json(),
+                "from": sample_user_json(),
+                "audio": {
+                    "file_id": "audio-file",
+                    "file_unique_id": "audio-unique",
+                    "duration": 5,
+                    "performer": " Ada ",
+                    "title": " Theme "
+                }
+            }
+        }))?;
+        assert_eq!(
+            fetcher_message_text(update_message(&audio_update)?),
+            "Ada   Theme"
+        );
+
+        let contact_update = serde_json::from_value(json!({
+            "update_id": 3,
+            "message": {
+                "message_id": 79,
+                "date": 1_710_000_000,
+                "chat": sample_private_chat_json(),
+                "from": sample_user_json(),
+                "contact": {
+                    "phone_number": "+123",
+                    "first_name": "Ada",
+                    "last_name": "Lovelace"
+                }
+            }
+        }))?;
+        assert_eq!(
+            fetcher_message_text(update_message(&contact_update)?),
+            "Ada Lovelace"
+        );
         Ok(())
     }
 

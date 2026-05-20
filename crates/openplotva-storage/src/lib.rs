@@ -4,7 +4,8 @@ use std::time::Duration;
 
 use openplotva_config::{PostgresConfig, RedisConfig};
 use openplotva_core::{
-    ChatSettings, ChatSettingsUpdate, ChatState, MessageIdMapping, PendingOp, UserState,
+    ChatMessageMeta, ChatSettings, ChatSettingsUpdate, ChatState, MessageIdMapping, PendingOp,
+    UserState,
 };
 use redis::{
     Client as RedisClient, ConnectionAddr, ConnectionInfo, IntoConnectionInfo, RedisConnectionInfo,
@@ -592,6 +593,52 @@ impl PostgresHistoryStore {
         Ok(true)
     }
 
+    /// Update the stored message text, original text, and metadata for an edited inbound message.
+    ///
+    /// Returns `false` when Go would silently no-op because the service is missing
+    /// required IDs or no text history row exists.
+    pub async fn update_message_entry(
+        &self,
+        chat_id: i64,
+        message_id: i32,
+        new_text: &str,
+        original_text: &str,
+        meta: &ChatMessageMeta,
+    ) -> Result<bool, StorageError> {
+        if chat_id == 0 || message_id == 0 {
+            return Ok(false);
+        }
+
+        let row = sqlx::query(SQL_SELECT_TEXT_HISTORY_ENTRY)
+            .bind(chat_id)
+            .bind(message_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        let Some(row) = row else {
+            return Ok(false);
+        };
+
+        let bucket_day: time::Date = row.try_get("bucket_day")?;
+        let entry_id: String = row.try_get("entry_id")?;
+        let payload: String = row.try_get("payload")?;
+        let updated_payload = history_text_payload_with_message_update(
+            &payload,
+            new_text,
+            original_text,
+            meta.clone(),
+        )?;
+
+        sqlx::query(SQL_UPDATE_HISTORY_ENTRY_PAYLOAD)
+            .bind(bucket_day)
+            .bind(chat_id)
+            .bind(&entry_id)
+            .bind(&updated_payload)
+            .execute(&self.pool)
+            .await?;
+        self.invalidate_history_cache(chat_id).await?;
+        Ok(true)
+    }
+
     /// Delete stored history entries for one Telegram message ID.
     pub async fn delete_message_entries(
         &self,
@@ -709,6 +756,71 @@ pub fn history_text_payload_with_text(
         );
     }
     serde_json::to_string(&payload).map_err(|source| StorageError::HistoryPayloadCodec { source })
+}
+
+/// Mutate a stored Go history payload the same way `Service.UpdateMessage` changes a text entry.
+pub fn history_text_payload_with_message_update(
+    payload: impl AsRef<[u8]>,
+    new_text: &str,
+    original_text: &str,
+    meta: ChatMessageMeta,
+) -> Result<String, StorageError> {
+    let mut payload: serde_json::Value = serde_json::from_slice(payload.as_ref())
+        .map_err(|source| StorageError::HistoryPayloadCodec { source })?;
+    let object = payload
+        .as_object_mut()
+        .ok_or(StorageError::HistoryPayloadShape)?;
+    let (text, original_text, meta) =
+        normalize_history_message_update(new_text, original_text, meta);
+
+    if text.is_empty() {
+        object.remove("text");
+    } else {
+        object.insert("text".to_owned(), serde_json::Value::String(text));
+    }
+    if original_text.is_empty() {
+        object.remove("original_text");
+    } else {
+        object.insert(
+            "original_text".to_owned(),
+            serde_json::Value::String(original_text),
+        );
+    }
+    object.insert(
+        "meta".to_owned(),
+        serde_json::to_value(meta)
+            .map_err(|source| StorageError::HistoryPayloadCodec { source })?,
+    );
+
+    serde_json::to_string(&payload).map_err(|source| StorageError::HistoryPayloadCodec { source })
+}
+
+fn normalize_history_message_update(
+    text: &str,
+    original_text: &str,
+    mut meta: ChatMessageMeta,
+) -> (String, String, ChatMessageMeta) {
+    let text = text.trim().to_owned();
+    let mut original_text = original_text.trim().to_owned();
+    if original_text == text {
+        original_text.clear();
+    }
+
+    if !text.is_empty() {
+        for attachment in &mut meta.attachments {
+            if attachment.source.trim() != "message" {
+                continue;
+            }
+            if !attachment.caption.trim().is_empty() {
+                attachment.caption.clear();
+            }
+            if attachment.content.trim() == text {
+                attachment.content.clear();
+            }
+        }
+    }
+
+    (text, original_text, meta)
 }
 
 /// Encode a rate-limit expiry as the approved Rust-native Redis JSON value.
@@ -977,6 +1089,62 @@ mod tests {
                 .expect_err("legacy gob values should be rejected after the approved cutover");
 
         assert!(error.to_string().contains("decode rate limit expiry"));
+    }
+
+    #[test]
+    fn history_text_payload_with_message_update_matches_go_normalization()
+    -> Result<(), Box<dyn Error>> {
+        let payload = serde_json::json!({
+            "entry_id": "msg:77",
+            "role": "user",
+            "kind": "text",
+            "timestamp": "2026-05-20T00:00:00Z",
+            "message_id": 77,
+            "date": 1_710_000_000,
+            "chat": {"id": 42, "type": "private"},
+            "text": "old text",
+            "original_text": "old original",
+            "meta": {}
+        });
+        let meta = openplotva_core::ChatMessageMeta {
+            sender_id: 99,
+            attachments: vec![
+                openplotva_core::ChatAttachment {
+                    kind: "image".to_owned(),
+                    source: "message".to_owned(),
+                    caption: " edited text ".to_owned(),
+                    content: "edited text".to_owned(),
+                    ..openplotva_core::ChatAttachment::default()
+                },
+                openplotva_core::ChatAttachment {
+                    kind: "image".to_owned(),
+                    source: "upload".to_owned(),
+                    caption: " keep ".to_owned(),
+                    content: "edited text".to_owned(),
+                    ..openplotva_core::ChatAttachment::default()
+                },
+            ],
+            ..openplotva_core::ChatMessageMeta::default()
+        };
+
+        let updated = super::history_text_payload_with_message_update(
+            payload.to_string(),
+            " edited text ",
+            " edited text ",
+            meta,
+        )?;
+        let updated: serde_json::Value = serde_json::from_str(&updated)?;
+
+        assert_eq!(updated["text"], "edited text");
+        assert!(updated.get("original_text").is_none());
+        assert_eq!(updated["meta"]["sender_id"], 99);
+        assert_eq!(updated["meta"]["attachments"][0]["source"], "message");
+        assert!(updated["meta"]["attachments"][0].get("caption").is_none());
+        assert!(updated["meta"]["attachments"][0].get("content").is_none());
+        assert_eq!(updated["meta"]["attachments"][1]["source"], "upload");
+        assert_eq!(updated["meta"]["attachments"][1]["caption"], " keep ");
+        assert_eq!(updated["meta"]["attachments"][1]["content"], "edited text");
+        Ok(())
     }
 
     #[test]

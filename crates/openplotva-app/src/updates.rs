@@ -12,7 +12,8 @@ use carapax::types::{Update as TelegramUpdate, UpdateType as TelegramUpdateType}
 use openplotva_core::{ChatMessageMeta, ChatState, UserState};
 use openplotva_updates::{
     HistoryTextEntry, UpdateConsumerConfig, UpdateProcessReport, UpdateStageOutcome,
-    build_history_text_entry, extract_update_state, should_skip_side_effects_at,
+    build_history_text_entry, extract_update_state, fetcher_message_text,
+    should_skip_side_effects_at,
 };
 use thiserror::Error;
 use time::{Date, OffsetDateTime};
@@ -31,6 +32,10 @@ pub type UpdateStateStoreFuture<'a, E> = Pin<Box<dyn Future<Output = Result<(), 
 /// Boxed future returned by inbound history storage calls.
 pub type InboundHistoryStoreFuture<'a, E> =
     Pin<Box<dyn Future<Output = Result<(), E>> + Send + 'a>>;
+
+/// Boxed future returned by edited-message history storage calls.
+pub type EditedHistoryStoreFuture<'a, E> =
+    Pin<Box<dyn Future<Output = Result<bool, E>> + Send + 'a>>;
 
 /// Source of decoded Telegram updates for the app-level consumer loop.
 pub trait UpdateSource {
@@ -161,6 +166,46 @@ impl InboundHistoryStore for openplotva_storage::PostgresHistoryStore {
     }
 }
 
+/// Storage capability needed to persist edited Telegram message history updates.
+pub trait EditedHistoryStore {
+    /// Error returned by the concrete history store.
+    type Error: fmt::Display;
+
+    /// Update one existing Go-shaped history entry after a Telegram edited-message update.
+    fn update_edited_message_history<'a>(
+        &'a self,
+        chat_id: i64,
+        message_id: i32,
+        new_text: &'a str,
+        original_text: &'a str,
+        meta: &'a ChatMessageMeta,
+    ) -> EditedHistoryStoreFuture<'a, Self::Error>;
+}
+
+impl EditedHistoryStore for openplotva_storage::PostgresHistoryStore {
+    type Error = openplotva_storage::StorageError;
+
+    fn update_edited_message_history<'a>(
+        &'a self,
+        chat_id: i64,
+        message_id: i32,
+        new_text: &'a str,
+        original_text: &'a str,
+        meta: &'a ChatMessageMeta,
+    ) -> EditedHistoryStoreFuture<'a, Self::Error> {
+        Box::pin(
+            openplotva_storage::PostgresHistoryStore::update_message_entry(
+                self,
+                chat_id,
+                message_id,
+                new_text,
+                original_text,
+                meta,
+            ),
+        )
+    }
+}
+
 /// Report for the Go consumer state-persistence stage.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct UpdateStatePersistenceReport {
@@ -239,6 +284,24 @@ pub enum InboundMessageHistoryError {
     },
 }
 
+/// Report for edited Telegram history persistence.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct EditedMessageHistoryReport {
+    /// Whether an existing history entry was found and updated.
+    pub entry_updated: bool,
+}
+
+/// Error returned while persisting edited message history.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum EditedMessageHistoryError {
+    /// History entry update failed.
+    #[error("update edited message history: {message}")]
+    Update {
+        /// Display form of the storage error.
+        message: String,
+    },
+}
+
 /// Build and persist the Go-shaped history entry for one inbound Telegram message update.
 pub async fn persist_inbound_message_history<S>(
     store: &S,
@@ -267,6 +330,37 @@ where
     Ok(InboundMessageHistoryReport {
         entry_persisted: true,
     })
+}
+
+/// Persist the Go-shaped history update for one inbound Telegram edited-message update.
+pub async fn persist_edited_message_history<S>(
+    store: &S,
+    update: &TelegramUpdate,
+    original_text: &str,
+    meta: ChatMessageMeta,
+) -> Result<EditedMessageHistoryReport, EditedMessageHistoryError>
+where
+    S: EditedHistoryStore + Sync,
+{
+    let TelegramUpdateType::EditedMessage(message) = &update.update_type else {
+        return Ok(EditedMessageHistoryReport::default());
+    };
+    let chat_id = message.chat.get_id().into();
+    if chat_id == 0 {
+        return Ok(EditedMessageHistoryReport::default());
+    }
+    let Ok(message_id) = i32::try_from(message.id) else {
+        return Ok(EditedMessageHistoryReport::default());
+    };
+    let new_text = fetcher_message_text(message);
+    let entry_updated = store
+        .update_edited_message_history(chat_id, message_id, &new_text, original_text, &meta)
+        .await
+        .map_err(|error| EditedMessageHistoryError::Update {
+            message: error.to_string(),
+        })?;
+
+    Ok(EditedMessageHistoryReport { entry_updated })
 }
 
 /// Process one decoded update with app-owned state persistence and an injected handler.
@@ -474,16 +568,16 @@ mod tests {
     };
 
     use carapax::types::Update as TelegramUpdate;
-    use openplotva_core::{ChatMessageMeta, ChatState, UserState};
+    use openplotva_core::{ChatAttachment, ChatMessageMeta, ChatState, UserState};
     use openplotva_updates::{UpdateConsumerConfig, UpdateStageOutcome};
     use serde_json::{Value, json};
     use tokio::sync::Notify;
 
     use super::{
-        InboundHistoryStore, InboundHistoryStoreFuture, InboundHistoryUpsert, UpdateHandler,
-        UpdateHandlerFuture, UpdateSource, UpdateSourceFuture, UpdateStateStore,
-        UpdateStateStoreFuture, persist_update_state, process_update_with_state_store_at,
-        run_update_consumer_until,
+        EditedHistoryStore, EditedHistoryStoreFuture, InboundHistoryStore,
+        InboundHistoryStoreFuture, InboundHistoryUpsert, UpdateHandler, UpdateHandlerFuture,
+        UpdateSource, UpdateSourceFuture, UpdateStateStore, UpdateStateStoreFuture,
+        persist_update_state, process_update_with_state_store_at, run_update_consumer_until,
     };
 
     #[tokio::test]
@@ -552,6 +646,45 @@ mod tests {
         assert!(payload.get("original_text").is_none());
         assert_eq!(payload["meta"]["sender_id"], 99);
         assert_eq!(payload["meta"]["sender_name"], "Ada");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn persist_edited_message_history_updates_existing_go_entry() -> Result<(), Box<dyn Error>>
+    {
+        let store = HistoryStoreStub::default();
+        let meta = ChatMessageMeta {
+            sender_id: 99,
+            attachments: vec![ChatAttachment {
+                kind: "image".to_owned(),
+                source: "message".to_owned(),
+                caption: " edited text ".to_owned(),
+                content: "edited text".to_owned(),
+                ..ChatAttachment::default()
+            }],
+            ..ChatMessageMeta::default()
+        };
+
+        let report = super::persist_edited_message_history(
+            &store,
+            &sample_edited_message_update()?,
+            " original edit ",
+            meta.clone(),
+        )
+        .await?;
+
+        assert!(report.entry_updated);
+        assert!(store.entries().is_empty());
+        assert_eq!(
+            store.edits(),
+            vec![RecordedHistoryEdit {
+                chat_id: 42,
+                message_id: 77,
+                new_text: " edited text ".to_owned(),
+                original_text: " original edit ".to_owned(),
+                meta,
+            }]
+        );
         Ok(())
     }
 
@@ -734,12 +867,26 @@ mod tests {
     #[derive(Clone, Default)]
     struct HistoryStoreStub {
         entries: Arc<Mutex<Vec<RecordedHistoryUpsert>>>,
+        edits: Arc<Mutex<Vec<RecordedHistoryEdit>>>,
     }
 
     impl HistoryStoreStub {
         fn entries(&self) -> Vec<RecordedHistoryUpsert> {
             self.entries.lock().expect("history entries").clone()
         }
+
+        fn edits(&self) -> Vec<RecordedHistoryEdit> {
+            self.edits.lock().expect("history edits").clone()
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct RecordedHistoryEdit {
+        chat_id: i64,
+        message_id: i32,
+        new_text: String,
+        original_text: String,
+        meta: ChatMessageMeta,
     }
 
     impl InboundHistoryStore for HistoryStoreStub {
@@ -766,6 +913,33 @@ mod tests {
                         payload: entry.payload.to_vec(),
                     });
                 Ok(())
+            })
+        }
+    }
+
+    impl EditedHistoryStore for HistoryStoreStub {
+        type Error = io::Error;
+
+        fn update_edited_message_history<'a>(
+            &'a self,
+            chat_id: i64,
+            message_id: i32,
+            new_text: &'a str,
+            original_text: &'a str,
+            meta: &'a ChatMessageMeta,
+        ) -> EditedHistoryStoreFuture<'a, Self::Error> {
+            Box::pin(async move {
+                self.edits
+                    .lock()
+                    .map_err(|err| io::Error::other(err.to_string()))?
+                    .push(RecordedHistoryEdit {
+                        chat_id,
+                        message_id,
+                        new_text: new_text.to_owned(),
+                        original_text: original_text.to_owned(),
+                        meta: meta.clone(),
+                    });
+                Ok(true)
             })
         }
     }
@@ -923,6 +1097,30 @@ mod tests {
                     "username": "ada_l"
                 },
                 "text": "/start hello"
+            }
+        }))
+    }
+
+    fn sample_edited_message_update() -> Result<TelegramUpdate, serde_json::Error> {
+        serde_json::from_value(json!({
+            "update_id": 12346,
+            "edited_message": {
+                "message_id": 77,
+                "date": 1_710_000_000,
+                "edit_date": 1_710_000_010,
+                "chat": {
+                    "id": 42,
+                    "type": "private",
+                    "first_name": "Ada",
+                    "username": "ada_l"
+                },
+                "from": {
+                    "id": 99,
+                    "is_bot": false,
+                    "first_name": "Ada",
+                    "username": "ada_l"
+                },
+                "text": " edited text "
             }
         }))
     }
