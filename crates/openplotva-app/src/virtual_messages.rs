@@ -5,18 +5,18 @@ use std::{fmt, future::Future, pin::Pin};
 use openplotva_core::{MessageIdMapping, ReadyPendingOp};
 use openplotva_telegram::{
     AudioMessageRequest, DispatcherMessage, DispatcherQueue, DispatcherSendStatus,
-    DispatcherWorkItem, EditMediaMessageRequest, EnqueueOutcome, MediaGroupMessageRequest,
-    MediaGroupPhotoItem, MessageFingerprint, OutboundBuildError, PENDING_OP_DELETE,
-    PENDING_OP_EDIT, PendingOpBuildError, PhotoMessageRequest, ReplyMessageRef,
+    DispatcherWorkItem, EditMediaMessageRequest, EditTextMessageRequest, EnqueueOutcome,
+    MediaGroupMessageRequest, MediaGroupPhotoItem, MessageFingerprint, OutboundBuildError,
+    PENDING_OP_DELETE, PENDING_OP_EDIT, PendingOpBuildError, PhotoMessageRequest, ReplyMessageRef,
     StickerMessageRequest, TELEGRAM_TEXT_MAX_BYTES, TelegramOutboundMethod,
     TelegramOutboundResponse, TextMessageRequest, build_audio_message_method,
     build_audio_message_plan, build_edit_media_message_method, build_edit_media_message_plan,
-    build_media_group_message_method, build_media_group_message_plan, build_pending_op_method,
-    build_photo_message_method, build_photo_message_plan, build_sticker_message_method,
-    build_sticker_message_plan, build_text_message_method, fingerprint_audio_message_plan,
-    fingerprint_photo_message_plan, fingerprint_sticker_message_plan,
-    fingerprint_text_message_part, forum_thread_id, hash_content, message_target_chat,
-    split_telegram_text, validate_text_message_text,
+    build_edit_text_message_method, build_media_group_message_method,
+    build_media_group_message_plan, build_pending_op_method, build_photo_message_method,
+    build_photo_message_plan, build_sticker_message_method, build_sticker_message_plan,
+    build_text_message_method, fingerprint_audio_message_plan, fingerprint_photo_message_plan,
+    fingerprint_sticker_message_plan, fingerprint_text_message_part, forum_thread_id, hash_content,
+    message_target_chat, split_telegram_text, validate_text_message_text,
 };
 use serde_json::json;
 use thiserror::Error;
@@ -236,6 +236,16 @@ pub struct QueueStickerRequest<'a> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+pub struct QueueEditTextRequest<'a> {
+    /// Telegram edit-text request fields.
+    pub message: &'a EditTextMessageRequest,
+    /// Whether the edit should enter the immediate queue.
+    pub immediate: bool,
+    /// Whether Go `TextMessage.BypassChatRestrictions` was set at enqueue time.
+    pub bypass_chat_restrictions: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct QueuePhotoRequest<'a> {
     /// Telegram photo request fields.
     pub message: &'a PhotoMessageRequest,
@@ -313,6 +323,14 @@ pub struct QueuePhotoReport {
 pub struct QueueAudioReport {
     pub enqueue_outcome: EnqueueOutcome,
     /// Whether this audio went to the immediate queue.
+    pub immediate: bool,
+}
+
+/// Summary of queueing one Go direct `EditText` call.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QueueEditTextReport {
+    pub enqueue_outcome: EnqueueOutcome,
+    /// Whether this edit went to the immediate queue.
     pub immediate: bool,
 }
 
@@ -519,6 +537,24 @@ pub fn queue_audio_message(
     })
 }
 
+/// Queue one edit-text call like Go `EditText` without virtual-message mapping.
+pub fn queue_edit_text_message(
+    queue: &DispatcherQueue,
+    req: QueueEditTextRequest<'_>,
+) -> Result<QueueEditTextReport, OutboundBuildError> {
+    let method = build_edit_text_message_method(req.message)?;
+    let dispatcher_message =
+        DispatcherMessage::new(edit_text_identity_fingerprint(req.message), "")
+            .with_method(TelegramOutboundMethod::from(method))
+            .with_bypass_chat_restrictions(req.bypass_chat_restrictions);
+    let enqueue_outcome = queue.enqueue(dispatcher_message, req.immediate);
+
+    Ok(QueueEditTextReport {
+        enqueue_outcome,
+        immediate: req.immediate,
+    })
+}
+
 /// Queue one media group like a Go direct `SendMediaGroup(api.MediaGroupConfig)` path.
 pub fn queue_media_group_message(
     queue: &DispatcherQueue,
@@ -585,6 +621,23 @@ fn edit_media_identity_fingerprint(req: &EditMediaMessageRequest) -> MessageFing
         std::any::type_name::<EditMediaMessageRequest>(),
         req.message_id,
         &req.media as *const MediaGroupPhotoItem
+    );
+    MessageFingerprint {
+        chat_id: req.chat.id,
+        message_type: "unknown".to_owned(),
+        content_hash: hash_content(&content),
+        debounce_key: None,
+    }
+}
+
+fn edit_text_identity_fingerprint(req: &EditTextMessageRequest) -> MessageFingerprint {
+    let content = format!(
+        "{}:{}:{}:{}:{:?}",
+        std::any::type_name::<EditTextMessageRequest>(),
+        req.message_id,
+        req.text,
+        req.render_as,
+        req.reply_markup
     );
     MessageFingerprint {
         chat_id: req.chat.id,
@@ -864,11 +917,12 @@ mod tests {
     use openplotva_core::MessageIdMapping;
     use openplotva_telegram::{
         AudioMessageRequest, AudioSource, ChatRef, DispatcherConfig, DispatcherMessage,
-        DispatcherQueue, DispatcherSendStatus, EditMediaMessageRequest, EnqueueOutcome,
-        MediaGroupMessageRequest, MediaGroupPhotoItem, PhotoMessageRequest, PhotoSource,
-        ReplyMessageRef, TELEGRAM_PARSE_MODE_HTML, TelegramMessage, TelegramOutboundMethod,
-        TelegramOutboundMethodKind, TelegramOutboundResponse, TextMessageRequest,
-        build_text_message_method, fingerprint_text_message_part, persistent_queue_from_drain,
+        DispatcherQueue, DispatcherSendStatus, EditMediaMessageRequest, EditTextMessageRequest,
+        EnqueueOutcome, MediaGroupMessageRequest, MediaGroupPhotoItem, PhotoMessageRequest,
+        PhotoSource, ReplyMessageRef, TELEGRAM_PARSE_MODE_HTML, TelegramMessage,
+        TelegramOutboundMethod, TelegramOutboundMethodKind, TelegramOutboundResponse,
+        TextMessageRequest, build_text_message_method, fingerprint_text_message_part,
+        persistent_queue_from_drain,
     };
     use serde_json::json;
 
@@ -876,12 +930,12 @@ mod tests {
 
     use super::{
         PENDING_OP_DELETE, PENDING_OP_EDIT, QueueAudioRequest, QueueEditMediaRequest,
-        QueueMediaGroupRequest, QueuePhotoRequest, QueueStickerRequest, QueueTextRequest,
-        VirtualDeleteRequest, VirtualEditRequest, VirtualMessageAction, VirtualMessageError,
-        VirtualMessageReport, VirtualMessageStore, delete_message_virtual, edit_text_virtual,
-        queue_audio_message, queue_edit_media_message, queue_media_group_message,
-        queue_photo_message, queue_sticker_message, queue_text_message_parts,
-        send_work_item_and_resolve,
+        QueueEditTextRequest, QueueMediaGroupRequest, QueuePhotoRequest, QueueStickerRequest,
+        QueueTextRequest, VirtualDeleteRequest, VirtualEditRequest, VirtualMessageAction,
+        VirtualMessageError, VirtualMessageReport, VirtualMessageStore, delete_message_virtual,
+        edit_text_virtual, queue_audio_message, queue_edit_media_message, queue_edit_text_message,
+        queue_media_group_message, queue_photo_message, queue_sticker_message,
+        queue_text_message_parts, send_work_item_and_resolve,
     };
 
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1505,6 +1559,67 @@ mod tests {
         assert_eq!(payload["Media"]["caption"], "<b>done</b>");
         assert_eq!(payload["Media"]["parse_mode"], TELEGRAM_PARSE_MODE_HTML);
         assert_eq!(payload["Media"]["has_spoiler"], true);
+
+        Ok(())
+    }
+
+    #[test]
+    fn queue_edit_text_message_enqueues_direct_edit_without_virtual_mapping_and_keeps_persistence()
+    -> Result<(), Box<dyn Error>> {
+        let queue = DispatcherQueue::new(DispatcherConfig::default());
+        let request = EditTextMessageRequest {
+            chat: ChatRef {
+                id: 42,
+                is_forum: false,
+            },
+            message_id: 99,
+            text: "<b>updated</b>".to_owned(),
+            render_as: TELEGRAM_PARSE_MODE_HTML.to_owned(),
+            reply_markup: None,
+        };
+
+        let report = queue_edit_text_message(
+            &queue,
+            QueueEditTextRequest {
+                message: &request,
+                immediate: true,
+                bypass_chat_restrictions: true,
+            },
+        )?;
+
+        assert_eq!(report.enqueue_outcome, EnqueueOutcome::Enqueued);
+        assert!(report.immediate);
+        let item = queue.dequeue_immediate().expect("queued edit item");
+        assert_eq!(item.metadata().virtual_id, "");
+        assert!(item.metadata().fingerprint_key.starts_with("42:unknown:"));
+        assert!(item.bypasses_chat_restrictions());
+        let (_, method, _) = item.into_persistence_parts();
+        assert_eq!(
+            method.as_ref().map(TelegramOutboundMethod::kind),
+            Some(TelegramOutboundMethodKind::EditMessageText)
+        );
+
+        let queue = DispatcherQueue::new(DispatcherConfig::default());
+        let _ = queue_edit_text_message(
+            &queue,
+            QueueEditTextRequest {
+                message: &request,
+                immediate: false,
+                bypass_chat_restrictions: false,
+            },
+        )?;
+        let persisted = persistent_queue_from_drain(queue.drain_for_shutdown(), 100)?;
+        assert_eq!(persisted.skipped, 0);
+        assert_eq!(persisted.items.len(), 1);
+        let item = &persisted.items[0];
+        assert_eq!(item.message_type, "*api.EditMessageTextConfig");
+        assert_eq!(item.virtual_id, "");
+        assert_eq!(item.chat_id, 42);
+        let payload: serde_json::Value = serde_json::from_slice(&item.message)?;
+        assert_eq!(payload["chat_id"], 42);
+        assert_eq!(payload["message_id"], 99);
+        assert_eq!(payload["text"], "<b>updated</b>");
+        assert_eq!(payload["parse_mode"], TELEGRAM_PARSE_MODE_HTML);
 
         Ok(())
     }
