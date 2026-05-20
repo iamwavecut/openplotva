@@ -21,8 +21,8 @@ use axum::{
 use openplotva_config::AppConfig;
 use openplotva_server::{ReadinessCheck, ReadinessResponse};
 use openplotva_storage::{
-    PostgresChatSettingsStore, PostgresHistoryStore, PostgresVirtualMessageStore,
-    RedisRateLimitStore, ServiceClients,
+    PostgresChatSettingsStore, PostgresHistoryStore, PostgresPaymentStore, PostgresVipStore,
+    PostgresVirtualMessageStore, RedisRateLimitStore, ServiceClients,
 };
 use serde::Deserialize;
 use thiserror::Error;
@@ -618,6 +618,10 @@ async fn start_runtime_workers(
             "telegram_commands",
             "OPENPLOTVA_CONNECT_SERVICES=false",
         ));
+        readiness_checks.push(ReadinessCheck::skipped(
+            "payment_control_jobs",
+            "OPENPLOTVA_CONNECT_SERVICES=false",
+        ));
         return Ok(RuntimeWorkers::default());
     };
 
@@ -637,6 +641,10 @@ async fn start_runtime_workers(
         ));
         readiness_checks.push(ReadinessCheck::skipped(
             "telegram_commands",
+            "BOT_KEY is not set",
+        ));
+        readiness_checks.push(ReadinessCheck::skipped(
+            "payment_control_jobs",
             "BOT_KEY is not set",
         ));
         return Ok(RuntimeWorkers::default());
@@ -698,6 +706,37 @@ async fn start_runtime_workers(
         dispatcher: None,
         webhook_route: None,
     };
+
+    let payment_store = payments::PostgresSuccessfulPaymentStore::new(
+        store.clone(),
+        PostgresPaymentStore::new(service_clients.postgres.clone()),
+        PostgresVipStore::new(service_clients.postgres.clone()),
+    );
+    let payment_successful_effects = payments::SuccessfulPaymentDispatcherEffects::new(
+        store.clone(),
+        Arc::clone(&dispatcher_queue),
+        payments::NoopVipCacheInvalidator,
+    );
+    let payment_effects =
+        payments::PaymentRuntimeEffects::new(telegram.clone(), payment_successful_effects);
+    let payment_queue = payments::InMemoryPaymentControlJobQueue::new();
+    let payment_stop = stop.subscribe();
+    let payment_worker = tokio::spawn(async move {
+        let report = payments::run_payment_control_job_worker_until(
+            &payment_queue,
+            &payment_store,
+            &payment_effects,
+            wait_for_runtime_stop(payment_stop),
+        )
+        .await;
+
+        tracing::info!(?report, "payment control-job worker stopped");
+    });
+    readiness_checks.push(ReadinessCheck::ok(
+        "payment_control_jobs",
+        "payment control-job worker started",
+    ));
+    workers.handles.push(payment_worker);
 
     let pending_store = store.clone();
     let pending_history = history_store.clone();

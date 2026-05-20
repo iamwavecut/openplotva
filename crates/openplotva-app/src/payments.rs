@@ -1175,6 +1175,84 @@ where
     }
 }
 
+/// Runtime payment side effects composed from direct Telegram invoice effects and dispatcher-backed
+/// successful-payment effects.
+#[derive(Clone)]
+pub struct PaymentRuntimeEffects<Invoice, Successful> {
+    invoice: Invoice,
+    successful: Successful,
+}
+
+impl<Invoice, Successful> PaymentRuntimeEffects<Invoice, Successful> {
+    /// Build a payment runtime effects adapter from the two concrete effect boundaries.
+    #[must_use]
+    pub fn new(invoice: Invoice, successful: Successful) -> Self {
+        Self {
+            invoice,
+            successful,
+        }
+    }
+}
+
+impl<Invoice, Successful> PaymentInvoiceEffects for PaymentRuntimeEffects<Invoice, Successful>
+where
+    Invoice: PaymentInvoiceEffects + Sync,
+    Successful: Sync,
+{
+    type Error = Invoice::Error;
+
+    fn create_subscription_invoice_link<'a>(
+        &'a self,
+        request: &'a openplotva_telegram::SubscriptionInvoiceLinkRequest,
+    ) -> PaymentInvoiceLinkFuture<'a, Self::Error> {
+        self.invoice.create_subscription_invoice_link(request)
+    }
+
+    fn create_donation_invoice_link<'a>(
+        &'a self,
+        request: &'a openplotva_telegram::DonationInvoiceLinkRequest,
+    ) -> PaymentInvoiceLinkFuture<'a, Self::Error> {
+        self.invoice.create_donation_invoice_link(request)
+    }
+
+    fn send_invoice_button_message<'a>(
+        &'a self,
+        message: InvoiceButtonMessage,
+    ) -> PaymentEffectsFuture<'a, Self::Error> {
+        self.invoice.send_invoice_button_message(message)
+    }
+
+    fn send_invoice_error_text<'a>(
+        &'a self,
+        chat_id: i64,
+        reply_to_message_id: i32,
+        text: &'a str,
+        parse_mode: &'a str,
+    ) -> PaymentEffectsFuture<'a, Self::Error> {
+        self.invoice
+            .send_invoice_error_text(chat_id, reply_to_message_id, text, parse_mode)
+    }
+}
+
+impl<Invoice, Successful> SuccessfulPaymentEffects for PaymentRuntimeEffects<Invoice, Successful>
+where
+    Invoice: Sync,
+    Successful: SuccessfulPaymentEffects + Sync,
+{
+    type Error = Successful::Error;
+
+    fn send_text<'a>(
+        &'a self,
+        message: PaymentTextMessage<'a>,
+    ) -> PaymentEffectsFuture<'a, Self::Error> {
+        self.successful.send_text(message)
+    }
+
+    fn invalidate_vip_cache<'a>(&'a self, user_id: i64) -> PaymentEffectsFuture<'a, Self::Error> {
+        self.successful.invalidate_vip_cache(user_id)
+    }
+}
+
 fn monotonic_payment_virtual_id_factory() -> PaymentVirtualIdFactory {
     let next_id = Arc::new(AtomicU64::new(1));
     let process_id = std::process::id();
@@ -3199,11 +3277,12 @@ mod tests {
         PaymentControlJobQueue, PaymentControlJobQueueFuture, PaymentControlJobReport,
         PaymentControlJobWorkItem, PaymentControlJobWorkerFuture, PaymentControlJobWorkerQueue,
         PaymentEffectsFuture, PaymentInvoiceCommandUpdateRoute, PaymentInvoiceControlJobBuild,
-        PaymentInvoiceEffects, PaymentInvoiceLinkFuture, PaymentStoreFuture, PaymentTextMessage,
-        PaymentUpdateHandler, PaymentUpdateRoute, PreCheckoutOutcome, PreCheckoutPaymentEffects,
-        PreCheckoutUpdateRoute, SuccessfulPayment, SuccessfulPaymentControlJobUpdateRoute,
-        SuccessfulPaymentDispatcherEffects, SuccessfulPaymentEffects, SuccessfulPaymentMessage,
-        SuccessfulPaymentOutcome, SuccessfulPaymentStore, SuccessfulPaymentUpdateRoute,
+        PaymentInvoiceEffects, PaymentInvoiceLinkFuture, PaymentRuntimeEffects, PaymentStoreFuture,
+        PaymentTextMessage, PaymentUpdateHandler, PaymentUpdateRoute, PreCheckoutOutcome,
+        PreCheckoutPaymentEffects, PreCheckoutUpdateRoute, SuccessfulPayment,
+        SuccessfulPaymentControlJobUpdateRoute, SuccessfulPaymentDispatcherEffects,
+        SuccessfulPaymentEffects, SuccessfulPaymentMessage, SuccessfulPaymentOutcome,
+        SuccessfulPaymentStore, SuccessfulPaymentUpdateRoute,
         encode_payment_control_job_queue_snapshot,
         enqueue_payment_invoice_command_update_or_else_at,
         enqueue_payment_invoice_command_update_with_vip_status_or_else_at,
@@ -4804,6 +4883,67 @@ mod tests {
             )]
         );
         assert!(effects.invoice_messages().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn payment_runtime_effects_keep_invoice_and_successful_payment_sides_separate()
+    -> Result<(), Box<dyn Error>> {
+        let invoice_effects =
+            EffectsStub::default().with_next_invoice_url("https://t.me/invoice-vip");
+        let successful_payment_effects = EffectsStub::default();
+        let effects =
+            PaymentRuntimeEffects::new(invoice_effects.clone(), successful_payment_effects.clone());
+
+        let invoice_url = effects
+            .create_subscription_invoice_link(
+                &openplotva_telegram::SubscriptionInvoiceLinkRequest {
+                    user_id: 42,
+                    user_name: "alice".to_owned(),
+                    amount_stars: 300,
+                },
+            )
+            .await?;
+        effects
+            .send_invoice_button_message(InvoiceButtonMessage {
+                chat_id: 1000,
+                text: expected_subscription_invoice_message_text(),
+                button_text: "💎 Оформить VIP подписку".to_owned(),
+                url: invoice_url,
+                parse_mode: "HTML".to_owned(),
+            })
+            .await?;
+        effects
+            .send_text(PaymentTextMessage {
+                chat_id: 1000,
+                reply_to_message_id: 77,
+                text: "Спасибо за поддержку!",
+                parse_mode: "HTML",
+            })
+            .await?;
+        effects.invalidate_vip_cache(42).await?;
+
+        assert_eq!(
+            invoice_effects.subscription_invoice_requests(),
+            vec![openplotva_telegram::SubscriptionInvoiceLinkRequest {
+                user_id: 42,
+                user_name: "alice".to_owned(),
+                amount_stars: 300,
+            }]
+        );
+        assert_eq!(invoice_effects.invoice_messages().len(), 1);
+        assert!(invoice_effects.sent_payment_texts().is_empty());
+        assert_eq!(
+            successful_payment_effects.sent_payment_texts(),
+            vec![SentPaymentText {
+                chat_id: 1000,
+                reply_to_message_id: 77,
+                text: "Спасибо за поддержку!".to_owned(),
+                parse_mode: "HTML".to_owned(),
+            }]
+        );
+        assert_eq!(successful_payment_effects.invalidated_vip_users(), vec![42]);
+        assert!(successful_payment_effects.invoice_messages().is_empty());
         Ok(())
     }
 
