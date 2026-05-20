@@ -472,6 +472,30 @@ pub trait SuccessfulPaymentStore {
     }
 }
 
+/// Storage boundary needed by Go `buildVIPStatusView`.
+pub trait VipStatusStore {
+    /// Error returned by the concrete storage implementation.
+    type Error: fmt::Display + Send + Sync + 'static;
+
+    /// Load the latest VIP ledger summary for a user.
+    fn get_vip_summary_by_user<'a>(
+        &'a self,
+        user_id: i64,
+    ) -> PaymentStoreFuture<'a, Option<VipSummaryRecord>, Self::Error>;
+
+    /// Load the current active, non-canceled, non-refunded paid subscription for a user.
+    fn get_active_subscription<'a>(
+        &'a self,
+        user_id: i64,
+    ) -> PaymentStoreFuture<'a, Option<SubscriptionRecord>, Self::Error>;
+
+    /// Load the external VIP cache row for a user.
+    fn get_vip_cache<'a>(
+        &'a self,
+        user_id: i64,
+    ) -> PaymentStoreFuture<'a, Option<VipCacheRecord>, Self::Error>;
+}
+
 /// Side-effect boundary for Go successful-payment processing.
 pub trait SuccessfulPaymentEffects {
     /// Error returned by the concrete side-effect implementation.
@@ -900,6 +924,43 @@ pub fn external_vip_status_message_if_active_at(
     })
 }
 
+/// Build Go `buildVIPStatusView` from storage, preserving lookup order and active checks.
+pub async fn build_vip_status_message_at<Store>(
+    store: &Store,
+    user_id: i64,
+    chat_id: i64,
+    reply_to_message_id: i32,
+    message_thread_id: Option<i32>,
+    now: OffsetDateTime,
+) -> Result<Option<VipStatusMessage>, Store::Error>
+where
+    Store: VipStatusStore + Sync,
+{
+    if let Some(summary) = store.get_vip_summary_by_user(user_id).await?
+        && summary.is_active
+        && now < summary.effective_expires_at
+    {
+        let active_subscription = store.get_active_subscription(user_id).await?;
+        return Ok(Some(active_vip_status_message_at(
+            &summary,
+            active_subscription.as_ref(),
+            chat_id,
+            reply_to_message_id,
+            message_thread_id,
+            now,
+        )));
+    }
+
+    let vip_cache = store.get_vip_cache(user_id).await?;
+    Ok(external_vip_status_message_if_active_at(
+        vip_cache.as_ref(),
+        chat_id,
+        reply_to_message_id,
+        message_thread_id,
+        now,
+    ))
+}
+
 /// Build the direct HTML `sendMessage` used by Go existing-VIP status replies.
 pub fn vip_status_send_message_method(
     message: &VipStatusMessage,
@@ -1131,6 +1192,31 @@ impl SuccessfulPaymentStore for PostgresSuccessfulPaymentStore {
 
     fn is_duplicate_insert_no_row(error: &Self::Error) -> bool {
         error.is_row_not_found()
+    }
+}
+
+impl VipStatusStore for PostgresSuccessfulPaymentStore {
+    type Error = StorageError;
+
+    fn get_vip_summary_by_user<'a>(
+        &'a self,
+        user_id: i64,
+    ) -> PaymentStoreFuture<'a, Option<VipSummaryRecord>, Self::Error> {
+        Box::pin(async move { self.vip.get_vip_summary_by_user(user_id).await })
+    }
+
+    fn get_active_subscription<'a>(
+        &'a self,
+        user_id: i64,
+    ) -> PaymentStoreFuture<'a, Option<SubscriptionRecord>, Self::Error> {
+        Box::pin(async move { self.payments.get_active_subscription(user_id).await })
+    }
+
+    fn get_vip_cache<'a>(
+        &'a self,
+        user_id: i64,
+    ) -> PaymentStoreFuture<'a, Option<VipCacheRecord>, Self::Error> {
+        Box::pin(async move { self.vip.get_vip_cache(user_id).await })
     }
 }
 
@@ -3338,6 +3424,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn build_vip_status_message_uses_active_summary_before_external_cache()
+    -> Result<(), Box<dyn Error>> {
+        let now = time::Date::from_calendar_date(2026, time::Month::June, 16)?
+            .with_hms(9, 30, 0)?
+            .assume_utc();
+        let store = VipStatusStoreStub::new()
+            .with_summary(active_vip_summary(now, now + time::Duration::days(3)))
+            .with_active_subscription(active_subscription(now, now + time::Duration::days(3)))
+            .with_cache(active_vip_cache(now, now + time::Duration::days(5)));
+
+        let message = super::build_vip_status_message_at(&store, 42, -10042, 555, Some(77), now)
+            .await?
+            .expect("active summary should build a status message");
+
+        assert!(message.text.contains("У вас уже есть активный VIP статус"));
+        assert!(message.show_cancel_button);
+        assert_eq!(
+            store.calls(),
+            vec!["get_vip_summary_by_user", "get_active_subscription"]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn build_vip_status_message_falls_back_to_external_cache_after_inactive_summary()
+    -> Result<(), Box<dyn Error>> {
+        let now = time::Date::from_calendar_date(2026, time::Month::June, 16)?
+            .with_hms(9, 30, 0)?
+            .assume_utc();
+        let mut inactive_summary = active_vip_summary(now, now + time::Duration::days(3));
+        inactive_summary.is_active = false;
+        let store = VipStatusStoreStub::new()
+            .with_summary(inactive_summary)
+            .with_active_subscription(active_subscription(now, now + time::Duration::days(3)))
+            .with_cache(active_vip_cache(now, now + time::Duration::days(5)));
+
+        let message = super::build_vip_status_message_at(&store, 42, -10042, 555, None, now)
+            .await?
+            .expect("active external cache should build a status message");
+
+        assert!(
+            message
+                .text
+                .contains("Доступ подтверждён через внешний источник")
+        );
+        assert!(!message.show_cancel_button);
+        assert_eq!(
+            store.calls(),
+            vec!["get_vip_summary_by_user", "get_vip_cache"]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn successful_payment_update_wrapper_delegates_non_payment_messages()
     -> Result<(), Box<dyn Error>> {
         let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
@@ -4120,6 +4260,131 @@ mod tests {
                 "invoice_payload": "subscription_42"
             }
         }))
+    }
+
+    fn active_vip_summary(
+        created_at: OffsetDateTime,
+        expires_at: OffsetDateTime,
+    ) -> VipSummaryRecord {
+        VipSummaryRecord {
+            latest_event_id: 77,
+            user_id: 42,
+            latest_event_type: VIP_EVENT_TYPE_PAYMENT.to_owned(),
+            latest_delta_seconds: vip_days_to_seconds(30),
+            effective_expires_at: expires_at,
+            is_active: true,
+            remaining_seconds: (expires_at - created_at).whole_seconds(),
+            latest_subscription_id: Some(10),
+            latest_actor_user_id: None,
+            latest_reason: "payment telegram-charge".to_owned(),
+            latest_created_at: created_at,
+        }
+    }
+
+    fn active_subscription(
+        created_at: OffsetDateTime,
+        expires_at: OffsetDateTime,
+    ) -> SubscriptionRecord {
+        SubscriptionRecord {
+            id: 10,
+            user_id: 42,
+            telegram_payment_charge_id: "telegram-charge".to_owned(),
+            provider_payment_charge_id: String::new(),
+            expires_at,
+            created_at,
+            updated_at: created_at,
+            canceled_at: None,
+            refunded_at: None,
+        }
+    }
+
+    fn active_vip_cache(created_at: OffsetDateTime, expires_at: OffsetDateTime) -> VipCacheRecord {
+        VipCacheRecord {
+            user_id: 42,
+            is_vip: true,
+            expires_at,
+            created_at,
+            updated_at: created_at,
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct VipStatusStoreStub {
+        state: Arc<Mutex<VipStatusStoreState>>,
+    }
+
+    #[derive(Default)]
+    struct VipStatusStoreState {
+        summary: Option<VipSummaryRecord>,
+        active_subscription: Option<SubscriptionRecord>,
+        cache: Option<VipCacheRecord>,
+        calls: Vec<&'static str>,
+    }
+
+    impl VipStatusStoreStub {
+        fn new() -> Self {
+            Self::default()
+        }
+
+        fn with_summary(self, summary: VipSummaryRecord) -> Self {
+            self.lock().summary = Some(summary);
+            self
+        }
+
+        fn with_active_subscription(self, subscription: SubscriptionRecord) -> Self {
+            self.lock().active_subscription = Some(subscription);
+            self
+        }
+
+        fn with_cache(self, cache: VipCacheRecord) -> Self {
+            self.lock().cache = Some(cache);
+            self
+        }
+
+        fn calls(&self) -> Vec<&'static str> {
+            self.lock().calls.clone()
+        }
+
+        fn lock(&self) -> MutexGuard<'_, VipStatusStoreState> {
+            self.state.lock().expect("VIP status stub lock poisoned")
+        }
+    }
+
+    impl super::VipStatusStore for VipStatusStoreStub {
+        type Error = StubError;
+
+        fn get_vip_summary_by_user<'a>(
+            &'a self,
+            _user_id: i64,
+        ) -> PaymentStoreFuture<'a, Option<VipSummaryRecord>, Self::Error> {
+            Box::pin(async move {
+                let mut state = self.lock();
+                state.calls.push("get_vip_summary_by_user");
+                Ok(state.summary.clone())
+            })
+        }
+
+        fn get_active_subscription<'a>(
+            &'a self,
+            _user_id: i64,
+        ) -> PaymentStoreFuture<'a, Option<SubscriptionRecord>, Self::Error> {
+            Box::pin(async move {
+                let mut state = self.lock();
+                state.calls.push("get_active_subscription");
+                Ok(state.active_subscription.clone())
+            })
+        }
+
+        fn get_vip_cache<'a>(
+            &'a self,
+            _user_id: i64,
+        ) -> PaymentStoreFuture<'a, Option<VipCacheRecord>, Self::Error> {
+            Box::pin(async move {
+                let mut state = self.lock();
+                state.calls.push("get_vip_cache");
+                Ok(state.cache.clone())
+            })
+        }
     }
 
     #[derive(Clone, Default)]
