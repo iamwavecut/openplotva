@@ -173,6 +173,18 @@ pub const CHAT_ADMINS_KEY_PREFIX: &str = "chat:";
 /// Go Redis key suffix for cached chat administrator IDs.
 pub const CHAT_ADMINS_KEY_SUFFIX: &str = ":admins";
 
+/// Go Redis key prefix for tracked ephemeral Telegram messages.
+pub const EPHEMERAL_MESSAGE_KEY_PREFIX: &str = "ephemeral_messages:";
+
+/// Go Redis SCAN pattern for tracked ephemeral Telegram messages.
+pub const EPHEMERAL_MESSAGE_PATTERN: &str = "ephemeral_messages:*";
+
+/// Go cleanup batch size for deleting expired ephemeral Telegram messages.
+pub const EPHEMERAL_CLEANUP_BATCH_SIZE: usize = 10;
+
+/// Go default cleanup interval for ephemeral Telegram messages.
+pub const EPHEMERAL_DEFAULT_CLEANUP_INTERVAL: Duration = Duration::from_secs(15);
+
 /// Go Redis key prefix for chat history read-through cache.
 pub const CHAT_HISTORY_CACHE_KEY_PREFIX: &str = "plotva:chat_history_cache:v2:";
 
@@ -211,6 +223,17 @@ pub struct RedisStore {
     client: RedisClient,
 }
 
+/// Persisted ephemeral Telegram message lifecycle record.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EphemeralMessage {
+    /// Telegram chat ID.
+    pub chat_id: i64,
+    /// Telegram message ID.
+    pub message_id: i64,
+    /// Instant after which cleanup should try deleting the message.
+    pub expires_at: OffsetDateTime,
+}
+
 impl RedisStore {
     /// Access the underlying Redis client.
     pub fn client(&self) -> &RedisClient {
@@ -225,6 +248,11 @@ impl RedisStore {
     /// Build the Redis-backed chat-admin cache store over this client.
     pub fn chat_admin_cache_store(&self) -> RedisChatAdminCacheStore {
         RedisChatAdminCacheStore::new(self.client.clone())
+    }
+
+    /// Build the Redis-backed ephemeral-message store over this client.
+    pub fn ephemeral_message_store(&self) -> RedisEphemeralMessageStore {
+        RedisEphemeralMessageStore::new(self.client.clone())
     }
 }
 
@@ -380,6 +408,105 @@ impl RedisChatAdminCacheStore {
             .as_deref()
             .map(chat_admin_ids_from_redis_value)
             .transpose()
+    }
+}
+
+/// Redis-backed store for Go `ephemeral_messages:{chat_id}:{message_id}` values.
+#[derive(Clone, Debug)]
+pub struct RedisEphemeralMessageStore {
+    client: RedisClient,
+    key_prefix: String,
+}
+
+impl RedisEphemeralMessageStore {
+    /// Build an ephemeral-message store using Go's persisted key prefix.
+    pub fn new(client: RedisClient) -> Self {
+        Self::with_key_prefix(client, EPHEMERAL_MESSAGE_KEY_PREFIX)
+    }
+
+    /// Build an ephemeral-message store with an explicit prefix, useful for isolated tests.
+    pub fn with_key_prefix(client: RedisClient, key_prefix: impl Into<String>) -> Self {
+        Self {
+            client,
+            key_prefix: key_prefix.into(),
+        }
+    }
+
+    /// Return the Redis key this store uses for one Telegram message.
+    pub fn key_for_message(&self, chat_id: i64, message_id: i64) -> String {
+        format!("{}{chat_id}:{message_id}", self.key_prefix)
+    }
+
+    /// Persist one ephemeral message with the Go cleanup-cushioned Redis TTL.
+    pub async fn set_ephemeral_message(
+        &self,
+        message: &EphemeralMessage,
+        ttl: Duration,
+    ) -> Result<(), StorageError> {
+        let value = ephemeral_message_redis_value(message)?;
+        let mut connection = self
+            .client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|source| StorageError::Redis { source })?;
+        let mut command = redis::cmd("SET");
+        command
+            .arg(self.key_for_message(message.chat_id, message.message_id))
+            .arg(value);
+        if !ttl.is_zero() {
+            command.arg("PX").arg(redis_ttl_millis(ttl));
+        }
+        let _: String = command
+            .query_async(&mut connection)
+            .await
+            .map_err(|source| StorageError::Redis { source })?;
+        Ok(())
+    }
+
+    /// Load one persisted ephemeral message.
+    pub async fn ephemeral_message(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+    ) -> Result<Option<EphemeralMessage>, StorageError> {
+        let mut connection = self
+            .client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|source| StorageError::Redis { source })?;
+        let value: Option<Vec<u8>> = redis::cmd("GET")
+            .arg(self.key_for_message(chat_id, message_id))
+            .query_async(&mut connection)
+            .await
+            .map_err(|source| StorageError::Redis { source })?;
+        value
+            .as_deref()
+            .map(ephemeral_message_from_redis_value)
+            .transpose()
+    }
+
+    /// Delete persisted ephemeral-message records after Telegram delete attempts.
+    pub async fn delete_ephemeral_messages(
+        &self,
+        messages: &[EphemeralMessage],
+    ) -> Result<(), StorageError> {
+        if messages.is_empty() {
+            return Ok(());
+        }
+        let mut connection = self
+            .client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|source| StorageError::Redis { source })?;
+        let keys = messages
+            .iter()
+            .map(|message| self.key_for_message(message.chat_id, message.message_id));
+        let _: i64 = redis::cmd("DEL")
+            .arg(keys.collect::<Vec<_>>())
+            .query_async(&mut connection)
+            .await
+            .map_err(|source| StorageError::Redis { source })?;
+        Ok(())
     }
 }
 
@@ -1616,9 +1743,21 @@ pub enum StorageError {
         /// JSON codec error.
         source: serde_json::Error,
     },
+    /// Ephemeral message JSON codec failed.
+    #[error("decode ephemeral message: {source}")]
+    EphemeralMessageCodec {
+        /// JSON codec error.
+        source: serde_json::Error,
+    },
     /// Rate-limit expiry timestamp could not be represented.
     #[error("invalid rate limit expiry timestamp: {source}")]
     RateLimitTimestamp {
+        /// Timestamp range error.
+        source: time::error::ComponentRange,
+    },
+    /// Ephemeral message expiry timestamp could not be represented.
+    #[error("invalid ephemeral message expiry timestamp: {source}")]
+    EphemeralMessageTimestamp {
         /// Timestamp range error.
         source: time::error::ComponentRange,
     },
@@ -1654,6 +1793,19 @@ pub fn rate_limited_chat_key(chat_id: i64) -> String {
 /// Build the Go cached-admin Redis key for a chat.
 pub fn chat_admins_key(chat_id: i64) -> String {
     format!("{CHAT_ADMINS_KEY_PREFIX}{chat_id}{CHAT_ADMINS_KEY_SUFFIX}")
+}
+
+/// Build the Go tracked-ephemeral-message Redis key for a Telegram message.
+pub fn ephemeral_message_key(chat_id: i64, message_id: i64) -> String {
+    format!("{EPHEMERAL_MESSAGE_KEY_PREFIX}{chat_id}:{message_id}")
+}
+
+/// Build Go tracked-ephemeral-message Redis keys for a cleanup batch.
+pub fn ephemeral_message_keys(messages: &[EphemeralMessage]) -> Vec<String> {
+    messages
+        .iter()
+        .map(|message| ephemeral_message_key(message.chat_id, message.message_id))
+        .collect()
 }
 
 /// Build the persisted Go chat-history cache key for a chat.
@@ -1773,6 +1925,49 @@ pub fn chat_admin_ids_from_redis_value(value: &[u8]) -> Result<Vec<i64>, Storage
     serde_json::from_slice(value).map_err(|source| StorageError::ChatAdminIdsCodec { source })
 }
 
+/// Encode an ephemeral message as the approved Rust-native Redis JSON value.
+pub fn ephemeral_message_redis_value(message: &EphemeralMessage) -> Result<Vec<u8>, StorageError> {
+    serde_json::to_vec(&EphemeralMessageValue {
+        chat_id: message.chat_id,
+        message_id: message.message_id,
+        expires_at_unix_timestamp_nanos: message.expires_at.unix_timestamp_nanos(),
+    })
+    .map_err(|source| StorageError::EphemeralMessageCodec { source })
+}
+
+/// Decode an ephemeral message from the Rust-native Redis JSON value.
+pub fn ephemeral_message_from_redis_value(value: &[u8]) -> Result<EphemeralMessage, StorageError> {
+    let value: EphemeralMessageValue = serde_json::from_slice(value)
+        .map_err(|source| StorageError::EphemeralMessageCodec { source })?;
+    let expires_at =
+        OffsetDateTime::from_unix_timestamp_nanos(value.expires_at_unix_timestamp_nanos)
+            .map_err(|source| StorageError::EphemeralMessageTimestamp { source })?;
+    Ok(EphemeralMessage {
+        chat_id: value.chat_id,
+        message_id: value.message_id,
+        expires_at,
+    })
+}
+
+/// Return the Redis TTL Go uses for tracked ephemeral messages.
+pub fn ephemeral_redis_ttl(duration: Duration, cleanup_interval: Duration) -> Duration {
+    duration
+        .saturating_add(cleanup_interval)
+        .saturating_add(Duration::from_secs(1))
+}
+
+/// Filter ephemeral messages whose expiry is strictly before `now`, matching Go `time.After`.
+pub fn expired_ephemeral_messages_at(
+    messages: &[EphemeralMessage],
+    now: OffsetDateTime,
+) -> Vec<EphemeralMessage> {
+    messages
+        .iter()
+        .filter(|message| now > message.expires_at)
+        .cloned()
+        .collect()
+}
+
 /// Return whether the loaded expiry is still active using Go's strict `time.Before` boundary.
 pub fn rate_limit_is_active_at(expiry: Option<OffsetDateTime>, now: OffsetDateTime) -> bool {
     expiry.is_some_and(|expiry| now < expiry)
@@ -1781,6 +1976,13 @@ pub fn rate_limit_is_active_at(expiry: Option<OffsetDateTime>, now: OffsetDateTi
 #[derive(Debug, Deserialize, Serialize)]
 struct RateLimitExpiryValue {
     unix_timestamp_nanos: i128,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct EphemeralMessageValue {
+    chat_id: i64,
+    message_id: i64,
+    expires_at_unix_timestamp_nanos: i128,
 }
 
 fn redis_ttl_millis(ttl: Duration) -> u64 {
@@ -2153,6 +2355,73 @@ mod tests {
         let error = super::chat_admin_ids_from_redis_value(&[0xff, 0xb4, 0x0a, 0x00, 0xff, 0xb0])
             .expect_err("legacy gob values should be rejected after the approved cutover");
         assert!(error.to_string().contains("decode chat admin ids"));
+        Ok(())
+    }
+
+    #[test]
+    fn ephemeral_message_keys_ttl_and_codec_preserve_go_lifecycle_contract()
+    -> Result<(), Box<dyn Error>> {
+        let expires_at =
+            time::OffsetDateTime::from_unix_timestamp_nanos(1_710_000_000_123_456_789)?;
+        let message = super::EphemeralMessage {
+            chat_id: -10042,
+            message_id: 77,
+            expires_at,
+        };
+
+        assert_eq!(
+            super::ephemeral_message_key(-10042, 77),
+            "ephemeral_messages:-10042:77"
+        );
+        assert_eq!(
+            super::ephemeral_message_keys(std::slice::from_ref(&message)),
+            vec!["ephemeral_messages:-10042:77"]
+        );
+        assert_eq!(super::EPHEMERAL_CLEANUP_BATCH_SIZE, 10);
+        assert_eq!(
+            super::ephemeral_redis_ttl(Duration::from_secs(60), Duration::from_secs(15)),
+            Duration::from_secs(76)
+        );
+
+        let value = super::ephemeral_message_redis_value(&message)?;
+        assert_eq!(
+            value,
+            br#"{"chat_id":-10042,"message_id":77,"expires_at_unix_timestamp_nanos":1710000000123456789}"#
+        );
+        assert_eq!(super::ephemeral_message_from_redis_value(&value)?, message);
+
+        let error =
+            super::ephemeral_message_from_redis_value(&[0xff, 0xb4, 0x0a, 0x00, 0xff, 0xb0])
+                .expect_err("legacy gob values should be rejected after the approved cutover");
+        assert!(error.to_string().contains("decode ephemeral message"));
+        Ok(())
+    }
+
+    #[test]
+    fn expired_ephemeral_messages_use_go_strict_after_boundary() -> Result<(), Box<dyn Error>> {
+        let now = time::OffsetDateTime::from_unix_timestamp(1_710_000_000)?;
+        let messages = vec![
+            super::EphemeralMessage {
+                chat_id: 1,
+                message_id: 10,
+                expires_at: now - time::Duration::seconds(1),
+            },
+            super::EphemeralMessage {
+                chat_id: 2,
+                message_id: 20,
+                expires_at: now,
+            },
+            super::EphemeralMessage {
+                chat_id: 3,
+                message_id: 30,
+                expires_at: now + time::Duration::seconds(1),
+            },
+        ];
+
+        assert_eq!(
+            super::expired_ephemeral_messages_at(&messages, now),
+            vec![messages[0].clone()]
+        );
         Ok(())
     }
 
@@ -3255,6 +3524,64 @@ mod tests {
 
         let _: i64 = redis::cmd("DEL")
             .arg(store.key_for_chat(chat_id))
+            .query_async(&mut connection)
+            .await?;
+        result
+    }
+
+    #[tokio::test]
+    async fn live_redis_ephemeral_message_store_round_trips_when_url_is_set()
+    -> Result<(), Box<dyn Error>> {
+        let Ok(url) = env::var("OPENPLOTVA_TEST_REDIS_URL") else {
+            return Ok(());
+        };
+        let client = redis::Client::open(url)?;
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let store = super::RedisEphemeralMessageStore::with_key_prefix(
+            client.clone(),
+            format!("openplotva:test:ephemeral_messages:{suffix}:"),
+        );
+        let expires_at =
+            time::OffsetDateTime::from_unix_timestamp_nanos(1_710_000_000_123_456_789)?;
+        let message = super::EphemeralMessage {
+            chat_id: -900_125,
+            message_id: 77,
+            expires_at,
+        };
+        let mut connection = client.get_multiplexed_async_connection().await?;
+
+        let result: Result<(), Box<dyn Error>> = async {
+            store
+                .set_ephemeral_message(
+                    &message,
+                    super::ephemeral_redis_ttl(
+                        Duration::from_secs(60),
+                        super::EPHEMERAL_DEFAULT_CLEANUP_INTERVAL,
+                    ),
+                )
+                .await?;
+
+            assert_eq!(
+                store
+                    .ephemeral_message(message.chat_id, message.message_id)
+                    .await?,
+                Some(message.clone())
+            );
+            store
+                .delete_ephemeral_messages(std::slice::from_ref(&message))
+                .await?;
+            assert_eq!(
+                store
+                    .ephemeral_message(message.chat_id, message.message_id)
+                    .await?,
+                None
+            );
+            Ok(())
+        }
+        .await;
+
+        let _: i64 = redis::cmd("DEL")
+            .arg(store.key_for_message(message.chat_id, message.message_id))
             .query_async(&mut connection)
             .await?;
         result
