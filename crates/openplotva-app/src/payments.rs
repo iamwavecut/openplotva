@@ -11,7 +11,7 @@ use openplotva_storage::{
     PostgresVirtualMessageStore, StorageError, SubscriptionCreate, SubscriptionRecord,
     VipEventCreate, VipEventRecord,
 };
-use openplotva_taskman::ControlJobParams;
+use openplotva_taskman::{ControlJobParams, ControlKind};
 use thiserror::Error;
 use time::OffsetDateTime;
 
@@ -154,6 +154,32 @@ pub struct InvoiceControlJobReport {
     pub error: Option<String>,
 }
 
+/// Payment-specific taskman control-job routing result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PaymentControlJobOutcome {
+    /// `vip_invoice` was routed to the VIP invoice executor.
+    VipInvoice(InvoiceControlJobOutcome),
+    /// `donate_invoice` was routed to the donation invoice executor.
+    DonateInvoice(InvoiceControlJobOutcome),
+    /// `successful_payment` was routed to the successful-payment processor.
+    SuccessfulPayment(SuccessfulPaymentOutcome),
+    /// `successful_payment` did not carry a Telegram payment payload.
+    MissingSuccessfulPayment,
+    /// `successful_payment` could not reconstruct a paying user.
+    MissingSuccessfulPaymentUser,
+    /// The control-job kind belongs to another app/fetcher executor.
+    NotPaymentControlJob,
+}
+
+/// Payment-specific taskman control-job execution report.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentControlJobReport {
+    /// Result class.
+    pub outcome: PaymentControlJobOutcome,
+    /// Displayable storage/side-effect error, if the routed executor reported one.
+    pub error: Option<String>,
+}
+
 /// Concrete Telegram invoice-effect failure.
 #[derive(Debug, Error)]
 pub enum TelegramPaymentInvoiceEffectError {
@@ -193,6 +219,39 @@ impl InvoiceControlJobReport {
         Self {
             outcome,
             error: Some(error.to_string()),
+        }
+    }
+}
+
+impl PaymentControlJobReport {
+    fn new(outcome: PaymentControlJobOutcome) -> Self {
+        Self {
+            outcome,
+            error: None,
+        }
+    }
+
+    fn with_error(outcome: PaymentControlJobOutcome, error: impl fmt::Display) -> Self {
+        Self {
+            outcome,
+            error: Some(error.to_string()),
+        }
+    }
+
+    fn from_invoice(
+        outcome: impl FnOnce(InvoiceControlJobOutcome) -> PaymentControlJobOutcome,
+        report: InvoiceControlJobReport,
+    ) -> Self {
+        Self {
+            outcome: outcome(report.outcome),
+            error: report.error,
+        }
+    }
+
+    fn from_successful_payment(report: SuccessfulPaymentReport) -> Self {
+        Self {
+            outcome: PaymentControlJobOutcome::SuccessfulPayment(report.outcome),
+            error: report.error,
         }
     }
 }
@@ -657,6 +716,90 @@ where
     }
 }
 
+/// Execute the payment-owned subset of Go taskman control jobs.
+pub async fn execute_payment_control_job_at<Store, Effects>(
+    store: &Store,
+    effects: &Effects,
+    params: &ControlJobParams,
+    now: OffsetDateTime,
+) -> PaymentControlJobReport
+where
+    Store: SuccessfulPaymentStore + Sync,
+    Effects: PaymentInvoiceEffects + SuccessfulPaymentEffects + Sync,
+{
+    match params.data.kind {
+        ControlKind::VipInvoice => {
+            let report = execute_vip_invoice_control_job(effects, params).await;
+            PaymentControlJobReport::from_invoice(PaymentControlJobOutcome::VipInvoice, report)
+        }
+        ControlKind::DonateInvoice => {
+            let report = execute_donate_invoice_control_job(effects, params).await;
+            PaymentControlJobReport::from_invoice(PaymentControlJobOutcome::DonateInvoice, report)
+        }
+        ControlKind::SuccessfulPayment => {
+            if params.data.payment.is_none() {
+                return PaymentControlJobReport::with_error(
+                    PaymentControlJobOutcome::MissingSuccessfulPayment,
+                    "successful payment control job payment is required",
+                );
+            }
+            if params.user_id <= 0 {
+                return PaymentControlJobReport::with_error(
+                    PaymentControlJobOutcome::MissingSuccessfulPaymentUser,
+                    "successful payment control job user is required",
+                );
+            }
+            let Some(message) = successful_payment_message_from_control_job(params) else {
+                return PaymentControlJobReport::with_error(
+                    PaymentControlJobOutcome::MissingSuccessfulPayment,
+                    "successful payment control job could not be reconstructed",
+                );
+            };
+            let report = process_successful_payment_at(store, effects, &message, now).await;
+            PaymentControlJobReport::from_successful_payment(report)
+        }
+        _ => PaymentControlJobReport::new(PaymentControlJobOutcome::NotPaymentControlJob),
+    }
+}
+
+#[must_use]
+pub fn successful_payment_message_from_control_job(
+    params: &ControlJobParams,
+) -> Option<SuccessfulPaymentMessage> {
+    if params.user_id <= 0 {
+        return None;
+    }
+    let payment = params.data.payment.as_ref()?;
+    Some(SuccessfulPaymentMessage {
+        chat_id: params.chat_id,
+        message_id: params.message_id,
+        user: user_state_from_control_job(params),
+        payment: SuccessfulPayment {
+            currency: payment.currency.clone(),
+            total_amount: i64::from(payment.total_amount),
+            invoice_payload: payment.invoice_payload.clone(),
+            telegram_payment_charge_id: payment.telegram_payment_charge_id.clone(),
+            provider_payment_charge_id: payment.provider_payment_charge_id.clone(),
+        },
+    })
+}
+
+fn user_state_from_control_job(params: &ControlJobParams) -> UserState {
+    let first_name = if params.data.first_name.trim().is_empty() {
+        params.user_full_name.clone()
+    } else {
+        params.data.first_name.clone()
+    };
+    UserState::new(
+        params.user_id,
+        first_name,
+        Some(params.data.last_name.clone()),
+        Some(params.data.user_name.clone()),
+        Some(params.data.language_code.clone()),
+        Some(params.data.is_premium),
+    )
+}
+
 /// Extract Go successful-payment message context from a decoded Telegram update.
 #[must_use]
 pub fn successful_payment_message_from_update(
@@ -1068,20 +1211,21 @@ mod tests {
         DonationCreate, DonationRecord, SubscriptionCreate, SubscriptionRecord, VipEventCreate,
         VipEventRecord,
     };
-    use openplotva_taskman::{ControlJobData, ControlJobParams, ControlKind};
+    use openplotva_taskman::{ControlJobData, ControlJobParams, ControlKind, ControlPayment};
     use serde_json::json;
     use time::OffsetDateTime;
 
     use super::{
-        InvoiceButtonMessage, InvoiceControlJobOutcome, PaymentEffectsFuture,
-        PaymentInvoiceEffects, PaymentInvoiceLinkFuture, PaymentStoreFuture, PreCheckoutOutcome,
-        PreCheckoutPaymentEffects, PreCheckoutUpdateRoute, SuccessfulPayment,
+        InvoiceButtonMessage, InvoiceControlJobOutcome, PaymentControlJobOutcome,
+        PaymentEffectsFuture, PaymentInvoiceEffects, PaymentInvoiceLinkFuture, PaymentStoreFuture,
+        PreCheckoutOutcome, PreCheckoutPaymentEffects, PreCheckoutUpdateRoute, SuccessfulPayment,
         SuccessfulPaymentEffects, SuccessfulPaymentMessage, SuccessfulPaymentOutcome,
         SuccessfulPaymentStore, SuccessfulPaymentUpdateRoute, execute_donate_invoice_control_job,
-        execute_vip_invoice_control_job, handle_pre_checkout_update_or_else,
-        handle_successful_payment_update_or_else_at, invoice_button_send_message_method,
-        process_successful_payment_at, subscription_invoice_message_text,
-        subscription_success_text, successful_payment_message_from_update,
+        execute_payment_control_job_at, execute_vip_invoice_control_job,
+        handle_pre_checkout_update_or_else, handle_successful_payment_update_or_else_at,
+        invoice_button_send_message_method, process_successful_payment_at,
+        subscription_invoice_message_text, subscription_success_text,
+        successful_payment_message_from_control_job, successful_payment_message_from_update,
     };
 
     #[tokio::test]
@@ -1624,6 +1768,136 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn payment_control_job_dispatches_vip_invoice_to_invoice_executor()
+    -> Result<(), Box<dyn Error>> {
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let store = StoreStub::new();
+        let effects = EffectsStub::default().with_next_invoice_url("https://t.me/invoice-vip");
+
+        let report = execute_payment_control_job_at(
+            &store,
+            &effects,
+            &sample_invoice_job(ControlKind::VipInvoice),
+            now,
+        )
+        .await;
+
+        assert_eq!(
+            report.outcome,
+            PaymentControlJobOutcome::VipInvoice(InvoiceControlJobOutcome::InvoiceSent)
+        );
+        assert_eq!(
+            effects.subscription_invoice_requests(),
+            vec![openplotva_telegram::SubscriptionInvoiceLinkRequest {
+                user_id: 42,
+                user_name: "alice".to_owned(),
+                amount_stars: 300,
+            }]
+        );
+        assert!(effects.donation_invoice_requests().is_empty());
+        assert!(store.users().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn payment_control_job_dispatches_successful_payment_to_existing_processor()
+    -> Result<(), Box<dyn Error>> {
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let expires_at = now + time::Duration::days(30);
+        let store = StoreStub::new().with_next_vip_event(VipEventRecord {
+            id: 77,
+            user_id: 42,
+            event_type: VIP_EVENT_TYPE_PAYMENT.to_owned(),
+            delta_seconds: vip_days_to_seconds(30),
+            effective_expires_at: expires_at,
+            subscription_id: Some(10),
+            actor_user_id: None,
+            reason: "payment telegram-charge".to_owned(),
+            created_at: now,
+        });
+        let effects = EffectsStub::default();
+
+        let report = execute_payment_control_job_at(
+            &store,
+            &effects,
+            &sample_successful_payment_control_job(),
+            now,
+        )
+        .await;
+
+        assert_eq!(
+            report.outcome,
+            PaymentControlJobOutcome::SuccessfulPayment(
+                SuccessfulPaymentOutcome::SubscriptionProcessed
+            )
+        );
+        assert_eq!(
+            store.users(),
+            vec![UserState::new(
+                42,
+                "Alice",
+                Some("Smith".to_owned()),
+                Some("alice".to_owned()),
+                Some("en".to_owned()),
+                Some(true),
+            )]
+        );
+        assert_eq!(
+            store.subscriptions(),
+            vec![SubscriptionCreate {
+                user_id: 42,
+                telegram_payment_charge_id: "telegram-charge",
+                provider_payment_charge_id: "provider-charge",
+                expires_at,
+            }]
+        );
+        assert_eq!(
+            effects.sent_texts(),
+            vec![subscription_success_text(expires_at)]
+        );
+        assert_eq!(effects.invalidated_vip_users(), vec![42]);
+        Ok(())
+    }
+
+    #[test]
+    fn successful_payment_control_job_message_uses_full_name_when_first_name_missing() {
+        let mut params = sample_successful_payment_control_job();
+        params.user_full_name = "Alice Smith".to_owned();
+        params.data.first_name.clear();
+
+        let message = successful_payment_message_from_control_job(&params)
+            .expect("payment control job should build a message");
+
+        assert_eq!(message.user.first_name, "Alice Smith");
+        assert_eq!(message.payment.invoice_payload, "subscription_42");
+    }
+
+    #[tokio::test]
+    async fn payment_control_job_skips_non_payment_kind() -> Result<(), Box<dyn Error>> {
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let store = StoreStub::new();
+        let effects = EffectsStub::default().with_next_invoice_url("https://t.me/unused");
+
+        let report = execute_payment_control_job_at(
+            &store,
+            &effects,
+            &sample_invoice_job(ControlKind::Translate),
+            now,
+        )
+        .await;
+
+        assert_eq!(
+            report.outcome,
+            PaymentControlJobOutcome::NotPaymentControlJob
+        );
+        assert!(effects.subscription_invoice_requests().is_empty());
+        assert!(effects.donation_invoice_requests().is_empty());
+        assert!(effects.invoice_messages().is_empty());
+        assert!(store.users().is_empty());
+        Ok(())
+    }
+
     #[test]
     fn invoice_button_send_message_method_matches_go_direct_chattable_payload()
     -> Result<(), Box<dyn Error>> {
@@ -1702,6 +1976,20 @@ mod tests {
                 ..ControlJobData::default()
             },
         }
+    }
+
+    fn sample_successful_payment_control_job() -> ControlJobParams {
+        let mut params = sample_invoice_job(ControlKind::SuccessfulPayment);
+        params.chat_id = 42;
+        params.message_id = 100;
+        params.data.payment = Some(ControlPayment {
+            currency: "XTR".to_owned(),
+            total_amount: 300,
+            invoice_payload: "subscription_42".to_owned(),
+            telegram_payment_charge_id: "telegram-charge".to_owned(),
+            provider_payment_charge_id: "provider-charge".to_owned(),
+        });
+        params
     }
 
     fn expected_subscription_invoice_message_text() -> String {
