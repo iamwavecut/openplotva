@@ -34,6 +34,8 @@ const GROUP_SETTINGS_PERMISSION_DENIED_TEXT: &str =
 const GROUP_SETTINGS_OPEN_PRIVATE_TEXT: &str =
     "Откройте личный чат со мной, чтобы выбрать чат для настройки:";
 const GROUP_SETTINGS_OPEN_BUTTON_TEXT: &str = "⚙️ Открыть настройки";
+const NEW_MEMBERS_FOLLOWUP_UNBLOCK_TEXT: &str = "🚫 Мои сообщения были отключены в этом чате из-за предыдущих ограничений доступа.\n\nНажмите на кнопку ниже и откройте настройки, где можно будет включить мою отправку сообщений:";
+const NEW_MEMBERS_FOLLOWUP_SETTINGS_BUTTON_TEXT: &str = "⚙️ Настройки";
 const ADMIN_CHAT_SETTINGS_USAGE_TEXT: &str = "Usage: /admin_chat_settings [chat_id или @username]";
 const ADMIN_CHAT_SETTINGS_WEBAPP_MISSING_TEXT: &str = "WebApp URL is not configured.";
 const CHAT_ADMINS_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
@@ -48,6 +50,9 @@ pub type GroupSettingsControlJobFuture<'a, T, E> =
 
 /// Boxed future returned by Go `syncChatAdmins` equivalents.
 pub type GroupSettingsSyncFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+
+/// Boxed future returned by new-members follow-up side effects.
+pub type NewMembersFollowupFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Boxed future returned by group settings member storage/API calls.
 pub type GroupSettingsMemberFuture<'a, T, E> =
@@ -84,6 +89,21 @@ pub trait GroupSettingsControlJobEffects {
 
     /// Run Go `syncChatAdmins`; it logs internally and does not affect the job result.
     fn sync_chat_admins<'a>(&'a self, chat_id: i64) -> GroupSettingsSyncFuture<'a>;
+}
+
+/// Side-effect boundary for Go new-members follow-up control jobs.
+pub trait NewMembersFollowupControlJobEffects {
+    /// Run Go `enableChatCommunication`.
+    fn enable_chat_communication<'a>(&'a self, chat_id: i64) -> NewMembersFollowupFuture<'a, ()>;
+
+    /// Check Go `ai.IsChatBlocked` after communication is re-enabled.
+    fn is_chat_blocked<'a>(&'a self, chat_id: i64) -> NewMembersFollowupFuture<'a, bool>;
+
+    /// Run Go `trySendGreetingForJoinWave`.
+    fn try_send_greeting_for_join_wave<'a>(
+        &'a self,
+        greeting: NewMembersGreeting,
+    ) -> NewMembersFollowupFuture<'a, ()>;
 }
 
 /// Storage boundary for Go `canOpenGroupSettings`.
@@ -321,6 +341,27 @@ pub enum GroupSettingsControlJobOutcome {
     BotUsernameMissing,
     /// Admin sync ran and the settings deep-link notice was queued.
     SentLink,
+}
+
+/// Control-message shape passed to the future Go greeting implementation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NewMembersGreeting {
+    /// Telegram chat ID.
+    pub chat_id: i64,
+    /// Trigger message ID.
+    pub message_id: i32,
+    /// Thread ID carried by taskman data, even though Go's reply helper omits it for control messages.
+    pub thread_id: Option<i32>,
+    pub new_chat_member_ids: Vec<i64>,
+}
+
+/// Result of executing Go's new-members follow-up control-job slice.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NewMembersFollowupControlJobOutcome {
+    /// The job was not the new-members follow-up control kind.
+    UnsupportedKind(ControlKind),
+    /// Greeting was attempted and the optional blocked-chat notice state is recorded.
+    Completed { unblock_notice_queued: bool },
 }
 
 /// Result of handling Go's `/admin_chat_settings` command path after admin auth.
@@ -586,6 +627,59 @@ where
     )
     .await?;
     Ok(GroupSettingsControlJobOutcome::SentLink)
+}
+
+/// Execute Go's new-members follow-up control-job behavior up to Telegram dispatch queueing.
+pub async fn execute_new_members_followup_control_job_at<S, Effects, NextId>(
+    store: &S,
+    dispatcher_queue: &DispatcherQueue,
+    effects: &Effects,
+    params: &ControlJobParams,
+    bot_username: &str,
+    next_virtual_id: NextId,
+) -> Result<NewMembersFollowupControlJobOutcome, OutboundBuildError>
+where
+    S: VirtualMessageStore + Sync,
+    Effects: NewMembersFollowupControlJobEffects + Sync,
+    NextId: FnMut() -> String,
+{
+    if params.data.kind != ControlKind::NewMembersFollowup {
+        return Ok(NewMembersFollowupControlJobOutcome::UnsupportedKind(
+            params.data.kind,
+        ));
+    }
+
+    let mut unblock_notice_queued = false;
+    if params.data.bot_was_added {
+        effects.enable_chat_communication(params.chat_id).await;
+        if effects.is_chat_blocked(params.chat_id).await {
+            let bot_url = if bot_username.is_empty() {
+                String::new()
+            } else {
+                format!("https://t.me/{bot_username}?start=settings")
+            };
+            let button = openplotva_telegram::build_inline_keyboard_button_url(
+                NEW_MEMBERS_FOLLOWUP_SETTINGS_BUTTON_TEXT,
+                bot_url,
+            );
+            queue_new_members_followup_control_text(
+                store,
+                dispatcher_queue,
+                params,
+                Some(ReplyMarkup::from([[button]])),
+                next_virtual_id,
+            )
+            .await?;
+            unblock_notice_queued = true;
+        }
+    }
+
+    effects
+        .try_send_greeting_for_join_wave(new_members_greeting_from_control_params(params))
+        .await;
+    Ok(NewMembersFollowupControlJobOutcome::Completed {
+        unblock_notice_queued,
+    })
 }
 
 /// Build the Go taskman control job produced by group `/settings`.
@@ -866,6 +960,51 @@ where
     .await
 }
 
+async fn queue_new_members_followup_control_text<S, NextId>(
+    store: &S,
+    queue: &DispatcherQueue,
+    params: &ControlJobParams,
+    reply_markup: Option<ReplyMarkup>,
+    next_virtual_id: NextId,
+) -> Result<QueueTextReport, OutboundBuildError>
+where
+    S: VirtualMessageStore + Sync,
+    NextId: FnMut() -> String,
+{
+    let chat = ChatRef {
+        id: params.chat_id,
+        is_forum: false,
+    };
+    let request = TextMessageRequest {
+        chat: Some(chat),
+        message_thread_id: 0,
+        disable_notification: false,
+        allow_sending_without_reply: None,
+        text: NEW_MEMBERS_FOLLOWUP_UNBLOCK_TEXT.to_owned(),
+        render_as: String::new(),
+        reply_markup,
+    };
+    let reply_to = ReplyMessageRef {
+        message_id: i64::from(params.message_id),
+        chat,
+        is_topic_message: false,
+        message_thread_id: 0,
+    };
+    queue_text_message_parts(
+        store,
+        queue,
+        QueueTextRequest {
+            message: &request,
+            reply_to: Some(&reply_to),
+            immediate_first: true,
+            bypass_chat_restrictions: true,
+            ephemeral_delete_after: None,
+        },
+        next_virtual_id,
+    )
+    .await
+}
+
 async fn queue_admin_chat_settings_text<S, NextId>(
     store: &S,
     queue: &DispatcherQueue,
@@ -913,6 +1052,15 @@ struct AdminChatSettingsText<'a> {
     reply_markup: Option<ReplyMarkup>,
     bypass_chat_restrictions: bool,
     immediate_first: bool,
+}
+
+fn new_members_greeting_from_control_params(params: &ControlJobParams) -> NewMembersGreeting {
+    NewMembersGreeting {
+        chat_id: params.chat_id,
+        message_id: params.message_id,
+        thread_id: params.thread_id,
+        new_chat_member_ids: params.data.new_chat_member_ids.clone(),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1597,9 +1745,9 @@ mod tests {
         SettingsCommandOutcome, SettingsControlJobQueue, SettingsControlJobQueueFuture,
         admin_chat_member_upsert_from_telegram, can_open_group_settings_with_sources,
         chat_member_upsert_from_telegram, execute_group_settings_control_job_at,
-        group_settings_control_job_from_update_at, handle_group_settings_command_update_at,
-        handle_private_settings_command_update, sync_chat_admins_with_cache,
-        sync_chat_admins_with_sources,
+        execute_new_members_followup_control_job_at, group_settings_control_job_from_update_at,
+        handle_group_settings_command_update_at, handle_private_settings_command_update,
+        sync_chat_admins_with_cache, sync_chat_admins_with_sources,
     };
 
     #[tokio::test]
@@ -2207,6 +2355,155 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn new_members_followup_executor_enables_chat_and_queues_blocked_notice_when_bot_added()
+    -> Result<(), Box<dyn Error>> {
+        let store = StoreStub::default();
+        let dispatcher = DispatcherQueue::new(DispatcherConfig::default());
+        let effects = NewMembersFollowupEffectsStub::blocked();
+        let params = new_members_followup_control_params(true);
+
+        let outcome = execute_new_members_followup_control_job_at(
+            &store,
+            &dispatcher,
+            &effects,
+            &params,
+            "PlotvaBot",
+            || "new-members-unblock-v1".to_owned(),
+        )
+        .await?;
+
+        assert_eq!(
+            outcome,
+            super::NewMembersFollowupControlJobOutcome::Completed {
+                unblock_notice_queued: true
+            }
+        );
+        assert_eq!(effects.enabled_chats(), vec![-10042]);
+        assert_eq!(effects.blocked_checks(), vec![-10042]);
+        assert_eq!(
+            effects.greetings(),
+            vec![super::NewMembersGreeting {
+                chat_id: -10042,
+                message_id: 88,
+                thread_id: Some(99),
+                new_chat_member_ids: vec![7, 8],
+            }]
+        );
+        assert_eq!(
+            store.inserted(),
+            vec![("new-members-unblock-v1".to_owned(), -10042, None)]
+        );
+
+        let item = dispatcher
+            .dequeue_immediate()
+            .expect("blocked bot-added follow-up should enqueue the bypass notice immediately");
+        assert!(item.bypasses_chat_restrictions());
+        let method = item.into_method().expect("queued new-members notice");
+        let value = serde_json::to_value(method_as_value(method)?)?;
+        assert_eq!(value["chat_id"], json!(-10042));
+        assert_eq!(
+            value["text"],
+            json!(
+                "🚫 Мои сообщения были отключены в этом чате из-за предыдущих ограничений доступа.\n\nНажмите на кнопку ниже и откройте настройки, где можно будет включить мою отправку сообщений:"
+            )
+        );
+        assert_eq!(value["reply_parameters"]["message_id"], json!(88));
+        assert_eq!(value["reply_parameters"]["chat_id"], json!(-10042));
+        assert_eq!(
+            value["reply_parameters"]["allow_sending_without_reply"],
+            json!(true)
+        );
+        assert!(value.get("message_thread_id").is_none());
+        assert_eq!(
+            value["reply_markup"]["inline_keyboard"][0][0]["text"],
+            json!("⚙️ Настройки")
+        );
+        assert_eq!(
+            value["reply_markup"]["inline_keyboard"][0][0]["url"],
+            json!("https://t.me/PlotvaBot?start=settings")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn new_members_followup_executor_skips_blocked_notice_when_bot_was_not_added()
+    -> Result<(), Box<dyn Error>> {
+        let store = StoreStub::default();
+        let dispatcher = DispatcherQueue::new(DispatcherConfig::default());
+        let effects = NewMembersFollowupEffectsStub::blocked();
+        let params = new_members_followup_control_params(false);
+
+        let outcome = execute_new_members_followup_control_job_at(
+            &store,
+            &dispatcher,
+            &effects,
+            &params,
+            "PlotvaBot",
+            || "unused-v1".to_owned(),
+        )
+        .await?;
+
+        assert_eq!(
+            outcome,
+            super::NewMembersFollowupControlJobOutcome::Completed {
+                unblock_notice_queued: false
+            }
+        );
+        assert!(effects.enabled_chats().is_empty());
+        assert!(effects.blocked_checks().is_empty());
+        assert_eq!(
+            effects.greetings(),
+            vec![super::NewMembersGreeting {
+                chat_id: -10042,
+                message_id: 88,
+                thread_id: Some(99),
+                new_chat_member_ids: vec![7, 8],
+            }]
+        );
+        assert!(store.inserted().is_empty());
+        assert!(dispatcher.snapshot().immediate.is_empty());
+        assert!(dispatcher.snapshot().regular.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn new_members_followup_executor_keeps_empty_settings_url_when_username_missing()
+    -> Result<(), Box<dyn Error>> {
+        let store = StoreStub::default();
+        let dispatcher = DispatcherQueue::new(DispatcherConfig::default());
+        let effects = NewMembersFollowupEffectsStub::blocked();
+        let params = new_members_followup_control_params(true);
+
+        let outcome = execute_new_members_followup_control_job_at(
+            &store,
+            &dispatcher,
+            &effects,
+            &params,
+            "",
+            || "new-members-empty-url-v1".to_owned(),
+        )
+        .await?;
+
+        assert_eq!(
+            outcome,
+            super::NewMembersFollowupControlJobOutcome::Completed {
+                unblock_notice_queued: true
+            }
+        );
+        let item = dispatcher
+            .dequeue_immediate()
+            .expect("blocked bot-added follow-up should still enqueue with an empty URL");
+        assert!(item.bypasses_chat_restrictions());
+        let method = item.into_method().expect("queued new-members notice");
+        let value = serde_json::to_value(method_as_value(method)?)?;
+        assert_eq!(
+            value["reply_markup"]["inline_keyboard"][0][0]["url"],
+            json!("")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn group_settings_permission_uses_stored_creator_without_telegram_call()
     -> Result<(), Box<dyn Error>> {
         let store = GroupSettingsMemberStoreStub::with_member(ChatMemberRecord {
@@ -2757,6 +3054,23 @@ mod tests {
         }
     }
 
+    fn new_members_followup_control_params(bot_was_added: bool) -> ControlJobParams {
+        ControlJobParams {
+            chat_id: -10042,
+            message_id: 88,
+            user_id: 42,
+            user_full_name: "Ada Lovelace".to_owned(),
+            thread_id: Some(99),
+            data: ControlJobData {
+                kind: ControlKind::NewMembersFollowup,
+                chat_type: "supergroup".to_owned(),
+                new_chat_member_ids: vec![7, 8],
+                bot_was_added,
+                ..ControlJobData::default()
+            },
+        }
+    }
+
     #[derive(Clone, Default)]
     struct AdminChatTargetResolverStub {
         state: Arc<Mutex<AdminChatTargetResolverState>>,
@@ -2954,6 +3268,96 @@ mod tests {
                     .expect("group settings effects state")
                     .synced_admin_chats
                     .push(chat_id);
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    struct NewMembersFollowupEffectsStub {
+        state: Arc<Mutex<NewMembersFollowupEffectsState>>,
+    }
+
+    #[derive(Default)]
+    struct NewMembersFollowupEffectsState {
+        chat_blocked: bool,
+        enabled_chats: Vec<i64>,
+        blocked_checks: Vec<i64>,
+        greetings: Vec<super::NewMembersGreeting>,
+    }
+
+    impl NewMembersFollowupEffectsStub {
+        fn blocked() -> Self {
+            Self {
+                state: Arc::new(Mutex::new(NewMembersFollowupEffectsState {
+                    chat_blocked: true,
+                    ..NewMembersFollowupEffectsState::default()
+                })),
+            }
+        }
+
+        fn enabled_chats(&self) -> Vec<i64> {
+            self.state
+                .lock()
+                .expect("new-members followup effects state")
+                .enabled_chats
+                .clone()
+        }
+
+        fn blocked_checks(&self) -> Vec<i64> {
+            self.state
+                .lock()
+                .expect("new-members followup effects state")
+                .blocked_checks
+                .clone()
+        }
+
+        fn greetings(&self) -> Vec<super::NewMembersGreeting> {
+            self.state
+                .lock()
+                .expect("new-members followup effects state")
+                .greetings
+                .clone()
+        }
+    }
+
+    impl super::NewMembersFollowupControlJobEffects for NewMembersFollowupEffectsStub {
+        fn enable_chat_communication<'a>(
+            &'a self,
+            chat_id: i64,
+        ) -> super::NewMembersFollowupFuture<'a, ()> {
+            Box::pin(async move {
+                self.state
+                    .lock()
+                    .expect("new-members followup effects state")
+                    .enabled_chats
+                    .push(chat_id);
+            })
+        }
+
+        fn is_chat_blocked<'a>(
+            &'a self,
+            chat_id: i64,
+        ) -> super::NewMembersFollowupFuture<'a, bool> {
+            Box::pin(async move {
+                let mut state = self
+                    .state
+                    .lock()
+                    .expect("new-members followup effects state");
+                state.blocked_checks.push(chat_id);
+                state.chat_blocked
+            })
+        }
+
+        fn try_send_greeting_for_join_wave<'a>(
+            &'a self,
+            greeting: super::NewMembersGreeting,
+        ) -> super::NewMembersFollowupFuture<'a, ()> {
+            Box::pin(async move {
+                self.state
+                    .lock()
+                    .expect("new-members followup effects state")
+                    .greetings
+                    .push(greeting);
             })
         }
     }
