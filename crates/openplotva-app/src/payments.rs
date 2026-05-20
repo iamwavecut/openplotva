@@ -6,6 +6,7 @@ use std::{
     time::Duration,
 };
 
+use crate::updates::{UpdateHandler, UpdateHandlerFuture};
 use carapax::types::{
     Chat as TelegramChat, Message as TelegramMessage, MessageData as TelegramMessageData,
     PreCheckoutQuery as TelegramPreCheckoutQuery, SuccessfulPayment as TelegramSuccessfulPayment,
@@ -1934,6 +1935,54 @@ async fn send_vip_status_error_text<Effects>(
         .await;
 }
 
+/// `UpdateHandler` adapter that handles Go payment-owned updates before fetcher routing.
+#[derive(Clone, Debug)]
+pub struct PaymentUpdateHandler<Queue, Vip, Effects, Next> {
+    queue: Arc<Queue>,
+    vip: Arc<Vip>,
+    effects: Arc<Effects>,
+    next: Arc<Next>,
+}
+
+impl<Queue, Vip, Effects, Next> PaymentUpdateHandler<Queue, Vip, Effects, Next> {
+    /// Build a payment-aware handler around the real downstream update handler.
+    pub fn new(queue: Arc<Queue>, vip: Arc<Vip>, effects: Arc<Effects>, next: Arc<Next>) -> Self {
+        Self {
+            queue,
+            vip,
+            effects,
+            next,
+        }
+    }
+}
+
+impl<Queue, Vip, Effects, Next> UpdateHandler for PaymentUpdateHandler<Queue, Vip, Effects, Next>
+where
+    Queue: PaymentControlJobQueue + Send + Sync,
+    Vip: VipStatusChecker + VipStatusStore + Send + Sync,
+    Effects: PreCheckoutPaymentEffects + VipStatusEffects + Send + Sync,
+    Next: UpdateHandler + Send + Sync,
+{
+    type Error = Next::Error;
+
+    fn handle_update<'a>(&'a self, update: TelegramUpdate) -> UpdateHandlerFuture<'a, Self::Error> {
+        Box::pin(async move {
+            let now = OffsetDateTime::now_utc();
+            handle_payment_update_or_else_at(
+                self.queue.as_ref(),
+                self.vip.as_ref(),
+                self.effects.as_ref(),
+                update,
+                now,
+                now,
+                |update| self.next.handle_update(update),
+            )
+            .await
+            .map(|_| ())
+        })
+    }
+}
+
 /// Handle the payment-owned subset of decoded updates, delegating everything else.
 pub async fn handle_payment_update_or_else_at<
     Queue,
@@ -2839,10 +2888,11 @@ mod tests {
     use std::{
         collections::VecDeque,
         error::Error,
-        fmt,
+        fmt, io,
         sync::{Arc, Mutex, MutexGuard},
     };
 
+    use crate::updates::{UpdateHandler, UpdateHandlerFuture};
     use carapax::types::Update as TelegramUpdate;
     use openplotva_core::{UserState, VIP_EVENT_TYPE_PAYMENT, vip_days_to_seconds};
     use openplotva_storage::{
@@ -2861,11 +2911,11 @@ mod tests {
         PaymentControlJobQueue, PaymentControlJobQueueFuture, PaymentControlJobReport,
         PaymentControlJobWorkItem, PaymentControlJobWorkerFuture, PaymentControlJobWorkerQueue,
         PaymentEffectsFuture, PaymentInvoiceCommandUpdateRoute, PaymentInvoiceControlJobBuild,
-        PaymentInvoiceEffects, PaymentInvoiceLinkFuture, PaymentStoreFuture, PaymentUpdateRoute,
-        PreCheckoutOutcome, PreCheckoutPaymentEffects, PreCheckoutUpdateRoute, SuccessfulPayment,
-        SuccessfulPaymentControlJobUpdateRoute, SuccessfulPaymentEffects, SuccessfulPaymentMessage,
-        SuccessfulPaymentOutcome, SuccessfulPaymentStore, SuccessfulPaymentUpdateRoute,
-        enqueue_payment_invoice_command_update_or_else_at,
+        PaymentInvoiceEffects, PaymentInvoiceLinkFuture, PaymentStoreFuture, PaymentUpdateHandler,
+        PaymentUpdateRoute, PreCheckoutOutcome, PreCheckoutPaymentEffects, PreCheckoutUpdateRoute,
+        SuccessfulPayment, SuccessfulPaymentControlJobUpdateRoute, SuccessfulPaymentEffects,
+        SuccessfulPaymentMessage, SuccessfulPaymentOutcome, SuccessfulPaymentStore,
+        SuccessfulPaymentUpdateRoute, enqueue_payment_invoice_command_update_or_else_at,
         enqueue_payment_invoice_command_update_with_vip_status_or_else_at,
         enqueue_successful_payment_update_or_else_at, execute_donate_invoice_control_job,
         execute_payment_control_job_at, execute_vip_invoice_control_job,
@@ -3845,6 +3895,55 @@ mod tests {
             &[999]
         );
         assert!(queue.assigned().is_empty());
+        assert!(effects.answered_pre_checkout_queries().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn payment_update_handler_delegates_non_payment_update_to_wrapped_handler()
+    -> Result<(), Box<dyn Error>> {
+        let queue = Arc::new(PaymentControlJobQueueStub::default());
+        let store = Arc::new(VipStatusStoreStub::new().with_is_vip(true));
+        let effects = Arc::new(EffectsStub::default());
+        let next = Arc::new(UpdateHandlerStub::default());
+        let handler = PaymentUpdateHandler::new(
+            Arc::clone(&queue),
+            Arc::clone(&store),
+            Arc::clone(&effects),
+            Arc::clone(&next),
+        );
+
+        handler.handle_update(sample_text_update()?).await?;
+
+        assert_eq!(next.calls(), vec![999]);
+        assert!(queue.assigned().is_empty());
+        assert!(effects.answered_pre_checkout_queries().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn payment_update_handler_intercepts_invoice_command_before_wrapped_handler()
+    -> Result<(), Box<dyn Error>> {
+        let queue = Arc::new(PaymentControlJobQueueStub::default());
+        let store = Arc::new(VipStatusStoreStub::new().with_is_vip(false));
+        let effects = Arc::new(EffectsStub::default());
+        let next = Arc::new(UpdateHandlerStub::default());
+        let handler = PaymentUpdateHandler::new(
+            Arc::clone(&queue),
+            Arc::clone(&store),
+            Arc::clone(&effects),
+            Arc::clone(&next),
+        );
+
+        handler
+            .handle_update(sample_payment_command_update("/vip")?)
+            .await?;
+
+        assert!(next.calls().is_empty());
+        let assigned = queue.assigned();
+        assert_eq!(assigned.len(), 1);
+        assert_eq!(assigned[0].0, CONTROL_QUEUE_NAME);
+        assert_eq!(assigned[0].1.title, "vip invoice");
         assert!(effects.answered_pre_checkout_queries().is_empty());
         Ok(())
     }
@@ -5587,6 +5686,34 @@ mod tests {
                     Some(error) => Err(error),
                     None => Ok(()),
                 }
+            })
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct UpdateHandlerStub {
+        calls: Arc<Mutex<Vec<i64>>>,
+    }
+
+    impl UpdateHandlerStub {
+        fn calls(&self) -> Vec<i64> {
+            self.calls.lock().expect("update handler calls").clone()
+        }
+    }
+
+    impl UpdateHandler for UpdateHandlerStub {
+        type Error = io::Error;
+
+        fn handle_update<'a>(
+            &'a self,
+            update: TelegramUpdate,
+        ) -> UpdateHandlerFuture<'a, Self::Error> {
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .map_err(|err| io::Error::other(err.to_string()))?
+                    .push(update.id);
+                Ok(())
             })
         }
     }
