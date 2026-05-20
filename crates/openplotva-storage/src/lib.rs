@@ -86,6 +86,12 @@ pub const SQL_DELETE_CHAT_MEMBER: &str =
 /// Go `UpsertChatMember` SQL with SQLC bindings converted to positional bindings.
 pub const SQL_UPSERT_CHAT_MEMBER: &str = "INSERT INTO chat_members (chat_id, user_id, status, is_anonymous, custom_title, can_be_edited, can_manage_chat, can_delete_messages, can_manage_video_chats, can_restrict_members, can_promote_members, can_change_info, can_invite_users, can_post_messages, can_edit_messages, can_pin_messages, can_manage_topics, can_send_messages, can_send_media_messages, can_send_polls, can_send_other_messages, can_add_web_page_previews, until_date) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23) ON CONFLICT (chat_id, user_id) DO UPDATE SET status = COALESCE(EXCLUDED.status, chat_members.status), is_anonymous = COALESCE(EXCLUDED.is_anonymous, chat_members.is_anonymous), custom_title = COALESCE(EXCLUDED.custom_title, chat_members.custom_title), can_be_edited = COALESCE(EXCLUDED.can_be_edited, chat_members.can_be_edited), can_manage_chat = COALESCE(EXCLUDED.can_manage_chat, chat_members.can_manage_chat), can_delete_messages = COALESCE(EXCLUDED.can_delete_messages, chat_members.can_delete_messages), can_manage_video_chats = COALESCE(EXCLUDED.can_manage_video_chats, chat_members.can_manage_video_chats), can_restrict_members = COALESCE(EXCLUDED.can_restrict_members, chat_members.can_restrict_members), can_promote_members = COALESCE(EXCLUDED.can_promote_members, chat_members.can_promote_members), can_change_info = COALESCE(EXCLUDED.can_change_info, chat_members.can_change_info), can_invite_users = COALESCE(EXCLUDED.can_invite_users, chat_members.can_invite_users), can_post_messages = COALESCE(EXCLUDED.can_post_messages, chat_members.can_post_messages), can_edit_messages = COALESCE(EXCLUDED.can_edit_messages, chat_members.can_edit_messages), can_pin_messages = COALESCE(EXCLUDED.can_pin_messages, chat_members.can_pin_messages), can_manage_topics = COALESCE(EXCLUDED.can_manage_topics, chat_members.can_manage_topics), can_send_messages = COALESCE(EXCLUDED.can_send_messages, chat_members.can_send_messages), can_send_media_messages = COALESCE(EXCLUDED.can_send_media_messages, chat_members.can_send_media_messages), can_send_polls = COALESCE(EXCLUDED.can_send_polls, chat_members.can_send_polls), can_send_other_messages = COALESCE(EXCLUDED.can_send_other_messages, chat_members.can_send_other_messages), can_add_web_page_previews = COALESCE(EXCLUDED.can_add_web_page_previews, chat_members.can_add_web_page_previews), until_date = COALESCE(EXCLUDED.until_date, chat_members.until_date), updated_at = CURRENT_TIMESTAMP";
 
+/// Go `UpdateMemberLastMessage` SQL.
+pub const SQL_UPDATE_MEMBER_LAST_MESSAGE: &str = "UPDATE chat_members SET last_message_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE chat_id = $1 AND user_id = $2";
+
+/// Go `UpsertChatActiveUser` SQL.
+pub const SQL_UPSERT_CHAT_ACTIVE_USER: &str = "INSERT INTO chat_active_users (chat_id, user_id, last_active_at) VALUES ($1, $2, CURRENT_TIMESTAMP) ON CONFLICT (chat_id, user_id) DO UPDATE SET last_active_at = CURRENT_TIMESTAMP";
+
 /// Go `GetChatSettings` SQL narrowed to fields currently needed by permission policy.
 pub const SQL_GET_CHAT_SETTINGS: &str = "SELECT chat_id, mood_alignment, custom_persona, reactivity_percentage, proactivity_percentage, enable_global_text_reply, enable_global_draw_reply, enable_obscenifier, enable_profanity, enable_greet_joiners, enable_daily_game, daily_game_theme, greeting_html FROM chat_settings WHERE chat_id = $1";
 
@@ -1045,6 +1051,34 @@ impl PostgresChatMemberStore {
     /// Delete one Go `chat_members` row.
     pub async fn delete_chat_member(&self, chat_id: i64, user_id: i64) -> Result<(), StorageError> {
         sqlx::query(SQL_DELETE_CHAT_MEMBER)
+            .bind(chat_id)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Update Go `chat_members.last_message_at` for a user message.
+    pub async fn update_member_last_message(
+        &self,
+        chat_id: i64,
+        user_id: i64,
+    ) -> Result<(), StorageError> {
+        sqlx::query(SQL_UPDATE_MEMBER_LAST_MESSAGE)
+            .bind(chat_id)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Upsert Go `chat_active_users` activity row.
+    pub async fn upsert_chat_active_user(
+        &self,
+        chat_id: i64,
+        user_id: i64,
+    ) -> Result<(), StorageError> {
+        sqlx::query(SQL_UPSERT_CHAT_ACTIVE_USER)
             .bind(chat_id)
             .bind(user_id)
             .execute(&self.pool)
@@ -2606,6 +2640,14 @@ mod tests {
         assert_eq!(
             super::SQL_UPSERT_CHAT_MEMBER,
             "INSERT INTO chat_members (chat_id, user_id, status, is_anonymous, custom_title, can_be_edited, can_manage_chat, can_delete_messages, can_manage_video_chats, can_restrict_members, can_promote_members, can_change_info, can_invite_users, can_post_messages, can_edit_messages, can_pin_messages, can_manage_topics, can_send_messages, can_send_media_messages, can_send_polls, can_send_other_messages, can_add_web_page_previews, until_date) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23) ON CONFLICT (chat_id, user_id) DO UPDATE SET status = COALESCE(EXCLUDED.status, chat_members.status), is_anonymous = COALESCE(EXCLUDED.is_anonymous, chat_members.is_anonymous), custom_title = COALESCE(EXCLUDED.custom_title, chat_members.custom_title), can_be_edited = COALESCE(EXCLUDED.can_be_edited, chat_members.can_be_edited), can_manage_chat = COALESCE(EXCLUDED.can_manage_chat, chat_members.can_manage_chat), can_delete_messages = COALESCE(EXCLUDED.can_delete_messages, chat_members.can_delete_messages), can_manage_video_chats = COALESCE(EXCLUDED.can_manage_video_chats, chat_members.can_manage_video_chats), can_restrict_members = COALESCE(EXCLUDED.can_restrict_members, chat_members.can_restrict_members), can_promote_members = COALESCE(EXCLUDED.can_promote_members, chat_members.can_promote_members), can_change_info = COALESCE(EXCLUDED.can_change_info, chat_members.can_change_info), can_invite_users = COALESCE(EXCLUDED.can_invite_users, chat_members.can_invite_users), can_post_messages = COALESCE(EXCLUDED.can_post_messages, chat_members.can_post_messages), can_edit_messages = COALESCE(EXCLUDED.can_edit_messages, chat_members.can_edit_messages), can_pin_messages = COALESCE(EXCLUDED.can_pin_messages, chat_members.can_pin_messages), can_manage_topics = COALESCE(EXCLUDED.can_manage_topics, chat_members.can_manage_topics), can_send_messages = COALESCE(EXCLUDED.can_send_messages, chat_members.can_send_messages), can_send_media_messages = COALESCE(EXCLUDED.can_send_media_messages, chat_members.can_send_media_messages), can_send_polls = COALESCE(EXCLUDED.can_send_polls, chat_members.can_send_polls), can_send_other_messages = COALESCE(EXCLUDED.can_send_other_messages, chat_members.can_send_other_messages), can_add_web_page_previews = COALESCE(EXCLUDED.can_add_web_page_previews, chat_members.can_add_web_page_previews), until_date = COALESCE(EXCLUDED.until_date, chat_members.until_date), updated_at = CURRENT_TIMESTAMP"
+        );
+        assert_eq!(
+            super::SQL_UPDATE_MEMBER_LAST_MESSAGE,
+            "UPDATE chat_members SET last_message_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE chat_id = $1 AND user_id = $2"
+        );
+        assert_eq!(
+            super::SQL_UPSERT_CHAT_ACTIVE_USER,
+            "INSERT INTO chat_active_users (chat_id, user_id, last_active_at) VALUES ($1, $2, CURRENT_TIMESTAMP) ON CONFLICT (chat_id, user_id) DO UPDATE SET last_active_at = CURRENT_TIMESTAMP"
         );
     }
 
