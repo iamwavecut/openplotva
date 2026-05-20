@@ -1078,6 +1078,19 @@ pub fn should_handle_random_response(
     !is_captionless_media_only_random_message(message, original_text)
 }
 
+/// Split Go `React` command words with first-word fallback.
+#[must_use]
+pub fn react_message_words(first_word_lower: &str, text: &str) -> Vec<String> {
+    let text = text.trim();
+    if !text.is_empty() {
+        return text.split(' ').map(ToOwned::to_owned).collect();
+    }
+    if !first_word_lower.is_empty() {
+        return vec![first_word_lower.to_owned()];
+    }
+    Vec::new()
+}
+
 /// Go `dialog.MessageKindText` history kind.
 pub const HISTORY_MESSAGE_KIND_TEXT: &str = "text";
 
@@ -2169,7 +2182,7 @@ mod tests {
         edited_image_prompt_update, extract_update_state, fetcher_message_text,
         is_allowed_producer_update, is_settings_command_message, parse_edit_command,
         parse_if_addressed, process_update_at, producer_update_name, producer_update_type,
-        resolve_draw_prompt_from_message, run_update_producer_until,
+        react_message_words, resolve_draw_prompt_from_message, run_update_producer_until,
         should_handle_addressed_message, should_handle_random_response,
         telegram_message_attachments, update_name,
     };
@@ -4033,6 +4046,16 @@ mod tests {
         ));
 
         Ok(())
+    }
+
+    #[test]
+    fn react_message_words_preserve_go_fallback_order() {
+        assert_eq!(
+            react_message_words("draw", "draw cat"),
+            vec!["draw".to_owned(), "cat".to_owned()]
+        );
+        assert_eq!(react_message_words("draw", " "), vec!["draw".to_owned()]);
+        assert!(react_message_words("", " ").is_empty());
     }
 
     #[tokio::test]
