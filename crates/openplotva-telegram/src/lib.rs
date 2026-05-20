@@ -16,7 +16,10 @@ pub use callback::{
     DELETE_DRAWING_ACTION_CLOSE, DELETE_DRAWING_ACTION_CONFIRM,
     DELETE_DRAWING_ACTION_FRAME_CONFIRM, DELETE_DRAWING_ACTION_FRAME_PICK,
     DELETE_DRAWING_ACTION_INIT, DELETE_LYRICS_ACTION_CLOSE, DELETE_LYRICS_ACTION_CONFIRM,
-    DELETE_LYRICS_ACTION_INIT, callback_handler_for_action, callback_query_ack_method,
+    DELETE_LYRICS_ACTION_INIT, build_delete_drawing_confirm_keyboard,
+    build_delete_drawing_frame_confirm_keyboard, build_delete_drawing_frame_picker_keyboard,
+    build_delete_drawing_initial_keyboard, build_lyrics_delete_confirm_keyboard,
+    build_lyrics_delete_keyboard, callback_handler_for_action, callback_query_ack_method,
     callback_query_ack_request, callback_query_route, checkin_theme_callback_init,
     checkin_theme_callback_theme, checkin_theme_selection_ack_method,
     checkin_theme_selection_alert, delete_drawing_callback_data, delete_lyrics_callback_data,
@@ -603,6 +606,7 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use serde::Deserialize;
+    use serde_json::json;
 
     use super::{
         API_CONSTRUCTOR_USAGES, BotCommandError, BotCommandScope, CALLBACK_ACTIONS,
@@ -612,6 +616,9 @@ mod tests {
         DELETE_DRAWING_ACTION_FRAME_PICK, DELETE_DRAWING_ACTION_INIT, DELETE_LYRICS_ACTION_CLOSE,
         DELETE_LYRICS_ACTION_CONFIRM, DELETE_LYRICS_ACTION_INIT, DONATE_COMMAND,
         GROUP_ADMIN_COMMANDS, GROUP_COMMANDS, HELP_COMMAND, PRIVATE_COMMANDS,
+        build_delete_drawing_confirm_keyboard, build_delete_drawing_frame_confirm_keyboard,
+        build_delete_drawing_frame_picker_keyboard, build_delete_drawing_initial_keyboard,
+        build_lyrics_delete_confirm_keyboard, build_lyrics_delete_keyboard,
         callback_handler_for_action, callback_query_ack_method, callback_query_ack_request,
         callback_query_route, checkin_theme_callback_init, checkin_theme_callback_theme,
         checkin_theme_selection_ack_method, checkin_theme_selection_alert,
@@ -885,6 +892,157 @@ mod tests {
         assert_eq!(parse_callback_i64("12x45"), 0);
         assert_eq!(parse_callback_i64(""), 0);
         assert_eq!(parse_callback_i64("9223372036854775808"), 0);
+    }
+
+    #[test]
+    fn delete_drawing_keyboards_match_go_layouts() -> Result<(), Box<dyn std::error::Error>> {
+        let initial =
+            serde_json::to_value(build_delete_drawing_initial_keyboard(42, -1001234567890))?;
+        assert_eq!(
+            initial["inline_keyboard"],
+            json!([
+                [
+                    {
+                        "text": "🗑️ Удалить",
+                        "callback_data": r#"{"a":"del_i","u":"42","c":"-1001234567890"}"#
+                    },
+                    {
+                        "text": "✕",
+                        "callback_data": r#"{"a":"del_x","u":"42","c":"-1001234567890"}"#
+                    }
+                ]
+            ])
+        );
+
+        let confirm =
+            serde_json::to_value(build_delete_drawing_confirm_keyboard(42, -1001234567890))?;
+        assert_eq!(
+            confirm["inline_keyboard"],
+            json!([
+                [
+                    {
+                        "text": "Да, удалить? ❌",
+                        "callback_data": r#"{"a":"del_c","u":"42","c":"-1001234567890"}"#
+                    },
+                    {
+                        "text": "✕",
+                        "callback_data": r#"{"a":"del_x","u":"42","c":"-1001234567890"}"#
+                    }
+                ]
+            ])
+        );
+
+        let frame_confirm = serde_json::to_value(build_delete_drawing_frame_confirm_keyboard(
+            42,
+            -1001234567890,
+            3,
+        ))?;
+        assert_eq!(
+            frame_confirm["inline_keyboard"],
+            json!([
+                [
+                    {
+                        "text": "Удалить #3? ❌",
+                        "callback_data": r#"{"a":"del_fc","u":"42","c":"-1001234567890","n":"3"}"#
+                    },
+                    {
+                        "text": "✕",
+                        "callback_data": r#"{"a":"del_x","u":"42","c":"-1001234567890"}"#
+                    }
+                ]
+            ])
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn delete_drawing_frame_picker_chunks_buttons_like_go() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let picker = serde_json::to_value(build_delete_drawing_frame_picker_keyboard(
+            42,
+            -1001234567890,
+            6,
+        ))?;
+        assert_eq!(
+            picker["inline_keyboard"],
+            json!([
+                [
+                    {
+                        "text": "#1",
+                        "callback_data": r#"{"a":"del_fp","u":"42","c":"-1001234567890","n":"1"}"#
+                    },
+                    {
+                        "text": "#2",
+                        "callback_data": r#"{"a":"del_fp","u":"42","c":"-1001234567890","n":"2"}"#
+                    },
+                    {
+                        "text": "#3",
+                        "callback_data": r#"{"a":"del_fp","u":"42","c":"-1001234567890","n":"3"}"#
+                    },
+                    {
+                        "text": "#4",
+                        "callback_data": r#"{"a":"del_fp","u":"42","c":"-1001234567890","n":"4"}"#
+                    },
+                    {
+                        "text": "#5",
+                        "callback_data": r#"{"a":"del_fp","u":"42","c":"-1001234567890","n":"5"}"#
+                    }
+                ],
+                [
+                    {
+                        "text": "#6",
+                        "callback_data": r#"{"a":"del_fp","u":"42","c":"-1001234567890","n":"6"}"#
+                    },
+                    {
+                        "text": "Всё",
+                        "callback_data": r#"{"a":"del_c","u":"42","c":"-1001234567890"}"#
+                    },
+                    {
+                        "text": "✕",
+                        "callback_data": r#"{"a":"del_x","u":"42","c":"-1001234567890"}"#
+                    }
+                ]
+            ])
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn lyrics_delete_keyboards_match_go_layouts() -> Result<(), Box<dyn std::error::Error>> {
+        let initial = serde_json::to_value(build_lyrics_delete_keyboard(42, -1001234567890))?;
+        assert_eq!(
+            initial["inline_keyboard"],
+            json!([
+                [
+                    {
+                        "text": "🗑 Удалить текст",
+                        "callback_data": r#"{"a":"dl_i","u":"42","c":"-1001234567890"}"#
+                    }
+                ]
+            ])
+        );
+
+        let confirm =
+            serde_json::to_value(build_lyrics_delete_confirm_keyboard(42, -1001234567890))?;
+        assert_eq!(
+            confirm["inline_keyboard"],
+            json!([
+                [
+                    {
+                        "text": "Да, удалить",
+                        "callback_data": r#"{"a":"dl_c","u":"42","c":"-1001234567890"}"#
+                    },
+                    {
+                        "text": "✕",
+                        "callback_data": r#"{"a":"dl_x","u":"42","c":"-1001234567890"}"#
+                    }
+                ]
+            ])
+        );
+
+        Ok(())
     }
 
     #[test]

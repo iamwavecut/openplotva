@@ -2,10 +2,14 @@
 
 use std::collections::BTreeMap;
 
+use carapax::types::{InlineKeyboardButton, InlineKeyboardMarkup};
 use serde::Serialize;
 
 use crate::{
-    outbound::{CallbackAnswerRequest, build_callback_answer_method},
+    outbound::{
+        CallbackAnswerRequest, build_callback_answer_method, build_inline_keyboard_button_data,
+        build_inline_keyboard_markup, build_inline_keyboard_row,
+    },
     transport::TelegramOutboundMethod,
 };
 
@@ -170,6 +174,126 @@ pub fn delete_lyrics_callback_data(action: &str, user_id: i64, chat_id: i64) -> 
         chat_id: chat_id.to_string(),
     })
     .expect("delete lyrics callback data serialization cannot fail")
+}
+
+/// Build Go `buildDeleteDrawingInitialKeyboard` inline controls.
+#[must_use]
+pub fn build_delete_drawing_initial_keyboard(user_id: i64, chat_id: i64) -> InlineKeyboardMarkup {
+    build_inline_keyboard_markup([build_inline_keyboard_row([
+        build_inline_keyboard_button_data(
+            "🗑️ Удалить",
+            delete_drawing_callback_data(DELETE_DRAWING_ACTION_INIT, user_id, chat_id, 0),
+        ),
+        build_inline_keyboard_button_data(
+            "✕",
+            delete_drawing_callback_data(DELETE_DRAWING_ACTION_CLOSE, user_id, chat_id, 0),
+        ),
+    ])])
+}
+
+/// Build Go `buildDeleteDrawingConfirmKeyboard` inline controls.
+#[must_use]
+pub fn build_delete_drawing_confirm_keyboard(user_id: i64, chat_id: i64) -> InlineKeyboardMarkup {
+    build_inline_keyboard_markup([build_inline_keyboard_row([
+        build_inline_keyboard_button_data(
+            "Да, удалить? ❌",
+            delete_drawing_callback_data(DELETE_DRAWING_ACTION_CONFIRM, user_id, chat_id, 0),
+        ),
+        build_inline_keyboard_button_data(
+            "✕",
+            delete_drawing_callback_data(DELETE_DRAWING_ACTION_CLOSE, user_id, chat_id, 0),
+        ),
+    ])])
+}
+
+/// Build Go `buildDeleteDrawingFramePickerKeyboard` inline controls.
+#[must_use]
+pub fn build_delete_drawing_frame_picker_keyboard(
+    user_id: i64,
+    chat_id: i64,
+    frame_count: i64,
+) -> InlineKeyboardMarkup {
+    let mut buttons = Vec::new();
+    for frame_num in 1..=frame_count {
+        buttons.push(build_inline_keyboard_button_data(
+            format!("#{frame_num}"),
+            delete_drawing_callback_data(
+                DELETE_DRAWING_ACTION_FRAME_PICK,
+                user_id,
+                chat_id,
+                frame_num,
+            ),
+        ));
+    }
+    buttons.push(build_inline_keyboard_button_data(
+        "Всё",
+        delete_drawing_callback_data(DELETE_DRAWING_ACTION_CONFIRM, user_id, chat_id, 0),
+    ));
+    buttons.push(build_inline_keyboard_button_data(
+        "✕",
+        delete_drawing_callback_data(DELETE_DRAWING_ACTION_CLOSE, user_id, chat_id, 0),
+    ));
+    build_inline_keyboard_markup(chunk_inline_keyboard_buttons(buttons, 5))
+}
+
+/// Build Go `buildDeleteDrawingFrameConfirmKeyboard` inline controls.
+#[must_use]
+pub fn build_delete_drawing_frame_confirm_keyboard(
+    user_id: i64,
+    chat_id: i64,
+    frame_num: i64,
+) -> InlineKeyboardMarkup {
+    build_inline_keyboard_markup([build_inline_keyboard_row([
+        build_inline_keyboard_button_data(
+            format!("Удалить #{frame_num}? ❌"),
+            delete_drawing_callback_data(
+                DELETE_DRAWING_ACTION_FRAME_CONFIRM,
+                user_id,
+                chat_id,
+                frame_num,
+            ),
+        ),
+        build_inline_keyboard_button_data(
+            "✕",
+            delete_drawing_callback_data(DELETE_DRAWING_ACTION_CLOSE, user_id, chat_id, 0),
+        ),
+    ])])
+}
+
+/// Build Go `buildLyricsDeleteKeyboard` inline controls.
+#[must_use]
+pub fn build_lyrics_delete_keyboard(user_id: i64, chat_id: i64) -> InlineKeyboardMarkup {
+    build_inline_keyboard_markup([build_inline_keyboard_row([
+        build_inline_keyboard_button_data(
+            "🗑 Удалить текст",
+            delete_lyrics_callback_data(DELETE_LYRICS_ACTION_INIT, user_id, chat_id),
+        ),
+    ])])
+}
+
+/// Build Go `buildLyricsDeleteConfirmKeyboard` inline controls.
+#[must_use]
+pub fn build_lyrics_delete_confirm_keyboard(user_id: i64, chat_id: i64) -> InlineKeyboardMarkup {
+    build_inline_keyboard_markup([build_inline_keyboard_row([
+        build_inline_keyboard_button_data(
+            "Да, удалить",
+            delete_lyrics_callback_data(DELETE_LYRICS_ACTION_CONFIRM, user_id, chat_id),
+        ),
+        build_inline_keyboard_button_data(
+            "✕",
+            delete_lyrics_callback_data(DELETE_LYRICS_ACTION_CLOSE, user_id, chat_id),
+        ),
+    ])])
+}
+
+fn chunk_inline_keyboard_buttons(
+    buttons: Vec<InlineKeyboardButton>,
+    max_per_row: usize,
+) -> Vec<Vec<InlineKeyboardButton>> {
+    buttons
+        .chunks(max_per_row)
+        .map(<[InlineKeyboardButton]>::to_vec)
+        .collect()
 }
 
 #[derive(Serialize)]
