@@ -826,6 +826,28 @@ pub fn build_message_meta(
     meta
 }
 
+/// Go fetcher message context fields needed before higher-level routing is ported.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FetcherMessageContext {
+    /// Original `Message.Text` before Go fills fallback content from captions or media.
+    pub original_text: String,
+    /// Go fetcher message text after fallback extraction.
+    pub text: String,
+    /// Go `buildMessageMeta` output.
+    pub meta: ChatMessageMeta,
+}
+
+/// Build the history-relevant part of Go `Fetcher.newMessageContext`.
+#[must_use]
+pub fn build_fetcher_message_context(message: &TelegramMessage) -> FetcherMessageContext {
+    let sender = resolve_message_sender(Some(message));
+    FetcherMessageContext {
+        original_text: message_text_before_fetcher_fallback(message),
+        text: fetcher_message_text(message),
+        meta: build_message_meta(Some(message), sender, &[], ""),
+    }
+}
+
 /// Go `dialog.MessageKindText` history kind.
 pub const HISTORY_MESSAGE_KIND_TEXT: &str = "text";
 
@@ -1336,6 +1358,13 @@ pub fn fetcher_message_text(message: &TelegramMessage) -> String {
         )
         .trim()
         .to_owned(),
+        _ => String::new(),
+    }
+}
+
+fn message_text_before_fetcher_fallback(message: &TelegramMessage) -> String {
+    match &message.data {
+        TelegramMessageData::Text(text) => text.as_ref().to_owned(),
         _ => String::new(),
     }
 }

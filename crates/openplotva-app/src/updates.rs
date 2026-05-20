@@ -12,8 +12,8 @@ use carapax::types::{Update as TelegramUpdate, UpdateType as TelegramUpdateType}
 use openplotva_core::{ChatMessageMeta, ChatState, UserState};
 use openplotva_updates::{
     HistoryTextEntry, UpdateConsumerConfig, UpdateProcessReport, UpdateStageOutcome,
-    build_history_text_entry, extract_update_state, fetcher_message_text,
-    should_skip_side_effects_at,
+    build_fetcher_message_context, build_history_text_entry, extract_update_state,
+    fetcher_message_text, should_skip_side_effects_at,
 };
 use thiserror::Error;
 use time::{Date, OffsetDateTime};
@@ -302,6 +302,32 @@ pub enum EditedMessageHistoryError {
     },
 }
 
+/// Report for history side effects derived directly from one decoded update.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct UpdateHistoryPersistenceReport {
+    /// Whether an inbound `message` update created or replaced a text history entry.
+    pub inbound_entry_persisted: bool,
+    /// Whether an inbound `edited_message` update found and updated an existing text entry.
+    pub edited_entry_updated: bool,
+}
+
+/// Error returned while persisting history side effects derived from a decoded update.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum UpdateHistoryPersistenceError {
+    /// Inbound message history persistence failed.
+    #[error("inbound message history: {message}")]
+    Inbound {
+        /// Display form of the persistence error.
+        message: String,
+    },
+    /// Edited message history persistence failed.
+    #[error("edited message history: {message}")]
+    Edited {
+        /// Display form of the persistence error.
+        message: String,
+    },
+}
+
 /// Build and persist the Go-shaped history entry for one inbound Telegram message update.
 pub async fn persist_inbound_message_history<S>(
     store: &S,
@@ -361,6 +387,53 @@ where
         })?;
 
     Ok(EditedMessageHistoryReport { entry_updated })
+}
+
+/// Persist Go history side effects for one decoded update using fetcher-derived context.
+pub async fn persist_update_history<S>(
+    store: &S,
+    update: &TelegramUpdate,
+    bot_id: i64,
+) -> Result<UpdateHistoryPersistenceReport, UpdateHistoryPersistenceError>
+where
+    S: InboundHistoryStore + EditedHistoryStore + Sync,
+{
+    match &update.update_type {
+        TelegramUpdateType::Message(message) => {
+            let context = build_fetcher_message_context(message);
+            let report = persist_inbound_message_history(
+                store,
+                update,
+                &context.original_text,
+                context.meta,
+                bot_id,
+            )
+            .await
+            .map_err(|error| UpdateHistoryPersistenceError::Inbound {
+                message: error.to_string(),
+            })?;
+
+            Ok(UpdateHistoryPersistenceReport {
+                inbound_entry_persisted: report.entry_persisted,
+                edited_entry_updated: false,
+            })
+        }
+        TelegramUpdateType::EditedMessage(message) => {
+            let context = build_fetcher_message_context(message);
+            let report =
+                persist_edited_message_history(store, update, &context.original_text, context.meta)
+                    .await
+                    .map_err(|error| UpdateHistoryPersistenceError::Edited {
+                        message: error.to_string(),
+                    })?;
+
+            Ok(UpdateHistoryPersistenceReport {
+                inbound_entry_persisted: false,
+                edited_entry_updated: report.entry_updated,
+            })
+        }
+        _ => Ok(UpdateHistoryPersistenceReport::default()),
+    }
 }
 
 /// Process one decoded update with app-owned state persistence and an injected handler.
@@ -685,6 +758,56 @@ mod tests {
                 meta,
             }]
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn persist_update_history_derives_go_context_for_inbound_caption_message()
+    -> Result<(), Box<dyn Error>> {
+        let store = HistoryStoreStub::default();
+
+        let report =
+            super::persist_update_history(&store, &sample_caption_message_update()?, 0).await?;
+
+        assert!(report.inbound_entry_persisted);
+        assert!(!report.edited_entry_updated);
+        assert!(store.edits().is_empty());
+        let entries = store.entries();
+        assert_eq!(entries.len(), 1);
+
+        let payload: Value = serde_json::from_slice(&entries[0].payload)?;
+        assert_eq!(payload["text"], "photo caption");
+        assert!(payload.get("original_text").is_none());
+        assert_eq!(payload["meta"]["type"], "image");
+        assert_eq!(payload["meta"]["attachments"][0]["kind"], "image");
+        assert_eq!(
+            payload["meta"]["attachments"][0]["file_unique_id"],
+            "photo-large-u"
+        );
+        assert!(payload["meta"]["attachments"][0].get("caption").is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn persist_update_history_derives_go_context_for_edited_message()
+    -> Result<(), Box<dyn Error>> {
+        let store = HistoryStoreStub::default();
+
+        let report =
+            super::persist_update_history(&store, &sample_edited_message_update()?, 0).await?;
+
+        assert!(!report.inbound_entry_persisted);
+        assert!(report.edited_entry_updated);
+        assert!(store.entries().is_empty());
+        let edits = store.edits();
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].chat_id, 42);
+        assert_eq!(edits[0].message_id, 77);
+        assert_eq!(edits[0].new_text, " edited text ");
+        assert_eq!(edits[0].original_text, " edited text ");
+        assert_eq!(edits[0].meta.message_type, "text");
+        assert_eq!(edits[0].meta.sender_id, 99);
+        assert_eq!(edits[0].meta.sender_name, "Ada");
         Ok(())
     }
 
@@ -1121,6 +1244,43 @@ mod tests {
                     "username": "ada_l"
                 },
                 "text": " edited text "
+            }
+        }))
+    }
+
+    fn sample_caption_message_update() -> Result<TelegramUpdate, serde_json::Error> {
+        serde_json::from_value(json!({
+            "update_id": 12347,
+            "message": {
+                "message_id": 78,
+                "date": 1_710_000_000,
+                "chat": {
+                    "id": 42,
+                    "type": "private",
+                    "first_name": "Ada",
+                    "username": "ada_l"
+                },
+                "from": {
+                    "id": 99,
+                    "is_bot": false,
+                    "first_name": "Ada",
+                    "username": "ada_l"
+                },
+                "caption": " photo caption ",
+                "photo": [
+                    {
+                        "file_id": "photo-small",
+                        "file_unique_id": "photo-small-u",
+                        "width": 1,
+                        "height": 1
+                    },
+                    {
+                        "file_id": "photo-large",
+                        "file_unique_id": "photo-large-u",
+                        "width": 1024,
+                        "height": 768
+                    }
+                ]
             }
         }))
     }
