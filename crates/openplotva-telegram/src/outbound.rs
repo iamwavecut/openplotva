@@ -4,10 +4,11 @@ use std::{borrow::Cow, fmt, io::Cursor};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use carapax::types::{
-    DeleteMessage, EditMessageCaption, EditMessageMedia, EditMessageReplyMarkup, EditMessageText,
-    InlineKeyboardMarkup, InputFile, InputFileReader, InputMedia, InputMediaError, InputMediaPhoto,
-    MediaGroup, MediaGroupError, MediaGroupItem, ParseMode, ReplyMarkup, ReplyParameters,
-    ReplyParametersError, SendAudio, SendMediaGroup, SendMessage, SendPhoto, SendSticker,
+    ChatAction, DeleteMessage, EditMessageCaption, EditMessageMedia, EditMessageReplyMarkup,
+    EditMessageText, InlineKeyboardMarkup, InputFile, InputFileReader, InputMedia, InputMediaError,
+    InputMediaPhoto, MediaGroup, MediaGroupError, MediaGroupItem, ParseMode, ReplyMarkup,
+    ReplyParameters, ReplyParametersError, SendAudio, SendChatAction, SendMediaGroup, SendMessage,
+    SendPhoto, SendSticker,
 };
 use crc::{CRC_32_ISCSI, Crc};
 use serde_json::{Map, Value, json};
@@ -136,6 +137,17 @@ pub struct EditReplyMarkupMessageRequest {
     pub message_id: i64,
     /// Replacement inline keyboard markup, including Go's explicit empty markup.
     pub reply_markup: InlineKeyboardMarkup,
+}
+
+/// Chat action request fields used by Go `api.NewChatAction` call sites.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChatActionRequest {
+    /// Target chat.
+    pub chat: ChatRef,
+    /// Target topic ID; Go omits zero values.
+    pub message_thread_id: i64,
+    /// Telegram chat action string, such as `typing` or `upload_photo`.
+    pub action: String,
 }
 
 /// Delete request fields used by Go `api.NewDeleteMessage` call sites.
@@ -375,6 +387,12 @@ pub enum OutboundBuildError {
     /// Go: `chat is not set`.
     #[error("chat is not set")]
     ChatNotSet,
+    /// Go drops blank chat action requests before sending.
+    #[error("chat action is required")]
+    ChatActionRequired,
+    /// `carapax` models Telegram chat actions as a closed enum.
+    #[error("unsupported Telegram chat action: {0}")]
+    UnsupportedChatAction(String),
     /// Go: `message ID is required for editing`.
     #[error("message ID is required for editing")]
     MessageIdRequired,
@@ -500,6 +518,22 @@ pub fn build_edit_reply_markup_message_method(
         EditMessageReplyMarkup::for_chat_message(req.chat.id, req.message_id)
             .with_reply_markup(req.reply_markup.clone()),
     )
+}
+
+/// Build an outbound `sendChatAction` method.
+pub fn build_chat_action_method(
+    req: &ChatActionRequest,
+) -> Result<SendChatAction, OutboundBuildError> {
+    if req.chat.id == 0 {
+        return Err(OutboundBuildError::ChatNotSet);
+    }
+
+    let action = chat_action_from_go(&req.action)?;
+    let mut method = SendChatAction::new(req.chat.id, action);
+    if req.message_thread_id != 0 {
+        method = method.with_message_thread_id(req.message_thread_id);
+    }
+    Ok(method)
 }
 
 /// Build an outbound `deleteMessage` method.
@@ -699,6 +733,28 @@ pub fn forum_thread_id(chat: ChatRef, message_thread_id: i64) -> Option<i64> {
 /// Go pointer default for `AllowSendingWithoutReply`.
 pub fn allow_sending_without_reply(value: Option<bool>) -> bool {
     value.unwrap_or(true)
+}
+
+fn chat_action_from_go(action: &str) -> Result<ChatAction, OutboundBuildError> {
+    let action = action.trim();
+    if action.is_empty() {
+        return Err(OutboundBuildError::ChatActionRequired);
+    }
+
+    match action {
+        "choose_sticker" => Ok(ChatAction::ChooseSticker),
+        "find_location" => Ok(ChatAction::FindLocation),
+        "record_video" => Ok(ChatAction::RecordVideo),
+        "record_voice" => Ok(ChatAction::RecordVoice),
+        "record_video_note" => Ok(ChatAction::RecordVideoNote),
+        "typing" => Ok(ChatAction::Typing),
+        "upload_document" => Ok(ChatAction::UploadDocument),
+        "upload_photo" => Ok(ChatAction::UploadPhoto),
+        "upload_video" => Ok(ChatAction::UploadVideo),
+        "upload_video_note" => Ok(ChatAction::UploadVideoNote),
+        "upload_voice" => Ok(ChatAction::UploadVoice),
+        other => Err(OutboundBuildError::UnsupportedChatAction(other.to_owned())),
+    }
 }
 
 /// Convert Go parse mode strings into `carapax` parse modes.
@@ -1184,20 +1240,20 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        AudioMessagePlan, AudioMessageRequest, AudioSource, ChatRef, DeleteMessageRequest,
-        EditCaptionMessageRequest, EditMediaMessagePlan, EditMediaMessageRequest,
-        EditReplyMarkupMessageRequest, EditTextMessageRequest, MESSAGE_TYPE_TEXT,
-        MediaGroupMessagePlan, MediaGroupMessageRequest, MediaGroupPhotoItem, MessageFingerprint,
-        OutboundBuildError, PhotoMessagePlan, PhotoMessageRequest, PhotoSource, ReplyMessageRef,
-        ReplyParametersPlan, StickerMessagePlan, StickerMessageRequest, TextMessageRequest,
-        allow_sending_without_reply, build_audio_message_method, build_audio_message_plan,
-        build_delete_message_method, build_edit_caption_message_method,
-        build_edit_media_message_method, build_edit_media_message_plan,
-        build_edit_reply_markup_message_method, build_edit_text_message_method,
-        build_media_group_message_method, build_media_group_message_plan,
-        build_photo_message_method, build_photo_message_plan, build_sticker_message_method,
-        build_sticker_message_plan, build_text_message_method, build_text_message_methods,
-        fingerprint_audio_message_plan, fingerprint_photo_message_plan,
+        AudioMessagePlan, AudioMessageRequest, AudioSource, ChatActionRequest, ChatRef,
+        DeleteMessageRequest, EditCaptionMessageRequest, EditMediaMessagePlan,
+        EditMediaMessageRequest, EditReplyMarkupMessageRequest, EditTextMessageRequest,
+        MESSAGE_TYPE_TEXT, MediaGroupMessagePlan, MediaGroupMessageRequest, MediaGroupPhotoItem,
+        MessageFingerprint, OutboundBuildError, PhotoMessagePlan, PhotoMessageRequest, PhotoSource,
+        ReplyMessageRef, ReplyParametersPlan, StickerMessagePlan, StickerMessageRequest,
+        TextMessageRequest, allow_sending_without_reply, build_audio_message_method,
+        build_audio_message_plan, build_chat_action_method, build_delete_message_method,
+        build_edit_caption_message_method, build_edit_media_message_method,
+        build_edit_media_message_plan, build_edit_reply_markup_message_method,
+        build_edit_text_message_method, build_media_group_message_method,
+        build_media_group_message_plan, build_photo_message_method, build_photo_message_plan,
+        build_sticker_message_method, build_sticker_message_plan, build_text_message_method,
+        build_text_message_methods, fingerprint_audio_message_plan, fingerprint_photo_message_plan,
         fingerprint_sticker_message_plan, fingerprint_text_message_part, forum_thread_id,
         hash_content, message_target_chat, validate_text_message_text,
     };
@@ -2156,6 +2212,63 @@ mod tests {
 
         assert_eq!(payload["chat_id"], json!(42));
         assert_eq!(payload["message_id"], json!(77));
+
+        Ok(())
+    }
+
+    #[test]
+    fn build_chat_action_method_matches_go_request_validation_and_thread_payload()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(
+            build_chat_action_method(&ChatActionRequest {
+                chat: private_chat(0),
+                message_thread_id: 0,
+                action: "typing".to_owned(),
+            })
+            .err(),
+            Some(OutboundBuildError::ChatNotSet),
+        );
+        assert_eq!(
+            build_chat_action_method(&ChatActionRequest {
+                chat: private_chat(42),
+                message_thread_id: 0,
+                action: " ".to_owned(),
+            })
+            .err(),
+            Some(OutboundBuildError::ChatActionRequired),
+        );
+
+        let typing = build_chat_action_method(&ChatActionRequest {
+            chat: private_chat(42),
+            message_thread_id: 5,
+            action: "typing".to_owned(),
+        })?;
+        let typing_payload = serde_json::to_value(typing)?;
+        assert_eq!(typing_payload["chat_id"], json!(42));
+        assert_eq!(typing_payload["message_thread_id"], json!(5));
+        assert_eq!(typing_payload["action"], json!("typing"));
+
+        let upload_voice = build_chat_action_method(&ChatActionRequest {
+            chat: private_chat(43),
+            message_thread_id: 0,
+            action: "upload_voice".to_owned(),
+        })?;
+        let upload_voice_payload = serde_json::to_value(upload_voice)?;
+        assert_eq!(upload_voice_payload["chat_id"], json!(43));
+        assert!(upload_voice_payload.get("message_thread_id").is_none());
+        assert_eq!(upload_voice_payload["action"], json!("upload_voice"));
+
+        assert_eq!(
+            build_chat_action_method(&ChatActionRequest {
+                chat: private_chat(44),
+                message_thread_id: 0,
+                action: "non_telegram_action".to_owned(),
+            })
+            .err(),
+            Some(OutboundBuildError::UnsupportedChatAction(
+                "non_telegram_action".to_owned()
+            )),
+        );
 
         Ok(())
     }

@@ -2,8 +2,8 @@ use carapax::{
     api::{Client, ExecuteError},
     types::{
         DeleteMessage, EditMessageCaption, EditMessageMedia, EditMessageReplyMarkup,
-        EditMessageResult, EditMessageText, Message, SendAudio, SendMediaGroup, SendMessage,
-        SendPhoto, SendSticker,
+        EditMessageResult, EditMessageText, Message, SendAudio, SendChatAction, SendMediaGroup,
+        SendMessage, SendPhoto, SendSticker,
     },
 };
 
@@ -22,6 +22,8 @@ pub enum TelegramOutboundMethod {
     SendAudio(Box<SendAudio>),
     /// Telegram `sendMediaGroup`.
     SendMediaGroup(Box<SendMediaGroup>),
+    /// Telegram `sendChatAction`.
+    SendChatAction(Box<SendChatAction>),
     /// Telegram `editMessageText`.
     EditMessageText(Box<EditMessageText>),
     /// Telegram `editMessageCaption`.
@@ -47,6 +49,8 @@ pub enum TelegramOutboundMethodKind {
     SendAudio,
     /// Telegram `sendMediaGroup`.
     SendMediaGroup,
+    /// Telegram `sendChatAction`.
+    SendChatAction,
     /// Telegram `editMessageText`.
     EditMessageText,
     /// Telegram `editMessageCaption`.
@@ -94,6 +98,7 @@ impl TelegramOutboundMethod {
             Self::SendPhoto(_) => TelegramOutboundMethodKind::SendPhoto,
             Self::SendAudio(_) => TelegramOutboundMethodKind::SendAudio,
             Self::SendMediaGroup(_) => TelegramOutboundMethodKind::SendMediaGroup,
+            Self::SendChatAction(_) => TelegramOutboundMethodKind::SendChatAction,
             Self::EditMessageText(_) => TelegramOutboundMethodKind::EditMessageText,
             Self::EditMessageCaption(_) => TelegramOutboundMethodKind::EditMessageCaption,
             Self::EditMessageReplyMarkup(_) => TelegramOutboundMethodKind::EditMessageReplyMarkup,
@@ -110,6 +115,7 @@ impl TelegramOutboundMethod {
             Self::SendPhoto(_) => "sendPhoto",
             Self::SendAudio(_) => "sendAudio",
             Self::SendMediaGroup(_) => "sendMediaGroup",
+            Self::SendChatAction(_) => "sendChatAction",
             Self::EditMessageText(_) => "editMessageText",
             Self::EditMessageCaption(_) => "editMessageCaption",
             Self::EditMessageReplyMarkup(_) => "editMessageReplyMarkup",
@@ -126,6 +132,7 @@ impl TelegramOutboundMethod {
             | Self::SendPhoto(_)
             | Self::SendAudio(_) => TelegramOutboundResponseKind::Message,
             Self::SendMediaGroup(_) => TelegramOutboundResponseKind::Messages,
+            Self::SendChatAction(_) => TelegramOutboundResponseKind::Boolean,
             Self::EditMessageText(_)
             | Self::EditMessageCaption(_)
             | Self::EditMessageReplyMarkup(_)
@@ -169,6 +176,10 @@ pub async fn execute_telegram_method(
             .execute(*method)
             .await
             .map(TelegramOutboundResponse::Messages),
+        TelegramOutboundMethod::SendChatAction(method) => client
+            .execute(*method)
+            .await
+            .map(TelegramOutboundResponse::Boolean),
         TelegramOutboundMethod::EditMessageText(method) => client
             .execute(*method)
             .await
@@ -233,6 +244,12 @@ impl From<SendMediaGroup> for TelegramOutboundMethod {
     }
 }
 
+impl From<SendChatAction> for TelegramOutboundMethod {
+    fn from(value: SendChatAction) -> Self {
+        Self::SendChatAction(Box::new(value))
+    }
+}
+
 impl From<EditMessageText> for TelegramOutboundMethod {
     fn from(value: EditMessageText) -> Self {
         Self::EditMessageText(Box::new(value))
@@ -267,14 +284,15 @@ impl From<DeleteMessage> for TelegramOutboundMethod {
 mod tests {
     use super::{TelegramOutboundMethod, TelegramOutboundMethodKind, TelegramOutboundResponseKind};
     use crate::{
-        AudioMessageRequest, AudioSource, ChatRef, EditCaptionMessageRequest,
+        AudioMessageRequest, AudioSource, ChatActionRequest, ChatRef, EditCaptionMessageRequest,
         EditMediaMessageRequest, EditReplyMarkupMessageRequest, EditTextMessageRequest,
         InlineKeyboardButton, InlineKeyboardMarkup, MediaGroupMessageRequest, MediaGroupPhotoItem,
         PhotoMessageRequest, PhotoSource, StickerMessageRequest, TELEGRAM_PARSE_MODE_HTML,
-        TextMessageRequest, build_audio_message_method, build_edit_caption_message_method,
-        build_edit_media_message_method, build_edit_reply_markup_message_method,
-        build_edit_text_message_method, build_media_group_message_method,
-        build_photo_message_method, build_sticker_message_method, build_text_message_method,
+        TextMessageRequest, build_audio_message_method, build_chat_action_method,
+        build_edit_caption_message_method, build_edit_media_message_method,
+        build_edit_reply_markup_message_method, build_edit_text_message_method,
+        build_media_group_message_method, build_photo_message_method, build_sticker_message_method,
+        build_text_message_method,
     };
 
     fn chat(id: i64) -> ChatRef {
@@ -398,6 +416,14 @@ mod tests {
             })
             .expect("edit reply markup method"),
         );
+        let chat_action = TelegramOutboundMethod::from(
+            build_chat_action_method(&ChatActionRequest {
+                chat: chat(42),
+                message_thread_id: 0,
+                action: "typing".to_owned(),
+            })
+            .expect("chat action method"),
+        );
         let delete_message =
             TelegramOutboundMethod::from(carapax::types::DeleteMessage::new(42, 7));
 
@@ -455,6 +481,12 @@ mod tests {
                 TelegramOutboundMethodKind::EditMessageReplyMarkup,
                 "editMessageReplyMarkup",
                 TelegramOutboundResponseKind::EditMessage,
+            ),
+            (
+                chat_action,
+                TelegramOutboundMethodKind::SendChatAction,
+                "sendChatAction",
+                TelegramOutboundResponseKind::Boolean,
             ),
             (
                 delete_message,

@@ -332,6 +332,7 @@ fn replay_method_from_value(
         TelegramOutboundMethodKind::SendPhoto => replay_photo_method(value),
         TelegramOutboundMethodKind::SendAudio => replay_audio_method(value),
         TelegramOutboundMethodKind::SendMediaGroup => replay_media_group_method(value),
+        TelegramOutboundMethodKind::SendChatAction => None,
         TelegramOutboundMethodKind::EditMessageText => replay_edit_text_method(value),
         TelegramOutboundMethodKind::EditMessageCaption
         | TelegramOutboundMethodKind::EditMessageReplyMarkup => None,
@@ -501,7 +502,8 @@ fn fingerprint_from_value(
             content_hash: hash_content(&value.to_string()),
             debounce_key: None,
         },
-        TelegramOutboundMethodKind::EditMessageText
+        TelegramOutboundMethodKind::SendChatAction
+        | TelegramOutboundMethodKind::EditMessageText
         | TelegramOutboundMethodKind::EditMessageCaption
         | TelegramOutboundMethodKind::EditMessageReplyMarkup
         | TelegramOutboundMethodKind::EditMessageMedia
@@ -692,6 +694,7 @@ fn serialize_outbound_method(
         | TelegramOutboundMethod::SendPhoto(_)
         | TelegramOutboundMethod::SendAudio(_)
         | TelegramOutboundMethod::SendMediaGroup(_)
+        | TelegramOutboundMethod::SendChatAction(_)
         | TelegramOutboundMethod::EditMessageCaption(_)
         | TelegramOutboundMethod::EditMessageReplyMarkup(_)
         | TelegramOutboundMethod::EditMessageMedia(_)
@@ -706,6 +709,7 @@ fn go_message_type(kind: TelegramOutboundMethodKind) -> &'static str {
         TelegramOutboundMethodKind::SendPhoto => "*api.PhotoConfig",
         TelegramOutboundMethodKind::SendAudio => "*api.AudioConfig",
         TelegramOutboundMethodKind::SendMediaGroup => "*api.MediaGroupConfig",
+        TelegramOutboundMethodKind::SendChatAction => "*api.ChatActionConfig",
         TelegramOutboundMethodKind::EditMessageText => "*api.EditMessageTextConfig",
         TelegramOutboundMethodKind::EditMessageCaption => "*api.EditMessageCaptionConfig",
         TelegramOutboundMethodKind::EditMessageReplyMarkup => "*api.EditMessageReplyMarkupConfig",
@@ -736,6 +740,10 @@ fn message_type_method_kind(message_type: &str) -> Option<TelegramOutboundMethod
         | "*api.MediaGroupConfig"
         | "tgbotapi.MediaGroupConfig"
         | "api.MediaGroupConfig" => Some(TelegramOutboundMethodKind::SendMediaGroup),
+        "*tgbotapi.ChatActionConfig"
+        | "*api.ChatActionConfig"
+        | "tgbotapi.ChatActionConfig"
+        | "api.ChatActionConfig" => Some(TelegramOutboundMethodKind::SendChatAction),
         "*api.EditMessageTextConfig" | "api.EditMessageTextConfig" => {
             Some(TelegramOutboundMethodKind::EditMessageText)
         }

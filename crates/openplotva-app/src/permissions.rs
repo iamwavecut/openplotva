@@ -295,7 +295,9 @@ pub fn dispatcher_required_actions(
     method_kind: TelegramOutboundMethodKind,
 ) -> &'static [&'static str] {
     match method_kind {
-        TelegramOutboundMethodKind::SendMessage => &[ACTION_SEND_TEXT],
+        TelegramOutboundMethodKind::SendMessage | TelegramOutboundMethodKind::SendChatAction => {
+            &[ACTION_SEND_TEXT]
+        }
         TelegramOutboundMethodKind::SendSticker => &[ACTION_SEND_STICKER, ACTION_SEND_TEXT],
         TelegramOutboundMethodKind::EditMessageText => &[ACTION_EDIT_MESSAGE],
         _ => &[],
@@ -322,9 +324,9 @@ fn is_permission_send_error(message: &str) -> bool {
 
 fn permission_error_media_flag(method_kind: TelegramOutboundMethodKind) -> Option<bool> {
     match method_kind {
-        TelegramOutboundMethodKind::SendMessage | TelegramOutboundMethodKind::EditMessageText => {
-            Some(false)
-        }
+        TelegramOutboundMethodKind::SendMessage
+        | TelegramOutboundMethodKind::SendChatAction
+        | TelegramOutboundMethodKind::EditMessageText => Some(false),
         TelegramOutboundMethodKind::SendSticker
         | TelegramOutboundMethodKind::SendPhoto
         | TelegramOutboundMethodKind::SendAudio
@@ -490,6 +492,10 @@ mod tests {
         assert_eq!(
             dispatcher_required_actions(TelegramOutboundMethodKind::SendSticker),
             &[ACTION_SEND_STICKER, ACTION_SEND_TEXT]
+        );
+        assert_eq!(
+            dispatcher_required_actions(TelegramOutboundMethodKind::SendChatAction),
+            &[ACTION_SEND_TEXT]
         );
         assert_eq!(
             dispatcher_required_actions(TelegramOutboundMethodKind::EditMessageText),
