@@ -2770,6 +2770,112 @@ fn donation_amount_stars_from_command_arguments(arguments: &str) -> Result<i64, 
     }
 }
 
+/// Parsed Go `/admin_grant_vip` command arguments.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AdminGrantVipCommandArgs {
+    /// First positional argument, the number of days.
+    pub duration: String,
+    /// Second positional argument, the user target.
+    pub target: String,
+    /// Remaining arguments collapsed with single spaces.
+    pub reason: String,
+    /// Whether a duration argument was present.
+    pub has_duration: bool,
+    /// Whether a target argument was present.
+    pub has_target: bool,
+}
+
+/// Parse Go `/admin_grant_vip` positional arguments without changing field semantics.
+#[must_use]
+pub fn parse_admin_grant_vip_command_args(raw: &str) -> AdminGrantVipCommandArgs {
+    let mut args = AdminGrantVipCommandArgs::default();
+    let mut reason = String::new();
+    for (index, arg) in raw.split_whitespace().enumerate() {
+        match index {
+            0 => {
+                args.duration = arg.to_owned();
+                args.has_duration = true;
+            }
+            1 => {
+                args.target = arg.to_owned();
+                args.has_target = true;
+            }
+            _ => {
+                if !reason.is_empty() {
+                    reason.push(' ');
+                }
+                reason.push_str(arg);
+            }
+        }
+    }
+    args.reason = reason;
+    args
+}
+
+/// Parse Go `/admin_grant_vip` duration with its default and invalid-duration flag.
+#[must_use]
+pub fn parse_admin_grant_vip_duration(arg: &str, has_duration: bool) -> (i64, bool) {
+    if !has_duration {
+        return (1, false);
+    }
+    match arg.parse::<i64>() {
+        Ok(days) if days != 0 && (-365..=365).contains(&days) => (days, false),
+        _ => (1, true),
+    }
+}
+
+/// Go default reason for `/admin_grant_vip`.
+#[must_use]
+pub fn admin_grant_vip_reason(reason: &str, actor_user_id: i64) -> String {
+    let trimmed = reason.trim();
+    if trimmed.is_empty() {
+        format!("telegram admin adjustment by {actor_user_id}")
+    } else {
+        trimmed.to_owned()
+    }
+}
+
+/// Go action word used in `/admin_grant_vip` success text.
+#[must_use]
+pub fn admin_grant_vip_action_text(duration_days: i64) -> &'static str {
+    if duration_days < 0 {
+        "списано"
+    } else {
+        "добавлено"
+    }
+}
+
+/// Go `/admin_grant_vip` missing-target usage text.
+#[must_use]
+pub fn admin_grant_vip_usage_text() -> &'static str {
+    "⚠️ Пожалуйста, укажите пользователя:\n\
+     • Ответьте на сообщение пользователя, или\n\
+     • Укажите во втором аргументе: user_id, @username или https://t.me/username\n\n\
+     Использование: /admin_grant_vip [дни=1|-1] [user_id/@username/https://t.me/username] [причина]"
+}
+
+/// Go `/admin_grant_vip` success text.
+#[must_use]
+pub fn admin_grant_vip_success_text(
+    target_user_id: i64,
+    duration_days: i64,
+    expires_at: OffsetDateTime,
+    reason: &str,
+    event_id: i64,
+) -> String {
+    format!(
+        "🎉 VIP корректировка успешно записана!\n\n\
+         👤 User ID: {target_user_id}\n\
+         ⏱️ Корректировка: {duration_days} дней ({})\n\
+         📅 Действует до: {}\n\
+         📝 Причина: {reason}\n\n\
+         🎁 Пользователь получает:\n{VIP_BENEFITS_TEXT}\n\n\
+         🆔 Event ID: {event_id}",
+        admin_grant_vip_action_text(duration_days),
+        go_date_time(expires_at)
+    )
+}
+
 fn payment_control_data_from_message(
     message: &TelegramMessage,
     kind: ControlKind,
@@ -3533,6 +3639,17 @@ fn go_date(value: OffsetDateTime) -> String {
     )
 }
 
+fn go_date_time(value: OffsetDateTime) -> String {
+    format!(
+        "{:02}.{:02}.{:04} {:02}:{:02}",
+        value.day(),
+        u8::from(value.month()),
+        value.year(),
+        value.hour(),
+        value.minute()
+    )
+}
+
 fn vip_display_days_left_at(expires_at: OffsetDateTime, now: OffsetDateTime) -> i64 {
     let remaining = expires_at - now;
     if remaining <= time::Duration::ZERO {
@@ -4170,6 +4287,64 @@ mod tests {
         let custom_data = custom_job.data.control_data.as_ref().expect("control data");
         assert_eq!(custom_data.kind, ControlKind::DonateInvoice);
         assert_eq!(custom_data.amount, 777);
+        Ok(())
+    }
+
+    #[test]
+    fn admin_grant_vip_command_args_preserve_go_fields_join_semantics() {
+        let args = super::parse_admin_grant_vip_command_args("  -3   @user   custom   reason  ");
+        assert!(args.has_target);
+        assert_eq!(args.duration, "-3");
+        assert_eq!(args.target, "@user");
+        assert_eq!(args.reason, "custom reason");
+
+        let missing_target = super::parse_admin_grant_vip_command_args("  5  ");
+        assert!(missing_target.has_duration);
+        assert!(!missing_target.has_target);
+        assert_eq!(missing_target.duration, "5");
+        assert_eq!(missing_target.reason, "");
+    }
+
+    #[test]
+    fn admin_grant_vip_duration_reason_and_success_text_match_go() -> Result<(), Box<dyn Error>> {
+        assert_eq!(super::parse_admin_grant_vip_duration("7", true), (7, false));
+        assert_eq!(super::parse_admin_grant_vip_duration("0", true), (1, true));
+        assert_eq!(
+            super::parse_admin_grant_vip_duration("366", true),
+            (1, true)
+        );
+        assert_eq!(super::parse_admin_grant_vip_duration("", false), (1, false));
+        assert_eq!(super::admin_grant_vip_reason("  custom  ", 99), "custom");
+        assert_eq!(
+            super::admin_grant_vip_reason(" ", 99),
+            "telegram admin adjustment by 99"
+        );
+        assert_eq!(super::admin_grant_vip_action_text(-3), "списано");
+        assert_eq!(super::admin_grant_vip_action_text(3), "добавлено");
+
+        let expires_at = time::Date::from_calendar_date(2026, time::Month::May, 19)?
+            .with_hms(12, 30, 0)?
+            .assume_utc();
+        let text = super::admin_grant_vip_success_text(42, -3, expires_at, "reason", 77);
+        for expected in [
+            "User ID: 42",
+            "Корректировка: -3 дней (списано)",
+            "Действует до: 19.05.2026 12:30",
+            "Причина: reason",
+            "Event ID: 77",
+            "Приоритетное выполнение запросов вне очереди",
+        ] {
+            assert!(
+                text.contains(expected),
+                "success text should contain {expected:?}:\n{text}"
+            );
+        }
+
+        assert!(
+            super::admin_grant_vip_usage_text().contains(
+                "Использование: /admin_grant_vip [дни=1|-1] [user_id/@username/https://t.me/username] [причина]"
+            )
+        );
         Ok(())
     }
 
