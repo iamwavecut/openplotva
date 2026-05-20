@@ -72,6 +72,7 @@ pub struct TelegramData {
 
 /// Go control job data.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
 pub struct ControlJobData {
     pub kind: ControlKind,
     #[serde(skip_serializing_if = "is_default_i64")]
@@ -385,6 +386,25 @@ mod tests {
                     "provider_payment_charge_id": "provider-charge"
                 }
             })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn control_job_data_deserializes_sparse_go_payloads_with_defaults()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let data: ControlJobData = serde_json::from_value(json!({
+            "kind": "donate_invoice",
+            "amount": 600
+        }))?;
+
+        assert_eq!(
+            data,
+            ControlJobData {
+                kind: ControlKind::DonateInvoice,
+                amount: 600,
+                ..ControlJobData::default()
+            }
         );
         Ok(())
     }

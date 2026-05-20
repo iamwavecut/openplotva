@@ -26,6 +26,7 @@ use openplotva_taskman::{
     CONTROL_QUEUE_NAME, ControlJobData, ControlJobParams, ControlKind, ControlPayment,
     HIGH_PRIORITY, StatelessJobItem, control_job_params_from_stateless_job, new_control_job_at,
 };
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use time::OffsetDateTime;
 
@@ -99,7 +100,7 @@ pub struct PaymentTextMessage<'value> {
 }
 
 /// Payment processing result class.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum SuccessfulPaymentOutcome {
     /// Payment was ignored because the currency is not Telegram Stars.
     UnsupportedCurrency,
@@ -269,7 +270,7 @@ pub struct VipStatusMessage {
 }
 
 /// Control-job invoice execution result class.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum InvoiceControlJobOutcome {
     /// Invoice link was created and the button message was sent.
     InvoiceSent,
@@ -284,7 +285,7 @@ pub enum InvoiceControlJobOutcome {
 }
 
 /// Invoice control-job report. Go returns errors for request/parse/send failures; Rust reports them.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct InvoiceControlJobReport {
     /// Result class.
     pub outcome: InvoiceControlJobOutcome,
@@ -293,7 +294,7 @@ pub struct InvoiceControlJobReport {
 }
 
 /// Payment-specific taskman control-job routing result.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum PaymentControlJobOutcome {
     /// `vip_invoice` was routed to the VIP invoice executor.
     VipInvoice(InvoiceControlJobOutcome),
@@ -310,7 +311,7 @@ pub enum PaymentControlJobOutcome {
 }
 
 /// Payment-specific taskman control-job execution report.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PaymentControlJobReport {
     /// Result class.
     pub outcome: PaymentControlJobOutcome,
@@ -709,6 +710,10 @@ pub struct InMemoryPaymentControlJobQueue {
     state: Arc<Mutex<InMemoryPaymentControlJobQueueState>>,
 }
 
+/// Version marker for the approved Rust-native payment control-job snapshot codec.
+pub const PAYMENT_CONTROL_JOB_QUEUE_SNAPSHOT_FORMAT: &str =
+    "openplotva.payment-control-job-queue.v1+json";
+
 #[derive(Clone, Debug, Default)]
 struct InMemoryPaymentControlJobQueueState {
     next_id: i64,
@@ -716,7 +721,7 @@ struct InMemoryPaymentControlJobQueueState {
 }
 
 /// In-memory taskman status used by the current payment queue adapter.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum InMemoryPaymentControlJobStatus {
     /// Job is pending worker execution.
     Pending,
@@ -729,7 +734,7 @@ pub enum InMemoryPaymentControlJobStatus {
 }
 
 /// Snapshot row for the in-memory payment taskman adapter.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct InMemoryPaymentControlJobRecord {
     /// Taskman job ID.
     pub id: i64,
@@ -745,12 +750,34 @@ pub struct InMemoryPaymentControlJobRecord {
     pub error: Option<String>,
 }
 
+/// Versioned Rust-native snapshot of the in-memory payment control-job queue.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct InMemoryPaymentControlJobQueueSnapshot {
+    /// Snapshot codec marker.
+    pub format: String,
+    /// Next taskman job ID to assign after restore.
+    pub next_id: i64,
+    /// ID-ordered queue records.
+    pub records: Vec<InMemoryPaymentControlJobRecord>,
+}
+
 /// Error returned by the in-memory payment taskman adapter.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum InMemoryPaymentControlJobQueueError {
     /// A status update targeted a job ID this queue has never assigned.
     #[error("payment control job {0} not found")]
     JobNotFound(i64),
+}
+
+/// Error returned while decoding the Rust-native payment control-job snapshot.
+#[derive(Debug, Error)]
+pub enum PaymentControlJobQueueSnapshotError {
+    /// JSON decoding failed.
+    #[error("decode payment control-job queue snapshot: {0}")]
+    Json(#[from] serde_json::Error),
+    /// Snapshot uses another codec family.
+    #[error("unsupported payment control-job queue snapshot format: {0}")]
+    UnsupportedFormat(String),
 }
 
 impl InMemoryPaymentControlJobQueue {
@@ -771,11 +798,59 @@ impl InMemoryPaymentControlJobQueue {
         self.lock().records.clone()
     }
 
+    /// Return a versioned Rust-native snapshot for durable queue persistence.
+    #[must_use]
+    pub fn persistence_snapshot(&self) -> InMemoryPaymentControlJobQueueSnapshot {
+        let state = self.lock();
+        InMemoryPaymentControlJobQueueSnapshot {
+            format: PAYMENT_CONTROL_JOB_QUEUE_SNAPSHOT_FORMAT.to_owned(),
+            next_id: state.next_id,
+            records: state.records.clone(),
+        }
+    }
+
+    /// Restore an in-memory queue from a decoded Rust-native persistence snapshot.
+    #[must_use]
+    pub fn from_persistence_snapshot(snapshot: InMemoryPaymentControlJobQueueSnapshot) -> Self {
+        let next_id_from_records = snapshot
+            .records
+            .iter()
+            .map(|record| record.id.saturating_add(1))
+            .max()
+            .unwrap_or(1);
+        Self {
+            state: Arc::new(Mutex::new(InMemoryPaymentControlJobQueueState {
+                next_id: snapshot.next_id.max(next_id_from_records).max(1),
+                records: snapshot.records,
+            })),
+        }
+    }
+
     fn lock(&self) -> MutexGuard<'_, InMemoryPaymentControlJobQueueState> {
         self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+}
+
+/// Encode a payment control-job queue snapshot as Rust-native JSON bytes.
+pub fn encode_payment_control_job_queue_snapshot(
+    snapshot: &InMemoryPaymentControlJobQueueSnapshot,
+) -> Result<Vec<u8>, serde_json::Error> {
+    serde_json::to_vec(snapshot)
+}
+
+/// Decode a payment control-job queue snapshot from Rust-native JSON bytes.
+pub fn decode_payment_control_job_queue_snapshot(
+    bytes: &[u8],
+) -> Result<InMemoryPaymentControlJobQueueSnapshot, PaymentControlJobQueueSnapshotError> {
+    let snapshot: InMemoryPaymentControlJobQueueSnapshot = serde_json::from_slice(bytes)?;
+    if snapshot.format != PAYMENT_CONTROL_JOB_QUEUE_SNAPSHOT_FORMAT {
+        return Err(PaymentControlJobQueueSnapshotError::UnsupportedFormat(
+            snapshot.format,
+        ));
+    }
+    Ok(snapshot)
 }
 
 impl Default for InMemoryPaymentControlJobQueue {
@@ -3129,6 +3204,7 @@ mod tests {
         PreCheckoutUpdateRoute, SuccessfulPayment, SuccessfulPaymentControlJobUpdateRoute,
         SuccessfulPaymentDispatcherEffects, SuccessfulPaymentEffects, SuccessfulPaymentMessage,
         SuccessfulPaymentOutcome, SuccessfulPaymentStore, SuccessfulPaymentUpdateRoute,
+        encode_payment_control_job_queue_snapshot,
         enqueue_payment_invoice_command_update_or_else_at,
         enqueue_payment_invoice_command_update_with_vip_status_or_else_at,
         enqueue_successful_payment_update_or_else_at, execute_donate_invoice_control_job,
@@ -5135,6 +5211,81 @@ mod tests {
         );
         assert_eq!(snapshot[1].completed_report, None);
         assert_eq!(snapshot[1].error.as_deref(), Some("invoice failed"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn in_memory_payment_control_job_queue_snapshot_uses_rust_native_json_and_restores_state()
+    -> Result<(), Box<dyn Error>> {
+        let queue = super::InMemoryPaymentControlJobQueue::new();
+        let created = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let low_old = new_control_job_at(sample_invoice_job(ControlKind::DonateInvoice), created)
+            .with_name("donate invoice");
+        let high_new = new_control_job_at(
+            sample_invoice_job(ControlKind::SuccessfulPayment),
+            created + time::Duration::seconds(1),
+        )
+        .with_name("successful payment")
+        .with_priority(HIGH_PRIORITY);
+
+        queue
+            .assign_payment_control_job(CONTROL_QUEUE_NAME, low_old)
+            .await?;
+        queue
+            .assign_payment_control_job(CONTROL_QUEUE_NAME, high_new)
+            .await?;
+        let processing = queue
+            .dequeue_payment_control_job(CONTROL_QUEUE_NAME)
+            .await?
+            .expect("high-priority job");
+        assert_eq!(processing.id, 2);
+        let report =
+            PaymentControlJobReport::new(super::PaymentControlJobOutcome::SuccessfulPayment(
+                SuccessfulPaymentOutcome::SubscriptionProcessed,
+            ));
+        queue
+            .complete_payment_control_job(processing.id, &report)
+            .await?;
+
+        let snapshot = queue.persistence_snapshot();
+        let encoded = encode_payment_control_job_queue_snapshot(&snapshot)?;
+        let encoded_text = std::str::from_utf8(&encoded)?;
+        assert!(encoded_text.starts_with('{'));
+        assert!(encoded_text.contains(super::PAYMENT_CONTROL_JOB_QUEUE_SNAPSHOT_FORMAT));
+
+        let decoded = super::decode_payment_control_job_queue_snapshot(&encoded)?;
+        let restored = super::InMemoryPaymentControlJobQueue::from_persistence_snapshot(decoded);
+        assert_eq!(restored.snapshot(), queue.snapshot());
+
+        let next = new_control_job_at(sample_invoice_job(ControlKind::VipInvoice), created)
+            .with_name("vip invoice");
+        restored
+            .assign_payment_control_job(CONTROL_QUEUE_NAME, next)
+            .await?;
+        assert_eq!(
+            restored
+                .snapshot()
+                .iter()
+                .map(|record| record.id)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        let next_pending = restored
+            .dequeue_payment_control_job(CONTROL_QUEUE_NAME)
+            .await?
+            .expect("old pending job survives restore");
+        assert_eq!(next_pending.id, 1);
+
+        let wrong_format = serde_json::to_vec(&json!({
+            "format": "go-gob",
+            "next_id": 1,
+            "records": []
+        }))?;
+        assert!(matches!(
+            super::decode_payment_control_job_queue_snapshot(&wrong_format),
+            Err(super::PaymentControlJobQueueSnapshotError::UnsupportedFormat(format))
+                if format == "go-gob"
+        ));
         Ok(())
     }
 
