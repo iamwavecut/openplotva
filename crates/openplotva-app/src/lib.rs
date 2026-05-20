@@ -1,6 +1,7 @@
 //! Composition root for the OpenPlotva application shell.
 
 pub mod pending_ops;
+pub mod permissions;
 pub mod rate_limits;
 mod reference_snapshot;
 pub mod updates;
@@ -19,7 +20,8 @@ use axum::{
 use openplotva_config::AppConfig;
 use openplotva_server::{ReadinessCheck, ReadinessResponse};
 use openplotva_storage::{
-    PostgresHistoryStore, PostgresVirtualMessageStore, RedisRateLimitStore, ServiceClients,
+    PostgresChatSettingsStore, PostgresHistoryStore, PostgresVirtualMessageStore,
+    RedisRateLimitStore, ServiceClients,
 };
 use serde::Deserialize;
 use thiserror::Error;
@@ -684,6 +686,9 @@ async fn start_runtime_workers(
     let rate_limit_policy = Arc::new(rate_limits::ChatRateLimitPolicy::new(
         service_clients.redis.rate_limit_store(),
     ));
+    let permission_policy = Arc::new(permissions::ChatPermissionPolicy::new(
+        PostgresChatSettingsStore::new(service_clients.postgres.clone()),
+    ));
 
     let (stop, _) = watch::channel(false);
     let mut workers = RuntimeWorkers {
@@ -724,6 +729,7 @@ async fn start_runtime_workers(
     let immediate_store = store.clone();
     let immediate_telegram = telegram.clone();
     let immediate_rate_limits = Arc::clone(&rate_limit_policy);
+    let immediate_permissions = Arc::clone(&permission_policy);
     let immediate_queue = Arc::clone(&dispatcher_queue);
     let immediate_stop = stop.subscribe();
     let immediate_worker = tokio::spawn(async move {
@@ -733,6 +739,7 @@ async fn start_runtime_workers(
                     immediate_store.clone(),
                     immediate_telegram.clone(),
                     Arc::clone(&immediate_rate_limits),
+                    Arc::clone(&immediate_permissions),
                     item,
                 )
             })
@@ -831,6 +838,7 @@ async fn start_runtime_workers(
     let regular_store = store;
     let regular_telegram = telegram;
     let regular_rate_limits = Arc::clone(&rate_limit_policy);
+    let regular_permissions = Arc::clone(&permission_policy);
     let regular_queue = Arc::clone(&dispatcher_queue);
     let regular_limiters = Arc::clone(&dispatcher_limiters);
     let regular_stop = stop.subscribe();
@@ -844,6 +852,7 @@ async fn start_runtime_workers(
                         regular_store.clone(),
                         regular_telegram.clone(),
                         Arc::clone(&regular_rate_limits),
+                        Arc::clone(&regular_permissions),
                         item,
                     )
                 },
@@ -973,8 +982,35 @@ async fn send_dispatcher_work_item(
     store: PostgresVirtualMessageStore,
     telegram: openplotva_telegram::TelegramClient,
     rate_limits: Arc<rate_limits::ChatRateLimitPolicy<RedisRateLimitStore>>,
+    permissions: Arc<permissions::ChatPermissionPolicy<PostgresChatSettingsStore>>,
     item: openplotva_telegram::DispatcherWorkItem,
 ) -> openplotva_telegram::DispatcherSendStatus {
+    send_dispatcher_work_item_with_transport(
+        store,
+        rate_limits,
+        permissions,
+        item,
+        |method| async move { openplotva_telegram::execute_telegram_method(&telegram, method).await },
+    )
+    .await
+}
+
+async fn send_dispatcher_work_item_with_transport<V, R, P, SendFn, SendFuture>(
+    store: V,
+    rate_limits: Arc<rate_limits::ChatRateLimitPolicy<R>>,
+    permissions: Arc<permissions::ChatPermissionPolicy<P>>,
+    item: openplotva_telegram::DispatcherWorkItem,
+    send: SendFn,
+) -> openplotva_telegram::DispatcherSendStatus
+where
+    V: virtual_messages::VirtualMessageStore + Sync,
+    R: rate_limits::RateLimitStore + Send + Sync,
+    P: permissions::ChatPermissionStore + Send + Sync,
+    SendFn: FnOnce(openplotva_telegram::TelegramOutboundMethod) -> SendFuture,
+    SendFuture: Future<
+        Output = Result<openplotva_telegram::TelegramOutboundResponse, carapax::api::ExecuteError>,
+    >,
+{
     let chat_id = item.metadata().chat_id;
     if chat_id != 0 {
         let check = rate_limits
@@ -992,12 +1028,38 @@ async fn send_dispatcher_work_item(
             return openplotva_telegram::DispatcherSendStatus::Failed;
         }
     }
+    if chat_id != 0
+        && let Some(method_kind) = item.method_kind()
+    {
+        for action in permissions::dispatcher_required_actions(method_kind) {
+            let report = permissions
+                .can_perform_action_at(chat_id, None, action, OffsetDateTime::now_utc())
+                .await;
+            if let Some(load_error) = report.load_error.as_deref() {
+                tracing::debug!(
+                    chat_id,
+                    action,
+                    %load_error,
+                    "failed to load Telegram permission state"
+                );
+            }
+            if !report.allowed {
+                tracing::debug!(
+                    chat_id,
+                    action,
+                    "skipping Telegram send for chat permission settings"
+                );
+                return openplotva_telegram::DispatcherSendStatus::Failed;
+            }
+        }
+    }
 
     let report = virtual_messages::send_work_item_and_resolve(&store, item, |method| {
-        let telegram = telegram.clone();
         let rate_limits = Arc::clone(&rate_limits);
+        let permissions = Arc::clone(&permissions);
         async move {
-            match openplotva_telegram::execute_telegram_method(&telegram, method).await {
+            let method_kind = method.kind();
+            match send(method).await {
                 Ok(response) => Ok(response),
                 Err(error) => {
                     if let Some(retry_after) =
@@ -1012,6 +1074,29 @@ async fn send_dispatcher_work_item(
                                 retry_after_seconds = retry_after.as_secs(),
                                 %save_error,
                                 "failed to persist Telegram rate-limit state"
+                            );
+                        }
+                    }
+                    if chat_id != 0
+                        && permissions::telegram_execute_error_is_permission_error(&error)
+                    {
+                        let report = permissions
+                            .record_send_permission_error(chat_id, method_kind)
+                            .await;
+                        if let Some(load_error) = report.load_error.as_deref() {
+                            tracing::warn!(
+                                chat_id,
+                                method = ?method_kind,
+                                %load_error,
+                                "failed to load chat permission state after Telegram permission error"
+                            );
+                        }
+                        if let Some(save_error) = report.save_error.as_deref() {
+                            tracing::warn!(
+                                chat_id,
+                                method = ?method_kind,
+                                %save_error,
+                                "failed to persist chat permission state after Telegram permission error"
                             );
                         }
                     }
@@ -1082,26 +1167,40 @@ mod tests {
         collections::VecDeque,
         error::Error,
         fmt,
-        sync::{Arc, Mutex},
+        pin::Pin,
+        sync::{Arc, Mutex, MutexGuard},
+        time::Duration,
     };
 
     use axum::{
         body::{Bytes, to_bytes},
         http::{HeaderMap, Method, StatusCode},
     };
-    use carapax::types::Update as TelegramUpdate;
+    use carapax::types::{InputFile, SendMessage, SendPhoto, Update as TelegramUpdate};
+    use openplotva_core::{ChatSettings, ChatSettingsUpdate, MessageIdMapping};
+    use openplotva_telegram::{
+        DispatcherConfig, DispatcherMessage, DispatcherQueue, DispatcherSendStatus,
+        DispatcherWorkItem, MessageFingerprint, TelegramOutboundMethod, TelegramOutboundResponse,
+    };
     use openplotva_updates::{
         UpdateProducerQueue, UpdateProducerQueueFuture, UpdateProducerSource,
         UpdateProducerSourceFuture,
     };
     use serde_json::json;
+    use time::OffsetDateTime;
 
     use super::{
         GO_DISPATCHER_DEBOUNCE_CACHE_SIZE, GO_DISPATCHER_DEBOUNCE_WINDOW,
         GO_DISPATCHER_MAX_QUEUE_SIZE, configure_telegram_bot_commands, go_dispatcher_config,
         run_long_poll_update_producer_after_delete_webhook,
-        run_webhook_update_producer_after_set_webhook, telegram_webhook_response,
+        run_webhook_update_producer_after_set_webhook, send_dispatcher_work_item_with_transport,
+        telegram_webhook_response,
     };
+    use crate::permissions::{
+        ChatPermissionContext, ChatPermissionPolicy, ChatPermissionStore, ChatPermissionStoreFuture,
+    };
+    use crate::rate_limits::{ChatRateLimitPolicy, RateLimitStore, RateLimitStoreFuture};
+    use crate::virtual_messages::VirtualMessageStore;
 
     #[test]
     fn go_dispatcher_config_matches_server_runtime_defaults() {
@@ -1117,6 +1216,77 @@ mod tests {
             config.dedupe_config.max_cache_size,
             GO_DISPATCHER_DEBOUNCE_CACHE_SIZE
         );
+    }
+
+    #[tokio::test]
+    async fn dispatcher_send_checks_permissions_before_telegram_transport()
+    -> Result<(), Box<dyn Error>> {
+        let store = VirtualMessageStoreStub;
+        let rate_limits = Arc::new(ChatRateLimitPolicy::new(RateLimitStoreStub));
+        let permission_store = PermissionStoreStub::with_context(ChatPermissionContext {
+            chat_type: Some("supergroup".to_owned()),
+            settings: Some(ChatSettings {
+                enable_global_text_reply: false,
+                ..ChatSettings::defaults(42)
+            }),
+        });
+        let permissions = Arc::new(ChatPermissionPolicy::new(permission_store));
+        let item = queued_method_item(TelegramOutboundMethod::from(SendMessage::new(42, "hello")));
+        let called = Arc::new(Mutex::new(false));
+        let called_for_send = Arc::clone(&called);
+
+        let status = send_dispatcher_work_item_with_transport(
+            store,
+            rate_limits,
+            permissions,
+            item,
+            move |_| {
+                *lock(&called_for_send) = true;
+                async { Err::<TelegramOutboundResponse, _>(permission_error()) }
+            },
+        )
+        .await;
+
+        assert_eq!(status, DispatcherSendStatus::Failed);
+        assert!(!*lock(&called));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dispatcher_send_auto_disables_settings_after_permission_error()
+    -> Result<(), Box<dyn Error>> {
+        let store = VirtualMessageStoreStub;
+        let rate_limits = Arc::new(ChatRateLimitPolicy::new(RateLimitStoreStub));
+        let permission_store = PermissionStoreStub::with_context(ChatPermissionContext {
+            chat_type: Some("supergroup".to_owned()),
+            settings: Some(ChatSettings::defaults(42)),
+        });
+        let permissions = Arc::new(ChatPermissionPolicy::new(permission_store.clone()));
+        let item = queued_method_item(TelegramOutboundMethod::from(SendPhoto::new(
+            42,
+            InputFile::file_id("photo-id"),
+        )));
+
+        let status = send_dispatcher_work_item_with_transport(
+            store,
+            rate_limits,
+            permissions,
+            item,
+            |_| async { Err::<TelegramOutboundResponse, _>(permission_error()) },
+        )
+        .await;
+
+        assert_eq!(status, DispatcherSendStatus::Failed);
+        assert_eq!(
+            permission_store.saved_updates(),
+            vec![ChatSettingsUpdate {
+                chat_id: 42,
+                chat_type: "supergroup".to_owned(),
+                enable_global_draw_reply: false,
+                ..chat_settings_update_defaults(42)
+            }]
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -1676,6 +1846,190 @@ mod tests {
                 .expect("enqueued updates")
                 .push(update.clone());
             Box::pin(async { Ok(()) })
+        }
+    }
+
+    struct VirtualMessageStoreStub;
+
+    impl VirtualMessageStore for VirtualMessageStoreStub {
+        type Error = StartupError;
+
+        fn get_mapping_by_virtual<'a>(
+            &'a self,
+            _vmsg_id: String,
+        ) -> Pin<
+            Box<
+                dyn std::future::Future<Output = Result<Option<MessageIdMapping>, Self::Error>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn insert_virtual_message<'a>(
+            &'a self,
+            _vmsg_id: String,
+            _chat_id: i64,
+            _thread_id: Option<i32>,
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<(), Self::Error>> + Send + 'a>>
+        {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn resolve_virtual_message<'a>(
+            &'a self,
+            _vmsg_id: String,
+            _real_message_id: i32,
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<(), Self::Error>> + Send + 'a>>
+        {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn enqueue_message_op<'a>(
+            &'a self,
+            _vmsg_id: String,
+            _chat_id: i64,
+            _op: &'static str,
+            _payload_json: Option<String>,
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<i64, Self::Error>> + Send + 'a>>
+        {
+            Box::pin(async { Ok(1) })
+        }
+
+        fn delete_mapping_by_virtual<'a>(
+            &'a self,
+            _vmsg_id: String,
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<(), Self::Error>> + Send + 'a>>
+        {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[derive(Clone, Copy, Default)]
+    struct RateLimitStoreStub;
+
+    impl RateLimitStore for RateLimitStoreStub {
+        type Error = StartupError;
+
+        fn load_expiry<'a>(
+            &'a self,
+            _chat_id: i64,
+        ) -> RateLimitStoreFuture<'a, Result<Option<OffsetDateTime>, Self::Error>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn save_expiry<'a>(
+            &'a self,
+            _chat_id: i64,
+            _expiry: OffsetDateTime,
+            _ttl: Duration,
+        ) -> RateLimitStoreFuture<'a, Result<(), Self::Error>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct PermissionStoreStub {
+        state: Arc<Mutex<PermissionStoreState>>,
+    }
+
+    #[derive(Default)]
+    struct PermissionStoreState {
+        context: ChatPermissionContext,
+        saved: Vec<ChatSettingsUpdate>,
+    }
+
+    impl PermissionStoreStub {
+        fn with_context(context: ChatPermissionContext) -> Self {
+            let store = Self::default();
+            store.state().context = context;
+            store
+        }
+
+        fn saved_updates(&self) -> Vec<ChatSettingsUpdate> {
+            self.state().saved.clone()
+        }
+
+        fn state(&self) -> MutexGuard<'_, PermissionStoreState> {
+            match self.state.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            }
+        }
+    }
+
+    impl ChatPermissionStore for PermissionStoreStub {
+        type Error = StartupError;
+
+        fn load_context<'a>(
+            &'a self,
+            _chat_id: i64,
+        ) -> ChatPermissionStoreFuture<'a, Result<ChatPermissionContext, Self::Error>> {
+            Box::pin(async move { Ok(self.state().context.clone()) })
+        }
+
+        fn save_settings<'a>(
+            &'a self,
+            update: ChatSettingsUpdate,
+        ) -> ChatPermissionStoreFuture<'a, Result<(), Self::Error>> {
+            Box::pin(async move {
+                self.state().saved.push(update);
+                Ok(())
+            })
+        }
+    }
+
+    fn queued_method_item(method: TelegramOutboundMethod) -> DispatcherWorkItem {
+        let queue = DispatcherQueue::new(DispatcherConfig::default());
+        let message = DispatcherMessage::new(
+            MessageFingerprint {
+                chat_id: 42,
+                message_type: "test".to_owned(),
+                content_hash: 7,
+                debounce_key: None,
+            },
+            "v1",
+        )
+        .with_method(method);
+        queue.enqueue(message, true);
+        queue.dequeue_immediate().expect("queued work item")
+    }
+
+    fn permission_error() -> carapax::api::ExecuteError {
+        let response: carapax::types::Response<serde_json::Value> = serde_json::from_str(
+            r#"{"ok":false,"error_code":400,"description":"Bad Request: CHAT_WRITE_FORBIDDEN"}"#,
+        )
+        .expect("permission error JSON");
+        match response.into_result() {
+            Ok(_) => panic!("test response unexpectedly succeeded"),
+            Err(error) => carapax::api::ExecuteError::Response(error),
+        }
+    }
+
+    fn chat_settings_update_defaults(chat_id: i64) -> ChatSettingsUpdate {
+        ChatSettingsUpdate {
+            chat_id,
+            chat_type: "supergroup".to_owned(),
+            mood_alignment: Some("neutral".to_owned()),
+            custom_persona: None,
+            reactivity_percentage: 3,
+            proactivity_percentage: 0,
+            enable_global_text_reply: true,
+            enable_global_draw_reply: true,
+            enable_obscenifier: true,
+            enable_profanity: true,
+            enable_greet_joiners: false,
+            enable_daily_game: true,
+            daily_game_theme: "auto".to_owned(),
+            greeting_html: None,
+        }
+    }
+
+    fn lock<T>(mutex: &Arc<Mutex<T>>) -> MutexGuard<'_, T> {
+        match mutex.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
         }
     }
 

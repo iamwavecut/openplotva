@@ -65,6 +65,9 @@ pub const SQL_MARK_OP_DONE: &str =
 pub const SQL_MARK_OP_FAILED: &str =
     "UPDATE message_ops_queue SET attempts = attempts + 1, last_error = $2 WHERE id = $1";
 
+/// Go `GetChatInfo` narrowed to the chat type needed by permission policy.
+pub const SQL_GET_CHAT_TYPE: &str = "SELECT type FROM chats WHERE id = $1";
+
 /// Go `GetChatSettings` SQL narrowed to fields currently needed by permission policy.
 pub const SQL_GET_CHAT_SETTINGS: &str = "SELECT chat_id, mood_alignment, custom_persona, reactivity_percentage, proactivity_percentage, enable_global_text_reply, enable_global_draw_reply, enable_obscenifier, enable_profanity, enable_greet_joiners, enable_daily_game, daily_game_theme, greeting_html FROM chat_settings WHERE chat_id = $1";
 
@@ -417,6 +420,15 @@ impl PostgresChatSettingsStore {
     /// Access the underlying Postgres pool.
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// Load the Go `chats.type` value for permission decisions.
+    pub async fn get_chat_type(&self, chat_id: i64) -> Result<Option<String>, StorageError> {
+        let chat_type = sqlx::query_scalar::<_, String>(SQL_GET_CHAT_TYPE)
+            .bind(chat_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(chat_type)
     }
 
     /// Load Go `chat_settings` for one chat.
@@ -1034,6 +1046,10 @@ mod tests {
     #[test]
     fn chat_settings_sql_matches_go_permission_contracts() {
         let _settings = openplotva_core::ChatSettings::defaults(42);
+        assert_eq!(
+            super::SQL_GET_CHAT_TYPE,
+            "SELECT type FROM chats WHERE id = $1"
+        );
         assert_eq!(
             super::SQL_GET_CHAT_SETTINGS,
             "SELECT chat_id, mood_alignment, custom_persona, reactivity_percentage, proactivity_percentage, enable_global_text_reply, enable_global_draw_reply, enable_obscenifier, enable_profanity, enable_greet_joiners, enable_daily_game, daily_game_theme, greeting_html FROM chat_settings WHERE chat_id = $1"
