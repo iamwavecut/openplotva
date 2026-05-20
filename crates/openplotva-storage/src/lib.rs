@@ -92,6 +92,42 @@ pub const SQL_ENSURE_CHAT_HISTORY_PARTITION: &str =
 /// Go `UpsertHistoryEntry` SQL with SQLC name/comment removed.
 pub const SQL_UPSERT_HISTORY_ENTRY: &str = "INSERT INTO chat_history_entries (bucket_day, chat_id, thread_id, message_id, entry_id, kind, role, occurred_at, sender_id, payload) VALUES ($1::date, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb) ON CONFLICT (bucket_day, chat_id, entry_id) DO UPDATE SET thread_id = EXCLUDED.thread_id, message_id = EXCLUDED.message_id, kind = EXCLUDED.kind, role = EXCLUDED.role, occurred_at = EXCLUDED.occurred_at, sender_id = EXCLUDED.sender_id, payload = EXCLUDED.payload, updated_at = CURRENT_TIMESTAMP";
 
+/// Go `CreateSubscription` SQL with SQLC name/comment removed.
+pub const SQL_CREATE_SUBSCRIPTION: &str = "INSERT INTO subscriptions (user_id, telegram_payment_charge_id, provider_payment_charge_id, expires_at) VALUES ($1, $2, $3, $4) ON CONFLICT (telegram_payment_charge_id) DO UPDATE SET expires_at = COALESCE(EXCLUDED.expires_at, subscriptions.expires_at), updated_at = CURRENT_TIMESTAMP RETURNING *";
+
+/// Go `GetActiveSubscription` SQL with SQLC name/comment removed.
+pub const SQL_GET_ACTIVE_SUBSCRIPTION: &str = "SELECT * FROM subscriptions WHERE user_id = $1 AND expires_at > NOW() AND canceled_at IS NULL AND refunded_at IS NULL AND telegram_payment_charge_id NOT LIKE 'admin_grant_%' ORDER BY created_at DESC, id DESC LIMIT 1";
+
+/// Go `ListSubscriptionsByUser` SQL with SQLC name/comment removed.
+pub const SQL_LIST_SUBSCRIPTIONS_BY_USER: &str =
+    "SELECT * FROM subscriptions WHERE user_id = $1 ORDER BY created_at DESC, id DESC";
+
+/// Go `GetSubscriptionByTelegramPaymentChargeID` SQL with SQLC name/comment removed.
+pub const SQL_GET_SUBSCRIPTION_BY_TELEGRAM_PAYMENT_CHARGE_ID: &str =
+    "SELECT * FROM subscriptions WHERE telegram_payment_charge_id = $1 LIMIT 1";
+
+/// Go `DeleteSubscription` SQL with SQLC name/comment removed.
+pub const SQL_DELETE_SUBSCRIPTION: &str = "DELETE FROM subscriptions WHERE id = $1 RETURNING *";
+
+/// Go `ExpireSubscription` SQL with SQLC name/comment removed.
+pub const SQL_EXPIRE_SUBSCRIPTION: &str = "UPDATE subscriptions SET expires_at = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $1 RETURNING *";
+
+/// Go `MarkSubscriptionCanceled` SQL with SQLC name/comment removed.
+pub const SQL_MARK_SUBSCRIPTION_CANCELED: &str = "UPDATE subscriptions SET canceled_at = COALESCE(canceled_at, CURRENT_TIMESTAMP), updated_at = CURRENT_TIMESTAMP WHERE id = $1 RETURNING *";
+
+/// Go `MarkSubscriptionRefunded` SQL with SQLC name/comment removed.
+pub const SQL_MARK_SUBSCRIPTION_REFUNDED: &str = "UPDATE subscriptions SET refunded_at = COALESCE(refunded_at, CURRENT_TIMESTAMP), updated_at = CURRENT_TIMESTAMP WHERE id = $1 RETURNING *";
+
+/// Go `CreateDonation` SQL with SQLC name/comment removed.
+pub const SQL_CREATE_DONATION: &str = "INSERT INTO donations (user_id, telegram_payment_charge_id, provider_payment_charge_id, amount_stars) VALUES ($1, $2, $3, $4) ON CONFLICT (telegram_payment_charge_id) DO NOTHING RETURNING *";
+
+/// Go `GetDonationByTelegramPaymentChargeID` SQL with SQLC name/comment removed.
+pub const SQL_GET_DONATION_BY_TELEGRAM_PAYMENT_CHARGE_ID: &str =
+    "SELECT * FROM donations WHERE telegram_payment_charge_id = $1 LIMIT 1";
+
+/// Go `DeleteDonation` SQL with SQLC name/comment removed.
+pub const SQL_DELETE_DONATION: &str = "DELETE FROM donations WHERE id = $1 RETURNING *";
+
 /// Go Redis key prefix for persisted rate-limited chat expiry timestamps.
 pub const RATE_LIMITED_CHAT_KEY_PREFIX: &str = "plotva:rate_limited_chat:";
 
@@ -675,6 +711,230 @@ impl PostgresHistoryStore {
     }
 }
 
+/// SQLx-backed storage for Go Telegram Stars subscriptions and donations.
+#[derive(Clone, Debug)]
+pub struct PostgresPaymentStore {
+    pool: PgPool,
+}
+
+/// Go `CreateSubscriptionParams` row shape.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SubscriptionCreate<'value> {
+    /// Telegram user ID.
+    pub user_id: i64,
+    /// Telegram Stars payment charge ID.
+    pub telegram_payment_charge_id: &'value str,
+    /// Provider-side payment charge ID, often empty for Stars.
+    pub provider_payment_charge_id: &'value str,
+    /// Subscription expiry recorded at payment processing time.
+    pub expires_at: OffsetDateTime,
+}
+
+/// Go `subscriptions` row shape used by payments and VIP ledger code.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubscriptionRecord {
+    /// Database primary key.
+    pub id: i64,
+    /// Telegram user ID.
+    pub user_id: i64,
+    /// Telegram Stars payment charge ID.
+    pub telegram_payment_charge_id: String,
+    /// Provider-side payment charge ID, often empty for Stars.
+    pub provider_payment_charge_id: String,
+    /// Subscription expiry.
+    pub expires_at: OffsetDateTime,
+    /// Row creation time.
+    pub created_at: OffsetDateTime,
+    /// Row update time.
+    pub updated_at: OffsetDateTime,
+    /// Telegram-side cancellation timestamp, when recorded.
+    pub canceled_at: Option<OffsetDateTime>,
+    /// Refund timestamp, when recorded.
+    pub refunded_at: Option<OffsetDateTime>,
+}
+
+/// Go `CreateDonationParams` row shape.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DonationCreate<'value> {
+    /// Telegram user ID.
+    pub user_id: i64,
+    /// Telegram Stars payment charge ID.
+    pub telegram_payment_charge_id: &'value str,
+    /// Provider-side payment charge ID, often empty for Stars.
+    pub provider_payment_charge_id: &'value str,
+    /// Donation amount in Telegram Stars.
+    pub amount_stars: i64,
+}
+
+/// Go `donations` row shape.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DonationRecord {
+    /// Database primary key.
+    pub id: i64,
+    /// Telegram user ID.
+    pub user_id: i64,
+    /// Telegram Stars payment charge ID.
+    pub telegram_payment_charge_id: String,
+    /// Provider-side payment charge ID, often empty for Stars.
+    pub provider_payment_charge_id: String,
+    /// Donation amount in Telegram Stars.
+    pub amount_stars: i64,
+    /// Row creation time.
+    pub created_at: OffsetDateTime,
+}
+
+impl PostgresPaymentStore {
+    /// Build a payment store on an existing Postgres pool.
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
+    /// Access the underlying Postgres pool.
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
+    /// Create or refresh a Go subscription payment row.
+    pub async fn create_subscription(
+        &self,
+        subscription: SubscriptionCreate<'_>,
+    ) -> Result<SubscriptionRecord, StorageError> {
+        let row = sqlx::query(SQL_CREATE_SUBSCRIPTION)
+            .bind(subscription.user_id)
+            .bind(subscription.telegram_payment_charge_id)
+            .bind(subscription.provider_payment_charge_id)
+            .bind(subscription.expires_at)
+            .fetch_one(&self.pool)
+            .await?;
+        subscription_from_row(row).map_err(StorageError::from)
+    }
+
+    /// Load the current active non-admin, non-canceled, non-refunded subscription for a user.
+    pub async fn get_active_subscription(
+        &self,
+        user_id: i64,
+    ) -> Result<Option<SubscriptionRecord>, StorageError> {
+        let row = sqlx::query(SQL_GET_ACTIVE_SUBSCRIPTION)
+            .bind(user_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(subscription_from_row).transpose()?)
+    }
+
+    /// List all subscription rows for a user in Go display order.
+    pub async fn list_subscriptions_by_user(
+        &self,
+        user_id: i64,
+    ) -> Result<Vec<SubscriptionRecord>, StorageError> {
+        let rows = sqlx::query(SQL_LIST_SUBSCRIPTIONS_BY_USER)
+            .bind(user_id)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter()
+            .map(subscription_from_row)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
+    }
+
+    /// Load a subscription by Telegram Stars payment charge ID.
+    pub async fn get_subscription_by_telegram_payment_charge_id(
+        &self,
+        telegram_payment_charge_id: &str,
+    ) -> Result<Option<SubscriptionRecord>, StorageError> {
+        let row = sqlx::query(SQL_GET_SUBSCRIPTION_BY_TELEGRAM_PAYMENT_CHARGE_ID)
+            .bind(telegram_payment_charge_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(subscription_from_row).transpose()?)
+    }
+
+    /// Delete a subscription row and return the removed row.
+    pub async fn delete_subscription(&self, id: i64) -> Result<SubscriptionRecord, StorageError> {
+        let row = sqlx::query(SQL_DELETE_SUBSCRIPTION)
+            .bind(id)
+            .fetch_one(&self.pool)
+            .await?;
+        subscription_from_row(row).map_err(StorageError::from)
+    }
+
+    /// Set a subscription expiry and return the updated row.
+    pub async fn expire_subscription(
+        &self,
+        id: i64,
+        expires_at: OffsetDateTime,
+    ) -> Result<SubscriptionRecord, StorageError> {
+        let row = sqlx::query(SQL_EXPIRE_SUBSCRIPTION)
+            .bind(id)
+            .bind(expires_at)
+            .fetch_one(&self.pool)
+            .await?;
+        subscription_from_row(row).map_err(StorageError::from)
+    }
+
+    /// Mark a subscription canceled using Go's first-write-wins timestamp behavior.
+    pub async fn mark_subscription_canceled(
+        &self,
+        id: i64,
+    ) -> Result<SubscriptionRecord, StorageError> {
+        let row = sqlx::query(SQL_MARK_SUBSCRIPTION_CANCELED)
+            .bind(id)
+            .fetch_one(&self.pool)
+            .await?;
+        subscription_from_row(row).map_err(StorageError::from)
+    }
+
+    /// Mark a subscription refunded using Go's first-write-wins timestamp behavior.
+    pub async fn mark_subscription_refunded(
+        &self,
+        id: i64,
+    ) -> Result<SubscriptionRecord, StorageError> {
+        let row = sqlx::query(SQL_MARK_SUBSCRIPTION_REFUNDED)
+            .bind(id)
+            .fetch_one(&self.pool)
+            .await?;
+        subscription_from_row(row).map_err(StorageError::from)
+    }
+
+    /// Insert a donation payment row.
+    ///
+    /// Duplicate Telegram charge IDs return `sqlx::Error::RowNotFound`, matching
+    /// SQLC's no-row result for Go `ON CONFLICT DO NOTHING RETURNING *`.
+    pub async fn create_donation(
+        &self,
+        donation: DonationCreate<'_>,
+    ) -> Result<DonationRecord, StorageError> {
+        let row = sqlx::query(SQL_CREATE_DONATION)
+            .bind(donation.user_id)
+            .bind(donation.telegram_payment_charge_id)
+            .bind(donation.provider_payment_charge_id)
+            .bind(donation.amount_stars)
+            .fetch_one(&self.pool)
+            .await?;
+        donation_from_row(row).map_err(StorageError::from)
+    }
+
+    /// Load a donation by Telegram Stars payment charge ID.
+    pub async fn get_donation_by_telegram_payment_charge_id(
+        &self,
+        telegram_payment_charge_id: &str,
+    ) -> Result<Option<DonationRecord>, StorageError> {
+        let row = sqlx::query(SQL_GET_DONATION_BY_TELEGRAM_PAYMENT_CHARGE_ID)
+            .bind(telegram_payment_charge_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(donation_from_row).transpose()?)
+    }
+
+    /// Delete a donation row and return the removed row.
+    pub async fn delete_donation(&self, id: i64) -> Result<DonationRecord, StorageError> {
+        let row = sqlx::query(SQL_DELETE_DONATION)
+            .bind(id)
+            .fetch_one(&self.pool)
+            .await?;
+        donation_from_row(row).map_err(StorageError::from)
+    }
+}
+
 /// Storage connection failures.
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -959,6 +1219,31 @@ fn chat_settings_from_row(row: PgRow) -> Result<ChatSettings, sqlx::Error> {
         enable_daily_game: row.try_get("enable_daily_game")?,
         daily_game_theme: row.try_get("daily_game_theme")?,
         greeting_html: row.try_get("greeting_html")?,
+    })
+}
+
+fn subscription_from_row(row: PgRow) -> Result<SubscriptionRecord, sqlx::Error> {
+    Ok(SubscriptionRecord {
+        id: row.try_get("id")?,
+        user_id: row.try_get("user_id")?,
+        telegram_payment_charge_id: row.try_get("telegram_payment_charge_id")?,
+        provider_payment_charge_id: row.try_get("provider_payment_charge_id")?,
+        expires_at: row.try_get("expires_at")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+        canceled_at: row.try_get("canceled_at")?,
+        refunded_at: row.try_get("refunded_at")?,
+    })
+}
+
+fn donation_from_row(row: PgRow) -> Result<DonationRecord, sqlx::Error> {
+    Ok(DonationRecord {
+        id: row.try_get("id")?,
+        user_id: row.try_get("user_id")?,
+        telegram_payment_charge_id: row.try_get("telegram_payment_charge_id")?,
+        provider_payment_charge_id: row.try_get("provider_payment_charge_id")?,
+        amount_stars: row.try_get("amount_stars")?,
+        created_at: row.try_get("created_at")?,
     })
 }
 
@@ -1298,6 +1583,219 @@ mod tests {
             super::SQL_UPSERT_CHAT_SETTINGS,
             "WITH ensure_chat AS (INSERT INTO chats (id, type) VALUES ($1, COALESCE(NULLIF($14::text, ''), 'private')) ON CONFLICT (id) DO NOTHING) INSERT INTO chat_settings (chat_id, mood_alignment, custom_persona, reactivity_percentage, proactivity_percentage, enable_obscenifier, enable_profanity, enable_greet_joiners, enable_global_text_reply, enable_global_draw_reply, enable_daily_game, daily_game_theme, updated, greeting_html) VALUES ($1, $2, $3, $4, $5, COALESCE($6, TRUE)::boolean, COALESCE($7, TRUE)::boolean, COALESCE($8, FALSE)::boolean, COALESCE($9, TRUE)::boolean, COALESCE($10, TRUE)::boolean, COALESCE($11, TRUE)::boolean, COALESCE($12, 'auto')::text, CURRENT_TIMESTAMP, $13) ON CONFLICT (chat_id) DO UPDATE SET mood_alignment = EXCLUDED.mood_alignment, custom_persona = EXCLUDED.custom_persona, reactivity_percentage = COALESCE(EXCLUDED.reactivity_percentage, chat_settings.reactivity_percentage), proactivity_percentage = COALESCE(EXCLUDED.proactivity_percentage, chat_settings.proactivity_percentage), enable_obscenifier = COALESCE(EXCLUDED.enable_obscenifier, chat_settings.enable_obscenifier), enable_profanity = COALESCE(EXCLUDED.enable_profanity, chat_settings.enable_profanity), enable_greet_joiners = COALESCE(EXCLUDED.enable_greet_joiners, chat_settings.enable_greet_joiners), enable_global_text_reply = COALESCE(EXCLUDED.enable_global_text_reply, chat_settings.enable_global_text_reply), enable_global_draw_reply = COALESCE(EXCLUDED.enable_global_draw_reply, chat_settings.enable_global_draw_reply), enable_daily_game = COALESCE(EXCLUDED.enable_daily_game, chat_settings.enable_daily_game), daily_game_theme = EXCLUDED.daily_game_theme, greeting_html = EXCLUDED.greeting_html, updated = CURRENT_TIMESTAMP"
         );
+    }
+
+    #[test]
+    fn payment_storage_sql_matches_go_query_contracts() {
+        assert_eq!(
+            super::SQL_CREATE_SUBSCRIPTION,
+            "INSERT INTO subscriptions (user_id, telegram_payment_charge_id, provider_payment_charge_id, expires_at) VALUES ($1, $2, $3, $4) ON CONFLICT (telegram_payment_charge_id) DO UPDATE SET expires_at = COALESCE(EXCLUDED.expires_at, subscriptions.expires_at), updated_at = CURRENT_TIMESTAMP RETURNING *"
+        );
+        assert_eq!(
+            super::SQL_GET_ACTIVE_SUBSCRIPTION,
+            "SELECT * FROM subscriptions WHERE user_id = $1 AND expires_at > NOW() AND canceled_at IS NULL AND refunded_at IS NULL AND telegram_payment_charge_id NOT LIKE 'admin_grant_%' ORDER BY created_at DESC, id DESC LIMIT 1"
+        );
+        assert_eq!(
+            super::SQL_LIST_SUBSCRIPTIONS_BY_USER,
+            "SELECT * FROM subscriptions WHERE user_id = $1 ORDER BY created_at DESC, id DESC"
+        );
+        assert_eq!(
+            super::SQL_GET_SUBSCRIPTION_BY_TELEGRAM_PAYMENT_CHARGE_ID,
+            "SELECT * FROM subscriptions WHERE telegram_payment_charge_id = $1 LIMIT 1"
+        );
+        assert_eq!(
+            super::SQL_DELETE_SUBSCRIPTION,
+            "DELETE FROM subscriptions WHERE id = $1 RETURNING *"
+        );
+        assert_eq!(
+            super::SQL_EXPIRE_SUBSCRIPTION,
+            "UPDATE subscriptions SET expires_at = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $1 RETURNING *"
+        );
+        assert_eq!(
+            super::SQL_MARK_SUBSCRIPTION_CANCELED,
+            "UPDATE subscriptions SET canceled_at = COALESCE(canceled_at, CURRENT_TIMESTAMP), updated_at = CURRENT_TIMESTAMP WHERE id = $1 RETURNING *"
+        );
+        assert_eq!(
+            super::SQL_MARK_SUBSCRIPTION_REFUNDED,
+            "UPDATE subscriptions SET refunded_at = COALESCE(refunded_at, CURRENT_TIMESTAMP), updated_at = CURRENT_TIMESTAMP WHERE id = $1 RETURNING *"
+        );
+        assert_eq!(
+            super::SQL_CREATE_DONATION,
+            "INSERT INTO donations (user_id, telegram_payment_charge_id, provider_payment_charge_id, amount_stars) VALUES ($1, $2, $3, $4) ON CONFLICT (telegram_payment_charge_id) DO NOTHING RETURNING *"
+        );
+        assert_eq!(
+            super::SQL_GET_DONATION_BY_TELEGRAM_PAYMENT_CHARGE_ID,
+            "SELECT * FROM donations WHERE telegram_payment_charge_id = $1 LIMIT 1"
+        );
+        assert_eq!(
+            super::SQL_DELETE_DONATION,
+            "DELETE FROM donations WHERE id = $1 RETURNING *"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_payment_store_round_trips_when_postgres_dsn_is_set() -> Result<(), Box<dyn Error>>
+    {
+        let Ok(dsn) = env::var("OPENPLOTVA_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&dsn)
+            .await?;
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
+        let user_id = 9_002_000_000_000_i64 + i64::try_from(suffix % 1_000_000)?;
+        let charge_id = format!("test_subscription_{suffix}");
+        let duplicate_provider_id = format!("provider_updated_{suffix}");
+        let donation_charge_id = format!("test_donation_{suffix}");
+        let admin_charge_id = format!("admin_grant_test_{suffix}");
+        let store = super::PostgresPaymentStore::new(pool.clone());
+        let identity_store = super::PostgresVirtualMessageStore::new(pool.clone());
+
+        identity_store
+            .upsert_user_state(&openplotva_core::UserState::new(
+                user_id,
+                "Payment Tester",
+                None,
+                None,
+                None,
+                None,
+            ))
+            .await?;
+
+        let first_expiry = time::OffsetDateTime::from_unix_timestamp(1_800_000_000)?;
+        let second_expiry = first_expiry + time::Duration::days(30);
+
+        let result: Result<(), Box<dyn Error>> = async {
+            let subscription = store
+                .create_subscription(super::SubscriptionCreate {
+                    user_id,
+                    telegram_payment_charge_id: &charge_id,
+                    provider_payment_charge_id: "provider-original",
+                    expires_at: first_expiry,
+                })
+                .await?;
+            assert_eq!(subscription.user_id, user_id);
+            assert_eq!(subscription.telegram_payment_charge_id, charge_id);
+            assert_eq!(subscription.provider_payment_charge_id, "provider-original");
+            assert_eq!(subscription.expires_at, first_expiry);
+
+            let duplicate = store
+                .create_subscription(super::SubscriptionCreate {
+                    user_id,
+                    telegram_payment_charge_id: &charge_id,
+                    provider_payment_charge_id: &duplicate_provider_id,
+                    expires_at: second_expiry,
+                })
+                .await?;
+            assert_eq!(duplicate.id, subscription.id);
+            assert_eq!(
+                duplicate.provider_payment_charge_id, "provider-original",
+                "Go only refreshes expires_at on duplicate Telegram charge IDs"
+            );
+            assert_eq!(duplicate.expires_at, second_expiry);
+
+            let loaded_subscription = store
+                .get_subscription_by_telegram_payment_charge_id(&charge_id)
+                .await?
+                .ok_or_else(|| std::io::Error::other("subscription should be readable"))?;
+            assert_eq!(loaded_subscription.id, subscription.id);
+
+            let expired = store
+                .expire_subscription(subscription.id, first_expiry)
+                .await?;
+            assert_eq!(expired.expires_at, first_expiry);
+
+            let active = store
+                .get_active_subscription(user_id)
+                .await?
+                .ok_or_else(|| std::io::Error::other("subscription should be active"))?;
+            assert_eq!(active.id, subscription.id);
+
+            let canceled = store.mark_subscription_canceled(subscription.id).await?;
+            assert!(canceled.canceled_at.is_some());
+            assert!(store.get_active_subscription(user_id).await?.is_none());
+
+            let admin_grant = store
+                .create_subscription(super::SubscriptionCreate {
+                    user_id,
+                    telegram_payment_charge_id: &admin_charge_id,
+                    provider_payment_charge_id: "",
+                    expires_at: second_expiry,
+                })
+                .await?;
+            assert!(store.get_active_subscription(user_id).await?.is_none());
+
+            let refunded = store.mark_subscription_refunded(admin_grant.id).await?;
+            assert!(refunded.refunded_at.is_some());
+
+            let subscriptions = store.list_subscriptions_by_user(user_id).await?;
+            assert_eq!(subscriptions.len(), 2);
+            assert_eq!(subscriptions[0].id, admin_grant.id);
+            assert_eq!(subscriptions[1].id, subscription.id);
+
+            let donation = store
+                .create_donation(super::DonationCreate {
+                    user_id,
+                    telegram_payment_charge_id: &donation_charge_id,
+                    provider_payment_charge_id: "provider-donation",
+                    amount_stars: 123,
+                })
+                .await?;
+            assert_eq!(donation.user_id, user_id);
+            assert_eq!(donation.amount_stars, 123);
+            assert!(matches!(
+                store
+                    .create_donation(super::DonationCreate {
+                        user_id,
+                        telegram_payment_charge_id: &donation_charge_id,
+                        provider_payment_charge_id: "provider-donation-duplicate",
+                        amount_stars: 456,
+                    })
+                    .await,
+                Err(super::StorageError::Postgres {
+                    source: sqlx::Error::RowNotFound
+                })
+            ));
+
+            let loaded_donation = store
+                .get_donation_by_telegram_payment_charge_id(&donation_charge_id)
+                .await?
+                .ok_or_else(|| std::io::Error::other("donation should be readable"))?;
+            assert_eq!(loaded_donation.id, donation.id);
+
+            let deleted = store.delete_donation(donation.id).await?;
+            assert_eq!(deleted.id, donation.id);
+            assert!(
+                store
+                    .get_donation_by_telegram_payment_charge_id(&donation_charge_id)
+                    .await?
+                    .is_none()
+            );
+
+            let deleted_admin_grant = store.delete_subscription(admin_grant.id).await?;
+            assert_eq!(deleted_admin_grant.id, admin_grant.id);
+            let deleted_subscription = store.delete_subscription(subscription.id).await?;
+            assert_eq!(deleted_subscription.id, subscription.id);
+
+            Ok(())
+        }
+        .await;
+
+        let _ = sqlx::query("DELETE FROM donations WHERE telegram_payment_charge_id = $1")
+            .bind(&donation_charge_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM subscriptions WHERE telegram_payment_charge_id = ANY($1)")
+            .bind([charge_id.as_str(), admin_charge_id.as_str()])
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
+        result
     }
 
     #[tokio::test]

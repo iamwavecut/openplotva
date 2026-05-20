@@ -169,6 +169,7 @@ Optional live Postgres storage smoke, run only against a scratch/local database:
 
 ```sh
 OPENPLOTVA_TEST_POSTGRES_DSN='postgres://plotva:plotva@127.0.0.1:5432/plotva?sslmode=disable' cargo test -p openplotva-storage live_virtual_message_store_round_trips_when_postgres_dsn_is_set -- --nocapture
+OPENPLOTVA_TEST_POSTGRES_DSN='postgres://plotva:plotva@127.0.0.1:5432/plotva?sslmode=disable' cargo test -p openplotva-storage live_payment_store_round_trips_when_postgres_dsn_is_set -- --nocapture
 ```
 
 Go baseline commands from `/Users/Shared/src/github.com/iamwavecut/reference-app`:
