@@ -1,7 +1,7 @@
 use std::{fmt, future::Future, pin::Pin};
 
 use carapax::types::{
-    Message as TelegramMessage, MessageData as TelegramMessageData,
+    Chat as TelegramChat, Message as TelegramMessage, MessageData as TelegramMessageData,
     PreCheckoutQuery as TelegramPreCheckoutQuery, SuccessfulPayment as TelegramSuccessfulPayment,
     Update as TelegramUpdate, UpdateType as TelegramUpdateType, User as TelegramUser,
 };
@@ -11,7 +11,10 @@ use openplotva_storage::{
     PostgresVirtualMessageStore, StorageError, SubscriptionCreate, SubscriptionRecord,
     VipEventCreate, VipEventRecord,
 };
-use openplotva_taskman::{ControlJobParams, ControlKind};
+use openplotva_taskman::{
+    CONTROL_QUEUE_NAME, ControlJobData, ControlJobParams, ControlKind, ControlPayment,
+    HIGH_PRIORITY, StatelessJobItem, new_control_job_at,
+};
 use thiserror::Error;
 use time::OffsetDateTime;
 
@@ -27,6 +30,10 @@ pub type PreCheckoutFuture<'a, E> = Pin<Box<dyn Future<Output = Result<(), E>> +
 /// Boxed future returned by direct invoice-link creation calls.
 pub type PaymentInvoiceLinkFuture<'a, E> =
     Pin<Box<dyn Future<Output = Result<String, E>> + Send + 'a>>;
+
+/// Boxed future returned by taskman control-job assignment calls.
+pub type PaymentControlJobQueueFuture<'a, E> =
+    Pin<Box<dyn Future<Output = Result<(), E>> + Send + 'a>>;
 
 /// Telegram successful-payment payload captured from a message/control job.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -93,6 +100,17 @@ pub struct SuccessfulPaymentReport {
 pub enum SuccessfulPaymentUpdateRoute {
     /// A Go successful-payment service message was processed.
     Processed(SuccessfulPaymentOutcome),
+    /// The update was not a successful-payment service message and was delegated.
+    Delegated,
+}
+
+/// Routing result for queueing Go successful-payment control jobs from decoded updates.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SuccessfulPaymentControlJobUpdateRoute {
+    /// A successful-payment control job was assigned to the Go control queue.
+    Queued,
+    /// Control-job assignment failed. Go logs and keeps the update handled.
+    QueueError,
     /// The update was not a successful-payment service message and was delegated.
     Delegated,
 }
@@ -364,6 +382,19 @@ pub trait PaymentInvoiceEffects {
         text: &'a str,
         parse_mode: &'a str,
     ) -> PaymentEffectsFuture<'a, Self::Error>;
+}
+
+/// Queue boundary for Go payment-owned taskman control jobs.
+pub trait PaymentControlJobQueue {
+    /// Error returned by the concrete queue implementation.
+    type Error: fmt::Display + Send + Sync + 'static;
+
+    /// Assign a control job to a named taskman queue.
+    fn assign_payment_control_job<'a>(
+        &'a self,
+        queue_name: &'static str,
+        job: StatelessJobItem,
+    ) -> PaymentControlJobQueueFuture<'a, Self::Error>;
 }
 
 impl PreCheckoutPaymentEffects for openplotva_telegram::TelegramClient {
@@ -714,6 +745,125 @@ where
             SuccessfulPaymentReport::new(SuccessfulPaymentOutcome::UnknownPayload)
         }
     }
+}
+
+/// Build the Go taskman control job produced by `processSuccessfulPayment`.
+#[must_use]
+pub fn successful_payment_control_job_from_update_at(
+    update: &TelegramUpdate,
+    created: OffsetDateTime,
+) -> Option<StatelessJobItem> {
+    let TelegramUpdateType::Message(message) = &update.update_type else {
+        return None;
+    };
+    successful_payment_control_job_from_message_at(message, created)
+}
+
+fn successful_payment_control_job_from_message_at(
+    message: &TelegramMessage,
+    created: OffsetDateTime,
+) -> Option<StatelessJobItem> {
+    let TelegramMessageData::SuccessfulPayment(payment) = &message.data else {
+        return None;
+    };
+
+    let mut data = ControlJobData {
+        kind: ControlKind::SuccessfulPayment,
+        chat_type: chat_type_name(&message.chat).to_owned(),
+        payment: Some(ControlPayment {
+            currency: payment.currency.clone(),
+            total_amount: i32::try_from(payment.total_amount).ok()?,
+            invoice_payload: payment.invoice_payload.clone(),
+            telegram_payment_charge_id: payment.telegram_payment_charge_id.clone(),
+            provider_payment_charge_id: payment.provider_payment_charge_id.clone(),
+        }),
+        ..ControlJobData::default()
+    };
+    let user = message.sender.get_user();
+    if let Some(user) = user {
+        data.user_name = user
+            .username
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        data.first_name = user.first_name.clone();
+        data.last_name = user.last_name.clone().unwrap_or_default();
+        data.language_code = user.language_code.clone().unwrap_or_default();
+        data.is_premium = user.is_premium.unwrap_or_default();
+    }
+
+    let params = ControlJobParams {
+        chat_id: message.chat.get_id().into(),
+        message_id: i32::try_from(message.id).ok()?,
+        user_id: user.map(|user| user.id.into()).unwrap_or_default(),
+        user_full_name: user
+            .map(user_full_name)
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_default(),
+        thread_id: message
+            .message_thread_id
+            .and_then(|thread_id| i32::try_from(thread_id).ok())
+            .filter(|thread_id| *thread_id != 0),
+        data,
+    };
+    Some(
+        new_control_job_at(params, created)
+            .with_name("successful payment")
+            .with_priority(HIGH_PRIORITY),
+    )
+}
+
+/// Queue successful-payment updates as Go taskman control jobs, delegating all other updates.
+pub async fn enqueue_successful_payment_update_or_else_at<
+    Queue,
+    HandleFn,
+    HandleFuture,
+    HandleError,
+>(
+    queue: &Queue,
+    update: TelegramUpdate,
+    created: OffsetDateTime,
+    handle_other: HandleFn,
+) -> Result<SuccessfulPaymentControlJobUpdateRoute, HandleError>
+where
+    Queue: PaymentControlJobQueue + Sync,
+    HandleFn: FnOnce(TelegramUpdate) -> HandleFuture,
+    HandleFuture: Future<Output = Result<(), HandleError>>,
+{
+    let Some(job) = successful_payment_control_job_from_update_at(&update, created) else {
+        handle_other(update).await?;
+        return Ok(SuccessfulPaymentControlJobUpdateRoute::Delegated);
+    };
+
+    match queue
+        .assign_payment_control_job(CONTROL_QUEUE_NAME, job)
+        .await
+    {
+        Ok(()) => Ok(SuccessfulPaymentControlJobUpdateRoute::Queued),
+        Err(error) => {
+            tracing::warn!(%error, "failed to assign successful-payment control job");
+            Ok(SuccessfulPaymentControlJobUpdateRoute::QueueError)
+        }
+    }
+}
+
+fn chat_type_name(chat: &TelegramChat) -> &'static str {
+    match chat {
+        TelegramChat::Channel(_) => "channel",
+        TelegramChat::Group(_) => "group",
+        TelegramChat::Private(_) => "private",
+        TelegramChat::Supergroup(_) => "supergroup",
+    }
+}
+
+fn user_full_name(user: &TelegramUser) -> String {
+    format!(
+        "{} {}",
+        user.first_name,
+        user.last_name.as_deref().unwrap_or_default()
+    )
+    .trim()
+    .to_owned()
 }
 
 /// Execute the payment-owned subset of Go taskman control jobs.
@@ -1211,21 +1361,27 @@ mod tests {
         DonationCreate, DonationRecord, SubscriptionCreate, SubscriptionRecord, VipEventCreate,
         VipEventRecord,
     };
-    use openplotva_taskman::{ControlJobData, ControlJobParams, ControlKind, ControlPayment};
+    use openplotva_taskman::{
+        CONTROL_QUEUE_NAME, ControlJobData, ControlJobParams, ControlKind, ControlPayment,
+        HIGH_PRIORITY, JobType, StatelessJobItem,
+    };
     use serde_json::json;
     use time::OffsetDateTime;
 
     use super::{
         InvoiceButtonMessage, InvoiceControlJobOutcome, PaymentControlJobOutcome,
-        PaymentEffectsFuture, PaymentInvoiceEffects, PaymentInvoiceLinkFuture, PaymentStoreFuture,
-        PreCheckoutOutcome, PreCheckoutPaymentEffects, PreCheckoutUpdateRoute, SuccessfulPayment,
-        SuccessfulPaymentEffects, SuccessfulPaymentMessage, SuccessfulPaymentOutcome,
-        SuccessfulPaymentStore, SuccessfulPaymentUpdateRoute, execute_donate_invoice_control_job,
+        PaymentControlJobQueue, PaymentControlJobQueueFuture, PaymentEffectsFuture,
+        PaymentInvoiceEffects, PaymentInvoiceLinkFuture, PaymentStoreFuture, PreCheckoutOutcome,
+        PreCheckoutPaymentEffects, PreCheckoutUpdateRoute, SuccessfulPayment,
+        SuccessfulPaymentControlJobUpdateRoute, SuccessfulPaymentEffects, SuccessfulPaymentMessage,
+        SuccessfulPaymentOutcome, SuccessfulPaymentStore, SuccessfulPaymentUpdateRoute,
+        enqueue_successful_payment_update_or_else_at, execute_donate_invoice_control_job,
         execute_payment_control_job_at, execute_vip_invoice_control_job,
         handle_pre_checkout_update_or_else, handle_successful_payment_update_or_else_at,
         invoice_button_send_message_method, process_successful_payment_at,
         subscription_invoice_message_text, subscription_success_text,
-        successful_payment_message_from_control_job, successful_payment_message_from_update,
+        successful_payment_control_job_from_update_at, successful_payment_message_from_control_job,
+        successful_payment_message_from_update,
     };
 
     #[tokio::test]
@@ -1521,6 +1677,144 @@ mod tests {
             vec![subscription_success_text(expires_at)]
         );
         assert_eq!(effects.invalidated_vip_users(), vec![42]);
+        Ok(())
+    }
+
+    #[test]
+    fn successful_payment_update_builds_go_taskman_control_job() -> Result<(), Box<dyn Error>> {
+        let created = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let update = sample_successful_payment_update_with_thread("subscription_42", 300, 77)?;
+
+        let job = successful_payment_control_job_from_update_at(&update, created)
+            .expect("successful payment should build a control job");
+
+        assert_eq!(CONTROL_QUEUE_NAME, "control");
+        assert_eq!(job.title, "successful payment");
+        assert_eq!(job.created, created);
+        assert_eq!(job.priority, HIGH_PRIORITY);
+        assert_eq!(job.data.job_type, JobType::Control);
+        let telegram_data = job.data.telegram_data.as_ref().expect("Telegram data");
+        assert_eq!(telegram_data.chat_id, 42);
+        assert_eq!(telegram_data.user_id, 42);
+        assert_eq!(telegram_data.message_id, 100);
+        assert_eq!(telegram_data.thread_message_id, Some(77));
+        assert_eq!(telegram_data.user_full_name, "Alice Smith");
+        let control_data = job.data.control_data.as_ref().expect("control data");
+        assert_eq!(control_data.kind, ControlKind::SuccessfulPayment);
+        assert_eq!(control_data.chat_type, "private");
+        assert_eq!(control_data.user_name, "alice");
+        assert_eq!(control_data.first_name, "Alice");
+        assert_eq!(control_data.last_name, "Smith");
+        assert_eq!(control_data.language_code, "en");
+        assert!(control_data.is_premium);
+        assert_eq!(
+            control_data.payment,
+            Some(ControlPayment {
+                currency: "XTR".to_owned(),
+                total_amount: 300,
+                invoice_payload: "subscription_42".to_owned(),
+                telegram_payment_charge_id: "telegram-charge".to_owned(),
+                provider_payment_charge_id: "provider-charge".to_owned(),
+            })
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn successful_payment_queue_wrapper_assigns_control_job_without_fallback()
+    -> Result<(), Box<dyn Error>> {
+        let created = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let queue = PaymentControlJobQueueStub::default();
+        let fallback_calls = Arc::new(Mutex::new(Vec::new()));
+        let fallback_calls_for_handle = Arc::clone(&fallback_calls);
+
+        let route = enqueue_successful_payment_update_or_else_at(
+            &queue,
+            sample_successful_payment_update("subscription_42", 300)?,
+            created,
+            move |update| {
+                let fallback_calls = Arc::clone(&fallback_calls_for_handle);
+                async move {
+                    fallback_calls
+                        .lock()
+                        .map_err(|err| std::io::Error::other(err.to_string()))?
+                        .push(update.id);
+                    Ok::<(), std::io::Error>(())
+                }
+            },
+        )
+        .await?;
+
+        assert_eq!(route, SuccessfulPaymentControlJobUpdateRoute::Queued);
+        assert!(fallback_calls.lock().expect("fallback calls").is_empty());
+        let assigned = queue.assigned();
+        assert_eq!(assigned.len(), 1);
+        assert_eq!(assigned[0].0, CONTROL_QUEUE_NAME);
+        assert_eq!(assigned[0].1.title, "successful payment");
+        assert_eq!(assigned[0].1.priority, HIGH_PRIORITY);
+        assert_eq!(
+            assigned[0]
+                .1
+                .data
+                .control_data
+                .as_ref()
+                .expect("control data")
+                .kind,
+            ControlKind::SuccessfulPayment
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn successful_payment_queue_wrapper_delegates_non_payment_updates()
+    -> Result<(), Box<dyn Error>> {
+        let created = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let queue = PaymentControlJobQueueStub::default();
+        let fallback_calls = Arc::new(Mutex::new(Vec::new()));
+        let fallback_calls_for_handle = Arc::clone(&fallback_calls);
+
+        let route = enqueue_successful_payment_update_or_else_at(
+            &queue,
+            sample_text_update()?,
+            created,
+            move |update| {
+                let fallback_calls = Arc::clone(&fallback_calls_for_handle);
+                async move {
+                    fallback_calls
+                        .lock()
+                        .map_err(|err| std::io::Error::other(err.to_string()))?
+                        .push(update.id);
+                    Ok::<(), std::io::Error>(())
+                }
+            },
+        )
+        .await?;
+
+        assert_eq!(route, SuccessfulPaymentControlJobUpdateRoute::Delegated);
+        assert_eq!(
+            fallback_calls.lock().expect("fallback calls").as_slice(),
+            &[999]
+        );
+        assert!(queue.assigned().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn successful_payment_queue_wrapper_keeps_assign_errors_nonfatal()
+    -> Result<(), Box<dyn Error>> {
+        let created = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let queue = PaymentControlJobQueueStub::failing(StubError::Request);
+
+        let route = enqueue_successful_payment_update_or_else_at(
+            &queue,
+            sample_successful_payment_update("subscription_42", 300)?,
+            created,
+            |_update| async { Ok::<(), std::io::Error>(()) },
+        )
+        .await?;
+
+        assert_eq!(route, SuccessfulPaymentControlJobUpdateRoute::QueueError);
+        assert_eq!(queue.assigned().len(), 1);
         Ok(())
     }
 
@@ -2006,34 +2300,54 @@ mod tests {
         payload: &str,
         total_amount: i64,
     ) -> Result<TelegramUpdate, serde_json::Error> {
+        sample_successful_payment_update_json(payload, total_amount, None)
+    }
+
+    fn sample_successful_payment_update_with_thread(
+        payload: &str,
+        total_amount: i64,
+        thread_id: i32,
+    ) -> Result<TelegramUpdate, serde_json::Error> {
+        sample_successful_payment_update_json(payload, total_amount, Some(thread_id))
+    }
+
+    fn sample_successful_payment_update_json(
+        payload: &str,
+        total_amount: i64,
+        thread_id: Option<i32>,
+    ) -> Result<TelegramUpdate, serde_json::Error> {
+        let mut message = json!({
+            "message_id": 100,
+            "date": 1_710_000_000,
+            "chat": {
+                "id": 42,
+                "type": "private",
+                "first_name": "Alice",
+                "username": "alice"
+            },
+            "from": {
+                "id": 42,
+                "is_bot": false,
+                "first_name": "Alice",
+                "last_name": "Smith",
+                "username": "alice",
+                "language_code": "en",
+                "is_premium": true
+            },
+            "successful_payment": {
+                "currency": "XTR",
+                "total_amount": total_amount,
+                "invoice_payload": payload,
+                "telegram_payment_charge_id": "telegram-charge",
+                "provider_payment_charge_id": "provider-charge"
+            }
+        });
+        if let Some(thread_id) = thread_id {
+            message["message_thread_id"] = json!(thread_id);
+        }
         serde_json::from_value(json!({
             "update_id": 999,
-            "message": {
-                "message_id": 100,
-                "date": 1_710_000_000,
-                "chat": {
-                    "id": 42,
-                    "type": "private",
-                    "first_name": "Alice",
-                    "username": "alice"
-                },
-                "from": {
-                    "id": 42,
-                    "is_bot": false,
-                    "first_name": "Alice",
-                    "last_name": "Smith",
-                    "username": "alice",
-                    "language_code": "en",
-                    "is_premium": true
-                },
-                "successful_payment": {
-                    "currency": "XTR",
-                    "total_amount": total_amount,
-                    "invoice_payload": payload,
-                    "telegram_payment_charge_id": "telegram-charge",
-                    "provider_payment_charge_id": "provider-charge"
-                }
-            }
+            "message": message
         }))
     }
 
@@ -2418,6 +2732,57 @@ mod tests {
                     .answered_pre_checkout_queries
                     .push(pre_checkout_query_id.to_owned());
                 match state.next_pre_checkout_error.take() {
+                    Some(error) => Err(error),
+                    None => Ok(()),
+                }
+            })
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct PaymentControlJobQueueStub {
+        state: Arc<Mutex<PaymentControlJobQueueState>>,
+    }
+
+    #[derive(Default)]
+    struct PaymentControlJobQueueState {
+        assigned: Vec<(&'static str, StatelessJobItem)>,
+        error: Option<StubError>,
+    }
+
+    impl PaymentControlJobQueueStub {
+        fn failing(error: StubError) -> Self {
+            Self {
+                state: Arc::new(Mutex::new(PaymentControlJobQueueState {
+                    error: Some(error),
+                    ..PaymentControlJobQueueState::default()
+                })),
+            }
+        }
+
+        fn assigned(&self) -> Vec<(&'static str, StatelessJobItem)> {
+            self.lock().assigned.clone()
+        }
+
+        fn lock(&self) -> MutexGuard<'_, PaymentControlJobQueueState> {
+            self.state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+    }
+
+    impl PaymentControlJobQueue for PaymentControlJobQueueStub {
+        type Error = StubError;
+
+        fn assign_payment_control_job<'a>(
+            &'a self,
+            queue_name: &'static str,
+            job: StatelessJobItem,
+        ) -> PaymentControlJobQueueFuture<'a, Self::Error> {
+            Box::pin(async move {
+                let mut state = self.lock();
+                state.assigned.push((queue_name, job));
+                match state.error.take() {
                     Some(error) => Err(error),
                     None => Ok(()),
                 }
