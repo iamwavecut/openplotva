@@ -937,6 +937,51 @@ pub fn parse_edit_command(text: &str) -> Option<String> {
     is_edit_verb(&first_word).then(|| rest_text.trim().to_owned())
 }
 
+/// Parse Go `resolveDrawPromptFromMessage` semantics for draw command text.
+#[must_use]
+pub fn resolve_draw_prompt_from_message(
+    message: &TelegramMessage,
+    first_word_lower: &str,
+    rest_text: &str,
+) -> Option<String> {
+    DRAW_VERB_ALIASES
+        .contains(&first_word_lower)
+        .then(|| draw_prompt_with_reply_context(rest_text, Some(message)))
+}
+
+/// Compose Go `drawPromptWithReplyContext` prompt text for reply-based draws.
+#[must_use]
+pub fn draw_prompt_with_reply_context(text: &str, message: Option<&TelegramMessage>) -> String {
+    let trimmed = text.trim();
+    let prefix = first_draw_reply_prefix(trimmed);
+    let Some(TelegramReplyTo::Message(reply)) =
+        message.and_then(|message| message.reply_to.as_ref())
+    else {
+        return trimmed.to_owned();
+    };
+    if !trimmed.is_empty() && prefix.is_none() {
+        return trimmed.to_owned();
+    }
+
+    let lower_text = prefix
+        .map(|prefix| {
+            let lower = trimmed.to_lowercase();
+            lower
+                .strip_prefix(prefix)
+                .unwrap_or(lower.as_str())
+                .trim()
+                .to_owned()
+        })
+        .unwrap_or_default();
+    format!(
+        "{} {}",
+        lower_text,
+        message_text_before_fetcher_fallback(reply)
+    )
+    .trim()
+    .to_owned()
+}
+
 /// Go `dialog.MessageKindText` history kind.
 pub const HISTORY_MESSAGE_KIND_TEXT: &str = "text";
 
@@ -1496,6 +1541,17 @@ fn is_edit_verb(word: &str) -> bool {
     EDIT_VERB_ALIASES.contains(&lower.as_str())
 }
 
+fn first_draw_reply_prefix(text: &str) -> Option<&'static str> {
+    DRAW_REPLY_PREFIXES.iter().copied().find(|prefix| {
+        text.get(..prefix.len())
+            .is_some_and(|head| head.to_lowercase() == *prefix)
+    })
+}
+
+const DRAW_VERB_ALIASES: &[&str] = &["нарисуй", "draw", "рисуй"];
+
+const DRAW_REPLY_PREFIXES: &[&str] = &["это", "this", "that", "these", "those"];
+
 const EDIT_VERB_ALIASES: &[&str] = &[
     "изменить",
     "измени",
@@ -1950,7 +2006,8 @@ mod tests {
         UpdateProducerSourceFuture, UpdateStageOutcome, blpop_timeout_arg, extract_update_state,
         fetcher_message_text, is_allowed_producer_update, is_settings_command_message,
         parse_edit_command, parse_if_addressed, process_update_at, producer_update_name,
-        producer_update_type, run_update_producer_until, telegram_message_attachments, update_name,
+        producer_update_type, resolve_draw_prompt_from_message, run_update_producer_until,
+        telegram_message_attachments, update_name,
     };
     use carapax::types::{
         Message as TelegramMessage, Update as TelegramUpdate, UpdateType as TelegramUpdateType,
@@ -3461,6 +3518,71 @@ mod tests {
 
         assert_eq!(parse_edit_command("нарисуй кота"), None);
         assert_eq!(parse_edit_command("  "), None);
+    }
+
+    #[test]
+    fn resolve_draw_prompt_from_message_matches_go_reply_context() -> Result<(), Box<dyn Error>> {
+        let reply_text = sample_message_from_value(json!({
+            "message_id": 9,
+            "date": 1_710_000_000,
+            "chat": sample_private_chat_json(),
+            "from": sample_user_json(),
+            "text": "reply text"
+        }))?;
+        let reply_caption = sample_message_from_value(json!({
+            "message_id": 10,
+            "date": 1_710_000_000,
+            "chat": sample_private_chat_json(),
+            "from": sample_user_json(),
+            "photo": [
+                {
+                    "file_id": "photo-file",
+                    "file_unique_id": "photo-unique",
+                    "width": 10,
+                    "height": 10
+                }
+            ],
+            "caption": "caption fallback"
+        }))?;
+        let text_reply = sample_message_from_value(json!({
+            "message_id": 11,
+            "date": 1_710_000_000,
+            "chat": sample_private_chat_json(),
+            "from": sample_user_json(),
+            "text": "draw",
+            "reply_to_message": reply_text
+        }))?;
+        let caption_reply = sample_message_from_value(json!({
+            "message_id": 12,
+            "date": 1_710_000_000,
+            "chat": sample_private_chat_json(),
+            "from": sample_user_json(),
+            "text": "draw",
+            "reply_to_message": reply_caption
+        }))?;
+
+        assert_eq!(
+            resolve_draw_prompt_from_message(&text_reply, "draw", ""),
+            Some("reply text".to_owned())
+        );
+        assert_eq!(
+            resolve_draw_prompt_from_message(&text_reply, "нарисуй", "this style"),
+            Some("style reply text".to_owned())
+        );
+        assert_eq!(
+            resolve_draw_prompt_from_message(&text_reply, "рисуй", "cat"),
+            Some("cat".to_owned())
+        );
+        assert_eq!(
+            resolve_draw_prompt_from_message(&caption_reply, "draw", "this style"),
+            Some("style".to_owned())
+        );
+        assert_eq!(
+            resolve_draw_prompt_from_message(&text_reply, "song", "cat"),
+            None
+        );
+
+        Ok(())
     }
 
     #[tokio::test]
