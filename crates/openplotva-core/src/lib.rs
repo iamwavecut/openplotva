@@ -112,6 +112,130 @@ impl UpdateState {
     }
 }
 
+/// Go `sharedtypes.SenderTypeUser`.
+pub const SENDER_TYPE_USER: &str = "user";
+/// Go `sharedtypes.SenderTypeChannel`.
+pub const SENDER_TYPE_CHANNEL: &str = "channel";
+/// Go `sharedtypes.SenderTypeSameChat`.
+pub const SENDER_TYPE_SAME_CHAT: &str = "same_chat";
+/// Go `sharedtypes.SenderTypeSystem`.
+pub const SENDER_TYPE_SYSTEM: &str = "system";
+
+/// Telegram sender identity after Go `utils.ResolveMessageSender` normalization.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct MessageSender {
+    /// Sender kind, one of the Go sender type constants.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sender_type: String,
+    /// Sender Telegram ID.
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub id: i64,
+    /// Full display name before final fallback formatting.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub full_name: String,
+    /// Telegram username without surrounding whitespace.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub username: String,
+    /// Whether the sender user is a bot.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_bot: bool,
+}
+
+impl MessageSender {
+    /// Build the Go system-sender zero path.
+    #[must_use]
+    pub fn system() -> Self {
+        Self {
+            sender_type: SENDER_TYPE_SYSTEM.to_owned(),
+            id: 0,
+            full_name: String::new(),
+            username: String::new(),
+            is_bot: false,
+        }
+    }
+
+    /// Return Go `MessageSender.DisplayName`.
+    #[must_use]
+    pub fn display_name(&self) -> String {
+        let full_name = self.full_name.trim();
+        if !full_name.is_empty() {
+            return full_name.to_owned();
+        }
+
+        let username = self.username.trim();
+        if !username.is_empty() {
+            if username.starts_with('@') {
+                return username.to_owned();
+            }
+            return format!("@{username}");
+        }
+
+        if self.id != 0 {
+            return self.id.to_string();
+        }
+
+        "Telegram".to_owned()
+    }
+}
+
+impl Default for MessageSender {
+    fn default() -> Self {
+        Self::system()
+    }
+}
+
+/// Go `sharedtypes.ToolCall` metadata stored with chat history entries.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct ToolCall {
+    /// Tool name.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    /// Tool reference.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub r#ref: String,
+    /// Tool input JSON.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<serde_json::Value>,
+    /// Tool output JSON.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<serde_json::Value>,
+    /// Tool timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<String>,
+}
+
+/// Go `sharedtypes.ChatMessageMeta` stored with chat history and dialog jobs.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct ChatMessageMeta {
+    /// Message type, serialized as Go `type`.
+    #[serde(default, rename = "type", skip_serializing_if = "String::is_empty")]
+    pub message_type: String,
+    /// Optional annotation.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub annotation: String,
+    /// Vision description.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub vision_description: String,
+    /// Sender kind.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sender_type: String,
+    /// Sender ID.
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub sender_id: i64,
+    /// Sender display name.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sender_name: String,
+    /// Sender Telegram username.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sender_username: String,
+    /// Message attachments.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<ChatAttachment>,
+    /// Tool calls associated with the message.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCall>,
+}
+
 /// Go `sharedtypes.ChatAttachment` metadata stored with chat history entries.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct ChatAttachment {
@@ -355,9 +479,56 @@ fn is_zero_i64(value: &i64) -> bool {
     *value == 0
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ChatSettings, ChatState, PendingEditPayload, UserState, pending_edit_payload};
+    use super::{
+        ChatSettings, ChatState, MessageSender, PendingEditPayload, UserState, pending_edit_payload,
+    };
+
+    #[test]
+    fn message_sender_display_name_matches_go_fallback_order() {
+        assert_eq!(
+            MessageSender {
+                full_name: " Ada Lovelace ".to_owned(),
+                username: "ada".to_owned(),
+                id: 99,
+                ..MessageSender::system()
+            }
+            .display_name(),
+            "Ada Lovelace"
+        );
+        assert_eq!(
+            MessageSender {
+                username: "ada".to_owned(),
+                id: 99,
+                ..MessageSender::system()
+            }
+            .display_name(),
+            "@ada"
+        );
+        assert_eq!(
+            MessageSender {
+                username: "@ada".to_owned(),
+                id: 99,
+                ..MessageSender::system()
+            }
+            .display_name(),
+            "@ada"
+        );
+        assert_eq!(
+            MessageSender {
+                id: 99,
+                ..MessageSender::system()
+            }
+            .display_name(),
+            "99"
+        );
+        assert_eq!(MessageSender::system().display_name(), "Telegram");
+    }
 
     #[test]
     fn pending_edit_payload_decodes_text_and_parse_mode_like_go() {

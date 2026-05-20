@@ -14,7 +14,10 @@ use carapax::types::{
     Message as TelegramMessage, MessageData as TelegramMessageData, PollAnswerVoter,
     Update as TelegramUpdate, UpdateType as TelegramUpdateType, User as TelegramUser,
 };
-use openplotva_core::{ChatAttachment, ChatState, UpdateState, UserState};
+use openplotva_core::{
+    ChatAttachment, ChatMessageMeta, ChatState, MessageSender, SENDER_TYPE_CHANNEL,
+    SENDER_TYPE_SAME_CHAT, SENDER_TYPE_SYSTEM, SENDER_TYPE_USER, UpdateState, UserState,
+};
 use redis::Client as RedisClient;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -745,6 +748,82 @@ pub fn collect_media_attachments(
     out
 }
 
+/// Resolve Go `utils.ResolveMessageSender` metadata from a Telegram message.
+#[must_use]
+pub fn resolve_message_sender(message: Option<&TelegramMessage>) -> MessageSender {
+    let Some(message) = message else {
+        return MessageSender::system();
+    };
+
+    match &message.sender {
+        carapax::types::MessageSender::Chat(chat) => {
+            let sender_type = if chat.get_id() == message.chat.get_id() {
+                SENDER_TYPE_SAME_CHAT
+            } else {
+                SENDER_TYPE_CHANNEL
+            };
+            let full_name = telegram_chat_full_name(chat);
+            MessageSender {
+                sender_type: sender_type.to_owned(),
+                id: chat.get_id().into(),
+                full_name: if full_name.is_empty() {
+                    String::new()
+                } else {
+                    format!("📣 {full_name}")
+                },
+                username: chat
+                    .get_username()
+                    .map(ToString::to_string)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_owned(),
+                is_bot: false,
+            }
+        }
+        carapax::types::MessageSender::User(user) => MessageSender {
+            sender_type: SENDER_TYPE_USER.to_owned(),
+            id: user.id.into(),
+            full_name: telegram_user_full_name(user),
+            username: user
+                .username
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default()
+                .trim()
+                .to_owned(),
+            is_bot: user.is_bot,
+        },
+        carapax::types::MessageSender::Unknown => MessageSender {
+            sender_type: SENDER_TYPE_SYSTEM.to_owned(),
+            ..MessageSender::system()
+        },
+    }
+}
+
+/// Build Go `fetcher.buildMessageMeta` output for a message.
+#[must_use]
+pub fn build_message_meta(
+    message: Option<&TelegramMessage>,
+    sender: MessageSender,
+    attachments: &[ChatAttachment],
+    vision_description: &str,
+) -> ChatMessageMeta {
+    let mut meta = ChatMessageMeta {
+        vision_description: vision_description.trim().to_owned(),
+        sender_type: sender.sender_type.clone(),
+        sender_id: sender.id,
+        sender_name: sender.display_name(),
+        sender_username: sender.username.trim().to_owned(),
+        attachments: attachments.to_vec(),
+        ..ChatMessageMeta::default()
+    };
+
+    meta.attachments
+        .extend(collect_media_attachments(message, &meta.attachments));
+    meta.message_type = detect_message_type(message, &meta.attachments);
+    meta
+}
+
 /// Apply Go fetcher MIME-derived attachment-kind normalization.
 #[must_use]
 pub fn normalize_attachment_kind(mut attachment: ChatAttachment) -> ChatAttachment {
@@ -869,6 +948,49 @@ fn telegram_message_type(message: Option<&TelegramMessage>) -> Option<&'static s
         TelegramMessageData::Photo(_) | TelegramMessageData::Sticker(_) => Some("image"),
         TelegramMessageData::Text(text) if !text.data.trim().is_empty() => Some("text"),
         _ => None,
+    }
+}
+
+fn telegram_user_full_name(user: &TelegramUser) -> String {
+    let name = format!(
+        "{} {}",
+        user.first_name,
+        user.last_name.as_deref().unwrap_or_default()
+    )
+    .trim()
+    .to_owned();
+    if name.is_empty() {
+        user.username
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_default()
+    } else {
+        name
+    }
+}
+
+fn telegram_chat_full_name(chat: &TelegramChat) -> String {
+    match chat {
+        TelegramChat::Channel(chat) => chat.title.clone(),
+        TelegramChat::Group(chat) => chat.title.clone(),
+        TelegramChat::Supergroup(chat) => chat.title.clone(),
+        TelegramChat::Private(chat) => {
+            let name = format!(
+                "{} {}",
+                chat.first_name,
+                chat.last_name.as_deref().unwrap_or_default()
+            )
+            .trim()
+            .to_owned();
+            if name.is_empty() {
+                chat.username
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_default()
+            } else {
+                name
+            }
+        }
     }
 }
 
@@ -2246,6 +2368,150 @@ mod tests {
         assert_eq!(got[0].file_unique_id, "voice-1");
         assert_eq!(got[0].duration_seconds, 7);
         assert_eq!(got[0].caption, "");
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_message_sender_matches_go_user_display_fields() -> Result<(), Box<dyn Error>> {
+        let update = serde_json::from_value(json!({
+            "update_id": 137,
+            "message": {
+                "message_id": 69,
+                "date": 1_710_000_000,
+                "chat": sample_private_chat_json(),
+                "from": {
+                    "id": 99,
+                    "is_bot": true,
+                    "first_name": " Ada ",
+                    "last_name": " Lovelace ",
+                    "username": " ada_l "
+                },
+                "text": "hello"
+            }
+        }))?;
+
+        assert_eq!(
+            super::resolve_message_sender(Some(update_message(&update)?)),
+            openplotva_core::MessageSender {
+                sender_type: openplotva_core::SENDER_TYPE_USER.to_owned(),
+                id: 99,
+                full_name: "Ada   Lovelace".to_owned(),
+                username: "ada_l".to_owned(),
+                is_bot: true,
+            }
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_message_sender_matches_go_channel_and_system_paths() -> Result<(), Box<dyn Error>> {
+        let channel_update = serde_json::from_value(json!({
+            "update_id": 138,
+            "message": {
+                "message_id": 70,
+                "date": 1_710_000_000,
+                "chat": {
+                    "id": -100,
+                    "type": "supergroup",
+                    "title": "Discussion"
+                },
+                "sender_chat": {
+                    "id": -200,
+                    "type": "channel",
+                    "title": "News",
+                    "username": " news "
+                },
+                "text": "post"
+            }
+        }))?;
+        let same_chat_update = serde_json::from_value(json!({
+            "update_id": 139,
+            "message": {
+                "message_id": 71,
+                "date": 1_710_000_000,
+                "chat": {
+                    "id": -100,
+                    "type": "supergroup",
+                    "title": "Discussion",
+                    "username": "discussion"
+                },
+                "sender_chat": {
+                    "id": -100,
+                    "type": "supergroup",
+                    "title": "Discussion",
+                    "username": "discussion"
+                },
+                "text": "anonymous"
+            }
+        }))?;
+
+        assert_eq!(
+            super::resolve_message_sender(Some(update_message(&channel_update)?)),
+            openplotva_core::MessageSender {
+                sender_type: openplotva_core::SENDER_TYPE_CHANNEL.to_owned(),
+                id: -200,
+                full_name: "📣 News".to_owned(),
+                username: "news".to_owned(),
+                is_bot: false,
+            }
+        );
+        assert_eq!(
+            super::resolve_message_sender(Some(update_message(&same_chat_update)?)).sender_type,
+            openplotva_core::SENDER_TYPE_SAME_CHAT
+        );
+        assert_eq!(
+            super::resolve_message_sender(None),
+            openplotva_core::MessageSender::system()
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn build_message_meta_matches_go_fetcher_shape() -> Result<(), Box<dyn Error>> {
+        let update = serde_json::from_value(json!({
+            "update_id": 140,
+            "message": {
+                "message_id": 72,
+                "date": 1_710_000_000,
+                "chat": sample_private_chat_json(),
+                "from": sample_user_json(),
+                "photo": [
+                    {
+                        "file_id": "photo-file",
+                        "file_unique_id": "photo-1",
+                        "height": 90,
+                        "width": 90
+                    }
+                ],
+                "caption": " photo caption "
+            }
+        }))?;
+        let message = update_message(&update)?;
+        let sender = super::resolve_message_sender(Some(message));
+        let existing = vec![openplotva_core::ChatAttachment {
+            kind: "audio".to_owned(),
+            source: "history".to_owned(),
+            file_unique_id: "audio-1".to_owned(),
+            ..openplotva_core::ChatAttachment::default()
+        }];
+
+        let got = super::build_message_meta(Some(message), sender, &existing, " vision ");
+
+        assert_eq!(got.message_type, "image");
+        assert_eq!(got.vision_description, "vision");
+        assert_eq!(got.sender_type, openplotva_core::SENDER_TYPE_USER);
+        assert_eq!(got.sender_id, 99);
+        assert_eq!(got.sender_name, "Ada");
+        assert_eq!(got.sender_username, "ada_l");
+        assert_eq!(got.attachments.len(), 2);
+        assert_eq!(got.attachments[0], existing[0]);
+        assert_eq!(got.attachments[1].kind, "image");
+        assert_eq!(got.attachments[1].source, "message");
+        assert_eq!(got.attachments[1].file_unique_id, "photo-1");
+        assert_eq!(got.attachments[1].caption, "photo caption");
+
         Ok(())
     }
 
