@@ -128,6 +128,29 @@ pub const SQL_GET_DONATION_BY_TELEGRAM_PAYMENT_CHARGE_ID: &str =
 /// Go `DeleteDonation` SQL with SQLC name/comment removed.
 pub const SQL_DELETE_DONATION: &str = "DELETE FROM donations WHERE id = $1 RETURNING *";
 
+/// Go `UpsertVIPCache` SQL with SQLC name/comment removed.
+pub const SQL_UPSERT_VIP_CACHE: &str = "INSERT INTO vip_cache (user_id, is_vip, expires_at) VALUES ($1, $2, $3) ON CONFLICT (user_id) DO UPDATE SET is_vip = COALESCE(EXCLUDED.is_vip, vip_cache.is_vip), expires_at = COALESCE(EXCLUDED.expires_at, vip_cache.expires_at), updated_at = CURRENT_TIMESTAMP";
+
+/// Go `CreateVIPEvent` SQL with SQLC name/comment removed.
+pub const SQL_CREATE_VIP_EVENT: &str = "SELECT id, user_id, event_type, delta_seconds, effective_expires_at, subscription_id, actor_user_id, reason, created_at FROM vip_create_event($1, $2, $3, $4, $5, $6)";
+
+/// Go `GetVIPSummaryByUser` SQL with SQLC name/comment removed.
+pub const SQL_GET_VIP_SUMMARY_BY_USER: &str = "SELECT id AS latest_event_id, user_id, event_type AS latest_event_type, delta_seconds AS latest_delta_seconds, effective_expires_at, effective_expires_at > CURRENT_TIMESTAMP AS is_active, CASE WHEN effective_expires_at > CURRENT_TIMESTAMP THEN FLOOR(EXTRACT(EPOCH FROM (effective_expires_at - CURRENT_TIMESTAMP)))::bigint ELSE 0::bigint END AS remaining_seconds, subscription_id AS latest_subscription_id, actor_user_id AS latest_actor_user_id, reason AS latest_reason, created_at AS latest_created_at FROM vip_events WHERE user_id = $1 ORDER BY id DESC LIMIT 1";
+
+/// Go `ListVIPEventsByUser` SQL with SQLC name/comment removed.
+pub const SQL_LIST_VIP_EVENTS_BY_USER: &str = "SELECT ve.id, ve.user_id, ve.event_type, ve.delta_seconds, ve.effective_expires_at, ve.subscription_id, ve.actor_user_id, actor.username AS actor_username, actor.first_name AS actor_first_name, ve.reason, ve.created_at, s.telegram_payment_charge_id, s.provider_payment_charge_id, s.expires_at AS subscription_expires_at, s.canceled_at AS subscription_canceled_at, s.refunded_at AS subscription_refunded_at FROM vip_events ve LEFT JOIN users actor ON actor.id = ve.actor_user_id LEFT JOIN subscriptions s ON s.id = ve.subscription_id WHERE ve.user_id = $1 ORDER BY ve.id DESC";
+
+/// Go `GetVIPCache` SQL with SQLC name/comment removed.
+pub const SQL_GET_VIP_CACHE: &str =
+    "SELECT * FROM vip_cache WHERE user_id = $1 AND expires_at > CURRENT_TIMESTAMP LIMIT 1";
+
+/// Go `DeleteVIPCache` SQL with SQLC name/comment removed.
+pub const SQL_DELETE_VIP_CACHE: &str = "DELETE FROM vip_cache WHERE user_id = $1";
+
+/// Go `CleanupExpiredVIPCache` SQL with SQLC name/comment removed.
+pub const SQL_CLEANUP_EXPIRED_VIP_CACHE: &str =
+    "DELETE FROM vip_cache WHERE expires_at <= CURRENT_TIMESTAMP RETURNING user_id";
+
 /// Go Redis key prefix for persisted rate-limited chat expiry timestamps.
 pub const RATE_LIMITED_CHAT_KEY_PREFIX: &str = "plotva:rate_limited_chat:";
 
@@ -935,6 +958,238 @@ impl PostgresPaymentStore {
     }
 }
 
+/// SQLx-backed storage for Go VIP cache and event-sourced VIP ledger rows.
+#[derive(Clone, Debug)]
+pub struct PostgresVipStore {
+    pool: PgPool,
+}
+
+/// Go `UpsertVIPCacheParams` row shape.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VipCacheUpsert {
+    /// Telegram user ID.
+    pub user_id: i64,
+    /// Whether the user has VIP according to the external Telegram check cache.
+    pub is_vip: bool,
+    /// Cached VIP expiry timestamp.
+    pub expires_at: OffsetDateTime,
+}
+
+/// Go `vip_cache` row shape.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VipCacheRecord {
+    /// Telegram user ID.
+    pub user_id: i64,
+    /// Whether the user has VIP according to the external Telegram check cache.
+    pub is_vip: bool,
+    /// Cached VIP expiry timestamp.
+    pub expires_at: OffsetDateTime,
+    /// Row creation time.
+    pub created_at: OffsetDateTime,
+    /// Row update time.
+    pub updated_at: OffsetDateTime,
+}
+
+/// Go `CreateVIPEventParams` row shape.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VipEventCreate<'value> {
+    /// Telegram user ID.
+    pub user_id: i64,
+    /// VIP event type.
+    pub event_type: &'value str,
+    /// Delta in VIP seconds.
+    pub delta_seconds: i64,
+    /// Related subscription row, when applicable.
+    pub subscription_id: Option<i64>,
+    /// Admin or actor user ID, when applicable.
+    pub actor_user_id: Option<i64>,
+    /// Human-readable reason. `None` is stored as an empty string by Go SQL.
+    pub reason: Option<&'value str>,
+}
+
+/// Go `vip_events` row shape.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VipEventRecord {
+    /// Database primary key.
+    pub id: i64,
+    /// Telegram user ID.
+    pub user_id: i64,
+    /// VIP event type.
+    pub event_type: String,
+    /// Delta in VIP seconds.
+    pub delta_seconds: i64,
+    /// Effective expiry after applying this event.
+    pub effective_expires_at: OffsetDateTime,
+    /// Related subscription row, when applicable.
+    pub subscription_id: Option<i64>,
+    /// Admin or actor user ID, when applicable.
+    pub actor_user_id: Option<i64>,
+    /// Human-readable reason.
+    pub reason: String,
+    /// Row creation time.
+    pub created_at: OffsetDateTime,
+}
+
+/// Go `GetVIPSummaryByUserRow` shape.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VipSummaryRecord {
+    /// Latest VIP event ID.
+    pub latest_event_id: i64,
+    /// Telegram user ID.
+    pub user_id: i64,
+    /// Latest VIP event type.
+    pub latest_event_type: String,
+    /// Latest VIP delta in seconds.
+    pub latest_delta_seconds: i64,
+    /// Current effective expiry.
+    pub effective_expires_at: OffsetDateTime,
+    /// Whether the effective expiry is still in the future at query time.
+    pub is_active: bool,
+    /// Query-time remaining seconds, clamped to zero by Go SQL.
+    pub remaining_seconds: i64,
+    /// Related latest subscription row, when applicable.
+    pub latest_subscription_id: Option<i64>,
+    /// Related latest actor user, when applicable.
+    pub latest_actor_user_id: Option<i64>,
+    /// Latest event reason.
+    pub latest_reason: String,
+    /// Latest event creation time.
+    pub latest_created_at: OffsetDateTime,
+}
+
+/// Go `ListVIPEventsByUserRow` shape.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VipEventListRecord {
+    /// Database primary key.
+    pub id: i64,
+    /// Telegram user ID.
+    pub user_id: i64,
+    /// VIP event type.
+    pub event_type: String,
+    /// Delta in VIP seconds.
+    pub delta_seconds: i64,
+    /// Effective expiry after applying this event.
+    pub effective_expires_at: OffsetDateTime,
+    /// Related subscription row, when applicable.
+    pub subscription_id: Option<i64>,
+    /// Admin or actor user ID, when applicable.
+    pub actor_user_id: Option<i64>,
+    /// Joined actor username.
+    pub actor_username: Option<String>,
+    /// Joined actor first name.
+    pub actor_first_name: Option<String>,
+    /// Human-readable reason.
+    pub reason: String,
+    /// Row creation time.
+    pub created_at: OffsetDateTime,
+    /// Joined subscription Telegram payment charge ID.
+    pub telegram_payment_charge_id: Option<String>,
+    /// Joined subscription provider payment charge ID.
+    pub provider_payment_charge_id: Option<String>,
+    /// Joined subscription expiry.
+    pub subscription_expires_at: Option<OffsetDateTime>,
+    /// Joined subscription cancellation timestamp.
+    pub subscription_canceled_at: Option<OffsetDateTime>,
+    /// Joined subscription refund timestamp.
+    pub subscription_refunded_at: Option<OffsetDateTime>,
+}
+
+impl PostgresVipStore {
+    /// Build a VIP store on an existing Postgres pool.
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
+    /// Access the underlying Postgres pool.
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
+    /// Upsert the legacy external VIP cache row.
+    pub async fn upsert_vip_cache(&self, cache: VipCacheUpsert) -> Result<(), StorageError> {
+        sqlx::query(SQL_UPSERT_VIP_CACHE)
+            .bind(cache.user_id)
+            .bind(cache.is_vip)
+            .bind(cache.expires_at)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Load a non-expired VIP cache row by user ID.
+    pub async fn get_vip_cache(
+        &self,
+        user_id: i64,
+    ) -> Result<Option<VipCacheRecord>, StorageError> {
+        let row = sqlx::query(SQL_GET_VIP_CACHE)
+            .bind(user_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(vip_cache_from_row).transpose()?)
+    }
+
+    /// Delete a VIP cache row by user ID.
+    pub async fn delete_vip_cache(&self, user_id: i64) -> Result<(), StorageError> {
+        sqlx::query(SQL_DELETE_VIP_CACHE)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Delete expired VIP cache rows and return affected user IDs.
+    pub async fn cleanup_expired_vip_cache(&self) -> Result<Vec<i64>, StorageError> {
+        let rows = sqlx::query_scalar::<_, i64>(SQL_CLEANUP_EXPIRED_VIP_CACHE)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows)
+    }
+
+    /// Create an event-sourced VIP ledger entry through Go's `vip_create_event` SQL function.
+    pub async fn create_vip_event(
+        &self,
+        event: VipEventCreate<'_>,
+    ) -> Result<VipEventRecord, StorageError> {
+        let row = sqlx::query(SQL_CREATE_VIP_EVENT)
+            .bind(event.user_id)
+            .bind(event.event_type)
+            .bind(event.delta_seconds)
+            .bind(event.subscription_id)
+            .bind(event.actor_user_id)
+            .bind(event.reason)
+            .fetch_one(&self.pool)
+            .await?;
+        vip_event_from_row(row).map_err(StorageError::from)
+    }
+
+    /// Load the latest VIP ledger summary for a user.
+    pub async fn get_vip_summary_by_user(
+        &self,
+        user_id: i64,
+    ) -> Result<Option<VipSummaryRecord>, StorageError> {
+        let row = sqlx::query(SQL_GET_VIP_SUMMARY_BY_USER)
+            .bind(user_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(vip_summary_from_row).transpose()?)
+    }
+
+    /// List VIP ledger events for a user in Go display order.
+    pub async fn list_vip_events_by_user(
+        &self,
+        user_id: i64,
+    ) -> Result<Vec<VipEventListRecord>, StorageError> {
+        let rows = sqlx::query(SQL_LIST_VIP_EVENTS_BY_USER)
+            .bind(user_id)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter()
+            .map(vip_event_list_from_row)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
+    }
+}
+
 /// Storage connection failures.
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -1244,6 +1499,67 @@ fn donation_from_row(row: PgRow) -> Result<DonationRecord, sqlx::Error> {
         provider_payment_charge_id: row.try_get("provider_payment_charge_id")?,
         amount_stars: row.try_get("amount_stars")?,
         created_at: row.try_get("created_at")?,
+    })
+}
+
+fn vip_cache_from_row(row: PgRow) -> Result<VipCacheRecord, sqlx::Error> {
+    Ok(VipCacheRecord {
+        user_id: row.try_get("user_id")?,
+        is_vip: row.try_get("is_vip")?,
+        expires_at: row.try_get("expires_at")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
+fn vip_event_from_row(row: PgRow) -> Result<VipEventRecord, sqlx::Error> {
+    Ok(VipEventRecord {
+        id: row.try_get("id")?,
+        user_id: row.try_get("user_id")?,
+        event_type: row.try_get("event_type")?,
+        delta_seconds: row.try_get("delta_seconds")?,
+        effective_expires_at: row.try_get("effective_expires_at")?,
+        subscription_id: row.try_get("subscription_id")?,
+        actor_user_id: row.try_get("actor_user_id")?,
+        reason: row.try_get("reason")?,
+        created_at: row.try_get("created_at")?,
+    })
+}
+
+fn vip_summary_from_row(row: PgRow) -> Result<VipSummaryRecord, sqlx::Error> {
+    Ok(VipSummaryRecord {
+        latest_event_id: row.try_get("latest_event_id")?,
+        user_id: row.try_get("user_id")?,
+        latest_event_type: row.try_get("latest_event_type")?,
+        latest_delta_seconds: row.try_get("latest_delta_seconds")?,
+        effective_expires_at: row.try_get("effective_expires_at")?,
+        is_active: row.try_get("is_active")?,
+        remaining_seconds: row.try_get("remaining_seconds")?,
+        latest_subscription_id: row.try_get("latest_subscription_id")?,
+        latest_actor_user_id: row.try_get("latest_actor_user_id")?,
+        latest_reason: row.try_get("latest_reason")?,
+        latest_created_at: row.try_get("latest_created_at")?,
+    })
+}
+
+fn vip_event_list_from_row(row: PgRow) -> Result<VipEventListRecord, sqlx::Error> {
+    Ok(VipEventListRecord {
+        id: row.try_get("id")?,
+        user_id: row.try_get("user_id")?,
+        event_type: row.try_get("event_type")?,
+        delta_seconds: row.try_get("delta_seconds")?,
+        effective_expires_at: row.try_get("effective_expires_at")?,
+        subscription_id: row.try_get("subscription_id")?,
+        actor_user_id: row.try_get("actor_user_id")?,
+        actor_username: row.try_get("actor_username")?,
+        actor_first_name: row.try_get("actor_first_name")?,
+        reason: row.try_get("reason")?,
+        created_at: row.try_get("created_at")?,
+        telegram_payment_charge_id: row.try_get("telegram_payment_charge_id")?,
+        provider_payment_charge_id: row.try_get("provider_payment_charge_id")?,
+        subscription_expires_at: row.try_get("subscription_expires_at")?,
+        subscription_canceled_at: row.try_get("subscription_canceled_at")?,
+        subscription_refunded_at: row.try_get("subscription_refunded_at")?,
     })
 }
 
@@ -1793,6 +2109,208 @@ mod tests {
             .await;
         let _ = sqlx::query("DELETE FROM users WHERE id = $1")
             .bind(user_id)
+            .execute(&pool)
+            .await;
+        result
+    }
+
+    #[test]
+    fn vip_storage_sql_matches_go_query_contracts() {
+        assert_eq!(
+            super::SQL_UPSERT_VIP_CACHE,
+            "INSERT INTO vip_cache (user_id, is_vip, expires_at) VALUES ($1, $2, $3) ON CONFLICT (user_id) DO UPDATE SET is_vip = COALESCE(EXCLUDED.is_vip, vip_cache.is_vip), expires_at = COALESCE(EXCLUDED.expires_at, vip_cache.expires_at), updated_at = CURRENT_TIMESTAMP"
+        );
+        assert_eq!(
+            super::SQL_CREATE_VIP_EVENT,
+            "SELECT id, user_id, event_type, delta_seconds, effective_expires_at, subscription_id, actor_user_id, reason, created_at FROM vip_create_event($1, $2, $3, $4, $5, $6)"
+        );
+        assert_eq!(
+            super::SQL_GET_VIP_SUMMARY_BY_USER,
+            "SELECT id AS latest_event_id, user_id, event_type AS latest_event_type, delta_seconds AS latest_delta_seconds, effective_expires_at, effective_expires_at > CURRENT_TIMESTAMP AS is_active, CASE WHEN effective_expires_at > CURRENT_TIMESTAMP THEN FLOOR(EXTRACT(EPOCH FROM (effective_expires_at - CURRENT_TIMESTAMP)))::bigint ELSE 0::bigint END AS remaining_seconds, subscription_id AS latest_subscription_id, actor_user_id AS latest_actor_user_id, reason AS latest_reason, created_at AS latest_created_at FROM vip_events WHERE user_id = $1 ORDER BY id DESC LIMIT 1"
+        );
+        assert_eq!(
+            super::SQL_LIST_VIP_EVENTS_BY_USER,
+            "SELECT ve.id, ve.user_id, ve.event_type, ve.delta_seconds, ve.effective_expires_at, ve.subscription_id, ve.actor_user_id, actor.username AS actor_username, actor.first_name AS actor_first_name, ve.reason, ve.created_at, s.telegram_payment_charge_id, s.provider_payment_charge_id, s.expires_at AS subscription_expires_at, s.canceled_at AS subscription_canceled_at, s.refunded_at AS subscription_refunded_at FROM vip_events ve LEFT JOIN users actor ON actor.id = ve.actor_user_id LEFT JOIN subscriptions s ON s.id = ve.subscription_id WHERE ve.user_id = $1 ORDER BY ve.id DESC"
+        );
+        assert_eq!(
+            super::SQL_GET_VIP_CACHE,
+            "SELECT * FROM vip_cache WHERE user_id = $1 AND expires_at > CURRENT_TIMESTAMP LIMIT 1"
+        );
+        assert_eq!(
+            super::SQL_DELETE_VIP_CACHE,
+            "DELETE FROM vip_cache WHERE user_id = $1"
+        );
+        assert_eq!(
+            super::SQL_CLEANUP_EXPIRED_VIP_CACHE,
+            "DELETE FROM vip_cache WHERE expires_at <= CURRENT_TIMESTAMP RETURNING user_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_vip_store_round_trips_when_postgres_dsn_is_set() -> Result<(), Box<dyn Error>> {
+        let Ok(dsn) = env::var("OPENPLOTVA_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&dsn)
+            .await?;
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
+        let user_id = 9_003_000_000_000_i64 + i64::try_from(suffix % 1_000_000)?;
+        let actor_id = user_id + 1;
+        let charge_id = format!("test_vip_subscription_{suffix}");
+        let identity_store = super::PostgresVirtualMessageStore::new(pool.clone());
+        let payment_store = super::PostgresPaymentStore::new(pool.clone());
+        let vip_store = super::PostgresVipStore::new(pool.clone());
+        let future_expiry = time::OffsetDateTime::from_unix_timestamp(1_900_000_000)?;
+        let past_expiry = time::OffsetDateTime::from_unix_timestamp(1_600_000_000)?;
+
+        identity_store
+            .upsert_user_state(&openplotva_core::UserState::new(
+                user_id,
+                "VIP Tester",
+                None,
+                None,
+                None,
+                None,
+            ))
+            .await?;
+        identity_store
+            .upsert_user_state(&openplotva_core::UserState::new(
+                actor_id,
+                "Admin Actor",
+                None,
+                Some("admin_actor".to_owned()),
+                None,
+                None,
+            ))
+            .await?;
+
+        let result: Result<(), Box<dyn Error>> = async {
+            vip_store
+                .upsert_vip_cache(super::VipCacheUpsert {
+                    user_id,
+                    is_vip: true,
+                    expires_at: future_expiry,
+                })
+                .await?;
+            let cache = vip_store
+                .get_vip_cache(user_id)
+                .await?
+                .ok_or_else(|| std::io::Error::other("future VIP cache should be readable"))?;
+            assert_eq!(cache.user_id, user_id);
+            assert!(cache.is_vip);
+            assert_eq!(cache.expires_at, future_expiry);
+
+            vip_store.delete_vip_cache(user_id).await?;
+            assert!(vip_store.get_vip_cache(user_id).await?.is_none());
+            vip_store
+                .upsert_vip_cache(super::VipCacheUpsert {
+                    user_id: actor_id,
+                    is_vip: true,
+                    expires_at: past_expiry,
+                })
+                .await?;
+            assert!(vip_store.get_vip_cache(actor_id).await?.is_none());
+            assert!(
+                vip_store
+                    .cleanup_expired_vip_cache()
+                    .await?
+                    .contains(&actor_id)
+            );
+
+            let subscription = payment_store
+                .create_subscription(super::SubscriptionCreate {
+                    user_id,
+                    telegram_payment_charge_id: &charge_id,
+                    provider_payment_charge_id: "provider-vip",
+                    expires_at: future_expiry,
+                })
+                .await?;
+            let payment_event = vip_store
+                .create_vip_event(super::VipEventCreate {
+                    user_id,
+                    event_type: openplotva_core::VIP_EVENT_TYPE_PAYMENT,
+                    delta_seconds: openplotva_core::vip_days_to_seconds(30),
+                    subscription_id: Some(subscription.id),
+                    actor_user_id: None,
+                    reason: Some("payment charge"),
+                })
+                .await?;
+            let duplicate_payment_event = vip_store
+                .create_vip_event(super::VipEventCreate {
+                    user_id,
+                    event_type: openplotva_core::VIP_EVENT_TYPE_PAYMENT,
+                    delta_seconds: openplotva_core::vip_days_to_seconds(30),
+                    subscription_id: Some(subscription.id),
+                    actor_user_id: None,
+                    reason: Some("payment duplicate"),
+                })
+                .await?;
+            assert_eq!(
+                duplicate_payment_event.id, payment_event.id,
+                "Go vip_create_event returns the existing subscription-scoped event on conflicts"
+            );
+
+            let adjustment = vip_store
+                .create_vip_event(super::VipEventCreate {
+                    user_id,
+                    event_type: openplotva_core::VIP_EVENT_TYPE_ADMIN_ADJUSTMENT,
+                    delta_seconds: -3_600,
+                    subscription_id: None,
+                    actor_user_id: Some(actor_id),
+                    reason: Some("admin correction"),
+                })
+                .await?;
+
+            let summary = vip_store
+                .get_vip_summary_by_user(user_id)
+                .await?
+                .ok_or_else(|| std::io::Error::other("VIP summary should be readable"))?;
+            assert_eq!(summary.latest_event_id, adjustment.id);
+            assert_eq!(
+                summary.latest_event_type,
+                openplotva_core::VIP_EVENT_TYPE_ADMIN_ADJUSTMENT
+            );
+            assert_eq!(summary.latest_actor_user_id, Some(actor_id));
+            assert_eq!(summary.latest_reason, "admin correction");
+
+            let events = vip_store.list_vip_events_by_user(user_id).await?;
+            assert_eq!(events.len(), 2);
+            assert_eq!(events[0].id, adjustment.id);
+            assert_eq!(events[0].actor_username.as_deref(), Some("admin_actor"));
+            assert_eq!(events[0].actor_first_name.as_deref(), Some("Admin Actor"));
+            assert_eq!(events[1].id, payment_event.id);
+            assert_eq!(events[1].subscription_id, Some(subscription.id));
+            assert_eq!(
+                events[1].telegram_payment_charge_id.as_deref(),
+                Some(charge_id.as_str())
+            );
+            assert_eq!(
+                events[1].provider_payment_charge_id.as_deref(),
+                Some("provider-vip")
+            );
+            assert_eq!(events[1].subscription_expires_at, Some(future_expiry));
+
+            Ok(())
+        }
+        .await;
+
+        let _ = sqlx::query("DELETE FROM vip_events WHERE user_id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM vip_cache WHERE user_id = ANY($1)")
+            .bind([user_id, actor_id])
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM subscriptions WHERE telegram_payment_charge_id = $1")
+            .bind(&charge_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE id = ANY($1)")
+            .bind([user_id, actor_id])
             .execute(&pool)
             .await;
         result

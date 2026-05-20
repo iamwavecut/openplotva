@@ -121,6 +121,50 @@ pub const SENDER_TYPE_SAME_CHAT: &str = "same_chat";
 /// Go `sharedtypes.SenderTypeSystem`.
 pub const SENDER_TYPE_SYSTEM: &str = "system";
 
+/// Go `vip.EventTypePayment`.
+pub const VIP_EVENT_TYPE_PAYMENT: &str = "payment";
+/// Go `vip.EventTypeAdminAdjustment`.
+pub const VIP_EVENT_TYPE_ADMIN_ADJUSTMENT: &str = "admin_adjustment";
+/// Go `vip.EventTypeAdminRevoke`.
+pub const VIP_EVENT_TYPE_ADMIN_REVOKE: &str = "admin_revoke";
+/// Go `vip.EventTypeRefundReversal`.
+pub const VIP_EVENT_TYPE_REFUND_REVERSAL: &str = "refund_reversal";
+/// Go `vip.EventTypeLegacySubscriptionBackfill`.
+pub const VIP_EVENT_TYPE_LEGACY_SUBSCRIPTION_BACKFILL: &str = "legacy_subscription_backfill";
+/// Go `vip.EventTypeLegacyVIPCacheBackfill`.
+pub const VIP_EVENT_TYPE_LEGACY_VIP_CACHE_BACKFILL: &str = "legacy_vip_cache_backfill";
+/// Go `vip.SecondsPerDay`.
+pub const VIP_SECONDS_PER_DAY: i64 = 24 * 60 * 60;
+
+/// Return Go `vip.DaysToSeconds`.
+#[must_use]
+pub fn vip_days_to_seconds(days: i64) -> i64 {
+    days * VIP_SECONDS_PER_DAY
+}
+
+/// Return Go `vip.IsSyntheticSubscriptionChargeID`.
+#[must_use]
+pub fn is_synthetic_subscription_charge_id(charge_id: &str) -> bool {
+    charge_id.trim().starts_with("admin_grant_")
+}
+
+/// Return Go `vip.SubscriptionDeltaSeconds`.
+#[must_use]
+pub fn subscription_delta_seconds(
+    charge_id: &str,
+    created_at: time::OffsetDateTime,
+    expires_at: time::OffsetDateTime,
+    default_days: i64,
+) -> i64 {
+    if !is_synthetic_subscription_charge_id(charge_id) {
+        return vip_days_to_seconds(default_days);
+    }
+    if expires_at < created_at {
+        return 0;
+    }
+    (expires_at - created_at).whole_seconds()
+}
+
 /// Telegram sender identity after Go `utils.ResolveMessageSender` normalization.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct MessageSender {
@@ -486,7 +530,12 @@ fn is_false(value: &bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChatSettings, ChatState, MessageSender, PendingEditPayload, UserState, pending_edit_payload,
+        ChatSettings, ChatState, MessageSender, PendingEditPayload, UserState,
+        VIP_EVENT_TYPE_ADMIN_ADJUSTMENT, VIP_EVENT_TYPE_ADMIN_REVOKE,
+        VIP_EVENT_TYPE_LEGACY_SUBSCRIPTION_BACKFILL, VIP_EVENT_TYPE_LEGACY_VIP_CACHE_BACKFILL,
+        VIP_EVENT_TYPE_PAYMENT, VIP_EVENT_TYPE_REFUND_REVERSAL,
+        is_synthetic_subscription_charge_id, pending_edit_payload, subscription_delta_seconds,
+        vip_days_to_seconds,
     };
 
     #[test]
@@ -608,5 +657,45 @@ mod tests {
         assert!(!settings.enable_greet_joiners);
         assert_eq!(settings.enable_daily_game, Some(true));
         assert_eq!(settings.daily_game_theme.as_deref(), Some("auto"));
+    }
+
+    #[test]
+    fn vip_domain_helpers_match_go_vip_package() -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(VIP_EVENT_TYPE_PAYMENT, "payment");
+        assert_eq!(VIP_EVENT_TYPE_ADMIN_ADJUSTMENT, "admin_adjustment");
+        assert_eq!(VIP_EVENT_TYPE_ADMIN_REVOKE, "admin_revoke");
+        assert_eq!(VIP_EVENT_TYPE_REFUND_REVERSAL, "refund_reversal");
+        assert_eq!(
+            VIP_EVENT_TYPE_LEGACY_SUBSCRIPTION_BACKFILL,
+            "legacy_subscription_backfill"
+        );
+        assert_eq!(
+            VIP_EVENT_TYPE_LEGACY_VIP_CACHE_BACKFILL,
+            "legacy_vip_cache_backfill"
+        );
+        assert_eq!(vip_days_to_seconds(30), 2_592_000);
+        assert!(is_synthetic_subscription_charge_id(" admin_grant_42 "));
+        assert!(!is_synthetic_subscription_charge_id("subscription_42"));
+
+        let created_at = time::OffsetDateTime::from_unix_timestamp(1_800_000_000)?;
+        let expires_at = created_at + time::Duration::seconds(1234);
+
+        assert_eq!(
+            subscription_delta_seconds("telegram-charge", created_at, expires_at, 30),
+            2_592_000,
+            "Go uses the configured default duration for paid Telegram charges"
+        );
+        assert_eq!(
+            subscription_delta_seconds("admin_grant_42", created_at, expires_at, 30),
+            1234,
+            "synthetic admin grants preserve their exact created/expires delta"
+        );
+        assert_eq!(
+            subscription_delta_seconds("admin_grant_42", expires_at, created_at, 30),
+            0,
+            "Go clamps inverted synthetic admin grants to zero seconds"
+        );
+
+        Ok(())
     }
 }
