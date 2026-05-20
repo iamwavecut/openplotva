@@ -1605,6 +1605,164 @@ pub fn fetcher_message_text(message: &TelegramMessage) -> String {
     }
 }
 
+/// Go `guestMessageRejectReason` guard result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GuestMessageRejectReason {
+    NilMessage,
+    MissingGuestQueryId,
+    BotCaller,
+    MissingHumanSender,
+    BotSender,
+    OtherBotMention,
+}
+
+impl GuestMessageRejectReason {
+    /// Return the exact Go log reason string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NilMessage => "nil_message",
+            Self::MissingGuestQueryId => "missing_guest_query_id",
+            Self::BotCaller => "bot_caller",
+            Self::MissingHumanSender => "missing_human_sender",
+            Self::BotSender => "bot_sender",
+            Self::OtherBotMention => "other_bot_mention",
+        }
+    }
+}
+
+/// Return Go `guestVisibleText` for a Telegram message.
+#[must_use]
+pub fn guest_visible_text(message: Option<&TelegramMessage>) -> String {
+    let Some(message) = message else {
+        return String::new();
+    };
+
+    if let Some(text) = message.get_text() {
+        let text = text.as_ref().trim();
+        if !text.is_empty() {
+            return text.to_owned();
+        }
+    }
+
+    if let TelegramMessageData::Sticker(sticker) = &message.data
+        && let Some(emoji) = sticker.emoji.as_deref()
+    {
+        let emoji = emoji.trim();
+        if !emoji.is_empty() {
+            return emoji.to_owned();
+        }
+    }
+
+    String::new()
+}
+
+/// Strip Go guest mode's leading `@BotUsername` address prefix.
+#[must_use]
+pub fn strip_guest_address_prefix(text: &str, bot_username: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || bot_username.is_empty() {
+        return trimmed.to_owned();
+    }
+
+    let username = format!(
+        "@{}",
+        bot_username.trim().trim_start_matches('@').to_lowercase()
+    );
+    let (first_word, rest) = cut_first_word(trimmed);
+    if first_word.eq_ignore_ascii_case(&username) {
+        return rest.trim().to_owned();
+    }
+
+    trimmed.to_owned()
+}
+
+/// Return Go `guestCurrentRequestText` for a Telegram guest message.
+#[must_use]
+pub fn guest_current_request_text(message: Option<&TelegramMessage>, bot_username: &str) -> String {
+    strip_guest_address_prefix(&guest_visible_text(message), bot_username)
+        .trim()
+        .to_owned()
+}
+
+/// Return whether Go guest routing sees visible text in the current message or reply.
+#[must_use]
+pub fn guest_request_has_visible_text(
+    message: Option<&TelegramMessage>,
+    bot_username: &str,
+) -> bool {
+    let current_text = guest_current_request_text(message, bot_username);
+    let reply_text = message
+        .and_then(reply_message)
+        .map_or_else(String::new, |reply| guest_visible_text(Some(reply)));
+
+    !current_text.trim().is_empty() || !reply_text.trim().is_empty()
+}
+
+/// Return Go `guestHasOtherBotMention`.
+#[must_use]
+pub fn guest_has_other_bot_mention(
+    message: Option<&TelegramMessage>,
+    bot_user: Option<&TelegramUser>,
+) -> bool {
+    let Some(message) = message else {
+        return false;
+    };
+
+    let own_bot_id = bot_user.map(user_id_i64).unwrap_or_default();
+    let own_username = bot_user
+        .and_then(user_username)
+        .map(|username| normalize_username(&username))
+        .unwrap_or_default();
+
+    if guest_text_mentions_other_bot(message.get_text(), own_bot_id) {
+        return true;
+    }
+
+    guest_ascii_mentions(&guest_visible_text(Some(message)))
+        .into_iter()
+        .any(|mention| {
+            let username = normalize_username(&mention);
+            !username.is_empty() && username != own_username && username.ends_with("bot")
+        })
+}
+
+/// Return Go `guestMessageRejectReason`.
+#[must_use]
+pub fn guest_message_reject_reason(
+    message: Option<&TelegramMessage>,
+    bot_user: Option<&TelegramUser>,
+) -> Option<GuestMessageRejectReason> {
+    let Some(message) = message else {
+        return Some(GuestMessageRejectReason::NilMessage);
+    };
+
+    if message
+        .guest_query_id
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .is_empty()
+    {
+        return Some(GuestMessageRejectReason::MissingGuestQueryId);
+    }
+    if guest_bot_caller_user_is_bot(message) {
+        return Some(GuestMessageRejectReason::BotCaller);
+    }
+
+    let Some(sender) = message.sender.get_user() else {
+        return Some(GuestMessageRejectReason::MissingHumanSender);
+    };
+    if sender.is_bot {
+        return Some(GuestMessageRejectReason::BotSender);
+    }
+    if bot_user.is_some() && guest_has_other_bot_mention(Some(message), bot_user) {
+        return Some(GuestMessageRejectReason::OtherBotMention);
+    }
+
+    None
+}
+
 fn message_text_before_fetcher_fallback(message: &TelegramMessage) -> String {
     match &message.data {
         TelegramMessageData::Text(text) => text.as_ref().to_owned(),
@@ -1638,6 +1796,81 @@ fn first_word_trim(value: &str) -> &str {
 
 fn word_separator(ch: char) -> bool {
     matches!(ch, ' ' | ',' | '.' | '!' | '?' | ':' | '\r' | '\n' | '\t')
+}
+
+fn reply_message(message: &TelegramMessage) -> Option<&TelegramMessage> {
+    match message.reply_to.as_ref()? {
+        TelegramReplyTo::Message(reply) => Some(reply),
+        TelegramReplyTo::Story(_) => None,
+    }
+}
+
+fn user_id_i64(user: &TelegramUser) -> i64 {
+    user.id.into()
+}
+
+fn user_username(user: &TelegramUser) -> Option<String> {
+    user.username.as_ref().map(ToString::to_string)
+}
+
+fn normalize_username(username: &str) -> String {
+    username.trim().trim_start_matches('@').to_lowercase()
+}
+
+fn guest_text_mentions_other_bot(text: Option<&TelegramText>, own_bot_id: i64) -> bool {
+    let Some(entities) = text.and_then(|text| text.entities.as_ref()) else {
+        return false;
+    };
+
+    entities.into_iter().any(|entity| {
+        let TelegramTextEntity::TextMention { user, .. } = entity else {
+            return false;
+        };
+        if !user.is_bot {
+            return false;
+        }
+        own_bot_id == 0 || user_id_i64(user) != own_bot_id
+    })
+}
+
+fn guest_ascii_mentions(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let mut mentions = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'@' {
+            i += 1;
+            continue;
+        }
+
+        let start = i;
+        i += 1;
+        let name_start = i;
+        while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+            i += 1;
+        }
+        if i - name_start >= 3 {
+            mentions.push(text[start..i].to_owned());
+        }
+    }
+
+    mentions
+}
+
+fn guest_bot_caller_user_is_bot(message: &TelegramMessage) -> bool {
+    let Some(guest_bot) = &message.guest_bot else {
+        return false;
+    };
+
+    serde_json::to_value(guest_bot)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("guest_bot_caller_user")
+                .and_then(|user| user.get("is_bot"))
+                .and_then(Value::as_bool)
+        })
+        .unwrap_or(false)
 }
 
 fn is_edit_verb(word: &str) -> bool {
@@ -2180,10 +2413,12 @@ mod tests {
         UpdateConsumerConfig, UpdateProducerQueue, UpdateProducerQueueFuture, UpdateProducerSource,
         UpdateProducerSourceFuture, UpdateStageOutcome, blpop_timeout_arg, compose_image_prompt,
         edited_image_prompt_update, extract_update_state, fetcher_message_text,
-        is_allowed_producer_update, is_settings_command_message, parse_edit_command,
-        parse_if_addressed, process_update_at, producer_update_name, producer_update_type,
-        react_message_words, resolve_draw_prompt_from_message, run_update_producer_until,
-        should_handle_addressed_message, should_handle_random_response,
+        guest_current_request_text, guest_has_other_bot_mention, guest_message_reject_reason,
+        guest_request_has_visible_text, guest_visible_text, is_allowed_producer_update,
+        is_settings_command_message, parse_edit_command, parse_if_addressed, process_update_at,
+        producer_update_name, producer_update_type, react_message_words,
+        resolve_draw_prompt_from_message, run_update_producer_until,
+        should_handle_addressed_message, should_handle_random_response, strip_guest_address_prefix,
         telegram_message_attachments, update_name,
     };
     use carapax::types::{
@@ -2739,6 +2974,239 @@ mod tests {
 
         assert_eq!(update_name(&update), "guest_message");
         assert_eq!(extract_update_state(&update), None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn guest_visible_text_and_address_prefix_match_go_helpers() -> Result<(), Box<dyn Error>> {
+        let text_message = sample_guest_message_from_value(sample_guest_message_json(
+            501,
+            "  @PlotvaBot   привет  ",
+        ))?;
+        assert_eq!(
+            guest_visible_text(Some(&text_message)),
+            "@PlotvaBot   привет"
+        );
+        assert_eq!(
+            guest_current_request_text(Some(&text_message), "plotvabot"),
+            "привет"
+        );
+        assert_eq!(
+            strip_guest_address_prefix("  @OtherBot привет  ", "PlotvaBot"),
+            "@OtherBot привет"
+        );
+        assert_eq!(guest_visible_text(None), "");
+
+        let caption_message = sample_guest_message_from_value(json!({
+            "message_id": 502,
+            "date": 1_710_000_000,
+            "chat": sample_private_chat_json(),
+            "from": sample_user_json(),
+            "guest_query_id": "guest-query",
+            "photo": [
+                {
+                    "file_id": "photo-file",
+                    "file_unique_id": "photo-1",
+                    "height": 90,
+                    "width": 90
+                }
+            ],
+            "caption": "  caption request  "
+        }))?;
+        assert_eq!(
+            guest_visible_text(Some(&caption_message)),
+            "caption request"
+        );
+
+        let sticker_message = sample_guest_message_from_value(json!({
+            "message_id": 503,
+            "date": 1_710_000_000,
+            "chat": sample_private_chat_json(),
+            "from": sample_user_json(),
+            "guest_query_id": "guest-query",
+            "sticker": {
+                "file_id": "sticker-file",
+                "file_unique_id": "sticker-1",
+                "type": "regular",
+                "width": 64,
+                "height": 64,
+                "is_animated": false,
+                "is_video": false,
+                "emoji": " 🙂 "
+            }
+        }))?;
+        assert_eq!(guest_visible_text(Some(&sticker_message)), "🙂");
+
+        Ok(())
+    }
+
+    #[test]
+    fn guest_request_has_visible_text_uses_current_message_or_reply() -> Result<(), Box<dyn Error>>
+    {
+        let current_message = sample_guest_message_from_value(sample_guest_message_json(
+            504,
+            "  @PlotvaBot   расскажи  ",
+        ))?;
+        assert!(guest_request_has_visible_text(
+            Some(&current_message),
+            "PlotvaBot"
+        ));
+
+        let reply_only_message = sample_guest_message_from_value(json!({
+            "message_id": 505,
+            "date": 1_710_000_000,
+            "chat": sample_private_chat_json(),
+            "from": sample_user_json(),
+            "guest_query_id": "guest-query",
+            "text": " @PlotvaBot ",
+            "reply_to_message": sample_message_json(404, 1_709_999_900, "  original topic  ")
+        }))?;
+        assert_eq!(
+            guest_current_request_text(Some(&reply_only_message), "PlotvaBot"),
+            ""
+        );
+        assert!(guest_request_has_visible_text(
+            Some(&reply_only_message),
+            "PlotvaBot"
+        ));
+
+        let empty_message =
+            sample_guest_message_from_value(sample_guest_message_json(506, " @PlotvaBot "))?;
+        assert!(!guest_request_has_visible_text(
+            Some(&empty_message),
+            "PlotvaBot"
+        ));
+        assert!(!guest_request_has_visible_text(None, "PlotvaBot"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn guest_message_reject_reason_matches_go_guard_order() -> Result<(), Box<dyn Error>> {
+        let bot = sample_bot_user();
+        assert_eq!(
+            guest_message_reject_reason(None, Some(&bot)).map(|reason| reason.as_str()),
+            Some("nil_message")
+        );
+
+        let missing_query = sample_guest_message_from_value(json!({
+            "message_id": 507,
+            "date": 1_710_000_000,
+            "chat": sample_private_chat_json(),
+            "from": sample_user_json(),
+            "text": "hello"
+        }))?;
+        assert_eq!(
+            guest_message_reject_reason(Some(&missing_query), Some(&bot))
+                .map(|reason| reason.as_str()),
+            Some("missing_guest_query_id")
+        );
+
+        let bot_caller = sample_guest_message_from_value(json!({
+            "message_id": 508,
+            "date": 1_710_000_000,
+            "chat": sample_private_chat_json(),
+            "guest_query_id": "guest-query",
+            "guest_bot_caller_user": {
+                "id": 88,
+                "is_bot": true,
+                "first_name": "CallerBot"
+            },
+            "text": "hello"
+        }))?;
+        assert_eq!(
+            guest_message_reject_reason(Some(&bot_caller), Some(&bot))
+                .map(|reason| reason.as_str()),
+            Some("bot_caller")
+        );
+
+        let missing_sender = sample_guest_message_from_value(json!({
+            "message_id": 509,
+            "date": 1_710_000_000,
+            "chat": sample_private_chat_json(),
+            "guest_query_id": "guest-query",
+            "text": "hello"
+        }))?;
+        assert_eq!(
+            guest_message_reject_reason(Some(&missing_sender), Some(&bot))
+                .map(|reason| reason.as_str()),
+            Some("missing_human_sender")
+        );
+
+        let bot_sender = sample_guest_message_from_value(json!({
+            "message_id": 510,
+            "date": 1_710_000_000,
+            "chat": sample_private_chat_json(),
+            "guest_query_id": "guest-query",
+            "from": {
+                "id": 100,
+                "is_bot": true,
+                "first_name": "SenderBot"
+            },
+            "text": "hello"
+        }))?;
+        assert_eq!(
+            guest_message_reject_reason(Some(&bot_sender), Some(&bot))
+                .map(|reason| reason.as_str()),
+            Some("bot_sender")
+        );
+
+        let other_bot_mention =
+            sample_guest_message_from_value(sample_guest_message_json(511, "hello @OtherBot"))?;
+        assert_eq!(
+            guest_message_reject_reason(Some(&other_bot_mention), Some(&bot))
+                .map(|reason| reason.as_str()),
+            Some("other_bot_mention")
+        );
+
+        let accepted =
+            sample_guest_message_from_value(sample_guest_message_json(512, "hello Plotva"))?;
+        assert_eq!(
+            guest_message_reject_reason(Some(&accepted), Some(&bot)),
+            None
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn guest_other_bot_mention_matches_go_text_and_entity_rules() -> Result<(), Box<dyn Error>> {
+        let bot = sample_bot_user();
+        let own_mention =
+            sample_guest_message_from_value(sample_guest_message_json(513, "hello @PlotvaBot"))?;
+        assert!(!guest_has_other_bot_mention(Some(&own_mention), Some(&bot)));
+
+        let not_bot =
+            sample_guest_message_from_value(sample_guest_message_json(514, "hello @PlotvaTeam"))?;
+        assert!(!guest_has_other_bot_mention(Some(&not_bot), Some(&bot)));
+
+        let bot_suffix =
+            sample_guest_message_from_value(sample_guest_message_json(515, "hello @OtherBot"))?;
+        assert!(guest_has_other_bot_mention(Some(&bot_suffix), Some(&bot)));
+
+        let entity_bot = sample_guest_message_from_value(json!({
+            "message_id": 516,
+            "date": 1_710_000_000,
+            "chat": sample_private_chat_json(),
+            "from": sample_user_json(),
+            "guest_query_id": "guest-query",
+            "text": "other",
+            "entities": [
+                {
+                    "type": "text_mention",
+                    "offset": 0,
+                    "length": 5,
+                    "user": {
+                        "id": 888,
+                        "is_bot": true,
+                        "first_name": "Other"
+                    }
+                }
+            ]
+        }))?;
+        assert!(guest_has_other_bot_mention(Some(&entity_bot), Some(&bot)));
+        assert!(!guest_has_other_bot_mention(None, Some(&bot)));
 
         Ok(())
     }
@@ -4406,6 +4874,23 @@ mod tests {
         value: serde_json::Value,
     ) -> Result<TelegramMessage, serde_json::Error> {
         serde_json::from_value(value)
+    }
+
+    fn sample_guest_message_from_value(
+        value: serde_json::Value,
+    ) -> Result<TelegramMessage, serde_json::Error> {
+        serde_json::from_value(value)
+    }
+
+    fn sample_guest_message_json(message_id: i64, text: &str) -> serde_json::Value {
+        json!({
+            "message_id": message_id,
+            "date": 1_710_000_000,
+            "chat": sample_private_chat_json(),
+            "from": sample_user_json(),
+            "guest_query_id": "guest-query",
+            "text": text
+        })
     }
 
     fn sample_bot_user() -> carapax::types::User {
