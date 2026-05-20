@@ -3,10 +3,11 @@
 use std::{fmt, future::Future, pin::Pin};
 
 use carapax::types::{
-    Chat as TelegramChat, Message as TelegramMessage, Update as TelegramUpdate, UpdateType,
-    User as TelegramUser,
+    Chat as TelegramChat, ChatMember as TelegramChatMember, ChatMemberRestricted,
+    Message as TelegramMessage, Update as TelegramUpdate, UpdateType, User as TelegramUser,
 };
 use openplotva_core::{SENDER_TYPE_CHANNEL, SENDER_TYPE_SAME_CHAT};
+use openplotva_storage::{ChatMemberRecord, ChatMemberUpsert};
 use openplotva_taskman::{
     CONTROL_QUEUE_NAME, ControlJobData, ControlJobParams, ControlKind, HIGH_PRIORITY,
     StatelessJobItem, new_control_job_at,
@@ -14,6 +15,7 @@ use openplotva_taskman::{
 use openplotva_telegram::{
     ChatRef, DispatcherQueue, OutboundBuildError, ReplyMarkup, ReplyMessageRef, TextMessageRequest,
 };
+use thiserror::Error;
 use time::OffsetDateTime;
 
 use crate::virtual_messages::{
@@ -43,6 +45,10 @@ pub type GroupSettingsControlJobFuture<'a, T, E> =
 /// Boxed future returned by Go `syncChatAdmins` equivalents.
 pub type GroupSettingsSyncFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
+/// Boxed future returned by group settings member storage/API calls.
+pub type GroupSettingsMemberFuture<'a, T, E> =
+    Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'a>>;
+
 /// Queue boundary for Go settings-owned taskman control jobs.
 pub trait SettingsControlJobQueue {
     /// Error returned by the concrete queue implementation.
@@ -70,6 +76,49 @@ pub trait GroupSettingsControlJobEffects {
 
     /// Run Go `syncChatAdmins`; it logs internally and does not affect the job result.
     fn sync_chat_admins<'a>(&'a self, chat_id: i64) -> GroupSettingsSyncFuture<'a>;
+}
+
+/// Storage boundary for Go `canOpenGroupSettings`.
+pub trait GroupSettingsMemberStore {
+    /// Error returned by concrete member storage.
+    type Error: fmt::Display + Send + Sync + 'static;
+
+    /// Load a cached chat-member row.
+    fn get_chat_member<'a>(
+        &'a self,
+        chat_id: i64,
+        user_id: i64,
+    ) -> GroupSettingsMemberFuture<'a, Option<ChatMemberRecord>, Self::Error>;
+
+    /// Persist a freshly fetched chat-member row.
+    fn upsert_chat_member<'a>(
+        &'a self,
+        member: ChatMemberUpsert,
+    ) -> GroupSettingsMemberFuture<'a, (), Self::Error>;
+}
+
+/// Telegram boundary for Go `getChatMember` permission probes.
+pub trait GroupSettingsMemberApi {
+    /// Error returned by concrete Telegram calls.
+    type Error: fmt::Display + Send + Sync + 'static;
+
+    /// Fetch one chat-member from Telegram.
+    fn get_chat_member<'a>(
+        &'a self,
+        chat_id: i64,
+        user_id: i64,
+    ) -> GroupSettingsMemberFuture<'a, TelegramChatMember, Self::Error>;
+}
+
+/// Error returned by the concrete Go `canOpenGroupSettings` port.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum GroupSettingsPermissionCheckError {
+    /// Go returns an error when the caller user ID is missing.
+    #[error("missing caller user ID")]
+    MissingCaller,
+    /// Telegram permission probe failed.
+    #[error("{0}")]
+    Telegram(String),
 }
 
 /// Result of handling a decoded `/settings` update.
@@ -557,10 +606,219 @@ where
     .await
 }
 
+/// Go `canOpenGroupSettings` port using injected storage and Telegram boundaries.
+pub async fn can_open_group_settings_with_sources<Store, Api>(
+    store: &Store,
+    telegram: &Api,
+    chat_id: i64,
+    user_id: i64,
+) -> Result<bool, GroupSettingsPermissionCheckError>
+where
+    Store: GroupSettingsMemberStore + Sync,
+    Api: GroupSettingsMemberApi + Sync,
+{
+    if user_id == 0 {
+        return Err(GroupSettingsPermissionCheckError::MissingCaller);
+    }
+
+    match store.get_chat_member(chat_id, user_id).await {
+        Ok(member)
+            if openplotva_storage::stored_member_can_open_group_settings(member.as_ref()) =>
+        {
+            return Ok(true);
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::debug!(
+                %error,
+                chat_id,
+                user_id,
+                "failed to load cached caller membership; falling back to Telegram"
+            );
+        }
+    }
+
+    let member = telegram
+        .get_chat_member(chat_id, user_id)
+        .await
+        .map_err(|error| GroupSettingsPermissionCheckError::Telegram(error.to_string()))?;
+    let upsert = chat_member_upsert_from_telegram(chat_id, user_id, &member);
+    if let Err(error) = store.upsert_chat_member(upsert).await {
+        tracing::debug!(
+            %error,
+            chat_id,
+            user_id,
+            "failed to upsert caller membership from API"
+        );
+    }
+
+    Ok(openplotva_telegram::telegram_member_can_open_group_settings(&member))
+}
+
+/// Build Go `chatMemberUpsertParams` from a `carapax` Telegram member.
+#[must_use]
+pub fn chat_member_upsert_from_telegram(
+    chat_id: i64,
+    user_id: i64,
+    member: &TelegramChatMember,
+) -> ChatMemberUpsert {
+    let mut params = ChatMemberUpsert {
+        chat_id,
+        user_id,
+        status: telegram_chat_member_status(member).to_owned(),
+        is_anonymous: Some(telegram_chat_member_is_anonymous(member)),
+        can_be_edited: Some(telegram_chat_member_can_be_edited(member)),
+        ..ChatMemberUpsert::default()
+    };
+    apply_chat_member_role_permissions(&mut params, member);
+    apply_chat_member_send_permissions(&mut params, member);
+    params
+}
+
 fn message_chat_ref(message: &TelegramMessage) -> ChatRef {
     ChatRef {
         id: message.chat.get_id().into(),
         is_forum: message.message_thread_id.is_some(),
+    }
+}
+
+impl GroupSettingsMemberStore for openplotva_storage::PostgresChatMemberStore {
+    type Error = openplotva_storage::StorageError;
+
+    fn get_chat_member<'a>(
+        &'a self,
+        chat_id: i64,
+        user_id: i64,
+    ) -> GroupSettingsMemberFuture<'a, Option<ChatMemberRecord>, Self::Error> {
+        Box::pin(async move { self.get_chat_member(chat_id, user_id).await })
+    }
+
+    fn upsert_chat_member<'a>(
+        &'a self,
+        member: ChatMemberUpsert,
+    ) -> GroupSettingsMemberFuture<'a, (), Self::Error> {
+        Box::pin(async move { self.upsert_chat_member(&member).await })
+    }
+}
+
+impl GroupSettingsMemberApi for openplotva_telegram::TelegramClient {
+    type Error = carapax::api::ExecuteError;
+
+    fn get_chat_member<'a>(
+        &'a self,
+        chat_id: i64,
+        user_id: i64,
+    ) -> GroupSettingsMemberFuture<'a, TelegramChatMember, Self::Error> {
+        Box::pin(async move {
+            self.execute(openplotva_telegram::build_get_chat_member_method(
+                chat_id, user_id,
+            ))
+            .await
+        })
+    }
+}
+
+fn telegram_chat_member_status(member: &TelegramChatMember) -> &'static str {
+    match member {
+        TelegramChatMember::Administrator(_) => {
+            openplotva_storage::CHAT_MEMBER_STATUS_ADMINISTRATOR
+        }
+        TelegramChatMember::Creator(_) => openplotva_storage::CHAT_MEMBER_STATUS_CREATOR,
+        TelegramChatMember::Kicked(_) => openplotva_storage::CHAT_MEMBER_STATUS_KICKED,
+        TelegramChatMember::Left(_) => openplotva_storage::CHAT_MEMBER_STATUS_LEFT,
+        TelegramChatMember::Member { .. } => openplotva_storage::CHAT_MEMBER_STATUS_MEMBER,
+        TelegramChatMember::Restricted(_) => "restricted",
+    }
+}
+
+fn telegram_chat_member_is_anonymous(member: &TelegramChatMember) -> bool {
+    match member {
+        TelegramChatMember::Administrator(admin) => admin.is_anonymous,
+        TelegramChatMember::Creator(creator) => creator.is_anonymous,
+        TelegramChatMember::Kicked(_)
+        | TelegramChatMember::Left(_)
+        | TelegramChatMember::Member { .. }
+        | TelegramChatMember::Restricted(_) => false,
+    }
+}
+
+fn telegram_chat_member_can_be_edited(member: &TelegramChatMember) -> bool {
+    match member {
+        TelegramChatMember::Administrator(admin) => admin.can_be_edited,
+        TelegramChatMember::Creator(_)
+        | TelegramChatMember::Kicked(_)
+        | TelegramChatMember::Left(_)
+        | TelegramChatMember::Member { .. }
+        | TelegramChatMember::Restricted(_) => false,
+    }
+}
+
+fn apply_chat_member_role_permissions(params: &mut ChatMemberUpsert, member: &TelegramChatMember) {
+    match member {
+        TelegramChatMember::Creator(_) => apply_creator_chat_member_permissions(params),
+        TelegramChatMember::Administrator(admin) => {
+            params.can_delete_messages = Some(admin.can_delete_messages);
+            params.can_manage_video_chats = Some(admin.can_manage_video_chats);
+            params.can_restrict_members = Some(admin.can_restrict_members);
+            params.can_promote_members = Some(admin.can_promote_members);
+            params.can_change_info = Some(admin.can_change_info);
+            params.can_invite_users = Some(admin.can_invite_users);
+            params.can_post_messages = admin.can_post_messages;
+            params.can_edit_messages = admin.can_edit_messages;
+            params.can_pin_messages = admin.can_pin_messages;
+            params.can_manage_topics = admin.can_manage_topics;
+        }
+        TelegramChatMember::Kicked(_)
+        | TelegramChatMember::Left(_)
+        | TelegramChatMember::Member { .. }
+        | TelegramChatMember::Restricted(_) => {}
+    }
+}
+
+fn apply_creator_chat_member_permissions(params: &mut ChatMemberUpsert) {
+    params.can_promote_members = Some(true);
+    params.can_delete_messages = Some(true);
+    params.can_manage_video_chats = Some(true);
+    params.can_restrict_members = Some(true);
+    params.can_change_info = Some(true);
+    params.can_invite_users = Some(true);
+    params.can_post_messages = Some(true);
+    params.can_edit_messages = Some(true);
+    params.can_pin_messages = Some(true);
+}
+
+fn apply_chat_member_send_permissions(params: &mut ChatMemberUpsert, member: &TelegramChatMember) {
+    let TelegramChatMember::Restricted(restricted) = member else {
+        return;
+    };
+    set_bool_if_true(&mut params.can_send_messages, restricted.can_send_messages);
+    set_bool_if_true(
+        &mut params.can_send_media_messages,
+        restricted_can_send_media_messages(restricted),
+    );
+    set_bool_if_true(&mut params.can_send_polls, restricted.can_send_polls);
+    set_bool_if_true(
+        &mut params.can_send_other_messages,
+        restricted.can_send_other_messages,
+    );
+    set_bool_if_true(
+        &mut params.can_add_web_page_previews,
+        restricted.can_add_web_page_previews,
+    );
+}
+
+fn restricted_can_send_media_messages(member: &ChatMemberRestricted) -> bool {
+    member.can_send_audios
+        && member.can_send_documents
+        && member.can_send_photos
+        && member.can_send_videos
+        && member.can_send_video_notes
+        && member.can_send_voice_notes
+}
+
+fn set_bool_if_true(target: &mut Option<bool>, value: bool) {
+    if value {
+        *target = Some(true);
     }
 }
 
@@ -602,8 +860,11 @@ mod tests {
         sync::{Arc, Mutex},
     };
 
-    use carapax::types::Update as TelegramUpdate;
+    use carapax::types::{
+        ChatMember, ChatMemberAdministrator, ChatMemberCreator, Update as TelegramUpdate, User,
+    };
     use openplotva_core::MessageIdMapping;
+    use openplotva_storage::{ChatMemberRecord, ChatMemberUpsert};
     use openplotva_taskman::{
         CONTROL_QUEUE_NAME, ControlJobData, ControlJobParams, ControlKind, HIGH_PRIORITY, JobType,
         StatelessJobItem,
@@ -617,6 +878,7 @@ mod tests {
     use super::{
         GroupSettingsCommandOutcome, GroupSettingsControlJobBuild, SettingsCommandOutcome,
         SettingsControlJobQueue, SettingsControlJobQueueFuture,
+        can_open_group_settings_with_sources, chat_member_upsert_from_telegram,
         execute_group_settings_control_job_at, group_settings_control_job_from_update_at,
         handle_group_settings_command_update_at, handle_private_settings_command_update,
     };
@@ -1081,6 +1343,121 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn group_settings_permission_uses_stored_creator_without_telegram_call()
+    -> Result<(), Box<dyn Error>> {
+        let store = GroupSettingsMemberStoreStub::with_member(ChatMemberRecord {
+            chat_id: -10042,
+            user_id: 42,
+            status: openplotva_storage::CHAT_MEMBER_STATUS_CREATOR.to_owned(),
+            ..ChatMemberRecord::default()
+        });
+        let telegram = GroupSettingsMemberApiStub::failing();
+
+        let allowed = can_open_group_settings_with_sources(&store, &telegram, -10042, 42).await?;
+
+        assert!(allowed);
+        assert_eq!(store.get_calls(), vec![(-10042, 42)]);
+        assert!(store.upserts().is_empty());
+        assert!(telegram.calls().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn group_settings_permission_refreshes_denied_store_from_telegram_and_upserts_member()
+    -> Result<(), Box<dyn Error>> {
+        let store = GroupSettingsMemberStoreStub::with_member(ChatMemberRecord {
+            chat_id: -10042,
+            user_id: 42,
+            status: openplotva_storage::CHAT_MEMBER_STATUS_ADMINISTRATOR.to_owned(),
+            can_promote_members: Some(false),
+            ..ChatMemberRecord::default()
+        });
+        let telegram = GroupSettingsMemberApiStub::with_member(promoting_admin_member(42));
+
+        let allowed = can_open_group_settings_with_sources(&store, &telegram, -10042, 42).await?;
+
+        assert!(allowed);
+        assert_eq!(telegram.calls(), vec![(-10042, 42)]);
+        let upserts = store.upserts();
+        assert_eq!(upserts.len(), 1);
+        let upsert = &upserts[0];
+        assert_eq!(upsert.chat_id, -10042);
+        assert_eq!(upsert.user_id, 42);
+        assert_eq!(
+            upsert.status,
+            openplotva_storage::CHAT_MEMBER_STATUS_ADMINISTRATOR
+        );
+        assert_eq!(upsert.can_promote_members, Some(true));
+        assert_eq!(upsert.can_delete_messages, Some(true));
+        assert_eq!(upsert.can_send_media_messages, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn group_settings_permission_ignores_store_errors_but_reports_telegram_errors() {
+        let store = GroupSettingsMemberStoreStub::failing_get();
+        let telegram = GroupSettingsMemberApiStub::failing();
+
+        let error = can_open_group_settings_with_sources(&store, &telegram, -10042, 42)
+            .await
+            .expect_err("Telegram failure should be surfaced");
+
+        assert_eq!(error.to_string(), "request failed");
+        assert_eq!(store.get_calls(), vec![(-10042, 42)]);
+        assert_eq!(telegram.calls(), vec![(-10042, 42)]);
+    }
+
+    #[tokio::test]
+    async fn group_settings_permission_rejects_missing_caller_before_io() {
+        let store = GroupSettingsMemberStoreStub::default();
+        let telegram = GroupSettingsMemberApiStub::with_member(promoting_admin_member(42));
+
+        let error = can_open_group_settings_with_sources(&store, &telegram, -10042, 0)
+            .await
+            .expect_err("missing caller should be rejected");
+
+        assert_eq!(error.to_string(), "missing caller user ID");
+        assert!(store.get_calls().is_empty());
+        assert!(telegram.calls().is_empty());
+    }
+
+    #[test]
+    fn chat_member_upsert_from_telegram_preserves_go_permission_semantics() {
+        let creator = chat_member_upsert_from_telegram(
+            -10042,
+            42,
+            &ChatMember::Creator(ChatMemberCreator::new(User::new(42, "Ada", false))),
+        );
+        assert_eq!(creator.can_promote_members, Some(true));
+        assert_eq!(creator.can_delete_messages, Some(true));
+        assert_eq!(creator.can_manage_video_chats, Some(true));
+        assert_eq!(creator.can_send_media_messages, None);
+
+        let admin = chat_member_upsert_from_telegram(-10042, 42, &promoting_admin_member(42));
+        assert_eq!(
+            admin.status,
+            openplotva_storage::CHAT_MEMBER_STATUS_ADMINISTRATOR
+        );
+        assert_eq!(admin.can_promote_members, Some(true));
+        assert_eq!(admin.can_delete_messages, Some(true));
+        assert_eq!(admin.can_manage_topics, Some(true));
+        assert_eq!(admin.can_send_messages, None);
+        assert_eq!(admin.can_send_media_messages, None);
+
+        let restricted = chat_member_upsert_from_telegram(
+            -10042,
+            42,
+            &restricted_member_with_send_permissions(42),
+        );
+        assert_eq!(restricted.status, "restricted");
+        assert_eq!(restricted.can_send_messages, Some(true));
+        assert_eq!(restricted.can_send_media_messages, Some(true));
+        assert_eq!(restricted.can_send_polls, Some(true));
+        assert_eq!(restricted.can_send_other_messages, Some(true));
+        assert_eq!(restricted.can_add_web_page_previews, Some(true));
+    }
+
     type RecordedVirtualInsert = (String, i64, Option<i32>);
 
     #[derive(Clone, Default)]
@@ -1435,5 +1812,183 @@ mod tests {
                     .push(chat_id);
             })
         }
+    }
+
+    #[derive(Clone, Default)]
+    struct GroupSettingsMemberStoreStub {
+        state: Arc<Mutex<GroupSettingsMemberStoreState>>,
+    }
+
+    #[derive(Default)]
+    struct GroupSettingsMemberStoreState {
+        member: Option<ChatMemberRecord>,
+        fail_get: bool,
+        get_calls: Vec<(i64, i64)>,
+        upserts: Vec<ChatMemberUpsert>,
+    }
+
+    impl GroupSettingsMemberStoreStub {
+        fn with_member(member: ChatMemberRecord) -> Self {
+            Self {
+                state: Arc::new(Mutex::new(GroupSettingsMemberStoreState {
+                    member: Some(member),
+                    ..GroupSettingsMemberStoreState::default()
+                })),
+            }
+        }
+
+        fn failing_get() -> Self {
+            Self {
+                state: Arc::new(Mutex::new(GroupSettingsMemberStoreState {
+                    fail_get: true,
+                    ..GroupSettingsMemberStoreState::default()
+                })),
+            }
+        }
+
+        fn get_calls(&self) -> Vec<(i64, i64)> {
+            self.state
+                .lock()
+                .expect("group settings member store state")
+                .get_calls
+                .clone()
+        }
+
+        fn upserts(&self) -> Vec<ChatMemberUpsert> {
+            self.state
+                .lock()
+                .expect("group settings member store state")
+                .upserts
+                .clone()
+        }
+    }
+
+    impl super::GroupSettingsMemberStore for GroupSettingsMemberStoreStub {
+        type Error = StubError;
+
+        fn get_chat_member<'a>(
+            &'a self,
+            chat_id: i64,
+            user_id: i64,
+        ) -> super::GroupSettingsMemberFuture<'a, Option<ChatMemberRecord>, Self::Error> {
+            Box::pin(async move {
+                let mut state = self
+                    .state
+                    .lock()
+                    .expect("group settings member store state");
+                state.get_calls.push((chat_id, user_id));
+                if state.fail_get {
+                    Err(StubError)
+                } else {
+                    Ok(state.member.clone())
+                }
+            })
+        }
+
+        fn upsert_chat_member<'a>(
+            &'a self,
+            member: ChatMemberUpsert,
+        ) -> super::GroupSettingsMemberFuture<'a, (), Self::Error> {
+            Box::pin(async move {
+                self.state
+                    .lock()
+                    .expect("group settings member store state")
+                    .upserts
+                    .push(member);
+                Ok(())
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    struct GroupSettingsMemberApiStub {
+        state: Arc<Mutex<GroupSettingsMemberApiState>>,
+    }
+
+    #[derive(Default)]
+    struct GroupSettingsMemberApiState {
+        member: Option<ChatMember>,
+        fail: bool,
+        calls: Vec<(i64, i64)>,
+    }
+
+    impl GroupSettingsMemberApiStub {
+        fn with_member(member: ChatMember) -> Self {
+            Self {
+                state: Arc::new(Mutex::new(GroupSettingsMemberApiState {
+                    member: Some(member),
+                    ..GroupSettingsMemberApiState::default()
+                })),
+            }
+        }
+
+        fn failing() -> Self {
+            Self {
+                state: Arc::new(Mutex::new(GroupSettingsMemberApiState {
+                    fail: true,
+                    ..GroupSettingsMemberApiState::default()
+                })),
+            }
+        }
+
+        fn calls(&self) -> Vec<(i64, i64)> {
+            self.state
+                .lock()
+                .expect("group settings member API state")
+                .calls
+                .clone()
+        }
+    }
+
+    impl super::GroupSettingsMemberApi for GroupSettingsMemberApiStub {
+        type Error = StubError;
+
+        fn get_chat_member<'a>(
+            &'a self,
+            chat_id: i64,
+            user_id: i64,
+        ) -> super::GroupSettingsMemberFuture<'a, ChatMember, Self::Error> {
+            Box::pin(async move {
+                let mut state = self.state.lock().expect("group settings member API state");
+                state.calls.push((chat_id, user_id));
+                if state.fail {
+                    return Err(StubError);
+                }
+                state.member.clone().ok_or(StubError)
+            })
+        }
+    }
+
+    fn promoting_admin_member(user_id: i64) -> ChatMember {
+        ChatMember::Administrator(
+            ChatMemberAdministrator::new(User::new(user_id, "Ada", false))
+                .with_can_be_edited(true)
+                .with_can_delete_messages(true)
+                .with_can_manage_video_chats(true)
+                .with_can_restrict_members(true)
+                .with_can_promote_members(true)
+                .with_can_change_info(true)
+                .with_can_invite_users(true)
+                .with_can_post_messages(true)
+                .with_can_edit_messages(true)
+                .with_can_pin_messages(true)
+                .with_can_manage_topics(true),
+        )
+    }
+
+    fn restricted_member_with_send_permissions(user_id: i64) -> ChatMember {
+        ChatMember::Restricted(
+            carapax::types::ChatMemberRestricted::new(User::new(user_id, "Ada", false), 0)
+                .with_can_send_messages(true)
+                .with_can_send_audios(true)
+                .with_can_send_documents(true)
+                .with_can_send_photos(true)
+                .with_can_send_videos(true)
+                .with_can_send_video_notes(true)
+                .with_can_send_voice_notes(true)
+                .with_can_send_polls(true)
+                .with_can_send_other_messages(true)
+                .with_can_add_web_page_previews(true),
+        )
     }
 }

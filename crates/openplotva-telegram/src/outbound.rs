@@ -5,13 +5,14 @@ use std::{borrow::Cow, fmt, io::Cursor};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use carapax::types::{
     AnswerCallbackQuery, AnswerGuestQuery, AnswerInlineQuery, AnswerPreCheckoutQuery, ChatAction,
-    CreateInvoiceLink, DeleteMessage, EditMessageCaption, EditMessageMedia, EditMessageReplyMarkup,
-    EditMessageText, EditUserStarSubscription, InlineKeyboardButton, InlineKeyboardMarkup,
-    InlineQueryResult, InlineQueryResultArticle, InputFile, InputFileReader, InputMedia,
-    InputMediaError, InputMediaPhoto, InputMessageContentText, InvoiceParameters, LabeledPrice,
-    MediaGroup, MediaGroupError, MediaGroupItem, ParseMode, RefundStarPayment, ReplyMarkup,
-    ReplyParameters, ReplyParametersError, SendAudio, SendChatAction, SendMediaGroup, SendMessage,
-    SendPhoto, SendSticker, WebAppInfo,
+    ChatMember, CreateInvoiceLink, DeleteMessage, EditMessageCaption, EditMessageMedia,
+    EditMessageReplyMarkup, EditMessageText, EditUserStarSubscription, GetChatMember,
+    InlineKeyboardButton, InlineKeyboardMarkup, InlineQueryResult, InlineQueryResultArticle,
+    InputFile, InputFileReader, InputMedia, InputMediaError, InputMediaPhoto,
+    InputMessageContentText, InvoiceParameters, LabeledPrice, MediaGroup, MediaGroupError,
+    MediaGroupItem, ParseMode, RefundStarPayment, ReplyMarkup, ReplyParameters,
+    ReplyParametersError, SendAudio, SendChatAction, SendMediaGroup, SendMessage, SendPhoto,
+    SendSticker, WebAppInfo,
 };
 use crc::{CRC_32_ISCSI, Crc};
 use serde_json::{Map, Value, json};
@@ -684,6 +685,25 @@ pub fn build_chat_action_method(
         method = method.with_message_thread_id(req.message_thread_id);
     }
     Ok(method)
+}
+
+/// Build Go's `getChatMember` permission probe request.
+#[must_use]
+pub fn build_get_chat_member_method(chat_id: i64, user_id: i64) -> GetChatMember {
+    GetChatMember::new(chat_id, user_id)
+}
+
+/// Go `telegramMemberCanOpenGroupSettings`.
+#[must_use]
+pub fn telegram_member_can_open_group_settings(member: &ChatMember) -> bool {
+    match member {
+        ChatMember::Creator(_) => true,
+        ChatMember::Administrator(admin) => admin.can_promote_members,
+        ChatMember::Kicked(_)
+        | ChatMember::Left(_)
+        | ChatMember::Member { .. }
+        | ChatMember::Restricted(_) => false,
+    }
 }
 
 /// Build an outbound `answerCallbackQuery` method.
@@ -1709,6 +1729,7 @@ fn format_go_file_bytes(file_name: &str, bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use carapax::types::{ChatMember, ChatMemberAdministrator, ChatMemberCreator, User};
     use serde_json::{Value, json};
 
     use super::{
@@ -1726,11 +1747,11 @@ mod tests {
         build_delete_message_method, build_donation_invoice_link_method,
         build_edit_caption_message_method, build_edit_media_message_method,
         build_edit_media_message_plan, build_edit_reply_markup_message_method,
-        build_edit_text_message_method, build_guest_add_to_chat_markup,
-        build_guest_html_answer_method, build_guest_query_answer_method,
-        build_inline_keyboard_button_data, build_inline_keyboard_button_url,
-        build_inline_keyboard_button_web_app, build_inline_keyboard_markup,
-        build_inline_keyboard_row, build_inline_query_answer_method,
+        build_edit_text_message_method, build_get_chat_member_method,
+        build_guest_add_to_chat_markup, build_guest_html_answer_method,
+        build_guest_query_answer_method, build_inline_keyboard_button_data,
+        build_inline_keyboard_button_url, build_inline_keyboard_button_web_app,
+        build_inline_keyboard_markup, build_inline_keyboard_row, build_inline_query_answer_method,
         build_inline_query_result_article, build_media_group_message_method,
         build_media_group_message_plan, build_photo_message_method, build_photo_message_plan,
         build_pre_checkout_ok_method, build_private_settings_keyboard,
@@ -1741,7 +1762,8 @@ mod tests {
         fingerprint_sticker_message_plan, fingerprint_text_message_part, forum_thread_id,
         guest_add_to_chat_url, guest_dialog_fallback_html, guest_inline_description,
         guest_inline_result_id, guest_unsupported_feature_html, hash_content, message_target_chat,
-        prepare_guest_html, subscription_invoice_payload, validate_text_message_text,
+        prepare_guest_html, subscription_invoice_payload, telegram_member_can_open_group_settings,
+        validate_text_message_text,
     };
     use crate::{
         InlineKeyboardButton, InlineKeyboardMarkup, ReplyMarkup, TELEGRAM_PARSE_MODE_HTML,
@@ -2757,6 +2779,42 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn build_get_chat_member_method_matches_go_permission_probe_payload()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let method = build_get_chat_member_method(-10042, 42);
+        let payload = serde_json::to_value(method)?;
+
+        assert_eq!(payload["chat_id"], json!(-10042));
+        assert_eq!(payload["user_id"], json!(42));
+        Ok(())
+    }
+
+    #[test]
+    fn telegram_member_permission_matches_go_group_settings_rule() {
+        let creator = ChatMember::Creator(ChatMemberCreator::new(User::new(42, "Ada", false)));
+        let promoting_admin = ChatMember::Administrator(
+            ChatMemberAdministrator::new(User::new(43, "Grace", false))
+                .with_can_promote_members(true),
+        );
+        let non_promoting_admin = ChatMember::Administrator(
+            ChatMemberAdministrator::new(User::new(44, "Alan", false))
+                .with_can_promote_members(false),
+        );
+        let member = ChatMember::Member {
+            user: User::new(45, "Linus", false),
+            tag: None,
+            until_date: None,
+        };
+
+        assert!(telegram_member_can_open_group_settings(&creator));
+        assert!(telegram_member_can_open_group_settings(&promoting_admin));
+        assert!(!telegram_member_can_open_group_settings(
+            &non_promoting_admin
+        ));
+        assert!(!telegram_member_can_open_group_settings(&member));
     }
 
     #[test]

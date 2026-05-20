@@ -58,7 +58,7 @@ pub use outbound::{
     build_donation_invoice_link_method, build_edit_caption_message_method,
     build_edit_media_message_method, build_edit_media_message_plan,
     build_edit_reply_markup_message_method, build_edit_text_message_method,
-    build_guest_add_to_chat_markup, build_guest_html_answer_method,
+    build_get_chat_member_method, build_guest_add_to_chat_markup, build_guest_html_answer_method,
     build_guest_query_answer_method, build_inline_keyboard_button_data,
     build_inline_keyboard_button_url, build_inline_keyboard_button_web_app,
     build_inline_keyboard_markup, build_inline_keyboard_row, build_inline_query_answer_method,
@@ -73,7 +73,7 @@ pub use outbound::{
     guest_dialog_fallback_html, guest_inline_description, guest_inline_result_id,
     guest_unsupported_feature_html, hash_content, message_target_chat, parse_mode_from_go,
     prepare_guest_html, subscription_invoice_payload, subscription_invoice_price_stars,
-    validate_text_message_text,
+    telegram_member_can_open_group_settings, validate_text_message_text,
 };
 pub use pending_ops::{
     PENDING_OP_DELETE, PENDING_OP_EDIT, PendingOpBuildError, build_pending_op_method,
@@ -125,6 +125,9 @@ pub type SetBotCommands = carapax::types::SetBotCommands;
 
 /// Telegram getUpdates method from `carapax`.
 pub type GetUpdates = carapax::types::GetUpdates;
+
+/// Telegram getChatMember method from `carapax`.
+pub type GetChatMember = carapax::types::GetChatMember;
 
 /// Telegram setWebhook method from `carapax`.
 pub type SetWebhook = carapax::types::SetWebhook;
