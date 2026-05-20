@@ -12,9 +12,9 @@ mod transport;
 mod update_startup;
 
 pub use callback::{
-    CallbackActionData, CallbackActionParse, CallbackHandlerKind, callback_handler_for_action,
-    checkin_theme_callback_init, checkin_theme_callback_theme, checkin_theme_selection_alert,
-    parse_callback_action,
+    CallbackActionData, CallbackActionParse, CallbackHandlerKind, CallbackQueryRoute,
+    callback_handler_for_action, callback_query_route, checkin_theme_callback_init,
+    checkin_theme_callback_theme, checkin_theme_selection_alert, parse_callback_action,
 };
 pub use dedup::{DEFAULT_DEBOUNCE_CACHE_SIZE, DEFAULT_DEBOUNCE_WINDOW, Debouncer, DebouncerConfig};
 pub use dispatcher::{
@@ -600,11 +600,11 @@ mod tests {
 
     use super::{
         API_CONSTRUCTOR_USAGES, BotCommandError, BotCommandScope, CALLBACK_ACTIONS,
-        COMMAND_ALIAS_GROUPS, COMMAND_SETS, CallbackActionParse, CallbackHandlerKind, CommandScope,
-        DONATE_COMMAND, GROUP_ADMIN_COMMANDS, GROUP_COMMANDS, HELP_COMMAND, PRIVATE_COMMANDS,
-        callback_handler_for_action, checkin_theme_callback_init, checkin_theme_callback_theme,
-        checkin_theme_selection_alert, delete_my_commands_method, empty_context,
-        parse_callback_action, set_my_commands_methods,
+        COMMAND_ALIAS_GROUPS, COMMAND_SETS, CallbackActionParse, CallbackHandlerKind,
+        CallbackQueryRoute, CommandScope, DONATE_COMMAND, GROUP_ADMIN_COMMANDS, GROUP_COMMANDS,
+        HELP_COMMAND, PRIVATE_COMMANDS, callback_handler_for_action, callback_query_route,
+        checkin_theme_callback_init, checkin_theme_callback_theme, checkin_theme_selection_alert,
+        delete_my_commands_method, empty_context, parse_callback_action, set_my_commands_methods,
     };
 
     #[derive(Debug, Deserialize)]
@@ -849,6 +849,63 @@ mod tests {
             .into_data()
             .expect("callback data");
         assert_eq!(checkin_theme_selection_alert(10, &missing), ("", true));
+    }
+
+    #[test]
+    fn callback_query_route_preserves_go_pre_handler_order() {
+        assert_eq!(
+            callback_query_route(false, true, r#"{"a":"del_i"}"#),
+            CallbackQueryRoute::AckOrphan
+        );
+        assert_eq!(
+            callback_query_route(true, true, r#"{"a":"del_i"}"#),
+            CallbackQueryRoute::SkipRateLimited
+        );
+        assert_eq!(
+            callback_query_route(true, false, ""),
+            CallbackQueryRoute::AckEmptyData
+        );
+        assert_eq!(
+            callback_query_route(true, false, "settings:enable_global_text_reply=true"),
+            CallbackQueryRoute::Settings {
+                data: "settings:enable_global_text_reply=true".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn callback_query_route_splits_ack_fallbacks_and_known_handlers() {
+        assert_eq!(
+            callback_query_route(true, false, "old-format"),
+            CallbackQueryRoute::AckLegacyData
+        );
+        assert_eq!(
+            callback_query_route(true, false, r#"{"u":"1"}"#),
+            CallbackQueryRoute::AckActionlessJson {
+                data: parse_callback_action(r#"{"u":"1"}"#)
+                    .into_data()
+                    .expect("callback data")
+            }
+        );
+        assert_eq!(
+            callback_query_route(true, false, r#"{"action":"unknown"}"#),
+            CallbackQueryRoute::AckUnknownAction {
+                action: "unknown".to_owned()
+            }
+        );
+
+        let route = callback_query_route(true, false, r#"{"a":"cts","i":"42"}"#);
+        let CallbackQueryRoute::Handle {
+            handler,
+            action,
+            data,
+        } = route
+        else {
+            panic!("expected known handler route");
+        };
+        assert_eq!(handler, CallbackHandlerKind::CheckinThemeSelect);
+        assert_eq!(action, "cts");
+        assert_eq!(data.get("i").map(String::as_str), Some("42"));
     }
 
     #[test]

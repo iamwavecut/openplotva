@@ -50,6 +50,43 @@ pub enum CallbackHandlerKind {
     DeleteLyrics,
 }
 
+/// Go `processCallbackQuery` decision before concrete handler side effects.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CallbackQueryRoute {
+    /// Callback query had no associated message, so Go only acknowledges it.
+    AckOrphan,
+    /// Chat is rate-limited; Go skips callback handling without acknowledging.
+    SkipRateLimited,
+    /// Callback data was empty and should receive an empty acknowledgement.
+    AckEmptyData,
+    /// Settings callback data is handled by the settings callback path.
+    Settings {
+        /// Raw callback data beginning with `settings:`.
+        data: String,
+    },
+    /// Callback data was not JSON.
+    AckLegacyData,
+    /// Callback data was JSON but had neither `action` nor `a`.
+    AckActionlessJson {
+        /// Parsed callback data.
+        data: CallbackActionData,
+    },
+    /// Callback data had an action but there is no Go handler for it.
+    AckUnknownAction {
+        /// Unhandled action value.
+        action: String,
+    },
+    /// Callback data should be dispatched to a concrete handler group.
+    Handle {
+        /// Go handler group.
+        handler: CallbackHandlerKind,
+        /// Resolved action value.
+        action: String,
+        /// Parsed callback data.
+        data: CallbackActionData,
+    },
+}
+
 /// Parse Go fetcher callback data, accepting long `action` and short `a` keys.
 #[must_use]
 pub fn parse_callback_action(raw: &str) -> CallbackActionParse {
@@ -62,6 +99,44 @@ pub fn parse_callback_action(raw: &str) -> CallbackActionParse {
     }
 
     CallbackActionParse::Actionless(data)
+}
+
+/// Classify a callback query according to Go `processCallbackQuery` pre-handler order.
+#[must_use]
+pub fn callback_query_route(
+    has_message: bool,
+    is_rate_limited: bool,
+    data: &str,
+) -> CallbackQueryRoute {
+    if !has_message {
+        return CallbackQueryRoute::AckOrphan;
+    }
+    if is_rate_limited {
+        return CallbackQueryRoute::SkipRateLimited;
+    }
+    if data.is_empty() {
+        return CallbackQueryRoute::AckEmptyData;
+    }
+    if data.starts_with("settings:") {
+        return CallbackQueryRoute::Settings {
+            data: data.to_owned(),
+        };
+    }
+
+    match parse_callback_action(data) {
+        CallbackActionParse::Invalid => CallbackQueryRoute::AckLegacyData,
+        CallbackActionParse::Actionless(data) => CallbackQueryRoute::AckActionlessJson { data },
+        CallbackActionParse::Action { data, action } => {
+            match callback_handler_for_action(&action) {
+                Some(handler) => CallbackQueryRoute::Handle {
+                    handler,
+                    action,
+                    data,
+                },
+                None => CallbackQueryRoute::AckUnknownAction { action },
+            }
+        }
+    }
 }
 
 /// Return the Go callback handler group for an action.
