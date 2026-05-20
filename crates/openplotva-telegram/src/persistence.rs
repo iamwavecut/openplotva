@@ -57,6 +57,9 @@ pub struct PersistentDispatcherItem {
     /// Virtual message ID, when the send path created one.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub virtual_id: String,
+    /// Rust-native preservation of Go `BypassChatRestrictions` after enqueue-time checks.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub bypass_chat_restrictions: bool,
 }
 
 impl PersistentDispatcherItem {
@@ -68,6 +71,7 @@ impl PersistentDispatcherItem {
     fn from_work_item(
         item: DispatcherWorkItem,
     ) -> Result<Option<Self>, DispatcherPersistenceError> {
+        let bypass_chat_restrictions = item.bypasses_chat_restrictions();
         let (metadata, method, persistence_payload) = item.into_persistence_parts();
         let Some(method) = method else {
             return Ok(None);
@@ -90,6 +94,7 @@ impl PersistentDispatcherItem {
             fingerprint: metadata.fingerprint_key,
             chat_id: metadata.chat_id,
             virtual_id: metadata.virtual_id,
+            bypass_chat_restrictions,
         }))
     }
 }
@@ -313,6 +318,7 @@ fn replay_item_from_persistent(
         enqueued_at,
         method,
         persistence_payload: Some(persistence_payload),
+        bypass_chat_restrictions: item.bypass_chat_restrictions,
     })
 }
 
@@ -740,6 +746,10 @@ fn format_system_time(value: SystemTime) -> Result<String, time::error::Format> 
     OffsetDateTime::from(value).format(&Rfc3339)
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 mod go_byte_slice {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use serde::{Deserialize, Deserializer, Serializer, de::Error as _};
@@ -813,6 +823,7 @@ mod tests {
             enqueued_at: std::time::SystemTime::now(),
             method: text_method(chat_id, text),
             persistence_payload: None,
+            bypass_chat_restrictions: false,
         }
     }
 
@@ -834,6 +845,7 @@ mod tests {
             fingerprint: "42:text:abcd".to_owned(),
             chat_id: 42,
             virtual_id: "vmsg-1".to_owned(),
+            bypass_chat_restrictions: false,
         };
 
         let value = serde_json::to_value(vec![item])?;
@@ -968,6 +980,37 @@ mod tests {
     }
 
     #[test]
+    fn bypass_chat_restrictions_survives_drain_and_replay() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let queue = DispatcherQueue::new(DispatcherConfig::default());
+        queue.enqueue(
+            text_message(42, "bypass", "bypass-1")
+                .with_method(text_method(42, "bypass"))
+                .with_bypass_chat_restrictions(true),
+            false,
+        );
+
+        let persisted = persistent_queue_from_drain(queue.drain_for_shutdown(), 100)?;
+
+        assert_eq!(persisted.skipped, 0);
+        assert_eq!(persisted.items.len(), 1);
+        assert!(persisted.items[0].bypass_chat_restrictions);
+
+        let raw = serde_json::to_vec(&persisted.items)?;
+        let replay = persistent_queue_replay_from_json(&raw)?;
+        let restored_queue = DispatcherQueue::new(DispatcherConfig::default());
+        for item in replay.items {
+            restored_queue.restore(item);
+        }
+
+        let restored = restored_queue
+            .dequeue_regular()
+            .expect("bypass item restored");
+        assert!(restored.bypasses_chat_restrictions());
+        Ok(())
+    }
+
+    #[test]
     fn replay_from_persisted_json_reconstructs_go_text_and_sticker_items()
     -> Result<(), Box<dyn std::error::Error>> {
         let persisted = vec![
@@ -979,6 +1022,7 @@ mod tests {
                 fingerprint: "42:text:2ebc7fa6".to_owned(),
                 chat_id: 42,
                 virtual_id: "text-vmsg".to_owned(),
+                bypass_chat_restrictions: false,
             },
             PersistentDispatcherItem {
                 message: br#"{"ChatID":43,"DisableNotification":true,"ReplyParameters":{"message_id":7,"chat_id":43,"allow_sending_without_reply":true},"File":"sticker-file-id"}"#.to_vec(),
@@ -988,6 +1032,7 @@ mod tests {
                 fingerprint: "43:sticker:3783d445".to_owned(),
                 chat_id: 43,
                 virtual_id: "sticker-vmsg".to_owned(),
+                bypass_chat_restrictions: false,
             },
         ];
         let raw = serde_json::to_vec(&persisted)?;
@@ -1056,6 +1101,7 @@ mod tests {
             fingerprint: "delete".to_owned(),
             chat_id: 42,
             virtual_id: "delete-vmsg".to_owned(),
+            bypass_chat_restrictions: false,
         }];
         let raw = serde_json::to_vec(&persisted)?;
 
@@ -1090,6 +1136,7 @@ mod tests {
                 fingerprint: String::new(),
                 chat_id: 42,
                 virtual_id: "kept".to_owned(),
+                bypass_chat_restrictions: false,
             },
             PersistentDispatcherItem {
                 message: br#"{"ChatID":42}"#.to_vec(),
@@ -1099,6 +1146,7 @@ mod tests {
                 fingerprint: String::new(),
                 chat_id: 42,
                 virtual_id: "unknown".to_owned(),
+                bypass_chat_restrictions: false,
             },
             PersistentDispatcherItem {
                 message: b"not-json".to_vec(),
@@ -1108,6 +1156,7 @@ mod tests {
                 fingerprint: String::new(),
                 chat_id: 43,
                 virtual_id: "malformed".to_owned(),
+                bypass_chat_restrictions: false,
             },
         ];
         let raw = serde_json::to_vec(&persisted)?;
@@ -1226,6 +1275,7 @@ mod tests {
             fingerprint: String::new(),
             chat_id: 42,
             virtual_id: virtual_id.to_owned(),
+            bypass_chat_restrictions: false,
         }
     }
 
@@ -1240,6 +1290,7 @@ mod tests {
             fingerprint: String::new(),
             chat_id: 42,
             virtual_id: "kept".to_owned(),
+            bypass_chat_restrictions: false,
         }];
         let expected = serde_json::to_vec(&persisted)?;
 
@@ -1261,6 +1312,7 @@ mod tests {
                 fingerprint: String::new(),
                 chat_id: 42,
                 virtual_id: "kept".to_owned(),
+                bypass_chat_restrictions: false,
             },
             PersistentDispatcherItem {
                 message: b"not-json".to_vec(),
@@ -1270,6 +1322,7 @@ mod tests {
                 fingerprint: String::new(),
                 chat_id: 43,
                 virtual_id: "bad".to_owned(),
+                bypass_chat_restrictions: false,
             },
         ];
 
@@ -1292,6 +1345,7 @@ mod tests {
             fingerprint: String::new(),
             chat_id: 42,
             virtual_id: "kept".to_owned(),
+            bypass_chat_restrictions: false,
         }];
         let legacy_json = serde_json::to_vec(&persisted).expect("fixture should serialize");
         assert_eq!(legacy_json.len(), 176);

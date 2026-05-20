@@ -1012,6 +1012,7 @@ where
     >,
 {
     let chat_id = item.metadata().chat_id;
+    let bypass_chat_restrictions = item.bypasses_chat_restrictions();
     if chat_id != 0 {
         let check = rate_limits
             .is_rate_limited_at(chat_id, OffsetDateTime::now_utc())
@@ -1029,6 +1030,7 @@ where
         }
     }
     if chat_id != 0
+        && !bypass_chat_restrictions
         && let Some(method_kind) = item.method_kind()
     {
         for action in permissions::dispatcher_required_actions(method_kind) {
@@ -1180,7 +1182,8 @@ mod tests {
     use openplotva_core::{ChatSettings, ChatSettingsUpdate, MessageIdMapping};
     use openplotva_telegram::{
         DispatcherConfig, DispatcherMessage, DispatcherQueue, DispatcherSendStatus,
-        DispatcherWorkItem, MessageFingerprint, TelegramOutboundMethod, TelegramOutboundResponse,
+        DispatcherWorkItem, MessageFingerprint, TelegramMessage, TelegramOutboundMethod,
+        TelegramOutboundResponse,
     };
     use openplotva_updates::{
         UpdateProducerQueue, UpdateProducerQueueFuture, UpdateProducerSource,
@@ -1249,6 +1252,46 @@ mod tests {
 
         assert_eq!(status, DispatcherSendStatus::Failed);
         assert!(!*lock(&called));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dispatcher_send_respects_go_bypass_chat_restrictions_flag()
+    -> Result<(), Box<dyn Error>> {
+        let store = VirtualMessageStoreStub;
+        let rate_limits = Arc::new(ChatRateLimitPolicy::new(RateLimitStoreStub));
+        let permission_store = PermissionStoreStub::with_context(ChatPermissionContext {
+            chat_type: Some("supergroup".to_owned()),
+            settings: Some(ChatSettings {
+                enable_global_text_reply: false,
+                ..ChatSettings::defaults(42)
+            }),
+        });
+        let permissions = Arc::new(ChatPermissionPolicy::new(permission_store.clone()));
+        let item =
+            queued_bypass_method_item(TelegramOutboundMethod::from(SendMessage::new(42, "hello")));
+        let called = Arc::new(Mutex::new(false));
+        let called_for_send = Arc::clone(&called);
+
+        let status = send_dispatcher_work_item_with_transport(
+            store,
+            rate_limits,
+            permissions,
+            item,
+            move |_| {
+                *lock(&called_for_send) = true;
+                async {
+                    Ok::<_, carapax::api::ExecuteError>(TelegramOutboundResponse::Message(
+                        Box::new(telegram_message(42, 100)),
+                    ))
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(status, DispatcherSendStatus::Sent);
+        assert!(*lock(&called));
+        assert!(permission_store.saved_updates().is_empty());
         Ok(())
     }
 
@@ -1996,6 +2039,23 @@ mod tests {
         queue.dequeue_immediate().expect("queued work item")
     }
 
+    fn queued_bypass_method_item(method: TelegramOutboundMethod) -> DispatcherWorkItem {
+        let queue = DispatcherQueue::new(DispatcherConfig::default());
+        let message = DispatcherMessage::new(
+            MessageFingerprint {
+                chat_id: 42,
+                message_type: "test".to_owned(),
+                content_hash: 7,
+                debounce_key: None,
+            },
+            "v1",
+        )
+        .with_method(method)
+        .with_bypass_chat_restrictions(true);
+        queue.enqueue(message, true);
+        queue.dequeue_immediate().expect("queued work item")
+    }
+
     fn permission_error() -> carapax::api::ExecuteError {
         let response: carapax::types::Response<serde_json::Value> = serde_json::from_str(
             r#"{"ok":false,"error_code":400,"description":"Bad Request: CHAT_WRITE_FORBIDDEN"}"#,
@@ -2005,6 +2065,19 @@ mod tests {
             Ok(_) => panic!("test response unexpectedly succeeded"),
             Err(error) => carapax::api::ExecuteError::Response(error),
         }
+    }
+
+    fn telegram_message(chat_id: i64, message_id: i64) -> TelegramMessage {
+        serde_json::from_value(json!({
+            "message_id": message_id,
+            "date": 0,
+            "chat": {
+                "type": "supergroup",
+                "id": chat_id,
+                "title": "Plotva",
+            },
+        }))
+        .expect("telegram message")
     }
 
     fn chat_settings_update_defaults(chat_id: i64) -> ChatSettingsUpdate {

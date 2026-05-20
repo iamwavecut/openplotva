@@ -73,6 +73,7 @@ pub struct DispatcherMessage {
     pub virtual_id: String,
     method: Option<TelegramOutboundMethod>,
     persistence_payload: Option<DispatcherPersistencePayload>,
+    bypass_chat_restrictions: bool,
 }
 
 impl DispatcherMessage {
@@ -83,6 +84,7 @@ impl DispatcherMessage {
             virtual_id: virtual_id.into(),
             method: None,
             persistence_payload: None,
+            bypass_chat_restrictions: false,
         }
     }
 
@@ -94,6 +96,12 @@ impl DispatcherMessage {
 
     pub fn with_persistence_payload(mut self, payload: DispatcherPersistencePayload) -> Self {
         self.persistence_payload = Some(payload);
+        self
+    }
+
+    /// Preserve Go `BypassChatRestrictions` for Rust dispatcher-time permission checks.
+    pub fn with_bypass_chat_restrictions(mut self, bypass: bool) -> Self {
+        self.bypass_chat_restrictions = bypass;
         self
     }
 }
@@ -201,6 +209,7 @@ pub struct DispatcherWorkItem {
     metadata: DispatcherQueuedMessage,
     method: Option<TelegramOutboundMethod>,
     persistence_payload: Option<DispatcherPersistencePayload>,
+    bypass_chat_restrictions: bool,
 }
 
 impl DispatcherWorkItem {
@@ -211,6 +220,11 @@ impl DispatcherWorkItem {
     /// Return the Telegram method kind without consuming the queued payload.
     pub fn method_kind(&self) -> Option<TelegramOutboundMethodKind> {
         self.method.as_ref().map(TelegramOutboundMethod::kind)
+    }
+
+    /// Return whether this queued item should skip chat permission settings.
+    pub fn bypasses_chat_restrictions(&self) -> bool {
+        self.bypass_chat_restrictions
     }
 
     /// Consume the worker item and return only the concrete Telegram method payload.
@@ -250,6 +264,8 @@ pub struct DispatcherRestoredMessage {
     /// Concrete Telegram method to replay.
     pub method: TelegramOutboundMethod,
     pub persistence_payload: Option<DispatcherPersistencePayload>,
+    /// Whether the original send path bypassed Go chat restriction checks.
+    pub bypass_chat_restrictions: bool,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -320,6 +336,7 @@ struct DispatcherQueueItem {
     metadata: DispatcherQueuedMessage,
     method: Option<TelegramOutboundMethod>,
     persistence_payload: Option<DispatcherPersistencePayload>,
+    bypass_chat_restrictions: bool,
 }
 
 impl DispatcherQueueItem {
@@ -328,6 +345,7 @@ impl DispatcherQueueItem {
             metadata: self.metadata,
             method: self.method,
             persistence_payload: self.persistence_payload,
+            bypass_chat_restrictions: self.bypass_chat_restrictions,
         }
     }
 }
@@ -666,6 +684,7 @@ impl DispatcherQueue {
             metadata: message.metadata,
             method: message.method,
             persistence_payload: message.persistence_payload,
+            bypass_chat_restrictions: message.bypass_chat_restrictions,
         });
         self.regular_notify.notify_one();
     }
@@ -726,6 +745,7 @@ impl DispatcherQueue {
             virtual_id,
             method,
             persistence_payload,
+            bypass_chat_restrictions,
         } = message;
 
         if !immediate && !self.debouncer.should_process_at(&fingerprint, now) {
@@ -744,6 +764,7 @@ impl DispatcherQueue {
             },
             method,
             persistence_payload,
+            bypass_chat_restrictions,
         };
 
         {
@@ -783,6 +804,7 @@ impl DispatcherQueue {
             enqueued_at,
             method,
             persistence_payload,
+            bypass_chat_restrictions,
         } = message;
 
         if !self.debouncer.should_process_at(&fingerprint, now) {
@@ -804,6 +826,7 @@ impl DispatcherQueue {
             },
             method: Some(method),
             persistence_payload,
+            bypass_chat_restrictions,
         };
 
         self.push_queue_item(queued);
@@ -1080,6 +1103,7 @@ mod tests {
             enqueued_at: std::time::SystemTime::now(),
             method: text_method(chat_id, text),
             persistence_payload: None,
+            bypass_chat_restrictions: false,
         }
     }
 

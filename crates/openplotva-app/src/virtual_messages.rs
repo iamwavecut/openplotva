@@ -219,6 +219,8 @@ pub struct QueueTextRequest<'a> {
     pub reply_to: Option<&'a ReplyMessageRef>,
     /// Whether Go would enqueue the first split part in the immediate queue.
     pub immediate_first: bool,
+    /// Whether Go `TextMessage.BypassChatRestrictions` was set at enqueue time.
+    pub bypass_chat_restrictions: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -229,6 +231,8 @@ pub struct QueueStickerRequest<'a> {
     pub reply_to: Option<&'a ReplyMessageRef>,
     /// Whether Go would enqueue the sticker in the immediate queue.
     pub immediate: bool,
+    /// Whether Go `StickerMessage.BypassChatRestrictions` was set at enqueue time.
+    pub bypass_chat_restrictions: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -417,7 +421,8 @@ where
         )?;
         let dispatcher_message =
             DispatcherMessage::new(fingerprint_text_message_part(chat.id, &part), &virtual_id)
-                .with_method(TelegramOutboundMethod::from(method));
+                .with_method(TelegramOutboundMethod::from(method))
+                .with_bypass_chat_restrictions(req.bypass_chat_restrictions);
         let immediate = req.immediate_first && index == 0;
         let enqueue_outcome = queue.enqueue(dispatcher_message, immediate);
         report.parts.push(QueuedTextPartReport {
@@ -460,7 +465,8 @@ where
     let dispatcher_message =
         DispatcherMessage::new(fingerprint_sticker_message_plan(&plan), &virtual_id)
             .with_method(TelegramOutboundMethod::from(method))
-            .with_persistence_payload(persistence_payload);
+            .with_persistence_payload(persistence_payload)
+            .with_bypass_chat_restrictions(req.bypass_chat_restrictions);
     let enqueue_outcome = queue.enqueue(dispatcher_message, req.immediate);
 
     Ok(QueueStickerReport {
@@ -1064,6 +1070,7 @@ mod tests {
                 message: &request,
                 reply_to: None,
                 immediate_first: true,
+                bypass_chat_restrictions: false,
             },
             || ids.next().expect("virtual id"),
         )
@@ -1108,6 +1115,7 @@ mod tests {
                 message: &request,
                 reply_to: None,
                 immediate_first: false,
+                bypass_chat_restrictions: false,
             },
             || "v1".to_owned(),
         )
@@ -1123,6 +1131,32 @@ mod tests {
             assert_eq!(state.inserted, vec![("v1".to_owned(), 42, None)]);
         });
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn queue_text_message_parts_marks_bypass_chat_restrictions_for_dispatcher()
+    -> Result<(), Box<dyn Error>> {
+        let store = StoreStub::default();
+        let queue = DispatcherQueue::new(DispatcherConfig::default());
+        let request = text_request("settings link");
+
+        let report = queue_text_message_parts(
+            &store,
+            &queue,
+            QueueTextRequest {
+                message: &request,
+                reply_to: None,
+                immediate_first: true,
+                bypass_chat_restrictions: true,
+            },
+            || "v1".to_owned(),
+        )
+        .await?;
+
+        assert_eq!(report.enqueued_count(), 1);
+        let item = queue.dequeue_immediate().expect("queued text item");
+        assert!(item.bypasses_chat_restrictions());
         Ok(())
     }
 
@@ -1148,6 +1182,7 @@ mod tests {
                 message: &request,
                 reply_to: None,
                 immediate: true,
+                bypass_chat_restrictions: false,
             },
             || "sticker-v1".to_owned(),
         )
@@ -1212,6 +1247,7 @@ mod tests {
                 message: &request,
                 reply_to: Some(&reply),
                 immediate: false,
+                bypass_chat_restrictions: false,
             },
             || "sticker-v2".to_owned(),
         )
