@@ -20,7 +20,8 @@ use carapax::types::{
 };
 use openplotva_core::{
     UserState, VIP_EVENT_TYPE_ADMIN_ADJUSTMENT, VIP_EVENT_TYPE_ADMIN_REVOKE,
-    VIP_EVENT_TYPE_PAYMENT, vip_days_to_seconds,
+    VIP_EVENT_TYPE_PAYMENT, VIP_EVENT_TYPE_REFUND_REVERSAL, is_synthetic_subscription_charge_id,
+    subscription_delta_seconds, vip_days_to_seconds,
 };
 use openplotva_storage::{
     DonationCreate, DonationRecord, PostgresPaymentStore, PostgresVipStore,
@@ -348,14 +349,20 @@ pub struct AdminGrantVipCommandReport {
 pub enum AdminCancelVipCommandOutcome {
     /// VIP was revoked through an admin ledger event.
     Revoked,
-    /// The refund branch is intentionally left outside this revoke slice.
-    RefundNotPorted,
+    /// Telegram Stars payment was refunded and a refund-reversal event was created.
+    Refunded,
     /// The target argument was missing or invalid.
     TargetError,
     /// Active VIP summary lookup failed.
     StatusLookupError,
     /// The target user does not have an active VIP status.
     NoActiveVip,
+    /// The target user has active VIP, but not an active paid subscription to refund.
+    NoPaidSubscription,
+    /// Active paid subscription lookup failed.
+    PaidSubscriptionLookupError,
+    /// Telegram refund, subscription marking, or refund-reversal event creation failed.
+    RefundFailed,
     /// The admin-revoke ledger event could not be written.
     RevokeStorageError,
 }
@@ -438,6 +445,12 @@ pub enum TelegramPaymentInvoiceEffectError {
     /// Telegram rejected or failed a direct Bot API request.
     #[error("failed to execute Telegram invoice request: {0}")]
     Execute(#[from] carapax::api::ExecuteError),
+    /// Telegram rejected or failed a refund request with Go-shaped wording.
+    #[error("{0}")]
+    RefundRequest(String),
+    /// Telegram returned a false refund result.
+    #[error("telegram API сообщил, что возврат не был успешен")]
+    RefundUnsuccessful,
 }
 
 /// Concrete successful-payment dispatch failure.
@@ -449,6 +462,28 @@ pub enum SuccessfulPaymentDispatchEffectError {
     /// VIP cache invalidation failed.
     #[error("failed to invalidate VIP cache: {0}")]
     VipCache(String),
+}
+
+/// Runtime admin-cancel effect failure preserving which side failed.
+#[derive(Debug)]
+pub enum PaymentRuntimeAdminCancelEffectError<Direct, Successful> {
+    /// Direct Telegram payment side failed.
+    Direct(Direct),
+    /// Dispatcher/cache side failed.
+    Successful(Successful),
+}
+
+impl<Direct, Successful> fmt::Display for PaymentRuntimeAdminCancelEffectError<Direct, Successful>
+where
+    Direct: fmt::Display,
+    Successful: fmt::Display,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Direct(error) => error.fmt(formatter),
+            Self::Successful(error) => error.fmt(formatter),
+        }
+    }
 }
 
 impl SuccessfulPaymentReport {
@@ -649,6 +684,18 @@ pub trait AdminCancelVipStore {
         &'a self,
         event: VipEventCreate<'a>,
     ) -> PaymentStoreFuture<'a, VipEventRecord, Self::Error>;
+
+    /// Load the active paid subscription that can be refunded through Telegram Stars.
+    fn get_active_subscription<'a>(
+        &'a self,
+        user_id: i64,
+    ) -> PaymentStoreFuture<'a, Option<SubscriptionRecord>, Self::Error>;
+
+    /// Mark a subscription refunded after Telegram accepts the refund.
+    fn mark_subscription_refunded<'a>(
+        &'a self,
+        id: i64,
+    ) -> PaymentStoreFuture<'a, SubscriptionRecord, Self::Error>;
 }
 
 /// VIP predicate boundary matching Go `Fetcher.IsVIP` before existing-status rendering.
@@ -754,27 +801,40 @@ pub trait AdminCancelVipEffects {
         &'a self,
         user_id: i64,
     ) -> PaymentEffectsFuture<'a, Self::Error>;
-}
 
-impl<T> AdminCancelVipEffects for T
-where
-    T: SuccessfulPaymentEffects,
-{
-    type Error = T::Error;
-
-    fn send_admin_cancel_vip_text<'a>(
-        &'a self,
-        message: PaymentTextMessage<'a>,
-    ) -> PaymentEffectsFuture<'a, Self::Error> {
-        self.send_text(message)
-    }
-
-    fn invalidate_admin_cancel_vip_cache<'a>(
+    /// Refund the Telegram Stars payment for an active subscription.
+    fn refund_admin_cancel_vip_payment<'a>(
         &'a self,
         user_id: i64,
-    ) -> PaymentEffectsFuture<'a, Self::Error> {
-        <T as SuccessfulPaymentEffects>::invalidate_vip_cache(self, user_id)
-    }
+        telegram_payment_charge_id: &'a str,
+    ) -> PaymentEffectsFuture<'a, Self::Error>;
+
+    /// Send the direct user refund notice. Go logs and ignores failures here.
+    fn send_admin_cancel_vip_user_text<'a>(
+        &'a self,
+        user_id: i64,
+        text: &'a str,
+    ) -> PaymentEffectsFuture<'a, Self::Error>;
+}
+
+/// Direct Telegram payment effects needed by `/admin_cancel_vip` refunds.
+pub trait AdminCancelVipDirectEffects {
+    /// Error returned by the concrete side-effect implementation.
+    type Error: fmt::Display + Send + Sync + 'static;
+
+    /// Refund a Telegram Stars payment.
+    fn refund_star_payment<'a>(
+        &'a self,
+        user_id: i64,
+        telegram_payment_charge_id: &'a str,
+    ) -> PaymentEffectsFuture<'a, Self::Error>;
+
+    /// Send a direct text message to the refunded user.
+    fn send_direct_payment_text<'a>(
+        &'a self,
+        user_id: i64,
+        text: &'a str,
+    ) -> PaymentEffectsFuture<'a, Self::Error>;
 }
 
 /// Side-effect boundary for Go `processPreCheckoutQuery`.
@@ -1551,6 +1611,51 @@ impl PaymentInvoiceEffects for openplotva_telegram::TelegramClient {
     }
 }
 
+impl AdminCancelVipDirectEffects for openplotva_telegram::TelegramClient {
+    type Error = TelegramPaymentInvoiceEffectError;
+
+    fn refund_star_payment<'a>(
+        &'a self,
+        user_id: i64,
+        telegram_payment_charge_id: &'a str,
+    ) -> PaymentEffectsFuture<'a, Self::Error> {
+        Box::pin(async move {
+            let refunded = self
+                .execute(openplotva_telegram::build_refund_star_payment_method(
+                    user_id,
+                    telegram_payment_charge_id.to_owned(),
+                ))
+                .await
+                .map_err(|error| {
+                    TelegramPaymentInvoiceEffectError::RefundRequest(format!(
+                        "Ошибка при возврате средств: {error}"
+                    ))
+                })?;
+            if refunded {
+                Ok(())
+            } else {
+                Err(TelegramPaymentInvoiceEffectError::RefundUnsuccessful)
+            }
+        })
+    }
+
+    fn send_direct_payment_text<'a>(
+        &'a self,
+        user_id: i64,
+        text: &'a str,
+    ) -> PaymentEffectsFuture<'a, Self::Error> {
+        Box::pin(async move {
+            let _message: carapax::types::Message = self
+                .execute(openplotva_telegram::SendMessage::new(
+                    user_id,
+                    text.to_owned(),
+                ))
+                .await?;
+            Ok(())
+        })
+    }
+}
+
 impl VipStatusEffects for openplotva_telegram::TelegramClient {
     type Error = TelegramPaymentInvoiceEffectError;
 
@@ -1755,6 +1860,64 @@ where
 
     fn invalidate_vip_cache<'a>(&'a self, user_id: i64) -> PaymentEffectsFuture<'a, Self::Error> {
         self.successful.invalidate_vip_cache(user_id)
+    }
+}
+
+impl<Direct, Successful> AdminCancelVipEffects for PaymentRuntimeEffects<Direct, Successful>
+where
+    Direct: AdminCancelVipDirectEffects + Sync,
+    Successful: SuccessfulPaymentEffects + Sync,
+{
+    type Error = PaymentRuntimeAdminCancelEffectError<Direct::Error, Successful::Error>;
+
+    fn send_admin_cancel_vip_text<'a>(
+        &'a self,
+        message: PaymentTextMessage<'a>,
+    ) -> PaymentEffectsFuture<'a, Self::Error> {
+        Box::pin(async move {
+            self.successful
+                .send_text(message)
+                .await
+                .map_err(PaymentRuntimeAdminCancelEffectError::Successful)
+        })
+    }
+
+    fn invalidate_admin_cancel_vip_cache<'a>(
+        &'a self,
+        user_id: i64,
+    ) -> PaymentEffectsFuture<'a, Self::Error> {
+        Box::pin(async move {
+            self.successful
+                .invalidate_vip_cache(user_id)
+                .await
+                .map_err(PaymentRuntimeAdminCancelEffectError::Successful)
+        })
+    }
+
+    fn refund_admin_cancel_vip_payment<'a>(
+        &'a self,
+        user_id: i64,
+        telegram_payment_charge_id: &'a str,
+    ) -> PaymentEffectsFuture<'a, Self::Error> {
+        Box::pin(async move {
+            self.invoice
+                .refund_star_payment(user_id, telegram_payment_charge_id)
+                .await
+                .map_err(PaymentRuntimeAdminCancelEffectError::Direct)
+        })
+    }
+
+    fn send_admin_cancel_vip_user_text<'a>(
+        &'a self,
+        user_id: i64,
+        text: &'a str,
+    ) -> PaymentEffectsFuture<'a, Self::Error> {
+        Box::pin(async move {
+            self.invoice
+                .send_direct_payment_text(user_id, text)
+                .await
+                .map_err(PaymentRuntimeAdminCancelEffectError::Direct)
+        })
     }
 }
 
@@ -2327,6 +2490,20 @@ impl AdminCancelVipStore for PostgresSuccessfulPaymentStore {
         event: VipEventCreate<'a>,
     ) -> PaymentStoreFuture<'a, VipEventRecord, Self::Error> {
         Box::pin(async move { self.vip.create_vip_event(event).await })
+    }
+
+    fn get_active_subscription<'a>(
+        &'a self,
+        user_id: i64,
+    ) -> PaymentStoreFuture<'a, Option<SubscriptionRecord>, Self::Error> {
+        Box::pin(async move { self.payments.get_active_subscription(user_id).await })
+    }
+
+    fn mark_subscription_refunded<'a>(
+        &'a self,
+        id: i64,
+    ) -> PaymentStoreFuture<'a, SubscriptionRecord, Self::Error> {
+        Box::pin(async move { self.payments.mark_subscription_refunded(id).await })
     }
 }
 
@@ -3401,10 +3578,10 @@ async fn send_admin_grant_vip_text<Effects>(
 
 const ADMIN_CANCEL_VIP_STATUS_ERROR_TEXT: &str = "❌ Ошибка при проверке статуса VIP пользователя.";
 const ADMIN_CANCEL_VIP_REVOKE_ERROR_TEXT: &str = "❌ Не удалось отозвать VIP. Ошибка базы данных.";
-const ADMIN_CANCEL_VIP_REFUND_NOT_PORTED_ERROR: &str =
-    "admin cancel VIP refund path is not ported yet";
+const ADMIN_CANCEL_VIP_PAID_SUBSCRIPTION_ERROR_TEXT: &str =
+    "❌ Ошибка при проверке оплаченной подписки пользователя.";
 
-/// Execute the non-refund Go `/admin_cancel_vip` revoke storage and side-effect behavior.
+/// Execute Go `/admin_cancel_vip` storage and side-effect behavior.
 pub async fn handle_admin_cancel_vip_command_at<Store, Effects>(
     store: &Store,
     effects: &Effects,
@@ -3457,37 +3634,84 @@ where
         }
     };
 
-    if args.with_refund {
-        return AdminCancelVipCommandReport {
-            outcome: AdminCancelVipCommandOutcome::RefundNotPorted,
-            target_user_id: Some(target_user_id),
-            event_id: None,
-            error: Some(ADMIN_CANCEL_VIP_REFUND_NOT_PORTED_ERROR.to_owned()),
+    let (event, outcome) = if args.with_refund {
+        let subscription = match store.get_active_subscription(target_user_id).await {
+            Ok(Some(subscription)) => subscription,
+            Ok(None) => {
+                let text = format!(
+                    "ℹ️ У пользователя {target_user_id} нет активной оплаченной VIP подписки для возврата."
+                );
+                send_admin_cancel_vip_text(effects, &command, &text).await;
+                return AdminCancelVipCommandReport {
+                    outcome: AdminCancelVipCommandOutcome::NoPaidSubscription,
+                    target_user_id: Some(target_user_id),
+                    event_id: None,
+                    error: None,
+                };
+            }
+            Err(error) => {
+                send_admin_cancel_vip_text(
+                    effects,
+                    &command,
+                    ADMIN_CANCEL_VIP_PAID_SUBSCRIPTION_ERROR_TEXT,
+                )
+                .await;
+                return AdminCancelVipCommandReport {
+                    outcome: AdminCancelVipCommandOutcome::PaidSubscriptionLookupError,
+                    target_user_id: Some(target_user_id),
+                    event_id: None,
+                    error: Some(error.to_string()),
+                };
+            }
         };
-    }
-
-    let reason = format!("telegram admin revoke by {}", command.actor_user_id);
-    let event = match store
-        .create_admin_cancel_vip_event(VipEventCreate {
-            user_id: target_user_id,
-            event_type: VIP_EVENT_TYPE_ADMIN_REVOKE,
-            delta_seconds: -summary.remaining_seconds,
-            subscription_id: None,
-            actor_user_id: Some(command.actor_user_id),
-            reason: Some(&reason),
-        })
+        match refund_admin_cancelled_vip_subscription(
+            store,
+            effects,
+            &subscription,
+            command.actor_user_id,
+        )
         .await
-    {
-        Ok(event) => event,
-        Err(error) => {
-            send_admin_cancel_vip_text(effects, &command, ADMIN_CANCEL_VIP_REVOKE_ERROR_TEXT).await;
-            return AdminCancelVipCommandReport {
-                outcome: AdminCancelVipCommandOutcome::RevokeStorageError,
-                target_user_id: Some(target_user_id),
-                event_id: None,
-                error: Some(error.to_string()),
-            };
+        {
+            Ok(event) => (event, AdminCancelVipCommandOutcome::Refunded),
+            Err(error) => {
+                let text = format!(
+                    "❌ Не удалось выполнить возврат средств: {error}\n\nПодписка не была отменена."
+                );
+                send_admin_cancel_vip_text(effects, &command, &text).await;
+                return AdminCancelVipCommandReport {
+                    outcome: AdminCancelVipCommandOutcome::RefundFailed,
+                    target_user_id: Some(target_user_id),
+                    event_id: None,
+                    error: Some(error),
+                };
+            }
         }
+    } else {
+        let reason = format!("telegram admin revoke by {}", command.actor_user_id);
+        let event = match store
+            .create_admin_cancel_vip_event(VipEventCreate {
+                user_id: target_user_id,
+                event_type: VIP_EVENT_TYPE_ADMIN_REVOKE,
+                delta_seconds: -summary.remaining_seconds,
+                subscription_id: None,
+                actor_user_id: Some(command.actor_user_id),
+                reason: Some(&reason),
+            })
+            .await
+        {
+            Ok(event) => event,
+            Err(error) => {
+                send_admin_cancel_vip_text(effects, &command, ADMIN_CANCEL_VIP_REVOKE_ERROR_TEXT)
+                    .await;
+                return AdminCancelVipCommandReport {
+                    outcome: AdminCancelVipCommandOutcome::RevokeStorageError,
+                    target_user_id: Some(target_user_id),
+                    event_id: None,
+                    error: Some(error.to_string()),
+                };
+            }
+        };
+        (event, AdminCancelVipCommandOutcome::Revoked)
     };
 
     let _ = effects
@@ -3500,18 +3724,95 @@ where
     let success = admin_cancel_vip_success_text(
         target_user_id,
         summary.effective_expires_at,
-        false,
+        args.with_refund,
         updated_summary.as_ref(),
         now,
     );
     send_admin_cancel_vip_text(effects, &command, &success).await;
 
     AdminCancelVipCommandReport {
-        outcome: AdminCancelVipCommandOutcome::Revoked,
+        outcome,
         target_user_id: Some(target_user_id),
         event_id: Some(event.id),
         error: None,
     }
+}
+
+async fn refund_admin_cancelled_vip_subscription<Store, Effects>(
+    store: &Store,
+    effects: &Effects,
+    subscription: &SubscriptionRecord,
+    actor_user_id: i64,
+) -> Result<VipEventRecord, String>
+where
+    Store: AdminCancelVipStore + Sync,
+    Effects: AdminCancelVipEffects + Sync,
+{
+    let telegram_payment_charge_id = subscription.telegram_payment_charge_id.as_str();
+    if is_synthetic_subscription_charge_id(telegram_payment_charge_id) {
+        return Err(
+            "ручная VIP-корректировка не является платежом Telegram и не может быть возвращена"
+                .to_owned(),
+        );
+    }
+
+    effects
+        .refund_admin_cancel_vip_payment(subscription.user_id, telegram_payment_charge_id)
+        .await
+        .map_err(|error| error.to_string())?;
+
+    let refund_notice = admin_cancel_vip_refund_notice_text(
+        telegram_payment_charge_id,
+        subscription_refund_price_stars(subscription.user_id),
+    );
+    let _ = effects
+        .send_admin_cancel_vip_user_text(subscription.user_id, &refund_notice)
+        .await;
+
+    store
+        .mark_subscription_refunded(subscription.id)
+        .await
+        .map_err(|error| format!("не удалось пометить подписку как refunded: {error}"))?;
+
+    let reason = format!("telegram admin refund by {actor_user_id}");
+    let event = store
+        .create_admin_cancel_vip_event(VipEventCreate {
+            user_id: subscription.user_id,
+            event_type: VIP_EVENT_TYPE_REFUND_REVERSAL,
+            delta_seconds: -subscription_delta_seconds(
+                telegram_payment_charge_id,
+                subscription.created_at,
+                subscription.expires_at,
+                openplotva_telegram::SUBSCRIPTION_DURATION_DAYS,
+            ),
+            subscription_id: Some(subscription.id),
+            actor_user_id: Some(actor_user_id),
+            reason: Some(&reason),
+        })
+        .await
+        .map_err(|error| format!("не удалось записать VIP refund_reversal: {error}"))?;
+
+    let _ = effects
+        .invalidate_admin_cancel_vip_cache(subscription.user_id)
+        .await;
+    Ok(event)
+}
+
+fn subscription_refund_price_stars(user_id: i64) -> i64 {
+    if user_id == 1_717_359_759 {
+        1
+    } else {
+        openplotva_telegram::SUBSCRIPTION_PRICE_STARS
+    }
+}
+
+fn admin_cancel_vip_refund_notice_text(
+    telegram_payment_charge_id: &str,
+    price_stars: i64,
+) -> String {
+    format!(
+        "💸 Вам был возвращен платеж в размере {price_stars} звезд по транзакции {telegram_payment_charge_id}."
+    )
 }
 
 async fn admin_cancel_vip_target<Store>(
@@ -4399,7 +4700,8 @@ mod tests {
     use carapax::types::Update as TelegramUpdate;
     use openplotva_core::{
         UserState, VIP_EVENT_TYPE_ADMIN_ADJUSTMENT, VIP_EVENT_TYPE_ADMIN_REVOKE,
-        VIP_EVENT_TYPE_PAYMENT, vip_days_to_seconds,
+        VIP_EVENT_TYPE_PAYMENT, VIP_EVENT_TYPE_REFUND_REVERSAL, subscription_delta_seconds,
+        vip_days_to_seconds,
     };
     use openplotva_storage::{
         DonationCreate, DonationRecord, SubscriptionCreate, SubscriptionRecord, VipCacheRecord,
@@ -5424,6 +5726,267 @@ mod tests {
             sent[0]
                 .text
                 .contains("Отозван администратором: 20.05.2026 12:00")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_cancel_vip_command_refunds_active_subscription_and_records_reversal()
+    -> Result<(), Box<dyn Error>> {
+        let now = time::Date::from_calendar_date(2026, time::Month::May, 20)?
+            .with_hms(12, 0, 0)?
+            .assume_utc();
+        let expires_at = now + time::Duration::days(30);
+        let subscription = active_subscription(now, expires_at);
+        let store = StoreStub::new()
+            .with_admin_cancel_summary(active_vip_summary(now, expires_at))
+            .with_admin_cancel_active_subscription(Some(subscription.clone()))
+            .with_admin_cancel_updated_summary(None)
+            .with_next_vip_event(VipEventRecord {
+                id: 94,
+                user_id: 42,
+                event_type: VIP_EVENT_TYPE_REFUND_REVERSAL.to_owned(),
+                delta_seconds: -subscription_delta_seconds(
+                    &subscription.telegram_payment_charge_id,
+                    subscription.created_at,
+                    subscription.expires_at,
+                    openplotva_telegram::SUBSCRIPTION_DURATION_DAYS,
+                ),
+                effective_expires_at: now,
+                subscription_id: Some(subscription.id),
+                actor_user_id: Some(7),
+                reason: "telegram admin refund by 7".to_owned(),
+                created_at: now,
+            });
+        let effects = EffectsStub::default();
+
+        let report = super::handle_admin_cancel_vip_command_at(
+            &store,
+            &effects,
+            super::AdminCancelVipCommand {
+                chat_id: 900,
+                message_id: 101,
+                actor_user_id: 7,
+                arguments: "42 true",
+            },
+            now,
+        )
+        .await;
+
+        assert_eq!(
+            report.outcome,
+            super::AdminCancelVipCommandOutcome::Refunded
+        );
+        assert_eq!(report.event_id, Some(94));
+        assert_eq!(
+            effects.refund_requests(),
+            vec![(42, "telegram-charge".to_owned())]
+        );
+        assert_eq!(store.refunded_subscription_ids(), vec![10]);
+        assert_eq!(
+            store.vip_events(),
+            vec![VipEventCreate {
+                user_id: 42,
+                event_type: VIP_EVENT_TYPE_REFUND_REVERSAL,
+                delta_seconds: -subscription_delta_seconds(
+                    &subscription.telegram_payment_charge_id,
+                    subscription.created_at,
+                    subscription.expires_at,
+                    openplotva_telegram::SUBSCRIPTION_DURATION_DAYS,
+                ),
+                subscription_id: Some(10),
+                actor_user_id: Some(7),
+                reason: Some("telegram admin refund by 7"),
+            }]
+        );
+        assert_eq!(
+            effects.direct_texts(),
+            vec![(
+                42,
+                "💸 Вам был возвращен платеж в размере 300 звезд по транзакции telegram-charge."
+                    .to_owned()
+            )]
+        );
+        assert_eq!(effects.invalidated_vip_users(), vec![42, 42]);
+        let sent = effects.sent_payment_texts();
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].text.contains("VIP статус успешно обработан"));
+        assert!(sent[0].text.contains("Возврат средств: выполнен"));
+        assert!(!sent[0].text.contains("Отозван администратором"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_cancel_vip_command_refund_reports_missing_paid_subscription()
+    -> Result<(), Box<dyn Error>> {
+        let now = time::Date::from_calendar_date(2026, time::Month::May, 20)?
+            .with_hms(12, 0, 0)?
+            .assume_utc();
+        let store = StoreStub::new()
+            .with_admin_cancel_summary(active_vip_summary(now, now + time::Duration::days(30)))
+            .with_admin_cancel_active_subscription(None);
+        let effects = EffectsStub::default();
+
+        let report = super::handle_admin_cancel_vip_command_at(
+            &store,
+            &effects,
+            super::AdminCancelVipCommand {
+                chat_id: 900,
+                message_id: 101,
+                actor_user_id: 7,
+                arguments: "42 true",
+            },
+            now,
+        )
+        .await;
+
+        assert_eq!(
+            report.outcome,
+            super::AdminCancelVipCommandOutcome::NoPaidSubscription
+        );
+        assert!(effects.refund_requests().is_empty());
+        assert!(store.refunded_subscription_ids().is_empty());
+        assert!(store.vip_events().is_empty());
+        assert!(effects.invalidated_vip_users().is_empty());
+        assert_eq!(
+            effects.sent_texts(),
+            vec!["ℹ️ У пользователя 42 нет активной оплаченной VIP подписки для возврата."]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_cancel_vip_command_refund_reports_paid_subscription_lookup_error()
+    -> Result<(), Box<dyn Error>> {
+        let now = time::Date::from_calendar_date(2026, time::Month::May, 20)?
+            .with_hms(12, 0, 0)?
+            .assume_utc();
+        let store = StoreStub::new()
+            .with_admin_cancel_summary(active_vip_summary(now, now + time::Duration::days(30)))
+            .with_admin_cancel_active_subscription_error(StubError::Request);
+        let effects = EffectsStub::default();
+
+        let report = super::handle_admin_cancel_vip_command_at(
+            &store,
+            &effects,
+            super::AdminCancelVipCommand {
+                chat_id: 900,
+                message_id: 101,
+                actor_user_id: 7,
+                arguments: "42 true",
+            },
+            now,
+        )
+        .await;
+
+        assert_eq!(
+            report.outcome,
+            super::AdminCancelVipCommandOutcome::PaidSubscriptionLookupError
+        );
+        assert!(effects.refund_requests().is_empty());
+        assert!(store.refunded_subscription_ids().is_empty());
+        assert!(store.vip_events().is_empty());
+        assert!(effects.invalidated_vip_users().is_empty());
+        assert_eq!(
+            effects.sent_texts(),
+            vec!["❌ Ошибка при проверке оплаченной подписки пользователя."]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_cancel_vip_command_refund_failure_stops_before_db_writes()
+    -> Result<(), Box<dyn Error>> {
+        let now = time::Date::from_calendar_date(2026, time::Month::May, 20)?
+            .with_hms(12, 0, 0)?
+            .assume_utc();
+        let store = StoreStub::new()
+            .with_admin_cancel_summary(active_vip_summary(now, now + time::Duration::days(30)))
+            .with_admin_cancel_active_subscription(Some(active_subscription(
+                now,
+                now + time::Duration::days(30),
+            )));
+        let effects = EffectsStub::default().with_next_refund_error(StubError::Request);
+
+        let report = super::handle_admin_cancel_vip_command_at(
+            &store,
+            &effects,
+            super::AdminCancelVipCommand {
+                chat_id: 900,
+                message_id: 101,
+                actor_user_id: 7,
+                arguments: "42 true",
+            },
+            now,
+        )
+        .await;
+
+        assert_eq!(
+            report.outcome,
+            super::AdminCancelVipCommandOutcome::RefundFailed
+        );
+        assert_eq!(
+            effects.refund_requests(),
+            vec![(42, "telegram-charge".to_owned())]
+        );
+        assert!(effects.direct_texts().is_empty());
+        assert!(store.refunded_subscription_ids().is_empty());
+        assert!(store.vip_events().is_empty());
+        assert!(effects.invalidated_vip_users().is_empty());
+        assert_eq!(effects.sent_payment_texts().len(), 1);
+        assert!(
+            effects.sent_payment_texts()[0]
+                .text
+                .contains("Не удалось выполнить возврат средств: request")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_cancel_vip_command_refund_db_failure_reports_not_cancelled()
+    -> Result<(), Box<dyn Error>> {
+        let now = time::Date::from_calendar_date(2026, time::Month::May, 20)?
+            .with_hms(12, 0, 0)?
+            .assume_utc();
+        let store = StoreStub::new()
+            .with_admin_cancel_summary(active_vip_summary(now, now + time::Duration::days(30)))
+            .with_admin_cancel_active_subscription(Some(active_subscription(
+                now,
+                now + time::Duration::days(30),
+            )))
+            .with_mark_subscription_refunded_error(StubError::Request);
+        let effects = EffectsStub::default();
+
+        let report = super::handle_admin_cancel_vip_command_at(
+            &store,
+            &effects,
+            super::AdminCancelVipCommand {
+                chat_id: 900,
+                message_id: 101,
+                actor_user_id: 7,
+                arguments: "42 true",
+            },
+            now,
+        )
+        .await;
+
+        assert_eq!(
+            report.outcome,
+            super::AdminCancelVipCommandOutcome::RefundFailed
+        );
+        assert_eq!(
+            effects.refund_requests(),
+            vec![(42, "telegram-charge".to_owned())]
+        );
+        assert_eq!(store.refunded_subscription_ids(), vec![10]);
+        assert_eq!(effects.direct_texts().len(), 1);
+        assert!(store.vip_events().is_empty());
+        assert!(effects.invalidated_vip_users().is_empty());
+        assert_eq!(effects.sent_payment_texts().len(), 1);
+        assert!(
+            effects.sent_payment_texts()[0]
+                .text
+                .contains("не удалось пометить подписку как refunded: request")
         );
         Ok(())
     }
@@ -7586,6 +8149,9 @@ mod tests {
         next_donations: VecDeque<DonationRecord>,
         next_vip_events: VecDeque<VipEventRecord>,
         admin_cancel_summaries: VecDeque<Result<Option<VipSummaryRecord>, StubError>>,
+        admin_cancel_active_subscriptions: VecDeque<Result<Option<SubscriptionRecord>, StubError>>,
+        refunded_subscription_ids: Vec<i64>,
+        mark_subscription_refunded_error: Option<StubError>,
     }
 
     impl StoreStub {
@@ -7642,6 +8208,28 @@ mod tests {
             self
         }
 
+        fn with_admin_cancel_active_subscription(
+            self,
+            subscription: Option<SubscriptionRecord>,
+        ) -> Self {
+            self.lock()
+                .admin_cancel_active_subscriptions
+                .push_back(Ok(subscription));
+            self
+        }
+
+        fn with_admin_cancel_active_subscription_error(self, error: StubError) -> Self {
+            self.lock()
+                .admin_cancel_active_subscriptions
+                .push_back(Err(error));
+            self
+        }
+
+        fn with_mark_subscription_refunded_error(self, error: StubError) -> Self {
+            self.lock().mark_subscription_refunded_error = Some(error);
+            self
+        }
+
         fn users(&self) -> Vec<UserState> {
             self.lock().users.clone()
         }
@@ -7656,6 +8244,10 @@ mod tests {
 
         fn vip_events(&self) -> Vec<VipEventCreate<'static>> {
             self.lock().vip_events.clone()
+        }
+
+        fn refunded_subscription_ids(&self) -> Vec<i64> {
+            self.lock().refunded_subscription_ids.clone()
         }
 
         fn lock(&self) -> MutexGuard<'_, StoreState> {
@@ -7825,6 +8417,44 @@ mod tests {
         ) -> PaymentStoreFuture<'a, VipEventRecord, Self::Error> {
             <Self as SuccessfulPaymentStore>::create_vip_event(self, event)
         }
+
+        fn get_active_subscription<'a>(
+            &'a self,
+            _user_id: i64,
+        ) -> PaymentStoreFuture<'a, Option<SubscriptionRecord>, Self::Error> {
+            Box::pin(async move {
+                Ok(self
+                    .lock()
+                    .admin_cancel_active_subscriptions
+                    .pop_front()
+                    .transpose()?
+                    .flatten())
+            })
+        }
+
+        fn mark_subscription_refunded<'a>(
+            &'a self,
+            id: i64,
+        ) -> PaymentStoreFuture<'a, SubscriptionRecord, Self::Error> {
+            Box::pin(async move {
+                let mut state = self.lock();
+                state.refunded_subscription_ids.push(id);
+                if let Some(error) = state.mark_subscription_refunded_error.take() {
+                    return Err(error);
+                }
+                Ok(SubscriptionRecord {
+                    id,
+                    user_id: 42,
+                    telegram_payment_charge_id: "telegram-charge".to_owned(),
+                    provider_payment_charge_id: String::new(),
+                    expires_at: OffsetDateTime::UNIX_EPOCH,
+                    created_at: OffsetDateTime::UNIX_EPOCH,
+                    updated_at: OffsetDateTime::UNIX_EPOCH,
+                    canceled_at: None,
+                    refunded_at: Some(OffsetDateTime::UNIX_EPOCH),
+                })
+            })
+        }
     }
 
     #[derive(Clone, Default)]
@@ -7962,6 +8592,9 @@ mod tests {
         invoice_error_texts: Vec<(i64, i32, String, String)>,
         vip_status_messages: Vec<super::VipStatusMessage>,
         vip_status_error_texts: Vec<(i64, i32, String, String)>,
+        refund_requests: Vec<(i64, String)>,
+        next_refund_error: Option<StubError>,
+        direct_texts: Vec<(i64, String)>,
     }
 
     impl EffectsStub {
@@ -7974,6 +8607,11 @@ mod tests {
             self.lock()
                 .next_invoice_urls
                 .push_back(invoice_url.to_owned());
+            self
+        }
+
+        fn with_next_refund_error(self, error: StubError) -> Self {
+            self.lock().next_refund_error = Some(error);
             self
         }
 
@@ -7991,6 +8629,14 @@ mod tests {
 
         fn invalidated_vip_users(&self) -> Vec<i64> {
             self.lock().invalidated_vip_users.clone()
+        }
+
+        fn refund_requests(&self) -> Vec<(i64, String)> {
+            self.lock().refund_requests.clone()
+        }
+
+        fn direct_texts(&self) -> Vec<(i64, String)> {
+            self.lock().direct_texts.clone()
         }
 
         fn answered_pre_checkout_queries(&self) -> Vec<String> {
@@ -8052,6 +8698,52 @@ mod tests {
         ) -> PaymentEffectsFuture<'a, Self::Error> {
             Box::pin(async move {
                 self.lock().invalidated_vip_users.push(user_id);
+                Ok(())
+            })
+        }
+    }
+
+    impl super::AdminCancelVipEffects for EffectsStub {
+        type Error = StubError;
+
+        fn send_admin_cancel_vip_text<'a>(
+            &'a self,
+            message: PaymentTextMessage<'a>,
+        ) -> PaymentEffectsFuture<'a, Self::Error> {
+            <Self as SuccessfulPaymentEffects>::send_text(self, message)
+        }
+
+        fn invalidate_admin_cancel_vip_cache<'a>(
+            &'a self,
+            user_id: i64,
+        ) -> PaymentEffectsFuture<'a, Self::Error> {
+            <Self as SuccessfulPaymentEffects>::invalidate_vip_cache(self, user_id)
+        }
+
+        fn refund_admin_cancel_vip_payment<'a>(
+            &'a self,
+            user_id: i64,
+            telegram_payment_charge_id: &'a str,
+        ) -> PaymentEffectsFuture<'a, Self::Error> {
+            Box::pin(async move {
+                let mut state = self.lock();
+                state
+                    .refund_requests
+                    .push((user_id, telegram_payment_charge_id.to_owned()));
+                match state.next_refund_error.take() {
+                    Some(error) => Err(error),
+                    None => Ok(()),
+                }
+            })
+        }
+
+        fn send_admin_cancel_vip_user_text<'a>(
+            &'a self,
+            user_id: i64,
+            text: &'a str,
+        ) -> PaymentEffectsFuture<'a, Self::Error> {
+            Box::pin(async move {
+                self.lock().direct_texts.push((user_id, text.to_owned()));
                 Ok(())
             })
         }
