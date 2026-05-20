@@ -10,7 +10,7 @@ use carapax::types::{
     InputFile, InputFileReader, InputMedia, InputMediaError, InputMediaPhoto,
     InputMessageContentText, MediaGroup, MediaGroupError, MediaGroupItem, ParseMode, ReplyMarkup,
     ReplyParameters, ReplyParametersError, SendAudio, SendChatAction, SendMediaGroup, SendMessage,
-    SendPhoto, SendSticker,
+    SendPhoto, SendSticker, WebAppInfo,
 };
 use crc::{CRC_32_ISCSI, Crc};
 use serde_json::{Map, Value, json};
@@ -26,6 +26,9 @@ pub const TELEGRAM_TEXT_MAX_BYTES: usize = 4096;
 
 /// Go message type string for outbound text fingerprints.
 pub const MESSAGE_TYPE_TEXT: &str = "text";
+
+/// Button text used by Go settings WebApp keyboards.
+pub const SETTINGS_BUTTON_TEXT: &str = "⚙️ Настройки";
 
 const MESSAGE_TYPE_STICKER: &str = "sticker";
 const MESSAGE_TYPE_PHOTO: &str = "photo";
@@ -667,6 +670,14 @@ pub fn build_inline_keyboard_button_url(
     InlineKeyboardButton::for_url(text, url)
 }
 
+/// Build a WebApp inline keyboard button matching Go `InlineKeyboardButton{WebApp: ...}`.
+pub fn build_inline_keyboard_button_web_app(
+    text: impl Into<String>,
+    url: impl Into<String>,
+) -> InlineKeyboardButton {
+    InlineKeyboardButton::for_web_app(text, WebAppInfo::from(url.into()))
+}
+
 /// Build an inline keyboard row matching Go `api.NewInlineKeyboardRow`.
 pub fn build_inline_keyboard_row(
     buttons: impl IntoIterator<Item = InlineKeyboardButton>,
@@ -679,6 +690,13 @@ pub fn build_inline_keyboard_markup(
     rows: impl IntoIterator<Item = impl IntoIterator<Item = InlineKeyboardButton>>,
 ) -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::from(rows)
+}
+
+/// Build the one-button settings keyboard used by Go private settings entrypoints.
+pub fn build_private_settings_keyboard(url: impl Into<String>) -> InlineKeyboardMarkup {
+    build_inline_keyboard_markup([build_inline_keyboard_row([
+        build_inline_keyboard_button_web_app(SETTINGS_BUTTON_TEXT, url),
+    ])])
 }
 
 /// Build an outbound `deleteMessage` method.
@@ -1398,14 +1416,15 @@ mod tests {
         build_edit_media_message_method, build_edit_media_message_plan,
         build_edit_reply_markup_message_method, build_edit_text_message_method,
         build_guest_query_answer_method, build_inline_keyboard_button_data,
-        build_inline_keyboard_button_url, build_inline_keyboard_markup, build_inline_keyboard_row,
-        build_inline_query_answer_method, build_inline_query_result_article,
-        build_media_group_message_method, build_media_group_message_plan,
-        build_photo_message_method, build_photo_message_plan, build_sticker_message_method,
-        build_sticker_message_plan, build_text_message_method, build_text_message_methods,
-        fingerprint_audio_message_plan, fingerprint_photo_message_plan,
-        fingerprint_sticker_message_plan, fingerprint_text_message_part, forum_thread_id,
-        hash_content, message_target_chat, validate_text_message_text,
+        build_inline_keyboard_button_url, build_inline_keyboard_button_web_app,
+        build_inline_keyboard_markup, build_inline_keyboard_row, build_inline_query_answer_method,
+        build_inline_query_result_article, build_media_group_message_method,
+        build_media_group_message_plan, build_photo_message_method, build_photo_message_plan,
+        build_private_settings_keyboard, build_sticker_message_method, build_sticker_message_plan,
+        build_text_message_method, build_text_message_methods, fingerprint_audio_message_plan,
+        fingerprint_photo_message_plan, fingerprint_sticker_message_plan,
+        fingerprint_text_message_part, forum_thread_id, hash_content, message_target_chat,
+        validate_text_message_text,
     };
     use crate::{
         InlineKeyboardButton, InlineKeyboardMarkup, ReplyMarkup, TELEGRAM_PARSE_MODE_HTML,
@@ -2591,6 +2610,50 @@ mod tests {
             payload["inline_keyboard"][0][1]
                 .get("callback_data")
                 .is_none()
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn build_inline_keyboard_web_app_button_matches_go_settings_payload()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let button = build_inline_keyboard_button_web_app(
+            "⚙️ Настройки",
+            "https://plotva.example/settings/?chat_id=42&signature=780e28cf",
+        );
+        let payload = serde_json::to_value(button)?;
+
+        assert_eq!(payload["text"], json!("⚙️ Настройки"));
+        assert_eq!(
+            payload["web_app"]["url"],
+            json!("https://plotva.example/settings/?chat_id=42&signature=780e28cf")
+        );
+        assert!(payload.get("url").is_none());
+        assert!(payload.get("callback_data").is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn build_private_settings_keyboard_matches_go_single_web_app_row()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let markup = build_private_settings_keyboard(
+            "https://plotva.example/settings/index.html?signature=780e28cf",
+        );
+        let payload = serde_json::to_value(markup)?;
+
+        let rows = payload["inline_keyboard"]
+            .as_array()
+            .ok_or("inline_keyboard must be an array")?;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            payload["inline_keyboard"][0][0]["text"],
+            json!("⚙️ Настройки")
+        );
+        assert_eq!(
+            payload["inline_keyboard"][0][0]["web_app"]["url"],
+            json!("https://plotva.example/settings/index.html?signature=780e28cf")
         );
 
         Ok(())
