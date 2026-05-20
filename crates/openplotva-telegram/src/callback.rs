@@ -2,6 +2,8 @@
 
 use std::collections::BTreeMap;
 
+use crate::outbound::CallbackAnswerRequest;
+
 pub type CallbackActionData = BTreeMap<String, String>;
 
 /// Result of parsing callback data while preserving Go's ack-routing split.
@@ -136,6 +138,30 @@ pub fn callback_query_route(
                 None => CallbackQueryRoute::AckUnknownAction { action },
             }
         }
+    }
+}
+
+/// Build the direct callback acknowledgement used by Go for terminal ack routes.
+#[must_use]
+pub fn callback_query_ack_request(
+    callback_query_id: impl Into<String>,
+    route: &CallbackQueryRoute,
+) -> Option<CallbackAnswerRequest> {
+    match route {
+        CallbackQueryRoute::AckOrphan
+        | CallbackQueryRoute::AckEmptyData
+        | CallbackQueryRoute::AckLegacyData
+        | CallbackQueryRoute::AckActionlessJson { .. }
+        | CallbackQueryRoute::AckUnknownAction { .. } => Some(CallbackAnswerRequest {
+            callback_query_id: callback_query_id.into(),
+            text: String::new(),
+            show_alert: false,
+            url: String::new(),
+            cache_time: 0,
+        }),
+        CallbackQueryRoute::SkipRateLimited
+        | CallbackQueryRoute::Settings { .. }
+        | CallbackQueryRoute::Handle { .. } => None,
     }
 }
 

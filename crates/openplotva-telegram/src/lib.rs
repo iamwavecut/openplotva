@@ -13,8 +13,9 @@ mod update_startup;
 
 pub use callback::{
     CallbackActionData, CallbackActionParse, CallbackHandlerKind, CallbackQueryRoute,
-    callback_handler_for_action, callback_query_route, checkin_theme_callback_init,
-    checkin_theme_callback_theme, checkin_theme_selection_alert, parse_callback_action,
+    callback_handler_for_action, callback_query_ack_request, callback_query_route,
+    checkin_theme_callback_init, checkin_theme_callback_theme, checkin_theme_selection_alert,
+    parse_callback_action,
 };
 pub use dedup::{DEFAULT_DEBOUNCE_CACHE_SIZE, DEFAULT_DEBOUNCE_WINDOW, Debouncer, DebouncerConfig};
 pub use dispatcher::{
@@ -602,9 +603,10 @@ mod tests {
         API_CONSTRUCTOR_USAGES, BotCommandError, BotCommandScope, CALLBACK_ACTIONS,
         COMMAND_ALIAS_GROUPS, COMMAND_SETS, CallbackActionParse, CallbackHandlerKind,
         CallbackQueryRoute, CommandScope, DONATE_COMMAND, GROUP_ADMIN_COMMANDS, GROUP_COMMANDS,
-        HELP_COMMAND, PRIVATE_COMMANDS, callback_handler_for_action, callback_query_route,
-        checkin_theme_callback_init, checkin_theme_callback_theme, checkin_theme_selection_alert,
-        delete_my_commands_method, empty_context, parse_callback_action, set_my_commands_methods,
+        HELP_COMMAND, PRIVATE_COMMANDS, callback_handler_for_action, callback_query_ack_request,
+        callback_query_route, checkin_theme_callback_init, checkin_theme_callback_theme,
+        checkin_theme_selection_alert, delete_my_commands_method, empty_context,
+        parse_callback_action, set_my_commands_methods,
     };
 
     #[derive(Debug, Deserialize)]
@@ -906,6 +908,53 @@ mod tests {
         assert_eq!(handler, CallbackHandlerKind::CheckinThemeSelect);
         assert_eq!(action, "cts");
         assert_eq!(data.get("i").map(String::as_str), Some("42"));
+    }
+
+    #[test]
+    fn callback_query_ack_request_matches_go_empty_ack_routes() {
+        for route in [
+            CallbackQueryRoute::AckOrphan,
+            CallbackQueryRoute::AckEmptyData,
+            CallbackQueryRoute::AckLegacyData,
+            CallbackQueryRoute::AckActionlessJson {
+                data: parse_callback_action(r#"{"u":"1"}"#)
+                    .into_data()
+                    .expect("callback data"),
+            },
+            CallbackQueryRoute::AckUnknownAction {
+                action: "unknown".to_owned(),
+            },
+        ] {
+            let ack = callback_query_ack_request("query-id", &route).expect("empty ack");
+            assert_eq!(ack.callback_query_id, "query-id");
+            assert!(ack.text.is_empty());
+            assert!(!ack.show_alert);
+            assert!(ack.url.is_empty());
+            assert_eq!(ack.cache_time, 0);
+        }
+    }
+
+    #[test]
+    fn callback_query_ack_request_skips_delegated_or_rate_limited_routes() {
+        assert!(
+            callback_query_ack_request("query-id", &CallbackQueryRoute::SkipRateLimited).is_none()
+        );
+        assert!(
+            callback_query_ack_request(
+                "query-id",
+                &CallbackQueryRoute::Settings {
+                    data: "settings:x".to_owned()
+                }
+            )
+            .is_none()
+        );
+        assert!(
+            callback_query_ack_request(
+                "query-id",
+                &callback_query_route(true, false, r#"{"a":"cts","i":"42"}"#)
+            )
+            .is_none()
+        );
     }
 
     #[test]
