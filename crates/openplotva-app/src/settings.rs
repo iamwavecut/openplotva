@@ -6,7 +6,7 @@ use carapax::types::{
     Chat as TelegramChat, ChatMember as TelegramChatMember, ChatMemberRestricted,
     Message as TelegramMessage, Update as TelegramUpdate, UpdateType, User as TelegramUser,
 };
-use openplotva_core::{SENDER_TYPE_CHANNEL, SENDER_TYPE_SAME_CHAT};
+use openplotva_core::{SENDER_TYPE_CHANNEL, SENDER_TYPE_SAME_CHAT, UserState};
 use openplotva_storage::{ChatMemberRecord, ChatMemberUpsert};
 use openplotva_taskman::{
     CONTROL_QUEUE_NAME, ControlJobData, ControlJobParams, ControlKind, HIGH_PRIORITY,
@@ -110,6 +110,42 @@ pub trait GroupSettingsMemberApi {
     ) -> GroupSettingsMemberFuture<'a, TelegramChatMember, Self::Error>;
 }
 
+/// Storage boundary for Go `syncChatAdmins`.
+pub trait GroupSettingsAdminSyncStore {
+    /// Error returned by concrete admin-sync storage.
+    type Error: fmt::Display + Send + Sync + 'static;
+
+    /// List cached chat-member rows for Telegram API fallback.
+    fn list_chat_members<'a>(
+        &'a self,
+        chat_id: i64,
+    ) -> GroupSettingsMemberFuture<'a, Vec<ChatMemberRecord>, Self::Error>;
+
+    /// Persist a freshly fetched admin membership.
+    fn upsert_chat_member<'a>(
+        &'a self,
+        member: ChatMemberUpsert,
+    ) -> GroupSettingsMemberFuture<'a, (), Self::Error>;
+
+    /// Persist the admin user, matching Go `ensureUserPersistence`.
+    fn upsert_user_state<'a>(
+        &'a self,
+        user: UserState,
+    ) -> GroupSettingsMemberFuture<'a, (), Self::Error>;
+}
+
+/// Telegram boundary for Go `getChatAdministrators`.
+pub trait GroupSettingsAdminsApi {
+    /// Error returned by concrete Telegram calls.
+    type Error: fmt::Display + Send + Sync + 'static;
+
+    /// Fetch chat administrators from Telegram.
+    fn get_chat_administrators<'a>(
+        &'a self,
+        chat_id: i64,
+    ) -> GroupSettingsMemberFuture<'a, Vec<TelegramChatMember>, Self::Error>;
+}
+
 /// Error returned by the concrete Go `canOpenGroupSettings` port.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum GroupSettingsPermissionCheckError {
@@ -119,6 +155,42 @@ pub enum GroupSettingsPermissionCheckError {
     /// Telegram permission probe failed.
     #[error("{0}")]
     Telegram(String),
+}
+
+/// Source used by a group-settings admin sync attempt.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum GroupSettingsAdminSyncSource {
+    /// Go skips zero chat IDs before IO.
+    #[default]
+    Skipped,
+    /// Administrators came from Telegram `getChatAdministrators`.
+    Telegram,
+    /// Telegram failed and stored admin rows were used.
+    StoredFallback,
+}
+
+/// Testable report for Go `syncChatAdmins` side effects.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct GroupSettingsAdminSyncReport {
+    /// Source used for admin rows.
+    pub source: GroupSettingsAdminSyncSource,
+    /// Number of admin rows processed.
+    pub admin_count: usize,
+    /// Best-effort membership upsert failures.
+    pub member_upsert_errors: usize,
+    /// Best-effort user upsert failures.
+    pub user_upsert_errors: usize,
+}
+
+/// Error returned by the concrete Go `syncChatAdmins` port.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum GroupSettingsAdminSyncError {
+    /// Telegram failed and no stored admin fallback was available.
+    #[error("{0}")]
+    Telegram(String),
+    /// Stored fallback failed after Telegram failed.
+    #[error("failed to get chat members: {0}")]
+    Storage(String),
 }
 
 /// Result of handling a decoded `/settings` update.
@@ -675,6 +747,102 @@ pub fn chat_member_upsert_from_telegram(
     params
 }
 
+/// Go `syncChatAdmins` and `getChatAdministrators` port with injectable boundaries.
+pub async fn sync_chat_admins_with_sources<Store, Api>(
+    store: &Store,
+    telegram: &Api,
+    chat_id: i64,
+) -> Result<GroupSettingsAdminSyncReport, GroupSettingsAdminSyncError>
+where
+    Store: GroupSettingsAdminSyncStore + Sync,
+    Api: GroupSettingsAdminsApi + Sync,
+{
+    if chat_id == 0 {
+        return Ok(GroupSettingsAdminSyncReport {
+            source: GroupSettingsAdminSyncSource::Skipped,
+            ..GroupSettingsAdminSyncReport::default()
+        });
+    }
+
+    match telegram.get_chat_administrators(chat_id).await {
+        Ok(admins) => sync_api_admins(store, chat_id, admins).await,
+        Err(api_error) => {
+            let api_error = api_error.to_string();
+            let members = store
+                .list_chat_members(chat_id)
+                .await
+                .map_err(|error| GroupSettingsAdminSyncError::Storage(error.to_string()))?;
+            let admins = members
+                .iter()
+                .filter_map(openplotva_storage::stored_admin_chat_member)
+                .collect::<Vec<_>>();
+            if admins.is_empty() {
+                return Err(GroupSettingsAdminSyncError::Telegram(api_error));
+            }
+            sync_stored_admins(store, admins).await
+        }
+    }
+}
+
+/// Build Go `adminChatMemberUpsertParams` from a `carapax` admin member.
+#[must_use]
+pub fn admin_chat_member_upsert_from_telegram(
+    chat_id: i64,
+    admin: &TelegramChatMember,
+) -> Option<ChatMemberUpsert> {
+    let (user, status, custom_title, is_anonymous, permissions) = match admin {
+        TelegramChatMember::Administrator(admin) => (
+            &admin.user,
+            openplotva_storage::CHAT_MEMBER_STATUS_ADMINISTRATOR,
+            admin.custom_title.clone().unwrap_or_default(),
+            admin.is_anonymous,
+            AdminSyncPermissions {
+                can_delete_messages: admin.can_delete_messages,
+                can_manage_video_chats: admin.can_manage_video_chats,
+                can_restrict_members: admin.can_restrict_members,
+                can_promote_members: admin.can_promote_members,
+                can_change_info: admin.can_change_info,
+                can_invite_users: admin.can_invite_users,
+                can_post_messages: admin.can_post_messages.unwrap_or_default(),
+                can_edit_messages: admin.can_edit_messages.unwrap_or_default(),
+                can_pin_messages: admin.can_pin_messages.unwrap_or_default(),
+            },
+        ),
+        TelegramChatMember::Creator(creator) => (
+            &creator.user,
+            openplotva_storage::CHAT_MEMBER_STATUS_CREATOR,
+            creator.custom_title.clone().unwrap_or_default(),
+            false,
+            AdminSyncPermissions::default(),
+        ),
+        TelegramChatMember::Kicked(_)
+        | TelegramChatMember::Left(_)
+        | TelegramChatMember::Member { .. }
+        | TelegramChatMember::Restricted(_) => return None,
+    };
+
+    Some(ChatMemberUpsert {
+        chat_id,
+        user_id: i64::from(user.id),
+        status: status.to_owned(),
+        is_anonymous: Some(is_anonymous),
+        custom_title: Some(custom_title),
+        can_be_edited: Some(false),
+        can_manage_chat: Some(true),
+        can_delete_messages: Some(permissions.can_delete_messages),
+        can_manage_video_chats: Some(permissions.can_manage_video_chats),
+        can_restrict_members: Some(permissions.can_restrict_members),
+        can_promote_members: Some(permissions.can_promote_members),
+        can_change_info: Some(permissions.can_change_info),
+        can_invite_users: Some(permissions.can_invite_users),
+        can_post_messages: Some(permissions.can_post_messages),
+        can_edit_messages: Some(permissions.can_edit_messages),
+        can_pin_messages: Some(permissions.can_pin_messages),
+        can_manage_topics: Some(false),
+        ..ChatMemberUpsert::default()
+    })
+}
+
 fn message_chat_ref(message: &TelegramMessage) -> ChatRef {
     ChatRef {
         id: message.chat.get_id().into(),
@@ -716,6 +884,135 @@ impl GroupSettingsMemberApi for openplotva_telegram::TelegramClient {
             .await
         })
     }
+}
+
+impl GroupSettingsAdminSyncStore for openplotva_storage::PostgresChatMemberStore {
+    type Error = openplotva_storage::StorageError;
+
+    fn list_chat_members<'a>(
+        &'a self,
+        chat_id: i64,
+    ) -> GroupSettingsMemberFuture<'a, Vec<ChatMemberRecord>, Self::Error> {
+        Box::pin(async move { self.list_chat_members(chat_id).await })
+    }
+
+    fn upsert_chat_member<'a>(
+        &'a self,
+        member: ChatMemberUpsert,
+    ) -> GroupSettingsMemberFuture<'a, (), Self::Error> {
+        Box::pin(async move { self.upsert_chat_member(&member).await })
+    }
+
+    fn upsert_user_state<'a>(
+        &'a self,
+        user: UserState,
+    ) -> GroupSettingsMemberFuture<'a, (), Self::Error> {
+        Box::pin(async move { self.upsert_user_state(&user).await })
+    }
+}
+
+impl GroupSettingsAdminsApi for openplotva_telegram::TelegramClient {
+    type Error = carapax::api::ExecuteError;
+
+    fn get_chat_administrators<'a>(
+        &'a self,
+        chat_id: i64,
+    ) -> GroupSettingsMemberFuture<'a, Vec<TelegramChatMember>, Self::Error> {
+        Box::pin(async move {
+            self.execute(openplotva_telegram::build_get_chat_administrators_method(
+                chat_id,
+            ))
+            .await
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct AdminSyncPermissions {
+    can_delete_messages: bool,
+    can_manage_video_chats: bool,
+    can_restrict_members: bool,
+    can_promote_members: bool,
+    can_change_info: bool,
+    can_invite_users: bool,
+    can_post_messages: bool,
+    can_edit_messages: bool,
+    can_pin_messages: bool,
+}
+
+async fn sync_api_admins<Store>(
+    store: &Store,
+    chat_id: i64,
+    admins: Vec<TelegramChatMember>,
+) -> Result<GroupSettingsAdminSyncReport, GroupSettingsAdminSyncError>
+where
+    Store: GroupSettingsAdminSyncStore + Sync,
+{
+    let mut report = GroupSettingsAdminSyncReport {
+        source: GroupSettingsAdminSyncSource::Telegram,
+        admin_count: admins.len(),
+        ..GroupSettingsAdminSyncReport::default()
+    };
+
+    for admin in admins {
+        if let Some(upsert) = admin_chat_member_upsert_from_telegram(chat_id, &admin)
+            && GroupSettingsAdminSyncStore::upsert_chat_member(store, upsert)
+                .await
+                .is_err()
+        {
+            report.member_upsert_errors += 1;
+        }
+        if GroupSettingsAdminSyncStore::upsert_user_state(
+            store,
+            user_state_from_telegram_user(admin.get_user()),
+        )
+        .await
+        .is_err()
+        {
+            report.user_upsert_errors += 1;
+        }
+    }
+
+    Ok(report)
+}
+
+async fn sync_stored_admins<Store>(
+    store: &Store,
+    admins: Vec<openplotva_storage::StoredAdminChatMember>,
+) -> Result<GroupSettingsAdminSyncReport, GroupSettingsAdminSyncError>
+where
+    Store: GroupSettingsAdminSyncStore + Sync,
+{
+    let mut report = GroupSettingsAdminSyncReport {
+        source: GroupSettingsAdminSyncSource::StoredFallback,
+        admin_count: admins.len(),
+        ..GroupSettingsAdminSyncReport::default()
+    };
+
+    for admin in admins {
+        if GroupSettingsAdminSyncStore::upsert_user_state(
+            store,
+            UserState::new(admin.user_id, "", None, None, None, None),
+        )
+        .await
+        .is_err()
+        {
+            report.user_upsert_errors += 1;
+        }
+    }
+
+    Ok(report)
+}
+
+fn user_state_from_telegram_user(user: &TelegramUser) -> UserState {
+    UserState::new(
+        i64::from(user.id),
+        user.first_name.clone(),
+        user.last_name.clone(),
+        user.username.as_ref().map(ToString::to_string),
+        user.language_code.clone(),
+        user.is_premium,
+    )
 }
 
 fn telegram_chat_member_status(member: &TelegramChatMember) -> &'static str {
@@ -863,7 +1160,7 @@ mod tests {
     use carapax::types::{
         ChatMember, ChatMemberAdministrator, ChatMemberCreator, Update as TelegramUpdate, User,
     };
-    use openplotva_core::MessageIdMapping;
+    use openplotva_core::{MessageIdMapping, UserState};
     use openplotva_storage::{ChatMemberRecord, ChatMemberUpsert};
     use openplotva_taskman::{
         CONTROL_QUEUE_NAME, ControlJobData, ControlJobParams, ControlKind, HIGH_PRIORITY, JobType,
@@ -876,11 +1173,12 @@ mod tests {
     use crate::virtual_messages::VirtualMessageStore;
 
     use super::{
-        GroupSettingsCommandOutcome, GroupSettingsControlJobBuild, SettingsCommandOutcome,
-        SettingsControlJobQueue, SettingsControlJobQueueFuture,
-        can_open_group_settings_with_sources, chat_member_upsert_from_telegram,
-        execute_group_settings_control_job_at, group_settings_control_job_from_update_at,
-        handle_group_settings_command_update_at, handle_private_settings_command_update,
+        GroupSettingsAdminSyncSource, GroupSettingsCommandOutcome, GroupSettingsControlJobBuild,
+        SettingsCommandOutcome, SettingsControlJobQueue, SettingsControlJobQueueFuture,
+        admin_chat_member_upsert_from_telegram, can_open_group_settings_with_sources,
+        chat_member_upsert_from_telegram, execute_group_settings_control_job_at,
+        group_settings_control_job_from_update_at, handle_group_settings_command_update_at,
+        handle_private_settings_command_update, sync_chat_admins_with_sources,
     };
 
     #[tokio::test]
@@ -1458,6 +1756,139 @@ mod tests {
         assert_eq!(restricted.can_add_web_page_previews, Some(true));
     }
 
+    #[test]
+    fn admin_chat_member_upsert_from_telegram_preserves_go_admin_sync_semantics() {
+        let admin = admin_chat_member_upsert_from_telegram(-10042, &promoting_admin_member(42))
+            .expect("administrator should map to an admin upsert");
+        assert_eq!(admin.chat_id, -10042);
+        assert_eq!(admin.user_id, 42);
+        assert_eq!(
+            admin.status,
+            openplotva_storage::CHAT_MEMBER_STATUS_ADMINISTRATOR
+        );
+        assert_eq!(admin.is_anonymous, Some(false));
+        assert_eq!(admin.custom_title.as_deref(), Some(""));
+        assert_eq!(admin.can_be_edited, Some(false));
+        assert_eq!(admin.can_manage_chat, Some(true));
+        assert_eq!(admin.can_promote_members, Some(true));
+        assert_eq!(admin.can_manage_topics, Some(false));
+
+        let creator = admin_chat_member_upsert_from_telegram(-10042, &creator_member(43))
+            .expect("creator should map to an admin upsert");
+        assert_eq!(
+            creator.status,
+            openplotva_storage::CHAT_MEMBER_STATUS_CREATOR
+        );
+        assert_eq!(creator.is_anonymous, Some(false));
+        assert_eq!(creator.can_manage_chat, Some(true));
+        assert_eq!(creator.can_promote_members, Some(false));
+
+        let member = ChatMember::Member {
+            user: User::new(44, "Linus", false),
+            tag: None,
+            until_date: None,
+        };
+        assert!(admin_chat_member_upsert_from_telegram(-10042, &member).is_none());
+    }
+
+    #[tokio::test]
+    async fn group_settings_admin_sync_upserts_api_admins_and_users() -> Result<(), Box<dyn Error>>
+    {
+        let store = GroupSettingsAdminSyncStoreStub::default();
+        let api = GroupSettingsAdminsApiStub::with_admins(vec![
+            promoting_admin_member(42),
+            creator_member(43),
+        ]);
+
+        let report = sync_chat_admins_with_sources(&store, &api, -10042).await?;
+
+        assert_eq!(report.source, GroupSettingsAdminSyncSource::Telegram);
+        assert_eq!(report.admin_count, 2);
+        assert_eq!(report.member_upsert_errors, 0);
+        assert_eq!(report.user_upsert_errors, 0);
+        assert_eq!(api.calls(), vec![-10042]);
+        assert!(store.list_calls().is_empty());
+
+        let upserts = store.upserts();
+        assert_eq!(upserts.len(), 2);
+        assert_eq!(upserts[0].user_id, 42);
+        assert_eq!(upserts[0].can_manage_chat, Some(true));
+        assert_eq!(upserts[0].can_manage_topics, Some(false));
+        assert_eq!(upserts[1].user_id, 43);
+
+        let users = store.users();
+        assert_eq!(users.len(), 2);
+        assert_eq!(users[0].id, 42);
+        assert_eq!(users[0].first_name, "Ada");
+        assert_eq!(users[1].id, 43);
+        assert_eq!(users[1].first_name, "Grace");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn group_settings_admin_sync_falls_back_to_stored_admins_after_api_error()
+    -> Result<(), Box<dyn Error>> {
+        let store = GroupSettingsAdminSyncStoreStub::with_members(vec![
+            ChatMemberRecord {
+                chat_id: -10042,
+                user_id: 42,
+                status: openplotva_storage::CHAT_MEMBER_STATUS_ADMINISTRATOR.to_owned(),
+                can_promote_members: Some(true),
+                ..ChatMemberRecord::default()
+            },
+            ChatMemberRecord {
+                chat_id: -10042,
+                user_id: 44,
+                status: openplotva_storage::CHAT_MEMBER_STATUS_MEMBER.to_owned(),
+                ..ChatMemberRecord::default()
+            },
+        ]);
+        let api = GroupSettingsAdminsApiStub::failing();
+
+        let report = sync_chat_admins_with_sources(&store, &api, -10042).await?;
+
+        assert_eq!(report.source, GroupSettingsAdminSyncSource::StoredFallback);
+        assert_eq!(report.admin_count, 1);
+        assert_eq!(api.calls(), vec![-10042]);
+        assert_eq!(store.list_calls(), vec![-10042]);
+        assert!(store.upserts().is_empty());
+
+        let users = store.users();
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].id, 42);
+        assert_eq!(users[0].first_name, "");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn group_settings_admin_sync_returns_api_error_when_no_stored_admins() {
+        let store = GroupSettingsAdminSyncStoreStub::with_members(Vec::new());
+        let api = GroupSettingsAdminsApiStub::failing();
+
+        let error = sync_chat_admins_with_sources(&store, &api, -10042)
+            .await
+            .expect_err("API failure with no stored admins should be reported");
+
+        assert_eq!(error.to_string(), "request failed");
+        assert_eq!(store.list_calls(), vec![-10042]);
+    }
+
+    #[tokio::test]
+    async fn group_settings_admin_sync_skips_zero_chat_without_io() -> Result<(), Box<dyn Error>> {
+        let store = GroupSettingsAdminSyncStoreStub::default();
+        let api = GroupSettingsAdminsApiStub::with_admins(vec![promoting_admin_member(42)]);
+
+        let report = sync_chat_admins_with_sources(&store, &api, 0).await?;
+
+        assert_eq!(report.source, GroupSettingsAdminSyncSource::Skipped);
+        assert_eq!(report.admin_count, 0);
+        assert!(api.calls().is_empty());
+        assert!(store.list_calls().is_empty());
+        assert!(store.upserts().is_empty());
+        assert!(store.users().is_empty());
+        Ok(())
+    }
+
     type RecordedVirtualInsert = (String, i64, Option<i32>);
 
     #[derive(Clone, Default)]
@@ -1959,6 +2390,164 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    struct GroupSettingsAdminSyncStoreStub {
+        state: Arc<Mutex<GroupSettingsAdminSyncStoreState>>,
+    }
+
+    #[derive(Default)]
+    struct GroupSettingsAdminSyncStoreState {
+        members: Vec<ChatMemberRecord>,
+        fail_list: bool,
+        list_calls: Vec<i64>,
+        upserts: Vec<ChatMemberUpsert>,
+        users: Vec<UserState>,
+    }
+
+    impl GroupSettingsAdminSyncStoreStub {
+        fn with_members(members: Vec<ChatMemberRecord>) -> Self {
+            Self {
+                state: Arc::new(Mutex::new(GroupSettingsAdminSyncStoreState {
+                    members,
+                    ..GroupSettingsAdminSyncStoreState::default()
+                })),
+            }
+        }
+
+        fn list_calls(&self) -> Vec<i64> {
+            self.state
+                .lock()
+                .expect("group settings admin sync store state")
+                .list_calls
+                .clone()
+        }
+
+        fn upserts(&self) -> Vec<ChatMemberUpsert> {
+            self.state
+                .lock()
+                .expect("group settings admin sync store state")
+                .upserts
+                .clone()
+        }
+
+        fn users(&self) -> Vec<UserState> {
+            self.state
+                .lock()
+                .expect("group settings admin sync store state")
+                .users
+                .clone()
+        }
+    }
+
+    impl super::GroupSettingsAdminSyncStore for GroupSettingsAdminSyncStoreStub {
+        type Error = StubError;
+
+        fn list_chat_members<'a>(
+            &'a self,
+            chat_id: i64,
+        ) -> super::GroupSettingsMemberFuture<'a, Vec<ChatMemberRecord>, Self::Error> {
+            Box::pin(async move {
+                let mut state = self
+                    .state
+                    .lock()
+                    .expect("group settings admin sync store state");
+                state.list_calls.push(chat_id);
+                if state.fail_list {
+                    Err(StubError)
+                } else {
+                    Ok(state.members.clone())
+                }
+            })
+        }
+
+        fn upsert_chat_member<'a>(
+            &'a self,
+            member: ChatMemberUpsert,
+        ) -> super::GroupSettingsMemberFuture<'a, (), Self::Error> {
+            Box::pin(async move {
+                self.state
+                    .lock()
+                    .expect("group settings admin sync store state")
+                    .upserts
+                    .push(member);
+                Ok(())
+            })
+        }
+
+        fn upsert_user_state<'a>(
+            &'a self,
+            user: UserState,
+        ) -> super::GroupSettingsMemberFuture<'a, (), Self::Error> {
+            Box::pin(async move {
+                self.state
+                    .lock()
+                    .expect("group settings admin sync store state")
+                    .users
+                    .push(user);
+                Ok(())
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    struct GroupSettingsAdminsApiStub {
+        state: Arc<Mutex<GroupSettingsAdminsApiState>>,
+    }
+
+    #[derive(Default)]
+    struct GroupSettingsAdminsApiState {
+        admins: Vec<ChatMember>,
+        fail: bool,
+        calls: Vec<i64>,
+    }
+
+    impl GroupSettingsAdminsApiStub {
+        fn with_admins(admins: Vec<ChatMember>) -> Self {
+            Self {
+                state: Arc::new(Mutex::new(GroupSettingsAdminsApiState {
+                    admins,
+                    ..GroupSettingsAdminsApiState::default()
+                })),
+            }
+        }
+
+        fn failing() -> Self {
+            Self {
+                state: Arc::new(Mutex::new(GroupSettingsAdminsApiState {
+                    fail: true,
+                    ..GroupSettingsAdminsApiState::default()
+                })),
+            }
+        }
+
+        fn calls(&self) -> Vec<i64> {
+            self.state
+                .lock()
+                .expect("group settings admins API state")
+                .calls
+                .clone()
+        }
+    }
+
+    impl super::GroupSettingsAdminsApi for GroupSettingsAdminsApiStub {
+        type Error = StubError;
+
+        fn get_chat_administrators<'a>(
+            &'a self,
+            chat_id: i64,
+        ) -> super::GroupSettingsMemberFuture<'a, Vec<ChatMember>, Self::Error> {
+            Box::pin(async move {
+                let mut state = self.state.lock().expect("group settings admins API state");
+                state.calls.push(chat_id);
+                if state.fail {
+                    Err(StubError)
+                } else {
+                    Ok(state.admins.clone())
+                }
+            })
+        }
+    }
+
     fn promoting_admin_member(user_id: i64) -> ChatMember {
         ChatMember::Administrator(
             ChatMemberAdministrator::new(User::new(user_id, "Ada", false))
@@ -1974,6 +2563,10 @@ mod tests {
                 .with_can_pin_messages(true)
                 .with_can_manage_topics(true),
         )
+    }
+
+    fn creator_member(user_id: i64) -> ChatMember {
+        ChatMember::Creator(ChatMemberCreator::new(User::new(user_id, "Grace", false)))
     }
 
     fn restricted_member_with_send_permissions(user_id: i64) -> ChatMember {

@@ -58,7 +58,8 @@ pub use outbound::{
     build_donation_invoice_link_method, build_edit_caption_message_method,
     build_edit_media_message_method, build_edit_media_message_plan,
     build_edit_reply_markup_message_method, build_edit_text_message_method,
-    build_get_chat_member_method, build_guest_add_to_chat_markup, build_guest_html_answer_method,
+    build_get_chat_administrators_method, build_get_chat_member_method,
+    build_guest_add_to_chat_markup, build_guest_html_answer_method,
     build_guest_query_answer_method, build_inline_keyboard_button_data,
     build_inline_keyboard_button_url, build_inline_keyboard_button_web_app,
     build_inline_keyboard_markup, build_inline_keyboard_row, build_inline_query_answer_method,
@@ -128,6 +129,9 @@ pub type GetUpdates = carapax::types::GetUpdates;
 
 /// Telegram getChatMember method from `carapax`.
 pub type GetChatMember = carapax::types::GetChatMember;
+
+/// Telegram getChatAdministrators method from `carapax`.
+pub type GetChatAdministrators = carapax::types::GetChatAdministrators;
 
 /// Telegram setWebhook method from `carapax`.
 pub type SetWebhook = carapax::types::SetWebhook;

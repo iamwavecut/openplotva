@@ -6,11 +6,11 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use carapax::types::{
     AnswerCallbackQuery, AnswerGuestQuery, AnswerInlineQuery, AnswerPreCheckoutQuery, ChatAction,
     ChatMember, CreateInvoiceLink, DeleteMessage, EditMessageCaption, EditMessageMedia,
-    EditMessageReplyMarkup, EditMessageText, EditUserStarSubscription, GetChatMember,
-    InlineKeyboardButton, InlineKeyboardMarkup, InlineQueryResult, InlineQueryResultArticle,
-    InputFile, InputFileReader, InputMedia, InputMediaError, InputMediaPhoto,
-    InputMessageContentText, InvoiceParameters, LabeledPrice, MediaGroup, MediaGroupError,
-    MediaGroupItem, ParseMode, RefundStarPayment, ReplyMarkup, ReplyParameters,
+    EditMessageReplyMarkup, EditMessageText, EditUserStarSubscription, GetChatAdministrators,
+    GetChatMember, InlineKeyboardButton, InlineKeyboardMarkup, InlineQueryResult,
+    InlineQueryResultArticle, InputFile, InputFileReader, InputMedia, InputMediaError,
+    InputMediaPhoto, InputMessageContentText, InvoiceParameters, LabeledPrice, MediaGroup,
+    MediaGroupError, MediaGroupItem, ParseMode, RefundStarPayment, ReplyMarkup, ReplyParameters,
     ReplyParametersError, SendAudio, SendChatAction, SendMediaGroup, SendMessage, SendPhoto,
     SendSticker, WebAppInfo,
 };
@@ -691,6 +691,12 @@ pub fn build_chat_action_method(
 #[must_use]
 pub fn build_get_chat_member_method(chat_id: i64, user_id: i64) -> GetChatMember {
     GetChatMember::new(chat_id, user_id)
+}
+
+/// Build Go's `getChatAdministrators` admin-sync request.
+#[must_use]
+pub fn build_get_chat_administrators_method(chat_id: i64) -> GetChatAdministrators {
+    GetChatAdministrators::new(chat_id)
 }
 
 /// Go `telegramMemberCanOpenGroupSettings`.
@@ -1747,11 +1753,12 @@ mod tests {
         build_delete_message_method, build_donation_invoice_link_method,
         build_edit_caption_message_method, build_edit_media_message_method,
         build_edit_media_message_plan, build_edit_reply_markup_message_method,
-        build_edit_text_message_method, build_get_chat_member_method,
-        build_guest_add_to_chat_markup, build_guest_html_answer_method,
-        build_guest_query_answer_method, build_inline_keyboard_button_data,
-        build_inline_keyboard_button_url, build_inline_keyboard_button_web_app,
-        build_inline_keyboard_markup, build_inline_keyboard_row, build_inline_query_answer_method,
+        build_edit_text_message_method, build_get_chat_administrators_method,
+        build_get_chat_member_method, build_guest_add_to_chat_markup,
+        build_guest_html_answer_method, build_guest_query_answer_method,
+        build_inline_keyboard_button_data, build_inline_keyboard_button_url,
+        build_inline_keyboard_button_web_app, build_inline_keyboard_markup,
+        build_inline_keyboard_row, build_inline_query_answer_method,
         build_inline_query_result_article, build_media_group_message_method,
         build_media_group_message_plan, build_photo_message_method, build_photo_message_plan,
         build_pre_checkout_ok_method, build_private_settings_keyboard,
@@ -2789,6 +2796,17 @@ mod tests {
 
         assert_eq!(payload["chat_id"], json!(-10042));
         assert_eq!(payload["user_id"], json!(42));
+        Ok(())
+    }
+
+    #[test]
+    fn build_get_chat_administrators_method_matches_go_admin_sync_payload()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let method = build_get_chat_administrators_method(-10042);
+        let payload = serde_json::to_value(method)?;
+
+        assert_eq!(payload["chat_id"], json!(-10042));
+        assert!(payload.get("return_bots").is_none());
         Ok(())
     }
 

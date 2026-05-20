@@ -76,6 +76,9 @@ pub const SQL_GET_CHAT_TYPE: &str = "SELECT type FROM chats WHERE id = $1";
 pub const SQL_GET_CHAT_MEMBER: &str =
     "SELECT * FROM chat_members WHERE chat_id = $1 AND user_id = $2";
 
+/// Go `ListChatMembers` SQL narrowed to one chat.
+pub const SQL_LIST_CHAT_MEMBERS: &str = "SELECT * FROM chat_members WHERE chat_id = $1";
+
 /// Go `UpsertChatMember` SQL with SQLC bindings converted to positional bindings.
 pub const SQL_UPSERT_CHAT_MEMBER: &str = "INSERT INTO chat_members (chat_id, user_id, status, is_anonymous, custom_title, can_be_edited, can_manage_chat, can_delete_messages, can_manage_video_chats, can_restrict_members, can_promote_members, can_change_info, can_invite_users, can_post_messages, can_edit_messages, can_pin_messages, can_manage_topics, can_send_messages, can_send_media_messages, can_send_polls, can_send_other_messages, can_add_web_page_previews, until_date) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23) ON CONFLICT (chat_id, user_id) DO UPDATE SET status = COALESCE(EXCLUDED.status, chat_members.status), is_anonymous = COALESCE(EXCLUDED.is_anonymous, chat_members.is_anonymous), custom_title = COALESCE(EXCLUDED.custom_title, chat_members.custom_title), can_be_edited = COALESCE(EXCLUDED.can_be_edited, chat_members.can_be_edited), can_manage_chat = COALESCE(EXCLUDED.can_manage_chat, chat_members.can_manage_chat), can_delete_messages = COALESCE(EXCLUDED.can_delete_messages, chat_members.can_delete_messages), can_manage_video_chats = COALESCE(EXCLUDED.can_manage_video_chats, chat_members.can_manage_video_chats), can_restrict_members = COALESCE(EXCLUDED.can_restrict_members, chat_members.can_restrict_members), can_promote_members = COALESCE(EXCLUDED.can_promote_members, chat_members.can_promote_members), can_change_info = COALESCE(EXCLUDED.can_change_info, chat_members.can_change_info), can_invite_users = COALESCE(EXCLUDED.can_invite_users, chat_members.can_invite_users), can_post_messages = COALESCE(EXCLUDED.can_post_messages, chat_members.can_post_messages), can_edit_messages = COALESCE(EXCLUDED.can_edit_messages, chat_members.can_edit_messages), can_pin_messages = COALESCE(EXCLUDED.can_pin_messages, chat_members.can_pin_messages), can_manage_topics = COALESCE(EXCLUDED.can_manage_topics, chat_members.can_manage_topics), can_send_messages = COALESCE(EXCLUDED.can_send_messages, chat_members.can_send_messages), can_send_media_messages = COALESCE(EXCLUDED.can_send_media_messages, chat_members.can_send_media_messages), can_send_polls = COALESCE(EXCLUDED.can_send_polls, chat_members.can_send_polls), can_send_other_messages = COALESCE(EXCLUDED.can_send_other_messages, chat_members.can_send_other_messages), can_add_web_page_previews = COALESCE(EXCLUDED.can_add_web_page_previews, chat_members.can_add_web_page_previews), until_date = COALESCE(EXCLUDED.until_date, chat_members.until_date), updated_at = CURRENT_TIMESTAMP";
 
@@ -681,6 +684,37 @@ pub struct ChatMemberUpsert {
     pub until_date: Option<OffsetDateTime>,
 }
 
+/// Telegram-free equivalent of Go `storedAdminChatMember`.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct StoredAdminChatMember {
+    /// Telegram user ID.
+    pub user_id: i64,
+    /// Stored admin/creator status.
+    pub status: String,
+    /// Whether the admin is anonymous.
+    pub is_anonymous: Option<bool>,
+    /// Custom admin title.
+    pub custom_title: Option<String>,
+    /// Whether the admin can delete messages.
+    pub can_delete_messages: Option<bool>,
+    /// Whether the admin can manage video chats.
+    pub can_manage_video_chats: Option<bool>,
+    /// Whether the admin can restrict members.
+    pub can_restrict_members: Option<bool>,
+    /// Whether the admin can promote members.
+    pub can_promote_members: Option<bool>,
+    /// Whether the admin can change chat info.
+    pub can_change_info: Option<bool>,
+    /// Whether the admin can invite users.
+    pub can_invite_users: Option<bool>,
+    /// Whether the admin can post messages.
+    pub can_post_messages: Option<bool>,
+    /// Whether the admin can edit messages.
+    pub can_edit_messages: Option<bool>,
+    /// Whether the admin can pin messages.
+    pub can_pin_messages: Option<bool>,
+}
+
 impl PostgresChatMemberStore {
     /// Build a chat-member store on an existing Postgres pool.
     pub fn new(pool: PgPool) -> Self {
@@ -704,6 +738,21 @@ impl PostgresChatMemberStore {
             .fetch_optional(&self.pool)
             .await?;
         Ok(row.map(chat_member_from_row).transpose()?)
+    }
+
+    /// List Go `chat_members` rows for one chat.
+    pub async fn list_chat_members(
+        &self,
+        chat_id: i64,
+    ) -> Result<Vec<ChatMemberRecord>, StorageError> {
+        let rows = sqlx::query(SQL_LIST_CHAT_MEMBERS)
+            .bind(chat_id)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter()
+            .map(chat_member_from_row)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
     }
 
     /// Upsert one Go `chat_members` row, preserving nullable permission semantics.
@@ -736,6 +785,21 @@ impl PostgresChatMemberStore {
             .await?;
         Ok(())
     }
+
+    /// Upsert user state for admin-sync user persistence.
+    pub async fn upsert_user_state(&self, user: &UserState) -> Result<(), StorageError> {
+        sqlx::query(SQL_UPSERT_USER)
+            .bind(user.id)
+            .bind(&user.first_name)
+            .bind(user.last_name.as_deref())
+            .bind(user.username.as_deref())
+            .bind(user.language_code.as_deref())
+            .bind(user.is_premium)
+            .bind(Option::<&str>::None)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
 }
 
 /// Go `storedMemberCanOpenGroupSettings`.
@@ -745,6 +809,32 @@ pub fn stored_member_can_open_group_settings(member: Option<&ChatMemberRecord>) 
         member.status == CHAT_MEMBER_STATUS_CREATOR
             || member.status == CHAT_MEMBER_STATUS_ADMINISTRATOR
                 && member.can_promote_members == Some(true)
+    })
+}
+
+/// Go `storedAdminChatMember` without Telegram SDK types.
+#[must_use]
+pub fn stored_admin_chat_member(member: &ChatMemberRecord) -> Option<StoredAdminChatMember> {
+    if member.status != CHAT_MEMBER_STATUS_ADMINISTRATOR
+        && member.status != CHAT_MEMBER_STATUS_CREATOR
+    {
+        return None;
+    }
+
+    Some(StoredAdminChatMember {
+        user_id: member.user_id,
+        status: member.status.clone(),
+        is_anonymous: member.is_anonymous,
+        custom_title: member.custom_title.clone(),
+        can_delete_messages: member.can_delete_messages,
+        can_manage_video_chats: member.can_manage_video_chats,
+        can_restrict_members: member.can_restrict_members,
+        can_promote_members: member.can_promote_members,
+        can_change_info: member.can_change_info,
+        can_invite_users: member.can_invite_users,
+        can_post_messages: member.can_post_messages,
+        can_edit_messages: member.can_edit_messages,
+        can_pin_messages: member.can_pin_messages,
     })
 }
 
@@ -2060,6 +2150,10 @@ mod tests {
             "SELECT * FROM chat_members WHERE chat_id = $1 AND user_id = $2"
         );
         assert_eq!(
+            super::SQL_LIST_CHAT_MEMBERS,
+            "SELECT * FROM chat_members WHERE chat_id = $1"
+        );
+        assert_eq!(
             super::SQL_UPSERT_CHAT_MEMBER,
             "INSERT INTO chat_members (chat_id, user_id, status, is_anonymous, custom_title, can_be_edited, can_manage_chat, can_delete_messages, can_manage_video_chats, can_restrict_members, can_promote_members, can_change_info, can_invite_users, can_post_messages, can_edit_messages, can_pin_messages, can_manage_topics, can_send_messages, can_send_media_messages, can_send_polls, can_send_other_messages, can_add_web_page_previews, until_date) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23) ON CONFLICT (chat_id, user_id) DO UPDATE SET status = COALESCE(EXCLUDED.status, chat_members.status), is_anonymous = COALESCE(EXCLUDED.is_anonymous, chat_members.is_anonymous), custom_title = COALESCE(EXCLUDED.custom_title, chat_members.custom_title), can_be_edited = COALESCE(EXCLUDED.can_be_edited, chat_members.can_be_edited), can_manage_chat = COALESCE(EXCLUDED.can_manage_chat, chat_members.can_manage_chat), can_delete_messages = COALESCE(EXCLUDED.can_delete_messages, chat_members.can_delete_messages), can_manage_video_chats = COALESCE(EXCLUDED.can_manage_video_chats, chat_members.can_manage_video_chats), can_restrict_members = COALESCE(EXCLUDED.can_restrict_members, chat_members.can_restrict_members), can_promote_members = COALESCE(EXCLUDED.can_promote_members, chat_members.can_promote_members), can_change_info = COALESCE(EXCLUDED.can_change_info, chat_members.can_change_info), can_invite_users = COALESCE(EXCLUDED.can_invite_users, chat_members.can_invite_users), can_post_messages = COALESCE(EXCLUDED.can_post_messages, chat_members.can_post_messages), can_edit_messages = COALESCE(EXCLUDED.can_edit_messages, chat_members.can_edit_messages), can_pin_messages = COALESCE(EXCLUDED.can_pin_messages, chat_members.can_pin_messages), can_manage_topics = COALESCE(EXCLUDED.can_manage_topics, chat_members.can_manage_topics), can_send_messages = COALESCE(EXCLUDED.can_send_messages, chat_members.can_send_messages), can_send_media_messages = COALESCE(EXCLUDED.can_send_media_messages, chat_members.can_send_media_messages), can_send_polls = COALESCE(EXCLUDED.can_send_polls, chat_members.can_send_polls), can_send_other_messages = COALESCE(EXCLUDED.can_send_other_messages, chat_members.can_send_other_messages), can_add_web_page_previews = COALESCE(EXCLUDED.can_add_web_page_previews, chat_members.can_add_web_page_previews), until_date = COALESCE(EXCLUDED.until_date, chat_members.until_date), updated_at = CURRENT_TIMESTAMP"
         );
@@ -2096,6 +2190,45 @@ mod tests {
             &non_promoting_admin
         )));
         assert!(!super::stored_member_can_open_group_settings(None));
+    }
+
+    #[test]
+    fn stored_admin_chat_member_maps_go_admin_permissions() {
+        let admin = super::ChatMemberRecord {
+            chat_id: -10042,
+            user_id: 42,
+            status: super::CHAT_MEMBER_STATUS_ADMINISTRATOR.to_owned(),
+            is_anonymous: Some(true),
+            custom_title: Some("Boss".to_owned()),
+            can_delete_messages: Some(true),
+            can_manage_video_chats: Some(true),
+            can_restrict_members: Some(true),
+            can_promote_members: Some(true),
+            can_change_info: Some(true),
+            can_invite_users: Some(true),
+            can_post_messages: Some(true),
+            can_edit_messages: Some(true),
+            can_pin_messages: Some(true),
+            ..super::ChatMemberRecord::default()
+        };
+        let regular_member = super::ChatMemberRecord {
+            chat_id: -10042,
+            user_id: 43,
+            status: super::CHAT_MEMBER_STATUS_MEMBER.to_owned(),
+            ..super::ChatMemberRecord::default()
+        };
+
+        let stored_admin =
+            super::stored_admin_chat_member(&admin).expect("admin should map from stored row");
+
+        assert_eq!(stored_admin.user_id, 42);
+        assert_eq!(stored_admin.status, super::CHAT_MEMBER_STATUS_ADMINISTRATOR);
+        assert_eq!(stored_admin.is_anonymous, Some(true));
+        assert_eq!(stored_admin.custom_title.as_deref(), Some("Boss"));
+        assert_eq!(stored_admin.can_delete_messages, Some(true));
+        assert_eq!(stored_admin.can_manage_video_chats, Some(true));
+        assert_eq!(stored_admin.can_promote_members, Some(true));
+        assert!(super::stored_admin_chat_member(&regular_member).is_none());
     }
 
     #[test]
@@ -2920,6 +3053,9 @@ mod tests {
                 "Go COALESCE upsert preserves nullable permissions when later writes omit them"
             );
             assert_eq!(member.can_delete_messages, Some(false));
+            let members = store.list_chat_members(chat_id).await?;
+            assert_eq!(members.len(), 1);
+            assert_eq!(members[0].user_id, user_id);
 
             Ok(())
         }
