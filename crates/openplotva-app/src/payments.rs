@@ -19,7 +19,8 @@ use carapax::types::{
     User as TelegramUser,
 };
 use openplotva_core::{
-    UserState, VIP_EVENT_TYPE_ADMIN_ADJUSTMENT, VIP_EVENT_TYPE_PAYMENT, vip_days_to_seconds,
+    UserState, VIP_EVENT_TYPE_ADMIN_ADJUSTMENT, VIP_EVENT_TYPE_ADMIN_REVOKE,
+    VIP_EVENT_TYPE_PAYMENT, vip_days_to_seconds,
 };
 use openplotva_storage::{
     DonationCreate, DonationRecord, PostgresPaymentStore, PostgresVipStore,
@@ -342,6 +343,36 @@ pub struct AdminGrantVipCommandReport {
     pub error: Option<String>,
 }
 
+/// Result class for Go `/admin_cancel_vip` command handling.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdminCancelVipCommandOutcome {
+    /// VIP was revoked through an admin ledger event.
+    Revoked,
+    /// The refund branch is intentionally left outside this revoke slice.
+    RefundNotPorted,
+    /// The target argument was missing or invalid.
+    TargetError,
+    /// Active VIP summary lookup failed.
+    StatusLookupError,
+    /// The target user does not have an active VIP status.
+    NoActiveVip,
+    /// The admin-revoke ledger event could not be written.
+    RevokeStorageError,
+}
+
+/// Report for Go `/admin_cancel_vip` command handling.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminCancelVipCommandReport {
+    /// Observable route/outcome.
+    pub outcome: AdminCancelVipCommandOutcome,
+    /// Target user affected by the command, when resolved.
+    pub target_user_id: Option<i64>,
+    /// Created VIP event ID, when an event was written.
+    pub event_id: Option<i64>,
+    /// Human-readable storage/target error, when Go would include or log one.
+    pub error: Option<String>,
+}
+
 /// Payment-specific taskman control-job execution report.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PaymentControlJobReport {
@@ -596,6 +627,30 @@ pub trait AdminGrantVipStore {
     ) -> PaymentStoreFuture<'a, VipEventRecord, Self::Error>;
 }
 
+/// Storage boundary needed by Go `/admin_cancel_vip`.
+pub trait AdminCancelVipStore {
+    /// Error returned by the concrete storage implementation.
+    type Error: fmt::Display + Send + Sync + 'static;
+
+    /// Resolve a remembered Telegram username to a user ID using Go `GetUserByUsername`.
+    fn get_user_id_by_username<'a>(
+        &'a self,
+        username: &'a str,
+    ) -> PaymentStoreFuture<'a, Option<i64>, Self::Error>;
+
+    /// Load the latest VIP ledger summary for active-status checks.
+    fn get_vip_summary_by_user<'a>(
+        &'a self,
+        user_id: i64,
+    ) -> PaymentStoreFuture<'a, Option<VipSummaryRecord>, Self::Error>;
+
+    /// Create a VIP ledger event.
+    fn create_admin_cancel_vip_event<'a>(
+        &'a self,
+        event: VipEventCreate<'a>,
+    ) -> PaymentStoreFuture<'a, VipEventRecord, Self::Error>;
+}
+
 /// VIP predicate boundary matching Go `Fetcher.IsVIP` before existing-status rendering.
 pub trait VipStatusChecker {
     /// Return whether this user should see existing VIP status instead of a new invoice.
@@ -676,6 +731,45 @@ where
     }
 
     fn invalidate_admin_grant_vip_cache<'a>(
+        &'a self,
+        user_id: i64,
+    ) -> PaymentEffectsFuture<'a, Self::Error> {
+        <T as SuccessfulPaymentEffects>::invalidate_vip_cache(self, user_id)
+    }
+}
+
+/// Side-effect boundary for Go `/admin_cancel_vip` replies and cache invalidation.
+pub trait AdminCancelVipEffects {
+    /// Error returned by the concrete side-effect implementation.
+    type Error: fmt::Display + Send + Sync + 'static;
+
+    /// Send a plain Go `SendText` reply for `/admin_cancel_vip`.
+    fn send_admin_cancel_vip_text<'a>(
+        &'a self,
+        message: PaymentTextMessage<'a>,
+    ) -> PaymentEffectsFuture<'a, Self::Error>;
+
+    /// Invalidate cached VIP status after a successful cancel/revoke operation.
+    fn invalidate_admin_cancel_vip_cache<'a>(
+        &'a self,
+        user_id: i64,
+    ) -> PaymentEffectsFuture<'a, Self::Error>;
+}
+
+impl<T> AdminCancelVipEffects for T
+where
+    T: SuccessfulPaymentEffects,
+{
+    type Error = T::Error;
+
+    fn send_admin_cancel_vip_text<'a>(
+        &'a self,
+        message: PaymentTextMessage<'a>,
+    ) -> PaymentEffectsFuture<'a, Self::Error> {
+        self.send_text(message)
+    }
+
+    fn invalidate_admin_cancel_vip_cache<'a>(
         &'a self,
         user_id: i64,
     ) -> PaymentEffectsFuture<'a, Self::Error> {
@@ -2211,6 +2305,31 @@ impl AdminGrantVipStore for PostgresSuccessfulPaymentStore {
     }
 }
 
+impl AdminCancelVipStore for PostgresSuccessfulPaymentStore {
+    type Error = StorageError;
+
+    fn get_user_id_by_username<'a>(
+        &'a self,
+        username: &'a str,
+    ) -> PaymentStoreFuture<'a, Option<i64>, Self::Error> {
+        Box::pin(async move { self.users.get_user_id_by_username(username).await })
+    }
+
+    fn get_vip_summary_by_user<'a>(
+        &'a self,
+        user_id: i64,
+    ) -> PaymentStoreFuture<'a, Option<VipSummaryRecord>, Self::Error> {
+        Box::pin(async move { self.vip.get_vip_summary_by_user(user_id).await })
+    }
+
+    fn create_admin_cancel_vip_event<'a>(
+        &'a self,
+        event: VipEventCreate<'a>,
+    ) -> PaymentStoreFuture<'a, VipEventRecord, Self::Error> {
+        Box::pin(async move { self.vip.create_vip_event(event).await })
+    }
+}
+
 impl VipStatusStore for PostgresSuccessfulPaymentStore {
     type Error = StorageError;
 
@@ -2905,6 +3024,30 @@ pub struct AdminGrantVipCommand<'value> {
     pub arguments: &'value str,
 }
 
+/// Parsed Go `/admin_cancel_vip` command arguments.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AdminCancelVipCommandArgs {
+    /// First positional argument, the user target.
+    pub target: String,
+    /// Whether the second positional argument requests a Telegram refund.
+    pub with_refund: bool,
+    /// Whether a target argument was present.
+    pub has_target: bool,
+}
+
+/// Minimal Go message context needed to execute `/admin_cancel_vip`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AdminCancelVipCommand<'value> {
+    /// Chat where the admin command was received.
+    pub chat_id: i64,
+    /// Command message ID used as the reply target for Go `SendText`.
+    pub message_id: i32,
+    /// Telegram user ID of the admin who issued the command.
+    pub actor_user_id: i64,
+    /// Raw `CommandArguments()` text after `/admin_cancel_vip`.
+    pub arguments: &'value str,
+}
+
 /// Parse Go `/admin_grant_vip` positional arguments without changing field semantics.
 #[must_use]
 pub fn parse_admin_grant_vip_command_args(raw: &str) -> AdminGrantVipCommandArgs {
@@ -2930,6 +3073,85 @@ pub fn parse_admin_grant_vip_command_args(raw: &str) -> AdminGrantVipCommandArgs
     }
     args.reason = reason;
     args
+}
+
+/// Parse Go `/admin_cancel_vip` positional arguments without changing field semantics.
+#[must_use]
+pub fn parse_admin_cancel_vip_command_args(raw: &str) -> AdminCancelVipCommandArgs {
+    let mut args = AdminCancelVipCommandArgs::default();
+    for (index, arg) in raw.split_whitespace().enumerate() {
+        match index {
+            0 => {
+                args.target = arg.to_owned();
+                args.has_target = true;
+            }
+            1 => {
+                args.with_refund = admin_cancel_vip_refund_flag(arg);
+                return args;
+            }
+            _ => return args,
+        }
+    }
+    args
+}
+
+/// Go refund flag parser for `/admin_cancel_vip`.
+#[must_use]
+pub fn admin_cancel_vip_refund_flag(refund_arg: &str) -> bool {
+    refund_arg.eq_ignore_ascii_case("true")
+        || refund_arg == "1"
+        || refund_arg.eq_ignore_ascii_case("yes")
+}
+
+/// Go `/admin_cancel_vip` target parse error text.
+#[must_use]
+pub fn admin_cancel_vip_parse_error_text(error: &str) -> &'static str {
+    match error {
+        "missing user identifier" => {
+            "⚠️ Пожалуйста, укажите ID пользователя или @username.\n\
+             Использование: /admin_cancel_vip [user_id или @username] [refund:true/false]\n\n\
+             Пример:\n\
+             • /admin_cancel_vip 123456\n\
+             • /admin_cancel_vip 123456 true\n\
+             • /admin_cancel_vip @username false"
+        }
+        "username resolution not supported yet" => {
+            "❌ Поиск по username временно не поддерживается. Используйте User ID."
+        }
+        _ => "❌ Неверный формат User ID. Используйте числовой ID.",
+    }
+}
+
+/// Go `/admin_cancel_vip` success text.
+#[must_use]
+pub fn admin_cancel_vip_success_text(
+    target_user_id: i64,
+    original_expires_at: OffsetDateTime,
+    with_refund: bool,
+    updated_summary: Option<&VipSummaryRecord>,
+    now: OffsetDateTime,
+) -> String {
+    let mut text = format!(
+        "✅ VIP статус успешно обработан!\n\n\
+         👤 User ID: {target_user_id}\n\
+         📅 Был действителен до: {}\n",
+        go_date_time(original_expires_at)
+    );
+    if with_refund {
+        text.push_str("💸 Возврат средств: выполнен\n");
+    } else {
+        text.push_str(&format!(
+            "⏰ Отозван администратором: {}\n",
+            go_date_time(now)
+        ));
+    }
+    if let Some(summary) = updated_summary {
+        text.push_str(&format!(
+            "📌 Остаток VIP после операции: до {}\n",
+            go_date_time(summary.effective_expires_at)
+        ));
+    }
+    text
 }
 
 /// Parse Go `/admin_grant_vip` duration with its default and invalid-duration flag.
@@ -3169,6 +3391,179 @@ async fn send_admin_grant_vip_text<Effects>(
 {
     let _ = effects
         .send_admin_grant_vip_text(PaymentTextMessage {
+            chat_id: command.chat_id,
+            reply_to_message_id: command.message_id,
+            text,
+            parse_mode: "",
+        })
+        .await;
+}
+
+const ADMIN_CANCEL_VIP_STATUS_ERROR_TEXT: &str = "❌ Ошибка при проверке статуса VIP пользователя.";
+const ADMIN_CANCEL_VIP_REVOKE_ERROR_TEXT: &str = "❌ Не удалось отозвать VIP. Ошибка базы данных.";
+const ADMIN_CANCEL_VIP_REFUND_NOT_PORTED_ERROR: &str =
+    "admin cancel VIP refund path is not ported yet";
+
+/// Execute the non-refund Go `/admin_cancel_vip` revoke storage and side-effect behavior.
+pub async fn handle_admin_cancel_vip_command_at<Store, Effects>(
+    store: &Store,
+    effects: &Effects,
+    command: AdminCancelVipCommand<'_>,
+    now: OffsetDateTime,
+) -> AdminCancelVipCommandReport
+where
+    Store: AdminCancelVipStore + Sync,
+    Effects: AdminCancelVipEffects + Sync,
+{
+    let args = parse_admin_cancel_vip_command_args(command.arguments);
+    let target_user_id = match admin_cancel_vip_target(store, &args).await {
+        Ok(target_user_id) => target_user_id,
+        Err(error) => {
+            send_admin_cancel_vip_text(
+                effects,
+                &command,
+                admin_cancel_vip_parse_error_text(&error),
+            )
+            .await;
+            return AdminCancelVipCommandReport {
+                outcome: AdminCancelVipCommandOutcome::TargetError,
+                target_user_id: None,
+                event_id: None,
+                error: Some(error),
+            };
+        }
+    };
+
+    let summary = match store.get_vip_summary_by_user(target_user_id).await {
+        Ok(Some(summary)) if active_admin_cancel_vip_summary_at(&summary, now) => summary,
+        Ok(_) => {
+            let text = format!("ℹ️ У пользователя {target_user_id} нет активного VIP статуса.");
+            send_admin_cancel_vip_text(effects, &command, &text).await;
+            return AdminCancelVipCommandReport {
+                outcome: AdminCancelVipCommandOutcome::NoActiveVip,
+                target_user_id: Some(target_user_id),
+                event_id: None,
+                error: None,
+            };
+        }
+        Err(error) => {
+            send_admin_cancel_vip_text(effects, &command, ADMIN_CANCEL_VIP_STATUS_ERROR_TEXT).await;
+            return AdminCancelVipCommandReport {
+                outcome: AdminCancelVipCommandOutcome::StatusLookupError,
+                target_user_id: Some(target_user_id),
+                event_id: None,
+                error: Some(error.to_string()),
+            };
+        }
+    };
+
+    if args.with_refund {
+        return AdminCancelVipCommandReport {
+            outcome: AdminCancelVipCommandOutcome::RefundNotPorted,
+            target_user_id: Some(target_user_id),
+            event_id: None,
+            error: Some(ADMIN_CANCEL_VIP_REFUND_NOT_PORTED_ERROR.to_owned()),
+        };
+    }
+
+    let reason = format!("telegram admin revoke by {}", command.actor_user_id);
+    let event = match store
+        .create_admin_cancel_vip_event(VipEventCreate {
+            user_id: target_user_id,
+            event_type: VIP_EVENT_TYPE_ADMIN_REVOKE,
+            delta_seconds: -summary.remaining_seconds,
+            subscription_id: None,
+            actor_user_id: Some(command.actor_user_id),
+            reason: Some(&reason),
+        })
+        .await
+    {
+        Ok(event) => event,
+        Err(error) => {
+            send_admin_cancel_vip_text(effects, &command, ADMIN_CANCEL_VIP_REVOKE_ERROR_TEXT).await;
+            return AdminCancelVipCommandReport {
+                outcome: AdminCancelVipCommandOutcome::RevokeStorageError,
+                target_user_id: Some(target_user_id),
+                event_id: None,
+                error: Some(error.to_string()),
+            };
+        }
+    };
+
+    let _ = effects
+        .invalidate_admin_cancel_vip_cache(target_user_id)
+        .await;
+    let updated_summary = match store.get_vip_summary_by_user(target_user_id).await {
+        Ok(Some(summary)) if active_admin_cancel_vip_summary_at(&summary, now) => Some(summary),
+        _ => None,
+    };
+    let success = admin_cancel_vip_success_text(
+        target_user_id,
+        summary.effective_expires_at,
+        false,
+        updated_summary.as_ref(),
+        now,
+    );
+    send_admin_cancel_vip_text(effects, &command, &success).await;
+
+    AdminCancelVipCommandReport {
+        outcome: AdminCancelVipCommandOutcome::Revoked,
+        target_user_id: Some(target_user_id),
+        event_id: Some(event.id),
+        error: None,
+    }
+}
+
+async fn admin_cancel_vip_target<Store>(
+    store: &Store,
+    args: &AdminCancelVipCommandArgs,
+) -> Result<i64, String>
+where
+    Store: AdminCancelVipStore + Sync,
+{
+    if !args.has_target {
+        return Err("missing user identifier".to_owned());
+    }
+    parse_admin_cancel_vip_target_identifier(store, &args.target).await
+}
+
+async fn parse_admin_cancel_vip_target_identifier<Store>(
+    store: &Store,
+    identifier: &str,
+) -> Result<i64, String>
+where
+    Store: AdminCancelVipStore + Sync,
+{
+    if let Ok(user_id) = identifier.parse::<i64>() {
+        return Ok(user_id);
+    }
+    if let Some(username) = identifier.strip_prefix('@') {
+        return match store.get_user_id_by_username(username).await {
+            Ok(Some(user_id)) => Ok(user_id),
+            Ok(None) => Err(format!("user with username {identifier} not found")),
+            Err(error) => Err(format!(
+                "user with username {identifier} not found: {error}"
+            )),
+        };
+    }
+    Err(format!(
+        "invalid user identifier format: {identifier} (must be user_id or @username)"
+    ))
+}
+
+fn active_admin_cancel_vip_summary_at(summary: &VipSummaryRecord, now: OffsetDateTime) -> bool {
+    summary.is_active && now < summary.effective_expires_at
+}
+
+async fn send_admin_cancel_vip_text<Effects>(
+    effects: &Effects,
+    command: &AdminCancelVipCommand<'_>,
+    text: &str,
+) where
+    Effects: AdminCancelVipEffects + Sync,
+{
+    let _ = effects
+        .send_admin_cancel_vip_text(PaymentTextMessage {
             chat_id: command.chat_id,
             reply_to_message_id: command.message_id,
             text,
@@ -4003,7 +4398,8 @@ mod tests {
     use crate::updates::{UpdateHandler, UpdateHandlerFuture};
     use carapax::types::Update as TelegramUpdate;
     use openplotva_core::{
-        UserState, VIP_EVENT_TYPE_ADMIN_ADJUSTMENT, VIP_EVENT_TYPE_PAYMENT, vip_days_to_seconds,
+        UserState, VIP_EVENT_TYPE_ADMIN_ADJUSTMENT, VIP_EVENT_TYPE_ADMIN_REVOKE,
+        VIP_EVENT_TYPE_PAYMENT, vip_days_to_seconds,
     };
     use openplotva_storage::{
         DonationCreate, DonationRecord, SubscriptionCreate, SubscriptionRecord, VipCacheRecord,
@@ -4927,6 +5323,170 @@ mod tests {
         assert_eq!(
             effects.sent_texts(),
             vec!["❌ user with username https://t.me/missing not found"]
+        );
+    }
+
+    #[test]
+    fn admin_cancel_vip_command_args_and_error_texts_match_go() {
+        let missing = super::parse_admin_cancel_vip_command_args(" ");
+        assert!(!missing.has_target);
+        assert!(!missing.with_refund);
+
+        let revoke = super::parse_admin_cancel_vip_command_args("42");
+        assert!(revoke.has_target);
+        assert_eq!(revoke.target, "42");
+        assert!(!revoke.with_refund);
+
+        for raw in ["42 true", "42 TRUE", "42 1", "42 yes", "42 YES"] {
+            assert!(
+                super::parse_admin_cancel_vip_command_args(raw).with_refund,
+                "{raw} should request refund"
+            );
+        }
+        for raw in ["42 false", "42 no", "42 0", "42 nope"] {
+            assert!(
+                !super::parse_admin_cancel_vip_command_args(raw).with_refund,
+                "{raw} should not request refund"
+            );
+        }
+
+        assert!(
+            super::admin_cancel_vip_parse_error_text("missing user identifier")
+                .contains("Использование: /admin_cancel_vip")
+        );
+        assert_eq!(
+            super::admin_cancel_vip_parse_error_text("user with username @missing not found"),
+            "❌ Неверный формат User ID. Используйте числовой ID."
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_cancel_vip_command_records_revoke_event_and_success_reply()
+    -> Result<(), Box<dyn Error>> {
+        let now = time::Date::from_calendar_date(2026, time::Month::May, 20)?
+            .with_hms(12, 0, 0)?
+            .assume_utc();
+        let expires_at = now + time::Duration::days(5);
+        let store = StoreStub::new()
+            .with_admin_cancel_summary(active_vip_summary(now, expires_at))
+            .with_admin_cancel_updated_summary(None)
+            .with_next_vip_event(VipEventRecord {
+                id: 93,
+                user_id: 42,
+                event_type: VIP_EVENT_TYPE_ADMIN_REVOKE.to_owned(),
+                delta_seconds: -time::Duration::days(5).whole_seconds(),
+                effective_expires_at: now,
+                subscription_id: None,
+                actor_user_id: Some(7),
+                reason: "telegram admin revoke by 7".to_owned(),
+                created_at: now,
+            });
+        let effects = EffectsStub::default();
+
+        let report = super::handle_admin_cancel_vip_command_at(
+            &store,
+            &effects,
+            super::AdminCancelVipCommand {
+                chat_id: 900,
+                message_id: 101,
+                actor_user_id: 7,
+                arguments: "42",
+            },
+            now,
+        )
+        .await;
+
+        assert_eq!(report.outcome, super::AdminCancelVipCommandOutcome::Revoked);
+        assert_eq!(
+            store.vip_events(),
+            vec![VipEventCreate {
+                user_id: 42,
+                event_type: VIP_EVENT_TYPE_ADMIN_REVOKE,
+                delta_seconds: -time::Duration::days(5).whole_seconds(),
+                subscription_id: None,
+                actor_user_id: Some(7),
+                reason: Some("telegram admin revoke by 7"),
+            }]
+        );
+        assert_eq!(effects.invalidated_vip_users(), vec![42]);
+        let sent = effects.sent_payment_texts();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].chat_id, 900);
+        assert_eq!(sent[0].reply_to_message_id, 101);
+        assert!(sent[0].text.contains("VIP статус успешно обработан"));
+        assert!(sent[0].text.contains("User ID: 42"));
+        assert!(
+            sent[0]
+                .text
+                .contains("Был действителен до: 25.05.2026 12:00")
+        );
+        assert!(
+            sent[0]
+                .text
+                .contains("Отозван администратором: 20.05.2026 12:00")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_cancel_vip_command_reports_no_active_status() {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let store = StoreStub::new().with_admin_cancel_updated_summary(None);
+        let effects = EffectsStub::default();
+
+        let report = super::handle_admin_cancel_vip_command_at(
+            &store,
+            &effects,
+            super::AdminCancelVipCommand {
+                chat_id: 900,
+                message_id: 101,
+                actor_user_id: 7,
+                arguments: "42",
+            },
+            now,
+        )
+        .await;
+
+        assert_eq!(
+            report.outcome,
+            super::AdminCancelVipCommandOutcome::NoActiveVip
+        );
+        assert!(store.vip_events().is_empty());
+        assert!(effects.invalidated_vip_users().is_empty());
+        assert_eq!(
+            effects.sent_texts(),
+            vec!["ℹ️ У пользователя 42 нет активного VIP статуса."]
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_cancel_vip_command_reports_status_lookup_error() {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let store = StoreStub::new().with_admin_cancel_summary_error(StubError::Request);
+        let effects = EffectsStub::default();
+
+        let report = super::handle_admin_cancel_vip_command_at(
+            &store,
+            &effects,
+            super::AdminCancelVipCommand {
+                chat_id: 900,
+                message_id: 101,
+                actor_user_id: 7,
+                arguments: "42",
+            },
+            now,
+        )
+        .await;
+
+        assert_eq!(
+            report.outcome,
+            super::AdminCancelVipCommandOutcome::StatusLookupError
+        );
+        assert!(store.vip_events().is_empty());
+        assert!(effects.invalidated_vip_users().is_empty());
+        assert_eq!(
+            effects.sent_texts(),
+            vec!["❌ Ошибка при проверке статуса VIP пользователя."]
         );
     }
 
@@ -7025,6 +7585,7 @@ mod tests {
         existing_subscription: Option<SubscriptionRecord>,
         next_donations: VecDeque<DonationRecord>,
         next_vip_events: VecDeque<VipEventRecord>,
+        admin_cancel_summaries: VecDeque<Result<Option<VipSummaryRecord>, StubError>>,
     }
 
     impl StoreStub {
@@ -7061,6 +7622,23 @@ mod tests {
             self.lock()
                 .username_users
                 .push((username.to_owned(), user_id));
+            self
+        }
+
+        fn with_admin_cancel_summary(self, summary: VipSummaryRecord) -> Self {
+            self.lock()
+                .admin_cancel_summaries
+                .push_back(Ok(Some(summary)));
+            self
+        }
+
+        fn with_admin_cancel_summary_error(self, error: StubError) -> Self {
+            self.lock().admin_cancel_summaries.push_back(Err(error));
+            self
+        }
+
+        fn with_admin_cancel_updated_summary(self, summary: Option<VipSummaryRecord>) -> Self {
+            self.lock().admin_cancel_summaries.push_back(Ok(summary));
             self
         }
 
@@ -7204,6 +7782,44 @@ mod tests {
         }
 
         fn create_admin_vip_event<'a>(
+            &'a self,
+            event: VipEventCreate<'a>,
+        ) -> PaymentStoreFuture<'a, VipEventRecord, Self::Error> {
+            <Self as SuccessfulPaymentStore>::create_vip_event(self, event)
+        }
+    }
+
+    impl super::AdminCancelVipStore for StoreStub {
+        type Error = StubError;
+
+        fn get_user_id_by_username<'a>(
+            &'a self,
+            username: &'a str,
+        ) -> PaymentStoreFuture<'a, Option<i64>, Self::Error> {
+            Box::pin(async move {
+                Ok(self
+                    .lock()
+                    .username_users
+                    .iter()
+                    .find_map(|(stored, user_id)| (stored == username).then_some(*user_id)))
+            })
+        }
+
+        fn get_vip_summary_by_user<'a>(
+            &'a self,
+            _user_id: i64,
+        ) -> PaymentStoreFuture<'a, Option<VipSummaryRecord>, Self::Error> {
+            Box::pin(async move {
+                Ok(self
+                    .lock()
+                    .admin_cancel_summaries
+                    .pop_front()
+                    .transpose()?
+                    .flatten())
+            })
+        }
+
+        fn create_admin_cancel_vip_event<'a>(
             &'a self,
             event: VipEventCreate<'a>,
         ) -> PaymentStoreFuture<'a, VipEventRecord, Self::Error> {
