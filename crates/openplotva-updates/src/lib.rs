@@ -10,10 +10,10 @@ use std::{
 
 use carapax::types::{
     AllowedUpdate as TelegramAllowedUpdate, Chat as TelegramChat, MaybeInaccessibleMessage,
-    PollAnswerVoter, Update as TelegramUpdate, UpdateType as TelegramUpdateType,
-    User as TelegramUser,
+    Message as TelegramMessage, MessageData as TelegramMessageData, PollAnswerVoter,
+    Update as TelegramUpdate, UpdateType as TelegramUpdateType, User as TelegramUser,
 };
-use openplotva_core::{ChatState, UpdateState, UserState};
+use openplotva_core::{ChatAttachment, ChatState, UpdateState, UserState};
 use redis::Client as RedisClient;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -422,6 +422,17 @@ pub struct UpdateProducerRunReport {
     pub source_closed: bool,
 }
 
+/// Options for extracting Go-shaped attachment metadata from a Telegram message.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TelegramMessageAttachmentOptions {
+    /// Attachment source; blanks default to Go's `message`.
+    pub source: String,
+    /// Caption supplied by the caller, trimmed before use.
+    pub caption: String,
+    /// Whether Go should promote the first image-like ref for inbound history.
+    pub promote_first_image_ref: bool,
+}
+
 /// Run Go's update producer loop over an abstract source and queue.
 pub async fn run_update_producer_until<S, Q, Stop>(
     source: &S,
@@ -680,6 +691,29 @@ pub fn extract_update_state(update: &TelegramUpdate) -> Option<UpdateState> {
     UpdateState::new(chat, user)
 }
 
+/// Extract Go `utils.TelegramMessageAttachments` metadata from a Telegram message.
+#[must_use]
+pub fn telegram_message_attachments(
+    message: &TelegramMessage,
+    opts: TelegramMessageAttachmentOptions,
+) -> Vec<ChatAttachment> {
+    let source = telegram_attachment_source(&opts.source);
+    let caption = opts.caption.trim();
+    let mut out = Vec::with_capacity(2);
+
+    append_telegram_image_attachment(
+        &mut out,
+        &message.data,
+        &source,
+        caption,
+        opts.promote_first_image_ref,
+    );
+    append_telegram_file_attachments(&mut out, &message.data, &source, caption);
+    append_telegram_contact_attachments(&mut out, &message.data, &source);
+
+    out
+}
+
 /// Return whether Go would skip user-visible side effects for this update age.
 pub fn should_skip_side_effects_at(
     update: &TelegramUpdate,
@@ -753,6 +787,180 @@ fn user_state(user: &TelegramUser) -> UserState {
         user.language_code.clone(),
         Some(user.is_premium.unwrap_or(false)),
     )
+}
+
+fn telegram_attachment_source(source: &str) -> String {
+    let source = source.trim();
+    if source.is_empty() {
+        "message".to_owned()
+    } else {
+        source.to_owned()
+    }
+}
+
+fn append_telegram_image_attachment(
+    out: &mut Vec<ChatAttachment>,
+    data: &TelegramMessageData,
+    source: &str,
+    caption: &str,
+    promote: bool,
+) {
+    if promote {
+        if let Some(attachment) = telegram_first_image_attachment(data, source, caption) {
+            out.push(attachment);
+        }
+        return;
+    }
+
+    if let TelegramMessageData::Photo(photo) = data
+        && let Some(ref_data) = photo.data.last()
+    {
+        out.push(ChatAttachment {
+            kind: "image".to_owned(),
+            source: source.to_owned(),
+            file_unique_id: ref_data.file_unique_id.clone(),
+            caption: caption.to_owned(),
+            ..ChatAttachment::default()
+        });
+    }
+}
+
+fn append_telegram_file_attachments(
+    out: &mut Vec<ChatAttachment>,
+    data: &TelegramMessageData,
+    source: &str,
+    caption: &str,
+) {
+    match data {
+        TelegramMessageData::Video(video) => out.push(ChatAttachment {
+            kind: "video".to_owned(),
+            source: source.to_owned(),
+            file_unique_id: video.data.file_unique_id.clone(),
+            file_name: video.data.file_name.clone().unwrap_or_default(),
+            mime_type: video.data.mime_type.clone().unwrap_or_default(),
+            caption: caption.to_owned(),
+            duration_seconds: video.data.duration,
+            ..ChatAttachment::default()
+        }),
+        TelegramMessageData::Audio(audio) => out.push(ChatAttachment {
+            kind: "audio".to_owned(),
+            source: source.to_owned(),
+            file_unique_id: audio.data.file_unique_id.clone(),
+            file_name: audio.data.file_name.clone().unwrap_or_default(),
+            mime_type: audio.data.mime_type.clone().unwrap_or_default(),
+            caption: caption.to_owned(),
+            duration_seconds: audio.data.duration,
+            performer: audio.data.performer.clone().unwrap_or_default(),
+            title: audio.data.title.clone().unwrap_or_default(),
+            ..ChatAttachment::default()
+        }),
+        TelegramMessageData::Voice(voice) => out.push(ChatAttachment {
+            kind: "voice".to_owned(),
+            source: source.to_owned(),
+            file_unique_id: voice.data.file_unique_id.clone(),
+            duration_seconds: voice.data.duration,
+            ..ChatAttachment::default()
+        }),
+        TelegramMessageData::Document(document) => out.push(ChatAttachment {
+            kind: "document".to_owned(),
+            source: source.to_owned(),
+            file_unique_id: document.data.file_unique_id.clone(),
+            file_name: document.data.file_name.clone().unwrap_or_default(),
+            mime_type: document.data.mime_type.clone().unwrap_or_default(),
+            caption: caption.to_owned(),
+            ..ChatAttachment::default()
+        }),
+        TelegramMessageData::Sticker(sticker) => out.push(ChatAttachment {
+            kind: "sticker".to_owned(),
+            source: source.to_owned(),
+            file_unique_id: sticker.file_unique_id.clone(),
+            content: sticker.emoji.clone().unwrap_or_default(),
+            ..ChatAttachment::default()
+        }),
+        _ => {}
+    }
+}
+
+fn append_telegram_contact_attachments(
+    out: &mut Vec<ChatAttachment>,
+    data: &TelegramMessageData,
+    source: &str,
+) {
+    match data {
+        TelegramMessageData::Location(location) => out.push(ChatAttachment {
+            kind: "location".to_owned(),
+            source: source.to_owned(),
+            latitude: Some(f64::from(location.latitude)),
+            longitude: Some(f64::from(location.longitude)),
+            ..ChatAttachment::default()
+        }),
+        TelegramMessageData::Venue(venue) => out.push(ChatAttachment {
+            kind: "venue".to_owned(),
+            source: source.to_owned(),
+            content: format!("{} {}", venue.title, venue.address)
+                .trim()
+                .to_owned(),
+            latitude: Some(f64::from(venue.location.latitude)),
+            longitude: Some(f64::from(venue.location.longitude)),
+            ..ChatAttachment::default()
+        }),
+        TelegramMessageData::Contact(contact) => out.push(ChatAttachment {
+            kind: "contact".to_owned(),
+            source: source.to_owned(),
+            phone: contact.phone_number.clone(),
+            first_name: contact.first_name.clone(),
+            last_name: contact.last_name.clone().unwrap_or_default(),
+            user_id: contact.user_id.unwrap_or_default(),
+            ..ChatAttachment::default()
+        }),
+        _ => {}
+    }
+}
+
+fn telegram_first_image_attachment(
+    data: &TelegramMessageData,
+    source: &str,
+    caption: &str,
+) -> Option<ChatAttachment> {
+    match data {
+        TelegramMessageData::Photo(photo) => photo.data.last().map(|ref_data| ChatAttachment {
+            kind: "image".to_owned(),
+            source: source.to_owned(),
+            file_unique_id: ref_data.file_unique_id.clone(),
+            caption: caption.to_owned(),
+            ..ChatAttachment::default()
+        }),
+        TelegramMessageData::Document(document)
+            if has_mime_prefix(
+                document.data.mime_type.as_deref().unwrap_or_default(),
+                "image/",
+            ) =>
+        {
+            Some(ChatAttachment {
+                kind: "image".to_owned(),
+                source: source.to_owned(),
+                file_unique_id: document.data.file_unique_id.clone(),
+                mime_type: document.data.mime_type.clone().unwrap_or_default(),
+                caption: caption.to_owned(),
+                ..ChatAttachment::default()
+            })
+        }
+        TelegramMessageData::Sticker(sticker) => Some(ChatAttachment {
+            kind: "image".to_owned(),
+            source: source.to_owned(),
+            file_unique_id: sticker.file_unique_id.clone(),
+            caption: caption.to_owned(),
+            ..ChatAttachment::default()
+        }),
+        _ => None,
+    }
+}
+
+fn has_mime_prefix(mime_type: &str, prefix: &str) -> bool {
+    let mime_type = mime_type.trim();
+    mime_type
+        .get(..prefix.len())
+        .is_some_and(|value| value.eq_ignore_ascii_case(prefix))
 }
 
 async fn run_stage<Fut, E>(stage: UpdateStage, timeout: Duration, task: Fut) -> UpdateStageReport
@@ -872,13 +1080,15 @@ mod tests {
 
     use super::{
         DEFAULT_UPDATE_QUEUE_KEY, EncodedUpdate, GO_ALLOWED_UPDATE_NAMES, GO_ALLOWED_UPDATES,
-        GoUpdateType, RedisUpdateQueue, UpdateCodecError, UpdateConsumerConfig,
-        UpdateProducerQueue, UpdateProducerQueueFuture, UpdateProducerSource,
+        GoUpdateType, RedisUpdateQueue, TelegramMessageAttachmentOptions, UpdateCodecError,
+        UpdateConsumerConfig, UpdateProducerQueue, UpdateProducerQueueFuture, UpdateProducerSource,
         UpdateProducerSourceFuture, UpdateStageOutcome, blpop_timeout_arg, extract_update_state,
         is_allowed_producer_update, process_update_at, producer_update_name, producer_update_type,
-        run_update_producer_until, update_name,
+        run_update_producer_until, telegram_message_attachments, update_name,
     };
-    use carapax::types::Update as TelegramUpdate;
+    use carapax::types::{
+        Message as TelegramMessage, Update as TelegramUpdate, UpdateType as TelegramUpdateType,
+    };
 
     #[test]
     fn queue_key_matches_go_update_queue() {
@@ -1471,6 +1681,283 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn telegram_message_attachments_promotes_image_document_like_go_utils()
+    -> Result<(), Box<dyn Error>> {
+        let update = serde_json::from_value(json!({
+            "update_id": 125,
+            "message": {
+                "message_id": 57,
+                "date": 1_710_000_000,
+                "chat": sample_private_chat_json(),
+                "from": sample_user_json(),
+                "caption": " diagram ",
+                "document": {
+                    "file_id": "doc-file",
+                    "file_unique_id": "doc-image",
+                    "file_name": "diagram.png",
+                    "mime_type": "image/png"
+                }
+            }
+        }))?;
+        let message = update_message(&update)?;
+
+        let got = telegram_message_attachments(
+            message,
+            TelegramMessageAttachmentOptions {
+                caption: "diagram".to_owned(),
+                promote_first_image_ref: true,
+                ..TelegramMessageAttachmentOptions::default()
+            },
+        );
+
+        assert_eq!(
+            got,
+            vec![
+                openplotva_core::ChatAttachment {
+                    kind: "image".to_owned(),
+                    source: "message".to_owned(),
+                    file_unique_id: "doc-image".to_owned(),
+                    mime_type: "image/png".to_owned(),
+                    caption: "diagram".to_owned(),
+                    ..openplotva_core::ChatAttachment::default()
+                },
+                openplotva_core::ChatAttachment {
+                    kind: "document".to_owned(),
+                    source: "message".to_owned(),
+                    file_unique_id: "doc-image".to_owned(),
+                    file_name: "diagram.png".to_owned(),
+                    mime_type: "image/png".to_owned(),
+                    caption: "diagram".to_owned(),
+                    ..openplotva_core::ChatAttachment::default()
+                },
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn telegram_message_attachments_promotes_uppercase_image_mime_like_go_utils()
+    -> Result<(), Box<dyn Error>> {
+        let update = serde_json::from_value(json!({
+            "update_id": 126,
+            "message": {
+                "message_id": 58,
+                "date": 1_710_000_000,
+                "chat": sample_private_chat_json(),
+                "from": sample_user_json(),
+                "document": {
+                    "file_id": "doc-file",
+                    "file_unique_id": "doc-image",
+                    "mime_type": " IMAGE/PNG "
+                }
+            }
+        }))?;
+        let message = update_message(&update)?;
+
+        let got = telegram_message_attachments(
+            message,
+            TelegramMessageAttachmentOptions {
+                source: " history ".to_owned(),
+                caption: " caption ".to_owned(),
+                promote_first_image_ref: true,
+            },
+        );
+
+        assert_eq!(got[0].kind, "image");
+        assert_eq!(got[0].source, "history");
+        assert_eq!(got[0].file_unique_id, "doc-image");
+        assert_eq!(got[0].mime_type, " IMAGE/PNG ");
+        assert_eq!(got[0].caption, "caption");
+
+        Ok(())
+    }
+
+    #[test]
+    fn telegram_message_attachments_keeps_sticker_unpromoted_by_default_like_go_utils()
+    -> Result<(), Box<dyn Error>> {
+        let update = serde_json::from_value(json!({
+            "update_id": 127,
+            "message": {
+                "message_id": 59,
+                "date": 1_710_000_000,
+                "chat": sample_private_chat_json(),
+                "from": sample_user_json(),
+                "sticker": {
+                    "file_id": "sticker-file",
+                    "file_unique_id": "sticker-1",
+                    "type": "regular",
+                    "height": 512,
+                    "width": 512,
+                    "is_animated": false,
+                    "is_video": false,
+                    "emoji": "ok"
+                }
+            }
+        }))?;
+        let message = update_message(&update)?;
+
+        let got =
+            telegram_message_attachments(message, TelegramMessageAttachmentOptions::default());
+
+        assert_eq!(
+            got,
+            vec![openplotva_core::ChatAttachment {
+                kind: "sticker".to_owned(),
+                source: "message".to_owned(),
+                file_unique_id: "sticker-1".to_owned(),
+                content: "ok".to_owned(),
+                ..openplotva_core::ChatAttachment::default()
+            }]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn telegram_message_attachments_uses_last_photo_size_like_go_utils()
+    -> Result<(), Box<dyn Error>> {
+        let update = serde_json::from_value(json!({
+            "update_id": 128,
+            "message": {
+                "message_id": 60,
+                "date": 1_710_000_000,
+                "chat": sample_private_chat_json(),
+                "from": sample_user_json(),
+                "photo": [
+                    {
+                        "file_id": "small-file",
+                        "file_unique_id": "small-photo",
+                        "height": 90,
+                        "width": 90
+                    },
+                    {
+                        "file_id": "large-file",
+                        "file_unique_id": "large-photo",
+                        "height": 1280,
+                        "width": 1280
+                    }
+                ],
+                "caption": " photo caption "
+            }
+        }))?;
+        let message = update_message(&update)?;
+
+        let got = telegram_message_attachments(
+            message,
+            TelegramMessageAttachmentOptions {
+                caption: " photo caption ".to_owned(),
+                ..TelegramMessageAttachmentOptions::default()
+            },
+        );
+
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].kind, "image");
+        assert_eq!(got[0].file_unique_id, "large-photo");
+        assert_eq!(got[0].caption, "photo caption");
+
+        Ok(())
+    }
+
+    #[test]
+    fn telegram_message_attachments_keeps_voice_caption_empty_like_go_utils()
+    -> Result<(), Box<dyn Error>> {
+        let update = serde_json::from_value(json!({
+            "update_id": 129,
+            "message": {
+                "message_id": 61,
+                "date": 1_710_000_000,
+                "chat": sample_private_chat_json(),
+                "from": sample_user_json(),
+                "voice": {
+                    "file_id": "voice-file",
+                    "file_unique_id": "voice-1",
+                    "duration": 7
+                },
+                "caption": " voice caption "
+            }
+        }))?;
+        let message = update_message(&update)?;
+
+        let got = telegram_message_attachments(
+            message,
+            TelegramMessageAttachmentOptions {
+                caption: "voice caption".to_owned(),
+                ..TelegramMessageAttachmentOptions::default()
+            },
+        );
+
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].kind, "voice");
+        assert_eq!(got[0].file_unique_id, "voice-1");
+        assert_eq!(got[0].duration_seconds, 7);
+        assert_eq!(got[0].caption, "");
+
+        Ok(())
+    }
+
+    #[test]
+    fn telegram_message_attachments_preserves_contact_and_location_like_go_utils()
+    -> Result<(), Box<dyn Error>> {
+        let contact_update = serde_json::from_value(json!({
+            "update_id": 130,
+            "message": {
+                "message_id": 62,
+                "date": 1_710_000_000,
+                "chat": sample_private_chat_json(),
+                "from": sample_user_json(),
+                "contact": {
+                    "phone_number": "+100",
+                    "first_name": "Grace",
+                    "last_name": "Hopper",
+                    "user_id": 123
+                }
+            }
+        }))?;
+        let location_update = serde_json::from_value(json!({
+            "update_id": 131,
+            "message": {
+                "message_id": 63,
+                "date": 1_710_000_000,
+                "chat": sample_private_chat_json(),
+                "from": sample_user_json(),
+                "location": {
+                    "latitude": 52.2297,
+                    "longitude": 21.0122
+                }
+            }
+        }))?;
+
+        let contact = telegram_message_attachments(
+            update_message(&contact_update)?,
+            TelegramMessageAttachmentOptions::default(),
+        );
+        let location = telegram_message_attachments(
+            update_message(&location_update)?,
+            TelegramMessageAttachmentOptions::default(),
+        );
+
+        assert_eq!(
+            contact,
+            vec![openplotva_core::ChatAttachment {
+                kind: "contact".to_owned(),
+                source: "message".to_owned(),
+                phone: "+100".to_owned(),
+                first_name: "Grace".to_owned(),
+                last_name: "Hopper".to_owned(),
+                user_id: 123,
+                ..openplotva_core::ChatAttachment::default()
+            }]
+        );
+        assert_eq!(location.len(), 1);
+        assert_eq!(location[0].kind, "location");
+        assert_float_eq(location[0].latitude, 52.2297);
+        assert_float_eq(location[0].longitude, 21.0122);
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn update_consumer_runs_state_and_handle_for_fresh_update() -> Result<(), Box<dyn Error>>
     {
@@ -1809,15 +2296,38 @@ mod tests {
         json!({
             "message_id": message_id,
             "date": date,
-            "chat": {
-                "id": 42,
-                "type": "private",
-                "first_name": "Ada",
-                "username": "ada_l"
-            },
+            "chat": sample_private_chat_json(),
             "from": sample_user_json(),
             "text": text
         })
+    }
+
+    fn sample_private_chat_json() -> serde_json::Value {
+        json!({
+            "id": 42,
+            "type": "private",
+            "first_name": "Ada",
+            "username": "ada_l"
+        })
+    }
+
+    fn update_message(update: &TelegramUpdate) -> Result<&TelegramMessage, io::Error> {
+        match &update.update_type {
+            TelegramUpdateType::Message(message) => Ok(message),
+            other => Err(io::Error::other(format!(
+                "expected message update, got {other:?}"
+            ))),
+        }
+    }
+
+    fn assert_float_eq(got: Option<f64>, want: f64) {
+        let Some(got) = got else {
+            panic!("missing float value, want {want}");
+        };
+        assert!(
+            (got - want).abs() < 0.00001,
+            "float value {got} differs from {want}"
+        );
     }
 
     fn sample_channel_message_json(message_id: i64, date: i64, text: &str) -> serde_json::Value {

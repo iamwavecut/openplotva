@@ -1,5 +1,5 @@
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Public project name used in diagnostics and health responses.
 pub const PROJECT_NAME: &str = "openplotva";
@@ -110,6 +110,59 @@ impl UpdateState {
             Some(Self { chat, user })
         }
     }
+}
+
+/// Go `sharedtypes.ChatAttachment` metadata stored with chat history entries.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct ChatAttachment {
+    /// Attachment kind, such as `image`, `audio`, or `contact`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub kind: String,
+    /// Attachment source, defaulting to `message` for Telegram messages.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source: String,
+    /// Textual content for stickers and venues.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub content: String,
+    /// Telegram stable file unique ID.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub file_unique_id: String,
+    /// Original file name, when Telegram provides it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub file_name: String,
+    /// MIME type, when Telegram provides it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub mime_type: String,
+    /// Media caption.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub caption: String,
+    /// Location latitude.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latitude: Option<f64>,
+    /// Location longitude.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub longitude: Option<f64>,
+    /// Audio/video/voice duration in seconds.
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub duration_seconds: i64,
+    /// Audio performer.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub performer: String,
+    /// Audio title.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub title: String,
+    /// Contact phone number.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub phone: String,
+    /// Contact first name.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub first_name: String,
+    /// Contact last name.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub last_name: String,
+    /// Contact Telegram user ID.
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub user_id: i64,
 }
 
 /// Go `chat_settings` fields used by permission and settings behavior.
@@ -296,6 +349,10 @@ pub fn pending_edit_payload(payload: &[u8]) -> PendingEditPayload {
 
 fn non_blank_string(value: Option<String>) -> Option<String> {
     value.filter(|value| !value.trim().is_empty())
+}
+
+fn is_zero_i64(value: &i64) -> bool {
+    *value == 0
 }
 
 #[cfg(test)]
