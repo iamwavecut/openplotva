@@ -328,6 +328,45 @@ pub enum UpdateHistoryPersistenceError {
     },
 }
 
+/// Non-fatal history side-effect result for one handled update.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct UpdateHistorySideEffectReport {
+    /// History persistence outcome when storage completed or the update had no history work.
+    pub persistence: UpdateHistoryPersistenceReport,
+    /// Display form of a history error that was logged and suppressed.
+    pub error: Option<String>,
+}
+
+impl UpdateHistorySideEffectReport {
+    fn from_persistence_result(
+        result: Result<UpdateHistoryPersistenceReport, UpdateHistoryPersistenceError>,
+    ) -> Self {
+        match result {
+            Ok(persistence) => Self {
+                persistence,
+                error: None,
+            },
+            Err(error) => Self {
+                persistence: UpdateHistoryPersistenceReport::default(),
+                error: Some(error.to_string()),
+            },
+        }
+    }
+}
+
+/// Error returned by a handler wrapped with non-fatal history persistence.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum UpdateHandleWithHistoryError {
+    /// The injected handler failed after history side effects were attempted.
+    #[error("handle update: {message}")]
+    Handler {
+        /// Display form of the handler error.
+        message: String,
+        /// History side-effect outcome observed before the handler error.
+        history: UpdateHistorySideEffectReport,
+    },
+}
+
 /// Build and persist the Go-shaped history entry for one inbound Telegram message update.
 pub async fn persist_inbound_message_history<S>(
     store: &S,
@@ -436,6 +475,44 @@ where
     }
 }
 
+/// Run Go-style history side effects before an injected decoded-update handler.
+///
+/// History failures are logged and returned in the report but do not prevent
+/// the injected handler from running, matching Go's history service call sites.
+pub async fn handle_update_with_history<S, HandleFn, HandleFuture, HandleError>(
+    store: &S,
+    update: TelegramUpdate,
+    bot_id: i64,
+    handle: HandleFn,
+) -> Result<UpdateHistorySideEffectReport, UpdateHandleWithHistoryError>
+where
+    S: InboundHistoryStore + EditedHistoryStore + Sync,
+    HandleFn: FnOnce(TelegramUpdate) -> HandleFuture,
+    HandleFuture: Future<Output = Result<(), HandleError>>,
+    HandleError: fmt::Display,
+{
+    let history = UpdateHistorySideEffectReport::from_persistence_result(
+        persist_update_history(store, &update, bot_id).await,
+    );
+    if let Some(error) = history.error.as_deref() {
+        tracing::warn!(
+            error,
+            update_id = update.id,
+            update_name = openplotva_updates::update_name(&update),
+            "update history persistence failed"
+        );
+    }
+
+    handle(update)
+        .await
+        .map_err(|error| UpdateHandleWithHistoryError::Handler {
+            message: error.to_string(),
+            history: history.clone(),
+        })?;
+
+    Ok(history)
+}
+
 /// Process one decoded update with app-owned state persistence and an injected handler.
 pub async fn process_update_with_state_store<S, HandleFn, HandleFuture, HandleError>(
     update: TelegramUpdate,
@@ -471,6 +548,79 @@ where
         now,
         |update| async move { persist_update_state(store, &update).await.map(|_| ()) },
         handle,
+    )
+    .await
+}
+
+/// Process one decoded update with app-owned state persistence, non-fatal
+/// history persistence, and an injected handler.
+pub async fn process_update_with_state_and_history_store<
+    S,
+    History,
+    HandleFn,
+    HandleFuture,
+    HandleError,
+>(
+    update: TelegramUpdate,
+    config: UpdateConsumerConfig,
+    state_store: &S,
+    history_store: &History,
+    bot_id: i64,
+    handle: HandleFn,
+) -> UpdateProcessReport
+where
+    S: UpdateStateStore + Sync,
+    History: InboundHistoryStore + EditedHistoryStore + Sync,
+    HandleFn: FnOnce(TelegramUpdate) -> HandleFuture,
+    HandleFuture: Future<Output = Result<(), HandleError>>,
+    HandleError: fmt::Display,
+{
+    process_update_with_state_and_history_store_at(
+        update,
+        config,
+        SystemTime::now(),
+        state_store,
+        history_store,
+        bot_id,
+        handle,
+    )
+    .await
+}
+
+/// Process one decoded update with an explicit clock instant and non-fatal
+/// history persistence in the handle stage.
+pub async fn process_update_with_state_and_history_store_at<
+    S,
+    History,
+    HandleFn,
+    HandleFuture,
+    HandleError,
+>(
+    update: TelegramUpdate,
+    config: UpdateConsumerConfig,
+    now: SystemTime,
+    state_store: &S,
+    history_store: &History,
+    bot_id: i64,
+    handle: HandleFn,
+) -> UpdateProcessReport
+where
+    S: UpdateStateStore + Sync,
+    History: InboundHistoryStore + EditedHistoryStore + Sync,
+    HandleFn: FnOnce(TelegramUpdate) -> HandleFuture,
+    HandleFuture: Future<Output = Result<(), HandleError>>,
+    HandleError: fmt::Display,
+{
+    openplotva_updates::process_update_at(
+        update,
+        config,
+        now,
+        |update| async move { persist_update_state(state_store, &update).await.map(|_| ()) },
+        |update| async move {
+            handle_update_with_history(history_store, update, bot_id, handle)
+                .await
+                .map(|_| ())
+        },
     )
     .await
 }
@@ -650,7 +800,8 @@ mod tests {
         EditedHistoryStore, EditedHistoryStoreFuture, InboundHistoryStore,
         InboundHistoryStoreFuture, InboundHistoryUpsert, UpdateHandler, UpdateHandlerFuture,
         UpdateSource, UpdateSourceFuture, UpdateStateStore, UpdateStateStoreFuture,
-        persist_update_state, process_update_with_state_store_at, run_update_consumer_until,
+        persist_update_state, process_update_with_state_and_history_store_at,
+        process_update_with_state_store_at, run_update_consumer_until,
     };
 
     #[tokio::test]
@@ -887,6 +1038,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn process_update_with_state_and_history_store_keeps_history_failures_nonfatal()
+    -> Result<(), Box<dyn Error>> {
+        let store = StoreStub::default();
+        let history = HistoryStoreStub::with_inbound_failure("history unavailable");
+        let handled = Arc::new(Mutex::new(Vec::new()));
+        let handled_updates = Arc::clone(&handled);
+
+        let report = process_update_with_state_and_history_store_at(
+            sample_message_update()?,
+            UpdateConsumerConfig {
+                state_timeout: Duration::from_secs(1),
+                handle_timeout: Duration::from_secs(1),
+                side_effect_max_age: Duration::from_secs(400_000_000),
+                ..UpdateConsumerConfig::default()
+            },
+            unix_time(1_710_000_010),
+            &store,
+            &history,
+            0,
+            move |update| {
+                let handled = Arc::clone(&handled_updates);
+                async move {
+                    handled
+                        .lock()
+                        .map_err(|err| io::Error::other(err.to_string()))?
+                        .push(update.id);
+                    Ok::<(), io::Error>(())
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(report.state.outcome, UpdateStageOutcome::Completed);
+        assert_eq!(
+            report.handle.as_ref().map(|stage| &stage.outcome),
+            Some(&UpdateStageOutcome::Completed)
+        );
+        assert_eq!(
+            handled.lock().expect("handled updates").as_slice(),
+            &[12345]
+        );
+        assert!(history.entries().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn run_update_consumer_until_processes_updates_and_reports_stage_outcomes()
     -> Result<(), Box<dyn Error>> {
         let source = Arc::new(SourceStub::new(vec![
@@ -991,9 +1188,17 @@ mod tests {
     struct HistoryStoreStub {
         entries: Arc<Mutex<Vec<RecordedHistoryUpsert>>>,
         edits: Arc<Mutex<Vec<RecordedHistoryEdit>>>,
+        fail_next_inbound: Arc<Mutex<Option<&'static str>>>,
     }
 
     impl HistoryStoreStub {
+        fn with_inbound_failure(message: &'static str) -> Self {
+            Self {
+                fail_next_inbound: Arc::new(Mutex::new(Some(message))),
+                ..Self::default()
+            }
+        }
+
         fn entries(&self) -> Vec<RecordedHistoryUpsert> {
             self.entries.lock().expect("history entries").clone()
         }
@@ -1020,6 +1225,14 @@ mod tests {
             entry: InboundHistoryUpsert<'a>,
         ) -> InboundHistoryStoreFuture<'a, Self::Error> {
             Box::pin(async move {
+                if let Some(message) = self
+                    .fail_next_inbound
+                    .lock()
+                    .map_err(|err| io::Error::other(err.to_string()))?
+                    .take()
+                {
+                    return Err(io::Error::other(message));
+                }
                 self.entries
                     .lock()
                     .map_err(|err| io::Error::other(err.to_string()))?
