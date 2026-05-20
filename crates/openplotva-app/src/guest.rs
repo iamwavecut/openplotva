@@ -1,22 +1,33 @@
 //! App-level guest-message routing.
 
-use std::{fmt, future::Future, pin::Pin, sync::Arc};
+use std::{
+    collections::HashMap,
+    fmt,
+    future::Future,
+    pin::Pin,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use carapax::types::{
     Chat as TelegramChat, Message as TelegramMessage, MessageSender as TelegramMessageSender,
     Update as TelegramUpdate, UpdateType, User as TelegramUser,
 };
 use openplotva_updates::{
-    GuestChainMessage, build_guest_dialog_text, build_guest_shield_query_text,
+    GuestChainMessage, GuestChainRole, build_guest_dialog_text, build_guest_shield_query_text,
     guest_current_request_text, guest_message_reject_reason, guest_request_has_visible_text,
     guest_visible_text, is_guest_unsupported_feature_request,
 };
+use sha1::{Digest, Sha1};
 use thiserror::Error;
+use time::OffsetDateTime;
 
 use crate::updates::{UpdateHandler, UpdateHandlerFuture};
 
 pub const GUEST_DIALOG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(35);
 pub const GUEST_DIALOG_MAX_OUTPUT_TOKENS: usize = 512;
+pub const GUEST_CHAIN_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+pub const GUEST_CHAIN_MAX_MESSAGES: usize = 15;
 
 pub type GuestMessageFuture<'a, T, E> = Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'a>>;
 
@@ -68,6 +79,151 @@ pub struct GuestChainRememberRequest {
     pub assistant_text: String,
     pub assistant_name: String,
     pub base_chain: Vec<GuestChainMessage>,
+}
+
+#[derive(Clone)]
+pub struct GuestChainCache {
+    inner: Arc<GuestChainCacheInner>,
+}
+
+struct GuestChainCacheInner {
+    ttl: Duration,
+    max_messages: usize,
+    entries: Mutex<HashMap<String, GuestChainEntry>>,
+    now: Box<dyn Fn() -> OffsetDateTime + Send + Sync>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GuestChainEntry {
+    messages: Vec<GuestChainMessage>,
+    expires_at: OffsetDateTime,
+}
+
+impl Default for GuestChainCache {
+    fn default() -> Self {
+        Self::new(GUEST_CHAIN_TTL, GUEST_CHAIN_MAX_MESSAGES)
+    }
+}
+
+impl fmt::Debug for GuestChainCache {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GuestChainCache")
+            .field("ttl", &self.inner.ttl)
+            .field("max_messages", &self.inner.max_messages)
+            .finish_non_exhaustive()
+    }
+}
+
+impl GuestChainCache {
+    #[must_use]
+    pub fn new(ttl: Duration, max_messages: usize) -> Self {
+        Self::with_clock(ttl, max_messages, OffsetDateTime::now_utc)
+    }
+
+    #[must_use]
+    pub fn with_clock(
+        ttl: Duration,
+        max_messages: usize,
+        now: impl Fn() -> OffsetDateTime + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            inner: Arc::new(GuestChainCacheInner {
+                ttl: if ttl.is_zero() { GUEST_CHAIN_TTL } else { ttl },
+                max_messages: if max_messages == 0 {
+                    GUEST_CHAIN_MAX_MESSAGES
+                } else {
+                    max_messages
+                },
+                entries: Mutex::new(HashMap::new()),
+                now: Box::new(now),
+            }),
+        }
+    }
+
+    #[must_use]
+    pub fn load(&self, request: &GuestChainLoadRequest) -> Vec<GuestChainMessage> {
+        let Some(key) = guest_chain_key(request.chat_id, &request.reply_text) else {
+            return Vec::new();
+        };
+
+        let now = self.current_time();
+        let mut entries = self.inner.entries.lock().expect("guest chain cache lock");
+        let Some(entry) = entries.get(&key).cloned() else {
+            return Vec::new();
+        };
+        if now >= entry.expires_at {
+            entries.remove(&key);
+            return Vec::new();
+        }
+
+        let messages = trim_guest_chain_messages_for_ttl(
+            &entry.messages,
+            self.inner.max_messages,
+            now,
+            self.inner.ttl,
+        );
+        if messages.is_empty() {
+            entries.remove(&key);
+            return Vec::new();
+        }
+        messages
+    }
+
+    pub fn remember(&self, request: &GuestChainRememberRequest) -> bool {
+        let user_text = request.user_text.trim();
+        let assistant_text = request.assistant_text.trim();
+        if user_text.is_empty() || assistant_text.is_empty() {
+            return false;
+        }
+
+        let Some(key) = guest_chain_key(request.chat_id, assistant_text) else {
+            return false;
+        };
+        let now = self.current_time();
+        let mut messages = trim_guest_chain_messages_for_ttl(
+            &request.base_chain,
+            self.inner.max_messages,
+            now,
+            self.inner.ttl,
+        );
+        messages.push(GuestChainMessage {
+            role: GuestChainRole::User,
+            name: guest_chain_cache_name(request.user_name.trim(), GuestChainRole::User),
+            text: user_text.to_owned(),
+            at: Some(now),
+        });
+        messages.push(GuestChainMessage {
+            role: GuestChainRole::Assistant,
+            name: guest_chain_cache_name(request.assistant_name.trim(), GuestChainRole::Assistant),
+            text: assistant_text.to_owned(),
+            at: Some(now),
+        });
+        let messages = trim_guest_chain_messages_for_ttl(
+            &messages,
+            self.inner.max_messages,
+            now,
+            self.inner.ttl,
+        );
+        if messages.is_empty() {
+            return false;
+        }
+
+        let mut entries = self.inner.entries.lock().expect("guest chain cache lock");
+        prune_expired_guest_chain_entries(&mut entries, now);
+        entries.insert(
+            key,
+            GuestChainEntry {
+                messages,
+                expires_at: now + self.inner.ttl,
+            },
+        );
+        true
+    }
+
+    fn current_time(&self) -> OffsetDateTime {
+        (self.inner.now)()
+    }
 }
 
 pub trait GuestMessageEffects {
@@ -545,24 +701,105 @@ fn guest_chain_assistant_text(answer: &str, bot_username: &str) -> String {
         .to_owned()
 }
 
+fn trim_guest_chain_messages_for_ttl(
+    messages: &[GuestChainMessage],
+    max_messages: usize,
+    now: OffsetDateTime,
+    ttl: Duration,
+) -> Vec<GuestChainMessage> {
+    let max_messages = if max_messages == 0 {
+        GUEST_CHAIN_MAX_MESSAGES
+    } else {
+        max_messages
+    };
+    let cutoff = now - ttl;
+    let mut out = Vec::with_capacity(messages.len().min(max_messages));
+    for message in messages {
+        if let Some(normalized) = normalize_guest_chain_cache_message(message, cutoff) {
+            out.push(normalized);
+        }
+    }
+    if out.len() <= max_messages {
+        return out;
+    }
+    out[out.len() - max_messages..].to_vec()
+}
+
+fn normalize_guest_chain_cache_message(
+    message: &GuestChainMessage,
+    cutoff: OffsetDateTime,
+) -> Option<GuestChainMessage> {
+    if message.at.is_some_and(|at| at < cutoff) {
+        return None;
+    }
+    let text = message.text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    Some(GuestChainMessage {
+        role: message.role,
+        name: guest_chain_cache_name(message.name.trim(), message.role),
+        text: text.to_owned(),
+        at: message.at,
+    })
+}
+
+fn prune_expired_guest_chain_entries(
+    entries: &mut HashMap<String, GuestChainEntry>,
+    now: OffsetDateTime,
+) {
+    entries.retain(|_, entry| now < entry.expires_at);
+}
+
+fn guest_chain_cache_name(name: &str, role: GuestChainRole) -> String {
+    if !name.is_empty() {
+        return name.to_owned();
+    }
+    match role {
+        GuestChainRole::Assistant => "Plotva".to_owned(),
+        GuestChainRole::User => "Telegram".to_owned(),
+    }
+}
+
+fn guest_chain_key(chat_id: i64, text: &str) -> Option<String> {
+    let normalized = guest_chain_key_text(text);
+    if normalized.is_empty() {
+        return None;
+    }
+    let mut hasher = Sha1::new();
+    hasher.update(normalized.as_bytes());
+    Some(format!("{chat_id}:{}", hex::encode(hasher.finalize())))
+}
+
+fn guest_chain_key_text(text: &str) -> String {
+    compact_whitespace(&openplotva_telegram::strip_telegram_html(text))
+}
+
+fn compact_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
         error::Error,
         io,
         sync::{Arc, Mutex},
+        time::Duration,
     };
 
     use carapax::types::{Update as TelegramUpdate, User as TelegramUser};
     use openplotva_updates::{GuestChainMessage, GuestChainRole};
     use serde_json::json;
+    use time::macros::datetime;
 
     use crate::updates::{UpdateHandler, UpdateHandlerFuture};
 
     use super::{
-        GuestChainLoadRequest, GuestChainRememberRequest, GuestDialogInput, GuestDialogOutput,
-        GuestMessageConfig, GuestMessageEffects, GuestMessageFuture, GuestMessageUpdateHandler,
-        GuestMessageUpdateRoute, GuestShieldRequest, handle_guest_message_update_or_else,
+        GuestChainCache, GuestChainLoadRequest, GuestChainRememberRequest, GuestDialogInput,
+        GuestDialogOutput, GuestMessageConfig, GuestMessageEffects, GuestMessageFuture,
+        GuestMessageUpdateHandler, GuestMessageUpdateRoute, GuestShieldRequest,
+        handle_guest_message_update_or_else,
     };
 
     #[tokio::test]
@@ -720,6 +957,113 @@ mod tests {
         handler.handle_update(guest_update("привет")?).await?;
         assert_eq!(effects.answers().len(), 1);
         Ok(())
+    }
+
+    #[test]
+    fn guest_chain_cache_loads_by_reply_answer_key_and_trims_to_go_limit() {
+        let now = datetime!(2026-05-20 12:00 UTC);
+        let cache = GuestChainCache::with_clock(Duration::from_secs(24 * 60 * 60), 15, move || now);
+        let mut base_chain = Vec::new();
+        for index in 0..14 {
+            base_chain.push(GuestChainMessage {
+                role: GuestChainRole::User,
+                name: format!("user {index}"),
+                text: format!("old {index}"),
+                at: Some(now),
+            });
+        }
+        let stored = cache.remember(&GuestChainRememberRequest {
+            chat_id: -100,
+            user_text: " вопрос ".to_owned(),
+            user_name: " Alice ".to_owned(),
+            assistant_text: " <b>Ответ</b>   с   пробелами ".to_owned(),
+            assistant_name: " Plotva ".to_owned(),
+            base_chain,
+        });
+        assert!(stored);
+
+        let loaded = cache.load(&GuestChainLoadRequest {
+            chat_id: -100,
+            reply_text: "Ответ с пробелами".to_owned(),
+        });
+        assert_eq!(loaded.len(), 15);
+        assert_eq!(loaded[0].text, "old 1");
+        assert_eq!(loaded[13].text, "вопрос");
+        assert_eq!(loaded[13].name, "Alice");
+        assert_eq!(loaded[14].text, "<b>Ответ</b>   с   пробелами");
+        assert_eq!(loaded[14].name, "Plotva");
+        assert_eq!(loaded[14].at, Some(now));
+    }
+
+    #[test]
+    fn guest_chain_cache_expires_entries_and_drops_stale_messages() {
+        let now = datetime!(2026-05-20 12:00 UTC);
+        let cache = GuestChainCache::with_clock(Duration::from_secs(24 * 60 * 60), 15, move || now);
+        assert!(cache.remember(&GuestChainRememberRequest {
+            chat_id: 42,
+            user_text: "fresh".to_owned(),
+            user_name: String::new(),
+            assistant_text: "answer".to_owned(),
+            assistant_name: String::new(),
+            base_chain: vec![GuestChainMessage {
+                role: GuestChainRole::User,
+                name: String::new(),
+                text: "too old".to_owned(),
+                at: Some(now - Duration::from_secs(25 * 60 * 60)),
+            }],
+        }));
+
+        let loaded = cache.load(&GuestChainLoadRequest {
+            chat_id: 42,
+            reply_text: "answer".to_owned(),
+        });
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].name, "Telegram");
+        assert_eq!(loaded[1].name, "Plotva");
+
+        let clock = Arc::new(Mutex::new(now));
+        let cache_clock = Arc::clone(&clock);
+        let expired_cache = GuestChainCache::with_clock(Duration::from_secs(1), 15, move || {
+            *cache_clock.lock().expect("clock")
+        });
+        assert!(expired_cache.remember(&GuestChainRememberRequest {
+            chat_id: 42,
+            user_text: "fresh".to_owned(),
+            user_name: "Alice".to_owned(),
+            assistant_text: "short".to_owned(),
+            assistant_name: "Plotva".to_owned(),
+            base_chain: Vec::new(),
+        }));
+        *clock.lock().expect("clock") = now + Duration::from_secs(1);
+        assert!(
+            expired_cache
+                .load(&GuestChainLoadRequest {
+                    chat_id: 42,
+                    reply_text: "short".to_owned(),
+                })
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn guest_chain_cache_rejects_empty_key_or_turn_text() {
+        let cache = GuestChainCache::default();
+        assert!(!cache.remember(&GuestChainRememberRequest {
+            chat_id: 42,
+            user_text: " ".to_owned(),
+            user_name: "Alice".to_owned(),
+            assistant_text: "answer".to_owned(),
+            assistant_name: "Plotva".to_owned(),
+            base_chain: Vec::new(),
+        }));
+        assert!(
+            cache
+                .load(&GuestChainLoadRequest {
+                    chat_id: 42,
+                    reply_text: " <b> </b> ".to_owned(),
+                })
+                .is_empty()
+        );
     }
 
     #[derive(Clone, Debug, Default)]

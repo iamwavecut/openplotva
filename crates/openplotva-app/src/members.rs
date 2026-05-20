@@ -783,17 +783,15 @@ where
         disable_error: None,
     };
 
-    if bot_left {
-        if let Err(error) = effects.disable_chat_communication(chat_id).await {
-            let message = error.to_string();
-            tracing::warn!(
-                message,
-                chat_id,
-                user_id,
-                "failed to disable chat communication after bot left"
-            );
-            outcome.disable_error = Some(message);
-        }
+    if bot_left && let Err(error) = effects.disable_chat_communication(chat_id).await {
+        let message = error.to_string();
+        tracing::warn!(
+            message,
+            chat_id,
+            user_id,
+            "failed to disable chat communication after bot left"
+        );
+        outcome.disable_error = Some(message);
     }
 
     if let Err(error) = store.delete_chat_member(chat_id, user_id).await {

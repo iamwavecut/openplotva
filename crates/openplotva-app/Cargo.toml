@@ -20,9 +20,11 @@ openplotva-taskman = { path = "../openplotva-taskman" }
 openplotva-telegram = { path = "../openplotva-telegram" }
 openplotva-updates = { path = "../openplotva-updates" }
 openplotva-web = { path = "../openplotva-web" }
+hex.workspace = true
 reqwest.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+sha1.workspace = true
 thiserror.workspace = true
 time.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
