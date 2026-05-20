@@ -118,6 +118,9 @@ More detail belongs under `docs/architecture/` as behavior is ported.
 
 ## Contract Rules
 
+Contract means observable semantic behavior, not byte-for-byte reproduction of Go
+internals.
+
 Keep these unchanged unless an approved deviation is recorded:
 
 - User-facing strings and prompts.
@@ -129,12 +132,13 @@ Keep these unchanged unless an approved deviation is recorded:
 
 Approved deviations must be written in `docs/contract/deviations.md`.
 
-Current approved deviation: Redis/runtime payload codecs do not preserve Go
-`encoding/gob` bit layouts. The Rust implementation keeps the Go keys, ordering, and
-lifecycle semantics, but stores Rust-native serde payloads: Telegram updates use
-zstd-compressed serde JSON envelopes over `carapax::types::Update`, and
-dispatcher shutdown snapshots store persistent-item JSON directly. Persisted
-chat rate-limit expiries use JSON timestamp values under the original
+Current approved deviation: Go `encoding/gob` payload codecs do not preserve Go
+bit layouts. The Rust implementation keeps observable runtime semantics such as keys,
+ordering, field meaning, TTLs, lifecycle behavior, and diagnostics, but stores
+Rust-native serde payloads. Current cases: Telegram updates use zstd-compressed
+serde JSON envelopes over `carapax::types::Update`; dispatcher shutdown
+snapshots store persistent-item JSON directly; persisted chat rate-limit
+expiries use JSON timestamp values under the original
 `plotva:rate_limited_chat:*` keys.
 
 ## Migrations

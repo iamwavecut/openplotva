@@ -9,12 +9,13 @@
 
 ## Goal
 
-Implementation Plotva from Go to modern Rust while preserving behavior.
+Implementation Plotva from Go to modern Rust while preserving observable behavior.
 
 Done means:
 
 - Rust app builds, runs, and passes contract checks against the frozen Go behavior.
 - No user-facing behavior changes exist unless recorded as approved deviations.
+- Contract means semantic/runtime compatibility, not byte-for-byte reproduction of Go internals.
 - The original Go repository remains unchanged.
 - README and developer docs are suitable for future open-source release.
 
@@ -77,7 +78,7 @@ Do not spend time polishing broad abstractions until the relevant contract inven
 - The Rust app shell configures Telegram bot commands when `OPENPLOTVA_CONNECT_SERVICES=true` and `BOT_KEY` is set: delete existing commands first, then apply the private, group, and group-admin scoped command lists in Go `initBot` order. Command setup failures abort startup before runtime workers.
 - The live outbound dispatcher in `openplotva-app` should keep the Go server runtime defaults: `plotva:message_queue`, max queue/persisted items `10000`, dedupe enabled with a `3s` window and `1000` cache entries, `50ms` dispatch interval, `10m` limiter cleanup cadence, `30m` limiter max idle, and `10s` shutdown persistence timeout.
 - Telegram update ingestion must preserve Go's Redis list contract: key `plotva:updates:queue`, `RPUSH` producers, `BLPOP` consumers, `LLEN` diagnostics, timeout handling, and FIFO ordering.
-- Approved deviation: do not maintain bitwise compatibility with Go `encoding/gob` payloads. Use Rust-native serde formats while preserving Redis keys, FIFO/list behavior, JSON field meaning, and lifecycle semantics. Update payloads use the `openplotva.update.v1+carapax-json.zstd` envelope around `carapax::types::Update`; dispatcher shutdown persistence stores the `PersistentDispatcherItem` JSON directly under `plotva:message_queue`; persisted chat rate-limit expiries under `plotva:rate_limited_chat:*` use JSON timestamp values. Treat mixed Go/Rust in-flight gob-backed queues as unsupported during cutover. Do not spend implementation effort recreating gob byte layouts unless the user explicitly reverses this deviation.
+- Approved deviation: do not maintain bitwise compatibility with Go `encoding/gob` payloads. For every gob-backed persistence surface encountered during the implementation, use a Rust-native serde codec while preserving the observable runtime contract: keys, ordering, field meaning, TTLs, lifecycle semantics, and diagnostics. Current instances: update payloads use the `openplotva.update.v1+carapax-json.zstd` envelope around `carapax::types::Update`; dispatcher shutdown persistence stores the `PersistentDispatcherItem` JSON directly under `plotva:message_queue`; persisted chat rate-limit expiries under `plotva:rate_limited_chat:*` use JSON timestamp values. Treat mixed Go/Rust in-flight gob-backed data as unsupported during cutover. Do not spend implementation effort recreating gob byte layouts unless the user explicitly reverses this deviation.
 - Keep update producer filtering in `openplotva-updates` separate from consumer stats naming: use `GO_ALLOWED_UPDATES`/`GO_ALLOWED_UPDATE_NAMES`, `producer_update_type`, `is_allowed_producer_update`, and `run_update_producer_until` for webhook/long-polling enqueue decisions. `update_name` is the consumer report label and intentionally does not cover every Go fetcher classifier.
 - Keep Telegram update startup methods and sources in `openplotva-telegram`: use `build_get_updates_method`, `build_set_webhook_method`, `build_delete_webhook_method`, `LongPollUpdateSource`, `webhook_update_channel`, and `TELEGRAM_WEBHOOK_PATH` for concrete `carapax` source wiring instead of reconstructing allowed updates, offsets, retries, webhook channel timeouts, or request validation at the app layer.
 - The Rust app shell starts Telegram update ingestion when `OPENPLOTVA_CONNECT_SERVICES=true` and `BOT_KEY` is set. By default it deletes any webhook first and feeds `LongPollUpdateSource` into `plotva:updates:queue`; `deleteWebhook` failure is logged inside the worker and must not fail app startup, matching Go's background `StartBot` goroutine. When `BOT_WEBHOOK_ENABLED=true` and `BOT_WEBHOOK_URL` is set, it registers `setWebhook`, installs `/telegram/webhook`, validates `X-Telegram-Bot-Api-Secret-Token`, uploads `BOT_WEBHOOK_CERT_FILE` as `cert.pem` when both `BOT_WEBHOOK_CERT_FILE` and `BOT_WEBHOOK_KEY_FILE` are set, and feeds `WebhookUpdateSource` into the same queue. Use the raw multipart path only for certificate mode because `carapax` serializes `setWebhook` as JSON.
