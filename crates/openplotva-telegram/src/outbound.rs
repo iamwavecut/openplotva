@@ -4,11 +4,12 @@ use std::{borrow::Cow, fmt, io::Cursor};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use carapax::types::{
-    AnswerCallbackQuery, ChatAction, DeleteMessage, EditMessageCaption, EditMessageMedia,
-    EditMessageReplyMarkup, EditMessageText, InlineKeyboardMarkup, InputFile, InputFileReader,
-    InputMedia, InputMediaError, InputMediaPhoto, MediaGroup, MediaGroupError, MediaGroupItem,
-    ParseMode, ReplyMarkup, ReplyParameters, ReplyParametersError, SendAudio, SendChatAction,
-    SendMediaGroup, SendMessage, SendPhoto, SendSticker,
+    AnswerCallbackQuery, AnswerGuestQuery, AnswerInlineQuery, ChatAction, DeleteMessage,
+    EditMessageCaption, EditMessageMedia, EditMessageReplyMarkup, EditMessageText,
+    InlineKeyboardMarkup, InlineQueryResult, InlineQueryResultArticle, InputFile, InputFileReader,
+    InputMedia, InputMediaError, InputMediaPhoto, InputMessageContentText, MediaGroup,
+    MediaGroupError, MediaGroupItem, ParseMode, ReplyMarkup, ReplyParameters, ReplyParametersError,
+    SendAudio, SendChatAction, SendMediaGroup, SendMessage, SendPhoto, SendSticker,
 };
 use crc::{CRC_32_ISCSI, Crc};
 use serde_json::{Map, Value, json};
@@ -163,6 +164,47 @@ pub struct CallbackAnswerRequest {
     pub url: String,
     /// Optional cache time in seconds; Go omits zero values.
     pub cache_time: i64,
+}
+
+/// Inline article fields used by Go `api.NewInlineQueryResultArticle*` call sites.
+#[derive(Clone, Debug, PartialEq)]
+pub struct InlineArticleRequest {
+    /// Inline result ID.
+    pub id: String,
+    /// Inline result title.
+    pub title: String,
+    /// Text sent when the result is selected.
+    pub message_text: String,
+    /// Go parse mode string; empty means plain text.
+    pub render_as: String,
+    /// Optional result description; Go omits empty values.
+    pub description: String,
+    /// Optional inline keyboard markup attached to the result.
+    pub reply_markup: Option<InlineKeyboardMarkup>,
+}
+
+/// Inline query answer fields used by Go `api.InlineConfig` call sites.
+#[derive(Clone, Debug, PartialEq)]
+pub struct InlineQueryAnswerRequest {
+    /// Telegram inline query ID.
+    pub inline_query_id: String,
+    /// Results to return to Telegram.
+    pub results: Vec<InlineQueryResult>,
+    /// Optional cache time in seconds; Go omits zero values.
+    pub cache_time: i64,
+    /// Whether results are personal; Go omits false values.
+    pub is_personal: bool,
+    /// Optional pagination offset; Go omits empty values.
+    pub next_offset: String,
+}
+
+/// Guest query answer fields used by Go `api.NewAnswerGuestQuery` call sites.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GuestQueryAnswerRequest {
+    /// Telegram guest query ID.
+    pub guest_query_id: String,
+    /// Inline result to send on behalf of the guest bot.
+    pub result: InlineQueryResult,
 }
 
 /// Delete request fields used by Go `api.NewDeleteMessage` call sites.
@@ -567,6 +609,45 @@ pub fn build_callback_answer_method(req: &CallbackAnswerRequest) -> AnswerCallba
         method = method.with_cache_time(req.cache_time);
     }
     method
+}
+
+/// Build an inline article result using Go `api.NewInlineQueryResultArticle*` semantics.
+pub fn build_inline_query_result_article(
+    req: &InlineArticleRequest,
+) -> Result<InlineQueryResult, OutboundBuildError> {
+    let mut content = InputMessageContentText::new(req.message_text.clone());
+    if let Some(parse_mode) = parse_mode_from_go(&req.render_as)? {
+        content = content.with_parse_mode(parse_mode);
+    }
+
+    let mut article = InlineQueryResultArticle::new(req.id.clone(), content, req.title.clone());
+    if !req.description.is_empty() {
+        article = article.with_description(req.description.clone());
+    }
+    if let Some(markup) = req.reply_markup.clone() {
+        article = article.with_reply_markup(markup);
+    }
+    Ok(article.into())
+}
+
+/// Build an outbound `answerInlineQuery` method.
+pub fn build_inline_query_answer_method(req: &InlineQueryAnswerRequest) -> AnswerInlineQuery {
+    let mut method = AnswerInlineQuery::new(req.inline_query_id.clone(), req.results.clone());
+    if req.cache_time != 0 {
+        method = method.with_cache_time(req.cache_time);
+    }
+    if req.is_personal {
+        method = method.with_is_personal(true);
+    }
+    if !req.next_offset.is_empty() {
+        method = method.with_next_offset(req.next_offset.clone());
+    }
+    method
+}
+
+/// Build an outbound `answerGuestQuery` method.
+pub fn build_guest_query_answer_method(req: &GuestQueryAnswerRequest) -> AnswerGuestQuery {
+    AnswerGuestQuery::new(req.guest_query_id.clone(), req.result.clone())
 }
 
 /// Build an outbound `deleteMessage` method.
@@ -1276,18 +1357,20 @@ mod tests {
         AudioMessagePlan, AudioMessageRequest, AudioSource, CallbackAnswerRequest,
         ChatActionRequest, ChatRef, DeleteMessageRequest, EditCaptionMessageRequest,
         EditMediaMessagePlan, EditMediaMessageRequest, EditReplyMarkupMessageRequest,
-        EditTextMessageRequest, MESSAGE_TYPE_TEXT, MediaGroupMessagePlan, MediaGroupMessageRequest,
-        MediaGroupPhotoItem, MessageFingerprint, OutboundBuildError, PhotoMessagePlan,
-        PhotoMessageRequest, PhotoSource, ReplyMessageRef, ReplyParametersPlan, StickerMessagePlan,
-        StickerMessageRequest, TextMessageRequest, allow_sending_without_reply,
+        EditTextMessageRequest, GuestQueryAnswerRequest, InlineArticleRequest,
+        InlineQueryAnswerRequest, MESSAGE_TYPE_TEXT, MediaGroupMessagePlan,
+        MediaGroupMessageRequest, MediaGroupPhotoItem, MessageFingerprint, OutboundBuildError,
+        PhotoMessagePlan, PhotoMessageRequest, PhotoSource, ReplyMessageRef, ReplyParametersPlan,
+        StickerMessagePlan, StickerMessageRequest, TextMessageRequest, allow_sending_without_reply,
         build_audio_message_method, build_audio_message_plan, build_callback_answer_method,
         build_chat_action_method, build_delete_message_method, build_edit_caption_message_method,
         build_edit_media_message_method, build_edit_media_message_plan,
         build_edit_reply_markup_message_method, build_edit_text_message_method,
-        build_media_group_message_method, build_media_group_message_plan,
-        build_photo_message_method, build_photo_message_plan, build_sticker_message_method,
-        build_sticker_message_plan, build_text_message_method, build_text_message_methods,
-        fingerprint_audio_message_plan, fingerprint_photo_message_plan,
+        build_guest_query_answer_method, build_inline_query_answer_method,
+        build_inline_query_result_article, build_media_group_message_method,
+        build_media_group_message_plan, build_photo_message_method, build_photo_message_plan,
+        build_sticker_message_method, build_sticker_message_plan, build_text_message_method,
+        build_text_message_methods, fingerprint_audio_message_plan, fingerprint_photo_message_plan,
         fingerprint_sticker_message_plan, fingerprint_text_message_part, forum_thread_id,
         hash_content, message_target_chat, validate_text_message_text,
     };
@@ -2340,6 +2423,109 @@ mod tests {
             json!("https://example.invalid/plotva")
         );
         assert_eq!(alert_payload["cache_time"], json!(10));
+
+        Ok(())
+    }
+
+    #[test]
+    fn build_inline_query_answer_method_matches_go_inline_config()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let article = build_inline_query_result_article(&InlineArticleRequest {
+            id: "inline-id".to_owned(),
+            title: "Шевелись, Плотва!".to_owned(),
+            message_text: "raw query".to_owned(),
+            render_as: String::new(),
+            description: String::new(),
+            reply_markup: None,
+        })?;
+        let article_payload = serde_json::to_value(article.clone())?;
+        assert_eq!(article_payload["type"], json!("article"));
+        assert_eq!(article_payload["id"], json!("inline-id"));
+        assert_eq!(article_payload["title"], json!("Шевелись, Плотва!"));
+        assert_eq!(
+            article_payload["input_message_content"]["message_text"],
+            json!("raw query")
+        );
+        assert!(
+            article_payload["input_message_content"]
+                .get("parse_mode")
+                .is_none()
+        );
+        assert!(article_payload.get("description").is_none());
+        assert!(article_payload.get("reply_markup").is_none());
+
+        let empty_options = build_inline_query_answer_method(&InlineQueryAnswerRequest {
+            inline_query_id: "inline-empty".to_owned(),
+            results: vec![article.clone()],
+            cache_time: 0,
+            is_personal: false,
+            next_offset: String::new(),
+        });
+        let empty_payload = serde_json::to_value(empty_options)?;
+        assert_eq!(empty_payload["inline_query_id"], json!("inline-empty"));
+        assert!(empty_payload.get("cache_time").is_none());
+        assert!(empty_payload.get("is_personal").is_none());
+        assert!(empty_payload.get("next_offset").is_none());
+
+        let method = build_inline_query_answer_method(&InlineQueryAnswerRequest {
+            inline_query_id: "inline-id".to_owned(),
+            results: vec![article],
+            cache_time: 1,
+            is_personal: true,
+            next_offset: String::new(),
+        });
+        let payload = serde_json::to_value(method)?;
+
+        assert_eq!(payload["inline_query_id"], json!("inline-id"));
+        assert_eq!(payload["cache_time"], json!(1));
+        assert_eq!(payload["is_personal"], json!(true));
+        assert!(payload.get("next_offset").is_none());
+        assert!(payload.get("button").is_none());
+        assert_eq!(payload["results"][0]["type"], json!("article"));
+        assert_eq!(
+            payload["results"][0]["input_message_content"]["message_text"],
+            json!("raw query")
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn build_guest_query_answer_method_matches_go_guest_article()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let markup =
+            InlineKeyboardMarkup::from([[InlineKeyboardButton::for_callback_data("ok", "ok")]]);
+        let article = build_inline_query_result_article(&InlineArticleRequest {
+            id: "guest-42".to_owned(),
+            title: "Добавьте Плотву в чат".to_owned(),
+            message_text: "<b>Готово</b>".to_owned(),
+            render_as: TELEGRAM_PARSE_MODE_HTML.to_owned(),
+            description: "Готово".to_owned(),
+            reply_markup: Some(markup),
+        })?;
+        let method = build_guest_query_answer_method(&GuestQueryAnswerRequest {
+            guest_query_id: "guest-query".to_owned(),
+            result: article,
+        });
+        let payload = serde_json::to_value(method)?;
+
+        assert_eq!(payload["guest_query_id"], json!("guest-query"));
+        assert_eq!(payload["result"]["type"], json!("article"));
+        assert_eq!(payload["result"]["id"], json!("guest-42"));
+        assert_eq!(payload["result"]["title"], json!("Добавьте Плотву в чат"));
+        assert_eq!(payload["result"]["description"], json!("Готово"));
+        assert_eq!(
+            payload["result"]["input_message_content"]["message_text"],
+            json!("<b>Готово</b>")
+        );
+        assert_eq!(
+            payload["result"]["input_message_content"]["parse_mode"],
+            json!("HTML")
+        );
+        assert_eq!(
+            payload["result"]["reply_markup"]["inline_keyboard"][0][0]["callback_data"],
+            json!("ok")
+        );
 
         Ok(())
     }

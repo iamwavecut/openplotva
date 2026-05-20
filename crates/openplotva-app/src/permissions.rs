@@ -335,6 +335,8 @@ fn permission_error_media_flag(method_kind: TelegramOutboundMethodKind) -> Optio
         | TelegramOutboundMethodKind::EditMessageReplyMarkup
         | TelegramOutboundMethodKind::EditMessageMedia
         | TelegramOutboundMethodKind::AnswerCallbackQuery
+        | TelegramOutboundMethodKind::AnswerInlineQuery
+        | TelegramOutboundMethodKind::AnswerGuestQuery
         | TelegramOutboundMethodKind::DeleteMessage => None,
     }
 }
@@ -504,6 +506,12 @@ mod tests {
         );
         assert!(
             dispatcher_required_actions(TelegramOutboundMethodKind::AnswerCallbackQuery).is_empty()
+        );
+        assert!(
+            dispatcher_required_actions(TelegramOutboundMethodKind::AnswerInlineQuery).is_empty()
+        );
+        assert!(
+            dispatcher_required_actions(TelegramOutboundMethodKind::AnswerGuestQuery).is_empty()
         );
         assert!(dispatcher_required_actions(TelegramOutboundMethodKind::SendPhoto).is_empty());
     }

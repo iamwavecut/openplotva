@@ -334,6 +334,8 @@ fn replay_method_from_value(
         TelegramOutboundMethodKind::SendMediaGroup => replay_media_group_method(value),
         TelegramOutboundMethodKind::SendChatAction => None,
         TelegramOutboundMethodKind::AnswerCallbackQuery => None,
+        TelegramOutboundMethodKind::AnswerInlineQuery => None,
+        TelegramOutboundMethodKind::AnswerGuestQuery => None,
         TelegramOutboundMethodKind::EditMessageText => replay_edit_text_method(value),
         TelegramOutboundMethodKind::EditMessageCaption
         | TelegramOutboundMethodKind::EditMessageReplyMarkup => None,
@@ -505,6 +507,8 @@ fn fingerprint_from_value(
         },
         TelegramOutboundMethodKind::SendChatAction
         | TelegramOutboundMethodKind::AnswerCallbackQuery
+        | TelegramOutboundMethodKind::AnswerInlineQuery
+        | TelegramOutboundMethodKind::AnswerGuestQuery
         | TelegramOutboundMethodKind::EditMessageText
         | TelegramOutboundMethodKind::EditMessageCaption
         | TelegramOutboundMethodKind::EditMessageReplyMarkup
@@ -698,6 +702,8 @@ fn serialize_outbound_method(
         | TelegramOutboundMethod::SendMediaGroup(_)
         | TelegramOutboundMethod::SendChatAction(_)
         | TelegramOutboundMethod::AnswerCallbackQuery(_)
+        | TelegramOutboundMethod::AnswerInlineQuery(_)
+        | TelegramOutboundMethod::AnswerGuestQuery(_)
         | TelegramOutboundMethod::EditMessageCaption(_)
         | TelegramOutboundMethod::EditMessageReplyMarkup(_)
         | TelegramOutboundMethod::EditMessageMedia(_)
@@ -714,6 +720,8 @@ fn go_message_type(kind: TelegramOutboundMethodKind) -> &'static str {
         TelegramOutboundMethodKind::SendMediaGroup => "*api.MediaGroupConfig",
         TelegramOutboundMethodKind::SendChatAction => "*api.ChatActionConfig",
         TelegramOutboundMethodKind::AnswerCallbackQuery => "*api.CallbackConfig",
+        TelegramOutboundMethodKind::AnswerInlineQuery => "api.InlineConfig",
+        TelegramOutboundMethodKind::AnswerGuestQuery => "api.AnswerGuestQueryConfig",
         TelegramOutboundMethodKind::EditMessageText => "*api.EditMessageTextConfig",
         TelegramOutboundMethodKind::EditMessageCaption => "*api.EditMessageCaptionConfig",
         TelegramOutboundMethodKind::EditMessageReplyMarkup => "*api.EditMessageReplyMarkupConfig",
@@ -752,6 +760,12 @@ fn message_type_method_kind(message_type: &str) -> Option<TelegramOutboundMethod
         | "*api.CallbackConfig"
         | "tgbotapi.CallbackConfig"
         | "api.CallbackConfig" => Some(TelegramOutboundMethodKind::AnswerCallbackQuery),
+        "api.InlineConfig" | "tgbotapi.InlineConfig" => {
+            Some(TelegramOutboundMethodKind::AnswerInlineQuery)
+        }
+        "api.AnswerGuestQueryConfig" | "tgbotapi.AnswerGuestQueryConfig" => {
+            Some(TelegramOutboundMethodKind::AnswerGuestQuery)
+        }
         "*api.EditMessageTextConfig" | "api.EditMessageTextConfig" => {
             Some(TelegramOutboundMethodKind::EditMessageText)
         }

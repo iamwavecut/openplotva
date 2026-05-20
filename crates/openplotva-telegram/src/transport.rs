@@ -1,9 +1,10 @@
 use carapax::{
     api::{Client, ExecuteError},
     types::{
-        AnswerCallbackQuery, DeleteMessage, EditMessageCaption, EditMessageMedia,
-        EditMessageReplyMarkup, EditMessageResult, EditMessageText, Message, SendAudio,
-        SendChatAction, SendMediaGroup, SendMessage, SendPhoto, SendSticker,
+        AnswerCallbackQuery, AnswerGuestQuery, AnswerInlineQuery, DeleteMessage,
+        EditMessageCaption, EditMessageMedia, EditMessageReplyMarkup, EditMessageResult,
+        EditMessageText, Message, SendAudio, SendChatAction, SendMediaGroup, SendMessage,
+        SendPhoto, SendSticker, SentGuestMessage,
     },
 };
 
@@ -26,6 +27,10 @@ pub enum TelegramOutboundMethod {
     SendChatAction(Box<SendChatAction>),
     /// Telegram `answerCallbackQuery`.
     AnswerCallbackQuery(Box<AnswerCallbackQuery>),
+    /// Telegram `answerInlineQuery`.
+    AnswerInlineQuery(Box<AnswerInlineQuery>),
+    /// Telegram `answerGuestQuery`.
+    AnswerGuestQuery(Box<AnswerGuestQuery>),
     /// Telegram `editMessageText`.
     EditMessageText(Box<EditMessageText>),
     /// Telegram `editMessageCaption`.
@@ -55,6 +60,10 @@ pub enum TelegramOutboundMethodKind {
     SendChatAction,
     /// Telegram `answerCallbackQuery`.
     AnswerCallbackQuery,
+    /// Telegram `answerInlineQuery`.
+    AnswerInlineQuery,
+    /// Telegram `answerGuestQuery`.
+    AnswerGuestQuery,
     /// Telegram `editMessageText`.
     EditMessageText,
     /// Telegram `editMessageCaption`.
@@ -78,6 +87,8 @@ pub enum TelegramOutboundResponseKind {
     EditMessage,
     /// Methods returning a boolean success flag.
     Boolean,
+    /// Telegram `answerGuestQuery` sent-message result.
+    SentGuestMessage,
 }
 
 /// Concrete successful response from executing an outbound Telegram method.
@@ -91,6 +102,8 @@ pub enum TelegramOutboundResponse {
     EditMessage(EditMessageResult),
     /// Boolean success flag.
     Boolean(bool),
+    /// Inline guest message response from `answerGuestQuery`.
+    SentGuestMessage(Box<SentGuestMessage>),
 }
 
 impl TelegramOutboundMethod {
@@ -104,6 +117,8 @@ impl TelegramOutboundMethod {
             Self::SendMediaGroup(_) => TelegramOutboundMethodKind::SendMediaGroup,
             Self::SendChatAction(_) => TelegramOutboundMethodKind::SendChatAction,
             Self::AnswerCallbackQuery(_) => TelegramOutboundMethodKind::AnswerCallbackQuery,
+            Self::AnswerInlineQuery(_) => TelegramOutboundMethodKind::AnswerInlineQuery,
+            Self::AnswerGuestQuery(_) => TelegramOutboundMethodKind::AnswerGuestQuery,
             Self::EditMessageText(_) => TelegramOutboundMethodKind::EditMessageText,
             Self::EditMessageCaption(_) => TelegramOutboundMethodKind::EditMessageCaption,
             Self::EditMessageReplyMarkup(_) => TelegramOutboundMethodKind::EditMessageReplyMarkup,
@@ -122,6 +137,8 @@ impl TelegramOutboundMethod {
             Self::SendMediaGroup(_) => "sendMediaGroup",
             Self::SendChatAction(_) => "sendChatAction",
             Self::AnswerCallbackQuery(_) => "answerCallbackQuery",
+            Self::AnswerInlineQuery(_) => "answerInlineQuery",
+            Self::AnswerGuestQuery(_) => "answerGuestQuery",
             Self::EditMessageText(_) => "editMessageText",
             Self::EditMessageCaption(_) => "editMessageCaption",
             Self::EditMessageReplyMarkup(_) => "editMessageReplyMarkup",
@@ -138,9 +155,10 @@ impl TelegramOutboundMethod {
             | Self::SendPhoto(_)
             | Self::SendAudio(_) => TelegramOutboundResponseKind::Message,
             Self::SendMediaGroup(_) => TelegramOutboundResponseKind::Messages,
-            Self::SendChatAction(_) | Self::AnswerCallbackQuery(_) => {
+            Self::SendChatAction(_) | Self::AnswerCallbackQuery(_) | Self::AnswerInlineQuery(_) => {
                 TelegramOutboundResponseKind::Boolean
             }
+            Self::AnswerGuestQuery(_) => TelegramOutboundResponseKind::SentGuestMessage,
             Self::EditMessageText(_)
             | Self::EditMessageCaption(_)
             | Self::EditMessageReplyMarkup(_)
@@ -192,6 +210,14 @@ pub async fn execute_telegram_method(
             .execute(*method)
             .await
             .map(TelegramOutboundResponse::Boolean),
+        TelegramOutboundMethod::AnswerInlineQuery(method) => client
+            .execute(*method)
+            .await
+            .map(TelegramOutboundResponse::Boolean),
+        TelegramOutboundMethod::AnswerGuestQuery(method) => client
+            .execute(*method)
+            .await
+            .map(|message| TelegramOutboundResponse::SentGuestMessage(Box::new(message))),
         TelegramOutboundMethod::EditMessageText(method) => client
             .execute(*method)
             .await
@@ -268,6 +294,18 @@ impl From<AnswerCallbackQuery> for TelegramOutboundMethod {
     }
 }
 
+impl From<AnswerInlineQuery> for TelegramOutboundMethod {
+    fn from(value: AnswerInlineQuery) -> Self {
+        Self::AnswerInlineQuery(Box::new(value))
+    }
+}
+
+impl From<AnswerGuestQuery> for TelegramOutboundMethod {
+    fn from(value: AnswerGuestQuery) -> Self {
+        Self::AnswerGuestQuery(Box::new(value))
+    }
+}
+
 impl From<EditMessageText> for TelegramOutboundMethod {
     fn from(value: EditMessageText) -> Self {
         Self::EditMessageText(Box::new(value))
@@ -304,14 +342,16 @@ mod tests {
     use crate::{
         AudioMessageRequest, AudioSource, CallbackAnswerRequest, ChatActionRequest, ChatRef,
         EditCaptionMessageRequest, EditMediaMessageRequest, EditReplyMarkupMessageRequest,
-        EditTextMessageRequest, InlineKeyboardButton, InlineKeyboardMarkup,
+        EditTextMessageRequest, GuestQueryAnswerRequest, InlineArticleRequest,
+        InlineKeyboardButton, InlineKeyboardMarkup, InlineQueryAnswerRequest,
         MediaGroupMessageRequest, MediaGroupPhotoItem, PhotoMessageRequest, PhotoSource,
         StickerMessageRequest, TELEGRAM_PARSE_MODE_HTML, TextMessageRequest,
         build_audio_message_method, build_callback_answer_method, build_chat_action_method,
         build_edit_caption_message_method, build_edit_media_message_method,
         build_edit_reply_markup_message_method, build_edit_text_message_method,
-        build_media_group_message_method, build_photo_message_method, build_sticker_message_method,
-        build_text_message_method,
+        build_guest_query_answer_method, build_inline_query_answer_method,
+        build_inline_query_result_article, build_media_group_message_method,
+        build_photo_message_method, build_sticker_message_method, build_text_message_method,
     };
 
     fn chat(id: i64) -> ChatRef {
@@ -451,6 +491,30 @@ mod tests {
                 url: String::new(),
                 cache_time: 0,
             }));
+        let inline_article = build_inline_query_result_article(&InlineArticleRequest {
+            id: "inline-id".to_owned(),
+            title: "Шевелись, Плотва!".to_owned(),
+            message_text: "raw query".to_owned(),
+            render_as: String::new(),
+            description: String::new(),
+            reply_markup: None,
+        })
+        .expect("inline article");
+        let inline_answer = TelegramOutboundMethod::from(build_inline_query_answer_method(
+            &InlineQueryAnswerRequest {
+                inline_query_id: "inline-id".to_owned(),
+                results: vec![inline_article.clone()],
+                cache_time: 1,
+                is_personal: true,
+                next_offset: String::new(),
+            },
+        ));
+        let guest_answer = TelegramOutboundMethod::from(build_guest_query_answer_method(
+            &GuestQueryAnswerRequest {
+                guest_query_id: "guest-query".to_owned(),
+                result: inline_article,
+            },
+        ));
         let delete_message =
             TelegramOutboundMethod::from(carapax::types::DeleteMessage::new(42, 7));
 
@@ -520,6 +584,18 @@ mod tests {
                 TelegramOutboundMethodKind::AnswerCallbackQuery,
                 "answerCallbackQuery",
                 TelegramOutboundResponseKind::Boolean,
+            ),
+            (
+                inline_answer,
+                TelegramOutboundMethodKind::AnswerInlineQuery,
+                "answerInlineQuery",
+                TelegramOutboundResponseKind::Boolean,
+            ),
+            (
+                guest_answer,
+                TelegramOutboundMethodKind::AnswerGuestQuery,
+                "answerGuestQuery",
+                TelegramOutboundResponseKind::SentGuestMessage,
             ),
             (
                 delete_message,
