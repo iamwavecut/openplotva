@@ -1,5 +1,6 @@
 //! Telegram Bot API boundary for OpenPlotva.
 
+mod callback;
 mod dedup;
 mod dispatcher;
 mod html;
@@ -10,6 +11,11 @@ mod rate_limit;
 mod transport;
 mod update_startup;
 
+pub use callback::{
+    CallbackActionData, CallbackActionParse, CallbackHandlerKind, callback_handler_for_action,
+    checkin_theme_callback_init, checkin_theme_callback_theme, checkin_theme_selection_alert,
+    parse_callback_action,
+};
 pub use dedup::{DEFAULT_DEBOUNCE_CACHE_SIZE, DEFAULT_DEBOUNCE_WINDOW, Debouncer, DebouncerConfig};
 pub use dispatcher::{
     DEFAULT_DISPATCHER_CLEANUP_INTERVAL, DispatcherConfig, DispatcherDrain, DispatcherMessage,
@@ -594,9 +600,11 @@ mod tests {
 
     use super::{
         API_CONSTRUCTOR_USAGES, BotCommandError, BotCommandScope, CALLBACK_ACTIONS,
-        COMMAND_ALIAS_GROUPS, COMMAND_SETS, CommandScope, DONATE_COMMAND, GROUP_ADMIN_COMMANDS,
-        GROUP_COMMANDS, HELP_COMMAND, PRIVATE_COMMANDS, delete_my_commands_method, empty_context,
-        set_my_commands_methods,
+        COMMAND_ALIAS_GROUPS, COMMAND_SETS, CallbackActionParse, CallbackHandlerKind, CommandScope,
+        DONATE_COMMAND, GROUP_ADMIN_COMMANDS, GROUP_COMMANDS, HELP_COMMAND, PRIVATE_COMMANDS,
+        callback_handler_for_action, checkin_theme_callback_init, checkin_theme_callback_theme,
+        checkin_theme_selection_alert, delete_my_commands_method, empty_context,
+        parse_callback_action, set_my_commands_methods,
     };
 
     #[derive(Debug, Deserialize)]
@@ -748,6 +756,99 @@ mod tests {
         assert_eq!(actual, expected);
 
         Ok(())
+    }
+
+    #[test]
+    fn parse_callback_action_uses_long_and_short_keys() {
+        let CallbackActionParse::Action { data, action } =
+            parse_callback_action(r#"{"action":"delete"}"#)
+        else {
+            panic!("expected action callback data");
+        };
+        assert_eq!(action, "delete");
+        assert_eq!(data.get("action").map(String::as_str), Some("delete"));
+
+        let CallbackActionParse::Action { data, action } =
+            parse_callback_action(r#"{"a":"del_i","u":"1"}"#)
+        else {
+            panic!("expected short action callback data");
+        };
+        assert_eq!(action, "del_i");
+        assert_eq!(data.get("u").map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn parse_callback_action_rejects_legacy_or_actionless_data() {
+        assert_eq!(
+            parse_callback_action("old-format"),
+            CallbackActionParse::Invalid
+        );
+
+        let CallbackActionParse::Actionless(data) = parse_callback_action(r#"{"u":"1"}"#) else {
+            panic!("expected json callback data without action");
+        };
+        assert_eq!(data.get("u").map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn callback_handler_for_action_covers_known_actions() {
+        for action in [
+            "delete",
+            "cancel_vip",
+            "confirm_cancel_vip",
+            "back_to_vip_status",
+            "checkin_theme_select",
+            "cts",
+            "del_i",
+            "dl_i",
+        ] {
+            assert!(
+                callback_handler_for_action(action).is_some(),
+                "expected callback handler for {action}"
+            );
+        }
+
+        assert_eq!(callback_handler_for_action("unknown"), None);
+        assert_eq!(
+            callback_handler_for_action("checkin_theme_select"),
+            Some(CallbackHandlerKind::CheckinThemeSelect)
+        );
+    }
+
+    #[test]
+    fn checkin_theme_callback_data_uses_long_and_short_keys() {
+        let long = parse_callback_action(r#"{"init":"10","i":"20","theme":"classic","t":"short"}"#)
+            .into_data()
+            .expect("callback data");
+        assert_eq!(checkin_theme_callback_init(&long), Some("10"));
+        assert_eq!(checkin_theme_callback_theme(&long), "classic");
+
+        let short = parse_callback_action(r#"{"i":"20","t":"short"}"#)
+            .into_data()
+            .expect("callback data");
+        assert_eq!(checkin_theme_callback_init(&short), Some("20"));
+        assert_eq!(checkin_theme_callback_theme(&short), "short");
+    }
+
+    #[test]
+    fn checkin_theme_selection_alert_matches_go_blocking() {
+        let own = parse_callback_action(r#"{"init":"10"}"#)
+            .into_data()
+            .expect("callback data");
+        assert_eq!(checkin_theme_selection_alert(10, &own), ("", false));
+
+        let foreign = parse_callback_action(r#"{"init":"20"}"#)
+            .into_data()
+            .expect("callback data");
+        assert_eq!(
+            checkin_theme_selection_alert(10, &foreign),
+            ("Только инициатор может выбрать тему", true)
+        );
+
+        let missing = parse_callback_action(r#"{"theme":"classic"}"#)
+            .into_data()
+            .expect("callback data");
+        assert_eq!(checkin_theme_selection_alert(10, &missing), ("", true));
     }
 
     #[test]
