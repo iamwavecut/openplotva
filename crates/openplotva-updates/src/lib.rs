@@ -1763,6 +1763,74 @@ pub fn guest_message_reject_reason(
     None
 }
 
+/// Return Go `isGuestUnsupportedFeatureRequest` for guest-mode routing.
+#[must_use]
+pub fn is_guest_unsupported_feature_request(
+    message: Option<&TelegramMessage>,
+    bot_username: &str,
+) -> bool {
+    let text = strip_guest_address_prefix(&guest_visible_text(message), bot_username)
+        .trim()
+        .to_lowercase();
+    if text.is_empty() {
+        return false;
+    }
+
+    let (first_word, rest_text) = cut_first_word(&text);
+    let first_word = normalize_guest_command_word(&first_word, bot_username);
+    let first_word = first_word.as_str();
+
+    if first_word == "%"
+        || DRAW_VERB_ALIASES.contains(&first_word)
+        || GUEST_DRAW_BANG_ALIASES.contains(&first_word)
+        || SONG_ALIASES.contains(&first_word)
+        || is_edit_verb(first_word)
+        || GUEST_UNSUPPORTED_COMMANDS.contains(&first_word)
+        || first_word.starts_with("admin")
+    {
+        return true;
+    }
+
+    looks_like_guest_history_summary_request(first_word, &rest_text)
+}
+
+/// Return Go `looksLikeGuestHistorySummaryRequest`.
+#[must_use]
+pub fn looks_like_guest_history_summary_request(first_word: &str, rest_text: &str) -> bool {
+    let text = format!("{first_word} {rest_text}").trim().to_owned();
+    if text.is_empty() {
+        return false;
+    }
+
+    let has_summary_verb = text.contains("перескаж")
+        || text.contains("summary")
+        || text.contains("recap")
+        || text.contains("о чем говорили")
+        || text.contains("о чём говорили");
+    has_summary_verb && (text.contains("чат") || text.contains("тред") || text.contains("сообщен"))
+}
+
+/// Return Go `normalizeGuestCommandWord`.
+#[must_use]
+pub fn normalize_guest_command_word(word: &str, bot_username: &str) -> String {
+    let word = word.trim().strip_prefix('/').unwrap_or(word.trim());
+    if word.is_empty() {
+        return String::new();
+    }
+
+    let Some((command, username)) = word.split_once('@') else {
+        return word.to_owned();
+    };
+
+    if bot_username.is_empty()
+        || username.eq_ignore_ascii_case(bot_username.trim().trim_start_matches('@'))
+    {
+        return command.to_owned();
+    }
+
+    word.to_owned()
+}
+
 fn message_text_before_fetcher_fallback(message: &TelegramMessage) -> String {
     match &message.data {
         TelegramMessageData::Text(text) => text.as_ref().to_owned(),
@@ -1958,7 +2026,20 @@ const BOT_ADDRESSED_RESPONSE_SAMPLING_DIVISOR: u64 = 3;
 
 const DRAW_VERB_ALIASES: &[&str] = &["нарисуй", "draw", "рисуй"];
 
+const GUEST_DRAW_BANG_ALIASES: &[&str] = &["!рис", "!draw"];
+
 const DRAW_REPLY_PREFIXES: &[&str] = &["это", "this", "that", "these", "those"];
+
+const SONG_ALIASES: &[&str] = &["song", "песня", "!song", "!песня"];
+
+const GUEST_UNSUPPORTED_COMMANDS: &[&str] = &[
+    "settings",
+    "admin_settings",
+    "delete_drawing",
+    "queue_status",
+    "cancel_drawing",
+    "очередь",
+];
 
 const EDIT_VERB_ALIASES: &[&str] = &[
     "изменить",
@@ -2415,9 +2496,10 @@ mod tests {
         edited_image_prompt_update, extract_update_state, fetcher_message_text,
         guest_current_request_text, guest_has_other_bot_mention, guest_message_reject_reason,
         guest_request_has_visible_text, guest_visible_text, is_allowed_producer_update,
-        is_settings_command_message, parse_edit_command, parse_if_addressed, process_update_at,
-        producer_update_name, producer_update_type, react_message_words,
-        resolve_draw_prompt_from_message, run_update_producer_until,
+        is_guest_unsupported_feature_request, is_settings_command_message,
+        looks_like_guest_history_summary_request, normalize_guest_command_word, parse_edit_command,
+        parse_if_addressed, process_update_at, producer_update_name, producer_update_type,
+        react_message_words, resolve_draw_prompt_from_message, run_update_producer_until,
         should_handle_addressed_message, should_handle_random_response, strip_guest_address_prefix,
         telegram_message_attachments, update_name,
     };
@@ -3209,6 +3291,66 @@ mod tests {
         assert!(!guest_has_other_bot_mention(None, Some(&bot)));
 
         Ok(())
+    }
+
+    #[test]
+    fn guest_unsupported_feature_request_matches_go_command_blocks() -> Result<(), Box<dyn Error>> {
+        let cases = [
+            ("@PlotvaBot draw a cat", true),
+            ("/draw@PlotvaBot cat", true),
+            ("!рис кота", true),
+            ("песня про море", true),
+            ("измени картинку", true),
+            ("/settings@PlotvaBot", true),
+            ("queue_status", true),
+            ("cancel_drawing", true),
+            ("admin_chat_settings 42", true),
+            ("%", true),
+            ("перескажи о чём говорили в чате", true),
+            ("@PlotvaBot", false),
+            ("/draw@OtherBot cat", false),
+            ("summary only", false),
+            ("просто поговорим", false),
+        ];
+
+        for (text, want) in cases {
+            let message = sample_guest_message_from_value(sample_guest_message_json(520, text))?;
+            assert_eq!(
+                is_guest_unsupported_feature_request(Some(&message), "PlotvaBot"),
+                want,
+                "guest unsupported feature detection for {text:?}"
+            );
+        }
+        assert!(!is_guest_unsupported_feature_request(None, "PlotvaBot"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn guest_command_normalization_and_history_summary_match_go_helpers() {
+        assert_eq!(
+            normalize_guest_command_word("/draw@PlotvaBot", "plotvabot"),
+            "draw"
+        );
+        assert_eq!(
+            normalize_guest_command_word("/draw@OtherBot", "plotvabot"),
+            "draw@OtherBot"
+        );
+        assert_eq!(normalize_guest_command_word("/settings", ""), "settings");
+
+        assert!(looks_like_guest_history_summary_request(
+            "перескажи",
+            "о чем говорили в чате"
+        ));
+        assert!(looks_like_guest_history_summary_request(
+            "summary",
+            "чат recap"
+        ));
+        assert!(!looks_like_guest_history_summary_request("summary", "only"));
+        assert!(!looks_like_guest_history_summary_request(
+            "перескажи",
+            "личные новости"
+        ));
     }
 
     #[test]
