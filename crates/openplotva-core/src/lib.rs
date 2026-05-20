@@ -112,6 +112,91 @@ impl UpdateState {
     }
 }
 
+/// Go `chat_settings` fields used by permission and settings behavior.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChatSettings {
+    /// Telegram chat ID.
+    pub chat_id: i64,
+    /// Chat persona mood alignment.
+    pub mood_alignment: Option<String>,
+    /// Chat custom persona text.
+    pub custom_persona: Option<String>,
+    /// Text reactivity percentage.
+    pub reactivity_percentage: i32,
+    /// Proactivity percentage.
+    pub proactivity_percentage: i32,
+    /// Whether global text replies are enabled.
+    pub enable_global_text_reply: bool,
+    /// Whether global draw/media replies are enabled.
+    pub enable_global_draw_reply: bool,
+    /// Whether the obscenifier feature is enabled.
+    pub enable_obscenifier: bool,
+    /// Whether profanity is enabled.
+    pub enable_profanity: bool,
+    /// Whether join greetings are enabled.
+    pub enable_greet_joiners: bool,
+    /// Whether the daily game is enabled. Go keeps this nullable in stored rows.
+    pub enable_daily_game: Option<bool>,
+    /// Daily game theme. Go defaults blank or missing values to `auto` on permission updates.
+    pub daily_game_theme: Option<String>,
+    /// Greeting HTML. Go permission updates leave this unset.
+    pub greeting_html: Option<String>,
+}
+
+impl ChatSettings {
+    /// Build Go default chat settings from `internal/db/defaults.Settings`.
+    pub fn defaults(chat_id: i64) -> Self {
+        Self {
+            chat_id,
+            mood_alignment: Some("neutral".to_owned()),
+            custom_persona: None,
+            reactivity_percentage: 3,
+            proactivity_percentage: 0,
+            enable_global_text_reply: true,
+            enable_global_draw_reply: true,
+            enable_obscenifier: true,
+            enable_profanity: true,
+            enable_greet_joiners: false,
+            enable_daily_game: Some(true),
+            daily_game_theme: Some("auto".to_owned()),
+            greeting_html: None,
+        }
+    }
+}
+
+/// Go `UpsertChatSettingsParams` shape used when permission errors auto-disable replies.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChatSettingsUpdate {
+    /// Telegram chat ID.
+    pub chat_id: i64,
+    /// Chat type to upsert into `chats` before writing settings.
+    pub chat_type: String,
+    /// Chat persona mood alignment.
+    pub mood_alignment: Option<String>,
+    /// Chat custom persona text.
+    pub custom_persona: Option<String>,
+    /// Text reactivity percentage.
+    pub reactivity_percentage: i32,
+    /// Proactivity percentage.
+    pub proactivity_percentage: i32,
+    /// Whether global text replies are enabled.
+    pub enable_global_text_reply: bool,
+    /// Whether global draw/media replies are enabled.
+    pub enable_global_draw_reply: bool,
+    /// Whether the obscenifier feature is enabled.
+    pub enable_obscenifier: bool,
+    /// Whether profanity is enabled.
+    pub enable_profanity: bool,
+    /// Whether join greetings are enabled.
+    pub enable_greet_joiners: bool,
+    /// Whether the daily game is enabled.
+    pub enable_daily_game: bool,
+    /// Daily game theme.
+    pub daily_game_theme: String,
+    /// Greeting HTML. Go permission updates leave this unset.
+    pub greeting_html: Option<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PendingOp {
     /// Pending operation ID.
@@ -215,7 +300,7 @@ fn non_blank_string(value: Option<String>) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ChatState, PendingEditPayload, UserState, pending_edit_payload};
+    use super::{ChatSettings, ChatState, PendingEditPayload, UserState, pending_edit_payload};
 
     #[test]
     fn pending_edit_payload_decodes_text_and_parse_mode_like_go() {
@@ -278,5 +363,22 @@ mod tests {
                 is_premium: Some(true),
             }
         );
+    }
+
+    #[test]
+    fn chat_settings_defaults_match_go_defaults() {
+        let settings = ChatSettings::defaults(42);
+
+        assert_eq!(settings.chat_id, 42);
+        assert_eq!(settings.mood_alignment.as_deref(), Some("neutral"));
+        assert_eq!(settings.reactivity_percentage, 3);
+        assert_eq!(settings.proactivity_percentage, 0);
+        assert!(settings.enable_global_text_reply);
+        assert!(settings.enable_global_draw_reply);
+        assert!(settings.enable_obscenifier);
+        assert!(settings.enable_profanity);
+        assert!(!settings.enable_greet_joiners);
+        assert_eq!(settings.enable_daily_game, Some(true));
+        assert_eq!(settings.daily_game_theme.as_deref(), Some("auto"));
     }
 }

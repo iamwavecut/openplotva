@@ -3,7 +3,9 @@
 use std::time::Duration;
 
 use openplotva_config::{PostgresConfig, RedisConfig};
-use openplotva_core::{ChatState, MessageIdMapping, PendingOp, UserState};
+use openplotva_core::{
+    ChatSettings, ChatSettingsUpdate, ChatState, MessageIdMapping, PendingOp, UserState,
+};
 use redis::{
     Client as RedisClient, ConnectionAddr, ConnectionInfo, IntoConnectionInfo, RedisConnectionInfo,
 };
@@ -62,6 +64,12 @@ pub const SQL_MARK_OP_DONE: &str =
 /// Go `MarkOpFailed` SQL.
 pub const SQL_MARK_OP_FAILED: &str =
     "UPDATE message_ops_queue SET attempts = attempts + 1, last_error = $2 WHERE id = $1";
+
+/// Go `GetChatSettings` SQL narrowed to fields currently needed by permission policy.
+pub const SQL_GET_CHAT_SETTINGS: &str = "SELECT chat_id, mood_alignment, custom_persona, reactivity_percentage, proactivity_percentage, enable_global_text_reply, enable_global_draw_reply, enable_obscenifier, enable_profanity, enable_greet_joiners, enable_daily_game, daily_game_theme, greeting_html FROM chat_settings WHERE chat_id = $1";
+
+/// Go `UpsertChatSettings` SQL with positional bindings for the permission update shape.
+pub const SQL_UPSERT_CHAT_SETTINGS: &str = "WITH ensure_chat AS (INSERT INTO chats (id, type) VALUES ($1, COALESCE(NULLIF($14::text, ''), 'private')) ON CONFLICT (id) DO NOTHING) INSERT INTO chat_settings (chat_id, mood_alignment, custom_persona, reactivity_percentage, proactivity_percentage, enable_obscenifier, enable_profanity, enable_greet_joiners, enable_global_text_reply, enable_global_draw_reply, enable_daily_game, daily_game_theme, updated, greeting_html) VALUES ($1, $2, $3, $4, $5, COALESCE($6, TRUE)::boolean, COALESCE($7, TRUE)::boolean, COALESCE($8, FALSE)::boolean, COALESCE($9, TRUE)::boolean, COALESCE($10, TRUE)::boolean, COALESCE($11, TRUE)::boolean, COALESCE($12, 'auto')::text, CURRENT_TIMESTAMP, $13) ON CONFLICT (chat_id) DO UPDATE SET mood_alignment = EXCLUDED.mood_alignment, custom_persona = EXCLUDED.custom_persona, reactivity_percentage = COALESCE(EXCLUDED.reactivity_percentage, chat_settings.reactivity_percentage), proactivity_percentage = COALESCE(EXCLUDED.proactivity_percentage, chat_settings.proactivity_percentage), enable_obscenifier = COALESCE(EXCLUDED.enable_obscenifier, chat_settings.enable_obscenifier), enable_profanity = COALESCE(EXCLUDED.enable_profanity, chat_settings.enable_profanity), enable_greet_joiners = COALESCE(EXCLUDED.enable_greet_joiners, chat_settings.enable_greet_joiners), enable_global_text_reply = COALESCE(EXCLUDED.enable_global_text_reply, chat_settings.enable_global_text_reply), enable_global_draw_reply = COALESCE(EXCLUDED.enable_global_draw_reply, chat_settings.enable_global_draw_reply), enable_daily_game = COALESCE(EXCLUDED.enable_daily_game, chat_settings.enable_daily_game), daily_game_theme = EXCLUDED.daily_game_theme, greeting_html = EXCLUDED.greeting_html, updated = CURRENT_TIMESTAMP";
 
 /// Go `SelectTextHistoryEntryPayload` plus the conflict keys needed for Rust-native updates.
 pub const SQL_SELECT_TEXT_HISTORY_ENTRY: &str = "SELECT bucket_day, entry_id, payload::text AS payload FROM chat_history_entries WHERE chat_id = $1 AND message_id = $2 AND kind = 'text' ORDER BY occurred_at DESC LIMIT 1";
@@ -394,6 +402,61 @@ impl PostgresVirtualMessageStore {
     }
 }
 
+/// SQLx-backed storage for Go chat settings used by permission policy.
+#[derive(Clone, Debug)]
+pub struct PostgresChatSettingsStore {
+    pool: PgPool,
+}
+
+impl PostgresChatSettingsStore {
+    /// Build a chat-settings store on an existing Postgres pool.
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
+    /// Access the underlying Postgres pool.
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
+    /// Load Go `chat_settings` for one chat.
+    pub async fn get_chat_settings(
+        &self,
+        chat_id: i64,
+    ) -> Result<Option<ChatSettings>, StorageError> {
+        let row = sqlx::query(SQL_GET_CHAT_SETTINGS)
+            .bind(chat_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(chat_settings_from_row).transpose()?)
+    }
+
+    /// Upsert Go `chat_settings` using the permission-update parameter shape.
+    pub async fn upsert_chat_settings(
+        &self,
+        update: &ChatSettingsUpdate,
+    ) -> Result<(), StorageError> {
+        sqlx::query(SQL_UPSERT_CHAT_SETTINGS)
+            .bind(update.chat_id)
+            .bind(update.mood_alignment.as_deref())
+            .bind(update.custom_persona.as_deref())
+            .bind(update.reactivity_percentage)
+            .bind(update.proactivity_percentage)
+            .bind(update.enable_obscenifier)
+            .bind(update.enable_profanity)
+            .bind(update.enable_greet_joiners)
+            .bind(update.enable_global_text_reply)
+            .bind(update.enable_global_draw_reply)
+            .bind(update.enable_daily_game)
+            .bind(update.daily_game_theme.as_str())
+            .bind(update.greeting_html.as_deref())
+            .bind(update.chat_type.as_str())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+}
+
 /// SQLx-backed storage for Go chat-history edit/delete side effects.
 #[derive(Clone, Debug)]
 pub struct PostgresHistoryStore {
@@ -697,6 +760,24 @@ fn pending_op_from_row(row: PgRow) -> Result<PendingOp, sqlx::Error> {
     })
 }
 
+fn chat_settings_from_row(row: PgRow) -> Result<ChatSettings, sqlx::Error> {
+    Ok(ChatSettings {
+        chat_id: row.try_get("chat_id")?,
+        mood_alignment: row.try_get("mood_alignment")?,
+        custom_persona: row.try_get("custom_persona")?,
+        reactivity_percentage: row.try_get("reactivity_percentage")?,
+        proactivity_percentage: row.try_get("proactivity_percentage")?,
+        enable_global_text_reply: row.try_get("enable_global_text_reply")?,
+        enable_global_draw_reply: row.try_get("enable_global_draw_reply")?,
+        enable_obscenifier: row.try_get("enable_obscenifier")?,
+        enable_profanity: row.try_get("enable_profanity")?,
+        enable_greet_joiners: row.try_get("enable_greet_joiners")?,
+        enable_daily_game: row.try_get("enable_daily_game")?,
+        daily_game_theme: row.try_get("daily_game_theme")?,
+        greeting_html: row.try_get("greeting_html")?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -950,6 +1031,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn chat_settings_sql_matches_go_permission_contracts() {
+        let _settings = openplotva_core::ChatSettings::defaults(42);
+        assert_eq!(
+            super::SQL_GET_CHAT_SETTINGS,
+            "SELECT chat_id, mood_alignment, custom_persona, reactivity_percentage, proactivity_percentage, enable_global_text_reply, enable_global_draw_reply, enable_obscenifier, enable_profanity, enable_greet_joiners, enable_daily_game, daily_game_theme, greeting_html FROM chat_settings WHERE chat_id = $1"
+        );
+        assert_eq!(
+            super::SQL_UPSERT_CHAT_SETTINGS,
+            "WITH ensure_chat AS (INSERT INTO chats (id, type) VALUES ($1, COALESCE(NULLIF($14::text, ''), 'private')) ON CONFLICT (id) DO NOTHING) INSERT INTO chat_settings (chat_id, mood_alignment, custom_persona, reactivity_percentage, proactivity_percentage, enable_obscenifier, enable_profanity, enable_greet_joiners, enable_global_text_reply, enable_global_draw_reply, enable_daily_game, daily_game_theme, updated, greeting_html) VALUES ($1, $2, $3, $4, $5, COALESCE($6, TRUE)::boolean, COALESCE($7, TRUE)::boolean, COALESCE($8, FALSE)::boolean, COALESCE($9, TRUE)::boolean, COALESCE($10, TRUE)::boolean, COALESCE($11, TRUE)::boolean, COALESCE($12, 'auto')::text, CURRENT_TIMESTAMP, $13) ON CONFLICT (chat_id) DO UPDATE SET mood_alignment = EXCLUDED.mood_alignment, custom_persona = EXCLUDED.custom_persona, reactivity_percentage = COALESCE(EXCLUDED.reactivity_percentage, chat_settings.reactivity_percentage), proactivity_percentage = COALESCE(EXCLUDED.proactivity_percentage, chat_settings.proactivity_percentage), enable_obscenifier = COALESCE(EXCLUDED.enable_obscenifier, chat_settings.enable_obscenifier), enable_profanity = COALESCE(EXCLUDED.enable_profanity, chat_settings.enable_profanity), enable_greet_joiners = COALESCE(EXCLUDED.enable_greet_joiners, chat_settings.enable_greet_joiners), enable_global_text_reply = COALESCE(EXCLUDED.enable_global_text_reply, chat_settings.enable_global_text_reply), enable_global_draw_reply = COALESCE(EXCLUDED.enable_global_draw_reply, chat_settings.enable_global_draw_reply), enable_daily_game = COALESCE(EXCLUDED.enable_daily_game, chat_settings.enable_daily_game), daily_game_theme = EXCLUDED.daily_game_theme, greeting_html = EXCLUDED.greeting_html, updated = CURRENT_TIMESTAMP"
+        );
+    }
+
     #[tokio::test]
     async fn live_virtual_message_store_round_trips_when_postgres_dsn_is_set()
     -> Result<(), Box<dyn Error>> {
@@ -1118,6 +1212,66 @@ mod tests {
         .await;
 
         let _ = store.delete_message_entries(chat_id, message_id).await;
+        result
+    }
+
+    #[tokio::test]
+    async fn live_chat_settings_store_round_trips_when_postgres_dsn_is_set()
+    -> Result<(), Box<dyn Error>> {
+        let Ok(dsn) = env::var("OPENPLOTVA_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&dsn)
+            .await?;
+        let store = super::PostgresChatSettingsStore::new(pool.clone());
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
+        let chat_id = -9_001_444_555_666_i64 - i64::try_from(suffix % 1_000_000)?;
+        let mut settings = openplotva_core::ChatSettings::defaults(chat_id);
+        settings.enable_global_draw_reply = false;
+        let update = openplotva_core::ChatSettingsUpdate {
+            chat_id,
+            chat_type: "supergroup".to_owned(),
+            mood_alignment: settings.mood_alignment.clone(),
+            custom_persona: settings.custom_persona.clone(),
+            reactivity_percentage: settings.reactivity_percentage,
+            proactivity_percentage: settings.proactivity_percentage,
+            enable_global_text_reply: settings.enable_global_text_reply,
+            enable_global_draw_reply: settings.enable_global_draw_reply,
+            enable_obscenifier: settings.enable_obscenifier,
+            enable_profanity: settings.enable_profanity,
+            enable_greet_joiners: settings.enable_greet_joiners,
+            enable_daily_game: settings.enable_daily_game.unwrap_or(true),
+            daily_game_theme: settings.daily_game_theme.clone().unwrap_or_default(),
+            greeting_html: None,
+        };
+
+        let result: Result<(), Box<dyn Error>> = async {
+            store.upsert_chat_settings(&update).await?;
+            let loaded = store
+                .get_chat_settings(chat_id)
+                .await?
+                .ok_or_else(|| std::io::Error::other("inserted settings were not readable"))?;
+
+            assert_eq!(loaded.chat_id, chat_id);
+            assert!(loaded.enable_global_text_reply);
+            assert!(!loaded.enable_global_draw_reply);
+            assert_eq!(loaded.daily_game_theme.as_deref(), Some("auto"));
+
+            Ok(())
+        }
+        .await;
+
+        let _ = sqlx::query("DELETE FROM chat_settings WHERE chat_id = $1")
+            .bind(chat_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM chats WHERE id = $1")
+            .bind(chat_id)
+            .execute(&pool)
+            .await;
         result
     }
 

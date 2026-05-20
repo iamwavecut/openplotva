@@ -7,7 +7,8 @@ use std::{
 
 use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
 pub use openplotva_core::{
-    MessageIdMapping, PendingEditPayload, PendingOp, ReadyPendingOp, pending_edit_payload,
+    ChatSettings, ChatSettingsUpdate, MessageIdMapping, PendingEditPayload, PendingOp,
+    ReadyPendingOp, pending_edit_payload,
 };
 use serde::Serialize;
 
@@ -209,6 +210,75 @@ pub fn vip_cache_key(user_id: i64) -> String {
     format!("vip:{user_id}")
 }
 
+/// Decide whether a Telegram action is allowed by Go's chat settings policy.
+pub fn can_perform_action(chat_type: &str, settings: Option<&ChatSettings>, action: &str) -> bool {
+    if chat_type == "private" {
+        return true;
+    }
+    let Some(settings) = settings else {
+        return true;
+    };
+
+    match action {
+        ACTION_SEND_TEXT | ACTION_EDIT_MESSAGE | ACTION_SEND_MESSAGE => {
+            settings.enable_global_text_reply
+        }
+        ACTION_SEND_IMAGE | ACTION_SEND_STICKER | ACTION_SEND_AUDIO => {
+            settings.enable_global_draw_reply
+        }
+        _ => false,
+    }
+}
+
+/// Return the chat type Go records when a permission error is classified.
+pub fn permission_error_chat_type(chat_type: Option<&str>) -> String {
+    match chat_type
+        .map(str::trim)
+        .filter(|chat_type| !chat_type.is_empty())
+    {
+        Some(chat_type) => chat_type.to_owned(),
+        None => "private".to_owned(),
+    }
+}
+
+/// Build Go's chat settings update after a Telegram permission send error.
+pub fn permission_error_settings_update(
+    settings: &ChatSettings,
+    chat_type: &str,
+    is_media_permission_error: bool,
+) -> ChatSettingsUpdate {
+    let enable_daily_game = settings.enable_daily_game.unwrap_or(true);
+    let daily_game_theme = settings
+        .daily_game_theme
+        .as_deref()
+        .filter(|theme| !theme.is_empty())
+        .unwrap_or("auto")
+        .to_owned();
+    let mut update = ChatSettingsUpdate {
+        chat_id: settings.chat_id,
+        chat_type: chat_type.to_owned(),
+        mood_alignment: settings.mood_alignment.clone(),
+        custom_persona: settings.custom_persona.clone(),
+        reactivity_percentage: settings.reactivity_percentage,
+        proactivity_percentage: settings.proactivity_percentage,
+        enable_global_text_reply: settings.enable_global_text_reply,
+        enable_global_draw_reply: settings.enable_global_draw_reply,
+        enable_obscenifier: settings.enable_obscenifier,
+        enable_profanity: settings.enable_profanity,
+        enable_greet_joiners: settings.enable_greet_joiners,
+        enable_daily_game,
+        daily_game_theme,
+        greeting_html: None,
+    };
+
+    if is_media_permission_error {
+        update.enable_global_draw_reply = false;
+    } else {
+        update.enable_global_text_reply = false;
+    }
+    update
+}
+
 impl ReadinessResponse {
     /// Build a ready response from startup checks.
     pub fn ready(checks: Vec<ReadinessCheck>) -> Self {
@@ -251,11 +321,13 @@ async fn ready(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Readines
 #[cfg(test)]
 mod tests {
     use super::{
-        ACTION_SEND_TEXT, HealthResponse, MessageIdMapping, PendingEditPayload, PendingOp,
-        PendingOpMappingError, PendingOpMappingStore, ReadinessCheck, ReadinessResponse,
+        ACTION_EDIT_MESSAGE, ACTION_SEND_STICKER, ACTION_SEND_TEXT, ACTION_SEND_VIDEO,
+        HealthResponse, MessageIdMapping, PendingEditPayload, PendingOp, PendingOpMappingError,
+        PendingOpMappingStore, ReadinessCheck, ReadinessResponse, can_perform_action,
         health_response, index_mappings_by_virtual_id, load_pending_op_mappings,
         pending_edit_payload, pending_op_virtual_ids, pending_ops_ready_for_execution,
-        permission_cache_key, rate_limit_key, rate_limited_chat_key, vip_cache_key,
+        permission_cache_key, permission_error_chat_type, permission_error_settings_update,
+        rate_limit_key, rate_limited_chat_key, vip_cache_key,
     };
 
     #[test]
@@ -294,6 +366,77 @@ mod tests {
             "perm_check:42:send_text"
         );
         assert_eq!(vip_cache_key(42), "vip:42");
+    }
+
+    #[test]
+    fn can_perform_action_matches_go_chat_settings_policy() {
+        let disabled = openplotva_core::ChatSettings {
+            chat_id: 42,
+            enable_global_text_reply: false,
+            enable_global_draw_reply: false,
+            ..openplotva_core::ChatSettings::defaults(42)
+        };
+        let draw_only = openplotva_core::ChatSettings {
+            chat_id: 42,
+            enable_global_text_reply: false,
+            enable_global_draw_reply: true,
+            ..openplotva_core::ChatSettings::defaults(42)
+        };
+
+        assert!(can_perform_action(
+            "private",
+            Some(&disabled),
+            ACTION_SEND_TEXT
+        ));
+        assert!(can_perform_action("supergroup", None, ACTION_SEND_TEXT));
+        assert!(!can_perform_action(
+            "supergroup",
+            Some(&disabled),
+            ACTION_SEND_TEXT
+        ));
+        assert!(!can_perform_action(
+            "supergroup",
+            Some(&draw_only),
+            ACTION_EDIT_MESSAGE
+        ));
+        assert!(can_perform_action(
+            "supergroup",
+            Some(&draw_only),
+            ACTION_SEND_STICKER
+        ));
+        assert!(!can_perform_action(
+            "supergroup",
+            Some(&draw_only),
+            ACTION_SEND_VIDEO
+        ));
+    }
+
+    #[test]
+    fn permission_error_settings_update_disables_expected_reply_mode_like_go() {
+        let mut settings = openplotva_core::ChatSettings::defaults(42);
+        settings.enable_daily_game = None;
+        settings.daily_game_theme = None;
+
+        let text_update = permission_error_settings_update(&settings, "supergroup", false);
+        let media_update = permission_error_settings_update(&settings, "supergroup", true);
+
+        assert!(!text_update.enable_global_text_reply);
+        assert!(text_update.enable_global_draw_reply);
+        assert!(media_update.enable_global_text_reply);
+        assert!(!media_update.enable_global_draw_reply);
+        assert!(text_update.enable_daily_game);
+        assert_eq!(text_update.daily_game_theme, "auto");
+        assert_eq!(text_update.chat_type, "supergroup");
+    }
+
+    #[test]
+    fn permission_error_chat_type_uses_known_chat_info_like_go() {
+        assert_eq!(permission_error_chat_type(None), "private");
+        assert_eq!(permission_error_chat_type(Some("  ")), "private");
+        assert_eq!(
+            permission_error_chat_type(Some(" supergroup ")),
+            "supergroup"
+        );
     }
 
     #[derive(Default)]
