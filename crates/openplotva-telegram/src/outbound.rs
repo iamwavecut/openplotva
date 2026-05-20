@@ -6,13 +6,13 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use carapax::types::{
     AnswerCallbackQuery, AnswerGuestQuery, AnswerInlineQuery, AnswerPreCheckoutQuery, ChatAction,
     ChatMember, CreateInvoiceLink, DeleteMessage, EditMessageCaption, EditMessageMedia,
-    EditMessageReplyMarkup, EditMessageText, EditUserStarSubscription, GetChatAdministrators,
-    GetChatMember, InlineKeyboardButton, InlineKeyboardMarkup, InlineQueryResult,
-    InlineQueryResultArticle, InputFile, InputFileReader, InputMedia, InputMediaError,
-    InputMediaPhoto, InputMessageContentText, InvoiceParameters, LabeledPrice, MediaGroup,
-    MediaGroupError, MediaGroupItem, ParseMode, RefundStarPayment, ReplyMarkup, ReplyParameters,
-    ReplyParametersError, SendAudio, SendChatAction, SendMediaGroup, SendMessage, SendPhoto,
-    SendSticker, WebAppInfo,
+    EditMessageReplyMarkup, EditMessageText, EditUserStarSubscription, GetChat,
+    GetChatAdministrators, GetChatMember, InlineKeyboardButton, InlineKeyboardMarkup,
+    InlineQueryResult, InlineQueryResultArticle, InputFile, InputFileReader, InputMedia,
+    InputMediaError, InputMediaPhoto, InputMessageContentText, InvoiceParameters, LabeledPrice,
+    MediaGroup, MediaGroupError, MediaGroupItem, ParseMode, RefundStarPayment, ReplyMarkup,
+    ReplyParameters, ReplyParametersError, SendAudio, SendChatAction, SendMediaGroup, SendMessage,
+    SendPhoto, SendSticker, WebAppInfo,
 };
 use crc::{CRC_32_ISCSI, Crc};
 use serde_json::{Map, Value, json};
@@ -691,6 +691,12 @@ pub fn build_chat_action_method(
 #[must_use]
 pub fn build_get_chat_member_method(chat_id: i64, user_id: i64) -> GetChatMember {
     GetChatMember::new(chat_id, user_id)
+}
+
+/// Build Go's `getChat` target-resolution request.
+#[must_use]
+pub fn build_get_chat_method(chat_id: impl Into<carapax::types::ChatId>) -> GetChat {
+    GetChat::new(chat_id)
 }
 
 /// Build Go's `getChatAdministrators` admin-sync request.
@@ -1754,7 +1760,7 @@ mod tests {
         build_edit_caption_message_method, build_edit_media_message_method,
         build_edit_media_message_plan, build_edit_reply_markup_message_method,
         build_edit_text_message_method, build_get_chat_administrators_method,
-        build_get_chat_member_method, build_guest_add_to_chat_markup,
+        build_get_chat_member_method, build_get_chat_method, build_guest_add_to_chat_markup,
         build_guest_html_answer_method, build_guest_query_answer_method,
         build_inline_keyboard_button_data, build_inline_keyboard_button_url,
         build_inline_keyboard_button_web_app, build_inline_keyboard_markup,
@@ -2796,6 +2802,19 @@ mod tests {
 
         assert_eq!(payload["chat_id"], json!(-10042));
         assert_eq!(payload["user_id"], json!(42));
+        Ok(())
+    }
+
+    #[test]
+    fn build_get_chat_method_matches_go_target_resolution_payload()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let id_method = build_get_chat_method(-10042);
+        let id_payload = serde_json::to_value(id_method)?;
+        assert_eq!(id_payload["chat_id"], json!(-10042));
+
+        let username_method = build_get_chat_method("@plotva_lab");
+        let username_payload = serde_json::to_value(username_method)?;
+        assert_eq!(username_payload["chat_id"], json!("@plotva_lab"));
         Ok(())
     }
 

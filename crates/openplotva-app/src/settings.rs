@@ -4,7 +4,8 @@ use std::{fmt, future::Future, pin::Pin, time::Duration};
 
 use carapax::types::{
     Chat as TelegramChat, ChatMember as TelegramChatMember, ChatMemberRestricted,
-    Message as TelegramMessage, Update as TelegramUpdate, UpdateType, User as TelegramUser,
+    Message as TelegramMessage, MessageData as TelegramMessageData,
+    TextEntity as TelegramTextEntity, Update as TelegramUpdate, UpdateType, User as TelegramUser,
 };
 use openplotva_core::{SENDER_TYPE_CHANNEL, SENDER_TYPE_SAME_CHAT, UserState};
 use openplotva_storage::{ChatMemberRecord, ChatMemberUpsert};
@@ -33,6 +34,8 @@ const GROUP_SETTINGS_PERMISSION_DENIED_TEXT: &str =
 const GROUP_SETTINGS_OPEN_PRIVATE_TEXT: &str =
     "Откройте личный чат со мной, чтобы выбрать чат для настройки:";
 const GROUP_SETTINGS_OPEN_BUTTON_TEXT: &str = "⚙️ Открыть настройки";
+const ADMIN_CHAT_SETTINGS_USAGE_TEXT: &str = "Usage: /admin_chat_settings [chat_id или @username]";
+const ADMIN_CHAT_SETTINGS_WEBAPP_MISSING_TEXT: &str = "WebApp URL is not configured.";
 const CHAT_ADMINS_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
 
 /// Boxed future returned by settings taskman assignment calls.
@@ -49,6 +52,10 @@ pub type GroupSettingsSyncFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 
 /// Boxed future returned by group settings member storage/API calls.
 pub type GroupSettingsMemberFuture<'a, T, E> =
     Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'a>>;
+
+/// Boxed future returned by `/admin_chat_settings` target lookups.
+pub type AdminChatTargetFuture<'a, E> =
+    Pin<Box<dyn Future<Output = Result<AdminChatSettingsTarget, E>> + Send + 'a>>;
 
 /// Queue boundary for Go settings-owned taskman control jobs.
 pub trait SettingsControlJobQueue {
@@ -161,6 +168,33 @@ pub trait GroupSettingsAdminsApi {
     ) -> GroupSettingsMemberFuture<'a, Vec<TelegramChatMember>, Self::Error>;
 }
 
+/// Telegram chat data needed by Go `/admin_chat_settings`.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AdminChatSettingsTarget {
+    /// Telegram chat ID.
+    pub id: i64,
+    /// Chat title, when Telegram returned one.
+    pub title: String,
+    /// Chat username without `@`, when Telegram returned one.
+    pub username: String,
+    /// First name for private-chat targets.
+    pub first_name: String,
+    /// Last name for private-chat targets.
+    pub last_name: String,
+}
+
+/// Telegram boundary for Go `resolveChatTarget`.
+pub trait AdminChatTargetResolver {
+    /// Error returned by concrete Telegram calls.
+    type Error: fmt::Display + Send + Sync + 'static;
+
+    /// Resolve a raw command target into Telegram chat metadata.
+    fn resolve_admin_chat_target<'a>(
+        &'a self,
+        target_identifier: &'a str,
+    ) -> AdminChatTargetFuture<'a, Self::Error>;
+}
+
 /// Error returned by the concrete Go `canOpenGroupSettings` port.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum GroupSettingsPermissionCheckError {
@@ -208,6 +242,17 @@ pub enum GroupSettingsAdminSyncError {
     /// Stored fallback failed after Telegram failed.
     #[error("failed to get chat members: {0}")]
     Storage(String),
+}
+
+/// Error returned by the concrete Go `resolveChatTarget` port.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum AdminChatTargetResolveError {
+    /// Telegram `getChat` failed for a numeric chat ID.
+    #[error("{0}")]
+    Telegram(String),
+    /// Telegram could not resolve a username target.
+    #[error("unable to resolve chat {0}")]
+    UnableToResolveChat(String),
 }
 
 /// Result of handling a decoded `/settings` update.
@@ -278,6 +323,21 @@ pub enum GroupSettingsControlJobOutcome {
     SentLink,
 }
 
+/// Result of handling Go's `/admin_chat_settings` command path after admin auth.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AdminChatSettingsCommandOutcome {
+    /// The update was not a Telegram message carrying Go's admin chat settings command.
+    NotAdminChatSettingsCommand,
+    /// Go sent the usage text because no target chat was provided.
+    Usage(QueueTextReport),
+    /// Go sent the target resolution error text.
+    ResolveError(QueueTextReport),
+    /// Go sent the missing WebApp URL text.
+    WebAppUrlMissing(QueueTextReport),
+    /// The target settings button was queued.
+    Queued(QueueTextReport),
+}
+
 /// Handle Go's private `/settings` command path.
 pub async fn handle_private_settings_command_update<S, NextId>(
     store: &S,
@@ -345,6 +405,109 @@ where
     .await?;
 
     Ok(SettingsCommandOutcome::Queued(report))
+}
+
+/// Handle Go's `/admin_chat_settings` command path after admin authorization.
+pub async fn handle_admin_chat_settings_command_update<S, Resolver, NextId>(
+    store: &S,
+    dispatcher_queue: &DispatcherQueue,
+    resolver: &Resolver,
+    update: &TelegramUpdate,
+    web_app_url: &str,
+    next_virtual_id: NextId,
+) -> Result<AdminChatSettingsCommandOutcome, OutboundBuildError>
+where
+    S: VirtualMessageStore + Sync,
+    Resolver: AdminChatTargetResolver + Sync,
+    NextId: FnMut() -> String,
+{
+    let UpdateType::Message(message) = &update.update_type else {
+        return Ok(AdminChatSettingsCommandOutcome::NotAdminChatSettingsCommand);
+    };
+    let Some(command) = admin_chat_settings_command_from_message(message) else {
+        return Ok(AdminChatSettingsCommandOutcome::NotAdminChatSettingsCommand);
+    };
+    if !command.name.eq_ignore_ascii_case("admin_chat_settings") {
+        return Ok(AdminChatSettingsCommandOutcome::NotAdminChatSettingsCommand);
+    }
+
+    let target_identifier = command.arguments.trim();
+    if target_identifier.is_empty() {
+        let report = queue_admin_chat_settings_text(
+            store,
+            dispatcher_queue,
+            message,
+            AdminChatSettingsText {
+                text: ADMIN_CHAT_SETTINGS_USAGE_TEXT,
+                reply_markup: None,
+                bypass_chat_restrictions: false,
+                immediate_first: false,
+            },
+            next_virtual_id,
+        )
+        .await?;
+        return Ok(AdminChatSettingsCommandOutcome::Usage(report));
+    }
+
+    let target = match resolver.resolve_admin_chat_target(target_identifier).await {
+        Ok(target) => target,
+        Err(error) => {
+            let text =
+                format!("Could not find or access chat: {target_identifier}. Error: {error}");
+            let report = queue_admin_chat_settings_text(
+                store,
+                dispatcher_queue,
+                message,
+                AdminChatSettingsText {
+                    text: &text,
+                    reply_markup: None,
+                    bypass_chat_restrictions: false,
+                    immediate_first: false,
+                },
+                next_virtual_id,
+            )
+            .await?;
+            return Ok(AdminChatSettingsCommandOutcome::ResolveError(report));
+        }
+    };
+
+    let Some(button_url) = openplotva_web::settings_button_url(web_app_url, target.id) else {
+        let report = queue_admin_chat_settings_text(
+            store,
+            dispatcher_queue,
+            message,
+            AdminChatSettingsText {
+                text: ADMIN_CHAT_SETTINGS_WEBAPP_MISSING_TEXT,
+                reply_markup: None,
+                bypass_chat_restrictions: false,
+                immediate_first: false,
+            },
+            next_virtual_id,
+        )
+        .await?;
+        return Ok(AdminChatSettingsCommandOutcome::WebAppUrlMissing(report));
+    };
+
+    let text = format!(
+        "Откройте настройки для чата \"{}\" (ID: {}):",
+        admin_chat_settings_display_title(&target),
+        target.id
+    );
+    let keyboard = openplotva_telegram::build_private_settings_keyboard(button_url);
+    let report = queue_admin_chat_settings_text(
+        store,
+        dispatcher_queue,
+        message,
+        AdminChatSettingsText {
+            text: &text,
+            reply_markup: Some(ReplyMarkup::InlineKeyboardMarkup(keyboard)),
+            bypass_chat_restrictions: true,
+            immediate_first: true,
+        },
+        next_virtual_id,
+    )
+    .await?;
+    Ok(AdminChatSettingsCommandOutcome::Queued(report))
 }
 
 /// Execute Go's group-settings control-job behavior up to Telegram dispatch queueing.
@@ -703,6 +866,127 @@ where
     .await
 }
 
+async fn queue_admin_chat_settings_text<S, NextId>(
+    store: &S,
+    queue: &DispatcherQueue,
+    message: &TelegramMessage,
+    text: AdminChatSettingsText<'_>,
+    next_virtual_id: NextId,
+) -> Result<QueueTextReport, OutboundBuildError>
+where
+    S: VirtualMessageStore + Sync,
+    NextId: FnMut() -> String,
+{
+    let chat = message_chat_ref(message);
+    let request = TextMessageRequest {
+        chat: Some(chat),
+        message_thread_id: 0,
+        disable_notification: false,
+        allow_sending_without_reply: None,
+        text: text.text.to_owned(),
+        render_as: String::new(),
+        reply_markup: text.reply_markup,
+    };
+    let reply_to = ReplyMessageRef {
+        message_id: message.id,
+        chat,
+        is_topic_message: message.message_thread_id.is_some(),
+        message_thread_id: message.message_thread_id.unwrap_or_default(),
+    };
+    queue_text_message_parts(
+        store,
+        queue,
+        QueueTextRequest {
+            message: &request,
+            reply_to: Some(&reply_to),
+            immediate_first: text.immediate_first,
+            bypass_chat_restrictions: text.bypass_chat_restrictions,
+            ephemeral_delete_after: None,
+        },
+        next_virtual_id,
+    )
+    .await
+}
+
+struct AdminChatSettingsText<'a> {
+    text: &'a str,
+    reply_markup: Option<ReplyMarkup>,
+    bypass_chat_restrictions: bool,
+    immediate_first: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AdminChatSettingsCommand<'a> {
+    name: &'a str,
+    arguments: &'a str,
+}
+
+fn admin_chat_settings_command_from_message(
+    message: &TelegramMessage,
+) -> Option<AdminChatSettingsCommand<'_>> {
+    let TelegramMessageData::Text(text) = &message.data else {
+        return None;
+    };
+    let first = text.entities.as_ref()?.into_iter().next()?;
+    let TelegramTextEntity::BotCommand(position) = first else {
+        return None;
+    };
+    if position.offset != 0 {
+        return None;
+    }
+
+    let command_end = utf16_index_to_byte_index(&text.data, position.length)?;
+    let command_with_slash = text.data.get(..command_end)?;
+    let command_with_at = command_with_slash.strip_prefix('/')?;
+    let name = command_with_at
+        .split_once('@')
+        .map_or(command_with_at, |(name, _)| name);
+    let arguments = command_arguments_after_command(&text.data, command_end)?;
+    Some(AdminChatSettingsCommand { name, arguments })
+}
+
+fn command_arguments_after_command(text: &str, command_end: usize) -> Option<&str> {
+    let after_command = text.get(command_end..)?;
+    let Some(separator) = after_command.chars().next() else {
+        return Some("");
+    };
+    after_command.get(separator.len_utf8()..)
+}
+
+fn utf16_index_to_byte_index(text: &str, utf16_units: u32) -> Option<usize> {
+    let mut consumed = 0_u32;
+    for (byte_index, ch) in text.char_indices() {
+        if consumed == utf16_units {
+            return Some(byte_index);
+        }
+        consumed = consumed.checked_add(u32::try_from(ch.len_utf16()).ok()?)?;
+        if consumed > utf16_units {
+            return None;
+        }
+    }
+    if consumed == utf16_units {
+        Some(text.len())
+    } else {
+        None
+    }
+}
+
+fn admin_chat_settings_display_title(target: &AdminChatSettingsTarget) -> String {
+    if !target.title.is_empty() {
+        return target.title.clone();
+    }
+    if !target.username.is_empty() {
+        return format!("@{}", target.username);
+    }
+    if !target.first_name.is_empty() {
+        if !target.last_name.is_empty() {
+            return format!("{} {}", target.first_name, target.last_name);
+        }
+        return target.first_name.clone();
+    }
+    target.id.to_string()
+}
+
 /// Go `canOpenGroupSettings` port using injected storage and Telegram boundaries.
 pub async fn can_open_group_settings_with_sources<Store, Api>(
     store: &Store,
@@ -993,6 +1277,59 @@ impl GroupSettingsAdminsApi for openplotva_telegram::TelegramClient {
             ))
             .await
         })
+    }
+}
+
+impl AdminChatTargetResolver for openplotva_telegram::TelegramClient {
+    type Error = AdminChatTargetResolveError;
+
+    fn resolve_admin_chat_target<'a>(
+        &'a self,
+        target_identifier: &'a str,
+    ) -> AdminChatTargetFuture<'a, Self::Error> {
+        Box::pin(async move {
+            let target_identifier = target_identifier.trim();
+            if let Ok(chat_id) = target_identifier.parse::<i64>() {
+                return self
+                    .execute(openplotva_telegram::build_get_chat_method(chat_id))
+                    .await
+                    .map(admin_chat_settings_target_from_full_info)
+                    .map_err(|error| AdminChatTargetResolveError::Telegram(error.to_string()));
+            }
+
+            let username = if target_identifier.starts_with('@') {
+                target_identifier.to_owned()
+            } else {
+                format!("@{target_identifier}")
+            };
+            match self
+                .execute(openplotva_telegram::build_get_chat_method(username.clone()))
+                .await
+            {
+                Ok(chat) => Ok(admin_chat_settings_target_from_full_info(chat)),
+                Err(_) => self
+                    .execute(openplotva_telegram::build_get_chat_method(username))
+                    .await
+                    .map(admin_chat_settings_target_from_full_info)
+                    .map_err(|_| {
+                        AdminChatTargetResolveError::UnableToResolveChat(
+                            target_identifier.to_owned(),
+                        )
+                    }),
+            }
+        })
+    }
+}
+
+fn admin_chat_settings_target_from_full_info(
+    chat: openplotva_telegram::ChatFullInfo,
+) -> AdminChatSettingsTarget {
+    AdminChatSettingsTarget {
+        id: chat.id,
+        title: chat.title.unwrap_or_default(),
+        username: chat.username.unwrap_or_default(),
+        first_name: chat.first_name.unwrap_or_default(),
+        last_name: chat.last_name.unwrap_or_default(),
     }
 }
 
@@ -1562,6 +1899,146 @@ mod tests {
 
         assert_eq!(outcome, GroupSettingsControlJobBuild::MissingCaller);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_chat_settings_command_queues_target_settings_button_with_bypass_and_immediate()
+    -> Result<(), Box<dyn Error>> {
+        let store = StoreStub::default();
+        let dispatcher = DispatcherQueue::new(DispatcherConfig::default());
+        let resolver = AdminChatTargetResolverStub::with_target(super::AdminChatSettingsTarget {
+            id: -100777,
+            title: "Target Lab".to_owned(),
+            username: "target_lab".to_owned(),
+            first_name: String::new(),
+            last_name: String::new(),
+        });
+        let update = admin_chat_settings_update("/admin_chat_settings @target_lab")?;
+
+        let outcome = super::handle_admin_chat_settings_command_update(
+            &store,
+            &dispatcher,
+            &resolver,
+            &update,
+            "https://plotva.example",
+            || "admin-settings-v1".to_owned(),
+        )
+        .await?;
+
+        let super::AdminChatSettingsCommandOutcome::Queued(report) = outcome else {
+            return Err(format!("expected queued admin settings link, got {outcome:?}").into());
+        };
+        assert_eq!(report.enqueued_count(), 1);
+        assert_eq!(resolver.calls(), vec!["@target_lab".to_owned()]);
+        assert_eq!(
+            store.inserted(),
+            vec![("admin-settings-v1".to_owned(), 42, None)]
+        );
+
+        let item = dispatcher
+            .dequeue_immediate()
+            .expect("admin chat settings button should enqueue immediately");
+        assert!(item.bypasses_chat_restrictions());
+        assert_eq!(item.ephemeral_delete_after(), None);
+        let method = item.into_method().expect("queued admin settings method");
+        let value = serde_json::to_value(method_as_value(method)?)?;
+
+        assert_eq!(value["chat_id"], json!(42));
+        assert_eq!(
+            value["text"],
+            json!("Откройте настройки для чата \"Target Lab\" (ID: -100777):")
+        );
+        assert_eq!(value["reply_parameters"]["message_id"], json!(79));
+        assert_eq!(
+            value["reply_markup"]["inline_keyboard"][0][0]["text"],
+            json!("⚙️ Настройки")
+        );
+        assert_eq!(
+            value["reply_markup"]["inline_keyboard"][0][0]["web_app"]["url"],
+            json!("https://plotva.example/settings/?chat_id=-100777&signature=b8e86493")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_chat_settings_command_sends_usage_without_target() -> Result<(), Box<dyn Error>>
+    {
+        let store = StoreStub::default();
+        let dispatcher = DispatcherQueue::new(DispatcherConfig::default());
+        let resolver = AdminChatTargetResolverStub::default();
+        let update = admin_chat_settings_update("/admin_chat_settings   ")?;
+
+        let outcome = super::handle_admin_chat_settings_command_update(
+            &store,
+            &dispatcher,
+            &resolver,
+            &update,
+            "https://plotva.example",
+            || "admin-settings-usage-v1".to_owned(),
+        )
+        .await?;
+
+        let super::AdminChatSettingsCommandOutcome::Usage(report) = outcome else {
+            return Err(format!("expected usage reply, got {outcome:?}").into());
+        };
+        assert_eq!(report.enqueued_count(), 1);
+        assert!(resolver.calls().is_empty());
+
+        let item = dispatcher
+            .dequeue_regular()
+            .expect("admin chat settings usage should use normal SendText queueing");
+        assert!(!item.bypasses_chat_restrictions());
+        let method = item.into_method().expect("queued usage method");
+        let value = serde_json::to_value(method_as_value(method)?)?;
+        assert_eq!(
+            value["text"],
+            json!("Usage: /admin_chat_settings [chat_id или @username]")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_chat_settings_command_reports_resolve_error_like_go()
+    -> Result<(), Box<dyn Error>> {
+        let store = StoreStub::default();
+        let dispatcher = DispatcherQueue::new(DispatcherConfig::default());
+        let resolver = AdminChatTargetResolverStub::failing();
+        let update = admin_chat_settings_update("/admin_chat_settings missing_chat")?;
+
+        let outcome = super::handle_admin_chat_settings_command_update(
+            &store,
+            &dispatcher,
+            &resolver,
+            &update,
+            "https://plotva.example",
+            || "admin-settings-error-v1".to_owned(),
+        )
+        .await?;
+
+        let super::AdminChatSettingsCommandOutcome::ResolveError(report) = outcome else {
+            return Err(format!("expected resolve-error reply, got {outcome:?}").into());
+        };
+        assert_eq!(report.enqueued_count(), 1);
+        assert_eq!(resolver.calls(), vec!["missing_chat".to_owned()]);
+
+        let item = dispatcher
+            .dequeue_regular()
+            .expect("admin chat settings resolve error should use normal SendText queueing");
+        assert!(!item.bypasses_chat_restrictions());
+        let method = item.into_method().expect("queued resolve error method");
+        let value = serde_json::to_value(method_as_value(method)?)?;
+        assert_eq!(
+            value["text"],
+            json!("Could not find or access chat: missing_chat. Error: request failed")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn telegram_client_implements_admin_chat_settings_target_resolver() {
+        fn assert_impl<T: super::AdminChatTargetResolver>() {}
+        assert_impl::<openplotva_telegram::TelegramClient>();
     }
 
     #[tokio::test]
@@ -2139,6 +2616,41 @@ mod tests {
         }))
     }
 
+    fn admin_chat_settings_update(text: &str) -> Result<TelegramUpdate, serde_json::Error> {
+        let command_len = text
+            .split_whitespace()
+            .next()
+            .map(|command| command.encode_utf16().count())
+            .unwrap_or_default();
+        serde_json::from_value(json!({
+            "update_id": 12349,
+            "message": {
+                "message_id": 79,
+                "date": 1_710_000_000,
+                "chat": {
+                    "id": 42,
+                    "type": "private",
+                    "first_name": "Ada",
+                    "username": "ada_l"
+                },
+                "from": {
+                    "id": 42,
+                    "is_bot": false,
+                    "first_name": "Ada",
+                    "username": "ada_l"
+                },
+                "text": text,
+                "entities": [
+                    {
+                        "offset": 0,
+                        "length": command_len,
+                        "type": "bot_command"
+                    }
+                ]
+            }
+        }))
+    }
+
     fn group_settings_update() -> Result<TelegramUpdate, serde_json::Error> {
         serde_json::from_value(json!({
             "update_id": 12346,
@@ -2242,6 +2754,64 @@ mod tests {
                 is_premium: true,
                 ..ControlJobData::default()
             },
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct AdminChatTargetResolverStub {
+        state: Arc<Mutex<AdminChatTargetResolverState>>,
+    }
+
+    #[derive(Default)]
+    struct AdminChatTargetResolverState {
+        target: Option<super::AdminChatSettingsTarget>,
+        fail: bool,
+        calls: Vec<String>,
+    }
+
+    impl AdminChatTargetResolverStub {
+        fn with_target(target: super::AdminChatSettingsTarget) -> Self {
+            Self {
+                state: Arc::new(Mutex::new(AdminChatTargetResolverState {
+                    target: Some(target),
+                    ..AdminChatTargetResolverState::default()
+                })),
+            }
+        }
+
+        fn failing() -> Self {
+            Self {
+                state: Arc::new(Mutex::new(AdminChatTargetResolverState {
+                    fail: true,
+                    ..AdminChatTargetResolverState::default()
+                })),
+            }
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.state
+                .lock()
+                .expect("admin chat target resolver state")
+                .calls
+                .clone()
+        }
+    }
+
+    impl super::AdminChatTargetResolver for AdminChatTargetResolverStub {
+        type Error = StubError;
+
+        fn resolve_admin_chat_target<'a>(
+            &'a self,
+            target_identifier: &'a str,
+        ) -> super::AdminChatTargetFuture<'a, Self::Error> {
+            Box::pin(async move {
+                let mut state = self.state.lock().expect("admin chat target resolver state");
+                state.calls.push(target_identifier.to_owned());
+                if state.fail {
+                    return Err(StubError);
+                }
+                state.target.clone().ok_or(StubError)
+            })
         }
     }
 
