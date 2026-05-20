@@ -24,6 +24,7 @@ use crate::virtual_messages::{
 };
 
 const GROUP_SETTINGS_CONTROL_JOB_TITLE: &str = "group settings";
+const NEW_MEMBERS_FOLLOWUP_CONTROL_JOB_TITLE: &str = "new members followup";
 const GROUP_SETTINGS_WAIT_NOTICE_TEXT: &str = "⏳ Проверяю права и готовлю ссылку на настройки...";
 const SETTINGS_SAME_CHAT_DECLINE_TEXT: &str = "❌ Невозможно подтвердить права владельца чата при отправке от имени чата.\n\nДля доступа к настройкам отправьте команду от имени владельца чата (не анонимно).";
 const SETTINGS_CHANNEL_DECLINE_TEXT: &str = "❌ Сообщения от имени канала не могут быть проверены как владелец чата.\n\nДля доступа к настройкам отправьте команду от имени владельца чата (не анонимно).";
@@ -104,6 +105,18 @@ pub trait NewMembersFollowupControlJobEffects {
         &'a self,
         greeting: NewMembersGreeting,
     ) -> NewMembersFollowupFuture<'a, ()>;
+}
+
+/// Storage boundary for Go new-chat-member persistence.
+pub trait NewMembersFollowupMemberStore {
+    /// Error returned by concrete member storage.
+    type Error: fmt::Display + Send + Sync + 'static;
+
+    /// Persist one Go `ChatMemberStatusMember` row for a newly joined member.
+    fn upsert_new_chat_member<'a>(
+        &'a self,
+        member: ChatMemberUpsert,
+    ) -> GroupSettingsMemberFuture<'a, (), Self::Error>;
 }
 
 /// Storage boundary for Go `canOpenGroupSettings`.
@@ -307,6 +320,19 @@ pub enum GroupSettingsControlJobBuild {
     Job(Box<StatelessJobItem>),
 }
 
+/// Result of building Go's new-members follow-up control job.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NewMembersFollowupControlJobBuild {
+    /// The update was not a Telegram message.
+    NotMessage,
+    /// The message had no `new_chat_members` service payload.
+    NoNewChatMembers,
+    /// Telegram identifiers did not fit the Go-shaped taskman payload.
+    InvalidMessage,
+    /// Go-shaped taskman job for the control queue.
+    Job(Box<StatelessJobItem>),
+}
+
 /// Result of handling Go's group `/settings` command path.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GroupSettingsCommandOutcome {
@@ -326,6 +352,35 @@ pub enum GroupSettingsCommandOutcome {
     QueueError(QueueTextReport),
     /// The control job was assigned and the wait notice was queued.
     Queued { notice: QueueTextReport },
+}
+
+/// Result of handling Go's new-members follow-up producer path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NewMembersFollowupUpdateOutcome {
+    /// The update was not a Telegram message.
+    NotMessage,
+    /// The message had no new-chat-member service payload.
+    NoNewChatMembers,
+    /// Telegram identifiers did not fit the Go-shaped taskman payload.
+    InvalidMessage,
+    /// Assigning the control job failed; Go queues the generic failure notice.
+    QueueError {
+        notice: QueueTextReport,
+        member_upsert_errors: usize,
+    },
+    /// The control job was assigned. Go sends no success notice for this producer.
+    Queued { member_upsert_errors: usize },
+}
+
+/// Inputs that identify one Go new-members producer pass.
+#[derive(Clone, Copy, Debug)]
+pub struct NewMembersFollowupUpdateInput<'a> {
+    /// Decoded Telegram update.
+    pub update: &'a TelegramUpdate,
+    /// Current bot Telegram user ID, or zero when unavailable.
+    pub bot_id: i64,
+    /// Task creation time.
+    pub created: OffsetDateTime,
 }
 
 /// Result of executing Go's group-settings control-job slice.
@@ -695,6 +750,19 @@ pub fn group_settings_control_job_from_update_at(
     group_settings_control_job_from_message_at(message, bot_username, created)
 }
 
+/// Build the Go taskman control job produced by `processNewChatMembers`.
+#[must_use]
+pub fn new_members_followup_control_job_from_update_at(
+    update: &TelegramUpdate,
+    bot_id: i64,
+    created: OffsetDateTime,
+) -> NewMembersFollowupControlJobBuild {
+    let UpdateType::Message(message) = &update.update_type else {
+        return NewMembersFollowupControlJobBuild::NotMessage;
+    };
+    new_members_followup_control_job_from_message_at(message, bot_id, created)
+}
+
 /// Handle Go's group `/settings` command path up to taskman assignment.
 pub async fn handle_group_settings_command_update_at<S, Queue, NextId>(
     store: &S,
@@ -792,6 +860,67 @@ where
     }
 }
 
+/// Handle Go `processNewChatMembers` up to taskman assignment.
+pub async fn handle_new_members_followup_update_at<S, Members, Queue, NextId>(
+    store: &S,
+    dispatcher_queue: &DispatcherQueue,
+    member_store: &Members,
+    control_queue: &Queue,
+    input: NewMembersFollowupUpdateInput<'_>,
+    next_virtual_id: NextId,
+) -> Result<NewMembersFollowupUpdateOutcome, OutboundBuildError>
+where
+    S: VirtualMessageStore + Sync,
+    Members: NewMembersFollowupMemberStore + Sync,
+    Queue: SettingsControlJobQueue + Sync,
+    NextId: FnMut() -> String,
+{
+    let UpdateType::Message(message) = &input.update.update_type else {
+        return Ok(NewMembersFollowupUpdateOutcome::NotMessage);
+    };
+
+    match new_members_followup_control_job_from_message_at(message, input.bot_id, input.created) {
+        NewMembersFollowupControlJobBuild::NotMessage => {
+            Ok(NewMembersFollowupUpdateOutcome::NotMessage)
+        }
+        NewMembersFollowupControlJobBuild::NoNewChatMembers => {
+            Ok(NewMembersFollowupUpdateOutcome::NoNewChatMembers)
+        }
+        NewMembersFollowupControlJobBuild::InvalidMessage => {
+            Ok(NewMembersFollowupUpdateOutcome::InvalidMessage)
+        }
+        NewMembersFollowupControlJobBuild::Job(job) => {
+            let member_upsert_errors =
+                upsert_new_chat_members_from_message(member_store, message).await;
+            match control_queue
+                .assign_settings_control_job(CONTROL_QUEUE_NAME, *job)
+                .await
+            {
+                Ok(()) => Ok(NewMembersFollowupUpdateOutcome::Queued {
+                    member_upsert_errors,
+                }),
+                Err(error) => {
+                    tracing::warn!(%error, "failed to assign new-members follow-up control job");
+                    let notice = queue_group_settings_notice(
+                        store,
+                        dispatcher_queue,
+                        message,
+                        SETTINGS_QUEUE_ERROR_TEXT,
+                        false,
+                        Some(Duration::from_secs(60)),
+                        next_virtual_id,
+                    )
+                    .await?;
+                    Ok(NewMembersFollowupUpdateOutcome::QueueError {
+                        notice,
+                        member_upsert_errors,
+                    })
+                }
+            }
+        }
+    }
+}
+
 fn group_settings_control_job_from_message_at(
     message: &TelegramMessage,
     bot_username: &str,
@@ -850,6 +979,58 @@ fn group_settings_control_job_from_message_at(
     ))
 }
 
+fn new_members_followup_control_job_from_message_at(
+    message: &TelegramMessage,
+    bot_id: i64,
+    created: OffsetDateTime,
+) -> NewMembersFollowupControlJobBuild {
+    let TelegramMessageData::NewChatMembers(members) = &message.data else {
+        return NewMembersFollowupControlJobBuild::NoNewChatMembers;
+    };
+    if members.is_empty() {
+        return NewMembersFollowupControlJobBuild::NoNewChatMembers;
+    }
+
+    let Ok(message_id) = i32::try_from(message.id) else {
+        return NewMembersFollowupControlJobBuild::InvalidMessage;
+    };
+    let thread_id = message
+        .message_thread_id
+        .and_then(|thread_id| i32::try_from(thread_id).ok())
+        .filter(|thread_id| *thread_id != 0);
+    let sender = openplotva_updates::resolve_message_sender(Some(message));
+    let user = message.sender.get_user();
+    let user_id = if sender.id != 0 {
+        sender.id
+    } else {
+        user.map(|user| i64::from(user.id)).unwrap_or_default()
+    };
+    let user_full_name = user.map(user_full_name).unwrap_or_default();
+    let user_full_name = if user_full_name.trim().is_empty() {
+        sender.display_name()
+    } else {
+        user_full_name
+    };
+    let mut data = control_data_from_settings_message(message);
+    data.kind = ControlKind::NewMembersFollowup;
+    data.bot_was_added = bot_id != 0 && members.iter().any(|member| i64::from(member.id) == bot_id);
+    data.new_chat_member_ids = members.iter().map(|member| i64::from(member.id)).collect();
+
+    let params = ControlJobParams {
+        chat_id: message.chat.get_id().into(),
+        message_id,
+        user_id,
+        user_full_name,
+        thread_id,
+        data,
+    };
+    NewMembersFollowupControlJobBuild::Job(Box::new(
+        new_control_job_at(params, created)
+            .with_name(NEW_MEMBERS_FOLLOWUP_CONTROL_JOB_TITLE)
+            .with_priority(HIGH_PRIORITY),
+    ))
+}
+
 fn control_data_from_settings_message(message: &TelegramMessage) -> ControlJobData {
     let mut data = ControlJobData {
         chat_type: chat_type_name(&message.chat).to_owned(),
@@ -867,6 +1048,34 @@ fn control_data_from_settings_message(message: &TelegramMessage) -> ControlJobDa
         data.is_premium = user.is_premium.unwrap_or_default();
     }
     data
+}
+
+async fn upsert_new_chat_members_from_message<Store>(
+    store: &Store,
+    message: &TelegramMessage,
+) -> usize
+where
+    Store: NewMembersFollowupMemberStore + Sync,
+{
+    let TelegramMessageData::NewChatMembers(members) = &message.data else {
+        return 0;
+    };
+    let chat_id = message.chat.get_id().into();
+    let mut errors = 0;
+    for member in members {
+        let upsert = ChatMemberUpsert {
+            chat_id,
+            user_id: member.id.into(),
+            status: openplotva_storage::CHAT_MEMBER_STATUS_MEMBER.to_owned(),
+            is_anonymous: Some(false),
+            can_be_edited: Some(false),
+            ..ChatMemberUpsert::default()
+        };
+        if store.upsert_new_chat_member(upsert).await.is_err() {
+            errors += 1;
+        }
+    }
+    errors
 }
 
 async fn queue_group_settings_notice<S, NextId>(
@@ -1357,6 +1566,17 @@ impl GroupSettingsMemberStore for openplotva_storage::PostgresChatMemberStore {
     }
 }
 
+impl NewMembersFollowupMemberStore for openplotva_storage::PostgresChatMemberStore {
+    type Error = openplotva_storage::StorageError;
+
+    fn upsert_new_chat_member<'a>(
+        &'a self,
+        member: ChatMemberUpsert,
+    ) -> GroupSettingsMemberFuture<'a, (), Self::Error> {
+        Box::pin(async move { self.upsert_chat_member(&member).await })
+    }
+}
+
 impl GroupSettingsMemberApi for openplotva_telegram::TelegramClient {
     type Error = carapax::api::ExecuteError;
 
@@ -1746,7 +1966,8 @@ mod tests {
         admin_chat_member_upsert_from_telegram, can_open_group_settings_with_sources,
         chat_member_upsert_from_telegram, execute_group_settings_control_job_at,
         execute_new_members_followup_control_job_at, group_settings_control_job_from_update_at,
-        handle_group_settings_command_update_at, handle_private_settings_command_update,
+        handle_group_settings_command_update_at, handle_new_members_followup_update_at,
+        handle_private_settings_command_update, new_members_followup_control_job_from_update_at,
         sync_chat_admins_with_cache, sync_chat_admins_with_sources,
     };
 
@@ -2503,6 +2724,143 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn new_members_followup_update_builds_go_control_job_payload() -> Result<(), Box<dyn Error>> {
+        let update = new_members_update()?;
+        let created = OffsetDateTime::UNIX_EPOCH;
+
+        let build = new_members_followup_control_job_from_update_at(&update, 999, created);
+
+        let super::NewMembersFollowupControlJobBuild::Job(job) = build else {
+            return Err(format!("expected new-members control job, got {build:?}").into());
+        };
+        assert_eq!(job.title, "new members followup");
+        assert_eq!(job.priority, HIGH_PRIORITY);
+        assert_eq!(job.created, created);
+        assert_eq!(job.data.job_type, JobType::Control);
+
+        let telegram = job.data.telegram_data.as_ref().expect("telegram metadata");
+        assert_eq!(telegram.chat_id, -10042);
+        assert_eq!(telegram.message_id, 88);
+        assert_eq!(telegram.user_id, 42);
+        assert_eq!(telegram.user_full_name, "Ada Lovelace");
+        assert_eq!(telegram.thread_message_id, Some(99));
+
+        let data = job.data.control_data.as_ref().expect("control data");
+        assert_eq!(data.kind, ControlKind::NewMembersFollowup);
+        assert_eq!(data.chat_type, "supergroup");
+        assert_eq!(data.user_name, "ada_l");
+        assert_eq!(data.first_name, "Ada");
+        assert_eq!(data.last_name, "Lovelace");
+        assert_eq!(data.language_code, "en");
+        assert!(data.is_premium);
+        assert!(data.bot_was_added);
+        assert_eq!(data.new_chat_member_ids, vec![999, 7]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn new_members_followup_update_upserts_members_and_assigns_control_job()
+    -> Result<(), Box<dyn Error>> {
+        let store = StoreStub::default();
+        let dispatcher = DispatcherQueue::new(DispatcherConfig::default());
+        let member_store = GroupSettingsMemberStoreStub::default();
+        let control_queue = SettingsControlJobQueueStub::default();
+        let update = new_members_update()?;
+
+        let outcome = handle_new_members_followup_update_at(
+            &store,
+            &dispatcher,
+            &member_store,
+            &control_queue,
+            super::NewMembersFollowupUpdateInput {
+                update: &update,
+                bot_id: 999,
+                created: OffsetDateTime::UNIX_EPOCH,
+            },
+            || "unused-v1".to_owned(),
+        )
+        .await?;
+
+        assert_eq!(
+            outcome,
+            super::NewMembersFollowupUpdateOutcome::Queued {
+                member_upsert_errors: 0
+            }
+        );
+        let upserts = member_store.upserts();
+        assert_eq!(upserts.len(), 2);
+        assert_eq!(upserts[0].chat_id, -10042);
+        assert_eq!(upserts[0].user_id, 999);
+        assert_eq!(
+            upserts[0].status,
+            openplotva_storage::CHAT_MEMBER_STATUS_MEMBER
+        );
+        assert_eq!(upserts[0].is_anonymous, Some(false));
+        assert_eq!(upserts[0].can_be_edited, Some(false));
+        assert_eq!(upserts[1].user_id, 7);
+
+        let assigned = control_queue.assigned();
+        assert_eq!(assigned.len(), 1);
+        assert_eq!(assigned[0].0, CONTROL_QUEUE_NAME);
+        assert_eq!(assigned[0].1.title, "new members followup");
+        assert!(store.inserted().is_empty());
+        assert!(dispatcher.snapshot().immediate.is_empty());
+        assert!(dispatcher.snapshot().regular.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn new_members_followup_update_queue_error_sends_go_failure_notice()
+    -> Result<(), Box<dyn Error>> {
+        let store = StoreStub::default();
+        let dispatcher = DispatcherQueue::new(DispatcherConfig::default());
+        let member_store = GroupSettingsMemberStoreStub::default();
+        let control_queue = SettingsControlJobQueueStub::failing();
+        let update = new_members_update()?;
+
+        let outcome = handle_new_members_followup_update_at(
+            &store,
+            &dispatcher,
+            &member_store,
+            &control_queue,
+            super::NewMembersFollowupUpdateInput {
+                update: &update,
+                bot_id: 999,
+                created: OffsetDateTime::UNIX_EPOCH,
+            },
+            || "new-members-queue-error-v1".to_owned(),
+        )
+        .await?;
+
+        let super::NewMembersFollowupUpdateOutcome::QueueError {
+            notice,
+            member_upsert_errors,
+        } = outcome
+        else {
+            return Err(format!("expected queue-error outcome, got {outcome:?}").into());
+        };
+        assert_eq!(member_upsert_errors, 0);
+        assert_eq!(notice.enqueued_count(), 1);
+        assert_eq!(
+            store.inserted(),
+            vec![("new-members-queue-error-v1".to_owned(), -10042, Some(0))]
+        );
+        let item = dispatcher
+            .dequeue_immediate()
+            .expect("new-members queue failure should enqueue ephemeral failure text");
+        assert!(!item.bypasses_chat_restrictions());
+        assert_eq!(item.ephemeral_delete_after(), Some(Duration::from_secs(60)));
+        let method = item.into_method().expect("queued failure notice");
+        let value = serde_json::to_value(method_as_value(method)?)?;
+        assert_eq!(
+            value["text"],
+            json!("❌ Не удалось поставить задачу в очередь.")
+        );
+        assert_eq!(value["message_thread_id"], json!(99));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn group_settings_permission_uses_stored_creator_without_telegram_call()
     -> Result<(), Box<dyn Error>> {
@@ -2981,6 +3339,43 @@ mod tests {
         }))
     }
 
+    fn new_members_update() -> Result<TelegramUpdate, serde_json::Error> {
+        serde_json::from_value(json!({
+            "update_id": 12350,
+            "message": {
+                "message_id": 88,
+                "message_thread_id": 99,
+                "date": 1_710_000_000,
+                "chat": {
+                    "id": -10042,
+                    "type": "supergroup",
+                    "title": "Plotva Lab"
+                },
+                "from": {
+                    "id": 42,
+                    "is_bot": false,
+                    "first_name": "Ada",
+                    "last_name": "Lovelace",
+                    "username": "ada_l",
+                    "language_code": "en",
+                    "is_premium": true
+                },
+                "new_chat_members": [
+                    {
+                        "id": 999,
+                        "is_bot": true,
+                        "first_name": "PlotvaBot"
+                    },
+                    {
+                        "id": 7,
+                        "is_bot": false,
+                        "first_name": "Grace"
+                    }
+                ]
+            }
+        }))
+    }
+
     fn same_chat_settings_update() -> Result<TelegramUpdate, serde_json::Error> {
         serde_json::from_value(json!({
             "update_id": 12347,
@@ -3434,6 +3829,24 @@ mod tests {
         }
 
         fn upsert_chat_member<'a>(
+            &'a self,
+            member: ChatMemberUpsert,
+        ) -> super::GroupSettingsMemberFuture<'a, (), Self::Error> {
+            Box::pin(async move {
+                self.state
+                    .lock()
+                    .expect("group settings member store state")
+                    .upserts
+                    .push(member);
+                Ok(())
+            })
+        }
+    }
+
+    impl super::NewMembersFollowupMemberStore for GroupSettingsMemberStoreStub {
+        type Error = StubError;
+
+        fn upsert_new_chat_member<'a>(
             &'a self,
             member: ChatMemberUpsert,
         ) -> super::GroupSettingsMemberFuture<'a, (), Self::Error> {
