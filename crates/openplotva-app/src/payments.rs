@@ -166,6 +166,19 @@ pub enum PreCheckoutUpdateRoute {
     Delegated,
 }
 
+/// Routing result for the payment-aware decoded-update wrapper used before fetcher routing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PaymentUpdateRoute {
+    /// A Go pre-checkout query was answered directly.
+    PreCheckout(PreCheckoutOutcome),
+    /// A successful-payment service message was queued as a taskman control job.
+    SuccessfulPayment(SuccessfulPaymentControlJobUpdateRoute),
+    /// A `/vip` or `/donate` command was queued or classified for Go side effects.
+    InvoiceCommand(PaymentInvoiceCommandUpdateRoute),
+    /// The update was not payment-owned and was delegated.
+    Delegated,
+}
+
 /// HTML message with one invoice URL button, matching Go direct chattable sends.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InvoiceButtonMessage {
@@ -1004,6 +1017,84 @@ where
     }
 }
 
+/// Handle the payment-owned subset of decoded updates, delegating everything else.
+pub async fn handle_payment_update_or_else_at<Queue, Effects, HandleFn, HandleFuture, HandleError>(
+    queue: &Queue,
+    effects: &Effects,
+    update: TelegramUpdate,
+    created: OffsetDateTime,
+    handle_other: HandleFn,
+) -> Result<PaymentUpdateRoute, HandleError>
+where
+    Queue: PaymentControlJobQueue + Sync,
+    Effects: PreCheckoutPaymentEffects + Sync,
+    HandleFn: FnOnce(TelegramUpdate) -> HandleFuture,
+    HandleFuture: Future<Output = Result<(), HandleError>>,
+{
+    if let Some(pre_checkout_query_id) = pre_checkout_query_id_from_update(&update) {
+        let outcome = match effects
+            .answer_pre_checkout_query(pre_checkout_query_id)
+            .await
+        {
+            Ok(()) => PreCheckoutOutcome::Acknowledged,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    pre_checkout_query_id,
+                    "failed to answer pre-checkout query"
+                );
+                PreCheckoutOutcome::AcknowledgementError
+            }
+        };
+        return Ok(PaymentUpdateRoute::PreCheckout(outcome));
+    }
+
+    if let Some(job) = successful_payment_control_job_from_update_at(&update, created) {
+        let route = match queue
+            .assign_payment_control_job(CONTROL_QUEUE_NAME, job)
+            .await
+        {
+            Ok(()) => SuccessfulPaymentControlJobUpdateRoute::Queued,
+            Err(error) => {
+                tracing::warn!(%error, "failed to assign successful-payment control job");
+                SuccessfulPaymentControlJobUpdateRoute::QueueError
+            }
+        };
+        return Ok(PaymentUpdateRoute::SuccessfulPayment(route));
+    }
+
+    match payment_invoice_control_job_from_update_at(&update, created) {
+        PaymentInvoiceControlJobBuild::Job(job) => {
+            let route = match queue
+                .assign_payment_control_job(CONTROL_QUEUE_NAME, *job)
+                .await
+            {
+                Ok(()) => PaymentInvoiceCommandUpdateRoute::Queued,
+                Err(error) => {
+                    tracing::warn!(%error, "failed to assign payment invoice control job");
+                    PaymentInvoiceCommandUpdateRoute::QueueError
+                }
+            };
+            Ok(PaymentUpdateRoute::InvoiceCommand(route))
+        }
+        PaymentInvoiceControlJobBuild::NonPrivateChat => Ok(PaymentUpdateRoute::InvoiceCommand(
+            PaymentInvoiceCommandUpdateRoute::NonPrivateChat,
+        )),
+        PaymentInvoiceControlJobBuild::MissingUser => Ok(PaymentUpdateRoute::InvoiceCommand(
+            PaymentInvoiceCommandUpdateRoute::MissingUser,
+        )),
+        PaymentInvoiceControlJobBuild::InvalidDonationAmount => {
+            Ok(PaymentUpdateRoute::InvoiceCommand(
+                PaymentInvoiceCommandUpdateRoute::InvalidDonationAmount,
+            ))
+        }
+        PaymentInvoiceControlJobBuild::NotPaymentCommand => {
+            handle_other(update).await?;
+            Ok(PaymentUpdateRoute::Delegated)
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PaymentCommand<'a> {
     name: &'a str,
@@ -1660,18 +1751,19 @@ mod tests {
         InvoiceButtonMessage, InvoiceControlJobOutcome, PaymentControlJobOutcome,
         PaymentControlJobQueue, PaymentControlJobQueueFuture, PaymentEffectsFuture,
         PaymentInvoiceCommandUpdateRoute, PaymentInvoiceControlJobBuild, PaymentInvoiceEffects,
-        PaymentInvoiceLinkFuture, PaymentStoreFuture, PreCheckoutOutcome,
+        PaymentInvoiceLinkFuture, PaymentStoreFuture, PaymentUpdateRoute, PreCheckoutOutcome,
         PreCheckoutPaymentEffects, PreCheckoutUpdateRoute, SuccessfulPayment,
         SuccessfulPaymentControlJobUpdateRoute, SuccessfulPaymentEffects, SuccessfulPaymentMessage,
         SuccessfulPaymentOutcome, SuccessfulPaymentStore, SuccessfulPaymentUpdateRoute,
         enqueue_payment_invoice_command_update_or_else_at,
         enqueue_successful_payment_update_or_else_at, execute_donate_invoice_control_job,
         execute_payment_control_job_at, execute_vip_invoice_control_job,
-        handle_pre_checkout_update_or_else, handle_successful_payment_update_or_else_at,
-        invoice_button_send_message_method, payment_invoice_control_job_from_update_at,
-        process_successful_payment_at, subscription_invoice_message_text,
-        subscription_success_text, successful_payment_control_job_from_update_at,
-        successful_payment_message_from_control_job, successful_payment_message_from_update,
+        handle_payment_update_or_else_at, handle_pre_checkout_update_or_else,
+        handle_successful_payment_update_or_else_at, invoice_button_send_message_method,
+        payment_invoice_control_job_from_update_at, process_successful_payment_at,
+        subscription_invoice_message_text, subscription_success_text,
+        successful_payment_control_job_from_update_at, successful_payment_message_from_control_job,
+        successful_payment_message_from_update,
     };
 
     #[tokio::test]
@@ -2296,6 +2388,181 @@ mod tests {
         );
         assert!(fallback_calls.lock().expect("fallback calls").is_empty());
         assert!(queue.assigned().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn payment_update_wrapper_acknowledges_pre_checkout_before_fallback()
+    -> Result<(), Box<dyn Error>> {
+        let created = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let queue = PaymentControlJobQueueStub::default();
+        let effects = EffectsStub::default();
+        let fallback_calls = Arc::new(Mutex::new(Vec::new()));
+        let fallback_calls_for_handle = Arc::clone(&fallback_calls);
+
+        let route = handle_payment_update_or_else_at(
+            &queue,
+            &effects,
+            sample_pre_checkout_update()?,
+            created,
+            move |update| {
+                let fallback_calls = Arc::clone(&fallback_calls_for_handle);
+                async move {
+                    fallback_calls
+                        .lock()
+                        .map_err(|err| std::io::Error::other(err.to_string()))?
+                        .push(update.id);
+                    Ok::<(), std::io::Error>(())
+                }
+            },
+        )
+        .await?;
+
+        assert_eq!(
+            route,
+            PaymentUpdateRoute::PreCheckout(PreCheckoutOutcome::Acknowledged)
+        );
+        assert_eq!(
+            effects.answered_pre_checkout_queries(),
+            vec!["pre-checkout-id".to_owned()]
+        );
+        assert!(queue.assigned().is_empty());
+        assert!(fallback_calls.lock().expect("fallback calls").is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn payment_update_wrapper_queues_successful_payment_before_fallback()
+    -> Result<(), Box<dyn Error>> {
+        let created = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let queue = PaymentControlJobQueueStub::default();
+        let effects = EffectsStub::default();
+        let fallback_calls = Arc::new(Mutex::new(Vec::new()));
+        let fallback_calls_for_handle = Arc::clone(&fallback_calls);
+
+        let route = handle_payment_update_or_else_at(
+            &queue,
+            &effects,
+            sample_successful_payment_update("subscription_42", 300)?,
+            created,
+            move |update| {
+                let fallback_calls = Arc::clone(&fallback_calls_for_handle);
+                async move {
+                    fallback_calls
+                        .lock()
+                        .map_err(|err| std::io::Error::other(err.to_string()))?
+                        .push(update.id);
+                    Ok::<(), std::io::Error>(())
+                }
+            },
+        )
+        .await?;
+
+        assert_eq!(
+            route,
+            PaymentUpdateRoute::SuccessfulPayment(SuccessfulPaymentControlJobUpdateRoute::Queued)
+        );
+        let assigned = queue.assigned();
+        assert_eq!(assigned.len(), 1);
+        assert_eq!(assigned[0].0, CONTROL_QUEUE_NAME);
+        assert_eq!(assigned[0].1.title, "successful payment");
+        assert_eq!(
+            assigned[0]
+                .1
+                .data
+                .control_data
+                .as_ref()
+                .expect("control data")
+                .kind,
+            ControlKind::SuccessfulPayment
+        );
+        assert!(effects.answered_pre_checkout_queries().is_empty());
+        assert!(fallback_calls.lock().expect("fallback calls").is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn payment_update_wrapper_queues_invoice_command_before_fallback()
+    -> Result<(), Box<dyn Error>> {
+        let created = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let queue = PaymentControlJobQueueStub::default();
+        let effects = EffectsStub::default();
+        let fallback_calls = Arc::new(Mutex::new(Vec::new()));
+        let fallback_calls_for_handle = Arc::clone(&fallback_calls);
+
+        let route = handle_payment_update_or_else_at(
+            &queue,
+            &effects,
+            sample_payment_command_update("/vip")?,
+            created,
+            move |update| {
+                let fallback_calls = Arc::clone(&fallback_calls_for_handle);
+                async move {
+                    fallback_calls
+                        .lock()
+                        .map_err(|err| std::io::Error::other(err.to_string()))?
+                        .push(update.id);
+                    Ok::<(), std::io::Error>(())
+                }
+            },
+        )
+        .await?;
+
+        assert_eq!(
+            route,
+            PaymentUpdateRoute::InvoiceCommand(PaymentInvoiceCommandUpdateRoute::Queued)
+        );
+        let assigned = queue.assigned();
+        assert_eq!(assigned.len(), 1);
+        assert_eq!(assigned[0].1.title, "vip invoice");
+        assert_eq!(
+            assigned[0]
+                .1
+                .data
+                .control_data
+                .as_ref()
+                .expect("control data")
+                .kind,
+            ControlKind::VipInvoice
+        );
+        assert!(fallback_calls.lock().expect("fallback calls").is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn payment_update_wrapper_delegates_non_payment_updates_once()
+    -> Result<(), Box<dyn Error>> {
+        let created = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let queue = PaymentControlJobQueueStub::default();
+        let effects = EffectsStub::default();
+        let fallback_calls = Arc::new(Mutex::new(Vec::new()));
+        let fallback_calls_for_handle = Arc::clone(&fallback_calls);
+
+        let route = handle_payment_update_or_else_at(
+            &queue,
+            &effects,
+            sample_text_update()?,
+            created,
+            move |update| {
+                let fallback_calls = Arc::clone(&fallback_calls_for_handle);
+                async move {
+                    fallback_calls
+                        .lock()
+                        .map_err(|err| std::io::Error::other(err.to_string()))?
+                        .push(update.id);
+                    Ok::<(), std::io::Error>(())
+                }
+            },
+        )
+        .await?;
+
+        assert_eq!(route, PaymentUpdateRoute::Delegated);
+        assert_eq!(
+            fallback_calls.lock().expect("fallback calls").as_slice(),
+            &[999]
+        );
+        assert!(queue.assigned().is_empty());
+        assert!(effects.answered_pre_checkout_queries().is_empty());
         Ok(())
     }
 
