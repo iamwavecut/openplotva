@@ -2,12 +2,32 @@
 
 use std::collections::BTreeMap;
 
+use serde::Serialize;
+
 use crate::{
     outbound::{CallbackAnswerRequest, build_callback_answer_method},
     transport::TelegramOutboundMethod,
 };
 
 pub type CallbackActionData = BTreeMap<String, String>;
+
+/// Go delete-drawing callback action: initialize deletion.
+pub const DELETE_DRAWING_ACTION_INIT: &str = "del_i";
+/// Go delete-drawing callback action: confirm all deletion.
+pub const DELETE_DRAWING_ACTION_CONFIRM: &str = "del_c";
+/// Go delete-drawing callback action: pick one frame.
+pub const DELETE_DRAWING_ACTION_FRAME_PICK: &str = "del_fp";
+/// Go delete-drawing callback action: confirm one frame.
+pub const DELETE_DRAWING_ACTION_FRAME_CONFIRM: &str = "del_fc";
+/// Go delete-drawing callback action: close controls.
+pub const DELETE_DRAWING_ACTION_CLOSE: &str = "del_x";
+
+/// Go delete-lyrics callback action: initialize deletion.
+pub const DELETE_LYRICS_ACTION_INIT: &str = "dl_i";
+/// Go delete-lyrics callback action: confirm deletion.
+pub const DELETE_LYRICS_ACTION_CONFIRM: &str = "dl_c";
+/// Go delete-lyrics callback action generated in keyboards but not routed by Go.
+pub const DELETE_LYRICS_ACTION_CLOSE: &str = "dl_x";
 
 /// Result of parsing callback data while preserving Go's ack-routing split.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -106,6 +126,74 @@ pub fn parse_callback_action(raw: &str) -> CallbackActionParse {
     CallbackActionParse::Actionless(data)
 }
 
+/// Parse Go callback integer fields, returning zero for blank or invalid input.
+#[must_use]
+pub fn parse_callback_i64(raw: &str) -> i64 {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return 0;
+    }
+    raw.parse().unwrap_or(0)
+}
+
+/// Encode Go delete-drawing callback data with stable field order.
+#[must_use]
+pub fn delete_drawing_callback_data(
+    action: &str,
+    user_id: i64,
+    chat_id: i64,
+    frame_num: i64,
+) -> String {
+    if frame_num > 0 {
+        return serde_json::to_string(&DeleteDrawingCallbackDataWithFrame {
+            action,
+            user_id: user_id.to_string(),
+            chat_id: chat_id.to_string(),
+            frame_num: frame_num.to_string(),
+        })
+        .expect("delete drawing callback data serialization cannot fail");
+    }
+    serde_json::to_string(&DeleteCallbackData {
+        action,
+        user_id: user_id.to_string(),
+        chat_id: chat_id.to_string(),
+    })
+    .expect("delete drawing callback data serialization cannot fail")
+}
+
+/// Encode Go delete-lyrics callback data with stable field order.
+#[must_use]
+pub fn delete_lyrics_callback_data(action: &str, user_id: i64, chat_id: i64) -> String {
+    serde_json::to_string(&DeleteCallbackData {
+        action,
+        user_id: user_id.to_string(),
+        chat_id: chat_id.to_string(),
+    })
+    .expect("delete lyrics callback data serialization cannot fail")
+}
+
+#[derive(Serialize)]
+struct DeleteCallbackData<'a> {
+    #[serde(rename = "a")]
+    action: &'a str,
+    #[serde(rename = "u")]
+    user_id: String,
+    #[serde(rename = "c")]
+    chat_id: String,
+}
+
+#[derive(Serialize)]
+struct DeleteDrawingCallbackDataWithFrame<'a> {
+    #[serde(rename = "a")]
+    action: &'a str,
+    #[serde(rename = "u")]
+    user_id: String,
+    #[serde(rename = "c")]
+    chat_id: String,
+    #[serde(rename = "n")]
+    frame_num: String,
+}
+
 /// Classify a callback query according to Go `processCallbackQuery` pre-handler order.
 #[must_use]
 pub fn callback_query_route(
@@ -201,10 +289,14 @@ pub fn callback_handler_for_action(action: &str) -> Option<CallbackHandlerKind> 
         "confirm_cancel_vip" => Some(CallbackHandlerKind::ConfirmCancelVip),
         "back_to_vip_status" => Some(CallbackHandlerKind::BackToVipStatus),
         "checkin_theme_select" | "cts" => Some(CallbackHandlerKind::CheckinThemeSelect),
-        "del_i" | "del_c" | "del_fp" | "del_fc" | "del_x" => {
-            Some(CallbackHandlerKind::DeleteDrawing)
+        DELETE_DRAWING_ACTION_INIT
+        | DELETE_DRAWING_ACTION_CONFIRM
+        | DELETE_DRAWING_ACTION_FRAME_PICK
+        | DELETE_DRAWING_ACTION_FRAME_CONFIRM
+        | DELETE_DRAWING_ACTION_CLOSE => Some(CallbackHandlerKind::DeleteDrawing),
+        DELETE_LYRICS_ACTION_INIT | DELETE_LYRICS_ACTION_CONFIRM => {
+            Some(CallbackHandlerKind::DeleteLyrics)
         }
-        "dl_i" | "dl_c" => Some(CallbackHandlerKind::DeleteLyrics),
         _ => None,
     }
 }

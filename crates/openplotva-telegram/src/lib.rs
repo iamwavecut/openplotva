@@ -13,10 +13,14 @@ mod update_startup;
 
 pub use callback::{
     CallbackActionData, CallbackActionParse, CallbackHandlerKind, CallbackQueryRoute,
-    callback_handler_for_action, callback_query_ack_method, callback_query_ack_request,
-    callback_query_route, checkin_theme_callback_init, checkin_theme_callback_theme,
-    checkin_theme_selection_ack_method, checkin_theme_selection_alert, parse_callback_action,
-    settings_callback_ack_method,
+    DELETE_DRAWING_ACTION_CLOSE, DELETE_DRAWING_ACTION_CONFIRM,
+    DELETE_DRAWING_ACTION_FRAME_CONFIRM, DELETE_DRAWING_ACTION_FRAME_PICK,
+    DELETE_DRAWING_ACTION_INIT, DELETE_LYRICS_ACTION_CLOSE, DELETE_LYRICS_ACTION_CONFIRM,
+    DELETE_LYRICS_ACTION_INIT, callback_handler_for_action, callback_query_ack_method,
+    callback_query_ack_request, callback_query_route, checkin_theme_callback_init,
+    checkin_theme_callback_theme, checkin_theme_selection_ack_method,
+    checkin_theme_selection_alert, delete_drawing_callback_data, delete_lyrics_callback_data,
+    parse_callback_action, parse_callback_i64, settings_callback_ack_method,
 };
 pub use dedup::{DEFAULT_DEBOUNCE_CACHE_SIZE, DEFAULT_DEBOUNCE_WINDOW, Debouncer, DebouncerConfig};
 pub use dispatcher::{
@@ -603,12 +607,17 @@ mod tests {
     use super::{
         API_CONSTRUCTOR_USAGES, BotCommandError, BotCommandScope, CALLBACK_ACTIONS,
         COMMAND_ALIAS_GROUPS, COMMAND_SETS, CallbackActionParse, CallbackHandlerKind,
-        CallbackQueryRoute, CommandScope, DONATE_COMMAND, GROUP_ADMIN_COMMANDS, GROUP_COMMANDS,
-        HELP_COMMAND, PRIVATE_COMMANDS, callback_handler_for_action, callback_query_ack_method,
-        callback_query_ack_request, callback_query_route, checkin_theme_callback_init,
-        checkin_theme_callback_theme, checkin_theme_selection_ack_method,
-        checkin_theme_selection_alert, delete_my_commands_method, empty_context,
-        parse_callback_action, set_my_commands_methods, settings_callback_ack_method,
+        CallbackQueryRoute, CommandScope, DELETE_DRAWING_ACTION_CLOSE,
+        DELETE_DRAWING_ACTION_CONFIRM, DELETE_DRAWING_ACTION_FRAME_CONFIRM,
+        DELETE_DRAWING_ACTION_FRAME_PICK, DELETE_DRAWING_ACTION_INIT, DELETE_LYRICS_ACTION_CLOSE,
+        DELETE_LYRICS_ACTION_CONFIRM, DELETE_LYRICS_ACTION_INIT, DONATE_COMMAND,
+        GROUP_ADMIN_COMMANDS, GROUP_COMMANDS, HELP_COMMAND, PRIVATE_COMMANDS,
+        callback_handler_for_action, callback_query_ack_method, callback_query_ack_request,
+        callback_query_route, checkin_theme_callback_init, checkin_theme_callback_theme,
+        checkin_theme_selection_ack_method, checkin_theme_selection_alert,
+        delete_drawing_callback_data, delete_lyrics_callback_data, delete_my_commands_method,
+        empty_context, parse_callback_action, parse_callback_i64, set_my_commands_methods,
+        settings_callback_ack_method,
     };
 
     #[derive(Debug, Deserialize)]
@@ -817,6 +826,65 @@ mod tests {
             callback_handler_for_action("checkin_theme_select"),
             Some(CallbackHandlerKind::CheckinThemeSelect)
         );
+    }
+
+    #[test]
+    fn delete_drawing_callback_data_matches_go_json_shapes() {
+        assert_eq!(
+            delete_drawing_callback_data(DELETE_DRAWING_ACTION_INIT, 42, -1001234567890, 0),
+            r#"{"a":"del_i","u":"42","c":"-1001234567890"}"#
+        );
+        assert_eq!(
+            delete_drawing_callback_data(DELETE_DRAWING_ACTION_FRAME_PICK, 42, -1001234567890, 3),
+            r#"{"a":"del_fp","u":"42","c":"-1001234567890","n":"3"}"#
+        );
+        assert_eq!(
+            delete_drawing_callback_data(
+                DELETE_DRAWING_ACTION_FRAME_CONFIRM,
+                42,
+                -1001234567890,
+                -1
+            ),
+            r#"{"a":"del_fc","u":"42","c":"-1001234567890"}"#
+        );
+        assert_eq!(
+            delete_drawing_callback_data(DELETE_DRAWING_ACTION_CONFIRM, 42, -1001234567890, 0),
+            r#"{"a":"del_c","u":"42","c":"-1001234567890"}"#
+        );
+        assert_eq!(
+            delete_drawing_callback_data(DELETE_DRAWING_ACTION_CLOSE, 42, -1001234567890, 0),
+            r#"{"a":"del_x","u":"42","c":"-1001234567890"}"#
+        );
+    }
+
+    #[test]
+    fn delete_lyrics_callback_data_matches_go_json_shapes() {
+        assert_eq!(
+            delete_lyrics_callback_data(DELETE_LYRICS_ACTION_INIT, 42, -1001234567890),
+            r#"{"a":"dl_i","u":"42","c":"-1001234567890"}"#
+        );
+        assert_eq!(
+            delete_lyrics_callback_data(DELETE_LYRICS_ACTION_CONFIRM, 42, -1001234567890),
+            r#"{"a":"dl_c","u":"42","c":"-1001234567890"}"#
+        );
+        assert_eq!(
+            delete_lyrics_callback_data(DELETE_LYRICS_ACTION_CLOSE, 42, -1001234567890),
+            r#"{"a":"dl_x","u":"42","c":"-1001234567890"}"#
+        );
+        assert_eq!(
+            callback_handler_for_action(DELETE_LYRICS_ACTION_CLOSE),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_callback_i64_matches_go_zero_fallback() {
+        assert_eq!(parse_callback_i64("12345"), 12345);
+        assert_eq!(parse_callback_i64("-1001234567890"), -1001234567890);
+        assert_eq!(parse_callback_i64(" 42 "), 42);
+        assert_eq!(parse_callback_i64("12x45"), 0);
+        assert_eq!(parse_callback_i64(""), 0);
+        assert_eq!(parse_callback_i64("9223372036854775808"), 0);
     }
 
     #[test]
