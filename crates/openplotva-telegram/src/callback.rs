@@ -178,6 +178,20 @@ pub fn callback_query_ack_method(
         .map(|request| TelegramOutboundMethod::from(build_callback_answer_method(&request)))
 }
 
+/// Build Go's cached empty acknowledgement for settings callbacks.
+#[must_use]
+pub fn settings_callback_ack_method(
+    callback_query_id: impl Into<String>,
+) -> TelegramOutboundMethod {
+    TelegramOutboundMethod::from(build_callback_answer_method(&CallbackAnswerRequest {
+        callback_query_id: callback_query_id.into(),
+        text: String::new(),
+        show_alert: false,
+        url: String::new(),
+        cache_time: 10,
+    }))
+}
+
 /// Return the Go callback handler group for an action.
 #[must_use]
 pub fn callback_handler_for_action(action: &str) -> Option<CallbackHandlerKind> {
