@@ -12,7 +12,9 @@ use std::{
 use carapax::types::{
     AllowedUpdate as TelegramAllowedUpdate, Chat as TelegramChat, MaybeInaccessibleMessage,
     Message as TelegramMessage, MessageData as TelegramMessageData, PollAnswerVoter,
-    Update as TelegramUpdate, UpdateType as TelegramUpdateType, User as TelegramUser,
+    ReplyTo as TelegramReplyTo, Text as TelegramText, TextEntity as TelegramTextEntity,
+    TextEntityPosition as TelegramTextEntityPosition, Update as TelegramUpdate,
+    UpdateType as TelegramUpdateType, User as TelegramUser,
 };
 use openplotva_core::{
     ChatAttachment, ChatMessageMeta, ChatState, MessageSender, SENDER_TYPE_CHANNEL,
@@ -848,6 +850,81 @@ pub fn build_fetcher_message_context(message: &TelegramMessage) -> FetcherMessag
     }
 }
 
+/// Result of Go `parseIfAdressed` over a Telegram message.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ParsedAddressedMessage {
+    /// Text used as the full message text for downstream handling.
+    pub message_text: String,
+    /// First parsed word after Go strips direct bot addressing where applicable.
+    pub first_word: String,
+    /// Remaining parsed text after the first word.
+    pub rest_text: String,
+    /// Whether the message is addressed to the bot.
+    pub is_addressed: bool,
+}
+
+/// Parse Go fetcher addressing semantics for a Telegram message.
+#[must_use]
+pub fn parse_if_addressed(message: &TelegramMessage, bot: &TelegramUser) -> ParsedAddressedMessage {
+    let (message_text, text_for_parsing) = addressable_message_text(message);
+    let (mut first_word, mut rest_text) = cut_first_word(&text_for_parsing);
+
+    if addressed_by_bot_name(bot, &first_word) {
+        (first_word, rest_text) = cut_first_word(&rest_text);
+        return ParsedAddressedMessage {
+            message_text,
+            first_word,
+            rest_text,
+            is_addressed: true,
+        };
+    }
+
+    if telegram_chat_is_private(&message.chat) {
+        return ParsedAddressedMessage {
+            message_text,
+            first_word,
+            rest_text,
+            is_addressed: true,
+        };
+    }
+
+    if addressed_by_bot_mention(bot, &first_word) {
+        (first_word, rest_text) = cut_first_word(&rest_text);
+        return ParsedAddressedMessage {
+            message_text,
+            first_word,
+            rest_text,
+            is_addressed: true,
+        };
+    }
+
+    let is_addressed = addressed_by_bot_reply(message, bot);
+    ParsedAddressedMessage {
+        message_text,
+        first_word,
+        rest_text,
+        is_addressed,
+    }
+}
+
+/// Return whether this message is Go's `/settings` command for the current bot.
+#[must_use]
+pub fn is_settings_command_message(message: &TelegramMessage, bot_username: &str) -> bool {
+    let Some(command) = leading_bot_command(message) else {
+        return false;
+    };
+    if !command.command.eq_ignore_ascii_case("settings") {
+        return false;
+    }
+    if telegram_chat_is_private(&message.chat) || bot_username.is_empty() {
+        return true;
+    }
+    command
+        .target
+        .as_deref()
+        .is_none_or(|target| target.eq_ignore_ascii_case(bot_username))
+}
+
 /// Go `dialog.MessageKindText` history kind.
 pub const HISTORY_MESSAGE_KIND_TEXT: &str = "text";
 
@@ -1369,6 +1446,191 @@ fn message_text_before_fetcher_fallback(message: &TelegramMessage) -> String {
     }
 }
 
+fn addressable_message_text(message: &TelegramMessage) -> (String, String) {
+    let message_text = fetcher_message_text(message);
+    (message_text.clone(), message_text)
+}
+
+fn cut_first_word(text: &str) -> (String, String) {
+    let Some((first, rest)) = text.split_once(' ') else {
+        return (first_word_trim_no_space(text).to_owned(), String::new());
+    };
+
+    (
+        first_word_trim(first).to_owned(),
+        rest.trim_start_matches(word_separator).to_owned(),
+    )
+}
+
+fn first_word_trim_no_space(value: &str) -> &str {
+    value.trim_end_matches([' ', ',', '.', '!', '?', ':'])
+}
+
+fn first_word_trim(value: &str) -> &str {
+    value.trim_end_matches(word_separator)
+}
+
+fn word_separator(ch: char) -> bool {
+    matches!(ch, ' ' | ',' | '.' | '!' | '?' | ':' | '\r' | '\n' | '\t')
+}
+
+fn telegram_chat_is_private(chat: &TelegramChat) -> bool {
+    matches!(chat, TelegramChat::Private(_))
+}
+
+fn addressed_by_bot_name(bot: &TelegramUser, first_word: &str) -> bool {
+    is_equal_transliterated(&bot.first_name, first_word)
+}
+
+fn addressed_by_bot_mention(bot: &TelegramUser, first_word: &str) -> bool {
+    let Some(username) = bot.username.as_ref() else {
+        return false;
+    };
+    first_word.eq_ignore_ascii_case(&format!("@{username}"))
+}
+
+fn addressed_by_bot_reply(message: &TelegramMessage, bot: &TelegramUser) -> bool {
+    let Some(TelegramReplyTo::Message(reply)) = message.reply_to.as_ref() else {
+        return false;
+    };
+    let Some(reply_user) = reply.sender.get_user() else {
+        return false;
+    };
+    if reply_user.id != bot.id {
+        return false;
+    }
+
+    let thread_id = message.message_thread_id.unwrap_or_default();
+    reply.id != thread_id
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BotCommandInMessage {
+    command: String,
+    target: Option<String>,
+}
+
+fn leading_bot_command(message: &TelegramMessage) -> Option<BotCommandInMessage> {
+    let TelegramMessageData::Text(text) = &message.data else {
+        return None;
+    };
+    leading_bot_command_from_text(text)
+}
+
+fn leading_bot_command_from_text(text: &TelegramText) -> Option<BotCommandInMessage> {
+    let first = text.entities.as_ref()?.into_iter().next()?;
+    let TelegramTextEntity::BotCommand(position) = first else {
+        return None;
+    };
+    if position.offset != 0 {
+        return None;
+    }
+
+    let command_with_slash = text_entity_content(&text.data, *position);
+    let command_with_target = command_with_slash.strip_prefix('/')?;
+    let (command, target) = match command_with_target.split_once('@') {
+        Some((command, target)) => (command, Some(target.to_owned())),
+        None => (command_with_target, None),
+    };
+
+    Some(BotCommandInMessage {
+        command: command.to_owned(),
+        target,
+    })
+}
+
+fn text_entity_content(text: &str, position: TelegramTextEntityPosition) -> String {
+    String::from_utf16_lossy(
+        &text
+            .encode_utf16()
+            .skip(position.offset as usize)
+            .take(position.length as usize)
+            .collect::<Vec<u16>>(),
+    )
+}
+
+fn is_equal_transliterated(name: &str, given: &str) -> bool {
+    if name.eq_ignore_ascii_case(given) {
+        return true;
+    }
+
+    let name = name.to_lowercase();
+    let given = given.to_lowercase();
+    transliterate1(&name) == given || transliterate2(&name) == given
+}
+
+fn transliterate1(value: &str) -> String {
+    transliterate(value, TransliterationStyle::One)
+}
+
+fn transliterate2(value: &str) -> String {
+    transliterate(value, TransliterationStyle::Two)
+}
+
+#[derive(Clone, Copy)]
+enum TransliterationStyle {
+    One,
+    Two,
+}
+
+fn transliterate(value: &str, style: TransliterationStyle) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match transliterated_char(ch, style) {
+            Some(replacement) => out.push_str(replacement),
+            None => out.push(ch),
+        }
+    }
+    out
+}
+
+fn transliterated_char(ch: char, style: TransliterationStyle) -> Option<&'static str> {
+    let value = match ch {
+        'а' => "a",
+        'б' => "b",
+        'в' => match style {
+            TransliterationStyle::One => "v",
+            TransliterationStyle::Two => "w",
+        },
+        'г' => "g",
+        'д' => "d",
+        'е' | 'ё' => "e",
+        'ж' => "j",
+        'з' => "z",
+        'и' => "i",
+        'й' => "y",
+        'к' => "k",
+        'л' => "l",
+        'м' => "m",
+        'н' => "n",
+        'о' => "o",
+        'п' => "p",
+        'р' => "r",
+        'с' => "s",
+        'т' => "t",
+        'у' => "u",
+        'ф' => "f",
+        'х' => "h",
+        'ц' => "c",
+        'ч' => "ch",
+        'ш' => "sh",
+        'щ' => "shch",
+        'ы' => "y",
+        'э' => "e",
+        'ю' => match style {
+            TransliterationStyle::One => "yu",
+            TransliterationStyle::Two => "ju",
+        },
+        'я' => match style {
+            TransliterationStyle::One => "ya",
+            TransliterationStyle::Two => "ja",
+        },
+        'ъ' | 'ь' => "",
+        _ => return None,
+    };
+    Some(value)
+}
+
 fn audio_fallback_text(audio: &carapax::types::Audio) -> String {
     let performer = audio.performer.as_deref().unwrap_or_default();
     let title = audio.title.as_deref().unwrap_or_default();
@@ -1624,8 +1886,9 @@ mod tests {
         GoUpdateType, RedisUpdateQueue, TelegramMessageAttachmentOptions, UpdateCodecError,
         UpdateConsumerConfig, UpdateProducerQueue, UpdateProducerQueueFuture, UpdateProducerSource,
         UpdateProducerSourceFuture, UpdateStageOutcome, blpop_timeout_arg, extract_update_state,
-        fetcher_message_text, is_allowed_producer_update, process_update_at, producer_update_name,
-        producer_update_type, run_update_producer_until, telegram_message_attachments, update_name,
+        fetcher_message_text, is_allowed_producer_update, is_settings_command_message,
+        parse_if_addressed, process_update_at, producer_update_name, producer_update_type,
+        run_update_producer_until, telegram_message_attachments, update_name,
     };
     use carapax::types::{
         Message as TelegramMessage, Update as TelegramUpdate, UpdateType as TelegramUpdateType,
@@ -2941,6 +3204,189 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn parse_if_addressed_matches_go_group_and_private_addressing() -> Result<(), Box<dyn Error>> {
+        let bot = sample_bot_user();
+        let group = sample_message_from_value(json!({
+            "message_id": 1,
+            "date": 1_710_000_000,
+            "chat": {
+                "id": -42,
+                "type": "group",
+                "title": "Group"
+            },
+            "from": sample_user_json(),
+            "text": "@PlotvaBot измени фон"
+        }))?;
+        let private = sample_message_from_value(json!({
+            "message_id": 2,
+            "date": 1_710_000_000,
+            "chat": sample_private_chat_json(),
+            "from": sample_user_json(),
+            "text": "@PlotvaBot измени фон"
+        }))?;
+
+        let parsed = parse_if_addressed(&group, &bot);
+        assert!(parsed.is_addressed);
+        assert_eq!(parsed.message_text, "@PlotvaBot измени фон");
+        assert_eq!(parsed.first_word, "измени");
+        assert_eq!(parsed.rest_text, "фон");
+
+        let parsed = parse_if_addressed(&private, &bot);
+        assert!(parsed.is_addressed);
+        assert_eq!(parsed.first_word, "@PlotvaBot");
+        assert_eq!(parsed.rest_text, "измени фон");
+        Ok(())
+    }
+
+    #[test]
+    fn parse_if_addressed_matches_go_name_transliteration_and_reply_rules()
+    -> Result<(), Box<dyn Error>> {
+        let bot = sample_bot_user();
+        let name_address = sample_message_from_value(json!({
+            "message_id": 3,
+            "date": 1_710_000_000,
+            "chat": {
+                "id": -42,
+                "type": "group",
+                "title": "Group"
+            },
+            "from": sample_user_json(),
+            "text": "plotva, измени фон"
+        }))?;
+        let reply_address = sample_message_from_value(json!({
+            "message_id": 4,
+            "date": 1_710_000_000,
+            "chat": {
+                "id": -42,
+                "type": "group",
+                "title": "Group"
+            },
+            "from": sample_user_json(),
+            "text": "а так?",
+            "reply_to_message": {
+                "message_id": 99,
+                "date": 1_710_000_000,
+                "chat": {
+                    "id": -42,
+                    "type": "group",
+                    "title": "Group"
+                },
+                "from": {
+                    "id": 777,
+                    "is_bot": true,
+                    "first_name": "Плотва",
+                    "username": "PlotvaBot"
+                },
+                "text": "old answer"
+            }
+        }))?;
+        let topic_reply = sample_message_from_value(json!({
+            "message_id": 5,
+            "message_thread_id": 99,
+            "date": 1_710_000_000,
+            "chat": {
+                "id": -42,
+                "type": "supergroup",
+                "title": "Forum",
+                "is_forum": true
+            },
+            "from": sample_user_json(),
+            "text": "topic root reply",
+            "reply_to_message": {
+                "message_id": 99,
+                "date": 1_710_000_000,
+                "chat": {
+                    "id": -42,
+                    "type": "supergroup",
+                    "title": "Forum",
+                    "is_forum": true
+                },
+                "from": {
+                    "id": 777,
+                    "is_bot": true,
+                    "first_name": "Плотва",
+                    "username": "PlotvaBot"
+                },
+                "text": "topic starter"
+            }
+        }))?;
+
+        let parsed = parse_if_addressed(&name_address, &bot);
+        assert!(parsed.is_addressed);
+        assert_eq!(parsed.first_word, "измени");
+        assert_eq!(parsed.rest_text, "фон");
+
+        let parsed = parse_if_addressed(&reply_address, &bot);
+        assert!(parsed.is_addressed);
+        assert_eq!(parsed.first_word, "а");
+        assert_eq!(parsed.rest_text, "так?");
+
+        let parsed = parse_if_addressed(&topic_reply, &bot);
+        assert!(!parsed.is_addressed);
+        Ok(())
+    }
+
+    #[test]
+    fn settings_command_message_matches_go_bot_target_rules() -> Result<(), Box<dyn Error>> {
+        let group_settings = sample_message_from_value(json!({
+            "message_id": 6,
+            "date": 1_710_000_000,
+            "chat": {
+                "id": -42,
+                "type": "group",
+                "title": "Group"
+            },
+            "from": sample_user_json(),
+            "text": "/settings@PlotvaBot",
+            "entities": [
+                {
+                    "type": "bot_command",
+                    "offset": 0,
+                    "length": 19
+                }
+            ]
+        }))?;
+        let wrong_bot = sample_message_from_value(json!({
+            "message_id": 7,
+            "date": 1_710_000_000,
+            "chat": {
+                "id": -42,
+                "type": "group",
+                "title": "Group"
+            },
+            "from": sample_user_json(),
+            "text": "/settings@OtherBot",
+            "entities": [
+                {
+                    "type": "bot_command",
+                    "offset": 0,
+                    "length": 18
+                }
+            ]
+        }))?;
+        let embedded_command = sample_message_from_value(json!({
+            "message_id": 8,
+            "date": 1_710_000_000,
+            "chat": sample_private_chat_json(),
+            "from": sample_user_json(),
+            "text": "see /settings",
+            "entities": [
+                {
+                    "type": "bot_command",
+                    "offset": 4,
+                    "length": 9
+                }
+            ]
+        }))?;
+
+        assert!(is_settings_command_message(&group_settings, "plotvabot"));
+        assert!(!is_settings_command_message(&wrong_bot, "plotvabot"));
+        assert!(is_settings_command_message(&group_settings, ""));
+        assert!(!is_settings_command_message(&embedded_command, "plotvabot"));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn update_consumer_runs_state_and_handle_for_fresh_update() -> Result<(), Box<dyn Error>>
     {
@@ -3283,6 +3729,22 @@ mod tests {
             "from": sample_user_json(),
             "text": text
         })
+    }
+
+    fn sample_message_from_value(
+        value: serde_json::Value,
+    ) -> Result<TelegramMessage, serde_json::Error> {
+        serde_json::from_value(value)
+    }
+
+    fn sample_bot_user() -> carapax::types::User {
+        serde_json::from_value(json!({
+            "id": 777,
+            "is_bot": true,
+            "first_name": "Плотва",
+            "username": "PlotvaBot"
+        }))
+        .expect("sample bot user")
     }
 
     fn sample_private_chat_json() -> serde_json::Value {
