@@ -92,6 +92,12 @@ pub const SQL_UPDATE_MEMBER_LAST_MESSAGE: &str = "UPDATE chat_members SET last_m
 /// Go `UpsertChatActiveUser` SQL.
 pub const SQL_UPSERT_CHAT_ACTIVE_USER: &str = "INSERT INTO chat_active_users (chat_id, user_id, last_active_at) VALUES ($1, $2, CURRENT_TIMESTAMP) ON CONFLICT (chat_id, user_id) DO UPDATE SET last_active_at = CURRENT_TIMESTAMP";
 
+/// Go `ListActiveParticipants` SQL.
+pub const SQL_LIST_ACTIVE_PARTICIPANTS: &str = "SELECT user_id FROM chat_members WHERE chat_id = $1 AND status IN ('administrator', 'member', 'creator') AND last_message_at IS NOT NULL AND last_message_at >= (CURRENT_TIMESTAMP - INTERVAL '24 hours') ORDER BY last_message_at DESC LIMIT $2";
+
+/// Go `ListActiveParticipantsFromTable` SQL.
+pub const SQL_LIST_ACTIVE_PARTICIPANTS_FROM_TABLE: &str = "SELECT user_id FROM chat_active_users WHERE chat_id = $1 AND last_active_at >= (CURRENT_TIMESTAMP - INTERVAL '24 hours') ORDER BY last_active_at DESC LIMIT $2";
+
 /// Go `GetChatSettings` SQL narrowed to fields currently needed by permission policy.
 pub const SQL_GET_CHAT_SETTINGS: &str = "SELECT chat_id, mood_alignment, custom_persona, reactivity_percentage, proactivity_percentage, enable_global_text_reply, enable_global_draw_reply, enable_obscenifier, enable_profanity, enable_greet_joiners, enable_daily_game, daily_game_theme, greeting_html FROM chat_settings WHERE chat_id = $1";
 
@@ -1084,6 +1090,34 @@ impl PostgresChatMemberStore {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    /// List Go active participants from `chat_members`.
+    pub async fn list_active_participants(
+        &self,
+        chat_id: i64,
+        limit_count: i32,
+    ) -> Result<Vec<i64>, StorageError> {
+        let rows = sqlx::query_scalar::<_, i64>(SQL_LIST_ACTIVE_PARTICIPANTS)
+            .bind(chat_id)
+            .bind(limit_count)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows)
+    }
+
+    /// List Go active participants from `chat_active_users`.
+    pub async fn list_active_participants_from_table(
+        &self,
+        chat_id: i64,
+        limit_count: i32,
+    ) -> Result<Vec<i64>, StorageError> {
+        let rows = sqlx::query_scalar::<_, i64>(SQL_LIST_ACTIVE_PARTICIPANTS_FROM_TABLE)
+            .bind(chat_id)
+            .bind(limit_count)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows)
     }
 
     /// Upsert user state for admin-sync user persistence.
@@ -2648,6 +2682,14 @@ mod tests {
         assert_eq!(
             super::SQL_UPSERT_CHAT_ACTIVE_USER,
             "INSERT INTO chat_active_users (chat_id, user_id, last_active_at) VALUES ($1, $2, CURRENT_TIMESTAMP) ON CONFLICT (chat_id, user_id) DO UPDATE SET last_active_at = CURRENT_TIMESTAMP"
+        );
+        assert_eq!(
+            super::SQL_LIST_ACTIVE_PARTICIPANTS,
+            "SELECT user_id FROM chat_members WHERE chat_id = $1 AND status IN ('administrator', 'member', 'creator') AND last_message_at IS NOT NULL AND last_message_at >= (CURRENT_TIMESTAMP - INTERVAL '24 hours') ORDER BY last_message_at DESC LIMIT $2"
+        );
+        assert_eq!(
+            super::SQL_LIST_ACTIVE_PARTICIPANTS_FROM_TABLE,
+            "SELECT user_id FROM chat_active_users WHERE chat_id = $1 AND last_active_at >= (CURRENT_TIMESTAMP - INTERVAL '24 hours') ORDER BY last_active_at DESC LIMIT $2"
         );
     }
 
