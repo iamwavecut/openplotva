@@ -1,5 +1,6 @@
 //! Composition root for the OpenPlotva application shell.
 
+pub mod callbacks;
 pub mod inline;
 pub mod members;
 pub mod payments;
