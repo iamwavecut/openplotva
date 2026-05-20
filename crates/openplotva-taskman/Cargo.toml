@@ -10,3 +10,9 @@ publish = false
 [lints]
 workspace = true
 
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+time = { workspace = true, features = ["serde"] }
+
+[dev-dependencies]
+serde_json.workspace = true
