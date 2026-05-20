@@ -25,13 +25,15 @@ pub use html::{
 };
 pub use outbound::{
     AudioMessagePlan, AudioMessageRequest, AudioSource, ChatRef, DeleteMessageRequest,
-    EditMediaMessagePlan, EditMediaMessageRequest, EditTextMessageRequest, MESSAGE_TYPE_TEXT,
+    EditCaptionMessageRequest, EditMediaMessagePlan, EditMediaMessageRequest,
+    EditReplyMarkupMessageRequest, EditTextMessageRequest, MESSAGE_TYPE_TEXT,
     MediaGroupMessagePlan, MediaGroupMessageRequest, MediaGroupPhotoItem, MessageFingerprint,
     OutboundBuildError, PhotoMessagePlan, PhotoMessageRequest, PhotoSource, ReplyMessageRef,
     ReplyParametersPlan, StickerMessagePlan, StickerMessageRequest, TELEGRAM_TEXT_MAX_BYTES,
     TextMessageRequest, allow_sending_without_reply, build_audio_message_method,
-    build_audio_message_plan, build_delete_message_method, build_edit_media_message_method,
-    build_edit_media_message_plan, build_edit_text_message_method,
+    build_audio_message_plan, build_delete_message_method, build_edit_caption_message_method,
+    build_edit_media_message_method, build_edit_media_message_plan,
+    build_edit_reply_markup_message_method, build_edit_text_message_method,
     build_media_group_message_method, build_media_group_message_plan, build_photo_message_method,
     build_photo_message_plan, build_sticker_message_method, build_sticker_message_plan,
     build_text_message_method, build_text_message_methods, fingerprint_audio_message_plan,

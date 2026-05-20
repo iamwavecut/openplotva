@@ -4,10 +4,10 @@ use std::{borrow::Cow, fmt, io::Cursor};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use carapax::types::{
-    DeleteMessage, EditMessageMedia, EditMessageText, InlineKeyboardMarkup, InputFile,
-    InputFileReader, InputMedia, InputMediaError, InputMediaPhoto, MediaGroup, MediaGroupError,
-    MediaGroupItem, ParseMode, ReplyMarkup, ReplyParameters, ReplyParametersError, SendAudio,
-    SendMediaGroup, SendMessage, SendPhoto, SendSticker,
+    DeleteMessage, EditMessageCaption, EditMessageMedia, EditMessageReplyMarkup, EditMessageText,
+    InlineKeyboardMarkup, InputFile, InputFileReader, InputMedia, InputMediaError, InputMediaPhoto,
+    MediaGroup, MediaGroupError, MediaGroupItem, ParseMode, ReplyMarkup, ReplyParameters,
+    ReplyParametersError, SendAudio, SendMediaGroup, SendMessage, SendPhoto, SendSticker,
 };
 use crc::{CRC_32_ISCSI, Crc};
 use serde_json::{Map, Value, json};
@@ -110,6 +110,32 @@ pub struct EditTextMessageRequest {
     pub render_as: String,
     /// Go edit path only applies inline keyboard markup.
     pub reply_markup: Option<InlineKeyboardMarkup>,
+}
+
+/// Caption edit request fields used by Go `api.NewEditMessageCaption` call sites.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EditCaptionMessageRequest {
+    /// Target chat.
+    pub chat: ChatRef,
+    /// Message ID to edit.
+    pub message_id: i64,
+    /// New caption text.
+    pub caption: String,
+    /// Go `ParseMode` string for the caption.
+    pub render_as: String,
+    /// Optional inline keyboard markup.
+    pub reply_markup: Option<InlineKeyboardMarkup>,
+}
+
+/// Reply-markup edit request fields used by Go `api.NewEditMessageReplyMarkup` call sites.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EditReplyMarkupMessageRequest {
+    /// Target chat.
+    pub chat: ChatRef,
+    /// Message ID to edit.
+    pub message_id: i64,
+    /// Replacement inline keyboard markup, including Go's explicit empty markup.
+    pub reply_markup: InlineKeyboardMarkup,
 }
 
 /// Delete request fields used by Go `api.NewDeleteMessage` call sites.
@@ -441,6 +467,39 @@ pub fn build_edit_text_message_method(
         method = method.with_reply_markup(markup);
     }
     Ok(method)
+}
+
+/// Build an outbound `editMessageCaption` method.
+pub fn build_edit_caption_message_method(
+    req: &EditCaptionMessageRequest,
+) -> Result<EditMessageCaption, OutboundBuildError> {
+    if req.message_id == 0 {
+        return Err(OutboundBuildError::MessageIdRequired);
+    }
+
+    let mut method = EditMessageCaption::for_chat_message(req.chat.id, req.message_id)
+        .with_caption(req.caption.clone());
+    if let Some(parse_mode) = parse_mode_from_go(&req.render_as)? {
+        method = method.with_caption_parse_mode(parse_mode);
+    }
+    if let Some(markup) = req.reply_markup.clone() {
+        method = method.with_reply_markup(markup);
+    }
+    Ok(method)
+}
+
+/// Build an outbound `editMessageReplyMarkup` method.
+pub fn build_edit_reply_markup_message_method(
+    req: &EditReplyMarkupMessageRequest,
+) -> Result<EditMessageReplyMarkup, OutboundBuildError> {
+    if req.message_id == 0 {
+        return Err(OutboundBuildError::MessageIdRequired);
+    }
+
+    Ok(
+        EditMessageReplyMarkup::for_chat_message(req.chat.id, req.message_id)
+            .with_reply_markup(req.reply_markup.clone()),
+    )
 }
 
 /// Build an outbound `deleteMessage` method.
@@ -1126,13 +1185,15 @@ mod tests {
 
     use super::{
         AudioMessagePlan, AudioMessageRequest, AudioSource, ChatRef, DeleteMessageRequest,
-        EditMediaMessagePlan, EditMediaMessageRequest, EditTextMessageRequest, MESSAGE_TYPE_TEXT,
+        EditCaptionMessageRequest, EditMediaMessagePlan, EditMediaMessageRequest,
+        EditReplyMarkupMessageRequest, EditTextMessageRequest, MESSAGE_TYPE_TEXT,
         MediaGroupMessagePlan, MediaGroupMessageRequest, MediaGroupPhotoItem, MessageFingerprint,
         OutboundBuildError, PhotoMessagePlan, PhotoMessageRequest, PhotoSource, ReplyMessageRef,
         ReplyParametersPlan, StickerMessagePlan, StickerMessageRequest, TextMessageRequest,
         allow_sending_without_reply, build_audio_message_method, build_audio_message_plan,
-        build_delete_message_method, build_edit_media_message_method,
-        build_edit_media_message_plan, build_edit_text_message_method,
+        build_delete_message_method, build_edit_caption_message_method,
+        build_edit_media_message_method, build_edit_media_message_plan,
+        build_edit_reply_markup_message_method, build_edit_text_message_method,
         build_media_group_message_method, build_media_group_message_plan,
         build_photo_message_method, build_photo_message_plan, build_sticker_message_method,
         build_sticker_message_plan, build_text_message_method, build_text_message_methods,
@@ -2028,6 +2089,60 @@ mod tests {
             build_edit_text_message_method(&req).err(),
             Some(OutboundBuildError::MessageIdRequired)
         );
+    }
+
+    #[test]
+    fn build_edit_caption_message_method_matches_go_caption_transfer_payload()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let req = EditCaptionMessageRequest {
+            chat: private_chat(42),
+            message_id: 88,
+            caption: "<b>kept caption</b>".to_owned(),
+            render_as: TELEGRAM_PARSE_MODE_HTML.to_owned(),
+            reply_markup: None,
+        };
+
+        let method = build_edit_caption_message_method(&req)?;
+        let payload = serde_json::to_value(method)?;
+
+        assert_eq!(payload["chat_id"], json!(42));
+        assert_eq!(payload["message_id"], json!(88));
+        assert_eq!(payload["caption"], json!("<b>kept caption</b>"));
+        assert_eq!(payload["parse_mode"], json!("HTML"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn build_edit_reply_markup_message_method_keeps_empty_and_nonempty_markup()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let empty = build_edit_reply_markup_message_method(&EditReplyMarkupMessageRequest {
+            chat: private_chat(42),
+            message_id: 77,
+            reply_markup: InlineKeyboardMarkup::default(),
+        })?;
+        let empty_payload = serde_json::to_value(empty)?;
+        assert_eq!(empty_payload["chat_id"], json!(42));
+        assert_eq!(empty_payload["message_id"], json!(77));
+        assert_eq!(empty_payload["reply_markup"]["inline_keyboard"], json!([]),);
+
+        let markup =
+            InlineKeyboardMarkup::from([[InlineKeyboardButton::for_callback_data("ok", "ok")]]);
+        let method = build_edit_reply_markup_message_method(&EditReplyMarkupMessageRequest {
+            chat: private_chat(43),
+            message_id: 78,
+            reply_markup: markup,
+        })?;
+        let payload = serde_json::to_value(method)?;
+
+        assert_eq!(payload["chat_id"], json!(43));
+        assert_eq!(payload["message_id"], json!(78));
+        assert_eq!(
+            payload["reply_markup"]["inline_keyboard"][0][0]["callback_data"],
+            json!("ok"),
+        );
+
+        Ok(())
     }
 
     #[test]

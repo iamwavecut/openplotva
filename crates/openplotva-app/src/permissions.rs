@@ -329,7 +329,9 @@ fn permission_error_media_flag(method_kind: TelegramOutboundMethodKind) -> Optio
         | TelegramOutboundMethodKind::SendPhoto
         | TelegramOutboundMethodKind::SendAudio
         | TelegramOutboundMethodKind::SendMediaGroup => Some(true),
-        TelegramOutboundMethodKind::EditMessageMedia
+        TelegramOutboundMethodKind::EditMessageCaption
+        | TelegramOutboundMethodKind::EditMessageReplyMarkup
+        | TelegramOutboundMethodKind::EditMessageMedia
         | TelegramOutboundMethodKind::DeleteMessage => None,
     }
 }

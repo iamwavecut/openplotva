@@ -333,6 +333,8 @@ fn replay_method_from_value(
         TelegramOutboundMethodKind::SendAudio => replay_audio_method(value),
         TelegramOutboundMethodKind::SendMediaGroup => replay_media_group_method(value),
         TelegramOutboundMethodKind::EditMessageText => replay_edit_text_method(value),
+        TelegramOutboundMethodKind::EditMessageCaption
+        | TelegramOutboundMethodKind::EditMessageReplyMarkup => None,
         TelegramOutboundMethodKind::EditMessageMedia => replay_edit_media_method(value),
         TelegramOutboundMethodKind::DeleteMessage => replay_delete_method(value),
     }
@@ -500,6 +502,8 @@ fn fingerprint_from_value(
             debounce_key: None,
         },
         TelegramOutboundMethodKind::EditMessageText
+        | TelegramOutboundMethodKind::EditMessageCaption
+        | TelegramOutboundMethodKind::EditMessageReplyMarkup
         | TelegramOutboundMethodKind::EditMessageMedia
         | TelegramOutboundMethodKind::DeleteMessage => MessageFingerprint {
             chat_id,
@@ -688,6 +692,8 @@ fn serialize_outbound_method(
         | TelegramOutboundMethod::SendPhoto(_)
         | TelegramOutboundMethod::SendAudio(_)
         | TelegramOutboundMethod::SendMediaGroup(_)
+        | TelegramOutboundMethod::EditMessageCaption(_)
+        | TelegramOutboundMethod::EditMessageReplyMarkup(_)
         | TelegramOutboundMethod::EditMessageMedia(_)
         | TelegramOutboundMethod::DeleteMessage(_) => Ok(None),
     }
@@ -701,6 +707,8 @@ fn go_message_type(kind: TelegramOutboundMethodKind) -> &'static str {
         TelegramOutboundMethodKind::SendAudio => "*api.AudioConfig",
         TelegramOutboundMethodKind::SendMediaGroup => "*api.MediaGroupConfig",
         TelegramOutboundMethodKind::EditMessageText => "*api.EditMessageTextConfig",
+        TelegramOutboundMethodKind::EditMessageCaption => "*api.EditMessageCaptionConfig",
+        TelegramOutboundMethodKind::EditMessageReplyMarkup => "*api.EditMessageReplyMarkupConfig",
         TelegramOutboundMethodKind::EditMessageMedia => "*api.EditMessageMediaConfig",
         TelegramOutboundMethodKind::DeleteMessage => "*api.DeleteMessageConfig",
     }
@@ -730,6 +738,12 @@ fn message_type_method_kind(message_type: &str) -> Option<TelegramOutboundMethod
         | "api.MediaGroupConfig" => Some(TelegramOutboundMethodKind::SendMediaGroup),
         "*api.EditMessageTextConfig" | "api.EditMessageTextConfig" => {
             Some(TelegramOutboundMethodKind::EditMessageText)
+        }
+        "*api.EditMessageCaptionConfig" | "api.EditMessageCaptionConfig" => {
+            Some(TelegramOutboundMethodKind::EditMessageCaption)
+        }
+        "*api.EditMessageReplyMarkupConfig" | "api.EditMessageReplyMarkupConfig" => {
+            Some(TelegramOutboundMethodKind::EditMessageReplyMarkup)
         }
         "*api.EditMessageMediaConfig" | "api.EditMessageMediaConfig" => {
             Some(TelegramOutboundMethodKind::EditMessageMedia)
