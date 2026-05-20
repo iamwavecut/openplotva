@@ -18,7 +18,9 @@ use carapax::types::{
     TextEntity as TelegramTextEntity, Update as TelegramUpdate, UpdateType as TelegramUpdateType,
     User as TelegramUser,
 };
-use openplotva_core::{UserState, VIP_EVENT_TYPE_PAYMENT, vip_days_to_seconds};
+use openplotva_core::{
+    UserState, VIP_EVENT_TYPE_ADMIN_ADJUSTMENT, VIP_EVENT_TYPE_PAYMENT, vip_days_to_seconds,
+};
 use openplotva_storage::{
     DonationCreate, DonationRecord, PostgresPaymentStore, PostgresVipStore,
     PostgresVirtualMessageStore, StorageError, SubscriptionCreate, SubscriptionRecord,
@@ -312,6 +314,34 @@ pub enum PaymentControlJobOutcome {
     NotPaymentControlJob,
 }
 
+/// Result class for Go `/admin_grant_vip` command handling.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdminGrantVipCommandOutcome {
+    /// A VIP ledger admin-adjustment event was created and a success reply was queued.
+    Granted,
+    /// The first duration argument was invalid, so Go's one-day default was applied.
+    GrantedWithDefaultDuration,
+    /// Neither an explicit target nor a replied-to user was available.
+    MissingTarget,
+    /// The explicit target argument could not be parsed or resolved.
+    TargetError,
+    /// The VIP ledger event could not be written.
+    StorageError,
+}
+
+/// Report for Go `/admin_grant_vip` command handling.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminGrantVipCommandReport {
+    /// Observable route/outcome.
+    pub outcome: AdminGrantVipCommandOutcome,
+    /// Target user affected by the command, when resolved.
+    pub target_user_id: Option<i64>,
+    /// Created VIP event ID, when an event was written.
+    pub event_id: Option<i64>,
+    /// Human-readable storage/target error, when Go would include or log one.
+    pub error: Option<String>,
+}
+
 /// Payment-specific taskman control-job execution report.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PaymentControlJobReport {
@@ -548,6 +578,24 @@ pub trait VipStatusStore {
     ) -> PaymentStoreFuture<'a, Option<VipCacheRecord>, Self::Error>;
 }
 
+/// Storage boundary needed by Go `/admin_grant_vip`.
+pub trait AdminGrantVipStore {
+    /// Error returned by the concrete storage implementation.
+    type Error: fmt::Display + Send + Sync + 'static;
+
+    /// Resolve a remembered Telegram username to a user ID using Go `GetUserByUsername`.
+    fn get_user_id_by_username<'a>(
+        &'a self,
+        username: &'a str,
+    ) -> PaymentStoreFuture<'a, Option<i64>, Self::Error>;
+
+    /// Create a VIP ledger event.
+    fn create_admin_vip_event<'a>(
+        &'a self,
+        event: VipEventCreate<'a>,
+    ) -> PaymentStoreFuture<'a, VipEventRecord, Self::Error>;
+}
+
 /// VIP predicate boundary matching Go `Fetcher.IsVIP` before existing-status rendering.
 pub trait VipStatusChecker {
     /// Return whether this user should see existing VIP status instead of a new invoice.
@@ -593,6 +641,45 @@ impl VipCacheInvalidator for NoopVipCacheInvalidator {
         _user_id: i64,
     ) -> VipCacheInvalidationFuture<'a, Self::Error> {
         Box::pin(async { Ok(()) })
+    }
+}
+
+/// Side-effect boundary for Go `/admin_grant_vip` replies and cache invalidation.
+pub trait AdminGrantVipEffects {
+    /// Error returned by the concrete side-effect implementation.
+    type Error: fmt::Display + Send + Sync + 'static;
+
+    /// Send a plain Go `SendText` reply for `/admin_grant_vip`.
+    fn send_admin_grant_vip_text<'a>(
+        &'a self,
+        message: PaymentTextMessage<'a>,
+    ) -> PaymentEffectsFuture<'a, Self::Error>;
+
+    /// Invalidate cached VIP status after a successful admin adjustment.
+    fn invalidate_admin_grant_vip_cache<'a>(
+        &'a self,
+        user_id: i64,
+    ) -> PaymentEffectsFuture<'a, Self::Error>;
+}
+
+impl<T> AdminGrantVipEffects for T
+where
+    T: SuccessfulPaymentEffects,
+{
+    type Error = T::Error;
+
+    fn send_admin_grant_vip_text<'a>(
+        &'a self,
+        message: PaymentTextMessage<'a>,
+    ) -> PaymentEffectsFuture<'a, Self::Error> {
+        self.send_text(message)
+    }
+
+    fn invalidate_admin_grant_vip_cache<'a>(
+        &'a self,
+        user_id: i64,
+    ) -> PaymentEffectsFuture<'a, Self::Error> {
+        <T as SuccessfulPaymentEffects>::invalidate_vip_cache(self, user_id)
     }
 }
 
@@ -2106,6 +2193,24 @@ impl SuccessfulPaymentStore for PostgresSuccessfulPaymentStore {
     }
 }
 
+impl AdminGrantVipStore for PostgresSuccessfulPaymentStore {
+    type Error = StorageError;
+
+    fn get_user_id_by_username<'a>(
+        &'a self,
+        username: &'a str,
+    ) -> PaymentStoreFuture<'a, Option<i64>, Self::Error> {
+        Box::pin(async move { self.users.get_user_id_by_username(username).await })
+    }
+
+    fn create_admin_vip_event<'a>(
+        &'a self,
+        event: VipEventCreate<'a>,
+    ) -> PaymentStoreFuture<'a, VipEventRecord, Self::Error> {
+        Box::pin(async move { self.vip.create_vip_event(event).await })
+    }
+}
+
 impl VipStatusStore for PostgresSuccessfulPaymentStore {
     type Error = StorageError;
 
@@ -2785,6 +2890,21 @@ pub struct AdminGrantVipCommandArgs {
     pub has_target: bool,
 }
 
+/// Minimal Go message context needed to execute `/admin_grant_vip`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AdminGrantVipCommand<'value> {
+    /// Chat where the admin command was received.
+    pub chat_id: i64,
+    /// Command message ID used as the reply target for Go `SendText`.
+    pub message_id: i32,
+    /// Telegram user ID of the admin who issued the command.
+    pub actor_user_id: i64,
+    /// Sender of the replied-to message, when the command targets by reply.
+    pub reply_user_id: Option<i64>,
+    /// Raw `CommandArguments()` text after `/admin_grant_vip`.
+    pub arguments: &'value str,
+}
+
 /// Parse Go `/admin_grant_vip` positional arguments without changing field semantics.
 #[must_use]
 pub fn parse_admin_grant_vip_command_args(raw: &str) -> AdminGrantVipCommandArgs {
@@ -2874,6 +2994,187 @@ pub fn admin_grant_vip_success_text(
         admin_grant_vip_action_text(duration_days),
         go_date_time(expires_at)
     )
+}
+
+const ADMIN_GRANT_VIP_INVALID_DURATION_TEXT: &str = "⚠️ Неверное количество дней в первом аргументе. Используйте число от -365 до 365, кроме 0. Применена корректировка по умолчанию: 1 день.";
+const ADMIN_GRANT_VIP_LEDGER_ERROR_TEXT: &str =
+    "❌ Не удалось записать VIP событие. Ошибка базы данных.";
+
+/// Execute Go `/admin_grant_vip` storage and side-effect behavior.
+pub async fn handle_admin_grant_vip_command_at<Store, Effects>(
+    store: &Store,
+    effects: &Effects,
+    command: AdminGrantVipCommand<'_>,
+) -> AdminGrantVipCommandReport
+where
+    Store: AdminGrantVipStore + Sync,
+    Effects: AdminGrantVipEffects + Sync,
+{
+    let args = parse_admin_grant_vip_command_args(command.arguments);
+    let target = match admin_grant_vip_target(store, command.reply_user_id, &args).await {
+        AdminGrantVipTargetResolution::Resolved {
+            target_user_id,
+            reason,
+        } => (target_user_id, reason),
+        AdminGrantVipTargetResolution::Missing => {
+            send_admin_grant_vip_text(effects, &command, admin_grant_vip_usage_text()).await;
+            return AdminGrantVipCommandReport {
+                outcome: AdminGrantVipCommandOutcome::MissingTarget,
+                target_user_id: None,
+                event_id: None,
+                error: None,
+            };
+        }
+        AdminGrantVipTargetResolution::Error(error) => {
+            let text = format!("❌ {error}");
+            send_admin_grant_vip_text(effects, &command, &text).await;
+            return AdminGrantVipCommandReport {
+                outcome: AdminGrantVipCommandOutcome::TargetError,
+                target_user_id: None,
+                event_id: None,
+                error: Some(error),
+            };
+        }
+    };
+
+    let (duration_days, invalid_duration) =
+        parse_admin_grant_vip_duration(&args.duration, args.has_duration);
+    if invalid_duration {
+        send_admin_grant_vip_text(effects, &command, ADMIN_GRANT_VIP_INVALID_DURATION_TEXT).await;
+    }
+
+    let reason = admin_grant_vip_reason(&target.1, command.actor_user_id);
+    let event = match store
+        .create_admin_vip_event(VipEventCreate {
+            user_id: target.0,
+            event_type: VIP_EVENT_TYPE_ADMIN_ADJUSTMENT,
+            delta_seconds: vip_days_to_seconds(duration_days),
+            subscription_id: None,
+            actor_user_id: Some(command.actor_user_id),
+            reason: Some(&reason),
+        })
+        .await
+    {
+        Ok(event) => event,
+        Err(error) => {
+            send_admin_grant_vip_text(effects, &command, ADMIN_GRANT_VIP_LEDGER_ERROR_TEXT).await;
+            return AdminGrantVipCommandReport {
+                outcome: AdminGrantVipCommandOutcome::StorageError,
+                target_user_id: Some(target.0),
+                event_id: None,
+                error: Some(error.to_string()),
+            };
+        }
+    };
+
+    let _ = effects.invalidate_admin_grant_vip_cache(target.0).await;
+    let success = admin_grant_vip_success_text(
+        target.0,
+        duration_days,
+        event.effective_expires_at,
+        &reason,
+        event.id,
+    );
+    send_admin_grant_vip_text(effects, &command, &success).await;
+
+    AdminGrantVipCommandReport {
+        outcome: if invalid_duration {
+            AdminGrantVipCommandOutcome::GrantedWithDefaultDuration
+        } else {
+            AdminGrantVipCommandOutcome::Granted
+        },
+        target_user_id: Some(target.0),
+        event_id: Some(event.id),
+        error: None,
+    }
+}
+
+enum AdminGrantVipTargetResolution {
+    Resolved { target_user_id: i64, reason: String },
+    Missing,
+    Error(String),
+}
+
+async fn admin_grant_vip_target<Store>(
+    store: &Store,
+    reply_user_id: Option<i64>,
+    args: &AdminGrantVipCommandArgs,
+) -> AdminGrantVipTargetResolution
+where
+    Store: AdminGrantVipStore + Sync,
+{
+    if args.has_target {
+        return match parse_admin_grant_vip_target_identifier(store, &args.target).await {
+            Ok(target_user_id) => AdminGrantVipTargetResolution::Resolved {
+                target_user_id,
+                reason: args.reason.clone(),
+            },
+            Err(error) => AdminGrantVipTargetResolution::Error(error),
+        };
+    }
+
+    match reply_user_id {
+        Some(target_user_id) => AdminGrantVipTargetResolution::Resolved {
+            target_user_id,
+            reason: String::new(),
+        },
+        None => AdminGrantVipTargetResolution::Missing,
+    }
+}
+
+async fn parse_admin_grant_vip_target_identifier<Store>(
+    store: &Store,
+    identifier: &str,
+) -> Result<i64, String>
+where
+    Store: AdminGrantVipStore + Sync,
+{
+    if let Ok(user_id) = identifier.parse::<i64>() {
+        return Ok(user_id);
+    }
+    if let Some(username) = identifier.strip_prefix('@') {
+        return resolve_admin_grant_vip_username(store, identifier, username).await;
+    }
+    if let Some(username) = identifier.strip_prefix("https://t.me/") {
+        return resolve_admin_grant_vip_username(store, identifier, username).await;
+    }
+    Err(format!(
+        "invalid user identifier format: {identifier} (must be user_id, @username, or https://t.me/username)"
+    ))
+}
+
+async fn resolve_admin_grant_vip_username<Store>(
+    store: &Store,
+    identifier: &str,
+    username: &str,
+) -> Result<i64, String>
+where
+    Store: AdminGrantVipStore + Sync,
+{
+    match store.get_user_id_by_username(username).await {
+        Ok(Some(user_id)) => Ok(user_id),
+        Ok(None) => Err(format!("user with username {identifier} not found")),
+        Err(error) => Err(format!(
+            "user with username {identifier} not found: {error}"
+        )),
+    }
+}
+
+async fn send_admin_grant_vip_text<Effects>(
+    effects: &Effects,
+    command: &AdminGrantVipCommand<'_>,
+    text: &str,
+) where
+    Effects: AdminGrantVipEffects + Sync,
+{
+    let _ = effects
+        .send_admin_grant_vip_text(PaymentTextMessage {
+            chat_id: command.chat_id,
+            reply_to_message_id: command.message_id,
+            text,
+            parse_mode: "",
+        })
+        .await;
 }
 
 fn payment_control_data_from_message(
@@ -3701,7 +4002,9 @@ mod tests {
 
     use crate::updates::{UpdateHandler, UpdateHandlerFuture};
     use carapax::types::Update as TelegramUpdate;
-    use openplotva_core::{UserState, VIP_EVENT_TYPE_PAYMENT, vip_days_to_seconds};
+    use openplotva_core::{
+        UserState, VIP_EVENT_TYPE_ADMIN_ADJUSTMENT, VIP_EVENT_TYPE_PAYMENT, vip_days_to_seconds,
+    };
     use openplotva_storage::{
         DonationCreate, DonationRecord, SubscriptionCreate, SubscriptionRecord, VipCacheRecord,
         VipEventCreate, VipEventRecord, VipSummaryRecord,
@@ -4346,6 +4649,285 @@ mod tests {
             )
         );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_grant_vip_command_records_ledger_event_and_success_reply()
+    -> Result<(), Box<dyn Error>> {
+        let expires_at = time::Date::from_calendar_date(2026, time::Month::May, 20)?
+            .with_hms(13, 0, 0)?
+            .assume_utc();
+        let store = StoreStub::new().with_next_vip_event(VipEventRecord {
+            id: 88,
+            user_id: 42,
+            event_type: VIP_EVENT_TYPE_ADMIN_ADJUSTMENT.to_owned(),
+            delta_seconds: vip_days_to_seconds(3),
+            effective_expires_at: expires_at,
+            subscription_id: None,
+            actor_user_id: Some(7),
+            reason: "manual grant".to_owned(),
+            created_at: OffsetDateTime::UNIX_EPOCH,
+        });
+        let effects = EffectsStub::default();
+
+        let report = super::handle_admin_grant_vip_command_at(
+            &store,
+            &effects,
+            super::AdminGrantVipCommand {
+                chat_id: 900,
+                message_id: 101,
+                actor_user_id: 7,
+                reply_user_id: None,
+                arguments: "3 42 manual grant",
+            },
+        )
+        .await;
+
+        assert_eq!(report.outcome, super::AdminGrantVipCommandOutcome::Granted);
+        assert_eq!(
+            store.vip_events(),
+            vec![VipEventCreate {
+                user_id: 42,
+                event_type: VIP_EVENT_TYPE_ADMIN_ADJUSTMENT,
+                delta_seconds: vip_days_to_seconds(3),
+                subscription_id: None,
+                actor_user_id: Some(7),
+                reason: Some("manual grant"),
+            }]
+        );
+        assert_eq!(effects.invalidated_vip_users(), vec![42]);
+        let sent = effects.sent_payment_texts();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].chat_id, 900);
+        assert_eq!(sent[0].reply_to_message_id, 101);
+        assert_eq!(sent[0].parse_mode, "");
+        assert!(sent[0].text.contains("VIP корректировка успешно записана"));
+        assert!(sent[0].text.contains("User ID: 42"));
+        assert!(sent[0].text.contains("Корректировка: 3 дней (добавлено)"));
+        assert!(sent[0].text.contains("Event ID: 88"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_grant_vip_command_sends_usage_without_target() {
+        let store = StoreStub::new();
+        let effects = EffectsStub::default();
+
+        let report = super::handle_admin_grant_vip_command_at(
+            &store,
+            &effects,
+            super::AdminGrantVipCommand {
+                chat_id: 900,
+                message_id: 101,
+                actor_user_id: 7,
+                reply_user_id: None,
+                arguments: "",
+            },
+        )
+        .await;
+
+        assert_eq!(
+            report.outcome,
+            super::AdminGrantVipCommandOutcome::MissingTarget
+        );
+        assert!(store.vip_events().is_empty());
+        assert!(effects.invalidated_vip_users().is_empty());
+        assert_eq!(
+            effects.sent_texts(),
+            vec![super::admin_grant_vip_usage_text()]
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_grant_vip_command_uses_reply_target_and_default_reason()
+    -> Result<(), Box<dyn Error>> {
+        let expires_at = time::Date::from_calendar_date(2026, time::Month::May, 20)?
+            .with_hms(13, 0, 0)?
+            .assume_utc();
+        let store = StoreStub::new().with_next_vip_event(VipEventRecord {
+            id: 89,
+            user_id: 55,
+            event_type: VIP_EVENT_TYPE_ADMIN_ADJUSTMENT.to_owned(),
+            delta_seconds: vip_days_to_seconds(5),
+            effective_expires_at: expires_at,
+            subscription_id: None,
+            actor_user_id: Some(7),
+            reason: "telegram admin adjustment by 7".to_owned(),
+            created_at: OffsetDateTime::UNIX_EPOCH,
+        });
+        let effects = EffectsStub::default();
+
+        let report = super::handle_admin_grant_vip_command_at(
+            &store,
+            &effects,
+            super::AdminGrantVipCommand {
+                chat_id: 900,
+                message_id: 101,
+                actor_user_id: 7,
+                reply_user_id: Some(55),
+                arguments: "5",
+            },
+        )
+        .await;
+
+        assert_eq!(report.outcome, super::AdminGrantVipCommandOutcome::Granted);
+        assert_eq!(report.target_user_id, Some(55));
+        assert_eq!(
+            store.vip_events()[0],
+            VipEventCreate {
+                user_id: 55,
+                event_type: VIP_EVENT_TYPE_ADMIN_ADJUSTMENT,
+                delta_seconds: vip_days_to_seconds(5),
+                subscription_id: None,
+                actor_user_id: Some(7),
+                reason: Some("telegram admin adjustment by 7"),
+            }
+        );
+        assert!(
+            effects.sent_texts()[0].contains("Причина: telegram admin adjustment by 7"),
+            "success text should include default admin reason"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_grant_vip_command_warns_and_defaults_invalid_duration()
+    -> Result<(), Box<dyn Error>> {
+        let expires_at = time::Date::from_calendar_date(2026, time::Month::May, 20)?
+            .with_hms(13, 0, 0)?
+            .assume_utc();
+        let store = StoreStub::new().with_next_vip_event(VipEventRecord {
+            id: 90,
+            user_id: 42,
+            event_type: VIP_EVENT_TYPE_ADMIN_ADJUSTMENT.to_owned(),
+            delta_seconds: vip_days_to_seconds(1),
+            effective_expires_at: expires_at,
+            subscription_id: None,
+            actor_user_id: Some(7),
+            reason: "bad duration".to_owned(),
+            created_at: OffsetDateTime::UNIX_EPOCH,
+        });
+        let effects = EffectsStub::default();
+
+        let report = super::handle_admin_grant_vip_command_at(
+            &store,
+            &effects,
+            super::AdminGrantVipCommand {
+                chat_id: 900,
+                message_id: 101,
+                actor_user_id: 7,
+                reply_user_id: None,
+                arguments: "0 42 bad duration",
+            },
+        )
+        .await;
+
+        assert_eq!(
+            report.outcome,
+            super::AdminGrantVipCommandOutcome::GrantedWithDefaultDuration
+        );
+        assert_eq!(store.vip_events()[0].delta_seconds, vip_days_to_seconds(1));
+        let sent = effects.sent_texts();
+        assert_eq!(sent.len(), 2);
+        assert!(sent[0].contains("Неверное количество дней"));
+        assert!(sent[1].contains("Корректировка: 1 дней (добавлено)"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_grant_vip_command_resolves_username_and_tme_targets()
+    -> Result<(), Box<dyn Error>> {
+        let expires_at = time::Date::from_calendar_date(2026, time::Month::May, 20)?
+            .with_hms(13, 0, 0)?
+            .assume_utc();
+        let store = StoreStub::new()
+            .with_username_user("bob", 42)
+            .with_username_user("carol", 43)
+            .with_next_vip_event(VipEventRecord {
+                id: 91,
+                user_id: 42,
+                event_type: VIP_EVENT_TYPE_ADMIN_ADJUSTMENT.to_owned(),
+                delta_seconds: vip_days_to_seconds(2),
+                effective_expires_at: expires_at,
+                subscription_id: None,
+                actor_user_id: Some(7),
+                reason: "username".to_owned(),
+                created_at: OffsetDateTime::UNIX_EPOCH,
+            })
+            .with_next_vip_event(VipEventRecord {
+                id: 92,
+                user_id: 43,
+                event_type: VIP_EVENT_TYPE_ADMIN_ADJUSTMENT.to_owned(),
+                delta_seconds: vip_days_to_seconds(4),
+                effective_expires_at: expires_at,
+                subscription_id: None,
+                actor_user_id: Some(7),
+                reason: "link".to_owned(),
+                created_at: OffsetDateTime::UNIX_EPOCH,
+            });
+        let effects = EffectsStub::default();
+
+        let username_report = super::handle_admin_grant_vip_command_at(
+            &store,
+            &effects,
+            super::AdminGrantVipCommand {
+                chat_id: 900,
+                message_id: 101,
+                actor_user_id: 7,
+                reply_user_id: None,
+                arguments: "2 @bob username",
+            },
+        )
+        .await;
+        let link_report = super::handle_admin_grant_vip_command_at(
+            &store,
+            &effects,
+            super::AdminGrantVipCommand {
+                chat_id: 900,
+                message_id: 102,
+                actor_user_id: 7,
+                reply_user_id: None,
+                arguments: "4 https://t.me/carol link",
+            },
+        )
+        .await;
+
+        assert_eq!(username_report.target_user_id, Some(42));
+        assert_eq!(link_report.target_user_id, Some(43));
+        assert_eq!(store.vip_events()[0].user_id, 42);
+        assert_eq!(store.vip_events()[1].user_id, 43);
+        assert_eq!(effects.invalidated_vip_users(), vec![42, 43]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_grant_vip_command_reports_target_resolution_error() {
+        let store = StoreStub::new();
+        let effects = EffectsStub::default();
+
+        let report = super::handle_admin_grant_vip_command_at(
+            &store,
+            &effects,
+            super::AdminGrantVipCommand {
+                chat_id: 900,
+                message_id: 101,
+                actor_user_id: 7,
+                reply_user_id: None,
+                arguments: "3 https://t.me/missing reason",
+            },
+        )
+        .await;
+
+        assert_eq!(
+            report.outcome,
+            super::AdminGrantVipCommandOutcome::TargetError
+        );
+        assert!(store.vip_events().is_empty());
+        assert!(effects.invalidated_vip_users().is_empty());
+        assert_eq!(
+            effects.sent_texts(),
+            vec!["❌ user with username https://t.me/missing not found"]
+        );
     }
 
     #[test]
@@ -6437,6 +7019,7 @@ mod tests {
         subscriptions: Vec<SubscriptionCreate<'static>>,
         donations: Vec<DonationCreate<'static>>,
         vip_events: Vec<VipEventCreate<'static>>,
+        username_users: Vec<(String, i64)>,
         next_subscription_id: i64,
         next_subscription_error: Option<StubError>,
         existing_subscription: Option<SubscriptionRecord>,
@@ -6471,6 +7054,13 @@ mod tests {
 
         fn with_existing_subscription(self, subscription: SubscriptionRecord) -> Self {
             self.lock().existing_subscription = Some(subscription);
+            self
+        }
+
+        fn with_username_user(self, username: &str, user_id: i64) -> Self {
+            self.lock()
+                .username_users
+                .push((username.to_owned(), user_id));
             self
         }
 
@@ -6594,6 +7184,30 @@ mod tests {
 
         fn is_duplicate_insert_no_row(error: &Self::Error) -> bool {
             matches!(error, StubError::Duplicate)
+        }
+    }
+
+    impl super::AdminGrantVipStore for StoreStub {
+        type Error = StubError;
+
+        fn get_user_id_by_username<'a>(
+            &'a self,
+            username: &'a str,
+        ) -> PaymentStoreFuture<'a, Option<i64>, Self::Error> {
+            Box::pin(async move {
+                Ok(self
+                    .lock()
+                    .username_users
+                    .iter()
+                    .find_map(|(stored, user_id)| (stored == username).then_some(*user_id)))
+            })
+        }
+
+        fn create_admin_vip_event<'a>(
+            &'a self,
+            event: VipEventCreate<'a>,
+        ) -> PaymentStoreFuture<'a, VipEventRecord, Self::Error> {
+            <Self as SuccessfulPaymentStore>::create_vip_event(self, event)
         }
     }
 
