@@ -1,9 +1,10 @@
 use carapax::{
     api::{Client, ExecuteError},
     types::{
-        AnswerCallbackQuery, AnswerGuestQuery, AnswerInlineQuery, DeleteMessage,
-        EditMessageCaption, EditMessageMedia, EditMessageReplyMarkup, EditMessageResult,
-        EditMessageText, Message, SendAudio, SendChatAction, SendMediaGroup, SendMessage,
+        AnswerCallbackQuery, AnswerGuestQuery, AnswerInlineQuery, AnswerPreCheckoutQuery,
+        CreateInvoiceLink, DeleteMessage, EditMessageCaption, EditMessageMedia,
+        EditMessageReplyMarkup, EditMessageResult, EditMessageText, EditUserStarSubscription,
+        Message, RefundStarPayment, SendAudio, SendChatAction, SendMediaGroup, SendMessage,
         SendPhoto, SendSticker, SentGuestMessage,
     },
 };
@@ -31,6 +32,14 @@ pub enum TelegramOutboundMethod {
     AnswerInlineQuery(Box<AnswerInlineQuery>),
     /// Telegram `answerGuestQuery`.
     AnswerGuestQuery(Box<AnswerGuestQuery>),
+    /// Telegram `answerPreCheckoutQuery`.
+    AnswerPreCheckoutQuery(Box<AnswerPreCheckoutQuery>),
+    /// Telegram `createInvoiceLink`.
+    CreateInvoiceLink(Box<CreateInvoiceLink>),
+    /// Telegram `refundStarPayment`.
+    RefundStarPayment(Box<RefundStarPayment>),
+    /// Telegram `editUserStarSubscription`.
+    EditUserStarSubscription(Box<EditUserStarSubscription>),
     /// Telegram `editMessageText`.
     EditMessageText(Box<EditMessageText>),
     /// Telegram `editMessageCaption`.
@@ -64,6 +73,14 @@ pub enum TelegramOutboundMethodKind {
     AnswerInlineQuery,
     /// Telegram `answerGuestQuery`.
     AnswerGuestQuery,
+    /// Telegram `answerPreCheckoutQuery`.
+    AnswerPreCheckoutQuery,
+    /// Telegram `createInvoiceLink`.
+    CreateInvoiceLink,
+    /// Telegram `refundStarPayment`.
+    RefundStarPayment,
+    /// Telegram `editUserStarSubscription`.
+    EditUserStarSubscription,
     /// Telegram `editMessageText`.
     EditMessageText,
     /// Telegram `editMessageCaption`.
@@ -89,6 +106,8 @@ pub enum TelegramOutboundResponseKind {
     Boolean,
     /// Telegram `answerGuestQuery` sent-message result.
     SentGuestMessage,
+    /// Methods returning a string value.
+    String,
 }
 
 /// Concrete successful response from executing an outbound Telegram method.
@@ -104,6 +123,8 @@ pub enum TelegramOutboundResponse {
     Boolean(bool),
     /// Inline guest message response from `answerGuestQuery`.
     SentGuestMessage(Box<SentGuestMessage>),
+    /// String response, such as `createInvoiceLink`.
+    String(String),
 }
 
 impl TelegramOutboundMethod {
@@ -119,6 +140,12 @@ impl TelegramOutboundMethod {
             Self::AnswerCallbackQuery(_) => TelegramOutboundMethodKind::AnswerCallbackQuery,
             Self::AnswerInlineQuery(_) => TelegramOutboundMethodKind::AnswerInlineQuery,
             Self::AnswerGuestQuery(_) => TelegramOutboundMethodKind::AnswerGuestQuery,
+            Self::AnswerPreCheckoutQuery(_) => TelegramOutboundMethodKind::AnswerPreCheckoutQuery,
+            Self::CreateInvoiceLink(_) => TelegramOutboundMethodKind::CreateInvoiceLink,
+            Self::RefundStarPayment(_) => TelegramOutboundMethodKind::RefundStarPayment,
+            Self::EditUserStarSubscription(_) => {
+                TelegramOutboundMethodKind::EditUserStarSubscription
+            }
             Self::EditMessageText(_) => TelegramOutboundMethodKind::EditMessageText,
             Self::EditMessageCaption(_) => TelegramOutboundMethodKind::EditMessageCaption,
             Self::EditMessageReplyMarkup(_) => TelegramOutboundMethodKind::EditMessageReplyMarkup,
@@ -139,6 +166,10 @@ impl TelegramOutboundMethod {
             Self::AnswerCallbackQuery(_) => "answerCallbackQuery",
             Self::AnswerInlineQuery(_) => "answerInlineQuery",
             Self::AnswerGuestQuery(_) => "answerGuestQuery",
+            Self::AnswerPreCheckoutQuery(_) => "answerPreCheckoutQuery",
+            Self::CreateInvoiceLink(_) => "createInvoiceLink",
+            Self::RefundStarPayment(_) => "refundStarPayment",
+            Self::EditUserStarSubscription(_) => "editUserStarSubscription",
             Self::EditMessageText(_) => "editMessageText",
             Self::EditMessageCaption(_) => "editMessageCaption",
             Self::EditMessageReplyMarkup(_) => "editMessageReplyMarkup",
@@ -155,9 +186,13 @@ impl TelegramOutboundMethod {
             | Self::SendPhoto(_)
             | Self::SendAudio(_) => TelegramOutboundResponseKind::Message,
             Self::SendMediaGroup(_) => TelegramOutboundResponseKind::Messages,
-            Self::SendChatAction(_) | Self::AnswerCallbackQuery(_) | Self::AnswerInlineQuery(_) => {
-                TelegramOutboundResponseKind::Boolean
-            }
+            Self::SendChatAction(_)
+            | Self::AnswerCallbackQuery(_)
+            | Self::AnswerInlineQuery(_)
+            | Self::AnswerPreCheckoutQuery(_)
+            | Self::RefundStarPayment(_)
+            | Self::EditUserStarSubscription(_) => TelegramOutboundResponseKind::Boolean,
+            Self::CreateInvoiceLink(_) => TelegramOutboundResponseKind::String,
             Self::AnswerGuestQuery(_) => TelegramOutboundResponseKind::SentGuestMessage,
             Self::EditMessageText(_)
             | Self::EditMessageCaption(_)
@@ -218,6 +253,22 @@ pub async fn execute_telegram_method(
             .execute(*method)
             .await
             .map(|message| TelegramOutboundResponse::SentGuestMessage(Box::new(message))),
+        TelegramOutboundMethod::AnswerPreCheckoutQuery(method) => client
+            .execute(*method)
+            .await
+            .map(TelegramOutboundResponse::Boolean),
+        TelegramOutboundMethod::CreateInvoiceLink(method) => client
+            .execute(*method)
+            .await
+            .map(TelegramOutboundResponse::String),
+        TelegramOutboundMethod::RefundStarPayment(method) => client
+            .execute(*method)
+            .await
+            .map(TelegramOutboundResponse::Boolean),
+        TelegramOutboundMethod::EditUserStarSubscription(method) => client
+            .execute(*method)
+            .await
+            .map(TelegramOutboundResponse::Boolean),
         TelegramOutboundMethod::EditMessageText(method) => client
             .execute(*method)
             .await
@@ -306,6 +357,30 @@ impl From<AnswerGuestQuery> for TelegramOutboundMethod {
     }
 }
 
+impl From<AnswerPreCheckoutQuery> for TelegramOutboundMethod {
+    fn from(value: AnswerPreCheckoutQuery) -> Self {
+        Self::AnswerPreCheckoutQuery(Box::new(value))
+    }
+}
+
+impl From<CreateInvoiceLink> for TelegramOutboundMethod {
+    fn from(value: CreateInvoiceLink) -> Self {
+        Self::CreateInvoiceLink(Box::new(value))
+    }
+}
+
+impl From<RefundStarPayment> for TelegramOutboundMethod {
+    fn from(value: RefundStarPayment) -> Self {
+        Self::RefundStarPayment(Box::new(value))
+    }
+}
+
+impl From<EditUserStarSubscription> for TelegramOutboundMethod {
+    fn from(value: EditUserStarSubscription) -> Self {
+        Self::EditUserStarSubscription(Box::new(value))
+    }
+}
+
 impl From<EditMessageText> for TelegramOutboundMethod {
     fn from(value: EditMessageText) -> Self {
         Self::EditMessageText(Box::new(value))
@@ -341,17 +416,21 @@ mod tests {
     use super::{TelegramOutboundMethod, TelegramOutboundMethodKind, TelegramOutboundResponseKind};
     use crate::{
         AudioMessageRequest, AudioSource, CallbackAnswerRequest, ChatActionRequest, ChatRef,
-        EditCaptionMessageRequest, EditMediaMessageRequest, EditReplyMarkupMessageRequest,
-        EditTextMessageRequest, GuestQueryAnswerRequest, InlineArticleRequest,
-        InlineKeyboardButton, InlineKeyboardMarkup, InlineQueryAnswerRequest,
+        DonationInvoiceLinkRequest, EditCaptionMessageRequest, EditMediaMessageRequest,
+        EditReplyMarkupMessageRequest, EditTextMessageRequest, GuestQueryAnswerRequest,
+        InlineArticleRequest, InlineKeyboardButton, InlineKeyboardMarkup, InlineQueryAnswerRequest,
         MediaGroupMessageRequest, MediaGroupPhotoItem, PhotoMessageRequest, PhotoSource,
-        StickerMessageRequest, TELEGRAM_PARSE_MODE_HTML, TextMessageRequest,
-        build_audio_message_method, build_callback_answer_method, build_chat_action_method,
+        StickerMessageRequest, SubscriptionInvoiceLinkRequest, TELEGRAM_PARSE_MODE_HTML,
+        TextMessageRequest, build_audio_message_method, build_callback_answer_method,
+        build_cancel_star_subscription_method, build_chat_action_method,
+        build_delete_message_method, build_donation_invoice_link_method,
         build_edit_caption_message_method, build_edit_media_message_method,
         build_edit_reply_markup_message_method, build_edit_text_message_method,
         build_guest_query_answer_method, build_inline_query_answer_method,
         build_inline_query_result_article, build_media_group_message_method,
-        build_photo_message_method, build_sticker_message_method, build_text_message_method,
+        build_photo_message_method, build_pre_checkout_ok_method, build_refund_star_payment_method,
+        build_sticker_message_method, build_subscription_invoice_link_method,
+        build_text_message_method,
     };
 
     fn chat(id: i64) -> ChatRef {
@@ -371,7 +450,8 @@ mod tests {
     }
 
     #[test]
-    fn outbound_method_metadata_names_the_real_bot_api_methods_and_response_shapes() {
+    fn outbound_method_metadata_names_the_real_bot_api_methods_and_response_shapes()
+    -> Result<(), Box<dyn std::error::Error>> {
         let text = TelegramOutboundMethod::from(
             build_text_message_method(
                 &TextMessageRequest {
@@ -515,8 +595,29 @@ mod tests {
                 result: inline_article,
             },
         ));
-        let delete_message =
-            TelegramOutboundMethod::from(carapax::types::DeleteMessage::new(42, 7));
+        let pre_checkout = TelegramOutboundMethod::from(build_pre_checkout_ok_method("pcq-id"));
+        let subscription_invoice = TelegramOutboundMethod::from(
+            build_subscription_invoice_link_method(&SubscriptionInvoiceLinkRequest {
+                user_id: 42,
+                user_name: String::new(),
+                amount_stars: 300,
+            }),
+        );
+        let donation_invoice = TelegramOutboundMethod::from(build_donation_invoice_link_method(
+            &DonationInvoiceLinkRequest {
+                user_id: 42,
+                amount_stars: 600,
+            },
+        ));
+        let refund = TelegramOutboundMethod::from(build_refund_star_payment_method(42, "charge"));
+        let cancel_subscription =
+            TelegramOutboundMethod::from(build_cancel_star_subscription_method(42, "charge"));
+        let delete_message = TelegramOutboundMethod::from(build_delete_message_method(
+            &crate::DeleteMessageRequest {
+                chat_id: 42,
+                message_id: 7,
+            },
+        )?);
 
         let cases = [
             (
@@ -598,6 +699,36 @@ mod tests {
                 TelegramOutboundResponseKind::SentGuestMessage,
             ),
             (
+                pre_checkout,
+                TelegramOutboundMethodKind::AnswerPreCheckoutQuery,
+                "answerPreCheckoutQuery",
+                TelegramOutboundResponseKind::Boolean,
+            ),
+            (
+                subscription_invoice,
+                TelegramOutboundMethodKind::CreateInvoiceLink,
+                "createInvoiceLink",
+                TelegramOutboundResponseKind::String,
+            ),
+            (
+                donation_invoice,
+                TelegramOutboundMethodKind::CreateInvoiceLink,
+                "createInvoiceLink",
+                TelegramOutboundResponseKind::String,
+            ),
+            (
+                refund,
+                TelegramOutboundMethodKind::RefundStarPayment,
+                "refundStarPayment",
+                TelegramOutboundResponseKind::Boolean,
+            ),
+            (
+                cancel_subscription,
+                TelegramOutboundMethodKind::EditUserStarSubscription,
+                "editUserStarSubscription",
+                TelegramOutboundResponseKind::Boolean,
+            ),
+            (
                 delete_message,
                 TelegramOutboundMethodKind::DeleteMessage,
                 "deleteMessage",
@@ -610,5 +741,7 @@ mod tests {
             assert_eq!(method.method_name(), name);
             assert_eq!(method.response_kind(), response_kind);
         }
+
+        Ok(())
     }
 }

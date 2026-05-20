@@ -4,11 +4,12 @@ use std::{borrow::Cow, fmt, io::Cursor};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use carapax::types::{
-    AnswerCallbackQuery, AnswerGuestQuery, AnswerInlineQuery, ChatAction, DeleteMessage,
-    EditMessageCaption, EditMessageMedia, EditMessageReplyMarkup, EditMessageText,
-    InlineKeyboardButton, InlineKeyboardMarkup, InlineQueryResult, InlineQueryResultArticle,
-    InputFile, InputFileReader, InputMedia, InputMediaError, InputMediaPhoto,
-    InputMessageContentText, MediaGroup, MediaGroupError, MediaGroupItem, ParseMode, ReplyMarkup,
+    AnswerCallbackQuery, AnswerGuestQuery, AnswerInlineQuery, AnswerPreCheckoutQuery, ChatAction,
+    CreateInvoiceLink, DeleteMessage, EditMessageCaption, EditMessageMedia, EditMessageReplyMarkup,
+    EditMessageText, EditUserStarSubscription, InlineKeyboardButton, InlineKeyboardMarkup,
+    InlineQueryResult, InlineQueryResultArticle, InputFile, InputFileReader, InputMedia,
+    InputMediaError, InputMediaPhoto, InputMessageContentText, InvoiceParameters, LabeledPrice,
+    MediaGroup, MediaGroupError, MediaGroupItem, ParseMode, RefundStarPayment, ReplyMarkup,
     ReplyParameters, ReplyParametersError, SendAudio, SendChatAction, SendMediaGroup, SendMessage,
     SendPhoto, SendSticker, WebAppInfo,
 };
@@ -42,6 +43,36 @@ pub const GUEST_ADD_TO_CHAT_PAYLOAD: &str = "guest";
 
 /// Fallback bot username used by Go guest helpers.
 pub const DEFAULT_GUEST_BOT_USERNAME: &str = "PlotvoBot";
+
+/// Telegram Stars currency used by Go payment requests.
+pub const TELEGRAM_STARS_CURRENCY: &str = "XTR";
+
+/// Go default VIP subscription price in Telegram Stars.
+pub const SUBSCRIPTION_PRICE_STARS: i64 = 300;
+
+/// Go lower donation command bound in Telegram Stars.
+pub const MIN_DONATION_STARS: i64 = 10;
+
+/// Go upper donation command bound in Telegram Stars.
+pub const MAX_DONATION_STARS: i64 = 10000;
+
+/// Go VIP subscription duration in days.
+pub const SUBSCRIPTION_DURATION_DAYS: i64 = 30;
+
+/// Bot API subscription period used by Go `createInvoiceLink` requests.
+pub const SUBSCRIPTION_PERIOD_SECONDS: i64 = 2_592_000;
+
+/// Go VIP invoice title and price label.
+pub const VIP_SUBSCRIPTION_TITLE: &str = "VIP Подписка на 30 дней";
+
+/// Go VIP invoice description.
+pub const VIP_SUBSCRIPTION_DESCRIPTION: &str = "Подписка на VIP статус в боте на 30 дней. Включает приоритетную обработку запросов, двойные лимиты на рисование, генерацию музыки, изображения лучшего качества и ранний доступ к новым фичам!";
+
+/// Go donation invoice title.
+pub const DONATION_TITLE: &str = "Донат разработчику";
+
+/// Go donation invoice description.
+pub const DONATION_DESCRIPTION: &str = "Поддержите разработку бота! Ваш донат согреет сердце разработчика и поможет создавать новые функции.";
 
 const MESSAGE_TYPE_STICKER: &str = "sticker";
 const MESSAGE_TYPE_PHOTO: &str = "photo";
@@ -239,6 +270,34 @@ pub struct GuestHtmlAnswerRequest {
     pub bot_username: String,
     /// Optional inline keyboard markup attached to the article.
     pub reply_markup: Option<InlineKeyboardMarkup>,
+}
+
+/// Go payment payload classes used after Telegram reports a successful payment.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PaymentPayloadKind {
+    Unknown,
+    Subscription,
+    Donation,
+}
+
+/// VIP invoice link fields used by Go `executeVIPInvoiceControlJob`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubscriptionInvoiceLinkRequest {
+    /// Telegram user ID that becomes the payment payload suffix.
+    pub user_id: i64,
+    /// Telegram username; Go discounts exactly `WaveCut`.
+    pub user_name: String,
+    /// Control-job override amount. Zero means Go's default subscription price.
+    pub amount_stars: i64,
+}
+
+/// Donation invoice link fields used by Go `executeDonateInvoiceControlJob`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DonationInvoiceLinkRequest {
+    /// Telegram user ID that becomes the payment payload suffix.
+    pub user_id: i64,
+    /// Donation amount in Telegram Stars.
+    pub amount_stars: i64,
 }
 
 /// Delete request fields used by Go `api.NewDeleteMessage` call sites.
@@ -682,6 +741,101 @@ pub fn build_inline_query_answer_method(req: &InlineQueryAnswerRequest) -> Answe
 /// Build an outbound `answerGuestQuery` method.
 pub fn build_guest_query_answer_method(req: &GuestQueryAnswerRequest) -> AnswerGuestQuery {
     AnswerGuestQuery::new(req.guest_query_id.clone(), req.result.clone())
+}
+
+/// Build the Go successful pre-checkout answer.
+#[must_use]
+pub fn build_pre_checkout_ok_method(
+    pre_checkout_query_id: impl Into<String>,
+) -> AnswerPreCheckoutQuery {
+    AnswerPreCheckoutQuery::ok(pre_checkout_query_id)
+}
+
+/// Build Go `subscription_<user_id>` invoice payload text.
+#[must_use]
+pub fn subscription_invoice_payload(user_id: i64) -> String {
+    format!("subscription_{user_id}")
+}
+
+/// Build Go `donation_<user_id>_<amount>` invoice payload text.
+#[must_use]
+pub fn donation_invoice_payload(user_id: i64, amount_stars: i64) -> String {
+    format!("donation_{user_id}_{amount_stars}")
+}
+
+/// Return the Go payment payload class using prefix semantics.
+#[must_use]
+pub fn classify_payment_payload(payload: &str) -> PaymentPayloadKind {
+    if payload.starts_with("subscription") {
+        PaymentPayloadKind::Subscription
+    } else if payload.starts_with("donation") {
+        PaymentPayloadKind::Donation
+    } else {
+        PaymentPayloadKind::Unknown
+    }
+}
+
+/// Return the Go VIP invoice price for one control-job request.
+#[must_use]
+pub fn subscription_invoice_price_stars(req: &SubscriptionInvoiceLinkRequest) -> i64 {
+    if req.user_name == "WaveCut" {
+        return 1;
+    }
+    if req.amount_stars > 0 {
+        req.amount_stars
+    } else {
+        SUBSCRIPTION_PRICE_STARS
+    }
+}
+
+/// Build Go `createInvoiceLink` for a VIP subscription invoice.
+#[must_use]
+pub fn build_subscription_invoice_link_method(
+    req: &SubscriptionInvoiceLinkRequest,
+) -> CreateInvoiceLink {
+    CreateInvoiceLink::new(
+        VIP_SUBSCRIPTION_TITLE,
+        VIP_SUBSCRIPTION_DESCRIPTION,
+        subscription_invoice_payload(req.user_id),
+        TELEGRAM_STARS_CURRENCY,
+        [LabeledPrice::new(
+            subscription_invoice_price_stars(req),
+            VIP_SUBSCRIPTION_TITLE,
+        )],
+    )
+    .with_parameters(InvoiceParameters::default().with_provider_token(""))
+    .with_subscription_period(SUBSCRIPTION_PERIOD_SECONDS)
+}
+
+/// Build Go `createInvoiceLink` for a donation invoice.
+#[must_use]
+pub fn build_donation_invoice_link_method(req: &DonationInvoiceLinkRequest) -> CreateInvoiceLink {
+    CreateInvoiceLink::new(
+        DONATION_TITLE,
+        DONATION_DESCRIPTION,
+        donation_invoice_payload(req.user_id, req.amount_stars),
+        TELEGRAM_STARS_CURRENCY,
+        [LabeledPrice::new(req.amount_stars, "Донат")],
+    )
+    .with_parameters(InvoiceParameters::default().with_provider_token(""))
+}
+
+/// Build Go `refundStarPayment` request params through `carapax`.
+#[must_use]
+pub fn build_refund_star_payment_method(
+    user_id: i64,
+    telegram_payment_charge_id: impl Into<String>,
+) -> RefundStarPayment {
+    RefundStarPayment::new(user_id, telegram_payment_charge_id)
+}
+
+/// Build Go cancellation request for a Telegram Stars subscription.
+#[must_use]
+pub fn build_cancel_star_subscription_method(
+    user_id: i64,
+    telegram_payment_charge_id: impl Into<String>,
+) -> EditUserStarSubscription {
+    EditUserStarSubscription::new(user_id, telegram_payment_charge_id, true)
 }
 
 /// Prepare guest HTML with Go `prepareGuestHTML` semantics.
@@ -1559,30 +1713,35 @@ mod tests {
 
     use super::{
         AudioMessagePlan, AudioMessageRequest, AudioSource, CallbackAnswerRequest,
-        ChatActionRequest, ChatRef, DeleteMessageRequest, EditCaptionMessageRequest,
-        EditMediaMessagePlan, EditMediaMessageRequest, EditReplyMarkupMessageRequest,
-        EditTextMessageRequest, GuestHtmlAnswerRequest, GuestQueryAnswerRequest,
-        InlineArticleRequest, InlineQueryAnswerRequest, MESSAGE_TYPE_TEXT, MediaGroupMessagePlan,
-        MediaGroupMessageRequest, MediaGroupPhotoItem, MessageFingerprint, OutboundBuildError,
-        PhotoMessagePlan, PhotoMessageRequest, PhotoSource, ReplyMessageRef, ReplyParametersPlan,
-        StickerMessagePlan, StickerMessageRequest, TextMessageRequest, allow_sending_without_reply,
+        ChatActionRequest, ChatRef, DeleteMessageRequest, DonationInvoiceLinkRequest,
+        EditCaptionMessageRequest, EditMediaMessagePlan, EditMediaMessageRequest,
+        EditReplyMarkupMessageRequest, EditTextMessageRequest, GuestHtmlAnswerRequest,
+        GuestQueryAnswerRequest, InlineArticleRequest, InlineQueryAnswerRequest, MESSAGE_TYPE_TEXT,
+        MediaGroupMessagePlan, MediaGroupMessageRequest, MediaGroupPhotoItem, MessageFingerprint,
+        OutboundBuildError, PaymentPayloadKind, PhotoMessagePlan, PhotoMessageRequest, PhotoSource,
+        ReplyMessageRef, ReplyParametersPlan, StickerMessagePlan, StickerMessageRequest,
+        SubscriptionInvoiceLinkRequest, TextMessageRequest, allow_sending_without_reply,
         build_audio_message_method, build_audio_message_plan, build_callback_answer_method,
-        build_chat_action_method, build_delete_message_method, build_edit_caption_message_method,
-        build_edit_media_message_method, build_edit_media_message_plan,
-        build_edit_reply_markup_message_method, build_edit_text_message_method,
-        build_guest_add_to_chat_markup, build_guest_html_answer_method,
-        build_guest_query_answer_method, build_inline_keyboard_button_data,
-        build_inline_keyboard_button_url, build_inline_keyboard_button_web_app,
-        build_inline_keyboard_markup, build_inline_keyboard_row, build_inline_query_answer_method,
+        build_cancel_star_subscription_method, build_chat_action_method,
+        build_delete_message_method, build_donation_invoice_link_method,
+        build_edit_caption_message_method, build_edit_media_message_method,
+        build_edit_media_message_plan, build_edit_reply_markup_message_method,
+        build_edit_text_message_method, build_guest_add_to_chat_markup,
+        build_guest_html_answer_method, build_guest_query_answer_method,
+        build_inline_keyboard_button_data, build_inline_keyboard_button_url,
+        build_inline_keyboard_button_web_app, build_inline_keyboard_markup,
+        build_inline_keyboard_row, build_inline_query_answer_method,
         build_inline_query_result_article, build_media_group_message_method,
         build_media_group_message_plan, build_photo_message_method, build_photo_message_plan,
-        build_private_settings_keyboard, build_sticker_message_method, build_sticker_message_plan,
-        build_text_message_method, build_text_message_methods, fingerprint_audio_message_plan,
-        fingerprint_photo_message_plan, fingerprint_sticker_message_plan,
-        fingerprint_text_message_part, forum_thread_id, guest_add_to_chat_url,
-        guest_dialog_fallback_html, guest_inline_description, guest_inline_result_id,
-        guest_unsupported_feature_html, hash_content, message_target_chat, prepare_guest_html,
-        validate_text_message_text,
+        build_pre_checkout_ok_method, build_private_settings_keyboard,
+        build_refund_star_payment_method, build_sticker_message_method, build_sticker_message_plan,
+        build_subscription_invoice_link_method, build_text_message_method,
+        build_text_message_methods, classify_payment_payload, donation_invoice_payload,
+        fingerprint_audio_message_plan, fingerprint_photo_message_plan,
+        fingerprint_sticker_message_plan, fingerprint_text_message_part, forum_thread_id,
+        guest_add_to_chat_url, guest_dialog_fallback_html, guest_inline_description,
+        guest_inline_result_id, guest_unsupported_feature_html, hash_content, message_target_chat,
+        prepare_guest_html, subscription_invoice_payload, validate_text_message_text,
     };
     use crate::{
         InlineKeyboardButton, InlineKeyboardMarkup, ReplyMarkup, TELEGRAM_PARSE_MODE_HTML,
@@ -2633,6 +2792,106 @@ mod tests {
             json!("https://example.invalid/plotva")
         );
         assert_eq!(alert_payload["cache_time"], json!(10));
+
+        Ok(())
+    }
+
+    #[test]
+    fn payment_payload_helpers_match_go_prefix_and_payload_rules() {
+        assert_eq!(subscription_invoice_payload(42), "subscription_42");
+        assert_eq!(donation_invoice_payload(42, 600), "donation_42_600");
+
+        assert_eq!(
+            classify_payment_payload("subscription_42"),
+            PaymentPayloadKind::Subscription
+        );
+        assert_eq!(
+            classify_payment_payload("donation_42_100"),
+            PaymentPayloadKind::Donation
+        );
+        assert_eq!(
+            classify_payment_payload("donation"),
+            PaymentPayloadKind::Donation
+        );
+        assert_eq!(
+            classify_payment_payload("other"),
+            PaymentPayloadKind::Unknown
+        );
+    }
+
+    #[test]
+    fn build_payment_methods_match_go_stars_payloads() -> Result<(), Box<dyn std::error::Error>> {
+        let subscription =
+            build_subscription_invoice_link_method(&SubscriptionInvoiceLinkRequest {
+                user_id: 42,
+                user_name: "Alice".to_owned(),
+                amount_stars: 0,
+            });
+        let subscription_payload = serde_json::to_value(subscription)?;
+        assert_eq!(
+            subscription_payload["title"],
+            json!("VIP Подписка на 30 дней")
+        );
+        assert_eq!(subscription_payload["payload"], json!("subscription_42"));
+        assert_eq!(subscription_payload["provider_token"], json!(""));
+        assert_eq!(subscription_payload["currency"], json!("XTR"));
+        assert_eq!(
+            subscription_payload["subscription_period"],
+            json!(2_592_000)
+        );
+        assert_eq!(
+            subscription_payload["prices"][0]["label"],
+            json!("VIP Подписка на 30 дней")
+        );
+        assert_eq!(subscription_payload["prices"][0]["amount"], json!(300));
+
+        let wavecut_subscription =
+            build_subscription_invoice_link_method(&SubscriptionInvoiceLinkRequest {
+                user_id: 1717359759,
+                user_name: "WaveCut".to_owned(),
+                amount_stars: 300,
+            });
+        let wavecut_payload = serde_json::to_value(wavecut_subscription)?;
+        assert_eq!(wavecut_payload["prices"][0]["amount"], json!(1));
+
+        let donation = build_donation_invoice_link_method(&DonationInvoiceLinkRequest {
+            user_id: 42,
+            amount_stars: 600,
+        });
+        let donation_payload = serde_json::to_value(donation)?;
+        assert_eq!(donation_payload["title"], json!("Донат разработчику"));
+        assert_eq!(donation_payload["payload"], json!("donation_42_600"));
+        assert_eq!(donation_payload["provider_token"], json!(""));
+        assert_eq!(donation_payload["currency"], json!("XTR"));
+        assert!(donation_payload.get("subscription_period").is_none());
+        assert_eq!(donation_payload["prices"][0]["label"], json!("Донат"));
+        assert_eq!(donation_payload["prices"][0]["amount"], json!(600));
+
+        let pre_checkout = build_pre_checkout_ok_method("pre-checkout-id");
+        let pre_checkout_payload = serde_json::to_value(pre_checkout)?;
+        assert_eq!(
+            pre_checkout_payload["pre_checkout_query_id"],
+            json!("pre-checkout-id")
+        );
+        assert_eq!(pre_checkout_payload["ok"], json!(true));
+        assert!(pre_checkout_payload.get("error_message").is_none());
+
+        let refund = build_refund_star_payment_method(42, "charge-id");
+        let refund_payload = serde_json::to_value(refund)?;
+        assert_eq!(refund_payload["user_id"], json!(42));
+        assert_eq!(
+            refund_payload["telegram_payment_charge_id"],
+            json!("charge-id")
+        );
+
+        let cancel = build_cancel_star_subscription_method(42, "charge-id");
+        let cancel_payload = serde_json::to_value(cancel)?;
+        assert_eq!(cancel_payload["user_id"], json!(42));
+        assert_eq!(
+            cancel_payload["telegram_payment_charge_id"],
+            json!("charge-id")
+        );
+        assert_eq!(cancel_payload["is_canceled"], json!(true));
 
         Ok(())
     }

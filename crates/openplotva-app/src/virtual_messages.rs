@@ -921,7 +921,8 @@ fn response_message_id(response: &TelegramOutboundResponse) -> Option<i32> {
         TelegramOutboundResponse::Messages(messages) => messages.first().map(|message| message.id),
         TelegramOutboundResponse::EditMessage(_)
         | TelegramOutboundResponse::Boolean(_)
-        | TelegramOutboundResponse::SentGuestMessage(_) => None,
+        | TelegramOutboundResponse::SentGuestMessage(_)
+        | TelegramOutboundResponse::String(_) => None,
     }?;
     i32::try_from(raw).ok()
 }

@@ -336,6 +336,10 @@ fn replay_method_from_value(
         TelegramOutboundMethodKind::AnswerCallbackQuery => None,
         TelegramOutboundMethodKind::AnswerInlineQuery => None,
         TelegramOutboundMethodKind::AnswerGuestQuery => None,
+        TelegramOutboundMethodKind::AnswerPreCheckoutQuery => None,
+        TelegramOutboundMethodKind::CreateInvoiceLink => None,
+        TelegramOutboundMethodKind::RefundStarPayment => None,
+        TelegramOutboundMethodKind::EditUserStarSubscription => None,
         TelegramOutboundMethodKind::EditMessageText => replay_edit_text_method(value),
         TelegramOutboundMethodKind::EditMessageCaption
         | TelegramOutboundMethodKind::EditMessageReplyMarkup => None,
@@ -509,6 +513,10 @@ fn fingerprint_from_value(
         | TelegramOutboundMethodKind::AnswerCallbackQuery
         | TelegramOutboundMethodKind::AnswerInlineQuery
         | TelegramOutboundMethodKind::AnswerGuestQuery
+        | TelegramOutboundMethodKind::AnswerPreCheckoutQuery
+        | TelegramOutboundMethodKind::CreateInvoiceLink
+        | TelegramOutboundMethodKind::RefundStarPayment
+        | TelegramOutboundMethodKind::EditUserStarSubscription
         | TelegramOutboundMethodKind::EditMessageText
         | TelegramOutboundMethodKind::EditMessageCaption
         | TelegramOutboundMethodKind::EditMessageReplyMarkup
@@ -704,6 +712,10 @@ fn serialize_outbound_method(
         | TelegramOutboundMethod::AnswerCallbackQuery(_)
         | TelegramOutboundMethod::AnswerInlineQuery(_)
         | TelegramOutboundMethod::AnswerGuestQuery(_)
+        | TelegramOutboundMethod::AnswerPreCheckoutQuery(_)
+        | TelegramOutboundMethod::CreateInvoiceLink(_)
+        | TelegramOutboundMethod::RefundStarPayment(_)
+        | TelegramOutboundMethod::EditUserStarSubscription(_)
         | TelegramOutboundMethod::EditMessageCaption(_)
         | TelegramOutboundMethod::EditMessageReplyMarkup(_)
         | TelegramOutboundMethod::EditMessageMedia(_)
@@ -722,6 +734,12 @@ fn go_message_type(kind: TelegramOutboundMethodKind) -> &'static str {
         TelegramOutboundMethodKind::AnswerCallbackQuery => "*api.CallbackConfig",
         TelegramOutboundMethodKind::AnswerInlineQuery => "api.InlineConfig",
         TelegramOutboundMethodKind::AnswerGuestQuery => "api.AnswerGuestQueryConfig",
+        TelegramOutboundMethodKind::AnswerPreCheckoutQuery => "api.PreCheckoutConfig",
+        TelegramOutboundMethodKind::CreateInvoiceLink => "api.CreateInvoiceLinkConfig",
+        TelegramOutboundMethodKind::RefundStarPayment => "api.RefundStarPaymentConfig",
+        TelegramOutboundMethodKind::EditUserStarSubscription => {
+            "api.EditUserStarSubscriptionConfig"
+        }
         TelegramOutboundMethodKind::EditMessageText => "*api.EditMessageTextConfig",
         TelegramOutboundMethodKind::EditMessageCaption => "*api.EditMessageCaptionConfig",
         TelegramOutboundMethodKind::EditMessageReplyMarkup => "*api.EditMessageReplyMarkupConfig",

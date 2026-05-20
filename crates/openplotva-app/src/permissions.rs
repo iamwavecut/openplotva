@@ -337,6 +337,10 @@ fn permission_error_media_flag(method_kind: TelegramOutboundMethodKind) -> Optio
         | TelegramOutboundMethodKind::AnswerCallbackQuery
         | TelegramOutboundMethodKind::AnswerInlineQuery
         | TelegramOutboundMethodKind::AnswerGuestQuery
+        | TelegramOutboundMethodKind::AnswerPreCheckoutQuery
+        | TelegramOutboundMethodKind::CreateInvoiceLink
+        | TelegramOutboundMethodKind::RefundStarPayment
+        | TelegramOutboundMethodKind::EditUserStarSubscription
         | TelegramOutboundMethodKind::DeleteMessage => None,
     }
 }

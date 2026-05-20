@@ -40,17 +40,22 @@ pub use html::{
 };
 pub use outbound::{
     AudioMessagePlan, AudioMessageRequest, AudioSource, CallbackAnswerRequest, ChatActionRequest,
-    ChatRef, DEFAULT_GUEST_BOT_USERNAME, DeleteMessageRequest, EditCaptionMessageRequest,
+    ChatRef, DEFAULT_GUEST_BOT_USERNAME, DONATION_DESCRIPTION, DONATION_TITLE,
+    DeleteMessageRequest, DonationInvoiceLinkRequest, EditCaptionMessageRequest,
     EditMediaMessagePlan, EditMediaMessageRequest, EditReplyMarkupMessageRequest,
     EditTextMessageRequest, GUEST_ADD_TO_CHAT_PAYLOAD, GUEST_INLINE_TEXT_LIMIT,
     GUEST_INLINE_TRUNCATE_LIMIT, GuestHtmlAnswerRequest, GuestQueryAnswerRequest,
-    InlineArticleRequest, InlineQueryAnswerRequest, MESSAGE_TYPE_TEXT, MediaGroupMessagePlan,
-    MediaGroupMessageRequest, MediaGroupPhotoItem, MessageFingerprint, OutboundBuildError,
-    PhotoMessagePlan, PhotoMessageRequest, PhotoSource, ReplyMessageRef, ReplyParametersPlan,
-    SETTINGS_BUTTON_TEXT, StickerMessagePlan, StickerMessageRequest, TELEGRAM_TEXT_MAX_BYTES,
-    TextMessageRequest, allow_sending_without_reply, build_audio_message_method,
-    build_audio_message_plan, build_callback_answer_method, build_chat_action_method,
-    build_delete_message_method, build_edit_caption_message_method,
+    InlineArticleRequest, InlineQueryAnswerRequest, MAX_DONATION_STARS, MESSAGE_TYPE_TEXT,
+    MIN_DONATION_STARS, MediaGroupMessagePlan, MediaGroupMessageRequest, MediaGroupPhotoItem,
+    MessageFingerprint, OutboundBuildError, PaymentPayloadKind, PhotoMessagePlan,
+    PhotoMessageRequest, PhotoSource, ReplyMessageRef, ReplyParametersPlan, SETTINGS_BUTTON_TEXT,
+    SUBSCRIPTION_DURATION_DAYS, SUBSCRIPTION_PERIOD_SECONDS, SUBSCRIPTION_PRICE_STARS,
+    StickerMessagePlan, StickerMessageRequest, SubscriptionInvoiceLinkRequest,
+    TELEGRAM_STARS_CURRENCY, TELEGRAM_TEXT_MAX_BYTES, TextMessageRequest,
+    VIP_SUBSCRIPTION_DESCRIPTION, VIP_SUBSCRIPTION_TITLE, allow_sending_without_reply,
+    build_audio_message_method, build_audio_message_plan, build_callback_answer_method,
+    build_cancel_star_subscription_method, build_chat_action_method, build_delete_message_method,
+    build_donation_invoice_link_method, build_edit_caption_message_method,
     build_edit_media_message_method, build_edit_media_message_plan,
     build_edit_reply_markup_message_method, build_edit_text_message_method,
     build_guest_add_to_chat_markup, build_guest_html_answer_method,
@@ -59,13 +64,16 @@ pub use outbound::{
     build_inline_keyboard_markup, build_inline_keyboard_row, build_inline_query_answer_method,
     build_inline_query_result_article, build_media_group_message_method,
     build_media_group_message_plan, build_photo_message_method, build_photo_message_plan,
-    build_private_settings_keyboard, build_sticker_message_method, build_sticker_message_plan,
-    build_text_message_method, build_text_message_methods, fingerprint_audio_message_plan,
+    build_pre_checkout_ok_method, build_private_settings_keyboard,
+    build_refund_star_payment_method, build_sticker_message_method, build_sticker_message_plan,
+    build_subscription_invoice_link_method, build_text_message_method, build_text_message_methods,
+    classify_payment_payload, donation_invoice_payload, fingerprint_audio_message_plan,
     fingerprint_photo_message_plan, fingerprint_sticker_message_plan,
     fingerprint_text_message_part, forum_thread_id, guest_add_to_chat_url,
     guest_dialog_fallback_html, guest_inline_description, guest_inline_result_id,
     guest_unsupported_feature_html, hash_content, message_target_chat, parse_mode_from_go,
-    prepare_guest_html, validate_text_message_text,
+    prepare_guest_html, subscription_invoice_payload, subscription_invoice_price_stars,
+    validate_text_message_text,
 };
 pub use pending_ops::{
     PENDING_OP_DELETE, PENDING_OP_EDIT, PendingOpBuildError, build_pending_op_method,
@@ -150,6 +158,18 @@ pub type EditMessageMedia = carapax::types::EditMessageMedia;
 
 /// Telegram deleteMessage method from `carapax`.
 pub type DeleteMessage = carapax::types::DeleteMessage;
+
+/// Telegram answerPreCheckoutQuery method from `carapax`.
+pub type AnswerPreCheckoutQuery = carapax::types::AnswerPreCheckoutQuery;
+
+/// Telegram createInvoiceLink method from `carapax`.
+pub type CreateInvoiceLink = carapax::types::CreateInvoiceLink;
+
+/// Telegram refundStarPayment method from `carapax`.
+pub type RefundStarPayment = carapax::types::RefundStarPayment;
+
+/// Telegram editUserStarSubscription method from `carapax`.
+pub type EditUserStarSubscription = carapax::types::EditUserStarSubscription;
 
 /// Telegram reply markup type from `carapax`.
 pub type ReplyMarkup = carapax::types::ReplyMarkup;
@@ -495,6 +515,14 @@ pub struct ApiConstructorUsage {
     pub count: usize,
 }
 
+/// Go raw Bot API method inventory entry from `MakeRequest*` call sites.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RawApiMethodUsage {
+    /// Raw Bot API method name.
+    pub method: &'static str,
+    pub count: usize,
+}
+
 pub const API_CONSTRUCTOR_USAGES: &[ApiConstructorUsage] = &[
     ApiConstructorUsage {
         name: "AnswerGuestQuery",
@@ -606,6 +634,21 @@ pub const API_CONSTRUCTOR_USAGES: &[ApiConstructorUsage] = &[
     },
 ];
 
+pub const RAW_API_METHOD_USAGES: &[RawApiMethodUsage] = &[
+    RawApiMethodUsage {
+        method: "createInvoiceLink",
+        count: 2,
+    },
+    RawApiMethodUsage {
+        method: "editUserStarSubscription",
+        count: 1,
+    },
+    RawApiMethodUsage {
+        method: "refundStarPayment",
+        count: 2,
+    },
+];
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
@@ -621,15 +664,15 @@ mod tests {
         DELETE_DRAWING_ACTION_FRAME_PICK, DELETE_DRAWING_ACTION_INIT, DELETE_LYRICS_ACTION_CLOSE,
         DELETE_LYRICS_ACTION_CONFIRM, DELETE_LYRICS_ACTION_INIT, DONATE_COMMAND,
         GROUP_ADMIN_COMMANDS, GROUP_COMMANDS, HELP_COMMAND, PRIVATE_COMMANDS,
-        build_delete_drawing_confirm_keyboard, build_delete_drawing_frame_confirm_keyboard,
-        build_delete_drawing_frame_picker_keyboard, build_delete_drawing_initial_keyboard,
-        build_lyrics_delete_confirm_keyboard, build_lyrics_delete_keyboard,
-        callback_handler_for_action, callback_query_ack_method, callback_query_ack_request,
-        callback_query_route, checkin_theme_callback_init, checkin_theme_callback_theme,
-        checkin_theme_selection_ack_method, checkin_theme_selection_alert,
-        delete_drawing_callback_data, delete_lyrics_callback_data, delete_my_commands_method,
-        empty_context, parse_callback_action, parse_callback_i64, set_my_commands_methods,
-        settings_callback_ack_method,
+        RAW_API_METHOD_USAGES, build_delete_drawing_confirm_keyboard,
+        build_delete_drawing_frame_confirm_keyboard, build_delete_drawing_frame_picker_keyboard,
+        build_delete_drawing_initial_keyboard, build_lyrics_delete_confirm_keyboard,
+        build_lyrics_delete_keyboard, callback_handler_for_action, callback_query_ack_method,
+        callback_query_ack_request, callback_query_route, checkin_theme_callback_init,
+        checkin_theme_callback_theme, checkin_theme_selection_ack_method,
+        checkin_theme_selection_alert, delete_drawing_callback_data, delete_lyrics_callback_data,
+        delete_my_commands_method, empty_context, parse_callback_action, parse_callback_i64,
+        set_my_commands_methods, settings_callback_ack_method,
     };
 
     #[derive(Debug, Deserialize)]
@@ -639,6 +682,7 @@ mod tests {
         command_aliases: BTreeMap<String, Vec<String>>,
         callback_actions: Vec<String>,
         api_constructors: Vec<InventoryApiConstructor>,
+        raw_api_methods: Vec<InventoryRawApiMethod>,
     }
 
     #[derive(Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
@@ -651,6 +695,12 @@ mod tests {
     #[derive(Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
     struct InventoryApiConstructor {
         name: String,
+        count: usize,
+    }
+
+    #[derive(Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
+    struct InventoryRawApiMethod {
+        method: String,
         count: usize,
     }
 
@@ -1321,6 +1371,25 @@ mod tests {
             .iter()
             .map(|usage| InventoryApiConstructor {
                 name: usage.name.to_owned(),
+                count: usage.count,
+            })
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(actual, expected);
+
+        Ok(())
+    }
+
+    #[test]
+    fn raw_api_method_usage_matches_generated_go_inventory() -> Result<(), serde_json::Error> {
+        let expected = inventory()?
+            .raw_api_methods
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let actual = RAW_API_METHOD_USAGES
+            .iter()
+            .map(|usage| InventoryRawApiMethod {
+                method: usage.method.to_owned(),
                 count: usage.count,
             })
             .collect::<BTreeSet<_>>();
