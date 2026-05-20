@@ -2,7 +2,10 @@
 
 use std::collections::BTreeMap;
 
-use crate::outbound::CallbackAnswerRequest;
+use crate::{
+    outbound::{CallbackAnswerRequest, build_callback_answer_method},
+    transport::TelegramOutboundMethod,
+};
 
 pub type CallbackActionData = BTreeMap<String, String>;
 
@@ -163,6 +166,16 @@ pub fn callback_query_ack_request(
         | CallbackQueryRoute::Settings { .. }
         | CallbackQueryRoute::Handle { .. } => None,
     }
+}
+
+/// Build the concrete direct `answerCallbackQuery` method for terminal ack routes.
+#[must_use]
+pub fn callback_query_ack_method(
+    callback_query_id: impl Into<String>,
+    route: &CallbackQueryRoute,
+) -> Option<TelegramOutboundMethod> {
+    callback_query_ack_request(callback_query_id, route)
+        .map(|request| TelegramOutboundMethod::from(build_callback_answer_method(&request)))
 }
 
 /// Return the Go callback handler group for an action.

@@ -13,9 +13,9 @@ mod update_startup;
 
 pub use callback::{
     CallbackActionData, CallbackActionParse, CallbackHandlerKind, CallbackQueryRoute,
-    callback_handler_for_action, callback_query_ack_request, callback_query_route,
-    checkin_theme_callback_init, checkin_theme_callback_theme, checkin_theme_selection_alert,
-    parse_callback_action,
+    callback_handler_for_action, callback_query_ack_method, callback_query_ack_request,
+    callback_query_route, checkin_theme_callback_init, checkin_theme_callback_theme,
+    checkin_theme_selection_alert, parse_callback_action,
 };
 pub use dedup::{DEFAULT_DEBOUNCE_CACHE_SIZE, DEFAULT_DEBOUNCE_WINDOW, Debouncer, DebouncerConfig};
 pub use dispatcher::{
@@ -603,10 +603,10 @@ mod tests {
         API_CONSTRUCTOR_USAGES, BotCommandError, BotCommandScope, CALLBACK_ACTIONS,
         COMMAND_ALIAS_GROUPS, COMMAND_SETS, CallbackActionParse, CallbackHandlerKind,
         CallbackQueryRoute, CommandScope, DONATE_COMMAND, GROUP_ADMIN_COMMANDS, GROUP_COMMANDS,
-        HELP_COMMAND, PRIVATE_COMMANDS, callback_handler_for_action, callback_query_ack_request,
-        callback_query_route, checkin_theme_callback_init, checkin_theme_callback_theme,
-        checkin_theme_selection_alert, delete_my_commands_method, empty_context,
-        parse_callback_action, set_my_commands_methods,
+        HELP_COMMAND, PRIVATE_COMMANDS, callback_handler_for_action, callback_query_ack_method,
+        callback_query_ack_request, callback_query_route, checkin_theme_callback_init,
+        checkin_theme_callback_theme, checkin_theme_selection_alert, delete_my_commands_method,
+        empty_context, parse_callback_action, set_my_commands_methods,
     };
 
     #[derive(Debug, Deserialize)]
@@ -952,6 +952,51 @@ mod tests {
             callback_query_ack_request(
                 "query-id",
                 &callback_query_route(true, false, r#"{"a":"cts","i":"42"}"#)
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn callback_query_ack_method_builds_go_empty_answer_callback_query() {
+        let method = callback_query_ack_method("query-id", &CallbackQueryRoute::AckEmptyData)
+            .expect("empty callback ack method");
+
+        assert_eq!(
+            method.kind(),
+            super::TelegramOutboundMethodKind::AnswerCallbackQuery
+        );
+        assert_eq!(method.method_name(), "answerCallbackQuery");
+
+        let super::TelegramOutboundMethod::AnswerCallbackQuery(method) = method else {
+            panic!("expected answerCallbackQuery method");
+        };
+        let payload = serde_json::to_value(method.as_ref()).expect("callback ack JSON");
+        assert_eq!(payload["callback_query_id"], "query-id");
+        assert!(payload.get("text").is_none());
+        assert!(payload.get("show_alert").is_none());
+        assert!(payload.get("url").is_none());
+        assert!(payload.get("cache_time").is_none());
+    }
+
+    #[test]
+    fn callback_query_ack_method_skips_delegated_or_rate_limited_routes() {
+        assert!(
+            callback_query_ack_method("query-id", &CallbackQueryRoute::SkipRateLimited).is_none()
+        );
+        assert!(
+            callback_query_ack_method(
+                "query-id",
+                &CallbackQueryRoute::Settings {
+                    data: "settings:x".to_owned()
+                }
+            )
+            .is_none()
+        );
+        assert!(
+            callback_query_ack_method(
+                "query-id",
+                &callback_query_route(true, false, r#"{"a":"delete"}"#)
             )
             .is_none()
         );
