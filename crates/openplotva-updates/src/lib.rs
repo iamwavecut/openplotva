@@ -1,6 +1,7 @@
 //! Telegram update ingestion, classification, and replay.
 
 use std::{
+    collections::HashSet,
     fmt,
     future::Future,
     io,
@@ -714,6 +715,54 @@ pub fn telegram_message_attachments(
     out
 }
 
+/// Return Go `fetcher.detectMessageType` for a Telegram message plus known attachments.
+#[must_use]
+pub fn detect_message_type(
+    message: Option<&TelegramMessage>,
+    attachments: &[ChatAttachment],
+) -> String {
+    first_message_attachment_kind(attachments)
+        .or_else(|| telegram_message_type(message))
+        .unwrap_or("text")
+        .to_owned()
+}
+
+/// Collect Go fetcher media attachments that are not already present in metadata.
+#[must_use]
+pub fn collect_media_attachments(
+    message: Option<&TelegramMessage>,
+    existing: &[ChatAttachment],
+) -> Vec<ChatAttachment> {
+    let Some(message) = message else {
+        return Vec::new();
+    };
+
+    let mut seen = attachment_key_set(existing);
+    let mut out = Vec::new();
+    for attachment in media_attachments_from_message(message) {
+        add_unique_attachment(&mut out, &mut seen, attachment);
+    }
+    out
+}
+
+/// Apply Go fetcher MIME-derived attachment-kind normalization.
+#[must_use]
+pub fn normalize_attachment_kind(mut attachment: ChatAttachment) -> ChatAttachment {
+    if !attachment.kind.is_empty() || attachment.mime_type.is_empty() {
+        return attachment;
+    }
+
+    if has_mime_prefix(&attachment.mime_type, "image/") {
+        attachment.kind = "image".to_owned();
+    } else if has_mime_prefix(&attachment.mime_type, "video/") {
+        attachment.kind = "video".to_owned();
+    } else if has_mime_prefix(&attachment.mime_type, "audio/") {
+        attachment.kind = "audio".to_owned();
+    }
+
+    attachment
+}
+
 /// Return whether Go would skip user-visible side effects for this update age.
 pub fn should_skip_side_effects_at(
     update: &TelegramUpdate,
@@ -796,6 +845,90 @@ fn telegram_attachment_source(source: &str) -> String {
     } else {
         source.to_owned()
     }
+}
+
+fn first_message_attachment_kind(attachments: &[ChatAttachment]) -> Option<&str> {
+    attachments.iter().find_map(|attachment| {
+        if attachment.source.trim() != "message" {
+            return None;
+        }
+        let kind = attachment.kind.trim();
+        (!kind.is_empty()).then_some(kind)
+    })
+}
+
+fn telegram_message_type(message: Option<&TelegramMessage>) -> Option<&'static str> {
+    let message = message?;
+    match &message.data {
+        TelegramMessageData::Voice(_) => Some("voice"),
+        TelegramMessageData::Video(_) => Some("video"),
+        TelegramMessageData::Audio(_) => Some("audio"),
+        TelegramMessageData::Document(_) => Some("document"),
+        TelegramMessageData::Location(_) | TelegramMessageData::Venue(_) => Some("location"),
+        TelegramMessageData::Contact(_) => Some("contact"),
+        TelegramMessageData::Photo(_) | TelegramMessageData::Sticker(_) => Some("image"),
+        TelegramMessageData::Text(text) if !text.data.trim().is_empty() => Some("text"),
+        _ => None,
+    }
+}
+
+fn attachment_key_set(existing: &[ChatAttachment]) -> HashSet<String> {
+    existing.iter().filter_map(attachment_key).collect()
+}
+
+fn add_unique_attachment(
+    out: &mut Vec<ChatAttachment>,
+    seen: &mut HashSet<String>,
+    attachment: ChatAttachment,
+) {
+    let attachment = normalize_attachment_kind(attachment);
+    if let Some(key) = attachment_key(&attachment)
+        && !seen.insert(key)
+    {
+        return;
+    }
+    out.push(attachment);
+}
+
+fn media_attachments_from_message(message: &TelegramMessage) -> Vec<ChatAttachment> {
+    telegram_message_attachments(
+        message,
+        TelegramMessageAttachmentOptions {
+            caption: attachment_caption(message),
+            promote_first_image_ref: true,
+            ..TelegramMessageAttachmentOptions::default()
+        },
+    )
+}
+
+fn attachment_caption(message: &TelegramMessage) -> String {
+    if matches!(
+        &message.data,
+        TelegramMessageData::Text(text) if !text.data.trim().is_empty()
+    ) {
+        return String::new();
+    }
+
+    message
+        .get_text()
+        .map(|text| text.as_ref().trim().to_owned())
+        .unwrap_or_default()
+}
+
+fn attachment_key(attachment: &ChatAttachment) -> Option<String> {
+    if !attachment.file_unique_id.is_empty() {
+        return Some(format!("{}:{}", attachment.kind, attachment.file_unique_id));
+    }
+    if !attachment.kind.is_empty()
+        && !attachment.source.is_empty()
+        && !attachment.content.is_empty()
+    {
+        return Some(format!(
+            "{}:{}:{}",
+            attachment.kind, attachment.source, attachment.content
+        ));
+    }
+    None
 }
 
 fn append_telegram_image_attachment(
@@ -1955,6 +2088,164 @@ mod tests {
         assert_float_eq(location[0].latitude, 52.2297);
         assert_float_eq(location[0].longitude, 21.0122);
 
+        Ok(())
+    }
+
+    #[test]
+    fn message_type_prefers_message_attachment_kind_like_go_fetcher() -> Result<(), Box<dyn Error>>
+    {
+        let update = serde_json::from_value(json!({
+            "update_id": 132,
+            "message": {
+                "message_id": 64,
+                "date": 1_710_000_000,
+                "chat": sample_private_chat_json(),
+                "from": sample_user_json(),
+                "voice": {
+                    "file_id": "voice-file",
+                    "file_unique_id": "voice-1",
+                    "duration": 7
+                }
+            }
+        }))?;
+        let attachments = vec![openplotva_core::ChatAttachment {
+            kind: "audio".to_owned(),
+            source: "message".to_owned(),
+            ..openplotva_core::ChatAttachment::default()
+        }];
+
+        assert_eq!(
+            super::detect_message_type(Some(update_message(&update)?), &attachments),
+            "audio"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn message_type_falls_back_to_telegram_fields_like_go_fetcher() -> Result<(), Box<dyn Error>> {
+        let voice_update = serde_json::from_value(json!({
+            "update_id": 133,
+            "message": {
+                "message_id": 65,
+                "date": 1_710_000_000,
+                "chat": sample_private_chat_json(),
+                "from": sample_user_json(),
+                "voice": {
+                    "file_id": "voice-file",
+                    "file_unique_id": "voice-1",
+                    "duration": 7
+                }
+            }
+        }))?;
+        let photo_update = serde_json::from_value(json!({
+            "update_id": 134,
+            "message": {
+                "message_id": 66,
+                "date": 1_710_000_000,
+                "chat": sample_private_chat_json(),
+                "from": sample_user_json(),
+                "photo": [
+                    {
+                        "file_id": "photo-file",
+                        "file_unique_id": "photo-1",
+                        "height": 90,
+                        "width": 90
+                    }
+                ]
+            }
+        }))?;
+        let text_update = sample_message_update()?;
+
+        assert_eq!(
+            super::detect_message_type(Some(update_message(&voice_update)?), &[]),
+            "voice"
+        );
+        assert_eq!(
+            super::detect_message_type(Some(update_message(&photo_update)?), &[]),
+            "image"
+        );
+        assert_eq!(
+            super::detect_message_type(Some(update_message(&text_update)?), &[]),
+            "text"
+        );
+        assert_eq!(super::detect_message_type(None, &[]), "text");
+
+        Ok(())
+    }
+
+    #[test]
+    fn normalize_attachment_kind_uses_case_insensitive_mime_prefix_like_go_fetcher() {
+        let got = super::normalize_attachment_kind(openplotva_core::ChatAttachment {
+            mime_type: " IMAGE/PNG ".to_owned(),
+            ..openplotva_core::ChatAttachment::default()
+        });
+
+        assert_eq!(got.kind, "image");
+    }
+
+    #[test]
+    fn collect_media_attachments_skips_existing_attachment_like_go_fetcher()
+    -> Result<(), Box<dyn Error>> {
+        let update = serde_json::from_value(json!({
+            "update_id": 135,
+            "message": {
+                "message_id": 67,
+                "date": 1_710_000_000,
+                "chat": sample_private_chat_json(),
+                "from": sample_user_json(),
+                "photo": [
+                    {
+                        "file_id": "photo-file",
+                        "file_unique_id": "photo-1",
+                        "height": 90,
+                        "width": 90
+                    }
+                ]
+            }
+        }))?;
+        let existing = vec![openplotva_core::ChatAttachment {
+            kind: "image".to_owned(),
+            source: "message".to_owned(),
+            file_unique_id: "photo-1".to_owned(),
+            ..openplotva_core::ChatAttachment::default()
+        }];
+
+        let got = super::collect_media_attachments(Some(update_message(&update)?), &existing);
+
+        assert!(
+            got.is_empty(),
+            "duplicate attachment should be skipped: {got:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn collect_media_attachments_keeps_voice_caption_empty_like_go_fetcher()
+    -> Result<(), Box<dyn Error>> {
+        let update = serde_json::from_value(json!({
+            "update_id": 136,
+            "message": {
+                "message_id": 68,
+                "date": 1_710_000_000,
+                "chat": sample_private_chat_json(),
+                "from": sample_user_json(),
+                "caption": " voice caption ",
+                "voice": {
+                    "file_id": "voice-file",
+                    "file_unique_id": "voice-1",
+                    "duration": 7
+                }
+            }
+        }))?;
+
+        let got = super::collect_media_attachments(Some(update_message(&update)?), &[]);
+
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].kind, "voice");
+        assert_eq!(got[0].file_unique_id, "voice-1");
+        assert_eq!(got[0].duration_seconds, 7);
+        assert_eq!(got[0].caption, "");
         Ok(())
     }
 
