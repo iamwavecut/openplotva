@@ -10,7 +10,7 @@ use openplotva_core::{UserState, VIP_EVENT_TYPE_PAYMENT, vip_days_to_seconds};
 use openplotva_storage::{
     DonationCreate, DonationRecord, PostgresPaymentStore, PostgresVipStore,
     PostgresVirtualMessageStore, StorageError, SubscriptionCreate, SubscriptionRecord,
-    VipEventCreate, VipEventRecord,
+    VipCacheRecord, VipEventCreate, VipEventRecord, VipSummaryRecord,
 };
 use openplotva_taskman::{
     CONTROL_QUEUE_NAME, ControlJobData, ControlJobParams, ControlKind, ControlPayment,
@@ -213,6 +213,21 @@ pub struct PaymentRedirectMessage {
     pub button_text: String,
     /// Telegram deep link URL.
     pub url: String,
+}
+
+/// Direct private-chat status reply for an already-active VIP user.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VipStatusMessage {
+    /// Telegram chat ID.
+    pub chat_id: i64,
+    /// Message ID to reply to.
+    pub reply_to_message_id: i32,
+    /// Forum topic ID when the source message belongs to a topic.
+    pub message_thread_id: Option<i32>,
+    /// HTML message body.
+    pub text: String,
+    /// Whether to attach Go's VIP cancellation callback button.
+    pub show_cancel_button: bool,
 }
 
 /// Control-job invoice execution result class.
@@ -815,6 +830,103 @@ pub fn payment_redirect_send_message_method(
         text: message.text.clone(),
         render_as: String::new(),
         reply_markup: Some(reply_markup),
+    };
+    let reply_to = openplotva_telegram::ReplyMessageRef {
+        message_id: i64::from(message.reply_to_message_id),
+        chat,
+        is_topic_message: message.message_thread_id.is_some(),
+        message_thread_id: message.message_thread_id.map(i64::from).unwrap_or_default(),
+    };
+    openplotva_telegram::build_text_message_method(
+        &req,
+        chat,
+        Some(&reply_to),
+        message.text.clone(),
+        true,
+    )
+}
+
+/// Build Go `activeVIPStatusText` plus optional cancel keyboard metadata.
+#[must_use]
+pub fn active_vip_status_message_at(
+    summary: &VipSummaryRecord,
+    active_subscription: Option<&SubscriptionRecord>,
+    chat_id: i64,
+    reply_to_message_id: i32,
+    message_thread_id: Option<i32>,
+    now: OffsetDateTime,
+) -> VipStatusMessage {
+    let days_left = vip_display_days_left_at(summary.effective_expires_at, now);
+    VipStatusMessage {
+        chat_id,
+        reply_to_message_id,
+        message_thread_id,
+        text: format!(
+            "✅ У вас уже есть активный VIP статус!\n\n\
+             Он действует до: <b>{}</b> ({} дней осталось)\n\n\
+             Вы получаете:\n{}",
+            go_date(summary.effective_expires_at),
+            days_left,
+            VIP_BENEFITS_TEXT
+        ),
+        show_cancel_button: active_subscription.is_some_and(|subscription| subscription.id > 0),
+    }
+}
+
+/// Build Go `externalVIPStatusText` when the cached external VIP status is active.
+#[must_use]
+pub fn external_vip_status_message_if_active_at(
+    vip_cache: Option<&VipCacheRecord>,
+    chat_id: i64,
+    reply_to_message_id: i32,
+    message_thread_id: Option<i32>,
+    now: OffsetDateTime,
+) -> Option<VipStatusMessage> {
+    let vip_cache = vip_cache?;
+    if !vip_cache.is_vip || now >= vip_cache.expires_at {
+        return None;
+    }
+    Some(VipStatusMessage {
+        chat_id,
+        reply_to_message_id,
+        message_thread_id,
+        text: format!(
+            "✅ У вас активен VIP статус.\n\n\
+             Доступ подтверждён через внешний источник.\n\n\
+             Вы получаете:\n{}",
+            VIP_BENEFITS_TEXT
+        ),
+        show_cancel_button: false,
+    })
+}
+
+/// Build the direct HTML `sendMessage` used by Go existing-VIP status replies.
+pub fn vip_status_send_message_method(
+    message: &VipStatusMessage,
+) -> Result<openplotva_telegram::SendMessage, openplotva_telegram::OutboundBuildError> {
+    openplotva_telegram::validate_text_message_text(
+        &message.text,
+        openplotva_telegram::TELEGRAM_PARSE_MODE_HTML,
+    )?;
+    let chat = openplotva_telegram::ChatRef {
+        id: message.chat_id,
+        is_forum: message.message_thread_id.is_some(),
+    };
+    let reply_markup = message.show_cancel_button.then(|| {
+        let button = openplotva_telegram::build_inline_keyboard_button_data(
+            "Отменить подписку",
+            "{\"action\":\"cancel_vip\"}",
+        );
+        openplotva_telegram::ReplyMarkup::from([[button]])
+    });
+    let req = openplotva_telegram::TextMessageRequest {
+        chat: Some(chat),
+        message_thread_id: 0,
+        disable_notification: false,
+        allow_sending_without_reply: None,
+        text: message.text.clone(),
+        render_as: openplotva_telegram::TELEGRAM_PARSE_MODE_HTML.to_owned(),
+        reply_markup,
     };
     let reply_to = openplotva_telegram::ReplyMessageRef {
         message_id: i64::from(message.reply_to_message_id),
@@ -2143,6 +2255,16 @@ fn go_date(value: OffsetDateTime) -> String {
     )
 }
 
+fn vip_display_days_left_at(expires_at: OffsetDateTime, now: OffsetDateTime) -> i64 {
+    let remaining = expires_at - now;
+    if remaining <= time::Duration::ZERO {
+        return 0;
+    }
+    ((remaining.whole_seconds() as f64) / 86_400.0)
+        .round()
+        .max(0.0) as i64
+}
+
 const SUBSCRIPTION_SAVE_ERROR_TEXT: &str = "❌ Платеж прошел успешно, но возникла ошибка при активации подписки. Пожалуйста, обратитесь в [поддержку](https://t.me/WaveCut)";
 const SUBSCRIPTION_DETAILS_ERROR_TEXT: &str = "✅ Платеж успешно обработан, но возникла ошибка при получении деталей подписки. Пожалуйста, обратитесь в [поддержку](https://t.me/WaveCut)";
 const SUBSCRIPTION_LEDGER_ERROR_TEXT: &str = "❌ Платеж прошел успешно, но возникла ошибка при фиксации VIP периода. Пожалуйста, обратитесь в [поддержку](https://t.me/WaveCut)";
@@ -2177,8 +2299,8 @@ mod tests {
     use carapax::types::Update as TelegramUpdate;
     use openplotva_core::{UserState, VIP_EVENT_TYPE_PAYMENT, vip_days_to_seconds};
     use openplotva_storage::{
-        DonationCreate, DonationRecord, SubscriptionCreate, SubscriptionRecord, VipEventCreate,
-        VipEventRecord,
+        DonationCreate, DonationRecord, SubscriptionCreate, SubscriptionRecord, VipCacheRecord,
+        VipEventCreate, VipEventRecord, VipSummaryRecord,
     };
     use openplotva_taskman::{
         CONTROL_QUEUE_NAME, ControlJobData, ControlJobParams, ControlKind, ControlPayment,
@@ -3093,6 +3215,125 @@ mod tests {
         assert_eq!(message.reply_to_message_id, 555);
         assert_eq!(message.message_thread_id, Some(77));
         assert_eq!(message.url, "https://t.me/PlotvaBot?start=donate_777");
+        Ok(())
+    }
+
+    #[test]
+    fn active_vip_status_message_method_matches_go_existing_vip_reply() -> Result<(), Box<dyn Error>>
+    {
+        let now = time::Date::from_calendar_date(2026, time::Month::June, 16)?
+            .with_hms(9, 30, 0)?
+            .assume_utc();
+        let expires_at = time::Date::from_calendar_date(2026, time::Month::June, 19)?
+            .with_hms(9, 30, 0)?
+            .assume_utc();
+        let summary = VipSummaryRecord {
+            latest_event_id: 77,
+            user_id: 42,
+            latest_event_type: VIP_EVENT_TYPE_PAYMENT.to_owned(),
+            latest_delta_seconds: vip_days_to_seconds(30),
+            effective_expires_at: expires_at,
+            is_active: true,
+            remaining_seconds: 259_200,
+            latest_subscription_id: Some(10),
+            latest_actor_user_id: None,
+            latest_reason: "payment telegram-charge".to_owned(),
+            latest_created_at: now,
+        };
+        let subscription = SubscriptionRecord {
+            id: 10,
+            user_id: 42,
+            telegram_payment_charge_id: "telegram-charge".to_owned(),
+            provider_payment_charge_id: String::new(),
+            expires_at,
+            created_at: now,
+            updated_at: now,
+            canceled_at: None,
+            refunded_at: None,
+        };
+
+        let message = super::active_vip_status_message_at(
+            &summary,
+            Some(&subscription),
+            -10042,
+            555,
+            Some(77),
+            now,
+        );
+
+        assert_eq!(
+            message.text,
+            "✅ У вас уже есть активный VIP статус!\n\n\
+             Он действует до: <b>19.06.2026</b> (3 дней осталось)\n\n\
+             Вы получаете:\n\
+             ⚡ Приоритетное выполнение запросов вне очереди\n\
+             🔄 Вдвое больше рисунков за то же время\n\
+             🖼️ Изображения лучшего качества с меньшей цензурой\n\
+             🎵 Генерация песен по теме через /song (с поддержкой audio reference)\n\
+             🚀 Доступ к новым функциям и фичам (в разработке)"
+        );
+        assert!(message.show_cancel_button);
+
+        let payload = serde_json::to_value(super::vip_status_send_message_method(&message)?)?;
+        assert_eq!(payload["chat_id"], json!(-10042));
+        assert_eq!(payload["message_thread_id"], json!(77));
+        assert_eq!(payload["reply_parameters"]["message_id"], json!(555));
+        assert_eq!(payload["reply_parameters"]["chat_id"], json!(-10042));
+        assert_eq!(
+            payload["reply_parameters"]["allow_sending_without_reply"],
+            json!(true)
+        );
+        assert_eq!(payload["parse_mode"], json!("HTML"));
+        assert_eq!(
+            payload["reply_markup"]["inline_keyboard"][0][0]["text"],
+            json!("Отменить подписку")
+        );
+        assert_eq!(
+            payload["reply_markup"]["inline_keyboard"][0][0]["callback_data"],
+            json!("{\"action\":\"cancel_vip\"}")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn external_vip_cache_status_message_matches_go_without_cancel_button()
+    -> Result<(), Box<dyn Error>> {
+        let now = time::Date::from_calendar_date(2026, time::Month::June, 16)?
+            .with_hms(9, 30, 0)?
+            .assume_utc();
+        let vip_cache = VipCacheRecord {
+            user_id: 42,
+            is_vip: true,
+            expires_at: now + time::Duration::days(1),
+            created_at: now,
+            updated_at: now,
+        };
+
+        let message = super::external_vip_status_message_if_active_at(
+            Some(&vip_cache),
+            -10042,
+            555,
+            None,
+            now,
+        )
+        .expect("active external VIP cache should build a status message");
+
+        assert_eq!(
+            message.text,
+            "✅ У вас активен VIP статус.\n\n\
+             Доступ подтверждён через внешний источник.\n\n\
+             Вы получаете:\n\
+             ⚡ Приоритетное выполнение запросов вне очереди\n\
+             🔄 Вдвое больше рисунков за то же время\n\
+             🖼️ Изображения лучшего качества с меньшей цензурой\n\
+             🎵 Генерация песен по теме через /song (с поддержкой audio reference)\n\
+             🚀 Доступ к новым функциям и фичам (в разработке)"
+        );
+        assert!(!message.show_cancel_button);
+
+        let payload = serde_json::to_value(super::vip_status_send_message_method(&message)?)?;
+        assert!(payload.get("reply_markup").is_none());
+        assert_eq!(payload["parse_mode"], json!("HTML"));
         Ok(())
     }
 
