@@ -1,9 +1,9 @@
 use carapax::{
     api::{Client, ExecuteError},
     types::{
-        DeleteMessage, EditMessageCaption, EditMessageMedia, EditMessageReplyMarkup,
-        EditMessageResult, EditMessageText, Message, SendAudio, SendChatAction, SendMediaGroup,
-        SendMessage, SendPhoto, SendSticker,
+        AnswerCallbackQuery, DeleteMessage, EditMessageCaption, EditMessageMedia,
+        EditMessageReplyMarkup, EditMessageResult, EditMessageText, Message, SendAudio,
+        SendChatAction, SendMediaGroup, SendMessage, SendPhoto, SendSticker,
     },
 };
 
@@ -24,6 +24,8 @@ pub enum TelegramOutboundMethod {
     SendMediaGroup(Box<SendMediaGroup>),
     /// Telegram `sendChatAction`.
     SendChatAction(Box<SendChatAction>),
+    /// Telegram `answerCallbackQuery`.
+    AnswerCallbackQuery(Box<AnswerCallbackQuery>),
     /// Telegram `editMessageText`.
     EditMessageText(Box<EditMessageText>),
     /// Telegram `editMessageCaption`.
@@ -51,6 +53,8 @@ pub enum TelegramOutboundMethodKind {
     SendMediaGroup,
     /// Telegram `sendChatAction`.
     SendChatAction,
+    /// Telegram `answerCallbackQuery`.
+    AnswerCallbackQuery,
     /// Telegram `editMessageText`.
     EditMessageText,
     /// Telegram `editMessageCaption`.
@@ -99,6 +103,7 @@ impl TelegramOutboundMethod {
             Self::SendAudio(_) => TelegramOutboundMethodKind::SendAudio,
             Self::SendMediaGroup(_) => TelegramOutboundMethodKind::SendMediaGroup,
             Self::SendChatAction(_) => TelegramOutboundMethodKind::SendChatAction,
+            Self::AnswerCallbackQuery(_) => TelegramOutboundMethodKind::AnswerCallbackQuery,
             Self::EditMessageText(_) => TelegramOutboundMethodKind::EditMessageText,
             Self::EditMessageCaption(_) => TelegramOutboundMethodKind::EditMessageCaption,
             Self::EditMessageReplyMarkup(_) => TelegramOutboundMethodKind::EditMessageReplyMarkup,
@@ -116,6 +121,7 @@ impl TelegramOutboundMethod {
             Self::SendAudio(_) => "sendAudio",
             Self::SendMediaGroup(_) => "sendMediaGroup",
             Self::SendChatAction(_) => "sendChatAction",
+            Self::AnswerCallbackQuery(_) => "answerCallbackQuery",
             Self::EditMessageText(_) => "editMessageText",
             Self::EditMessageCaption(_) => "editMessageCaption",
             Self::EditMessageReplyMarkup(_) => "editMessageReplyMarkup",
@@ -132,7 +138,9 @@ impl TelegramOutboundMethod {
             | Self::SendPhoto(_)
             | Self::SendAudio(_) => TelegramOutboundResponseKind::Message,
             Self::SendMediaGroup(_) => TelegramOutboundResponseKind::Messages,
-            Self::SendChatAction(_) => TelegramOutboundResponseKind::Boolean,
+            Self::SendChatAction(_) | Self::AnswerCallbackQuery(_) => {
+                TelegramOutboundResponseKind::Boolean
+            }
             Self::EditMessageText(_)
             | Self::EditMessageCaption(_)
             | Self::EditMessageReplyMarkup(_)
@@ -177,6 +185,10 @@ pub async fn execute_telegram_method(
             .await
             .map(TelegramOutboundResponse::Messages),
         TelegramOutboundMethod::SendChatAction(method) => client
+            .execute(*method)
+            .await
+            .map(TelegramOutboundResponse::Boolean),
+        TelegramOutboundMethod::AnswerCallbackQuery(method) => client
             .execute(*method)
             .await
             .map(TelegramOutboundResponse::Boolean),
@@ -250,6 +262,12 @@ impl From<SendChatAction> for TelegramOutboundMethod {
     }
 }
 
+impl From<AnswerCallbackQuery> for TelegramOutboundMethod {
+    fn from(value: AnswerCallbackQuery) -> Self {
+        Self::AnswerCallbackQuery(Box::new(value))
+    }
+}
+
 impl From<EditMessageText> for TelegramOutboundMethod {
     fn from(value: EditMessageText) -> Self {
         Self::EditMessageText(Box::new(value))
@@ -284,11 +302,12 @@ impl From<DeleteMessage> for TelegramOutboundMethod {
 mod tests {
     use super::{TelegramOutboundMethod, TelegramOutboundMethodKind, TelegramOutboundResponseKind};
     use crate::{
-        AudioMessageRequest, AudioSource, ChatActionRequest, ChatRef, EditCaptionMessageRequest,
-        EditMediaMessageRequest, EditReplyMarkupMessageRequest, EditTextMessageRequest,
-        InlineKeyboardButton, InlineKeyboardMarkup, MediaGroupMessageRequest, MediaGroupPhotoItem,
-        PhotoMessageRequest, PhotoSource, StickerMessageRequest, TELEGRAM_PARSE_MODE_HTML,
-        TextMessageRequest, build_audio_message_method, build_chat_action_method,
+        AudioMessageRequest, AudioSource, CallbackAnswerRequest, ChatActionRequest, ChatRef,
+        EditCaptionMessageRequest, EditMediaMessageRequest, EditReplyMarkupMessageRequest,
+        EditTextMessageRequest, InlineKeyboardButton, InlineKeyboardMarkup,
+        MediaGroupMessageRequest, MediaGroupPhotoItem, PhotoMessageRequest, PhotoSource,
+        StickerMessageRequest, TELEGRAM_PARSE_MODE_HTML, TextMessageRequest,
+        build_audio_message_method, build_callback_answer_method, build_chat_action_method,
         build_edit_caption_message_method, build_edit_media_message_method,
         build_edit_reply_markup_message_method, build_edit_text_message_method,
         build_media_group_message_method, build_photo_message_method, build_sticker_message_method,
@@ -424,6 +443,14 @@ mod tests {
             })
             .expect("chat action method"),
         );
+        let callback_answer =
+            TelegramOutboundMethod::from(build_callback_answer_method(&CallbackAnswerRequest {
+                callback_query_id: "query-id".to_owned(),
+                text: "ack".to_owned(),
+                show_alert: false,
+                url: String::new(),
+                cache_time: 0,
+            }));
         let delete_message =
             TelegramOutboundMethod::from(carapax::types::DeleteMessage::new(42, 7));
 
@@ -486,6 +513,12 @@ mod tests {
                 chat_action,
                 TelegramOutboundMethodKind::SendChatAction,
                 "sendChatAction",
+                TelegramOutboundResponseKind::Boolean,
+            ),
+            (
+                callback_answer,
+                TelegramOutboundMethodKind::AnswerCallbackQuery,
+                "answerCallbackQuery",
                 TelegramOutboundResponseKind::Boolean,
             ),
             (

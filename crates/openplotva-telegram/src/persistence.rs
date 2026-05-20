@@ -333,6 +333,7 @@ fn replay_method_from_value(
         TelegramOutboundMethodKind::SendAudio => replay_audio_method(value),
         TelegramOutboundMethodKind::SendMediaGroup => replay_media_group_method(value),
         TelegramOutboundMethodKind::SendChatAction => None,
+        TelegramOutboundMethodKind::AnswerCallbackQuery => None,
         TelegramOutboundMethodKind::EditMessageText => replay_edit_text_method(value),
         TelegramOutboundMethodKind::EditMessageCaption
         | TelegramOutboundMethodKind::EditMessageReplyMarkup => None,
@@ -503,6 +504,7 @@ fn fingerprint_from_value(
             debounce_key: None,
         },
         TelegramOutboundMethodKind::SendChatAction
+        | TelegramOutboundMethodKind::AnswerCallbackQuery
         | TelegramOutboundMethodKind::EditMessageText
         | TelegramOutboundMethodKind::EditMessageCaption
         | TelegramOutboundMethodKind::EditMessageReplyMarkup
@@ -695,6 +697,7 @@ fn serialize_outbound_method(
         | TelegramOutboundMethod::SendAudio(_)
         | TelegramOutboundMethod::SendMediaGroup(_)
         | TelegramOutboundMethod::SendChatAction(_)
+        | TelegramOutboundMethod::AnswerCallbackQuery(_)
         | TelegramOutboundMethod::EditMessageCaption(_)
         | TelegramOutboundMethod::EditMessageReplyMarkup(_)
         | TelegramOutboundMethod::EditMessageMedia(_)
@@ -710,6 +713,7 @@ fn go_message_type(kind: TelegramOutboundMethodKind) -> &'static str {
         TelegramOutboundMethodKind::SendAudio => "*api.AudioConfig",
         TelegramOutboundMethodKind::SendMediaGroup => "*api.MediaGroupConfig",
         TelegramOutboundMethodKind::SendChatAction => "*api.ChatActionConfig",
+        TelegramOutboundMethodKind::AnswerCallbackQuery => "*api.CallbackConfig",
         TelegramOutboundMethodKind::EditMessageText => "*api.EditMessageTextConfig",
         TelegramOutboundMethodKind::EditMessageCaption => "*api.EditMessageCaptionConfig",
         TelegramOutboundMethodKind::EditMessageReplyMarkup => "*api.EditMessageReplyMarkupConfig",
@@ -744,6 +748,10 @@ fn message_type_method_kind(message_type: &str) -> Option<TelegramOutboundMethod
         | "*api.ChatActionConfig"
         | "tgbotapi.ChatActionConfig"
         | "api.ChatActionConfig" => Some(TelegramOutboundMethodKind::SendChatAction),
+        "*tgbotapi.CallbackConfig"
+        | "*api.CallbackConfig"
+        | "tgbotapi.CallbackConfig"
+        | "api.CallbackConfig" => Some(TelegramOutboundMethodKind::AnswerCallbackQuery),
         "*api.EditMessageTextConfig" | "api.EditMessageTextConfig" => {
             Some(TelegramOutboundMethodKind::EditMessageText)
         }

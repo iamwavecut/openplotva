@@ -4,11 +4,11 @@ use std::{borrow::Cow, fmt, io::Cursor};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use carapax::types::{
-    ChatAction, DeleteMessage, EditMessageCaption, EditMessageMedia, EditMessageReplyMarkup,
-    EditMessageText, InlineKeyboardMarkup, InputFile, InputFileReader, InputMedia, InputMediaError,
-    InputMediaPhoto, MediaGroup, MediaGroupError, MediaGroupItem, ParseMode, ReplyMarkup,
-    ReplyParameters, ReplyParametersError, SendAudio, SendChatAction, SendMediaGroup, SendMessage,
-    SendPhoto, SendSticker,
+    AnswerCallbackQuery, ChatAction, DeleteMessage, EditMessageCaption, EditMessageMedia,
+    EditMessageReplyMarkup, EditMessageText, InlineKeyboardMarkup, InputFile, InputFileReader,
+    InputMedia, InputMediaError, InputMediaPhoto, MediaGroup, MediaGroupError, MediaGroupItem,
+    ParseMode, ReplyMarkup, ReplyParameters, ReplyParametersError, SendAudio, SendChatAction,
+    SendMediaGroup, SendMessage, SendPhoto, SendSticker,
 };
 use crc::{CRC_32_ISCSI, Crc};
 use serde_json::{Map, Value, json};
@@ -148,6 +148,21 @@ pub struct ChatActionRequest {
     pub message_thread_id: i64,
     /// Telegram chat action string, such as `typing` or `upload_photo`.
     pub action: String,
+}
+
+/// Callback query answer fields used by Go `api.NewCallback*` call sites.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CallbackAnswerRequest {
+    /// Telegram callback query ID.
+    pub callback_query_id: String,
+    /// Optional notification text; Go omits empty values.
+    pub text: String,
+    /// Whether to show an alert; Go omits false values.
+    pub show_alert: bool,
+    /// Optional URL; Go omits empty values.
+    pub url: String,
+    /// Optional cache time in seconds; Go omits zero values.
+    pub cache_time: i64,
 }
 
 /// Delete request fields used by Go `api.NewDeleteMessage` call sites.
@@ -534,6 +549,24 @@ pub fn build_chat_action_method(
         method = method.with_message_thread_id(req.message_thread_id);
     }
     Ok(method)
+}
+
+/// Build an outbound `answerCallbackQuery` method.
+pub fn build_callback_answer_method(req: &CallbackAnswerRequest) -> AnswerCallbackQuery {
+    let mut method = AnswerCallbackQuery::new(req.callback_query_id.clone());
+    if !req.text.is_empty() {
+        method = method.with_text(req.text.clone());
+    }
+    if req.show_alert {
+        method = method.with_show_alert(true);
+    }
+    if !req.url.is_empty() {
+        method = method.with_url(req.url.clone());
+    }
+    if req.cache_time != 0 {
+        method = method.with_cache_time(req.cache_time);
+    }
+    method
 }
 
 /// Build an outbound `deleteMessage` method.
@@ -1240,20 +1273,21 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        AudioMessagePlan, AudioMessageRequest, AudioSource, ChatActionRequest, ChatRef,
-        DeleteMessageRequest, EditCaptionMessageRequest, EditMediaMessagePlan,
-        EditMediaMessageRequest, EditReplyMarkupMessageRequest, EditTextMessageRequest,
-        MESSAGE_TYPE_TEXT, MediaGroupMessagePlan, MediaGroupMessageRequest, MediaGroupPhotoItem,
-        MessageFingerprint, OutboundBuildError, PhotoMessagePlan, PhotoMessageRequest, PhotoSource,
-        ReplyMessageRef, ReplyParametersPlan, StickerMessagePlan, StickerMessageRequest,
-        TextMessageRequest, allow_sending_without_reply, build_audio_message_method,
-        build_audio_message_plan, build_chat_action_method, build_delete_message_method,
-        build_edit_caption_message_method, build_edit_media_message_method,
-        build_edit_media_message_plan, build_edit_reply_markup_message_method,
-        build_edit_text_message_method, build_media_group_message_method,
-        build_media_group_message_plan, build_photo_message_method, build_photo_message_plan,
-        build_sticker_message_method, build_sticker_message_plan, build_text_message_method,
-        build_text_message_methods, fingerprint_audio_message_plan, fingerprint_photo_message_plan,
+        AudioMessagePlan, AudioMessageRequest, AudioSource, CallbackAnswerRequest,
+        ChatActionRequest, ChatRef, DeleteMessageRequest, EditCaptionMessageRequest,
+        EditMediaMessagePlan, EditMediaMessageRequest, EditReplyMarkupMessageRequest,
+        EditTextMessageRequest, MESSAGE_TYPE_TEXT, MediaGroupMessagePlan, MediaGroupMessageRequest,
+        MediaGroupPhotoItem, MessageFingerprint, OutboundBuildError, PhotoMessagePlan,
+        PhotoMessageRequest, PhotoSource, ReplyMessageRef, ReplyParametersPlan, StickerMessagePlan,
+        StickerMessageRequest, TextMessageRequest, allow_sending_without_reply,
+        build_audio_message_method, build_audio_message_plan, build_callback_answer_method,
+        build_chat_action_method, build_delete_message_method, build_edit_caption_message_method,
+        build_edit_media_message_method, build_edit_media_message_plan,
+        build_edit_reply_markup_message_method, build_edit_text_message_method,
+        build_media_group_message_method, build_media_group_message_plan,
+        build_photo_message_method, build_photo_message_plan, build_sticker_message_method,
+        build_sticker_message_plan, build_text_message_method, build_text_message_methods,
+        fingerprint_audio_message_plan, fingerprint_photo_message_plan,
         fingerprint_sticker_message_plan, fingerprint_text_message_part, forum_thread_id,
         hash_content, message_target_chat, validate_text_message_text,
     };
@@ -2269,6 +2303,43 @@ mod tests {
                 "non_telegram_action".to_owned()
             )),
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn build_callback_answer_method_matches_go_callback_params()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ack = build_callback_answer_method(&CallbackAnswerRequest {
+            callback_query_id: "query-1".to_owned(),
+            text: String::new(),
+            show_alert: false,
+            url: String::new(),
+            cache_time: 0,
+        });
+        let ack_payload = serde_json::to_value(ack)?;
+        assert_eq!(ack_payload["callback_query_id"], json!("query-1"));
+        assert!(ack_payload.get("text").is_none());
+        assert!(ack_payload.get("show_alert").is_none());
+        assert!(ack_payload.get("url").is_none());
+        assert!(ack_payload.get("cache_time").is_none());
+
+        let alert = build_callback_answer_method(&CallbackAnswerRequest {
+            callback_query_id: "query-2".to_owned(),
+            text: "Генерация не найдена".to_owned(),
+            show_alert: true,
+            url: "https://example.invalid/plotva".to_owned(),
+            cache_time: 10,
+        });
+        let alert_payload = serde_json::to_value(alert)?;
+        assert_eq!(alert_payload["callback_query_id"], json!("query-2"));
+        assert_eq!(alert_payload["text"], json!("Генерация не найдена"));
+        assert_eq!(alert_payload["show_alert"], json!(true));
+        assert_eq!(
+            alert_payload["url"],
+            json!("https://example.invalid/plotva")
+        );
+        assert_eq!(alert_payload["cache_time"], json!(10));
 
         Ok(())
     }

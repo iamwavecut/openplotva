@@ -334,6 +334,7 @@ fn permission_error_media_flag(method_kind: TelegramOutboundMethodKind) -> Optio
         TelegramOutboundMethodKind::EditMessageCaption
         | TelegramOutboundMethodKind::EditMessageReplyMarkup
         | TelegramOutboundMethodKind::EditMessageMedia
+        | TelegramOutboundMethodKind::AnswerCallbackQuery
         | TelegramOutboundMethodKind::DeleteMessage => None,
     }
 }
@@ -500,6 +501,9 @@ mod tests {
         assert_eq!(
             dispatcher_required_actions(TelegramOutboundMethodKind::EditMessageText),
             &[ACTION_EDIT_MESSAGE]
+        );
+        assert!(
+            dispatcher_required_actions(TelegramOutboundMethodKind::AnswerCallbackQuery).is_empty()
         );
         assert!(dispatcher_required_actions(TelegramOutboundMethodKind::SendPhoto).is_empty());
     }
