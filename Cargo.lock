@@ -1624,6 +1624,7 @@ dependencies = [
  "redis",
  "serde",
  "serde_json",
+ "sha1",
  "thiserror",
  "time",
  "tokio",

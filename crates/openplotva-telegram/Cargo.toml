@@ -17,6 +17,7 @@ openplotva-updates = { path = "../openplotva-updates" }
 redis = { workspace = true, features = ["tokio-comp"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+sha1.workspace = true
 thiserror.workspace = true
 time = { workspace = true, features = ["formatting", "parsing"] }
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }

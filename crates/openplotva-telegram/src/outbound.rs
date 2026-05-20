@@ -14,11 +14,12 @@ use carapax::types::{
 };
 use crc::{CRC_32_ISCSI, Crc};
 use serde_json::{Map, Value, json};
+use sha1::{Digest, Sha1};
 use thiserror::Error;
 
 use crate::{
-    DispatcherPersistencePayload, TELEGRAM_PARSE_MODE_HTML, extract_visible_text,
-    split_telegram_text,
+    DispatcherPersistencePayload, TELEGRAM_PARSE_MODE_HTML, escape_telegram_html_text,
+    extract_visible_text, sanitize_telegram_html, split_telegram_text, strip_telegram_html,
 };
 
 /// Telegram text message limit used by the Go outbound server.
@@ -29,6 +30,18 @@ pub const MESSAGE_TYPE_TEXT: &str = "text";
 
 /// Button text used by Go settings WebApp keyboards.
 pub const SETTINGS_BUTTON_TEXT: &str = "⚙️ Настройки";
+
+/// Telegram inline message text limit used by Go guest answers.
+pub const GUEST_INLINE_TEXT_LIMIT: usize = 4096;
+
+/// Plain-text truncate limit used when sanitized guest HTML exceeds Telegram's inline limit.
+pub const GUEST_INLINE_TRUNCATE_LIMIT: usize = 3900;
+
+/// Payload used by Go guest add-to-chat links.
+pub const GUEST_ADD_TO_CHAT_PAYLOAD: &str = "guest";
+
+/// Fallback bot username used by Go guest helpers.
+pub const DEFAULT_GUEST_BOT_USERNAME: &str = "PlotvoBot";
 
 const MESSAGE_TYPE_STICKER: &str = "sticker";
 const MESSAGE_TYPE_PHOTO: &str = "photo";
@@ -209,6 +222,23 @@ pub struct GuestQueryAnswerRequest {
     pub guest_query_id: String,
     /// Inline result to send on behalf of the guest bot.
     pub result: InlineQueryResult,
+}
+
+/// HTML guest answer fields used by Go `Fetcher.answerGuestHTML`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GuestHtmlAnswerRequest {
+    /// Telegram guest query ID.
+    pub guest_query_id: String,
+    /// Source message ID used as a fallback result ID seed.
+    pub message_id: i64,
+    /// Inline article title.
+    pub title: String,
+    /// Candidate HTML answer text.
+    pub html_text: String,
+    /// Bot username used for fallback and add-to-chat links.
+    pub bot_username: String,
+    /// Optional inline keyboard markup attached to the article.
+    pub reply_markup: Option<InlineKeyboardMarkup>,
 }
 
 /// Delete request fields used by Go `api.NewDeleteMessage` call sites.
@@ -652,6 +682,131 @@ pub fn build_inline_query_answer_method(req: &InlineQueryAnswerRequest) -> Answe
 /// Build an outbound `answerGuestQuery` method.
 pub fn build_guest_query_answer_method(req: &GuestQueryAnswerRequest) -> AnswerGuestQuery {
     AnswerGuestQuery::new(req.guest_query_id.clone(), req.result.clone())
+}
+
+/// Prepare guest HTML with Go `prepareGuestHTML` semantics.
+#[must_use]
+pub fn prepare_guest_html(text: &str) -> String {
+    let sanitized = sanitize_telegram_html(text);
+    if strip_telegram_html(&sanitized).trim().is_empty() {
+        return String::new();
+    }
+    if sanitized.chars().count() <= GUEST_INLINE_TEXT_LIMIT {
+        return sanitized;
+    }
+
+    let plain = strip_telegram_html(&sanitized);
+    let truncated = if plain.chars().count() > GUEST_INLINE_TRUNCATE_LIMIT {
+        let mut text = plain
+            .chars()
+            .take(GUEST_INLINE_TRUNCATE_LIMIT)
+            .collect::<String>();
+        text.push_str("...");
+        text
+    } else {
+        plain
+    };
+    escape_telegram_html_text(&truncated)
+}
+
+/// Build Go `guestInlineDescription` from prepared guest HTML.
+#[must_use]
+pub fn guest_inline_description(html_text: &str) -> String {
+    let plain = strip_telegram_html(html_text);
+    if plain.chars().count() <= 120 {
+        return plain;
+    }
+    let mut description = plain.chars().take(117).collect::<String>();
+    description.push_str("...");
+    description
+}
+
+/// Build Go `guestInlineResultID` from optional guest query and message ID.
+#[must_use]
+pub fn guest_inline_result_id(guest_query_id: Option<&str>, message_id: i64) -> String {
+    let Some(query_id) = guest_query_id else {
+        return "guest".to_owned();
+    };
+    let mut base = query_id.trim().to_owned();
+    if base.is_empty() {
+        base = format!("message-{message_id}");
+    }
+    if base.len() <= 58 {
+        return format!("guest-{base}");
+    }
+    let digest = Sha1::digest(base.as_bytes());
+    let hash = format!("{digest:x}");
+    format!("guest-{}", &hash[..24])
+}
+
+/// Build Go `guestAddToChatURL`.
+#[must_use]
+pub fn guest_add_to_chat_url(bot_username: &str) -> String {
+    let username = bot_username.trim().trim_start_matches('@');
+    let username = if username.is_empty() {
+        DEFAULT_GUEST_BOT_USERNAME
+    } else {
+        username
+    };
+    format!("https://t.me/{username}?startgroup={GUEST_ADD_TO_CHAT_PAYLOAD}")
+}
+
+/// Build Go `guestUnsupportedFeatureHTML`.
+#[must_use]
+pub fn guest_unsupported_feature_html(bot_username: &str) -> String {
+    let add_url = guest_add_to_chat_url(bot_username);
+    format!(
+        "Некоторые функции Плотвы работают только в чате, куда её добавили: картинки, песни, настройки и длинные фоновые задачи.\n\n<a href=\"{add_url}\">Добавить Плотву в чат</a>"
+    )
+}
+
+/// Build Go `guestDialogFallbackHTML`.
+#[must_use]
+pub fn guest_dialog_fallback_html(bot_username: &str) -> String {
+    let add_url = guest_add_to_chat_url(bot_username);
+    format!(
+        "Не успела ответить в гостевом режиме. <a href=\"{add_url}\">Добавьте Плотву в чат</a>, если нужна длинная задача."
+    )
+}
+
+/// Build Go `guestAddToChatMarkup`.
+#[must_use]
+pub fn build_guest_add_to_chat_markup(bot_username: &str) -> InlineKeyboardMarkup {
+    build_inline_keyboard_markup([build_inline_keyboard_row([
+        build_inline_keyboard_button_url(
+            "Добавить Плотву в чат",
+            guest_add_to_chat_url(bot_username),
+        ),
+    ])])
+}
+
+/// Build Go `Fetcher.answerGuestHTML`'s direct `answerGuestQuery` method.
+#[must_use]
+pub fn build_guest_html_answer_method(req: &GuestHtmlAnswerRequest) -> Option<AnswerGuestQuery> {
+    let guest_query_id = req.guest_query_id.trim();
+    if guest_query_id.is_empty() {
+        return None;
+    }
+
+    let mut prepared = prepare_guest_html(&req.html_text);
+    if prepared.is_empty() {
+        prepared = prepare_guest_html(&guest_dialog_fallback_html(&req.bot_username));
+    }
+
+    let article = build_inline_query_result_article(&InlineArticleRequest {
+        id: guest_inline_result_id(Some(guest_query_id), req.message_id),
+        title: req.title.clone(),
+        message_text: prepared.clone(),
+        render_as: TELEGRAM_PARSE_MODE_HTML.to_owned(),
+        description: guest_inline_description(&prepared),
+        reply_markup: req.reply_markup.clone(),
+    })
+    .expect("Telegram HTML parse mode is supported");
+
+    Some(build_guest_query_answer_method(&GuestQueryAnswerRequest {
+        guest_query_id: guest_query_id.to_owned(),
+        result: article,
+    }))
 }
 
 /// Build a callback-data inline keyboard button matching Go `api.NewInlineKeyboardButtonData`.
@@ -1406,8 +1561,8 @@ mod tests {
         AudioMessagePlan, AudioMessageRequest, AudioSource, CallbackAnswerRequest,
         ChatActionRequest, ChatRef, DeleteMessageRequest, EditCaptionMessageRequest,
         EditMediaMessagePlan, EditMediaMessageRequest, EditReplyMarkupMessageRequest,
-        EditTextMessageRequest, GuestQueryAnswerRequest, InlineArticleRequest,
-        InlineQueryAnswerRequest, MESSAGE_TYPE_TEXT, MediaGroupMessagePlan,
+        EditTextMessageRequest, GuestHtmlAnswerRequest, GuestQueryAnswerRequest,
+        InlineArticleRequest, InlineQueryAnswerRequest, MESSAGE_TYPE_TEXT, MediaGroupMessagePlan,
         MediaGroupMessageRequest, MediaGroupPhotoItem, MessageFingerprint, OutboundBuildError,
         PhotoMessagePlan, PhotoMessageRequest, PhotoSource, ReplyMessageRef, ReplyParametersPlan,
         StickerMessagePlan, StickerMessageRequest, TextMessageRequest, allow_sending_without_reply,
@@ -1415,6 +1570,7 @@ mod tests {
         build_chat_action_method, build_delete_message_method, build_edit_caption_message_method,
         build_edit_media_message_method, build_edit_media_message_plan,
         build_edit_reply_markup_message_method, build_edit_text_message_method,
+        build_guest_add_to_chat_markup, build_guest_html_answer_method,
         build_guest_query_answer_method, build_inline_keyboard_button_data,
         build_inline_keyboard_button_url, build_inline_keyboard_button_web_app,
         build_inline_keyboard_markup, build_inline_keyboard_row, build_inline_query_answer_method,
@@ -1423,7 +1579,9 @@ mod tests {
         build_private_settings_keyboard, build_sticker_message_method, build_sticker_message_plan,
         build_text_message_method, build_text_message_methods, fingerprint_audio_message_plan,
         fingerprint_photo_message_plan, fingerprint_sticker_message_plan,
-        fingerprint_text_message_part, forum_thread_id, hash_content, message_target_chat,
+        fingerprint_text_message_part, forum_thread_id, guest_add_to_chat_url,
+        guest_dialog_fallback_html, guest_inline_description, guest_inline_result_id,
+        guest_unsupported_feature_html, hash_content, message_target_chat, prepare_guest_html,
         validate_text_message_text,
     };
     use crate::{
@@ -2577,6 +2735,149 @@ mod tests {
         assert_eq!(
             payload["result"]["reply_markup"]["inline_keyboard"][0][0]["callback_data"],
             json!("ok")
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn guest_html_preparation_matches_go_sanitizer_and_truncation() {
+        assert_eq!(
+            prepare_guest_html("<script>bad()</script><b>Готово</b>"),
+            "<b>Готово</b>"
+        );
+        assert_eq!(prepare_guest_html("<b>   </b>"), "");
+
+        let long = format!("<b>{}</b>", "ж".repeat(4100));
+        let prepared = prepare_guest_html(&long);
+        assert_eq!(prepared.chars().count(), 3903);
+        assert!(prepared.starts_with(&"ж".repeat(3900)));
+        assert!(prepared.ends_with("..."));
+        assert!(!prepared.contains("<b>"));
+    }
+
+    #[test]
+    fn guest_inline_description_and_ids_match_go_helpers() {
+        assert_eq!(
+            guest_inline_description("<b>Готово</b> &amp; спокойно"),
+            "Готово & спокойно"
+        );
+        let long_description = format!("{}{}", "а".repeat(120), "б");
+        assert_eq!(
+            guest_inline_description(&long_description),
+            format!("{}...", "а".repeat(117))
+        );
+
+        assert_eq!(guest_inline_result_id(None, 77), "guest");
+        assert_eq!(guest_inline_result_id(Some("   "), 77), "guest-message-77");
+        assert_eq!(
+            guest_inline_result_id(Some("short-query"), 77),
+            "guest-short-query"
+        );
+        assert_eq!(
+            guest_inline_result_id(
+                Some(
+                    "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz"
+                ),
+                77
+            ),
+            "guest-f2090afe4177d6f288072a47"
+        );
+    }
+
+    #[test]
+    fn guest_add_to_chat_helpers_match_go_text_and_markup() -> Result<(), Box<dyn std::error::Error>>
+    {
+        assert_eq!(
+            guest_add_to_chat_url("@PlotvoBot"),
+            "https://t.me/PlotvoBot?startgroup=guest"
+        );
+        assert_eq!(
+            guest_add_to_chat_url("  "),
+            "https://t.me/PlotvoBot?startgroup=guest"
+        );
+
+        let unsupported = guest_unsupported_feature_html("@PlotvoBot");
+        assert!(unsupported.contains("Некоторые функции Плотвы работают только в чате"));
+        assert!(unsupported.contains("https://t.me/PlotvoBot?startgroup=guest"));
+
+        let fallback = guest_dialog_fallback_html("PlotvoBot");
+        assert!(fallback.contains("Не успела ответить в гостевом режиме."));
+        assert!(fallback.contains("https://t.me/PlotvoBot?startgroup=guest"));
+
+        let markup = build_guest_add_to_chat_markup("@PlotvoBot");
+        let payload = serde_json::to_value(markup)?;
+        assert_eq!(
+            payload["inline_keyboard"][0][0]["text"],
+            json!("Добавить Плотву в чат")
+        );
+        assert_eq!(
+            payload["inline_keyboard"][0][0]["url"],
+            json!("https://t.me/PlotvoBot?startgroup=guest")
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn build_guest_html_answer_method_matches_go_answer_guest_html()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let method = build_guest_html_answer_method(&GuestHtmlAnswerRequest {
+            guest_query_id: "guest-query".to_owned(),
+            message_id: 55,
+            title: "Плотва отвечает".to_owned(),
+            html_text: "<script>bad()</script><b>Готово</b>".to_owned(),
+            bot_username: "@PlotvoBot".to_owned(),
+            reply_markup: Some(build_guest_add_to_chat_markup("@PlotvoBot")),
+        })
+        .expect("non-empty guest query id builds a method");
+        let payload = serde_json::to_value(method)?;
+
+        assert_eq!(payload["guest_query_id"], json!("guest-query"));
+        assert_eq!(payload["result"]["id"], json!("guest-guest-query"));
+        assert_eq!(payload["result"]["title"], json!("Плотва отвечает"));
+        assert_eq!(payload["result"]["description"], json!("Готово"));
+        assert_eq!(
+            payload["result"]["input_message_content"]["message_text"],
+            json!("<b>Готово</b>")
+        );
+        assert_eq!(
+            payload["result"]["input_message_content"]["parse_mode"],
+            json!("HTML")
+        );
+        assert_eq!(
+            payload["result"]["reply_markup"]["inline_keyboard"][0][0]["url"],
+            json!("https://t.me/PlotvoBot?startgroup=guest")
+        );
+
+        let fallback = build_guest_html_answer_method(&GuestHtmlAnswerRequest {
+            guest_query_id: "fallback-query".to_owned(),
+            message_id: 56,
+            title: "Плотва отвечает".to_owned(),
+            html_text: "<b>   </b>".to_owned(),
+            bot_username: "PlotvoBot".to_owned(),
+            reply_markup: None,
+        })
+        .expect("fallback still builds a method");
+        let fallback_payload = serde_json::to_value(fallback)?;
+        assert!(
+            fallback_payload["result"]["input_message_content"]["message_text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Не успела ответить в гостевом режиме.")
+        );
+        assert!(fallback_payload["result"].get("reply_markup").is_none());
+
+        assert!(
+            build_guest_html_answer_method(&GuestHtmlAnswerRequest {
+                guest_query_id: "  ".to_owned(),
+                message_id: 57,
+                title: "Плотва отвечает".to_owned(),
+                html_text: "Готово".to_owned(),
+                bot_username: "PlotvoBot".to_owned(),
+                reply_markup: None,
+            })
+            .is_none()
         );
 
         Ok(())
