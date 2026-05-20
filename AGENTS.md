@@ -15,7 +15,7 @@ Done means:
 
 - Rust app builds, runs, and passes contract checks against the frozen Go behavior.
 - No user-facing behavior changes exist unless recorded as approved deviations.
-- Contract means semantic/runtime compatibility, not byte-for-byte reproduction of Go internals.
+- Contract means semantic/runtime compatibility, not byte-for-byte reproduction of Go internals such as `encoding/gob` bitstreams.
 - The original Go repository remains unchanged.
 - README and developer docs are suitable for future open-source release.
 
