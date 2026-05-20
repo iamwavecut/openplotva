@@ -11,7 +11,7 @@ The repository is private while the implementation is in progress. The code and 
 - The Go repository is read-only reference material for this implementation.
 - The first runnable Rust shell exposes `/api/health` and `/api/ready`.
 - App startup enforces the Go reference snapshot by default and can optionally probe Postgres plus Redis/Dragonfly.
-- Current Telegram/payment/settings slices cover dispatcher/update-queue primitives, payment invoice/control-job paths, successful-payment VIP ledger writes, `/admin_grant_vip` admin-adjustment handling, `/admin_cancel_vip` revoke/refund handling, the private `/settings` WebApp button path, and group `/settings` control-job assignment/notice behavior behind injectable storage/effects.
+- Current Telegram/payment/settings slices cover dispatcher/update-queue primitives, payment invoice/control-job paths, successful-payment VIP ledger writes, `/admin_grant_vip` admin-adjustment handling, `/admin_cancel_vip` revoke/refund handling, the private `/settings` WebApp button path, and group `/settings` control-job assignment plus executor link/decline behavior behind injectable storage/effects.
 
 ## Local Setup
 

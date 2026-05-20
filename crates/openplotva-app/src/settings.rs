@@ -25,10 +25,23 @@ const GROUP_SETTINGS_WAIT_NOTICE_TEXT: &str = "⏳ Проверяю права �
 const SETTINGS_SAME_CHAT_DECLINE_TEXT: &str = "❌ Невозможно подтвердить права владельца чата при отправке от имени чата.\n\nДля доступа к настройкам отправьте команду от имени владельца чата (не анонимно).";
 const SETTINGS_CHANNEL_DECLINE_TEXT: &str = "❌ Сообщения от имени канала не могут быть проверены как владелец чата.\n\nДля доступа к настройкам отправьте команду от имени владельца чата (не анонимно).";
 const SETTINGS_QUEUE_ERROR_TEXT: &str = "❌ Не удалось поставить задачу в очередь.";
+const GROUP_SETTINGS_CHECK_FAILED_TEXT: &str = "❌ Не удалось проверить права. Попробуйте позже.";
+const GROUP_SETTINGS_PERMISSION_DENIED_TEXT: &str =
+    "❌ У вас нет прав для управления настройками этого чата.";
+const GROUP_SETTINGS_OPEN_PRIVATE_TEXT: &str =
+    "Откройте личный чат со мной, чтобы выбрать чат для настройки:";
+const GROUP_SETTINGS_OPEN_BUTTON_TEXT: &str = "⚙️ Открыть настройки";
 
 /// Boxed future returned by settings taskman assignment calls.
 pub type SettingsControlJobQueueFuture<'a, E> =
     Pin<Box<dyn Future<Output = Result<(), E>> + Send + 'a>>;
+
+/// Boxed future returned by group settings executor permission checks.
+pub type GroupSettingsControlJobFuture<'a, T, E> =
+    Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'a>>;
+
+/// Boxed future returned by Go `syncChatAdmins` equivalents.
+pub type GroupSettingsSyncFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
 /// Queue boundary for Go settings-owned taskman control jobs.
 pub trait SettingsControlJobQueue {
@@ -41,6 +54,22 @@ pub trait SettingsControlJobQueue {
         queue_name: &'static str,
         job: StatelessJobItem,
     ) -> SettingsControlJobQueueFuture<'a, Self::Error>;
+}
+
+/// Side-effect boundary for Go group settings control jobs.
+pub trait GroupSettingsControlJobEffects {
+    /// Error returned by permission checks.
+    type Error: fmt::Display + Send + Sync + 'static;
+
+    /// Check Go `canOpenGroupSettings`.
+    fn can_open_group_settings<'a>(
+        &'a self,
+        chat_id: i64,
+        user_id: i64,
+    ) -> GroupSettingsControlJobFuture<'a, bool, Self::Error>;
+
+    /// Run Go `syncChatAdmins`; it logs internally and does not affect the job result.
+    fn sync_chat_admins<'a>(&'a self, chat_id: i64) -> GroupSettingsSyncFuture<'a>;
 }
 
 /// Result of handling a decoded `/settings` update.
@@ -94,6 +123,21 @@ pub enum GroupSettingsCommandOutcome {
     QueueError(QueueTextReport),
     /// The control job was assigned and the wait notice was queued.
     Queued { notice: QueueTextReport },
+}
+
+/// Result of executing Go's group-settings control-job slice.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GroupSettingsControlJobOutcome {
+    /// The job was not the group-settings control kind.
+    UnsupportedKind(ControlKind),
+    /// Permission check failed; Go sends a retry-later notice and returns the check error.
+    PermissionCheckFailed(String),
+    /// The caller is not allowed to manage group settings.
+    PermissionDenied,
+    /// Go returns an error before sync/send when the bot username is unavailable.
+    BotUsernameMissing,
+    /// Admin sync ran and the settings deep-link notice was queued.
+    SentLink,
 }
 
 /// Handle Go's private `/settings` command path.
@@ -162,6 +206,84 @@ where
     .await?;
 
     Ok(SettingsCommandOutcome::Queued(report))
+}
+
+/// Execute Go's group-settings control-job behavior up to Telegram dispatch queueing.
+pub async fn execute_group_settings_control_job_at<S, Effects, NextId>(
+    store: &S,
+    dispatcher_queue: &DispatcherQueue,
+    effects: &Effects,
+    params: &ControlJobParams,
+    bot_username: &str,
+    next_virtual_id: NextId,
+) -> Result<GroupSettingsControlJobOutcome, OutboundBuildError>
+where
+    S: VirtualMessageStore + Sync,
+    Effects: GroupSettingsControlJobEffects + Sync,
+    NextId: FnMut() -> String,
+{
+    if params.data.kind != ControlKind::GroupSettings {
+        return Ok(GroupSettingsControlJobOutcome::UnsupportedKind(
+            params.data.kind,
+        ));
+    }
+
+    match effects
+        .can_open_group_settings(params.chat_id, params.user_id)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            queue_group_settings_control_text(
+                store,
+                dispatcher_queue,
+                params,
+                GROUP_SETTINGS_PERMISSION_DENIED_TEXT,
+                None,
+                true,
+                next_virtual_id,
+            )
+            .await?;
+            return Ok(GroupSettingsControlJobOutcome::PermissionDenied);
+        }
+        Err(error) => {
+            let error = error.to_string();
+            queue_group_settings_control_text(
+                store,
+                dispatcher_queue,
+                params,
+                GROUP_SETTINGS_CHECK_FAILED_TEXT,
+                None,
+                true,
+                next_virtual_id,
+            )
+            .await?;
+            return Ok(GroupSettingsControlJobOutcome::PermissionCheckFailed(error));
+        }
+    }
+
+    if bot_username.is_empty() {
+        return Ok(GroupSettingsControlJobOutcome::BotUsernameMissing);
+    }
+
+    effects.sync_chat_admins(params.chat_id).await;
+
+    let deep_link = format!("https://t.me/{bot_username}?start=settings");
+    let button = openplotva_telegram::build_inline_keyboard_button_url(
+        GROUP_SETTINGS_OPEN_BUTTON_TEXT,
+        &deep_link,
+    );
+    queue_group_settings_control_text(
+        store,
+        dispatcher_queue,
+        params,
+        GROUP_SETTINGS_OPEN_PRIVATE_TEXT,
+        Some(ReplyMarkup::from([[button]])),
+        true,
+        next_virtual_id,
+    )
+    .await?;
+    Ok(GroupSettingsControlJobOutcome::SentLink)
 }
 
 /// Build the Go taskman control job produced by group `/settings`.
@@ -389,6 +511,52 @@ where
     .await
 }
 
+async fn queue_group_settings_control_text<S, NextId>(
+    store: &S,
+    queue: &DispatcherQueue,
+    params: &ControlJobParams,
+    text: &str,
+    reply_markup: Option<ReplyMarkup>,
+    bypass_chat_restrictions: bool,
+    next_virtual_id: NextId,
+) -> Result<QueueTextReport, OutboundBuildError>
+where
+    S: VirtualMessageStore + Sync,
+    NextId: FnMut() -> String,
+{
+    let chat = ChatRef {
+        id: params.chat_id,
+        is_forum: false,
+    };
+    let request = TextMessageRequest {
+        chat: Some(chat),
+        message_thread_id: 0,
+        disable_notification: false,
+        allow_sending_without_reply: None,
+        text: text.to_owned(),
+        render_as: String::new(),
+        reply_markup,
+    };
+    let reply_to = ReplyMessageRef {
+        message_id: i64::from(params.message_id),
+        chat,
+        is_topic_message: false,
+        message_thread_id: 0,
+    };
+    queue_text_message_parts(
+        store,
+        queue,
+        QueueTextRequest {
+            message: &request,
+            reply_to: Some(&reply_to),
+            immediate_first: true,
+            bypass_chat_restrictions,
+        },
+        next_virtual_id,
+    )
+    .await
+}
+
 fn message_chat_ref(message: &TelegramMessage) -> ChatRef {
     ChatRef {
         id: message.chat.get_id().into(),
@@ -437,7 +605,8 @@ mod tests {
     use carapax::types::Update as TelegramUpdate;
     use openplotva_core::MessageIdMapping;
     use openplotva_taskman::{
-        CONTROL_QUEUE_NAME, ControlKind, HIGH_PRIORITY, JobType, StatelessJobItem,
+        CONTROL_QUEUE_NAME, ControlJobData, ControlJobParams, ControlKind, HIGH_PRIORITY, JobType,
+        StatelessJobItem,
     };
     use openplotva_telegram::{DispatcherConfig, DispatcherQueue, TelegramOutboundMethodKind};
     use serde_json::{Value, json};
@@ -448,8 +617,8 @@ mod tests {
     use super::{
         GroupSettingsCommandOutcome, GroupSettingsControlJobBuild, SettingsCommandOutcome,
         SettingsControlJobQueue, SettingsControlJobQueueFuture,
-        group_settings_control_job_from_update_at, handle_group_settings_command_update_at,
-        handle_private_settings_command_update,
+        execute_group_settings_control_job_at, group_settings_control_job_from_update_at,
+        handle_group_settings_command_update_at, handle_private_settings_command_update,
     };
 
     #[tokio::test]
@@ -747,6 +916,171 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn group_settings_executor_syncs_admins_and_sends_deep_link_when_allowed()
+    -> Result<(), Box<dyn Error>> {
+        let store = StoreStub::default();
+        let dispatcher = DispatcherQueue::new(DispatcherConfig::default());
+        let effects = GroupSettingsEffectsStub::allowing();
+        let params = group_settings_control_params();
+
+        let outcome = execute_group_settings_control_job_at(
+            &store,
+            &dispatcher,
+            &effects,
+            &params,
+            "PlotvaBot",
+            || "settings-link-v1".to_owned(),
+        )
+        .await?;
+
+        assert_eq!(outcome, super::GroupSettingsControlJobOutcome::SentLink);
+        assert_eq!(effects.permission_checks(), vec![(-10042, 42)]);
+        assert_eq!(effects.synced_admin_chats(), vec![-10042]);
+        assert_eq!(
+            store.inserted(),
+            vec![("settings-link-v1".to_owned(), -10042, None)]
+        );
+
+        let item = dispatcher
+            .dequeue_immediate()
+            .expect("settings deep-link should enqueue immediately");
+        assert!(item.bypasses_chat_restrictions());
+        let method = item.into_method().expect("queued settings deep-link");
+        let value = serde_json::to_value(method_as_value(method)?)?;
+
+        assert_eq!(value["chat_id"], json!(-10042));
+        assert_eq!(
+            value["text"],
+            json!("Откройте личный чат со мной, чтобы выбрать чат для настройки:")
+        );
+        assert_eq!(value["reply_parameters"]["message_id"], json!(78));
+        assert_eq!(value["reply_parameters"]["chat_id"], json!(-10042));
+        assert_eq!(
+            value["reply_parameters"]["allow_sending_without_reply"],
+            json!(true)
+        );
+        assert!(value.get("message_thread_id").is_none());
+        assert_eq!(
+            value["reply_markup"]["inline_keyboard"][0][0]["text"],
+            json!("⚙️ Открыть настройки")
+        );
+        assert_eq!(
+            value["reply_markup"]["inline_keyboard"][0][0]["url"],
+            json!("https://t.me/PlotvaBot?start=settings")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn group_settings_executor_sends_rights_decline_when_not_allowed()
+    -> Result<(), Box<dyn Error>> {
+        let store = StoreStub::default();
+        let dispatcher = DispatcherQueue::new(DispatcherConfig::default());
+        let effects = GroupSettingsEffectsStub::denying();
+        let params = group_settings_control_params();
+
+        let outcome = execute_group_settings_control_job_at(
+            &store,
+            &dispatcher,
+            &effects,
+            &params,
+            "PlotvaBot",
+            || "settings-denied-v1".to_owned(),
+        )
+        .await?;
+
+        assert_eq!(
+            outcome,
+            super::GroupSettingsControlJobOutcome::PermissionDenied
+        );
+        assert_eq!(effects.permission_checks(), vec![(-10042, 42)]);
+        assert!(effects.synced_admin_chats().is_empty());
+
+        let item = dispatcher
+            .dequeue_immediate()
+            .expect("settings rights decline should enqueue immediately");
+        assert!(item.bypasses_chat_restrictions());
+        let method = item.into_method().expect("queued settings rights decline");
+        let value = serde_json::to_value(method_as_value(method)?)?;
+        assert_eq!(
+            value["text"],
+            json!("❌ У вас нет прав для управления настройками этого чата.")
+        );
+        assert!(value.get("reply_markup").is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn group_settings_executor_sends_check_failure_and_reports_error()
+    -> Result<(), Box<dyn Error>> {
+        let store = StoreStub::default();
+        let dispatcher = DispatcherQueue::new(DispatcherConfig::default());
+        let effects = GroupSettingsEffectsStub::failing_permission_check();
+        let params = group_settings_control_params();
+
+        let outcome = execute_group_settings_control_job_at(
+            &store,
+            &dispatcher,
+            &effects,
+            &params,
+            "PlotvaBot",
+            || "settings-check-failed-v1".to_owned(),
+        )
+        .await?;
+
+        assert_eq!(
+            outcome,
+            super::GroupSettingsControlJobOutcome::PermissionCheckFailed(
+                "request failed".to_owned()
+            )
+        );
+        assert_eq!(effects.permission_checks(), vec![(-10042, 42)]);
+        assert!(effects.synced_admin_chats().is_empty());
+
+        let item = dispatcher
+            .dequeue_immediate()
+            .expect("settings permission-check failure should enqueue immediately");
+        assert!(item.bypasses_chat_restrictions());
+        let method = item.into_method().expect("queued settings check failure");
+        let value = serde_json::to_value(method_as_value(method)?)?;
+        assert_eq!(
+            value["text"],
+            json!("❌ Не удалось проверить права. Попробуйте позже.")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn group_settings_executor_rejects_blank_bot_username_before_sync_or_send()
+    -> Result<(), Box<dyn Error>> {
+        let store = StoreStub::default();
+        let dispatcher = DispatcherQueue::new(DispatcherConfig::default());
+        let effects = GroupSettingsEffectsStub::allowing();
+        let params = group_settings_control_params();
+
+        let outcome = execute_group_settings_control_job_at(
+            &store,
+            &dispatcher,
+            &effects,
+            &params,
+            "",
+            || "settings-link-v1".to_owned(),
+        )
+        .await?;
+
+        assert_eq!(
+            outcome,
+            super::GroupSettingsControlJobOutcome::BotUsernameMissing
+        );
+        assert_eq!(effects.permission_checks(), vec![(-10042, 42)]);
+        assert!(effects.synced_admin_chats().is_empty());
+        assert!(dispatcher.snapshot().immediate.is_empty());
+        assert!(store.inserted().is_empty());
+        Ok(())
+    }
+
     type RecordedVirtualInsert = (String, i64, Option<i32>);
 
     #[derive(Clone, Default)]
@@ -940,6 +1274,26 @@ mod tests {
         }))
     }
 
+    fn group_settings_control_params() -> ControlJobParams {
+        ControlJobParams {
+            chat_id: -10042,
+            message_id: 78,
+            user_id: 42,
+            user_full_name: "Ada Lovelace".to_owned(),
+            thread_id: Some(99),
+            data: ControlJobData {
+                kind: ControlKind::GroupSettings,
+                chat_type: "supergroup".to_owned(),
+                user_name: "ada_l".to_owned(),
+                first_name: "Ada".to_owned(),
+                last_name: "Lovelace".to_owned(),
+                language_code: "en".to_owned(),
+                is_premium: true,
+                ..ControlJobData::default()
+            },
+        }
+    }
+
     #[derive(Clone, Default)]
     struct SettingsControlJobQueueStub {
         state: Arc<Mutex<SettingsControlJobQueueState>>,
@@ -995,6 +1349,91 @@ mod tests {
     impl fmt::Display for StubError {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             f.write_str("request failed")
+        }
+    }
+
+    #[derive(Clone)]
+    struct GroupSettingsEffectsStub {
+        state: Arc<Mutex<GroupSettingsEffectsState>>,
+    }
+
+    #[derive(Default)]
+    struct GroupSettingsEffectsState {
+        allow: bool,
+        fail_permission_check: bool,
+        permission_checks: Vec<(i64, i64)>,
+        synced_admin_chats: Vec<i64>,
+    }
+
+    impl GroupSettingsEffectsStub {
+        fn allowing() -> Self {
+            Self::with_state(GroupSettingsEffectsState {
+                allow: true,
+                ..GroupSettingsEffectsState::default()
+            })
+        }
+
+        fn denying() -> Self {
+            Self::with_state(GroupSettingsEffectsState::default())
+        }
+
+        fn failing_permission_check() -> Self {
+            Self::with_state(GroupSettingsEffectsState {
+                fail_permission_check: true,
+                ..GroupSettingsEffectsState::default()
+            })
+        }
+
+        fn with_state(state: GroupSettingsEffectsState) -> Self {
+            Self {
+                state: Arc::new(Mutex::new(state)),
+            }
+        }
+
+        fn permission_checks(&self) -> Vec<(i64, i64)> {
+            self.state
+                .lock()
+                .expect("group settings effects state")
+                .permission_checks
+                .clone()
+        }
+
+        fn synced_admin_chats(&self) -> Vec<i64> {
+            self.state
+                .lock()
+                .expect("group settings effects state")
+                .synced_admin_chats
+                .clone()
+        }
+    }
+
+    impl super::GroupSettingsControlJobEffects for GroupSettingsEffectsStub {
+        type Error = StubError;
+
+        fn can_open_group_settings<'a>(
+            &'a self,
+            chat_id: i64,
+            user_id: i64,
+        ) -> super::GroupSettingsControlJobFuture<'a, bool, Self::Error> {
+            Box::pin(async move {
+                let mut state = self.state.lock().expect("group settings effects state");
+                state.permission_checks.push((chat_id, user_id));
+                if state.fail_permission_check {
+                    Err(StubError)
+                } else {
+                    Ok(state.allow)
+                }
+            })
+        }
+
+        fn sync_chat_admins<'a>(&'a self, chat_id: i64) -> super::GroupSettingsSyncFuture<'a> {
+            Box::pin(async move {
+                self.state
+                    .lock()
+                    .expect("group settings effects state")
+                    .synced_admin_chats
+                    .push(chat_id);
+            })
         }
     }
 }
