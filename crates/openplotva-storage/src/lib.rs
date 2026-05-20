@@ -84,6 +84,13 @@ pub const SQL_UPDATE_HISTORY_ENTRY_PAYLOAD: &str = "UPDATE chat_history_entries 
 pub const SQL_DELETE_HISTORY_MESSAGE_ENTRIES: &str =
     "DELETE FROM chat_history_entries WHERE chat_id = $1 AND message_id = $2";
 
+/// Go `ensure_chat_history_partition` call used before history entry upserts.
+pub const SQL_ENSURE_CHAT_HISTORY_PARTITION: &str =
+    "SELECT ensure_chat_history_partition($1::date)";
+
+/// Go `UpsertHistoryEntry` SQL with SQLC name/comment removed.
+pub const SQL_UPSERT_HISTORY_ENTRY: &str = "INSERT INTO chat_history_entries (bucket_day, chat_id, thread_id, message_id, entry_id, kind, role, occurred_at, sender_id, payload) VALUES ($1::date, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb) ON CONFLICT (bucket_day, chat_id, entry_id) DO UPDATE SET thread_id = EXCLUDED.thread_id, message_id = EXCLUDED.message_id, kind = EXCLUDED.kind, role = EXCLUDED.role, occurred_at = EXCLUDED.occurred_at, sender_id = EXCLUDED.sender_id, payload = EXCLUDED.payload, updated_at = CURRENT_TIMESTAMP";
+
 /// Go Redis key prefix for persisted rate-limited chat expiry timestamps.
 pub const RATE_LIMITED_CHAT_KEY_PREFIX: &str = "plotva:rate_limited_chat:";
 
@@ -476,6 +483,31 @@ pub struct PostgresHistoryStore {
     redis: Option<RedisClient>,
 }
 
+/// Go `UpsertHistoryEntryParams` row shape for chat-history persistence.
+#[derive(Clone, Copy, Debug)]
+pub struct HistoryEntryUpsert<'payload> {
+    /// UTC bucket day partition.
+    pub bucket_day: time::Date,
+    /// Telegram chat ID.
+    pub chat_id: i64,
+    /// Telegram thread/topic ID.
+    pub thread_id: i32,
+    /// Telegram message ID.
+    pub message_id: i32,
+    /// Stable history entry ID, such as `msg:123`.
+    pub entry_id: &'payload str,
+    /// History message kind.
+    pub kind: &'payload str,
+    /// Dialog role.
+    pub role: &'payload str,
+    /// Message timestamp.
+    pub occurred_at: OffsetDateTime,
+    /// Sender ID.
+    pub sender_id: i64,
+    /// Serialized Go-shaped `MessageEntry` JSON payload.
+    pub payload: &'payload [u8],
+}
+
 impl PostgresHistoryStore {
     /// Build a history store on an existing Postgres pool.
     pub fn new(pool: PgPool) -> Self {
@@ -491,6 +523,34 @@ impl PostgresHistoryStore {
     /// Access the underlying Postgres pool.
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// Ensure the daily partition and upsert one Go-shaped history entry row.
+    pub async fn upsert_history_entry(
+        &self,
+        entry: HistoryEntryUpsert<'_>,
+    ) -> Result<(), StorageError> {
+        sqlx::query(SQL_ENSURE_CHAT_HISTORY_PARTITION)
+            .bind(entry.bucket_day)
+            .execute(&self.pool)
+            .await?;
+
+        sqlx::query(SQL_UPSERT_HISTORY_ENTRY)
+            .bind(entry.bucket_day)
+            .bind(entry.chat_id)
+            .bind(entry.thread_id)
+            .bind(entry.message_id)
+            .bind(entry.entry_id)
+            .bind(entry.kind)
+            .bind(entry.role)
+            .bind(entry.occurred_at)
+            .bind(entry.sender_id)
+            .bind(entry.payload)
+            .execute(&self.pool)
+            .await?;
+
+        self.invalidate_history_cache(entry.chat_id).await?;
+        Ok(())
     }
 
     /// Update the stored text payload for one Go chat-history message entry.
@@ -1014,6 +1074,18 @@ mod tests {
     }
 
     #[test]
+    fn history_upsert_storage_contract_matches_go_service() {
+        assert_eq!(
+            super::SQL_UPSERT_HISTORY_ENTRY,
+            "INSERT INTO chat_history_entries (bucket_day, chat_id, thread_id, message_id, entry_id, kind, role, occurred_at, sender_id, payload) VALUES ($1::date, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb) ON CONFLICT (bucket_day, chat_id, entry_id) DO UPDATE SET thread_id = EXCLUDED.thread_id, message_id = EXCLUDED.message_id, kind = EXCLUDED.kind, role = EXCLUDED.role, occurred_at = EXCLUDED.occurred_at, sender_id = EXCLUDED.sender_id, payload = EXCLUDED.payload, updated_at = CURRENT_TIMESTAMP"
+        );
+        assert_eq!(
+            super::SQL_ENSURE_CHAT_HISTORY_PARTITION,
+            "SELECT ensure_chat_history_partition($1::date)"
+        );
+    }
+
+    #[test]
     fn user_and_chat_state_sql_matches_go_query_contracts() {
         let _user = openplotva_core::UserState {
             id: 500,
@@ -1186,17 +1258,20 @@ mod tests {
         let _ = store.delete_message_entries(chat_id, message_id).await;
 
         let result: Result<(), Box<dyn Error>> = async {
-            sqlx::query(
-                "INSERT INTO chat_history_entries (bucket_day, chat_id, thread_id, message_id, entry_id, kind, role, occurred_at, sender_id, payload) VALUES ($1, $2, 0, $3, $4, 'text', 'user', $5, 100, $6::jsonb)",
-            )
-            .bind(bucket_day)
-            .bind(chat_id)
-            .bind(message_id)
-            .bind(&entry_id)
-            .bind(occurred_at)
-            .bind(&payload)
-            .execute(&pool)
-            .await?;
+            store
+                .upsert_history_entry(super::HistoryEntryUpsert {
+                    bucket_day,
+                    chat_id,
+                    thread_id: 0,
+                    message_id,
+                    entry_id: &entry_id,
+                    kind: "text",
+                    role: "user",
+                    occurred_at,
+                    sender_id: 100,
+                    payload: payload.as_bytes(),
+                })
+                .await?;
 
             assert!(store
                 .update_text_entry(chat_id, message_id, "new text")
