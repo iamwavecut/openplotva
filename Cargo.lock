@@ -1520,6 +1520,7 @@ dependencies = [
  "openplotva-taskman",
  "openplotva-telegram",
  "openplotva-updates",
+ "openplotva-web",
  "reqwest",
  "serde",
  "serde_json",

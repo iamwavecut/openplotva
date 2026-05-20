@@ -4,6 +4,7 @@ pub mod payments;
 pub mod pending_ops;
 pub mod permissions;
 pub mod rate_limits;
+pub mod settings;
 mod reference_snapshot;
 pub mod updates;
 pub mod virtual_messages;

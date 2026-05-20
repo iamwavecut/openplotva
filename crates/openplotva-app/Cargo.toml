@@ -19,6 +19,7 @@ openplotva-storage = { path = "../openplotva-storage" }
 openplotva-taskman = { path = "../openplotva-taskman" }
 openplotva-telegram = { path = "../openplotva-telegram" }
 openplotva-updates = { path = "../openplotva-updates" }
+openplotva-web = { path = "../openplotva-web" }
 reqwest.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
