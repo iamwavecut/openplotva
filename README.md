@@ -139,7 +139,8 @@ Rust-native serde payloads. Current cases: Telegram updates use zstd-compressed
 serde JSON envelopes over `carapax::types::Update`; dispatcher shutdown
 snapshots store persistent-item JSON directly; persisted chat rate-limit
 expiries use JSON timestamp values under the original
-`plotva:rate_limited_chat:*` keys.
+`plotva:rate_limited_chat:*` keys. Tests for these surfaces should assert
+decoded values and lifecycle behavior rather than gob bytes.
 
 ## Migrations
 
