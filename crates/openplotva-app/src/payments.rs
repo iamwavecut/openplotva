@@ -12,6 +12,7 @@ use openplotva_storage::{
     VipEventCreate, VipEventRecord,
 };
 use openplotva_taskman::ControlJobParams;
+use thiserror::Error;
 use time::OffsetDateTime;
 
 /// Boxed future returned by payment storage calls.
@@ -151,6 +152,17 @@ pub struct InvoiceControlJobReport {
     pub outcome: InvoiceControlJobOutcome,
     /// Displayable side-effect error, if the outcome represents a failure.
     pub error: Option<String>,
+}
+
+/// Concrete Telegram invoice-effect failure.
+#[derive(Debug, Error)]
+pub enum TelegramPaymentInvoiceEffectError {
+    /// A trusted app-level invoice message could not be converted into a Telegram method.
+    #[error("failed to build Telegram invoice message: {0}")]
+    Build(#[from] openplotva_telegram::OutboundBuildError),
+    /// Telegram rejected or failed a direct Bot API request.
+    #[error("failed to execute Telegram invoice request: {0}")]
+    Execute(#[from] carapax::api::ExecuteError),
 }
 
 impl SuccessfulPaymentReport {
@@ -310,6 +322,120 @@ impl PreCheckoutPaymentEffects for openplotva_telegram::TelegramClient {
             .map(|_: bool| ())
         })
     }
+}
+
+impl PaymentInvoiceEffects for openplotva_telegram::TelegramClient {
+    type Error = TelegramPaymentInvoiceEffectError;
+
+    fn create_subscription_invoice_link<'a>(
+        &'a self,
+        request: &'a openplotva_telegram::SubscriptionInvoiceLinkRequest,
+    ) -> PaymentInvoiceLinkFuture<'a, Self::Error> {
+        Box::pin(async move {
+            self.execute(openplotva_telegram::build_subscription_invoice_link_method(
+                request,
+            ))
+            .await
+            .map_err(TelegramPaymentInvoiceEffectError::from)
+        })
+    }
+
+    fn create_donation_invoice_link<'a>(
+        &'a self,
+        request: &'a openplotva_telegram::DonationInvoiceLinkRequest,
+    ) -> PaymentInvoiceLinkFuture<'a, Self::Error> {
+        Box::pin(async move {
+            self.execute(openplotva_telegram::build_donation_invoice_link_method(
+                request,
+            ))
+            .await
+            .map_err(TelegramPaymentInvoiceEffectError::from)
+        })
+    }
+
+    fn send_invoice_button_message<'a>(
+        &'a self,
+        message: InvoiceButtonMessage,
+    ) -> PaymentEffectsFuture<'a, Self::Error> {
+        Box::pin(async move {
+            let method = invoice_button_send_message_method(&message)?;
+            let _message: carapax::types::Message = self.execute(method).await?;
+            Ok(())
+        })
+    }
+
+    fn send_invoice_error_text<'a>(
+        &'a self,
+        chat_id: i64,
+        reply_to_message_id: i32,
+        text: &'a str,
+        parse_mode: &'a str,
+    ) -> PaymentEffectsFuture<'a, Self::Error> {
+        Box::pin(async move {
+            let methods = invoice_error_text_send_message_methods(
+                chat_id,
+                reply_to_message_id,
+                text,
+                parse_mode,
+            )?;
+            for method in methods {
+                let _message: carapax::types::Message = self.execute(method).await?;
+            }
+            Ok(())
+        })
+    }
+}
+
+/// Build the direct `sendMessage` used for Go invoice button messages.
+pub fn invoice_button_send_message_method(
+    message: &InvoiceButtonMessage,
+) -> Result<openplotva_telegram::SendMessage, openplotva_telegram::OutboundBuildError> {
+    openplotva_telegram::validate_text_message_text(&message.text, &message.parse_mode)?;
+    let chat = openplotva_telegram::ChatRef {
+        id: message.chat_id,
+        is_forum: false,
+    };
+    let button =
+        openplotva_telegram::build_inline_keyboard_button_url(&message.button_text, &message.url);
+    let reply_markup = openplotva_telegram::ReplyMarkup::from([[button]]);
+    let req = openplotva_telegram::TextMessageRequest {
+        chat: Some(chat),
+        message_thread_id: 0,
+        disable_notification: false,
+        allow_sending_without_reply: None,
+        text: message.text.clone(),
+        render_as: message.parse_mode.clone(),
+        reply_markup: Some(reply_markup),
+    };
+    openplotva_telegram::build_text_message_method(&req, chat, None, message.text.clone(), true)
+}
+
+fn invoice_error_text_send_message_methods(
+    chat_id: i64,
+    reply_to_message_id: i32,
+    text: &str,
+    parse_mode: &str,
+) -> Result<Vec<openplotva_telegram::SendMessage>, openplotva_telegram::OutboundBuildError> {
+    let chat = openplotva_telegram::ChatRef {
+        id: chat_id,
+        is_forum: false,
+    };
+    let req = openplotva_telegram::TextMessageRequest {
+        chat: Some(chat),
+        message_thread_id: 0,
+        disable_notification: false,
+        allow_sending_without_reply: None,
+        text: text.to_owned(),
+        render_as: parse_mode.to_owned(),
+        reply_markup: None,
+    };
+    let reply_to = openplotva_telegram::ReplyMessageRef {
+        message_id: i64::from(reply_to_message_id),
+        chat,
+        is_topic_message: false,
+        message_thread_id: 0,
+    };
+    openplotva_telegram::build_text_message_methods(&req, Some(&reply_to))
 }
 
 /// Execute Go `executeVIPInvoiceControlJob`.
@@ -953,9 +1079,9 @@ mod tests {
         SuccessfulPaymentEffects, SuccessfulPaymentMessage, SuccessfulPaymentOutcome,
         SuccessfulPaymentStore, SuccessfulPaymentUpdateRoute, execute_donate_invoice_control_job,
         execute_vip_invoice_control_job, handle_pre_checkout_update_or_else,
-        handle_successful_payment_update_or_else_at, process_successful_payment_at,
-        subscription_invoice_message_text, subscription_success_text,
-        successful_payment_message_from_update,
+        handle_successful_payment_update_or_else_at, invoice_button_send_message_method,
+        process_successful_payment_at, subscription_invoice_message_text,
+        subscription_success_text, successful_payment_message_from_update,
     };
 
     #[tokio::test]
@@ -1496,6 +1622,43 @@ mod tests {
         );
         assert!(effects.invoice_error_texts().is_empty());
         Ok(())
+    }
+
+    #[test]
+    fn invoice_button_send_message_method_matches_go_direct_chattable_payload()
+    -> Result<(), Box<dyn Error>> {
+        let method = invoice_button_send_message_method(&InvoiceButtonMessage {
+            chat_id: 1000,
+            text: expected_subscription_invoice_message_text(),
+            button_text: "💎 Оформить VIP подписку".to_owned(),
+            url: "https://t.me/invoice-vip".to_owned(),
+            parse_mode: "HTML".to_owned(),
+        })?;
+
+        let payload = serde_json::to_value(method)?;
+        assert_eq!(payload["chat_id"], json!(1000));
+        assert_eq!(
+            payload["text"],
+            json!(expected_subscription_invoice_message_text())
+        );
+        assert_eq!(payload["parse_mode"], json!("HTML"));
+        assert!(payload.get("reply_parameters").is_none());
+        assert_eq!(
+            payload["reply_markup"]["inline_keyboard"][0][0]["text"],
+            json!("💎 Оформить VIP подписку")
+        );
+        assert_eq!(
+            payload["reply_markup"]["inline_keyboard"][0][0]["url"],
+            json!("https://t.me/invoice-vip")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn telegram_client_implements_payment_invoice_effects() {
+        fn assert_impl<T: PaymentInvoiceEffects>() {}
+
+        assert_impl::<openplotva_telegram::TelegramClient>();
     }
 
     fn sample_message(payload: &str, total_amount: i64) -> SuccessfulPaymentMessage {
