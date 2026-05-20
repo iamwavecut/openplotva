@@ -2,7 +2,10 @@ use std::{
     fmt,
     future::Future,
     pin::Pin,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -31,6 +34,10 @@ pub type PaymentStoreFuture<'a, T, E> = Pin<Box<dyn Future<Output = Result<T, E>
 
 /// Boxed future returned by payment side-effect calls.
 pub type PaymentEffectsFuture<'a, E> = Pin<Box<dyn Future<Output = Result<(), E>> + Send + 'a>>;
+
+/// Boxed future returned by VIP cache invalidation calls.
+pub type VipCacheInvalidationFuture<'a, E> =
+    Pin<Box<dyn Future<Output = Result<(), E>> + Send + 'a>>;
 
 /// Boxed future returned by direct pre-checkout acknowledgement calls.
 pub type PreCheckoutFuture<'a, E> = Pin<Box<dyn Future<Output = Result<(), E>> + Send + 'a>>;
@@ -76,6 +83,19 @@ pub struct SuccessfulPaymentMessage {
     pub user: UserState,
     /// Payment payload reported by Telegram.
     pub payment: SuccessfulPayment,
+}
+
+/// User-visible text sent by the Go successful-payment path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PaymentTextMessage<'value> {
+    /// Telegram chat ID.
+    pub chat_id: i64,
+    /// Telegram message ID used as the response anchor.
+    pub reply_to_message_id: i32,
+    /// Message text.
+    pub text: &'value str,
+    /// Go parse mode string.
+    pub parse_mode: &'value str,
 }
 
 /// Payment processing result class.
@@ -356,6 +376,17 @@ pub enum TelegramPaymentInvoiceEffectError {
     Execute(#[from] carapax::api::ExecuteError),
 }
 
+/// Concrete successful-payment dispatch failure.
+#[derive(Debug, Error)]
+pub enum SuccessfulPaymentDispatchEffectError {
+    /// A payment text message could not be converted into dispatcher work.
+    #[error("failed to queue successful-payment text: {0}")]
+    Queue(#[from] openplotva_telegram::OutboundBuildError),
+    /// VIP cache invalidation failed.
+    #[error("failed to invalidate VIP cache: {0}")]
+    VipCache(String),
+}
+
 impl SuccessfulPaymentReport {
     fn new(outcome: SuccessfulPaymentOutcome) -> Self {
         Self {
@@ -528,13 +559,38 @@ pub trait SuccessfulPaymentEffects {
     /// Send a user-facing text response. Go ignores send failures here.
     fn send_text<'a>(
         &'a self,
-        chat_id: i64,
-        reply_to_message_id: i32,
-        text: &'a str,
+        message: PaymentTextMessage<'a>,
     ) -> PaymentEffectsFuture<'a, Self::Error>;
 
     /// Invalidate cached VIP status after subscription activation.
     fn invalidate_vip_cache<'a>(&'a self, user_id: i64) -> PaymentEffectsFuture<'a, Self::Error>;
+}
+
+/// Side-effect boundary for the Go in-memory VIP cache.
+pub trait VipCacheInvalidator {
+    /// Error returned by the concrete cache implementation.
+    type Error: fmt::Display + Send + Sync + 'static;
+
+    /// Invalidate one user-specific Go VIP cache key.
+    fn invalidate_vip_cache<'a>(
+        &'a self,
+        user_id: i64,
+    ) -> VipCacheInvalidationFuture<'a, Self::Error>;
+}
+
+/// Placeholder invalidator for runtime slices that do not yet carry Go's server main cache.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoopVipCacheInvalidator;
+
+impl VipCacheInvalidator for NoopVipCacheInvalidator {
+    type Error = std::convert::Infallible;
+
+    fn invalidate_vip_cache<'a>(
+        &'a self,
+        _user_id: i64,
+    ) -> VipCacheInvalidationFuture<'a, Self::Error> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 /// Side-effect boundary for Go `processPreCheckoutQuery`.
@@ -949,6 +1005,109 @@ impl VipStatusEffects for openplotva_telegram::TelegramClient {
             Ok(())
         })
     }
+}
+
+/// Generator for virtual-message IDs used by successful-payment text replies.
+pub type PaymentVirtualIdFactory = Arc<dyn Fn() -> String + Send + Sync>;
+
+/// Dispatcher-backed side effects for Go successful-payment processing.
+#[derive(Clone)]
+pub struct SuccessfulPaymentDispatcherEffects<Store, Invalidator = NoopVipCacheInvalidator> {
+    store: Store,
+    queue: Arc<openplotva_telegram::DispatcherQueue>,
+    invalidator: Invalidator,
+    next_virtual_id: PaymentVirtualIdFactory,
+}
+
+impl<Store, Invalidator> SuccessfulPaymentDispatcherEffects<Store, Invalidator> {
+    /// Build successful-payment effects backed by the normal outbound dispatcher.
+    pub fn new(
+        store: Store,
+        queue: Arc<openplotva_telegram::DispatcherQueue>,
+        invalidator: Invalidator,
+    ) -> Self {
+        Self {
+            store,
+            queue,
+            invalidator,
+            next_virtual_id: monotonic_payment_virtual_id_factory(),
+        }
+    }
+
+    /// Override virtual-message ID generation for deterministic tests.
+    #[must_use]
+    pub fn with_virtual_id_factory(mut self, next_virtual_id: PaymentVirtualIdFactory) -> Self {
+        self.next_virtual_id = next_virtual_id;
+        self
+    }
+}
+
+impl<Store, Invalidator> SuccessfulPaymentEffects
+    for SuccessfulPaymentDispatcherEffects<Store, Invalidator>
+where
+    Store: crate::virtual_messages::VirtualMessageStore + Send + Sync,
+    Invalidator: VipCacheInvalidator + Send + Sync,
+{
+    type Error = SuccessfulPaymentDispatchEffectError;
+
+    fn send_text<'a>(
+        &'a self,
+        message: PaymentTextMessage<'a>,
+    ) -> PaymentEffectsFuture<'a, Self::Error> {
+        Box::pin(async move {
+            let chat = openplotva_telegram::ChatRef {
+                id: message.chat_id,
+                is_forum: false,
+            };
+            let request = openplotva_telegram::TextMessageRequest {
+                chat: Some(chat),
+                message_thread_id: 0,
+                disable_notification: false,
+                allow_sending_without_reply: None,
+                text: message.text.to_owned(),
+                render_as: message.parse_mode.to_owned(),
+                reply_markup: None,
+            };
+            let reply_to = openplotva_telegram::ReplyMessageRef {
+                message_id: i64::from(message.reply_to_message_id),
+                chat,
+                is_topic_message: false,
+                message_thread_id: 0,
+            };
+            crate::virtual_messages::queue_text_message_parts(
+                &self.store,
+                &self.queue,
+                crate::virtual_messages::QueueTextRequest {
+                    message: &request,
+                    reply_to: Some(&reply_to),
+                    immediate_first: false,
+                    bypass_chat_restrictions: false,
+                },
+                || (self.next_virtual_id)(),
+            )
+            .await?;
+            Ok(())
+        })
+    }
+
+    fn invalidate_vip_cache<'a>(&'a self, user_id: i64) -> PaymentEffectsFuture<'a, Self::Error> {
+        Box::pin(async move {
+            self.invalidator
+                .invalidate_vip_cache(user_id)
+                .await
+                .map_err(|error| SuccessfulPaymentDispatchEffectError::VipCache(error.to_string()))
+        })
+    }
+}
+
+fn monotonic_payment_virtual_id_factory() -> PaymentVirtualIdFactory {
+    let next_id = Arc::new(AtomicU64::new(1));
+    let process_id = std::process::id();
+    let started_at = OffsetDateTime::now_utc().unix_timestamp_nanos();
+    Arc::new(move || {
+        let id = next_id.fetch_add(1, Ordering::Relaxed);
+        format!("payment-vmsg-{process_id:x}-{started_at:x}-{id:x}")
+    })
 }
 
 /// Build the direct `sendMessage` used for Go invoice button messages.
@@ -2626,14 +2785,26 @@ where
                 Ok(Some(subscription)) => subscription,
                 Ok(None) => {
                     let error = "duplicate subscription was not found by Telegram charge ID";
-                    send_payment_text(effects, message, SUBSCRIPTION_DETAILS_ERROR_TEXT).await;
+                    send_payment_text(
+                        effects,
+                        message,
+                        SUBSCRIPTION_DETAILS_ERROR_TEXT,
+                        openplotva_telegram::TELEGRAM_PARSE_MODE_HTML,
+                    )
+                    .await;
                     return SuccessfulPaymentReport::with_error(
                         SuccessfulPaymentOutcome::SubscriptionStorageError,
                         error,
                     );
                 }
                 Err(error) => {
-                    send_payment_text(effects, message, SUBSCRIPTION_DETAILS_ERROR_TEXT).await;
+                    send_payment_text(
+                        effects,
+                        message,
+                        SUBSCRIPTION_DETAILS_ERROR_TEXT,
+                        openplotva_telegram::TELEGRAM_PARSE_MODE_HTML,
+                    )
+                    .await;
                     return SuccessfulPaymentReport::with_error(
                         SuccessfulPaymentOutcome::SubscriptionStorageError,
                         error,
@@ -2642,7 +2813,13 @@ where
             }
         }
         Err(error) => {
-            send_payment_text(effects, message, SUBSCRIPTION_SAVE_ERROR_TEXT).await;
+            send_payment_text(
+                effects,
+                message,
+                SUBSCRIPTION_SAVE_ERROR_TEXT,
+                openplotva_telegram::TELEGRAM_PARSE_MODE_HTML,
+            )
+            .await;
             return SuccessfulPaymentReport::with_error(
                 SuccessfulPaymentOutcome::SubscriptionStorageError,
                 error,
@@ -2664,7 +2841,13 @@ where
     {
         Ok(event) => event,
         Err(error) => {
-            send_payment_text(effects, message, SUBSCRIPTION_LEDGER_ERROR_TEXT).await;
+            send_payment_text(
+                effects,
+                message,
+                SUBSCRIPTION_LEDGER_ERROR_TEXT,
+                openplotva_telegram::TELEGRAM_PARSE_MODE_HTML,
+            )
+            .await;
             return SuccessfulPaymentReport::with_error(
                 SuccessfulPaymentOutcome::SubscriptionLedgerError,
                 error,
@@ -2676,6 +2859,7 @@ where
         effects,
         message,
         &subscription_success_text(event.effective_expires_at),
+        "",
     )
     .await;
     let _ = effects.invalidate_vip_cache(message.user.id).await;
@@ -2712,14 +2896,26 @@ where
                 Ok(Some(donation)) => donation,
                 Ok(None) => {
                     let error = "duplicate donation was not found by Telegram charge ID";
-                    send_payment_text(effects, message, DONATION_DETAILS_ERROR_TEXT).await;
+                    send_payment_text(
+                        effects,
+                        message,
+                        DONATION_DETAILS_ERROR_TEXT,
+                        openplotva_telegram::TELEGRAM_PARSE_MODE_HTML,
+                    )
+                    .await;
                     return SuccessfulPaymentReport::with_error(
                         SuccessfulPaymentOutcome::DonationStorageError,
                         error,
                     );
                 }
                 Err(error) => {
-                    send_payment_text(effects, message, DONATION_DETAILS_ERROR_TEXT).await;
+                    send_payment_text(
+                        effects,
+                        message,
+                        DONATION_DETAILS_ERROR_TEXT,
+                        openplotva_telegram::TELEGRAM_PARSE_MODE_HTML,
+                    )
+                    .await;
                     return SuccessfulPaymentReport::with_error(
                         SuccessfulPaymentOutcome::DonationStorageError,
                         error,
@@ -2728,7 +2924,13 @@ where
             }
         }
         Err(error) => {
-            send_payment_text(effects, message, DONATION_SAVE_ERROR_TEXT).await;
+            send_payment_text(
+                effects,
+                message,
+                DONATION_SAVE_ERROR_TEXT,
+                openplotva_telegram::TELEGRAM_PARSE_MODE_HTML,
+            )
+            .await;
             return SuccessfulPaymentReport::with_error(
                 SuccessfulPaymentOutcome::DonationStorageError,
                 error,
@@ -2740,6 +2942,7 @@ where
         effects,
         message,
         &donation_success_text(donation.amount_stars),
+        "",
     )
     .await;
     if duplicate_donation {
@@ -2760,11 +2963,17 @@ async fn send_payment_text<Effects>(
     effects: &Effects,
     message: &SuccessfulPaymentMessage,
     text: &str,
+    parse_mode: &str,
 ) where
     Effects: SuccessfulPaymentEffects + Sync,
 {
     let _ = effects
-        .send_text(message.chat_id, message.message_id, text)
+        .send_text(PaymentTextMessage {
+            chat_id: message.chat_id,
+            reply_to_message_id: message.message_id,
+            text,
+            parse_mode,
+        })
         .await;
 }
 
@@ -2888,7 +3097,11 @@ mod tests {
     use std::{
         collections::VecDeque,
         error::Error,
-        fmt, io,
+        fmt,
+        future::Future,
+        io,
+        pin::Pin,
+        sync::atomic::{AtomicU64, Ordering},
         sync::{Arc, Mutex, MutexGuard},
     };
 
@@ -2911,11 +3124,12 @@ mod tests {
         PaymentControlJobQueue, PaymentControlJobQueueFuture, PaymentControlJobReport,
         PaymentControlJobWorkItem, PaymentControlJobWorkerFuture, PaymentControlJobWorkerQueue,
         PaymentEffectsFuture, PaymentInvoiceCommandUpdateRoute, PaymentInvoiceControlJobBuild,
-        PaymentInvoiceEffects, PaymentInvoiceLinkFuture, PaymentStoreFuture, PaymentUpdateHandler,
-        PaymentUpdateRoute, PreCheckoutOutcome, PreCheckoutPaymentEffects, PreCheckoutUpdateRoute,
-        SuccessfulPayment, SuccessfulPaymentControlJobUpdateRoute, SuccessfulPaymentEffects,
-        SuccessfulPaymentMessage, SuccessfulPaymentOutcome, SuccessfulPaymentStore,
-        SuccessfulPaymentUpdateRoute, enqueue_payment_invoice_command_update_or_else_at,
+        PaymentInvoiceEffects, PaymentInvoiceLinkFuture, PaymentStoreFuture, PaymentTextMessage,
+        PaymentUpdateHandler, PaymentUpdateRoute, PreCheckoutOutcome, PreCheckoutPaymentEffects,
+        PreCheckoutUpdateRoute, SuccessfulPayment, SuccessfulPaymentControlJobUpdateRoute,
+        SuccessfulPaymentDispatcherEffects, SuccessfulPaymentEffects, SuccessfulPaymentMessage,
+        SuccessfulPaymentOutcome, SuccessfulPaymentStore, SuccessfulPaymentUpdateRoute,
+        enqueue_payment_invoice_command_update_or_else_at,
         enqueue_payment_invoice_command_update_with_vip_status_or_else_at,
         enqueue_successful_payment_update_or_else_at, execute_donate_invoice_control_job,
         execute_payment_control_job_at, execute_vip_invoice_control_job,
@@ -3095,6 +3309,39 @@ mod tests {
             vec![subscription_success_text(expires_at)]
         );
         assert_eq!(effects.invalidated_vip_users(), vec![42]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn subscription_payment_save_error_sends_go_html_error_text() -> Result<(), Box<dyn Error>>
+    {
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let store = StoreStub::new().with_next_subscription_error(StubError::Request);
+        let effects = EffectsStub::default();
+
+        let report = process_successful_payment_at(
+            &store,
+            &effects,
+            &sample_message("subscription_42", 300),
+            now,
+        )
+        .await;
+
+        assert_eq!(
+            report.outcome,
+            SuccessfulPaymentOutcome::SubscriptionStorageError
+        );
+        assert_eq!(
+            effects.sent_payment_texts(),
+            vec![SentPaymentText {
+                chat_id: 42,
+                reply_to_message_id: 100,
+                text: super::SUBSCRIPTION_SAVE_ERROR_TEXT.to_owned(),
+                parse_mode: openplotva_telegram::TELEGRAM_PARSE_MODE_HTML.to_owned(),
+            }]
+        );
+        assert!(store.vip_events().is_empty());
+        assert!(effects.invalidated_vip_users().is_empty());
         Ok(())
     }
 
@@ -3945,6 +4192,73 @@ mod tests {
         assert_eq!(assigned[0].0, CONTROL_QUEUE_NAME);
         assert_eq!(assigned[0].1.title, "vip invoice");
         assert!(effects.answered_pre_checkout_queries().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn successful_payment_dispatcher_effects_queue_text_reply_and_invalidate_vip_cache()
+    -> Result<(), Box<dyn Error>> {
+        let store = VirtualMessageStoreStub::default();
+        let queue = Arc::new(openplotva_telegram::DispatcherQueue::new(
+            openplotva_telegram::DispatcherConfig::default(),
+        ));
+        let invalidator = VipCacheInvalidatorStub::default();
+        let next_id = Arc::new(AtomicU64::new(1));
+        let effects = SuccessfulPaymentDispatcherEffects::new(
+            store.clone(),
+            Arc::clone(&queue),
+            invalidator.clone(),
+        )
+        .with_virtual_id_factory({
+            let next_id = Arc::clone(&next_id);
+            Arc::new(move || format!("payment-vmsg-{}", next_id.fetch_add(1, Ordering::Relaxed)))
+        });
+
+        effects
+            .send_text(PaymentTextMessage {
+                chat_id: 42,
+                reply_to_message_id: 100,
+                text: "hello <b>VIP</b>",
+                parse_mode: openplotva_telegram::TELEGRAM_PARSE_MODE_HTML,
+            })
+            .await?;
+        effects.invalidate_vip_cache(42).await?;
+
+        assert_eq!(
+            store.inserted(),
+            vec![("payment-vmsg-1".to_owned(), 42, None)]
+        );
+        assert_eq!(invalidator.invalidated_users(), vec![42]);
+
+        let snapshot = queue.snapshot();
+        assert!(snapshot.immediate.is_empty());
+        assert_eq!(snapshot.regular.len(), 1);
+        assert_eq!(snapshot.regular[0].chat_id, 42);
+        assert_eq!(snapshot.regular[0].virtual_id, "payment-vmsg-1");
+
+        let item = queue.dequeue_regular().expect("queued payment text");
+        assert_eq!(
+            item.method_kind(),
+            Some(openplotva_telegram::TelegramOutboundMethodKind::SendMessage)
+        );
+        let (_metadata, method) = item.into_parts();
+        let method = match method.expect("queued Telegram method") {
+            openplotva_telegram::TelegramOutboundMethod::SendMessage(method) => method,
+            other => panic!("unexpected payment text method: {other:?}"),
+        };
+        let payload = serde_json::to_value(method)?;
+        assert_eq!(payload["chat_id"], json!(42));
+        assert_eq!(payload["text"], json!("hello <b>VIP</b>"));
+        assert_eq!(
+            payload["parse_mode"],
+            json!(openplotva_telegram::TELEGRAM_PARSE_MODE_HTML)
+        );
+        assert_eq!(payload["reply_parameters"]["message_id"], json!(100));
+        assert_eq!(payload["reply_parameters"]["chat_id"], json!(42));
+        assert_eq!(
+            payload["reply_parameters"]["allow_sending_without_reply"],
+            json!(true)
+        );
         Ok(())
     }
 
@@ -5426,13 +5740,130 @@ mod tests {
     }
 
     #[derive(Clone, Default)]
+    struct VirtualMessageStoreStub {
+        state: Arc<Mutex<VirtualMessageStoreState>>,
+    }
+
+    #[derive(Default)]
+    struct VirtualMessageStoreState {
+        inserted: Vec<(String, i64, Option<i32>)>,
+    }
+
+    impl VirtualMessageStoreStub {
+        fn inserted(&self) -> Vec<(String, i64, Option<i32>)> {
+            self.state
+                .lock()
+                .expect("virtual message store state")
+                .inserted
+                .clone()
+        }
+    }
+
+    impl crate::virtual_messages::VirtualMessageStore for VirtualMessageStoreStub {
+        type Error = StubError;
+
+        fn get_mapping_by_virtual<'a>(
+            &'a self,
+            _vmsg_id: String,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<Option<openplotva_core::MessageIdMapping>, Self::Error>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn insert_virtual_message<'a>(
+            &'a self,
+            vmsg_id: String,
+            chat_id: i64,
+            thread_id: Option<i32>,
+        ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
+            Box::pin(async move {
+                self.state
+                    .lock()
+                    .expect("virtual message store state")
+                    .inserted
+                    .push((vmsg_id, chat_id, thread_id));
+                Ok(())
+            })
+        }
+
+        fn resolve_virtual_message<'a>(
+            &'a self,
+            _vmsg_id: String,
+            _real_message_id: i32,
+        ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn enqueue_message_op<'a>(
+            &'a self,
+            _vmsg_id: String,
+            _chat_id: i64,
+            _op: &'static str,
+            _payload_json: Option<String>,
+        ) -> Pin<Box<dyn Future<Output = Result<i64, Self::Error>> + Send + 'a>> {
+            Box::pin(async { Ok(1) })
+        }
+
+        fn delete_mapping_by_virtual<'a>(
+            &'a self,
+            _vmsg_id: String,
+        ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct VipCacheInvalidatorStub {
+        invalidated_users: Arc<Mutex<Vec<i64>>>,
+    }
+
+    impl VipCacheInvalidatorStub {
+        fn invalidated_users(&self) -> Vec<i64> {
+            self.invalidated_users
+                .lock()
+                .expect("invalidated users")
+                .clone()
+        }
+    }
+
+    impl super::VipCacheInvalidator for VipCacheInvalidatorStub {
+        type Error = StubError;
+
+        fn invalidate_vip_cache<'a>(
+            &'a self,
+            user_id: i64,
+        ) -> super::VipCacheInvalidationFuture<'a, Self::Error> {
+            Box::pin(async move {
+                self.invalidated_users
+                    .lock()
+                    .expect("invalidated users")
+                    .push(user_id);
+                Ok(())
+            })
+        }
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct SentPaymentText {
+        chat_id: i64,
+        reply_to_message_id: i32,
+        text: String,
+        parse_mode: String,
+    }
+
+    #[derive(Clone, Default)]
     struct EffectsStub {
         state: Arc<Mutex<EffectsState>>,
     }
 
     #[derive(Default)]
     struct EffectsState {
-        sent_texts: Vec<String>,
+        sent_texts: Vec<SentPaymentText>,
         invalidated_vip_users: Vec<i64>,
         answered_pre_checkout_queries: Vec<String>,
         next_pre_checkout_error: Option<StubError>,
@@ -5459,6 +5890,14 @@ mod tests {
         }
 
         fn sent_texts(&self) -> Vec<String> {
+            self.lock()
+                .sent_texts
+                .iter()
+                .map(|message| message.text.clone())
+                .collect()
+        }
+
+        fn sent_payment_texts(&self) -> Vec<SentPaymentText> {
             self.lock().sent_texts.clone()
         }
 
@@ -5506,12 +5945,15 @@ mod tests {
 
         fn send_text<'a>(
             &'a self,
-            _chat_id: i64,
-            _reply_to_message_id: i32,
-            text: &'a str,
+            message: PaymentTextMessage<'a>,
         ) -> PaymentEffectsFuture<'a, Self::Error> {
             Box::pin(async move {
-                self.lock().sent_texts.push(text.to_owned());
+                self.lock().sent_texts.push(SentPaymentText {
+                    chat_id: message.chat_id,
+                    reply_to_message_id: message.reply_to_message_id,
+                    text: message.text.to_owned(),
+                    parse_mode: message.parse_mode.to_owned(),
+                });
                 Ok(())
             })
         }
