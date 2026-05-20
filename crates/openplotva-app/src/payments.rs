@@ -1,5 +1,10 @@
 use std::{fmt, future::Future, pin::Pin};
 
+use carapax::types::{
+    Message as TelegramMessage, MessageData as TelegramMessageData,
+    SuccessfulPayment as TelegramSuccessfulPayment, Update as TelegramUpdate,
+    UpdateType as TelegramUpdateType, User as TelegramUser,
+};
 use openplotva_core::{UserState, VIP_EVENT_TYPE_PAYMENT, vip_days_to_seconds};
 use openplotva_storage::{
     DonationCreate, DonationRecord, PostgresPaymentStore, PostgresVipStore,
@@ -72,6 +77,15 @@ pub struct SuccessfulPaymentReport {
     pub outcome: SuccessfulPaymentOutcome,
     /// Displayable storage/side-effect error, if the outcome represents a failure.
     pub error: Option<String>,
+}
+
+/// Routing result for a decoded Telegram update passed through the payment-aware wrapper.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SuccessfulPaymentUpdateRoute {
+    /// A Go successful-payment service message was processed.
+    Processed(SuccessfulPaymentOutcome),
+    /// The update was not a successful-payment service message and was delegated.
+    Delegated,
 }
 
 impl SuccessfulPaymentReport {
@@ -262,6 +276,82 @@ where
             SuccessfulPaymentReport::new(SuccessfulPaymentOutcome::UnknownPayload)
         }
     }
+}
+
+/// Extract Go successful-payment message context from a decoded Telegram update.
+#[must_use]
+pub fn successful_payment_message_from_update(
+    update: &TelegramUpdate,
+) -> Option<SuccessfulPaymentMessage> {
+    let TelegramUpdateType::Message(message) = &update.update_type else {
+        return None;
+    };
+    successful_payment_message_from_message(message)
+}
+
+fn successful_payment_message_from_message(
+    message: &TelegramMessage,
+) -> Option<SuccessfulPaymentMessage> {
+    let TelegramMessageData::SuccessfulPayment(payment) = &message.data else {
+        return None;
+    };
+    let user = message.sender.get_user()?;
+    Some(SuccessfulPaymentMessage {
+        chat_id: message.chat.get_id().into(),
+        message_id: i32::try_from(message.id).ok()?,
+        user: user_state_from_telegram_user(user),
+        payment: successful_payment_from_telegram(payment),
+    })
+}
+
+fn user_state_from_telegram_user(user: &TelegramUser) -> UserState {
+    UserState::new(
+        user.id.into(),
+        user.first_name.clone(),
+        user.last_name.clone(),
+        user.username.as_ref().map(ToString::to_string),
+        user.language_code.clone(),
+        user.is_premium,
+    )
+}
+
+fn successful_payment_from_telegram(payment: &TelegramSuccessfulPayment) -> SuccessfulPayment {
+    SuccessfulPayment {
+        currency: payment.currency.clone(),
+        total_amount: payment.total_amount,
+        invoice_payload: payment.invoice_payload.clone(),
+        telegram_payment_charge_id: payment.telegram_payment_charge_id.clone(),
+        provider_payment_charge_id: payment.provider_payment_charge_id.clone(),
+    }
+}
+
+/// Handle only successful-payment updates and delegate all other updates to the caller.
+pub async fn handle_successful_payment_update_or_else_at<
+    Store,
+    Effects,
+    HandleFn,
+    HandleFuture,
+    HandleError,
+>(
+    store: &Store,
+    effects: &Effects,
+    update: TelegramUpdate,
+    now: OffsetDateTime,
+    handle_other: HandleFn,
+) -> Result<SuccessfulPaymentUpdateRoute, HandleError>
+where
+    Store: SuccessfulPaymentStore + Sync,
+    Effects: SuccessfulPaymentEffects + Sync,
+    HandleFn: FnOnce(TelegramUpdate) -> HandleFuture,
+    HandleFuture: Future<Output = Result<(), HandleError>>,
+{
+    let Some(message) = successful_payment_message_from_update(&update) else {
+        handle_other(update).await?;
+        return Ok(SuccessfulPaymentUpdateRoute::Delegated);
+    };
+
+    let report = process_successful_payment_at(store, effects, &message, now).await;
+    Ok(SuccessfulPaymentUpdateRoute::Processed(report.outcome))
 }
 
 async fn process_subscription_payment<Store, Effects>(
@@ -510,17 +600,21 @@ mod tests {
         sync::{Arc, Mutex, MutexGuard},
     };
 
+    use carapax::types::Update as TelegramUpdate;
     use openplotva_core::{UserState, VIP_EVENT_TYPE_PAYMENT, vip_days_to_seconds};
     use openplotva_storage::{
         DonationCreate, DonationRecord, SubscriptionCreate, SubscriptionRecord, VipEventCreate,
         VipEventRecord,
     };
+    use serde_json::json;
     use time::OffsetDateTime;
 
     use super::{
         PaymentEffectsFuture, PaymentStoreFuture, SuccessfulPayment, SuccessfulPaymentEffects,
         SuccessfulPaymentMessage, SuccessfulPaymentOutcome, SuccessfulPaymentStore,
+        SuccessfulPaymentUpdateRoute, handle_successful_payment_update_or_else_at,
         process_successful_payment_at, subscription_success_text,
+        successful_payment_message_from_update,
     };
 
     #[tokio::test]
@@ -730,6 +824,132 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn successful_payment_message_from_update_extracts_go_message_context()
+    -> Result<(), Box<dyn Error>> {
+        let message = successful_payment_message_from_update(&sample_successful_payment_update(
+            "subscription_42",
+            300,
+        )?)
+        .expect("successful payment should be extracted");
+
+        assert_eq!(message.chat_id, 42);
+        assert_eq!(message.message_id, 100);
+        assert_eq!(
+            message.user,
+            UserState::new(
+                42,
+                "Alice",
+                Some("Smith".to_owned()),
+                Some("alice".to_owned()),
+                Some("en".to_owned()),
+                Some(true),
+            )
+        );
+        assert_eq!(message.payment.currency, "XTR");
+        assert_eq!(message.payment.total_amount, 300);
+        assert_eq!(message.payment.invoice_payload, "subscription_42");
+        assert_eq!(
+            message.payment.telegram_payment_charge_id,
+            "telegram-charge"
+        );
+        assert_eq!(
+            message.payment.provider_payment_charge_id,
+            "provider-charge"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn successful_payment_update_wrapper_processes_payment_without_fallback()
+    -> Result<(), Box<dyn Error>> {
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let expires_at = now + time::Duration::days(30);
+        let store = StoreStub::new().with_next_vip_event(VipEventRecord {
+            id: 77,
+            user_id: 42,
+            event_type: VIP_EVENT_TYPE_PAYMENT.to_owned(),
+            delta_seconds: vip_days_to_seconds(30),
+            effective_expires_at: expires_at,
+            subscription_id: Some(10),
+            actor_user_id: None,
+            reason: "payment telegram-charge".to_owned(),
+            created_at: now,
+        });
+        let effects = EffectsStub::default();
+        let fallback_calls = Arc::new(Mutex::new(Vec::new()));
+        let fallback_calls_for_handle = Arc::clone(&fallback_calls);
+
+        let route = handle_successful_payment_update_or_else_at(
+            &store,
+            &effects,
+            sample_successful_payment_update("subscription_42", 300)?,
+            now,
+            move |update| {
+                let fallback_calls = Arc::clone(&fallback_calls_for_handle);
+                async move {
+                    fallback_calls
+                        .lock()
+                        .map_err(|err| std::io::Error::other(err.to_string()))?
+                        .push(update.id);
+                    Ok::<(), std::io::Error>(())
+                }
+            },
+        )
+        .await?;
+
+        assert_eq!(
+            route,
+            SuccessfulPaymentUpdateRoute::Processed(
+                SuccessfulPaymentOutcome::SubscriptionProcessed
+            )
+        );
+        assert!(fallback_calls.lock().expect("fallback calls").is_empty());
+        assert_eq!(
+            effects.sent_texts(),
+            vec![subscription_success_text(expires_at)]
+        );
+        assert_eq!(effects.invalidated_vip_users(), vec![42]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn successful_payment_update_wrapper_delegates_non_payment_messages()
+    -> Result<(), Box<dyn Error>> {
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let store = StoreStub::new();
+        let effects = EffectsStub::default();
+        let fallback_calls = Arc::new(Mutex::new(Vec::new()));
+        let fallback_calls_for_handle = Arc::clone(&fallback_calls);
+
+        let route = handle_successful_payment_update_or_else_at(
+            &store,
+            &effects,
+            sample_text_update()?,
+            now,
+            move |update| {
+                let fallback_calls = Arc::clone(&fallback_calls_for_handle);
+                async move {
+                    fallback_calls
+                        .lock()
+                        .map_err(|err| std::io::Error::other(err.to_string()))?
+                        .push(update.id);
+                    Ok::<(), std::io::Error>(())
+                }
+            },
+        )
+        .await?;
+
+        assert_eq!(route, SuccessfulPaymentUpdateRoute::Delegated);
+        assert_eq!(
+            fallback_calls.lock().expect("fallback calls").as_slice(),
+            &[999]
+        );
+        assert!(store.users().is_empty());
+        assert!(effects.sent_texts().is_empty());
+        Ok(())
+    }
+
     fn sample_message(payload: &str, total_amount: i64) -> SuccessfulPaymentMessage {
         SuccessfulPaymentMessage {
             chat_id: 42,
@@ -750,6 +970,64 @@ mod tests {
                 provider_payment_charge_id: "provider-charge".to_owned(),
             },
         }
+    }
+
+    fn sample_successful_payment_update(
+        payload: &str,
+        total_amount: i64,
+    ) -> Result<TelegramUpdate, serde_json::Error> {
+        serde_json::from_value(json!({
+            "update_id": 999,
+            "message": {
+                "message_id": 100,
+                "date": 1_710_000_000,
+                "chat": {
+                    "id": 42,
+                    "type": "private",
+                    "first_name": "Alice",
+                    "username": "alice"
+                },
+                "from": {
+                    "id": 42,
+                    "is_bot": false,
+                    "first_name": "Alice",
+                    "last_name": "Smith",
+                    "username": "alice",
+                    "language_code": "en",
+                    "is_premium": true
+                },
+                "successful_payment": {
+                    "currency": "XTR",
+                    "total_amount": total_amount,
+                    "invoice_payload": payload,
+                    "telegram_payment_charge_id": "telegram-charge",
+                    "provider_payment_charge_id": "provider-charge"
+                }
+            }
+        }))
+    }
+
+    fn sample_text_update() -> Result<TelegramUpdate, serde_json::Error> {
+        serde_json::from_value(json!({
+            "update_id": 999,
+            "message": {
+                "message_id": 100,
+                "date": 1_710_000_000,
+                "chat": {
+                    "id": 42,
+                    "type": "private",
+                    "first_name": "Alice",
+                    "username": "alice"
+                },
+                "from": {
+                    "id": 42,
+                    "is_bot": false,
+                    "first_name": "Alice",
+                    "username": "alice"
+                },
+                "text": "hello"
+            }
+        }))
     }
 
     #[derive(Clone, Default)]
