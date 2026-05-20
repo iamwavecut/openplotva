@@ -6,10 +6,11 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use carapax::types::{
     AnswerCallbackQuery, AnswerGuestQuery, AnswerInlineQuery, ChatAction, DeleteMessage,
     EditMessageCaption, EditMessageMedia, EditMessageReplyMarkup, EditMessageText,
-    InlineKeyboardMarkup, InlineQueryResult, InlineQueryResultArticle, InputFile, InputFileReader,
-    InputMedia, InputMediaError, InputMediaPhoto, InputMessageContentText, MediaGroup,
-    MediaGroupError, MediaGroupItem, ParseMode, ReplyMarkup, ReplyParameters, ReplyParametersError,
-    SendAudio, SendChatAction, SendMediaGroup, SendMessage, SendPhoto, SendSticker,
+    InlineKeyboardButton, InlineKeyboardMarkup, InlineQueryResult, InlineQueryResultArticle,
+    InputFile, InputFileReader, InputMedia, InputMediaError, InputMediaPhoto,
+    InputMessageContentText, MediaGroup, MediaGroupError, MediaGroupItem, ParseMode, ReplyMarkup,
+    ReplyParameters, ReplyParametersError, SendAudio, SendChatAction, SendMediaGroup, SendMessage,
+    SendPhoto, SendSticker,
 };
 use crc::{CRC_32_ISCSI, Crc};
 use serde_json::{Map, Value, json};
@@ -648,6 +649,36 @@ pub fn build_inline_query_answer_method(req: &InlineQueryAnswerRequest) -> Answe
 /// Build an outbound `answerGuestQuery` method.
 pub fn build_guest_query_answer_method(req: &GuestQueryAnswerRequest) -> AnswerGuestQuery {
     AnswerGuestQuery::new(req.guest_query_id.clone(), req.result.clone())
+}
+
+/// Build a callback-data inline keyboard button matching Go `api.NewInlineKeyboardButtonData`.
+pub fn build_inline_keyboard_button_data(
+    text: impl Into<String>,
+    data: impl Into<String>,
+) -> InlineKeyboardButton {
+    InlineKeyboardButton::for_callback_data(text, data)
+}
+
+/// Build a URL inline keyboard button matching Go `api.NewInlineKeyboardButtonURL`.
+pub fn build_inline_keyboard_button_url(
+    text: impl Into<String>,
+    url: impl Into<String>,
+) -> InlineKeyboardButton {
+    InlineKeyboardButton::for_url(text, url)
+}
+
+/// Build an inline keyboard row matching Go `api.NewInlineKeyboardRow`.
+pub fn build_inline_keyboard_row(
+    buttons: impl IntoIterator<Item = InlineKeyboardButton>,
+) -> Vec<InlineKeyboardButton> {
+    buttons.into_iter().collect()
+}
+
+/// Build an inline keyboard markup matching Go `api.NewInlineKeyboardMarkup`.
+pub fn build_inline_keyboard_markup(
+    rows: impl IntoIterator<Item = impl IntoIterator<Item = InlineKeyboardButton>>,
+) -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::from(rows)
 }
 
 /// Build an outbound `deleteMessage` method.
@@ -1366,11 +1397,13 @@ mod tests {
         build_chat_action_method, build_delete_message_method, build_edit_caption_message_method,
         build_edit_media_message_method, build_edit_media_message_plan,
         build_edit_reply_markup_message_method, build_edit_text_message_method,
-        build_guest_query_answer_method, build_inline_query_answer_method,
-        build_inline_query_result_article, build_media_group_message_method,
-        build_media_group_message_plan, build_photo_message_method, build_photo_message_plan,
-        build_sticker_message_method, build_sticker_message_plan, build_text_message_method,
-        build_text_message_methods, fingerprint_audio_message_plan, fingerprint_photo_message_plan,
+        build_guest_query_answer_method, build_inline_keyboard_button_data,
+        build_inline_keyboard_button_url, build_inline_keyboard_markup, build_inline_keyboard_row,
+        build_inline_query_answer_method, build_inline_query_result_article,
+        build_media_group_message_method, build_media_group_message_plan,
+        build_photo_message_method, build_photo_message_plan, build_sticker_message_method,
+        build_sticker_message_plan, build_text_message_method, build_text_message_methods,
+        fingerprint_audio_message_plan, fingerprint_photo_message_plan,
         fingerprint_sticker_message_plan, fingerprint_text_message_part, forum_thread_id,
         hash_content, message_target_chat, validate_text_message_text,
     };
@@ -2525,6 +2558,61 @@ mod tests {
         assert_eq!(
             payload["result"]["reply_markup"]["inline_keyboard"][0][0]["callback_data"],
             json!("ok")
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn build_inline_keyboard_helpers_match_go_constructor_payloads()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let delete_button = build_inline_keyboard_button_data("🗑 Удалить текст", "dl_i:22:-100");
+        let url_button =
+            build_inline_keyboard_button_url("📖 Помощь", "https://t.me/PlotvoBot?start=help");
+        let row = build_inline_keyboard_row([delete_button.clone(), url_button.clone()]);
+        let markup = build_inline_keyboard_markup([row]);
+        let payload = serde_json::to_value(markup)?;
+
+        assert_eq!(
+            payload["inline_keyboard"][0][0]["text"],
+            json!("🗑 Удалить текст")
+        );
+        assert_eq!(
+            payload["inline_keyboard"][0][0]["callback_data"],
+            json!("dl_i:22:-100")
+        );
+        assert_eq!(payload["inline_keyboard"][0][1]["text"], json!("📖 Помощь"));
+        assert_eq!(
+            payload["inline_keyboard"][0][1]["url"],
+            json!("https://t.me/PlotvoBot?start=help")
+        );
+        assert!(payload["inline_keyboard"][0][0].get("url").is_none());
+        assert!(
+            payload["inline_keyboard"][0][1]
+                .get("callback_data")
+                .is_none()
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn build_inline_keyboard_helpers_preserve_empty_and_copied_rows()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let empty_payload = serde_json::to_value(build_inline_keyboard_markup(Vec::<
+            Vec<InlineKeyboardButton>,
+        >::new()))?;
+        assert_eq!(empty_payload["inline_keyboard"], json!([]));
+
+        let source = [build_inline_keyboard_button_data("Да", "confirm")];
+        let copied = build_inline_keyboard_row(source.iter().cloned());
+        let markup = build_inline_keyboard_markup([copied]);
+        let payload = serde_json::to_value(markup)?;
+
+        assert_eq!(payload["inline_keyboard"][0][0]["text"], json!("Да"));
+        assert_eq!(
+            payload["inline_keyboard"][0][0]["callback_data"],
+            json!("confirm")
         );
 
         Ok(())
