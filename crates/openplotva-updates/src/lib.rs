@@ -1034,6 +1034,50 @@ pub fn compose_image_prompt(prompt: &str, meta: &ChatMessageMeta) -> String {
     parts.join("\n\n")
 }
 
+/// Return whether Go would continue handling an addressed message from this sender.
+#[must_use]
+pub fn should_handle_addressed_message(
+    message: Option<&TelegramMessage>,
+    sender: &MessageSender,
+    bot_id: i64,
+) -> bool {
+    if !sender.is_bot {
+        return true;
+    }
+
+    let Some(message) = message else {
+        return false;
+    };
+    if message.id == 0 || bot_id == 0 {
+        return false;
+    }
+
+    let Some(TelegramReplyTo::Message(reply)) = message.reply_to.as_ref() else {
+        return false;
+    };
+    let Some(reply_user) = reply.sender.get_user() else {
+        return false;
+    };
+    if reply_user.id != bot_id {
+        return false;
+    }
+
+    addressed_bot_response_bucket(message.chat.get_id().into(), message.id) == 0
+}
+
+/// Return whether Go random-response routing would consider this message.
+#[must_use]
+pub fn should_handle_random_response(
+    message: Option<&TelegramMessage>,
+    original_text: &str,
+    sender: &MessageSender,
+) -> bool {
+    if sender.is_bot {
+        return false;
+    }
+    !is_captionless_media_only_random_message(message, original_text)
+}
+
 /// Go `dialog.MessageKindText` history kind.
 pub const HISTORY_MESSAGE_KIND_TEXT: &str = "text";
 
@@ -1608,6 +1652,64 @@ fn add_image_prompt_part(parts: &mut Vec<String>, seen: &mut HashSet<String>, va
     parts.push(trimmed.to_owned());
 }
 
+fn is_captionless_media_only_random_message(
+    message: Option<&TelegramMessage>,
+    original_text: &str,
+) -> bool {
+    let Some(message) = message else {
+        return true;
+    };
+    if !original_text.trim().is_empty() || !message_caption_text(message).trim().is_empty() {
+        return false;
+    }
+
+    matches!(
+        message.data,
+        TelegramMessageData::Animation(_)
+            | TelegramMessageData::Audio(_)
+            | TelegramMessageData::Document(_)
+            | TelegramMessageData::PaidMedia(_)
+            | TelegramMessageData::Photo(_)
+            | TelegramMessageData::Sticker(_)
+            | TelegramMessageData::Story(_)
+            | TelegramMessageData::Video(_)
+            | TelegramMessageData::VideoNote(_)
+            | TelegramMessageData::Voice(_)
+            | TelegramMessageData::Contact(_)
+            | TelegramMessageData::Dice(_)
+            | TelegramMessageData::Location(_)
+            | TelegramMessageData::Venue(_)
+            | TelegramMessageData::Checklist(_)
+    )
+}
+
+fn message_caption_text(message: &TelegramMessage) -> String {
+    match &message.data {
+        TelegramMessageData::Audio(audio) => text_option_to_string(audio.caption.as_ref()),
+        TelegramMessageData::Document(document) => text_option_to_string(document.caption.as_ref()),
+        TelegramMessageData::Photo(photo) => text_option_to_string(photo.caption.as_ref()),
+        TelegramMessageData::Video(video) => text_option_to_string(video.caption.as_ref()),
+        TelegramMessageData::Voice(voice) => text_option_to_string(voice.caption.as_ref()),
+        _ => String::new(),
+    }
+}
+
+fn text_option_to_string(text: Option<&TelegramText>) -> String {
+    text.map(|text| text.as_ref().to_owned())
+        .unwrap_or_default()
+}
+
+fn addressed_bot_response_bucket(chat_id: i64, message_id: i64) -> u64 {
+    if message_id <= 0 {
+        return 1;
+    }
+
+    let abs_chat_id = chat_id.unsigned_abs();
+    (abs_chat_id + message_id as u64) % BOT_ADDRESSED_RESPONSE_SAMPLING_DIVISOR
+}
+
+const BOT_ADDRESSED_RESPONSE_SAMPLING_DIVISOR: u64 = 3;
+
 const DRAW_VERB_ALIASES: &[&str] = &["нарисуй", "draw", "рисуй"];
 
 const DRAW_REPLY_PREFIXES: &[&str] = &["это", "this", "that", "these", "those"];
@@ -2056,7 +2158,7 @@ mod tests {
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
-    use openplotva_core::{ChatAttachment, ChatMessageMeta, SENDER_TYPE_USER};
+    use openplotva_core::{ChatAttachment, ChatMessageMeta, MessageSender, SENDER_TYPE_USER};
     use serde_json::{Value, json};
 
     use super::{
@@ -2067,8 +2169,9 @@ mod tests {
         edited_image_prompt_update, extract_update_state, fetcher_message_text,
         is_allowed_producer_update, is_settings_command_message, parse_edit_command,
         parse_if_addressed, process_update_at, producer_update_name, producer_update_type,
-        resolve_draw_prompt_from_message, run_update_producer_until, telegram_message_attachments,
-        update_name,
+        resolve_draw_prompt_from_message, run_update_producer_until,
+        should_handle_addressed_message, should_handle_random_response,
+        telegram_message_attachments, update_name,
     };
     use carapax::types::{
         Message as TelegramMessage, Update as TelegramUpdate, UpdateType as TelegramUpdateType,
@@ -3701,6 +3804,233 @@ mod tests {
             edited_image_prompt_update(&message, "song", "кота", &ChatMessageMeta::default())
                 .is_none()
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn should_handle_addressed_message_matches_go_bot_gate() -> Result<(), Box<dyn Error>> {
+        let human_sender = MessageSender {
+            id: 42,
+            is_bot: false,
+            ..MessageSender::system()
+        };
+        let bot_sender = MessageSender {
+            id: 777,
+            is_bot: true,
+            ..MessageSender::system()
+        };
+        let human_message = sample_message_from_value(json!({
+            "message_id": 1,
+            "date": 1_710_000_000,
+            "chat": {
+                "id": -1001,
+                "type": "group",
+                "title": "Group"
+            },
+            "from": sample_user_json(),
+            "text": "hello"
+        }))?;
+        let bot_reply_allowed = sample_message_from_value(json!({
+            "message_id": 2,
+            "date": 1_710_000_000,
+            "chat": {
+                "id": -100,
+                "type": "group",
+                "title": "Group"
+            },
+            "from": {
+                "id": 777,
+                "is_bot": true,
+                "first_name": "RelayBot"
+            },
+            "reply_to_message": {
+                "message_id": 99,
+                "date": 1_710_000_000,
+                "chat": {
+                    "id": -100,
+                    "type": "group",
+                    "title": "Group"
+                },
+                "from": {
+                    "id": 12345,
+                    "is_bot": true,
+                    "first_name": "Plotva",
+                    "username": "PlotvaBot"
+                },
+                "text": "old answer"
+            },
+            "text": "bot reply"
+        }))?;
+        let bot_reply_denied = sample_message_from_value(json!({
+            "message_id": 1,
+            "date": 1_710_000_000,
+            "chat": {
+                "id": -100,
+                "type": "group",
+                "title": "Group"
+            },
+            "from": {
+                "id": 777,
+                "is_bot": true,
+                "first_name": "RelayBot"
+            },
+            "reply_to_message": {
+                "message_id": 99,
+                "date": 1_710_000_000,
+                "chat": {
+                    "id": -100,
+                    "type": "group",
+                    "title": "Group"
+                },
+                "from": {
+                    "id": 12345,
+                    "is_bot": true,
+                    "first_name": "Plotva",
+                    "username": "PlotvaBot"
+                },
+                "text": "old answer"
+            },
+            "text": "bot reply"
+        }))?;
+        let wrong_bot_reply = sample_message_from_value(json!({
+            "message_id": 2,
+            "date": 1_710_000_000,
+            "chat": {
+                "id": -100,
+                "type": "group",
+                "title": "Group"
+            },
+            "from": {
+                "id": 777,
+                "is_bot": true,
+                "first_name": "RelayBot"
+            },
+            "reply_to_message": {
+                "message_id": 99,
+                "date": 1_710_000_000,
+                "chat": {
+                    "id": -100,
+                    "type": "group",
+                    "title": "Group"
+                },
+                "from": {
+                    "id": 99999,
+                    "is_bot": true,
+                    "first_name": "AnotherBot"
+                },
+                "text": "old answer"
+            },
+            "text": "bot reply"
+        }))?;
+
+        assert!(should_handle_addressed_message(
+            Some(&human_message),
+            &human_sender,
+            12345
+        ));
+        assert!(should_handle_addressed_message(
+            Some(&bot_reply_allowed),
+            &bot_sender,
+            12345
+        ));
+        assert!(!should_handle_addressed_message(
+            Some(&bot_reply_denied),
+            &bot_sender,
+            12345
+        ));
+        assert!(!should_handle_addressed_message(
+            Some(&wrong_bot_reply),
+            &bot_sender,
+            12345
+        ));
+        assert_eq!(
+            super::addressed_bot_response_bucket(100, 2),
+            super::addressed_bot_response_bucket(-100, 2)
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn should_handle_random_response_matches_go_media_gate() -> Result<(), Box<dyn Error>> {
+        let human_sender = MessageSender {
+            id: 42,
+            is_bot: false,
+            ..MessageSender::system()
+        };
+        let bot_sender = MessageSender {
+            id: 777,
+            is_bot: true,
+            ..MessageSender::system()
+        };
+        let text_message = sample_message_from_value(json!({
+            "message_id": 14,
+            "date": 1_710_000_000,
+            "chat": sample_private_chat_json(),
+            "from": sample_user_json(),
+            "text": "привет"
+        }))?;
+        let document_message = sample_message_from_value(json!({
+            "message_id": 15,
+            "date": 1_710_000_000,
+            "chat": sample_private_chat_json(),
+            "from": sample_user_json(),
+            "document": {
+                "file_id": "doc-file",
+                "file_unique_id": "doc-unique",
+                "file_name": "IMG_4253.MP4"
+            }
+        }))?;
+        let captioned_video_message = sample_message_from_value(json!({
+            "message_id": 16,
+            "date": 1_710_000_000,
+            "chat": sample_private_chat_json(),
+            "from": sample_user_json(),
+            "video": {
+                "file_id": "video-file",
+                "file_unique_id": "video-unique",
+                "width": 640,
+                "height": 480,
+                "duration": 7
+            },
+            "caption": "смотри что тут"
+        }))?;
+        let animation_message = sample_message_from_value(json!({
+            "message_id": 17,
+            "date": 1_710_000_000,
+            "chat": sample_private_chat_json(),
+            "from": sample_user_json(),
+            "animation": {
+                "file_id": "animation-file",
+                "file_unique_id": "animation-unique",
+                "width": 320,
+                "height": 240,
+                "duration": 4
+            }
+        }))?;
+
+        assert!(should_handle_random_response(
+            Some(&text_message),
+            "привет",
+            &human_sender
+        ));
+        assert!(!should_handle_random_response(None, "", &bot_sender));
+        assert!(!should_handle_random_response(
+            Some(&document_message),
+            "",
+            &human_sender
+        ));
+        assert!(should_handle_random_response(
+            Some(&captioned_video_message),
+            "",
+            &human_sender
+        ));
+        assert!(!should_handle_random_response(
+            Some(&animation_message),
+            "",
+            &human_sender
+        ));
 
         Ok(())
     }
