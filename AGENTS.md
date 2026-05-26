@@ -5,7 +5,7 @@
 - Answer the user in their language; write code, comments, docs, and commits in English unless asked otherwise.
 - Verify repository facts before claiming them. Do not describe crate ownership, runtime flow, commands, or deployment state from memory.
 - Favor broad product progress over auxiliary scaffolding. Avoid placeholders, provenance notes, and speculative abstractions.
-- Dirty user changes are normal in this migrated repository; account for them and continue unless they directly conflict with the task. Never reset, clean, push, deploy, restart services, or implementation history unless explicitly asked in the current request.
+- Dirty user changes are normal in this migrated repository; account for them and continue unless they directly conflict with the task. Never reset, clean, push, deploy, restart services, or rewrite history unless explicitly asked in the current request.
 - Never commit secrets: live `.env` values, Telegram tokens, provider keys, database dumps, Redis snapshots, private file IDs, or smoke inputs.
 - Report exact verification commands and results. If checks are skipped, say so and name the risk.
 

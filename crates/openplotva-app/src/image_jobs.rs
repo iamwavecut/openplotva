@@ -341,6 +341,7 @@ where
         }
     }
 
+    /// Generate with an explicit job ID, useful for deterministic contract tests.
     pub async fn generate_image_with_job_id(
         &self,
         request: ImageGenerationRequest,
@@ -369,6 +370,7 @@ where
         })
     }
 
+    /// Edit an image with an explicit job ID, useful for deterministic contract tests.
     pub async fn edit_image_with_job_id(
         &self,
         request: ImageEditRequest,

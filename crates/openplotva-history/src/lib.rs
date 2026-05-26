@@ -481,6 +481,7 @@ pub struct SummaryDocument {
     pub cascade_depth: i32,
     /// Quality score override.
     pub quality_score: f64,
+    /// Quality notes override.
     pub quality_notes: String,
 }
 
@@ -535,6 +536,7 @@ pub struct StoredSummary {
     pub cascade_depth: i32,
     /// Quality score.
     pub quality_score: f64,
+    /// Quality notes.
     pub quality_notes: String,
     /// Creation timestamp.
     pub created_at: OffsetDateTime,
@@ -672,6 +674,7 @@ pub struct SummaryContent {
         skip_serializing_if = "is_zero_f64"
     )]
     pub quality_score: f64,
+    /// Optional quality notes.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub quality_notes: String,
 }

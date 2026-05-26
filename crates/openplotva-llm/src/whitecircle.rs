@@ -1341,7 +1341,7 @@ mod tests {
     }
 
     #[test]
-    fn whitecircle_event_uses_reference_source_and_obfuscated_runtime_identity() {
+    fn whitecircle_event_uses_go_source_and_obfuscated_runtime_identity() {
         let input = DialogInput {
             context: DialogContext {
                 chat_id: 100,

@@ -17,7 +17,7 @@ Never commit:
 - Production database dumps or Redis snapshots.
 - Private Telegram file IDs or chat/user IDs used for live smokes.
 
-Use ignored local files or environment variables for smoke-test inputs. Redact secrets from logs and notes notes.
+Use ignored local files or environment variables for smoke-test inputs. Redact secrets from logs and handoff notes.
 
 ## Supported Security Surface
 

@@ -1,3 +1,4 @@
+//! Provider-neutral dialog contracts and tool parsing.
 
 use std::{error::Error, fmt, future::Future, pin::Pin};
 

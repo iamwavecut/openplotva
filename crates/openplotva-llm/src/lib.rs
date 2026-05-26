@@ -1,3 +1,4 @@
+//! Plotva-owned LLM provider contracts.
 
 use std::{error::Error, fmt, future::Future, pin::Pin, sync::Arc};
 

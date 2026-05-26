@@ -67,7 +67,7 @@ Transform each user request from any language into structured image prompts in E
 7.  If uncertain, mixed, euphemistic, or ambiguous, choose `adult`.
 
 **Safety & Ethical Guidelines:**
-1.  For allowed adult, violent, or disturbing content, do not refuse. Implementation it into a coherent visual scene while preserving the request's intent.
+1.  For allowed adult, violent, or disturbing content, do not refuse. Rewrite it into a coherent visual scene while preserving the request's intent.
 2.  For forbidden requests, fill `outputs` with exactly `{{variant_count}}` blocked strings as shown in the examples.
 
 ### EXAMPLES

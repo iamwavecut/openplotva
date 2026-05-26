@@ -470,6 +470,7 @@ impl<Generator> DirectDrawApiRuntimeEffects<Generator, TelegramClient> {
 }
 
 impl<Generator, Sender> DirectDrawApiRuntimeEffects<Generator, Sender> {
+    /// Build runtime effects with an injectable sender for contract tests.
     #[must_use]
     pub fn with_sender(sender: Sender, generator: Generator) -> Self {
         Self {
