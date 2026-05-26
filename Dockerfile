@@ -11,7 +11,6 @@ COPY tools ./tools
 COPY migrations ./migrations
 COPY prompts ./prompts
 COPY web ./web
-COPY docs ./docs
 
 RUN cargo build --release -p openplotva-app
 
