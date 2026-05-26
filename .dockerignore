@@ -1,0 +1,15 @@
+.git
+.github
+.reference
+target
+*.log
+*.tmp
+.env
+.env.*
+!.env.example
+docs/tmp
+tmp
+coverage
+node_modules
+web/admin/*.map
+web/settings/*.map

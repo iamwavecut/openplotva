@@ -2,7 +2,9 @@
 /.reference/
 /.env
 /.env.*
+/.inf
+/.inf.*
+/*.inf
 !.env.example
 *.log
 .DS_Store
-
