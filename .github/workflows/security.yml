@@ -51,12 +51,28 @@ jobs:
         run: python -m pip install "semgrep==${SEMGREP_VERSION}"
 
       - name: Run Semgrep
-        run: semgrep scan --config=auto --sarif --output=semgrep.sarif . || true
+        run: semgrep scan --config=auto --sarif --output=semgrep.sarif .
+
+      - name: Validate Semgrep SARIF
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          path = Path("semgrep.sarif")
+          if not path.is_file() or path.stat().st_size == 0:
+              raise SystemExit("semgrep.sarif was not created or is empty")
+
+          with path.open(encoding="utf-8") as handle:
+              payload = json.load(handle)
+
+          if payload.get("version") != "2.1.0" or not isinstance(payload.get("runs"), list):
+              raise SystemExit("semgrep.sarif is not a valid SARIF 2.1.0 payload")
+          PY
 
       - name: Upload Semgrep SARIF
-        if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
         uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: semgrep.sarif
           category: semgrep
-        continue-on-error: true
