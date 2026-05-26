@@ -186,7 +186,7 @@ impl GoUpdateType {
     }
 }
 
-///
+/// Serialized and compressed Telegram update for Redis queue storage.
 /// envelope around `carapax::types::Update`, then compresses that envelope
 /// with zstd before pushing it as a binary-safe Redis string.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -342,7 +342,7 @@ impl RedisUpdateQueue {
         self.enqueue_encoded(&update).await
     }
 
-    ///
+    /// Enqueue an update only when producer policy allows its update type.
     /// Returns `Ok(true)` when the update was pushed and `Ok(false)` when the
     /// update type is intentionally ignored.
     pub async fn enqueue_allowed_update(
@@ -356,7 +356,7 @@ impl RedisUpdateQueue {
         Ok(true)
     }
 
-    ///
+    /// Dequeue one encoded update with Redis `BLPOP` semantics.
     pub async fn dequeue_encoded(
         &self,
         timeout: Duration,
@@ -814,7 +814,7 @@ pub fn extract_update_state(update: &TelegramUpdate) -> Option<UpdateState> {
     UpdateState::new(chat, user)
 }
 
-///
+/// Collect Telegram file metadata references attached to an update.
 /// that can use media references for vision/audio context.
 #[must_use]
 pub fn update_file_metadata_refs(update: &TelegramUpdate) -> Vec<TelegramFileMetadataRef> {

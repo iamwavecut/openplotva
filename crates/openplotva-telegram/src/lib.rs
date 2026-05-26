@@ -678,14 +678,12 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        API_CONSTRUCTOR_USAGES, BotCommandError, BotCommandScope, CALLBACK_ACTIONS,
-        COMMAND_ALIAS_GROUPS, COMMAND_SETS, CallbackActionParse, CallbackHandlerKind,
+        BotCommandError, BotCommandScope, CallbackActionParse, CallbackHandlerKind,
         CallbackQueryRoute, CommandScope, DELETE_DRAWING_ACTION_CLOSE,
         DELETE_DRAWING_ACTION_CONFIRM, DELETE_DRAWING_ACTION_FRAME_CONFIRM,
         DELETE_DRAWING_ACTION_FRAME_PICK, DELETE_DRAWING_ACTION_INIT, DELETE_LYRICS_ACTION_CLOSE,
-        DELETE_LYRICS_ACTION_CONFIRM, DELETE_LYRICS_ACTION_INIT, DONATE_COMMAND,
-        GROUP_ADMIN_COMMANDS, GROUP_COMMANDS, HELP_COMMAND, PRIVATE_COMMANDS,
-        RAW_API_METHOD_USAGES, build_delete_drawing_confirm_keyboard,
+        DELETE_LYRICS_ACTION_CONFIRM, DELETE_LYRICS_ACTION_INIT, GROUP_ADMIN_COMMANDS,
+        GROUP_COMMANDS, PRIVATE_COMMANDS, build_delete_drawing_confirm_keyboard,
         build_delete_drawing_frame_confirm_keyboard, build_delete_drawing_frame_picker_keyboard,
         build_delete_drawing_initial_keyboard, build_lyrics_delete_confirm_keyboard,
         build_lyrics_delete_keyboard, callback_handler_for_action, callback_query_ack_method,

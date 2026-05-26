@@ -1,0 +1,44 @@
+name: Rust Deep Analysis
+
+on:
+  workflow_dispatch:
+    inputs:
+      baseline_rev:
+        description: Git revision used by cargo-semver-checks as the public API baseline
+        required: false
+        default: origin/main
+  schedule:
+    - cron: "47 4 * * 0"
+
+env:
+  RUST_VERSION: "1.95.0"
+  CARGO_HACK_VERSION: "0.6.44"
+  CARGO_SEMVER_CHECKS_VERSION: "0.47.0"
+
+permissions:
+  contents: read
+
+jobs:
+  rust-deep:
+    name: Rust deep gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup default "$RUST_VERSION"
+
+      - name: Install deep analysis tools
+        run: |
+          cargo install cargo-hack --locked --version "$CARGO_HACK_VERSION"
+          cargo install cargo-semver-checks --locked --version "$CARGO_SEMVER_CHECKS_VERSION"
+
+      - name: Deep Rust gate
+        env:
+          BASELINE_REV: ${{ github.event.inputs.baseline_rev || 'origin/main' }}
+        run: tools/rust-deep-gate.sh --baseline-rev "$BASELINE_REV"

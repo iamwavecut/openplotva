@@ -940,7 +940,6 @@ mod tests {
         runtime_token_expired_at, runtime_token_secret_hash_matches, vip_cache_key,
     };
     use axum::{body::to_bytes, http::header};
-    use std::collections::BTreeSet;
     use std::sync::Arc;
     use time::{Duration as TimeDuration, OffsetDateTime};
 
@@ -1000,7 +999,8 @@ mod tests {
 
     #[test]
     fn runtime_api_tls_config_rejects_empty_material() {
-        let error = runtime_api_tls_config_from_pem(b"", b"").unwrap_err();
+        let error = runtime_api_tls_config_from_pem(b"", b"")
+            .expect_err("empty TLS material should be rejected");
         assert!(matches!(
             error,
             super::RuntimeApiTlsError::EmptyCertificateChain
@@ -1048,43 +1048,6 @@ mod tests {
         assert_eq!(payload["data"]["configSnapshot"]["runtimeApiPort"], 9091);
         assert_eq!(payload["data"]["taskmanJobs"]["total"], 0);
         assert_eq!(payload["data"]["logs"]["count"], 0);
-    }
-
-    fn graphql_root_type<'a>(sdl: &'a str, operation: &str) -> &'a str {
-        let schema_body = sdl
-            .split_once("schema {")
-            .and_then(|(_, tail)| tail.split_once('}'))
-            .map(|(body, _)| body)
-            .unwrap_or_else(|| panic!("schema block missing from GraphQL SDL"));
-        let prefix = format!("{operation}:");
-        schema_body
-            .lines()
-            .map(str::trim)
-            .find_map(|line| line.strip_prefix(&prefix))
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-            .unwrap_or_else(|| panic!("{operation} root missing from GraphQL SDL"))
-    }
-
-    fn graphql_object_fields(sdl: &str, type_name: &str) -> BTreeSet<String> {
-        let header = format!("type {type_name} {{");
-        let body = sdl
-            .split_once(&header)
-            .and_then(|(_, tail)| tail.split_once('}'))
-            .map(|(body, _)| body)
-            .unwrap_or_else(|| panic!("type {type_name} missing from GraphQL SDL"));
-
-        body.lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .map(|line| {
-                line.split(['(', ':'])
-                    .next()
-                    .unwrap_or(line)
-                    .trim()
-                    .to_owned()
-            })
-            .collect()
     }
 
     #[tokio::test]
@@ -2501,7 +2464,7 @@ mod tests {
         let body = String::from_utf8(body.to_vec())
             .unwrap_or_else(|error| panic!("profile fallback utf8: {error}"));
         assert!(body.contains("profile: profile"));
-        assert!(body.contains("intentionally omitted"));
+        assert!(body.contains("intentionally unavailable"));
 
         let heap = runtime_api_pprof_response("heap");
         assert_eq!(heap.status(), axum::http::StatusCode::OK);

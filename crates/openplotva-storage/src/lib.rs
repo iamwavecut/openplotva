@@ -3246,7 +3246,7 @@ impl PostgresHistoryStore {
         Ok(())
     }
 
-    ///
+    /// Update the stored text for an existing inbound history row.
     /// required IDs or no text history row exists.
     pub async fn update_text_entry(
         &self,
@@ -3328,7 +3328,7 @@ impl PostgresHistoryStore {
         Ok(true)
     }
 
-    ///
+    /// Upsert vision descriptions into stored message metadata.
     /// updates are empty, no text row exists, or the stored metadata is already equivalent.
     pub async fn upsert_vision_descriptions(
         &self,
@@ -3392,7 +3392,7 @@ impl PostgresHistoryStore {
         Ok(result.rows_affected())
     }
 
-    ///
+    /// Upsert tool-call history into stored message metadata.
     /// terminator filtering, or the base text history row is absent.
     pub async fn upsert_tool_call_history(
         &self,
@@ -3458,7 +3458,7 @@ impl PostgresHistoryStore {
         Ok(true)
     }
 
-    ///
+    /// Mark one chat/thread history reset point.
     pub async fn reset_history_at(
         &self,
         chat_id: i64,
@@ -6622,6 +6622,7 @@ fn vip_event_list_from_row(row: PgRow) -> Result<VipEventListRecord, sqlx::Error
 #[cfg(test)]
 mod tests {
     use std::{
+        env,
         error::Error,
         time::{Duration, SystemTime, UNIX_EPOCH},
     };

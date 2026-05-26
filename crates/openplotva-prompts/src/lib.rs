@@ -461,9 +461,7 @@ fn push_prompt_message(messages: &mut Vec<PromptMessage>, role: &str, content: &
 mod tests {
     use std::path::Path;
 
-    use super::{
-        load_registry, prompt_entries, prompt_metadata, prompt_root, read, render, render_messages,
-    };
+    use super::{load_registry, prompt_metadata, prompt_root, read, render, render_messages};
 
     #[test]
     fn reads_prompt_with_or_without_suffix() -> Result<(), Box<dyn std::error::Error>> {
