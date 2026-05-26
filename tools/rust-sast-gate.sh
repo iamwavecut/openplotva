@@ -33,7 +33,9 @@ case "${1:-}" in
     ;;
 esac
 
-export PATH="/opt/homebrew/bin:$PATH"
+if [[ -d /opt/homebrew/bin && ":$PATH:" != *":/opt/homebrew/bin:"* ]]; then
+  export PATH="$PATH:/opt/homebrew/bin"
+fi
 
 repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"

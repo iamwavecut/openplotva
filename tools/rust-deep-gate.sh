@@ -19,7 +19,9 @@ Required cargo subcommands:
 USAGE
 }
 
-export PATH="/opt/homebrew/bin:$PATH"
+if [[ -d /opt/homebrew/bin && ":$PATH:" != *":/opt/homebrew/bin:"* ]]; then
+  export PATH="$PATH:/opt/homebrew/bin"
+fi
 
 baseline_rev="origin/main"
 run_hack=1
