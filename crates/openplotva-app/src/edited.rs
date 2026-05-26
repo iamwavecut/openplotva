@@ -4,17 +4,20 @@ use std::{fmt, future::Future, pin::Pin, sync::Arc};
 
 use carapax::types::{Update as TelegramUpdate, UpdateType, User as TelegramUser};
 use openplotva_core::ChatMessageMeta;
+use openplotva_taskman::InMemoryTaskQueue;
 use openplotva_updates::{
     build_fetcher_message_context, edited_image_prompt_update, parse_if_addressed,
 };
 use thiserror::Error;
 
-use crate::updates::{UpdateHandler, UpdateHandlerFuture};
+use crate::{
+    dialog_debounce::InMemoryDialogDebounce,
+    updates::{UpdateHandler, UpdateHandlerFuture},
+};
 
 /// Boxed future returned by edited-message side effects.
 pub type EditedMessageFuture<'a, T, E> = Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'a>>;
 
-/// Go-shaped data used to update pending dialog jobs after message edits.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EditedDialogJobUpdate<'payload> {
     /// Telegram chat ID.
@@ -25,15 +28,12 @@ pub struct EditedDialogJobUpdate<'payload> {
     pub sender_id: i64,
     /// Telegram forum topic/thread ID, when present.
     pub thread_id: Option<i32>,
-    /// Go `parseIfAdressed` message text after fallback extraction.
     pub message_text: &'payload str,
     /// Original `Message.Text` before fallback extraction.
     pub original_text: &'payload str,
-    /// Go-shaped message metadata.
     pub meta: &'payload ChatMessageMeta,
 }
 
-/// Go-shaped data used to update pending image jobs after message edits.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EditedImageJobUpdate<'payload> {
     /// Telegram chat ID.
@@ -44,11 +44,9 @@ pub struct EditedImageJobUpdate<'payload> {
     pub prompt: &'payload str,
     /// Trimmed prompt before metadata context is appended.
     pub original_prompt: &'payload str,
-    /// Go-shaped message metadata.
     pub meta: &'payload ChatMessageMeta,
 }
 
-/// Side-effect boundary for Go `processEditedMessage` after history persistence.
 pub trait EditedMessageEffects {
     /// Error returned by concrete effects.
     type Error: fmt::Display + Send + Sync + 'static;
@@ -77,9 +75,7 @@ pub trait EditedMessageEffects {
 pub enum EditedMessageUpdateRoute {
     /// The update was not an edited message and was delegated.
     Delegated,
-    /// Go ignores nil/zero-chat edited messages.
     IgnoredInvalidMessage,
-    /// Go edited-message side effects were attempted and the update was consumed.
     Handled {
         /// Whether an existing dialog debounce entry was updated.
         dialog_debounce_updated: bool,
@@ -87,7 +83,6 @@ pub enum EditedMessageUpdateRoute {
         pending_dialog_updated: bool,
         /// Whether an existing pending image job was updated.
         pending_image_updated: bool,
-        /// Effect errors that Go would log and suppress.
         suppressed_errors: Vec<String>,
     },
 }
@@ -103,12 +98,93 @@ pub enum EditedMessageUpdateError {
     },
 }
 
-/// `UpdateHandler` adapter for Go edited-message side effects.
 #[derive(Clone, Debug)]
 pub struct EditedMessageUpdateHandler<Effects, Next> {
     effects: Arc<Effects>,
     bot_user: TelegramUser,
     next: Arc<Next>,
+}
+
+/// Concrete edited-message effects backed by the shared taskman queue core.
+#[derive(Clone, Debug)]
+pub struct TaskmanEditedMessageEffects {
+    queue: Arc<InMemoryTaskQueue>,
+    dialog_debounce: Option<Arc<InMemoryDialogDebounce>>,
+}
+
+impl TaskmanEditedMessageEffects {
+    /// Build taskman-backed edited-message effects.
+    #[must_use]
+    pub fn new(queue: Arc<InMemoryTaskQueue>) -> Self {
+        Self {
+            queue,
+            dialog_debounce: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_dialog_debounce(mut self, dialog_debounce: Arc<InMemoryDialogDebounce>) -> Self {
+        self.dialog_debounce = Some(dialog_debounce);
+        self
+    }
+}
+
+/// Error returned by taskman-backed edited-message effects.
+#[derive(Debug, Error)]
+pub enum TaskmanEditedMessageEffectsError {
+    /// Chat metadata could not be converted into taskman JSON.
+    #[error("serialize edited-message metadata: {0}")]
+    SerializeMeta(#[from] serde_json::Error),
+}
+
+impl EditedMessageEffects for TaskmanEditedMessageEffects {
+    type Error = TaskmanEditedMessageEffectsError;
+
+    fn update_dialog_debounce<'a>(
+        &'a self,
+        update: EditedDialogJobUpdate<'a>,
+    ) -> EditedMessageFuture<'a, bool, Self::Error> {
+        Box::pin(async move {
+            let Some(dialog_debounce) = self.dialog_debounce.as_ref() else {
+                return Ok(false);
+            };
+            dialog_debounce
+                .update(update)
+                .map_err(TaskmanEditedMessageEffectsError::SerializeMeta)
+        })
+    }
+
+    fn update_pending_dialog_job<'a>(
+        &'a self,
+        update: EditedDialogJobUpdate<'a>,
+    ) -> EditedMessageFuture<'a, bool, Self::Error> {
+        Box::pin(async move {
+            let meta = serde_json::to_value(update.meta)?;
+            Ok(self.queue.update_pending_dialog_job_by_message_id(
+                update.chat_id,
+                update.message_id,
+                update.message_text,
+                update.original_text,
+                meta,
+            ))
+        })
+    }
+
+    fn update_pending_image_job<'a>(
+        &'a self,
+        update: EditedImageJobUpdate<'a>,
+    ) -> EditedMessageFuture<'a, bool, Self::Error> {
+        Box::pin(async move {
+            let meta = serde_json::to_value(update.meta)?;
+            Ok(self.queue.update_pending_image_job_by_message_id(
+                update.chat_id,
+                update.message_id,
+                update.prompt,
+                update.original_prompt,
+                meta,
+            ))
+        })
+    }
 }
 
 impl<Effects, Next> EditedMessageUpdateHandler<Effects, Next> {
@@ -143,7 +219,6 @@ where
     }
 }
 
-/// Handle Go's edited-message processor and delegate every non-edited update.
 pub async fn handle_edited_message_update_or_else<Effects, HandleFn, HandleFuture, HandleError>(
     effects: &Effects,
     bot_user: &TelegramUser,
@@ -262,17 +337,30 @@ mod tests {
         error::Error,
         io,
         sync::{Arc, Mutex},
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
     use carapax::types::{Update as TelegramUpdate, User as TelegramUser};
-    use openplotva_core::ChatMessageMeta;
+    use openplotva_core::{ChatMessageMeta, ChatState, UserState};
+    use openplotva_storage::TelegramFileMetadataUpsert;
+    use openplotva_taskman::{
+        DEFAULT_PRIORITY, DIALOG_AIFARM_QUEUE_NAME, DialogJobData, IMAGE_REGULAR_QUEUE_NAME,
+        ImageJobData, InMemoryTaskQueue, JobPayload, JobType, StatelessJobItem, TelegramData,
+    };
+    use openplotva_updates::{UpdateConsumerConfig, UpdateStageOutcome};
     use serde_json::json;
+    use time::OffsetDateTime;
 
-    use crate::updates::{UpdateHandler, UpdateHandlerFuture};
+    use crate::dialog_debounce::{DialogDebounceKey, InMemoryDialogDebounce};
+    use crate::updates::{
+        TelegramFileMetadataStoreFuture, UpdateHandler, UpdateHandlerFuture, UpdateStateStore,
+        UpdateStateStoreFuture, process_update_with_state_store_at,
+    };
 
     use super::{
         EditedDialogJobUpdate, EditedImageJobUpdate, EditedMessageEffects, EditedMessageFuture,
-        EditedMessageUpdateHandler, EditedMessageUpdateRoute, handle_edited_message_update_or_else,
+        EditedMessageUpdateHandler, EditedMessageUpdateRoute, TaskmanEditedMessageEffects,
+        handle_edited_message_update_or_else,
     };
 
     #[tokio::test]
@@ -404,6 +492,264 @@ mod tests {
 
         assert_eq!(effects.dialog_updates().len(), 2);
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn taskman_edited_effects_update_pending_dialog_and_image_jobs()
+    -> Result<(), Box<dyn Error>> {
+        let queue = Arc::new(InMemoryTaskQueue::new());
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        queue.assign(
+            DIALOG_AIFARM_QUEUE_NAME,
+            taskman_dialog_job("old dialog", now, 111, 42, 77),
+        );
+        queue.assign(
+            IMAGE_REGULAR_QUEUE_NAME,
+            taskman_image_job("old prompt", now, 111, 42, 77),
+        );
+        let effects = TaskmanEditedMessageEffects::new(queue.clone());
+        let meta = ChatMessageMeta {
+            sender_id: 111,
+            sender_type: "user".to_owned(),
+            sender_name: "Ada".to_owned(),
+            ..ChatMessageMeta::default()
+        };
+
+        assert!(
+            effects
+                .update_pending_dialog_job(EditedDialogJobUpdate {
+                    chat_id: 42,
+                    message_id: 77,
+                    sender_id: 111,
+                    thread_id: None,
+                    message_text: "\u{200f}new\ttext ",
+                    original_text: " original text ",
+                    meta: &meta,
+                })
+                .await?
+        );
+        assert!(
+            effects
+                .update_pending_image_job(EditedImageJobUpdate {
+                    chat_id: 42,
+                    message_id: 77,
+                    prompt: "\u{200f}new\tprompt ",
+                    original_prompt: " raw prompt ",
+                    meta: &meta,
+                })
+                .await?
+        );
+
+        let records = queue.records();
+        let dialog = records
+            .iter()
+            .find_map(|record| record.job.data.dialog_data.as_ref())
+            .expect("dialog data");
+        assert_eq!(dialog.message_text, "new text");
+        assert_eq!(dialog.original_text, "original text");
+        assert_eq!(dialog.meta["sender_id"], 111);
+        assert_eq!(dialog.meta["sender_type"], "user");
+
+        let image = records
+            .iter()
+            .find_map(|record| record.job.data.image_data.as_ref())
+            .expect("image data");
+        assert_eq!(image.prompt, "new prompt");
+        assert_eq!(image.original_text, "raw prompt");
+        assert!(image.prompt_variants.is_empty());
+        assert_eq!(image.meta["sender_name"], "Ada");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn taskman_edited_effects_update_dialog_debounce_before_assignment()
+    -> Result<(), Box<dyn Error>> {
+        let queue = Arc::new(InMemoryTaskQueue::new());
+        let debounce = Arc::new(InMemoryDialogDebounce::new());
+        let key = DialogDebounceKey {
+            chat_id: 42,
+            user_id: 111,
+            thread_id: 9,
+        };
+        debounce.register(
+            key,
+            77,
+            DIALOG_AIFARM_QUEUE_NAME,
+            taskman_dialog_job("old dialog", OffsetDateTime::UNIX_EPOCH, 111, 42, 77),
+        );
+        let effects = TaskmanEditedMessageEffects::new(Arc::clone(&queue))
+            .with_dialog_debounce(debounce.clone());
+        let meta = ChatMessageMeta {
+            sender_id: 111,
+            sender_type: "user".to_owned(),
+            sender_name: "Ada".to_owned(),
+            ..ChatMessageMeta::default()
+        };
+
+        assert!(
+            effects
+                .update_dialog_debounce(EditedDialogJobUpdate {
+                    chat_id: 42,
+                    message_id: 77,
+                    sender_id: 111,
+                    thread_id: Some(9),
+                    message_text: "\u{200f}new\ttext ",
+                    original_text: " original text ",
+                    meta: &meta,
+                })
+                .await?
+        );
+        let assigned = debounce.assign_due(key, &queue).expect("assigned");
+
+        assert_eq!(assigned.queue_name, DIALOG_AIFARM_QUEUE_NAME);
+        let records = queue.records();
+        let dialog = records[0].job.data.dialog_data.as_ref().expect("dialog");
+        assert_eq!(dialog.message_text, "new text");
+        assert_eq!(dialog.original_text, "original text");
+        assert_eq!(dialog.meta["sender_name"], "Ada");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_redis_decoded_edited_draw_updates_pending_jobs_when_url_is_set()
+    -> Result<(), Box<dyn Error>> {
+        let Ok(redis_url) = std::env::var("OPENPLOTVA_TEST_REDIS_URL") else {
+            return Ok(());
+        };
+        let redis_client = redis::Client::open(redis_url)?;
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let key = format!("openplotva:test:decoded-edited-draw:{suffix}");
+        let update_queue =
+            openplotva_updates::RedisUpdateQueue::with_key(redis_client.clone(), key.clone());
+        let mut redis = redis_client.get_multiplexed_async_connection().await?;
+        let _: i64 = redis::cmd("DEL").arg(&key).query_async(&mut redis).await?;
+
+        let now_secs = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        update_queue
+            .enqueue_update(&edited_draw_update_at(now_secs as i64)?)
+            .await?;
+        assert_eq!(update_queue.len().await?, 1);
+        let decoded = update_queue
+            .dequeue_update(Duration::from_secs(1))
+            .await?
+            .ok_or_else(|| io::Error::other("expected decoded edited draw update"))?;
+
+        let state_store = UpdateStateStoreStub::default();
+        let queue = Arc::new(InMemoryTaskQueue::new());
+        let debounce = Arc::new(InMemoryDialogDebounce::new());
+        let created = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        queue.assign(
+            DIALOG_AIFARM_QUEUE_NAME,
+            taskman_dialog_job("old dialog", created, 111, 42, 77),
+        );
+        queue.assign(
+            IMAGE_REGULAR_QUEUE_NAME,
+            taskman_image_job("old prompt", created, 111, 42, 77),
+        );
+        let debounce_key = DialogDebounceKey {
+            chat_id: 42,
+            user_id: 111,
+            thread_id: 9,
+        };
+        debounce.register(
+            debounce_key,
+            77,
+            DIALOG_AIFARM_QUEUE_NAME,
+            taskman_dialog_job("old debounce", created, 111, 42, 77),
+        );
+        let effects = TaskmanEditedMessageEffects::new(Arc::clone(&queue))
+            .with_dialog_debounce(debounce.clone());
+        let next = UpdateHandlerStub::default();
+        let route = Arc::new(Mutex::new(None));
+        let captured_route = Arc::clone(&route);
+
+        let report = process_update_with_state_store_at(
+            decoded,
+            UpdateConsumerConfig {
+                dequeue_timeout: Duration::from_millis(1),
+                state_timeout: Duration::from_secs(1),
+                handle_timeout: Duration::from_secs(1),
+                side_effect_max_age: Duration::from_secs(60),
+                worker_limit: 1,
+            },
+            UNIX_EPOCH + Duration::from_secs(now_secs),
+            &state_store,
+            |update| async {
+                let handled = handle_edited_message_update_or_else(
+                    &effects,
+                    &sample_bot_user()?,
+                    update,
+                    |update| next.handle_update(update),
+                )
+                .await
+                .map_err(|error| io::Error::other(error.to_string()))?;
+                *captured_route.lock().expect("route") = Some(handled);
+                Ok::<(), io::Error>(())
+            },
+        )
+        .await;
+
+        assert_eq!(report.update_id, 102);
+        assert_eq!(report.update_name, "edited_message");
+        assert_eq!(report.state.outcome, UpdateStageOutcome::Completed);
+        assert_eq!(
+            report.handle.as_ref().map(|stage| &stage.outcome),
+            Some(&UpdateStageOutcome::Completed)
+        );
+        assert!(!report.skipped_handle);
+        assert_eq!(
+            state_store.calls(),
+            vec![
+                "chat:42:private:Ada:".to_owned(),
+                "user:111:Ada:ada".to_owned()
+            ]
+        );
+        assert_eq!(
+            *route.lock().expect("route"),
+            Some(EditedMessageUpdateRoute::Handled {
+                dialog_debounce_updated: true,
+                pending_dialog_updated: true,
+                pending_image_updated: true,
+                suppressed_errors: vec![],
+            })
+        );
+        assert_eq!(next.handled_count(), 0);
+
+        let records = queue.records();
+        assert_eq!(records.len(), 2);
+        let dialog = records
+            .iter()
+            .find_map(|record| record.job.data.dialog_data.as_ref())
+            .expect("dialog data");
+        assert_eq!(dialog.message_text, "нарисуй кота");
+        assert_eq!(dialog.original_text, "нарисуй кота");
+        assert_eq!(dialog.meta["sender_id"], 111);
+        let image = records
+            .iter()
+            .find_map(|record| record.job.data.image_data.as_ref())
+            .expect("image data");
+        assert_eq!(image.prompt, "кота");
+        assert_eq!(image.original_text, "кота");
+        assert!(image.prompt_variants.is_empty());
+        assert_eq!(image.meta["sender_name"], "Ada");
+
+        let assigned = debounce
+            .assign_due(debounce_key, &queue)
+            .ok_or_else(|| io::Error::other("expected edited debounce assignment"))?;
+        assert_eq!(assigned.queue_name, DIALOG_AIFARM_QUEUE_NAME);
+        let assigned_dialog = queue
+            .records()
+            .into_iter()
+            .find(|record| record.id == assigned.task_id)
+            .and_then(|record| record.job.data.dialog_data)
+            .ok_or_else(|| io::Error::other("expected assigned dialog data"))?;
+        assert_eq!(assigned_dialog.message_text, "нарисуй кота");
+        assert_eq!(assigned_dialog.original_text, "нарисуй кота");
+        assert_eq!(assigned_dialog.meta["sender_name"], "Ada");
+        assert_eq!(update_queue.len().await?, 0);
+
+        let _: i64 = redis::cmd("DEL").arg(&key).query_async(&mut redis).await?;
         Ok(())
     }
 
@@ -580,11 +926,15 @@ mod tests {
     }
 
     fn edited_draw_update() -> Result<TelegramUpdate, serde_json::Error> {
+        edited_draw_update_at(1_710_000_000)
+    }
+
+    fn edited_draw_update_at(date: i64) -> Result<TelegramUpdate, serde_json::Error> {
         serde_json::from_value(json!({
             "update_id": 102,
             "edited_message": {
                 "message_id": 77,
-                "date": 1_710_000_000,
+                "date": date,
                 "message_thread_id": 9,
                 "chat": {"id": 42, "type": "private", "first_name": "Ada"},
                 "from": {
@@ -596,6 +946,59 @@ mod tests {
                 "text": "нарисуй кота"
             }
         }))
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct UpdateStateStoreStub {
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl UpdateStateStoreStub {
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().expect("calls").clone()
+        }
+    }
+
+    impl UpdateStateStore for UpdateStateStoreStub {
+        type Error = io::Error;
+
+        fn upsert_chat_state<'a>(
+            &'a self,
+            chat: &'a ChatState,
+        ) -> UpdateStateStoreFuture<'a, Self::Error> {
+            Box::pin(async move {
+                self.calls.lock().expect("calls").push(format!(
+                    "chat:{}:{}:{}:{}",
+                    chat.id,
+                    chat.chat_type,
+                    chat.first_name.as_deref().unwrap_or_default(),
+                    chat.username.as_deref().unwrap_or_default()
+                ));
+                Ok(())
+            })
+        }
+
+        fn upsert_user_state<'a>(
+            &'a self,
+            user: &'a UserState,
+        ) -> UpdateStateStoreFuture<'a, Self::Error> {
+            Box::pin(async move {
+                self.calls.lock().expect("calls").push(format!(
+                    "user:{}:{}:{}",
+                    user.id,
+                    user.first_name,
+                    user.username.as_deref().unwrap_or_default()
+                ));
+                Ok(())
+            })
+        }
+
+        fn upsert_telegram_file_metadata<'a>(
+            &'a self,
+            _params: &'a TelegramFileMetadataUpsert,
+        ) -> TelegramFileMetadataStoreFuture<'a, Self::Error> {
+            Box::pin(async { Ok(()) })
+        }
     }
 
     fn sample_message_json(text: &str) -> serde_json::Value {
@@ -611,5 +1014,70 @@ mod tests {
             },
             "text": text
         })
+    }
+
+    fn taskman_dialog_job(
+        message_text: &str,
+        created: OffsetDateTime,
+        user_id: i64,
+        chat_id: i64,
+        message_id: i32,
+    ) -> StatelessJobItem {
+        StatelessJobItem {
+            title: "dialog".to_owned(),
+            created,
+            priority: DEFAULT_PRIORITY,
+            processing_timeout_seconds: 0,
+            data: JobPayload {
+                job_type: JobType::Dialog,
+                telegram_data: Some(taskman_telegram_data(user_id, chat_id, message_id)),
+                image_data: None,
+                music_data: None,
+                dialog_data: Some(DialogJobData {
+                    message_text: message_text.to_owned(),
+                    ..DialogJobData::default()
+                }),
+                control_data: None,
+            },
+        }
+    }
+
+    fn taskman_image_job(
+        prompt: &str,
+        created: OffsetDateTime,
+        user_id: i64,
+        chat_id: i64,
+        message_id: i32,
+    ) -> StatelessJobItem {
+        StatelessJobItem {
+            title: "image_gen".to_owned(),
+            created,
+            priority: DEFAULT_PRIORITY,
+            processing_timeout_seconds: 0,
+            data: JobPayload {
+                job_type: JobType::ImageGen,
+                telegram_data: Some(taskman_telegram_data(user_id, chat_id, message_id)),
+                image_data: Some(ImageJobData {
+                    prompt: prompt.to_owned(),
+                    original_text: prompt.to_owned(),
+                    prompt_variants: vec!["enhanced".to_owned()],
+                    ..ImageJobData::default()
+                }),
+                music_data: None,
+                dialog_data: None,
+                control_data: None,
+            },
+        }
+    }
+
+    fn taskman_telegram_data(user_id: i64, chat_id: i64, message_id: i32) -> TelegramData {
+        TelegramData {
+            chat_id,
+            user_id,
+            message_id,
+            thread_message_id: None,
+            user_full_name: "Ada".to_owned(),
+            chat_title: String::new(),
+        }
     }
 }

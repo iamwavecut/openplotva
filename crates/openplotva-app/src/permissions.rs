@@ -1,11 +1,12 @@
-//! App-level Telegram chat permission policy matching Go server behavior.
-
 use std::{
     collections::HashMap,
     fmt,
     future::Future,
     pin::Pin,
-    sync::{Mutex, MutexGuard},
+    sync::{
+        Mutex, MutexGuard,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use openplotva_core::{ChatSettings, ChatSettingsUpdate};
@@ -14,20 +15,17 @@ use openplotva_server::{
     ACTION_SEND_TEXT, can_perform_action, permission_cache_key, permission_error_chat_type,
     permission_error_settings_update,
 };
-use openplotva_telegram::TelegramOutboundMethodKind;
+use openplotva_telegram::{TelegramOutboundMethodKind, classify_telegram_send_error};
 use time::OffsetDateTime;
 
-/// Go server in-memory permission cache TTL.
 pub const GO_PERMISSION_CACHE_TTL: time::Duration = time::Duration::minutes(30);
 
 /// Boxed future returned by permission persistence stores.
 pub type ChatPermissionStoreFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// Chat context needed by Go permission checks and permission-error updates.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ChatPermissionContext {
     pub chat_type: Option<String>,
-    /// Stored Go `chat_settings` row.
     pub settings: Option<ChatSettings>,
 }
 
@@ -42,7 +40,6 @@ pub trait ChatPermissionStore {
         chat_id: i64,
     ) -> ChatPermissionStoreFuture<'a, Result<ChatPermissionContext, Self::Error>>;
 
-    /// Save a Go-shaped chat settings update.
     fn save_settings<'a>(
         &'a self,
         update: ChatSettingsUpdate,
@@ -75,15 +72,11 @@ impl ChatPermissionStore for openplotva_storage::PostgresChatSettingsStore {
 /// Source used to decide one permission check.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PermissionCheckSource {
-    /// Go allows all private-chat actions before touching storage.
     PrivateChat,
-    /// The in-memory Go policy cache had an entry.
     Cache,
     /// Stored chat settings decided the action.
     Store,
-    /// Stored settings were missing, which Go treats as allowed.
     MissingSettings,
-    /// Storage returned an error, which Go treats as allowed for `CanPerformAction`.
     LoadError,
 }
 
@@ -100,11 +93,9 @@ pub struct PermissionCheckReport {
 /// Result of applying a Telegram permission-send-error side effect.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PermissionErrorUpdateReport {
-    /// Whether the method kind maps to a Go permission auto-disable path.
     pub applicable: bool,
     /// Whether an update was attempted and saved without error.
     pub updated: bool,
-    /// Chat type written to Go `UpsertChatSettingsParams`.
     pub chat_type: Option<String>,
     /// Context load error that prevented an update.
     pub load_error: Option<String>,
@@ -116,6 +107,8 @@ pub struct PermissionErrorUpdateReport {
 pub struct ChatPermissionPolicy<S> {
     store: S,
     cache: Mutex<HashMap<String, CachedPermission>>,
+    cache_hits: AtomicU64,
+    cache_misses: AtomicU64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -130,10 +123,11 @@ impl<S> ChatPermissionPolicy<S> {
         Self {
             store,
             cache: Mutex::new(HashMap::new()),
+            cache_hits: AtomicU64::new(0),
+            cache_misses: AtomicU64::new(0),
         }
     }
 
-    /// Invalidate the same action keys as Go `InvalidatePermissionCache`.
     pub fn invalidate_chat(&self, chat_id: i64) {
         let mut cache = self.cache();
         for action in [
@@ -151,7 +145,6 @@ impl<S> ChatPermissionPolicy<S>
 where
     S: ChatPermissionStore + Send + Sync,
 {
-    /// Return whether one Go permission action is allowed at `now`.
     pub async fn can_perform_action_at(
         &self,
         chat_id: i64,
@@ -207,7 +200,6 @@ where
         }
     }
 
-    /// Apply Go's auto-disable side effect after a Telegram permission send error.
     pub async fn record_send_permission_error(
         &self,
         chat_id: i64,
@@ -262,11 +254,16 @@ where
 
     fn cached_permission(&self, key: &str, now: OffsetDateTime) -> Option<bool> {
         let mut cache = self.cache();
-        let cached = cache.get(key).copied()?;
+        let Some(cached) = cache.get(key).copied() else {
+            self.cache_misses.fetch_add(1, Ordering::Relaxed);
+            return None;
+        };
         if now > cached.cached_until {
             cache.remove(key);
+            self.cache_misses.fetch_add(1, Ordering::Relaxed);
             return None;
         }
+        self.cache_hits.fetch_add(1, Ordering::Relaxed);
         Some(cached.allowed)
     }
 
@@ -288,9 +285,18 @@ impl<S> ChatPermissionPolicy<S> {
             Err(poisoned) => poisoned.into_inner(),
         }
     }
+
+    pub(crate) fn cache_stats(&self) -> crate::runtime_cache::PolicyCacheStats {
+        let size = self.cache().len();
+        crate::runtime_cache::PolicyCacheStats {
+            size,
+            hits: self.cache_hits.load(Ordering::Relaxed),
+            misses: self.cache_misses.load(Ordering::Relaxed),
+            mem_size: size.saturating_mul(std::mem::size_of::<CachedPermission>()) as u64,
+        }
+    }
 }
 
-/// Return the Go permission actions checked before dispatching a queued method.
 pub fn dispatcher_required_actions(
     method_kind: TelegramOutboundMethodKind,
 ) -> &'static [&'static str] {
@@ -304,22 +310,8 @@ pub fn dispatcher_required_actions(
     }
 }
 
-/// Return whether a `carapax` execute error is a Go permission send error.
 pub fn telegram_execute_error_is_permission_error(error: &carapax::api::ExecuteError) -> bool {
-    let carapax::api::ExecuteError::Response(response) = error else {
-        return false;
-    };
-    match response.error_code() {
-        Some(403) => true,
-        Some(400) => is_permission_send_error(response.description()),
-        _ => false,
-    }
-}
-
-fn is_permission_send_error(message: &str) -> bool {
-    message.contains("not enough rights")
-        || message.contains("CHAT_WRITE_FORBIDDEN")
-        || message.contains("have no rights to send a message")
+    classify_telegram_send_error(error).permission_error
 }
 
 fn permission_error_media_flag(method_kind: TelegramOutboundMethodKind) -> Option<bool> {
@@ -401,6 +393,11 @@ mod tests {
         assert!(cached.allowed);
         assert_eq!(cached.source, PermissionCheckSource::Cache);
         assert_eq!(store.load_count(), 1);
+        let stats = policy.cache_stats();
+        assert_eq!(stats.size, 1);
+        assert_eq!(stats.hits, 1);
+        assert_eq!(stats.misses, 1);
+        assert!(stats.mem_size > 0);
         Ok(())
     }
 

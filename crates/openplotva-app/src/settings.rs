@@ -1,20 +1,33 @@
 //! App-level fetcher settings command behavior.
 
-use std::{fmt, future::Future, pin::Pin, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    fmt,
+    future::Future,
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use carapax::types::{
     Chat as TelegramChat, ChatMember as TelegramChatMember, ChatMemberRestricted,
     Message as TelegramMessage, MessageData as TelegramMessageData,
     TextEntity as TelegramTextEntity, Update as TelegramUpdate, UpdateType, User as TelegramUser,
 };
-use openplotva_core::{SENDER_TYPE_CHANNEL, SENDER_TYPE_SAME_CHAT, UserState};
+use openplotva_core::{ChatSettings, SENDER_TYPE_CHANNEL, SENDER_TYPE_SAME_CHAT, UserState};
+use openplotva_server::ACTION_SEND_TEXT;
 use openplotva_storage::{ChatMemberRecord, ChatMemberUpsert};
 use openplotva_taskman::{
     CONTROL_QUEUE_NAME, ControlJobData, ControlJobParams, ControlKind, HIGH_PRIORITY,
-    StatelessJobItem, new_control_job_at,
+    StatelessJobItem, control_job_params_from_stateless_job, new_control_job_at,
 };
 use openplotva_telegram::{
-    ChatRef, DispatcherQueue, OutboundBuildError, ReplyMarkup, ReplyMessageRef, TextMessageRequest,
+    ChatRef, DeleteMessageRequest, DispatcherConfig, DispatcherQueue, OutboundBuildError,
+    ReplyMarkup, ReplyMessageRef, TELEGRAM_PARSE_MODE_HTML, TextMessageRequest,
+    build_delete_message_method, execute_telegram_method,
 };
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -23,6 +36,7 @@ use crate::updates::{UpdateHandler, UpdateHandlerFuture};
 use crate::virtual_messages::{
     QueueTextReport, QueueTextRequest, VirtualIdFactory, VirtualMessageStore,
     monotonic_virtual_id_factory, queue_text_message_parts,
+    send_work_item_and_resolve_with_ephemeral,
 };
 
 const GROUP_SETTINGS_CONTROL_JOB_TITLE: &str = "group settings";
@@ -39,6 +53,10 @@ const GROUP_SETTINGS_OPEN_PRIVATE_TEXT: &str =
 const GROUP_SETTINGS_OPEN_BUTTON_TEXT: &str = "⚙️ Открыть настройки";
 const NEW_MEMBERS_FOLLOWUP_UNBLOCK_TEXT: &str = "🚫 Мои сообщения были отключены в этом чате из-за предыдущих ограничений доступа.\n\nНажмите на кнопку ниже и откройте настройки, где можно будет включить мою отправку сообщений:";
 const NEW_MEMBERS_FOLLOWUP_SETTINGS_BUTTON_TEXT: &str = "⚙️ Настройки";
+const JOIN_GREETING_DELETE_AFTER: Duration = Duration::from_secs(10 * 60);
+const JOIN_GREETING_DEBOUNCE: Duration = Duration::from_secs(30);
+const ADMIN_COMMAND_UNAUTHORIZED_TEXT: &str = "❌ У вас нет прав на выполнение этой команды.";
+const ADMIN_COMMAND_UNAUTHORIZED_DELETE_AFTER: Duration = Duration::from_secs(60);
 const ADMIN_CHAT_SETTINGS_USAGE_TEXT: &str = "Usage: /admin_chat_settings [chat_id или @username]";
 const ADMIN_CHAT_SETTINGS_WEBAPP_MISSING_TEXT: &str = "WebApp URL is not configured.";
 const CHAT_ADMINS_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
@@ -47,15 +65,22 @@ const CHAT_ADMINS_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
 pub type SettingsControlJobQueueFuture<'a, E> =
     Pin<Box<dyn Future<Output = Result<(), E>> + Send + 'a>>;
 
+/// Boxed future returned by settings taskman worker queue calls.
+pub type SettingsControlJobWorkerFuture<'a, T, E> =
+    Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'a>>;
+
 /// Boxed future returned by group settings executor permission checks.
 pub type GroupSettingsControlJobFuture<'a, T, E> =
     Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'a>>;
 
-/// Boxed future returned by Go `syncChatAdmins` equivalents.
 pub type GroupSettingsSyncFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
 /// Boxed future returned by new-members follow-up side effects.
 pub type NewMembersFollowupFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// Boxed future returned by fallible new-members runtime stores.
+pub type NewMembersRuntimeFuture<'a, T, E> =
+    Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'a>>;
 
 /// Boxed future returned by group settings member storage/API calls.
 pub type GroupSettingsMemberFuture<'a, T, E> =
@@ -65,7 +90,6 @@ pub type GroupSettingsMemberFuture<'a, T, E> =
 pub type AdminChatTargetFuture<'a, E> =
     Pin<Box<dyn Future<Output = Result<AdminChatSettingsTarget, E>> + Send + 'a>>;
 
-/// Queue boundary for Go settings-owned taskman control jobs.
 pub trait SettingsControlJobQueue {
     /// Error returned by the concrete queue implementation.
     type Error: fmt::Display + Send + Sync + 'static;
@@ -78,50 +102,642 @@ pub trait SettingsControlJobQueue {
     ) -> SettingsControlJobQueueFuture<'a, Self::Error>;
 }
 
-/// Side-effect boundary for Go group settings control jobs.
+impl<T> SettingsControlJobQueue for T
+where
+    T: crate::payments::PaymentControlJobQueue + Sync,
+{
+    type Error = T::Error;
+
+    fn assign_settings_control_job<'a>(
+        &'a self,
+        queue_name: &'static str,
+        job: StatelessJobItem,
+    ) -> SettingsControlJobQueueFuture<'a, Self::Error> {
+        self.assign_payment_control_job(queue_name, job)
+    }
+}
+
+/// Queue/status boundary for settings-owned taskman control-job workers.
+pub trait SettingsControlJobWorkerQueue {
+    /// Error returned by the concrete queue implementation.
+    type Error: fmt::Display + Send + Sync + 'static;
+
+    fn dequeue_settings_control_job<'a>(
+        &'a self,
+        queue_name: &'static str,
+    ) -> SettingsControlJobWorkerFuture<
+        'a,
+        Option<crate::payments::PaymentControlJobWorkItem>,
+        Self::Error,
+    >;
+
+    /// Finalize one settings-owned control job as completed.
+    fn complete_settings_control_job<'a>(
+        &'a self,
+        job_id: i64,
+    ) -> SettingsControlJobWorkerFuture<'a, (), Self::Error>;
+
+    /// Finalize one settings-owned control job as failed.
+    fn fail_settings_control_job<'a>(
+        &'a self,
+        job_id: i64,
+        error: &'a str,
+    ) -> SettingsControlJobWorkerFuture<'a, (), Self::Error>;
+}
+
+impl<T> SettingsControlJobWorkerQueue for T
+where
+    T: crate::payments::SharedControlJobWorkerQueue + Sync,
+{
+    type Error = T::Error;
+
+    fn dequeue_settings_control_job<'a>(
+        &'a self,
+        queue_name: &'static str,
+    ) -> SettingsControlJobWorkerFuture<
+        'a,
+        Option<crate::payments::PaymentControlJobWorkItem>,
+        Self::Error,
+    > {
+        self.dequeue_shared_control_job_matching(
+            queue_name,
+            "settings-control",
+            is_settings_control_job,
+        )
+    }
+
+    fn complete_settings_control_job<'a>(
+        &'a self,
+        job_id: i64,
+    ) -> SettingsControlJobWorkerFuture<'a, (), Self::Error> {
+        self.complete_shared_control_job(job_id)
+    }
+
+    fn fail_settings_control_job<'a>(
+        &'a self,
+        job_id: i64,
+        error: &'a str,
+    ) -> SettingsControlJobWorkerFuture<'a, (), Self::Error> {
+        self.fail_shared_control_job(job_id, error)
+    }
+}
+
 pub trait GroupSettingsControlJobEffects {
     /// Error returned by permission checks.
     type Error: fmt::Display + Send + Sync + 'static;
 
-    /// Check Go `canOpenGroupSettings`.
     fn can_open_group_settings<'a>(
         &'a self,
         chat_id: i64,
         user_id: i64,
     ) -> GroupSettingsControlJobFuture<'a, bool, Self::Error>;
 
-    /// Run Go `syncChatAdmins`; it logs internally and does not affect the job result.
     fn sync_chat_admins<'a>(&'a self, chat_id: i64) -> GroupSettingsSyncFuture<'a>;
 }
 
-/// Side-effect boundary for Go new-members follow-up control jobs.
 pub trait NewMembersFollowupControlJobEffects {
-    /// Run Go `enableChatCommunication`.
     fn enable_chat_communication<'a>(&'a self, chat_id: i64) -> NewMembersFollowupFuture<'a, ()>;
 
-    /// Check Go `ai.IsChatBlocked` after communication is re-enabled.
     fn is_chat_blocked<'a>(&'a self, chat_id: i64) -> NewMembersFollowupFuture<'a, bool>;
 
-    /// Run Go `trySendGreetingForJoinWave`.
     fn try_send_greeting_for_join_wave<'a>(
         &'a self,
         greeting: NewMembersGreeting,
     ) -> NewMembersFollowupFuture<'a, ()>;
 }
 
-/// Storage boundary for Go new-chat-member persistence.
 pub trait NewMembersFollowupMemberStore {
     /// Error returned by concrete member storage.
     type Error: fmt::Display + Send + Sync + 'static;
 
-    /// Persist one Go `ChatMemberStatusMember` row for a newly joined member.
     fn upsert_new_chat_member<'a>(
         &'a self,
         member: ChatMemberUpsert,
     ) -> GroupSettingsMemberFuture<'a, (), Self::Error>;
 }
 
-/// Storage boundary for Go `canOpenGroupSettings`.
+pub trait NewMembersBlockedChatStore {
+    /// Store error type.
+    type Error: fmt::Display + Send + Sync + 'static;
+
+    /// Check whether a chat is blocked at a specific instant.
+    fn is_chat_blocked_at<'a>(
+        &'a self,
+        chat_id: i64,
+        now: OffsetDateTime,
+    ) -> NewMembersRuntimeFuture<'a, bool, Self::Error>;
+}
+
+impl NewMembersBlockedChatStore for openplotva_storage::RedisBlockedChatStore {
+    type Error = openplotva_storage::StorageError;
+
+    fn is_chat_blocked_at<'a>(
+        &'a self,
+        chat_id: i64,
+        now: OffsetDateTime,
+    ) -> NewMembersRuntimeFuture<'a, bool, Self::Error> {
+        Box::pin(async move { self.is_chat_blocked_at(chat_id, now).await })
+    }
+}
+
+pub trait NewMembersGreetingCache {
+    /// Store error type.
+    type Error: fmt::Display + Send + Sync + 'static;
+
+    /// Record joined user IDs in `join_greet:users:{chat_id}`.
+    fn record_join_member_ids<'a>(
+        &'a self,
+        chat_id: i64,
+        user_ids: &'a [i64],
+        score: i64,
+        ttl: Duration,
+    ) -> NewMembersRuntimeFuture<'a, (), Self::Error>;
+
+    fn start_debounce<'a>(
+        &'a self,
+        chat_id: i64,
+        ttl: Duration,
+    ) -> NewMembersRuntimeFuture<'a, bool, Self::Error>;
+
+    /// Load user ID strings from `join_greet:users:{chat_id}`.
+    fn recent_join_member_ids<'a>(
+        &'a self,
+        chat_id: i64,
+        min_score: i64,
+    ) -> NewMembersRuntimeFuture<'a, Vec<String>, Self::Error>;
+
+    /// Load `join_greet:msg:{chat_id}`.
+    fn previous_greeting_message_id<'a>(
+        &'a self,
+        chat_id: i64,
+    ) -> NewMembersRuntimeFuture<'a, Option<i32>, Self::Error>;
+
+    /// Save `join_greet:msg:{chat_id}`.
+    fn set_previous_greeting_message_id<'a>(
+        &'a self,
+        chat_id: i64,
+        message_id: i32,
+        ttl: Duration,
+    ) -> NewMembersRuntimeFuture<'a, (), Self::Error>;
+}
+
+impl NewMembersGreetingCache for openplotva_storage::RedisJoinGreetingStore {
+    type Error = openplotva_storage::StorageError;
+
+    fn record_join_member_ids<'a>(
+        &'a self,
+        chat_id: i64,
+        user_ids: &'a [i64],
+        score: i64,
+        ttl: Duration,
+    ) -> NewMembersRuntimeFuture<'a, (), Self::Error> {
+        Box::pin(async move {
+            self.record_join_member_ids(chat_id, user_ids, score, ttl)
+                .await
+        })
+    }
+
+    fn start_debounce<'a>(
+        &'a self,
+        chat_id: i64,
+        ttl: Duration,
+    ) -> NewMembersRuntimeFuture<'a, bool, Self::Error> {
+        Box::pin(async move { self.start_debounce(chat_id, ttl).await })
+    }
+
+    fn recent_join_member_ids<'a>(
+        &'a self,
+        chat_id: i64,
+        min_score: i64,
+    ) -> NewMembersRuntimeFuture<'a, Vec<String>, Self::Error> {
+        Box::pin(async move { self.recent_join_member_ids(chat_id, min_score).await })
+    }
+
+    fn previous_greeting_message_id<'a>(
+        &'a self,
+        chat_id: i64,
+    ) -> NewMembersRuntimeFuture<'a, Option<i32>, Self::Error> {
+        Box::pin(async move { self.previous_greeting_message_id(chat_id).await })
+    }
+
+    fn set_previous_greeting_message_id<'a>(
+        &'a self,
+        chat_id: i64,
+        message_id: i32,
+        ttl: Duration,
+    ) -> NewMembersRuntimeFuture<'a, (), Self::Error> {
+        Box::pin(async move {
+            self.set_previous_greeting_message_id(chat_id, message_id, ttl)
+                .await
+        })
+    }
+}
+
+pub trait NewMembersGreetingSettingsStore {
+    /// Store error type.
+    type Error: fmt::Display + Send + Sync + 'static;
+
+    /// Load `chat_settings`.
+    fn greeting_chat_settings<'a>(
+        &'a self,
+        chat_id: i64,
+    ) -> NewMembersRuntimeFuture<'a, Option<ChatSettings>, Self::Error>;
+}
+
+impl NewMembersGreetingSettingsStore for openplotva_storage::PostgresChatSettingsStore {
+    type Error = openplotva_storage::StorageError;
+
+    fn greeting_chat_settings<'a>(
+        &'a self,
+        chat_id: i64,
+    ) -> NewMembersRuntimeFuture<'a, Option<ChatSettings>, Self::Error> {
+        Box::pin(async move { self.get_chat_settings(chat_id).await })
+    }
+}
+
+pub trait NewMembersGreetingMemberDataStore {
+    /// Store error type.
+    type Error: fmt::Display + Send + Sync + 'static;
+
+    /// Load users by IDs.
+    fn list_user_states_by_ids<'a>(
+        &'a self,
+        user_ids: &'a [i64],
+    ) -> NewMembersRuntimeFuture<'a, Vec<UserState>, Self::Error>;
+
+    /// Load one user by ID.
+    fn get_user_state<'a>(
+        &'a self,
+        user_id: i64,
+    ) -> NewMembersRuntimeFuture<'a, Option<UserState>, Self::Error>;
+
+    /// Load chat-member rows by candidate IDs.
+    fn list_chat_members_by_user_ids<'a>(
+        &'a self,
+        chat_id: i64,
+        user_ids: &'a [i64],
+    ) -> NewMembersRuntimeFuture<'a, Vec<ChatMemberRecord>, Self::Error>;
+
+    /// Load one chat-member row.
+    fn get_chat_member<'a>(
+        &'a self,
+        chat_id: i64,
+        user_id: i64,
+    ) -> NewMembersRuntimeFuture<'a, Option<ChatMemberRecord>, Self::Error>;
+}
+
+impl NewMembersGreetingMemberDataStore for openplotva_storage::PostgresChatMemberStore {
+    type Error = openplotva_storage::StorageError;
+
+    fn list_user_states_by_ids<'a>(
+        &'a self,
+        user_ids: &'a [i64],
+    ) -> NewMembersRuntimeFuture<'a, Vec<UserState>, Self::Error> {
+        Box::pin(async move { self.list_user_states_by_ids(user_ids).await })
+    }
+
+    fn get_user_state<'a>(
+        &'a self,
+        user_id: i64,
+    ) -> NewMembersRuntimeFuture<'a, Option<UserState>, Self::Error> {
+        Box::pin(async move { self.get_user_state(user_id).await })
+    }
+
+    fn list_chat_members_by_user_ids<'a>(
+        &'a self,
+        chat_id: i64,
+        user_ids: &'a [i64],
+    ) -> NewMembersRuntimeFuture<'a, Vec<ChatMemberRecord>, Self::Error> {
+        Box::pin(async move { self.list_chat_members_by_user_ids(chat_id, user_ids).await })
+    }
+
+    fn get_chat_member<'a>(
+        &'a self,
+        chat_id: i64,
+        user_id: i64,
+    ) -> NewMembersRuntimeFuture<'a, Option<ChatMemberRecord>, Self::Error> {
+        Box::pin(async move { self.get_chat_member(chat_id, user_id).await })
+    }
+}
+
+pub trait NewMembersGreetingSender {
+    /// Delete the previous greeting message. Errors are logged by the concrete sender.
+    fn delete_previous_greeting_message<'a>(
+        &'a self,
+        chat_id: i64,
+        message_id: i32,
+    ) -> NewMembersFollowupFuture<'a, ()>;
+
+    fn send_ephemeral_greeting<'a>(
+        &'a self,
+        message: NewMembersGreetingMessage,
+    ) -> NewMembersFollowupFuture<'a, Option<i32>>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NewMembersGreetingMessage {
+    /// Telegram chat ID.
+    pub chat_id: i64,
+    /// Trigger service message ID.
+    pub reply_to_message_id: i32,
+    /// Optional topic ID carried by taskman data.
+    pub thread_id: Option<i32>,
+    /// HTML greeting text.
+    pub text: String,
+    pub disable_notification: bool,
+    /// Ephemeral delete timing.
+    pub delete_after: Duration,
+}
+
+/// Runner boundary used by concrete new-members control-job effects.
+pub trait NewMembersGreetingRunner {
+    fn run_join_greeting<'a>(
+        &'a self,
+        greeting: NewMembersGreeting,
+    ) -> NewMembersFollowupFuture<'a, ()>;
+}
+
+/// Concrete new-members follow-up effects composed from communication, blocked-chat, and greeting boundaries.
+#[derive(Clone, Debug)]
+pub struct NewMembersFollowupRuntimeEffects<Communication, Blocked, Greeting> {
+    communication: Communication,
+    blocked: Blocked,
+    greeting: Greeting,
+}
+
+impl<Communication, Blocked, Greeting>
+    NewMembersFollowupRuntimeEffects<Communication, Blocked, Greeting>
+{
+    pub fn new(communication: Communication, blocked: Blocked, greeting: Greeting) -> Self {
+        Self {
+            communication,
+            blocked,
+            greeting,
+        }
+    }
+}
+
+impl<Communication, Blocked, Greeting> NewMembersFollowupControlJobEffects
+    for NewMembersFollowupRuntimeEffects<Communication, Blocked, Greeting>
+where
+    Communication: crate::members::ChatCommunicationEffects + Sync,
+    Blocked: NewMembersBlockedChatStore + Sync,
+    Greeting: NewMembersGreetingRunner + Sync,
+{
+    fn enable_chat_communication<'a>(&'a self, chat_id: i64) -> NewMembersFollowupFuture<'a, ()> {
+        Box::pin(async move {
+            if let Err(error) = self.communication.enable_chat_communication(chat_id).await {
+                tracing::warn!(%error, chat_id, "failed to enable chat communication for new-members follow-up");
+            }
+        })
+    }
+
+    fn is_chat_blocked<'a>(&'a self, chat_id: i64) -> NewMembersFollowupFuture<'a, bool> {
+        Box::pin(async move {
+            match self
+                .blocked
+                .is_chat_blocked_at(chat_id, OffsetDateTime::now_utc())
+                .await
+            {
+                Ok(blocked) => blocked,
+                Err(error) => {
+                    tracing::warn!(%error, chat_id, "failed to check blocked-chat state");
+                    false
+                }
+            }
+        })
+    }
+
+    fn try_send_greeting_for_join_wave<'a>(
+        &'a self,
+        greeting: NewMembersGreeting,
+    ) -> NewMembersFollowupFuture<'a, ()> {
+        self.greeting.run_join_greeting(greeting)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct NewMembersJoinGreetingRuntime<Cache, Settings, Members, Sender> {
+    cache: Cache,
+    settings: Settings,
+    members: Members,
+    sender: Sender,
+    debounce_delay: Duration,
+}
+
+impl<Cache, Settings, Members, Sender>
+    NewMembersJoinGreetingRuntime<Cache, Settings, Members, Sender>
+{
+    pub fn new(cache: Cache, settings: Settings, members: Members, sender: Sender) -> Self {
+        Self {
+            cache,
+            settings,
+            members,
+            sender,
+            debounce_delay: JOIN_GREETING_DEBOUNCE,
+        }
+    }
+
+    /// Override the debounce delay, useful for deterministic tests.
+    pub fn with_debounce_delay(mut self, debounce_delay: Duration) -> Self {
+        self.debounce_delay = debounce_delay;
+        self
+    }
+}
+
+impl<Cache, Settings, Members, Sender> NewMembersGreetingRunner
+    for NewMembersJoinGreetingRuntime<Cache, Settings, Members, Sender>
+where
+    Cache: NewMembersGreetingCache + Clone + Send + Sync + 'static,
+    Settings: NewMembersGreetingSettingsStore + Clone + Send + Sync + 'static,
+    Members: NewMembersGreetingMemberDataStore + Clone + Send + Sync + 'static,
+    Sender: NewMembersGreetingSender + Clone + Send + Sync + 'static,
+{
+    fn run_join_greeting<'a>(
+        &'a self,
+        greeting: NewMembersGreeting,
+    ) -> NewMembersFollowupFuture<'a, ()> {
+        Box::pin(async move {
+            let started = try_send_greeting_for_join_wave_at(
+                &self.cache,
+                &self.settings,
+                &greeting,
+                OffsetDateTime::now_utc(),
+            )
+            .await;
+            if !started {
+                return;
+            }
+
+            if self.debounce_delay.is_zero() {
+                compose_and_send_greeting_at(
+                    &self.cache,
+                    &self.settings,
+                    &self.members,
+                    &self.sender,
+                    &greeting,
+                    OffsetDateTime::now_utc(),
+                )
+                .await;
+                return;
+            }
+
+            let runtime = self.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(runtime.debounce_delay).await;
+                compose_and_send_greeting_at(
+                    &runtime.cache,
+                    &runtime.settings,
+                    &runtime.members,
+                    &runtime.sender,
+                    &greeting,
+                    OffsetDateTime::now_utc(),
+                )
+                .await;
+            });
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct TelegramJoinGreetingSender {
+    virtual_store: openplotva_storage::PostgresVirtualMessageStore,
+    ephemeral_store: openplotva_storage::RedisEphemeralMessageStore,
+    permissions: Arc<
+        crate::permissions::ChatPermissionPolicy<openplotva_storage::PostgresChatSettingsStore>,
+    >,
+    telegram: openplotva_telegram::TelegramClient,
+    next_virtual_id: Arc<AtomicU64>,
+}
+
+impl TelegramJoinGreetingSender {
+    /// Build a concrete join-greeting sender for runtime effects.
+    pub fn new(
+        virtual_store: openplotva_storage::PostgresVirtualMessageStore,
+        ephemeral_store: openplotva_storage::RedisEphemeralMessageStore,
+        permissions: Arc<
+            crate::permissions::ChatPermissionPolicy<openplotva_storage::PostgresChatSettingsStore>,
+        >,
+        telegram: openplotva_telegram::TelegramClient,
+    ) -> Self {
+        Self {
+            virtual_store,
+            ephemeral_store,
+            permissions,
+            telegram,
+            next_virtual_id: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    fn next_virtual_id(&self) -> String {
+        let id = self.next_virtual_id.fetch_add(1, Ordering::Relaxed);
+        format!("join-greeting-{id}")
+    }
+}
+
+impl NewMembersGreetingSender for TelegramJoinGreetingSender {
+    fn delete_previous_greeting_message<'a>(
+        &'a self,
+        chat_id: i64,
+        message_id: i32,
+    ) -> NewMembersFollowupFuture<'a, ()> {
+        Box::pin(async move {
+            let Ok(method) = build_delete_message_method(&DeleteMessageRequest {
+                chat_id,
+                message_id: i64::from(message_id),
+            }) else {
+                return;
+            };
+            if let Err(error) = execute_telegram_method(&self.telegram, method.into()).await {
+                tracing::warn!(%error, chat_id, message_id, "failed to delete previous join greeting");
+            }
+        })
+    }
+
+    fn send_ephemeral_greeting<'a>(
+        &'a self,
+        message: NewMembersGreetingMessage,
+    ) -> NewMembersFollowupFuture<'a, Option<i32>> {
+        Box::pin(async move {
+            let now = OffsetDateTime::now_utc();
+            let permission = self
+                .permissions
+                .can_perform_action_at(message.chat_id, None, ACTION_SEND_TEXT, now)
+                .await;
+            if !permission.allowed {
+                return None;
+            }
+
+            let queue = DispatcherQueue::new(DispatcherConfig::default());
+            let chat = ChatRef {
+                id: message.chat_id,
+                is_forum: message.thread_id.is_some(),
+            };
+            let request = TextMessageRequest {
+                chat: Some(chat),
+                message_thread_id: message.thread_id.unwrap_or_default().into(),
+                disable_notification: message.disable_notification,
+                allow_sending_without_reply: None,
+                text: message.text,
+                render_as: TELEGRAM_PARSE_MODE_HTML.to_owned(),
+                reply_markup: None,
+            };
+            let reply_to = ReplyMessageRef {
+                message_id: i64::from(message.reply_to_message_id),
+                chat,
+                is_topic_message: message.thread_id.is_some(),
+                message_thread_id: message.thread_id.unwrap_or_default().into(),
+            };
+            if let Err(error) = queue_text_message_parts(
+                &self.virtual_store,
+                &queue,
+                QueueTextRequest {
+                    message: &request,
+                    reply_to: Some(&reply_to),
+                    immediate_first: true,
+                    bypass_chat_restrictions: false,
+                    ephemeral_delete_after: Some(message.delete_after),
+                },
+                || self.next_virtual_id(),
+            )
+            .await
+            {
+                tracing::warn!(%error, chat_id = chat.id, "failed to queue join greeting");
+                return None;
+            }
+
+            let mut first_message_id = None;
+            let mut next = queue
+                .dequeue_immediate()
+                .or_else(|| queue.dequeue_regular());
+            while let Some(item) = next {
+                let report = send_work_item_and_resolve_with_ephemeral(
+                    &self.virtual_store,
+                    &self.ephemeral_store,
+                    item,
+                    OffsetDateTime::now_utc(),
+                    |method| async move { execute_telegram_method(&self.telegram, method).await },
+                )
+                .await;
+                if first_message_id.is_none() {
+                    first_message_id = report.resolved_message_id;
+                }
+                if let Some(error) = report.send_error {
+                    tracing::warn!(
+                        error,
+                        chat_id = chat.id,
+                        "failed to send join greeting part"
+                    );
+                }
+                next = queue
+                    .dequeue_immediate()
+                    .or_else(|| queue.dequeue_regular());
+            }
+            first_message_id
+        })
+    }
+}
+
 pub trait GroupSettingsMemberStore {
     /// Error returned by concrete member storage.
     type Error: fmt::Display + Send + Sync + 'static;
@@ -140,7 +756,6 @@ pub trait GroupSettingsMemberStore {
     ) -> GroupSettingsMemberFuture<'a, (), Self::Error>;
 }
 
-/// Telegram boundary for Go `getChatMember` permission probes.
 pub trait GroupSettingsMemberApi {
     /// Error returned by concrete Telegram calls.
     type Error: fmt::Display + Send + Sync + 'static;
@@ -153,7 +768,6 @@ pub trait GroupSettingsMemberApi {
     ) -> GroupSettingsMemberFuture<'a, TelegramChatMember, Self::Error>;
 }
 
-/// Storage boundary for Go `syncChatAdmins`.
 pub trait GroupSettingsAdminSyncStore {
     /// Error returned by concrete admin-sync storage.
     type Error: fmt::Display + Send + Sync + 'static;
@@ -170,14 +784,12 @@ pub trait GroupSettingsAdminSyncStore {
         member: ChatMemberUpsert,
     ) -> GroupSettingsMemberFuture<'a, (), Self::Error>;
 
-    /// Persist the admin user, matching Go `ensureUserPersistence`.
     fn upsert_user_state<'a>(
         &'a self,
         user: UserState,
     ) -> GroupSettingsMemberFuture<'a, (), Self::Error>;
 }
 
-/// Redis cache boundary for Go `syncChatAdmins`.
 pub trait GroupSettingsAdminCache {
     /// Error returned by concrete admin-cache storage.
     type Error: fmt::Display + Send + Sync + 'static;
@@ -191,7 +803,6 @@ pub trait GroupSettingsAdminCache {
     ) -> GroupSettingsMemberFuture<'a, (), Self::Error>;
 }
 
-/// Telegram boundary for Go `getChatAdministrators`.
 pub trait GroupSettingsAdminsApi {
     /// Error returned by concrete Telegram calls.
     type Error: fmt::Display + Send + Sync + 'static;
@@ -203,7 +814,84 @@ pub trait GroupSettingsAdminsApi {
     ) -> GroupSettingsMemberFuture<'a, Vec<TelegramChatMember>, Self::Error>;
 }
 
-/// Telegram chat data needed by Go `/admin_chat_settings`.
+#[derive(Clone, Debug)]
+pub struct GroupSettingsRuntimeEffects<MemberStore, MemberApi, AdminStore, AdminApi, AdminCache> {
+    member_store: MemberStore,
+    member_api: MemberApi,
+    admin_store: AdminStore,
+    admin_api: AdminApi,
+    admin_cache: AdminCache,
+}
+
+impl<MemberStore, MemberApi, AdminStore, AdminApi, AdminCache>
+    GroupSettingsRuntimeEffects<MemberStore, MemberApi, AdminStore, AdminApi, AdminCache>
+{
+    /// Build concrete group-settings control-job effects from storage, Telegram, and cache ports.
+    #[must_use]
+    pub fn new(
+        member_store: MemberStore,
+        member_api: MemberApi,
+        admin_store: AdminStore,
+        admin_api: AdminApi,
+        admin_cache: AdminCache,
+    ) -> Self {
+        Self {
+            member_store,
+            member_api,
+            admin_store,
+            admin_api,
+            admin_cache,
+        }
+    }
+}
+
+impl<MemberStore, MemberApi, AdminStore, AdminApi, AdminCache> GroupSettingsControlJobEffects
+    for GroupSettingsRuntimeEffects<MemberStore, MemberApi, AdminStore, AdminApi, AdminCache>
+where
+    MemberStore: GroupSettingsMemberStore + Send + Sync,
+    MemberApi: GroupSettingsMemberApi + Send + Sync,
+    AdminStore: GroupSettingsAdminSyncStore + Send + Sync,
+    AdminApi: GroupSettingsAdminsApi + Send + Sync,
+    AdminCache: GroupSettingsAdminCache + Send + Sync,
+{
+    type Error = GroupSettingsPermissionCheckError;
+
+    fn can_open_group_settings<'a>(
+        &'a self,
+        chat_id: i64,
+        user_id: i64,
+    ) -> GroupSettingsControlJobFuture<'a, bool, Self::Error> {
+        Box::pin(async move {
+            can_open_group_settings_with_sources(
+                &self.member_store,
+                &self.member_api,
+                chat_id,
+                user_id,
+            )
+            .await
+        })
+    }
+
+    fn sync_chat_admins<'a>(&'a self, chat_id: i64) -> GroupSettingsSyncFuture<'a> {
+        Box::pin(async move {
+            if let Err(error) = sync_chat_admins_with_cache(
+                &self.admin_store,
+                &self.admin_api,
+                &self.admin_cache,
+                chat_id,
+            )
+            .await
+            {
+                tracing::warn!(
+                    %error,
+                    chat_id,
+                    "failed to sync chat administrators for group settings control job"
+                );
+            }
+        })
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct AdminChatSettingsTarget {
     /// Telegram chat ID.
@@ -218,7 +906,6 @@ pub struct AdminChatSettingsTarget {
     pub last_name: String,
 }
 
-/// Telegram boundary for Go `resolveChatTarget`.
 pub trait AdminChatTargetResolver {
     /// Error returned by concrete Telegram calls.
     type Error: fmt::Display + Send + Sync + 'static;
@@ -230,10 +917,8 @@ pub trait AdminChatTargetResolver {
     ) -> AdminChatTargetFuture<'a, Self::Error>;
 }
 
-/// Error returned by the concrete Go `canOpenGroupSettings` port.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum GroupSettingsPermissionCheckError {
-    /// Go returns an error when the caller user ID is missing.
     #[error("missing caller user ID")]
     MissingCaller,
     /// Telegram permission probe failed.
@@ -244,7 +929,6 @@ pub enum GroupSettingsPermissionCheckError {
 /// Source used by a group-settings admin sync attempt.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum GroupSettingsAdminSyncSource {
-    /// Go skips zero chat IDs before IO.
     #[default]
     Skipped,
     /// Administrators came from Telegram `getChatAdministrators`.
@@ -253,7 +937,6 @@ pub enum GroupSettingsAdminSyncSource {
     StoredFallback,
 }
 
-/// Testable report for Go `syncChatAdmins` side effects.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct GroupSettingsAdminSyncReport {
     /// Source used for admin rows.
@@ -268,7 +951,6 @@ pub struct GroupSettingsAdminSyncReport {
     pub cache_errors: usize,
 }
 
-/// Error returned by the concrete Go `syncChatAdmins` port.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum GroupSettingsAdminSyncError {
     /// Telegram failed and no stored admin fallback was available.
@@ -279,7 +961,6 @@ pub enum GroupSettingsAdminSyncError {
     Storage(String),
 }
 
-/// Error returned by the concrete Go `resolveChatTarget` port.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum AdminChatTargetResolveError {
     /// Telegram `getChat` failed for a numeric chat ID.
@@ -293,52 +974,37 @@ pub enum AdminChatTargetResolveError {
 /// Result of handling a decoded `/settings` update.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SettingsCommandOutcome {
-    /// The update was not a Telegram message carrying Go's `/settings` command.
     NotSettingsCommand,
     /// The command was not in a private chat; group handling is a later taskman slice.
     NonPrivateChat,
-    /// Go logs and returns when `WEBAPP_URL` is blank.
     WebAppUrlMissing,
-    /// The private settings link was queued through Go's text-send path.
     Queued(QueueTextReport),
 }
 
-/// Result of building Go's group `/settings` control job.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GroupSettingsControlJobBuild {
-    /// The update was not a Telegram message carrying Go's `/settings` command.
     NotSettingsCommand,
     /// Private chats are handled by `handlePrivateSettingsCommand`.
     PrivateChat,
-    /// Go declines anonymous admins sent as the chat itself.
     UnsupportedSameChatSender,
-    /// Go declines linked-channel senders because owner rights cannot be checked.
     UnsupportedChannelSender,
-    /// Go logs and returns when the caller user ID is absent.
     MissingCaller,
-    /// Telegram identifiers did not fit the Go-shaped taskman payload.
     InvalidMessage,
-    /// Go-shaped taskman job for the control queue.
     Job(Box<StatelessJobItem>),
 }
 
-/// Result of building Go's new-members follow-up control job.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NewMembersFollowupControlJobBuild {
     /// The update was not a Telegram message.
     NotMessage,
     /// The message had no `new_chat_members` service payload.
     NoNewChatMembers,
-    /// Telegram identifiers did not fit the Go-shaped taskman payload.
     InvalidMessage,
-    /// Go-shaped taskman job for the control queue.
     Job(Box<StatelessJobItem>),
 }
 
-/// Result of handling Go's group `/settings` command path.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GroupSettingsCommandOutcome {
-    /// The update was not a Telegram message carrying Go's `/settings` command.
     NotSettingsCommand,
     /// Private chats are handled by `handlePrivateSettingsCommand`.
     PrivateChat,
@@ -346,35 +1012,31 @@ pub enum GroupSettingsCommandOutcome {
     UnsupportedSameChatSender(QueueTextReport),
     /// Channel sender decline text was queued.
     UnsupportedChannelSender(QueueTextReport),
-    /// Go logs and returns when the caller user ID is absent.
     MissingCaller,
-    /// Telegram identifiers did not fit the Go-shaped taskman payload.
     InvalidMessage,
-    /// Assigning the control job failed; Go queues the failure text.
     QueueError(QueueTextReport),
     /// The control job was assigned and the wait notice was queued.
-    Queued { notice: QueueTextReport },
+    Queued {
+        notice: QueueTextReport,
+    },
 }
 
-/// Result of handling Go's new-members follow-up producer path.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NewMembersFollowupUpdateOutcome {
     /// The update was not a Telegram message.
     NotMessage,
     /// The message had no new-chat-member service payload.
     NoNewChatMembers,
-    /// Telegram identifiers did not fit the Go-shaped taskman payload.
     InvalidMessage,
-    /// Assigning the control job failed; Go queues the generic failure notice.
     QueueError {
         notice: QueueTextReport,
         member_upsert_errors: usize,
     },
-    /// The control job was assigned. Go sends no success notice for this producer.
-    Queued { member_upsert_errors: usize },
+    Queued {
+        member_upsert_errors: usize,
+    },
 }
 
-/// Inputs that identify one Go new-members producer pass.
 #[derive(Clone, Copy, Debug)]
 pub struct NewMembersFollowupUpdateInput<'a> {
     /// Decoded Telegram update.
@@ -420,7 +1082,6 @@ pub enum SettingsUpdateRoute {
     PrivateSettings(SettingsCommandOutcome),
     /// A group `/settings` command was handled.
     GroupSettings(GroupSettingsCommandOutcome),
-    /// A `new_chat_members` producer ran, then the update was delegated like Go.
     NewMembersFollowup {
         /// Producer outcome.
         outcome: NewMembersFollowupUpdateOutcome,
@@ -550,34 +1211,28 @@ where
     }
 }
 
-/// Result of executing Go's group-settings control-job slice.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GroupSettingsControlJobOutcome {
     /// The job was not the group-settings control kind.
     UnsupportedKind(ControlKind),
-    /// Permission check failed; Go sends a retry-later notice and returns the check error.
     PermissionCheckFailed(String),
     /// The caller is not allowed to manage group settings.
     PermissionDenied,
-    /// Go returns an error before sync/send when the bot username is unavailable.
     BotUsernameMissing,
     /// Admin sync ran and the settings deep-link notice was queued.
     SentLink,
 }
 
-/// Control-message shape passed to the future Go greeting implementation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NewMembersGreeting {
     /// Telegram chat ID.
     pub chat_id: i64,
     /// Trigger message ID.
     pub message_id: i32,
-    /// Thread ID carried by taskman data, even though Go's reply helper omits it for control messages.
     pub thread_id: Option<i32>,
     pub new_chat_member_ids: Vec<i64>,
 }
 
-/// Result of executing Go's new-members follow-up control-job slice.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NewMembersFollowupControlJobOutcome {
     /// The job was not the new-members follow-up control kind.
@@ -586,22 +1241,232 @@ pub enum NewMembersFollowupControlJobOutcome {
     Completed { unblock_notice_queued: bool },
 }
 
-/// Result of handling Go's `/admin_chat_settings` command path after admin auth.
+/// Settings-owned control-job execution result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SettingsControlJobExecution {
+    /// Group settings executor result.
+    GroupSettings(GroupSettingsControlJobOutcome),
+    /// New-members follow-up executor result.
+    NewMembersFollowup(NewMembersFollowupControlJobOutcome),
+}
+
+/// Result of one settings-owned taskman worker tick.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SettingsControlJobWorkerReport {
+    /// Whether a job was dequeued.
+    pub dequeued: bool,
+    /// Dequeued taskman job ID.
+    pub job_id: Option<i64>,
+    /// Settings executor result, when payload decoding succeeded.
+    pub execution: Option<SettingsControlJobExecution>,
+    /// The job was finalized as completed.
+    pub completed: bool,
+    /// The job was finalized as failed.
+    pub failed: bool,
+    /// Queue dequeue failed.
+    pub dequeue_error: Option<String>,
+    pub decode_error: Option<String>,
+    /// Executor returned a direct runtime error.
+    pub execution_error: Option<String>,
+    /// Completion/failure status write failed.
+    pub status_error: Option<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AdminChatSettingsCommandOutcome {
-    /// The update was not a Telegram message carrying Go's admin chat settings command.
     NotAdminChatSettingsCommand,
-    /// Go sent the usage text because no target chat was provided.
     Usage(QueueTextReport),
-    /// Go sent the target resolution error text.
     ResolveError(QueueTextReport),
-    /// Go sent the missing WebApp URL text.
     WebAppUrlMissing(QueueTextReport),
     /// The target settings button was queued.
     Queued(QueueTextReport),
 }
 
-/// Handle Go's private `/settings` command path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AdminChatSettingsCommandUpdateOutcome {
+    /// Update was not owned by this slice and went downstream.
+    Delegated,
+    Unauthorized,
+    UnauthorizedSendError {
+        /// Queue/build error text.
+        message: String,
+    },
+    /// The authorized command was handled by the pure command path.
+    Handled(AdminChatSettingsCommandOutcome),
+    /// The authorized command hit a queue/build error while sending its result.
+    SendError {
+        /// Queue/build error text.
+        message: String,
+    },
+}
+
+#[derive(Clone)]
+pub struct AdminChatSettingsCommandUpdateHandler<Store, Resolver, Next> {
+    store: Arc<Store>,
+    dispatcher_queue: Arc<DispatcherQueue>,
+    resolver: Arc<Resolver>,
+    admin_ids: Arc<[i64]>,
+    bot_username: String,
+    web_app_url: String,
+    next_virtual_id: VirtualIdFactory,
+    next: Arc<Next>,
+}
+
+impl<Store, Resolver, Next> AdminChatSettingsCommandUpdateHandler<Store, Resolver, Next> {
+    /// Build the admin chat-settings command handler around a real downstream handler.
+    #[must_use]
+    pub fn new(
+        store: Arc<Store>,
+        dispatcher_queue: Arc<DispatcherQueue>,
+        resolver: Arc<Resolver>,
+        admin_ids: Vec<i64>,
+        bot_username: impl Into<String>,
+        web_app_url: impl Into<String>,
+        next: Arc<Next>,
+    ) -> Self {
+        Self {
+            store,
+            dispatcher_queue,
+            resolver,
+            admin_ids: Arc::from(admin_ids.into_boxed_slice()),
+            bot_username: bot_username.into(),
+            web_app_url: web_app_url.into(),
+            next_virtual_id: monotonic_virtual_id_factory("admin-chat-settings-vmsg"),
+            next,
+        }
+    }
+
+    /// Override virtual-message ID generation for deterministic tests.
+    #[must_use]
+    pub fn with_virtual_id_factory(mut self, next_virtual_id: VirtualIdFactory) -> Self {
+        self.next_virtual_id = next_virtual_id;
+        self
+    }
+}
+
+impl<Store, Resolver, Next> UpdateHandler
+    for AdminChatSettingsCommandUpdateHandler<Store, Resolver, Next>
+where
+    Store: VirtualMessageStore + Send + Sync,
+    Resolver: AdminChatTargetResolver + Send + Sync,
+    Next: UpdateHandler + Send + Sync,
+{
+    type Error = Next::Error;
+
+    fn handle_update<'a>(&'a self, update: TelegramUpdate) -> UpdateHandlerFuture<'a, Self::Error> {
+        Box::pin(async move {
+            handle_admin_chat_settings_command_update_or_else_at(
+                AdminChatSettingsCommandUpdateRuntime {
+                    store: self.store.as_ref(),
+                    dispatcher_queue: self.dispatcher_queue.as_ref(),
+                    resolver: self.resolver.as_ref(),
+                    admin_ids: &self.admin_ids,
+                    bot_username: &self.bot_username,
+                    web_app_url: &self.web_app_url,
+                    next_virtual_id: &self.next_virtual_id,
+                },
+                update,
+                |update| self.next.handle_update(update),
+            )
+            .await
+            .map(|_| ())
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct AdminChatSettingsCommandUpdateRuntime<'a, Store, Resolver> {
+    pub store: &'a Store,
+    pub dispatcher_queue: &'a DispatcherQueue,
+    pub resolver: &'a Resolver,
+    /// Authorized Telegram admin user IDs.
+    pub admin_ids: &'a [i64],
+    /// Current bot username from `getMe`.
+    pub bot_username: &'a str,
+    /// Settings WebApp base URL.
+    pub web_app_url: &'a str,
+    /// Virtual ID generator for queued replies.
+    pub next_virtual_id: &'a VirtualIdFactory,
+}
+
+pub async fn handle_admin_chat_settings_command_update_or_else_at<
+    Store,
+    Resolver,
+    HandleFn,
+    HandleFuture,
+    HandleError,
+>(
+    runtime: AdminChatSettingsCommandUpdateRuntime<'_, Store, Resolver>,
+    update: TelegramUpdate,
+    handle_other: HandleFn,
+) -> Result<AdminChatSettingsCommandUpdateOutcome, HandleError>
+where
+    Store: VirtualMessageStore + Sync,
+    Resolver: AdminChatTargetResolver + Sync,
+    HandleFn: FnOnce(TelegramUpdate) -> HandleFuture,
+    HandleFuture: Future<Output = Result<(), HandleError>>,
+{
+    let UpdateType::Message(message) = &update.update_type else {
+        handle_other(update).await?;
+        return Ok(AdminChatSettingsCommandUpdateOutcome::Delegated);
+    };
+    let Some(command) = admin_chat_settings_command_for_message(message, runtime.bot_username)
+    else {
+        handle_other(update).await?;
+        return Ok(AdminChatSettingsCommandUpdateOutcome::Delegated);
+    };
+    if !command.name.eq_ignore_ascii_case("admin_chat_settings") {
+        handle_other(update).await?;
+        return Ok(AdminChatSettingsCommandUpdateOutcome::Delegated);
+    }
+
+    let actor_user_id = message
+        .sender
+        .get_user()
+        .map(|user| i64::from(user.id))
+        .unwrap_or_default();
+    if !runtime.admin_ids.contains(&actor_user_id) {
+        return match queue_admin_chat_settings_ephemeral_text(
+            runtime.store,
+            runtime.dispatcher_queue,
+            message,
+            ADMIN_COMMAND_UNAUTHORIZED_TEXT,
+            || (runtime.next_virtual_id)(),
+        )
+        .await
+        {
+            Ok(_) => Ok(AdminChatSettingsCommandUpdateOutcome::Unauthorized),
+            Err(error) => {
+                tracing::warn!(%error, actor_user_id, "failed to queue admin chat-settings denial");
+                Ok(
+                    AdminChatSettingsCommandUpdateOutcome::UnauthorizedSendError {
+                        message: error.to_string(),
+                    },
+                )
+            }
+        };
+    }
+
+    let outcome = handle_admin_chat_settings_command_update(
+        runtime.store,
+        runtime.dispatcher_queue,
+        runtime.resolver,
+        &update,
+        runtime.web_app_url,
+        || (runtime.next_virtual_id)(),
+    )
+    .await;
+    match outcome {
+        Ok(outcome) => Ok(AdminChatSettingsCommandUpdateOutcome::Handled(outcome)),
+        Err(error) => {
+            tracing::warn!(%error, actor_user_id, "failed to queue admin chat-settings result");
+            Ok(AdminChatSettingsCommandUpdateOutcome::SendError {
+                message: error.to_string(),
+            })
+        }
+    }
+}
+
 pub async fn handle_private_settings_command_update<S, NextId>(
     store: &S,
     queue: &DispatcherQueue,
@@ -670,7 +1535,6 @@ where
     Ok(SettingsCommandOutcome::Queued(report))
 }
 
-/// Handle Go's `/admin_chat_settings` command path after admin authorization.
 pub async fn handle_admin_chat_settings_command_update<S, Resolver, NextId>(
     store: &S,
     dispatcher_queue: &DispatcherQueue,
@@ -773,7 +1637,6 @@ where
     Ok(AdminChatSettingsCommandOutcome::Queued(report))
 }
 
-/// Execute Go's group-settings control-job behavior up to Telegram dispatch queueing.
 pub async fn execute_group_settings_control_job_at<S, Effects, NextId>(
     store: &S,
     dispatcher_queue: &DispatcherQueue,
@@ -851,7 +1714,6 @@ where
     Ok(GroupSettingsControlJobOutcome::SentLink)
 }
 
-/// Execute Go's new-members follow-up control-job behavior up to Telegram dispatch queueing.
 pub async fn execute_new_members_followup_control_job_at<S, Effects, NextId>(
     store: &S,
     dispatcher_queue: &DispatcherQueue,
@@ -904,7 +1766,144 @@ where
     })
 }
 
-/// Build the Go taskman control job produced by group `/settings`.
+/// Process one settings-owned taskman control job, if available.
+pub async fn process_settings_control_job_once_at<Queue, Store, GroupEffects, NewEffects, NextId>(
+    queue: &Queue,
+    store: &Store,
+    dispatcher_queue: &DispatcherQueue,
+    group_effects: &GroupEffects,
+    new_members_effects: &NewEffects,
+    bot_username: &str,
+    mut next_virtual_id: NextId,
+) -> SettingsControlJobWorkerReport
+where
+    Queue: SettingsControlJobWorkerQueue + Sync,
+    Store: VirtualMessageStore + Sync,
+    GroupEffects: GroupSettingsControlJobEffects + Sync,
+    NewEffects: NewMembersFollowupControlJobEffects + Sync,
+    NextId: FnMut() -> String,
+{
+    let mut report = SettingsControlJobWorkerReport::default();
+    let item = match queue.dequeue_settings_control_job(CONTROL_QUEUE_NAME).await {
+        Ok(item) => item,
+        Err(error) => {
+            report.dequeue_error = Some(error.to_string());
+            return report;
+        }
+    };
+
+    let Some(item) = item else {
+        return report;
+    };
+    report.dequeued = true;
+    report.job_id = Some(item.id);
+
+    let params = match control_job_params_from_stateless_job(&item.job) {
+        Ok(params) => params,
+        Err(error) => {
+            let error = error.to_string();
+            report.decode_error = Some(error.clone());
+            mark_settings_control_job_failed(queue, item.id, &error, &mut report).await;
+            return report;
+        }
+    };
+
+    let execution = match params.data.kind {
+        ControlKind::GroupSettings => execute_group_settings_control_job_at(
+            store,
+            dispatcher_queue,
+            group_effects,
+            &params,
+            bot_username,
+            &mut next_virtual_id,
+        )
+        .await
+        .map(SettingsControlJobExecution::GroupSettings),
+        ControlKind::NewMembersFollowup => execute_new_members_followup_control_job_at(
+            store,
+            dispatcher_queue,
+            new_members_effects,
+            &params,
+            bot_username,
+            &mut next_virtual_id,
+        )
+        .await
+        .map(SettingsControlJobExecution::NewMembersFollowup),
+        kind => Ok(SettingsControlJobExecution::GroupSettings(
+            GroupSettingsControlJobOutcome::UnsupportedKind(kind),
+        )),
+    };
+
+    let execution = match execution {
+        Ok(execution) => execution,
+        Err(error) => {
+            let error = error.to_string();
+            report.execution_error = Some(error.clone());
+            mark_settings_control_job_failed(queue, item.id, &error, &mut report).await;
+            return report;
+        }
+    };
+
+    if let Some(error) = settings_control_job_failure_message(&execution) {
+        mark_settings_control_job_failed(queue, item.id, &error, &mut report).await;
+    } else {
+        match queue.complete_settings_control_job(item.id).await {
+            Ok(()) => report.completed = true,
+            Err(error) => report.status_error = Some(error.to_string()),
+        }
+    }
+    report.execution = Some(execution);
+    report
+}
+
+async fn mark_settings_control_job_failed<Queue>(
+    queue: &Queue,
+    job_id: i64,
+    error: &str,
+    report: &mut SettingsControlJobWorkerReport,
+) where
+    Queue: SettingsControlJobWorkerQueue + Sync,
+{
+    match queue.fail_settings_control_job(job_id, error).await {
+        Ok(()) => report.failed = true,
+        Err(error) => report.status_error = Some(error.to_string()),
+    }
+}
+
+pub(crate) fn settings_control_job_failure_message(
+    execution: &SettingsControlJobExecution,
+) -> Option<String> {
+    match execution {
+        SettingsControlJobExecution::GroupSettings(
+            GroupSettingsControlJobOutcome::PermissionCheckFailed(error),
+        ) => Some(error.clone()),
+        SettingsControlJobExecution::GroupSettings(
+            GroupSettingsControlJobOutcome::BotUsernameMissing,
+        ) => Some("bot username is empty".to_owned()),
+        SettingsControlJobExecution::GroupSettings(
+            GroupSettingsControlJobOutcome::UnsupportedKind(kind),
+        )
+        | SettingsControlJobExecution::NewMembersFollowup(
+            NewMembersFollowupControlJobOutcome::UnsupportedKind(kind),
+        ) => Some(format!("unsupported settings control job kind: {kind:?}")),
+        SettingsControlJobExecution::GroupSettings(
+            GroupSettingsControlJobOutcome::PermissionDenied,
+        )
+        | SettingsControlJobExecution::GroupSettings(GroupSettingsControlJobOutcome::SentLink)
+        | SettingsControlJobExecution::NewMembersFollowup(
+            NewMembersFollowupControlJobOutcome::Completed { .. },
+        ) => None,
+    }
+}
+
+fn is_settings_control_job(job: &StatelessJobItem) -> bool {
+    job.data.job_type == openplotva_taskman::JobType::Control
+        && matches!(
+            job.data.control_data.as_ref().map(|data| data.kind),
+            Some(ControlKind::GroupSettings | ControlKind::NewMembersFollowup)
+        )
+}
+
 #[must_use]
 pub fn group_settings_control_job_from_update_at(
     update: &TelegramUpdate,
@@ -917,7 +1916,6 @@ pub fn group_settings_control_job_from_update_at(
     group_settings_control_job_from_message_at(message, bot_username, created)
 }
 
-/// Build the Go taskman control job produced by `processNewChatMembers`.
 #[must_use]
 pub fn new_members_followup_control_job_from_update_at(
     update: &TelegramUpdate,
@@ -930,7 +1928,6 @@ pub fn new_members_followup_control_job_from_update_at(
     new_members_followup_control_job_from_message_at(message, bot_id, created)
 }
 
-/// Handle Go's group `/settings` command path up to taskman assignment.
 pub async fn handle_group_settings_command_update_at<S, Queue, NextId>(
     store: &S,
     dispatcher_queue: &DispatcherQueue,
@@ -1027,7 +2024,6 @@ where
     }
 }
 
-/// Handle Go `processNewChatMembers` up to taskman assignment.
 pub async fn handle_new_members_followup_update_at<S, Members, Queue, NextId>(
     store: &S,
     dispatcher_queue: &DispatcherQueue,
@@ -1540,6 +2536,48 @@ where
     .await
 }
 
+async fn queue_admin_chat_settings_ephemeral_text<S, NextId>(
+    store: &S,
+    queue: &DispatcherQueue,
+    message: &TelegramMessage,
+    text: &str,
+    next_virtual_id: NextId,
+) -> Result<QueueTextReport, OutboundBuildError>
+where
+    S: VirtualMessageStore + Sync,
+    NextId: FnMut() -> String,
+{
+    let chat = message_chat_ref(message);
+    let request = TextMessageRequest {
+        chat: Some(chat),
+        message_thread_id: message.message_thread_id.unwrap_or_default(),
+        disable_notification: false,
+        allow_sending_without_reply: None,
+        text: text.to_owned(),
+        render_as: String::new(),
+        reply_markup: None,
+    };
+    let reply_to = ReplyMessageRef {
+        message_id: message.id,
+        chat,
+        is_topic_message: message.message_thread_id.is_some(),
+        message_thread_id: message.message_thread_id.unwrap_or_default(),
+    };
+    queue_text_message_parts(
+        store,
+        queue,
+        QueueTextRequest {
+            message: &request,
+            reply_to: Some(&reply_to),
+            immediate_first: true,
+            bypass_chat_restrictions: false,
+            ephemeral_delete_after: Some(ADMIN_COMMAND_UNAUTHORIZED_DELETE_AFTER),
+        },
+        next_virtual_id,
+    )
+    .await
+}
+
 struct AdminChatSettingsText<'a> {
     text: &'a str,
     reply_markup: Option<ReplyMarkup>,
@@ -1556,9 +2594,355 @@ fn new_members_greeting_from_control_params(params: &ControlJobParams) -> NewMem
     }
 }
 
+pub async fn try_send_greeting_for_join_wave_at<Cache, Settings>(
+    cache: &Cache,
+    settings: &Settings,
+    greeting: &NewMembersGreeting,
+    now: OffsetDateTime,
+) -> bool
+where
+    Cache: NewMembersGreetingCache + Sync,
+    Settings: NewMembersGreetingSettingsStore + Sync,
+{
+    if greeting.new_chat_member_ids.is_empty() {
+        return false;
+    }
+    let Some(settings) = load_join_greeting_settings(settings, greeting.chat_id).await else {
+        return false;
+    };
+    if !join_greeting_enabled(&settings) {
+        return false;
+    }
+
+    if let Err(error) = cache
+        .record_join_member_ids(
+            greeting.chat_id,
+            &greeting.new_chat_member_ids,
+            now.unix_timestamp(),
+            openplotva_storage::JOIN_GREETING_USERS_TTL,
+        )
+        .await
+    {
+        tracing::warn!(%error, chat_id = greeting.chat_id, "failed to record join-greeting users");
+    }
+
+    match cache
+        .start_debounce(
+            greeting.chat_id,
+            openplotva_storage::JOIN_GREETING_DEBOUNCE_TTL,
+        )
+        .await
+    {
+        Ok(started) => started,
+        Err(error) => {
+            tracing::warn!(%error, chat_id = greeting.chat_id, "failed to start join-greeting debounce");
+            false
+        }
+    }
+}
+
+pub async fn compose_and_send_greeting_at<Cache, Settings, Members, Sender>(
+    cache: &Cache,
+    settings: &Settings,
+    members: &Members,
+    sender: &Sender,
+    greeting: &NewMembersGreeting,
+    now: OffsetDateTime,
+) where
+    Cache: NewMembersGreetingCache + Sync,
+    Settings: NewMembersGreetingSettingsStore + Sync,
+    Members: NewMembersGreetingMemberDataStore + Sync,
+    Sender: NewMembersGreetingSender + Sync,
+{
+    let min_score = now.unix_timestamp() - JOIN_GREETING_DEBOUNCE.as_secs() as i64;
+    let user_ids = match cache
+        .recent_join_member_ids(greeting.chat_id, min_score)
+        .await
+    {
+        Ok(user_ids) => user_ids,
+        Err(error) => {
+            tracing::warn!(%error, chat_id = greeting.chat_id, "failed to load join-greeting users");
+            return;
+        }
+    };
+    let filtered = filter_active_greeting_member_ids(members, greeting.chat_id, &user_ids).await;
+    if filtered.is_empty() {
+        return;
+    }
+
+    let Some(settings) = load_join_greeting_settings(settings, greeting.chat_id).await else {
+        return;
+    };
+    let Some(html_body) = settings
+        .greeting_html
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+
+    let names = greeting_member_links(members, &filtered).await;
+    if names.is_empty() {
+        return;
+    }
+
+    let text = join_greeting_text(
+        &names,
+        &openplotva_telegram::sanitize_telegram_html(html_body),
+    );
+    if let Ok(Some(previous_id)) = cache.previous_greeting_message_id(greeting.chat_id).await {
+        sender
+            .delete_previous_greeting_message(greeting.chat_id, previous_id)
+            .await;
+    }
+    let message_id = sender
+        .send_ephemeral_greeting(NewMembersGreetingMessage {
+            chat_id: greeting.chat_id,
+            reply_to_message_id: greeting.message_id,
+            thread_id: greeting.thread_id,
+            text,
+            disable_notification: names.len() > 1,
+            delete_after: JOIN_GREETING_DELETE_AFTER,
+        })
+        .await;
+    if let Some(message_id) = message_id
+        && let Err(error) = cache
+            .set_previous_greeting_message_id(
+                greeting.chat_id,
+                message_id,
+                openplotva_storage::JOIN_GREETING_MESSAGE_TTL,
+            )
+            .await
+    {
+        tracing::warn!(%error, chat_id = greeting.chat_id, message_id, "failed to save previous join-greeting message id");
+    }
+}
+
+async fn load_join_greeting_settings<Settings>(
+    settings: &Settings,
+    chat_id: i64,
+) -> Option<ChatSettings>
+where
+    Settings: NewMembersGreetingSettingsStore + Sync,
+{
+    match settings.greeting_chat_settings(chat_id).await {
+        Ok(settings) => settings,
+        Err(error) => {
+            tracing::warn!(%error, chat_id, "failed to load join-greeting chat settings");
+            None
+        }
+    }
+}
+
+fn join_greeting_enabled(settings: &ChatSettings) -> bool {
+    settings.enable_greet_joiners
+        && settings
+            .greeting_html
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+}
+
+async fn filter_active_greeting_member_ids<Members>(
+    members: &Members,
+    chat_id: i64,
+    user_ids: &[String],
+) -> Vec<String>
+where
+    Members: NewMembersGreetingMemberDataStore + Sync,
+{
+    let (parsed, unique_ids) = parse_greeting_member_ids(user_ids);
+    if parsed.is_empty() {
+        return Vec::new();
+    }
+
+    match members
+        .list_chat_members_by_user_ids(chat_id, &unique_ids)
+        .await
+    {
+        Ok(rows) => filter_greeting_member_candidates(&parsed, &rows),
+        Err(error) => {
+            tracing::warn!(%error, chat_id, "failed to batch-load join-greeting members");
+            filter_greeting_member_candidates_one_by_one(members, chat_id, &parsed).await
+        }
+    }
+}
+
+async fn filter_greeting_member_candidates_one_by_one<Members>(
+    members: &Members,
+    chat_id: i64,
+    parsed: &[GreetingMemberId],
+) -> Vec<String>
+where
+    Members: NewMembersGreetingMemberDataStore + Sync,
+{
+    let mut active_by_id = HashMap::with_capacity(parsed.len());
+    for candidate in parsed {
+        let active = members
+            .get_chat_member(chat_id, candidate.id)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|member| is_active_participant_status(&member.status));
+        active_by_id.insert(candidate.id, active);
+    }
+    filter_greeting_member_candidates_by_active_ids(parsed, &active_by_id)
+}
+
+fn filter_greeting_member_candidates(
+    parsed: &[GreetingMemberId],
+    members: &[ChatMemberRecord],
+) -> Vec<String> {
+    let active_by_id = members
+        .iter()
+        .map(|member| (member.user_id, is_active_participant_status(&member.status)))
+        .collect::<HashMap<_, _>>();
+    filter_greeting_member_candidates_by_active_ids(parsed, &active_by_id)
+}
+
+fn filter_greeting_member_candidates_by_active_ids(
+    parsed: &[GreetingMemberId],
+    active_by_id: &HashMap<i64, bool>,
+) -> Vec<String> {
+    parsed
+        .iter()
+        .filter(|candidate| active_by_id.get(&candidate.id).copied().unwrap_or(false))
+        .map(|candidate| candidate.raw.clone())
+        .collect()
+}
+
+async fn greeting_member_links<Members>(members: &Members, user_ids: &[String]) -> Vec<String>
+where
+    Members: NewMembersGreetingMemberDataStore + Sync,
+{
+    let (parsed, unique_ids) = parse_greeting_member_ids(user_ids);
+    if parsed.is_empty() {
+        return Vec::new();
+    }
+
+    let users_by_id = members
+        .list_user_states_by_ids(&unique_ids)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|user| (user.id, user))
+        .collect::<HashMap<_, _>>();
+
+    let mut names = Vec::with_capacity(parsed.len());
+    for candidate in parsed {
+        let display_name = match users_by_id
+            .get(&candidate.id)
+            .and_then(user_link_display_name)
+        {
+            Some(name) => name,
+            None => get_greeting_user_name(members, candidate.id).await,
+        };
+        let safe = openplotva_telegram::escape_telegram_html_text(&display_name);
+        names.push(format_user_link(candidate.id, &safe));
+    }
+    names
+}
+
+async fn get_greeting_user_name<Members>(members: &Members, user_id: i64) -> String
+where
+    Members: NewMembersGreetingMemberDataStore + Sync,
+{
+    members
+        .get_user_state(user_id)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|user| user_link_display_name(&user))
+        .unwrap_or_else(|| user_id.to_string())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GreetingMemberId {
+    raw: String,
+    id: i64,
+}
+
+fn parse_greeting_member_ids(user_ids: &[String]) -> (Vec<GreetingMemberId>, Vec<i64>) {
+    let mut parsed = Vec::with_capacity(user_ids.len());
+    let mut unique_ids = Vec::with_capacity(user_ids.len());
+    let mut seen = HashMap::with_capacity(user_ids.len());
+    for raw in user_ids {
+        let Ok(id) = raw.parse::<i64>() else {
+            continue;
+        };
+        parsed.push(GreetingMemberId {
+            raw: raw.clone(),
+            id,
+        });
+        if seen.insert(id, ()).is_none() {
+            unique_ids.push(id);
+        }
+    }
+    (parsed, unique_ids)
+}
+
+fn user_link_display_name(user: &UserState) -> Option<String> {
+    if user
+        .last_name
+        .as_deref()
+        .is_some_and(|last| !last.is_empty())
+    {
+        return Some(
+            format!(
+                "{} {}",
+                user.first_name,
+                user.last_name.as_deref().unwrap_or_default()
+            )
+            .trim()
+            .to_owned(),
+        );
+    }
+    if !user.first_name.is_empty() {
+        return Some(user.first_name.clone());
+    }
+    if user
+        .username
+        .as_deref()
+        .is_some_and(|name| !name.is_empty())
+    {
+        return Some(format!("@{}", user.username.as_deref().unwrap_or_default()));
+    }
+    Some(user.first_name.clone())
+}
+
+fn format_user_link(user_id: i64, safe_name: &str) -> String {
+    format!("<a href='tg://user?id={user_id}'>{safe_name}</a>")
+}
+
+fn join_greeting_text(names: &[String], html_body: &str) -> String {
+    if names.len() == 1 {
+        return format!("{}, добро пожаловать!\n{html_body}", names[0]);
+    }
+    format!(
+        "Новые участники:\n{}\n\n{html_body}",
+        numbered_greeting_names(names).join("\n")
+    )
+}
+
+fn numbered_greeting_names(names: &[String]) -> Vec<String> {
+    names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| format!("{}) {name}", index + 1))
+        .collect()
+}
+
+fn is_active_participant_status(status: &str) -> bool {
+    let status = status.trim();
+    status.eq_ignore_ascii_case(openplotva_storage::CHAT_MEMBER_STATUS_ADMINISTRATOR)
+        || status.eq_ignore_ascii_case(openplotva_storage::CHAT_MEMBER_STATUS_MEMBER)
+        || status.eq_ignore_ascii_case(openplotva_storage::CHAT_MEMBER_STATUS_CREATOR)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct AdminChatSettingsCommand<'a> {
     name: &'a str,
+    target: Option<&'a str>,
     arguments: &'a str,
 }
 
@@ -1579,11 +2963,28 @@ fn admin_chat_settings_command_from_message(
     let command_end = utf16_index_to_byte_index(&text.data, position.length)?;
     let command_with_slash = text.data.get(..command_end)?;
     let command_with_at = command_with_slash.strip_prefix('/')?;
-    let name = command_with_at
+    let (name, target) = command_with_at
         .split_once('@')
-        .map_or(command_with_at, |(name, _)| name);
+        .map_or((command_with_at, None), |(name, target)| {
+            (name, Some(target))
+        });
     let arguments = command_arguments_after_command(&text.data, command_end)?;
-    Some(AdminChatSettingsCommand { name, arguments })
+    Some(AdminChatSettingsCommand {
+        name,
+        target,
+        arguments,
+    })
+}
+
+fn admin_chat_settings_command_for_message<'a>(
+    message: &'a TelegramMessage,
+    bot_username: &str,
+) -> Option<AdminChatSettingsCommand<'a>> {
+    let command = admin_chat_settings_command_from_message(message)?;
+    if matches!(message.chat, TelegramChat::Private(_)) {
+        return Some(command);
+    }
+    (command.target == Some(bot_username)).then_some(command)
 }
 
 fn command_arguments_after_command(text: &str, command_end: usize) -> Option<&str> {
@@ -1628,7 +3029,6 @@ fn admin_chat_settings_display_title(target: &AdminChatSettingsTarget) -> String
     target.id.to_string()
 }
 
-/// Go `canOpenGroupSettings` port using injected storage and Telegram boundaries.
 pub async fn can_open_group_settings_with_sources<Store, Api>(
     store: &Store,
     telegram: &Api,
@@ -1677,7 +3077,6 @@ where
     Ok(openplotva_telegram::telegram_member_can_open_group_settings(&member))
 }
 
-/// Build Go `chatMemberUpsertParams` from a `carapax` Telegram member.
 #[must_use]
 pub fn chat_member_upsert_from_telegram(
     chat_id: i64,
@@ -1697,7 +3096,6 @@ pub fn chat_member_upsert_from_telegram(
     params
 }
 
-/// Go `syncChatAdmins` and `getChatAdministrators` port with injectable boundaries.
 pub async fn sync_chat_admins_with_sources<Store, Api>(
     store: &Store,
     telegram: &Api,
@@ -1710,7 +3108,6 @@ where
     sync_chat_admins_with_cache(store, telegram, &NoopGroupSettingsAdminCache, chat_id).await
 }
 
-/// Go `syncChatAdmins` and `getChatAdministrators` port with injectable Redis cache.
 pub async fn sync_chat_admins_with_cache<Store, Api, Cache>(
     store: &Store,
     telegram: &Api,
@@ -1765,7 +3162,6 @@ impl GroupSettingsAdminCache for NoopGroupSettingsAdminCache {
     }
 }
 
-/// Build Go `adminChatMemberUpsertParams` from a `carapax` admin member.
 #[must_use]
 pub fn admin_chat_member_upsert_from_telegram(
     chat_id: i64,
@@ -2075,7 +3471,7 @@ where
     Ok(report)
 }
 
-fn user_state_from_telegram_user(user: &TelegramUser) -> UserState {
+pub(crate) fn user_state_from_telegram_user(user: &TelegramUser) -> UserState {
     UserState::new(
         i64::from(user.id),
         user.first_name.clone(),
@@ -2220,43 +3616,209 @@ fn user_full_name(user: &TelegramUser) -> String {
 #[cfg(test)]
 mod tests {
     use std::{
+        env,
         error::Error,
         fmt,
         future::Future,
         io,
         pin::Pin,
-        sync::{Arc, Mutex},
-        time::Duration,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicU64, Ordering},
+        },
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
     use carapax::types::{
         ChatMember, ChatMemberAdministrator, ChatMemberCreator, Update as TelegramUpdate, User,
     };
-    use openplotva_core::{MessageIdMapping, UserState};
+    use openplotva_core::{ChatSettings, MessageIdMapping, UserSettings, UserState};
     use openplotva_storage::{ChatMemberRecord, ChatMemberUpsert};
     use openplotva_taskman::{
-        CONTROL_QUEUE_NAME, ControlJobData, ControlJobParams, ControlKind, HIGH_PRIORITY, JobType,
-        StatelessJobItem,
+        CONTROL_QUEUE_NAME, ControlJobData, ControlJobParams, ControlKind,
+        DIALOG_AIFARM_QUEUE_NAME, HIGH_PRIORITY, JobType, StatelessJobItem, new_control_job_at,
     };
     use openplotva_telegram::{DispatcherConfig, DispatcherQueue, TelegramOutboundMethodKind};
     use serde_json::{Value, json};
     use time::OffsetDateTime;
 
-    use crate::updates::{UpdateHandler, UpdateHandlerFuture};
+    use crate::dialog_messages::{
+        DialogMessageFuture, DialogMessageSchedule, DialogMessageScheduleReport,
+        DialogMessageScheduler, DialogMessageUpdateConfig, DialogMessageUpdateHandler,
+        DirectSongNoticeEffects, DirectSongNoticeFuture, DirectSongNoticePlan, RandomDialogEffects,
+        RandomDialogRng, RandomDialogSettingsStore, RandomObscenifiedTextPlan,
+    };
+    use crate::help::{HelpBotIdentity, HelpCommandUpdateHandler, HelpDispatcherEffects};
+    use crate::payments::{InMemoryPaymentControlJobQueue, InMemoryPaymentControlJobStatus};
+    use crate::updates::{
+        TelegramFileMetadataStoreFuture, UpdateHandler, UpdateHandlerFuture, UpdateStateStore,
+        UpdateStateStoreFuture, process_update_with_state_store_at,
+    };
     use crate::virtual_messages::{VirtualIdFactory, VirtualMessageStore};
+    use openplotva_updates::{UpdateConsumerConfig, UpdateStageOutcome};
 
     use super::{
-        GroupSettingsAdminSyncSource, GroupSettingsCommandOutcome, GroupSettingsControlJobBuild,
-        SettingsCommandOutcome, SettingsControlJobQueue, SettingsControlJobQueueFuture,
-        SettingsUpdateContext, SettingsUpdateHandler, SettingsUpdateHandlerConfig,
-        SettingsUpdatePorts, SettingsUpdateRoute, admin_chat_member_upsert_from_telegram,
+        AdminChatSettingsCommandUpdateHandler, AdminChatSettingsCommandUpdateOutcome,
+        AdminChatSettingsCommandUpdateRuntime, GroupSettingsAdminSyncSource,
+        GroupSettingsCommandOutcome, GroupSettingsControlJobBuild, GroupSettingsControlJobEffects,
+        GroupSettingsRuntimeEffects, SettingsCommandOutcome, SettingsControlJobExecution,
+        SettingsControlJobQueue, SettingsControlJobQueueFuture, SettingsUpdateContext,
+        SettingsUpdateHandler, SettingsUpdateHandlerConfig, SettingsUpdatePorts,
+        SettingsUpdateRoute, admin_chat_member_upsert_from_telegram,
         can_open_group_settings_with_sources, chat_member_upsert_from_telegram,
         execute_group_settings_control_job_at, execute_new_members_followup_control_job_at,
-        group_settings_control_job_from_update_at, handle_group_settings_command_update_at,
-        handle_new_members_followup_update_at, handle_private_settings_command_update,
-        handle_settings_update_or_else_at, new_members_followup_control_job_from_update_at,
+        group_settings_control_job_from_update_at,
+        handle_admin_chat_settings_command_update_or_else_at,
+        handle_group_settings_command_update_at, handle_new_members_followup_update_at,
+        handle_private_settings_command_update, handle_settings_update_or_else_at,
+        new_members_followup_control_job_from_update_at, process_settings_control_job_once_at,
         sync_chat_admins_with_cache, sync_chat_admins_with_sources,
     };
+
+    #[tokio::test]
+    async fn settings_control_jobs_can_use_shared_persistent_control_queue()
+    -> Result<(), Box<dyn Error>> {
+        let queue = InMemoryPaymentControlJobQueue::new();
+        let job = new_control_job_at(
+            ControlJobParams {
+                chat_id: -10042,
+                message_id: 77,
+                user_id: 42,
+                user_full_name: "Owner".to_owned(),
+                thread_id: Some(5),
+                data: ControlJobData {
+                    kind: ControlKind::GroupSettings,
+                    ..ControlJobData::default()
+                },
+            },
+            OffsetDateTime::UNIX_EPOCH,
+        );
+
+        queue
+            .assign_settings_control_job(CONTROL_QUEUE_NAME, job.clone())
+            .await?;
+
+        let snapshot = queue.snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].queue_name, CONTROL_QUEUE_NAME);
+        assert_eq!(snapshot[0].job, job);
+        assert_eq!(
+            snapshot[0]
+                .job
+                .data
+                .control_data
+                .as_ref()
+                .map(|data| data.kind),
+            Some(ControlKind::GroupSettings)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn settings_control_worker_skips_payment_job_and_completes_group_settings_job()
+    -> Result<(), Box<dyn Error>> {
+        let queue = InMemoryPaymentControlJobQueue::new();
+        let store = StoreStub::default();
+        let dispatcher_queue = DispatcherQueue::new(DispatcherConfig::default());
+        let group_effects = GroupSettingsEffectsStub::allowing();
+        let new_members_effects = NewMembersFollowupEffectsStub::blocked();
+        let payment_job = settings_test_control_job(ControlKind::VipInvoice, "vip invoice");
+        let settings_job = settings_test_control_job(ControlKind::GroupSettings, "group settings");
+        queue
+            .assign_settings_control_job(CONTROL_QUEUE_NAME, payment_job)
+            .await?;
+        queue
+            .assign_settings_control_job(CONTROL_QUEUE_NAME, settings_job.clone())
+            .await?;
+
+        let report = process_settings_control_job_once_at(
+            &queue,
+            &store,
+            &dispatcher_queue,
+            &group_effects,
+            &new_members_effects,
+            "PlotvaBot",
+            || "settings-worker-v1".to_owned(),
+        )
+        .await;
+
+        assert!(report.dequeued);
+        assert_eq!(report.job_id, Some(2));
+        assert_eq!(
+            report.execution,
+            Some(SettingsControlJobExecution::GroupSettings(
+                super::GroupSettingsControlJobOutcome::SentLink
+            ))
+        );
+        assert!(report.completed);
+        assert!(!report.failed);
+        let snapshot = queue.snapshot();
+        assert_eq!(snapshot[0].status, InMemoryPaymentControlJobStatus::Pending);
+        assert_eq!(
+            snapshot[1].status,
+            InMemoryPaymentControlJobStatus::Completed
+        );
+        assert_eq!(snapshot[1].job, settings_job);
+        assert_eq!(group_effects.synced_admin_chats(), vec![-10042]);
+        let item = dispatcher_queue
+            .dequeue_immediate()
+            .expect("settings worker should queue settings deep-link text");
+        assert!(item.bypasses_chat_restrictions());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn settings_control_worker_completes_new_members_followup_job()
+    -> Result<(), Box<dyn Error>> {
+        let queue = InMemoryPaymentControlJobQueue::new();
+        let store = StoreStub::default();
+        let dispatcher_queue = DispatcherQueue::new(DispatcherConfig::default());
+        let group_effects = GroupSettingsEffectsStub::allowing();
+        let new_members_effects = NewMembersFollowupEffectsStub::blocked();
+        let job = new_control_job_at(
+            new_members_followup_control_params(true),
+            OffsetDateTime::UNIX_EPOCH,
+        )
+        .with_name("new members followup")
+        .with_priority(HIGH_PRIORITY);
+        queue
+            .assign_settings_control_job(CONTROL_QUEUE_NAME, job.clone())
+            .await?;
+
+        let report = process_settings_control_job_once_at(
+            &queue,
+            &store,
+            &dispatcher_queue,
+            &group_effects,
+            &new_members_effects,
+            "PlotvaBot",
+            || "new-members-worker-v1".to_owned(),
+        )
+        .await;
+
+        assert_eq!(report.job_id, Some(1));
+        assert_eq!(
+            report.execution,
+            Some(SettingsControlJobExecution::NewMembersFollowup(
+                super::NewMembersFollowupControlJobOutcome::Completed {
+                    unblock_notice_queued: true
+                }
+            ))
+        );
+        assert!(report.completed);
+        let snapshot = queue.snapshot();
+        assert_eq!(
+            snapshot[0].status,
+            InMemoryPaymentControlJobStatus::Completed
+        );
+        assert_eq!(snapshot[0].job, job);
+        assert_eq!(new_members_effects.enabled_chats(), vec![-10042]);
+        let item = dispatcher_queue
+            .dequeue_immediate()
+            .expect("new-members worker should queue unblock settings text");
+        assert!(item.bypasses_chat_restrictions());
+        Ok(())
+    }
 
     #[tokio::test]
     async fn private_settings_command_queues_go_webapp_button_with_bypass_and_immediate()
@@ -2691,6 +4253,279 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn admin_chat_settings_update_wrapper_rejects_unauthorized_with_ephemeral_denial()
+    -> Result<(), Box<dyn Error>> {
+        let store = StoreStub::default();
+        let dispatcher = DispatcherQueue::new(DispatcherConfig::default());
+        let resolver = AdminChatTargetResolverStub::default();
+        let next = UpdateHandlerStub::default();
+        let admin_ids = [7];
+        let next_virtual_id: VirtualIdFactory =
+            Arc::new(|| "admin-chat-settings-denial-v1".to_owned());
+
+        let outcome = handle_admin_chat_settings_command_update_or_else_at(
+            AdminChatSettingsCommandUpdateRuntime {
+                store: &store,
+                dispatcher_queue: &dispatcher,
+                resolver: &resolver,
+                admin_ids: &admin_ids,
+                bot_username: "PlotvaBot",
+                web_app_url: "https://plotva.example",
+                next_virtual_id: &next_virtual_id,
+            },
+            admin_chat_settings_update("/admin_chat_settings @target_lab")?,
+            |update| next.handle_update(update),
+        )
+        .await?;
+
+        assert_eq!(outcome, AdminChatSettingsCommandUpdateOutcome::Unauthorized);
+        assert!(next.calls().is_empty());
+        assert!(resolver.calls().is_empty());
+        assert_eq!(
+            store.inserted(),
+            vec![("admin-chat-settings-denial-v1".to_owned(), 42, None)]
+        );
+        let item = dispatcher
+            .dequeue_immediate()
+            .expect("admin chat settings denial should enqueue immediately");
+        assert_eq!(item.ephemeral_delete_after(), Some(Duration::from_secs(60)));
+        let method = item.into_method().expect("queued denial method");
+        let value = serde_json::to_value(method_as_value(method)?)?;
+        assert_eq!(
+            value["text"],
+            json!("❌ У вас нет прав на выполнение этой команды.")
+        );
+        assert_eq!(value["reply_parameters"]["message_id"], json!(79));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_chat_settings_update_wrapper_handles_authorized_command_before_next()
+    -> Result<(), Box<dyn Error>> {
+        let store = StoreStub::default();
+        let dispatcher = DispatcherQueue::new(DispatcherConfig::default());
+        let resolver = AdminChatTargetResolverStub::with_target(super::AdminChatSettingsTarget {
+            id: -100777,
+            title: "Target Lab".to_owned(),
+            username: "target_lab".to_owned(),
+            first_name: String::new(),
+            last_name: String::new(),
+        });
+        let next = UpdateHandlerStub::default();
+        let admin_ids = [42];
+        let next_virtual_id: VirtualIdFactory = Arc::new(|| "admin-chat-settings-v1".to_owned());
+
+        let outcome = handle_admin_chat_settings_command_update_or_else_at(
+            AdminChatSettingsCommandUpdateRuntime {
+                store: &store,
+                dispatcher_queue: &dispatcher,
+                resolver: &resolver,
+                admin_ids: &admin_ids,
+                bot_username: "PlotvaBot",
+                web_app_url: "https://plotva.example",
+                next_virtual_id: &next_virtual_id,
+            },
+            admin_chat_settings_update("/admin_chat_settings @target_lab")?,
+            |update| next.handle_update(update),
+        )
+        .await?;
+
+        assert!(matches!(
+            outcome,
+            AdminChatSettingsCommandUpdateOutcome::Handled(
+                super::AdminChatSettingsCommandOutcome::Queued(_)
+            )
+        ));
+        assert!(next.calls().is_empty());
+        assert_eq!(resolver.calls(), vec!["@target_lab".to_owned()]);
+        assert_eq!(
+            store.inserted(),
+            vec![("admin-chat-settings-v1".to_owned(), 42, None)]
+        );
+        assert!(dispatcher.dequeue_immediate().is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_chat_settings_update_handler_delegates_group_command_without_bot_target()
+    -> Result<(), Box<dyn Error>> {
+        let store = Arc::new(StoreStub::default());
+        let dispatcher = Arc::new(DispatcherQueue::new(DispatcherConfig::default()));
+        let resolver = Arc::new(AdminChatTargetResolverStub::default());
+        let next = Arc::new(UpdateHandlerStub::default());
+        let handler = AdminChatSettingsCommandUpdateHandler::new(
+            Arc::clone(&store),
+            dispatcher,
+            resolver,
+            vec![42],
+            "PlotvaBot",
+            "https://plotva.example",
+            Arc::clone(&next),
+        );
+
+        handler
+            .handle_update(group_admin_chat_settings_update(
+                "/admin_chat_settings @target_lab",
+            )?)
+            .await?;
+
+        assert_eq!(next.calls(), vec![12351]);
+        assert!(store.inserted().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_redis_decoded_admin_chat_settings_command_when_url_is_set()
+    -> Result<(), Box<dyn Error>> {
+        let Ok(redis_url) = env::var("OPENPLOTVA_TEST_REDIS_URL") else {
+            return Ok(());
+        };
+        let redis_client = redis::Client::open(redis_url.as_str())?;
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let key = format!("openplotva:test:decoded-admin-chat-settings:{suffix}");
+        let update_queue =
+            openplotva_updates::RedisUpdateQueue::with_key(redis_client.clone(), key.clone());
+        let mut redis = redis_client.get_multiplexed_async_connection().await?;
+        let _: i64 = redis::cmd("DEL").arg(&key).query_async(&mut redis).await?;
+
+        update_queue
+            .enqueue_update(&admin_chat_settings_update(
+                "/admin_chat_settings @target_lab",
+            )?)
+            .await?;
+        update_queue
+            .enqueue_update(&group_admin_chat_settings_update(
+                "/admin_chat_settings@PlotvaBot @target_lab",
+            )?)
+            .await?;
+        assert_eq!(update_queue.len().await?, 2);
+
+        let store = Arc::new(StoreStub::default());
+        let dispatcher = Arc::new(DispatcherQueue::new(DispatcherConfig::default()));
+        let resolver = Arc::new(AdminChatTargetResolverStub::with_target(
+            super::AdminChatSettingsTarget {
+                id: -100777,
+                title: "Target Lab".to_owned(),
+                username: "target_lab".to_owned(),
+                first_name: String::new(),
+                last_name: String::new(),
+            },
+        ));
+        let terminal = Arc::new(UpdateHandlerStub::default());
+        let next_counter = Arc::new(AtomicU64::new(1));
+        let next_counter_for_factory = Arc::clone(&next_counter);
+        let ids: VirtualIdFactory = Arc::new(move || {
+            let id = next_counter_for_factory.fetch_add(1, Ordering::Relaxed);
+            format!("admin-chat-settings-live-v{id}")
+        });
+        let handler = AdminChatSettingsCommandUpdateHandler::new(
+            Arc::clone(&store),
+            Arc::clone(&dispatcher),
+            Arc::clone(&resolver),
+            vec![42],
+            "PlotvaBot",
+            "https://plotva.example",
+            Arc::clone(&terminal),
+        )
+        .with_virtual_id_factory(ids);
+        let state_store = UpdateStateStoreStub::default();
+        let config = UpdateConsumerConfig {
+            dequeue_timeout: Duration::from_millis(1),
+            state_timeout: Duration::from_secs(1),
+            handle_timeout: Duration::from_secs(1),
+            side_effect_max_age: Duration::from_secs(60),
+            worker_limit: 1,
+        };
+        let now = UNIX_EPOCH + Duration::from_secs(1_710_000_010);
+
+        for expected in [
+            "expected private admin-chat-settings update",
+            "expected group admin-chat-settings update",
+        ] {
+            let update = update_queue
+                .dequeue_update(Duration::from_secs(1))
+                .await?
+                .ok_or_else(|| io::Error::other(expected))?;
+            let report =
+                process_update_with_state_store_at(update, config, now, &state_store, |update| {
+                    handler.handle_update(update)
+                })
+                .await;
+            assert_eq!(report.update_name, "message");
+            assert_eq!(report.state.outcome, UpdateStageOutcome::Completed);
+            assert_eq!(
+                report.handle.as_ref().map(|stage| &stage.outcome),
+                Some(&UpdateStageOutcome::Completed)
+            );
+        }
+
+        assert!(terminal.calls().is_empty());
+        assert_eq!(
+            state_store.calls(),
+            vec![
+                "chat:42:private".to_owned(),
+                "user:42:Ada".to_owned(),
+                "chat:-10042:supergroup".to_owned(),
+                "user:42:Ada".to_owned(),
+            ]
+        );
+        assert_eq!(
+            resolver.calls(),
+            vec!["@target_lab".to_owned(), "@target_lab".to_owned()]
+        );
+        assert_eq!(
+            store.inserted(),
+            vec![
+                ("admin-chat-settings-live-v1".to_owned(), 42, None),
+                ("admin-chat-settings-live-v2".to_owned(), -10042, Some(0)),
+            ]
+        );
+
+        let private_item = dispatcher
+            .dequeue_immediate()
+            .expect("private admin chat settings should enqueue immediately");
+        assert!(private_item.bypasses_chat_restrictions());
+        assert_eq!(private_item.ephemeral_delete_after(), None);
+        let private_value = serde_json::to_value(method_as_value(
+            private_item
+                .into_method()
+                .expect("private admin chat settings method"),
+        )?)?;
+        assert_eq!(private_value["chat_id"], json!(42));
+        assert_eq!(
+            private_value["text"],
+            json!("Откройте настройки для чата \"Target Lab\" (ID: -100777):")
+        );
+        assert_eq!(
+            private_value["reply_markup"]["inline_keyboard"][0][0]["web_app"]["url"],
+            json!("https://plotva.example/settings/?chat_id=-100777&signature=b8e86493")
+        );
+
+        let group_item = dispatcher
+            .dequeue_immediate()
+            .expect("group admin chat settings should enqueue immediately");
+        assert!(group_item.bypasses_chat_restrictions());
+        assert_eq!(group_item.ephemeral_delete_after(), None);
+        let group_value = serde_json::to_value(method_as_value(
+            group_item
+                .into_method()
+                .expect("group admin chat settings method"),
+        )?)?;
+        assert_eq!(group_value["chat_id"], json!(-10042));
+        assert_eq!(group_value["message_thread_id"], json!(99));
+        assert_eq!(group_value["reply_parameters"]["message_id"], json!(80));
+        assert_eq!(
+            group_value["text"],
+            json!("Откройте настройки для чата \"Target Lab\" (ID: -100777):")
+        );
+        assert!(dispatcher.snapshot().immediate.is_empty());
+        assert_eq!(update_queue.len().await?, 0);
+
+        let _: i64 = redis::cmd("DEL").arg(&key).query_async(&mut redis).await?;
+        Ok(())
+    }
+
     #[test]
     fn telegram_client_implements_admin_chat_settings_target_resolver() {
         fn assert_impl<T: super::AdminChatTargetResolver>() {}
@@ -3011,6 +4846,88 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn join_greeting_records_users_and_composes_debounced_html_greeting()
+    -> Result<(), Box<dyn Error>> {
+        let now = OffsetDateTime::from_unix_timestamp(1_710_000_000)?;
+        let cache = JoinGreetingCacheStub::with_recent(vec!["7", "8"]);
+        cache.set_previous(Some(55));
+        let settings = JoinGreetingSettingsStub::enabled("<b>welcome</b>");
+        let members = JoinGreetingMemberDataStub::default();
+        members.set_users(vec![
+            UserState::new(7, "Alice", None, None, None, None),
+            UserState::new(8, "Bob", Some("Builder".to_owned()), None, None, None),
+        ]);
+        members.set_members(vec![
+            ChatMemberRecord {
+                chat_id: -10042,
+                user_id: 7,
+                status: openplotva_storage::CHAT_MEMBER_STATUS_MEMBER.to_owned(),
+                ..ChatMemberRecord::default()
+            },
+            ChatMemberRecord {
+                chat_id: -10042,
+                user_id: 8,
+                status: openplotva_storage::CHAT_MEMBER_STATUS_ADMINISTRATOR.to_owned(),
+                ..ChatMemberRecord::default()
+            },
+        ]);
+        let sender = JoinGreetingSenderStub::with_next_message_id(Some(77));
+        let greeting = super::NewMembersGreeting {
+            chat_id: -10042,
+            message_id: 88,
+            thread_id: Some(99),
+            new_chat_member_ids: vec![7, 8],
+        };
+
+        assert!(super::try_send_greeting_for_join_wave_at(&cache, &settings, &greeting, now).await);
+        super::compose_and_send_greeting_at(&cache, &settings, &members, &sender, &greeting, now)
+            .await;
+
+        assert_eq!(cache.recorded(), vec![(-10042, vec![7, 8], 1_710_000_000)]);
+        assert_eq!(cache.debounce_started(), vec![-10042]);
+        assert_eq!(sender.deleted(), vec![(-10042, 55)]);
+        assert_eq!(
+            sender.sent(),
+            vec![super::NewMembersGreetingMessage {
+                chat_id: -10042,
+                reply_to_message_id: 88,
+                thread_id: Some(99),
+                text: "Новые участники:\n1) <a href='tg://user?id=7'>Alice</a>\n2) <a href='tg://user?id=8'>Bob Builder</a>\n\n<b>welcome</b>".to_owned(),
+                disable_notification: true,
+                delete_after: Duration::from_secs(10 * 60),
+            }]
+        );
+        assert_eq!(cache.saved_previous(), vec![(-10042, 77)]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn join_greeting_skips_redis_when_settings_disable_greetings()
+    -> Result<(), Box<dyn Error>> {
+        let cache = JoinGreetingCacheStub::with_recent(vec!["7"]);
+        let settings = JoinGreetingSettingsStub::disabled();
+        let greeting = super::NewMembersGreeting {
+            chat_id: -10042,
+            message_id: 88,
+            thread_id: None,
+            new_chat_member_ids: vec![7],
+        };
+
+        assert!(
+            !super::try_send_greeting_for_join_wave_at(
+                &cache,
+                &settings,
+                &greeting,
+                OffsetDateTime::from_unix_timestamp(1_710_000_000)?,
+            )
+            .await
+        );
+        assert!(cache.recorded().is_empty());
+        assert!(cache.debounce_started().is_empty());
+        Ok(())
+    }
+
     #[test]
     fn new_members_followup_update_builds_go_control_job_payload() -> Result<(), Box<dyn Error>> {
         let update = new_members_update()?;
@@ -3292,6 +5209,302 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_redis_decoded_private_start_settings_delegates_into_settings_handler_when_url_is_set()
+    -> Result<(), Box<dyn Error>> {
+        let Ok(redis_url) = env::var("OPENPLOTVA_TEST_REDIS_URL") else {
+            return Ok(());
+        };
+        let redis_client = redis::Client::open(redis_url.as_str())?;
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let key = format!("openplotva:test:decoded-start-settings:{suffix}");
+        let update_queue =
+            openplotva_updates::RedisUpdateQueue::with_key(redis_client.clone(), key.clone());
+        let mut redis = redis_client.get_multiplexed_async_connection().await?;
+        let _: i64 = redis::cmd("DEL").arg(&key).query_async(&mut redis).await?;
+
+        update_queue
+            .enqueue_update(&private_start_settings_update()?)
+            .await?;
+        assert_eq!(update_queue.len().await?, 1);
+
+        let store = Arc::new(StoreStub::default());
+        let settings_dispatcher = Arc::new(DispatcherQueue::new(DispatcherConfig::default()));
+        let help_dispatcher = Arc::new(DispatcherQueue::new(DispatcherConfig::default()));
+        let member_store = Arc::new(GroupSettingsMemberStoreStub::default());
+        let control_queue = Arc::new(InMemoryPaymentControlJobQueue::new());
+        let terminal = Arc::new(UpdateHandlerStub::default());
+        let dialog_terminal = Arc::new(DialogMessageUpdateHandler::new(
+            Arc::new(SettingsDialogSchedulerStub),
+            Arc::new(SettingsDialogStoreStub),
+            Arc::new(SettingsDialogEffectsStub),
+            Arc::new(SettingsDialogRngStub),
+            settings_dialog_config(),
+            Arc::clone(&terminal),
+        ));
+        let ids: VirtualIdFactory = Arc::new(|| "start-settings-v1".to_owned());
+        let settings_handler = Arc::new(
+            SettingsUpdateHandler::new(
+                Arc::clone(&store),
+                Arc::clone(&settings_dispatcher),
+                Arc::clone(&member_store),
+                Arc::clone(&control_queue),
+                SettingsUpdateHandlerConfig::new("PlotvaBot", 999, "https://plotva.example"),
+                dialog_terminal,
+            )
+            .with_virtual_id_factory(ids),
+        );
+        let telegram = openplotva_telegram::telegram_client("123:token")?;
+        let help_effects = Arc::new(HelpDispatcherEffects::new(
+            store.as_ref().clone(),
+            Arc::clone(&help_dispatcher),
+            telegram,
+            Arc::clone(&settings_handler),
+        ));
+        let help_handler = HelpCommandUpdateHandler::new(
+            HelpBotIdentity {
+                first_name: "Plotva".to_owned(),
+                username: "PlotvaBot".to_owned(),
+                token: "123:token".to_owned(),
+            },
+            help_effects,
+            Arc::clone(&terminal),
+        );
+        let state_store = UpdateStateStoreStub::default();
+        let config = UpdateConsumerConfig {
+            dequeue_timeout: Duration::from_millis(1),
+            state_timeout: Duration::from_secs(1),
+            handle_timeout: Duration::from_secs(1),
+            side_effect_max_age: Duration::from_secs(60),
+            worker_limit: 1,
+        };
+        let update = update_queue
+            .dequeue_update(Duration::from_secs(1))
+            .await?
+            .ok_or_else(|| io::Error::other("expected decoded private start settings update"))?;
+        let report = process_update_with_state_store_at(
+            update,
+            config,
+            UNIX_EPOCH + Duration::from_secs(1_710_000_010),
+            &state_store,
+            |update| help_handler.handle_update(update),
+        )
+        .await;
+
+        assert_eq!(report.update_id, 12352);
+        assert_eq!(report.update_name, "message");
+        assert_eq!(report.state.outcome, UpdateStageOutcome::Completed);
+        assert_eq!(
+            report.handle.as_ref().map(|stage| &stage.outcome),
+            Some(&UpdateStageOutcome::Completed)
+        );
+        assert!(!report.skipped_handle);
+        assert_eq!(
+            state_store.calls(),
+            vec!["chat:42:private".to_owned(), "user:42:Ada".to_owned()]
+        );
+        assert_eq!(
+            store.inserted(),
+            vec![("start-settings-v1".to_owned(), 42, None)]
+        );
+        assert!(terminal.calls().is_empty());
+        assert!(member_store.upserts().is_empty());
+        assert!(control_queue.snapshot().is_empty());
+        assert!(help_dispatcher.snapshot().immediate.is_empty());
+        assert!(help_dispatcher.snapshot().regular.is_empty());
+
+        let private_item = settings_dispatcher
+            .dequeue_immediate()
+            .expect("start settings should delegate into private settings button");
+        assert!(private_item.bypasses_chat_restrictions());
+        assert_eq!(private_item.ephemeral_delete_after(), None);
+        let private_value = serde_json::to_value(method_as_value(
+            private_item
+                .into_method()
+                .expect("private start settings should become sendMessage"),
+        )?)?;
+        assert_eq!(private_value["chat_id"], json!(42));
+        assert_eq!(private_value["text"], json!("Откройте настройки бота:"));
+        assert_eq!(private_value["reply_parameters"]["message_id"], json!(81));
+        assert_eq!(
+            private_value["reply_markup"]["inline_keyboard"][0][0]["web_app"]["url"],
+            json!("https://plotva.example/settings/index.html?signature=780e28cf")
+        );
+        assert!(settings_dispatcher.snapshot().immediate.is_empty());
+        assert_eq!(update_queue.len().await?, 0);
+
+        let _: i64 = redis::cmd("DEL").arg(&key).query_async(&mut redis).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_redis_decoded_settings_commands_and_new_members_when_url_is_set()
+    -> Result<(), Box<dyn Error>> {
+        let Ok(redis_url) = env::var("OPENPLOTVA_TEST_REDIS_URL") else {
+            return Ok(());
+        };
+        let redis_client = redis::Client::open(redis_url.as_str())?;
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let key = format!("openplotva:test:decoded-settings:{suffix}");
+        let update_queue =
+            openplotva_updates::RedisUpdateQueue::with_key(redis_client.clone(), key.clone());
+        let mut redis = redis_client.get_multiplexed_async_connection().await?;
+        let _: i64 = redis::cmd("DEL").arg(&key).query_async(&mut redis).await?;
+
+        update_queue
+            .enqueue_update(&private_settings_update()?)
+            .await?;
+        update_queue
+            .enqueue_update(&group_settings_update()?)
+            .await?;
+        update_queue.enqueue_update(&new_members_update()?).await?;
+        assert_eq!(update_queue.len().await?, 3);
+
+        let store = Arc::new(StoreStub::default());
+        let dispatcher = Arc::new(DispatcherQueue::new(DispatcherConfig::default()));
+        let member_store = Arc::new(GroupSettingsMemberStoreStub::default());
+        let control_queue = Arc::new(InMemoryPaymentControlJobQueue::new());
+        let terminal = Arc::new(UpdateHandlerStub::default());
+        let dialog_terminal = Arc::new(DialogMessageUpdateHandler::new(
+            Arc::new(SettingsDialogSchedulerStub),
+            Arc::new(SettingsDialogStoreStub),
+            Arc::new(SettingsDialogEffectsStub),
+            Arc::new(SettingsDialogRngStub),
+            settings_dialog_config(),
+            Arc::clone(&terminal),
+        ));
+        let next_counter = Arc::new(AtomicU64::new(1));
+        let next_counter_for_factory = Arc::clone(&next_counter);
+        let ids: VirtualIdFactory = Arc::new(move || {
+            let id = next_counter_for_factory.fetch_add(1, Ordering::Relaxed);
+            format!("settings-live-v{id}")
+        });
+        let handler = SettingsUpdateHandler::new(
+            Arc::clone(&store),
+            Arc::clone(&dispatcher),
+            Arc::clone(&member_store),
+            Arc::clone(&control_queue),
+            SettingsUpdateHandlerConfig::new("PlotvaBot", 999, "https://plotva.example"),
+            dialog_terminal,
+        )
+        .with_virtual_id_factory(ids);
+        let state_store = UpdateStateStoreStub::default();
+        let config = UpdateConsumerConfig {
+            dequeue_timeout: Duration::from_millis(1),
+            state_timeout: Duration::from_secs(1),
+            handle_timeout: Duration::from_secs(1),
+            side_effect_max_age: Duration::from_secs(60),
+            worker_limit: 1,
+        };
+        let now = UNIX_EPOCH + Duration::from_secs(1_710_000_010);
+
+        for expected in [
+            "expected private settings update",
+            "expected group settings update",
+            "expected new-members settings update",
+        ] {
+            let update = update_queue
+                .dequeue_update(Duration::from_secs(1))
+                .await?
+                .ok_or_else(|| io::Error::other(expected))?;
+            let report =
+                process_update_with_state_store_at(update, config, now, &state_store, |update| {
+                    handler.handle_update(update)
+                })
+                .await;
+            assert_eq!(report.update_name, "message");
+            assert_eq!(report.state.outcome, UpdateStageOutcome::Completed);
+            assert_eq!(
+                report.handle.as_ref().map(|stage| &stage.outcome),
+                Some(&UpdateStageOutcome::Completed)
+            );
+        }
+
+        assert_eq!(
+            state_store.calls(),
+            vec![
+                "chat:42:private".to_owned(),
+                "user:42:Ada".to_owned(),
+                "chat:-10042:supergroup".to_owned(),
+                "user:42:Ada".to_owned(),
+                "chat:-10042:supergroup".to_owned(),
+                "user:42:Ada".to_owned(),
+            ]
+        );
+        assert_eq!(
+            store.inserted(),
+            vec![
+                ("settings-live-v1".to_owned(), 42, None),
+                ("settings-live-v2".to_owned(), -10042, Some(0)),
+            ]
+        );
+        assert!(terminal.calls().is_empty());
+        let upserts = member_store.upserts();
+        assert_eq!(upserts.len(), 2);
+        assert_eq!(upserts[0].chat_id, -10042);
+        assert_eq!(upserts[0].user_id, 999);
+        assert_eq!(upserts[1].user_id, 7);
+
+        let snapshot = control_queue.snapshot();
+        assert_eq!(snapshot.len(), 2);
+        assert_eq!(
+            snapshot
+                .iter()
+                .filter_map(|item| item.job.data.control_data.as_ref().map(|data| data.kind))
+                .collect::<Vec<_>>(),
+            vec![ControlKind::GroupSettings, ControlKind::NewMembersFollowup]
+        );
+        assert_eq!(
+            snapshot
+                .iter()
+                .map(|item| item.queue_name.as_str())
+                .collect::<Vec<_>>(),
+            vec![CONTROL_QUEUE_NAME, CONTROL_QUEUE_NAME]
+        );
+
+        let private_item = dispatcher
+            .dequeue_immediate()
+            .expect("private settings should enqueue settings button");
+        assert!(private_item.bypasses_chat_restrictions());
+        assert_eq!(private_item.ephemeral_delete_after(), None);
+        let private_value = serde_json::to_value(method_as_value(
+            private_item
+                .into_method()
+                .expect("private settings should be a sendMessage method"),
+        )?)?;
+        assert_eq!(private_value["chat_id"], json!(42));
+        assert_eq!(private_value["text"], json!("Откройте настройки бота:"));
+        assert_eq!(
+            private_value["reply_markup"]["inline_keyboard"][0][0]["web_app"]["url"],
+            json!("https://plotva.example/settings/index.html?signature=780e28cf")
+        );
+
+        let group_item = dispatcher
+            .dequeue_immediate()
+            .expect("group settings should enqueue wait notice");
+        assert!(group_item.bypasses_chat_restrictions());
+        assert_eq!(
+            group_item.ephemeral_delete_after(),
+            Some(Duration::from_secs(60))
+        );
+        let group_value = serde_json::to_value(method_as_value(
+            group_item
+                .into_method()
+                .expect("group settings should be a sendMessage method"),
+        )?)?;
+        assert_eq!(group_value["chat_id"], json!(-10042));
+        assert_eq!(
+            group_value["text"],
+            json!("⏳ Проверяю права и готовлю ссылку на настройки...")
+        );
+        assert_eq!(group_value["message_thread_id"], json!(99));
+        assert!(dispatcher.snapshot().immediate.is_empty());
+        assert_eq!(update_queue.len().await?, 0);
+
+        let _: i64 = redis::cmd("DEL").arg(&key).query_async(&mut redis).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn group_settings_permission_uses_stored_creator_without_telegram_call()
     -> Result<(), Box<dyn Error>> {
         let store = GroupSettingsMemberStoreStub::with_member(ChatMemberRecord {
@@ -3308,6 +5521,62 @@ mod tests {
         assert_eq!(store.get_calls(), vec![(-10042, 42)]);
         assert!(store.upserts().is_empty());
         assert!(telegram.calls().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn group_settings_runtime_effects_check_permissions_through_sources()
+    -> Result<(), Box<dyn Error>> {
+        let member_store = GroupSettingsMemberStoreStub::with_member(ChatMemberRecord {
+            chat_id: -10042,
+            user_id: 42,
+            status: openplotva_storage::CHAT_MEMBER_STATUS_CREATOR.to_owned(),
+            ..ChatMemberRecord::default()
+        });
+        let member_api = GroupSettingsMemberApiStub::failing();
+        let admin_store = GroupSettingsAdminSyncStoreStub::default();
+        let admin_api = GroupSettingsAdminsApiStub::failing();
+        let cache = GroupSettingsAdminCacheStub::default();
+        let effects = GroupSettingsRuntimeEffects::new(
+            member_store.clone(),
+            member_api.clone(),
+            admin_store,
+            admin_api,
+            cache,
+        );
+
+        let allowed = effects.can_open_group_settings(-10042, 42).await?;
+
+        assert!(allowed);
+        assert_eq!(member_store.get_calls(), vec![(-10042, 42)]);
+        assert!(member_api.calls().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn group_settings_runtime_effects_sync_admins_with_cache_nonfatal()
+    -> Result<(), Box<dyn Error>> {
+        let member_store = GroupSettingsMemberStoreStub::default();
+        let member_api = GroupSettingsMemberApiStub::failing();
+        let admin_store = GroupSettingsAdminSyncStoreStub::default();
+        let admin_api = GroupSettingsAdminsApiStub::with_admins(vec![promoting_admin_member(42)]);
+        let cache = GroupSettingsAdminCacheStub::default();
+        let effects = GroupSettingsRuntimeEffects::new(
+            member_store,
+            member_api,
+            admin_store.clone(),
+            admin_api.clone(),
+            cache.clone(),
+        );
+
+        effects.sync_chat_admins(-10042).await;
+
+        assert_eq!(admin_api.calls(), vec![-10042]);
+        assert_eq!(admin_store.upserts().len(), 1);
+        assert_eq!(
+            cache.saves(),
+            vec![(-10042, vec![42], Duration::from_secs(30 * 60))]
+        );
         Ok(())
     }
 
@@ -3555,7 +5824,7 @@ mod tests {
         let _ = sync_chat_admins_with_cache(&cache_store, &cache_api, &cache, -10042).await?;
         assert!(
             cache.saves().is_empty(),
-            "Go caches admin IDs only after an API success, not DB fallback"
+            "Admin IDs are cached only after an API success, not DB fallback"
         );
 
         let users = store.users();
@@ -3591,6 +5860,54 @@ mod tests {
         assert!(store.list_calls().is_empty());
         assert!(store.upserts().is_empty());
         assert!(store.users().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "live Telegram Bot API membership smoke"]
+    async fn live_telegram_membership_smoke_gets_member_and_admins() -> Result<(), Box<dyn Error>> {
+        let bot_key = std::env::var("BOT_KEY")
+            .map_err(|_| "BOT_KEY is required for live Telegram membership smoke")?;
+        let chat_id = std::env::var("OPENPLOTVA_SMOKE_CHAT_ID")
+            .map_err(|_| "OPENPLOTVA_SMOKE_CHAT_ID is required")?
+            .parse::<i64>()?;
+        let user_id = std::env::var("OPENPLOTVA_SMOKE_USER_ID")
+            .map_err(|_| "OPENPLOTVA_SMOKE_USER_ID is required")?
+            .parse::<i64>()?;
+        let bot_api_base_url = std::env::var("BOT_API_BASE_URL").unwrap_or_default();
+        let telegram =
+            openplotva_telegram::telegram_client_with_base_url(bot_key, bot_api_base_url)?;
+
+        let member =
+            super::GroupSettingsMemberApi::get_chat_member(&telegram, chat_id, user_id).await?;
+        let upsert = chat_member_upsert_from_telegram(chat_id, user_id, &member);
+        assert_eq!(upsert.chat_id, chat_id);
+        assert_eq!(upsert.user_id, user_id);
+        assert!(
+            !upsert.status.trim().is_empty(),
+            "Telegram member status must be present"
+        );
+
+        let admins =
+            super::GroupSettingsAdminsApi::get_chat_administrators(&telegram, chat_id).await?;
+        assert!(
+            !admins.is_empty(),
+            "Telegram group should report at least one administrator"
+        );
+        for admin in admins {
+            let Some(admin_upsert) = admin_chat_member_upsert_from_telegram(chat_id, &admin) else {
+                panic!("getChatAdministrators returned a non-admin member");
+            };
+            assert_eq!(admin_upsert.chat_id, chat_id);
+            assert!(
+                matches!(
+                    admin_upsert.status.as_str(),
+                    openplotva_storage::CHAT_MEMBER_STATUS_CREATOR
+                        | openplotva_storage::CHAT_MEMBER_STATUS_ADMINISTRATOR
+                ),
+                "admin status should match the admin sync surface"
+            );
+        }
         Ok(())
     }
 
@@ -3659,6 +5976,60 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Debug, Default)]
+    struct UpdateStateStoreStub {
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl UpdateStateStoreStub {
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().expect("state calls").clone()
+        }
+    }
+
+    impl UpdateStateStore for UpdateStateStoreStub {
+        type Error = io::Error;
+
+        fn upsert_chat_state<'a>(
+            &'a self,
+            chat: &'a openplotva_core::ChatState,
+        ) -> UpdateStateStoreFuture<'a, Self::Error> {
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .map_err(|error| io::Error::other(error.to_string()))?
+                    .push(format!("chat:{}:{}", chat.id, chat.chat_type));
+                Ok(())
+            })
+        }
+
+        fn upsert_user_state<'a>(
+            &'a self,
+            user: &'a UserState,
+        ) -> UpdateStateStoreFuture<'a, Self::Error> {
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .map_err(|error| io::Error::other(error.to_string()))?
+                    .push(format!("user:{}:{}", user.id, user.first_name));
+                Ok(())
+            })
+        }
+
+        fn upsert_telegram_file_metadata<'a>(
+            &'a self,
+            params: &'a openplotva_storage::TelegramFileMetadataUpsert,
+        ) -> TelegramFileMetadataStoreFuture<'a, Self::Error> {
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .map_err(|error| io::Error::other(error.to_string()))?
+                    .push(format!("file:{}", params.file_unique_id));
+                Ok(())
+            })
+        }
+    }
+
     fn method_as_value(method: openplotva_telegram::TelegramOutboundMethod) -> io::Result<Value> {
         match method {
             openplotva_telegram::TelegramOutboundMethod::SendMessage(method) => {
@@ -3694,6 +6065,36 @@ mod tests {
                     {
                         "offset": 0,
                         "length": 9,
+                        "type": "bot_command"
+                    }
+                ]
+            }
+        }))
+    }
+
+    fn private_start_settings_update() -> Result<TelegramUpdate, serde_json::Error> {
+        serde_json::from_value(json!({
+            "update_id": 12352,
+            "message": {
+                "message_id": 81,
+                "date": 1_710_000_000,
+                "chat": {
+                    "id": 42,
+                    "type": "private",
+                    "first_name": "Ada",
+                    "username": "ada_l"
+                },
+                "from": {
+                    "id": 42,
+                    "is_bot": false,
+                    "first_name": "Ada",
+                    "username": "ada_l"
+                },
+                "text": "/start settings",
+                "entities": [
+                    {
+                        "offset": 0,
+                        "length": 6,
                         "type": "bot_command"
                     }
                 ]
@@ -3762,6 +6163,42 @@ mod tests {
                     {
                         "offset": 0,
                         "length": 19,
+                        "type": "bot_command"
+                    }
+                ]
+            }
+        }))
+    }
+
+    fn group_admin_chat_settings_update(text: &str) -> Result<TelegramUpdate, serde_json::Error> {
+        let command_len = text
+            .split_whitespace()
+            .next()
+            .map(|command| command.encode_utf16().count())
+            .unwrap_or_default();
+        serde_json::from_value(json!({
+            "update_id": 12351,
+            "message": {
+                "message_id": 80,
+                "message_thread_id": 99,
+                "date": 1_710_000_000,
+                "chat": {
+                    "id": -10042,
+                    "type": "supergroup",
+                    "title": "Plotva Lab"
+                },
+                "from": {
+                    "id": 42,
+                    "is_bot": false,
+                    "first_name": "Ada",
+                    "last_name": "Lovelace",
+                    "username": "ada_l"
+                },
+                "text": text,
+                "entities": [
+                    {
+                        "offset": 0,
+                        "length": command_len,
                         "type": "bot_command"
                     }
                 ]
@@ -3896,6 +6333,14 @@ mod tests {
         }
     }
 
+    fn settings_test_control_job(kind: ControlKind, title: &str) -> StatelessJobItem {
+        let mut params = group_settings_control_params();
+        params.data.kind = kind;
+        new_control_job_at(params, OffsetDateTime::UNIX_EPOCH)
+            .with_name(title)
+            .with_priority(HIGH_PRIORITY)
+    }
+
     #[derive(Clone, Default)]
     struct AdminChatTargetResolverStub {
         state: Arc<Mutex<AdminChatTargetResolverState>>,
@@ -3979,6 +6424,107 @@ mod tests {
                     .push(update.id);
                 Ok(())
             })
+        }
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct SettingsDialogSchedulerStub;
+
+    impl DialogMessageScheduler for SettingsDialogSchedulerStub {
+        type Error = StubError;
+
+        fn schedule_dialog_message<'a>(
+            &'a self,
+            _schedule: DialogMessageSchedule<'a>,
+        ) -> DialogMessageFuture<'a, DialogMessageScheduleReport, Self::Error> {
+            Box::pin(async move {
+                Ok(DialogMessageScheduleReport {
+                    queue_name: DIALOG_AIFARM_QUEUE_NAME.to_owned(),
+                    delay: Duration::ZERO,
+                    replaced: false,
+                })
+            })
+        }
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct SettingsDialogStoreStub;
+
+    impl RandomDialogSettingsStore for SettingsDialogStoreStub {
+        type Error = StubError;
+
+        fn random_chat_settings<'a>(
+            &'a self,
+            chat_id: i64,
+        ) -> DialogMessageFuture<'a, Option<ChatSettings>, Self::Error> {
+            Box::pin(async move {
+                Ok(Some(ChatSettings {
+                    reactivity_percentage: 0,
+                    ..ChatSettings::defaults(chat_id)
+                }))
+            })
+        }
+
+        fn random_user_settings<'a>(
+            &'a self,
+            _user_id: i64,
+        ) -> DialogMessageFuture<'a, Option<UserSettings>, Self::Error> {
+            Box::pin(async { Ok(None) })
+        }
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct SettingsDialogEffectsStub;
+
+    impl RandomDialogEffects for SettingsDialogEffectsStub {
+        type Error = StubError;
+
+        fn send_random_obscenified_text<'a>(
+            &'a self,
+            _plan: RandomObscenifiedTextPlan,
+        ) -> DialogMessageFuture<'a, (), Self::Error> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    impl DirectSongNoticeEffects for SettingsDialogEffectsStub {
+        fn send_direct_song_notice<'a>(
+            &'a self,
+            _plan: DirectSongNoticePlan,
+        ) -> DirectSongNoticeFuture<'a> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct SettingsDialogRngStub;
+
+    impl RandomDialogRng for SettingsDialogRngStub {
+        fn random_response_roll(&self) -> i32 {
+            0
+        }
+
+        fn obscenifier_roll(&self) -> i32 {
+            0
+        }
+
+        fn obscenify_variant_roll(&self) -> i32 {
+            0
+        }
+    }
+
+    fn settings_dialog_config() -> DialogMessageUpdateConfig {
+        let mut bot_user = User::new(999, "Plotva".to_owned(), true);
+        bot_user.username = Some("plotvabot".to_owned().into());
+        DialogMessageUpdateConfig {
+            bot_user,
+            queue_name: DIALOG_AIFARM_QUEUE_NAME.to_owned(),
+            use_aifarm_budgets: true,
+            aifarm_max_tokens: 4096,
+            aifarm_random_max_tokens: 768,
+            aifarm_default_max_tokens: 1024,
+            aifarm_long_max_tokens: 2048,
+            processing_timeout_seconds: 720,
         }
     }
 
@@ -4211,6 +6757,332 @@ mod tests {
                     .expect("new-members followup effects state")
                     .greetings
                     .push(greeting);
+            })
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct JoinGreetingCacheStub {
+        state: Arc<Mutex<JoinGreetingCacheState>>,
+    }
+
+    #[derive(Default)]
+    struct JoinGreetingCacheState {
+        recent: Vec<String>,
+        previous: Option<i32>,
+        recorded: Vec<(i64, Vec<i64>, i64)>,
+        debounce_started: Vec<i64>,
+        saved_previous: Vec<(i64, i32)>,
+    }
+
+    impl JoinGreetingCacheStub {
+        fn with_recent(values: Vec<&str>) -> Self {
+            Self {
+                state: Arc::new(Mutex::new(JoinGreetingCacheState {
+                    recent: values.into_iter().map(str::to_owned).collect(),
+                    ..JoinGreetingCacheState::default()
+                })),
+            }
+        }
+
+        fn set_previous(&self, previous: Option<i32>) {
+            self.state
+                .lock()
+                .expect("join greeting cache state")
+                .previous = previous;
+        }
+
+        fn recorded(&self) -> Vec<(i64, Vec<i64>, i64)> {
+            self.state
+                .lock()
+                .expect("join greeting cache state")
+                .recorded
+                .clone()
+        }
+
+        fn debounce_started(&self) -> Vec<i64> {
+            self.state
+                .lock()
+                .expect("join greeting cache state")
+                .debounce_started
+                .clone()
+        }
+
+        fn saved_previous(&self) -> Vec<(i64, i32)> {
+            self.state
+                .lock()
+                .expect("join greeting cache state")
+                .saved_previous
+                .clone()
+        }
+    }
+
+    impl super::NewMembersGreetingCache for JoinGreetingCacheStub {
+        type Error = StubError;
+
+        fn record_join_member_ids<'a>(
+            &'a self,
+            chat_id: i64,
+            user_ids: &'a [i64],
+            score: i64,
+            _ttl: Duration,
+        ) -> super::NewMembersRuntimeFuture<'a, (), Self::Error> {
+            Box::pin(async move {
+                self.state
+                    .lock()
+                    .expect("join greeting cache state")
+                    .recorded
+                    .push((chat_id, user_ids.to_vec(), score));
+                Ok(())
+            })
+        }
+
+        fn start_debounce<'a>(
+            &'a self,
+            chat_id: i64,
+            _ttl: Duration,
+        ) -> super::NewMembersRuntimeFuture<'a, bool, Self::Error> {
+            Box::pin(async move {
+                self.state
+                    .lock()
+                    .expect("join greeting cache state")
+                    .debounce_started
+                    .push(chat_id);
+                Ok(true)
+            })
+        }
+
+        fn recent_join_member_ids<'a>(
+            &'a self,
+            _chat_id: i64,
+            _min_score: i64,
+        ) -> super::NewMembersRuntimeFuture<'a, Vec<String>, Self::Error> {
+            Box::pin(async move {
+                Ok(self
+                    .state
+                    .lock()
+                    .expect("join greeting cache state")
+                    .recent
+                    .clone())
+            })
+        }
+
+        fn previous_greeting_message_id<'a>(
+            &'a self,
+            _chat_id: i64,
+        ) -> super::NewMembersRuntimeFuture<'a, Option<i32>, Self::Error> {
+            Box::pin(async move {
+                Ok(self
+                    .state
+                    .lock()
+                    .expect("join greeting cache state")
+                    .previous)
+            })
+        }
+
+        fn set_previous_greeting_message_id<'a>(
+            &'a self,
+            chat_id: i64,
+            message_id: i32,
+            _ttl: Duration,
+        ) -> super::NewMembersRuntimeFuture<'a, (), Self::Error> {
+            Box::pin(async move {
+                self.state
+                    .lock()
+                    .expect("join greeting cache state")
+                    .saved_previous
+                    .push((chat_id, message_id));
+                Ok(())
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    struct JoinGreetingSettingsStub {
+        settings: Option<ChatSettings>,
+    }
+
+    impl JoinGreetingSettingsStub {
+        fn enabled(html: &str) -> Self {
+            Self {
+                settings: Some(ChatSettings {
+                    chat_id: -10042,
+                    enable_greet_joiners: true,
+                    greeting_html: Some(html.to_owned()),
+                    ..ChatSettings::defaults(-10042)
+                }),
+            }
+        }
+
+        fn disabled() -> Self {
+            Self {
+                settings: Some(ChatSettings::defaults(-10042)),
+            }
+        }
+    }
+
+    impl super::NewMembersGreetingSettingsStore for JoinGreetingSettingsStub {
+        type Error = StubError;
+
+        fn greeting_chat_settings<'a>(
+            &'a self,
+            _chat_id: i64,
+        ) -> super::NewMembersRuntimeFuture<'a, Option<ChatSettings>, Self::Error> {
+            Box::pin(async move { Ok(self.settings.clone()) })
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct JoinGreetingMemberDataStub {
+        state: Arc<Mutex<JoinGreetingMemberDataState>>,
+    }
+
+    #[derive(Default)]
+    struct JoinGreetingMemberDataState {
+        users: Vec<UserState>,
+        members: Vec<ChatMemberRecord>,
+    }
+
+    impl JoinGreetingMemberDataStub {
+        fn set_users(&self, users: Vec<UserState>) {
+            self.state
+                .lock()
+                .expect("join greeting member data state")
+                .users = users;
+        }
+
+        fn set_members(&self, members: Vec<ChatMemberRecord>) {
+            self.state
+                .lock()
+                .expect("join greeting member data state")
+                .members = members;
+        }
+    }
+
+    impl super::NewMembersGreetingMemberDataStore for JoinGreetingMemberDataStub {
+        type Error = StubError;
+
+        fn list_user_states_by_ids<'a>(
+            &'a self,
+            user_ids: &'a [i64],
+        ) -> super::NewMembersRuntimeFuture<'a, Vec<UserState>, Self::Error> {
+            Box::pin(async move {
+                let state = self.state.lock().expect("join greeting member data state");
+                Ok(state
+                    .users
+                    .iter()
+                    .filter(|user| user_ids.contains(&user.id))
+                    .cloned()
+                    .collect())
+            })
+        }
+
+        fn get_user_state<'a>(
+            &'a self,
+            user_id: i64,
+        ) -> super::NewMembersRuntimeFuture<'a, Option<UserState>, Self::Error> {
+            Box::pin(async move {
+                let state = self.state.lock().expect("join greeting member data state");
+                Ok(state.users.iter().find(|user| user.id == user_id).cloned())
+            })
+        }
+
+        fn list_chat_members_by_user_ids<'a>(
+            &'a self,
+            chat_id: i64,
+            user_ids: &'a [i64],
+        ) -> super::NewMembersRuntimeFuture<'a, Vec<ChatMemberRecord>, Self::Error> {
+            Box::pin(async move {
+                let state = self.state.lock().expect("join greeting member data state");
+                Ok(state
+                    .members
+                    .iter()
+                    .filter(|member| {
+                        member.chat_id == chat_id && user_ids.contains(&member.user_id)
+                    })
+                    .cloned()
+                    .collect())
+            })
+        }
+
+        fn get_chat_member<'a>(
+            &'a self,
+            chat_id: i64,
+            user_id: i64,
+        ) -> super::NewMembersRuntimeFuture<'a, Option<ChatMemberRecord>, Self::Error> {
+            Box::pin(async move {
+                let state = self.state.lock().expect("join greeting member data state");
+                Ok(state
+                    .members
+                    .iter()
+                    .find(|member| member.chat_id == chat_id && member.user_id == user_id)
+                    .cloned())
+            })
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct JoinGreetingSenderStub {
+        state: Arc<Mutex<JoinGreetingSenderState>>,
+    }
+
+    #[derive(Default)]
+    struct JoinGreetingSenderState {
+        next_message_id: Option<i32>,
+        deleted: Vec<(i64, i32)>,
+        sent: Vec<super::NewMembersGreetingMessage>,
+    }
+
+    impl JoinGreetingSenderStub {
+        fn with_next_message_id(next_message_id: Option<i32>) -> Self {
+            Self {
+                state: Arc::new(Mutex::new(JoinGreetingSenderState {
+                    next_message_id,
+                    ..JoinGreetingSenderState::default()
+                })),
+            }
+        }
+
+        fn deleted(&self) -> Vec<(i64, i32)> {
+            self.state
+                .lock()
+                .expect("join greeting sender state")
+                .deleted
+                .clone()
+        }
+
+        fn sent(&self) -> Vec<super::NewMembersGreetingMessage> {
+            self.state
+                .lock()
+                .expect("join greeting sender state")
+                .sent
+                .clone()
+        }
+    }
+
+    impl super::NewMembersGreetingSender for JoinGreetingSenderStub {
+        fn delete_previous_greeting_message<'a>(
+            &'a self,
+            chat_id: i64,
+            message_id: i32,
+        ) -> super::NewMembersFollowupFuture<'a, ()> {
+            Box::pin(async move {
+                self.state
+                    .lock()
+                    .expect("join greeting sender state")
+                    .deleted
+                    .push((chat_id, message_id));
+            })
+        }
+
+        fn send_ephemeral_greeting<'a>(
+            &'a self,
+            message: super::NewMembersGreetingMessage,
+        ) -> super::NewMembersFollowupFuture<'a, Option<i32>> {
+            Box::pin(async move {
+                let mut state = self.state.lock().expect("join greeting sender state");
+                state.sent.push(message);
+                state.next_message_id
             })
         }
     }

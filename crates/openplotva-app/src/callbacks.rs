@@ -24,7 +24,6 @@ pub type CallbackQueryFuture<'a, E> = Pin<Box<dyn Future<Output = Result<(), E>>
 /// Boxed future returned by callback rate-limit checks.
 pub type CallbackRateLimitFuture<'a> = Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
 
-/// Side-effect boundary for Go callback acknowledgements.
 pub trait CallbackQueryEffects {
     /// Error returned by the concrete effect.
     type Error: fmt::Display + Send + Sync + 'static;
@@ -47,7 +46,6 @@ impl CallbackQueryEffects for openplotva_telegram::TelegramClient {
     }
 }
 
-/// Rate-limit boundary for Go `srv.IsRateLimited` callback checks.
 pub trait CallbackRateLimitPolicy {
     /// Return whether the callback's chat is rate-limited.
     fn is_callback_chat_rate_limited<'a>(&'a self, chat_id: i64) -> CallbackRateLimitFuture<'a>;
@@ -71,26 +69,21 @@ where
 pub enum CallbackQueryUpdateRoute {
     /// The update was not a callback query and was delegated.
     Delegated,
-    /// Go skipped a rate-limited callback without acknowledgement.
     SkippedRateLimited {
         /// Rate-limited chat ID.
         chat_id: i64,
     },
-    /// Go sent a terminal empty acknowledgement.
     Acked(CallbackQueryRoute),
-    /// Go tried to acknowledge but Telegram returned an error; the update is consumed.
     AckError {
         /// Route that required an acknowledgement.
         route: CallbackQueryRoute,
         /// Display form of the effect error.
         message: String,
     },
-    /// Go sent the cached settings callback acknowledgement.
     SettingsAcked {
         /// Raw settings callback data.
         data: String,
     },
-    /// Go tried to acknowledge a settings callback but Telegram returned an error.
     SettingsAckError {
         /// Raw settings callback data.
         data: String,
@@ -99,7 +92,6 @@ pub enum CallbackQueryUpdateRoute {
     },
     /// A known concrete callback handler is still owned by the downstream fetcher route.
     HandlerDelegated {
-        /// Go handler group.
         handler: CallbackHandlerKind,
         /// Resolved callback action.
         action: String,
@@ -117,7 +109,6 @@ pub enum CallbackQueryUpdateError {
     },
 }
 
-/// `UpdateHandler` adapter for Go callback query pre-handler behavior.
 #[derive(Clone, Debug)]
 pub struct CallbackQueryUpdateHandler<Effects, RateLimit, Next> {
     effects: Arc<Effects>,
@@ -159,7 +150,6 @@ where
     }
 }
 
-/// Handle Go `processCallbackQuery` terminal pre-handler routes and delegate known handlers.
 pub async fn handle_callback_query_update_or_else<
     Effects,
     RateLimit,
@@ -203,14 +193,33 @@ where
         }),
         CallbackQueryRoute::Settings { data } => {
             let method = settings_callback_ack_method(query.id.clone());
+            tracing::info!(
+                query_id = query.id.as_str(),
+                route = "settings",
+                "callback query acknowledgement requested"
+            );
             match effects.answer_callback_query(method).await {
-                Ok(()) => Ok(CallbackQueryUpdateRoute::SettingsAcked { data: data.clone() }),
+                Ok(()) => {
+                    tracing::info!(
+                        query_id = query.id.as_str(),
+                        route = "settings",
+                        answer_failed = false,
+                        "callback query acknowledgement completed"
+                    );
+                    Ok(CallbackQueryUpdateRoute::SettingsAcked { data: data.clone() })
+                }
                 Err(error) => {
                     let message = error.to_string();
                     tracing::warn!(
                         message,
                         query_id = query.id,
                         "failed to send settings callback response"
+                    );
+                    tracing::info!(
+                        query_id = query.id.as_str(),
+                        route = "settings",
+                        answer_failed = true,
+                        "callback query acknowledgement completed"
                     );
                     Ok(CallbackQueryUpdateRoute::SettingsAckError {
                         data: data.clone(),
@@ -235,14 +244,33 @@ where
             let Some(method) = callback_query_ack_method(query.id.clone(), &route) else {
                 return Ok(CallbackQueryUpdateRoute::Acked(route));
             };
+            tracing::info!(
+                query_id = query.id.as_str(),
+                route = ?route,
+                "callback query acknowledgement requested"
+            );
             match effects.answer_callback_query(method).await {
-                Ok(()) => Ok(CallbackQueryUpdateRoute::Acked(route)),
+                Ok(()) => {
+                    tracing::info!(
+                        query_id = query.id.as_str(),
+                        route = ?route,
+                        answer_failed = false,
+                        "callback query acknowledgement completed"
+                    );
+                    Ok(CallbackQueryUpdateRoute::Acked(route))
+                }
                 Err(error) => {
                     let message = error.to_string();
                     tracing::warn!(
                         message,
                         query_id = query.id,
                         "failed to acknowledge callback query"
+                    );
+                    tracing::info!(
+                        query_id = query.id.as_str(),
+                        route = ?route,
+                        answer_failed = true,
+                        "callback query acknowledgement completed"
                     );
                     Ok(CallbackQueryUpdateRoute::AckError { route, message })
                 }
@@ -263,16 +291,24 @@ fn callback_message_chat_id(query: &TelegramCallbackQuery) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use std::{
+        env,
         error::Error,
         fmt, io,
         sync::{Arc, Mutex},
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
     use carapax::types::Update as TelegramUpdate;
-    use openplotva_telegram::{CallbackHandlerKind, TelegramOutboundMethod};
+    use openplotva_telegram::{
+        CallbackHandlerKind, TelegramOutboundMethod, TelegramOutboundMethodKind,
+    };
+    use openplotva_updates::UpdateConsumerConfig;
     use serde_json::{Value, json};
 
-    use crate::updates::{UpdateHandler, UpdateHandlerFuture};
+    use crate::updates::{
+        TelegramFileMetadataStoreFuture, UpdateHandler, UpdateHandlerFuture, UpdateStateStore,
+        UpdateStateStoreFuture, process_update_with_state_store_at,
+    };
 
     use super::{
         CallbackQueryEffects, CallbackQueryFuture, CallbackQueryUpdateHandler,
@@ -420,6 +456,98 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn live_redis_decoded_callback_query_acknowledges_terminal_route_when_url_is_set()
+    -> Result<(), Box<dyn Error>> {
+        let Ok(redis_url) = env::var("OPENPLOTVA_TEST_REDIS_URL") else {
+            return Ok(());
+        };
+        let redis_client = redis::Client::open(redis_url)?;
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let key = format!("openplotva:test:decoded-callback:{suffix}");
+        let update_queue =
+            openplotva_updates::RedisUpdateQueue::with_key(redis_client.clone(), key.clone());
+        let mut redis = redis_client.get_multiplexed_async_connection().await?;
+        let _: i64 = redis::cmd("DEL").arg(&key).query_async(&mut redis).await?;
+
+        update_queue
+            .enqueue_update(&callback_query_update("", true)?)
+            .await?;
+        assert_eq!(update_queue.len().await?, 1);
+        let decoded = update_queue
+            .dequeue_update(Duration::from_secs(1))
+            .await?
+            .ok_or_else(|| io::Error::other("expected decoded callback query update"))?;
+
+        let state_store = UpdateStateStoreStub::default();
+        let effects = CallbackEffectsStub::default();
+        let rate_limit = CallbackRateLimitStub::default();
+        let next = UpdateHandlerStub::default();
+        let route = Arc::new(Mutex::new(None));
+        let captured_route = Arc::clone(&route);
+
+        let report = process_update_with_state_store_at(
+            decoded,
+            UpdateConsumerConfig {
+                dequeue_timeout: Duration::from_millis(1),
+                state_timeout: Duration::from_secs(1),
+                handle_timeout: Duration::from_secs(1),
+                side_effect_max_age: Duration::from_secs(60),
+                worker_limit: 1,
+            },
+            UNIX_EPOCH + Duration::from_secs(1_710_000_000),
+            &state_store,
+            |update| async {
+                let handled =
+                    handle_callback_query_update_or_else(&effects, &rate_limit, update, |update| {
+                        next.handle_update(update)
+                    })
+                    .await
+                    .map_err(|error| io::Error::other(error.to_string()))?;
+                *captured_route.lock().expect("route") = Some(handled);
+                Ok::<(), io::Error>(())
+            },
+        )
+        .await;
+
+        assert_eq!(report.update_id, 5151);
+        assert_eq!(report.update_name, "callback_query");
+        assert_eq!(
+            report.state.outcome,
+            openplotva_updates::UpdateStageOutcome::Completed
+        );
+        assert_eq!(
+            report.handle.as_ref().map(|stage| &stage.outcome),
+            Some(&openplotva_updates::UpdateStageOutcome::Completed)
+        );
+        assert!(!report.skipped_handle);
+        assert_eq!(
+            state_store.calls(),
+            vec!["chat:-10042".to_owned(), "user:7".to_owned()]
+        );
+        assert!(next.calls().is_empty());
+        assert!(matches!(
+            *route.lock().expect("route"),
+            Some(CallbackQueryUpdateRoute::Acked(_))
+        ));
+
+        let artifacts = effects.method_artifacts();
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(
+            artifacts[0].0,
+            TelegramOutboundMethodKind::AnswerCallbackQuery
+        );
+        let payload = &artifacts[0].1;
+        assert_eq!(payload["callback_query_id"], json!("callback-query-id"));
+        assert!(payload.get("text").is_none());
+        assert!(payload.get("show_alert").is_none());
+        assert!(payload.get("cache_time").is_none());
+        assert_eq!(update_queue.len().await?, 0);
+
+        let _: i64 = redis::cmd("DEL").arg(&key).query_async(&mut redis).await?;
+        Ok(())
+    }
+
     fn callback_query_update(
         data: &str,
         include_message: bool,
@@ -470,11 +598,16 @@ mod tests {
     #[derive(Clone, Default)]
     struct CallbackEffectsStub {
         payloads: Arc<Mutex<Vec<Value>>>,
+        artifacts: Arc<Mutex<Vec<(TelegramOutboundMethodKind, Value)>>>,
     }
 
     impl CallbackEffectsStub {
         fn payloads(&self) -> Vec<Value> {
             self.payloads.lock().expect("callback payloads").clone()
+        }
+
+        fn method_artifacts(&self) -> Vec<(TelegramOutboundMethodKind, Value)> {
+            self.artifacts.lock().expect("callback artifacts").clone()
         }
     }
 
@@ -486,13 +619,19 @@ mod tests {
             method: TelegramOutboundMethod,
         ) -> CallbackQueryFuture<'a, Self::Error> {
             Box::pin(async move {
+                let kind = method.kind();
                 let TelegramOutboundMethod::AnswerCallbackQuery(method) = method else {
                     return Err(StubError);
                 };
+                let payload = serde_json::to_value(method.as_ref()).map_err(|_| StubError)?;
+                self.artifacts
+                    .lock()
+                    .expect("callback artifacts")
+                    .push((kind, payload.clone()));
                 self.payloads
                     .lock()
                     .expect("callback payloads")
-                    .push(serde_json::to_value(method.as_ref()).map_err(|_| StubError)?);
+                    .push(payload);
                 Ok(())
             })
         }
@@ -558,4 +697,58 @@ mod tests {
     }
 
     impl Error for StubError {}
+
+    #[derive(Clone, Debug, Default)]
+    struct UpdateStateStoreStub {
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl UpdateStateStoreStub {
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().expect("state calls").clone()
+        }
+    }
+
+    impl UpdateStateStore for UpdateStateStoreStub {
+        type Error = io::Error;
+
+        fn upsert_chat_state<'a>(
+            &'a self,
+            chat: &'a openplotva_core::ChatState,
+        ) -> UpdateStateStoreFuture<'a, Self::Error> {
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .expect("state calls")
+                    .push(format!("chat:{}", chat.id));
+                Ok(())
+            })
+        }
+
+        fn upsert_user_state<'a>(
+            &'a self,
+            user: &'a openplotva_core::UserState,
+        ) -> UpdateStateStoreFuture<'a, Self::Error> {
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .expect("state calls")
+                    .push(format!("user:{}", user.id));
+                Ok(())
+            })
+        }
+
+        fn upsert_telegram_file_metadata<'a>(
+            &'a self,
+            params: &'a openplotva_storage::TelegramFileMetadataUpsert,
+        ) -> TelegramFileMetadataStoreFuture<'a, Self::Error> {
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .expect("state calls")
+                    .push(format!("file:{}", params.file_unique_id));
+                Ok(())
+            })
+        }
+    }
 }

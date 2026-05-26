@@ -1,52 +1,123 @@
 //! Composition root for the OpenPlotva application shell.
 
 pub mod activity;
+pub mod admin;
 pub mod callbacks;
+pub mod checkin;
+pub mod control_jobs;
+pub mod delete_drawing;
+pub mod delete_lyrics;
+pub mod delete_message;
+pub mod diagnostics;
+pub mod dialog_context;
+pub mod dialog_debounce;
+pub mod dialog_jobs;
+pub mod dialog_messages;
+pub mod dialog_runtime;
+pub mod dialog_tools;
 pub mod edited;
 pub mod guest;
+pub mod help;
+pub mod history_summary;
+pub mod image_jobs;
 pub mod inline;
+pub mod media;
 pub mod members;
+pub mod memory_runtime;
+pub mod message_gate;
+pub mod music_jobs;
 pub mod payments;
 pub mod pending_ops;
 pub mod permissions;
 pub mod rate_limits;
+pub mod rates;
+pub mod reset;
+pub mod runtime_api;
+mod runtime_cache;
+mod runtime_dispatcher;
+mod runtime_entities;
+mod runtime_gemini_cache;
+mod runtime_llm;
+mod runtime_llm_analytics;
+mod runtime_pending_ops;
+mod runtime_safety;
+mod runtime_sql;
+mod runtime_taskman;
+mod runtime_updates;
+pub mod serper;
 pub mod settings;
 pub mod skipped;
-mod reference_snapshot;
+pub mod task_queue;
+pub mod tinyfish;
+pub mod translate;
 pub mod updates;
 pub mod virtual_messages;
+pub mod vision;
+pub mod youtube;
 
-use std::{fmt, future::Future, pin::Pin, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    convert::Infallible,
+    fmt,
+    future::Future,
+    pin::Pin,
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::Context as _;
 use axum::{
     body::Bytes,
-    extract::Extension,
-    http::{HeaderMap, Method, StatusCode},
-    response::{IntoResponse, Response},
-    routing::any,
+    extract::{Extension, Path, RawQuery},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, header},
+    response::{
+        IntoResponse, Response,
+        sse::{Event, KeepAlive, Sse},
+    },
+    routing::{any, get},
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use futures_util::{Stream, stream};
 use openplotva_config::AppConfig;
 use openplotva_server::{ReadinessCheck, ReadinessResponse};
 use openplotva_storage::{
-    PostgresChatSettingsStore, PostgresHistoryStore, PostgresPaymentStore, PostgresVipStore,
-    PostgresVirtualMessageStore, RedisEphemeralMessageStore, RedisRateLimitStore, ServiceClients,
+    PostgresChatMemberStore, PostgresChatSettingsStore, PostgresHistoryStore, PostgresMemoryStore,
+    PostgresPaymentStore, PostgresRuntimeTokenStore, PostgresShieldStore,
+    PostgresTelegramFileStore, PostgresVipStore, PostgresVirtualMessageStore,
+    RedisBlockedChatStore, RedisEphemeralMessageStore, RedisRateLimitStore, ServiceClients,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use sqlx::{PgPool, Row, postgres::PgRow};
 use thiserror::Error;
-use time::OffsetDateTime;
-use tokio::{sync::watch, task::JoinHandle, time::timeout};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use tokio::{
+    sync::watch,
+    task::JoinHandle,
+    time::{Interval, timeout},
+};
 
 const GO_DISPATCHER_MAX_QUEUE_SIZE: usize = 10_000;
 const GO_DISPATCHER_DEBOUNCE_WINDOW: Duration = Duration::from_secs(3);
 const GO_DISPATCHER_DEBOUNCE_CACHE_SIZE: usize = 1_000;
+const GO_WEBHOOK_DELETE_ON_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Default)]
 struct RuntimeWorkers {
     handles: Vec<JoinHandle<()>>,
     stop: Option<watch::Sender<bool>>,
     dispatcher: Option<DispatcherRuntime>,
+    shared_task_queue: Option<task_queue::SharedTaskQueueRuntime>,
+    dialog_debounce: Option<Arc<dialog_debounce::InMemoryDialogDebounce>>,
     webhook_route: Option<TelegramWebhookRoute>,
+    telegram: Option<openplotva_telegram::TelegramClient>,
+    delete_webhook_on_shutdown: bool,
+    bot_username: Option<String>,
+    bot_id: Option<i64>,
+    dispatcher_inspector: runtime_dispatcher::RuntimeDispatcherInspectorHandle,
+    cache_inspector: runtime_cache::RuntimeCacheInspectorHandle,
+    taskman_inspector: runtime_taskman::RuntimeTaskmanInspectorHandle,
+    memory_restart_trigger: Option<Arc<tokio::sync::Notify>>,
+    llm_trace_buffer: Option<runtime_llm::RuntimeLlmTraceBuffer>,
 }
 
 struct DispatcherRuntime {
@@ -68,7 +139,6 @@ pub trait DeleteWebhookExecutor {
     /// Error returned by the concrete Telegram client.
     type Error: fmt::Display + Send;
 
-    /// Execute Go's startup `deleteWebhook` request.
     fn delete_webhook<'a>(&'a self) -> DeleteWebhookFuture<'a, Self::Error>;
 }
 
@@ -89,7 +159,6 @@ pub trait SetWebhookExecutor {
     /// Error returned by the concrete Telegram client.
     type Error: fmt::Display + Send;
 
-    /// Execute Go's startup `setWebhook` request.
     fn set_webhook<'a>(
         &'a self,
         setup: &'a openplotva_telegram::WebhookSetup,
@@ -225,13 +294,11 @@ pub trait BotCommandSetupExecutor {
     /// Error returned by the concrete Telegram client.
     type Error: fmt::Display + Send;
 
-    /// Execute Go's startup `deleteMyCommands` request.
     fn delete_my_commands<'a>(
         &'a self,
         method: openplotva_telegram::DeleteBotCommands,
     ) -> BotCommandSetupFuture<'a, Self::Error>;
 
-    /// Execute one Go startup `setMyCommands` request for a named command set.
     fn set_my_commands<'a>(
         &'a self,
         scope: &'static str,
@@ -262,7 +329,6 @@ impl BotCommandSetupExecutor for openplotva_telegram::TelegramClient {
 pub struct BotCommandSetupReport {
     /// Whether the global command list was deleted first.
     pub deleted_existing: bool,
-    /// Go inventory names for command scopes successfully registered.
     pub set_scopes: Vec<&'static str>,
 }
 
@@ -284,7 +350,6 @@ pub enum BotCommandSetupError {
     /// A scoped `setMyCommands` request failed.
     #[error("set {scope} bot commands: {message}")]
     Set {
-        /// Go inventory name for the command scope.
         scope: &'static str,
         /// Display form of the Telegram client error.
         message: String,
@@ -302,15 +367,196 @@ pub struct TelegramUpdateProducerStartupReport {
     pub producer: Option<openplotva_updates::UpdateProducerRunReport>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WebhookShutdownCleanupReport {
+    SkippedDisabled,
+    /// Telegram `deleteWebhook` completed successfully.
+    Deleted,
+    Failed {
+        error: String,
+    },
+    TimedOut,
+}
+
 #[derive(Clone)]
 struct TelegramWebhookRoute {
     sender: openplotva_telegram::WebhookUpdateSender,
     secret_token: Arc<str>,
 }
 
+#[derive(Clone)]
+struct StaticWebRoutes {
+    admin_ids: Arc<[i64]>,
+    bot_token: Arc<str>,
+    webapp_url: Arc<str>,
+    bot_username: Arc<str>,
+    bot_id: Option<i64>,
+    default_log_level: Arc<str>,
+    postgres: Option<PgPool>,
+    redis: Option<redis::Client>,
+    log_buffer: Option<Arc<openplotva_observability::RuntimeLogBuffer>>,
+    telegram: Option<openplotva_telegram::TelegramClient>,
+    dispatcher_inspector: runtime_dispatcher::RuntimeDispatcherInspectorHandle,
+    cache_inspector: runtime_cache::RuntimeCacheInspectorHandle,
+    taskman_inspector: runtime_taskman::RuntimeTaskmanInspectorHandle,
+    llm_trace_buffer: Option<runtime_llm::RuntimeLlmTraceBuffer>,
+    llm_discovery_base_url: Arc<str>,
+    llm_discovery_service_name: Arc<str>,
+    state_store: Option<PostgresVirtualMessageStore>,
+    settings_store: Option<PostgresChatSettingsStore>,
+    member_store: Option<PostgresChatMemberStore>,
+    vip_store: Option<PostgresVipStore>,
+    memory_store: Option<PostgresMemoryStore>,
+    memory_admin_enabled: bool,
+    memory_retention: Duration,
+    memory_consolidation_model: Arc<str>,
+    memory_max_input_tokens: i32,
+    memory_max_messages_per_run: i32,
+    memory_token_estimator_source: Arc<str>,
+    memory_restart_trigger: Option<Arc<tokio::sync::Notify>>,
+    memory_override_runtime: Option<AdminMemoryOverrideRuntime>,
+    shield_store: Option<PostgresShieldStore>,
+    shield_options: openplotva_shield::Options,
+    shield_embedder: Option<Arc<dyn memory_runtime::EmbeddingProvider>>,
+}
+
+#[derive(Clone)]
+struct AdminMemoryOverrideRuntime {
+    config: Arc<AppConfig>,
+    store: PostgresMemoryStore,
+    lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+fn static_web_routes(
+    admin_ids: Vec<i64>,
+    bot_token: impl Into<String>,
+    webapp_url: impl Into<String>,
+    bot_username: impl Into<String>,
+    state_store: Option<PostgresVirtualMessageStore>,
+) -> StaticWebRoutes {
+    StaticWebRoutes {
+        admin_ids: Arc::from(admin_ids),
+        bot_token: Arc::from(bot_token.into()),
+        webapp_url: Arc::from(webapp_url.into()),
+        bot_username: Arc::from(bot_username.into()),
+        bot_id: None,
+        default_log_level: Arc::from("info"),
+        postgres: None,
+        redis: None,
+        log_buffer: None,
+        telegram: None,
+        dispatcher_inspector: runtime_dispatcher::RuntimeDispatcherInspectorHandle::default(),
+        cache_inspector: runtime_cache::RuntimeCacheInspectorHandle::default(),
+        taskman_inspector: runtime_taskman::RuntimeTaskmanInspectorHandle::default(),
+        llm_trace_buffer: None,
+        llm_discovery_base_url: Arc::from(""),
+        llm_discovery_service_name: Arc::from(""),
+        state_store,
+        settings_store: None,
+        member_store: None,
+        vip_store: None,
+        memory_store: None,
+        memory_admin_enabled: false,
+        memory_retention: Duration::from_secs(7 * 24 * 60 * 60),
+        memory_consolidation_model: Arc::from(
+            openplotva_memory::DEFAULT_MEMORY_CONSOLIDATION_MODEL,
+        ),
+        memory_max_input_tokens: 0,
+        memory_max_messages_per_run: 0,
+        memory_token_estimator_source: Arc::from(""),
+        memory_restart_trigger: None,
+        memory_override_runtime: None,
+        shield_store: None,
+        shield_options: openplotva_shield::Options::default(),
+        shield_embedder: None,
+    }
+}
+
+fn static_web_routes_from_config(
+    config: &AppConfig,
+    service_clients: Option<&ServiceClients>,
+    bot_username: impl Into<String>,
+    log_buffer: Arc<openplotva_observability::RuntimeLogBuffer>,
+    runtime_workers: &RuntimeWorkers,
+) -> StaticWebRoutes {
+    let mut routes = static_web_routes(
+        config.admins.admin_ids.clone(),
+        config.bot.key.clone().unwrap_or_default(),
+        config.server.url.clone(),
+        bot_username,
+        service_clients.map(|clients| PostgresVirtualMessageStore::new(clients.postgres.clone())),
+    );
+    routes.default_log_level = Arc::from(config.observability.log_level.clone());
+    routes.log_buffer = Some(log_buffer);
+    routes.telegram = runtime_workers.telegram.clone();
+    routes.bot_id = runtime_workers.bot_id;
+    routes.dispatcher_inspector = runtime_workers.dispatcher_inspector.clone();
+    routes.cache_inspector = runtime_workers.cache_inspector.clone();
+    routes.taskman_inspector = runtime_workers.taskman_inspector.clone();
+    routes.llm_trace_buffer = runtime_workers.llm_trace_buffer.clone();
+    routes.llm_discovery_base_url = Arc::from(config.llm.discovery.base_url.clone());
+    routes.llm_discovery_service_name = Arc::from(config.llm.dialog.discovery_service_name.clone());
+    routes.memory_admin_enabled = config.memory.enabled;
+    let memory_worker_config =
+        memory_runtime::memory_service_worker_config_from_memory_config(&config.memory);
+    routes.memory_retention = memory_worker_config.retention;
+    routes.memory_consolidation_model = Arc::from(config.memory.consolidation_model.clone());
+    routes.memory_max_input_tokens = memory_worker_config.process.max_input_tokens;
+    routes.memory_max_messages_per_run = memory_worker_config.process.max_messages_per_run;
+    routes.memory_token_estimator_source = Arc::from(memory_token_estimator_source(config));
+    routes.memory_restart_trigger = runtime_workers.memory_restart_trigger.clone();
+    routes.shield_options = shield_options_from_config(&config.shield);
+    if let Some(clients) = service_clients {
+        routes.postgres = Some(clients.postgres.clone());
+        routes.redis = Some(clients.redis.client().clone());
+        routes.settings_store = Some(PostgresChatSettingsStore::new(clients.postgres.clone()));
+        routes.member_store = Some(PostgresChatMemberStore::new(clients.postgres.clone()));
+        routes.vip_store = Some(PostgresVipStore::new(clients.postgres.clone()));
+        let memory_store = PostgresMemoryStore::new(clients.postgres.clone());
+        routes.memory_store = Some(memory_store.clone());
+        if config.memory.enabled {
+            routes.memory_override_runtime = Some(AdminMemoryOverrideRuntime {
+                config: Arc::new(config.clone()),
+                store: memory_store,
+                lock: Arc::new(tokio::sync::Mutex::new(())),
+            });
+        }
+        if config.shield.enabled {
+            routes.shield_store = Some(PostgresShieldStore::new(clients.postgres.clone()));
+            match memory_runtime::shield_embedder_from_config(&config.shield) {
+                Ok(Some(client)) => {
+                    routes.shield_embedder =
+                        Some(Arc::new(client) as Arc<dyn memory_runtime::EmbeddingProvider>);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "failed to configure admin shield embedder");
+                }
+            }
+        }
+    }
+    routes
+}
+
+fn memory_token_estimator_source(config: &AppConfig) -> String {
+    let base = config
+        .memory
+        .token_estimator_url
+        .trim()
+        .trim_end_matches('/');
+    if base.is_empty() {
+        "heuristic".to_owned()
+    } else {
+        format!("http-token-estimator:{base}/estimate")
+    }
+}
+
 /// Build the HTTP router without binding a socket.
 pub fn router() -> axum::Router {
-    openplotva_server::router()
+    router_with_readiness_and_static_web(
+        ReadinessResponse::ready(Vec::new()),
+        static_web_routes(Vec::new(), "", "", "", None),
+    )
 }
 
 /// Build the HTTP router with a Telegram webhook intake route attached.
@@ -324,14 +570,29 @@ pub fn router_with_readiness_and_telegram_webhook(
         secret_token: Arc::from(secret_token.into()),
     };
 
-    router_with_readiness_and_telegram_webhook_route(readiness, route)
+    router_with_readiness_static_web_and_telegram_webhook_route(
+        readiness,
+        static_web_routes(Vec::new(), "", "", "", None),
+        route,
+    )
 }
 
-fn router_with_readiness_and_telegram_webhook_route(
+fn router_with_readiness_and_static_web(
     readiness: ReadinessResponse,
+    static_web: StaticWebRoutes,
+) -> axum::Router {
+    install_static_web_routes(
+        openplotva_server::router_with_readiness(readiness),
+        static_web,
+    )
+}
+
+fn router_with_readiness_static_web_and_telegram_webhook_route(
+    readiness: ReadinessResponse,
+    static_web: StaticWebRoutes,
     route: TelegramWebhookRoute,
 ) -> axum::Router {
-    openplotva_server::router_with_readiness(readiness)
+    router_with_readiness_and_static_web(readiness, static_web)
         .route(
             openplotva_telegram::TELEGRAM_WEBHOOK_PATH,
             any(telegram_webhook),
@@ -339,16 +600,6517 @@ fn router_with_readiness_and_telegram_webhook_route(
         .layer(Extension(route))
 }
 
+fn install_static_web_routes(router: axum::Router, static_web: StaticWebRoutes) -> axum::Router {
+    router
+        .route("/settings", get(settings_redirect))
+        .route("/settings/", get(settings_index))
+        .route("/settings/{*path}", get(settings_asset))
+        .route("/api/settings", any(settings_api))
+        .route("/api/settings/", any(settings_api))
+        .route("/api/settings/deputies", any(settings_deputies_api))
+        .route("/api/settings/deputies/", any(settings_deputies_api))
+        .route(
+            "/api/settings/deputies/candidates",
+            any(settings_deputy_candidates_api),
+        )
+        .route(
+            "/api/settings/deputies/candidates/",
+            any(settings_deputy_candidates_api),
+        )
+        .route("/api/settings/memory", any(settings_memory_api))
+        .route("/api/settings/memory/", any(settings_memory_api))
+        .route("/api/chats", any(settings_chats_api))
+        .route("/admin/api/auth", any(admin_auth))
+        .route("/admin/api/auth_check", get(admin_auth_check))
+        .route("/admin/api/state", any(admin_state))
+        .route("/admin/api/loglevel", any(admin_loglevel))
+        .route("/admin/api/aifarm/pool", any(admin_aifarm_pool))
+        .route(
+            "/admin/api/aifarm/pool/reasoning",
+            any(admin_aifarm_pool_reasoning),
+        )
+        .route("/admin/api/logs/stream", any(admin_logs_stream))
+        .route("/admin/api/bootstrap", get(admin_bootstrap))
+        .route("/admin/api/metrics", any(admin_state))
+        .route("/admin/api/llm/requests", any(admin_llm_requests))
+        .route(
+            "/admin/api/llm/requests/clear",
+            any(admin_llm_requests_clear),
+        )
+        .route("/admin/api/safety/checks", any(admin_safety_checks))
+        .route(
+            "/admin/api/analytics/llm/summary",
+            any(admin_llm_analytics_summary),
+        )
+        .route("/admin/api/memory/cards", any(admin_memory_cards))
+        .route("/admin/api/memory/runs", any(admin_memory_runs))
+        .route("/admin/api/memory/restart", any(admin_memory_restart))
+        .route("/admin/api/shield/documents", any(admin_shield_documents))
+        .route(
+            "/admin/api/shield/embeddings/rebuild",
+            any(admin_shield_embeddings_rebuild),
+        )
+        .route("/admin/api/shield/test", any(admin_shield_test))
+        .route("/admin/api/redis/list", any(admin_redis_list))
+        .route("/admin/api/redis/get", any(admin_redis_get))
+        .route(
+            "/admin/api/redis/delete_prefix",
+            any(admin_redis_delete_prefix),
+        )
+        .route("/admin/api/redis/prefixes", any(admin_redis_prefixes))
+        .route("/admin/api/redis/delete_key", any(admin_redis_delete_key))
+        .route("/admin/api/redis/flushdb", any(admin_redis_flushdb))
+        .route("/admin/api/chat", any(admin_chat_get))
+        .route("/admin/api/chat/settings", any(admin_chat_settings))
+        .route("/admin/api/chat/block", any(admin_chat_block))
+        .route("/admin/api/chat/unblock", any(admin_chat_unblock))
+        .route("/admin/api/chat/members", any(admin_chat_members))
+        .route("/admin/api/chats", any(admin_chats_list))
+        .route(
+            "/admin/api/chats/search_by_member",
+            any(admin_chats_search_by_member),
+        )
+        .route("/admin/api/users", any(admin_users_list))
+        .route("/admin/api/user", any(admin_user_get))
+        .route("/admin/api/user/grant_vip", any(admin_user_grant_vip))
+        .route("/admin/api/user/revoke_vip", any(admin_user_revoke_vip))
+        .route("/admin/api/user/delete", any(admin_user_delete))
+        .route("/admin/api/taskman/jobs", any(admin_taskman_jobs))
+        .route(
+            "/admin/api/taskman/jobs/clear",
+            any(admin_taskman_jobs_clear),
+        )
+        .route("/admin/api/taskman/job", any(admin_taskman_job))
+        .route(
+            "/admin/api/taskman/job/cancel",
+            any(admin_taskman_job_cancel),
+        )
+        .route(
+            "/admin/api/taskman/job/restart",
+            any(admin_taskman_job_restart),
+        )
+        .route("/admin", get(admin_redirect))
+        .route("/admin/", get(admin_index))
+        .route("/admin/{*path}", get(admin_asset))
+        .layer(Extension(static_web))
+}
+
+#[cfg(test)]
+const GO_ADMIN_API_ROUTE_PATTERNS: &[&str] = &[
+    "/admin/api/auth",
+    "/admin/api/auth_check",
+    "/admin/api/state",
+    "/admin/api/loglevel",
+    "/admin/api/aifarm/pool",
+    "/admin/api/aifarm/pool/reasoning",
+    "/admin/api/logs/stream",
+    "/admin/api/bootstrap",
+    "/admin/api/metrics",
+    "/admin/api/llm/requests",
+    "/admin/api/llm/requests/clear",
+    "/admin/api/safety/checks",
+    "/admin/api/analytics/llm/summary",
+    "/admin/api/memory/cards",
+    "/admin/api/memory/runs",
+    "/admin/api/memory/restart",
+    "/admin/api/shield/documents",
+    "/admin/api/shield/embeddings/rebuild",
+    "/admin/api/shield/test",
+    "/admin/api/redis/list",
+    "/admin/api/redis/get",
+    "/admin/api/redis/delete_prefix",
+    "/admin/api/redis/prefixes",
+    "/admin/api/redis/delete_key",
+    "/admin/api/redis/flushdb",
+    "/admin/api/chat",
+    "/admin/api/chat/settings",
+    "/admin/api/chat/block",
+    "/admin/api/chat/unblock",
+    "/admin/api/chat/members",
+    "/admin/api/chats",
+    "/admin/api/chats/search_by_member",
+    "/admin/api/users",
+    "/admin/api/user",
+    "/admin/api/user/grant_vip",
+    "/admin/api/user/revoke_vip",
+    "/admin/api/user/delete",
+    "/admin/api/taskman/jobs",
+    "/admin/api/taskman/jobs/clear",
+    "/admin/api/taskman/job",
+    "/admin/api/taskman/job/cancel",
+    "/admin/api/taskman/job/restart",
+];
+
+async fn settings_redirect() -> Response {
+    moved_permanently("/settings/")
+}
+
+async fn admin_redirect() -> Response {
+    moved_permanently("/admin/")
+}
+
+async fn settings_index() -> Response {
+    static_web_asset_response(openplotva_web::StaticAssetGroup::Settings, "")
+}
+
+async fn settings_asset(Path(path): Path<String>) -> Response {
+    static_web_asset_response(openplotva_web::StaticAssetGroup::Settings, &path)
+}
+
+async fn settings_api(
+    method: Method,
+    RawQuery(raw_query): RawQuery,
+    Extension(routes): Extension<StaticWebRoutes>,
+    body: Bytes,
+) -> Response {
+    match method {
+        Method::OPTIONS => settings_options_response(),
+        Method::GET => settings_get_response(&routes, raw_query.as_deref()).await,
+        Method::POST | Method::PUT => settings_update_response(&routes, &body).await,
+        _ => settings_error_response(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed"),
+    }
+}
+
+async fn settings_deputies_api(
+    method: Method,
+    RawQuery(_raw_query): RawQuery,
+    Extension(routes): Extension<StaticWebRoutes>,
+    body: Bytes,
+) -> Response {
+    match method {
+        Method::OPTIONS => settings_side_options_response("GET, PUT, OPTIONS"),
+        Method::PUT => settings_deputies_update_response(&routes, &body).await,
+        _ => settings_side_error_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "Method not allowed",
+            "GET, PUT, OPTIONS",
+        ),
+    }
+}
+
+async fn settings_deputy_candidates_api(
+    method: Method,
+    RawQuery(raw_query): RawQuery,
+    Extension(routes): Extension<StaticWebRoutes>,
+) -> Response {
+    match method {
+        Method::OPTIONS => settings_side_options_response("GET, PUT, OPTIONS"),
+        Method::GET => settings_deputy_candidates_response(&routes, raw_query.as_deref()).await,
+        _ => settings_side_error_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "Method not allowed",
+            "GET, PUT, OPTIONS",
+        ),
+    }
+}
+
+async fn settings_memory_api(
+    method: Method,
+    RawQuery(raw_query): RawQuery,
+    Extension(routes): Extension<StaticWebRoutes>,
+) -> Response {
+    match method {
+        Method::OPTIONS => settings_side_options_response("GET, DELETE, OPTIONS"),
+        Method::GET => settings_memory_get_response(&routes, raw_query.as_deref()).await,
+        Method::DELETE => settings_memory_delete_response(&routes, raw_query.as_deref()).await,
+        _ => settings_side_error_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "method not allowed",
+            "GET, DELETE, OPTIONS",
+        ),
+    }
+}
+
+async fn settings_chats_api(
+    method: Method,
+    RawQuery(raw_query): RawQuery,
+    Extension(routes): Extension<StaticWebRoutes>,
+) -> Response {
+    if method != Method::GET {
+        return (StatusCode::METHOD_NOT_ALLOWED, "Method not allowed\n").into_response();
+    }
+    settings_chats_response(&routes, raw_query.as_deref()).await
+}
+
+async fn admin_auth(
+    method: Method,
+    RawQuery(raw_query): RawQuery,
+    Extension(routes): Extension<StaticWebRoutes>,
+) -> Response {
+    admin_auth_response(&routes, method, raw_query.as_deref()).await
+}
+
+async fn admin_auth_check(
+    Extension(routes): Extension<StaticWebRoutes>,
+    headers: HeaderMap,
+) -> Response {
+    let authenticated_user_id =
+        admin_session_user_id(&headers).filter(|user_id| routes.admin_ids.contains(user_id));
+    match authenticated_user_id {
+        Some(user_id) => admin_json_response(
+            StatusCode::OK,
+            serde_json::json!({
+                "authenticated": true,
+                "user_id": user_id,
+            }),
+        ),
+        None => admin_json_response(
+            StatusCode::OK,
+            serde_json::json!({ "authenticated": false }),
+        ),
+    }
+}
+
+async fn admin_bootstrap(Extension(routes): Extension<StaticWebRoutes>) -> Response {
+    admin_json_response(
+        StatusCode::OK,
+        serde_json::json!({
+            "webapp_url": routes.webapp_url.as_ref(),
+            "bot_username": routes.bot_username.as_ref(),
+        }),
+    )
+}
+
+async fn admin_state(Extension(routes): Extension<StaticWebRoutes>) -> Response {
+    admin_state_response(&routes).await
+}
+
+async fn admin_loglevel(
+    method: Method,
+    headers: HeaderMap,
+    Extension(routes): Extension<StaticWebRoutes>,
+    body: Bytes,
+) -> Response {
+    admin_loglevel_response(&routes, method, &headers, &body).await
+}
+
+async fn admin_aifarm_pool(
+    method: Method,
+    headers: HeaderMap,
+    Extension(routes): Extension<StaticWebRoutes>,
+    body: Bytes,
+) -> Response {
+    admin_aifarm_pool_toggle_response(
+        &routes,
+        method,
+        &headers,
+        &body,
+        "aifarm.pool.enabled",
+        openplotva_llm::aifarm::set_pool_enabled,
+    )
+    .await
+}
+
+async fn admin_aifarm_pool_reasoning(
+    method: Method,
+    headers: HeaderMap,
+    Extension(routes): Extension<StaticWebRoutes>,
+    body: Bytes,
+) -> Response {
+    admin_aifarm_pool_toggle_response(
+        &routes,
+        method,
+        &headers,
+        &body,
+        "aifarm.pool.reasoning_enabled",
+        openplotva_llm::aifarm::set_pool_reasoning_enabled,
+    )
+    .await
+}
+
+async fn admin_logs_stream(
+    headers: HeaderMap,
+    Extension(routes): Extension<StaticWebRoutes>,
+) -> Response {
+    if let Err(error) = require_admin_request(&headers, &routes.admin_ids) {
+        return admin_auth_failure_response(error);
+    }
+    let Some(buffer) = routes.log_buffer.clone() else {
+        return admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed");
+    };
+    Sse::new(admin_logs_sse_stream(buffer))
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("keep-alive"),
+        )
+        .into_response()
+}
+
+async fn admin_llm_requests(
+    method: Method,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Extension(routes): Extension<StaticWebRoutes>,
+) -> Response {
+    admin_llm_requests_response(&routes, method, &headers, raw_query.as_deref())
+}
+
+async fn admin_llm_requests_clear(
+    method: Method,
+    headers: HeaderMap,
+    Extension(routes): Extension<StaticWebRoutes>,
+) -> Response {
+    admin_llm_requests_clear_response(&routes, method, &headers)
+}
+
+async fn admin_safety_checks(
+    method: Method,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Extension(routes): Extension<StaticWebRoutes>,
+) -> Response {
+    admin_safety_checks_response(&routes, method, &headers, raw_query.as_deref()).await
+}
+
+async fn admin_llm_analytics_summary(
+    method: Method,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Extension(routes): Extension<StaticWebRoutes>,
+) -> Response {
+    admin_llm_analytics_summary_response(&routes, method, &headers, raw_query.as_deref()).await
+}
+
+async fn admin_memory_cards(
+    method: Method,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Extension(routes): Extension<StaticWebRoutes>,
+) -> Response {
+    admin_memory_cards_response(&routes, method, &headers, raw_query.as_deref()).await
+}
+
+async fn admin_memory_runs(
+    method: Method,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Extension(routes): Extension<StaticWebRoutes>,
+    body: Bytes,
+) -> Response {
+    admin_memory_runs_response(&routes, method, &headers, raw_query.as_deref(), &body).await
+}
+
+async fn admin_memory_restart(
+    method: Method,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Extension(routes): Extension<StaticWebRoutes>,
+    body: Bytes,
+) -> Response {
+    admin_memory_restart_response(&routes, method, &headers, raw_query.as_deref(), &body).await
+}
+
+async fn admin_shield_documents(
+    method: Method,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Extension(routes): Extension<StaticWebRoutes>,
+    body: Bytes,
+) -> Response {
+    admin_shield_documents_response(&routes, method, &headers, raw_query.as_deref(), &body).await
+}
+
+async fn admin_shield_embeddings_rebuild(
+    method: Method,
+    headers: HeaderMap,
+    Extension(routes): Extension<StaticWebRoutes>,
+) -> Response {
+    admin_shield_embeddings_rebuild_response(&routes, method, &headers).await
+}
+
+async fn admin_shield_test(
+    method: Method,
+    headers: HeaderMap,
+    Extension(routes): Extension<StaticWebRoutes>,
+    body: Bytes,
+) -> Response {
+    admin_shield_test_response(&routes, method, &headers, &body).await
+}
+
+async fn admin_taskman_jobs(
+    method: Method,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Extension(routes): Extension<StaticWebRoutes>,
+) -> Response {
+    admin_taskman_jobs_response(&routes, method, &headers, raw_query.as_deref())
+}
+
+async fn admin_taskman_jobs_clear(
+    method: Method,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Extension(routes): Extension<StaticWebRoutes>,
+) -> Response {
+    admin_taskman_jobs_clear_response(&routes, method, &headers, raw_query.as_deref())
+}
+
+async fn admin_taskman_job(
+    method: Method,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Extension(routes): Extension<StaticWebRoutes>,
+) -> Response {
+    admin_taskman_job_response(&routes, method, &headers, raw_query.as_deref())
+}
+
+async fn admin_taskman_job_cancel(
+    method: Method,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Extension(routes): Extension<StaticWebRoutes>,
+) -> Response {
+    admin_taskman_job_cancel_response(&routes, method, &headers, raw_query.as_deref())
+}
+
+async fn admin_taskman_job_restart(
+    method: Method,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Extension(routes): Extension<StaticWebRoutes>,
+) -> Response {
+    admin_taskman_job_restart_response(&routes, method, &headers, raw_query.as_deref())
+}
+
+async fn admin_redis_list(
+    method: Method,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Extension(routes): Extension<StaticWebRoutes>,
+) -> Response {
+    if method != Method::GET {
+        return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+    }
+    if let Err(error) = require_admin_request(&headers, &routes.admin_ids) {
+        return admin_auth_failure_response(error);
+    }
+    let pattern = admin_auth_query_values(raw_query.as_deref())
+        .remove("pattern")
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "*".to_owned());
+    let Some(redis) = routes.redis_inspector() else {
+        return admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed");
+    };
+    match redis.scan_all_keys(&pattern).await {
+        Ok(keys) => admin_json_response(StatusCode::OK, serde_json::json!({ "keys": keys })),
+        Err(error) => {
+            tracing::warn!(%error, pattern, "failed to list admin redis keys");
+            admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed")
+        }
+    }
+}
+
+async fn admin_redis_get(
+    method: Method,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Extension(routes): Extension<StaticWebRoutes>,
+) -> Response {
+    if method != Method::GET {
+        return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+    }
+    if let Err(error) = require_admin_request(&headers, &routes.admin_ids) {
+        return admin_auth_failure_response(error);
+    }
+    let values = admin_auth_query_values(raw_query.as_deref());
+    let Some(key) = values.get("key").filter(|value| !value.is_empty()) else {
+        return admin_error_response(StatusCode::BAD_REQUEST, "key required");
+    };
+    let Some(redis) = routes.redis_inspector() else {
+        return admin_error_response(StatusCode::NOT_FOUND, "not found");
+    };
+    match redis.raw_value(key).await {
+        Ok(Some(value)) => admin_json_response(
+            StatusCode::OK,
+            serde_json::json!({ "key": key, "value": value }),
+        ),
+        Ok(None) => admin_error_response(StatusCode::NOT_FOUND, "not found"),
+        Err(error) => {
+            tracing::warn!(%error, key, "failed to get admin redis value");
+            admin_error_response(StatusCode::NOT_FOUND, "not found")
+        }
+    }
+}
+
+async fn admin_redis_delete_prefix(
+    method: Method,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Extension(routes): Extension<StaticWebRoutes>,
+) -> Response {
+    if method != Method::DELETE {
+        return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+    }
+    if let Err(error) = require_admin_request(&headers, &routes.admin_ids) {
+        return admin_auth_failure_response(error);
+    }
+    let values = admin_auth_query_values(raw_query.as_deref());
+    let Some(prefix) = values.get("prefix").filter(|value| !value.is_empty()) else {
+        return admin_error_response(StatusCode::BAD_REQUEST, "prefix required");
+    };
+    let Some(redis) = routes.redis_inspector() else {
+        return admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed");
+    };
+    match redis.delete_by_prefix(prefix).await {
+        Ok(()) => admin_json_response(StatusCode::OK, serde_json::json!({ "ok": true })),
+        Err(error) => {
+            tracing::warn!(%error, prefix, "failed to delete admin redis prefix");
+            admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed")
+        }
+    }
+}
+
+async fn admin_redis_prefixes(
+    method: Method,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Extension(routes): Extension<StaticWebRoutes>,
+) -> Response {
+    if method != Method::GET {
+        return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+    }
+    if let Err(error) = require_admin_request(&headers, &routes.admin_ids) {
+        return admin_auth_failure_response(error);
+    }
+    let prefix = admin_auth_query_values(raw_query.as_deref())
+        .remove("prefix")
+        .unwrap_or_default();
+    let Some(redis) = routes.redis_inspector() else {
+        return admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed");
+    };
+    match redis.scan_all_keys(&format!("{prefix}*")).await {
+        Ok(keys) => admin_json_response(
+            StatusCode::OK,
+            serde_json::json!({ "groups": admin_redis_prefix_groups_from_keys(&prefix, keys) }),
+        ),
+        Err(error) => {
+            tracing::warn!(%error, prefix, "failed to list admin redis prefixes");
+            admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed")
+        }
+    }
+}
+
+async fn admin_redis_delete_key(
+    method: Method,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Extension(routes): Extension<StaticWebRoutes>,
+) -> Response {
+    if method != Method::DELETE {
+        return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+    }
+    if let Err(error) = require_admin_request(&headers, &routes.admin_ids) {
+        return admin_auth_failure_response(error);
+    }
+    let values = admin_auth_query_values(raw_query.as_deref());
+    let Some(key) = values.get("key").filter(|value| !value.is_empty()) else {
+        return admin_error_response(StatusCode::BAD_REQUEST, "key required");
+    };
+    let Some(redis) = routes.redis_inspector() else {
+        return admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed");
+    };
+    match redis.delete_key(key).await {
+        Ok(()) => admin_json_response(StatusCode::OK, serde_json::json!({ "ok": true })),
+        Err(error) => {
+            tracing::warn!(%error, key, "failed to delete admin redis key");
+            admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed")
+        }
+    }
+}
+
+async fn admin_redis_flushdb(
+    method: Method,
+    headers: HeaderMap,
+    Extension(routes): Extension<StaticWebRoutes>,
+) -> Response {
+    if method != Method::POST {
+        return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+    }
+    if let Err(error) = require_admin_request(&headers, &routes.admin_ids) {
+        return admin_auth_failure_response(error);
+    }
+    let Some(redis) = routes.redis_inspector() else {
+        return admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed");
+    };
+    match redis.flushdb().await {
+        Ok(()) => admin_json_response(StatusCode::OK, serde_json::json!({ "ok": true })),
+        Err(error) => {
+            tracing::warn!(%error, "failed to flush admin redis db");
+            admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed")
+        }
+    }
+}
+
+async fn admin_chat_get(
+    method: Method,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Extension(routes): Extension<StaticWebRoutes>,
+) -> Response {
+    admin_chat_get_response(&routes, method, &headers, raw_query.as_deref()).await
+}
+
+async fn admin_chat_settings(
+    method: Method,
+    headers: HeaderMap,
+    Extension(routes): Extension<StaticWebRoutes>,
+    body: Bytes,
+) -> Response {
+    admin_chat_settings_response(&routes, method, &headers, &body).await
+}
+
+async fn admin_chat_block(
+    method: Method,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Extension(routes): Extension<StaticWebRoutes>,
+) -> Response {
+    admin_chat_block_response(&routes, method, &headers, raw_query.as_deref()).await
+}
+
+async fn admin_chat_unblock(
+    method: Method,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Extension(routes): Extension<StaticWebRoutes>,
+) -> Response {
+    admin_chat_unblock_response(&routes, method, &headers, raw_query.as_deref()).await
+}
+
+async fn admin_chat_members(
+    method: Method,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Extension(routes): Extension<StaticWebRoutes>,
+) -> Response {
+    admin_chat_members_response(&routes, method, &headers, raw_query.as_deref()).await
+}
+
+async fn admin_chats_list(
+    method: Method,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Extension(routes): Extension<StaticWebRoutes>,
+) -> Response {
+    admin_chats_list_response(&routes, method, &headers, raw_query.as_deref()).await
+}
+
+async fn admin_chats_search_by_member(
+    method: Method,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Extension(routes): Extension<StaticWebRoutes>,
+) -> Response {
+    admin_chats_search_by_member_response(&routes, method, &headers, raw_query.as_deref()).await
+}
+
+async fn admin_users_list(
+    method: Method,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Extension(routes): Extension<StaticWebRoutes>,
+) -> Response {
+    admin_users_list_response(&routes, method, &headers, raw_query.as_deref()).await
+}
+
+async fn admin_user_get(
+    method: Method,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Extension(routes): Extension<StaticWebRoutes>,
+) -> Response {
+    admin_user_get_response(&routes, method, &headers, raw_query.as_deref()).await
+}
+
+async fn admin_user_grant_vip(
+    method: Method,
+    headers: HeaderMap,
+    Extension(routes): Extension<StaticWebRoutes>,
+    body: Bytes,
+) -> Response {
+    admin_user_grant_vip_response(&routes, method, &headers, &body).await
+}
+
+async fn admin_user_revoke_vip(
+    method: Method,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Extension(routes): Extension<StaticWebRoutes>,
+) -> Response {
+    admin_user_revoke_vip_response(&routes, method, &headers, raw_query.as_deref()).await
+}
+
+async fn admin_user_delete(
+    method: Method,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Extension(routes): Extension<StaticWebRoutes>,
+) -> Response {
+    admin_user_delete_response(&routes, method, &headers, raw_query.as_deref()).await
+}
+
+async fn admin_index(
+    Extension(routes): Extension<StaticWebRoutes>,
+    headers: HeaderMap,
+) -> Response {
+    admin_web_asset_response(&routes, &headers, "")
+}
+
+async fn admin_asset(
+    Path(path): Path<String>,
+    Extension(routes): Extension<StaticWebRoutes>,
+    headers: HeaderMap,
+) -> Response {
+    admin_web_asset_response(&routes, &headers, &path)
+}
+
+fn admin_web_asset_response(routes: &StaticWebRoutes, headers: &HeaderMap, path: &str) -> Response {
+    if admin_static_asset_requires_auth(path)
+        && !admin_session_is_authorized(headers, &routes.admin_ids)
+    {
+        return found("/admin/login.html");
+    }
+    static_web_asset_response(openplotva_web::StaticAssetGroup::Admin, path)
+}
+
+fn static_web_asset_response(group: openplotva_web::StaticAssetGroup, path: &str) -> Response {
+    let Some(asset) = openplotva_web::static_asset(group, path) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, asset.content_type),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        asset.bytes,
+    )
+        .into_response()
+}
+
+fn moved_permanently(location: &'static str) -> Response {
+    (
+        StatusCode::MOVED_PERMANENTLY,
+        [(header::LOCATION, location)],
+    )
+        .into_response()
+}
+
+fn found(location: &'static str) -> Response {
+    (StatusCode::FOUND, [(header::LOCATION, location)]).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct SettingsUpdateRequest {
+    chat_id: i64,
+    #[serde(default)]
+    user_id: i64,
+    mood_alignment: Option<String>,
+    custom_persona: Option<String>,
+    reactivity_percentage: Option<i32>,
+    proactivity_percentage: Option<i32>,
+    enable_obscenifier: Option<bool>,
+    enable_profanity: Option<bool>,
+    enable_greet_joiners: Option<bool>,
+    enable_global_text_reply: Option<bool>,
+    enable_global_draw_reply: Option<bool>,
+    signature: String,
+    enable_daily_game: Option<bool>,
+    daily_game_theme: Option<String>,
+    greeting_html: Option<String>,
+    disable_random_reactivity: Option<bool>,
+    hide_original_draw_prompt: Option<bool>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct SettingsDeputySummary {
+    id: i64,
+    first_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    username: Option<String>,
+    status: String,
+    display_name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct SettingsResponseBody {
+    chat_id: i64,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    chat_title: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    chat_type: String,
+    mood_alignment: Option<String>,
+    custom_persona: Option<String>,
+    reactivity_percentage: i32,
+    proactivity_percentage: i32,
+    enable_obscenifier: bool,
+    enable_profanity: bool,
+    enable_greet_joiners: bool,
+    enable_global_text_reply: bool,
+    enable_global_draw_reply: bool,
+    enable_daily_game: bool,
+    daily_game_theme: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    greeting_html: Option<String>,
+    is_vip: bool,
+    disable_random_reactivity: bool,
+    hide_original_draw_prompt: bool,
+    is_deputy: bool,
+    can_manage_deputies: bool,
+    deputies: Vec<SettingsDeputySummary>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SettingsAccess {
+    chat_id: i64,
+    user_id: i64,
+    is_global_admin: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SettingsAccessError {
+    InvalidChatId,
+    MissingSignature,
+    InvalidSignature,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeputyUpdateRequest {
+    chat_id: i64,
+    user_id: i64,
+    signature: String,
+    #[serde(default)]
+    deputy_ids: Vec<i64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct DeputyCandidatesResponse {
+    items: Vec<SettingsDeputySummary>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct DeputyUpdateResponse {
+    ok: bool,
+    deputies: Vec<SettingsDeputySummary>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DeputyOwnerAccess {
+    chat_id: i64,
+    user_id: i64,
+    is_global_admin: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct ChatListItem {
+    id: i64,
+    title: String,
+    #[serde(rename = "type")]
+    chat_type: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct SettingsMemoryResponse {
+    chat_id: i64,
+    user_id: i64,
+    count: usize,
+    cards: Vec<openplotva_memory::Card>,
+}
+
+async fn settings_get_response(routes: &StaticWebRoutes, raw_query: Option<&str>) -> Response {
+    let Some(settings_store) = &routes.settings_store else {
+        return settings_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "settings store not configured",
+        );
+    };
+    let Some(member_store) = &routes.member_store else {
+        return settings_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "settings store not configured",
+        );
+    };
+
+    let values = admin_auth_query_values(raw_query);
+    let access = match parse_settings_get_access(&values, &routes.admin_ids) {
+        Ok(access) => access,
+        Err(error) => return settings_access_error_response(error),
+    };
+
+    if let Err(error) = ensure_settings_chat_available(routes, access.chat_id, access.user_id).await
+    {
+        return error;
+    }
+    if let Err(error) = authorize_settings_user(routes, access).await {
+        return error;
+    }
+
+    let mut settings = match settings_store.get_chat_settings(access.chat_id).await {
+        Ok(Some(settings)) => settings,
+        Ok(None) | Err(_) => openplotva_core::ChatSettings::defaults(access.chat_id),
+    };
+    settings.custom_persona =
+        openplotva_web::truncate_custom_persona(settings.custom_persona.take());
+
+    let (chat_title, chat_type) =
+        settings_chat_display_for_read(routes, access.chat_id, access.user_id).await;
+    let mut response = new_settings_response(&settings, chat_title, chat_type.clone());
+    apply_private_chat_response_defaults(&mut response, access.chat_id, access.user_id);
+    apply_user_settings_response(routes, &mut response, access.user_id).await;
+    apply_deputy_settings_response(
+        member_store,
+        &mut response,
+        access.chat_id,
+        access.user_id,
+        &chat_type,
+        access.is_global_admin,
+    )
+    .await;
+    settings_json_response(StatusCode::OK, &response)
+}
+
+async fn settings_update_response(routes: &StaticWebRoutes, body: &[u8]) -> Response {
+    let Some(settings_store) = &routes.settings_store else {
+        return settings_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "settings store not configured",
+        );
+    };
+    let req = match parse_settings_update_request(body) {
+        Ok(req) => req,
+        Err(response) => return *response,
+    };
+    if let Err(error) = ensure_settings_chat_available(routes, req.chat_id, req.user_id).await {
+        return error;
+    }
+    let chat = match settings_update_chat(routes, req.chat_id, req.user_id).await {
+        Ok(chat) => chat,
+        Err(response) => return response,
+    };
+    let access = SettingsAccess {
+        chat_id: req.chat_id,
+        user_id: req.user_id,
+        is_global_admin: routes.admin_ids.contains(&req.user_id),
+    };
+    if let Err(error) = authorize_settings_user(routes, access).await {
+        return error;
+    }
+
+    let update = settings_update_from_request(settings_store, &req, &chat).await;
+    if let Err(error) = settings_store.upsert_chat_settings(&update).await {
+        tracing::error!(%error, chat_id = req.chat_id, "failed to update chat settings");
+        return settings_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to update settings",
+        );
+    }
+    update_user_settings_from_request(routes, &req).await;
+    settings_json_response(StatusCode::OK, &serde_json::json!({ "status": "success" }))
+}
+
+async fn settings_chats_response(routes: &StaticWebRoutes, raw_query: Option<&str>) -> Response {
+    let values = admin_auth_query_values(raw_query);
+    let Some(user_id_raw) = values.get("user_id") else {
+        return settings_json_raw_response(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":"missing user_id"}"#,
+        );
+    };
+    let Ok(user_id) = user_id_raw.parse::<i64>() else {
+        return settings_json_raw_response(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":"invalid user_id"}"#,
+        );
+    };
+    let Some(signature) = values.get("signature").filter(|value| !value.is_empty()) else {
+        return settings_json_raw_response(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":"missing signature"}"#,
+        );
+    };
+    if !openplotva_web::validate_settings_access_signature(user_id, 0, signature) {
+        return settings_json_raw_response(
+            StatusCode::FORBIDDEN,
+            r#"{"error":"invalid signature"}"#,
+        );
+    }
+    let Some(settings_store) = &routes.settings_store else {
+        return settings_json_response(StatusCode::OK, &Vec::<ChatListItem>::new());
+    };
+    let Some(member_store) = &routes.member_store else {
+        return settings_json_response(StatusCode::OK, &Vec::<ChatListItem>::new());
+    };
+    let chats = managed_chat_list_items(routes, settings_store, member_store, user_id).await;
+    settings_json_response(StatusCode::OK, &chats)
+}
+
+async fn settings_deputy_candidates_response(
+    routes: &StaticWebRoutes,
+    raw_query: Option<&str>,
+) -> Response {
+    let access = match parse_deputy_owner_access(routes, raw_query).await {
+        Ok(access) => access,
+        Err(response) => return response,
+    };
+    if !access.is_global_admin
+        && let Err(response) =
+            ensure_deputy_management_permission(routes, access.chat_id, access.user_id).await
+    {
+        return response;
+    }
+    let query_values = admin_auth_query_values(raw_query);
+    let query = query_values
+        .get("query")
+        .or_else(|| query_values.get("q"))
+        .map(|value| value.trim())
+        .unwrap_or("");
+    let limit = parse_deputy_candidates_limit(query_values.get("limit").map(String::as_str));
+    let Some(member_store) = &routes.member_store else {
+        return settings_side_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "settings store not configured",
+            "GET, PUT, OPTIONS",
+        );
+    };
+    let rows = match member_store
+        .search_chat_member_candidates(access.chat_id, query, limit as i32)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(%error, chat_id = access.chat_id, user_id = access.user_id, "failed to search deputy candidates");
+            return settings_side_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to search deputy candidates",
+                "GET, PUT, OPTIONS",
+            );
+        }
+    };
+    let items = rows
+        .into_iter()
+        .filter(|row| row.id != 0 && row.id != access.user_id)
+        .map(|row| SettingsDeputySummary {
+            id: row.id,
+            display_name: build_deputy_display_name(
+                row.id,
+                &row.first_name,
+                row.last_name.as_deref(),
+                row.username.as_deref(),
+            ),
+            first_name: row.first_name,
+            last_name: row.last_name,
+            username: row.username,
+            status: row.status,
+        })
+        .collect::<Vec<_>>();
+    settings_side_json_response(
+        StatusCode::OK,
+        &DeputyCandidatesResponse { items },
+        "GET, PUT, OPTIONS",
+    )
+}
+
+async fn settings_deputies_update_response(routes: &StaticWebRoutes, body: &[u8]) -> Response {
+    let req = match parse_deputy_update_request(body) {
+        Ok(req) => req,
+        Err(response) => return *response,
+    };
+    if let Err(error) = ensure_settings_chat_available(routes, req.chat_id, req.user_id).await {
+        return error;
+    }
+    if !routes.admin_ids.contains(&req.user_id)
+        && let Err(response) =
+            ensure_deputy_management_permission(routes, req.chat_id, req.user_id).await
+    {
+        return response;
+    }
+    let deputy_ids = normalize_deputy_ids(&req.deputy_ids, req.user_id);
+    if let Err(message) = validate_deputy_ids(routes, req.chat_id, &deputy_ids).await {
+        return settings_side_json_raw_response(
+            StatusCode::BAD_REQUEST,
+            &serde_json::json!({ "error": message }).to_string(),
+            "GET, PUT, OPTIONS",
+        );
+    }
+    let Some(member_store) = &routes.member_store else {
+        return settings_side_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "settings store not configured",
+            "GET, PUT, OPTIONS",
+        );
+    };
+    if let Err(error) = member_store
+        .replace_chat_deputies(req.chat_id, &deputy_ids)
+        .await
+    {
+        tracing::warn!(%error, chat_id = req.chat_id, user_id = req.user_id, "failed to replace chat deputies");
+        return settings_side_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to update deputies",
+            "GET, PUT, OPTIONS",
+        );
+    }
+    let deputies = list_deputy_summaries(routes, req.chat_id)
+        .await
+        .unwrap_or_default();
+    settings_side_json_response(
+        StatusCode::OK,
+        &DeputyUpdateResponse { ok: true, deputies },
+        "GET, PUT, OPTIONS",
+    )
+}
+
+async fn settings_memory_get_response(
+    routes: &StaticWebRoutes,
+    raw_query: Option<&str>,
+) -> Response {
+    let (chat_id, user_id, scope) = match parse_settings_memory_access(routes, raw_query).await {
+        Ok(access) => access,
+        Err(response) => return response,
+    };
+    let limit = parse_memory_limit(
+        admin_auth_query_values(raw_query)
+            .get("limit")
+            .map(String::as_str),
+    );
+    let cards = match &routes.memory_store {
+        Some(store) => match store.list_visible_cards(&scope, limit as i32).await {
+            Ok(cards) => cards,
+            Err(error) => {
+                tracing::error!(%error, chat_id, user_id, "failed to list settings memory");
+                return settings_side_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed to list memory",
+                    "GET, DELETE, OPTIONS",
+                );
+            }
+        },
+        None => Vec::new(),
+    };
+    settings_side_json_response(
+        StatusCode::OK,
+        &SettingsMemoryResponse {
+            chat_id,
+            user_id,
+            count: cards.len(),
+            cards,
+        },
+        "GET, DELETE, OPTIONS",
+    )
+}
+
+async fn settings_memory_delete_response(
+    routes: &StaticWebRoutes,
+    raw_query: Option<&str>,
+) -> Response {
+    let (_, user_id, scope) = match parse_settings_memory_access(routes, raw_query).await {
+        Ok(access) => access,
+        Err(response) => return response,
+    };
+    let id = admin_auth_query_values(raw_query)
+        .get("id")
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|id| *id != 0);
+    let Some(id) = id else {
+        return settings_side_error_response(
+            StatusCode::BAD_REQUEST,
+            "id required",
+            "GET, DELETE, OPTIONS",
+        );
+    };
+    let deleted = match &routes.memory_store {
+        Some(store) => match store.soft_delete_visible_card(id, user_id, &scope).await {
+            Ok(deleted) => deleted,
+            Err(error) => {
+                tracing::error!(%error, id, user_id, "failed to soft-delete settings memory card");
+                return settings_side_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed to delete memory",
+                    "GET, DELETE, OPTIONS",
+                );
+            }
+        },
+        None => {
+            return settings_side_json_response(
+                StatusCode::OK,
+                &serde_json::json!({ "ok": true }),
+                "GET, DELETE, OPTIONS",
+            );
+        }
+    };
+    if !deleted {
+        return settings_side_error_response(
+            StatusCode::NOT_FOUND,
+            "memory card not found",
+            "GET, DELETE, OPTIONS",
+        );
+    }
+    settings_side_json_response(
+        StatusCode::OK,
+        &serde_json::json!({ "ok": true }),
+        "GET, DELETE, OPTIONS",
+    )
+}
+
+fn parse_settings_get_access(
+    values: &BTreeMap<String, String>,
+    admin_ids: &[i64],
+) -> Result<SettingsAccess, SettingsAccessError> {
+    let chat_id = values
+        .get("chat_id")
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|chat_id| *chat_id != 0)
+        .ok_or(SettingsAccessError::InvalidChatId)?;
+    let signature = values
+        .get("signature")
+        .filter(|value| !value.is_empty())
+        .ok_or(SettingsAccessError::MissingSignature)?;
+    let user_id = values
+        .get("user_id")
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(0);
+    if !openplotva_web::validate_settings_access_signature(chat_id, user_id, signature) {
+        return Err(SettingsAccessError::InvalidSignature);
+    }
+    Ok(SettingsAccess {
+        chat_id,
+        user_id,
+        is_global_admin: admin_ids.contains(&user_id),
+    })
+}
+
+fn settings_access_error_response(error: SettingsAccessError) -> Response {
+    match error {
+        SettingsAccessError::InvalidChatId => {
+            settings_error_response(StatusCode::BAD_REQUEST, "Invalid chat_id")
+        }
+        SettingsAccessError::MissingSignature => {
+            settings_error_response(StatusCode::BAD_REQUEST, "Missing signature")
+        }
+        SettingsAccessError::InvalidSignature => {
+            settings_error_response(StatusCode::FORBIDDEN, "Invalid signature")
+        }
+    }
+}
+
+fn parse_deputy_update_request(body: &[u8]) -> Result<DeputyUpdateRequest, Box<Response>> {
+    let req = serde_json::from_slice::<DeputyUpdateRequest>(body).map_err(|_| {
+        Box::new(settings_side_error_response(
+            StatusCode::BAD_REQUEST,
+            "Invalid JSON in request body",
+            "GET, PUT, OPTIONS",
+        ))
+    })?;
+    if req.chat_id == 0 || req.user_id == 0 {
+        return Err(Box::new(settings_side_error_response(
+            StatusCode::BAD_REQUEST,
+            "chat_id and user_id are required",
+            "GET, PUT, OPTIONS",
+        )));
+    }
+    if req.signature.trim().is_empty() {
+        return Err(Box::new(settings_side_error_response(
+            StatusCode::BAD_REQUEST,
+            "Missing signature",
+            "GET, PUT, OPTIONS",
+        )));
+    }
+    if !openplotva_web::validate_settings_access_signature(req.chat_id, req.user_id, &req.signature)
+    {
+        return Err(Box::new(settings_side_error_response(
+            StatusCode::FORBIDDEN,
+            "Invalid signature",
+            "GET, PUT, OPTIONS",
+        )));
+    }
+    Ok(req)
+}
+
+async fn parse_deputy_owner_access(
+    routes: &StaticWebRoutes,
+    raw_query: Option<&str>,
+) -> Result<DeputyOwnerAccess, Response> {
+    let values = admin_auth_query_values(raw_query);
+    let chat_id = values
+        .get("chat_id")
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value != 0)
+        .ok_or_else(|| {
+            settings_side_error_response(
+                StatusCode::BAD_REQUEST,
+                "Invalid chat_id",
+                "GET, PUT, OPTIONS",
+            )
+        })?;
+    let user_id = values
+        .get("user_id")
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value != 0)
+        .ok_or_else(|| {
+            settings_side_error_response(
+                StatusCode::BAD_REQUEST,
+                "Invalid user_id",
+                "GET, PUT, OPTIONS",
+            )
+        })?;
+    let signature = values
+        .get("signature")
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            settings_side_error_response(
+                StatusCode::BAD_REQUEST,
+                "Missing signature",
+                "GET, PUT, OPTIONS",
+            )
+        })?;
+    if !openplotva_web::validate_settings_access_signature(chat_id, user_id, signature) {
+        return Err(settings_side_error_response(
+            StatusCode::FORBIDDEN,
+            "Invalid signature",
+            "GET, PUT, OPTIONS",
+        ));
+    }
+    if chat_id == user_id {
+        return Err(settings_side_error_response(
+            StatusCode::BAD_REQUEST,
+            "Deputies are available only for chats",
+            "GET, PUT, OPTIONS",
+        ));
+    }
+    ensure_settings_chat_available(routes, chat_id, user_id).await?;
+    let Some(settings_store) = &routes.settings_store else {
+        return Err(settings_side_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "settings store not configured",
+            "GET, PUT, OPTIONS",
+        ));
+    };
+    let chat = settings_store
+        .get_chat_state(chat_id)
+        .await
+        .map_err(|_| {
+            settings_side_error_response(
+                StatusCode::NOT_FOUND,
+                "Chat not found",
+                "GET, PUT, OPTIONS",
+            )
+        })?
+        .ok_or_else(|| {
+            settings_side_error_response(
+                StatusCode::NOT_FOUND,
+                "Chat not found",
+                "GET, PUT, OPTIONS",
+            )
+        })?;
+    if !chat_allows_deputies(&chat) {
+        return Err(settings_side_error_response(
+            StatusCode::BAD_REQUEST,
+            "Deputies are available only for chats",
+            "GET, PUT, OPTIONS",
+        ));
+    }
+    Ok(DeputyOwnerAccess {
+        chat_id,
+        user_id,
+        is_global_admin: routes.admin_ids.contains(&user_id),
+    })
+}
+
+async fn ensure_deputy_management_permission(
+    routes: &StaticWebRoutes,
+    chat_id: i64,
+    user_id: i64,
+) -> Result<(), Response> {
+    let Some(member_store) = &routes.member_store else {
+        return Err(settings_side_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "settings store not configured",
+            "GET, PUT, OPTIONS",
+        ));
+    };
+    match member_store.get_chat_member(chat_id, user_id).await {
+        Ok(Some(member)) if member.status == openplotva_storage::CHAT_MEMBER_STATUS_CREATOR => {
+            return Ok(());
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(%error, chat_id, user_id, "deputy permission check failed");
+            return Err(settings_side_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Permission check failed",
+                "GET, PUT, OPTIONS",
+            ));
+        }
+    }
+    if routes.telegram.is_some()
+        && let Ok(Some(member)) = refresh_chat_member_for_web(routes, chat_id, user_id).await
+        && member.status == openplotva_storage::CHAT_MEMBER_STATUS_CREATOR
+    {
+        return Ok(());
+    }
+    Err(settings_side_error_response(
+        StatusCode::FORBIDDEN,
+        "Unauthorized access",
+        "GET, PUT, OPTIONS",
+    ))
+}
+
+fn normalize_deputy_ids(values: &[i64], current_user_id: i64) -> Vec<i64> {
+    let mut seen = HashSet::with_capacity(values.len());
+    let mut result = Vec::with_capacity(values.len());
+    for value in values {
+        if *value <= 0 || *value == current_user_id || !seen.insert(*value) {
+            continue;
+        }
+        result.push(*value);
+    }
+    result.sort_unstable();
+    result
+}
+
+async fn validate_deputy_ids(
+    routes: &StaticWebRoutes,
+    chat_id: i64,
+    deputy_ids: &[i64],
+) -> Result<(), String> {
+    if deputy_ids.is_empty() {
+        return Ok(());
+    }
+    let Some(member_store) = &routes.member_store else {
+        return Err(format!("invalid deputy {}", deputy_ids[0]));
+    };
+    let members = member_store
+        .list_chat_members_by_user_ids(chat_id, deputy_ids)
+        .await
+        .map_err(|_| format!("invalid deputy {}", deputy_ids[0]))?;
+    let mut by_id = members
+        .into_iter()
+        .map(|member| (member.user_id, member))
+        .collect::<HashMap<_, _>>();
+    for deputy_id in deputy_ids {
+        if routes.telegram.is_some()
+            && !by_id.get(deputy_id).is_some_and(|member| {
+                openplotva_storage::is_active_chat_member_status(&member.status)
+            })
+            && let Ok(Some(member)) = refresh_chat_member_for_web(routes, chat_id, *deputy_id).await
+        {
+            by_id.insert(*deputy_id, member);
+        }
+        let Some(member) = by_id.get(deputy_id) else {
+            return Err(format!("invalid deputy {deputy_id}"));
+        };
+        if !openplotva_storage::is_active_chat_member_status(&member.status) {
+            return Err(format!("invalid deputy {deputy_id}"));
+        }
+    }
+    Ok(())
+}
+
+async fn list_deputy_summaries(
+    routes: &StaticWebRoutes,
+    chat_id: i64,
+) -> Result<Vec<SettingsDeputySummary>, String> {
+    let member_store = routes
+        .member_store
+        .as_ref()
+        .ok_or_else(|| "settings store not configured".to_owned())?;
+    list_deputy_summaries_from_store(member_store, chat_id).await
+}
+
+async fn list_deputy_summaries_from_store(
+    member_store: &PostgresChatMemberStore,
+    chat_id: i64,
+) -> Result<Vec<SettingsDeputySummary>, String> {
+    let deputy_ids = member_store
+        .list_chat_deputy_ids(chat_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    if deputy_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let members = member_store
+        .list_chat_members_by_user_ids(chat_id, &deputy_ids)
+        .await
+        .map_err(|error| error.to_string())?;
+    let users = member_store
+        .list_user_states_by_ids(&deputy_ids)
+        .await
+        .map_err(|error| error.to_string())?;
+    let members_by_id = members
+        .into_iter()
+        .map(|member| (member.user_id, member))
+        .collect::<HashMap<_, _>>();
+    let users_by_id = users
+        .into_iter()
+        .map(|user| (user.id, user))
+        .collect::<HashMap<_, _>>();
+    let mut deputies = Vec::with_capacity(deputy_ids.len());
+    for deputy_id in deputy_ids {
+        let Some(member) = members_by_id.get(&deputy_id) else {
+            continue;
+        };
+        if !openplotva_storage::is_active_chat_member_status(&member.status) {
+            continue;
+        }
+        let Some(user) = users_by_id.get(&deputy_id) else {
+            continue;
+        };
+        deputies.push(SettingsDeputySummary {
+            id: user.id,
+            first_name: user.first_name.clone(),
+            last_name: user.last_name.clone(),
+            username: user.username.clone(),
+            status: member.status.clone(),
+            display_name: build_deputy_display_name(
+                user.id,
+                &user.first_name,
+                user.last_name.as_deref(),
+                user.username.as_deref(),
+            ),
+        });
+    }
+    deputies.sort_by(|left, right| {
+        left.display_name
+            .cmp(&right.display_name)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    Ok(deputies)
+}
+
+fn build_deputy_display_name(
+    user_id: i64,
+    first_name: &str,
+    last_name: Option<&str>,
+    username: Option<&str>,
+) -> String {
+    let mut name = first_name.trim().to_owned();
+    if let Some(last_name) = last_name.map(str::trim).filter(|value| !value.is_empty()) {
+        if !name.is_empty() {
+            name.push(' ');
+        }
+        name.push_str(last_name);
+    }
+    if !name.is_empty() {
+        return name;
+    }
+    if let Some(username) = username.map(str::trim).filter(|value| !value.is_empty()) {
+        return format!("@{username}");
+    }
+    format!("User {user_id}")
+}
+
+fn parse_deputy_candidates_limit(value: Option<&str>) -> usize {
+    match value.and_then(|value| value.trim().parse::<usize>().ok()) {
+        Some(limit) if limit > 100 => 100,
+        Some(limit) if limit > 0 => limit,
+        _ => 50,
+    }
+}
+
+fn chat_allows_deputies(chat: &openplotva_core::ChatState) -> bool {
+    !chat.chat_type.trim().is_empty() && chat.chat_type != "private"
+}
+
+fn parse_settings_update_request(body: &[u8]) -> Result<SettingsUpdateRequest, Box<Response>> {
+    let mut req = serde_json::from_slice::<SettingsUpdateRequest>(body).map_err(|error| {
+        tracing::error!(%error, "invalid JSON in settings update request");
+        Box::new(settings_error_response(
+            StatusCode::BAD_REQUEST,
+            "Invalid JSON in request body",
+        ))
+    })?;
+    if req.chat_id == 0 {
+        return Err(Box::new(settings_error_response(
+            StatusCode::BAD_REQUEST,
+            "Chat ID is required",
+        )));
+    }
+    if req.signature.is_empty() {
+        return Err(Box::new(settings_error_response(
+            StatusCode::BAD_REQUEST,
+            "Missing signature",
+        )));
+    }
+    if !openplotva_web::validate_settings_access_signature(req.chat_id, req.user_id, &req.signature)
+    {
+        return Err(Box::new(settings_error_response(
+            StatusCode::FORBIDDEN,
+            "Invalid signature",
+        )));
+    }
+    req.custom_persona = openplotva_web::truncate_custom_persona(req.custom_persona);
+    Ok(req)
+}
+
+async fn ensure_settings_chat_available(
+    routes: &StaticWebRoutes,
+    chat_id: i64,
+    user_id: i64,
+) -> Result<(), Response> {
+    if chat_id == user_id {
+        return Ok(());
+    }
+    let Some(settings_store) = &routes.settings_store else {
+        return Err(settings_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "settings store not configured",
+        ));
+    };
+    match settings_store.get_chat_state(chat_id).await {
+        Ok(Some(_)) => ensure_settings_bot_membership(routes, chat_id).await,
+        Ok(None) => {
+            refresh_settings_chat_from_telegram(routes, chat_id).await?;
+            ensure_settings_bot_membership(routes, chat_id).await
+        }
+        Err(error) => {
+            tracing::warn!(%error, chat_id, "failed to validate chat availability");
+            Err(settings_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to validate chat availability",
+            ))
+        }
+    }
+}
+
+async fn refresh_settings_chat_from_telegram(
+    routes: &StaticWebRoutes,
+    chat_id: i64,
+) -> Result<(), Response> {
+    let Some(telegram) = &routes.telegram else {
+        return Err(settings_error_response(
+            StatusCode::NOT_FOUND,
+            "Chat not found",
+        ));
+    };
+    let Some(state_store) = &routes.state_store else {
+        return Err(settings_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to validate chat availability",
+        ));
+    };
+    let chat = telegram
+        .execute(openplotva_telegram::build_get_chat_method(chat_id))
+        .await
+        .map_err(|error| {
+            tracing::debug!(%error, chat_id, "Telegram getChat failed for settings availability");
+            settings_error_response(StatusCode::NOT_FOUND, "Chat not found")
+        })?;
+    let chat_state = settings_chat_state_from_full_info(chat);
+    state_store
+        .upsert_chat_state(&chat_state)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, chat_id, "failed to persist Telegram chat freshness for settings availability");
+            settings_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to validate chat availability",
+            )
+        })
+}
+
+async fn ensure_settings_bot_membership(
+    routes: &StaticWebRoutes,
+    chat_id: i64,
+) -> Result<(), Response> {
+    let (Some(telegram), Some(bot_id)) = (&routes.telegram, routes.bot_id) else {
+        return Ok(());
+    };
+    let Some(member_store) = &routes.member_store else {
+        return Err(settings_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to validate chat availability",
+        ));
+    };
+    match member_store.get_chat_member(chat_id, bot_id).await {
+        Ok(Some(member)) if openplotva_storage::is_active_chat_member_status(&member.status) => {
+            return Ok(());
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::debug!(%error, chat_id, bot_id, "failed to load cached bot membership for settings availability");
+        }
+    }
+    let member = settings::GroupSettingsMemberApi::get_chat_member(telegram, chat_id, bot_id)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, chat_id, bot_id, "Telegram bot membership check failed for settings availability");
+            settings_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to validate chat availability",
+            )
+        })?;
+    let upsert = settings::chat_member_upsert_from_telegram(chat_id, bot_id, &member);
+    if let Err(error) = member_store.upsert_chat_member(&upsert).await {
+        tracing::debug!(%error, chat_id, bot_id, "failed to persist Telegram bot membership freshness for settings availability");
+    }
+    let user_state = settings::user_state_from_telegram_user(member.get_user());
+    if let Err(error) = member_store.upsert_user_state(&user_state).await {
+        tracing::debug!(%error, chat_id, bot_id, "failed to persist Telegram bot user freshness for settings availability");
+    }
+    if openplotva_storage::is_active_chat_member_status(&upsert.status) {
+        Ok(())
+    } else {
+        Err(settings_error_response(
+            StatusCode::NOT_FOUND,
+            "Chat not found",
+        ))
+    }
+}
+
+fn settings_chat_state_from_full_info(
+    chat: openplotva_telegram::ChatFullInfo,
+) -> openplotva_core::ChatState {
+    openplotva_core::ChatState::new(
+        chat.id,
+        settings_chat_full_info_type_name(chat.chat_type),
+        chat.title,
+        chat.username,
+        chat.first_name,
+        chat.last_name,
+        chat.is_forum,
+    )
+}
+
+fn settings_chat_full_info_type_name(chat_type: carapax::types::ChatFullInfoType) -> &'static str {
+    match chat_type {
+        carapax::types::ChatFullInfoType::Channel => "channel",
+        carapax::types::ChatFullInfoType::Group => "group",
+        carapax::types::ChatFullInfoType::Private => "private",
+        carapax::types::ChatFullInfoType::Supergroup => "supergroup",
+    }
+}
+
+async fn authorize_settings_user(
+    routes: &StaticWebRoutes,
+    access: SettingsAccess,
+) -> Result<(), Response> {
+    if access.user_id == 0 || access.is_global_admin {
+        return Ok(());
+    }
+    match settings_user_can_edit(routes, access.chat_id, access.user_id).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(settings_error_response(
+            StatusCode::FORBIDDEN,
+            "Unauthorized access",
+        )),
+        Err(error) => {
+            tracing::warn!(%error, chat_id = access.chat_id, user_id = access.user_id, "settings permission check failed");
+            Err(settings_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Permission check failed",
+            ))
+        }
+    }
+}
+
+async fn authorize_settings_memory_user(
+    routes: &StaticWebRoutes,
+    access: SettingsAccess,
+) -> Result<(), Response> {
+    if access.user_id == 0 {
+        return Ok(());
+    }
+    match settings_user_can_edit(routes, access.chat_id, access.user_id).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(settings_error_response(
+            StatusCode::FORBIDDEN,
+            "Unauthorized access",
+        )),
+        Err(error) => {
+            tracing::warn!(%error, chat_id = access.chat_id, user_id = access.user_id, "settings memory permission check failed");
+            Err(settings_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Permission check failed",
+            ))
+        }
+    }
+}
+
+async fn settings_user_can_edit(
+    routes: &StaticWebRoutes,
+    chat_id: i64,
+    user_id: i64,
+) -> Result<bool, String> {
+    if user_id == 0 {
+        return Err("user ID is required".to_owned());
+    }
+    if chat_id == user_id {
+        return Ok(true);
+    }
+    let settings_store = routes
+        .settings_store
+        .as_ref()
+        .ok_or_else(|| "settings store not configured".to_owned())?;
+    let member_store = routes
+        .member_store
+        .as_ref()
+        .ok_or_else(|| "settings store not configured".to_owned())?;
+    let Some(chat) = settings_store
+        .get_chat_state(chat_id)
+        .await
+        .map_err(|error| error.to_string())?
+    else {
+        return Err("failed to get chat info".to_owned());
+    };
+    if chat.chat_type == "private" {
+        return Ok(false);
+    }
+    let mut member = member_store
+        .get_chat_member(chat_id, user_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    if openplotva_storage::stored_member_can_open_group_settings(member.as_ref()) {
+        return Ok(true);
+    }
+    if routes.telegram.is_some() {
+        member = refresh_chat_member_for_web(routes, chat_id, user_id).await?;
+        if openplotva_storage::stored_member_can_open_group_settings(member.as_ref()) {
+            return Ok(true);
+        }
+    }
+    let Some(member) = member.as_ref() else {
+        return Ok(false);
+    };
+    if !openplotva_storage::is_active_chat_member_status(&member.status) {
+        return Ok(false);
+    }
+    let deputy_ids = member_store
+        .list_chat_deputy_ids(chat_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(deputy_ids.contains(&user_id))
+}
+
+async fn refresh_chat_member_for_web(
+    routes: &StaticWebRoutes,
+    chat_id: i64,
+    user_id: i64,
+) -> Result<Option<openplotva_storage::ChatMemberRecord>, String> {
+    let member_store = routes
+        .member_store
+        .as_ref()
+        .ok_or_else(|| "settings store not configured".to_owned())?;
+    let Some(telegram) = &routes.telegram else {
+        return member_store
+            .get_chat_member(chat_id, user_id)
+            .await
+            .map_err(|error| error.to_string());
+    };
+    if chat_id == 0 || user_id == 0 {
+        return Ok(None);
+    }
+
+    match settings::GroupSettingsMemberApi::get_chat_member(telegram, chat_id, user_id).await {
+        Ok(member) => {
+            let upsert = settings::chat_member_upsert_from_telegram(chat_id, user_id, &member);
+            if let Err(error) = member_store.upsert_chat_member(&upsert).await {
+                tracing::debug!(%error, chat_id, user_id, "failed to persist Telegram member freshness for web route");
+                return Ok(Some(chat_member_record_from_upsert(&upsert)));
+            }
+            let user_state = settings::user_state_from_telegram_user(member.get_user());
+            if let Err(error) = member_store.upsert_user_state(&user_state).await {
+                tracing::debug!(%error, chat_id, user_id, "failed to persist Telegram user freshness for web route");
+            }
+            member_store
+                .get_chat_member(chat_id, user_id)
+                .await
+                .map(|stored| stored.or_else(|| Some(chat_member_record_from_upsert(&upsert))))
+                .map_err(|error| error.to_string())
+        }
+        Err(error) => {
+            tracing::debug!(%error, chat_id, user_id, "Telegram member freshness failed for web route; using cached row");
+            member_store
+                .get_chat_member(chat_id, user_id)
+                .await
+                .map_err(|error| error.to_string())
+        }
+    }
+}
+
+fn chat_member_record_from_upsert(
+    upsert: &openplotva_storage::ChatMemberUpsert,
+) -> openplotva_storage::ChatMemberRecord {
+    openplotva_storage::ChatMemberRecord {
+        chat_id: upsert.chat_id,
+        user_id: upsert.user_id,
+        status: upsert.status.clone(),
+        is_anonymous: upsert.is_anonymous,
+        custom_title: upsert.custom_title.clone(),
+        can_be_edited: upsert.can_be_edited,
+        can_manage_chat: upsert.can_manage_chat,
+        can_delete_messages: upsert.can_delete_messages,
+        can_manage_video_chats: upsert.can_manage_video_chats,
+        can_restrict_members: upsert.can_restrict_members,
+        can_promote_members: upsert.can_promote_members,
+        can_change_info: upsert.can_change_info,
+        can_invite_users: upsert.can_invite_users,
+        can_post_messages: upsert.can_post_messages,
+        can_edit_messages: upsert.can_edit_messages,
+        can_pin_messages: upsert.can_pin_messages,
+        can_manage_topics: upsert.can_manage_topics,
+        can_send_messages: upsert.can_send_messages,
+        can_send_media_messages: upsert.can_send_media_messages,
+        can_send_polls: upsert.can_send_polls,
+        can_send_other_messages: upsert.can_send_other_messages,
+        can_add_web_page_previews: upsert.can_add_web_page_previews,
+        until_date: upsert.until_date,
+    }
+}
+
+async fn settings_update_chat(
+    routes: &StaticWebRoutes,
+    chat_id: i64,
+    user_id: i64,
+) -> Result<openplotva_core::ChatState, Response> {
+    let Some(settings_store) = &routes.settings_store else {
+        return Err(settings_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "settings store not configured",
+        ));
+    };
+    match settings_store.get_chat_state(chat_id).await {
+        Ok(Some(chat)) => Ok(chat),
+        Ok(None) if chat_id == user_id && user_id != 0 => {
+            create_private_settings_chat(routes, chat_id).await
+        }
+        Ok(None) => Err(settings_error_response(
+            StatusCode::NOT_FOUND,
+            "Chat not found",
+        )),
+        Err(error) => {
+            tracing::error!(%error, chat_id, "chat not found for settings update");
+            Err(settings_error_response(
+                StatusCode::NOT_FOUND,
+                "Chat not found",
+            ))
+        }
+    }
+}
+
+async fn create_private_settings_chat(
+    routes: &StaticWebRoutes,
+    chat_id: i64,
+) -> Result<openplotva_core::ChatState, Response> {
+    let chat = openplotva_core::ChatState::new(chat_id, "private", None, None, None, None, None);
+    if let Some(store) = &routes.state_store
+        && let Err(error) = store.upsert_chat_state(&chat).await
+    {
+        tracing::error!(%error, chat_id, "failed to create private chat record");
+        return Err(settings_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to initialize chat",
+        ));
+    }
+    Ok(chat)
+}
+
+async fn settings_chat_display_for_read(
+    routes: &StaticWebRoutes,
+    chat_id: i64,
+    user_id: i64,
+) -> (String, String) {
+    let Some(settings_store) = &routes.settings_store else {
+        return (String::new(), String::new());
+    };
+    match settings_store.get_chat_state(chat_id).await {
+        Ok(Some(chat)) => settings_chat_display(&chat),
+        Ok(None) | Err(_) if chat_id == user_id && user_id != 0 => {
+            let _ = create_private_settings_chat(routes, chat_id).await;
+            (String::new(), "private".to_owned())
+        }
+        Ok(None) | Err(_) => (String::new(), String::new()),
+    }
+}
+
+fn settings_chat_display(chat: &openplotva_core::ChatState) -> (String, String) {
+    if let Some(title) = chat.title.as_ref().filter(|value| !value.is_empty()) {
+        return (title.clone(), chat.chat_type.clone());
+    }
+    let private_name = settings_chat_name(chat.first_name.as_deref(), chat.last_name.as_deref());
+    if !private_name.is_empty() {
+        return (private_name, chat.chat_type.clone());
+    }
+    if let Some(username) = chat.username.as_ref().filter(|value| !value.is_empty()) {
+        return (format!("@{username}"), chat.chat_type.clone());
+    }
+    (String::new(), chat.chat_type.clone())
+}
+
+fn settings_chat_name(first_name: Option<&str>, last_name: Option<&str>) -> String {
+    let Some(first_name) = first_name else {
+        return String::new();
+    };
+    let mut title = first_name.to_owned();
+    if let Some(last_name) = last_name.filter(|value| !value.is_empty()) {
+        title.push(' ');
+        title.push_str(last_name);
+    }
+    title
+}
+
+fn new_settings_response(
+    settings: &openplotva_core::ChatSettings,
+    chat_title: String,
+    chat_type: String,
+) -> SettingsResponseBody {
+    SettingsResponseBody {
+        chat_id: settings.chat_id,
+        chat_title,
+        chat_type,
+        mood_alignment: settings.mood_alignment.clone(),
+        custom_persona: settings.custom_persona.clone(),
+        reactivity_percentage: settings.reactivity_percentage,
+        proactivity_percentage: settings.proactivity_percentage,
+        enable_obscenifier: settings.enable_obscenifier,
+        enable_profanity: settings.enable_profanity,
+        enable_greet_joiners: settings.enable_greet_joiners,
+        enable_global_text_reply: settings.enable_global_text_reply,
+        enable_global_draw_reply: settings.enable_global_draw_reply,
+        enable_daily_game: settings.enable_daily_game.unwrap_or(true),
+        daily_game_theme: chat_setting_daily_game_theme(settings.daily_game_theme.as_deref()),
+        greeting_html: settings.greeting_html.clone(),
+        is_vip: false,
+        disable_random_reactivity: false,
+        hide_original_draw_prompt: false,
+        is_deputy: false,
+        can_manage_deputies: false,
+        deputies: Vec::new(),
+    }
+}
+
+fn chat_setting_daily_game_theme(theme: Option<&str>) -> String {
+    theme
+        .filter(|value| !value.is_empty())
+        .unwrap_or("auto")
+        .to_owned()
+}
+
+fn apply_private_chat_response_defaults(
+    response: &mut SettingsResponseBody,
+    chat_id: i64,
+    user_id: i64,
+) {
+    if chat_id == user_id && user_id != 0 {
+        response.enable_global_text_reply = true;
+        response.enable_global_draw_reply = true;
+    }
+}
+
+async fn apply_user_settings_response(
+    routes: &StaticWebRoutes,
+    response: &mut SettingsResponseBody,
+    user_id: i64,
+) {
+    if user_id != 0 {
+        response.is_vip = settings_user_is_vip(routes, user_id).await;
+        if let Some(settings_store) = &routes.settings_store
+            && let Ok(Some(user_settings)) = settings_store.get_user_settings(user_id).await
+        {
+            response.disable_random_reactivity = user_settings.disable_random_reactivity;
+            if response.is_vip {
+                response.hide_original_draw_prompt = user_settings.hide_original_draw_prompt;
+            }
+        }
+    }
+    if !response.is_vip {
+        response.hide_original_draw_prompt = false;
+    }
+}
+
+async fn settings_user_is_vip(routes: &StaticWebRoutes, user_id: i64) -> bool {
+    if user_id <= 0 {
+        return false;
+    }
+    let Some(vip_store) = &routes.vip_store else {
+        return false;
+    };
+    if let Ok(Some(summary)) = vip_store.get_vip_summary_by_user(user_id).await
+        && summary.is_active
+        && OffsetDateTime::now_utc() < summary.effective_expires_at
+    {
+        return true;
+    }
+    vip_store
+        .get_vip_cache(user_id)
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|cache| cache.is_vip && OffsetDateTime::now_utc() < cache.expires_at)
+}
+
+async fn apply_deputy_settings_response(
+    member_store: &PostgresChatMemberStore,
+    response: &mut SettingsResponseBody,
+    chat_id: i64,
+    user_id: i64,
+    chat_type: &str,
+    is_global_admin: bool,
+) {
+    if chat_id == user_id || chat_type == "private" {
+        return;
+    }
+    let deputy_ids = member_store
+        .list_chat_deputy_ids(chat_id)
+        .await
+        .unwrap_or_default();
+    let member = member_store
+        .get_chat_member(chat_id, user_id)
+        .await
+        .ok()
+        .flatten();
+    response.is_deputy = member
+        .as_ref()
+        .is_some_and(|member| openplotva_storage::is_active_chat_member_status(&member.status))
+        && deputy_ids.contains(&user_id);
+    response.can_manage_deputies = is_global_admin
+        || member
+            .as_ref()
+            .is_some_and(|member| member.status == openplotva_storage::CHAT_MEMBER_STATUS_CREATOR);
+    if response.can_manage_deputies {
+        response.deputies = list_deputy_summaries_from_store(member_store, chat_id)
+            .await
+            .unwrap_or_default();
+    }
+}
+
+async fn settings_update_from_request(
+    settings_store: &PostgresChatSettingsStore,
+    req: &SettingsUpdateRequest,
+    chat: &openplotva_core::ChatState,
+) -> openplotva_core::ChatSettingsUpdate {
+    let (enable_global_text_reply, enable_global_draw_reply) =
+        settings_reply_flags(&chat.chat_type, req);
+    let (enable_daily_game, daily_game_theme) =
+        daily_game_update(settings_store, req, is_group_chat_type(&chat.chat_type)).await;
+    openplotva_core::ChatSettingsUpdate {
+        chat_id: req.chat_id,
+        chat_type: chat.chat_type.clone(),
+        mood_alignment: req.mood_alignment.clone(),
+        custom_persona: req.custom_persona.clone(),
+        reactivity_percentage: req.reactivity_percentage.unwrap_or(50),
+        proactivity_percentage: req.proactivity_percentage.unwrap_or(50),
+        enable_global_text_reply,
+        enable_global_draw_reply,
+        enable_obscenifier: req.enable_obscenifier.unwrap_or(true),
+        enable_profanity: req.enable_profanity.unwrap_or(true),
+        enable_greet_joiners: req.enable_greet_joiners.unwrap_or(false),
+        enable_daily_game,
+        daily_game_theme: chat_setting_daily_game_theme(daily_game_theme.as_deref()),
+        greeting_html: req.greeting_html.clone(),
+    }
+}
+
+fn settings_reply_flags(chat_type: &str, req: &SettingsUpdateRequest) -> (bool, bool) {
+    let mut enable_global_text_reply = req.enable_global_text_reply.unwrap_or(true);
+    let mut enable_global_draw_reply = req.enable_global_draw_reply.unwrap_or(true);
+    if chat_type == "private" {
+        enable_global_text_reply = true;
+        enable_global_draw_reply = true;
+    }
+    (enable_global_text_reply, enable_global_draw_reply)
+}
+
+async fn daily_game_update(
+    settings_store: &PostgresChatSettingsStore,
+    req: &SettingsUpdateRequest,
+    is_group: bool,
+) -> (bool, Option<String>) {
+    let current = settings_store
+        .get_chat_settings(req.chat_id)
+        .await
+        .ok()
+        .flatten();
+    let mut daily_enabled = current
+        .as_ref()
+        .and_then(|settings| settings.enable_daily_game)
+        .unwrap_or(true);
+    let mut daily_theme = current.and_then(|settings| settings.daily_game_theme);
+    if is_group {
+        if let Some(enabled) = req.enable_daily_game {
+            daily_enabled = enabled;
+        }
+        if req.daily_game_theme.is_some() {
+            daily_theme = req.daily_game_theme.clone();
+        }
+    }
+    (daily_enabled, daily_theme)
+}
+
+fn is_group_chat_type(chat_type: &str) -> bool {
+    chat_type == "group" || chat_type == "supergroup"
+}
+
+async fn update_user_settings_from_request(routes: &StaticWebRoutes, req: &SettingsUpdateRequest) {
+    if req.user_id == 0
+        || (req.disable_random_reactivity.is_none() && req.hide_original_draw_prompt.is_none())
+    {
+        return;
+    }
+    let Some(settings_store) = &routes.settings_store else {
+        return;
+    };
+    let current = settings_store
+        .get_user_settings(req.user_id)
+        .await
+        .ok()
+        .flatten();
+    let disable_random_reactivity = req.disable_random_reactivity.unwrap_or_else(|| {
+        current
+            .as_ref()
+            .is_some_and(|settings| settings.disable_random_reactivity)
+    });
+    let mut hide_original_draw_prompt = current
+        .as_ref()
+        .is_some_and(|settings| settings.hide_original_draw_prompt);
+    if settings_user_is_vip(routes, req.user_id).await {
+        if let Some(hide) = req.hide_original_draw_prompt {
+            hide_original_draw_prompt = hide;
+        }
+    } else {
+        hide_original_draw_prompt = false;
+    }
+    if let Err(error) = settings_store
+        .upsert_user_settings(
+            req.user_id,
+            disable_random_reactivity,
+            hide_original_draw_prompt,
+        )
+        .await
+    {
+        tracing::warn!(%error, user_id = req.user_id, "failed to update user settings");
+    }
+}
+
+async fn managed_chat_list_items(
+    routes: &StaticWebRoutes,
+    settings_store: &PostgresChatSettingsStore,
+    member_store: &PostgresChatMemberStore,
+    user_id: i64,
+) -> Vec<ChatListItem> {
+    let chats = match settings_store.list_user_chats(user_id).await {
+        Ok(chats) => chats,
+        Err(error) => {
+            tracing::debug!(%error, user_id, "failed to list user chats");
+            return Vec::new();
+        }
+    };
+    let memberships = member_store.list_user_chat_memberships(user_id).await;
+    let membership_fallback = memberships.is_err();
+    let members_by_chat_id = memberships
+        .unwrap_or_default()
+        .into_iter()
+        .map(|member| (member.chat_id, member))
+        .collect::<HashMap<_, _>>();
+    let deputy_chats = member_store.list_user_deputy_chat_ids(user_id).await;
+    let deputy_fallback = deputy_chats.is_err();
+    let deputy_chat_ids = deputy_chats
+        .unwrap_or_default()
+        .into_iter()
+        .collect::<HashSet<_>>();
+
+    let mut result = Vec::with_capacity(chats.len());
+    for chat in chats {
+        let mut member = if membership_fallback {
+            member_store
+                .get_chat_member(chat.id, user_id)
+                .await
+                .ok()
+                .flatten()
+        } else {
+            members_by_chat_id.get(&chat.id).cloned()
+        };
+        if routes.telegram.is_some()
+            && !member
+                .as_ref()
+                .is_some_and(|member| chat_member_can_manage_settings(member, false))
+            && let Ok(fresh) = refresh_chat_member_for_web(routes, chat.id, user_id).await
+        {
+            member = fresh;
+        }
+        let Some(member) = member else {
+            continue;
+        };
+        let is_deputy = user_is_deputy_for_managed_chat(
+            member_store,
+            user_id,
+            chat.id,
+            &member,
+            &deputy_chat_ids,
+            deputy_fallback,
+        )
+        .await;
+        if !chat_member_can_manage_settings(&member, is_deputy) {
+            continue;
+        }
+        result.push(ChatListItem {
+            id: chat.id,
+            title: chat_list_title(&chat),
+            chat_type: chat.chat_type,
+        });
+    }
+    result
+}
+
+async fn user_is_deputy_for_managed_chat(
+    member_store: &PostgresChatMemberStore,
+    user_id: i64,
+    chat_id: i64,
+    member: &openplotva_storage::ChatMemberRecord,
+    deputy_chat_ids: &HashSet<i64>,
+    fallback: bool,
+) -> bool {
+    if chat_member_can_manage_settings(member, false)
+        || !openplotva_storage::is_active_chat_member_status(&member.status)
+    {
+        return false;
+    }
+    if !fallback {
+        return deputy_chat_ids.contains(&chat_id);
+    }
+    member_store
+        .list_chat_deputy_ids(chat_id)
+        .await
+        .is_ok_and(|ids| ids.contains(&user_id))
+}
+
+fn chat_member_can_manage_settings(
+    member: &openplotva_storage::ChatMemberRecord,
+    is_deputy: bool,
+) -> bool {
+    member.status == openplotva_storage::CHAT_MEMBER_STATUS_CREATOR
+        || is_deputy
+        || member.status == openplotva_storage::CHAT_MEMBER_STATUS_ADMINISTRATOR
+            && member.can_promote_members == Some(true)
+}
+
+fn chat_list_title(chat: &openplotva_core::ChatState) -> String {
+    let (title, _) = settings_chat_display(chat);
+    if title.is_empty() {
+        format!("Chat {}", chat.id)
+    } else {
+        title
+    }
+}
+
+async fn parse_settings_memory_access(
+    routes: &StaticWebRoutes,
+    raw_query: Option<&str>,
+) -> Result<(i64, i64, openplotva_memory::RetrievalScope), Response> {
+    let values = admin_auth_query_values(raw_query);
+    let chat_id = values
+        .get("chat_id")
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value != 0)
+        .ok_or_else(|| {
+            settings_side_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid chat_id",
+                "GET, DELETE, OPTIONS",
+            )
+        })?;
+    let signature = values
+        .get("signature")
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            settings_side_error_response(
+                StatusCode::BAD_REQUEST,
+                "missing signature",
+                "GET, DELETE, OPTIONS",
+            )
+        })?;
+    let user_id = values
+        .get("user_id")
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(0);
+    if !openplotva_web::validate_settings_access_signature(chat_id, user_id, signature) {
+        return Err(settings_side_error_response(
+            StatusCode::FORBIDDEN,
+            "invalid signature",
+            "GET, DELETE, OPTIONS",
+        ));
+    }
+    if user_id != 0
+        && let Err(error) = authorize_settings_memory_user(
+            routes,
+            SettingsAccess {
+                chat_id,
+                user_id,
+                is_global_admin: false,
+            },
+        )
+        .await
+    {
+        return Err(match error.status() {
+            StatusCode::FORBIDDEN => settings_side_error_response(
+                StatusCode::FORBIDDEN,
+                "unauthorized access",
+                "GET, DELETE, OPTIONS",
+            ),
+            _ => settings_side_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "permission check failed",
+                "GET, DELETE, OPTIONS",
+            ),
+        });
+    }
+    let thread_id = values
+        .get("thread_id")
+        .map(String::as_str)
+        .map(parse_optional_i32)
+        .unwrap_or(0);
+    let mut scope = openplotva_memory::RetrievalScope {
+        chat_id,
+        thread_id,
+        user_id,
+        ..openplotva_memory::RetrievalScope::default()
+    };
+    if let Some(settings_store) = &routes.settings_store
+        && let Ok(Some(meta)) = settings_store.get_dialog_memory_chat_meta(chat_id).await
+    {
+        scope.chat_type = meta.chat_type;
+        scope.username = meta.username;
+        scope.active_usernames = meta.active_usernames;
+    }
+    Ok((chat_id, user_id, scope))
+}
+
+fn parse_memory_limit(value: Option<&str>) -> usize {
+    match value.and_then(|value| value.trim().parse::<usize>().ok()) {
+        Some(limit) if limit > 500 => 500,
+        Some(limit) if limit > 0 => limit,
+        _ => 100,
+    }
+}
+
+fn parse_optional_i32(value: &str) -> i32 {
+    value
+        .trim()
+        .parse::<i32>()
+        .ok()
+        .filter(|value| *value >= 0)
+        .unwrap_or(0)
+}
+
+fn settings_options_response() -> Response {
+    let mut response = StatusCode::OK.into_response();
+    add_settings_api_headers(response.headers_mut());
+    response
+}
+
+fn settings_error_response(status: StatusCode, error: &str) -> Response {
+    settings_json_raw_response(status, &format!(r#"{{"error": "{error}"}}"#))
+}
+
+fn settings_json_response<T: Serialize>(status: StatusCode, value: &T) -> Response {
+    let body = match serde_json::to_string(value) {
+        Ok(body) => body,
+        Err(error) => {
+            tracing::error!(%error, "failed to encode settings response");
+            r#"{"error": "Failed to encode response"}"#.to_owned()
+        }
+    };
+    settings_json_raw_response(status, &body)
+}
+
+fn settings_json_raw_response(status: StatusCode, body: &str) -> Response {
+    let mut response = (
+        status,
+        [(header::CONTENT_TYPE, "application/json")],
+        format!("{body}\n"),
+    )
+        .into_response();
+    add_settings_api_headers(response.headers_mut());
+    response
+}
+
+fn settings_side_options_response(methods: &'static str) -> Response {
+    let mut response = StatusCode::OK.into_response();
+    add_settings_side_api_headers(response.headers_mut(), methods);
+    response
+}
+
+fn settings_side_error_response(
+    status: StatusCode,
+    error: &str,
+    methods: &'static str,
+) -> Response {
+    settings_side_json_raw_response(
+        status,
+        &serde_json::json!({ "error": error }).to_string(),
+        methods,
+    )
+}
+
+fn settings_side_json_response<T: Serialize>(
+    status: StatusCode,
+    value: &T,
+    methods: &'static str,
+) -> Response {
+    let body = serde_json::to_string(value).unwrap_or_else(|error| {
+        tracing::error!(%error, "failed to encode settings side response");
+        r#"{"error":"Failed to encode response"}"#.to_owned()
+    });
+    settings_side_json_raw_response(status, &body, methods)
+}
+
+fn settings_side_json_raw_response(
+    status: StatusCode,
+    body: &str,
+    methods: &'static str,
+) -> Response {
+    let mut response = (
+        status,
+        [(header::CONTENT_TYPE, "application/json")],
+        format!("{body}\n"),
+    )
+        .into_response();
+    add_settings_side_api_headers(response.headers_mut(), methods);
+    response
+}
+
+fn add_settings_api_headers(headers: &mut HeaderMap) {
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        HeaderValue::from_static("*"),
+    );
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_METHODS,
+        HeaderValue::from_static("GET, POST, PUT, OPTIONS"),
+    );
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_HEADERS,
+        HeaderValue::from_static("Content-Type, Authorization"),
+    );
+}
+
+fn add_settings_side_api_headers(headers: &mut HeaderMap, methods: &'static str) {
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        HeaderValue::from_static("*"),
+    );
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_METHODS,
+        HeaderValue::from_static(methods),
+    );
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_HEADERS,
+        HeaderValue::from_static("Content-Type, Authorization"),
+    );
+}
+
+async fn admin_auth_response(
+    routes: &StaticWebRoutes,
+    method: Method,
+    raw_query: Option<&str>,
+) -> Response {
+    if method != Method::GET && method != Method::POST {
+        return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+    }
+
+    let values = admin_auth_query_values(raw_query);
+    let Some(user_id_raw) = values.get("id").filter(|value| !value.is_empty()) else {
+        return admin_error_response(StatusCode::BAD_REQUEST, "missing parameters");
+    };
+    let Some(hash) = values.get("hash").filter(|value| !value.is_empty()) else {
+        return admin_error_response(StatusCode::BAD_REQUEST, "missing parameters");
+    };
+    let Ok(user_id) = user_id_raw.parse::<i64>() else {
+        return admin_error_response(StatusCode::BAD_REQUEST, "invalid user id");
+    };
+    if routes.bot_token.is_empty() {
+        return admin_error_response(StatusCode::BAD_REQUEST, "bot token not configured");
+    }
+
+    let pairs = values
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()));
+    if !openplotva_web::validate_telegram_auth(pairs, &routes.bot_token, hash) {
+        tracing::error!("invalid admin auth signature");
+        return admin_error_response(StatusCode::FORBIDDEN, "invalid auth");
+    }
+
+    if !routes.admin_ids.contains(&user_id) {
+        tracing::error!(user_id, "authenticated Telegram user is not an admin");
+        return admin_error_response(StatusCode::FORBIDDEN, "forbidden");
+    }
+
+    persist_admin_session_user(routes, &values, user_id).await;
+    (
+        StatusCode::FOUND,
+        [
+            (header::LOCATION, "/admin/".to_owned()),
+            (
+                header::SET_COOKIE,
+                openplotva_web::admin_session_cookie(user_id),
+            ),
+        ],
+    )
+        .into_response()
+}
+
+fn admin_auth_query_values(raw_query: Option<&str>) -> BTreeMap<String, String> {
+    let mut values = BTreeMap::new();
+    let Some(raw_query) = raw_query else {
+        return values;
+    };
+    for (key, value) in url::form_urlencoded::parse(raw_query.as_bytes()) {
+        values
+            .entry(key.into_owned())
+            .or_insert_with(|| value.into_owned());
+    }
+    values
+}
+
+async fn persist_admin_session_user(
+    routes: &StaticWebRoutes,
+    values: &BTreeMap<String, String>,
+    user_id: i64,
+) {
+    let Some(store) = &routes.state_store else {
+        return;
+    };
+    let user = admin_auth_user_state(values, user_id);
+    if let Err(error) = store.upsert_user_state(&user).await {
+        tracing::warn!(%error, user_id, "failed to persist admin session user");
+    }
+}
+
+fn admin_auth_user_state(
+    values: &BTreeMap<String, String>,
+    user_id: i64,
+) -> openplotva_core::UserState {
+    openplotva_core::UserState::new(
+        user_id,
+        trimmed_auth_value(values, "first_name").unwrap_or_else(|| "Telegram Admin".to_owned()),
+        trimmed_auth_value(values, "last_name"),
+        trimmed_auth_value(values, "username"),
+        trimmed_auth_value(values, "language_code"),
+        None,
+    )
+}
+
+fn trimmed_auth_value(values: &BTreeMap<String, String>, key: &str) -> Option<String> {
+    values
+        .get(key)
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn admin_error_response(status: StatusCode, error: &str) -> Response {
+    (
+        status,
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        format!(r#"{{"error":"{error}"}}"#) + "\n",
+    )
+        .into_response()
+}
+
+fn admin_json_response(status: StatusCode, value: serde_json::Value) -> Response {
+    (
+        status,
+        [(header::CONTENT_TYPE, "application/json")],
+        format!("{value}\n"),
+    )
+        .into_response()
+}
+
+fn admin_json_no_cache_response(status: StatusCode, value: serde_json::Value) -> Response {
+    (
+        status,
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        format!("{value}\n"),
+    )
+        .into_response()
+}
+
+const ADMIN_PAGE_LIMIT: i64 = 1000;
+const SQL_ADMIN_LIST_USERS_FILTERED: &str = "SELECT * FROM users WHERE ($1::text IS NULL OR LOWER(COALESCE(username, '')) LIKE '%' || LOWER($1::text) || '%' OR LOWER(first_name) LIKE '%' || LOWER($1::text) || '%' OR LOWER(COALESCE(last_name, '')) LIKE '%' || LOWER($1::text) || '%') ORDER BY id LIMIT $2 OFFSET $3";
+const SQL_ADMIN_GET_USER: &str = "SELECT * FROM users WHERE id = $1";
+const SQL_ADMIN_GET_USER_BY_USERNAME: &str = "SELECT * FROM users WHERE username = $1 LIMIT 1";
+const SQL_ADMIN_SAFE_DELETE_USER: &str = "WITH deleted_memberships AS (DELETE FROM chat_members WHERE user_id = $1 RETURNING user_id), deleted_vip AS (DELETE FROM vip_cache WHERE user_id = $1 RETURNING user_id) DELETE FROM users WHERE id = $1";
+const SQL_ADMIN_LIST_CHATS: &str = "SELECT * FROM chats";
+const SQL_ADMIN_LIST_CHATS_FILTERED: &str = "SELECT * FROM chats WHERE ($1::text IS NULL OR CAST(id AS text) LIKE '%' || $1::text || '%' OR LOWER(COALESCE(title, '')) LIKE '%' || LOWER($1::text) || '%' OR LOWER(COALESCE(username, '')) LIKE '%' || LOWER($1::text) || '%' OR LOWER(COALESCE(first_name, '')) LIKE '%' || LOWER($1::text) || '%' OR LOWER(COALESCE(last_name, '')) LIKE '%' || LOWER($1::text) || '%') ORDER BY id LIMIT $2 OFFSET $3";
+const SQL_ADMIN_SEARCH_CHATS_BY_MEMBER: &str = "SELECT DISTINCT c.* FROM chats c JOIN chat_members cm ON c.id = cm.chat_id JOIN users u ON cm.user_id = u.id WHERE ($1::text IS NULL OR LOWER(u.username) = LOWER($1::text)) AND ($2::bigint IS NULL OR u.id = $2::bigint) ORDER BY c.id";
+const SQL_ADMIN_GET_CHAT: &str = "SELECT * FROM chats WHERE id = $1";
+const SQL_ADMIN_GET_CHAT_TYPE: &str = "SELECT type FROM chats WHERE id = $1";
+const SQL_ADMIN_GET_CHAT_SETTINGS: &str = "SELECT * FROM chat_settings WHERE chat_id = $1";
+const SQL_ADMIN_GET_CHAT_PERMISSIONS: &str =
+    "SELECT * FROM chat_permissions WHERE chat_id = $1 LIMIT 1";
+const SQL_ADMIN_COUNT_CHAT_MEMBERS: &str =
+    "SELECT COUNT(*)::bigint AS count FROM chat_members WHERE chat_id = $1";
+const SQL_ADMIN_LIST_CHAT_MEMBERS_WITH_USERS: &str = "SELECT cm.chat_id AS member_chat_id, cm.user_id AS member_user_id, cm.status AS member_status, cm.is_anonymous AS member_is_anonymous, cm.custom_title AS member_custom_title, cm.can_be_edited AS member_can_be_edited, cm.can_manage_chat AS member_can_manage_chat, cm.can_delete_messages AS member_can_delete_messages, cm.can_manage_video_chats AS member_can_manage_video_chats, cm.can_restrict_members AS member_can_restrict_members, cm.can_promote_members AS member_can_promote_members, cm.can_change_info AS member_can_change_info, cm.can_invite_users AS member_can_invite_users, cm.can_post_messages AS member_can_post_messages, cm.can_edit_messages AS member_can_edit_messages, cm.can_pin_messages AS member_can_pin_messages, cm.can_manage_topics AS member_can_manage_topics, cm.can_send_messages AS member_can_send_messages, cm.can_send_media_messages AS member_can_send_media_messages, cm.can_send_polls AS member_can_send_polls, cm.can_send_other_messages AS member_can_send_other_messages, cm.can_add_web_page_previews AS member_can_add_web_page_previews, cm.until_date AS member_until_date, cm.created_at AS member_created_at, cm.updated_at AS member_updated_at, cm.last_message_at AS member_last_message_at, u.id AS user_id, u.is_premium AS user_is_premium, u.first_name AS user_first_name, u.last_name AS user_last_name, u.username AS user_username, u.language_code AS user_language_code, u.is_vip AS user_is_vip, u.settings AS user_settings, u.discovered AS user_discovered, u.updated AS user_updated FROM chat_members cm LEFT JOIN users u ON u.id = cm.user_id WHERE cm.chat_id = $1";
+
+#[derive(Debug, Deserialize)]
+struct AdminChatSettingsUpdateRequest {
+    chat_id: i64,
+    mood_alignment: Option<String>,
+    custom_persona: Option<String>,
+    reactivity_percentage: Option<i32>,
+    proactivity_percentage: Option<i32>,
+    enable_obscenifier: Option<bool>,
+    enable_profanity: Option<bool>,
+    enable_greet_joiners: Option<bool>,
+    enable_global_text_reply: Option<bool>,
+    enable_global_draw_reply: Option<bool>,
+    enable_daily_game: Option<bool>,
+    daily_game_theme: Option<String>,
+    greeting_html: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AdminVipGrantRequest {
+    user_id: serde_json::Value,
+    days: i64,
+    #[serde(default)]
+    reason: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct AdminMemoryRestartRequest {
+    #[serde(default, rename = "override")]
+    override_: bool,
+    #[serde(default)]
+    provider: String,
+    #[serde(default)]
+    model: String,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct AdminMemoryOverride {
+    provider: String,
+    model: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct AdminShieldDocumentRequest {
+    #[serde(default)]
+    id: i64,
+    #[serde(default)]
+    slug: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    category: String,
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    priority: i32,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct AdminShieldTestRequest {
+    #[serde(default)]
+    query: String,
+    #[serde(default)]
+    expected_category: String,
+    #[serde(default)]
+    max_matches: i32,
+    #[serde(default)]
+    debug: bool,
+}
+
+async fn admin_memory_cards_response(
+    routes: &StaticWebRoutes,
+    method: Method,
+    headers: &HeaderMap,
+    raw_query: Option<&str>,
+) -> Response {
+    match method {
+        Method::GET => admin_memory_cards_list_response(routes, headers, raw_query).await,
+        Method::DELETE => admin_memory_card_delete_response(routes, headers, raw_query).await,
+        _ => admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed"),
+    }
+}
+
+async fn admin_memory_cards_list_response(
+    routes: &StaticWebRoutes,
+    headers: &HeaderMap,
+    raw_query: Option<&str>,
+) -> Response {
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+        return admin_auth_failure_response(error);
+    }
+    let Some(store) = routes
+        .memory_store
+        .as_ref()
+        .filter(|_| routes.memory_admin_enabled)
+    else {
+        return admin_json_response(
+            StatusCode::OK,
+            serde_json::json!({ "count": 0, "cards": serde_json::Value::Null }),
+        );
+    };
+    let filter = admin_memory_card_filter(raw_query);
+    match store.list_cards(&filter).await {
+        Ok(cards) => admin_json_response(
+            StatusCode::OK,
+            serde_json::json!({
+                "count": cards.len(),
+                "cards": cards,
+            }),
+        ),
+        Err(error) => {
+            tracing::warn!(%error, "failed to list admin memory cards");
+            admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed")
+        }
+    }
+}
+
+async fn admin_memory_card_delete_response(
+    routes: &StaticWebRoutes,
+    headers: &HeaderMap,
+    raw_query: Option<&str>,
+) -> Response {
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+        return admin_auth_failure_response(error);
+    }
+    let id = match admin_memory_required_id(raw_query, "id required") {
+        Ok(id) => id,
+        Err(response) => return *response,
+    };
+    if let Some(store) = routes
+        .memory_store
+        .as_ref()
+        .filter(|_| routes.memory_admin_enabled)
+        && let Err(error) = store
+            .soft_delete_card(id, current_admin_user_id(headers))
+            .await
+    {
+        tracing::warn!(%error, id, "failed to delete admin memory card");
+        return admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed");
+    }
+    admin_json_response(StatusCode::OK, serde_json::json!({ "ok": true }))
+}
+
+async fn admin_memory_runs_response(
+    routes: &StaticWebRoutes,
+    method: Method,
+    headers: &HeaderMap,
+    raw_query: Option<&str>,
+    body: &[u8],
+) -> Response {
+    match method {
+        Method::GET => admin_memory_runs_list_response(routes, headers, raw_query).await,
+        Method::POST => admin_memory_run_retry_response(routes, headers, raw_query, body).await,
+        _ => admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed"),
+    }
+}
+
+async fn admin_memory_runs_list_response(
+    routes: &StaticWebRoutes,
+    headers: &HeaderMap,
+    raw_query: Option<&str>,
+) -> Response {
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+        return admin_auth_failure_response(error);
+    }
+    let Some(store) = routes
+        .memory_store
+        .as_ref()
+        .filter(|_| routes.memory_admin_enabled)
+    else {
+        return admin_json_response(
+            StatusCode::OK,
+            serde_json::json!({ "count": 0, "runs": serde_json::Value::Null }),
+        );
+    };
+    let limit = parse_memory_limit(
+        admin_auth_query_values(raw_query)
+            .get("limit")
+            .map(String::as_str),
+    );
+    match store.list_runs(limit as i32).await {
+        Ok(runs) => admin_json_response(
+            StatusCode::OK,
+            serde_json::json!({
+                "count": runs.len(),
+                "runs": runs,
+            }),
+        ),
+        Err(error) => {
+            tracing::warn!(%error, "failed to list admin memory runs");
+            admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed")
+        }
+    }
+}
+
+async fn admin_memory_run_retry_response(
+    routes: &StaticWebRoutes,
+    headers: &HeaderMap,
+    raw_query: Option<&str>,
+    body: &[u8],
+) -> Response {
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+        return admin_auth_failure_response(error);
+    }
+    let id = match admin_memory_required_id(raw_query, "id required") {
+        Ok(id) => id,
+        Err(response) => return *response,
+    };
+    admin_memory_restart_execute_response(routes, headers, raw_query, body, id, false).await
+}
+
+async fn admin_memory_restart_response(
+    routes: &StaticWebRoutes,
+    method: Method,
+    headers: &HeaderMap,
+    raw_query: Option<&str>,
+    body: &[u8],
+) -> Response {
+    if method != Method::POST {
+        return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+    }
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+        return admin_auth_failure_response(error);
+    }
+    let id = match admin_memory_optional_restart_id(raw_query) {
+        Ok(id) => id,
+        Err(response) => return *response,
+    };
+    let run_now = admin_auth_query_values(raw_query)
+        .get("run_now")
+        .and_then(|value| parse_go_bool(value))
+        .unwrap_or(false);
+    admin_memory_restart_execute_response(routes, headers, raw_query, body, id, run_now).await
+}
+
+async fn admin_memory_restart_execute_response(
+    routes: &StaticWebRoutes,
+    headers: &HeaderMap,
+    raw_query: Option<&str>,
+    body: &[u8],
+    id: i64,
+    run_now: bool,
+) -> Response {
+    let Some(store) = routes
+        .memory_store
+        .as_ref()
+        .filter(|_| routes.memory_admin_enabled)
+    else {
+        return admin_error_response(StatusCode::SERVICE_UNAVAILABLE, "memory disabled");
+    };
+    let (override_, explicit_override) =
+        match admin_memory_restart_override(headers, raw_query, body) {
+            Ok(value) => value,
+            Err(response) => return *response,
+        };
+    if explicit_override {
+        return admin_memory_restart_override_execute_response(routes, override_, id, run_now)
+            .await;
+    }
+    let mut retried_failed_runs = 0_i64;
+    let mut queued_runs = 0_i64;
+    let result = if run_now {
+        store
+            .ensure_daily_runs(OffsetDateTime::now_utc(), routes.memory_retention)
+            .await
+            .map(|queued| queued_runs = admin_u64_to_i64(queued))
+    } else if id > 0 {
+        store.retry_run(id).await.map(|()| retried_failed_runs = 1)
+    } else {
+        store
+            .retry_failed_runs()
+            .await
+            .map(|retried| retried_failed_runs = admin_u64_to_i64(retried))
+    };
+    if let Err(error) = result {
+        tracing::warn!(%error, id, run_now, "failed to restart admin memory runs");
+        return admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed");
+    }
+    let started = routes
+        .memory_restart_trigger
+        .as_ref()
+        .map(|trigger| {
+            trigger.notify_one();
+            true
+        })
+        .unwrap_or(false);
+    let provider = if explicit_override && !override_.provider.trim().is_empty() {
+        normalize_memory_restart_provider(&override_.provider)
+    } else {
+        "aifarm".to_owned()
+    };
+    let model = if explicit_override && !override_.model.trim().is_empty() {
+        override_.model.trim().to_owned()
+    } else {
+        admin_memory_restart_model(&routes.memory_consolidation_model)
+    };
+    admin_memory_restart_ok_response(
+        id,
+        retried_failed_runs,
+        queued_runs,
+        started,
+        explicit_override,
+        provider,
+        model,
+    )
+}
+
+async fn admin_memory_restart_override_execute_response(
+    routes: &StaticWebRoutes,
+    override_: AdminMemoryOverride,
+    id: i64,
+    run_now: bool,
+) -> Response {
+    let Some(runtime) = routes.memory_override_runtime.clone() else {
+        tracing::warn!(
+            provider = override_.provider,
+            model = override_.model,
+            "admin memory override drain is unavailable"
+        );
+        return admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed");
+    };
+    let (provider, model) = match admin_memory_resolve_override(
+        &override_,
+        &runtime.config,
+        &routes.memory_consolidation_model,
+    ) {
+        Ok(value) => value,
+        Err(unsupported_provider) => {
+            tracing::warn!(
+                provider = unsupported_provider,
+                model = override_.model,
+                "admin memory override provider is unsupported"
+            );
+            return admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed");
+        }
+    };
+    let extractor = match memory_runtime::memory_extractor_from_app_config_with_override(
+        &runtime.config,
+        Some(&provider),
+        Some(&model),
+    ) {
+        Ok(extractor) => extractor,
+        Err(error) => {
+            tracing::warn!(%error, provider, model, "failed to build admin memory override extractor");
+            return admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed");
+        }
+    };
+    let embedder = match memory_runtime::memory_write_embedder_from_config(&runtime.config.memory) {
+        Ok(embedder) => embedder,
+        Err(error) => {
+            tracing::warn!(%error, provider, model, "failed to build admin memory override embedder");
+            return admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed");
+        }
+    };
+    let Ok(guard) = runtime.lock.clone().try_lock_owned() else {
+        return admin_memory_restart_ok_response(id, 0, 0, false, true, provider, model);
+    };
+    let mut retried_failed_runs = 0_i64;
+    let mut queued_runs = 0_i64;
+    let result = if run_now {
+        runtime
+            .store
+            .ensure_daily_runs(OffsetDateTime::now_utc(), routes.memory_retention)
+            .await
+            .map(|queued| queued_runs = admin_u64_to_i64(queued))
+    } else if id > 0 {
+        runtime
+            .store
+            .retry_run(id)
+            .await
+            .map(|()| retried_failed_runs = 1)
+    } else {
+        runtime
+            .store
+            .retry_failed_runs()
+            .await
+            .map(|retried| retried_failed_runs = admin_u64_to_i64(retried))
+    };
+    if let Err(error) = result {
+        tracing::warn!(
+            %error,
+            id,
+            run_now,
+            provider,
+            model,
+            "failed to restart admin memory runs with override"
+        );
+        return admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed");
+    }
+    let mut cfg =
+        memory_runtime::memory_service_worker_config_from_memory_config(&runtime.config.memory)
+            .process;
+    cfg.episode_model = model.clone();
+    tokio::spawn(admin_memory_override_drain(
+        runtime,
+        extractor,
+        embedder,
+        cfg,
+        model.clone(),
+        guard,
+    ));
+    admin_memory_restart_ok_response(
+        id,
+        retried_failed_runs,
+        queued_runs,
+        true,
+        true,
+        provider,
+        model,
+    )
+}
+
+async fn admin_memory_override_drain(
+    runtime: AdminMemoryOverrideRuntime,
+    extractor: memory_runtime::AppMemoryExtractor,
+    embedder: Option<memory_runtime::HttpEmbedderClient>,
+    cfg: memory_runtime::MemoryRunProcessConfig,
+    model: String,
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+) {
+    let started_at = std::time::Instant::now();
+    let mut completed = 0_i64;
+    let mut failed = 0_i64;
+    let mut store_errors = 0_i64;
+    tracing::info!(model, workers = 1, "admin memory override drain started");
+    loop {
+        match memory_runtime::process_next_memory_run(
+            &extractor,
+            &runtime.store,
+            embedder.as_ref(),
+            cfg.clone(),
+        )
+        .await
+        {
+            Ok(report) if report.processed => {
+                completed += 1;
+                tracing::info!(?report, "admin memory override run processed");
+            }
+            Ok(_) => break,
+            Err(memory_runtime::MemoryRunProcessError::Process { run_id, source }) => {
+                failed += 1;
+                tracing::warn!(%source, run_id, "admin memory override run failed");
+            }
+            Err(memory_runtime::MemoryRunProcessError::Store { source }) => {
+                store_errors += 1;
+                tracing::warn!(%source, "admin memory override store operation failed");
+                break;
+            }
+        }
+    }
+    tracing::info!(
+        model,
+        completed,
+        failed,
+        store_errors,
+        duration = ?started_at.elapsed(),
+        "admin memory override drain finished"
+    );
+}
+
+fn admin_memory_resolve_override(
+    override_: &AdminMemoryOverride,
+    config: &AppConfig,
+    default_model: &str,
+) -> Result<(String, String), String> {
+    let provider = normalize_memory_restart_provider(&override_.provider);
+    let provider = if provider.is_empty() {
+        "aifarm".to_owned()
+    } else {
+        provider
+    };
+    match provider.as_str() {
+        "aifarm" => {
+            let model = if override_.model.trim().is_empty() {
+                admin_memory_restart_model(default_model)
+            } else {
+                override_.model.trim().to_owned()
+            };
+            Ok((provider, model))
+        }
+        "genkit" | "gemini" => {
+            let model =
+                memory_runtime::genkit_memory_extractor_model(config, Some(&override_.model));
+            Ok(("genkit".to_owned(), model))
+        }
+        _ => Err(provider),
+    }
+}
+
+fn admin_memory_restart_ok_response(
+    id: i64,
+    retried_failed_runs: i64,
+    queued_runs: i64,
+    started: bool,
+    override_: bool,
+    provider: String,
+    model: String,
+) -> Response {
+    let mut value = serde_json::Map::new();
+    value.insert("ok".to_owned(), serde_json::json!(true));
+    if id != 0 {
+        value.insert("run_id".to_owned(), serde_json::json!(id));
+    }
+    value.insert(
+        "retried_failed_runs".to_owned(),
+        serde_json::json!(retried_failed_runs),
+    );
+    value.insert("queued_runs".to_owned(), serde_json::json!(queued_runs));
+    value.insert("started".to_owned(), serde_json::json!(started));
+    value.insert("override".to_owned(), serde_json::json!(override_));
+    if !provider.is_empty() {
+        value.insert("provider".to_owned(), serde_json::json!(provider));
+    }
+    if !model.is_empty() {
+        value.insert("model".to_owned(), serde_json::json!(model));
+    }
+    admin_json_response(StatusCode::OK, serde_json::Value::Object(value))
+}
+
+fn admin_memory_card_filter(raw_query: Option<&str>) -> openplotva_memory::CardFilter {
+    let values = admin_auth_query_values(raw_query);
+    openplotva_memory::CardFilter {
+        chat_id: values
+            .get("chat_id")
+            .and_then(|value| value.trim().parse::<i64>().ok())
+            .unwrap_or_default(),
+        thread_id: values
+            .get("thread_id")
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .and_then(|value| value.parse::<i32>().ok()),
+        user_id: values
+            .get("user_id")
+            .and_then(|value| value.trim().parse::<i64>().ok())
+            .unwrap_or_default(),
+        status: values
+            .get("status")
+            .map(|value| value.trim().to_owned())
+            .unwrap_or_default(),
+        limit: parse_memory_limit(values.get("limit").map(String::as_str)) as i32,
+    }
+}
+
+fn admin_memory_required_id(raw_query: Option<&str>, missing: &str) -> Result<i64, Box<Response>> {
+    let values = admin_auth_query_values(raw_query);
+    let Some(raw) = values.get("id") else {
+        return Err(Box::new(admin_error_response(
+            StatusCode::BAD_REQUEST,
+            missing,
+        )));
+    };
+    let id = raw.trim().parse::<i64>().map_err(|_| {
+        Box::new(admin_error_response(
+            StatusCode::BAD_REQUEST,
+            if missing == "invalid id" {
+                "invalid id"
+            } else {
+                missing
+            },
+        ))
+    })?;
+    if id == 0 {
+        return Err(Box::new(admin_error_response(
+            StatusCode::BAD_REQUEST,
+            missing,
+        )));
+    }
+    Ok(id)
+}
+
+fn admin_memory_optional_restart_id(raw_query: Option<&str>) -> Result<i64, Box<Response>> {
+    let values = admin_auth_query_values(raw_query);
+    let Some(raw) = values.get("id").map(String::as_str).map(str::trim) else {
+        return Ok(0);
+    };
+    if raw.is_empty() {
+        return Ok(0);
+    }
+    let id = raw
+        .parse::<i64>()
+        .map_err(|_| Box::new(admin_error_response(StatusCode::BAD_REQUEST, "invalid id")))?;
+    if id <= 0 {
+        return Err(Box::new(admin_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid id",
+        )));
+    }
+    Ok(id)
+}
+
+fn admin_memory_restart_override(
+    headers: &HeaderMap,
+    raw_query: Option<&str>,
+    body: &[u8],
+) -> Result<(AdminMemoryOverride, bool), Box<Response>> {
+    let mut req = if admin_request_is_json(headers) {
+        if body.is_empty() {
+            AdminMemoryRestartRequest::default()
+        } else {
+            serde_json::from_slice::<AdminMemoryRestartRequest>(body).map_err(|_| {
+                Box::new(admin_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid override",
+                ))
+            })?
+        }
+    } else {
+        AdminMemoryRestartRequest::default()
+    };
+    let values = admin_auth_query_values(raw_query);
+    if let Some(raw) = values.get("override").map(String::as_str).map(str::trim)
+        && !raw.is_empty()
+        && let Some(value) = parse_go_bool(raw)
+    {
+        req.override_ = value;
+    }
+    if let Some(raw) = values.get("provider").map(String::as_str).map(str::trim)
+        && !raw.is_empty()
+    {
+        req.provider = raw.to_owned();
+    }
+    if let Some(raw) = values.get("model").map(String::as_str).map(str::trim)
+        && !raw.is_empty()
+    {
+        req.model = raw.to_owned();
+    }
+    let provider = req.provider.trim().to_lowercase();
+    if !matches!(provider.as_str(), "" | "aifarm" | "genkit" | "gemini") {
+        return Err(Box::new(admin_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid override",
+        )));
+    }
+    let model = req.model.trim().to_owned();
+    let explicit = req.override_ || !provider.is_empty() || !model.is_empty();
+    Ok((AdminMemoryOverride { provider, model }, explicit))
+}
+
+fn admin_request_is_json(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| contains_ascii_fold(value, "application/json"))
+}
+
+fn contains_ascii_fold(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    haystack.as_bytes().windows(needle.len()).any(|window| {
+        std::str::from_utf8(window).is_ok_and(|part| part.eq_ignore_ascii_case(needle))
+    })
+}
+
+fn parse_go_bool(value: &str) -> Option<bool> {
+    match value.trim() {
+        "1" => Some(true),
+        "0" => Some(false),
+        value if value.eq_ignore_ascii_case("t") => Some(true),
+        value if value.eq_ignore_ascii_case("true") => Some(true),
+        value if value.eq_ignore_ascii_case("f") => Some(false),
+        value if value.eq_ignore_ascii_case("false") => Some(false),
+        _ => None,
+    }
+}
+
+fn admin_memory_restart_model(model: &str) -> String {
+    let model = model.trim();
+    if model.is_empty() {
+        openplotva_memory::DEFAULT_MEMORY_CONSOLIDATION_MODEL.to_owned()
+    } else {
+        model.to_owned()
+    }
+}
+
+fn normalize_memory_restart_provider(provider: &str) -> String {
+    let provider = provider.trim();
+    if provider.eq_ignore_ascii_case("aifarm") {
+        "aifarm".to_owned()
+    } else if provider.eq_ignore_ascii_case("genkit") {
+        "genkit".to_owned()
+    } else if provider.eq_ignore_ascii_case("gemini") {
+        "gemini".to_owned()
+    } else {
+        provider.to_lowercase()
+    }
+}
+
+fn admin_u64_to_i64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+async fn admin_shield_documents_response(
+    routes: &StaticWebRoutes,
+    method: Method,
+    headers: &HeaderMap,
+    raw_query: Option<&str>,
+    body: &[u8],
+) -> Response {
+    match method {
+        Method::GET => admin_shield_documents_list_response(routes, headers, raw_query).await,
+        Method::POST => admin_shield_document_create_response(routes, headers, body).await,
+        Method::PUT => {
+            admin_shield_document_update_response(routes, headers, raw_query, body).await
+        }
+        Method::DELETE => admin_shield_document_delete_response(routes, headers, raw_query).await,
+        _ => admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed"),
+    }
+}
+
+async fn admin_shield_documents_list_response(
+    routes: &StaticWebRoutes,
+    headers: &HeaderMap,
+    raw_query: Option<&str>,
+) -> Response {
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+        return admin_auth_failure_response(error);
+    }
+    let Some(store) = routes.shield_store.as_ref() else {
+        return admin_json_response(
+            StatusCode::OK,
+            serde_json::json!({ "count": 0, "documents": [] }),
+        );
+    };
+    let values = admin_auth_query_values(raw_query);
+    let filter = openplotva_shield::ListFilter {
+        query: values.get("q").cloned().unwrap_or_default(),
+        include_disabled: parse_admin_optional_bool(
+            values.get("include_disabled").map(String::as_str),
+        )
+        .unwrap_or(false),
+        limit: parse_shield_limit(values.get("limit").map(String::as_str)),
+        offset: 0,
+    };
+    match store.list_documents(&filter).await {
+        Ok(documents) => admin_json_response(
+            StatusCode::OK,
+            serde_json::json!({
+                "count": documents.len(),
+                "documents": documents.iter().map(admin_shield_document_json).collect::<Vec<_>>(),
+            }),
+        ),
+        Err(error) => {
+            tracing::warn!(%error, "failed to list admin shield documents");
+            admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed")
+        }
+    }
+}
+
+async fn admin_shield_document_create_response(
+    routes: &StaticWebRoutes,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Response {
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+        return admin_auth_failure_response(error);
+    }
+    let Some(store) = routes.shield_store.as_ref() else {
+        return admin_error_response(StatusCode::SERVICE_UNAVAILABLE, "shield disabled");
+    };
+    let Ok(req) = serde_json::from_slice::<AdminShieldDocumentRequest>(body) else {
+        return admin_error_response(StatusCode::BAD_REQUEST, "invalid json");
+    };
+    let input =
+        match openplotva_shield::normalize_document_input(admin_shield_document_input(req, true)) {
+            Ok(input) => input,
+            Err(error) => return admin_error_response(StatusCode::BAD_REQUEST, &error.to_string()),
+        };
+    let embedding = admin_shield_embed_title(routes, &input.title).await;
+    match store.create_document(input, embedding.as_ref()).await {
+        Ok(document) => admin_json_response(StatusCode::OK, admin_shield_document_json(&document)),
+        Err(error) => {
+            tracing::warn!(%error, "failed to create admin shield document");
+            admin_error_response(StatusCode::BAD_REQUEST, &error.to_string())
+        }
+    }
+}
+
+async fn admin_shield_document_update_response(
+    routes: &StaticWebRoutes,
+    headers: &HeaderMap,
+    raw_query: Option<&str>,
+    body: &[u8],
+) -> Response {
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+        return admin_auth_failure_response(error);
+    }
+    let Some(store) = routes.shield_store.as_ref() else {
+        return admin_error_response(StatusCode::SERVICE_UNAVAILABLE, "shield disabled");
+    };
+    let Ok(req) = serde_json::from_slice::<AdminShieldDocumentRequest>(body) else {
+        return admin_error_response(StatusCode::BAD_REQUEST, "invalid json");
+    };
+    let values = admin_auth_query_values(raw_query);
+    let mut id = req.id;
+    if let Some(raw_id) = values
+        .get("id")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    {
+        let Ok(parsed) = raw_id.parse::<i64>() else {
+            return admin_error_response(StatusCode::BAD_REQUEST, "invalid id");
+        };
+        if parsed <= 0 {
+            return admin_error_response(StatusCode::BAD_REQUEST, "invalid id");
+        }
+        id = parsed;
+    }
+    if id <= 0 {
+        return admin_error_response(StatusCode::BAD_REQUEST, "id required");
+    }
+    let input = match openplotva_shield::normalize_document_input(admin_shield_document_input(
+        req, false,
+    )) {
+        Ok(input) => input,
+        Err(error) => return admin_error_response(StatusCode::BAD_REQUEST, &error.to_string()),
+    };
+    let embedding = admin_shield_embed_title(routes, &input.title).await;
+    match store.update_document(id, input, embedding.as_ref()).await {
+        Ok(document) => admin_json_response(StatusCode::OK, admin_shield_document_json(&document)),
+        Err(error) => {
+            tracing::warn!(%error, id, "failed to update admin shield document");
+            admin_error_response(StatusCode::BAD_REQUEST, &error.to_string())
+        }
+    }
+}
+
+async fn admin_shield_document_delete_response(
+    routes: &StaticWebRoutes,
+    headers: &HeaderMap,
+    raw_query: Option<&str>,
+) -> Response {
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+        return admin_auth_failure_response(error);
+    }
+    let values = admin_auth_query_values(raw_query);
+    let id = match admin_required_i64(&values, "id", "id required", "id required") {
+        Ok(value) if value > 0 => value,
+        Ok(_) => return admin_error_response(StatusCode::BAD_REQUEST, "id required"),
+        Err(response) => return *response,
+    };
+    if let Some(store) = routes.shield_store.as_ref()
+        && let Err(error) = store.delete_document(id).await
+    {
+        tracing::warn!(%error, id, "failed to delete admin shield document");
+        return admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed");
+    }
+    admin_json_response(StatusCode::OK, serde_json::json!({ "ok": true }))
+}
+
+async fn admin_shield_embeddings_rebuild_response(
+    routes: &StaticWebRoutes,
+    method: Method,
+    headers: &HeaderMap,
+) -> Response {
+    if method != Method::POST {
+        return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+    }
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+        return admin_auth_failure_response(error);
+    }
+    let Some(store) = routes.shield_store.as_ref() else {
+        return admin_error_response(StatusCode::SERVICE_UNAVAILABLE, "shield disabled");
+    };
+    let Some(embedder) = routes.shield_embedder.as_ref() else {
+        return admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed");
+    };
+    let documents = match store
+        .documents_without_embeddings(routes.shield_options.rebuild_batch_size)
+        .await
+    {
+        Ok(documents) => documents,
+        Err(error) => {
+            tracing::warn!(%error, "failed to list shield documents without embeddings");
+            return admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed");
+        }
+    };
+    let mut processed = 0_i32;
+    let mut failed = 0_i32;
+    for document in documents {
+        processed += 1;
+        let embedding = match embedder
+            .embed_one(
+                document.title.trim(),
+                routes.shield_options.embedding_dim,
+                openplotva_shield::TITLE_EMBEDDING_TASK,
+            )
+            .await
+        {
+            Ok(embedding) => embedding,
+            Err(error) => {
+                failed += 1;
+                tracing::warn!(
+                    %error,
+                    document_id = document.id,
+                    "shield title embedding rebuild failed"
+                );
+                continue;
+            }
+        };
+        if let Err(error) = store
+            .update_embedding(document.id, embedding.as_ref())
+            .await
+        {
+            failed += 1;
+            tracing::warn!(
+                %error,
+                document_id = document.id,
+                "shield embedding update failed"
+            );
+        }
+    }
+    admin_json_response(
+        StatusCode::OK,
+        serde_json::json!({ "ok": true, "processed": processed, "failed": failed }),
+    )
+}
+
+async fn admin_shield_test_response(
+    routes: &StaticWebRoutes,
+    method: Method,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Response {
+    if method != Method::POST {
+        return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+    }
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+        return admin_auth_failure_response(error);
+    }
+    let Some(store) = routes.shield_store.as_ref() else {
+        return admin_error_response(StatusCode::SERVICE_UNAVAILABLE, "shield disabled");
+    };
+    let Ok(req) = serde_json::from_slice::<AdminShieldTestRequest>(body) else {
+        return admin_error_response(StatusCode::BAD_REQUEST, "invalid json");
+    };
+    if req.query.trim().is_empty() {
+        return admin_error_response(StatusCode::BAD_REQUEST, "query required");
+    }
+    let request = openplotva_shield::SearchRequest {
+        query: req.query.clone(),
+        max_matches: req.max_matches,
+        include_candidates: req.debug,
+    };
+    let embedding = admin_shield_embed_query(routes, &req.query).await;
+    match store
+        .search_with_vector(&request, &routes.shield_options, embedding.as_ref())
+        .await
+    {
+        Ok(result) => admin_json_response(
+            StatusCode::OK,
+            admin_shield_test_json(&result, &req.expected_category),
+        ),
+        Err(error) => {
+            tracing::warn!(%error, "failed to test admin shield query");
+            admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed")
+        }
+    }
+}
+
+fn admin_shield_document_input(
+    req: AdminShieldDocumentRequest,
+    default_enabled: bool,
+) -> openplotva_shield::DocumentInput {
+    openplotva_shield::DocumentInput {
+        slug: req.slug,
+        title: req.title,
+        body: req.body,
+        category: req.category,
+        enabled: req.enabled.unwrap_or(default_enabled),
+        priority: req.priority,
+    }
+}
+
+async fn admin_shield_embed_title(
+    routes: &StaticWebRoutes,
+    title: &str,
+) -> Option<openplotva_storage::PgEmbeddingVector> {
+    let embedder = routes.shield_embedder.as_ref()?;
+    match embedder
+        .embed_one(
+            title.trim(),
+            routes.shield_options.embedding_dim,
+            openplotva_shield::TITLE_EMBEDDING_TASK,
+        )
+        .await
+    {
+        Ok(embedding) => embedding,
+        Err(error) => {
+            tracing::warn!(%error, "shield title embedding failed; storing lexical-only document");
+            None
+        }
+    }
+}
+
+async fn admin_shield_embed_query(
+    routes: &StaticWebRoutes,
+    query: &str,
+) -> Option<openplotva_storage::PgEmbeddingVector> {
+    let embedder = routes.shield_embedder.as_ref()?;
+    match embedder
+        .embed_one(
+            query,
+            routes.shield_options.embedding_dim,
+            openplotva_shield::QUERY_EMBEDDING_TASK,
+        )
+        .await
+    {
+        Ok(embedding) => embedding,
+        Err(error) => {
+            tracing::warn!(%error, "shield embedding failed; using lexical-only retrieval");
+            None
+        }
+    }
+}
+
+fn parse_shield_limit(raw: Option<&str>) -> i32 {
+    parse_admin_positive_i32(raw, 100, 500)
+}
+
+fn admin_shield_category_matched(matches: &[openplotva_shield::Match], expected: &str) -> bool {
+    let expected = expected.trim();
+    if expected.is_empty() {
+        return false;
+    }
+    matches
+        .iter()
+        .any(|item| item.document.category.trim().eq_ignore_ascii_case(expected))
+}
+
+fn admin_shield_document_json(document: &openplotva_shield::Document) -> serde_json::Value {
+    serde_json::json!({
+        "id": document.id,
+        "slug": document.slug,
+        "title": document.title,
+        "body": document.body,
+        "category": document.category,
+        "enabled": document.enabled,
+        "priority": document.priority,
+        "created_at": admin_time_json(document.created_at),
+        "updated_at": admin_time_json(document.updated_at),
+    })
+}
+
+fn admin_shield_scored_document_json(
+    item: &openplotva_shield::ScoredDocument,
+) -> serde_json::Value {
+    serde_json::json!({
+        "document": admin_shield_document_json(&item.document),
+        "lexical_score": item.lexical_score,
+        "vector_score": item.vector_score,
+    })
+}
+
+fn admin_shield_candidate_json(candidate: &openplotva_shield::Candidate) -> serde_json::Value {
+    let mut value = serde_json::Map::new();
+    value.insert(
+        "document".to_owned(),
+        admin_shield_document_json(&candidate.document),
+    );
+    value.insert(
+        "lexical_score".to_owned(),
+        serde_json::json!(candidate.lexical_score),
+    );
+    value.insert(
+        "vector_score".to_owned(),
+        serde_json::json!(candidate.vector_score),
+    );
+    value.insert("matched".to_owned(), serde_json::json!(candidate.matched));
+    if !candidate.signals.is_empty() {
+        value.insert("signals".to_owned(), serde_json::json!(candidate.signals));
+    }
+    serde_json::Value::Object(value)
+}
+
+fn admin_shield_test_json(
+    result: &openplotva_shield::SearchResult,
+    expected_category: &str,
+) -> serde_json::Value {
+    let mut value = serde_json::Map::new();
+    value.insert("query".to_owned(), serde_json::json!(result.query));
+    value.insert(
+        "matches".to_owned(),
+        serde_json::json!(
+            result
+                .matches
+                .iter()
+                .map(admin_shield_scored_document_json)
+                .collect::<Vec<_>>()
+        ),
+    );
+    value.insert("context".to_owned(), serde_json::json!(result.context));
+    value.insert(
+        "lexical_only".to_owned(),
+        serde_json::json!(result.lexical_only),
+    );
+    if !result.candidates.is_empty() {
+        value.insert(
+            "candidates".to_owned(),
+            serde_json::json!(
+                result
+                    .candidates
+                    .iter()
+                    .map(admin_shield_candidate_json)
+                    .collect::<Vec<_>>()
+            ),
+        );
+    }
+    if let Some(debug) = result.debug.as_ref() {
+        value.insert(
+            "debug".to_owned(),
+            serde_json::json!({
+                "max_matches": debug.max_matches,
+                "candidate_limit": debug.candidate_limit,
+                "lexical_min_score": debug.lexical_min_score,
+                "vector_min_score": debug.vector_min_score,
+            }),
+        );
+    }
+    let expected = expected_category.trim();
+    if !expected.is_empty() {
+        value.insert("expected_category".to_owned(), serde_json::json!(expected));
+        value.insert(
+            "category_matched".to_owned(),
+            serde_json::json!(admin_shield_category_matched(&result.matches, expected)),
+        );
+    }
+    serde_json::Value::Object(value)
+}
+
+fn admin_taskman_jobs_response(
+    routes: &StaticWebRoutes,
+    method: Method,
+    headers: &HeaderMap,
+    raw_query: Option<&str>,
+) -> Response {
+    if method != Method::GET {
+        return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+    }
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+        return admin_auth_failure_response(error);
+    }
+    if !routes.taskman_inspector.is_configured() {
+        return admin_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "task manager not configured",
+        );
+    }
+    let filter = match admin_taskman_jobs_filter(raw_query) {
+        Ok(filter) => filter,
+        Err(response) => return *response,
+    };
+    match openplotva_server::RuntimeTaskmanInspector::list_jobs(&routes.taskman_inspector, filter) {
+        Ok(result) => {
+            admin_json_no_cache_response(StatusCode::OK, admin_taskman_list_json(&result))
+        }
+        Err(error) => {
+            tracing::warn!(%error, "failed to list admin taskman jobs");
+            admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed")
+        }
+    }
+}
+
+fn admin_taskman_jobs_clear_response(
+    routes: &StaticWebRoutes,
+    method: Method,
+    headers: &HeaderMap,
+    raw_query: Option<&str>,
+) -> Response {
+    if method != Method::POST && method != Method::DELETE {
+        return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+    }
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+        return admin_auth_failure_response(error);
+    }
+    if !routes.taskman_inspector.is_configured() {
+        return admin_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "task manager not configured",
+        );
+    }
+    let mut filter = match admin_taskman_jobs_filter(raw_query) {
+        Ok(filter) => filter,
+        Err(response) => return *response,
+    };
+    filter.offset = 0;
+    filter.limit = 0;
+    match routes.taskman_inspector.delete_jobs(filter) {
+        Ok(result) => admin_json_response(
+            StatusCode::OK,
+            serde_json::json!({
+                "ok": true,
+                "matched": result.matched,
+                "deleted": result.deleted,
+                "deleted_active": result.deleted_active,
+                "skipped_active": result.skipped_active,
+            }),
+        ),
+        Err(error) => {
+            tracing::warn!(%error, "failed to clear admin taskman jobs");
+            admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed")
+        }
+    }
+}
+
+fn admin_taskman_job_response(
+    routes: &StaticWebRoutes,
+    method: Method,
+    headers: &HeaderMap,
+    raw_query: Option<&str>,
+) -> Response {
+    if method != Method::GET {
+        return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+    }
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+        return admin_auth_failure_response(error);
+    }
+    if !routes.taskman_inspector.is_configured() {
+        return admin_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "task manager not configured",
+        );
+    }
+    let job_id = match admin_taskman_job_id(raw_query) {
+        Ok(job_id) => job_id,
+        Err(response) => return *response,
+    };
+    match openplotva_server::RuntimeTaskmanInspector::job(&routes.taskman_inspector, job_id) {
+        Ok(Some(details)) => {
+            admin_json_no_cache_response(StatusCode::OK, admin_taskman_details_json(&details))
+        }
+        Ok(None) => admin_error_response(StatusCode::NOT_FOUND, "not found"),
+        Err(error) => {
+            tracing::warn!(%error, job_id, "failed to load admin taskman job");
+            admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed")
+        }
+    }
+}
+
+fn admin_taskman_job_cancel_response(
+    routes: &StaticWebRoutes,
+    method: Method,
+    headers: &HeaderMap,
+    raw_query: Option<&str>,
+) -> Response {
+    if method != Method::POST && method != Method::PUT {
+        return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+    }
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+        return admin_auth_failure_response(error);
+    }
+    if !routes.taskman_inspector.is_configured() {
+        return admin_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "task manager not configured",
+        );
+    }
+    let job_id = match admin_taskman_job_id(raw_query) {
+        Ok(job_id) => job_id,
+        Err(response) => return *response,
+    };
+    match routes.taskman_inspector.cancel_job(job_id) {
+        Ok(()) => admin_json_response(StatusCode::OK, serde_json::json!({ "ok": true })),
+        Err(error) => {
+            tracing::warn!(%error, job_id, "failed to cancel admin taskman job");
+            admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed")
+        }
+    }
+}
+
+fn admin_taskman_job_restart_response(
+    routes: &StaticWebRoutes,
+    method: Method,
+    headers: &HeaderMap,
+    raw_query: Option<&str>,
+) -> Response {
+    if method != Method::POST && method != Method::PUT {
+        return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+    }
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+        return admin_auth_failure_response(error);
+    }
+    if !routes.taskman_inspector.is_configured() {
+        return admin_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "task manager not configured",
+        );
+    }
+    let job_id = match admin_taskman_job_id(raw_query) {
+        Ok(job_id) => job_id,
+        Err(response) => return *response,
+    };
+    match routes.taskman_inspector.restart_job(job_id) {
+        Ok(new_job_id) => admin_json_response(
+            StatusCode::OK,
+            serde_json::json!({ "ok": true, "new_job_id": new_job_id }),
+        ),
+        Err(error) => {
+            tracing::warn!(%error, job_id, "failed to restart admin taskman job");
+            admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed")
+        }
+    }
+}
+
+fn admin_taskman_jobs_filter(
+    raw_query: Option<&str>,
+) -> Result<openplotva_server::RuntimeTaskmanJobsFilter, Box<Response>> {
+    let values = admin_auth_query_values(raw_query);
+    Ok(openplotva_server::RuntimeTaskmanJobsFilter {
+        q: values
+            .get("q")
+            .map(|value| value.trim().to_owned())
+            .unwrap_or_default(),
+        status: admin_taskman_csv_values(&values, "status")
+            .into_iter()
+            .map(|status| {
+                admin_taskman_valid_choice(
+                    &status,
+                    &["pending", "processing", "completed", "failed", "cancelled"],
+                    "invalid status",
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        queue: admin_taskman_csv_values(&values, "queue"),
+        user_id: admin_taskman_i64(&values, "user_id", "invalid user_id")?,
+        chat_id: admin_taskman_i64(&values, "chat_id", "invalid chat_id")?,
+        time_field: values
+            .get("time_field")
+            .map(|value| {
+                admin_taskman_optional_choice(
+                    value,
+                    &["created_at", "started_at", "completed_at"],
+                    "invalid time_field",
+                )
+            })
+            .transpose()?
+            .unwrap_or_default(),
+        from: values
+            .get("from")
+            .map(|value| admin_taskman_time(value, "invalid from"))
+            .transpose()?
+            .unwrap_or_default(),
+        to: values
+            .get("to")
+            .map(|value| admin_taskman_time(value, "invalid to"))
+            .transpose()?
+            .unwrap_or_default(),
+        sort_by: values
+            .get("sort_by")
+            .map(|value| {
+                admin_taskman_optional_choice(
+                    value,
+                    &["id", "priority", "created_at", "started_at", "completed_at"],
+                    "invalid sort_by",
+                )
+            })
+            .transpose()?
+            .unwrap_or_default(),
+        sort_dir: values
+            .get("sort_dir")
+            .map(|value| admin_taskman_optional_choice(value, &["asc", "desc"], "invalid sort_dir"))
+            .transpose()?
+            .unwrap_or_default(),
+        offset: admin_taskman_i32(&values, "offset", "invalid offset")?.unwrap_or_default(),
+        limit: admin_taskman_i32(&values, "limit", "invalid limit")?.unwrap_or_default(),
+    })
+}
+
+fn admin_taskman_job_id(raw_query: Option<&str>) -> Result<i64, Box<Response>> {
+    let values = admin_auth_query_values(raw_query);
+    let raw = values
+        .get("job_id")
+        .or_else(|| values.get("id"))
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            Box::new(admin_error_response(
+                StatusCode::BAD_REQUEST,
+                "job_id required",
+            ))
+        })?;
+    let id = raw.parse::<i64>().map_err(|_| {
+        Box::new(admin_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid job_id",
+        ))
+    })?;
+    if id <= 0 {
+        return Err(Box::new(admin_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid job_id",
+        )));
+    }
+    Ok(id)
+}
+
+fn admin_taskman_csv_values(values: &BTreeMap<String, String>, key: &str) -> Vec<String> {
+    values
+        .get(key)
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn admin_taskman_i64(
+    values: &BTreeMap<String, String>,
+    key: &str,
+    invalid: &str,
+) -> Result<Option<i64>, Box<Response>> {
+    let Some(value) = values
+        .get(key)
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    value
+        .parse::<i64>()
+        .map(Some)
+        .map_err(|_| Box::new(admin_error_response(StatusCode::BAD_REQUEST, invalid)))
+}
+
+fn admin_taskman_i32(
+    values: &BTreeMap<String, String>,
+    key: &str,
+    invalid: &str,
+) -> Result<Option<i32>, Box<Response>> {
+    let Some(value) = values
+        .get(key)
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    value
+        .parse::<i32>()
+        .map(Some)
+        .map_err(|_| Box::new(admin_error_response(StatusCode::BAD_REQUEST, invalid)))
+}
+
+fn admin_taskman_optional_choice(
+    value: &str,
+    allowed: &[&str],
+    invalid: &str,
+) -> Result<String, Box<Response>> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(String::new());
+    }
+    admin_taskman_valid_choice(value, allowed, invalid)
+}
+
+fn admin_taskman_valid_choice(
+    value: &str,
+    allowed: &[&str],
+    invalid: &str,
+) -> Result<String, Box<Response>> {
+    if allowed.contains(&value) {
+        Ok(value.to_owned())
+    } else {
+        Err(Box::new(admin_error_response(
+            StatusCode::BAD_REQUEST,
+            invalid,
+        )))
+    }
+}
+
+fn admin_taskman_time(value: &str, invalid: &str) -> Result<String, Box<Response>> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(String::new());
+    }
+    if let Ok(parsed) = OffsetDateTime::parse(value, &Rfc3339) {
+        return Ok(admin_format_time(parsed));
+    }
+    if let Ok(timestamp) = value.parse::<i64>()
+        && let Ok(parsed) = OffsetDateTime::from_unix_timestamp(timestamp)
+    {
+        return Ok(admin_format_time(parsed));
+    }
+    Err(Box::new(admin_error_response(
+        StatusCode::BAD_REQUEST,
+        invalid,
+    )))
+}
+
+fn admin_taskman_list_json(
+    result: &openplotva_server::RuntimeTaskmanJobListResultData,
+) -> serde_json::Value {
+    serde_json::json!({
+        "total": result.total,
+        "offset": result.offset,
+        "limit": result.limit,
+        "summary": {
+            "by_status": result.summary.by_status,
+            "by_queue": result.summary.by_queue,
+        },
+        "items": result.items.iter().map(admin_taskman_list_entry_json).collect::<Vec<_>>(),
+    })
+}
+
+fn admin_taskman_list_entry_json(
+    item: &openplotva_server::RuntimeTaskmanJobListEntryData,
+) -> serde_json::Value {
+    let mut value = admin_taskman_job_base_json(
+        item.id,
+        &item.queue_name,
+        item.priority,
+        &item.title,
+        Some(serde_json::json!(item.job_type)),
+        &item.status,
+        item.user_id,
+        item.chat_id,
+        item.trigger_message_id,
+        item.thread_message_id,
+        item.progress_message_id,
+        item.queue_position_message_id,
+        item.result_message_id,
+        item.worker_id.as_deref(),
+        &item.created_at,
+        item.started_at.as_deref(),
+        item.completed_at.as_deref(),
+        item.error_message.as_deref(),
+        item.processing_timeout_seconds,
+        item.prompt_hash.as_deref(),
+        item.estimated_processing_time,
+        item.actual_processing_time,
+    );
+    if let Some(preview) = item.preview.as_deref().filter(|value| !value.is_empty()) {
+        value.insert("preview".to_owned(), serde_json::json!(preview));
+    }
+    serde_json::Value::Object(value)
+}
+
+fn admin_taskman_details_json(
+    details: &openplotva_server::RuntimeTaskmanJobDetailsData,
+) -> serde_json::Value {
+    let mut value = serde_json::Map::new();
+    value.insert("job".to_owned(), admin_taskman_job_json(&details.job));
+    value.insert(
+        "messages".to_owned(),
+        serde_json::json!(
+            details
+                .messages
+                .iter()
+                .map(admin_taskman_message_json)
+                .collect::<Vec<_>>()
+        ),
+    );
+    if let Some(events) = details.events.as_ref() {
+        value.insert("events".to_owned(), events.clone());
+    }
+    serde_json::Value::Object(value)
+}
+
+fn admin_taskman_job_json(job: &openplotva_server::RuntimeTaskmanJobData) -> serde_json::Value {
+    serde_json::Value::Object(admin_taskman_job_base_json(
+        job.id,
+        &job.queue_name,
+        job.priority,
+        &job.title,
+        job.payload.clone(),
+        &job.status,
+        job.user_id,
+        job.chat_id,
+        job.trigger_message_id,
+        job.thread_message_id,
+        job.progress_message_id,
+        job.queue_position_message_id,
+        job.result_message_id,
+        job.worker_id.as_deref(),
+        &job.created_at,
+        job.started_at.as_deref(),
+        job.completed_at.as_deref(),
+        job.error_message.as_deref(),
+        job.processing_timeout_seconds,
+        job.prompt_hash.as_deref(),
+        job.estimated_processing_time,
+        job.actual_processing_time,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn admin_taskman_job_base_json(
+    id: i64,
+    queue_name: &str,
+    priority: i32,
+    title: &str,
+    payload_or_type: Option<serde_json::Value>,
+    status: &str,
+    user_id: i64,
+    chat_id: i64,
+    trigger_message_id: i32,
+    thread_message_id: Option<i32>,
+    progress_message_id: Option<i32>,
+    queue_position_message_id: Option<i32>,
+    result_message_id: Option<i32>,
+    worker_id: Option<&str>,
+    created_at: &str,
+    started_at: Option<&str>,
+    completed_at: Option<&str>,
+    error_message: Option<&str>,
+    processing_timeout_seconds: i32,
+    prompt_hash: Option<&str>,
+    estimated_processing_time: Option<i32>,
+    actual_processing_time: Option<i32>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut value = serde_json::Map::new();
+    value.insert("id".to_owned(), serde_json::json!(id));
+    value.insert("queue_name".to_owned(), serde_json::json!(queue_name));
+    value.insert("priority".to_owned(), serde_json::json!(priority));
+    value.insert("title".to_owned(), serde_json::json!(title));
+    if let Some(payload_or_type) = payload_or_type {
+        let key = if payload_or_type.is_string() {
+            "job_type"
+        } else {
+            "payload"
+        };
+        value.insert(key.to_owned(), payload_or_type);
+    }
+    value.insert("status".to_owned(), serde_json::json!(status));
+    value.insert("user_id".to_owned(), serde_json::json!(user_id));
+    value.insert("chat_id".to_owned(), serde_json::json!(chat_id));
+    value.insert(
+        "trigger_message_id".to_owned(),
+        serde_json::json!(trigger_message_id),
+    );
+    admin_insert_i32_option(&mut value, "thread_message_id", thread_message_id);
+    admin_insert_i32_option(&mut value, "progress_message_id", progress_message_id);
+    admin_insert_i32_option(
+        &mut value,
+        "queue_position_message_id",
+        queue_position_message_id,
+    );
+    admin_insert_i32_option(&mut value, "result_message_id", result_message_id);
+    admin_insert_str_option(&mut value, "worker_id", worker_id);
+    value.insert("created_at".to_owned(), serde_json::json!(created_at));
+    admin_insert_str_option(&mut value, "started_at", started_at);
+    admin_insert_str_option(&mut value, "completed_at", completed_at);
+    admin_insert_str_option(&mut value, "error_message", error_message);
+    value.insert(
+        "processing_timeout_seconds".to_owned(),
+        serde_json::json!(processing_timeout_seconds),
+    );
+    admin_insert_str_option(&mut value, "prompt_hash", prompt_hash);
+    admin_insert_i32_option(
+        &mut value,
+        "estimated_processing_time",
+        estimated_processing_time,
+    );
+    admin_insert_i32_option(&mut value, "actual_processing_time", actual_processing_time);
+    value
+}
+
+fn admin_taskman_message_json(
+    message: &openplotva_server::RuntimeTaskmanJobMessageData,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": message.id,
+        "job_id": message.job_id,
+        "message_type": message.message_type,
+        "chat_id": message.chat_id,
+        "message_id": message.message_id,
+        "created_at": message.created_at,
+        "status": message.status,
+    })
+}
+
+fn admin_insert_i32_option(
+    value: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    item: Option<i32>,
+) {
+    if let Some(item) = item {
+        value.insert(key.to_owned(), serde_json::json!(item));
+    }
+}
+
+fn admin_insert_str_option(
+    value: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    item: Option<&str>,
+) {
+    if let Some(item) = item {
+        value.insert(key.to_owned(), serde_json::json!(item));
+    }
+}
+
+async fn admin_chat_get_response(
+    routes: &StaticWebRoutes,
+    method: Method,
+    headers: &HeaderMap,
+    raw_query: Option<&str>,
+) -> Response {
+    if method != Method::GET {
+        return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+    }
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+        return admin_auth_failure_response(error);
+    }
+    let values = admin_auth_query_values(raw_query);
+    let chat_id =
+        match admin_required_i64(&values, "chat_id", "chat_id required", "invalid chat_id") {
+            Ok(value) => value,
+            Err(response) => return *response,
+        };
+    let Some(pool) = routes.postgres.as_ref() else {
+        return admin_json_response(
+            StatusCode::OK,
+            serde_json::json!({
+                "info": null,
+                "settings": null,
+                "permissions": null,
+                "members_count": 0,
+                "blocked": false,
+            }),
+        );
+    };
+    sync_admin_members_for_web(routes, chat_id).await;
+    let info = admin_fetch_optional_json(pool, SQL_ADMIN_GET_CHAT, chat_id, admin_chat_json).await;
+    let settings = admin_fetch_optional_json(
+        pool,
+        SQL_ADMIN_GET_CHAT_SETTINGS,
+        chat_id,
+        admin_settings_json,
+    )
+    .await;
+    let permissions = admin_fetch_optional_json(
+        pool,
+        SQL_ADMIN_GET_CHAT_PERMISSIONS,
+        chat_id,
+        admin_permissions_json,
+    )
+    .await;
+    let members_count = sqlx::query_scalar::<_, i64>(SQL_ADMIN_COUNT_CHAT_MEMBERS)
+        .bind(chat_id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(0);
+    let blocked = match routes.redis.clone() {
+        Some(redis) => RedisBlockedChatStore::new(redis)
+            .blocked_until(chat_id)
+            .await
+            .ok()
+            .flatten()
+            .is_some(),
+        None => false,
+    };
+    admin_json_response(
+        StatusCode::OK,
+        serde_json::json!({
+            "info": info,
+            "settings": settings,
+            "permissions": permissions,
+            "members_count": members_count,
+            "blocked": blocked,
+        }),
+    )
+}
+
+async fn admin_chat_settings_response(
+    routes: &StaticWebRoutes,
+    method: Method,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Response {
+    if method != Method::POST && method != Method::PUT {
+        return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+    }
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+        return admin_auth_failure_response(error);
+    }
+    let Ok(mut req) = serde_json::from_slice::<AdminChatSettingsUpdateRequest>(body) else {
+        return admin_error_response(StatusCode::BAD_REQUEST, "bad request");
+    };
+    if req.chat_id == 0 {
+        return admin_error_response(StatusCode::BAD_REQUEST, "chat_id required");
+    }
+    req.custom_persona = openplotva_web::truncate_custom_persona(req.custom_persona.take());
+    let Some(settings_store) = routes.settings_store.as_ref() else {
+        return admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed");
+    };
+    let cur = settings_store
+        .get_chat_settings(req.chat_id)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| openplotva_core::ChatSettings::defaults(req.chat_id));
+    let chat_type = admin_chat_type(routes, req.chat_id).await;
+    let update = openplotva_core::ChatSettingsUpdate {
+        chat_id: req.chat_id,
+        chat_type,
+        mood_alignment: req.mood_alignment,
+        custom_persona: req.custom_persona,
+        reactivity_percentage: req
+            .reactivity_percentage
+            .unwrap_or(cur.reactivity_percentage),
+        proactivity_percentage: req
+            .proactivity_percentage
+            .unwrap_or(cur.proactivity_percentage),
+        enable_global_text_reply: req
+            .enable_global_text_reply
+            .unwrap_or(cur.enable_global_text_reply),
+        enable_global_draw_reply: req
+            .enable_global_draw_reply
+            .unwrap_or(cur.enable_global_draw_reply),
+        enable_obscenifier: req.enable_obscenifier.unwrap_or(cur.enable_obscenifier),
+        enable_profanity: req.enable_profanity.unwrap_or(cur.enable_profanity),
+        enable_greet_joiners: req.enable_greet_joiners.unwrap_or(cur.enable_greet_joiners),
+        enable_daily_game: req
+            .enable_daily_game
+            .unwrap_or_else(|| cur.enable_daily_game.unwrap_or(true)),
+        daily_game_theme: req
+            .daily_game_theme
+            .unwrap_or_else(|| cur.daily_game_theme.unwrap_or_default()),
+        greeting_html: req.greeting_html,
+    };
+    match settings_store.upsert_chat_settings(&update).await {
+        Ok(()) => admin_json_response(StatusCode::OK, serde_json::json!({ "ok": true })),
+        Err(error) => {
+            tracing::warn!(%error, chat_id = req.chat_id, "failed to update admin chat settings");
+            admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed")
+        }
+    }
+}
+
+async fn admin_chat_block_response(
+    routes: &StaticWebRoutes,
+    method: Method,
+    headers: &HeaderMap,
+    raw_query: Option<&str>,
+) -> Response {
+    if method != Method::POST {
+        return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+    }
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+        return admin_auth_failure_response(error);
+    }
+    let values = admin_auth_query_values(raw_query);
+    let chat_id =
+        match admin_required_i64(&values, "chat_id", "chat_id required", "invalid chat_id") {
+            Ok(value) => value,
+            Err(response) => return *response,
+        };
+    let minutes = values
+        .get("minutes")
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(10);
+    let until = OffsetDateTime::now_utc() + time::Duration::minutes(minutes);
+    let Some(redis) = routes.redis.clone() else {
+        return admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed");
+    };
+    let ttl = Duration::from_secs((minutes as u64).saturating_mul(60));
+    match RedisBlockedChatStore::new(redis)
+        .block_chat_until_with_ttl(chat_id, until, ttl)
+        .await
+    {
+        Ok(()) => admin_json_response(
+            StatusCode::OK,
+            serde_json::json!({ "ok": true, "until": admin_format_time(until) }),
+        ),
+        Err(error) => {
+            tracing::warn!(%error, chat_id, "failed to block chat from admin web");
+            admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed")
+        }
+    }
+}
+
+async fn admin_chat_unblock_response(
+    routes: &StaticWebRoutes,
+    method: Method,
+    headers: &HeaderMap,
+    raw_query: Option<&str>,
+) -> Response {
+    if method != Method::DELETE {
+        return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+    }
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+        return admin_auth_failure_response(error);
+    }
+    let values = admin_auth_query_values(raw_query);
+    let chat_id =
+        match admin_required_i64(&values, "chat_id", "chat_id required", "invalid chat_id") {
+            Ok(value) => value,
+            Err(response) => return *response,
+        };
+    let Some(redis) = routes.redis_inspector() else {
+        return admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed");
+    };
+    let Some(redis_client) = routes.redis.clone() else {
+        return admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed");
+    };
+    let key = RedisBlockedChatStore::new(redis_client).key_for_chat(chat_id);
+    match redis.delete_key(&key).await {
+        Ok(()) => admin_json_response(StatusCode::OK, serde_json::json!({ "ok": true })),
+        Err(error) => {
+            tracing::warn!(%error, chat_id, "failed to unblock chat from admin web");
+            admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed")
+        }
+    }
+}
+
+async fn admin_chat_members_response(
+    routes: &StaticWebRoutes,
+    method: Method,
+    headers: &HeaderMap,
+    raw_query: Option<&str>,
+) -> Response {
+    if method != Method::GET {
+        return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+    }
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+        return admin_auth_failure_response(error);
+    }
+    let values = admin_auth_query_values(raw_query);
+    let chat_id =
+        match admin_required_i64(&values, "chat_id", "chat_id required", "invalid chat_id") {
+            Ok(value) => value,
+            Err(response) => return *response,
+        };
+    let Some(pool) = routes.postgres.as_ref() else {
+        return admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed to load members");
+    };
+    sync_admin_members_for_web(routes, chat_id).await;
+    match sqlx::query(SQL_ADMIN_LIST_CHAT_MEMBERS_WITH_USERS)
+        .bind(chat_id)
+        .fetch_all(pool)
+        .await
+    {
+        Ok(rows) => {
+            let members = rows
+                .into_iter()
+                .map(|row| {
+                    serde_json::json!({
+                        "member": admin_chat_member_prefixed_json(&row),
+                        "user": admin_user_prefixed_json(&row),
+                    })
+                })
+                .collect::<Vec<_>>();
+            admin_json_response(StatusCode::OK, serde_json::json!({ "members": members }))
+        }
+        Err(error) => {
+            tracing::warn!(%error, chat_id, "failed to list admin chat members");
+            admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed to load members")
+        }
+    }
+}
+
+async fn sync_admin_members_for_web(routes: &StaticWebRoutes, chat_id: i64) {
+    let (Some(member_store), Some(telegram)) = (&routes.member_store, &routes.telegram) else {
+        return;
+    };
+    match settings::sync_chat_admins_with_sources(member_store, telegram, chat_id).await {
+        Ok(report) => tracing::debug!(
+            chat_id,
+            source = ?report.source,
+            admin_count = report.admin_count,
+            member_upsert_errors = report.member_upsert_errors,
+            user_upsert_errors = report.user_upsert_errors,
+            cache_errors = report.cache_errors,
+            "refreshed admin members for web route"
+        ),
+        Err(error) => {
+            tracing::debug!(%error, chat_id, "Telegram admin freshness failed for web route");
+        }
+    }
+}
+
+async fn admin_chats_list_response(
+    routes: &StaticWebRoutes,
+    method: Method,
+    headers: &HeaderMap,
+    raw_query: Option<&str>,
+) -> Response {
+    if method != Method::GET {
+        return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+    }
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+        return admin_auth_failure_response(error);
+    }
+    let Some(pool) = routes.postgres.as_ref() else {
+        return admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed");
+    };
+    let q = admin_auth_query_values(raw_query)
+        .remove("q")
+        .map(|value| value.trim().to_lowercase())
+        .filter(|value| !value.is_empty());
+    let rows = match q.as_deref() {
+        Some(search) => {
+            sqlx::query(SQL_ADMIN_LIST_CHATS_FILTERED)
+                .bind(search)
+                .bind(ADMIN_PAGE_LIMIT)
+                .bind(0_i64)
+                .fetch_all(pool)
+                .await
+        }
+        None => sqlx::query(SQL_ADMIN_LIST_CHATS).fetch_all(pool).await,
+    };
+    match rows {
+        Ok(rows) => admin_json_response(
+            StatusCode::OK,
+            serde_json::json!({ "chats": rows.iter().map(admin_chat_json).collect::<Vec<_>>() }),
+        ),
+        Err(error) => {
+            tracing::warn!(%error, "failed to list admin chats");
+            admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed")
+        }
+    }
+}
+
+async fn admin_chats_search_by_member_response(
+    routes: &StaticWebRoutes,
+    method: Method,
+    headers: &HeaderMap,
+    raw_query: Option<&str>,
+) -> Response {
+    if method != Method::GET {
+        return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+    }
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+        return admin_auth_failure_response(error);
+    }
+    let values = admin_auth_query_values(raw_query);
+    let username = values
+        .get("username")
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    let user_id = values
+        .get("user_id")
+        .and_then(|value| value.parse::<i64>().ok());
+    if username.is_none() && user_id.is_none() {
+        return admin_error_response(StatusCode::BAD_REQUEST, "username or user_id required");
+    }
+    let Some(pool) = routes.postgres.as_ref() else {
+        return admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "database error");
+    };
+    match sqlx::query(SQL_ADMIN_SEARCH_CHATS_BY_MEMBER)
+        .bind(username.as_deref())
+        .bind(user_id)
+        .fetch_all(pool)
+        .await
+    {
+        Ok(rows) => admin_json_response(
+            StatusCode::OK,
+            serde_json::json!({ "chats": rows.iter().map(admin_chat_json).collect::<Vec<_>>() }),
+        ),
+        Err(error) => {
+            tracing::warn!(%error, "failed to search admin chats by member");
+            admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "database error")
+        }
+    }
+}
+
+async fn admin_users_list_response(
+    routes: &StaticWebRoutes,
+    method: Method,
+    headers: &HeaderMap,
+    raw_query: Option<&str>,
+) -> Response {
+    if method != Method::GET {
+        return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+    }
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+        return admin_auth_failure_response(error);
+    }
+    let Some(pool) = routes.postgres.as_ref() else {
+        return admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "database error");
+    };
+    let q = admin_auth_query_values(raw_query)
+        .remove("q")
+        .map(|value| value.trim().to_lowercase())
+        .filter(|value| !value.is_empty());
+    match sqlx::query(SQL_ADMIN_LIST_USERS_FILTERED)
+        .bind(q.as_deref())
+        .bind(ADMIN_PAGE_LIMIT)
+        .bind(0_i64)
+        .fetch_all(pool)
+        .await
+    {
+        Ok(rows) => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "application/json"),
+                (header::CACHE_CONTROL, "no-cache"),
+            ],
+            format!(
+                "{}\n",
+                serde_json::json!({ "users": rows.iter().map(admin_user_json).collect::<Vec<_>>() })
+            ),
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::warn!(%error, "failed to list admin users");
+            admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "database error")
+        }
+    }
+}
+
+async fn admin_user_get_response(
+    routes: &StaticWebRoutes,
+    method: Method,
+    headers: &HeaderMap,
+    raw_query: Option<&str>,
+) -> Response {
+    if method != Method::GET {
+        return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+    }
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+        return admin_auth_failure_response(error);
+    }
+    let values = admin_auth_query_values(raw_query);
+    let Some(pool) = routes.postgres.as_ref() else {
+        return admin_error_response(StatusCode::NOT_FOUND, "not found");
+    };
+    let user_row = if let Some(id_raw) = values.get("id").filter(|value| !value.is_empty()) {
+        let Ok(id) = id_raw.parse::<i64>() else {
+            return admin_error_response(StatusCode::BAD_REQUEST, "invalid id");
+        };
+        sqlx::query(SQL_ADMIN_GET_USER)
+            .bind(id)
+            .fetch_optional(pool)
+            .await
+    } else if let Some(username) = values.get("username").filter(|value| !value.is_empty()) {
+        sqlx::query(SQL_ADMIN_GET_USER_BY_USERNAME)
+            .bind(username)
+            .fetch_optional(pool)
+            .await
+    } else {
+        return admin_error_response(StatusCode::BAD_REQUEST, "id or username required");
+    };
+    let user_row = match user_row {
+        Ok(Some(row)) => row,
+        Ok(None) | Err(_) => return admin_error_response(StatusCode::NOT_FOUND, "not found"),
+    };
+    let user_id = user_row.try_get::<i64, _>("id").unwrap_or_default();
+    let payment_store = PostgresPaymentStore::new(pool.clone());
+    let vip_store = routes
+        .vip_store
+        .clone()
+        .unwrap_or_else(|| PostgresVipStore::new(pool.clone()));
+    let subscription = payment_store
+        .get_active_subscription(user_id)
+        .await
+        .ok()
+        .flatten()
+        .map(admin_subscription_json);
+    let vip_cache = vip_store
+        .get_vip_cache(user_id)
+        .await
+        .ok()
+        .flatten()
+        .map(admin_vip_cache_json);
+    let vip_summary = match vip_store.get_vip_summary_by_user(user_id).await {
+        Ok(summary) => admin_vip_summary_json(summary.as_ref()),
+        Err(_) => admin_vip_summary_json(None),
+    };
+    let vip_events = match vip_store.list_vip_events_by_user(user_id).await {
+        Ok(events) => events.iter().map(admin_vip_event_json).collect::<Vec<_>>(),
+        Err(error) => {
+            tracing::warn!(%error, user_id, "failed to load admin vip events");
+            return admin_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to load vip events",
+            );
+        }
+    };
+    let subscriptions = match payment_store.list_subscriptions_by_user(user_id).await {
+        Ok(items) => items
+            .iter()
+            .map(admin_subscription_artifact_json)
+            .collect::<Vec<_>>(),
+        Err(error) => {
+            tracing::warn!(%error, user_id, "failed to load admin subscriptions");
+            return admin_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to load subscriptions",
+            );
+        }
+    };
+    admin_json_response(
+        StatusCode::OK,
+        serde_json::json!({
+            "user": admin_user_json(&user_row),
+            "subscription": subscription,
+            "vip": vip_cache,
+            "vip_summary": vip_summary,
+            "vip_events": vip_events,
+            "subscriptions": subscriptions,
+        }),
+    )
+}
+
+async fn admin_user_grant_vip_response(
+    routes: &StaticWebRoutes,
+    method: Method,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Response {
+    if method != Method::POST && method != Method::PUT {
+        return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+    }
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+        return admin_auth_failure_response(error);
+    }
+    let Ok(req) = serde_json::from_slice::<AdminVipGrantRequest>(body) else {
+        return admin_error_response(StatusCode::BAD_REQUEST, "bad request");
+    };
+    let Some(user_id) = admin_i64_from_json(&req.user_id) else {
+        return admin_error_response(
+            StatusCode::BAD_REQUEST,
+            "user_id and non-zero signed days required",
+        );
+    };
+    if user_id == 0 || req.days == 0 {
+        return admin_error_response(
+            StatusCode::BAD_REQUEST,
+            "user_id and non-zero signed days required",
+        );
+    }
+    let Some(pool) = routes.postgres.as_ref() else {
+        return admin_error_response(StatusCode::NOT_FOUND, "user not found");
+    };
+    let user_exists = sqlx::query(SQL_ADMIN_GET_USER)
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .is_some();
+    if !user_exists {
+        return admin_error_response(StatusCode::NOT_FOUND, "user not found");
+    }
+    let admin_id = current_admin_user_id(headers);
+    let reason = admin_non_empty_string(&req.reason)
+        .unwrap_or_else(|| format!("web admin adjustment by {admin_id}"));
+    let actor_user_id = admin_existing_user_id(pool, admin_id).await;
+    let vip_store = routes
+        .vip_store
+        .clone()
+        .unwrap_or_else(|| PostgresVipStore::new(pool.clone()));
+    match vip_store
+        .create_vip_event(openplotva_storage::VipEventCreate {
+            user_id,
+            event_type: openplotva_core::VIP_EVENT_TYPE_ADMIN_ADJUSTMENT,
+            delta_seconds: openplotva_core::vip_days_to_seconds(req.days),
+            subscription_id: None,
+            actor_user_id,
+            reason: Some(&reason),
+        })
+        .await
+    {
+        Ok(event) => admin_json_response(
+            StatusCode::OK,
+            serde_json::json!({
+                "ok": true,
+                "event_id": event.id,
+                "expires_at": admin_format_time(event.effective_expires_at),
+            }),
+        ),
+        Err(error) => {
+            tracing::warn!(%error, user_id, "failed to grant admin vip");
+            admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed")
+        }
+    }
+}
+
+async fn admin_user_revoke_vip_response(
+    routes: &StaticWebRoutes,
+    method: Method,
+    headers: &HeaderMap,
+    raw_query: Option<&str>,
+) -> Response {
+    if method != Method::DELETE {
+        return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+    }
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+        return admin_auth_failure_response(error);
+    }
+    let values = admin_auth_query_values(raw_query);
+    let user_id =
+        match admin_required_i64(&values, "user_id", "user_id required", "invalid user_id") {
+            Ok(value) => value,
+            Err(response) => return *response,
+        };
+    let Some(pool) = routes.postgres.as_ref() else {
+        return admin_json_response(
+            StatusCode::OK,
+            serde_json::json!({ "ok": true, "revoked": false }),
+        );
+    };
+    let vip_store = routes
+        .vip_store
+        .clone()
+        .unwrap_or_else(|| PostgresVipStore::new(pool.clone()));
+    let summary = vip_store
+        .get_vip_summary_by_user(user_id)
+        .await
+        .ok()
+        .flatten();
+    if !admin_vip_summary_can_be_revoked(summary.as_ref()) {
+        return admin_json_response(
+            StatusCode::OK,
+            serde_json::json!({ "ok": true, "revoked": false }),
+        );
+    }
+    let summary = summary.expect("checked");
+    let admin_id = current_admin_user_id(headers);
+    let reason = values
+        .get("reason")
+        .and_then(|value| admin_non_empty_string(value))
+        .unwrap_or_else(|| format!("web admin revoke by {admin_id}"));
+    let actor_user_id = admin_existing_user_id(pool, admin_id).await;
+    match vip_store
+        .create_vip_event(openplotva_storage::VipEventCreate {
+            user_id,
+            event_type: openplotva_core::VIP_EVENT_TYPE_ADMIN_REVOKE,
+            delta_seconds: -summary.remaining_seconds,
+            subscription_id: None,
+            actor_user_id,
+            reason: Some(&reason),
+        })
+        .await
+    {
+        Ok(_) => admin_json_response(
+            StatusCode::OK,
+            serde_json::json!({ "ok": true, "revoked": true }),
+        ),
+        Err(error) => {
+            tracing::warn!(%error, user_id, "failed to revoke admin vip");
+            admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed")
+        }
+    }
+}
+
+async fn admin_user_delete_response(
+    routes: &StaticWebRoutes,
+    method: Method,
+    headers: &HeaderMap,
+    raw_query: Option<&str>,
+) -> Response {
+    if method != Method::DELETE {
+        return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+    }
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+        return admin_auth_failure_response(error);
+    }
+    let values = admin_auth_query_values(raw_query);
+    let user_id = match admin_required_i64(&values, "id", "id required", "invalid id") {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    let Some(pool) = routes.postgres.as_ref() else {
+        return admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed");
+    };
+    match sqlx::query(SQL_ADMIN_SAFE_DELETE_USER)
+        .bind(user_id)
+        .execute(pool)
+        .await
+    {
+        Ok(_) => admin_json_response(StatusCode::OK, serde_json::json!({ "ok": true })),
+        Err(error) => {
+            tracing::warn!(%error, user_id, "failed to delete admin user");
+            admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed")
+        }
+    }
+}
+
+async fn admin_chat_type(routes: &StaticWebRoutes, chat_id: i64) -> String {
+    let Some(pool) = routes.postgres.as_ref() else {
+        return "private".to_owned();
+    };
+    sqlx::query_scalar::<_, String>(SQL_ADMIN_GET_CHAT_TYPE)
+        .bind(chat_id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "private".to_owned())
+}
+
+async fn admin_fetch_optional_json(
+    pool: &PgPool,
+    query: &'static str,
+    id: i64,
+    mapper: fn(&PgRow) -> serde_json::Value,
+) -> Option<serde_json::Value> {
+    sqlx::query(query)
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .as_ref()
+        .map(mapper)
+}
+
+fn admin_required_i64(
+    values: &BTreeMap<String, String>,
+    key: &str,
+    missing: &str,
+    invalid: &str,
+) -> Result<i64, Box<Response>> {
+    let Some(value) = values.get(key).filter(|value| !value.is_empty()) else {
+        return Err(Box::new(admin_error_response(
+            StatusCode::BAD_REQUEST,
+            missing,
+        )));
+    };
+    value
+        .parse::<i64>()
+        .map_err(|_| Box::new(admin_error_response(StatusCode::BAD_REQUEST, invalid)))
+}
+
+fn current_admin_user_id(headers: &HeaderMap) -> i64 {
+    headers
+        .get("X-Telegram-User-ID")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .or_else(|| admin_session_user_id(headers))
+        .unwrap_or(0)
+}
+
+async fn admin_existing_user_id(pool: &PgPool, user_id: i64) -> Option<i64> {
+    if user_id <= 0 {
+        return None;
+    }
+    sqlx::query(SQL_ADMIN_GET_USER)
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .map(|_| user_id)
+}
+
+fn admin_non_empty_string(value: &str) -> Option<String> {
+    let normalized = value.trim().to_owned();
+    (!normalized.is_empty()).then_some(normalized)
+}
+
+fn admin_i64_from_json(value: &serde_json::Value) -> Option<i64> {
+    value.as_i64().or_else(|| {
+        value
+            .as_str()
+            .and_then(|value| value.trim().parse::<i64>().ok())
+    })
+}
+
+fn admin_format_time(value: OffsetDateTime) -> String {
+    value
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| value.unix_timestamp().to_string())
+}
+
+fn admin_time_json(value: Option<OffsetDateTime>) -> serde_json::Value {
+    value
+        .map(admin_format_time)
+        .map(serde_json::Value::String)
+        .unwrap_or(serde_json::Value::Null)
+}
+
+fn admin_row_time(row: &PgRow, key: &str) -> serde_json::Value {
+    admin_time_json(row.try_get::<Option<OffsetDateTime>, _>(key).ok().flatten())
+}
+
+fn admin_jsonb_base64(row: &PgRow, key: &str) -> serde_json::Value {
+    row.try_get::<Option<serde_json::Value>, _>(key)
+        .ok()
+        .flatten()
+        .and_then(|value| serde_json::to_vec(&value).ok())
+        .map(|bytes| BASE64_STANDARD.encode(bytes))
+        .map(serde_json::Value::String)
+        .unwrap_or(serde_json::Value::Null)
+}
+
+fn admin_i64_json(row: &PgRow, key: &str) -> serde_json::Value {
+    row.try_get::<Option<i64>, _>(key)
+        .ok()
+        .flatten()
+        .map(serde_json::Value::from)
+        .unwrap_or(serde_json::Value::Null)
+}
+
+fn admin_bool_json(row: &PgRow, key: &str) -> serde_json::Value {
+    row.try_get::<Option<bool>, _>(key)
+        .ok()
+        .flatten()
+        .map(serde_json::Value::from)
+        .unwrap_or(serde_json::Value::Null)
+}
+
+fn admin_string_json(row: &PgRow, key: &str) -> serde_json::Value {
+    row.try_get::<Option<String>, _>(key)
+        .ok()
+        .flatten()
+        .map(serde_json::Value::from)
+        .unwrap_or(serde_json::Value::Null)
+}
+
+fn admin_chat_json(row: &PgRow) -> serde_json::Value {
+    serde_json::json!({
+        "id": row.try_get::<i64, _>("id").unwrap_or_default(),
+        "type": row.try_get::<String, _>("type").unwrap_or_default(),
+        "title": admin_string_json(row, "title"),
+        "username": admin_string_json(row, "username"),
+        "first_name": admin_string_json(row, "first_name"),
+        "last_name": admin_string_json(row, "last_name"),
+        "is_forum": admin_bool_json(row, "is_forum"),
+        "active_usernames": admin_jsonb_base64(row, "active_usernames"),
+        "available_reactions": admin_jsonb_base64(row, "available_reactions"),
+        "bio": admin_string_json(row, "bio"),
+        "has_private_forwards": admin_bool_json(row, "has_private_forwards"),
+        "has_restricted_voice_and_video_messages": admin_bool_json(row, "has_restricted_voice_and_video_messages"),
+        "join_to_send_messages": admin_bool_json(row, "join_to_send_messages"),
+        "join_by_request": admin_bool_json(row, "join_by_request"),
+        "description": admin_string_json(row, "description"),
+        "invite_link": admin_string_json(row, "invite_link"),
+        "pinned_message": admin_jsonb_base64(row, "pinned_message"),
+        "permissions": admin_jsonb_base64(row, "permissions"),
+        "slow_mode_delay": admin_i64_json(row, "slow_mode_delay"),
+        "message_auto_delete_time": admin_i64_json(row, "message_auto_delete_time"),
+        "has_aggressive_anti_spam_enabled": admin_bool_json(row, "has_aggressive_anti_spam_enabled"),
+        "has_hidden_members": admin_bool_json(row, "has_hidden_members"),
+        "has_protected_content": admin_bool_json(row, "has_protected_content"),
+        "has_visible_history": admin_bool_json(row, "has_visible_history"),
+        "sticker_set_name": admin_string_json(row, "sticker_set_name"),
+        "can_set_sticker_set": admin_bool_json(row, "can_set_sticker_set"),
+        "linked_chat_id": admin_i64_json(row, "linked_chat_id"),
+        "location": admin_jsonb_base64(row, "location"),
+        "discovered": admin_row_time(row, "discovered"),
+        "updated": admin_row_time(row, "updated"),
+    })
+}
+
+fn admin_user_json(row: &PgRow) -> serde_json::Value {
+    serde_json::json!({
+        "id": row.try_get::<i64, _>("id").unwrap_or_default(),
+        "is_premium": admin_bool_json(row, "is_premium"),
+        "first_name": row.try_get::<String, _>("first_name").unwrap_or_default(),
+        "last_name": admin_string_json(row, "last_name"),
+        "username": admin_string_json(row, "username"),
+        "language_code": admin_string_json(row, "language_code"),
+        "is_vip": admin_bool_json(row, "is_vip"),
+        "settings": admin_jsonb_base64(row, "settings"),
+        "discovered": admin_row_time(row, "discovered"),
+        "updated": admin_row_time(row, "updated"),
+    })
+}
+
+fn admin_settings_json(row: &PgRow) -> serde_json::Value {
+    serde_json::json!({
+        "chat_id": row.try_get::<i64, _>("chat_id").unwrap_or_default(),
+        "mood_alignment": admin_string_json(row, "mood_alignment"),
+        "custom_persona": admin_string_json(row, "custom_persona"),
+        "updated": admin_row_time(row, "updated"),
+        "reactivity_percentage": row.try_get::<i32, _>("reactivity_percentage").unwrap_or_default(),
+        "proactivity_percentage": row.try_get::<i32, _>("proactivity_percentage").unwrap_or_default(),
+        "enable_global_text_reply": row.try_get::<bool, _>("enable_global_text_reply").unwrap_or(false),
+        "enable_global_draw_reply": row.try_get::<bool, _>("enable_global_draw_reply").unwrap_or(false),
+        "enable_obscenifier": row.try_get::<bool, _>("enable_obscenifier").unwrap_or(false),
+        "enable_profanity": row.try_get::<bool, _>("enable_profanity").unwrap_or(false),
+        "enable_greet_joiners": row.try_get::<bool, _>("enable_greet_joiners").unwrap_or(false),
+        "enable_daily_game": admin_bool_json(row, "enable_daily_game"),
+        "daily_game_theme": admin_string_json(row, "daily_game_theme"),
+        "greeting_html": admin_string_json(row, "greeting_html"),
+    })
+}
+
+fn admin_permissions_json(row: &PgRow) -> serde_json::Value {
+    serde_json::json!({
+        "chat_id": row.try_get::<i64, _>("chat_id").unwrap_or_default(),
+        "status": row.try_get::<String, _>("status").unwrap_or_default(),
+        "can_manage_chat": admin_bool_json(row, "can_manage_chat"),
+        "can_delete_messages": admin_bool_json(row, "can_delete_messages"),
+        "can_manage_video_chats": admin_bool_json(row, "can_manage_video_chats"),
+        "can_restrict_members": admin_bool_json(row, "can_restrict_members"),
+        "can_promote_members": admin_bool_json(row, "can_promote_members"),
+        "can_change_info": admin_bool_json(row, "can_change_info"),
+        "can_invite_users": admin_bool_json(row, "can_invite_users"),
+        "can_post_messages": admin_bool_json(row, "can_post_messages"),
+        "can_edit_messages": admin_bool_json(row, "can_edit_messages"),
+        "can_pin_messages": admin_bool_json(row, "can_pin_messages"),
+        "can_manage_topics": admin_bool_json(row, "can_manage_topics"),
+        "can_send_messages": admin_bool_json(row, "can_send_messages"),
+        "can_send_media_messages": admin_bool_json(row, "can_send_media_messages"),
+        "can_send_polls": admin_bool_json(row, "can_send_polls"),
+        "can_send_other_messages": admin_bool_json(row, "can_send_other_messages"),
+        "can_add_web_page_previews": admin_bool_json(row, "can_add_web_page_previews"),
+        "last_checked_at": admin_row_time(row, "last_checked_at"),
+        "last_error_at": admin_row_time(row, "last_error_at"),
+        "error_count": row.try_get::<Option<i32>, _>("error_count").ok().flatten(),
+        "error_message": admin_string_json(row, "error_message"),
+        "created_at": admin_row_time(row, "created_at"),
+        "updated_at": admin_row_time(row, "updated_at"),
+    })
+}
+
+fn admin_chat_member_prefixed_json(row: &PgRow) -> serde_json::Value {
+    serde_json::json!({
+        "chat_id": row.try_get::<i64, _>("member_chat_id").unwrap_or_default(),
+        "user_id": row.try_get::<i64, _>("member_user_id").unwrap_or_default(),
+        "status": row.try_get::<String, _>("member_status").unwrap_or_default(),
+        "is_anonymous": admin_bool_json(row, "member_is_anonymous"),
+        "custom_title": admin_string_json(row, "member_custom_title"),
+        "can_be_edited": admin_bool_json(row, "member_can_be_edited"),
+        "can_manage_chat": admin_bool_json(row, "member_can_manage_chat"),
+        "can_delete_messages": admin_bool_json(row, "member_can_delete_messages"),
+        "can_manage_video_chats": admin_bool_json(row, "member_can_manage_video_chats"),
+        "can_restrict_members": admin_bool_json(row, "member_can_restrict_members"),
+        "can_promote_members": admin_bool_json(row, "member_can_promote_members"),
+        "can_change_info": admin_bool_json(row, "member_can_change_info"),
+        "can_invite_users": admin_bool_json(row, "member_can_invite_users"),
+        "can_post_messages": admin_bool_json(row, "member_can_post_messages"),
+        "can_edit_messages": admin_bool_json(row, "member_can_edit_messages"),
+        "can_pin_messages": admin_bool_json(row, "member_can_pin_messages"),
+        "can_manage_topics": admin_bool_json(row, "member_can_manage_topics"),
+        "can_send_messages": admin_bool_json(row, "member_can_send_messages"),
+        "can_send_media_messages": admin_bool_json(row, "member_can_send_media_messages"),
+        "can_send_polls": admin_bool_json(row, "member_can_send_polls"),
+        "can_send_other_messages": admin_bool_json(row, "member_can_send_other_messages"),
+        "can_add_web_page_previews": admin_bool_json(row, "member_can_add_web_page_previews"),
+        "until_date": admin_row_time(row, "member_until_date"),
+        "created_at": admin_row_time(row, "member_created_at"),
+        "updated_at": admin_row_time(row, "member_updated_at"),
+        "last_message_at": admin_row_time(row, "member_last_message_at"),
+    })
+}
+
+fn admin_user_prefixed_json(row: &PgRow) -> serde_json::Value {
+    if row
+        .try_get::<Option<i64>, _>("user_id")
+        .ok()
+        .flatten()
+        .is_none()
+    {
+        return serde_json::Value::Null;
+    }
+    serde_json::json!({
+        "id": row.try_get::<i64, _>("user_id").unwrap_or_default(),
+        "is_premium": admin_bool_json(row, "user_is_premium"),
+        "first_name": row.try_get::<String, _>("user_first_name").unwrap_or_default(),
+        "last_name": admin_string_json(row, "user_last_name"),
+        "username": admin_string_json(row, "user_username"),
+        "language_code": admin_string_json(row, "user_language_code"),
+        "is_vip": admin_bool_json(row, "user_is_vip"),
+        "settings": admin_jsonb_base64(row, "user_settings"),
+        "discovered": admin_row_time(row, "user_discovered"),
+        "updated": admin_row_time(row, "user_updated"),
+    })
+}
+
+fn admin_subscription_json(item: openplotva_storage::SubscriptionRecord) -> serde_json::Value {
+    serde_json::json!({
+        "id": item.id,
+        "user_id": item.user_id,
+        "telegram_payment_charge_id": item.telegram_payment_charge_id,
+        "provider_payment_charge_id": item.provider_payment_charge_id,
+        "expires_at": admin_format_time(item.expires_at),
+        "created_at": admin_format_time(item.created_at),
+        "updated_at": admin_format_time(item.updated_at),
+        "canceled_at": admin_time_json(item.canceled_at),
+        "refunded_at": admin_time_json(item.refunded_at),
+    })
+}
+
+fn admin_subscription_artifact_json(
+    item: &openplotva_storage::SubscriptionRecord,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": item.id,
+        "telegram_payment_charge_id": item.telegram_payment_charge_id,
+        "provider_payment_charge_id": item.provider_payment_charge_id,
+        "expires_at": admin_format_time(item.expires_at),
+        "created_at": admin_format_time(item.created_at),
+        "updated_at": admin_format_time(item.updated_at),
+        "canceled_at": admin_time_json(item.canceled_at),
+        "refunded_at": admin_time_json(item.refunded_at),
+        "status": admin_subscription_status(item.expires_at, item.canceled_at, item.refunded_at),
+    })
+}
+
+fn admin_vip_cache_json(item: openplotva_storage::VipCacheRecord) -> serde_json::Value {
+    serde_json::json!({
+        "user_id": item.user_id,
+        "is_vip": item.is_vip,
+        "expires_at": admin_format_time(item.expires_at),
+        "created_at": admin_format_time(item.created_at),
+        "updated_at": admin_format_time(item.updated_at),
+    })
+}
+
+fn admin_vip_summary_json(
+    summary: Option<&openplotva_storage::VipSummaryRecord>,
+) -> serde_json::Value {
+    let Some(summary) = summary else {
+        return serde_json::json!({
+            "active": false,
+            "has_history": false,
+            "remaining_seconds": 0,
+            "remaining_days": 0,
+        });
+    };
+    let active = summary.is_active && OffsetDateTime::now_utc() < summary.effective_expires_at;
+    let remaining_days = if active {
+        let seconds = (summary.effective_expires_at - OffsetDateTime::now_utc()).whole_seconds();
+        ((seconds as f64 / openplotva_core::VIP_SECONDS_PER_DAY as f64).round() as i64).max(0)
+    } else {
+        0
+    };
+    serde_json::json!({
+        "active": active,
+        "has_history": true,
+        "expires_at": admin_format_time(summary.effective_expires_at),
+        "remaining_seconds": summary.remaining_seconds,
+        "remaining_days": remaining_days.max(0),
+        "latest_event_id": summary.latest_event_id,
+        "latest_event_type": summary.latest_event_type,
+        "latest_reason": summary.latest_reason,
+        "latest_created_at": admin_format_time(summary.latest_created_at),
+    })
+}
+
+fn admin_vip_event_json(item: &openplotva_storage::VipEventListRecord) -> serde_json::Value {
+    let actor_label = item
+        .actor_username
+        .as_ref()
+        .filter(|value| !value.is_empty())
+        .map(|value| format!("@{value}"))
+        .or_else(|| {
+            item.actor_first_name
+                .clone()
+                .filter(|value| !value.is_empty())
+        })
+        .or_else(|| item.actor_user_id.map(|value| value.to_string()))
+        .unwrap_or_default();
+    let subscription_status = if item.subscription_id.is_some() {
+        admin_subscription_status(
+            item.subscription_expires_at
+                .unwrap_or(item.effective_expires_at),
+            item.subscription_canceled_at,
+            item.subscription_refunded_at,
+        )
+    } else {
+        String::new()
+    };
+    serde_json::json!({
+        "id": item.id,
+        "event_type": item.event_type,
+        "delta_seconds": item.delta_seconds,
+        "delta_days": item.delta_seconds as f64 / openplotva_core::VIP_SECONDS_PER_DAY as f64,
+        "effective_expires_at": admin_format_time(item.effective_expires_at),
+        "actor_user_id": item.actor_user_id,
+        "actor_label": actor_label,
+        "reason": item.reason,
+        "created_at": admin_format_time(item.created_at),
+        "subscription_id": item.subscription_id,
+        "telegram_payment_charge_id": item.telegram_payment_charge_id,
+        "provider_payment_charge_id": item.provider_payment_charge_id,
+        "subscription_status": subscription_status,
+    })
+}
+
+fn admin_subscription_status(
+    expires_at: OffsetDateTime,
+    canceled_at: Option<OffsetDateTime>,
+    refunded_at: Option<OffsetDateTime>,
+) -> String {
+    if refunded_at.is_some() {
+        "refunded".to_owned()
+    } else if canceled_at.is_some() {
+        "canceled".to_owned()
+    } else if OffsetDateTime::now_utc() < expires_at {
+        "active".to_owned()
+    } else {
+        "expired".to_owned()
+    }
+}
+
+fn admin_vip_summary_can_be_revoked(
+    summary: Option<&openplotva_storage::VipSummaryRecord>,
+) -> bool {
+    summary
+        .map(|summary| {
+            summary.is_active && OffsetDateTime::now_utc() < summary.effective_expires_at
+        })
+        .unwrap_or(false)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AdminAuthFailure {
+    Unauthorized,
+    Forbidden,
+}
+
+fn admin_auth_failure_response(error: AdminAuthFailure) -> Response {
+    match error {
+        AdminAuthFailure::Unauthorized => {
+            admin_error_response(StatusCode::FORBIDDEN, "unauthorized")
+        }
+        AdminAuthFailure::Forbidden => admin_error_response(StatusCode::FORBIDDEN, "forbidden"),
+    }
+}
+
+fn require_admin_request(headers: &HeaderMap, admin_ids: &[i64]) -> Result<(), AdminAuthFailure> {
+    let user_id = headers
+        .get("X-Telegram-User-ID")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+        .or_else(|| admin_session_user_id(headers).map(|value| value.to_string()));
+    let Some(user_id) = user_id else {
+        return Err(AdminAuthFailure::Unauthorized);
+    };
+    let Ok(user_id) = user_id.trim().parse::<i64>() else {
+        return Err(AdminAuthFailure::Unauthorized);
+    };
+    if !admin_ids.contains(&user_id) {
+        return Err(AdminAuthFailure::Forbidden);
+    }
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct AdminLogLevelRequest {
+    level: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AdminAifarmPoolRequest {
+    enabled: bool,
+}
+
+async fn admin_state_response(routes: &StaticWebRoutes) -> Response {
+    let level = admin_app_setting(routes, "log_level")
+        .await
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| routes.default_log_level.to_string());
+    let dispatcher_stats =
+        openplotva_server::RuntimeDispatcherInspector::stats(&routes.dispatcher_inspector);
+    let cache_stats = openplotva_server::RuntimeCacheInspector::stats(&routes.cache_inspector);
+    admin_json_response(
+        StatusCode::OK,
+        serde_json::json!({
+            "log_level": level,
+            "queue": {
+                "regularQueueSize": dispatcher_stats.regular_queue_size,
+                "immediateQueueSize": dispatcher_stats.immediate_queue_size,
+                "processedTotal": dispatcher_stats.processed_total,
+                "dedupedTotal": dispatcher_stats.deduped_total,
+            },
+            "cache": admin_cache_stats_json(cache_stats.cache),
+            "planner": admin_cache_stats_json(cache_stats.planner_cache),
+            "aifarm_pool_enabled": openplotva_llm::aifarm::pool_enabled(),
+            "aifarm_pool_reasoning_enabled": openplotva_llm::aifarm::pool_reasoning_enabled(),
+        }),
+    )
+}
+
+fn admin_cache_stats_json(stats: openplotva_server::RuntimeCacheStatsData) -> serde_json::Value {
+    serde_json::json!({
+        "Size": stats.size,
+        "Capacity": stats.capacity,
+        "Hits": stats.hits,
+        "Misses": stats.misses,
+        "MemSize": stats.mem_size,
+    })
+}
+
+async fn admin_loglevel_response(
+    routes: &StaticWebRoutes,
+    method: Method,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Response {
+    if method != Method::POST && method != Method::PUT {
+        return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+    }
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+        return admin_auth_failure_response(error);
+    }
+    let Ok(req) = serde_json::from_slice::<AdminLogLevelRequest>(body) else {
+        return admin_error_response(StatusCode::BAD_REQUEST, "bad request");
+    };
+    let level = req.level.trim().to_lowercase();
+    match level.as_str() {
+        "debug" | "info" | "warn" | "warning" | "error" => {}
+        _ => return admin_error_response(StatusCode::BAD_REQUEST, "invalid level"),
+    }
+    if let Err(error) = openplotva_observability::set_log_level(&level) {
+        tracing::warn!(%error, level, "failed to update runtime log level");
+    }
+    if let Err(error) = admin_upsert_app_setting(routes, "log_level", &level).await {
+        tracing::warn!(%error, level, "failed to persist admin log level");
+    }
+    admin_json_response(
+        StatusCode::OK,
+        serde_json::json!({ "ok": true, "level": level }),
+    )
+}
+
+async fn admin_aifarm_pool_toggle_response(
+    routes: &StaticWebRoutes,
+    method: Method,
+    headers: &HeaderMap,
+    body: &[u8],
+    setting_key: &'static str,
+    set_enabled: fn(bool),
+) -> Response {
+    if method != Method::POST && method != Method::PUT {
+        return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+    }
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+        return admin_auth_failure_response(error);
+    }
+    let Ok(req) = serde_json::from_slice::<AdminAifarmPoolRequest>(body) else {
+        return admin_error_response(StatusCode::BAD_REQUEST, "bad request");
+    };
+    set_enabled(req.enabled);
+    if let Err(error) =
+        admin_upsert_app_setting(routes, setting_key, &req.enabled.to_string()).await
+    {
+        tracing::warn!(
+            %error,
+            setting_key,
+            enabled = req.enabled,
+            "failed to persist admin AI Farm pool setting"
+        );
+    }
+    admin_json_response(
+        StatusCode::OK,
+        serde_json::json!({ "ok": true, "enabled": req.enabled }),
+    )
+}
+
+fn admin_llm_requests_response(
+    routes: &StaticWebRoutes,
+    method: Method,
+    headers: &HeaderMap,
+    raw_query: Option<&str>,
+) -> Response {
+    if method != Method::GET {
+        return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+    }
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+        return admin_auth_failure_response(error);
+    }
+    let requests = match routes.llm_trace_buffer.as_ref() {
+        Some(buffer) => openplotva_server::RuntimeLlmTraceInspector::llm_requests(
+            buffer,
+            admin_llm_requests_filter(raw_query),
+        ),
+        None => Ok(Vec::new()),
+    };
+    match requests {
+        Ok(requests) => {
+            let requests = requests
+                .iter()
+                .map(admin_llm_request_json)
+                .collect::<Vec<_>>();
+            admin_json_no_cache_response(
+                StatusCode::OK,
+                serde_json::json!({
+                    "count": requests.len(),
+                    "requests": requests,
+                }),
+            )
+        }
+        Err(error) => {
+            tracing::warn!(%error, "failed to list admin llm requests");
+            admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed")
+        }
+    }
+}
+
+fn admin_llm_requests_clear_response(
+    routes: &StaticWebRoutes,
+    method: Method,
+    headers: &HeaderMap,
+) -> Response {
+    if method != Method::POST {
+        return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+    }
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+        return admin_auth_failure_response(error);
+    }
+    if let Some(buffer) = &routes.llm_trace_buffer {
+        buffer.clear();
+    }
+    admin_json_response(StatusCode::OK, serde_json::json!({ "ok": true }))
+}
+
+async fn admin_safety_checks_response(
+    routes: &StaticWebRoutes,
+    method: Method,
+    headers: &HeaderMap,
+    raw_query: Option<&str>,
+) -> Response {
+    if method != Method::GET {
+        return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+    }
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+        return admin_auth_failure_response(error);
+    }
+    let Some(pool) = routes.postgres.clone() else {
+        return admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed");
+    };
+    let reader = runtime_safety::PostgresRuntimeSafetyCheckReader::new(pool);
+    match openplotva_server::RuntimeSafetyCheckReader::safety_checks(
+        &reader,
+        admin_safety_checks_filter(raw_query),
+    )
+    .await
+    {
+        Ok(connection) => {
+            let checks = connection
+                .items
+                .iter()
+                .map(admin_safety_check_json)
+                .collect::<Vec<_>>();
+            admin_json_no_cache_response(
+                StatusCode::OK,
+                serde_json::json!({
+                    "count": checks.len(),
+                    "checks": checks,
+                }),
+            )
+        }
+        Err(error) => {
+            tracing::warn!(%error, "failed to list admin safety checks");
+            admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed")
+        }
+    }
+}
+
+async fn admin_llm_analytics_summary_response(
+    routes: &StaticWebRoutes,
+    method: Method,
+    headers: &HeaderMap,
+    raw_query: Option<&str>,
+) -> Response {
+    if method != Method::GET {
+        return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+    }
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+        return admin_auth_failure_response(error);
+    }
+    let Some(pool) = routes.postgres.clone() else {
+        return admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed");
+    };
+    let taskman: Arc<dyn openplotva_server::RuntimeTaskmanInspector> =
+        Arc::new(routes.taskman_inspector.clone());
+    let reader = runtime_llm_analytics::PostgresRuntimeLlmAnalyticsReader::new(pool)
+        .with_discovery_capacity(
+            routes.llm_discovery_base_url.to_string(),
+            routes.llm_discovery_service_name.to_string(),
+        )
+        .with_taskman(taskman);
+    let range = admin_auth_query_values(raw_query)
+        .remove("range")
+        .map(|value| value.trim().to_owned())
+        .unwrap_or_default();
+    match openplotva_server::RuntimeLlmAnalyticsReader::llm_analytics(&reader, &range).await {
+        Ok(summary) => {
+            let since = admin_llm_analytics_since_time(&summary);
+            let tool_calls = openplotva_dialog::tool_telemetry::snapshot_since(since, 50);
+            let (memory_runs, memory_runs_error) =
+                admin_llm_memory_run_analytics(routes, since).await;
+            admin_json_no_cache_response(
+                StatusCode::OK,
+                admin_llm_analytics_summary_json(
+                    &summary,
+                    &tool_calls,
+                    memory_runs.as_ref(),
+                    memory_runs_error.as_deref(),
+                ),
+            )
+        }
+        Err(error) => {
+            tracing::warn!(%error, "failed to build admin llm analytics summary");
+            admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed")
+        }
+    }
+}
+
+fn admin_llm_analytics_since_time(
+    summary: &openplotva_server::RuntimeLlmAnalyticsData,
+) -> OffsetDateTime {
+    OffsetDateTime::parse(&summary.since, &Rfc3339).unwrap_or_else(|_| OffsetDateTime::now_utc())
+}
+
+async fn admin_llm_memory_run_analytics(
+    routes: &StaticWebRoutes,
+    since: OffsetDateTime,
+) -> (Option<openplotva_memory::RunAnalytics>, Option<String>) {
+    let Some(store) = routes
+        .memory_store
+        .as_ref()
+        .filter(|_| routes.memory_admin_enabled)
+    else {
+        return (None, None);
+    };
+    match store.run_analytics(since).await {
+        Ok(mut analytics) => {
+            analytics.token_estimator = routes.memory_token_estimator_source.to_string();
+            analytics.max_input_tokens = routes.memory_max_input_tokens;
+            analytics.max_messages_per_run = routes.memory_max_messages_per_run;
+            (Some(analytics), None)
+        }
+        Err(error) => (None, Some(error.to_string())),
+    }
+}
+
+fn admin_llm_requests_filter(
+    raw_query: Option<&str>,
+) -> openplotva_server::RuntimeLlmRequestsFilter {
+    let values = admin_auth_query_values(raw_query);
+    openplotva_server::RuntimeLlmRequestsFilter {
+        q: values
+            .get("q")
+            .map(|value| value.trim())
+            .unwrap_or("")
+            .to_owned(),
+        source: values
+            .get("source")
+            .map(|value| value.trim())
+            .unwrap_or("")
+            .to_owned(),
+        model: values
+            .get("model")
+            .map(|value| value.trim())
+            .unwrap_or("")
+            .to_owned(),
+        chat_id: values
+            .get("chat_id")
+            .and_then(|value| value.trim().parse::<i64>().ok()),
+        user_id: values
+            .get("user_id")
+            .and_then(|value| value.trim().parse::<i64>().ok()),
+        limit: parse_admin_positive_i32(values.get("limit").map(String::as_str), 1000, 1000),
+    }
+}
+
+fn admin_safety_checks_filter(
+    raw_query: Option<&str>,
+) -> openplotva_server::RuntimeSafetyChecksFilter {
+    let values = admin_auth_query_values(raw_query);
+    openplotva_server::RuntimeSafetyChecksFilter {
+        q: values
+            .get("q")
+            .map(|value| value.trim())
+            .unwrap_or("")
+            .to_owned(),
+        flagged: parse_admin_optional_bool(values.get("flagged").map(String::as_str)),
+        offset: parse_admin_non_negative_i32(values.get("offset").map(String::as_str), 0),
+        limit: parse_admin_positive_i32(values.get("limit").map(String::as_str), 200, 1000),
+    }
+}
+
+fn parse_admin_positive_i32(value: Option<&str>, default_value: i32, max_value: i32) -> i32 {
+    match value
+        .map(str::trim)
+        .and_then(|value| value.parse::<i32>().ok())
+    {
+        Some(parsed) if parsed > 0 => parsed.min(max_value),
+        _ => default_value,
+    }
+}
+
+fn parse_admin_non_negative_i32(value: Option<&str>, default_value: i32) -> i32 {
+    match value
+        .map(str::trim)
+        .and_then(|value| value.parse::<i32>().ok())
+    {
+        Some(parsed) if parsed >= 0 => parsed,
+        _ => default_value,
+    }
+}
+
+fn parse_admin_optional_bool(value: Option<&str>) -> Option<bool> {
+    match value.map(str::trim).map(str::to_lowercase).as_deref() {
+        Some("true" | "1" | "yes") => Some(true),
+        Some("false" | "0" | "no") => Some(false),
+        _ => None,
+    }
+}
+
+fn admin_llm_request_json(request: &openplotva_server::RuntimeLlmRequestData) -> serde_json::Value {
+    let mut root = serde_json::Map::new();
+    admin_insert(&mut root, "id", request.id);
+    admin_insert(&mut root, "at", &request.at);
+    admin_insert_opt(&mut root, "provider", request.provider.as_deref());
+    admin_insert_opt(&mut root, "request_kind", request.request_kind.as_deref());
+    admin_insert(&mut root, "source", &request.source);
+    admin_insert_opt(&mut root, "mode", request.mode.as_deref());
+    admin_insert_opt(&mut root, "flow", request.flow.as_deref());
+    admin_insert(&mut root, "iteration", request.iteration);
+    admin_insert_opt(&mut root, "model", request.model.as_deref());
+    admin_insert(&mut root, "chat", admin_llm_chat_json(&request.chat));
+    admin_insert(&mut root, "user", admin_llm_user_json(&request.user));
+    admin_insert(
+        &mut root,
+        "message",
+        admin_llm_message_json(&request.message),
+    );
+    admin_insert(
+        &mut root,
+        "gen_config",
+        admin_llm_gen_config_json(&request.gen_config),
+    );
+    admin_insert_opt_value(&mut root, "docs", request.docs.as_ref());
+    admin_insert_opt_value(&mut root, "messages", request.messages.as_ref());
+    admin_insert_opt_value(&mut root, "raw_request", request.raw_request.as_ref());
+    admin_insert_opt_value(
+        &mut root,
+        "resolved_cache_content",
+        request.resolved_cache_content.as_ref(),
+    );
+    admin_insert_opt_value(&mut root, "raw_response", request.raw_response.as_ref());
+    admin_insert_opt_value(&mut root, "transport", request.transport.as_ref());
+    admin_insert_opt_value(
+        &mut root,
+        "inference_params",
+        request.inference_params.as_ref(),
+    );
+    admin_insert_opt_value(&mut root, "usage", request.usage.as_ref());
+    admin_insert_opt_value(&mut root, "timings", request.timings.as_ref());
+    admin_insert(&mut root, "prompt_chars", request.prompt_chars);
+    if request.prompt_messages != 0 {
+        admin_insert(&mut root, "prompt_messages", request.prompt_messages);
+    }
+    admin_insert(&mut root, "docs_chars", request.docs_chars);
+    if request.duration_ms != 0 {
+        admin_insert(&mut root, "duration_ms", request.duration_ms);
+    }
+    admin_insert(&mut root, "result", admin_llm_result_json(&request.result));
+    serde_json::Value::Object(root)
+}
+
+fn admin_llm_chat_json(chat: &openplotva_server::RuntimeLlmRequestChatData) -> serde_json::Value {
+    let mut root = serde_json::Map::new();
+    admin_insert(&mut root, "chat_id", chat.chat_id);
+    admin_insert_opt(&mut root, "thread_id", chat.thread_id);
+    admin_insert_opt(&mut root, "chat_title", chat.chat_title.as_deref());
+    serde_json::Value::Object(root)
+}
+
+fn admin_llm_user_json(user: &openplotva_server::RuntimeLlmRequestUserData) -> serde_json::Value {
+    let mut root = serde_json::Map::new();
+    admin_insert(&mut root, "user_id", user.user_id);
+    admin_insert_opt(&mut root, "full_name", user.full_name.as_deref());
+    serde_json::Value::Object(root)
+}
+
+fn admin_llm_message_json(
+    message: &openplotva_server::RuntimeLlmRequestMessageData,
+) -> serde_json::Value {
+    serde_json::json!({ "message_id": message.message_id })
+}
+
+fn admin_llm_gen_config_json(
+    gen_config: &openplotva_server::RuntimeLlmGenConfigData,
+) -> serde_json::Value {
+    let mut root = serde_json::Map::new();
+    if gen_config.max_output_tokens != 0 {
+        admin_insert(&mut root, "max_output_tokens", gen_config.max_output_tokens);
+    }
+    if gen_config.temperature != 0.0 {
+        admin_insert(&mut root, "temperature", gen_config.temperature);
+    }
+    if gen_config.top_p != 0.0 {
+        admin_insert(&mut root, "top_p", gen_config.top_p);
+    }
+    if gen_config.top_k != 0 {
+        admin_insert(&mut root, "top_k", gen_config.top_k);
+    }
+    admin_insert_opt_value(
+        &mut root,
+        "safety_settings",
+        gen_config.safety_settings.as_ref(),
+    );
+    serde_json::Value::Object(root)
+}
+
+fn admin_llm_result_json(
+    result: &openplotva_server::RuntimeLlmRequestResultData,
+) -> serde_json::Value {
+    let mut root = serde_json::Map::new();
+    admin_insert(&mut root, "duration_ms", result.duration_ms);
+    admin_insert_opt(&mut root, "error", result.error.as_deref());
+    admin_insert_opt(
+        &mut root,
+        "response_text_preview",
+        result.response_text_preview.as_deref(),
+    );
+    serde_json::Value::Object(root)
+}
+
+fn admin_safety_check_json(check: &openplotva_server::RuntimeSafetyCheckData) -> serde_json::Value {
+    let mut root = serde_json::Map::new();
+    admin_insert(&mut root, "id", check.id);
+    admin_insert(&mut root, "created_at", &check.created_at);
+    admin_insert(&mut root, "source", &check.source);
+    admin_insert_opt(&mut root, "flow", check.flow.as_deref());
+    admin_insert_opt(&mut root, "mode", check.mode.as_deref());
+    admin_insert_opt(&mut root, "chat_id", check.chat_id);
+    admin_insert_opt(&mut root, "thread_id", check.thread_id);
+    admin_insert_opt(&mut root, "message_id", check.message_id);
+    admin_insert_opt(&mut root, "user_id", check.user_id);
+    admin_insert(&mut root, "deployment_id", &check.deployment_id);
+    admin_insert_opt(
+        &mut root,
+        "external_session_id",
+        check.external_session_id.as_deref(),
+    );
+    admin_insert(
+        &mut root,
+        "request_messages",
+        check
+            .request_messages
+            .clone()
+            .unwrap_or(serde_json::Value::Null),
+    );
+    admin_insert_opt(&mut root, "flagged", check.flagged);
+    admin_insert_opt(
+        &mut root,
+        "internal_session_id",
+        check.internal_session_id.as_deref(),
+    );
+    admin_insert_opt_value(&mut root, "policies", check.policies.as_ref());
+    admin_insert_opt_value(&mut root, "response_json", check.response_json.as_ref());
+    admin_insert(&mut root, "duration_ms", check.duration_ms);
+    admin_insert_opt(&mut root, "error", check.error.as_deref());
+    serde_json::Value::Object(root)
+}
+
+fn admin_llm_analytics_summary_json(
+    summary: &openplotva_server::RuntimeLlmAnalyticsData,
+    tool_calls: &openplotva_dialog::tool_telemetry::ToolTelemetrySnapshot,
+    memory_runs: Option<&openplotva_memory::RunAnalytics>,
+    memory_runs_error: Option<&str>,
+) -> serde_json::Value {
+    let mut root = serde_json::Map::new();
+    admin_insert(&mut root, "range", &summary.range);
+    admin_insert(&mut root, "bucket", &summary.bucket);
+    admin_insert(&mut root, "since", &summary.since);
+    admin_insert(
+        &mut root,
+        "totals",
+        serde_json::json!({
+            "total_count": summary.totals.total_count,
+            "error_count": summary.totals.error_count,
+            "avg_duration_ms": summary.totals.avg_duration_ms,
+        }),
+    );
+    admin_insert(&mut root, "series", admin_llm_series_json(&summary.series));
+    admin_insert(
+        &mut root,
+        "model_series",
+        admin_llm_model_series_json(&summary.model_series),
+    );
+    admin_insert(
+        &mut root,
+        "top_chats",
+        admin_llm_top_chats_json(&summary.top_chats),
+    );
+    admin_insert(&mut root, "models", admin_llm_models_json(&summary.models));
+    admin_insert(
+        &mut root,
+        "providers",
+        admin_llm_providers_json(&summary.providers),
+    );
+    admin_insert(
+        &mut root,
+        "inference_params",
+        admin_llm_inference_params_json(&summary.inference_params),
+    );
+    admin_insert(
+        &mut root,
+        "stage_metrics",
+        admin_llm_stage_metrics_json(&summary.stage_metrics),
+    );
+    admin_insert(
+        &mut root,
+        "runtime_jobs",
+        admin_runtime_jobs_json(&summary.runtime_jobs),
+    );
+    admin_insert_opt(
+        &mut root,
+        "runtime_jobs_error",
+        summary.runtime_jobs_error.as_deref(),
+    );
+    admin_insert(&mut root, "tool_calls", tool_calls.to_json());
+    let memory_runs_value = memory_runs.and_then(|analytics| serde_json::to_value(analytics).ok());
+    admin_insert_opt_value(&mut root, "memory_runs", memory_runs_value.as_ref());
+    admin_insert_opt(&mut root, "memory_runs_error", memory_runs_error);
+    let ai_farm_capacity = summary
+        .ai_farm_capacity
+        .as_ref()
+        .map(admin_aifarm_capacity_json);
+    admin_insert_opt_value(&mut root, "aifarm_capacity", ai_farm_capacity.as_ref());
+    serde_json::Value::Object(root)
+}
+
+fn admin_llm_series_json(
+    series: &[openplotva_server::RuntimeLlmAnalyticsSeriesPointData],
+) -> Vec<serde_json::Value> {
+    series
+        .iter()
+        .map(|point| {
+            serde_json::json!({
+                "ts": point.ts,
+                "total_count": point.total_count,
+                "error_count": point.error_count,
+                "avg_duration_ms": point.avg_duration_ms,
+            })
+        })
+        .collect()
+}
+
+fn admin_llm_model_series_json(
+    series: &[openplotva_server::RuntimeLlmAnalyticsModelSeriesPointData],
+) -> Vec<serde_json::Value> {
+    series
+        .iter()
+        .map(|point| {
+            serde_json::json!({
+                "ts": point.ts,
+                "model": point.model,
+                "request_count": point.request_count,
+                "error_count": point.error_count,
+                "avg_duration_ms": point.avg_duration_ms,
+                "avg_generation_tps": point.avg_generation_tps,
+                "avg_effective_output_tps": point.avg_effective_output_tps,
+                "output_tokens": point.output_tokens,
+            })
+        })
+        .collect()
+}
+
+fn admin_llm_top_chats_json(
+    chats: &[openplotva_server::RuntimeLlmAnalyticsTopChatData],
+) -> Vec<serde_json::Value> {
+    chats
+        .iter()
+        .map(|chat| {
+            let mut root = serde_json::Map::new();
+            admin_insert(&mut root, "chat_id", chat.chat_id);
+            admin_insert_opt(&mut root, "title", chat.title.as_deref());
+            admin_insert_opt(&mut root, "username", chat.username.as_deref());
+            admin_insert(&mut root, "request_count", chat.request_count);
+            serde_json::Value::Object(root)
+        })
+        .collect()
+}
+
+fn admin_llm_models_json(
+    models: &[openplotva_server::RuntimeLlmAnalyticsModelStatData],
+) -> Vec<serde_json::Value> {
+    models
+        .iter()
+        .map(|model| {
+            serde_json::json!({
+                "model": model.model,
+                "request_count": model.request_count,
+                "error_count": model.error_count,
+                "avg_duration_ms": model.avg_duration_ms,
+                "p50_duration_ms": model.p50_duration_ms,
+                "p95_duration_ms": model.p95_duration_ms,
+                "input_tokens": model.input_tokens,
+                "output_tokens": model.output_tokens,
+                "total_tokens": model.total_tokens,
+                "avg_generation_tps": model.avg_generation_tps,
+                "avg_effective_output_tps": model.avg_effective_output_tps,
+                "p50_effective_output_tps": model.p50_effective_output_tps,
+                "p95_effective_output_tps": model.p95_effective_output_tps,
+            })
+        })
+        .collect()
+}
+
+fn admin_llm_providers_json(
+    providers: &[openplotva_server::RuntimeLlmAnalyticsProviderStatData],
+) -> Vec<serde_json::Value> {
+    providers
+        .iter()
+        .map(|provider| {
+            serde_json::json!({
+                "provider": provider.provider,
+                "source": provider.source,
+                "request_count": provider.request_count,
+                "error_count": provider.error_count,
+                "avg_duration_ms": provider.avg_duration_ms,
+                "p50_duration_ms": provider.p50_duration_ms,
+                "p95_duration_ms": provider.p95_duration_ms,
+                "input_tokens": provider.input_tokens,
+                "output_tokens": provider.output_tokens,
+                "total_tokens": provider.total_tokens,
+                "avg_generation_tps": provider.avg_generation_tps,
+                "avg_effective_output_tps": provider.avg_effective_output_tps,
+            })
+        })
+        .collect()
+}
+
+fn admin_llm_inference_params_json(
+    params: &[openplotva_server::RuntimeLlmAnalyticsInferenceParamStatData],
+) -> Vec<serde_json::Value> {
+    params
+        .iter()
+        .map(|param| {
+            let mut root = serde_json::Map::new();
+            admin_insert(&mut root, "provider", &param.provider);
+            admin_insert(&mut root, "source", &param.source);
+            admin_insert(&mut root, "model", &param.model);
+            admin_insert_opt(&mut root, "max_tokens", param.max_tokens);
+            admin_insert_opt(&mut root, "temperature", param.temperature);
+            admin_insert_opt(&mut root, "top_p", param.top_p);
+            admin_insert_opt(&mut root, "top_k", param.top_k);
+            admin_insert_opt(&mut root, "candidate_count", param.candidate_count);
+            admin_insert(&mut root, "tool_mode", &param.tool_mode);
+            admin_insert(&mut root, "response_format", &param.response_format);
+            admin_insert(&mut root, "request_count", param.request_count);
+            admin_insert(&mut root, "error_count", param.error_count);
+            admin_insert(&mut root, "avg_duration_ms", param.avg_duration_ms);
+            admin_insert(
+                &mut root,
+                "avg_effective_output_tps",
+                param.avg_effective_output_tps,
+            );
+            serde_json::Value::Object(root)
+        })
+        .collect()
+}
+
+fn admin_llm_stage_metrics_json(
+    metrics: &[openplotva_server::RuntimeLlmAnalyticsStageMetricData],
+) -> Vec<serde_json::Value> {
+    metrics
+        .iter()
+        .map(|metric| {
+            serde_json::json!({
+                "stage": metric.stage,
+                "source": metric.source,
+                "request_count": metric.request_count,
+                "error_count": metric.error_count,
+                "avg_duration_ms": metric.avg_duration_ms,
+                "p50_duration_ms": metric.p50_duration_ms,
+                "p95_duration_ms": metric.p95_duration_ms,
+                "avg_iteration": metric.avg_iteration,
+                "max_iteration": metric.max_iteration,
+            })
+        })
+        .collect()
+}
+
+fn admin_runtime_jobs_json(
+    jobs: &[openplotva_server::RuntimeJobAnalyticsStatData],
+) -> Vec<serde_json::Value> {
+    jobs.iter()
+        .map(|job| {
+            serde_json::json!({
+                "job_type": job.job_type,
+                "queue_name": job.queue_name,
+                "provider": job.provider,
+                "created_count": job.created_count,
+                "completed_count": job.completed_count,
+                "failed_count": job.failed_count,
+                "avg_wait_ms": job.avg_wait_ms,
+                "p95_wait_ms": job.p95_wait_ms,
+                "avg_processing_ms": job.avg_processing_ms,
+                "p95_processing_ms": job.p95_processing_ms,
+            })
+        })
+        .collect()
+}
+
+fn admin_aifarm_capacity_json(
+    capacity: &openplotva_server::RuntimeAifarmCapacitySnapshotData,
+) -> serde_json::Value {
+    let mut root = serde_json::Map::new();
+    admin_insert(&mut root, "service", &capacity.service);
+    admin_insert(
+        &mut root,
+        "max_concurrent_jobs",
+        capacity.max_concurrent_jobs,
+    );
+    admin_insert(&mut root, "running", capacity.running);
+    admin_insert(&mut root, "queued", capacity.queued);
+    admin_insert(&mut root, "available", capacity.available);
+    admin_insert(&mut root, "locked", capacity.locked);
+    admin_insert(&mut root, "ready", capacity.ready);
+    admin_insert(&mut root, "observed_at", &capacity.observed_at);
+    admin_insert_opt(&mut root, "error", capacity.error.as_deref());
+    serde_json::Value::Object(root)
+}
+
+fn admin_insert<T: Serialize>(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    value: T,
+) {
+    map.insert(key.to_owned(), serde_json::json!(value));
+}
+
+fn admin_insert_opt<T: Serialize>(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    value: Option<T>,
+) {
+    if let Some(value) = value {
+        admin_insert(map, key, value);
+    }
+}
+
+fn admin_insert_opt_value(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    value: Option<&serde_json::Value>,
+) {
+    if let Some(value) = value {
+        map.insert(key.to_owned(), value.clone());
+    }
+}
+
+async fn admin_app_setting(routes: &StaticWebRoutes, key: &str) -> Option<String> {
+    let pool = routes.postgres.as_ref()?;
+    sqlx::query_scalar::<_, String>("SELECT value FROM app_settings WHERE key = $1")
+        .bind(key)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+}
+
+async fn admin_upsert_app_setting(
+    routes: &StaticWebRoutes,
+    key: &str,
+    value: &str,
+) -> Result<(), sqlx::Error> {
+    let Some(pool) = routes.postgres.as_ref() else {
+        return Ok(());
+    };
+    sqlx::query(
+        "INSERT INTO app_settings (key, value, updated_at) \
+         VALUES ($1, $2, NOW()) \
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()",
+    )
+    .bind(key)
+    .bind(value)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+#[derive(Debug)]
+struct AdminLogStreamState {
+    buffer: Arc<openplotva_observability::RuntimeLogBuffer>,
+    after_seq: u64,
+    pending: VecDeque<openplotva_observability::RuntimeLogEntry>,
+    interval: Interval,
+}
+
+fn admin_logs_sse_stream(
+    buffer: Arc<openplotva_observability::RuntimeLogBuffer>,
+) -> impl Stream<Item = Result<Event, Infallible>> {
+    let after_seq = buffer.latest_seq();
+    stream::unfold(
+        AdminLogStreamState {
+            buffer,
+            after_seq,
+            pending: VecDeque::new(),
+            interval: tokio::time::interval(Duration::from_secs(1)),
+        },
+        |mut state| async move {
+            loop {
+                if let Some(entry) = state.pending.pop_front() {
+                    state.after_seq = state.after_seq.max(entry.seq);
+                    let data = serde_json::json!({
+                        "seq": entry.seq,
+                        "time": entry.time,
+                        "level": entry.level,
+                        "message": entry.message,
+                        "attrs": entry.attrs,
+                    })
+                    .to_string();
+                    return Some((Ok(Event::default().data(data)), state));
+                }
+                state.interval.tick().await;
+                state.pending = VecDeque::from(state.buffer.logs(state.after_seq, 100, "", ""));
+            }
+        },
+    )
+}
+
+fn admin_static_asset_requires_auth(path: &str) -> bool {
+    let path = path.trim_matches('/');
+    path.is_empty() || path == "index.html"
+}
+
+impl StaticWebRoutes {
+    fn redis_inspector(&self) -> Option<RedisRuntimeInspector> {
+        self.redis.clone().map(RedisRuntimeInspector::new)
+    }
+}
+
+fn admin_session_is_authorized(headers: &HeaderMap, admin_ids: &[i64]) -> bool {
+    admin_session_user_ids(headers)
+        .into_iter()
+        .any(|user_id| admin_ids.contains(&user_id))
+}
+
+fn admin_session_user_id(headers: &HeaderMap) -> Option<i64> {
+    admin_session_user_ids(headers).into_iter().next()
+}
+
+fn admin_session_user_ids(headers: &HeaderMap) -> Vec<i64> {
+    let Some(cookie) = headers
+        .get(header::COOKIE)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return Vec::new();
+    };
+    cookie
+        .split(';')
+        .filter_map(|part| {
+            part.trim()
+                .strip_prefix(openplotva_web::ADMIN_SESSION_COOKIE_NAME)
+                .and_then(|value| value.strip_prefix('='))
+        })
+        .filter_map(|value| value.parse::<i64>().ok())
+        .collect()
+}
+
 /// Run the current OpenPlotva app shell.
 pub async fn run() -> anyhow::Result<()> {
     let config = AppConfig::from_env().context("load configuration")?;
-    openplotva_observability::init(&config.observability);
+    let log_buffer = openplotva_observability::init_with_log_buffer_capacity(
+        &config.observability,
+        config.runtime_api.log_buffer_size,
+    );
 
-    let reference_snapshot = reference_snapshot::verify(&config.reference_snapshot).context("verify Go reference snapshot")?;
-    let mut readiness_checks = vec![reference_snapshot.readiness_check()];
+    let mut readiness_checks = Vec::new();
     let service_clients = connect_services(&config, &mut readiness_checks).await?;
-    let runtime_workers =
-        start_runtime_workers(&config, service_clients.as_ref(), &mut readiness_checks).await?;
+    apply_runtime_aifarm_pool_settings(&config, service_clients.as_ref()).await;
+    let runtime_workers = start_runtime_workers(
+        &config,
+        service_clients.as_ref(),
+        &mut readiness_checks,
+        Arc::clone(&log_buffer),
+    )
+    .await?;
 
     let listener = tokio::net::TcpListener::bind(&config.server.bind_addr)
         .await
@@ -360,10 +7122,25 @@ pub async fn run() -> anyhow::Result<()> {
     tracing::info!(address = %local_addr, "openplotva listening");
 
     let readiness = ReadinessResponse::ready(readiness_checks);
+    let bot_username = runtime_workers
+        .bot_username
+        .clone()
+        .unwrap_or_else(|| std::env::var("BOT_USERNAME").unwrap_or_default());
+    let static_web = static_web_routes_from_config(
+        &config,
+        service_clients.as_ref(),
+        bot_username,
+        log_buffer,
+        &runtime_workers,
+    );
     let app = if let Some(webhook_route) = runtime_workers.webhook_route.clone() {
-        router_with_readiness_and_telegram_webhook_route(readiness, webhook_route)
+        router_with_readiness_static_web_and_telegram_webhook_route(
+            readiness,
+            static_web,
+            webhook_route,
+        )
     } else {
-        openplotva_server::router_with_readiness(readiness)
+        router_with_readiness_and_static_web(readiness, static_web)
     };
 
     let serve_result = axum::serve(listener, app)
@@ -375,6 +7152,40 @@ pub async fn run() -> anyhow::Result<()> {
     serve_result?;
     drop(service_clients);
     Ok(())
+}
+
+async fn apply_runtime_aifarm_pool_settings(
+    config: &AppConfig,
+    service_clients: Option<&ServiceClients>,
+) {
+    if config.llm.dialog.aifarm_pool_reasoning_max_tokens > 0 {
+        openplotva_llm::aifarm::set_pool_reasoning_max_tokens(
+            config.llm.dialog.aifarm_pool_reasoning_max_tokens,
+        );
+    }
+    let Some(service_clients) = service_clients else {
+        return;
+    };
+    if let Some(enabled) =
+        postgres_bool_app_setting(&service_clients.postgres, "aifarm.pool.enabled").await
+    {
+        openplotva_llm::aifarm::set_pool_enabled(enabled);
+    }
+    if let Some(enabled) =
+        postgres_bool_app_setting(&service_clients.postgres, "aifarm.pool.reasoning_enabled").await
+    {
+        openplotva_llm::aifarm::set_pool_reasoning_enabled(enabled);
+    }
+}
+
+async fn postgres_bool_app_setting(pool: &PgPool, key: &str) -> Option<bool> {
+    let value = sqlx::query_scalar::<_, String>("SELECT value FROM app_settings WHERE key = $1")
+        .bind(key)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()?;
+    value.trim().parse::<bool>().ok()
 }
 
 async fn connect_services(
@@ -419,7 +7230,6 @@ async fn connect_services(
     Ok(Some(clients))
 }
 
-/// Run Go's long-poll startup order: delete webhook, then produce updates.
 pub async fn run_long_poll_update_producer_after_delete_webhook<Startup, Source, Queue, Stop>(
     startup: &Startup,
     source: &Source,
@@ -447,7 +7257,6 @@ where
     }
 }
 
-/// Run Go's webhook startup order: set webhook, then produce updates from the webhook source.
 pub async fn run_webhook_update_producer_after_set_webhook<Startup, Source, Queue, Stop>(
     startup: &Startup,
     setup: &openplotva_telegram::WebhookSetup,
@@ -476,7 +7285,27 @@ where
     }
 }
 
-/// Configure Telegram bot commands in the same order as Go `initBot`.
+pub async fn delete_webhook_on_shutdown_if_enabled<Startup>(
+    enabled: bool,
+    startup: &Startup,
+) -> WebhookShutdownCleanupReport
+where
+    Startup: DeleteWebhookExecutor + Sync,
+    Startup::Error: fmt::Display,
+{
+    if !enabled {
+        return WebhookShutdownCleanupReport::SkippedDisabled;
+    }
+
+    match timeout(GO_WEBHOOK_DELETE_ON_STOP_TIMEOUT, startup.delete_webhook()).await {
+        Ok(Ok(())) => WebhookShutdownCleanupReport::Deleted,
+        Ok(Err(error)) => WebhookShutdownCleanupReport::Failed {
+            error: error.to_string(),
+        },
+        Err(_) => WebhookShutdownCleanupReport::TimedOut,
+    }
+}
+
 pub async fn configure_telegram_bot_commands<C>(
     client: &C,
 ) -> Result<BotCommandSetupReport, BotCommandSetupError>
@@ -600,12 +7429,505 @@ pub fn telegram_webhook_multipart_plan(
     })
 }
 
+fn runtime_api_bind_addr(config: &openplotva_config::RuntimeApiConfig) -> String {
+    format!("{}:{}", config.host, config.port)
+}
+
+fn shield_options_from_config(
+    config: &openplotva_config::ShieldConfig,
+) -> openplotva_shield::Options {
+    openplotva_shield::Options {
+        enabled: config.enabled,
+        embedder_url: config.embedder_url.clone(),
+        embedding_dim: config.embedding_dim,
+        max_matches: config.max_matches,
+        vector_min_score: config.vector_min_score,
+        lexical_min_score: config.lexical_min_score,
+        query_max_chars: usize::try_from(config.query_max_chars.max(0)).unwrap_or_default(),
+        retrieval_timeout_seconds: config.retrieval_timeout_seconds,
+        rebuild_batch_size: openplotva_shield::DEFAULT_REBUILD_BATCH_SIZE,
+    }
+    .with_defaults()
+}
+
+fn shield_history_tail_messages_from_config(config: &openplotva_config::ShieldConfig) -> usize {
+    usize::try_from(config.history_tail_messages.max(0)).unwrap_or_default()
+}
+
+fn dialog_memory_context_enabled(config: &AppConfig) -> bool {
+    config.memory.enabled
+}
+
+fn admin_queue_config_from_app_config(config: &AppConfig) -> admin::AdminQueueCommandConfig {
+    let queue = &config.persistent_queue;
+    admin::AdminQueueCommandConfig {
+        persistent_queue_enabled: queue.enabled,
+        default_processing_timeout: Duration::from_secs(
+            queue.default_processing_timeout_seconds.max(0) as u64,
+        ),
+        workers: vec![
+            admin::AdminQueueWorkerConfig {
+                queue_name: openplotva_taskman::CONTROL_QUEUE_NAME.to_owned(),
+                worker_count: queue.control_workers,
+            },
+            admin::AdminQueueWorkerConfig {
+                queue_name: openplotva_taskman::TEXT_QUEUE_NAME.to_owned(),
+                worker_count: queue.text_workers,
+            },
+            admin::AdminQueueWorkerConfig {
+                queue_name: openplotva_taskman::DIALOG_AIFARM_QUEUE_NAME.to_owned(),
+                worker_count: queue.dialog_aifarm_workers,
+            },
+            admin::AdminQueueWorkerConfig {
+                queue_name: openplotva_taskman::IMAGE_REGULAR_QUEUE_NAME.to_owned(),
+                worker_count: queue.image_regular_workers,
+            },
+            admin::AdminQueueWorkerConfig {
+                queue_name: openplotva_taskman::IMAGE_VIP_QUEUE_NAME.to_owned(),
+                worker_count: queue.image_vip_workers,
+            },
+            admin::AdminQueueWorkerConfig {
+                queue_name: openplotva_taskman::MUSIC_VIP_QUEUE_NAME.to_owned(),
+                worker_count: queue.music_vip_workers,
+            },
+            admin::AdminQueueWorkerConfig {
+                queue_name: openplotva_taskman::MEMORY_CONSOLIDATION_QUEUE_NAME.to_owned(),
+                worker_count: queue.memory_consolidation_workers,
+            },
+        ],
+    }
+}
+
+fn runtime_api_graphql_snapshot(
+    config: &AppConfig,
+) -> openplotva_server::RuntimeApiGraphqlSnapshot {
+    openplotva_server::RuntimeApiGraphqlSnapshot {
+        log_level: config.observability.log_level.clone(),
+        web_host: config.server.host.clone(),
+        web_port: i32::from(config.server.port),
+        runtime_api_enabled: config.runtime_api.enabled,
+        runtime_api_host: config.runtime_api.host.clone(),
+        runtime_api_port: i32::from(config.runtime_api.port),
+        discovery_base_url: Some(config.llm.discovery.base_url.clone())
+            .filter(|value| !value.trim().is_empty()),
+        embedder_enabled: !config.memory.embedder_url.trim().is_empty(),
+        embedder_url: Some(config.memory.embedder_url.clone())
+            .filter(|value| !value.trim().is_empty()),
+        shield_enabled: config.shield.enabled,
+        shield_embedder_url: Some(config.shield.embedder_url.clone())
+            .filter(|value| !value.trim().is_empty()),
+        shield_max_matches: config.shield.max_matches,
+        shield_vector_min_score: config.shield.vector_min_score,
+        shield_lexical_min_score: config.shield.lexical_min_score,
+        shield_retrieval_timeout_seconds: config.shield.retrieval_timeout_seconds,
+        shield_history_tail_messages: config.shield.history_tail_messages,
+        vision_discovery_service_name: config.vision.discovery_service_name.clone(),
+        vision_discovery_endpoint_name: config.vision.discovery_endpoint_name.clone(),
+        vision_model: config.vision.model.clone(),
+        vision_max_tokens: config.vision.max_tokens,
+        vision_temperature: config.vision.temperature,
+        vision_direct_image_limit: config.vision.direct_image_limit,
+        vision_request_timeout_seconds: config.vision.request_timeout_seconds,
+        white_circle_enabled: dialog_runtime::white_circle_effective_enabled(config),
+        ace_step_enabled: config.music.acestep.enabled,
+        ace_step_base_url: Some(config.music.acestep.base_url.trim().to_owned())
+            .filter(|value| !value.is_empty()),
+        dialog_provider: config.llm.dialog.provider.clone(),
+        dialog_fallback_provider: Some(config.llm.dialog.fallback_provider.clone())
+            .filter(|value| !value.trim().is_empty()),
+        model_scope_base_url: Some(config.model_scope.base_url.trim().to_owned())
+            .filter(|value| !value.is_empty()),
+        pruna_endpoint: Some(config.pruna.endpoint.trim().to_owned())
+            .filter(|value| !value.is_empty()),
+        persistent_queue_enabled: config.persistent_queue.enabled,
+        active_draw_providers: runtime_active_draw_providers(config),
+        sql_timeout_ms: config.runtime_api.sql_timeout_ms,
+        sql_row_limit: config.runtime_api.sql_row_limit,
+        sql_result_bytes_limit: config.runtime_api.sql_result_bytes_limit,
+        db_status: "ok".to_owned(),
+        redis_status: "ok".to_owned(),
+    }
+}
+
+fn runtime_active_draw_providers(config: &AppConfig) -> Vec<String> {
+    let mut providers = Vec::new();
+    if !config.llm.discovery.base_url.trim().is_empty() {
+        providers.push("drawapi".to_owned());
+    }
+    if !config.together.key.trim().is_empty()
+        || config
+            .together
+            .keys
+            .iter()
+            .any(|key| !key.trim().is_empty())
+    {
+        providers.push("together".to_owned());
+    }
+    if !config.pruna.endpoint.trim().is_empty() {
+        providers.push("pruna".to_owned());
+    }
+    if !config.ai_horde.base_url.trim().is_empty() {
+        providers.push("aihorde".to_owned());
+    }
+    if !config.model_scope.base_url.trim().is_empty() && !config.model_scope.key.trim().is_empty() {
+        providers.push("modelscope".to_owned());
+    }
+    providers.sort();
+    providers
+}
+
+#[derive(Clone)]
+struct RedisRuntimeInspector {
+    client: redis::Client,
+}
+
+impl RedisRuntimeInspector {
+    fn new(client: redis::Client) -> Self {
+        Self { client }
+    }
+
+    async fn scan_all_keys(&self, pattern: &str) -> Result<Vec<String>, redis::RedisError> {
+        let mut connection = self.client.get_multiplexed_async_connection().await?;
+        let mut cursor = 0_u64;
+        let mut keys = Vec::new();
+
+        loop {
+            let (next_cursor, batch): (u64, Vec<String>) = redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg(pattern)
+                .arg("COUNT")
+                .arg(1000)
+                .query_async(&mut connection)
+                .await?;
+            keys.extend(batch);
+            if next_cursor == 0 {
+                break;
+            }
+            cursor = next_cursor;
+        }
+
+        Ok(keys)
+    }
+
+    async fn scan_keys(
+        &self,
+        pattern: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, redis::RedisError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut connection = self.client.get_multiplexed_async_connection().await?;
+        let mut cursor = 0_u64;
+        let mut keys = Vec::new();
+
+        loop {
+            let remaining = limit.saturating_sub(keys.len());
+            if remaining == 0 {
+                break;
+            }
+            let (next_cursor, batch): (u64, Vec<String>) = redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg(pattern)
+                .arg("COUNT")
+                .arg(remaining.min(100))
+                .query_async(&mut connection)
+                .await?;
+
+            keys.extend(batch.into_iter().take(remaining));
+            if next_cursor == 0 {
+                break;
+            }
+            cursor = next_cursor;
+        }
+
+        Ok(keys)
+    }
+
+    async fn prefix_groups(
+        &self,
+        prefix: &str,
+        limit: usize,
+    ) -> Result<Vec<openplotva_server::RuntimeRedisPrefixGroup>, redis::RedisError> {
+        let keys = self.scan_keys(&format!("{prefix}*"), limit).await?;
+        Ok(runtime_redis_prefix_groups_from_keys(prefix, keys))
+    }
+
+    async fn value(
+        &self,
+        key: &str,
+        max_bytes: usize,
+    ) -> Result<Option<openplotva_server::RuntimeRedisValue>, redis::RedisError> {
+        let mut connection = self.client.get_multiplexed_async_connection().await?;
+        let value: Option<Vec<u8>> = redis::cmd("GET")
+            .arg(key)
+            .query_async(&mut connection)
+            .await?;
+        Ok(value.map(|bytes| runtime_redis_value_from_bytes(key, &bytes, max_bytes)))
+    }
+
+    async fn raw_value(&self, key: &str) -> Result<Option<String>, redis::RedisError> {
+        let mut connection = self.client.get_multiplexed_async_connection().await?;
+        let value: Option<Vec<u8>> = redis::cmd("GET")
+            .arg(key)
+            .query_async(&mut connection)
+            .await?;
+        Ok(value.map(|bytes| String::from_utf8_lossy(&bytes).into_owned()))
+    }
+
+    async fn delete_key(&self, key: &str) -> Result<(), redis::RedisError> {
+        let mut connection = self.client.get_multiplexed_async_connection().await?;
+        let _: () = redis::cmd("DEL")
+            .arg(key)
+            .query_async(&mut connection)
+            .await?;
+        Ok(())
+    }
+
+    async fn delete_by_prefix(&self, prefix: &str) -> Result<(), redis::RedisError> {
+        let pattern = format!("{prefix}*");
+        let mut connection = self.client.get_multiplexed_async_connection().await?;
+        let mut cursor = 0_u64;
+
+        loop {
+            let (next_cursor, batch): (u64, Vec<String>) = redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg(&pattern)
+                .arg("COUNT")
+                .arg(1000)
+                .query_async(&mut connection)
+                .await?;
+            if !batch.is_empty() {
+                let _: () = redis::cmd("DEL")
+                    .arg(batch)
+                    .query_async(&mut connection)
+                    .await?;
+            }
+            if next_cursor == 0 {
+                break;
+            }
+            cursor = next_cursor;
+        }
+
+        Ok(())
+    }
+
+    async fn flushdb(&self) -> Result<(), redis::RedisError> {
+        let mut connection = self.client.get_multiplexed_async_connection().await?;
+        redis::cmd("FLUSHDB").query_async(&mut connection).await
+    }
+}
+
+fn runtime_redis_prefix_groups_from_keys(
+    prefix: &str,
+    keys: impl IntoIterator<Item = String>,
+) -> Vec<openplotva_server::RuntimeRedisPrefixGroup> {
+    let mut groups = HashMap::<String, i32>::new();
+    for key in keys {
+        let Some(rest) = key.strip_prefix(prefix) else {
+            continue;
+        };
+        if rest.is_empty() {
+            continue;
+        }
+        let segment = match rest.find(':') {
+            Some(index) => &rest[..=index],
+            None => rest,
+        };
+        *groups.entry(format!("{prefix}{segment}")).or_default() += 1;
+    }
+
+    let mut keys = groups.keys().cloned().collect::<Vec<_>>();
+    keys.sort();
+    keys.into_iter()
+        .map(|prefix| openplotva_server::RuntimeRedisPrefixGroup {
+            count: groups[&prefix],
+            prefix,
+        })
+        .collect()
+}
+
+fn admin_redis_prefix_groups_from_keys(
+    prefix: &str,
+    keys: impl IntoIterator<Item = String>,
+) -> HashMap<String, i32> {
+    let mut groups = HashMap::<String, i32>::new();
+    for key in keys {
+        let Some(rest) = key.strip_prefix(prefix) else {
+            continue;
+        };
+        if rest.is_empty() {
+            continue;
+        };
+        let segment = match rest.find(':') {
+            Some(index) => &rest[..=index],
+            None => rest,
+        };
+        *groups.entry(format!("{prefix}{segment}")).or_default() += 1;
+    }
+    groups
+}
+
+fn runtime_redis_value_from_bytes(
+    key: &str,
+    bytes: &[u8],
+    max_bytes: usize,
+) -> openplotva_server::RuntimeRedisValue {
+    let truncated = max_bytes > 0 && bytes.len() > max_bytes;
+    let bytes = if truncated {
+        &bytes[..max_bytes]
+    } else {
+        bytes
+    };
+    openplotva_server::RuntimeRedisValue {
+        key: key.to_owned(),
+        value: String::from_utf8_lossy(bytes).into_owned(),
+        truncated,
+    }
+}
+
+impl openplotva_server::RuntimeRedisInspector for RedisRuntimeInspector {
+    fn prefix_groups<'a>(
+        &'a self,
+        prefix: &'a str,
+        limit: usize,
+    ) -> openplotva_server::RuntimeRedisInspectorFuture<
+        'a,
+        Vec<openplotva_server::RuntimeRedisPrefixGroup>,
+    > {
+        Box::pin(async move {
+            self.prefix_groups(prefix, limit)
+                .await
+                .map_err(|error| error.to_string())
+        })
+    }
+
+    fn keys<'a>(
+        &'a self,
+        pattern: &'a str,
+        limit: usize,
+    ) -> openplotva_server::RuntimeRedisInspectorFuture<'a, Vec<String>> {
+        Box::pin(async move {
+            self.scan_keys(pattern, limit)
+                .await
+                .map_err(|error| error.to_string())
+        })
+    }
+
+    fn value<'a>(
+        &'a self,
+        key: &'a str,
+        max_bytes: usize,
+    ) -> openplotva_server::RuntimeRedisInspectorFuture<
+        'a,
+        Option<openplotva_server::RuntimeRedisValue>,
+    > {
+        Box::pin(async move {
+            self.value(key, max_bytes)
+                .await
+                .map_err(|error| error.to_string())
+        })
+    }
+}
+
+#[derive(Clone)]
+struct RuntimeLogInspector {
+    buffer: Arc<openplotva_observability::RuntimeLogBuffer>,
+}
+
+impl RuntimeLogInspector {
+    fn new(buffer: Arc<openplotva_observability::RuntimeLogBuffer>) -> Self {
+        Self { buffer }
+    }
+}
+
+impl openplotva_server::RuntimeLogInspector for RuntimeLogInspector {
+    fn logs(
+        &self,
+        query: openplotva_server::RuntimeLogQuery,
+    ) -> Vec<openplotva_server::RuntimeLogEntry> {
+        self.buffer
+            .logs(query.after_seq, query.limit, &query.level, &query.search)
+            .into_iter()
+            .map(|entry| openplotva_server::RuntimeLogEntry {
+                seq: entry.seq,
+                time: entry.time,
+                level: entry.level,
+                message: entry.message,
+                attrs: entry.attrs,
+            })
+            .collect()
+    }
+}
+
+async fn start_runtime_api_worker(
+    app_config: &AppConfig,
+    config: &openplotva_config::RuntimeApiConfig,
+    service_clients: &ServiceClients,
+    diagnostics: openplotva_server::RuntimeApiLiveDiagnostics,
+    stop: watch::Receiver<bool>,
+) -> anyhow::Result<(JoinHandle<()>, std::net::SocketAddr)> {
+    let bind_addr = runtime_api_bind_addr(config);
+    let tcp_listener = tokio::net::TcpListener::bind(&bind_addr)
+        .await
+        .with_context(|| format!("bind runtime API TLS listener to {bind_addr}"))?;
+    let local_addr = tcp_listener
+        .local_addr()
+        .context("read runtime API listener address")?;
+    let cert_pem = std::fs::read(&config.cert_file)
+        .with_context(|| format!("read runtime API certificate {}", config.cert_file))?;
+    let key_pem = std::fs::read(&config.key_file)
+        .with_context(|| format!("read runtime API private key {}", config.key_file))?;
+    let tls_acceptor = openplotva_server::runtime_api_tls_acceptor_from_pem(&cert_pem, &key_pem)
+        .context("load runtime API TLS material")?;
+    let token_store = PostgresRuntimeTokenStore::new(service_clients.postgres.clone());
+    let token_manager = runtime_api::RuntimeTokenManager::new(token_store);
+    let app = openplotva_server::runtime_api_router_with_graphql_live_diagnostics(
+        token_manager,
+        runtime_api_graphql_snapshot(app_config),
+        diagnostics,
+    );
+    let tls_listener = openplotva_server::RuntimeApiTlsListener::new(tcp_listener, tls_acceptor);
+    let tls_public_key_pin = config.tls_public_key_pin.as_str();
+
+    tracing::info!(
+        address = %local_addr,
+        tls_public_key_pin = %tls_public_key_pin,
+        "runtime API listening"
+    );
+
+    let worker = tokio::spawn(async move {
+        let result = axum::serve(tls_listener, app)
+            .with_graceful_shutdown(wait_for_runtime_stop(stop))
+            .await;
+        if let Err(error) = result {
+            tracing::warn!(%error, "runtime API server stopped with error");
+        }
+    });
+
+    Ok((worker, local_addr))
+}
+
 async fn start_runtime_workers(
     config: &AppConfig,
     service_clients: Option<&ServiceClients>,
     readiness_checks: &mut Vec<ReadinessCheck>,
+    log_buffer: Arc<openplotva_observability::RuntimeLogBuffer>,
 ) -> anyhow::Result<RuntimeWorkers> {
     let Some(service_clients) = service_clients else {
+        if config.runtime_api.enabled {
+            anyhow::bail!(
+                "RUNTIME_API_ENABLED=true requires OPENPLOTVA_CONNECT_SERVICES=true for runtime token validation"
+            );
+        }
+        readiness_checks.push(ReadinessCheck::skipped(
+            "runtime_api",
+            "RUNTIME_API_ENABLED=false",
+        ));
         readiness_checks.push(ReadinessCheck::skipped(
             "pending_ops",
             "OPENPLOTVA_CONNECT_SERVICES=false",
@@ -623,15 +7945,203 @@ async fn start_runtime_workers(
             "OPENPLOTVA_CONNECT_SERVICES=false",
         ));
         readiness_checks.push(ReadinessCheck::skipped(
+            "telegram_update_consumer",
+            "OPENPLOTVA_CONNECT_SERVICES=false",
+        ));
+        readiness_checks.push(ReadinessCheck::skipped(
             "telegram_commands",
             "OPENPLOTVA_CONNECT_SERVICES=false",
         ));
         readiness_checks.push(ReadinessCheck::skipped(
-            "payment_control_jobs",
+            "telegram_get_me",
+            "OPENPLOTVA_CONNECT_SERVICES=false",
+        ));
+        readiness_checks.push(ReadinessCheck::skipped(
+            "control_jobs",
+            "OPENPLOTVA_CONNECT_SERVICES=false",
+        ));
+        readiness_checks.push(ReadinessCheck::skipped(
+            "shared_task_queue_restore",
+            "OPENPLOTVA_CONNECT_SERVICES=false",
+        ));
+        readiness_checks.push(ReadinessCheck::skipped(
+            "shared_task_queue_snapshot",
+            "OPENPLOTVA_CONNECT_SERVICES=false",
+        ));
+        readiness_checks.push(ReadinessCheck::skipped(
+            "dialog_jobs",
+            "OPENPLOTVA_CONNECT_SERVICES=false",
+        ));
+        readiness_checks.push(ReadinessCheck::skipped(
+            "image_jobs",
+            "OPENPLOTVA_CONNECT_SERVICES=false",
+        ));
+        readiness_checks.push(ReadinessCheck::skipped(
+            "music_jobs",
             "OPENPLOTVA_CONNECT_SERVICES=false",
         ));
         return Ok(RuntimeWorkers::default());
     };
+
+    let (stop, _) = watch::channel(false);
+    let taskman_inspector = runtime_taskman::RuntimeTaskmanInspectorHandle::default();
+    let dispatcher_inspector = runtime_dispatcher::RuntimeDispatcherInspectorHandle::default();
+    let cache_inspector = runtime_cache::RuntimeCacheInspectorHandle::default();
+    let mut workers = RuntimeWorkers {
+        handles: Vec::new(),
+        stop: Some(stop.clone()),
+        dispatcher: None,
+        shared_task_queue: None,
+        dialog_debounce: None,
+        webhook_route: None,
+        telegram: None,
+        delete_webhook_on_shutdown: false,
+        bot_username: None,
+        bot_id: None,
+        dispatcher_inspector: dispatcher_inspector.clone(),
+        cache_inspector: cache_inspector.clone(),
+        taskman_inspector: taskman_inspector.clone(),
+        memory_restart_trigger: None,
+        llm_trace_buffer: None,
+    };
+    let updates_inspector = runtime_updates::RuntimeUpdatesInspectorHandle::new(
+        openplotva_updates::RedisUpdateQueue::new(service_clients.redis.client().clone()),
+    );
+    let llm_trace_buffer = runtime_llm::RuntimeLlmTraceBuffer::default();
+    workers.llm_trace_buffer = Some(llm_trace_buffer.clone());
+    let memory_store = PostgresMemoryStore::new(service_clients.postgres.clone());
+    let memory_restart_trigger = Arc::new(tokio::sync::Notify::new());
+
+    if config.runtime_api.enabled {
+        let runtime_taskman_reader: Arc<dyn openplotva_server::RuntimeTaskmanInspector> =
+            Arc::new(taskman_inspector.clone());
+        let gemini_cache_purger = runtime_gemini_cache::GeminiExplicitCachePurger::from_config(
+            &config.google_ai,
+        )
+        .map(|purger| Arc::new(purger) as Arc<dyn openplotva_server::RuntimeGeminiCachePurger>);
+        let diagnostics = openplotva_server::RuntimeApiLiveDiagnostics {
+            redis_inspector: Some(Arc::new(RedisRuntimeInspector::new(
+                service_clients.redis.client().clone(),
+            ))),
+            sql_reader: Some(Arc::new(runtime_sql::PostgresRuntimeSqlReader::new(
+                service_clients.postgres.clone(),
+            ))),
+            entity_reader: Some(Arc::new(
+                runtime_entities::PostgresRuntimeEntityReader::new(
+                    service_clients.postgres.clone(),
+                ),
+            )),
+            pending_ops_reader: Some(Arc::new(
+                runtime_pending_ops::PostgresRuntimePendingOpsReader::new(
+                    service_clients.postgres.clone(),
+                ),
+            )),
+            safety_check_reader: Some(Arc::new(
+                runtime_safety::PostgresRuntimeSafetyCheckReader::new(
+                    service_clients.postgres.clone(),
+                ),
+            )),
+            llm_trace_inspector: Some(Arc::new(llm_trace_buffer.clone())),
+            llm_analytics_reader: Some(Arc::new(
+                runtime_llm_analytics::PostgresRuntimeLlmAnalyticsReader::new(
+                    service_clients.postgres.clone(),
+                )
+                .with_discovery_capacity(
+                    config.llm.discovery.base_url.clone(),
+                    config.llm.dialog.discovery_service_name.clone(),
+                )
+                .with_taskman(Arc::clone(&runtime_taskman_reader)),
+            )),
+            log_inspector: Some(Arc::new(RuntimeLogInspector::new(Arc::clone(&log_buffer)))),
+            taskman_inspector: Some(runtime_taskman_reader),
+            updates_inspector: Some(Arc::new(updates_inspector.clone())),
+            dispatcher_inspector: Some(Arc::new(dispatcher_inspector.clone())),
+            cache_inspector: Some(Arc::new(cache_inspector.clone())),
+            memory_restarter: config.memory.enabled.then(|| {
+                Arc::new(memory_runtime::RuntimeMemoryRestarter::new(
+                    memory_store.clone(),
+                    Arc::clone(&memory_restart_trigger),
+                    config.memory.consolidation_model.clone(),
+                )) as Arc<dyn openplotva_server::RuntimeMemoryRestarter>
+            }),
+            gemini_cache_purger,
+        };
+        let (worker, local_addr) = start_runtime_api_worker(
+            config,
+            &config.runtime_api,
+            service_clients,
+            diagnostics,
+            stop.subscribe(),
+        )
+        .await
+        .context("start runtime API worker")?;
+        readiness_checks.push(ReadinessCheck::ok(
+            "runtime_api",
+            format!(
+                "TLS runtime API listening on {local_addr}; public key pin {}",
+                config.runtime_api.tls_public_key_pin
+            ),
+        ));
+        workers.handles.push(worker);
+    } else {
+        readiness_checks.push(ReadinessCheck::skipped(
+            "runtime_api",
+            "RUNTIME_API_ENABLED=false",
+        ));
+    }
+
+    if config.memory.enabled && config.bot.key.is_none() {
+        match (
+            memory_runtime::memory_extractor_from_app_config(config),
+            memory_runtime::memory_write_embedder_from_config(&config.memory),
+        ) {
+            (Ok(memory_extractor), Ok(memory_write_embedder)) => {
+                let memory_worker_store = memory_store.clone();
+                let memory_worker_config =
+                    memory_runtime::memory_service_worker_config_from_memory_config(&config.memory);
+                let memory_worker_stop = stop.subscribe();
+                let memory_worker_trigger = Arc::clone(&memory_restart_trigger);
+                let memory_worker = tokio::spawn(async move {
+                    let report = memory_runtime::run_memory_service_worker_with_trigger_until(
+                        &memory_extractor,
+                        &memory_worker_store,
+                        memory_write_embedder.as_ref(),
+                        memory_worker_config,
+                        memory_worker_trigger,
+                        wait_for_runtime_stop(memory_worker_stop),
+                    )
+                    .await;
+
+                    tracing::info!(?report, "memory service worker stopped");
+                });
+                readiness_checks.push(ReadinessCheck::ok(
+                    "memory_service",
+                    "Memory service worker started with daily-run ensure, queue drain, AIFarm extraction, and SQLx persistence",
+                ));
+                workers.memory_restart_trigger = Some(Arc::clone(&memory_restart_trigger));
+                workers.handles.push(memory_worker);
+            }
+            (Err(error), _) => {
+                tracing::warn!(%error, "memory extractor unavailable for memory service worker");
+                readiness_checks.push(ReadinessCheck::skipped(
+                    "memory_service",
+                    format!("memory extractor unavailable: {error}"),
+                ));
+            }
+            (_, Err(error)) => {
+                tracing::warn!(%error, "memory embedder unavailable for memory service worker");
+                readiness_checks.push(ReadinessCheck::skipped(
+                    "memory_service",
+                    format!("memory embedder unavailable: {error}"),
+                ));
+            }
+        }
+    } else if !config.memory.enabled {
+        readiness_checks.push(ReadinessCheck::skipped(
+            "memory_service",
+            "MEMORY_ENABLED=false",
+        ));
+    }
 
     let Some(bot_key) = config.bot.key.as_deref() else {
         readiness_checks.push(ReadinessCheck::skipped("pending_ops", "BOT_KEY is not set"));
@@ -648,18 +8158,55 @@ async fn start_runtime_workers(
             "BOT_KEY is not set",
         ));
         readiness_checks.push(ReadinessCheck::skipped(
+            "telegram_update_consumer",
+            "BOT_KEY is not set",
+        ));
+        readiness_checks.push(ReadinessCheck::skipped(
             "telegram_commands",
             "BOT_KEY is not set",
         ));
         readiness_checks.push(ReadinessCheck::skipped(
-            "payment_control_jobs",
+            "telegram_get_me",
             "BOT_KEY is not set",
         ));
-        return Ok(RuntimeWorkers::default());
+        readiness_checks.push(ReadinessCheck::skipped(
+            "control_jobs",
+            "BOT_KEY is not set",
+        ));
+        readiness_checks.push(ReadinessCheck::skipped(
+            "shared_task_queue_restore",
+            "BOT_KEY is not set",
+        ));
+        readiness_checks.push(ReadinessCheck::skipped(
+            "shared_task_queue_snapshot",
+            "BOT_KEY is not set",
+        ));
+        readiness_checks.push(ReadinessCheck::skipped("dialog_jobs", "BOT_KEY is not set"));
+        readiness_checks.push(ReadinessCheck::skipped("image_jobs", "BOT_KEY is not set"));
+        readiness_checks.push(ReadinessCheck::skipped("music_jobs", "BOT_KEY is not set"));
+        return Ok(workers);
     };
 
-    let telegram = openplotva_telegram::telegram_client(bot_key.to_owned())
-        .context("create Telegram Bot API client")?;
+    let telegram = openplotva_telegram::telegram_client_with_base_url(
+        bot_key.to_owned(),
+        &config.bot.api_base_url,
+    )
+    .context("create Telegram Bot API client")?;
+    let bot_identity = telegram
+        .execute(openplotva_telegram::build_get_bot_method())
+        .await
+        .context("get Telegram bot identity")?;
+    readiness_checks.push(ReadinessCheck::ok(
+        "telegram_get_me",
+        format!(
+            "loaded bot identity @{} ({})",
+            bot_identity.username, bot_identity.id
+        ),
+    ));
+    workers.bot_username = Some(bot_identity.username.clone());
+    workers.bot_id = Some(bot_identity.id);
+    workers.telegram = Some(telegram.clone());
+    workers.delete_webhook_on_shutdown = config.bot.webhook.enabled;
     let command_report = configure_telegram_bot_commands(&telegram)
         .await
         .context("configure Telegram bot commands")?;
@@ -683,6 +8230,7 @@ async fn start_runtime_workers(
     let dispatcher_queue = Arc::new(openplotva_telegram::DispatcherQueue::new(
         go_dispatcher_config(),
     ));
+    dispatcher_inspector.set_queue(Arc::clone(&dispatcher_queue));
     let restore_report = dispatcher_persistence
         .load_into_queue(&dispatcher_queue)
         .await
@@ -707,14 +8255,12 @@ async fn start_runtime_workers(
     let permission_policy = Arc::new(permissions::ChatPermissionPolicy::new(
         PostgresChatSettingsStore::new(service_clients.postgres.clone()),
     ));
-
-    let (stop, _) = watch::channel(false);
-    let mut workers = RuntimeWorkers {
-        handles: Vec::new(),
-        stop: Some(stop.clone()),
-        dispatcher: None,
-        webhook_route: None,
-    };
+    cache_inspector.set_policy_caches(
+        Arc::clone(&rate_limit_policy),
+        Arc::clone(&permission_policy),
+    );
+    let chat_settings_store = PostgresChatSettingsStore::new(service_clients.postgres.clone());
+    let chat_member_store = PostgresChatMemberStore::new(service_clients.postgres.clone());
 
     let payment_store = payments::PostgresSuccessfulPaymentStore::new(
         store.clone(),
@@ -728,18 +8274,20 @@ async fn start_runtime_workers(
     );
     let payment_effects =
         payments::PaymentRuntimeEffects::new(telegram.clone(), payment_successful_effects);
+    let taskman_ids = openplotva_taskman::TaskQueueIdAllocator::new();
     let payment_snapshot_store = payments::PaymentControlJobSnapshotFileStore::new(
         payments::default_payment_control_job_snapshot_path(),
     );
     let payment_snapshot_path = payment_snapshot_store.path().to_path_buf();
-    let (payment_queue, payment_readiness) =
-        match payments::PersistentPaymentControlJobQueue::load_or_new(
+    let (control_queue, control_queue_readiness) =
+        match payments::PersistentPaymentControlJobQueue::load_or_new_with_id_allocator(
             payment_snapshot_store.clone(),
+            taskman_ids.clone(),
         ) {
             Ok(queue) => (
                 queue,
                 format!(
-                    "payment control-job worker started with Rust-native snapshot persistence at {}",
+                    "unified control-job worker started with Rust-native snapshot persistence at {}",
                     payment_snapshot_path.display()
                 ),
             ),
@@ -750,30 +8298,967 @@ async fn start_runtime_workers(
                     "failed to load payment control-job snapshot; starting empty"
                 );
                 (
-                    payments::PersistentPaymentControlJobQueue::new_empty(payment_snapshot_store),
+                    payments::PersistentPaymentControlJobQueue::new_empty_with_id_allocator(
+                        payment_snapshot_store,
+                        taskman_ids.clone(),
+                    ),
                     format!(
-                        "payment control-job worker started with an empty queue after snapshot load failure: {error}"
+                        "unified control-job worker started with an empty queue after snapshot load failure: {error}"
                     ),
                 )
             }
         };
-    let payment_stop = stop.subscribe();
-    let payment_worker = tokio::spawn(async move {
-        let report = payments::run_payment_control_job_worker_until(
-            &payment_queue,
-            &payment_store,
-            &payment_effects,
-            wait_for_runtime_stop(payment_stop),
+    taskman_inspector.set_control_queue(control_queue.clone());
+    let translation_cache = service_clients.redis.translation_cache_store();
+    let translator = match translate::t8_translator_from_app_config(config, translation_cache) {
+        Ok(translator) => RuntimeTranslator::Ready(Box::new(translator)),
+        Err(error) => {
+            tracing::warn!(%error, "translation provider unavailable for unified control jobs");
+            RuntimeTranslator::Unavailable(error.to_string())
+        }
+    };
+    let translate_effects =
+        translate::TranslateDispatcherEffects::new(store.clone(), Arc::clone(&dispatcher_queue));
+    let admin_cache_store = service_clients.redis.chat_admin_cache_store();
+    let group_settings_effects = settings::GroupSettingsRuntimeEffects::new(
+        chat_member_store.clone(),
+        telegram.clone(),
+        chat_member_store.clone(),
+        telegram.clone(),
+        admin_cache_store.clone(),
+    );
+    let join_greeting_sender = settings::TelegramJoinGreetingSender::new(
+        store.clone(),
+        ephemeral_store.clone(),
+        Arc::clone(&permission_policy),
+        telegram.clone(),
+    );
+    let join_greeting_runtime = settings::NewMembersJoinGreetingRuntime::new(
+        service_clients.redis.join_greeting_store(),
+        chat_settings_store.clone(),
+        chat_member_store.clone(),
+        join_greeting_sender,
+    );
+    let new_members_effects = settings::NewMembersFollowupRuntimeEffects::new(
+        members::ChatSettingsCommunicationEffects::new(chat_settings_store.clone()),
+        service_clients.redis.blocked_chat_store(),
+        join_greeting_runtime,
+    );
+    let member_effects = members::MemberStateRuntimeEffects::new(
+        chat_member_store.clone(),
+        telegram.clone(),
+        telegram.clone(),
+        admin_cache_store,
+    );
+    let checkin_game_store = checkin::PostgresCheckinGameStore::new(
+        chat_settings_store.clone(),
+        chat_member_store.clone(),
+    );
+    let checkin_effects = checkin::CheckinGameRuntimeEffects::new(
+        checkin_game_store.clone(),
+        checkin::TelegramCheckinGameSender::new(
+            store.clone(),
+            ephemeral_store.clone(),
+            telegram.clone(),
+        ),
+        Arc::clone(&permission_policy),
+        bot_identity.id,
+    );
+    let bot_username = bot_identity.username.clone();
+    let telegram_effects = Arc::new(telegram.clone());
+    let payment_runtime_effects = Arc::new(payment_effects.clone());
+    let control_queue_for_updates = Arc::new(control_queue.clone());
+    let shared_task_queue_snapshot_path =
+        task_queue::shared_task_queue_snapshot_path_from_config(&config.persistent_queue);
+    let shared_task_queue_snapshot_interval =
+        task_queue::shared_task_queue_snapshot_interval_from_config(&config.persistent_queue);
+    let shared_task_queue_recovery_interval =
+        task_queue::shared_task_queue_recovery_interval_from_config(&config.persistent_queue);
+    let shared_task_queue_heartbeat_interval =
+        task_queue::shared_task_queue_heartbeat_interval_from_config(&config.persistent_queue);
+    let shared_task_queue_placeholder_cleanup_interval =
+        task_queue::shared_task_queue_placeholder_cleanup_interval_from_config(
+            &config.persistent_queue,
+        );
+    let shared_task_queue_placeholder_max_age =
+        task_queue::shared_task_queue_placeholder_max_age_from_config(&config.persistent_queue);
+    let shared_task_queue_store =
+        task_queue::SharedTaskQueueSnapshotFileStore::new(shared_task_queue_snapshot_path);
+    let shared_task_queue_path = shared_task_queue_store.path().to_path_buf();
+    let (shared_task_queue, shared_task_queue_readiness) =
+        match task_queue::SharedTaskQueueRuntime::load_or_new_with_id_allocator(
+            shared_task_queue_store.clone(),
+            taskman_ids.clone(),
+        ) {
+            Ok((runtime, report)) => (
+                runtime,
+                format!(
+                    "restored {} shared taskman jobs, requeued {} processing jobs from Rust-native snapshot at {}",
+                    report.restored,
+                    report.requeued,
+                    shared_task_queue_path.display()
+                ),
+            ),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    path = %shared_task_queue_path.display(),
+                    "failed to load shared task queue snapshot; starting empty"
+                );
+                (
+                    task_queue::SharedTaskQueueRuntime::new_empty_with_id_allocator(
+                        shared_task_queue_store,
+                        taskman_ids,
+                    ),
+                    format!(
+                        "started an empty shared taskman queue after snapshot load failure: {error}"
+                    ),
+                )
+            }
+        };
+    let task_queue_for_updates = shared_task_queue.queue();
+    readiness_checks.push(ReadinessCheck::ok(
+        "shared_task_queue_restore",
+        shared_task_queue_readiness,
+    ));
+    let shared_task_queue_snapshot_runtime = shared_task_queue.clone();
+    let shared_task_queue_snapshot_stop = stop.subscribe();
+    let shared_task_queue_snapshot_worker = tokio::spawn(async move {
+        let report = task_queue::run_shared_task_queue_snapshot_worker_until(
+            shared_task_queue_snapshot_runtime,
+            shared_task_queue_snapshot_interval,
+            wait_for_runtime_stop(shared_task_queue_snapshot_stop),
         )
         .await;
 
-        tracing::info!(?report, "payment control-job worker stopped");
+        tracing::info!(?report, "shared taskman snapshot worker stopped");
     });
     readiness_checks.push(ReadinessCheck::ok(
-        "payment_control_jobs",
-        payment_readiness,
+        "shared_task_queue_snapshot",
+        format!(
+            "periodic Rust-native snapshots every {}s at {}",
+            shared_task_queue_snapshot_interval.as_secs(),
+            shared_task_queue_path.display()
+        ),
     ));
-    workers.handles.push(payment_worker);
+    workers.handles.push(shared_task_queue_snapshot_worker);
+    let shared_task_queue_recovery_runtime = shared_task_queue.clone();
+    let shared_task_queue_recovery_stop = stop.subscribe();
+    let shared_task_queue_recovery_worker = tokio::spawn(async move {
+        let report = task_queue::run_shared_task_queue_recovery_worker_until(
+            shared_task_queue_recovery_runtime,
+            shared_task_queue_recovery_interval,
+            wait_for_runtime_stop(shared_task_queue_recovery_stop),
+        )
+        .await;
+
+        tracing::info!(?report, "shared taskman recovery worker stopped");
+    });
+    readiness_checks.push(ReadinessCheck::ok(
+        "shared_task_queue_recovery",
+        format!(
+            "stale processing recovery every {}s",
+            shared_task_queue_recovery_interval.as_secs()
+        ),
+    ));
+    workers.handles.push(shared_task_queue_recovery_worker);
+    let shared_task_queue_stuck_runtime = shared_task_queue.clone();
+    let shared_task_queue_stuck_stop = stop.subscribe();
+    let shared_task_queue_stuck_worker = tokio::spawn(async move {
+        let report = task_queue::run_shared_task_queue_stuck_cleanup_worker_until(
+            shared_task_queue_stuck_runtime,
+            task_queue::SHARED_TASK_QUEUE_STUCK_SCAN_INTERVAL,
+            task_queue::SHARED_TASK_QUEUE_STUCK_DURATION,
+            wait_for_runtime_stop(shared_task_queue_stuck_stop),
+        )
+        .await;
+
+        tracing::info!(?report, "shared taskman stuck-job cleanup worker stopped");
+    });
+    readiness_checks.push(ReadinessCheck::ok(
+        "shared_task_queue_stuck_cleanup",
+        format!(
+            "stuck-job cleanup every {}s, stuck after {}s",
+            task_queue::SHARED_TASK_QUEUE_STUCK_SCAN_INTERVAL.as_secs(),
+            task_queue::SHARED_TASK_QUEUE_STUCK_DURATION.as_secs()
+        ),
+    ));
+    workers.handles.push(shared_task_queue_stuck_worker);
+    let shared_task_queue_placeholder_runtime = shared_task_queue.clone();
+    let shared_task_queue_placeholder_effects = telegram.clone();
+    let shared_task_queue_placeholder_stop = stop.subscribe();
+    let shared_task_queue_placeholder_worker = tokio::spawn(async move {
+        let report = task_queue::run_shared_task_queue_placeholder_cleanup_worker_until(
+            shared_task_queue_placeholder_runtime,
+            shared_task_queue_placeholder_effects,
+            shared_task_queue_placeholder_cleanup_interval,
+            shared_task_queue_placeholder_max_age,
+            std::time::Duration::from_secs(1),
+            wait_for_runtime_stop(shared_task_queue_placeholder_stop),
+        )
+        .await;
+
+        tracing::info!(?report, "shared taskman placeholder cleanup worker stopped");
+    });
+    readiness_checks.push(ReadinessCheck::ok(
+        "shared_task_queue_placeholder_cleanup",
+        format!(
+            "placeholder cleanup every {}s, max age {}s",
+            shared_task_queue_placeholder_cleanup_interval.as_secs(),
+            shared_task_queue_placeholder_max_age.as_secs()
+        ),
+    ));
+    workers.handles.push(shared_task_queue_placeholder_worker);
+    workers.shared_task_queue = Some(shared_task_queue.clone());
+    let mut shared_taskman_worker_counts = BTreeMap::new();
+    if config.memory.enabled {
+        match (
+            memory_runtime::memory_extractor_from_app_config(config),
+            memory_runtime::memory_write_embedder_from_config(&config.memory),
+        ) {
+            (Ok(_), Ok(memory_write_embedder)) => {
+                let memory_scheduler_store = memory_store.clone();
+                let memory_scheduler_queue = Arc::clone(&task_queue_for_updates);
+                let memory_scheduler_config =
+                    memory_runtime::memory_service_worker_config_from_memory_config(&config.memory);
+                let memory_scheduler_trigger = Arc::clone(&memory_restart_trigger);
+                let memory_scheduler_stop = stop.subscribe();
+                let memory_scheduler = tokio::spawn(async move {
+                    let report =
+                        memory_runtime::run_memory_consolidation_taskman_scheduler_with_trigger_until(
+                            &memory_scheduler_store,
+                            memory_scheduler_queue.as_ref(),
+                            memory_scheduler_config,
+                            memory_scheduler_trigger,
+                            wait_for_runtime_stop(memory_scheduler_stop),
+                        )
+                        .await;
+
+                    tracing::info!(?report, "memory-consolidation taskman scheduler stopped");
+                });
+                workers.handles.push(memory_scheduler);
+
+                let memory_worker_count =
+                    config.persistent_queue.memory_consolidation_workers.max(0);
+                for index in 0..memory_worker_count {
+                    let memory_worker_extractor =
+                        match memory_runtime::memory_extractor_from_app_config(config) {
+                            Ok(extractor) => extractor,
+                            Err(error) => {
+                                tracing::warn!(
+                                    %error,
+                                    index,
+                                    "memory extractor unavailable for memory-consolidation taskman worker"
+                                );
+                                break;
+                            }
+                        };
+                    let memory_worker_store = memory_store.clone();
+                    let memory_worker_embedder = memory_write_embedder.clone();
+                    let memory_worker_queue = Arc::clone(&task_queue_for_updates);
+                    let memory_worker_id = format!(
+                        "{}-{index}",
+                        memory_runtime::MEMORY_CONSOLIDATION_JOB_WORKER_PREFIX
+                    );
+                    let memory_worker_config =
+                        memory_runtime::MemoryConsolidationQueueWorkerConfig {
+                            process:
+                                memory_runtime::memory_service_worker_config_from_memory_config(
+                                    &config.memory,
+                                )
+                                .process,
+                            worker_id: memory_worker_id.clone(),
+                            interval: memory_runtime::MEMORY_CONSOLIDATION_JOB_POLL_INTERVAL,
+                        };
+                    let memory_worker_stop = stop.subscribe();
+                    let memory_worker = tokio::spawn(async move {
+                        let report = memory_runtime::run_memory_consolidation_taskman_worker_until(
+                            memory_worker_queue.as_ref(),
+                            &memory_worker_extractor,
+                            &memory_worker_store,
+                            memory_worker_embedder.as_ref(),
+                            memory_worker_config,
+                            wait_for_runtime_stop(memory_worker_stop),
+                        )
+                        .await;
+
+                        tracing::info!(?report, worker_id = %memory_worker_id, "memory-consolidation taskman worker stopped");
+                    });
+                    workers.handles.push(memory_worker);
+                }
+                readiness_checks.push(ReadinessCheck::ok(
+                    "memory_service",
+                    format!(
+                        "Memory service schedules memory-consolidation taskman jobs and starts {memory_worker_count} workers over SQLx persistence"
+                    ),
+                ));
+                workers.memory_restart_trigger = Some(Arc::clone(&memory_restart_trigger));
+                shared_taskman_worker_counts.insert(
+                    openplotva_taskman::MEMORY_CONSOLIDATION_QUEUE_NAME.to_owned(),
+                    memory_worker_count,
+                );
+            }
+            (Err(error), _) => {
+                tracing::warn!(%error, "memory extractor unavailable for memory-consolidation taskman worker");
+                readiness_checks.push(ReadinessCheck::skipped(
+                    "memory_service",
+                    format!("memory extractor unavailable: {error}"),
+                ));
+            }
+            (_, Err(error)) => {
+                tracing::warn!(%error, "memory embedder unavailable for memory-consolidation taskman worker");
+                readiness_checks.push(ReadinessCheck::skipped(
+                    "memory_service",
+                    format!("memory embedder unavailable: {error}"),
+                ));
+            }
+        }
+    }
+    let payment_store_for_updates = Arc::new(payment_store.clone());
+    let store_for_updates = Arc::new(store.clone());
+    let history_store_for_updates = Arc::new(history_store.clone());
+    let chat_members_for_updates = Arc::new(chat_member_store.clone());
+    let checkin_game_store_for_updates = Arc::new(checkin_game_store.clone());
+    let rate_limits_for_updates = Arc::clone(&rate_limit_policy);
+    let permission_policy_for_updates = Arc::clone(&permission_policy);
+    let dispatcher_queue_for_updates = Arc::clone(&dispatcher_queue);
+    let control_store = store.clone();
+    let control_dispatcher_queue = Arc::clone(&dispatcher_queue);
+    let dialog_translator = Arc::new(translator.clone());
+    let control_stop = stop.subscribe();
+    let control_worker = tokio::spawn(async move {
+        let control_next_sequence = Arc::new(std::sync::atomic::AtomicU64::new(1));
+        let control_next_virtual_id = {
+            let control_next_sequence = Arc::clone(&control_next_sequence);
+            move || {
+                let id = control_next_sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                format!("control-vmsg-{id}")
+            }
+        };
+        let registry = control_jobs::AppControlJobExecutors {
+            payment_store: &payment_store,
+            payment_effects: &payment_effects,
+            settings_store: &control_store,
+            dispatcher_queue: &control_dispatcher_queue,
+            group_settings_effects: &group_settings_effects,
+            new_members_effects: &new_members_effects,
+            bot_username: &bot_username,
+            next_virtual_id: &control_next_virtual_id,
+            translator: &translator,
+            translation_effects: &translate_effects,
+            member_effects: &member_effects,
+            checkin_effects: &checkin_effects,
+        };
+        let report = control_jobs::run_control_job_worker_until(
+            &control_queue,
+            &registry,
+            wait_for_runtime_stop(control_stop),
+        )
+        .await;
+
+        tracing::info!(?report, "unified control-job worker stopped");
+    });
+    readiness_checks.push(ReadinessCheck::ok("control_jobs", control_queue_readiness));
+    workers.handles.push(control_worker);
+
+    let music_client_result = config.music.acestep.enabled.then(|| {
+        openplotva_media::acestep::AceStepClient::new(music_jobs::acestep_config_from_app_config(
+            config,
+        ))
+    });
+    let music_service_available = matches!(music_client_result.as_ref(), Some(Ok(_)));
+    let dialog_tool_adapter = Arc::new(
+        dialog_tools::TaskmanDialogToolAdapter::new(Arc::clone(&task_queue_for_updates))
+            .with_draw_image_vip_status(payment_store_for_updates.clone())
+            .with_draw_image_rate_limit(Arc::new(dialog_tools::DrawImageRateLimitPolicy::new(
+                service_clients.redis.draw_rate_limit_store(),
+            )))
+            .with_draw_image_permission(permission_policy.clone())
+            .with_song_service_available(music_service_available)
+            .with_song_audio_permission(permission_policy.clone())
+            .with_image_edit_file_resolver(Arc::new(
+                dialog_tools::TelegramImageEditFileResolver::new(
+                    PostgresTelegramFileStore::new(service_clients.postgres.clone()),
+                    dialog_tools::TelegramBotFileUrlProvider::new(
+                        telegram.clone(),
+                        bot_key.to_owned(),
+                    ),
+                ),
+            )),
+    );
+    let vision_data_urls = vision::TelegramClientVisionDataUrlProvider::new(telegram.clone());
+    let dialog_tool_vision = Arc::new(
+        vision::TelegramVisionDescriber::new(
+            PostgresTelegramFileStore::new(service_clients.postgres.clone()),
+            vision::AifarmVisionCaptioner::new(
+                vision::aifarm_vision_captioner_config_from_app_config(config),
+                vision_data_urls.clone(),
+            ),
+        )
+        .with_model_name(config.vision.model.clone())
+        .with_history_store(history_store.clone()),
+    );
+    let dialog_context_vision = Arc::new(vision::TelegramDialogVisionInputMaterializer::new(
+        vision::TelegramVisionDescriber::new(
+            PostgresTelegramFileStore::new(service_clients.postgres.clone()),
+            vision::AifarmVisionCaptioner::new(
+                vision::aifarm_vision_captioner_config_from_app_config(config),
+                vision_data_urls.clone(),
+            ),
+        )
+        .with_model_name(config.vision.model.clone())
+        .with_history_store(history_store.clone()),
+        vision_data_urls.clone(),
+        dialog_context::dialog_vision_direct_image_limit(Some(config.vision.direct_image_limit)),
+    ));
+    let rates_fetcher = Arc::new(
+        rates::RbcRatesClient::from_config(&config.rbc)
+            .context("failed to initialize RBC rates provider")?,
+    );
+    let rates_tool_dispatcher = Arc::new(rates::RatesToolDispatcherEffects::new(
+        store.clone(),
+        Arc::clone(&dispatcher_queue),
+    ));
+    let history_summarizer = match history_summary::history_summary_service_from_app_config(
+        config,
+        Arc::new(history_store.clone()),
+    ) {
+        Ok(service) => {
+            readiness_checks.push(ReadinessCheck::ok(
+                "history_summary",
+                "Chat history summary dialog tool wired to Postgres history store and configured provider",
+            ));
+            Some(Arc::new(service) as Arc<dyn dialog_tools::ChatHistorySummarizer>)
+        }
+        Err(error) => {
+            tracing::warn!(%error, "history summary service unavailable for dialog toolbox");
+            readiness_checks.push(ReadinessCheck::skipped(
+                "history_summary",
+                format!("history summary service unavailable: {error}"),
+            ));
+            None
+        }
+    };
+    let youtube_summarizer = match youtube::RuntimeYouTubeSummarizer::from_app_config(config) {
+        Ok(Some(summarizer)) => {
+            let provider = summarizer.provider_label();
+            readiness_checks.push(ReadinessCheck::ok(
+                "youtube_summary",
+                format!("YouTube transcript fetcher and {provider} summary tool wired"),
+            ));
+            Some(Arc::new(summarizer) as Arc<dyn dialog_tools::YouTubeSummarizer>)
+        }
+        Ok(None) => {
+            readiness_checks.push(ReadinessCheck::skipped(
+                "youtube_summary",
+                "YouTube summary dialog tool unavailable: Google AI key is not configured",
+            ));
+            None
+        }
+        Err(error) => {
+            tracing::warn!(%error, "YouTube summary dialog tool unavailable");
+            readiness_checks.push(ReadinessCheck::skipped(
+                "youtube_summary",
+                format!("YouTube summary dialog tool unavailable: {error}"),
+            ));
+            None
+        }
+    };
+    let serper_client = match serper::SerperClient::from_app_config(config) {
+        Ok(Some(client)) => {
+            readiness_checks.push(ReadinessCheck::ok(
+                "serper",
+                "Serper web_search/crawl_url dialog tools wired as the primary search provider",
+            ));
+            Some(Arc::new(client))
+        }
+        Ok(None) => {
+            readiness_checks.push(ReadinessCheck::skipped(
+                "serper",
+                "SERPER_API_KEY is not configured",
+            ));
+            None
+        }
+        Err(error) => {
+            tracing::warn!(%error, "Serper dialog tools unavailable");
+            readiness_checks.push(ReadinessCheck::skipped(
+                "serper",
+                format!("Serper unavailable: {error}"),
+            ));
+            None
+        }
+    };
+    let tinyfish_client = if serper_client.is_some() {
+        readiness_checks.push(ReadinessCheck::skipped(
+            "tinyfish",
+            "TinyFish legacy fallback skipped because SERPER_API_KEY is configured",
+        ));
+        None
+    } else {
+        let tinyfish_runtime_store = Arc::new(tinyfish::PostgresTinyFishRuntimeStore::new(
+            service_clients.postgres.clone(),
+        )) as Arc<dyn tinyfish::TinyFishRuntimeStore>;
+        match tinyfish::TinyFishClient::from_app_config(config, Some(tinyfish_runtime_store)) {
+            Ok(Some(client)) => {
+                client
+                    .bootstrap_runtime_state()
+                    .await
+                    .context("bootstrap tinyfish runtime state")?;
+                readiness_checks.push(ReadinessCheck::ok(
+                    "tinyfish",
+                    "TinyFish legacy web_search/crawl_url fallback wired through REST or MCP/OAuth",
+                ));
+                Some(Arc::new(client))
+            }
+            Ok(None) if !config.tinyfish.enabled => {
+                readiness_checks.push(ReadinessCheck::skipped(
+                    "tinyfish",
+                    "TINYFISH_ENABLED=false",
+                ));
+                None
+            }
+            Ok(None) => {
+                let reason = "TinyFish legacy fallback unavailable: TINYFISH_API_KEY and MCP/OAuth runtime state are not set";
+                readiness_checks.push(ReadinessCheck::skipped("tinyfish", reason));
+                None
+            }
+            Err(error) => {
+                tracing::warn!(%error, "TinyFish dialog tools unavailable");
+                readiness_checks.push(ReadinessCheck::skipped(
+                    "tinyfish",
+                    format!("TinyFish legacy fallback unavailable: {error}"),
+                ));
+                None
+            }
+        }
+    };
+    let mut app_dialog_toolbox = dialog_tools::AppDialogToolbox::new(
+        Some(Arc::clone(&rates_fetcher)),
+        Some(rates_tool_dispatcher),
+        Some(dialog_translator),
+    )
+    .with_queue_status_provider(dialog_tool_adapter.clone())
+    .with_drawing_canceller(dialog_tool_adapter.clone())
+    .with_image_scheduler(dialog_tool_adapter.clone())
+    .with_song_scheduler(dialog_tool_adapter.clone())
+    .with_vision_describer(dialog_tool_vision);
+    if let Some(history_summarizer) = history_summarizer {
+        app_dialog_toolbox = app_dialog_toolbox.with_history_summarizer(history_summarizer);
+    }
+    if let Some(youtube_summarizer) = youtube_summarizer {
+        app_dialog_toolbox = app_dialog_toolbox.with_youtube_summarizer(youtube_summarizer);
+    }
+    if let Some(serper_client) = serper_client {
+        let web_searcher: Arc<dyn dialog_tools::WebSearchProvider> = serper_client.clone();
+        let url_crawler: Arc<dyn dialog_tools::UrlCrawler> = serper_client;
+        app_dialog_toolbox = app_dialog_toolbox
+            .with_web_searcher(web_searcher)
+            .with_url_crawler(url_crawler);
+    } else if let Some(tinyfish_client) = tinyfish_client {
+        let web_searcher: Arc<dyn dialog_tools::WebSearchProvider> = tinyfish_client.clone();
+        let url_crawler: Arc<dyn dialog_tools::UrlCrawler> = tinyfish_client;
+        app_dialog_toolbox = app_dialog_toolbox
+            .with_web_searcher(web_searcher)
+            .with_url_crawler(url_crawler);
+    }
+    let dialog_toolbox: Arc<dyn openplotva_dialog::DialogToolbox> = Arc::new(app_dialog_toolbox);
+    let memory_query_embedder = if dialog_memory_context_enabled(config) {
+        memory_runtime::memory_retrieval_embedder_from_config(&config.memory)?
+            .map(|client| Arc::new(client) as Arc<dyn memory_runtime::EmbeddingProvider>)
+    } else {
+        None
+    };
+    let shield_query_embedder = memory_runtime::shield_embedder_from_config(&config.shield)?
+        .map(|client| Arc::new(client) as Arc<dyn memory_runtime::EmbeddingProvider>);
+    let genkit_fallback = dialog_runtime::genkit_dialog_provider_from_app_config_with_toolbox(
+        config,
+        Some(Arc::clone(&dialog_toolbox)),
+    );
+    let dialog_fallback_provider_for_runtime = genkit_fallback.clone();
+    let mut dialog_provider_for_updates: Option<openplotva_llm::ChatProviderHandle> = None;
+    match dialog_runtime::dialog_provider_from_app_config_with_fallback(
+        config,
+        Arc::clone(&dialog_toolbox),
+        genkit_fallback,
+    ) {
+        Ok(mut dialog_provider) => {
+            if dialog_runtime::white_circle_effective_enabled(config) {
+                let white_circle_client = openplotva_llm::whitecircle::WhiteCircleClient::new(
+                    dialog_runtime::white_circle_client_config_from_app_config(config),
+                );
+                let white_circle_recorder: Arc<
+                    dyn openplotva_llm::whitecircle::WhiteCircleCheckEventRecorder,
+                > = Arc::new(runtime_safety::PostgresWhiteCircleCheckEventRecorder::new(
+                    service_clients.postgres.clone(),
+                ));
+                dialog_provider = Arc::new(
+                    openplotva_llm::whitecircle::WhiteCirclePreToolChatProvider::new(
+                        dialog_provider,
+                        white_circle_client,
+                        Some(white_circle_recorder),
+                        dialog_runtime::white_circle_pre_tool_config_from_app_config(config),
+                    ),
+                );
+            }
+            let dialog_provider: openplotva_llm::ChatProviderHandle = Arc::new(
+                runtime_llm::TracingChatProvider::new(dialog_provider, llm_trace_buffer.clone()),
+            );
+            dialog_provider_for_updates = Some(Arc::clone(&dialog_provider));
+            let dialog_queue = Arc::clone(&task_queue_for_updates);
+            let dialog_effects = dialog_jobs::DialogDispatcherEffects::new(
+                store.clone(),
+                Arc::clone(&dispatcher_queue),
+            );
+            let mut dialog_materializer = dialog_jobs::PostgresDialogInputMaterializer::new(
+                chat_settings_store.clone(),
+                store.clone(),
+                history_store.clone(),
+                dialog_jobs::DialogBotIdentity::new(
+                    bot_identity.id,
+                    bot_identity.first_name.clone(),
+                ),
+            );
+            if dialog_memory_context_enabled(config) {
+                dialog_materializer = dialog_materializer.with_memory_store(memory_store.clone());
+                if let Some(embedder) = memory_query_embedder.clone() {
+                    dialog_materializer = dialog_materializer
+                        .with_memory_embedder(embedder, config.memory.embedding_dim);
+                }
+            }
+            if config.shield.enabled {
+                dialog_materializer = dialog_materializer.with_shield_store(
+                    PostgresShieldStore::new(service_clients.postgres.clone()),
+                    shield_options_from_config(&config.shield),
+                    shield_history_tail_messages_from_config(&config.shield),
+                );
+                if let Some(embedder) = shield_query_embedder.clone() {
+                    dialog_materializer = dialog_materializer.with_shield_embedder(embedder);
+                }
+            }
+            dialog_materializer =
+                dialog_materializer.with_vision_materializer(dialog_context_vision);
+            let dialog_tool_history = history_store.clone();
+            let fallback_materializer = dialog_materializer.clone();
+            let fallback_effects = dialog_effects.clone();
+            let fallback_tool_history = dialog_tool_history.clone();
+            let dialog_provider_for_worker = Arc::clone(&dialog_provider);
+            let dialog_max_llm_job_attempts = config.persistent_queue.llm_job_max_attempts;
+            let dialog_stop = stop.subscribe();
+            let dialog_worker = tokio::spawn(async move {
+                let report =
+                    dialog_jobs::run_dialog_job_worker_with_materializer_and_history_until_with_max_attempts(
+                        dialog_queue.as_ref(),
+                        dialog_provider_for_worker.as_ref(),
+                        &dialog_effects,
+                        &dialog_materializer,
+                        &dialog_tool_history,
+                        dialog_max_llm_job_attempts,
+                        wait_for_runtime_stop(dialog_stop),
+                    )
+                    .await;
+
+                tracing::info!(?report, "dialog taskman worker stopped");
+            });
+            readiness_checks.push(ReadinessCheck::ok(
+                "dialog_jobs",
+                "Dialog taskman worker started for text and dialog-aifarm queues with storage-backed input materialization",
+            ));
+            for queue_name in dialog_jobs::DIALOG_JOB_WORKER_QUEUES {
+                shared_taskman_worker_counts.insert(queue_name.to_owned(), 1);
+            }
+            workers.handles.push(dialog_worker);
+
+            let fallback_worker_count = config
+                .persistent_queue
+                .dialog_aifarm_fallback_workers
+                .max(0);
+            if fallback_worker_count > 0 {
+                if let Some(dialog_fallback_provider) = dialog_fallback_provider_for_runtime.clone()
+                {
+                    let dialog_fallback_provider: openplotva_llm::ChatProviderHandle =
+                        Arc::new(runtime_llm::TracingChatProvider::new(
+                            dialog_fallback_provider,
+                            llm_trace_buffer.clone(),
+                        ));
+                    let fallback_high = config
+                        .persistent_queue
+                        .dialog_aifarm_fallback_high_watermark;
+                    let fallback_low = config.persistent_queue.dialog_aifarm_fallback_low_watermark;
+                    let fallback_interval = Duration::from_secs(
+                        config
+                            .persistent_queue
+                            .dialog_aifarm_fallback_poll_interval_seconds
+                            .max(1) as u64,
+                    );
+                    for index in 0..fallback_worker_count {
+                        let fallback_queue = Arc::clone(&task_queue_for_updates);
+                        let fallback_provider = Arc::clone(&dialog_fallback_provider);
+                        let fallback_effects = fallback_effects.clone();
+                        let fallback_materializer = fallback_materializer.clone();
+                        let fallback_tool_history = fallback_tool_history.clone();
+                        let fallback_stop = stop.subscribe();
+                        let fallback_worker = tokio::spawn(async move {
+                            let report =
+                                dialog_jobs::run_dialog_aifarm_fallback_worker_with_materializer_and_history_until_with_max_attempts(
+                                    fallback_queue.as_ref(),
+                                    fallback_provider.as_ref(),
+                                    &fallback_effects,
+                                    dialog_jobs::DialogAifarmFallbackWorkerOptions {
+                                        materializer: &fallback_materializer,
+                                        tool_history: &fallback_tool_history,
+                                        high_watermark: fallback_high,
+                                        low_watermark: fallback_low,
+                                        interval: fallback_interval,
+                                        max_llm_job_attempts: dialog_max_llm_job_attempts,
+                                    },
+                                    wait_for_runtime_stop(fallback_stop),
+                                )
+                                .await;
+
+                            tracing::info!(?report, index, "dialog-aifarm fallback worker stopped");
+                        });
+                        workers.handles.push(fallback_worker);
+                    }
+                    readiness_checks.push(ReadinessCheck::ok(
+                        "dialog_aifarm_fallback_jobs",
+                        format!(
+                            "Started {fallback_worker_count} dialog-aifarm fallback workers with configured high/low watermarks {fallback_high}/{fallback_low}"
+                        ),
+                    ));
+                    shared_taskman_worker_counts
+                        .entry(openplotva_taskman::DIALOG_AIFARM_QUEUE_NAME.to_owned())
+                        .and_modify(|count| *count += fallback_worker_count)
+                        .or_insert(fallback_worker_count);
+                } else {
+                    readiness_checks.push(ReadinessCheck::skipped(
+                        "dialog_aifarm_fallback_jobs",
+                        "fallback provider unavailable",
+                    ));
+                }
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, "dialog provider unavailable for dialog taskman worker");
+            readiness_checks.push(ReadinessCheck::skipped(
+                "dialog_jobs",
+                format!("dialog provider unavailable: {error}"),
+            ));
+        }
+    }
+
+    let media_prompt_optimizer = media::MediaPromptOptimizerService::new(
+        media::media_prompt_optimizer_from_app_config(config),
+    );
+    let media_max_llm_job_attempts = config.persistent_queue.llm_job_max_attempts;
+    let vip_image_queue = Arc::clone(&task_queue_for_updates);
+    let vip_image_generator = image_jobs::OptimizingImageGenerator::new(
+        image_jobs::FallbackImageGenerator::new(
+            image_jobs::PrunaImageGenerator::new(image_jobs::pruna_config_from_app_config(config))
+                .map_err(|error| anyhow::anyhow!("build Pruna image generator: {error:?}"))?,
+            image_jobs::AifarmDrawApiImageGenerator::new(
+                image_jobs::aifarm_draw_api_config_from_app_config(config),
+            ),
+        ),
+        media_prompt_optimizer.clone(),
+    );
+    let vip_image_effects = image_jobs::TelegramImageJobEffects::new(
+        service_clients.redis.queued_sticker_store(),
+        ephemeral_store.clone(),
+        telegram.clone(),
+    );
+    let vip_image_stop = stop.subscribe();
+    let vip_image_worker = tokio::spawn(async move {
+        let report = image_jobs::run_image_gen_worker_every_until_with_max_attempts(
+            vip_image_queue.as_ref(),
+            &vip_image_generator,
+            &vip_image_effects,
+            &image_jobs::IMAGE_VIP_JOB_WORKER_QUEUES,
+            image_jobs::IMAGE_JOB_POLL_INTERVAL,
+            media_max_llm_job_attempts,
+            wait_for_runtime_stop(vip_image_stop),
+        )
+        .await;
+
+        tracing::info!(?report, "VIP image generation taskman worker stopped");
+    });
+    workers.handles.push(vip_image_worker);
+
+    let vip_image_edit_queue = Arc::clone(&task_queue_for_updates);
+    let vip_image_edit_provider = image_jobs::OptimizingImageEditor::new(
+        image_jobs::ResolvingImageEditor::new(
+            vision_data_urls.clone(),
+            image_jobs::AifarmDrawApiImageGenerator::new(
+                image_jobs::aifarm_draw_api_config_from_app_config(config),
+            ),
+        ),
+        media_prompt_optimizer.clone(),
+    );
+    let vip_image_edit_effects = image_jobs::TelegramImageJobEffects::new(
+        service_clients.redis.queued_sticker_store(),
+        ephemeral_store.clone(),
+        telegram.clone(),
+    );
+    let vip_image_edit_stop = stop.subscribe();
+    let vip_image_edit_worker = tokio::spawn(async move {
+        let report = image_jobs::run_image_edit_worker_every_until_with_max_attempts(
+            vip_image_edit_queue.as_ref(),
+            &vip_image_edit_provider,
+            &vip_image_edit_effects,
+            &image_jobs::IMAGE_VIP_JOB_WORKER_QUEUES,
+            image_jobs::IMAGE_JOB_POLL_INTERVAL,
+            media_max_llm_job_attempts,
+            wait_for_runtime_stop(vip_image_edit_stop),
+        )
+        .await;
+
+        tracing::info!(?report, "VIP image edit taskman worker stopped");
+    });
+    workers.handles.push(vip_image_edit_worker);
+
+    let regular_image_queue = Arc::clone(&task_queue_for_updates);
+    let regular_image_generator = image_jobs::OptimizingImageGenerator::new(
+        image_jobs::AifarmDrawApiImageGenerator::new(
+            image_jobs::aifarm_draw_api_config_from_app_config(config),
+        ),
+        media_prompt_optimizer,
+    );
+    let regular_image_effects = image_jobs::TelegramImageJobEffects::new(
+        service_clients.redis.queued_sticker_store(),
+        ephemeral_store.clone(),
+        telegram.clone(),
+    );
+    let regular_image_stop = stop.subscribe();
+    let regular_image_worker = tokio::spawn(async move {
+        let report = image_jobs::run_image_gen_worker_every_until_with_max_attempts(
+            regular_image_queue.as_ref(),
+            &regular_image_generator,
+            &regular_image_effects,
+            &image_jobs::IMAGE_REGULAR_JOB_WORKER_QUEUES,
+            image_jobs::IMAGE_JOB_POLL_INTERVAL,
+            media_max_llm_job_attempts,
+            wait_for_runtime_stop(regular_image_stop),
+        )
+        .await;
+
+        tracing::info!(?report, "regular image generation taskman worker stopped");
+    });
+    workers.handles.push(regular_image_worker);
+    readiness_checks.push(ReadinessCheck::ok(
+        "image_jobs",
+        "Image taskman workers started for VIP generation/edit and regular generation queues with VIP Pruna-to-draw-api fallback plus draw-api edit/regular providers",
+    ));
+    for queue_name in image_jobs::IMAGE_VIP_JOB_WORKER_QUEUES {
+        shared_taskman_worker_counts
+            .entry(queue_name.to_owned())
+            .and_modify(|count| *count += 2)
+            .or_insert(2);
+    }
+    for queue_name in image_jobs::IMAGE_REGULAR_JOB_WORKER_QUEUES {
+        shared_taskman_worker_counts
+            .entry(queue_name.to_owned())
+            .and_modify(|count| *count += 1)
+            .or_insert(1);
+    }
+    if let Some(music_client_result) = music_client_result {
+        match music_client_result {
+            Ok(acestep_client) => {
+                let music_queue = Arc::clone(&task_queue_for_updates);
+                let aifarm_song_prompt_generator =
+                    media::aifarm_media_prompt_optimizer_from_app_config(config);
+                let music_song_prompt_generator: Arc<
+                    dyn music_jobs::SongPromptGenerator + Send + Sync,
+                > = match media::gemini_media_prompt_optimizer_from_app_config(config) {
+                    Some(gemini_song_prompt_generator) => {
+                        Arc::new(music_jobs::FallbackSongPromptGenerator::go_aifarm_gemini(
+                            aifarm_song_prompt_generator,
+                            gemini_song_prompt_generator,
+                        ))
+                    }
+                    None => Arc::new(aifarm_song_prompt_generator),
+                };
+                let music_material_provider = music_jobs::AifarmSongMaterialProvider::new(
+                    music_song_prompt_generator,
+                    PostgresVirtualMessageStore::new(service_clients.postgres.clone()),
+                );
+                let music_generator = music_jobs::AceStepMusicGenerator::new(
+                    acestep_client,
+                    config.music.acestep.audio_format.clone(),
+                );
+                let music_effects = music_jobs::TelegramMusicJobEffects::new(
+                    Arc::clone(&permission_policy),
+                    PostgresTelegramFileStore::new(service_clients.postgres.clone()),
+                    telegram.clone(),
+                );
+                let music_stop = stop.subscribe();
+                let music_worker = tokio::spawn(async move {
+                    let report = music_jobs::run_music_worker_every_until_with_max_attempts(
+                        music_queue.as_ref(),
+                        &music_material_provider,
+                        &music_generator,
+                        &music_effects,
+                        music_jobs::MUSIC_JOB_POLL_INTERVAL,
+                        media_max_llm_job_attempts,
+                        wait_for_runtime_stop(music_stop),
+                    )
+                    .await;
+
+                    tracing::info!(?report, "music generation taskman worker stopped");
+                });
+                workers.handles.push(music_worker);
+                readiness_checks.push(ReadinessCheck::ok(
+                    "music_jobs",
+                    "Music taskman worker started for music-vip queue with AIFarm song reprompt, optional Gemini fallback, and ACE-Step provider",
+                ));
+                for queue_name in music_jobs::MUSIC_JOB_WORKER_QUEUES {
+                    shared_taskman_worker_counts
+                        .entry(queue_name.to_owned())
+                        .and_modify(|count| *count += 1)
+                        .or_insert(1);
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "ACE-Step client unavailable for music taskman worker");
+                readiness_checks.push(ReadinessCheck::skipped(
+                    "music_jobs",
+                    format!("ACE-Step client unavailable: {error}"),
+                ));
+            }
+        }
+    } else {
+        readiness_checks.push(ReadinessCheck::skipped(
+            "music_jobs",
+            "ACESTEP_ENABLED=false",
+        ));
+    }
+    let shared_taskman_worker_ids =
+        task_queue::shared_task_queue_worker_ids(&shared_taskman_worker_counts);
+    taskman_inspector.set_shared_queue(
+        Arc::clone(&task_queue_for_updates),
+        shared_taskman_worker_counts,
+    );
+    let shared_task_queue_heartbeat_runtime = shared_task_queue.clone();
+    let shared_task_queue_heartbeat_stop = stop.subscribe();
+    let shared_task_queue_heartbeat_worker_ids = shared_taskman_worker_ids.clone();
+    let shared_task_queue_heartbeat_worker = tokio::spawn(async move {
+        let report = task_queue::run_shared_task_queue_heartbeat_worker_until(
+            shared_task_queue_heartbeat_runtime,
+            shared_task_queue_heartbeat_worker_ids,
+            shared_task_queue_heartbeat_interval,
+            wait_for_runtime_stop(shared_task_queue_heartbeat_stop),
+        )
+        .await;
+
+        tracing::info!(?report, "shared taskman worker heartbeat stopped");
+    });
+    readiness_checks.push(ReadinessCheck::ok(
+        "shared_task_queue_worker_heartbeat",
+        format!(
+            "worker heartbeat every {}s for {} shared taskman workers",
+            shared_task_queue_heartbeat_interval.as_secs(),
+            shared_taskman_worker_ids.len()
+        ),
+    ));
+    workers.handles.push(shared_task_queue_heartbeat_worker);
 
     let pending_store = store.clone();
     let pending_history = history_store.clone();
@@ -855,7 +9340,12 @@ async fn start_runtime_workers(
         tracing::info!(?outcome, "outbound immediate dispatcher worker stopped");
     });
 
-    if config.bot.webhook.enabled {
+    if !config.service_probe.produce_updates {
+        readiness_checks.push(ReadinessCheck::skipped(
+            "telegram_update_producer",
+            "OPENPLOTVA_PRODUCE_UPDATES=false",
+        ));
+    } else if config.bot.webhook.enabled {
         if config.bot.webhook.url.is_empty() {
             tracing::warn!("BOT_WEBHOOK_URL is required when webhook updates are enabled");
             readiness_checks.push(ReadinessCheck::skipped(
@@ -942,6 +9432,405 @@ async fn start_runtime_workers(
         ));
     }
 
+    if config.service_probe.consume_updates {
+        let dialog_debounce = Arc::new(dialog_debounce::InMemoryDialogDebounce::new());
+        workers.dialog_debounce = Some(Arc::clone(&dialog_debounce));
+        let dialog_scheduler = Arc::new(
+            dialog_messages::TaskmanDialogMessageScheduler::new(
+                Arc::clone(&task_queue_for_updates),
+                Arc::clone(&dialog_debounce),
+                dialog_debounce::GO_DIALOG_DEBOUNCE_INTERVAL,
+            )
+            .with_typing_effects(Arc::new(
+                dialog_messages::DialogTypingActionRuntimeEffects::new(
+                    telegram.clone(),
+                    Arc::clone(&permission_policy),
+                ),
+            )),
+        );
+        let random_dialog_effects = Arc::new(dialog_messages::RandomDialogDispatcherEffects::new(
+            store.clone(),
+            Arc::clone(&dispatcher_queue_for_updates),
+        ));
+        let mut direct_draw_api_config = image_jobs::aifarm_draw_api_config_from_app_config(config);
+        direct_draw_api_config.timeout = Duration::from_secs(120);
+        let direct_draw_api_effects = Arc::new(
+            dialog_messages::DirectDrawApiRuntimeEffects::new(
+                telegram.clone(),
+                image_jobs::AifarmDrawApiImageGenerator::new(direct_draw_api_config),
+            )
+            .with_send_policies(rate_limit_policy.clone(), permission_policy.clone())
+            .with_history_store(history_store_for_updates.clone(), bot_identity.id),
+        );
+        let terminal = Arc::new(RuntimeUnhandledUpdateHandler);
+        let dialog_terminal = Arc::new(
+            dialog_messages::DialogMessageUpdateHandler::new(
+                dialog_scheduler,
+                Arc::new(chat_settings_store.clone()),
+                random_dialog_effects,
+                Arc::new(dialog_messages::ThreadRandomDialogRng),
+                dialog_messages::DialogMessageUpdateConfig::from_app_config(
+                    config,
+                    bot_user_from_get_me(&bot_identity),
+                ),
+                terminal,
+            )
+            .with_image_scheduler(dialog_tool_adapter.clone())
+            .with_song_scheduler(dialog_tool_adapter.clone())
+            .with_direct_draw_api_effects(direct_draw_api_effects),
+        );
+        let skipped = Arc::new(skipped::SkippedUpdateHandler::new(dialog_terminal));
+        let mut guest_effects = guest::GuestRuntimeEffects::new(telegram.clone())
+            .with_dialog_provider(dialog_provider_for_updates.clone());
+        if config.shield.enabled {
+            guest_effects = guest_effects.with_shield_store(
+                PostgresShieldStore::new(service_clients.postgres.clone()),
+                shield_options_from_config(&config.shield),
+            );
+            if let Some(embedder) = shield_query_embedder.clone() {
+                guest_effects = guest_effects.with_shield_embedder(embedder);
+            }
+        }
+        let guest_handler = Arc::new(guest::GuestMessageUpdateHandler::new(
+            Arc::new(guest_effects),
+            guest::GuestMessageConfig {
+                bot_user: bot_user_from_get_me(&bot_identity),
+                shield_query_max_chars: shield_options_from_config(&config.shield).query_max_chars,
+            },
+            skipped,
+        ));
+        let delete_lyrics = Arc::new(delete_lyrics::DeleteLyricsCallbackUpdateHandler::new(
+            Arc::clone(&telegram_effects),
+            Arc::clone(&telegram_effects),
+            guest_handler,
+        ));
+        let delete_drawing = Arc::new(delete_drawing::DeleteDrawingCallbackUpdateHandler::new(
+            Arc::new(service_clients.redis.last_generation_store()),
+            Arc::clone(&telegram_effects),
+            Arc::clone(&payment_store_for_updates),
+            Arc::clone(&telegram_effects),
+            delete_lyrics,
+        ));
+        let checkin_theme = Arc::new(checkin::CheckinThemeCallbackUpdateHandler::new(
+            Arc::clone(&control_queue_for_updates),
+            Arc::new(checkin::CheckinThemeRuntimeEffects::new(
+                store.clone(),
+                Arc::clone(&dispatcher_queue_for_updates),
+                telegram.clone(),
+            )),
+            delete_drawing,
+        ));
+        let vip_callbacks = Arc::new(payments::VipCancellationCallbackUpdateHandler::new(
+            Arc::clone(&payment_store_for_updates),
+            Arc::clone(&payment_runtime_effects),
+            checkin_theme,
+        ));
+        let delete_message = Arc::new(delete_message::DeleteMessageCallbackUpdateHandler::new(
+            Arc::clone(&telegram_effects),
+            Arc::clone(&telegram_effects),
+            vip_callbacks,
+        ));
+        let callbacks = Arc::new(callbacks::CallbackQueryUpdateHandler::new(
+            Arc::clone(&telegram_effects),
+            rate_limits_for_updates,
+            delete_message,
+        ));
+        let inline = Arc::new(inline::InlineQueryUpdateHandler::new(
+            Arc::clone(&telegram_effects),
+            callbacks,
+        ));
+        let text_reply_settings_gate =
+            Arc::new(message_gate::TextReplySettingsGateUpdateHandler::new(
+                Arc::new(chat_settings_store.clone()),
+                inline,
+            ));
+        let reset_handler = Arc::new(reset::ResetCommandUpdateHandler::new(
+            Arc::clone(&history_store_for_updates),
+            Arc::clone(&store_for_updates),
+            Arc::clone(&dispatcher_queue_for_updates),
+            bot_identity.username.clone(),
+            text_reply_settings_gate,
+        ));
+        let delete_drawing_command =
+            Arc::new(delete_drawing::DeleteDrawingCommandUpdateHandler::new(
+                Arc::new(service_clients.redis.last_generation_store()),
+                Arc::new(delete_drawing::DeleteDrawingCommandDispatcherEffects::new(
+                    store.clone(),
+                    Arc::clone(&dispatcher_queue_for_updates),
+                )),
+                reset_handler,
+            ));
+        let translate_handler = Arc::new(translate::TranslateCommandUpdateHandler::new(
+            translate::TranslateBotIdentity {
+                user: bot_user_from_get_me(&bot_identity),
+            },
+            Arc::new(MessageGateCheckedTranslatePermission),
+            Arc::clone(&control_queue_for_updates),
+            Arc::new(translate::TranslateDispatcherEffects::new(
+                store.clone(),
+                Arc::clone(&dispatcher_queue_for_updates),
+            )),
+            delete_drawing_command,
+        ));
+        let rates_handler = Arc::new(rates::RatesCommandUpdateHandler::new(
+            rates::RatesBotIdentity {
+                user: bot_user_from_get_me(&bot_identity),
+            },
+            Arc::new(MessageGateCheckedRatesPermission),
+            Some(Arc::clone(&rates_fetcher)),
+            Arc::new(RuntimeRatesHeaderProvider),
+            Arc::new(rates::RatesDispatcherEffects::new(
+                store.clone(),
+                Arc::clone(&dispatcher_queue_for_updates),
+            )),
+            translate_handler,
+        ));
+        let checkin_command = Arc::new(checkin::CheckinCommandUpdateHandler::new(
+            Arc::clone(&control_queue_for_updates),
+            checkin_game_store_for_updates,
+            Arc::clone(&permission_policy),
+            Arc::new(checkin::CheckinCommandDispatcherEffects::new(
+                store.clone(),
+                Arc::clone(&dispatcher_queue_for_updates),
+            )),
+            bot_identity.username.clone(),
+            rates_handler,
+        ));
+        let post_service_blocked_gate =
+            Arc::new(message_gate::PostServiceBlockedChatUpdateHandler::new(
+                Arc::new(service_clients.redis.blocked_chat_store()),
+                checkin_command,
+            ));
+        let settings_handler = Arc::new(settings::SettingsUpdateHandler::new(
+            Arc::clone(&store_for_updates),
+            Arc::clone(&dispatcher_queue_for_updates),
+            Arc::clone(&chat_members_for_updates),
+            Arc::clone(&control_queue_for_updates),
+            settings::SettingsUpdateHandlerConfig::new(
+                bot_identity.username.clone(),
+                bot_identity.id,
+                config.server.url.clone(),
+            ),
+            post_service_blocked_gate,
+        ));
+        let chat_communication = Arc::new(members::ChatSettingsCommunicationEffects::new(
+            chat_settings_store.clone(),
+        ));
+        let payment_handler = Arc::new(
+            payments::PaymentUpdateHandler::new(
+                Arc::clone(&control_queue_for_updates),
+                Arc::clone(&payment_store_for_updates),
+                Arc::clone(&telegram_effects),
+                settings_handler,
+            )
+            .with_bot_username(bot_identity.username.clone()),
+        );
+        let admin_chat_settings_handler =
+            Arc::new(settings::AdminChatSettingsCommandUpdateHandler::new(
+                Arc::clone(&store_for_updates),
+                Arc::clone(&dispatcher_queue_for_updates),
+                Arc::new(telegram.clone()),
+                config.admins.admin_ids.clone(),
+                bot_identity.username.clone(),
+                config.server.url.clone(),
+                Arc::clone(&payment_handler),
+            ));
+        let admin_settings_handler = Arc::new(admin::AdminSettingsCommandUpdateHandler::new(
+            Arc::new(admin::AdminDispatcherEffects::new(
+                store.clone(),
+                Arc::clone(&dispatcher_queue_for_updates),
+            )),
+            config.admins.admin_ids.clone(),
+            bot_identity.username.clone(),
+            config.server.url.clone(),
+            admin_chat_settings_handler,
+        ));
+        let admin_enable_chat_handler = Arc::new(admin::AdminEnableChatCommandUpdateHandler::new(
+            Arc::new(telegram.clone()),
+            Arc::clone(&chat_communication),
+            Arc::new(admin::AdminDispatcherEffects::new(
+                store.clone(),
+                Arc::clone(&dispatcher_queue_for_updates),
+            )),
+            config.admins.admin_ids.clone(),
+            bot_identity.username.clone(),
+            admin_settings_handler,
+        ));
+        let admin_gemini_cache_purger =
+            runtime_gemini_cache::GeminiExplicitCachePurger::from_config(&config.google_ai)
+                .map(Arc::new);
+        let admin_gemini_cache_handler =
+            Arc::new(admin::AdminGeminiCacheCommandUpdateHandler::new(
+                admin_gemini_cache_purger,
+                Arc::new(admin::AdminDispatcherEffects::new(
+                    store.clone(),
+                    Arc::clone(&dispatcher_queue_for_updates),
+                )),
+                config.admins.admin_ids.clone(),
+                bot_identity.username.clone(),
+                admin_enable_chat_handler,
+            ));
+        let admin_redis_cache_handler = Arc::new(admin::AdminRedisCacheCommandUpdateHandler::new(
+            Arc::new(service_clients.redis.client().clone()),
+            Arc::new(admin::AdminDispatcherEffects::new(
+                store.clone(),
+                Arc::clone(&dispatcher_queue_for_updates),
+            )),
+            config.admins.admin_ids.clone(),
+            bot_identity.username.clone(),
+            admin_gemini_cache_handler,
+        ));
+        let admin_runtime_token_manager = config.runtime_api.enabled.then(|| {
+            Arc::new(runtime_api::RuntimeTokenManager::new(
+                PostgresRuntimeTokenStore::new(service_clients.postgres.clone()),
+            ))
+        });
+        let runtime_api_tls_public_key_pin = config.runtime_api.tls_public_key_pin.clone();
+        let admin_runtime_token_handler =
+            Arc::new(admin::AdminRuntimeTokenCommandUpdateHandler::new(
+                admin_runtime_token_manager,
+                Arc::new(admin::AdminDispatcherEffects::new(
+                    store.clone(),
+                    Arc::clone(&dispatcher_queue_for_updates),
+                )),
+                config.admins.admin_ids.clone(),
+                bot_identity.username.clone(),
+                runtime_api_tls_public_key_pin,
+                admin_redis_cache_handler,
+            ));
+        let admin_help_handler = Arc::new(admin::AdminHelpCommandUpdateHandler::new(
+            Arc::new(admin::AdminDispatcherEffects::new(
+                store.clone(),
+                Arc::clone(&dispatcher_queue_for_updates),
+            )),
+            config.admins.admin_ids.clone(),
+            bot_identity.username.clone(),
+            admin_runtime_token_handler,
+        ));
+        let admin_taskman_inspector: Arc<dyn openplotva_server::RuntimeTaskmanInspector> =
+            Arc::new(taskman_inspector.clone());
+        let admin_dispatcher_inspector: Arc<dyn openplotva_server::RuntimeDispatcherInspector> =
+            Arc::new(dispatcher_inspector.clone());
+        let admin_updates_inspector: Arc<dyn openplotva_server::RuntimeUpdatesInspector> =
+            Arc::new(updates_inspector.clone());
+        let admin_dialog_debounce = Arc::clone(&dialog_debounce);
+        let admin_queue_handler = Arc::new(admin::AdminQueueCommandUpdateHandler::new(
+            admin::AdminQueueRuntimeConfig::new(admin_queue_config_from_app_config(config))
+                .with_taskman(admin_taskman_inspector)
+                .with_dispatcher(admin_dispatcher_inspector)
+                .with_updates(admin_updates_inspector)
+                .with_dialog_debounce_len(Arc::new(move || admin_dialog_debounce.len())),
+            Arc::new(admin::AdminDispatcherEffects::new(
+                store.clone(),
+                Arc::clone(&dispatcher_queue_for_updates),
+            )),
+            config.admins.admin_ids.clone(),
+            bot_identity.username.clone(),
+            admin_help_handler,
+        ));
+        let admin_vip_handler = Arc::new(payments::AdminVipCommandUpdateHandler::new(
+            Arc::clone(&store_for_updates),
+            Arc::clone(&dispatcher_queue_for_updates),
+            Arc::clone(&payment_store_for_updates),
+            Arc::clone(&payment_runtime_effects),
+            config.admins.admin_ids.clone(),
+            bot_identity.username.clone(),
+            admin_queue_handler,
+        ));
+        let diagnostics_handler = Arc::new(diagnostics::DiagnosticsCommandUpdateHandler::new(
+            diagnostics::DiagnosticsBotIdentity {
+                username: bot_identity.username.clone(),
+            },
+            Arc::new(diagnostics::DiagnosticsDispatcherEffects::new(
+                store.clone(),
+                Arc::clone(&dispatcher_queue_for_updates),
+                telegram.clone(),
+                service_clients.redis.client().clone(),
+            )),
+            admin_vip_handler,
+        ));
+        let help_handler = Arc::new(help::HelpCommandUpdateHandler::new(
+            help::HelpBotIdentity {
+                first_name: bot_identity.first_name.clone(),
+                username: bot_identity.username.clone(),
+                token: bot_key.to_owned(),
+            },
+            Arc::new(help::HelpDispatcherEffects::new(
+                store.clone(),
+                Arc::clone(&dispatcher_queue_for_updates),
+                telegram.clone(),
+                Arc::clone(&payment_handler),
+            )),
+            diagnostics_handler,
+        ));
+        let left_member = Arc::new(members::LeftChatMemberUpdateHandler::new(
+            Arc::clone(&chat_members_for_updates),
+            Arc::clone(&chat_communication),
+            bot_identity.id,
+            help_handler,
+        ));
+        let member_state = Arc::new(members::ChatMemberStateUpdateHandler::new(
+            Arc::clone(&chat_members_for_updates),
+            Arc::clone(&control_queue_for_updates),
+            chat_communication,
+            bot_identity.id,
+            left_member,
+        ));
+        let activity = Arc::new(activity::MessageActivityUpdateHandler::new(
+            Arc::clone(&chat_members_for_updates),
+            member_state,
+        ));
+        let edited_effects = Arc::new(
+            edited::TaskmanEditedMessageEffects::new(Arc::clone(&task_queue_for_updates))
+                .with_dialog_debounce(dialog_debounce),
+        );
+        let edited = Arc::new(edited::EditedMessageUpdateHandler::new(
+            edited_effects,
+            bot_user_from_get_me(&bot_identity),
+            activity,
+        ));
+        let history_handler = Arc::new(updates::UpdateHandlerWithHistory::new(
+            Arc::clone(&history_store_for_updates),
+            edited,
+            bot_identity.id,
+        ));
+        let handler = Arc::new(message_gate::MessageGateUpdateHandler::new(
+            Arc::clone(&rate_limit_policy),
+            permission_policy_for_updates,
+            Arc::new(service_clients.redis.blocked_chat_store()),
+            bot_identity.username.clone(),
+            history_handler,
+        ));
+        let update_consumer_queue = Arc::new(openplotva_updates::RedisUpdateQueue::new(
+            service_clients.redis.client().clone(),
+        ));
+        let update_stage_tracker = Arc::new(updates_inspector.stage_tracker());
+        let update_consumer_stop = stop.subscribe();
+        let update_consumer_worker = tokio::spawn(async move {
+            let report = updates::run_update_consumer_with_stage_tracker_until(
+                update_consumer_queue,
+                openplotva_updates::UpdateConsumerConfig::default(),
+                store_for_updates,
+                handler,
+                update_stage_tracker,
+                wait_for_runtime_stop(update_consumer_stop),
+            )
+            .await;
+
+            tracing::info!(?report, "Telegram decoded update consumer stopped");
+        });
+        workers.handles.push(update_consumer_worker);
+        readiness_checks.push(ReadinessCheck::ok(
+            "telegram_update_consumer",
+            "Telegram decoded update consumer worker started for ported fetcher slices",
+        ));
+    } else {
+        readiness_checks.push(ReadinessCheck::skipped(
+            "telegram_update_consumer",
+            "OPENPLOTVA_CONSUME_UPDATES=false",
+        ));
+    }
+
     let regular_store = store;
     let regular_history = history_store;
     let regular_telegram = telegram;
@@ -1009,7 +9898,18 @@ async fn shutdown_runtime_workers(workers: RuntimeWorkers) {
         handles,
         stop,
         dispatcher,
+        shared_task_queue,
+        dialog_debounce,
         webhook_route: _,
+        telegram,
+        delete_webhook_on_shutdown,
+        bot_username: _,
+        bot_id: _,
+        dispatcher_inspector: _,
+        cache_inspector: _,
+        taskman_inspector: _,
+        memory_restart_trigger: _,
+        llm_trace_buffer: _,
     } = workers;
 
     if let Some(stop) = stop {
@@ -1020,8 +9920,39 @@ async fn shutdown_runtime_workers(workers: RuntimeWorkers) {
         persist_dispatcher_queue_on_shutdown(dispatcher).await;
     }
 
+    if let Some(dialog_debounce) = dialog_debounce {
+        let stopped = dialog_debounce.stop_all();
+        if stopped > 0 {
+            tracing::info!(stopped, "stopped pending dialog debounce timers");
+        }
+    }
+
     for worker in handles {
         await_runtime_worker_shutdown(worker).await;
+    }
+
+    if let Some(shared_task_queue) = shared_task_queue {
+        persist_shared_task_queue_on_shutdown(shared_task_queue).await;
+    }
+
+    if delete_webhook_on_shutdown {
+        match telegram {
+            Some(telegram) => match delete_webhook_on_shutdown_if_enabled(true, &telegram).await {
+                WebhookShutdownCleanupReport::Deleted => {
+                    tracing::debug!("Telegram webhook configuration deleted during shutdown");
+                }
+                WebhookShutdownCleanupReport::Failed { error } => {
+                    tracing::warn!(%error, "failed to delete Telegram webhook during shutdown");
+                }
+                WebhookShutdownCleanupReport::TimedOut => {
+                    tracing::warn!("timed out deleting Telegram webhook during shutdown");
+                }
+                WebhookShutdownCleanupReport::SkippedDisabled => {}
+            },
+            None => {
+                tracing::warn!("Telegram webhook cleanup was requested without a Telegram client");
+            }
+        }
     }
 }
 
@@ -1074,6 +10005,33 @@ async fn await_runtime_worker_shutdown(mut worker: JoinHandle<()>) {
                 Err(error) if error.is_cancelled() => {}
                 Err(error) => tracing::warn!(%error, "runtime worker abort failed"),
             }
+        }
+    }
+}
+
+async fn persist_shared_task_queue_on_shutdown(queue: task_queue::SharedTaskQueueRuntime) {
+    let path = queue.snapshot_path().to_path_buf();
+    let save_result = timeout(task_queue::SHARED_TASK_QUEUE_SHUTDOWN_TIMEOUT, async {
+        queue.persist_snapshot()
+    })
+    .await;
+
+    match save_result {
+        Ok(Ok(())) => {
+            tracing::info!(
+                path = %path.display(),
+                "saved shared taskman queue during shutdown"
+            );
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(%error, path = %path.display(), "failed to save shared taskman queue during shutdown");
+        }
+        Err(_) => {
+            tracing::warn!(
+                timeout_ms = task_queue::SHARED_TASK_QUEUE_SHUTDOWN_TIMEOUT.as_millis(),
+                path = %path.display(),
+                "timed out saving shared taskman queue during shutdown"
+            );
         }
     }
 }
@@ -1218,6 +10176,15 @@ where
                 match send(method).await {
                     Ok(response) => Ok(response),
                     Err(error) => {
+                        if method_kind == openplotva_telegram::TelegramOutboundMethodKind::SendMessage
+                            && openplotva_telegram::telegram_execute_error_is_reply_missing(&error)
+                        {
+                            tracing::warn!(
+                                chat_id,
+                                "reply target missing for Telegram sendMessage"
+                            );
+                            return Ok(openplotva_telegram::TelegramOutboundResponse::Boolean(true));
+                        }
                         if let Some(retry_after) =
                             rate_limits::telegram_retry_after_from_execute_error(&error)
                         {
@@ -1294,6 +10261,107 @@ fn go_dispatcher_config() -> openplotva_telegram::DispatcherConfig {
     }
 }
 
+#[derive(Clone, Debug)]
+enum RuntimeTranslator {
+    Ready(Box<translate::RuntimeT8Translator>),
+    Unavailable(String),
+}
+
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+enum RuntimeTranslatorError {
+    #[error("{0}")]
+    Provider(#[from] translate::T8TranslatorError),
+    #[error("{0}")]
+    Unavailable(String),
+}
+
+impl translate::TextTranslator for RuntimeTranslator {
+    type Error = RuntimeTranslatorError;
+
+    fn translate_text<'a>(
+        &'a self,
+        text: &'a str,
+        target_lang: &'a str,
+    ) -> translate::TranslateProviderFuture<'a, Self::Error> {
+        Box::pin(async move {
+            match self {
+                Self::Ready(translator) => translator
+                    .translate_text(text, target_lang)
+                    .await
+                    .map_err(RuntimeTranslatorError::Provider),
+                Self::Unavailable(reason) => {
+                    Err(RuntimeTranslatorError::Unavailable(reason.clone()))
+                }
+            }
+        })
+    }
+}
+
+fn bot_user_from_get_me(bot: &carapax::types::Bot) -> carapax::types::User {
+    let mut user = carapax::types::User::new(bot.id, bot.first_name.clone(), true);
+    user.username = Some(bot.username.clone().into());
+    user.last_name = bot.last_name.clone();
+    user
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MessageGateCheckedTranslatePermission;
+
+impl translate::TranslateSendPermission for MessageGateCheckedTranslatePermission {
+    fn can_send_translate_text(&self, _chat: &carapax::types::Chat) -> bool {
+        true
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MessageGateCheckedRatesPermission;
+
+impl rates::RatesSendPermission for MessageGateCheckedRatesPermission {
+    fn can_send_rates_text(&self, _chat: &carapax::types::Chat) -> bool {
+        true
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RuntimeRatesHeaderProvider;
+
+impl rates::RatesHeaderProvider for RuntimeRatesHeaderProvider {
+    fn rates_header(&self, user_full_name: &str) -> String {
+        user_full_name.to_owned()
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct RuntimeUnhandledUpdateHandler;
+
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+enum RuntimeUnhandledUpdateError {
+    #[error("unported fetcher route for {update_name}")]
+    Unported { update_name: &'static str },
+}
+
+impl updates::UpdateHandler for RuntimeUnhandledUpdateHandler {
+    type Error = RuntimeUnhandledUpdateError;
+
+    fn handle_update<'a>(
+        &'a self,
+        update: carapax::types::Update,
+    ) -> updates::UpdateHandlerFuture<'a, Self::Error> {
+        Box::pin(async move {
+            if matches!(&update.update_type, carapax::types::UpdateType::Message(_)) {
+                tracing::debug!(
+                    update_id = update.id,
+                    "residual message update consumed at quiet terminal"
+                );
+                return Ok(());
+            }
+            Err(RuntimeUnhandledUpdateError::Unported {
+                update_name: openplotva_updates::update_name(&update),
+            })
+        })
+    }
+}
+
 async fn shutdown_signal() {
     let ctrl_c = async {
         if let Err(error) = tokio::signal::ctrl_c().await {
@@ -1329,7 +10397,7 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::VecDeque,
+        collections::{BTreeMap, VecDeque},
         error::Error,
         fmt,
         pin::Pin,
@@ -1339,7 +10407,8 @@ mod tests {
 
     use axum::{
         body::{Bytes, to_bytes},
-        http::{HeaderMap, Method, StatusCode},
+        extract::Extension,
+        http::{HeaderMap, Method, StatusCode, header},
     };
     use carapax::types::{InputFile, SendMessage, SendPhoto, Update as TelegramUpdate};
     use openplotva_core::{ChatSettings, ChatSettingsUpdate, MessageIdMapping};
@@ -1353,20 +10422,51 @@ mod tests {
         UpdateProducerSourceFuture,
     };
     use serde_json::json;
-    use time::OffsetDateTime;
+    use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
     use super::{
-        GO_DISPATCHER_DEBOUNCE_CACHE_SIZE, GO_DISPATCHER_DEBOUNCE_WINDOW,
-        GO_DISPATCHER_MAX_QUEUE_SIZE, configure_telegram_bot_commands, go_dispatcher_config,
+        AdminMemoryOverride, GO_ADMIN_API_ROUTE_PATTERNS, GO_DISPATCHER_DEBOUNCE_CACHE_SIZE,
+        GO_DISPATCHER_DEBOUNCE_WINDOW, GO_DISPATCHER_MAX_QUEUE_SIZE, RuntimeUnhandledUpdateHandler,
+        WebhookShutdownCleanupReport, admin_aifarm_pool_toggle_response, admin_auth_check,
+        admin_auth_query_values, admin_auth_response, admin_auth_user_state, admin_bootstrap,
+        admin_chat_get_response, admin_chats_search_by_member_response, admin_i64_from_json,
+        admin_llm_analytics_summary_json, admin_llm_requests_clear_response,
+        admin_llm_requests_filter, admin_llm_requests_response, admin_loglevel_response,
+        admin_memory_cards_response, admin_memory_resolve_override, admin_memory_restart_override,
+        admin_memory_restart_response, admin_memory_runs_response, admin_non_empty_string,
+        admin_redis_prefix_groups_from_keys, admin_safety_check_json, admin_safety_checks_filter,
+        admin_session_is_authorized, admin_shield_category_matched, admin_shield_document_input,
+        admin_shield_document_json, admin_shield_documents_response,
+        admin_shield_embeddings_rebuild_response, admin_shield_test_json,
+        admin_shield_test_response, admin_state_response, admin_static_asset_requires_auth,
+        admin_taskman_job_cancel_response, admin_taskman_job_response,
+        admin_taskman_job_restart_response, admin_taskman_jobs_clear_response,
+        admin_taskman_jobs_filter, admin_taskman_jobs_response, admin_user_grant_vip_response,
+        admin_vip_summary_json, apply_private_chat_response_defaults, build_deputy_display_name,
+        chat_list_title, chat_member_can_manage_settings, chat_member_record_from_upsert,
+        configure_telegram_bot_commands, delete_webhook_on_shutdown_if_enabled,
+        dialog_memory_context_enabled, found, go_dispatcher_config, new_settings_response,
+        normalize_deputy_ids, parse_admin_non_negative_i32, parse_admin_optional_bool,
+        parse_admin_positive_i32, parse_deputy_candidates_limit, parse_deputy_update_request,
+        parse_memory_limit, parse_optional_i32, parse_settings_get_access,
+        parse_settings_memory_access, parse_settings_update_request, parse_shield_limit,
         run_long_poll_update_producer_after_delete_webhook,
-        run_webhook_update_producer_after_set_webhook, send_dispatcher_work_item_with_transport,
+        run_webhook_update_producer_after_set_webhook, runtime_api_graphql_snapshot,
+        runtime_redis_prefix_groups_from_keys, runtime_redis_value_from_bytes,
+        send_dispatcher_work_item_with_transport, settings_chat_display,
+        settings_chat_full_info_type_name, settings_chat_state_from_full_info,
+        settings_get_response, settings_reply_flags, shield_history_tail_messages_from_config,
+        shield_options_from_config, static_web_asset_response, static_web_routes,
         telegram_webhook_response,
     };
     use crate::permissions::{
         ChatPermissionContext, ChatPermissionPolicy, ChatPermissionStore, ChatPermissionStoreFuture,
     };
     use crate::rate_limits::{ChatRateLimitPolicy, RateLimitStore, RateLimitStoreFuture};
+    use crate::updates::UpdateHandler;
     use crate::virtual_messages::VirtualMessageStore;
+
+    static AIFARM_POOL_SETTINGS_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[test]
     fn go_dispatcher_config_matches_server_runtime_defaults() {
@@ -1382,6 +10482,168 @@ mod tests {
             config.dedupe_config.max_cache_size,
             GO_DISPATCHER_DEBOUNCE_CACHE_SIZE
         );
+    }
+
+    #[test]
+    fn dialog_memory_runtime_wiring_follows_go_memory_service_gate() -> Result<(), Box<dyn Error>> {
+        let disabled = openplotva_config::AppConfig::from_raw(openplotva_config::RawConfig {
+            memory_enabled: Some("false".to_owned()),
+            memory_embedder_url: Some("http://embedder.test".to_owned()),
+            ..openplotva_config::RawConfig::default()
+        })?;
+        let enabled = openplotva_config::AppConfig::from_raw(openplotva_config::RawConfig {
+            memory_enabled: Some("true".to_owned()),
+            memory_embedder_url: Some("http://embedder.test".to_owned()),
+            ..openplotva_config::RawConfig::default()
+        })?;
+
+        assert!(!dialog_memory_context_enabled(&disabled));
+        assert!(dialog_memory_context_enabled(&enabled));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_snapshot_and_shield_options_preserve_go_shield_config() -> Result<(), Box<dyn Error>>
+    {
+        let config = openplotva_config::AppConfig::from_raw(openplotva_config::RawConfig {
+            shield_enabled: Some("true".to_owned()),
+            shield_embedder_url: Some("http://shield.test".to_owned()),
+            shield_embedding_dim: Some("256".to_owned()),
+            shield_max_matches: Some("5".to_owned()),
+            shield_vector_min_score: Some("0.51".to_owned()),
+            shield_lexical_min_score: Some("0.09".to_owned()),
+            shield_query_max_chars: Some("1234".to_owned()),
+            shield_retrieval_timeout_seconds: Some("7".to_owned()),
+            shield_history_tail_messages: Some("3".to_owned()),
+            vision_discovery_service_name: Some("vision-service".to_owned()),
+            vision_discovery_endpoint_name: Some("vision-endpoint".to_owned()),
+            vision_model: Some("vision-model".to_owned()),
+            vision_max_tokens: Some("333".to_owned()),
+            vision_temperature: Some("0.2".to_owned()),
+            vision_direct_image_limit: Some("4".to_owned()),
+            vision_request_timeout_seconds: Some("88".to_owned()),
+            acestep_enabled: Some("true".to_owned()),
+            acestep_base_url: Some(" https://ace.test ".to_owned()),
+            together_key: Some(" together-key ".to_owned()),
+            pruna_endpoint: Some(" https://pruna.test/replicate ".to_owned()),
+            modelscope_key: Some(" modelscope-key ".to_owned()),
+            modelscope_base_url: Some(" https://modelscope.test/api/ ".to_owned()),
+            aihorde_api_key: Some(" ".to_owned()),
+            aihorde_base_url: Some(" https://aihorde.test ".to_owned()),
+            ..openplotva_config::RawConfig::default()
+        })?;
+
+        let options = shield_options_from_config(&config.shield);
+        let snapshot = runtime_api_graphql_snapshot(&config);
+
+        assert!(options.enabled);
+        assert_eq!(options.embedder_url, "http://shield.test");
+        assert_eq!(options.embedding_dim, 256);
+        assert_eq!(options.max_matches, 5);
+        assert_eq!(options.vector_min_score, 0.51);
+        assert_eq!(options.lexical_min_score, 0.09);
+        assert_eq!(options.query_max_chars, 1234);
+        assert_eq!(options.retrieval_timeout_seconds, 7);
+        assert_eq!(shield_history_tail_messages_from_config(&config.shield), 3);
+        assert!(snapshot.shield_enabled);
+        assert_eq!(
+            snapshot.shield_embedder_url.as_deref(),
+            Some("http://shield.test")
+        );
+        assert_eq!(snapshot.shield_max_matches, 5);
+        assert_eq!(snapshot.shield_vector_min_score, 0.51);
+        assert_eq!(snapshot.shield_lexical_min_score, 0.09);
+        assert_eq!(snapshot.shield_retrieval_timeout_seconds, 7);
+        assert_eq!(snapshot.shield_history_tail_messages, 3);
+        assert_eq!(snapshot.vision_discovery_service_name, "vision-service");
+        assert_eq!(snapshot.vision_discovery_endpoint_name, "vision-endpoint");
+        assert_eq!(snapshot.vision_model, "vision-model");
+        assert_eq!(snapshot.vision_max_tokens, 333);
+        assert_eq!(snapshot.vision_temperature, 0.2);
+        assert_eq!(snapshot.vision_direct_image_limit, 4);
+        assert_eq!(snapshot.vision_request_timeout_seconds, 88);
+        assert!(snapshot.ace_step_enabled);
+        assert_eq!(
+            snapshot.ace_step_base_url.as_deref(),
+            Some("https://ace.test")
+        );
+        assert_eq!(
+            snapshot.active_draw_providers,
+            vec![
+                "aihorde".to_owned(),
+                "drawapi".to_owned(),
+                "modelscope".to_owned(),
+                "pruna".to_owned(),
+                "together".to_owned()
+            ]
+        );
+        assert_eq!(
+            snapshot.model_scope_base_url.as_deref(),
+            Some("https://modelscope.test/api/")
+        );
+        assert_eq!(
+            snapshot.pruna_endpoint.as_deref(),
+            Some("https://pruna.test/replicate")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_redis_prefix_groups_match_go_segment_rules() {
+        let groups = runtime_redis_prefix_groups_from_keys(
+            "plotva:",
+            [
+                "plotva:updates:queue".to_owned(),
+                "plotva:updates:dead".to_owned(),
+                "plotva:message_queue".to_owned(),
+                "plotva:".to_owned(),
+                "other:key".to_owned(),
+            ],
+        );
+
+        assert_eq!(
+            groups,
+            vec![
+                openplotva_server::RuntimeRedisPrefixGroup {
+                    prefix: "plotva:message_queue".to_owned(),
+                    count: 1,
+                },
+                openplotva_server::RuntimeRedisPrefixGroup {
+                    prefix: "plotva:updates:".to_owned(),
+                    count: 2,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn runtime_redis_value_truncates_by_bytes_like_go_limit() {
+        assert_eq!(
+            runtime_redis_value_from_bytes("key", b"abcdef", 3),
+            openplotva_server::RuntimeRedisValue {
+                key: "key".to_owned(),
+                value: "abc".to_owned(),
+                truncated: true,
+            }
+        );
+        assert_eq!(
+            runtime_redis_value_from_bytes("key", b"abc", 64 * 1024),
+            openplotva_server::RuntimeRedisValue {
+                key: "key".to_owned(),
+                value: "abc".to_owned(),
+                truncated: false,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_unhandled_update_handler_consumes_residual_messages_like_go()
+    -> Result<(), Box<dyn Error>> {
+        RuntimeUnhandledUpdateHandler
+            .handle_update(sample_message_update(700)?)
+            .await
+            .expect("residual message terminal should be a quiet no-op");
+        Ok(())
     }
 
     #[tokio::test]
@@ -1492,6 +10754,32 @@ mod tests {
                 ..chat_settings_update_defaults(42)
             }]
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dispatcher_send_consumes_reply_missing_send_message_like_go_dialog_response()
+    -> Result<(), Box<dyn Error>> {
+        let store = VirtualMessageStoreStub;
+        let rate_limits = Arc::new(ChatRateLimitPolicy::new(RateLimitStoreStub));
+        let permission_store = PermissionStoreStub::with_context(ChatPermissionContext {
+            chat_type: Some("supergroup".to_owned()),
+            settings: Some(ChatSettings::defaults(42)),
+        });
+        let permissions = Arc::new(ChatPermissionPolicy::new(permission_store.clone()));
+        let item = queued_method_item(TelegramOutboundMethod::from(SendMessage::new(42, "hello")));
+
+        let status = send_dispatcher_work_item_with_transport(
+            store,
+            rate_limits,
+            permissions,
+            item,
+            |_| async { Err::<TelegramOutboundResponse, _>(reply_missing_error()) },
+        )
+        .await;
+
+        assert_eq!(status, DispatcherSendStatus::Sent);
+        assert!(permission_store.saved_updates().is_empty());
         Ok(())
     }
 
@@ -1619,6 +10907,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn webhook_shutdown_deletes_webhook_only_when_webhook_config_enabled_like_go()
+    -> Result<(), Box<dyn Error>> {
+        let disabled = DeleteWebhookStub::default();
+
+        let disabled_report = delete_webhook_on_shutdown_if_enabled(false, &disabled).await;
+
+        assert_eq!(disabled.calls(), 0);
+        assert_eq!(
+            disabled_report,
+            WebhookShutdownCleanupReport::SkippedDisabled
+        );
+
+        let enabled = DeleteWebhookStub::default();
+
+        let enabled_report = delete_webhook_on_shutdown_if_enabled(true, &enabled).await;
+
+        assert_eq!(enabled.calls(), 1);
+        assert_eq!(enabled_report, WebhookShutdownCleanupReport::Deleted);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn telegram_webhook_response_accepts_update_and_maps_go_errors()
     -> Result<(), Box<dyn Error>> {
         let (sender, source) = openplotva_telegram::webhook_update_channel(1);
@@ -1675,6 +10985,1310 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await?;
         assert_eq!(&body[..], br#"{"error":"invalid update"}"#);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn static_web_assets_serve_copied_go_settings_files() -> Result<(), Box<dyn Error>> {
+        let response =
+            static_web_asset_response(openplotva_web::StaticAssetGroup::Settings, "index.js");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE),
+            Some(&"text/javascript; charset=utf-8".parse()?)
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await?;
+        assert_eq!(
+            openplotva_web::static_asset_sha256_hex(&body),
+            "1e854fc52928bb34e0ec27891c842740611ffcbd4e2f71979a01dc17331070cb"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn admin_static_index_auth_matches_go_cookie_gate() -> Result<(), Box<dyn Error>> {
+        assert!(admin_static_asset_requires_auth(""));
+        assert!(admin_static_asset_requires_auth("/index.html"));
+        assert!(!admin_static_asset_requires_auth("login.html"));
+
+        let mut headers = HeaderMap::new();
+        assert!(!admin_session_is_authorized(&headers, &[7]));
+        headers.insert(header::COOKIE, "theme=dark; admin_session=7".parse()?);
+        assert!(admin_session_is_authorized(&headers, &[7, 9]));
+        assert!(!admin_session_is_authorized(&headers, &[9]));
+
+        let redirect = found("/admin/login.html");
+        assert_eq!(redirect.status(), StatusCode::FOUND);
+        assert_eq!(
+            redirect.headers().get(header::LOCATION),
+            Some(&"/admin/login.html".parse()?)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_auth_api_matches_go_login_contract() -> Result<(), Box<dyn Error>> {
+        let routes = static_web_routes(
+            vec![7],
+            "123:ABC",
+            "https://plotva.example",
+            "PlotvaBot",
+            None,
+        );
+        let valid_query = concat!(
+            "id=7&first_name=Ada&auth_date=1700000000&username=ada&hash=",
+            "c340b883eb8c3556a6f1c1b9086b792ffdd782f369b68777ca404488f89fcfec"
+        );
+
+        let response = admin_auth_response(&routes, Method::GET, Some(valid_query)).await;
+        assert_eq!(response.status(), StatusCode::FOUND);
+        assert_eq!(
+            response.headers().get(header::LOCATION),
+            Some(&"/admin/".parse()?)
+        );
+        assert_eq!(
+            response.headers().get(header::SET_COOKIE),
+            Some(&"admin_session=7; Path=/admin/; Max-Age=604800; HttpOnly; SameSite=Lax".parse()?)
+        );
+
+        let response = admin_auth_response(&routes, Method::PUT, Some(valid_query)).await;
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        let body = to_bytes(response.into_body(), usize::MAX).await?;
+        assert_eq!(&body[..], b"{\"error\":\"method not allowed\"}\n");
+
+        let response = admin_auth_response(&routes, Method::GET, Some("id=7")).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = admin_auth_response(&routes, Method::GET, Some("id=nope&hash=x")).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = admin_auth_response(
+            &routes,
+            Method::GET,
+            Some("id=7&auth_date=1700000000&hash=bad"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let non_admin_routes = static_web_routes(vec![9], "123:ABC", "", "", None);
+        let response = admin_auth_response(&non_admin_routes, Method::GET, Some(valid_query)).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let no_token_routes = static_web_routes(vec![7], "", "", "", None);
+        let response = admin_auth_response(&no_token_routes, Method::GET, Some(valid_query)).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_auth_check_and_bootstrap_match_go_json_shapes() -> Result<(), Box<dyn Error>> {
+        let routes = static_web_routes(
+            vec![7],
+            "123:ABC",
+            "https://plotva.example",
+            "PlotvaBot",
+            None,
+        );
+
+        let response = admin_auth_check(Extension(routes.clone()), HeaderMap::new()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE),
+            Some(&"application/json".parse()?)
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await?;
+        assert_eq!(&body[..], b"{\"authenticated\":false}\n");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, "admin_session=7".parse()?);
+        let response = admin_auth_check(Extension(routes.clone()), headers).await;
+        let body = to_bytes(response.into_body(), usize::MAX).await?;
+        assert_eq!(&body[..], b"{\"authenticated\":true,\"user_id\":7}\n");
+
+        let response = admin_bootstrap(Extension(routes)).await;
+        let body = to_bytes(response.into_body(), usize::MAX).await?;
+        assert_eq!(
+            &body[..],
+            b"{\"bot_username\":\"PlotvaBot\",\"webapp_url\":\"https://plotva.example\"}\n"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_state_matches_go_json_shape_without_live_services() -> Result<(), Box<dyn Error>>
+    {
+        let _guard = AIFARM_POOL_SETTINGS_LOCK.lock().await;
+        openplotva_llm::aifarm::set_pool_enabled(true);
+        openplotva_llm::aifarm::set_pool_reasoning_enabled(false);
+        let routes = static_web_routes(vec![7], "123:ABC", "https://plotva.example", "", None);
+        let response = admin_state_response(&routes).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await?;
+        let value: serde_json::Value = serde_json::from_slice(&body)?;
+        assert_eq!(value["log_level"], "info");
+        assert_eq!(value["queue"]["regularQueueSize"], 0);
+        assert_eq!(value["queue"]["immediateQueueSize"], 0);
+        assert_eq!(value["queue"]["processedTotal"], 0);
+        assert_eq!(value["queue"]["dedupedTotal"], 0);
+        assert_eq!(value["cache"]["Size"], 0);
+        assert_eq!(value["planner"]["Capacity"], 0);
+        assert_eq!(value["aifarm_pool_enabled"], true);
+        assert_eq!(value["aifarm_pool_reasoning_enabled"], false);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_loglevel_matches_go_auth_method_and_level_contract() -> Result<(), Box<dyn Error>>
+    {
+        let routes = static_web_routes(vec![7], "123:ABC", "https://plotva.example", "", None);
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, "admin_session=7".parse()?);
+
+        let response =
+            admin_loglevel_response(&routes, Method::POST, &headers, br#"{"level":" warning "}"#)
+                .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await?;
+        let value: serde_json::Value = serde_json::from_slice(&body)?;
+        assert_eq!(value, json!({ "ok": true, "level": "warning" }));
+        assert_eq!(body.last(), Some(&b'\n'));
+
+        let response =
+            admin_loglevel_response(&routes, Method::GET, &headers, br#"{"level":"debug"}"#).await;
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+
+        let response = admin_loglevel_response(
+            &routes,
+            Method::POST,
+            &HeaderMap::new(),
+            br#"{"level":"debug"}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = to_bytes(response.into_body(), usize::MAX).await?;
+        assert_eq!(&body[..], b"{\"error\":\"unauthorized\"}\n");
+        assert_eq!(body.last(), Some(&b'\n'));
+
+        let mut non_admin_headers = HeaderMap::new();
+        non_admin_headers.insert("X-Telegram-User-ID", "8".parse()?);
+        let response = admin_loglevel_response(
+            &routes,
+            Method::POST,
+            &non_admin_headers,
+            br#"{"level":"debug"}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = to_bytes(response.into_body(), usize::MAX).await?;
+        assert_eq!(&body[..], b"{\"error\":\"forbidden\"}\n");
+        assert_eq!(body.last(), Some(&b'\n'));
+
+        let response =
+            admin_loglevel_response(&routes, Method::POST, &headers, br#"{"level":"trace"}"#).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_aifarm_pool_toggles_match_go_auth_and_body_contract()
+    -> Result<(), Box<dyn Error>> {
+        let _guard = AIFARM_POOL_SETTINGS_LOCK.lock().await;
+        openplotva_llm::aifarm::set_pool_enabled(true);
+        openplotva_llm::aifarm::set_pool_reasoning_enabled(false);
+        let routes = static_web_routes(vec![7], "123:ABC", "https://plotva.example", "", None);
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, "admin_session=7".parse()?);
+
+        let response = admin_aifarm_pool_toggle_response(
+            &routes,
+            Method::POST,
+            &headers,
+            br#"{"enabled":false}"#,
+            "aifarm.pool.enabled",
+            openplotva_llm::aifarm::set_pool_enabled,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await?;
+        let value: serde_json::Value = serde_json::from_slice(&body)?;
+        assert_eq!(value, json!({ "ok": true, "enabled": false }));
+        assert!(!openplotva_llm::aifarm::pool_enabled());
+
+        let response = admin_aifarm_pool_toggle_response(
+            &routes,
+            Method::PUT,
+            &headers,
+            br#"{"enabled":true}"#,
+            "aifarm.pool.reasoning_enabled",
+            openplotva_llm::aifarm::set_pool_reasoning_enabled,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(openplotva_llm::aifarm::pool_reasoning_enabled());
+
+        let response = admin_aifarm_pool_toggle_response(
+            &routes,
+            Method::GET,
+            &headers,
+            br#"{"enabled":true}"#,
+            "aifarm.pool.enabled",
+            openplotva_llm::aifarm::set_pool_enabled,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+
+        let response = admin_aifarm_pool_toggle_response(
+            &routes,
+            Method::POST,
+            &HeaderMap::new(),
+            br#"{"enabled":true}"#,
+            "aifarm.pool.enabled",
+            openplotva_llm::aifarm::set_pool_enabled,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        openplotva_llm::aifarm::set_pool_enabled(true);
+        openplotva_llm::aifarm::set_pool_reasoning_enabled(false);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_llm_requests_static_rest_lists_and_clears_live_trace_buffer()
+    -> Result<(), Box<dyn Error>> {
+        let mut routes = static_web_routes(vec![7], "123:ABC", "https://plotva.example", "", None);
+        let buffer = super::runtime_llm::RuntimeLlmTraceBuffer::new(4);
+        buffer.record(openplotva_server::RuntimeLlmRequestData {
+            at: "2026-05-21T00:00:00Z".to_owned(),
+            provider: Some("aifarm".to_owned()),
+            source: "dialog".to_owned(),
+            model: Some("model-a".to_owned()),
+            chat: openplotva_server::RuntimeLlmRequestChatData {
+                chat_id: -100,
+                chat_title: Some("Plotva Lab".to_owned()),
+                ..openplotva_server::RuntimeLlmRequestChatData::default()
+            },
+            user: openplotva_server::RuntimeLlmRequestUserData {
+                user_id: 7,
+                full_name: Some("Ada".to_owned()),
+            },
+            message: openplotva_server::RuntimeLlmRequestMessageData { message_id: 77 },
+            gen_config: openplotva_server::RuntimeLlmGenConfigData {
+                max_output_tokens: 128,
+                ..openplotva_server::RuntimeLlmGenConfigData::default()
+            },
+            raw_response: Some(json!({"content": "answer"})),
+            result: openplotva_server::RuntimeLlmRequestResultData {
+                duration_ms: 42,
+                response_text_preview: Some("answer".to_owned()),
+                ..openplotva_server::RuntimeLlmRequestResultData::default()
+            },
+            ..openplotva_server::RuntimeLlmRequestData::default()
+        });
+        routes.llm_trace_buffer = Some(buffer);
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, "admin_session=7".parse()?);
+
+        let response =
+            admin_llm_requests_response(&routes, Method::GET, &headers, Some("q=answer"));
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL),
+            Some(&"no-cache".parse()?)
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await?;
+        let value: serde_json::Value = serde_json::from_slice(&body)?;
+        assert_eq!(value["count"], 1);
+        assert_eq!(value["requests"][0]["id"], 1);
+        assert_eq!(value["requests"][0]["provider"], "aifarm");
+        assert_eq!(value["requests"][0]["chat"]["chat_title"], "Plotva Lab");
+        assert_eq!(value["requests"][0]["gen_config"]["max_output_tokens"], 128);
+        assert_eq!(
+            value["requests"][0]["result"]["response_text_preview"],
+            "answer"
+        );
+
+        let response = admin_llm_requests_clear_response(&routes, Method::POST, &headers);
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await?;
+        assert_eq!(&body[..], b"{\"ok\":true}\n");
+
+        let response = admin_llm_requests_response(&routes, Method::GET, &headers, None);
+        let body = to_bytes(response.into_body(), usize::MAX).await?;
+        let value: serde_json::Value = serde_json::from_slice(&body)?;
+        assert_eq!(value, json!({"count": 0, "requests": []}));
+
+        let response = admin_llm_requests_response(&routes, Method::POST, &headers, None);
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        Ok(())
+    }
+
+    #[test]
+    fn admin_safety_query_and_row_mapping_match_go_contract() {
+        let filter =
+            admin_safety_checks_filter(Some("limit=5000&offset=-1&flagged=yes&q=%20risk%20"));
+        assert_eq!(filter.limit, 1000);
+        assert_eq!(filter.offset, 0);
+        assert_eq!(filter.flagged, Some(true));
+        assert_eq!(filter.q, "risk");
+        assert_eq!(parse_admin_positive_i32(Some("0"), 200, 1000), 200);
+        assert_eq!(parse_admin_positive_i32(Some("42"), 200, 1000), 42);
+        assert_eq!(parse_admin_non_negative_i32(Some("-7"), 3), 3);
+        assert_eq!(parse_admin_optional_bool(Some("no")), Some(false));
+        assert_eq!(parse_admin_optional_bool(Some("maybe")), None);
+
+        let row = openplotva_server::RuntimeSafetyCheckData {
+            id: 5,
+            created_at: "2026-05-21T00:00:00Z".to_owned(),
+            source: "whitecircle".to_owned(),
+            chat_id: Some(-100),
+            request_messages: Some(json!([{"role": "user"}])),
+            flagged: Some(true),
+            response_json: Some(json!({"flagged": true})),
+            duration_ms: 17,
+            ..openplotva_server::RuntimeSafetyCheckData::default()
+        };
+        let value = admin_safety_check_json(&row);
+        assert_eq!(value["id"], 5);
+        assert_eq!(value["chat_id"], -100);
+        assert_eq!(value["request_messages"][0]["role"], "user");
+        assert_eq!(value["flagged"], true);
+        assert_eq!(value["duration_ms"], 17);
+        assert!(value.get("flow").is_none());
+    }
+
+    #[test]
+    fn admin_llm_analytics_json_keeps_static_ui_shape_over_runtime_core()
+    -> Result<(), Box<dyn Error>> {
+        let summary = openplotva_server::RuntimeLlmAnalyticsData {
+            range: "24h0m0s".to_owned(),
+            bucket: "minute".to_owned(),
+            since: "2026-05-20T00:00:00Z".to_owned(),
+            totals: openplotva_server::RuntimeLlmAnalyticsTotalsData {
+                total_count: 3,
+                error_count: 1,
+                avg_duration_ms: 20,
+            },
+            series: vec![openplotva_server::RuntimeLlmAnalyticsSeriesPointData {
+                ts: "2026-05-21T00:00:00Z".to_owned(),
+                total_count: 2,
+                error_count: 0,
+                avg_duration_ms: 10,
+            }],
+            model_series: vec![openplotva_server::RuntimeLlmAnalyticsModelSeriesPointData {
+                ts: "2026-05-21T00:00:00Z".to_owned(),
+                model: "model-a".to_owned(),
+                request_count: 2,
+                avg_generation_tps: 11.5,
+                output_tokens: 200,
+                ..openplotva_server::RuntimeLlmAnalyticsModelSeriesPointData::default()
+            }],
+            models: vec![openplotva_server::RuntimeLlmAnalyticsModelStatData {
+                model: "model-a".to_owned(),
+                request_count: 3,
+                p95_duration_ms: 40,
+                input_tokens: 100,
+                avg_effective_output_tps: 7.5,
+                ..openplotva_server::RuntimeLlmAnalyticsModelStatData::default()
+            }],
+            inference_params: vec![
+                openplotva_server::RuntimeLlmAnalyticsInferenceParamStatData {
+                    provider: "AI Farm".to_owned(),
+                    source: "aifarm".to_owned(),
+                    model: "model-a".to_owned(),
+                    max_tokens: Some(512),
+                    temperature: Some(0.7),
+                    tool_mode: "text".to_owned(),
+                    response_format: "json".to_owned(),
+                    request_count: 2,
+                    avg_effective_output_tps: 7.5,
+                    ..openplotva_server::RuntimeLlmAnalyticsInferenceParamStatData::default()
+                },
+            ],
+            runtime_jobs: vec![openplotva_server::RuntimeJobAnalyticsStatData {
+                job_type: "image".to_owned(),
+                queue_name: "image-vip".to_owned(),
+                provider: "aifarm".to_owned(),
+                created_count: 1,
+                ..openplotva_server::RuntimeJobAnalyticsStatData::default()
+            }],
+            ai_farm_capacity: Some(openplotva_server::RuntimeAifarmCapacitySnapshotData {
+                service: "dialog".to_owned(),
+                available: 2,
+                ready: true,
+                observed_at: "2026-05-21T00:00:00Z".to_owned(),
+                ..openplotva_server::RuntimeAifarmCapacitySnapshotData::default()
+            }),
+            ..openplotva_server::RuntimeLlmAnalyticsData::default()
+        };
+
+        let tool_calls = openplotva_dialog::tool_telemetry::ToolTelemetrySnapshot {
+            since: "2026-05-20T00:00:00Z".to_owned(),
+            total: 2,
+            by_outcome: vec![openplotva_dialog::tool_telemetry::ToolTelemetryCounter {
+                key: "detected".to_owned(),
+                count: 1,
+            }],
+            by_form: Vec::new(),
+            by_tool: vec![openplotva_dialog::tool_telemetry::ToolTelemetryCounter {
+                key: "draw_image".to_owned(),
+                count: 2,
+            }],
+            recent: vec![openplotva_dialog::tool_telemetry::ToolTelemetryEvent {
+                at: OffsetDateTime::parse("2026-05-21T00:00:00Z", &Rfc3339)?,
+                provider: "aifarm".to_owned(),
+                model: "model-a".to_owned(),
+                tool: "draw_image".to_owned(),
+                form: "fenced".to_owned(),
+                outcome: "detected".to_owned(),
+                iteration: 1,
+                ..openplotva_dialog::tool_telemetry::ToolTelemetryEvent::default()
+            }],
+        };
+        let memory_runs = openplotva_memory::RunAnalytics {
+            since: OffsetDateTime::parse("2026-05-20T00:00:00Z", &Rfc3339)?,
+            queued_count: 1,
+            token_estimator: "heuristic".to_owned(),
+            max_input_tokens: 10_000,
+            max_messages_per_run: 200,
+            statuses: vec![openplotva_memory::RunStatusStat {
+                status: "queued".to_owned(),
+                count: 1,
+                message_count: 5,
+                ..openplotva_memory::RunStatusStat::default()
+            }],
+            ..openplotva_memory::RunAnalytics::default()
+        };
+        let value =
+            admin_llm_analytics_summary_json(&summary, &tool_calls, Some(&memory_runs), None);
+        assert_eq!(value["totals"]["total_count"], 3);
+        assert_eq!(value["series"][0]["total_count"], 2);
+        assert_eq!(value["model_series"][0]["output_tokens"], 200);
+        assert_eq!(value["inference_params"][0]["max_tokens"], 512);
+        assert_eq!(value["tool_calls"]["total"], 2);
+        assert_eq!(value["tool_calls"]["by_tool"][0]["key"], "draw_image");
+        assert_eq!(value["memory_runs"]["queued_count"], 1);
+        assert_eq!(value["memory_runs"]["token_estimator"], "heuristic");
+        assert_eq!(value["models"][0]["model"], "model-a");
+        assert_eq!(value["models"][0]["input_tokens"], 100);
+        assert_eq!(value["models"][0]["avg_effective_output_tps"], 7.5);
+        assert_eq!(value["runtime_jobs"][0]["queue_name"], "image-vip");
+        assert_eq!(value["aifarm_capacity"]["available"], 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_shield_rest_matches_go_disabled_contract() -> Result<(), Box<dyn Error>> {
+        let routes = static_web_routes(vec![7], "123:ABC", "https://plotva.example", "", None);
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, "admin_session=7".parse()?);
+
+        let response = admin_shield_documents_response(
+            &routes,
+            Method::GET,
+            &headers,
+            Some("limit=999&include_disabled=yes&q=risk"),
+            &[],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await?;
+        assert_eq!(&body[..], b"{\"count\":0,\"documents\":[]}\n");
+
+        let response = admin_shield_documents_response(
+            &routes,
+            Method::POST,
+            &headers,
+            None,
+            br#"{"title":"Risk"}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), usize::MAX).await?;
+        assert_eq!(&body[..], b"{\"error\":\"shield disabled\"}\n");
+
+        let response =
+            admin_shield_documents_response(&routes, Method::DELETE, &headers, None, &[]).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await?;
+        assert_eq!(&body[..], b"{\"error\":\"id required\"}\n");
+
+        let response =
+            admin_shield_documents_response(&routes, Method::DELETE, &headers, Some("id=5"), &[])
+                .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await?;
+        assert_eq!(&body[..], b"{\"ok\":true}\n");
+
+        let response =
+            admin_shield_embeddings_rebuild_response(&routes, Method::POST, &headers).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let response = admin_shield_test_response(&routes, Method::GET, &headers, br#"{}"#).await;
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+
+        let response = admin_shield_test_response(&routes, Method::POST, &headers, br#"{}"#).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        Ok(())
+    }
+
+    #[test]
+    fn admin_shield_json_and_helpers_match_go_contract() -> Result<(), Box<dyn Error>> {
+        assert_eq!(parse_shield_limit(None), 100);
+        assert_eq!(parse_shield_limit(Some("0")), 100);
+        assert_eq!(parse_shield_limit(Some("999")), 500);
+
+        let input = admin_shield_document_input(
+            super::AdminShieldDocumentRequest {
+                title: " Risk Title ".to_owned(),
+                body: " Body ".to_owned(),
+                ..super::AdminShieldDocumentRequest::default()
+            },
+            true,
+        );
+        let normalized = openplotva_shield::normalize_document_input(input)?;
+        assert_eq!(normalized.slug, "risk-title");
+        assert_eq!(normalized.category, "general");
+        assert!(normalized.enabled);
+
+        let created_at =
+            OffsetDateTime::parse("2026-05-21T10:00:00Z", &Rfc3339).expect("test timestamp");
+        let document = openplotva_shield::Document {
+            id: 42,
+            slug: "risk-title".to_owned(),
+            title: "Risk Title".to_owned(),
+            body: "Body".to_owned(),
+            category: "Safety".to_owned(),
+            enabled: true,
+            priority: 9,
+            created_at: Some(created_at),
+            updated_at: Some(created_at),
+        };
+        let document_json = admin_shield_document_json(&document);
+        assert_eq!(document_json["created_at"], "2026-05-21T10:00:00Z");
+        assert_eq!(document_json["category"], "Safety");
+
+        let result = openplotva_shield::SearchResult {
+            query: "risk".to_owned(),
+            matches: vec![openplotva_shield::ScoredDocument {
+                document,
+                lexical_score: 0.3,
+                vector_score: 0.7,
+            }],
+            context: "<shield></shield>".to_owned(),
+            lexical_only: false,
+            ..openplotva_shield::SearchResult::default()
+        };
+        assert!(admin_shield_category_matched(&result.matches, " safety "));
+        let value = admin_shield_test_json(&result, " safety ");
+        assert_eq!(value["expected_category"], "safety");
+        assert_eq!(value["category_matched"], true);
+        assert_eq!(value["matches"][0]["document"]["slug"], "risk-title");
+        assert!(value.get("candidates").is_none());
+        assert!(value.get("debug").is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_taskman_rest_lists_gets_cancels_restarts_and_clears_shared_queue()
+    -> Result<(), Box<dyn Error>> {
+        let routes = static_web_routes(vec![7], "123:ABC", "https://plotva.example", "", None);
+        let queue = Arc::new(openplotva_taskman::InMemoryTaskQueue::new());
+        let created_at = OffsetDateTime::parse("2026-05-21T10:00:00Z", &Rfc3339)?;
+        let job_id = queue.assign(
+            openplotva_taskman::IMAGE_VIP_QUEUE_NAME,
+            openplotva_taskman::StatelessJobItem {
+                title: "draw".to_owned(),
+                created: created_at,
+                priority: openplotva_taskman::HIGH_PRIORITY,
+                processing_timeout_seconds: 90,
+                data: openplotva_taskman::JobPayload {
+                    job_type: openplotva_taskman::JobType::ImageGen,
+                    telegram_data: Some(openplotva_taskman::TelegramData {
+                        chat_id: -200,
+                        user_id: 100,
+                        message_id: 5,
+                        thread_message_id: Some(10),
+                        user_full_name: "Ada".to_owned(),
+                        chat_title: "Plotva Lab".to_owned(),
+                    }),
+                    image_data: None,
+                    music_data: None,
+                    dialog_data: None,
+                    control_data: None,
+                },
+            },
+        );
+        routes
+            .taskman_inspector
+            .set_shared_queue(queue.clone(), BTreeMap::new());
+        let diagnostic_id = job_id;
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, "admin_session=7".parse()?);
+
+        let response = admin_taskman_jobs_response(
+            &routes,
+            Method::GET,
+            &headers,
+            Some("status=pending&queue=image-vip"),
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL),
+            Some(&"no-cache".parse()?)
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await?;
+        let value: serde_json::Value = serde_json::from_slice(&body)?;
+        assert_eq!(value["total"], 1);
+        assert_eq!(value["items"][0]["id"], diagnostic_id);
+        assert_eq!(value["items"][0]["job_type"], "image_gen");
+        assert_eq!(value["items"][0]["thread_message_id"], 10);
+
+        let response = admin_taskman_job_response(
+            &routes,
+            Method::GET,
+            &headers,
+            Some(&format!("id={diagnostic_id}")),
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await?;
+        let value: serde_json::Value = serde_json::from_slice(&body)?;
+        assert_eq!(value["job"]["payload"]["type"], "image_gen");
+        assert_eq!(value["messages"], json!([]));
+
+        let response = admin_taskman_job_cancel_response(
+            &routes,
+            Method::POST,
+            &headers,
+            Some(&format!("job_id={diagnostic_id}")),
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            queue.record(job_id).expect("cancelled job").status,
+            openplotva_taskman::JobStatus::Cancelled
+        );
+
+        let response = admin_taskman_job_restart_response(
+            &routes,
+            Method::PUT,
+            &headers,
+            Some(&format!("job_id={diagnostic_id}")),
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await?;
+        let value: serde_json::Value = serde_json::from_slice(&body)?;
+        assert!(value["new_job_id"].as_i64().unwrap_or_default() > diagnostic_id);
+
+        let response = admin_taskman_jobs_clear_response(
+            &routes,
+            Method::DELETE,
+            &headers,
+            Some("status=cancelled"),
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await?;
+        let value: serde_json::Value = serde_json::from_slice(&body)?;
+        assert_eq!(value["matched"], 1);
+        assert_eq!(value["deleted"], 1);
+        assert_eq!(value["deleted_active"], 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_memory_rest_disabled_and_query_contract_match_go() -> Result<(), Box<dyn Error>>
+    {
+        let routes = static_web_routes(vec![7], "123:ABC", "https://plotva.example", "", None);
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, "admin_session=7".parse()?);
+
+        let response =
+            admin_memory_cards_response(&routes, Method::GET, &headers, Some("limit=999")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await?;
+        let value: serde_json::Value = serde_json::from_slice(&body)?;
+        assert_eq!(value["count"], 0);
+        assert!(value["cards"].is_null());
+
+        let response =
+            admin_memory_cards_response(&routes, Method::DELETE, &headers, Some("id=42")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await?;
+        assert_eq!(&body[..], b"{\"ok\":true}\n");
+
+        let response = admin_memory_runs_response(&routes, Method::GET, &headers, None, &[]).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await?;
+        let value: serde_json::Value = serde_json::from_slice(&body)?;
+        assert_eq!(value["count"], 0);
+        assert!(value["runs"].is_null());
+
+        let response =
+            admin_memory_runs_response(&routes, Method::POST, &headers, Some("id=42"), &[]).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), usize::MAX).await?;
+        assert_eq!(&body[..], b"{\"error\":\"memory disabled\"}\n");
+
+        let response =
+            admin_memory_restart_response(&routes, Method::POST, &headers, Some("id=bad"), &[])
+                .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await?;
+        assert_eq!(&body[..], b"{\"error\":\"invalid id\"}\n");
+
+        let response =
+            admin_memory_restart_response(&routes, Method::GET, &headers, None, &[]).await;
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_memory_restart_override_matches_go_query_and_json_rules()
+    -> Result<(), Box<dyn Error>> {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            "Application/JSON; charset=utf-8".parse()?,
+        );
+        let (override_, explicit) = admin_memory_restart_override(
+            &headers,
+            Some("override=true&provider=Gemini&model=%20gemini-model%20"),
+            br#"{"override":false,"provider":"aifarm","model":"ignored"}"#,
+        )
+        .expect("valid override");
+        assert!(explicit);
+        assert_eq!(override_.provider, "gemini");
+        assert_eq!(override_.model, "gemini-model");
+
+        let (override_, explicit) =
+            admin_memory_restart_override(&HeaderMap::new(), Some("override=1"), b"{not json}")
+                .expect("non-json content type skips body");
+        assert!(explicit);
+        assert_eq!(override_.provider, "");
+
+        let err = admin_memory_restart_override(&headers, Some("provider=bogus"), b"{}")
+            .expect_err("invalid provider");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes((*err).into_body(), usize::MAX).await?;
+        assert_eq!(&body[..], b"{\"error\":\"invalid override\"}\n");
+        Ok(())
+    }
+
+    #[test]
+    fn admin_memory_override_runtime_resolves_aifarm_and_genkit_providers() {
+        let config = openplotva_config::AppConfig::from_raw(openplotva_config::RawConfig {
+            googleai_key: Some("gemini-key".to_owned()),
+            ..openplotva_config::RawConfig::default()
+        })
+        .expect("config");
+        let (provider, model) = admin_memory_resolve_override(
+            &AdminMemoryOverride {
+                provider: String::new(),
+                model: " override-model ".to_owned(),
+            },
+            &config,
+            "default-model",
+        )
+        .expect("aifarm default");
+        assert_eq!(provider, "aifarm");
+        assert_eq!(model, "override-model");
+
+        let (provider, model) = admin_memory_resolve_override(
+            &AdminMemoryOverride {
+                provider: "aifarm".to_owned(),
+                model: String::new(),
+            },
+            &config,
+            " default-model ",
+        )
+        .expect("explicit aifarm");
+        assert_eq!(provider, "aifarm");
+        assert_eq!(model, "default-model");
+
+        let (provider, model) = admin_memory_resolve_override(
+            &AdminMemoryOverride {
+                provider: "gemini".to_owned(),
+                model: String::new(),
+            },
+            &config,
+            "default-model",
+        )
+        .expect("gemini aliases to genkit provider");
+        assert_eq!(provider, "genkit");
+        assert_eq!(model, openplotva_llm::gemini::MODEL_GEMINI_FLASH_LITE);
+    }
+
+    #[tokio::test]
+    async fn admin_taskman_query_and_disabled_contract_match_go() -> Result<(), Box<dyn Error>> {
+        let filter = admin_taskman_jobs_filter(Some(
+            "q=%20image%20&status=pending,completed&queue=image-vip,music-vip&user_id=42&chat_id=100&time_field=completed_at&from=1700000000&to=2026-05-19T12:00:00Z&sort_by=priority&sort_dir=asc&offset=20&limit=50",
+        ))
+        .expect("valid filter");
+        assert_eq!(filter.q, "image");
+        assert_eq!(filter.status, vec!["pending", "completed"]);
+        assert_eq!(filter.queue, vec!["image-vip", "music-vip"]);
+        assert_eq!(filter.user_id, Some(42));
+        assert_eq!(filter.chat_id, Some(100));
+        assert_eq!(filter.time_field, "completed_at");
+        assert_eq!(filter.from, "2023-11-14T22:13:20Z");
+        assert_eq!(filter.to, "2026-05-19T12:00:00Z");
+        assert_eq!(filter.sort_by, "priority");
+        assert_eq!(filter.sort_dir, "asc");
+        assert_eq!(filter.offset, 20);
+        assert_eq!(filter.limit, 50);
+
+        let err = admin_taskman_jobs_filter(Some("status=unknown"))
+            .expect_err("invalid status should be rejected");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(err.into_body(), usize::MAX).await?;
+        assert_eq!(&body[..], b"{\"error\":\"invalid status\"}\n");
+
+        let routes = static_web_routes(vec![7], "123:ABC", "https://plotva.example", "", None);
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, "admin_session=7".parse()?);
+        let response = admin_taskman_jobs_response(&routes, Method::GET, &headers, None);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), usize::MAX).await?;
+        assert_eq!(&body[..], b"{\"error\":\"task manager not configured\"}\n");
+
+        let response = admin_taskman_job_response(&routes, Method::GET, &headers, None);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let response =
+            admin_taskman_jobs_response(&routes, Method::POST, &headers, Some("status=pending"));
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        Ok(())
+    }
+
+    #[test]
+    fn admin_llm_request_filter_keeps_defaults_and_optional_ids() {
+        let filter = admin_llm_requests_filter(Some(
+            "limit=0&q=%20needle%20&source=dialog&model=m&chat_id=-100&user_id=bad",
+        ));
+        assert_eq!(filter.limit, 1000);
+        assert_eq!(filter.q, "needle");
+        assert_eq!(filter.source, "dialog");
+        assert_eq!(filter.model, "m");
+        assert_eq!(filter.chat_id, Some(-100));
+        assert_eq!(filter.user_id, None);
+    }
+
+    #[tokio::test]
+    async fn admin_chat_and_user_routes_keep_go_auth_method_and_param_errors()
+    -> Result<(), Box<dyn Error>> {
+        let routes = static_web_routes(vec![7], "123:ABC", "https://plotva.example", "", None);
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, "admin_session=7".parse()?);
+
+        let response =
+            admin_chat_get_response(&routes, Method::POST, &headers, Some("chat_id=1")).await;
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        let body = to_bytes(response.into_body(), usize::MAX).await?;
+        assert_eq!(&body[..], b"{\"error\":\"method not allowed\"}\n");
+
+        let response =
+            admin_chat_get_response(&routes, Method::GET, &HeaderMap::new(), Some("chat_id=1"))
+                .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = to_bytes(response.into_body(), usize::MAX).await?;
+        assert_eq!(&body[..], b"{\"error\":\"unauthorized\"}\n");
+
+        let response = admin_chat_get_response(&routes, Method::GET, &headers, None).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await?;
+        assert_eq!(&body[..], b"{\"error\":\"chat_id required\"}\n");
+
+        let response =
+            admin_chat_get_response(&routes, Method::GET, &headers, Some("chat_id=nope")).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await?;
+        assert_eq!(&body[..], b"{\"error\":\"invalid chat_id\"}\n");
+
+        let response = admin_chats_search_by_member_response(
+            &routes,
+            Method::GET,
+            &headers,
+            Some("user_id=nope"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await?;
+        assert_eq!(&body[..], b"{\"error\":\"username or user_id required\"}\n");
+
+        let response = admin_user_grant_vip_response(
+            &routes,
+            Method::POST,
+            &headers,
+            br#"{"user_id":"bad","days":1}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await?;
+        assert_eq!(
+            &body[..],
+            b"{\"error\":\"user_id and non-zero signed days required\"}\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn admin_vip_and_json_helpers_match_go_web_shapes() {
+        assert_eq!(admin_i64_from_json(&json!(42)), Some(42));
+        assert_eq!(admin_i64_from_json(&json!("42")), Some(42));
+        assert_eq!(admin_i64_from_json(&json!("nope")), None);
+        assert_eq!(
+            admin_non_empty_string("  hello   world "),
+            Some("hello   world".to_owned())
+        );
+        assert_eq!(admin_non_empty_string("   "), None);
+        assert_eq!(
+            admin_vip_summary_json(None),
+            json!({
+                "active": false,
+                "has_history": false,
+                "remaining_seconds": 0,
+                "remaining_days": 0
+            })
+        );
+    }
+
+    #[test]
+    fn admin_redis_prefix_groups_match_go_admin_map_rules() {
+        let groups = admin_redis_prefix_groups_from_keys(
+            "plotva:",
+            [
+                "plotva:updates:queue".to_owned(),
+                "plotva:updates:dead".to_owned(),
+                "plotva:message_queue".to_owned(),
+                "plotva:".to_owned(),
+                "other:key".to_owned(),
+            ],
+        );
+
+        assert_eq!(groups.get("plotva:updates:"), Some(&2));
+        assert_eq!(groups.get("plotva:message_queue"), Some(&1));
+        assert_eq!(groups.len(), 2);
+    }
+
+    #[test]
+    fn admin_auth_query_and_user_persistence_shape_match_go() {
+        let values = admin_auth_query_values(Some(
+            "first_name=%20%20&last_name=%20Lovelace%20&username=%20ada%20&language_code=%20ru%20&id=7",
+        ));
+        let user = admin_auth_user_state(&values, 7);
+        assert_eq!(user.id, 7);
+        assert_eq!(user.first_name, "Telegram Admin");
+        assert_eq!(user.last_name.as_deref(), Some("Lovelace"));
+        assert_eq!(user.username.as_deref(), Some("ada"));
+        assert_eq!(user.language_code.as_deref(), Some("ru"));
+        assert_eq!(user.is_premium, None);
+    }
+
+    #[tokio::test]
+    async fn settings_api_without_services_fails_loud_with_go_cors_headers()
+    -> Result<(), Box<dyn Error>> {
+        let routes = static_web_routes(Vec::new(), "", "", "", None);
+        let response = settings_get_response(&routes, Some("chat_id=42&signature=780e28cf")).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            Some(&"*".parse()?)
+        );
+        assert_eq!(
+            response.headers().get(header::ACCESS_CONTROL_ALLOW_METHODS),
+            Some(&"GET, POST, PUT, OPTIONS".parse()?)
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await?;
+        assert_eq!(
+            &body[..],
+            b"{\"error\": \"settings store not configured\"}\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn settings_get_access_accepts_user_or_chat_signature_like_go() {
+        let values =
+            admin_auth_query_values(Some("chat_id=-1001234567890&user_id=42&signature=780e28cf"));
+        let access = parse_settings_get_access(&values, &[42]).expect("user signature");
+        assert_eq!(access.chat_id, -1001234567890);
+        assert_eq!(access.user_id, 42);
+        assert!(access.is_global_admin);
+
+        let values =
+            admin_auth_query_values(Some("chat_id=-1001234567890&user_id=42&signature=8ebdb694"));
+        assert!(parse_settings_get_access(&values, &[]).is_ok());
+
+        let values = admin_auth_query_values(Some("chat_id=0&signature=780e28cf"));
+        assert!(parse_settings_get_access(&values, &[]).is_err());
+
+        let values = admin_auth_query_values(Some("chat_id=42"));
+        assert!(parse_settings_get_access(&values, &[]).is_err());
+    }
+
+    #[tokio::test]
+    async fn settings_memory_access_does_not_inherit_global_admin_bypass_like_go()
+    -> Result<(), Box<dyn Error>> {
+        let routes = static_web_routes(vec![42], "123:ABC", "https://plotva.example", "", None);
+
+        let response = match parse_settings_memory_access(
+            &routes,
+            Some("chat_id=-1001234567890&user_id=42&signature=780e28cf"),
+        )
+        .await
+        {
+            Ok(_) => panic!("memory APIs must run the real group permission check"),
+            Err(response) => response,
+        };
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = to_bytes(response.into_body(), usize::MAX).await?;
+        assert_eq!(&body[..], b"{\"error\":\"permission check failed\"}\n");
+        Ok(())
+    }
+
+    #[test]
+    fn settings_response_and_display_helpers_match_go_shape() {
+        let chat = openplotva_core::ChatState::new(
+            -10042,
+            "supergroup",
+            Some("Plotva Lab".to_owned()),
+            Some("plotvalab".to_owned()),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            settings_chat_display(&chat),
+            ("Plotva Lab".to_owned(), "supergroup".to_owned())
+        );
+        let private = openplotva_core::ChatState::new(
+            42,
+            "private",
+            None,
+            None,
+            Some("Ada".to_owned()),
+            Some("Lovelace".to_owned()),
+            None,
+        );
+        assert_eq!(
+            settings_chat_display(&private),
+            ("Ada Lovelace".to_owned(), "private".to_owned())
+        );
+
+        let mut settings = openplotva_core::ChatSettings::defaults(42);
+        settings.enable_global_text_reply = false;
+        settings.enable_global_draw_reply = false;
+        settings.daily_game_theme = None;
+        let mut response = new_settings_response(&settings, String::new(), "private".to_owned());
+        apply_private_chat_response_defaults(&mut response, 42, 42);
+        assert_eq!(response.chat_id, 42);
+        assert!(response.enable_global_text_reply);
+        assert!(response.enable_global_draw_reply);
+        assert!(response.enable_daily_game);
+        assert_eq!(response.daily_game_theme, "auto");
+        assert!(!response.is_vip);
+        assert!(response.deputies.is_empty());
+    }
+
+    #[test]
+    fn settings_update_request_validates_signature_and_private_reply_flags_like_go() {
+        let long_persona = "я".repeat(1_001);
+        let body = serde_json::json!({
+            "chat_id": 42,
+            "user_id": 42,
+            "signature": "780e28cf",
+            "custom_persona": long_persona,
+            "enable_global_text_reply": false,
+            "enable_global_draw_reply": false
+        })
+        .to_string();
+        let req = match parse_settings_update_request(body.as_bytes()) {
+            Ok(req) => req,
+            Err(_) => panic!("valid settings request"),
+        };
+        assert_eq!(
+            req.custom_persona
+                .as_ref()
+                .map(|value| value.chars().count()),
+            Some(1_000)
+        );
+        assert_eq!(settings_reply_flags("private", &req), (true, true));
+
+        let bad = br#"{"chat_id":42,"user_id":42,"signature":"bad"}"#;
+        assert!(parse_settings_update_request(bad).is_err());
+        let missing = br#"{"chat_id":42,"user_id":42}"#;
+        assert!(parse_settings_update_request(missing).is_err());
+    }
+
+    #[test]
+    fn settings_chat_full_info_conversion_preserves_go_refresh_fields() -> Result<(), Box<dyn Error>>
+    {
+        assert_eq!(
+            settings_chat_full_info_type_name(carapax::types::ChatFullInfoType::Channel),
+            "channel"
+        );
+        assert_eq!(
+            settings_chat_full_info_type_name(carapax::types::ChatFullInfoType::Group),
+            "group"
+        );
+        assert_eq!(
+            settings_chat_full_info_type_name(carapax::types::ChatFullInfoType::Private),
+            "private"
+        );
+        assert_eq!(
+            settings_chat_full_info_type_name(carapax::types::ChatFullInfoType::Supergroup),
+            "supergroup"
+        );
+
+        let chat: openplotva_telegram::ChatFullInfo = serde_json::from_value(json!({
+            "id": -100123,
+            "type": "supergroup",
+            "accent_color_id": 1,
+            "max_reaction_count": 11,
+            "title": " Plotva Lab ",
+            "username": "plotvalab",
+            "is_forum": true
+        }))?;
+        let state = settings_chat_state_from_full_info(chat);
+
+        assert_eq!(state.id, -100123);
+        assert_eq!(state.chat_type, "supergroup");
+        assert_eq!(state.title.as_deref(), Some(" Plotva Lab "));
+        assert_eq!(state.username.as_deref(), Some("plotvalab"));
+        assert_eq!(state.is_forum, Some(true));
+        Ok(())
+    }
+
+    #[test]
+    fn settings_side_helpers_match_go_deputy_and_memory_shapes() {
+        assert_eq!(normalize_deputy_ids(&[5, 0, -1, 4, 5, 3], 4), vec![3, 5]);
+        assert_eq!(parse_deputy_candidates_limit(None), 50);
+        assert_eq!(parse_deputy_candidates_limit(Some("0")), 50);
+        assert_eq!(parse_deputy_candidates_limit(Some("250")), 100);
+        assert_eq!(parse_memory_limit(None), 100);
+        assert_eq!(parse_memory_limit(Some("999")), 500);
+        assert_eq!(parse_optional_i32("-1"), 0);
+        assert_eq!(parse_optional_i32("42"), 42);
+        assert_eq!(
+            build_deputy_display_name(7, " Ada ", Some(" Lovelace "), Some("ada")),
+            "Ada Lovelace"
+        );
+        assert_eq!(
+            build_deputy_display_name(7, "", None, Some(" ada ")),
+            "@ada"
+        );
+        assert_eq!(build_deputy_display_name(7, "", None, None), "User 7");
+
+        let creator = openplotva_storage::ChatMemberRecord {
+            status: openplotva_storage::CHAT_MEMBER_STATUS_CREATOR.to_owned(),
+            ..openplotva_storage::ChatMemberRecord::default()
+        };
+        let admin = openplotva_storage::ChatMemberRecord {
+            status: openplotva_storage::CHAT_MEMBER_STATUS_ADMINISTRATOR.to_owned(),
+            can_promote_members: Some(true),
+            ..openplotva_storage::ChatMemberRecord::default()
+        };
+        let member = openplotva_storage::ChatMemberRecord {
+            status: openplotva_storage::CHAT_MEMBER_STATUS_MEMBER.to_owned(),
+            ..openplotva_storage::ChatMemberRecord::default()
+        };
+        assert!(chat_member_can_manage_settings(&creator, false));
+        assert!(chat_member_can_manage_settings(&admin, false));
+        assert!(chat_member_can_manage_settings(&member, true));
+        assert!(!chat_member_can_manage_settings(&member, false));
+
+        let upsert = openplotva_storage::ChatMemberUpsert {
+            chat_id: -100,
+            user_id: 42,
+            status: openplotva_storage::CHAT_MEMBER_STATUS_ADMINISTRATOR.to_owned(),
+            can_promote_members: Some(true),
+            can_delete_messages: Some(false),
+            ..openplotva_storage::ChatMemberUpsert::default()
+        };
+        let fresh = chat_member_record_from_upsert(&upsert);
+        assert_eq!(fresh.chat_id, -100);
+        assert_eq!(fresh.user_id, 42);
+        assert_eq!(
+            fresh.status,
+            openplotva_storage::CHAT_MEMBER_STATUS_ADMINISTRATOR
+        );
+        assert_eq!(fresh.can_promote_members, Some(true));
+        assert_eq!(fresh.can_delete_messages, Some(false));
+
+        let unnamed = openplotva_core::ChatState::new(99, "group", None, None, None, None, None);
+        assert_eq!(chat_list_title(&unnamed), "Chat 99");
+    }
+
+    #[test]
+    fn settings_deputy_update_request_matches_go_validation_shape() {
+        let req = parse_deputy_update_request(
+            br#"{"chat_id":-100,"user_id":42,"signature":"780e28cf","deputy_ids":[9,9,42,0]}"#,
+        )
+        .expect("valid deputy update request");
+        assert_eq!(req.chat_id, -100);
+        assert_eq!(req.user_id, 42);
+        assert_eq!(normalize_deputy_ids(&req.deputy_ids, req.user_id), vec![9]);
+
+        assert!(
+            parse_deputy_update_request(br#"{"chat_id":0,"user_id":42,"signature":"780e28cf"}"#)
+                .is_err()
+        );
+        assert!(
+            parse_deputy_update_request(br#"{"chat_id":-100,"user_id":42,"signature":"bad"}"#)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn app_router_builds_with_admin_api_routes_before_static_wildcard() {
+        assert_eq!(
+            GO_ADMIN_API_ROUTE_PATTERNS,
+            [
+                "/admin/api/auth",
+                "/admin/api/auth_check",
+                "/admin/api/state",
+                "/admin/api/loglevel",
+                "/admin/api/aifarm/pool",
+                "/admin/api/aifarm/pool/reasoning",
+                "/admin/api/logs/stream",
+                "/admin/api/bootstrap",
+                "/admin/api/metrics",
+                "/admin/api/llm/requests",
+                "/admin/api/llm/requests/clear",
+                "/admin/api/safety/checks",
+                "/admin/api/analytics/llm/summary",
+                "/admin/api/memory/cards",
+                "/admin/api/memory/runs",
+                "/admin/api/memory/restart",
+                "/admin/api/shield/documents",
+                "/admin/api/shield/embeddings/rebuild",
+                "/admin/api/shield/test",
+                "/admin/api/redis/list",
+                "/admin/api/redis/get",
+                "/admin/api/redis/delete_prefix",
+                "/admin/api/redis/prefixes",
+                "/admin/api/redis/delete_key",
+                "/admin/api/redis/flushdb",
+                "/admin/api/chat",
+                "/admin/api/chat/settings",
+                "/admin/api/chat/block",
+                "/admin/api/chat/unblock",
+                "/admin/api/chat/members",
+                "/admin/api/chats",
+                "/admin/api/chats/search_by_member",
+                "/admin/api/users",
+                "/admin/api/user",
+                "/admin/api/user/grant_vip",
+                "/admin/api/user/revoke_vip",
+                "/admin/api/user/delete",
+                "/admin/api/taskman/jobs",
+                "/admin/api/taskman/jobs/clear",
+                "/admin/api/taskman/job",
+                "/admin/api/taskman/job/cancel",
+                "/admin/api/taskman/job/restart",
+            ]
+        );
+        let _ = super::router();
     }
 
     #[test]
@@ -2224,6 +12838,17 @@ mod tests {
             r#"{"ok":false,"error_code":400,"description":"Bad Request: CHAT_WRITE_FORBIDDEN"}"#,
         )
         .expect("permission error JSON");
+        match response.into_result() {
+            Ok(_) => panic!("test response unexpectedly succeeded"),
+            Err(error) => carapax::api::ExecuteError::Response(error),
+        }
+    }
+
+    fn reply_missing_error() -> carapax::api::ExecuteError {
+        let response: carapax::types::Response<serde_json::Value> = serde_json::from_str(
+            r#"{"ok":false,"error_code":400,"description":"Bad Request: reply message not found"}"#,
+        )
+        .expect("reply missing error JSON");
         match response.into_result() {
             Ok(_) => panic!("test response unexpectedly succeeded"),
             Err(error) => carapax::api::ExecuteError::Response(error),

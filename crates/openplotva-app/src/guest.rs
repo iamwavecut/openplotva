@@ -13,6 +13,8 @@ use carapax::types::{
     Chat as TelegramChat, Message as TelegramMessage, MessageSender as TelegramMessageSender,
     Update as TelegramUpdate, UpdateType, User as TelegramUser,
 };
+use openplotva_dialog::{DialogContext, DialogInput, DialogMessage, DialogUser, Persona};
+use openplotva_llm::ChatProviderHandle;
 use openplotva_updates::{
     GuestChainMessage, GuestChainRole, build_guest_dialog_text, build_guest_shield_query_text,
     guest_current_request_text, guest_message_reject_reason, guest_request_has_visible_text,
@@ -255,6 +257,202 @@ pub trait GuestMessageEffects {
     ) -> GuestMessageFuture<'a, (), Self::Error>;
 }
 
+#[derive(Clone)]
+pub struct GuestRuntimeEffects {
+    telegram: openplotva_telegram::TelegramClient,
+    chain_cache: GuestChainCache,
+    dialog_provider: Option<ChatProviderHandle>,
+    shield_store: Option<openplotva_storage::PostgresShieldStore>,
+    shield_options: openplotva_shield::Options,
+    shield_embedder: Option<Arc<dyn crate::memory_runtime::EmbeddingProvider>>,
+}
+
+impl GuestRuntimeEffects {
+    #[must_use]
+    pub fn new(telegram: openplotva_telegram::TelegramClient) -> Self {
+        Self {
+            telegram,
+            chain_cache: GuestChainCache::default(),
+            dialog_provider: None,
+            shield_store: None,
+            shield_options: openplotva_shield::Options::default(),
+            shield_embedder: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_dialog_provider(mut self, provider: Option<ChatProviderHandle>) -> Self {
+        self.dialog_provider = provider;
+        self
+    }
+
+    #[must_use]
+    pub fn with_shield_store(
+        mut self,
+        store: openplotva_storage::PostgresShieldStore,
+        options: openplotva_shield::Options,
+    ) -> Self {
+        self.shield_store = Some(store);
+        self.shield_options = options.with_defaults();
+        self
+    }
+
+    #[must_use]
+    pub fn with_shield_embedder(
+        mut self,
+        embedder: Arc<dyn crate::memory_runtime::EmbeddingProvider>,
+    ) -> Self {
+        self.shield_embedder = Some(embedder);
+        self
+    }
+}
+
+impl fmt::Debug for GuestRuntimeEffects {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GuestRuntimeEffects")
+            .field("chain_cache", &self.chain_cache)
+            .field("has_dialog_provider", &self.dialog_provider.is_some())
+            .field("has_shield_store", &self.shield_store.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum GuestRuntimeEffectError {
+    #[error("answer guest query: {0}")]
+    Answer(String),
+    #[error("guest dialog timeout")]
+    DialogTimeout,
+    #[error("guest dialog provider unavailable")]
+    DialogUnavailable,
+    #[error("guest dialog provider: {0}")]
+    Dialog(String),
+    #[error("guest shield search: {0}")]
+    ShieldSearch(#[from] openplotva_storage::StorageError),
+}
+
+impl GuestMessageEffects for GuestRuntimeEffects {
+    type Error = GuestRuntimeEffectError;
+
+    fn answer_guest_html<'a>(
+        &'a self,
+        request: openplotva_telegram::GuestHtmlAnswerRequest,
+    ) -> GuestMessageFuture<'a, (), Self::Error> {
+        Box::pin(async move {
+            let Some(method) = openplotva_telegram::build_guest_html_answer_method(&request) else {
+                return Ok(());
+            };
+            openplotva_telegram::execute_telegram_method(
+                &self.telegram,
+                openplotva_telegram::TelegramOutboundMethod::from(method),
+            )
+            .await
+            .map(|_| ())
+            .map_err(|error| GuestRuntimeEffectError::Answer(error.to_string()))
+        })
+    }
+
+    fn load_guest_chain<'a>(
+        &'a self,
+        request: GuestChainLoadRequest,
+    ) -> GuestMessageFuture<'a, Vec<GuestChainMessage>, Self::Error> {
+        Box::pin(async move { Ok(self.chain_cache.load(&request)) })
+    }
+
+    fn retrieve_guest_shield_context<'a>(
+        &'a self,
+        request: GuestShieldRequest,
+    ) -> GuestMessageFuture<'a, String, Self::Error> {
+        Box::pin(async move {
+            let Some(store) = self.shield_store.as_ref() else {
+                return Ok(String::new());
+            };
+            let query = request.query.trim();
+            if query.is_empty() {
+                return Ok(String::new());
+            }
+
+            let embedding = if let Some(embedder) = self.shield_embedder.as_ref() {
+                match embedder
+                    .embed_one(
+                        query,
+                        self.shield_options.embedding_dim,
+                        openplotva_shield::QUERY_EMBEDDING_TASK,
+                    )
+                    .await
+                {
+                    Ok(embedding) => embedding,
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            chat_id = request.chat_id,
+                            message_id = request.message_id,
+                            "guest shield query embedding failed; using lexical-only retrieval"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            let result = store
+                .search_with_vector(
+                    &openplotva_shield::SearchRequest {
+                        query: query.to_owned(),
+                        max_matches: self.shield_options.max_matches,
+                        include_candidates: false,
+                    },
+                    &self.shield_options,
+                    embedding.as_ref(),
+                )
+                .await?;
+            if !result.matches.is_empty() {
+                tracing::info!(
+                    chat_id = request.chat_id,
+                    message_id = request.message_id,
+                    lexical_only = result.lexical_only,
+                    matches = result.matches.len(),
+                    "guest shield retrieval matched"
+                );
+            }
+            Ok(result.context)
+        })
+    }
+
+    fn run_guest_dialog<'a>(
+        &'a self,
+        input: GuestDialogInput,
+    ) -> GuestMessageFuture<'a, GuestDialogOutput, Self::Error> {
+        Box::pin(async move {
+            let Some(provider) = self.dialog_provider.as_ref() else {
+                return Err(GuestRuntimeEffectError::DialogUnavailable);
+            };
+            let dialog_input = dialog_input_from_guest_at(&input, OffsetDateTime::now_utc());
+            let output =
+                tokio::time::timeout(GUEST_DIALOG_TIMEOUT, provider.run_dialog(dialog_input))
+                    .await
+                    .map_err(|_| GuestRuntimeEffectError::DialogTimeout)?
+                    .map_err(|error| GuestRuntimeEffectError::Dialog(error.to_string()))?;
+            Ok(GuestDialogOutput {
+                answer: output.answer,
+                response: output.response,
+            })
+        })
+    }
+
+    fn remember_guest_chain_turn<'a>(
+        &'a self,
+        request: GuestChainRememberRequest,
+    ) -> GuestMessageFuture<'a, (), Self::Error> {
+        Box::pin(async move {
+            self.chain_cache.remember(&request);
+            Ok(())
+        })
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct GuestMessageConfig {
     pub bot_user: TelegramUser,
@@ -344,7 +542,16 @@ where
         return Ok(GuestMessageUpdateRoute::Delegated);
     };
 
+    let chat_id: i64 = message.chat.get_id().into();
+    let message_id = message.id;
+
     if let Some(reason) = guest_message_reject_reason(Some(message), Some(&config.bot_user)) {
+        tracing::info!(
+            chat_id,
+            message_id,
+            reason = reason.as_str(),
+            "guest message ignored"
+        );
         return Ok(GuestMessageUpdateRoute::Rejected {
             reason: reason.as_str(),
         });
@@ -352,10 +559,17 @@ where
 
     let bot_username = guest_bot_username(&config.bot_user);
     if !guest_request_has_visible_text(Some(message), &bot_username) {
+        tracing::info!(
+            chat_id,
+            message_id,
+            reason = "empty_request",
+            "guest message ignored"
+        );
         return Ok(GuestMessageUpdateRoute::EmptyRequest);
     }
 
     if is_guest_unsupported_feature_request(Some(message), &bot_username) {
+        tracing::info!(chat_id, message_id, "guest unsupported feature requested");
         let answer_error = send_guest_html(
             effects,
             unsupported_feature_request(message, &bot_username),
@@ -363,9 +577,17 @@ where
         )
         .await
         .err();
+        let answer_failed = answer_error.is_some();
+        tracing::info!(
+            chat_id,
+            message_id,
+            answer_failed,
+            "guest unsupported feature answered"
+        );
         return Ok(GuestMessageUpdateRoute::UnsupportedFeature { answer_error });
     }
 
+    tracing::info!(chat_id, message_id, "guest message accepted for dialog");
     let mut suppressed_errors = Vec::new();
     let chain = suppress_guest_effect(
         effects.load_guest_chain(guest_chain_load_request(message)),
@@ -398,8 +620,11 @@ where
     if answer.is_empty() {
         answer = dialog_output.response.trim().to_owned();
     }
+    let mut fallback_answer = false;
     if answer.is_empty() {
         answer = openplotva_telegram::guest_dialog_fallback_html(&bot_username);
+        fallback_answer = true;
+        tracing::info!(chat_id, message_id, "guest dialog fallback answer selected");
     }
 
     let answer_error = send_guest_html(
@@ -421,6 +646,16 @@ where
     } else {
         false
     };
+    let answer_failed = answer_error.is_some();
+    tracing::info!(
+        chat_id,
+        message_id,
+        remembered,
+        fallback_answer,
+        suppressed_errors = suppressed_errors.len(),
+        answer_failed,
+        "guest message answered"
+    );
 
     Ok(GuestMessageUpdateRoute::DialogAnswered {
         answer,
@@ -529,6 +764,43 @@ fn guest_dialog_input(
     }
 }
 
+#[must_use]
+pub fn dialog_input_from_guest_at(input: &GuestDialogInput, now: OffsetDateTime) -> DialogInput {
+    DialogInput {
+        context: DialogContext {
+            chat_id: input.chat_id,
+            chat_title: input.chat_title.clone(),
+            bot_name: input.bot_name.clone(),
+            locale: input.locale.clone(),
+            ..DialogContext::default()
+        },
+        user: DialogUser {
+            id: input.user_id,
+            full_name: input.user_full_name.clone(),
+        },
+        message: DialogMessage {
+            id: input.message_id.try_into().unwrap_or_default(),
+            text: input.text.clone(),
+            normalized: input.normalized.clone(),
+            original_text: input.original_text.clone(),
+            timestamp: Some(now),
+            reply_to_id: input.reply_to_id.try_into().unwrap_or_default(),
+            reply_to_name: input.reply_to_name.clone(),
+            ..DialogMessage::default()
+        },
+        persona: Persona {
+            mood: "neutral".to_owned(),
+            ..Persona::default()
+        },
+        shield_context: input.shield_context.trim().to_owned(),
+        timestamp: Some(now),
+        max_output_tokens: input.max_output_tokens.min(i32::MAX as usize) as i32,
+        guest_mode: input.guest_mode,
+        disable_tools: input.disable_tools,
+        ..DialogInput::default()
+    }
+}
+
 fn guest_chain_remember_request(
     message: &TelegramMessage,
     bot_user: &TelegramUser,
@@ -564,6 +836,11 @@ async fn send_guest_html<Effects>(
 where
     Effects: GuestMessageEffects + Sync,
 {
+    tracing::info!(
+        context,
+        message_id = request.message_id,
+        "guest answer requested"
+    );
     effects.answer_guest_html(request).await.map_err(|error| {
         let message = error.to_string();
         tracing::warn!(message, context, "guest answer failed");
@@ -782,23 +1059,29 @@ fn compact_whitespace(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::{
+        env,
         error::Error,
         io,
         sync::{Arc, Mutex},
-        time::Duration,
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
     use carapax::types::{Update as TelegramUpdate, User as TelegramUser};
-    use openplotva_updates::{GuestChainMessage, GuestChainRole};
-    use serde_json::json;
-    use time::macros::datetime;
+    use openplotva_telegram::TelegramOutboundMethodKind;
+    use openplotva_updates::{GuestChainMessage, GuestChainRole, UpdateConsumerConfig};
+    use serde_json::{Value, json};
+    use time::{OffsetDateTime, macros::datetime};
 
-    use crate::updates::{UpdateHandler, UpdateHandlerFuture};
+    use crate::updates::{
+        TelegramFileMetadataStoreFuture, UpdateHandler, UpdateHandlerFuture, UpdateStateStore,
+        UpdateStateStoreFuture, process_update_with_state_store_at,
+    };
 
     use super::{
-        GuestChainCache, GuestChainLoadRequest, GuestChainRememberRequest, GuestDialogInput,
-        GuestDialogOutput, GuestMessageConfig, GuestMessageEffects, GuestMessageFuture,
-        GuestMessageUpdateHandler, GuestMessageUpdateRoute, GuestShieldRequest,
+        GUEST_DIALOG_MAX_OUTPUT_TOKENS, GuestChainCache, GuestChainLoadRequest,
+        GuestChainRememberRequest, GuestDialogInput, GuestDialogOutput, GuestMessageConfig,
+        GuestMessageEffects, GuestMessageFuture, GuestMessageUpdateHandler,
+        GuestMessageUpdateRoute, GuestShieldRequest, dialog_input_from_guest_at,
         handle_guest_message_update_or_else,
     };
 
@@ -825,27 +1108,91 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn guest_unsupported_feature_sends_add_to_chat_answer() -> Result<(), Box<dyn Error>> {
-        let effects = GuestEffectsStub::default();
-        let next = UpdateHandlerStub::default();
-        let route = handle_guest_message_update_or_else(
-            &effects,
-            &guest_config()?,
-            guest_update("нарисуй кота")?,
-            |update| next.handle_update(update),
-        )
-        .await?;
-        assert_eq!(
-            route,
-            GuestMessageUpdateRoute::UnsupportedFeature { answer_error: None }
-        );
-        let answers = effects.answers();
-        assert_eq!(answers.len(), 1);
-        assert_eq!(answers[0].title, "Добавьте Плотву в чат");
-        assert!(answers[0].html_text.contains("Некоторые функции Плотвы"));
-        assert!(answers[0].reply_markup.is_some());
-        assert!(effects.dialog_inputs().is_empty());
-        assert_eq!(next.handled_count(), 0);
+    async fn guest_message_rejects_invalid_or_bot_callers_before_effects()
+    -> Result<(), Box<dyn Error>> {
+        for (label, update, reason) in [
+            (
+                "bot caller",
+                guest_update_with_bot_caller("bot-caller")?,
+                "bot_caller",
+            ),
+            (
+                "bot sender",
+                guest_update_with_bot_sender("from-bot")?,
+                "bot_sender",
+            ),
+            (
+                "other bot mention",
+                guest_update("@OtherBot @PlotvaBot сравните")?,
+                "other_bot_mention",
+            ),
+            (
+                "missing sender",
+                guest_update_without_sender("no-from")?,
+                "missing_human_sender",
+            ),
+        ] {
+            let effects = GuestEffectsStub::default();
+            let next = UpdateHandlerStub::default();
+            let route =
+                handle_guest_message_update_or_else(&effects, &guest_config()?, update, |update| {
+                    next.handle_update(update)
+                })
+                .await?;
+            assert_eq!(
+                route,
+                GuestMessageUpdateRoute::Rejected { reason },
+                "{label}"
+            );
+            assert!(effects.answers().is_empty(), "{label}");
+            assert!(effects.loads().is_empty(), "{label}");
+            assert!(effects.dialog_inputs().is_empty(), "{label}");
+            assert!(effects.remembered().is_empty(), "{label}");
+            assert_eq!(next.handled_count(), 0, "{label}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn guest_unsupported_features_send_add_to_chat_answer() -> Result<(), Box<dyn Error>> {
+        for text in [
+            "нарисуй кота",
+            "!draw cat",
+            "песня про море",
+            "измени картинку",
+            "/settings@PlotvaBot",
+            "queue_status",
+            "cancel_drawing",
+            "очередь",
+            "admin_chat_settings 42",
+            "перескажи о чём говорили в чате",
+        ] {
+            let effects = GuestEffectsStub::default();
+            let next = UpdateHandlerStub::default();
+            let route = handle_guest_message_update_or_else(
+                &effects,
+                &guest_config()?,
+                guest_update(text)?,
+                |update| next.handle_update(update),
+            )
+            .await?;
+
+            assert_eq!(
+                route,
+                GuestMessageUpdateRoute::UnsupportedFeature { answer_error: None },
+                "{text}"
+            );
+            let answers = effects.answers();
+            assert_eq!(answers.len(), 1, "{text}");
+            assert_eq!(answers[0].title, "Добавьте Плотву в чат", "{text}");
+            assert!(
+                answers[0].html_text.contains("Некоторые функции Плотвы"),
+                "{text}"
+            );
+            assert!(answers[0].reply_markup.is_some(), "{text}");
+            assert!(effects.dialog_inputs().is_empty(), "{text}");
+            assert_eq!(next.handled_count(), 0, "{text}");
+        }
         Ok(())
     }
 
@@ -959,6 +1306,383 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn live_redis_decoded_guest_message_answers_and_remembers_when_url_is_set()
+    -> Result<(), Box<dyn Error>> {
+        let Ok(redis_url) = env::var("OPENPLOTVA_TEST_REDIS_URL") else {
+            return Ok(());
+        };
+        let redis_client = redis::Client::open(redis_url)?;
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let key = format!("openplotva:test:decoded-guest:{suffix}");
+        let update_queue =
+            openplotva_updates::RedisUpdateQueue::with_key(redis_client.clone(), key.clone());
+        let mut redis = redis_client.get_multiplexed_async_connection().await?;
+        let _: i64 = redis::cmd("DEL").arg(&key).query_async(&mut redis).await?;
+
+        update_queue
+            .enqueue_update(&guest_reply_update("@PlotvaBot привет", "старый ответ")?)
+            .await?;
+        assert_eq!(update_queue.len().await?, 1);
+        let decoded = update_queue
+            .dequeue_update(Duration::from_secs(1))
+            .await?
+            .ok_or_else(|| io::Error::other("expected decoded guest update"))?;
+
+        let state_store = UpdateStateStoreStub::default();
+        let effects = GuestEffectsStub::default()
+            .with_chain(vec![GuestChainMessage {
+                role: GuestChainRole::Assistant,
+                name: "Plotva".to_owned(),
+                text: "старый ответ".to_owned(),
+                at: None,
+            }])
+            .with_dialog_answer("<script>bad()</script><b>готово</b>");
+        let next = UpdateHandlerStub::default();
+        let route = Arc::new(Mutex::new(None));
+        let captured_route = Arc::clone(&route);
+
+        let report = process_update_with_state_store_at(
+            decoded,
+            UpdateConsumerConfig {
+                dequeue_timeout: Duration::from_millis(1),
+                state_timeout: Duration::from_secs(1),
+                handle_timeout: Duration::from_secs(1),
+                side_effect_max_age: Duration::from_secs(60),
+                worker_limit: 1,
+            },
+            UNIX_EPOCH + Duration::from_secs(1_710_000_000),
+            &state_store,
+            |update| async {
+                let handled = handle_guest_message_update_or_else(
+                    &effects,
+                    &guest_config().expect("guest config"),
+                    update,
+                    |update| next.handle_update(update),
+                )
+                .await
+                .map_err(|error| io::Error::other(error.to_string()))?;
+                *captured_route.lock().expect("route") = Some(handled);
+                Ok::<(), io::Error>(())
+            },
+        )
+        .await;
+
+        assert_eq!(report.update_id, 303);
+        assert_eq!(report.update_name, "guest_message");
+        assert_eq!(
+            report.state.outcome,
+            openplotva_updates::UpdateStageOutcome::Completed
+        );
+        assert_eq!(
+            report.handle.as_ref().map(|stage| &stage.outcome),
+            Some(&openplotva_updates::UpdateStageOutcome::Completed)
+        );
+        assert!(!report.skipped_handle);
+        assert!(state_store.calls().is_empty());
+        assert_eq!(next.handled_count(), 0);
+        assert_eq!(
+            *route.lock().expect("route"),
+            Some(GuestMessageUpdateRoute::DialogAnswered {
+                answer: "<script>bad()</script><b>готово</b>".to_owned(),
+                remembered: true,
+                suppressed_errors: vec![],
+                answer_error: None,
+            })
+        );
+
+        assert_eq!(
+            effects.loads(),
+            vec![GuestChainLoadRequest {
+                chat_id: 42,
+                reply_text: "старый ответ".to_owned(),
+            }]
+        );
+        let input = effects.dialog_inputs().pop().expect("dialog input");
+        assert_eq!(input.normalized, "привет");
+        assert!(input.text.contains("Гостевая цепочка за последние сутки"));
+        assert_eq!(input.shield_context, "shield context");
+        assert_eq!(input.max_output_tokens, GUEST_DIALOG_MAX_OUTPUT_TOKENS);
+
+        let answers = effects.answers();
+        assert_eq!(answers.len(), 1);
+        assert_eq!(answers[0].guest_query_id, "guest-query");
+        assert_eq!(answers[0].message_id, 77);
+        assert_eq!(answers[0].title, "Плотва отвечает");
+        let methods = effects.answer_methods();
+        assert_eq!(
+            methods
+                .iter()
+                .map(|(kind, _payload)| *kind)
+                .collect::<Vec<_>>(),
+            vec![TelegramOutboundMethodKind::AnswerGuestQuery]
+        );
+        let payload = &methods[0].1;
+        assert_eq!(payload["guest_query_id"], json!("guest-query"));
+        assert_eq!(payload["result"]["id"], json!("guest-guest-query"));
+        assert_eq!(
+            payload["result"]["input_message_content"]["message_text"],
+            json!("<b>готово</b>")
+        );
+        assert_eq!(
+            payload["result"]["input_message_content"]["parse_mode"],
+            json!("HTML")
+        );
+        assert_eq!(
+            effects
+                .remembered()
+                .pop()
+                .expect("remembered chain")
+                .assistant_text,
+            "готово"
+        );
+        assert_eq!(update_queue.len().await?, 0);
+
+        let _: i64 = redis::cmd("DEL").arg(&key).query_async(&mut redis).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_redis_decoded_guest_invalid_or_bot_callers_stop_before_effects_when_url_is_set()
+    -> Result<(), Box<dyn Error>> {
+        let Ok(redis_url) = env::var("OPENPLOTVA_TEST_REDIS_URL") else {
+            return Ok(());
+        };
+        let redis_client = redis::Client::open(redis_url)?;
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let key = format!("openplotva:test:decoded-guest-reject:{suffix}");
+        let update_queue =
+            openplotva_updates::RedisUpdateQueue::with_key(redis_client.clone(), key.clone());
+        let mut redis = redis_client.get_multiplexed_async_connection().await?;
+        let _: i64 = redis::cmd("DEL").arg(&key).query_async(&mut redis).await?;
+
+        let cases = vec![
+            (
+                "missing query",
+                302,
+                guest_update_without_query()?,
+                "missing_guest_query_id",
+            ),
+            (
+                "bot caller",
+                304,
+                guest_update_with_bot_caller("bot-caller")?,
+                "bot_caller",
+            ),
+            (
+                "bot sender",
+                305,
+                guest_update_with_bot_sender("from-bot")?,
+                "bot_sender",
+            ),
+            (
+                "other bot mention",
+                301,
+                guest_update("@OtherBot @PlotvaBot сравните")?,
+                "other_bot_mention",
+            ),
+            (
+                "missing sender",
+                306,
+                guest_update_without_sender("no-from")?,
+                "missing_human_sender",
+            ),
+        ];
+        for (_, _, update, _) in &cases {
+            update_queue.enqueue_update(update).await?;
+        }
+        assert_eq!(update_queue.len().await?, cases.len() as i64);
+
+        let state_store = UpdateStateStoreStub::default();
+        let effects = GuestEffectsStub::default();
+        let next = UpdateHandlerStub::default();
+
+        for (label, expected_update_id, _, reason) in cases {
+            let decoded = update_queue
+                .dequeue_update(Duration::from_secs(1))
+                .await?
+                .ok_or_else(|| {
+                    io::Error::other(format!("expected decoded rejected guest {label} update"))
+                })?;
+            let route = Arc::new(Mutex::new(None));
+            let captured_route = Arc::clone(&route);
+
+            let report = process_update_with_state_store_at(
+                decoded,
+                UpdateConsumerConfig {
+                    dequeue_timeout: Duration::from_millis(1),
+                    state_timeout: Duration::from_secs(1),
+                    handle_timeout: Duration::from_secs(1),
+                    side_effect_max_age: Duration::from_secs(60),
+                    worker_limit: 1,
+                },
+                UNIX_EPOCH + Duration::from_secs(1_710_000_000),
+                &state_store,
+                |update| async {
+                    let handled = handle_guest_message_update_or_else(
+                        &effects,
+                        &guest_config().expect("guest config"),
+                        update,
+                        |update| next.handle_update(update),
+                    )
+                    .await
+                    .map_err(|error| io::Error::other(error.to_string()))?;
+                    *captured_route.lock().expect("route") = Some(handled);
+                    Ok::<(), io::Error>(())
+                },
+            )
+            .await;
+
+            assert_eq!(report.update_id, expected_update_id, "{label}");
+            assert_eq!(report.update_name, "guest_message", "{label}");
+            assert_eq!(
+                report.state.outcome,
+                openplotva_updates::UpdateStageOutcome::Completed,
+                "{label}"
+            );
+            assert_eq!(
+                report.handle.as_ref().map(|stage| &stage.outcome),
+                Some(&openplotva_updates::UpdateStageOutcome::Completed),
+                "{label}"
+            );
+            assert!(!report.skipped_handle, "{label}");
+            assert_eq!(
+                *route.lock().expect("route"),
+                Some(GuestMessageUpdateRoute::Rejected { reason }),
+                "{label}"
+            );
+        }
+
+        assert!(state_store.calls().is_empty());
+        assert_eq!(next.handled_count(), 0);
+        assert!(effects.answers().is_empty());
+        assert!(effects.loads().is_empty());
+        assert!(effects.dialog_inputs().is_empty());
+        assert!(effects.remembered().is_empty());
+        assert_eq!(update_queue.len().await?, 0);
+
+        let _: i64 = redis::cmd("DEL").arg(&key).query_async(&mut redis).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_redis_decoded_guest_unsupported_feature_answers_add_to_chat_when_url_is_set()
+    -> Result<(), Box<dyn Error>> {
+        let Ok(redis_url) = env::var("OPENPLOTVA_TEST_REDIS_URL") else {
+            return Ok(());
+        };
+        let redis_client = redis::Client::open(redis_url)?;
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let key = format!("openplotva:test:decoded-guest-unsupported:{suffix}");
+        let update_queue =
+            openplotva_updates::RedisUpdateQueue::with_key(redis_client.clone(), key.clone());
+        let mut redis = redis_client.get_multiplexed_async_connection().await?;
+        let _: i64 = redis::cmd("DEL").arg(&key).query_async(&mut redis).await?;
+
+        update_queue
+            .enqueue_update(&guest_update("% нарисуй кота")?)
+            .await?;
+        assert_eq!(update_queue.len().await?, 1);
+
+        let state_store = UpdateStateStoreStub::default();
+        let effects = GuestEffectsStub::default();
+        let next = UpdateHandlerStub::default();
+        let route = Arc::new(Mutex::new(None));
+        let captured_route = Arc::clone(&route);
+        let decoded = update_queue
+            .dequeue_update(Duration::from_secs(1))
+            .await?
+            .ok_or_else(|| io::Error::other("expected decoded unsupported guest update"))?;
+
+        let report = process_update_with_state_store_at(
+            decoded,
+            UpdateConsumerConfig {
+                dequeue_timeout: Duration::from_millis(1),
+                state_timeout: Duration::from_secs(1),
+                handle_timeout: Duration::from_secs(1),
+                side_effect_max_age: Duration::from_secs(60),
+                worker_limit: 1,
+            },
+            UNIX_EPOCH + Duration::from_secs(1_710_000_000),
+            &state_store,
+            |update| async {
+                let handled = handle_guest_message_update_or_else(
+                    &effects,
+                    &guest_config().map_err(io::Error::other)?,
+                    update,
+                    |update| next.handle_update(update),
+                )
+                .await
+                .map_err(|error| io::Error::other(error.to_string()))?;
+                *captured_route.lock().expect("route") = Some(handled);
+                Ok::<(), io::Error>(())
+            },
+        )
+        .await;
+
+        assert_eq!(report.update_id, 301);
+        assert_eq!(report.update_name, "guest_message");
+        assert_eq!(
+            report.state.outcome,
+            openplotva_updates::UpdateStageOutcome::Completed
+        );
+        assert_eq!(
+            report.handle.as_ref().map(|stage| &stage.outcome),
+            Some(&openplotva_updates::UpdateStageOutcome::Completed)
+        );
+        assert!(!report.skipped_handle);
+        assert_eq!(
+            *route.lock().expect("route"),
+            Some(GuestMessageUpdateRoute::UnsupportedFeature { answer_error: None })
+        );
+        assert!(state_store.calls().is_empty());
+        assert_eq!(next.handled_count(), 0);
+        assert!(effects.loads().is_empty());
+        assert!(effects.dialog_inputs().is_empty());
+        assert!(effects.remembered().is_empty());
+
+        let answers = effects.answers();
+        assert_eq!(answers.len(), 1);
+        assert_eq!(answers[0].guest_query_id, "guest-query");
+        assert_eq!(answers[0].title, "Добавьте Плотву в чат");
+        assert!(answers[0].html_text.contains("Некоторые функции Плотвы"));
+        assert_eq!(answers[0].bot_username, "PlotvaBot");
+        assert!(answers[0].reply_markup.is_some());
+
+        let methods = effects.answer_methods();
+        assert_eq!(
+            methods
+                .iter()
+                .map(|(kind, _payload)| *kind)
+                .collect::<Vec<_>>(),
+            vec![TelegramOutboundMethodKind::AnswerGuestQuery]
+        );
+        let payload = &methods[0].1;
+        assert_eq!(payload["guest_query_id"], json!("guest-query"));
+        assert_eq!(payload["result"]["id"], json!("guest-guest-query"));
+        assert_eq!(payload["result"]["title"], json!("Добавьте Плотву в чат"));
+        assert_eq!(
+            payload["result"]["input_message_content"]["parse_mode"],
+            json!("HTML")
+        );
+        let message_text = payload["result"]["input_message_content"]["message_text"]
+            .as_str()
+            .expect("guest message text");
+        assert!(message_text.contains("https://t.me/PlotvaBot?startgroup=guest"));
+        assert_eq!(
+            payload["result"]["reply_markup"]["inline_keyboard"][0][0]["text"],
+            json!("Добавить Плотву в чат")
+        );
+        assert_eq!(
+            payload["result"]["reply_markup"]["inline_keyboard"][0][0]["url"],
+            json!("https://t.me/PlotvaBot?startgroup=guest")
+        );
+        assert_eq!(update_queue.len().await?, 0);
+
+        let _: i64 = redis::cmd("DEL").arg(&key).query_async(&mut redis).await?;
+        Ok(())
+    }
+
     #[test]
     fn guest_chain_cache_loads_by_reply_answer_key_and_trims_to_go_limit() {
         let now = datetime!(2026-05-20 12:00 UTC);
@@ -1066,6 +1790,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn guest_dialog_input_maps_to_go_dialog_input_shape() {
+        let now = OffsetDateTime::from_unix_timestamp(1_710_000_000).expect("timestamp");
+        let input = GuestDialogInput {
+            chat_id: -10042,
+            chat_title: "Plotva Group".to_owned(),
+            bot_name: "Plotva".to_owned(),
+            locale: "en".to_owned(),
+            user_id: 22,
+            user_full_name: "Alice Guest".to_owned(),
+            message_id: 77,
+            text: "Гостевой запрос пользователя:\nhello".to_owned(),
+            normalized: "hello".to_owned(),
+            original_text: "@PlotvaBot hello".to_owned(),
+            reply_to_id: 55,
+            reply_to_name: "Bob".to_owned(),
+            shield_context: " <shield_context>risk</shield_context> ".to_owned(),
+            chain: Vec::new(),
+            max_output_tokens: GUEST_DIALOG_MAX_OUTPUT_TOKENS,
+            guest_mode: true,
+            disable_tools: true,
+        };
+
+        let dialog = dialog_input_from_guest_at(&input, now);
+
+        assert_eq!(dialog.context.chat_id, -10042);
+        assert_eq!(dialog.context.chat_title, "Plotva Group");
+        assert_eq!(dialog.context.bot_name, "Plotva");
+        assert_eq!(dialog.context.locale, "en");
+        assert_eq!(dialog.user.id, 22);
+        assert_eq!(dialog.user.full_name, "Alice Guest");
+        assert_eq!(dialog.message.id, 77);
+        assert_eq!(dialog.message.text, "Гостевой запрос пользователя:\nhello");
+        assert_eq!(dialog.message.normalized, "hello");
+        assert_eq!(dialog.message.original_text, "@PlotvaBot hello");
+        assert_eq!(dialog.message.reply_to_id, 55);
+        assert_eq!(dialog.message.reply_to_name, "Bob");
+        assert_eq!(dialog.persona.mood, "neutral");
+        assert!(dialog.history.is_empty());
+        assert!(dialog.reference_context.is_empty());
+        assert_eq!(
+            dialog.shield_context,
+            "<shield_context>risk</shield_context>"
+        );
+        assert_eq!(dialog.timestamp, Some(now));
+        assert_eq!(dialog.max_output_tokens, 512);
+        assert!(dialog.guest_mode);
+        assert!(dialog.disable_tools);
+    }
+
     #[derive(Clone, Debug, Default)]
     struct GuestEffectsStub {
         state: Arc<Mutex<GuestEffectsState>>,
@@ -1074,6 +1848,7 @@ mod tests {
     #[derive(Debug, Default)]
     struct GuestEffectsState {
         answers: Vec<openplotva_telegram::GuestHtmlAnswerRequest>,
+        answer_methods: Vec<(TelegramOutboundMethodKind, Value)>,
         loads: Vec<GuestChainLoadRequest>,
         shield_requests: Vec<GuestShieldRequest>,
         dialog_inputs: Vec<GuestDialogInput>,
@@ -1109,6 +1884,10 @@ mod tests {
             self.state.lock().expect("state").answers.clone()
         }
 
+        fn answer_methods(&self) -> Vec<(TelegramOutboundMethodKind, Value)> {
+            self.state.lock().expect("state").answer_methods.clone()
+        }
+
         fn loads(&self) -> Vec<GuestChainLoadRequest> {
             self.state.lock().expect("state").loads.clone()
         }
@@ -1135,6 +1914,13 @@ mod tests {
         ) -> GuestMessageFuture<'a, (), Self::Error> {
             Box::pin(async move {
                 let mut state = self.state.lock().expect("state");
+                if let Some(method) = openplotva_telegram::build_guest_html_answer_method(&request)
+                {
+                    state.answer_methods.push((
+                        TelegramOutboundMethodKind::AnswerGuestQuery,
+                        serde_json::to_value(method).map_err(io::Error::other)?,
+                    ));
+                }
                 state.answers.push(request);
                 if state.fail_answers {
                     return Err(io::Error::other("answer failed"));
@@ -1218,6 +2004,60 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Debug, Default)]
+    struct UpdateStateStoreStub {
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl UpdateStateStoreStub {
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().expect("calls").clone()
+        }
+    }
+
+    impl UpdateStateStore for UpdateStateStoreStub {
+        type Error = io::Error;
+
+        fn upsert_chat_state<'a>(
+            &'a self,
+            chat: &'a openplotva_core::ChatState,
+        ) -> UpdateStateStoreFuture<'a, Self::Error> {
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .expect("calls")
+                    .push(format!("chat:{}", chat.id));
+                Ok(())
+            })
+        }
+
+        fn upsert_user_state<'a>(
+            &'a self,
+            user: &'a openplotva_core::UserState,
+        ) -> UpdateStateStoreFuture<'a, Self::Error> {
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .expect("calls")
+                    .push(format!("user:{}", user.id));
+                Ok(())
+            })
+        }
+
+        fn upsert_telegram_file_metadata<'a>(
+            &'a self,
+            params: &'a openplotva_storage::TelegramFileMetadataUpsert,
+        ) -> TelegramFileMetadataStoreFuture<'a, Self::Error> {
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .expect("calls")
+                    .push(format!("file:{}", params.file_unique_id));
+                Ok(())
+            })
+        }
+    }
+
     fn guest_config() -> Result<GuestMessageConfig, serde_json::Error> {
         Ok(GuestMessageConfig {
             bot_user: sample_bot_user()?,
@@ -1266,6 +2106,37 @@ mod tests {
         }))
     }
 
+    fn guest_update_with_bot_caller(query_id: &str) -> Result<TelegramUpdate, serde_json::Error> {
+        let mut message = guest_message_json("привет");
+        message["guest_query_id"] = json!(query_id);
+        message["guest_bot_caller_user"]["is_bot"] = json!(true);
+        serde_json::from_value(json!({
+            "update_id": 304,
+            "guest_message": message
+        }))
+    }
+
+    fn guest_update_with_bot_sender(query_id: &str) -> Result<TelegramUpdate, serde_json::Error> {
+        let mut message = guest_message_json("привет");
+        message["guest_query_id"] = json!(query_id);
+        message["from"]["is_bot"] = json!(true);
+        message["from"]["first_name"] = json!("SenderBot");
+        serde_json::from_value(json!({
+            "update_id": 305,
+            "guest_message": message
+        }))
+    }
+
+    fn guest_update_without_sender(query_id: &str) -> Result<TelegramUpdate, serde_json::Error> {
+        let mut message = guest_message_json("привет");
+        message["guest_query_id"] = json!(query_id);
+        message.as_object_mut().expect("object").remove("from");
+        serde_json::from_value(json!({
+            "update_id": 306,
+            "guest_message": message
+        }))
+    }
+
     fn guest_reply_update(
         text: &str,
         reply_text: &str,
@@ -1296,14 +2167,12 @@ mod tests {
             "chat": {"id": 42, "type": "private", "first_name": "Ada"},
             "from": sample_user_json(),
             "text": text,
-            "guest_bot": {
-                "guest_bot_caller_user": {
-                    "id": 111,
-                    "is_bot": false,
-                    "first_name": "Ada",
-                    "last_name": "Lovelace",
-                    "language_code": "en"
-                }
+            "guest_bot_caller_user": {
+                "id": 111,
+                "is_bot": false,
+                "first_name": "Ada",
+                "last_name": "Lovelace",
+                "language_code": "en"
             }
         })
     }

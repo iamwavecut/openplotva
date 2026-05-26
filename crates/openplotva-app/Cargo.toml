@@ -10,25 +10,41 @@ publish = false
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
+base64.workspace = true
 carapax.workspace = true
 openplotva-config = { path = "../openplotva-config" }
 openplotva-core = { path = "../openplotva-core" }
+openplotva-dialog = { path = "../openplotva-dialog" }
+openplotva-llm = { path = "../openplotva-llm" }
+openplotva-media = { path = "../openplotva-media" }
+openplotva-memory = { path = "../openplotva-memory" }
+openplotva-history = { path = "../openplotva-history" }
 openplotva-observability = { path = "../openplotva-observability" }
+openplotva-prompts = { path = "../openplotva-prompts" }
 openplotva-server = { path = "../openplotva-server" }
+openplotva-shield = { path = "../openplotva-shield" }
 openplotva-storage = { path = "../openplotva-storage" }
 openplotva-taskman = { path = "../openplotva-taskman" }
 openplotva-telegram = { path = "../openplotva-telegram" }
 openplotva-updates = { path = "../openplotva-updates" }
 openplotva-web = { path = "../openplotva-web" }
+futures-util.workspace = true
 hex.workspace = true
+image.workspace = true
+quick-xml.workspace = true
+rand.workspace = true
+redis = { workspace = true, features = ["tokio-comp"] }
 reqwest.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha1.workspace = true
+sha2.workspace = true
+sqlx = { workspace = true, features = ["json", "postgres", "runtime-tokio", "time"] }
 thiserror.workspace = true
-time.workspace = true
+time = { workspace = true, features = ["formatting", "parsing"] }
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tracing.workspace = true
+url.workspace = true
 
 [lints]
 workspace = true

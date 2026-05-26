@@ -11,20 +11,16 @@ use openplotva_telegram::{
     build_pending_op_method,
 };
 
-/// Go pending-operation poll batch size.
 pub const PENDING_OP_BATCH_LIMIT: i32 = 50;
 
-/// Go pending-operation worker tick interval.
 pub const PENDING_OP_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// Storage operations needed by the Go pending-op processing loop.
 pub trait PendingOpStore {
     /// Store error type.
     type Error: fmt::Display + Send + Sync + 'static;
 
-    /// List pending operations in Go execution order.
     fn list_pending_ops<'a>(
         &'a self,
         limit: i32,
@@ -189,7 +185,6 @@ pub struct PendingOpProcessReport {
     pub send_failed: usize,
     /// Number of failed attempts to write a done/failed status back to storage.
     pub status_write_failed: usize,
-    /// Storage error from listing pending ops; Go returns early on this case.
     pub list_error: Option<String>,
 }
 

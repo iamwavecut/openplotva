@@ -1,17 +1,17 @@
-//! App-level Telegram rate-limit policy matching Go server behavior.
-
 use std::{
     collections::HashMap,
     fmt,
     future::Future,
     pin::Pin,
-    sync::{Mutex, MutexGuard},
+    sync::{
+        Mutex, MutexGuard,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
 use time::OffsetDateTime;
 
-/// Go server in-memory policy cache TTL.
 pub const GO_RATE_LIMIT_CACHE_TTL: time::Duration = time::Duration::minutes(30);
 
 /// Boxed future returned by rate-limit persistence stores.
@@ -60,13 +60,11 @@ impl RateLimitStore for openplotva_storage::RedisRateLimitStore {
 /// Source used to decide the latest rate-limit check.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RateLimitCheckSource {
-    /// The in-memory Go policy cache had an entry.
     Cache,
     /// Redis/Dragonfly had an active persisted expiry.
     PersistentStore,
     /// Redis/Dragonfly had no active persisted expiry.
     Missing,
-    /// Redis/Dragonfly returned an error, which Go treats as not rate-limited.
     LoadError,
 }
 
@@ -93,6 +91,8 @@ pub struct RateLimitSetReport {
 pub struct ChatRateLimitPolicy<S> {
     store: S,
     cache: Mutex<HashMap<i64, CachedRateLimit>>,
+    cache_hits: AtomicU64,
+    cache_misses: AtomicU64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -107,6 +107,8 @@ impl<S> ChatRateLimitPolicy<S> {
         Self {
             store,
             cache: Mutex::new(HashMap::new()),
+            cache_hits: AtomicU64::new(0),
+            cache_misses: AtomicU64::new(0),
         }
     }
 }
@@ -176,11 +178,16 @@ where
 
     fn cached_expiry(&self, chat_id: i64, now: OffsetDateTime) -> Option<OffsetDateTime> {
         let mut cache = self.cache();
-        let cached = cache.get(&chat_id).copied()?;
+        let Some(cached) = cache.get(&chat_id).copied() else {
+            self.cache_misses.fetch_add(1, Ordering::Relaxed);
+            return None;
+        };
         if now > cached.cached_until {
             cache.remove(&chat_id);
+            self.cache_misses.fetch_add(1, Ordering::Relaxed);
             return None;
         }
+        self.cache_hits.fetch_add(1, Ordering::Relaxed);
         Some(cached.expiry)
     }
 
@@ -198,6 +205,16 @@ where
         match self.cache.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    pub(crate) fn cache_stats(&self) -> crate::runtime_cache::PolicyCacheStats {
+        let size = self.cache().len();
+        crate::runtime_cache::PolicyCacheStats {
+            size,
+            hits: self.cache_hits.load(Ordering::Relaxed),
+            misses: self.cache_misses.load(Ordering::Relaxed),
+            mem_size: size.saturating_mul(std::mem::size_of::<CachedRateLimit>()) as u64,
         }
     }
 }
@@ -261,6 +278,11 @@ mod tests {
         let boundary = policy.is_rate_limited_at(42, report.expiry).await;
         assert!(!boundary.rate_limited);
         assert_eq!(boundary.source, RateLimitCheckSource::Cache);
+        let stats = policy.cache_stats();
+        assert_eq!(stats.size, 1);
+        assert_eq!(stats.hits, 2);
+        assert_eq!(stats.misses, 0);
+        assert!(stats.mem_size > 0);
 
         Ok(())
     }

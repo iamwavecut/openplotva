@@ -10,10 +10,12 @@ use std::{
 
 use carapax::types::{Update as TelegramUpdate, UpdateType as TelegramUpdateType};
 use openplotva_core::{ChatMessageMeta, ChatState, UserState};
+use openplotva_storage::TelegramFileMetadataUpsert;
 use openplotva_updates::{
-    HistoryTextEntry, UpdateConsumerConfig, UpdateProcessReport, UpdateStageOutcome,
-    build_fetcher_message_context, build_history_text_entry, extract_update_state,
-    fetcher_message_text, should_skip_side_effects_at,
+    HistoryTextEntry, NoopUpdateStageTracker, UpdateConsumerConfig, UpdateProcessReport,
+    UpdateStageOutcome, UpdateStageTracker, build_fetcher_message_context,
+    build_history_text_entry, extract_update_state, fetcher_message_text,
+    should_skip_side_effects_at,
 };
 use thiserror::Error;
 use time::{Date, OffsetDateTime};
@@ -28,6 +30,10 @@ pub type UpdateHandlerFuture<'a, E> = Pin<Box<dyn Future<Output = Result<(), E>>
 
 /// Boxed future returned by update state storage calls.
 pub type UpdateStateStoreFuture<'a, E> = Pin<Box<dyn Future<Output = Result<(), E>> + Send + 'a>>;
+
+/// Boxed future returned by Telegram file metadata storage calls.
+pub type TelegramFileMetadataStoreFuture<'a, E> =
+    Pin<Box<dyn Future<Output = Result<(), E>> + Send + 'a>>;
 
 /// Boxed future returned by inbound history storage calls.
 pub type InboundHistoryStoreFuture<'a, E> =
@@ -56,7 +62,6 @@ impl UpdateSource for openplotva_updates::RedisUpdateQueue {
     }
 }
 
-/// User-visible Telegram update handler plugged in once fetcher routing is ported.
 pub trait UpdateHandler {
     /// Error returned by the concrete handler.
     type Error: fmt::Display;
@@ -81,6 +86,12 @@ pub trait UpdateStateStore {
         &'a self,
         user: &'a UserState,
     ) -> UpdateStateStoreFuture<'a, Self::Error>;
+
+    /// Persist Telegram file metadata extracted from decoded updates.
+    fn upsert_telegram_file_metadata<'a>(
+        &'a self,
+        params: &'a TelegramFileMetadataUpsert,
+    ) -> TelegramFileMetadataStoreFuture<'a, Self::Error>;
 }
 
 impl UpdateStateStore for openplotva_storage::PostgresVirtualMessageStore {
@@ -98,6 +109,18 @@ impl UpdateStateStore for openplotva_storage::PostgresVirtualMessageStore {
         user: &'a UserState,
     ) -> UpdateStateStoreFuture<'a, Self::Error> {
         Box::pin(openplotva_storage::PostgresVirtualMessageStore::upsert_user_state(self, user))
+    }
+
+    fn upsert_telegram_file_metadata<'a>(
+        &'a self,
+        params: &'a TelegramFileMetadataUpsert,
+    ) -> TelegramFileMetadataStoreFuture<'a, Self::Error> {
+        Box::pin(async move {
+            openplotva_storage::PostgresTelegramFileStore::new(self.pool().clone())
+                .upsert_metadata(params)
+                .await
+                .map(|_| ())
+        })
     }
 }
 
@@ -122,7 +145,6 @@ pub struct InboundHistoryUpsert<'payload> {
     pub occurred_at: OffsetDateTime,
     /// Sender ID.
     pub sender_id: i64,
-    /// Serialized Go-shaped `MessageEntry` JSON payload.
     pub payload: &'payload [u8],
 }
 
@@ -131,7 +153,6 @@ pub trait InboundHistoryStore {
     /// Error returned by the concrete history store.
     type Error: fmt::Display;
 
-    /// Upsert one Go-shaped inbound history entry.
     fn upsert_inbound_history<'a>(
         &'a self,
         entry: InboundHistoryUpsert<'a>,
@@ -171,7 +192,6 @@ pub trait EditedHistoryStore {
     /// Error returned by the concrete history store.
     type Error: fmt::Display;
 
-    /// Update one existing Go-shaped history entry after a Telegram edited-message update.
     fn update_edited_message_history<'a>(
         &'a self,
         chat_id: i64,
@@ -206,13 +226,18 @@ impl EditedHistoryStore for openplotva_storage::PostgresHistoryStore {
     }
 }
 
-/// Report for the Go consumer state-persistence stage.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct UpdateStatePersistenceReport {
     /// Whether a chat row was upserted.
     pub chat_persisted: bool,
     /// Whether a user row was upserted.
     pub user_persisted: bool,
+    /// Telegram file refs extracted from the update and reply message.
+    pub telegram_files_seen: usize,
+    /// Telegram file metadata rows successfully upserted.
+    pub telegram_files_persisted: usize,
+    /// Non-fatal Telegram file metadata upsert failures.
+    pub telegram_file_errors: usize,
 }
 
 /// Error returned while persisting extracted update state.
@@ -232,7 +257,6 @@ pub enum UpdateStatePersistenceError {
     },
 }
 
-/// Persist the chat/user state that Go writes before user-visible side effects.
 pub async fn persist_update_state<S>(
     store: &S,
     update: &TelegramUpdate,
@@ -263,7 +287,51 @@ where
             })?;
         report.user_persisted = true;
     }
+    let refs = openplotva_updates::update_file_metadata_refs(update);
+    report.telegram_files_seen = refs.len();
+    for file_ref in refs {
+        let Some(params) = telegram_file_metadata_upsert_from_ref(&file_ref) else {
+            continue;
+        };
+        match store.upsert_telegram_file_metadata(&params).await {
+            Ok(()) => {
+                report.telegram_files_persisted += 1;
+            }
+            Err(error) => {
+                report.telegram_file_errors += 1;
+                tracing::warn!(
+                    error = error.to_string(),
+                    file_unique_id = params.file_unique_id,
+                    "failed to upsert Telegram file metadata"
+                );
+            }
+        }
+    }
     Ok(report)
+}
+
+fn telegram_file_metadata_upsert_from_ref(
+    file_ref: &openplotva_updates::TelegramFileMetadataRef,
+) -> Option<TelegramFileMetadataUpsert> {
+    if file_ref.file_id.is_empty() || file_ref.file_unique_id.is_empty() {
+        return None;
+    }
+
+    let first_seen_chat_id = (file_ref.chat_id != 0).then_some(file_ref.chat_id);
+    let first_seen_message_id = (file_ref.message_id != 0).then_some(file_ref.message_id);
+    Some(TelegramFileMetadataUpsert {
+        file_unique_id: file_ref.file_unique_id.clone(),
+        latest_file_id: file_ref.file_id.clone(),
+        media_kind: file_ref.media_kind.clone(),
+        mime_type: (!file_ref.mime_type.is_empty()).then(|| file_ref.mime_type.clone()),
+        width: (file_ref.width > 0).then_some(file_ref.width),
+        height: (file_ref.height > 0).then_some(file_ref.height),
+        file_size: (file_ref.file_size > 0).then_some(file_ref.file_size),
+        first_seen_chat_id,
+        first_seen_message_id,
+        last_seen_chat_id: first_seen_chat_id,
+        last_seen_message_id: first_seen_message_id,
+    })
 }
 
 /// Report for inbound Telegram history persistence.
@@ -376,7 +444,6 @@ pub struct UpdateHandlerWithHistory<History, Handler> {
 }
 
 impl<History, Handler> UpdateHandlerWithHistory<History, Handler> {
-    /// Wrap a concrete update handler with Go-style history side effects.
     pub fn new(history_store: Arc<History>, handler: Arc<Handler>, bot_id: i64) -> Self {
         Self {
             history_store,
@@ -404,7 +471,6 @@ where
     }
 }
 
-/// Build and persist the Go-shaped history entry for one inbound Telegram message update.
 pub async fn persist_inbound_message_history<S>(
     store: &S,
     update: &TelegramUpdate,
@@ -434,7 +500,6 @@ where
     })
 }
 
-/// Persist the Go-shaped history update for one inbound Telegram edited-message update.
 pub async fn persist_edited_message_history<S>(
     store: &S,
     update: &TelegramUpdate,
@@ -465,7 +530,6 @@ where
     Ok(EditedMessageHistoryReport { entry_updated })
 }
 
-/// Persist Go history side effects for one decoded update using fetcher-derived context.
 pub async fn persist_update_history<S>(
     store: &S,
     update: &TelegramUpdate,
@@ -512,10 +576,8 @@ where
     }
 }
 
-/// Run Go-style history side effects before an injected decoded-update handler.
 ///
 /// History failures are logged and returned in the report but do not prevent
-/// the injected handler from running, matching Go's history service call sites.
 pub async fn handle_update_with_history<S, HandleFn, HandleFuture, HandleError>(
     store: &S,
     update: TelegramUpdate,
@@ -585,6 +647,39 @@ where
         now,
         |update| async move { persist_update_state(store, &update).await.map(|_| ()) },
         handle,
+    )
+    .await
+}
+
+/// Process one decoded update with app-owned state persistence and live stage diagnostics.
+pub async fn process_update_with_state_store_tracked_at<
+    S,
+    HandleFn,
+    HandleFuture,
+    HandleError,
+    Tracker,
+>(
+    update: TelegramUpdate,
+    config: UpdateConsumerConfig,
+    now: SystemTime,
+    store: &S,
+    handle: HandleFn,
+    tracker: &Tracker,
+) -> UpdateProcessReport
+where
+    S: UpdateStateStore + Sync,
+    HandleFn: FnOnce(TelegramUpdate) -> HandleFuture,
+    HandleFuture: Future<Output = Result<(), HandleError>>,
+    HandleError: fmt::Display,
+    Tracker: UpdateStageTracker + ?Sized,
+{
+    openplotva_updates::process_update_with_stage_tracker_at(
+        update,
+        config,
+        now,
+        |update| async move { persist_update_state(store, &update).await.map(|_| ()) },
+        handle,
+        tracker,
     )
     .await
 }
@@ -669,7 +764,6 @@ pub struct UpdateConsumerRunReport {
     pub dequeued: usize,
     /// Empty polls/timeouts observed while waiting for updates.
     pub empty_polls: usize,
-    /// Dequeue errors observed; the loop continues after these like Go logs and continues.
     pub dequeue_errors: Vec<String>,
     /// Processed update reports completed before shutdown returned.
     pub processed: usize,
@@ -699,6 +793,33 @@ where
     H: UpdateHandler + Send + Sync + 'static,
     Stop: Future<Output = ()> + Send,
 {
+    run_update_consumer_with_stage_tracker_until(
+        source,
+        config,
+        store,
+        handler,
+        Arc::new(NoopUpdateStageTracker),
+        stop,
+    )
+    .await
+}
+
+/// Run the app-level update consumer with live stage diagnostics.
+pub async fn run_update_consumer_with_stage_tracker_until<Q, S, H, Tracker, Stop>(
+    source: Arc<Q>,
+    config: UpdateConsumerConfig,
+    store: Arc<S>,
+    handler: Arc<H>,
+    tracker: Arc<Tracker>,
+    stop: Stop,
+) -> UpdateConsumerRunReport
+where
+    Q: UpdateSource + Send + Sync + 'static,
+    S: UpdateStateStore + Send + Sync + 'static,
+    H: UpdateHandler + Send + Sync + 'static,
+    Tracker: UpdateStageTracker + Send + Sync + 'static,
+    Stop: Future<Output = ()> + Send,
+{
     let worker_limit = config.worker_limit.max(1);
     let semaphore = Arc::new(Semaphore::new(worker_limit));
     let mut workers = JoinSet::new();
@@ -726,14 +847,16 @@ where
 
                         let store = Arc::clone(&store);
                         let handler = Arc::clone(&handler);
+                        let tracker = Arc::clone(&tracker);
                         workers.spawn(async move {
                             let _permits = permits;
-                            process_update_with_state_store_at(
+                            process_update_with_state_store_tracked_at(
                                 update,
                                 config,
                                 now,
                                 store.as_ref(),
                                 |update| handler.handle_update(update),
+                                tracker.as_ref(),
                             )
                             .await
                         });
@@ -835,9 +958,9 @@ mod tests {
 
     use super::{
         EditedHistoryStore, EditedHistoryStoreFuture, InboundHistoryStore,
-        InboundHistoryStoreFuture, InboundHistoryUpsert, UpdateHandler, UpdateHandlerFuture,
-        UpdateHandlerWithHistory, UpdateSource, UpdateSourceFuture, UpdateStateStore,
-        UpdateStateStoreFuture, persist_update_state,
+        InboundHistoryStoreFuture, InboundHistoryUpsert, TelegramFileMetadataStoreFuture,
+        UpdateHandler, UpdateHandlerFuture, UpdateHandlerWithHistory, UpdateSource,
+        UpdateSourceFuture, UpdateStateStore, UpdateStateStoreFuture, persist_update_state,
         process_update_with_state_and_history_store_at, process_update_with_state_store_at,
         run_update_consumer_until,
     };
@@ -871,6 +994,30 @@ mod tests {
         assert!(!report.chat_persisted);
         assert!(!report.user_persisted);
         assert!(store.calls().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn persist_update_state_captures_telegram_file_metadata_like_go_fetcher()
+    -> Result<(), Box<dyn Error>> {
+        let store = StoreStub::default();
+
+        let report = persist_update_state(&store, &sample_caption_message_update()?).await?;
+
+        assert!(report.chat_persisted);
+        assert!(report.user_persisted);
+        assert_eq!(report.telegram_files_seen, 1);
+        assert_eq!(report.telegram_files_persisted, 1);
+        assert_eq!(report.telegram_file_errors, 0);
+        assert_eq!(
+            store.calls(),
+            vec![
+                "chat:42:private:Ada:ada_l".to_owned(),
+                "user:99:Ada:ada_l".to_owned(),
+                "file:photo-large-u:photo-large:photo::Some(1024):Some(768):None:Some(42):Some(78)"
+                    .to_owned(),
+            ]
+        );
         Ok(())
     }
 
@@ -1072,6 +1219,36 @@ mod tests {
         assert!(report.skipped_handle);
         assert_eq!(report.handle, None);
         assert_eq!(store.calls().len(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn process_update_with_state_store_skips_go_unprocessed_update_after_state()
+    -> Result<(), Box<dyn Error>> {
+        let store = StoreStub::default();
+        let terminal = Arc::new(FailingUpdateHandler);
+        let skipped = crate::skipped::SkippedUpdateHandler::new(terminal);
+
+        let report = process_update_with_state_store_at(
+            sample_poll_update_with_id(12348)?,
+            UpdateConsumerConfig {
+                state_timeout: Duration::from_secs(1),
+                handle_timeout: Duration::from_secs(1),
+                ..UpdateConsumerConfig::default()
+            },
+            unix_time(1_710_000_010),
+            &store,
+            |update| skipped.handle_update(update),
+        )
+        .await;
+
+        assert_eq!(report.update_id, 12348);
+        assert_eq!(report.update_name, "poll");
+        assert_eq!(report.state.outcome, UpdateStageOutcome::Completed);
+        assert_eq!(
+            report.handle.as_ref().map(|stage| &stage.outcome),
+            Some(&UpdateStageOutcome::Completed)
+        );
         Ok(())
     }
 
@@ -1397,6 +1574,30 @@ mod tests {
                 Ok(())
             })
         }
+
+        fn upsert_telegram_file_metadata<'a>(
+            &'a self,
+            params: &'a openplotva_storage::TelegramFileMetadataUpsert,
+        ) -> TelegramFileMetadataStoreFuture<'a, Self::Error> {
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .map_err(|err| io::Error::other(err.to_string()))?
+                    .push(format!(
+                        "file:{}:{}:{}:{}:{:?}:{:?}:{:?}:{:?}:{:?}",
+                        params.file_unique_id,
+                        params.latest_file_id,
+                        params.media_kind,
+                        params.mime_type.as_deref().unwrap_or_default(),
+                        params.width,
+                        params.height,
+                        params.file_size,
+                        params.last_seen_chat_id,
+                        params.last_seen_message_id
+                    ));
+                Ok(())
+            })
+        }
     }
 
     #[derive(Clone)]
@@ -1488,6 +1689,25 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Debug)]
+    struct FailingUpdateHandler;
+
+    impl UpdateHandler for FailingUpdateHandler {
+        type Error = io::Error;
+
+        fn handle_update<'a>(
+            &'a self,
+            update: TelegramUpdate,
+        ) -> UpdateHandlerFuture<'a, Self::Error> {
+            Box::pin(async move {
+                Err(io::Error::other(format!(
+                    "unexpected delegated update {}",
+                    update.id
+                )))
+            })
+        }
+    }
+
     fn sample_message_update() -> Result<TelegramUpdate, serde_json::Error> {
         sample_message_update_with_id(12345)
     }
@@ -1511,6 +1731,35 @@ mod tests {
                     "username": "ada_l"
                 },
                 "text": "/start hello"
+            }
+        }))
+    }
+
+    fn sample_poll_update_with_id(update_id: i64) -> Result<TelegramUpdate, serde_json::Error> {
+        serde_json::from_value(json!({
+            "update_id": update_id,
+            "poll": {
+                "type": "regular",
+                "allows_multiple_answers": false,
+                "allows_revoting": false,
+                "id": "poll-id",
+                "is_anonymous": true,
+                "is_closed": true,
+                "members_only": false,
+                "options": [
+                    {
+                        "persistent_id": "1",
+                        "text": "Yes",
+                        "voter_count": 1000
+                    },
+                    {
+                        "persistent_id": "2",
+                        "text": "No",
+                        "voter_count": 0
+                    }
+                ],
+                "question": "Rust?",
+                "total_voter_count": 1000
             }
         }))
     }

@@ -51,7 +51,6 @@ pub fn monotonic_virtual_id_factory(prefix: &'static str) -> VirtualIdFactory {
     })
 }
 
-/// Storage operations used by Go's virtual send/edit/delete paths.
 pub trait VirtualMessageStore {
     /// Store error type.
     type Error: fmt::Display + Send + Sync + 'static;
@@ -147,7 +146,6 @@ impl VirtualMessageStore for openplotva_storage::PostgresVirtualMessageStore {
     }
 }
 
-/// Store boundary for Go's ephemeral post-send message tracking.
 pub trait EphemeralMessageTracker {
     /// Store error type.
     type Error: fmt::Display + Send + Sync + 'static;
@@ -192,7 +190,6 @@ impl EphemeralMessageTracker for openplotva_storage::RedisEphemeralMessageStore 
     }
 }
 
-/// Store boundary for Go's periodic ephemeral-message cleanup.
 pub trait EphemeralCleanupStore {
     /// Store error type.
     type Error: fmt::Display + Send + Sync + 'static;
@@ -261,9 +258,7 @@ pub struct VirtualMessageReport {
     pub real_message_id: Option<i32>,
     /// Pending operation row ID, when enqueue succeeded.
     pub enqueued_op_id: Option<i64>,
-    /// Mapping lookup error ignored by Go before queueing a pending operation.
     pub lookup_error: Option<String>,
-    /// Enqueue error ignored by Go after deciding to queue.
     pub enqueue_error: Option<String>,
     /// Number of queued dispatcher items removed by virtual ID.
     pub canceled: usize,
@@ -273,7 +268,6 @@ pub struct VirtualMessageReport {
     pub history_deleted: bool,
     /// Whether a successful delete removed its virtual-message mapping.
     pub mapping_deleted: bool,
-    /// Mapping-delete error ignored by Go after a successful Telegram delete.
     pub delete_mapping_error: Option<String>,
 }
 
@@ -322,7 +316,6 @@ pub struct VirtualEditRequest<'a> {
     pub vmsg_id: &'a str,
     /// New message text.
     pub text: &'a str,
-    /// Go parse mode string, such as `HTML`.
     pub parse_mode: &'a str,
 }
 
@@ -340,11 +333,8 @@ pub struct QueueTextRequest<'a> {
     pub message: &'a TextMessageRequest,
     /// Optional replied-to message fields.
     pub reply_to: Option<&'a ReplyMessageRef>,
-    /// Whether Go would enqueue the first split part in the immediate queue.
     pub immediate_first: bool,
-    /// Whether Go `TextMessage.BypassChatRestrictions` was set at enqueue time.
     pub bypass_chat_restrictions: bool,
-    /// Go `SendEphemeralText` delete timing, attached only to the first split part.
     pub ephemeral_delete_after: Option<Duration>,
 }
 
@@ -354,11 +344,8 @@ pub struct QueueStickerRequest<'a> {
     pub message: &'a StickerMessageRequest,
     /// Optional replied-to message fields.
     pub reply_to: Option<&'a ReplyMessageRef>,
-    /// Whether Go would enqueue the sticker in the immediate queue.
     pub immediate: bool,
-    /// Whether Go `StickerMessage.BypassChatRestrictions` was set at enqueue time.
     pub bypass_chat_restrictions: bool,
-    /// Go `SendEphemeralSticker` delete timing.
     pub ephemeral_delete_after: Option<Duration>,
 }
 
@@ -368,7 +355,6 @@ pub struct QueueEditTextRequest<'a> {
     pub message: &'a EditTextMessageRequest,
     /// Whether the edit should enter the immediate queue.
     pub immediate: bool,
-    /// Whether Go `TextMessage.BypassChatRestrictions` was set at enqueue time.
     pub bypass_chat_restrictions: bool,
 }
 
@@ -414,18 +400,15 @@ pub struct QueuedTextPartReport {
     pub enqueue_outcome: EnqueueOutcome,
     /// Whether this part went to the immediate queue.
     pub immediate: bool,
-    /// Storage error ignored by Go when inserting the virtual ID row.
     pub insert_error: Option<String>,
 }
 
-/// Summary of queueing one Go `SendText` request.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct QueueTextReport {
     /// Split text parts that were queued or deduped.
     pub parts: Vec<QueuedTextPartReport>,
 }
 
-/// Summary of queueing one Go `SendSticker` request.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueueStickerReport {
     /// Virtual message ID generated before queueing.
@@ -433,11 +416,9 @@ pub struct QueueStickerReport {
     pub enqueue_outcome: EnqueueOutcome,
     /// Whether this sticker went to the immediate queue.
     pub immediate: bool,
-    /// Storage error ignored by Go when inserting the virtual ID row.
     pub insert_error: Option<String>,
 }
 
-/// Summary of queueing one Go direct `sendPhoto` chattable.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct QueuePhotoReport {
     pub enqueue_outcome: EnqueueOutcome,
@@ -445,7 +426,6 @@ pub struct QueuePhotoReport {
     pub immediate: bool,
 }
 
-/// Summary of queueing one Go direct `sendAudio` chattable.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct QueueAudioReport {
     pub enqueue_outcome: EnqueueOutcome,
@@ -453,7 +433,6 @@ pub struct QueueAudioReport {
     pub immediate: bool,
 }
 
-/// Summary of queueing one Go direct `EditText` call.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct QueueEditTextReport {
     pub enqueue_outcome: EnqueueOutcome,
@@ -461,7 +440,6 @@ pub struct QueueEditTextReport {
     pub immediate: bool,
 }
 
-/// Summary of queueing one Go direct `sendMediaGroup` call.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct QueueMediaGroupReport {
     pub enqueue_outcome: EnqueueOutcome,
@@ -469,7 +447,6 @@ pub struct QueueMediaGroupReport {
     pub immediate: bool,
 }
 
-/// Summary of queueing one Go direct `editMessageMedia` call.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct QueueEditMediaReport {
     pub enqueue_outcome: EnqueueOutcome,
@@ -495,7 +472,6 @@ impl QueueTextReport {
     }
 }
 
-/// Report from sending one dispatcher work item and applying Go post-send mapping resolution.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DispatchResolveReport {
     pub status: DispatcherSendStatus,
@@ -507,9 +483,7 @@ pub struct DispatchResolveReport {
     pub missing_method: bool,
     /// Telegram send error returned by the transport callback.
     pub send_error: Option<String>,
-    /// Mapping-resolution error ignored by Go after send success.
     pub resolve_error: Option<String>,
-    /// Ephemeral tracking error ignored by Go after send success.
     pub ephemeral_track_error: Option<String>,
     /// Whether a direct edit-text item was reflected into history after send success.
     pub history_updated: bool,
@@ -519,7 +493,6 @@ pub struct DispatchResolveReport {
 pub struct EphemeralCleanupReport {
     /// Number of tracked records loaded from the store.
     pub loaded: usize,
-    /// Number of records expired at the strict Go `now > expires_at` boundary.
     pub expired: usize,
     /// Number of Telegram delete requests attempted.
     pub telegram_delete_attempted: usize,
@@ -720,7 +693,6 @@ fn trace_ephemeral_cleanup_tick(tick: &EphemeralCleanupReport) {
 /// Recoverable errors from immediate virtual-message handling.
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum VirtualMessageError {
-    /// Go returns this before trying storage for virtual edits.
     #[error("text is empty")]
     EmptyText,
     /// The resolved operation could not be converted into a Telegram method.
@@ -731,7 +703,6 @@ pub enum VirtualMessageError {
     Send(String),
 }
 
-/// Queue text parts like Go `SendText`, creating virtual-message rows before dispatcher enqueue.
 pub async fn queue_text_message_parts<S, NextId>(
     store: &S,
     queue: &DispatcherQueue,
@@ -793,7 +764,6 @@ where
     Ok(report)
 }
 
-/// Queue one sticker like Go `SendSticker`, creating a virtual-message row before dispatcher enqueue.
 pub async fn queue_sticker_message<S, NextId>(
     store: &S,
     queue: &DispatcherQueue,
@@ -838,7 +808,6 @@ where
     })
 }
 
-/// Queue one photo like a Go direct `SendChattable(api.PhotoConfig)` path.
 pub fn queue_photo_message(
     queue: &DispatcherQueue,
     req: QueuePhotoRequest<'_>,
@@ -859,7 +828,6 @@ pub fn queue_photo_message(
     })
 }
 
-/// Queue one audio like a Go direct `SendChattable(api.AudioConfig)` path.
 pub fn queue_audio_message(
     queue: &DispatcherQueue,
     req: QueueAudioRequest<'_>,
@@ -880,7 +848,6 @@ pub fn queue_audio_message(
     })
 }
 
-/// Queue one edit-text call like Go `EditText` without virtual-message mapping.
 pub fn queue_edit_text_message(
     queue: &DispatcherQueue,
     req: QueueEditTextRequest<'_>,
@@ -898,7 +865,6 @@ pub fn queue_edit_text_message(
     })
 }
 
-/// Queue one media group like a Go direct `SendMediaGroup(api.MediaGroupConfig)` path.
 pub fn queue_media_group_message(
     queue: &DispatcherQueue,
     req: QueueMediaGroupRequest<'_>,
@@ -920,7 +886,6 @@ pub fn queue_media_group_message(
     })
 }
 
-/// Queue one edit-media call like a Go direct `EditMessageMediaWithContext` path.
 pub fn queue_edit_media_message(
     queue: &DispatcherQueue,
     req: QueueEditMediaRequest<'_>,

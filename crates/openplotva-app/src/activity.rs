@@ -12,19 +12,16 @@ use crate::updates::{UpdateHandler, UpdateHandlerFuture};
 /// Boxed future returned by activity storage calls.
 pub type ActivityStoreFuture<'a, T, E> = Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'a>>;
 
-/// Store boundary for Go `trackUserActivity`.
 pub trait MessageActivityStore {
     /// Store error type.
     type Error: fmt::Display + Send + Sync + 'static;
 
-    /// Update Go `chat_members.last_message_at`.
     fn update_member_last_message<'a>(
         &'a self,
         chat_id: i64,
         user_id: i64,
     ) -> ActivityStoreFuture<'a, (), Self::Error>;
 
-    /// Upsert Go `chat_active_users`.
     fn upsert_chat_active_user<'a>(
         &'a self,
         chat_id: i64,
@@ -65,17 +62,14 @@ impl MessageActivityStore for openplotva_storage::PostgresChatMemberStore {
     }
 }
 
-/// Route chosen by Go message-activity tracking.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub enum MessageActivityRoute {
-    /// The update was not a user message that Go tracks.
     #[default]
     Skipped,
     /// A user message was tracked.
     Tracked(MessageActivityReport),
 }
 
-/// Side-effect report for one Go `trackUserActivity` run.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MessageActivityReport {
     pub chat_id: i64,
@@ -99,7 +93,6 @@ pub enum MessageActivityError {
     },
 }
 
-/// `UpdateHandler` adapter that tracks Go message activity before downstream routing.
 #[derive(Clone, Debug)]
 pub struct MessageActivityUpdateHandler<Store, Next> {
     store: Arc<Store>,
@@ -131,7 +124,6 @@ where
     }
 }
 
-/// Track Go message activity, then always delegate update handling.
 pub async fn handle_message_activity_update_or_else<Store, HandleFn, HandleFuture, HandleError>(
     store: &Store,
     update: TelegramUpdate,
@@ -152,7 +144,6 @@ where
     Ok(route)
 }
 
-/// Run Go `trackMessageSenderActivity`/`trackUserActivity` for one decoded update.
 pub async fn track_message_activity<Store>(
     store: &Store,
     update: &TelegramUpdate,
@@ -245,16 +236,22 @@ fn user_state(user: &carapax::types::User) -> UserState {
 #[cfg(test)]
 mod tests {
     use std::{
+        env,
         error::Error,
         io,
         sync::{Arc, Mutex},
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
     use carapax::types::Update as TelegramUpdate;
     use openplotva_core::UserState;
+    use openplotva_updates::{UpdateConsumerConfig, UpdateStageOutcome};
     use serde_json::json;
 
-    use crate::updates::{UpdateHandler, UpdateHandlerFuture};
+    use crate::updates::{
+        TelegramFileMetadataStoreFuture, UpdateHandler, UpdateHandlerFuture, UpdateStateStore,
+        UpdateStateStoreFuture, process_update_with_state_store_at,
+    };
 
     use super::{
         ActivityStoreFuture, MessageActivityRoute, MessageActivityStore,
@@ -360,6 +357,75 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn live_redis_decoded_activity_tracks_retries_and_delegates_when_url_is_set()
+    -> Result<(), Box<dyn Error>> {
+        let Ok(redis_url) = env::var("OPENPLOTVA_TEST_REDIS_URL") else {
+            return Ok(());
+        };
+        let redis_client = redis::Client::open(redis_url.as_str())?;
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let key = format!("openplotva:test:decoded-activity:{suffix}");
+        let update_queue =
+            openplotva_updates::RedisUpdateQueue::with_key(redis_client.clone(), key.clone());
+        let mut redis = redis_client.get_multiplexed_async_connection().await?;
+        let _: i64 = redis::cmd("DEL").arg(&key).query_async(&mut redis).await?;
+
+        update_queue.enqueue_update(&message_update()?).await?;
+        assert_eq!(update_queue.len().await?, 1);
+
+        let store = Arc::new(ActivityStoreStub::default().fail_first_active());
+        let next = Arc::new(UpdateHandlerStub::default());
+        let handler = MessageActivityUpdateHandler::new(Arc::clone(&store), Arc::clone(&next));
+        let state_store = UpdateStateStoreStub::default();
+        let config = UpdateConsumerConfig {
+            dequeue_timeout: Duration::from_millis(1),
+            state_timeout: Duration::from_secs(1),
+            handle_timeout: Duration::from_secs(1),
+            side_effect_max_age: Duration::from_secs(60),
+            worker_limit: 1,
+        };
+        let decoded = update_queue
+            .dequeue_update(Duration::from_secs(1))
+            .await?
+            .ok_or_else(|| io::Error::other("expected decoded activity update"))?;
+        let report = process_update_with_state_store_at(
+            decoded,
+            config,
+            UNIX_EPOCH + Duration::from_secs(1_710_000_010),
+            &state_store,
+            |update| handler.handle_update(update),
+        )
+        .await;
+
+        assert_eq!(report.update_id, 501);
+        assert_eq!(report.update_name, "message");
+        assert_eq!(report.state.outcome, UpdateStageOutcome::Completed);
+        assert_eq!(
+            report.handle.as_ref().map(|stage| &stage.outcome),
+            Some(&UpdateStageOutcome::Completed)
+        );
+        assert!(!report.skipped_handle);
+        assert_eq!(
+            state_store.calls(),
+            vec!["chat:42:private".to_owned(), "user:111:Ada".to_owned()]
+        );
+        assert_eq!(
+            store.calls(),
+            vec![
+                "last:42:111".to_owned(),
+                "active:42:111".to_owned(),
+                "user:111:Ada".to_owned(),
+                "active:42:111".to_owned(),
+            ]
+        );
+        assert_eq!(next.handled_count(), 1);
+        assert_eq!(update_queue.len().await?, 0);
+
+        let _: i64 = redis::cmd("DEL").arg(&key).query_async(&mut redis).await?;
+        Ok(())
+    }
+
     #[derive(Clone, Debug, Default)]
     struct ActivityStoreStub {
         state: Arc<Mutex<ActivityStoreState>>,
@@ -426,6 +492,60 @@ mod tests {
                     .expect("state")
                     .calls
                     .push(format!("user:{}:{}", user.id, user.first_name));
+                Ok(())
+            })
+        }
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct UpdateStateStoreStub {
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl UpdateStateStoreStub {
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().expect("state calls").clone()
+        }
+    }
+
+    impl UpdateStateStore for UpdateStateStoreStub {
+        type Error = io::Error;
+
+        fn upsert_chat_state<'a>(
+            &'a self,
+            chat: &'a openplotva_core::ChatState,
+        ) -> UpdateStateStoreFuture<'a, Self::Error> {
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .map_err(|error| io::Error::other(error.to_string()))?
+                    .push(format!("chat:{}:{}", chat.id, chat.chat_type));
+                Ok(())
+            })
+        }
+
+        fn upsert_user_state<'a>(
+            &'a self,
+            user: &'a UserState,
+        ) -> UpdateStateStoreFuture<'a, Self::Error> {
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .map_err(|error| io::Error::other(error.to_string()))?
+                    .push(format!("user:{}:{}", user.id, user.first_name));
+                Ok(())
+            })
+        }
+
+        fn upsert_telegram_file_metadata<'a>(
+            &'a self,
+            params: &'a openplotva_storage::TelegramFileMetadataUpsert,
+        ) -> TelegramFileMetadataStoreFuture<'a, Self::Error> {
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .map_err(|error| io::Error::other(error.to_string()))?
+                    .push(format!("file:{}", params.file_unique_id));
                 Ok(())
             })
         }

@@ -1,22 +1,27 @@
 use std::{
+    collections::HashMap,
     fmt, fs,
     future::Future,
     io::{self, Write},
     path::{Path, PathBuf},
     pin::Pin,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
 use crate::{
     updates::{UpdateHandler, UpdateHandlerFuture},
-    virtual_messages::{VirtualIdFactory, monotonic_virtual_id_factory},
+    virtual_messages::{
+        QueueTextRequest, VirtualIdFactory, VirtualMessageStore, monotonic_virtual_id_factory,
+        queue_text_message_parts,
+    },
 };
 use carapax::types::{
-    Chat as TelegramChat, Message as TelegramMessage, MessageData as TelegramMessageData,
-    PreCheckoutQuery as TelegramPreCheckoutQuery, SuccessfulPayment as TelegramSuccessfulPayment,
-    TextEntity as TelegramTextEntity, Update as TelegramUpdate, UpdateType as TelegramUpdateType,
-    User as TelegramUser,
+    CallbackQuery as TelegramCallbackQuery, Chat as TelegramChat, MaybeInaccessibleMessage,
+    Message as TelegramMessage, MessageData as TelegramMessageData,
+    PreCheckoutQuery as TelegramPreCheckoutQuery, ReplyTo as TelegramReplyTo,
+    SuccessfulPayment as TelegramSuccessfulPayment, TextEntity as TelegramTextEntity,
+    Update as TelegramUpdate, UpdateType as TelegramUpdateType, User as TelegramUser,
 };
 use openplotva_core::{
     UserState, VIP_EVENT_TYPE_ADMIN_ADJUSTMENT, VIP_EVENT_TYPE_ADMIN_REVOKE,
@@ -30,7 +35,9 @@ use openplotva_storage::{
 };
 use openplotva_taskman::{
     CONTROL_QUEUE_NAME, ControlJobData, ControlJobParams, ControlKind, ControlPayment,
-    HIGH_PRIORITY, StatelessJobItem, control_job_params_from_stateless_job, new_control_job_at,
+    HIGH_PRIORITY, InMemoryTaskQueue, JobStatus, JobType, StatelessJobItem,
+    TASK_QUEUE_SNAPSHOT_FORMAT, TaskQueueIdAllocator, TaskQueueRecord, TaskQueueSnapshot,
+    control_job_params_from_stateless_job, new_control_job_at,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -64,10 +71,13 @@ pub type PaymentControlJobWorkerFuture<'a, T, E> =
 /// Boxed future returned by VIP status checks.
 pub type VipStatusCheckFuture<'a> = Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
 
+/// Boxed future returned by VIP cancellation side effects.
+pub type VipCancellationEffectFuture<'a, E> =
+    Pin<Box<dyn Future<Output = Result<(), E>> + Send + 'a>>;
+
 /// Telegram successful-payment payload captured from a message/control job.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SuccessfulPayment {
-    /// Telegram currency. Go only processes Stars payments (`XTR`).
     pub currency: String,
     /// Telegram total amount in Stars.
     pub total_amount: i64,
@@ -79,7 +89,6 @@ pub struct SuccessfulPayment {
     pub provider_payment_charge_id: String,
 }
 
-/// Minimal message context needed to process Go successful-payment side effects.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SuccessfulPaymentMessage {
     /// Telegram chat ID used for the response message.
@@ -92,7 +101,6 @@ pub struct SuccessfulPaymentMessage {
     pub payment: SuccessfulPayment,
 }
 
-/// User-visible text sent by the Go successful-payment path.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PaymentTextMessage<'value> {
     /// Telegram chat ID.
@@ -101,7 +109,6 @@ pub struct PaymentTextMessage<'value> {
     pub reply_to_message_id: i32,
     /// Message text.
     pub text: &'value str,
-    /// Go parse mode string.
     pub parse_mode: &'value str,
 }
 
@@ -128,7 +135,6 @@ pub enum SuccessfulPaymentOutcome {
     DonationStorageError,
 }
 
-/// Payment processing report. Go logs most failures and returns nil, so Rust reports them explicitly.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SuccessfulPaymentReport {
     /// Result class.
@@ -140,54 +146,39 @@ pub struct SuccessfulPaymentReport {
 /// Routing result for a decoded Telegram update passed through the payment-aware wrapper.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SuccessfulPaymentUpdateRoute {
-    /// A Go successful-payment service message was processed.
     Processed(SuccessfulPaymentOutcome),
     /// The update was not a successful-payment service message and was delegated.
     Delegated,
 }
 
-/// Routing result for queueing Go successful-payment control jobs from decoded updates.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SuccessfulPaymentControlJobUpdateRoute {
-    /// A successful-payment control job was assigned to the Go control queue.
     Queued,
-    /// Control-job assignment failed. Go logs and keeps the update handled.
     QueueError,
     /// The update was not a successful-payment service message and was delegated.
     Delegated,
 }
 
-/// Result of building the Go `/vip` or `/donate` invoice control job.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PaymentInvoiceControlJobBuild {
     /// A high-priority payment invoice control job was built.
     Job(Box<StatelessJobItem>),
     /// The update was not a payment invoice command.
     NotPaymentCommand,
-    /// The command was sent outside a private chat; Go sends a deep-link redirect instead.
     NonPrivateChat,
-    /// Go cannot identify a valid non-bot VIP subscriber.
     MissingUser,
-    /// `/donate` carried an amount outside the Go-supported Stars range or not an integer.
     InvalidDonationAmount,
 }
 
-/// Routing result for queueing Go payment invoice command control jobs.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PaymentInvoiceCommandUpdateRoute {
-    /// A VIP/donation invoice control job was assigned to the Go control queue.
     Queued,
-    /// Control-job assignment failed. Go logs and keeps the command handled.
     QueueError,
-    /// The command was sent outside a private chat; caller should send the Go redirect message.
     NonPrivateChat,
     /// VIP invoice command did not have a valid non-bot user.
     MissingUser,
-    /// Private `/vip` found an active VIP status and sent Go's status message instead of an invoice.
     ExistingVipStatusSent,
-    /// Private `/vip` found an active VIP status but failed to send Go's status message.
     ExistingVipStatusSendError,
-    /// Private `/vip` was VIP-positive, but the status lookup failed; Go sends an error instead of queueing.
     ExistingVipStatusLookupError,
     /// Private `/vip` was VIP-positive, but no displayable status view was found.
     ExistingVipStatusUnavailable,
@@ -202,33 +193,58 @@ pub enum PaymentInvoiceCommandUpdateRoute {
 pub enum PreCheckoutOutcome {
     /// Telegram accepted the successful pre-checkout answer.
     Acknowledged,
-    /// Telegram rejected the answer. Go logs this and still treats the update as handled.
     AcknowledgementError,
 }
 
 /// Routing result for a decoded Telegram pre-checkout update.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PreCheckoutUpdateRoute {
-    /// A Go pre-checkout query was answered.
     Processed(PreCheckoutOutcome),
     /// The update was not a pre-checkout query and was delegated.
     Delegated,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum VipCancellationCallbackOutcome {
+    /// Update did not belong to this slice and was delegated.
+    Delegated,
+    /// Callback matched a VIP cancellation action but did not carry a message to edit.
+    MissingMessage,
+    /// `cancel_vip` edited the status message into the confirmation prompt.
+    ConfirmationShown,
+    /// `confirm_cancel_vip` found no active paid subscription or failed to load it.
+    MissingSubscription,
+    /// Telegram rejected the Stars subscription cancellation request.
+    TelegramCancelError,
+    Canceled,
+    /// `back_to_vip_status` found no active status view and edited the inactive text.
+    BackInactive,
+    /// `back_to_vip_status` restored the active VIP status view.
+    BackStatusShown,
+}
+
+/// Fatal errors from the VIP cancellation callback wrapper.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum VipCancellationCallbackError {
+    /// Downstream update handling failed.
+    #[error("downstream update handler failed: {message}")]
+    Downstream {
+        /// Error text.
+        message: String,
+    },
+}
+
 /// Routing result for the payment-aware decoded-update wrapper used before fetcher routing.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PaymentUpdateRoute {
-    /// A Go pre-checkout query was answered directly.
     PreCheckout(PreCheckoutOutcome),
     /// A successful-payment service message was queued as a taskman control job.
     SuccessfulPayment(SuccessfulPaymentControlJobUpdateRoute),
-    /// A `/vip` or `/donate` command was queued or classified for Go side effects.
     InvoiceCommand(PaymentInvoiceCommandUpdateRoute),
     /// The update was not payment-owned and was delegated.
     Delegated,
 }
 
-/// HTML message with one invoice URL button, matching Go direct chattable sends.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InvoiceButtonMessage {
     /// Telegram chat ID.
@@ -239,7 +255,6 @@ pub struct InvoiceButtonMessage {
     pub button_text: String,
     /// Telegram invoice URL returned by `createInvoiceLink`.
     pub url: String,
-    /// Telegram parse mode. Go uses HTML.
     pub parse_mode: String,
 }
 
@@ -271,7 +286,6 @@ pub struct VipStatusMessage {
     pub message_thread_id: Option<i32>,
     /// HTML message body.
     pub text: String,
-    /// Whether to attach Go's VIP cancellation callback button.
     pub show_cancel_button: bool,
 }
 
@@ -290,7 +304,6 @@ pub enum InvoiceControlJobOutcome {
     SendError,
 }
 
-/// Invoice control-job report. Go returns errors for request/parse/send failures; Rust reports them.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct InvoiceControlJobReport {
     /// Result class.
@@ -316,12 +329,10 @@ pub enum PaymentControlJobOutcome {
     NotPaymentControlJob,
 }
 
-/// Result class for Go `/admin_grant_vip` command handling.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AdminGrantVipCommandOutcome {
     /// A VIP ledger admin-adjustment event was created and a success reply was queued.
     Granted,
-    /// The first duration argument was invalid, so Go's one-day default was applied.
     GrantedWithDefaultDuration,
     /// Neither an explicit target nor a replied-to user was available.
     MissingTarget,
@@ -331,7 +342,6 @@ pub enum AdminGrantVipCommandOutcome {
     StorageError,
 }
 
-/// Report for Go `/admin_grant_vip` command handling.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdminGrantVipCommandReport {
     /// Observable route/outcome.
@@ -340,11 +350,9 @@ pub struct AdminGrantVipCommandReport {
     pub target_user_id: Option<i64>,
     /// Created VIP event ID, when an event was written.
     pub event_id: Option<i64>,
-    /// Human-readable storage/target error, when Go would include or log one.
     pub error: Option<String>,
 }
 
-/// Result class for Go `/admin_cancel_vip` command handling.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AdminCancelVipCommandOutcome {
     /// VIP was revoked through an admin ledger event.
@@ -367,7 +375,6 @@ pub enum AdminCancelVipCommandOutcome {
     RevokeStorageError,
 }
 
-/// Report for Go `/admin_cancel_vip` command handling.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdminCancelVipCommandReport {
     /// Observable route/outcome.
@@ -376,7 +383,41 @@ pub struct AdminCancelVipCommandReport {
     pub target_user_id: Option<i64>,
     /// Created VIP event ID, when an event was written.
     pub event_id: Option<i64>,
-    /// Human-readable storage/target error, when Go would include or log one.
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdminRefundCommandOutcome {
+    /// No Telegram payment charge ID argument was provided.
+    MissingChargeId,
+    /// Subscription lookup failed before donation fallback.
+    SubscriptionLookupError,
+    /// Donation lookup failed after subscription fallback.
+    DonationLookupError,
+    /// Neither a subscription nor a donation matched the charge ID.
+    NotFound,
+    /// The stored row did not contain a usable user ID or amount.
+    InvalidTarget,
+    /// The target subscription is a legacy admin grant, not a Telegram payment.
+    SyntheticSubscription,
+    /// Telegram refund request failed or returned an unsuccessful result.
+    RefundApiError,
+    /// A subscription was refunded and post-refund storage effects were attempted.
+    RefundedSubscription,
+    /// A donation was refunded and its donation row deletion was attempted.
+    RefundedDonation,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminRefundCommandReport {
+    /// Observable route/outcome.
+    pub outcome: AdminRefundCommandOutcome,
+    /// Telegram charge ID supplied to the command, when present.
+    pub telegram_payment_charge_id: Option<String>,
+    /// Refunded user ID, when resolved.
+    pub target_user_id: Option<i64>,
+    /// Refunded amount in Telegram Stars, when resolved.
+    pub amount_stars: Option<i64>,
     pub error: Option<String>,
 }
 
@@ -394,7 +435,6 @@ pub struct PaymentControlJobReport {
 pub struct PaymentControlJobWorkItem {
     /// Taskman job ID used for completion/failure writes.
     pub id: i64,
-    /// Stateless Go-shaped task payload.
     pub job: StatelessJobItem,
 }
 
@@ -413,7 +453,6 @@ pub struct PaymentControlJobWorkerReport {
     pub failed: bool,
     /// Queue dequeue failed.
     pub dequeue_error: Option<String>,
-    /// Queued task payload could not be decoded as Go control-job executor input.
     pub decode_error: Option<String>,
     /// Completion/failure status write failed.
     pub status_error: Option<String>,
@@ -445,7 +484,6 @@ pub enum TelegramPaymentInvoiceEffectError {
     /// Telegram rejected or failed a direct Bot API request.
     #[error("failed to execute Telegram invoice request: {0}")]
     Execute(#[from] carapax::api::ExecuteError),
-    /// Telegram rejected or failed a refund request with Go-shaped wording.
     #[error("{0}")]
     RefundRequest(String),
     /// Telegram returned a false refund result.
@@ -474,6 +512,29 @@ pub enum PaymentRuntimeAdminCancelEffectError<Direct, Successful> {
 }
 
 impl<Direct, Successful> fmt::Display for PaymentRuntimeAdminCancelEffectError<Direct, Successful>
+where
+    Direct: fmt::Display,
+    Successful: fmt::Display,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Direct(error) => error.fmt(formatter),
+            Self::Successful(error) => error.fmt(formatter),
+        }
+    }
+}
+
+/// Runtime VIP-cancellation effect failure preserving which side failed.
+#[derive(Debug)]
+pub enum PaymentRuntimeVipCancellationEffectError<Direct, Successful> {
+    /// Direct Telegram payment side failed.
+    Direct(Direct),
+    /// Dispatcher/cache side failed.
+    Successful(Successful),
+}
+
+impl<Direct, Successful> fmt::Display
+    for PaymentRuntimeVipCancellationEffectError<Direct, Successful>
 where
     Direct: fmt::Display,
     Successful: fmt::Display,
@@ -572,12 +633,10 @@ impl PaymentControlJobWorkerRunReport {
     }
 }
 
-/// Storage boundary needed by Go successful-payment processing.
 pub trait SuccessfulPaymentStore {
     /// Error returned by the concrete storage implementation.
     type Error: fmt::Display + Send + Sync + 'static;
 
-    /// Persist the paying user. Errors are non-fatal, matching Go `ensureUserPersistence`.
     fn upsert_payment_user<'a>(
         &'a self,
         user: &'a UserState,
@@ -620,7 +679,6 @@ pub trait SuccessfulPaymentStore {
     }
 }
 
-/// Storage boundary needed by Go `buildVIPStatusView`.
 pub trait VipStatusStore {
     /// Error returned by the concrete storage implementation.
     type Error: fmt::Display + Send + Sync + 'static;
@@ -644,12 +702,18 @@ pub trait VipStatusStore {
     ) -> PaymentStoreFuture<'a, Option<VipCacheRecord>, Self::Error>;
 }
 
-/// Storage boundary needed by Go `/admin_grant_vip`.
+pub trait VipCancellationStore: VipStatusStore {
+    /// Mark a subscription canceled after Telegram accepts cancellation.
+    fn mark_subscription_canceled<'a>(
+        &'a self,
+        id: i64,
+    ) -> PaymentStoreFuture<'a, SubscriptionRecord, Self::Error>;
+}
+
 pub trait AdminGrantVipStore {
     /// Error returned by the concrete storage implementation.
     type Error: fmt::Display + Send + Sync + 'static;
 
-    /// Resolve a remembered Telegram username to a user ID using Go `GetUserByUsername`.
     fn get_user_id_by_username<'a>(
         &'a self,
         username: &'a str,
@@ -662,12 +726,10 @@ pub trait AdminGrantVipStore {
     ) -> PaymentStoreFuture<'a, VipEventRecord, Self::Error>;
 }
 
-/// Storage boundary needed by Go `/admin_cancel_vip`.
 pub trait AdminCancelVipStore {
     /// Error returned by the concrete storage implementation.
     type Error: fmt::Display + Send + Sync + 'static;
 
-    /// Resolve a remembered Telegram username to a user ID using Go `GetUserByUsername`.
     fn get_user_id_by_username<'a>(
         &'a self,
         username: &'a str,
@@ -698,18 +760,49 @@ pub trait AdminCancelVipStore {
     ) -> PaymentStoreFuture<'a, SubscriptionRecord, Self::Error>;
 }
 
-/// VIP predicate boundary matching Go `Fetcher.IsVIP` before existing-status rendering.
+pub trait AdminRefundStore {
+    /// Error returned by the concrete storage implementation.
+    type Error: fmt::Display + Send + Sync + 'static;
+
+    /// Load a subscription by Telegram Stars charge ID.
+    fn get_admin_refund_subscription_by_charge_id<'a>(
+        &'a self,
+        telegram_payment_charge_id: &'a str,
+    ) -> PaymentStoreFuture<'a, Option<SubscriptionRecord>, Self::Error>;
+
+    /// Load a donation by Telegram Stars charge ID.
+    fn get_admin_refund_donation_by_charge_id<'a>(
+        &'a self,
+        telegram_payment_charge_id: &'a str,
+    ) -> PaymentStoreFuture<'a, Option<DonationRecord>, Self::Error>;
+
+    /// Mark a subscription refunded after Telegram accepts the refund.
+    fn mark_admin_refund_subscription_refunded<'a>(
+        &'a self,
+        id: i64,
+    ) -> PaymentStoreFuture<'a, SubscriptionRecord, Self::Error>;
+
+    /// Write the subscription refund-reversal ledger event.
+    fn create_admin_refund_vip_event<'a>(
+        &'a self,
+        event: VipEventCreate<'a>,
+    ) -> PaymentStoreFuture<'a, VipEventRecord, Self::Error>;
+
+    fn delete_admin_refund_donation<'a>(
+        &'a self,
+        id: i64,
+    ) -> PaymentStoreFuture<'a, DonationRecord, Self::Error>;
+}
+
 pub trait VipStatusChecker {
     /// Return whether this user should see existing VIP status instead of a new invoice.
     fn is_vip_at<'a>(&'a self, user_id: i64, now: OffsetDateTime) -> VipStatusCheckFuture<'a>;
 }
 
-/// Side-effect boundary for Go successful-payment processing.
 pub trait SuccessfulPaymentEffects {
     /// Error returned by the concrete side-effect implementation.
     type Error: fmt::Display + Send + Sync + 'static;
 
-    /// Send a user-facing text response. Go ignores send failures here.
     fn send_text<'a>(
         &'a self,
         message: PaymentTextMessage<'a>,
@@ -719,19 +812,16 @@ pub trait SuccessfulPaymentEffects {
     fn invalidate_vip_cache<'a>(&'a self, user_id: i64) -> PaymentEffectsFuture<'a, Self::Error>;
 }
 
-/// Side-effect boundary for the Go in-memory VIP cache.
 pub trait VipCacheInvalidator {
     /// Error returned by the concrete cache implementation.
     type Error: fmt::Display + Send + Sync + 'static;
 
-    /// Invalidate one user-specific Go VIP cache key.
     fn invalidate_vip_cache<'a>(
         &'a self,
         user_id: i64,
     ) -> VipCacheInvalidationFuture<'a, Self::Error>;
 }
 
-/// Placeholder invalidator for runtime slices that do not yet carry Go's server main cache.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NoopVipCacheInvalidator;
 
@@ -746,12 +836,10 @@ impl VipCacheInvalidator for NoopVipCacheInvalidator {
     }
 }
 
-/// Side-effect boundary for Go `/admin_grant_vip` replies and cache invalidation.
 pub trait AdminGrantVipEffects {
     /// Error returned by the concrete side-effect implementation.
     type Error: fmt::Display + Send + Sync + 'static;
 
-    /// Send a plain Go `SendText` reply for `/admin_grant_vip`.
     fn send_admin_grant_vip_text<'a>(
         &'a self,
         message: PaymentTextMessage<'a>,
@@ -785,12 +873,10 @@ where
     }
 }
 
-/// Side-effect boundary for Go `/admin_cancel_vip` replies and cache invalidation.
 pub trait AdminCancelVipEffects {
     /// Error returned by the concrete side-effect implementation.
     type Error: fmt::Display + Send + Sync + 'static;
 
-    /// Send a plain Go `SendText` reply for `/admin_cancel_vip`.
     fn send_admin_cancel_vip_text<'a>(
         &'a self,
         message: PaymentTextMessage<'a>,
@@ -809,12 +895,77 @@ pub trait AdminCancelVipEffects {
         telegram_payment_charge_id: &'a str,
     ) -> PaymentEffectsFuture<'a, Self::Error>;
 
-    /// Send the direct user refund notice. Go logs and ignores failures here.
     fn send_admin_cancel_vip_user_text<'a>(
         &'a self,
         user_id: i64,
         text: &'a str,
     ) -> PaymentEffectsFuture<'a, Self::Error>;
+}
+
+pub trait AdminRefundEffects {
+    /// Error returned by the concrete side-effect implementation.
+    type Error: fmt::Display + Send + Sync + 'static;
+
+    fn send_admin_refund_text<'a>(
+        &'a self,
+        message: PaymentTextMessage<'a>,
+    ) -> PaymentEffectsFuture<'a, Self::Error>;
+
+    /// Refund the Telegram Stars payment.
+    fn refund_admin_refund_payment<'a>(
+        &'a self,
+        user_id: i64,
+        telegram_payment_charge_id: &'a str,
+    ) -> PaymentEffectsFuture<'a, Self::Error>;
+
+    fn send_admin_refund_user_text<'a>(
+        &'a self,
+        user_id: i64,
+        text: &'a str,
+    ) -> PaymentEffectsFuture<'a, Self::Error>;
+
+    /// Invalidate cached VIP status after a subscription refund.
+    fn invalidate_admin_refund_cache<'a>(
+        &'a self,
+        user_id: i64,
+    ) -> PaymentEffectsFuture<'a, Self::Error>;
+}
+
+impl<T> AdminRefundEffects for T
+where
+    T: AdminCancelVipEffects,
+{
+    type Error = T::Error;
+
+    fn send_admin_refund_text<'a>(
+        &'a self,
+        message: PaymentTextMessage<'a>,
+    ) -> PaymentEffectsFuture<'a, Self::Error> {
+        self.send_admin_cancel_vip_text(message)
+    }
+
+    fn refund_admin_refund_payment<'a>(
+        &'a self,
+        user_id: i64,
+        telegram_payment_charge_id: &'a str,
+    ) -> PaymentEffectsFuture<'a, Self::Error> {
+        self.refund_admin_cancel_vip_payment(user_id, telegram_payment_charge_id)
+    }
+
+    fn send_admin_refund_user_text<'a>(
+        &'a self,
+        user_id: i64,
+        text: &'a str,
+    ) -> PaymentEffectsFuture<'a, Self::Error> {
+        self.send_admin_cancel_vip_user_text(user_id, text)
+    }
+
+    fn invalidate_admin_refund_cache<'a>(
+        &'a self,
+        user_id: i64,
+    ) -> PaymentEffectsFuture<'a, Self::Error> {
+        self.invalidate_admin_cancel_vip_cache(user_id)
+    }
 }
 
 /// Direct Telegram payment effects needed by `/admin_cancel_vip` refunds.
@@ -837,7 +988,6 @@ pub trait AdminCancelVipDirectEffects {
     ) -> PaymentEffectsFuture<'a, Self::Error>;
 }
 
-/// Side-effect boundary for Go `processPreCheckoutQuery`.
 pub trait PreCheckoutPaymentEffects {
     /// Error returned by the concrete side-effect implementation.
     type Error: fmt::Display + Send + Sync + 'static;
@@ -849,18 +999,15 @@ pub trait PreCheckoutPaymentEffects {
     ) -> PreCheckoutFuture<'a, Self::Error>;
 }
 
-/// Side-effect boundary for Go existing-VIP status replies.
 pub trait VipStatusEffects {
     /// Error returned by the concrete side-effect implementation.
     type Error: fmt::Display + Send + Sync + 'static;
 
-    /// Send Go's existing-VIP status reply.
     fn send_vip_status_message<'a>(
         &'a self,
         message: VipStatusMessage,
     ) -> PaymentEffectsFuture<'a, Self::Error>;
 
-    /// Send a Go `sendPaymentErrorMessage` equivalent for VIP status failures.
     fn send_vip_status_error_text<'a>(
         &'a self,
         chat_id: i64,
@@ -870,7 +1017,43 @@ pub trait VipStatusEffects {
     ) -> PaymentEffectsFuture<'a, Self::Error>;
 }
 
-/// Side-effect boundary for Go VIP/donation invoice control jobs.
+pub trait PaymentRedirectEffects {
+    /// Error returned by the concrete side-effect implementation.
+    type Error: fmt::Display + Send + Sync + 'static;
+
+    fn send_payment_redirect_message<'a>(
+        &'a self,
+        message: PaymentRedirectMessage,
+    ) -> PaymentEffectsFuture<'a, Self::Error>;
+}
+
+/// Direct Telegram side effects needed by VIP subscription callbacks.
+pub trait VipCancellationDirectEffects {
+    /// Error returned by the concrete side-effect implementation.
+    type Error: fmt::Display + Send + Sync + 'static;
+
+    fn execute_vip_cancellation_method<'a>(
+        &'a self,
+        method: openplotva_telegram::TelegramOutboundMethod,
+    ) -> VipCancellationEffectFuture<'a, Self::Error>;
+}
+
+pub trait VipCancellationEffects {
+    /// Error returned by the concrete side-effect implementation.
+    type Error: fmt::Display + Send + Sync + 'static;
+
+    fn execute_vip_cancellation_method<'a>(
+        &'a self,
+        method: openplotva_telegram::TelegramOutboundMethod,
+    ) -> VipCancellationEffectFuture<'a, Self::Error>;
+
+    /// Invalidate cached VIP status after successful cancellation.
+    fn invalidate_vip_cancellation_cache<'a>(
+        &'a self,
+        user_id: i64,
+    ) -> VipCancellationEffectFuture<'a, Self::Error>;
+}
+
 pub trait PaymentInvoiceEffects {
     /// Error returned by the concrete side-effect implementation.
     type Error: fmt::Display + Send + Sync + 'static;
@@ -893,7 +1076,6 @@ pub trait PaymentInvoiceEffects {
         message: InvoiceButtonMessage,
     ) -> PaymentEffectsFuture<'a, Self::Error>;
 
-    /// Send a Go `sendPaymentErrorMessage` equivalent.
     fn send_invoice_error_text<'a>(
         &'a self,
         chat_id: i64,
@@ -903,7 +1085,6 @@ pub trait PaymentInvoiceEffects {
     ) -> PaymentEffectsFuture<'a, Self::Error>;
 }
 
-/// Queue boundary for Go payment-owned taskman control jobs.
 pub trait PaymentControlJobQueue {
     /// Error returned by the concrete queue implementation.
     type Error: fmt::Display + Send + Sync + 'static;
@@ -942,25 +1123,45 @@ pub trait PaymentControlJobWorkerQueue {
     ) -> PaymentControlJobWorkerFuture<'a, (), Self::Error>;
 }
 
+pub trait SharedControlJobWorkerQueue {
+    /// Error returned by the concrete queue implementation.
+    type Error: fmt::Display + Send + Sync + 'static;
+
+    /// Dequeue the next pending control job owned by one executor family.
+    fn dequeue_shared_control_job_matching<'a>(
+        &'a self,
+        queue_name: &'static str,
+        worker_id: &'static str,
+        predicate: fn(&StatelessJobItem) -> bool,
+    ) -> PaymentControlJobWorkerFuture<'a, Option<PaymentControlJobWorkItem>, Self::Error>;
+
+    /// Mark one shared control job completed.
+    fn complete_shared_control_job<'a>(
+        &'a self,
+        job_id: i64,
+    ) -> PaymentControlJobWorkerFuture<'a, (), Self::Error>;
+
+    /// Mark one shared control job failed.
+    fn fail_shared_control_job<'a>(
+        &'a self,
+        job_id: i64,
+        error: &'a str,
+    ) -> PaymentControlJobWorkerFuture<'a, (), Self::Error>;
+}
+
 /// Rust-native in-memory control-job queue for the current payment vertical slice.
 ///
-/// Go's current taskman repository is memory/WAL-backed, while the converted SQL corpus drops the
 /// old `job_queue` tables. This adapter gives runtime wiring a concrete queue with the same
 /// priority ordering for payment-owned control jobs.
 #[derive(Clone, Debug)]
 pub struct InMemoryPaymentControlJobQueue {
-    state: Arc<Mutex<InMemoryPaymentControlJobQueueState>>,
+    queue: InMemoryTaskQueue,
+    completed_reports: Arc<Mutex<HashMap<i64, PaymentControlJobReport>>>,
 }
 
 /// Version marker for the approved Rust-native payment control-job snapshot codec.
 pub const PAYMENT_CONTROL_JOB_QUEUE_SNAPSHOT_FORMAT: &str =
     "openplotva.payment-control-job-queue.v1+json";
-
-#[derive(Clone, Debug, Default)]
-struct InMemoryPaymentControlJobQueueState {
-    next_id: i64,
-    records: Vec<InMemoryPaymentControlJobRecord>,
-}
 
 /// In-memory taskman status used by the current payment queue adapter.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -980,11 +1181,9 @@ pub enum InMemoryPaymentControlJobStatus {
 pub struct InMemoryPaymentControlJobRecord {
     /// Taskman job ID.
     pub id: i64,
-    /// Queue name, usually Go's `control` queue.
     pub queue_name: String,
     /// Current in-memory status.
     pub status: InMemoryPaymentControlJobStatus,
-    /// Go-shaped stateless job payload.
     pub job: StatelessJobItem,
     /// Completion report recorded by the payment worker.
     pub completed_report: Option<PaymentControlJobReport>,
@@ -1009,6 +1208,9 @@ pub enum InMemoryPaymentControlJobQueueError {
     /// A status update targeted a job ID this queue has never assigned.
     #[error("payment control job {0} not found")]
     JobNotFound(i64),
+    /// The shared taskman queue core rejected an operation unexpectedly.
+    #[error("payment control job queue: {0}")]
+    Taskman(String),
 }
 
 /// Error returned while decoding the Rust-native payment control-job snapshot.
@@ -1022,57 +1224,123 @@ pub enum PaymentControlJobQueueSnapshotError {
     UnsupportedFormat(String),
 }
 
-/// Default Rust-native payment control-job snapshot name under Go's `~/.plotva` work directory.
 pub const DEFAULT_PAYMENT_CONTROL_JOB_SNAPSHOT_FILE: &str = "openplotva-payment-control-jobs.snap";
+
+const PAYMENT_CONTROL_JOB_WAL_ARCHIVE_KEEP: usize = 3;
 
 impl InMemoryPaymentControlJobQueue {
     /// Build an empty in-memory payment control-job queue.
     #[must_use]
     pub fn new() -> Self {
         Self {
-            state: Arc::new(Mutex::new(InMemoryPaymentControlJobQueueState {
-                next_id: 1,
-                records: Vec::new(),
-            })),
+            queue: InMemoryTaskQueue::new(),
+            completed_reports: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Build an empty in-memory payment control-job queue with shared taskman IDs.
+    #[must_use]
+    pub fn new_with_id_allocator(ids: TaskQueueIdAllocator) -> Self {
+        Self {
+            queue: InMemoryTaskQueue::new_with_id_allocator(ids),
+            completed_reports: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     /// Return a stable ID-ordered snapshot of the queue state.
     #[must_use]
     pub fn snapshot(&self) -> Vec<InMemoryPaymentControlJobRecord> {
-        self.lock().records.clone()
+        let records = self.queue.records();
+        let completed_reports = self.completed_reports();
+        payment_records_from_taskman(&records, &completed_reports)
+    }
+
+    /// Return raw taskman records with worker IDs and timestamps for runtime diagnostics.
+    #[must_use]
+    pub fn taskman_records(&self) -> Vec<TaskQueueRecord> {
+        self.queue.records()
+    }
+
+    /// Cancel one raw taskman control job for admin/runtime control surfaces.
+    pub fn cancel_taskman_job(
+        &self,
+        job_id: i64,
+    ) -> Result<(), InMemoryPaymentControlJobQueueError> {
+        self.queue
+            .cancel(job_id, "cancelled by admin", OffsetDateTime::now_utc())
+            .map_err(in_memory_payment_queue_error)?;
+        self.completed_reports().remove(&job_id);
+        Ok(())
+    }
+
+    /// Delete one raw taskman control job for admin/runtime control surfaces.
+    pub fn delete_taskman_job(
+        &self,
+        job_id: i64,
+    ) -> Result<TaskQueueRecord, InMemoryPaymentControlJobQueueError> {
+        let record = self
+            .queue
+            .delete(job_id)
+            .map_err(in_memory_payment_queue_error)?;
+        self.completed_reports().remove(&job_id);
+        Ok(record)
+    }
+
+    /// Restart one raw taskman control job for admin/runtime control surfaces.
+    pub fn restart_taskman_job(
+        &self,
+        job_id: i64,
+    ) -> Result<i64, InMemoryPaymentControlJobQueueError> {
+        self.queue
+            .restart(job_id, OffsetDateTime::now_utc())
+            .map_err(in_memory_payment_queue_error)
     }
 
     /// Return a versioned Rust-native snapshot for durable queue persistence.
     #[must_use]
     pub fn persistence_snapshot(&self) -> InMemoryPaymentControlJobQueueSnapshot {
-        let state = self.lock();
+        let snapshot = self.queue.snapshot();
+        let completed_reports = self.completed_reports();
         InMemoryPaymentControlJobQueueSnapshot {
             format: PAYMENT_CONTROL_JOB_QUEUE_SNAPSHOT_FORMAT.to_owned(),
-            next_id: state.next_id,
-            records: state.records.clone(),
+            next_id: snapshot.next_id,
+            records: payment_records_from_taskman(&snapshot.records, &completed_reports),
         }
     }
 
     /// Restore an in-memory queue from a decoded Rust-native persistence snapshot.
     #[must_use]
     pub fn from_persistence_snapshot(snapshot: InMemoryPaymentControlJobQueueSnapshot) -> Self {
-        let next_id_from_records = snapshot
-            .records
-            .iter()
-            .map(|record| record.id.saturating_add(1))
-            .max()
-            .unwrap_or(1);
+        Self::from_persistence_snapshot_inner(snapshot, None)
+    }
+
+    /// Restore an in-memory queue using the shared runtime taskman ID allocator.
+    #[must_use]
+    pub fn from_persistence_snapshot_with_id_allocator(
+        snapshot: InMemoryPaymentControlJobQueueSnapshot,
+        ids: TaskQueueIdAllocator,
+    ) -> Self {
+        Self::from_persistence_snapshot_inner(snapshot, Some(ids))
+    }
+
+    fn from_persistence_snapshot_inner(
+        snapshot: InMemoryPaymentControlJobQueueSnapshot,
+        ids: Option<TaskQueueIdAllocator>,
+    ) -> Self {
+        let (snapshot, completed_reports) = payment_snapshot_into_taskman(snapshot);
         Self {
-            state: Arc::new(Mutex::new(InMemoryPaymentControlJobQueueState {
-                next_id: snapshot.next_id.max(next_id_from_records).max(1),
-                records: snapshot.records,
-            })),
+            queue: match ids {
+                Some(ids) => InMemoryTaskQueue::from_snapshot_with_id_allocator(snapshot, ids),
+                None => InMemoryTaskQueue::from_snapshot(snapshot),
+            },
+            completed_reports: Arc::new(Mutex::new(completed_reports)),
         }
     }
 
-    fn lock(&self) -> MutexGuard<'_, InMemoryPaymentControlJobQueueState> {
-        self.state
+    fn completed_reports(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<i64, PaymentControlJobReport>> {
+        self.completed_reports
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -1112,6 +1380,7 @@ pub fn default_payment_control_job_snapshot_path() -> PathBuf {
 #[derive(Clone, Debug)]
 pub struct PaymentControlJobSnapshotFileStore {
     path: PathBuf,
+    wal_path: PathBuf,
 }
 
 /// Error returned by the payment control-job snapshot file store.
@@ -1182,19 +1451,92 @@ pub enum PaymentControlJobSnapshotFileStoreError {
         #[source]
         source: io::Error,
     },
+    /// Reading the snapshot WAL failed.
+    #[error("read payment control-job queue WAL {path}: {source}")]
+    WalRead {
+        /// WAL file path.
+        path: PathBuf,
+        /// Underlying filesystem error.
+        #[source]
+        source: io::Error,
+    },
+    /// Decoding a WAL line failed.
+    #[error("decode payment control-job queue WAL {path}: {source}")]
+    WalDecode {
+        /// WAL file path.
+        path: PathBuf,
+        /// Underlying snapshot decode error.
+        #[source]
+        source: PaymentControlJobQueueSnapshotError,
+    },
+    /// Opening the snapshot WAL failed.
+    #[error("open payment control-job queue WAL {path}: {source}")]
+    WalOpen {
+        /// WAL file path.
+        path: PathBuf,
+        /// Underlying filesystem error.
+        #[source]
+        source: io::Error,
+    },
+    /// Writing the snapshot WAL failed.
+    #[error("write payment control-job queue WAL {path}: {source}")]
+    WalWrite {
+        /// WAL file path.
+        path: PathBuf,
+        /// Underlying filesystem error.
+        #[source]
+        source: io::Error,
+    },
+    /// Syncing the snapshot WAL failed.
+    #[error("sync payment control-job queue WAL {path}: {source}")]
+    WalSync {
+        /// WAL file path.
+        path: PathBuf,
+        /// Underlying filesystem error.
+        #[source]
+        source: io::Error,
+    },
+    /// Rotating the compacted WAL failed.
+    #[error("rotate payment control-job queue WAL {from} -> {to}: {source}")]
+    WalRename {
+        /// Active WAL path.
+        from: PathBuf,
+        /// Archive WAL path.
+        to: PathBuf,
+        /// Underlying filesystem error.
+        #[source]
+        source: io::Error,
+    },
+    /// Pruning compacted WAL archives failed.
+    #[error("prune payment control-job queue WAL archives near {path}: {source}")]
+    WalArchive {
+        /// Active WAL path whose archives were being pruned.
+        path: PathBuf,
+        /// Underlying filesystem error.
+        #[source]
+        source: io::Error,
+    },
 }
 
 impl PaymentControlJobSnapshotFileStore {
     /// Build a snapshot store for a concrete file path.
     #[must_use]
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        let path = path.into();
+        let wal_path = payment_control_job_wal_path(&path);
+        Self { path, wal_path }
     }
 
     /// Return the configured snapshot file path.
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Return the configured snapshot WAL path.
+    #[must_use]
+    pub fn wal_path(&self) -> &Path {
+        &self.wal_path
     }
 
     /// Load the Rust-native snapshot from disk, returning `None` when it does not exist yet.
@@ -1204,9 +1546,14 @@ impl PaymentControlJobSnapshotFileStore {
         Option<InMemoryPaymentControlJobQueueSnapshot>,
         PaymentControlJobSnapshotFileStoreError,
     > {
-        let bytes = match fs::read(&self.path) {
-            Ok(bytes) => bytes,
-            Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
+        let snapshot = match fs::read(&self.path) {
+            Ok(bytes) => decode_payment_control_job_queue_snapshot(&bytes)
+                .map(Some)
+                .map_err(|source| PaymentControlJobSnapshotFileStoreError::Decode {
+                    path: self.path.clone(),
+                    source,
+                })?,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => None,
             Err(source) => {
                 return Err(PaymentControlJobSnapshotFileStoreError::Read {
                     path: self.path.clone(),
@@ -1215,15 +1562,10 @@ impl PaymentControlJobSnapshotFileStore {
             }
         };
 
-        decode_payment_control_job_queue_snapshot(&bytes)
-            .map(Some)
-            .map_err(|source| PaymentControlJobSnapshotFileStoreError::Decode {
-                path: self.path.clone(),
-                source,
-            })
+        Ok(self.load_wal_snapshot()?.or(snapshot))
     }
 
-    /// Save the Rust-native snapshot atomically through a sibling temporary file.
+    /// Save the Rust-native snapshot through WAL replay first, then an atomic sibling file.
     pub fn save_snapshot(
         &self,
         snapshot: &InMemoryPaymentControlJobQueueSnapshot,
@@ -1234,6 +1576,7 @@ impl PaymentControlJobSnapshotFileStore {
                 source,
             }
         })?;
+        self.append_wal_snapshot(snapshot)?;
         if let Some(parent) = self
             .path
             .parent()
@@ -1273,7 +1616,139 @@ impl PaymentControlJobSnapshotFileStore {
                 to: self.path.clone(),
                 source,
             }
-        })
+        })?;
+        self.rotate_wal_after_snapshot()
+    }
+
+    fn load_wal_snapshot(
+        &self,
+    ) -> Result<
+        Option<InMemoryPaymentControlJobQueueSnapshot>,
+        PaymentControlJobSnapshotFileStoreError,
+    > {
+        let bytes = match fs::read(&self.wal_path) {
+            Ok(bytes) => bytes,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => {
+                return Err(PaymentControlJobSnapshotFileStoreError::WalRead {
+                    path: self.wal_path.clone(),
+                    source,
+                });
+            }
+        };
+        if bytes.is_empty() {
+            return Ok(None);
+        }
+
+        let lines: Vec<&[u8]> = bytes.split(|byte| *byte == b'\n').collect();
+        let mut latest = None;
+        for (index, line) in lines.iter().enumerate() {
+            if line.is_empty() {
+                continue;
+            }
+            match decode_payment_control_job_queue_snapshot(line) {
+                Ok(snapshot) => latest = Some(snapshot),
+                Err(_source) if index + 1 == lines.len() => break,
+                Err(source) => {
+                    return Err(PaymentControlJobSnapshotFileStoreError::WalDecode {
+                        path: self.wal_path.clone(),
+                        source,
+                    });
+                }
+            }
+        }
+        Ok(latest)
+    }
+
+    fn append_wal_snapshot(
+        &self,
+        snapshot: &InMemoryPaymentControlJobQueueSnapshot,
+    ) -> Result<(), PaymentControlJobSnapshotFileStoreError> {
+        let bytes = encode_payment_control_job_queue_snapshot(snapshot).map_err(|source| {
+            PaymentControlJobSnapshotFileStoreError::Encode {
+                path: self.wal_path.clone(),
+                source,
+            }
+        })?;
+        if let Some(parent) = self
+            .wal_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent).map_err(|source| {
+                PaymentControlJobSnapshotFileStoreError::CreateDir {
+                    path: parent.to_path_buf(),
+                    source,
+                }
+            })?;
+        }
+
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.wal_path)
+            .map_err(|source| PaymentControlJobSnapshotFileStoreError::WalOpen {
+                path: self.wal_path.clone(),
+                source,
+            })?;
+        file.write_all(&bytes).map_err(|source| {
+            PaymentControlJobSnapshotFileStoreError::WalWrite {
+                path: self.wal_path.clone(),
+                source,
+            }
+        })?;
+        file.write_all(b"\n").map_err(|source| {
+            PaymentControlJobSnapshotFileStoreError::WalWrite {
+                path: self.wal_path.clone(),
+                source,
+            }
+        })?;
+        file.sync_all()
+            .map_err(|source| PaymentControlJobSnapshotFileStoreError::WalSync {
+                path: self.wal_path.clone(),
+                source,
+            })
+    }
+
+    fn rotate_wal_after_snapshot(&self) -> Result<(), PaymentControlJobSnapshotFileStoreError> {
+        match fs::metadata(&self.wal_path) {
+            Ok(metadata) if metadata.len() > 0 => {
+                let archive_path = payment_control_job_wal_archive_path(&self.wal_path);
+                fs::rename(&self.wal_path, &archive_path).map_err(|source| {
+                    PaymentControlJobSnapshotFileStoreError::WalRename {
+                        from: self.wal_path.clone(),
+                        to: archive_path,
+                        source,
+                    }
+                })?;
+                prune_payment_control_job_wal_archives(&self.wal_path).map_err(|source| {
+                    PaymentControlJobSnapshotFileStoreError::WalArchive {
+                        path: self.wal_path.clone(),
+                        source,
+                    }
+                })?;
+            }
+            Ok(_) => {}
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(PaymentControlJobSnapshotFileStoreError::WalRead {
+                    path: self.wal_path.clone(),
+                    source,
+                });
+            }
+        }
+
+        let file = fs::File::create(&self.wal_path).map_err(|source| {
+            PaymentControlJobSnapshotFileStoreError::WalOpen {
+                path: self.wal_path.clone(),
+                source,
+            }
+        })?;
+        file.sync_all()
+            .map_err(|source| PaymentControlJobSnapshotFileStoreError::WalSync {
+                path: self.wal_path.clone(),
+                source,
+            })
     }
 }
 
@@ -1300,14 +1775,40 @@ impl PersistentPaymentControlJobQueue {
     pub fn load_or_new(
         snapshots: PaymentControlJobSnapshotFileStore,
     ) -> Result<Self, PaymentControlJobSnapshotFileStoreError> {
+        Self::load_or_new_inner(snapshots, None)
+    }
+
+    /// Load a queue using the shared runtime taskman ID allocator.
+    pub fn load_or_new_with_id_allocator(
+        snapshots: PaymentControlJobSnapshotFileStore,
+        ids: TaskQueueIdAllocator,
+    ) -> Result<Self, PaymentControlJobSnapshotFileStoreError> {
+        Self::load_or_new_inner(snapshots, Some(ids))
+    }
+
+    fn load_or_new_inner(
+        snapshots: PaymentControlJobSnapshotFileStore,
+        ids: Option<TaskQueueIdAllocator>,
+    ) -> Result<Self, PaymentControlJobSnapshotFileStoreError> {
         let queue = match snapshots.load_snapshot()? {
             Some(mut snapshot) => {
                 if requeue_processing_payment_control_jobs_for_startup(&mut snapshot) > 0 {
                     snapshots.save_snapshot(&snapshot)?;
                 }
-                InMemoryPaymentControlJobQueue::from_persistence_snapshot(snapshot)
+                match &ids {
+                    Some(ids) => {
+                        InMemoryPaymentControlJobQueue::from_persistence_snapshot_with_id_allocator(
+                            snapshot,
+                            ids.clone(),
+                        )
+                    }
+                    None => InMemoryPaymentControlJobQueue::from_persistence_snapshot(snapshot),
+                }
             }
-            None => InMemoryPaymentControlJobQueue::new(),
+            None => match ids {
+                Some(ids) => InMemoryPaymentControlJobQueue::new_with_id_allocator(ids),
+                None => InMemoryPaymentControlJobQueue::new(),
+            },
         };
         Ok(Self { queue, snapshots })
     }
@@ -1321,10 +1822,58 @@ impl PersistentPaymentControlJobQueue {
         }
     }
 
+    /// Build an empty queue with the shared runtime taskman ID allocator.
+    #[must_use]
+    pub fn new_empty_with_id_allocator(
+        snapshots: PaymentControlJobSnapshotFileStore,
+        ids: TaskQueueIdAllocator,
+    ) -> Self {
+        Self {
+            queue: InMemoryPaymentControlJobQueue::new_with_id_allocator(ids),
+            snapshots,
+        }
+    }
+
     /// Return a stable ID-ordered snapshot of the queue state.
     #[must_use]
     pub fn snapshot(&self) -> Vec<InMemoryPaymentControlJobRecord> {
         self.queue.snapshot()
+    }
+
+    /// Return raw taskman records with worker IDs and timestamps for runtime diagnostics.
+    #[must_use]
+    pub fn taskman_records(&self) -> Vec<TaskQueueRecord> {
+        self.queue.taskman_records()
+    }
+
+    /// Cancel one raw taskman control job and persist the queue snapshot.
+    pub fn cancel_taskman_job(
+        &self,
+        job_id: i64,
+    ) -> Result<(), PersistentPaymentControlJobQueueError> {
+        self.queue.cancel_taskman_job(job_id)?;
+        self.persist_snapshot()?;
+        Ok(())
+    }
+
+    /// Delete one raw taskman control job and persist the queue snapshot.
+    pub fn delete_taskman_job(
+        &self,
+        job_id: i64,
+    ) -> Result<TaskQueueRecord, PersistentPaymentControlJobQueueError> {
+        let record = self.queue.delete_taskman_job(job_id)?;
+        self.persist_snapshot()?;
+        Ok(record)
+    }
+
+    /// Restart one raw taskman control job and persist the queue snapshot.
+    pub fn restart_taskman_job(
+        &self,
+        job_id: i64,
+    ) -> Result<i64, PersistentPaymentControlJobQueueError> {
+        let new_id = self.queue.restart_taskman_job(job_id)?;
+        self.persist_snapshot()?;
+        Ok(new_id)
     }
 
     fn persist_snapshot(&self) -> Result<(), PaymentControlJobSnapshotFileStoreError> {
@@ -1358,13 +1907,11 @@ impl PaymentControlJobWorkerQueue for PersistentPaymentControlJobQueue {
         &'a self,
         queue_name: &'static str,
     ) -> PaymentControlJobWorkerFuture<'a, Option<PaymentControlJobWorkItem>, Self::Error> {
-        Box::pin(async move {
-            let work_item = self.queue.dequeue_payment_control_job(queue_name).await?;
-            if work_item.is_some() {
-                self.persist_snapshot()?;
-            }
-            Ok(work_item)
-        })
+        self.dequeue_shared_control_job_matching(
+            queue_name,
+            "payment-control",
+            is_payment_control_job,
+        )
     }
 
     fn complete_payment_control_job<'a>(
@@ -1386,8 +1933,49 @@ impl PaymentControlJobWorkerQueue for PersistentPaymentControlJobQueue {
         job_id: i64,
         error: &'a str,
     ) -> PaymentControlJobWorkerFuture<'a, (), Self::Error> {
+        self.fail_shared_control_job(job_id, error)
+    }
+}
+
+impl SharedControlJobWorkerQueue for PersistentPaymentControlJobQueue {
+    type Error = PersistentPaymentControlJobQueueError;
+
+    fn dequeue_shared_control_job_matching<'a>(
+        &'a self,
+        queue_name: &'static str,
+        worker_id: &'static str,
+        predicate: fn(&StatelessJobItem) -> bool,
+    ) -> PaymentControlJobWorkerFuture<'a, Option<PaymentControlJobWorkItem>, Self::Error> {
         Box::pin(async move {
-            self.queue.fail_payment_control_job(job_id, error).await?;
+            let work_item = self
+                .queue
+                .dequeue_shared_control_job_matching(queue_name, worker_id, predicate)
+                .await?;
+            if work_item.is_some() {
+                self.persist_snapshot()?;
+            }
+            Ok(work_item)
+        })
+    }
+
+    fn complete_shared_control_job<'a>(
+        &'a self,
+        job_id: i64,
+    ) -> PaymentControlJobWorkerFuture<'a, (), Self::Error> {
+        Box::pin(async move {
+            self.queue.complete_shared_control_job(job_id).await?;
+            self.persist_snapshot()?;
+            Ok(())
+        })
+    }
+
+    fn fail_shared_control_job<'a>(
+        &'a self,
+        job_id: i64,
+        error: &'a str,
+    ) -> PaymentControlJobWorkerFuture<'a, (), Self::Error> {
+        Box::pin(async move {
+            self.queue.fail_shared_control_job(job_id, error).await?;
             self.persist_snapshot()?;
             Ok(())
         })
@@ -1418,6 +2006,68 @@ fn payment_control_job_snapshot_tmp_path(path: &Path) -> PathBuf {
     path.with_file_name(format!("{file_name}.tmp"))
 }
 
+fn payment_control_job_wal_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| DEFAULT_PAYMENT_CONTROL_JOB_SNAPSHOT_FILE.into());
+    path.with_file_name(format!("{file_name}.wal"))
+}
+
+fn payment_control_job_wal_archive_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| DEFAULT_PAYMENT_CONTROL_JOB_SNAPSHOT_FILE.into());
+    let timestamp = OffsetDateTime::now_utc().unix_timestamp_nanos();
+    let pid = std::process::id();
+    let mut suffix = 0_u32;
+    loop {
+        let candidate = if suffix == 0 {
+            path.with_file_name(format!("{file_name}.archive.{timestamp}.{pid}"))
+        } else {
+            path.with_file_name(format!("{file_name}.archive.{timestamp}.{pid}.{suffix}"))
+        };
+        if !candidate.exists() {
+            return candidate;
+        }
+        suffix = suffix.saturating_add(1);
+    }
+}
+
+fn prune_payment_control_job_wal_archives(wal_path: &Path) -> io::Result<()> {
+    let Some(parent) = wal_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    else {
+        return Ok(());
+    };
+    let Some(file_name) = wal_path.file_name().map(|name| name.to_string_lossy()) else {
+        return Ok(());
+    };
+    let prefix = format!("{file_name}.archive.");
+    let mut archives = Vec::new();
+    for entry in fs::read_dir(parent)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        if entry.file_name().to_string_lossy().starts_with(&prefix) {
+            archives.push(entry.path());
+        }
+    }
+    archives.sort();
+    let remove_count = archives
+        .len()
+        .saturating_sub(PAYMENT_CONTROL_JOB_WAL_ARCHIVE_KEEP);
+    for archive in archives.into_iter().take(remove_count) {
+        fs::remove_file(archive)?;
+    }
+    Ok(())
+}
+
 impl Default for InMemoryPaymentControlJobQueue {
     fn default() -> Self {
         Self::new()
@@ -1433,17 +2083,7 @@ impl PaymentControlJobQueue for InMemoryPaymentControlJobQueue {
         job: StatelessJobItem,
     ) -> PaymentControlJobQueueFuture<'a, Self::Error> {
         Box::pin(async move {
-            let mut state = self.lock();
-            let id = state.next_id;
-            state.next_id += 1;
-            state.records.push(InMemoryPaymentControlJobRecord {
-                id,
-                queue_name: queue_name.to_owned(),
-                status: InMemoryPaymentControlJobStatus::Pending,
-                job,
-                completed_report: None,
-                error: None,
-            });
+            self.queue.assign(queue_name, job);
             Ok(())
         })
     }
@@ -1456,19 +2096,11 @@ impl PaymentControlJobWorkerQueue for InMemoryPaymentControlJobQueue {
         &'a self,
         queue_name: &'static str,
     ) -> PaymentControlJobWorkerFuture<'a, Option<PaymentControlJobWorkItem>, Self::Error> {
-        Box::pin(async move {
-            let mut state = self.lock();
-            let Some(index) = next_in_memory_payment_control_job_index(&state.records, queue_name)
-            else {
-                return Ok(None);
-            };
-            let record = &mut state.records[index];
-            record.status = InMemoryPaymentControlJobStatus::Processing;
-            Ok(Some(PaymentControlJobWorkItem {
-                id: record.id,
-                job: record.job.clone(),
-            }))
-        })
+        self.dequeue_shared_control_job_matching(
+            queue_name,
+            "payment-control",
+            is_payment_control_job,
+        )
     }
 
     fn complete_payment_control_job<'a>(
@@ -1477,15 +2109,10 @@ impl PaymentControlJobWorkerQueue for InMemoryPaymentControlJobQueue {
         report: &'a PaymentControlJobReport,
     ) -> PaymentControlJobWorkerFuture<'a, (), Self::Error> {
         Box::pin(async move {
-            let mut state = self.lock();
-            let record = state
-                .records
-                .iter_mut()
-                .find(|record| record.id == job_id)
-                .ok_or(InMemoryPaymentControlJobQueueError::JobNotFound(job_id))?;
-            record.status = InMemoryPaymentControlJobStatus::Completed;
-            record.completed_report = Some(report.clone());
-            record.error = None;
+            self.queue
+                .complete(job_id, OffsetDateTime::now_utc())
+                .map_err(in_memory_payment_queue_error)?;
+            self.completed_reports().insert(job_id, report.clone());
             Ok(())
         })
     }
@@ -1496,40 +2123,157 @@ impl PaymentControlJobWorkerQueue for InMemoryPaymentControlJobQueue {
         error: &'a str,
     ) -> PaymentControlJobWorkerFuture<'a, (), Self::Error> {
         Box::pin(async move {
-            let mut state = self.lock();
-            let record = state
-                .records
-                .iter_mut()
-                .find(|record| record.id == job_id)
-                .ok_or(InMemoryPaymentControlJobQueueError::JobNotFound(job_id))?;
-            record.status = InMemoryPaymentControlJobStatus::Failed;
-            record.completed_report = None;
-            record.error = Some(error.to_owned());
+            self.queue
+                .fail(job_id, error, OffsetDateTime::now_utc())
+                .map_err(in_memory_payment_queue_error)?;
+            self.completed_reports().remove(&job_id);
             Ok(())
         })
     }
 }
 
-fn next_in_memory_payment_control_job_index(
-    records: &[InMemoryPaymentControlJobRecord],
-    queue_name: &str,
-) -> Option<usize> {
+impl SharedControlJobWorkerQueue for InMemoryPaymentControlJobQueue {
+    type Error = InMemoryPaymentControlJobQueueError;
+
+    fn dequeue_shared_control_job_matching<'a>(
+        &'a self,
+        queue_name: &'static str,
+        worker_id: &'static str,
+        predicate: fn(&StatelessJobItem) -> bool,
+    ) -> PaymentControlJobWorkerFuture<'a, Option<PaymentControlJobWorkItem>, Self::Error> {
+        Box::pin(async move {
+            Ok(self
+                .queue
+                .dequeue_matching(queue_name, worker_id, OffsetDateTime::now_utc(), predicate)
+                .map(|item| PaymentControlJobWorkItem {
+                    id: item.id,
+                    job: item.job,
+                }))
+        })
+    }
+
+    fn complete_shared_control_job<'a>(
+        &'a self,
+        job_id: i64,
+    ) -> PaymentControlJobWorkerFuture<'a, (), Self::Error> {
+        Box::pin(async move {
+            self.queue
+                .complete(job_id, OffsetDateTime::now_utc())
+                .map_err(in_memory_payment_queue_error)?;
+            self.completed_reports().remove(&job_id);
+            Ok(())
+        })
+    }
+
+    fn fail_shared_control_job<'a>(
+        &'a self,
+        job_id: i64,
+        error: &'a str,
+    ) -> PaymentControlJobWorkerFuture<'a, (), Self::Error> {
+        Box::pin(async move {
+            self.queue
+                .fail(job_id, error, OffsetDateTime::now_utc())
+                .map_err(in_memory_payment_queue_error)?;
+            self.completed_reports().remove(&job_id);
+            Ok(())
+        })
+    }
+}
+
+fn in_memory_payment_queue_error(
+    error: openplotva_taskman::TaskQueueError,
+) -> InMemoryPaymentControlJobQueueError {
+    match error {
+        openplotva_taskman::TaskQueueError::JobNotFound(job_id) => {
+            InMemoryPaymentControlJobQueueError::JobNotFound(job_id)
+        }
+        error => InMemoryPaymentControlJobQueueError::Taskman(error.to_string()),
+    }
+}
+
+fn is_payment_control_job(job: &StatelessJobItem) -> bool {
+    if job.data.job_type != JobType::Control {
+        return false;
+    }
+    matches!(
+        job.data.control_data.as_ref().map(|data| data.kind),
+        Some(ControlKind::VipInvoice | ControlKind::DonateInvoice | ControlKind::SuccessfulPayment)
+    )
+}
+
+fn payment_records_from_taskman(
+    records: &[TaskQueueRecord],
+    completed_reports: &HashMap<i64, PaymentControlJobReport>,
+) -> Vec<InMemoryPaymentControlJobRecord> {
     records
         .iter()
-        .enumerate()
-        .filter(|(_index, record)| {
-            record.queue_name == queue_name
-                && record.status == InMemoryPaymentControlJobStatus::Pending
+        .map(|record| InMemoryPaymentControlJobRecord {
+            id: record.id,
+            queue_name: record.queue_name.clone(),
+            status: payment_status_from_taskman(record.status),
+            job: record.job.clone(),
+            completed_report: completed_reports.get(&record.id).cloned(),
+            error: record.error.clone(),
         })
-        .min_by(|(_left_index, left), (_right_index, right)| {
-            right
-                .job
-                .priority
-                .cmp(&left.job.priority)
-                .then_with(|| left.job.created.cmp(&right.job.created))
-                .then_with(|| left.id.cmp(&right.id))
+        .collect()
+}
+
+fn payment_snapshot_into_taskman(
+    snapshot: InMemoryPaymentControlJobQueueSnapshot,
+) -> (TaskQueueSnapshot, HashMap<i64, PaymentControlJobReport>) {
+    let mut completed_reports = HashMap::new();
+    let records = snapshot
+        .records
+        .into_iter()
+        .map(|record| {
+            if let Some(report) = record.completed_report {
+                completed_reports.insert(record.id, report);
+            }
+            TaskQueueRecord {
+                id: record.id,
+                queue_name: record.queue_name,
+                status: taskman_status_from_payment(record.status),
+                job: record.job,
+                worker_id: None,
+                started_at: None,
+                execution_started_at: None,
+                completed_at: None,
+                error: record.error,
+                progress_message_id: None,
+                queue_position_message_id: None,
+                result_message_id: None,
+                messages: Vec::new(),
+                events: Vec::new(),
+            }
         })
-        .map(|(index, _record)| index)
+        .collect();
+    (
+        TaskQueueSnapshot {
+            format: TASK_QUEUE_SNAPSHOT_FORMAT.to_owned(),
+            next_id: snapshot.next_id,
+            next_message_id: 1,
+            records,
+        },
+        completed_reports,
+    )
+}
+
+fn payment_status_from_taskman(status: JobStatus) -> InMemoryPaymentControlJobStatus {
+    match status {
+        JobStatus::Pending => InMemoryPaymentControlJobStatus::Pending,
+        JobStatus::Processing => InMemoryPaymentControlJobStatus::Processing,
+        JobStatus::Completed => InMemoryPaymentControlJobStatus::Completed,
+        JobStatus::Failed | JobStatus::Cancelled => InMemoryPaymentControlJobStatus::Failed,
+    }
+}
+
+fn taskman_status_from_payment(status: InMemoryPaymentControlJobStatus) -> JobStatus {
+    match status {
+        InMemoryPaymentControlJobStatus::Pending => JobStatus::Pending,
+        InMemoryPaymentControlJobStatus::Processing => JobStatus::Processing,
+        InMemoryPaymentControlJobStatus::Completed => JobStatus::Completed,
+        InMemoryPaymentControlJobStatus::Failed => JobStatus::Failed,
+    }
 }
 
 impl PreCheckoutPaymentEffects for openplotva_telegram::TelegramClient {
@@ -1656,6 +2400,20 @@ impl AdminCancelVipDirectEffects for openplotva_telegram::TelegramClient {
     }
 }
 
+impl VipCancellationDirectEffects for openplotva_telegram::TelegramClient {
+    type Error = TelegramPaymentInvoiceEffectError;
+
+    fn execute_vip_cancellation_method<'a>(
+        &'a self,
+        method: openplotva_telegram::TelegramOutboundMethod,
+    ) -> VipCancellationEffectFuture<'a, Self::Error> {
+        Box::pin(async move {
+            method.execute_with(self).await?;
+            Ok(())
+        })
+    }
+}
+
 impl VipStatusEffects for openplotva_telegram::TelegramClient {
     type Error = TelegramPaymentInvoiceEffectError;
 
@@ -1692,10 +2450,24 @@ impl VipStatusEffects for openplotva_telegram::TelegramClient {
     }
 }
 
+impl PaymentRedirectEffects for openplotva_telegram::TelegramClient {
+    type Error = TelegramPaymentInvoiceEffectError;
+
+    fn send_payment_redirect_message<'a>(
+        &'a self,
+        message: PaymentRedirectMessage,
+    ) -> PaymentEffectsFuture<'a, Self::Error> {
+        Box::pin(async move {
+            let method = payment_redirect_send_message_method(&message)?;
+            let _message: carapax::types::Message = self.execute(method).await?;
+            Ok(())
+        })
+    }
+}
+
 /// Generator for virtual-message IDs used by successful-payment text replies.
 pub type PaymentVirtualIdFactory = VirtualIdFactory;
 
-/// Dispatcher-backed side effects for Go successful-payment processing.
 #[derive(Clone)]
 pub struct SuccessfulPaymentDispatcherEffects<Store, Invalidator = NoopVipCacheInvalidator> {
     store: Store,
@@ -1922,11 +2694,42 @@ where
     }
 }
 
+impl<Direct, Successful> VipCancellationEffects for PaymentRuntimeEffects<Direct, Successful>
+where
+    Direct: VipCancellationDirectEffects + Sync,
+    Successful: SuccessfulPaymentEffects + Sync,
+{
+    type Error = PaymentRuntimeVipCancellationEffectError<Direct::Error, Successful::Error>;
+
+    fn execute_vip_cancellation_method<'a>(
+        &'a self,
+        method: openplotva_telegram::TelegramOutboundMethod,
+    ) -> VipCancellationEffectFuture<'a, Self::Error> {
+        Box::pin(async move {
+            self.invoice
+                .execute_vip_cancellation_method(method)
+                .await
+                .map_err(PaymentRuntimeVipCancellationEffectError::Direct)
+        })
+    }
+
+    fn invalidate_vip_cancellation_cache<'a>(
+        &'a self,
+        user_id: i64,
+    ) -> VipCancellationEffectFuture<'a, Self::Error> {
+        Box::pin(async move {
+            self.successful
+                .invalidate_vip_cache(user_id)
+                .await
+                .map_err(PaymentRuntimeVipCancellationEffectError::Successful)
+        })
+    }
+}
+
 fn monotonic_payment_virtual_id_factory() -> PaymentVirtualIdFactory {
     monotonic_virtual_id_factory("payment-vmsg")
 }
 
-/// Build the direct `sendMessage` used for Go invoice button messages.
 pub fn invoice_button_send_message_method(
     message: &InvoiceButtonMessage,
 ) -> Result<openplotva_telegram::SendMessage, openplotva_telegram::OutboundBuildError> {
@@ -1978,7 +2781,6 @@ fn invoice_error_text_send_message_methods(
     openplotva_telegram::build_text_message_methods(&req, Some(&reply_to))
 }
 
-/// Build Go `createVIPRedirectMessage` payload.
 #[must_use]
 pub fn vip_redirect_message(
     bot_username: &str,
@@ -2003,7 +2805,6 @@ pub fn vip_redirect_message(
     }
 }
 
-/// Build Go `createDonationRedirectMessage` payload.
 #[must_use]
 pub fn donation_redirect_message(
     bot_username: &str,
@@ -2028,7 +2829,6 @@ pub fn donation_redirect_message(
     }
 }
 
-/// Build a Go payment redirect message from a decoded non-private `/vip` or `/donate` update.
 #[must_use]
 pub fn payment_redirect_message_from_update(
     update: &TelegramUpdate,
@@ -2048,6 +2848,9 @@ fn payment_redirect_message_from_message(
         return None;
     }
     let command = payment_command_from_message(message)?;
+    if bot_username.is_empty() || command.target != Some(bot_username) {
+        return None;
+    }
     let chat_id = message.chat.get_id().into();
     let reply_to_message_id = i32::try_from(message.id).ok()?;
     let message_thread_id = message
@@ -2084,7 +2887,6 @@ fn donation_redirect_start_param(command_arguments: &str) -> String {
     }
 }
 
-/// Build the direct `sendMessage` used by Go payment group redirect messages.
 pub fn payment_redirect_send_message_method(
     message: &PaymentRedirectMessage,
 ) -> Result<openplotva_telegram::SendMessage, openplotva_telegram::OutboundBuildError> {
@@ -2120,7 +2922,23 @@ pub fn payment_redirect_send_message_method(
     )
 }
 
-/// Build Go `activeVIPStatusText` plus optional cancel keyboard metadata.
+fn non_private_payment_command_targets_other_bot(
+    update: &TelegramUpdate,
+    bot_username: &str,
+) -> bool {
+    let TelegramUpdateType::Message(message) = &update.update_type else {
+        return false;
+    };
+    if matches!(message.chat, TelegramChat::Private(_)) {
+        return false;
+    }
+    let Some(command) = payment_command_from_message(message) else {
+        return false;
+    };
+    matches!(command.name, "vip" | "donate")
+        && (bot_username.is_empty() || command.target != Some(bot_username))
+}
+
 #[must_use]
 pub fn active_vip_status_message_at(
     summary: &VipSummaryRecord,
@@ -2147,7 +2965,6 @@ pub fn active_vip_status_message_at(
     }
 }
 
-/// Build Go `externalVIPStatusText` when the cached external VIP status is active.
 #[must_use]
 pub fn external_vip_status_message_if_active_at(
     vip_cache: Option<&VipCacheRecord>,
@@ -2174,7 +2991,6 @@ pub fn external_vip_status_message_if_active_at(
     })
 }
 
-/// Build Go `buildVIPStatusView` from storage, preserving lookup order and active checks.
 pub async fn build_vip_status_message_at<Store>(
     store: &Store,
     user_id: i64,
@@ -2211,7 +3027,6 @@ where
     ))
 }
 
-/// Build the direct HTML `sendMessage` used by Go existing-VIP status replies.
 pub fn vip_status_send_message_method(
     message: &VipStatusMessage,
 ) -> Result<openplotva_telegram::SendMessage, openplotva_telegram::OutboundBuildError> {
@@ -2254,7 +3069,477 @@ pub fn vip_status_send_message_method(
     )
 }
 
-/// Execute Go `executeVIPInvoiceControlJob`.
+#[derive(Clone, Debug)]
+pub struct VipCancellationCallbackUpdateHandler<Store, Effects, Next> {
+    store: Arc<Store>,
+    effects: Arc<Effects>,
+    next: Arc<Next>,
+}
+
+impl<Store, Effects, Next> VipCancellationCallbackUpdateHandler<Store, Effects, Next> {
+    /// Build a VIP callback handler around the real downstream update handler.
+    #[must_use]
+    pub fn new(store: Arc<Store>, effects: Arc<Effects>, next: Arc<Next>) -> Self {
+        Self {
+            store,
+            effects,
+            next,
+        }
+    }
+}
+
+impl<Store, Effects, Next> UpdateHandler
+    for VipCancellationCallbackUpdateHandler<Store, Effects, Next>
+where
+    Store: VipCancellationStore + Send + Sync,
+    Effects: VipCancellationEffects + Send + Sync,
+    Next: UpdateHandler + Send + Sync,
+{
+    type Error = VipCancellationCallbackError;
+
+    fn handle_update<'a>(&'a self, update: TelegramUpdate) -> UpdateHandlerFuture<'a, Self::Error> {
+        Box::pin(async move {
+            handle_vip_cancellation_callback_update_or_else_at(
+                self.store.as_ref(),
+                self.effects.as_ref(),
+                update,
+                OffsetDateTime::now_utc(),
+                |update| self.next.handle_update(update),
+            )
+            .await
+            .map(|_| ())
+        })
+    }
+}
+
+pub async fn handle_vip_cancellation_callback_update_or_else_at<
+    Store,
+    Effects,
+    HandleFn,
+    HandleFuture,
+    HandleError,
+>(
+    store: &Store,
+    effects: &Effects,
+    update: TelegramUpdate,
+    now: OffsetDateTime,
+    handle_other: HandleFn,
+) -> Result<VipCancellationCallbackOutcome, VipCancellationCallbackError>
+where
+    Store: VipCancellationStore + Sync,
+    Effects: VipCancellationEffects + Sync,
+    HandleFn: FnOnce(TelegramUpdate) -> HandleFuture,
+    HandleFuture: Future<Output = Result<(), HandleError>>,
+    HandleError: fmt::Display,
+{
+    let TelegramUpdateType::CallbackQuery(query) = &update.update_type else {
+        handle_other(update)
+            .await
+            .map_err(|error| VipCancellationCallbackError::Downstream {
+                message: error.to_string(),
+            })?;
+        return Ok(VipCancellationCallbackOutcome::Delegated);
+    };
+
+    let Some(action) = vip_cancellation_callback_action(query) else {
+        handle_other(update)
+            .await
+            .map_err(|error| VipCancellationCallbackError::Downstream {
+                message: error.to_string(),
+            })?;
+        return Ok(VipCancellationCallbackOutcome::Delegated);
+    };
+
+    Ok(handle_vip_cancellation_callback_at(store, effects, query, action, now).await)
+}
+
+pub async fn handle_vip_cancellation_callback_at<Store, Effects>(
+    store: &Store,
+    effects: &Effects,
+    query: &TelegramCallbackQuery,
+    action: &str,
+    now: OffsetDateTime,
+) -> VipCancellationCallbackOutcome
+where
+    Store: VipCancellationStore + Sync,
+    Effects: VipCancellationEffects + Sync,
+{
+    let Some(message) = vip_callback_message(query) else {
+        return VipCancellationCallbackOutcome::MissingMessage;
+    };
+
+    match action {
+        "cancel_vip" => handle_cancel_vip_callback(effects, query, message).await,
+        "confirm_cancel_vip" => {
+            handle_confirm_cancel_vip_callback_at(store, effects, query, message, now).await
+        }
+        "back_to_vip_status" => {
+            handle_back_to_vip_status_callback_at(store, effects, query, message, now).await
+        }
+        _ => VipCancellationCallbackOutcome::Delegated,
+    }
+}
+
+async fn handle_cancel_vip_callback<Effects>(
+    effects: &Effects,
+    query: &TelegramCallbackQuery,
+    message: VipCallbackMessage,
+) -> VipCancellationCallbackOutcome
+where
+    Effects: VipCancellationEffects + Sync,
+{
+    let keyboard = openplotva_telegram::build_inline_keyboard_markup([
+        openplotva_telegram::build_inline_keyboard_row([
+            openplotva_telegram::build_inline_keyboard_button_data(
+                "Да, отменить",
+                "{\"action\":\"confirm_cancel_vip\"}",
+            ),
+            openplotva_telegram::build_inline_keyboard_button_data(
+                "Нет, вернуться",
+                "{\"action\":\"back_to_vip_status\"}",
+            ),
+        ]),
+    ]);
+    try_edit_vip_callback_text(
+        effects,
+        message,
+        "Вы уверены, что хотите отменить вашу VIP подписку? 😢",
+        openplotva_telegram::TELEGRAM_PARSE_MODE_HTML,
+        Some(keyboard),
+        "VIP cancel confirmation edit",
+    )
+    .await;
+    try_answer_vip_callback(
+        effects,
+        &query.id,
+        "",
+        false,
+        0,
+        "VIP cancel confirmation ack",
+    )
+    .await;
+    VipCancellationCallbackOutcome::ConfirmationShown
+}
+
+async fn handle_confirm_cancel_vip_callback_at<Store, Effects>(
+    store: &Store,
+    effects: &Effects,
+    query: &TelegramCallbackQuery,
+    message: VipCallbackMessage,
+    now: OffsetDateTime,
+) -> VipCancellationCallbackOutcome
+where
+    Store: VipCancellationStore + Sync,
+    Effects: VipCancellationEffects + Sync,
+{
+    let user_id = i64::from(query.from.id);
+    let subscription = match store.get_active_subscription(user_id).await {
+        Ok(Some(subscription)) => subscription,
+        Ok(None) => {
+            try_answer_vip_callback(
+                effects,
+                &query.id,
+                "Не удалось отменить подписку. Не найдена активная подписка.",
+                true,
+                0,
+                "VIP missing subscription ack",
+            )
+            .await;
+            return VipCancellationCallbackOutcome::MissingSubscription;
+        }
+        Err(error) => {
+            tracing::warn!(
+                message = %error,
+                user_id,
+                "failed to load active subscription for VIP cancellation"
+            );
+            try_answer_vip_callback(
+                effects,
+                &query.id,
+                "Не удалось отменить подписку. Не найдена активная подписка.",
+                true,
+                0,
+                "VIP missing subscription ack",
+            )
+            .await;
+            return VipCancellationCallbackOutcome::MissingSubscription;
+        }
+    };
+
+    let cancel = openplotva_telegram::build_cancel_star_subscription_method(
+        user_id,
+        subscription.telegram_payment_charge_id.clone(),
+    );
+    if let Err(error) = effects.execute_vip_cancellation_method(cancel.into()).await {
+        tracing::warn!(
+            message = %error,
+            user_id,
+            subscription_id = subscription.id,
+            telegram_payment_charge_id = %subscription.telegram_payment_charge_id,
+            "failed to cancel VIP subscription on Telegram side"
+        );
+        try_answer_vip_callback(
+            effects,
+            &query.id,
+            "Не удалось отменить подписку на стороне Telegram. Пожалуйста, попробуйте позже или обратитесь в поддержку.",
+            true,
+            0,
+            "VIP Telegram cancellation failure ack",
+        )
+        .await;
+        return VipCancellationCallbackOutcome::TelegramCancelError;
+    }
+
+    if let Err(error) = store.mark_subscription_canceled(subscription.id).await {
+        tracing::warn!(
+            message = %error,
+            user_id,
+            subscription_id = subscription.id,
+            "failed to mark VIP subscription canceled after Telegram cancellation"
+        );
+    }
+    if let Err(error) = effects.invalidate_vip_cancellation_cache(user_id).await {
+        tracing::warn!(message = %error, user_id, "failed to invalidate VIP cache after cancellation");
+    }
+
+    let text = vip_cancellation_success_text_at(store, user_id, now).await;
+    try_edit_vip_callback_text(
+        effects,
+        message,
+        &text,
+        openplotva_telegram::TELEGRAM_PARSE_MODE_HTML,
+        Some(openplotva_telegram::InlineKeyboardMarkup::default()),
+        "VIP cancellation success edit",
+    )
+    .await;
+    try_answer_vip_callback(
+        effects,
+        &query.id,
+        "Подписка отменена.",
+        false,
+        0,
+        "VIP cancellation success ack",
+    )
+    .await;
+    VipCancellationCallbackOutcome::Canceled
+}
+
+async fn handle_back_to_vip_status_callback_at<Store, Effects>(
+    store: &Store,
+    effects: &Effects,
+    query: &TelegramCallbackQuery,
+    message: VipCallbackMessage,
+    now: OffsetDateTime,
+) -> VipCancellationCallbackOutcome
+where
+    Store: VipCancellationStore + Sync,
+    Effects: VipCancellationEffects + Sync,
+{
+    let user_id = i64::from(query.from.id);
+    let status = match build_vip_status_message_at(
+        store,
+        user_id,
+        message.chat.id,
+        message.message_id as i32,
+        None,
+        now,
+    )
+    .await
+    {
+        Ok(Some(status)) => status,
+        Ok(None) => {
+            edit_inactive_vip_status(effects, query, message).await;
+            return VipCancellationCallbackOutcome::BackInactive;
+        }
+        Err(error) => {
+            tracing::warn!(
+                message = %error,
+                user_id,
+                "failed to build VIP status for back callback"
+            );
+            edit_inactive_vip_status(effects, query, message).await;
+            return VipCancellationCallbackOutcome::BackInactive;
+        }
+    };
+
+    try_edit_vip_callback_text(
+        effects,
+        message,
+        &status.text,
+        openplotva_telegram::TELEGRAM_PARSE_MODE_HTML,
+        status.show_cancel_button.then(vip_cancel_status_keyboard),
+        "VIP status back edit",
+    )
+    .await;
+    try_answer_vip_callback(effects, &query.id, "", false, 0, "VIP status back ack").await;
+    VipCancellationCallbackOutcome::BackStatusShown
+}
+
+async fn edit_inactive_vip_status<Effects>(
+    effects: &Effects,
+    query: &TelegramCallbackQuery,
+    message: VipCallbackMessage,
+) where
+    Effects: VipCancellationEffects + Sync,
+{
+    try_edit_vip_callback_text(
+        effects,
+        message,
+        "Ваша подписка больше не активна. Отправьте /vip, чтобы подписаться снова.",
+        "",
+        None,
+        "VIP inactive back edit",
+    )
+    .await;
+    try_answer_vip_callback(effects, &query.id, "", false, 0, "VIP inactive back ack").await;
+}
+
+async fn vip_cancellation_success_text_at<Store>(
+    store: &Store,
+    user_id: i64,
+    now: OffsetDateTime,
+) -> String
+where
+    Store: VipCancellationStore + Sync,
+{
+    let text = "✅ Автопродление VIP подписки отключено.";
+    match store.get_vip_summary_by_user(user_id).await {
+        Ok(Some(summary)) if summary.is_active && now < summary.effective_expires_at => format!(
+            "{text}\n\nВаш VIP статус остаётся активным до <b>{}</b> ({} дней осталось).",
+            go_date(summary.effective_expires_at),
+            vip_display_days_left_at(summary.effective_expires_at, now),
+        ),
+        Ok(_) => text.to_owned(),
+        Err(error) => {
+            tracing::warn!(message = %error, user_id, "failed to load VIP summary after cancellation");
+            text.to_owned()
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct VipCallbackMessage {
+    chat: openplotva_telegram::ChatRef,
+    message_id: i64,
+}
+
+fn vip_callback_message(query: &TelegramCallbackQuery) -> Option<VipCallbackMessage> {
+    match query.message.as_ref()? {
+        MaybeInaccessibleMessage::Message(message) => Some(VipCallbackMessage {
+            chat: openplotva_telegram::ChatRef {
+                id: message.chat.get_id().into(),
+                is_forum: message.message_thread_id.is_some(),
+            },
+            message_id: message.id,
+        }),
+        MaybeInaccessibleMessage::InaccessibleMessage(message) => Some(VipCallbackMessage {
+            chat: openplotva_telegram::ChatRef {
+                id: message.chat.get_id().into(),
+                is_forum: false,
+            },
+            message_id: message.message_id,
+        }),
+    }
+}
+
+fn vip_cancellation_callback_action(query: &TelegramCallbackQuery) -> Option<&str> {
+    let openplotva_telegram::CallbackActionParse::Action { action, .. } =
+        openplotva_telegram::parse_callback_action(query.data.as_deref().unwrap_or_default())
+    else {
+        return None;
+    };
+    matches!(
+        action.as_str(),
+        "cancel_vip" | "confirm_cancel_vip" | "back_to_vip_status"
+    )
+    .then_some(match action.as_str() {
+        "cancel_vip" => "cancel_vip",
+        "confirm_cancel_vip" => "confirm_cancel_vip",
+        "back_to_vip_status" => "back_to_vip_status",
+        _ => unreachable!(),
+    })
+}
+
+fn vip_cancel_status_keyboard() -> openplotva_telegram::InlineKeyboardMarkup {
+    openplotva_telegram::build_inline_keyboard_markup([
+        openplotva_telegram::build_inline_keyboard_row([
+            openplotva_telegram::build_inline_keyboard_button_data(
+                "Отменить подписку",
+                "{\"action\":\"cancel_vip\"}",
+            ),
+        ]),
+    ])
+}
+
+async fn try_edit_vip_callback_text<Effects>(
+    effects: &Effects,
+    message: VipCallbackMessage,
+    text: &str,
+    render_as: &str,
+    reply_markup: Option<openplotva_telegram::InlineKeyboardMarkup>,
+    context: &'static str,
+) where
+    Effects: VipCancellationEffects + Sync,
+{
+    match openplotva_telegram::build_edit_text_message_method(
+        &openplotva_telegram::EditTextMessageRequest {
+            chat: message.chat,
+            message_id: message.message_id,
+            text: text.to_owned(),
+            render_as: render_as.to_owned(),
+            reply_markup,
+        },
+    ) {
+        Ok(method) => try_execute_vip_callback_method(effects, method.into(), context).await,
+        Err(error) => {
+            tracing::warn!(message = %error, context, "failed to build VIP callback edit")
+        }
+    }
+}
+
+async fn try_answer_vip_callback<Effects>(
+    effects: &Effects,
+    query_id: &str,
+    text: &str,
+    show_alert: bool,
+    cache_time: i64,
+    context: &'static str,
+) where
+    Effects: VipCancellationEffects + Sync,
+{
+    let request = openplotva_telegram::CallbackAnswerRequest {
+        callback_query_id: query_id.to_owned(),
+        text: text.to_owned(),
+        show_alert,
+        url: String::new(),
+        cache_time,
+    };
+    try_execute_vip_callback_method(
+        effects,
+        openplotva_telegram::build_callback_answer_method(&request).into(),
+        context,
+    )
+    .await;
+}
+
+async fn try_execute_vip_callback_method<Effects>(
+    effects: &Effects,
+    method: openplotva_telegram::TelegramOutboundMethod,
+    context: &'static str,
+) where
+    Effects: VipCancellationEffects + Sync,
+{
+    let method_name = method.method_name();
+    if let Err(error) = effects.execute_vip_cancellation_method(method).await {
+        tracing::warn!(
+            message = %error,
+            method = method_name,
+            context,
+            "VIP cancellation callback Telegram side effect failed"
+        );
+    }
+}
+
 pub async fn execute_vip_invoice_control_job<Effects>(
     effects: &Effects,
     params: &ControlJobParams,
@@ -2305,7 +3590,6 @@ where
     }
 }
 
-/// Execute Go `executeDonateInvoiceControlJob`.
 pub async fn execute_donate_invoice_control_job<Effects>(
     effects: &Effects,
     params: &ControlJobParams,
@@ -2502,6 +3786,53 @@ impl AdminCancelVipStore for PostgresSuccessfulPaymentStore {
     }
 }
 
+impl AdminRefundStore for PostgresSuccessfulPaymentStore {
+    type Error = StorageError;
+
+    fn get_admin_refund_subscription_by_charge_id<'a>(
+        &'a self,
+        telegram_payment_charge_id: &'a str,
+    ) -> PaymentStoreFuture<'a, Option<SubscriptionRecord>, Self::Error> {
+        Box::pin(async move {
+            self.payments
+                .get_subscription_by_telegram_payment_charge_id(telegram_payment_charge_id)
+                .await
+        })
+    }
+
+    fn get_admin_refund_donation_by_charge_id<'a>(
+        &'a self,
+        telegram_payment_charge_id: &'a str,
+    ) -> PaymentStoreFuture<'a, Option<DonationRecord>, Self::Error> {
+        Box::pin(async move {
+            self.payments
+                .get_donation_by_telegram_payment_charge_id(telegram_payment_charge_id)
+                .await
+        })
+    }
+
+    fn mark_admin_refund_subscription_refunded<'a>(
+        &'a self,
+        id: i64,
+    ) -> PaymentStoreFuture<'a, SubscriptionRecord, Self::Error> {
+        Box::pin(async move { self.payments.mark_subscription_refunded(id).await })
+    }
+
+    fn create_admin_refund_vip_event<'a>(
+        &'a self,
+        event: VipEventCreate<'a>,
+    ) -> PaymentStoreFuture<'a, VipEventRecord, Self::Error> {
+        Box::pin(async move { self.vip.create_vip_event(event).await })
+    }
+
+    fn delete_admin_refund_donation<'a>(
+        &'a self,
+        id: i64,
+    ) -> PaymentStoreFuture<'a, DonationRecord, Self::Error> {
+        Box::pin(async move { self.payments.delete_donation(id).await })
+    }
+}
+
 impl VipStatusStore for PostgresSuccessfulPaymentStore {
     type Error = StorageError;
 
@@ -2527,6 +3858,15 @@ impl VipStatusStore for PostgresSuccessfulPaymentStore {
     }
 }
 
+impl VipCancellationStore for PostgresSuccessfulPaymentStore {
+    fn mark_subscription_canceled<'a>(
+        &'a self,
+        id: i64,
+    ) -> PaymentStoreFuture<'a, SubscriptionRecord, Self::Error> {
+        Box::pin(async move { self.payments.mark_subscription_canceled(id).await })
+    }
+}
+
 impl VipStatusChecker for PostgresSuccessfulPaymentStore {
     fn is_vip_at<'a>(&'a self, user_id: i64, now: OffsetDateTime) -> VipStatusCheckFuture<'a> {
         Box::pin(async move {
@@ -2547,7 +3887,6 @@ impl VipStatusChecker for PostgresSuccessfulPaymentStore {
     }
 }
 
-/// Process one Telegram successful-payment message with Go `processSuccessfulPaymentNow` semantics.
 pub async fn process_successful_payment_at<Store, Effects>(
     store: &Store,
     effects: &Effects,
@@ -2575,7 +3914,6 @@ where
     }
 }
 
-/// Build the Go taskman control job produced by `processSuccessfulPayment`.
 #[must_use]
 pub fn successful_payment_control_job_from_update_at(
     update: &TelegramUpdate,
@@ -2641,7 +3979,6 @@ fn successful_payment_control_job_from_message_at(
     )
 }
 
-/// Queue successful-payment updates as Go taskman control jobs, delegating all other updates.
 pub async fn enqueue_successful_payment_update_or_else_at<
     Queue,
     HandleFn,
@@ -2675,16 +4012,11 @@ where
     }
 }
 
-/// Go default VIP subscription price in Telegram Stars.
 pub const SUBSCRIPTION_PRICE_STARS: i64 = 300;
-/// Go default donation amount in Telegram Stars.
 pub const DEFAULT_DONATION_STARS: i64 = 600;
-/// Minimum explicit donation amount accepted by Go.
 pub const MIN_DONATION_STARS: i64 = 10;
-/// Maximum explicit donation amount accepted by Go.
 pub const MAX_DONATION_STARS: i64 = 10_000;
 
-/// Build the Go taskman control job produced by private `/vip` and `/donate` commands.
 #[must_use]
 pub fn payment_invoice_control_job_from_update_at(
     update: &TelegramUpdate,
@@ -2703,12 +4035,15 @@ fn payment_invoice_control_job_from_message_at(
     let Some(command) = payment_command_from_message(message) else {
         return PaymentInvoiceControlJobBuild::NotPaymentCommand;
     };
-    if !matches!(message.chat, TelegramChat::Private(_)) {
-        return PaymentInvoiceControlJobBuild::NonPrivateChat;
-    }
 
     match command.name {
+        "vip" if !matches!(message.chat, TelegramChat::Private(_)) => {
+            PaymentInvoiceControlJobBuild::NonPrivateChat
+        }
         "vip" => vip_invoice_control_job_from_message_at(message, created),
+        "donate" if !matches!(message.chat, TelegramChat::Private(_)) => {
+            PaymentInvoiceControlJobBuild::NonPrivateChat
+        }
         "donate" => {
             donation_invoice_control_job_from_message_at(message, command.arguments, created)
         }
@@ -2755,7 +4090,6 @@ fn donation_invoice_control_job_from_message_at(
         .unwrap_or(PaymentInvoiceControlJobBuild::NotPaymentCommand)
 }
 
-/// Queue private `/vip` and `/donate` updates as Go taskman control jobs, delegating other updates.
 pub async fn enqueue_payment_invoice_command_update_or_else_at<
     Queue,
     HandleFn,
@@ -2799,7 +4133,6 @@ where
     }
 }
 
-/// Queue private `/vip` and `/donate` updates, but send Go existing-VIP status before `/vip` invoices.
 pub async fn enqueue_payment_invoice_command_update_with_vip_status_or_else_at<
     Queue,
     Vip,
@@ -2831,6 +4164,10 @@ where
         handle_other(update).await?;
         return Ok(PaymentInvoiceCommandUpdateRoute::Delegated);
     };
+    if !matches!(command.name, "vip" | "donate") {
+        handle_other(update).await?;
+        return Ok(PaymentInvoiceCommandUpdateRoute::Delegated);
+    }
     if !matches!(message.chat, TelegramChat::Private(_)) {
         return Ok(PaymentInvoiceCommandUpdateRoute::NonPrivateChat);
     }
@@ -2967,13 +4304,13 @@ async fn send_vip_status_error_text<Effects>(
         .await;
 }
 
-/// `UpdateHandler` adapter that handles Go payment-owned updates before fetcher routing.
 #[derive(Clone, Debug)]
 pub struct PaymentUpdateHandler<Queue, Vip, Effects, Next> {
     queue: Arc<Queue>,
     vip: Arc<Vip>,
     effects: Arc<Effects>,
     next: Arc<Next>,
+    bot_username: String,
 }
 
 impl<Queue, Vip, Effects, Next> PaymentUpdateHandler<Queue, Vip, Effects, Next> {
@@ -2984,7 +4321,14 @@ impl<Queue, Vip, Effects, Next> PaymentUpdateHandler<Queue, Vip, Effects, Next> 
             vip,
             effects,
             next,
+            bot_username: String::new(),
         }
+    }
+
+    #[must_use]
+    pub fn with_bot_username(mut self, bot_username: impl Into<String>) -> Self {
+        self.bot_username = bot_username.into();
+        self
     }
 }
 
@@ -2992,15 +4336,20 @@ impl<Queue, Vip, Effects, Next> UpdateHandler for PaymentUpdateHandler<Queue, Vi
 where
     Queue: PaymentControlJobQueue + Send + Sync,
     Vip: VipStatusChecker + VipStatusStore + Send + Sync,
-    Effects: PreCheckoutPaymentEffects + VipStatusEffects + Send + Sync,
+    Effects: PreCheckoutPaymentEffects + VipStatusEffects + PaymentRedirectEffects + Send + Sync,
     Next: UpdateHandler + Send + Sync,
 {
     type Error = Next::Error;
 
     fn handle_update<'a>(&'a self, update: TelegramUpdate) -> UpdateHandlerFuture<'a, Self::Error> {
         Box::pin(async move {
+            if non_private_payment_command_targets_other_bot(&update, &self.bot_username) {
+                self.next.handle_update(update).await?;
+                return Ok(());
+            }
+            let redirect = payment_redirect_message_from_update(&update, &self.bot_username);
             let now = OffsetDateTime::now_utc();
-            handle_payment_update_or_else_at(
+            let route = handle_payment_update_or_else_at(
                 self.queue.as_ref(),
                 self.vip.as_ref(),
                 self.effects.as_ref(),
@@ -3009,9 +4358,273 @@ where
                 now,
                 |update| self.next.handle_update(update),
             )
+            .await?;
+            if matches!(
+                route,
+                PaymentUpdateRoute::InvoiceCommand(
+                    PaymentInvoiceCommandUpdateRoute::NonPrivateChat
+                )
+            ) && let Some(message) = redirect
+                && let Err(error) = self.effects.send_payment_redirect_message(message).await
+            {
+                tracing::warn!(%error, "failed to send payment redirect message");
+            }
+            Ok(())
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AdminVipCommandUpdateOutcome {
+    /// Update was not owned by this slice and went downstream.
+    Delegated,
+    MalformedCommand,
+    Unauthorized,
+    UnauthorizedSendError {
+        /// Queue/build error text.
+        message: String,
+    },
+    /// `/admin_grant_vip` was authorized and executed.
+    Grant(AdminGrantVipCommandReport),
+    /// `/admin_cancel_vip` was authorized and executed.
+    Cancel(AdminCancelVipCommandReport),
+    /// `/admin_refund` was authorized and executed.
+    Refund(AdminRefundCommandReport),
+}
+
+#[derive(Clone)]
+pub struct AdminVipCommandUpdateHandler<Store, Vip, Effects, Next> {
+    store: Arc<Store>,
+    queue: Arc<openplotva_telegram::DispatcherQueue>,
+    vip: Arc<Vip>,
+    effects: Arc<Effects>,
+    admin_ids: Arc<[i64]>,
+    bot_username: String,
+    next: Arc<Next>,
+    next_virtual_id: VirtualIdFactory,
+}
+
+impl<Store, Vip, Effects, Next> AdminVipCommandUpdateHandler<Store, Vip, Effects, Next> {
+    /// Build an admin VIP command handler around the real downstream update handler.
+    #[must_use]
+    pub fn new(
+        store: Arc<Store>,
+        queue: Arc<openplotva_telegram::DispatcherQueue>,
+        vip: Arc<Vip>,
+        effects: Arc<Effects>,
+        admin_ids: Vec<i64>,
+        bot_username: impl Into<String>,
+        next: Arc<Next>,
+    ) -> Self {
+        Self {
+            store,
+            queue,
+            vip,
+            effects,
+            admin_ids: Arc::from(admin_ids.into_boxed_slice()),
+            bot_username: bot_username.into(),
+            next,
+            next_virtual_id: monotonic_virtual_id_factory("admin-vip-vmsg"),
+        }
+    }
+
+    /// Override virtual-message ID generation for deterministic tests.
+    #[must_use]
+    pub fn with_virtual_id_factory(mut self, next_virtual_id: VirtualIdFactory) -> Self {
+        self.next_virtual_id = next_virtual_id;
+        self
+    }
+}
+
+impl<Store, Vip, Effects, Next> UpdateHandler
+    for AdminVipCommandUpdateHandler<Store, Vip, Effects, Next>
+where
+    Store: VirtualMessageStore + Send + Sync,
+    Vip: AdminGrantVipStore + AdminCancelVipStore + AdminRefundStore + Send + Sync,
+    Effects: AdminGrantVipEffects + AdminCancelVipEffects + AdminRefundEffects + Send + Sync,
+    Next: UpdateHandler + Send + Sync,
+{
+    type Error = Next::Error;
+
+    fn handle_update<'a>(&'a self, update: TelegramUpdate) -> UpdateHandlerFuture<'a, Self::Error> {
+        Box::pin(async move {
+            handle_admin_vip_command_update_or_else_at(
+                AdminVipCommandUpdateRuntime {
+                    store: self.store.as_ref(),
+                    queue: self.queue.as_ref(),
+                    vip: self.vip.as_ref(),
+                    effects: self.effects.as_ref(),
+                    admin_ids: &self.admin_ids,
+                    bot_username: &self.bot_username,
+                    next_virtual_id: &self.next_virtual_id,
+                    now: OffsetDateTime::now_utc(),
+                },
+                update,
+                |update| self.next.handle_update(update),
+            )
             .await
             .map(|_| ())
         })
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct AdminVipCommandUpdateRuntime<'a, Store, Vip, Effects> {
+    pub store: &'a Store,
+    pub queue: &'a openplotva_telegram::DispatcherQueue,
+    /// Payment/VIP storage boundary.
+    pub vip: &'a Vip,
+    /// Payment/admin side-effect boundary.
+    pub effects: &'a Effects,
+    /// Authorized Telegram admin user IDs.
+    pub admin_ids: &'a [i64],
+    /// Current bot username from `getMe`.
+    pub bot_username: &'a str,
+    /// Virtual ID generator for denial replies.
+    pub next_virtual_id: &'a VirtualIdFactory,
+    /// Clock value used for `/admin_cancel_vip` active-status checks.
+    pub now: OffsetDateTime,
+}
+
+pub async fn handle_admin_vip_command_update_or_else_at<
+    Store,
+    Vip,
+    Effects,
+    HandleFn,
+    HandleFuture,
+    HandleError,
+>(
+    runtime: AdminVipCommandUpdateRuntime<'_, Store, Vip, Effects>,
+    update: TelegramUpdate,
+    handle_other: HandleFn,
+) -> Result<AdminVipCommandUpdateOutcome, HandleError>
+where
+    Store: VirtualMessageStore + Sync,
+    Vip: AdminGrantVipStore + AdminCancelVipStore + AdminRefundStore + Sync,
+    Effects: AdminGrantVipEffects + AdminCancelVipEffects + AdminRefundEffects + Sync,
+    HandleFn: FnOnce(TelegramUpdate) -> HandleFuture,
+    HandleFuture: Future<Output = Result<(), HandleError>>,
+{
+    let TelegramUpdateType::Message(message) = &update.update_type else {
+        handle_other(update).await?;
+        return Ok(AdminVipCommandUpdateOutcome::Delegated);
+    };
+    let Some(command) = admin_vip_command_for_message(message, runtime.bot_username) else {
+        handle_other(update).await?;
+        return Ok(AdminVipCommandUpdateOutcome::Delegated);
+    };
+
+    let actor_user_id = message
+        .sender
+        .get_user()
+        .map(|user| i64::from(user.id))
+        .unwrap_or_default();
+    if !runtime.admin_ids.contains(&actor_user_id) {
+        return match send_admin_command_unauthorized_text(
+            runtime.store,
+            runtime.queue,
+            runtime.next_virtual_id,
+            message,
+        )
+        .await
+        {
+            Ok(()) => Ok(AdminVipCommandUpdateOutcome::Unauthorized),
+            Err(error) => {
+                tracing::warn!(%error, actor_user_id, "failed to queue admin command denial");
+                Ok(AdminVipCommandUpdateOutcome::UnauthorizedSendError {
+                    message: error.to_string(),
+                })
+            }
+        };
+    }
+
+    match command.name {
+        "admin_grant_vip" => {
+            let Some(command) =
+                admin_grant_vip_command_from_message(message, command.arguments, actor_user_id)
+            else {
+                return Ok(AdminVipCommandUpdateOutcome::MalformedCommand);
+            };
+            Ok(AdminVipCommandUpdateOutcome::Grant(
+                handle_admin_grant_vip_command_at(runtime.vip, runtime.effects, command).await,
+            ))
+        }
+        "admin_cancel_vip" => {
+            let Some(command) =
+                admin_cancel_vip_command_from_message(message, command.arguments, actor_user_id)
+            else {
+                return Ok(AdminVipCommandUpdateOutcome::MalformedCommand);
+            };
+            Ok(AdminVipCommandUpdateOutcome::Cancel(
+                handle_admin_cancel_vip_command_at(
+                    runtime.vip,
+                    runtime.effects,
+                    command,
+                    runtime.now,
+                )
+                .await,
+            ))
+        }
+        "admin_refund" => {
+            let Some(command) =
+                admin_refund_command_from_message(message, command.arguments, actor_user_id)
+            else {
+                return Ok(AdminVipCommandUpdateOutcome::MalformedCommand);
+            };
+            let Some(telegram_payment_charge_id) = first_admin_refund_charge_id(command.arguments)
+            else {
+                return match send_admin_command_ephemeral_text(
+                    runtime.store,
+                    runtime.queue,
+                    runtime.next_virtual_id,
+                    message,
+                    ADMIN_REFUND_MISSING_ARGUMENT_TEXT,
+                )
+                .await
+                {
+                    Ok(()) => Ok(AdminVipCommandUpdateOutcome::Refund(
+                        AdminRefundCommandReport {
+                            outcome: AdminRefundCommandOutcome::MissingChargeId,
+                            telegram_payment_charge_id: None,
+                            target_user_id: None,
+                            amount_stars: None,
+                            error: None,
+                        },
+                    )),
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            actor_user_id,
+                            "failed to queue admin refund usage reply"
+                        );
+                        Ok(AdminVipCommandUpdateOutcome::Refund(
+                            AdminRefundCommandReport {
+                                outcome: AdminRefundCommandOutcome::MissingChargeId,
+                                telegram_payment_charge_id: None,
+                                target_user_id: None,
+                                amount_stars: None,
+                                error: Some(error.to_string()),
+                            },
+                        ))
+                    }
+                };
+            };
+            Ok(AdminVipCommandUpdateOutcome::Refund(
+                handle_admin_refund_command_at(
+                    runtime.vip,
+                    runtime.effects,
+                    AdminRefundCommand {
+                        telegram_payment_charge_id,
+                        ..command
+                    },
+                )
+                .await,
+            ))
+        }
+        _ => {
+            handle_other(update).await?;
+            Ok(AdminVipCommandUpdateOutcome::Delegated)
+        }
     }
 }
 
@@ -3040,16 +4653,29 @@ where
     HandleFuture: Future<Output = Result<(), HandleError>>,
 {
     if let Some(pre_checkout_query_id) = pre_checkout_query_id_from_update(&update) {
+        tracing::info!(pre_checkout_query_id, "pre-checkout answer requested");
         let outcome = match effects
             .answer_pre_checkout_query(pre_checkout_query_id)
             .await
         {
-            Ok(()) => PreCheckoutOutcome::Acknowledged,
+            Ok(()) => {
+                tracing::info!(
+                    pre_checkout_query_id,
+                    answer_failed = false,
+                    "pre-checkout answer completed"
+                );
+                PreCheckoutOutcome::Acknowledged
+            }
             Err(error) => {
                 tracing::warn!(
                     %error,
                     pre_checkout_query_id,
                     "failed to answer pre-checkout query"
+                );
+                tracing::info!(
+                    pre_checkout_query_id,
+                    answer_failed = true,
+                    "pre-checkout answer completed"
                 );
                 PreCheckoutOutcome::AcknowledgementError
             }
@@ -3091,7 +4717,141 @@ where
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PaymentCommand<'a> {
     name: &'a str,
+    target: Option<&'a str>,
     arguments: &'a str,
+}
+
+fn admin_vip_command_for_message<'a>(
+    message: &'a TelegramMessage,
+    bot_username: &str,
+) -> Option<PaymentCommand<'a>> {
+    let command = payment_command_from_message(message)?;
+    if !matches!(
+        command.name,
+        "admin_grant_vip" | "admin_cancel_vip" | "admin_refund"
+    ) {
+        return None;
+    }
+    if matches!(message.chat, TelegramChat::Private(_)) {
+        return Some(command);
+    }
+    (command.target == Some(bot_username)).then_some(command)
+}
+
+fn admin_grant_vip_command_from_message<'a>(
+    message: &'a TelegramMessage,
+    arguments: &'a str,
+    actor_user_id: i64,
+) -> Option<AdminGrantVipCommand<'a>> {
+    Some(AdminGrantVipCommand {
+        chat_id: message.chat.get_id().into(),
+        message_id: i32::try_from(message.id).ok()?,
+        actor_user_id,
+        reply_user_id: admin_reply_user_id(message),
+        arguments,
+    })
+}
+
+fn admin_cancel_vip_command_from_message<'a>(
+    message: &'a TelegramMessage,
+    arguments: &'a str,
+    actor_user_id: i64,
+) -> Option<AdminCancelVipCommand<'a>> {
+    Some(AdminCancelVipCommand {
+        chat_id: message.chat.get_id().into(),
+        message_id: i32::try_from(message.id).ok()?,
+        actor_user_id,
+        arguments,
+    })
+}
+
+fn admin_refund_command_from_message<'a>(
+    message: &'a TelegramMessage,
+    arguments: &'a str,
+    actor_user_id: i64,
+) -> Option<AdminRefundCommand<'a>> {
+    Some(AdminRefundCommand {
+        chat_id: message.chat.get_id().into(),
+        message_id: i32::try_from(message.id).ok()?,
+        actor_user_id,
+        arguments,
+        telegram_payment_charge_id: "",
+    })
+}
+
+fn first_admin_refund_charge_id(arguments: &str) -> Option<&str> {
+    arguments.split_whitespace().next()
+}
+
+fn admin_reply_user_id(message: &TelegramMessage) -> Option<i64> {
+    let TelegramReplyTo::Message(reply) = message.reply_to.as_ref()? else {
+        return None;
+    };
+    reply.sender.get_user().map(|user| user.id.into())
+}
+
+async fn send_admin_command_unauthorized_text<Store>(
+    store: &Store,
+    queue: &openplotva_telegram::DispatcherQueue,
+    next_virtual_id: &VirtualIdFactory,
+    message: &TelegramMessage,
+) -> Result<(), openplotva_telegram::OutboundBuildError>
+where
+    Store: VirtualMessageStore + Sync,
+{
+    send_admin_command_ephemeral_text(
+        store,
+        queue,
+        next_virtual_id,
+        message,
+        ADMIN_COMMAND_UNAUTHORIZED_TEXT,
+    )
+    .await
+}
+
+async fn send_admin_command_ephemeral_text<Store>(
+    store: &Store,
+    queue: &openplotva_telegram::DispatcherQueue,
+    next_virtual_id: &VirtualIdFactory,
+    message: &TelegramMessage,
+    text: &str,
+) -> Result<(), openplotva_telegram::OutboundBuildError>
+where
+    Store: VirtualMessageStore + Sync,
+{
+    let chat = openplotva_telegram::ChatRef {
+        id: message.chat.get_id().into(),
+        is_forum: message.message_thread_id.is_some(),
+    };
+    let request = openplotva_telegram::TextMessageRequest {
+        chat: Some(chat),
+        message_thread_id: message.message_thread_id.unwrap_or_default(),
+        disable_notification: false,
+        allow_sending_without_reply: None,
+        text: text.to_owned(),
+        render_as: String::new(),
+        reply_markup: None,
+    };
+    let reply_to = openplotva_telegram::ReplyMessageRef {
+        message_id: message.id,
+        chat,
+        is_topic_message: message.message_thread_id.is_some(),
+        message_thread_id: message.message_thread_id.unwrap_or_default(),
+    };
+    queue_text_message_parts(
+        store,
+        queue,
+        QueueTextRequest {
+            message: &request,
+            reply_to: Some(&reply_to),
+            immediate_first: true,
+            bypass_chat_restrictions: false,
+            ephemeral_delete_after: Some(ADMIN_COMMAND_UNAUTHORIZED_DELETE_AFTER),
+        },
+        || next_virtual_id(),
+    )
+    .await?;
+    Ok(())
 }
 
 fn payment_command_from_message(message: &TelegramMessage) -> Option<PaymentCommand<'_>> {
@@ -3109,11 +4869,17 @@ fn payment_command_from_message(message: &TelegramMessage) -> Option<PaymentComm
     let command_end = utf16_index_to_byte_index(&text.data, position.length)?;
     let command_with_slash = text.data.get(..command_end)?;
     let command_with_at = command_with_slash.strip_prefix('/')?;
-    let name = command_with_at
+    let (name, target) = command_with_at
         .split_once('@')
-        .map_or(command_with_at, |(name, _)| name);
+        .map_or((command_with_at, None), |(name, target)| {
+            (name, Some(target))
+        });
     let arguments = command_arguments_after_command(&text.data, command_end)?;
-    Some(PaymentCommand { name, arguments })
+    Some(PaymentCommand {
+        name,
+        target,
+        arguments,
+    })
 }
 
 fn command_arguments_after_command(text: &str, command_end: usize) -> Option<&str> {
@@ -3166,7 +4932,6 @@ fn donation_amount_stars_from_command_arguments(arguments: &str) -> Result<i64, 
     }
 }
 
-/// Parsed Go `/admin_grant_vip` command arguments.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct AdminGrantVipCommandArgs {
     /// First positional argument, the number of days.
@@ -3181,12 +4946,10 @@ pub struct AdminGrantVipCommandArgs {
     pub has_target: bool,
 }
 
-/// Minimal Go message context needed to execute `/admin_grant_vip`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AdminGrantVipCommand<'value> {
     /// Chat where the admin command was received.
     pub chat_id: i64,
-    /// Command message ID used as the reply target for Go `SendText`.
     pub message_id: i32,
     /// Telegram user ID of the admin who issued the command.
     pub actor_user_id: i64,
@@ -3196,7 +4959,6 @@ pub struct AdminGrantVipCommand<'value> {
     pub arguments: &'value str,
 }
 
-/// Parsed Go `/admin_cancel_vip` command arguments.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct AdminCancelVipCommandArgs {
     /// First positional argument, the user target.
@@ -3207,12 +4969,10 @@ pub struct AdminCancelVipCommandArgs {
     pub has_target: bool,
 }
 
-/// Minimal Go message context needed to execute `/admin_cancel_vip`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AdminCancelVipCommand<'value> {
     /// Chat where the admin command was received.
     pub chat_id: i64,
-    /// Command message ID used as the reply target for Go `SendText`.
     pub message_id: i32,
     /// Telegram user ID of the admin who issued the command.
     pub actor_user_id: i64,
@@ -3220,7 +4980,18 @@ pub struct AdminCancelVipCommand<'value> {
     pub arguments: &'value str,
 }
 
-/// Parse Go `/admin_grant_vip` positional arguments without changing field semantics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AdminRefundCommand<'value> {
+    /// Chat where the admin command was received.
+    pub chat_id: i64,
+    pub message_id: i32,
+    /// Telegram user ID of the admin who issued the command.
+    pub actor_user_id: i64,
+    /// Raw `CommandArguments()` text after `/admin_refund`.
+    pub arguments: &'value str,
+    pub telegram_payment_charge_id: &'value str,
+}
+
 #[must_use]
 pub fn parse_admin_grant_vip_command_args(raw: &str) -> AdminGrantVipCommandArgs {
     let mut args = AdminGrantVipCommandArgs::default();
@@ -3247,7 +5018,6 @@ pub fn parse_admin_grant_vip_command_args(raw: &str) -> AdminGrantVipCommandArgs
     args
 }
 
-/// Parse Go `/admin_cancel_vip` positional arguments without changing field semantics.
 #[must_use]
 pub fn parse_admin_cancel_vip_command_args(raw: &str) -> AdminCancelVipCommandArgs {
     let mut args = AdminCancelVipCommandArgs::default();
@@ -3267,7 +5037,6 @@ pub fn parse_admin_cancel_vip_command_args(raw: &str) -> AdminCancelVipCommandAr
     args
 }
 
-/// Go refund flag parser for `/admin_cancel_vip`.
 #[must_use]
 pub fn admin_cancel_vip_refund_flag(refund_arg: &str) -> bool {
     refund_arg.eq_ignore_ascii_case("true")
@@ -3275,7 +5044,6 @@ pub fn admin_cancel_vip_refund_flag(refund_arg: &str) -> bool {
         || refund_arg.eq_ignore_ascii_case("yes")
 }
 
-/// Go `/admin_cancel_vip` target parse error text.
 #[must_use]
 pub fn admin_cancel_vip_parse_error_text(error: &str) -> &'static str {
     match error {
@@ -3294,7 +5062,6 @@ pub fn admin_cancel_vip_parse_error_text(error: &str) -> &'static str {
     }
 }
 
-/// Go `/admin_cancel_vip` success text.
 #[must_use]
 pub fn admin_cancel_vip_success_text(
     target_user_id: i64,
@@ -3326,7 +5093,6 @@ pub fn admin_cancel_vip_success_text(
     text
 }
 
-/// Parse Go `/admin_grant_vip` duration with its default and invalid-duration flag.
 #[must_use]
 pub fn parse_admin_grant_vip_duration(arg: &str, has_duration: bool) -> (i64, bool) {
     if !has_duration {
@@ -3338,7 +5104,6 @@ pub fn parse_admin_grant_vip_duration(arg: &str, has_duration: bool) -> (i64, bo
     }
 }
 
-/// Go default reason for `/admin_grant_vip`.
 #[must_use]
 pub fn admin_grant_vip_reason(reason: &str, actor_user_id: i64) -> String {
     let trimmed = reason.trim();
@@ -3349,7 +5114,6 @@ pub fn admin_grant_vip_reason(reason: &str, actor_user_id: i64) -> String {
     }
 }
 
-/// Go action word used in `/admin_grant_vip` success text.
 #[must_use]
 pub fn admin_grant_vip_action_text(duration_days: i64) -> &'static str {
     if duration_days < 0 {
@@ -3359,7 +5123,6 @@ pub fn admin_grant_vip_action_text(duration_days: i64) -> &'static str {
     }
 }
 
-/// Go `/admin_grant_vip` missing-target usage text.
 #[must_use]
 pub fn admin_grant_vip_usage_text() -> &'static str {
     "⚠️ Пожалуйста, укажите пользователя:\n\
@@ -3368,7 +5131,6 @@ pub fn admin_grant_vip_usage_text() -> &'static str {
      Использование: /admin_grant_vip [дни=1|-1] [user_id/@username/https://t.me/username] [причина]"
 }
 
-/// Go `/admin_grant_vip` success text.
 #[must_use]
 pub fn admin_grant_vip_success_text(
     target_user_id: i64,
@@ -3394,7 +5156,6 @@ const ADMIN_GRANT_VIP_INVALID_DURATION_TEXT: &str = "⚠️ Неверное к�
 const ADMIN_GRANT_VIP_LEDGER_ERROR_TEXT: &str =
     "❌ Не удалось записать VIP событие. Ошибка базы данных.";
 
-/// Execute Go `/admin_grant_vip` storage and side-effect behavior.
 pub async fn handle_admin_grant_vip_command_at<Store, Effects>(
     store: &Store,
     effects: &Effects,
@@ -3576,7 +5337,6 @@ const ADMIN_CANCEL_VIP_REVOKE_ERROR_TEXT: &str = "❌ Не удалось ото
 const ADMIN_CANCEL_VIP_PAID_SUBSCRIPTION_ERROR_TEXT: &str =
     "❌ Ошибка при проверке оплаченной подписки пользователя.";
 
-/// Execute Go `/admin_cancel_vip` storage and side-effect behavior.
 pub async fn handle_admin_cancel_vip_command_at<Store, Effects>(
     store: &Store,
     effects: &Effects,
@@ -3868,6 +5628,293 @@ async fn send_admin_cancel_vip_text<Effects>(
         .await;
 }
 
+const ADMIN_REFUND_MISSING_ARGUMENT_TEXT: &str = "⚠️ Пожалуйста, укажите ID транзакции для возврата (telegram_payment_charge_id).\nИспользование: /refund <telegram_payment_charge_id>";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum AdminRefundTarget {
+    Subscription(SubscriptionRecord),
+    Donation(DonationRecord),
+}
+
+impl AdminRefundTarget {
+    fn user_id(&self) -> i64 {
+        match self {
+            Self::Subscription(subscription) => subscription.user_id,
+            Self::Donation(donation) => donation.user_id,
+        }
+    }
+
+    fn amount_stars(&self) -> i64 {
+        match self {
+            Self::Subscription(subscription) => {
+                subscription_refund_price_stars(subscription.user_id)
+            }
+            Self::Donation(donation) => donation.amount_stars,
+        }
+    }
+
+    fn outcome(&self) -> AdminRefundCommandOutcome {
+        match self {
+            Self::Subscription(_) => AdminRefundCommandOutcome::RefundedSubscription,
+            Self::Donation(_) => AdminRefundCommandOutcome::RefundedDonation,
+        }
+    }
+
+    fn is_valid(&self) -> bool {
+        self.user_id() != 0 && self.amount_stars() != 0
+    }
+}
+
+fn admin_refund_subscription_target(subscription: SubscriptionRecord) -> Option<AdminRefundTarget> {
+    (subscription.id > 0).then_some(AdminRefundTarget::Subscription(subscription))
+}
+
+fn admin_refund_donation_target(donation: DonationRecord) -> Option<AdminRefundTarget> {
+    (donation.id > 0).then_some(AdminRefundTarget::Donation(donation))
+}
+
+enum AdminRefundLookup {
+    Found(AdminRefundTarget),
+    NotFound,
+    SubscriptionError(String),
+    DonationError(String),
+}
+
+pub async fn handle_admin_refund_command_at<Store, Effects>(
+    store: &Store,
+    effects: &Effects,
+    command: AdminRefundCommand<'_>,
+) -> AdminRefundCommandReport
+where
+    Store: AdminRefundStore + Sync,
+    Effects: AdminRefundEffects + Sync,
+{
+    let charge_id = command.telegram_payment_charge_id;
+    let target = match lookup_admin_refund_target(store, charge_id).await {
+        AdminRefundLookup::Found(target) => target,
+        AdminRefundLookup::SubscriptionError(error) => {
+            let text = format!("❌ Ошибка при поиске подписки с ID транзакции {charge_id}.");
+            send_admin_refund_text(effects, &command, &text).await;
+            return AdminRefundCommandReport {
+                outcome: AdminRefundCommandOutcome::SubscriptionLookupError,
+                telegram_payment_charge_id: Some(charge_id.to_owned()),
+                target_user_id: None,
+                amount_stars: None,
+                error: Some(error),
+            };
+        }
+        AdminRefundLookup::DonationError(error) => {
+            let text = format!("❌ Ошибка при поиске доната с ID транзакции {charge_id}.");
+            send_admin_refund_text(effects, &command, &text).await;
+            return AdminRefundCommandReport {
+                outcome: AdminRefundCommandOutcome::DonationLookupError,
+                telegram_payment_charge_id: Some(charge_id.to_owned()),
+                target_user_id: None,
+                amount_stars: None,
+                error: Some(error),
+            };
+        }
+        AdminRefundLookup::NotFound => {
+            let text =
+                format!("🤷 Транзакция с ID {charge_id} не найдена (ни подписка, ни донат).");
+            send_admin_refund_text(effects, &command, &text).await;
+            return AdminRefundCommandReport {
+                outcome: AdminRefundCommandOutcome::NotFound,
+                telegram_payment_charge_id: Some(charge_id.to_owned()),
+                target_user_id: None,
+                amount_stars: None,
+                error: None,
+            };
+        }
+    };
+
+    let target_user_id = target.user_id();
+    let amount_stars = target.amount_stars();
+    if !target.is_valid() {
+        let text = format!("❌ Не удалось определить детали транзакции {charge_id} для возврата.");
+        send_admin_refund_text(effects, &command, &text).await;
+        return AdminRefundCommandReport {
+            outcome: AdminRefundCommandOutcome::InvalidTarget,
+            telegram_payment_charge_id: Some(charge_id.to_owned()),
+            target_user_id: Some(target_user_id),
+            amount_stars: Some(amount_stars),
+            error: None,
+        };
+    }
+
+    if let AdminRefundTarget::Subscription(subscription) = &target
+        && is_synthetic_subscription_charge_id(&subscription.telegram_payment_charge_id)
+    {
+        let text = admin_refund_synthetic_subscription_text(charge_id);
+        send_admin_refund_text(effects, &command, &text).await;
+        return AdminRefundCommandReport {
+            outcome: AdminRefundCommandOutcome::SyntheticSubscription,
+            telegram_payment_charge_id: Some(charge_id.to_owned()),
+            target_user_id: Some(target_user_id),
+            amount_stars: Some(amount_stars),
+            error: None,
+        };
+    }
+
+    if let Err(error) = effects
+        .refund_admin_refund_payment(target_user_id, charge_id)
+        .await
+    {
+        let error = error.to_string();
+        let text = admin_refund_api_error_text(charge_id, &error);
+        send_admin_refund_text(effects, &command, &text).await;
+        return AdminRefundCommandReport {
+            outcome: AdminRefundCommandOutcome::RefundApiError,
+            telegram_payment_charge_id: Some(charge_id.to_owned()),
+            target_user_id: Some(target_user_id),
+            amount_stars: Some(amount_stars),
+            error: Some(error),
+        };
+    }
+
+    record_admin_refund(store, effects, &command, &target).await;
+
+    let success = admin_refund_success_text(charge_id, target_user_id, amount_stars);
+    send_admin_refund_text(effects, &command, &success).await;
+    let notice = admin_refund_notice_text(charge_id, amount_stars);
+    let _ = effects
+        .send_admin_refund_user_text(target_user_id, &notice)
+        .await;
+
+    AdminRefundCommandReport {
+        outcome: target.outcome(),
+        telegram_payment_charge_id: Some(charge_id.to_owned()),
+        target_user_id: Some(target_user_id),
+        amount_stars: Some(amount_stars),
+        error: None,
+    }
+}
+
+async fn lookup_admin_refund_target<Store>(store: &Store, charge_id: &str) -> AdminRefundLookup
+where
+    Store: AdminRefundStore + Sync,
+{
+    match store
+        .get_admin_refund_subscription_by_charge_id(charge_id)
+        .await
+    {
+        Ok(Some(subscription)) => {
+            return admin_refund_subscription_target(subscription)
+                .map(AdminRefundLookup::Found)
+                .unwrap_or_else(|| AdminRefundLookup::SubscriptionError(String::new()));
+        }
+        Ok(None) => {}
+        Err(error) => return AdminRefundLookup::SubscriptionError(error.to_string()),
+    }
+
+    match store
+        .get_admin_refund_donation_by_charge_id(charge_id)
+        .await
+    {
+        Ok(Some(donation)) => admin_refund_donation_target(donation)
+            .map(AdminRefundLookup::Found)
+            .unwrap_or_else(|| AdminRefundLookup::DonationError(String::new())),
+        Ok(None) => AdminRefundLookup::NotFound,
+        Err(error) => AdminRefundLookup::DonationError(error.to_string()),
+    }
+}
+
+async fn record_admin_refund<Store, Effects>(
+    store: &Store,
+    effects: &Effects,
+    command: &AdminRefundCommand<'_>,
+    target: &AdminRefundTarget,
+) where
+    Store: AdminRefundStore + Sync,
+    Effects: AdminRefundEffects + Sync,
+{
+    match target {
+        AdminRefundTarget::Subscription(subscription) => {
+            let mark_ok = store
+                .mark_admin_refund_subscription_refunded(subscription.id)
+                .await
+                .is_ok();
+            if mark_ok {
+                let reason = format!("admin refund {}", command.telegram_payment_charge_id);
+                let _ = store
+                    .create_admin_refund_vip_event(VipEventCreate {
+                        user_id: subscription.user_id,
+                        event_type: VIP_EVENT_TYPE_REFUND_REVERSAL,
+                        delta_seconds: -subscription_delta_seconds(
+                            &subscription.telegram_payment_charge_id,
+                            subscription.created_at,
+                            subscription.expires_at,
+                            openplotva_telegram::SUBSCRIPTION_DURATION_DAYS,
+                        ),
+                        subscription_id: Some(subscription.id),
+                        actor_user_id: Some(command.actor_user_id),
+                        reason: Some(&reason),
+                    })
+                    .await;
+            }
+            let _ = effects
+                .invalidate_admin_refund_cache(subscription.user_id)
+                .await;
+        }
+        AdminRefundTarget::Donation(donation) => {
+            let _ = store.delete_admin_refund_donation(donation.id).await;
+        }
+    }
+}
+
+fn admin_refund_synthetic_subscription_text(telegram_payment_charge_id: &str) -> String {
+    format!(
+        "❌ Транзакция {telegram_payment_charge_id} относится к legacy admin grant и не может быть возвращена через Telegram refund."
+    )
+}
+
+fn admin_refund_api_error_text(telegram_payment_charge_id: &str, error: &str) -> String {
+    if error.contains("telegram API сообщил, что возврат не был успешен")
+    {
+        return admin_refund_api_unsuccessful_text(telegram_payment_charge_id, "");
+    }
+    format!("❌ Ошибка при возврате средств для транзакции {telegram_payment_charge_id}: {error}")
+}
+
+fn admin_refund_api_unsuccessful_text(telegram_payment_charge_id: &str, response: &str) -> String {
+    format!(
+        "❌ Telegram API сообщил, что возврат для транзакции {telegram_payment_charge_id} не был успешен. Ответ: {response}"
+    )
+}
+
+fn admin_refund_success_text(
+    telegram_payment_charge_id: &str,
+    user_id: i64,
+    amount_stars: i64,
+) -> String {
+    format!(
+        "✅ Возврат средств для транзакции {telegram_payment_charge_id} (пользователь ID {user_id}, сумма {amount_stars} звезд) успешно выполнен."
+    )
+}
+
+fn admin_refund_notice_text(telegram_payment_charge_id: &str, amount_stars: i64) -> String {
+    format!(
+        "💸 Вам был возвращен платеж в размере {amount_stars} звезд по транзакции {telegram_payment_charge_id}."
+    )
+}
+
+async fn send_admin_refund_text<Effects>(
+    effects: &Effects,
+    command: &AdminRefundCommand<'_>,
+    text: &str,
+) where
+    Effects: AdminRefundEffects + Sync,
+{
+    let _ = effects
+        .send_admin_refund_text(PaymentTextMessage {
+            chat_id: command.chat_id,
+            reply_to_message_id: command.message_id,
+            text,
+            parse_mode: "",
+        })
+        .await;
+}
+
 fn payment_control_data_from_message(
     message: &TelegramMessage,
     kind: ControlKind,
@@ -3940,7 +5987,6 @@ fn user_full_name(user: &TelegramUser) -> String {
     .to_owned()
 }
 
-/// Execute the payment-owned subset of Go taskman control jobs.
 pub async fn execute_payment_control_job_at<Store, Effects>(
     store: &Store,
     effects: &Effects,
@@ -3986,7 +6032,6 @@ where
     }
 }
 
-/// Go taskman control queue poll interval used by the payment-owned worker loop.
 pub const PAYMENT_CONTROL_JOB_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Process one payment-owned taskman control job, if available.
@@ -4110,7 +6155,9 @@ async fn mark_payment_control_job_failed<Queue>(
     }
 }
 
-fn payment_control_job_failure_message(report: &PaymentControlJobReport) -> Option<String> {
+pub(crate) fn payment_control_job_failure_message(
+    report: &PaymentControlJobReport,
+) -> Option<String> {
     match &report.outcome {
         PaymentControlJobOutcome::VipInvoice(
             InvoiceControlJobOutcome::InvoiceLinkRequestError
@@ -4202,7 +6249,6 @@ fn user_state_from_control_job(params: &ControlJobParams) -> UserState {
     )
 }
 
-/// Extract Go successful-payment message context from a decoded Telegram update.
 #[must_use]
 pub fn successful_payment_message_from_update(
     update: &TelegramUpdate,
@@ -4249,7 +6295,6 @@ fn successful_payment_from_telegram(payment: &TelegramSuccessfulPayment) -> Succ
     }
 }
 
-/// Extract Go pre-checkout query ID from a decoded Telegram update.
 #[must_use]
 pub fn pre_checkout_query_id_from_update(update: &TelegramUpdate) -> Option<&str> {
     let TelegramUpdateType::PreCheckoutQuery(query) = &update.update_type else {
@@ -4278,18 +6323,31 @@ where
         return Ok(PreCheckoutUpdateRoute::Delegated);
     };
 
+    tracing::info!(pre_checkout_query_id, "pre-checkout answer requested");
     match effects
         .answer_pre_checkout_query(pre_checkout_query_id)
         .await
     {
-        Ok(()) => Ok(PreCheckoutUpdateRoute::Processed(
-            PreCheckoutOutcome::Acknowledged,
-        )),
+        Ok(()) => {
+            tracing::info!(
+                pre_checkout_query_id,
+                answer_failed = false,
+                "pre-checkout answer completed"
+            );
+            Ok(PreCheckoutUpdateRoute::Processed(
+                PreCheckoutOutcome::Acknowledged,
+            ))
+        }
         Err(error) => {
             tracing::warn!(
                 %error,
                 pre_checkout_query_id,
                 "failed to answer pre-checkout query"
+            );
+            tracing::info!(
+                pre_checkout_query_id,
+                answer_failed = true,
+                "pre-checkout answer completed"
             );
             Ok(PreCheckoutUpdateRoute::Processed(
                 PreCheckoutOutcome::AcknowledgementError,
@@ -4580,7 +6638,6 @@ fn subscription_payment_reason(telegram_payment_charge_id: &str) -> String {
         .to_owned()
 }
 
-/// Go `subscriptionSuccessText`.
 #[must_use]
 pub fn subscription_success_text(expires_at: OffsetDateTime) -> String {
     format!(
@@ -4589,7 +6646,6 @@ pub fn subscription_success_text(expires_at: OffsetDateTime) -> String {
     )
 }
 
-/// Go donation thank-you text from `processDonationPayment`.
 #[must_use]
 pub fn donation_success_text(amount_stars: i64) -> String {
     format!(
@@ -4599,7 +6655,6 @@ pub fn donation_success_text(amount_stars: i64) -> String {
     )
 }
 
-/// Go VIP invoice button message text.
 #[must_use]
 pub fn subscription_invoice_message_text() -> String {
     format!(
@@ -4667,6 +6722,8 @@ const SUBSCRIPTION_INVOICE_CREATE_ERROR_TEXT: &str =
 const DONATION_INVOICE_CREATE_ERROR_TEXT: &str =
     "❌ Не удалось создать счет для доната. Пожалуйста, попробуйте позже.";
 const SUBSCRIPTION_INVOICE_BUTTON_TEXT: &str = "💎 Оформить VIP подписку";
+const ADMIN_COMMAND_UNAUTHORIZED_TEXT: &str = "❌ У вас нет прав на выполнение этой команды.";
+const ADMIN_COMMAND_UNAUTHORIZED_DELETE_AFTER: Duration = Duration::from_secs(60);
 const VIP_BENEFITS_TEXT: &str = "⚡ Приоритетное выполнение запросов вне очереди\n\
                                 🔄 Вдвое больше рисунков за то же время\n\
                                 🖼️ Изображения лучшего качества с меньшей цензурой\n\
@@ -4682,6 +6739,7 @@ const VIP_BENEFITS_EXTENDED: &str = "⚡ Приоритетное выполне
 mod tests {
     use std::{
         collections::VecDeque,
+        env,
         error::Error,
         fmt,
         future::Future,
@@ -4689,9 +6747,25 @@ mod tests {
         pin::Pin,
         sync::atomic::{AtomicU64, Ordering},
         sync::{Arc, Mutex, MutexGuard},
+        time::{Duration as StdDuration, SystemTime, UNIX_EPOCH},
     };
 
-    use crate::updates::{UpdateHandler, UpdateHandlerFuture};
+    use crate::{
+        callbacks::{
+            CallbackQueryEffects, CallbackQueryFuture, CallbackQueryUpdateRoute,
+            CallbackRateLimitFuture, CallbackRateLimitPolicy, handle_callback_query_update_or_else,
+        },
+        control_jobs::{
+            ControlJobExecution, ControlJobExecutionResult, ControlJobExecutorFuture,
+            ControlJobExecutorRegistry, process_control_job_once_at,
+        },
+        help::{HelpBotIdentity, HelpCommandUpdateHandler, HelpDispatcherEffects},
+        updates::{
+            TelegramFileMetadataStoreFuture, UpdateHandler, UpdateHandlerFuture, UpdateStateStore,
+            UpdateStateStoreFuture, process_update_with_state_store_at,
+        },
+        virtual_messages::VirtualIdFactory,
+    };
     use carapax::types::Update as TelegramUpdate;
     use openplotva_core::{
         UserState, VIP_EVENT_TYPE_ADMIN_ADJUSTMENT, VIP_EVENT_TYPE_ADMIN_REVOKE,
@@ -4706,31 +6780,37 @@ mod tests {
         CONTROL_QUEUE_NAME, ControlJobData, ControlJobParams, ControlKind, ControlPayment,
         DEFAULT_PRIORITY, HIGH_PRIORITY, JobPayload, JobType, StatelessJobItem, new_control_job_at,
     };
+    use openplotva_updates::{UpdateConsumerConfig, UpdateStageOutcome};
     use serde_json::json;
     use time::OffsetDateTime;
 
     use super::{
-        InvoiceButtonMessage, InvoiceControlJobOutcome, PaymentControlJobOutcome,
+        AdminVipCommandUpdateHandler, AdminVipCommandUpdateOutcome, AdminVipCommandUpdateRuntime,
+        InMemoryPaymentControlJobQueue, InMemoryPaymentControlJobStatus, InvoiceButtonMessage,
+        InvoiceControlJobOutcome, InvoiceControlJobReport, PaymentControlJobOutcome,
         PaymentControlJobQueue, PaymentControlJobQueueFuture, PaymentControlJobReport,
         PaymentControlJobWorkItem, PaymentControlJobWorkerFuture, PaymentControlJobWorkerQueue,
         PaymentEffectsFuture, PaymentInvoiceCommandUpdateRoute, PaymentInvoiceControlJobBuild,
-        PaymentInvoiceEffects, PaymentInvoiceLinkFuture, PaymentRuntimeEffects, PaymentStoreFuture,
-        PaymentTextMessage, PaymentUpdateHandler, PaymentUpdateRoute, PreCheckoutOutcome,
-        PreCheckoutPaymentEffects, PreCheckoutUpdateRoute, SuccessfulPayment,
-        SuccessfulPaymentControlJobUpdateRoute, SuccessfulPaymentDispatcherEffects,
-        SuccessfulPaymentEffects, SuccessfulPaymentMessage, SuccessfulPaymentOutcome,
-        SuccessfulPaymentStore, SuccessfulPaymentUpdateRoute,
-        encode_payment_control_job_queue_snapshot,
+        PaymentInvoiceEffects, PaymentInvoiceLinkFuture, PaymentRedirectMessage,
+        PaymentRuntimeEffects, PaymentStoreFuture, PaymentTextMessage, PaymentUpdateHandler,
+        PaymentUpdateRoute, PreCheckoutOutcome, PreCheckoutPaymentEffects, PreCheckoutUpdateRoute,
+        SuccessfulPayment, SuccessfulPaymentControlJobUpdateRoute,
+        SuccessfulPaymentDispatcherEffects, SuccessfulPaymentEffects, SuccessfulPaymentMessage,
+        SuccessfulPaymentOutcome, SuccessfulPaymentStore, SuccessfulPaymentUpdateRoute,
+        VipCancellationCallbackOutcome, VipCancellationEffectFuture, VipCancellationEffects,
+        VipCancellationStore, encode_payment_control_job_queue_snapshot,
         enqueue_payment_invoice_command_update_or_else_at,
         enqueue_payment_invoice_command_update_with_vip_status_or_else_at,
         enqueue_successful_payment_update_or_else_at, execute_donate_invoice_control_job,
         execute_payment_control_job_at, execute_vip_invoice_control_job,
-        handle_payment_update_or_else_at, handle_pre_checkout_update_or_else,
-        handle_successful_payment_update_or_else_at, invoice_button_send_message_method,
-        payment_invoice_control_job_from_update_at, process_payment_control_job_once_at,
-        process_successful_payment_at, subscription_invoice_message_text,
-        subscription_success_text, successful_payment_control_job_from_update_at,
-        successful_payment_message_from_control_job, successful_payment_message_from_update,
+        handle_admin_vip_command_update_or_else_at, handle_payment_update_or_else_at,
+        handle_pre_checkout_update_or_else, handle_successful_payment_update_or_else_at,
+        handle_vip_cancellation_callback_update_or_else_at, invoice_button_send_message_method,
+        payment_control_job_failure_message, payment_invoice_control_job_from_update_at,
+        process_payment_control_job_once_at, process_successful_payment_at,
+        subscription_invoice_message_text, subscription_success_text,
+        successful_payment_control_job_from_update_at, successful_payment_message_from_control_job,
+        successful_payment_message_from_update,
     };
 
     #[tokio::test]
@@ -6049,6 +8129,374 @@ mod tests {
     }
 
     #[test]
+    fn admin_refund_helpers_match_go_texts_and_targets() {
+        let mut subscription =
+            active_subscription(OffsetDateTime::UNIX_EPOCH, OffsetDateTime::UNIX_EPOCH);
+        subscription.user_id = 1_717_359_759;
+        let target =
+            super::admin_refund_subscription_target(subscription).expect("subscription target");
+        assert_eq!(target.user_id(), 1_717_359_759);
+        assert_eq!(target.amount_stars(), 1);
+
+        let zero_subscription = SubscriptionRecord {
+            id: 0,
+            user_id: 42,
+            telegram_payment_charge_id: "charge-zero".to_owned(),
+            provider_payment_charge_id: String::new(),
+            expires_at: OffsetDateTime::UNIX_EPOCH,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: OffsetDateTime::UNIX_EPOCH,
+            canceled_at: None,
+            refunded_at: None,
+        };
+        assert!(super::admin_refund_subscription_target(zero_subscription).is_none());
+
+        let donation = DonationRecord {
+            id: 20,
+            user_id: 42,
+            telegram_payment_charge_id: "charge-donation".to_owned(),
+            provider_payment_charge_id: String::new(),
+            amount_stars: 123,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        let donation_target =
+            super::admin_refund_donation_target(donation).expect("donation target");
+        assert_eq!(donation_target.user_id(), 42);
+        assert_eq!(donation_target.amount_stars(), 123);
+        assert!(donation_target.is_valid());
+
+        assert_eq!(
+            super::first_admin_refund_charge_id("  charge-1 tail"),
+            Some("charge-1")
+        );
+        assert_eq!(
+            super::admin_refund_success_text("charge-1", 42, 300),
+            "✅ Возврат средств для транзакции charge-1 (пользователь ID 42, сумма 300 звезд) успешно выполнен."
+        );
+        assert_eq!(
+            super::admin_refund_notice_text("charge-1", 300),
+            "💸 Вам был возвращен платеж в размере 300 звезд по транзакции charge-1."
+        );
+        assert!(
+            super::admin_refund_synthetic_subscription_text("charge-1")
+                .contains("legacy admin grant")
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_refund_command_refunds_subscription_and_records_reversal()
+    -> Result<(), Box<dyn Error>> {
+        let now = time::Date::from_calendar_date(2026, time::Month::May, 20)?
+            .with_hms(12, 0, 0)?
+            .assume_utc();
+        let expires_at = now + time::Duration::days(30);
+        let mut subscription = active_subscription(now, expires_at);
+        subscription.user_id = 1_717_359_759;
+        subscription.telegram_payment_charge_id = "charge-sub".to_owned();
+        let store = StoreStub::new()
+            .with_admin_refund_subscription(Some(subscription.clone()))
+            .with_next_vip_event(VipEventRecord {
+                id: 95,
+                user_id: subscription.user_id,
+                event_type: VIP_EVENT_TYPE_REFUND_REVERSAL.to_owned(),
+                delta_seconds: -subscription_delta_seconds(
+                    &subscription.telegram_payment_charge_id,
+                    subscription.created_at,
+                    subscription.expires_at,
+                    openplotva_telegram::SUBSCRIPTION_DURATION_DAYS,
+                ),
+                effective_expires_at: now,
+                subscription_id: Some(subscription.id),
+                actor_user_id: Some(7),
+                reason: "admin refund charge-sub".to_owned(),
+                created_at: now,
+            });
+        let effects = EffectsStub::default();
+
+        let report = super::handle_admin_refund_command_at(
+            &store,
+            &effects,
+            super::AdminRefundCommand {
+                chat_id: 900,
+                message_id: 101,
+                actor_user_id: 7,
+                arguments: "charge-sub",
+                telegram_payment_charge_id: "charge-sub",
+            },
+        )
+        .await;
+
+        assert_eq!(
+            report.outcome,
+            super::AdminRefundCommandOutcome::RefundedSubscription
+        );
+        assert_eq!(report.target_user_id, Some(1_717_359_759));
+        assert_eq!(report.amount_stars, Some(1));
+        assert_eq!(
+            effects.refund_requests(),
+            vec![(1_717_359_759, "charge-sub".to_owned())]
+        );
+        assert_eq!(store.refunded_subscription_ids(), vec![10]);
+        assert_eq!(
+            store.vip_events(),
+            vec![VipEventCreate {
+                user_id: 1_717_359_759,
+                event_type: VIP_EVENT_TYPE_REFUND_REVERSAL,
+                delta_seconds: -subscription_delta_seconds(
+                    &subscription.telegram_payment_charge_id,
+                    subscription.created_at,
+                    subscription.expires_at,
+                    openplotva_telegram::SUBSCRIPTION_DURATION_DAYS,
+                ),
+                subscription_id: Some(10),
+                actor_user_id: Some(7),
+                reason: Some("admin refund charge-sub"),
+            }]
+        );
+        assert_eq!(effects.invalidated_vip_users(), vec![1_717_359_759]);
+        assert_eq!(
+            effects.direct_texts(),
+            vec![(
+                1_717_359_759,
+                "💸 Вам был возвращен платеж в размере 1 звезд по транзакции charge-sub."
+                    .to_owned()
+            )]
+        );
+        assert_eq!(effects.sent_payment_texts().len(), 1);
+        assert!(
+            effects.sent_payment_texts()[0]
+                .text
+                .contains("сумма 1 звезд")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_refund_command_refunds_donation_and_deletes_row_best_effort()
+    -> Result<(), Box<dyn Error>> {
+        let donation = DonationRecord {
+            id: 20,
+            user_id: 42,
+            telegram_payment_charge_id: "charge-donation".to_owned(),
+            provider_payment_charge_id: String::new(),
+            amount_stars: 123,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        let store = StoreStub::new()
+            .with_admin_refund_subscription(None)
+            .with_admin_refund_donation(Some(donation))
+            .with_delete_donation_error(StubError::Request);
+        let effects = EffectsStub::default();
+
+        let report = super::handle_admin_refund_command_at(
+            &store,
+            &effects,
+            super::AdminRefundCommand {
+                chat_id: 900,
+                message_id: 101,
+                actor_user_id: 7,
+                arguments: "charge-donation",
+                telegram_payment_charge_id: "charge-donation",
+            },
+        )
+        .await;
+
+        assert_eq!(
+            report.outcome,
+            super::AdminRefundCommandOutcome::RefundedDonation
+        );
+        assert_eq!(
+            effects.refund_requests(),
+            vec![(42, "charge-donation".to_owned())]
+        );
+        assert_eq!(store.deleted_donation_ids(), vec![20]);
+        assert!(store.vip_events().is_empty());
+        assert!(effects.invalidated_vip_users().is_empty());
+        assert_eq!(
+            effects.direct_texts(),
+            vec![(
+                42,
+                "💸 Вам был возвращен платеж в размере 123 звезд по транзакции charge-donation."
+                    .to_owned()
+            )]
+        );
+        assert!(
+            effects.sent_payment_texts()[0]
+                .text
+                .contains("сумма 123 звезд")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_refund_command_reports_lookup_errors_and_not_found() {
+        let effects = EffectsStub::default();
+        let subscription_error =
+            StoreStub::new().with_admin_refund_subscription_error(StubError::Request);
+        let report = super::handle_admin_refund_command_at(
+            &subscription_error,
+            &effects,
+            super::AdminRefundCommand {
+                chat_id: 900,
+                message_id: 101,
+                actor_user_id: 7,
+                arguments: "charge-sub",
+                telegram_payment_charge_id: "charge-sub",
+            },
+        )
+        .await;
+        assert_eq!(
+            report.outcome,
+            super::AdminRefundCommandOutcome::SubscriptionLookupError
+        );
+
+        let effects = EffectsStub::default();
+        let donation_error = StoreStub::new()
+            .with_admin_refund_subscription(None)
+            .with_admin_refund_donation_error(StubError::Request);
+        let report = super::handle_admin_refund_command_at(
+            &donation_error,
+            &effects,
+            super::AdminRefundCommand {
+                chat_id: 900,
+                message_id: 101,
+                actor_user_id: 7,
+                arguments: "charge-donation",
+                telegram_payment_charge_id: "charge-donation",
+            },
+        )
+        .await;
+        assert_eq!(
+            report.outcome,
+            super::AdminRefundCommandOutcome::DonationLookupError
+        );
+
+        let effects = EffectsStub::default();
+        let not_found = StoreStub::new()
+            .with_admin_refund_subscription(None)
+            .with_admin_refund_donation(None);
+        let report = super::handle_admin_refund_command_at(
+            &not_found,
+            &effects,
+            super::AdminRefundCommand {
+                chat_id: 900,
+                message_id: 101,
+                actor_user_id: 7,
+                arguments: "missing-charge",
+                telegram_payment_charge_id: "missing-charge",
+            },
+        )
+        .await;
+        assert_eq!(report.outcome, super::AdminRefundCommandOutcome::NotFound);
+        assert_eq!(
+            effects.sent_texts(),
+            vec!["🤷 Транзакция с ID missing-charge не найдена (ни подписка, ни донат)."]
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_refund_command_rejects_synthetic_subscription_before_api()
+    -> Result<(), Box<dyn Error>> {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let mut subscription = active_subscription(now, now + time::Duration::days(1));
+        subscription.telegram_payment_charge_id = "admin_grant_42".to_owned();
+        let store = StoreStub::new().with_admin_refund_subscription(Some(subscription));
+        let effects = EffectsStub::default();
+
+        let report = super::handle_admin_refund_command_at(
+            &store,
+            &effects,
+            super::AdminRefundCommand {
+                chat_id: 900,
+                message_id: 101,
+                actor_user_id: 7,
+                arguments: "admin_grant_42",
+                telegram_payment_charge_id: "admin_grant_42",
+            },
+        )
+        .await;
+
+        assert_eq!(
+            report.outcome,
+            super::AdminRefundCommandOutcome::SyntheticSubscription
+        );
+        assert!(effects.refund_requests().is_empty());
+        assert!(store.refunded_subscription_ids().is_empty());
+        assert!(store.vip_events().is_empty());
+        assert!(effects.sent_texts()[0].contains("legacy admin grant"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_refund_update_missing_charge_queues_go_ephemeral_usage()
+    -> Result<(), Box<dyn Error>> {
+        let virtual_store = VirtualMessageStoreStub::default();
+        let dispatcher = openplotva_telegram::DispatcherQueue::new(
+            openplotva_telegram::DispatcherConfig::default(),
+        );
+        let store = StoreStub::new();
+        let effects = EffectsStub::default();
+        let next = UpdateHandlerStub::default();
+        let admin_ids = [42];
+        let next_id = Arc::new(AtomicU64::new(1));
+        let next_virtual_id: VirtualIdFactory = {
+            let next_id = Arc::clone(&next_id);
+            Arc::new(move || {
+                format!(
+                    "admin-refund-vmsg-{}",
+                    next_id.fetch_add(1, Ordering::Relaxed)
+                )
+            })
+        };
+
+        let outcome = handle_admin_vip_command_update_or_else_at(
+            AdminVipCommandUpdateRuntime {
+                store: &virtual_store,
+                queue: &dispatcher,
+                vip: &store,
+                effects: &effects,
+                admin_ids: &admin_ids,
+                bot_username: "PlotvaBot",
+                next_virtual_id: &next_virtual_id,
+                now: OffsetDateTime::UNIX_EPOCH,
+            },
+            sample_payment_command_update("/admin_refund")?,
+            |update| next.handle_update(update),
+        )
+        .await?;
+
+        assert!(matches!(
+            outcome,
+            AdminVipCommandUpdateOutcome::Refund(report)
+                if report.outcome == super::AdminRefundCommandOutcome::MissingChargeId
+        ));
+        assert!(next.calls().is_empty());
+        assert!(effects.sent_texts().is_empty());
+        assert_eq!(
+            virtual_store.inserted(),
+            vec![("admin-refund-vmsg-1".to_owned(), 42, Some(77))]
+        );
+        let item = dispatcher
+            .dequeue_immediate()
+            .expect("queued admin refund usage");
+        assert_eq!(
+            item.ephemeral_delete_after(),
+            Some(std::time::Duration::from_secs(60))
+        );
+        let method = match item.into_method().expect("admin refund usage method") {
+            openplotva_telegram::TelegramOutboundMethod::SendMessage(method) => method,
+            other => panic!("unexpected admin refund usage method: {other:?}"),
+        };
+        let payload = serde_json::to_value(method)?;
+        assert_eq!(
+            payload["text"],
+            json!(super::ADMIN_REFUND_MISSING_ARGUMENT_TEXT)
+        );
+        assert_eq!(payload["reply_parameters"]["message_id"], json!(100));
+        Ok(())
+    }
+
+    #[test]
     fn donation_invoice_command_rejects_go_invalid_amounts() -> Result<(), Box<dyn Error>> {
         let created = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
 
@@ -6243,6 +8691,448 @@ mod tests {
         assert_eq!(queue.assigned().len(), 1);
         assert_eq!(queue.assigned()[0].1.title, "vip invoice");
         assert_eq!(store.calls(), vec!["is_vip_at"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancel_vip_callback_edits_confirmation_and_acks() -> Result<(), Box<dyn Error>> {
+        let now = time::Date::from_calendar_date(2026, time::Month::June, 16)?
+            .with_hms(9, 30, 0)?
+            .assume_utc();
+        let store = VipStatusStoreStub::new();
+        let effects = EffectsStub::default();
+
+        let outcome = handle_vip_cancellation_callback_update_or_else_at(
+            &store,
+            &effects,
+            sample_vip_callback_update("cancel_vip", 42)?,
+            now,
+            |_update| async { Ok::<(), std::io::Error>(()) },
+        )
+        .await?;
+
+        assert_eq!(outcome, VipCancellationCallbackOutcome::ConfirmationShown);
+        let methods = effects.vip_callback_methods();
+        assert_eq!(
+            method_names(&methods),
+            vec!["editMessageText", "answerCallbackQuery"]
+        );
+        assert_eq!(
+            methods[0].1["text"],
+            json!("Вы уверены, что хотите отменить вашу VIP подписку? 😢")
+        );
+        assert_eq!(methods[0].1["parse_mode"], json!("HTML"));
+        assert_eq!(
+            methods[0].1["reply_markup"]["inline_keyboard"][0][0]["callback_data"],
+            json!("{\"action\":\"confirm_cancel_vip\"}")
+        );
+        assert_eq!(
+            methods[0].1["reply_markup"]["inline_keyboard"][0][1]["callback_data"],
+            json!("{\"action\":\"back_to_vip_status\"}")
+        );
+        assert!(methods[1].1.get("text").is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_redis_decoded_cancel_vip_callback_delegates_and_edits_confirmation_when_url_is_set()
+    -> Result<(), Box<dyn Error>> {
+        let Ok(redis_url) = env::var("OPENPLOTVA_TEST_REDIS_URL") else {
+            return Ok(());
+        };
+        let redis_client = redis::Client::open(redis_url)?;
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let key = format!("openplotva:test:decoded-cancel-vip-callback:{suffix}");
+        let update_queue =
+            openplotva_updates::RedisUpdateQueue::with_key(redis_client.clone(), key.clone());
+        let mut redis = redis_client.get_multiplexed_async_connection().await?;
+        let _: i64 = redis::cmd("DEL").arg(&key).query_async(&mut redis).await?;
+
+        update_queue
+            .enqueue_update(&sample_vip_callback_update("cancel_vip", 42)?)
+            .await?;
+        assert_eq!(update_queue.len().await?, 1);
+        let decoded = update_queue
+            .dequeue_update(StdDuration::from_secs(1))
+            .await?
+            .ok_or_else(|| io::Error::other("expected decoded VIP callback update"))?;
+
+        let state_store = UpdateStateStoreStub::default();
+        let callback_effects = CallbackAckEffectsStub::default();
+        let rate_limit = CallbackRateLimitStub::default();
+        let store = VipStatusStoreStub::new();
+        let effects = EffectsStub::default();
+        let next = UpdateHandlerStub::default();
+        let prehandler_route = Arc::new(Mutex::new(None));
+        let captured_route = Arc::clone(&prehandler_route);
+        let vip_outcome = Arc::new(Mutex::new(None));
+        let captured_outcome = Arc::clone(&vip_outcome);
+        let now = time::Date::from_calendar_date(2026, time::Month::June, 16)?
+            .with_hms(9, 30, 0)?
+            .assume_utc();
+
+        let report = process_update_with_state_store_at(
+            decoded,
+            UpdateConsumerConfig {
+                dequeue_timeout: StdDuration::from_millis(1),
+                state_timeout: StdDuration::from_secs(1),
+                handle_timeout: StdDuration::from_secs(1),
+                side_effect_max_age: StdDuration::from_secs(60),
+                worker_limit: 1,
+            },
+            UNIX_EPOCH + StdDuration::from_secs(1_710_000_000),
+            &state_store,
+            |update| async {
+                let route = handle_callback_query_update_or_else(
+                    &callback_effects,
+                    &rate_limit,
+                    update,
+                    |update| async {
+                        let outcome = handle_vip_cancellation_callback_update_or_else_at(
+                            &store,
+                            &effects,
+                            update,
+                            now,
+                            |update| next.handle_update(update),
+                        )
+                        .await
+                        .map_err(|error| io::Error::other(error.to_string()))?;
+                        *captured_outcome.lock().expect("VIP outcome") = Some(outcome);
+                        Ok::<(), io::Error>(())
+                    },
+                )
+                .await
+                .map_err(|error| io::Error::other(error.to_string()))?;
+                *captured_route.lock().expect("callback route") = Some(route);
+                Ok::<(), io::Error>(())
+            },
+        )
+        .await;
+
+        assert_eq!(report.update_id, 1001);
+        assert_eq!(report.update_name, "callback_query");
+        assert_eq!(report.state.outcome, UpdateStageOutcome::Completed);
+        assert_eq!(
+            report.handle.as_ref().map(|stage| &stage.outcome),
+            Some(&UpdateStageOutcome::Completed)
+        );
+        assert_eq!(
+            state_store.calls(),
+            vec![
+                "chat:42:private:Alice:alice".to_owned(),
+                "user:42:Alice:alice".to_owned()
+            ]
+        );
+        assert_eq!(
+            *prehandler_route.lock().expect("callback route"),
+            Some(CallbackQueryUpdateRoute::HandlerDelegated {
+                handler: openplotva_telegram::CallbackHandlerKind::CancelVip,
+                action: "cancel_vip".to_owned(),
+            })
+        );
+        assert_eq!(
+            *vip_outcome.lock().expect("VIP outcome"),
+            Some(VipCancellationCallbackOutcome::ConfirmationShown)
+        );
+        assert!(callback_effects.methods().is_empty());
+        assert_eq!(next.calls(), Vec::<i64>::new());
+
+        let methods = effects.vip_callback_methods();
+        assert_eq!(
+            method_names(&methods),
+            vec!["editMessageText", "answerCallbackQuery"]
+        );
+        assert_eq!(methods[0].1["chat_id"], json!(42));
+        assert_eq!(methods[0].1["message_id"], json!(555));
+        assert_eq!(
+            methods[0].1["text"],
+            json!("Вы уверены, что хотите отменить вашу VIP подписку? 😢")
+        );
+        assert_eq!(
+            methods[0].1["reply_markup"]["inline_keyboard"][0][0]["callback_data"],
+            json!("{\"action\":\"confirm_cancel_vip\"}")
+        );
+        assert_eq!(methods[1].1["callback_query_id"], json!("vip-callback-id"));
+        assert!(methods[1].1.get("text").is_none());
+        assert_eq!(update_queue.len().await?, 0);
+
+        let _: i64 = redis::cmd("DEL").arg(&key).query_async(&mut redis).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_redis_decoded_back_to_vip_status_callback_restores_status_when_url_is_set()
+    -> Result<(), Box<dyn Error>> {
+        let Ok(redis_url) = env::var("OPENPLOTVA_TEST_REDIS_URL") else {
+            return Ok(());
+        };
+        let redis_client = redis::Client::open(redis_url.as_str())?;
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let key = format!("openplotva:test:decoded-back-vip-callback:{suffix}");
+        let update_queue =
+            openplotva_updates::RedisUpdateQueue::with_key(redis_client.clone(), key.clone());
+        let mut redis = redis_client.get_multiplexed_async_connection().await?;
+        let _: i64 = redis::cmd("DEL").arg(&key).query_async(&mut redis).await?;
+
+        update_queue
+            .enqueue_update(&sample_vip_callback_update("back_to_vip_status", 42)?)
+            .await?;
+        assert_eq!(update_queue.len().await?, 1);
+        let decoded = update_queue
+            .dequeue_update(StdDuration::from_secs(1))
+            .await?
+            .ok_or_else(|| io::Error::other("expected decoded VIP back callback update"))?;
+
+        let now = time::Date::from_calendar_date(2026, time::Month::June, 16)?
+            .with_hms(9, 30, 0)?
+            .assume_utc();
+        let state_store = UpdateStateStoreStub::default();
+        let callback_effects = CallbackAckEffectsStub::default();
+        let rate_limit = CallbackRateLimitStub::default();
+        let store = VipStatusStoreStub::new()
+            .with_summary(active_vip_summary(now, now + time::Duration::days(3)))
+            .with_active_subscription(active_subscription(now, now + time::Duration::days(3)));
+        let effects = EffectsStub::default();
+        let next = UpdateHandlerStub::default();
+        let prehandler_route = Arc::new(Mutex::new(None));
+        let captured_route = Arc::clone(&prehandler_route);
+        let vip_outcome = Arc::new(Mutex::new(None));
+        let captured_outcome = Arc::clone(&vip_outcome);
+
+        let report = process_update_with_state_store_at(
+            decoded,
+            UpdateConsumerConfig {
+                dequeue_timeout: StdDuration::from_millis(1),
+                state_timeout: StdDuration::from_secs(1),
+                handle_timeout: StdDuration::from_secs(1),
+                side_effect_max_age: StdDuration::from_secs(60),
+                worker_limit: 1,
+            },
+            UNIX_EPOCH + StdDuration::from_secs(1_710_000_000),
+            &state_store,
+            |update| async {
+                let route = handle_callback_query_update_or_else(
+                    &callback_effects,
+                    &rate_limit,
+                    update,
+                    |update| async {
+                        let outcome = handle_vip_cancellation_callback_update_or_else_at(
+                            &store,
+                            &effects,
+                            update,
+                            now,
+                            |update| next.handle_update(update),
+                        )
+                        .await
+                        .map_err(|error| io::Error::other(error.to_string()))?;
+                        *captured_outcome.lock().expect("VIP outcome") = Some(outcome);
+                        Ok::<(), io::Error>(())
+                    },
+                )
+                .await
+                .map_err(|error| io::Error::other(error.to_string()))?;
+                *captured_route.lock().expect("callback route") = Some(route);
+                Ok::<(), io::Error>(())
+            },
+        )
+        .await;
+
+        assert_eq!(report.update_id, 1001);
+        assert_eq!(report.update_name, "callback_query");
+        assert_eq!(report.state.outcome, UpdateStageOutcome::Completed);
+        assert_eq!(
+            report.handle.as_ref().map(|stage| &stage.outcome),
+            Some(&UpdateStageOutcome::Completed)
+        );
+        assert_eq!(
+            state_store.calls(),
+            vec![
+                "chat:42:private:Alice:alice".to_owned(),
+                "user:42:Alice:alice".to_owned()
+            ]
+        );
+        assert_eq!(
+            *prehandler_route.lock().expect("callback route"),
+            Some(CallbackQueryUpdateRoute::HandlerDelegated {
+                handler: openplotva_telegram::CallbackHandlerKind::BackToVipStatus,
+                action: "back_to_vip_status".to_owned(),
+            })
+        );
+        assert_eq!(
+            *vip_outcome.lock().expect("VIP outcome"),
+            Some(VipCancellationCallbackOutcome::BackStatusShown)
+        );
+        assert!(callback_effects.methods().is_empty());
+        assert_eq!(next.calls(), Vec::<i64>::new());
+
+        let methods = effects.vip_callback_methods();
+        assert_eq!(
+            method_names(&methods),
+            vec!["editMessageText", "answerCallbackQuery"]
+        );
+        assert_eq!(methods[0].1["chat_id"], json!(42));
+        assert_eq!(methods[0].1["message_id"], json!(555));
+        assert!(
+            methods[0].1["text"]
+                .as_str()
+                .expect("status text")
+                .contains("У вас уже есть активный VIP статус")
+        );
+        assert_eq!(
+            methods[0].1["reply_markup"]["inline_keyboard"][0][0]["callback_data"],
+            json!("{\"action\":\"cancel_vip\"}")
+        );
+        assert_eq!(methods[1].1["callback_query_id"], json!("vip-callback-id"));
+        assert!(methods[1].1.get("text").is_none());
+        assert_eq!(update_queue.len().await?, 0);
+
+        let _: i64 = redis::cmd("DEL").arg(&key).query_async(&mut redis).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn confirm_cancel_vip_callback_cancels_marks_invalidates_edits_success_and_acks()
+    -> Result<(), Box<dyn Error>> {
+        let now = time::Date::from_calendar_date(2026, time::Month::June, 16)?
+            .with_hms(9, 30, 0)?
+            .assume_utc();
+        let expires_at = now + time::Duration::days(9);
+        let store = VipStatusStoreStub::new()
+            .with_summary(active_vip_summary(now, expires_at))
+            .with_active_subscription(active_subscription(now, expires_at));
+        let effects = EffectsStub::default();
+
+        let outcome = handle_vip_cancellation_callback_update_or_else_at(
+            &store,
+            &effects,
+            sample_vip_callback_update("confirm_cancel_vip", 42)?,
+            now,
+            |_update| async { Ok::<(), std::io::Error>(()) },
+        )
+        .await?;
+
+        assert_eq!(outcome, VipCancellationCallbackOutcome::Canceled);
+        assert_eq!(store.canceled_subscription_ids(), vec![10]);
+        assert_eq!(effects.invalidated_vip_users(), vec![42]);
+        let methods = effects.vip_callback_methods();
+        assert_eq!(
+            method_names(&methods),
+            vec![
+                "editUserStarSubscription",
+                "editMessageText",
+                "answerCallbackQuery"
+            ]
+        );
+        assert_eq!(methods[0].1["user_id"], json!(42));
+        assert_eq!(
+            methods[0].1["telegram_payment_charge_id"],
+            json!("telegram-charge")
+        );
+        assert_eq!(methods[0].1["is_canceled"], json!(true));
+        assert!(
+            methods[1].1["text"]
+                .as_str()
+                .expect("success text")
+                .contains(
+                    "Ваш VIP статус остаётся активным до <b>25.06.2026</b> (9 дней осталось)."
+                )
+        );
+        assert_eq!(methods[1].1["reply_markup"]["inline_keyboard"], json!([]));
+        assert_eq!(methods[2].1["text"], json!("Подписка отменена."));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn confirm_cancel_vip_callback_missing_subscription_sends_go_alert()
+    -> Result<(), Box<dyn Error>> {
+        let now = time::Date::from_calendar_date(2026, time::Month::June, 16)?
+            .with_hms(9, 30, 0)?
+            .assume_utc();
+        let store = VipStatusStoreStub::new();
+        let effects = EffectsStub::default();
+
+        let outcome = handle_vip_cancellation_callback_update_or_else_at(
+            &store,
+            &effects,
+            sample_vip_callback_update("confirm_cancel_vip", 42)?,
+            now,
+            |_update| async { Ok::<(), std::io::Error>(()) },
+        )
+        .await?;
+
+        assert_eq!(outcome, VipCancellationCallbackOutcome::MissingSubscription);
+        let methods = effects.vip_callback_methods();
+        assert_eq!(method_names(&methods), vec!["answerCallbackQuery"]);
+        assert_eq!(
+            methods[0].1["text"],
+            json!("Не удалось отменить подписку. Не найдена активная подписка.")
+        );
+        assert_eq!(methods[0].1["show_alert"], json!(true));
+        assert!(store.canceled_subscription_ids().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn back_to_vip_status_callback_restores_status_or_inactive_text()
+    -> Result<(), Box<dyn Error>> {
+        let now = time::Date::from_calendar_date(2026, time::Month::June, 16)?
+            .with_hms(9, 30, 0)?
+            .assume_utc();
+        let active_store = VipStatusStoreStub::new()
+            .with_summary(active_vip_summary(now, now + time::Duration::days(3)))
+            .with_active_subscription(active_subscription(now, now + time::Duration::days(3)));
+        let active_effects = EffectsStub::default();
+
+        let active_outcome = handle_vip_cancellation_callback_update_or_else_at(
+            &active_store,
+            &active_effects,
+            sample_vip_callback_update("back_to_vip_status", 42)?,
+            now,
+            |_update| async { Ok::<(), std::io::Error>(()) },
+        )
+        .await?;
+
+        assert_eq!(
+            active_outcome,
+            VipCancellationCallbackOutcome::BackStatusShown
+        );
+        let active_methods = active_effects.vip_callback_methods();
+        assert_eq!(
+            method_names(&active_methods),
+            vec!["editMessageText", "answerCallbackQuery"]
+        );
+        assert!(
+            active_methods[0].1["text"]
+                .as_str()
+                .expect("status text")
+                .contains("У вас уже есть активный VIP статус")
+        );
+        assert_eq!(
+            active_methods[0].1["reply_markup"]["inline_keyboard"][0][0]["callback_data"],
+            json!("{\"action\":\"cancel_vip\"}")
+        );
+
+        let inactive_store = VipStatusStoreStub::new();
+        let inactive_effects = EffectsStub::default();
+        let inactive_outcome = handle_vip_cancellation_callback_update_or_else_at(
+            &inactive_store,
+            &inactive_effects,
+            sample_vip_callback_update("back_to_vip_status", 42)?,
+            now,
+            |_update| async { Ok::<(), std::io::Error>(()) },
+        )
+        .await?;
+
+        assert_eq!(
+            inactive_outcome,
+            VipCancellationCallbackOutcome::BackInactive
+        );
+        let inactive_methods = inactive_effects.vip_callback_methods();
+        assert_eq!(
+            inactive_methods[0].1["text"],
+            json!("Ваша подписка больше не активна. Отправьте /vip, чтобы подписаться снова.")
+        );
+        assert!(inactive_methods[0].1.get("parse_mode").is_none());
         Ok(())
     }
 
@@ -6550,6 +9440,205 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn payment_update_handler_sends_group_redirects_only_for_targeted_payment_commands()
+    -> Result<(), Box<dyn Error>> {
+        let queue = Arc::new(PaymentControlJobQueueStub::default());
+        let store = Arc::new(VipStatusStoreStub::new().with_is_vip(false));
+        let effects = Arc::new(EffectsStub::default());
+        let next = Arc::new(UpdateHandlerStub::default());
+        let handler = PaymentUpdateHandler::new(
+            Arc::clone(&queue),
+            Arc::clone(&store),
+            Arc::clone(&effects),
+            Arc::clone(&next),
+        )
+        .with_bot_username("PlotvaBot");
+
+        handler
+            .handle_update(sample_group_payment_command_update("/vip@PlotvaBot")?)
+            .await?;
+        handler
+            .handle_update(sample_group_payment_command_update(
+                "/donate@PlotvaBot 777",
+            )?)
+            .await?;
+        handler
+            .handle_update(sample_group_payment_command_update("/donate 777")?)
+            .await?;
+        handler
+            .handle_update(sample_group_payment_command_update("/vip@OtherBot")?)
+            .await?;
+
+        assert_eq!(next.calls(), vec![999, 999]);
+        assert!(queue.assigned().is_empty());
+        let redirects = effects.payment_redirect_messages();
+        assert_eq!(redirects.len(), 2);
+        assert_eq!(redirects[0].chat_id, -10042);
+        assert_eq!(redirects[0].reply_to_message_id, 555);
+        assert_eq!(redirects[0].message_thread_id, Some(77));
+        assert_eq!(redirects[0].button_text, "💎 Оформить VIP подписку");
+        assert_eq!(redirects[0].url, "https://t.me/PlotvaBot?start=vip");
+        assert!(redirects[0].text.contains("VIP даёт вам:"));
+        assert_eq!(redirects[1].button_text, "💝 Сделать донат");
+        assert_eq!(redirects[1].url, "https://t.me/PlotvaBot?start=donate_777");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_vip_handler_rejects_unauthorized_command_with_go_ephemeral_text()
+    -> Result<(), Box<dyn Error>> {
+        let virtual_store = VirtualMessageStoreStub::default();
+        let dispatcher = Arc::new(openplotva_telegram::DispatcherQueue::new(
+            openplotva_telegram::DispatcherConfig::default(),
+        ));
+        let store = Arc::new(StoreStub::new());
+        let effects = Arc::new(EffectsStub::default());
+        let next = Arc::new(UpdateHandlerStub::default());
+        let next_id = Arc::new(AtomicU64::new(1));
+        let handler = AdminVipCommandUpdateHandler::new(
+            Arc::new(virtual_store.clone()),
+            Arc::clone(&dispatcher),
+            store,
+            effects.clone(),
+            vec![7],
+            "PlotvaBot",
+            Arc::clone(&next),
+        )
+        .with_virtual_id_factory({
+            let next_id = Arc::clone(&next_id);
+            Arc::new(move || format!("admin-vmsg-{}", next_id.fetch_add(1, Ordering::Relaxed)))
+        });
+
+        handler
+            .handle_update(sample_payment_command_update("/admin_grant_vip 1 99 test")?)
+            .await?;
+
+        assert!(next.calls().is_empty());
+        assert!(effects.sent_texts().is_empty());
+        assert_eq!(
+            virtual_store.inserted(),
+            vec![("admin-vmsg-1".to_owned(), 42, Some(77))]
+        );
+        let item = dispatcher.dequeue_immediate().expect("queued admin denial");
+        assert_eq!(
+            item.ephemeral_delete_after(),
+            Some(std::time::Duration::from_secs(60))
+        );
+        let method = match item.into_method().expect("admin denial method") {
+            openplotva_telegram::TelegramOutboundMethod::SendMessage(method) => method,
+            other => panic!("unexpected admin denial method: {other:?}"),
+        };
+        let payload = serde_json::to_value(method)?;
+        assert_eq!(
+            payload["text"],
+            json!("❌ У вас нет прав на выполнение этой команды.")
+        );
+        assert_eq!(payload["reply_parameters"]["message_id"], json!(100));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_grant_vip_update_executes_for_authorized_targeted_group_command()
+    -> Result<(), Box<dyn Error>> {
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let expires_at = now + time::Duration::days(7);
+        let store = StoreStub::new().with_next_vip_event(VipEventRecord {
+            id: 88,
+            user_id: 99,
+            event_type: VIP_EVENT_TYPE_ADMIN_ADJUSTMENT.to_owned(),
+            delta_seconds: vip_days_to_seconds(7),
+            effective_expires_at: expires_at,
+            subscription_id: None,
+            actor_user_id: Some(42),
+            reason: "manual test".to_owned(),
+            created_at: now,
+        });
+        let virtual_store = VirtualMessageStoreStub::default();
+        let dispatcher = openplotva_telegram::DispatcherQueue::new(
+            openplotva_telegram::DispatcherConfig::default(),
+        );
+        let effects = EffectsStub::default();
+        let next = UpdateHandlerStub::default();
+        let admin_ids = [42];
+
+        let next_virtual_id =
+            crate::virtual_messages::monotonic_virtual_id_factory("admin-test-vmsg");
+        let outcome = handle_admin_vip_command_update_or_else_at(
+            AdminVipCommandUpdateRuntime {
+                store: &virtual_store,
+                queue: &dispatcher,
+                vip: &store,
+                effects: &effects,
+                admin_ids: &admin_ids,
+                bot_username: "PlotvaBot",
+                next_virtual_id: &next_virtual_id,
+                now,
+            },
+            sample_group_payment_command_update("/admin_grant_vip@PlotvaBot 7 99 manual test")?,
+            |update| next.handle_update(update),
+        )
+        .await?;
+
+        assert!(matches!(
+            outcome,
+            AdminVipCommandUpdateOutcome::Grant(report)
+                if report.outcome == super::AdminGrantVipCommandOutcome::Granted
+                    && report.target_user_id == Some(99)
+                    && report.event_id == Some(88)
+        ));
+        assert!(next.calls().is_empty());
+        assert_eq!(
+            store.vip_events(),
+            vec![VipEventCreate {
+                user_id: 99,
+                event_type: VIP_EVENT_TYPE_ADMIN_ADJUSTMENT,
+                delta_seconds: vip_days_to_seconds(7),
+                subscription_id: None,
+                actor_user_id: Some(42),
+                reason: Some("manual test"),
+            }]
+        );
+        assert!(effects.sent_texts()[0].contains("VIP корректировка успешно записана"));
+        assert_eq!(effects.invalidated_vip_users(), vec![99]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn group_admin_vip_command_without_bot_target_delegates() -> Result<(), Box<dyn Error>> {
+        let virtual_store = VirtualMessageStoreStub::default();
+        let dispatcher = openplotva_telegram::DispatcherQueue::new(
+            openplotva_telegram::DispatcherConfig::default(),
+        );
+        let store = StoreStub::new();
+        let effects = EffectsStub::default();
+        let next = UpdateHandlerStub::default();
+        let admin_ids = [42];
+
+        let next_virtual_id =
+            crate::virtual_messages::monotonic_virtual_id_factory("admin-test-vmsg");
+        let outcome = handle_admin_vip_command_update_or_else_at(
+            AdminVipCommandUpdateRuntime {
+                store: &virtual_store,
+                queue: &dispatcher,
+                vip: &store,
+                effects: &effects,
+                admin_ids: &admin_ids,
+                bot_username: "PlotvaBot",
+                next_virtual_id: &next_virtual_id,
+                now: OffsetDateTime::UNIX_EPOCH,
+            },
+            sample_group_payment_command_update("/admin_grant_vip 7 99 manual test")?,
+            |update| next.handle_update(update),
+        )
+        .await?;
+
+        assert_eq!(outcome, AdminVipCommandUpdateOutcome::Delegated);
+        assert_eq!(next.calls(), vec![999]);
+        assert!(effects.sent_texts().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn successful_payment_dispatcher_effects_queue_text_reply_and_invalidate_vip_cache()
     -> Result<(), Box<dyn Error>> {
         let store = VirtualMessageStoreStub::default();
@@ -6693,7 +9782,7 @@ mod tests {
     fn payment_redirect_message_from_update_builds_non_private_command_redirect()
     -> Result<(), Box<dyn Error>> {
         let message = super::payment_redirect_message_from_update(
-            &sample_group_payment_command_update("/donate 777")?,
+            &sample_group_payment_command_update("/donate@PlotvaBot 777")?,
             "PlotvaBot",
         )
         .expect("group donate command should build a redirect");
@@ -6702,6 +9791,13 @@ mod tests {
         assert_eq!(message.reply_to_message_id, 555);
         assert_eq!(message.message_thread_id, Some(77));
         assert_eq!(message.url, "https://t.me/PlotvaBot?start=donate_777");
+        assert!(
+            super::payment_redirect_message_from_update(
+                &sample_group_payment_command_update("/donate 777")?,
+                "PlotvaBot"
+            )
+            .is_none()
+        );
         Ok(())
     }
 
@@ -6947,6 +10043,1024 @@ mod tests {
             effects.answered_pre_checkout_queries(),
             vec!["pre-checkout-id".to_owned()]
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_redis_decoded_pre_checkout_acknowledges_without_downstream_when_url_is_set()
+    -> Result<(), Box<dyn Error>> {
+        let Ok(redis_url) = env::var("OPENPLOTVA_TEST_REDIS_URL") else {
+            return Ok(());
+        };
+        let redis_client = redis::Client::open(redis_url)?;
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let key = format!("openplotva:test:decoded-pre-checkout:{suffix}");
+        let update_queue =
+            openplotva_updates::RedisUpdateQueue::with_key(redis_client.clone(), key.clone());
+        let mut redis = redis_client.get_multiplexed_async_connection().await?;
+        let _: i64 = redis::cmd("DEL").arg(&key).query_async(&mut redis).await?;
+
+        let state_store = UpdateStateStoreStub::default();
+        let queue = Arc::new(PaymentControlJobQueueStub::default());
+        let vip = Arc::new(VipStatusStoreStub::new());
+        let effects = Arc::new(EffectsStub::default());
+        let next = Arc::new(UpdateHandlerStub::default());
+        let handler = PaymentUpdateHandler::new(
+            Arc::clone(&queue),
+            Arc::clone(&vip),
+            Arc::clone(&effects),
+            Arc::clone(&next),
+        );
+
+        let update = sample_pre_checkout_update()?;
+        update_queue.enqueue_update(&update).await?;
+        assert_eq!(update_queue.len().await?, 1);
+        let decoded = update_queue
+            .dequeue_update(StdDuration::from_secs(1))
+            .await?
+            .ok_or_else(|| io::Error::other("expected decoded pre-checkout update"))?;
+
+        let report = process_update_with_state_store_at(
+            decoded,
+            UpdateConsumerConfig {
+                dequeue_timeout: StdDuration::from_millis(1),
+                state_timeout: StdDuration::from_secs(1),
+                handle_timeout: StdDuration::from_secs(1),
+                side_effect_max_age: StdDuration::from_secs(60),
+                worker_limit: 1,
+            },
+            UNIX_EPOCH + StdDuration::from_secs(1_779_193_800),
+            &state_store,
+            |update| handler.handle_update(update),
+        )
+        .await;
+
+        assert_eq!(report.update_id, 999);
+        assert_eq!(report.update_name, "pre_checkout_query");
+        assert_eq!(report.state.outcome, UpdateStageOutcome::Completed);
+        assert_eq!(
+            report.handle.as_ref().map(|stage| &stage.outcome),
+            Some(&UpdateStageOutcome::Completed)
+        );
+        assert!(!report.skipped_handle);
+        assert_eq!(state_store.calls(), vec!["user:42:Alice:alice".to_owned()]);
+        assert_eq!(
+            effects.answered_pre_checkout_queries(),
+            vec!["pre-checkout-id".to_owned()]
+        );
+        assert!(queue.assigned().is_empty());
+        assert!(next.calls().is_empty());
+        assert_eq!(update_queue.len().await?, 0);
+
+        let _: i64 = redis::cmd("DEL").arg(&key).query_async(&mut redis).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_redis_decoded_payment_producers_route_control_jobs_and_status_when_url_is_set()
+    -> Result<(), Box<dyn Error>> {
+        let Ok(redis_url) = env::var("OPENPLOTVA_TEST_REDIS_URL") else {
+            return Ok(());
+        };
+        let processor_now = UNIX_EPOCH + StdDuration::from_secs(1_710_000_000);
+        let active_status_now = time::Date::from_calendar_date(2026, time::Month::June, 16)?
+            .with_hms(9, 30, 0)?
+            .assume_utc();
+
+        let redis_client = redis::Client::open(redis_url.as_str())?;
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let key = format!("openplotva:test:decoded-successful-payment:{suffix}");
+        let update_queue =
+            openplotva_updates::RedisUpdateQueue::with_key(redis_client.clone(), key.clone());
+        let mut redis = redis_client.get_multiplexed_async_connection().await?;
+        let _: i64 = redis::cmd("DEL").arg(&key).query_async(&mut redis).await?;
+
+        let state_store = UpdateStateStoreStub::default();
+        let queue = Arc::new(PaymentControlJobQueueStub::default());
+        let vip = Arc::new(VipStatusStoreStub::new().with_is_vip(false));
+        let effects = Arc::new(EffectsStub::default());
+        let next = Arc::new(UpdateHandlerStub::default());
+        let handler = PaymentUpdateHandler::new(
+            Arc::clone(&queue),
+            Arc::clone(&vip),
+            Arc::clone(&effects),
+            Arc::clone(&next),
+        );
+        let update = sample_successful_payment_update_with_thread("subscription_42", 300, 77)?;
+        update_queue.enqueue_update(&update).await?;
+        let decoded = update_queue
+            .dequeue_update(StdDuration::from_secs(1))
+            .await?
+            .ok_or_else(|| io::Error::other("expected decoded successful-payment update"))?;
+        let report = process_update_with_state_store_at(
+            decoded,
+            UpdateConsumerConfig {
+                dequeue_timeout: StdDuration::from_millis(1),
+                state_timeout: StdDuration::from_secs(1),
+                handle_timeout: StdDuration::from_secs(1),
+                side_effect_max_age: StdDuration::from_secs(60),
+                worker_limit: 1,
+            },
+            processor_now,
+            &state_store,
+            |update| handler.handle_update(update),
+        )
+        .await;
+
+        assert_eq!(report.update_id, 999);
+        assert_eq!(report.update_name, "message");
+        assert_eq!(report.state.outcome, UpdateStageOutcome::Completed);
+        assert_eq!(
+            report.handle.as_ref().map(|stage| &stage.outcome),
+            Some(&UpdateStageOutcome::Completed)
+        );
+        assert_eq!(
+            state_store.calls(),
+            vec![
+                "chat:42:private:Alice:alice".to_owned(),
+                "user:42:Alice:alice".to_owned()
+            ]
+        );
+        assert!(next.calls().is_empty());
+        let assigned = queue.assigned();
+        assert_eq!(assigned.len(), 1);
+        assert_eq!(assigned[0].0, CONTROL_QUEUE_NAME);
+        assert_eq!(assigned[0].1.title, "successful payment");
+        assert_eq!(assigned[0].1.priority, HIGH_PRIORITY);
+        let telegram = assigned[0]
+            .1
+            .data
+            .telegram_data
+            .as_ref()
+            .expect("successful payment telegram data");
+        assert_eq!(telegram.thread_message_id, Some(77));
+        let control = assigned[0]
+            .1
+            .data
+            .control_data
+            .as_ref()
+            .expect("successful payment control data");
+        assert_eq!(control.kind, ControlKind::SuccessfulPayment);
+        assert_eq!(
+            control
+                .payment
+                .as_ref()
+                .map(|payment| payment.invoice_payload.as_str()),
+            Some("subscription_42")
+        );
+        assert_eq!(update_queue.len().await?, 0);
+        let _: i64 = redis::cmd("DEL").arg(&key).query_async(&mut redis).await?;
+
+        let redis_client = redis::Client::open(redis_url.as_str())?;
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let key = format!("openplotva:test:decoded-donate-invoice:{suffix}");
+        let update_queue =
+            openplotva_updates::RedisUpdateQueue::with_key(redis_client.clone(), key.clone());
+        let mut redis = redis_client.get_multiplexed_async_connection().await?;
+        let _: i64 = redis::cmd("DEL").arg(&key).query_async(&mut redis).await?;
+
+        let state_store = UpdateStateStoreStub::default();
+        let queue = Arc::new(PaymentControlJobQueueStub::default());
+        let vip = Arc::new(VipStatusStoreStub::new().with_is_vip(false));
+        let effects = Arc::new(EffectsStub::default());
+        let next = Arc::new(UpdateHandlerStub::default());
+        let handler = PaymentUpdateHandler::new(
+            Arc::clone(&queue),
+            Arc::clone(&vip),
+            Arc::clone(&effects),
+            Arc::clone(&next),
+        );
+        let update = sample_payment_command_update("/donate 777")?;
+        update_queue.enqueue_update(&update).await?;
+        let decoded = update_queue
+            .dequeue_update(StdDuration::from_secs(1))
+            .await?
+            .ok_or_else(|| io::Error::other("expected decoded donate invoice update"))?;
+        let report = process_update_with_state_store_at(
+            decoded,
+            UpdateConsumerConfig {
+                dequeue_timeout: StdDuration::from_millis(1),
+                state_timeout: StdDuration::from_secs(1),
+                handle_timeout: StdDuration::from_secs(1),
+                side_effect_max_age: StdDuration::from_secs(60),
+                worker_limit: 1,
+            },
+            processor_now,
+            &state_store,
+            |update| handler.handle_update(update),
+        )
+        .await;
+
+        assert_eq!(report.update_id, 999);
+        assert_eq!(report.update_name, "message");
+        assert_eq!(report.state.outcome, UpdateStageOutcome::Completed);
+        assert_eq!(
+            report.handle.as_ref().map(|stage| &stage.outcome),
+            Some(&UpdateStageOutcome::Completed)
+        );
+        assert_eq!(
+            state_store.calls(),
+            vec![
+                "chat:42:private:Alice:alice".to_owned(),
+                "user:42:Alice:alice".to_owned()
+            ]
+        );
+        assert!(next.calls().is_empty());
+        let assigned = queue.assigned();
+        assert_eq!(assigned.len(), 1);
+        assert_eq!(assigned[0].0, CONTROL_QUEUE_NAME);
+        assert_eq!(assigned[0].1.title, "donate invoice");
+        assert_eq!(assigned[0].1.priority, HIGH_PRIORITY);
+        let control = assigned[0]
+            .1
+            .data
+            .control_data
+            .as_ref()
+            .expect("donate invoice control data");
+        assert_eq!(control.kind, ControlKind::DonateInvoice);
+        assert_eq!(control.amount, 777);
+        assert_eq!(update_queue.len().await?, 0);
+        let _: i64 = redis::cmd("DEL").arg(&key).query_async(&mut redis).await?;
+
+        let redis_client = redis::Client::open(redis_url.as_str())?;
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let key = format!("openplotva:test:decoded-vip-invoice:{suffix}");
+        let update_queue =
+            openplotva_updates::RedisUpdateQueue::with_key(redis_client.clone(), key.clone());
+        let mut redis = redis_client.get_multiplexed_async_connection().await?;
+        let _: i64 = redis::cmd("DEL").arg(&key).query_async(&mut redis).await?;
+
+        let state_store = UpdateStateStoreStub::default();
+        let queue = Arc::new(PaymentControlJobQueueStub::default());
+        let vip = Arc::new(VipStatusStoreStub::new().with_is_vip(false));
+        let effects = Arc::new(EffectsStub::default());
+        let next = Arc::new(UpdateHandlerStub::default());
+        let handler = PaymentUpdateHandler::new(
+            Arc::clone(&queue),
+            Arc::clone(&vip),
+            Arc::clone(&effects),
+            Arc::clone(&next),
+        );
+        let update = sample_payment_command_update("/vip")?;
+        update_queue.enqueue_update(&update).await?;
+        let decoded = update_queue
+            .dequeue_update(StdDuration::from_secs(1))
+            .await?
+            .ok_or_else(|| io::Error::other("expected decoded vip invoice update"))?;
+        let report = process_update_with_state_store_at(
+            decoded,
+            UpdateConsumerConfig {
+                dequeue_timeout: StdDuration::from_millis(1),
+                state_timeout: StdDuration::from_secs(1),
+                handle_timeout: StdDuration::from_secs(1),
+                side_effect_max_age: StdDuration::from_secs(60),
+                worker_limit: 1,
+            },
+            processor_now,
+            &state_store,
+            |update| handler.handle_update(update),
+        )
+        .await;
+
+        assert_eq!(report.update_id, 999);
+        assert_eq!(report.update_name, "message");
+        assert_eq!(report.state.outcome, UpdateStageOutcome::Completed);
+        assert_eq!(
+            report.handle.as_ref().map(|stage| &stage.outcome),
+            Some(&UpdateStageOutcome::Completed)
+        );
+        assert_eq!(
+            state_store.calls(),
+            vec![
+                "chat:42:private:Alice:alice".to_owned(),
+                "user:42:Alice:alice".to_owned()
+            ]
+        );
+        assert!(next.calls().is_empty());
+        assert!(effects.vip_status_messages().is_empty());
+        let assigned = queue.assigned();
+        assert_eq!(assigned.len(), 1);
+        assert_eq!(assigned[0].0, CONTROL_QUEUE_NAME);
+        assert_eq!(assigned[0].1.title, "vip invoice");
+        assert_eq!(assigned[0].1.priority, HIGH_PRIORITY);
+        let control = assigned[0]
+            .1
+            .data
+            .control_data
+            .as_ref()
+            .expect("vip invoice control data");
+        assert_eq!(control.kind, ControlKind::VipInvoice);
+        assert_eq!(control.amount, 300);
+        assert_eq!(vip.calls(), vec!["is_vip_at"]);
+        assert_eq!(update_queue.len().await?, 0);
+        let _: i64 = redis::cmd("DEL").arg(&key).query_async(&mut redis).await?;
+
+        let redis_client = redis::Client::open(redis_url.as_str())?;
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let key = format!("openplotva:test:decoded-vip-existing-status:{suffix}");
+        let update_queue =
+            openplotva_updates::RedisUpdateQueue::with_key(redis_client.clone(), key.clone());
+        let mut redis = redis_client.get_multiplexed_async_connection().await?;
+        let _: i64 = redis::cmd("DEL").arg(&key).query_async(&mut redis).await?;
+
+        let state_store = UpdateStateStoreStub::default();
+        let queue = Arc::new(PaymentControlJobQueueStub::default());
+        let vip = Arc::new(
+            VipStatusStoreStub::new()
+                .with_is_vip(true)
+                .with_summary(active_vip_summary(
+                    active_status_now,
+                    active_status_now + time::Duration::days(3),
+                ))
+                .with_active_subscription(active_subscription(
+                    active_status_now,
+                    active_status_now + time::Duration::days(3),
+                )),
+        );
+        let effects = Arc::new(EffectsStub::default());
+        let next = Arc::new(UpdateHandlerStub::default());
+        let handler = PaymentUpdateHandler::new(
+            Arc::clone(&queue),
+            Arc::clone(&vip),
+            Arc::clone(&effects),
+            Arc::clone(&next),
+        );
+        let update = sample_payment_command_update("/vip")?;
+        update_queue.enqueue_update(&update).await?;
+        let decoded = update_queue
+            .dequeue_update(StdDuration::from_secs(1))
+            .await?
+            .ok_or_else(|| io::Error::other("expected decoded existing VIP status update"))?;
+        let report = process_update_with_state_store_at(
+            decoded,
+            UpdateConsumerConfig {
+                dequeue_timeout: StdDuration::from_millis(1),
+                state_timeout: StdDuration::from_secs(1),
+                handle_timeout: StdDuration::from_secs(1),
+                side_effect_max_age: StdDuration::from_secs(60),
+                worker_limit: 1,
+            },
+            processor_now,
+            &state_store,
+            |update| handler.handle_update(update),
+        )
+        .await;
+
+        assert_eq!(report.update_id, 999);
+        assert_eq!(report.update_name, "message");
+        assert_eq!(report.state.outcome, UpdateStageOutcome::Completed);
+        assert_eq!(
+            report.handle.as_ref().map(|stage| &stage.outcome),
+            Some(&UpdateStageOutcome::Completed)
+        );
+        assert_eq!(
+            state_store.calls(),
+            vec![
+                "chat:42:private:Alice:alice".to_owned(),
+                "user:42:Alice:alice".to_owned()
+            ]
+        );
+        assert!(next.calls().is_empty());
+        assert!(queue.assigned().is_empty());
+        let status_messages = effects.vip_status_messages();
+        assert_eq!(status_messages.len(), 1);
+        assert!(
+            status_messages[0]
+                .text
+                .contains("У вас уже есть активный VIP статус")
+        );
+        assert!(status_messages[0].show_cancel_button);
+        assert_eq!(
+            vip.calls(),
+            vec![
+                "is_vip_at",
+                "get_vip_summary_by_user",
+                "get_active_subscription"
+            ]
+        );
+        assert_eq!(update_queue.len().await?, 0);
+        let _: i64 = redis::cmd("DEL").arg(&key).query_async(&mut redis).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_redis_decoded_private_start_payment_payloads_delegate_into_payment_handler_when_url_is_set()
+    -> Result<(), Box<dyn Error>> {
+        let Ok(redis_url) = env::var("OPENPLOTVA_TEST_REDIS_URL") else {
+            return Ok(());
+        };
+        let redis_client = redis::Client::open(redis_url.as_str())?;
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let key = format!("openplotva:test:decoded-start-payment:{suffix}");
+        let update_queue =
+            openplotva_updates::RedisUpdateQueue::with_key(redis_client.clone(), key.clone());
+        let mut redis = redis_client.get_multiplexed_async_connection().await?;
+        let _: i64 = redis::cmd("DEL").arg(&key).query_async(&mut redis).await?;
+
+        let mut start_vip = sample_payment_command_update("/start vip")?;
+        start_vip.id = 1201;
+        let mut start_donate_default = sample_payment_command_update("/start donate")?;
+        start_donate_default.id = 1202;
+        let mut start_donate_amount = sample_payment_command_update("/start donate_777")?;
+        start_donate_amount.id = 1203;
+        let mut start_donate_bad = sample_payment_command_update("/start donate_bad")?;
+        start_donate_bad.id = 1204;
+        update_queue.enqueue_update(&start_vip).await?;
+        update_queue.enqueue_update(&start_donate_default).await?;
+        update_queue.enqueue_update(&start_donate_amount).await?;
+        update_queue.enqueue_update(&start_donate_bad).await?;
+        assert_eq!(update_queue.len().await?, 4);
+
+        let state_store = UpdateStateStoreStub::default();
+        let queue = Arc::new(PaymentControlJobQueueStub::default());
+        let vip = Arc::new(VipStatusStoreStub::new().with_is_vip(false));
+        let effects = Arc::new(EffectsStub::default());
+        let terminal = Arc::new(UpdateHandlerStub::default());
+        let payment_handler = Arc::new(PaymentUpdateHandler::new(
+            Arc::clone(&queue),
+            Arc::clone(&vip),
+            Arc::clone(&effects),
+            Arc::clone(&terminal),
+        ));
+        let virtual_store = VirtualMessageStoreStub::default();
+        let dispatcher = Arc::new(openplotva_telegram::DispatcherQueue::new(
+            openplotva_telegram::DispatcherConfig::default(),
+        ));
+        let telegram = openplotva_telegram::telegram_client("123:token")?;
+        let help_effects = Arc::new(HelpDispatcherEffects::new(
+            virtual_store.clone(),
+            Arc::clone(&dispatcher),
+            telegram,
+            Arc::clone(&payment_handler),
+        ));
+        let help_handler = HelpCommandUpdateHandler::new(
+            HelpBotIdentity {
+                first_name: "Plotva".to_owned(),
+                username: "PlotvaBot".to_owned(),
+                token: "123:token".to_owned(),
+            },
+            help_effects,
+            Arc::clone(&terminal),
+        );
+        let config = UpdateConsumerConfig {
+            dequeue_timeout: StdDuration::from_millis(1),
+            state_timeout: StdDuration::from_secs(1),
+            handle_timeout: StdDuration::from_secs(1),
+            side_effect_max_age: StdDuration::from_secs(60),
+            worker_limit: 1,
+        };
+
+        for expected_update_id in [1201, 1202, 1203, 1204] {
+            let decoded = update_queue
+                .dequeue_update(StdDuration::from_secs(1))
+                .await?
+                .ok_or_else(|| io::Error::other("expected decoded private start payment update"))?;
+            let report = process_update_with_state_store_at(
+                decoded,
+                config,
+                UNIX_EPOCH + StdDuration::from_secs(1_710_000_010),
+                &state_store,
+                |update| help_handler.handle_update(update),
+            )
+            .await;
+            assert_eq!(report.update_id, expected_update_id);
+            assert_eq!(report.update_name, "message");
+            assert_eq!(report.state.outcome, UpdateStageOutcome::Completed);
+            assert_eq!(
+                report.handle.as_ref().map(|stage| &stage.outcome),
+                Some(&UpdateStageOutcome::Completed)
+            );
+            assert!(!report.skipped_handle);
+        }
+
+        assert_eq!(
+            state_store.calls(),
+            vec![
+                "chat:42:private:Alice:alice".to_owned(),
+                "user:42:Alice:alice".to_owned(),
+                "chat:42:private:Alice:alice".to_owned(),
+                "user:42:Alice:alice".to_owned(),
+                "chat:42:private:Alice:alice".to_owned(),
+                "user:42:Alice:alice".to_owned(),
+                "chat:42:private:Alice:alice".to_owned(),
+                "user:42:Alice:alice".to_owned(),
+            ]
+        );
+        assert_eq!(terminal.calls(), Vec::<i64>::new());
+        let dispatcher_snapshot = dispatcher.snapshot();
+        assert!(dispatcher_snapshot.immediate.is_empty());
+        assert!(dispatcher_snapshot.regular.is_empty());
+        assert!(virtual_store.inserted().is_empty());
+        assert!(effects.vip_status_messages().is_empty());
+        assert!(effects.payment_redirect_messages().is_empty());
+
+        let assigned = queue.assigned();
+        assert_eq!(assigned.len(), 4);
+        assert_eq!(assigned[0].0, CONTROL_QUEUE_NAME);
+        assert_eq!(assigned[0].1.title, "vip invoice");
+        let vip_control = assigned[0]
+            .1
+            .data
+            .control_data
+            .as_ref()
+            .expect("vip invoice control data");
+        assert_eq!(vip_control.kind, ControlKind::VipInvoice);
+        assert_eq!(vip_control.amount, 300);
+
+        assert_eq!(assigned[1].0, CONTROL_QUEUE_NAME);
+        assert_eq!(assigned[1].1.title, "donate invoice");
+        let donate_default_control = assigned[1]
+            .1
+            .data
+            .control_data
+            .as_ref()
+            .expect("default donate invoice control data");
+        assert_eq!(donate_default_control.kind, ControlKind::DonateInvoice);
+        assert_eq!(donate_default_control.amount, 600);
+
+        assert_eq!(assigned[2].0, CONTROL_QUEUE_NAME);
+        assert_eq!(assigned[2].1.title, "donate invoice");
+        let donate_amount_control = assigned[2]
+            .1
+            .data
+            .control_data
+            .as_ref()
+            .expect("amount donate invoice control data");
+        assert_eq!(donate_amount_control.kind, ControlKind::DonateInvoice);
+        assert_eq!(donate_amount_control.amount, 777);
+
+        assert_eq!(assigned[3].0, CONTROL_QUEUE_NAME);
+        assert_eq!(assigned[3].1.title, "donate invoice");
+        let donate_bad_control = assigned[3]
+            .1
+            .data
+            .control_data
+            .as_ref()
+            .expect("malformed donate invoice control data");
+        assert_eq!(donate_bad_control.kind, ControlKind::DonateInvoice);
+        assert_eq!(donate_bad_control.amount, 600);
+        assert_eq!(vip.calls(), vec!["is_vip_at"]);
+        assert_eq!(update_queue.len().await?, 0);
+
+        let _: i64 = redis::cmd("DEL").arg(&key).query_async(&mut redis).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_redis_decoded_group_payment_redirects_send_direct_payloads_when_url_is_set()
+    -> Result<(), Box<dyn Error>> {
+        let Ok(redis_url) = env::var("OPENPLOTVA_TEST_REDIS_URL") else {
+            return Ok(());
+        };
+        let redis_client = redis::Client::open(redis_url.as_str())?;
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let key = format!("openplotva:test:decoded-payment-redirect:{suffix}");
+        let update_queue =
+            openplotva_updates::RedisUpdateQueue::with_key(redis_client.clone(), key.clone());
+        let mut redis = redis_client.get_multiplexed_async_connection().await?;
+        let _: i64 = redis::cmd("DEL").arg(&key).query_async(&mut redis).await?;
+
+        for update in [
+            sample_group_payment_command_update("/vip@PlotvaBot")?,
+            sample_group_payment_command_update("/donate@PlotvaBot 777")?,
+            sample_group_payment_command_update("/donate 777")?,
+            sample_group_payment_command_update("/vip@OtherBot")?,
+            sample_group_payment_command_update("/settings@PlotvaBot")?,
+        ] {
+            update_queue.enqueue_update(&update).await?;
+        }
+        assert_eq!(update_queue.len().await?, 5);
+
+        let state_store = UpdateStateStoreStub::default();
+        let queue = Arc::new(PaymentControlJobQueueStub::default());
+        let vip = Arc::new(VipStatusStoreStub::new().with_is_vip(false));
+        let effects = Arc::new(EffectsStub::default());
+        let next = Arc::new(UpdateHandlerStub::default());
+        let handler = PaymentUpdateHandler::new(
+            Arc::clone(&queue),
+            Arc::clone(&vip),
+            Arc::clone(&effects),
+            Arc::clone(&next),
+        )
+        .with_bot_username("PlotvaBot");
+
+        let mut reports = Vec::new();
+        for expected in 0..5 {
+            let decoded = update_queue
+                .dequeue_update(StdDuration::from_secs(1))
+                .await?
+                .ok_or_else(|| io::Error::other("expected decoded payment redirect update"))?;
+            let report = process_update_with_state_store_at(
+                decoded,
+                UpdateConsumerConfig {
+                    dequeue_timeout: StdDuration::from_millis(1),
+                    state_timeout: StdDuration::from_secs(1),
+                    handle_timeout: StdDuration::from_secs(1),
+                    side_effect_max_age: StdDuration::from_secs(60),
+                    worker_limit: 1,
+                },
+                UNIX_EPOCH + StdDuration::from_secs(1_710_000_000 + expected),
+                &state_store,
+                |update| handler.handle_update(update),
+            )
+            .await;
+            reports.push(report);
+        }
+
+        for report in &reports {
+            assert_eq!(report.update_id, 999);
+            assert_eq!(report.update_name, "message");
+            assert_eq!(report.state.outcome, UpdateStageOutcome::Completed);
+            assert_eq!(
+                report.handle.as_ref().map(|stage| &stage.outcome),
+                Some(&UpdateStageOutcome::Completed)
+            );
+            assert!(!report.skipped_handle);
+        }
+        assert_eq!(
+            state_store.calls(),
+            vec![
+                "chat:-10042:supergroup::".to_owned(),
+                "user:42:Alice:alice".to_owned(),
+                "chat:-10042:supergroup::".to_owned(),
+                "user:42:Alice:alice".to_owned(),
+                "chat:-10042:supergroup::".to_owned(),
+                "user:42:Alice:alice".to_owned(),
+                "chat:-10042:supergroup::".to_owned(),
+                "user:42:Alice:alice".to_owned(),
+                "chat:-10042:supergroup::".to_owned(),
+                "user:42:Alice:alice".to_owned(),
+            ]
+        );
+        assert!(queue.assigned().is_empty());
+        assert_eq!(next.calls(), vec![999, 999, 999]);
+
+        let redirects = effects.payment_redirect_messages();
+        assert_eq!(redirects.len(), 2);
+        assert_eq!(redirects[0].chat_id, -10042);
+        assert_eq!(redirects[0].reply_to_message_id, 555);
+        assert_eq!(redirects[0].message_thread_id, Some(77));
+        assert_eq!(redirects[0].button_text, "💎 Оформить VIP подписку");
+        assert_eq!(redirects[0].url, "https://t.me/PlotvaBot?start=vip");
+        assert!(redirects[0].text.contains("VIP даёт вам:"));
+        assert_eq!(redirects[1].button_text, "💝 Сделать донат");
+        assert_eq!(redirects[1].url, "https://t.me/PlotvaBot?start=donate_777");
+        assert_eq!(update_queue.len().await?, 0);
+
+        let _: i64 = redis::cmd("DEL").arg(&key).query_async(&mut redis).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_redis_decoded_admin_payment_commands_when_url_is_set()
+    -> Result<(), Box<dyn Error>> {
+        let Ok(redis_url) = env::var("OPENPLOTVA_TEST_REDIS_URL") else {
+            return Ok(());
+        };
+        let processor_now = UNIX_EPOCH + StdDuration::from_secs(1_710_000_000);
+        let now = time::Date::from_calendar_date(2026, time::Month::May, 20)?
+            .with_hms(12, 0, 0)?
+            .assume_utc();
+        let expires_at = now + time::Duration::days(30);
+        let mut refund_subscription = active_subscription(now, expires_at);
+        refund_subscription.user_id = 1_717_359_759;
+        refund_subscription.telegram_payment_charge_id = "charge-sub".to_owned();
+
+        let redis_client = redis::Client::open(redis_url.as_str())?;
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let key = format!("openplotva:test:decoded-admin-payment:{suffix}");
+        let update_queue =
+            openplotva_updates::RedisUpdateQueue::with_key(redis_client.clone(), key.clone());
+        let mut redis = redis_client.get_multiplexed_async_connection().await?;
+        let _: i64 = redis::cmd("DEL").arg(&key).query_async(&mut redis).await?;
+
+        update_queue
+            .enqueue_update(&sample_payment_command_update(
+                "/admin_grant_vip 7 99 manual test",
+            )?)
+            .await?;
+        update_queue
+            .enqueue_update(&sample_group_payment_command_update(
+                "/admin_cancel_vip@PlotvaBot 42",
+            )?)
+            .await?;
+        update_queue
+            .enqueue_update(&sample_payment_command_update("/admin_refund charge-sub")?)
+            .await?;
+        assert_eq!(update_queue.len().await?, 3);
+
+        let state_store = UpdateStateStoreStub::default();
+        let virtual_store = VirtualMessageStoreStub::default();
+        let dispatcher = openplotva_telegram::DispatcherQueue::new(
+            openplotva_telegram::DispatcherConfig::default(),
+        );
+        let store = StoreStub::new()
+            .with_admin_cancel_summary(active_vip_summary(now, expires_at))
+            .with_admin_cancel_updated_summary(None)
+            .with_admin_refund_subscription(Some(refund_subscription.clone()))
+            .with_next_vip_event(VipEventRecord {
+                id: 201,
+                user_id: 99,
+                event_type: VIP_EVENT_TYPE_ADMIN_ADJUSTMENT.to_owned(),
+                delta_seconds: vip_days_to_seconds(7),
+                effective_expires_at: now + time::Duration::days(7),
+                subscription_id: None,
+                actor_user_id: Some(42),
+                reason: "manual test".to_owned(),
+                created_at: now,
+            })
+            .with_next_vip_event(VipEventRecord {
+                id: 202,
+                user_id: 42,
+                event_type: VIP_EVENT_TYPE_ADMIN_REVOKE.to_owned(),
+                delta_seconds: -time::Duration::days(30).whole_seconds(),
+                effective_expires_at: now,
+                subscription_id: None,
+                actor_user_id: Some(42),
+                reason: "telegram admin revoke by 42".to_owned(),
+                created_at: now,
+            })
+            .with_next_vip_event(VipEventRecord {
+                id: 203,
+                user_id: refund_subscription.user_id,
+                event_type: VIP_EVENT_TYPE_REFUND_REVERSAL.to_owned(),
+                delta_seconds: -subscription_delta_seconds(
+                    &refund_subscription.telegram_payment_charge_id,
+                    refund_subscription.created_at,
+                    refund_subscription.expires_at,
+                    openplotva_telegram::SUBSCRIPTION_DURATION_DAYS,
+                ),
+                effective_expires_at: now,
+                subscription_id: Some(refund_subscription.id),
+                actor_user_id: Some(42),
+                reason: "admin refund charge-sub".to_owned(),
+                created_at: now,
+            });
+        let effects = EffectsStub::default();
+        let next = UpdateHandlerStub::default();
+        let next_virtual_id =
+            crate::virtual_messages::monotonic_virtual_id_factory("admin-payment-vmsg");
+        let mut outcomes = Vec::new();
+
+        for expected_name in ["message", "message", "message"] {
+            let decoded = update_queue
+                .dequeue_update(StdDuration::from_secs(1))
+                .await?
+                .ok_or_else(|| io::Error::other("expected decoded admin payment update"))?;
+            let report = process_update_with_state_store_at(
+                decoded,
+                UpdateConsumerConfig {
+                    dequeue_timeout: StdDuration::from_millis(1),
+                    state_timeout: StdDuration::from_secs(1),
+                    handle_timeout: StdDuration::from_secs(1),
+                    side_effect_max_age: StdDuration::from_secs(60),
+                    worker_limit: 1,
+                },
+                processor_now,
+                &state_store,
+                |update| async {
+                    let outcome = handle_admin_vip_command_update_or_else_at(
+                        AdminVipCommandUpdateRuntime {
+                            store: &virtual_store,
+                            queue: &dispatcher,
+                            vip: &store,
+                            effects: &effects,
+                            admin_ids: &[42],
+                            bot_username: "PlotvaBot",
+                            next_virtual_id: &next_virtual_id,
+                            now,
+                        },
+                        update,
+                        |update| next.handle_update(update),
+                    )
+                    .await?;
+                    outcomes.push(outcome);
+                    Ok::<(), io::Error>(())
+                },
+            )
+            .await;
+
+            assert_eq!(report.update_id, 999);
+            assert_eq!(report.update_name, expected_name);
+            assert_eq!(report.state.outcome, UpdateStageOutcome::Completed);
+            assert_eq!(
+                report.handle.as_ref().map(|stage| &stage.outcome),
+                Some(&UpdateStageOutcome::Completed)
+            );
+            assert!(!report.skipped_handle);
+        }
+
+        assert_eq!(update_queue.len().await?, 0);
+        assert_eq!(
+            state_store.calls(),
+            vec![
+                "chat:42:private:Alice:alice".to_owned(),
+                "user:42:Alice:alice".to_owned(),
+                "chat:-10042:supergroup::".to_owned(),
+                "user:42:Alice:alice".to_owned(),
+                "chat:42:private:Alice:alice".to_owned(),
+                "user:42:Alice:alice".to_owned(),
+            ]
+        );
+        assert!(next.calls().is_empty());
+        assert!(virtual_store.inserted().is_empty());
+        assert!(dispatcher.dequeue_immediate().is_none());
+        assert_eq!(outcomes.len(), 3);
+        assert!(matches!(
+            &outcomes[0],
+            AdminVipCommandUpdateOutcome::Grant(report)
+                if report.outcome == super::AdminGrantVipCommandOutcome::Granted
+                    && report.target_user_id == Some(99)
+                    && report.event_id == Some(201)
+        ));
+        assert!(matches!(
+            &outcomes[1],
+            AdminVipCommandUpdateOutcome::Cancel(report)
+                if report.outcome == super::AdminCancelVipCommandOutcome::Revoked
+                    && report.target_user_id == Some(42)
+                    && report.event_id == Some(202)
+        ));
+        assert!(matches!(
+            &outcomes[2],
+            AdminVipCommandUpdateOutcome::Refund(report)
+                if report.outcome == super::AdminRefundCommandOutcome::RefundedSubscription
+                    && report.target_user_id == Some(1_717_359_759)
+                    && report.amount_stars == Some(1)
+        ));
+        assert_eq!(
+            effects.refund_requests(),
+            vec![(1_717_359_759, "charge-sub".to_owned())]
+        );
+        assert_eq!(effects.invalidated_vip_users(), vec![99, 42, 1_717_359_759]);
+        assert_eq!(store.refunded_subscription_ids(), vec![10]);
+        assert_eq!(
+            store
+                .vip_events()
+                .into_iter()
+                .map(|event| (
+                    event.user_id,
+                    event.event_type.to_owned(),
+                    event.actor_user_id,
+                    event.reason.map(str::to_owned)
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    99,
+                    VIP_EVENT_TYPE_ADMIN_ADJUSTMENT.to_owned(),
+                    Some(42),
+                    Some("manual test".to_owned())
+                ),
+                (
+                    42,
+                    VIP_EVENT_TYPE_ADMIN_REVOKE.to_owned(),
+                    Some(42),
+                    Some("telegram admin revoke by 42".to_owned())
+                ),
+                (
+                    1_717_359_759,
+                    VIP_EVENT_TYPE_REFUND_REVERSAL.to_owned(),
+                    Some(42),
+                    Some("admin refund charge-sub".to_owned())
+                ),
+            ]
+        );
+        let sent = effects.sent_payment_texts();
+        assert_eq!(sent.len(), 3);
+        assert_eq!(sent[0].chat_id, 42);
+        assert_eq!(sent[0].reply_to_message_id, 100);
+        assert!(sent[0].text.contains("VIP корректировка успешно записана"));
+        assert_eq!(sent[1].chat_id, -10042);
+        assert_eq!(sent[1].reply_to_message_id, 555);
+        assert!(sent[1].text.contains("VIP статус успешно обработан"));
+        assert_eq!(sent[2].chat_id, 42);
+        assert_eq!(sent[2].reply_to_message_id, 100);
+        assert!(
+            sent[2]
+                .text
+                .contains("Возврат средств для транзакции charge-sub")
+        );
+        assert_eq!(
+            effects.direct_texts(),
+            vec![(
+                1_717_359_759,
+                "💸 Вам был возвращен платеж в размере 1 звезд по транзакции charge-sub."
+                    .to_owned()
+            )]
+        );
+
+        let _: i64 = redis::cmd("DEL").arg(&key).query_async(&mut redis).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_redis_decoded_donate_invoice_executes_unified_control_job_when_url_is_set()
+    -> Result<(), Box<dyn Error>> {
+        let Ok(redis_url) = env::var("OPENPLOTVA_TEST_REDIS_URL") else {
+            return Ok(());
+        };
+        let processor_now = UNIX_EPOCH + StdDuration::from_secs(1_710_000_000);
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+
+        let redis_client = redis::Client::open(redis_url.as_str())?;
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let key = format!("openplotva:test:decoded-donate-invoice-worker:{suffix}");
+        let update_queue =
+            openplotva_updates::RedisUpdateQueue::with_key(redis_client.clone(), key.clone());
+        let mut redis = redis_client.get_multiplexed_async_connection().await?;
+        let _: i64 = redis::cmd("DEL").arg(&key).query_async(&mut redis).await?;
+
+        let state_store = UpdateStateStoreStub::default();
+        let queue = Arc::new(InMemoryPaymentControlJobQueue::new());
+        let vip = Arc::new(VipStatusStoreStub::new().with_is_vip(false));
+        let effects = Arc::new(EffectsStub::default().with_next_invoice_url("https://t.me/donate"));
+        let next = Arc::new(UpdateHandlerStub::default());
+        let handler = PaymentUpdateHandler::new(
+            Arc::clone(&queue),
+            Arc::clone(&vip),
+            Arc::clone(&effects),
+            Arc::clone(&next),
+        );
+
+        update_queue
+            .enqueue_update(&sample_payment_command_update("/donate 777")?)
+            .await?;
+        let decoded = update_queue
+            .dequeue_update(StdDuration::from_secs(1))
+            .await?
+            .ok_or_else(|| io::Error::other("expected decoded donate invoice update"))?;
+        let report = process_update_with_state_store_at(
+            decoded,
+            UpdateConsumerConfig {
+                dequeue_timeout: StdDuration::from_millis(1),
+                state_timeout: StdDuration::from_secs(1),
+                handle_timeout: StdDuration::from_secs(1),
+                side_effect_max_age: StdDuration::from_secs(60),
+                worker_limit: 1,
+            },
+            processor_now,
+            &state_store,
+            |update| handler.handle_update(update),
+        )
+        .await;
+
+        assert_eq!(report.update_id, 999);
+        assert_eq!(report.update_name, "message");
+        assert_eq!(report.state.outcome, UpdateStageOutcome::Completed);
+        assert_eq!(
+            report.handle.as_ref().map(|stage| &stage.outcome),
+            Some(&UpdateStageOutcome::Completed)
+        );
+        assert!(next.calls().is_empty());
+        assert_eq!(queue.snapshot().len(), 1);
+        assert_eq!(queue.snapshot()[0].job.title, "donate invoice");
+        assert_eq!(
+            queue.snapshot()[0].status,
+            InMemoryPaymentControlJobStatus::Pending
+        );
+
+        let store = StoreStub::new();
+        let registry = PaymentOnlyControlJobRegistry {
+            store: &store,
+            effects: effects.as_ref(),
+        };
+        let worker = process_control_job_once_at(queue.as_ref(), &registry, now).await;
+
+        assert!(worker.dequeued);
+        assert_eq!(worker.kind, Some(ControlKind::DonateInvoice));
+        assert!(worker.completed);
+        assert!(!worker.failed);
+        assert_eq!(
+            worker.execution,
+            Some(ControlJobExecution::Payment(
+                PaymentControlJobReport::from_invoice(
+                    PaymentControlJobOutcome::DonateInvoice,
+                    InvoiceControlJobReport::new(InvoiceControlJobOutcome::InvoiceSent)
+                )
+            ))
+        );
+        assert_eq!(
+            effects.donation_invoice_requests(),
+            vec![openplotva_telegram::DonationInvoiceLinkRequest {
+                user_id: 42,
+                amount_stars: 777,
+            }]
+        );
+        let invoice_messages = effects.invoice_messages();
+        assert_eq!(invoice_messages.len(), 1);
+        assert_eq!(invoice_messages[0].chat_id, 42);
+        assert_eq!(invoice_messages[0].url, "https://t.me/donate");
+        assert_eq!(
+            invoice_messages[0].button_text,
+            "🌟 Отправить донат 777 звезд?"
+        );
+        assert_eq!(
+            queue.snapshot()[0].status,
+            InMemoryPaymentControlJobStatus::Completed
+        );
+        assert_eq!(update_queue.len().await?, 0);
+
+        let _: i64 = redis::cmd("DEL").arg(&key).query_async(&mut redis).await?;
         Ok(())
     }
 
@@ -7417,6 +11531,9 @@ mod tests {
         item.job.data = JobPayload {
             job_type: JobType::Control,
             telegram_data: item.job.data.telegram_data.take(),
+            image_data: None,
+            music_data: None,
+            dialog_data: None,
             control_data: None,
         };
         let queue = PaymentControlJobWorkerQueueStub::default().with_next_job(item);
@@ -7491,6 +11608,47 @@ mod tests {
                 .dequeue_payment_control_job(CONTROL_QUEUE_NAME)
                 .await?
                 .is_none()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn in_memory_payment_control_job_queue_skips_non_payment_control_jobs()
+    -> Result<(), Box<dyn Error>> {
+        let created = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let queue = super::InMemoryPaymentControlJobQueue::new();
+        let translate = new_control_job_at(sample_invoice_job(ControlKind::Translate), created)
+            .with_name("translate")
+            .with_priority(HIGH_PRIORITY);
+        let donate = new_control_job_at(
+            sample_invoice_job(ControlKind::DonateInvoice),
+            created + time::Duration::seconds(1),
+        )
+        .with_name("donate")
+        .with_priority(DEFAULT_PRIORITY);
+
+        queue
+            .assign_payment_control_job(CONTROL_QUEUE_NAME, translate)
+            .await?;
+        queue
+            .assign_payment_control_job(CONTROL_QUEUE_NAME, donate)
+            .await?;
+
+        let item = queue
+            .dequeue_payment_control_job(CONTROL_QUEUE_NAME)
+            .await?
+            .expect("payment item");
+        assert_eq!(item.job.title, "donate");
+        let snapshot = queue.snapshot();
+        assert_eq!(snapshot[0].job.title, "translate");
+        assert_eq!(
+            snapshot[0].status,
+            super::InMemoryPaymentControlJobStatus::Pending
+        );
+        assert_eq!(snapshot[1].job.title, "donate");
+        assert_eq!(
+            snapshot[1].status,
+            super::InMemoryPaymentControlJobStatus::Processing
         );
         Ok(())
     }
@@ -7632,7 +11790,7 @@ mod tests {
     async fn persistent_payment_control_job_queue_saves_mutations_and_requeues_processing_on_startup()
     -> Result<(), Box<dyn Error>> {
         let path = unique_payment_queue_snapshot_path("persistent-payment-control");
-        let _ = std::fs::remove_file(&path);
+        remove_payment_queue_files(&path);
         let store = super::PaymentControlJobSnapshotFileStore::new(path.clone());
         let queue = super::PersistentPaymentControlJobQueue::load_or_new(store.clone())?;
         let created = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
@@ -7655,6 +11813,9 @@ mod tests {
         let encoded_text = std::fs::read_to_string(&path)?;
         assert!(encoded_text.starts_with('{'));
         assert!(encoded_text.contains(super::PAYMENT_CONTROL_JOB_QUEUE_SNAPSHOT_FORMAT));
+        let wal_path = super::payment_control_job_wal_path(&path);
+        assert_eq!(std::fs::metadata(&wal_path)?.len(), 0);
+        assert!(!payment_control_job_wal_archives(&wal_path)?.is_empty());
 
         let processing = queue
             .dequeue_payment_control_job(CONTROL_QUEUE_NAME)
@@ -7684,7 +11845,77 @@ mod tests {
         );
         assert_eq!(restored.snapshot()[1].completed_report, Some(report));
 
-        let _ = std::fs::remove_file(&path);
+        remove_payment_queue_files(&path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn persistent_payment_control_job_queue_replays_wal_when_snapshot_lags()
+    -> Result<(), Box<dyn Error>> {
+        let path = unique_payment_queue_snapshot_path("persistent-payment-control-wal-replay");
+        remove_payment_queue_files(&path);
+        let store = super::PaymentControlJobSnapshotFileStore::new(path.clone());
+        let queue = super::InMemoryPaymentControlJobQueue::new();
+        let created = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        queue
+            .assign_payment_control_job(
+                CONTROL_QUEUE_NAME,
+                new_control_job_at(sample_invoice_job(ControlKind::DonateInvoice), created)
+                    .with_name("donate invoice"),
+            )
+            .await?;
+        store.save_snapshot(&queue.persistence_snapshot())?;
+        queue
+            .assign_payment_control_job(
+                CONTROL_QUEUE_NAME,
+                new_control_job_at(
+                    sample_invoice_job(ControlKind::SuccessfulPayment),
+                    created + time::Duration::seconds(1),
+                )
+                .with_name("successful payment")
+                .with_priority(HIGH_PRIORITY),
+            )
+            .await?;
+        store.append_wal_snapshot(&queue.persistence_snapshot())?;
+
+        let restored = super::PersistentPaymentControlJobQueue::load_or_new(store)?;
+        let snapshot = restored.snapshot();
+        assert_eq!(snapshot.len(), 2);
+        assert_eq!(snapshot[0].job.title, "donate invoice");
+        assert_eq!(snapshot[1].job.title, "successful payment");
+
+        remove_payment_queue_files(&path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn persistent_payment_control_job_queue_prunes_wal_archives() -> Result<(), Box<dyn Error>>
+    {
+        let path = unique_payment_queue_snapshot_path("persistent-payment-control-wal-prune");
+        remove_payment_queue_files(&path);
+        let store = super::PaymentControlJobSnapshotFileStore::new(path.clone());
+        let queue = super::PersistentPaymentControlJobQueue::load_or_new(store)?;
+        let created = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+
+        for index in 0..(super::PAYMENT_CONTROL_JOB_WAL_ARCHIVE_KEEP + 3) {
+            queue
+                .assign_payment_control_job(
+                    CONTROL_QUEUE_NAME,
+                    new_control_job_at(
+                        sample_invoice_job(ControlKind::DonateInvoice),
+                        created + time::Duration::seconds(index as i64),
+                    )
+                    .with_name(format!("donate invoice {index}")),
+                )
+                .await?;
+        }
+
+        let wal_path = super::payment_control_job_wal_path(&path);
+        let archives = payment_control_job_wal_archives(&wal_path)?;
+        assert_eq!(archives.len(), super::PAYMENT_CONTROL_JOB_WAL_ARCHIVE_KEEP);
+        assert_eq!(std::fs::metadata(&wal_path)?.len(), 0);
+
+        remove_payment_queue_files(&path);
         Ok(())
     }
 
@@ -7694,6 +11925,42 @@ mod tests {
             std::process::id(),
             OffsetDateTime::now_utc().unix_timestamp_nanos()
         ))
+    }
+
+    fn remove_payment_queue_files(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(super::payment_control_job_snapshot_tmp_path(path));
+        let wal_path = super::payment_control_job_wal_path(path);
+        let _ = std::fs::remove_file(&wal_path);
+        if let Ok(archives) = payment_control_job_wal_archives(&wal_path) {
+            for archive in archives {
+                let _ = std::fs::remove_file(archive);
+            }
+        }
+    }
+
+    fn payment_control_job_wal_archives(
+        wal_path: &std::path::Path,
+    ) -> Result<Vec<std::path::PathBuf>, Box<dyn std::error::Error>> {
+        let Some(parent) = wal_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        else {
+            return Ok(Vec::new());
+        };
+        let Some(file_name) = wal_path.file_name().map(|name| name.to_string_lossy()) else {
+            return Ok(Vec::new());
+        };
+        let prefix = format!("{file_name}.archive.");
+        let mut archives = Vec::new();
+        for entry in std::fs::read_dir(parent)? {
+            let entry = entry?;
+            if entry.file_name().to_string_lossy().starts_with(&prefix) {
+                archives.push(entry.path());
+            }
+        }
+        archives.sort();
+        Ok(archives)
     }
 
     #[test]
@@ -7798,6 +12065,33 @@ mod tests {
         PaymentControlJobWorkItem {
             id,
             job: new_control_job_at(params, created),
+        }
+    }
+
+    struct PaymentOnlyControlJobRegistry<'a> {
+        store: &'a StoreStub,
+        effects: &'a EffectsStub,
+    }
+
+    impl ControlJobExecutorRegistry for PaymentOnlyControlJobRegistry<'_> {
+        fn execute_control_job<'a>(
+            &'a self,
+            params: &'a ControlJobParams,
+            now: OffsetDateTime,
+        ) -> ControlJobExecutorFuture<'a> {
+            Box::pin(async move {
+                let report =
+                    execute_payment_control_job_at(self.store, self.effects, params, now).await;
+                let execution = ControlJobExecution::Payment(report.clone());
+                if let Some(error) = payment_control_job_failure_message(&report) {
+                    ControlJobExecutionResult::Failed {
+                        execution: Some(execution),
+                        error,
+                    }
+                } else {
+                    ControlJobExecutionResult::Completed(execution)
+                }
+            })
         }
     }
 
@@ -7929,6 +12223,37 @@ mod tests {
         }))
     }
 
+    fn sample_vip_callback_update(
+        action: &str,
+        user_id: i64,
+    ) -> Result<TelegramUpdate, serde_json::Error> {
+        serde_json::from_value(json!({
+            "update_id": 1001,
+            "callback_query": {
+                "id": "vip-callback-id",
+                "from": {
+                    "id": user_id,
+                    "is_bot": false,
+                    "first_name": "Alice",
+                    "username": "alice"
+                },
+                "chat_instance": "chat-instance",
+                "data": format!(r#"{{"action":"{action}"}}"#),
+                "message": {
+                    "message_id": 555,
+                    "date": 1_710_000_000,
+                    "chat": {
+                        "id": 42,
+                        "type": "private",
+                        "first_name": "Alice",
+                        "username": "alice"
+                    },
+                    "text": "VIP status"
+                }
+            }
+        }))
+    }
+
     fn sample_group_payment_command_update(
         text: &str,
     ) -> Result<TelegramUpdate, serde_json::Error> {
@@ -8000,6 +12325,33 @@ mod tests {
         }
     }
 
+    fn method_names(methods: &[(String, serde_json::Value)]) -> Vec<&str> {
+        methods.iter().map(|(name, _)| name.as_str()).collect()
+    }
+
+    fn telegram_method_payload(
+        method: openplotva_telegram::TelegramOutboundMethod,
+    ) -> Result<serde_json::Value, StubError> {
+        match method {
+            openplotva_telegram::TelegramOutboundMethod::AnswerCallbackQuery(method) => {
+                serde_json::to_value(method.as_ref())
+            }
+            openplotva_telegram::TelegramOutboundMethod::EditMessageText(method) => {
+                serde_json::to_value(method.as_ref())
+            }
+            openplotva_telegram::TelegramOutboundMethod::EditUserStarSubscription(method) => {
+                serde_json::to_value(method.as_ref())
+            }
+            other => {
+                return Err(StubError::Other(format!(
+                    "unexpected Telegram method {}",
+                    other.method_name()
+                )));
+            }
+        }
+        .map_err(|error| StubError::Other(error.to_string()))
+    }
+
     fn active_subscription(
         created_at: OffsetDateTime,
         expires_at: OffsetDateTime,
@@ -8038,6 +12390,7 @@ mod tests {
         summary: Option<VipSummaryRecord>,
         active_subscription: Option<SubscriptionRecord>,
         cache: Option<VipCacheRecord>,
+        canceled_subscription_ids: Vec<i64>,
         calls: Vec<&'static str>,
     }
 
@@ -8068,6 +12421,10 @@ mod tests {
 
         fn calls(&self) -> Vec<&'static str> {
             self.lock().calls.clone()
+        }
+
+        fn canceled_subscription_ids(&self) -> Vec<i64> {
+            self.lock().canceled_subscription_ids.clone()
         }
 
         fn lock(&self) -> MutexGuard<'_, VipStatusStoreState> {
@@ -8126,6 +12483,25 @@ mod tests {
         }
     }
 
+    impl VipCancellationStore for VipStatusStoreStub {
+        fn mark_subscription_canceled<'a>(
+            &'a self,
+            id: i64,
+        ) -> PaymentStoreFuture<'a, SubscriptionRecord, Self::Error> {
+            Box::pin(async move {
+                let mut state = self.lock();
+                state.calls.push("mark_subscription_canceled");
+                state.canceled_subscription_ids.push(id);
+                let mut subscription = state.active_subscription.clone().unwrap_or_else(|| {
+                    active_subscription(OffsetDateTime::UNIX_EPOCH, OffsetDateTime::UNIX_EPOCH)
+                });
+                subscription.id = id;
+                subscription.canceled_at = Some(OffsetDateTime::UNIX_EPOCH);
+                Ok(subscription)
+            })
+        }
+    }
+
     #[derive(Clone, Default)]
     struct StoreStub {
         state: Arc<Mutex<StoreState>>,
@@ -8147,6 +12523,10 @@ mod tests {
         admin_cancel_active_subscriptions: VecDeque<Result<Option<SubscriptionRecord>, StubError>>,
         refunded_subscription_ids: Vec<i64>,
         mark_subscription_refunded_error: Option<StubError>,
+        admin_refund_subscriptions: VecDeque<Result<Option<SubscriptionRecord>, StubError>>,
+        admin_refund_donations: VecDeque<Result<Option<DonationRecord>, StubError>>,
+        deleted_donation_ids: Vec<i64>,
+        delete_donation_error: Option<StubError>,
     }
 
     impl StoreStub {
@@ -8225,6 +12605,33 @@ mod tests {
             self
         }
 
+        fn with_admin_refund_subscription(self, subscription: Option<SubscriptionRecord>) -> Self {
+            self.lock()
+                .admin_refund_subscriptions
+                .push_back(Ok(subscription));
+            self
+        }
+
+        fn with_admin_refund_subscription_error(self, error: StubError) -> Self {
+            self.lock().admin_refund_subscriptions.push_back(Err(error));
+            self
+        }
+
+        fn with_admin_refund_donation(self, donation: Option<DonationRecord>) -> Self {
+            self.lock().admin_refund_donations.push_back(Ok(donation));
+            self
+        }
+
+        fn with_admin_refund_donation_error(self, error: StubError) -> Self {
+            self.lock().admin_refund_donations.push_back(Err(error));
+            self
+        }
+
+        fn with_delete_donation_error(self, error: StubError) -> Self {
+            self.lock().delete_donation_error = Some(error);
+            self
+        }
+
         fn users(&self) -> Vec<UserState> {
             self.lock().users.clone()
         }
@@ -8243,6 +12650,10 @@ mod tests {
 
         fn refunded_subscription_ids(&self) -> Vec<i64> {
             self.lock().refunded_subscription_ids.clone()
+        }
+
+        fn deleted_donation_ids(&self) -> Vec<i64> {
+            self.lock().deleted_donation_ids.clone()
         }
 
         fn lock(&self) -> MutexGuard<'_, StoreState> {
@@ -8452,6 +12863,72 @@ mod tests {
         }
     }
 
+    impl super::AdminRefundStore for StoreStub {
+        type Error = StubError;
+
+        fn get_admin_refund_subscription_by_charge_id<'a>(
+            &'a self,
+            _telegram_payment_charge_id: &'a str,
+        ) -> PaymentStoreFuture<'a, Option<SubscriptionRecord>, Self::Error> {
+            Box::pin(async move {
+                let mut state = self.lock();
+                match state.admin_refund_subscriptions.pop_front() {
+                    Some(result) => result,
+                    None => Ok(state.existing_subscription.clone()),
+                }
+            })
+        }
+
+        fn get_admin_refund_donation_by_charge_id<'a>(
+            &'a self,
+            _telegram_payment_charge_id: &'a str,
+        ) -> PaymentStoreFuture<'a, Option<DonationRecord>, Self::Error> {
+            Box::pin(async move {
+                Ok(self
+                    .lock()
+                    .admin_refund_donations
+                    .pop_front()
+                    .transpose()?
+                    .flatten())
+            })
+        }
+
+        fn mark_admin_refund_subscription_refunded<'a>(
+            &'a self,
+            id: i64,
+        ) -> PaymentStoreFuture<'a, SubscriptionRecord, Self::Error> {
+            <Self as super::AdminCancelVipStore>::mark_subscription_refunded(self, id)
+        }
+
+        fn create_admin_refund_vip_event<'a>(
+            &'a self,
+            event: VipEventCreate<'a>,
+        ) -> PaymentStoreFuture<'a, VipEventRecord, Self::Error> {
+            <Self as SuccessfulPaymentStore>::create_vip_event(self, event)
+        }
+
+        fn delete_admin_refund_donation<'a>(
+            &'a self,
+            id: i64,
+        ) -> PaymentStoreFuture<'a, DonationRecord, Self::Error> {
+            Box::pin(async move {
+                let mut state = self.lock();
+                state.deleted_donation_ids.push(id);
+                if let Some(error) = state.delete_donation_error.take() {
+                    return Err(error);
+                }
+                Ok(DonationRecord {
+                    id,
+                    user_id: 42,
+                    telegram_payment_charge_id: "donation-charge".to_owned(),
+                    provider_payment_charge_id: String::new(),
+                    amount_stars: 123,
+                    created_at: OffsetDateTime::UNIX_EPOCH,
+                })
+            })
+        }
+    }
+
     #[derive(Clone, Default)]
     struct VirtualMessageStoreStub {
         state: Arc<Mutex<VirtualMessageStoreState>>,
@@ -8587,9 +13064,11 @@ mod tests {
         invoice_error_texts: Vec<(i64, i32, String, String)>,
         vip_status_messages: Vec<super::VipStatusMessage>,
         vip_status_error_texts: Vec<(i64, i32, String, String)>,
+        vip_callback_methods: Vec<(String, serde_json::Value)>,
         refund_requests: Vec<(i64, String)>,
         next_refund_error: Option<StubError>,
         direct_texts: Vec<(i64, String)>,
+        payment_redirect_messages: Vec<PaymentRedirectMessage>,
     }
 
     impl EffectsStub {
@@ -8660,6 +13139,14 @@ mod tests {
 
         fn vip_status_messages(&self) -> Vec<super::VipStatusMessage> {
             self.lock().vip_status_messages.clone()
+        }
+
+        fn vip_callback_methods(&self) -> Vec<(String, serde_json::Value)> {
+            self.lock().vip_callback_methods.clone()
+        }
+
+        fn payment_redirect_messages(&self) -> Vec<PaymentRedirectMessage> {
+            self.lock().payment_redirect_messages.clone()
         }
 
         fn lock(&self) -> MutexGuard<'_, EffectsState> {
@@ -8776,6 +13263,43 @@ mod tests {
         }
     }
 
+    impl super::PaymentRedirectEffects for EffectsStub {
+        type Error = StubError;
+
+        fn send_payment_redirect_message<'a>(
+            &'a self,
+            message: PaymentRedirectMessage,
+        ) -> PaymentEffectsFuture<'a, Self::Error> {
+            Box::pin(async move {
+                self.lock().payment_redirect_messages.push(message);
+                Ok(())
+            })
+        }
+    }
+
+    impl VipCancellationEffects for EffectsStub {
+        type Error = StubError;
+
+        fn execute_vip_cancellation_method<'a>(
+            &'a self,
+            method: openplotva_telegram::TelegramOutboundMethod,
+        ) -> VipCancellationEffectFuture<'a, Self::Error> {
+            Box::pin(async move {
+                let name = method.method_name().to_owned();
+                let payload = telegram_method_payload(method)?;
+                self.lock().vip_callback_methods.push((name, payload));
+                Ok(())
+            })
+        }
+
+        fn invalidate_vip_cancellation_cache<'a>(
+            &'a self,
+            user_id: i64,
+        ) -> VipCancellationEffectFuture<'a, Self::Error> {
+            <Self as SuccessfulPaymentEffects>::invalidate_vip_cache(self, user_id)
+        }
+    }
+
     impl PaymentInvoiceEffects for EffectsStub {
         type Error = StubError;
 
@@ -8852,6 +13376,130 @@ mod tests {
                     Some(error) => Err(error),
                     None => Ok(()),
                 }
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct CallbackAckEffectsStub {
+        methods: Mutex<
+            Vec<(
+                openplotva_telegram::TelegramOutboundMethodKind,
+                serde_json::Value,
+            )>,
+        >,
+    }
+
+    impl CallbackAckEffectsStub {
+        fn methods(
+            &self,
+        ) -> Vec<(
+            openplotva_telegram::TelegramOutboundMethodKind,
+            serde_json::Value,
+        )> {
+            self.methods.lock().expect("callback ack methods").clone()
+        }
+    }
+
+    impl CallbackQueryEffects for CallbackAckEffectsStub {
+        type Error = io::Error;
+
+        fn answer_callback_query<'a>(
+            &'a self,
+            method: openplotva_telegram::TelegramOutboundMethod,
+        ) -> CallbackQueryFuture<'a, Self::Error> {
+            Box::pin(async move {
+                let kind = method.kind();
+                let payload = match method {
+                    openplotva_telegram::TelegramOutboundMethod::AnswerCallbackQuery(method) => {
+                        serde_json::to_value(method.as_ref()).map_err(io::Error::other)?
+                    }
+                    _ => return Err(io::Error::other("unexpected callback ack method")),
+                };
+                self.methods
+                    .lock()
+                    .expect("callback ack methods")
+                    .push((kind, payload));
+                Ok(())
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct CallbackRateLimitStub {
+        limited_chat_id: Option<i64>,
+    }
+
+    impl CallbackRateLimitPolicy for CallbackRateLimitStub {
+        fn is_callback_chat_rate_limited<'a>(
+            &'a self,
+            chat_id: i64,
+        ) -> CallbackRateLimitFuture<'a> {
+            Box::pin(async move { self.limited_chat_id == Some(chat_id) })
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct UpdateStateStoreStub {
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl UpdateStateStoreStub {
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().expect("state calls").clone()
+        }
+    }
+
+    impl UpdateStateStore for UpdateStateStoreStub {
+        type Error = io::Error;
+
+        fn upsert_chat_state<'a>(
+            &'a self,
+            chat: &'a openplotva_core::ChatState,
+        ) -> UpdateStateStoreFuture<'a, Self::Error> {
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .map_err(|err| io::Error::other(err.to_string()))?
+                    .push(format!(
+                        "chat:{}:{}:{}:{}",
+                        chat.id,
+                        chat.chat_type,
+                        chat.first_name.as_deref().unwrap_or_default(),
+                        chat.username.as_deref().unwrap_or_default()
+                    ));
+                Ok(())
+            })
+        }
+
+        fn upsert_user_state<'a>(
+            &'a self,
+            user: &'a UserState,
+        ) -> UpdateStateStoreFuture<'a, Self::Error> {
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .map_err(|err| io::Error::other(err.to_string()))?
+                    .push(format!(
+                        "user:{}:{}:{}",
+                        user.id,
+                        user.first_name,
+                        user.username.as_deref().unwrap_or_default()
+                    ));
+                Ok(())
+            })
+        }
+
+        fn upsert_telegram_file_metadata<'a>(
+            &'a self,
+            params: &'a openplotva_storage::TelegramFileMetadataUpsert,
+        ) -> TelegramFileMetadataStoreFuture<'a, Self::Error> {
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .map_err(|err| io::Error::other(err.to_string()))?
+                    .push(format!("file:{}", params.file_unique_id));
+                Ok(())
             })
         }
     }
@@ -9025,6 +13673,7 @@ mod tests {
     #[derive(Clone, Debug)]
     enum StubError {
         Duplicate,
+        Other(String),
         Request,
     }
 
@@ -9032,6 +13681,7 @@ mod tests {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             match self {
                 Self::Duplicate => f.write_str("duplicate"),
+                Self::Other(message) => f.write_str(message),
                 Self::Request => f.write_str("request"),
             }
         }
