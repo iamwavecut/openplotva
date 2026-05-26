@@ -9,8 +9,9 @@ publish = false
 
 [dependencies]
 openplotva-config = { path = "../openplotva-config" }
+serde_json.workspace = true
+tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
 
 [lints]
 workspace = true
-

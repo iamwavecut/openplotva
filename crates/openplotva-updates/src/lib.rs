@@ -29,7 +29,6 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 /// Human-readable crate purpose used by scaffold tests and docs.
 pub const PURPOSE: &str = "updates";
 
-/// Go `internal/updates.QueueKey` Redis list used for Telegram update ingestion.
 pub const DEFAULT_UPDATE_QUEUE_KEY: &str = "plotva:updates:queue";
 
 /// Rust-native update payload format stored inside the Redis update queue.
@@ -37,10 +36,8 @@ pub const NATIVE_UPDATE_CODEC: &str = "openplotva.update.v1+carapax-json.zstd";
 
 pub const NATIVE_UPDATE_FORMAT_VERSION: u16 = 1;
 
-/// Go `internal/processor` dequeue timeout for the update consumer loop.
 pub const DEFAULT_UPDATE_DEQUEUE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Go `internal/fetcher.allowedUpdates` names passed to Telegram startup.
 pub const GO_ALLOWED_UPDATE_NAMES: &[&str] = &[
     "message",
     "edited_message",
@@ -54,7 +51,6 @@ pub const GO_ALLOWED_UPDATE_NAMES: &[&str] = &[
     "pre_checkout_query",
 ];
 
-/// Go `internal/fetcher.allowedUpdates` represented as native `carapax` values.
 pub const GO_ALLOWED_UPDATES: &[TelegramAllowedUpdate] = &[
     TelegramAllowedUpdate::Message,
     TelegramAllowedUpdate::EditedMessage,
@@ -68,28 +64,48 @@ pub const GO_ALLOWED_UPDATES: &[TelegramAllowedUpdate] = &[
     TelegramAllowedUpdate::PreCheckoutQuery,
 ];
 
-/// Go `internal/processor.updateStateTimeout`.
+pub const TELEGRAM_FILE_MEDIA_KIND_PHOTO: &str = "photo";
+pub const TELEGRAM_FILE_MEDIA_KIND_DOCUMENT: &str = "document";
+pub const TELEGRAM_FILE_MEDIA_KIND_AUDIO: &str = "audio";
+pub const TELEGRAM_FILE_MEDIA_KIND_VOICE: &str = "voice";
+pub const TELEGRAM_FILE_MEDIA_KIND_STICKER: &str = "sticker";
+
 pub const UPDATE_STATE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Go `internal/processor.updateHandleTimeout`.
 pub const UPDATE_HANDLE_TIMEOUT: Duration = Duration::from_secs(45);
 
-/// Go `shouldSkipSideEffects` max age.
 pub const UPDATE_SIDE_EFFECT_MAX_AGE: Duration = Duration::from_secs(60);
 
-/// Go `internal/processor.updateStallAge`.
 pub const UPDATE_STALL_AGE: Duration = Duration::from_secs(120);
 
-/// Go update consumer worker limit multiplier over available CPUs.
 pub const UPDATE_WORKER_LIMIT_PER_CPU: usize = 4;
 
-/// Go guest inline chain max message count.
 pub const GUEST_CHAIN_MAX_MESSAGES: usize = 15;
 
-/// Go update classifier names used by the fetcher before enqueueing updates.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TelegramFileMetadataRef {
+    /// Telegram downloadable file ID.
+    pub file_id: String,
+    /// Telegram stable unique file ID.
+    pub file_unique_id: String,
+    pub media_kind: String,
+    pub mime_type: String,
+    /// Image/sticker width.
+    pub width: i32,
+    /// Image/sticker height.
+    pub height: i32,
+    /// File size in bytes.
+    pub file_size: i64,
+    /// Source chat ID.
+    pub chat_id: i64,
+    /// Source message ID.
+    pub message_id: i64,
+    /// Forum topic/thread ID, or zero when absent.
+    pub thread_id: i32,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GoUpdateType {
-    /// No Go-known update payload is present.
     Unknown,
     /// `message`.
     Message,
@@ -128,7 +144,6 @@ pub enum GoUpdateType {
 }
 
 impl GoUpdateType {
-    /// Return the Go string form for this update classifier value.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -153,7 +168,6 @@ impl GoUpdateType {
         }
     }
 
-    /// Return whether Go's fetcher enqueues this update type.
     #[must_use]
     pub const fn is_allowed(self) -> bool {
         matches!(
@@ -173,7 +187,6 @@ impl GoUpdateType {
 }
 
 ///
-/// The Go runtime stored each update as zstd-compressed `encoding/gob`
 /// envelope around `carapax::types::Update`, then compresses that envelope
 /// with zstd before pushing it as a binary-safe Redis string.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -235,7 +248,7 @@ impl EncodedUpdate {
             });
         }
 
-        Ok(serde_json::from_value(envelope.update)?)
+        Ok(decode_telegram_update_value(envelope.update)?)
     }
 }
 
@@ -244,6 +257,41 @@ struct NativeUpdateEnvelope {
     version: u16,
     codec: String,
     update: serde_json::Value,
+}
+
+/// Decode one Telegram update JSON payload with compatibility fixes for
+/// Bot API fields not represented by the current `carapax` wire shape.
+pub fn decode_telegram_update_json_slice(
+    bytes: &[u8],
+) -> Result<TelegramUpdate, serde_json::Error> {
+    decode_telegram_update_value(serde_json::from_slice(bytes)?)
+}
+
+/// Decode one Telegram update JSON value with compatibility fixes for
+/// Bot API fields not represented by the current `carapax` wire shape.
+pub fn decode_telegram_update_value(
+    mut value: serde_json::Value,
+) -> Result<TelegramUpdate, serde_json::Error> {
+    normalize_poll_answer_voter_chat(&mut value);
+    serde_json::from_value(value)
+}
+
+fn normalize_poll_answer_voter_chat(value: &mut serde_json::Value) {
+    let Some(update) = value.as_object_mut() else {
+        return;
+    };
+    let Some(poll_answer) = update
+        .get_mut("poll_answer")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    if poll_answer.contains_key("chat") {
+        return;
+    }
+    if let Some(voter_chat) = poll_answer.get("voter_chat").cloned() {
+        poll_answer.insert("chat".to_owned(), voter_chat);
+    }
 }
 
 #[derive(Serialize)]
@@ -261,7 +309,6 @@ pub struct RedisUpdateQueue {
 }
 
 impl RedisUpdateQueue {
-    /// Create a queue using the Go update queue key.
     pub fn new(client: RedisClient) -> Self {
         Self::with_key(client, DEFAULT_UPDATE_QUEUE_KEY)
     }
@@ -279,7 +326,6 @@ impl RedisUpdateQueue {
         &self.key
     }
 
-    /// Enqueue an already-encoded Telegram update with Go `RPUSH` semantics.
     pub async fn enqueue_encoded(&self, update: &EncodedUpdate) -> Result<(), UpdateQueueError> {
         let mut connection = self.client.get_multiplexed_async_connection().await?;
         let _: i64 = redis::cmd("RPUSH")
@@ -296,7 +342,6 @@ impl RedisUpdateQueue {
         self.enqueue_encoded(&update).await
     }
 
-    /// Encode and enqueue only updates Go's fetcher would pass through.
     ///
     /// Returns `Ok(true)` when the update was pushed and `Ok(false)` when the
     /// update type is intentionally ignored.
@@ -311,9 +356,7 @@ impl RedisUpdateQueue {
         Ok(true)
     }
 
-    /// Dequeue one encoded update with Go `BLPOP` semantics.
     ///
-    /// `Ok(None)` corresponds to Go `cache.ErrNotFound`, including a timeout.
     pub async fn dequeue_encoded(
         &self,
         timeout: Duration,
@@ -366,7 +409,6 @@ impl RedisUpdateQueue {
         Ok(Some(process_update(update, config, state, handle).await))
     }
 
-    /// Return the Redis list length using Go `LLEN` semantics.
     pub async fn len(&self) -> Result<i64, UpdateQueueError> {
         let mut connection = self.client.get_multiplexed_async_connection().await?;
         let len: i64 = redis::cmd("LLEN")
@@ -418,33 +460,25 @@ impl UpdateProducerQueue for RedisUpdateQueue {
     }
 }
 
-/// Summary for one Go-style update producer run.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct UpdateProducerRunReport {
     /// Updates received from the source.
     pub received: usize,
-    /// Updates accepted by the Go producer filter and successfully enqueued.
     pub enqueued: usize,
-    /// Updates rejected by the Go producer filter.
     pub skipped: usize,
-    /// Enqueue errors observed; the producer continues after these like Go logs and continues.
     pub enqueue_errors: Vec<String>,
     /// Whether the source closed before shutdown was requested.
     pub source_closed: bool,
 }
 
-/// Options for extracting Go-shaped attachment metadata from a Telegram message.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TelegramMessageAttachmentOptions {
-    /// Attachment source; blanks default to Go's `message`.
     pub source: String,
     /// Caption supplied by the caller, trimmed before use.
     pub caption: String,
-    /// Whether Go should promote the first image-like ref for inbound history.
     pub promote_first_image_ref: bool,
 }
 
-/// Run Go's update producer loop over an abstract source and queue.
 pub async fn run_update_producer_until<S, Q, Stop>(
     source: &S,
     queue: &Q,
@@ -493,7 +527,6 @@ where
     report
 }
 
-/// Runtime knobs matching the Go update consumer defaults.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UpdateConsumerConfig {
     /// Blocking pop timeout for one queue read.
@@ -537,7 +570,6 @@ pub enum UpdateStage {
 pub enum UpdateStageOutcome {
     /// Stage completed without returning an error.
     Completed,
-    /// Stage returned an error. Go logs these and keeps the consumer alive.
     Failed(String),
     /// Stage exceeded its configured timeout.
     TimedOut,
@@ -554,6 +586,37 @@ pub struct UpdateStageReport {
     pub elapsed: Duration,
 }
 
+/// Observer for live update consumer stage diagnostics.
+pub trait UpdateStageTracker {
+    /// Register one stage start and return a token passed back on finish.
+    fn stage_started(
+        &self,
+        update: &TelegramUpdate,
+        stage: UpdateStage,
+        started_at: SystemTime,
+    ) -> u64;
+
+    /// Register one stage finish.
+    fn stage_finished(&self, token: u64, report: &UpdateStageReport, finished_at: SystemTime);
+}
+
+/// No-op update stage tracker.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoopUpdateStageTracker;
+
+impl UpdateStageTracker for NoopUpdateStageTracker {
+    fn stage_started(
+        &self,
+        _update: &TelegramUpdate,
+        _stage: UpdateStage,
+        _started_at: SystemTime,
+    ) -> u64 {
+        0
+    }
+
+    fn stage_finished(&self, _token: u64, _report: &UpdateStageReport, _finished_at: SystemTime) {}
+}
+
 /// Report for one decoded update.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UpdateProcessReport {
@@ -568,7 +631,6 @@ pub struct UpdateProcessReport {
     pub skipped_handle: bool,
 }
 
-/// Process one update using Go consumer stage ordering and timeouts.
 pub async fn process_update<StateFn, StateFuture, StateError, HandleFn, HandleFuture, HandleError>(
     update: TelegramUpdate,
     config: UpdateConsumerConfig,
@@ -608,13 +670,52 @@ where
     HandleFuture: Future<Output = Result<(), HandleError>>,
     HandleError: fmt::Display,
 {
+    process_update_with_stage_tracker_at(
+        update,
+        config,
+        now,
+        state,
+        handle,
+        &NoopUpdateStageTracker,
+    )
+    .await
+}
+
+/// Process one update with live stage tracking hooks.
+pub async fn process_update_with_stage_tracker_at<
+    StateFn,
+    StateFuture,
+    StateError,
+    HandleFn,
+    HandleFuture,
+    HandleError,
+    Tracker,
+>(
+    update: TelegramUpdate,
+    config: UpdateConsumerConfig,
+    now: SystemTime,
+    state: StateFn,
+    handle: HandleFn,
+    tracker: &Tracker,
+) -> UpdateProcessReport
+where
+    StateFn: FnOnce(TelegramUpdate) -> StateFuture,
+    StateFuture: Future<Output = Result<(), StateError>>,
+    StateError: fmt::Display,
+    HandleFn: FnOnce(TelegramUpdate) -> HandleFuture,
+    HandleFuture: Future<Output = Result<(), HandleError>>,
+    HandleError: fmt::Display,
+    Tracker: UpdateStageTracker + ?Sized,
+{
     let update_id = update.id;
     let name = update_name(&update);
     let skip_handle = should_skip_side_effects_at(&update, config.side_effect_max_age, now);
-    let state_task = run_stage(
+    let state_task = run_tracked_stage(
+        &update,
         UpdateStage::State,
         config.state_timeout,
         state(update.clone()),
+        tracker,
     );
 
     if skip_handle {
@@ -627,7 +728,14 @@ where
         };
     }
 
-    let handle_task = run_stage(UpdateStage::Handle, config.handle_timeout, handle(update));
+    let handle_update = update.clone();
+    let handle_task = run_tracked_stage(
+        &update,
+        UpdateStage::Handle,
+        config.handle_timeout,
+        handle(handle_update),
+        tracker,
+    );
     let (state, handle) = tokio::join!(state_task, handle_task);
 
     UpdateProcessReport {
@@ -639,22 +747,29 @@ where
     }
 }
 
-/// Return the Go consumer stats name for an update.
 pub fn update_name(update: &TelegramUpdate) -> &'static str {
     match &update.update_type {
-        TelegramUpdateType::Message(_) => "message",
-        TelegramUpdateType::EditedMessage(_) => "edited_message",
-        TelegramUpdateType::GuestMessage(_) => "guest_message",
-        TelegramUpdateType::CallbackQuery(_) => "callback_query",
-        TelegramUpdateType::PreCheckoutQuery(_) => "pre_checkout_query",
-        TelegramUpdateType::BotStatus(_) => "my_chat_member",
-        TelegramUpdateType::UserStatus(_) => "chat_member",
-        TelegramUpdateType::ChatJoinRequest(_) => "chat_join_request",
+        TelegramUpdateType::Message(_) => GoUpdateType::Message.as_str(),
+        TelegramUpdateType::EditedMessage(_) => GoUpdateType::EditedMessage.as_str(),
+        TelegramUpdateType::GuestMessage(_) => GoUpdateType::GuestMessage.as_str(),
+        TelegramUpdateType::ChannelPost(_) => GoUpdateType::ChannelPost.as_str(),
+        TelegramUpdateType::EditedChannelPost(_) => GoUpdateType::EditedChannelPost.as_str(),
+        TelegramUpdateType::InlineQuery(_) => GoUpdateType::InlineQuery.as_str(),
+        TelegramUpdateType::ChosenInlineResult(_) => GoUpdateType::ChosenInlineResult.as_str(),
+        TelegramUpdateType::CallbackQuery(_) => GoUpdateType::CallbackQuery.as_str(),
+        TelegramUpdateType::ShippingQuery(_) => GoUpdateType::ShippingQuery.as_str(),
+        TelegramUpdateType::PreCheckoutQuery(_) => GoUpdateType::PreCheckoutQuery.as_str(),
+        TelegramUpdateType::Poll(_) => GoUpdateType::Poll.as_str(),
+        TelegramUpdateType::PollAnswer(_) => GoUpdateType::PollAnswer.as_str(),
+        TelegramUpdateType::BotStatus(_) => GoUpdateType::MyChatMember.as_str(),
+        TelegramUpdateType::UserStatus(_) => GoUpdateType::ChatMember.as_str(),
+        TelegramUpdateType::ChatJoinRequest(_) => GoUpdateType::ChatJoinRequest.as_str(),
+        TelegramUpdateType::MessageReaction(_) => GoUpdateType::MessageReaction.as_str(),
+        TelegramUpdateType::MessageReactionCount(_) => GoUpdateType::MessageReactionCount.as_str(),
         _ => "unknown",
     }
 }
 
-/// Return the Go fetcher classification for an update before enqueueing.
 #[must_use]
 pub fn producer_update_type(update: &TelegramUpdate) -> GoUpdateType {
     match &update.update_type {
@@ -679,19 +794,16 @@ pub fn producer_update_type(update: &TelegramUpdate) -> GoUpdateType {
     }
 }
 
-/// Return the Go fetcher classification name for an update before enqueueing.
 #[must_use]
 pub fn producer_update_name(update: &TelegramUpdate) -> &'static str {
     producer_update_type(update).as_str()
 }
 
-/// Return whether Go's fetcher would enqueue this update.
 #[must_use]
 pub fn is_allowed_producer_update(update: &TelegramUpdate) -> bool {
     producer_update_type(update).is_allowed()
 }
 
-/// Extract the chat/user state Go persists before update side effects.
 pub fn extract_update_state(update: &TelegramUpdate) -> Option<UpdateState> {
     if matches!(update.update_type, TelegramUpdateType::GuestMessage(_)) {
         return None;
@@ -702,7 +814,80 @@ pub fn extract_update_state(update: &TelegramUpdate) -> Option<UpdateState> {
     UpdateState::new(chat, user)
 }
 
-/// Extract Go `utils.TelegramMessageAttachments` metadata from a Telegram message.
+///
+/// that can use media references for vision/audio context.
+#[must_use]
+pub fn update_file_metadata_refs(update: &TelegramUpdate) -> Vec<TelegramFileMetadataRef> {
+    match &update.update_type {
+        TelegramUpdateType::Message(message) | TelegramUpdateType::EditedMessage(message) => {
+            telegram_message_and_reply_file_metadata_refs(message)
+        }
+        _ => Vec::new(),
+    }
+}
+
+#[must_use]
+pub fn telegram_message_and_reply_file_metadata_refs(
+    message: &TelegramMessage,
+) -> Vec<TelegramFileMetadataRef> {
+    let mut refs = telegram_message_file_metadata_refs(message);
+    if let Some(reply) = reply_message(message) {
+        refs.extend(telegram_message_file_metadata_refs(reply));
+    }
+    refs
+}
+
+#[must_use]
+pub fn telegram_message_file_metadata_refs(
+    message: &TelegramMessage,
+) -> Vec<TelegramFileMetadataRef> {
+    let Some(base) = telegram_file_metadata_base(message) else {
+        return Vec::new();
+    };
+
+    let mut refs = Vec::new();
+    if let TelegramMessageData::Photo(photo) = &message.data
+        && let Some(ref_data) = photo.data.last()
+    {
+        refs.push(
+            base.clone()
+                .with_file(
+                    &ref_data.file_id,
+                    &ref_data.file_unique_id,
+                    TELEGRAM_FILE_MEDIA_KIND_PHOTO,
+                    "",
+                    ref_data.file_size.unwrap_or_default(),
+                )
+                .with_dimensions(ref_data.width, ref_data.height),
+        );
+    }
+    if let Some(ref_data) = document_file_metadata_ref(&base, &message.data) {
+        refs.push(ref_data);
+    }
+    if let TelegramMessageData::Audio(audio) = &message.data {
+        refs.push(base.clone().with_file(
+            &audio.data.file_id,
+            &audio.data.file_unique_id,
+            TELEGRAM_FILE_MEDIA_KIND_AUDIO,
+            audio.data.mime_type.as_deref().unwrap_or_default(),
+            audio.data.file_size.unwrap_or_default(),
+        ));
+    }
+    if let TelegramMessageData::Voice(voice) = &message.data {
+        refs.push(base.clone().with_file(
+            &voice.data.file_id,
+            &voice.data.file_unique_id,
+            TELEGRAM_FILE_MEDIA_KIND_VOICE,
+            "audio/ogg",
+            voice.data.file_size.unwrap_or_default(),
+        ));
+    }
+    if let Some(ref_data) = sticker_file_metadata_ref(&base, &message.data) {
+        refs.push(ref_data);
+    }
+    refs
+}
+
 #[must_use]
 pub fn telegram_message_attachments(
     message: &TelegramMessage,
@@ -725,7 +910,6 @@ pub fn telegram_message_attachments(
     out
 }
 
-/// Return Go `fetcher.detectMessageType` for a Telegram message plus known attachments.
 #[must_use]
 pub fn detect_message_type(
     message: Option<&TelegramMessage>,
@@ -737,7 +921,6 @@ pub fn detect_message_type(
         .to_owned()
 }
 
-/// Collect Go fetcher media attachments that are not already present in metadata.
 #[must_use]
 pub fn collect_media_attachments(
     message: Option<&TelegramMessage>,
@@ -755,7 +938,88 @@ pub fn collect_media_attachments(
     out
 }
 
-/// Resolve Go `utils.ResolveMessageSender` metadata from a Telegram message.
+fn collect_dialog_attachments(message: &TelegramMessage) -> Vec<ChatAttachment> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::with_capacity(2);
+
+    if let Some(reply) = reply_message(message) {
+        add_dialog_attachment(
+            &mut out,
+            &mut seen,
+            "quoted",
+            "image",
+            first_dialog_image_unique_id(reply),
+        );
+        add_dialog_attachment(
+            &mut out,
+            &mut seen,
+            "quoted",
+            "audio",
+            first_dialog_audio_unique_id(reply),
+        );
+    }
+
+    out
+}
+
+fn add_dialog_attachment(
+    out: &mut Vec<ChatAttachment>,
+    seen: &mut HashSet<String>,
+    source: &str,
+    kind: &str,
+    file_unique_id: Option<String>,
+) {
+    let Some(file_unique_id) = file_unique_id else {
+        return;
+    };
+    let file_unique_id = file_unique_id.trim();
+    if file_unique_id.is_empty() || !seen.insert(file_unique_id.to_owned()) {
+        return;
+    }
+    out.push(ChatAttachment {
+        kind: kind.to_owned(),
+        source: source.to_owned(),
+        file_unique_id: file_unique_id.to_owned(),
+        ..ChatAttachment::default()
+    });
+}
+
+fn first_dialog_image_unique_id(message: &TelegramMessage) -> Option<String> {
+    match &message.data {
+        TelegramMessageData::Photo(photo) => {
+            photo.data.last().map(|photo| photo.file_unique_id.clone())
+        }
+        TelegramMessageData::Document(document)
+            if has_mime_prefix(
+                document.data.mime_type.as_deref().unwrap_or_default(),
+                "image/",
+            ) =>
+        {
+            Some(document.data.file_unique_id.clone())
+        }
+        TelegramMessageData::Sticker(sticker) if !sticker.is_animated && !sticker.is_video => {
+            Some(sticker.file_unique_id.clone())
+        }
+        _ => None,
+    }
+}
+
+fn first_dialog_audio_unique_id(message: &TelegramMessage) -> Option<String> {
+    match &message.data {
+        TelegramMessageData::Audio(audio) => Some(audio.data.file_unique_id.clone()),
+        TelegramMessageData::Voice(voice) => Some(voice.data.file_unique_id.clone()),
+        TelegramMessageData::Document(document)
+            if has_mime_prefix(
+                document.data.mime_type.as_deref().unwrap_or_default(),
+                "audio/",
+            ) =>
+        {
+            Some(document.data.file_unique_id.clone())
+        }
+        _ => None,
+    }
+}
+
 #[must_use]
 pub fn resolve_message_sender(message: Option<&TelegramMessage>) -> MessageSender {
     let Some(message) = message else {
@@ -807,7 +1071,6 @@ pub fn resolve_message_sender(message: Option<&TelegramMessage>) -> MessageSende
     }
 }
 
-/// Build Go `fetcher.buildMessageMeta` output for a message.
 #[must_use]
 pub fn build_message_meta(
     message: Option<&TelegramMessage>,
@@ -831,34 +1094,28 @@ pub fn build_message_meta(
     meta
 }
 
-/// Go fetcher message context fields needed before higher-level routing is ported.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FetcherMessageContext {
-    /// Original `Message.Text` before Go fills fallback content from captions or media.
     pub original_text: String,
-    /// Go fetcher message text after fallback extraction.
     pub text: String,
-    /// Go `buildMessageMeta` output.
     pub meta: ChatMessageMeta,
 }
 
-/// Build the history-relevant part of Go `Fetcher.newMessageContext`.
 #[must_use]
 pub fn build_fetcher_message_context(message: &TelegramMessage) -> FetcherMessageContext {
     let sender = resolve_message_sender(Some(message));
+    let attachments = collect_dialog_attachments(message);
     FetcherMessageContext {
         original_text: message_text_before_fetcher_fallback(message),
         text: fetcher_message_text(message),
-        meta: build_message_meta(Some(message), sender, &[], ""),
+        meta: build_message_meta(Some(message), sender, &attachments, ""),
     }
 }
 
-/// Result of Go `parseIfAdressed` over a Telegram message.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ParsedAddressedMessage {
     /// Text used as the full message text for downstream handling.
     pub message_text: String,
-    /// First parsed word after Go strips direct bot addressing where applicable.
     pub first_word: String,
     /// Remaining parsed text after the first word.
     pub rest_text: String,
@@ -866,7 +1123,6 @@ pub struct ParsedAddressedMessage {
     pub is_addressed: bool,
 }
 
-/// Parse Go fetcher addressing semantics for a Telegram message.
 #[must_use]
 pub fn parse_if_addressed(message: &TelegramMessage, bot: &TelegramUser) -> ParsedAddressedMessage {
     let (message_text, text_for_parsing) = addressable_message_text(message);
@@ -910,7 +1166,6 @@ pub fn parse_if_addressed(message: &TelegramMessage, bot: &TelegramUser) -> Pars
     }
 }
 
-/// Return whether this message is Go's `/settings` command for the current bot.
 #[must_use]
 pub fn is_settings_command_message(message: &TelegramMessage, bot_username: &str) -> bool {
     let Some(command) = leading_bot_command(message) else {
@@ -928,7 +1183,6 @@ pub fn is_settings_command_message(message: &TelegramMessage, bot_username: &str
         .is_none_or(|target| target.eq_ignore_ascii_case(bot_username))
 }
 
-/// Parse Go `parseEditCommand` semantics for image-edit intent text.
 #[must_use]
 pub fn parse_edit_command(text: &str) -> Option<String> {
     let trimmed = text.trim();
@@ -940,7 +1194,6 @@ pub fn parse_edit_command(text: &str) -> Option<String> {
     is_edit_verb(&first_word).then(|| rest_text.trim().to_owned())
 }
 
-/// Parse Go `resolveDrawPromptFromMessage` semantics for draw command text.
 #[must_use]
 pub fn resolve_draw_prompt_from_message(
     message: &TelegramMessage,
@@ -952,7 +1205,6 @@ pub fn resolve_draw_prompt_from_message(
         .then(|| draw_prompt_with_reply_context(rest_text, Some(message)))
 }
 
-/// Compose Go `drawPromptWithReplyContext` prompt text for reply-based draws.
 #[must_use]
 pub fn draw_prompt_with_reply_context(text: &str, message: Option<&TelegramMessage>) -> String {
     let trimmed = text.trim();
@@ -985,7 +1237,6 @@ pub fn draw_prompt_with_reply_context(text: &str, message: Option<&TelegramMessa
     .to_owned()
 }
 
-/// Result of Go `editedImagePromptUpdate` for pending image job updates.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EditedImagePromptUpdate {
     /// Prompt with message metadata context composed for image generation.
@@ -994,7 +1245,6 @@ pub struct EditedImagePromptUpdate {
     pub original_prompt: String,
 }
 
-/// Compose Go `editedImagePromptUpdate` semantics for edited draw messages.
 #[must_use]
 pub fn edited_image_prompt_update(
     message: &TelegramMessage,
@@ -1016,7 +1266,6 @@ pub fn edited_image_prompt_update(
     })
 }
 
-/// Compose Go image prompt context from prompt, vision description, and attachments.
 #[must_use]
 pub fn compose_image_prompt(prompt: &str, meta: &ChatMessageMeta) -> String {
     let mut parts = Vec::with_capacity(1 + meta.attachments.len());
@@ -1037,7 +1286,6 @@ pub fn compose_image_prompt(prompt: &str, meta: &ChatMessageMeta) -> String {
     parts.join("\n\n")
 }
 
-/// Return whether Go would continue handling an addressed message from this sender.
 #[must_use]
 pub fn should_handle_addressed_message(
     message: Option<&TelegramMessage>,
@@ -1068,7 +1316,6 @@ pub fn should_handle_addressed_message(
     addressed_bot_response_bucket(message.chat.get_id().into(), message.id) == 0
 }
 
-/// Return whether Go random-response routing would consider this message.
 #[must_use]
 pub fn should_handle_random_response(
     message: Option<&TelegramMessage>,
@@ -1081,7 +1328,6 @@ pub fn should_handle_random_response(
     !is_captionless_media_only_random_message(message, original_text)
 }
 
-/// Split Go `React` command words with first-word fallback.
 #[must_use]
 pub fn react_message_words(first_word_lower: &str, text: &str) -> Vec<String> {
     let text = text.trim();
@@ -1094,23 +1340,16 @@ pub fn react_message_words(first_word_lower: &str, text: &str) -> Vec<String> {
     Vec::new()
 }
 
-/// Go `dialog.MessageKindText` history kind.
 pub const HISTORY_MESSAGE_KIND_TEXT: &str = "text";
 
-/// Go `dialog.RoleUser` history role.
 pub const HISTORY_ROLE_USER: &str = "user";
 
-/// Go `dialog.RoleModel` history role.
 pub const HISTORY_ROLE_MODEL: &str = "model";
 
-/// Storage-ready Go text history entry extracted from a Telegram message.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HistoryTextEntry {
-    /// Go `MessageEntry.EntryID`, currently `msg:<message_id>` for text entries.
     pub entry_id: String,
-    /// Go history kind.
     pub kind: String,
-    /// Go dialog role.
     pub role: String,
     /// Telegram chat ID.
     pub chat_id: i64,
@@ -1118,15 +1357,12 @@ pub struct HistoryTextEntry {
     pub thread_id: i32,
     /// Telegram message ID.
     pub message_id: i32,
-    /// Resolved sender ID used by Go history indexes.
     pub sender_id: i64,
     /// UTC occurrence timestamp.
     pub occurred_at: OffsetDateTime,
-    /// Go-shaped `history.MessageEntry` JSON payload.
     pub payload: Vec<u8>,
 }
 
-/// Build the Go `history.messageEntryFromTelegramMessage` text-entry payload.
 #[must_use]
 pub fn build_history_text_entry(
     message: &TelegramMessage,
@@ -1189,7 +1425,6 @@ pub fn build_history_text_entry(
     })
 }
 
-/// Apply Go fetcher MIME-derived attachment-kind normalization.
 #[must_use]
 pub fn normalize_attachment_kind(mut attachment: ChatAttachment) -> ChatAttachment {
     if !attachment.kind.is_empty() || attachment.mime_type.is_empty() {
@@ -1207,7 +1442,6 @@ pub fn normalize_attachment_kind(mut attachment: ChatAttachment) -> ChatAttachme
     attachment
 }
 
-/// Return whether Go would skip user-visible side effects for this update age.
 pub fn should_skip_side_effects_at(
     update: &TelegramUpdate,
     max_age: Duration,
@@ -1576,6 +1810,102 @@ fn telegram_first_image_attachment(
     }
 }
 
+impl TelegramFileMetadataRef {
+    fn with_file(
+        mut self,
+        file_id: &str,
+        file_unique_id: &str,
+        media_kind: &str,
+        mime_type: &str,
+        file_size: i64,
+    ) -> Self {
+        self.file_id = file_id.to_owned();
+        self.file_unique_id = file_unique_id.to_owned();
+        self.media_kind = media_kind.to_owned();
+        self.mime_type = mime_type.to_owned();
+        self.file_size = file_size;
+        self
+    }
+
+    fn with_dimensions(mut self, width: i64, height: i64) -> Self {
+        self.width = width as i32;
+        self.height = height as i32;
+        self
+    }
+}
+
+fn telegram_file_metadata_base(message: &TelegramMessage) -> Option<TelegramFileMetadataRef> {
+    if message.chat.get_id() == 0 {
+        return None;
+    }
+
+    Some(TelegramFileMetadataRef {
+        chat_id: message.chat.get_id().into(),
+        message_id: message.id,
+        thread_id: message
+            .message_thread_id
+            .map(|value| value as i32)
+            .unwrap_or_default(),
+        ..TelegramFileMetadataRef::default()
+    })
+}
+
+fn document_file_metadata_ref(
+    base: &TelegramFileMetadataRef,
+    data: &TelegramMessageData,
+) -> Option<TelegramFileMetadataRef> {
+    let TelegramMessageData::Document(document) = data else {
+        return None;
+    };
+    let mime_type = document.data.mime_type.as_deref().unwrap_or_default();
+    if has_mime_prefix(mime_type, "image/") {
+        let mut file = base.clone().with_file(
+            &document.data.file_id,
+            &document.data.file_unique_id,
+            TELEGRAM_FILE_MEDIA_KIND_DOCUMENT,
+            mime_type,
+            document.data.file_size.unwrap_or_default(),
+        );
+        if let Some(thumbnail) = document.data.thumbnail.as_ref() {
+            file = file.with_dimensions(thumbnail.width, thumbnail.height);
+        }
+        return Some(file);
+    }
+    if has_mime_prefix(mime_type, "audio/") {
+        return Some(base.clone().with_file(
+            &document.data.file_id,
+            &document.data.file_unique_id,
+            TELEGRAM_FILE_MEDIA_KIND_DOCUMENT,
+            mime_type,
+            document.data.file_size.unwrap_or_default(),
+        ));
+    }
+    None
+}
+
+fn sticker_file_metadata_ref(
+    base: &TelegramFileMetadataRef,
+    data: &TelegramMessageData,
+) -> Option<TelegramFileMetadataRef> {
+    let TelegramMessageData::Sticker(sticker) = data else {
+        return None;
+    };
+    if sticker.is_animated || sticker.is_video {
+        return None;
+    }
+    Some(
+        base.clone()
+            .with_file(
+                &sticker.file_id,
+                &sticker.file_unique_id,
+                TELEGRAM_FILE_MEDIA_KIND_STICKER,
+                "",
+                sticker.file_size.unwrap_or_default(),
+            )
+            .with_dimensions(sticker.width, sticker.height),
+    )
+}
+
 fn has_mime_prefix(mime_type: &str, prefix: &str) -> bool {
     let mime_type = mime_type.trim();
     mime_type
@@ -1583,7 +1913,6 @@ fn has_mime_prefix(mime_type: &str, prefix: &str) -> bool {
         .is_some_and(|value| value.eq_ignore_ascii_case(prefix))
 }
 
-/// Return the text Go fetcher would place into `Message.Text` before processing.
 #[must_use]
 pub fn fetcher_message_text(message: &TelegramMessage) -> String {
     if let Some(text) = message.get_text() {
@@ -1597,18 +1926,24 @@ pub fn fetcher_message_text(message: &TelegramMessage) -> String {
         TelegramMessageData::Document(document) => {
             document.data.file_name.clone().unwrap_or_default()
         }
-        TelegramMessageData::Contact(contact) => format!(
-            "{} {}",
-            contact.first_name,
-            contact.last_name.as_deref().unwrap_or_default()
-        )
-        .trim()
-        .to_owned(),
+        TelegramMessageData::Contact(contact) => {
+            let name = format!(
+                "{} {}",
+                contact.first_name,
+                contact.last_name.as_deref().unwrap_or_default()
+            )
+            .trim()
+            .to_owned();
+            if name.is_empty() {
+                contact.phone_number.clone()
+            } else {
+                name
+            }
+        }
         _ => String::new(),
     }
 }
 
-/// Go `guestMessageRejectReason` guard result.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GuestMessageRejectReason {
     NilMessage,
@@ -1620,7 +1955,6 @@ pub enum GuestMessageRejectReason {
 }
 
 impl GuestMessageRejectReason {
-    /// Return the exact Go log reason string.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -1634,7 +1968,6 @@ impl GuestMessageRejectReason {
     }
 }
 
-/// Go guest-chain message role.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GuestChainRole {
     User,
@@ -1642,7 +1975,6 @@ pub enum GuestChainRole {
 }
 
 impl GuestChainRole {
-    /// Return Go's string form for this guest-chain role.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -1652,7 +1984,6 @@ impl GuestChainRole {
     }
 }
 
-/// One message in Go's in-memory guest inline chain cache.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GuestChainMessage {
     pub role: GuestChainRole,
@@ -1661,7 +1992,6 @@ pub struct GuestChainMessage {
     pub at: Option<OffsetDateTime>,
 }
 
-/// Return Go `guestVisibleText` for a Telegram message.
 #[must_use]
 pub fn guest_visible_text(message: Option<&TelegramMessage>) -> String {
     let Some(message) = message else {
@@ -1687,7 +2017,6 @@ pub fn guest_visible_text(message: Option<&TelegramMessage>) -> String {
     String::new()
 }
 
-/// Strip Go guest mode's leading `@BotUsername` address prefix.
 #[must_use]
 pub fn strip_guest_address_prefix(text: &str, bot_username: &str) -> String {
     let trimmed = text.trim();
@@ -1707,7 +2036,6 @@ pub fn strip_guest_address_prefix(text: &str, bot_username: &str) -> String {
     trimmed.to_owned()
 }
 
-/// Return Go `guestCurrentRequestText` for a Telegram guest message.
 #[must_use]
 pub fn guest_current_request_text(message: Option<&TelegramMessage>, bot_username: &str) -> String {
     strip_guest_address_prefix(&guest_visible_text(message), bot_username)
@@ -1715,7 +2043,6 @@ pub fn guest_current_request_text(message: Option<&TelegramMessage>, bot_usernam
         .to_owned()
 }
 
-/// Return whether Go guest routing sees visible text in the current message or reply.
 #[must_use]
 pub fn guest_request_has_visible_text(
     message: Option<&TelegramMessage>,
@@ -1729,7 +2056,6 @@ pub fn guest_request_has_visible_text(
     !current_text.trim().is_empty() || !reply_text.trim().is_empty()
 }
 
-/// Return Go `guestHasOtherBotMention`.
 #[must_use]
 pub fn guest_has_other_bot_mention(
     message: Option<&TelegramMessage>,
@@ -1757,7 +2083,6 @@ pub fn guest_has_other_bot_mention(
         })
 }
 
-/// Return Go `guestMessageRejectReason`.
 #[must_use]
 pub fn guest_message_reject_reason(
     message: Option<&TelegramMessage>,
@@ -1793,7 +2118,6 @@ pub fn guest_message_reject_reason(
     None
 }
 
-/// Return Go `isGuestUnsupportedFeatureRequest` for guest-mode routing.
 #[must_use]
 pub fn is_guest_unsupported_feature_request(
     message: Option<&TelegramMessage>,
@@ -1824,7 +2148,6 @@ pub fn is_guest_unsupported_feature_request(
     looks_like_guest_history_summary_request(first_word, &rest_text)
 }
 
-/// Return Go `looksLikeGuestHistorySummaryRequest`.
 #[must_use]
 pub fn looks_like_guest_history_summary_request(first_word: &str, rest_text: &str) -> bool {
     let text = format!("{first_word} {rest_text}").trim().to_owned();
@@ -1840,7 +2163,6 @@ pub fn looks_like_guest_history_summary_request(first_word: &str, rest_text: &st
     has_summary_verb && (text.contains("чат") || text.contains("тред") || text.contains("сообщен"))
 }
 
-/// Return Go `normalizeGuestCommandWord`.
 #[must_use]
 pub fn normalize_guest_command_word(word: &str, bot_username: &str) -> String {
     let word = word.trim().strip_prefix('/').unwrap_or(word.trim());
@@ -1861,7 +2183,6 @@ pub fn normalize_guest_command_word(word: &str, bot_username: &str) -> String {
     word.to_owned()
 }
 
-/// Return Go `formatGuestChainForPrompt`.
 #[must_use]
 pub fn format_guest_chain_for_prompt(messages: &[GuestChainMessage]) -> String {
     let messages = trim_guest_chain_messages(messages, GUEST_CHAIN_MAX_MESSAGES);
@@ -1876,7 +2197,6 @@ pub fn format_guest_chain_for_prompt(messages: &[GuestChainMessage]) -> String {
         .join("\n")
 }
 
-/// Return Go `buildGuestDialogText`.
 #[must_use]
 pub fn build_guest_dialog_text(
     message: Option<&TelegramMessage>,
@@ -1911,7 +2231,6 @@ pub fn build_guest_dialog_text(
     format!("Гостевая цепочка за последние сутки:\n{chain_text}\n\n{text}")
 }
 
-/// Return Go `buildGuestShieldQueryText`.
 #[must_use]
 pub fn build_guest_shield_query_text(
     message: Option<&TelegramMessage>,
@@ -2139,24 +2458,31 @@ fn is_captionless_media_only_random_message(
         return false;
     }
 
-    matches!(
-        message.data,
+    match &message.data {
         TelegramMessageData::Animation(_)
-            | TelegramMessageData::Audio(_)
-            | TelegramMessageData::Document(_)
-            | TelegramMessageData::PaidMedia(_)
-            | TelegramMessageData::Photo(_)
-            | TelegramMessageData::Sticker(_)
-            | TelegramMessageData::Story(_)
-            | TelegramMessageData::Video(_)
-            | TelegramMessageData::VideoNote(_)
-            | TelegramMessageData::Voice(_)
-            | TelegramMessageData::Contact(_)
-            | TelegramMessageData::Dice(_)
-            | TelegramMessageData::Location(_)
-            | TelegramMessageData::Venue(_)
-            | TelegramMessageData::Checklist(_)
-    )
+        | TelegramMessageData::Audio(_)
+        | TelegramMessageData::Document(_)
+        | TelegramMessageData::PaidMedia(_)
+        | TelegramMessageData::Photo(_)
+        | TelegramMessageData::Sticker(_)
+        | TelegramMessageData::Story(_)
+        | TelegramMessageData::Video(_)
+        | TelegramMessageData::VideoNote(_)
+        | TelegramMessageData::Voice(_)
+        | TelegramMessageData::Contact(_)
+        | TelegramMessageData::Dice(_)
+        | TelegramMessageData::Location(_)
+        | TelegramMessageData::Venue(_)
+        | TelegramMessageData::Checklist(_) => true,
+        TelegramMessageData::Unknown(value) => is_go_premium_animation_message_data(value),
+        _ => false,
+    }
+}
+
+fn is_go_premium_animation_message_data(value: &Value) -> bool {
+    value
+        .as_object()
+        .is_some_and(|object| object.contains_key("premium_animation"))
 }
 
 fn message_caption_text(message: &TelegramMessage) -> String {
@@ -2556,6 +2882,24 @@ where
     }
 }
 
+async fn run_tracked_stage<Fut, E, Tracker>(
+    update: &TelegramUpdate,
+    stage: UpdateStage,
+    timeout: Duration,
+    task: Fut,
+    tracker: &Tracker,
+) -> UpdateStageReport
+where
+    Fut: Future<Output = Result<(), E>>,
+    E: fmt::Display,
+    Tracker: UpdateStageTracker + ?Sized,
+{
+    let token = tracker.stage_started(update, stage, SystemTime::now());
+    let report = run_stage(stage, timeout, task).await;
+    tracker.stage_finished(token, &report, SystemTime::now());
+    report
+}
+
 fn stage_outcome<E>(result: Result<(), E>) -> UpdateStageOutcome
 where
     E: fmt::Display,
@@ -2655,20 +2999,23 @@ mod tests {
         GoUpdateType, GuestChainMessage, GuestChainRole, RedisUpdateQueue,
         TelegramMessageAttachmentOptions, UpdateCodecError, UpdateConsumerConfig,
         UpdateProducerQueue, UpdateProducerQueueFuture, UpdateProducerSource,
-        UpdateProducerSourceFuture, UpdateStageOutcome, blpop_timeout_arg, build_guest_dialog_text,
+        UpdateProducerSourceFuture, UpdateStage, UpdateStageOutcome, UpdateStageReport,
+        UpdateStageTracker, blpop_timeout_arg, build_guest_dialog_text,
         build_guest_shield_query_text, compose_image_prompt, edited_image_prompt_update,
         extract_update_state, fetcher_message_text, format_guest_chain_for_prompt,
         guest_current_request_text, guest_has_other_bot_mention, guest_message_reject_reason,
         guest_request_has_visible_text, guest_visible_text, is_allowed_producer_update,
         is_guest_unsupported_feature_request, is_settings_command_message,
         looks_like_guest_history_summary_request, normalize_guest_command_word, parse_edit_command,
-        parse_if_addressed, process_update_at, producer_update_name, producer_update_type,
-        react_message_words, resolve_draw_prompt_from_message, run_update_producer_until,
+        parse_if_addressed, process_update_at, process_update_with_stage_tracker_at,
+        producer_update_name, producer_update_type, react_message_words,
+        resolve_draw_prompt_from_message, run_update_producer_until,
         should_handle_addressed_message, should_handle_random_response, strip_guest_address_prefix,
         telegram_message_attachments, update_name,
     };
     use carapax::types::{
-        Message as TelegramMessage, Update as TelegramUpdate, UpdateType as TelegramUpdateType,
+        Message as TelegramMessage, MessageData as TelegramMessageData, Update as TelegramUpdate,
+        UpdateType as TelegramUpdateType,
     };
 
     #[test]
@@ -2712,6 +3059,65 @@ mod tests {
             .and_then(|message| message.get_text())
             .ok_or_else(|| io::Error::other("expected decoded message text"))?;
         assert_eq!(text.as_ref(), "/start hello");
+
+        Ok(())
+    }
+
+    #[test]
+    fn telegram_update_decoder_accepts_bot_api_poll_answer_voter_chat() -> Result<(), Box<dyn Error>>
+    {
+        let update = super::decode_telegram_update_value(json!({
+            "update_id": 17,
+            "poll_answer": {
+                "poll_id": "poll-id",
+                "voter_chat": {
+                    "id": -10043,
+                    "type": "supergroup",
+                    "title": "Poll Team"
+                },
+                "option_ids": [1],
+                "option_persistent_ids": []
+            }
+        }))?;
+
+        assert_eq!(producer_update_name(&update), "poll_answer");
+        let state = extract_update_state(&update)
+            .ok_or_else(|| io::Error::other("expected poll-answer state"))?;
+        let chat = state
+            .chat
+            .ok_or_else(|| io::Error::other("expected voter chat state"))?;
+        assert_eq!(chat.id, -10043);
+        assert_eq!(chat.chat_type, "supergroup");
+        assert!(state.user.is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn native_update_frame_decodes_bot_api_poll_answer_voter_chat() -> Result<(), Box<dyn Error>> {
+        let payload = serde_json::to_vec(&json!({
+            "version": 1,
+            "codec": super::NATIVE_UPDATE_CODEC,
+            "update": {
+                "update_id": 18,
+                "poll_answer": {
+                    "poll_id": "poll-id",
+                    "voter_chat": {
+                        "id": -10044,
+                        "type": "supergroup",
+                        "title": "Poll Team"
+                    },
+                    "option_ids": [1],
+                    "option_persistent_ids": []
+                }
+            }
+        }))?;
+        let update = EncodedUpdate::from_native_json_bytes(&payload)?.decode_update()?;
+
+        assert_eq!(producer_update_name(&update), "poll_answer");
+        let state = extract_update_state(&update)
+            .ok_or_else(|| io::Error::other("expected poll-answer state"))?;
+        assert_eq!(state.chat.expect("voter chat").id, -10044);
 
         Ok(())
     }
@@ -3066,6 +3472,16 @@ mod tests {
             assert_eq!(is_allowed_producer_update(&update), want_allowed, "{name}");
         }
 
+        for (name, update) in sample_sdk_known_go_unknown_update_cases()? {
+            assert_eq!(
+                producer_update_type(&update),
+                GoUpdateType::Unknown,
+                "{name}"
+            );
+            assert_eq!(producer_update_name(&update), "unknown", "{name}");
+            assert!(!is_allowed_producer_update(&update), "{name}");
+        }
+
         Ok(())
     }
 
@@ -3162,7 +3578,19 @@ mod tests {
                     "new_reaction": []
                 }
             }))?),
-            "unknown"
+            "message_reaction"
+        );
+        assert_eq!(
+            update_name(&serde_json::from_value(json!({
+                "update_id": 4,
+                "inline_query": {
+                    "id": "inline-id",
+                    "from": sample_user_json(),
+                    "query": "plotva",
+                    "offset": ""
+                }
+            }))?),
+            "inline_query"
         );
 
         Ok(())
@@ -4079,6 +4507,191 @@ mod tests {
     }
 
     #[test]
+    fn telegram_file_metadata_refs_match_go_photo_audio_voice_and_static_sticker()
+    -> Result<(), Box<dyn Error>> {
+        let photo_update = serde_json::from_value(json!({
+            "update_id": 137,
+            "message": {
+                "message_id": 69,
+                "message_thread_id": 7,
+                "date": 1_710_000_000,
+                "chat": sample_private_chat_json(),
+                "from": sample_user_json(),
+                "photo": [
+                    {
+                        "file_id": "photo-small",
+                        "file_unique_id": "photo-small-u",
+                        "height": 10,
+                        "width": 10,
+                        "file_size": 1
+                    },
+                    {
+                        "file_id": "photo-large",
+                        "file_unique_id": "photo-large-u",
+                        "height": 800,
+                        "width": 600,
+                        "file_size": 20
+                    }
+                ],
+                "reply_to_message": {
+                    "message_id": 68,
+                    "date": 1_709_999_900,
+                    "chat": sample_private_chat_json(),
+                    "from": sample_user_json(),
+                    "voice": {
+                        "file_id": "voice-file",
+                        "file_unique_id": "voice-u",
+                        "duration": 5,
+                        "file_size": 30
+                    }
+                }
+            }
+        }))?;
+
+        let refs = super::update_file_metadata_refs(&photo_update);
+
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0].media_kind, super::TELEGRAM_FILE_MEDIA_KIND_PHOTO);
+        assert_eq!(refs[0].file_id, "photo-large");
+        assert_eq!(refs[0].file_unique_id, "photo-large-u");
+        assert_eq!(refs[0].width, 600);
+        assert_eq!(refs[0].height, 800);
+        assert_eq!(refs[0].file_size, 20);
+        assert_eq!(refs[0].chat_id, 42);
+        assert_eq!(refs[0].message_id, 69);
+        assert_eq!(refs[0].thread_id, 7);
+        assert_eq!(refs[1].media_kind, super::TELEGRAM_FILE_MEDIA_KIND_VOICE);
+        assert_eq!(refs[1].mime_type, "audio/ogg");
+        assert_eq!(refs[1].file_unique_id, "voice-u");
+
+        let audio_update = serde_json::from_value(json!({
+            "update_id": 138,
+            "message": {
+                "message_id": 70,
+                "date": 1_710_000_000,
+                "chat": sample_private_chat_json(),
+                "from": sample_user_json(),
+                "audio": {
+                    "file_id": "audio-file",
+                    "file_unique_id": "audio-u",
+                    "duration": 7,
+                    "mime_type": "audio/mpeg",
+                    "file_size": 40
+                }
+            }
+        }))?;
+        let audio_refs = super::update_file_metadata_refs(&audio_update);
+        assert_eq!(audio_refs.len(), 1);
+        assert_eq!(
+            audio_refs[0].media_kind,
+            super::TELEGRAM_FILE_MEDIA_KIND_AUDIO
+        );
+        assert_eq!(audio_refs[0].mime_type, "audio/mpeg");
+
+        let sticker_update = serde_json::from_value(json!({
+            "update_id": 139,
+            "message": {
+                "message_id": 71,
+                "date": 1_710_000_000,
+                "chat": sample_private_chat_json(),
+                "from": sample_user_json(),
+                "sticker": {
+                    "file_id": "sticker-file",
+                    "file_unique_id": "sticker-u",
+                    "height": 512,
+                    "width": 512,
+                    "is_animated": false,
+                    "is_video": false,
+                    "type": "regular",
+                    "file_size": 50
+                }
+            }
+        }))?;
+        let sticker_refs = super::update_file_metadata_refs(&sticker_update);
+        assert_eq!(sticker_refs.len(), 1);
+        assert_eq!(
+            sticker_refs[0].media_kind,
+            super::TELEGRAM_FILE_MEDIA_KIND_STICKER
+        );
+        assert_eq!(sticker_refs[0].width, 512);
+        assert_eq!(sticker_refs[0].height, 512);
+
+        Ok(())
+    }
+
+    #[test]
+    fn telegram_file_metadata_refs_match_go_document_mime_filters() -> Result<(), Box<dyn Error>> {
+        let image_update = serde_json::from_value(json!({
+            "update_id": 140,
+            "message": {
+                "message_id": 72,
+                "date": 1_710_000_000,
+                "chat": sample_private_chat_json(),
+                "from": sample_user_json(),
+                "document": {
+                    "file_id": "image-file",
+                    "file_unique_id": "image-u",
+                    "mime_type": " IMAGE/PNG ",
+                    "file_size": 60,
+                    "thumbnail": {
+                        "file_id": "thumb",
+                        "file_unique_id": "thumb-u",
+                        "height": 90,
+                        "width": 120
+                    }
+                }
+            }
+        }))?;
+        let audio_update = serde_json::from_value(json!({
+            "update_id": 141,
+            "message": {
+                "message_id": 73,
+                "date": 1_710_000_000,
+                "chat": sample_private_chat_json(),
+                "from": sample_user_json(),
+                "document": {
+                    "file_id": "audio-doc",
+                    "file_unique_id": "audio-doc-u",
+                    "mime_type": " AUDIO/MPEG ",
+                    "file_size": 70
+                }
+            }
+        }))?;
+        let pdf_update = serde_json::from_value(json!({
+            "update_id": 142,
+            "message": {
+                "message_id": 74,
+                "date": 1_710_000_000,
+                "chat": sample_private_chat_json(),
+                "from": sample_user_json(),
+                "document": {
+                    "file_id": "pdf-file",
+                    "file_unique_id": "pdf-u",
+                    "mime_type": "application/pdf"
+                }
+            }
+        }))?;
+
+        let image_refs = super::update_file_metadata_refs(&image_update);
+        assert_eq!(image_refs.len(), 1);
+        assert_eq!(
+            image_refs[0].media_kind,
+            super::TELEGRAM_FILE_MEDIA_KIND_DOCUMENT
+        );
+        assert_eq!(image_refs[0].mime_type, " IMAGE/PNG ");
+        assert_eq!(image_refs[0].width, 120);
+        assert_eq!(image_refs[0].height, 90);
+
+        let audio_refs = super::update_file_metadata_refs(&audio_update);
+        assert_eq!(audio_refs.len(), 1);
+        assert_eq!(audio_refs[0].file_unique_id, "audio-doc-u");
+        assert_eq!(audio_refs[0].mime_type, " AUDIO/MPEG ");
+
+        assert!(super::update_file_metadata_refs(&pdf_update).is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn collect_media_attachments_skips_existing_attachment_like_go_fetcher()
     -> Result<(), Box<dyn Error>> {
         let update = serde_json::from_value(json!({
@@ -4182,6 +4795,88 @@ mod tests {
             "Ada   Theme"
         );
 
+        let audio_file_update = serde_json::from_value(json!({
+            "update_id": 21,
+            "message": {
+                "message_id": 81,
+                "date": 1_710_000_000,
+                "chat": sample_private_chat_json(),
+                "from": sample_user_json(),
+                "audio": {
+                    "file_id": "audio-file",
+                    "file_unique_id": "audio-unique",
+                    "duration": 5,
+                    "file_name": "song.mp3"
+                }
+            }
+        }))?;
+        assert_eq!(
+            fetcher_message_text(update_message(&audio_file_update)?),
+            "song.mp3"
+        );
+
+        let video_update = serde_json::from_value(json!({
+            "update_id": 22,
+            "message": {
+                "message_id": 82,
+                "date": 1_710_000_000,
+                "chat": sample_private_chat_json(),
+                "from": sample_user_json(),
+                "video": {
+                    "file_id": "video-file",
+                    "file_unique_id": "video-unique",
+                    "duration": 5,
+                    "width": 640,
+                    "height": 360,
+                    "file_name": "clip.mp4"
+                }
+            }
+        }))?;
+        assert_eq!(
+            fetcher_message_text(update_message(&video_update)?),
+            "clip.mp4"
+        );
+
+        let document_update = serde_json::from_value(json!({
+            "update_id": 23,
+            "message": {
+                "message_id": 83,
+                "date": 1_710_000_000,
+                "chat": sample_private_chat_json(),
+                "from": sample_user_json(),
+                "document": {
+                    "file_id": "doc-file",
+                    "file_unique_id": "doc-unique",
+                    "file_name": "doc.pdf"
+                }
+            }
+        }))?;
+        assert_eq!(
+            fetcher_message_text(update_message(&document_update)?),
+            "doc.pdf"
+        );
+
+        let sticker_update = serde_json::from_value(json!({
+            "update_id": 24,
+            "message": {
+                "message_id": 84,
+                "date": 1_710_000_000,
+                "chat": sample_private_chat_json(),
+                "from": sample_user_json(),
+                "sticker": {
+                    "file_id": "sticker-file",
+                    "file_unique_id": "sticker-unique",
+                    "type": "regular",
+                    "width": 512,
+                    "height": 512,
+                    "is_animated": false,
+                    "is_video": false,
+                    "emoji": "🙂"
+                }
+            }
+        }))?;
+        assert_eq!(fetcher_message_text(update_message(&sticker_update)?), "🙂");
+
         let contact_update = serde_json::from_value(json!({
             "update_id": 3,
             "message": {
@@ -4199,6 +4894,25 @@ mod tests {
         assert_eq!(
             fetcher_message_text(update_message(&contact_update)?),
             "Ada Lovelace"
+        );
+
+        let phone_contact_update = serde_json::from_value(json!({
+            "update_id": 4,
+            "message": {
+                "message_id": 80,
+                "date": 1_710_000_000,
+                "chat": sample_private_chat_json(),
+                "from": sample_user_json(),
+                "contact": {
+                    "phone_number": "+123",
+                    "first_name": "",
+                    "last_name": ""
+                }
+            }
+        }))?;
+        assert_eq!(
+            fetcher_message_text(update_message(&phone_contact_update)?),
+            "+123"
         );
         Ok(())
     }
@@ -4344,6 +5058,92 @@ mod tests {
         assert_eq!(got.attachments[1].file_unique_id, "photo-1");
         assert_eq!(got.attachments[1].caption, "photo caption");
 
+        Ok(())
+    }
+
+    #[test]
+    fn build_fetcher_message_context_includes_quoted_reply_audio_like_go()
+    -> Result<(), Box<dyn Error>> {
+        let update = sample_update_json(json!({
+            "update_id": 141,
+            "message": {
+                "message_id": 73,
+                "date": 1_710_000_000,
+                "chat": sample_private_chat_json(),
+                "from": sample_user_json(),
+                "text": "!song night",
+                "reply_to_message": {
+                    "message_id": 72,
+                    "date": 1_709_999_999,
+                    "chat": sample_private_chat_json(),
+                    "from": sample_user_json(),
+                    "audio": {
+                        "file_id": "reply-audio-file",
+                        "file_unique_id": "reply-audio-unique",
+                        "duration": 5
+                    }
+                }
+            }
+        }))?;
+
+        let got = super::build_fetcher_message_context(update_message(&update)?);
+
+        assert_eq!(got.meta.attachments.len(), 1);
+        assert_eq!(got.meta.attachments[0].kind, "audio");
+        assert_eq!(got.meta.attachments[0].source, "quoted");
+        assert_eq!(got.meta.attachments[0].file_unique_id, "reply-audio-unique");
+        Ok(())
+    }
+
+    #[test]
+    fn build_fetcher_message_context_keeps_quoted_image_before_current_media()
+    -> Result<(), Box<dyn Error>> {
+        let update = sample_update_json(json!({
+            "update_id": 142,
+            "message": {
+                "message_id": 74,
+                "date": 1_710_000_000,
+                "chat": sample_private_chat_json(),
+                "from": sample_user_json(),
+                "photo": [
+                    {
+                        "file_id": "current-photo-file",
+                        "file_unique_id": "current-photo-unique",
+                        "height": 90,
+                        "width": 90
+                    }
+                ],
+                "caption": "fix contrast",
+                "reply_to_message": {
+                    "message_id": 71,
+                    "date": 1_709_999_998,
+                    "chat": sample_private_chat_json(),
+                    "from": sample_user_json(),
+                    "photo": [
+                        {
+                            "file_id": "reply-photo-file",
+                            "file_unique_id": "reply-photo-unique",
+                            "height": 90,
+                            "width": 90
+                        }
+                    ]
+                }
+            }
+        }))?;
+
+        let got = super::build_fetcher_message_context(update_message(&update)?);
+
+        assert_eq!(got.meta.attachments.len(), 2);
+        assert_eq!(got.meta.attachments[0].kind, "image");
+        assert_eq!(got.meta.attachments[0].source, "quoted");
+        assert_eq!(got.meta.attachments[0].file_unique_id, "reply-photo-unique");
+        assert_eq!(got.meta.attachments[1].kind, "image");
+        assert_eq!(got.meta.attachments[1].source, "message");
+        assert_eq!(
+            got.meta.attachments[1].file_unique_id,
+            "current-photo-unique"
+        );
+        assert_eq!(got.meta.attachments[1].caption, "fix contrast");
         Ok(())
     }
 
@@ -4949,6 +5749,19 @@ mod tests {
                 "duration": 4
             }
         }))?;
+        let premium_animation_message = sample_message_from_value(json!({
+            "message_id": 18,
+            "date": 1_710_000_000,
+            "chat": sample_private_chat_json(),
+            "from": sample_user_json(),
+            "premium_animation": {
+                "file_id": "premium-animation-file",
+                "file_unique_id": "premium-animation-unique",
+                "width": 320,
+                "height": 240,
+                "duration": 4
+            }
+        }))?;
 
         assert!(should_handle_random_response(
             Some(&text_message),
@@ -4968,6 +5781,18 @@ mod tests {
         ));
         assert!(!should_handle_random_response(
             Some(&animation_message),
+            "",
+            &human_sender
+        ));
+        assert!(matches!(
+            &premium_animation_message.data,
+            TelegramMessageData::Unknown(value)
+                if value
+                    .as_object()
+                    .is_some_and(|object| object.contains_key("premium_animation"))
+        ));
+        assert!(!should_handle_random_response(
+            Some(&premium_animation_message),
             "",
             &human_sender
         ));
@@ -5023,6 +5848,74 @@ mod tests {
             Some(&UpdateStageOutcome::Completed)
         );
         assert!(!report.skipped_handle);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_consumer_stage_tracker_observes_go_state_and_handle_tasks()
+    -> Result<(), Box<dyn Error>> {
+        #[derive(Clone, Default)]
+        struct Tracker {
+            events: Arc<Mutex<Vec<String>>>,
+        }
+
+        impl UpdateStageTracker for Tracker {
+            fn stage_started(
+                &self,
+                update: &carapax::types::Update,
+                stage: UpdateStage,
+                _started_at: SystemTime,
+            ) -> u64 {
+                self.events
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(format!("start:{stage:?}:{}", update_name(update)));
+                match stage {
+                    UpdateStage::State => 1,
+                    UpdateStage::Handle => 2,
+                }
+            }
+
+            fn stage_finished(
+                &self,
+                token: u64,
+                report: &UpdateStageReport,
+                _finished_at: SystemTime,
+            ) {
+                self.events
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(format!("finish:{token}:{:?}", report.outcome));
+            }
+        }
+
+        let tracker = Tracker::default();
+        let update = sample_message_update_with_date(1_710_000_000)?;
+        let report = process_update_with_stage_tracker_at(
+            update,
+            UpdateConsumerConfig::default(),
+            UNIX_EPOCH + Duration::from_secs(1_710_000_030),
+            |_| async { Ok::<_, io::Error>(()) },
+            |_| async { Ok::<_, io::Error>(()) },
+            &tracker,
+        )
+        .await;
+
+        assert_eq!(report.state.outcome, UpdateStageOutcome::Completed);
+        assert_eq!(
+            report.handle.as_ref().map(|stage| &stage.outcome),
+            Some(&UpdateStageOutcome::Completed)
+        );
+        let events = tracker
+            .events
+            .lock()
+            .map_err(|err| io::Error::other(err.to_string()))?
+            .clone();
+        assert!(events.contains(&"start:State:message".to_owned()));
+        assert!(events.contains(&"start:Handle:message".to_owned()));
+        assert!(events.contains(&"finish:1:Completed".to_owned()));
+        assert!(events.contains(&"finish:2:Completed".to_owned()));
 
         Ok(())
     }
@@ -5319,6 +6212,101 @@ mod tests {
         serde_json::from_value(value)
     }
 
+    fn sample_sdk_known_go_unknown_update_cases()
+    -> Result<Vec<(&'static str, TelegramUpdate)>, serde_json::Error> {
+        Ok(vec![
+            (
+                "business_connection",
+                sample_update_json(json!({
+                    "update_id": 18,
+                    "business_connection": {
+                        "id": "business-1",
+                        "user": sample_user_json(),
+                        "user_chat_id": 42,
+                        "date": 1_710_000_000,
+                        "is_enabled": true
+                    }
+                }))?,
+            ),
+            (
+                "business_message",
+                sample_update_json(json!({
+                    "update_id": 19,
+                    "business_message": sample_business_message_json(19)
+                }))?,
+            ),
+            (
+                "edited_business_message",
+                sample_update_json(json!({
+                    "update_id": 20,
+                    "edited_business_message": sample_business_message_json(20)
+                }))?,
+            ),
+            (
+                "deleted_business_messages",
+                sample_update_json(json!({
+                    "update_id": 21,
+                    "deleted_business_messages": {
+                        "business_connection_id": "business-1",
+                        "chat": sample_private_chat_json(),
+                        "message_ids": [1, 2]
+                    }
+                }))?,
+            ),
+            (
+                "chat_boost",
+                sample_update_json(json!({
+                    "update_id": 22,
+                    "chat_boost": {
+                        "chat": sample_channel_chat_json(),
+                        "boost": {
+                            "boost_id": "boost-1",
+                            "add_date": 1_710_000_000,
+                            "expiration_date": 1_710_086_400,
+                            "source": sample_boost_source_json()
+                        }
+                    }
+                }))?,
+            ),
+            (
+                "removed_chat_boost",
+                sample_update_json(json!({
+                    "update_id": 23,
+                    "removed_chat_boost": {
+                        "boost_id": "boost-1",
+                        "chat": sample_channel_chat_json(),
+                        "remove_date": 1_710_086_400,
+                        "source": sample_boost_source_json()
+                    }
+                }))?,
+            ),
+            (
+                "managed_bot",
+                sample_update_json(json!({
+                    "update_id": 24,
+                    "managed_bot": {
+                        "bot": {
+                            "id": 777,
+                            "is_bot": true,
+                            "first_name": "ManagedBot"
+                        },
+                        "user": sample_user_json()
+                    }
+                }))?,
+            ),
+            (
+                "purchased_paid_media",
+                sample_update_json(json!({
+                    "update_id": 25,
+                    "purchased_paid_media": {
+                        "from": sample_user_json(),
+                        "paid_media_payload": "paid-media-payload"
+                    }
+                }))?,
+            ),
+        ])
+    }
+
     fn sample_message_json(message_id: i64, date: i64, text: &str) -> serde_json::Value {
         json!({
             "message_id": message_id,
@@ -5407,6 +6395,28 @@ mod tests {
                 "username": "channel_name"
             },
             "text": text
+        })
+    }
+
+    fn sample_business_message_json(message_id: i64) -> serde_json::Value {
+        let mut value = sample_message_json(message_id, 1_710_000_000, "business text");
+        value["business_connection_id"] = json!("business-1");
+        value
+    }
+
+    fn sample_channel_chat_json() -> serde_json::Value {
+        json!({
+            "id": -100,
+            "type": "channel",
+            "title": "Channel",
+            "username": "channel_name"
+        })
+    }
+
+    fn sample_boost_source_json() -> serde_json::Value {
+        json!({
+            "source": "gift_code",
+            "user": sample_user_json()
         })
     }
 

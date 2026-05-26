@@ -12,7 +12,7 @@ workspace = true
 
 [dependencies]
 serde = { workspace = true, features = ["derive"] }
-time = { workspace = true, features = ["serde"] }
+serde_json.workspace = true
+time = { workspace = true, features = ["formatting", "serde"] }
 
 [dev-dependencies]
-serde_json.workspace = true

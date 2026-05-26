@@ -303,6 +303,100 @@ pub async fn send_telegram_method_status(
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TelegramSendErrorClassification {
+    /// Operator-visible formatted error prefix/body.
+    pub message: String,
+    pub permission_error: bool,
+}
+
+pub fn classify_telegram_send_error(error: &ExecuteError) -> TelegramSendErrorClassification {
+    let ExecuteError::Response(response) = error else {
+        return TelegramSendErrorClassification {
+            message: format!("failed to send message: {error}"),
+            permission_error: false,
+        };
+    };
+
+    let message = response.description();
+    match response.error_code() {
+        Some(403) => TelegramSendErrorClassification {
+            message: format!("bot was blocked or kicked: {error}"),
+            permission_error: true,
+        },
+        Some(400) if is_empty_text_send_error(message) => TelegramSendErrorClassification {
+            message: "bad request: text must be non-empty".to_owned(),
+            permission_error: false,
+        },
+        Some(400) if is_permission_send_error(message) => TelegramSendErrorClassification {
+            message: format!("insufficient rights: {error}"),
+            permission_error: true,
+        },
+        Some(400) if message.contains("message thread not found") => {
+            TelegramSendErrorClassification {
+                message: format!("forum thread not found: {error}"),
+                permission_error: false,
+            }
+        }
+        Some(400) => TelegramSendErrorClassification {
+            message: format!("bad request: {error}"),
+            permission_error: false,
+        },
+        _ => TelegramSendErrorClassification {
+            message: format!("telegram API error: {error}"),
+            permission_error: false,
+        },
+    }
+}
+
+fn is_empty_text_send_error(message: &str) -> bool {
+    message.contains("text must be non-empty") || message.contains("message text is empty")
+}
+
+fn is_permission_send_error(message: &str) -> bool {
+    message.contains("not enough rights")
+        || message.contains("CHAT_WRITE_FORBIDDEN")
+        || message.contains("have no rights to send a message")
+}
+
+pub fn telegram_execute_error_is_reply_missing(error: &ExecuteError) -> bool {
+    let ExecuteError::Response(response) = error else {
+        return false;
+    };
+    response.error_code() == Some(400)
+        && contains_any_ascii_fold(response.description(), REPLY_MISSING_ERROR_FRAGMENTS)
+}
+
+const REPLY_MISSING_ERROR_FRAGMENTS: &[&str] = &[
+    "reply message not found",
+    "message to reply not found",
+    "message to be replied not found",
+    "reply_to_message not found",
+];
+
+fn contains_any_ascii_fold(haystack: &str, needles: &[&str]) -> bool {
+    needles
+        .iter()
+        .any(|needle| contains_ascii_fold(haystack, needle))
+}
+
+fn contains_ascii_fold(haystack: &str, needle: &str) -> bool {
+    let needle = needle.as_bytes();
+    if needle.is_empty() {
+        return true;
+    }
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .any(|window| ascii_eq_fold(window, needle))
+}
+
+fn ascii_eq_fold(left: &[u8], right: &[u8]) -> bool {
+    left.iter()
+        .zip(right)
+        .all(|(left, right)| left.eq_ignore_ascii_case(right))
+}
+
 impl From<SendMessage> for TelegramOutboundMethod {
     fn from(value: SendMessage) -> Self {
         Self::SendMessage(Box::new(value))
@@ -413,7 +507,10 @@ impl From<DeleteMessage> for TelegramOutboundMethod {
 
 #[cfg(test)]
 mod tests {
-    use super::{TelegramOutboundMethod, TelegramOutboundMethodKind, TelegramOutboundResponseKind};
+    use super::{
+        TelegramOutboundMethod, TelegramOutboundMethodKind, TelegramOutboundResponseKind,
+        classify_telegram_send_error, telegram_execute_error_is_reply_missing,
+    };
     use crate::{
         AudioMessageRequest, AudioSource, CallbackAnswerRequest, ChatActionRequest, ChatRef,
         DonationInvoiceLinkRequest, EditCaptionMessageRequest, EditMediaMessageRequest,
@@ -743,5 +840,102 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    #[test]
+    fn reply_missing_classifier_matches_go_fragments() -> Result<(), Box<dyn std::error::Error>> {
+        let cases = [
+            ("Bad Request: reply message not found", true),
+            ("message to reply not found", true),
+            ("Bad Request: message to be replied not found", true),
+            ("reply_to_message not found", true),
+            ("Bad Request: chat not found", false),
+        ];
+
+        for (description, expected) in cases {
+            let error = response_error(400, description)?;
+            assert_eq!(
+                telegram_execute_error_is_reply_missing(&error),
+                expected,
+                "{description}"
+            );
+        }
+        let forbidden = response_error(403, "Forbidden")?;
+        assert!(!telegram_execute_error_is_reply_missing(&forbidden));
+
+        Ok(())
+    }
+
+    #[test]
+    fn reply_missing_classifier_matches_mixed_case() -> Result<(), Box<dyn std::error::Error>> {
+        let error = response_error(400, "Bad Request: REPLY MESSAGE NOT FOUND")?;
+
+        assert!(telegram_execute_error_is_reply_missing(&error));
+
+        Ok(())
+    }
+
+    #[test]
+    fn send_error_classifier_matches_go_server_policy() -> Result<(), Box<dyn std::error::Error>> {
+        let cases = [
+            (
+                response_error(403, "Forbidden: bot was kicked from the group chat")?,
+                "bot was blocked or kicked",
+                true,
+            ),
+            (
+                response_error(400, "Bad Request: not enough rights to send text messages")?,
+                "insufficient rights",
+                true,
+            ),
+            (
+                response_error(400, "Bad Request: message text is empty")?,
+                "bad request: text must be non-empty",
+                false,
+            ),
+            (
+                response_error(400, "Bad Request: message thread not found")?,
+                "forum thread not found",
+                false,
+            ),
+            (
+                response_error(400, "Bad Request: chat not found")?,
+                "bad request",
+                false,
+            ),
+            (
+                response_error(500, "Internal Server Error")?,
+                "telegram API error",
+                false,
+            ),
+        ];
+
+        for (error, expected_message, expected_permission) in cases {
+            let classified = classify_telegram_send_error(&error);
+            assert!(
+                classified.message.starts_with(expected_message),
+                "{} did not start with {expected_message}",
+                classified.message
+            );
+            assert_eq!(classified.permission_error, expected_permission);
+        }
+
+        Ok(())
+    }
+
+    fn response_error(
+        code: i64,
+        description: &str,
+    ) -> Result<carapax::api::ExecuteError, Box<dyn std::error::Error>> {
+        let response: carapax::types::Response<serde_json::Value> =
+            serde_json::from_value(serde_json::json!({
+                "ok": false,
+                "error_code": code,
+                "description": description,
+            }))?;
+        match response.into_result() {
+            Ok(_) => panic!("test response unexpectedly succeeded"),
+            Err(error) => Ok(carapax::api::ExecuteError::Response(error)),
+        }
     }
 }

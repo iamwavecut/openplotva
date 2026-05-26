@@ -18,22 +18,16 @@ use tokio::{
     time::{sleep, timeout},
 };
 
-/// Go `StartUpdateLoop` long-poll timeout.
 pub const GO_LONG_POLL_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Go `GetUpdatesChan` retry delay after a failed poll.
 pub const GO_LONG_POLL_RETRY_DELAY: Duration = Duration::from_secs(3);
 
-/// Go webhook route registered by `ListenForUpdates`.
 pub const TELEGRAM_WEBHOOK_PATH: &str = "/telegram/webhook";
 
-/// Go webhook secret-token header checked by `ListenForUpdates`.
 pub const TELEGRAM_WEBHOOK_SECRET_HEADER: &str = "X-Telegram-Bot-Api-Secret-Token";
 
-/// Go `botAPI.Buffer` value set in `cmd/main.go`.
 pub const GO_WEBHOOK_UPDATE_BUFFER_SIZE: usize = 1_000_000;
 
-/// Go timeout for accepting one webhook update into the update channel.
 pub const GO_WEBHOOK_UPDATE_SEND_TIMEOUT: Duration = Duration::from_millis(1_500);
 
 /// Boxed future returned by Telegram `getUpdates` executors.
@@ -71,7 +65,6 @@ struct LongPollState {
 }
 
 impl<C> LongPollUpdateSource<C> {
-    /// Create a long-polling source using Go's retry delay.
     pub fn new(client: C) -> Self {
         Self {
             client,
@@ -141,12 +134,10 @@ where
     }
 }
 
-/// Source side of Go's webhook update channel.
 pub struct WebhookUpdateSource {
     receiver: Mutex<mpsc::Receiver<TelegramUpdate>>,
 }
 
-/// Sender side of Go's webhook update channel.
 #[derive(Clone, Debug)]
 pub struct WebhookUpdateSender {
     sender: mpsc::Sender<TelegramUpdate>,
@@ -159,7 +150,6 @@ pub enum WebhookUpdateSendError {
     /// The receiver side has been closed.
     #[error("webhook update receiver is closed")]
     Closed,
-    /// The update channel stayed full until the Go timeout elapsed.
     #[error("webhook update channel is full")]
     Timeout,
 }
@@ -175,13 +165,11 @@ pub enum WebhookUpdateRequestError {
     /// Request body could not be parsed as a Telegram update.
     #[error("invalid update")]
     InvalidUpdate,
-    /// The update channel stayed full until the Go timeout elapsed.
     #[error("service unavailable")]
     ServiceUnavailable,
 }
 
 impl WebhookUpdateRequestError {
-    /// HTTP status code returned by Go `ListenForUpdates`.
     pub const fn http_status(self) -> u16 {
         match self {
             Self::MethodNotAllowed => 405,
@@ -191,7 +179,6 @@ impl WebhookUpdateRequestError {
         }
     }
 
-    /// Error body returned by Go for invalid update payloads.
     pub const fn error_body(self) -> Option<&'static str> {
         match self {
             Self::InvalidUpdate => Some(r#"{"error":"invalid update"}"#),
@@ -200,7 +187,6 @@ impl WebhookUpdateRequestError {
     }
 }
 
-/// Build Go's webhook update channel pair.
 pub fn webhook_update_channel(buffer_size: usize) -> (WebhookUpdateSender, WebhookUpdateSource) {
     let (sender, receiver) = mpsc::channel(buffer_size);
     (
@@ -231,7 +217,6 @@ impl WebhookUpdateSender {
             .map_err(|_| WebhookUpdateSendError::Closed)
     }
 
-    /// Validate and accept one Telegram webhook request like Go `ListenForUpdates`.
     pub async fn handle_webhook_request(
         &self,
         method: &str,
@@ -246,8 +231,8 @@ impl WebhookUpdateSender {
             return Err(WebhookUpdateRequestError::Unauthorized);
         }
 
-        let update: TelegramUpdate =
-            serde_json::from_slice(body).map_err(|_| WebhookUpdateRequestError::InvalidUpdate)?;
+        let update = openplotva_updates::decode_telegram_update_json_slice(body)
+            .map_err(|_| WebhookUpdateRequestError::InvalidUpdate)?;
         self.accept_update(update)
             .await
             .map_err(|_| WebhookUpdateRequestError::ServiceUnavailable)
@@ -271,14 +256,12 @@ impl UpdateProducerSource for WebhookUpdateSource {
     }
 }
 
-/// Minimal webhook setup inputs used by Go `StartWebhookServer`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WebhookSetup {
     /// Public Telegram webhook URL.
     pub url: String,
     /// Optional `X-Telegram-Bot-Api-Secret-Token` value.
     pub secret_token: Option<String>,
-    /// Optional custom certificate uploaded as `cert.pem` like Go `api.FileBytes`.
     pub certificate: Option<WebhookCertificate>,
 }
 
@@ -318,7 +301,6 @@ impl WebhookSetup {
     }
 }
 
-/// Return the Go allowed-update list as a native `carapax` set.
 pub fn go_allowed_update_set() -> HashSet<AllowedUpdate> {
     openplotva_updates::GO_ALLOWED_UPDATES
         .iter()
@@ -326,12 +308,10 @@ pub fn go_allowed_update_set() -> HashSet<AllowedUpdate> {
         .collect()
 }
 
-/// Build Go's long-polling `getUpdates` method.
 pub fn build_get_updates_method() -> GetUpdates {
     build_get_updates_method_with_offset(0)
 }
 
-/// Build Go's long-polling `getUpdates` method with an explicit offset.
 pub fn build_get_updates_method_with_offset(offset: i64) -> GetUpdates {
     GetUpdates::default()
         .with_offset(offset)
@@ -339,12 +319,10 @@ pub fn build_get_updates_method_with_offset(offset: i64) -> GetUpdates {
         .with_allowed_updates(go_allowed_update_set())
 }
 
-/// Build Go's webhook deletion method used before long polling.
 pub fn build_delete_webhook_method() -> DeleteWebhook {
     DeleteWebhook::default()
 }
 
-/// Build Go's webhook setup method.
 pub fn build_set_webhook_method(setup: &WebhookSetup) -> SetWebhook {
     let mut method =
         SetWebhook::new(setup.url.clone()).with_allowed_updates(go_allowed_update_set());
@@ -396,7 +374,7 @@ mod tests {
         );
         assert!(
             payload.get("limit").is_none(),
-            "Go NewUpdate(0) leaves limit unset"
+            "Zero update limit stays unset"
         );
         assert_eq!(GO_LONG_POLL_TIMEOUT.as_secs(), 60);
     }
@@ -557,6 +535,37 @@ mod tests {
 
         let update = source.next_update().await.ok_or("expected update")?;
         assert_eq!(update.id, 10);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn webhook_request_accepts_bot_api_poll_answer_voter_chat() -> Result<(), Box<dyn Error>>
+    {
+        let (sender, source) = webhook_update_channel(1);
+        let body = serde_json::to_vec(&json!({
+            "update_id": 13,
+            "poll_answer": {
+                "poll_id": "poll-id",
+                "voter_chat": {
+                    "id": -10043,
+                    "type": "supergroup",
+                    "title": "Poll Team"
+                },
+                "option_ids": [1],
+                "option_persistent_ids": []
+            }
+        }))?;
+
+        sender
+            .handle_webhook_request("POST", Some("secret"), "secret", &body)
+            .await?;
+
+        let update = source.next_update().await.ok_or("expected update")?;
+        assert_eq!(update.id, 13);
+        assert_eq!(
+            openplotva_updates::producer_update_name(&update),
+            "poll_answer"
+        );
         Ok(())
     }
 

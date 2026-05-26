@@ -1,0 +1,3105 @@
+use std::{future::Future, pin::Pin, sync::Arc};
+
+use async_graphql::{EmptySubscription, ID, InputObject, Json, Object, Schema, SimpleObject};
+use serde_json::{Value, json};
+
+/// Runtime API GraphQL schema type.
+pub type RuntimeApiSchema = Schema<RuntimeQuery, RuntimeMutation, EmptySubscription>;
+
+const RUNTIME_TASKMAN_LOWEST_PRIORITY: i32 = -4;
+
+/// Boxed future returned by runtime Redis diagnostic inspectors.
+pub type RuntimeRedisInspectorFuture<'a, T> =
+    Pin<Box<dyn Future<Output = Result<T, String>> + Send + 'a>>;
+
+/// Boxed future returned by runtime SQL diagnostic readers.
+pub type RuntimeSqlReaderFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<RuntimeSqlReadResult, String>> + Send + 'a>>;
+
+/// Boxed future returned by runtime entity readers.
+pub type RuntimeEntityReaderFuture<'a, T> =
+    Pin<Box<dyn Future<Output = Result<T, String>> + Send + 'a>>;
+
+/// Boxed future returned by runtime pending-operation readers.
+pub type RuntimePendingOpsReaderFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Vec<RuntimePendingOpData>, String>> + Send + 'a>>;
+
+/// Boxed future returned by runtime safety-check readers.
+pub type RuntimeSafetyCheckReaderFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<RuntimeSafetyCheckConnectionData, String>> + Send + 'a>>;
+
+/// Boxed future returned by runtime update diagnostic inspectors.
+pub type RuntimeUpdatesInspectorFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<RuntimeUpdatesRuntimeData, String>> + Send + 'a>>;
+
+/// Boxed future returned by runtime memory restart mutations.
+pub type RuntimeMemoryRestartFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<RuntimeMemoryRestartResultData, String>> + Send + 'a>>;
+
+/// Boxed future returned by runtime Gemini cache purge mutations.
+pub type RuntimeGeminiCachePurgerFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<RuntimeGeminiCachePurgeResultData, String>> + Send + 'a>>;
+
+/// Boxed future returned by runtime LLM analytics readers.
+pub type RuntimeLlmAnalyticsReaderFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<RuntimeLlmAnalyticsData, String>> + Send + 'a>>;
+
+/// Runtime API Redis diagnostics boundary.
+pub trait RuntimeRedisInspector: Send + Sync {
+    fn prefix_groups<'a>(
+        &'a self,
+        prefix: &'a str,
+        limit: usize,
+    ) -> RuntimeRedisInspectorFuture<'a, Vec<RuntimeRedisPrefixGroup>>;
+
+    fn keys<'a>(
+        &'a self,
+        pattern: &'a str,
+        limit: usize,
+    ) -> RuntimeRedisInspectorFuture<'a, Vec<String>>;
+
+    fn value<'a>(
+        &'a self,
+        key: &'a str,
+        max_bytes: usize,
+    ) -> RuntimeRedisInspectorFuture<'a, Option<RuntimeRedisValue>>;
+}
+
+/// Runtime API read-only SQL boundary.
+pub trait RuntimeSqlReader: Send + Sync {
+    /// Execute a guarded read-only SQL diagnostic query.
+    fn read<'a>(&'a self, request: RuntimeSqlReadRequest) -> RuntimeSqlReaderFuture<'a>;
+}
+
+/// Runtime API core entity read boundary.
+pub trait RuntimeEntityReader: Send + Sync {
+    fn users<'a>(
+        &'a self,
+        filter: RuntimeUsersFilter,
+    ) -> RuntimeEntityReaderFuture<'a, RuntimeUserConnectionData>;
+
+    /// Load one user by ID or username.
+    fn user<'a>(
+        &'a self,
+        lookup: RuntimeUserLookup,
+    ) -> RuntimeEntityReaderFuture<'a, Option<RuntimeUserDetailsData>>;
+
+    fn chats<'a>(
+        &'a self,
+        filter: RuntimeChatsFilter,
+    ) -> RuntimeEntityReaderFuture<'a, RuntimeChatConnectionData>;
+
+    /// Load one chat by ID.
+    fn chat<'a>(&'a self, id: i64) -> RuntimeEntityReaderFuture<'a, Option<RuntimeChatData>>;
+
+    /// List one chat's members and optional user rows.
+    fn chat_members<'a>(
+        &'a self,
+        chat_id: i64,
+    ) -> RuntimeEntityReaderFuture<'a, Vec<RuntimeChatMemberWithUserData>>;
+}
+
+/// Runtime API pending virtual-message operation read boundary.
+pub trait RuntimePendingOpsReader: Send + Sync {
+    fn pending_ops<'a>(&'a self, limit: i32) -> RuntimePendingOpsReaderFuture<'a>;
+}
+
+/// Runtime API safety-check read boundary.
+pub trait RuntimeSafetyCheckReader: Send + Sync {
+    fn safety_checks<'a>(
+        &'a self,
+        filter: RuntimeSafetyChecksFilter,
+    ) -> RuntimeSafetyCheckReaderFuture<'a>;
+}
+
+/// Runtime API LLM trace read boundary.
+pub trait RuntimeLlmTraceInspector: Send + Sync {
+    fn llm_requests(
+        &self,
+        filter: RuntimeLlmRequestsFilter,
+    ) -> Result<Vec<RuntimeLlmRequestData>, String>;
+}
+
+/// Runtime API LLM analytics read boundary.
+pub trait RuntimeLlmAnalyticsReader: Send + Sync {
+    fn llm_analytics<'a>(&'a self, range: &'a str) -> RuntimeLlmAnalyticsReaderFuture<'a>;
+}
+
+/// Runtime API log replay boundary.
+pub trait RuntimeLogInspector: Send + Sync {
+    fn logs(&self, query: RuntimeLogQuery) -> Vec<RuntimeLogEntry>;
+}
+
+/// Runtime API dispatcher diagnostics boundary.
+pub trait RuntimeDispatcherInspector: Send + Sync {
+    fn stats(&self) -> RuntimeDispatcherStatsData;
+}
+
+/// Runtime API cache diagnostics boundary.
+pub trait RuntimeCacheInspector: Send + Sync {
+    fn stats(&self) -> RuntimeCacheSnapshotData;
+}
+
+/// Runtime API updates diagnostics boundary.
+pub trait RuntimeUpdatesInspector: Send + Sync {
+    /// Return a live decoded-update runtime snapshot.
+    fn snapshot<'a>(&'a self) -> RuntimeUpdatesInspectorFuture<'a>;
+}
+
+/// Runtime API memory restart mutation boundary.
+pub trait RuntimeMemoryRestarter: Send + Sync {
+    /// Retry failed memory runs and trigger the memory worker.
+    fn restart<'a>(&'a self, run_id: Option<i64>) -> RuntimeMemoryRestartFuture<'a>;
+}
+
+/// Runtime API Gemini explicit-cache purge mutation boundary.
+pub trait RuntimeGeminiCachePurger: Send + Sync {
+    /// Purge remotely tracked Gemini explicit caches.
+    fn purge<'a>(&'a self) -> RuntimeGeminiCachePurgerFuture<'a>;
+}
+
+/// Runtime API taskman diagnostics boundary.
+pub trait RuntimeTaskmanInspector: Send + Sync {
+    fn list_jobs(
+        &self,
+        filter: RuntimeTaskmanJobsFilter,
+    ) -> Result<RuntimeTaskmanJobListResultData, String>;
+
+    /// Inspect one taskman job by ID.
+    fn job(&self, id: i64) -> Result<Option<RuntimeTaskmanJobDetailsData>, String>;
+
+    /// Return a live taskman queue diagnostic snapshot.
+    fn queue_diagnostics(
+        &self,
+        queues: Vec<String>,
+        priority: i32,
+    ) -> Result<RuntimeTaskmanDiagnosticsData, String>;
+}
+
+/// Optional live runtime diagnostic providers used by the GraphQL route shell.
+#[derive(Clone, Default)]
+pub struct RuntimeApiLiveDiagnostics {
+    pub redis_inspector: Option<Arc<dyn RuntimeRedisInspector>>,
+    pub sql_reader: Option<Arc<dyn RuntimeSqlReader>>,
+    pub entity_reader: Option<Arc<dyn RuntimeEntityReader>>,
+    pub pending_ops_reader: Option<Arc<dyn RuntimePendingOpsReader>>,
+    pub safety_check_reader: Option<Arc<dyn RuntimeSafetyCheckReader>>,
+    pub llm_trace_inspector: Option<Arc<dyn RuntimeLlmTraceInspector>>,
+    pub llm_analytics_reader: Option<Arc<dyn RuntimeLlmAnalyticsReader>>,
+    pub log_inspector: Option<Arc<dyn RuntimeLogInspector>>,
+    pub taskman_inspector: Option<Arc<dyn RuntimeTaskmanInspector>>,
+    pub updates_inspector: Option<Arc<dyn RuntimeUpdatesInspector>>,
+    pub dispatcher_inspector: Option<Arc<dyn RuntimeDispatcherInspector>>,
+    pub cache_inspector: Option<Arc<dyn RuntimeCacheInspector>>,
+    pub memory_restarter: Option<Arc<dyn RuntimeMemoryRestarter>>,
+    pub gemini_cache_purger: Option<Arc<dyn RuntimeGeminiCachePurger>>,
+}
+
+/// Runtime API log replay query after GraphQL/default shaping.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeLogQuery {
+    pub after_seq: u64,
+    pub limit: i32,
+    pub level: String,
+    pub search: String,
+}
+
+/// Runtime API log entry.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RuntimeLogEntry {
+    pub seq: u64,
+    pub time: Option<String>,
+    pub level: String,
+    pub message: String,
+    pub attrs: Option<Value>,
+}
+
+/// Runtime API outbound dispatcher stats from a live inspector.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeDispatcherStatsData {
+    pub regular_queue_size: i32,
+    pub immediate_queue_size: i32,
+    pub processed_total: i64,
+    pub deduped_total: i64,
+    pub oldest_regular_age_ms: i32,
+    pub oldest_immediate_age_ms: i32,
+}
+
+/// Runtime API cache stats from a live inspector.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeCacheStatsData {
+    pub size: i32,
+    pub capacity: i32,
+    pub hits: u64,
+    pub misses: u64,
+    pub mem_size: u64,
+}
+
+/// Runtime API main/planner cache stats from a live inspector.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeCacheSnapshotData {
+    pub cache: RuntimeCacheStatsData,
+    pub planner_cache: RuntimeCacheStatsData,
+}
+
+/// Runtime API memory restart mutation result.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeMemoryRestartResultData {
+    pub ok: bool,
+    pub run_id: Option<i64>,
+    pub retried_failed_runs: i32,
+    pub queued_runs: i32,
+    pub started: bool,
+    pub override_: bool,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+}
+
+/// Runtime API Gemini explicit-cache purge mutation result.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeGeminiCachePurgeResultData {
+    pub scanned: i32,
+    pub matched: i32,
+    pub deleted: i32,
+    pub failed: i32,
+}
+
+/// Runtime API taskman job list filter after GraphQL/default shaping.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeTaskmanJobsFilter {
+    pub q: String,
+    pub status: Vec<String>,
+    pub queue: Vec<String>,
+    pub user_id: Option<i64>,
+    pub chat_id: Option<i64>,
+    pub time_field: String,
+    pub from: String,
+    pub to: String,
+    pub sort_by: String,
+    pub sort_dir: String,
+    pub offset: i32,
+    pub limit: i32,
+}
+
+/// Runtime API taskman list result from a live inspector.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RuntimeTaskmanJobListResultData {
+    pub total: i32,
+    pub offset: i32,
+    pub limit: i32,
+    pub summary: RuntimeTaskmanJobSummaryData,
+    pub items: Vec<RuntimeTaskmanJobListEntryData>,
+}
+
+/// Runtime API taskman summary maps.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RuntimeTaskmanJobSummaryData {
+    pub by_status: Value,
+    pub by_queue: Value,
+}
+
+/// Runtime API taskman job list row from a live inspector.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RuntimeTaskmanJobListEntryData {
+    pub id: i64,
+    pub queue_name: String,
+    pub priority: i32,
+    pub title: String,
+    pub job_type: String,
+    pub status: String,
+    pub user_id: i64,
+    pub chat_id: i64,
+    pub trigger_message_id: i32,
+    pub thread_message_id: Option<i32>,
+    pub progress_message_id: Option<i32>,
+    pub queue_position_message_id: Option<i32>,
+    pub result_message_id: Option<i32>,
+    pub worker_id: Option<String>,
+    pub created_at: String,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub error_message: Option<String>,
+    pub processing_timeout_seconds: i32,
+    pub prompt_hash: Option<String>,
+    pub estimated_processing_time: Option<i32>,
+    pub actual_processing_time: Option<i32>,
+    pub preview: Option<String>,
+}
+
+/// Runtime API taskman job details from a live inspector.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RuntimeTaskmanJobDetailsData {
+    pub job: RuntimeTaskmanJobData,
+    pub messages: Vec<RuntimeTaskmanJobMessageData>,
+    pub events: Option<Value>,
+}
+
+/// Runtime API taskman full job row from a live inspector.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RuntimeTaskmanJobData {
+    pub id: i64,
+    pub queue_name: String,
+    pub priority: i32,
+    pub title: String,
+    pub payload: Option<Value>,
+    pub status: String,
+    pub user_id: i64,
+    pub chat_id: i64,
+    pub trigger_message_id: i32,
+    pub thread_message_id: Option<i32>,
+    pub progress_message_id: Option<i32>,
+    pub queue_position_message_id: Option<i32>,
+    pub result_message_id: Option<i32>,
+    pub worker_id: Option<String>,
+    pub created_at: String,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub error_message: Option<String>,
+    pub processing_timeout_seconds: i32,
+    pub prompt_hash: Option<String>,
+    pub estimated_processing_time: Option<i32>,
+    pub actual_processing_time: Option<i32>,
+}
+
+/// Runtime API taskman message row from a live inspector.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RuntimeTaskmanJobMessageData {
+    pub id: i64,
+    pub job_id: i64,
+    pub message_type: String,
+    pub chat_id: i64,
+    pub message_id: i32,
+    pub created_at: String,
+    pub status: String,
+}
+
+/// Runtime API taskman diagnostics from a live inspector.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeTaskmanDiagnosticsData {
+    pub running: bool,
+    pub active: i32,
+    pub started1m: i32,
+    pub completed1m: i32,
+    pub worker_count: i32,
+    pub queue_signal_count: i32,
+    pub slow_job_count: i32,
+    pub queues: Vec<RuntimeTaskmanQueueDiagnosticsData>,
+}
+
+/// Runtime API taskman queue diagnostics from a live inspector.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeTaskmanQueueDiagnosticsData {
+    pub queue_name: String,
+    pub priority: i32,
+    pub pending: i32,
+    pub pending_or_higher: i32,
+    pub active: i32,
+    pub worker_count: i32,
+    pub eta_seconds: i32,
+}
+
+/// Runtime API decoded-update runtime snapshot from a live inspector.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeUpdatesRuntimeData {
+    pub active: i32,
+    pub state_active: i32,
+    pub handle_active: i32,
+    pub queue_len: i32,
+    pub queue_error: Option<String>,
+    pub started1m: i32,
+    pub completed1m: i32,
+    pub timeouts1m: i32,
+    pub oldest_active_ms: i32,
+    pub last_stall_at: Option<String>,
+    pub tasks: Vec<RuntimeUpdatesTaskData>,
+}
+
+/// Runtime API decoded-update task row from a live inspector.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeUpdatesTaskData {
+    pub stage: String,
+    pub started_at: String,
+    pub age_ms: i32,
+    pub chat_id: Option<i64>,
+    pub user_id: Option<i64>,
+    pub update: String,
+}
+
+/// Runtime API SQL read request after GraphQL/default shaping.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RuntimeSqlReadRequest {
+    pub sql: String,
+    pub args: Vec<Value>,
+    pub timeout_ms: i32,
+    pub row_limit: i32,
+    pub result_bytes_limit: i32,
+}
+
+/// Runtime API SQL read result.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RuntimeSqlReadResult {
+    pub columns: Vec<String>,
+    pub rows: Vec<Value>,
+    pub row_count: i32,
+    pub elapsed_ms: i32,
+    pub truncated: bool,
+}
+
+/// Runtime API users list filter after GraphQL/default shaping.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeUsersFilter {
+    pub q: String,
+    pub offset: i32,
+    pub limit: i32,
+}
+
+/// Runtime API user lookup after GraphQL/default shaping.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RuntimeUserLookup {
+    Id(i64),
+    Username(String),
+}
+
+/// Runtime API chats list filter after GraphQL/default shaping.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeChatsFilter {
+    pub q: String,
+    pub offset: i32,
+    pub limit: i32,
+    pub member_username: Option<String>,
+    pub member_user_id: Option<i64>,
+}
+
+/// Runtime API user row from a live entity reader.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeUserData {
+    pub id: i64,
+    pub is_premium: Option<bool>,
+    pub first_name: String,
+    pub last_name: Option<String>,
+    pub username: Option<String>,
+    pub language_code: Option<String>,
+    pub is_vip: Option<bool>,
+    pub discovered_at: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+/// Runtime API users connection from a live entity reader.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeUserConnectionData {
+    pub count: i32,
+    pub offset: i32,
+    pub limit: i32,
+    pub items: Vec<RuntimeUserData>,
+}
+
+/// Runtime API user details from a live entity reader.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RuntimeUserDetailsData {
+    pub user: RuntimeUserData,
+    pub subscription: Option<RuntimeSubscriptionData>,
+    pub vip: Option<RuntimeVipCacheData>,
+    pub vip_summary: Option<RuntimeVipSummaryData>,
+    pub vip_events: Vec<RuntimeVipEventData>,
+    pub subscriptions: Vec<RuntimeSubscriptionData>,
+}
+
+/// Runtime API subscription row from a live entity reader.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeSubscriptionData {
+    pub id: i64,
+    pub user_id: i64,
+    pub telegram_payment_charge_id: String,
+    pub provider_payment_charge_id: String,
+    pub expires_at: Option<String>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+    pub canceled_at: Option<String>,
+    pub refunded_at: Option<String>,
+    pub status: String,
+}
+
+/// Runtime API VIP cache row from a live entity reader.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeVipCacheData {
+    pub user_id: i64,
+    pub is_vip: bool,
+    pub expires_at: Option<String>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+/// Runtime API VIP summary from a live entity reader.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RuntimeVipSummaryData {
+    pub active: bool,
+    pub has_history: bool,
+    pub expires_at: Option<String>,
+    pub remaining_seconds: String,
+    pub remaining_days: i32,
+    pub latest_event_id: Option<i64>,
+    pub latest_event_type: Option<String>,
+    pub latest_reason: Option<String>,
+    pub latest_created_at: Option<String>,
+}
+
+/// Runtime API VIP event row from a live entity reader.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RuntimeVipEventData {
+    pub id: i64,
+    pub event_type: String,
+    pub delta_seconds: String,
+    pub delta_days: f64,
+    pub effective_expires_at: Option<String>,
+    pub actor_user_id: Option<i64>,
+    pub actor_label: Option<String>,
+    pub reason: Option<String>,
+    pub created_at: Option<String>,
+    pub subscription_id: Option<i64>,
+    pub telegram_payment_charge_id: Option<String>,
+    pub provider_payment_charge_id: Option<String>,
+    pub subscription_status: Option<String>,
+}
+
+/// Runtime API chat row from a live entity reader.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeChatData {
+    pub id: i64,
+    pub chat_type: String,
+    pub title: Option<String>,
+    pub username: Option<String>,
+    pub first_name: Option<String>,
+    pub last_name: Option<String>,
+    pub is_forum: Option<bool>,
+    pub description: Option<String>,
+    pub invite_link: Option<String>,
+    pub discovered_at: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+/// Runtime API chats connection from a live entity reader.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeChatConnectionData {
+    pub count: i32,
+    pub offset: i32,
+    pub limit: i32,
+    pub items: Vec<RuntimeChatData>,
+}
+
+/// Runtime API chat-member row from a live entity reader.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeChatMemberData {
+    pub chat_id: i64,
+    pub user_id: i64,
+    pub status: String,
+    pub is_anonymous: Option<bool>,
+    pub custom_title: Option<String>,
+    pub can_be_edited: Option<bool>,
+    pub can_manage_chat: Option<bool>,
+    pub can_delete_messages: Option<bool>,
+    pub can_manage_video_chats: Option<bool>,
+    pub can_restrict_members: Option<bool>,
+    pub can_promote_members: Option<bool>,
+    pub can_change_info: Option<bool>,
+    pub can_invite_users: Option<bool>,
+    pub can_post_messages: Option<bool>,
+    pub can_edit_messages: Option<bool>,
+    pub can_pin_messages: Option<bool>,
+    pub can_manage_topics: Option<bool>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+    pub last_message_at: Option<String>,
+}
+
+/// Runtime API chat-member plus optional user row from a live entity reader.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeChatMemberWithUserData {
+    pub member: RuntimeChatMemberData,
+    pub user: Option<RuntimeUserData>,
+}
+
+/// Runtime API pending virtual-message operation from a live reader.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RuntimePendingOpData {
+    pub id: i64,
+    pub vmsg_id: String,
+    pub chat_id: i64,
+    pub op: String,
+    pub payload: Option<Value>,
+    pub status: String,
+    pub created_at: String,
+    pub attempts: i32,
+}
+
+/// Runtime API safety-check list filter after GraphQL/default shaping.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeSafetyChecksFilter {
+    pub q: String,
+    pub flagged: Option<bool>,
+    pub offset: i32,
+    pub limit: i32,
+}
+
+/// Runtime API safety-check connection from a live reader.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RuntimeSafetyCheckConnectionData {
+    pub count: i32,
+    pub offset: i32,
+    pub limit: i32,
+    pub items: Vec<RuntimeSafetyCheckData>,
+}
+
+/// Runtime API safety-check row from a live reader.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RuntimeSafetyCheckData {
+    pub id: i64,
+    pub created_at: String,
+    pub source: String,
+    pub flow: Option<String>,
+    pub mode: Option<String>,
+    pub chat_id: Option<i64>,
+    pub thread_id: Option<i32>,
+    pub message_id: Option<i32>,
+    pub user_id: Option<i64>,
+    pub deployment_id: String,
+    pub external_session_id: Option<String>,
+    pub request_messages: Option<Value>,
+    pub flagged: Option<bool>,
+    pub internal_session_id: Option<String>,
+    pub policies: Option<Value>,
+    pub response_json: Option<Value>,
+    pub duration_ms: i32,
+    pub error: Option<String>,
+}
+
+/// Runtime API LLM request filter after GraphQL/default shaping.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeLlmRequestsFilter {
+    pub q: String,
+    pub source: String,
+    pub model: String,
+    pub chat_id: Option<i64>,
+    pub user_id: Option<i64>,
+    pub limit: i32,
+}
+
+/// Runtime API LLM request trace.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RuntimeLlmRequestData {
+    pub id: i64,
+    pub at: String,
+    pub provider: Option<String>,
+    pub request_kind: Option<String>,
+    pub source: String,
+    pub mode: Option<String>,
+    pub flow: Option<String>,
+    pub iteration: i32,
+    pub model: Option<String>,
+    pub chat: RuntimeLlmRequestChatData,
+    pub user: RuntimeLlmRequestUserData,
+    pub message: RuntimeLlmRequestMessageData,
+    pub gen_config: RuntimeLlmGenConfigData,
+    pub docs: Option<Value>,
+    pub messages: Option<Value>,
+    pub raw_request: Option<Value>,
+    pub resolved_cache_content: Option<Value>,
+    pub raw_response: Option<Value>,
+    pub transport: Option<Value>,
+    pub inference_params: Option<Value>,
+    pub usage: Option<Value>,
+    pub timings: Option<Value>,
+    pub prompt_chars: i32,
+    pub prompt_messages: i32,
+    pub docs_chars: i32,
+    pub duration_ms: i32,
+    pub result: RuntimeLlmRequestResultData,
+}
+
+/// Runtime API LLM request chat metadata.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeLlmRequestChatData {
+    pub chat_id: i64,
+    pub thread_id: Option<i32>,
+    pub chat_title: Option<String>,
+}
+
+/// Runtime API LLM request user metadata.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeLlmRequestUserData {
+    pub user_id: i64,
+    pub full_name: Option<String>,
+}
+
+/// Runtime API LLM request message metadata.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeLlmRequestMessageData {
+    pub message_id: i32,
+}
+
+/// Runtime API LLM generation config.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RuntimeLlmGenConfigData {
+    pub max_output_tokens: i32,
+    pub temperature: f64,
+    pub top_p: f64,
+    pub top_k: i32,
+    pub safety_settings: Option<Value>,
+}
+
+/// Runtime API LLM request result.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeLlmRequestResultData {
+    pub duration_ms: i32,
+    pub error: Option<String>,
+    pub response_text_preview: Option<String>,
+}
+
+/// Runtime API LLM analytics summary.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RuntimeLlmAnalyticsData {
+    pub range: String,
+    pub bucket: String,
+    pub since: String,
+    pub totals: RuntimeLlmAnalyticsTotalsData,
+    pub series: Vec<RuntimeLlmAnalyticsSeriesPointData>,
+    pub model_series: Vec<RuntimeLlmAnalyticsModelSeriesPointData>,
+    pub top_chats: Vec<RuntimeLlmAnalyticsTopChatData>,
+    pub models: Vec<RuntimeLlmAnalyticsModelStatData>,
+    pub providers: Vec<RuntimeLlmAnalyticsProviderStatData>,
+    pub inference_params: Vec<RuntimeLlmAnalyticsInferenceParamStatData>,
+    pub stage_metrics: Vec<RuntimeLlmAnalyticsStageMetricData>,
+    pub runtime_jobs: Vec<RuntimeJobAnalyticsStatData>,
+    pub runtime_jobs_error: Option<String>,
+    pub ai_farm_capacity: Option<RuntimeAifarmCapacitySnapshotData>,
+}
+
+/// Runtime API LLM analytics model time-series point.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RuntimeLlmAnalyticsModelSeriesPointData {
+    pub ts: String,
+    pub model: String,
+    pub request_count: i32,
+    pub error_count: i32,
+    pub avg_duration_ms: i32,
+    pub avg_generation_tps: f64,
+    pub avg_effective_output_tps: f64,
+    pub output_tokens: i64,
+}
+
+/// Runtime API LLM analytics totals.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeLlmAnalyticsTotalsData {
+    pub total_count: i32,
+    pub error_count: i32,
+    pub avg_duration_ms: i32,
+}
+
+/// Runtime API LLM analytics series point.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeLlmAnalyticsSeriesPointData {
+    pub ts: String,
+    pub total_count: i32,
+    pub error_count: i32,
+    pub avg_duration_ms: i32,
+}
+
+/// Runtime API LLM analytics top chat.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeLlmAnalyticsTopChatData {
+    pub chat_id: i64,
+    pub title: Option<String>,
+    pub username: Option<String>,
+    pub request_count: i32,
+}
+
+/// Runtime API LLM analytics model stat.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RuntimeLlmAnalyticsModelStatData {
+    pub model: String,
+    pub request_count: i32,
+    pub error_count: i32,
+    pub avg_duration_ms: i32,
+    pub p50_duration_ms: i32,
+    pub p95_duration_ms: i32,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub total_tokens: i64,
+    pub avg_generation_tps: f64,
+    pub avg_effective_output_tps: f64,
+    pub p50_effective_output_tps: f64,
+    pub p95_effective_output_tps: f64,
+}
+
+/// Runtime API LLM analytics provider stat.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RuntimeLlmAnalyticsProviderStatData {
+    pub provider: String,
+    pub source: String,
+    pub request_count: i32,
+    pub error_count: i32,
+    pub avg_duration_ms: i32,
+    pub p50_duration_ms: i32,
+    pub p95_duration_ms: i32,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub total_tokens: i64,
+    pub avg_generation_tps: f64,
+    pub avg_effective_output_tps: f64,
+}
+
+/// Runtime API LLM analytics inference-parameter stat.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RuntimeLlmAnalyticsInferenceParamStatData {
+    pub provider: String,
+    pub source: String,
+    pub model: String,
+    pub max_tokens: Option<i32>,
+    pub temperature: Option<f64>,
+    pub top_p: Option<f64>,
+    pub top_k: Option<f64>,
+    pub candidate_count: Option<i32>,
+    pub tool_mode: String,
+    pub response_format: String,
+    pub request_count: i32,
+    pub error_count: i32,
+    pub avg_duration_ms: i32,
+    pub avg_effective_output_tps: f64,
+}
+
+/// Runtime API LLM analytics stage metric.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeLlmAnalyticsStageMetricData {
+    pub stage: String,
+    pub source: String,
+    pub request_count: i32,
+    pub error_count: i32,
+    pub avg_duration_ms: i32,
+    pub p50_duration_ms: i32,
+    pub p95_duration_ms: i32,
+    pub avg_iteration: i32,
+    pub max_iteration: i32,
+}
+
+/// Runtime API task/job analytics stat.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeJobAnalyticsStatData {
+    pub job_type: String,
+    pub queue_name: String,
+    pub provider: String,
+    pub created_count: i32,
+    pub completed_count: i32,
+    pub failed_count: i32,
+    pub avg_wait_ms: i32,
+    pub p95_wait_ms: i32,
+    pub avg_processing_ms: i32,
+    pub p95_processing_ms: i32,
+}
+
+/// Runtime API AI Farm capacity snapshot.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeAifarmCapacitySnapshotData {
+    pub service: String,
+    pub max_concurrent_jobs: i32,
+    pub running: i32,
+    pub queued: i32,
+    pub available: i32,
+    pub locked: bool,
+    pub ready: bool,
+    pub observed_at: String,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RuntimeApiGraphqlSnapshot {
+    pub log_level: String,
+    pub web_host: String,
+    pub web_port: i32,
+    pub runtime_api_enabled: bool,
+    pub runtime_api_host: String,
+    pub runtime_api_port: i32,
+    pub discovery_base_url: Option<String>,
+    pub embedder_enabled: bool,
+    pub embedder_url: Option<String>,
+    pub shield_enabled: bool,
+    pub shield_embedder_url: Option<String>,
+    pub shield_max_matches: i32,
+    pub shield_vector_min_score: f64,
+    pub shield_lexical_min_score: f64,
+    pub shield_retrieval_timeout_seconds: i32,
+    pub shield_history_tail_messages: i32,
+    pub vision_discovery_service_name: String,
+    pub vision_discovery_endpoint_name: String,
+    pub vision_model: String,
+    pub vision_max_tokens: i32,
+    pub vision_temperature: f64,
+    pub vision_direct_image_limit: i32,
+    pub vision_request_timeout_seconds: i32,
+    pub white_circle_enabled: bool,
+    pub ace_step_enabled: bool,
+    pub ace_step_base_url: Option<String>,
+    pub dialog_provider: String,
+    pub dialog_fallback_provider: Option<String>,
+    pub model_scope_base_url: Option<String>,
+    pub pruna_endpoint: Option<String>,
+    pub persistent_queue_enabled: bool,
+    pub active_draw_providers: Vec<String>,
+    pub sql_timeout_ms: i32,
+    pub sql_row_limit: i32,
+    pub sql_result_bytes_limit: i32,
+    pub db_status: String,
+    pub redis_status: String,
+}
+
+impl Default for RuntimeApiGraphqlSnapshot {
+    fn default() -> Self {
+        Self {
+            log_level: "info".to_owned(),
+            web_host: "127.0.0.1".to_owned(),
+            web_port: 0,
+            runtime_api_enabled: false,
+            runtime_api_host: "127.0.0.1".to_owned(),
+            runtime_api_port: 0,
+            discovery_base_url: None,
+            embedder_enabled: false,
+            embedder_url: None,
+            shield_enabled: false,
+            shield_embedder_url: None,
+            shield_max_matches: 0,
+            shield_vector_min_score: 0.0,
+            shield_lexical_min_score: 0.0,
+            shield_retrieval_timeout_seconds: 0,
+            shield_history_tail_messages: 0,
+            vision_discovery_service_name: String::new(),
+            vision_discovery_endpoint_name: String::new(),
+            vision_model: String::new(),
+            vision_max_tokens: 0,
+            vision_temperature: 0.0,
+            vision_direct_image_limit: 0,
+            vision_request_timeout_seconds: 0,
+            white_circle_enabled: false,
+            ace_step_enabled: false,
+            ace_step_base_url: None,
+            dialog_provider: String::new(),
+            dialog_fallback_provider: None,
+            model_scope_base_url: None,
+            pruna_endpoint: None,
+            persistent_queue_enabled: false,
+            active_draw_providers: Vec::new(),
+            sql_timeout_ms: 0,
+            sql_row_limit: 0,
+            sql_result_bytes_limit: 0,
+            db_status: "disabled".to_owned(),
+            redis_status: "disabled".to_owned(),
+        }
+    }
+}
+
+pub fn runtime_api_graphql_schema(snapshot: RuntimeApiGraphqlSnapshot) -> RuntimeApiSchema {
+    runtime_api_graphql_schema_with_redis(snapshot, None)
+}
+
+/// Build the runtime GraphQL schema with optional live Redis diagnostics.
+pub fn runtime_api_graphql_schema_with_redis(
+    snapshot: RuntimeApiGraphqlSnapshot,
+    redis_inspector: Option<Arc<dyn RuntimeRedisInspector>>,
+) -> RuntimeApiSchema {
+    runtime_api_graphql_schema_with_diagnostics(snapshot, redis_inspector, None)
+}
+
+/// Build the runtime GraphQL schema with optional live diagnostics.
+pub fn runtime_api_graphql_schema_with_diagnostics(
+    snapshot: RuntimeApiGraphqlSnapshot,
+    redis_inspector: Option<Arc<dyn RuntimeRedisInspector>>,
+    sql_reader: Option<Arc<dyn RuntimeSqlReader>>,
+) -> RuntimeApiSchema {
+    runtime_api_graphql_schema_with_live_diagnostics(
+        snapshot,
+        RuntimeApiLiveDiagnostics {
+            redis_inspector,
+            sql_reader,
+            ..RuntimeApiLiveDiagnostics::default()
+        },
+    )
+}
+
+/// Build the runtime GraphQL schema with optional live diagnostics.
+pub fn runtime_api_graphql_schema_with_live_diagnostics(
+    snapshot: RuntimeApiGraphqlSnapshot,
+    diagnostics: RuntimeApiLiveDiagnostics,
+) -> RuntimeApiSchema {
+    Schema::build(
+        RuntimeQuery {
+            snapshot,
+            redis_inspector: diagnostics.redis_inspector,
+            sql_reader: diagnostics.sql_reader,
+            entity_reader: diagnostics.entity_reader,
+            pending_ops_reader: diagnostics.pending_ops_reader,
+            safety_check_reader: diagnostics.safety_check_reader,
+            llm_trace_inspector: diagnostics.llm_trace_inspector,
+            llm_analytics_reader: diagnostics.llm_analytics_reader,
+            log_inspector: diagnostics.log_inspector,
+            taskman_inspector: diagnostics.taskman_inspector,
+            updates_inspector: diagnostics.updates_inspector,
+            dispatcher_inspector: diagnostics.dispatcher_inspector,
+            cache_inspector: diagnostics.cache_inspector,
+        },
+        RuntimeMutation {
+            memory_restarter: diagnostics.memory_restarter,
+            gemini_cache_purger: diagnostics.gemini_cache_purger,
+        },
+        EmptySubscription,
+    )
+    .finish()
+}
+
+pub struct RuntimeQuery {
+    snapshot: RuntimeApiGraphqlSnapshot,
+    redis_inspector: Option<Arc<dyn RuntimeRedisInspector>>,
+    sql_reader: Option<Arc<dyn RuntimeSqlReader>>,
+    entity_reader: Option<Arc<dyn RuntimeEntityReader>>,
+    pending_ops_reader: Option<Arc<dyn RuntimePendingOpsReader>>,
+    safety_check_reader: Option<Arc<dyn RuntimeSafetyCheckReader>>,
+    llm_trace_inspector: Option<Arc<dyn RuntimeLlmTraceInspector>>,
+    llm_analytics_reader: Option<Arc<dyn RuntimeLlmAnalyticsReader>>,
+    log_inspector: Option<Arc<dyn RuntimeLogInspector>>,
+    taskman_inspector: Option<Arc<dyn RuntimeTaskmanInspector>>,
+    updates_inspector: Option<Arc<dyn RuntimeUpdatesInspector>>,
+    dispatcher_inspector: Option<Arc<dyn RuntimeDispatcherInspector>>,
+    cache_inspector: Option<Arc<dyn RuntimeCacheInspector>>,
+}
+
+pub struct RuntimeMutation {
+    memory_restarter: Option<Arc<dyn RuntimeMemoryRestarter>>,
+    gemini_cache_purger: Option<Arc<dyn RuntimeGeminiCachePurger>>,
+}
+
+#[Object]
+impl RuntimeQuery {
+    async fn runtime_state(&self) -> RuntimeState {
+        let cache_snapshot = self
+            .cache_inspector
+            .as_deref()
+            .map(RuntimeCacheInspector::stats)
+            .unwrap_or_default();
+        RuntimeState {
+            log_level: self.snapshot.log_level.clone(),
+            dispatcher: self
+                .dispatcher_inspector
+                .as_deref()
+                .map(RuntimeDispatcherInspector::stats)
+                .map(DispatcherStats::from)
+                .unwrap_or_default(),
+            cache: CacheStats::from(cache_snapshot.cache),
+            planner_cache: CacheStats::from(cache_snapshot.planner_cache),
+        }
+    }
+
+    async fn health_snapshot(&self) -> HealthSnapshot {
+        let updates_queue_length = match self.updates_inspector.as_deref() {
+            Some(inspector) => inspector
+                .snapshot()
+                .await
+                .map(|runtime| runtime.queue_len)
+                .unwrap_or(-1),
+            None => 0,
+        };
+
+        HealthSnapshot {
+            db: DependencyHealth::from_status(&self.snapshot.db_status),
+            redis: DependencyHealth::from_status(&self.snapshot.redis_status),
+            dispatcher: DependencyHealth::from_status("disabled"),
+            ai_handler: DependencyHealth::from_status("disabled"),
+            shield: DependencyHealth::from_status("disabled"),
+            rag: DependencyHealth::from_status("disabled"),
+            ace_step: DependencyHealth::from_status("disabled"),
+            updates_queue_length,
+        }
+    }
+
+    async fn config_snapshot(&self) -> ConfigSnapshot {
+        ConfigSnapshot::from(self.snapshot.clone())
+    }
+
+    async fn users(
+        &self,
+        filter: Option<UsersFilterInput>,
+    ) -> async_graphql::Result<UserConnection> {
+        let Some(reader) = self.entity_reader.as_deref() else {
+            return Err("runtime entity reader is not configured".into());
+        };
+        reader
+            .users(users_filter_from_input(filter))
+            .await
+            .map(UserConnection::from)
+            .map_err(async_graphql::Error::new)
+    }
+
+    async fn user(
+        &self,
+        id: Option<ID>,
+        username: Option<String>,
+    ) -> async_graphql::Result<Option<UserDetails>> {
+        let Some(reader) = self.entity_reader.as_deref() else {
+            return Err("runtime entity reader is not configured".into());
+        };
+        let lookup = user_lookup_from_input(id, username)?;
+        reader
+            .user(lookup)
+            .await
+            .map(|user| user.map(UserDetails::from))
+            .map_err(async_graphql::Error::new)
+    }
+
+    async fn chats(
+        &self,
+        filter: Option<ChatsFilterInput>,
+    ) -> async_graphql::Result<ChatConnection> {
+        let Some(reader) = self.entity_reader.as_deref() else {
+            return Err("runtime entity reader is not configured".into());
+        };
+        reader
+            .chats(chats_filter_from_input(filter)?)
+            .await
+            .map(ChatConnection::from)
+            .map_err(async_graphql::Error::new)
+    }
+
+    async fn chat(&self, id: ID) -> async_graphql::Result<Option<Chat>> {
+        let Some(reader) = self.entity_reader.as_deref() else {
+            return Err("runtime entity reader is not configured".into());
+        };
+        let id = parse_id(id, "id")?;
+        reader
+            .chat(id)
+            .await
+            .map(|chat| chat.map(Chat::from))
+            .map_err(async_graphql::Error::new)
+    }
+
+    async fn chat_members(
+        &self,
+        #[graphql(name = "chatID")] chat_id: ID,
+    ) -> async_graphql::Result<Vec<ChatMemberWithUser>> {
+        let Some(reader) = self.entity_reader.as_deref() else {
+            return Err("runtime entity reader is not configured".into());
+        };
+        let chat_id = parse_id(chat_id, "chatID")?;
+        reader
+            .chat_members(chat_id)
+            .await
+            .map(|members| members.into_iter().map(ChatMemberWithUser::from).collect())
+            .map_err(async_graphql::Error::new)
+    }
+
+    async fn taskman_jobs(
+        &self,
+        filter: Option<TaskmanJobsFilterInput>,
+    ) -> async_graphql::Result<TaskmanJobListResult> {
+        let Some(inspector) = self.taskman_inspector.as_deref() else {
+            return Ok(TaskmanJobListResult::empty());
+        };
+        let filter = taskman_jobs_filter_from_input(filter)?;
+        let result = inspector
+            .list_jobs(filter)
+            .map_err(async_graphql::Error::new)?;
+        Ok(TaskmanJobListResult::from(result))
+    }
+
+    async fn taskman_job(&self, id: ID) -> async_graphql::Result<Option<TaskmanJobDetails>> {
+        let Some(inspector) = self.taskman_inspector.as_deref() else {
+            return Ok(None);
+        };
+        let id = id
+            .as_str()
+            .parse::<i64>()
+            .map_err(|error| async_graphql::Error::new(error.to_string()))?;
+        inspector
+            .job(id)
+            .map(|job| job.map(TaskmanJobDetails::from))
+            .map_err(async_graphql::Error::new)
+    }
+
+    async fn taskman_queue_diagnostics(
+        &self,
+        queues: Option<Vec<String>>,
+        priority: Option<i32>,
+    ) -> async_graphql::Result<TaskmanDiagnostics> {
+        let Some(inspector) = self.taskman_inspector.as_deref() else {
+            return Ok(TaskmanDiagnostics::default());
+        };
+        inspector
+            .queue_diagnostics(
+                queues.unwrap_or_default(),
+                priority.unwrap_or(RUNTIME_TASKMAN_LOWEST_PRIORITY),
+            )
+            .map(TaskmanDiagnostics::from)
+            .map_err(async_graphql::Error::new)
+    }
+
+    async fn pending_ops(&self, limit: Option<i32>) -> async_graphql::Result<Vec<PendingOp>> {
+        let Some(reader) = self.pending_ops_reader.as_deref() else {
+            return Err("runtime pending-op reader is not configured".into());
+        };
+        reader
+            .pending_ops(clamp_positive_range_i32(limit.unwrap_or(0), 50, 200))
+            .await
+            .map(|items| items.into_iter().map(PendingOp::from).collect())
+            .map_err(async_graphql::Error::new)
+    }
+
+    async fn safety_checks(
+        &self,
+        filter: Option<SafetyChecksFilterInput>,
+    ) -> async_graphql::Result<SafetyCheckConnection> {
+        let Some(reader) = self.safety_check_reader.as_deref() else {
+            return Err("runtime safety-check reader is not configured".into());
+        };
+        reader
+            .safety_checks(safety_checks_filter_from_input(filter))
+            .await
+            .map(SafetyCheckConnection::from)
+            .map_err(async_graphql::Error::new)
+    }
+
+    async fn llm_requests(
+        &self,
+        filter: Option<LlmRequestsFilterInput>,
+    ) -> async_graphql::Result<Vec<LlmRequest>> {
+        let Some(inspector) = self.llm_trace_inspector.as_deref() else {
+            return Ok(Vec::new());
+        };
+        inspector
+            .llm_requests(llm_requests_filter_from_input(filter)?)
+            .map(|items| items.into_iter().map(LlmRequest::from).collect())
+            .map_err(async_graphql::Error::new)
+    }
+
+    async fn llm_analytics(&self, range: Option<String>) -> async_graphql::Result<LlmAnalytics> {
+        let Some(reader) = self.llm_analytics_reader.as_deref() else {
+            return Err("runtime LLM analytics reader is not configured".into());
+        };
+        reader
+            .llm_analytics(range.as_deref().unwrap_or_default())
+            .await
+            .map(LlmAnalytics::from)
+            .map_err(async_graphql::Error::new)
+    }
+
+    async fn updates_runtime(&self) -> async_graphql::Result<UpdatesRuntime> {
+        let Some(inspector) = self.updates_inspector.as_deref() else {
+            return Ok(UpdatesRuntime::default());
+        };
+        inspector
+            .snapshot()
+            .await
+            .map(UpdatesRuntime::from)
+            .map_err(async_graphql::Error::new)
+    }
+
+    async fn logs(
+        &self,
+        after_seq: Option<ID>,
+        limit: Option<i32>,
+        level: Option<String>,
+        search: Option<String>,
+    ) -> async_graphql::Result<LogsResult> {
+        let after_seq = match after_seq {
+            Some(after_seq) => after_seq
+                .as_str()
+                .parse::<u64>()
+                .map_err(|error| async_graphql::Error::new(error.to_string()))?,
+            None => 0,
+        };
+        let limit = clamp_positive_range_i32(limit.unwrap_or(0), 50, 200);
+        let items = self
+            .log_inspector
+            .as_deref()
+            .map(|inspector| {
+                inspector.logs(RuntimeLogQuery {
+                    after_seq,
+                    limit,
+                    level: level.unwrap_or_default().trim().to_owned(),
+                    search: search.unwrap_or_default().trim().to_owned(),
+                })
+            })
+            .unwrap_or_default();
+        let last_seq = items.last().map(|entry| ID(entry.seq.to_string()));
+        Ok(LogsResult {
+            count: items.len() as i32,
+            last_seq,
+            items: items.into_iter().map(LogEntry::from).collect(),
+        })
+    }
+
+    async fn redis_prefixes(
+        &self,
+        prefix: Option<String>,
+    ) -> async_graphql::Result<Vec<RuntimeRedisPrefixGroup>> {
+        let Some(inspector) = self.redis_inspector.as_deref() else {
+            return Err("redis client is not configured".into());
+        };
+        inspector
+            .prefix_groups(prefix.as_deref().unwrap_or("").trim(), 1000)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn redis_keys(&self, pattern: String, limit: i32) -> async_graphql::Result<Vec<String>> {
+        let Some(inspector) = self.redis_inspector.as_deref() else {
+            return Err("redis client is not configured".into());
+        };
+        inspector
+            .keys(
+                &pattern,
+                clamp_positive_range_i32(limit, 100, 1000) as usize,
+            )
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn redis_value(&self, key: String) -> async_graphql::Result<Option<RuntimeRedisValue>> {
+        let Some(inspector) = self.redis_inspector.as_deref() else {
+            return Err("redis client is not configured".into());
+        };
+        Ok(inspector.value(&key, 64 * 1024).await.unwrap_or(None))
+    }
+
+    async fn sql_read(&self, input: SqlReadInput) -> async_graphql::Result<SqlReadResult> {
+        let Some(reader) = self.sql_reader.as_deref() else {
+            return Err("database pool not initialized".into());
+        };
+        let timeout_ms = match input.timeout_ms {
+            Some(timeout_ms) if timeout_ms > 0 => timeout_ms.min(self.snapshot.sql_timeout_ms),
+            _ => self.snapshot.sql_timeout_ms,
+        };
+        let result = reader
+            .read(RuntimeSqlReadRequest {
+                sql: input.sql,
+                args: input
+                    .args
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|arg| arg.0)
+                    .collect(),
+                timeout_ms,
+                row_limit: self.snapshot.sql_row_limit,
+                result_bytes_limit: self.snapshot.sql_result_bytes_limit,
+            })
+            .await
+            .map_err(async_graphql::Error::new)?;
+        Ok(SqlReadResult {
+            columns: result.columns,
+            rows: result.rows.into_iter().map(Json).collect(),
+            row_count: result.row_count,
+            elapsed_ms: result.elapsed_ms,
+            truncated: result.truncated,
+        })
+    }
+}
+
+fn users_filter_from_input(input: Option<UsersFilterInput>) -> RuntimeUsersFilter {
+    let Some(input) = input else {
+        return RuntimeUsersFilter {
+            limit: 100,
+            ..RuntimeUsersFilter::default()
+        };
+    };
+    RuntimeUsersFilter {
+        q: trim_optional(input.q),
+        offset: clamp_non_negative_i32(input.offset.unwrap_or(0)),
+        limit: clamp_positive_range_i32(input.limit.unwrap_or(0), 100, 500),
+    }
+}
+
+fn user_lookup_from_input(
+    id: Option<ID>,
+    username: Option<String>,
+) -> async_graphql::Result<RuntimeUserLookup> {
+    if let Some(id) = id {
+        return parse_id(id, "id").map(RuntimeUserLookup::Id);
+    }
+    let username = username.unwrap_or_default().trim().to_owned();
+    if !username.is_empty() {
+        return Ok(RuntimeUserLookup::Username(username));
+    }
+    Err("id or username required".into())
+}
+
+fn chats_filter_from_input(
+    input: Option<ChatsFilterInput>,
+) -> async_graphql::Result<RuntimeChatsFilter> {
+    let Some(input) = input else {
+        return Ok(RuntimeChatsFilter {
+            limit: 100,
+            ..RuntimeChatsFilter::default()
+        });
+    };
+    Ok(RuntimeChatsFilter {
+        q: trim_optional(input.q),
+        offset: clamp_non_negative_i32(input.offset.unwrap_or(0)),
+        limit: clamp_positive_range_i32(input.limit.unwrap_or(0), 100, 500),
+        member_username: trim_nonempty(input.member_username),
+        member_user_id: parse_optional_id(input.member_user_id, "memberUserID")?,
+    })
+}
+
+fn safety_checks_filter_from_input(
+    input: Option<SafetyChecksFilterInput>,
+) -> RuntimeSafetyChecksFilter {
+    let Some(input) = input else {
+        return RuntimeSafetyChecksFilter {
+            limit: 100,
+            ..RuntimeSafetyChecksFilter::default()
+        };
+    };
+    RuntimeSafetyChecksFilter {
+        q: trim_optional(input.q),
+        flagged: input.flagged,
+        offset: clamp_non_negative_i32(input.offset.unwrap_or(0)),
+        limit: clamp_positive_range_i32(input.limit.unwrap_or(0), 100, 1000),
+    }
+}
+
+fn llm_requests_filter_from_input(
+    input: Option<LlmRequestsFilterInput>,
+) -> async_graphql::Result<RuntimeLlmRequestsFilter> {
+    let Some(input) = input else {
+        return Ok(RuntimeLlmRequestsFilter {
+            limit: 100,
+            ..RuntimeLlmRequestsFilter::default()
+        });
+    };
+    Ok(RuntimeLlmRequestsFilter {
+        q: trim_optional(input.q),
+        source: trim_optional(input.source),
+        model: trim_optional(input.model),
+        chat_id: parse_optional_id(input.chat_id, "chatID")?,
+        user_id: parse_optional_id(input.user_id, "userID")?,
+        limit: clamp_positive_range_i32(input.limit.unwrap_or(0), 100, 1000),
+    })
+}
+
+fn clamp_non_negative_i32(value: i32) -> i32 {
+    value.max(0)
+}
+
+fn clamp_positive_range_i32(value: i32, default: i32, max_value: i32) -> i32 {
+    let mut result = if value == 0 { default } else { value };
+    if result < 1 {
+        result = 1;
+    }
+    if result > max_value {
+        result = max_value;
+    }
+    result
+}
+
+fn taskman_jobs_filter_from_input(
+    input: Option<TaskmanJobsFilterInput>,
+) -> async_graphql::Result<RuntimeTaskmanJobsFilter> {
+    let Some(input) = input else {
+        return Ok(RuntimeTaskmanJobsFilter::default());
+    };
+    Ok(RuntimeTaskmanJobsFilter {
+        q: trim_optional(input.q),
+        status: trim_vec(input.status),
+        queue: trim_vec(input.queue),
+        user_id: parse_optional_id(input.user_id, "userID")?,
+        chat_id: parse_optional_id(input.chat_id, "chatID")?,
+        time_field: trim_optional(input.time_field),
+        from: trim_optional(input.from),
+        to: trim_optional(input.to),
+        sort_by: trim_optional(input.sort_by),
+        sort_dir: trim_optional(input.sort_dir),
+        offset: input.offset.unwrap_or(0),
+        limit: input.limit.unwrap_or(0),
+    })
+}
+
+fn parse_optional_id(value: Option<ID>, name: &str) -> async_graphql::Result<Option<i64>> {
+    value.map(|value| parse_id(value, name)).transpose()
+}
+
+fn parse_id(value: ID, name: &str) -> async_graphql::Result<i64> {
+    value
+        .as_str()
+        .parse::<i64>()
+        .map_err(|error| async_graphql::Error::new(format!("invalid {name}: {error}")))
+}
+
+fn trim_optional(value: Option<String>) -> String {
+    value.unwrap_or_default().trim().to_owned()
+}
+
+fn trim_vec(value: Option<Vec<String>>) -> Vec<String> {
+    value
+        .unwrap_or_default()
+        .into_iter()
+        .map(|item| item.trim().to_owned())
+        .filter(|item| !item.is_empty())
+        .collect()
+}
+
+#[Object]
+impl RuntimeMutation {
+    async fn restart_memory(
+        &self,
+        #[graphql(name = "runID")] run_id: Option<ID>,
+    ) -> async_graphql::Result<MemoryRestartResult> {
+        let Some(restarter) = self.memory_restarter.as_deref() else {
+            return Err("memory service is not configured".into());
+        };
+        let run_id = parse_optional_id(run_id, "runID")?;
+        if run_id.is_some_and(|id| id <= 0) {
+            return Err("runID must be positive".into());
+        }
+        restarter
+            .restart(run_id)
+            .await
+            .map(MemoryRestartResult::from)
+            .map_err(async_graphql::Error::new)
+    }
+
+    async fn purge_gemini_explicit_caches(
+        &self,
+    ) -> async_graphql::Result<GeminiExplicitCachePurgeResult> {
+        let Some(purger) = self.gemini_cache_purger.as_deref() else {
+            return Err("gemini explicit cache purger is not configured".into());
+        };
+        purger
+            .purge()
+            .await
+            .map(GeminiExplicitCachePurgeResult::from)
+            .map_err(async_graphql::Error::new)
+    }
+}
+
+#[derive(Clone, SimpleObject)]
+struct RuntimeState {
+    log_level: String,
+    dispatcher: DispatcherStats,
+    cache: CacheStats,
+    planner_cache: CacheStats,
+}
+
+#[derive(Clone, Default, SimpleObject)]
+struct CacheStats {
+    size: i32,
+    capacity: i32,
+    hits: String,
+    misses: String,
+    mem_size: String,
+}
+
+impl From<RuntimeCacheStatsData> for CacheStats {
+    fn from(stats: RuntimeCacheStatsData) -> Self {
+        Self {
+            size: stats.size,
+            capacity: stats.capacity,
+            hits: stats.hits.to_string(),
+            misses: stats.misses.to_string(),
+            mem_size: stats.mem_size.to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Default, SimpleObject)]
+struct DispatcherStats {
+    regular_queue_size: i32,
+    immediate_queue_size: i32,
+    processed_total: String,
+    deduped_total: String,
+    oldest_regular_age_ms: i32,
+    oldest_immediate_age_ms: i32,
+}
+
+impl From<RuntimeDispatcherStatsData> for DispatcherStats {
+    fn from(stats: RuntimeDispatcherStatsData) -> Self {
+        Self {
+            regular_queue_size: stats.regular_queue_size,
+            immediate_queue_size: stats.immediate_queue_size,
+            processed_total: stats.processed_total.to_string(),
+            deduped_total: stats.deduped_total.to_string(),
+            oldest_regular_age_ms: stats.oldest_regular_age_ms,
+            oldest_immediate_age_ms: stats.oldest_immediate_age_ms,
+        }
+    }
+}
+
+#[derive(Clone, SimpleObject)]
+struct DependencyHealth {
+    status: String,
+    error: Option<String>,
+    latency_ms: Option<i32>,
+    details: Option<Json<Value>>,
+}
+
+impl DependencyHealth {
+    fn from_status(status: &str) -> Self {
+        Self {
+            status: status.to_owned(),
+            error: None,
+            latency_ms: None,
+            details: None,
+        }
+    }
+}
+
+#[derive(Clone, SimpleObject)]
+struct HealthSnapshot {
+    db: DependencyHealth,
+    redis: DependencyHealth,
+    dispatcher: DependencyHealth,
+    ai_handler: DependencyHealth,
+    shield: DependencyHealth,
+    rag: DependencyHealth,
+    ace_step: DependencyHealth,
+    updates_queue_length: i32,
+}
+
+#[derive(Clone, SimpleObject)]
+#[graphql(name = "ConfigSnapshot")]
+struct ConfigSnapshot {
+    log_level: String,
+    web_host: String,
+    web_port: i32,
+    runtime_api_enabled: bool,
+    runtime_api_host: String,
+    runtime_api_port: i32,
+    #[graphql(name = "discoveryBaseURL")]
+    discovery_base_url: Option<String>,
+    embedder_enabled: bool,
+    #[graphql(name = "embedderURL")]
+    embedder_url: Option<String>,
+    shield_enabled: bool,
+    #[graphql(name = "shieldEmbedderURL")]
+    shield_embedder_url: Option<String>,
+    shield_max_matches: i32,
+    shield_vector_min_score: f64,
+    shield_lexical_min_score: f64,
+    shield_retrieval_timeout_seconds: i32,
+    shield_history_tail_messages: i32,
+    white_circle_enabled: bool,
+    ace_step_enabled: bool,
+    #[graphql(name = "aceStepBaseURL")]
+    ace_step_base_url: Option<String>,
+    dialog_provider: String,
+    dialog_fallback_provider: Option<String>,
+    #[graphql(name = "modelScopeBaseURL")]
+    model_scope_base_url: Option<String>,
+    pruna_endpoint: Option<String>,
+    persistent_queue_enabled: bool,
+    active_draw_providers: Vec<String>,
+    sql_timeout_ms: i32,
+    sql_row_limit: i32,
+    sql_result_bytes_limit: i32,
+}
+
+impl From<RuntimeApiGraphqlSnapshot> for ConfigSnapshot {
+    fn from(snapshot: RuntimeApiGraphqlSnapshot) -> Self {
+        Self {
+            log_level: snapshot.log_level,
+            web_host: snapshot.web_host,
+            web_port: snapshot.web_port,
+            runtime_api_enabled: snapshot.runtime_api_enabled,
+            runtime_api_host: snapshot.runtime_api_host,
+            runtime_api_port: snapshot.runtime_api_port,
+            discovery_base_url: snapshot.discovery_base_url,
+            embedder_enabled: snapshot.embedder_enabled,
+            embedder_url: snapshot.embedder_url,
+            shield_enabled: snapshot.shield_enabled,
+            shield_embedder_url: snapshot.shield_embedder_url,
+            shield_max_matches: snapshot.shield_max_matches,
+            shield_vector_min_score: snapshot.shield_vector_min_score,
+            shield_lexical_min_score: snapshot.shield_lexical_min_score,
+            shield_retrieval_timeout_seconds: snapshot.shield_retrieval_timeout_seconds,
+            shield_history_tail_messages: snapshot.shield_history_tail_messages,
+            white_circle_enabled: snapshot.white_circle_enabled,
+            ace_step_enabled: snapshot.ace_step_enabled,
+            ace_step_base_url: snapshot.ace_step_base_url,
+            dialog_provider: snapshot.dialog_provider,
+            dialog_fallback_provider: snapshot.dialog_fallback_provider,
+            model_scope_base_url: snapshot.model_scope_base_url,
+            pruna_endpoint: snapshot.pruna_endpoint,
+            persistent_queue_enabled: snapshot.persistent_queue_enabled,
+            active_draw_providers: snapshot.active_draw_providers,
+            sql_timeout_ms: snapshot.sql_timeout_ms,
+            sql_row_limit: snapshot.sql_row_limit,
+            sql_result_bytes_limit: snapshot.sql_result_bytes_limit,
+        }
+    }
+}
+
+#[derive(InputObject)]
+#[allow(dead_code)]
+struct UsersFilterInput {
+    q: Option<String>,
+    offset: Option<i32>,
+    limit: Option<i32>,
+}
+
+#[derive(InputObject)]
+#[allow(dead_code)]
+struct ChatsFilterInput {
+    q: Option<String>,
+    offset: Option<i32>,
+    limit: Option<i32>,
+    member_username: Option<String>,
+    #[graphql(name = "memberUserID")]
+    member_user_id: Option<ID>,
+}
+
+#[derive(InputObject)]
+#[allow(dead_code)]
+struct SafetyChecksFilterInput {
+    q: Option<String>,
+    flagged: Option<bool>,
+    offset: Option<i32>,
+    limit: Option<i32>,
+}
+
+#[derive(InputObject)]
+#[allow(dead_code)]
+struct LlmRequestsFilterInput {
+    q: Option<String>,
+    source: Option<String>,
+    model: Option<String>,
+    #[graphql(name = "chatID")]
+    chat_id: Option<ID>,
+    #[graphql(name = "userID")]
+    user_id: Option<ID>,
+    limit: Option<i32>,
+}
+
+#[derive(InputObject)]
+#[allow(dead_code)]
+struct TaskmanJobsFilterInput {
+    q: Option<String>,
+    status: Option<Vec<String>>,
+    queue: Option<Vec<String>>,
+    #[graphql(name = "userID")]
+    user_id: Option<ID>,
+    #[graphql(name = "chatID")]
+    chat_id: Option<ID>,
+    time_field: Option<String>,
+    from: Option<String>,
+    to: Option<String>,
+    sort_by: Option<String>,
+    sort_dir: Option<String>,
+    offset: Option<i32>,
+    limit: Option<i32>,
+}
+
+#[derive(Clone, SimpleObject)]
+struct User {
+    id: ID,
+    is_premium: Option<bool>,
+    first_name: String,
+    last_name: Option<String>,
+    username: Option<String>,
+    language_code: Option<String>,
+    is_vip: Option<bool>,
+    discovered_at: Option<String>,
+    updated_at: Option<String>,
+}
+
+impl From<RuntimeUserData> for User {
+    fn from(user: RuntimeUserData) -> Self {
+        Self {
+            id: ID(user.id.to_string()),
+            is_premium: user.is_premium,
+            first_name: user.first_name,
+            last_name: user.last_name,
+            username: user.username,
+            language_code: user.language_code,
+            is_vip: user.is_vip,
+            discovered_at: user.discovered_at,
+            updated_at: user.updated_at,
+        }
+    }
+}
+
+#[derive(Clone, SimpleObject)]
+struct UserConnection {
+    count: i32,
+    offset: i32,
+    limit: i32,
+    items: Vec<User>,
+}
+
+impl From<RuntimeUserConnectionData> for UserConnection {
+    fn from(connection: RuntimeUserConnectionData) -> Self {
+        Self {
+            count: connection.count,
+            offset: connection.offset,
+            limit: connection.limit,
+            items: connection.items.into_iter().map(User::from).collect(),
+        }
+    }
+}
+
+#[derive(Clone, SimpleObject)]
+struct UserDetails {
+    id: ID,
+    is_premium: Option<bool>,
+    first_name: String,
+    last_name: Option<String>,
+    username: Option<String>,
+    language_code: Option<String>,
+    is_vip: Option<bool>,
+    discovered_at: Option<String>,
+    updated_at: Option<String>,
+    subscription: Option<Subscription>,
+    vip: Option<VipCache>,
+    vip_summary: Option<VipSummary>,
+    vip_events: Vec<VipEvent>,
+    subscriptions: Vec<Subscription>,
+}
+
+impl From<RuntimeUserDetailsData> for UserDetails {
+    fn from(details: RuntimeUserDetailsData) -> Self {
+        let user = details.user;
+        Self {
+            id: ID(user.id.to_string()),
+            is_premium: user.is_premium,
+            first_name: user.first_name,
+            last_name: user.last_name,
+            username: user.username,
+            language_code: user.language_code,
+            is_vip: user.is_vip,
+            discovered_at: user.discovered_at,
+            updated_at: user.updated_at,
+            subscription: details.subscription.map(Subscription::from),
+            vip: details.vip.map(VipCache::from),
+            vip_summary: details.vip_summary.map(VipSummary::from),
+            vip_events: details.vip_events.into_iter().map(VipEvent::from).collect(),
+            subscriptions: details
+                .subscriptions
+                .into_iter()
+                .map(Subscription::from)
+                .collect(),
+        }
+    }
+}
+
+#[derive(Clone, SimpleObject)]
+struct Subscription {
+    id: ID,
+    #[graphql(name = "userID")]
+    user_id: ID,
+    #[graphql(name = "telegramPaymentChargeID")]
+    telegram_payment_charge_id: String,
+    #[graphql(name = "providerPaymentChargeID")]
+    provider_payment_charge_id: String,
+    expires_at: Option<String>,
+    created_at: Option<String>,
+    updated_at: Option<String>,
+    canceled_at: Option<String>,
+    refunded_at: Option<String>,
+    status: String,
+}
+
+impl From<RuntimeSubscriptionData> for Subscription {
+    fn from(subscription: RuntimeSubscriptionData) -> Self {
+        Self {
+            id: ID(subscription.id.to_string()),
+            user_id: ID(subscription.user_id.to_string()),
+            telegram_payment_charge_id: subscription.telegram_payment_charge_id,
+            provider_payment_charge_id: subscription.provider_payment_charge_id,
+            expires_at: subscription.expires_at,
+            created_at: subscription.created_at,
+            updated_at: subscription.updated_at,
+            canceled_at: subscription.canceled_at,
+            refunded_at: subscription.refunded_at,
+            status: subscription.status,
+        }
+    }
+}
+
+#[derive(Clone, SimpleObject)]
+struct VipCache {
+    #[graphql(name = "userID")]
+    user_id: ID,
+    is_vip: bool,
+    expires_at: Option<String>,
+    created_at: Option<String>,
+    updated_at: Option<String>,
+}
+
+impl From<RuntimeVipCacheData> for VipCache {
+    fn from(vip: RuntimeVipCacheData) -> Self {
+        Self {
+            user_id: ID(vip.user_id.to_string()),
+            is_vip: vip.is_vip,
+            expires_at: vip.expires_at,
+            created_at: vip.created_at,
+            updated_at: vip.updated_at,
+        }
+    }
+}
+
+#[derive(Clone, SimpleObject)]
+struct VipSummary {
+    active: bool,
+    has_history: bool,
+    expires_at: Option<String>,
+    remaining_seconds: String,
+    remaining_days: i32,
+    #[graphql(name = "latestEventID")]
+    latest_event_id: Option<ID>,
+    latest_event_type: Option<String>,
+    latest_reason: Option<String>,
+    latest_created_at: Option<String>,
+}
+
+impl From<RuntimeVipSummaryData> for VipSummary {
+    fn from(summary: RuntimeVipSummaryData) -> Self {
+        Self {
+            active: summary.active,
+            has_history: summary.has_history,
+            expires_at: summary.expires_at,
+            remaining_seconds: summary.remaining_seconds,
+            remaining_days: summary.remaining_days,
+            latest_event_id: summary.latest_event_id.map(|id| ID(id.to_string())),
+            latest_event_type: summary.latest_event_type,
+            latest_reason: summary.latest_reason,
+            latest_created_at: summary.latest_created_at,
+        }
+    }
+}
+
+#[derive(Clone, SimpleObject)]
+struct VipEvent {
+    id: ID,
+    event_type: String,
+    delta_seconds: String,
+    delta_days: f64,
+    effective_expires_at: Option<String>,
+    #[graphql(name = "actorUserID")]
+    actor_user_id: Option<ID>,
+    actor_label: Option<String>,
+    reason: Option<String>,
+    created_at: Option<String>,
+    #[graphql(name = "subscriptionID")]
+    subscription_id: Option<ID>,
+    #[graphql(name = "telegramPaymentChargeID")]
+    telegram_payment_charge_id: Option<String>,
+    #[graphql(name = "providerPaymentChargeID")]
+    provider_payment_charge_id: Option<String>,
+    subscription_status: Option<String>,
+}
+
+impl From<RuntimeVipEventData> for VipEvent {
+    fn from(event: RuntimeVipEventData) -> Self {
+        Self {
+            id: ID(event.id.to_string()),
+            event_type: event.event_type,
+            delta_seconds: event.delta_seconds,
+            delta_days: event.delta_days,
+            effective_expires_at: event.effective_expires_at,
+            actor_user_id: event.actor_user_id.map(|id| ID(id.to_string())),
+            actor_label: event.actor_label,
+            reason: event.reason,
+            created_at: event.created_at,
+            subscription_id: event.subscription_id.map(|id| ID(id.to_string())),
+            telegram_payment_charge_id: event.telegram_payment_charge_id,
+            provider_payment_charge_id: event.provider_payment_charge_id,
+            subscription_status: event.subscription_status,
+        }
+    }
+}
+
+#[derive(Clone, SimpleObject)]
+struct Chat {
+    id: ID,
+    #[graphql(name = "type")]
+    chat_type: String,
+    title: Option<String>,
+    username: Option<String>,
+    first_name: Option<String>,
+    last_name: Option<String>,
+    is_forum: Option<bool>,
+    description: Option<String>,
+    invite_link: Option<String>,
+    discovered_at: Option<String>,
+    updated_at: Option<String>,
+}
+
+impl From<RuntimeChatData> for Chat {
+    fn from(chat: RuntimeChatData) -> Self {
+        Self {
+            id: ID(chat.id.to_string()),
+            chat_type: chat.chat_type,
+            title: chat.title,
+            username: chat.username,
+            first_name: chat.first_name,
+            last_name: chat.last_name,
+            is_forum: chat.is_forum,
+            description: chat.description,
+            invite_link: chat.invite_link,
+            discovered_at: chat.discovered_at,
+            updated_at: chat.updated_at,
+        }
+    }
+}
+
+#[derive(Clone, SimpleObject)]
+struct ChatConnection {
+    count: i32,
+    offset: i32,
+    limit: i32,
+    items: Vec<Chat>,
+}
+
+impl From<RuntimeChatConnectionData> for ChatConnection {
+    fn from(connection: RuntimeChatConnectionData) -> Self {
+        Self {
+            count: connection.count,
+            offset: connection.offset,
+            limit: connection.limit,
+            items: connection.items.into_iter().map(Chat::from).collect(),
+        }
+    }
+}
+
+#[derive(Clone, SimpleObject)]
+struct ChatMember {
+    #[graphql(name = "chatID")]
+    chat_id: ID,
+    #[graphql(name = "userID")]
+    user_id: ID,
+    status: String,
+    is_anonymous: Option<bool>,
+    custom_title: Option<String>,
+    can_be_edited: Option<bool>,
+    can_manage_chat: Option<bool>,
+    can_delete_messages: Option<bool>,
+    can_manage_video_chats: Option<bool>,
+    can_restrict_members: Option<bool>,
+    can_promote_members: Option<bool>,
+    can_change_info: Option<bool>,
+    can_invite_users: Option<bool>,
+    can_post_messages: Option<bool>,
+    can_edit_messages: Option<bool>,
+    can_pin_messages: Option<bool>,
+    can_manage_topics: Option<bool>,
+    created_at: Option<String>,
+    updated_at: Option<String>,
+    last_message_at: Option<String>,
+}
+
+impl From<RuntimeChatMemberData> for ChatMember {
+    fn from(member: RuntimeChatMemberData) -> Self {
+        Self {
+            chat_id: ID(member.chat_id.to_string()),
+            user_id: ID(member.user_id.to_string()),
+            status: member.status,
+            is_anonymous: member.is_anonymous,
+            custom_title: member.custom_title,
+            can_be_edited: member.can_be_edited,
+            can_manage_chat: member.can_manage_chat,
+            can_delete_messages: member.can_delete_messages,
+            can_manage_video_chats: member.can_manage_video_chats,
+            can_restrict_members: member.can_restrict_members,
+            can_promote_members: member.can_promote_members,
+            can_change_info: member.can_change_info,
+            can_invite_users: member.can_invite_users,
+            can_post_messages: member.can_post_messages,
+            can_edit_messages: member.can_edit_messages,
+            can_pin_messages: member.can_pin_messages,
+            can_manage_topics: member.can_manage_topics,
+            created_at: member.created_at,
+            updated_at: member.updated_at,
+            last_message_at: member.last_message_at,
+        }
+    }
+}
+
+#[derive(Clone, SimpleObject)]
+struct ChatMemberWithUser {
+    member: ChatMember,
+    user: Option<User>,
+}
+
+impl From<RuntimeChatMemberWithUserData> for ChatMemberWithUser {
+    fn from(value: RuntimeChatMemberWithUserData) -> Self {
+        Self {
+            member: ChatMember::from(value.member),
+            user: value.user.map(User::from),
+        }
+    }
+}
+
+#[derive(Clone, SimpleObject)]
+struct TaskmanJobListResult {
+    total: i32,
+    offset: i32,
+    limit: i32,
+    summary: TaskmanJobSummary,
+    items: Vec<TaskmanJobListEntry>,
+}
+
+impl TaskmanJobListResult {
+    fn empty() -> Self {
+        Self {
+            total: 0,
+            offset: 0,
+            limit: 0,
+            summary: TaskmanJobSummary::default(),
+            items: Vec::new(),
+        }
+    }
+}
+
+impl From<RuntimeTaskmanJobListResultData> for TaskmanJobListResult {
+    fn from(result: RuntimeTaskmanJobListResultData) -> Self {
+        Self {
+            total: result.total,
+            offset: result.offset,
+            limit: result.limit,
+            summary: TaskmanJobSummary {
+                by_status: Json(result.summary.by_status),
+                by_queue: Json(result.summary.by_queue),
+            },
+            items: result
+                .items
+                .into_iter()
+                .map(TaskmanJobListEntry::from)
+                .collect(),
+        }
+    }
+}
+
+#[derive(Clone, SimpleObject)]
+struct TaskmanJobSummary {
+    by_status: Json<Value>,
+    by_queue: Json<Value>,
+}
+
+impl Default for TaskmanJobSummary {
+    fn default() -> Self {
+        Self {
+            by_status: Json(json!({})),
+            by_queue: Json(json!({})),
+        }
+    }
+}
+
+#[derive(Clone, SimpleObject)]
+struct TaskmanJobListEntry {
+    id: ID,
+    queue_name: String,
+    priority: i32,
+    title: String,
+    job_type: String,
+    status: String,
+    #[graphql(name = "userID")]
+    user_id: ID,
+    #[graphql(name = "chatID")]
+    chat_id: ID,
+    #[graphql(name = "triggerMessageID")]
+    trigger_message_id: i32,
+    #[graphql(name = "threadMessageID")]
+    thread_message_id: Option<i32>,
+    #[graphql(name = "progressMessageID")]
+    progress_message_id: Option<i32>,
+    #[graphql(name = "queuePositionMessageID")]
+    queue_position_message_id: Option<i32>,
+    #[graphql(name = "resultMessageID")]
+    result_message_id: Option<i32>,
+    #[graphql(name = "workerID")]
+    worker_id: Option<String>,
+    created_at: String,
+    started_at: Option<String>,
+    completed_at: Option<String>,
+    error_message: Option<String>,
+    processing_timeout_seconds: i32,
+    prompt_hash: Option<String>,
+    estimated_processing_time: Option<i32>,
+    actual_processing_time: Option<i32>,
+    preview: Option<String>,
+}
+
+impl From<RuntimeTaskmanJobListEntryData> for TaskmanJobListEntry {
+    fn from(entry: RuntimeTaskmanJobListEntryData) -> Self {
+        Self {
+            id: ID(entry.id.to_string()),
+            queue_name: entry.queue_name,
+            priority: entry.priority,
+            title: entry.title,
+            job_type: entry.job_type,
+            status: entry.status,
+            user_id: ID(entry.user_id.to_string()),
+            chat_id: ID(entry.chat_id.to_string()),
+            trigger_message_id: entry.trigger_message_id,
+            thread_message_id: entry.thread_message_id,
+            progress_message_id: entry.progress_message_id,
+            queue_position_message_id: entry.queue_position_message_id,
+            result_message_id: entry.result_message_id,
+            worker_id: entry.worker_id,
+            created_at: entry.created_at,
+            started_at: entry.started_at,
+            completed_at: entry.completed_at,
+            error_message: entry.error_message,
+            processing_timeout_seconds: entry.processing_timeout_seconds,
+            prompt_hash: entry.prompt_hash,
+            estimated_processing_time: entry.estimated_processing_time,
+            actual_processing_time: entry.actual_processing_time,
+            preview: entry.preview,
+        }
+    }
+}
+
+#[derive(Clone, SimpleObject)]
+struct TaskmanJobDetails {
+    job: TaskmanJob,
+    messages: Vec<TaskmanJobMessage>,
+    events: Option<Json<Value>>,
+}
+
+impl From<RuntimeTaskmanJobDetailsData> for TaskmanJobDetails {
+    fn from(details: RuntimeTaskmanJobDetailsData) -> Self {
+        Self {
+            job: TaskmanJob::from(details.job),
+            messages: details
+                .messages
+                .into_iter()
+                .map(TaskmanJobMessage::from)
+                .collect(),
+            events: details.events.map(Json),
+        }
+    }
+}
+
+#[derive(Clone, SimpleObject)]
+struct TaskmanJob {
+    id: ID,
+    queue_name: String,
+    priority: i32,
+    title: String,
+    payload: Option<Json<Value>>,
+    status: String,
+    #[graphql(name = "userID")]
+    user_id: ID,
+    #[graphql(name = "chatID")]
+    chat_id: ID,
+    #[graphql(name = "triggerMessageID")]
+    trigger_message_id: i32,
+    #[graphql(name = "threadMessageID")]
+    thread_message_id: Option<i32>,
+    #[graphql(name = "progressMessageID")]
+    progress_message_id: Option<i32>,
+    #[graphql(name = "queuePositionMessageID")]
+    queue_position_message_id: Option<i32>,
+    #[graphql(name = "resultMessageID")]
+    result_message_id: Option<i32>,
+    #[graphql(name = "workerID")]
+    worker_id: Option<String>,
+    created_at: String,
+    started_at: Option<String>,
+    completed_at: Option<String>,
+    error_message: Option<String>,
+    processing_timeout_seconds: i32,
+    prompt_hash: Option<String>,
+    estimated_processing_time: Option<i32>,
+    actual_processing_time: Option<i32>,
+}
+
+impl From<RuntimeTaskmanJobData> for TaskmanJob {
+    fn from(job: RuntimeTaskmanJobData) -> Self {
+        Self {
+            id: ID(job.id.to_string()),
+            queue_name: job.queue_name,
+            priority: job.priority,
+            title: job.title,
+            payload: job.payload.map(Json),
+            status: job.status,
+            user_id: ID(job.user_id.to_string()),
+            chat_id: ID(job.chat_id.to_string()),
+            trigger_message_id: job.trigger_message_id,
+            thread_message_id: job.thread_message_id,
+            progress_message_id: job.progress_message_id,
+            queue_position_message_id: job.queue_position_message_id,
+            result_message_id: job.result_message_id,
+            worker_id: job.worker_id,
+            created_at: job.created_at,
+            started_at: job.started_at,
+            completed_at: job.completed_at,
+            error_message: job.error_message,
+            processing_timeout_seconds: job.processing_timeout_seconds,
+            prompt_hash: job.prompt_hash,
+            estimated_processing_time: job.estimated_processing_time,
+            actual_processing_time: job.actual_processing_time,
+        }
+    }
+}
+
+#[derive(Clone, SimpleObject)]
+struct TaskmanJobMessage {
+    id: ID,
+    #[graphql(name = "jobID")]
+    job_id: ID,
+    message_type: String,
+    #[graphql(name = "chatID")]
+    chat_id: ID,
+    #[graphql(name = "messageID")]
+    message_id: i32,
+    created_at: String,
+    status: String,
+}
+
+impl From<RuntimeTaskmanJobMessageData> for TaskmanJobMessage {
+    fn from(message: RuntimeTaskmanJobMessageData) -> Self {
+        Self {
+            id: ID(message.id.to_string()),
+            job_id: ID(message.job_id.to_string()),
+            message_type: message.message_type,
+            chat_id: ID(message.chat_id.to_string()),
+            message_id: message.message_id,
+            created_at: message.created_at,
+            status: message.status,
+        }
+    }
+}
+
+#[derive(Clone, Default, SimpleObject)]
+struct TaskmanDiagnostics {
+    running: bool,
+    active: i32,
+    started1m: i32,
+    completed1m: i32,
+    worker_count: i32,
+    queue_signal_count: i32,
+    slow_job_count: i32,
+    queues: Vec<TaskmanQueueDiagnostics>,
+}
+
+impl From<RuntimeTaskmanDiagnosticsData> for TaskmanDiagnostics {
+    fn from(diagnostics: RuntimeTaskmanDiagnosticsData) -> Self {
+        Self {
+            running: diagnostics.running,
+            active: diagnostics.active,
+            started1m: diagnostics.started1m,
+            completed1m: diagnostics.completed1m,
+            worker_count: diagnostics.worker_count,
+            queue_signal_count: diagnostics.queue_signal_count,
+            slow_job_count: diagnostics.slow_job_count,
+            queues: diagnostics
+                .queues
+                .into_iter()
+                .map(TaskmanQueueDiagnostics::from)
+                .collect(),
+        }
+    }
+}
+
+#[derive(Clone, SimpleObject)]
+struct TaskmanQueueDiagnostics {
+    queue_name: String,
+    priority: i32,
+    pending: i32,
+    pending_or_higher: i32,
+    active: i32,
+    worker_count: i32,
+    #[graphql(name = "etaSeconds")]
+    eta_seconds: i32,
+}
+
+impl From<RuntimeTaskmanQueueDiagnosticsData> for TaskmanQueueDiagnostics {
+    fn from(queue: RuntimeTaskmanQueueDiagnosticsData) -> Self {
+        Self {
+            queue_name: queue.queue_name,
+            priority: queue.priority,
+            pending: queue.pending,
+            pending_or_higher: queue.pending_or_higher,
+            active: queue.active,
+            worker_count: queue.worker_count,
+            eta_seconds: queue.eta_seconds,
+        }
+    }
+}
+
+#[derive(Clone, SimpleObject)]
+struct PendingOp {
+    id: ID,
+    #[graphql(name = "vmsgID")]
+    vmsg_id: String,
+    #[graphql(name = "chatID")]
+    chat_id: ID,
+    op: String,
+    payload: Option<Json<Value>>,
+    status: String,
+    created_at: String,
+    attempts: i32,
+}
+
+impl From<RuntimePendingOpData> for PendingOp {
+    fn from(op: RuntimePendingOpData) -> Self {
+        Self {
+            id: ID(op.id.to_string()),
+            vmsg_id: op.vmsg_id,
+            chat_id: ID(op.chat_id.to_string()),
+            op: op.op,
+            payload: op.payload.map(Json),
+            status: op.status,
+            created_at: op.created_at,
+            attempts: op.attempts,
+        }
+    }
+}
+
+#[derive(Clone, Default, SimpleObject)]
+struct SafetyCheckConnection {
+    count: i32,
+    offset: i32,
+    limit: i32,
+    items: Vec<SafetyCheck>,
+}
+
+impl From<RuntimeSafetyCheckConnectionData> for SafetyCheckConnection {
+    fn from(connection: RuntimeSafetyCheckConnectionData) -> Self {
+        Self {
+            count: connection.count,
+            offset: connection.offset,
+            limit: connection.limit,
+            items: connection
+                .items
+                .into_iter()
+                .map(SafetyCheck::from)
+                .collect(),
+        }
+    }
+}
+
+#[derive(Clone, SimpleObject)]
+struct SafetyCheck {
+    id: ID,
+    created_at: String,
+    source: String,
+    flow: Option<String>,
+    mode: Option<String>,
+    #[graphql(name = "chatID")]
+    chat_id: Option<ID>,
+    #[graphql(name = "threadID")]
+    thread_id: Option<i32>,
+    #[graphql(name = "messageID")]
+    message_id: Option<i32>,
+    #[graphql(name = "userID")]
+    user_id: Option<ID>,
+    #[graphql(name = "deploymentID")]
+    deployment_id: String,
+    #[graphql(name = "externalSessionID")]
+    external_session_id: Option<String>,
+    request_messages: Option<Json<Value>>,
+    flagged: Option<bool>,
+    #[graphql(name = "internalSessionID")]
+    internal_session_id: Option<String>,
+    policies: Option<Json<Value>>,
+    #[graphql(name = "responseJSON")]
+    response_json: Option<Json<Value>>,
+    duration_ms: i32,
+    error: Option<String>,
+}
+
+impl From<RuntimeSafetyCheckData> for SafetyCheck {
+    fn from(check: RuntimeSafetyCheckData) -> Self {
+        Self {
+            id: ID(check.id.to_string()),
+            created_at: check.created_at,
+            source: check.source,
+            flow: check.flow,
+            mode: check.mode,
+            chat_id: check.chat_id.map(|id| ID(id.to_string())),
+            thread_id: check.thread_id,
+            message_id: check.message_id,
+            user_id: check.user_id.map(|id| ID(id.to_string())),
+            deployment_id: check.deployment_id,
+            external_session_id: check.external_session_id,
+            request_messages: check.request_messages.map(Json),
+            flagged: check.flagged,
+            internal_session_id: check.internal_session_id,
+            policies: check.policies.map(Json),
+            response_json: check.response_json.map(Json),
+            duration_ms: check.duration_ms,
+            error: check.error,
+        }
+    }
+}
+
+#[derive(Clone, SimpleObject)]
+struct LlmRequest {
+    id: ID,
+    at: String,
+    provider: Option<String>,
+    request_kind: Option<String>,
+    source: String,
+    mode: Option<String>,
+    flow: Option<String>,
+    iteration: i32,
+    model: Option<String>,
+    chat: LlmRequestChat,
+    user: LlmRequestUser,
+    message: LlmRequestMessage,
+    gen_config: LlmGenConfig,
+    docs: Option<Json<Value>>,
+    messages: Option<Json<Value>>,
+    raw_request: Option<Json<Value>>,
+    resolved_cache_content: Option<Json<Value>>,
+    raw_response: Option<Json<Value>>,
+    transport: Option<Json<Value>>,
+    inference_params: Option<Json<Value>>,
+    usage: Option<Json<Value>>,
+    timings: Option<Json<Value>>,
+    prompt_chars: i32,
+    prompt_messages: i32,
+    docs_chars: i32,
+    duration_ms: i32,
+    result: LlmRequestResult,
+}
+
+impl From<RuntimeLlmRequestData> for LlmRequest {
+    fn from(request: RuntimeLlmRequestData) -> Self {
+        Self {
+            id: ID(request.id.to_string()),
+            at: request.at,
+            provider: request.provider,
+            request_kind: request.request_kind,
+            source: request.source,
+            mode: request.mode,
+            flow: request.flow,
+            iteration: request.iteration,
+            model: request.model,
+            chat: LlmRequestChat::from(request.chat),
+            user: LlmRequestUser::from(request.user),
+            message: LlmRequestMessage::from(request.message),
+            gen_config: LlmGenConfig::from(request.gen_config),
+            docs: request.docs.map(Json),
+            messages: request.messages.map(Json),
+            raw_request: request.raw_request.map(Json),
+            resolved_cache_content: request.resolved_cache_content.map(Json),
+            raw_response: request.raw_response.map(Json),
+            transport: request.transport.map(Json),
+            inference_params: request.inference_params.map(Json),
+            usage: request.usage.map(Json),
+            timings: request.timings.map(Json),
+            prompt_chars: request.prompt_chars,
+            prompt_messages: request.prompt_messages,
+            docs_chars: request.docs_chars,
+            duration_ms: request.duration_ms,
+            result: LlmRequestResult::from(request.result),
+        }
+    }
+}
+
+#[derive(Clone, SimpleObject)]
+struct LlmRequestChat {
+    #[graphql(name = "chatID")]
+    chat_id: ID,
+    #[graphql(name = "threadID")]
+    thread_id: Option<i32>,
+    chat_title: Option<String>,
+}
+
+impl From<RuntimeLlmRequestChatData> for LlmRequestChat {
+    fn from(chat: RuntimeLlmRequestChatData) -> Self {
+        Self {
+            chat_id: ID(chat.chat_id.to_string()),
+            thread_id: chat.thread_id,
+            chat_title: chat.chat_title,
+        }
+    }
+}
+
+#[derive(Clone, SimpleObject)]
+struct LlmRequestUser {
+    #[graphql(name = "userID")]
+    user_id: ID,
+    full_name: Option<String>,
+}
+
+impl From<RuntimeLlmRequestUserData> for LlmRequestUser {
+    fn from(user: RuntimeLlmRequestUserData) -> Self {
+        Self {
+            user_id: ID(user.user_id.to_string()),
+            full_name: user.full_name,
+        }
+    }
+}
+
+#[derive(Clone, SimpleObject)]
+struct LlmRequestMessage {
+    #[graphql(name = "messageID")]
+    message_id: i32,
+}
+
+impl From<RuntimeLlmRequestMessageData> for LlmRequestMessage {
+    fn from(message: RuntimeLlmRequestMessageData) -> Self {
+        Self {
+            message_id: message.message_id,
+        }
+    }
+}
+
+#[derive(Clone, SimpleObject)]
+struct LlmGenConfig {
+    max_output_tokens: i32,
+    temperature: f64,
+    top_p: f64,
+    top_k: i32,
+    safety_settings: Option<Json<Value>>,
+}
+
+impl From<RuntimeLlmGenConfigData> for LlmGenConfig {
+    fn from(config: RuntimeLlmGenConfigData) -> Self {
+        Self {
+            max_output_tokens: config.max_output_tokens,
+            temperature: config.temperature,
+            top_p: config.top_p,
+            top_k: config.top_k,
+            safety_settings: config.safety_settings.map(Json),
+        }
+    }
+}
+
+#[derive(Clone, SimpleObject)]
+struct LlmRequestResult {
+    duration_ms: i32,
+    error: Option<String>,
+    response_text_preview: Option<String>,
+}
+
+impl From<RuntimeLlmRequestResultData> for LlmRequestResult {
+    fn from(result: RuntimeLlmRequestResultData) -> Self {
+        Self {
+            duration_ms: result.duration_ms,
+            error: result.error,
+            response_text_preview: result.response_text_preview,
+        }
+    }
+}
+
+#[derive(Clone, SimpleObject)]
+struct LlmAnalytics {
+    range: String,
+    bucket: String,
+    since: String,
+    totals: LlmAnalyticsTotals,
+    series: Vec<LlmAnalyticsSeriesPoint>,
+    top_chats: Vec<LlmAnalyticsTopChat>,
+    models: Vec<LlmAnalyticsModelStat>,
+    providers: Vec<LlmAnalyticsProviderStat>,
+    stage_metrics: Vec<LlmAnalyticsStageMetric>,
+    runtime_jobs: Vec<RuntimeJobAnalyticsStat>,
+    runtime_jobs_error: Option<String>,
+    ai_farm_capacity: Option<AifarmCapacitySnapshot>,
+}
+
+impl From<RuntimeLlmAnalyticsData> for LlmAnalytics {
+    fn from(summary: RuntimeLlmAnalyticsData) -> Self {
+        Self {
+            range: summary.range,
+            bucket: summary.bucket,
+            since: summary.since,
+            totals: LlmAnalyticsTotals::from(summary.totals),
+            series: summary
+                .series
+                .into_iter()
+                .map(LlmAnalyticsSeriesPoint::from)
+                .collect(),
+            top_chats: summary
+                .top_chats
+                .into_iter()
+                .map(LlmAnalyticsTopChat::from)
+                .collect(),
+            models: summary
+                .models
+                .into_iter()
+                .map(LlmAnalyticsModelStat::from)
+                .collect(),
+            providers: summary
+                .providers
+                .into_iter()
+                .map(LlmAnalyticsProviderStat::from)
+                .collect(),
+            stage_metrics: summary
+                .stage_metrics
+                .into_iter()
+                .map(LlmAnalyticsStageMetric::from)
+                .collect(),
+            runtime_jobs: summary
+                .runtime_jobs
+                .into_iter()
+                .map(RuntimeJobAnalyticsStat::from)
+                .collect(),
+            runtime_jobs_error: summary.runtime_jobs_error,
+            ai_farm_capacity: summary.ai_farm_capacity.map(AifarmCapacitySnapshot::from),
+        }
+    }
+}
+
+#[derive(Clone, Default, SimpleObject)]
+struct LlmAnalyticsTotals {
+    total_count: i32,
+    error_count: i32,
+    avg_duration_ms: i32,
+}
+
+impl From<RuntimeLlmAnalyticsTotalsData> for LlmAnalyticsTotals {
+    fn from(totals: RuntimeLlmAnalyticsTotalsData) -> Self {
+        Self {
+            total_count: totals.total_count,
+            error_count: totals.error_count,
+            avg_duration_ms: totals.avg_duration_ms,
+        }
+    }
+}
+
+#[derive(Clone, SimpleObject)]
+struct LlmAnalyticsSeriesPoint {
+    ts: String,
+    total_count: i32,
+    error_count: i32,
+    avg_duration_ms: i32,
+}
+
+impl From<RuntimeLlmAnalyticsSeriesPointData> for LlmAnalyticsSeriesPoint {
+    fn from(point: RuntimeLlmAnalyticsSeriesPointData) -> Self {
+        Self {
+            ts: point.ts,
+            total_count: point.total_count,
+            error_count: point.error_count,
+            avg_duration_ms: point.avg_duration_ms,
+        }
+    }
+}
+
+#[derive(Clone, SimpleObject)]
+struct LlmAnalyticsTopChat {
+    #[graphql(name = "chatID")]
+    chat_id: ID,
+    title: Option<String>,
+    username: Option<String>,
+    request_count: i32,
+}
+
+impl From<RuntimeLlmAnalyticsTopChatData> for LlmAnalyticsTopChat {
+    fn from(chat: RuntimeLlmAnalyticsTopChatData) -> Self {
+        Self {
+            chat_id: ID(chat.chat_id.to_string()),
+            title: chat.title,
+            username: chat.username,
+            request_count: chat.request_count,
+        }
+    }
+}
+
+#[derive(Clone, SimpleObject)]
+struct LlmAnalyticsModelStat {
+    model: String,
+    request_count: i32,
+    error_count: i32,
+    avg_duration_ms: i32,
+    p50_duration_ms: i32,
+    p95_duration_ms: i32,
+}
+
+impl From<RuntimeLlmAnalyticsModelStatData> for LlmAnalyticsModelStat {
+    fn from(stat: RuntimeLlmAnalyticsModelStatData) -> Self {
+        Self {
+            model: stat.model,
+            request_count: stat.request_count,
+            error_count: stat.error_count,
+            avg_duration_ms: stat.avg_duration_ms,
+            p50_duration_ms: stat.p50_duration_ms,
+            p95_duration_ms: stat.p95_duration_ms,
+        }
+    }
+}
+
+#[derive(Clone, SimpleObject)]
+struct LlmAnalyticsProviderStat {
+    provider: String,
+    source: String,
+    request_count: i32,
+    error_count: i32,
+    avg_duration_ms: i32,
+    p50_duration_ms: i32,
+    p95_duration_ms: i32,
+}
+
+impl From<RuntimeLlmAnalyticsProviderStatData> for LlmAnalyticsProviderStat {
+    fn from(stat: RuntimeLlmAnalyticsProviderStatData) -> Self {
+        Self {
+            provider: stat.provider,
+            source: stat.source,
+            request_count: stat.request_count,
+            error_count: stat.error_count,
+            avg_duration_ms: stat.avg_duration_ms,
+            p50_duration_ms: stat.p50_duration_ms,
+            p95_duration_ms: stat.p95_duration_ms,
+        }
+    }
+}
+
+#[derive(Clone, SimpleObject)]
+struct LlmAnalyticsStageMetric {
+    stage: String,
+    source: String,
+    request_count: i32,
+    error_count: i32,
+    avg_duration_ms: i32,
+    p50_duration_ms: i32,
+    p95_duration_ms: i32,
+    avg_iteration: i32,
+    max_iteration: i32,
+}
+
+impl From<RuntimeLlmAnalyticsStageMetricData> for LlmAnalyticsStageMetric {
+    fn from(metric: RuntimeLlmAnalyticsStageMetricData) -> Self {
+        Self {
+            stage: metric.stage,
+            source: metric.source,
+            request_count: metric.request_count,
+            error_count: metric.error_count,
+            avg_duration_ms: metric.avg_duration_ms,
+            p50_duration_ms: metric.p50_duration_ms,
+            p95_duration_ms: metric.p95_duration_ms,
+            avg_iteration: metric.avg_iteration,
+            max_iteration: metric.max_iteration,
+        }
+    }
+}
+
+#[derive(Clone, SimpleObject)]
+struct RuntimeJobAnalyticsStat {
+    job_type: String,
+    queue_name: String,
+    provider: String,
+    created_count: i32,
+    completed_count: i32,
+    failed_count: i32,
+    avg_wait_ms: i32,
+    p95_wait_ms: i32,
+    avg_processing_ms: i32,
+    p95_processing_ms: i32,
+}
+
+impl From<RuntimeJobAnalyticsStatData> for RuntimeJobAnalyticsStat {
+    fn from(stat: RuntimeJobAnalyticsStatData) -> Self {
+        Self {
+            job_type: stat.job_type,
+            queue_name: stat.queue_name,
+            provider: stat.provider,
+            created_count: stat.created_count,
+            completed_count: stat.completed_count,
+            failed_count: stat.failed_count,
+            avg_wait_ms: stat.avg_wait_ms,
+            p95_wait_ms: stat.p95_wait_ms,
+            avg_processing_ms: stat.avg_processing_ms,
+            p95_processing_ms: stat.p95_processing_ms,
+        }
+    }
+}
+
+#[derive(Clone, SimpleObject)]
+struct AifarmCapacitySnapshot {
+    service: String,
+    max_concurrent_jobs: i32,
+    running: i32,
+    queued: i32,
+    available: i32,
+    locked: bool,
+    ready: bool,
+    observed_at: String,
+    error: Option<String>,
+}
+
+impl From<RuntimeAifarmCapacitySnapshotData> for AifarmCapacitySnapshot {
+    fn from(snapshot: RuntimeAifarmCapacitySnapshotData) -> Self {
+        Self {
+            service: snapshot.service,
+            max_concurrent_jobs: snapshot.max_concurrent_jobs,
+            running: snapshot.running,
+            queued: snapshot.queued,
+            available: snapshot.available,
+            locked: snapshot.locked,
+            ready: snapshot.ready,
+            observed_at: snapshot.observed_at,
+            error: snapshot.error,
+        }
+    }
+}
+
+#[derive(Clone, Default, SimpleObject)]
+struct UpdatesRuntime {
+    active: i32,
+    state_active: i32,
+    handle_active: i32,
+    queue_len: i32,
+    queue_error: Option<String>,
+    started1m: i32,
+    completed1m: i32,
+    timeouts1m: i32,
+    oldest_active_ms: i32,
+    last_stall_at: Option<String>,
+    tasks: Vec<UpdatesTask>,
+}
+
+impl From<RuntimeUpdatesRuntimeData> for UpdatesRuntime {
+    fn from(runtime: RuntimeUpdatesRuntimeData) -> Self {
+        Self {
+            active: runtime.active,
+            state_active: runtime.state_active,
+            handle_active: runtime.handle_active,
+            queue_len: runtime.queue_len,
+            queue_error: runtime.queue_error,
+            started1m: runtime.started1m,
+            completed1m: runtime.completed1m,
+            timeouts1m: runtime.timeouts1m,
+            oldest_active_ms: runtime.oldest_active_ms,
+            last_stall_at: runtime.last_stall_at,
+            tasks: runtime.tasks.into_iter().map(UpdatesTask::from).collect(),
+        }
+    }
+}
+
+#[derive(Clone, SimpleObject)]
+struct UpdatesTask {
+    stage: String,
+    started_at: String,
+    age_ms: i32,
+    #[graphql(name = "chatID")]
+    chat_id: Option<ID>,
+    #[graphql(name = "userID")]
+    user_id: Option<ID>,
+    update: String,
+}
+
+impl From<RuntimeUpdatesTaskData> for UpdatesTask {
+    fn from(task: RuntimeUpdatesTaskData) -> Self {
+        Self {
+            stage: task.stage,
+            started_at: task.started_at,
+            age_ms: task.age_ms,
+            chat_id: task.chat_id.map(|id| ID(id.to_string())),
+            user_id: task.user_id.map(|id| ID(id.to_string())),
+            update: task.update,
+        }
+    }
+}
+
+#[derive(Clone, SimpleObject)]
+struct LogEntry {
+    seq: ID,
+    time: Option<String>,
+    level: String,
+    message: String,
+    attrs: Option<Json<Value>>,
+}
+
+impl From<RuntimeLogEntry> for LogEntry {
+    fn from(entry: RuntimeLogEntry) -> Self {
+        Self {
+            seq: ID(entry.seq.to_string()),
+            time: entry.time,
+            level: entry.level,
+            message: entry.message,
+            attrs: entry.attrs.map(Json),
+        }
+    }
+}
+
+#[derive(Clone, SimpleObject)]
+struct LogsResult {
+    count: i32,
+    last_seq: Option<ID>,
+    items: Vec<LogEntry>,
+}
+
+/// Redis prefix group returned by runtime API diagnostics.
+#[derive(Clone, Debug, Eq, PartialEq, SimpleObject)]
+pub struct RuntimeRedisPrefixGroup {
+    pub prefix: String,
+    pub count: i32,
+}
+
+/// Redis value returned by runtime API diagnostics.
+#[derive(Clone, Debug, Eq, PartialEq, SimpleObject)]
+pub struct RuntimeRedisValue {
+    pub key: String,
+    pub value: String,
+    pub truncated: bool,
+}
+
+#[derive(InputObject)]
+#[allow(dead_code)]
+struct SqlReadInput {
+    sql: String,
+    args: Option<Vec<Json<Value>>>,
+    timeout_ms: Option<i32>,
+}
+
+#[derive(Clone, SimpleObject)]
+struct SqlReadResult {
+    columns: Vec<String>,
+    rows: Vec<Json<Value>>,
+    row_count: i32,
+    elapsed_ms: i32,
+    truncated: bool,
+}
+
+#[derive(Clone, SimpleObject)]
+struct MemoryRestartResult {
+    ok: bool,
+    #[graphql(name = "runID")]
+    run_id: Option<ID>,
+    retried_failed_runs: i32,
+    queued_runs: i32,
+    started: bool,
+    #[graphql(name = "override")]
+    override_: bool,
+    provider: Option<String>,
+    model: Option<String>,
+}
+
+impl From<RuntimeMemoryRestartResultData> for MemoryRestartResult {
+    fn from(result: RuntimeMemoryRestartResultData) -> Self {
+        Self {
+            ok: result.ok,
+            run_id: result.run_id.map(|id| ID(id.to_string())),
+            retried_failed_runs: result.retried_failed_runs,
+            queued_runs: result.queued_runs,
+            started: result.started,
+            override_: result.override_,
+            provider: trim_nonempty(result.provider),
+            model: trim_nonempty(result.model),
+        }
+    }
+}
+
+#[derive(Clone, SimpleObject)]
+struct GeminiExplicitCachePurgeResult {
+    ok: bool,
+    scanned: i32,
+    matched: i32,
+    deleted: i32,
+    failed: i32,
+}
+
+impl From<RuntimeGeminiCachePurgeResultData> for GeminiExplicitCachePurgeResult {
+    fn from(result: RuntimeGeminiCachePurgeResultData) -> Self {
+        Self {
+            ok: result.failed == 0,
+            scanned: result.scanned,
+            matched: result.matched,
+            deleted: result.deleted,
+            failed: result.failed,
+        }
+    }
+}
+
+fn trim_nonempty(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}

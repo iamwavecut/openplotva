@@ -6,20 +6,15 @@ use std::{
 
 use crate::MessageFingerprint;
 
-/// Go default outbound deduplication window.
 pub const DEFAULT_DEBOUNCE_WINDOW: Duration = Duration::from_secs(30);
 
-/// Go default number of outbound fingerprints kept in the debouncer cache.
 pub const DEFAULT_DEBOUNCE_CACHE_SIZE: usize = 1000;
 
-/// Go outbound debouncer settings.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DebouncerConfig {
     /// Whether outbound deduplication is enabled.
     pub enabled: bool,
-    /// Default deduplication window. `Duration::ZERO` maps to Go's 30 second default.
     pub default_window: Duration,
-    /// Maximum cache size. `0` maps to Go's 1000 entry default.
     pub max_cache_size: usize,
     /// Per-chat deduplication windows keyed by Telegram chat ID.
     pub per_chat_settings: HashMap<i64, Duration>,
@@ -70,7 +65,6 @@ struct DebouncerEntry {
 }
 
 impl Debouncer {
-    /// Build a debouncer with Go's zero-value default handling.
     pub fn new(config: DebouncerConfig) -> Self {
         Self {
             config: config.normalized(),

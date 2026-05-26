@@ -4,10 +4,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Go default interval between regular outbound sends for the same chat.
 pub const DEFAULT_DISPATCH_INTERVAL: Duration = Duration::from_millis(50);
 
-/// Go default idle age before unused per-chat dispatch limiters are cleaned up.
 pub const DEFAULT_RATE_LIMITER_MAX_IDLE: Duration = Duration::from_secs(30 * 60);
 
 /// Per-chat burst-one limiter collection used by the outbound dispatcher.

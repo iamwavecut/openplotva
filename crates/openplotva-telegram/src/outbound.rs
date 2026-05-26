@@ -1,5 +1,3 @@
-//! Outbound Telegram request builders ported from the Go server send path.
-
 use std::{borrow::Cow, fmt, io::Cursor};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
@@ -24,55 +22,39 @@ use crate::{
     extract_visible_text, sanitize_telegram_html, split_telegram_text, strip_telegram_html,
 };
 
-/// Telegram text message limit used by the Go outbound server.
 pub const TELEGRAM_TEXT_MAX_BYTES: usize = 4096;
 
-/// Go message type string for outbound text fingerprints.
 pub const MESSAGE_TYPE_TEXT: &str = "text";
 
-/// Button text used by Go settings WebApp keyboards.
 pub const SETTINGS_BUTTON_TEXT: &str = "⚙️ Настройки";
 
-/// Telegram inline message text limit used by Go guest answers.
 pub const GUEST_INLINE_TEXT_LIMIT: usize = 4096;
 
 /// Plain-text truncate limit used when sanitized guest HTML exceeds Telegram's inline limit.
 pub const GUEST_INLINE_TRUNCATE_LIMIT: usize = 3900;
 
-/// Payload used by Go guest add-to-chat links.
 pub const GUEST_ADD_TO_CHAT_PAYLOAD: &str = "guest";
 
-/// Fallback bot username used by Go guest helpers.
 pub const DEFAULT_GUEST_BOT_USERNAME: &str = "PlotvoBot";
 
-/// Telegram Stars currency used by Go payment requests.
 pub const TELEGRAM_STARS_CURRENCY: &str = "XTR";
 
-/// Go default VIP subscription price in Telegram Stars.
 pub const SUBSCRIPTION_PRICE_STARS: i64 = 300;
 
-/// Go lower donation command bound in Telegram Stars.
 pub const MIN_DONATION_STARS: i64 = 10;
 
-/// Go upper donation command bound in Telegram Stars.
 pub const MAX_DONATION_STARS: i64 = 10000;
 
-/// Go VIP subscription duration in days.
 pub const SUBSCRIPTION_DURATION_DAYS: i64 = 30;
 
-/// Bot API subscription period used by Go `createInvoiceLink` requests.
 pub const SUBSCRIPTION_PERIOD_SECONDS: i64 = 2_592_000;
 
-/// Go VIP invoice title and price label.
 pub const VIP_SUBSCRIPTION_TITLE: &str = "VIP Подписка на 30 дней";
 
-/// Go VIP invoice description.
 pub const VIP_SUBSCRIPTION_DESCRIPTION: &str = "Подписка на VIP статус в боте на 30 дней. Включает приоритетную обработку запросов, двойные лимиты на рисование, генерацию музыки, изображения лучшего качества и ранний доступ к новым фичам!";
 
-/// Go donation invoice title.
 pub const DONATION_TITLE: &str = "Донат разработчику";
 
-/// Go donation invoice description.
 pub const DONATION_DESCRIPTION: &str = "Поддержите разработку бота! Ваш донат согреет сердце разработчика и поможет создавать новые функции.";
 
 const MESSAGE_TYPE_STICKER: &str = "sticker";
@@ -80,12 +62,10 @@ const MESSAGE_TYPE_PHOTO: &str = "photo";
 const MESSAGE_TYPE_AUDIO: &str = "audio";
 const CRC32_CASTAGNOLI: Crc<u32> = Crc::<u32>::new(&CRC_32_ISCSI);
 
-/// Deduplication fingerprint key material used by the Go dispatcher.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MessageFingerprint {
     /// Telegram chat ID.
     pub chat_id: i64,
-    /// Go message type string, such as `text`, `photo`, or `audio`.
     pub message_type: String,
     /// CRC32-Castagnoli hash of the outbound content.
     pub content_hash: u32,
@@ -116,7 +96,6 @@ pub struct ChatRef {
     pub is_forum: bool,
 }
 
-/// Minimal replied-to message fields used by the Go reply helpers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReplyMessageRef {
     /// Replied-to Telegram message ID.
@@ -129,7 +108,6 @@ pub struct ReplyMessageRef {
     pub message_thread_id: i64,
 }
 
-/// Text send request fields used by the Go `TextMessage` builder.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TextMessageRequest {
     /// Target chat when not replying to an existing message.
@@ -138,17 +116,14 @@ pub struct TextMessageRequest {
     pub message_thread_id: i64,
     /// Whether Telegram should suppress user notification sound.
     pub disable_notification: bool,
-    /// Go pointer semantics: `None` means default true.
     pub allow_sending_without_reply: Option<bool>,
     /// Message text.
     pub text: String,
-    /// Go `RenderAs` parse mode string.
     pub render_as: String,
     /// Markup attached only to the last split text part.
     pub reply_markup: Option<ReplyMarkup>,
 }
 
-/// Text edit request fields used by the Go `TextMessage` builder.
 #[derive(Clone, Debug, PartialEq)]
 pub struct EditTextMessageRequest {
     /// Target chat.
@@ -157,13 +132,10 @@ pub struct EditTextMessageRequest {
     pub message_id: i64,
     /// New message text.
     pub text: String,
-    /// Go `RenderAs` parse mode string.
     pub render_as: String,
-    /// Go edit path only applies inline keyboard markup.
     pub reply_markup: Option<InlineKeyboardMarkup>,
 }
 
-/// Caption edit request fields used by Go `api.NewEditMessageCaption` call sites.
 #[derive(Clone, Debug, PartialEq)]
 pub struct EditCaptionMessageRequest {
     /// Target chat.
@@ -172,50 +144,39 @@ pub struct EditCaptionMessageRequest {
     pub message_id: i64,
     /// New caption text.
     pub caption: String,
-    /// Go `ParseMode` string for the caption.
     pub render_as: String,
     /// Optional inline keyboard markup.
     pub reply_markup: Option<InlineKeyboardMarkup>,
 }
 
-/// Reply-markup edit request fields used by Go `api.NewEditMessageReplyMarkup` call sites.
 #[derive(Clone, Debug, PartialEq)]
 pub struct EditReplyMarkupMessageRequest {
     /// Target chat.
     pub chat: ChatRef,
     /// Message ID to edit.
     pub message_id: i64,
-    /// Replacement inline keyboard markup, including Go's explicit empty markup.
     pub reply_markup: InlineKeyboardMarkup,
 }
 
-/// Chat action request fields used by Go `api.NewChatAction` call sites.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChatActionRequest {
     /// Target chat.
     pub chat: ChatRef,
-    /// Target topic ID; Go omits zero values.
     pub message_thread_id: i64,
     /// Telegram chat action string, such as `typing` or `upload_photo`.
     pub action: String,
 }
 
-/// Callback query answer fields used by Go `api.NewCallback*` call sites.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CallbackAnswerRequest {
     /// Telegram callback query ID.
     pub callback_query_id: String,
-    /// Optional notification text; Go omits empty values.
     pub text: String,
-    /// Whether to show an alert; Go omits false values.
     pub show_alert: bool,
-    /// Optional URL; Go omits empty values.
     pub url: String,
-    /// Optional cache time in seconds; Go omits zero values.
     pub cache_time: i64,
 }
 
-/// Inline article fields used by Go `api.NewInlineQueryResultArticle*` call sites.
 #[derive(Clone, Debug, PartialEq)]
 pub struct InlineArticleRequest {
     /// Inline result ID.
@@ -224,30 +185,23 @@ pub struct InlineArticleRequest {
     pub title: String,
     /// Text sent when the result is selected.
     pub message_text: String,
-    /// Go parse mode string; empty means plain text.
     pub render_as: String,
-    /// Optional result description; Go omits empty values.
     pub description: String,
     /// Optional inline keyboard markup attached to the result.
     pub reply_markup: Option<InlineKeyboardMarkup>,
 }
 
-/// Inline query answer fields used by Go `api.InlineConfig` call sites.
 #[derive(Clone, Debug, PartialEq)]
 pub struct InlineQueryAnswerRequest {
     /// Telegram inline query ID.
     pub inline_query_id: String,
     /// Results to return to Telegram.
     pub results: Vec<InlineQueryResult>,
-    /// Optional cache time in seconds; Go omits zero values.
     pub cache_time: i64,
-    /// Whether results are personal; Go omits false values.
     pub is_personal: bool,
-    /// Optional pagination offset; Go omits empty values.
     pub next_offset: String,
 }
 
-/// Guest query answer fields used by Go `api.NewAnswerGuestQuery` call sites.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GuestQueryAnswerRequest {
     /// Telegram guest query ID.
@@ -256,7 +210,6 @@ pub struct GuestQueryAnswerRequest {
     pub result: InlineQueryResult,
 }
 
-/// HTML guest answer fields used by Go `Fetcher.answerGuestHTML`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GuestHtmlAnswerRequest {
     /// Telegram guest query ID.
@@ -273,7 +226,6 @@ pub struct GuestHtmlAnswerRequest {
     pub reply_markup: Option<InlineKeyboardMarkup>,
 }
 
-/// Go payment payload classes used after Telegram reports a successful payment.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PaymentPayloadKind {
     Unknown,
@@ -281,18 +233,14 @@ pub enum PaymentPayloadKind {
     Donation,
 }
 
-/// VIP invoice link fields used by Go `executeVIPInvoiceControlJob`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SubscriptionInvoiceLinkRequest {
     /// Telegram user ID that becomes the payment payload suffix.
     pub user_id: i64,
-    /// Telegram username; Go discounts exactly `WaveCut`.
     pub user_name: String,
-    /// Control-job override amount. Zero means Go's default subscription price.
     pub amount_stars: i64,
 }
 
-/// Donation invoice link fields used by Go `executeDonateInvoiceControlJob`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DonationInvoiceLinkRequest {
     /// Telegram user ID that becomes the payment payload suffix.
@@ -301,7 +249,6 @@ pub struct DonationInvoiceLinkRequest {
     pub amount_stars: i64,
 }
 
-/// Delete request fields used by Go `api.NewDeleteMessage` call sites.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DeleteMessageRequest {
     /// Target chat ID.
@@ -310,7 +257,6 @@ pub struct DeleteMessageRequest {
     pub message_id: i64,
 }
 
-/// Sticker send request fields used by the Go `StickerMessage` builder.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StickerMessageRequest {
     /// Target chat when not replying to an existing message.
@@ -341,7 +287,6 @@ pub struct StickerMessagePlan {
     pub chat_id: i64,
     /// Telegram sticker file ID.
     pub file_id: String,
-    /// Forum topic ID, when Go would set it on the outbound config.
     pub message_thread_id: Option<i64>,
     /// Whether Telegram should suppress user notification sound.
     pub disable_notification: bool,
@@ -349,14 +294,12 @@ pub struct StickerMessagePlan {
     pub reply_parameters: Option<ReplyParametersPlan>,
 }
 
-/// Telegram photo source variants used by Go `api.NewPhoto` call sites.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PhotoSource {
     /// Existing Telegram file ID.
     FileId(String),
     /// Public URL for Telegram to fetch.
     Url(String),
-    /// Uploaded file bytes with the multipart file name Go would attach.
     Bytes {
         /// Multipart file name.
         file_name: String,
@@ -365,7 +308,6 @@ pub enum PhotoSource {
     },
 }
 
-/// Photo send request fields assembled by Go draw/fetcher paths.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PhotoMessageRequest {
     /// Target chat.
@@ -378,11 +320,9 @@ pub struct PhotoMessageRequest {
     pub photo: PhotoSource,
     /// Optional Telegram caption.
     pub caption: String,
-    /// Go `ParseMode` string for the caption.
     pub render_as: String,
     /// Whether Telegram should cover the media with a spoiler.
     pub has_spoiler: bool,
-    /// Explicit reply parameters overlaid by the Go caller.
     pub reply_parameters: Option<ReplyParametersPlan>,
 }
 
@@ -393,13 +333,11 @@ pub struct PhotoMessagePlan {
     pub chat_id: i64,
     /// Photo file, URL, or upload bytes.
     pub photo: PhotoSource,
-    /// Forum topic ID, when Go would set it on the outbound config.
     pub message_thread_id: Option<i64>,
     /// Whether Telegram should suppress user notification sound.
     pub disable_notification: bool,
     /// Optional Telegram caption.
     pub caption: String,
-    /// Go `ParseMode` string for the caption.
     pub render_as: String,
     /// Whether Telegram should cover the media with a spoiler.
     pub has_spoiler: bool,
@@ -407,14 +345,12 @@ pub struct PhotoMessagePlan {
     pub reply_parameters: Option<ReplyParametersPlan>,
 }
 
-/// Telegram audio source variants used by Go `api.NewAudio` call sites.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AudioSource {
     /// Existing Telegram file ID.
     FileId(String),
     /// Public URL for Telegram to fetch.
     Url(String),
-    /// Uploaded audio bytes with the multipart file name Go attaches.
     Bytes {
         /// Multipart file name.
         file_name: String,
@@ -423,7 +359,6 @@ pub enum AudioSource {
     },
 }
 
-/// Audio send request fields assembled by the Go song generation path.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AudioMessageRequest {
     /// Target chat.
@@ -436,9 +371,7 @@ pub struct AudioMessageRequest {
     pub audio: AudioSource,
     /// Optional Telegram caption.
     pub caption: String,
-    /// Go `ParseMode` string for the caption.
     pub render_as: String,
-    /// Explicit reply parameters overlaid by the Go caller.
     pub reply_parameters: Option<ReplyParametersPlan>,
 }
 
@@ -449,32 +382,27 @@ pub struct AudioMessagePlan {
     pub chat_id: i64,
     /// Audio file, URL, or upload bytes.
     pub audio: AudioSource,
-    /// Forum topic ID, when Go would set it on the outbound config.
     pub message_thread_id: Option<i64>,
     /// Whether Telegram should suppress user notification sound.
     pub disable_notification: bool,
     /// Optional Telegram caption.
     pub caption: String,
-    /// Go `ParseMode` string for the caption.
     pub render_as: String,
     /// Reply parameters, when sending as a reply.
     pub reply_parameters: Option<ReplyParametersPlan>,
 }
 
-/// Photo item in a Telegram media group, matching Go `api.InputMediaPhoto`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MediaGroupPhotoItem {
     /// Photo file, URL, or upload bytes.
     pub photo: PhotoSource,
     /// Optional Telegram caption.
     pub caption: String,
-    /// Go `ParseMode` string for the caption.
     pub render_as: String,
     /// Whether Telegram should cover the media with a spoiler.
     pub has_spoiler: bool,
 }
 
-/// Media group send request fields assembled by the Go image workflow.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MediaGroupMessageRequest {
     /// Target chat.
@@ -485,7 +413,6 @@ pub struct MediaGroupMessageRequest {
     pub disable_notification: bool,
     /// Ordered album items.
     pub items: Vec<MediaGroupPhotoItem>,
-    /// Explicit reply parameters overlaid by the Go caller.
     pub reply_parameters: Option<ReplyParametersPlan>,
 }
 
@@ -494,7 +421,6 @@ pub struct MediaGroupMessageRequest {
 pub struct MediaGroupMessagePlan {
     /// Telegram target chat ID.
     pub chat_id: i64,
-    /// Forum topic ID, when Go would set it on the outbound config.
     pub message_thread_id: Option<i64>,
     /// Whether Telegram should suppress user notification sound.
     pub disable_notification: bool,
@@ -504,7 +430,6 @@ pub struct MediaGroupMessagePlan {
     pub reply_parameters: Option<ReplyParametersPlan>,
 }
 
-/// Edit-media request fields used by the Go generated-image placeholder replacement path.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EditMediaMessageRequest {
     /// Target chat.
@@ -526,25 +451,19 @@ pub struct EditMediaMessagePlan {
     pub media: MediaGroupPhotoItem,
 }
 
-/// Outbound builder error matching Go validation failures where possible.
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum OutboundBuildError {
-    /// Go: `text is empty`.
     #[error("text is empty")]
     EmptyText,
-    /// Go: `text is empty after formatting`.
     #[error("text is empty after formatting")]
     EmptyTextAfterFormatting,
-    /// Go: `chat is not set`.
     #[error("chat is not set")]
     ChatNotSet,
-    /// Go drops blank chat action requests before sending.
     #[error("chat action is required")]
     ChatActionRequired,
     /// `carapax` models Telegram chat actions as a closed enum.
     #[error("unsupported Telegram chat action: {0}")]
     UnsupportedChatAction(String),
-    /// Go: `message ID is required for editing`.
     #[error("message ID is required for editing")]
     MessageIdRequired,
     /// `carapax` does not accept raw parse-mode strings.
@@ -687,25 +606,21 @@ pub fn build_chat_action_method(
     Ok(method)
 }
 
-/// Build Go's `getChatMember` permission probe request.
 #[must_use]
 pub fn build_get_chat_member_method(chat_id: i64, user_id: i64) -> GetChatMember {
     GetChatMember::new(chat_id, user_id)
 }
 
-/// Build Go's `getChat` target-resolution request.
 #[must_use]
 pub fn build_get_chat_method(chat_id: impl Into<carapax::types::ChatId>) -> GetChat {
     GetChat::new(chat_id)
 }
 
-/// Build Go's `getChatAdministrators` admin-sync request.
 #[must_use]
 pub fn build_get_chat_administrators_method(chat_id: i64) -> GetChatAdministrators {
     GetChatAdministrators::new(chat_id)
 }
 
-/// Go `telegramMemberCanOpenGroupSettings`.
 #[must_use]
 pub fn telegram_member_can_open_group_settings(member: &ChatMember) -> bool {
     match member {
@@ -736,7 +651,6 @@ pub fn build_callback_answer_method(req: &CallbackAnswerRequest) -> AnswerCallba
     method
 }
 
-/// Build an inline article result using Go `api.NewInlineQueryResultArticle*` semantics.
 pub fn build_inline_query_result_article(
     req: &InlineArticleRequest,
 ) -> Result<InlineQueryResult, OutboundBuildError> {
@@ -775,7 +689,6 @@ pub fn build_guest_query_answer_method(req: &GuestQueryAnswerRequest) -> AnswerG
     AnswerGuestQuery::new(req.guest_query_id.clone(), req.result.clone())
 }
 
-/// Build the Go successful pre-checkout answer.
 #[must_use]
 pub fn build_pre_checkout_ok_method(
     pre_checkout_query_id: impl Into<String>,
@@ -783,19 +696,16 @@ pub fn build_pre_checkout_ok_method(
     AnswerPreCheckoutQuery::ok(pre_checkout_query_id)
 }
 
-/// Build Go `subscription_<user_id>` invoice payload text.
 #[must_use]
 pub fn subscription_invoice_payload(user_id: i64) -> String {
     format!("subscription_{user_id}")
 }
 
-/// Build Go `donation_<user_id>_<amount>` invoice payload text.
 #[must_use]
 pub fn donation_invoice_payload(user_id: i64, amount_stars: i64) -> String {
     format!("donation_{user_id}_{amount_stars}")
 }
 
-/// Return the Go payment payload class using prefix semantics.
 #[must_use]
 pub fn classify_payment_payload(payload: &str) -> PaymentPayloadKind {
     if payload.starts_with("subscription") {
@@ -807,7 +717,6 @@ pub fn classify_payment_payload(payload: &str) -> PaymentPayloadKind {
     }
 }
 
-/// Return the Go VIP invoice price for one control-job request.
 #[must_use]
 pub fn subscription_invoice_price_stars(req: &SubscriptionInvoiceLinkRequest) -> i64 {
     if req.user_name == "WaveCut" {
@@ -820,7 +729,6 @@ pub fn subscription_invoice_price_stars(req: &SubscriptionInvoiceLinkRequest) ->
     }
 }
 
-/// Build Go `createInvoiceLink` for a VIP subscription invoice.
 #[must_use]
 pub fn build_subscription_invoice_link_method(
     req: &SubscriptionInvoiceLinkRequest,
@@ -839,7 +747,6 @@ pub fn build_subscription_invoice_link_method(
     .with_subscription_period(SUBSCRIPTION_PERIOD_SECONDS)
 }
 
-/// Build Go `createInvoiceLink` for a donation invoice.
 #[must_use]
 pub fn build_donation_invoice_link_method(req: &DonationInvoiceLinkRequest) -> CreateInvoiceLink {
     CreateInvoiceLink::new(
@@ -852,7 +759,6 @@ pub fn build_donation_invoice_link_method(req: &DonationInvoiceLinkRequest) -> C
     .with_parameters(InvoiceParameters::default().with_provider_token(""))
 }
 
-/// Build Go `refundStarPayment` request params through `carapax`.
 #[must_use]
 pub fn build_refund_star_payment_method(
     user_id: i64,
@@ -861,7 +767,6 @@ pub fn build_refund_star_payment_method(
     RefundStarPayment::new(user_id, telegram_payment_charge_id)
 }
 
-/// Build Go cancellation request for a Telegram Stars subscription.
 #[must_use]
 pub fn build_cancel_star_subscription_method(
     user_id: i64,
@@ -870,7 +775,6 @@ pub fn build_cancel_star_subscription_method(
     EditUserStarSubscription::new(user_id, telegram_payment_charge_id, true)
 }
 
-/// Prepare guest HTML with Go `prepareGuestHTML` semantics.
 #[must_use]
 pub fn prepare_guest_html(text: &str) -> String {
     let sanitized = sanitize_telegram_html(text);
@@ -895,7 +799,6 @@ pub fn prepare_guest_html(text: &str) -> String {
     escape_telegram_html_text(&truncated)
 }
 
-/// Build Go `guestInlineDescription` from prepared guest HTML.
 #[must_use]
 pub fn guest_inline_description(html_text: &str) -> String {
     let plain = strip_telegram_html(html_text);
@@ -907,7 +810,6 @@ pub fn guest_inline_description(html_text: &str) -> String {
     description
 }
 
-/// Build Go `guestInlineResultID` from optional guest query and message ID.
 #[must_use]
 pub fn guest_inline_result_id(guest_query_id: Option<&str>, message_id: i64) -> String {
     let Some(query_id) = guest_query_id else {
@@ -925,7 +827,6 @@ pub fn guest_inline_result_id(guest_query_id: Option<&str>, message_id: i64) -> 
     format!("guest-{}", &hash[..24])
 }
 
-/// Build Go `guestAddToChatURL`.
 #[must_use]
 pub fn guest_add_to_chat_url(bot_username: &str) -> String {
     let username = bot_username.trim().trim_start_matches('@');
@@ -937,7 +838,6 @@ pub fn guest_add_to_chat_url(bot_username: &str) -> String {
     format!("https://t.me/{username}?startgroup={GUEST_ADD_TO_CHAT_PAYLOAD}")
 }
 
-/// Build Go `guestUnsupportedFeatureHTML`.
 #[must_use]
 pub fn guest_unsupported_feature_html(bot_username: &str) -> String {
     let add_url = guest_add_to_chat_url(bot_username);
@@ -946,7 +846,6 @@ pub fn guest_unsupported_feature_html(bot_username: &str) -> String {
     )
 }
 
-/// Build Go `guestDialogFallbackHTML`.
 #[must_use]
 pub fn guest_dialog_fallback_html(bot_username: &str) -> String {
     let add_url = guest_add_to_chat_url(bot_username);
@@ -955,7 +854,6 @@ pub fn guest_dialog_fallback_html(bot_username: &str) -> String {
     )
 }
 
-/// Build Go `guestAddToChatMarkup`.
 #[must_use]
 pub fn build_guest_add_to_chat_markup(bot_username: &str) -> InlineKeyboardMarkup {
     build_inline_keyboard_markup([build_inline_keyboard_row([
@@ -966,7 +864,6 @@ pub fn build_guest_add_to_chat_markup(bot_username: &str) -> InlineKeyboardMarku
     ])])
 }
 
-/// Build Go `Fetcher.answerGuestHTML`'s direct `answerGuestQuery` method.
 #[must_use]
 pub fn build_guest_html_answer_method(req: &GuestHtmlAnswerRequest) -> Option<AnswerGuestQuery> {
     let guest_query_id = req.guest_query_id.trim();
@@ -995,7 +892,6 @@ pub fn build_guest_html_answer_method(req: &GuestHtmlAnswerRequest) -> Option<An
     }))
 }
 
-/// Build a callback-data inline keyboard button matching Go `api.NewInlineKeyboardButtonData`.
 pub fn build_inline_keyboard_button_data(
     text: impl Into<String>,
     data: impl Into<String>,
@@ -1003,7 +899,6 @@ pub fn build_inline_keyboard_button_data(
     InlineKeyboardButton::for_callback_data(text, data)
 }
 
-/// Build a URL inline keyboard button matching Go `api.NewInlineKeyboardButtonURL`.
 pub fn build_inline_keyboard_button_url(
     text: impl Into<String>,
     url: impl Into<String>,
@@ -1011,7 +906,6 @@ pub fn build_inline_keyboard_button_url(
     InlineKeyboardButton::for_url(text, url)
 }
 
-/// Build a WebApp inline keyboard button matching Go `InlineKeyboardButton{WebApp: ...}`.
 pub fn build_inline_keyboard_button_web_app(
     text: impl Into<String>,
     url: impl Into<String>,
@@ -1019,21 +913,18 @@ pub fn build_inline_keyboard_button_web_app(
     InlineKeyboardButton::for_web_app(text, WebAppInfo::from(url.into()))
 }
 
-/// Build an inline keyboard row matching Go `api.NewInlineKeyboardRow`.
 pub fn build_inline_keyboard_row(
     buttons: impl IntoIterator<Item = InlineKeyboardButton>,
 ) -> Vec<InlineKeyboardButton> {
     buttons.into_iter().collect()
 }
 
-/// Build an inline keyboard markup matching Go `api.NewInlineKeyboardMarkup`.
 pub fn build_inline_keyboard_markup(
     rows: impl IntoIterator<Item = impl IntoIterator<Item = InlineKeyboardButton>>,
 ) -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::from(rows)
 }
 
-/// Build the one-button settings keyboard used by Go private settings entrypoints.
 pub fn build_private_settings_keyboard(url: impl Into<String>) -> InlineKeyboardMarkup {
     build_inline_keyboard_markup([build_inline_keyboard_row([
         build_inline_keyboard_button_web_app(SETTINGS_BUTTON_TEXT, url),
@@ -1058,7 +949,6 @@ pub fn build_sticker_message_method(
     build_sticker_message_plan(req, reply_to)?.to_carapax()
 }
 
-/// Build an inspectable sticker payload plan matching Go `buildStickerMessageConfig`.
 pub fn build_sticker_message_plan(
     req: &StickerMessageRequest,
     reply_to: Option<&ReplyMessageRef>,
@@ -1098,7 +988,6 @@ pub fn build_photo_message_method(
     build_photo_message_plan(req)?.to_carapax()
 }
 
-/// Build an inspectable photo payload plan matching Go `api.NewPhoto` overlays.
 pub fn build_photo_message_plan(
     req: &PhotoMessageRequest,
 ) -> Result<PhotoMessagePlan, OutboundBuildError> {
@@ -1121,7 +1010,6 @@ pub fn build_audio_message_method(
     build_audio_message_plan(req).to_carapax()
 }
 
-/// Build an inspectable audio payload plan matching Go `api.NewAudio` overlays.
 pub fn build_audio_message_plan(req: &AudioMessageRequest) -> AudioMessagePlan {
     AudioMessagePlan {
         chat_id: req.chat.id,
@@ -1141,7 +1029,6 @@ pub fn build_media_group_message_method(
     build_media_group_message_plan(req).to_carapax()
 }
 
-/// Build an inspectable media-group payload plan matching Go `api.NewMediaGroup` overlays.
 pub fn build_media_group_message_plan(req: &MediaGroupMessageRequest) -> MediaGroupMessagePlan {
     MediaGroupMessagePlan {
         chat_id: req.chat.id,
@@ -1159,7 +1046,6 @@ pub fn build_edit_media_message_method(
     build_edit_media_message_plan(req).to_carapax()
 }
 
-/// Build an inspectable edit-media payload plan matching Go `editMessageMediaConfig`.
 pub fn build_edit_media_message_plan(req: &EditMediaMessageRequest) -> EditMediaMessagePlan {
     EditMediaMessagePlan {
         chat_id: req.chat.id,
@@ -1168,17 +1054,14 @@ pub fn build_edit_media_message_plan(req: &EditMediaMessageRequest) -> EditMedia
     }
 }
 
-/// Hash outbound content with Go's CRC32-Castagnoli deduplication algorithm.
 pub fn hash_content(content: &str) -> u32 {
     CRC32_CASTAGNOLI.checksum(content.as_bytes())
 }
 
-/// Build the Go-equivalent fingerprint for one outbound text message part.
 pub fn fingerprint_text_message_part(chat_id: i64, part: &str) -> MessageFingerprint {
     message_fingerprint(chat_id, MESSAGE_TYPE_TEXT, hash_content(part))
 }
 
-/// Build the Go-equivalent fingerprint for a sticker send plan.
 pub fn fingerprint_sticker_message_plan(plan: &StickerMessagePlan) -> MessageFingerprint {
     message_fingerprint(
         plan.chat_id,
@@ -1187,7 +1070,6 @@ pub fn fingerprint_sticker_message_plan(plan: &StickerMessagePlan) -> MessageFin
     )
 }
 
-/// Build the Go-equivalent fingerprint for a photo send plan.
 pub fn fingerprint_photo_message_plan(plan: &PhotoMessagePlan) -> MessageFingerprint {
     let content = plan.photo.fingerprint_content();
     message_fingerprint(
@@ -1197,7 +1079,6 @@ pub fn fingerprint_photo_message_plan(plan: &PhotoMessagePlan) -> MessageFingerp
     )
 }
 
-/// Build the Go-equivalent fingerprint for an audio send plan.
 pub fn fingerprint_audio_message_plan(plan: &AudioMessagePlan) -> MessageFingerprint {
     let content = plan.audio.fingerprint_content();
     message_fingerprint(
@@ -1207,7 +1088,6 @@ pub fn fingerprint_audio_message_plan(plan: &AudioMessagePlan) -> MessageFingerp
     )
 }
 
-/// Validate text exactly like Go before send/edit.
 pub fn validate_text_message_text(text: &str, render_as: &str) -> Result<(), OutboundBuildError> {
     if text.is_empty() {
         return Err(OutboundBuildError::EmptyText);
@@ -1218,7 +1098,6 @@ pub fn validate_text_message_text(text: &str, render_as: &str) -> Result<(), Out
     Ok(())
 }
 
-/// Choose the target chat using Go `messageTargetChat` precedence.
 pub fn message_target_chat(
     req_chat: Option<&ChatRef>,
     reply_to: Option<&ReplyMessageRef>,
@@ -1229,12 +1108,10 @@ pub fn message_target_chat(
     req_chat.copied().ok_or(OutboundBuildError::ChatNotSet)
 }
 
-/// Return the virtual-message topic ID following the Go helper.
 pub fn forum_thread_id(chat: ChatRef, message_thread_id: i64) -> Option<i64> {
     chat.is_forum.then_some(message_thread_id)
 }
 
-/// Go pointer default for `AllowSendingWithoutReply`.
 pub fn allow_sending_without_reply(value: Option<bool>) -> bool {
     value.unwrap_or(true)
 }
@@ -1261,7 +1138,6 @@ fn chat_action_from_go(action: &str) -> Result<ChatAction, OutboundBuildError> {
     }
 }
 
-/// Convert Go parse mode strings into `carapax` parse modes.
 pub fn parse_mode_from_go(value: &str) -> Result<Option<ParseMode>, OutboundBuildError> {
     match value {
         "" => Ok(None),
@@ -1273,7 +1149,6 @@ pub fn parse_mode_from_go(value: &str) -> Result<Option<ParseMode>, OutboundBuil
 }
 
 impl StickerMessagePlan {
-    /// Build the Go `api.StickerConfig` JSON payload used by queue persistence.
     pub fn to_persistence_payload(
         &self,
     ) -> Result<DispatcherPersistencePayload, serde_json::Error> {
@@ -1317,7 +1192,6 @@ impl ReplyParametersPlan {
 }
 
 impl PhotoMessagePlan {
-    /// Build the Go `api.PhotoConfig` JSON payload used by queue persistence.
     pub fn to_persistence_payload(
         &self,
     ) -> Result<DispatcherPersistencePayload, serde_json::Error> {
@@ -1394,7 +1268,6 @@ impl PhotoSource {
 }
 
 impl AudioMessagePlan {
-    /// Build the Go `api.AudioConfig` JSON payload used by queue persistence.
     pub fn to_persistence_payload(
         &self,
     ) -> Result<DispatcherPersistencePayload, serde_json::Error> {
@@ -1469,7 +1342,6 @@ impl AudioSource {
 }
 
 impl MediaGroupMessagePlan {
-    /// Build the Go `api.MediaGroupConfig` JSON payload used by queue persistence.
     pub fn to_persistence_payload(
         &self,
     ) -> Result<DispatcherPersistencePayload, serde_json::Error> {
@@ -1560,7 +1432,6 @@ impl MediaGroupPhotoItem {
 }
 
 impl EditMediaMessagePlan {
-    /// Build the Go `api.EditMessageMediaConfig` JSON payload used by queue persistence.
     pub fn to_persistence_payload(
         &self,
     ) -> Result<DispatcherPersistencePayload, serde_json::Error> {

@@ -10,9 +10,15 @@ publish = false
 [dependencies]
 openplotva-config = { path = "../openplotva-config" }
 openplotva-core = { path = "../openplotva-core" }
+openplotva-history = { path = "../openplotva-history" }
+openplotva-memory = { path = "../openplotva-memory" }
+openplotva-shield = { path = "../openplotva-shield" }
+hex.workspace = true
+pgvector.workspace = true
 redis = { workspace = true, features = ["tokio-comp"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+sha2.workspace = true
 sqlx = { workspace = true, features = ["migrate", "postgres", "runtime-tokio", "time"] }
 thiserror.workspace = true
 time.workspace = true

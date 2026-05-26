@@ -1,5 +1,3 @@
-//! Telegram-safe HTML helpers ported from the Go outbound server.
-
 use std::cell::RefCell;
 
 use html5ever::Attribute;
@@ -89,7 +87,15 @@ pub fn strip_telegram_html(input: &str) -> String {
     tokenizer.sink.finish()
 }
 
-/// Match the Go `extractVisibleText` helper used before outbound sends.
+/// Decode HTML entities without applying Telegram tag sanitization.
+pub fn decode_html_entities(input: &str) -> String {
+    if input.is_empty() {
+        return String::new();
+    }
+
+    html_escape::decode_html_entities(input).into_owned()
+}
+
 pub fn extract_visible_text(text: &str, parse_mode: &str) -> String {
     let cleaned = ensure_telegram_safe_text(text);
     if parse_mode == TELEGRAM_PARSE_MODE_HTML {
@@ -99,7 +105,6 @@ pub fn extract_visible_text(text: &str, parse_mode: &str) -> String {
     }
 }
 
-/// Match the Go `EnsureTelegramSafeText` cleanup used before sending.
 pub fn ensure_telegram_safe_text(text: &str) -> String {
     if text.is_empty() {
         return String::new();
@@ -110,7 +115,6 @@ pub fn ensure_telegram_safe_text(text: &str) -> String {
     )
 }
 
-/// Match the Go `CleanUnicodeNonPrintables` cleanup.
 pub fn clean_unicode_non_printables(text: &str) -> String {
     if text.is_empty() {
         return String::new();
@@ -135,7 +139,6 @@ pub fn clean_unicode_non_printables(text: &str) -> String {
     result.trim().to_owned()
 }
 
-/// Split outbound Telegram text with the Go byte-limit policy.
 pub fn split_telegram_text(text: &str, parse_mode: &str, max_len: usize) -> Vec<String> {
     if max_len == 0 || text.len() <= max_len {
         return vec![text.to_owned()];
@@ -694,10 +697,10 @@ fn clean_unicode_char(ch: char) -> Option<char> {
 #[cfg(test)]
 mod tests {
     use super::{
-        TELEGRAM_PARSE_MODE_HTML, clean_unicode_non_printables, ensure_telegram_safe_text,
-        escape_telegram_html_text, extract_visible_text, is_allowed_scheme, is_valid_telegram_html,
-        parse_tag_token, sanitize_telegram_html, split_html, split_telegram_text,
-        strip_telegram_html, truncate_utf8,
+        TELEGRAM_PARSE_MODE_HTML, clean_unicode_non_printables, decode_html_entities,
+        ensure_telegram_safe_text, escape_telegram_html_text, extract_visible_text,
+        is_allowed_scheme, is_valid_telegram_html, parse_tag_token, sanitize_telegram_html,
+        split_html, split_telegram_text, strip_telegram_html, truncate_utf8,
     };
 
     #[test]
@@ -772,6 +775,14 @@ mod tests {
         let got = strip_telegram_html("<b>hello</b> <a href=\"https://example.com\">world</a>");
 
         assert_eq!(got, "hello world");
+    }
+
+    #[test]
+    fn decode_html_entities_matches_go_unescape_step() {
+        assert_eq!(
+            decode_html_entities("<b>Tom &amp; Jerry</b> &#39;ok&#39; &#x1f44b;"),
+            "<b>Tom & Jerry</b> 'ok' 👋"
+        );
     }
 
     #[test]

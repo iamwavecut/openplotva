@@ -9,10 +9,8 @@ use crate::{
     parse_mode_from_go,
 };
 
-/// Go pending operation name for virtual-message deletes.
 pub const PENDING_OP_DELETE: &str = "delete";
 
-/// Go pending operation name for virtual-message edits.
 pub const PENDING_OP_EDIT: &str = "edit";
 
 /// Pending operation could not be converted into a Telegram method.

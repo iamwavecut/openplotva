@@ -16,14 +16,15 @@ pub use callback::{
     DELETE_DRAWING_ACTION_CLOSE, DELETE_DRAWING_ACTION_CONFIRM,
     DELETE_DRAWING_ACTION_FRAME_CONFIRM, DELETE_DRAWING_ACTION_FRAME_PICK,
     DELETE_DRAWING_ACTION_INIT, DELETE_LYRICS_ACTION_CLOSE, DELETE_LYRICS_ACTION_CONFIRM,
-    DELETE_LYRICS_ACTION_INIT, build_delete_drawing_confirm_keyboard,
-    build_delete_drawing_frame_confirm_keyboard, build_delete_drawing_frame_picker_keyboard,
-    build_delete_drawing_initial_keyboard, build_lyrics_delete_confirm_keyboard,
-    build_lyrics_delete_keyboard, callback_handler_for_action, callback_query_ack_method,
-    callback_query_ack_request, callback_query_route, checkin_theme_callback_init,
-    checkin_theme_callback_theme, checkin_theme_selection_ack_method,
-    checkin_theme_selection_alert, delete_drawing_callback_data, delete_lyrics_callback_data,
-    parse_callback_action, parse_callback_i64, settings_callback_ack_method,
+    DELETE_LYRICS_ACTION_INIT, build_checkin_theme_selection_keyboard,
+    build_delete_drawing_confirm_keyboard, build_delete_drawing_frame_confirm_keyboard,
+    build_delete_drawing_frame_picker_keyboard, build_delete_drawing_initial_keyboard,
+    build_lyrics_delete_confirm_keyboard, build_lyrics_delete_keyboard,
+    callback_handler_for_action, callback_query_ack_method, callback_query_ack_request,
+    callback_query_route, checkin_theme_callback_init, checkin_theme_callback_theme,
+    checkin_theme_selection_ack_method, checkin_theme_selection_alert,
+    delete_drawing_callback_data, delete_lyrics_callback_data, parse_callback_action,
+    parse_callback_i64, settings_callback_ack_method,
 };
 pub use dedup::{DEFAULT_DEBOUNCE_CACHE_SIZE, DEFAULT_DEBOUNCE_WINDOW, Debouncer, DebouncerConfig};
 pub use dispatcher::{
@@ -34,9 +35,9 @@ pub use dispatcher::{
     QueueSnapshot, RegularDequeueOutcome, run_limiter_cleanup_until,
 };
 pub use html::{
-    TELEGRAM_PARSE_MODE_HTML, clean_unicode_non_printables, ensure_telegram_safe_text,
-    escape_telegram_html_text, extract_visible_text, is_valid_telegram_html,
-    sanitize_telegram_html, split_telegram_text, strip_telegram_html,
+    TELEGRAM_PARSE_MODE_HTML, clean_unicode_non_printables, decode_html_entities,
+    ensure_telegram_safe_text, escape_telegram_html_text, extract_visible_text,
+    is_valid_telegram_html, sanitize_telegram_html, split_telegram_text, strip_telegram_html,
 };
 pub use outbound::{
     AudioMessagePlan, AudioMessageRequest, AudioSource, CallbackAnswerRequest, ChatActionRequest,
@@ -90,7 +91,8 @@ pub use persistence::{
 pub use rate_limit::{ChatLimiters, DEFAULT_DISPATCH_INTERVAL, DEFAULT_RATE_LIMITER_MAX_IDLE};
 pub use transport::{
     TelegramOutboundMethod, TelegramOutboundMethodKind, TelegramOutboundResponse,
-    TelegramOutboundResponseKind, execute_telegram_method, send_telegram_method_status,
+    TelegramOutboundResponseKind, TelegramSendErrorClassification, classify_telegram_send_error,
+    execute_telegram_method, send_telegram_method_status, telegram_execute_error_is_reply_missing,
 };
 pub use update_startup::{
     GO_LONG_POLL_RETRY_DELAY, GO_LONG_POLL_TIMEOUT, GO_WEBHOOK_UPDATE_BUFFER_SIZE,
@@ -103,10 +105,8 @@ pub use update_startup::{
 
 pub const INTEGRATION_CRATE: &str = "carapax";
 
-/// `/help` command constant from the Go runtime.
 pub const HELP_COMMAND: &str = "help";
 
-/// `/donate` command constant from the Go runtime.
 pub const DONATE_COMMAND: &str = "donate";
 
 /// Re-exported `carapax` context type used to anchor the Telegram boundary.
@@ -123,6 +123,12 @@ pub type DeleteBotCommands = carapax::types::DeleteBotCommands;
 
 /// Telegram method that sets configured bot commands.
 pub type SetBotCommands = carapax::types::SetBotCommands;
+
+/// Telegram getMe method from `carapax`/`tgbot`.
+pub type GetBot = carapax::types::GetBot;
+
+/// Telegram bot identity returned by getMe.
+pub type Bot = carapax::types::Bot;
 
 /// Telegram getUpdates method from `carapax`.
 pub type GetUpdates = carapax::types::GetUpdates;
@@ -233,10 +239,28 @@ pub fn empty_context() -> CarapaxContext {
 
 /// Create a Telegram Bot API client through the mandated `carapax` integration.
 pub fn telegram_client(token: impl Into<String>) -> Result<TelegramClient, TelegramClientError> {
-    TelegramClient::new(token)
+    telegram_client_with_base_url(token, "")
 }
 
-/// Bot command scope used by the Go command setup.
+/// Create a Telegram Bot API client, optionally targeting a loopback/local Bot API host.
+pub fn telegram_client_with_base_url(
+    token: impl Into<String>,
+    base_url: impl AsRef<str>,
+) -> Result<TelegramClient, TelegramClientError> {
+    let client = TelegramClient::new(token)?;
+    let base_url = base_url.as_ref().trim().trim_end_matches('/');
+    if base_url.is_empty() {
+        Ok(client)
+    } else {
+        Ok(client.with_host(base_url.to_owned()))
+    }
+}
+
+#[must_use]
+pub const fn build_get_bot_method() -> GetBot {
+    carapax::types::GetBot
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CommandScope {
     /// All private chats.
@@ -282,7 +306,6 @@ impl CommandSpec {
     }
 }
 
-/// Commands for all private chats. Order matches `cmd/main.go`.
 pub const PRIVATE_COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         command: "reset",
@@ -310,7 +333,6 @@ pub const PRIVATE_COMMANDS: &[CommandSpec] = &[
     },
 ];
 
-/// Commands for all group chats. Order matches `cmd/main.go`.
 pub const GROUP_COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         command: "reset",
@@ -387,7 +409,6 @@ pub struct CommandSet {
     pub commands: &'static [CommandSpec],
 }
 
-/// All command sets applied during Go bot initialization.
 pub const COMMAND_SETS: &[CommandSet] = &[
     CommandSet {
         scope: CommandScope::Private,
@@ -408,7 +429,6 @@ pub fn delete_my_commands_method() -> DeleteBotCommands {
     DeleteBotCommands::default()
 }
 
-/// Build the three `setMyCommands` methods used by Go startup.
 pub fn set_my_commands_methods() -> Result<Vec<SetBotCommands>, BotCommandError> {
     COMMAND_SETS
         .iter()
@@ -432,10 +452,8 @@ pub struct CommandAliasGroup {
     pub aliases: &'static [&'static str],
 }
 
-/// Draw command aliases from the Go fetcher.
 pub const DRAW_ALIASES: &[&str] = &["нарисуй", "draw", "рисуй"];
 
-/// Edit command aliases from the Go fetcher.
 pub const EDIT_ALIASES: &[&str] = &[
     "изменить",
     "измени",
@@ -476,13 +494,10 @@ pub const EDIT_ALIASES: &[&str] = &[
     "tweak",
 ];
 
-/// Song command aliases from the Go fetcher.
 pub const SONG_ALIASES: &[&str] = &["song", "песня", "!song", "!песня"];
 
-/// Translation command aliases from the Go fetcher.
 pub const TRANSLATE_ALIASES: &[&str] = &["переведи", "перевод", "translate"];
 
-/// All command alias groups currently found in Go.
 pub const COMMAND_ALIAS_GROUPS: &[CommandAliasGroup] = &[
     CommandAliasGroup {
         name: "draw",
@@ -502,7 +517,6 @@ pub const COMMAND_ALIAS_GROUPS: &[CommandAliasGroup] = &[
     },
 ];
 
-/// Callback data action prefixes currently found in Go.
 pub const CALLBACK_ACTIONS: &[&str] = &[
     "back_to_vip_status",
     "cancel_vip",
@@ -520,15 +534,12 @@ pub const CALLBACK_ACTIONS: &[&str] = &[
     "dl_x",
 ];
 
-/// Go Telegram API constructor inventory entry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ApiConstructorUsage {
-    /// Go constructor name without the `api.New` prefix.
     pub name: &'static str,
     pub count: usize,
 }
 
-/// Go raw Bot API method inventory entry from `MakeRequest*` call sites.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RawApiMethodUsage {
     /// Raw Bot API method name.
@@ -664,9 +675,6 @@ pub const RAW_API_METHOD_USAGES: &[RawApiMethodUsage] = &[
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, BTreeSet};
-
-    use serde::Deserialize;
     use serde_json::json;
 
     use super::{
@@ -687,52 +695,6 @@ mod tests {
         delete_my_commands_method, empty_context, parse_callback_action, parse_callback_i64,
         set_my_commands_methods, settings_callback_ack_method,
     };
-
-    #[derive(Debug, Deserialize)]
-    struct TelegramInventory {
-        bot_commands: Vec<InventoryCommand>,
-        command_constants: Vec<String>,
-        command_aliases: BTreeMap<String, Vec<String>>,
-        callback_actions: Vec<String>,
-        api_constructors: Vec<InventoryApiConstructor>,
-        raw_api_methods: Vec<InventoryRawApiMethod>,
-    }
-
-    #[derive(Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
-    struct InventoryCommand {
-        scope: String,
-        command: String,
-        description: String,
-    }
-
-    #[derive(Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
-    struct InventoryApiConstructor {
-        name: String,
-        count: usize,
-    }
-
-    #[derive(Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
-    struct InventoryRawApiMethod {
-        method: String,
-        count: usize,
-    }
-
-    fn inventory() -> Result<TelegramInventory, serde_json::Error> {
-        serde_json::from_str(include_str!("../../../docs/contract/generated/telegram.json"))
-    }
-
-    fn rust_inventory_commands() -> BTreeSet<InventoryCommand> {
-        COMMAND_SETS
-            .iter()
-            .flat_map(|set| {
-                set.commands.iter().map(move |command| InventoryCommand {
-                    scope: set.scope.inventory_name().to_owned(),
-                    command: command.command.to_owned(),
-                    description: command.description.to_owned(),
-                })
-            })
-            .collect()
-    }
 
     #[test]
     fn telegram_boundary_uses_carapax() {
@@ -781,69 +743,6 @@ mod tests {
                 "settings"
             ]
         );
-    }
-
-    #[test]
-    fn command_sets_match_generated_go_inventory() -> Result<(), serde_json::Error> {
-        let expected = inventory()?
-            .bot_commands
-            .into_iter()
-            .collect::<BTreeSet<_>>();
-
-        assert_eq!(rust_inventory_commands(), expected);
-
-        Ok(())
-    }
-
-    #[test]
-    fn command_constants_match_generated_go_inventory() -> Result<(), serde_json::Error> {
-        let mut expected = inventory()?.command_constants;
-        expected.sort();
-
-        let mut actual = vec![DONATE_COMMAND.to_owned(), HELP_COMMAND.to_owned()];
-        actual.sort();
-
-        assert_eq!(actual, expected);
-
-        Ok(())
-    }
-
-    #[test]
-    fn command_aliases_match_generated_go_inventory() -> Result<(), serde_json::Error> {
-        let expected = inventory()?.command_aliases;
-        let actual = COMMAND_ALIAS_GROUPS
-            .iter()
-            .map(|group| {
-                (
-                    group.name.to_owned(),
-                    group
-                        .aliases
-                        .iter()
-                        .map(|alias| (*alias).to_owned())
-                        .collect::<Vec<_>>(),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-
-        assert_eq!(actual, expected);
-
-        Ok(())
-    }
-
-    #[test]
-    fn callback_actions_match_generated_go_inventory() -> Result<(), serde_json::Error> {
-        let expected = inventory()?
-            .callback_actions
-            .into_iter()
-            .collect::<BTreeSet<_>>();
-        let actual = CALLBACK_ACTIONS
-            .iter()
-            .map(|action| (*action).to_owned())
-            .collect::<BTreeSet<_>>();
-
-        assert_eq!(actual, expected);
-
-        Ok(())
     }
 
     #[test]
@@ -1372,44 +1271,6 @@ mod tests {
         assert!(payload.get("show_alert").is_none());
         assert!(payload.get("url").is_none());
         assert_eq!(payload["cache_time"], 10);
-    }
-
-    #[test]
-    fn api_constructor_usage_matches_generated_go_inventory() -> Result<(), serde_json::Error> {
-        let expected = inventory()?
-            .api_constructors
-            .into_iter()
-            .collect::<BTreeSet<_>>();
-        let actual = API_CONSTRUCTOR_USAGES
-            .iter()
-            .map(|usage| InventoryApiConstructor {
-                name: usage.name.to_owned(),
-                count: usage.count,
-            })
-            .collect::<BTreeSet<_>>();
-
-        assert_eq!(actual, expected);
-
-        Ok(())
-    }
-
-    #[test]
-    fn raw_api_method_usage_matches_generated_go_inventory() -> Result<(), serde_json::Error> {
-        let expected = inventory()?
-            .raw_api_methods
-            .into_iter()
-            .collect::<BTreeSet<_>>();
-        let actual = RAW_API_METHOD_USAGES
-            .iter()
-            .map(|usage| InventoryRawApiMethod {
-                method: usage.method.to_owned(),
-                count: usage.count,
-            })
-            .collect::<BTreeSet<_>>();
-
-        assert_eq!(actual, expected);
-
-        Ok(())
     }
 
     #[test]

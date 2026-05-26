@@ -1,14 +1,8 @@
-
 use serde::{Deserialize, Serialize};
 
 /// Public project name used in diagnostics and health responses.
 pub const PROJECT_NAME: &str = "openplotva";
 
-pub const REFERENCE_SOURCE_REPOSITORY: &str = "/Users/Shared/src/github.com/iamwavecut/reference-app";
-
-pub const INITIAL_REFERENCE_SOURCE_COMMIT: &str = "56506a95a749629235ecf1ea35c54d5a4172fdbd";
-
-/// Chat identity/state extracted by the Go update consumer before handling side effects.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChatState {
     /// Telegram chat ID.
@@ -22,12 +16,10 @@ pub struct ChatState {
     pub first_name: Option<String>,
     /// Private chat last name, when non-blank.
     pub last_name: Option<String>,
-    /// Forum flag. Go only writes this when Telegram reports it as true.
     pub is_forum: Option<bool>,
 }
 
 impl ChatState {
-    /// Build chat state while preserving Go's blank-field normalization.
     pub fn new(
         id: i64,
         chat_type: impl Into<String>,
@@ -54,16 +46,13 @@ impl ChatState {
     }
 }
 
-/// User identity/state extracted by the Go update consumer before handling side effects.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UserState {
     /// Telegram user ID.
     pub id: i64,
     /// Telegram first name.
     pub first_name: String,
-    /// Telegram last name. Go preserves present empty strings here.
     pub last_name: Option<String>,
-    /// Telegram username. Go preserves present empty strings here.
     pub username: Option<String>,
     /// Telegram language code, when non-blank.
     pub language_code: Option<String>,
@@ -72,7 +61,6 @@ pub struct UserState {
 }
 
 impl UserState {
-    /// Build user state while preserving Go's language-code blank normalization.
     pub fn new(
         id: i64,
         first_name: impl Into<String>,
@@ -102,7 +90,6 @@ pub struct UpdateState {
 }
 
 impl UpdateState {
-    /// Return `None` when both chat and user state are absent, matching Go no-op state updates.
     pub fn new(chat: Option<ChatState>, user: Option<UserState>) -> Option<Self> {
         if chat.is_none() && user.is_none() {
             None
@@ -112,43 +99,29 @@ impl UpdateState {
     }
 }
 
-/// Go `sharedtypes.SenderTypeUser`.
 pub const SENDER_TYPE_USER: &str = "user";
-/// Go `sharedtypes.SenderTypeChannel`.
 pub const SENDER_TYPE_CHANNEL: &str = "channel";
-/// Go `sharedtypes.SenderTypeSameChat`.
 pub const SENDER_TYPE_SAME_CHAT: &str = "same_chat";
-/// Go `sharedtypes.SenderTypeSystem`.
 pub const SENDER_TYPE_SYSTEM: &str = "system";
 
-/// Go `vip.EventTypePayment`.
 pub const VIP_EVENT_TYPE_PAYMENT: &str = "payment";
-/// Go `vip.EventTypeAdminAdjustment`.
 pub const VIP_EVENT_TYPE_ADMIN_ADJUSTMENT: &str = "admin_adjustment";
-/// Go `vip.EventTypeAdminRevoke`.
 pub const VIP_EVENT_TYPE_ADMIN_REVOKE: &str = "admin_revoke";
-/// Go `vip.EventTypeRefundReversal`.
 pub const VIP_EVENT_TYPE_REFUND_REVERSAL: &str = "refund_reversal";
-/// Go `vip.EventTypeLegacySubscriptionBackfill`.
 pub const VIP_EVENT_TYPE_LEGACY_SUBSCRIPTION_BACKFILL: &str = "legacy_subscription_backfill";
-/// Go `vip.EventTypeLegacyVIPCacheBackfill`.
 pub const VIP_EVENT_TYPE_LEGACY_VIP_CACHE_BACKFILL: &str = "legacy_vip_cache_backfill";
-/// Go `vip.SecondsPerDay`.
 pub const VIP_SECONDS_PER_DAY: i64 = 24 * 60 * 60;
 
-/// Return Go `vip.DaysToSeconds`.
 #[must_use]
 pub fn vip_days_to_seconds(days: i64) -> i64 {
     days * VIP_SECONDS_PER_DAY
 }
 
-/// Return Go `vip.IsSyntheticSubscriptionChargeID`.
 #[must_use]
 pub fn is_synthetic_subscription_charge_id(charge_id: &str) -> bool {
     charge_id.trim().starts_with("admin_grant_")
 }
 
-/// Return Go `vip.SubscriptionDeltaSeconds`.
 #[must_use]
 pub fn subscription_delta_seconds(
     charge_id: &str,
@@ -165,10 +138,8 @@ pub fn subscription_delta_seconds(
     (expires_at - created_at).whole_seconds()
 }
 
-/// Telegram sender identity after Go `utils.ResolveMessageSender` normalization.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct MessageSender {
-    /// Sender kind, one of the Go sender type constants.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub sender_type: String,
     /// Sender Telegram ID.
@@ -186,7 +157,6 @@ pub struct MessageSender {
 }
 
 impl MessageSender {
-    /// Build the Go system-sender zero path.
     #[must_use]
     pub fn system() -> Self {
         Self {
@@ -198,7 +168,6 @@ impl MessageSender {
         }
     }
 
-    /// Return Go `MessageSender.DisplayName`.
     #[must_use]
     pub fn display_name(&self) -> String {
         let full_name = self.full_name.trim();
@@ -228,7 +197,6 @@ impl Default for MessageSender {
     }
 }
 
-/// Go `sharedtypes.ToolCall` metadata stored with chat history entries.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct ToolCall {
     /// Tool name.
@@ -248,10 +216,25 @@ pub struct ToolCall {
     pub at: Option<String>,
 }
 
-/// Go `sharedtypes.ChatMessageMeta` stored with chat history and dialog jobs.
+#[must_use]
+pub fn is_terminator_tool_call_name(name: &str) -> bool {
+    let name = name.trim();
+    name.eq_ignore_ascii_case("final_response")
+        || name.eq_ignore_ascii_case("optimize_prompt_terminator")
+        || name.eq_ignore_ascii_case("optimize_edit_prompt_terminator")
+}
+
+#[must_use]
+pub fn filter_non_terminator_tool_calls(calls: &[ToolCall]) -> Vec<ToolCall> {
+    calls
+        .iter()
+        .filter(|call| !is_terminator_tool_call_name(&call.name))
+        .cloned()
+        .collect()
+}
+
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct ChatMessageMeta {
-    /// Message type, serialized as Go `type`.
     #[serde(default, rename = "type", skip_serializing_if = "String::is_empty")]
     pub message_type: String,
     /// Optional annotation.
@@ -280,7 +263,6 @@ pub struct ChatMessageMeta {
     pub tool_calls: Vec<ToolCall>,
 }
 
-/// Go `sharedtypes.ChatAttachment` metadata stored with chat history entries.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct ChatAttachment {
     /// Attachment kind, such as `image`, `audio`, or `contact`.
@@ -333,7 +315,6 @@ pub struct ChatAttachment {
     pub user_id: i64,
 }
 
-/// Go `chat_settings` fields used by permission and settings behavior.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChatSettings {
     /// Telegram chat ID.
@@ -356,16 +337,12 @@ pub struct ChatSettings {
     pub enable_profanity: bool,
     /// Whether join greetings are enabled.
     pub enable_greet_joiners: bool,
-    /// Whether the daily game is enabled. Go keeps this nullable in stored rows.
     pub enable_daily_game: Option<bool>,
-    /// Daily game theme. Go defaults blank or missing values to `auto` on permission updates.
     pub daily_game_theme: Option<String>,
-    /// Greeting HTML. Go permission updates leave this unset.
     pub greeting_html: Option<String>,
 }
 
 impl ChatSettings {
-    /// Build Go default chat settings from `internal/db/defaults.Settings`.
     pub fn defaults(chat_id: i64) -> Self {
         Self {
             chat_id,
@@ -385,7 +362,6 @@ impl ChatSettings {
     }
 }
 
-/// Go `UpsertChatSettingsParams` shape used when permission errors auto-disable replies.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChatSettingsUpdate {
     /// Telegram chat ID.
@@ -414,8 +390,19 @@ pub struct ChatSettingsUpdate {
     pub enable_daily_game: bool,
     /// Daily game theme.
     pub daily_game_theme: String,
-    /// Greeting HTML. Go permission updates leave this unset.
     pub greeting_html: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UserSettings {
+    /// Telegram user ID.
+    pub user_id: i64,
+    /// Whether random group reactivity is disabled for this user.
+    pub disable_random_reactivity: bool,
+    /// Whether original draw prompts are hidden for this user.
+    pub hide_original_draw_prompt: bool,
+    /// Last update timestamp.
+    pub updated: time::OffsetDateTime,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -426,16 +413,13 @@ pub struct PendingOp {
     pub vmsg_id: String,
     /// Telegram chat ID.
     pub chat_id: i64,
-    /// Operation kind, currently `edit` or `delete` in Go.
     pub op: String,
     /// Operation payload, if any.
     pub payload: Vec<u8>,
-    /// Number of attempts recorded by Go storage.
     pub attempts: i32,
 }
 
 impl PendingOp {
-    /// Build a pending op with the fields used by the Go mapping helpers.
     pub fn new(id: i64, vmsg_id: impl Into<String>, chat_id: i64, op: impl Into<String>) -> Self {
         Self {
             id,
@@ -491,7 +475,6 @@ pub struct ReadyPendingOp {
     pub vmsg_id: String,
     /// Telegram chat ID.
     pub chat_id: i64,
-    /// Operation kind, currently `edit` or `delete` in Go.
     pub op: String,
     /// Operation payload, if any.
     pub payload: Vec<u8>,
@@ -499,7 +482,6 @@ pub struct ReadyPendingOp {
     pub real_message_id: i32,
 }
 
-/// Decoded Go pending edit payload.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
 pub struct PendingEditPayload {
     /// Edited text.
@@ -510,7 +492,6 @@ pub struct PendingEditPayload {
     pub parse_mode: String,
 }
 
-/// Decode Go's pending edit payload, returning zero-values on malformed JSON.
 pub fn pending_edit_payload(payload: &[u8]) -> PendingEditPayload {
     serde_json::from_slice(payload).unwrap_or_default()
 }
@@ -530,12 +511,12 @@ fn is_false(value: &bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChatSettings, ChatState, MessageSender, PendingEditPayload, UserState,
+        ChatSettings, ChatState, MessageSender, PendingEditPayload, ToolCall, UserState,
         VIP_EVENT_TYPE_ADMIN_ADJUSTMENT, VIP_EVENT_TYPE_ADMIN_REVOKE,
         VIP_EVENT_TYPE_LEGACY_SUBSCRIPTION_BACKFILL, VIP_EVENT_TYPE_LEGACY_VIP_CACHE_BACKFILL,
-        VIP_EVENT_TYPE_PAYMENT, VIP_EVENT_TYPE_REFUND_REVERSAL,
-        is_synthetic_subscription_charge_id, pending_edit_payload, subscription_delta_seconds,
-        vip_days_to_seconds,
+        VIP_EVENT_TYPE_PAYMENT, VIP_EVENT_TYPE_REFUND_REVERSAL, filter_non_terminator_tool_calls,
+        is_synthetic_subscription_charge_id, is_terminator_tool_call_name, pending_edit_payload,
+        subscription_delta_seconds, vip_days_to_seconds,
     };
 
     #[test]
@@ -577,6 +558,47 @@ mod tests {
             "99"
         );
         assert_eq!(MessageSender::system().display_name(), "Telegram");
+    }
+
+    #[test]
+    fn tool_call_terminator_filter_matches_go_names() {
+        assert!(is_terminator_tool_call_name("final_response"));
+        assert!(is_terminator_tool_call_name(" optimize_prompt_terminator "));
+        assert!(is_terminator_tool_call_name(
+            "OPTIMIZE_EDIT_PROMPT_TERMINATOR"
+        ));
+        assert!(!is_terminator_tool_call_name("draw_image"));
+        assert!(!is_terminator_tool_call_name(""));
+
+        let filtered = filter_non_terminator_tool_calls(&[
+            ToolCall {
+                name: "web_search".to_owned(),
+                ..ToolCall::default()
+            },
+            ToolCall {
+                name: "final_response".to_owned(),
+                ..ToolCall::default()
+            },
+            ToolCall {
+                name: "draw_image".to_owned(),
+                ..ToolCall::default()
+            },
+        ]);
+
+        assert_eq!(
+            filtered
+                .iter()
+                .map(|call| call.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["web_search", "draw_image"]
+        );
+        assert!(
+            filter_non_terminator_tool_calls(&[ToolCall {
+                name: "final_response".to_owned(),
+                ..ToolCall::default()
+            }])
+            .is_empty()
+        );
     }
 
     #[test]
@@ -683,7 +705,7 @@ mod tests {
         assert_eq!(
             subscription_delta_seconds("telegram-charge", created_at, expires_at, 30),
             2_592_000,
-            "Go uses the configured default duration for paid Telegram charges"
+            "Paid Telegram charges use the configured default duration"
         );
         assert_eq!(
             subscription_delta_seconds("admin_grant_42", created_at, expires_at, 30),
@@ -693,7 +715,7 @@ mod tests {
         assert_eq!(
             subscription_delta_seconds("admin_grant_42", expires_at, created_at, 30),
             0,
-            "Go clamps inverted synthetic admin grants to zero seconds"
+            "Inverted synthetic admin grants clamp to zero seconds"
         );
 
         Ok(())

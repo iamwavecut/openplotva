@@ -15,25 +15,16 @@ use crate::{
 
 pub type CallbackActionData = BTreeMap<String, String>;
 
-/// Go delete-drawing callback action: initialize deletion.
 pub const DELETE_DRAWING_ACTION_INIT: &str = "del_i";
-/// Go delete-drawing callback action: confirm all deletion.
 pub const DELETE_DRAWING_ACTION_CONFIRM: &str = "del_c";
-/// Go delete-drawing callback action: pick one frame.
 pub const DELETE_DRAWING_ACTION_FRAME_PICK: &str = "del_fp";
-/// Go delete-drawing callback action: confirm one frame.
 pub const DELETE_DRAWING_ACTION_FRAME_CONFIRM: &str = "del_fc";
-/// Go delete-drawing callback action: close controls.
 pub const DELETE_DRAWING_ACTION_CLOSE: &str = "del_x";
 
-/// Go delete-lyrics callback action: initialize deletion.
 pub const DELETE_LYRICS_ACTION_INIT: &str = "dl_i";
-/// Go delete-lyrics callback action: confirm deletion.
 pub const DELETE_LYRICS_ACTION_CONFIRM: &str = "dl_c";
-/// Go delete-lyrics callback action generated in keyboards but not routed by Go.
 pub const DELETE_LYRICS_ACTION_CLOSE: &str = "dl_x";
 
-/// Result of parsing callback data while preserving Go's ack-routing split.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CallbackActionParse {
     /// JSON callback data with an `action` or short `a` key.
@@ -79,12 +70,9 @@ pub enum CallbackHandlerKind {
     DeleteLyrics,
 }
 
-/// Go `processCallbackQuery` decision before concrete handler side effects.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CallbackQueryRoute {
-    /// Callback query had no associated message, so Go only acknowledges it.
     AckOrphan,
-    /// Chat is rate-limited; Go skips callback handling without acknowledging.
     SkipRateLimited,
     /// Callback data was empty and should receive an empty acknowledgement.
     AckEmptyData,
@@ -100,14 +88,12 @@ pub enum CallbackQueryRoute {
         /// Parsed callback data.
         data: CallbackActionData,
     },
-    /// Callback data had an action but there is no Go handler for it.
     AckUnknownAction {
         /// Unhandled action value.
         action: String,
     },
     /// Callback data should be dispatched to a concrete handler group.
     Handle {
-        /// Go handler group.
         handler: CallbackHandlerKind,
         /// Resolved action value.
         action: String,
@@ -116,7 +102,6 @@ pub enum CallbackQueryRoute {
     },
 }
 
-/// Parse Go fetcher callback data, accepting long `action` and short `a` keys.
 #[must_use]
 pub fn parse_callback_action(raw: &str) -> CallbackActionParse {
     let Ok(data) = serde_json::from_str::<CallbackActionData>(raw) else {
@@ -130,7 +115,6 @@ pub fn parse_callback_action(raw: &str) -> CallbackActionParse {
     CallbackActionParse::Actionless(data)
 }
 
-/// Parse Go callback integer fields, returning zero for blank or invalid input.
 #[must_use]
 pub fn parse_callback_i64(raw: &str) -> i64 {
     let raw = raw.trim();
@@ -140,7 +124,6 @@ pub fn parse_callback_i64(raw: &str) -> i64 {
     raw.parse().unwrap_or(0)
 }
 
-/// Encode Go delete-drawing callback data with stable field order.
 #[must_use]
 pub fn delete_drawing_callback_data(
     action: &str,
@@ -165,7 +148,6 @@ pub fn delete_drawing_callback_data(
     .expect("delete drawing callback data serialization cannot fail")
 }
 
-/// Encode Go delete-lyrics callback data with stable field order.
 #[must_use]
 pub fn delete_lyrics_callback_data(action: &str, user_id: i64, chat_id: i64) -> String {
     serde_json::to_string(&DeleteCallbackData {
@@ -176,7 +158,6 @@ pub fn delete_lyrics_callback_data(action: &str, user_id: i64, chat_id: i64) -> 
     .expect("delete lyrics callback data serialization cannot fail")
 }
 
-/// Build Go `buildDeleteDrawingInitialKeyboard` inline controls.
 #[must_use]
 pub fn build_delete_drawing_initial_keyboard(user_id: i64, chat_id: i64) -> InlineKeyboardMarkup {
     build_inline_keyboard_markup([build_inline_keyboard_row([
@@ -191,7 +172,6 @@ pub fn build_delete_drawing_initial_keyboard(user_id: i64, chat_id: i64) -> Inli
     ])])
 }
 
-/// Build Go `buildDeleteDrawingConfirmKeyboard` inline controls.
 #[must_use]
 pub fn build_delete_drawing_confirm_keyboard(user_id: i64, chat_id: i64) -> InlineKeyboardMarkup {
     build_inline_keyboard_markup([build_inline_keyboard_row([
@@ -206,7 +186,6 @@ pub fn build_delete_drawing_confirm_keyboard(user_id: i64, chat_id: i64) -> Inli
     ])])
 }
 
-/// Build Go `buildDeleteDrawingFramePickerKeyboard` inline controls.
 #[must_use]
 pub fn build_delete_drawing_frame_picker_keyboard(
     user_id: i64,
@@ -236,7 +215,6 @@ pub fn build_delete_drawing_frame_picker_keyboard(
     build_inline_keyboard_markup(chunk_inline_keyboard_buttons(buttons, 5))
 }
 
-/// Build Go `buildDeleteDrawingFrameConfirmKeyboard` inline controls.
 #[must_use]
 pub fn build_delete_drawing_frame_confirm_keyboard(
     user_id: i64,
@@ -260,7 +238,6 @@ pub fn build_delete_drawing_frame_confirm_keyboard(
     ])])
 }
 
-/// Build Go `buildLyricsDeleteKeyboard` inline controls.
 #[must_use]
 pub fn build_lyrics_delete_keyboard(user_id: i64, chat_id: i64) -> InlineKeyboardMarkup {
     build_inline_keyboard_markup([build_inline_keyboard_row([
@@ -271,7 +248,6 @@ pub fn build_lyrics_delete_keyboard(user_id: i64, chat_id: i64) -> InlineKeyboar
     ])])
 }
 
-/// Build Go `buildLyricsDeleteConfirmKeyboard` inline controls.
 #[must_use]
 pub fn build_lyrics_delete_confirm_keyboard(user_id: i64, chat_id: i64) -> InlineKeyboardMarkup {
     build_inline_keyboard_markup([build_inline_keyboard_row([
@@ -284,6 +260,24 @@ pub fn build_lyrics_delete_confirm_keyboard(user_id: i64, chat_id: i64) -> Inlin
             delete_lyrics_callback_data(DELETE_LYRICS_ACTION_CLOSE, user_id, chat_id),
         ),
     ])])
+}
+
+#[must_use]
+pub fn build_checkin_theme_selection_keyboard(user_id: i64) -> InlineKeyboardMarkup {
+    let buttons = [
+        ("Король горы", "king"),
+        ("Пидор дня", "pidor"),
+        ("Котик дня", "kotik"),
+        ("Чиновник дня", "lucky"),
+    ];
+    build_inline_keyboard_markup(buttons.chunks(2).map(|chunk| {
+        build_inline_keyboard_row(chunk.iter().map(|(text, key)| {
+            build_inline_keyboard_button_data(
+                *text,
+                format!(r#"{{"a":"cts","t":"{key}","i":"{user_id}"}}"#),
+            )
+        }))
+    }))
 }
 
 fn chunk_inline_keyboard_buttons(
@@ -318,7 +312,6 @@ struct DeleteDrawingCallbackDataWithFrame<'a> {
     frame_num: String,
 }
 
-/// Classify a callback query according to Go `processCallbackQuery` pre-handler order.
 #[must_use]
 pub fn callback_query_route(
     has_message: bool,
@@ -356,7 +349,6 @@ pub fn callback_query_route(
     }
 }
 
-/// Build the direct callback acknowledgement used by Go for terminal ack routes.
 #[must_use]
 pub fn callback_query_ack_request(
     callback_query_id: impl Into<String>,
@@ -390,7 +382,6 @@ pub fn callback_query_ack_method(
         .map(|request| TelegramOutboundMethod::from(build_callback_answer_method(&request)))
 }
 
-/// Build Go's cached empty acknowledgement for settings callbacks.
 #[must_use]
 pub fn settings_callback_ack_method(
     callback_query_id: impl Into<String>,
@@ -404,7 +395,6 @@ pub fn settings_callback_ack_method(
     }))
 }
 
-/// Return the Go callback handler group for an action.
 #[must_use]
 pub fn callback_handler_for_action(action: &str) -> Option<CallbackHandlerKind> {
     match action {
@@ -442,7 +432,6 @@ pub fn checkin_theme_callback_theme(data: &CallbackActionData) -> &str {
     data.get("t").map_or("", String::as_str)
 }
 
-/// Return Go's check-in theme selection alert and whether selection is blocked.
 #[must_use]
 pub fn checkin_theme_selection_alert(
     user_id: i64,
@@ -459,7 +448,6 @@ pub fn checkin_theme_selection_alert(
     }
 }
 
-/// Build Go's check-in theme selection callback acknowledgement or alert.
 #[must_use]
 pub fn checkin_theme_selection_ack_method(
     callback_query_id: impl Into<String>,
@@ -478,4 +466,44 @@ pub fn checkin_theme_selection_ack_method(
         TelegramOutboundMethod::from(build_callback_answer_method(&request)),
         blocked,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn checkin_theme_selection_keyboard_matches_go_payloads() {
+        let value = serde_json::to_value(build_checkin_theme_selection_keyboard(42))
+            .expect("serialize keyboard");
+
+        assert_eq!(
+            value,
+            json!({
+                "inline_keyboard": [
+                    [
+                        {
+                            "text": "Король горы",
+                            "callback_data": "{\"a\":\"cts\",\"t\":\"king\",\"i\":\"42\"}"
+                        },
+                        {
+                            "text": "Пидор дня",
+                            "callback_data": "{\"a\":\"cts\",\"t\":\"pidor\",\"i\":\"42\"}"
+                        }
+                    ],
+                    [
+                        {
+                            "text": "Котик дня",
+                            "callback_data": "{\"a\":\"cts\",\"t\":\"kotik\",\"i\":\"42\"}"
+                        },
+                        {
+                            "text": "Чиновник дня",
+                            "callback_data": "{\"a\":\"cts\",\"t\":\"lucky\",\"i\":\"42\"}"
+                        }
+                    ]
+                ]
+            })
+        );
+    }
 }

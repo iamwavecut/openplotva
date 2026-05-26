@@ -16,10 +16,8 @@ use crate::{
     hash_content, parse_mode_from_go,
 };
 
-/// Go Redis key used for dispatcher shutdown queue persistence.
 pub const DEFAULT_DISPATCHER_QUEUE_KEY: &str = "plotva:message_queue";
 
-/// Go dispatcher shutdown timeout before queue persistence is abandoned.
 pub const DEFAULT_DISPATCHER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Error returned while saving, loading, or converting dispatcher queue persistence.
@@ -40,14 +38,11 @@ pub enum DispatcherPersistenceError {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PersistentDispatcherItem {
-    /// JSON-encoded Telegram message/method payload, serialized as base64 like Go `[]byte`.
     #[serde(with = "go_byte_slice")]
     pub message: Vec<u8>,
-    /// Go message config type string used by the queue loader.
     pub message_type: String,
     /// Whether this item came from the immediate queue.
     pub immediate: bool,
-    /// Wall-clock enqueue time in RFC3339 form, matching Go `time.Time` JSON.
     pub enqueued_at: String,
     /// Dedupe fingerprint string.
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -57,16 +52,13 @@ pub struct PersistentDispatcherItem {
     /// Virtual message ID, when the send path created one.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub virtual_id: String,
-    /// Rust-native preservation of Go `BypassChatRestrictions` after enqueue-time checks.
     #[serde(default, skip_serializing_if = "is_false")]
     pub bypass_chat_restrictions: bool,
-    /// Rust-native preservation of Go ephemeral delete timing after enqueue.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ephemeral_delete_after_ms: Option<u64>,
 }
 
 impl PersistentDispatcherItem {
-    /// Return the Rust outbound method kind implied by the Go message type string.
     pub fn method_kind(&self) -> Option<TelegramOutboundMethodKind> {
         message_type_method_kind(&self.message_type)
     }
@@ -117,7 +109,6 @@ pub struct PersistentDispatcherQueue {
 pub struct PersistentDispatcherReplay {
     /// Items ready to restore into the dispatcher queue.
     pub items: Vec<DispatcherRestoredMessage>,
-    /// Number of persistent items skipped because Go would fail to decode them.
     pub skipped: usize,
 }
 
@@ -133,7 +124,6 @@ pub struct PersistentDispatcherRestoreReport {
     pub skipped: usize,
 }
 
-/// Redis-backed store for the Go dispatcher queue persistence key.
 #[derive(Clone, Debug)]
 pub struct RedisDispatcherQueueStore {
     client: RedisClient,
@@ -142,7 +132,6 @@ pub struct RedisDispatcherQueueStore {
 }
 
 impl RedisDispatcherQueueStore {
-    /// Create a store using the Go dispatcher queue key and max-message cap.
     pub fn new(client: RedisClient, key: impl Into<String>, max_messages: usize) -> Self {
         Self {
             client,
@@ -156,7 +145,6 @@ impl RedisDispatcherQueueStore {
         &self.key
     }
 
-    /// Load Redis replay data into the dispatcher queue using Go startup semantics.
     pub async fn load_into_queue(
         &self,
         queue: &DispatcherQueue,
@@ -179,7 +167,6 @@ impl RedisDispatcherQueueStore {
         Ok(queue)
     }
 
-    /// Drain the dispatcher queue and persist it with Go graceful-shutdown semantics.
     pub async fn save_queue_on_shutdown(
         &self,
         queue: &DispatcherQueue,
@@ -202,7 +189,6 @@ impl RedisDispatcherQueueStore {
         Ok(())
     }
 
-    /// Load replayable queue items from Redis and delete the key like Go `LoadQueue`.
     pub async fn load_replay(
         &self,
     ) -> Result<Option<PersistentDispatcherReplay>, DispatcherPersistenceError> {
@@ -267,7 +253,6 @@ pub fn persistent_queue_replay_from_redis_value(
     persistent_queue_replay_from_json(value)
 }
 
-/// Apply decoded replay items to a dispatcher queue like Go `Dispatcher.Start`.
 pub fn restore_persistent_queue_replay(
     queue: &DispatcherQueue,
     replay: PersistentDispatcherReplay,

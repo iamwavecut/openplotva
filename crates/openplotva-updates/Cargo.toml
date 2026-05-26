@@ -8,18 +8,17 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+anyhow.workspace = true
 carapax.workspace = true
+clap = { workspace = true, features = ["derive"] }
 openplotva-core = { path = "../openplotva-core" }
 redis = { workspace = true, features = ["tokio-comp"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 thiserror.workspace = true
 time = { workspace = true, features = ["formatting"] }
-tokio = { workspace = true, features = ["time"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 zstd.workspace = true
-
-[dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]
 workspace = true

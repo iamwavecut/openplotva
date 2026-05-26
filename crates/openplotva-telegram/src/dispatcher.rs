@@ -14,19 +14,15 @@ use crate::{
     TelegramOutboundMethodKind, send_telegram_method_status,
 };
 
-/// Go default interval for dispatcher limiter cleanup ticks.
 pub const DEFAULT_DISPATCHER_CLEANUP_INTERVAL: Duration = Duration::from_secs(10 * 60);
 
-/// Go outbound dispatcher queue settings currently ported to Rust.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DispatcherConfig {
-    /// Maximum items retained in each queue. `0` means unbounded, matching Go.
     pub max_queue_size: usize,
     /// Regular-queue duplicate suppression settings.
     pub dedupe_config: DebouncerConfig,
 }
 
-/// Go outbound dispatcher runtime lifecycle settings ported to Rust.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DispatcherRuntimeConfig {
     /// Interval between idle per-chat limiter cleanup passes.
@@ -45,7 +41,6 @@ impl Default for DispatcherRuntimeConfig {
 }
 
 impl DispatcherRuntimeConfig {
-    /// Cleanup interval with Go's zero-value default applied.
     pub fn cleanup_interval(self) -> Duration {
         if self.cleanup_interval.is_zero() {
             DEFAULT_DISPATCHER_CLEANUP_INTERVAL
@@ -54,7 +49,6 @@ impl DispatcherRuntimeConfig {
         }
     }
 
-    /// Per-chat limiter max idle duration with Go's zero-value default applied.
     pub fn rate_limiter_max_idle(self) -> Duration {
         if self.rate_limiter_max_idle.is_zero() {
             DEFAULT_RATE_LIMITER_MAX_IDLE
@@ -101,13 +95,11 @@ impl DispatcherMessage {
         self
     }
 
-    /// Preserve Go `BypassChatRestrictions` for Rust dispatcher-time permission checks.
     pub fn with_bypass_chat_restrictions(mut self, bypass: bool) -> Self {
         self.bypass_chat_restrictions = bypass;
         self
     }
 
-    /// Preserve Go `SendEphemeral*` delete timing for post-send tracking.
     pub fn with_ephemeral_delete_after(mut self, duration: Duration) -> Self {
         self.ephemeral_delete_after = Some(duration);
         self
@@ -116,7 +108,6 @@ impl DispatcherMessage {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DispatcherPersistencePayload {
-    /// Go message config type string used by the queue loader.
     pub message_type: String,
     /// JSON-encoded Telegram message/method payload.
     pub message: Vec<u8>,
@@ -163,9 +154,7 @@ pub enum RegularDequeueOutcome {
 /// Result returned by an outbound transport after trying to send a queued item.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DispatcherSendStatus {
-    /// Transport accepted the message and Go would increment processed stats.
     Sent,
-    /// Transport returned an error and Go would leave processed stats unchanged.
     Failed,
 }
 
@@ -195,7 +184,6 @@ pub enum DispatcherWorkerLoopOutcome {
     Stopped,
 }
 
-/// Inspectable queue item matching the Go dispatcher's persisted item metadata.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DispatcherQueuedMessage {
     /// Telegram chat ID used by the regular dispatch rate limiter.
@@ -209,7 +197,6 @@ pub struct DispatcherQueuedMessage {
     /// Enqueue time used for oldest-age statistics.
     pub added_at: Instant,
     pub enqueued_at: SystemTime,
-    /// Duration after successful send before Go-style ephemeral cleanup should delete it.
     pub ephemeral_delete_after: Option<Duration>,
 }
 
@@ -238,7 +225,6 @@ impl DispatcherWorkItem {
         self.bypass_chat_restrictions
     }
 
-    /// Return the Go-style ephemeral delete timing carried by this queued item.
     pub fn ephemeral_delete_after(&self) -> Option<Duration> {
         self.ephemeral_delete_after
     }
@@ -273,7 +259,6 @@ impl DispatcherWorkItem {
 
 #[derive(Debug)]
 pub struct DispatcherRestoredMessage {
-    /// Fingerprint used to re-apply Go startup deduplication.
     pub fingerprint: MessageFingerprint,
     /// Persisted dedupe key string to keep future shutdown snapshots stable.
     pub fingerprint_key: String,
@@ -286,9 +271,7 @@ pub struct DispatcherRestoredMessage {
     /// Concrete Telegram method to replay.
     pub method: TelegramOutboundMethod,
     pub persistence_payload: Option<DispatcherPersistencePayload>,
-    /// Whether the original send path bypassed Go chat restriction checks.
     pub bypass_chat_restrictions: bool,
-    /// Duration after successful send before Go-style ephemeral cleanup should delete it.
     pub ephemeral_delete_after: Option<Duration>,
 }
 
@@ -300,10 +283,8 @@ pub struct QueueSnapshot {
     pub immediate: Vec<DispatcherQueuedMessage>,
 }
 
-/// Work items drained during dispatcher shutdown, preserving Go persistence order.
 #[derive(Debug, Default)]
 pub struct DispatcherDrain {
-    /// Immediate queue items, oldest first. Go persists these before regular items.
     pub immediate: Vec<DispatcherWorkItem>,
     /// Regular queue items, oldest first.
     pub regular: Vec<DispatcherWorkItem>,
@@ -321,7 +302,6 @@ impl DispatcherDrain {
     }
 }
 
-/// Go dispatcher statistics ported for the queue layer.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DispatcherStats {
     /// Number of queued regular messages.
@@ -330,7 +310,6 @@ pub struct DispatcherStats {
     pub immediate_queue_size: usize,
     /// Number of successfully processed messages.
     pub processed_total: i64,
-    /// Go's combined dispatcher and debouncer dedupe count.
     pub deduped_total: i64,
     /// Age of the oldest regular queue item.
     pub oldest_regular_age: Duration,
@@ -704,7 +683,6 @@ impl DispatcherQueue {
         .await
     }
 
-    /// Put a deferred regular item back at the front, matching Go wait-error handling.
     pub fn requeue_regular_front(&self, message: DispatcherWorkItem) {
         self.state().regular.push_front(DispatcherQueueItem {
             metadata: message.metadata,
@@ -722,7 +700,6 @@ impl DispatcherQueue {
         state.processed_total += 1;
     }
 
-    /// Record a send attempt, incrementing processed stats only on success like Go.
     pub fn record_send_result(&self, sent: bool) {
         if sent {
             self.record_processed();
