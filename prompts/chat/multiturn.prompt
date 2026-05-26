@@ -1,0 +1,5 @@
+{{role "system"}}
+{{>system}}
+{{>system_multiturn}}
+{{role "user"}}
+{{>persona}}

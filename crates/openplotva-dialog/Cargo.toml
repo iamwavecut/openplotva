@@ -7,6 +7,11 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+[dependencies]
+openplotva-core = { path = "../openplotva-core" }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+time = { workspace = true, features = ["formatting", "serde"] }
+
 [lints]
 workspace = true
-

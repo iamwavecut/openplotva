@@ -1,0 +1,25 @@
+<meta{{#if Type}} type="{{Type}}"{{/if}}>
+  {{~#if Annotation}}<annotation>{{Annotation}}</annotation>{{/if}}
+  {{~#if VisionDescription}}<vision_description>{{VisionDescription}}</vision_description>{{/if}}
+  {{~#if Attachments}}
+  <attachments>
+    {{~#each Attachments}}
+    <attachment{{#if Kind}} kind="{{Kind}}"{{/if}}{{#if Source}} source="{{Source}}"{{/if}}{{#if MimeType}} mime="{{MimeType}}"{{/if}}>
+      {{~#if FileID}}<file_id>{{FileID}}</file_id>{{/if}}
+      {{~#if FileName}}<file_name>{{FileName}}</file_name>{{/if}}
+      {{~#if Caption}}<caption>{{Caption}}</caption>{{/if}}
+      {{~#if DurationSeconds}}<duration>{{DurationSeconds}}</duration>{{/if}}
+      {{~#if Performer}}<performer>{{Performer}}</performer>{{/if}}
+      {{~#if Title}}<title>{{Title}}</title>{{/if}}
+      {{~#if Phone}}<phone>{{Phone}}</phone>{{/if}}
+      {{~#if FirstName}}<first_name>{{FirstName}}</first_name>{{/if}}
+      {{~#if LastName}}<last_name>{{LastName}}</last_name>{{/if}}
+      {{~#if HasGeo}}
+      <geo{{#if Lat}} lat="{{Lat}}"{{/if}}{{#if Lon}} lon="{{Lon}}"{{/if}}/>
+      {{~/if}}
+      {{~#if Content}}<content>{{Content}}</content>{{/if}}
+    </attachment>
+    {{~/each}}
+  </attachments>
+  {{~/if}}
+</meta>

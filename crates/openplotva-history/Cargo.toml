@@ -10,3 +10,11 @@ publish = false
 [lints]
 workspace = true
 
+[dependencies]
+openplotva-core = { path = "../openplotva-core" }
+openplotva-dialog = { path = "../openplotva-dialog" }
+hex.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sha2.workspace = true
+time = { workspace = true, features = ["formatting", "parsing", "serde"] }

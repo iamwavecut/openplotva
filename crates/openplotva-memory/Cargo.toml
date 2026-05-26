@@ -10,3 +10,15 @@ publish = false
 [lints]
 workspace = true
 
+[dependencies]
+base64.workspace = true
+reqwest.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+time = { workspace = true, features = ["formatting", "parsing", "serde"] }
+tokio = { workspace = true, features = ["time"] }
+url.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

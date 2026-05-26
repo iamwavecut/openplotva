@@ -7,6 +7,27 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+[dependencies]
+openplotva-core = { path = "../openplotva-core" }
+openplotva-dialog = { path = "../openplotva-dialog" }
+openplotva-history = { path = "../openplotva-history" }
+openplotva-media = { path = "../openplotva-media" }
+openplotva-memory = { path = "../openplotva-memory" }
+openplotva-prompts = { path = "../openplotva-prompts" }
+base64.workspace = true
+hex.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+time = { workspace = true, features = ["formatting"] }
+tokio = { workspace = true, features = ["rt", "time"] }
+url.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
 [lints]
 workspace = true
-

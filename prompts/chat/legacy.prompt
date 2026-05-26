@@ -1,0 +1,10 @@
+{{role "system"}}
+{{>system}}
+{{role "user"}}
+{{>persona}}
+{{#if historyXML}}
+{{{historyXML}}}
+{{/if}}
+{{#if lastMessageXML}}
+{{{lastMessageXML}}}
+{{/if}}

@@ -10,3 +10,16 @@ publish = false
 [lints]
 workspace = true
 
+[dependencies]
+base64.workspace = true
+openplotva-prompts = { path = "../openplotva-prompts" }
+regex.workspace = true
+reqwest.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["time"] }
+url.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

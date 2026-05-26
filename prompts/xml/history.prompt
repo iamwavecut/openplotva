@@ -1,0 +1,5 @@
+<history usage="reference-only" note="контекст для связности; не отвечай на эти сообщения напрямую">
+{{#each Messages}}
+  {{>message}}
+{{/each}}
+</history>

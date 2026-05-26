@@ -1,0 +1,11 @@
+<{{Tag}} id="{{ID}}"{{#if ThreadID}} thread_id="{{ThreadID}}"{{/if}}{{#if Timestamp}} timestamp="{{Timestamp}}"{{/if}}>
+  {{~#if User}}<{{RoleTag}}>{{User}}</{{RoleTag}}>{{/if}}
+  {{~#if Reply}}
+  <reply{{#if Reply.ToID}} to_id="{{Reply.ToID}}"{{/if}}>
+    {{~#if Reply.ToUser}}<to_user>{{Reply.ToUser}}</to_user>{{/if}}
+  </reply>
+  {{~/if}}
+  {{~#if Text}}<text>{{Text}}</text>{{else}}{{#if ShowEmpty}}<no_text></no_text>{{/if}}{{/if}}
+  {{~#if Original}}<original>{{Original}}</original>{{/if}}
+  {{~#if Meta}}{{#with Meta}}{{>meta}}{{/with}}{{/if}}
+</{{Tag}}>
