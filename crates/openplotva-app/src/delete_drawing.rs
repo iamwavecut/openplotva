@@ -1279,7 +1279,7 @@ pub fn delete_drawing_command_plan(
     DeleteDrawingCommandPlan::Control(control_plan(message, user_id, generation))
 }
 
-///
+/// Return whether a message is a delete-drawing command.
 /// so group commands targeted at any bot are still consumed.
 #[must_use]
 pub fn is_delete_drawing_command(message: &TelegramMessage) -> bool {

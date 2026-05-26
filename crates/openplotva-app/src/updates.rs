@@ -576,7 +576,7 @@ where
     }
 }
 
-///
+/// Persist update history before and after invoking the update handler.
 /// History failures are logged and returned in the report but do not prevent
 pub async fn handle_update_with_history<S, HandleFn, HandleFuture, HandleError>(
     store: &S,

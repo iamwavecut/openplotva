@@ -591,7 +591,7 @@ mod tests {
     fn optimizer_prompt_rendering_and_tool_schemas_match_go_contract() {
         let prompt = render_image_optimizer_prompt(2).expect("render image optimizer prompt");
         assert!(prompt.contains("optimize_prompt_terminator"));
-        assert!(prompt.contains("must contain exactly `2` rewritten prompts"));
+        assert!(prompt.contains("must contain exactly `2` optimized prompts"));
 
         let edit_prompt =
             render_image_edit_optimizer_prompt(0).expect("render image edit optimizer prompt");

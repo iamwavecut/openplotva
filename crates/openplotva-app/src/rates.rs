@@ -2340,7 +2340,10 @@ mod tests {
         assert!(request_lower.contains("\r\ncache-control: no-cache"));
         assert!(request_lower.contains("\r\npragma: no-cache"));
         assert!(request_lower.contains("\r\nreferer: https://www.rbc.ru/quote/ticker/338247"));
-        assert!(request_lower.contains("\r\nuser-agent: go-http-client/1.1"));
+        assert!(request_lower.contains(&format!(
+            "\r\nuser-agent: {}",
+            RBC_HTTP_USER_AGENT.to_ascii_lowercase()
+        )));
     }
 
     fn rbc_item(
