@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="ru">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <title>Настройки</title>
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <link rel="stylesheet" href="https://unpkg.com/framework7@9.0.2/framework7-bundle.min.css">
+    <style>
+        :root {
+            --f7-theme-color: var(--tg-theme-button-color, #007aff);
+            --f7-theme-color-rgb: 0, 122, 255;
+            --f7-bars-bg-color: var(--tg-theme-bg-color, #ffffff);
+            --f7-bars-text-color: var(--tg-theme-text-color, #000000);
+            --f7-page-bg-color: var(--tg-theme-bg-color, #ffffff);
+        }
+
+        .theme-dark {
+            --f7-bars-bg-color: var(--tg-theme-bg-color, #000000);
+            --f7-page-bg-color: var(--tg-theme-bg-color, #000000);
+            --f7-bars-text-color: var(--tg-theme-text-color, #ffffff);
+        }
+
+        .list-icon {
+            font-size: 28px;
+            width: 40px;
+            height: 40px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .settings-header {
+            text-align: center;
+            padding: 40px 20px 20px;
+        }
+
+        .settings-header h1 {
+            margin: 0;
+            font-size: 28px;
+            font-weight: 600;
+        }
+
+        .settings-header p {
+            margin: 8px 0 0;
+            color: var(--tg-theme-hint-color, #999);
+            font-size: 15px;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="app">
+        <div class="view view-main">
+            <div class="page">
+                <div class="navbar">
+                    <div class="navbar-bg"></div>
+                    <div class="navbar-inner">
+                        <div class="title">Настройки</div>
+                    </div>
+                </div>
+                <div class="page-content">
+                    <div class="settings-header">
+                        <h1>⚙️ Настройки</h1>
+                        <p>Управление ботом Плотва</p>
+                    </div>
+
+                    <div class="list list-strong list-outline-ios list-dividers-ios inset">
+                        <ul>
+                            <li>
+                                <a href="#" class="item-link item-content" id="manageChatsTile">
+                                    <div class="item-media">
+                                        <div class="list-icon">💬</div>
+                                    </div>
+                                    <div class="item-inner">
+                                        <div class="item-title">
+                                            <div class="item-header">Чаты</div>
+                                            Управление чатами
+                                        </div>
+                                        <div class="item-after"></div>
+                                    </div>
+                                </a>
+                            </li>
+                            <li>
+                                <a href="#" class="item-link item-content" id="generalSettingsTile">
+                                    <div class="item-media">
+                                        <div class="list-icon">⚙️</div>
+                                    </div>
+                                    <div class="item-inner">
+                                        <div class="item-title">
+                                            <div class="item-header">Настройки</div>
+                                            Общие настройки
+                                        </div>
+                                        <div class="item-after"></div>
+                                    </div>
+                                </a>
+                            </li>
+                        </ul>
+                    </div>
+
+                    <div class="block block-strong inset" style="margin-top: 20px; display: none;" id="debugBlock">
+                        <p class="text-color-gray" style="font-size: 13px; margin: 0;">
+                            <strong>Debug Info:</strong><br>
+                            <span id="debugInfo"></span>
+                        </p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://unpkg.com/framework7@9.0.2/framework7-bundle.min.js"></script>
+    <script>
+        let tg;
+        let currentUserId;
+        let app;
+
+        try {
+            tg = window.Telegram.WebApp;
+            tg.ready();
+            tg.expand();
+            tg.setHeaderColor(tg.headerColor || 'bg_color');
+            tg.setBackgroundColor(tg.backgroundColor || 'bg_color');
+
+            const user = tg.initDataUnsafe && tg.initDataUnsafe.user ? tg.initDataUnsafe.user : null;
+            currentUserId = user ? user.id : null;
+
+            const debugInfo = document.getElementById('debugInfo');
+            if (debugInfo) {
+                debugInfo.innerHTML = `User ID: ${currentUserId}<br>Platform: ${tg.platform}<br>Version: ${tg.version}`;
+            }
+
+            app = new Framework7({
+                el: '#app',
+                theme: tg.colorScheme === 'dark' ? 'ios' : 'auto',
+                darkMode: tg.colorScheme === 'dark',
+                colors: {
+                    primary: getComputedStyle(document.documentElement).getPropertyValue('--tg-theme-button-color') || '#007aff'
+                }
+            });
+
+            if (tg.colorScheme === 'dark') {
+                document.body.classList.add('theme-dark');
+            }
+
+        } catch (e) {
+            console.error("Failed to initialize Telegram WebApp:", e);
+            tg = {
+                showAlert: (text) => alert(text),
+                expand: () => { },
+                setHeaderColor: () => { },
+                setBackgroundColor: () => { },
+                colorScheme: 'light',
+                platform: 'unknown'
+            };
+            currentUserId = null;
+
+            app = new Framework7({
+                el: '#app',
+                theme: 'auto'
+            });
+        }
+
+        if (tg.onEvent) {
+            tg.onEvent('themeChanged', () => {
+                if (tg.colorScheme === 'dark') {
+                    document.body.classList.add('theme-dark');
+                } else {
+                    document.body.classList.remove('theme-dark');
+                }
+            });
+        }
+
+        document.getElementById('manageChatsTile').addEventListener('click', function (e) {
+            e.preventDefault();
+            const params = new URLSearchParams(window.location.search);
+            const signature = params.get('signature');
+            let url = '../settings/index.html?mode=chat_selector';
+            if (currentUserId) url += `&user_id=${currentUserId}`;
+            if (signature) url += `&signature=${signature}`;
+            window.location.href = url;
+        });
+
+        document.getElementById('generalSettingsTile').addEventListener('click', function (e) {
+            e.preventDefault();
+            const params = new URLSearchParams(window.location.search);
+            const signature = params.get('signature');
+            let url = '../settings/index.html?mode=general';
+            if (currentUserId) url += `&user_id=${currentUserId}`;
+            if (signature) url += `&signature=${signature}`;
+            window.location.href = url;
+        });
+
+        let tapCount = 0;
+        let tapTimer;
+        document.querySelector('.settings-header h1').addEventListener('click', function () {
+            tapCount++;
+            clearTimeout(tapTimer);
+            tapTimer = setTimeout(() => { tapCount = 0; }, 500);
+            if (tapCount === 3) {
+                const debugBlock = document.getElementById('debugBlock');
+                debugBlock.style.display = debugBlock.style.display === 'none' ? 'block' : 'none';
+                tapCount = 0;
+            }
+        });
+    </script>
+</body>
+
+</html>

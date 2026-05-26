@@ -1,0 +1,3564 @@
+<!doctype html>
+<html lang="ru">
+
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="application-name" content="Plotva Admin">
+    <meta name="theme-color" content="#0f172a">
+    <title>Plotva Admin</title>
+    <link rel="icon" href="favicon.svg" type="image/svg+xml">
+    <link rel="manifest" href="site.webmanifest">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="admin.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+</head>
+
+<body>
+    <div class="app-layout">
+        <!-- Sidebar -->
+        <aside class="sidebar" id="sidebar">
+            <div class="brand">
+                <span class="brand-mark" aria-hidden="true">P</span>
+                <span class="brand-copy">
+                    <span class="brand-title">Plotva</span>
+                    <span class="brand-subtitle">Runtime Admin</span>
+                </span>
+            </div>
+
+            <nav class="nav-menu">
+                <button class="nav-item active" onclick="switchTab('settings')">
+                    <span>Settings</span>
+                </button>
+                <button class="nav-item" onclick="switchTab('metrics')">
+                    <span>Metrics</span>
+                </button>
+                <button class="nav-item" onclick="switchTab('taskman')">
+                    <span>Tasks</span>
+                </button>
+                <button class="nav-item" onclick="switchTab('redis')">
+                    <span>Redis</span>
+                </button>
+                <button class="nav-item" onclick="switchTab('chats')">
+                    <span>Chats</span>
+                </button>
+                <button class="nav-item" onclick="switchTab('users')">
+                    <span>Users</span>
+                </button>
+                <button class="nav-item" onclick="switchTab('memory')">
+                    <span>Memory</span>
+                </button>
+                <button class="nav-item" onclick="switchTab('shield')">
+                    <span>Shield</span>
+                </button>
+                <button class="nav-item" onclick="switchTab('llm')">
+                    <span>LLM Context</span>
+                </button>
+                <button class="nav-item" onclick="switchTab('safety')">
+                    <span>Safety Checks</span>
+                </button>
+                <button class="nav-item" onclick="switchTab('analytics')">
+                    <span>Analytics</span>
+                </button>
+                <button class="nav-item" onclick="switchTab('logs')">
+                    <span>Logs</span>
+                </button>
+            </nav>
+
+            <div class="sidebar-footer">
+                <button class="theme-toggle" id="theme-toggle" title="Toggle Theme">
+                    <span id="theme-icon">☀️</span>
+                </button>
+                <div class="text-muted" style="font-size: 0.8rem;">v1.0.0</div>
+            </div>
+        </aside>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <div id="loader" class="loader-overlay">
+                <div class="spinner"></div>
+            </div>
+
+            <header class="header">
+                <button class="mobile-menu-toggle btn btn-outline btn-sm" onclick="toggleSidebar()">Menu</button>
+                <div id="page-title" class="page-title">Settings</div>
+                <div class="user-info text-muted">Administrator</div>
+            </header>
+
+            <div class="content-scroll">
+                <div class="container-fluid">
+
+                    <!-- Settings Tab -->
+                    <div id="settings" class="tab-pane active">
+                        <div class="card">
+                            <div class="card-header">General Settings</div>
+                            <div class="card-body">
+                                <div class="form-group">
+                                    <label class="form-label">Log Level</label>
+                                    <div class="d-flex gap-2">
+                                        <select id="log-level" class="form-control" style="max-width: 200px;">
+                                            <option value="debug">Debug</option>
+                                            <option value="info">Info</option>
+                                            <option value="warn">Warning</option>
+                                            <option value="error">Error</option>
+                                        </select>
+                                        <button class="btn btn-primary" onclick="saveLogLevel()">Apply</button>
+                                    </div>
+                                </div>
+                                <div class="form-group">
+                                    <label class="form-label">AI Farm Priority Pool</label>
+                                    <div class="d-flex gap-2">
+                                        <select id="aifarm-pool-enabled" class="form-control" style="max-width: 200px;">
+                                            <option value="enabled">Enabled</option>
+                                            <option value="disabled">Disabled</option>
+                                        </select>
+                                        <button class="btn btn-primary" onclick="saveAIFarmPool()">Apply</button>
+                                    </div>
+                                    <div class="text-muted" style="font-size: 0.8rem; margin-top: 0.25rem;">
+                                        When disabled, the bot behaves as before the priority-pool feature: AI Farm primary only, with Gemini as the upstream fallback.
+                                    </div>
+                                </div>
+                                <div class="form-group">
+                                    <label class="form-label">VRAM Cloud Reasoning (Qwen3.6)</label>
+                                    <div class="d-flex gap-2">
+                                        <select id="aifarm-pool-reasoning-enabled" class="form-control" style="max-width: 200px;">
+                                            <option value="enabled">Enabled</option>
+                                            <option value="disabled">Disabled</option>
+                                        </select>
+                                        <button class="btn btn-primary" onclick="saveAIFarmPoolReasoning()">Apply</button>
+                                    </div>
+                                    <div class="text-muted" style="font-size: 0.8rem; margin-top: 0.25rem;">
+                                        Controls chat_template_kwargs.enable_thinking for pooled reasoning models. When enabled, max_tokens is automatically lifted to DIALOG_AIFARM_POOL_REASONING_MAX_TOKENS (default 8192) so the model exits the thinking block into a final content payload.
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Metrics Tab -->
+                    <div id="metrics" class="tab-pane">
+                        <div class="grid-3">
+                            <div class="card">
+                                <div class="card-header">Message Queue</div>
+                                <div class="card-body">
+                                    <div id="queue-stats" class="mono">Loading...</div>
+                                </div>
+                            </div>
+                            <div class="card">
+                                <div class="card-header">Cache Stats</div>
+                                <div class="card-body">
+                                    <div id="cache-stats" class="mono">Loading...</div>
+                                </div>
+                            </div>
+                            <div class="card">
+                                <div class="card-header">Planner Stats</div>
+                                <div class="card-body">
+                                    <div id="planner-stats" class="mono">Loading...</div>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="mt-4 text-right">
+                            <button class="btn btn-outline" onclick="refreshState()">Refresh Metrics</button>
+                        </div>
+                    </div>
+
+                    <div id="taskman" class="tab-pane">
+                        <div class="split-pane" id="pane-taskman">
+                            <div class="pane-list">
+                                <form onsubmit="event.preventDefault(); loadTaskmanJobs(true);">
+                                    <div class="card">
+                                        <div class="card-header">
+                                            <span>Task Search</span>
+                                            <div class="d-flex gap-2">
+                                                <button type="button" class="btn btn-outline btn-sm"
+                                                    onclick="loadTaskmanJobs(true)" data-search-btn>Refresh</button>
+                                                <button type="button" class="btn btn-danger btn-sm"
+                                                    onclick="clearTaskmanJobsByFilter()" data-search-btn>Clear
+                                                    Filtered</button>
+                                            </div>
+                                        </div>
+                                        <div class="card-body">
+                                            <div class="d-flex gap-2 mb-4">
+                                                <input type="text" id="taskman-search-input" class="form-control"
+                                                    placeholder="Search (id/chat/user/prompt)...">
+                                            </div>
+
+                                            <div class="grid-2 mb-4">
+                                                <div class="form-group">
+                                                    <label class="form-label">Queue</label>
+                                                    <select id="taskman-queue" class="form-control">
+                                                        <option value="">All</option>
+                                                        <option value="text">text</option>
+                                                        <option value="image-regular">image-regular</option>
+                                                        <option value="image-vip">image-vip</option>
+                                                    </select>
+                                                </div>
+                                                <div class="form-group">
+                                                    <label class="form-label">Status</label>
+                                                    <select id="taskman-status" class="form-control">
+                                                        <option value="">All</option>
+                                                        <option value="pending">pending</option>
+                                                        <option value="processing">processing</option>
+                                                        <option value="completed">completed</option>
+                                                        <option value="failed">failed</option>
+                                                        <option value="cancelled">cancelled</option>
+                                                    </select>
+                                                </div>
+                                            </div>
+
+                                            <div class="grid-2 mb-4">
+                                                <div class="form-group">
+                                                    <label class="form-label">Chat ID</label>
+                                                    <input type="text" id="taskman-chat-id" class="form-control"
+                                                        placeholder="Chat ID">
+                                                </div>
+                                                <div class="form-group">
+                                                    <label class="form-label">User ID</label>
+                                                    <input type="text" id="taskman-user-id" class="form-control"
+                                                        placeholder="User ID">
+                                                </div>
+                                            </div>
+
+                                            <div class="grid-2 mb-4">
+                                                <div class="form-group">
+                                                    <label class="form-label">Time field</label>
+                                                    <select id="taskman-time-field" class="form-control">
+                                                        <option value="created_at" selected>created_at</option>
+                                                        <option value="started_at">started_at</option>
+                                                        <option value="completed_at">completed_at</option>
+                                                    </select>
+                                                </div>
+                                                <div class="form-group">
+                                                    <label class="form-label">Sort</label>
+                                                    <div class="d-flex gap-2">
+                                                        <select id="taskman-sort-by" class="form-control">
+                                                            <option value="created_at" selected>created_at</option>
+                                                            <option value="started_at">started_at</option>
+                                                            <option value="completed_at">completed_at</option>
+                                                            <option value="priority">priority</option>
+                                                            <option value="id">id</option>
+                                                        </select>
+                                                        <select id="taskman-sort-dir" class="form-control"
+                                                            style="max-width: 110px;">
+                                                            <option value="desc" selected>desc</option>
+                                                            <option value="asc">asc</option>
+                                                        </select>
+                                                    </div>
+                                                </div>
+                                            </div>
+
+                                            <div class="grid-2 mb-4">
+                                                <div class="form-group">
+                                                    <label class="form-label">From</label>
+                                                    <input type="datetime-local" id="taskman-from" class="form-control">
+                                                </div>
+                                                <div class="form-group">
+                                                    <label class="form-label">To</label>
+                                                    <input type="datetime-local" id="taskman-to" class="form-control">
+                                                </div>
+                                            </div>
+
+                                            <div class="d-flex justify-between align-center">
+                                                <div class="d-flex gap-2 align-center">
+                                                    <span class="text-muted" style="min-width: 44px;">Limit</span>
+                                                    <select id="taskman-limit" class="form-control"
+                                                        style="max-width: 100px;">
+                                                        <option value="50">50</option>
+                                                        <option value="100">100</option>
+                                                        <option value="200" selected>200</option>
+                                                        <option value="500">500</option>
+                                                        <option value="1000">1000</option>
+                                                    </select>
+                                                </div>
+                                                <button type="submit" class="btn btn-primary"
+                                                    id="btn-search-taskman">Search</button>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </form>
+
+                                <div class="d-flex justify-between align-center mb-4">
+                                    <div id="taskman-summary" class="mono text-muted"
+                                        style="white-space: pre-wrap; font-size: 0.85rem;">—</div>
+                                    <div class="d-flex gap-2">
+                                        <button class="btn btn-outline btn-sm" onclick="taskmanPrevPage()">Prev</button>
+                                        <button class="btn btn-outline btn-sm" onclick="taskmanNextPage()">Next</button>
+                                    </div>
+                                </div>
+                                <div id="taskman-jobs-list" class="table-container"></div>
+                            </div>
+
+                            <div class="resizer hidden" id="resizer-taskman"></div>
+
+                            <div class="pane-details hidden" id="pane-taskman-details">
+                                <div class="card">
+                                    <div class="card-header">
+                                        <span>Job Details</span>
+                                        <div class="d-flex gap-2">
+                                            <button class="btn btn-outline btn-sm"
+                                                onclick="copyTaskmanSelectedJob()">Copy JSON</button>
+                                            <button class="btn btn-danger btn-sm"
+                                                onclick="cancelTaskmanSelectedJob()">Cancel</button>
+                                            <button class="btn btn-primary btn-sm"
+                                                onclick="restartTaskmanSelectedJob()">Restart</button>
+                                            <button class="btn btn-outline btn-sm"
+                                                onclick="toggleTaskmanDetails()">Close</button>
+                                        </div>
+                                    </div>
+                                    <div class="card-body">
+                                        <div class="d-flex gap-2 mb-4 align-center">
+                                            <input type="text" id="taskman-job-id" class="form-control"
+                                                placeholder="Job ID">
+                                            <button class="btn btn-outline"
+                                                onclick="loadTaskmanJobByInput()">Load</button>
+                                        </div>
+
+                                        <div class="card" style="background-color: var(--c-bg-app);">
+                                            <div class="card-header">Details</div>
+                                            <div class="card-body">
+                                                <div id="taskman-job-artifacts" class="mb-3" style="display:none;">
+                                                </div>
+                                                <div id="taskman-job-details" class="mono text-muted"
+                                                    style="white-space: pre-wrap; font-size: 0.85rem;">—</div>
+                                            </div>
+                                        </div>
+
+                                        <div class="card" style="background-color: var(--c-bg-app);">
+                                            <div class="card-header">Events</div>
+                                            <div class="card-body">
+                                                <div id="taskman-job-events" class="table-container"></div>
+                                            </div>
+                                        </div>
+
+                                        <div class="card" style="background-color: var(--c-bg-app);">
+                                            <div class="card-header">Messages</div>
+                                            <div class="card-body">
+                                                <div id="taskman-job-messages" class="table-container"></div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Redis Tab -->
+                    <div id="redis" class="tab-pane">
+                        <div class="grid-3">
+                            <!-- Prefixes Column -->
+                            <div class="card">
+                                <div class="card-header">
+                                    <span>Prefixes</span>
+                                    <button class="btn btn-danger btn-sm" onclick="flushDB()">Flush DB</button>
+                                </div>
+                                <div class="card-body">
+                                    <div class="d-flex gap-2 mb-4">
+                                        <input type="text" id="redis-prefix-search" class="form-control"
+                                            placeholder="Prefix...">
+                                        <button class="btn btn-outline" onclick="loadRedisPrefixes()">Load</button>
+                                    </div>
+                                    <div id="redis-prefixes-list" class="list-group"
+                                        style="max-height: 500px; overflow-y: auto;"></div>
+                                </div>
+                            </div>
+
+                            <!-- Keys Column -->
+                            <div class="card">
+                                <div class="card-header">Keys</div>
+                                <div class="card-body">
+                                    <div class="d-flex gap-2 mb-4">
+                                        <input type="text" id="redis-pattern-search" class="form-control"
+                                            placeholder="Pattern...">
+                                        <button class="btn btn-outline" onclick="loadRedisKeys()">Search</button>
+                                    </div>
+                                    <div id="redis-keys-list" class="list-group"
+                                        style="max-height: 500px; overflow-y: auto;">
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- Value Column -->
+                            <div class="card">
+                                <div class="card-header">
+                                    <span>Value</span>
+                                    <button class="btn btn-danger btn-sm" onclick="deleteRedisKey()">Delete Key</button>
+                                </div>
+                                <div class="card-body">
+                                    <div class="d-flex gap-2 mb-4">
+                                        <input type="text" id="redis-key-input" class="form-control" placeholder="Key">
+                                    </div>
+                                    <textarea id="redis-value-display" class="form-control mono"
+                                        style="height: 400px; resize: vertical;" readonly></textarea>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Chats Tab -->
+                    <div id="chats" class="tab-pane">
+                        <div class="split-pane" id="pane-chats">
+                            <!-- Search Column -->
+                            <div class="pane-list">
+                                <form onsubmit="event.preventDefault(); searchChats();">
+                                    <div class="card">
+                                        <div class="card-header">Find Chats</div>
+                                        <div class="card-body">
+                                            <div class="form-group">
+                                                <label class="form-label">Search Mode</label>
+                                                <select id="chat-search-mode" class="form-control mb-2">
+                                                    <option value="all">All Chats</option>
+                                                    <option value="member">By Member Username/ID</option>
+                                                </select>
+                                            </div>
+                                            <div class="form-group">
+                                                <input type="text" id="chat-search-input" class="form-control"
+                                                    placeholder="Search...">
+                                            </div>
+                                            <button type="submit" class="btn btn-primary btn-block mb-4"
+                                                id="btn-search-chats">Search</button>
+                                            <div id="chat-list" class="list-group">
+                                            </div>
+                                        </div>
+                                    </div>
+                                </form>
+                            </div>
+
+                            <div class="resizer hidden" id="resizer-chats"></div>
+
+                            <!-- Details Column -->
+                            <div class="pane-details hidden" id="pane-chats-details">
+                                <div class="card">
+                                    <div class="card-header">
+                                        <span>Chat Info</span>
+                                        <div class="d-flex gap-2">
+                                            <button class="btn btn-outline btn-sm" onclick="blockChat(10)">Block
+                                                10m</button>
+                                            <button class="btn btn-success btn-sm"
+                                                onclick="unblockChat()">Unblock</button>
+                                            <button class="btn btn-outline btn-sm"
+                                                onclick="toggleChatDetails()">Close</button>
+                                        </div>
+                                    </div>
+                                    <div class="card-body">
+                                        <div class="d-flex gap-2 mb-4 align-center">
+                                            <input type="text" id="chat-id-input" class="form-control"
+                                                placeholder="Chat ID" readonly>
+                                            <button class="btn btn-outline" onclick="loadChat()">Load</button>
+                                            <span id="chat-type-badge" class="badge"></span>
+                                        </div>
+
+                                        <div id="chat-details" class="mono mb-4 text-muted"
+                                            style="white-space: pre-wrap; font-size: 0.85rem;"></div>
+
+                                        <div class="grid-2">
+                                            <div class="form-group">
+                                                <label class="form-label">Mood</label>
+                                                <input type="text" id="chat-mood" class="form-control">
+                                            </div>
+                                            <div class="form-group">
+                                                <label class="form-label">Persona</label>
+                                                <textarea id="chat-persona" class="form-control" rows="5"></textarea>
+                                            </div>
+                                            <div class="form-group">
+                                                <label class="form-label">Reactivity</label>
+                                                <input type="number" id="chat-reactivity" class="form-control">
+                                            </div>
+                                            <div class="form-group">
+                                                <label class="form-label">Proactivity</label>
+                                                <input type="number" id="chat-proactivity" class="form-control">
+                                            </div>
+                                        </div>
+
+                                        <div class="grid-2 mb-4">
+                                            <label class="d-flex align-center gap-2"><input type="checkbox"
+                                                    id="chat-text-reply"> Text replies</label>
+                                            <label class="d-flex align-center gap-2"><input type="checkbox"
+                                                    id="chat-draw-reply"> Draw replies</label>
+                                            <label class="d-flex align-center gap-2"><input type="checkbox"
+                                                    id="chat-obscenifier"> Obscenifier</label>
+                                            <label class="d-flex align-center gap-2"><input type="checkbox"
+                                                    id="chat-profanity">
+                                                Profanity</label>
+                                            <label class="d-flex align-center gap-2"><input type="checkbox"
+                                                    id="chat-greet">
+                                                Greet joiners</label>
+                                            <label class="d-flex align-center gap-2"><input type="checkbox"
+                                                    id="chat-daily-game"> Daily game</label>
+                                        </div>
+
+                                        <div class="grid-2 mb-4">
+                                            <div class="form-group">
+                                                <label class="form-label">Daily theme</label>
+                                                <input type="text" id="chat-daily-theme" class="form-control">
+                                            </div>
+                                            <div class="form-group">
+                                                <label class="form-label">Greeting HTML</label>
+                                                <textarea id="chat-greeting-html" class="form-control"
+                                                    rows="3"></textarea>
+                                            </div>
+                                        </div>
+
+                                        <div class="text-right">
+                                            <button class="btn btn-primary" onclick="saveChatSettings()">Save
+                                                Settings</button>
+                                        </div>
+
+                                        <hr style="border-color: var(--c-border); margin: var(--sp-6) 0;">
+
+                                        <button class="btn btn-outline btn-sm mb-4" onclick="loadChatMembers()">Load
+                                            Members</button>
+                                        <div id="chat-members-list" class="table-container"></div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Users Tab -->
+                    <div id="users" class="tab-pane">
+                        <div class="split-pane" id="pane-users">
+                            <!-- Search Column -->
+                            <div class="pane-list">
+                                <form onsubmit="event.preventDefault(); searchUsers();">
+                                    <div class="card">
+                                        <div class="card-header">Find Users</div>
+                                        <div class="card-body">
+                                            <div class="form-group">
+                                                <input type="text" id="user-search-input" class="form-control"
+                                                    placeholder="Username or Name...">
+                                            </div>
+                                            <button type="submit" class="btn btn-primary btn-block mb-4"
+                                                id="btn-search-users">Search</button>
+                                            <div id="user-list" class="list-group">
+                                            </div>
+                                        </div>
+                                    </div>
+                                </form>
+                            </div>
+
+                            <div class="resizer hidden" id="resizer-users"></div>
+
+                            <!-- Details Column -->
+                            <div class="pane-details hidden" id="pane-users-details">
+                                <div class="card">
+                                    <div class="card-header">
+                                        <span>User Details</span>
+                                        <button class="btn btn-outline btn-sm"
+                                            onclick="toggleUserDetails()">Close</button>
+                                    </div>
+                                    <div class="card-body">
+                                        <div class="grid-2 mb-4">
+                                            <input type="text" id="user-id-input" class="form-control"
+                                                placeholder="User ID">
+                                            <button class="btn btn-outline" onclick="loadUser()">Load by ID</button>
+                                        </div>
+                                        <div class="grid-2 mb-4">
+                                            <input type="text" id="user-username-input" class="form-control"
+                                                placeholder="Username">
+                                            <button class="btn btn-outline" onclick="loadUserByUsername()">Load by
+                                                Username</button>
+                                        </div>
+
+                                        <div id="user-details" class="mono mb-4 text-muted"
+                                            style="white-space: pre-wrap; font-size: 0.85rem;"></div>
+                                        <div class="card mb-4" style="background-color: var(--c-bg-app);">
+                                            <div class="card-body">
+                                                <h4 class="mb-4" style="margin-top: 0;">VIP Summary</h4>
+                                                <div id="user-vip-summary" class="text-muted">No VIP summary loaded</div>
+                                            </div>
+                                        </div>
+                                        <div class="card mb-4" style="background-color: var(--c-bg-app);">
+                                            <div class="card-body">
+                                                <h4 class="mb-4" style="margin-top: 0;">VIP History</h4>
+                                                <div id="user-vip-events" class="table-container text-muted">No VIP events</div>
+                                            </div>
+                                        </div>
+                                        <div class="card mb-4" style="background-color: var(--c-bg-app);">
+                                            <div class="card-body">
+                                                <h4 class="mb-4" style="margin-top: 0;">Subscription Artifacts</h4>
+                                                <div id="user-subscriptions" class="table-container text-muted">No subscriptions</div>
+                                            </div>
+                                        </div>
+
+                                        <div class="card" style="background-color: var(--c-bg-app);">
+                                            <div class="card-body">
+                                                <h4 class="mb-4" style="margin-top: 0;">VIP Management</h4>
+                                                <div class="form-group">
+                                                    <label class="form-label">Signed days</label>
+                                                    <input type="number" id="vip-days" class="form-control" value="30">
+                                                </div>
+                                                <div class="form-group">
+                                                    <label class="form-label">Reason</label>
+                                                    <input type="text" id="vip-reason" class="form-control"
+                                                        placeholder="manual adjustment reason">
+                                                </div>
+                                                <div class="d-flex gap-2 justify-between mt-4">
+                                                    <div>
+                                                        <button class="btn btn-success" onclick="grantVIP()">Grant
+                                                            VIP</button>
+                                                        <button class="btn btn-primary" onclick="revokeVIP()">Revoke
+                                                            VIP</button>
+                                                    </div>
+                                                    <button class="btn btn-danger" onclick="deleteUser()">Delete
+                                                        User</button>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    <!-- Memory Tab -->
+                    <div id="memory" class="tab-pane">
+                        <div class="card">
+                            <div class="card-header">
+                                <span>Memory Cards</span>
+                                <button type="button" class="btn btn-outline btn-sm" onclick="loadMemoryCards()" data-search-btn>Load</button>
+                            </div>
+                            <div class="card-body">
+                                <div class="grid-3 mb-4">
+                                    <div class="form-group"><label class="form-label">Chat ID</label><input type="text" id="memory-chat-id" class="form-control" placeholder="optional"></div>
+                                    <div class="form-group"><label class="form-label">User ID</label><input type="text" id="memory-user-id" class="form-control" placeholder="optional"></div>
+                                    <div class="form-group"><label class="form-label">Limit</label><input type="number" id="memory-limit" class="form-control" min="1" max="500" value="100"></div>
+                                </div>
+                                <div id="memory-meta" class="text-muted mb-3"></div>
+                                <div class="table-container">
+                                    <table class="table table-condensed">
+                                        <thead><tr><th>ID</th><th>Visibility</th><th>Type</th><th>Text</th><th>Conf</th><th>Updated</th><th>Actions</th></tr></thead>
+                                        <tbody id="memory-table-body"></tbody>
+                                    </table>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="card mt-4">
+                            <div class="card-header">
+                                <span>Memory Runs</span>
+                                <div class="header-actions">
+                                    <button type="button" class="btn btn-outline btn-sm" onclick="runMemoryNow()">Run Now</button>
+                                    <button type="button" class="btn btn-outline btn-sm" onclick="restartFailedMemoryRuns()">Restart Failed</button>
+                                    <button type="button" class="btn btn-outline btn-sm" onclick="loadMemoryRuns()" data-search-btn>Load</button>
+                                </div>
+                            </div>
+                            <div class="card-body">
+                                <div class="grid-3 mb-4">
+                                    <div class="form-group">
+                                        <label class="form-label">Manual Provider</label>
+                                        <select id="memory-override-provider" class="form-control">
+                                            <option value="genkit">GenKit / Gemini</option>
+                                            <option value="aifarm">AI Farm</option>
+                                        </select>
+                                    </div>
+                                    <div class="form-group">
+                                        <label class="form-label">Manual Model</label>
+                                        <input type="text" id="memory-override-model" class="form-control" placeholder="optional">
+                                    </div>
+                                    <div class="form-group">
+                                        <label class="form-label">&nbsp;</label>
+                                        <button type="button" class="btn btn-primary" onclick="runMemoryNowWithOverride()">Force Run Now</button>
+                                        <button type="button" class="btn btn-outline" onclick="restartFailedMemoryRunsWithOverride()">Force Restart Failed</button>
+                                    </div>
+                                </div>
+                                <div id="memory-runs-meta" class="text-muted mb-3"></div>
+                                <div class="table-container">
+                                    <table class="table table-condensed">
+                                        <thead><tr><th>ID</th><th>Status</th><th>Chat</th><th>Window</th><th>Messages</th><th>Tokens</th><th>Cards</th><th>Error</th><th>Actions</th></tr></thead>
+                                        <tbody id="memory-runs-table-body"></tbody>
+                                    </table>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Shield Tab -->
+                    <div id="shield" class="tab-pane">
+                        <div class="grid-2">
+                            <div class="card">
+                                <div class="card-header">
+                                    <span>Shield Documents</span>
+                                    <div class="header-actions">
+                                        <button type="button" class="btn btn-outline btn-sm" onclick="loadShieldDocuments()">Load</button>
+                                        <button type="button" class="btn btn-outline btn-sm" onclick="rebuildShieldEmbeddings()">Rebuild Embeddings</button>
+                                    </div>
+                                </div>
+                                <div class="card-body">
+                                    <div class="d-flex gap-2 mb-4">
+                                        <input type="text" id="shield-search" class="form-control" placeholder="Search title/category...">
+                                        <button type="button" class="btn btn-outline" onclick="loadShieldDocuments()">Apply</button>
+                                    </div>
+                                    <div id="shield-meta" class="text-muted mb-3"></div>
+                                    <div class="table-container">
+                                        <table class="table table-condensed">
+                                            <thead><tr><th>ID</th><th>Type</th><th>Title</th><th>Priority</th><th>State</th><th>Actions</th></tr></thead>
+                                            <tbody id="shield-table-body"></tbody>
+                                        </table>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="card">
+                                <div class="card-header">
+                                    <span>Document Editor</span>
+                                    <button type="button" class="btn btn-outline btn-sm" onclick="resetShieldForm()">New</button>
+                                </div>
+                                <div class="card-body">
+                                    <input type="hidden" id="shield-id">
+                                    <div class="grid-2 mb-4">
+                                        <div class="form-group">
+                                            <label class="form-label">Slug</label>
+                                            <input type="text" id="shield-slug" class="form-control" placeholder="auto_from_title">
+                                        </div>
+                                        <div class="form-group">
+                                            <label class="form-label">Category</label>
+                                            <input type="text" id="shield-category" class="form-control" placeholder="self_harm">
+                                        </div>
+                                    </div>
+                                    <div class="form-group">
+                                        <label class="form-label">Title / Retrieval Case</label>
+                                        <textarea id="shield-title" class="form-control" rows="3" placeholder="Keywords and natural-language case description used for retrieval"></textarea>
+                                    </div>
+                                    <div class="form-group">
+                                        <label class="form-label">Body / Injected Guidance</label>
+                                        <textarea id="shield-body" class="form-control" rows="8" placeholder="Instruction inserted into shield_context when matched"></textarea>
+                                    </div>
+                                    <div class="grid-2 mb-4">
+                                        <div class="form-group">
+                                            <label class="form-label">Priority</label>
+                                            <input type="number" id="shield-priority" class="form-control" value="0">
+                                        </div>
+                                        <div class="form-group">
+                                            <label class="form-label">Enabled</label>
+                                            <label class="checkbox-row"><input type="checkbox" id="shield-enabled" checked> Active</label>
+                                        </div>
+                                    </div>
+                                    <div class="d-flex gap-2">
+                                        <button type="button" class="btn btn-primary" onclick="saveShieldDocument()">Save</button>
+                                        <button type="button" class="btn btn-danger" onclick="deleteSelectedShieldDocument()">Delete</button>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="card mt-4">
+                            <div class="card-header">Test Query</div>
+                            <div class="card-body">
+                                <div class="d-flex gap-2 mb-4">
+                                    <input type="text" id="shield-test-query" class="form-control" placeholder="Type a risky message to test retrieval">
+                                    <input type="text" id="shield-test-category" class="form-control" placeholder="Expected category">
+                                    <button type="button" class="btn btn-outline" onclick="testShieldQuery()">Test</button>
+                                </div>
+                                <pre id="shield-test-result" class="pre-wrap mono text-muted">No test run</pre>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- LLM Context Tab -->
+                    <div id="llm" class="tab-pane">
+                        <div class="split-pane" id="pane-llm">
+                            <div class="pane-list">
+                                <form onsubmit="event.preventDefault(); renderLLMRequests();">
+                                    <div class="card llm-requests-card">
+                                        <div class="card-header">
+                                            <span>LLM Requests (last 1000)</span>
+                                            <div class="d-flex gap-2">
+                                                <button type="button" class="btn btn-outline btn-sm"
+                                                    onclick="loadLLMRequests(true)">Refresh</button>
+                                                <button type="button" class="btn btn-danger btn-sm"
+                                                    onclick="clearLLMRequests()">Clear</button>
+                                            </div>
+                                        </div>
+                                        <div class="card-body">
+                                            <div class="d-flex gap-2 mb-4">
+                                                <input type="text" id="llm-search-input" class="form-control"
+                                                    placeholder="Search (chat/user/model/text)...">
+                                                <button type="submit" class="btn btn-outline">Apply</button>
+                                            </div>
+                                            <div id="llm-requests-list" class="list-group"></div>
+                                        </div>
+                                    </div>
+                                </form>
+                            </div>
+
+                            <div class="resizer hidden" id="resizer-llm"></div>
+
+                            <div class="pane-details hidden" id="pane-llm-details">
+                                <div class="card llm-details-card">
+                                    <div class="card-header">
+                                        <span>Request Details</span>
+                                        <div class="d-flex gap-2">
+                                            <button type="button" class="btn btn-outline btn-sm"
+                                                onclick="copySelectedLLMRequest()">Copy JSON</button>
+                                            <button type="button" class="btn btn-outline btn-sm"
+                                                onclick="toggleLLMDetails()">Close</button>
+                                        </div>
+                                    </div>
+                                    <div class="card-body">
+                                        <div id="llm-request-details" class="mono mb-4 text-muted llm-request-details">
+                                        </div>
+
+                                        <div class="card llm-context-card" style="background-color: var(--c-bg-app);">
+                                            <div class="card-header">
+                                                <span>Raw Provider Context</span>
+                                                <div class="d-flex gap-2">
+                                                    <button type="button" class="btn btn-outline btn-sm"
+                                                        onclick="expandLLMJSONTree()">Expand</button>
+                                                    <button type="button" class="btn btn-outline btn-sm"
+                                                        onclick="collapseLLMJSONTree()">Collapse</button>
+                                                    <button type="button" class="btn btn-outline btn-sm"
+                                                        onclick="copySelectedLLMRawRequest()">Copy Context</button>
+                                                </div>
+                                            </div>
+                                            <div class="card-body">
+                                                <div class="form-group llm-context-json-group">
+                                                    <div class="json-tree-wrap">
+                                                        <div id="llm-context-json" class="json-tree"></div>
+                                                        <div id="llm-context-json-empty"
+                                                            class="text-muted json-tree-empty"></div>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Safety Checks Tab -->
+                    <div id="safety" class="tab-pane">
+                        <div class="split-pane" id="pane-safety">
+                            <div class="pane-list">
+                                <form onsubmit="event.preventDefault(); loadSafetyChecks(true);">
+                                    <div class="card safety-checks-card">
+                                        <div class="card-header">
+                                            <span>WhiteCircle Checks</span>
+                                            <div class="d-flex gap-2">
+                                                <button type="button" class="btn btn-outline btn-sm"
+                                                    onclick="loadSafetyChecks(true)">Refresh</button>
+                                            </div>
+                                        </div>
+                                        <div class="card-body">
+                                            <div class="grid-2 mb-4">
+                                                <input type="text" id="safety-search-input" class="form-control"
+                                                    placeholder="Search (chat/user/source/error)...">
+                                                <select id="safety-flagged-filter" class="form-control">
+                                                    <option value="">All</option>
+                                                    <option value="true">Flagged</option>
+                                                    <option value="false">Clean</option>
+                                                </select>
+                                            </div>
+                                            <div class="d-flex gap-2 mb-4">
+                                                <label class="form-label mb-0" style="min-width: 44px;">Limit</label>
+                                                <select id="safety-limit" class="form-control" style="max-width: 110px;">
+                                                    <option value="50">50</option>
+                                                    <option value="100" selected>100</option>
+                                                    <option value="200">200</option>
+                                                    <option value="500">500</option>
+                                                </select>
+                                                <button type="submit" class="btn btn-outline">Apply</button>
+                                            </div>
+                                            <div id="safety-checks-list" class="list-group"></div>
+                                        </div>
+                                    </div>
+                                </form>
+                            </div>
+
+                            <div class="resizer hidden" id="resizer-safety"></div>
+
+                            <div class="pane-details hidden" id="pane-safety-details">
+                                <div class="card safety-details-card">
+                                    <div class="card-header">
+                                        <span>Check Details</span>
+                                        <div class="d-flex gap-2">
+                                            <button type="button" class="btn btn-outline btn-sm"
+                                                onclick="copySelectedSafetyCheck()">Copy JSON</button>
+                                            <button type="button" class="btn btn-outline btn-sm"
+                                                onclick="toggleSafetyDetails()">Close</button>
+                                        </div>
+                                    </div>
+                                    <div class="card-body">
+                                        <div id="safety-check-details"
+                                            class="mono mb-4 text-muted safety-check-details"></div>
+                                        <div class="card" style="background-color: var(--c-bg-app);">
+                                            <div class="card-header">Request Messages</div>
+                                            <div class="card-body">
+                                                <div id="safety-check-request" class="mono text-muted"
+                                                    style="white-space: pre-wrap; font-size: 0.85rem;">—</div>
+                                            </div>
+                                        </div>
+                                        <div class="card" style="background-color: var(--c-bg-app);">
+                                            <div class="card-header">Policies</div>
+                                            <div class="card-body">
+                                                <div id="safety-check-policies" class="mono text-muted"
+                                                    style="white-space: pre-wrap; font-size: 0.85rem;">—</div>
+                                            </div>
+                                        </div>
+                                        <div class="card" style="background-color: var(--c-bg-app);">
+                                            <div class="card-header">Raw Response</div>
+                                            <div class="card-body">
+                                                <div id="safety-check-response" class="mono text-muted"
+                                                    style="white-space: pre-wrap; font-size: 0.85rem;">—</div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Analytics Tab -->
+                    <div id="analytics" class="tab-pane">
+                        <div class="card">
+                            <div class="card-header">
+                                <span>LLM Analytics</span>
+                                <div class="d-flex gap-2 align-center">
+                                    <select id="llm-analytics-range" class="form-control" style="max-width: 140px;">
+                                        <option value="1h">1h</option>
+                                        <option value="6h">6h</option>
+                                        <option value="24h" selected>24h</option>
+                                        <option value="7d">7d</option>
+                                        <option value="30d">30d</option>
+                                    </select>
+                                    <button class="btn btn-outline btn-sm" onclick="loadLLMAnalytics()">Refresh</button>
+                                </div>
+                            </div>
+                            <div class="card-body">
+                                <div class="grid-2">
+                                    <div class="card" style="background-color: var(--c-bg-app);">
+                                        <div class="card-header">Load</div>
+                                        <div class="card-body">
+                                            <div style="height: 320px;">
+                                                <canvas id="llm-series-chart"></canvas>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <div class="card" style="background-color: var(--c-bg-app);">
+                                        <div class="card-header">Top Chats</div>
+                                        <div class="card-body">
+                                            <div style="height: 320px;">
+                                                <canvas id="llm-topchats-chart"></canvas>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <div class="grid-2">
+                                    <div class="card" style="background-color: var(--c-bg-app);">
+                                        <div class="card-header">Summary</div>
+                                        <div class="card-body">
+                                            <div id="llm-analytics-summary" class="mono text-muted"
+                                                style="white-space: pre-wrap; font-size: 0.85rem;">—</div>
+                                        </div>
+                                    </div>
+                                    <div class="card" style="background-color: var(--c-bg-app);">
+                                        <div class="card-header">Hourly Models</div>
+                                        <div class="card-body">
+                                            <div style="height: 320px;">
+                                                <canvas id="llm-models-chart"></canvas>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <div class="grid-2">
+                                    <div class="card" style="background-color: var(--c-bg-app);">
+                                        <div class="card-header">LLM Providers</div>
+                                        <div class="card-body">
+                                            <div id="llm-providers-table" class="table-container text-muted">—</div>
+                                        </div>
+                                    </div>
+                                    <div class="card" style="background-color: var(--c-bg-app);">
+                                        <div class="card-header">Model Performance</div>
+                                        <div class="card-body">
+                                            <div id="llm-models-table" class="table-container text-muted">—</div>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <div class="card" style="background-color: var(--c-bg-app);">
+                                    <div class="card-header">Inference Params</div>
+                                    <div class="card-body">
+                                        <div id="llm-inference-table" class="table-container text-muted">—</div>
+                                    </div>
+                                </div>
+
+                                <div class="card" style="background-color: var(--c-bg-app);">
+                                    <div class="card-header">Tool Calling Parser</div>
+                                    <div class="card-body">
+                                        <div id="tool-call-parser-summary" class="mono text-muted mb-3"
+                                            style="white-space: pre-wrap; font-size: 0.85rem;">—</div>
+                                        <div id="tool-call-parser-table" class="table-container text-muted">—</div>
+                                    </div>
+                                </div>
+
+                                <div class="grid-2">
+                                    <div class="card" style="background-color: var(--c-bg-app);">
+                                        <div class="card-header">Image / Music Jobs</div>
+                                        <div class="card-body">
+                                            <div id="runtime-jobs-table" class="table-container text-muted">—</div>
+                                            <div id="runtime-jobs-error" class="text-danger mt-2"></div>
+                                        </div>
+                                    </div>
+                                    <div class="card" style="background-color: var(--c-bg-app);">
+                                        <div class="card-header">Live AI Farm</div>
+                                        <div class="card-body">
+                                            <div id="llm-aifarm-capacity" class="mono text-muted"
+                                                style="white-space: pre-wrap; font-size: 0.85rem;">—</div>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <div class="grid-2">
+                                    <div class="card" style="background-color: var(--c-bg-app);">
+                                        <div class="card-header">Memory Jobs</div>
+                                        <div class="card-body">
+                                            <div id="memory-jobs-summary" class="mono text-muted mb-3"
+                                                style="white-space: pre-wrap; font-size: 0.85rem;">—</div>
+                                            <div id="memory-jobs-table" class="table-container text-muted">—</div>
+                                            <div id="memory-jobs-error" class="text-danger mt-2"></div>
+                                        </div>
+                                    </div>
+                                    <div class="card" style="background-color: var(--c-bg-app);">
+                                        <div class="card-header">Memory Errors</div>
+                                        <div class="card-body">
+                                            <div id="memory-errors-table" class="table-container text-muted">—</div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div id="logs" class="tab-pane">
+                        <div class="card logs-card"
+                            style="display: flex; flex-direction: column; flex: 1; min-height: 0; margin-bottom: 0;">
+                            <div class="card-header sticky-header" style="flex-shrink: 0;">
+                                <div class="logs-filters d-flex gap-2 flex-wrap align-center">
+                                    <span>Real-time Logs</span>
+                                    <select id="logs-level-filter" class="form-control" style="max-width: 120px;">
+                                        <option value="">All Levels</option>
+                                        <option value="DEBUG">Debug</option>
+                                        <option value="INFO">Info</option>
+                                        <option value="WARN">Warn</option>
+                                        <option value="ERROR">Error</option>
+                                    </select>
+                                    <input type="text" id="logs-search-input" class="form-control"
+                                        placeholder="Search logs..." style="max-width: 300px;">
+                                    <div class="d-flex gap-2 align-center">
+                                        <label class="d-flex align-center gap-2"
+                                            style="font-size: 0.9rem; cursor: pointer; user-select: none;">
+                                            <input type="checkbox" id="logs-autoscroll" checked> Auto-scroll
+                                        </label>
+                                        <button class="btn btn-outline btn-sm" onclick="clearLogsUI()">Clear UI</button>
+                                        <span id="logs-count" class="text-muted" style="font-size: 0.8rem;">0
+                                            entries</span>
+                                    </div>
+                                    <div id="logs-status" class="status-indicator"></div>
+                                </div>
+                            </div>
+                            <div class="card-body p-0"
+                                style="flex: 1; overflow: hidden; position: relative; background: var(--c-bg-app);">
+                                <div id="logs-container" class="logs-container"
+                                    style="position: absolute; inset: 0; overflow-y: auto; padding: 10px;">
+                                    <div id="logs-list" class="logs-list"></div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+        </main>
+    </div>
+
+    <script>
+        // --- Theme Management ---
+        const themeToggle = document.getElementById('theme-toggle');
+        const themeIcon = document.getElementById('theme-icon');
+
+        function setTheme(theme) {
+            document.documentElement.setAttribute('data-theme', theme);
+            localStorage.setItem('theme', theme);
+            themeIcon.textContent = theme === 'dark' ? '☀️' : '🌙';
+        }
+
+        const savedTheme = localStorage.getItem('theme') ||
+            (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+        setTheme(savedTheme);
+
+        themeToggle.addEventListener('click', () => {
+            const current = document.documentElement.getAttribute('data-theme');
+            setTheme(current === 'dark' ? 'light' : 'dark');
+        });
+
+        // --- Navigation ---
+        function switchTab(tabId) {
+            // Update Sidebar
+            document.querySelectorAll('.nav-item').forEach(el => {
+                el.classList.remove('active');
+                if (el.getAttribute('onclick').includes(tabId)) el.classList.add('active');
+            });
+
+            // Update Content
+            document.querySelectorAll('.tab-pane').forEach(el => el.classList.remove('active'));
+            document.getElementById(tabId).classList.add('active');
+
+            // Update Title
+            const titles = {
+                'settings': 'Settings',
+                'metrics': 'Metrics',
+                'taskman': 'Tasks',
+                'redis': 'Redis',
+                'chats': 'Chats',
+                'users': 'Users',
+                'memory': 'Memory',
+                'shield': 'Shield',
+                'llm': 'LLM Context',
+                'safety': 'Safety Checks',
+                'analytics': 'Analytics',
+                'logs': 'Real-time Logs'
+            };
+            document.getElementById('page-title').textContent = titles[tabId];
+            document.title = `${titles[tabId]} - Plotva Admin`;
+
+            // Close mobile sidebar if open
+            document.getElementById('sidebar').classList.remove('open');
+
+            if (tabId === 'llm') {
+                loadLLMRequests(false);
+            }
+            if (tabId === 'safety') {
+                loadSafetyChecks(false);
+            }
+            if (tabId === 'analytics') {
+                loadLLMAnalytics();
+            }
+            if (tabId === 'taskman') {
+                loadTaskmanJobs(false);
+            }
+            if (tabId === 'memory') {
+                loadMemoryCards();
+                loadMemoryRuns();
+            }
+            if (tabId === 'shield') {
+                loadShieldDocuments();
+            }
+            if (tabId === 'logs') {
+                initLogs();
+            }
+        }
+
+        function toggleSidebar() {
+            document.getElementById('sidebar').classList.toggle('open');
+        }
+
+        // --- API Helpers ---
+        async function apiCall(endpoint, options = {}) {
+            const loader = document.getElementById('loader');
+            const searchButtons = document.querySelectorAll('[data-search-btn], [type="submit"]');
+
+            if (loader) loader.classList.add('active');
+            searchButtons.forEach(btn => btn.disabled = true);
+
+            try {
+                // If options.body is an object, stringify it and set Content-Type
+                if (options.body && typeof options.body === 'object') {
+                    options.headers = {
+                        ...options.headers,
+                        'Content-Type': 'application/json'
+                    };
+                    options.body = JSON.stringify(options.body);
+                }
+
+                const res = await fetch(`/admin/api${endpoint}`, options);
+                if (res.status === 401 || res.status === 403) {
+                    window.location.href = '/admin/login.html';
+                    return null;
+                }
+                const data = await res.json();
+                if (!res.ok) {
+                    throw new Error(data.error || `API Error: ${res.statusText}`);
+                }
+                return data;
+            } catch (err) {
+                console.error(err);
+                alert(err.message);
+                return null;
+            } finally {
+                if (loader) loader.classList.remove('active');
+                searchButtons.forEach(btn => btn.disabled = false);
+            }
+        }
+
+        // --- Settings ---
+        async function saveLogLevel() {
+            const level = document.getElementById('log-level').value;
+            await apiCall('/loglevel', { method: 'POST', body: { level } });
+            alert('Log level updated');
+        }
+
+        async function saveAIFarmPool() {
+            const enabled = document.getElementById('aifarm-pool-enabled').value === 'enabled';
+            await apiCall('/aifarm/pool', { method: 'POST', body: { enabled } });
+            alert('AI Farm priority pool ' + (enabled ? 'enabled' : 'disabled'));
+        }
+
+        async function saveAIFarmPoolReasoning() {
+            const enabled = document.getElementById('aifarm-pool-reasoning-enabled').value === 'enabled';
+            await apiCall('/aifarm/pool/reasoning', { method: 'POST', body: { enabled } });
+            alert('VRAM Cloud reasoning ' + (enabled ? 'enabled' : 'disabled'));
+        }
+
+        // --- Metrics ---
+        async function refreshState() {
+            const data = await apiCall('/state');
+            if (!data) return;
+
+            document.getElementById('log-level').value = data.log_level;
+            const poolSelect = document.getElementById('aifarm-pool-enabled');
+            if (poolSelect && typeof data.aifarm_pool_enabled === 'boolean') {
+                poolSelect.value = data.aifarm_pool_enabled ? 'enabled' : 'disabled';
+            }
+            const reasoningSelect = document.getElementById('aifarm-pool-reasoning-enabled');
+            if (reasoningSelect && typeof data.aifarm_pool_reasoning_enabled === 'boolean') {
+                reasoningSelect.value = data.aifarm_pool_reasoning_enabled ? 'enabled' : 'disabled';
+            }
+            document.getElementById('queue-stats').textContent = JSON.stringify(data.queue, null, 2);
+            document.getElementById('cache-stats').textContent = JSON.stringify(data.cache, null, 2);
+            document.getElementById('planner-stats').textContent = JSON.stringify(data.planner, null, 2);
+        }
+
+        // --- Redis ---
+        async function loadRedisPrefixes() {
+            const prefix = document.getElementById('redis-prefix-search').value;
+            const data = await apiCall(`/redis/prefixes?prefix=${encodeURIComponent(prefix)}`);
+            if (!data) return;
+
+            const list = document.getElementById('redis-prefixes-list');
+            list.innerHTML = '';
+
+            for (const [group, count] of Object.entries(data.groups)) {
+                const item = document.createElement('div');
+                item.className = 'list-item d-flex justify-between align-center';
+                item.innerHTML = `
+                    <span class="mono">${group}</span>
+                    <span class="badge" style="background: var(--c-bg-app); padding: 2px 6px; border-radius: 4px;">${count}</span>
+                `;
+                item.onclick = () => {
+                    document.getElementById('redis-pattern-search').value = group + '*';
+                    loadRedisKeys();
+                };
+                list.appendChild(item);
+            }
+        }
+
+        async function loadRedisKeys() {
+            const pattern = document.getElementById('redis-pattern-search').value;
+            const data = await apiCall(`/redis/list?pattern=${encodeURIComponent(pattern)}`);
+            if (!data) return;
+
+            const list = document.getElementById('redis-keys-list');
+            list.innerHTML = '';
+
+            data.keys.forEach(key => {
+                const item = document.createElement('div');
+                item.className = 'list-item mono';
+                item.textContent = key;
+                item.onclick = () => {
+                    document.getElementById('redis-key-input').value = key;
+                    loadRedisValue(key);
+                };
+                list.appendChild(item);
+            });
+        }
+
+        async function loadRedisValue(key) {
+            const data = await apiCall(`/redis/get?key=${encodeURIComponent(key)}`);
+            if (!data) return;
+            document.getElementById('redis-value-display').value = data.value;
+        }
+
+        async function deleteRedisKey() {
+            const key = document.getElementById('redis-key-input').value;
+            if (!confirm(`Delete key ${key}?`)) return;
+            await apiCall(`/redis/delete_key?key=${encodeURIComponent(key)}`, { method: 'DELETE' });
+            loadRedisKeys();
+            document.getElementById('redis-value-display').value = '';
+        }
+
+        async function flushDB() {
+            if (!confirm('DANGER: Flush entire Redis DB?')) return;
+            await apiCall('/redis/flushdb', { method: 'POST' });
+            alert('DB Flushed');
+            loadRedisPrefixes();
+        }
+
+        // --- Chats ---
+        function getChatTypeBadgeClass(type) {
+            const typeMap = {
+                'private': 'badge-private',
+                'group': 'badge-group',
+                'supergroup': 'badge-supergroup',
+                'channel': 'badge-channel'
+            };
+            return typeMap[type] || 'badge-private';
+        }
+
+        async function searchChats() {
+            const mode = document.getElementById('chat-search-mode').value;
+            const q = (document.getElementById('chat-search-input').value || '').trim();
+            const list = document.getElementById('chat-list');
+            list.innerHTML = '';
+
+            let data;
+            if (mode === 'member') {
+                if (!q) {
+                    alert('Please enter username or user ID');
+                    return;
+                }
+                const isNumeric = /^\d+$/.test(q);
+                const endpoint = isNumeric
+                    ? `/chats/search_by_member?user_id=${encodeURIComponent(q)}`
+                    : `/chats/search_by_member?username=${encodeURIComponent(q)}`;
+                data = await apiCall(endpoint);
+            } else {
+                // Fetch ALL chats only when the operator explicitly asks for an empty search.
+                if (!q && !confirm('Fetching ALL chats may be slow. Continue?')) return;
+                const endpoint = q ? `/chats?q=${encodeURIComponent(q)}` : '/chats';
+                data = await apiCall(endpoint);
+            }
+
+            if (!data || !data.chats) return;
+
+            // Apply manual search filtering if it's "all" mode with query
+            let chats = data.chats;
+            if (mode === 'all' && q) {
+                const query = q.toLowerCase();
+                chats = chats.filter(chat =>
+                    String(chat.id).includes(query) ||
+                    (chat.title && chat.title.toLowerCase().includes(query)) ||
+                    (chat.username && chat.username.toLowerCase().includes(query))
+                );
+            }
+
+            // Limit to 200 items in UI for performance
+            if (chats.length > 200) {
+                const total = chats.length;
+                chats = chats.slice(0, 200);
+                const info = document.createElement('div');
+                info.className = 'text-muted mb-2';
+                info.textContent = `Showing first 200 of ${total} chats`;
+                list.appendChild(info);
+            }
+
+            chats.forEach(chat => {
+                if (mode === 'all' && q && !JSON.stringify(chat).toLowerCase().includes(q)) return;
+
+                let title = chat.title;
+                if (!title || title.trim() === '') {
+                    if (chat.first_name || chat.last_name) {
+                        title = `${chat.first_name || ''} ${chat.last_name || ''}`.trim();
+                    } else if (chat.username) {
+                        title = `@${chat.username}`;
+                    } else {
+                        title = 'No Title';
+                    }
+                }
+
+                const usernameDisplay = chat.username ? `<span style="color: var(--c-primary);">@${chat.username}</span>` : '';
+                const typeBadge = `<span class="badge ${getChatTypeBadgeClass(chat.type)}">${chat.type || 'private'}</span>`;
+
+                const item = document.createElement('div');
+                item.className = 'list-item';
+                item.innerHTML = `
+                    <div class="d-flex justify-between align-center">
+                        <div style="font-weight: 500;">${title}</div>
+                        ${typeBadge}
+                    </div>
+                    <div class="text-muted mono" style="font-size: 0.8rem;">
+                        ${chat.id} ${usernameDisplay ? ' | ' + usernameDisplay : ''}
+                    </div>
+                `;
+                item.onclick = () => {
+                    const detailsPane = document.getElementById('pane-chats-details');
+                    const resizer = document.getElementById('resizer-chats');
+                    const listPane = document.querySelector('#pane-chats .pane-list');
+
+                    if (document.getElementById('chat-id-input').value == chat.id && !detailsPane.classList.contains('hidden')) {
+                        toggleChatDetails();
+                    } else {
+                        document.getElementById('chat-id-input').value = chat.id;
+                        loadChat();
+                        detailsPane.classList.remove('hidden');
+                        resizer.classList.remove('hidden');
+                        listPane.style.flex = '0 0 33%';
+                    }
+                };
+                list.appendChild(item);
+            });
+        }
+
+        async function loadChat() {
+            const id = document.getElementById('chat-id-input').value;
+            const data = await apiCall(`/chat?chat_id=${id}`);
+            if (!data) return;
+
+            const chatType = data.info?.type || 'private';
+            const badge = document.getElementById('chat-type-badge');
+            badge.textContent = chatType;
+            badge.className = `badge ${getChatTypeBadgeClass(chatType)}`;
+
+            document.getElementById('chat-details').textContent = JSON.stringify(data, null, 2);
+
+            const s = data.settings || {};
+            document.getElementById('chat-mood').value = s.mood_alignment || '';
+            document.getElementById('chat-persona').value = s.custom_persona || '';
+            document.getElementById('chat-reactivity').value = s.reactivity_percentage || 0;
+            document.getElementById('chat-proactivity').value = s.proactivity_percentage || 0;
+            document.getElementById('chat-daily-theme').value = s.daily_game_theme || '';
+            document.getElementById('chat-greeting-html').value = s.greeting_html || '';
+
+            document.getElementById('chat-text-reply').checked = s.enable_global_text_reply;
+            document.getElementById('chat-draw-reply').checked = s.enable_global_draw_reply;
+            document.getElementById('chat-obscenifier').checked = s.enable_obscenifier;
+            document.getElementById('chat-profanity').checked = s.enable_profanity;
+            document.getElementById('chat-greet').checked = s.enable_greet_joiners;
+            document.getElementById('chat-daily-game').checked = s.enable_daily_game;
+        }
+
+        async function saveChatSettings() {
+            const id = document.getElementById('chat-id-input').value;
+            if (!id) return;
+            const body = {
+                chat_id: parseInt(id, 10),
+                mood_alignment: document.getElementById('chat-mood').value,
+                custom_persona: document.getElementById('chat-persona').value,
+                reactivity_percentage: parseInt(document.getElementById('chat-reactivity').value || '0', 10),
+                proactivity_percentage: parseInt(document.getElementById('chat-proactivity').value || '0', 10),
+                enable_global_text_reply: document.getElementById('chat-text-reply').checked,
+                enable_global_draw_reply: document.getElementById('chat-draw-reply').checked,
+                enable_obscenifier: document.getElementById('chat-obscenifier').checked,
+                enable_profanity: document.getElementById('chat-profanity').checked,
+                enable_greet_joiners: document.getElementById('chat-greet').checked,
+                enable_daily_game: document.getElementById('chat-daily-game').checked,
+                daily_game_theme: document.getElementById('chat-daily-theme').value,
+                greeting_html: document.getElementById('chat-greeting-html').value,
+            };
+            await apiCall('/chat/settings', { method: 'POST', body });
+            alert('Settings saved');
+        }
+
+        async function blockChat(mins) {
+            const id = document.getElementById('chat-id-input').value;
+            if (!id) return;
+            await apiCall(`/chat/block?chat_id=${id}&minutes=${mins}`, { method: 'POST' });
+            alert('Chat blocked');
+            loadChat();
+        }
+
+        async function unblockChat() {
+            const id = document.getElementById('chat-id-input').value;
+            if (!id) return;
+            await apiCall(`/chat/unblock?chat_id=${id}`, { method: 'DELETE' });
+            alert('Chat unblocked');
+            loadChat();
+        }
+
+        async function loadChatMembers() {
+            const id = document.getElementById('chat-id-input').value;
+            const data = await apiCall(`/chat/members?chat_id=${id}`);
+            if (!data) return;
+
+            const container = document.getElementById('chat-members-list');
+            let html = '<table class="table"><thead><tr><th>User ID</th><th>Role</th><th>Name</th><th>Username</th></tr></thead><tbody>';
+
+            data.members.forEach(m => {
+                const u = m.user || {};
+                html += `<tr>
+	                    <td class="mono">${m.member.user_id}</td>
+	                    <td>${m.member.status || ''}</td>
+	                    <td>${u.first_name || ''} ${u.last_name || ''}</td>
+	                    <td>${u.username || ''}</td>
+	                </tr>`;
+            });
+            html += '</tbody></table>';
+            container.innerHTML = html;
+        }
+
+        // --- Users ---
+        async function searchUsers() {
+            const q = (document.getElementById('user-search-input').value || '').trim();
+            const list = document.getElementById('user-list');
+            list.innerHTML = '';
+
+            if (!q && !confirm('Fetching ALL users may be slow. Continue?')) return;
+
+            const endpoint = q ? `/users?q=${encodeURIComponent(q)}` : '/users';
+            const data = await apiCall(endpoint);
+            if (!data || !data.users) return;
+
+            let users = data.users;
+            if (q) {
+                const query = q.toLowerCase();
+                users = users.filter(u =>
+                    String(u.id).includes(query) ||
+                    (u.username && u.username.toLowerCase().includes(query)) ||
+                    (u.first_name && u.first_name.toLowerCase().includes(query)) ||
+                    (u.last_name && u.last_name.toLowerCase().includes(query))
+                );
+            }
+
+            // Limit to 200 items in UI for performance
+            if (users.length > 200) {
+                const total = users.length;
+                users = users.slice(0, 200);
+                const info = document.createElement('div');
+                info.className = 'text-muted mb-2';
+                info.textContent = `Showing first 200 of ${total} users`;
+                list.appendChild(info);
+            }
+
+            users.forEach(u => {
+                const item = document.createElement('div');
+                item.className = 'list-item';
+                item.innerHTML = `
+                    <div style="font-weight: 500;">${u.first_name || ''} ${u.last_name || ''}</div>
+                    <div class="text-muted mono" style="font-size: 0.8rem;">@${u.username || '---'} | ${u.id}</div>
+                `;
+                item.onclick = () => {
+                    const detailsPane = document.getElementById('pane-users-details');
+                    const resizer = document.getElementById('resizer-users');
+                    const listPane = document.querySelector('#pane-users .pane-list');
+
+                    if (document.getElementById('user-id-input').value == u.id && !detailsPane.classList.contains('hidden')) {
+                        toggleUserDetails();
+                    } else {
+                        document.getElementById('user-id-input').value = u.id;
+                        loadUser();
+                        detailsPane.classList.remove('hidden');
+                        resizer.classList.remove('hidden');
+                        listPane.style.flex = '0 0 33%';
+                    }
+                };
+                list.appendChild(item);
+            });
+        }
+
+        async function loadUser() {
+            const id = document.getElementById('user-id-input').value;
+            const data = await apiCall(`/user?id=${id}`);
+            if (!data) return;
+            renderUserDetails(data);
+        }
+
+        async function loadUserByUsername() {
+            const uname = document.getElementById('user-username-input').value;
+            const data = await apiCall(`/user?username=${encodeURIComponent(uname)}`);
+            if (!data) return;
+            renderUserDetails(data);
+            document.getElementById('user-id-input').value = data.user.id;
+        }
+
+        function renderUserDetails(data) {
+            document.getElementById('user-details').textContent = JSON.stringify(data, null, 2);
+            renderVIPSummary(data?.vip_summary || null);
+            renderVIPEvents(data?.vip_events || []);
+            renderSubscriptions(data?.subscriptions || []);
+        }
+
+        function formatDateValue(value) {
+            if (!value) return '—';
+            const date = new Date(value);
+            if (Number.isNaN(date.getTime())) return value;
+            return date.toLocaleString();
+        }
+
+        function renderVIPSummary(summary) {
+            const container = document.getElementById('user-vip-summary');
+            if (!summary || summary.has_history !== true) {
+                container.innerHTML = '<div class="text-muted">No VIP history</div>';
+                return;
+            }
+
+            const rows = [
+                ['Active', summary.active ? 'yes' : 'no'],
+                ['Expires', formatDateValue(summary.expires_at)],
+                ['Remaining', `${summary.remaining_days || 0} days / ${summary.remaining_seconds || 0}s`],
+                ['Latest type', summary.latest_event_type || '—'],
+                ['Latest reason', summary.latest_reason || '—'],
+                ['Latest at', formatDateValue(summary.latest_created_at)],
+            ];
+
+            container.innerHTML = '<table><tbody>' + rows.map(([label, value]) =>
+                `<tr><td class="mono" style="width: 180px;">${escapeHtml(String(label))}</td><td>${escapeHtml(String(value))}</td></tr>`
+            ).join('') + '</tbody></table>';
+        }
+
+        function renderVIPEvents(events) {
+            const container = document.getElementById('user-vip-events');
+            if (!Array.isArray(events) || events.length === 0) {
+                container.innerHTML = '<div class="text-muted">No VIP events</div>';
+                return;
+            }
+
+            const header = `
+                <table>
+                    <thead>
+                        <tr>
+                            <th>ID</th>
+                            <th>Date</th>
+                            <th>Type</th>
+                            <th>Δ days</th>
+                            <th>Effective until</th>
+                            <th>Actor</th>
+                            <th>Reason</th>
+                            <th>Payment</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+            `;
+            const body = events.map(event => {
+                const subscriptionStatus = event.subscription_status
+                    ? `<br><span class="text-muted">${escapeHtml(String(event.subscription_status))}</span>`
+                    : '';
+                return `
+                <tr>
+                    <td class="mono">${escapeHtml(String(event.id ?? '—'))}</td>
+                    <td>${escapeHtml(formatDateValue(event.created_at))}</td>
+                    <td class="mono">${escapeHtml(String(event.event_type || '—'))}</td>
+                    <td class="mono">${escapeHtml(Number(event.delta_days || 0).toFixed(2))}</td>
+                    <td>${escapeHtml(formatDateValue(event.effective_expires_at))}</td>
+                    <td>${escapeHtml(String(event.actor_label || '—'))}</td>
+                    <td>${escapeHtml(String(event.reason || '—'))}</td>
+                    <td class="mono">${escapeHtml(String(event.telegram_payment_charge_id || '—'))}${subscriptionStatus}</td>
+                </tr>
+            `;
+            }).join('');
+            container.innerHTML = header + body + '</tbody></table>';
+        }
+
+        function renderSubscriptions(items) {
+            const container = document.getElementById('user-subscriptions');
+            if (!Array.isArray(items) || items.length === 0) {
+                container.innerHTML = '<div class="text-muted">No subscriptions</div>';
+                return;
+            }
+
+            const header = `
+                <table>
+                    <thead>
+                        <tr>
+                            <th>ID</th>
+                            <th>Created</th>
+                            <th>Expires</th>
+                            <th>Status</th>
+                            <th>Telegram charge</th>
+                            <th>Provider charge</th>
+                            <th>Canceled</th>
+                            <th>Refunded</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+            `;
+            const body = items.map(item => `
+                <tr>
+                    <td class="mono">${escapeHtml(String(item.id ?? '—'))}</td>
+                    <td>${escapeHtml(formatDateValue(item.created_at))}</td>
+                    <td>${escapeHtml(formatDateValue(item.expires_at))}</td>
+                    <td class="mono">${escapeHtml(String(item.status || '—'))}</td>
+                    <td class="mono">${escapeHtml(String(item.telegram_payment_charge_id || '—'))}</td>
+                    <td class="mono">${escapeHtml(String(item.provider_payment_charge_id || '—'))}</td>
+                    <td>${escapeHtml(formatDateValue(item.canceled_at))}</td>
+                    <td>${escapeHtml(formatDateValue(item.refunded_at))}</td>
+                </tr>
+            `).join('');
+            container.innerHTML = header + body + '</tbody></table>';
+        }
+
+        async function grantVIP() {
+            const id = document.getElementById('user-id-input').value;
+            const days = parseInt(document.getElementById('vip-days').value, 10);
+            const reason = (document.getElementById('vip-reason').value || '').trim();
+            if (!id || !days) return;
+            await apiCall('/user/grant_vip', { method: 'POST', body: { user_id: id, days, reason, vip: true } });
+            alert('VIP adjustment recorded');
+            loadUser();
+        }
+
+        async function revokeVIP() {
+            const id = document.getElementById('user-id-input').value;
+            const reason = (document.getElementById('vip-reason').value || '').trim();
+            if (!id) return;
+            await apiCall(`/user/revoke_vip?user_id=${id}&reason=${encodeURIComponent(reason)}`, { method: 'DELETE' });
+            alert('VIP revoked');
+            loadUser();
+        }
+
+        async function deleteUser() {
+            const id = document.getElementById('user-id-input').value;
+            if (!id || !confirm(`Delete user ${id}?`)) return;
+            await apiCall(`/user/delete?id=${id}`, { method: 'DELETE' });
+            alert('User deleted');
+            document.getElementById('user-details').textContent = '';
+            document.getElementById('user-vip-summary').innerHTML = '<div class="text-muted">No VIP summary loaded</div>';
+            document.getElementById('user-vip-events').innerHTML = '<div class="text-muted">No VIP events</div>';
+            document.getElementById('user-subscriptions').innerHTML = '<div class="text-muted">No subscriptions</div>';
+            searchUsers();
+        }
+
+        // --- Memory ---
+        let memoryCards = [];
+        let memoryRuns = [];
+
+        function memoryQueryParams() {
+            const params = new URLSearchParams();
+            const chatID = (document.getElementById('memory-chat-id')?.value || '').trim();
+            const userID = (document.getElementById('memory-user-id')?.value || '').trim();
+            const limit = Math.max(1, Math.min(500, parseInt(document.getElementById('memory-limit')?.value || '100', 10) || 100));
+            if (chatID) params.set('chat_id', chatID);
+            if (userID) params.set('user_id', userID);
+            params.set('limit', String(limit));
+            return params.toString();
+        }
+
+        async function loadMemoryCards() {
+            const data = await apiCall(`/memory/cards?${memoryQueryParams()}`);
+            memoryCards = Array.isArray(data?.cards) ? data.cards : [];
+            const meta = document.getElementById('memory-meta');
+            if (meta) meta.textContent = `${memoryCards.length} cards`;
+            renderMemoryCards();
+        }
+
+        function renderMemoryCards() {
+            const tbody = document.getElementById('memory-table-body');
+            if (!tbody) return;
+            if (!Array.isArray(memoryCards) || memoryCards.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="7" class="text-muted">No memory cards</td></tr>';
+                return;
+            }
+            tbody.innerHTML = memoryCards.map(card => `
+                <tr>
+                    <td class="mono">${escapeHtml(card?.id ?? '')}</td>
+                    <td>${escapeHtml(card?.visibility || '')}</td>
+                    <td>${escapeHtml(card?.card_type || '')}</td>
+                    <td>${escapeHtml(card?.fact_text || '')}</td>
+                    <td>${escapeHtml(Number(card?.confidence || 0).toFixed(2))}</td>
+                    <td>${escapeHtml(formatDateValue(card?.updated_at))}</td>
+                    <td><button class="btn btn-danger btn-sm" onclick="deleteMemoryCard(${Number(card?.id || 0)})">Delete</button></td>
+                </tr>
+            `).join('');
+        }
+
+        async function deleteMemoryCard(id) {
+            if (!id || !confirm(`Delete memory card ${id}?`)) return;
+            await apiCall(`/memory/cards?id=${encodeURIComponent(id)}`, { method: 'DELETE' });
+            await loadMemoryCards();
+        }
+
+        async function loadMemoryRuns() {
+            const data = await apiCall('/memory/runs?limit=100');
+            memoryRuns = Array.isArray(data?.runs) ? data.runs : [];
+            const meta = document.getElementById('memory-runs-meta');
+            if (meta) meta.textContent = `${memoryRuns.length} runs`;
+            renderMemoryRuns();
+        }
+
+        function renderMemoryRuns() {
+            const tbody = document.getElementById('memory-runs-table-body');
+            if (!tbody) return;
+            if (!Array.isArray(memoryRuns) || memoryRuns.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="9" class="text-muted">No memory runs</td></tr>';
+                return;
+            }
+            tbody.innerHTML = memoryRuns.map(run => {
+                const cards = Number(run?.cards_inserted || 0) + Number(run?.cards_updated || 0);
+                const inputTokens = Number(run?.input_token_estimate || 0);
+                const outputTokens = Number(run?.output_token_estimate || 0);
+                const tokenText = inputTokens || outputTokens ? `${formatAnalyticsCount(inputTokens)} / ${formatAnalyticsCount(outputTokens)}` : '—';
+                const retry = run?.status === 'failed'
+                    ? `<button class="btn btn-outline btn-sm" onclick="retryMemoryRun(${Number(run?.id || 0)})">Retry</button> <button class="btn btn-primary btn-sm" onclick="retryMemoryRunWithOverride(${Number(run?.id || 0)})">Force</button>`
+                    : '';
+                return `
+                    <tr>
+                        <td class="mono">${escapeHtml(run?.id ?? '')}</td>
+                        <td>${escapeHtml(run?.status || '')}</td>
+                        <td class="mono">${escapeHtml(run?.chat_id ?? '')}${run?.thread_id ? '/' + escapeHtml(run.thread_id) : ''}</td>
+                        <td>${escapeHtml(formatDateValue(run?.range_start_at))}<br>${escapeHtml(formatDateValue(run?.range_end_at))}</td>
+                        <td>${escapeHtml(run?.message_count ?? 0)}</td>
+                        <td class="mono">${escapeHtml(tokenText)}</td>
+                        <td>${escapeHtml(cards)}</td>
+                        <td>${escapeHtml(run?.error || '')}</td>
+                        <td>${retry}</td>
+                    </tr>
+                `;
+            }).join('');
+        }
+
+        function memoryOverrideQueryParams() {
+            const params = new URLSearchParams();
+            params.set('override', 'true');
+            const provider = (document.getElementById('memory-override-provider')?.value || '').trim();
+            const model = (document.getElementById('memory-override-model')?.value || '').trim();
+            if (provider) params.set('provider', provider);
+            if (model) params.set('model', model);
+            return params;
+        }
+
+        function memoryRestartMessage(result, prefix) {
+            const mode = result?.override
+                ? ` via ${result?.provider || 'override'}${result?.model ? '/' + result.model : ''}`
+                : '';
+            const action = result?.override && !result?.started
+                ? prefix.replace('queued', 'not queued')
+                : prefix;
+            return `${action}${mode}; worker ${result?.started ? 'started' : 'already running'}`;
+        }
+
+        async function retryMemoryRun(id, useOverride = false) {
+            if (!id) return;
+            const params = useOverride ? memoryOverrideQueryParams() : new URLSearchParams();
+            params.set('id', String(id));
+            const result = await apiCall(`/memory/restart?${params.toString()}`, { method: 'POST' });
+            const meta = document.getElementById('memory-runs-meta');
+            if (meta) {
+                meta.textContent = memoryRestartMessage(result, `Run ${id} queued`);
+            }
+            await loadMemoryRuns();
+        }
+
+        async function retryMemoryRunWithOverride(id) {
+            if (!id || !confirm(`Force retry memory run ${id} with the selected provider/model?`)) return;
+            await retryMemoryRun(id, true);
+        }
+
+        async function restartFailedMemoryRuns() {
+            if (!confirm('Restart all failed memory runs and kick the worker now?')) return;
+            const result = await apiCall('/memory/restart', { method: 'POST' });
+            const retried = Number(result?.retried_failed_runs || 0);
+            const meta = document.getElementById('memory-runs-meta');
+            if (meta) {
+                meta.textContent = memoryRestartMessage(result, `${retried} failed runs queued`);
+            }
+            await loadMemoryRuns();
+        }
+
+        async function runMemoryNow() {
+            if (!confirm('Queue missing memory consolidation runs and kick the worker now?')) return;
+            const result = await apiCall('/memory/restart?run_now=true', { method: 'POST' });
+            const queued = Number(result?.queued_runs || 0);
+            const meta = document.getElementById('memory-runs-meta');
+            if (meta) {
+                meta.textContent = memoryRestartMessage(result, `${queued} new runs queued`);
+            }
+            await loadMemoryRuns();
+        }
+
+        async function runMemoryNowWithOverride() {
+            if (!confirm('Force memory consolidation now with the selected provider/model?')) return;
+            const params = memoryOverrideQueryParams();
+            params.set('run_now', 'true');
+            const result = await apiCall(`/memory/restart?${params.toString()}`, { method: 'POST' });
+            const queued = Number(result?.queued_runs || 0);
+            const meta = document.getElementById('memory-runs-meta');
+            if (meta) {
+                meta.textContent = memoryRestartMessage(result, `${queued} new runs queued`);
+            }
+            await loadMemoryRuns();
+        }
+
+        async function restartFailedMemoryRunsWithOverride() {
+            if (!confirm('Force restart failed memory runs with the selected provider/model?')) return;
+            const params = memoryOverrideQueryParams();
+            const result = await apiCall(`/memory/restart?${params.toString()}`, { method: 'POST' });
+            const retried = Number(result?.retried_failed_runs || 0);
+            const meta = document.getElementById('memory-runs-meta');
+            if (meta) {
+                meta.textContent = memoryRestartMessage(result, `${retried} failed runs queued`);
+            }
+            await loadMemoryRuns();
+        }
+
+        // --- Shield ---
+        let shieldDocuments = [];
+
+        function shieldCategoryBadgeClass(category) {
+            const map = {
+                self_harm: 'badge-shield-red',
+                mental_health: 'badge-shield-violet',
+                child_safety: 'badge-shield-red',
+                violence: 'badge-shield-orange',
+                illegal: 'badge-shield-yellow',
+                abuse: 'badge-shield-violet',
+                medical: 'badge-shield-cyan'
+            };
+            return map[String(category || '').trim()] || 'badge-shield-neutral';
+        }
+
+        async function loadShieldDocuments() {
+            const params = new URLSearchParams();
+            const q = (document.getElementById('shield-search')?.value || '').trim();
+            if (q) params.set('q', q);
+            params.set('include_disabled', 'true');
+            params.set('limit', '500');
+            const data = await apiCall(`/shield/documents?${params.toString()}`);
+            shieldDocuments = Array.isArray(data?.documents) ? data.documents : [];
+            const meta = document.getElementById('shield-meta');
+            if (meta) meta.textContent = `${shieldDocuments.length} documents`;
+            renderShieldDocuments();
+        }
+
+        function renderShieldDocuments() {
+            const tbody = document.getElementById('shield-table-body');
+            if (!tbody) return;
+            if (!Array.isArray(shieldDocuments) || shieldDocuments.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="6" class="text-muted">No Shield documents</td></tr>';
+                return;
+            }
+            tbody.innerHTML = shieldDocuments.map(doc => {
+                const category = doc?.category || 'general';
+                const title = String(doc?.title || '');
+                const shortTitle = title.length > 110 ? title.slice(0, 107) + '...' : title;
+                const stateClass = doc?.enabled ? 'badge-success' : 'badge-danger';
+                const stateText = doc?.enabled ? 'enabled' : 'disabled';
+                return `
+                    <tr>
+                        <td class="mono">${escapeHtml(doc?.id ?? '')}</td>
+                        <td><span class="badge ${shieldCategoryBadgeClass(category)}">${escapeHtml(category)}</span></td>
+                        <td>${escapeHtml(shortTitle)}</td>
+                        <td class="mono">${escapeHtml(doc?.priority ?? 0)}</td>
+                        <td><span class="badge ${stateClass}">${stateText}</span></td>
+                        <td>
+                            <button type="button" class="btn btn-outline btn-sm" onclick="editShieldDocument(${Number(doc?.id || 0)})">Edit</button>
+                            <button type="button" class="btn btn-danger btn-sm" onclick="deleteShieldDocument(${Number(doc?.id || 0)})">Delete</button>
+                        </td>
+                    </tr>
+                `;
+            }).join('');
+        }
+
+        function resetShieldForm() {
+            document.getElementById('shield-id').value = '';
+            document.getElementById('shield-slug').value = '';
+            document.getElementById('shield-category').value = '';
+            document.getElementById('shield-title').value = '';
+            document.getElementById('shield-body').value = '';
+            document.getElementById('shield-priority').value = '0';
+            document.getElementById('shield-enabled').checked = true;
+        }
+
+        function editShieldDocument(id) {
+            const doc = shieldDocuments.find(item => Number(item?.id) === Number(id));
+            if (!doc) return;
+            document.getElementById('shield-id').value = String(doc.id || '');
+            document.getElementById('shield-slug').value = doc.slug || '';
+            document.getElementById('shield-category').value = doc.category || '';
+            document.getElementById('shield-title').value = doc.title || '';
+            document.getElementById('shield-body').value = doc.body || '';
+            document.getElementById('shield-priority').value = String(doc.priority || 0);
+            document.getElementById('shield-enabled').checked = !!doc.enabled;
+        }
+
+        function shieldFormPayload() {
+            return {
+                id: parseInt(document.getElementById('shield-id').value || '0', 10) || 0,
+                slug: (document.getElementById('shield-slug').value || '').trim(),
+                title: (document.getElementById('shield-title').value || '').trim(),
+                body: (document.getElementById('shield-body').value || '').trim(),
+                category: (document.getElementById('shield-category').value || '').trim(),
+                priority: parseInt(document.getElementById('shield-priority').value || '0', 10) || 0,
+                enabled: document.getElementById('shield-enabled').checked
+            };
+        }
+
+        async function saveShieldDocument() {
+            const payload = shieldFormPayload();
+            if (!payload.title || !payload.body) {
+                alert('Title and body are required');
+                return;
+            }
+            const isUpdate = payload.id > 0;
+            const endpoint = isUpdate ? `/shield/documents?id=${encodeURIComponent(payload.id)}` : '/shield/documents';
+            const method = isUpdate ? 'PUT' : 'POST';
+            const saved = await apiCall(endpoint, { method, body: payload });
+            await loadShieldDocuments();
+            if (saved?.id) editShieldDocument(saved.id);
+        }
+
+        async function deleteSelectedShieldDocument() {
+            const id = parseInt(document.getElementById('shield-id').value || '0', 10) || 0;
+            if (!id) return;
+            await deleteShieldDocument(id);
+        }
+
+        async function deleteShieldDocument(id) {
+            if (!id || !confirm(`Delete Shield document ${id}?`)) return;
+            await apiCall(`/shield/documents?id=${encodeURIComponent(id)}`, { method: 'DELETE' });
+            resetShieldForm();
+            await loadShieldDocuments();
+        }
+
+        async function rebuildShieldEmbeddings() {
+            if (!confirm('Rebuild missing Shield title embeddings now?')) return;
+            const result = await apiCall('/shield/embeddings/rebuild', { method: 'POST' });
+            const meta = document.getElementById('shield-meta');
+            if (meta) meta.textContent = `Rebuild processed ${result?.processed || 0}, failed ${result?.failed || 0}`;
+            await loadShieldDocuments();
+        }
+
+        function formatShieldScore(value) {
+            const num = Number(value || 0);
+            return Number.isFinite(num) ? num.toFixed(3) : '0.000';
+        }
+
+        function formatShieldCandidate(item) {
+            const doc = item?.document || {};
+            const matched = item?.matched === true ? 'matched' : 'debug-only';
+            const signals = Array.isArray(item?.signals) && item.signals.length ? ` signals=${item.signals.join(',')}` : '';
+            return `  - [${matched}] ${doc.category || 'uncategorized'}/${doc.slug || doc.id || 'unknown'} L=${formatShieldScore(item?.lexical_score)} V=${formatShieldScore(item?.vector_score)}${signals}`;
+        }
+
+        function formatShieldTestResult(result) {
+            const matches = Array.isArray(result?.matches) ? result.matches : [];
+            const candidates = Array.isArray(result?.candidates) ? result.candidates : [];
+            const debug = result?.debug || {};
+            const lines = [];
+
+            if (result?.expected_category) {
+                lines.push(`expected_category: ${result.expected_category}`);
+                lines.push(`category_matched: ${result.category_matched === true ? 'yes' : 'no'}`);
+                lines.push('');
+            }
+
+            lines.push(`lexical_only: ${result?.lexical_only === true ? 'yes' : 'no'}`);
+            if (debug.lexical_min_score !== undefined || debug.vector_min_score !== undefined) {
+                lines.push(`thresholds: lexical>=${formatShieldScore(debug.lexical_min_score)} vector>=${formatShieldScore(debug.vector_min_score)} max_matches=${debug.max_matches || matches.length}`);
+            }
+            lines.push('');
+
+            lines.push('Injected matches (sent to LLM):');
+            if (!matches.length) {
+                lines.push('  none');
+            } else {
+                matches.forEach((item) => lines.push(formatShieldCandidate({ ...item, matched: true })));
+            }
+            lines.push('');
+
+            lines.push('Debug candidates (not sent unless marked matched):');
+            if (!candidates.length) {
+                lines.push('  none');
+            } else {
+                candidates.forEach((item) => lines.push(formatShieldCandidate(item)));
+            }
+            lines.push('');
+
+            if (result?.context) {
+                lines.push('Context preview:');
+                lines.push(result.context.slice(0, 1200));
+                lines.push('');
+            }
+
+            lines.push('Raw JSON:');
+            lines.push(JSON.stringify(result, null, 2));
+            return lines.join('\n');
+        }
+
+        async function testShieldQuery() {
+            const query = (document.getElementById('shield-test-query').value || '').trim();
+            if (!query) return;
+            const expected_category = (document.getElementById('shield-test-category').value || '').trim();
+            const body = { query, debug: true };
+            if (expected_category) body.expected_category = expected_category;
+            const result = await apiCall('/shield/test', { method: 'POST', body });
+            document.getElementById('shield-test-result').textContent = formatShieldTestResult(result);
+        }
+
+        // --- LLM Context ---
+        let llmRequests = [];
+        let llmRequestsLoaded = false;
+        let selectedLLMRequestID = null;
+
+        const LLM_TYPE_PALETTE = [
+            { bg: 'rgba(34, 211, 238, 0.16)', border: 'rgba(34, 211, 238, 0.42)', text: '#67e8f9' },
+            { bg: 'rgba(16, 185, 129, 0.16)', border: 'rgba(16, 185, 129, 0.42)', text: '#6ee7b7' },
+            { bg: 'rgba(245, 158, 11, 0.18)', border: 'rgba(245, 158, 11, 0.44)', text: '#fbbf24' },
+            { bg: 'rgba(239, 68, 68, 0.15)', border: 'rgba(239, 68, 68, 0.40)', text: '#fca5a5' },
+            { bg: 'rgba(168, 85, 247, 0.16)', border: 'rgba(168, 85, 247, 0.42)', text: '#d8b4fe' },
+            { bg: 'rgba(20, 184, 166, 0.16)', border: 'rgba(20, 184, 166, 0.42)', text: '#5eead4' },
+            { bg: 'rgba(244, 114, 182, 0.16)', border: 'rgba(244, 114, 182, 0.42)', text: '#f9a8d4' },
+            { bg: 'rgba(132, 204, 22, 0.16)', border: 'rgba(132, 204, 22, 0.42)', text: '#bef264' },
+        ];
+
+        function safeStringify(obj) {
+            try {
+                return JSON.stringify(obj, null, 2);
+            } catch (e) {
+                return String(obj);
+            }
+        }
+
+        function compactLLMText(value, limit) {
+            const compact = String(value || '').replace(/\s+/g, ' ').trim();
+            if (!compact || !limit || compact.length <= limit) return compact;
+            return compact.slice(0, limit) + '…';
+        }
+
+        function llmField(req, snake, camel) {
+            if (!req) return undefined;
+            if (req[snake] !== undefined && req[snake] !== null) return req[snake];
+            if (camel && req[camel] !== undefined && req[camel] !== null) return req[camel];
+            return undefined;
+        }
+
+        function humanizeLLMType(value) {
+            const raw = String(value || '').trim();
+            if (!raw) return 'unknown';
+            return raw
+                .replace(/^chat_flow_/, 'chat / ')
+                .replace(/^aifarm_/, 'aifarm / ')
+                .replace(/^geminiadapter$/, 'gemini adapter')
+                .replace(/[._-]+/g, ' ')
+                .replace(/\s+\/\s+/g, ' / ')
+                .replace(/\s+/g, ' ')
+                .trim();
+        }
+
+        function llmRequestType(req) {
+            const source = String(req?.source || '').trim();
+            const flow = String(req?.flow || '').trim();
+            const requestKind = String(llmField(req, 'request_kind', 'requestKind') || '').trim();
+            const provider = String(req?.provider || '').trim();
+            let key = source || flow || requestKind || provider || 'unknown';
+            if (source === 'aifarm' && flow) key = `${source}:${flow}`;
+            const label = humanizeLLMType(key);
+            return { key, label };
+        }
+
+        function llmTypePalette(key) {
+            const value = String(key || 'unknown');
+            let hash = 0;
+            for (let i = 0; i < value.length; i += 1) {
+                hash = ((hash << 5) - hash + value.charCodeAt(i)) | 0;
+            }
+            return LLM_TYPE_PALETTE[Math.abs(hash) % LLM_TYPE_PALETTE.length];
+        }
+
+        function llmTypeStyle(key) {
+            const palette = llmTypePalette(key);
+            return `--llm-type-bg: ${palette.bg}; --llm-type-border: ${palette.border}; --llm-type-text: ${palette.text};`;
+        }
+
+        function extractTextFromPart(part) {
+            if (!part) return '';
+            if (typeof part.text === 'string' && part.text.trim() !== '') return part.text;
+            if (typeof part.data === 'string' && part.data.trim() !== '') return part.data;
+            if (typeof part.reasoning === 'string' && part.reasoning.trim() !== '') return part.reasoning;
+
+            if (part.media && part.media.url) {
+                const ct = part.media.contentType || '';
+                return `[media${ct ? ':' + ct : ''}] ${part.media.url}`;
+            }
+            if (part.toolRequest) {
+                const name = part.toolRequest.name || 'tool';
+                const input = part.toolRequest.input !== undefined ? part.toolRequest.input : '';
+                const rendered = typeof input === 'string' ? input : safeStringify(input);
+                return `[toolRequest:${name}] ${rendered}`.trim();
+            }
+            if (part.toolResponse) {
+                const name = part.toolResponse.name || 'tool';
+                const output = part.toolResponse.output !== undefined ? part.toolResponse.output : '';
+                const rendered = typeof output === 'string' ? output : safeStringify(output);
+                return `[toolResponse:${name}] ${rendered}`.trim();
+            }
+            if (part.resource && part.resource.uri) {
+                return `[resource] ${part.resource.uri}`;
+            }
+            if (part.custom) {
+                return `[custom] ${safeStringify(part.custom)}`;
+            }
+            return '';
+        }
+
+        function extractTextFromMessage(message) {
+            if (!message || !Array.isArray(message.content)) return '';
+            return message.content.map(extractTextFromPart).filter(Boolean).join('\n');
+        }
+
+        function extractTextFromJSONValue(value) {
+            const chunks = [];
+            const visit = value => {
+                if (!value) return;
+                if (typeof value === 'string') {
+                    chunks.push(value);
+                    return;
+                }
+                if (Array.isArray(value)) {
+                    value.forEach(visit);
+                    return;
+                }
+                if (typeof value !== 'object') return;
+                if (typeof value.content === 'string') chunks.push(value.content);
+                if (typeof value.text === 'string') chunks.push(value.text);
+                Object.values(value).forEach(child => {
+                    if (child !== value.content && child !== value.text) visit(child);
+                });
+            };
+            visit(value);
+            return chunks.join('\n');
+        }
+
+        function extractTextFromRawLLMRequest(req) {
+            return extractTextFromJSONValue(llmRawRequestValue(req));
+        }
+
+        function extractTextFromRawLLMResponse(req) {
+            return extractTextFromJSONValue(llmRawResponseValue(req));
+        }
+
+        function llmResponsePreview(req) {
+            const direct = req?.result?.response_text_preview || req?.result?.responseTextPreview;
+            if (direct) return compactLLMText(direct, 180);
+            return compactLLMText(extractTextFromRawLLMResponse(req), 180);
+        }
+
+        function llmRequestMatchesQuery(req, q) {
+            if (!q) return true;
+            try {
+                const type = llmRequestType(req);
+                const hay = [
+                    req?.id,
+                    req?.provider,
+                    llmField(req, 'request_kind', 'requestKind'),
+                    req?.source,
+                    req?.flow,
+                    type.key,
+                    type.label,
+                    req?.model,
+                    req?.iteration,
+                    req?.chat?.chat_id,
+                    req?.user?.user_id,
+                    req?.message?.message_id,
+                    req?.result?.error,
+                    req?.result?.response_text_preview,
+                    req?.result?.responseTextPreview,
+                    req?.prompt_chars,
+                    req?.docs_chars,
+                ].join(' ').toLowerCase();
+                if (hay.includes(q)) return true;
+            } catch (_) { }
+
+            try {
+                const rawText = extractTextFromRawLLMRequest(req);
+                if (rawText && rawText.toLowerCase().includes(q)) return true;
+                const responseText = extractTextFromRawLLMResponse(req);
+                if (responseText && responseText.toLowerCase().includes(q)) return true;
+                if (Array.isArray(req?.messages)) {
+                    for (const msg of req.messages) {
+                        const text = extractTextFromMessage(msg);
+                        if (text && text.toLowerCase().includes(q)) return true;
+                    }
+                }
+            } catch (_) { }
+
+            return false;
+        }
+
+        function renderLLMRequests() {
+            const list = document.getElementById('llm-requests-list');
+            if (!list) return;
+
+            const q = (document.getElementById('llm-search-input')?.value || '').toLowerCase().trim();
+            const filtered = (llmRequests || []).filter(r => llmRequestMatchesQuery(r, q));
+
+            list.innerHTML = '';
+            filtered.forEach(req => {
+                const item = document.createElement('div');
+                item.className = 'list-item';
+                item.dataset.llmRequestId = String(req.id);
+                if (selectedLLMRequestID === req.id) item.classList.add('active');
+
+                const at = req.at ? new Date(req.at).toLocaleString() : '---';
+                const chatID = req.chat?.chat_id ?? '---';
+                const msgID = req.message?.message_id ?? '---';
+                const model = req.model || '---';
+                const iter = req.iteration || 0;
+                const err = req.result?.error ? 'ERROR' : '';
+                const type = llmRequestType(req);
+
+                let preview = llmResponsePreview(req);
+                const previewKind = preview ? 'response' : 'request';
+                if (!preview) preview = extractTextFromRawLLMRequest(req);
+                const userMsg = Array.isArray(req.messages) ? req.messages.find(m => m && m.role === 'user') : null;
+                if (!preview && userMsg) preview = extractTextFromMessage(userMsg);
+                if (!preview && Array.isArray(req.messages) && req.messages.length > 0) preview = extractTextFromMessage(req.messages[req.messages.length - 1]);
+                preview = compactLLMText(preview, 160);
+
+                item.innerHTML = `
+                    <div class="llm-list-topline">
+                        <div style="font-weight: 600;">${escapeHtml(at)}</div>
+                        <span class="badge llm-model-badge">${escapeHtml(model)}</span>
+                    </div>
+                    <div class="llm-list-tags">
+                        <span class="llm-type-pill" style="${llmTypeStyle(type.key)}" title="${escapeHtml(type.key)}">${escapeHtml(type.label)}</span>
+                        <span class="llm-preview-source">${previewKind}</span>
+                    </div>
+                    <div class="text-muted mono" style="font-size: 0.8rem; margin-top: 4px;">
+                        chat:${escapeHtml(String(chatID))} msg:${escapeHtml(String(msgID))} iter:${escapeHtml(String(iter))} ${err ? '| ' + err : ''}
+                    </div>
+                    <div class="llm-preview ${previewKind === 'response' ? 'llm-preview-answer' : 'text-muted'}">
+                        ${escapeHtml(preview || '—')}
+                    </div>
+                `;
+                item.onclick = () => selectLLMRequest(req.id);
+                list.appendChild(item);
+            });
+        }
+
+        function updateSelectedLLMRequestInList() {
+            const list = document.getElementById('llm-requests-list');
+            if (!list) return;
+            list.querySelectorAll('.list-item').forEach(el => {
+                const id = el.dataset.llmRequestId;
+                if (id && selectedLLMRequestID != null && id === String(selectedLLMRequestID)) {
+                    el.classList.add('active');
+                } else {
+                    el.classList.remove('active');
+                }
+            });
+        }
+
+        function clearLLMDetails() {
+            const details = document.getElementById('llm-request-details');
+            if (details) details.textContent = '';
+            clearLLMContextJSON();
+            selectedLLMRequestID = null;
+            updateSelectedLLMRequestInList();
+
+            const detailsPane = document.getElementById('pane-llm-details');
+            const resizer = document.getElementById('resizer-llm');
+            const listPane = document.querySelector('#pane-llm .pane-list');
+            if (detailsPane) detailsPane.classList.add('hidden');
+            if (resizer) resizer.classList.add('hidden');
+            if (listPane) listPane.style.flex = '1';
+        }
+
+        function selectLLMRequest(id) {
+            const detailsPane = document.getElementById('pane-llm-details');
+            const resizer = document.getElementById('resizer-llm');
+            const listPane = document.querySelector('#pane-llm .pane-list');
+
+            if (selectedLLMRequestID == id && detailsPane && !detailsPane.classList.contains('hidden')) {
+                toggleLLMDetails();
+                return;
+            }
+
+            selectedLLMRequestID = id;
+            updateSelectedLLMRequestInList();
+
+            const req = (llmRequests || []).find(r => r && r.id === id);
+            const details = document.getElementById('llm-request-details');
+
+            if (!req) {
+                clearLLMDetails();
+                return;
+            }
+
+            if (detailsPane) detailsPane.classList.remove('hidden');
+            if (resizer) resizer.classList.remove('hidden');
+            if (listPane) listPane.style.flex = '0 0 33%';
+
+            if (details) {
+                const meta = JSON.parse(JSON.stringify(req));
+                delete meta.messages;
+                delete meta.docs;
+                delete meta.raw_request;
+                delete meta.rawRequest;
+                delete meta.resolved_cache_content;
+                delete meta.resolvedCacheContent;
+                delete meta.raw_response;
+                delete meta.rawResponse;
+                details.textContent = JSON.stringify(meta, null, 2);
+            }
+
+            updateLLMContextJSON(req);
+        }
+
+        function clearLLMContextJSON() {
+            const container = document.getElementById('llm-context-json');
+            const empty = document.getElementById('llm-context-json-empty');
+            if (container) container.innerHTML = '';
+            if (empty) {
+                empty.textContent = '';
+                empty.style.display = 'none';
+            }
+        }
+
+        function normalizeRawJSONValue(value) {
+            if (typeof value !== 'string') return value;
+            const trimmed = value.trim();
+            if (!trimmed) return value;
+            try {
+                return JSON.parse(trimmed);
+            } catch (_) {
+                return value;
+            }
+        }
+
+        function llmResolvedCacheContentValue(req) {
+            if (!req) return null;
+            if (req.resolved_cache_content !== undefined && req.resolved_cache_content !== null) {
+                return normalizeRawJSONValue(req.resolved_cache_content);
+            }
+            if (req.resolvedCacheContent !== undefined && req.resolvedCacheContent !== null) {
+                return normalizeRawJSONValue(req.resolvedCacheContent);
+            }
+            return null;
+        }
+
+        function llmRawResponseValue(req) {
+            if (!req) return null;
+            if (req.raw_response !== undefined && req.raw_response !== null) return normalizeRawJSONValue(req.raw_response);
+            if (req.rawResponse !== undefined && req.rawResponse !== null) return normalizeRawJSONValue(req.rawResponse);
+            const transport = normalizeRawJSONValue(req.transport);
+            if (transport && typeof transport === 'object' && transport.response !== undefined && transport.response !== null) {
+                return normalizeRawJSONValue(transport.response);
+            }
+            return null;
+        }
+
+        function llmRawRequestValue(req) {
+            if (!req) return null;
+            const resolvedCacheContent = llmResolvedCacheContentValue(req);
+            const withResolvedCache = raw => {
+                if (resolvedCacheContent === null || resolvedCacheContent === undefined) return raw;
+                return {
+                    raw_provider_request: raw,
+                    resolved_cached_content: resolvedCacheContent,
+                };
+            };
+            if (req.raw_request !== undefined && req.raw_request !== null) return withResolvedCache(normalizeRawJSONValue(req.raw_request));
+            if (req.rawRequest !== undefined && req.rawRequest !== null) return withResolvedCache(normalizeRawJSONValue(req.rawRequest));
+            if (Array.isArray(req.messages) || Array.isArray(req.docs)) {
+                return withResolvedCache({ messages: req.messages || [], docs: req.docs || [] });
+            }
+            if (resolvedCacheContent !== null && resolvedCacheContent !== undefined) {
+                return { resolved_cached_content: resolvedCacheContent };
+            }
+            return null;
+        }
+
+        function llmContextValue(req) {
+            if (!req) return null;
+            const context = {
+                type: llmRequestType(req),
+                request: llmRawRequestValue(req),
+                response: llmRawResponseValue(req),
+                result: req.result || null,
+            };
+            if (req.usage) context.usage = normalizeRawJSONValue(req.usage);
+            if (req.timings) context.timings = normalizeRawJSONValue(req.timings);
+            if (req.inference_params || req.inferenceParams) {
+                context.inference_params = normalizeRawJSONValue(req.inference_params || req.inferenceParams);
+            }
+            if (req.transport) context.transport = normalizeRawJSONValue(req.transport);
+            Object.keys(context).forEach(key => {
+                if (context[key] === null || context[key] === undefined) delete context[key];
+            });
+            return Object.keys(context).length > 1 ? context : null;
+        }
+
+        function jsonNodeKind(value) {
+            if (value === null) return 'null';
+            if (Array.isArray(value)) return 'array';
+            return typeof value;
+        }
+
+        function jsonNodeSummary(value) {
+            if (Array.isArray(value)) return `[${value.length}]`;
+            if (value && typeof value === 'object') return `{${Object.keys(value).length}}`;
+            if (typeof value === 'string') {
+                const compact = value.replace(/\s+/g, ' ').trim();
+                return JSON.stringify(compact.length > 160 ? compact.slice(0, 160) + '...' : compact);
+            }
+            return JSON.stringify(value);
+        }
+
+        function isExpandableJSONString(value) {
+            if (typeof value !== 'string') return false;
+            if (value.length > 220) return true;
+            const trimmed = value.trim();
+            return trimmed.includes('\n') ||
+                trimmed.startsWith('<message') ||
+                trimmed.startsWith('<last_message') ||
+                trimmed.startsWith('<assistant_message') ||
+                trimmed.startsWith('<chat_context') ||
+                trimmed.startsWith('<chat_system_contract') ||
+                trimmed.startsWith('<multi_turn_transport') ||
+                trimmed.startsWith('<tool_result') ||
+                trimmed.startsWith('<system_contract');
+        }
+
+        function buildJSONNode(key, value, depth) {
+            const kind = jsonNodeKind(value);
+            const isObject = value && typeof value === 'object';
+            const isExpandableString = isExpandableJSONString(value);
+            const hasChildren = isObject || isExpandableString;
+
+            const nodeEl = document.createElement('div');
+            nodeEl.className = 'json-node';
+            if (depth === 0) nodeEl.classList.add('root');
+            if (hasChildren && depth > 0) nodeEl.classList.add('collapsed');
+
+            const header = document.createElement('div');
+            header.className = 'json-node-header';
+            if (hasChildren) header.dataset.toggle = 'true';
+
+            const toggle = document.createElement('span');
+            toggle.className = 'json-node-toggle';
+            toggle.textContent = hasChildren ? (nodeEl.classList.contains('collapsed') ? '▸' : '▾') : '';
+            header.appendChild(toggle);
+
+            const keyEl = document.createElement('span');
+            keyEl.className = 'json-node-key';
+            keyEl.textContent = key;
+            header.appendChild(keyEl);
+
+            const typeEl = document.createElement('span');
+            typeEl.className = 'json-node-type';
+            typeEl.textContent = kind;
+            header.appendChild(typeEl);
+
+            const summary = document.createElement('span');
+            summary.className = 'json-node-value';
+            summary.textContent = jsonNodeSummary(value);
+            header.appendChild(summary);
+            nodeEl.appendChild(header);
+
+            if (hasChildren) {
+                const childrenEl = document.createElement('div');
+                childrenEl.className = 'json-node-children';
+                if (Array.isArray(value)) {
+                    value.forEach((item, index) => childrenEl.appendChild(buildJSONNode(`[${index}]`, item, depth + 1)));
+                } else if (isObject) {
+                    Object.keys(value).sort().forEach(childKey => {
+                        childrenEl.appendChild(buildJSONNode(childKey, value[childKey], depth + 1));
+                    });
+                } else {
+                    const textEl = document.createElement('pre');
+                    textEl.className = 'json-string-full';
+                    textEl.textContent = value;
+                    childrenEl.appendChild(textEl);
+                }
+                nodeEl.appendChild(childrenEl);
+            }
+
+            return nodeEl;
+        }
+
+        function bindJSONTree(container) {
+            if (!container || container.dataset.bound === 'true') return;
+            container.dataset.bound = 'true';
+            container.addEventListener('click', event => {
+                const header = event.target.closest('.json-node-header[data-toggle="true"]');
+                if (!header || !container.contains(header)) return;
+                const nodeEl = header.parentElement;
+                if (!nodeEl) return;
+                nodeEl.classList.toggle('collapsed');
+                const toggle = header.querySelector('.json-node-toggle');
+                if (toggle) {
+                    toggle.textContent = nodeEl.classList.contains('collapsed') ? '▸' : '▾';
+                }
+            });
+            container.addEventListener('click', event => {
+                const nodeEl = event.target.closest('.json-node');
+                if (!nodeEl || !container.contains(nodeEl)) return;
+                setJSONActive(container, nodeEl);
+            });
+        }
+
+        function clearJSONActive(container) {
+            if (!container) return;
+            container.querySelectorAll('.json-node.is-active, .json-node.is-active-ancestor').forEach(node => {
+                node.classList.remove('is-active');
+                node.classList.remove('is-active-ancestor');
+            });
+        }
+
+        function setJSONActive(container, nodeEl) {
+            if (!container || !nodeEl) return;
+            clearJSONActive(container);
+            nodeEl.classList.add('is-active');
+            let parent = nodeEl.parentElement;
+            while (parent && parent !== container) {
+                if (parent.classList && parent.classList.contains('json-node')) {
+                    parent.classList.add('is-active-ancestor');
+                }
+                parent = parent.parentElement;
+            }
+        }
+
+        function updateLLMContextJSON(req) {
+            const container = document.getElementById('llm-context-json');
+            const empty = document.getElementById('llm-context-json-empty');
+            if (!container || !empty) return;
+            container.innerHTML = '';
+            empty.textContent = '';
+            empty.style.display = 'none';
+
+            const context = llmContextValue(req);
+            if (context === null || context === undefined) {
+                empty.textContent = 'No raw provider context captured';
+                empty.style.display = 'block';
+                return;
+            }
+
+            container.appendChild(buildJSONNode('llm_context', context, 0));
+            bindJSONTree(container);
+        }
+
+        function setAllJSONNodesCollapsed(collapsed) {
+            const container = document.getElementById('llm-context-json');
+            if (!container) return;
+            container.querySelectorAll('.json-node').forEach(node => {
+                const header = node.querySelector(':scope > .json-node-header[data-toggle="true"]');
+                if (!header) return;
+                node.classList.toggle('collapsed', collapsed && !node.classList.contains('root'));
+                const toggle = header.querySelector('.json-node-toggle');
+                if (toggle) toggle.textContent = node.classList.contains('collapsed') ? '▸' : '▾';
+            });
+        }
+
+        function expandLLMJSONTree() {
+            setAllJSONNodesCollapsed(false);
+        }
+
+        function collapseLLMJSONTree() {
+            setAllJSONNodesCollapsed(true);
+        }
+
+        async function loadLLMRequests(force) {
+            if (!force && llmRequestsLoaded && Array.isArray(llmRequests) && llmRequests.length > 0) {
+                return;
+            }
+
+            const details = document.getElementById('llm-request-details');
+            if (details && (!llmRequestsLoaded || force)) {
+                details.textContent = 'Loading...';
+            }
+
+            const data = await apiCall('/llm/requests');
+            if (!data) return;
+
+            llmRequests = data.requests || [];
+            llmRequestsLoaded = true;
+            clearLLMDetails();
+            renderLLMRequests();
+        }
+
+        async function clearLLMRequests() {
+            if (!confirm('Clear all LLM requests?')) return;
+            const data = await apiCall('/llm/requests/clear', { method: 'POST' });
+            if (data) {
+                alert('Cleared');
+                loadLLMRequests();
+            }
+        }
+
+        async function copySelectedLLMRequest() {
+            const req = (llmRequests || []).find(r => r && r.id === selectedLLMRequestID);
+            if (!req) {
+                alert('No request selected');
+                return;
+            }
+
+            const text = JSON.stringify(req, null, 2);
+            try {
+                if (navigator.clipboard && window.isSecureContext) {
+                    await navigator.clipboard.writeText(text);
+                    alert('Copied');
+                    return;
+                }
+                throw new Error('Clipboard API unavailable (insecure context)');
+            } catch (e) {
+                try {
+                    const ta = document.createElement('textarea');
+                    ta.value = text;
+                    ta.style.position = 'fixed';
+                    ta.style.left = '-9999px';
+                    ta.style.top = '0';
+                    document.body.appendChild(ta);
+                    ta.focus();
+                    ta.select();
+                    const ok = document.execCommand('copy');
+                    document.body.removeChild(ta);
+                    if (ok) {
+                        alert('Copied');
+                        return;
+                    }
+                    throw new Error('execCommand returned false');
+                } catch (e2) {
+                    alert('Copy failed: ' + (e2.message || e.message));
+                }
+            }
+        }
+
+        // --- Safety Checks ---
+        let safetyChecks = [];
+        let safetyChecksLoaded = false;
+        let selectedSafetyCheckID = null;
+
+        function renderSafetyChecks() {
+            const list = document.getElementById('safety-checks-list');
+            if (!list) return;
+            list.innerHTML = '';
+
+            (safetyChecks || []).forEach(check => {
+                if (!check) return;
+                const item = document.createElement('div');
+                item.className = 'list-item';
+                item.dataset.safetyCheckId = String(check.id);
+                if (selectedSafetyCheckID === check.id) item.classList.add('active');
+
+                const at = check.created_at
+                    ? new Date(check.created_at).toLocaleString()
+                    : '---';
+                const chatID = check.chat_id ?? '---';
+                const userID = check.user_id ?? '---';
+                const sessionID = check.external_session_id || check.internal_session_id || '---';
+                const flagged = check.flagged;
+                const flaggedText = flagged === true ? 'FLAGGED' : (flagged === false ? 'CLEAN' : 'UNKNOWN');
+                const badgeClass = flagged === true ? 'badge-danger' : (flagged === false ? 'badge-success' : '');
+                const errText = check.error ? ` | err` : '';
+
+                item.innerHTML = `
+                    <div class="d-flex justify-between align-center">
+                        <div style="font-weight: 600;">${at}</div>
+                        <span class="badge ${badgeClass}" style="background: var(--c-bg-app);">${flaggedText}</span>
+                    </div>
+                    <div class="text-muted mono" style="font-size: 0.8rem; margin-top: 4px;">
+                        chat:${chatID} user:${userID} session:${sessionID} ${check.source || 'whitecircle'}${errText}
+                    </div>
+                `;
+
+                item.onclick = () => selectSafetyCheck(check.id);
+                list.appendChild(item);
+            });
+        }
+
+        function updateSelectedSafetyCheckInList() {
+            const list = document.getElementById('safety-checks-list');
+            if (!list) return;
+            list.querySelectorAll('.list-item').forEach(el => {
+                const id = el.dataset.safetyCheckId;
+                if (id && selectedSafetyCheckID != null && id === String(selectedSafetyCheckID)) {
+                    el.classList.add('active');
+                } else {
+                    el.classList.remove('active');
+                }
+            });
+        }
+
+        function clearSafetyCheckDetails() {
+            const details = document.getElementById('safety-check-details');
+            const requestView = document.getElementById('safety-check-request');
+            const policiesView = document.getElementById('safety-check-policies');
+            const responseView = document.getElementById('safety-check-response');
+            if (details) details.textContent = '';
+            if (requestView) requestView.textContent = '—';
+            if (policiesView) policiesView.textContent = '—';
+            if (responseView) responseView.textContent = '—';
+
+            selectedSafetyCheckID = null;
+            updateSelectedSafetyCheckInList();
+
+            const detailsPane = document.getElementById('pane-safety-details');
+            const resizer = document.getElementById('resizer-safety');
+            const listPane = document.querySelector('#pane-safety .pane-list');
+            if (detailsPane) detailsPane.classList.add('hidden');
+            if (resizer) resizer.classList.add('hidden');
+            if (listPane) listPane.style.flex = '1';
+        }
+
+        function selectSafetyCheck(id) {
+            const detailsPane = document.getElementById('pane-safety-details');
+            const resizer = document.getElementById('resizer-safety');
+            const listPane = document.querySelector('#pane-safety .pane-list');
+            if (selectedSafetyCheckID == id && detailsPane && !detailsPane.classList.contains('hidden')) {
+                toggleSafetyDetails();
+                return;
+            }
+
+            selectedSafetyCheckID = id;
+            updateSelectedSafetyCheckInList();
+
+            const check = (safetyChecks || []).find(item => item && item.id === id);
+            if (!check) {
+                clearSafetyCheckDetails();
+                return;
+            }
+
+            if (detailsPane) detailsPane.classList.remove('hidden');
+            if (resizer) resizer.classList.remove('hidden');
+            if (listPane) listPane.style.flex = '0 0 33%';
+
+            const details = document.getElementById('safety-check-details');
+            const requestView = document.getElementById('safety-check-request');
+            const policiesView = document.getElementById('safety-check-policies');
+            const responseView = document.getElementById('safety-check-response');
+
+            if (details) {
+                const meta = JSON.parse(JSON.stringify(check));
+                delete meta.request_messages;
+                delete meta.policies;
+                delete meta.response_json;
+                details.textContent = JSON.stringify(meta, null, 2);
+            }
+            if (requestView) requestView.textContent = JSON.stringify(check.request_messages || [], null, 2);
+            if (policiesView) policiesView.textContent = JSON.stringify(check.policies || {}, null, 2);
+            if (responseView) responseView.textContent = JSON.stringify(check.response_json || {}, null, 2);
+        }
+
+        function toggleSafetyDetails() {
+            const detailsPane = document.getElementById('pane-safety-details');
+            const resizer = document.getElementById('resizer-safety');
+            const listPane = document.querySelector('#pane-safety .pane-list');
+            if (!detailsPane || !resizer || !listPane) return;
+            if (!detailsPane.classList.contains('hidden')) {
+                detailsPane.classList.add('hidden');
+                resizer.classList.add('hidden');
+                listPane.style.flex = '1';
+            } else {
+                detailsPane.classList.remove('hidden');
+                resizer.classList.remove('hidden');
+                listPane.style.flex = '0 0 33%';
+            }
+        }
+
+        async function loadSafetyChecks(force) {
+            if (!force && safetyChecksLoaded && Array.isArray(safetyChecks) && safetyChecks.length > 0) {
+                return;
+            }
+
+            const q = (document.getElementById('safety-search-input')?.value || '').trim();
+            const flagged = (document.getElementById('safety-flagged-filter')?.value || '').trim();
+            const limit = (document.getElementById('safety-limit')?.value || '100').trim();
+
+            const params = new URLSearchParams();
+            params.set('limit', limit);
+            if (q) params.set('q', q);
+            if (flagged) params.set('flagged', flagged);
+
+            const data = await apiCall(`/safety/checks?${params.toString()}`);
+            if (!data) return;
+
+            safetyChecks = data.checks || [];
+            safetyChecksLoaded = true;
+            clearSafetyCheckDetails();
+            renderSafetyChecks();
+        }
+
+        async function copySelectedSafetyCheck() {
+            const check = (safetyChecks || []).find(item => item && item.id === selectedSafetyCheckID);
+            if (!check) {
+                alert('No safety check selected');
+                return;
+            }
+            const text = JSON.stringify(check, null, 2);
+            try {
+                if (navigator.clipboard && window.isSecureContext) {
+                    await navigator.clipboard.writeText(text);
+                    alert('Copied');
+                    return;
+                }
+                throw new Error('Clipboard API unavailable (insecure context)');
+            } catch (e) {
+                try {
+                    const ta = document.createElement('textarea');
+                    ta.value = text;
+                    ta.style.position = 'fixed';
+                    ta.style.left = '-9999px';
+                    ta.style.top = '0';
+                    document.body.appendChild(ta);
+                    ta.focus();
+                    ta.select();
+                    const ok = document.execCommand('copy');
+                    document.body.removeChild(ta);
+                    if (ok) {
+                        alert('Copied');
+                        return;
+                    }
+                    throw new Error('execCommand returned false');
+                } catch (e2) {
+                    alert('Copy failed: ' + (e2.message || e.message));
+                }
+            }
+        }
+
+        async function copySelectedLLMRawRequest() {
+            const req = (llmRequests || []).find(r => r && r.id === selectedLLMRequestID);
+            const raw = llmContextValue(req);
+            if (raw === null || raw === undefined) {
+                alert('No raw context selected');
+                return;
+            }
+            const text = typeof raw === 'string' ? raw : JSON.stringify(raw, null, 2);
+            try {
+                if (navigator.clipboard && window.isSecureContext) {
+                    await navigator.clipboard.writeText(text);
+                    alert('Copied');
+                    return;
+                }
+                const ta = document.createElement('textarea');
+                ta.value = text;
+                ta.style.position = 'fixed';
+                ta.style.left = '-9999px';
+                ta.style.top = '0';
+                document.body.appendChild(ta);
+                ta.focus();
+                ta.select();
+                const ok = document.execCommand('copy');
+                document.body.removeChild(ta);
+                if (ok) alert('Copied');
+            } catch (e) {
+                alert('Copy failed: ' + (e.message || e));
+            }
+        }
+
+        // --- Analytics ---
+        let llmSeriesChart = null;
+        let llmTopChatsChart = null;
+        let llmModelsChart = null;
+
+        function destroyChart(chart) {
+            if (!chart) return null;
+            try {
+                chart.destroy();
+            } catch (_) { }
+            return null;
+        }
+
+        function formatChartLabel(ts) {
+            try {
+                return new Date(ts).toLocaleString();
+            } catch (_) {
+                return ts;
+            }
+        }
+
+        function buildTopChatLabel(row) {
+            if (!row) return 'chat';
+            if (row.title) return row.title;
+            if (row.username) return '@' + row.username;
+            return 'chat ' + row.chat_id;
+        }
+
+        function formatAnalyticsCount(value) {
+            return Number(value || 0).toLocaleString();
+        }
+
+        function formatAnalyticsMs(value) {
+            const ms = Number(value || 0);
+            if (!ms) return '—';
+            if (ms >= 60000) return `${(ms / 60000).toFixed(1)}m`;
+            if (ms >= 1000) return `${(ms / 1000).toFixed(1)}s`;
+            return `${ms}ms`;
+        }
+
+        function formatAnalyticsTPS(value) {
+            const tps = Number(value || 0);
+            if (!tps) return '—';
+            return `${tps.toFixed(tps >= 100 ? 0 : 1)}/s`;
+        }
+
+        function formatAnalyticsMaybe(value, formatter) {
+            if (value === null || value === undefined || value === '') return '—';
+            return formatter ? formatter(value) : escapeHtml(String(value));
+        }
+
+        function renderAnalyticsTable(containerID, headers, rows, emptyText) {
+            const container = document.getElementById(containerID);
+            if (!container) return;
+            if (!rows || rows.length === 0) {
+                container.classList.add('text-muted');
+                container.innerHTML = escapeHtml(emptyText || 'No data');
+                return;
+            }
+            container.classList.remove('text-muted');
+            const head = headers.map(h => `<th>${escapeHtml(h)}</th>`).join('');
+            const body = rows.map(row => `<tr>${row.map(cell => `<td>${cell}</td>`).join('')}</tr>`).join('');
+            container.innerHTML = `<table class="table table-condensed"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
+        }
+
+        function renderLLMProviderAnalytics(providers) {
+            renderAnalyticsTable('llm-providers-table',
+                ['Provider', 'Source', 'Req', 'Err', 'Avg', 'P95', 'Tokens', 'TPS'],
+                (providers || []).map(row => [
+                    escapeHtml(row.provider || 'unknown'),
+                    `<span class="mono">${escapeHtml(row.source || 'unknown')}</span>`,
+                    formatAnalyticsCount(row.request_count),
+                    formatAnalyticsCount(row.error_count),
+                    formatAnalyticsMs(row.avg_duration_ms),
+                    formatAnalyticsMs(row.p95_duration_ms),
+                    formatAnalyticsCount(row.total_tokens),
+                    formatAnalyticsTPS(row.avg_generation_tps || row.avg_effective_output_tps),
+                ]),
+                'No provider requests');
+        }
+
+        function renderLLMModelAnalytics(models) {
+            renderAnalyticsTable('llm-models-table',
+                ['Model', 'Req', 'Err', 'Avg', 'P95', 'In', 'Out', 'TPS avg', 'TPS p95'],
+                (models || []).slice(0, 20).map(row => [
+                    `<span class="mono">${escapeHtml(row.model || 'unknown')}</span>`,
+                    formatAnalyticsCount(row.request_count),
+                    formatAnalyticsCount(row.error_count),
+                    formatAnalyticsMs(row.avg_duration_ms),
+                    formatAnalyticsMs(row.p95_duration_ms),
+                    formatAnalyticsCount(row.input_tokens),
+                    formatAnalyticsCount(row.output_tokens),
+                    formatAnalyticsTPS(row.avg_generation_tps || row.avg_effective_output_tps),
+                    formatAnalyticsTPS(row.p95_effective_output_tps),
+                ]),
+                'No model requests');
+        }
+
+        function renderLLMInferenceAnalytics(rows) {
+            renderAnalyticsTable('llm-inference-table',
+                ['Provider', 'Model', 'Source', 'Req', 'Err', 'Max', 'Temp', 'TopP', 'TopK', 'Tools', 'Format', 'Avg', 'TPS'],
+                (rows || []).map(row => [
+                    escapeHtml(row.provider || 'unknown'),
+                    `<span class="mono">${escapeHtml(row.model || 'unknown')}</span>`,
+                    `<span class="mono">${escapeHtml(row.source || 'unknown')}</span>`,
+                    formatAnalyticsCount(row.request_count),
+                    formatAnalyticsCount(row.error_count),
+                    formatAnalyticsMaybe(row.max_tokens, formatAnalyticsCount),
+                    formatAnalyticsMaybe(row.temperature, v => Number(v).toFixed(2)),
+                    formatAnalyticsMaybe(row.top_p, v => Number(v).toFixed(2)),
+                    formatAnalyticsMaybe(row.top_k, v => Number(v).toFixed(0)),
+                    escapeHtml(row.tool_mode || 'default'),
+                    escapeHtml(row.response_format || 'text'),
+                    formatAnalyticsMs(row.avg_duration_ms),
+                    formatAnalyticsTPS(row.avg_effective_output_tps),
+                ]),
+                'No inference params');
+        }
+
+        function renderRuntimeJobAnalytics(jobs, error) {
+            renderAnalyticsTable('runtime-jobs-table',
+                ['Type', 'Queue', 'Provider', 'New', 'Done', 'Fail', 'Wait avg', 'Wait p95', 'Run avg', 'Run p95'],
+                (jobs || []).map(row => [
+                    `<span class="mono">${escapeHtml(row.job_type || 'unknown')}</span>`,
+                    `<span class="mono">${escapeHtml(row.queue_name || 'unknown')}</span>`,
+                    escapeHtml(row.provider || 'unknown'),
+                    formatAnalyticsCount(row.created_count),
+                    formatAnalyticsCount(row.completed_count),
+                    formatAnalyticsCount(row.failed_count),
+                    formatAnalyticsMs(row.avg_wait_ms),
+                    formatAnalyticsMs(row.p95_wait_ms),
+                    formatAnalyticsMs(row.avg_processing_ms),
+                    formatAnalyticsMs(row.p95_processing_ms),
+                ]),
+                'No image or music jobs');
+            const errNode = document.getElementById('runtime-jobs-error');
+            if (errNode) errNode.textContent = error || '';
+        }
+
+        function analyticsCounterValue(rows, key) {
+            const found = (rows || []).find(row => row && row.key === key);
+            return found ? Number(found.count || 0) : 0;
+        }
+
+        function renderAnalyticsCounters(rows, limit) {
+            return (rows || []).slice(0, limit || 6).map(row => {
+                if (!row) return '';
+                return `${row.key || 'unknown'}=${formatAnalyticsCount(row.count)}`;
+            }).filter(Boolean).join(', ') || '—';
+        }
+
+        function renderToolCallParserAnalytics(toolCalls) {
+            const summary = document.getElementById('tool-call-parser-summary');
+            const total = Number(toolCalls?.total || 0);
+            if (summary) {
+                const outcome = toolCalls?.by_outcome || [];
+                const lines = [
+                    `events: ${formatAnalyticsCount(total)}`,
+                    `detected: ${formatAnalyticsCount(analyticsCounterValue(outcome, 'detected'))}`,
+                    `executed: ${formatAnalyticsCount(analyticsCounterValue(outcome, 'executed'))}`,
+                    `ignored: ${formatAnalyticsCount(analyticsCounterValue(outcome, 'ignored'))}`,
+                    `errors: ${formatAnalyticsCount(analyticsCounterValue(outcome, 'error'))}`,
+                    `plain text: ${formatAnalyticsCount(analyticsCounterValue(outcome, 'none'))}`,
+                    `forms: ${renderAnalyticsCounters(toolCalls?.by_form || [], 8)}`,
+                    `tools: ${renderAnalyticsCounters(toolCalls?.by_tool || [], 8)}`,
+                ];
+                summary.textContent = lines.join('\n');
+            }
+            renderAnalyticsTable('tool-call-parser-table',
+                ['Time', 'Outcome', 'Form', 'Tool', 'Reason'],
+                (toolCalls?.recent || []).slice().reverse().map(row => [
+                    escapeHtml(formatDateValue(row.at)),
+                    escapeHtml(row.outcome || 'unknown'),
+                    `<span class="mono">${escapeHtml(row.form || '—')}</span>`,
+                    `<span class="mono">${escapeHtml(row.tool || '—')}</span>`,
+                    escapeHtml(row.reason || ''),
+                ]),
+                'No tool parser events');
+        }
+
+        function renderMemoryJobAnalytics(memoryRuns, error) {
+            const summary = document.getElementById('memory-jobs-summary');
+            if (!memoryRuns) {
+                if (summary) summary.textContent = 'memory service unavailable';
+                renderAnalyticsTable('memory-jobs-table', [], [], 'No memory job data');
+                renderAnalyticsTable('memory-errors-table', [], [], 'No memory errors');
+                return;
+            }
+            if (summary) {
+                const lines = [
+                    `estimator: ${memoryRuns.token_estimator || 'unknown'}`,
+                    `max input: ${formatAnalyticsCount(memoryRuns.max_input_tokens)} tokens`,
+                    `max messages: ${formatAnalyticsCount(memoryRuns.max_messages_per_run)}`,
+                    `queued: ${formatAnalyticsCount(memoryRuns.queued_count)}`,
+                    `processing: ${formatAnalyticsCount(memoryRuns.processing_count)}`,
+                    `failed: ${formatAnalyticsCount(memoryRuns.failed_count)}`,
+                    `completed: ${formatAnalyticsCount(memoryRuns.completed_count)}`,
+                    `stale processing: ${formatAnalyticsCount(memoryRuns.stale_processing_count)}`,
+                    `latest completed: ${formatDateValue(memoryRuns.latest_completed_at)}`,
+                    `latest token stats: ${formatDateValue(memoryRuns.latest_run_with_token_stats)}`,
+                ];
+                summary.textContent = lines.join('\n');
+            }
+            renderAnalyticsTable('memory-jobs-table',
+                ['Status', 'Runs', 'Messages', 'In avg', 'In max', 'Out avg', 'Out max', 'Avg run', 'Max run', 'Latest'],
+                (memoryRuns.statuses || []).map(row => [
+                    escapeHtml(row.status || 'unknown'),
+                    formatAnalyticsCount(row.count),
+                    formatAnalyticsCount(row.message_count),
+                    formatAnalyticsCount(row.avg_input_tokens),
+                    formatAnalyticsCount(row.max_input_tokens),
+                    formatAnalyticsCount(row.avg_output_tokens),
+                    formatAnalyticsCount(row.max_output_tokens),
+                    formatAnalyticsMs(row.avg_duration_ms),
+                    formatAnalyticsMs(row.max_duration_ms),
+                    escapeHtml(formatDateValue(row.latest_updated_at)),
+                ]),
+                'No memory jobs');
+            renderAnalyticsTable('memory-errors-table',
+                ['Latest', 'Count', 'Error'],
+                (memoryRuns.recent_errors || []).map(row => [
+                    escapeHtml(formatDateValue(row.latest_updated_at)),
+                    formatAnalyticsCount(row.count),
+                    escapeHtml(row.error || ''),
+                ]),
+                'No memory errors');
+            const errNode = document.getElementById('memory-jobs-error');
+            if (errNode) errNode.textContent = error || '';
+        }
+
+        function renderAIFarmCapacity(capacity) {
+            const container = document.getElementById('llm-aifarm-capacity');
+            if (!container) return;
+            if (!capacity) {
+                container.textContent = 'not configured';
+                return;
+            }
+            const lines = [
+                `service: ${capacity.service || 'unknown'}`,
+                `max jobs: ${capacity.max_concurrent_jobs ?? 0}`,
+                `running: ${capacity.running ?? 0}`,
+                `queued: ${capacity.queued ?? 0}`,
+                `available: ${capacity.available ?? 0}`,
+                `ready: ${capacity.ready === true}`,
+                `locked: ${capacity.locked === true}`,
+                `observed: ${formatDateValue(capacity.observed_at)}`,
+            ];
+            if (capacity.error) lines.push(`error: ${capacity.error}`);
+            container.textContent = lines.join('\n');
+        }
+
+        async function loadLLMAnalytics() {
+            const range = document.getElementById('llm-analytics-range')?.value || '24h';
+            const summary = document.getElementById('llm-analytics-summary');
+            if (summary) summary.textContent = 'Loading...';
+
+            const data = await apiCall(`/analytics/llm/summary?range=${encodeURIComponent(range)}`);
+            if (!data) return;
+
+            const totals = data.totals || {};
+            if (summary) {
+                const lines = [
+                    `range: ${data.range || range}`,
+                    `bucket: ${data.bucket || 'minute'}`,
+                    `since: ${data.since || ''}`,
+	                    `total: ${totals.total_count ?? 0}`,
+	                    `errors: ${totals.error_count ?? 0}`,
+	                    `avg duration: ${totals.avg_duration_ms ?? 0}ms`,
+	                    `tokens: in ${formatAnalyticsCount(totals.input_tokens)} / out ${formatAnalyticsCount(totals.output_tokens)} / total ${formatAnalyticsCount(totals.total_tokens)}`,
+	                    `effective output TPS: ${formatAnalyticsTPS(totals.avg_effective_output_tps)}`,
+	                ];
+	                summary.textContent = lines.join('\n');
+	            }
+
+	            renderLLMProviderAnalytics(data.providers || []);
+	            renderLLMModelAnalytics(data.models || []);
+	            renderLLMInferenceAnalytics(data.inference_params || []);
+                renderToolCallParserAnalytics(data.tool_calls || null);
+	            renderRuntimeJobAnalytics(data.runtime_jobs || [], data.runtime_jobs_error || '');
+            renderMemoryJobAnalytics(data.memory_runs || null, data.memory_runs_error || '');
+            renderAIFarmCapacity(data.aifarm_capacity || null);
+
+            if (typeof Chart === 'undefined') return;
+
+            const series = data.series || [];
+            const labels = series.map(p => formatChartLabel(p.ts));
+            const counts = series.map(p => p.total_count || 0);
+            const errors = series.map(p => p.error_count || 0);
+
+            const seriesCanvas = document.getElementById('llm-series-chart');
+            if (seriesCanvas) {
+                const ctx = seriesCanvas.getContext('2d');
+                if (!llmSeriesChart) {
+                    llmSeriesChart = new Chart(ctx, {
+                        type: 'line',
+                        data: {
+                            labels,
+                            datasets: [
+                                { label: 'requests', data: counts, borderColor: '#6366f1', backgroundColor: 'rgba(99,102,241,0.12)', tension: 0.2, fill: true },
+                                { label: 'errors', data: errors, borderColor: '#ef4444', backgroundColor: 'rgba(239,68,68,0.12)', tension: 0.2, fill: false },
+                            ]
+                        },
+                        options: { responsive: true, maintainAspectRatio: false, scales: { y: { beginAtZero: true } } }
+                    });
+                } else {
+                    llmSeriesChart.data.labels = labels;
+                    llmSeriesChart.data.datasets[0].data = counts;
+                    llmSeriesChart.data.datasets[1].data = errors;
+                    llmSeriesChart.update();
+                }
+            }
+
+            const topChats = data.top_chats || [];
+            const topLabels = topChats.map(buildTopChatLabel);
+            const topCounts = topChats.map(r => r.request_count || 0);
+
+            const topCanvas = document.getElementById('llm-topchats-chart');
+            if (topCanvas) {
+                const ctx = topCanvas.getContext('2d');
+                if (!llmTopChatsChart) {
+                    llmTopChatsChart = new Chart(ctx, {
+                        type: 'bar',
+                        data: { labels: topLabels, datasets: [{ label: 'requests', data: topCounts, backgroundColor: 'rgba(16,185,129,0.35)', borderColor: '#10b981' }] },
+                        options: { responsive: true, maintainAspectRatio: false, scales: { y: { beginAtZero: true } } }
+                    });
+                } else {
+                    llmTopChatsChart.data.labels = topLabels;
+                    llmTopChatsChart.data.datasets[0].data = topCounts;
+                    llmTopChatsChart.update();
+                }
+            }
+
+	            const modelSeries = data.model_series || [];
+	            const modelLabels = Array.from(new Set(modelSeries.map(p => formatChartLabel(p.ts))));
+	            const topModelNames = (data.models || []).slice(0, 8).map(m => m.model || 'unknown');
+	            const palette = [
+	                ['rgba(99,102,241,0.55)', '#6366f1'],
+	                ['rgba(16,185,129,0.55)', '#10b981'],
+	                ['rgba(245,158,11,0.55)', '#f59e0b'],
+	                ['rgba(14,165,233,0.55)', '#0ea5e9'],
+	                ['rgba(239,68,68,0.45)', '#ef4444'],
+	                ['rgba(168,85,247,0.45)', '#a855f7'],
+	                ['rgba(20,184,166,0.45)', '#14b8a6'],
+	                ['rgba(100,116,139,0.45)', '#64748b'],
+	            ];
+	            const bucketKey = p => formatChartLabel(p.ts);
+	            const modelDatasets = topModelNames.map((modelName, index) => {
+	                const byBucket = new Map(modelSeries.filter(p => (p.model || 'unknown') === modelName).map(p => [bucketKey(p), p.request_count || 0]));
+	                const colors = palette[index % palette.length];
+	                return {
+	                    label: modelName,
+	                    data: modelLabels.map(label => byBucket.get(label) || 0),
+	                    backgroundColor: colors[0],
+	                    borderColor: colors[1],
+	                    borderWidth: 1,
+	                    stack: 'models',
+	                };
+	            });
+
+	            const modelsCanvas = document.getElementById('llm-models-chart');
+	            if (modelsCanvas) {
+	                const ctx = modelsCanvas.getContext('2d');
+	                if (!llmModelsChart) {
+	                    llmModelsChart = new Chart(ctx, {
+	                        type: 'bar',
+	                        data: { labels: modelLabels, datasets: modelDatasets },
+	                        options: {
+	                            responsive: true,
+	                            maintainAspectRatio: false,
+	                            scales: { x: { stacked: true }, y: { stacked: true, beginAtZero: true } },
+	                            plugins: { tooltip: { mode: 'index', intersect: false } }
+	                        }
+	                    });
+	                } else {
+	                    llmModelsChart.data.labels = modelLabels;
+	                    llmModelsChart.data.datasets = modelDatasets;
+	                    llmModelsChart.update();
+	                }
+	            }
+        }
+
+        // --- Logs ---
+        let logsEventSource = null;
+        let logsBuffer = [];
+        const MAX_LOGS = 100000;
+
+        function initLogs() {
+            if (logsEventSource) return;
+
+            const status = document.getElementById('logs-status');
+            if (status) {
+                status.textContent = 'Connecting...';
+                status.style.opacity = '0.6';
+            }
+
+            logsEventSource = new EventSource('/admin/api/logs/stream');
+
+            logsEventSource.onopen = () => {
+                const status = document.getElementById('logs-status');
+                if (status) {
+                    status.className = 'status-indicator status-connected';
+                    status.title = 'Connected';
+                    status.textContent = '';
+                    status.style.opacity = '1';
+                }
+            };
+
+            logsEventSource.onmessage = (e) => {
+                try {
+                    const entry = JSON.parse(e.data);
+                    addLogEntry(entry);
+                } catch (err) {
+                    console.error('Failed to parse log entry:', err);
+                }
+            };
+
+            logsEventSource.onerror = (err) => {
+                console.error('SSE Error:', err);
+                const status = document.getElementById('logs-status');
+                if (status) {
+                    status.className = 'status-indicator status-error';
+                    status.title = 'Disconnected (Reconnecting...)';
+                    status.textContent = '';
+                }
+                logsEventSource.close();
+                logsEventSource = null;
+                setTimeout(initLogs, 5000);
+            };
+
+            document.getElementById('logs-level-filter').addEventListener('change', renderLogs);
+            document.getElementById('logs-search-input').addEventListener('input', debounce(renderLogs, 300));
+        }
+
+        function addLogEntry(entry) {
+            const coreFields = ['time', 'level', 'msg', 'attrs'];
+            const attrs = entry.attrs || {};
+            for (const key in entry) {
+                if (!coreFields.includes(key)) {
+                    attrs[key] = entry[key];
+                    delete entry[key];
+                }
+            }
+            entry.attrs = attrs;
+
+            logsBuffer.push(entry);
+            if (logsBuffer.length > MAX_LOGS) {
+                logsBuffer.shift();
+            }
+
+            const levelFilter = document.getElementById('logs-level-filter').value;
+            const searchFilter = document.getElementById('logs-search-input').value.toLowerCase();
+
+            if (shouldShowLog(entry, levelFilter, searchFilter)) {
+                appendLogToUI(entry);
+            }
+
+            updateLogsCount();
+        }
+
+        function shouldShowLog(entry, level, search) {
+            if (level && entry.level !== level) return false;
+            if (search) {
+                const hay = (entry.msg + ' ' + JSON.stringify(entry.attrs || {})).toLowerCase();
+                if (!hay.includes(search)) return false;
+            }
+            return true;
+        }
+
+        function appendLogToUI(entry) {
+            const list = document.getElementById('logs-list');
+            const container = document.getElementById('logs-container');
+            if (!list || !container) return;
+
+            const autoscroll = document.getElementById('logs-autoscroll').checked;
+            const isAtBottom = container.scrollHeight - container.scrollTop <= container.clientHeight + 50;
+
+            const item = createLogElement(entry);
+            list.appendChild(item);
+
+            // Limit UI items for performance (keep last 5000 in DOM)
+            if (list.children.length > 5000) {
+                list.removeChild(list.firstChild);
+            }
+
+            if (autoscroll && isAtBottom) {
+                container.scrollTop = container.scrollHeight;
+            }
+        }
+
+        function createLogElement(entry) {
+            const div = document.createElement('div');
+            div.className = `log-entry log-${(entry.level || 'info').toLowerCase()}`;
+
+            const timeStr = entry.time ? new Date(entry.time).toLocaleTimeString() : new Date().toLocaleTimeString();
+            const time = timeStr;
+            const level = entry.level || 'INFO';
+            const msg = entry.msg || '';
+
+            div.innerHTML = `
+                <div class="log-row" onclick="toggleLogDetails(this)">
+                    <span class="log-time">${time}</span>
+                    <span class="log-level">${level}</span>
+                    <span class="log-msg">${escapeHtml(msg)}</span>
+                </div>
+                <div class="log-details">
+                    <pre class="log-attrs">${entry.attrs ? highlightJSON(entry.attrs) : 'No attributes'}</pre>
+                </div>
+            `;
+            return div;
+        }
+
+        function toggleLogDetails(row) {
+            row.parentElement.classList.toggle('expanded');
+        }
+
+        function renderLogs() {
+            const list = document.getElementById('logs-list');
+            if (!list) return;
+
+            const levelFilter = document.getElementById('logs-level-filter').value;
+            const searchFilter = document.getElementById('logs-search-input').value.toLowerCase();
+
+            list.innerHTML = '';
+            const filtered = logsBuffer.filter(e => shouldShowLog(e, levelFilter, searchFilter)).slice(-5000);
+
+            filtered.forEach(e => {
+                list.appendChild(createLogElement(e));
+            });
+
+            const container = document.getElementById('logs-container');
+            if (container) {
+                container.scrollTop = container.scrollHeight;
+            }
+            updateLogsCount();
+        }
+
+        function clearLogsUI() {
+            logsBuffer = [];
+            const list = document.getElementById('logs-list');
+            if (list) list.innerHTML = '';
+            updateLogsCount();
+        }
+
+        function updateLogsCount() {
+            const el = document.getElementById('logs-count');
+            if (el) el.textContent = `${logsBuffer.length} entries`;
+        }
+
+        function highlightJSON(obj) {
+            const json = JSON.stringify(obj, null, 2);
+            return json.replace(/("(\\u[a-zA-Z0-9]{4}|\\[^u]|[^\\"])*"(\s*:)?|\b(true|false|null)\b|-?\d+(?:\.\d*)?(?:[eE][+-]?\d+)?)/g, function (match) {
+                let cls = 'json-number';
+                if (/^"/.test(match)) {
+                    if (/:$/.test(match)) {
+                        cls = 'json-key';
+                    } else {
+                        cls = 'json-string';
+                    }
+                } else if (/true|false/.test(match)) {
+                    cls = 'json-boolean';
+                } else if (/null/.test(match)) {
+                    cls = 'json-null';
+                }
+                return '<span class="' + cls + '">' + match + '</span>';
+            });
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        function debounce(func, wait) {
+            let timeout;
+            return function (...args) {
+                clearTimeout(timeout);
+                timeout = setTimeout(() => func.apply(this, args), wait);
+            };
+        }
+
+        // Init
+        refreshState();
+        checkAuth();
+
+        async function checkAuth() {
+            const res = await fetch('/admin/api/auth_check');
+            const data = await res.json();
+            if (!data.authenticated) {
+                window.location.href = '/admin/login.html';
+            }
+        }
+        // Resizer Logic
+        function initResizer(resizerId, paneId) {
+            const resizer = document.getElementById(resizerId);
+            const leftPane = document.querySelector(`#${paneId} .pane-list`);
+
+            if (!resizer || !leftPane) return;
+
+            let startX, startWidth;
+
+            resizer.addEventListener('mousedown', (e) => {
+                startX = e.clientX;
+                startWidth = leftPane.offsetWidth;
+                resizer.classList.add('active');
+                document.body.classList.add('dragging');
+
+                function onMouseMove(e) {
+                    const width = startWidth + (e.clientX - startX);
+                    // Minimal 200px, maximal window - 300px
+                    if (width > 200 && width < window.innerWidth - 300) {
+                        leftPane.style.flex = `0 0 ${width}px`;
+                    }
+                }
+
+                function onMouseUp() {
+                    resizer.classList.remove('active');
+                    document.body.classList.remove('dragging');
+                    document.removeEventListener('mousemove', onMouseMove);
+                    document.removeEventListener('mouseup', onMouseUp);
+                }
+
+                document.addEventListener('mousemove', onMouseMove);
+                document.addEventListener('mouseup', onMouseUp);
+            });
+        }
+
+        // Initialize resizers on load
+        window.addEventListener('DOMContentLoaded', () => {
+            initResizer('resizer-taskman', 'pane-taskman');
+            initResizer('resizer-chats', 'pane-chats');
+            initResizer('resizer-users', 'pane-users');
+            initResizer('resizer-llm', 'pane-llm');
+            initResizer('resizer-safety', 'pane-safety');
+        });
+    </script>
+</body>
+
+</html>

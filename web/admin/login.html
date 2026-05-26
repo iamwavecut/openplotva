@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="ru">
+
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="application-name" content="Plotva Admin">
+    <meta name="theme-color" content="#0f172a">
+    <title>Login - Plotva Admin</title>
+    <link rel="icon" href="favicon.svg" type="image/svg+xml">
+    <link rel="manifest" href="site.webmanifest">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="admin.css">
+</head>
+
+<body class="login-page">
+    <div class="login-card">
+        <div class="login-brand">
+            <span class="brand-mark brand-mark-lg" aria-hidden="true">P</span>
+            <div>
+                <h1>Plotva Admin</h1>
+                <p>Runtime console</p>
+            </div>
+        </div>
+        <p class="text-muted mb-4">Please login with Telegram to continue</p>
+
+        <div id="telegram-login-widget">
+            <div class="spinner"></div>
+            <p class="mt-4 text-muted">Loading Telegram widget...</p>
+        </div>
+
+        <div id="auth-result" class="mt-4"></div>
+    </div>
+
+    <script>
+        (async function initTelegramLogin() {
+            try {
+                // Get bot info from bootstrap API
+                const response = await fetch('/admin/api/bootstrap');
+                if (!response.ok) {
+                    document.getElementById('telegram-login-widget').innerHTML =
+                        '<div class="btn btn-danger btn-block">Failed to load authentication</div>';
+                    return;
+                }
+
+                const data = await response.json();
+                const botUsername = data.bot_username;
+
+                if (!botUsername) {
+                    document.getElementById('telegram-login-widget').innerHTML =
+                        '<div class="btn btn-danger btn-block">Bot username not configured</div>';
+                    return;
+                }
+
+                // Create Telegram login widget
+                const widgetContainer = document.getElementById('telegram-login-widget');
+                const script = document.createElement('script');
+                script.async = true;
+                script.src = 'https://telegram.org/js/telegram-widget.js?22';
+                script.setAttribute('data-telegram-login', botUsername);
+                script.setAttribute('data-size', 'large');
+                script.setAttribute('data-radius', '8');
+                script.setAttribute('data-auth-url', window.location.origin + '/admin/api/auth');
+                script.setAttribute('data-request-access', 'write');
+
+                widgetContainer.innerHTML = '';
+                widgetContainer.appendChild(script);
+
+                // Listen for successful authentication
+                window.addEventListener('message', function (event) {
+                    if (event.data && event.data.event === 'telegram_widget_user_logged_in') {
+                        // Authentication successful, redirect to admin panel
+                        document.getElementById('auth-result').innerHTML =
+                            '<div class="btn btn-success btn-block">Authentication successful! Redirecting...</div>';
+
+                        setTimeout(() => {
+                            window.location.href = '/admin/';
+                        }, 1000);
+                    }
+                });
+
+            } catch (error) {
+                console.error('Error initializing Telegram login:', error);
+                document.getElementById('telegram-login-widget').innerHTML =
+                    '<div class="btn btn-danger btn-block">Error loading authentication widget</div>';
+            }
+        })();
+    </script>
+</body>
+
+</html>

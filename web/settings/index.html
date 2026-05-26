@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="ru">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <title>Настройки</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <link rel="stylesheet" href="https://unpkg.com/framework7@9.0.2/framework7-bundle.min.css">
+  <style>
+    :root {
+      --f7-theme-color: var(--tg-theme-button-color, #007aff);
+      --f7-theme-color-rgb: 0, 122, 255;
+      --f7-bars-bg-color: var(--tg-theme-bg-color, #ffffff);
+      --f7-bars-text-color: var(--tg-theme-text-color, #000000);
+      --f7-page-bg-color: var(--tg-theme-secondary-bg-color, #f0f0f5);
+      --f7-list-bg-color: var(--tg-theme-bg-color, #ffffff);
+    }
+
+    .theme-dark {
+      --f7-bars-bg-color: var(--tg-theme-bg-color, #000000);
+      --f7-page-bg-color: #000000;
+      --f7-list-bg-color: #1c1c1d;
+      --f7-bars-text-color: var(--tg-theme-text-color, #ffffff);
+    }
+
+    html,
+    body {
+      height: 100%;
+      margin: 0;
+    }
+
+    .list-icon {
+      font-size: 24px;
+      width: 32px;
+      text-align: center;
+    }
+
+    #app textarea {
+      line-height: 1.35;
+      min-height: calc(3.5 * 1.35em);
+      scrollbar-width: thin;
+      scrollbar-color: rgba(0, 0, 0, 0.25) transparent;
+    }
+
+    .theme-dark #app textarea {
+      scrollbar-color: rgba(255, 255, 255, 0.25) transparent;
+    }
+
+    #app textarea::-webkit-scrollbar {
+      width: 8px;
+    }
+
+    #app textarea::-webkit-scrollbar-track {
+      background: transparent;
+    }
+
+    #app textarea::-webkit-scrollbar-thumb {
+      background-color: rgba(0, 0, 0, 0.22);
+      border-radius: 10px;
+      border: 2px solid transparent;
+      background-clip: padding-box;
+    }
+
+    .theme-dark #app textarea::-webkit-scrollbar-thumb {
+      background-color: rgba(255, 255, 255, 0.22);
+    }
+
+    #app textarea::-webkit-scrollbar-corner {
+      background: transparent;
+    }
+
+    .page[data-name="settings"] .page-content {
+      padding-bottom: 0;
+    }
+
+    .page[data-name="settings"].settings-savebar-visible .page-content {
+      padding-bottom: calc(var(--f7-toolbar-height) + env(safe-area-inset-bottom, 0px));
+    }
+
+    .feature-hidden {
+      display: none !important;
+    }
+
+    #app .settings-tile-link,
+    #app .settings-tile-link:visited,
+    #app .settings-tile-link:active,
+    #app .settings-tile-link:focus {
+      color: var(--tg-theme-text-color, var(--f7-bars-text-color, #000000)) !important;
+      text-decoration: none;
+    }
+
+    #app .settings-tile-link .text-color-gray {
+      color: var(--tg-theme-hint-color, #8e8e93) !important;
+    }
+
+    #app .settings-picker-item .item-input-wrap::before,
+    #app .settings-picker-item .item-input-wrap::after {
+      display: none !important;
+    }
+
+    #app .settings-picker-input {
+      border: 0 !important;
+      box-shadow: none !important;
+      background: transparent !important;
+      padding: 0 !important;
+      margin: 0 !important;
+      min-height: 0 !important;
+      color: var(--tg-theme-text-color, var(--f7-bars-text-color, #000000));
+    }
+
+    #app .memory-scope-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 12px;
+      line-height: 1.2;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+
+    #app .memory-scope-private {
+      color: #0c4a6e;
+      background: #e0f2fe;
+    }
+
+    #app .memory-scope-public {
+      color: #14532d;
+      background: #dcfce7;
+    }
+
+    .theme-dark #app .memory-scope-private {
+      color: #93c5fd;
+      background: rgba(30, 64, 175, 0.35);
+    }
+
+    .theme-dark #app .memory-scope-public {
+      color: #86efac;
+      background: rgba(20, 83, 45, 0.5);
+    }
+
+    #app .deputies-summary {
+      white-space: normal;
+      line-height: 1.35;
+    }
+
+    #app .deputies-preview {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    #app .deputies-preview .chip {
+      max-width: 100%;
+    }
+
+    #app .deputies-preview .chip-label {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      max-width: min(62vw, 240px);
+    }
+
+    #app .autocomplete-deputy-meta {
+      color: var(--tg-theme-hint-color, #8e8e93);
+      font-size: 13px;
+      line-height: 1.3;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="app">
+    <div class="view view-main"></div>
+  </div>
+
+  <script src="https://unpkg.com/framework7@9.0.2/framework7-bundle.min.js"></script>
+  <script src="index.js"></script>
+</body>
+
+</html>

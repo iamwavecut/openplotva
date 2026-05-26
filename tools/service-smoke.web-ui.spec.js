@@ -1,0 +1,511 @@
+const { test, expect } = require('@playwright/test');
+
+const baseURL = process.env.OPENPLOTVA_WEB_UI_BASE_URL;
+const browserPath = process.env.OPENPLOTVA_WEB_UI_BROWSER || '';
+const headless = process.env.OPENPLOTVA_WEB_UI_HEADLESS !== '0';
+
+if (!baseURL) {
+  throw new Error('OPENPLOTVA_WEB_UI_BASE_URL is required');
+}
+
+test.use({
+  baseURL,
+  headless,
+  launchOptions: browserPath ? { executablePath: browserPath } : {},
+});
+
+test.setTimeout(60_000);
+
+function watchPageErrors(page) {
+  const errors = [];
+  page.on('pageerror', (error) => {
+    errors.push(error.message);
+  });
+  return () => {
+    expect(errors).toEqual([]);
+  };
+}
+
+async function stubTelegramWebApp(page) {
+  await page.route('https://telegram.org/js/telegram-web-app.js', async (route) => {
+    await route.fulfill({
+      contentType: 'application/javascript',
+      body: `
+        window.Telegram = {
+          WebApp: {
+            initDataUnsafe: {},
+            colorScheme: 'light',
+            platform: 'web',
+            version: 'service-smoke',
+            headerColor: 'bg_color',
+            backgroundColor: 'bg_color',
+            ready() {},
+            expand() {},
+            setHeaderColor() {},
+            setBackgroundColor() {},
+            enableClosingConfirmation() {},
+            disableClosingConfirmation() {},
+            onEvent() {},
+            showAlert(message) { window.__lastTelegramAlert = String(message || ''); }
+          }
+        };
+      `,
+    });
+  });
+}
+
+async function stubAdminExternalScripts(page) {
+  await page.route('https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js', async (route) => {
+    await route.fulfill({
+      contentType: 'application/javascript',
+      body: `
+        window.__charts = [];
+        window.Chart = class {
+          constructor(ctx, config) {
+            this.canvasID = ctx && ctx.canvas ? ctx.canvas.id : '';
+            this.data = config && config.data ? config.data : { labels: [], datasets: [] };
+            this.options = config && config.options ? config.options : {};
+            window.__charts.push(this);
+          }
+          update() {
+            window.__charts.push(this);
+          }
+          destroy() {}
+        };
+      `,
+    });
+  });
+}
+
+test('admin login gate and authenticated shell render', async ({ page, context }) => {
+  const assertNoPageErrors = watchPageErrors(page);
+  await stubAdminExternalScripts(page);
+
+  await page.goto('/admin/login.html', { waitUntil: 'domcontentloaded' });
+  await expect(page).toHaveTitle(/Plotva Admin/);
+  await expect(page.locator('h1')).toHaveText('Plotva Admin');
+  await expect(page.locator('#telegram-login-widget')).toBeVisible();
+  await expect(page.locator('#telegram-login-widget script[data-telegram-login="SmokePlotvaBot"]'))
+    .toHaveCount(1);
+
+  await page.goto('/admin/', { waitUntil: 'domcontentloaded' });
+  await expect(page).toHaveURL(/\/admin\/login\.html$/);
+
+  await context.addCookies([{
+    name: 'admin_session',
+    value: '1001',
+    url: baseURL,
+  }]);
+  await page.goto('/admin/', { waitUntil: 'domcontentloaded' });
+  await expect(page.locator('.brand-title')).toHaveText('Plotva');
+  await expect(page.locator('#page-title')).toHaveText('Settings');
+  await expect(page.locator('#log-level')).toHaveValue('info');
+  await expect(page.locator('#queue-stats')).toContainText('{');
+
+  await page.locator('#log-level').selectOption('debug');
+  const loglevelResponse = page.waitForResponse((response) => {
+    return response.url().endsWith('/admin/api/loglevel')
+      && response.request().method() === 'POST';
+  });
+  page.once('dialog', async (dialog) => {
+    expect(dialog.message()).toBe('Log level updated');
+    await dialog.accept();
+  });
+  await page.locator('button', { hasText: 'Apply' }).first().click();
+  await expect((await loglevelResponse).status()).toBe(200);
+
+  await page.locator('.nav-item', { hasText: 'Redis' }).click();
+  await expect(page.locator('#page-title')).toHaveText('Redis');
+  await page.locator('#redis-pattern-search').fill('*');
+  const redisListResponse = page.waitForResponse((response) => {
+    return response.url().includes('/admin/api/redis/list?')
+      && response.request().method() === 'GET';
+  });
+  await page.locator('#redis button[onclick="loadRedisKeys()"]').click();
+  const redisList = await (await redisListResponse).json();
+  expect(Array.isArray(redisList.keys)).toBe(true);
+
+  const memoryCardsResponse = page.waitForResponse((response) => {
+    return response.url().includes('/admin/api/memory/cards?')
+      && response.request().method() === 'GET';
+  });
+  const memoryRunsResponse = page.waitForResponse((response) => {
+    return response.url().endsWith('/admin/api/memory/runs?limit=100')
+      && response.request().method() === 'GET';
+  });
+  await page.locator('.nav-item', { hasText: 'Memory' }).click();
+  const memoryCards = await (await memoryCardsResponse).json();
+  await memoryRunsResponse;
+  expect(Array.isArray(memoryCards.cards)).toBe(true);
+  await expect(page.locator('#memory-meta')).toContainText('cards');
+  await expect(page.locator('#memory-table-body')).toContainText('Smoke Group likes real DB settings smoke.');
+  await expect(page.locator('#memory-runs-meta')).toContainText('runs');
+
+  const shieldResponse = page.waitForResponse((response) => {
+    return response.url().includes('/admin/api/shield/documents?')
+      && response.request().method() === 'GET';
+  });
+  await page.locator('.nav-item', { hasText: 'Shield' }).click();
+  const shieldDocs = await (await shieldResponse).json();
+  expect(Array.isArray(shieldDocs.documents)).toBe(true);
+  await expect(page.locator('#shield-meta')).toContainText('documents');
+
+  await page.locator('.nav-item', { hasText: 'Logs' }).click();
+  await expect(page.locator('#page-title')).toHaveText('Real-time Logs');
+  await expect(page.locator('#logs-status')).toHaveClass(/status-connected/);
+
+  const chatsResponse = page.waitForResponse((response) => {
+    return response.url().includes('/admin/api/chats/search_by_member?user_id=7')
+      && response.request().method() === 'GET';
+  });
+  await page.locator('.nav-item', { hasText: 'Chats' }).click();
+  await page.locator('#chat-search-mode').selectOption('member');
+  await page.locator('#chat-search-input').fill('7');
+  await page.locator('#btn-search-chats').click();
+  const chats = await (await chatsResponse).json();
+  expect(Array.isArray(chats.chats)).toBe(true);
+  await expect(page.locator('#chat-list')).toContainText('Smoke Group');
+
+  const chatResponse = page.waitForResponse((response) => {
+    return response.url().includes('/admin/api/chat?chat_id=-100777')
+      && response.request().method() === 'GET';
+  });
+  await page.locator('#chat-list .list-item').first().click();
+  await chatResponse;
+  await expect(page.locator('#chat-details')).toContainText('Smoke Group');
+
+  const chatMembersResponse = page.waitForResponse((response) => {
+    return response.url().includes('/admin/api/chat/members?chat_id=-100777')
+      && response.request().method() === 'GET';
+  });
+  await page.locator('#pane-chats-details button', { hasText: 'Load Members' }).click();
+  await chatMembersResponse;
+  await expect(page.locator('#chat-members-list')).toContainText('Owner');
+
+  await page.locator('#chat-mood').fill('browser-smoke-mood');
+  await page.locator('#chat-persona').fill('browser smoke persona');
+  await page.locator('#chat-reactivity').fill('88');
+  await page.locator('#chat-proactivity').fill('22');
+  await page.locator('#chat-daily-theme').fill('browser-smoke-theme');
+  await page.locator('#chat-greeting-html').fill('<b>browser hello</b>');
+  await page.locator('#chat-draw-reply').setChecked(true);
+  await page.locator('#chat-obscenifier').setChecked(true);
+  await page.locator('#chat-profanity').setChecked(false);
+  const chatSettingsResponse = page.waitForResponse((response) => {
+    return response.url().endsWith('/admin/api/chat/settings')
+      && response.request().method() === 'POST';
+  });
+  page.once('dialog', async (dialog) => {
+    expect(dialog.message()).toBe('Settings saved');
+    await dialog.accept();
+  });
+  await page.locator('#pane-chats-details button', { hasText: 'Save Settings' }).click();
+  expect(await (await chatSettingsResponse).json()).toMatchObject({ ok: true });
+  const chatReloadAfterSettings = page.waitForResponse((response) => {
+    return response.url().includes('/admin/api/chat?chat_id=-100777')
+      && response.request().method() === 'GET';
+  });
+  await page.locator('#pane-chats-details button').filter({ hasText: /^Load$/ }).click();
+  await chatReloadAfterSettings;
+  await expect(page.locator('#chat-mood')).toHaveValue('browser-smoke-mood');
+  await expect(page.locator('#chat-persona')).toHaveValue('browser smoke persona');
+  await expect(page.locator('#chat-daily-theme')).toHaveValue('browser-smoke-theme');
+
+  const chatBlockResponse = page.waitForResponse((response) => {
+    return response.url().includes('/admin/api/chat/block?chat_id=-100777')
+      && response.request().method() === 'POST';
+  });
+  const chatReloadAfterBlock = page.waitForResponse((response) => {
+    return response.url().includes('/admin/api/chat?chat_id=-100777')
+      && response.request().method() === 'GET';
+  });
+  page.once('dialog', async (dialog) => {
+    expect(dialog.message()).toBe('Chat blocked');
+    await dialog.accept();
+  });
+  await page.locator('#pane-chats-details button', { hasText: 'Block 10m' }).click();
+  expect(await (await chatBlockResponse).json()).toHaveProperty('ok', true);
+  await chatReloadAfterBlock;
+  await expect(page.locator('#chat-details')).toContainText('"blocked": true');
+
+  const chatUnblockResponse = page.waitForResponse((response) => {
+    return response.url().includes('/admin/api/chat/unblock?chat_id=-100777')
+      && response.request().method() === 'DELETE';
+  });
+  const chatReloadAfterUnblock = page.waitForResponse((response) => {
+    return response.url().includes('/admin/api/chat?chat_id=-100777')
+      && response.request().method() === 'GET';
+  });
+  page.once('dialog', async (dialog) => {
+    expect(dialog.message()).toBe('Chat unblocked');
+    await dialog.accept();
+  });
+  await page.locator('#pane-chats-details button', { hasText: 'Unblock' }).click();
+  expect(await (await chatUnblockResponse).json()).toMatchObject({ ok: true });
+  await chatReloadAfterUnblock;
+  await expect(page.locator('#chat-details')).toContainText('"blocked": false');
+
+  const usersResponse = page.waitForResponse((response) => {
+    return response.url().includes('/admin/api/users?q=owner')
+      && response.request().method() === 'GET';
+  });
+  await page.locator('.nav-item', { hasText: 'Users' }).click();
+  await page.locator('#user-search-input').fill('owner');
+  await page.locator('#btn-search-users').click();
+  const users = await (await usersResponse).json();
+  expect(Array.isArray(users.users)).toBe(true);
+  await expect(page.locator('#user-list')).toContainText('@owner');
+
+  const userResponse = page.waitForResponse((response) => {
+    return response.url().includes('/admin/api/user?id=7')
+      && response.request().method() === 'GET';
+  });
+  await page.locator('#user-list .list-item').first().click();
+  await userResponse;
+  await expect(page.locator('#user-details')).toContainText('"username": "owner"');
+
+  await page.locator('#vip-days').fill('2');
+  await page.locator('#vip-reason').fill('browser vip smoke');
+  const grantVipResponse = page.waitForResponse((response) => {
+    return response.url().endsWith('/admin/api/user/grant_vip')
+      && response.request().method() === 'POST';
+  });
+  const userReloadAfterGrant = page.waitForResponse((response) => {
+    return response.url().includes('/admin/api/user?id=7')
+      && response.request().method() === 'GET';
+  });
+  page.once('dialog', async (dialog) => {
+    expect(dialog.message()).toBe('VIP adjustment recorded');
+    await dialog.accept();
+  });
+  await page.locator('#pane-users-details button', { hasText: 'Grant VIP' }).click();
+  expect(await (await grantVipResponse).json()).toHaveProperty('ok', true);
+  await userReloadAfterGrant;
+  await expect(page.locator('#user-vip-summary')).toContainText('Active');
+  await expect(page.locator('#user-vip-summary')).toContainText('yes');
+  await expect(page.locator('#user-vip-events')).toContainText('admin_adjustment');
+  await expect(page.locator('#user-vip-events')).toContainText('browser vip smoke');
+
+  await page.locator('#vip-reason').fill('browser vip revoke');
+  const revokeVipResponse = page.waitForResponse((response) => {
+    return response.url().includes('/admin/api/user/revoke_vip?user_id=7')
+      && response.request().method() === 'DELETE';
+  });
+  const userReloadAfterRevoke = page.waitForResponse((response) => {
+    return response.url().includes('/admin/api/user?id=7')
+      && response.request().method() === 'GET';
+  });
+  page.once('dialog', async (dialog) => {
+    expect(dialog.message()).toBe('VIP revoked');
+    await dialog.accept();
+  });
+  await page.locator('#pane-users-details button', { hasText: 'Revoke VIP' }).click();
+  expect(await (await revokeVipResponse).json()).toMatchObject({ ok: true, revoked: true });
+  await userReloadAfterRevoke;
+  await expect(page.locator('#user-vip-events')).toContainText('admin_revoke');
+  await expect(page.locator('#user-vip-events')).toContainText('browser vip revoke');
+
+  const safetyResponse = page.waitForResponse((response) => {
+    return response.url().includes('/admin/api/safety/checks?')
+      && response.request().method() === 'GET';
+  });
+  await page.locator('.nav-item', { hasText: 'Safety Checks' }).click();
+  const safety = await (await safetyResponse).json();
+  expect(Array.isArray(safety.checks)).toBe(true);
+  const seededSafety = safety.checks.find((check) => check.external_session_id === 'wc-smoke-ext');
+  expect(seededSafety).toMatchObject({
+    source: 'service-smoke',
+    flagged: true,
+    duration_ms: 123,
+  });
+  await expect(page.locator('#safety-checks-list')).toBeVisible();
+  await expect(page.locator('#safety-checks-list')).toContainText('wc-smoke-ext');
+  await expect(page.locator('#safety-checks-list')).toContainText('FLAGGED');
+  await page.locator('#safety-checks-list .list-item', { hasText: 'wc-smoke-ext' }).click();
+  await expect(page.locator('#safety-check-details')).toContainText('"deployment_id": "service-smoke"');
+  await expect(page.locator('#safety-check-request')).toContainText('smoke risky text');
+  await expect(page.locator('#safety-check-policies')).toContainText('"violence": true');
+  await expect(page.locator('#safety-check-response')).toContainText('"flagged": true');
+
+  const analyticsResponse = page.waitForResponse((response) => {
+    return response.url().includes('/admin/api/analytics/llm/summary?')
+      && response.request().method() === 'GET';
+  });
+  await page.locator('.nav-item', { hasText: 'Analytics' }).click();
+  const analytics = await (await analyticsResponse).json();
+  expect(analytics).toHaveProperty('range');
+  expect(analytics.totals).toMatchObject({ total_count: 2, error_count: 1 });
+  expect(analytics.providers.find((row) => row.provider === 'AI Farm')).toMatchObject({
+    request_count: 1,
+    total_tokens: 140,
+  });
+  expect(analytics.models.find((row) => row.model === 'smoke-model-a')).toMatchObject({
+    output_tokens: 40,
+    p95_duration_ms: 2400,
+  });
+  expect(analytics.inference_params.find((row) => row.model === 'smoke-model-a')).toMatchObject({
+    max_tokens: 512,
+    tool_mode: 'auto',
+    response_format: 'json',
+  });
+  expect(analytics.top_chats.find((row) => row.chat_id === -100777)).toMatchObject({
+    title: 'Smoke Group',
+    request_count: 2,
+  });
+  expect(analytics.memory_runs).toMatchObject({ completed_count: 1 });
+  await expect(page.locator('#llm-analytics-summary')).toContainText('range:');
+  await expect(page.locator('#llm-analytics-summary')).toContainText('total: 2');
+  await expect(page.locator('#llm-providers-table')).toContainText('AI Farm');
+  await expect(page.locator('#llm-models-table')).toContainText('smoke-model-a');
+  await expect(page.locator('#llm-inference-table')).toContainText('auto');
+  await expect(page.locator('#memory-jobs-summary')).toContainText('completed: 1');
+  await expect(page.locator('#memory-jobs-table')).toContainText('completed');
+  const chartSnapshots = await page.evaluate(() => (window.__charts || []).map((chart) => ({
+    canvasID: chart.canvasID,
+    labels: chart.data?.labels || [],
+    datasets: (chart.data?.datasets || []).map((dataset) => ({
+      label: dataset.label,
+      data: dataset.data || [],
+    })),
+  })));
+  expect(chartSnapshots.some((chart) => {
+    return chart.canvasID === 'llm-series-chart'
+      && chart.datasets.some((dataset) => dataset.label === 'requests'
+        && dataset.data.reduce((sum, value) => sum + Number(value || 0), 0) === 2);
+  })).toBe(true);
+  expect(chartSnapshots.some((chart) => {
+    return chart.canvasID === 'llm-topchats-chart'
+      && chart.labels.includes('Smoke Group')
+      && chart.datasets.some((dataset) => dataset.data.includes(2));
+  })).toBe(true);
+  expect(chartSnapshots.some((chart) => {
+    return chart.canvasID === 'llm-models-chart'
+      && chart.datasets.some((dataset) => dataset.label === 'smoke-model-a'
+        && dataset.data.reduce((sum, value) => sum + Number(value || 0), 0) === 1);
+  })).toBe(true);
+
+  assertNoPageErrors();
+});
+
+test('admin LLM context detail renders trace artifacts', async ({ page, context }) => {
+  const assertNoPageErrors = watchPageErrors(page);
+  await stubAdminExternalScripts(page);
+
+  await context.addCookies([{
+    name: 'admin_session',
+    value: '1001',
+    url: baseURL,
+  }]);
+
+  await page.route('**/admin/api/llm/requests', async (route) => {
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({
+        requests: [{
+          id: 101,
+          at: '2026-05-25T12:34:56Z',
+          provider: 'AI Farm',
+          request_kind: 'chat_completion',
+          source: 'aifarm',
+          mode: 'tools',
+          flow: 'chat_flow_dialog',
+          iteration: 2,
+          model: 'smoke-model-a',
+          chat: { chat_id: -100777, chat_title: 'Smoke Group' },
+          user: { user_id: 7, full_name: 'Owner User' },
+          message: { message_id: 5001 },
+          result: {
+            response_text_preview: 'smoke answer detail',
+            error: null,
+          },
+          raw_request: {
+            messages: [{
+              role: 'user',
+              content: [{ text: 'smoke user prompt with detail context' }],
+            }],
+            tools: [{ name: 'currency_rates' }],
+          },
+          resolved_cache_content: {
+            name: 'cachedContents/service-smoke',
+          },
+          raw_response: {
+            choices: [{
+              message: { content: 'smoke answer detail from provider' },
+            }],
+          },
+          usage: {
+            input_tokens: 100,
+            output_tokens: 40,
+            total_tokens: 140,
+          },
+          timings: {
+            generation_tps: 40,
+          },
+          inference_params: {
+            tool_mode: 'auto',
+            response_format: 'json',
+          },
+          transport: {
+            job_id: 'job-service-smoke',
+          },
+        }],
+      }),
+    });
+  });
+
+  await page.goto('/admin/', { waitUntil: 'domcontentloaded' });
+  const llmResponse = page.waitForResponse((response) => {
+    return response.url().endsWith('/admin/api/llm/requests')
+      && response.request().method() === 'GET';
+  });
+  await page.locator('.nav-item', { hasText: 'LLM Context' }).click();
+  const payload = await (await llmResponse).json();
+  expect(payload.requests).toHaveLength(1);
+
+  await expect(page.locator('#page-title')).toHaveText('LLM Context');
+  await expect(page.locator('#llm-requests-list')).toContainText('smoke-model-a');
+  await expect(page.locator('#llm-requests-list')).toContainText('smoke answer detail');
+
+  await page.locator('#llm-requests-list .list-item').first().click();
+  await expect(page.locator('#pane-llm-details')).toBeVisible();
+  await expect(page.locator('#llm-request-details')).toContainText('"provider": "AI Farm"');
+  await expect(page.locator('#llm-request-details')).toContainText('"model": "smoke-model-a"');
+  await expect(page.locator('#llm-context-json')).toContainText('llm_context');
+  await expect(page.locator('#llm-context-json')).toContainText('request');
+  await expect(page.locator('#llm-context-json')).toContainText('response');
+  await expect(page.locator('#llm-context-json')).toContainText('usage');
+  await expect(page.locator('#llm-context-json')).toContainText('inference_params');
+  await expect(page.locator('#llm-context-json')).toContainText('transport');
+
+  assertNoPageErrors();
+});
+
+test('settings landing loads managed chats from real API', async ({ page }) => {
+  const assertNoPageErrors = watchPageErrors(page);
+  await stubTelegramWebApp(page);
+
+  await page.goto('/settings/index.html?user_id=7&signature=68b3a1ec', {
+    waitUntil: 'domcontentloaded',
+  });
+  await expect(page.locator('#tileChats')).toContainText('Настройки чатов');
+  await page.locator('#tileChats').click();
+  await expect(page.locator('#chatList')).toContainText('Smoke Group');
+  await expect(page.locator('#chatList')).toContainText('👥');
+
+  assertNoPageErrors();
+});
+
+test('settings general page renders persisted private settings', async ({ page }) => {
+  const assertNoPageErrors = watchPageErrors(page);
+  await stubTelegramWebApp(page);
+
+  await page.goto('/settings/index.html?user_id=42&signature=780e28cf&mode=general', {
+    waitUntil: 'domcontentloaded',
+  });
+  await expect(page.locator('#pageTitle')).toHaveText('Настройки пользователя');
+  await expect(page.locator('textarea[name="custom_persona"]')).toHaveValue('service smoke persona');
+  await expect(page.locator('input[name="disable_random_reactivity"]')).toBeChecked();
+  await expect(page.locator('input[name="enable_profanity"]')).toBeChecked();
+
+  assertNoPageErrors();
+});
