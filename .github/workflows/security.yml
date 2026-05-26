@@ -70,9 +70,17 @@ jobs:
               raise SystemExit("semgrep.sarif is not a valid SARIF 2.1.0 payload")
           PY
 
-      - name: Upload Semgrep SARIF
+      - name: Upload Semgrep SARIF artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: semgrep-sarif
+          path: semgrep.sarif
+          if-no-files-found: error
+
+      - name: Upload Semgrep SARIF to code scanning
         if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
         uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: semgrep.sarif
           category: semgrep
+        continue-on-error: true
