@@ -9,7 +9,7 @@ use std::{
 };
 
 use base64::{Engine as _, engine::general_purpose};
-use openplotva_config::{AppConfig, DEFAULT_AIHORDE_MODEL};
+use openplotva_config::AppConfig;
 use openplotva_core::ChatMessageMeta;
 use openplotva_dialog::sanitize_tool_text;
 use openplotva_llm::aifarm::{
@@ -18,12 +18,7 @@ use openplotva_llm::aifarm::{
     decode_discovery_body, is_failure_status, is_queued_status, is_running_status,
     is_success_status, parse_job_error,
 };
-use openplotva_media::aihorde::{AIHordeClient, AIHordeConfig, AIHordeRequest};
-use openplotva_media::modelscope::{ModelScopeClient, ModelScopeConfig, ModelScopeGenerateRequest};
 use openplotva_media::pruna::{PrunaClient, PrunaConfig, PrunaRequest};
-use openplotva_media::together::{
-    TogetherClient, TogetherConfig, TogetherError, TogetherImageRequest,
-};
 use openplotva_taskman::{
     DEFAULT_LLM_JOB_MAX_ATTEMPTS, IMAGE_REGULAR_QUEUE_NAME, IMAGE_VIP_QUEUE_NAME,
     ImageEditJobParams, ImageGenJobParams, InMemoryTaskQueue, JobType,
@@ -253,50 +248,6 @@ pub fn pruna_config_from_app_config(config: &AppConfig) -> PrunaConfig {
         api_key: config.pruna.api_key.clone(),
         bearer: config.pruna.bearer.clone(),
         timeout: duration_seconds_or_zero(config.pruna.timeout_seconds),
-    }
-    .with_defaults()
-}
-
-/// Build ModelScope config from app config.
-#[must_use]
-pub fn modelscope_config_from_app_config(config: &AppConfig) -> ModelScopeConfig {
-    ModelScopeConfig {
-        api_key: config.model_scope.key.clone(),
-        base_url: config.model_scope.base_url.clone(),
-        poll_interval: duration_seconds_or_zero(config.model_scope.poll_interval_seconds),
-        request_timeout: StdDuration::ZERO,
-    }
-    .with_defaults()
-}
-
-/// Build Together image-provider config from app config.
-#[must_use]
-pub fn together_config_from_app_config(config: &AppConfig) -> TogetherConfig {
-    let api_key = non_empty(config.together.key.clone()).unwrap_or_else(|| {
-        config
-            .together
-            .keys
-            .iter()
-            .find_map(|key| non_empty(key.clone()))
-            .unwrap_or_default()
-    });
-    TogetherConfig {
-        api_key,
-        rate_limit_duration: duration_seconds_or_zero(config.together.rate_limit_seconds),
-        ..TogetherConfig::default()
-    }
-    .with_defaults()
-}
-
-/// Build AIHorde image-provider config from app config.
-#[must_use]
-pub fn aihorde_config_from_app_config(config: &AppConfig) -> AIHordeConfig {
-    AIHordeConfig {
-        api_key: config.ai_horde.api_key.clone(),
-        base_url: config.ai_horde.base_url.clone(),
-        client_agent: config.ai_horde.client_agent.clone(),
-        request_timeout: duration_seconds_or_zero(config.ai_horde.timeout_seconds),
-        poll_interval: duration_seconds_or_zero(config.ai_horde.poll_interval_seconds),
     }
     .with_defaults()
 }
@@ -587,140 +538,6 @@ impl ImageGenerator for PrunaImageGenerator {
                     .then_some(result.image)
                     .into_iter()
                     .collect(),
-            })
-        })
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct TogetherImageGenerator {
-    client: TogetherClient,
-}
-
-impl TogetherImageGenerator {
-    /// Build a Together image generator.
-    pub fn new(config: TogetherConfig) -> Result<Self, ImageGenerationError> {
-        Ok(Self {
-            client: TogetherClient::new(config)
-                .map_err(|error| ImageGenerationError::Provider(error.to_string()))?,
-        })
-    }
-}
-
-impl ImageGenerator for TogetherImageGenerator {
-    fn generate_image<'a>(&'a self, request: ImageGenerationRequest) -> ImageGenerationFuture<'a> {
-        Box::pin(async move {
-            let prompt = draw_api_prompt_text(&request);
-            if prompt.trim().is_empty() {
-                return Ok(ImageGenerationResult::default());
-            }
-            let (width, height) = image_dimensions_from_aspect_ratio(&request.aspect_ratio, 1024);
-            let result = self
-                .client
-                .images_generate(TogetherImageRequest {
-                    prompt,
-                    seed: parse_image_seed(&request.seed),
-                    width: Some(width),
-                    height: Some(height),
-                    negative_prompt: request.negative_prompt,
-                    ..TogetherImageRequest::default()
-                })
-                .await
-                .map_err(together_generation_error)?;
-            Ok(ImageGenerationResult {
-                image_url: result.url.clone(),
-                image_urls: (!result.url.is_empty())
-                    .then_some(result.url)
-                    .into_iter()
-                    .collect(),
-                image_bytes: Vec::new(),
-            })
-        })
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct ModelScopeImageGenerator {
-    client: ModelScopeClient,
-}
-
-impl ModelScopeImageGenerator {
-    /// Build a ModelScope image generator.
-    pub fn new(config: ModelScopeConfig) -> Result<Self, ImageGenerationError> {
-        Ok(Self {
-            client: ModelScopeClient::new(config)
-                .map_err(|error| ImageGenerationError::Provider(error.to_string()))?,
-        })
-    }
-}
-
-impl ImageGenerator for ModelScopeImageGenerator {
-    fn generate_image<'a>(&'a self, request: ImageGenerationRequest) -> ImageGenerationFuture<'a> {
-        Box::pin(async move {
-            let prompt = draw_api_prompt_text(&request);
-            if prompt.trim().is_empty() {
-                return Ok(ImageGenerationResult::default());
-            }
-            let result = self
-                .client
-                .generate(ModelScopeGenerateRequest {
-                    model: String::new(),
-                    prompt,
-                    poll_interval: StdDuration::ZERO,
-                })
-                .await
-                .map_err(|error| ImageGenerationError::Provider(error.to_string()))?;
-            Ok(ImageGenerationResult {
-                image_bytes: result.images,
-                ..ImageGenerationResult::default()
-            })
-        })
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct AIHordeImageGenerator {
-    client: AIHordeClient,
-    model: String,
-}
-
-impl AIHordeImageGenerator {
-    /// Build an AIHorde image generator.
-    pub fn new(config: AIHordeConfig, model: String) -> Result<Self, ImageGenerationError> {
-        Ok(Self {
-            client: AIHordeClient::new(config)
-                .map_err(|error| ImageGenerationError::Provider(error.to_string()))?,
-            model: non_empty(model).unwrap_or_else(|| DEFAULT_AIHORDE_MODEL.to_owned()),
-        })
-    }
-}
-
-impl ImageGenerator for AIHordeImageGenerator {
-    fn generate_image<'a>(&'a self, request: ImageGenerationRequest) -> ImageGenerationFuture<'a> {
-        Box::pin(async move {
-            let prompt = draw_api_prompt_text(&request);
-            if prompt.trim().is_empty() {
-                return Ok(ImageGenerationResult::default());
-            }
-            let (width, height) = image_dimensions_from_aspect_ratio(&request.aspect_ratio, 576);
-            let result = self
-                .client
-                .generate(AIHordeRequest {
-                    prompt,
-                    negative_prompt: request.negative_prompt,
-                    width,
-                    height,
-                    seed: parse_image_seed(&request.seed).unwrap_or_default(),
-                    models: vec![self.model.clone()],
-                    nsfw: request.is_nsfw,
-                    censor_nsfw: !request.is_nsfw,
-                    ..AIHordeRequest::default()
-                })
-                .await
-                .map_err(|error| ImageGenerationError::Provider(error.to_string()))?;
-            Ok(ImageGenerationResult {
-                image_bytes: result.images,
-                ..ImageGenerationResult::default()
             })
         })
     }
@@ -2441,60 +2258,6 @@ fn build_draw_prompt_text(
     out
 }
 
-fn together_generation_error(error: TogetherError) -> ImageGenerationError {
-    match error {
-        TogetherError::ProviderStatus { status: 420, .. } => ImageGenerationError::Forbidden,
-        other => ImageGenerationError::Provider(other.to_string()),
-    }
-}
-
-fn image_dimensions_from_aspect_ratio(aspect_ratio: &str, max_side: u32) -> (u32, u32) {
-    let max_side = max_side.max(1);
-    let Some((width_ratio, height_ratio)) = parse_aspect_ratio(aspect_ratio) else {
-        return (max_side, max_side);
-    };
-    if width_ratio >= height_ratio {
-        let height = scale_side(max_side, height_ratio / width_ratio);
-        (max_side, height)
-    } else {
-        let width = scale_side(max_side, width_ratio / height_ratio);
-        (width, max_side)
-    }
-}
-
-fn parse_aspect_ratio(aspect_ratio: &str) -> Option<(f64, f64)> {
-    let candidate = aspect_ratio
-        .split_whitespace()
-        .find(|part| part.contains(':') || part.contains('x') || part.contains('/'))
-        .unwrap_or(aspect_ratio)
-        .trim();
-    let separator = [':', 'x', '/']
-        .into_iter()
-        .find(|separator| candidate.contains(*separator))?;
-    let (width, height) = candidate.split_once(separator)?;
-    let width = width.trim().parse::<f64>().ok()?;
-    let height = height.trim().parse::<f64>().ok()?;
-    (width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0)
-        .then_some((width, height))
-}
-
-fn scale_side(max_side: u32, ratio: f64) -> u32 {
-    ((max_side as f64 * ratio).round() as u32).clamp(1, max_side)
-}
-
-fn parse_image_seed(seed: &str) -> Option<i64> {
-    let seed = seed.trim();
-    if seed.is_empty() {
-        return None;
-    }
-    seed.split_whitespace()
-        .last()
-        .unwrap_or(seed)
-        .trim_matches(|ch: char| !ch.is_ascii_digit() && ch != '-')
-        .parse::<i64>()
-        .ok()
-}
-
 fn draw_api_payload(prompt: &str, image_inputs: &[String]) -> serde_json::Result<Vec<u8>> {
     let (image_urls, image_b64) = split_draw_api_image_inputs(image_inputs);
     let image_url = one_or_many_strings(&image_urls);
@@ -3639,104 +3402,6 @@ mod tests {
         assert_eq!(pruna.timeout, StdDuration::from_secs(45));
         assert!(pruna.configured());
         Ok(())
-    }
-
-    #[test]
-    fn modelscope_config_from_app_config_maps_go_env() -> Result<(), openplotva_config::ConfigError>
-    {
-        let config = AppConfig::from_raw(openplotva_config::RawConfig {
-            modelscope_key: Some(" modelscope-key ".to_owned()),
-            modelscope_base_url: Some(" https://modelscope.test/api/ ".to_owned()),
-            modelscope_poll_interval_seconds: Some("7".to_owned()),
-            ..openplotva_config::RawConfig::default()
-        })?;
-
-        let modelscope = modelscope_config_from_app_config(&config);
-
-        assert_eq!(modelscope.api_key, "modelscope-key");
-        assert_eq!(modelscope.base_url, "https://modelscope.test/api");
-        assert_eq!(modelscope.poll_interval, StdDuration::from_secs(7));
-        assert_eq!(
-            modelscope.request_timeout,
-            openplotva_media::modelscope::DEFAULT_REQUEST_TIMEOUT
-        );
-        assert!(modelscope.configured());
-        Ok(())
-    }
-
-    #[test]
-    fn together_config_from_app_config_maps_go_env() -> Result<(), openplotva_config::ConfigError> {
-        let config = AppConfig::from_raw(openplotva_config::RawConfig {
-            together_key: Some(" together-key ".to_owned()),
-            together_rate_limit_seconds: Some("13".to_owned()),
-            ..openplotva_config::RawConfig::default()
-        })?;
-
-        let together = together_config_from_app_config(&config);
-
-        assert_eq!(together.api_key, "together-key");
-        assert_eq!(
-            together.base_url,
-            openplotva_media::together::DEFAULT_BASE_URL
-        );
-        assert_eq!(together.rate_limit_duration, StdDuration::from_secs(13));
-        assert_eq!(
-            together.request_timeout,
-            openplotva_media::together::DEFAULT_REQUEST_TIMEOUT
-        );
-        assert!(together.configured());
-        Ok(())
-    }
-
-    #[test]
-    fn together_config_from_app_config_falls_back_to_key_pool()
-    -> Result<(), openplotva_config::ConfigError> {
-        let config = AppConfig::from_raw(openplotva_config::RawConfig {
-            together_key: Some(" ".to_owned()),
-            together_keys: Some(" pool-key-1,pool-key-2 ".to_owned()),
-            ..openplotva_config::RawConfig::default()
-        })?;
-
-        let together = together_config_from_app_config(&config);
-
-        assert_eq!(together.api_key, "pool-key-1");
-        assert!(together.configured());
-        Ok(())
-    }
-
-    #[test]
-    fn aihorde_config_from_app_config_maps_go_env() -> Result<(), openplotva_config::ConfigError> {
-        let config = AppConfig::from_raw(openplotva_config::RawConfig {
-            aihorde_api_key: Some(" horde-key ".to_owned()),
-            aihorde_base_url: Some(" https://aihorde.test/api/ ".to_owned()),
-            aihorde_client_agent: Some(" openplotva:test ".to_owned()),
-            aihorde_timeout_seconds: Some("66".to_owned()),
-            aihorde_poll_interval_seconds: Some("4".to_owned()),
-            ..openplotva_config::RawConfig::default()
-        })?;
-
-        let horde = aihorde_config_from_app_config(&config);
-
-        assert_eq!(horde.api_key, "horde-key");
-        assert_eq!(horde.base_url, "https://aihorde.test/api");
-        assert_eq!(horde.client_agent, "openplotva:test");
-        assert_eq!(horde.request_timeout, StdDuration::from_secs(66));
-        assert_eq!(horde.poll_interval, StdDuration::from_secs(4));
-        assert!(horde.configured());
-        Ok(())
-    }
-
-    #[test]
-    fn image_provider_request_helpers_preserve_go_dimensions_and_seed() {
-        assert_eq!(
-            image_dimensions_from_aspect_ratio("16:9", 1024),
-            (1024, 576)
-        );
-        assert_eq!(image_dimensions_from_aspect_ratio("9:16", 576), (324, 576));
-        assert_eq!(image_dimensions_from_aspect_ratio("", 576), (576, 576));
-        assert_eq!(parse_image_seed("seed 42"), Some(42));
-        assert_eq!(parse_image_seed("  -7  "), Some(-7));
-        assert_eq!(parse_image_seed("random"), None);
     }
 
     #[test]

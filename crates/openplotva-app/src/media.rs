@@ -16,9 +16,7 @@ use thiserror::Error;
 use crate::runtime_gemini_cache::resolve_google_ai_key;
 
 const OPENROUTER_MODEL_PREFIX: &str = "openrouter/";
-const TOGETHER_MODEL_PREFIX: &str = "together/";
 const OPENROUTER_CHAT_COMPLETIONS_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
-const TOGETHER_CHAT_COMPLETIONS_URL: &str = "https://api.together.xyz/v1/chat/completions";
 
 /// Boxed image-prompt optimizer future.
 pub type ImagePromptOptimizeFuture<'a> =
@@ -511,14 +509,6 @@ fn genkit_openai_compatible_media_prompt_optimizer_config_from_app_config(
                 config.open_router.request_timeout_seconds,
                 "openrouter",
             )
-        } else if let Some(model) = strip_provider_prefix_fold(model, TOGETHER_MODEL_PREFIX) {
-            (
-                TOGETHER_CHAT_COMPLETIONS_URL,
-                together_api_key(config),
-                model.trim().to_owned(),
-                config.llm.dialog.request_timeout_seconds,
-                "together",
-            )
         } else {
             return None;
         };
@@ -603,21 +593,6 @@ fn strip_provider_prefix_fold<'a>(value: &'a str, prefix: &str) -> Option<&'a st
         .get(..prefix.len())
         .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
         .then(|| &value[prefix.len()..])
-}
-
-fn together_api_key(config: &AppConfig) -> String {
-    let key = config.together.key.trim();
-    if !key.is_empty() {
-        return key.to_owned();
-    }
-    config
-        .together
-        .keys
-        .iter()
-        .map(|key| key.trim())
-        .find(|key| !key.is_empty())
-        .unwrap_or_default()
-        .to_owned()
 }
 
 #[cfg(test)]
@@ -848,32 +823,6 @@ mod tests {
         assert_eq!(cfg.client.request_timeout, Duration::from_secs(333));
         assert_eq!(cfg.client.service_name, "svc");
         assert_eq!(cfg.client.endpoint_name, "endpoint");
-    }
-
-    #[test]
-    fn provider_media_genkit_fallback_routes_together_default_model() {
-        let config = AppConfig::from_raw(openplotva_config::RawConfig {
-            googleai_key: Some("google-key".to_owned()),
-            genkit_default_model: Some(" together/meta-llama/Llama-4 ".to_owned()),
-            together_keys: Some(" , together-key ".to_owned()),
-            dialog_request_timeout_seconds: Some("222".to_owned()),
-            ..openplotva_config::RawConfig::default()
-        })
-        .expect("config");
-
-        let (cfg, provider) =
-            genkit_openai_compatible_media_prompt_optimizer_config_from_app_config(
-                &config,
-                "together/meta-llama/Llama-4",
-            )
-            .expect("together config");
-
-        assert_eq!(provider, "together");
-        assert_eq!(cfg.model, "meta-llama/Llama-4");
-        assert_eq!(cfg.client.direct_url, TOGETHER_CHAT_COMPLETIONS_URL);
-        assert_eq!(cfg.client.api_key, "together-key");
-        assert_eq!(cfg.client.default_model, "meta-llama/Llama-4");
-        assert_eq!(cfg.client.request_timeout, Duration::from_secs(222));
     }
 
     #[tokio::test]

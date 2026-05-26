@@ -106,16 +106,8 @@ google_ai_key_source_present() {
   [[ -n "${GOOGLEAI_KEY:-}" || -n "${GOOGLEAI_KEY_STATS_FILE:-}" ]]
 }
 
-together_key_source_present() {
-  [[ -n "${TOGETHER_KEY:-}" || -n "${TOGETHER_KEYS:-}" ]]
-}
-
 openrouter_dialog_provider_ready() {
   [[ -n "${OPENROUTER_KEY:-}" ]] && google_ai_key_source_present
-}
-
-together_dialog_provider_ready() {
-  together_key_source_present && google_ai_key_source_present
 }
 
 dialog_provider_env_present() {
@@ -123,8 +115,7 @@ dialog_provider_env_present() {
     || -n "${DIALOG_AIFARM_POOL_API_KEY:-}" \
     || -n "${DIALOG_NVIDIA_API_KEY:-}" ]] \
     || google_ai_key_source_present \
-    || openrouter_dialog_provider_ready \
-    || together_dialog_provider_ready
+    || openrouter_dialog_provider_ready
 }
 
 is_offline_media_selector() {

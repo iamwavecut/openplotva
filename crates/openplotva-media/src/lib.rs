@@ -1,10 +1,7 @@
 //! Image, vision, music, and Telegram media integrations.
 
 pub mod acestep;
-pub mod aihorde;
-pub mod modelscope;
 pub mod pruna;
-pub mod together;
 
 use std::sync::LazyLock;
 

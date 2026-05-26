@@ -53,9 +53,7 @@ const EXISTING_CARDS_LIMIT: i32 = 80;
 const EXISTING_USER_CARDS_LIMIT: i32 = 20;
 const EXISTING_PARTICIPANT_CARDS_MAX_USER: usize = 20;
 const OPENROUTER_MODEL_PREFIX: &str = "openrouter/";
-const TOGETHER_MODEL_PREFIX: &str = "together/";
 const OPENROUTER_CHAT_COMPLETIONS_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
-const TOGETHER_CHAT_COMPLETIONS_URL: &str = "https://api.together.xyz/v1/chat/completions";
 
 type AifarmGenkitMemoryExtractor = FallbackMemoryExtractor<
     AifarmMemoryExtractor<ReqwestAifarmTransport>,
@@ -2813,14 +2811,6 @@ fn genkit_openai_compatible_memory_extractor_config_from_app_config(
                 config.open_router.request_timeout_seconds,
                 "openrouter",
             )
-        } else if let Some(model) = strip_provider_prefix_fold(model, TOGETHER_MODEL_PREFIX) {
-            (
-                TOGETHER_CHAT_COMPLETIONS_URL,
-                together_api_key(config),
-                model.trim().to_owned(),
-                config.llm.dialog.request_timeout_seconds,
-                "together",
-            )
         } else {
             return Ok(None);
         };
@@ -2837,21 +2827,6 @@ fn genkit_openai_compatible_memory_extractor_config_from_app_config(
         request_timeout: positive_seconds(request_timeout_seconds),
         ..GenkitOpenAiCompatibleMemoryExtractorConfig::default()
     }))
-}
-
-fn together_api_key(config: &AppConfig) -> String {
-    let key = config.together.key.trim();
-    if !key.is_empty() {
-        return key.to_owned();
-    }
-    config
-        .together
-        .keys
-        .iter()
-        .map(|key| key.trim())
-        .find(|key| !key.is_empty())
-        .unwrap_or_default()
-        .to_owned()
 }
 
 fn strip_provider_prefix_fold<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
@@ -3537,23 +3512,6 @@ mod tests {
             genkit_memory_extractor_model(&config, None),
             "openrouter/provider-model"
         );
-
-        let together = AppConfig::from_raw(openplotva_config::RawConfig {
-            memory_consolidation_provider: Some(" gemini ".to_owned()),
-            memory_redaction_enabled: Some("false".to_owned()),
-            together_keys: Some(" , together-key ".to_owned()),
-            ..openplotva_config::RawConfig::default()
-        })
-        .expect("together config");
-        assert!(matches!(
-            memory_extractor_from_app_config_with_override(
-                &together,
-                Some("genkit"),
-                Some(" together/provider-model ")
-            )
-            .expect("together extractor"),
-            AppMemoryExtractor::GeminiPlain(AppGenkitMemoryExtractor::OpenAiCompatible(_))
-        ));
     }
 
     #[test]

@@ -128,24 +128,6 @@ pub const DEFAULT_RBC_TIMEOUT_SECONDS: i32 = 15;
 
 pub const DEFAULT_SERPER_TIMEOUT_SECONDS: i32 = 30;
 
-pub const DEFAULT_TINYFISH_ENABLED: bool = true;
-
-pub const DEFAULT_TINYFISH_SEARCH_BASE_URL: &str = "https://api.search.tinyfish.ai";
-
-pub const DEFAULT_TINYFISH_FETCH_BASE_URL: &str = "https://api.fetch.tinyfish.ai";
-
-pub const DEFAULT_TINYFISH_SEARCH_LANGUAGE: &str = "ru";
-
-pub const DEFAULT_TINYFISH_FETCH_FORMAT: &str = "markdown";
-
-pub const DEFAULT_TINYFISH_MAX_CONTENT_CHARS: i32 = 6000;
-
-pub const DEFAULT_TINYFISH_TIMEOUT_SECONDS: i32 = 30;
-
-pub const DEFAULT_TINYFISH_MCP_URL: &str = "https://agent.tinyfish.ai/mcp";
-
-pub const DEFAULT_TINYFISH_MCP_OAUTH_TOKEN_URL: &str = "https://agent.tinyfish.ai/oauth/token";
-
 pub const DEFAULT_DISCOVERY_BASE_URL: &str = "http://127.0.0.1:50051";
 
 pub const DEFAULT_DIALOG_PROVIDER: &str = "aifarm";
@@ -157,20 +139,6 @@ pub const DEFAULT_DIALOG_MODEL: &str = "Gemma 4 26B Heretic";
 pub const DEFAULT_DIALOG_API_KEY: &str = "";
 
 pub const DEFAULT_OPENROUTER_REQUEST_TIMEOUT_SECONDS: i32 = 300;
-
-pub const DEFAULT_TOGETHER_RATE_LIMIT_SECONDS: i32 = 11;
-
-pub const DEFAULT_AIHORDE_API_KEY: &str = "";
-
-pub const DEFAULT_AIHORDE_BASE_URL: &str = "https://aihorde.net";
-
-pub const DEFAULT_AIHORDE_CLIENT_AGENT: &str = "openplotva:dev";
-
-pub const DEFAULT_AIHORDE_TIMEOUT_SECONDS: i32 = 120;
-
-pub const DEFAULT_AIHORDE_POLL_INTERVAL_SECONDS: i32 = 3;
-
-pub const DEFAULT_AIHORDE_MODEL: &str = "Z-Image-Turbo";
 
 pub const DEFAULT_DIALOG_DISCOVERY_SERVICE_NAME: &str = "llm-openai";
 
@@ -221,10 +189,6 @@ pub const DEFAULT_PRUNA_API_KEY: &str = "";
 pub const DEFAULT_PRUNA_BEARER: &str = "";
 
 pub const DEFAULT_PRUNA_TIMEOUT_SECONDS: i32 = 120;
-
-pub const DEFAULT_MODELSCOPE_BASE_URL: &str = "https://api-inference.modelscope.cn";
-
-pub const DEFAULT_MODELSCOPE_POLL_INTERVAL_SECONDS: i32 = 5;
 
 pub const DEFAULT_DIALOG_NVIDIA_URL: &str = "https://integrate.api.nvidia.com/v1/chat/completions";
 
@@ -294,16 +258,11 @@ pub struct AppConfig {
     pub rbc: RbcConfig,
     /// Serper web search provider configuration.
     pub serper: SerperConfig,
-    /// TinyFish web search/fetch provider configuration.
-    pub tinyfish: TinyFishConfig,
     /// Translation provider configuration.
     pub translation: TranslationConfig,
     pub google_ai: GoogleAiConfig,
     pub open_router: OpenRouterConfig,
-    pub together: TogetherConfig,
     pub pruna: PrunaConfig,
-    pub model_scope: ModelScopeConfig,
-    pub ai_horde: AiHordeConfig,
     pub white_circle: WhiteCircleConfig,
     /// Discovery/dialog LLM configuration.
     pub llm: LlmConfig,
@@ -506,26 +465,6 @@ pub struct SerperConfig {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct TinyFishConfig {
-    pub enabled: bool,
-    pub api_key: String,
-    pub search_base_url: String,
-    pub fetch_base_url: String,
-    pub search_location: String,
-    pub search_language: String,
-    pub fetch_format: String,
-    pub max_content_chars: i32,
-    pub timeout_seconds: i32,
-    pub mcp_url: String,
-    pub mcp_access_token: String,
-    pub mcp_refresh_token: String,
-    pub mcp_oauth_client_id: String,
-    pub mcp_oauth_token_url: String,
-    pub mcp_search_tool_name: String,
-    pub mcp_fetch_tool_name: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TranslationConfig {
     /// DeepL API-compatible configuration, from `DEEPL_*`.
     pub deepl: DeeplConfig,
@@ -557,32 +496,6 @@ pub struct OpenRouterConfig {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct TogetherConfig {
-    /// Primary API key, from `TOGETHER_KEY`.
-    pub key: String,
-    /// API key pool, from `TOGETHER_KEYS`.
-    pub keys: Vec<String>,
-    /// Rate-limit interval, from `TOGETHER_RATE_LIMIT_SECONDS`.
-    pub rate_limit_seconds: i32,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct AiHordeConfig {
-    /// API key, from `AIHORDE_API_KEY`.
-    pub api_key: String,
-    /// Base API URL, from `AIHORDE_BASE_URL`.
-    pub base_url: String,
-    /// Client-Agent header, from `AIHORDE_CLIENT_AGENT`.
-    pub client_agent: String,
-    /// HTTP timeout, from `AIHORDE_TIMEOUT_SECONDS`.
-    pub timeout_seconds: i32,
-    /// Task poll interval, from `AIHORDE_POLL_INTERVAL_SECONDS`.
-    pub poll_interval_seconds: i32,
-    /// Default model inserted into AIHorde workflow params, from `AIHORDE_MODEL`.
-    pub model: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PrunaConfig {
     /// Supabase function endpoint, from `PRUNA_ENDPOINT`.
     pub endpoint: String,
@@ -594,16 +507,6 @@ pub struct PrunaConfig {
     pub bearer: String,
     /// Request timeout, from `PRUNA_TIMEOUT_SECONDS`.
     pub timeout_seconds: i32,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ModelScopeConfig {
-    /// API key, from `MODELSCOPE_KEY`.
-    pub key: String,
-    /// Base API URL, from `MODELSCOPE_BASE_URL`.
-    pub base_url: String,
-    /// Task poll interval, from `MODELSCOPE_POLL_INTERVAL_SECONDS`.
-    pub poll_interval_seconds: i32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -920,38 +823,6 @@ pub struct RawConfig {
     pub serper_api_key: Option<String>,
     /// `SERPER_TIMEOUT_SECONDS`.
     pub serper_timeout_seconds: Option<String>,
-    /// `TINYFISH_ENABLED`.
-    pub tinyfish_enabled: Option<String>,
-    /// `TINYFISH_API_KEY`.
-    pub tinyfish_api_key: Option<String>,
-    /// `TINYFISH_SEARCH_BASE_URL`.
-    pub tinyfish_search_base_url: Option<String>,
-    /// `TINYFISH_FETCH_BASE_URL`.
-    pub tinyfish_fetch_base_url: Option<String>,
-    /// `TINYFISH_SEARCH_LOCATION`.
-    pub tinyfish_search_location: Option<String>,
-    /// `TINYFISH_SEARCH_LANGUAGE`.
-    pub tinyfish_search_language: Option<String>,
-    /// `TINYFISH_FETCH_FORMAT`.
-    pub tinyfish_fetch_format: Option<String>,
-    /// `TINYFISH_MAX_CONTENT_CHARS`.
-    pub tinyfish_max_content_chars: Option<String>,
-    /// `TINYFISH_TIMEOUT_SECONDS`.
-    pub tinyfish_timeout_seconds: Option<String>,
-    /// `TINYFISH_MCP_URL`.
-    pub tinyfish_mcp_url: Option<String>,
-    /// `TINYFISH_MCP_ACCESS_TOKEN`.
-    pub tinyfish_mcp_access_token: Option<String>,
-    /// `TINYFISH_MCP_REFRESH_TOKEN`.
-    pub tinyfish_mcp_refresh_token: Option<String>,
-    /// `TINYFISH_MCP_OAUTH_CLIENT_ID`.
-    pub tinyfish_mcp_oauth_client_id: Option<String>,
-    /// `TINYFISH_MCP_OAUTH_TOKEN_URL`.
-    pub tinyfish_mcp_oauth_token_url: Option<String>,
-    /// `TINYFISH_MCP_SEARCH_TOOL_NAME`.
-    pub tinyfish_mcp_search_tool_name: Option<String>,
-    /// `TINYFISH_MCP_FETCH_TOOL_NAME`.
-    pub tinyfish_mcp_fetch_tool_name: Option<String>,
     /// `DEEPL_KEY`.
     pub deepl_key: Option<String>,
     /// `DEEPL_URL`.
@@ -964,24 +835,6 @@ pub struct RawConfig {
     pub openrouter_key: Option<String>,
     /// `OPENROUTER_REQUEST_TIMEOUT_SECONDS`.
     pub openrouter_request_timeout_seconds: Option<String>,
-    /// `TOGETHER_KEY`.
-    pub together_key: Option<String>,
-    /// `TOGETHER_KEYS`.
-    pub together_keys: Option<String>,
-    /// `TOGETHER_RATE_LIMIT_SECONDS`.
-    pub together_rate_limit_seconds: Option<String>,
-    /// `AIHORDE_API_KEY`.
-    pub aihorde_api_key: Option<String>,
-    /// `AIHORDE_BASE_URL`.
-    pub aihorde_base_url: Option<String>,
-    /// `AIHORDE_CLIENT_AGENT`.
-    pub aihorde_client_agent: Option<String>,
-    /// `AIHORDE_TIMEOUT_SECONDS`.
-    pub aihorde_timeout_seconds: Option<String>,
-    /// `AIHORDE_POLL_INTERVAL_SECONDS`.
-    pub aihorde_poll_interval_seconds: Option<String>,
-    /// `AIHORDE_MODEL`.
-    pub aihorde_model: Option<String>,
     /// `PRUNA_ENDPOINT`.
     pub pruna_endpoint: Option<String>,
     /// `PRUNA_MODEL`.
@@ -992,12 +845,6 @@ pub struct RawConfig {
     pub pruna_bearer: Option<String>,
     /// `PRUNA_TIMEOUT_SECONDS`.
     pub pruna_timeout_seconds: Option<String>,
-    /// `MODELSCOPE_KEY`.
-    pub modelscope_key: Option<String>,
-    /// `MODELSCOPE_BASE_URL`.
-    pub modelscope_base_url: Option<String>,
-    /// `MODELSCOPE_POLL_INTERVAL_SECONDS`.
-    pub modelscope_poll_interval_seconds: Option<String>,
     /// `WHITECIRCLE_ENABLED`.
     pub whitecircle_enabled: Option<String>,
     /// `WHITECIRCLE_API_KEY`.
@@ -1288,20 +1135,6 @@ pub enum ConfigError {
     },
     #[error("{name} must be set when the feature is enabled")]
     InvalidEmptyValue { name: &'static str },
-    #[error("invalid {name} value: {reason}")]
-    InvalidAbsoluteUrl {
-        /// Environment variable name.
-        name: &'static str,
-        /// Raw URL value.
-        value: String,
-        /// Parse or shape failure.
-        reason: String,
-    },
-    #[error("invalid TINYFISH_FETCH_FORMAT value: {value}")]
-    InvalidTinyFishFetchFormat {
-        /// Raw fetch format.
-        value: String,
-    },
     #[error("{name} must be greater than zero")]
     NonPositiveInteger {
         /// Environment variable name.
@@ -1582,11 +1415,6 @@ impl AppConfig {
                 value: openrouter_request_timeout_seconds,
             });
         }
-        let together_rate_limit_seconds = parse_i32(
-            "TOGETHER_RATE_LIMIT_SECONDS",
-            raw.together_rate_limit_seconds,
-            DEFAULT_TOGETHER_RATE_LIMIT_SECONDS,
-        )?;
         let serper = SerperConfig {
             api_key: raw.serper_api_key.unwrap_or_default(),
             timeout_seconds: parse_i32(
@@ -1595,49 +1423,6 @@ impl AppConfig {
                 DEFAULT_SERPER_TIMEOUT_SECONDS,
             )?,
         };
-        let tinyfish = TinyFishConfig {
-            enabled: parse_bool(
-                "TINYFISH_ENABLED",
-                raw.tinyfish_enabled,
-                DEFAULT_TINYFISH_ENABLED,
-            )?,
-            api_key: raw.tinyfish_api_key.unwrap_or_default(),
-            search_base_url: raw
-                .tinyfish_search_base_url
-                .unwrap_or_else(|| DEFAULT_TINYFISH_SEARCH_BASE_URL.to_owned()),
-            fetch_base_url: raw
-                .tinyfish_fetch_base_url
-                .unwrap_or_else(|| DEFAULT_TINYFISH_FETCH_BASE_URL.to_owned()),
-            search_location: raw.tinyfish_search_location.unwrap_or_default(),
-            search_language: raw
-                .tinyfish_search_language
-                .unwrap_or_else(|| DEFAULT_TINYFISH_SEARCH_LANGUAGE.to_owned()),
-            fetch_format: raw
-                .tinyfish_fetch_format
-                .unwrap_or_else(|| DEFAULT_TINYFISH_FETCH_FORMAT.to_owned()),
-            max_content_chars: parse_i32(
-                "TINYFISH_MAX_CONTENT_CHARS",
-                raw.tinyfish_max_content_chars,
-                DEFAULT_TINYFISH_MAX_CONTENT_CHARS,
-            )?,
-            timeout_seconds: parse_i32(
-                "TINYFISH_TIMEOUT_SECONDS",
-                raw.tinyfish_timeout_seconds,
-                DEFAULT_TINYFISH_TIMEOUT_SECONDS,
-            )?,
-            mcp_url: raw
-                .tinyfish_mcp_url
-                .unwrap_or_else(|| DEFAULT_TINYFISH_MCP_URL.to_owned()),
-            mcp_access_token: raw.tinyfish_mcp_access_token.unwrap_or_default(),
-            mcp_refresh_token: raw.tinyfish_mcp_refresh_token.unwrap_or_default(),
-            mcp_oauth_client_id: raw.tinyfish_mcp_oauth_client_id.unwrap_or_default(),
-            mcp_oauth_token_url: raw
-                .tinyfish_mcp_oauth_token_url
-                .unwrap_or_else(|| DEFAULT_TINYFISH_MCP_OAUTH_TOKEN_URL.to_owned()),
-            mcp_search_tool_name: raw.tinyfish_mcp_search_tool_name.unwrap_or_default(),
-            mcp_fetch_tool_name: raw.tinyfish_mcp_fetch_tool_name.unwrap_or_default(),
-        };
-        validate_tinyfish_config(&tinyfish)?;
 
         let postgres = PostgresConfig {
             host: raw
@@ -1717,7 +1502,6 @@ impl AppConfig {
                 )?,
             },
             serper,
-            tinyfish,
             translation: TranslationConfig {
                 deepl: DeeplConfig {
                     key: raw.deepl_key.unwrap_or_default(),
@@ -1733,35 +1517,6 @@ impl AppConfig {
             open_router: OpenRouterConfig {
                 key: raw.openrouter_key.unwrap_or_default(),
                 request_timeout_seconds: openrouter_request_timeout_seconds,
-            },
-            together: TogetherConfig {
-                key: raw.together_key.unwrap_or_default(),
-                keys: parse_string_list(raw.together_keys),
-                rate_limit_seconds: together_rate_limit_seconds,
-            },
-            ai_horde: AiHordeConfig {
-                api_key: raw
-                    .aihorde_api_key
-                    .unwrap_or_else(|| DEFAULT_AIHORDE_API_KEY.to_owned()),
-                base_url: raw
-                    .aihorde_base_url
-                    .unwrap_or_else(|| DEFAULT_AIHORDE_BASE_URL.to_owned()),
-                client_agent: raw
-                    .aihorde_client_agent
-                    .unwrap_or_else(|| DEFAULT_AIHORDE_CLIENT_AGENT.to_owned()),
-                timeout_seconds: parse_i32(
-                    "AIHORDE_TIMEOUT_SECONDS",
-                    raw.aihorde_timeout_seconds,
-                    DEFAULT_AIHORDE_TIMEOUT_SECONDS,
-                )?,
-                poll_interval_seconds: parse_i32(
-                    "AIHORDE_POLL_INTERVAL_SECONDS",
-                    raw.aihorde_poll_interval_seconds,
-                    DEFAULT_AIHORDE_POLL_INTERVAL_SECONDS,
-                )?,
-                model: raw
-                    .aihorde_model
-                    .unwrap_or_else(|| DEFAULT_AIHORDE_MODEL.to_owned()),
             },
             pruna: PrunaConfig {
                 endpoint: raw
@@ -1780,17 +1535,6 @@ impl AppConfig {
                     "PRUNA_TIMEOUT_SECONDS",
                     raw.pruna_timeout_seconds,
                     DEFAULT_PRUNA_TIMEOUT_SECONDS,
-                )?,
-            },
-            model_scope: ModelScopeConfig {
-                key: raw.modelscope_key.unwrap_or_default(),
-                base_url: raw
-                    .modelscope_base_url
-                    .unwrap_or_else(|| DEFAULT_MODELSCOPE_BASE_URL.to_owned()),
-                poll_interval_seconds: parse_i32(
-                    "MODELSCOPE_POLL_INTERVAL_SECONDS",
-                    raw.modelscope_poll_interval_seconds,
-                    DEFAULT_MODELSCOPE_POLL_INTERVAL_SECONDS,
                 )?,
             },
             white_circle: WhiteCircleConfig {
@@ -2354,45 +2098,17 @@ impl RawConfig {
             rbc_timeout_seconds: env("RBC_TIMEOUT_SECONDS"),
             serper_api_key: env("SERPER_API_KEY"),
             serper_timeout_seconds: env("SERPER_TIMEOUT_SECONDS"),
-            tinyfish_enabled: env("TINYFISH_ENABLED"),
-            tinyfish_api_key: env("TINYFISH_API_KEY"),
-            tinyfish_search_base_url: env("TINYFISH_SEARCH_BASE_URL"),
-            tinyfish_fetch_base_url: env("TINYFISH_FETCH_BASE_URL"),
-            tinyfish_search_location: env("TINYFISH_SEARCH_LOCATION"),
-            tinyfish_search_language: env("TINYFISH_SEARCH_LANGUAGE"),
-            tinyfish_fetch_format: env("TINYFISH_FETCH_FORMAT"),
-            tinyfish_max_content_chars: env("TINYFISH_MAX_CONTENT_CHARS"),
-            tinyfish_timeout_seconds: env("TINYFISH_TIMEOUT_SECONDS"),
-            tinyfish_mcp_url: env("TINYFISH_MCP_URL"),
-            tinyfish_mcp_access_token: env("TINYFISH_MCP_ACCESS_TOKEN"),
-            tinyfish_mcp_refresh_token: env("TINYFISH_MCP_REFRESH_TOKEN"),
-            tinyfish_mcp_oauth_client_id: env("TINYFISH_MCP_OAUTH_CLIENT_ID"),
-            tinyfish_mcp_oauth_token_url: env("TINYFISH_MCP_OAUTH_TOKEN_URL"),
-            tinyfish_mcp_search_tool_name: env("TINYFISH_MCP_SEARCH_TOOL_NAME"),
-            tinyfish_mcp_fetch_tool_name: env("TINYFISH_MCP_FETCH_TOOL_NAME"),
             deepl_key: env("DEEPL_KEY"),
             deepl_url: env("DEEPL_URL"),
             googleai_key: env("GOOGLEAI_KEY"),
             googleai_key_stats_file: env("GOOGLEAI_KEY_STATS_FILE"),
             openrouter_key: env("OPENROUTER_KEY"),
             openrouter_request_timeout_seconds: env("OPENROUTER_REQUEST_TIMEOUT_SECONDS"),
-            together_key: env("TOGETHER_KEY"),
-            together_keys: env("TOGETHER_KEYS"),
-            together_rate_limit_seconds: env("TOGETHER_RATE_LIMIT_SECONDS"),
-            aihorde_api_key: env("AIHORDE_API_KEY"),
-            aihorde_base_url: env("AIHORDE_BASE_URL"),
-            aihorde_client_agent: env("AIHORDE_CLIENT_AGENT"),
-            aihorde_timeout_seconds: env("AIHORDE_TIMEOUT_SECONDS"),
-            aihorde_poll_interval_seconds: env("AIHORDE_POLL_INTERVAL_SECONDS"),
-            aihorde_model: env("AIHORDE_MODEL"),
             pruna_endpoint: env("PRUNA_ENDPOINT"),
             pruna_model: env("PRUNA_MODEL"),
             pruna_api_key: env("PRUNA_API_KEY"),
             pruna_bearer: env("PRUNA_BEARER"),
             pruna_timeout_seconds: env("PRUNA_TIMEOUT_SECONDS"),
-            modelscope_key: env("MODELSCOPE_KEY"),
-            modelscope_base_url: env("MODELSCOPE_BASE_URL"),
-            modelscope_poll_interval_seconds: env("MODELSCOPE_POLL_INTERVAL_SECONDS"),
             whitecircle_enabled: env("WHITECIRCLE_ENABLED"),
             whitecircle_api_key: env("WHITECIRCLE_API_KEY"),
             whitecircle_deployment_id: env("WHITECIRCLE_DEPLOYMENT_ID"),
@@ -2655,47 +2371,6 @@ fn validate_history_summary_provider(value: &str) -> Result<(), ConfigError> {
     }
 }
 
-fn validate_tinyfish_config(config: &TinyFishConfig) -> Result<(), ConfigError> {
-    if !config.enabled {
-        return Ok(());
-    }
-    validate_optional_absolute_url("TINYFISH_SEARCH_BASE_URL", &config.search_base_url)?;
-    validate_optional_absolute_url("TINYFISH_FETCH_BASE_URL", &config.fetch_base_url)?;
-    validate_optional_absolute_url("TINYFISH_MCP_URL", &config.mcp_url)?;
-    validate_optional_absolute_url("TINYFISH_MCP_OAUTH_TOKEN_URL", &config.mcp_oauth_token_url)?;
-    match config.fetch_format.trim().to_ascii_lowercase().as_str() {
-        "" | "markdown" | "html" | "json" => {}
-        _ => {
-            return Err(ConfigError::InvalidTinyFishFetchFormat {
-                value: config.fetch_format.clone(),
-            });
-        }
-    }
-    validate_non_negative_i32("TINYFISH_MAX_CONTENT_CHARS", config.max_content_chars)?;
-    validate_positive_i32("TINYFISH_TIMEOUT_SECONDS", config.timeout_seconds)?;
-    Ok(())
-}
-
-fn validate_optional_absolute_url(name: &'static str, value: &str) -> Result<(), ConfigError> {
-    let value = value.trim();
-    if value.is_empty() {
-        return Ok(());
-    }
-    let parsed = url::Url::parse(value).map_err(|source| ConfigError::InvalidAbsoluteUrl {
-        name,
-        value: value.to_owned(),
-        reason: source.to_string(),
-    })?;
-    if parsed.scheme().is_empty() || parsed.host_str().is_none() {
-        return Err(ConfigError::InvalidAbsoluteUrl {
-            name,
-            value: value.to_owned(),
-            reason: "URL must include scheme and host".to_owned(),
-        });
-    }
-    Ok(())
-}
-
 fn validate_non_empty_when_enabled(name: &'static str, value: &str) -> Result<(), ConfigError> {
     if value.trim().is_empty() {
         return Err(ConfigError::InvalidEmptyValue { name });
@@ -2836,14 +2511,11 @@ mod tests {
         AppConfig, DEFAULT_ACESTEP_API_MODE, DEFAULT_ACESTEP_AUDIO_FORMAT,
         DEFAULT_ACESTEP_BASE_URL, DEFAULT_ACESTEP_MODEL, DEFAULT_ACESTEP_POLL_INTERVAL_SECONDS,
         DEFAULT_ACESTEP_REQUEST_TIMEOUT_SECONDS, DEFAULT_ACESTEP_TASK_TIMEOUT_SECONDS,
-        DEFAULT_AIHORDE_API_KEY, DEFAULT_AIHORDE_BASE_URL, DEFAULT_AIHORDE_CLIENT_AGENT,
-        DEFAULT_AIHORDE_MODEL, DEFAULT_AIHORDE_POLL_INTERVAL_SECONDS,
-        DEFAULT_AIHORDE_TIMEOUT_SECONDS, DEFAULT_DIALOG_AIFARM_POOL_BASE_URLS,
-        DEFAULT_DIALOG_AIFARM_POOL_MODELS, DEFAULT_DIALOG_AIFARM_POOL_REASONING_MAX_TOKENS,
-        DEFAULT_DIALOG_MODEL, DEFAULT_DISCOVERY_BASE_URL, DEFAULT_HISTORY_SUMMARY_PROVIDER,
+        DEFAULT_DIALOG_AIFARM_POOL_BASE_URLS, DEFAULT_DIALOG_AIFARM_POOL_MODELS,
+        DEFAULT_DIALOG_AIFARM_POOL_REASONING_MAX_TOKENS, DEFAULT_DIALOG_MODEL,
+        DEFAULT_DISCOVERY_BASE_URL, DEFAULT_HISTORY_SUMMARY_PROVIDER,
         DEFAULT_HISTORY_SUMMARY_TIMEOUT_SECONDS, DEFAULT_LLM_JOB_MAX_ATTEMPTS, DEFAULT_LOG_FILTER,
-        DEFAULT_MEMORY_CONSOLIDATION_MODEL, DEFAULT_MODELSCOPE_BASE_URL,
-        DEFAULT_MODELSCOPE_POLL_INTERVAL_SECONDS, DEFAULT_OPENROUTER_REQUEST_TIMEOUT_SECONDS,
+        DEFAULT_MEMORY_CONSOLIDATION_MODEL, DEFAULT_OPENROUTER_REQUEST_TIMEOUT_SECONDS,
         DEFAULT_PERSISTENT_QUEUE_CLEANUP_INTERVAL_SECONDS,
         DEFAULT_PERSISTENT_QUEUE_COMPLETED_JOB_RETENTION_DAYS,
         DEFAULT_PERSISTENT_QUEUE_CONTROL_WORKERS,
@@ -2871,14 +2543,9 @@ mod tests {
         DEFAULT_SERPER_TIMEOUT_SECONDS, DEFAULT_SHIELD_EMBEDDING_DIM,
         DEFAULT_SHIELD_LEXICAL_MIN_SCORE, DEFAULT_SHIELD_MAX_MATCHES,
         DEFAULT_SHIELD_QUERY_MAX_CHARS, DEFAULT_SHIELD_RETRIEVAL_TIMEOUT_SECONDS,
-        DEFAULT_SHIELD_VECTOR_MIN_SCORE, DEFAULT_TINYFISH_FETCH_BASE_URL,
-        DEFAULT_TINYFISH_FETCH_FORMAT, DEFAULT_TINYFISH_MAX_CONTENT_CHARS,
-        DEFAULT_TINYFISH_MCP_OAUTH_TOKEN_URL, DEFAULT_TINYFISH_MCP_URL,
-        DEFAULT_TINYFISH_SEARCH_BASE_URL, DEFAULT_TINYFISH_SEARCH_LANGUAGE,
-        DEFAULT_TINYFISH_TIMEOUT_SECONDS, DEFAULT_TOGETHER_RATE_LIMIT_SECONDS,
-        DEFAULT_VISION_DIRECT_IMAGE_LIMIT, DEFAULT_VISION_MAX_TOKENS, DEFAULT_VISION_MODEL,
-        DEFAULT_VISION_REQUEST_TIMEOUT_SECONDS, DEFAULT_WEBAPP_PORT, DEFAULT_WEBAPP_URL, RawConfig,
-        parse_string_list_or_default,
+        DEFAULT_SHIELD_VECTOR_MIN_SCORE, DEFAULT_VISION_DIRECT_IMAGE_LIMIT,
+        DEFAULT_VISION_MAX_TOKENS, DEFAULT_VISION_MODEL, DEFAULT_VISION_REQUEST_TIMEOUT_SECONDS,
+        DEFAULT_WEBAPP_PORT, DEFAULT_WEBAPP_URL, RawConfig, parse_string_list_or_default,
     };
 
     #[test]
@@ -3037,50 +2704,10 @@ mod tests {
             config.serper.timeout_seconds,
             DEFAULT_SERPER_TIMEOUT_SECONDS
         );
-        assert!(config.tinyfish.enabled);
-        assert_eq!(config.tinyfish.api_key, "");
-        assert_eq!(
-            config.tinyfish.search_base_url,
-            DEFAULT_TINYFISH_SEARCH_BASE_URL
-        );
-        assert_eq!(
-            config.tinyfish.fetch_base_url,
-            DEFAULT_TINYFISH_FETCH_BASE_URL
-        );
-        assert_eq!(config.tinyfish.search_location, "");
-        assert_eq!(
-            config.tinyfish.search_language,
-            DEFAULT_TINYFISH_SEARCH_LANGUAGE
-        );
-        assert_eq!(config.tinyfish.fetch_format, DEFAULT_TINYFISH_FETCH_FORMAT);
-        assert_eq!(
-            config.tinyfish.max_content_chars,
-            DEFAULT_TINYFISH_MAX_CONTENT_CHARS
-        );
-        assert_eq!(
-            config.tinyfish.timeout_seconds,
-            DEFAULT_TINYFISH_TIMEOUT_SECONDS
-        );
-        assert_eq!(config.tinyfish.mcp_url, DEFAULT_TINYFISH_MCP_URL);
-        assert_eq!(config.tinyfish.mcp_access_token, "");
-        assert_eq!(config.tinyfish.mcp_refresh_token, "");
-        assert_eq!(config.tinyfish.mcp_oauth_client_id, "");
-        assert_eq!(
-            config.tinyfish.mcp_oauth_token_url,
-            DEFAULT_TINYFISH_MCP_OAUTH_TOKEN_URL
-        );
-        assert_eq!(config.tinyfish.mcp_search_tool_name, "");
-        assert_eq!(config.tinyfish.mcp_fetch_tool_name, "");
         assert_eq!(config.open_router.key, "");
         assert_eq!(
             config.open_router.request_timeout_seconds,
             DEFAULT_OPENROUTER_REQUEST_TIMEOUT_SECONDS
-        );
-        assert_eq!(config.together.key, "");
-        assert!(config.together.keys.is_empty());
-        assert_eq!(
-            config.together.rate_limit_seconds,
-            DEFAULT_TOGETHER_RATE_LIMIT_SECONDS
         );
         assert_eq!(config.llm.discovery.base_url, DEFAULT_DISCOVERY_BASE_URL);
         assert_eq!(config.llm.genkit.default_model, "");
@@ -3172,12 +2799,6 @@ mod tests {
         assert_eq!(config.pruna.api_key, DEFAULT_PRUNA_API_KEY);
         assert_eq!(config.pruna.bearer, DEFAULT_PRUNA_BEARER);
         assert_eq!(config.pruna.timeout_seconds, DEFAULT_PRUNA_TIMEOUT_SECONDS);
-        assert_eq!(config.model_scope.key, "");
-        assert_eq!(config.model_scope.base_url, DEFAULT_MODELSCOPE_BASE_URL);
-        assert_eq!(
-            config.model_scope.poll_interval_seconds,
-            DEFAULT_MODELSCOPE_POLL_INTERVAL_SECONDS
-        );
         assert!(config.memory.enabled);
         assert_eq!(config.memory.retention_hours, 168);
         assert_eq!(config.memory.consolidation_provider, "aifarm");
@@ -3557,177 +3178,15 @@ mod tests {
     }
 
     #[test]
-    fn tinyfish_config_loads_go_env_values() -> Result<(), super::ConfigError> {
-        let config = AppConfig::from_raw(RawConfig {
-            tinyfish_enabled: Some("true".to_owned()),
-            tinyfish_api_key: Some("tf-key".to_owned()),
-            tinyfish_search_base_url: Some("https://search.example.test".to_owned()),
-            tinyfish_fetch_base_url: Some("https://fetch.example.test".to_owned()),
-            tinyfish_search_location: Some("Warsaw".to_owned()),
-            tinyfish_search_language: Some("pl".to_owned()),
-            tinyfish_fetch_format: Some("html".to_owned()),
-            tinyfish_max_content_chars: Some("1234".to_owned()),
-            tinyfish_timeout_seconds: Some("7".to_owned()),
-            tinyfish_mcp_url: Some("https://mcp.example.test".to_owned()),
-            tinyfish_mcp_access_token: Some("access".to_owned()),
-            tinyfish_mcp_refresh_token: Some("refresh".to_owned()),
-            tinyfish_mcp_oauth_client_id: Some("client".to_owned()),
-            tinyfish_mcp_oauth_token_url: Some("https://oauth.example.test/token".to_owned()),
-            tinyfish_mcp_search_tool_name: Some("search".to_owned()),
-            tinyfish_mcp_fetch_tool_name: Some("fetch".to_owned()),
-            ..RawConfig::default()
-        })?;
-
-        assert!(config.tinyfish.enabled);
-        assert_eq!(config.tinyfish.api_key, "tf-key");
-        assert_eq!(
-            config.tinyfish.search_base_url,
-            "https://search.example.test"
-        );
-        assert_eq!(config.tinyfish.fetch_base_url, "https://fetch.example.test");
-        assert_eq!(config.tinyfish.search_location, "Warsaw");
-        assert_eq!(config.tinyfish.search_language, "pl");
-        assert_eq!(config.tinyfish.fetch_format, "html");
-        assert_eq!(config.tinyfish.max_content_chars, 1234);
-        assert_eq!(config.tinyfish.timeout_seconds, 7);
-        assert_eq!(config.tinyfish.mcp_url, "https://mcp.example.test");
-        assert_eq!(config.tinyfish.mcp_access_token, "access");
-        assert_eq!(config.tinyfish.mcp_refresh_token, "refresh");
-        assert_eq!(config.tinyfish.mcp_oauth_client_id, "client");
-        assert_eq!(
-            config.tinyfish.mcp_oauth_token_url,
-            "https://oauth.example.test/token"
-        );
-        assert_eq!(config.tinyfish.mcp_search_tool_name, "search");
-        assert_eq!(config.tinyfish.mcp_fetch_tool_name, "fetch");
-        Ok(())
-    }
-
-    #[test]
-    fn tinyfish_disabled_skips_go_validation() -> Result<(), super::ConfigError> {
-        let config = AppConfig::from_raw(RawConfig {
-            tinyfish_enabled: Some("false".to_owned()),
-            tinyfish_search_base_url: Some("not a url".to_owned()),
-            tinyfish_fetch_format: Some("xml".to_owned()),
-            tinyfish_timeout_seconds: Some("0".to_owned()),
-            ..RawConfig::default()
-        })?;
-
-        assert!(!config.tinyfish.enabled);
-        Ok(())
-    }
-
-    #[test]
-    fn tinyfish_enabled_rejects_invalid_url_like_go() {
-        let error = AppConfig::from_raw(RawConfig {
-            tinyfish_search_base_url: Some("not a url".to_owned()),
-            ..RawConfig::default()
-        })
-        .err();
-
-        assert!(matches!(
-            error,
-            Some(super::ConfigError::InvalidAbsoluteUrl {
-                name: "TINYFISH_SEARCH_BASE_URL",
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn tinyfish_enabled_rejects_invalid_fetch_format_like_go() {
-        let error = AppConfig::from_raw(RawConfig {
-            tinyfish_fetch_format: Some("xml".to_owned()),
-            ..RawConfig::default()
-        })
-        .err();
-
-        assert!(matches!(
-            error,
-            Some(super::ConfigError::InvalidTinyFishFetchFormat { .. })
-        ));
-    }
-
-    #[test]
-    fn tinyfish_enabled_rejects_invalid_limits_like_go() {
-        let negative_chars = AppConfig::from_raw(RawConfig {
-            tinyfish_max_content_chars: Some("-1".to_owned()),
-            ..RawConfig::default()
-        })
-        .err();
-        let zero_timeout = AppConfig::from_raw(RawConfig {
-            tinyfish_timeout_seconds: Some("0".to_owned()),
-            ..RawConfig::default()
-        })
-        .err();
-
-        assert!(matches!(
-            negative_chars,
-            Some(super::ConfigError::NegativeInteger {
-                name: "TINYFISH_MAX_CONTENT_CHARS",
-                value: -1,
-            })
-        ));
-        assert!(matches!(
-            zero_timeout,
-            Some(super::ConfigError::NonPositiveInteger {
-                name: "TINYFISH_TIMEOUT_SECONDS",
-                value: 0,
-            })
-        ));
-    }
-
-    #[test]
-    fn openrouter_and_together_config_load_env_values() -> Result<(), super::ConfigError> {
+    fn openrouter_config_load_env_values() -> Result<(), super::ConfigError> {
         let config = AppConfig::from_raw(RawConfig {
             openrouter_key: Some(" openrouter-key ".to_owned()),
             openrouter_request_timeout_seconds: Some("123".to_owned()),
-            together_key: Some(" together-key ".to_owned()),
-            together_keys: Some(" key-a, key-b ,, ".to_owned()),
-            together_rate_limit_seconds: Some("17".to_owned()),
             ..RawConfig::default()
         })?;
 
         assert_eq!(config.open_router.key, " openrouter-key ");
         assert_eq!(config.open_router.request_timeout_seconds, 123);
-        assert_eq!(config.together.key, " together-key ");
-        assert_eq!(config.together.keys, vec!["key-a", "key-b"]);
-        assert_eq!(config.together.rate_limit_seconds, 17);
-        Ok(())
-    }
-
-    #[test]
-    fn aihorde_config_loads_env_values() -> Result<(), super::ConfigError> {
-        let defaults = AppConfig::from_raw(RawConfig::default())?;
-        assert_eq!(defaults.ai_horde.api_key, DEFAULT_AIHORDE_API_KEY);
-        assert_eq!(defaults.ai_horde.base_url, DEFAULT_AIHORDE_BASE_URL);
-        assert_eq!(defaults.ai_horde.client_agent, DEFAULT_AIHORDE_CLIENT_AGENT);
-        assert_eq!(
-            defaults.ai_horde.timeout_seconds,
-            DEFAULT_AIHORDE_TIMEOUT_SECONDS
-        );
-        assert_eq!(
-            defaults.ai_horde.poll_interval_seconds,
-            DEFAULT_AIHORDE_POLL_INTERVAL_SECONDS
-        );
-        assert_eq!(defaults.ai_horde.model, DEFAULT_AIHORDE_MODEL);
-
-        let config = AppConfig::from_raw(RawConfig {
-            aihorde_api_key: Some(" horde-key ".to_owned()),
-            aihorde_base_url: Some(" https://aihorde.test ".to_owned()),
-            aihorde_client_agent: Some(" openplotva:test ".to_owned()),
-            aihorde_timeout_seconds: Some("44".to_owned()),
-            aihorde_poll_interval_seconds: Some("5".to_owned()),
-            aihorde_model: Some(" custom-model ".to_owned()),
-            ..RawConfig::default()
-        })?;
-
-        assert_eq!(config.ai_horde.api_key, " horde-key ");
-        assert_eq!(config.ai_horde.base_url, " https://aihorde.test ");
-        assert_eq!(config.ai_horde.client_agent, " openplotva:test ");
-        assert_eq!(config.ai_horde.timeout_seconds, 44);
-        assert_eq!(config.ai_horde.poll_interval_seconds, 5);
-        assert_eq!(config.ai_horde.model, " custom-model ");
         Ok(())
     }
 
@@ -3747,24 +3206,6 @@ mod tests {
         assert_eq!(config.pruna.api_key, " api-key ");
         assert_eq!(config.pruna.bearer, " bearer-token ");
         assert_eq!(config.pruna.timeout_seconds, 45);
-        Ok(())
-    }
-
-    #[test]
-    fn modelscope_config_loads_env_values() -> Result<(), super::ConfigError> {
-        let config = AppConfig::from_raw(RawConfig {
-            modelscope_key: Some(" modelscope-key ".to_owned()),
-            modelscope_base_url: Some(" https://modelscope.test/api/ ".to_owned()),
-            modelscope_poll_interval_seconds: Some("7".to_owned()),
-            ..RawConfig::default()
-        })?;
-
-        assert_eq!(config.model_scope.key, " modelscope-key ");
-        assert_eq!(
-            config.model_scope.base_url,
-            " https://modelscope.test/api/ "
-        );
-        assert_eq!(config.model_scope.poll_interval_seconds, 7);
         Ok(())
     }
 

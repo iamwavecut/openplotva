@@ -60,7 +60,7 @@ The app reads `.env` files and environment variables. Important groups:
 - `ADMINS_ADMIN_IDS` for administrative Telegram users.
 - `RUNTIME_API_*` for the optional diagnostic API.
 - `PERSISTENT_QUEUE_*` for worker and queue behavior.
-- `DISCOVERY_*`, `DIALOG_*`, `GOOGLEAI_*`, `OPENROUTER_*`, `TOGETHER_*`, `AIHORDE_*`, `PRUNA_*`, `MODELSCOPE_*`, `ACESTEP_*`, `MEMORY_*`, `SHIELD_*`, `VISION_*`, `SERPER_*`, and `TINYFISH_*` for provider integrations.
+- `DISCOVERY_*`, `DIALOG_*`, `GOOGLEAI_*`, `OPENROUTER_*`, `PRUNA_*`, `ACESTEP_*`, `MEMORY_*`, `SHIELD_*`, `VISION_*`, and `SERPER_*` for provider integrations.
 
 Service connections are opt-in by default for local shell runs:
 
@@ -94,4 +94,3 @@ OPENPLOTVA_PRODUCE_UPDATES=false OPENPLOTVA_CONSUME_UPDATES=true cargo run -p op
 - `crates/openplotva-updates`: update queue codec and helpers.
 - `crates/openplotva-web`: admin/settings WebApp helpers and embedded assets.
 - `tools`: local smoke checks and auxiliary service binaries.
-

@@ -36,9 +36,7 @@ use crate::media::aifarm_pool_config_from_app_config;
 use crate::runtime_gemini_cache::resolve_google_ai_key;
 
 const OPENROUTER_MODEL_PREFIX: &str = "openrouter/";
-const TOGETHER_MODEL_PREFIX: &str = "together/";
 const OPENROUTER_CHAT_COMPLETIONS_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
-const TOGETHER_CHAT_COMPLETIONS_URL: &str = "https://api.together.xyz/v1/chat/completions";
 
 /// Concrete app history-summary service used by the dialog toolbox runtime.
 pub type AppHistorySummaryService =
@@ -496,14 +494,6 @@ fn genkit_openai_compatible_history_summary_config_from_app_config(
                 config.open_router.request_timeout_seconds,
                 "openrouter",
             )
-        } else if let Some(model) = strip_provider_prefix_fold(model, TOGETHER_MODEL_PREFIX) {
-            (
-                TOGETHER_CHAT_COMPLETIONS_URL,
-                together_api_key(config),
-                model.trim().to_owned(),
-                config.llm.dialog.request_timeout_seconds,
-                "together",
-            )
         } else {
             return Ok(None);
         };
@@ -520,21 +510,6 @@ fn genkit_openai_compatible_history_summary_config_from_app_config(
         request_timeout: positive_seconds(request_timeout_seconds),
         ..GenkitOpenAiCompatibleHistorySummaryConfig::default()
     }))
-}
-
-fn together_api_key(config: &AppConfig) -> String {
-    let key = config.together.key.trim();
-    if !key.is_empty() {
-        return key.to_owned();
-    }
-    config
-        .together
-        .keys
-        .iter()
-        .map(|key| key.trim())
-        .find(|key| !key.is_empty())
-        .unwrap_or_default()
-        .to_owned()
 }
 
 fn strip_provider_prefix_fold<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {

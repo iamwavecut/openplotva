@@ -13,7 +13,6 @@ explicitly enabled.
 Default checks:
   - deterministic offline RBC request/decoder contract smokes
   - deterministic offline Serper request/crawl contract smokes
-  - deterministic offline TinyFish REST request/decoder contract smokes
   - deterministic offline media/provider contract smokes batched by app/media filters
   - deterministic offline LLM/provider contract smokes batched by provider filters
   - live RBC USD/RUB provider smoke when the RBC endpoint is reachable
@@ -22,23 +21,12 @@ Optional env:
   BOT_KEY                                      run Telegram getMe smoke when set
   OPENPLOTVA_PROVIDER_SMOKE_RBC               auto, 1, or 0; default auto
   OPENPLOTVA_PROVIDER_SMOKE_SERPER            auto, 1, or 0; default auto
-  OPENPLOTVA_PROVIDER_SMOKE_TINYFISH          auto, 1, or 0; default auto
-  OPENPLOTVA_PROVIDER_SMOKE_TINYFISH_MCP      auto, 1, or 0; default auto
   OPENPLOTVA_PROVIDER_SMOKE_GEMINI            auto, 1, or 0; default auto
   OPENPLOTVA_PROVIDER_SMOKE_OPENROUTER        auto, 1, or 0; default auto
-  OPENPLOTVA_PROVIDER_SMOKE_TOGETHER_CHAT     auto, 1, or 0; default auto
-  OPENPLOTVA_PROVIDER_SMOKE_TOGETHER_IMAGE    auto, 1, or 0; default auto
   OPENPLOTVA_PROVIDER_SMOKE_LOOPBACK          auto, 1, or 0; default auto runs selected live-shaped fake provider smokes when live inputs are absent
   SERPER_API_KEY                               Serper API key for live smoke
-  TINYFISH_API_KEY                             TinyFish REST API key for live smoke
-  TINYFISH_MCP_ACCESS_TOKEN                    TinyFish MCP bearer token for live smoke
-  TINYFISH_MCP_REFRESH_TOKEN                   TinyFish MCP refresh token for live OAuth smoke
-  TINYFISH_MCP_OAUTH_CLIENT_ID                 TinyFish MCP OAuth client id for live OAuth smoke
   GOOGLEAI_KEY                                 Gemini direct/provider smoke key
   OPENROUTER_KEY                               OpenRouter GenKit-compatible dialog smoke key
-  TOGETHER_KEY or TOGETHER_KEYS                Together chat/image smoke key source
-  OPENPLOTVA_TINYFISH_SMOKE_QUERY             live TinyFish search query
-  OPENPLOTVA_TINYFISH_SMOKE_FETCH_URL         live TinyFish fetch URL, default https://example.com/
   OPENPLOTVA_SERPER_SMOKE_QUERY               live Serper search query
   OPENPLOTVA_PROVIDER_SMOKE_TELEGRAM          run Telegram getMe smoke when BOT_KEY is set, default 1
   OPENPLOTVA_PROVIDER_SMOKE_TELEGRAM_MEMBERSHIP
@@ -104,10 +92,6 @@ provider_loopback_enabled() {
 
 google_ai_key_source_present() {
   [[ -n "${GOOGLEAI_KEY:-}" || -n "${GOOGLEAI_KEY_STATS_FILE:-}" ]]
-}
-
-together_key_source_present() {
-  [[ -n "${TOGETHER_KEY:-}" || -n "${TOGETHER_KEYS:-}" ]]
 }
 
 validate_auto_mode() {
@@ -235,99 +219,6 @@ class Handler(BaseHTTPRequestHandler):
         for key, values in query.items():
             if values:
                 params.setdefault(key, values[-1])
-        if parsed.path.endswith("/tinyfish/search"):
-            body = b"loopback tinyfish search result"
-            self.send_response(200)
-            self.send_header("content-type", "text/plain; charset=utf-8")
-            self.send_header("content-length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
-        if parsed.path.endswith("/tinyfish/fetch"):
-            body = json.dumps({"results": [{"text": "loopback tinyfish fetched page"}], "errors": []}, ensure_ascii=False).encode("utf-8")
-            self.send_response(200)
-            self.send_header("content-type", "application/json")
-            self.send_header("content-length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
-        if parsed.path.endswith("/tinyfish/oauth/token"):
-            body = json.dumps({
-                "access_token": "loopback-mcp-access",
-                "refresh_token": "loopback-mcp-refresh",
-                "token_type": "bearer",
-                "expires_in": 3600,
-            }, ensure_ascii=False).encode("utf-8")
-            self.send_response(200)
-            self.send_header("content-type", "application/json")
-            self.send_header("content-length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
-        if parsed.path.endswith("/tinyfish/mcp"):
-            rpc_method = params.get("method", "")
-            rpc_id = params.get("id")
-            result = {}
-            if rpc_method == "initialize":
-                result = {
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {},
-                    "serverInfo": {"name": "tinyfish-loopback", "version": "1.0.0"},
-                }
-            elif rpc_method == "tools/list":
-                result = {
-                    "tools": [
-                        {
-                            "name": "Tiny_Fish-Search",
-                            "description": "Search",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "q": {"type": "string"},
-                                    "location": {"type": "string"},
-                                    "language": {"type": "string"},
-                                },
-                            },
-                        },
-                        {
-                            "name": "tinyfish_fetch",
-                            "description": "Fetch",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "urls": {"type": "array"},
-                                    "format": {"type": "string"},
-                                    "links": {"type": "boolean"},
-                                    "image_links": {"type": "boolean"},
-                                },
-                            },
-                        },
-                    ],
-                }
-            elif rpc_method == "tools/call":
-                call = params.get("params", {})
-                name = call.get("name", "")
-                text = "loopback tinyfish mcp fetched page" if name.lower() == "tinyfish_fetch" else "loopback tinyfish mcp search result"
-                body = ("event: message\ndata: " + json.dumps({
-                    "jsonrpc": "2.0",
-                    "id": rpc_id,
-                    "result": {"content": [{"type": "text", "text": text}]},
-                }, ensure_ascii=False) + "\n\n").encode("utf-8")
-                self.send_response(200)
-                self.send_header("content-type", "text/event-stream")
-                self.send_header("mcp-session-id", "loopback-session")
-                self.send_header("content-length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-                return
-            body = json.dumps({"jsonrpc": "2.0", "id": rpc_id, "result": result}, ensure_ascii=False).encode("utf-8")
-            self.send_response(200)
-            self.send_header("content-type", "application/json")
-            self.send_header("mcp-session-id", "loopback-session")
-            self.send_header("content-length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
         if "chat_id" in params and int(params["chat_id"]) != chat_id:
             result = False
         else:
@@ -381,121 +272,6 @@ run_serper_live_smoke() {
     -- --ignored --nocapture
 }
 
-run_tinyfish_contract_smoke() {
-  echo "+ offline TinyFish REST tool contract smokes"
-  cargo test -p openplotva-app tinyfish -- --nocapture
-}
-
-run_tinyfish_live_smoke() {
-  local mode="${OPENPLOTVA_PROVIDER_SMOKE_TINYFISH:-auto}"
-  if [[ "$mode" == "0" ]]; then
-    echo "+ skip TinyFish live smoke"
-    return
-  fi
-  if [[ "$mode" != "auto" && "$mode" != "1" ]]; then
-    echo "OPENPLOTVA_PROVIDER_SMOKE_TINYFISH must be auto, 1, or 0" >&2
-    exit 2
-  fi
-  case "${TINYFISH_ENABLED:-true}" in
-    false | FALSE | False)
-      if [[ "$mode" == "1" ]]; then
-        echo "TINYFISH_ENABLED=false disables the live TinyFish smoke" >&2
-        exit 1
-      fi
-      echo "+ skip TinyFish live smoke: TINYFISH_ENABLED=false"
-      return
-      ;;
-  esac
-  if [[ -z "${TINYFISH_API_KEY:-}" ]]; then
-    if [[ "$mode" == "1" ]]; then
-      echo "TINYFISH_API_KEY is required for live TinyFish smoke" >&2
-      exit 1
-    fi
-    echo "+ skip TinyFish live smoke: TINYFISH_API_KEY not set"
-    return
-  fi
-
-  echo "+ live TinyFish REST smoke"
-  cargo test -p openplotva-app live_tinyfish_rest_smoke_searches_and_fetches \
-    -- --ignored --nocapture
-}
-
-run_tinyfish_loopback_smoke() {
-  require curl
-  local port
-  port="$(free_tcp_port)"
-  start_loopback_provider_api "$port" "-100424242" "424242"
-  echo "+ loopback TinyFish REST smoke"
-  TINYFISH_API_KEY=loopback-tinyfish-key \
-    TINYFISH_SEARCH_BASE_URL="http://127.0.0.1:${port}/tinyfish/search" \
-    TINYFISH_FETCH_BASE_URL="http://127.0.0.1:${port}/tinyfish/fetch" \
-    OPENPLOTVA_TINYFISH_SMOKE_QUERY="openplotva loopback" \
-    OPENPLOTVA_TINYFISH_SMOKE_FETCH_URL="https://loopback.openplotva.test/page" \
-    cargo test -p openplotva-app live_tinyfish_rest_smoke_searches_and_fetches \
-      -- --ignored --nocapture
-}
-
-tinyfish_mcp_auth_present() {
-  [[ -n "${TINYFISH_MCP_ACCESS_TOKEN:-}" ]] \
-    || { [[ -n "${TINYFISH_MCP_REFRESH_TOKEN:-}" ]] && [[ -n "${TINYFISH_MCP_OAUTH_CLIENT_ID:-}" ]]; }
-}
-
-run_tinyfish_mcp_live_smoke() {
-  local mode="${OPENPLOTVA_PROVIDER_SMOKE_TINYFISH_MCP:-auto}"
-  if [[ "$mode" == "0" ]]; then
-    echo "+ skip TinyFish MCP/OAuth smoke"
-    return
-  fi
-  if [[ "$mode" != "auto" && "$mode" != "1" ]]; then
-    echo "OPENPLOTVA_PROVIDER_SMOKE_TINYFISH_MCP must be auto, 1, or 0" >&2
-    exit 2
-  fi
-  case "${TINYFISH_ENABLED:-true}" in
-    false | FALSE | False)
-      if [[ "$mode" == "1" ]]; then
-        echo "TINYFISH_ENABLED=false disables the TinyFish MCP/OAuth smoke" >&2
-        exit 1
-      fi
-      echo "+ skip TinyFish MCP/OAuth smoke: TINYFISH_ENABLED=false"
-      return
-      ;;
-  esac
-  if ! tinyfish_mcp_auth_present; then
-    if [[ "$mode" == "1" ]]; then
-      echo "TINYFISH_MCP_ACCESS_TOKEN or TINYFISH_MCP_REFRESH_TOKEN plus TINYFISH_MCP_OAUTH_CLIENT_ID is required for TinyFish MCP/OAuth smoke" >&2
-      exit 1
-    fi
-    echo "+ skip TinyFish MCP/OAuth smoke: MCP auth not set"
-    return
-  fi
-
-  echo "+ live TinyFish MCP/OAuth smoke"
-  TINYFISH_API_KEY= \
-    cargo test -p openplotva-app live_tinyfish_mcp_smoke_searches_and_fetches \
-      -- --ignored --nocapture
-}
-
-run_tinyfish_mcp_loopback_smoke() {
-  require curl
-  local port
-  port="$(free_tcp_port)"
-  start_loopback_provider_api "$port" "-100424242" "424242"
-  echo "+ loopback TinyFish MCP/OAuth smoke"
-  TINYFISH_API_KEY= \
-    TINYFISH_MCP_ACCESS_TOKEN= \
-    TINYFISH_MCP_REFRESH_TOKEN=loopback-refresh \
-    TINYFISH_MCP_OAUTH_CLIENT_ID=loopback-client \
-    TINYFISH_MCP_URL="http://127.0.0.1:${port}/tinyfish/mcp" \
-    TINYFISH_MCP_OAUTH_TOKEN_URL="http://127.0.0.1:${port}/tinyfish/oauth/token" \
-    TINYFISH_SEARCH_LOCATION=Warsaw \
-    TINYFISH_SEARCH_LANGUAGE=ru \
-    TINYFISH_FETCH_FORMAT=markdown \
-    OPENPLOTVA_TINYFISH_SMOKE_QUERY="openplotva loopback mcp" \
-    OPENPLOTVA_TINYFISH_SMOKE_FETCH_URL="https://loopback.openplotva.test/mcp-page" \
-    cargo test -p openplotva-app live_tinyfish_mcp_smoke_searches_and_fetches \
-      -- --ignored --nocapture
-}
-
 run_media_provider_contract_smoke() {
   echo "+ offline app AIFarm/media provider contract smokes"
   cargo test -p openplotva-app aifarm_ -- --nocapture
@@ -509,12 +285,6 @@ run_media_provider_contract_smoke() {
   cargo test -p openplotva-media client_ -- --nocapture
   echo "+ offline Pruna image provider contract smokes"
   cargo test -p openplotva-media pruna -- --nocapture
-  echo "+ offline ModelScope image provider contract smokes"
-  cargo test -p openplotva-media modelscope -- --nocapture
-  echo "+ offline Together image provider contract smokes"
-  cargo test -p openplotva-media together -- --nocapture
-  echo "+ offline AIHorde image provider contract smokes"
-  cargo test -p openplotva-media aihorde -- --nocapture
 }
 
 run_llm_provider_contract_smoke() {
@@ -528,9 +298,9 @@ run_llm_provider_contract_smoke() {
 }
 
 run_genkit_openai_compatible_contract_smoke() {
-  echo "+ offline GenKit OpenRouter/Together compatibility smokes"
+  echo "+ offline GenKit OpenRouter compatibility smokes"
   cargo test -p openplotva-app genkit_openai_compatible -- --nocapture
-  cargo test -p openplotva-app genkit_dialog_provider_factory_builds_openrouter_and_together_plugin_routes -- --nocapture
+  cargo test -p openplotva-app genkit_dialog_provider_factory_builds_openrouter_plugin_route -- --nocapture
   cargo test -p openplotva-app genkit_dialog_provider_factory_preserves_go_google_key_requirement_for_plugin_routes -- --nocapture
   cargo test -p openplotva-app provider_media_genkit_fallback_routes -- --nocapture
   cargo test -p openplotva-app provider_youtube_config_routes -- --nocapture
@@ -581,54 +351,6 @@ run_openrouter_live_smoke() {
   fi
   echo "+ live OpenRouter GenKit-compatible dialog smoke"
   cargo test -p openplotva-app live_genkit_openrouter_dialog_smoke_completes_minimal_prompt \
-    -- --ignored --nocapture
-}
-
-run_together_chat_live_smoke() {
-  local mode="${OPENPLOTVA_PROVIDER_SMOKE_TOGETHER_CHAT:-auto}"
-  validate_auto_mode OPENPLOTVA_PROVIDER_SMOKE_TOGETHER_CHAT "$mode"
-  if [[ "$mode" == "0" ]]; then
-    echo "+ skip Together chat live smoke"
-    return
-  fi
-  if ! together_key_source_present; then
-    if [[ "$mode" == "1" ]]; then
-      echo "TOGETHER_KEY or TOGETHER_KEYS is required for live Together chat smoke" >&2
-      exit 1
-    fi
-    echo "+ skip Together chat live smoke: Together key source not set"
-    return
-  fi
-  if ! google_ai_key_source_present; then
-    if [[ "$mode" == "1" ]]; then
-      echo "GOOGLEAI_KEY or GOOGLEAI_KEY_STATS_FILE is required by the configured GenKit plugin route" >&2
-      exit 1
-    fi
-    echo "+ skip Together chat live smoke: Google AI key source not set"
-    return
-  fi
-  echo "+ live Together GenKit-compatible dialog smoke"
-  cargo test -p openplotva-app live_genkit_together_dialog_smoke_completes_minimal_prompt \
-    -- --ignored --nocapture
-}
-
-run_together_image_live_smoke() {
-  local mode="${OPENPLOTVA_PROVIDER_SMOKE_TOGETHER_IMAGE:-auto}"
-  validate_auto_mode OPENPLOTVA_PROVIDER_SMOKE_TOGETHER_IMAGE "$mode"
-  if [[ "$mode" == "0" ]]; then
-    echo "+ skip Together image live smoke"
-    return
-  fi
-  if ! together_key_source_present; then
-    if [[ "$mode" == "1" ]]; then
-      echo "TOGETHER_KEY or TOGETHER_KEYS is required for live Together image smoke" >&2
-      exit 1
-    fi
-    echo "+ skip Together image live smoke: Together key source not set"
-    return
-  fi
-  echo "+ live Together image smoke"
-  cargo test -p openplotva-media live_together_image_smoke_generates_first_url \
     -- --ignored --nocapture
 }
 
@@ -809,15 +531,10 @@ run_discovery_capacity_smoke() {
 run_rbc_contract_smoke
 run_serper_contract_smoke
 run_serper_live_smoke
-run_tinyfish_contract_smoke
-run_tinyfish_live_smoke
-run_tinyfish_mcp_live_smoke
 run_media_provider_contract_smoke
 run_llm_provider_contract_smoke
 run_gemini_live_smoke
 run_openrouter_live_smoke
-run_together_chat_live_smoke
-run_together_image_live_smoke
 run_rbc_smoke
 run_telegram_smoke
 run_telegram_membership_smoke

@@ -11,7 +11,6 @@ publish = false
 dotenvy.workspace = true
 serde = { workspace = true, features = ["derive"] }
 thiserror.workspace = true
-url.workspace = true
 
 [lints]
 workspace = true

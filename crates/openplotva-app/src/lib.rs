@@ -48,7 +48,6 @@ pub mod serper;
 pub mod settings;
 pub mod skipped;
 pub mod task_queue;
-pub mod tinyfish;
 pub mod translate;
 pub mod updates;
 pub mod virtual_messages;
@@ -7535,8 +7534,6 @@ fn runtime_api_graphql_snapshot(
         dialog_provider: config.llm.dialog.provider.clone(),
         dialog_fallback_provider: Some(config.llm.dialog.fallback_provider.clone())
             .filter(|value| !value.trim().is_empty()),
-        model_scope_base_url: Some(config.model_scope.base_url.trim().to_owned())
-            .filter(|value| !value.is_empty()),
         pruna_endpoint: Some(config.pruna.endpoint.trim().to_owned())
             .filter(|value| !value.is_empty()),
         persistent_queue_enabled: config.persistent_queue.enabled,
@@ -7554,23 +7551,8 @@ fn runtime_active_draw_providers(config: &AppConfig) -> Vec<String> {
     if !config.llm.discovery.base_url.trim().is_empty() {
         providers.push("drawapi".to_owned());
     }
-    if !config.together.key.trim().is_empty()
-        || config
-            .together
-            .keys
-            .iter()
-            .any(|key| !key.trim().is_empty())
-    {
-        providers.push("together".to_owned());
-    }
     if !config.pruna.endpoint.trim().is_empty() {
         providers.push("pruna".to_owned());
-    }
-    if !config.ai_horde.base_url.trim().is_empty() {
-        providers.push("aihorde".to_owned());
-    }
-    if !config.model_scope.base_url.trim().is_empty() && !config.model_scope.key.trim().is_empty() {
-        providers.push("modelscope".to_owned());
     }
     providers.sort();
     providers
@@ -8788,50 +8770,6 @@ async fn start_runtime_workers(
             None
         }
     };
-    let tinyfish_client = if serper_client.is_some() {
-        readiness_checks.push(ReadinessCheck::skipped(
-            "tinyfish",
-            "TinyFish legacy fallback skipped because SERPER_API_KEY is configured",
-        ));
-        None
-    } else {
-        let tinyfish_runtime_store = Arc::new(tinyfish::PostgresTinyFishRuntimeStore::new(
-            service_clients.postgres.clone(),
-        )) as Arc<dyn tinyfish::TinyFishRuntimeStore>;
-        match tinyfish::TinyFishClient::from_app_config(config, Some(tinyfish_runtime_store)) {
-            Ok(Some(client)) => {
-                client
-                    .bootstrap_runtime_state()
-                    .await
-                    .context("bootstrap tinyfish runtime state")?;
-                readiness_checks.push(ReadinessCheck::ok(
-                    "tinyfish",
-                    "TinyFish legacy web_search/crawl_url fallback wired through REST or MCP/OAuth",
-                ));
-                Some(Arc::new(client))
-            }
-            Ok(None) if !config.tinyfish.enabled => {
-                readiness_checks.push(ReadinessCheck::skipped(
-                    "tinyfish",
-                    "TINYFISH_ENABLED=false",
-                ));
-                None
-            }
-            Ok(None) => {
-                let reason = "TinyFish legacy fallback unavailable: TINYFISH_API_KEY and MCP/OAuth runtime state are not set";
-                readiness_checks.push(ReadinessCheck::skipped("tinyfish", reason));
-                None
-            }
-            Err(error) => {
-                tracing::warn!(%error, "TinyFish dialog tools unavailable");
-                readiness_checks.push(ReadinessCheck::skipped(
-                    "tinyfish",
-                    format!("TinyFish legacy fallback unavailable: {error}"),
-                ));
-                None
-            }
-        }
-    };
     let mut app_dialog_toolbox = dialog_tools::AppDialogToolbox::new(
         Some(Arc::clone(&rates_fetcher)),
         Some(rates_tool_dispatcher),
@@ -8851,12 +8789,6 @@ async fn start_runtime_workers(
     if let Some(serper_client) = serper_client {
         let web_searcher: Arc<dyn dialog_tools::WebSearchProvider> = serper_client.clone();
         let url_crawler: Arc<dyn dialog_tools::UrlCrawler> = serper_client;
-        app_dialog_toolbox = app_dialog_toolbox
-            .with_web_searcher(web_searcher)
-            .with_url_crawler(url_crawler);
-    } else if let Some(tinyfish_client) = tinyfish_client {
-        let web_searcher: Arc<dyn dialog_tools::WebSearchProvider> = tinyfish_client.clone();
-        let url_crawler: Arc<dyn dialog_tools::UrlCrawler> = tinyfish_client;
         app_dialog_toolbox = app_dialog_toolbox
             .with_web_searcher(web_searcher)
             .with_url_crawler(url_crawler);
@@ -10524,12 +10456,7 @@ mod tests {
             vision_request_timeout_seconds: Some("88".to_owned()),
             acestep_enabled: Some("true".to_owned()),
             acestep_base_url: Some(" https://ace.test ".to_owned()),
-            together_key: Some(" together-key ".to_owned()),
             pruna_endpoint: Some(" https://pruna.test/replicate ".to_owned()),
-            modelscope_key: Some(" modelscope-key ".to_owned()),
-            modelscope_base_url: Some(" https://modelscope.test/api/ ".to_owned()),
-            aihorde_api_key: Some(" ".to_owned()),
-            aihorde_base_url: Some(" https://aihorde.test ".to_owned()),
             ..openplotva_config::RawConfig::default()
         })?;
 
@@ -10569,17 +10496,7 @@ mod tests {
         );
         assert_eq!(
             snapshot.active_draw_providers,
-            vec![
-                "aihorde".to_owned(),
-                "drawapi".to_owned(),
-                "modelscope".to_owned(),
-                "pruna".to_owned(),
-                "together".to_owned()
-            ]
-        );
-        assert_eq!(
-            snapshot.model_scope_base_url.as_deref(),
-            Some("https://modelscope.test/api/")
+            vec!["drawapi".to_owned(), "pruna".to_owned()]
         );
         assert_eq!(
             snapshot.pruna_endpoint.as_deref(),

@@ -27,9 +27,7 @@ use crate::media::{
 use crate::runtime_gemini_cache::resolve_google_ai_key;
 
 const OPENROUTER_MODEL_PREFIX: &str = "openrouter/";
-const TOGETHER_MODEL_PREFIX: &str = "together/";
 const OPENROUTER_CHAT_COMPLETIONS_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
-const TOGETHER_CHAT_COMPLETIONS_URL: &str = "https://api.together.xyz/v1/chat/completions";
 
 /// Shared dialog provider handle.
 pub type DialogProviderHandle = Arc<dyn ChatProvider>;
@@ -155,7 +153,6 @@ pub fn genkit_openai_compatible_dialog_config_from_app_config(
 fn genkit_openai_compatible_dialog_config_result_from_app_config(
     config: &AppConfig,
 ) -> Result<Option<AifarmDialogConfig>, DialogProviderBuildError> {
-    let dialog = &config.llm.dialog;
     let raw_model = genkit_dialog_model_from_app_config(config);
     let raw_model = raw_model.trim();
     let (provider, direct_url, api_key, model, request_timeout_seconds) =
@@ -166,14 +163,6 @@ fn genkit_openai_compatible_dialog_config_result_from_app_config(
                 config.open_router.key.trim().to_owned(),
                 model.trim().to_owned(),
                 config.open_router.request_timeout_seconds,
-            )
-        } else if let Some(model) = strip_provider_prefix_fold(raw_model, TOGETHER_MODEL_PREFIX) {
-            (
-                "together",
-                TOGETHER_CHAT_COMPLETIONS_URL,
-                together_api_key(config).trim().to_owned(),
-                model.trim().to_owned(),
-                dialog.request_timeout_seconds,
             )
         } else {
             return Ok(None);
@@ -297,21 +286,6 @@ pub fn white_circle_pre_tool_config_from_app_config(
         assistant_model: config.llm.dialog.model.clone(),
         ..WhiteCirclePreToolConfig::default()
     }
-}
-
-fn together_api_key(config: &AppConfig) -> String {
-    let key = config.together.key.trim();
-    if !key.is_empty() {
-        return key.to_owned();
-    }
-    config
-        .together
-        .keys
-        .iter()
-        .map(|key| key.trim())
-        .find(|key| !key.is_empty())
-        .unwrap_or_default()
-        .to_owned()
 }
 
 fn strip_provider_prefix_fold<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
@@ -467,7 +441,7 @@ mod tests {
     }
 
     #[test]
-    fn genkit_dialog_provider_factory_builds_openrouter_and_together_plugin_routes() {
+    fn genkit_dialog_provider_factory_builds_openrouter_plugin_route() {
         let openrouter = AppConfig::from_raw(openplotva_config::RawConfig {
             dialog_provider: Some("genkit".to_owned()),
             dialog_model: Some("openrouter/x-ai/grok-4.1-fast".to_owned()),
@@ -509,27 +483,6 @@ mod tests {
         let cfg = genkit_openai_compatible_dialog_config_from_app_config(&openrouter_default)
             .expect("openrouter default config");
         assert_eq!(cfg.model, "default-model");
-
-        let together = AppConfig::from_raw(openplotva_config::RawConfig {
-            dialog_provider: Some("genkit".to_owned()),
-            dialog_model: Some("together/meta-llama/Llama-3.3-70B-Instruct-Turbo".to_owned()),
-            googleai_key: Some("gemini-key".to_owned()),
-            together_keys: Some(" , together-a, together-b ".to_owned()),
-            dialog_request_timeout_seconds: Some("45".to_owned()),
-            ..openplotva_config::RawConfig::default()
-        })
-        .expect("together config");
-
-        let cfg = genkit_openai_compatible_dialog_config_from_app_config(&together)
-            .expect("together config");
-
-        assert_eq!(cfg.model, "meta-llama/Llama-3.3-70B-Instruct-Turbo");
-        assert_eq!(
-            cfg.client.direct_url,
-            "https://api.together.xyz/v1/chat/completions"
-        );
-        assert_eq!(cfg.client.api_key, "together-a");
-        assert_eq!(cfg.client.request_timeout.as_secs(), 45);
     }
 
     #[test]
@@ -570,24 +523,6 @@ mod tests {
                 provider: "openrouter",
             })
         );
-
-        let config = AppConfig::from_raw(openplotva_config::RawConfig {
-            dialog_provider: Some("genkit".to_owned()),
-            dialog_model: Some("together/meta-llama/Llama-3.3-70B-Instruct-Turbo".to_owned()),
-            googleai_key: Some("gemini-key".to_owned()),
-            ..openplotva_config::RawConfig::default()
-        })
-        .expect("config");
-
-        let toolbox: Arc<dyn DialogToolbox> = Arc::new(EmptyToolbox);
-        let error = dialog_provider_from_app_config(&config, toolbox).err();
-
-        assert_eq!(
-            error,
-            Some(DialogProviderBuildError::GenkitProviderApiKeyRequired {
-                provider: "together",
-            })
-        );
     }
 
     #[tokio::test]
@@ -623,40 +558,6 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    #[ignore = "live Together GenKit-compatible dialog smoke"]
-    async fn live_genkit_together_dialog_smoke_completes_minimal_prompt()
-    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let together_key = together_live_key()
-            .ok_or("TOGETHER_KEY or TOGETHER_KEYS is required for Together dialog smoke")?;
-        let googleai_key = optional_env("GOOGLEAI_KEY");
-        let googleai_key_stats_file = optional_env("GOOGLEAI_KEY_STATS_FILE");
-        if googleai_key.is_none() && googleai_key_stats_file.is_none() {
-            return Err("GOOGLEAI_KEY or GOOGLEAI_KEY_STATS_FILE is required by the configured GenKit plugin route".into());
-        }
-        let model = std::env::var("OPENPLOTVA_TOGETHER_CHAT_SMOKE_MODEL")
-            .unwrap_or_else(|_| "meta-llama/Llama-3.3-70B-Instruct-Turbo".to_owned());
-        let config = AppConfig::from_raw(openplotva_config::RawConfig {
-            dialog_provider: Some("genkit".to_owned()),
-            dialog_model: Some(format!("together/{model}")),
-            googleai_key,
-            googleai_key_stats_file,
-            together_key: Some(together_key),
-            dialog_request_timeout_seconds: Some("60".to_owned()),
-            ..openplotva_config::RawConfig::default()
-        })?;
-        let toolbox: Arc<dyn DialogToolbox> = Arc::new(EmptyToolbox);
-        let provider = dialog_provider_from_app_config(&config, toolbox)?;
-
-        let output = provider.run_dialog(live_dialog_smoke_input()).await?;
-
-        assert!(
-            !output.answer.trim().is_empty(),
-            "Together dialog answer must be non-empty"
-        );
-        Ok(())
-    }
-
     fn live_dialog_smoke_input() -> DialogInput {
         let prompt =
             std::env::var("OPENPLOTVA_DIALOG_PROVIDER_SMOKE_PROMPT").unwrap_or_else(|_| {
@@ -685,17 +586,6 @@ mod tests {
             .ok()
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty())
-    }
-
-    fn together_live_key() -> Option<String> {
-        optional_env("TOGETHER_KEY").or_else(|| {
-            optional_env("TOGETHER_KEYS").and_then(|keys| {
-                keys.split(',')
-                    .map(str::trim)
-                    .find(|key| !key.is_empty())
-                    .map(ToOwned::to_owned)
-            })
-        })
     }
 
     struct EmptyProvider {
