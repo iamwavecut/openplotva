@@ -19,7 +19,7 @@ redis = { workspace = true, features = ["tokio-comp"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha2.workspace = true
-sqlx = { workspace = true, features = ["migrate", "postgres", "runtime-tokio", "time"] }
+sqlx = { workspace = true, features = ["macros", "migrate", "postgres", "runtime-tokio", "time"] }
 thiserror.workspace = true
 time.workspace = true
 

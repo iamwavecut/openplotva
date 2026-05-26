@@ -12,7 +12,7 @@ async-graphql.workspace = true
 axum.workspace = true
 openplotva-core = { path = "../openplotva-core" }
 rustls.workspace = true
-rustls-pemfile.workspace = true
+rustls-pki-types.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha2.workspace = true

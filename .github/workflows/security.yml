@@ -11,6 +11,7 @@ on:
     - cron: "21 3 * * 1"
 
 permissions:
+  actions: read
   contents: read
   security-events: write
 
@@ -26,12 +27,18 @@ jobs:
         uses: github/codeql-action/init@v4
         with:
           languages: rust
-          build-mode: none
+          build-mode: manual
+
+      - name: Build for CodeQL
+        run: cargo check --workspace --all-targets --all-features
 
       - name: Analyze
         uses: github/codeql-action/analyze@v4
         with:
           category: "/language:rust"
+          upload: never
+          upload-database: false
+          wait-for-processing: false
 
   semgrep:
     name: Semgrep CE

@@ -6,7 +6,6 @@ use std::{
     collections::{HashMap, HashSet},
     env,
     future::Future,
-    io::Cursor,
     net::SocketAddr,
     pin::Pin,
     sync::{Arc, LazyLock},
@@ -25,6 +24,7 @@ pub use openplotva_core::{
     ChatSettings, ChatSettingsUpdate, MessageIdMapping, PendingEditPayload, PendingOp,
     ReadyPendingOp, pending_edit_payload,
 };
+use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -195,13 +195,13 @@ pub trait RuntimeTokenValidator {
 pub enum RuntimeApiTlsError {
     /// Certificate PEM could not be decoded.
     #[error("parse runtime api certificate pem: {0}")]
-    CertificatePem(#[source] std::io::Error),
+    CertificatePem(#[source] rustls_pki_types::pem::Error),
     /// Certificate chain is empty.
     #[error("runtime api certificate pem is empty")]
     EmptyCertificateChain,
     /// Private key PEM could not be decoded.
     #[error("parse runtime api private key pem: {0}")]
-    PrivateKeyPem(#[source] std::io::Error),
+    PrivateKeyPem(#[source] rustls_pki_types::pem::Error),
     /// Private key PEM is missing.
     #[error("runtime api private key pem is empty")]
     MissingPrivateKey,
@@ -272,18 +272,17 @@ pub fn runtime_api_tls_config_from_pem(
     cert_pem: &[u8],
     key_pem: &[u8],
 ) -> Result<rustls::ServerConfig, RuntimeApiTlsError> {
-    let mut cert_reader = Cursor::new(cert_pem);
-    let certs = rustls_pemfile::certs(&mut cert_reader)
+    let certs = CertificateDer::pem_slice_iter(cert_pem)
         .collect::<Result<Vec<_>, _>>()
         .map_err(RuntimeApiTlsError::CertificatePem)?;
     if certs.is_empty() {
         return Err(RuntimeApiTlsError::EmptyCertificateChain);
     }
 
-    let mut key_reader = Cursor::new(key_pem);
-    let key = rustls_pemfile::private_key(&mut key_reader)
-        .map_err(RuntimeApiTlsError::PrivateKeyPem)?
-        .ok_or(RuntimeApiTlsError::MissingPrivateKey)?;
+    let key = PrivateKeyDer::from_pem_slice(key_pem).map_err(|error| match error {
+        rustls_pki_types::pem::Error::NoItemsFound => RuntimeApiTlsError::MissingPrivateKey,
+        error => RuntimeApiTlsError::PrivateKeyPem(error),
+    })?;
 
     let mut config = rustls::ServerConfig::builder_with_protocol_versions(&[
         &rustls::version::TLS13,

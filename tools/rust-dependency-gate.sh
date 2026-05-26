@@ -8,7 +8,7 @@ Usage:
 
 Runs the dependency, advisory, license, and supply-chain gate:
   - cargo deny check
-  - cargo audit
+  - cargo audit, with a documented sqlx optional-MySQL false-positive ignore
   - cargo machete
   - cargo vet --locked, only when supply-chain/ exists
 
@@ -62,7 +62,10 @@ require_cargo_subcommand audit "cargo install cargo-audit --locked --version 0.2
 require_cargo_subcommand machete "cargo install cargo-machete --locked --version 0.9.2"
 
 run cargo deny check
-run cargo audit
+# cargo audit scans every package recorded in Cargo.lock, including sqlx's
+# optional MySQL support. The workspace enables only Postgres sqlx features;
+# cargo deny checks that selected feature graph above.
+run cargo audit --ignore RUSTSEC-2023-0071
 run cargo machete
 
 if [[ -d supply-chain ]]; then
