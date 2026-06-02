@@ -2939,14 +2939,14 @@ mod tests {
             runtime_api_cert_file: Some("/tmp/openplotva-runtime-api.crt".to_owned()),
             ..RawConfig::default()
         })
-        .expect_err("runtime API TLS files must be configured as a pair");
+        .err();
 
-        assert_eq!(
+        assert!(matches!(
             error,
-            super::ConfigError::InvalidEmptyValue {
+            Some(super::ConfigError::InvalidEmptyValue {
                 name: "RUNTIME_API_KEY_FILE"
-            }
-        );
+            })
+        ));
     }
 
     #[test]
