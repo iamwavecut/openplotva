@@ -1,0 +1,56 @@
+services:
+  openplotva:
+    image: ${OPENPLOTVA_IMAGE:?OPENPLOTVA_IMAGE is required}
+    env_file:
+      - .env.production
+    environment:
+      WEBAPP_HOST: 0.0.0.0
+      WEBAPP_PORT: 8080
+      DB_POSTGRES_HOST: postgresql
+      DB_POSTGRES_PORT: 5432
+      DB_POSTGRES_USER: plotva
+      DB_POSTGRES_PASSWORD: plotva
+      DB_POSTGRES_DB: plotva
+      DB_POSTGRES_SSL_MODE: disable
+      REDIS_HOST: dragonfly
+      REDIS_PORT: 6379
+      REDIS_DB: ${REDIS_DB:-0}
+      MEMORY_EMBEDDER_URL: http://embedder:12500
+      MEMORY_TOKEN_ESTIMATOR_URL: http://token-estimator:12600
+      RUNTIME_API_ENABLED: "true"
+      RUNTIME_API_HOST: 0.0.0.0
+      RUNTIME_API_PORT: 9091
+      OPENPLOTVA_CONNECT_SERVICES: "true"
+      OPENPLOTVA_RUN_MIGRATIONS: "true"
+      OPENPLOTVA_CONSUME_UPDATES: "true"
+      OPENPLOTVA_PRODUCE_UPDATES: "true"
+    ports:
+      - "127.0.0.1:8080:8080"
+      - "100.77.77.51:9091:9091"
+    volumes:
+      - openplotva-state:/home/openplotva/.plotva
+    networks:
+      - plotva-net
+      - search-subnet
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/api/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 30s
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  plotva-net:
+    external: true
+    name: go-plotva_plotva-net
+  search-subnet:
+    external: true
+
+volumes:
+  openplotva-state:

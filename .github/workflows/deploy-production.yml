@@ -1,0 +1,172 @@
+name: Production Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to deploy
+        required: true
+        default: main
+      operation:
+        description: Deployment operation
+        required: true
+        type: choice
+        default: prepare
+        options:
+          - prepare
+          - first-cutover
+          - redeploy
+      confirm:
+        description: Required for first-cutover/redeploy. Must be geta.moe/openplotva
+        required: false
+        default: ""
+
+env:
+  RUST_VERSION: "1.95.0"
+  GETA_SSH_TARGET: wavecut@geta.moe
+  GETA_DEPLOY_ROOT: /home/wavecut/openplotva
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-deploy:
+    name: Build image and deploy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate dispatch inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ inputs.operation }}" in
+            prepare)
+              ;;
+            first-cutover|redeploy)
+              if [[ "${{ inputs.confirm }}" != "geta.moe/openplotva" ]]; then
+                echo "first-cutover/redeploy require confirm=geta.moe/openplotva" >&2
+                exit 1
+              fi
+              ;;
+            *)
+              echo "Unsupported operation: ${{ inputs.operation }}" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal --component clippy --component rustfmt
+          rustup default "$RUST_VERSION"
+
+      - name: Fast Rust gate
+        run: tools/rust-fast-gate.sh
+
+      - name: Build and push GHCR image
+        shell: bash
+        env:
+          GHCR_PUSH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY}:${GITHUB_SHA}"
+          image="$(printf '%s' "$image" | tr '[:upper:]' '[:lower:]')"
+          echo "OPENPLOTVA_IMAGE=$image" >> "$GITHUB_ENV"
+          printf '%s' "$GHCR_PUSH_TOKEN" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+          docker build --target runtime --build-arg RUST_VERSION="$RUST_VERSION" -t "$image" .
+          docker push "$image"
+
+      - name: Configure SSH
+        shell: bash
+        env:
+          GETA_SSH_PRIVATE_KEY: ${{ secrets.GETA_SSH_PRIVATE_KEY }}
+          GETA_SSH_KNOWN_HOSTS: ${{ secrets.GETA_SSH_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          test -n "$GETA_SSH_PRIVATE_KEY"
+          test -n "$GETA_SSH_KNOWN_HOSTS"
+          install -m 700 -d "$HOME/.ssh"
+          printf '%s\n' "$GETA_SSH_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          eval "$(ssh-agent -s)"
+          printf '%s\n' "$GETA_SSH_PRIVATE_KEY" | ssh-add -
+          echo "SSH_AUTH_SOCK=$SSH_AUTH_SOCK" >> "$GITHUB_ENV"
+          echo "SSH_AGENT_PID=$SSH_AGENT_PID" >> "$GITHUB_ENV"
+
+      - name: Upload deploy assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh "$GETA_SSH_TARGET" "install -d -m 755 '$GETA_DEPLOY_ROOT' '$GETA_DEPLOY_ROOT/backups'"
+          scp deploy/production/compose.production.yml "$GETA_SSH_TARGET:$GETA_DEPLOY_ROOT/compose.production.yml"
+          scp deploy/production/deploy-production.sh "$GETA_SSH_TARGET:$GETA_DEPLOY_ROOT/deploy-production.sh"
+          ssh "$GETA_SSH_TARGET" "chmod 755 '$GETA_DEPLOY_ROOT/deploy-production.sh'"
+
+      - name: Run production deploy operation
+        shell: bash
+        env:
+          GHCR_PULL_TOKEN: ${{ secrets.GHCR_PULL_TOKEN }}
+          DEPLOY_OPERATION: ${{ inputs.operation }}
+          DEPLOY_CONFIRM: ${{ inputs.confirm }}
+        run: |
+          set -euo pipefail
+          test -n "$GHCR_PULL_TOKEN"
+          printf -v image_q '%q' "$OPENPLOTVA_IMAGE"
+          printf -v op_q '%q' "$DEPLOY_OPERATION"
+          printf -v confirm_q '%q' "$DEPLOY_CONFIRM"
+          printf -v token_q '%q' "$GHCR_PULL_TOKEN"
+          printf -v actor_q '%q' "$GITHUB_ACTOR"
+          ssh "$GETA_SSH_TARGET" \
+            "OPENPLOTVA_DEPLOY_IMAGE=$image_q OPENPLOTVA_DEPLOY_OPERATION=$op_q OPENPLOTVA_DEPLOY_CONFIRM=$confirm_q GHCR_USERNAME=$actor_q GHCR_PULL_TOKEN=$token_q '$GETA_DEPLOY_ROOT/deploy-production.sh'"
+
+      - name: Cleanup old GHCR images
+        if: ${{ inputs.operation != 'prepare' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GHCR_CLEANUP_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -n "${GH_TOKEN:-}" || {
+            echo "GHCR_CLEANUP_TOKEN is required for post-deploy package cleanup" >&2
+            exit 1
+          }
+
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          package="${GITHUB_REPOSITORY#*/}"
+          package="${package,,}"
+          current_tag="${GITHUB_SHA}"
+          deployed_image="$(ssh "$GETA_SSH_TARGET" "docker inspect -f '{{.Config.Image}}' openplotva-openplotva-1 2>/dev/null || true")"
+          deployed_tag="${deployed_image##*:}"
+          cutoff_epoch="$(date -u -d '1 day ago' +%s)"
+          versions_file="$(mktemp)"
+
+          echo "Cleaning GHCR package ${owner}/${package}; keeping current tag ${current_tag} and deployed tag ${deployed_tag}"
+          gh api --paginate --slurp "/users/${owner}/packages/container/${package}/versions?per_page=100" > "$versions_file"
+
+          deleted=0
+          while IFS= read -r version; do
+            id="$(jq -r '.id' <<<"$version")"
+            created_at="$(jq -r '.created_at' <<<"$version")"
+            created_epoch="$(date -u -d "$created_at" +%s)"
+            tags="$(jq -r '[.metadata.container.tags[]?] | join(",")' <<<"$version")"
+
+            if (( created_epoch >= cutoff_epoch )); then
+              continue
+            fi
+            if jq -e --arg tag "$current_tag" '.metadata.container.tags // [] | index($tag)' <<<"$version" >/dev/null; then
+              continue
+            fi
+            if [[ -n "$deployed_tag" ]] && jq -e --arg tag "$deployed_tag" '.metadata.container.tags // [] | index($tag)' <<<"$version" >/dev/null; then
+              continue
+            fi
+
+            echo "Deleting GHCR version id=${id} created_at=${created_at} tags=${tags:-<none>}"
+            gh api -X DELETE "/users/${owner}/packages/container/${package}/versions/${id}"
+            deleted=$((deleted + 1))
+          done < <(jq -c '.[][]' "$versions_file")
+
+          echo "Deleted ${deleted} old GHCR package version(s)"

@@ -2961,7 +2961,7 @@ mod tests {
             ..RawConfig::default()
         })?;
 
-        assert!(config.runtime_api.enabled);
+        assert!(!config.runtime_api.enabled);
         assert_eq!(config.runtime_api.port, 0);
         assert_eq!(config.runtime_api.log_buffer_size, 0);
         Ok(())
@@ -3538,7 +3538,7 @@ mod tests {
         })?;
 
         assert_eq!(config.server.port, DEFAULT_WEBAPP_PORT);
-        assert!(!config.runtime_api.enabled);
+        assert!(config.runtime_api.enabled);
         assert_eq!(config.redis.db, 0);
         assert_eq!(config.vision.temperature, 0.1);
         assert_eq!(
