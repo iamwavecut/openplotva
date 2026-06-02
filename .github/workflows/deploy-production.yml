@@ -156,11 +156,11 @@ jobs:
         if: ${{ inputs.operation != 'prepare' }}
         shell: bash
         env:
-          GH_TOKEN: ${{ secrets.GHCR_CLEANUP_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           test -n "${GH_TOKEN:-}" || {
-            echo "GHCR_CLEANUP_TOKEN is required for post-deploy package cleanup" >&2
+            echo "GITHUB_TOKEN is required for post-deploy package cleanup" >&2
             exit 1
           }
 
