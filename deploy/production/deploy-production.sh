@@ -127,7 +127,18 @@ verify_rust_app() {
   OPENPLOTVA_IMAGE="$image" docker compose --env-file "$env_file" -p openplotva -f "$compose_file" ps openplotva
 }
 
+prepare_state_volume() {
+  log "preparing Rust state volume ownership"
+  docker volume create openplotva_openplotva-state >/dev/null
+  docker run --rm \
+    --entrypoint /bin/sh \
+    -v openplotva_openplotva-state:/state \
+    "$image" \
+    -c 'chown -R 10001:999 /state'
+}
+
 start_rust_app() {
+  prepare_state_volume
   OPENPLOTVA_IMAGE="$image" docker compose --env-file "$env_file" -p openplotva -f "$compose_file" up -d --remove-orphans openplotva
   verify_rust_app
 }
