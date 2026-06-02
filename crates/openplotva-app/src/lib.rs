@@ -117,6 +117,7 @@ struct RuntimeWorkers {
     taskman_inspector: runtime_taskman::RuntimeTaskmanInspectorHandle,
     memory_restart_trigger: Option<Arc<tokio::sync::Notify>>,
     llm_trace_buffer: Option<runtime_llm::RuntimeLlmTraceBuffer>,
+    runtime_api_tls_public_key_pin: Option<String>,
 }
 
 struct DispatcherRuntime {
@@ -7846,13 +7847,71 @@ impl openplotva_server::RuntimeLogInspector for RuntimeLogInspector {
     }
 }
 
+struct RuntimeApiTlsMaterial {
+    cert_pem: Vec<u8>,
+    key_pem: Vec<u8>,
+    tls_public_key_pin: String,
+    source: &'static str,
+}
+
+fn runtime_api_tls_material(
+    config: &openplotva_config::RuntimeApiConfig,
+) -> anyhow::Result<RuntimeApiTlsMaterial> {
+    let cert_file_present = !config.cert_file.trim().is_empty();
+    let key_file_present = !config.key_file.trim().is_empty();
+    if cert_file_present && key_file_present {
+        let cert_pem = std::fs::read(&config.cert_file)
+            .with_context(|| format!("read runtime API certificate {}", config.cert_file))?;
+        let key_pem = std::fs::read(&config.key_file)
+            .with_context(|| format!("read runtime API private key {}", config.key_file))?;
+        let tls_public_key_pin =
+            openplotva_server::runtime_api_tls_public_key_pin_from_pem(&cert_pem)
+                .context("compute runtime API TLS public key pin")?;
+        return Ok(RuntimeApiTlsMaterial {
+            cert_pem,
+            key_pem,
+            tls_public_key_pin,
+            source: "configured",
+        });
+    }
+
+    let generated = openplotva_server::generate_runtime_api_tls_material(
+        runtime_api_tls_subject_alt_names(config),
+    )
+    .context("generate runtime API TLS material")?;
+    Ok(RuntimeApiTlsMaterial {
+        cert_pem: generated.cert_pem,
+        key_pem: generated.key_pem,
+        tls_public_key_pin: generated.tls_public_key_pin,
+        source: "generated",
+    })
+}
+
+fn runtime_api_tls_subject_alt_names(config: &openplotva_config::RuntimeApiConfig) -> Vec<String> {
+    let mut names = Vec::new();
+    push_unique_tls_name(&mut names, "localhost");
+    push_unique_tls_name(&mut names, "127.0.0.1");
+    push_unique_tls_name(&mut names, "::1");
+    let host = config.host.trim();
+    if !host.is_empty() && host != "0.0.0.0" && host != "::" {
+        push_unique_tls_name(&mut names, host);
+    }
+    names
+}
+
+fn push_unique_tls_name(names: &mut Vec<String>, value: &str) {
+    if !names.iter().any(|name| name == value) {
+        names.push(value.to_owned());
+    }
+}
+
 async fn start_runtime_api_worker(
     app_config: &AppConfig,
     config: &openplotva_config::RuntimeApiConfig,
     service_clients: &ServiceClients,
     diagnostics: openplotva_server::RuntimeApiLiveDiagnostics,
     stop: watch::Receiver<bool>,
-) -> anyhow::Result<(JoinHandle<()>, std::net::SocketAddr)> {
+) -> anyhow::Result<(JoinHandle<()>, std::net::SocketAddr, String)> {
     let bind_addr = runtime_api_bind_addr(config);
     let tcp_listener = tokio::net::TcpListener::bind(&bind_addr)
         .await
@@ -7860,12 +7919,12 @@ async fn start_runtime_api_worker(
     let local_addr = tcp_listener
         .local_addr()
         .context("read runtime API listener address")?;
-    let cert_pem = std::fs::read(&config.cert_file)
-        .with_context(|| format!("read runtime API certificate {}", config.cert_file))?;
-    let key_pem = std::fs::read(&config.key_file)
-        .with_context(|| format!("read runtime API private key {}", config.key_file))?;
-    let tls_acceptor = openplotva_server::runtime_api_tls_acceptor_from_pem(&cert_pem, &key_pem)
-        .context("load runtime API TLS material")?;
+    let tls_material = runtime_api_tls_material(config)?;
+    let tls_acceptor = openplotva_server::runtime_api_tls_acceptor_from_pem(
+        &tls_material.cert_pem,
+        &tls_material.key_pem,
+    )
+    .context("load runtime API TLS material")?;
     let token_store = PostgresRuntimeTokenStore::new(service_clients.postgres.clone());
     let token_manager = runtime_api::RuntimeTokenManager::new(token_store);
     let app = openplotva_server::runtime_api_router_with_graphql_live_diagnostics(
@@ -7874,11 +7933,12 @@ async fn start_runtime_api_worker(
         diagnostics,
     );
     let tls_listener = openplotva_server::RuntimeApiTlsListener::new(tcp_listener, tls_acceptor);
-    let tls_public_key_pin = config.tls_public_key_pin.as_str();
+    let tls_public_key_pin = tls_material.tls_public_key_pin;
 
     tracing::info!(
         address = %local_addr,
         tls_public_key_pin = %tls_public_key_pin,
+        tls_material = tls_material.source,
         "runtime API listening"
     );
 
@@ -7891,7 +7951,7 @@ async fn start_runtime_api_worker(
         }
     });
 
-    Ok((worker, local_addr))
+    Ok((worker, local_addr, tls_public_key_pin))
 }
 
 async fn start_runtime_workers(
@@ -7985,6 +8045,7 @@ async fn start_runtime_workers(
         taskman_inspector: taskman_inspector.clone(),
         memory_restart_trigger: None,
         llm_trace_buffer: None,
+        runtime_api_tls_public_key_pin: None,
     };
     let updates_inspector = runtime_updates::RuntimeUpdatesInspectorHandle::new(
         openplotva_updates::RedisUpdateQueue::new(service_clients.redis.client().clone()),
@@ -8048,7 +8109,7 @@ async fn start_runtime_workers(
             }),
             gemini_cache_purger,
         };
-        let (worker, local_addr) = start_runtime_api_worker(
+        let (worker, local_addr, tls_public_key_pin) = start_runtime_api_worker(
             config,
             &config.runtime_api,
             service_clients,
@@ -8061,9 +8122,10 @@ async fn start_runtime_workers(
             "runtime_api",
             format!(
                 "TLS runtime API listening on {local_addr}; public key pin {}",
-                config.runtime_api.tls_public_key_pin
+                tls_public_key_pin
             ),
         ));
+        workers.runtime_api_tls_public_key_pin = Some(tls_public_key_pin);
         workers.handles.push(worker);
     } else {
         readiness_checks.push(ReadinessCheck::skipped(
@@ -9617,7 +9679,10 @@ async fn start_runtime_workers(
                 PostgresRuntimeTokenStore::new(service_clients.postgres.clone()),
             ))
         });
-        let runtime_api_tls_public_key_pin = config.runtime_api.tls_public_key_pin.clone();
+        let runtime_api_tls_public_key_pin = workers
+            .runtime_api_tls_public_key_pin
+            .clone()
+            .unwrap_or_default();
         let admin_runtime_token_handler =
             Arc::new(admin::AdminRuntimeTokenCommandUpdateHandler::new(
                 admin_runtime_token_manager,
@@ -9842,6 +9907,7 @@ async fn shutdown_runtime_workers(workers: RuntimeWorkers) {
         taskman_inspector: _,
         memory_restart_trigger: _,
         llm_trace_buffer: _,
+        runtime_api_tls_public_key_pin: _,
     } = workers;
 
     if let Some(stop) = stop {

@@ -14,7 +14,7 @@ pub const DEFAULT_WEBAPP_PORT: u16 = 8080;
 
 pub const DEFAULT_WEBAPP_URL: &str = "http://127.0.0.1:8080";
 
-pub const DEFAULT_RUNTIME_API_ENABLED: bool = false;
+pub const DEFAULT_RUNTIME_API_ENABLED: bool = true;
 
 pub const DEFAULT_RUNTIME_API_HOST: &str = "127.0.0.1";
 
@@ -59,7 +59,7 @@ pub const DEFAULT_REDIS_PORT: u16 = 6379;
 
 pub const DEFAULT_REDIS_DB: i64 = 0;
 
-pub const DEFAULT_CONNECT_SERVICES: bool = false;
+pub const DEFAULT_CONNECT_SERVICES: bool = true;
 
 pub const DEFAULT_RUN_MIGRATIONS: bool = false;
 
@@ -307,11 +307,11 @@ pub struct RuntimeApiConfig {
     pub sql_row_limit: i32,
     /// Diagnostic SQL result byte ceiling, from `RUNTIME_API_SQL_RESULT_BYTES_LIMIT`.
     pub sql_result_bytes_limit: i32,
-    /// Certificate PEM file for the runtime TLS listener, from `RUNTIME_API_CERT_FILE`.
+    /// Optional certificate PEM file for the runtime TLS listener, from `RUNTIME_API_CERT_FILE`.
     pub cert_file: String,
-    /// Private key PEM file for the runtime TLS listener, from `RUNTIME_API_KEY_FILE`.
+    /// Optional private key PEM file for the runtime TLS listener, from `RUNTIME_API_KEY_FILE`.
     pub key_file: String,
-    /// Public-key pin shown to operators, from `RUNTIME_API_TLS_PUBLIC_KEY_PIN`.
+    /// Optional operator-provided pin hint, from `RUNTIME_API_TLS_PUBLIC_KEY_PIN`.
     pub tls_public_key_pin: String,
 }
 
@@ -2371,13 +2371,6 @@ fn validate_history_summary_provider(value: &str) -> Result<(), ConfigError> {
     }
 }
 
-fn validate_non_empty_when_enabled(name: &'static str, value: &str) -> Result<(), ConfigError> {
-    if value.trim().is_empty() {
-        return Err(ConfigError::InvalidEmptyValue { name });
-    }
-    Ok(())
-}
-
 fn validate_runtime_api(config: &RuntimeApiConfig) -> Result<(), ConfigError> {
     if !config.enabled {
         return Ok(());
@@ -2397,9 +2390,17 @@ fn validate_runtime_api(config: &RuntimeApiConfig) -> Result<(), ConfigError> {
         config.sql_result_bytes_limit,
         104_857_600,
     )?;
-    validate_non_empty_when_enabled("RUNTIME_API_CERT_FILE", &config.cert_file)?;
-    validate_non_empty_when_enabled("RUNTIME_API_KEY_FILE", &config.key_file)?;
-    validate_non_empty_when_enabled("RUNTIME_API_TLS_PUBLIC_KEY_PIN", &config.tls_public_key_pin)?;
+    let cert_file_present = !config.cert_file.trim().is_empty();
+    let key_file_present = !config.key_file.trim().is_empty();
+    if cert_file_present != key_file_present {
+        return Err(ConfigError::InvalidEmptyValue {
+            name: if cert_file_present {
+                "RUNTIME_API_KEY_FILE"
+            } else {
+                "RUNTIME_API_CERT_FILE"
+            },
+        });
+    }
     Ok(())
 }
 
@@ -2556,7 +2557,7 @@ mod tests {
         assert_eq!(config.server.port, 8080);
         assert_eq!(config.server.bind_addr, "0.0.0.0:8080");
         assert_eq!(config.server.url, DEFAULT_WEBAPP_URL);
-        assert!(!config.runtime_api.enabled);
+        assert!(config.runtime_api.enabled);
         assert_eq!(config.runtime_api.host, DEFAULT_RUNTIME_API_HOST);
         assert_eq!(config.runtime_api.port, DEFAULT_RUNTIME_API_PORT);
         assert_eq!(
@@ -2874,7 +2875,7 @@ mod tests {
             DEFAULT_SHIELD_RETRIEVAL_TIMEOUT_SECONDS
         );
         assert_eq!(config.shield.history_tail_messages, 0);
-        assert!(!config.service_probe.connect_services);
+        assert!(config.service_probe.connect_services);
         assert!(!config.service_probe.run_migrations);
         assert!(config.service_probe.produce_updates);
         assert!(config.service_probe.consume_updates);
@@ -2918,6 +2919,37 @@ mod tests {
     }
 
     #[test]
+    fn runtime_api_enabled_accepts_generated_tls_defaults() -> Result<(), super::ConfigError> {
+        let config = AppConfig::from_raw(RawConfig {
+            runtime_api_enabled: Some("true".to_owned()),
+            ..RawConfig::default()
+        })?;
+
+        assert!(config.runtime_api.enabled);
+        assert_eq!(config.runtime_api.cert_file, "");
+        assert_eq!(config.runtime_api.key_file, "");
+        assert_eq!(config.runtime_api.tls_public_key_pin, "");
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_api_enabled_rejects_partial_tls_files() {
+        let error = AppConfig::from_raw(RawConfig {
+            runtime_api_enabled: Some("true".to_owned()),
+            runtime_api_cert_file: Some("/tmp/openplotva-runtime-api.crt".to_owned()),
+            ..RawConfig::default()
+        })
+        .expect_err("runtime API TLS files must be configured as a pair");
+
+        assert_eq!(
+            error,
+            super::ConfigError::InvalidEmptyValue {
+                name: "RUNTIME_API_KEY_FILE"
+            }
+        );
+    }
+
+    #[test]
     fn runtime_api_disabled_accepts_zero_limits() -> Result<(), super::ConfigError> {
         let config = AppConfig::from_raw(RawConfig {
             runtime_api_enabled: Some("false".to_owned()),
@@ -2929,7 +2961,7 @@ mod tests {
             ..RawConfig::default()
         })?;
 
-        assert!(!config.runtime_api.enabled);
+        assert!(config.runtime_api.enabled);
         assert_eq!(config.runtime_api.port, 0);
         assert_eq!(config.runtime_api.log_buffer_size, 0);
         Ok(())

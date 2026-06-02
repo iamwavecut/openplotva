@@ -10,7 +10,9 @@ publish = false
 [dependencies]
 async-graphql.workspace = true
 axum.workspace = true
+base64.workspace = true
 openplotva-core = { path = "../openplotva-core" }
+rcgen = "0.14.8"
 rustls.workspace = true
 rustls-pki-types.workspace = true
 serde = { workspace = true, features = ["derive"] }
@@ -21,6 +23,7 @@ time.workspace = true
 tokio = { workspace = true, features = ["net", "time"] }
 tokio-rustls.workspace = true
 tracing.workspace = true
+x509-parser = "0.18.1"
 
 [dev-dependencies]
 hex.workspace = true

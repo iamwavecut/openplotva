@@ -20,10 +20,12 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{any, get},
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 pub use openplotva_core::{
     ChatSettings, ChatSettingsUpdate, MessageIdMapping, PendingEditPayload, PendingOp,
     ReadyPendingOp, pending_edit_payload,
 };
+use rcgen::{CertifiedKey, generate_simple_self_signed};
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -31,6 +33,7 @@ use thiserror::Error;
 use time::{Duration as TimeDuration, OffsetDateTime};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::{TlsAcceptor, server::TlsStream};
+use x509_parser::parse_x509_certificate;
 
 pub use runtime_graphql::{
     RuntimeAifarmCapacitySnapshotData, RuntimeApiGraphqlSnapshot, RuntimeApiLiveDiagnostics,
@@ -196,9 +199,15 @@ pub enum RuntimeApiTlsError {
     /// Certificate PEM could not be decoded.
     #[error("parse runtime api certificate pem: {0}")]
     CertificatePem(#[source] rustls_pki_types::pem::Error),
+    /// Certificate DER could not be decoded as X.509.
+    #[error("parse runtime api x509 certificate: {0}")]
+    CertificateX509(String),
     /// Certificate chain is empty.
     #[error("runtime api certificate pem is empty")]
     EmptyCertificateChain,
+    /// Self-signed TLS material could not be generated.
+    #[error("generate runtime api self-signed certificate: {0}")]
+    Generate(#[from] rcgen::Error),
     /// Private key PEM could not be decoded.
     #[error("parse runtime api private key pem: {0}")]
     PrivateKeyPem(#[source] rustls_pki_types::pem::Error),
@@ -208,6 +217,17 @@ pub enum RuntimeApiTlsError {
     /// Rustls rejected the certificate/key pair.
     #[error("build runtime api tls config: {0}")]
     Rustls(#[from] rustls::Error),
+}
+
+/// Self-signed runtime API TLS material generated for the current process.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeApiGeneratedTlsMaterial {
+    /// PEM encoded certificate chain.
+    pub cert_pem: Vec<u8>,
+    /// PEM encoded private key.
+    pub key_pem: Vec<u8>,
+    /// Public-key pin computed from the certificate subject public key info.
+    pub tls_public_key_pin: String,
 }
 
 pub struct RuntimeApiTlsListener {
@@ -259,6 +279,7 @@ struct RuntimeApiState<Validator> {
 }
 
 static RUNTIME_API_DIAGNOSTICS_STARTED: LazyLock<StdInstant> = LazyLock::new(StdInstant::now);
+
 pub fn runtime_api_tls_acceptor_from_pem(
     cert_pem: &[u8],
     key_pem: &[u8],
@@ -292,6 +313,49 @@ pub fn runtime_api_tls_config_from_pem(
     .with_single_cert(certs, key)?;
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(config)
+}
+
+/// Compute the browser-style SHA-256 public-key pin from the first certificate in a PEM chain.
+pub fn runtime_api_tls_public_key_pin_from_pem(
+    cert_pem: &[u8],
+) -> Result<String, RuntimeApiTlsError> {
+    let certs = CertificateDer::pem_slice_iter(cert_pem)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(RuntimeApiTlsError::CertificatePem)?;
+    let cert = certs
+        .first()
+        .ok_or(RuntimeApiTlsError::EmptyCertificateChain)?;
+    let (_, parsed) = parse_x509_certificate(cert.as_ref())
+        .map_err(|error| RuntimeApiTlsError::CertificateX509(format!("{error:?}")))?;
+    let digest = Sha256::digest(parsed.tbs_certificate.subject_pki.raw);
+    Ok(format!("sha256//{}", BASE64_STANDARD.encode(digest)))
+}
+
+/// Generate self-signed runtime API TLS material and its matching public-key pin.
+pub fn generate_runtime_api_tls_material<I, S>(
+    subject_alt_names: I,
+) -> Result<RuntimeApiGeneratedTlsMaterial, RuntimeApiTlsError>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let mut names = subject_alt_names
+        .into_iter()
+        .map(Into::into)
+        .filter(|name| !name.trim().is_empty())
+        .collect::<Vec<_>>();
+    if names.is_empty() {
+        names.push("localhost".to_owned());
+    }
+    let CertifiedKey { cert, signing_key } = generate_simple_self_signed(names)?;
+    let cert_pem = cert.pem().into_bytes();
+    let key_pem = signing_key.serialize_pem().into_bytes();
+    let tls_public_key_pin = runtime_api_tls_public_key_pin_from_pem(&cert_pem)?;
+    Ok(RuntimeApiGeneratedTlsMaterial {
+        cert_pem,
+        key_pem,
+        tls_public_key_pin,
+    })
 }
 
 #[must_use]
