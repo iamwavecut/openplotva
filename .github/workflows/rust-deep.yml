@@ -28,15 +28,47 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Cache Rust toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.rustup/toolchains
+            ~/.rustup/update-hashes
+          key: rustup-${{ runner.os }}-${{ env.RUST_VERSION }}-deep-v1
+
       - name: Install Rust
         run: |
           rustup toolchain install "$RUST_VERSION" --profile minimal
           rustup default "$RUST_VERSION"
 
+      - name: Cache Rust deep artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-${{ runner.os }}-${{ env.RUST_VERSION }}-deep
+
+      - name: Cache cargo deep tools
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-hack
+            ~/.cargo/bin/cargo-semver-checks
+          key: cargo-tools-${{ runner.os }}-hack-${{ env.CARGO_HACK_VERSION }}-semver-${{ env.CARGO_SEMVER_CHECKS_VERSION }}
+
       - name: Install deep analysis tools
         run: |
-          cargo install cargo-hack --locked --version "$CARGO_HACK_VERSION"
-          cargo install cargo-semver-checks --locked --version "$CARGO_SEMVER_CHECKS_VERSION"
+          install_tool() {
+            local bin="$1"
+            local crate="$2"
+            local version="$3"
+            if command -v "$bin" >/dev/null 2>&1 && "$bin" --version | grep -F "$version" >/dev/null 2>&1; then
+              echo "${bin} ${version} restored from cache"
+            else
+              cargo install "$crate" --locked --version "$version"
+            fi
+          }
+
+          install_tool cargo-hack cargo-hack "$CARGO_HACK_VERSION"
+          install_tool cargo-semver-checks cargo-semver-checks "$CARGO_SEMVER_CHECKS_VERSION"
 
       - name: Deep Rust gate
         env:

@@ -47,6 +47,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
+      - name: Cache Semgrep pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: semgrep-pip-${{ runner.os }}-${{ env.SEMGREP_VERSION }}
+
       - name: Install Semgrep
         run: python -m pip install "semgrep==${SEMGREP_VERSION}"
 

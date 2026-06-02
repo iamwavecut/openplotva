@@ -25,10 +25,23 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
+      - name: Cache Rust toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.rustup/toolchains
+            ~/.rustup/update-hashes
+          key: rustup-${{ runner.os }}-${{ env.RUST_VERSION }}-workspace-v1
+
       - name: Install Rust
         run: |
           rustup toolchain install "$RUST_VERSION" --profile minimal --component clippy --component rustfmt
           rustup default "$RUST_VERSION"
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-${{ runner.os }}-${{ env.RUST_VERSION }}-workspace
 
       - name: Fast Rust gate
         run: tools/rust-fast-gate.sh
@@ -40,16 +53,49 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
+      - name: Cache Rust toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.rustup/toolchains
+            ~/.rustup/update-hashes
+          key: rustup-${{ runner.os }}-${{ env.RUST_VERSION }}-dependencies-v1
+
       - name: Install Rust
         run: |
           rustup toolchain install "$RUST_VERSION" --profile minimal
           rustup default "$RUST_VERSION"
 
+      - name: Cache Rust dependency artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-${{ runner.os }}-${{ env.RUST_VERSION }}-dependencies
+
+      - name: Cache cargo analysis tools
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-deny
+            ~/.cargo/bin/cargo-audit
+            ~/.cargo/bin/cargo-machete
+          key: cargo-tools-${{ runner.os }}-deny-${{ env.CARGO_DENY_VERSION }}-audit-${{ env.CARGO_AUDIT_VERSION }}-machete-${{ env.CARGO_MACHETE_VERSION }}
+
       - name: Install dependency analysis tools
         run: |
-          cargo install cargo-deny --locked --version "$CARGO_DENY_VERSION"
-          cargo install cargo-audit --locked --version "$CARGO_AUDIT_VERSION"
-          cargo install cargo-machete --locked --version "$CARGO_MACHETE_VERSION"
+          install_tool() {
+            local bin="$1"
+            local crate="$2"
+            local version="$3"
+            if command -v "$bin" >/dev/null 2>&1 && "$bin" --version | grep -F "$version" >/dev/null 2>&1; then
+              echo "${bin} ${version} restored from cache"
+            else
+              cargo install "$crate" --locked --version "$version"
+            fi
+          }
+
+          install_tool cargo-deny cargo-deny "$CARGO_DENY_VERSION"
+          install_tool cargo-audit cargo-audit "$CARGO_AUDIT_VERSION"
+          install_tool cargo-machete cargo-machete "$CARGO_MACHETE_VERSION"
 
       - name: Dependency gate
         run: tools/rust-dependency-gate.sh
@@ -64,5 +110,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Build runtime image
-        run: docker build --target runtime --build-arg RUST_VERSION="$RUST_VERSION" -t openplotva:ci .
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: runtime
+          build-args: RUST_VERSION=${{ env.RUST_VERSION }}
+          tags: openplotva:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
