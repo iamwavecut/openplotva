@@ -566,7 +566,11 @@ pub const SQL_UPSERT_CHAT_MEMBER: &str = "INSERT INTO chat_members (chat_id, use
 
 pub const SQL_UPDATE_MEMBER_LAST_MESSAGE: &str = "UPDATE chat_members SET last_message_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE chat_id = $1 AND user_id = $2";
 
+pub const SQL_UPDATE_MEMBER_LAST_MESSAGES: &str = "WITH input AS (SELECT * FROM unnest($1::bigint[], $2::bigint[]) AS input(chat_id, user_id)) UPDATE chat_members AS member SET last_message_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP FROM input WHERE member.chat_id = input.chat_id AND member.user_id = input.user_id";
+
 pub const SQL_UPSERT_CHAT_ACTIVE_USER: &str = "INSERT INTO chat_active_users (chat_id, user_id, last_active_at) VALUES ($1, $2, CURRENT_TIMESTAMP) ON CONFLICT (chat_id, user_id) DO UPDATE SET last_active_at = CURRENT_TIMESTAMP";
+
+pub const SQL_UPSERT_CHAT_ACTIVE_USERS: &str = "INSERT INTO chat_active_users (chat_id, user_id, last_active_at) SELECT input.chat_id, input.user_id, CURRENT_TIMESTAMP FROM unnest($1::bigint[], $2::bigint[]) AS input(chat_id, user_id) ON CONFLICT (chat_id, user_id) DO UPDATE SET last_active_at = CURRENT_TIMESTAMP";
 
 pub const SQL_LIST_ACTIVE_PARTICIPANTS: &str = "SELECT user_id FROM chat_members WHERE chat_id = $1 AND status IN ('administrator', 'member', 'creator') AND last_message_at IS NOT NULL AND last_message_at >= (CURRENT_TIMESTAMP - INTERVAL '24 hours') ORDER BY last_message_at DESC LIMIT $2";
 
@@ -675,28 +679,144 @@ WHERE status = 'processing'
   AND attempts >= 5
   AND (leased_until IS NULL OR leased_until < CURRENT_TIMESTAMP)"#;
 
-pub const SQL_CLAIM_MEMORY_RUN: &str = r#"WITH candidate AS (
+pub const SQL_CLAIM_MEMORY_RUN: &str = r#"WITH current_processing AS (
+    SELECT id, 0 AS priority
+    FROM (
+        SELECT id
+        FROM memory_runs
+        WHERE prompt_version = $1
+          AND status = 'processing'
+          AND leased_until < CURRENT_TIMESTAMP
+          AND attempts < 5
+        ORDER BY range_end_at DESC,
+                 range_start_at DESC,
+                 cursor_after_at ASC,
+                 cursor_after_message_id ASC,
+                 id ASC
+        FOR UPDATE SKIP LOCKED
+        LIMIT 1
+    ) current_processing
+),
+current_failed AS (
+    SELECT id, 1 AS priority
+    FROM (
+        SELECT id
+        FROM memory_runs
+        WHERE prompt_version = $1
+          AND status = 'failed'
+          AND attempts < 5
+          AND (leased_until IS NULL OR leased_until < CURRENT_TIMESTAMP)
+          AND NOT EXISTS (SELECT 1 FROM current_processing)
+        ORDER BY range_end_at DESC,
+                 range_start_at DESC,
+                 cursor_after_at ASC,
+                 cursor_after_message_id ASC,
+                 id ASC
+        FOR UPDATE SKIP LOCKED
+        LIMIT 1
+    ) current_failed
+),
+current_queued AS (
+    SELECT id, 2 AS priority
+    FROM (
+        SELECT id
+        FROM memory_runs
+        WHERE prompt_version = $1
+          AND status = 'queued'
+          AND (leased_until IS NULL OR leased_until < CURRENT_TIMESTAMP)
+          AND NOT EXISTS (SELECT 1 FROM current_processing)
+          AND NOT EXISTS (SELECT 1 FROM current_failed)
+        ORDER BY range_end_at DESC,
+                 range_start_at DESC,
+                 cursor_after_at ASC,
+                 cursor_after_message_id ASC,
+                 id ASC
+        FOR UPDATE SKIP LOCKED
+        LIMIT 1
+    ) current_queued
+),
+current_candidate AS (
+    SELECT id, priority FROM current_processing
+    UNION ALL
+    SELECT id, priority FROM current_failed
+    UNION ALL
+    SELECT id, priority FROM current_queued
+),
+legacy_processing AS (
+    SELECT id, 3 AS priority
+    FROM (
+        SELECT id
+        FROM memory_runs
+        WHERE prompt_version <> $1
+          AND status = 'processing'
+          AND leased_until < CURRENT_TIMESTAMP
+          AND attempts < 5
+          AND NOT EXISTS (SELECT 1 FROM current_candidate)
+        ORDER BY range_end_at DESC,
+                 range_start_at DESC,
+                 cursor_after_at ASC,
+                 cursor_after_message_id ASC,
+                 id ASC
+        FOR UPDATE SKIP LOCKED
+        LIMIT 1
+    ) legacy_processing
+),
+legacy_failed AS (
+    SELECT id, 4 AS priority
+    FROM (
+        SELECT id
+        FROM memory_runs
+        WHERE prompt_version <> $1
+          AND status = 'failed'
+          AND attempts < 5
+          AND (leased_until IS NULL OR leased_until < CURRENT_TIMESTAMP)
+          AND NOT EXISTS (SELECT 1 FROM current_candidate)
+          AND NOT EXISTS (SELECT 1 FROM legacy_processing)
+        ORDER BY range_end_at DESC,
+                 range_start_at DESC,
+                 cursor_after_at ASC,
+                 cursor_after_message_id ASC,
+                 id ASC
+        FOR UPDATE SKIP LOCKED
+        LIMIT 1
+    ) legacy_failed
+),
+legacy_queued AS (
+    SELECT id, 5 AS priority
+    FROM (
+        SELECT id
+        FROM memory_runs
+        WHERE prompt_version <> $1
+          AND status = 'queued'
+          AND (leased_until IS NULL OR leased_until < CURRENT_TIMESTAMP)
+          AND NOT EXISTS (SELECT 1 FROM current_candidate)
+          AND NOT EXISTS (SELECT 1 FROM legacy_processing)
+          AND NOT EXISTS (SELECT 1 FROM legacy_failed)
+        ORDER BY range_end_at DESC,
+                 range_start_at DESC,
+                 cursor_after_at ASC,
+                 cursor_after_message_id ASC,
+                 id ASC
+        FOR UPDATE SKIP LOCKED
+        LIMIT 1
+    ) legacy_queued
+),
+candidate AS (
     SELECT id
-    FROM memory_runs
-    WHERE (
-        status = 'queued'
-        OR (status = 'failed' AND attempts < 5)
-        OR (status = 'processing' AND leased_until < CURRENT_TIMESTAMP AND attempts < 5)
-    )
-      AND (leased_until IS NULL OR leased_until < CURRENT_TIMESTAMP)
-    ORDER BY
-        CASE WHEN memory_runs.prompt_version = $1 THEN 0 ELSE 1 END ASC,
-        CASE
-            WHEN status = 'processing' AND leased_until < CURRENT_TIMESTAMP THEN 0
-            WHEN status = 'failed' THEN 1
-            ELSE 2
-        END ASC,
-        range_end_at DESC,
-        range_start_at DESC,
-        cursor_after_at ASC,
-        cursor_after_message_id ASC,
-        id ASC
-    FOR UPDATE SKIP LOCKED
+    FROM (
+        SELECT id, priority
+        FROM current_candidate
+        UNION ALL
+        SELECT id, priority
+        FROM legacy_processing
+        UNION ALL
+        SELECT id, priority
+        FROM legacy_failed
+        UNION ALL
+        SELECT id, priority
+        FROM legacy_queued
+    ) candidates
+    ORDER BY priority ASC
     LIMIT 1
 )
 UPDATE memory_runs AS r
@@ -736,27 +856,29 @@ pub const SQL_RETRY_MEMORY_RUN: &str = "UPDATE memory_runs SET status = 'queued'
 
 pub const SQL_RETRY_FAILED_MEMORY_RUNS: &str = "UPDATE memory_runs SET status = 'queued', lease_owner = '', leased_until = NULL, attempts = 0, error = '', updated_at = CURRENT_TIMESTAMP WHERE status = 'failed'";
 
-pub const SQL_ENSURE_DAILY_MEMORY_RUNS: &str = r#"WITH hourly_windows AS (
-    SELECT
-        window_start AS range_start_at,
-        LEAST(window_start + interval '1 hour', $3::timestamptz) AS range_end_at
-    FROM generate_series($2::timestamptz, $3::timestamptz - interval '1 microsecond', interval '1 hour') AS window_start
-),
-active_windows AS (
+pub const SQL_ENSURE_DAILY_MEMORY_RUNS: &str = r#"WITH grouped_windows AS (
     SELECT
         h.chat_id,
         h.thread_id,
-        w.range_start_at,
-        w.range_end_at,
+        date_trunc('hour', h.occurred_at) AS range_start_at,
         count(*)::int AS message_count
-    FROM hourly_windows w
-    JOIN chat_history_entries h
-      ON h.occurred_at >= w.range_start_at
-     AND h.occurred_at < w.range_end_at
-     AND h.occurred_at >= $4::timestamptz
-     AND h.kind = 'text'
-    GROUP BY h.chat_id, h.thread_id, w.range_start_at, w.range_end_at
+    FROM chat_history_entries h
+    WHERE h.bucket_day >= GREATEST($2::timestamptz, $4::timestamptz)::date
+      AND h.bucket_day < $3::timestamptz::date
+      AND h.occurred_at >= GREATEST($2::timestamptz, $4::timestamptz)
+      AND h.occurred_at < $3::timestamptz
+      AND h.kind = 'text'
+    GROUP BY h.chat_id, h.thread_id, date_trunc('hour', h.occurred_at)
     HAVING count(*) > 0
+),
+active_windows AS (
+    SELECT
+        chat_id,
+        thread_id,
+        range_start_at,
+        LEAST(range_start_at + interval '1 hour', $3::timestamptz) AS range_end_at,
+        message_count
+    FROM grouped_windows
 )
 INSERT INTO memory_runs (
     chat_id,
@@ -2786,6 +2908,22 @@ impl PostgresChatMemberStore {
         Ok(())
     }
 
+    pub async fn update_member_last_messages(
+        &self,
+        pairs: &[(i64, i64)],
+    ) -> Result<(), StorageError> {
+        if pairs.is_empty() {
+            return Ok(());
+        }
+        let (chat_ids, user_ids) = chat_user_pair_arrays(pairs);
+        sqlx::query(SQL_UPDATE_MEMBER_LAST_MESSAGES)
+            .bind(&chat_ids)
+            .bind(&user_ids)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn upsert_chat_active_user(
         &self,
         chat_id: i64,
@@ -2794,6 +2932,19 @@ impl PostgresChatMemberStore {
         sqlx::query(SQL_UPSERT_CHAT_ACTIVE_USER)
             .bind(chat_id)
             .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn upsert_chat_active_users(&self, pairs: &[(i64, i64)]) -> Result<(), StorageError> {
+        if pairs.is_empty() {
+            return Ok(());
+        }
+        let (chat_ids, user_ids) = chat_user_pair_arrays(pairs);
+        sqlx::query(SQL_UPSERT_CHAT_ACTIVE_USERS)
+            .bind(&chat_ids)
+            .bind(&user_ids)
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -3018,6 +3169,16 @@ impl PostgresChatMemberStore {
             .collect::<Result<Vec<_>, _>>()
             .map_err(StorageError::from)
     }
+}
+
+fn chat_user_pair_arrays(pairs: &[(i64, i64)]) -> (Vec<i64>, Vec<i64>) {
+    let mut chat_ids = Vec::with_capacity(pairs.len());
+    let mut user_ids = Vec::with_capacity(pairs.len());
+    for &(chat_id, user_id) in pairs {
+        chat_ids.push(chat_id);
+        user_ids.push(user_id);
+    }
+    (chat_ids, user_ids)
 }
 
 #[derive(Clone, Debug)]
@@ -5975,6 +6136,7 @@ fn legacy_migration_id_for_version(version: i64) -> Option<&'static str> {
         107 => Some("107_enable_daily_game_for_all_chats.sql"),
         108 => Some("108_memory_run_error_log_and_retry_cap.sql"),
         109 => Some("109_backfill_memory_run_error_log.sql"),
+        110 => Some("110_query_performance_indexes.sql"),
         10 => Some("10_daily_game.sql"),
         11 => Some("11_member_activity.sql"),
         12 => Some("12_enable_daily_game_by_default.sql"),
@@ -6633,7 +6795,7 @@ mod tests {
 
     #[test]
     fn migration_corpus_is_embedded() {
-        assert_eq!(super::MIGRATOR.iter().count(), 96);
+        assert_eq!(super::MIGRATOR.iter().count(), 98);
     }
 
     #[test]
@@ -6892,7 +7054,7 @@ mod tests {
         assert!(super::SQL_MARK_EXHAUSTED_MEMORY_RUNS.contains("attempts >= 5"));
         assert!(
             super::SQL_CLAIM_MEMORY_RUN
-                .contains("CASE WHEN memory_runs.prompt_version = $1 THEN 0 ELSE 1 END")
+                .contains("WHERE prompt_version = $1\n          AND status = 'queued'")
         );
         assert!(super::SQL_CLAIM_MEMORY_RUN.contains("FOR UPDATE SKIP LOCKED"));
         assert!(super::SQL_COMPLETE_MEMORY_RUN.contains("cards_superseded = $4"));
@@ -6901,7 +7063,8 @@ mod tests {
         assert!(super::SQL_RETRY_FAILED_MEMORY_RUNS.contains("WHERE status = 'failed'"));
         assert!(super::SQL_LIST_MEMORY_RUNS.contains("error_log::text AS error_log"));
         assert!(super::SQL_LIST_MEMORY_RUNS.contains("ORDER BY range_start_at DESC, id DESC"));
-        assert!(super::SQL_ENSURE_DAILY_MEMORY_RUNS.contains("generate_series"));
+        assert!(super::SQL_ENSURE_DAILY_MEMORY_RUNS.contains("date_trunc('hour', h.occurred_at)"));
+        assert!(super::SQL_ENSURE_DAILY_MEMORY_RUNS.contains("h.bucket_day >="));
         assert!(super::SQL_SKIP_SUPERSEDED_MEMORY_RUNS.contains("prompt_version <> $1"));
         assert!(
             super::SQL_SELECT_MEMORY_RUN_MESSAGES
@@ -7963,8 +8126,16 @@ mod tests {
             "UPDATE chat_members SET last_message_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE chat_id = $1 AND user_id = $2"
         );
         assert_eq!(
+            super::SQL_UPDATE_MEMBER_LAST_MESSAGES,
+            "WITH input AS (SELECT * FROM unnest($1::bigint[], $2::bigint[]) AS input(chat_id, user_id)) UPDATE chat_members AS member SET last_message_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP FROM input WHERE member.chat_id = input.chat_id AND member.user_id = input.user_id"
+        );
+        assert_eq!(
             super::SQL_UPSERT_CHAT_ACTIVE_USER,
             "INSERT INTO chat_active_users (chat_id, user_id, last_active_at) VALUES ($1, $2, CURRENT_TIMESTAMP) ON CONFLICT (chat_id, user_id) DO UPDATE SET last_active_at = CURRENT_TIMESTAMP"
+        );
+        assert_eq!(
+            super::SQL_UPSERT_CHAT_ACTIVE_USERS,
+            "INSERT INTO chat_active_users (chat_id, user_id, last_active_at) SELECT input.chat_id, input.user_id, CURRENT_TIMESTAMP FROM unnest($1::bigint[], $2::bigint[]) AS input(chat_id, user_id) ON CONFLICT (chat_id, user_id) DO UPDATE SET last_active_at = CURRENT_TIMESTAMP"
         );
         assert_eq!(
             super::SQL_LIST_ACTIVE_PARTICIPANTS,

@@ -3331,13 +3331,13 @@ fn admin_json_no_cache_response(status: StatusCode, value: serde_json::Value) ->
 }
 
 const ADMIN_PAGE_LIMIT: i64 = 1000;
-const SQL_ADMIN_LIST_USERS_FILTERED: &str = "SELECT * FROM users WHERE ($1::text IS NULL OR LOWER(COALESCE(username, '')) LIKE '%' || LOWER($1::text) || '%' OR LOWER(first_name) LIKE '%' || LOWER($1::text) || '%' OR LOWER(COALESCE(last_name, '')) LIKE '%' || LOWER($1::text) || '%') ORDER BY id LIMIT $2 OFFSET $3";
+const SQL_ADMIN_LIST_USERS_FILTERED: &str = "SELECT * FROM users WHERE ($1::text IS NULL OR username ILIKE '%' || $1::text || '%' OR first_name ILIKE '%' || $1::text || '%' OR last_name ILIKE '%' || $1::text || '%') ORDER BY id LIMIT $2 OFFSET $3";
 const SQL_ADMIN_GET_USER: &str = "SELECT * FROM users WHERE id = $1";
 const SQL_ADMIN_GET_USER_BY_USERNAME: &str = "SELECT * FROM users WHERE username = $1 LIMIT 1";
 const SQL_ADMIN_SAFE_DELETE_USER: &str = "WITH deleted_memberships AS (DELETE FROM chat_members WHERE user_id = $1 RETURNING user_id), deleted_vip AS (DELETE FROM vip_cache WHERE user_id = $1 RETURNING user_id) DELETE FROM users WHERE id = $1";
-const SQL_ADMIN_LIST_CHATS: &str = "SELECT * FROM chats";
-const SQL_ADMIN_LIST_CHATS_FILTERED: &str = "SELECT * FROM chats WHERE ($1::text IS NULL OR CAST(id AS text) LIKE '%' || $1::text || '%' OR LOWER(COALESCE(title, '')) LIKE '%' || LOWER($1::text) || '%' OR LOWER(COALESCE(username, '')) LIKE '%' || LOWER($1::text) || '%' OR LOWER(COALESCE(first_name, '')) LIKE '%' || LOWER($1::text) || '%' OR LOWER(COALESCE(last_name, '')) LIKE '%' || LOWER($1::text) || '%') ORDER BY id LIMIT $2 OFFSET $3";
-const SQL_ADMIN_SEARCH_CHATS_BY_MEMBER: &str = "SELECT DISTINCT c.* FROM chats c JOIN chat_members cm ON c.id = cm.chat_id JOIN users u ON cm.user_id = u.id WHERE ($1::text IS NULL OR LOWER(u.username) = LOWER($1::text)) AND ($2::bigint IS NULL OR u.id = $2::bigint) ORDER BY c.id";
+const SQL_ADMIN_LIST_CHATS: &str = "SELECT * FROM chats ORDER BY id LIMIT $1 OFFSET $2";
+const SQL_ADMIN_LIST_CHATS_FILTERED: &str = "SELECT * FROM chats WHERE ($1::text IS NULL OR CAST(id AS text) LIKE '%' || $1::text || '%' OR title ILIKE '%' || $1::text || '%' OR username ILIKE '%' || $1::text || '%' OR first_name ILIKE '%' || $1::text || '%' OR last_name ILIKE '%' || $1::text || '%') ORDER BY id LIMIT $2 OFFSET $3";
+const SQL_ADMIN_SEARCH_CHATS_BY_MEMBER: &str = "SELECT DISTINCT c.* FROM chats c JOIN chat_members cm ON c.id = cm.chat_id JOIN users u ON cm.user_id = u.id WHERE ($1::text IS NULL OR LOWER(u.username) = LOWER($1::text)) AND ($2::bigint IS NULL OR u.id = $2::bigint) ORDER BY c.id LIMIT $3";
 const SQL_ADMIN_GET_CHAT: &str = "SELECT * FROM chats WHERE id = $1";
 const SQL_ADMIN_GET_CHAT_TYPE: &str = "SELECT type FROM chats WHERE id = $1";
 const SQL_ADMIN_GET_CHAT_SETTINGS: &str = "SELECT * FROM chat_settings WHERE chat_id = $1";
@@ -5354,7 +5354,13 @@ async fn admin_chats_list_response(
                 .fetch_all(pool)
                 .await
         }
-        None => sqlx::query(SQL_ADMIN_LIST_CHATS).fetch_all(pool).await,
+        None => {
+            sqlx::query(SQL_ADMIN_LIST_CHATS)
+                .bind(ADMIN_PAGE_LIMIT)
+                .bind(0_i64)
+                .fetch_all(pool)
+                .await
+        }
     };
     match rows {
         Ok(rows) => admin_json_response(
@@ -5397,6 +5403,7 @@ async fn admin_chats_search_by_member_response(
     match sqlx::query(SQL_ADMIN_SEARCH_CHATS_BY_MEMBER)
         .bind(username.as_deref())
         .bind(user_id)
+        .bind(ADMIN_PAGE_LIMIT)
         .fetch_all(pool)
         .await
     {
@@ -8051,6 +8058,12 @@ async fn start_runtime_workers(
         openplotva_updates::RedisUpdateQueue::new(service_clients.redis.client().clone()),
     );
     let llm_trace_buffer = runtime_llm::RuntimeLlmTraceBuffer::default();
+    let (llm_event_recorder, llm_event_recorder_worker) =
+        runtime_llm::PostgresRuntimeLlmEventRecorder::spawn(
+            service_clients.postgres.clone(),
+            stop.subscribe(),
+        );
+    workers.handles.push(llm_event_recorder_worker);
     workers.llm_trace_buffer = Some(llm_trace_buffer.clone());
     let memory_store = PostgresMemoryStore::new(service_clients.postgres.clone());
     let memory_restart_trigger = Arc::new(tokio::sync::Notify::new());
@@ -8662,6 +8675,13 @@ async fn start_runtime_workers(
     let store_for_updates = Arc::new(store.clone());
     let history_store_for_updates = Arc::new(history_store.clone());
     let chat_members_for_updates = Arc::new(chat_member_store.clone());
+    let (message_activity_store, message_activity_worker) =
+        activity::BufferedMessageActivityStore::spawn(
+            Arc::clone(&chat_members_for_updates),
+            stop.subscribe(),
+        );
+    let message_activity_store = Arc::new(message_activity_store);
+    workers.handles.push(message_activity_worker);
     let checkin_game_store_for_updates = Arc::new(checkin_game_store.clone());
     let rate_limits_for_updates = Arc::clone(&rate_limit_policy);
     let permission_policy_for_updates = Arc::clone(&permission_policy);
@@ -8880,11 +8900,15 @@ async fn start_runtime_workers(
                 let white_circle_client = openplotva_llm::whitecircle::WhiteCircleClient::new(
                     dialog_runtime::white_circle_client_config_from_app_config(config),
                 );
+                let (white_circle_recorder, white_circle_recorder_worker) =
+                    runtime_safety::PostgresWhiteCircleCheckEventRecorder::spawn(
+                        service_clients.postgres.clone(),
+                        stop.subscribe(),
+                    );
+                workers.handles.push(white_circle_recorder_worker);
                 let white_circle_recorder: Arc<
                     dyn openplotva_llm::whitecircle::WhiteCircleCheckEventRecorder,
-                > = Arc::new(runtime_safety::PostgresWhiteCircleCheckEventRecorder::new(
-                    service_clients.postgres.clone(),
-                ));
+                > = Arc::new(white_circle_recorder);
                 dialog_provider = Arc::new(
                     openplotva_llm::whitecircle::WhiteCirclePreToolChatProvider::new(
                         dialog_provider,
@@ -8895,7 +8919,8 @@ async fn start_runtime_workers(
                 );
             }
             let dialog_provider: openplotva_llm::ChatProviderHandle = Arc::new(
-                runtime_llm::TracingChatProvider::new(dialog_provider, llm_trace_buffer.clone()),
+                runtime_llm::TracingChatProvider::new(dialog_provider, llm_trace_buffer.clone())
+                    .with_event_recorder(llm_event_recorder.clone()),
             );
             dialog_provider_for_updates = Some(Arc::clone(&dialog_provider));
             let dialog_queue = Arc::clone(&task_queue_for_updates);
@@ -8969,11 +8994,13 @@ async fn start_runtime_workers(
             if fallback_worker_count > 0 {
                 if let Some(dialog_fallback_provider) = dialog_fallback_provider_for_runtime.clone()
                 {
-                    let dialog_fallback_provider: openplotva_llm::ChatProviderHandle =
-                        Arc::new(runtime_llm::TracingChatProvider::new(
+                    let dialog_fallback_provider: openplotva_llm::ChatProviderHandle = Arc::new(
+                        runtime_llm::TracingChatProvider::new(
                             dialog_fallback_provider,
                             llm_trace_buffer.clone(),
-                        ));
+                        )
+                        .with_event_recorder(llm_event_recorder.clone()),
+                    );
                     let fallback_high = config
                         .persistent_queue
                         .dialog_aifarm_fallback_high_watermark;
@@ -9774,7 +9801,7 @@ async fn start_runtime_workers(
             left_member,
         ));
         let activity = Arc::new(activity::MessageActivityUpdateHandler::new(
-            Arc::clone(&chat_members_for_updates),
+            Arc::clone(&message_activity_store),
             member_state,
         ));
         let edited_effects = Arc::new(

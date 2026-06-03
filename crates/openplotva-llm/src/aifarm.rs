@@ -6832,6 +6832,7 @@ mod tests {
         calls: Vec<String>,
         draw_requests: Vec<DrawRequest>,
         vision_requests: Vec<VisionRequest>,
+        web_search_queries: Vec<String>,
         results: VecDeque<ToolResult>,
     }
 
@@ -6855,6 +6856,10 @@ mod tests {
 
         fn vision_requests(&self) -> Vec<VisionRequest> {
             self.state().vision_requests.clone()
+        }
+
+        fn web_search_queries(&self) -> Vec<String> {
+            self.state().web_search_queries.clone()
         }
 
         fn record(
@@ -6906,6 +6911,20 @@ mod tests {
                 let mut state = self.state();
                 state.calls.push(STEP_VISION_IMAGE.to_owned());
                 state.vision_requests.push(req);
+                Ok(state.results.pop_front().unwrap_or_else(|| ToolResult {
+                    status: TOOL_RESULT_STATUS_OK.to_owned(),
+                    message: "ok".to_owned(),
+                    ..ToolResult::default()
+                }))
+            };
+            Box::pin(async move { result })
+        }
+
+        fn web_search<'a>(&'a self, query: String) -> openplotva_dialog::ToolboxFuture<'a> {
+            let result = {
+                let mut state = self.state();
+                state.calls.push(STEP_WEB_SEARCH.to_owned());
+                state.web_search_queries.push(query);
                 Ok(state.results.pop_front().unwrap_or_else(|| ToolResult {
                     status: TOOL_RESULT_STATUS_OK.to_owned(),
                     message: "ok".to_owned(),
@@ -7175,6 +7194,62 @@ mod tests {
                     .as_str()
                     .is_some_and(|content| content.contains("<tool_result")))
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dialog_provider_executes_xml_wrapper_tool_call_then_continues_to_final_text()
+    -> Result<(), CompletionError> {
+        let toolbox = FakeToolbox::new(vec![ToolResult {
+            status: TOOL_RESULT_STATUS_OK.to_owned(),
+            message: "weather ready".to_owned(),
+            ..ToolResult::default()
+        }]);
+        let (provider, transport, toolbox) = direct_dialog_provider_with_responses(
+            vec![
+                json!({
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": "<tool_calls>\n  <tool_call>web_search{query: \"weather St. Petersburg June 2026 forecast\"}</tool_call>\n</tool_calls>"
+                        }
+                    }]
+                }),
+                json!({
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": "На ПМЭФ захвати зонт: прогноз уже в руках"
+                        }
+                    }]
+                }),
+            ],
+            AifarmDialogConfig::default(),
+            toolbox,
+        );
+        let mut input = base_input();
+        input.message = DialogMessage {
+            id: 104,
+            text: "Плотва, дай погоду на ПМЭФ на 4 дня".to_owned(),
+            ..DialogMessage::default()
+        };
+
+        let output = crate::ChatProvider::run_dialog(&provider, input).await?;
+
+        assert_eq!(output.answer, "На ПМЭФ захвати зонт: прогноз уже в руках");
+        assert!(!output.answer.contains("<tool_calls>"));
+        assert_eq!(output.tool_calls.len(), 1);
+        assert_eq!(output.tool_calls[0].name, STEP_WEB_SEARCH);
+        assert_eq!(
+            output.tool_calls[0].input.as_ref().expect("tool input")["query"],
+            "weather St. Petersburg June 2026 forecast"
+        );
+        assert_eq!(toolbox.calls(), vec![STEP_WEB_SEARCH.to_owned()]);
+        assert_eq!(
+            toolbox.web_search_queries(),
+            vec!["weather St. Petersburg June 2026 forecast".to_owned()]
+        );
+        assert_eq!(transport.requests().len(), 2);
         Ok(())
     }
 

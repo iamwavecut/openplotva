@@ -1,16 +1,52 @@
 //! App-level message activity tracking.
 
-use std::{fmt, future::Future, pin::Pin, sync::Arc};
+use std::{
+    collections::HashSet,
+    fmt,
+    future::Future,
+    pin::Pin,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use carapax::types::{Message as TelegramMessage, Update as TelegramUpdate, UpdateType};
 use openplotva_core::{SENDER_TYPE_USER, UserState};
 use openplotva_updates::resolve_message_sender;
 use thiserror::Error;
+use tokio::{sync::watch, task::JoinHandle};
 
 use crate::updates::{UpdateHandler, UpdateHandlerFuture};
 
 /// Boxed future returned by activity storage calls.
 pub type ActivityStoreFuture<'a, T, E> = Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'a>>;
+
+pub const MESSAGE_ACTIVITY_BUFFER_FLUSH_INTERVAL: Duration = Duration::from_secs(10);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct MessageActivityKey {
+    pub chat_id: i64,
+    pub user_id: i64,
+}
+
+pub trait MessageActivityBatchWriter {
+    /// Store error type.
+    type Error: fmt::Display + Send + Sync + 'static;
+
+    fn flush_member_last_messages<'a>(
+        &'a self,
+        keys: &'a [MessageActivityKey],
+    ) -> ActivityStoreFuture<'a, (), Self::Error>;
+
+    fn flush_chat_active_users<'a>(
+        &'a self,
+        keys: &'a [MessageActivityKey],
+    ) -> ActivityStoreFuture<'a, (), Self::Error>;
+
+    fn upsert_activity_user<'a>(
+        &'a self,
+        user: UserState,
+    ) -> ActivityStoreFuture<'a, (), Self::Error>;
+}
 
 pub trait MessageActivityStore {
     /// Store error type.
@@ -59,6 +95,214 @@ impl MessageActivityStore for openplotva_storage::PostgresChatMemberStore {
         user: UserState,
     ) -> ActivityStoreFuture<'a, (), Self::Error> {
         Box::pin(async move { self.upsert_user_state(&user).await })
+    }
+}
+
+impl MessageActivityBatchWriter for openplotva_storage::PostgresChatMemberStore {
+    type Error = openplotva_storage::StorageError;
+
+    fn flush_member_last_messages<'a>(
+        &'a self,
+        keys: &'a [MessageActivityKey],
+    ) -> ActivityStoreFuture<'a, (), Self::Error> {
+        let pairs = keys
+            .iter()
+            .map(|key| (key.chat_id, key.user_id))
+            .collect::<Vec<_>>();
+        Box::pin(async move { self.update_member_last_messages(&pairs).await })
+    }
+
+    fn flush_chat_active_users<'a>(
+        &'a self,
+        keys: &'a [MessageActivityKey],
+    ) -> ActivityStoreFuture<'a, (), Self::Error> {
+        let pairs = keys
+            .iter()
+            .map(|key| (key.chat_id, key.user_id))
+            .collect::<Vec<_>>();
+        Box::pin(async move { self.upsert_chat_active_users(&pairs).await })
+    }
+
+    fn upsert_activity_user<'a>(
+        &'a self,
+        user: UserState,
+    ) -> ActivityStoreFuture<'a, (), Self::Error> {
+        Box::pin(async move { self.upsert_user_state(&user).await })
+    }
+}
+
+pub struct BufferedMessageActivityStore<Writer> {
+    writer: Arc<Writer>,
+    pending: Arc<Mutex<BufferedMessageActivityPending>>,
+}
+
+impl<Writer> Clone for BufferedMessageActivityStore<Writer> {
+    fn clone(&self) -> Self {
+        Self {
+            writer: Arc::clone(&self.writer),
+            pending: Arc::clone(&self.pending),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct BufferedMessageActivityPending {
+    member_last_messages: HashSet<MessageActivityKey>,
+    active_users: HashSet<MessageActivityKey>,
+}
+
+impl<Writer> BufferedMessageActivityStore<Writer> {
+    pub fn new(writer: Arc<Writer>) -> Self {
+        Self {
+            writer,
+            pending: Arc::new(Mutex::new(BufferedMessageActivityPending::default())),
+        }
+    }
+
+    pub fn spawn(writer: Arc<Writer>, stop: watch::Receiver<bool>) -> (Self, JoinHandle<()>)
+    where
+        Writer: MessageActivityBatchWriter + Send + Sync + 'static,
+    {
+        let store = Self::new(writer);
+        let worker_store = store.clone();
+        let handle = tokio::spawn(run_buffered_message_activity_writer(
+            worker_store,
+            stop,
+            MESSAGE_ACTIVITY_BUFFER_FLUSH_INTERVAL,
+        ));
+        (store, handle)
+    }
+
+    pub async fn flush_pending(&self) -> Result<(), Writer::Error>
+    where
+        Writer: MessageActivityBatchWriter,
+    {
+        let (member_last_messages, active_users) = self.take_pending();
+        if member_last_messages.is_empty() && active_users.is_empty() {
+            return Ok(());
+        }
+        if !member_last_messages.is_empty() {
+            if let Err(error) = self
+                .writer
+                .flush_member_last_messages(&member_last_messages)
+                .await
+            {
+                self.requeue_pending(member_last_messages, active_users);
+                return Err(error);
+            }
+        }
+        if !active_users.is_empty() {
+            if let Err(error) = self.writer.flush_chat_active_users(&active_users).await {
+                self.requeue_pending(Vec::new(), active_users);
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    fn enqueue_member_last_message(&self, key: MessageActivityKey) {
+        self.lock_pending().member_last_messages.insert(key);
+    }
+
+    fn enqueue_active_user(&self, key: MessageActivityKey) {
+        self.lock_pending().active_users.insert(key);
+    }
+
+    fn take_pending(&self) -> (Vec<MessageActivityKey>, Vec<MessageActivityKey>) {
+        let mut pending = self.lock_pending();
+        let mut member_last_messages = pending.member_last_messages.drain().collect::<Vec<_>>();
+        let mut active_users = pending.active_users.drain().collect::<Vec<_>>();
+        member_last_messages.sort_unstable();
+        active_users.sort_unstable();
+        (member_last_messages, active_users)
+    }
+
+    fn requeue_pending(
+        &self,
+        member_last_messages: Vec<MessageActivityKey>,
+        active_users: Vec<MessageActivityKey>,
+    ) {
+        let mut pending = self.lock_pending();
+        pending.member_last_messages.extend(member_last_messages);
+        pending.active_users.extend(active_users);
+    }
+
+    fn lock_pending(&self) -> std::sync::MutexGuard<'_, BufferedMessageActivityPending> {
+        self.pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+impl<Writer> MessageActivityStore for BufferedMessageActivityStore<Writer>
+where
+    Writer: MessageActivityBatchWriter + Send + Sync,
+{
+    type Error = Writer::Error;
+
+    fn update_member_last_message<'a>(
+        &'a self,
+        chat_id: i64,
+        user_id: i64,
+    ) -> ActivityStoreFuture<'a, (), Self::Error> {
+        self.enqueue_member_last_message(MessageActivityKey { chat_id, user_id });
+        Box::pin(std::future::ready(Ok(())))
+    }
+
+    fn upsert_chat_active_user<'a>(
+        &'a self,
+        chat_id: i64,
+        user_id: i64,
+    ) -> ActivityStoreFuture<'a, (), Self::Error> {
+        self.enqueue_active_user(MessageActivityKey { chat_id, user_id });
+        Box::pin(std::future::ready(Ok(())))
+    }
+
+    fn upsert_activity_user<'a>(
+        &'a self,
+        user: UserState,
+    ) -> ActivityStoreFuture<'a, (), Self::Error> {
+        self.writer.upsert_activity_user(user)
+    }
+}
+
+async fn run_buffered_message_activity_writer<Writer>(
+    store: BufferedMessageActivityStore<Writer>,
+    mut stop: watch::Receiver<bool>,
+    flush_interval: Duration,
+) where
+    Writer: MessageActivityBatchWriter + Send + Sync + 'static,
+{
+    let flush_interval = flush_interval.max(Duration::from_millis(1));
+    let mut interval = tokio::time::interval(flush_interval);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        if *stop.borrow() {
+            flush_buffered_message_activity(&store).await;
+            break;
+        }
+
+        tokio::select! {
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() {
+                    flush_buffered_message_activity(&store).await;
+                    break;
+                }
+            }
+            _ = interval.tick() => {
+                flush_buffered_message_activity(&store).await;
+            }
+        }
+    }
+}
+
+async fn flush_buffered_message_activity<Writer>(store: &BufferedMessageActivityStore<Writer>)
+where
+    Writer: MessageActivityBatchWriter,
+{
+    if let Err(error) = store.flush_pending().await {
+        tracing::warn!(%error, "failed to flush buffered message activity");
     }
 }
 
@@ -254,7 +498,8 @@ mod tests {
     };
 
     use super::{
-        ActivityStoreFuture, MessageActivityRoute, MessageActivityStore,
+        ActivityStoreFuture, BufferedMessageActivityStore, MessageActivityBatchWriter,
+        MessageActivityKey, MessageActivityRoute, MessageActivityStore,
         MessageActivityUpdateHandler, handle_message_activity_update_or_else,
         track_message_activity,
     };
@@ -358,6 +603,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn buffered_activity_store_coalesces_repeated_writes_until_flush() {
+        let writer = Arc::new(BatchActivityStoreStub::default());
+        let store = BufferedMessageActivityStore::new(Arc::clone(&writer));
+
+        store
+            .update_member_last_message(42, 111)
+            .await
+            .expect("enqueue first last-message activity");
+        store
+            .update_member_last_message(42, 111)
+            .await
+            .expect("coalesce duplicate last-message activity");
+        store
+            .update_member_last_message(42, 222)
+            .await
+            .expect("enqueue second last-message activity");
+        store
+            .upsert_chat_active_user(42, 111)
+            .await
+            .expect("enqueue first active user");
+        store
+            .upsert_chat_active_user(42, 111)
+            .await
+            .expect("coalesce duplicate active user");
+
+        assert!(writer.calls().is_empty());
+
+        store.flush_pending().await.expect("flush pending activity");
+
+        assert_eq!(
+            writer.calls(),
+            vec!["last:42:111,42:222".to_owned(), "active:42:111".to_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn buffered_activity_store_empty_flush_is_noop() {
+        let writer = Arc::new(BatchActivityStoreStub::default());
+        let store = BufferedMessageActivityStore::new(Arc::clone(&writer));
+
+        store.flush_pending().await.expect("empty flush");
+
+        assert!(writer.calls().is_empty());
+    }
+
+    #[tokio::test]
     async fn live_redis_decoded_activity_tracks_retries_and_delegates_when_url_is_set()
     -> Result<(), Box<dyn Error>> {
         let Ok(redis_url) = env::var("OPENPLOTVA_TEST_REDIS_URL") else {
@@ -424,6 +715,67 @@ mod tests {
 
         let _: i64 = redis::cmd("DEL").arg(&key).query_async(&mut redis).await?;
         Ok(())
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct BatchActivityStoreStub {
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl BatchActivityStoreStub {
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().expect("batch calls").clone()
+        }
+    }
+
+    impl MessageActivityBatchWriter for BatchActivityStoreStub {
+        type Error = io::Error;
+
+        fn flush_member_last_messages<'a>(
+            &'a self,
+            keys: &'a [MessageActivityKey],
+        ) -> ActivityStoreFuture<'a, (), Self::Error> {
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .expect("batch calls")
+                    .push(format!("last:{}", activity_key_list(keys)));
+                Ok(())
+            })
+        }
+
+        fn flush_chat_active_users<'a>(
+            &'a self,
+            keys: &'a [MessageActivityKey],
+        ) -> ActivityStoreFuture<'a, (), Self::Error> {
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .expect("batch calls")
+                    .push(format!("active:{}", activity_key_list(keys)));
+                Ok(())
+            })
+        }
+
+        fn upsert_activity_user<'a>(
+            &'a self,
+            user: UserState,
+        ) -> ActivityStoreFuture<'a, (), Self::Error> {
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .expect("batch calls")
+                    .push(format!("user:{}:{}", user.id, user.first_name));
+                Ok(())
+            })
+        }
+    }
+
+    fn activity_key_list(keys: &[MessageActivityKey]) -> String {
+        keys.iter()
+            .map(|key| format!("{}:{}", key.chat_id, key.user_id))
+            .collect::<Vec<_>>()
+            .join(",")
     }
 
     #[derive(Clone, Debug, Default)]

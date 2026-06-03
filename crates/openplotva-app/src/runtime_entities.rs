@@ -21,9 +21,9 @@ SELECT COUNT(*)::int
 FROM users
 WHERE (
     $1::text IS NULL
-    OR LOWER(COALESCE(username, '')) LIKE '%' || LOWER($1::text) || '%'
-    OR LOWER(first_name) LIKE '%' || LOWER($1::text) || '%'
-    OR LOWER(COALESCE(last_name, '')) LIKE '%' || LOWER($1::text) || '%'
+    OR username ILIKE '%' || $1::text || '%'
+    OR first_name ILIKE '%' || $1::text || '%'
+    OR last_name ILIKE '%' || $1::text || '%'
 )"#;
 
 const SQL_LIST_USERS_FILTERED: &str = r#"
@@ -31,9 +31,9 @@ SELECT *
 FROM users
 WHERE (
     $1::text IS NULL
-    OR LOWER(COALESCE(username, '')) LIKE '%' || LOWER($1::text) || '%'
-    OR LOWER(first_name) LIKE '%' || LOWER($1::text) || '%'
-    OR LOWER(COALESCE(last_name, '')) LIKE '%' || LOWER($1::text) || '%'
+    OR username ILIKE '%' || $1::text || '%'
+    OR first_name ILIKE '%' || $1::text || '%'
+    OR last_name ILIKE '%' || $1::text || '%'
 )
 ORDER BY id
 LIMIT $2
@@ -49,10 +49,10 @@ FROM chats
 WHERE (
     $1::text IS NULL
     OR CAST(id AS text) LIKE '%' || $1::text || '%'
-    OR LOWER(COALESCE(title, '')) LIKE '%' || LOWER($1::text) || '%'
-    OR LOWER(COALESCE(username, '')) LIKE '%' || LOWER($1::text) || '%'
-    OR LOWER(COALESCE(first_name, '')) LIKE '%' || LOWER($1::text) || '%'
-    OR LOWER(COALESCE(last_name, '')) LIKE '%' || LOWER($1::text) || '%'
+    OR title ILIKE '%' || $1::text || '%'
+    OR username ILIKE '%' || $1::text || '%'
+    OR first_name ILIKE '%' || $1::text || '%'
+    OR last_name ILIKE '%' || $1::text || '%'
 )"#;
 
 const SQL_LIST_CHATS_FILTERED: &str = r#"
@@ -61,10 +61,10 @@ FROM chats
 WHERE (
     $1::text IS NULL
     OR CAST(id AS text) LIKE '%' || $1::text || '%'
-    OR LOWER(COALESCE(title, '')) LIKE '%' || LOWER($1::text) || '%'
-    OR LOWER(COALESCE(username, '')) LIKE '%' || LOWER($1::text) || '%'
-    OR LOWER(COALESCE(first_name, '')) LIKE '%' || LOWER($1::text) || '%'
-    OR LOWER(COALESCE(last_name, '')) LIKE '%' || LOWER($1::text) || '%'
+    OR title ILIKE '%' || $1::text || '%'
+    OR username ILIKE '%' || $1::text || '%'
+    OR first_name ILIKE '%' || $1::text || '%'
+    OR last_name ILIKE '%' || $1::text || '%'
 )
 ORDER BY id
 LIMIT $2

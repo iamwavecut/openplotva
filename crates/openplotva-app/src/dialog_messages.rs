@@ -8818,7 +8818,10 @@ mod tests {
     impl ImageEditProviderStub {
         fn success(image_urls: Vec<String>) -> Self {
             Self {
-                result: Ok(crate::image_jobs::ImageEditResult { image_urls }),
+                result: Ok(crate::image_jobs::ImageEditResult {
+                    image_urls,
+                    ..crate::image_jobs::ImageEditResult::default()
+                }),
                 requests: Arc::new(Mutex::new(Vec::new())),
             }
         }

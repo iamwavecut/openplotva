@@ -6,7 +6,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicI64, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use openplotva_dialog::{DialogInput, DialogOutput, DialogTraceArtifacts, DialogTraceError};
@@ -17,10 +17,58 @@ use openplotva_server::{
     RuntimeLlmRequestsFilter, RuntimeLlmTraceInspector,
 };
 use serde_json::{Value, json};
+use sqlx::{PgPool, Postgres, QueryBuilder};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use tokio::{
+    sync::{mpsc, watch},
+    task::JoinHandle,
+};
 
 const GO_LLM_TRACE_BUFFER_CAPACITY: usize = 1_000;
 const GO_RESPONSE_PREVIEW_SIZE: usize = 500;
+const LLM_EVENT_WRITER_CHANNEL_CAPACITY: usize = 10_000;
+const LLM_EVENT_WRITER_BATCH_SIZE: usize = 100;
+const LLM_EVENT_WRITER_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
+const SQL_INSERT_LLM_REQUEST_EVENTS_PREFIX: &str = r#"INSERT INTO llm_request_events (
+    created_at,
+    provider,
+    request_kind,
+    source,
+    flow,
+    chat_id,
+    thread_id,
+    message_id,
+    user_id,
+    model,
+    iteration,
+    prompt_chars,
+    prompt_messages,
+    docs_chars,
+    duration_ms,
+    input_tokens,
+    output_tokens,
+    total_tokens,
+    cached_tokens,
+    thoughts_tokens,
+    tool_use_prompt_tokens,
+    prompt_eval_tokens,
+    prompt_eval_ms,
+    prompt_tps,
+    generation_tokens,
+    generation_ms,
+    generation_tps,
+    effective_output_tps,
+    effective_total_tps,
+    max_tokens,
+    temperature,
+    top_p,
+    top_k,
+    candidate_count,
+    tool_mode,
+    response_format,
+    inference_params,
+    error
+)"#;
 
 #[derive(Clone, Debug)]
 pub struct RuntimeLlmTraceBuffer {
@@ -104,6 +152,46 @@ impl RuntimeLlmTraceBuffer {
     }
 }
 
+/// SQLx-backed LLM analytics event recorder.
+#[derive(Clone, Debug)]
+pub struct PostgresRuntimeLlmEventRecorder {
+    sender: mpsc::Sender<RuntimeLlmRequestData>,
+}
+
+impl PostgresRuntimeLlmEventRecorder {
+    /// Build a recorder and background buffered writer over an existing Postgres pool.
+    pub fn spawn(pool: PgPool, stop: watch::Receiver<bool>) -> (Self, JoinHandle<()>) {
+        let (sender, receiver) = mpsc::channel(LLM_EVENT_WRITER_CHANNEL_CAPACITY);
+        let handle = tokio::spawn(run_llm_request_event_writer(
+            pool,
+            receiver,
+            stop,
+            LLM_EVENT_WRITER_BATCH_SIZE,
+            LLM_EVENT_WRITER_FLUSH_INTERVAL,
+        ));
+        (Self { sender }, handle)
+    }
+
+    fn enqueue(&self, trace: RuntimeLlmRequestData) {
+        if let Err(error) = self.sender.try_send(trace) {
+            match error {
+                mpsc::error::TrySendError::Full(trace) => {
+                    tracing::warn!(
+                        source = %trace.source,
+                        "dropping llm request event because writer channel is full"
+                    );
+                }
+                mpsc::error::TrySendError::Closed(trace) => {
+                    tracing::debug!(
+                        source = %trace.source,
+                        "dropping llm request event because writer is stopped"
+                    );
+                }
+            }
+        }
+    }
+}
+
 impl RuntimeLlmTraceInspector for RuntimeLlmTraceBuffer {
     fn llm_requests(
         &self,
@@ -126,12 +214,23 @@ impl RuntimeLlmTraceInspector for RuntimeLlmTraceBuffer {
 pub struct TracingChatProvider {
     inner: ChatProviderHandle,
     traces: RuntimeLlmTraceBuffer,
+    event_recorder: Option<PostgresRuntimeLlmEventRecorder>,
 }
 
 impl TracingChatProvider {
     /// Wrap a dialog provider with runtime trace capture.
     pub fn new(inner: ChatProviderHandle, traces: RuntimeLlmTraceBuffer) -> Self {
-        Self { inner, traces }
+        Self {
+            inner,
+            traces,
+            event_recorder: None,
+        }
+    }
+
+    /// Attach persistent LLM analytics event capture.
+    pub fn with_event_recorder(mut self, recorder: PostgresRuntimeLlmEventRecorder) -> Self {
+        self.event_recorder = Some(recorder);
+        self
     }
 }
 
@@ -148,6 +247,7 @@ impl ChatProvider for TracingChatProvider {
                 Ok(output) => {
                     record_dialog_success_traces(
                         &self.traces,
+                        self.event_recorder.as_ref(),
                         self.inner.provider_name(),
                         &trace_input,
                         &output,
@@ -159,6 +259,7 @@ impl ChatProvider for TracingChatProvider {
                     let message = error.to_string();
                     record_dialog_error_traces(
                         &self.traces,
+                        self.event_recorder.as_ref(),
                         self.inner.provider_name(),
                         &trace_input,
                         error.as_ref(),
@@ -174,6 +275,7 @@ impl ChatProvider for TracingChatProvider {
 
 fn record_dialog_error_traces(
     traces: &RuntimeLlmTraceBuffer,
+    event_recorder: Option<&PostgresRuntimeLlmEventRecorder>,
     provider_name: &str,
     input: &DialogInput,
     error: &(dyn Error + 'static),
@@ -183,23 +285,25 @@ fn record_dialog_error_traces(
     if let Some(events) = dialog_trace_events_from_error(error).filter(|events| !events.is_empty())
     {
         for artifact in events {
-            traces.record(trace_from_dialog_error_with_artifact(
-                provider_name,
-                input,
-                message,
-                Some(artifact),
-                duration_ms,
-            ));
+            record_dialog_trace(
+                traces,
+                event_recorder,
+                trace_from_dialog_error_with_artifact(
+                    provider_name,
+                    input,
+                    message,
+                    Some(artifact),
+                    duration_ms,
+                ),
+            );
         }
         return;
     }
-    traces.record(trace_from_dialog_error_with_artifact(
-        provider_name,
-        input,
-        message,
-        None,
-        duration_ms,
-    ));
+    record_dialog_trace(
+        traces,
+        event_recorder,
+        trace_from_dialog_error_with_artifact(provider_name, input, message, None, duration_ms),
+    );
 }
 
 fn dialog_trace_events_from_error<'a>(
@@ -213,28 +317,338 @@ fn dialog_trace_events_from_error<'a>(
 
 fn record_dialog_success_traces(
     traces: &RuntimeLlmTraceBuffer,
+    event_recorder: Option<&PostgresRuntimeLlmEventRecorder>,
     provider_name: &str,
     input: &DialogInput,
     output: &DialogOutput,
     duration_ms: i32,
 ) {
     if output.trace_events.is_empty() {
-        traces.record(trace_from_dialog_success(
-            provider_name,
-            input,
-            output,
-            duration_ms,
-        ));
+        record_dialog_trace(
+            traces,
+            event_recorder,
+            trace_from_dialog_success(provider_name, input, output, duration_ms),
+        );
         return;
     }
     for artifact in &output.trace_events {
-        traces.record(trace_from_dialog_success_with_artifact(
-            provider_name,
-            input,
-            output,
-            Some(artifact),
-            duration_ms,
-        ));
+        record_dialog_trace(
+            traces,
+            event_recorder,
+            trace_from_dialog_success_with_artifact(
+                provider_name,
+                input,
+                output,
+                Some(artifact),
+                duration_ms,
+            ),
+        );
+    }
+}
+
+fn record_dialog_trace(
+    traces: &RuntimeLlmTraceBuffer,
+    event_recorder: Option<&PostgresRuntimeLlmEventRecorder>,
+    trace: RuntimeLlmRequestData,
+) {
+    traces.record(trace.clone());
+    if let Some(event_recorder) = event_recorder {
+        event_recorder.enqueue(trace);
+    }
+}
+
+async fn run_llm_request_event_writer(
+    pool: PgPool,
+    mut receiver: mpsc::Receiver<RuntimeLlmRequestData>,
+    mut stop: watch::Receiver<bool>,
+    batch_size: usize,
+    flush_interval: Duration,
+) {
+    let batch_size = batch_size.max(1);
+    let mut pending = Vec::with_capacity(batch_size);
+    let mut interval = tokio::time::interval(flush_interval);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        if *stop.borrow() {
+            drain_and_flush_llm_request_event_batches(
+                &pool,
+                &mut receiver,
+                &mut pending,
+                batch_size,
+            )
+            .await;
+            break;
+        }
+
+        tokio::select! {
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() {
+                    drain_and_flush_llm_request_event_batches(
+                        &pool,
+                        &mut receiver,
+                        &mut pending,
+                        batch_size,
+                    )
+                    .await;
+                    break;
+                }
+            }
+            maybe_trace = receiver.recv() => {
+                let Some(trace) = maybe_trace else {
+                    flush_llm_request_event_batch(&pool, &mut pending).await;
+                    break;
+                };
+                pending.push(trace);
+                if pending.len() >= batch_size {
+                    flush_llm_request_event_batch(&pool, &mut pending).await;
+                }
+            }
+            _ = interval.tick() => {
+                flush_llm_request_event_batch(&pool, &mut pending).await;
+            }
+        }
+    }
+}
+
+async fn drain_and_flush_llm_request_event_batches(
+    pool: &PgPool,
+    receiver: &mut mpsc::Receiver<RuntimeLlmRequestData>,
+    pending: &mut Vec<RuntimeLlmRequestData>,
+    batch_size: usize,
+) {
+    loop {
+        drain_llm_request_event_channel(receiver, pending, batch_size);
+        if pending.is_empty() {
+            break;
+        }
+        flush_llm_request_event_batch(pool, pending).await;
+    }
+}
+
+fn drain_llm_request_event_channel(
+    receiver: &mut mpsc::Receiver<RuntimeLlmRequestData>,
+    pending: &mut Vec<RuntimeLlmRequestData>,
+    batch_size: usize,
+) {
+    while pending.len() < batch_size {
+        match receiver.try_recv() {
+            Ok(trace) => pending.push(trace),
+            Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
+                break;
+            }
+        }
+    }
+}
+
+async fn flush_llm_request_event_batch(pool: &PgPool, pending: &mut Vec<RuntimeLlmRequestData>) {
+    if pending.is_empty() {
+        return;
+    }
+    let batch = std::mem::take(pending);
+    if let Err(error) = insert_llm_request_events(pool, &batch).await {
+        let sources = batch
+            .iter()
+            .map(|trace| trace.source.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        tracing::warn!(%error, sources, count = batch.len(), "failed to insert llm request event batch");
+    }
+}
+
+async fn insert_llm_request_events(
+    pool: &PgPool,
+    traces: &[RuntimeLlmRequestData],
+) -> Result<(), sqlx::Error> {
+    if traces.is_empty() {
+        return Ok(());
+    }
+    let events = traces
+        .iter()
+        .map(LlmRequestEvent::from_trace)
+        .collect::<Vec<_>>();
+    let mut builder = llm_request_event_insert_builder(&events);
+    builder.build().execute(pool).await?;
+    Ok(())
+}
+
+fn llm_request_event_insert_builder(events: &[LlmRequestEvent]) -> QueryBuilder<Postgres> {
+    let mut builder = QueryBuilder::new(SQL_INSERT_LLM_REQUEST_EVENTS_PREFIX);
+    builder.push(" ");
+    builder.push_values(events.iter(), |mut row, event| {
+        row.push_bind(event.created_at)
+            .push_bind(event.provider.clone())
+            .push_bind(event.request_kind.clone())
+            .push_bind(event.source.clone())
+            .push_bind(event.flow.clone())
+            .push_bind(event.chat_id)
+            .push_bind(event.thread_id)
+            .push_bind(event.message_id)
+            .push_bind(event.user_id)
+            .push_bind(event.model.clone())
+            .push_bind(event.iteration)
+            .push_bind(event.prompt_chars)
+            .push_bind(event.prompt_messages)
+            .push_bind(event.docs_chars)
+            .push_bind(event.duration_ms)
+            .push_bind(event.input_tokens)
+            .push_bind(event.output_tokens)
+            .push_bind(event.total_tokens)
+            .push_bind(event.cached_tokens)
+            .push_bind(event.thoughts_tokens)
+            .push_bind(event.tool_use_prompt_tokens)
+            .push_bind(event.prompt_eval_tokens)
+            .push_bind(event.prompt_eval_ms)
+            .push_bind(event.prompt_tps)
+            .push_bind(event.generation_tokens)
+            .push_bind(event.generation_ms)
+            .push_bind(event.generation_tps)
+            .push_bind(event.effective_output_tps)
+            .push_bind(event.effective_total_tps)
+            .push_bind(event.max_tokens)
+            .push_bind(event.temperature)
+            .push_bind(event.top_p)
+            .push_bind(event.top_k)
+            .push_bind(event.candidate_count)
+            .push_bind(event.tool_mode.clone())
+            .push_bind(event.response_format.clone())
+            .push_bind(sqlx::types::Json(event.inference_params.clone()))
+            .push_bind(event.error.clone());
+    });
+    builder
+}
+
+#[cfg(test)]
+fn llm_request_event_batch_insert_sql_for_test(traces: &[RuntimeLlmRequestData]) -> String {
+    let events = traces
+        .iter()
+        .map(LlmRequestEvent::from_trace)
+        .collect::<Vec<_>>();
+    llm_request_event_insert_builder(&events).into_string()
+}
+
+#[cfg(test)]
+fn llm_request_event_shutdown_batch_sizes_for_test(
+    mut receiver: mpsc::Receiver<RuntimeLlmRequestData>,
+    batch_size: usize,
+) -> Vec<usize> {
+    let batch_size = batch_size.max(1);
+    let mut pending = Vec::with_capacity(batch_size);
+    let mut batch_sizes = Vec::new();
+    loop {
+        drain_llm_request_event_channel(&mut receiver, &mut pending, batch_size);
+        if pending.is_empty() {
+            break;
+        }
+        batch_sizes.push(pending.len());
+        pending.clear();
+    }
+    batch_sizes
+}
+
+#[derive(Debug, PartialEq)]
+struct LlmRequestEvent {
+    created_at: OffsetDateTime,
+    provider: Option<String>,
+    request_kind: Option<String>,
+    source: String,
+    flow: Option<String>,
+    chat_id: Option<i64>,
+    thread_id: Option<i32>,
+    message_id: Option<i32>,
+    user_id: Option<i64>,
+    model: Option<String>,
+    iteration: i32,
+    prompt_chars: i32,
+    prompt_messages: i32,
+    docs_chars: i32,
+    duration_ms: i32,
+    input_tokens: Option<i32>,
+    output_tokens: Option<i32>,
+    total_tokens: Option<i32>,
+    cached_tokens: Option<i32>,
+    thoughts_tokens: Option<i32>,
+    tool_use_prompt_tokens: Option<i32>,
+    prompt_eval_tokens: Option<i32>,
+    prompt_eval_ms: Option<f64>,
+    prompt_tps: Option<f64>,
+    generation_tokens: Option<i32>,
+    generation_ms: Option<f64>,
+    generation_tps: Option<f64>,
+    effective_output_tps: Option<f64>,
+    effective_total_tps: Option<f64>,
+    max_tokens: Option<i32>,
+    temperature: Option<f64>,
+    top_p: Option<f64>,
+    top_k: Option<i32>,
+    candidate_count: Option<i32>,
+    tool_mode: Option<String>,
+    response_format: Option<String>,
+    inference_params: Value,
+    error: Option<String>,
+}
+
+impl LlmRequestEvent {
+    fn from_trace(trace: &RuntimeLlmRequestData) -> Self {
+        let inference_params = trace
+            .inference_params
+            .clone()
+            .filter(Value::is_object)
+            .unwrap_or_else(|| json!({}));
+        let usage = trace.usage.as_ref();
+        let timings = trace.timings.as_ref();
+        let duration_ms = if trace.result.duration_ms > 0 {
+            trace.result.duration_ms
+        } else {
+            trace.duration_ms
+        };
+
+        Self {
+            created_at: parse_rfc3339(&trace.at).unwrap_or_else(OffsetDateTime::now_utc),
+            provider: non_empty_opt(trace.provider.as_deref()),
+            request_kind: non_empty_opt(trace.request_kind.as_deref()),
+            source: non_empty(&trace.source).unwrap_or_else(|| "unknown".to_owned()),
+            flow: non_empty_opt(trace.flow.as_deref()),
+            chat_id: nonzero_i64(trace.chat.chat_id),
+            thread_id: trace.chat.thread_id,
+            message_id: nonzero_i32(trace.message.message_id),
+            user_id: nonzero_i64(trace.user.user_id),
+            model: non_empty_opt(trace.model.as_deref()),
+            iteration: trace.iteration.max(1),
+            prompt_chars: trace.prompt_chars.max(0),
+            prompt_messages: trace.prompt_messages.max(0),
+            docs_chars: trace.docs_chars.max(0),
+            duration_ms: duration_ms.max(0),
+            input_tokens: positive_json_i32(usage, "input_tokens"),
+            output_tokens: positive_json_i32(usage, "output_tokens"),
+            total_tokens: positive_json_i32(usage, "total_tokens"),
+            cached_tokens: positive_json_i32(usage, "cached_tokens"),
+            thoughts_tokens: positive_json_i32(usage, "thoughts_tokens"),
+            tool_use_prompt_tokens: positive_json_i32(usage, "tool_use_prompt_tokens"),
+            prompt_eval_tokens: positive_json_i32(timings, "prompt_eval_tokens"),
+            prompt_eval_ms: positive_json_f64(timings, "prompt_eval_ms"),
+            prompt_tps: positive_json_f64(timings, "prompt_tps"),
+            generation_tokens: positive_json_i32(timings, "generation_tokens"),
+            generation_ms: positive_json_f64(timings, "generation_ms"),
+            generation_tps: positive_json_f64(timings, "generation_tps"),
+            effective_output_tps: positive_json_f64(timings, "effective_output_tps")
+                .or_else(|| derived_tps(positive_json_i32(usage, "output_tokens"), duration_ms)),
+            effective_total_tps: positive_json_f64(timings, "effective_total_tps")
+                .or_else(|| derived_tps(positive_json_i32(usage, "total_tokens"), duration_ms)),
+            max_tokens: positive_json_i32(Some(&inference_params), "max_tokens")
+                .or_else(|| positive_i32(trace.gen_config.max_output_tokens)),
+            temperature: positive_json_f64(Some(&inference_params), "temperature")
+                .or_else(|| positive_f64(trace.gen_config.temperature)),
+            top_p: positive_json_f64(Some(&inference_params), "top_p")
+                .or_else(|| positive_f64(trace.gen_config.top_p)),
+            top_k: positive_json_i32(Some(&inference_params), "top_k")
+                .or_else(|| positive_i32(trace.gen_config.top_k)),
+            candidate_count: positive_json_i32(Some(&inference_params), "candidate_count"),
+            tool_mode: string_json_field(&inference_params, "tool_mode"),
+            response_format: string_json_field(&inference_params, "response_format"),
+            inference_params,
+            error: non_empty_opt(trace.result.error.as_deref()),
+        }
     }
 }
 
@@ -540,8 +954,71 @@ fn non_empty(value: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_owned())
 }
 
+fn non_empty_opt(value: Option<&str>) -> Option<String> {
+    value.and_then(non_empty)
+}
+
+fn nonzero_i32(value: i32) -> Option<i32> {
+    (value != 0).then_some(value)
+}
+
+fn nonzero_i64(value: i64) -> Option<i64> {
+    (value != 0).then_some(value)
+}
+
+fn positive_i32(value: i32) -> Option<i32> {
+    (value > 0).then_some(value)
+}
+
+fn positive_f64(value: f64) -> Option<f64> {
+    (value.is_finite() && value > 0.0).then_some(value)
+}
+
+fn positive_json_i32(value: Option<&Value>, key: &str) -> Option<i32> {
+    json_i32(value?.get(key)?).and_then(positive_i32)
+}
+
+fn positive_json_f64(value: Option<&Value>, key: &str) -> Option<f64> {
+    json_f64(value?.get(key)?).and_then(positive_f64)
+}
+
+fn json_i32(value: &Value) -> Option<i32> {
+    if let Some(value) = value.as_i64() {
+        return i32::try_from(value).ok();
+    }
+    if let Some(value) = value.as_u64() {
+        return i32::try_from(value).ok();
+    }
+    if let Some(value) = value.as_f64().filter(|value| value.is_finite()) {
+        return i32::try_from(value.round() as i64).ok();
+    }
+    value.as_str()?.trim().parse::<i32>().ok()
+}
+
+fn json_f64(value: &Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_str()?.trim().parse::<f64>().ok())
+}
+
+fn string_json_field(value: &Value, key: &str) -> Option<String> {
+    value.get(key).and_then(Value::as_str).and_then(non_empty)
+}
+
+fn derived_tps(tokens: Option<i32>, duration_ms: i32) -> Option<f64> {
+    let tokens = tokens?;
+    if duration_ms <= 0 {
+        return None;
+    }
+    positive_f64(f64::from(tokens) / (f64::from(duration_ms) / 1000.0))
+}
+
 fn contains_fold(value: &str, needle: &str) -> bool {
     value.to_lowercase().contains(&needle.to_lowercase())
+}
+
+fn parse_rfc3339(value: &str) -> Option<OffsetDateTime> {
+    OffsetDateTime::parse(value, &Rfc3339).ok()
 }
 
 fn format_ts(ts: OffsetDateTime) -> String {
@@ -730,6 +1207,129 @@ mod tests {
     }
 
     #[test]
+    fn llm_request_event_from_trace_matches_go_persistence_shape() {
+        let trace = RuntimeLlmRequestData {
+            at: "2026-06-03T12:00:00Z".to_owned(),
+            provider: Some(" aifarm ".to_owned()),
+            request_kind: Some("openai.chat.completions".to_owned()),
+            source: "aifarm".to_owned(),
+            flow: Some("dialog".to_owned()),
+            iteration: 2,
+            model: Some("model-a".to_owned()),
+            chat: RuntimeLlmRequestChatData {
+                chat_id: -100,
+                thread_id: Some(5),
+                ..RuntimeLlmRequestChatData::default()
+            },
+            user: RuntimeLlmRequestUserData {
+                user_id: 7,
+                ..RuntimeLlmRequestUserData::default()
+            },
+            message: RuntimeLlmRequestMessageData { message_id: 77 },
+            gen_config: RuntimeLlmGenConfigData {
+                max_output_tokens: 512,
+                ..RuntimeLlmGenConfigData::default()
+            },
+            inference_params: Some(json!({
+                "max_tokens": 768,
+                "temperature": 0.7,
+                "top_p": 0.9,
+                "top_k": 40,
+                "candidate_count": 2,
+                "tool_mode": "auto",
+                "response_format": "json_schema",
+            })),
+            usage: Some(json!({
+                "input_tokens": 11,
+                "output_tokens": 7,
+                "total_tokens": 18,
+                "cached_tokens": 3,
+                "thoughts_tokens": 2,
+                "tool_use_prompt_tokens": 1,
+            })),
+            timings: Some(json!({
+                "prompt_eval_tokens": 11,
+                "prompt_eval_ms": 40.5,
+                "prompt_tps": 275.0,
+                "generation_tokens": 7,
+                "generation_ms": 350.0,
+                "generation_tps": 20.0,
+            })),
+            prompt_chars: 123,
+            prompt_messages: 4,
+            docs_chars: 9,
+            duration_ms: 400,
+            result: RuntimeLlmRequestResultData {
+                error: Some("rate limited".to_owned()),
+                ..RuntimeLlmRequestResultData::default()
+            },
+            ..RuntimeLlmRequestData::default()
+        };
+
+        let event = LlmRequestEvent::from_trace(&trace);
+
+        assert_eq!(
+            event.created_at.format(&Rfc3339).unwrap_or_default(),
+            "2026-06-03T12:00:00Z"
+        );
+        assert_eq!(event.provider.as_deref(), Some("aifarm"));
+        assert_eq!(event.chat_id, Some(-100));
+        assert_eq!(event.thread_id, Some(5));
+        assert_eq!(event.message_id, Some(77));
+        assert_eq!(event.user_id, Some(7));
+        assert_eq!(event.iteration, 2);
+        assert_eq!(event.prompt_chars, 123);
+        assert_eq!(event.input_tokens, Some(11));
+        assert_eq!(event.output_tokens, Some(7));
+        assert_eq!(event.generation_tps, Some(20.0));
+        assert_eq!(event.effective_output_tps, Some(17.5));
+        assert_eq!(event.max_tokens, Some(768));
+        assert_eq!(event.top_k, Some(40));
+        assert_eq!(event.tool_mode.as_deref(), Some("auto"));
+        assert_eq!(event.response_format.as_deref(), Some("json_schema"));
+        assert_eq!(event.inference_params["temperature"], json!(0.7));
+        assert_eq!(event.error.as_deref(), Some("rate limited"));
+    }
+
+    #[test]
+    fn llm_request_event_batch_insert_sql_uses_one_multi_row_statement() {
+        let first = RuntimeLlmRequestData {
+            source: "dialog".to_owned(),
+            model: Some("model-a".to_owned()),
+            ..RuntimeLlmRequestData::default()
+        };
+        let second = RuntimeLlmRequestData {
+            source: "dialog".to_owned(),
+            model: Some("model-b".to_owned()),
+            ..RuntimeLlmRequestData::default()
+        };
+
+        let sql = llm_request_event_batch_insert_sql_for_test(&[first, second]);
+
+        assert!(sql.starts_with("INSERT INTO llm_request_events"));
+        assert!(sql.contains("), ("));
+        assert!(!sql.contains("VALUES (\n    $1,"));
+    }
+
+    #[test]
+    fn llm_request_event_shutdown_drain_flushes_all_queued_batches() {
+        let (sender, receiver) = tokio::sync::mpsc::channel(8);
+        for index in 0..5 {
+            sender
+                .try_send(RuntimeLlmRequestData {
+                    source: format!("dialog-{index}"),
+                    ..RuntimeLlmRequestData::default()
+                })
+                .expect("test channel should accept all queued traces");
+        }
+        drop(sender);
+
+        let batch_sizes = llm_request_event_shutdown_batch_sizes_for_test(receiver, 2);
+
+        assert_eq!(batch_sizes, vec![2, 2, 1]);
+    }
+
+    #[test]
     fn dialog_trace_events_record_each_provider_request_like_go() {
         let buffer = RuntimeLlmTraceBuffer::new(8);
         let input = DialogInput {
@@ -792,7 +1392,7 @@ mod tests {
             ..DialogOutput::default()
         };
 
-        record_dialog_success_traces(&buffer, "aifarm", &input, &output, 99);
+        record_dialog_success_traces(&buffer, None, "aifarm", &input, &output, 99);
 
         let traces = buffer
             .llm_requests(RuntimeLlmRequestsFilter {
@@ -862,7 +1462,15 @@ mod tests {
             }],
         );
 
-        record_dialog_error_traces(&buffer, "aifarm", &input, &error, &error.to_string(), 77);
+        record_dialog_error_traces(
+            &buffer,
+            None,
+            "aifarm",
+            &input,
+            &error,
+            &error.to_string(),
+            77,
+        );
 
         let traces = buffer
             .llm_requests(RuntimeLlmRequestsFilter {

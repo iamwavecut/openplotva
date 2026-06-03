@@ -1544,6 +1544,10 @@ fn parse_xmlish_tool_call_step(raw: &str) -> Result<(ToolStep, bool), ToolParseE
         return parse_bare_tool_call_step(payload);
     }
     if let Some(payload) = first_xmlish_tool_body(raw) {
+        let (nested_step, nested_ok) = parse_xmlish_tool_call_step(&payload)?;
+        if nested_ok {
+            return Ok((nested_step, true));
+        }
         return parse_bare_tool_call_step(&payload);
     }
     let Some(name) = xmlish_tool_attr(&tag, "name") else {
@@ -2218,6 +2222,33 @@ mod tests {
                     hours: 6,
                     message_count: 120,
                     scope: "thread".to_owned(),
+                    ..ToolStep::default()
+                },
+                "xmlish",
+            ),
+            (
+                r#"<tool_calls><tool_call>web_search{query: "weather St. Petersburg June 2026 forecast"}</tool_call></tool_calls>"#.to_owned(),
+                ToolStep {
+                    step: STEP_WEB_SEARCH.to_owned(),
+                    query: "weather St. Petersburg June 2026 forecast".to_owned(),
+                    ..ToolStep::default()
+                },
+                "xmlish",
+            ),
+            (
+                "<tool_calls>\n  <tool_call>web_search{query: \"weather St. Petersburg June 2026 forecast\"}</tool_call>\n</tool_calls>".to_owned(),
+                ToolStep {
+                    step: STEP_WEB_SEARCH.to_owned(),
+                    query: "weather St. Petersburg June 2026 forecast".to_owned(),
+                    ..ToolStep::default()
+                },
+                "xmlish",
+            ),
+            (
+                " <tool_calls>\n\n  <tool_call>\n    web_search{query: \"weather St. Petersburg June 2026 forecast\"}\n  </tool_call>\n</tool_calls> ".to_owned(),
+                ToolStep {
+                    step: STEP_WEB_SEARCH.to_owned(),
+                    query: "weather St. Petersburg June 2026 forecast".to_owned(),
                     ..ToolStep::default()
                 },
                 "xmlish",

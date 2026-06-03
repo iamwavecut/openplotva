@@ -1,15 +1,23 @@
 //! Runtime API WhiteCircle safety-check reader backed by Postgres.
 
+use std::time::Duration;
+
 use openplotva_server::{
     RuntimeSafetyCheckConnectionData, RuntimeSafetyCheckData, RuntimeSafetyCheckReader,
     RuntimeSafetyCheckReaderFuture, RuntimeSafetyChecksFilter,
 };
 use serde_json::Value;
-use sqlx::{PgPool, Row};
+use sqlx::{PgPool, Postgres, QueryBuilder, Row};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use tokio::{
+    sync::{mpsc, watch},
+    task::JoinHandle,
+};
 
-const SQL_INSERT_RUNTIME_SAFETY_CHECK: &str = r#"
-INSERT INTO whitecircle_checks (
+const WHITE_CIRCLE_EVENT_WRITER_CHANNEL_CAPACITY: usize = 10_000;
+const WHITE_CIRCLE_EVENT_WRITER_BATCH_SIZE: usize = 100;
+const WHITE_CIRCLE_EVENT_WRITER_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
+const SQL_INSERT_RUNTIME_SAFETY_CHECKS_PREFIX: &str = r#"INSERT INTO whitecircle_checks (
     created_at,
     source,
     flow,
@@ -27,24 +35,6 @@ INSERT INTO whitecircle_checks (
     response_json,
     duration_ms,
     error
-) VALUES (
-    $1,
-    $2,
-    $3::text,
-    $4::text,
-    $5::bigint,
-    $6::int,
-    $7::int,
-    $8::bigint,
-    $9,
-    $10::text,
-    $11::jsonb,
-    $12::bool,
-    $13::text,
-    $14::jsonb,
-    $15::jsonb,
-    $16,
-    $17::text
 )"#;
 
 const SQL_LIST_RUNTIME_SAFETY_CHECKS: &str = r#"
@@ -93,7 +83,7 @@ pub struct PostgresRuntimeSafetyCheckReader {
 /// SQLx-backed WhiteCircle event recorder.
 #[derive(Clone, Debug)]
 pub struct PostgresWhiteCircleCheckEventRecorder {
-    pool: PgPool,
+    sender: mpsc::Sender<openplotva_llm::whitecircle::WhiteCircleCheckEvent>,
 }
 
 impl PostgresRuntimeSafetyCheckReader {
@@ -104,9 +94,17 @@ impl PostgresRuntimeSafetyCheckReader {
 }
 
 impl PostgresWhiteCircleCheckEventRecorder {
-    /// Build a recorder over an existing Postgres pool.
-    pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+    /// Build a recorder and background buffered writer over an existing Postgres pool.
+    pub fn spawn(pool: PgPool, stop: watch::Receiver<bool>) -> (Self, JoinHandle<()>) {
+        let (sender, receiver) = mpsc::channel(WHITE_CIRCLE_EVENT_WRITER_CHANNEL_CAPACITY);
+        let handle = tokio::spawn(run_whitecircle_check_event_writer(
+            pool,
+            receiver,
+            stop,
+            WHITE_CIRCLE_EVENT_WRITER_BATCH_SIZE,
+            WHITE_CIRCLE_EVENT_WRITER_FLUSH_INTERVAL,
+        ));
+        (Self { sender }, handle)
     }
 }
 
@@ -117,13 +115,22 @@ impl openplotva_llm::whitecircle::WhiteCircleCheckEventRecorder
         &self,
         event: openplotva_llm::whitecircle::WhiteCircleCheckEvent,
     ) {
-        let pool = self.pool.clone();
-        let source = event.source.clone();
-        tokio::spawn(async move {
-            if let Err(error) = insert_white_circle_check_event(&pool, &event).await {
-                tracing::warn!(%error, source, "failed to insert whitecircle check");
+        if let Err(error) = self.sender.try_send(event) {
+            match error {
+                mpsc::error::TrySendError::Full(event) => {
+                    tracing::warn!(
+                        source = %event.source,
+                        "dropping whitecircle check because writer channel is full"
+                    );
+                }
+                mpsc::error::TrySendError::Closed(event) => {
+                    tracing::debug!(
+                        source = %event.source,
+                        "dropping whitecircle check because writer is stopped"
+                    );
+                }
             }
-        });
+        }
     }
 }
 
@@ -162,31 +169,171 @@ impl PostgresRuntimeSafetyCheckReader {
     }
 }
 
-pub async fn insert_white_circle_check_event(
+async fn run_whitecircle_check_event_writer(
+    pool: PgPool,
+    mut receiver: mpsc::Receiver<openplotva_llm::whitecircle::WhiteCircleCheckEvent>,
+    mut stop: watch::Receiver<bool>,
+    batch_size: usize,
+    flush_interval: Duration,
+) {
+    let batch_size = batch_size.max(1);
+    let mut pending = Vec::with_capacity(batch_size);
+    let mut interval = tokio::time::interval(flush_interval);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        if *stop.borrow() {
+            drain_and_flush_whitecircle_check_event_batches(
+                &pool,
+                &mut receiver,
+                &mut pending,
+                batch_size,
+            )
+            .await;
+            break;
+        }
+
+        tokio::select! {
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() {
+                    drain_and_flush_whitecircle_check_event_batches(
+                        &pool,
+                        &mut receiver,
+                        &mut pending,
+                        batch_size,
+                    )
+                    .await;
+                    break;
+                }
+            }
+            maybe_event = receiver.recv() => {
+                let Some(event) = maybe_event else {
+                    flush_whitecircle_check_event_batch(&pool, &mut pending).await;
+                    break;
+                };
+                pending.push(event);
+                if pending.len() >= batch_size {
+                    flush_whitecircle_check_event_batch(&pool, &mut pending).await;
+                }
+            }
+            _ = interval.tick() => {
+                flush_whitecircle_check_event_batch(&pool, &mut pending).await;
+            }
+        }
+    }
+}
+
+async fn drain_and_flush_whitecircle_check_event_batches(
     pool: &PgPool,
-    event: &openplotva_llm::whitecircle::WhiteCircleCheckEvent,
+    receiver: &mut mpsc::Receiver<openplotva_llm::whitecircle::WhiteCircleCheckEvent>,
+    pending: &mut Vec<openplotva_llm::whitecircle::WhiteCircleCheckEvent>,
+    batch_size: usize,
+) {
+    loop {
+        drain_whitecircle_check_event_channel(receiver, pending, batch_size);
+        if pending.is_empty() {
+            break;
+        }
+        flush_whitecircle_check_event_batch(pool, pending).await;
+    }
+}
+
+fn drain_whitecircle_check_event_channel(
+    receiver: &mut mpsc::Receiver<openplotva_llm::whitecircle::WhiteCircleCheckEvent>,
+    pending: &mut Vec<openplotva_llm::whitecircle::WhiteCircleCheckEvent>,
+    batch_size: usize,
+) {
+    while pending.len() < batch_size {
+        match receiver.try_recv() {
+            Ok(event) => pending.push(event),
+            Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
+                break;
+            }
+        }
+    }
+}
+
+async fn flush_whitecircle_check_event_batch(
+    pool: &PgPool,
+    pending: &mut Vec<openplotva_llm::whitecircle::WhiteCircleCheckEvent>,
+) {
+    if pending.is_empty() {
+        return;
+    }
+    let batch = std::mem::take(pending);
+    if let Err(error) = insert_white_circle_check_events(pool, &batch).await {
+        let sources = batch
+            .iter()
+            .map(|event| event.source.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        tracing::warn!(%error, sources, count = batch.len(), "failed to insert whitecircle check batch");
+    }
+}
+
+pub async fn insert_white_circle_check_events(
+    pool: &PgPool,
+    events: &[openplotva_llm::whitecircle::WhiteCircleCheckEvent],
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(SQL_INSERT_RUNTIME_SAFETY_CHECK)
-        .bind(event.created_at)
-        .bind(&event.source)
-        .bind(event.flow.as_deref())
-        .bind(event.mode.as_deref())
-        .bind(event.chat_id)
-        .bind(event.thread_id)
-        .bind(event.message_id)
-        .bind(event.user_id)
-        .bind(&event.deployment_id)
-        .bind(event.external_session_id.as_deref())
-        .bind(sqlx::types::Json(event.request_messages.clone()))
-        .bind(event.flagged)
-        .bind(event.internal_session_id.as_deref())
-        .bind(event.policies.clone().map(sqlx::types::Json))
-        .bind(event.response_json.clone().map(sqlx::types::Json))
-        .bind(event.duration_ms)
-        .bind(event.error.as_deref())
-        .execute(pool)
-        .await?;
+    if events.is_empty() {
+        return Ok(());
+    }
+    let mut builder = whitecircle_check_event_insert_builder(events);
+    builder.build().execute(pool).await?;
     Ok(())
+}
+
+fn whitecircle_check_event_insert_builder(
+    events: &[openplotva_llm::whitecircle::WhiteCircleCheckEvent],
+) -> QueryBuilder<Postgres> {
+    let mut builder = QueryBuilder::new(SQL_INSERT_RUNTIME_SAFETY_CHECKS_PREFIX);
+    builder.push(" ");
+    builder.push_values(events.iter(), |mut row, event| {
+        row.push_bind(event.created_at)
+            .push_bind(event.source.clone())
+            .push_bind(event.flow.clone())
+            .push_bind(event.mode.clone())
+            .push_bind(event.chat_id)
+            .push_bind(event.thread_id)
+            .push_bind(event.message_id)
+            .push_bind(event.user_id)
+            .push_bind(event.deployment_id.clone())
+            .push_bind(event.external_session_id.clone())
+            .push_bind(sqlx::types::Json(event.request_messages.clone()))
+            .push_bind(event.flagged)
+            .push_bind(event.internal_session_id.clone())
+            .push_bind(event.policies.clone().map(sqlx::types::Json))
+            .push_bind(event.response_json.clone().map(sqlx::types::Json))
+            .push_bind(event.duration_ms)
+            .push_bind(event.error.clone());
+    });
+    builder
+}
+
+#[cfg(test)]
+fn whitecircle_check_batch_insert_sql_for_test(
+    events: &[openplotva_llm::whitecircle::WhiteCircleCheckEvent],
+) -> String {
+    whitecircle_check_event_insert_builder(events).into_string()
+}
+
+#[cfg(test)]
+fn whitecircle_check_shutdown_batch_sizes_for_test(
+    mut receiver: mpsc::Receiver<openplotva_llm::whitecircle::WhiteCircleCheckEvent>,
+    batch_size: usize,
+) -> Vec<usize> {
+    let batch_size = batch_size.max(1);
+    let mut pending = Vec::with_capacity(batch_size);
+    let mut batch_sizes = Vec::new();
+    loop {
+        drain_whitecircle_check_event_channel(&mut receiver, &mut pending, batch_size);
+        if pending.is_empty() {
+            break;
+        }
+        batch_sizes.push(pending.len());
+        pending.clear();
+    }
+    batch_sizes
 }
 
 fn runtime_safety_check_from_row(
@@ -255,5 +402,54 @@ mod tests {
             runtime_json_from_payload("not-json"),
             Some(json!("not-json"))
         );
+    }
+
+    #[test]
+    fn whitecircle_check_batch_insert_sql_uses_one_multi_row_statement() {
+        let first = whitecircle_event("dialog");
+        let second = whitecircle_event("fallback");
+
+        let sql = super::whitecircle_check_batch_insert_sql_for_test(&[first, second]);
+
+        assert!(sql.starts_with("INSERT INTO whitecircle_checks"));
+        assert!(sql.contains("), ("));
+        assert!(!sql.contains("VALUES (\n    $1,"));
+    }
+
+    #[test]
+    fn whitecircle_check_shutdown_drain_flushes_all_queued_batches() {
+        let (sender, receiver) = tokio::sync::mpsc::channel(8);
+        for index in 0..5 {
+            sender
+                .try_send(whitecircle_event(&format!("dialog-{index}")))
+                .expect("test channel should accept all queued events");
+        }
+        drop(sender);
+
+        let batch_sizes = super::whitecircle_check_shutdown_batch_sizes_for_test(receiver, 2);
+
+        assert_eq!(batch_sizes, vec![2, 2, 1]);
+    }
+
+    fn whitecircle_event(source: &str) -> openplotva_llm::whitecircle::WhiteCircleCheckEvent {
+        openplotva_llm::whitecircle::WhiteCircleCheckEvent {
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+            source: source.to_owned(),
+            mode: None,
+            flow: None,
+            chat_id: None,
+            thread_id: None,
+            message_id: None,
+            user_id: None,
+            deployment_id: "whitecircle".to_owned(),
+            external_session_id: None,
+            request_messages: json!([]),
+            flagged: None,
+            internal_session_id: None,
+            policies: None,
+            response_json: None,
+            duration_ms: 0,
+            error: None,
+        }
     }
 }

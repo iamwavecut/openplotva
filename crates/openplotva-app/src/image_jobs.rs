@@ -142,6 +142,8 @@ impl ImageGenerationResult {
 pub struct ImageEditResult {
     /// URLs produced by a concrete edit provider, if it reports them.
     pub image_urls: Vec<String>,
+    /// Generated image bytes returned by the edit provider.
+    pub image_bytes: Vec<Vec<u8>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -357,6 +359,7 @@ where
         }
         Ok(ImageEditResult {
             image_urls: result.urls,
+            image_bytes: result.images,
         })
     }
 
@@ -1498,12 +1501,25 @@ where
 
     match result {
         Ok(result) => {
+            let image_bytes = result
+                .image_bytes
+                .into_iter()
+                .filter(|image| !image.is_empty())
+                .collect::<Vec<_>>();
             let image_urls = result
                 .image_urls
                 .into_iter()
                 .filter_map(non_empty)
                 .collect::<Vec<_>>();
-            let Some(photo) = image_urls.first().cloned().map(PhotoSource::Url) else {
+            let photo = image_bytes
+                .first()
+                .cloned()
+                .map(|bytes| PhotoSource::Bytes {
+                    file_name: "image.png".to_owned(),
+                    bytes,
+                })
+                .or_else(|| image_urls.first().cloned().map(PhotoSource::Url));
+            let Some(photo) = photo else {
                 return ImageEditJobExecutionReport {
                     outcome: ImageEditJobExecutionOutcome::Failed,
                     prompt: params.prompt,
@@ -3702,6 +3718,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn image_edit_job_delivers_draw_api_image_b64_result() {
+        let image = vec![9_u8, 8, 7];
+        let draw_payload = serde_json::to_vec(&json!({
+            "image_b64": general_purpose::STANDARD.encode(&image)
+        }))
+        .expect("draw payload");
+        let response_body = general_purpose::STANDARD.encode(draw_payload);
+        let transport = AifarmTransportStub::new(vec![
+            Ok(json_response(
+                json!({"job_id": "edit-b64", "state": "queued"}),
+            )),
+            Ok(json_response(json!({
+                "job": {
+                    "job_id": "edit-b64",
+                    "state": "completed",
+                    "result": {
+                        "response": {
+                            "status_code": 200,
+                            "body": response_body
+                        }
+                    }
+                }
+            }))),
+        ]);
+        let editor = AifarmDrawApiImageGenerator::with_transport(
+            AifarmDrawApiConfig {
+                base_url: "https://draw.example.test".to_owned(),
+                timeout: StdDuration::from_secs(5),
+                poll_interval: StdDuration::from_nanos(1),
+            },
+            transport,
+        );
+        let effects = EffectsStub::new(Some(777));
+
+        let report = execute_image_edit_job(
+            &editor,
+            &effects,
+            ImageEditJobParams {
+                chat_id: -100,
+                message_id: 20,
+                user_id: 30,
+                user_full_name: "Alice".to_owned(),
+                prompt: "make it night".to_owned(),
+                photo_urls: vec!["https://telegram.test/original.png".to_owned()],
+                thread_id: Some(9),
+                ..ImageEditJobParams::default()
+            },
+        )
+        .await;
+
+        assert_eq!(report.outcome, ImageEditJobExecutionOutcome::Completed);
+        assert_eq!(report.result_message_id, Some(888));
+        assert_eq!(
+            effects.calls(),
+            vec![
+                "remove_queued:-100:20",
+                "send_drawing:-100:20:30:9",
+                "remove_drawing:-100:777",
+                "send_image:-100:20:9:Bytes { file_name: \"image.png\", bytes: [9, 8, 7] }",
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn resolving_image_editor_turns_telegram_file_data_url_into_draw_api_b64() {
         let draw_payload = serde_json::to_vec(&json!({"image_url": ["https://img.test/edit.png"]}))
             .expect("draw payload");
@@ -4219,7 +4299,10 @@ mod tests {
     impl EditorStub {
         fn success(image_urls: Vec<String>) -> Self {
             Self {
-                result: Ok(ImageEditResult { image_urls }),
+                result: Ok(ImageEditResult {
+                    image_urls,
+                    ..ImageEditResult::default()
+                }),
                 requests: Arc::new(Mutex::new(Vec::new())),
             }
         }
