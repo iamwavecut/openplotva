@@ -1421,6 +1421,24 @@ impl InMemoryTaskQueue {
         Ok(())
     }
 
+    pub fn update_job_result_message(
+        &self,
+        job_id: i64,
+        result_message_id: Option<i32>,
+    ) -> Result<(), TaskQueueError> {
+        let mut state = self.lock();
+        let record = state
+            .records
+            .iter_mut()
+            .find(|record| record.id == job_id)
+            .ok_or(TaskQueueError::JobNotFound(job_id))?;
+        record.result_message_id = result_message_id;
+        let record = record.clone();
+        self.append_wal_record(task_queue_wal_upsert(record));
+        drop(state);
+        Ok(())
+    }
+
     pub fn create_job_message(
         &self,
         params: TaskQueueJobMessageParams,

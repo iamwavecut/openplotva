@@ -1630,12 +1630,7 @@ where
             if let Some(image_url) = execution.image_url {
                 let _ = queue.set_job_image_urls(work.id, vec![image_url]);
             }
-            let _ = queue.update_job_messages(
-                work.id,
-                work.job.progress_message_id,
-                work.job.queue_position_message_id,
-                execution.result_message_id,
-            );
+            let _ = queue.update_job_result_message(work.id, execution.result_message_id);
             finalize_completed(
                 queue,
                 work.id,
@@ -1856,12 +1851,7 @@ where
             if !execution.image_urls.is_empty() {
                 let _ = queue.set_job_image_urls(work.id, execution.image_urls);
             }
-            let _ = queue.update_job_messages(
-                work.id,
-                work.job.progress_message_id,
-                work.job.queue_position_message_id,
-                execution.result_message_id,
-            );
+            let _ = queue.update_job_result_message(work.id, execution.result_message_id);
             finalize_image_edit_completed(
                 queue,
                 work.id,
@@ -2972,7 +2962,7 @@ mod tests {
         );
         let record = &queue.records()[0];
         assert_eq!(record.status, JobStatus::Completed);
-        assert_eq!(record.job.result_message_id, Some(888));
+        assert_eq!(record.result_message_id, Some(888));
         assert_eq!(
             record
                 .job
