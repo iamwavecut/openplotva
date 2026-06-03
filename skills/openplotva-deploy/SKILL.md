@@ -17,6 +17,28 @@ Use this skill when deploying OpenPlotva to `geta.moe` or checking deployment re
 - The production env file is server-local. The deploy script creates `/home/wavecut/openplotva/.env.production` by copying `/home/wavecut/go-plotva/.env` on `geta.moe` if the new file is absent.
 - After successful `first-cutover` or `redeploy`, the workflow deletes GHCR package versions older than 24 hours unless they match the currently deployed image tag.
 
+## Production Config Invariants
+
+Preserve these invariants during incidents and redeploys:
+
+- Dialog primary is AI Farm Discovery, not the external pool:
+  `DIALOG_PROVIDER=aifarm`, `DISCOVERY_BASE_URL=<AI Farm Discovery>`,
+  `DIALOG_DISCOVERY_SERVICE_NAME=llm-openai`.
+- `DIALOG_AIFARM_POOL_BASE_URLS`, `DIALOG_AIFARM_POOL_MODELS`, and
+  `DIALOG_AIFARM_POOL_API_KEY` configure the first overflow fallback pool. They
+  are separate from Discovery and must stay separate.
+- `dialog_aifarm_fallback_jobs` is expected in readiness. It is the GenKit
+  threshold drainer for queue overflow or primary stalls. Do not disable it by
+  setting `PERSISTENT_QUEUE_DIALOG_AIFARM_FALLBACK_WORKERS=0` unless explicitly
+  requested.
+- Do not change high/low fallback watermarks just to silence a symptom; inspect
+  queue diagnostics and job events first.
+- Runtime debug API exposure is controlled by the published compose port. The
+  container listens on `RUNTIME_API_HOST:RUNTIME_API_PORT`; the host bind may be
+  Tailscale-only or public via `OPENPLOTVA_RUNTIME_API_PUBLISH_HOST`.
+- Runtime TLS pins are generated from the live certificate and can change on
+  every container restart.
+
 ## Workflow
 
 Workflow file:
@@ -96,6 +118,26 @@ Check Rust health after cutover:
 
 ```bash
 ssh geta.moe 'curl -fsS http://127.0.0.1:8080/api/health && curl -fsS http://127.0.0.1:8080/api/ready'
+```
+
+Check routing invariants without printing secrets:
+
+```bash
+ssh geta.moe 'docker exec openplotva-openplotva-1 sh -lc '"'"'
+for k in DISCOVERY_BASE_URL DIALOG_PROVIDER DIALOG_DISCOVERY_SERVICE_NAME DIALOG_MODEL \
+  DIALOG_AIFARM_POOL_BASE_URLS DIALOG_AIFARM_POOL_MODELS \
+  PERSISTENT_QUEUE_DIALOG_AIFARM_FALLBACK_WORKERS RUNTIME_API_HOST RUNTIME_API_PORT; do
+  eval v="${'"'"'$k'"'"'-}"
+  case "$k" in
+    DISCOVERY_BASE_URL|DIALOG_AIFARM_POOL_BASE_URLS|DIALOG_AIFARM_POOL_MODELS)
+      printf "%s=<configured>\n" "$k"
+      ;;
+    *)
+      printf "%s=%s\n" "$k" "$v"
+      ;;
+  esac
+done
+'"'"''
 ```
 
 Check logs without exposing env:

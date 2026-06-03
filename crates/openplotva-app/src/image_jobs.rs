@@ -27,8 +27,9 @@ use openplotva_taskman::{
     image_gen_job_params_from_stateless_job,
 };
 use openplotva_telegram::{
-    ChatRef, DeleteMessageRequest, ReplyMessageRef, StickerMessageRequest, TelegramOutboundMethod,
-    TelegramOutboundResponse, TextMessageRequest, build_delete_message_method,
+    ChatRef, DeleteMessageRequest, PhotoMessageRequest, PhotoSource, ReplyMessageRef,
+    ReplyParametersPlan, StickerMessageRequest, TelegramOutboundMethod, TelegramOutboundResponse,
+    TextMessageRequest, build_delete_message_method, build_photo_message_method,
     build_sticker_message_method, build_text_message_methods, execute_telegram_method,
 };
 use serde::Serialize;
@@ -881,6 +882,15 @@ pub trait ImageJobEffects {
         user_id: i64,
         thread_id: Option<i32>,
     ) -> ImageJobEffectFuture<'a, ()>;
+
+    /// Send a generated image and return the Telegram result message ID.
+    fn send_generated_image<'a>(
+        &'a self,
+        chat_id: i64,
+        message_id: i32,
+        thread_id: Option<i32>,
+        photo: PhotoSource,
+    ) -> ImageJobEffectFuture<'a, Result<i32, String>>;
 }
 
 /// Concrete image-job sticker effects over Redis and Telegram.
@@ -1001,6 +1011,25 @@ where
             }
         })
     }
+
+    fn send_generated_image<'a>(
+        &'a self,
+        chat_id: i64,
+        message_id: i32,
+        thread_id: Option<i32>,
+        photo: PhotoSource,
+    ) -> ImageJobEffectFuture<'a, Result<i32, String>> {
+        Box::pin(async move {
+            let request = generated_image_message_request(chat_id, message_id, thread_id, photo);
+            let method = build_photo_message_method(&request).map_err(|error| error.to_string())?;
+            let response = self
+                .telegram
+                .send_image_job_method(TelegramOutboundMethod::from(method))
+                .await?;
+            image_job_response_message_id(&response)
+                .ok_or_else(|| "sendPhoto returned non-message response".to_owned())
+        })
+    }
 }
 
 impl<Queued, Ephemeral, Sender> TelegramImageJobEffects<Queued, Ephemeral, Sender>
@@ -1050,6 +1079,33 @@ fn nsfw_blocked_message_request(
     )
 }
 
+fn generated_image_message_request(
+    chat_id: i64,
+    message_id: i32,
+    thread_id: Option<i32>,
+    photo: PhotoSource,
+) -> PhotoMessageRequest {
+    let message_thread_id = i64::from(thread_id.unwrap_or_default());
+    let is_topic_message = message_thread_id != 0;
+    PhotoMessageRequest {
+        chat: ChatRef {
+            id: chat_id,
+            is_forum: is_topic_message,
+        },
+        message_thread_id,
+        disable_notification: false,
+        photo,
+        caption: String::new(),
+        render_as: String::new(),
+        has_spoiler: false,
+        reply_parameters: Some(ReplyParametersPlan {
+            message_id: i64::from(message_id),
+            chat_id,
+            allow_sending_without_reply: true,
+        }),
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ImageGenJobExecutionOutcome {
     Completed,
@@ -1068,6 +1124,8 @@ pub struct ImageGenJobExecutionReport {
     pub caption_text: String,
     /// Generated image URL when present.
     pub image_url: Option<String>,
+    /// Telegram message ID of the delivered image.
+    pub result_message_id: Option<i32>,
     /// Failure text when the job should fail.
     pub error: Option<String>,
 }
@@ -1088,6 +1146,8 @@ pub struct ImageEditJobExecutionReport {
     pub prompt: String,
     /// Image URLs produced by the edit provider, if present.
     pub image_urls: Vec<String>,
+    /// Telegram message ID of the delivered image.
+    pub result_message_id: Option<i32>,
     /// Failure text when the job should fail.
     pub error: Option<String>,
 }
@@ -1327,13 +1387,40 @@ where
     }
 
     match result {
-        Ok(result) => ImageGenJobExecutionReport {
-            outcome: ImageGenJobExecutionOutcome::Completed,
-            prompt,
-            caption_text,
-            image_url: result.first_image_url(),
-            error: None,
-        },
+        Ok(result) => {
+            let image_url = result.first_image_url();
+            let Some(photo) = image_generation_photo_source(&result) else {
+                return ImageGenJobExecutionReport {
+                    outcome: ImageGenJobExecutionOutcome::Failed,
+                    prompt,
+                    caption_text,
+                    image_url: None,
+                    result_message_id: None,
+                    error: Some("image generation produced no image".to_owned()),
+                };
+            };
+            match effects
+                .send_generated_image(params.chat_id, params.message_id, params.thread_id, photo)
+                .await
+            {
+                Ok(result_message_id) => ImageGenJobExecutionReport {
+                    outcome: ImageGenJobExecutionOutcome::Completed,
+                    prompt,
+                    caption_text,
+                    image_url,
+                    result_message_id: Some(result_message_id),
+                    error: None,
+                },
+                Err(error) => ImageGenJobExecutionReport {
+                    outcome: ImageGenJobExecutionOutcome::Failed,
+                    prompt,
+                    caption_text,
+                    image_url,
+                    result_message_id: None,
+                    error: Some(format!("send generated image: {error}")),
+                },
+            }
+        }
         Err(ImageGenerationError::Forbidden) => {
             effects
                 .send_nsfw_blocked_message(
@@ -1348,6 +1435,7 @@ where
                 prompt,
                 caption_text,
                 image_url: None,
+                result_message_id: None,
                 error: None,
             }
         }
@@ -1356,6 +1444,7 @@ where
             prompt,
             caption_text,
             image_url: None,
+            result_message_id: None,
             error: Some(error.message()),
         },
     }
@@ -1408,16 +1497,41 @@ where
     }
 
     match result {
-        Ok(result) => ImageEditJobExecutionReport {
-            outcome: ImageEditJobExecutionOutcome::Completed,
-            prompt: params.prompt,
-            image_urls: result
+        Ok(result) => {
+            let image_urls = result
                 .image_urls
                 .into_iter()
                 .filter_map(non_empty)
-                .collect(),
-            error: None,
-        },
+                .collect::<Vec<_>>();
+            let Some(photo) = image_urls.first().cloned().map(PhotoSource::Url) else {
+                return ImageEditJobExecutionReport {
+                    outcome: ImageEditJobExecutionOutcome::Failed,
+                    prompt: params.prompt,
+                    image_urls,
+                    result_message_id: None,
+                    error: Some("image edit produced no image".to_owned()),
+                };
+            };
+            match effects
+                .send_generated_image(params.chat_id, params.message_id, params.thread_id, photo)
+                .await
+            {
+                Ok(result_message_id) => ImageEditJobExecutionReport {
+                    outcome: ImageEditJobExecutionOutcome::Completed,
+                    prompt: params.prompt,
+                    image_urls,
+                    result_message_id: Some(result_message_id),
+                    error: None,
+                },
+                Err(error) => ImageEditJobExecutionReport {
+                    outcome: ImageEditJobExecutionOutcome::Failed,
+                    prompt: params.prompt,
+                    image_urls,
+                    result_message_id: None,
+                    error: Some(format!("send generated image: {error}")),
+                },
+            }
+        }
         Err(ImageEditError::Forbidden) => {
             effects
                 .send_nsfw_blocked_message(
@@ -1431,6 +1545,7 @@ where
                 outcome: ImageEditJobExecutionOutcome::SafetyBlocked,
                 prompt: params.prompt,
                 image_urls: Vec::new(),
+                result_message_id: None,
                 error: None,
             }
         }
@@ -1438,6 +1553,7 @@ where
             outcome: ImageEditJobExecutionOutcome::Failed,
             prompt: params.prompt,
             image_urls: Vec::new(),
+            result_message_id: None,
             error: Some(error.message()),
         },
     }
@@ -1514,6 +1630,12 @@ where
             if let Some(image_url) = execution.image_url {
                 let _ = queue.set_job_image_urls(work.id, vec![image_url]);
             }
+            let _ = queue.update_job_messages(
+                work.id,
+                work.job.progress_message_id,
+                work.job.queue_position_message_id,
+                execution.result_message_id,
+            );
             finalize_completed(
                 queue,
                 work.id,
@@ -1734,6 +1856,12 @@ where
             if !execution.image_urls.is_empty() {
                 let _ = queue.set_job_image_urls(work.id, execution.image_urls);
             }
+            let _ = queue.update_job_messages(
+                work.id,
+                work.job.progress_message_id,
+                work.job.queue_position_message_id,
+                execution.result_message_id,
+            );
             finalize_image_edit_completed(
                 queue,
                 work.id,
@@ -2307,6 +2435,19 @@ fn starts_http_url(value: &str) -> bool {
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
 }
 
+fn image_generation_photo_source(result: &ImageGenerationResult) -> Option<PhotoSource> {
+    result
+        .image_bytes
+        .iter()
+        .find(|image| !image.is_empty())
+        .cloned()
+        .map(|bytes| PhotoSource::Bytes {
+            file_name: "image.png".to_owned(),
+            bytes,
+        })
+        .or_else(|| result.first_image_url().map(PhotoSource::Url))
+}
+
 fn one_or_many_strings<'a>(values: &[&'a str]) -> Option<OneOrManyStrings<'a>> {
     match values {
         [] => None,
@@ -2544,6 +2685,7 @@ mod tests {
         assert_eq!(report.prompt, "neon castle");
         assert_eq!(report.caption_text, "original caption");
         assert_eq!(report.image_url.as_deref(), Some("https://img.test/1.png"));
+        assert_eq!(report.result_message_id, Some(888));
         assert_eq!(
             generator.requests(),
             vec![ImageGenerationRequest {
@@ -2567,6 +2709,7 @@ mod tests {
                 "remove_queued:-100:20",
                 "send_drawing:-100:20:30:9",
                 "remove_drawing:-100:777",
+                "send_image:-100:20:9:Url(\"https://img.test/1.png\")",
             ]
         );
     }
@@ -2631,6 +2774,7 @@ mod tests {
 
         assert_eq!(report.outcome, ImageEditJobExecutionOutcome::Completed);
         assert_eq!(report.prompt, "make it night");
+        assert_eq!(report.result_message_id, Some(888));
         assert_eq!(
             report.image_urls,
             vec![
@@ -2657,6 +2801,7 @@ mod tests {
                 "remove_queued:-100:20",
                 "send_drawing:-100:20:30:9",
                 "remove_drawing:-100:777",
+                "send_image:-100:20:9:Url(\"https://img.test/edit-1.png\")",
             ]
         );
     }
@@ -2827,6 +2972,7 @@ mod tests {
         );
         let record = &queue.records()[0];
         assert_eq!(record.status, JobStatus::Completed);
+        assert_eq!(record.job.result_message_id, Some(888));
         assert_eq!(
             record
                 .job
@@ -4261,6 +4407,20 @@ mod tests {
             self.call_log()
                 .push(format!("remove_drawing:{chat_id}:{sticker_message_id}"));
             Box::pin(async {})
+        }
+
+        fn send_generated_image<'a>(
+            &'a self,
+            chat_id: i64,
+            message_id: i32,
+            thread_id: Option<i32>,
+            photo: PhotoSource,
+        ) -> ImageJobEffectFuture<'a, Result<i32, String>> {
+            self.call_log().push(format!(
+                "send_image:{chat_id}:{message_id}:{}:{photo:?}",
+                thread_id.unwrap_or_default()
+            ));
+            Box::pin(async { Ok(888) })
         }
 
         fn send_nsfw_blocked_message<'a>(
