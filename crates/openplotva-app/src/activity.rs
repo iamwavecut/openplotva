@@ -181,23 +181,43 @@ impl<Writer> BufferedMessageActivityStore<Writer> {
         if member_last_messages.is_empty() && active_users.is_empty() {
             return Ok(());
         }
-        if !member_last_messages.is_empty() {
-            if let Err(error) = self
-                .writer
-                .flush_member_last_messages(&member_last_messages)
-                .await
-            {
-                self.requeue_pending(member_last_messages, active_users);
-                return Err(error);
-            }
+        if let Err(error) = self.flush_member_last_messages(&member_last_messages).await {
+            self.requeue_pending(member_last_messages, active_users);
+            return Err(error);
         }
-        if !active_users.is_empty() {
-            if let Err(error) = self.writer.flush_chat_active_users(&active_users).await {
-                self.requeue_pending(Vec::new(), active_users);
-                return Err(error);
-            }
+        if let Err(error) = self.flush_chat_active_users(&active_users).await {
+            self.requeue_pending(Vec::new(), active_users);
+            return Err(error);
         }
         Ok(())
+    }
+
+    async fn flush_member_last_messages(
+        &self,
+        member_last_messages: &[MessageActivityKey],
+    ) -> Result<(), Writer::Error>
+    where
+        Writer: MessageActivityBatchWriter,
+    {
+        if member_last_messages.is_empty() {
+            return Ok(());
+        }
+        self.writer
+            .flush_member_last_messages(member_last_messages)
+            .await
+    }
+
+    async fn flush_chat_active_users(
+        &self,
+        active_users: &[MessageActivityKey],
+    ) -> Result<(), Writer::Error>
+    where
+        Writer: MessageActivityBatchWriter,
+    {
+        if active_users.is_empty() {
+            return Ok(());
+        }
+        self.writer.flush_chat_active_users(active_users).await
     }
 
     fn enqueue_member_last_message(&self, key: MessageActivityKey) {
