@@ -1381,6 +1381,7 @@ pub fn default_payment_control_job_snapshot_path() -> PathBuf {
 pub struct PaymentControlJobSnapshotFileStore {
     path: PathBuf,
     wal_path: PathBuf,
+    lock: Arc<Mutex<()>>,
 }
 
 /// Error returned by the payment control-job snapshot file store.
@@ -1524,7 +1525,11 @@ impl PaymentControlJobSnapshotFileStore {
     pub fn new(path: impl Into<PathBuf>) -> Self {
         let path = path.into();
         let wal_path = payment_control_job_wal_path(&path);
-        Self { path, wal_path }
+        Self {
+            path,
+            wal_path,
+            lock: Arc::new(Mutex::new(())),
+        }
     }
 
     /// Return the configured snapshot file path.
@@ -1546,6 +1551,7 @@ impl PaymentControlJobSnapshotFileStore {
         Option<InMemoryPaymentControlJobQueueSnapshot>,
         PaymentControlJobSnapshotFileStoreError,
     > {
+        let _guard = self.file_lock();
         let snapshot = match fs::read(&self.path) {
             Ok(bytes) => decode_payment_control_job_queue_snapshot(&bytes)
                 .map(Some)
@@ -1570,13 +1576,27 @@ impl PaymentControlJobSnapshotFileStore {
         &self,
         snapshot: &InMemoryPaymentControlJobQueueSnapshot,
     ) -> Result<(), PaymentControlJobSnapshotFileStoreError> {
+        let _guard = self.file_lock();
+        self.save_snapshot_locked(snapshot)
+    }
+
+    fn file_lock(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn save_snapshot_locked(
+        &self,
+        snapshot: &InMemoryPaymentControlJobQueueSnapshot,
+    ) -> Result<(), PaymentControlJobSnapshotFileStoreError> {
         let bytes = encode_payment_control_job_queue_snapshot(snapshot).map_err(|source| {
             PaymentControlJobSnapshotFileStoreError::Encode {
                 path: self.path.clone(),
                 source,
             }
         })?;
-        self.append_wal_snapshot(snapshot)?;
+        self.append_wal_snapshot_locked(snapshot)?;
         if let Some(parent) = self
             .path
             .parent()
@@ -1617,7 +1637,7 @@ impl PaymentControlJobSnapshotFileStore {
                 source,
             }
         })?;
-        self.rotate_wal_after_snapshot()
+        self.rotate_wal_after_snapshot_locked()
     }
 
     fn load_wal_snapshot(
@@ -1660,7 +1680,16 @@ impl PaymentControlJobSnapshotFileStore {
         Ok(latest)
     }
 
+    #[cfg(test)]
     fn append_wal_snapshot(
+        &self,
+        snapshot: &InMemoryPaymentControlJobQueueSnapshot,
+    ) -> Result<(), PaymentControlJobSnapshotFileStoreError> {
+        let _guard = self.file_lock();
+        self.append_wal_snapshot_locked(snapshot)
+    }
+
+    fn append_wal_snapshot_locked(
         &self,
         snapshot: &InMemoryPaymentControlJobQueueSnapshot,
     ) -> Result<(), PaymentControlJobSnapshotFileStoreError> {
@@ -1710,7 +1739,9 @@ impl PaymentControlJobSnapshotFileStore {
             })
     }
 
-    fn rotate_wal_after_snapshot(&self) -> Result<(), PaymentControlJobSnapshotFileStoreError> {
+    fn rotate_wal_after_snapshot_locked(
+        &self,
+    ) -> Result<(), PaymentControlJobSnapshotFileStoreError> {
         match fs::metadata(&self.wal_path) {
             Ok(metadata) if metadata.len() > 0 => {
                 let archive_path = payment_control_job_wal_archive_path(&self.wal_path);
