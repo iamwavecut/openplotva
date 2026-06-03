@@ -5179,8 +5179,6 @@ pub enum StorageError {
         #[from]
         source: MigrateError,
     },
-    #[error("missing migration bridge id for SQLx migration version {version}")]
-    MissingLegacyMigrationId { version: i64 },
     #[error("unknown existing migration ids: {ids:?}")]
     UnknownLegacyMigrations { ids: Vec<String> },
     /// Rate-limit expiry JSON codec failed.
@@ -6104,20 +6102,16 @@ fn redis_ttl_seconds(ttl: Duration) -> u64 {
     seconds
 }
 
-fn legacy_migration_bridge_entries()
--> Result<Vec<LegacyMigrationBridgeEntry<'static>>, StorageError> {
+fn legacy_migration_bridge_entries() -> Vec<LegacyMigrationBridgeEntry<'static>> {
     MIGRATOR
         .iter()
         .filter(|migration| migration.migration_type.is_up_migration())
-        .map(|migration| {
-            let legacy_id = legacy_migration_id_for_version(migration.version).ok_or(
-                StorageError::MissingLegacyMigrationId {
-                    version: migration.version,
-                },
-            )?;
-            Ok(LegacyMigrationBridgeEntry {
-                legacy_id,
-                migration,
+        .filter_map(|migration| {
+            legacy_migration_id_for_version(migration.version).map(|legacy_id| {
+                LegacyMigrationBridgeEntry {
+                    legacy_id,
+                    migration,
+                }
             })
         })
         .collect()
@@ -6228,7 +6222,7 @@ pub async fn bridge_existing_migration_history(pool: &PgPool) -> Result<usize, S
         return Ok(0);
     }
 
-    let bridge_entries = legacy_migration_bridge_entries()?;
+    let bridge_entries = legacy_migration_bridge_entries();
     let known_legacy_ids = bridge_entries
         .iter()
         .map(|entry| entry.legacy_id)
