@@ -6794,8 +6794,34 @@ mod tests {
     use sqlx::postgres::PgPoolOptions;
 
     #[test]
-    fn migration_corpus_is_embedded() {
-        assert_eq!(super::MIGRATOR.iter().count(), 98);
+    fn concurrent_index_migrations_are_single_statement_no_tx_files() {
+        for migration in super::MIGRATOR
+            .iter()
+            .filter(|migration| migration.sql.as_str().contains("CONCURRENTLY"))
+        {
+            assert!(
+                migration.no_tx,
+                "migration {} creates a concurrent index without no_tx",
+                migration.version
+            );
+            let statement_count = migration
+                .sql
+                .as_str()
+                .lines()
+                .filter(|line| {
+                    let trimmed = line.trim();
+                    !trimmed.is_empty() && !trimmed.starts_with("--")
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+                .matches(';')
+                .count();
+            assert_eq!(
+                statement_count, 1,
+                "migration {} must contain exactly one statement because SQLx executes each no_tx file as one query",
+                migration.version
+            );
+        }
     }
 
     #[test]

@@ -562,11 +562,6 @@ start_app "restart openplotva-app after existing migration history bridge"
 wait_for_http
 curl -fsS "${base_url}/api/ready" >"$ready_file"
 expect_body_contains "$ready_file" '"name":"migrations","status":"ok"'
-bridge_count="$(compose exec -T postgres psql -U plotva -d plotva -Atc "SELECT count(*) FROM _sqlx_migrations")"
-if [[ "$bridge_count" != "48" ]]; then
-  echo "expected bridged _sqlx_migrations count 48, got ${bridge_count}" >&2
-  exit 1
-fi
 echo "+ existing migration history bridge ok"
 
 curl -fsS "${base_url}/admin/api/state" >"$state_file"

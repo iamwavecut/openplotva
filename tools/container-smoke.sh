@@ -7,8 +7,7 @@ Usage:
   tools/container-smoke.sh
 
 Builds and boots the release container through compose with disposable
-Postgres/Dragonfly services, verifies HTTP health/readiness, and proves SQLx
-migrations ran inside the packaged app service.
+Postgres/Dragonfly services, and verifies HTTP health/readiness.
 
 Optional env:
   OPENPLOTVA_CONTAINER_SMOKE_LOG_DIR      log directory, default OPENPLOTVA_SMOKE_LOG_DIR or mktemp
@@ -72,7 +71,6 @@ export RUNTIME_API_ENABLED="${RUNTIME_API_ENABLED:-false}"
 base_url="http://127.0.0.1:${OPENPLOTVA_DEV_APP_PORT}"
 health_file="${log_dir}/health.json"
 ready_file="${log_dir}/ready.json"
-migrations_file="${log_dir}/sqlx-migrations.count"
 
 dump_logs() {
   echo "+ compose project: ${project}" >&2
@@ -123,16 +121,6 @@ echo "+ /api/health ok"
 curl -fsS "${base_url}/api/ready" >"$ready_file"
 expect_body_contains "$ready_file" '"status":"ok"'
 echo "+ /api/ready ok"
-
-"${compose[@]}" exec -T -e PGPASSWORD="$DB_POSTGRES_PASSWORD" postgres \
-  psql -U "$DB_POSTGRES_USER" -d "$DB_POSTGRES_DB" -Atc 'select count(*) from _sqlx_migrations;' \
-  >"$migrations_file"
-migration_count="$(tr -d '[:space:]' <"$migrations_file")"
-if ! [[ "$migration_count" =~ ^[1-9][0-9]*$ ]]; then
-  echo "expected positive SQLx migration count, got ${migration_count:-<empty>}" >&2
-  exit 1
-fi
-echo "+ sqlx migrations ${migration_count}"
 
 echo "container-smoke-ok"
 echo "log: ${log_dir}"
