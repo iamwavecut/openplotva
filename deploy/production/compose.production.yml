@@ -8,9 +8,9 @@ services:
       WEBAPP_PORT: 8080
       DB_POSTGRES_HOST: postgresql
       DB_POSTGRES_PORT: 5432
-      DB_POSTGRES_USER: plotva
-      DB_POSTGRES_PASSWORD: plotva
-      DB_POSTGRES_DB: plotva
+      DB_POSTGRES_USER: ${DB_POSTGRES_USER:-plotva}
+      DB_POSTGRES_PASSWORD: ${DB_POSTGRES_PASSWORD:?DB_POSTGRES_PASSWORD is required}
+      DB_POSTGRES_DB: ${DB_POSTGRES_DB:-plotva}
       DB_POSTGRES_SSL_MODE: disable
       REDIS_HOST: dragonfly
       REDIS_PORT: 6379
@@ -29,9 +29,17 @@ services:
       - "${OPENPLOTVA_RUNTIME_API_PUBLISH_HOST:-100.77.77.51}:9091:9091"
     volumes:
       - openplotva-state:/home/openplotva/.plotva
+    depends_on:
+      postgresql:
+        condition: service_healthy
+      dragonfly:
+        condition: service_healthy
+      embedder:
+        condition: service_healthy
+      token-estimator:
+        condition: service_healthy
     networks:
       - plotva-net
-      - search-subnet
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/api/health"]
@@ -45,12 +53,128 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  postgresql:
+    image: pgvector/pgvector:pg17-trixie
+    environment:
+      POSTGRES_USER: ${DB_POSTGRES_USER:-plotva}
+      POSTGRES_PASSWORD: ${DB_POSTGRES_PASSWORD:?DB_POSTGRES_PASSWORD is required}
+      POSTGRES_DB: ${DB_POSTGRES_DB:-plotva}
+    command:
+      - postgres
+      - -c
+      - shared_preload_libraries=pg_stat_statements,auto_explain
+      - -c
+      - pg_stat_statements.max=10000
+      - -c
+      - pg_stat_statements.track=top
+      - -c
+      - pg_stat_statements.track_utility=off
+      - -c
+      - pg_stat_statements.save=on
+      - -c
+      - track_io_timing=on
+      - -c
+      - compute_query_id=auto
+      - -c
+      - auto_explain.log_min_duration=50ms
+      - -c
+      - auto_explain.log_analyze=on
+      - -c
+      - auto_explain.log_buffers=on
+      - -c
+      - auto_explain.log_nested_statements=on
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - plotva-net
+    logging:
+      driver: none
+
+  dragonfly:
+    image: docker.dragonflydb.io/dragonflydb/dragonfly
+    ulimits:
+      memlock: -1
+    volumes:
+      - dragonfly-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-h", "localhost", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - plotva-net
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  embedder:
+    build:
+      context: ./tools/embedder
+    environment:
+      EMBEDDER_MODEL: jinaai/jina-embeddings-v5-text-nano
+      EMBEDDER_DIMENSION: 512
+      EMBEDDER_DEVICE: cpu
+      EMBEDDER_BACKEND: auto
+      EMBEDDER_TASK: retrieval
+    volumes:
+      - embedder-cache:/models
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:12500/health', timeout=5).read()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    restart: unless-stopped
+    networks:
+      - plotva-net
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  token-estimator:
+    build:
+      context: ./tools/token-estimator
+    env_file:
+      - .env.production
+    environment:
+      TOKEN_ESTIMATOR_MODEL: google/gemma-4-26B-A4B-it
+      TOKEN_ESTIMATOR_MAX_TEXT_CHARS: 1000000
+    volumes:
+      - token-estimator-cache:/models
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:12600/health', timeout=5).read()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    restart: unless-stopped
+    networks:
+      - plotva-net
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
+
 networks:
   plotva-net:
-    external: true
-    name: go-plotva_plotva-net
-  search-subnet:
-    external: true
+    driver: bridge
 
 volumes:
   openplotva-state:
+  postgres-data:
+  dragonfly-data:
+  embedder-cache:
+  token-estimator-cache:

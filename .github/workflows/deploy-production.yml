@@ -2,62 +2,39 @@ name: Production Deploy
 
 on:
   workflow_dispatch:
-    inputs:
-      ref:
-        description: Git ref to deploy
-        required: true
-        default: main
-      operation:
-        description: Deployment operation
-        required: true
-        type: choice
-        default: prepare
-        options:
-          - prepare
-          - first-cutover
-          - redeploy
-      confirm:
-        description: Required for first-cutover/redeploy. Must be geta.moe/openplotva
-        required: false
-        default: ""
 
 env:
   RUST_VERSION: "1.95.0"
   GETA_SSH_TARGET: wavecut@geta.moe
   GETA_DEPLOY_ROOT: /home/wavecut/openplotva
 
-permissions:
-  contents: read
-  packages: write
+permissions: {}
 
 jobs:
-  build-and-deploy:
-    name: Build image and deploy
+  authorize:
+    name: Authorize deployment operator
     runs-on: ubuntu-latest
+    permissions: {}
     steps:
-      - name: Validate dispatch inputs
+      - name: Require repository owner
         shell: bash
         run: |
           set -euo pipefail
-          case "${{ inputs.operation }}" in
-            prepare)
-              ;;
-            first-cutover|redeploy)
-              if [[ "${{ inputs.confirm }}" != "geta.moe/openplotva" ]]; then
-                echo "first-cutover/redeploy require confirm=geta.moe/openplotva" >&2
-                exit 1
-              fi
-              ;;
-            *)
-              echo "Unsupported operation: ${{ inputs.operation }}" >&2
-              exit 1
-              ;;
-          esac
+          if [[ "${{ github.actor }}" != "iamwavecut" || "${{ github.triggering_actor }}" != "iamwavecut" ]]; then
+            echo "Production deploy can only be started or re-run by iamwavecut" >&2
+            exit 1
+          fi
 
+  build-and-deploy:
+    name: Build image and deploy
+    needs: authorize
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
       - name: Checkout
         uses: actions/checkout@v5
-        with:
-          ref: ${{ inputs.ref }}
 
       - name: Cache Rust toolchain
         uses: actions/cache@v4
@@ -130,30 +107,29 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          ssh "$GETA_SSH_TARGET" "install -d -m 755 '$GETA_DEPLOY_ROOT' '$GETA_DEPLOY_ROOT/backups'"
+          ssh "$GETA_SSH_TARGET" "install -d -m 755 '$GETA_DEPLOY_ROOT' '$GETA_DEPLOY_ROOT/tools/embedder' '$GETA_DEPLOY_ROOT/tools/token-estimator'"
           scp deploy/production/compose.production.yml "$GETA_SSH_TARGET:$GETA_DEPLOY_ROOT/compose.production.yml"
           scp deploy/production/deploy-production.sh "$GETA_SSH_TARGET:$GETA_DEPLOY_ROOT/deploy-production.sh"
+          tar -C tools/embedder -czf - . | ssh "$GETA_SSH_TARGET" "tar -xzf - -C '$GETA_DEPLOY_ROOT/tools/embedder'"
+          tar -C tools/token-estimator -czf - . | ssh "$GETA_SSH_TARGET" "tar -xzf - -C '$GETA_DEPLOY_ROOT/tools/token-estimator'"
           ssh "$GETA_SSH_TARGET" "chmod 755 '$GETA_DEPLOY_ROOT/deploy-production.sh'"
 
-      - name: Run production deploy operation
+      - name: Apply production deployment
         shell: bash
         env:
           GHCR_PULL_TOKEN: ${{ secrets.GHCR_PULL_TOKEN }}
-          DEPLOY_OPERATION: ${{ inputs.operation }}
-          DEPLOY_CONFIRM: ${{ inputs.confirm }}
+          OPENPLOTVA_PRODUCTION_ENV_B64: ${{ secrets.OPENPLOTVA_PRODUCTION_ENV_B64 }}
         run: |
           set -euo pipefail
           test -n "$GHCR_PULL_TOKEN"
           printf -v image_q '%q' "$OPENPLOTVA_IMAGE"
-          printf -v op_q '%q' "$DEPLOY_OPERATION"
-          printf -v confirm_q '%q' "$DEPLOY_CONFIRM"
           printf -v token_q '%q' "$GHCR_PULL_TOKEN"
           printf -v actor_q '%q' "$GITHUB_ACTOR"
+          printf -v env_q '%q' "${OPENPLOTVA_PRODUCTION_ENV_B64:-}"
           ssh "$GETA_SSH_TARGET" \
-            "OPENPLOTVA_DEPLOY_IMAGE=$image_q OPENPLOTVA_DEPLOY_OPERATION=$op_q OPENPLOTVA_DEPLOY_CONFIRM=$confirm_q GHCR_USERNAME=$actor_q GHCR_PULL_TOKEN=$token_q '$GETA_DEPLOY_ROOT/deploy-production.sh'"
+            "OPENPLOTVA_DEPLOY_IMAGE=$image_q GHCR_USERNAME=$actor_q GHCR_PULL_TOKEN=$token_q OPENPLOTVA_PRODUCTION_ENV_B64=$env_q '$GETA_DEPLOY_ROOT/deploy-production.sh'"
 
       - name: Cleanup old GHCR images
-        if: ${{ inputs.operation != 'prepare' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}

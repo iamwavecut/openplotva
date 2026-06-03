@@ -2225,14 +2225,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "openplotva-tool-embedder"
-version = "0.1.0"
-
-[[package]]
-name = "openplotva-tool-token-estimator"
-version = "0.1.0"
-
-[[package]]
 name = "openplotva-updates"
 version = "0.1.0"
 dependencies = [
