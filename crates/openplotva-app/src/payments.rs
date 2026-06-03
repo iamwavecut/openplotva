@@ -3448,16 +3448,12 @@ fn vip_cancellation_callback_action(query: &TelegramCallbackQuery) -> Option<&st
     else {
         return None;
     };
-    matches!(
-        action.as_str(),
-        "cancel_vip" | "confirm_cancel_vip" | "back_to_vip_status"
-    )
-    .then_some(match action.as_str() {
-        "cancel_vip" => "cancel_vip",
-        "confirm_cancel_vip" => "confirm_cancel_vip",
-        "back_to_vip_status" => "back_to_vip_status",
-        _ => unreachable!(),
-    })
+    match action.as_str() {
+        "cancel_vip" => Some("cancel_vip"),
+        "confirm_cancel_vip" => Some("confirm_cancel_vip"),
+        "back_to_vip_status" => Some("back_to_vip_status"),
+        _ => None,
+    }
 }
 
 fn vip_cancel_status_keyboard() -> openplotva_telegram::InlineKeyboardMarkup {
@@ -8731,6 +8727,37 @@ mod tests {
             json!("{\"action\":\"back_to_vip_status\"}")
         );
         assert!(methods[1].1.get("text").is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unknown_vip_callback_action_delegates_without_panic() -> Result<(), Box<dyn Error>> {
+        let now = time::Date::from_calendar_date(2026, time::Month::June, 16)?
+            .with_hms(9, 30, 0)?
+            .assume_utc();
+        let store = VipStatusStoreStub::new();
+        let effects = EffectsStub::default();
+        let delegated = Arc::new(AtomicU64::new(0));
+        let delegated_ref = Arc::clone(&delegated);
+
+        let outcome = handle_vip_cancellation_callback_update_or_else_at(
+            &store,
+            &effects,
+            sample_vip_callback_update("unknown_vip_action", 42)?,
+            now,
+            move |_update| {
+                let delegated_ref = Arc::clone(&delegated_ref);
+                async move {
+                    delegated_ref.fetch_add(1, Ordering::SeqCst);
+                    Ok::<(), std::io::Error>(())
+                }
+            },
+        )
+        .await?;
+
+        assert_eq!(outcome, VipCancellationCallbackOutcome::Delegated);
+        assert_eq!(delegated.load(Ordering::SeqCst), 1);
+        assert!(effects.vip_callback_methods().is_empty());
         Ok(())
     }
 
