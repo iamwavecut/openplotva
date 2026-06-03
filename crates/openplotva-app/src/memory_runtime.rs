@@ -35,7 +35,8 @@ use crate::media::aifarm_pool_config_from_app_config;
 use crate::runtime_gemini_cache::resolve_google_ai_key;
 
 pub const EMBEDDER_DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
-pub const MEMORY_RETRIEVAL_EMBEDDING_TIMEOUT: Duration = Duration::from_secs(2);
+pub const MEMORY_RETRIEVAL_EMBEDDING_TIMEOUT: Duration = Duration::from_secs(15);
+pub const MEMORY_RETRIEVAL_EMBEDDING_MAX_RETRIES: usize = 1;
 pub const EMBEDDER_DEFAULT_RETRY_DELAY: Duration = Duration::from_secs(1);
 pub const EMBEDDER_DEFAULT_MAX_RETRIES: usize = 3;
 pub const EMBEDDER_USER_AGENT: &str = "plotva-embedder-client/1.0";
@@ -2411,8 +2412,8 @@ pub fn memory_retrieval_embedder_from_config(
     http_embedder_from_url(
         &config.embedder_url,
         MEMORY_RETRIEVAL_EMBEDDING_TIMEOUT,
-        0,
-        MEMORY_RETRIEVAL_EMBEDDING_TIMEOUT,
+        MEMORY_RETRIEVAL_EMBEDDING_MAX_RETRIES,
+        EMBEDDER_DEFAULT_RETRY_DELAY,
     )
 }
 
@@ -3580,7 +3581,10 @@ mod tests {
             memory_client.config().timeout,
             MEMORY_RETRIEVAL_EMBEDDING_TIMEOUT
         );
-        assert_eq!(memory_client.config().max_retries, 0);
+        assert_eq!(
+            memory_client.config().max_retries,
+            MEMORY_RETRIEVAL_EMBEDDING_MAX_RETRIES
+        );
     }
 
     #[test]

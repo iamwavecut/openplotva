@@ -74,6 +74,9 @@ pub trait ChatMemberStateStore {
         &'a self,
         member: ChatMemberUpsert,
     ) -> MemberStoreFuture<'a, (), Self::Error>;
+
+    /// Persist the Telegram user row needed by chat-member foreign keys.
+    fn upsert_user_state<'a>(&'a self, user: UserState) -> MemberStoreFuture<'a, (), Self::Error>;
 }
 
 impl LeftChatMemberStore for openplotva_storage::PostgresChatMemberStore {
@@ -112,6 +115,10 @@ impl ChatMemberStateStore for openplotva_storage::PostgresChatMemberStore {
         member: ChatMemberUpsert,
     ) -> MemberStoreFuture<'a, (), Self::Error> {
         Box::pin(async move { self.upsert_chat_member(&member).await })
+    }
+
+    fn upsert_user_state<'a>(&'a self, user: UserState) -> MemberStoreFuture<'a, (), Self::Error> {
+        Box::pin(async move { self.upsert_user_state(&user).await })
     }
 }
 
@@ -440,6 +447,8 @@ pub struct ChatMemberStateOutcome {
     pub deleted: bool,
     /// Whether an active row was upserted.
     pub upserted: bool,
+    /// Whether the user row needed by the member foreign key was upserted.
+    pub user_upserted: bool,
     /// Whether stored status differed or could not be loaded.
     pub changed: bool,
     /// Sync job kind assigned before storage mutation, if any.
@@ -452,6 +461,8 @@ pub struct ChatMemberStateOutcome {
     pub delete_error: Option<String>,
     /// Non-fatal member upsert error, if any.
     pub upsert_error: Option<String>,
+    /// Non-fatal user upsert error, if any.
+    pub user_upsert_error: Option<String>,
     /// Non-fatal communication toggle error, if any.
     pub communication_error: Option<String>,
 }
@@ -787,6 +798,22 @@ where
             outcome.changed = true;
             outcome.load_error = Some(message);
         }
+    }
+
+    if let Err(error) = store
+        .upsert_user_state(user_state_from_telegram_user(member.get_user()))
+        .await
+    {
+        let message = error.to_string();
+        tracing::warn!(
+            message,
+            chat_id,
+            user_id,
+            "failed to upsert chat member user state"
+        );
+        outcome.user_upsert_error = Some(message);
+    } else {
+        outcome.user_upserted = true;
     }
 
     if let Err(error) = store
@@ -1521,8 +1548,20 @@ mod tests {
         assert_eq!(outcome.user_id, 7);
         assert_eq!(outcome.status, "member");
         assert!(outcome.changed);
+        assert!(outcome.user_upserted);
         assert!(outcome.upserted);
         assert_eq!(outcome.queued_job, Some(ControlKind::ChatMemberSync));
+        assert_eq!(
+            store.users(),
+            vec![UserState::new(
+                7,
+                "Tracked".to_owned(),
+                None,
+                None,
+                None,
+                None
+            )]
+        );
         assert_eq!(store.upserted(), vec![member_upsert(-10042, 7, "member")]);
         assert!(store.deleted().is_empty());
         assert!(effects.enabled().is_empty());
@@ -2071,6 +2110,16 @@ mod tests {
         ) -> MemberStoreFuture<'a, (), Self::Error> {
             Box::pin(async move {
                 self.upserted.lock().expect("member store").push(member);
+                Ok(())
+            })
+        }
+
+        fn upsert_user_state<'a>(
+            &'a self,
+            user: UserState,
+        ) -> MemberStoreFuture<'a, (), Self::Error> {
+            Box::pin(async move {
+                self.users.lock().expect("member store").push(user);
                 Ok(())
             })
         }

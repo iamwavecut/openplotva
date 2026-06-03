@@ -23,9 +23,11 @@ RUN apt-get update \
     && useradd --system --create-home --uid 10001 openplotva
 
 COPY --from=builder /workspace/target/release/openplotva-app /usr/local/bin/openplotva-app
+COPY --from=builder /workspace/prompts /app/prompts
 
 ENV WEBAPP_HOST=0.0.0.0 \
     WEBAPP_PORT=8080 \
+    OPENPLOTVA_PROMPTS_DIR=/app/prompts \
     RUNTIME_API_HOST=0.0.0.0 \
     OPENPLOTVA_CONNECT_SERVICES=true \
     OPENPLOTVA_RUN_MIGRATIONS=true \
