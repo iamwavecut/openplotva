@@ -2651,7 +2651,7 @@ fn is_equal_transliterated(name: &str, given: &str) -> bool {
 
     let name = name.to_lowercase();
     let given = given.to_lowercase();
-    transliterate1(&name) == given || transliterate2(&name) == given
+    name == given || transliterate1(&name) == given || transliterate2(&name) == given
 }
 
 fn transliterate1(value: &str) -> String {
@@ -5347,6 +5347,30 @@ mod tests {
 
         let parsed = parse_if_addressed(&topic_reply, &bot);
         assert!(!parsed.is_addressed);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_if_addressed_accepts_lowercase_cyrillic_bot_name_like_go_equalfold()
+    -> Result<(), Box<dyn Error>> {
+        let bot = sample_bot_user();
+        let name_address = sample_message_from_value(json!({
+            "message_id": 9,
+            "date": 1_710_000_000,
+            "chat": {
+                "id": -42,
+                "type": "group",
+                "title": "Group"
+            },
+            "from": sample_user_json(),
+            "text": "плотва, измени фон"
+        }))?;
+
+        let parsed = parse_if_addressed(&name_address, &bot);
+
+        assert!(parsed.is_addressed);
+        assert_eq!(parsed.first_word, "измени");
+        assert_eq!(parsed.rest_text, "фон");
         Ok(())
     }
 
