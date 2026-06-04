@@ -2,6 +2,11 @@
 .github
 .reference
 target
+!target/
+target/*
+!target/release/
+target/release/*
+!target/release/openplotva-app
 *.log
 *.tmp
 .env
