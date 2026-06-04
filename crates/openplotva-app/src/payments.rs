@@ -17,8 +17,8 @@ use crate::{
     },
 };
 use carapax::types::{
-    CallbackQuery as TelegramCallbackQuery, Chat as TelegramChat, MaybeInaccessibleMessage,
-    Message as TelegramMessage, MessageData as TelegramMessageData,
+    CallbackQuery as TelegramCallbackQuery, Chat as TelegramChat, ChatMember as TelegramChatMember,
+    MaybeInaccessibleMessage, Message as TelegramMessage, MessageData as TelegramMessageData,
     PreCheckoutQuery as TelegramPreCheckoutQuery, ReplyTo as TelegramReplyTo,
     SuccessfulPayment as TelegramSuccessfulPayment, TextEntity as TelegramTextEntity,
     Update as TelegramUpdate, UpdateType as TelegramUpdateType, User as TelegramUser,
@@ -31,7 +31,7 @@ use openplotva_core::{
 use openplotva_storage::{
     DonationCreate, DonationRecord, PostgresPaymentStore, PostgresVipStore,
     PostgresVirtualMessageStore, StorageError, SubscriptionCreate, SubscriptionRecord,
-    VipCacheRecord, VipEventCreate, VipEventRecord, VipSummaryRecord,
+    VipCacheRecord, VipCacheUpsert, VipEventCreate, VipEventRecord, VipSummaryRecord,
 };
 use openplotva_taskman::{
     CONTROL_QUEUE_NAME, ControlJobData, ControlJobParams, ControlKind, ControlPayment,
@@ -41,7 +41,7 @@ use openplotva_taskman::{
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use time::OffsetDateTime;
+use time::{Duration as TimeDuration, OffsetDateTime};
 
 /// Boxed future returned by payment storage calls.
 pub type PaymentStoreFuture<'a, T, E> = Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'a>>;
@@ -70,6 +70,10 @@ pub type PaymentControlJobWorkerFuture<'a, T, E> =
 
 /// Boxed future returned by VIP status checks.
 pub type VipStatusCheckFuture<'a> = Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
+
+/// Boxed future returned by external VIP membership checks.
+pub type ExternalVipMembershipFuture<'a, E> =
+    Pin<Box<dyn Future<Output = Result<bool, E>> + Send + 'a>>;
 
 /// Boxed future returned by VIP cancellation side effects.
 pub type VipCancellationEffectFuture<'a, E> =
@@ -708,6 +712,29 @@ pub trait VipCancellationStore: VipStatusStore {
         &'a self,
         id: i64,
     ) -> PaymentStoreFuture<'a, SubscriptionRecord, Self::Error>;
+}
+
+pub trait ExternalVipCacheStore {
+    /// Error returned by the concrete storage implementation.
+    type Error: fmt::Display + Send + Sync + 'static;
+
+    /// Store the latest external VIP membership result.
+    fn upsert_vip_cache<'a>(
+        &'a self,
+        cache: VipCacheUpsert,
+    ) -> PaymentStoreFuture<'a, (), Self::Error>;
+}
+
+pub trait ExternalVipMembershipChecker {
+    /// Error returned by the concrete membership provider.
+    type Error: fmt::Display + Send + Sync + 'static;
+
+    /// Return whether the user is an active member of the configured VIP chat.
+    fn is_external_vip_member<'a>(
+        &'a self,
+        chat_id: i64,
+        user_id: i64,
+    ) -> ExternalVipMembershipFuture<'a, Self::Error>;
 }
 
 pub trait AdminGrantVipStore {
@@ -3894,6 +3921,17 @@ impl VipCancellationStore for PostgresSuccessfulPaymentStore {
     }
 }
 
+impl ExternalVipCacheStore for PostgresSuccessfulPaymentStore {
+    type Error = StorageError;
+
+    fn upsert_vip_cache<'a>(
+        &'a self,
+        cache: VipCacheUpsert,
+    ) -> PaymentStoreFuture<'a, (), Self::Error> {
+        Box::pin(async move { self.vip.upsert_vip_cache(cache).await })
+    }
+}
+
 impl VipStatusChecker for PostgresSuccessfulPaymentStore {
     fn is_vip_at<'a>(&'a self, user_id: i64, now: OffsetDateTime) -> VipStatusCheckFuture<'a> {
         Box::pin(async move {
@@ -3911,6 +3949,166 @@ impl VipStatusChecker for PostgresSuccessfulPaymentStore {
                 _ => false,
             }
         })
+    }
+}
+
+pub const VIP_TELEGRAM_CACHE_TTL: TimeDuration = TimeDuration::hours(24);
+pub const NON_VIP_TELEGRAM_CACHE_TTL: TimeDuration = TimeDuration::minutes(10);
+
+#[derive(Clone, Debug)]
+pub struct VipStatusWithExternalMembership<Store, Membership> {
+    store: Store,
+    membership: Membership,
+    vip_chat_id: i64,
+}
+
+impl<Store, Membership> VipStatusWithExternalMembership<Store, Membership> {
+    #[must_use]
+    pub fn new(store: Store, membership: Membership, vip_chat_id: i64) -> Self {
+        Self {
+            store,
+            membership,
+            vip_chat_id,
+        }
+    }
+}
+
+impl<Store, Membership> VipStatusStore for VipStatusWithExternalMembership<Store, Membership>
+where
+    Store: VipStatusStore + Sync,
+    Membership: Send + Sync,
+{
+    type Error = Store::Error;
+
+    fn get_vip_summary_by_user<'a>(
+        &'a self,
+        user_id: i64,
+    ) -> PaymentStoreFuture<'a, Option<VipSummaryRecord>, Self::Error> {
+        self.store.get_vip_summary_by_user(user_id)
+    }
+
+    fn get_active_subscription<'a>(
+        &'a self,
+        user_id: i64,
+    ) -> PaymentStoreFuture<'a, Option<SubscriptionRecord>, Self::Error> {
+        self.store.get_active_subscription(user_id)
+    }
+
+    fn get_vip_cache<'a>(
+        &'a self,
+        user_id: i64,
+    ) -> PaymentStoreFuture<'a, Option<VipCacheRecord>, Self::Error> {
+        self.store.get_vip_cache(user_id)
+    }
+}
+
+impl<Store, Membership> VipStatusChecker for VipStatusWithExternalMembership<Store, Membership>
+where
+    Store: VipStatusStore + ExternalVipCacheStore + Sync,
+    Membership: ExternalVipMembershipChecker + Sync,
+{
+    fn is_vip_at<'a>(&'a self, user_id: i64, now: OffsetDateTime) -> VipStatusCheckFuture<'a> {
+        Box::pin(async move {
+            if user_id <= 0 {
+                return false;
+            }
+            if let Ok(Some(summary)) = self.store.get_vip_summary_by_user(user_id).await
+                && summary.is_active
+                && now < summary.effective_expires_at
+            {
+                return true;
+            }
+            match self.store.get_vip_cache(user_id).await {
+                Ok(Some(cache)) if now < cache.expires_at => return cache.is_vip,
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(%error, user_id, "failed to read VIP cache before external check");
+                }
+            }
+            if self.vip_chat_id == 0 {
+                return false;
+            }
+            let is_vip = match self
+                .membership
+                .is_external_vip_member(self.vip_chat_id, user_id)
+                .await
+            {
+                Ok(is_vip) => is_vip,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        user_id,
+                        vip_chat_id = self.vip_chat_id,
+                        "failed to check external VIP chat membership"
+                    );
+                    return false;
+                }
+            };
+            let ttl = vip_telegram_cache_ttl(is_vip);
+            if let Err(error) = self
+                .store
+                .upsert_vip_cache(VipCacheUpsert {
+                    user_id,
+                    is_vip,
+                    expires_at: now + ttl,
+                })
+                .await
+            {
+                tracing::warn!(%error, user_id, "failed to update external VIP cache");
+            }
+            is_vip
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct TelegramExternalVipMembershipChecker {
+    telegram: openplotva_telegram::TelegramClient,
+}
+
+impl TelegramExternalVipMembershipChecker {
+    #[must_use]
+    pub fn new(telegram: openplotva_telegram::TelegramClient) -> Self {
+        Self { telegram }
+    }
+}
+
+impl ExternalVipMembershipChecker for TelegramExternalVipMembershipChecker {
+    type Error = carapax::api::ExecuteError;
+
+    fn is_external_vip_member<'a>(
+        &'a self,
+        chat_id: i64,
+        user_id: i64,
+    ) -> ExternalVipMembershipFuture<'a, Self::Error> {
+        Box::pin(async move {
+            let member = self
+                .telegram
+                .execute(openplotva_telegram::build_get_chat_member_method(
+                    chat_id, user_id,
+                ))
+                .await?;
+            Ok(telegram_member_has_vip_status(&member))
+        })
+    }
+}
+
+#[must_use]
+pub fn telegram_member_has_vip_status(member: &TelegramChatMember) -> bool {
+    matches!(
+        member,
+        TelegramChatMember::Creator(_)
+            | TelegramChatMember::Administrator(_)
+            | TelegramChatMember::Member { .. }
+    )
+}
+
+#[must_use]
+pub fn vip_telegram_cache_ttl(is_vip: bool) -> TimeDuration {
+    if is_vip {
+        VIP_TELEGRAM_CACHE_TTL
+    } else {
+        NON_VIP_TELEGRAM_CACHE_TTL
     }
 }
 
@@ -6801,7 +6999,7 @@ mod tests {
     };
     use openplotva_storage::{
         DonationCreate, DonationRecord, SubscriptionCreate, SubscriptionRecord, VipCacheRecord,
-        VipEventCreate, VipEventRecord, VipSummaryRecord,
+        VipCacheUpsert, VipEventCreate, VipEventRecord, VipSummaryRecord,
     };
     use openplotva_taskman::{
         CONTROL_QUEUE_NAME, ControlJobData, ControlJobParams, ControlKind, ControlPayment,
@@ -10033,6 +10231,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn vip_status_checker_uses_external_vip_chat_membership_when_ledger_and_cache_are_empty()
+    -> Result<(), Box<dyn Error>> {
+        let now = time::Date::from_calendar_date(2026, time::Month::June, 16)?
+            .with_hms(9, 30, 0)?
+            .assume_utc();
+        let store = VipStatusStoreStub::new();
+        let membership = ExternalVipMembershipStub::new(true);
+        let checker = super::VipStatusWithExternalMembership::new(
+            store.clone(),
+            membership.clone(),
+            -1001998670656,
+        );
+
+        assert!(super::VipStatusChecker::is_vip_at(&checker, 42, now).await);
+
+        assert_eq!(membership.calls(), vec![(-1001998670656, 42)]);
+        assert_eq!(
+            store.calls(),
+            vec![
+                "get_vip_summary_by_user",
+                "get_vip_cache",
+                "upsert_vip_cache"
+            ]
+        );
+        assert_eq!(
+            store.upserted_caches(),
+            vec![VipCacheUpsert {
+                user_id: 42,
+                is_vip: true,
+                expires_at: now + super::VIP_TELEGRAM_CACHE_TTL,
+            }]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn successful_payment_update_wrapper_delegates_non_payment_messages()
     -> Result<(), Box<dyn Error>> {
         let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
@@ -12448,6 +12682,7 @@ mod tests {
         summary: Option<VipSummaryRecord>,
         active_subscription: Option<SubscriptionRecord>,
         cache: Option<VipCacheRecord>,
+        upserted_caches: Vec<VipCacheUpsert>,
         canceled_subscription_ids: Vec<i64>,
         calls: Vec<&'static str>,
     }
@@ -12483,6 +12718,10 @@ mod tests {
 
         fn canceled_subscription_ids(&self) -> Vec<i64> {
             self.lock().canceled_subscription_ids.clone()
+        }
+
+        fn upserted_caches(&self) -> Vec<VipCacheUpsert> {
+            self.lock().upserted_caches.clone()
         }
 
         fn lock(&self) -> MutexGuard<'_, VipStatusStoreState> {
@@ -12537,6 +12776,68 @@ mod tests {
                 let mut state = self.lock();
                 state.calls.push("get_vip_cache");
                 Ok(state.cache.clone())
+            })
+        }
+    }
+
+    impl super::ExternalVipCacheStore for VipStatusStoreStub {
+        type Error = StubError;
+
+        fn upsert_vip_cache<'a>(
+            &'a self,
+            cache: VipCacheUpsert,
+        ) -> PaymentStoreFuture<'a, (), Self::Error> {
+            Box::pin(async move {
+                let mut state = self.lock();
+                state.calls.push("upsert_vip_cache");
+                state.upserted_caches.push(cache);
+                Ok(())
+            })
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct ExternalVipMembershipStub {
+        state: Arc<Mutex<ExternalVipMembershipState>>,
+    }
+
+    #[derive(Default)]
+    struct ExternalVipMembershipState {
+        is_member: bool,
+        calls: Vec<(i64, i64)>,
+    }
+
+    impl ExternalVipMembershipStub {
+        fn new(is_member: bool) -> Self {
+            let stub = Self::default();
+            stub.state
+                .lock()
+                .expect("external VIP membership")
+                .is_member = is_member;
+            stub
+        }
+
+        fn calls(&self) -> Vec<(i64, i64)> {
+            self.state
+                .lock()
+                .expect("external VIP membership")
+                .calls
+                .clone()
+        }
+    }
+
+    impl super::ExternalVipMembershipChecker for ExternalVipMembershipStub {
+        type Error = StubError;
+
+        fn is_external_vip_member<'a>(
+            &'a self,
+            chat_id: i64,
+            user_id: i64,
+        ) -> super::ExternalVipMembershipFuture<'a, Self::Error> {
+            Box::pin(async move {
+                let mut state = self.state.lock().expect("external VIP membership");
+                state.calls.push((chat_id, user_id));
+                Ok(state.is_member)
             })
         }
     }

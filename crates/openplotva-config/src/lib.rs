@@ -74,6 +74,8 @@ pub const DEFAULT_BOT_WEBHOOK_ENABLED: bool = false;
 
 pub const DEFAULT_ADMINS_ADMIN_IDS: &str = "";
 
+pub const DEFAULT_VIP_CHAT_ID: i64 = -1001998670656;
+
 pub const DEFAULT_PERSISTENT_QUEUE_ENABLED: bool = true;
 
 pub const DEFAULT_PERSISTENT_QUEUE_HEARTBEAT_INTERVAL_SECONDS: i32 = 30;
@@ -252,6 +254,8 @@ pub struct AppConfig {
     pub bot: BotConfig,
     /// Telegram administrator configuration.
     pub admins: AdminConfig,
+    /// VIP status configuration.
+    pub vip: VipConfig,
     /// Persistent task queue configuration.
     pub persistent_queue: PersistentQueueConfig,
     /// RBC rates provider configuration.
@@ -402,6 +406,12 @@ pub struct BotWebhookConfig {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AdminConfig {
     pub admin_ids: Vec<i64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct VipConfig {
+    /// Telegram chat whose active members receive VIP status, from `VIP_CHAT_ID` or legacy `CHAT_ID`.
+    pub chat_id: i64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -767,6 +777,10 @@ pub struct RawConfig {
     pub bot_debug: Option<String>,
     /// `ADMINS_ADMIN_IDS`.
     pub admins_admin_ids: Option<String>,
+    /// `VIP_CHAT_ID`.
+    pub vip_chat_id: Option<String>,
+    /// Legacy Go-era VIP chat id variable, `CHAT_ID`.
+    pub legacy_vip_chat_id: Option<String>,
     /// `PERSISTENT_QUEUE_ENABLED`.
     pub persistent_queue_enabled: Option<String>,
     /// `PERSISTENT_QUEUE_HEARTBEAT_INTERVAL_SECONDS`.
@@ -1493,6 +1507,20 @@ impl AppConfig {
                     DEFAULT_ADMINS_ADMIN_IDS,
                 )?,
             },
+            vip: VipConfig {
+                chat_id: {
+                    let var_name = if raw.vip_chat_id.is_some() {
+                        "VIP_CHAT_ID"
+                    } else {
+                        "CHAT_ID"
+                    };
+                    parse_i64(
+                        var_name,
+                        raw.vip_chat_id.or(raw.legacy_vip_chat_id),
+                        DEFAULT_VIP_CHAT_ID,
+                    )?
+                },
+            },
             persistent_queue,
             rbc: RbcConfig {
                 timeout_seconds: parse_i32(
@@ -2040,6 +2068,8 @@ impl RawConfig {
             bot_webhook_secret_token: env("BOT_WEBHOOK_SECRET_TOKEN"),
             bot_debug: env("BOT_DEBUG"),
             admins_admin_ids: env("ADMINS_ADMIN_IDS"),
+            vip_chat_id: env("VIP_CHAT_ID"),
+            legacy_vip_chat_id: env("CHAT_ID"),
             persistent_queue_enabled: env("PERSISTENT_QUEUE_ENABLED"),
             persistent_queue_heartbeat_interval_seconds: env(
                 "PERSISTENT_QUEUE_HEARTBEAT_INTERVAL_SECONDS",
@@ -2544,7 +2574,7 @@ mod tests {
         DEFAULT_SERPER_TIMEOUT_SECONDS, DEFAULT_SHIELD_EMBEDDING_DIM,
         DEFAULT_SHIELD_LEXICAL_MIN_SCORE, DEFAULT_SHIELD_MAX_MATCHES,
         DEFAULT_SHIELD_QUERY_MAX_CHARS, DEFAULT_SHIELD_RETRIEVAL_TIMEOUT_SECONDS,
-        DEFAULT_SHIELD_VECTOR_MIN_SCORE, DEFAULT_VISION_DIRECT_IMAGE_LIMIT,
+        DEFAULT_SHIELD_VECTOR_MIN_SCORE, DEFAULT_VIP_CHAT_ID, DEFAULT_VISION_DIRECT_IMAGE_LIMIT,
         DEFAULT_VISION_MAX_TOKENS, DEFAULT_VISION_MODEL, DEFAULT_VISION_REQUEST_TIMEOUT_SECONDS,
         DEFAULT_WEBAPP_PORT, DEFAULT_WEBAPP_URL, RawConfig, parse_string_list_or_default,
     };
@@ -2557,6 +2587,7 @@ mod tests {
         assert_eq!(config.server.port, 8080);
         assert_eq!(config.server.bind_addr, "0.0.0.0:8080");
         assert_eq!(config.server.url, DEFAULT_WEBAPP_URL);
+        assert_eq!(config.vip.chat_id, DEFAULT_VIP_CHAT_ID);
         assert!(config.runtime_api.enabled);
         assert_eq!(config.runtime_api.host, DEFAULT_RUNTIME_API_HOST);
         assert_eq!(config.runtime_api.port, DEFAULT_RUNTIME_API_PORT);
@@ -2880,6 +2911,25 @@ mod tests {
         assert!(config.service_probe.produce_updates);
         assert!(config.service_probe.consume_updates);
 
+        Ok(())
+    }
+
+    #[test]
+    fn vip_config_accepts_legacy_go_chat_id() -> Result<(), super::ConfigError> {
+        let config = AppConfig::from_raw(RawConfig {
+            legacy_vip_chat_id: Some("-1001998670656".to_owned()),
+            ..RawConfig::default()
+        })?;
+
+        assert_eq!(config.vip.chat_id, -1001998670656);
+
+        let config = AppConfig::from_raw(RawConfig {
+            vip_chat_id: Some("-10042".to_owned()),
+            legacy_vip_chat_id: Some("-1001998670656".to_owned()),
+            ..RawConfig::default()
+        })?;
+
+        assert_eq!(config.vip.chat_id, -10042);
         Ok(())
     }
 

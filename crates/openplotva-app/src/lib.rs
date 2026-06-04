@@ -406,6 +406,7 @@ struct StaticWebRoutes {
     settings_store: Option<PostgresChatSettingsStore>,
     member_store: Option<PostgresChatMemberStore>,
     vip_store: Option<PostgresVipStore>,
+    vip_status: Option<Arc<dyn payments::VipStatusChecker + Send + Sync>>,
     memory_store: Option<PostgresMemoryStore>,
     memory_admin_enabled: bool,
     memory_retention: Duration,
@@ -455,6 +456,7 @@ fn static_web_routes(
         settings_store: None,
         member_store: None,
         vip_store: None,
+        vip_status: None,
         memory_store: None,
         memory_admin_enabled: false,
         memory_retention: Duration::from_secs(7 * 24 * 60 * 60),
@@ -512,6 +514,18 @@ fn static_web_routes_from_config(
         routes.settings_store = Some(PostgresChatSettingsStore::new(clients.postgres.clone()));
         routes.member_store = Some(PostgresChatMemberStore::new(clients.postgres.clone()));
         routes.vip_store = Some(PostgresVipStore::new(clients.postgres.clone()));
+        if let Some(telegram) = runtime_workers.telegram.as_ref() {
+            let payment_store = payments::PostgresSuccessfulPaymentStore::new(
+                PostgresVirtualMessageStore::new(clients.postgres.clone()),
+                PostgresPaymentStore::new(clients.postgres.clone()),
+                PostgresVipStore::new(clients.postgres.clone()),
+            );
+            routes.vip_status = Some(Arc::new(payments::VipStatusWithExternalMembership::new(
+                payment_store,
+                payments::TelegramExternalVipMembershipChecker::new(telegram.clone()),
+                config.vip.chat_id,
+            )));
+        }
         let memory_store = PostgresMemoryStore::new(clients.postgres.clone());
         routes.memory_store = Some(memory_store.clone());
         if config.memory.enabled {
@@ -2723,6 +2737,11 @@ async fn apply_user_settings_response(
 async fn settings_user_is_vip(routes: &StaticWebRoutes, user_id: i64) -> bool {
     if user_id <= 0 {
         return false;
+    }
+    if let Some(vip_status) = &routes.vip_status {
+        return vip_status
+            .is_vip_at(user_id, OffsetDateTime::now_utc())
+            .await;
     }
     let Some(vip_store) = &routes.vip_store else {
         return false;
@@ -8672,6 +8691,11 @@ async fn start_runtime_workers(
         }
     }
     let payment_store_for_updates = Arc::new(payment_store.clone());
+    let vip_status_for_updates = Arc::new(payments::VipStatusWithExternalMembership::new(
+        payment_store.clone(),
+        payments::TelegramExternalVipMembershipChecker::new(telegram.clone()),
+        config.vip.chat_id,
+    ));
     let store_for_updates = Arc::new(store.clone());
     let history_store_for_updates = Arc::new(history_store.clone());
     let chat_members_for_updates = Arc::new(chat_member_store.clone());
@@ -8733,7 +8757,7 @@ async fn start_runtime_workers(
     let music_service_available = matches!(music_client_result.as_ref(), Some(Ok(_)));
     let dialog_tool_adapter = Arc::new(
         dialog_tools::TaskmanDialogToolAdapter::new(Arc::clone(&task_queue_for_updates))
-            .with_draw_image_vip_status(payment_store_for_updates.clone())
+            .with_draw_image_vip_status(vip_status_for_updates.clone())
             .with_draw_image_rate_limit(Arc::new(dialog_tools::DrawImageRateLimitPolicy::new(
                 service_clients.redis.draw_rate_limit_store(),
             )))
@@ -9532,7 +9556,7 @@ async fn start_runtime_workers(
         let delete_drawing = Arc::new(delete_drawing::DeleteDrawingCallbackUpdateHandler::new(
             Arc::new(service_clients.redis.last_generation_store()),
             Arc::clone(&telegram_effects),
-            Arc::clone(&payment_store_for_updates),
+            Arc::clone(&vip_status_for_updates),
             Arc::clone(&telegram_effects),
             delete_lyrics,
         ));
@@ -9644,7 +9668,7 @@ async fn start_runtime_workers(
         let payment_handler = Arc::new(
             payments::PaymentUpdateHandler::new(
                 Arc::clone(&control_queue_for_updates),
-                Arc::clone(&payment_store_for_updates),
+                Arc::clone(&vip_status_for_updates),
                 Arc::clone(&telegram_effects),
                 settings_handler,
             )
