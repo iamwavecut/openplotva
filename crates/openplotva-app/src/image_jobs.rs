@@ -1210,9 +1210,11 @@ fn generated_image_media_group_request(
             .enumerate()
             .map(|(index, photo)| MediaGroupPhotoItem {
                 photo,
-                caption: (index == 0)
-                    .then(|| caption_text.clone())
-                    .unwrap_or_default(),
+                caption: if index == 0 {
+                    caption_text.clone()
+                } else {
+                    String::new()
+                },
                 render_as: String::new(),
                 has_spoiler: false,
             })
