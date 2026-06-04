@@ -27,9 +27,10 @@ use openplotva_taskman::{
     image_gen_job_params_from_stateless_job,
 };
 use openplotva_telegram::{
-    ChatRef, DeleteMessageRequest, PhotoMessageRequest, PhotoSource, ReplyMessageRef,
-    ReplyParametersPlan, StickerMessageRequest, TelegramOutboundMethod, TelegramOutboundResponse,
-    TextMessageRequest, build_delete_message_method, build_photo_message_method,
+    ChatRef, DeleteMessageRequest, MediaGroupMessageRequest, MediaGroupPhotoItem,
+    PhotoMessageRequest, PhotoSource, ReplyMessageRef, ReplyParametersPlan, StickerMessageRequest,
+    TelegramOutboundMethod, TelegramOutboundResponse, TextMessageRequest,
+    build_delete_message_method, build_media_group_message_method, build_photo_message_method,
     build_sticker_message_method, build_text_message_methods, execute_telegram_method,
 };
 use serde::Serialize;
@@ -68,6 +69,7 @@ pub const IMAGE_REGULAR_JOB_WORKER_QUEUES: [&str; 1] = [IMAGE_REGULAR_QUEUE_NAME
 
 const IMAGE_REGULAR_WORKER_ID: &str = "image-regular-worker";
 const IMAGE_VIP_WORKER_ID: &str = "image-vip-worker";
+const TELEGRAM_MEDIA_GROUP_MAX_ITEMS: usize = 10;
 
 /// Provider-neutral image generation request.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -534,14 +536,22 @@ impl ImageGenerator for PrunaImageGenerator {
                 .map_err(|error| ImageGenerationError::Provider(error.to_string()))?;
             Ok(ImageGenerationResult {
                 image_url: result.url.clone(),
-                image_urls: (!result.url.is_empty())
-                    .then_some(result.url)
-                    .into_iter()
-                    .collect(),
-                image_bytes: (!result.image.is_empty())
-                    .then_some(result.image)
-                    .into_iter()
-                    .collect(),
+                image_urls: if result.urls.is_empty() {
+                    (!result.url.is_empty())
+                        .then_some(result.url)
+                        .into_iter()
+                        .collect()
+                } else {
+                    result.urls
+                },
+                image_bytes: if result.images.is_empty() {
+                    (!result.image.is_empty())
+                        .then_some(result.image)
+                        .into_iter()
+                        .collect()
+                } else {
+                    result.images
+                },
             })
         })
     }
@@ -894,6 +904,16 @@ pub trait ImageJobEffects {
         thread_id: Option<i32>,
         photo: PhotoSource,
     ) -> ImageJobEffectFuture<'a, Result<i32, String>>;
+
+    /// Send one or more generated images and return the first Telegram result message ID.
+    fn send_generated_images<'a>(
+        &'a self,
+        chat_id: i64,
+        message_id: i32,
+        thread_id: Option<i32>,
+        caption_text: String,
+        photos: Vec<PhotoSource>,
+    ) -> ImageJobEffectFuture<'a, Result<i32, String>>;
 }
 
 /// Concrete image-job sticker effects over Redis and Telegram.
@@ -1023,7 +1043,13 @@ where
         photo: PhotoSource,
     ) -> ImageJobEffectFuture<'a, Result<i32, String>> {
         Box::pin(async move {
-            let request = generated_image_message_request(chat_id, message_id, thread_id, photo);
+            let request = generated_image_message_request(
+                chat_id,
+                message_id,
+                thread_id,
+                String::new(),
+                photo,
+            );
             let method = build_photo_message_method(&request).map_err(|error| error.to_string())?;
             let response = self
                 .telegram
@@ -1031,6 +1057,59 @@ where
                 .await?;
             image_job_response_message_id(&response)
                 .ok_or_else(|| "sendPhoto returned non-message response".to_owned())
+        })
+    }
+
+    fn send_generated_images<'a>(
+        &'a self,
+        chat_id: i64,
+        message_id: i32,
+        thread_id: Option<i32>,
+        caption_text: String,
+        photos: Vec<PhotoSource>,
+    ) -> ImageJobEffectFuture<'a, Result<i32, String>> {
+        Box::pin(async move {
+            let photos = photos
+                .into_iter()
+                .take(TELEGRAM_MEDIA_GROUP_MAX_ITEMS)
+                .collect::<Vec<_>>();
+            match photos.as_slice() {
+                [] => Err("image generation produced no image".to_owned()),
+                [photo] => {
+                    let request = generated_image_message_request(
+                        chat_id,
+                        message_id,
+                        thread_id,
+                        caption_text,
+                        photo.clone(),
+                    );
+                    let method =
+                        build_photo_message_method(&request).map_err(|error| error.to_string())?;
+                    let response = self
+                        .telegram
+                        .send_image_job_method(TelegramOutboundMethod::from(method))
+                        .await?;
+                    image_job_response_message_id(&response)
+                        .ok_or_else(|| "sendPhoto returned non-message response".to_owned())
+                }
+                _ => {
+                    let request = generated_image_media_group_request(
+                        chat_id,
+                        message_id,
+                        thread_id,
+                        caption_text,
+                        photos,
+                    );
+                    let method = build_media_group_message_method(&request)
+                        .map_err(|error| error.to_string())?;
+                    let response = self
+                        .telegram
+                        .send_image_job_method(TelegramOutboundMethod::from(method))
+                        .await?;
+                    image_job_response_message_id(&response)
+                        .ok_or_else(|| "sendMediaGroup returned no message response".to_owned())
+                }
+            }
         })
     }
 }
@@ -1086,6 +1165,7 @@ fn generated_image_message_request(
     chat_id: i64,
     message_id: i32,
     thread_id: Option<i32>,
+    caption_text: String,
     photo: PhotoSource,
 ) -> PhotoMessageRequest {
     let message_thread_id = i64::from(thread_id.unwrap_or_default());
@@ -1098,9 +1178,45 @@ fn generated_image_message_request(
         message_thread_id,
         disable_notification: false,
         photo,
-        caption: String::new(),
+        caption: caption_text,
         render_as: String::new(),
         has_spoiler: false,
+        reply_parameters: Some(ReplyParametersPlan {
+            message_id: i64::from(message_id),
+            chat_id,
+            allow_sending_without_reply: true,
+        }),
+    }
+}
+
+fn generated_image_media_group_request(
+    chat_id: i64,
+    message_id: i32,
+    thread_id: Option<i32>,
+    caption_text: String,
+    photos: Vec<PhotoSource>,
+) -> MediaGroupMessageRequest {
+    let message_thread_id = i64::from(thread_id.unwrap_or_default());
+    let is_topic_message = message_thread_id != 0;
+    MediaGroupMessageRequest {
+        chat: ChatRef {
+            id: chat_id,
+            is_forum: is_topic_message,
+        },
+        message_thread_id,
+        disable_notification: false,
+        items: photos
+            .into_iter()
+            .enumerate()
+            .map(|(index, photo)| MediaGroupPhotoItem {
+                photo,
+                caption: (index == 0)
+                    .then(|| caption_text.clone())
+                    .unwrap_or_default(),
+                render_as: String::new(),
+                has_spoiler: false,
+            })
+            .collect(),
         reply_parameters: Some(ReplyParametersPlan {
             message_id: i64::from(message_id),
             chat_id,
@@ -1127,6 +1243,8 @@ pub struct ImageGenJobExecutionReport {
     pub caption_text: String,
     /// Generated image URL when present.
     pub image_url: Option<String>,
+    /// Generated image URLs when present.
+    pub image_urls: Vec<String>,
     /// Telegram message ID of the delivered image.
     pub result_message_id: Option<i32>,
     /// Failure text when the job should fail.
@@ -1391,19 +1509,28 @@ where
 
     match result {
         Ok(result) => {
-            let image_url = result.first_image_url();
-            let Some(photo) = image_generation_photo_source(&result) else {
+            let image_urls = image_generation_urls(&result);
+            let image_url = image_urls.first().cloned();
+            let photos = image_generation_photo_sources(&result);
+            if photos.is_empty() {
                 return ImageGenJobExecutionReport {
                     outcome: ImageGenJobExecutionOutcome::Failed,
                     prompt,
                     caption_text,
                     image_url: None,
+                    image_urls,
                     result_message_id: None,
                     error: Some("image generation produced no image".to_owned()),
                 };
-            };
+            }
             match effects
-                .send_generated_image(params.chat_id, params.message_id, params.thread_id, photo)
+                .send_generated_images(
+                    params.chat_id,
+                    params.message_id,
+                    params.thread_id,
+                    caption_text.clone(),
+                    photos,
+                )
                 .await
             {
                 Ok(result_message_id) => ImageGenJobExecutionReport {
@@ -1411,6 +1538,7 @@ where
                     prompt,
                     caption_text,
                     image_url,
+                    image_urls,
                     result_message_id: Some(result_message_id),
                     error: None,
                 },
@@ -1419,6 +1547,7 @@ where
                     prompt,
                     caption_text,
                     image_url,
+                    image_urls,
                     result_message_id: None,
                     error: Some(format!("send generated image: {error}")),
                 },
@@ -1438,6 +1567,7 @@ where
                 prompt,
                 caption_text,
                 image_url: None,
+                image_urls: Vec::new(),
                 result_message_id: None,
                 error: None,
             }
@@ -1447,6 +1577,7 @@ where
             prompt,
             caption_text,
             image_url: None,
+            image_urls: Vec::new(),
             result_message_id: None,
             error: Some(error.message()),
         },
@@ -1643,7 +1774,9 @@ where
     let execution = execute_image_gen_job(generator, effects, params).await;
     match execution.outcome {
         ImageGenJobExecutionOutcome::Completed => {
-            if let Some(image_url) = execution.image_url {
+            if !execution.image_urls.is_empty() {
+                let _ = queue.set_job_image_urls(work.id, execution.image_urls);
+            } else if let Some(image_url) = execution.image_url {
                 let _ = queue.set_job_image_urls(work.id, vec![image_url]);
             }
             let _ = queue.update_job_result_message(work.id, execution.result_message_id);
@@ -2441,17 +2574,47 @@ fn starts_http_url(value: &str) -> bool {
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
 }
 
-fn image_generation_photo_source(result: &ImageGenerationResult) -> Option<PhotoSource> {
-    result
+fn image_generation_photo_sources(result: &ImageGenerationResult) -> Vec<PhotoSource> {
+    let mut photos = Vec::new();
+    let images = result
         .image_bytes
         .iter()
-        .find(|image| !image.is_empty())
-        .cloned()
-        .map(|bytes| PhotoSource::Bytes {
-            file_name: "image.png".to_owned(),
-            bytes,
-        })
-        .or_else(|| result.first_image_url().map(PhotoSource::Url))
+        .filter(|image| !image.is_empty())
+        .collect::<Vec<_>>();
+    let single_image = images.len() == 1 && image_generation_urls(result).is_empty();
+    for (index, bytes) in images.into_iter().enumerate() {
+        photos.push(PhotoSource::Bytes {
+            file_name: if single_image {
+                "image.png".to_owned()
+            } else {
+                format!("image-{}.png", index + 1)
+            },
+            bytes: bytes.clone(),
+        });
+    }
+    photos.extend(
+        image_generation_urls(result)
+            .into_iter()
+            .map(PhotoSource::Url),
+    );
+    photos
+}
+
+fn image_generation_urls(result: &ImageGenerationResult) -> Vec<String> {
+    let mut urls = Vec::new();
+    if let Some(url) = non_empty(result.image_url.clone()) {
+        urls.push(url);
+    }
+    for url in result
+        .image_urls
+        .iter()
+        .filter_map(|url| non_empty(url.clone()))
+    {
+        if !urls.iter().any(|existing| existing == &url) {
+            urls.push(url);
+        }
+    }
+    urls
 }
 
 fn one_or_many_strings<'a>(values: &[&'a str]) -> Option<OneOrManyStrings<'a>> {
@@ -2715,7 +2878,43 @@ mod tests {
                 "remove_queued:-100:20",
                 "send_drawing:-100:20:30:9",
                 "remove_drawing:-100:777",
-                "send_image:-100:20:9:Url(\"https://img.test/1.png\")",
+                "send_images:-100:20:9:original caption:[Url(\"https://img.test/1.png\")]",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_image_gen_job_delivers_all_provider_images_as_captioned_album() {
+        let generator = GeneratorStub::success_many(vec![
+            " https://img.test/1.png ".to_owned(),
+            "https://img.test/2.png".to_owned(),
+        ]);
+        let effects = EffectsStub::new(Some(777));
+        let report = execute_image_gen_job(
+            &generator,
+            &effects,
+            ImageGenJobParams {
+                chat_id: -100,
+                message_id: 20,
+                user_id: 30,
+                user_full_name: "Alice".to_owned(),
+                prompt: "castle".to_owned(),
+                original_text: "original caption".to_owned(),
+                thread_id: Some(9),
+                ..ImageGenJobParams::default()
+            },
+        )
+        .await;
+
+        assert_eq!(report.outcome, ImageGenJobExecutionOutcome::Completed);
+        assert_eq!(report.result_message_id, Some(888));
+        assert_eq!(
+            effects.calls(),
+            vec![
+                "remove_queued:-100:20",
+                "send_drawing:-100:20:30:9",
+                "remove_drawing:-100:777",
+                "send_images:-100:20:9:original caption:[Url(\"https://img.test/1.png\"), Url(\"https://img.test/2.png\")]",
             ]
         );
     }
@@ -3888,6 +4087,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn telegram_image_job_effects_send_generated_images_uses_media_group() {
+        let queued = QueuedStickerStoreStub::default();
+        let ephemeral = EphemeralTrackerStub::default();
+        let telegram = TelegramSenderStub::new(vec![Ok(TelegramOutboundResponse::Messages(vec![
+            telegram_message(-10042, 555),
+            telegram_message(-10042, 556),
+        ]))]);
+        let effects =
+            TelegramImageJobEffects::new(queued.clone(), ephemeral.clone(), telegram.clone());
+
+        let result_message_id = effects
+            .send_generated_images(
+                -10042,
+                77,
+                Some(9),
+                "caption".to_owned(),
+                vec![
+                    PhotoSource::Url("https://img.test/1.png".to_owned()),
+                    PhotoSource::Url("https://img.test/2.png".to_owned()),
+                ],
+            )
+            .await;
+
+        assert_eq!(result_message_id, Ok(555));
+        assert_eq!(
+            telegram.kinds(),
+            vec![TelegramOutboundMethodKind::SendMediaGroup]
+        );
+        assert!(queued.snapshot().loads.is_empty());
+        assert!(ephemeral.tracked().is_empty());
+    }
+
+    #[tokio::test]
     async fn telegram_image_job_effects_remove_queued_sticker_deletes_message_and_key() {
         let queued = QueuedStickerStoreStub::with_queued_id(Some(444));
         let ephemeral = EphemeralTrackerStub::default();
@@ -4260,6 +4492,16 @@ mod tests {
             }
         }
 
+        fn success_many(image_urls: Vec<String>) -> Self {
+            Self {
+                result: Ok(ImageGenerationResult {
+                    image_urls,
+                    ..ImageGenerationResult::default()
+                }),
+                requests: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
         fn forbidden() -> Self {
             Self {
                 result: Err(ImageGenerationError::Forbidden),
@@ -4491,6 +4733,21 @@ mod tests {
         ) -> ImageJobEffectFuture<'a, Result<i32, String>> {
             self.call_log().push(format!(
                 "send_image:{chat_id}:{message_id}:{}:{photo:?}",
+                thread_id.unwrap_or_default()
+            ));
+            Box::pin(async { Ok(888) })
+        }
+
+        fn send_generated_images<'a>(
+            &'a self,
+            chat_id: i64,
+            message_id: i32,
+            thread_id: Option<i32>,
+            caption_text: String,
+            photos: Vec<PhotoSource>,
+        ) -> ImageJobEffectFuture<'a, Result<i32, String>> {
+            self.call_log().push(format!(
+                "send_images:{chat_id}:{message_id}:{}:{caption_text}:{photos:?}",
                 thread_id.unwrap_or_default()
             ));
             Box::pin(async { Ok(888) })

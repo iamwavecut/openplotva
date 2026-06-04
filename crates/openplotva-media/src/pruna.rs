@@ -89,6 +89,10 @@ pub struct PrunaResult {
     pub url: String,
     /// Decoded image bytes when returned inline.
     pub image: Vec<u8>,
+    /// Remote image URLs when the provider returns multiple outputs.
+    pub urls: Vec<String>,
+    /// Decoded image bytes when the provider returns multiple inline outputs.
+    pub images: Vec<Vec<u8>>,
 }
 
 /// HTTP Pruna client.
@@ -146,11 +150,16 @@ impl PrunaClient {
         let status = response.status().as_u16();
         let body = response.bytes().await.map_err(PrunaError::Http)?.to_vec();
         let decoded = decode_generate_response(status, &body)?;
-        let (url, image) = decoded.first_image();
-        if url.is_empty() && image.is_empty() {
+        let (urls, images) = decoded.images();
+        if urls.is_empty() && images.is_empty() {
             return Err(PrunaError::MissingImage(body_preview(&body)));
         }
-        Ok(PrunaResult { url, image })
+        Ok(PrunaResult {
+            url: urls.first().cloned().unwrap_or_default(),
+            image: images.first().cloned().unwrap_or_default(),
+            urls,
+            images,
+        })
     }
 }
 
@@ -321,14 +330,19 @@ impl PrunaResponse {
         candidates
     }
 
-    fn first_image(&self) -> (String, Vec<u8>) {
+    fn images(&self) -> (Vec<String>, Vec<Vec<u8>>) {
+        let mut urls = Vec::new();
+        let mut images = Vec::new();
         for candidate in self.candidates() {
             let (url, data) = decode_image_candidate(candidate);
-            if !url.is_empty() || !data.is_empty() {
-                return (url, data);
+            if !url.is_empty() && !urls.iter().any(|existing| existing == &url) {
+                urls.push(url);
+            }
+            if !data.is_empty() {
+                images.push(data);
             }
         }
-        (String::new(), Vec::new())
+        (urls, images)
     }
 }
 
@@ -567,5 +581,67 @@ mod tests {
         assert!(request.contains("\"aspect_ratio\":\"9:16\""));
         assert!(request.contains("\"disable_safety_checker\":true"));
         assert!(request.contains("\"visitorId\":\"visitor-fixed\""));
+    }
+
+    #[tokio::test]
+    async fn client_preserves_multiple_output_urls() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("read timeout");
+            let mut bytes = Vec::new();
+            let mut buf = [0_u8; 1024];
+            loop {
+                let read = stream.read(&mut buf).expect("read request");
+                if read == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&buf[..read]);
+                if String::from_utf8_lossy(&bytes).contains("\"visitorId\":\"visitor-fixed\"") {
+                    break;
+                }
+            }
+            let body = "{\"output\":[\"https://img.test/1.png\",\"https://img.test/2.png\"]}";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+        });
+
+        let client = PrunaClient::new(PrunaConfig {
+            endpoint: format!("http://{addr}"),
+            model: "test-model".to_owned(),
+            api_key: "test-key".to_owned(),
+            bearer: "test-bearer".to_owned(),
+            timeout: Duration::from_secs(5),
+        })
+        .expect("client");
+
+        let result = client
+            .generate(PrunaRequest {
+                prompt: "draw a cat".to_owned(),
+                aspect_ratio: "1:1".to_owned(),
+                visitor_id: "visitor-fixed".to_owned(),
+            })
+            .await
+            .expect("generate");
+
+        handle.join().expect("server thread");
+        assert_eq!(result.url, "https://img.test/1.png");
+        assert_eq!(
+            result.urls,
+            vec![
+                "https://img.test/1.png".to_owned(),
+                "https://img.test/2.png".to_owned()
+            ]
+        );
+        assert!(result.images.is_empty());
     }
 }
