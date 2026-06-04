@@ -9072,13 +9072,17 @@ async fn start_runtime_workers(
     );
     let media_max_llm_job_attempts = config.persistent_queue.llm_job_max_attempts;
     let vip_image_queue = Arc::clone(&task_queue_for_updates);
+    let vip_draw_api_config = image_jobs::aifarm_draw_api_config_from_app_config(config);
     let vip_image_generator = image_jobs::OptimizingImageGenerator::new(
-        image_jobs::FallbackImageGenerator::new(
-            image_jobs::PrunaImageGenerator::new(image_jobs::pruna_config_from_app_config(config))
+        image_jobs::SequentialImageGenerator::new(
+            image_jobs::FallbackImageGenerator::new(
+                image_jobs::PrunaImageGenerator::new(image_jobs::pruna_config_from_app_config(
+                    config,
+                ))
                 .map_err(|error| anyhow::anyhow!("build Pruna image generator: {error:?}"))?,
-            image_jobs::AifarmDrawApiImageGenerator::new(
-                image_jobs::aifarm_draw_api_config_from_app_config(config),
+                image_jobs::AifarmDrawApiImageGenerator::new(vip_draw_api_config.clone()),
             ),
+            image_jobs::AifarmDrawApiImageGenerator::new(vip_draw_api_config),
         ),
         media_prompt_optimizer.clone(),
     );
@@ -9166,7 +9170,7 @@ async fn start_runtime_workers(
     workers.handles.push(regular_image_worker);
     readiness_checks.push(ReadinessCheck::ok(
         "image_jobs",
-        "Image taskman workers started for VIP generation/edit and regular generation queues with VIP Pruna-to-draw-api fallback plus draw-api edit/regular providers",
+        "Image taskman workers started for VIP generation/edit and regular generation queues with VIP Pruna-or-draw-api first slot plus draw-api second slot/edit/regular providers",
     ));
     for queue_name in image_jobs::IMAGE_VIP_JOB_WORKER_QUEUES {
         shared_taskman_worker_counts

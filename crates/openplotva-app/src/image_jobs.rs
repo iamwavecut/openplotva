@@ -27,12 +27,15 @@ use openplotva_taskman::{
     image_gen_job_params_from_stateless_job,
 };
 use openplotva_telegram::{
-    ChatRef, DeleteMessageRequest, MediaGroupMessageRequest, MediaGroupPhotoItem,
-    PhotoMessageRequest, PhotoSource, ReplyMessageRef, ReplyParametersPlan, StickerMessageRequest,
-    TelegramOutboundMethod, TelegramOutboundResponse, TextMessageRequest,
-    build_delete_message_method, build_media_group_message_method, build_photo_message_method,
-    build_sticker_message_method, build_text_message_methods, execute_telegram_method,
+    ChatRef, DeleteMessageRequest, EditMediaMessageRequest, MediaGroupMessageRequest,
+    MediaGroupPhotoItem, PhotoMessageRequest, PhotoSource, ReplyMessageRef, ReplyParametersPlan,
+    StickerMessageRequest, TELEGRAM_PARSE_MODE_HTML, TelegramOutboundMethod,
+    TelegramOutboundResponse, TextMessageRequest, build_delete_message_method,
+    build_edit_media_message_method, build_media_group_message_method, build_photo_message_method,
+    build_sticker_message_method, build_text_message_methods, ensure_telegram_safe_text,
+    escape_telegram_html_text, execute_telegram_method, strip_telegram_html,
 };
+use rand::RngExt;
 use serde::Serialize;
 use serde_json::Value;
 use time::OffsetDateTime;
@@ -66,10 +69,34 @@ pub const IMAGE_JOB_POLL_INTERVAL: StdDuration = StdDuration::from_secs(1);
 pub const IMAGE_JOB_WORKER_QUEUES: [&str; 2] = [IMAGE_VIP_QUEUE_NAME, IMAGE_REGULAR_QUEUE_NAME];
 pub const IMAGE_VIP_JOB_WORKER_QUEUES: [&str; 1] = [IMAGE_VIP_QUEUE_NAME];
 pub const IMAGE_REGULAR_JOB_WORKER_QUEUES: [&str; 1] = [IMAGE_REGULAR_QUEUE_NAME];
+pub const IMAGE_PLACEHOLDER_FILE_ID: &str =
+    "AgACAgIAAxkBAAFhmg5oDV5-lLcooLSE8nKFLlF768nEygAC6O8xG2uvaUjfFg40SWg2rgEAAwIAA3kAAzYE";
+pub const DRAW_SUPPORT_ME_URL: &str = "https://t.me/PlotvoBot?start=donate";
+pub const DRAW_VIP_URL: &str = "https://t.me/PlotvoBot?start=vip";
 
 const IMAGE_REGULAR_WORKER_ID: &str = "image-regular-worker";
 const IMAGE_VIP_WORKER_ID: &str = "image-vip-worker";
 const TELEGRAM_MEDIA_GROUP_MAX_ITEMS: usize = 10;
+const DRAW_CAPTION_WORD_THRESHOLD: usize = 25;
+const TELEGRAM_CAPTION_MAX_VISIBLE: usize = 1024;
+const DRAW_CAPTION_ELLIPSIS: &str = "…";
+const IMAGE_SUPPORT_PHRASES: [&str; 15] = [
+    "автору на вдохновение ✨",
+    "Плотва в долгу ❤️",
+    "за каждый мем 🐸",
+    "на улучшения бота 🔧",
+    "спасибо от всей стаи 🐟",
+    "донат = волшебство ✨",
+    "помоги расти 📈",
+    "на новые эксперименты 🧪",
+    "автору на счастье 😊",
+    "Плотва любит донаты 💙",
+    "за креатив без границ 🌈",
+    "на развитие магии 🪄",
+    "спасибо, ты лучший 🏆",
+    "поддержи Плотвин дом 🏠",
+    "поддержать ❤️",
+];
 
 /// Provider-neutral image generation request.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -576,6 +603,10 @@ where
     Primary: ImageGenerator + Sync,
     Fallback: ImageGenerator + Sync,
 {
+    fn expected_image_count(&self) -> usize {
+        self.primary.expected_image_count()
+    }
+
     fn generate_image<'a>(&'a self, request: ImageGenerationRequest) -> ImageGenerationFuture<'a> {
         Box::pin(async move {
             match self.primary.generate_image(request.clone()).await {
@@ -585,6 +616,88 @@ where
                 }
                 Err(ImageGenerationError::Forbidden) => Err(ImageGenerationError::Forbidden),
             }
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SequentialImageGenerator<First, Second> {
+    first: First,
+    second: Second,
+}
+
+impl<First, Second> SequentialImageGenerator<First, Second> {
+    /// Build a sequential generator where both slots should be attempted.
+    #[must_use]
+    pub const fn new(first: First, second: Second) -> Self {
+        Self { first, second }
+    }
+}
+
+impl<First, Second> ImageGenerator for SequentialImageGenerator<First, Second>
+where
+    First: ImageGenerator + Sync,
+    Second: ImageGenerator + Sync,
+{
+    fn expected_image_count(&self) -> usize {
+        self.first.expected_image_count() + self.second.expected_image_count()
+    }
+
+    fn generate_image<'a>(&'a self, request: ImageGenerationRequest) -> ImageGenerationFuture<'a> {
+        Box::pin(async move {
+            let mut combined = ImageGenerationResult::default();
+            let mut last_provider_error = None;
+
+            match self
+                .first
+                .generate_image(image_generation_request_for_prompt_slot(&request, 0))
+                .await
+            {
+                Ok(result) if image_generation_result_has_images(&result) => {
+                    append_image_generation_result(&mut combined, result);
+                }
+                Ok(_) => {
+                    last_provider_error = Some(ImageGenerationError::Provider(
+                        "first image slot was empty".to_owned(),
+                    ));
+                }
+                Err(ImageGenerationError::Forbidden) => {
+                    return Err(ImageGenerationError::Forbidden);
+                }
+                Err(error) => last_provider_error = Some(error),
+            }
+
+            let second_slot = self.first.expected_image_count().max(1);
+            match self
+                .second
+                .generate_image(image_generation_request_for_prompt_slot(
+                    &request,
+                    second_slot,
+                ))
+                .await
+            {
+                Ok(result) if image_generation_result_has_images(&result) => {
+                    append_image_generation_result(&mut combined, result);
+                }
+                Ok(_) => {
+                    last_provider_error = Some(ImageGenerationError::Provider(
+                        "second image slot was empty".to_owned(),
+                    ));
+                }
+                Err(ImageGenerationError::Forbidden) => {
+                    return Err(ImageGenerationError::Forbidden);
+                }
+                Err(error) => last_provider_error = Some(error),
+            }
+
+            if image_generation_result_has_images(&combined) {
+                return Ok(combined);
+            }
+            Err(last_provider_error.unwrap_or_else(|| {
+                ImageGenerationError::Provider(
+                    "sequential image workflow produced no image".to_owned(),
+                )
+            }))
         })
     }
 }
@@ -633,6 +746,11 @@ where
 }
 
 pub trait ImageGenerator {
+    /// Number of placeholder/result slots this workflow should reserve.
+    fn expected_image_count(&self) -> usize {
+        1
+    }
+
     /// Generate and send an image.
     fn generate_image<'a>(&'a self, request: ImageGenerationRequest) -> ImageGenerationFuture<'a>;
 }
@@ -667,9 +785,18 @@ where
     Generator: ImageGenerator + Sync,
     Optimizer: MediaPromptOptimizer,
 {
+    fn expected_image_count(&self) -> usize {
+        self.generator.expected_image_count()
+    }
+
     fn generate_image<'a>(&'a self, request: ImageGenerationRequest) -> ImageGenerationFuture<'a> {
         Box::pin(async move {
-            let request = optimized_image_generation_request(&self.optimizer, request).await?;
+            let request = optimized_image_generation_request(
+                &self.optimizer,
+                request,
+                self.generator.expected_image_count().max(1),
+            )
+            .await?;
             self.generator.generate_image(request).await
         })
     }
@@ -705,6 +832,7 @@ where
 async fn optimized_image_generation_request<Optimizer>(
     optimizer: &MediaPromptOptimizerService<Optimizer>,
     mut request: ImageGenerationRequest,
+    variant_count: usize,
 ) -> Result<ImageGenerationRequest, ImageGenerationError>
 where
     Optimizer: MediaPromptOptimizer,
@@ -726,7 +854,7 @@ where
         return Ok(request);
     }
     let optimized = optimizer
-        .enhance_image_prompt(&original_prompt, &request.aspect_ratio, 1)
+        .enhance_image_prompt(&original_prompt, &request.aspect_ratio, variant_count)
         .await;
     if let Some(error) = optimized.provider_error.as_deref() {
         tracing::debug!(%error, "image prompt optimization failed; using original prompt");
@@ -795,6 +923,39 @@ fn first_prompt_variant(variants: Vec<String>, fallback: &str) -> String {
 
 fn image_generation_result_has_images(result: &ImageGenerationResult) -> bool {
     result.first_image_url().is_some() || result.image_bytes.iter().any(|image| !image.is_empty())
+}
+
+fn image_generation_request_for_prompt_slot(
+    request: &ImageGenerationRequest,
+    slot: usize,
+) -> ImageGenerationRequest {
+    let mut request = request.clone();
+    request.prompt_variants = request
+        .prompt_variants
+        .get(slot)
+        .and_then(|variant| non_empty(variant.clone()))
+        .into_iter()
+        .collect();
+    request
+}
+
+fn append_image_generation_result(
+    combined: &mut ImageGenerationResult,
+    result: ImageGenerationResult,
+) {
+    let urls = image_generation_urls(&result);
+    if combined.image_url.trim().is_empty()
+        && let Some(first_url) = urls.first()
+    {
+        combined.image_url = first_url.clone();
+    }
+    combined.image_urls.extend(urls);
+    combined.image_bytes.extend(
+        result
+            .image_bytes
+            .into_iter()
+            .filter(|image| !image.is_empty()),
+    );
 }
 
 pub trait QueuedStickerStore {
@@ -894,6 +1055,35 @@ pub trait ImageJobEffects {
         message_id: i32,
         user_id: i64,
         thread_id: Option<i32>,
+    ) -> ImageJobEffectFuture<'a, ()>;
+
+    /// Send initial generated-image placeholders and return their Telegram message IDs.
+    fn send_initial_placeholders<'a>(
+        &'a self,
+        chat_id: i64,
+        message_id: i32,
+        thread_id: Option<i32>,
+        caption_text: String,
+        is_nsfw: bool,
+        count: usize,
+    ) -> ImageJobEffectFuture<'a, Result<Vec<i32>, String>>;
+
+    /// Replace one placeholder with generated media.
+    fn replace_placeholder_image<'a>(
+        &'a self,
+        chat_id: i64,
+        placeholder_message_id: i32,
+        thread_id: Option<i32>,
+        photo: PhotoSource,
+        caption_text: String,
+        is_nsfw: bool,
+    ) -> ImageJobEffectFuture<'a, Result<i32, String>>;
+
+    /// Delete an unused placeholder.
+    fn delete_placeholder_image<'a>(
+        &'a self,
+        chat_id: i64,
+        placeholder_message_id: i32,
     ) -> ImageJobEffectFuture<'a, ()>;
 
     /// Send a generated image and return the Telegram result message ID.
@@ -1032,6 +1222,103 @@ where
                     .send_image_job_method(TelegramOutboundMethod::from(method))
                     .await;
             }
+        })
+    }
+
+    fn send_initial_placeholders<'a>(
+        &'a self,
+        chat_id: i64,
+        message_id: i32,
+        thread_id: Option<i32>,
+        caption_text: String,
+        is_nsfw: bool,
+        count: usize,
+    ) -> ImageJobEffectFuture<'a, Result<Vec<i32>, String>> {
+        Box::pin(async move {
+            let count = count.clamp(1, TELEGRAM_MEDIA_GROUP_MAX_ITEMS);
+            let response = if count == 1 {
+                let request = placeholder_image_message_request(
+                    chat_id,
+                    message_id,
+                    thread_id,
+                    caption_text,
+                    is_nsfw,
+                );
+                let method =
+                    build_photo_message_method(&request).map_err(|error| error.to_string())?;
+                self.telegram
+                    .send_image_job_method(TelegramOutboundMethod::from(method))
+                    .await?
+            } else {
+                let request = placeholder_image_media_group_request(
+                    chat_id,
+                    message_id,
+                    thread_id,
+                    caption_text,
+                    is_nsfw,
+                    count,
+                );
+                let method = build_media_group_message_method(&request)
+                    .map_err(|error| error.to_string())?;
+                self.telegram
+                    .send_image_job_method(TelegramOutboundMethod::from(method))
+                    .await?
+            };
+            let ids = image_job_response_message_ids(&response);
+            if ids.is_empty() {
+                return Err("placeholder send returned no message response".to_owned());
+            }
+            Ok(ids)
+        })
+    }
+
+    fn replace_placeholder_image<'a>(
+        &'a self,
+        chat_id: i64,
+        placeholder_message_id: i32,
+        _thread_id: Option<i32>,
+        photo: PhotoSource,
+        caption_text: String,
+        is_nsfw: bool,
+    ) -> ImageJobEffectFuture<'a, Result<i32, String>> {
+        Box::pin(async move {
+            let request = replacement_image_message_request(
+                chat_id,
+                placeholder_message_id,
+                photo,
+                caption_text,
+                is_nsfw,
+            );
+            let method =
+                build_edit_media_message_method(&request).map_err(|error| error.to_string())?;
+            let response = self
+                .telegram
+                .send_image_job_method(TelegramOutboundMethod::from(method))
+                .await?;
+            match response {
+                TelegramOutboundResponse::EditMessage(_)
+                | TelegramOutboundResponse::Message(_)
+                | TelegramOutboundResponse::Boolean(true) => Ok(placeholder_message_id),
+                TelegramOutboundResponse::Boolean(false) => {
+                    Err("editMessageMedia returned false".to_owned())
+                }
+                TelegramOutboundResponse::Messages(_)
+                | TelegramOutboundResponse::SentGuestMessage(_)
+                | TelegramOutboundResponse::String(_) => {
+                    Err("editMessageMedia returned unexpected response".to_owned())
+                }
+            }
+        })
+    }
+
+    fn delete_placeholder_image<'a>(
+        &'a self,
+        chat_id: i64,
+        placeholder_message_id: i32,
+    ) -> ImageJobEffectFuture<'a, ()> {
+        Box::pin(async move {
+            self.delete_telegram_message(chat_id, i64::from(placeholder_message_id))
+                .await;
         })
     }
 
@@ -1189,6 +1476,25 @@ fn generated_image_message_request(
     }
 }
 
+fn placeholder_image_message_request(
+    chat_id: i64,
+    message_id: i32,
+    thread_id: Option<i32>,
+    caption_text: String,
+    is_nsfw: bool,
+) -> PhotoMessageRequest {
+    let mut request = generated_image_message_request(
+        chat_id,
+        message_id,
+        thread_id,
+        caption_text,
+        PhotoSource::FileId(IMAGE_PLACEHOLDER_FILE_ID.to_owned()),
+    );
+    request.render_as = TELEGRAM_PARSE_MODE_HTML.to_owned();
+    request.has_spoiler = is_nsfw;
+    request
+}
+
 fn generated_image_media_group_request(
     chat_id: i64,
     message_id: i32,
@@ -1224,6 +1530,73 @@ fn generated_image_media_group_request(
             chat_id,
             allow_sending_without_reply: true,
         }),
+    }
+}
+
+fn placeholder_image_media_group_request(
+    chat_id: i64,
+    message_id: i32,
+    thread_id: Option<i32>,
+    caption_text: String,
+    is_nsfw: bool,
+    count: usize,
+) -> MediaGroupMessageRequest {
+    let message_thread_id = i64::from(thread_id.unwrap_or_default());
+    let is_topic_message = message_thread_id != 0;
+    MediaGroupMessageRequest {
+        chat: ChatRef {
+            id: chat_id,
+            is_forum: is_topic_message,
+        },
+        message_thread_id,
+        disable_notification: false,
+        items: (0..count)
+            .map(|index| MediaGroupPhotoItem {
+                photo: PhotoSource::FileId(IMAGE_PLACEHOLDER_FILE_ID.to_owned()),
+                caption: if index == 0 {
+                    caption_text.clone()
+                } else {
+                    String::new()
+                },
+                render_as: if index == 0 {
+                    TELEGRAM_PARSE_MODE_HTML.to_owned()
+                } else {
+                    String::new()
+                },
+                has_spoiler: is_nsfw,
+            })
+            .collect(),
+        reply_parameters: Some(ReplyParametersPlan {
+            message_id: i64::from(message_id),
+            chat_id,
+            allow_sending_without_reply: true,
+        }),
+    }
+}
+
+fn replacement_image_message_request(
+    chat_id: i64,
+    placeholder_message_id: i32,
+    photo: PhotoSource,
+    caption_text: String,
+    is_nsfw: bool,
+) -> EditMediaMessageRequest {
+    EditMediaMessageRequest {
+        chat: ChatRef {
+            id: chat_id,
+            is_forum: false,
+        },
+        message_id: i64::from(placeholder_message_id),
+        media: MediaGroupPhotoItem {
+            photo,
+            render_as: if caption_text.is_empty() {
+                String::new()
+            } else {
+                TELEGRAM_PARSE_MODE_HTML.to_owned()
+            },
+            caption: caption_text,
+            has_spoiler: is_nsfw,
+        },
     }
 }
 
@@ -1475,6 +1848,15 @@ where
     let params = sanitize_image_gen_job_params(params);
     let prompt = image_gen_prompt(&params);
     let caption_text = image_gen_caption_text(&params, &prompt);
+    let expected_image_count = generator
+        .expected_image_count()
+        .clamp(1, TELEGRAM_MEDIA_GROUP_MAX_ITEMS);
+    let display_caption = build_image_generation_caption(
+        &caption_text,
+        &params.user_full_name,
+        expected_image_count > 1,
+        params.is_nsfw,
+    );
     effects
         .remove_queued_sticker(params.chat_id, params.message_id)
         .await;
@@ -1486,6 +1868,36 @@ where
             params.thread_id,
         )
         .await;
+
+    let placeholders = match effects
+        .send_initial_placeholders(
+            params.chat_id,
+            params.message_id,
+            params.thread_id,
+            display_caption.clone(),
+            params.is_nsfw,
+            expected_image_count,
+        )
+        .await
+    {
+        Ok(placeholders) => placeholders,
+        Err(error) => {
+            if let Some(sticker_id) = drawing_sticker.filter(|sticker_id| *sticker_id > 0) {
+                effects
+                    .remove_drawing_sticker(params.chat_id, sticker_id)
+                    .await;
+            }
+            return ImageGenJobExecutionReport {
+                outcome: ImageGenJobExecutionOutcome::Failed,
+                prompt,
+                caption_text,
+                image_url: None,
+                image_urls: Vec::new(),
+                result_message_id: None,
+                error: Some(format!("send initial placeholders: {error}")),
+            };
+        }
+    };
 
     let request = ImageGenerationRequest {
         chat_id: params.chat_id,
@@ -1515,6 +1927,7 @@ where
             let image_url = image_urls.first().cloned();
             let photos = image_generation_photo_sources(&result);
             if photos.is_empty() {
+                cleanup_image_placeholders(effects, params.chat_id, &placeholders).await;
                 return ImageGenJobExecutionReport {
                     outcome: ImageGenJobExecutionOutcome::Failed,
                     prompt,
@@ -1525,15 +1938,16 @@ where
                     error: Some("image generation produced no image".to_owned()),
                 };
             }
-            match effects
-                .send_generated_images(
-                    params.chat_id,
-                    params.message_id,
-                    params.thread_id,
-                    caption_text.clone(),
-                    photos,
-                )
-                .await
+            match fill_image_placeholders(
+                effects,
+                params.chat_id,
+                params.thread_id,
+                &placeholders,
+                photos,
+                display_caption,
+                params.is_nsfw,
+            )
+            .await
             {
                 Ok(result_message_id) => ImageGenJobExecutionReport {
                     outcome: ImageGenJobExecutionOutcome::Completed,
@@ -1556,6 +1970,7 @@ where
             }
         }
         Err(ImageGenerationError::Forbidden) => {
+            cleanup_image_placeholders(effects, params.chat_id, &placeholders).await;
             effects
                 .send_nsfw_blocked_message(
                     params.chat_id,
@@ -1574,15 +1989,75 @@ where
                 error: None,
             }
         }
-        Err(error) => ImageGenJobExecutionReport {
-            outcome: ImageGenJobExecutionOutcome::Failed,
-            prompt,
-            caption_text,
-            image_url: None,
-            image_urls: Vec::new(),
-            result_message_id: None,
-            error: Some(error.message()),
-        },
+        Err(error) => {
+            cleanup_image_placeholders(effects, params.chat_id, &placeholders).await;
+            ImageGenJobExecutionReport {
+                outcome: ImageGenJobExecutionOutcome::Failed,
+                prompt,
+                caption_text,
+                image_url: None,
+                image_urls: Vec::new(),
+                result_message_id: None,
+                error: Some(error.message()),
+            }
+        }
+    }
+}
+
+async fn fill_image_placeholders<Effects>(
+    effects: &Effects,
+    chat_id: i64,
+    thread_id: Option<i32>,
+    placeholders: &[i32],
+    photos: Vec<PhotoSource>,
+    caption_text: String,
+    is_nsfw: bool,
+) -> Result<i32, String>
+where
+    Effects: ImageJobEffects + Sync,
+{
+    if placeholders.is_empty() {
+        return Err("initial placeholders are empty".to_owned());
+    }
+    let mut result_message_id = None;
+    let mut filled_count = 0usize;
+    for (index, (placeholder, photo)) in placeholders.iter().copied().zip(photos).enumerate() {
+        let caption = if index == 0 {
+            caption_text.clone()
+        } else {
+            String::new()
+        };
+        let message_id = match effects
+            .replace_placeholder_image(chat_id, placeholder, thread_id, photo, caption, is_nsfw)
+            .await
+        {
+            Ok(message_id) => message_id,
+            Err(error) => {
+                for placeholder in placeholders.iter().copied().skip(filled_count) {
+                    effects.delete_placeholder_image(chat_id, placeholder).await;
+                }
+                return Err(error);
+            }
+        };
+        if result_message_id.is_none() {
+            result_message_id = Some(message_id);
+        }
+        filled_count += 1;
+    }
+    for placeholder in placeholders.iter().copied().skip(filled_count) {
+        effects.delete_placeholder_image(chat_id, placeholder).await;
+    }
+    result_message_id.ok_or_else(|| "image generation produced no image".to_owned())
+}
+
+async fn cleanup_image_placeholders<Effects>(effects: &Effects, chat_id: i64, placeholders: &[i32])
+where
+    Effects: ImageJobEffects + Sync,
+{
+    for placeholder in placeholders {
+        effects
+            .delete_placeholder_image(chat_id, *placeholder)
+            .await;
     }
 }
 
@@ -2411,6 +2886,135 @@ fn image_job_response_message_id(response: &TelegramOutboundResponse) -> Option<
     }
 }
 
+fn image_job_response_message_ids(response: &TelegramOutboundResponse) -> Vec<i32> {
+    match response {
+        TelegramOutboundResponse::Message(message) => {
+            i32::try_from(message.id).ok().into_iter().collect()
+        }
+        TelegramOutboundResponse::Messages(messages) => messages
+            .iter()
+            .filter_map(|message| i32::try_from(message.id).ok())
+            .collect(),
+        TelegramOutboundResponse::EditMessage(_)
+        | TelegramOutboundResponse::Boolean(_)
+        | TelegramOutboundResponse::SentGuestMessage(_)
+        | TelegramOutboundResponse::String(_) => Vec::new(),
+    }
+}
+
+#[must_use]
+pub fn build_image_generation_caption(
+    prompt: &str,
+    author: &str,
+    is_vip: bool,
+    is_nsfw: bool,
+) -> String {
+    build_image_generation_caption_with_support(
+        prompt,
+        author,
+        is_vip,
+        is_nsfw,
+        random_image_support_phrase(),
+    )
+}
+
+#[must_use]
+pub fn build_image_generation_caption_with_support(
+    prompt: &str,
+    author: &str,
+    is_vip: bool,
+    is_nsfw: bool,
+    support_text: &str,
+) -> String {
+    let cleaned_prompt = ensure_telegram_safe_text(prompt.trim());
+    let cleaned_author = ensure_telegram_safe_text(author.trim());
+    let mut author_text = escape_telegram_html_text(&cleaned_author);
+    if is_vip {
+        author_text = format!("<a href=\"{DRAW_VIP_URL}\">VIP-персоны  👑</a> {author_text}");
+    }
+    if is_nsfw {
+        author_text.push_str("\n#nsfw 18+");
+    }
+    let support_text = escape_telegram_html_text(support_text.trim());
+    let prompt = if cleaned_prompt.is_empty() {
+        "Изображение по запросу пользователя".to_owned()
+    } else {
+        cleaned_prompt
+    };
+    let expandable = draw_caption_prompt_word_count(&prompt) > DRAW_CAPTION_WORD_THRESHOLD;
+    let prompt = trim_draw_caption_prompt(&prompt, expandable, &author_text, &support_text);
+    format_draw_caption(&prompt, expandable, &author_text, &support_text)
+}
+
+fn draw_caption_prompt_word_count(prompt: &str) -> usize {
+    prompt.split_whitespace().count()
+}
+
+fn trim_draw_caption_prompt(
+    prompt: &str,
+    expandable: bool,
+    author_text: &str,
+    support_text: &str,
+) -> String {
+    let caption = format_draw_caption(prompt, expandable, author_text, support_text);
+    if telegram_caption_visible_len(&caption) <= TELEGRAM_CAPTION_MAX_VISIBLE {
+        return prompt.to_owned();
+    }
+
+    let runes = prompt.chars().collect::<Vec<_>>();
+    let mut best = DRAW_CAPTION_ELLIPSIS.to_owned();
+    let mut low = 0usize;
+    let mut high = runes.len();
+    while low <= high {
+        let mid = low + (high - low) / 2;
+        let candidate = runes[..mid]
+            .iter()
+            .collect::<String>()
+            .trim_end()
+            .to_owned()
+            + DRAW_CAPTION_ELLIPSIS;
+        let caption = format_draw_caption(&candidate, expandable, author_text, support_text);
+        if telegram_caption_visible_len(&caption) <= TELEGRAM_CAPTION_MAX_VISIBLE {
+            best = candidate;
+            low = mid.saturating_add(1);
+        } else if mid == 0 {
+            break;
+        } else {
+            high = mid - 1;
+        }
+    }
+    best
+}
+
+fn format_draw_caption(
+    prompt: &str,
+    expandable: bool,
+    author_text: &str,
+    support_text: &str,
+) -> String {
+    let prompt_text = format_draw_caption_prompt(prompt, expandable);
+    format!(
+        "{prompt_text} \nза авторством <i>{author_text}</i>\n<a href=\"{DRAW_SUPPORT_ME_URL}\">{support_text}</a>"
+    )
+}
+
+fn format_draw_caption_prompt(prompt: &str, expandable: bool) -> String {
+    let escaped_prompt = escape_telegram_html_text(prompt);
+    if expandable {
+        return format!("<blockquote expandable>{escaped_prompt}</blockquote>");
+    }
+    format!("<code>{escaped_prompt}</code>")
+}
+
+fn telegram_caption_visible_len(caption: &str) -> usize {
+    strip_telegram_html(caption).encode_utf16().count()
+}
+
+fn random_image_support_phrase() -> &'static str {
+    let index = rand::rng().random_range(0..IMAGE_SUPPORT_PHRASES.len());
+    IMAGE_SUPPORT_PHRASES[index]
+}
+
 #[must_use]
 pub fn draw_api_prompt_text(request: &ImageGenerationRequest) -> String {
     if let Some(variant) = request.prompt_variants.iter().find_map(|value| {
@@ -2874,15 +3478,16 @@ mod tests {
                 seed: "42".to_owned(),
             }]
         );
-        assert_eq!(
-            effects.calls(),
-            vec![
-                "remove_queued:-100:20",
-                "send_drawing:-100:20:30:9",
-                "remove_drawing:-100:777",
-                "send_images:-100:20:9:original caption:[Url(\"https://img.test/1.png\")]",
-            ]
+        let calls = effects.calls();
+        assert_eq!(calls[0], "remove_queued:-100:20");
+        assert_eq!(calls[1], "send_drawing:-100:20:30:9");
+        assert!(
+            calls[2].starts_with("send_placeholders:-100:20:9:1:<code>original caption</code>")
         );
+        assert_eq!(calls[3], "remove_drawing:-100:777");
+        assert!(calls[4].starts_with(
+            "replace_placeholder:-100:888:9:Url(\"https://img.test/1.png\"):<code>original caption</code>"
+        ));
     }
 
     #[tokio::test]
@@ -2890,8 +3495,9 @@ mod tests {
         let generator = GeneratorStub::success_many(vec![
             " https://img.test/1.png ".to_owned(),
             "https://img.test/2.png".to_owned(),
-        ]);
-        let effects = EffectsStub::new(Some(777));
+        ])
+        .with_expected_image_count(2);
+        let effects = EffectsStub::new(Some(777)).with_placeholder_ids(vec![888, 889]);
         let report = execute_image_gen_job(
             &generator,
             &effects,
@@ -2910,14 +3516,76 @@ mod tests {
 
         assert_eq!(report.outcome, ImageGenJobExecutionOutcome::Completed);
         assert_eq!(report.result_message_id, Some(888));
+        let calls = effects.calls();
+        assert_eq!(calls[0], "remove_queued:-100:20");
+        assert_eq!(calls[1], "send_drawing:-100:20:30:9");
+        assert!(
+            calls[2].starts_with("send_placeholders:-100:20:9:2:<code>original caption</code>")
+        );
+        assert_eq!(calls[3], "remove_drawing:-100:777");
+        assert!(calls[4].starts_with(
+            "replace_placeholder:-100:888:9:Url(\"https://img.test/1.png\"):<code>original caption</code>"
+        ));
         assert_eq!(
-            effects.calls(),
-            vec![
-                "remove_queued:-100:20",
-                "send_drawing:-100:20:30:9",
-                "remove_drawing:-100:777",
-                "send_images:-100:20:9:original caption:[Url(\"https://img.test/1.png\"), Url(\"https://img.test/2.png\")]",
-            ]
+            calls[5],
+            "replace_placeholder:-100:889:9:Url(\"https://img.test/2.png\"):"
+        );
+    }
+
+    #[test]
+    fn image_generation_caption_matches_go_draw_caption_contract() {
+        let caption = build_image_generation_caption_with_support(
+            "sunset over <mountains>",
+            "Alice & Bob",
+            true,
+            true,
+            "support",
+        );
+
+        assert!(caption.contains("<code>sunset over &lt;mountains&gt;</code>"));
+        assert!(caption.contains(
+            "<a href=\"https://t.me/PlotvoBot?start=vip\">VIP-персоны  👑</a> Alice &amp; Bob"
+        ));
+        assert!(caption.contains("#nsfw 18+"));
+        assert!(caption.contains("<a href=\"https://t.me/PlotvoBot?start=donate\">support</a>"));
+    }
+
+    #[tokio::test]
+    async fn execute_vip_image_gen_job_sends_placeholders_and_edits_slots_in_order() {
+        let generator = GeneratorStub::success_many(vec![
+            "https://img.test/vip-1.png".to_owned(),
+            "https://img.test/vip-2.png".to_owned(),
+        ])
+        .with_expected_image_count(2);
+        let effects = EffectsStub::new(Some(777)).with_placeholder_ids(vec![901, 902]);
+        let report = execute_image_gen_job(
+            &generator,
+            &effects,
+            ImageGenJobParams {
+                chat_id: -100,
+                message_id: 20,
+                user_id: 30,
+                user_full_name: "Alice".to_owned(),
+                prompt: "castle".to_owned(),
+                thread_id: Some(9),
+                ..ImageGenJobParams::default()
+            },
+        )
+        .await;
+
+        assert_eq!(report.outcome, ImageGenJobExecutionOutcome::Completed);
+        assert_eq!(report.result_message_id, Some(901));
+        let calls = effects.calls();
+        assert_eq!(calls[0], "remove_queued:-100:20");
+        assert_eq!(calls[1], "send_drawing:-100:20:30:9");
+        assert!(calls[2].starts_with("send_placeholders:-100:20:9:2:<code>castle</code>"));
+        assert_eq!(calls[3], "remove_drawing:-100:777");
+        assert!(calls[4].starts_with(
+            "replace_placeholder:-100:901:9:Url(\"https://img.test/vip-1.png\"):<code>castle</code>"
+        ));
+        assert_eq!(
+            calls[5],
+            "replace_placeholder:-100:902:9:Url(\"https://img.test/vip-2.png\"):"
         );
     }
 
@@ -2945,13 +3613,14 @@ mod tests {
         assert_eq!(report.prompt, "рыжий\n\nкот");
         assert_eq!(report.caption_text, "рыжий\n\nкот");
         assert_eq!(report.error, None);
+        let calls = effects.calls();
+        assert_eq!(calls[0], "remove_queued:-100:20");
+        assert_eq!(calls[1], "send_drawing:-100:20:30:0");
+        assert!(calls[2].starts_with("send_placeholders:-100:20:0:1:<code>рыжий\n\nкот</code>"));
+        assert_eq!(calls[3], "delete_placeholder:-100:888");
         assert_eq!(
-            effects.calls(),
-            vec![
-                "remove_queued:-100:20",
-                "send_drawing:-100:20:30:0",
-                "send_nsfw_blocked:-100:20:30:0:Ваш запрос заблокирован, так как содержит неприемлемый контент. Попробуйте переформулировать запрос.",
-            ]
+            calls[4],
+            "send_nsfw_blocked:-100:20:30:0:Ваш запрос заблокирован, так как содержит неприемлемый контент. Попробуйте переформулировать запрос."
         );
     }
 
@@ -3094,6 +3763,82 @@ mod tests {
                 seed: "seed 42".to_owned(),
                 ..ImageGenerationRequest::default()
             }]
+        );
+    }
+
+    #[tokio::test]
+    async fn optimizing_image_generator_requests_variants_for_expected_image_slots() {
+        let generator =
+            GeneratorStub::success("https://img.test/1.png").with_expected_image_count(2);
+        let optimizer =
+            OptimizerStub::default().with_image_result(openplotva_media::ImageOptimize {
+                input: "cat | blur 1:1 seed 42".to_owned(),
+                outputs: vec![
+                    "plotva swims near a roach".to_owned(),
+                    "plotva sleeps near a roach".to_owned(),
+                ],
+                aspect_ratio: "16:9".to_owned(),
+                nsfw_result: openplotva_media::NsfwResult::Safe,
+            });
+        let optimizing = OptimizingImageGenerator::new(
+            generator.clone(),
+            crate::media::MediaPromptOptimizerService::new(Some(optimizer.clone())),
+        );
+
+        let result = optimizing
+            .generate_image(ImageGenerationRequest {
+                prompt: "cat".to_owned(),
+                negative_prompt: "blur".to_owned(),
+                aspect_ratio: "1:1".to_owned(),
+                seed: "seed 42".to_owned(),
+                ..ImageGenerationRequest::default()
+            })
+            .await;
+
+        assert!(result.is_ok());
+        assert_eq!(
+            optimizer.calls(),
+            vec!["image:cat | blur 1:1 seed 42:2".to_owned()]
+        );
+        assert_eq!(
+            generator.requests()[0].prompt_variants,
+            vec![
+                "roach-fish swims near a roach-fish".to_owned(),
+                "roach-fish sleeps near a roach-fish".to_owned()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn sequential_image_generator_uses_prompt_slots_and_combines_results() {
+        let first = GeneratorStub::success("https://img.test/first.png");
+        let second = GeneratorStub::success("https://img.test/second.png");
+        let sequential = SequentialImageGenerator::new(first.clone(), second.clone());
+
+        let result = sequential
+            .generate_image(ImageGenerationRequest {
+                prompt: "fallback prompt".to_owned(),
+                prompt_variants: vec!["first prompt".to_owned(), "second prompt".to_owned()],
+                ..ImageGenerationRequest::default()
+            })
+            .await
+            .expect("sequential result");
+
+        assert_eq!(sequential.expected_image_count(), 2);
+        assert_eq!(
+            image_generation_urls(&result),
+            vec![
+                "https://img.test/first.png".to_owned(),
+                "https://img.test/second.png".to_owned()
+            ]
+        );
+        assert_eq!(
+            first.requests()[0].prompt_variants,
+            vec!["first prompt".to_owned()]
+        );
+        assert_eq!(
+            second.requests()[0].prompt_variants,
+            vec!["second prompt".to_owned()]
         );
     }
 
@@ -4122,6 +4867,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn telegram_image_job_effects_send_initial_placeholders_uses_media_group_for_multi_slot()
+    {
+        let queued = QueuedStickerStoreStub::default();
+        let ephemeral = EphemeralTrackerStub::default();
+        let telegram = TelegramSenderStub::new(vec![Ok(TelegramOutboundResponse::Messages(vec![
+            telegram_message(-10042, 555),
+            telegram_message(-10042, 556),
+        ]))]);
+        let effects =
+            TelegramImageJobEffects::new(queued.clone(), ephemeral.clone(), telegram.clone());
+
+        let result = effects
+            .send_initial_placeholders(
+                -10042,
+                77,
+                Some(9),
+                "<code>caption</code>".to_owned(),
+                true,
+                2,
+            )
+            .await;
+
+        assert_eq!(result, Ok(vec![555, 556]));
+        assert_eq!(
+            telegram.kinds(),
+            vec![TelegramOutboundMethodKind::SendMediaGroup]
+        );
+        assert!(queued.snapshot().loads.is_empty());
+        assert!(ephemeral.tracked().is_empty());
+    }
+
+    #[tokio::test]
+    async fn telegram_image_job_effects_replace_placeholder_uses_edit_media() {
+        let queued = QueuedStickerStoreStub::default();
+        let ephemeral = EphemeralTrackerStub::default();
+        let telegram = TelegramSenderStub::new(vec![Ok(TelegramOutboundResponse::Boolean(true))]);
+        let effects =
+            TelegramImageJobEffects::new(queued.clone(), ephemeral.clone(), telegram.clone());
+
+        let result = effects
+            .replace_placeholder_image(
+                -10042,
+                555,
+                Some(9),
+                PhotoSource::Url("https://img.test/1.png".to_owned()),
+                "<code>caption</code>".to_owned(),
+                false,
+            )
+            .await;
+
+        assert_eq!(result, Ok(555));
+        assert_eq!(
+            telegram.kinds(),
+            vec![TelegramOutboundMethodKind::EditMessageMedia]
+        );
+        assert!(queued.snapshot().loads.is_empty());
+        assert!(ephemeral.tracked().is_empty());
+    }
+
+    #[tokio::test]
     async fn telegram_image_job_effects_remove_queued_sticker_deletes_message_and_key() {
         let queued = QueuedStickerStoreStub::with_queued_id(Some(444));
         let ephemeral = EphemeralTrackerStub::default();
@@ -4481,6 +5286,7 @@ mod tests {
     struct GeneratorStub {
         result: Result<ImageGenerationResult, ImageGenerationError>,
         requests: Arc<Mutex<Vec<ImageGenerationRequest>>>,
+        expected_image_count: usize,
     }
 
     impl GeneratorStub {
@@ -4491,6 +5297,7 @@ mod tests {
                     ..ImageGenerationResult::default()
                 }),
                 requests: Arc::new(Mutex::new(Vec::new())),
+                expected_image_count: 1,
             }
         }
 
@@ -4501,6 +5308,7 @@ mod tests {
                     ..ImageGenerationResult::default()
                 }),
                 requests: Arc::new(Mutex::new(Vec::new())),
+                expected_image_count: 1,
             }
         }
 
@@ -4508,6 +5316,7 @@ mod tests {
             Self {
                 result: Err(ImageGenerationError::Forbidden),
                 requests: Arc::new(Mutex::new(Vec::new())),
+                expected_image_count: 1,
             }
         }
 
@@ -4515,7 +5324,13 @@ mod tests {
             Self {
                 result: Err(ImageGenerationError::Provider(message.into())),
                 requests: Arc::new(Mutex::new(Vec::new())),
+                expected_image_count: 1,
             }
+        }
+
+        fn with_expected_image_count(mut self, expected_image_count: usize) -> Self {
+            self.expected_image_count = expected_image_count;
+            self
         }
 
         fn requests(&self) -> Vec<ImageGenerationRequest> {
@@ -4524,6 +5339,10 @@ mod tests {
     }
 
     impl ImageGenerator for GeneratorStub {
+        fn expected_image_count(&self) -> usize {
+            self.expected_image_count
+        }
+
         fn generate_image<'a>(
             &'a self,
             request: ImageGenerationRequest,
@@ -4672,6 +5491,7 @@ mod tests {
     struct EffectsStub {
         drawing_sticker: Option<i32>,
         calls: Mutex<Vec<String>>,
+        placeholder_ids: Vec<i32>,
     }
 
     impl EffectsStub {
@@ -4679,7 +5499,13 @@ mod tests {
             Self {
                 drawing_sticker,
                 calls: Mutex::new(Vec::new()),
+                placeholder_ids: vec![888],
             }
+        }
+
+        fn with_placeholder_ids(mut self, placeholder_ids: Vec<i32>) -> Self {
+            self.placeholder_ids = placeholder_ids;
+            self
         }
 
         fn calls(&self) -> Vec<String> {
@@ -4723,6 +5549,55 @@ mod tests {
         ) -> ImageJobEffectFuture<'a, ()> {
             self.call_log()
                 .push(format!("remove_drawing:{chat_id}:{sticker_message_id}"));
+            Box::pin(async {})
+        }
+
+        fn send_initial_placeholders<'a>(
+            &'a self,
+            chat_id: i64,
+            message_id: i32,
+            thread_id: Option<i32>,
+            caption_text: String,
+            _is_nsfw: bool,
+            count: usize,
+        ) -> ImageJobEffectFuture<'a, Result<Vec<i32>, String>> {
+            self.call_log().push(format!(
+                "send_placeholders:{chat_id}:{message_id}:{}:{count}:{caption_text}",
+                thread_id.unwrap_or_default()
+            ));
+            let placeholder_ids = self
+                .placeholder_ids
+                .iter()
+                .copied()
+                .take(count)
+                .collect::<Vec<_>>();
+            Box::pin(async move { Ok(placeholder_ids) })
+        }
+
+        fn replace_placeholder_image<'a>(
+            &'a self,
+            chat_id: i64,
+            placeholder_message_id: i32,
+            thread_id: Option<i32>,
+            photo: PhotoSource,
+            caption_text: String,
+            _is_nsfw: bool,
+        ) -> ImageJobEffectFuture<'a, Result<i32, String>> {
+            self.call_log().push(format!(
+                "replace_placeholder:{chat_id}:{placeholder_message_id}:{}:{photo:?}:{caption_text}",
+                thread_id.unwrap_or_default()
+            ));
+            Box::pin(async move { Ok(placeholder_message_id) })
+        }
+
+        fn delete_placeholder_image<'a>(
+            &'a self,
+            chat_id: i64,
+            placeholder_message_id: i32,
+        ) -> ImageJobEffectFuture<'a, ()> {
+            self.call_log().push(format!(
+                "delete_placeholder:{chat_id}:{placeholder_message_id}"
+            ));
             Box::pin(async {})
         }
 
