@@ -2077,6 +2077,8 @@ where
     Effects: ImageJobEffects + Sync,
 {
     let params = sanitize_image_edit_job_params(params);
+    let display_caption =
+        build_image_generation_caption(&params.prompt, &params.user_full_name, true, false);
     effects
         .remove_queued_sticker(params.chat_id, params.message_id)
         .await;
@@ -2089,11 +2091,53 @@ where
         )
         .await;
 
+    let placeholders = match effects
+        .send_initial_placeholders(
+            params.chat_id,
+            params.message_id,
+            params.thread_id,
+            display_caption.clone(),
+            false,
+            1,
+        )
+        .await
+    {
+        Ok(placeholders) => placeholders,
+        Err(error) => {
+            if let Some(sticker_id) = drawing_sticker.filter(|sticker_id| *sticker_id > 0) {
+                effects
+                    .remove_drawing_sticker(params.chat_id, sticker_id)
+                    .await;
+            }
+            return ImageEditJobExecutionReport {
+                outcome: ImageEditJobExecutionOutcome::Failed,
+                prompt: params.prompt,
+                image_urls: Vec::new(),
+                result_message_id: None,
+                error: Some(format!("send initial placeholders: {error}")),
+            };
+        }
+    };
+    let Some(placeholder_message_id) = placeholders.first().copied() else {
+        if let Some(sticker_id) = drawing_sticker.filter(|sticker_id| *sticker_id > 0) {
+            effects
+                .remove_drawing_sticker(params.chat_id, sticker_id)
+                .await;
+        }
+        return ImageEditJobExecutionReport {
+            outcome: ImageEditJobExecutionOutcome::Failed,
+            prompt: params.prompt,
+            image_urls: Vec::new(),
+            result_message_id: None,
+            error: Some("initial placeholders are empty".to_owned()),
+        };
+    };
+
     let request = ImageEditRequest {
         chat_id: params.chat_id,
         message_id: params.message_id,
         user_id: params.user_id,
-        user_full_name: params.user_full_name,
+        user_full_name: params.user_full_name.clone(),
         thread_id: params.thread_id,
         prompt: params.prompt.clone(),
         photo_file_id: params.photo_file_id,
@@ -2128,6 +2172,7 @@ where
                 })
                 .or_else(|| image_urls.first().cloned().map(PhotoSource::Url));
             let Some(photo) = photo else {
+                cleanup_image_placeholders(effects, params.chat_id, &placeholders).await;
                 return ImageEditJobExecutionReport {
                     outcome: ImageEditJobExecutionOutcome::Failed,
                     prompt: params.prompt,
@@ -2137,7 +2182,14 @@ where
                 };
             };
             match effects
-                .send_generated_image(params.chat_id, params.message_id, params.thread_id, photo)
+                .replace_placeholder_image(
+                    params.chat_id,
+                    placeholder_message_id,
+                    params.thread_id,
+                    photo,
+                    display_caption,
+                    false,
+                )
                 .await
             {
                 Ok(result_message_id) => ImageEditJobExecutionReport {
@@ -2147,16 +2199,20 @@ where
                     result_message_id: Some(result_message_id),
                     error: None,
                 },
-                Err(error) => ImageEditJobExecutionReport {
-                    outcome: ImageEditJobExecutionOutcome::Failed,
-                    prompt: params.prompt,
-                    image_urls,
-                    result_message_id: None,
-                    error: Some(format!("send generated image: {error}")),
-                },
+                Err(error) => {
+                    cleanup_image_placeholders(effects, params.chat_id, &placeholders).await;
+                    ImageEditJobExecutionReport {
+                        outcome: ImageEditJobExecutionOutcome::Failed,
+                        prompt: params.prompt,
+                        image_urls,
+                        result_message_id: None,
+                        error: Some(format!("send generated image: {error}")),
+                    }
+                }
             }
         }
         Err(ImageEditError::Forbidden) => {
+            cleanup_image_placeholders(effects, params.chat_id, &placeholders).await;
             effects
                 .send_nsfw_blocked_message(
                     params.chat_id,
@@ -2173,13 +2229,16 @@ where
                 error: None,
             }
         }
-        Err(error) => ImageEditJobExecutionReport {
-            outcome: ImageEditJobExecutionOutcome::Failed,
-            prompt: params.prompt,
-            image_urls: Vec::new(),
-            result_message_id: None,
-            error: Some(error.message()),
-        },
+        Err(error) => {
+            cleanup_image_placeholders(effects, params.chat_id, &placeholders).await;
+            ImageEditJobExecutionReport {
+                outcome: ImageEditJobExecutionOutcome::Failed,
+                prompt: params.prompt,
+                image_urls: Vec::new(),
+                result_message_id: None,
+                error: Some(error.message()),
+            }
+        }
     }
 }
 
@@ -3671,15 +3730,17 @@ mod tests {
                 photo_urls: vec!["https://telegram.test/original.png".to_owned()],
             }]
         );
-        assert_eq!(
-            effects.calls(),
-            vec![
-                "remove_queued:-100:20",
-                "send_drawing:-100:20:30:9",
-                "remove_drawing:-100:777",
-                "send_image:-100:20:9:Url(\"https://img.test/edit-1.png\")",
-            ]
-        );
+        let calls = effects.calls();
+        assert_eq!(calls.len(), 5);
+        assert_eq!(calls[0], "remove_queued:-100:20");
+        assert_eq!(calls[1], "send_drawing:-100:20:30:9");
+        assert!(calls[2].starts_with(
+            "send_placeholders:-100:20:9:1:<code>make it night</code> \nза авторством <i><a href=\"https://t.me/PlotvoBot?start=vip\">VIP-персоны  👑</a> Alice</i>\n<a href=\"https://t.me/PlotvoBot?start=donate\">"
+        ));
+        assert_eq!(calls[3], "remove_drawing:-100:777");
+        assert!(calls[4].starts_with(
+            "replace_placeholder:-100:888:9:Url(\"https://img.test/edit-1.png\"):<code>make it night</code> \nза авторством <i><a href=\"https://t.me/PlotvoBot?start=vip\">VIP-персоны  👑</a> Alice</i>\n<a href=\"https://t.me/PlotvoBot?start=donate\">"
+        ));
     }
 
     #[tokio::test]
@@ -3703,14 +3764,51 @@ mod tests {
         assert_eq!(report.prompt, "edit");
         assert!(report.image_urls.is_empty());
         assert_eq!(report.error, None);
+        let calls = effects.calls();
+        assert_eq!(calls.len(), 5);
+        assert_eq!(calls[0], "remove_queued:-100:20");
+        assert_eq!(calls[1], "send_drawing:-100:20:30:0");
+        assert!(calls[2].starts_with(
+            "send_placeholders:-100:20:0:1:<code>edit</code> \nза авторством <i><a href=\"https://t.me/PlotvoBot?start=vip\">VIP-персоны  👑</a> </i>\n<a href=\"https://t.me/PlotvoBot?start=donate\">"
+        ));
+        assert_eq!(calls[3], "delete_placeholder:-100:888");
         assert_eq!(
-            effects.calls(),
-            vec![
-                "remove_queued:-100:20",
-                "send_drawing:-100:20:30:0",
-                "send_nsfw_blocked:-100:20:30:0:Ваш запрос заблокирован, так как содержит неприемлемый контент. Попробуйте переформулировать запрос.",
-            ]
+            calls[4],
+            "send_nsfw_blocked:-100:20:30:0:Ваш запрос заблокирован, так как содержит неприемлемый контент. Попробуйте переформулировать запрос."
         );
+    }
+
+    #[tokio::test]
+    async fn execute_image_edit_job_deletes_placeholder_when_provider_fails() {
+        let editor = EditorStub::error("draw api failed");
+        let effects = EffectsStub::new(Some(777));
+        let report = execute_image_edit_job(
+            &editor,
+            &effects,
+            ImageEditJobParams {
+                chat_id: -100,
+                message_id: 20,
+                user_id: 30,
+                user_full_name: "Alice".to_owned(),
+                prompt: " make it night ".to_owned(),
+                thread_id: Some(9),
+                ..ImageEditJobParams::default()
+            },
+        )
+        .await;
+
+        assert_eq!(report.outcome, ImageEditJobExecutionOutcome::Failed);
+        assert_eq!(report.prompt, "make it night");
+        assert_eq!(report.error, Some("draw api failed".to_owned()));
+        let calls = effects.calls();
+        assert_eq!(calls.len(), 5);
+        assert_eq!(calls[0], "remove_queued:-100:20");
+        assert_eq!(calls[1], "send_drawing:-100:20:30:9");
+        assert!(calls[2].starts_with(
+            "send_placeholders:-100:20:9:1:<code>make it night</code> \nза авторством <i><a href=\"https://t.me/PlotvoBot?start=vip\">VIP-персоны  👑</a> Alice</i>\n<a href=\"https://t.me/PlotvoBot?start=donate\">"
+        ));
+        assert_eq!(calls[3], "remove_drawing:-100:777");
+        assert_eq!(calls[4], "delete_placeholder:-100:888");
     }
 
     #[tokio::test]
@@ -4716,15 +4814,17 @@ mod tests {
 
         assert_eq!(report.outcome, ImageEditJobExecutionOutcome::Completed);
         assert_eq!(report.result_message_id, Some(888));
-        assert_eq!(
-            effects.calls(),
-            vec![
-                "remove_queued:-100:20",
-                "send_drawing:-100:20:30:9",
-                "remove_drawing:-100:777",
-                "send_image:-100:20:9:Bytes { file_name: \"image.png\", bytes: [9, 8, 7] }",
-            ]
-        );
+        let calls = effects.calls();
+        assert_eq!(calls.len(), 5);
+        assert_eq!(calls[0], "remove_queued:-100:20");
+        assert_eq!(calls[1], "send_drawing:-100:20:30:9");
+        assert!(calls[2].starts_with(
+            "send_placeholders:-100:20:9:1:<code>make it night</code> \nза авторством <i><a href=\"https://t.me/PlotvoBot?start=vip\">VIP-персоны  👑</a> Alice</i>\n<a href=\"https://t.me/PlotvoBot?start=donate\">"
+        ));
+        assert_eq!(calls[3], "remove_drawing:-100:777");
+        assert!(calls[4].starts_with(
+            "replace_placeholder:-100:888:9:Bytes { file_name: \"image.png\", bytes: [9, 8, 7] }:<code>make it night</code> \nза авторством <i><a href=\"https://t.me/PlotvoBot?start=vip\">VIP-персоны  👑</a> Alice</i>\n<a href=\"https://t.me/PlotvoBot?start=donate\">"
+        ));
     }
 
     #[tokio::test]
