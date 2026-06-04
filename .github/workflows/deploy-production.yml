@@ -52,7 +52,7 @@ jobs:
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: rust-${{ runner.os }}-${{ env.RUST_VERSION }}-deploy
+          shared-key: rust-${{ runner.os }}-ubuntu-22.04-${{ env.RUST_VERSION }}-deploy
 
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
