@@ -3441,12 +3441,61 @@ fn append_trimmed_string(mut out: Vec<String>, value: &str) -> Vec<String> {
 }
 
 fn classify_draw_api_error(message: String) -> ImageGenerationError {
-    let lower = message.to_ascii_lowercase();
-    if lower.contains("forbidden") || lower.contains("safety") || lower.contains("nsfw") {
+    if draw_api_error_is_forbidden_minor_sexual(&message) {
         ImageGenerationError::Forbidden
     } else {
         ImageGenerationError::Provider(message)
     }
+}
+
+fn draw_api_error_is_forbidden_minor_sexual(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    if contains_any(
+        &lower,
+        &[
+            "csam",
+            "child sexual abuse",
+            "sexual content involving minor",
+            "sexual content involving child",
+            "sexualized minor",
+            "sexualized child",
+            "underage nudity",
+            "underage nude",
+        ],
+    ) {
+        return true;
+    }
+
+    contains_any(
+        &lower,
+        &[
+            "minor",
+            "underage",
+            "under-age",
+            "child",
+            "children",
+            "prepubescent",
+            "pre-pubescent",
+        ],
+    ) && contains_any(
+        &lower,
+        &[
+            "sexual",
+            "sex",
+            "nude",
+            "nudity",
+            "porn",
+            "erotic",
+            "sexualized",
+            "exploitation",
+            "exploitative",
+            "abuse",
+        ],
+    )
+}
+
+fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(*needle))
 }
 
 fn generated_draw_job_id() -> String {
@@ -5380,6 +5429,31 @@ mod tests {
         assert_eq!(result.image_url, "https://drawapi.test/1.png");
         assert_eq!(primary.requests().len(), 1);
         assert_eq!(fallback.requests().len(), 1);
+    }
+
+    #[test]
+    fn draw_api_error_classification_keeps_generic_safety_as_provider_error() {
+        for message in [
+            "job failed: safety filter blocked prompt",
+            "job failed: nsfw content refused",
+            "job failed: forbidden by provider policy",
+        ] {
+            assert_eq!(
+                classify_draw_api_error(message.to_owned()),
+                ImageGenerationError::Provider(message.to_owned())
+            );
+        }
+
+        for message in [
+            "job failed: CSAM content detected",
+            "job failed: child sexual abuse material detected",
+            "job failed: underage nudity detected",
+        ] {
+            assert_eq!(
+                classify_draw_api_error(message.to_owned()),
+                ImageGenerationError::Forbidden
+            );
+        }
     }
 
     #[derive(Clone, Debug)]

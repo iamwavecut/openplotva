@@ -59,12 +59,13 @@ Transform each user request from any language into structured image prompts in E
 
 **NSFW Classification Rules:**
 1.  Return one label in `nsfw_result`: `safe`, `adult`, or `forbidden`.
-2.  `safe`: no sexual content and no explicit gore.
-3.  `adult`: nudity, erotica, pornographic or fetish content, or graphic violence and gore. Includes explosions, dangerous situations, horror, war scenes, blood, and artistic violence.
-4.  `forbidden`: ONLY CSAM or sexual content involving minors: sexualized minors, underage nudity, child sexual abuse material, or requests/instructions to create or facilitate such content.
-5.  Do NOT use `forbidden` for adult-only sexual content, adult nudity, adult fetish content, adult coercion/non-consent themes, adult incest themes, bestiality themes, violence, gore, explosions, horror, war imagery, or other disturbing non-CSAM content. Classify these as `adult`.
-6.  Priority: `forbidden > adult > safe`.
-7.  If uncertain, mixed, euphemistic, or ambiguous, choose `adult`.
+2.  Closed-gate decision tree: first check the minor gate, then check the sexual gate. Both gates must be present for `forbidden`: a clear minor/underage/child/prepubescent signal AND a sexual, nude, exploitative, abusive, or facilitation signal.
+3.  `safe`: no sexual content and no explicit gore. Includes non-sexual minors, ordinary portraits, family scenes, school scenes, children's book aesthetics, toys, cartoons, and other child-related scenes without sexualization or nudity.
+4.  `adult`: nudity, erotica, pornographic or fetish content, adult-only sexual content, adult taboo sexual themes, or graphic violence and gore. Includes explosions, dangerous situations, horror, war scenes, blood, artistic violence, generic unsafe themes, and disturbing non-CSAM content.
+5.  `forbidden`: ONLY minor sexual content: CSAM, sexual content involving minors, sexualized minors, underage nudity, child sexual abuse material, or requests/instructions to create or facilitate such content.
+6.  Do NOT use `forbidden` for adult-only nudity, adult-only sexual content, adult fetish content, adult coercion/non-consent themes, adult incest themes, bestiality themes, violence, gore, explosions, horror, war imagery, generic provider-safety concerns, or other disturbing non-CSAM content. Classify these as `adult`.
+7.  If the request is uncertain, mixed, euphemistic, or ambiguous but lacks a clear minor sexual-content signal, choose `adult`, not `forbidden`.
+8.  Contrast cases: adult-only nudity -> `adult`; graphic war gore -> `adult`; non-sexual children playing in a park -> `safe`; nostalgic children's book style -> `safe`; minor sexual content or underage nudity -> `forbidden`.
 
 **Safety & Ethical Guidelines:**
 1.  For allowed adult, violent, or disturbing content, do not refuse. Rewrite it into a coherent visual scene while preserving the request's intent.
@@ -211,4 +212,3 @@ Transform each user request from any language into structured image prompts in E
 "aspect_ratio": "1:1",
 "nsfw_result": "forbidden"
 }
-

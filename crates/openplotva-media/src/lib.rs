@@ -443,6 +443,7 @@ fn optimizer_terminator_definition(
             json!({
                 "type": "string",
                 "enum": ["safe", "adult", "forbidden"],
+                "description": "Image safety classification. Use forbidden for minor sexual content only: CSAM, sexual content involving minors, sexualized minors, underage nudity, or facilitation of that content. Use adult for adult-only sexual content, gore, violence, horror, war, generic unsafe themes, or ambiguous non-CSAM content.",
             }),
         ),
     ]);
@@ -589,11 +590,21 @@ mod tests {
         let prompt = render_image_optimizer_prompt(2).expect("render image optimizer prompt");
         assert!(prompt.contains("optimize_prompt_terminator"));
         assert!(prompt.contains("must contain exactly `2` optimized prompts"));
+        assert!(prompt.contains("Closed-gate decision tree"));
+        assert!(prompt.contains("Both gates must be present for `forbidden`"));
+        assert!(prompt.contains("adult-only nudity"));
+        assert!(prompt.contains("non-sexual children"));
+        assert!(prompt.contains("minor sexual content"));
 
         let edit_prompt =
             render_image_edit_optimizer_prompt(0).expect("render image edit optimizer prompt");
         assert!(edit_prompt.contains("optimize_edit_prompt_terminator"));
         assert!(edit_prompt.contains("must contain exactly `1` final edit instructions"));
+        assert!(edit_prompt.contains("Closed-gate decision tree"));
+        assert!(edit_prompt.contains("Both gates must be present for `forbidden`"));
+        assert!(edit_prompt.contains("adult-only nudity"));
+        assert!(edit_prompt.contains("non-sexual children"));
+        assert!(edit_prompt.contains("minor sexual content"));
 
         let tool = optimize_prompt_terminator_definition(2);
         assert_eq!(tool.name, OPTIMIZE_PROMPT_TERMINATOR_TOOL_NAME);
@@ -608,6 +619,11 @@ mod tests {
             tool.input_schema["properties"]["aspect_ratio"]["type"],
             "string"
         );
+        assert!(
+            tool.input_schema["properties"]["nsfw_result"]["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("minor sexual content only"))
+        );
 
         let edit_tool = optimize_edit_prompt_terminator_definition(0);
         assert_eq!(edit_tool.name, OPTIMIZE_EDIT_PROMPT_TERMINATOR_TOOL_NAME);
@@ -616,6 +632,11 @@ mod tests {
             1
         );
         assert!(edit_tool.input_schema["properties"]["aspect_ratio"].is_null());
+        assert!(
+            edit_tool.input_schema["properties"]["nsfw_result"]["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("minor sexual content only"))
+        );
     }
 
     #[test]

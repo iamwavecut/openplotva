@@ -49,11 +49,13 @@ Editing rules:
 
 NSFW classification:
 1. Return `nsfw_result` as one of: `safe`, `adult`, `forbidden`.
-2. `safe`: no sexual content and no explicit gore.
-3. `adult`: nudity, erotica, pornographic or fetish content, or graphic violence and gore. Includes blood, horror effects, explosions, and war imagery.
-4. `forbidden`: ONLY CSAM or sexual content involving minors: sexualized minors, underage nudity, child sexual abuse material, or requests/instructions to create or facilitate such content.
-5. Do NOT use `forbidden` for adult-only sexual content, adult nudity, adult fetish content, adult coercion/non-consent themes, adult incest themes, bestiality themes, violence, gore, blood, horror edits, battle damage, or other disturbing non-CSAM content. Classify these as `adult`.
-6. Priority: `forbidden > adult > safe`. If uncertain, choose `adult`.
+2. Closed-gate decision tree: first check the minor gate, then check the sexual gate. Both gates must be present for `forbidden`: a clear minor/underage/child/prepubescent signal AND a sexual, nude, exploitative, abusive, or facilitation signal.
+3. `safe`: no sexual content and no explicit gore. Includes non-sexual minors, ordinary portraits, family scenes, school scenes, children's book aesthetics, toys, cartoons, and other child-related edits without sexualization or nudity.
+4. `adult`: nudity, erotica, pornographic or fetish content, adult-only sexual content, adult taboo sexual themes, or graphic violence and gore. Includes blood, horror effects, explosions, war imagery, battle damage, generic unsafe themes, and disturbing non-CSAM content.
+5. `forbidden`: ONLY minor sexual content: CSAM, sexual content involving minors, sexualized minors, underage nudity, child sexual abuse material, or requests/instructions to create or facilitate such content.
+6. Do NOT use `forbidden` for adult-only nudity, adult-only sexual content, adult fetish content, adult coercion/non-consent themes, adult incest themes, bestiality themes, violence, gore, blood, horror edits, battle damage, generic provider-safety concerns, or other disturbing non-CSAM content. Classify these as `adult`.
+7. If the request is uncertain, mixed, euphemistic, or ambiguous but lacks a clear minor sexual-content signal, choose `adult`, not `forbidden`.
+8. Contrast cases: adult-only nudity -> `adult`; graphic war gore -> `adult`; non-sexual children in a family photo -> `safe`; nostalgic children's book style -> `safe`; minor sexual content or underage nudity -> `forbidden`.
 
 <examples>
 
