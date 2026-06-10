@@ -10311,6 +10311,7 @@ fn go_dispatcher_config() -> openplotva_telegram::DispatcherConfig {
             max_cache_size: GO_DISPATCHER_DEBOUNCE_CACHE_SIZE,
             per_chat_settings: Default::default(),
         },
+        ..openplotva_telegram::DispatcherConfig::default()
     }
 }
 

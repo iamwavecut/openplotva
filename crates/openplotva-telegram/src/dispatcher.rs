@@ -6,7 +6,10 @@ use std::{
 };
 
 use carapax::api::Client;
-use tokio::{sync::Notify, time::sleep};
+use tokio::{
+    sync::Notify,
+    time::{sleep, timeout},
+};
 
 use crate::rate_limit::DEFAULT_RATE_LIMITER_MAX_IDLE;
 use crate::{
@@ -15,12 +18,25 @@ use crate::{
 };
 
 pub const DEFAULT_DISPATCHER_CLEANUP_INTERVAL: Duration = Duration::from_secs(10 * 60);
+pub const DEFAULT_DISPATCHER_SEND_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DispatcherConfig {
     pub max_queue_size: usize,
     /// Regular-queue duplicate suppression settings.
     pub dedupe_config: DebouncerConfig,
+    /// Maximum time a worker may spend on one outbound item.
+    pub send_timeout: Duration,
+}
+
+impl DispatcherConfig {
+    fn send_timeout(&self) -> Duration {
+        if self.send_timeout.is_zero() {
+            DEFAULT_DISPATCHER_SEND_TIMEOUT
+        } else {
+            self.send_timeout
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -927,7 +943,21 @@ impl DispatcherQueue {
     {
         let virtual_id = item.metadata().virtual_id.clone();
         let immediate = item.metadata().immediate;
-        let status = send(item).await;
+        let chat_id = item.metadata().chat_id;
+        let send_timeout = self.config.send_timeout();
+        let status = match timeout(send_timeout, send(item)).await {
+            Ok(status) => status,
+            Err(_) => {
+                tracing::warn!(
+                    virtual_id = %virtual_id,
+                    chat_id,
+                    immediate,
+                    timeout_ms = send_timeout.as_millis() as u64,
+                    "dispatcher send timed out"
+                );
+                DispatcherSendStatus::Failed
+            }
+        };
         self.record_send_result(status.is_sent());
         if status.is_sent() {
             DispatcherWorkerOutcome::Sent {
@@ -1062,6 +1092,7 @@ where
 mod tests {
     use std::{
         collections::HashMap,
+        future::pending,
         sync::{Arc, Mutex},
         time::Duration,
     };
@@ -1931,6 +1962,50 @@ mod tests {
         assert_eq!(queue.stats_at(now).immediate_queue_size, 0);
     }
 
+    #[tokio::test]
+    async fn stuck_immediate_send_times_out_so_worker_can_process_next_item() {
+        let queue = DispatcherQueue::new(DispatcherConfig {
+            send_timeout: Duration::from_millis(10),
+            ..DispatcherConfig::default()
+        });
+        let now = std::time::Instant::now();
+
+        queue.enqueue_at(text_message(42, "stuck", "immediate-1"), true, now);
+        queue.enqueue_at(
+            text_message(42, "next", "immediate-2"),
+            true,
+            now + Duration::from_millis(1),
+        );
+
+        let timeout_outcome = queue
+            .process_immediate_once(|_| pending::<DispatcherSendStatus>())
+            .await;
+
+        assert_eq!(
+            timeout_outcome,
+            DispatcherWorkerOutcome::SendFailed {
+                virtual_id: "immediate-1".to_owned(),
+                immediate: true,
+            }
+        );
+        assert_eq!(queue.stats_at(now).processed_total, 0);
+        assert_eq!(queue.stats_at(now).immediate_queue_size, 1);
+
+        let next_outcome = queue
+            .process_immediate_once(|_| async { DispatcherSendStatus::Sent })
+            .await;
+
+        assert_eq!(
+            next_outcome,
+            DispatcherWorkerOutcome::Sent {
+                virtual_id: "immediate-2".to_owned(),
+                immediate: true,
+            }
+        );
+        assert_eq!(queue.stats_at(now).processed_total, 1);
+        assert_eq!(queue.stats_at(now).immediate_queue_size, 0);
+    }
+
     #[test]
     fn dispatcher_stats_include_queue_sizes_and_oldest_ages() {
         let queue = DispatcherQueue::new(DispatcherConfig::default());
@@ -1969,6 +2044,7 @@ mod tests {
                 max_cache_size: 1000,
                 per_chat_settings: HashMap::new(),
             },
+            ..DispatcherConfig::default()
         });
         let now = std::time::Instant::now();
 
@@ -2013,6 +2089,7 @@ mod tests {
                 max_cache_size: 1000,
                 per_chat_settings: HashMap::new(),
             },
+            ..DispatcherConfig::default()
         });
         let now = std::time::Instant::now();
 
@@ -2045,6 +2122,7 @@ mod tests {
                 max_cache_size: 1000,
                 per_chat_settings: HashMap::new(),
             },
+            ..DispatcherConfig::default()
         });
 
         assert_eq!(
@@ -2074,6 +2152,7 @@ mod tests {
         let queue = DispatcherQueue::new(DispatcherConfig {
             max_queue_size: 1,
             dedupe_config: DebouncerConfig::default(),
+            ..DispatcherConfig::default()
         });
         let now = std::time::Instant::now();
 

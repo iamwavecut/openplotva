@@ -1479,6 +1479,7 @@ mod tests {
                 max_cache_size: 1000,
                 per_chat_settings: Default::default(),
             },
+            ..DispatcherConfig::default()
         });
         assert_eq!(
             queue.enqueue(
