@@ -4822,8 +4822,12 @@ mod tests {
         let image_ephemeral = ImageEphemeralCapture::default();
         let image_sender = ImageTelegramSenderCapture::new(vec![
             Ok(TelegramOutboundResponse::Message(Box::new(
+                telegram_bot_message(-100, 869)?,
+            ))),
+            Ok(TelegramOutboundResponse::Message(Box::new(
                 telegram_bot_message(-100, 870)?,
             ))),
+            Ok(TelegramOutboundResponse::Boolean(true)),
             Ok(TelegramOutboundResponse::Boolean(true)),
         ]);
         let image_effects = crate::image_jobs::TelegramImageJobEffects::new(
@@ -4870,7 +4874,7 @@ mod tests {
         assert!(image_queued.deletes().is_empty());
         assert_eq!(
             image_ephemeral.tracked(),
-            vec![(-100, 870, crate::image_jobs::DRAWING_STICKER_DELETE_AFTER)]
+            vec![(-100, 869, crate::image_jobs::DRAWING_STICKER_DELETE_AFTER)]
         );
         let image_methods = image_sender.methods();
         assert_eq!(
@@ -4880,7 +4884,9 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 TelegramOutboundMethodKind::SendSticker,
+                TelegramOutboundMethodKind::SendPhoto,
                 TelegramOutboundMethodKind::DeleteMessage,
+                TelegramOutboundMethodKind::EditMessageMedia,
             ]
         );
         let sticker_debug = image_methods[0].1["debug"].as_str().expect("sticker debug");
@@ -4889,8 +4895,12 @@ mod tests {
         assert!(sticker_debug.contains("disable_notification"));
         assert!(sticker_debug.contains("reply_parameters"));
         assert!(sticker_debug.contains("78"));
-        assert_eq!(image_methods[1].1["chat_id"], json!(-100));
-        assert_eq!(image_methods[1].1["message_id"], json!(870));
+        let placeholder_debug = image_methods[1].1["debug"]
+            .as_str()
+            .expect("placeholder debug");
+        assert!(placeholder_debug.contains("-100"));
+        assert_eq!(image_methods[2].1["chat_id"], json!(-100));
+        assert_eq!(image_methods[2].1["message_id"], json!(869));
         let records = queue.records();
         assert_eq!(records[0].status, JobStatus::Completed);
         assert_eq!(
@@ -4901,7 +4911,10 @@ mod tests {
                 .as_ref()
                 .expect("image")
                 .image_urls,
-            &vec!["https://img.test/neon-cat.png".to_owned()]
+            &vec![
+                "https://img.test/neon-cat.png".to_owned(),
+                "https://img.test/fallback.png".to_owned(),
+            ]
         );
         assert_eq!(update_queue.len().await?, 0);
 
@@ -6955,8 +6968,12 @@ mod tests {
         let image_ephemeral = ImageEphemeralCapture::default();
         let image_sender = ImageTelegramSenderCapture::new(vec![
             Ok(TelegramOutboundResponse::Message(Box::new(
+                telegram_bot_message(42, 879)?,
+            ))),
+            Ok(TelegramOutboundResponse::Message(Box::new(
                 telegram_bot_message(42, 880)?,
             ))),
+            Ok(TelegramOutboundResponse::Boolean(true)),
             Ok(TelegramOutboundResponse::Boolean(true)),
         ]);
         let image_effects = crate::image_jobs::TelegramImageJobEffects::new(
@@ -6999,7 +7016,7 @@ mod tests {
         assert!(image_queued.deletes().is_empty());
         assert_eq!(
             image_ephemeral.tracked(),
-            vec![(42, 880, crate::image_jobs::DRAWING_STICKER_DELETE_AFTER)]
+            vec![(42, 879, crate::image_jobs::DRAWING_STICKER_DELETE_AFTER)]
         );
         let image_methods = image_sender.methods();
         assert_eq!(
@@ -7009,7 +7026,9 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 TelegramOutboundMethodKind::SendSticker,
+                TelegramOutboundMethodKind::SendPhoto,
                 TelegramOutboundMethodKind::DeleteMessage,
+                TelegramOutboundMethodKind::EditMessageMedia,
             ]
         );
         let sticker_debug = image_methods[0].1["debug"].as_str().expect("sticker debug");
@@ -7018,8 +7037,12 @@ mod tests {
         assert!(sticker_debug.contains("disable_notification"));
         assert!(sticker_debug.contains("reply_parameters"));
         assert!(sticker_debug.contains("77"));
-        assert_eq!(image_methods[1].1["chat_id"], json!(42));
-        assert_eq!(image_methods[1].1["message_id"], json!(880));
+        let placeholder_debug = image_methods[1].1["debug"]
+            .as_str()
+            .expect("placeholder debug");
+        assert!(placeholder_debug.contains("42"));
+        assert_eq!(image_methods[2].1["chat_id"], json!(42));
+        assert_eq!(image_methods[2].1["message_id"], json!(879));
         let records = queue.records();
         assert_eq!(records[0].status, JobStatus::Completed);
         assert_eq!(
