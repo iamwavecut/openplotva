@@ -18,8 +18,9 @@ use openplotva_core::{
 use openplotva_dialog::{
     DialogContext, DialogInput, DialogMessage, DialogOutput, DialogUser, HistoryMessage,
     MESSAGE_KIND_TEXT, MESSAGE_KIND_TOOL_REQUEST, MESSAGE_KIND_TOOL_RESPONSE, Persona, ROLE_MODEL,
-    ROLE_TOOL, ROLE_USER, conversation_projection, daily_persona_for_unix_timestamp,
-    filter_dialog_tool_calls_for_history, is_dialog_history_noise_tool_call_name,
+    ROLE_TOOL, ROLE_USER, TOOL_RESULT_STATUS_QUEUED, ToolResult, conversation_projection,
+    daily_persona_for_unix_timestamp, filter_dialog_tool_calls_for_history,
+    is_dialog_history_noise_tool_call_name,
 };
 use openplotva_llm::ChatProvider;
 use openplotva_memory::format_context as format_memory_context;
@@ -1683,7 +1684,37 @@ pub fn dialog_job_answer(output: &DialogOutput) -> String {
     if !answer.is_empty() {
         return answer.to_owned();
     }
-    output.response.trim().to_owned()
+    let response = output.response.trim();
+    if !response.is_empty() {
+        return response.to_owned();
+    }
+    queued_generation_tool_message(&output.tool_calls).unwrap_or_default()
+}
+
+fn queued_generation_tool_message(calls: &[ToolCall]) -> Option<String> {
+    calls.iter().find_map(|call| {
+        let output = call.output.as_ref()?;
+        let result: ToolResult = serde_json::from_value(output.clone()).ok()?;
+        if result.no_reply
+            || !result
+                .status
+                .eq_ignore_ascii_case(TOOL_RESULT_STATUS_QUEUED)
+        {
+            return None;
+        }
+        let side_effect = result.side_effect.as_ref()?;
+        if !side_effect.state.eq_ignore_ascii_case("queued") {
+            return None;
+        }
+        if !matches!(
+            side_effect.kind.as_str(),
+            "image_generation_job" | "music_generation_job"
+        ) {
+            return None;
+        }
+        let message = result.message.trim();
+        (!message.is_empty()).then(|| message.to_owned())
+    })
 }
 
 #[must_use]
@@ -2734,6 +2765,62 @@ mod tests {
         assert!(report.sent_answer);
         assert!(report.completed);
         assert!(!report.failed);
+        assert_eq!(record_status(&queue, job_id), JobStatus::Completed);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dialog_worker_sends_queued_tool_message_when_provider_has_no_answer()
+    -> Result<(), Box<dyn Error>> {
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let queue = InMemoryTaskQueue::new();
+        let job_id = queue.assign(
+            DIALOG_AIFARM_QUEUE_NAME,
+            new_dialog_job_at(dialog_params("напиши песню"), now),
+        );
+        let provider = ProviderStub::returning(DialogOutput {
+            provider: "stub".to_owned(),
+            tool_calls: vec![ToolCall {
+                name: "generate_song".to_owned(),
+                r#ref: "generate_song-1".to_owned(),
+                output: Some(serde_json::json!({
+                    "status": "queued",
+                    "message": "Задача на генерацию песни поставлена в очередь.",
+                    "side_effect": {
+                        "kind": "music_generation_job",
+                        "state": "queued"
+                    }
+                })),
+                ..ToolCall::default()
+            }],
+            ..DialogOutput::default()
+        });
+        let effects = EffectsStub::default();
+        let history = ToolHistoryStub::default();
+
+        let report = process_dialog_job_once_in_queue_with_materializer_and_history_at(
+            &queue,
+            DIALOG_AIFARM_QUEUE_NAME,
+            &provider,
+            &effects,
+            &BasicDialogInputMaterializer,
+            &history,
+            now,
+        )
+        .await;
+
+        assert_eq!(report.job_id, Some(job_id));
+        assert!(report.persisted_tool_call_history);
+        assert!(report.sent_answer);
+        assert!(report.completed);
+        assert!(!report.failed);
+        assert_eq!(
+            effects.sent(),
+            vec![(
+                "напиши песню".to_owned(),
+                "Задача на генерацию песни поставлена в очередь.".to_owned()
+            )]
+        );
         assert_eq!(record_status(&queue, job_id), JobStatus::Completed);
         Ok(())
     }

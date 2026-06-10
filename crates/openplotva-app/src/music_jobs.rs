@@ -752,6 +752,7 @@ pub struct MusicJobExecutionReport {
     pub outcome: MusicJobExecutionOutcome,
     pub topic: String,
     pub error: Option<String>,
+    pub result_message_id: Option<i32>,
 }
 
 /// Result from one queue poll.
@@ -827,6 +828,7 @@ where
             outcome: MusicJobExecutionOutcome::SkippedPermission,
             topic: String::new(),
             error: None,
+            result_message_id: None,
         };
     }
     let topic = music_job_topic(&params);
@@ -835,6 +837,7 @@ where
             outcome: MusicJobExecutionOutcome::Failed,
             topic,
             error: Some("music topic is empty".to_owned()),
+            result_message_id: None,
         };
     }
     let material = match material_provider.build_song_material(&params, &topic).await {
@@ -844,6 +847,7 @@ where
                 outcome: MusicJobExecutionOutcome::Failed,
                 topic,
                 error: Some(error.message()),
+                result_message_id: None,
             };
         }
     };
@@ -862,6 +866,7 @@ where
                 outcome: MusicJobExecutionOutcome::Failed,
                 topic,
                 error: Some(error.message()),
+                result_message_id: None,
             };
         }
     };
@@ -893,17 +898,20 @@ where
                 outcome: MusicJobExecutionOutcome::Completed,
                 topic,
                 error: None,
+                result_message_id: Some(audio_message_id),
             }
         }
         Ok(None) => MusicJobExecutionReport {
             outcome: MusicJobExecutionOutcome::Completed,
             topic,
             error: None,
+            result_message_id: None,
         },
         Err(error) => MusicJobExecutionReport {
             outcome: MusicJobExecutionOutcome::Failed,
             topic,
             error: Some(error),
+            result_message_id: None,
         },
     }
 }
@@ -976,20 +984,24 @@ where
 
     let _ = queue.set_execution_started(work.id, now);
     let execution = execute_music_gen_job(material_provider, generator, effects, params).await;
+    let finished_at = OffsetDateTime::now_utc();
     match execution.outcome {
-        MusicJobExecutionOutcome::Completed => finalize_music_completed(
-            queue,
-            work.id,
-            queue_name,
-            MusicQueuePollOutcome::Completed,
-            now,
-        ),
+        MusicJobExecutionOutcome::Completed => {
+            let _ = queue.update_job_result_message(work.id, execution.result_message_id);
+            finalize_music_completed(
+                queue,
+                work.id,
+                queue_name,
+                MusicQueuePollOutcome::Completed,
+                finished_at,
+            )
+        }
         MusicJobExecutionOutcome::SkippedPermission => finalize_music_completed(
             queue,
             work.id,
             queue_name,
             MusicQueuePollOutcome::SkippedPermission,
-            now,
+            finished_at,
         ),
         MusicJobExecutionOutcome::Failed => {
             let error = execution
@@ -1001,11 +1013,11 @@ where
                 queue_name,
                 &error,
                 max_llm_job_attempts,
-                now,
+                finished_at,
             ) {
                 return report;
             }
-            let _ = queue.fail(work.id, error.clone(), now);
+            let _ = queue.fail(work.id, error.clone(), finished_at);
             MusicQueuePollReport {
                 queue_name: queue_name.to_owned(),
                 job_id: Some(work.id),
@@ -1791,6 +1803,55 @@ mod tests {
         assert_eq!(
             queue.records()[0].status,
             openplotva_taskman::JobStatus::Completed
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn music_queue_once_records_result_message_id_when_completed()
+    -> Result<(), Box<dyn Error>> {
+        let queue = openplotva_taskman::InMemoryTaskQueue::new();
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800).expect("time");
+        let job_id = queue.assign(
+            MUSIC_VIP_QUEUE_NAME,
+            new_music_gen_job_at(
+                MusicGenJobParams {
+                    chat_id: 42,
+                    message_id: 9,
+                    user_id: 7,
+                    user_full_name: "Alice".to_owned(),
+                    topic: "city".to_owned(),
+                    ..MusicGenJobParams::default()
+                },
+                now,
+            )
+            .with_name("music")
+            .with_priority(HIGHEST_PRIORITY),
+        );
+        let effects = EffectsStub::allowed();
+
+        let report = run_music_queue_once(
+            &queue,
+            MUSIC_VIP_QUEUE_NAME,
+            &HeuristicSongMaterialProvider,
+            &GeneratorStub::new(Ok(GeneratedSongAudio {
+                data: b"MP3".to_vec(),
+                file_name: "city.mp3".to_owned(),
+            })),
+            &effects,
+            now,
+        )
+        .await;
+
+        assert_eq!(report.outcome, MusicQueuePollOutcome::Completed);
+        let record = queue.record(job_id).expect("music job");
+        assert_eq!(record.status, JobStatus::Completed);
+        assert_eq!(record.result_message_id, Some(100));
+        assert_eq!(record.started_at, Some(now));
+        assert_eq!(record.execution_started_at, Some(now));
+        assert!(
+            record.completed_at > Some(now),
+            "completed_at should reflect the end of generation, not the dequeue time"
         );
         Ok(())
     }
