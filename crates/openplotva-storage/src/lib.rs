@@ -2,6 +2,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    sync::Arc,
     time::Duration,
 };
 
@@ -20,6 +21,7 @@ use openplotva_shield::{Options as ShieldOptions, SearchRequest as ShieldSearchR
 use pgvector::Vector;
 use redis::{
     Client as RedisClient, ConnectionAddr, ConnectionInfo, IntoConnectionInfo, RedisConnectionInfo,
+    aio::ConnectionManager,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -30,6 +32,7 @@ use sqlx::{
 };
 use thiserror::Error;
 use time::OffsetDateTime;
+use tokio::sync::OnceCell;
 
 /// Human-readable crate purpose used by scaffold tests and docs.
 pub const PURPOSE: &str = "storage";
@@ -1111,7 +1114,38 @@ pub struct ServiceClients {
 /// Redis client wrapper.
 #[derive(Clone, Debug)]
 pub struct RedisStore {
+    connections: RedisConnectionPool,
+}
+
+#[derive(Clone, Debug)]
+struct RedisConnectionPool {
     client: RedisClient,
+    manager: Arc<OnceCell<ConnectionManager>>,
+}
+
+impl RedisConnectionPool {
+    fn new(client: RedisClient) -> Self {
+        Self {
+            client,
+            manager: Arc::new(OnceCell::new()),
+        }
+    }
+
+    fn client(&self) -> &RedisClient {
+        &self.client
+    }
+
+    async fn connection(&self) -> redis::RedisResult<ConnectionManager> {
+        self.manager
+            .get_or_try_init(|| async { self.client.get_connection_manager().await })
+            .await
+            .cloned()
+    }
+
+    #[cfg(test)]
+    fn shares_manager_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.manager, &other.manager)
+    }
 }
 
 /// Persisted ephemeral Telegram message lifecycle record.
@@ -1317,60 +1351,90 @@ pub fn telegram_file_ref_from_record(record: Option<&TelegramFileRecord>) -> Tel
 }
 
 impl RedisStore {
+    pub fn from_client(client: RedisClient) -> Self {
+        Self {
+            connections: RedisConnectionPool::new(client),
+        }
+    }
+
     /// Access the underlying Redis client.
     pub fn client(&self) -> &RedisClient {
-        &self.client
+        self.connections.client()
     }
 
     /// Build the Redis-backed rate-limit store over this client.
     pub fn rate_limit_store(&self) -> RedisRateLimitStore {
-        RedisRateLimitStore::new(self.client.clone())
+        RedisRateLimitStore::with_connection_pool(
+            self.connections.clone(),
+            RATE_LIMITED_CHAT_KEY_PREFIX,
+        )
     }
 
     /// Build the Redis-backed draw rate-limit store over this client.
     pub fn draw_rate_limit_store(&self) -> RedisDrawRateLimitStore {
-        RedisDrawRateLimitStore::new(self.client.clone())
+        RedisDrawRateLimitStore::with_connection_pool(
+            self.connections.clone(),
+            DRAW_RATE_LIMIT_KEY_PREFIX,
+        )
     }
 
     /// Build the Redis-backed chat-admin cache store over this client.
     pub fn chat_admin_cache_store(&self) -> RedisChatAdminCacheStore {
-        RedisChatAdminCacheStore::new(self.client.clone())
+        RedisChatAdminCacheStore::with_connection_pool(
+            self.connections.clone(),
+            CHAT_ADMINS_KEY_PREFIX,
+        )
     }
 
     /// Build the Redis-backed ephemeral-message store over this client.
     pub fn ephemeral_message_store(&self) -> RedisEphemeralMessageStore {
-        RedisEphemeralMessageStore::new(self.client.clone())
+        RedisEphemeralMessageStore::with_connection_pool(
+            self.connections.clone(),
+            EPHEMERAL_MESSAGE_KEY_PREFIX,
+        )
     }
 
     /// Build the Redis-backed queued-sticker store over this client.
     pub fn queued_sticker_store(&self) -> RedisQueuedStickerStore {
-        RedisQueuedStickerStore::new(self.client.clone())
+        RedisQueuedStickerStore::with_connection_pool(
+            self.connections.clone(),
+            QUEUED_STICKER_KEY_PREFIX,
+        )
     }
 
     /// Build the Redis-backed last-generation store over this client.
     pub fn last_generation_store(&self) -> RedisLastGenerationStore {
-        RedisLastGenerationStore::new(self.client.clone())
+        RedisLastGenerationStore::with_connection_pool(
+            self.connections.clone(),
+            LAST_GENERATION_KEY_PREFIX,
+        )
     }
 
     /// Build the Redis-backed translation cache store over this client.
     pub fn translation_cache_store(&self) -> RedisTranslationCacheStore {
-        RedisTranslationCacheStore::new(self.client.clone())
+        RedisTranslationCacheStore::with_connection_pool(
+            self.connections.clone(),
+            TRANSLATION_CACHE_KEY_PREFIX,
+        )
     }
 
     /// Build the Redis-backed blocked-chat store over this client.
     pub fn blocked_chat_store(&self) -> RedisBlockedChatStore {
-        RedisBlockedChatStore::new(self.client.clone())
+        RedisBlockedChatStore::with_connection_pool(
+            self.connections.clone(),
+            BLOCKED_CHAT_KEY_PREFIX,
+        )
     }
 
     /// Build the Redis-backed join-greeting store over this client.
     pub fn join_greeting_store(&self) -> RedisJoinGreetingStore {
-        RedisJoinGreetingStore::new(self.client.clone())
+        RedisJoinGreetingStore::with_connection_pool(self.connections.clone())
     }
 }
 
 #[derive(Clone, Debug)]
 pub struct RedisRateLimitStore {
-    client: RedisClient,
+    connections: RedisConnectionPool,
     key_prefix: String,
 }
 
@@ -1381,8 +1445,15 @@ impl RedisRateLimitStore {
 
     /// Build a rate-limit store with an explicit key prefix, useful for isolated tests.
     pub fn with_key_prefix(client: RedisClient, key_prefix: impl Into<String>) -> Self {
+        Self::with_connection_pool(RedisConnectionPool::new(client), key_prefix)
+    }
+
+    fn with_connection_pool(
+        connections: RedisConnectionPool,
+        key_prefix: impl Into<String>,
+    ) -> Self {
         Self {
-            client,
+            connections,
             key_prefix: key_prefix.into(),
         }
     }
@@ -1400,8 +1471,8 @@ impl RedisRateLimitStore {
     ) -> Result<(), StorageError> {
         let value = rate_limit_expiry_redis_value(expiry)?;
         let mut connection = self
-            .client
-            .get_multiplexed_async_connection()
+            .connections
+            .connection()
             .await
             .map_err(|source| StorageError::Redis { source })?;
         let mut command = redis::cmd("SET");
@@ -1422,8 +1493,8 @@ impl RedisRateLimitStore {
         chat_id: i64,
     ) -> Result<Option<OffsetDateTime>, StorageError> {
         let mut connection = self
-            .client
-            .get_multiplexed_async_connection()
+            .connections
+            .connection()
             .await
             .map_err(|source| StorageError::Redis { source })?;
         let value: Option<Vec<u8>> = redis::cmd("GET")
@@ -1450,7 +1521,7 @@ impl RedisRateLimitStore {
 
 #[derive(Clone, Debug)]
 pub struct RedisDrawRateLimitStore {
-    client: RedisClient,
+    connections: RedisConnectionPool,
     key_prefix: String,
 }
 
@@ -1461,8 +1532,15 @@ impl RedisDrawRateLimitStore {
 
     /// Build a draw rate-limit store with an explicit key prefix, useful for isolated tests.
     pub fn with_key_prefix(client: RedisClient, key_prefix: impl Into<String>) -> Self {
+        Self::with_connection_pool(RedisConnectionPool::new(client), key_prefix)
+    }
+
+    fn with_connection_pool(
+        connections: RedisConnectionPool,
+        key_prefix: impl Into<String>,
+    ) -> Self {
         Self {
-            client,
+            connections,
             key_prefix: key_prefix.into(),
         }
     }
@@ -1478,8 +1556,8 @@ impl RedisDrawRateLimitStore {
         user_id: i64,
     ) -> Result<Vec<OffsetDateTime>, StorageError> {
         let mut connection = self
-            .client
-            .get_multiplexed_async_connection()
+            .connections
+            .connection()
             .await
             .map_err(|source| StorageError::Redis { source })?;
         let value: Option<Vec<u8>> = redis::cmd("GET")
@@ -1511,8 +1589,8 @@ impl RedisDrawRateLimitStore {
     ) -> Result<(), StorageError> {
         let value = draw_rate_limit_timestamps_redis_value(timestamps)?;
         let mut connection = self
-            .client
-            .get_multiplexed_async_connection()
+            .connections
+            .connection()
             .await
             .map_err(|source| StorageError::Redis { source })?;
         let mut command = redis::cmd("SET");
@@ -1530,7 +1608,7 @@ impl RedisDrawRateLimitStore {
 
 #[derive(Clone, Debug)]
 pub struct RedisChatAdminCacheStore {
-    client: RedisClient,
+    connections: RedisConnectionPool,
     key_prefix: String,
     key_suffix: String,
 }
@@ -1542,8 +1620,15 @@ impl RedisChatAdminCacheStore {
 
     /// Build a chat-admin cache store with an explicit prefix, useful for isolated tests.
     pub fn with_key_prefix(client: RedisClient, key_prefix: impl Into<String>) -> Self {
+        Self::with_connection_pool(RedisConnectionPool::new(client), key_prefix)
+    }
+
+    fn with_connection_pool(
+        connections: RedisConnectionPool,
+        key_prefix: impl Into<String>,
+    ) -> Self {
         Self {
-            client,
+            connections,
             key_prefix: key_prefix.into(),
             key_suffix: CHAT_ADMINS_KEY_SUFFIX.to_owned(),
         }
@@ -1562,8 +1647,8 @@ impl RedisChatAdminCacheStore {
     ) -> Result<(), StorageError> {
         let value = chat_admin_ids_redis_value(admin_ids)?;
         let mut connection = self
-            .client
-            .get_multiplexed_async_connection()
+            .connections
+            .connection()
             .await
             .map_err(|source| StorageError::Redis { source })?;
         let mut command = redis::cmd("SET");
@@ -1581,8 +1666,8 @@ impl RedisChatAdminCacheStore {
     /// Load cached Telegram admin IDs for one chat.
     pub async fn chat_admin_ids(&self, chat_id: i64) -> Result<Option<Vec<i64>>, StorageError> {
         let mut connection = self
-            .client
-            .get_multiplexed_async_connection()
+            .connections
+            .connection()
             .await
             .map_err(|source| StorageError::Redis { source })?;
         let value: Option<Vec<u8>> = redis::cmd("GET")
@@ -1599,7 +1684,7 @@ impl RedisChatAdminCacheStore {
 
 #[derive(Clone, Debug)]
 pub struct RedisQueuedStickerStore {
-    client: RedisClient,
+    connections: RedisConnectionPool,
     key_prefix: String,
 }
 
@@ -1610,8 +1695,15 @@ impl RedisQueuedStickerStore {
 
     /// Build a queued-sticker store with an explicit prefix, useful for isolated tests.
     pub fn with_key_prefix(client: RedisClient, key_prefix: impl Into<String>) -> Self {
+        Self::with_connection_pool(RedisConnectionPool::new(client), key_prefix)
+    }
+
+    fn with_connection_pool(
+        connections: RedisConnectionPool,
+        key_prefix: impl Into<String>,
+    ) -> Self {
         Self {
-            client,
+            connections,
             key_prefix: key_prefix.into(),
         }
     }
@@ -1629,8 +1721,8 @@ impl RedisQueuedStickerStore {
         ttl: Duration,
     ) -> Result<(), StorageError> {
         let mut connection = self
-            .client
-            .get_multiplexed_async_connection()
+            .connections
+            .connection()
             .await
             .map_err(|source| StorageError::Redis { source })?;
         let mut command = redis::cmd("SET");
@@ -1654,8 +1746,8 @@ impl RedisQueuedStickerStore {
         message_id: i64,
     ) -> Result<Option<i64>, StorageError> {
         let mut connection = self
-            .client
-            .get_multiplexed_async_connection()
+            .connections
+            .connection()
             .await
             .map_err(|source| StorageError::Redis { source })?;
         let value: Option<String> = redis::cmd("GET")
@@ -1673,8 +1765,8 @@ impl RedisQueuedStickerStore {
         message_id: i64,
     ) -> Result<(), StorageError> {
         let mut connection = self
-            .client
-            .get_multiplexed_async_connection()
+            .connections
+            .connection()
             .await
             .map_err(|source| StorageError::Redis { source })?;
         let _: i64 = redis::cmd("DEL")
@@ -1688,7 +1780,7 @@ impl RedisQueuedStickerStore {
 
 #[derive(Clone, Debug)]
 pub struct RedisEphemeralMessageStore {
-    client: RedisClient,
+    connections: RedisConnectionPool,
     key_prefix: String,
 }
 
@@ -1699,8 +1791,15 @@ impl RedisEphemeralMessageStore {
 
     /// Build an ephemeral-message store with an explicit prefix, useful for isolated tests.
     pub fn with_key_prefix(client: RedisClient, key_prefix: impl Into<String>) -> Self {
+        Self::with_connection_pool(RedisConnectionPool::new(client), key_prefix)
+    }
+
+    fn with_connection_pool(
+        connections: RedisConnectionPool,
+        key_prefix: impl Into<String>,
+    ) -> Self {
         Self {
-            client,
+            connections,
             key_prefix: key_prefix.into(),
         }
     }
@@ -1717,8 +1816,8 @@ impl RedisEphemeralMessageStore {
     ) -> Result<(), StorageError> {
         let value = ephemeral_message_redis_value(message)?;
         let mut connection = self
-            .client
-            .get_multiplexed_async_connection()
+            .connections
+            .connection()
             .await
             .map_err(|source| StorageError::Redis { source })?;
         let mut command = redis::cmd("SET");
@@ -1742,8 +1841,8 @@ impl RedisEphemeralMessageStore {
         message_id: i64,
     ) -> Result<Option<EphemeralMessage>, StorageError> {
         let mut connection = self
-            .client
-            .get_multiplexed_async_connection()
+            .connections
+            .connection()
             .await
             .map_err(|source| StorageError::Redis { source })?;
         let value: Option<Vec<u8>> = redis::cmd("GET")
@@ -1759,8 +1858,8 @@ impl RedisEphemeralMessageStore {
 
     pub async fn ephemeral_messages(&self) -> Result<Vec<EphemeralMessage>, StorageError> {
         let mut connection = self
-            .client
-            .get_multiplexed_async_connection()
+            .connections
+            .connection()
             .await
             .map_err(|source| StorageError::Redis { source })?;
         let mut cursor = 0_u64;
@@ -1807,8 +1906,8 @@ impl RedisEphemeralMessageStore {
             return Ok(());
         }
         let mut connection = self
-            .client
-            .get_multiplexed_async_connection()
+            .connections
+            .connection()
             .await
             .map_err(|source| StorageError::Redis { source })?;
         let keys = messages
@@ -1825,7 +1924,7 @@ impl RedisEphemeralMessageStore {
 
 #[derive(Clone, Debug)]
 pub struct RedisLastGenerationStore {
-    client: RedisClient,
+    connections: RedisConnectionPool,
     key_prefix: String,
 }
 
@@ -1836,8 +1935,15 @@ impl RedisLastGenerationStore {
 
     /// Build a last-generation store with an explicit key prefix, useful for isolated tests.
     pub fn with_key_prefix(client: RedisClient, key_prefix: impl Into<String>) -> Self {
+        Self::with_connection_pool(RedisConnectionPool::new(client), key_prefix)
+    }
+
+    fn with_connection_pool(
+        connections: RedisConnectionPool,
+        key_prefix: impl Into<String>,
+    ) -> Self {
         Self {
-            client,
+            connections,
             key_prefix: key_prefix.into(),
         }
     }
@@ -1863,8 +1969,8 @@ impl RedisLastGenerationStore {
     ) -> Result<(), StorageError> {
         let value = last_generation_redis_value(generation)?;
         let mut connection = self
-            .client
-            .get_multiplexed_async_connection()
+            .connections
+            .connection()
             .await
             .map_err(|source| StorageError::Redis { source })?;
         let mut command = redis::cmd("SET");
@@ -1888,8 +1994,8 @@ impl RedisLastGenerationStore {
         user_id: i64,
     ) -> Result<Option<LastGenerationRecord>, StorageError> {
         let mut connection = self
-            .client
-            .get_multiplexed_async_connection()
+            .connections
+            .connection()
             .await
             .map_err(|source| StorageError::Redis { source })?;
         let value: Option<Vec<u8>> = redis::cmd("GET")
@@ -1910,8 +2016,8 @@ impl RedisLastGenerationStore {
         user_id: i64,
     ) -> Result<(), StorageError> {
         let mut connection = self
-            .client
-            .get_multiplexed_async_connection()
+            .connections
+            .connection()
             .await
             .map_err(|source| StorageError::Redis { source })?;
         let _: i64 = redis::cmd("DEL")
@@ -1925,7 +2031,7 @@ impl RedisLastGenerationStore {
 
 #[derive(Clone, Debug)]
 pub struct RedisTranslationCacheStore {
-    client: RedisClient,
+    connections: RedisConnectionPool,
     key_prefix: String,
 }
 
@@ -1936,8 +2042,15 @@ impl RedisTranslationCacheStore {
 
     /// Build a translation cache store with an explicit prefix, useful for isolated tests.
     pub fn with_key_prefix(client: RedisClient, key_prefix: impl Into<String>) -> Self {
+        Self::with_connection_pool(RedisConnectionPool::new(client), key_prefix)
+    }
+
+    fn with_connection_pool(
+        connections: RedisConnectionPool,
+        key_prefix: impl Into<String>,
+    ) -> Self {
         Self {
-            client,
+            connections,
             key_prefix: key_prefix.into(),
         }
     }
@@ -1954,8 +2067,8 @@ impl RedisTranslationCacheStore {
         text: &str,
     ) -> Result<Option<String>, StorageError> {
         let mut connection = self
-            .client
-            .get_multiplexed_async_connection()
+            .connections
+            .connection()
             .await
             .map_err(|source| StorageError::Redis { source })?;
         let value: Option<Vec<u8>> = redis::cmd("GET")
@@ -1989,8 +2102,8 @@ impl RedisTranslationCacheStore {
     ) -> Result<(), StorageError> {
         let value = translation_cache_redis_value(translation)?;
         let mut connection = self
-            .client
-            .get_multiplexed_async_connection()
+            .connections
+            .connection()
             .await
             .map_err(|source| StorageError::Redis { source })?;
         let mut command = redis::cmd("SET");
@@ -2010,7 +2123,7 @@ impl RedisTranslationCacheStore {
 
 #[derive(Clone, Debug)]
 pub struct RedisBlockedChatStore {
-    client: RedisClient,
+    connections: RedisConnectionPool,
     key_prefix: String,
 }
 
@@ -2021,8 +2134,15 @@ impl RedisBlockedChatStore {
 
     /// Build a blocked-chat store with an explicit prefix, useful for isolated tests.
     pub fn with_key_prefix(client: RedisClient, key_prefix: impl Into<String>) -> Self {
+        Self::with_connection_pool(RedisConnectionPool::new(client), key_prefix)
+    }
+
+    fn with_connection_pool(
+        connections: RedisConnectionPool,
+        key_prefix: impl Into<String>,
+    ) -> Self {
         Self {
-            client,
+            connections,
             key_prefix: key_prefix.into(),
         }
     }
@@ -2050,8 +2170,8 @@ impl RedisBlockedChatStore {
     ) -> Result<(), StorageError> {
         let value = blocked_chat_redis_value(unblock_at)?;
         let mut connection = self
-            .client
-            .get_multiplexed_async_connection()
+            .connections
+            .connection()
             .await
             .map_err(|source| StorageError::Redis { source })?;
         let mut command = redis::cmd("SET");
@@ -2072,8 +2192,8 @@ impl RedisBlockedChatStore {
         chat_id: i64,
     ) -> Result<Option<OffsetDateTime>, StorageError> {
         let mut connection = self
-            .client
-            .get_multiplexed_async_connection()
+            .connections
+            .connection()
             .await
             .map_err(|source| StorageError::Redis { source })?;
         let value: Option<Vec<u8>> = redis::cmd("GET")
@@ -2101,12 +2221,16 @@ impl RedisBlockedChatStore {
 
 #[derive(Clone, Debug)]
 pub struct RedisJoinGreetingStore {
-    client: RedisClient,
+    connections: RedisConnectionPool,
 }
 
 impl RedisJoinGreetingStore {
     pub fn new(client: RedisClient) -> Self {
-        Self { client }
+        Self::with_connection_pool(RedisConnectionPool::new(client))
+    }
+
+    fn with_connection_pool(connections: RedisConnectionPool) -> Self {
+        Self { connections }
     }
 
     pub fn users_key(chat_id: i64) -> String {
@@ -2132,8 +2256,8 @@ impl RedisJoinGreetingStore {
             return Ok(());
         }
         let mut connection = self
-            .client
-            .get_multiplexed_async_connection()
+            .connections
+            .connection()
             .await
             .map_err(|source| StorageError::Redis { source })?;
         let key = Self::users_key(chat_id);
@@ -2159,8 +2283,8 @@ impl RedisJoinGreetingStore {
 
     pub async fn start_debounce(&self, chat_id: i64, ttl: Duration) -> Result<bool, StorageError> {
         let mut connection = self
-            .client
-            .get_multiplexed_async_connection()
+            .connections
+            .connection()
             .await
             .map_err(|source| StorageError::Redis { source })?;
         let mut command = redis::cmd("SET");
@@ -2182,8 +2306,8 @@ impl RedisJoinGreetingStore {
         min_score: i64,
     ) -> Result<Vec<String>, StorageError> {
         let mut connection = self
-            .client
-            .get_multiplexed_async_connection()
+            .connections
+            .connection()
             .await
             .map_err(|source| StorageError::Redis { source })?;
         redis::cmd("ZRANGEBYSCORE")
@@ -2200,8 +2324,8 @@ impl RedisJoinGreetingStore {
         chat_id: i64,
     ) -> Result<Option<i32>, StorageError> {
         let mut connection = self
-            .client
-            .get_multiplexed_async_connection()
+            .connections
+            .connection()
             .await
             .map_err(|source| StorageError::Redis { source })?;
         let value: Option<String> = redis::cmd("GET")
@@ -2219,8 +2343,8 @@ impl RedisJoinGreetingStore {
         ttl: Duration,
     ) -> Result<(), StorageError> {
         let mut connection = self
-            .client
-            .get_multiplexed_async_connection()
+            .connections
+            .connection()
             .await
             .map_err(|source| StorageError::Redis { source })?;
         let mut command = redis::cmd("SET");
@@ -3313,7 +3437,7 @@ pub fn stored_admin_chat_member(member: &ChatMemberRecord) -> Option<StoredAdmin
 #[derive(Clone, Debug)]
 pub struct PostgresHistoryStore {
     pool: PgPool,
-    redis: Option<RedisClient>,
+    redis: Option<RedisConnectionPool>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3368,7 +3492,7 @@ impl PostgresHistoryStore {
     }
 
     pub fn with_redis_client(mut self, redis: RedisClient) -> Self {
-        self.redis = Some(redis);
+        self.redis = Some(RedisConnectionPool::new(redis));
         self
     }
 
@@ -3858,7 +3982,7 @@ impl PostgresHistoryStore {
             return Ok(());
         };
         let mut connection = redis
-            .get_multiplexed_async_connection()
+            .connection()
             .await
             .map_err(|source| StorageError::Redis { source })?;
         let _: i64 = redis::cmd("DEL")
@@ -6268,8 +6392,10 @@ pub async fn connect_redis(config: &RedisConfig) -> Result<RedisStore, StorageEr
         redis_connection_info(config).map_err(|source| StorageError::RedisConfig { source })?,
     )
     .map_err(|source| StorageError::RedisConfig { source })?;
-    let mut connection = client
-        .get_multiplexed_async_connection()
+    let store = RedisStore::from_client(client);
+    let mut connection = store
+        .connections
+        .connection()
         .await
         .map_err(|source| StorageError::Redis { source })?;
     let _: String = redis::cmd("PING")
@@ -6277,7 +6403,7 @@ pub async fn connect_redis(config: &RedisConfig) -> Result<RedisStore, StorageEr
         .await
         .map_err(|source| StorageError::Redis { source })?;
 
-    Ok(RedisStore { client })
+    Ok(store)
 }
 
 fn redis_connection_info(config: &RedisConfig) -> redis::RedisResult<ConnectionInfo> {
@@ -6786,6 +6912,28 @@ mod tests {
     use openplotva_config::{DEFAULT_REDIS_DB, RedisConfig};
     use redis::ConnectionAddr;
     use sqlx::postgres::PgPoolOptions;
+
+    #[test]
+    fn redis_store_derived_stores_share_connection_pool() -> Result<(), Box<dyn Error>> {
+        let client = redis::Client::open("redis://127.0.0.1/0")?;
+        let store = super::RedisStore::from_client(client);
+
+        let rate_limits = store.rate_limit_store();
+        let ephemeral = store.ephemeral_message_store();
+        let blocked = store.blocked_chat_store();
+
+        assert!(
+            rate_limits
+                .connections
+                .shares_manager_with(&ephemeral.connections)
+        );
+        assert!(
+            ephemeral
+                .connections
+                .shares_manager_with(&blocked.connections)
+        );
+        Ok(())
+    }
 
     #[test]
     fn concurrent_index_migrations_are_single_statement_no_tx_files() {

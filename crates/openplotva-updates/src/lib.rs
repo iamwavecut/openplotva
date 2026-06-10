@@ -6,6 +6,7 @@ use std::{
     future::Future,
     io,
     pin::Pin,
+    sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -20,11 +21,12 @@ use openplotva_core::{
     ChatAttachment, ChatMessageMeta, ChatState, MessageSender, SENDER_TYPE_CHANNEL,
     SENDER_TYPE_SAME_CHAT, SENDER_TYPE_SYSTEM, SENDER_TYPE_USER, UpdateState, UserState,
 };
-use redis::Client as RedisClient;
+use redis::{Client as RedisClient, aio::ConnectionManager};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use thiserror::Error;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use tokio::sync::OnceCell;
 
 /// Human-readable crate purpose used by scaffold tests and docs.
 pub const PURPOSE: &str = "updates";
@@ -304,8 +306,49 @@ struct NativeUpdateEnvelopeRef<'a> {
 /// Redis-backed Telegram update queue.
 #[derive(Clone, Debug)]
 pub struct RedisUpdateQueue {
-    client: RedisClient,
+    connections: RedisUpdateConnections,
     key: String,
+}
+
+#[derive(Clone, Debug)]
+struct RedisUpdateConnections {
+    client: RedisClient,
+    commands: Arc<OnceCell<ConnectionManager>>,
+    blocking: Arc<OnceCell<ConnectionManager>>,
+}
+
+impl RedisUpdateConnections {
+    fn new(client: RedisClient) -> Self {
+        Self {
+            client,
+            commands: Arc::new(OnceCell::new()),
+            blocking: Arc::new(OnceCell::new()),
+        }
+    }
+
+    async fn command_connection(&self) -> redis::RedisResult<ConnectionManager> {
+        self.commands
+            .get_or_try_init(|| async { self.client.get_connection_manager().await })
+            .await
+            .cloned()
+    }
+
+    async fn blocking_connection(&self) -> redis::RedisResult<ConnectionManager> {
+        self.blocking
+            .get_or_try_init(|| async { self.client.get_connection_manager().await })
+            .await
+            .cloned()
+    }
+
+    #[cfg(test)]
+    fn shares_command_manager_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.commands, &other.commands)
+    }
+
+    #[cfg(test)]
+    fn shares_blocking_manager_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.blocking, &other.blocking)
+    }
 }
 
 impl RedisUpdateQueue {
@@ -316,7 +359,7 @@ impl RedisUpdateQueue {
     /// Create a queue using an explicit Redis key, useful for isolated tests.
     pub fn with_key(client: RedisClient, key: impl Into<String>) -> Self {
         Self {
-            client,
+            connections: RedisUpdateConnections::new(client),
             key: key.into(),
         }
     }
@@ -327,7 +370,7 @@ impl RedisUpdateQueue {
     }
 
     pub async fn enqueue_encoded(&self, update: &EncodedUpdate) -> Result<(), UpdateQueueError> {
-        let mut connection = self.client.get_multiplexed_async_connection().await?;
+        let mut connection = self.connections.command_connection().await?;
         let _: i64 = redis::cmd("RPUSH")
             .arg(&self.key)
             .arg(update.as_queue_value())
@@ -361,7 +404,7 @@ impl RedisUpdateQueue {
         &self,
         timeout: Duration,
     ) -> Result<Option<EncodedUpdate>, UpdateQueueError> {
-        let mut connection = self.client.get_multiplexed_async_connection().await?;
+        let mut connection = self.connections.blocking_connection().await?;
         let result: Option<(String, Vec<u8>)> = redis::cmd("BLPOP")
             .arg(&self.key)
             .arg(blpop_timeout_arg(timeout))
@@ -410,7 +453,7 @@ impl RedisUpdateQueue {
     }
 
     pub async fn len(&self) -> Result<i64, UpdateQueueError> {
-        let mut connection = self.client.get_multiplexed_async_connection().await?;
+        let mut connection = self.connections.command_connection().await?;
         let len: i64 = redis::cmd("LLEN")
             .arg(&self.key)
             .query_async(&mut connection)
@@ -3021,6 +3064,26 @@ mod tests {
     #[test]
     fn queue_key_matches_go_update_queue() {
         assert_eq!(DEFAULT_UPDATE_QUEUE_KEY, "plotva:updates:queue");
+    }
+
+    #[test]
+    fn redis_update_queue_clones_share_command_and_blocking_connection_pools()
+    -> Result<(), Box<dyn Error>> {
+        let client = redis::Client::open("redis://127.0.0.1/0")?;
+        let queue = RedisUpdateQueue::with_key(client, "openplotva:test:updates:pool");
+        let clone = queue.clone();
+
+        assert!(
+            queue
+                .connections
+                .shares_command_manager_with(&clone.connections)
+        );
+        assert!(
+            queue
+                .connections
+                .shares_blocking_manager_with(&clone.connections)
+        );
+        Ok(())
     }
 
     #[test]

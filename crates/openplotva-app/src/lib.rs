@@ -8073,9 +8073,10 @@ async fn start_runtime_workers(
         llm_trace_buffer: None,
         runtime_api_tls_public_key_pin: None,
     };
-    let updates_inspector = runtime_updates::RuntimeUpdatesInspectorHandle::new(
-        openplotva_updates::RedisUpdateQueue::new(service_clients.redis.client().clone()),
-    );
+    let update_queue =
+        openplotva_updates::RedisUpdateQueue::new(service_clients.redis.client().clone());
+    let updates_inspector =
+        runtime_updates::RuntimeUpdatesInspectorHandle::new(update_queue.clone());
     let llm_trace_buffer = runtime_llm::RuntimeLlmTraceBuffer::default();
     let (llm_event_recorder, llm_event_recorder_worker) =
         runtime_llm::PostgresRuntimeLlmEventRecorder::spawn(
@@ -9419,9 +9420,7 @@ async fn start_runtime_workers(
             if let Some(webhook_setup) = webhook_setup {
                 let webhook_startup =
                     TelegramWebhookSetupClient::new(bot_key.to_owned(), telegram.clone());
-                let update_queue = openplotva_updates::RedisUpdateQueue::new(
-                    service_clients.redis.client().clone(),
-                );
+                let update_queue = update_queue.clone();
                 let update_stop = stop.subscribe();
                 let update_producer_worker = tokio::spawn(async move {
                     let report = run_webhook_update_producer_after_set_webhook(
@@ -9456,8 +9455,7 @@ async fn start_runtime_workers(
     } else {
         let update_startup = telegram.clone();
         let update_source = openplotva_telegram::LongPollUpdateSource::new(telegram.clone());
-        let update_queue =
-            openplotva_updates::RedisUpdateQueue::new(service_clients.redis.client().clone());
+        let update_queue = update_queue.clone();
         let update_stop = stop.subscribe();
         let update_producer_worker = tokio::spawn(async move {
             let report = run_long_poll_update_producer_after_delete_webhook(
@@ -9853,9 +9851,7 @@ async fn start_runtime_workers(
             bot_identity.username.clone(),
             history_handler,
         ));
-        let update_consumer_queue = Arc::new(openplotva_updates::RedisUpdateQueue::new(
-            service_clients.redis.client().clone(),
-        ));
+        let update_consumer_queue = Arc::new(update_queue.clone());
         let update_stage_tracker = Arc::new(updates_inspector.stage_tracker());
         let update_consumer_stop = stop.subscribe();
         let update_consumer_worker = tokio::spawn(async move {

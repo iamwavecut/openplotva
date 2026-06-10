@@ -12,12 +12,12 @@ anyhow.workspace = true
 carapax.workspace = true
 clap = { workspace = true, features = ["derive"] }
 openplotva-core = { path = "../openplotva-core" }
-redis = { workspace = true, features = ["tokio-comp"] }
+redis = { workspace = true, features = ["tokio-comp", "connection-manager"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 thiserror.workspace = true
 time = { workspace = true, features = ["formatting"] }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
 zstd.workspace = true
 
 [lints]

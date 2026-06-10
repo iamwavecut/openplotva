@@ -15,13 +15,14 @@ openplotva-memory = { path = "../openplotva-memory" }
 openplotva-shield = { path = "../openplotva-shield" }
 hex.workspace = true
 pgvector.workspace = true
-redis = { workspace = true, features = ["tokio-comp"] }
+redis = { workspace = true, features = ["tokio-comp", "connection-manager"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha2.workspace = true
 sqlx = { workspace = true, features = ["macros", "migrate", "postgres", "runtime-tokio", "time"] }
 thiserror.workspace = true
 time.workspace = true
+tokio = { workspace = true, features = ["sync"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
