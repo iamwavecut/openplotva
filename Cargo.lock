@@ -2232,6 +2232,7 @@ dependencies = [
  "openplotva-core",
  "openplotva-updates",
  "redis",
+ "reqwest",
  "serde",
  "serde_json",
  "sha1",
@@ -2256,6 +2257,7 @@ dependencies = [
  "thiserror",
  "time",
  "tokio",
+ "tracing",
  "zstd",
 ]
 

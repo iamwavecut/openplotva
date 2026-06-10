@@ -237,6 +237,13 @@ pub fn empty_context() -> CarapaxContext {
     CarapaxContext::default()
 }
 
+/// Total per-request bound for Bot API HTTP calls. Must stay above the 60s
+/// `getUpdates` long-poll hold (`GO_LONG_POLL_TIMEOUT`) plus network slack;
+/// without it a half-open socket stalls outbound sends indefinitely.
+const TELEGRAM_HTTP_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
+const TELEGRAM_HTTP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Create a Telegram Bot API client through the mandated `carapax` integration.
 pub fn telegram_client(token: impl Into<String>) -> Result<TelegramClient, TelegramClientError> {
     telegram_client_with_base_url(token, "")
@@ -247,7 +254,13 @@ pub fn telegram_client_with_base_url(
     token: impl Into<String>,
     base_url: impl AsRef<str>,
 ) -> Result<TelegramClient, TelegramClientError> {
-    let client = TelegramClient::new(token)?;
+    let http_client = reqwest::Client::builder()
+        .tls_backend_rustls()
+        .connect_timeout(TELEGRAM_HTTP_CONNECT_TIMEOUT)
+        .timeout(TELEGRAM_HTTP_REQUEST_TIMEOUT)
+        .build()
+        .map_err(TelegramClientError::BuildClient)?;
+    let client = TelegramClient::with_http_client(http_client, token);
     let base_url = base_url.as_ref().trim().trim_end_matches('/');
     if base_url.is_empty() {
         Ok(client)

@@ -862,7 +862,11 @@ where
                         });
                     }
                     Ok(None) => report.empty_polls += 1,
-                    Err(error) => report.dequeue_errors.push(error.to_string()),
+                    Err(error) => {
+                        let error = error.to_string();
+                        tracing::warn!(%error, "failed to dequeue Telegram update");
+                        report.dequeue_errors.push(error);
+                    }
                 }
             }
             Some(joined) = workers.join_next(), if !workers.is_empty() => {

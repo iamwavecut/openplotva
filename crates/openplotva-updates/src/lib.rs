@@ -21,7 +21,10 @@ use openplotva_core::{
     ChatAttachment, ChatMessageMeta, ChatState, MessageSender, SENDER_TYPE_CHANNEL,
     SENDER_TYPE_SAME_CHAT, SENDER_TYPE_SYSTEM, SENDER_TYPE_USER, UpdateState, UserState,
 };
-use redis::{Client as RedisClient, aio::ConnectionManager};
+use redis::{
+    AsyncConnectionConfig, Client as RedisClient,
+    aio::{ConnectionManager, MultiplexedConnection},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use thiserror::Error;
@@ -314,7 +317,14 @@ pub struct RedisUpdateQueue {
 struct RedisUpdateConnections {
     client: RedisClient,
     commands: Arc<OnceCell<ConnectionManager>>,
-    blocking: Arc<OnceCell<ConnectionManager>>,
+}
+
+/// Margin added to the client-side response timeout of a blocking read so the
+/// server-side `BLPOP` timeout always fires first.
+const BLOCKING_RESPONSE_TIMEOUT_GRACE: Duration = Duration::from_secs(2);
+
+fn blocking_response_timeout(timeout: Duration) -> Option<Duration> {
+    (!timeout.is_zero()).then(|| timeout + BLOCKING_RESPONSE_TIMEOUT_GRACE)
 }
 
 impl RedisUpdateConnections {
@@ -322,7 +332,6 @@ impl RedisUpdateConnections {
         Self {
             client,
             commands: Arc::new(OnceCell::new()),
-            blocking: Arc::new(OnceCell::new()),
         }
     }
 
@@ -333,21 +342,27 @@ impl RedisUpdateConnections {
             .cloned()
     }
 
-    async fn blocking_connection(&self) -> redis::RedisResult<ConnectionManager> {
-        self.blocking
-            .get_or_try_init(|| async { self.client.get_connection_manager().await })
+    /// Blocking reads use a dedicated connection per call: dropping it on
+    /// caller cancellation or timeout closes the socket, which cancels the
+    /// server-side `BLPOP`. A shared multiplexed connection must never carry
+    /// blocking commands - an abandoned `BLPOP` keeps blocking server-side
+    /// and delivers any popped update to a dropped receiver, silently losing
+    /// it. The client-side response timeout stays above the `BLPOP` timeout
+    /// so the server always answers first.
+    async fn blocking_connection(
+        &self,
+        timeout: Duration,
+    ) -> redis::RedisResult<MultiplexedConnection> {
+        let config =
+            AsyncConnectionConfig::new().set_response_timeout(blocking_response_timeout(timeout));
+        self.client
+            .get_multiplexed_async_connection_with_config(&config)
             .await
-            .cloned()
     }
 
     #[cfg(test)]
     fn shares_command_manager_with(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.commands, &other.commands)
-    }
-
-    #[cfg(test)]
-    fn shares_blocking_manager_with(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.blocking, &other.blocking)
     }
 }
 
@@ -404,7 +419,7 @@ impl RedisUpdateQueue {
         &self,
         timeout: Duration,
     ) -> Result<Option<EncodedUpdate>, UpdateQueueError> {
-        let mut connection = self.connections.blocking_connection().await?;
+        let mut connection = self.connections.blocking_connection(timeout).await?;
         let result: Option<(String, Vec<u8>)> = redis::cmd("BLPOP")
             .arg(&self.key)
             .arg(blpop_timeout_arg(timeout))
@@ -560,7 +575,11 @@ where
                     _ = &mut stop => break,
                     result = &mut queued => match result {
                         Ok(()) => report.enqueued += 1,
-                        Err(error) => report.enqueue_errors.push(error.to_string()),
+                        Err(error) => {
+                            let error = error.to_string();
+                            tracing::warn!(%error, "failed to enqueue Telegram update");
+                            report.enqueue_errors.push(error);
+                        }
                     },
                 }
             }
@@ -3043,7 +3062,7 @@ mod tests {
         TelegramMessageAttachmentOptions, UpdateCodecError, UpdateConsumerConfig,
         UpdateProducerQueue, UpdateProducerQueueFuture, UpdateProducerSource,
         UpdateProducerSourceFuture, UpdateStage, UpdateStageOutcome, UpdateStageReport,
-        UpdateStageTracker, blpop_timeout_arg, build_guest_dialog_text,
+        UpdateStageTracker, blocking_response_timeout, blpop_timeout_arg, build_guest_dialog_text,
         build_guest_shield_query_text, compose_image_prompt, edited_image_prompt_update,
         extract_update_state, fetcher_message_text, format_guest_chain_for_prompt,
         guest_current_request_text, guest_has_other_bot_mention, guest_message_reject_reason,
@@ -3067,8 +3086,7 @@ mod tests {
     }
 
     #[test]
-    fn redis_update_queue_clones_share_command_and_blocking_connection_pools()
-    -> Result<(), Box<dyn Error>> {
+    fn redis_update_queue_clones_share_command_connection_pool() -> Result<(), Box<dyn Error>> {
         let client = redis::Client::open("redis://127.0.0.1/0")?;
         let queue = RedisUpdateQueue::with_key(client, "openplotva:test:updates:pool");
         let clone = queue.clone();
@@ -3078,12 +3096,16 @@ mod tests {
                 .connections
                 .shares_command_manager_with(&clone.connections)
         );
-        assert!(
-            queue
-                .connections
-                .shares_blocking_manager_with(&clone.connections)
-        );
         Ok(())
+    }
+
+    #[test]
+    fn blocking_response_timeout_outlives_server_side_blpop_timeout() {
+        assert_eq!(blocking_response_timeout(Duration::ZERO), None);
+        assert_eq!(
+            blocking_response_timeout(Duration::from_secs(5)),
+            Some(Duration::from_secs(7))
+        );
     }
 
     #[test]
@@ -6154,6 +6176,50 @@ mod tests {
             processed.handle.as_ref().map(|stage| &stage.outcome),
             Some(&UpdateStageOutcome::Completed)
         );
+
+        let _: i64 = redis::cmd("DEL")
+            .arg(&key)
+            .query_async(&mut connection)
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_redis_cancelled_blocking_dequeues_do_not_swallow_updates_when_url_is_set()
+    -> Result<(), Box<dyn Error>> {
+        let Ok(redis_url) = env::var("OPENPLOTVA_TEST_REDIS_URL") else {
+            return Ok(());
+        };
+
+        let client = redis::Client::open(redis_url)?;
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let key = format!("openplotva:test:updates:cancel:{suffix}");
+        let queue = RedisUpdateQueue::with_key(client.clone(), key.clone());
+        let mut connection = client.get_multiplexed_async_connection().await?;
+        let _: i64 = redis::cmd("DEL")
+            .arg(&key)
+            .query_async(&mut connection)
+            .await?;
+
+        // Abandon in-flight blocking reads the way the consumer select loop
+        // does. Each abandoned read must cancel its server-side BLPOP instead
+        // of leaving it to swallow the next enqueued update.
+        for _ in 0..5 {
+            let pending = queue.dequeue_encoded(Duration::from_secs(5));
+            tokio::pin!(pending);
+            let raced = tokio::time::timeout(Duration::from_millis(200), &mut pending).await;
+            assert!(
+                raced.is_err(),
+                "BLPOP should still be blocked when abandoned"
+            );
+        }
+
+        queue.enqueue_update(&sample_message_update()?).await?;
+        let dequeued = queue
+            .dequeue_update(Duration::from_secs(5))
+            .await?
+            .ok_or_else(|| io::Error::other("update swallowed by an abandoned blocking read"))?;
+        assert_eq!(dequeued.id, 12345);
 
         let _: i64 = redis::cmd("DEL")
             .arg(&key)
