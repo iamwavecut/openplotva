@@ -6451,16 +6451,9 @@ async fn admin_llm_analytics_summary_response(
         Ok(summary) => {
             let since = admin_llm_analytics_since_time(&summary);
             let tool_calls = openplotva_dialog::tool_telemetry::snapshot_since(since, 50);
-            let (memory_runs, memory_runs_error) =
-                admin_llm_memory_run_analytics(routes, since).await;
             admin_json_no_cache_response(
                 StatusCode::OK,
-                admin_llm_analytics_summary_json(
-                    &summary,
-                    &tool_calls,
-                    memory_runs.as_ref(),
-                    memory_runs_error.as_deref(),
-                ),
+                admin_llm_analytics_summary_json(&summary, &tool_calls),
             )
         }
         Err(error) => {
@@ -6474,28 +6467,6 @@ fn admin_llm_analytics_since_time(
     summary: &openplotva_server::RuntimeLlmAnalyticsData,
 ) -> OffsetDateTime {
     OffsetDateTime::parse(&summary.since, &Rfc3339).unwrap_or_else(|_| OffsetDateTime::now_utc())
-}
-
-async fn admin_llm_memory_run_analytics(
-    routes: &StaticWebRoutes,
-    since: OffsetDateTime,
-) -> (Option<openplotva_memory::RunAnalytics>, Option<String>) {
-    let Some(store) = routes
-        .memory_store
-        .as_ref()
-        .filter(|_| routes.memory_admin_enabled)
-    else {
-        return (None, None);
-    };
-    match store.run_analytics(since).await {
-        Ok(mut analytics) => {
-            analytics.token_estimator = routes.memory_token_estimator_source.to_string();
-            analytics.max_input_tokens = routes.memory_max_input_tokens;
-            analytics.max_messages_per_run = routes.memory_max_messages_per_run;
-            (Some(analytics), None)
-        }
-        Err(error) => (None, Some(error.to_string())),
-    }
 }
 
 fn admin_llm_requests_filter(
@@ -6724,8 +6695,6 @@ fn admin_safety_check_json(check: &openplotva_server::RuntimeSafetyCheckData) ->
 fn admin_llm_analytics_summary_json(
     summary: &openplotva_server::RuntimeLlmAnalyticsData,
     tool_calls: &openplotva_dialog::tool_telemetry::ToolTelemetrySnapshot,
-    memory_runs: Option<&openplotva_memory::RunAnalytics>,
-    memory_runs_error: Option<&str>,
 ) -> serde_json::Value {
     let mut root = serde_json::Map::new();
     admin_insert(&mut root, "range", &summary.range);
@@ -6778,9 +6747,6 @@ fn admin_llm_analytics_summary_json(
         summary.runtime_jobs_error.as_deref(),
     );
     admin_insert(&mut root, "tool_calls", tool_calls.to_json());
-    let memory_runs_value = memory_runs.and_then(|analytics| serde_json::to_value(analytics).ok());
-    admin_insert_opt_value(&mut root, "memory_runs", memory_runs_value.as_ref());
-    admin_insert_opt(&mut root, "memory_runs_error", memory_runs_error);
     let ai_farm_capacity = summary
         .ai_farm_capacity
         .as_ref()
@@ -11559,30 +11525,15 @@ mod tests {
                 ..openplotva_dialog::tool_telemetry::ToolTelemetryEvent::default()
             }],
         };
-        let memory_runs = openplotva_memory::RunAnalytics {
-            since: OffsetDateTime::parse("2026-05-20T00:00:00Z", &Rfc3339)?,
-            queued_count: 1,
-            token_estimator: "heuristic".to_owned(),
-            max_input_tokens: 10_000,
-            max_messages_per_run: 200,
-            statuses: vec![openplotva_memory::RunStatusStat {
-                status: "queued".to_owned(),
-                count: 1,
-                message_count: 5,
-                ..openplotva_memory::RunStatusStat::default()
-            }],
-            ..openplotva_memory::RunAnalytics::default()
-        };
-        let value =
-            admin_llm_analytics_summary_json(&summary, &tool_calls, Some(&memory_runs), None);
+        let value = admin_llm_analytics_summary_json(&summary, &tool_calls);
         assert_eq!(value["totals"]["total_count"], 3);
         assert_eq!(value["series"][0]["total_count"], 2);
         assert_eq!(value["model_series"][0]["output_tokens"], 200);
         assert_eq!(value["inference_params"][0]["max_tokens"], 512);
         assert_eq!(value["tool_calls"]["total"], 2);
         assert_eq!(value["tool_calls"]["by_tool"][0]["key"], "draw_image");
-        assert_eq!(value["memory_runs"]["queued_count"], 1);
-        assert_eq!(value["memory_runs"]["token_estimator"], "heuristic");
+        assert!(value.get("memory_runs").is_none());
+        assert!(value.get("memory_runs_error").is_none());
         assert_eq!(value["models"][0]["model"], "model-a");
         assert_eq!(value["models"][0]["input_tokens"], 100);
         assert_eq!(value["models"][0]["avg_effective_output_tps"], 7.5);

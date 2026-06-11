@@ -41,6 +41,8 @@ OFFSET $3"#;
 
 const SQL_GET_RUNTIME_USER: &str = "SELECT * FROM users WHERE id = $1";
 const SQL_GET_RUNTIME_USER_BY_USERNAME: &str = "SELECT * FROM users WHERE username = $1 LIMIT 1";
+const SQL_GET_RUNTIME_USER_ID_BY_USERNAME: &str =
+    "SELECT id FROM users WHERE lower(username) = lower($1) LIMIT 1";
 const SQL_LIST_RUNTIME_USERS_BY_IDS: &str = "SELECT * FROM users WHERE id = ANY($1::bigint[])";
 
 const SQL_COUNT_CHATS_FILTERED: &str = r#"
@@ -74,20 +76,16 @@ const SQL_COUNT_CHATS_BY_MEMBER: &str = r#"
 SELECT COUNT(DISTINCT c.id)::int
 FROM chats c
 JOIN chat_members cm ON c.id = cm.chat_id
-JOIN users u ON cm.user_id = u.id
-WHERE ($1::text IS NULL OR LOWER(u.username) = LOWER($1::text))
-  AND ($2::bigint IS NULL OR u.id = $2::bigint)"#;
+WHERE cm.user_id = $1"#;
 
 const SQL_LIST_CHATS_BY_MEMBER: &str = r#"
 SELECT DISTINCT c.*
 FROM chats c
 JOIN chat_members cm ON c.id = cm.chat_id
-JOIN users u ON cm.user_id = u.id
-WHERE ($1::text IS NULL OR LOWER(u.username) = LOWER($1::text))
-  AND ($2::bigint IS NULL OR u.id = $2::bigint)
+WHERE cm.user_id = $1
 ORDER BY c.id
-LIMIT $3
-OFFSET $4"#;
+LIMIT $2
+OFFSET $3"#;
 
 const SQL_GET_RUNTIME_CHAT: &str = "SELECT * FROM chats WHERE id = $1";
 const SQL_LIST_RUNTIME_CHAT_MEMBERS: &str = "SELECT * FROM chat_members WHERE chat_id = $1";
@@ -274,14 +272,20 @@ impl PostgresRuntimeEntityReader {
         &self,
         filter: RuntimeChatsFilter,
     ) -> Result<RuntimeChatConnectionData, sqlx::Error> {
+        let Some(member_user_id) = self.chat_member_filter_user_id(&filter).await? else {
+            return Ok(RuntimeChatConnectionData {
+                count: 0,
+                offset: filter.offset,
+                limit: filter.limit,
+                items: Vec::new(),
+            });
+        };
         let count = sqlx::query_scalar::<_, i32>(SQL_COUNT_CHATS_BY_MEMBER)
-            .bind(filter.member_username.as_deref())
-            .bind(filter.member_user_id)
+            .bind(member_user_id)
             .fetch_one(&self.pool)
             .await?;
         let rows = sqlx::query(SQL_LIST_CHATS_BY_MEMBER)
-            .bind(filter.member_username.as_deref())
-            .bind(filter.member_user_id)
+            .bind(member_user_id)
             .bind(filter.limit)
             .bind(filter.offset)
             .fetch_all(&self.pool)
@@ -295,6 +299,39 @@ impl PostgresRuntimeEntityReader {
                 .map(runtime_chat_from_row)
                 .collect::<Result<Vec<_>, _>>()?,
         })
+    }
+
+    async fn chat_member_filter_user_id(
+        &self,
+        filter: &RuntimeChatsFilter,
+    ) -> Result<Option<i64>, sqlx::Error> {
+        let username = filter
+            .member_username
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let username_was_requested = username.is_some();
+        let username_user_id = match username {
+            Some(username) => {
+                sqlx::query_scalar::<_, i64>(SQL_GET_RUNTIME_USER_ID_BY_USERNAME)
+                    .bind(username)
+                    .fetch_optional(&self.pool)
+                    .await?
+            }
+            None => None,
+        };
+        match (filter.member_user_id, username_user_id) {
+            (Some(member_user_id), Some(username_user_id))
+                if member_user_id == username_user_id =>
+            {
+                Ok(Some(member_user_id))
+            }
+            (Some(_), Some(_)) => Ok(None),
+            (Some(_), None) if username_was_requested => Ok(None),
+            (Some(member_user_id), None) => Ok(Some(member_user_id)),
+            (None, Some(username_user_id)) => Ok(Some(username_user_id)),
+            (None, None) => Ok(None),
+        }
     }
 
     async fn get_chat(&self, id: i64) -> Result<Option<RuntimeChatData>, sqlx::Error> {
@@ -597,5 +634,13 @@ mod tests {
         assert_eq!(runtime_actor_label(&event).as_deref(), Some("Alice"));
         event.actor_first_name = None;
         assert_eq!(runtime_actor_label(&event).as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn chat_member_filter_sql_uses_resolved_user_id_path() {
+        assert!(SQL_COUNT_CHATS_BY_MEMBER.contains("cm.user_id = $1"));
+        assert!(SQL_LIST_CHATS_BY_MEMBER.contains("cm.user_id = $1"));
+        assert!(!SQL_COUNT_CHATS_BY_MEMBER.contains("LOWER(u.username)"));
+        assert!(!SQL_LIST_CHATS_BY_MEMBER.contains("LOWER(u.username)"));
     }
 }

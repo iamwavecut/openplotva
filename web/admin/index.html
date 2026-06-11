@@ -1010,23 +1010,6 @@
                                     </div>
                                 </div>
 
-                                <div class="grid-2">
-                                    <div class="card" style="background-color: var(--c-bg-app);">
-                                        <div class="card-header">Memory Jobs</div>
-                                        <div class="card-body">
-                                            <div id="memory-jobs-summary" class="mono text-muted mb-3"
-                                                style="white-space: pre-wrap; font-size: 0.85rem;">—</div>
-                                            <div id="memory-jobs-table" class="table-container text-muted">—</div>
-                                            <div id="memory-jobs-error" class="text-danger mt-2"></div>
-                                        </div>
-                                    </div>
-                                    <div class="card" style="background-color: var(--c-bg-app);">
-                                        <div class="card-header">Memory Errors</div>
-                                        <div class="card-body">
-                                            <div id="memory-errors-table" class="table-container text-muted">—</div>
-                                        </div>
-                                    </div>
-                                </div>
                             </div>
                         </div>
                     </div>
@@ -3103,56 +3086,6 @@
                 'No tool parser events');
         }
 
-        function renderMemoryJobAnalytics(memoryRuns, error) {
-            const summary = document.getElementById('memory-jobs-summary');
-            if (!memoryRuns) {
-                if (summary) summary.textContent = 'memory service unavailable';
-                renderAnalyticsTable('memory-jobs-table', [], [], 'No memory job data');
-                renderAnalyticsTable('memory-errors-table', [], [], 'No memory errors');
-                return;
-            }
-            if (summary) {
-                const lines = [
-                    `estimator: ${memoryRuns.token_estimator || 'unknown'}`,
-                    `max input: ${formatAnalyticsCount(memoryRuns.max_input_tokens)} tokens`,
-                    `max messages: ${formatAnalyticsCount(memoryRuns.max_messages_per_run)}`,
-                    `queued: ${formatAnalyticsCount(memoryRuns.queued_count)}`,
-                    `processing: ${formatAnalyticsCount(memoryRuns.processing_count)}`,
-                    `failed: ${formatAnalyticsCount(memoryRuns.failed_count)}`,
-                    `completed: ${formatAnalyticsCount(memoryRuns.completed_count)}`,
-                    `stale processing: ${formatAnalyticsCount(memoryRuns.stale_processing_count)}`,
-                    `latest completed: ${formatDateValue(memoryRuns.latest_completed_at)}`,
-                    `latest token stats: ${formatDateValue(memoryRuns.latest_run_with_token_stats)}`,
-                ];
-                summary.textContent = lines.join('\n');
-            }
-            renderAnalyticsTable('memory-jobs-table',
-                ['Status', 'Runs', 'Messages', 'In avg', 'In max', 'Out avg', 'Out max', 'Avg run', 'Max run', 'Latest'],
-                (memoryRuns.statuses || []).map(row => [
-                    escapeHtml(row.status || 'unknown'),
-                    formatAnalyticsCount(row.count),
-                    formatAnalyticsCount(row.message_count),
-                    formatAnalyticsCount(row.avg_input_tokens),
-                    formatAnalyticsCount(row.max_input_tokens),
-                    formatAnalyticsCount(row.avg_output_tokens),
-                    formatAnalyticsCount(row.max_output_tokens),
-                    formatAnalyticsMs(row.avg_duration_ms),
-                    formatAnalyticsMs(row.max_duration_ms),
-                    escapeHtml(formatDateValue(row.latest_updated_at)),
-                ]),
-                'No memory jobs');
-            renderAnalyticsTable('memory-errors-table',
-                ['Latest', 'Count', 'Error'],
-                (memoryRuns.recent_errors || []).map(row => [
-                    escapeHtml(formatDateValue(row.latest_updated_at)),
-                    formatAnalyticsCount(row.count),
-                    escapeHtml(row.error || ''),
-                ]),
-                'No memory errors');
-            const errNode = document.getElementById('memory-jobs-error');
-            if (errNode) errNode.textContent = error || '';
-        }
-
         function renderAIFarmCapacity(capacity) {
             const container = document.getElementById('llm-aifarm-capacity');
             if (!container) return;
@@ -3202,7 +3135,6 @@
 	            renderLLMInferenceAnalytics(data.inference_params || []);
                 renderToolCallParserAnalytics(data.tool_calls || null);
 	            renderRuntimeJobAnalytics(data.runtime_jobs || [], data.runtime_jobs_error || '');
-            renderMemoryJobAnalytics(data.memory_runs || null, data.memory_runs_error || '');
             renderAIFarmCapacity(data.aifarm_capacity || null);
 
             if (typeof Chart === 'undefined') return;
