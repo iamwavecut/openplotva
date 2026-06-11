@@ -5,6 +5,7 @@ use std::{
     fmt,
     future::Future,
     pin::Pin,
+    sync::Arc,
     time::Duration,
 };
 
@@ -26,7 +27,7 @@ pub const TELEGRAM_WEBHOOK_PATH: &str = "/telegram/webhook";
 
 pub const TELEGRAM_WEBHOOK_SECRET_HEADER: &str = "X-Telegram-Bot-Api-Secret-Token";
 
-pub const GO_WEBHOOK_UPDATE_BUFFER_SIZE: usize = 1_000_000;
+pub const GO_WEBHOOK_UPDATE_BUFFER_SIZE: usize = 10_000;
 
 pub const GO_WEBHOOK_UPDATE_SEND_TIMEOUT: Duration = Duration::from_millis(1_500);
 
@@ -141,7 +142,9 @@ pub struct WebhookUpdateSource {
 #[derive(Clone, Debug)]
 pub struct WebhookUpdateSender {
     sender: mpsc::Sender<TelegramUpdate>,
+    buffer_size: usize,
     send_timeout: Duration,
+    ingress_guard: Option<Arc<openplotva_updates::UpdateIngressGuard>>,
 }
 
 /// Error returned while accepting a webhook update into the in-memory channel.
@@ -192,7 +195,9 @@ pub fn webhook_update_channel(buffer_size: usize) -> (WebhookUpdateSender, Webho
     (
         WebhookUpdateSender {
             sender,
+            buffer_size,
             send_timeout: GO_WEBHOOK_UPDATE_SEND_TIMEOUT,
+            ingress_guard: None,
         },
         WebhookUpdateSource {
             receiver: Mutex::new(receiver),
@@ -206,15 +211,43 @@ impl WebhookUpdateSender {
         self
     }
 
+    pub fn with_ingress_guard(
+        mut self,
+        ingress_guard: Arc<openplotva_updates::UpdateIngressGuard>,
+    ) -> Self {
+        self.ingress_guard = Some(ingress_guard);
+        self
+    }
+
     /// Accept one parsed Telegram update into the webhook channel.
     pub async fn accept_update(
         &self,
         update: TelegramUpdate,
     ) -> Result<(), WebhookUpdateSendError> {
+        let update_id = update.id;
+        let update_name = openplotva_updates::producer_update_name(&update);
         timeout(self.send_timeout, self.sender.send(update))
             .await
-            .map_err(|_| WebhookUpdateSendError::Timeout)?
-            .map_err(|_| WebhookUpdateSendError::Closed)
+            .map_err(|_| {
+                tracing::warn!(
+                    update_id,
+                    update_name,
+                    channel_capacity = self.sender.capacity(),
+                    channel_buffer_size = self.buffer_size,
+                    "timed out sending Telegram webhook update to bounded channel"
+                );
+                WebhookUpdateSendError::Timeout
+            })?
+            .map_err(|_| {
+                tracing::warn!(
+                    update_id,
+                    update_name,
+                    channel_capacity = self.sender.capacity(),
+                    channel_buffer_size = self.buffer_size,
+                    "Telegram webhook update channel receiver is closed"
+                );
+                WebhookUpdateSendError::Closed
+            })
     }
 
     pub async fn handle_webhook_request(
@@ -233,6 +266,20 @@ impl WebhookUpdateSender {
 
         let update = openplotva_updates::decode_telegram_update_json_slice(body)
             .map_err(|_| WebhookUpdateRequestError::InvalidUpdate)?;
+        if let Some(ingress_guard) = &self.ingress_guard {
+            let decision = ingress_guard.check_update(&update);
+            if decision.is_dropped() {
+                tracing::warn!(
+                    chat_id = decision.chat_id(),
+                    update_id = update.id,
+                    update_name = openplotva_updates::producer_update_name(&update),
+                    channel_capacity = self.sender.capacity(),
+                    channel_buffer_size = self.buffer_size,
+                    "dropped Telegram webhook update by ingress flood guard"
+                );
+                return Ok(());
+            }
+        }
         self.accept_update(update)
             .await
             .map_err(|_| WebhookUpdateRequestError::ServiceUnavailable)
@@ -491,7 +538,7 @@ mod tests {
         let second = source.next_update().await.ok_or("expected second update")?;
 
         assert_eq!([first.id, second.id], [10, 11]);
-        assert_eq!(GO_WEBHOOK_UPDATE_BUFFER_SIZE, 1_000_000);
+        assert_eq!(GO_WEBHOOK_UPDATE_BUFFER_SIZE, 10_000);
         assert_eq!(GO_WEBHOOK_UPDATE_SEND_TIMEOUT.as_millis(), 1_500);
         Ok(())
     }
@@ -593,6 +640,30 @@ mod tests {
         assert_eq!(full, WebhookUpdateRequestError::ServiceUnavailable);
         assert_eq!(full.http_status(), 503);
         assert_eq!(source.next_update().await.ok_or("queued update")?.id, 10);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn webhook_request_drops_guarded_flood_update_with_ok_without_enqueue()
+    -> Result<(), Box<dyn Error>> {
+        let guard = Arc::new(openplotva_updates::UpdateIngressGuard::new(
+            openplotva_updates::UpdateIngressGuardConfig {
+                short_window: Duration::from_secs(10),
+                short_limit: 1,
+                long_window: Duration::from_secs(60),
+                long_limit: 100,
+                block_duration: Duration::from_secs(300),
+            },
+        ));
+        let (sender, source) = webhook_update_channel(1);
+        let sender = sender.with_ingress_guard(guard);
+        let body = serde_json::to_vec(&sample_message_update(10)?)?;
+
+        sender
+            .handle_webhook_request("POST", Some("secret"), "secret", &body)
+            .await?;
+
+        assert!(source.next_update_now().await.is_none());
         Ok(())
     }
 

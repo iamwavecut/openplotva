@@ -21,7 +21,7 @@ use openplotva_shield::{Options as ShieldOptions, SearchRequest as ShieldSearchR
 use pgvector::Vector;
 use redis::{
     Client as RedisClient, ConnectionAddr, ConnectionInfo, IntoConnectionInfo, RedisConnectionInfo,
-    aio::ConnectionManager,
+    aio::{ConnectionManager, ConnectionManagerConfig},
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -40,6 +40,24 @@ pub const PURPOSE: &str = "storage";
 const POSTGRES_MAX_CONNECTIONS: u32 = 50;
 const POSTGRES_MIN_CONNECTIONS: u32 = 10;
 const POSTGRES_MAX_CONNECTION_LIFETIME: Duration = Duration::from_secs(45 * 60);
+const REDIS_COMMAND_RESPONSE_TIMEOUT: Duration = Duration::from_secs(3);
+const REDIS_STORAGE_CLIENT_NAME: &str = "openplotva:storage:general";
+
+fn redis_connection_manager_config() -> ConnectionManagerConfig {
+    ConnectionManagerConfig::new().set_response_timeout(Some(REDIS_COMMAND_RESPONSE_TIMEOUT))
+}
+
+async fn set_redis_client_name(
+    connection: &mut impl redis::aio::ConnectionLike,
+    name: &str,
+) -> redis::RedisResult<()> {
+    let _: String = redis::cmd("CLIENT")
+        .arg("SETNAME")
+        .arg(name)
+        .query_async(connection)
+        .await?;
+    Ok(())
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct MemoryCardUpsertParams {
@@ -564,6 +582,9 @@ pub const SQL_UPSERT_CHAT_DEPUTIES: &str = "INSERT INTO chat_deputies (chat_id, 
 
 pub const SQL_DELETE_CHAT_MEMBER: &str =
     "DELETE FROM chat_members WHERE chat_id = $1 AND user_id = $2";
+
+pub const SQL_DELETE_STALE_INACTIVE_CHAT_MEMBERS: &str =
+    "DELETE FROM chat_members WHERE status IN ('left', 'kicked') AND updated_at < $1";
 
 pub const SQL_UPSERT_CHAT_MEMBER: &str = "INSERT INTO chat_members (chat_id, user_id, status, is_anonymous, custom_title, can_be_edited, can_manage_chat, can_delete_messages, can_manage_video_chats, can_restrict_members, can_promote_members, can_change_info, can_invite_users, can_post_messages, can_edit_messages, can_pin_messages, can_manage_topics, can_send_messages, can_send_media_messages, can_send_polls, can_send_other_messages, can_add_web_page_previews, until_date) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23) ON CONFLICT (chat_id, user_id) DO UPDATE SET status = COALESCE(EXCLUDED.status, chat_members.status), is_anonymous = COALESCE(EXCLUDED.is_anonymous, chat_members.is_anonymous), custom_title = COALESCE(EXCLUDED.custom_title, chat_members.custom_title), can_be_edited = COALESCE(EXCLUDED.can_be_edited, chat_members.can_be_edited), can_manage_chat = COALESCE(EXCLUDED.can_manage_chat, chat_members.can_manage_chat), can_delete_messages = COALESCE(EXCLUDED.can_delete_messages, chat_members.can_delete_messages), can_manage_video_chats = COALESCE(EXCLUDED.can_manage_video_chats, chat_members.can_manage_video_chats), can_restrict_members = COALESCE(EXCLUDED.can_restrict_members, chat_members.can_restrict_members), can_promote_members = COALESCE(EXCLUDED.can_promote_members, chat_members.can_promote_members), can_change_info = COALESCE(EXCLUDED.can_change_info, chat_members.can_change_info), can_invite_users = COALESCE(EXCLUDED.can_invite_users, chat_members.can_invite_users), can_post_messages = COALESCE(EXCLUDED.can_post_messages, chat_members.can_post_messages), can_edit_messages = COALESCE(EXCLUDED.can_edit_messages, chat_members.can_edit_messages), can_pin_messages = COALESCE(EXCLUDED.can_pin_messages, chat_members.can_pin_messages), can_manage_topics = COALESCE(EXCLUDED.can_manage_topics, chat_members.can_manage_topics), can_send_messages = COALESCE(EXCLUDED.can_send_messages, chat_members.can_send_messages), can_send_media_messages = COALESCE(EXCLUDED.can_send_media_messages, chat_members.can_send_media_messages), can_send_polls = COALESCE(EXCLUDED.can_send_polls, chat_members.can_send_polls), can_send_other_messages = COALESCE(EXCLUDED.can_send_other_messages, chat_members.can_send_other_messages), can_add_web_page_previews = COALESCE(EXCLUDED.can_add_web_page_previews, chat_members.can_add_web_page_previews), until_date = COALESCE(EXCLUDED.until_date, chat_members.until_date), updated_at = CURRENT_TIMESTAMP";
 
@@ -1137,7 +1158,14 @@ impl RedisConnectionPool {
 
     async fn connection(&self) -> redis::RedisResult<ConnectionManager> {
         self.manager
-            .get_or_try_init(|| async { self.client.get_connection_manager().await })
+            .get_or_try_init(|| async {
+                let mut connection = self
+                    .client
+                    .get_connection_manager_with_config(redis_connection_manager_config())
+                    .await?;
+                set_redis_client_name(&mut connection, REDIS_STORAGE_CLIENT_NAME).await?;
+                Ok(connection)
+            })
             .await
             .cloned()
     }
@@ -3017,6 +3045,17 @@ impl PostgresChatMemberStore {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    pub async fn delete_stale_inactive_chat_members_before(
+        &self,
+        cutoff: OffsetDateTime,
+    ) -> Result<u64, StorageError> {
+        let result = sqlx::query(SQL_DELETE_STALE_INACTIVE_CHAT_MEMBERS)
+            .bind(cutoff)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
     }
 
     pub async fn update_member_last_message(
@@ -6936,6 +6975,14 @@ mod tests {
     }
 
     #[test]
+    fn redis_store_connection_timeout_outlives_redis_default_response_timeout() {
+        let config = super::redis_connection_manager_config();
+
+        assert_eq!(config.response_timeout(), Some(Duration::from_secs(3)));
+        assert!(config.response_timeout() > Some(Duration::from_millis(500)));
+    }
+
+    #[test]
     fn concurrent_index_migrations_are_single_statement_no_tx_files() {
         for migration in super::MIGRATOR
             .iter()
@@ -8284,6 +8331,10 @@ mod tests {
         assert_eq!(
             super::SQL_DELETE_CHAT_MEMBER,
             "DELETE FROM chat_members WHERE chat_id = $1 AND user_id = $2"
+        );
+        assert_eq!(
+            super::SQL_DELETE_STALE_INACTIVE_CHAT_MEMBERS,
+            "DELETE FROM chat_members WHERE status IN ('left', 'kicked') AND updated_at < $1"
         );
         assert_eq!(
             super::SQL_UPSERT_CHAT_MEMBER,

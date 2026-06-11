@@ -1,6 +1,6 @@
 //! App-level chat-member service-event behavior.
 
-use std::{fmt, future::Future, pin::Pin, sync::Arc};
+use std::{fmt, future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use carapax::types::{
     Chat as TelegramChat, ChatMember as TelegramChatMember,
@@ -38,6 +38,13 @@ pub type MemberStateControlJobWorkerFuture<'a, T, E> =
 
 /// Boxed future returned by member-state sync side effects.
 pub type MemberStateControlJobFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+
+/// Boxed future returned by stale inactive member cleanup storage.
+pub type StaleInactiveMemberCleanupFuture<'a, E> =
+    Pin<Box<dyn Future<Output = Result<u64, E>> + Send + 'a>>;
+
+pub const STALE_INACTIVE_MEMBER_CLEANUP_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+pub const STALE_INACTIVE_MEMBER_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 pub trait LeftChatMemberStore {
     /// Store error type.
@@ -119,6 +126,28 @@ impl ChatMemberStateStore for openplotva_storage::PostgresChatMemberStore {
 
     fn upsert_user_state<'a>(&'a self, user: UserState) -> MemberStoreFuture<'a, (), Self::Error> {
         Box::pin(async move { self.upsert_user_state(&user).await })
+    }
+}
+
+pub trait StaleInactiveMemberCleanupStore {
+    /// Store error type.
+    type Error: fmt::Display + Send + Sync + 'static;
+
+    /// Delete cached inactive membership rows older than the cutoff.
+    fn delete_stale_inactive_chat_members_before<'a>(
+        &'a self,
+        cutoff: OffsetDateTime,
+    ) -> StaleInactiveMemberCleanupFuture<'a, Self::Error>;
+}
+
+impl StaleInactiveMemberCleanupStore for openplotva_storage::PostgresChatMemberStore {
+    type Error = openplotva_storage::StorageError;
+
+    fn delete_stale_inactive_chat_members_before<'a>(
+        &'a self,
+        cutoff: OffsetDateTime,
+    ) -> StaleInactiveMemberCleanupFuture<'a, Self::Error> {
+        Box::pin(async move { self.delete_stale_inactive_chat_members_before(cutoff).await })
     }
 }
 
@@ -496,6 +525,17 @@ pub struct MemberStateControlJobWorkerReport {
     pub status_error: Option<String>,
 }
 
+/// Result of the stale inactive member cleanup worker.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct StaleInactiveMemberCleanupWorkerReport {
+    /// Completed cleanup ticks.
+    pub ticks: usize,
+    /// Total inactive member rows deleted by completed ticks.
+    pub deleted: u64,
+    /// Non-fatal storage errors.
+    pub errors: Vec<String>,
+}
+
 /// Route chosen by the left-chat-member update wrapper.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LeftChatMemberUpdateRoute {
@@ -850,6 +890,60 @@ where
     }
 
     Some(outcome)
+}
+
+pub async fn run_stale_inactive_member_cleanup_worker_until<Store, Stop>(
+    store: &Store,
+    interval: Duration,
+    max_age: Duration,
+    stop: Stop,
+) -> StaleInactiveMemberCleanupWorkerReport
+where
+    Store: StaleInactiveMemberCleanupStore + Sync,
+    Stop: Future<Output = ()> + Send,
+{
+    run_stale_inactive_member_cleanup_worker_at_until(
+        store,
+        interval,
+        max_age,
+        OffsetDateTime::now_utc,
+        stop,
+    )
+    .await
+}
+
+pub async fn run_stale_inactive_member_cleanup_worker_at_until<Store, Stop, Now>(
+    store: &Store,
+    interval: Duration,
+    max_age: Duration,
+    mut now: Now,
+    stop: Stop,
+) -> StaleInactiveMemberCleanupWorkerReport
+where
+    Store: StaleInactiveMemberCleanupStore + Sync,
+    Stop: Future<Output = ()> + Send,
+    Now: FnMut() -> OffsetDateTime,
+{
+    let interval = interval.max(Duration::from_millis(1));
+    let max_age = time::Duration::seconds(max_age.as_secs().min(i64::MAX as u64) as i64);
+    let mut report = StaleInactiveMemberCleanupWorkerReport::default();
+    tokio::pin!(stop);
+
+    loop {
+        tokio::select! {
+            _ = &mut stop => break,
+            _ = tokio::time::sleep(interval) => {
+                report.ticks += 1;
+                let cutoff = now() - max_age;
+                match store.delete_stale_inactive_chat_members_before(cutoff).await {
+                    Ok(deleted) => report.deleted += deleted,
+                    Err(error) => report.errors.push(error.to_string()),
+                }
+            }
+        }
+    }
+
+    report
 }
 
 /// Process one member-state control job, if available.
@@ -1274,9 +1368,11 @@ mod tests {
         ChatMemberStateUpdateHandler, ChatMemberStateUpdateRoute, ChatSettingsCommunicationEffects,
         LeftChatMemberStore, LeftChatMemberUpdateHandler, LeftChatMemberUpdateRoute,
         MemberStateControlJobEffects, MemberStateControlJobQueue, MemberStateControlJobQueueFuture,
-        MemberStoreFuture, handle_chat_member_state_update_or_else_at,
-        handle_left_chat_member_update_or_else, process_member_state_control_job_once_at,
-        sync_chat_member_with_sources,
+        MemberStoreFuture, STALE_INACTIVE_MEMBER_CLEANUP_INTERVAL, STALE_INACTIVE_MEMBER_MAX_AGE,
+        StaleInactiveMemberCleanupFuture, StaleInactiveMemberCleanupStore,
+        handle_chat_member_state_update_or_else_at, handle_left_chat_member_update_or_else,
+        process_member_state_control_job_once_at,
+        run_stale_inactive_member_cleanup_worker_at_until, sync_chat_member_with_sources,
     };
 
     #[tokio::test]
@@ -1315,6 +1411,36 @@ mod tests {
                 .map(|data| data.kind),
             Some(ControlKind::ChatMemberSync)
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stale_inactive_member_cleanup_worker_uses_week_cutoff_after_daily_interval()
+    -> Result<(), Box<dyn Error>> {
+        let now = OffsetDateTime::from_unix_timestamp(1_800_604_800)?;
+        let expected_cutoff = now - time::Duration::days(7);
+        let (stop_sender, stop_receiver) = tokio::sync::oneshot::channel();
+        let store = StaleInactiveCleanupStoreStub::new(3, stop_sender);
+
+        let report = run_stale_inactive_member_cleanup_worker_at_until(
+            &store,
+            Duration::from_millis(1),
+            STALE_INACTIVE_MEMBER_MAX_AGE,
+            || now,
+            async {
+                let _ = stop_receiver.await;
+            },
+        )
+        .await;
+
+        assert_eq!(
+            STALE_INACTIVE_MEMBER_CLEANUP_INTERVAL,
+            Duration::from_secs(86_400)
+        );
+        assert_eq!(report.ticks, 1);
+        assert_eq!(report.deleted, 3);
+        assert!(report.errors.is_empty());
+        assert_eq!(store.cutoffs(), vec![expected_cutoff]);
         Ok(())
     }
 
@@ -2028,6 +2154,43 @@ mod tests {
             can_manage_chat: Some(true),
             can_manage_topics: Some(false),
             ..admin_member_state_upsert(chat_id, user_id)
+        }
+    }
+
+    struct StaleInactiveCleanupStoreStub {
+        deleted: u64,
+        cutoffs: Arc<Mutex<Vec<OffsetDateTime>>>,
+        stop_sender: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+    }
+
+    impl StaleInactiveCleanupStoreStub {
+        fn new(deleted: u64, stop_sender: tokio::sync::oneshot::Sender<()>) -> Self {
+            Self {
+                deleted,
+                cutoffs: Arc::new(Mutex::new(Vec::new())),
+                stop_sender: Arc::new(Mutex::new(Some(stop_sender))),
+            }
+        }
+
+        fn cutoffs(&self) -> Vec<OffsetDateTime> {
+            self.cutoffs.lock().expect("cleanup cutoffs").clone()
+        }
+    }
+
+    impl StaleInactiveMemberCleanupStore for StaleInactiveCleanupStoreStub {
+        type Error = io::Error;
+
+        fn delete_stale_inactive_chat_members_before<'a>(
+            &'a self,
+            cutoff: OffsetDateTime,
+        ) -> StaleInactiveMemberCleanupFuture<'a, Self::Error> {
+            Box::pin(async move {
+                self.cutoffs.lock().expect("cleanup cutoffs").push(cutoff);
+                if let Some(stop_sender) = self.stop_sender.lock().expect("cleanup stop").take() {
+                    let _ = stop_sender.send(());
+                }
+                Ok(self.deleted)
+            })
         }
     }
 

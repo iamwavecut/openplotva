@@ -65,7 +65,7 @@ services:
       - postgres-data:/var/lib/postgresql/data
 
   dragonfly:
-    image: docker.dragonflydb.io/dragonflydb/dragonfly:latest
+    image: docker.dragonflydb.io/dragonflydb/dragonfly:v1.38.1
     command: ["--logtostderr", "--cache_mode=false"]
     ports:
       - "${OPENPLOTVA_DEV_REDIS_PORT:-56379}:6379"

@@ -7283,6 +7283,47 @@ where
     }
 }
 
+pub async fn run_long_poll_update_producer_with_ingress_guard_after_delete_webhook<
+    Startup,
+    Source,
+    Queue,
+    Stop,
+>(
+    startup: &Startup,
+    source: &Source,
+    queue: &Queue,
+    ingress_guard: &openplotva_updates::UpdateIngressGuard,
+    stop: Stop,
+) -> TelegramUpdateProducerStartupReport
+where
+    Startup: DeleteWebhookExecutor + Sync,
+    Source: openplotva_updates::UpdateProducerSource + Sync,
+    Queue: openplotva_updates::UpdateProducerQueue + Sync,
+    Stop: Future<Output = ()>,
+{
+    if let Err(error) = startup.delete_webhook().await {
+        return TelegramUpdateProducerStartupReport {
+            delete_webhook_error: Some(error.to_string()),
+            set_webhook_error: None,
+            producer: None,
+        };
+    }
+
+    TelegramUpdateProducerStartupReport {
+        delete_webhook_error: None,
+        set_webhook_error: None,
+        producer: Some(
+            openplotva_updates::run_update_producer_with_ingress_guard_until(
+                source,
+                queue,
+                ingress_guard,
+                stop,
+            )
+            .await,
+        ),
+    }
+}
+
 pub async fn run_webhook_update_producer_after_set_webhook<Startup, Source, Queue, Stop>(
     startup: &Startup,
     setup: &openplotva_telegram::WebhookSetup,
@@ -8075,6 +8116,8 @@ async fn start_runtime_workers(
     };
     let update_queue =
         openplotva_updates::RedisUpdateQueue::new(service_clients.redis.client().clone());
+    let update_queue_backend = config.update_queue.backend.as_str();
+    let update_ingress_guard = Arc::new(openplotva_updates::UpdateIngressGuard::with_defaults());
     let updates_inspector =
         runtime_updates::RuntimeUpdatesInspectorHandle::new(update_queue.clone());
     let llm_trace_buffer = runtime_llm::RuntimeLlmTraceBuffer::default();
@@ -8338,6 +8381,28 @@ async fn start_runtime_workers(
     );
     let chat_settings_store = PostgresChatSettingsStore::new(service_clients.postgres.clone());
     let chat_member_store = PostgresChatMemberStore::new(service_clients.postgres.clone());
+    let stale_inactive_member_cleanup_store = chat_member_store.clone();
+    let stale_inactive_member_cleanup_stop = stop.subscribe();
+    let stale_inactive_member_cleanup_worker = tokio::spawn(async move {
+        let report = members::run_stale_inactive_member_cleanup_worker_until(
+            &stale_inactive_member_cleanup_store,
+            members::STALE_INACTIVE_MEMBER_CLEANUP_INTERVAL,
+            members::STALE_INACTIVE_MEMBER_MAX_AGE,
+            wait_for_runtime_stop(stale_inactive_member_cleanup_stop),
+        )
+        .await;
+
+        tracing::info!(?report, "stale inactive chat-member cleanup worker stopped");
+    });
+    readiness_checks.push(ReadinessCheck::ok(
+        "stale_inactive_chat_members",
+        format!(
+            "cleanup every {}s, max age {}s",
+            members::STALE_INACTIVE_MEMBER_CLEANUP_INTERVAL.as_secs(),
+            members::STALE_INACTIVE_MEMBER_MAX_AGE.as_secs()
+        ),
+    ));
+    workers.handles.push(stale_inactive_member_cleanup_worker);
 
     let payment_store = payments::PostgresSuccessfulPaymentStore::new(
         store.clone(),
@@ -9390,7 +9455,12 @@ async fn start_runtime_workers(
         tracing::info!(?outcome, "outbound immediate dispatcher worker stopped");
     });
 
-    if !config.service_probe.produce_updates {
+    if update_queue_backend != "list" {
+        readiness_checks.push(ReadinessCheck::skipped(
+            "telegram_update_producer",
+            format!("UPDATE_QUEUE_BACKEND={update_queue_backend} is spike-only; production default remains list"),
+        ));
+    } else if !config.service_probe.produce_updates {
         readiness_checks.push(ReadinessCheck::skipped(
             "telegram_update_producer",
             "OPENPLOTVA_PRODUCE_UPDATES=false",
@@ -9403,9 +9473,10 @@ async fn start_runtime_workers(
                 "BOT_WEBHOOK_URL is not set",
             ));
         } else {
-            let (webhook_sender, webhook_source) = openplotva_telegram::webhook_update_channel(
-                openplotva_telegram::GO_WEBHOOK_UPDATE_BUFFER_SIZE,
-            );
+            let (webhook_sender, webhook_source) =
+                openplotva_telegram::webhook_update_channel(config.bot.webhook.update_buffer_size);
+            let webhook_sender =
+                webhook_sender.with_ingress_guard(Arc::clone(&update_ingress_guard));
             let webhook_setup = match webhook_setup_from_config(&config.bot.webhook) {
                 Ok(setup) => Some(setup),
                 Err(error) => {
@@ -9456,12 +9527,14 @@ async fn start_runtime_workers(
         let update_startup = telegram.clone();
         let update_source = openplotva_telegram::LongPollUpdateSource::new(telegram.clone());
         let update_queue = update_queue.clone();
+        let update_ingress_guard = Arc::clone(&update_ingress_guard);
         let update_stop = stop.subscribe();
         let update_producer_worker = tokio::spawn(async move {
-            let report = run_long_poll_update_producer_after_delete_webhook(
+            let report = run_long_poll_update_producer_with_ingress_guard_after_delete_webhook(
                 &update_startup,
                 &update_source,
                 &update_queue,
+                update_ingress_guard.as_ref(),
                 wait_for_runtime_stop(update_stop),
             )
             .await;
@@ -9479,7 +9552,12 @@ async fn start_runtime_workers(
         ));
     }
 
-    if config.service_probe.consume_updates {
+    if update_queue_backend != "list" {
+        readiness_checks.push(ReadinessCheck::skipped(
+            "telegram_update_consumer",
+            format!("UPDATE_QUEUE_BACKEND={update_queue_backend} is spike-only; production default remains list"),
+        ));
+    } else if config.service_probe.consume_updates {
         let dialog_debounce = Arc::new(dialog_debounce::InMemoryDialogDebounce::new());
         workers.dialog_debounce = Some(Arc::clone(&dialog_debounce));
         let dialog_scheduler = Arc::new(
@@ -12337,6 +12415,7 @@ mod tests {
             cert_file: cert_path.to_string_lossy().into_owned(),
             key_file: "/unused-key.pem".to_owned(),
             secret_token: "secret".to_owned(),
+            update_buffer_size: openplotva_config::DEFAULT_BOT_WEBHOOK_UPDATE_BUFFER_SIZE,
         };
 
         let setup = super::webhook_setup_from_config(&config)?;
@@ -12361,6 +12440,7 @@ mod tests {
             cert_file: cert_path.to_string_lossy().into_owned(),
             key_file: String::new(),
             secret_token: String::new(),
+            update_buffer_size: openplotva_config::DEFAULT_BOT_WEBHOOK_UPDATE_BUFFER_SIZE,
         };
 
         let setup = super::webhook_setup_from_config(&config)?;

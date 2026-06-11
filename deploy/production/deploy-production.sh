@@ -6,6 +6,7 @@ compose_file="${deploy_root}/compose.production.yml"
 env_file="${deploy_root}/.env.production"
 project="${OPENPLOTVA_COMPOSE_PROJECT:-openplotva}"
 image="${OPENPLOTVA_DEPLOY_IMAGE:?OPENPLOTVA_DEPLOY_IMAGE is required}"
+dragonfly_image="${DRAGONFLY_IMAGE:-docker.dragonflydb.io/dragonflydb/dragonfly:v1.38.1}"
 alpine_image="${OPENPLOTVA_DEPLOY_ALPINE_IMAGE:-alpine:3.20}"
 
 log() {
@@ -20,7 +21,7 @@ fail() {
 compose() {
   local db_password
   db_password="$(effective_db_postgres_password)"
-  OPENPLOTVA_IMAGE="$image" DB_POSTGRES_PASSWORD="$db_password" docker compose --env-file "$env_file" -p "$project" -f "$compose_file" "$@"
+  OPENPLOTVA_IMAGE="$image" DRAGONFLY_IMAGE="$dragonfly_image" DB_POSTGRES_PASSWORD="$db_password" docker compose --env-file "$env_file" -p "$project" -f "$compose_file" "$@"
 }
 
 env_file_has_key() {
@@ -80,6 +81,7 @@ docker_login_and_pull() {
   [[ -n "${GHCR_USERNAME:-}" ]] || fail "GHCR_USERNAME is required"
   printf '%s' "$GHCR_PULL_TOKEN" | docker login ghcr.io -u "$GHCR_USERNAME" --password-stdin >/dev/null
   docker pull "$image"
+  compose pull dragonfly
 }
 
 compose_config() {
@@ -196,6 +198,50 @@ ensure_service() {
   compose up -d --no-deps --no-recreate "$service"
 }
 
+container_config_image() {
+  docker inspect -f '{{.Config.Image}}' "$1" 2>/dev/null || true
+}
+
+save_dragonfly_if_running() {
+  local container
+  container="$(compose ps -q dragonfly)"
+  if [[ -n "$container" ]] && container_running "$container"; then
+    log "saving Dragonfly before image change"
+    docker exec "$container" redis-cli SAVE >/dev/null
+  fi
+}
+
+log_dragonfly_info() {
+  local container
+  local info
+  container="$(compose ps -q dragonfly)"
+  [[ -n "$container" ]] || return 0
+  info="$(docker exec "$container" redis-cli INFO server 2>/dev/null | tr -d '\r' | grep -E '^(dragonfly_version|redis_version):' || true)"
+  [[ -n "$info" ]] || return 0
+  while IFS= read -r line; do
+    log "dragonfly ${line}"
+  done <<<"$info"
+}
+
+ensure_dragonfly() {
+  local container="${project}-dragonfly-1"
+  local running_image
+  if container_exists "$container"; then
+    running_image="$(container_config_image "$container")"
+    if [[ "$running_image" != "$dragonfly_image" ]]; then
+      log "recreating dragonfly for image ${dragonfly_image} (was ${running_image:-unknown})"
+      save_dragonfly_if_running
+      compose up -d --no-deps --force-recreate dragonfly
+    else
+      ensure_service dragonfly
+    fi
+  else
+    ensure_service dragonfly
+  fi
+  wait_for_service_health dragonfly
+  log_dragonfly_info
+}
+
 wait_for_service_health() {
   local service="$1"
   local container
@@ -266,8 +312,7 @@ start_dependencies() {
     import_postgres_dump
   fi
 
-  ensure_service dragonfly
-  wait_for_service_health dragonfly
+  ensure_dragonfly
   ensure_service embedder
   wait_for_service_health embedder
   ensure_service token-estimator

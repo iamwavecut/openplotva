@@ -59,6 +59,8 @@ pub const DEFAULT_REDIS_PORT: u16 = 6379;
 
 pub const DEFAULT_REDIS_DB: i64 = 0;
 
+pub const DEFAULT_UPDATE_QUEUE_BACKEND: &str = "list";
+
 pub const DEFAULT_CONNECT_SERVICES: bool = true;
 
 pub const DEFAULT_RUN_MIGRATIONS: bool = false;
@@ -71,6 +73,8 @@ pub const DEFAULT_PRODUCE_UPDATES: bool = true;
 pub const DEFAULT_BOT_DEBUG: bool = false;
 
 pub const DEFAULT_BOT_WEBHOOK_ENABLED: bool = false;
+
+pub const DEFAULT_BOT_WEBHOOK_UPDATE_BUFFER_SIZE: usize = 10_000;
 
 pub const DEFAULT_ADMINS_ADMIN_IDS: &str = "";
 
@@ -250,6 +254,8 @@ pub struct AppConfig {
     pub database: DatabaseConfig,
     /// Redis/Dragonfly configuration.
     pub redis: RedisConfig,
+    /// Telegram update queue backend configuration.
+    pub update_queue: UpdateQueueConfig,
     /// Telegram bot configuration.
     pub bot: BotConfig,
     /// Telegram administrator configuration.
@@ -334,6 +340,12 @@ pub struct DatabaseConfig {
     pub postgres: PostgresConfig,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct UpdateQueueConfig {
+    /// Telegram update queue backend, from `UPDATE_QUEUE_BACKEND`.
+    pub backend: String,
+}
+
 /// Postgres configuration.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PostgresConfig {
@@ -401,6 +413,8 @@ pub struct BotWebhookConfig {
     pub key_file: String,
     /// Secret-token header value, from `BOT_WEBHOOK_SECRET_TOKEN`.
     pub secret_token: String,
+    /// In-memory webhook update channel capacity, from `BOT_WEBHOOK_UPDATE_BUFFER_SIZE`.
+    pub update_buffer_size: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -759,6 +773,8 @@ pub struct RawConfig {
     pub redis_password: Option<String>,
     /// `REDIS_DB`.
     pub redis_db: Option<String>,
+    /// `UPDATE_QUEUE_BACKEND`.
+    pub update_queue_backend: Option<String>,
     /// `BOT_KEY`.
     pub bot_key: Option<String>,
     /// `BOT_API_BASE_URL`.
@@ -773,6 +789,8 @@ pub struct RawConfig {
     pub bot_webhook_key_file: Option<String>,
     /// `BOT_WEBHOOK_SECRET_TOKEN`.
     pub bot_webhook_secret_token: Option<String>,
+    /// `BOT_WEBHOOK_UPDATE_BUFFER_SIZE`.
+    pub bot_webhook_update_buffer_size: Option<String>,
     /// `BOT_DEBUG`.
     pub bot_debug: Option<String>,
     /// `ADMINS_ADMIN_IDS`.
@@ -1176,6 +1194,8 @@ pub enum ConfigError {
         "PERSISTENT_QUEUE_DIALOG_AIFARM_FALLBACK_LOW_WATERMARK cannot exceed PERSISTENT_QUEUE_DIALOG_AIFARM_FALLBACK_HIGH_WATERMARK"
     )]
     PersistentQueueFallbackWatermarkRange,
+    #[error("invalid UPDATE_QUEUE_BACKEND value {value:?}: expected list or stream")]
+    InvalidUpdateQueueBackend { value: String },
 }
 
 impl AppConfig {
@@ -1484,6 +1504,9 @@ impl AppConfig {
                 password: raw.redis_password.unwrap_or_default(),
                 db: parse_i64("REDIS_DB", raw.redis_db, DEFAULT_REDIS_DB)?,
             },
+            update_queue: UpdateQueueConfig {
+                backend: parse_update_queue_backend(raw.update_queue_backend)?,
+            },
             bot: BotConfig {
                 key: raw.bot_key.filter(|value| !value.is_empty()),
                 api_base_url: raw.bot_api_base_url.unwrap_or_default(),
@@ -1497,6 +1520,11 @@ impl AppConfig {
                     cert_file: raw.bot_webhook_cert_file.unwrap_or_default(),
                     key_file: raw.bot_webhook_key_file.unwrap_or_default(),
                     secret_token: raw.bot_webhook_secret_token.unwrap_or_default(),
+                    update_buffer_size: parse_usize(
+                        "BOT_WEBHOOK_UPDATE_BUFFER_SIZE",
+                        raw.bot_webhook_update_buffer_size,
+                        DEFAULT_BOT_WEBHOOK_UPDATE_BUFFER_SIZE,
+                    )?,
                 },
                 debug: parse_bool("BOT_DEBUG", raw.bot_debug, DEFAULT_BOT_DEBUG)?,
             },
@@ -2059,6 +2087,7 @@ impl RawConfig {
             redis_port: env("REDIS_PORT"),
             redis_password: env("REDIS_PASSWORD"),
             redis_db: env("REDIS_DB"),
+            update_queue_backend: env("UPDATE_QUEUE_BACKEND"),
             bot_key: env("BOT_KEY"),
             bot_api_base_url: env("BOT_API_BASE_URL"),
             bot_webhook_enabled: env("BOT_WEBHOOK_ENABLED"),
@@ -2066,6 +2095,7 @@ impl RawConfig {
             bot_webhook_cert_file: env("BOT_WEBHOOK_CERT_FILE"),
             bot_webhook_key_file: env("BOT_WEBHOOK_KEY_FILE"),
             bot_webhook_secret_token: env("BOT_WEBHOOK_SECRET_TOKEN"),
+            bot_webhook_update_buffer_size: env("BOT_WEBHOOK_UPDATE_BUFFER_SIZE"),
             bot_debug: env("BOT_DEBUG"),
             admins_admin_ids: env("ADMINS_ADMIN_IDS"),
             vip_chat_id: env("VIP_CHAT_ID"),
@@ -2289,6 +2319,28 @@ fn parse_u16(name: &'static str, value: Option<String>, default: u16) -> Result<
     })
 }
 
+fn parse_usize(
+    name: &'static str,
+    value: Option<String>,
+    default: usize,
+) -> Result<usize, ConfigError> {
+    let Some(value) = parse_scalar_value(value) else {
+        return Ok(default);
+    };
+    let parsed = value
+        .parse::<i64>()
+        .map_err(|source| ConfigError::InvalidInteger {
+            name,
+            value: value.clone(),
+            source,
+        })?;
+    usize::try_from(parsed).map_err(|source| ConfigError::IntegerOutOfRange {
+        name,
+        value: parsed,
+        source,
+    })
+}
+
 fn parse_i64(name: &'static str, value: Option<String>, default: i64) -> Result<i64, ConfigError> {
     let Some(value) = parse_scalar_value(value) else {
         return Ok(default);
@@ -2345,6 +2397,16 @@ fn parse_bool(
         "1" | "t" | "true" => Ok(true),
         "0" | "f" | "false" => Ok(false),
         _ => Err(ConfigError::InvalidBoolean { name, value }),
+    }
+}
+
+fn parse_update_queue_backend(value: Option<String>) -> Result<String, ConfigError> {
+    let backend = parse_scalar_value(value)
+        .unwrap_or_else(|| DEFAULT_UPDATE_QUEUE_BACKEND.to_owned())
+        .to_ascii_lowercase();
+    match backend.as_str() {
+        "list" | "stream" => Ok(backend),
+        _ => Err(ConfigError::InvalidUpdateQueueBackend { value: backend }),
     }
 }
 
@@ -2542,9 +2604,9 @@ mod tests {
         AppConfig, DEFAULT_ACESTEP_API_MODE, DEFAULT_ACESTEP_AUDIO_FORMAT,
         DEFAULT_ACESTEP_BASE_URL, DEFAULT_ACESTEP_MODEL, DEFAULT_ACESTEP_POLL_INTERVAL_SECONDS,
         DEFAULT_ACESTEP_REQUEST_TIMEOUT_SECONDS, DEFAULT_ACESTEP_TASK_TIMEOUT_SECONDS,
-        DEFAULT_DIALOG_AIFARM_POOL_BASE_URLS, DEFAULT_DIALOG_AIFARM_POOL_MODELS,
-        DEFAULT_DIALOG_AIFARM_POOL_REASONING_MAX_TOKENS, DEFAULT_DIALOG_MODEL,
-        DEFAULT_DISCOVERY_BASE_URL, DEFAULT_HISTORY_SUMMARY_PROVIDER,
+        DEFAULT_BOT_WEBHOOK_UPDATE_BUFFER_SIZE, DEFAULT_DIALOG_AIFARM_POOL_BASE_URLS,
+        DEFAULT_DIALOG_AIFARM_POOL_MODELS, DEFAULT_DIALOG_AIFARM_POOL_REASONING_MAX_TOKENS,
+        DEFAULT_DIALOG_MODEL, DEFAULT_DISCOVERY_BASE_URL, DEFAULT_HISTORY_SUMMARY_PROVIDER,
         DEFAULT_HISTORY_SUMMARY_TIMEOUT_SECONDS, DEFAULT_LLM_JOB_MAX_ATTEMPTS, DEFAULT_LOG_FILTER,
         DEFAULT_MEMORY_CONSOLIDATION_MODEL, DEFAULT_OPENROUTER_REQUEST_TIMEOUT_SECONDS,
         DEFAULT_PERSISTENT_QUEUE_CLEANUP_INTERVAL_SECONDS,
@@ -2574,9 +2636,10 @@ mod tests {
         DEFAULT_SERPER_TIMEOUT_SECONDS, DEFAULT_SHIELD_EMBEDDING_DIM,
         DEFAULT_SHIELD_LEXICAL_MIN_SCORE, DEFAULT_SHIELD_MAX_MATCHES,
         DEFAULT_SHIELD_QUERY_MAX_CHARS, DEFAULT_SHIELD_RETRIEVAL_TIMEOUT_SECONDS,
-        DEFAULT_SHIELD_VECTOR_MIN_SCORE, DEFAULT_VIP_CHAT_ID, DEFAULT_VISION_DIRECT_IMAGE_LIMIT,
-        DEFAULT_VISION_MAX_TOKENS, DEFAULT_VISION_MODEL, DEFAULT_VISION_REQUEST_TIMEOUT_SECONDS,
-        DEFAULT_WEBAPP_PORT, DEFAULT_WEBAPP_URL, RawConfig, parse_string_list_or_default,
+        DEFAULT_SHIELD_VECTOR_MIN_SCORE, DEFAULT_UPDATE_QUEUE_BACKEND, DEFAULT_VIP_CHAT_ID,
+        DEFAULT_VISION_DIRECT_IMAGE_LIMIT, DEFAULT_VISION_MAX_TOKENS, DEFAULT_VISION_MODEL,
+        DEFAULT_VISION_REQUEST_TIMEOUT_SECONDS, DEFAULT_WEBAPP_PORT, DEFAULT_WEBAPP_URL, RawConfig,
+        parse_string_list_or_default,
     };
 
     #[test]
@@ -2618,6 +2681,7 @@ mod tests {
         assert_eq!(config.redis.port, 6379);
         assert_eq!(config.redis.password, "");
         assert_eq!(config.redis.db, 0);
+        assert_eq!(config.update_queue.backend, DEFAULT_UPDATE_QUEUE_BACKEND);
         assert_eq!(config.translation.deepl.key, "");
         assert_eq!(config.translation.deepl.url, "");
         assert_eq!(config.bot.key, None);
@@ -2628,6 +2692,10 @@ mod tests {
         assert_eq!(config.bot.webhook.cert_file, "");
         assert_eq!(config.bot.webhook.key_file, "");
         assert_eq!(config.bot.webhook.secret_token, "");
+        assert_eq!(
+            config.bot.webhook.update_buffer_size,
+            DEFAULT_BOT_WEBHOOK_UPDATE_BUFFER_SIZE
+        );
         assert!(config.admins.admin_ids.is_empty());
         assert!(config.persistent_queue.enabled);
         assert_eq!(
@@ -3577,6 +3645,26 @@ mod tests {
     }
 
     #[test]
+    fn update_queue_backend_is_explicitly_gated() -> Result<(), super::ConfigError> {
+        let stream_config = AppConfig::from_raw(RawConfig {
+            update_queue_backend: Some("STREAM".to_owned()),
+            ..RawConfig::default()
+        })?;
+        assert_eq!(stream_config.update_queue.backend, "stream");
+
+        let error = AppConfig::from_raw(RawConfig {
+            update_queue_backend: Some("sorted-set".to_owned()),
+            ..RawConfig::default()
+        })
+        .err();
+        assert!(matches!(
+            error,
+            Some(super::ConfigError::InvalidUpdateQueueBackend { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn blank_scalar_values_fall_back_to_defaults() -> Result<(), super::ConfigError> {
         let config = AppConfig::from_raw(RawConfig {
             webapp_port: Some(String::new()),
@@ -3695,6 +3783,7 @@ mod tests {
             bot_webhook_cert_file: Some("/cert.pem".to_owned()),
             bot_webhook_key_file: Some("/key.pem".to_owned()),
             bot_webhook_secret_token: Some("webhook-secret".to_owned()),
+            bot_webhook_update_buffer_size: Some("256".to_owned()),
             admins_admin_ids: Some(" 1001, 42 ".to_owned()),
             ..RawConfig::default()
         })?;
@@ -3710,6 +3799,7 @@ mod tests {
         assert_eq!(config.bot.webhook.cert_file, "/cert.pem");
         assert_eq!(config.bot.webhook.key_file, "/key.pem");
         assert_eq!(config.bot.webhook.secret_token, "webhook-secret");
+        assert_eq!(config.bot.webhook.update_buffer_size, 256);
         assert_eq!(config.admins.admin_ids, vec![1_001, 42]);
 
         Ok(())

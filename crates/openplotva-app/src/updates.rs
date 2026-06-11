@@ -1,6 +1,7 @@
 //! App-level Telegram update consumer glue.
 
 use std::{
+    collections::HashMap,
     fmt,
     future::Future,
     pin::Pin,
@@ -8,7 +9,10 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use carapax::types::{Update as TelegramUpdate, UpdateType as TelegramUpdateType};
+use carapax::types::{
+    ChatMember as TelegramChatMember, ChatMemberUpdated as TelegramChatMemberUpdated,
+    Update as TelegramUpdate, UpdateType as TelegramUpdateType,
+};
 use openplotva_core::{ChatMessageMeta, ChatState, UserState};
 use openplotva_storage::TelegramFileMetadataUpsert;
 use openplotva_updates::{
@@ -24,6 +28,8 @@ use tokio::{sync::Semaphore, task::JoinSet};
 /// Boxed future returned by update sources.
 pub type UpdateSourceFuture<'a, E> =
     Pin<Box<dyn Future<Output = Result<Option<TelegramUpdate>, E>> + Send + 'a>>;
+pub type UpdateSourceBatchFuture<'a, E> =
+    Pin<Box<dyn Future<Output = Result<Vec<TelegramUpdate>, E>> + Send + 'a>>;
 
 /// Boxed future returned by update handlers.
 pub type UpdateHandlerFuture<'a, E> = Pin<Box<dyn Future<Output = Result<(), E>> + Send + 'a>>;
@@ -43,6 +49,8 @@ pub type InboundHistoryStoreFuture<'a, E> =
 pub type EditedHistoryStoreFuture<'a, E> =
     Pin<Box<dyn Future<Output = Result<bool, E>> + Send + 'a>>;
 
+const UPDATE_CONSUMER_DEQUEUE_BATCH_MAX: usize = 256;
+
 /// Source of decoded Telegram updates for the app-level consumer loop.
 pub trait UpdateSource {
     /// Error returned by the concrete update source.
@@ -50,6 +58,24 @@ pub trait UpdateSource {
 
     /// Dequeue one decoded update, returning `None` for a timeout or empty poll.
     fn dequeue_update<'a>(&'a self, timeout: Duration) -> UpdateSourceFuture<'a, Self::Error>;
+
+    fn dequeue_updates<'a>(
+        &'a self,
+        timeout: Duration,
+        max_count: usize,
+    ) -> UpdateSourceBatchFuture<'a, Self::Error>
+    where
+        Self: Sync,
+    {
+        Box::pin(async move {
+            let Some(update) = self.dequeue_update(timeout).await? else {
+                return Ok(Vec::new());
+            };
+            let mut updates = Vec::with_capacity(max_count.max(1).min(1));
+            updates.push(update);
+            Ok(updates)
+        })
+    }
 }
 
 impl UpdateSource for openplotva_updates::RedisUpdateQueue {
@@ -58,6 +84,16 @@ impl UpdateSource for openplotva_updates::RedisUpdateQueue {
     fn dequeue_update<'a>(&'a self, timeout: Duration) -> UpdateSourceFuture<'a, Self::Error> {
         Box::pin(openplotva_updates::RedisUpdateQueue::dequeue_update(
             self, timeout,
+        ))
+    }
+
+    fn dequeue_updates<'a>(
+        &'a self,
+        timeout: Duration,
+        max_count: usize,
+    ) -> UpdateSourceBatchFuture<'a, Self::Error> {
+        Box::pin(openplotva_updates::RedisUpdateQueue::dequeue_updates(
+            self, timeout, max_count,
         ))
     }
 }
@@ -775,6 +811,8 @@ pub struct UpdateConsumerRunReport {
     pub timeouts: usize,
     /// Handler stages skipped because the update was stale.
     pub skipped_handles: usize,
+    /// Buffered human chat-member updates dropped by net-effect coalescing.
+    pub coalesced_member_updates: usize,
     /// Worker task join failures.
     pub join_errors: Vec<String>,
 }
@@ -826,42 +864,46 @@ where
     let mut report = UpdateConsumerRunReport::default();
     tokio::pin!(stop);
 
-    loop {
+    'outer: loop {
         tokio::select! {
             _ = &mut stop => break,
-            dequeued = source.dequeue_update(config.dequeue_timeout) => {
+            dequeued = source.dequeue_updates(config.dequeue_timeout, UPDATE_CONSUMER_DEQUEUE_BATCH_MAX) => {
                 match dequeued {
-                    Ok(Some(update)) => {
-                        report.dequeued += 1;
-                        let now = SystemTime::now();
-                        let permit_count = stage_permits_for_update(&update, config, now, worker_limit);
-                        let permits = tokio::select! {
-                            _ = &mut stop => break,
-                            acquired = semaphore.clone().acquire_many_owned(permit_count) => {
-                                match acquired {
-                                    Ok(permits) => permits,
-                                    Err(_) => break,
+                    Ok(updates) if updates.is_empty() => report.empty_polls += 1,
+                    Ok(updates) => {
+                        report.dequeued += updates.len();
+                        let updates = coalesce_buffered_member_updates(updates, &mut report);
+                        for update in updates {
+                            let now = SystemTime::now();
+                            let permit_count =
+                                stage_permits_for_update(&update, config, now, worker_limit);
+                            let permits = tokio::select! {
+                                _ = &mut stop => break 'outer,
+                                acquired = semaphore.clone().acquire_many_owned(permit_count) => {
+                                    match acquired {
+                                        Ok(permits) => permits,
+                                        Err(_) => break 'outer,
+                                    }
                                 }
-                            }
-                        };
+                            };
 
-                        let store = Arc::clone(&store);
-                        let handler = Arc::clone(&handler);
-                        let tracker = Arc::clone(&tracker);
-                        workers.spawn(async move {
-                            let _permits = permits;
-                            process_update_with_state_store_tracked_at(
-                                update,
-                                config,
-                                now,
-                                store.as_ref(),
-                                |update| handler.handle_update(update),
-                                tracker.as_ref(),
-                            )
-                            .await
-                        });
+                            let store = Arc::clone(&store);
+                            let handler = Arc::clone(&handler);
+                            let tracker = Arc::clone(&tracker);
+                            workers.spawn(async move {
+                                let _permits = permits;
+                                process_update_with_state_store_tracked_at(
+                                    update,
+                                    config,
+                                    now,
+                                    store.as_ref(),
+                                    |update| handler.handle_update(update),
+                                    tracker.as_ref(),
+                                )
+                                .await
+                            });
+                        }
                     }
-                    Ok(None) => report.empty_polls += 1,
                     Err(error) => {
                         let error = error.to_string();
                         tracing::warn!(%error, "failed to dequeue Telegram update");
@@ -880,6 +922,158 @@ where
     }
 
     report
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct MemberCoalesceKey {
+    chat_id: i64,
+    user_id: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MemberPresence {
+    Active,
+    Inactive,
+}
+
+struct MemberCoalesceEntry {
+    key: MemberCoalesceKey,
+    old_presence: MemberPresence,
+    new_presence: MemberPresence,
+    update: TelegramUpdate,
+}
+
+struct MemberCoalesceSummary {
+    first_old_presence: MemberPresence,
+    final_new_presence: MemberPresence,
+    count: usize,
+    last_index: usize,
+    last_update: TelegramUpdate,
+}
+
+fn coalesce_buffered_member_updates(
+    updates: Vec<TelegramUpdate>,
+    report: &mut UpdateConsumerRunReport,
+) -> Vec<TelegramUpdate> {
+    let mut out = Vec::with_capacity(updates.len());
+    let mut run = Vec::new();
+
+    for update in updates {
+        if let Some(transition) = coalescible_member_transition_from_update(&update) {
+            run.push(MemberCoalesceEntry {
+                key: transition.key,
+                old_presence: transition.old_presence,
+                new_presence: transition.new_presence,
+                update,
+            });
+        } else {
+            flush_member_coalesce_run(&mut run, &mut out, report);
+            out.push(update);
+        }
+    }
+    flush_member_coalesce_run(&mut run, &mut out, report);
+    out
+}
+
+fn flush_member_coalesce_run(
+    run: &mut Vec<MemberCoalesceEntry>,
+    out: &mut Vec<TelegramUpdate>,
+    report: &mut UpdateConsumerRunReport,
+) {
+    if run.is_empty() {
+        return;
+    }
+
+    let mut order = Vec::new();
+    let mut summaries: HashMap<MemberCoalesceKey, MemberCoalesceSummary> = HashMap::new();
+    for (index, entry) in run.drain(..).enumerate() {
+        match summaries.get_mut(&entry.key) {
+            Some(summary) => {
+                summary.final_new_presence = entry.new_presence;
+                summary.count += 1;
+                summary.last_index = index;
+                summary.last_update = entry.update;
+            }
+            None => {
+                order.push(entry.key);
+                summaries.insert(
+                    entry.key,
+                    MemberCoalesceSummary {
+                        first_old_presence: entry.old_presence,
+                        final_new_presence: entry.new_presence,
+                        count: 1,
+                        last_index: index,
+                        last_update: entry.update,
+                    },
+                );
+            }
+        }
+    }
+
+    order.sort_by_key(|key| {
+        summaries
+            .get(key)
+            .map_or(usize::MAX, |summary| summary.last_index)
+    });
+    for key in order {
+        let Some(summary) = summaries.remove(&key) else {
+            continue;
+        };
+        if summary.first_old_presence == summary.final_new_presence {
+            report.coalesced_member_updates += summary.count;
+        } else {
+            report.coalesced_member_updates += summary.count.saturating_sub(1);
+            out.push(summary.last_update);
+        }
+    }
+}
+
+fn coalescible_member_transition_from_update(
+    update: &TelegramUpdate,
+) -> Option<MemberCoalesceTransition> {
+    let TelegramUpdateType::UserStatus(member_update) = &update.update_type else {
+        return None;
+    };
+    coalescible_member_transition(member_update.as_ref())
+}
+
+struct MemberCoalesceTransition {
+    key: MemberCoalesceKey,
+    old_presence: MemberPresence,
+    new_presence: MemberPresence,
+}
+
+fn coalescible_member_transition(
+    update: &TelegramChatMemberUpdated,
+) -> Option<MemberCoalesceTransition> {
+    let old_user = update.old_chat_member.get_user();
+    let new_user = update.new_chat_member.get_user();
+    let user_id = i64::from(new_user.id);
+    if user_id == 0 || i64::from(old_user.id) != user_id || old_user.is_bot || new_user.is_bot {
+        return None;
+    }
+    let chat_id = update.chat.get_id().into();
+    if chat_id == 0 {
+        return None;
+    }
+
+    Some(MemberCoalesceTransition {
+        key: MemberCoalesceKey { chat_id, user_id },
+        old_presence: coalescible_member_presence(&update.old_chat_member)?,
+        new_presence: coalescible_member_presence(&update.new_chat_member)?,
+    })
+}
+
+fn coalescible_member_presence(member: &TelegramChatMember) -> Option<MemberPresence> {
+    match member {
+        TelegramChatMember::Member { .. } => Some(MemberPresence::Active),
+        TelegramChatMember::Left(_) | TelegramChatMember::Kicked(_) => {
+            Some(MemberPresence::Inactive)
+        }
+        TelegramChatMember::Administrator(_)
+        | TelegramChatMember::Creator(_)
+        | TelegramChatMember::Restricted(_) => None,
+    }
 }
 
 fn stage_permits_for_update(
@@ -964,9 +1158,9 @@ mod tests {
         EditedHistoryStore, EditedHistoryStoreFuture, InboundHistoryStore,
         InboundHistoryStoreFuture, InboundHistoryUpsert, TelegramFileMetadataStoreFuture,
         UpdateHandler, UpdateHandlerFuture, UpdateHandlerWithHistory, UpdateSource,
-        UpdateSourceFuture, UpdateStateStore, UpdateStateStoreFuture, persist_update_state,
-        process_update_with_state_and_history_store_at, process_update_with_state_store_at,
-        run_update_consumer_until,
+        UpdateSourceBatchFuture, UpdateSourceFuture, UpdateStateStore, UpdateStateStoreFuture,
+        persist_update_state, process_update_with_state_and_history_store_at,
+        process_update_with_state_store_at, run_update_consumer_until,
     };
 
     #[tokio::test]
@@ -1379,6 +1573,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_update_consumer_until_coalesces_buffered_join_kick_without_state_or_handler()
+    -> Result<(), Box<dyn Error>> {
+        let source = Arc::new(SourceStub::new(vec![
+            SourceAction::Update(Box::new(sample_chat_member_update(
+                12350, 7, "left", "member",
+            )?)),
+            SourceAction::Update(Box::new(sample_chat_member_update(
+                12351, 7, "member", "kicked",
+            )?)),
+        ]));
+        let store = Arc::new(StoreStub::default());
+        let handler = Arc::new(HandlerStub::default());
+
+        let report = run_update_consumer_until(
+            source,
+            UpdateConsumerConfig {
+                dequeue_timeout: Duration::from_millis(1),
+                state_timeout: Duration::from_secs(1),
+                handle_timeout: Duration::from_secs(1),
+                side_effect_max_age: Duration::from_secs(400_000_000),
+                worker_limit: 2,
+            },
+            Arc::clone(&store),
+            Arc::clone(&handler),
+            async {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            },
+        )
+        .await;
+
+        assert_eq!(report.dequeued, 2);
+        assert_eq!(report.coalesced_member_updates, 2);
+        assert_eq!(report.processed, 0);
+        assert!(store.calls().is_empty());
+        assert!(handler.calls().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn buffered_member_coalescing_preserves_active_to_inactive_delete() -> Result<(), Box<dyn Error>>
+    {
+        let update = sample_chat_member_update(12352, 7, "member", "left")?;
+        let mut report = super::UpdateConsumerRunReport::default();
+
+        let updates = super::coalesce_buffered_member_updates(vec![update], &mut report);
+
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].id, 12352);
+        assert_eq!(report.coalesced_member_updates, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn buffered_member_coalescing_does_not_collapse_admin_or_bot_sensitive_updates()
+    -> Result<(), Box<dyn Error>> {
+        let admin_update = sample_chat_member_update(12353, 7, "member", "administrator")?;
+        let bot_update = sample_bot_chat_member_update(12354, 8, "left", "member")?;
+        let mut report = super::UpdateConsumerRunReport::default();
+
+        let updates =
+            super::coalesce_buffered_member_updates(vec![admin_update, bot_update], &mut report);
+
+        assert_eq!(
+            updates.iter().map(|update| update.id).collect::<Vec<_>>(),
+            vec![12353, 12354]
+        );
+        assert_eq!(report.coalesced_member_updates, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn run_update_consumer_until_can_wrap_handler_with_nonfatal_history()
     -> Result<(), Box<dyn Error>> {
         let source = Arc::new(SourceStub::new(vec![SourceAction::Update(Box::new(
@@ -1652,6 +1917,44 @@ mod tests {
                 }
             })
         }
+
+        fn dequeue_updates<'a>(
+            &'a self,
+            timeout: Duration,
+            max_count: usize,
+        ) -> UpdateSourceBatchFuture<'a, Self::Error> {
+            Box::pin(async move {
+                self.timeouts
+                    .lock()
+                    .map_err(|err| io::Error::other(err.to_string()))?
+                    .push(timeout);
+                let updates = {
+                    let mut updates = Vec::new();
+                    let mut actions = self
+                        .actions
+                        .lock()
+                        .map_err(|err| io::Error::other(err.to_string()))?;
+                    while updates.len() < max_count.max(1) {
+                        match actions.pop_front() {
+                            Some(SourceAction::Update(update)) => updates.push(*update),
+                            Some(SourceAction::Error(message)) if updates.is_empty() => {
+                                return Err(io::Error::other(message));
+                            }
+                            Some(SourceAction::Error(message)) => {
+                                actions.push_front(SourceAction::Error(message));
+                                break;
+                            }
+                            None => break,
+                        }
+                    }
+                    updates
+                };
+                if updates.is_empty() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                Ok(updates)
+            })
+        }
     }
 
     #[derive(Clone, Default)]
@@ -1737,6 +2040,103 @@ mod tests {
                 "text": "/start hello"
             }
         }))
+    }
+
+    fn sample_chat_member_update(
+        update_id: i64,
+        user_id: i64,
+        old_status: &str,
+        new_status: &str,
+    ) -> Result<TelegramUpdate, serde_json::Error> {
+        serde_json::from_value(json!({
+            "update_id": update_id,
+            "chat_member": {
+                "chat": {
+                    "id": -10042,
+                    "type": "supergroup",
+                    "title": "Plotva Lab"
+                },
+                "from": {
+                    "id": 42,
+                    "is_bot": false,
+                    "first_name": "Admin"
+                },
+                "date": 1_710_000_000,
+                "old_chat_member": chat_member_json(user_id, old_status),
+                "new_chat_member": chat_member_json(user_id, new_status)
+            }
+        }))
+    }
+
+    fn sample_bot_chat_member_update(
+        update_id: i64,
+        user_id: i64,
+        old_status: &str,
+        new_status: &str,
+    ) -> Result<TelegramUpdate, serde_json::Error> {
+        serde_json::from_value(json!({
+            "update_id": update_id,
+            "chat_member": {
+                "chat": {
+                    "id": -10042,
+                    "type": "supergroup",
+                    "title": "Plotva Lab"
+                },
+                "from": {
+                    "id": 42,
+                    "is_bot": false,
+                    "first_name": "Admin"
+                },
+                "date": 1_710_000_000,
+                "old_chat_member": chat_member_json_for_user(user_id, old_status, true),
+                "new_chat_member": chat_member_json_for_user(user_id, new_status, true)
+            }
+        }))
+    }
+
+    fn chat_member_json(user_id: i64, status: &str) -> serde_json::Value {
+        chat_member_json_for_user(user_id, status, false)
+    }
+
+    fn chat_member_json_for_user(user_id: i64, status: &str, is_bot: bool) -> serde_json::Value {
+        let user = json!({
+            "id": user_id,
+            "is_bot": is_bot,
+            "first_name": "Tracked"
+        });
+        match status {
+            "kicked" => json!({
+                "status": "kicked",
+                "until_date": 0,
+                "user": user
+            }),
+            "left" => json!({
+                "status": "left",
+                "user": user
+            }),
+            "member" => json!({
+                "status": "member",
+                "user": user
+            }),
+            "administrator" => json!({
+                "status": "administrator",
+                "user": user,
+                "can_be_edited": false,
+                "is_anonymous": false,
+                "can_manage_chat": true,
+                "can_delete_messages": true,
+                "can_manage_video_chats": true,
+                "can_restrict_members": true,
+                "can_promote_members": true,
+                "can_change_info": true,
+                "can_invite_users": true,
+                "can_post_messages": true,
+                "can_edit_messages": true,
+                "can_pin_messages": true,
+                "can_manage_topics": false
+            }),
+            other => panic!("unsupported sample member status {other}"),
+        }
     }
 
     fn sample_poll_update_with_id(update_id: i64) -> Result<TelegramUpdate, serde_json::Error> {

@@ -1,12 +1,12 @@
 //! Telegram update ingestion, classification, and replay.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet, VecDeque},
     fmt,
     future::Future,
     io,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -23,7 +23,7 @@ use openplotva_core::{
 };
 use redis::{
     AsyncConnectionConfig, Client as RedisClient,
-    aio::{ConnectionManager, MultiplexedConnection},
+    aio::{ConnectionManager, ConnectionManagerConfig, MultiplexedConnection},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -322,6 +322,25 @@ struct RedisUpdateConnections {
 /// Margin added to the client-side response timeout of a blocking read so the
 /// server-side `BLPOP` timeout always fires first.
 const BLOCKING_RESPONSE_TIMEOUT_GRACE: Duration = Duration::from_secs(2);
+const COMMAND_RESPONSE_TIMEOUT: Duration = Duration::from_secs(3);
+const REDIS_UPDATE_COMMAND_CLIENT_NAME: &str = "openplotva:updates:commands";
+const REDIS_UPDATE_BLOCKING_CLIENT_NAME: &str = "openplotva:updates:blocking";
+
+fn command_connection_config() -> ConnectionManagerConfig {
+    ConnectionManagerConfig::new().set_response_timeout(Some(COMMAND_RESPONSE_TIMEOUT))
+}
+
+async fn set_redis_client_name(
+    connection: &mut impl redis::aio::ConnectionLike,
+    name: &str,
+) -> redis::RedisResult<()> {
+    let _: String = redis::cmd("CLIENT")
+        .arg("SETNAME")
+        .arg(name)
+        .query_async(connection)
+        .await?;
+    Ok(())
+}
 
 fn blocking_response_timeout(timeout: Duration) -> Option<Duration> {
     (!timeout.is_zero()).then(|| timeout + BLOCKING_RESPONSE_TIMEOUT_GRACE)
@@ -337,7 +356,14 @@ impl RedisUpdateConnections {
 
     async fn command_connection(&self) -> redis::RedisResult<ConnectionManager> {
         self.commands
-            .get_or_try_init(|| async { self.client.get_connection_manager().await })
+            .get_or_try_init(|| async {
+                let mut connection = self
+                    .client
+                    .get_connection_manager_with_config(command_connection_config())
+                    .await?;
+                set_redis_client_name(&mut connection, REDIS_UPDATE_COMMAND_CLIENT_NAME).await?;
+                Ok(connection)
+            })
             .await
             .cloned()
     }
@@ -355,9 +381,12 @@ impl RedisUpdateConnections {
     ) -> redis::RedisResult<MultiplexedConnection> {
         let config =
             AsyncConnectionConfig::new().set_response_timeout(blocking_response_timeout(timeout));
-        self.client
+        let mut connection = self
+            .client
             .get_multiplexed_async_connection_with_config(&config)
-            .await
+            .await?;
+        set_redis_client_name(&mut connection, REDIS_UPDATE_BLOCKING_CLIENT_NAME).await?;
+        Ok(connection)
     }
 
     #[cfg(test)]
@@ -428,6 +457,36 @@ impl RedisUpdateQueue {
         Ok(result.map(|(_, value)| EncodedUpdate::from_queue_value(value)))
     }
 
+    pub async fn dequeue_encoded_batch(
+        &self,
+        timeout: Duration,
+        max_count: usize,
+    ) -> Result<Vec<EncodedUpdate>, UpdateQueueError> {
+        if max_count == 0 {
+            return Ok(Vec::new());
+        }
+        let Some(first) = self.dequeue_encoded(timeout).await? else {
+            return Ok(Vec::new());
+        };
+        let mut updates = Vec::with_capacity(max_count);
+        updates.push(first);
+        let remaining = max_count.saturating_sub(1);
+        if remaining == 0 {
+            return Ok(updates);
+        }
+
+        let mut connection = self.connections.command_connection().await?;
+        let values: Option<Vec<Vec<u8>>> = redis::cmd("LPOP")
+            .arg(&self.key)
+            .arg(remaining)
+            .query_async(&mut connection)
+            .await?;
+        if let Some(values) = values {
+            updates.extend(values.into_iter().map(EncodedUpdate::from_queue_value));
+        }
+        Ok(updates)
+    }
+
     /// Dequeue and decode one typed Telegram update.
     pub async fn dequeue_update(
         &self,
@@ -437,6 +496,18 @@ impl RedisUpdateQueue {
             return Ok(None);
         };
         Ok(Some(update.decode_update()?))
+    }
+
+    pub async fn dequeue_updates(
+        &self,
+        timeout: Duration,
+        max_count: usize,
+    ) -> Result<Vec<TelegramUpdate>, UpdateQueueError> {
+        let updates = self.dequeue_encoded_batch(timeout, max_count).await?;
+        updates
+            .into_iter()
+            .map(|update| update.decode_update().map_err(UpdateQueueError::from))
+            .collect()
     }
 
     /// Dequeue and process one update using the Rust-native consumer primitive.
@@ -524,6 +595,7 @@ pub struct UpdateProducerRunReport {
     pub received: usize,
     pub enqueued: usize,
     pub skipped: usize,
+    pub dropped_by_ingress_guard: usize,
     pub enqueue_errors: Vec<String>,
     /// Whether the source closed before shutdown was requested.
     pub source_closed: bool,
@@ -540,6 +612,35 @@ pub struct TelegramMessageAttachmentOptions {
 pub async fn run_update_producer_until<S, Q, Stop>(
     source: &S,
     queue: &Q,
+    stop: Stop,
+) -> UpdateProducerRunReport
+where
+    S: UpdateProducerSource + Sync,
+    Q: UpdateProducerQueue + Sync,
+    Stop: Future<Output = ()>,
+{
+    run_update_producer_with_optional_ingress_guard_until(source, queue, None, stop).await
+}
+
+pub async fn run_update_producer_with_ingress_guard_until<S, Q, Stop>(
+    source: &S,
+    queue: &Q,
+    ingress_guard: &UpdateIngressGuard,
+    stop: Stop,
+) -> UpdateProducerRunReport
+where
+    S: UpdateProducerSource + Sync,
+    Q: UpdateProducerQueue + Sync,
+    Stop: Future<Output = ()>,
+{
+    run_update_producer_with_optional_ingress_guard_until(source, queue, Some(ingress_guard), stop)
+        .await
+}
+
+async fn run_update_producer_with_optional_ingress_guard_until<S, Q, Stop>(
+    source: &S,
+    queue: &Q,
+    ingress_guard: Option<&UpdateIngressGuard>,
     stop: Stop,
 ) -> UpdateProducerRunReport
 where
@@ -565,6 +666,19 @@ where
                 if !is_allowed_producer_update(&update) {
                     report.skipped += 1;
                     continue;
+                }
+                if let Some(ingress_guard) = ingress_guard {
+                    let decision = ingress_guard.check_update(&update);
+                    if decision.is_dropped() {
+                        report.dropped_by_ingress_guard += 1;
+                        tracing::warn!(
+                            chat_id = decision.chat_id(),
+                            update_id = update.id,
+                            update_name = producer_update_name(&update),
+                            "dropped Telegram update by ingress flood guard"
+                        );
+                        continue;
+                    }
                 }
 
                 let queued = queue.enqueue_update(&update);
@@ -864,6 +978,161 @@ pub fn producer_update_name(update: &TelegramUpdate) -> &'static str {
 #[must_use]
 pub fn is_allowed_producer_update(update: &TelegramUpdate) -> bool {
     producer_update_type(update).is_allowed()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UpdateIngressGuardConfig {
+    pub short_window: Duration,
+    pub short_limit: usize,
+    pub long_window: Duration,
+    pub long_limit: usize,
+    pub block_duration: Duration,
+}
+
+impl Default for UpdateIngressGuardConfig {
+    fn default() -> Self {
+        Self {
+            short_window: Duration::from_secs(10),
+            short_limit: 200,
+            long_window: Duration::from_secs(60),
+            long_limit: 600,
+            block_duration: Duration::from_secs(5 * 60),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UpdateIngressDecision {
+    Allowed {
+        chat_id: Option<i64>,
+    },
+    DroppedBlocked {
+        chat_id: i64,
+        blocked_until: SystemTime,
+    },
+    DroppedFlood {
+        chat_id: i64,
+        blocked_until: SystemTime,
+    },
+}
+
+impl UpdateIngressDecision {
+    #[must_use]
+    pub const fn is_allowed(self) -> bool {
+        matches!(self, Self::Allowed { .. })
+    }
+
+    #[must_use]
+    pub const fn is_dropped(self) -> bool {
+        !self.is_allowed()
+    }
+
+    #[must_use]
+    pub const fn chat_id(self) -> Option<i64> {
+        match self {
+            Self::Allowed { chat_id } => chat_id,
+            Self::DroppedBlocked { chat_id, .. } | Self::DroppedFlood { chat_id, .. } => {
+                Some(chat_id)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct UpdateIngressGuard {
+    config: UpdateIngressGuardConfig,
+    chats: Mutex<HashMap<i64, ChatIngressState>>,
+}
+
+#[derive(Debug, Default)]
+struct ChatIngressState {
+    samples: VecDeque<SystemTime>,
+    blocked_until: Option<SystemTime>,
+}
+
+impl UpdateIngressGuard {
+    #[must_use]
+    pub fn new(config: UpdateIngressGuardConfig) -> Self {
+        Self {
+            config,
+            chats: Mutex::new(HashMap::new()),
+        }
+    }
+
+    #[must_use]
+    pub fn with_defaults() -> Self {
+        Self::new(UpdateIngressGuardConfig::default())
+    }
+
+    #[must_use]
+    pub fn check_update(&self, update: &TelegramUpdate) -> UpdateIngressDecision {
+        self.check_update_at(update, SystemTime::now())
+    }
+
+    #[must_use]
+    pub fn check_update_at(
+        &self,
+        update: &TelegramUpdate,
+        now: SystemTime,
+    ) -> UpdateIngressDecision {
+        let Some(chat_id) = update_chat_id(update).filter(|chat_id| *chat_id != 0) else {
+            return UpdateIngressDecision::Allowed { chat_id: None };
+        };
+        let Ok(mut chats) = self.chats.lock() else {
+            return UpdateIngressDecision::Allowed {
+                chat_id: Some(chat_id),
+            };
+        };
+        let state = chats.entry(chat_id).or_default();
+        if let Some(blocked_until) = state.blocked_until {
+            if now < blocked_until {
+                return UpdateIngressDecision::DroppedBlocked {
+                    chat_id,
+                    blocked_until,
+                };
+            }
+            state.blocked_until = None;
+        }
+
+        retain_recent_samples(&mut state.samples, now, self.config.long_window);
+        let short_count = recent_sample_count(&state.samples, now, self.config.short_window) + 1;
+        let long_count = state.samples.len() + 1;
+        if short_count >= self.config.short_limit || long_count >= self.config.long_limit {
+            let blocked_until = now + self.config.block_duration;
+            state.blocked_until = Some(blocked_until);
+            state.samples.clear();
+            return UpdateIngressDecision::DroppedFlood {
+                chat_id,
+                blocked_until,
+            };
+        }
+
+        state.samples.push_back(now);
+        UpdateIngressDecision::Allowed {
+            chat_id: Some(chat_id),
+        }
+    }
+}
+
+#[must_use]
+pub fn update_chat_id(update: &TelegramUpdate) -> Option<i64> {
+    extract_update_chat(update).map(|chat| chat.get_id().into())
+}
+
+fn retain_recent_samples(samples: &mut VecDeque<SystemTime>, now: SystemTime, window: Duration) {
+    while samples
+        .front()
+        .is_some_and(|sample| now.duration_since(*sample).is_ok_and(|age| age >= window))
+    {
+        samples.pop_front();
+    }
+}
+
+fn recent_sample_count(samples: &VecDeque<SystemTime>, now: SystemTime, window: Duration) -> usize {
+    samples
+        .iter()
+        .filter(|sample| now.duration_since(**sample).is_ok_and(|age| age < window))
+        .count()
 }
 
 pub fn extract_update_state(update: &TelegramUpdate) -> Option<UpdateState> {
@@ -3063,15 +3332,15 @@ mod tests {
         UpdateProducerQueue, UpdateProducerQueueFuture, UpdateProducerSource,
         UpdateProducerSourceFuture, UpdateStage, UpdateStageOutcome, UpdateStageReport,
         UpdateStageTracker, blocking_response_timeout, blpop_timeout_arg, build_guest_dialog_text,
-        build_guest_shield_query_text, compose_image_prompt, edited_image_prompt_update,
-        extract_update_state, fetcher_message_text, format_guest_chain_for_prompt,
-        guest_current_request_text, guest_has_other_bot_mention, guest_message_reject_reason,
-        guest_request_has_visible_text, guest_visible_text, is_allowed_producer_update,
-        is_guest_unsupported_feature_request, is_settings_command_message,
-        looks_like_guest_history_summary_request, normalize_guest_command_word, parse_edit_command,
-        parse_if_addressed, process_update_at, process_update_with_stage_tracker_at,
-        producer_update_name, producer_update_type, react_message_words,
-        resolve_draw_prompt_from_message, run_update_producer_until,
+        build_guest_shield_query_text, command_connection_config, compose_image_prompt,
+        edited_image_prompt_update, extract_update_state, fetcher_message_text,
+        format_guest_chain_for_prompt, guest_current_request_text, guest_has_other_bot_mention,
+        guest_message_reject_reason, guest_request_has_visible_text, guest_visible_text,
+        is_allowed_producer_update, is_guest_unsupported_feature_request,
+        is_settings_command_message, looks_like_guest_history_summary_request,
+        normalize_guest_command_word, parse_edit_command, parse_if_addressed, process_update_at,
+        process_update_with_stage_tracker_at, producer_update_name, producer_update_type,
+        react_message_words, resolve_draw_prompt_from_message, run_update_producer_until,
         should_handle_addressed_message, should_handle_random_response, strip_guest_address_prefix,
         telegram_message_attachments, update_name,
     };
@@ -3106,6 +3375,59 @@ mod tests {
             blocking_response_timeout(Duration::from_secs(5)),
             Some(Duration::from_secs(7))
         );
+    }
+
+    #[test]
+    fn command_connection_timeout_outlives_redis_default_response_timeout() {
+        let config = command_connection_config();
+
+        assert_eq!(config.response_timeout(), Some(Duration::from_secs(3)));
+        assert!(config.response_timeout() > Some(Duration::from_millis(500)));
+    }
+
+    #[test]
+    fn ingress_guard_blocks_chat_at_balanced_short_window_without_blocking_other_chats()
+    -> Result<(), Box<dyn Error>> {
+        let guard = super::UpdateIngressGuard::new(super::UpdateIngressGuardConfig {
+            short_window: Duration::from_secs(10),
+            short_limit: 3,
+            long_window: Duration::from_secs(60),
+            long_limit: 100,
+            block_duration: Duration::from_secs(300),
+        });
+        let now = UNIX_EPOCH + Duration::from_secs(1_710_000_000);
+        let update = sample_message_update()?;
+
+        assert!(guard.check_update_at(&update, now).is_allowed());
+        assert!(
+            guard
+                .check_update_at(&update, now + Duration::from_secs(1))
+                .is_allowed()
+        );
+
+        let blocked = guard.check_update_at(&update, now + Duration::from_secs(2));
+        assert!(blocked.is_dropped());
+        assert_eq!(blocked.chat_id(), Some(42));
+
+        assert!(
+            guard
+                .check_update_at(
+                    &sample_message_update_for_chat(1001)?,
+                    now + Duration::from_secs(3)
+                )
+                .is_allowed()
+        );
+        assert!(
+            guard
+                .check_update_at(&update, now + Duration::from_secs(299))
+                .is_dropped()
+        );
+        assert!(
+            guard
+                .check_update_at(&update, now + Duration::from_secs(303))
+                .is_allowed()
+        );
+        Ok(())
     }
 
     #[test]
@@ -6398,6 +6720,15 @@ mod tests {
         serde_json::from_value(json!({
             "update_id": 12345,
             "message": sample_message_json(77, date, "/start hello")
+        }))
+    }
+
+    fn sample_message_update_for_chat(chat_id: i64) -> Result<TelegramUpdate, serde_json::Error> {
+        let mut message = sample_message_json(77, 1_710_000_000, "/start hello");
+        message["chat"]["id"] = json!(chat_id);
+        serde_json::from_value(json!({
+            "update_id": 12345,
+            "message": message
         }))
     }
 
