@@ -844,6 +844,7 @@ where
     {
         return Ok(request);
     }
+    extract_prompt_modifiers(&mut request);
     let original_prompt = build_draw_prompt_text(
         &request.prompt,
         &request.negative_prompt,
@@ -866,10 +867,26 @@ where
         .into_iter()
         .filter_map(non_empty)
         .collect();
-    if !optimized.aspect_ratio.trim().is_empty() {
+    if request.aspect_ratio.trim().is_empty() {
         request.aspect_ratio = optimized.aspect_ratio.trim().to_owned();
     }
     Ok(request)
+}
+
+/// Split user-typed modifiers out of the prompt before optimization so an
+/// explicit aspect ratio, seed, or negative prompt survives optimizer misses.
+fn extract_prompt_modifiers(request: &mut ImageGenerationRequest) {
+    let parts = openplotva_media::part_image_prompt(&request.prompt);
+    request.prompt = parts.prompt;
+    if request.negative_prompt.trim().is_empty() {
+        request.negative_prompt = parts.negative_prompt;
+    }
+    if request.aspect_ratio.trim().is_empty() {
+        request.aspect_ratio = parts.aspect_ratio;
+    }
+    if request.seed.trim().is_empty() {
+        request.seed = parts.seed;
+    }
 }
 
 async fn optimized_image_edit_request<Optimizer>(
@@ -3906,11 +3923,99 @@ mod tests {
                 prompt_variants: vec!["roach-fish swims near a roach-fish".to_owned()],
                 is_nsfw: false,
                 negative_prompt: "blur".to_owned(),
-                aspect_ratio: "16:9".to_owned(),
+                aspect_ratio: "1:1".to_owned(),
                 seed: "seed 42".to_owned(),
                 ..ImageGenerationRequest::default()
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn optimizing_image_generator_extracts_prompt_modifiers_like_go_part_image_prompt() {
+        let generator = GeneratorStub::success("https://img.test/1.png");
+        let optimizer =
+            OptimizerStub::default().with_image_result(openplotva_media::ImageOptimize {
+                input: "cat portrait | blurry lowres 16:9 123".to_owned(),
+                outputs: vec!["cat portrait variant".to_owned()],
+                aspect_ratio: String::new(),
+                nsfw_result: openplotva_media::NsfwResult::Safe,
+            });
+        let optimizing = OptimizingImageGenerator::new(
+            generator.clone(),
+            crate::media::MediaPromptOptimizerService::new(Some(optimizer.clone())),
+        );
+
+        let result = optimizing
+            .generate_image(ImageGenerationRequest {
+                prompt: "cat portrait seed:123 16:9 | blurry lowres".to_owned(),
+                ..ImageGenerationRequest::default()
+            })
+            .await;
+
+        assert!(result.is_ok());
+        assert_eq!(
+            optimizer.calls(),
+            vec!["image:cat portrait | blurry lowres 16:9 123:1".to_owned()]
+        );
+        let request = &generator.requests()[0];
+        assert_eq!(request.prompt, "cat portrait");
+        assert_eq!(request.negative_prompt, "blurry lowres");
+        assert_eq!(request.aspect_ratio, "16:9");
+        assert_eq!(request.seed, "123");
+    }
+
+    #[tokio::test]
+    async fn optimizing_image_generator_keeps_user_aspect_ratio_when_optimizer_suggests_another() {
+        let generator = GeneratorStub::success("https://img.test/1.png");
+        let optimizer =
+            OptimizerStub::default().with_image_result(openplotva_media::ImageOptimize {
+                input: "cat 16:9".to_owned(),
+                outputs: vec!["cat variant".to_owned()],
+                aspect_ratio: "2:3".to_owned(),
+                nsfw_result: openplotva_media::NsfwResult::Safe,
+            });
+        let optimizing = OptimizingImageGenerator::new(
+            generator.clone(),
+            crate::media::MediaPromptOptimizerService::new(Some(optimizer.clone())),
+        );
+
+        let result = optimizing
+            .generate_image(ImageGenerationRequest {
+                prompt: "cat 16:9".to_owned(),
+                ..ImageGenerationRequest::default()
+            })
+            .await;
+
+        assert!(result.is_ok());
+        let request = &generator.requests()[0];
+        assert_eq!(request.prompt, "cat");
+        assert_eq!(request.aspect_ratio, "16:9");
+    }
+
+    #[tokio::test]
+    async fn optimizing_image_generator_uses_optimizer_aspect_ratio_when_user_omits_it() {
+        let generator = GeneratorStub::success("https://img.test/1.png");
+        let optimizer =
+            OptimizerStub::default().with_image_result(openplotva_media::ImageOptimize {
+                input: "cat".to_owned(),
+                outputs: vec!["cat variant".to_owned()],
+                aspect_ratio: "2:3".to_owned(),
+                nsfw_result: openplotva_media::NsfwResult::Safe,
+            });
+        let optimizing = OptimizingImageGenerator::new(
+            generator.clone(),
+            crate::media::MediaPromptOptimizerService::new(Some(optimizer.clone())),
+        );
+
+        let result = optimizing
+            .generate_image(ImageGenerationRequest {
+                prompt: "cat".to_owned(),
+                ..ImageGenerationRequest::default()
+            })
+            .await;
+
+        assert!(result.is_ok());
+        assert_eq!(generator.requests()[0].aspect_ratio, "2:3");
     }
 
     #[tokio::test]

@@ -5460,6 +5460,46 @@ mod tests {
     }
 
     #[test]
+    fn parse_if_addressed_accepts_uppercase_name_and_mention_like_go_equalfold()
+    -> Result<(), Box<dyn Error>> {
+        let bot = sample_bot_user();
+        let group_chat = json!({
+            "id": -42,
+            "type": "group",
+            "title": "Group"
+        });
+        let uppercase_name = sample_message_from_value(json!({
+            "message_id": 10,
+            "date": 1_710_000_000,
+            "chat": group_chat.clone(),
+            "from": sample_user_json(),
+            "text": "ПЛОТВА, нарисуй кота"
+        }))?;
+        let mixed_case_translit = sample_message_from_value(json!({
+            "message_id": 11,
+            "date": 1_710_000_000,
+            "chat": group_chat.clone(),
+            "from": sample_user_json(),
+            "text": "PLOTVA нарисуй кота"
+        }))?;
+        let uppercase_mention = sample_message_from_value(json!({
+            "message_id": 12,
+            "date": 1_710_000_000,
+            "chat": group_chat,
+            "from": sample_user_json(),
+            "text": "@PLOTVABOT нарисуй кота"
+        }))?;
+
+        for message in [uppercase_name, mixed_case_translit, uppercase_mention] {
+            let parsed = parse_if_addressed(&message, &bot);
+            assert!(parsed.is_addressed, "{}", parsed.message_text);
+            assert_eq!(parsed.first_word, "нарисуй");
+            assert_eq!(parsed.rest_text, "кота");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn settings_command_message_matches_go_bot_target_rules() -> Result<(), Box<dyn Error>> {
         let group_settings = sample_message_from_value(json!({
             "message_id": 6,
