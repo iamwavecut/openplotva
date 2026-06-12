@@ -337,7 +337,7 @@ where
         if prompt.trim().is_empty() {
             return Ok(ImageGenerationResult::default());
         }
-        let payload = draw_api_payload(&prompt, &[])
+        let payload = draw_api_payload(&prompt, &[], draw_api_dimensions(&request.aspect_ratio))
             .map_err(|err| ImageGenerationError::Provider(err.to_string()))?;
         let job_id = self.submit_draw_api_job(job_id, payload).await?;
         let result = self.wait_draw_api_job(&job_id).await?;
@@ -371,7 +371,7 @@ where
                 "image edit requires image input".to_owned(),
             ));
         }
-        let payload = draw_api_payload(&prompt, &image_inputs)
+        let payload = draw_api_payload(&prompt, &image_inputs, None)
             .map_err(|err| ImageEditError::Provider(err.to_string()))?;
         let job_id = self
             .submit_draw_api_job(job_id, payload)
@@ -3153,6 +3153,10 @@ struct DrawApiGenerateRequest<'a> {
     #[serde(skip_serializing_if = "str::is_empty")]
     prompt: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
+    width: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    height: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     image_url: Option<OneOrManyStrings<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     image_b64: Option<OneOrManyStrings<'a>>,
@@ -3207,7 +3211,11 @@ fn build_draw_prompt_text(
     out
 }
 
-fn draw_api_payload(prompt: &str, image_inputs: &[String]) -> serde_json::Result<Vec<u8>> {
+fn draw_api_payload(
+    prompt: &str,
+    image_inputs: &[String],
+    dimensions: Option<(i32, i32)>,
+) -> serde_json::Result<Vec<u8>> {
     let (image_urls, image_b64) = split_draw_api_image_inputs(image_inputs);
     let image_url = one_or_many_strings(&image_urls);
     let image_b64 = if image_url.is_some() {
@@ -3217,9 +3225,41 @@ fn draw_api_payload(prompt: &str, image_inputs: &[String]) -> serde_json::Result
     };
     serde_json::to_vec(&DrawApiGenerateRequest {
         prompt,
+        width: dimensions.map(|(width, _)| width),
+        height: dimensions.map(|(_, height)| height),
         image_url,
         image_b64,
     })
+}
+
+const DRAW_API_BASE_RESOLUTION: i32 = 1024;
+
+/// Width/height for an explicit `N:M` aspect ratio, clamped to [1:2, 2:1] and
+/// scaled around `DRAW_API_BASE_RESOLUTION` in 64px steps.
+fn draw_api_dimensions(aspect_ratio: &str) -> Option<(i32, i32)> {
+    let (hor_text, ver_text) = aspect_ratio.trim().split_once(':')?;
+    let mut hor = hor_text.parse::<i32>().ok().filter(|value| *value > 0)?;
+    let mut ver = ver_text.parse::<i32>().ok().filter(|value| *value > 0)?;
+    let ratio = f64::from(hor) / f64::from(ver);
+    if ratio > 2.0 {
+        (hor, ver) = (2, 1);
+    } else if ratio < 0.5 {
+        (hor, ver) = (1, 2);
+    }
+    let divisor = gcd(hor, ver);
+    hor /= divisor;
+    ver /= divisor;
+    let part = f64::from(DRAW_API_BASE_RESOLUTION * 2) / f64::from(hor + ver);
+    let width = 64 * (part * f64::from(hor) / 64.0).floor() as i32;
+    let height = 64 * (part * f64::from(ver) / 64.0).floor() as i32;
+    (width > 0 && height > 0).then_some((width, height))
+}
+
+fn gcd(mut a: i32, mut b: i32) -> i32 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
 }
 
 fn normalized_image_edit_inputs(request: &ImageEditRequest) -> Vec<String> {
@@ -4732,6 +4772,24 @@ mod tests {
     }
 
     #[test]
+    fn draw_api_dimensions_match_go_set_aspect_ratio_math() {
+        let cases: [(&str, Option<(i32, i32)>); 9] = [
+            ("4:3", Some((1152, 832))),
+            ("16:9", Some((1280, 704))),
+            ("9:16", Some((704, 1280))),
+            ("1:1", Some((1024, 1024))),
+            ("2:1", Some((1344, 640))),
+            ("3:1", Some((1344, 640))),
+            ("1:3", Some((640, 1344))),
+            ("", None),
+            ("0:3", None),
+        ];
+        for (input, want) in cases {
+            assert_eq!(draw_api_dimensions(input), want, "input: {input}");
+        }
+    }
+
+    #[test]
     fn pruna_config_from_app_config_maps_go_pruna_env() -> Result<(), openplotva_config::ConfigError>
     {
         let config = AppConfig::from_raw(openplotva_config::RawConfig {
@@ -4847,7 +4905,10 @@ mod tests {
         assert_eq!(job.invocation.timeout_ms, 5000);
         let draw_body = decode_discovery_body(&job.invocation.body).expect("draw body");
         let draw_request: Value = serde_json::from_slice(&draw_body).expect("draw request");
-        assert_eq!(draw_request, json!({"prompt": "variant one"}));
+        assert_eq!(
+            draw_request,
+            json!({"prompt": "variant one", "width": 1280, "height": 704})
+        );
         assert_eq!(requests[1].method, AifarmHttpMethod::Get);
         assert_eq!(requests[1].url, "https://draw.example.test/v1/jobs/job-1");
     }
