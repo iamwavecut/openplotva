@@ -22,7 +22,7 @@ use openplotva_telegram::{
     DeleteMessageRequest, TelegramOutboundMethod, build_delete_message_method,
 };
 use thiserror::Error;
-use time::OffsetDateTime;
+use time::{Duration as TimeDuration, OffsetDateTime};
 
 pub const DEFAULT_SHARED_TASK_QUEUE_SNAPSHOT_FILE: &str = "openplotva-task-queue.snap";
 
@@ -498,6 +498,20 @@ pub struct SharedTaskQueueRecoveryWorkerReport {
     pub last_error: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SharedTaskQueueTerminalCleanupWorkerReport {
+    /// Number of cleanup ticks observed.
+    pub ticks: usize,
+    /// Number of terminal jobs deleted.
+    pub deleted: usize,
+    /// Number of successful snapshot writes after cleanup.
+    pub saved: usize,
+    /// Number of failed snapshot writes after cleanup.
+    pub errors: usize,
+    /// Last snapshot write error, if any.
+    pub last_error: Option<String>,
+}
+
 /// Periodic worker-heartbeat report.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SharedTaskQueueHeartbeatWorkerReport {
@@ -738,6 +752,10 @@ impl SharedTaskQueueRuntime {
     pub fn fail_stuck_processing(&self, now: OffsetDateTime, stuck_duration: Duration) -> Vec<i64> {
         self.queue.fail_stuck_processing(now, stuck_duration)
     }
+
+    pub fn prune_terminal_before(&self, cutoff: OffsetDateTime) -> Vec<i64> {
+        self.queue.prune_terminal_before(cutoff)
+    }
 }
 
 /// Default Rust-native snapshot path for the shared task queue.
@@ -768,6 +786,18 @@ pub fn shared_task_queue_snapshot_interval_from_config(config: &PersistentQueueC
 #[must_use]
 pub fn shared_task_queue_recovery_interval_from_config(config: &PersistentQueueConfig) -> Duration {
     Duration::from_secs(config.recovery_interval_seconds.max(1) as u64)
+}
+
+#[must_use]
+pub fn shared_task_queue_cleanup_interval_from_config(config: &PersistentQueueConfig) -> Duration {
+    Duration::from_secs(config.cleanup_interval_seconds.max(1) as u64)
+}
+
+#[must_use]
+pub fn shared_task_queue_completed_retention_from_config(
+    config: &PersistentQueueConfig,
+) -> TimeDuration {
+    TimeDuration::days(i64::from(config.completed_job_retention_days.max(0)))
 }
 
 #[must_use]
@@ -891,6 +921,44 @@ pub async fn run_shared_task_queue_recovery_worker_until(
                         report.errors += 1;
                         report.last_error = Some(error.to_string());
                         tracing::warn!(%error, path = %runtime.snapshot_path().display(), "failed to persist shared task queue snapshot after recovery");
+                    }
+                }
+            }
+        }
+    }
+
+    report
+}
+
+pub async fn run_shared_task_queue_terminal_cleanup_worker_until(
+    runtime: SharedTaskQueueRuntime,
+    interval: Duration,
+    retention: TimeDuration,
+    stop: impl std::future::Future<Output = ()>,
+) -> SharedTaskQueueTerminalCleanupWorkerReport {
+    let mut report = SharedTaskQueueTerminalCleanupWorkerReport::default();
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    tokio::pin!(stop);
+
+    loop {
+        tokio::select! {
+            () = &mut stop => break,
+            _ = ticker.tick() => {
+                report.ticks += 1;
+                let cutoff = OffsetDateTime::now_utc() - retention;
+                let deleted = runtime.prune_terminal_before(cutoff);
+                if deleted.is_empty() {
+                    continue;
+                }
+                report.deleted += deleted.len();
+                tracing::warn!(deleted = deleted.len(), "deleted old shared taskman terminal jobs");
+                match runtime.persist_snapshot() {
+                    Ok(()) => report.saved += 1,
+                    Err(error) => {
+                        report.errors += 1;
+                        report.last_error = Some(error.to_string());
+                        tracing::warn!(%error, path = %runtime.snapshot_path().display(), "failed to persist shared task queue snapshot after terminal cleanup");
                     }
                 }
             }

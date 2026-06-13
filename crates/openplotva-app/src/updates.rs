@@ -33,6 +33,10 @@ pub type UpdateSourceBatchFuture<'a, E> =
 
 /// Boxed future returned by update handlers.
 pub type UpdateHandlerFuture<'a, E> = Pin<Box<dyn Future<Output = Result<(), E>> + Send + 'a>>;
+type UpdateProcessorFuture = Pin<Box<dyn Future<Output = UpdateProcessReport> + Send>>;
+type UpdateProcessor = Arc<
+    dyn Fn(TelegramUpdate, UpdateConsumerConfig, SystemTime) -> UpdateProcessorFuture + Send + Sync,
+>;
 
 /// Boxed future returned by update state storage calls.
 pub type UpdateStateStoreFuture<'a, E> = Pin<Box<dyn Future<Output = Result<(), E>> + Send + 'a>>;
@@ -458,6 +462,15 @@ impl UpdateHistorySideEffectReport {
     }
 }
 
+fn trace_update_history_error(update: &TelegramUpdate, error: &str) {
+    tracing::warn!(
+        error,
+        update_id = update.id,
+        update_name = openplotva_updates::update_name(update),
+        "update history persistence failed"
+    );
+}
+
 /// Error returned by a handler wrapped with non-fatal history persistence.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum UpdateHandleWithHistoryError {
@@ -630,12 +643,7 @@ where
         persist_update_history(store, &update, bot_id).await,
     );
     if let Some(error) = history.error.as_deref() {
-        tracing::warn!(
-            error,
-            update_id = update.id,
-            update_name = openplotva_updates::update_name(&update),
-            "update history persistence failed"
-        );
+        trace_update_history_error(&update, error);
     }
 
     handle(update)
@@ -779,16 +787,63 @@ where
     HandleFuture: Future<Output = Result<(), HandleError>>,
     HandleError: fmt::Display,
 {
-    openplotva_updates::process_update_at(
+    process_update_with_state_and_history_store_tracked_at(
         update,
         config,
         now,
-        |update| async move { persist_update_state(state_store, &update).await.map(|_| ()) },
+        state_store,
+        history_store,
+        bot_id,
+        handle,
+        &NoopUpdateStageTracker,
+    )
+    .await
+}
+
+pub async fn process_update_with_state_and_history_store_tracked_at<
+    S,
+    History,
+    HandleFn,
+    HandleFuture,
+    HandleError,
+    Tracker,
+>(
+    update: TelegramUpdate,
+    config: UpdateConsumerConfig,
+    now: SystemTime,
+    state_store: &S,
+    history_store: &History,
+    bot_id: i64,
+    handle: HandleFn,
+    tracker: &Tracker,
+) -> UpdateProcessReport
+where
+    S: UpdateStateStore + Sync,
+    History: InboundHistoryStore + EditedHistoryStore + Sync,
+    HandleFn: FnOnce(TelegramUpdate) -> HandleFuture,
+    HandleFuture: Future<Output = Result<(), HandleError>>,
+    HandleError: fmt::Display,
+    Tracker: UpdateStageTracker + ?Sized,
+{
+    openplotva_updates::process_update_with_stage_tracker_at(
+        update,
+        config,
+        now,
         |update| async move {
-            handle_update_with_history(history_store, update, bot_id, handle)
+            let state = persist_update_state(state_store, &update)
                 .await
                 .map(|_| ())
+                .map_err(|error| error.to_string());
+            let history = UpdateHistorySideEffectReport::from_persistence_result(
+                persist_update_history(history_store, &update, bot_id).await,
+            );
+            if let Some(error) = history.error.as_deref() {
+                trace_update_history_error(&update, error);
+            }
+            state
         },
+        handle,
+        tracker,
     )
     .await
 }
@@ -858,6 +913,75 @@ where
     Tracker: UpdateStageTracker + Send + Sync + 'static,
     Stop: Future<Output = ()> + Send,
 {
+    let processor: UpdateProcessor = Arc::new(move |update, config, now| {
+        let store = Arc::clone(&store);
+        let handler = Arc::clone(&handler);
+        let tracker = Arc::clone(&tracker);
+        Box::pin(async move {
+            process_update_with_state_store_tracked_at(
+                update,
+                config,
+                now,
+                store.as_ref(),
+                |update| handler.handle_update(update),
+                tracker.as_ref(),
+            )
+            .await
+        })
+    });
+    run_update_consumer_with_processor_until(source, config, processor, stop).await
+}
+
+pub async fn run_update_consumer_with_history_stage_tracker_until<Q, S, History, H, Tracker, Stop>(
+    source: Arc<Q>,
+    config: UpdateConsumerConfig,
+    store: Arc<S>,
+    history_store: Arc<History>,
+    bot_id: i64,
+    handler: Arc<H>,
+    tracker: Arc<Tracker>,
+    stop: Stop,
+) -> UpdateConsumerRunReport
+where
+    Q: UpdateSource + Send + Sync + 'static,
+    S: UpdateStateStore + Send + Sync + 'static,
+    History: InboundHistoryStore + EditedHistoryStore + Send + Sync + 'static,
+    H: UpdateHandler + Send + Sync + 'static,
+    Tracker: UpdateStageTracker + Send + Sync + 'static,
+    Stop: Future<Output = ()> + Send,
+{
+    let processor: UpdateProcessor = Arc::new(move |update, config, now| {
+        let store = Arc::clone(&store);
+        let history_store = Arc::clone(&history_store);
+        let handler = Arc::clone(&handler);
+        let tracker = Arc::clone(&tracker);
+        Box::pin(async move {
+            process_update_with_state_and_history_store_tracked_at(
+                update,
+                config,
+                now,
+                store.as_ref(),
+                history_store.as_ref(),
+                bot_id,
+                |update| handler.handle_update(update),
+                tracker.as_ref(),
+            )
+            .await
+        })
+    });
+    run_update_consumer_with_processor_until(source, config, processor, stop).await
+}
+
+async fn run_update_consumer_with_processor_until<Q, Stop>(
+    source: Arc<Q>,
+    config: UpdateConsumerConfig,
+    processor: UpdateProcessor,
+    stop: Stop,
+) -> UpdateConsumerRunReport
+where
+    Q: UpdateSource + Send + Sync + 'static,
+    Stop: Future<Output = ()> + Send,
+{
     let worker_limit = config.worker_limit.max(1);
     let semaphore = Arc::new(Semaphore::new(worker_limit));
     let mut workers = JoinSet::new();
@@ -887,20 +1011,10 @@ where
                                 }
                             };
 
-                            let store = Arc::clone(&store);
-                            let handler = Arc::clone(&handler);
-                            let tracker = Arc::clone(&tracker);
+                            let processor = Arc::clone(&processor);
                             workers.spawn(async move {
                                 let _permits = permits;
-                                process_update_with_state_store_tracked_at(
-                                    update,
-                                    config,
-                                    now,
-                                    store.as_ref(),
-                                    |update| handler.handle_update(update),
-                                    tracker.as_ref(),
-                                )
-                                .await
+                                processor(update, config, now).await
                             });
                         }
                     }
@@ -1416,6 +1530,48 @@ mod tests {
         assert_eq!(report.state.outcome, UpdateStageOutcome::Completed);
         assert!(report.skipped_handle);
         assert_eq!(report.handle, None);
+        assert_eq!(store.calls().len(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn process_update_with_state_and_history_store_keeps_stale_history_without_handler()
+    -> Result<(), Box<dyn Error>> {
+        let store = StoreStub::default();
+        let history = HistoryStoreStub::default();
+        let handled = Arc::new(Mutex::new(Vec::new()));
+        let handled_updates = Arc::clone(&handled);
+
+        let report = process_update_with_state_and_history_store_at(
+            sample_message_update()?,
+            UpdateConsumerConfig {
+                state_timeout: Duration::from_secs(1),
+                handle_timeout: Duration::from_secs(1),
+                side_effect_max_age: Duration::from_secs(5 * 60),
+                ..UpdateConsumerConfig::default()
+            },
+            unix_time(1_710_000_300),
+            &store,
+            &history,
+            0,
+            move |update| {
+                let handled = Arc::clone(&handled_updates);
+                async move {
+                    handled
+                        .lock()
+                        .map_err(|err| io::Error::other(err.to_string()))?
+                        .push(update.id);
+                    Ok::<(), io::Error>(())
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(report.state.outcome, UpdateStageOutcome::Completed);
+        assert!(report.skipped_handle);
+        assert_eq!(report.handle, None);
+        assert!(handled.lock().expect("handled updates").is_empty());
+        assert_eq!(history.entries().len(), 1);
         assert_eq!(store.calls().len(), 2);
         Ok(())
     }

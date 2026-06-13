@@ -8482,6 +8482,10 @@ async fn start_runtime_workers(
         task_queue::shared_task_queue_snapshot_interval_from_config(&config.persistent_queue);
     let shared_task_queue_recovery_interval =
         task_queue::shared_task_queue_recovery_interval_from_config(&config.persistent_queue);
+    let shared_task_queue_cleanup_interval =
+        task_queue::shared_task_queue_cleanup_interval_from_config(&config.persistent_queue);
+    let shared_task_queue_completed_retention =
+        task_queue::shared_task_queue_completed_retention_from_config(&config.persistent_queue);
     let shared_task_queue_heartbeat_interval =
         task_queue::shared_task_queue_heartbeat_interval_from_config(&config.persistent_queue);
     let shared_task_queue_placeholder_cleanup_interval =
@@ -8570,6 +8574,28 @@ async fn start_runtime_workers(
         ),
     ));
     workers.handles.push(shared_task_queue_recovery_worker);
+    let shared_task_queue_cleanup_runtime = shared_task_queue.clone();
+    let shared_task_queue_cleanup_stop = stop.subscribe();
+    let shared_task_queue_cleanup_worker = tokio::spawn(async move {
+        let report = task_queue::run_shared_task_queue_terminal_cleanup_worker_until(
+            shared_task_queue_cleanup_runtime,
+            shared_task_queue_cleanup_interval,
+            shared_task_queue_completed_retention,
+            wait_for_runtime_stop(shared_task_queue_cleanup_stop),
+        )
+        .await;
+
+        tracing::info!(?report, "shared taskman terminal cleanup worker stopped");
+    });
+    readiness_checks.push(ReadinessCheck::ok(
+        "shared_task_queue_terminal_cleanup",
+        format!(
+            "terminal cleanup every {}s, retention {}d",
+            shared_task_queue_cleanup_interval.as_secs(),
+            shared_task_queue_completed_retention.whole_days()
+        ),
+    ));
+    workers.handles.push(shared_task_queue_cleanup_worker);
     let shared_task_queue_stuck_runtime = shared_task_queue.clone();
     let shared_task_queue_stuck_stop = stop.subscribe();
     let shared_task_queue_stuck_worker = tokio::spawn(async move {
@@ -9883,26 +9909,25 @@ async fn start_runtime_workers(
             bot_user_from_get_me(&bot_identity),
             activity,
         ));
-        let history_handler = Arc::new(updates::UpdateHandlerWithHistory::new(
-            Arc::clone(&history_store_for_updates),
-            edited,
-            bot_identity.id,
-        ));
         let handler = Arc::new(message_gate::MessageGateUpdateHandler::new(
             Arc::clone(&rate_limit_policy),
             permission_policy_for_updates,
             Arc::new(service_clients.redis.blocked_chat_store()),
             bot_identity.username.clone(),
-            history_handler,
+            edited,
         ));
         let update_consumer_queue = Arc::new(update_queue.clone());
         let update_stage_tracker = Arc::new(updates_inspector.stage_tracker());
+        let update_history_store = Arc::clone(&history_store_for_updates);
+        let update_bot_id = bot_identity.id;
         let update_consumer_stop = stop.subscribe();
         let update_consumer_worker = tokio::spawn(async move {
-            let report = updates::run_update_consumer_with_stage_tracker_until(
+            let report = updates::run_update_consumer_with_history_stage_tracker_until(
                 update_consumer_queue,
                 openplotva_updates::UpdateConsumerConfig::default(),
                 store_for_updates,
+                update_history_store,
+                update_bot_id,
                 handler,
                 update_stage_tracker,
                 wait_for_runtime_stop(update_consumer_stop),

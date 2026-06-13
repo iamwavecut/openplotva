@@ -79,7 +79,7 @@ pub const UPDATE_STATE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub const UPDATE_HANDLE_TIMEOUT: Duration = Duration::from_secs(45);
 
-pub const UPDATE_SIDE_EFFECT_MAX_AGE: Duration = Duration::from_secs(60);
+pub const UPDATE_SIDE_EFFECT_MAX_AGE: Duration = Duration::from_secs(5 * 60);
 
 pub const UPDATE_STALL_AGE: Duration = Duration::from_secs(120);
 

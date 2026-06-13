@@ -1180,6 +1180,21 @@ impl InMemoryTaskQueue {
         ids
     }
 
+    pub fn prune_terminal_before(&self, cutoff: OffsetDateTime) -> Vec<i64> {
+        let mut state = self.lock();
+        let mut ids = Vec::new();
+        state.records.retain(|record| {
+            let prune = task_queue_record_terminal_before(record, cutoff);
+            if prune {
+                ids.push(record.id);
+            }
+            !prune
+        });
+        self.append_wal_records(ids.iter().copied().map(task_queue_wal_delete));
+        drop(state);
+        ids
+    }
+
     /// Update one worker heartbeat timestamp.
     pub fn update_worker_heartbeat(&self, worker_id: impl Into<String>, at: OffsetDateTime) {
         self.lock().worker_heartbeats.insert(worker_id.into(), at);
@@ -2484,13 +2499,14 @@ fn next_pending_index_matching(
     queue_name: &str,
     mut predicate: impl FnMut(&StatelessJobItem) -> bool,
 ) -> Option<usize> {
+    let lane_blockers = dialog_lane_blockers(records);
     records
         .iter()
         .enumerate()
         .filter(|(_index, record)| {
             record.queue_name == queue_name && record.status == JobStatus::Pending
         })
-        .filter(|(index, record)| !dialog_lane_blocked(records, *index, record))
+        .filter(|(index, record)| !dialog_lane_blocked(&lane_blockers, records, *index, record))
         .filter(|(_index, record)| predicate(&record.job))
         .min_by(|(_left_index, left), (_right_index, right)| compare_go_queue_records(left, right))
         .map(|(index, _record)| index)
@@ -2506,6 +2522,7 @@ fn compare_go_queue_records(left: &TaskQueueRecord, right: &TaskQueueRecord) -> 
 }
 
 fn dialog_lane_blocked(
+    lane_blockers: &BTreeMap<(i64, i32), DialogLaneBlocker>,
     records: &[TaskQueueRecord],
     candidate_index: usize,
     candidate: &TaskQueueRecord,
@@ -2513,18 +2530,46 @@ fn dialog_lane_blocked(
     if !indexes_dialog_lane(candidate) {
         return false;
     }
-    records.iter().enumerate().any(|(index, other)| {
-        index != candidate_index && dialog_lane_record_blocks(other, candidate)
-    })
+    let Some(blocker) = lane_blockers.get(&dialog_lane_key(candidate)) else {
+        return false;
+    };
+    if blocker.processing {
+        return true;
+    }
+    let Some(pending_index) = blocker.best_pending_index else {
+        return false;
+    };
+    pending_index != candidate_index
+        && compare_go_queue_records(&records[pending_index], candidate).is_lt()
 }
 
-fn dialog_lane_record_blocks(other: &TaskQueueRecord, candidate: &TaskQueueRecord) -> bool {
-    if !indexes_dialog_lane(other) || dialog_lane_key(other) != dialog_lane_key(candidate) {
-        return false;
+#[derive(Clone, Copy, Debug, Default)]
+struct DialogLaneBlocker {
+    processing: bool,
+    best_pending_index: Option<usize>,
+}
+
+fn dialog_lane_blockers(records: &[TaskQueueRecord]) -> BTreeMap<(i64, i32), DialogLaneBlocker> {
+    let mut blockers: BTreeMap<(i64, i32), DialogLaneBlocker> = BTreeMap::new();
+    for (index, record) in records.iter().enumerate() {
+        if !indexes_dialog_lane(record) {
+            continue;
+        }
+        let blocker = blockers.entry(dialog_lane_key(record)).or_default();
+        match record.status {
+            JobStatus::Processing => blocker.processing = true,
+            JobStatus::Pending => {
+                let replace = blocker.best_pending_index.map_or(true, |best_index| {
+                    compare_go_queue_records(record, &records[best_index]).is_lt()
+                });
+                if replace {
+                    blocker.best_pending_index = Some(index);
+                }
+            }
+            _ => {}
+        }
     }
-    matches!(other.status, JobStatus::Processing)
-        || (other.status == JobStatus::Pending
-            && compare_go_queue_records(other, candidate).is_lt())
+    blockers
 }
 
 fn indexes_dialog_lane(record: &TaskQueueRecord) -> bool {
@@ -2629,6 +2674,16 @@ fn fail_stuck_processing_records(
     failed
 }
 
+fn task_queue_record_terminal_before(record: &TaskQueueRecord, cutoff: OffsetDateTime) -> bool {
+    if record.status.is_active() {
+        return false;
+    }
+    match record.completed_at {
+        Some(completed_at) => completed_at < cutoff,
+        None => false,
+    }
+}
+
 #[must_use]
 pub fn fallback_queue_time_estimate(queue_name: &str, depth: usize) -> std::time::Duration {
     if depth == 0 {
@@ -2692,7 +2747,7 @@ mod tests {
     };
 
     use serde_json::json;
-    use time::OffsetDateTime;
+    use time::{Duration as TimeDuration, OffsetDateTime};
 
     use super::{
         CONTROL_QUEUE_NAME, ControlJobData, ControlJobParams, ControlJobPayloadError, ControlKind,
@@ -3754,6 +3809,43 @@ mod tests {
         assert_eq!(record.status, JobStatus::Failed);
         assert_eq!(record.execution_started_at, Some(execution_start));
         assert_eq!(record.error.as_deref(), Some(STUCK_JOB_ERROR_MESSAGE));
+        Ok(())
+    }
+
+    #[test]
+    fn in_memory_task_queue_prunes_old_terminal_records() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let queue = InMemoryTaskQueue::new();
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let old = now - TimeDuration::days(2);
+        let recent = now - TimeDuration::hours(1);
+        let cutoff = now - TimeDuration::days(1);
+
+        let old_done = queue.assign(
+            TEXT_QUEUE_NAME,
+            job_at("old", DEFAULT_PRIORITY, old, 1, 1, 1),
+        );
+        let recent_done = queue.assign(
+            TEXT_QUEUE_NAME,
+            job_at("recent", DEFAULT_PRIORITY, recent, 2, 1, 2),
+        );
+        let active = queue.assign(
+            TEXT_QUEUE_NAME,
+            job_at("active", DEFAULT_PRIORITY, old, 3, 1, 3),
+        );
+
+        queue.complete(old_done, old)?;
+        queue.fail(recent_done, "recent failure", recent)?;
+
+        assert_eq!(queue.prune_terminal_before(cutoff), vec![old_done]);
+        let statuses: HashMap<i64, JobStatus> = queue
+            .records()
+            .into_iter()
+            .map(|record| (record.id, record.status))
+            .collect();
+        assert_eq!(statuses.get(&old_done), None);
+        assert_eq!(statuses.get(&recent_done), Some(&JobStatus::Failed));
+        assert_eq!(statuses.get(&active), Some(&JobStatus::Pending));
         Ok(())
     }
 

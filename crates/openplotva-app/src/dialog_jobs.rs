@@ -98,6 +98,7 @@ pub struct DialogJobWorkerReport {
     /// Provider chosen for execution.
     pub provider: Option<String>,
     pub skipped_empty_payload: bool,
+    pub skipped_stale: bool,
     pub content_blocked: bool,
     pub sent_answer: bool,
     /// Dialog answer matched the latest comparable bot reply and was suppressed.
@@ -148,6 +149,8 @@ pub struct DialogJobWorkerRunReport {
     pub failed: u64,
     /// Number of empty-payload jobs skipped.
     pub skipped_empty_payload: u64,
+    /// Number of stale jobs completed without provider execution.
+    pub skipped_stale: u64,
     /// Number of content-blocked provider results treated as completed.
     pub content_blocked: u64,
     /// Number of answers queued.
@@ -178,6 +181,9 @@ impl DialogJobWorkerRunReport {
         }
         if tick.skipped_empty_payload {
             self.skipped_empty_payload += 1;
+        }
+        if tick.skipped_stale {
+            self.skipped_stale += 1;
         }
         if tick.content_blocked {
             self.content_blocked += 1;
@@ -845,6 +851,12 @@ where
         }
     };
 
+    if dialog_job_is_stale(&item.job, options.now) {
+        report.skipped_stale = true;
+        mark_dialog_job_completed(queue, item.id, &mut report).await;
+        return report;
+    }
+
     if !dialog_job_has_payload(&params) {
         report.skipped_empty_payload = true;
         mark_dialog_job_completed(queue, item.id, &mut report).await;
@@ -1296,6 +1308,14 @@ pub fn dialog_job_has_payload(params: &DialogJobParams) -> bool {
         || !meta.annotation.trim().is_empty()
         || !meta.vision_description.trim().is_empty()
         || !meta.attachments.is_empty()
+}
+
+fn dialog_job_is_stale(job: &StatelessJobItem, now: OffsetDateTime) -> bool {
+    now - job.created >= dialog_job_response_max_age()
+}
+
+fn dialog_job_response_max_age() -> TimeDuration {
+    TimeDuration::seconds(openplotva_updates::UPDATE_SIDE_EFFECT_MAX_AGE.as_secs() as i64)
 }
 
 #[must_use]
@@ -2486,6 +2506,7 @@ fn trace_dialog_job_tick(tick: &DialogJobWorkerReport) {
         completed = tick.completed,
         failed = tick.failed,
         skipped_empty_payload = tick.skipped_empty_payload,
+        skipped_stale = tick.skipped_stale,
         content_blocked = tick.content_blocked,
         sent_answer = tick.sent_answer,
         suppressed_duplicate_message_id = tick.suppressed_duplicate_message_id,
@@ -2946,6 +2967,32 @@ mod tests {
 
         assert_eq!(report.job_id, Some(job_id));
         assert!(report.skipped_empty_payload);
+        assert!(report.completed);
+        assert!(provider.inputs().is_empty());
+        assert!(effects.sent().is_empty());
+        assert_eq!(record_status(&queue, job_id), JobStatus::Completed);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dialog_worker_skips_stale_job_without_provider_call() -> Result<(), Box<dyn Error>> {
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let created = now - TimeDuration::seconds(5 * 60);
+        let queue = InMemoryTaskQueue::new();
+        let job_id = queue.assign(
+            DIALOG_AIFARM_QUEUE_NAME,
+            new_dialog_job_at(dialog_params("old hello"), created),
+        );
+        let provider = ProviderStub::returning(DialogOutput {
+            answer: "unused".to_owned(),
+            ..DialogOutput::default()
+        });
+        let effects = EffectsStub::default();
+
+        let report = process_dialog_job_once_at(&queue, &provider, &effects, now).await;
+
+        assert_eq!(report.job_id, Some(job_id));
+        assert!(report.skipped_stale);
         assert!(report.completed);
         assert!(provider.inputs().is_empty());
         assert!(effects.sent().is_empty());
