@@ -728,7 +728,7 @@ where
     .await
 }
 
-/// Process one decoded update with app-owned state persistence, non-fatal
+/// Process one decoded update with app-owned state persistence, stale-only
 /// history persistence, and an injected handler.
 pub async fn process_update_with_state_and_history_store<
     S,
@@ -763,8 +763,8 @@ where
     .await
 }
 
-/// Process one decoded update with an explicit clock instant and non-fatal
-/// history persistence in the handle stage.
+/// Process one decoded update with an explicit clock instant and stale-only
+/// history persistence before the handle stage.
 pub async fn process_update_with_state_and_history_store_at<
     S,
     History,
@@ -825,6 +825,8 @@ where
     HandleError: fmt::Display,
     Tracker: UpdateStageTracker + ?Sized,
 {
+    let persist_history_before_handle =
+        openplotva_updates::should_skip_side_effects_at(&update, config.side_effect_max_age, now);
     openplotva_updates::process_update_with_stage_tracker_at(
         update,
         config,
@@ -834,11 +836,13 @@ where
                 .await
                 .map(|_| ())
                 .map_err(|error| error.to_string());
-            let history = UpdateHistorySideEffectReport::from_persistence_result(
-                persist_update_history(history_store, &update, bot_id).await,
-            );
-            if let Some(error) = history.error.as_deref() {
-                trace_update_history_error(&update, error);
+            if persist_history_before_handle {
+                let history = UpdateHistorySideEffectReport::from_persistence_result(
+                    persist_update_history(history_store, &update, bot_id).await,
+                );
+                if let Some(error) = history.error.as_deref() {
+                    trace_update_history_error(&update, error);
+                }
             }
             state
         },
@@ -1611,6 +1615,47 @@ mod tests {
     -> Result<(), Box<dyn Error>> {
         let store = StoreStub::default();
         let history = HistoryStoreStub::with_inbound_failure("history unavailable");
+        let handled = Arc::new(Mutex::new(Vec::new()));
+        let handled_updates = Arc::clone(&handled);
+
+        let report = process_update_with_state_and_history_store_at(
+            sample_message_update()?,
+            UpdateConsumerConfig {
+                state_timeout: Duration::from_secs(1),
+                handle_timeout: Duration::from_secs(1),
+                side_effect_max_age: Duration::from_secs(5 * 60),
+                ..UpdateConsumerConfig::default()
+            },
+            unix_time(1_710_000_300),
+            &store,
+            &history,
+            0,
+            move |update| {
+                let handled = Arc::clone(&handled_updates);
+                async move {
+                    handled
+                        .lock()
+                        .map_err(|err| io::Error::other(err.to_string()))?
+                        .push(update.id);
+                    Ok::<(), io::Error>(())
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(report.state.outcome, UpdateStageOutcome::Completed);
+        assert!(report.skipped_handle);
+        assert_eq!(report.handle, None);
+        assert!(handled.lock().expect("handled updates").is_empty());
+        assert!(history.entries().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn process_update_with_state_and_history_store_leaves_fresh_history_to_handler()
+    -> Result<(), Box<dyn Error>> {
+        let store = StoreStub::default();
+        let history = HistoryStoreStub::default();
         let handled = Arc::new(Mutex::new(Vec::new()));
         let handled_updates = Arc::clone(&handled);
 

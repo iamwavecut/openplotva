@@ -9909,12 +9909,17 @@ async fn start_runtime_workers(
             bot_user_from_get_me(&bot_identity),
             activity,
         ));
+        let history_handler = Arc::new(updates::UpdateHandlerWithHistory::new(
+            Arc::clone(&history_store_for_updates),
+            edited,
+            bot_identity.id,
+        ));
         let handler = Arc::new(message_gate::MessageGateUpdateHandler::new(
             Arc::clone(&rate_limit_policy),
             permission_policy_for_updates,
             Arc::new(service_clients.redis.blocked_chat_store()),
             bot_identity.username.clone(),
-            edited,
+            history_handler,
         ));
         let update_consumer_queue = Arc::new(update_queue.clone());
         let update_stage_tracker = Arc::new(updates_inspector.stage_tracker());

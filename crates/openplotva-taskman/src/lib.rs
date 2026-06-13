@@ -2499,14 +2499,17 @@ fn next_pending_index_matching(
     queue_name: &str,
     mut predicate: impl FnMut(&StatelessJobItem) -> bool,
 ) -> Option<usize> {
-    let lane_blockers = dialog_lane_blockers(records);
+    let lane_blockers =
+        (queue_name == DIALOG_AIFARM_QUEUE_NAME).then(|| dialog_lane_blockers(records));
     records
         .iter()
         .enumerate()
         .filter(|(_index, record)| {
             record.queue_name == queue_name && record.status == JobStatus::Pending
         })
-        .filter(|(index, record)| !dialog_lane_blocked(&lane_blockers, records, *index, record))
+        .filter(|(index, record)| {
+            !dialog_lane_blocked(lane_blockers.as_ref(), records, *index, record)
+        })
         .filter(|(_index, record)| predicate(&record.job))
         .min_by(|(_left_index, left), (_right_index, right)| compare_go_queue_records(left, right))
         .map(|(index, _record)| index)
@@ -2522,7 +2525,7 @@ fn compare_go_queue_records(left: &TaskQueueRecord, right: &TaskQueueRecord) -> 
 }
 
 fn dialog_lane_blocked(
-    lane_blockers: &BTreeMap<(i64, i32), DialogLaneBlocker>,
+    lane_blockers: Option<&BTreeMap<(i64, i32), DialogLaneBlocker>>,
     records: &[TaskQueueRecord],
     candidate_index: usize,
     candidate: &TaskQueueRecord,
@@ -2530,6 +2533,9 @@ fn dialog_lane_blocked(
     if !indexes_dialog_lane(candidate) {
         return false;
     }
+    let Some(lane_blockers) = lane_blockers else {
+        return false;
+    };
     let Some(blocker) = lane_blockers.get(&dialog_lane_key(candidate)) else {
         return false;
     };
