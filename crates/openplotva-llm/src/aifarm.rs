@@ -233,6 +233,9 @@ pub struct ChatCompletionRequest {
     /// Chat template kwargs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_template_kwargs: Option<Value>,
+    /// Trace metadata for low-level call observation. Never serialized to the wire.
+    #[serde(skip)]
+    pub trace: Option<crate::trace::LlmCallTrace>,
 }
 
 /// AIFarm completion error.
@@ -607,6 +610,7 @@ impl AifarmHttpTransport for ReqwestAifarmTransport {
 pub struct AifarmHttpClient<T = ReqwestAifarmTransport> {
     cfg: AifarmClientConfig,
     transport: T,
+    trace_registry: Arc<crate::trace::LlmCallTraceRegistry>,
 }
 
 impl AifarmHttpClient<ReqwestAifarmTransport> {
@@ -616,6 +620,7 @@ impl AifarmHttpClient<ReqwestAifarmTransport> {
         Self {
             cfg,
             transport: ReqwestAifarmTransport::default(),
+            trace_registry: crate::trace::global_registry(),
         }
     }
 }
@@ -630,7 +635,19 @@ where
         Self {
             cfg: cfg.with_defaults(),
             transport,
+            trace_registry: crate::trace::global_registry(),
         }
+    }
+
+    /// Override the trace registry (production uses the global one by default; tests
+    /// inject an isolated registry).
+    #[must_use]
+    pub fn with_trace_registry(
+        mut self,
+        trace_registry: Arc<crate::trace::LlmCallTraceRegistry>,
+    ) -> Self {
+        self.trace_registry = trace_registry;
+        self
     }
 
     /// Complete using direct endpoint when configured, otherwise Discovery.
@@ -640,13 +657,66 @@ where
         on_status: &mut (dyn FnMut(StatusUpdate) + Send),
     ) -> Result<CompletionResult, CompletionError> {
         let request = request_with_default_model(&request, &self.cfg.default_model);
-        if self.uses_direct_endpoint() {
-            self.complete_direct_with_job_id(request, &generated_dialog_job_id(), on_status)
+        let started = std::time::Instant::now();
+        let result = if self.uses_direct_endpoint() {
+            self.complete_direct_with_job_id(request.clone(), &generated_dialog_job_id(), on_status)
                 .await
         } else {
-            self.complete_discovery_with_job_id(request, &generated_dialog_job_id(), on_status)
-                .await
+            self.complete_discovery_with_job_id(
+                request.clone(),
+                &generated_dialog_job_id(),
+                on_status,
+            )
+            .await
+        };
+        self.emit_call_trace(&request, &result, started.elapsed());
+        result
+    }
+
+    /// Emit one trace record per model round-trip when the request carries trace
+    /// metadata. Fires on success and error; the pool calls this per backend attempt, so
+    /// per-attempt + per-backend model labelling is automatic.
+    fn emit_call_trace(
+        &self,
+        request: &ChatCompletionRequest,
+        result: &Result<CompletionResult, CompletionError>,
+        elapsed: StdDuration,
+    ) {
+        let Some(trace) = request.trace.as_ref() else {
+            return;
+        };
+        let tags = TraceTags {
+            provider: &trace.tags.provider,
+            source: &trace.tags.source,
+            flow: &trace.tags.flow,
+            mode: &trace.tags.mode,
+            request_kind: &trace.tags.request_kind,
+            iteration: trace.tags.iteration,
+        };
+        let mut artifact = match result {
+            Ok(completion) => {
+                aifarm_call_trace_artifacts(request, completion, trace.tags.docs_chars, tags)
+            }
+            Err(error) => {
+                let mut artifact = aifarm_call_trace_artifacts(
+                    request,
+                    &CompletionResult::default(),
+                    trace.tags.docs_chars,
+                    tags,
+                );
+                artifact.error = error.to_string();
+                artifact
+            }
+        };
+        if artifact.model.trim().is_empty() {
+            artifact.model = request.model.trim().to_owned();
         }
+        let duration_ms = i32::try_from(elapsed.as_millis()).unwrap_or(i32::MAX);
+        self.trace_registry.observe(crate::trace::LlmCallRecord {
+            context: trace.context.clone(),
+            artifact,
+            duration_ms,
+        });
     }
 
     pub async fn complete_discovery_with_job_id(
@@ -2599,6 +2669,32 @@ where
         if let Some(enable_thinking) = self.cfg.enable_thinking {
             request.chat_template_kwargs = Some(json!({ "enable_thinking": enable_thinking }));
         }
+        let docs_chars = input
+            .reference_context
+            .iter()
+            .map(String::len)
+            .sum::<usize>()
+            .min(i32::MAX as usize) as i32;
+        let provider = self.provider().to_owned();
+        request.trace = Some(crate::trace::LlmCallTrace {
+            context: crate::trace::LlmCallContext {
+                chat_id: input.context.chat_id,
+                thread_id: input.context.thread_id,
+                chat_title: input.context.chat_title.clone(),
+                user_id: input.user.id,
+                full_name: input.user.full_name.clone(),
+                message_id: input.message.id,
+            },
+            tags: crate::trace::LlmCallTags {
+                provider: provider.clone(),
+                source: provider,
+                flow: "dialog".to_owned(),
+                mode: "tools".to_owned(),
+                request_kind: "openai.chat.completions".to_owned(),
+                iteration,
+                docs_chars,
+            },
+        });
         Ok(request)
     }
 
@@ -6038,6 +6134,72 @@ mod tests {
                 })
             })
         }
+    }
+
+    #[derive(Default)]
+    struct RecordingObserver(Arc<Mutex<Vec<crate::trace::LlmCallRecord>>>);
+
+    impl crate::trace::LlmCallObserver for RecordingObserver {
+        fn observe(&self, record: crate::trace::LlmCallRecord) {
+            self.0.lock().expect("observer mutex").push(record);
+        }
+    }
+
+    #[tokio::test]
+    async fn aifarm_complete_emits_trace_record_with_flow_model_and_context() {
+        let response = json!({
+            "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+        });
+        let transport = FakeTransport::new(vec![Ok(AifarmHttpResponse {
+            status_code: 200,
+            status_text: "OK".to_owned(),
+            body: serde_json::to_vec(&response).expect("serialize response"),
+            ..AifarmHttpResponse::default()
+        })]);
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let registry = Arc::new(crate::trace::LlmCallTraceRegistry::new());
+        assert!(registry.set(Arc::new(RecordingObserver(Arc::clone(&sink)))));
+        let client = AifarmHttpClient::with_transport(
+            AifarmClientConfig {
+                direct_url: "https://llm.example/v1/chat/completions".to_owned(),
+                api_key: "token".to_owned(),
+                ..AifarmClientConfig::default()
+            },
+            transport,
+        )
+        .with_trace_registry(registry);
+        let request = ChatCompletionRequest {
+            model: "vram.cloud/qwen3.6-27b".to_owned(),
+            trace: Some(crate::trace::LlmCallTrace {
+                context: crate::trace::LlmCallContext {
+                    chat_id: -100,
+                    user_id: 7,
+                    message_id: 77,
+                    ..crate::trace::LlmCallContext::default()
+                },
+                tags: crate::trace::LlmCallTags {
+                    provider: "aifarm".to_owned(),
+                    source: "aifarm".to_owned(),
+                    flow: "dialog".to_owned(),
+                    mode: "tools".to_owned(),
+                    request_kind: "openai.chat.completions".to_owned(),
+                    iteration: 1,
+                    docs_chars: 0,
+                },
+            }),
+            ..ChatCompletionRequest::default()
+        };
+        let mut noop = |_status: StatusUpdate| {};
+        let result = client.complete(request, &mut noop).await;
+        assert!(result.is_ok(), "complete should succeed: {result:?}");
+        let records = sink.lock().expect("sink mutex");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].artifact.flow, "dialog");
+        assert_eq!(records[0].artifact.model, "vram.cloud/qwen3.6-27b");
+        assert_eq!(records[0].artifact.source, "aifarm");
+        assert_eq!(records[0].context.chat_id, -100);
+        assert_eq!(records[0].context.user_id, 7);
     }
 
     #[tokio::test]

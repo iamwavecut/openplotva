@@ -2,13 +2,16 @@
 //! that every model round-trip reports to, so dialog, auxiliary flows, and each pool
 //! attempt are counted at the layer where the call actually happens.
 
-use std::sync::{Arc, OnceLock};
+use std::{
+    fmt,
+    sync::{Arc, OnceLock},
+};
 
 use openplotva_dialog::DialogTraceArtifacts;
 
 /// Caller identity for a single model round-trip. Supplies the fields the low-level
-/// client cannot know on its own (chat/user/message); flow/source/model live on the
-/// artifact.
+/// client cannot know on its own (chat/user/message); flow/source/model live on
+/// [`LlmCallTags`] / the artifact.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct LlmCallContext {
     /// Chat the call belongs to (0 when not chat-scoped).
@@ -25,14 +28,46 @@ pub struct LlmCallContext {
     pub message_id: i32,
 }
 
-/// One model round-trip observation: identity context plus the existing trace artifact
-/// (provider/source/flow/model/usage/timings/inference_params/error/sizes).
+/// Routing tags for a single model round-trip. Mirrors the go-plotva trace metadata so
+/// the persisted rows group by the same `provider`/`source`/`flow` as before.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LlmCallTags {
+    /// Provider label (e.g. `aifarm`, `genkit`).
+    pub provider: String,
+    /// Source label used by analytics normalization.
+    pub source: String,
+    /// Logical flow (e.g. `dialog`, `memory_extraction`).
+    pub flow: String,
+    /// Mode (e.g. `tools`, `json`).
+    pub mode: String,
+    /// Request kind (e.g. `openai.chat.completions`).
+    pub request_kind: String,
+    /// Agent tool-loop iteration (1-based; 0 for non-iterative flows).
+    pub iteration: usize,
+    /// Reference-doc character count attributed to this call.
+    pub docs_chars: i32,
+}
+
+/// Trace metadata carried alongside a request into the low-level client.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LlmCallTrace {
+    /// Caller identity.
+    pub context: LlmCallContext,
+    /// Routing tags.
+    pub tags: LlmCallTags,
+}
+
+/// One model round-trip observation: identity context, the existing trace artifact
+/// (provider/source/flow/model/usage/timings/inference_params/error/sizes), and the
+/// measured wall-clock duration.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct LlmCallRecord {
     /// Caller identity.
     pub context: LlmCallContext,
     /// Provider-side call artifact.
     pub artifact: DialogTraceArtifacts,
+    /// Measured wall-clock duration in milliseconds.
+    pub duration_ms: i32,
 }
 
 /// Sink for low-level model-call observations. Implemented in `openplotva-app`.
@@ -46,6 +81,14 @@ pub trait LlmCallObserver: Send + Sync {
 #[derive(Default)]
 pub struct LlmCallTraceRegistry {
     observer: OnceLock<Arc<dyn LlmCallObserver>>,
+}
+
+impl fmt::Debug for LlmCallTraceRegistry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LlmCallTraceRegistry")
+            .field("observer_set", &self.observer.get().is_some())
+            .finish()
+    }
 }
 
 impl LlmCallTraceRegistry {
@@ -70,11 +113,14 @@ impl LlmCallTraceRegistry {
     }
 }
 
-static GLOBAL: OnceLock<LlmCallTraceRegistry> = OnceLock::new();
+static GLOBAL: OnceLock<Arc<LlmCallTraceRegistry>> = OnceLock::new();
 
-/// Process-wide registry (lazily initialized).
-pub fn global_registry() -> &'static LlmCallTraceRegistry {
-    GLOBAL.get_or_init(LlmCallTraceRegistry::new)
+/// Process-wide registry handle (lazily initialized). Low-level clients hold a clone of
+/// this by default, so registering an observer here makes every model call observable.
+pub fn global_registry() -> Arc<LlmCallTraceRegistry> {
+    GLOBAL
+        .get_or_init(|| Arc::new(LlmCallTraceRegistry::new()))
+        .clone()
 }
 
 /// Register the process-wide observer once (analogue of Go `llmtrace.SetEventEnqueuer`).
@@ -120,11 +166,13 @@ mod tests {
                 model: "Gemma".to_owned(),
                 ..DialogTraceArtifacts::default()
             },
+            duration_ms: 42,
         });
         let got = sink.lock().expect("sink mutex");
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].context.chat_id, -100);
         assert_eq!(got[0].artifact.flow, "memory_extraction");
+        assert_eq!(got[0].duration_ms, 42);
     }
 
     #[test]
