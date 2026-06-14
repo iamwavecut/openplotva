@@ -7,7 +7,10 @@ use openplotva_dialog::{DialogInput, DialogOutput};
 pub mod aifarm;
 pub mod gemini;
 pub mod retry;
+pub mod trace;
 pub mod whitecircle;
+
+pub use trace::{LlmCallContext, LlmCallObserver, LlmCallRecord};
 
 /// Boxed LLM provider error.
 pub type ChatProviderError = Box<dyn Error + Send + Sync + 'static>;
