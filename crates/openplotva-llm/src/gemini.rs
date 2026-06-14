@@ -241,6 +241,7 @@ pub struct GeminiDialogProvider<T = ReqwestAifarmTransport> {
     transport: T,
     toolbox: Option<std::sync::Arc<dyn DialogToolbox>>,
     cache: Option<Arc<GeminiExplicitCacheStore>>,
+    trace_registry: Arc<crate::trace::LlmCallTraceRegistry>,
 }
 
 #[derive(Debug)]
@@ -407,6 +408,7 @@ impl GeminiDialogProvider<ReqwestAifarmTransport> {
             cfg,
             transport: ReqwestAifarmTransport::new(client),
             toolbox: None,
+            trace_registry: crate::trace::global_registry(),
         }
     }
 }
@@ -424,6 +426,7 @@ where
             cfg,
             transport,
             toolbox: None,
+            trace_registry: crate::trace::global_registry(),
         }
     }
 
@@ -432,6 +435,38 @@ where
     pub fn with_toolbox(mut self, toolbox: std::sync::Arc<dyn DialogToolbox>) -> Self {
         self.toolbox = Some(toolbox);
         self
+    }
+
+    /// Override the trace registry (production uses the global one; tests inject an
+    /// isolated registry).
+    #[must_use]
+    pub fn with_trace_registry(
+        mut self,
+        trace_registry: Arc<crate::trace::LlmCallTraceRegistry>,
+    ) -> Self {
+        self.trace_registry = trace_registry;
+        self
+    }
+
+    /// Emit one trace record for a model round-trip on the dialog path.
+    fn emit_call_trace(
+        &self,
+        input: &DialogInput,
+        artifact: &DialogTraceArtifacts,
+        duration_ms: i32,
+    ) {
+        self.trace_registry.observe(crate::trace::LlmCallRecord {
+            context: crate::trace::LlmCallContext {
+                chat_id: input.context.chat_id,
+                thread_id: input.context.thread_id,
+                chat_title: input.context.chat_title.clone(),
+                user_id: input.user.id,
+                full_name: input.user.full_name.clone(),
+                message_id: input.message.id,
+            },
+            artifact: artifact.clone(),
+            duration_ms,
+        });
     }
 
     /// Build the Gemini REST request for tests and tracing.
@@ -502,9 +537,12 @@ where
             let cache_snapshot = self
                 .resolve_and_apply_generate_cache(&model, &mut request)
                 .await;
+            let started = std::time::Instant::now();
             let response = match self.send_request(&model, &request).await {
                 Ok(response) => response,
                 Err(error) => {
+                    let duration_ms =
+                        i32::try_from(started.elapsed().as_millis()).unwrap_or(i32::MAX);
                     let mut trace = gemini_dialog_trace_artifacts(
                         &request,
                         None,
@@ -514,10 +552,12 @@ where
                         cache_snapshot.as_ref(),
                     );
                     trace.error = error.to_string();
+                    self.emit_call_trace(&state.input, &trace, duration_ms);
                     state.trace_events.push(trace);
                     return Err(gemini_dialog_error_with_traces(error, &state));
                 }
             };
+            let duration_ms = i32::try_from(started.elapsed().as_millis()).unwrap_or(i32::MAX);
             let trace = gemini_dialog_trace_artifacts(
                 &request,
                 Some(&response),
@@ -526,6 +566,7 @@ where
                 iteration,
                 cache_snapshot.as_ref(),
             );
+            self.emit_call_trace(&state.input, &trace, duration_ms);
             state.trace_events.push(trace.clone());
             match decode_gemini_dialog_response(&response) {
                 Ok(GeminiDialogResponse::Text(text)) => {
@@ -3265,6 +3306,48 @@ mod tests {
                 })
             })
         }
+    }
+
+    #[derive(Default)]
+    struct GeminiRecordingObserver(Arc<Mutex<Vec<crate::trace::LlmCallRecord>>>);
+
+    impl crate::trace::LlmCallObserver for GeminiRecordingObserver {
+        fn observe(&self, record: crate::trace::LlmCallRecord) {
+            self.0.lock().expect("observer mutex").push(record);
+        }
+    }
+
+    #[tokio::test]
+    async fn gemini_dialog_emits_trace_record_per_round_trip() -> Result<(), ChatProviderError> {
+        let transport = FakeTransport::new(vec![Ok(json_response(json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"text": "{\"answer\":\"hi\"}"}]},
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {"promptTokenCount": 5, "candidatesTokenCount": 3, "totalTokenCount": 8}
+        })))]);
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let registry = Arc::new(crate::trace::LlmCallTraceRegistry::new());
+        assert!(registry.set(Arc::new(GeminiRecordingObserver(Arc::clone(&sink)))));
+        let provider = GeminiDialogProvider::with_transport(
+            GeminiDialogConfig {
+                api_key: " key ".to_owned(),
+                model: MODEL_GEMINI_FLASH_LITE.to_owned(),
+                max_output_tokens: 2048,
+                ..GeminiDialogConfig::default()
+            },
+            transport.clone(),
+        )
+        .with_trace_registry(registry);
+
+        let output = provider.run_dialog(sample_input()).await?;
+
+        let records = sink.lock().expect("sink mutex");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].artifact.flow, "dialog");
+        assert_eq!(records[0].artifact.request_kind, "gemini.generateContent");
+        assert_eq!(records[0].artifact, output.trace_events[0]);
+        Ok(())
     }
 
     #[tokio::test]
