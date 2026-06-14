@@ -1369,6 +1369,7 @@ pub struct GeminiMediaPromptOptimizer<T = ReqwestAifarmTransport> {
     image_cache: Arc<GeminiExplicitCacheStore>,
     edit_cache: Arc<GeminiExplicitCacheStore>,
     song_cache: Arc<GeminiExplicitCacheStore>,
+    trace_registry: Arc<crate::trace::LlmCallTraceRegistry>,
 }
 
 impl GeminiMediaPromptOptimizer<ReqwestAifarmTransport> {
@@ -1396,7 +1397,19 @@ where
             song_cache: optimizer_cache_store(&cfg.model, GEMINI_SONG_REPROMPT_CACHE_USE_CASE),
             cfg,
             transport,
+            trace_registry: crate::trace::global_registry(),
         }
+    }
+
+    /// Override the trace registry (production uses the global one; tests inject an
+    /// isolated registry).
+    #[must_use]
+    pub fn with_trace_registry(
+        mut self,
+        trace_registry: Arc<crate::trace::LlmCallTraceRegistry>,
+    ) -> Self {
+        self.trace_registry = trace_registry;
+        self
     }
 
     pub async fn optimize_image_prompt(
@@ -1408,7 +1421,7 @@ where
         let prompt = openplotva_media::render_image_optimizer_prompt(variant_count)?;
         let tool = openplotva_media::optimize_prompt_terminator_definition(variant_count);
         let payload = self
-            .run_optimizer(&text, &prompt, &tool, &self.image_cache)
+            .run_optimizer(&text, &prompt, &tool, &self.image_cache, "optimize_prompt")
             .await?;
         let optimized =
             serde_json::from_value(payload).map_err(GeminiMediaPromptOptimizerError::Decode)?;
@@ -1428,7 +1441,13 @@ where
         let prompt = openplotva_media::render_image_edit_optimizer_prompt(variant_count)?;
         let tool = openplotva_media::optimize_edit_prompt_terminator_definition(variant_count);
         let payload = self
-            .run_optimizer(&text, &prompt, &tool, &self.edit_cache)
+            .run_optimizer(
+                &text,
+                &prompt,
+                &tool,
+                &self.edit_cache,
+                "optimize_edit_prompt",
+            )
             .await?;
         let optimized =
             serde_json::from_value(payload).map_err(GeminiMediaPromptOptimizerError::Decode)?;
@@ -1452,7 +1471,9 @@ where
             .map_err(GeminiMediaPromptOptimizerError::Generate)?;
         self.resolve_and_apply_optimizer_cache(&self.song_cache, &model, &mut gemini_request)
             .await;
-        let response = self.send_optimizer_request(&model, &gemini_request).await?;
+        let response = self
+            .send_optimizer_request(&model, &gemini_request, "optimize_song_prompt")
+            .await?;
         let payload = decode_gemini_optimizer_tool_payload(&response, tool.name)?;
         let payload: openplotva_media::acestep::SongPromptPayload =
             serde_json::from_value(payload).map_err(GeminiMediaPromptOptimizerError::Decode)?;
@@ -1466,12 +1487,13 @@ where
         prompt: &str,
         tool: &openplotva_media::OptimizerTerminatorDefinition,
         cache: &GeminiExplicitCacheStore,
+        flow: &str,
     ) -> Result<Value, GeminiMediaPromptOptimizerError> {
         let model = self.cfg.model.clone();
         let mut request = gemini_optimizer_request(text, prompt, tool, &model);
         self.resolve_and_apply_optimizer_cache(cache, &model, &mut request)
             .await;
-        let response = self.send_optimizer_request(&model, &request).await?;
+        let response = self.send_optimizer_request(&model, &request, flow).await?;
         decode_gemini_optimizer_tool_payload(&response, tool.name)
     }
 
@@ -1564,6 +1586,7 @@ where
         &self,
         model: &str,
         request: &GeminiGenerateContentRequest,
+        flow: &str,
     ) -> Result<AifarmHttpResponse, GeminiMediaPromptOptimizerError> {
         let url = gemini_generate_url(&self.cfg.base_url, model)
             .map_err(|error| GeminiMediaPromptOptimizerError::Generate(error.to_string()))?;
@@ -1572,7 +1595,9 @@ where
         let mut headers = BTreeMap::new();
         headers.insert("content-type".to_owned(), "application/json".to_owned());
         headers.insert("x-goog-api-key".to_owned(), self.cfg.api_key.clone());
-        self.transport
+        let started = std::time::Instant::now();
+        let response = self
+            .transport
             .send(AifarmHttpRequest {
                 method: AifarmHttpMethod::Post,
                 url,
@@ -1580,7 +1605,29 @@ where
                 body,
             })
             .await
-            .map_err(|error| GeminiMediaPromptOptimizerError::Generate(error.to_string()))
+            .map_err(|error| GeminiMediaPromptOptimizerError::Generate(error.to_string()));
+        let duration_ms = i32::try_from(started.elapsed().as_millis()).unwrap_or(i32::MAX);
+        match &response {
+            Ok(http_response) => emit_gemini_aux_trace(
+                &self.trace_registry,
+                request,
+                Some(http_response),
+                model,
+                flow,
+                None,
+                duration_ms,
+            ),
+            Err(error) => emit_gemini_aux_trace(
+                &self.trace_registry,
+                request,
+                None,
+                model,
+                flow,
+                Some(&error.to_string()),
+                duration_ms,
+            ),
+        }
+        response
     }
 }
 
@@ -1666,6 +1713,7 @@ pub type ReqwestGeminiMemoryExtractor = GeminiMemoryExtractor<ReqwestAifarmTrans
 pub struct GeminiMemoryExtractor<T = ReqwestAifarmTransport> {
     cfg: GeminiMemoryExtractorConfig,
     transport: T,
+    trace_registry: Arc<crate::trace::LlmCallTraceRegistry>,
 }
 
 impl GeminiMemoryExtractor<ReqwestAifarmTransport> {
@@ -1680,6 +1728,7 @@ impl GeminiMemoryExtractor<ReqwestAifarmTransport> {
         Self {
             cfg,
             transport: ReqwestAifarmTransport::new(client),
+            trace_registry: crate::trace::global_registry(),
         }
     }
 }
@@ -1694,7 +1743,19 @@ where
         Self {
             cfg: cfg.with_defaults(),
             transport,
+            trace_registry: crate::trace::global_registry(),
         }
+    }
+
+    /// Override the trace registry (production uses the global one; tests inject an
+    /// isolated registry).
+    #[must_use]
+    pub fn with_trace_registry(
+        mut self,
+        trace_registry: Arc<crate::trace::LlmCallTraceRegistry>,
+    ) -> Self {
+        self.trace_registry = trace_registry;
+        self
     }
 
     pub fn request_for_input(
@@ -1742,10 +1803,31 @@ where
             ));
         }
         let request = self.request_for_input(input)?;
-        let response = self
-            .send_request(&self.cfg.model, &request)
-            .await
-            .map_err(|error| GeminiMemoryExtractorError::Generate(error.to_string()))?;
+        let started = std::time::Instant::now();
+        let response = self.send_request(&self.cfg.model, &request).await;
+        let duration_ms = i32::try_from(started.elapsed().as_millis()).unwrap_or(i32::MAX);
+        match &response {
+            Ok(http_response) => emit_gemini_aux_trace(
+                &self.trace_registry,
+                &request,
+                Some(http_response),
+                &self.cfg.model,
+                "memory_extraction",
+                None,
+                duration_ms,
+            ),
+            Err(error) => emit_gemini_aux_trace(
+                &self.trace_registry,
+                &request,
+                None,
+                &self.cfg.model,
+                "memory_extraction",
+                Some(&error.to_string()),
+                duration_ms,
+            ),
+        }
+        let response =
+            response.map_err(|error| GeminiMemoryExtractorError::Generate(error.to_string()))?;
         let text = decode_gemini_response(&response)
             .map_err(|error| GeminiMemoryExtractorError::Generate(error.to_string()))?;
         decode_extraction_json(&text).map_err(GeminiMemoryExtractorError::Decode)
@@ -1874,6 +1956,7 @@ pub type ReqwestGeminiHistorySummaryGenerator =
 pub struct GeminiHistorySummaryGenerator<T = ReqwestAifarmTransport> {
     cfg: GeminiHistorySummaryConfig,
     transport: T,
+    trace_registry: Arc<crate::trace::LlmCallTraceRegistry>,
 }
 
 impl GeminiHistorySummaryGenerator<ReqwestAifarmTransport> {
@@ -1888,6 +1971,7 @@ impl GeminiHistorySummaryGenerator<ReqwestAifarmTransport> {
         Self {
             cfg,
             transport: ReqwestAifarmTransport::new(client),
+            trace_registry: crate::trace::global_registry(),
         }
     }
 }
@@ -1902,7 +1986,19 @@ where
         Self {
             cfg: cfg.with_defaults(),
             transport,
+            trace_registry: crate::trace::global_registry(),
         }
+    }
+
+    /// Override the trace registry (production uses the global one; tests inject an
+    /// isolated registry).
+    #[must_use]
+    pub fn with_trace_registry(
+        mut self,
+        trace_registry: Arc<crate::trace::LlmCallTraceRegistry>,
+    ) -> Self {
+        self.trace_registry = trace_registry;
+        self
     }
 
     pub fn request_for_input(
@@ -1953,21 +2049,44 @@ where
         let request = self.request_for_input(input)?;
         let mut last_error = None;
         for attempt in 1..=HISTORY_SUMMARY_GENERATE_MAX_ATTEMPTS {
-            let text = match self.send_request(&self.cfg.model, &request).await {
-                Ok(response) => match decode_gemini_response(&response) {
-                    Ok(text) => text,
-                    Err(error) => {
-                        let retryable = history_summary_gemini_error_retryable(error.as_ref());
-                        let message = error.to_string();
-                        if attempt == HISTORY_SUMMARY_GENERATE_MAX_ATTEMPTS || !retryable {
-                            return Err(GeminiHistorySummaryError::Generate(message));
+            let started = std::time::Instant::now();
+            let send_result = self.send_request(&self.cfg.model, &request).await;
+            let duration_ms = i32::try_from(started.elapsed().as_millis()).unwrap_or(i32::MAX);
+            let text = match send_result {
+                Ok(response) => {
+                    emit_gemini_aux_trace(
+                        &self.trace_registry,
+                        &request,
+                        Some(&response),
+                        &self.cfg.model,
+                        "history_summary",
+                        None,
+                        duration_ms,
+                    );
+                    match decode_gemini_response(&response) {
+                        Ok(text) => text,
+                        Err(error) => {
+                            let retryable = history_summary_gemini_error_retryable(error.as_ref());
+                            let message = error.to_string();
+                            if attempt == HISTORY_SUMMARY_GENERATE_MAX_ATTEMPTS || !retryable {
+                                return Err(GeminiHistorySummaryError::Generate(message));
+                            }
+                            last_error = Some(message);
+                            sleep_history_summary_retry().await;
+                            continue;
                         }
-                        last_error = Some(message);
-                        sleep_history_summary_retry().await;
-                        continue;
                     }
-                },
+                }
                 Err(error) => {
+                    emit_gemini_aux_trace(
+                        &self.trace_registry,
+                        &request,
+                        None,
+                        &self.cfg.model,
+                        "history_summary",
+                        Some(&error.to_string()),
+                        duration_ms,
+                    );
                     let retryable = history_summary_gemini_error_retryable(error.as_ref());
                     let message = error.to_string();
                     if attempt == HISTORY_SUMMARY_GENERATE_MAX_ATTEMPTS || !retryable {
@@ -2881,6 +3000,65 @@ fn gemini_dialog_trace_artifacts(
     }
 }
 
+/// Build a trace artifact for an auxiliary gemini round-trip (memory/history/optimizers).
+fn gemini_aux_trace_artifacts(
+    request: &GeminiGenerateContentRequest,
+    response: Option<&AifarmHttpResponse>,
+    model: &str,
+    flow: &str,
+) -> DialogTraceArtifacts {
+    let raw_response =
+        response.and_then(|response| serde_json::from_slice::<Value>(&response.body).ok());
+    let usage = raw_response
+        .as_ref()
+        .and_then(gemini_trace_usage_from_response);
+    DialogTraceArtifacts {
+        provider: PROVIDER_GENKIT.to_owned(),
+        request_kind: "gemini.generateContent".to_owned(),
+        source: PROVIDER_GENKIT.to_owned(),
+        mode: "json".to_owned(),
+        flow: flow.to_owned(),
+        iteration: 1,
+        model: model.trim().to_owned(),
+        raw_request: serde_json::to_value(request).ok(),
+        raw_response,
+        inference_params: Some(gemini_trace_inference_params(request, None)),
+        usage,
+        prompt_chars: serde_json::to_vec(request)
+            .map(|bytes| bytes.len().min(i32::MAX as usize) as i32)
+            .unwrap_or_default(),
+        prompt_messages: i32::try_from(
+            request
+                .contents
+                .len()
+                .saturating_add(usize::from(request.system_instruction.is_some())),
+        )
+        .unwrap_or(i32::MAX),
+        ..DialogTraceArtifacts::default()
+    }
+}
+
+/// Emit one trace record for an auxiliary gemini round-trip via the registry.
+fn emit_gemini_aux_trace(
+    registry: &crate::trace::LlmCallTraceRegistry,
+    request: &GeminiGenerateContentRequest,
+    response: Option<&AifarmHttpResponse>,
+    model: &str,
+    flow: &str,
+    error: Option<&str>,
+    duration_ms: i32,
+) {
+    let mut artifact = gemini_aux_trace_artifacts(request, response, model, flow);
+    if let Some(error) = error {
+        artifact.error = error.to_owned();
+    }
+    registry.observe(crate::trace::LlmCallRecord {
+        context: crate::trace::LlmCallContext::default(),
+        artifact,
+        duration_ms,
+    });
+}
+
 fn gemini_trace_inference_params(
     request: &GeminiGenerateContentRequest,
     cache_snapshot: Option<&GeminiCacheTraceSnapshot>,
@@ -3348,6 +3526,34 @@ mod tests {
         assert_eq!(records[0].artifact.request_kind, "gemini.generateContent");
         assert_eq!(records[0].artifact, output.trace_events[0]);
         Ok(())
+    }
+
+    #[test]
+    fn gemini_aux_trace_artifacts_tags_flow_and_model() {
+        let request = GeminiGenerateContentRequest {
+            cached_content: None,
+            system_instruction: None,
+            contents: Vec::new(),
+            generation_config: GeminiGenerationConfig {
+                max_output_tokens: 0,
+                temperature: 0.0,
+                top_p: 0.0,
+                top_k: None,
+            },
+            safety_settings: Vec::new(),
+            tools: Vec::new(),
+            tool_config: None,
+        };
+        let artifact = gemini_aux_trace_artifacts(
+            &request,
+            None,
+            "gemini-2.5-flash-lite",
+            "memory_extraction",
+        );
+        assert_eq!(artifact.flow, "memory_extraction");
+        assert_eq!(artifact.source, PROVIDER_GENKIT);
+        assert_eq!(artifact.request_kind, "gemini.generateContent");
+        assert_eq!(artifact.model, "gemini-2.5-flash-lite");
     }
 
     #[tokio::test]
