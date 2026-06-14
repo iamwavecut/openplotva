@@ -1,20 +1,18 @@
 //! Runtime API LLM trace buffer and dialog provider recorder.
 
 use std::{
-    error::Error,
     sync::{
         Arc, Mutex,
         atomic::{AtomicI64, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
-use openplotva_dialog::{DialogInput, DialogOutput, DialogTraceArtifacts, DialogTraceError};
-use openplotva_llm::{ChatProvider, ChatProviderFuture, ChatProviderHandle};
+use openplotva_dialog::DialogTraceArtifacts;
 use openplotva_server::{
-    RuntimeLlmGenConfigData, RuntimeLlmRequestChatData, RuntimeLlmRequestData,
-    RuntimeLlmRequestMessageData, RuntimeLlmRequestResultData, RuntimeLlmRequestUserData,
-    RuntimeLlmRequestsFilter, RuntimeLlmTraceInspector,
+    RuntimeLlmRequestChatData, RuntimeLlmRequestData, RuntimeLlmRequestMessageData,
+    RuntimeLlmRequestResultData, RuntimeLlmRequestUserData, RuntimeLlmRequestsFilter,
+    RuntimeLlmTraceInspector,
 };
 use serde_json::{Value, json};
 use sqlx::{PgPool, Postgres, QueryBuilder};
@@ -192,6 +190,74 @@ impl PostgresRuntimeLlmEventRecorder {
     }
 }
 
+/// Observer that turns low-level `openplotva-llm` call records into runtime trace rows.
+/// Registered process-wide so every model round-trip (dialog, memory, history, prompt
+/// optimizers, and each aifarm pool attempt) becomes one `llm_request_events` row — the
+/// single source of those rows, replacing the provider-level `TracingChatProvider`.
+#[derive(Clone)]
+pub struct RuntimeLlmObserver {
+    buffer: RuntimeLlmTraceBuffer,
+    recorder: Option<PostgresRuntimeLlmEventRecorder>,
+}
+
+impl RuntimeLlmObserver {
+    /// Build an observer feeding the live ring buffer and, when present, the Postgres
+    /// analytics recorder.
+    pub fn new(
+        buffer: RuntimeLlmTraceBuffer,
+        recorder: Option<PostgresRuntimeLlmEventRecorder>,
+    ) -> Self {
+        Self { buffer, recorder }
+    }
+}
+
+impl openplotva_llm::LlmCallObserver for RuntimeLlmObserver {
+    fn observe(&self, record: openplotva_llm::LlmCallRecord) {
+        let trace = trace_from_record(&record.context, &record.artifact, record.duration_ms);
+        self.buffer.record(trace.clone());
+        if let Some(recorder) = &self.recorder {
+            recorder.enqueue(trace);
+        }
+    }
+}
+
+fn trace_from_record(
+    context: &openplotva_llm::LlmCallContext,
+    artifact: &DialogTraceArtifacts,
+    duration_ms: i32,
+) -> RuntimeLlmRequestData {
+    let mut trace = RuntimeLlmRequestData {
+        at: format_ts(OffsetDateTime::now_utc()),
+        duration_ms,
+        chat: RuntimeLlmRequestChatData {
+            chat_id: context.chat_id,
+            thread_id: context.thread_id,
+            chat_title: non_empty(&context.chat_title),
+        },
+        user: RuntimeLlmRequestUserData {
+            user_id: context.user_id,
+            full_name: non_empty(&context.full_name),
+        },
+        message: RuntimeLlmRequestMessageData {
+            message_id: context.message_id,
+        },
+        ..RuntimeLlmRequestData::default()
+    };
+    apply_dialog_trace_artifact(&mut trace, artifact);
+    let preview = artifact
+        .raw_response
+        .as_ref()
+        .and_then(trace_response_text)
+        .map(|text| compact_preview(&text, GO_RESPONSE_PREVIEW_SIZE))
+        .and_then(|text| non_empty(&text));
+    trace.result = RuntimeLlmRequestResultData {
+        duration_ms,
+        error: non_empty(&artifact.error),
+        response_text_preview: preview,
+    };
+    trace
+}
+
 impl RuntimeLlmTraceInspector for RuntimeLlmTraceBuffer {
     fn llm_requests(
         &self,
@@ -208,152 +274,6 @@ impl RuntimeLlmTraceInspector for RuntimeLlmTraceBuffer {
             }
         }
         Ok(out)
-    }
-}
-
-pub struct TracingChatProvider {
-    inner: ChatProviderHandle,
-    traces: RuntimeLlmTraceBuffer,
-    event_recorder: Option<PostgresRuntimeLlmEventRecorder>,
-}
-
-impl TracingChatProvider {
-    /// Wrap a dialog provider with runtime trace capture.
-    pub fn new(inner: ChatProviderHandle, traces: RuntimeLlmTraceBuffer) -> Self {
-        Self {
-            inner,
-            traces,
-            event_recorder: None,
-        }
-    }
-
-    /// Attach persistent LLM analytics event capture.
-    pub fn with_event_recorder(mut self, recorder: PostgresRuntimeLlmEventRecorder) -> Self {
-        self.event_recorder = Some(recorder);
-        self
-    }
-}
-
-impl ChatProvider for TracingChatProvider {
-    fn provider_name(&self) -> &str {
-        self.inner.provider_name()
-    }
-
-    fn run_dialog<'a>(&'a self, input: DialogInput) -> ChatProviderFuture<'a> {
-        Box::pin(async move {
-            let started = Instant::now();
-            let trace_input = input.clone();
-            match self.inner.run_dialog(input).await {
-                Ok(output) => {
-                    record_dialog_success_traces(
-                        &self.traces,
-                        self.event_recorder.as_ref(),
-                        self.inner.provider_name(),
-                        &trace_input,
-                        &output,
-                        elapsed_ms(started),
-                    );
-                    Ok(output)
-                }
-                Err(error) => {
-                    let message = error.to_string();
-                    record_dialog_error_traces(
-                        &self.traces,
-                        self.event_recorder.as_ref(),
-                        self.inner.provider_name(),
-                        &trace_input,
-                        error.as_ref(),
-                        &message,
-                        elapsed_ms(started),
-                    );
-                    Err(error)
-                }
-            }
-        })
-    }
-}
-
-fn record_dialog_error_traces(
-    traces: &RuntimeLlmTraceBuffer,
-    event_recorder: Option<&PostgresRuntimeLlmEventRecorder>,
-    provider_name: &str,
-    input: &DialogInput,
-    error: &(dyn Error + 'static),
-    message: &str,
-    duration_ms: i32,
-) {
-    if let Some(events) = dialog_trace_events_from_error(error).filter(|events| !events.is_empty())
-    {
-        for artifact in events {
-            record_dialog_trace(
-                traces,
-                event_recorder,
-                trace_from_dialog_error_with_artifact(
-                    provider_name,
-                    input,
-                    message,
-                    Some(artifact),
-                    duration_ms,
-                ),
-            );
-        }
-        return;
-    }
-    record_dialog_trace(
-        traces,
-        event_recorder,
-        trace_from_dialog_error_with_artifact(provider_name, input, message, None, duration_ms),
-    );
-}
-
-fn dialog_trace_events_from_error<'a>(
-    error: &'a (dyn Error + 'static),
-) -> Option<&'a [DialogTraceArtifacts]> {
-    if let Some(error) = error.downcast_ref::<DialogTraceError>() {
-        return Some(error.trace_events());
-    }
-    error.source().and_then(dialog_trace_events_from_error)
-}
-
-fn record_dialog_success_traces(
-    traces: &RuntimeLlmTraceBuffer,
-    event_recorder: Option<&PostgresRuntimeLlmEventRecorder>,
-    provider_name: &str,
-    input: &DialogInput,
-    output: &DialogOutput,
-    duration_ms: i32,
-) {
-    if output.trace_events.is_empty() {
-        record_dialog_trace(
-            traces,
-            event_recorder,
-            trace_from_dialog_success(provider_name, input, output, duration_ms),
-        );
-        return;
-    }
-    for artifact in &output.trace_events {
-        record_dialog_trace(
-            traces,
-            event_recorder,
-            trace_from_dialog_success_with_artifact(
-                provider_name,
-                input,
-                output,
-                Some(artifact),
-                duration_ms,
-            ),
-        );
-    }
-}
-
-fn record_dialog_trace(
-    traces: &RuntimeLlmTraceBuffer,
-    event_recorder: Option<&PostgresRuntimeLlmEventRecorder>,
-    trace: RuntimeLlmRequestData,
-) {
-    traces.record(trace.clone());
-    if let Some(event_recorder) = event_recorder {
-        event_recorder.enqueue(trace);
     }
 }
 
@@ -652,46 +572,6 @@ impl LlmRequestEvent {
     }
 }
 
-fn trace_from_dialog_success(
-    provider_name: &str,
-    input: &DialogInput,
-    output: &DialogOutput,
-    duration_ms: i32,
-) -> RuntimeLlmRequestData {
-    trace_from_dialog_success_with_artifact(
-        provider_name,
-        input,
-        output,
-        output.trace.as_ref(),
-        duration_ms,
-    )
-}
-
-fn trace_from_dialog_success_with_artifact(
-    provider_name: &str,
-    input: &DialogInput,
-    output: &DialogOutput,
-    artifact: Option<&DialogTraceArtifacts>,
-    duration_ms: i32,
-) -> RuntimeLlmRequestData {
-    let provider = non_empty(&output.provider).unwrap_or_else(|| provider_name.to_owned());
-    let preview = trace_response_preview(output, artifact);
-    let mut trace = trace_from_dialog_base(input, duration_ms);
-    trace.provider = Some(provider);
-    trace.raw_response = artifact
-        .and_then(|artifact| artifact.raw_response.clone())
-        .or_else(|| to_json_value(output));
-    if let Some(artifact) = artifact {
-        apply_dialog_trace_artifact(&mut trace, artifact);
-    }
-    trace.result = RuntimeLlmRequestResultData {
-        duration_ms,
-        response_text_preview: non_empty(&preview),
-        ..RuntimeLlmRequestResultData::default()
-    };
-    trace
-}
-
 fn apply_dialog_trace_artifact(trace: &mut RuntimeLlmRequestData, artifact: &DialogTraceArtifacts) {
     if !artifact.provider.trim().is_empty() {
         trace.provider = Some(artifact.provider.trim().to_owned());
@@ -747,79 +627,6 @@ fn apply_dialog_trace_artifact(trace: &mut RuntimeLlmRequestData, artifact: &Dia
     }
 }
 
-fn trace_from_dialog_error_with_artifact(
-    provider_name: &str,
-    input: &DialogInput,
-    error: &str,
-    artifact: Option<&DialogTraceArtifacts>,
-    duration_ms: i32,
-) -> RuntimeLlmRequestData {
-    let mut trace = trace_from_dialog_base(input, duration_ms);
-    trace.provider = Some(provider_name.to_owned());
-    if let Some(artifact) = artifact {
-        apply_dialog_trace_artifact(&mut trace, artifact);
-    }
-    trace.result = RuntimeLlmRequestResultData {
-        duration_ms,
-        error: non_empty(
-            artifact
-                .map(|artifact| artifact.error.as_str())
-                .filter(|error| !error.trim().is_empty())
-                .unwrap_or(error),
-        ),
-        response_text_preview: artifact
-            .and_then(|artifact| artifact.raw_response.as_ref())
-            .and_then(trace_response_text)
-            .map(|text| compact_preview(&text, GO_RESPONSE_PREVIEW_SIZE))
-            .and_then(|text| non_empty(&text)),
-    };
-    trace
-}
-
-fn trace_from_dialog_base(input: &DialogInput, duration_ms: i32) -> RuntimeLlmRequestData {
-    let raw_request = to_json_value(input);
-    let docs_chars = input
-        .reference_context
-        .iter()
-        .map(String::len)
-        .sum::<usize>()
-        .saturating_add(input.shield_context.len())
-        .min(i32::MAX as usize) as i32;
-    RuntimeLlmRequestData {
-        at: format_ts(OffsetDateTime::now_utc()),
-        request_kind: Some("dialog".to_owned()),
-        source: "dialog".to_owned(),
-        mode: Some(if input.guest_mode { "guest" } else { "chat" }.to_owned()),
-        flow: Some("dialog".to_owned()),
-        iteration: 1,
-        model: non_empty(&input.model),
-        chat: RuntimeLlmRequestChatData {
-            chat_id: input.context.chat_id,
-            thread_id: input.context.thread_id,
-            chat_title: non_empty(&input.context.chat_title),
-        },
-        user: RuntimeLlmRequestUserData {
-            user_id: input.user.id,
-            full_name: non_empty(&input.user.full_name),
-        },
-        message: RuntimeLlmRequestMessageData {
-            message_id: input.message.id,
-        },
-        gen_config: RuntimeLlmGenConfigData {
-            max_output_tokens: input.max_output_tokens,
-            ..RuntimeLlmGenConfigData::default()
-        },
-        docs: (!input.reference_context.is_empty()).then(|| json!(input.reference_context)),
-        messages: (!input.history.is_empty()).then(|| json!(input.history)),
-        raw_request,
-        prompt_chars: raw_request_chars(input),
-        prompt_messages: input.history.len().saturating_add(1).min(i32::MAX as usize) as i32,
-        docs_chars,
-        duration_ms,
-        ..RuntimeLlmRequestData::default()
-    }
-}
-
 fn llm_trace_matches_filter(
     trace: &RuntimeLlmRequestData,
     filter: &RuntimeLlmRequestsFilter,
@@ -863,39 +670,6 @@ fn llm_trace_matches_query(trace: &RuntimeLlmRequestData, q: &str) -> bool {
             .raw_response
             .as_ref()
             .is_some_and(|value| contains_fold(&value.to_string(), q))
-}
-
-fn to_json_value<T: serde::Serialize>(value: &T) -> Option<Value> {
-    serde_json::to_value(value).ok()
-}
-
-fn raw_request_chars(input: &DialogInput) -> i32 {
-    serde_json::to_vec(input)
-        .map(|bytes| bytes.len().min(i32::MAX as usize) as i32)
-        .unwrap_or_default()
-}
-
-fn response_preview(output: &DialogOutput) -> String {
-    compact_preview(
-        if output.answer.trim().is_empty() {
-            &output.response
-        } else {
-            &output.answer
-        },
-        GO_RESPONSE_PREVIEW_SIZE,
-    )
-}
-
-fn trace_response_preview(
-    output: &DialogOutput,
-    artifact: Option<&DialogTraceArtifacts>,
-) -> String {
-    artifact
-        .and_then(|artifact| artifact.raw_response.as_ref())
-        .and_then(trace_response_text)
-        .map(|text| compact_preview(&text, GO_RESPONSE_PREVIEW_SIZE))
-        .filter(|text| !text.is_empty())
-        .unwrap_or_else(|| response_preview(output))
 }
 
 fn trace_response_text(value: &Value) -> Option<String> {
@@ -943,10 +717,6 @@ fn compact_preview(value: &str, limit: usize) -> String {
         }
     }
     out
-}
-
-fn elapsed_ms(started: Instant) -> i32 {
-    started.elapsed().as_millis().min(i32::MAX as u128) as i32
 }
 
 fn non_empty(value: &str) -> Option<String> {
@@ -1027,9 +797,50 @@ fn format_ts(ts: OffsetDateTime) -> String {
 
 #[cfg(test)]
 mod tests {
-    use openplotva_dialog::{DialogContext, DialogMessage, DialogUser};
+    use openplotva_server::RuntimeLlmGenConfigData;
 
     use super::*;
+
+    #[test]
+    fn runtime_observer_converts_record_to_row_and_buffers() {
+        let buffer = RuntimeLlmTraceBuffer::new(8);
+        let observer = RuntimeLlmObserver::new(buffer.clone(), None);
+        openplotva_llm::LlmCallObserver::observe(
+            &observer,
+            openplotva_llm::LlmCallRecord {
+                context: openplotva_llm::LlmCallContext {
+                    chat_id: -100,
+                    user_id: 7,
+                    message_id: 77,
+                    ..openplotva_llm::LlmCallContext::default()
+                },
+                artifact: openplotva_dialog::DialogTraceArtifacts {
+                    provider: "aifarm".to_owned(),
+                    source: "aifarm_memory_extractor".to_owned(),
+                    flow: "memory_extraction".to_owned(),
+                    model: "Gemma".to_owned(),
+                    request_kind: "openai.chat.completions".to_owned(),
+                    ..openplotva_dialog::DialogTraceArtifacts::default()
+                },
+                duration_ms: 123,
+            },
+        );
+        let rows = buffer
+            .llm_requests(RuntimeLlmRequestsFilter {
+                limit: 10,
+                ..RuntimeLlmRequestsFilter::default()
+            })
+            .expect("rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].chat.chat_id, -100);
+        assert_eq!(rows[0].source, "aifarm_memory_extractor");
+        assert_eq!(
+            rows[0].request_kind.as_deref(),
+            Some("openai.chat.completions")
+        );
+        assert_eq!(rows[0].model.as_deref(), Some("Gemma"));
+        assert_eq!(rows[0].result.duration_ms, 123);
+    }
 
     #[test]
     fn runtime_llm_trace_buffer_lists_newest_and_filters_like_go() {
@@ -1104,106 +915,6 @@ mod tests {
             })
             .expect("trace list after rerecord");
         assert_eq!(traces[0].id, 3);
-    }
-
-    #[test]
-    fn dialog_trace_shape_preserves_runtime_api_contract() {
-        let input = DialogInput {
-            context: DialogContext {
-                chat_id: -100,
-                thread_id: Some(5),
-                chat_title: "Plotva Lab".to_owned(),
-                ..DialogContext::default()
-            },
-            user: DialogUser {
-                id: 7,
-                full_name: "Alice".to_owned(),
-            },
-            message: DialogMessage {
-                id: 77,
-                text: "hello".to_owned(),
-                ..DialogMessage::default()
-            },
-            model: "model-a".to_owned(),
-            max_output_tokens: 512,
-            ..DialogInput::default()
-        };
-        let output = DialogOutput {
-            provider: "aifarm".to_owned(),
-            answer: " hello   world ".to_owned(),
-            trace: Some(openplotva_dialog::DialogTraceArtifacts {
-                request_kind: "gemini.generateContent".to_owned(),
-                raw_request: Some(json!({"contents": [{"role": "user"}]})),
-                raw_response: Some(json!({"candidates": [{"content": "needle"}]})),
-                resolved_cache_content: Some(json!({
-                    "use_case": "chat_core_multi_turn",
-                    "name": "cachedContents/chat-core-1",
-                    "status": "hit"
-                })),
-                transport: Some(json!({"job_id": "job-1"})),
-                inference_params: Some(json!({"tool_mode": "none"})),
-                usage: Some(openplotva_dialog::DialogTraceUsage {
-                    input_tokens: 11,
-                    output_tokens: 7,
-                    total_tokens: 18,
-                    cached_tokens: 3,
-                    thoughts_tokens: 2,
-                    tool_use_prompt_tokens: 1,
-                    traffic_type: "ON_DEMAND".to_owned(),
-                }),
-                timings: Some(json!({"generation_tps": 40.0})),
-                ..openplotva_dialog::DialogTraceArtifacts::default()
-            }),
-            ..DialogOutput::default()
-        };
-
-        let trace = trace_from_dialog_success("aifarm", &input, &output, 42);
-
-        assert_eq!(trace.provider.as_deref(), Some("aifarm"));
-        assert_eq!(trace.source, "dialog");
-        assert_eq!(trace.chat.chat_id, -100);
-        assert_eq!(trace.user.user_id, 7);
-        assert_eq!(trace.message.message_id, 77);
-        assert_eq!(trace.gen_config.max_output_tokens, 512);
-        assert_eq!(
-            trace.request_kind.as_deref(),
-            Some("gemini.generateContent")
-        );
-        assert_eq!(
-            trace.result.response_text_preview.as_deref(),
-            Some("needle")
-        );
-        assert_eq!(
-            trace.raw_request,
-            Some(json!({"contents": [{"role": "user"}]}))
-        );
-        assert_eq!(
-            trace.raw_response,
-            Some(json!({"candidates": [{"content": "needle"}]}))
-        );
-        assert_eq!(
-            trace.resolved_cache_content,
-            Some(json!({
-                "use_case": "chat_core_multi_turn",
-                "name": "cachedContents/chat-core-1",
-                "status": "hit"
-            }))
-        );
-        assert_eq!(trace.transport, Some(json!({"job_id": "job-1"})));
-        assert_eq!(trace.inference_params, Some(json!({"tool_mode": "none"})));
-        assert_eq!(trace.timings, Some(json!({"generation_tps": 40.0})));
-        assert_eq!(
-            trace.usage,
-            Some(json!({
-                "input_tokens": 11,
-                "output_tokens": 7,
-                "total_tokens": 18,
-                "cached_tokens": 3,
-                "thoughts_tokens": 2,
-                "tool_use_prompt_tokens": 1,
-                "traffic_type": "ON_DEMAND"
-            }))
-        );
     }
 
     #[test]
@@ -1327,181 +1038,5 @@ mod tests {
         let batch_sizes = llm_request_event_shutdown_batch_sizes_for_test(receiver, 2);
 
         assert_eq!(batch_sizes, vec![2, 2, 1]);
-    }
-
-    #[test]
-    fn dialog_trace_events_record_each_provider_request_like_go() {
-        let buffer = RuntimeLlmTraceBuffer::new(8);
-        let input = DialogInput {
-            context: DialogContext {
-                chat_id: -100,
-                thread_id: Some(5),
-                chat_title: "Plotva Lab".to_owned(),
-                ..DialogContext::default()
-            },
-            user: DialogUser {
-                id: 7,
-                full_name: "Alice".to_owned(),
-            },
-            message: DialogMessage {
-                id: 77,
-                text: "hello".to_owned(),
-                ..DialogMessage::default()
-            },
-            model: "fallback-model".to_owned(),
-            max_output_tokens: 512,
-            ..DialogInput::default()
-        };
-        let output = DialogOutput {
-            provider: "aifarm".to_owned(),
-            answer: "final answer".to_owned(),
-            trace_events: vec![
-                openplotva_dialog::DialogTraceArtifacts {
-                    provider: "aifarm".to_owned(),
-                    request_kind: "openai.chat.completions".to_owned(),
-                    source: "aifarm".to_owned(),
-                    mode: "tools".to_owned(),
-                    flow: "dialog".to_owned(),
-                    iteration: 1,
-                    model: "model-a".to_owned(),
-                    raw_response: Some(
-                        json!({"choices": [{"message": {"content": "tool please"}}]}),
-                    ),
-                    prompt_chars: 111,
-                    prompt_messages: 3,
-                    docs_chars: 9,
-                    ..openplotva_dialog::DialogTraceArtifacts::default()
-                },
-                openplotva_dialog::DialogTraceArtifacts {
-                    provider: "aifarm".to_owned(),
-                    request_kind: "openai.chat.completions".to_owned(),
-                    source: "aifarm".to_owned(),
-                    mode: "tools".to_owned(),
-                    flow: "dialog".to_owned(),
-                    iteration: 2,
-                    model: "model-a".to_owned(),
-                    raw_response: Some(
-                        json!({"choices": [{"message": {"content": "final answer"}}]}),
-                    ),
-                    prompt_chars: 222,
-                    prompt_messages: 5,
-                    docs_chars: 9,
-                    ..openplotva_dialog::DialogTraceArtifacts::default()
-                },
-            ],
-            ..DialogOutput::default()
-        };
-
-        record_dialog_success_traces(&buffer, None, "aifarm", &input, &output, 99);
-
-        let traces = buffer
-            .llm_requests(RuntimeLlmRequestsFilter {
-                limit: 10,
-                ..RuntimeLlmRequestsFilter::default()
-            })
-            .expect("trace list");
-        assert_eq!(traces.len(), 2);
-        assert_eq!(traces[0].iteration, 2);
-        assert_eq!(traces[0].source, "aifarm");
-        assert_eq!(traces[0].mode.as_deref(), Some("tools"));
-        assert_eq!(traces[0].model.as_deref(), Some("model-a"));
-        assert_eq!(traces[0].prompt_chars, 222);
-        assert_eq!(traces[0].prompt_messages, 5);
-        assert_eq!(traces[0].docs_chars, 9);
-        assert_eq!(
-            traces[0].result.response_text_preview.as_deref(),
-            Some("final answer")
-        );
-        assert_eq!(traces[1].iteration, 1);
-        assert_eq!(
-            traces[1].result.response_text_preview.as_deref(),
-            Some("tool please")
-        );
-    }
-
-    #[test]
-    fn dialog_trace_errors_record_provider_artifacts_and_error_text() {
-        let buffer = RuntimeLlmTraceBuffer::new(8);
-        let input = DialogInput {
-            context: DialogContext {
-                chat_id: -100,
-                thread_id: Some(5),
-                chat_title: "Plotva Lab".to_owned(),
-                ..DialogContext::default()
-            },
-            user: DialogUser {
-                id: 7,
-                full_name: "Alice".to_owned(),
-            },
-            message: DialogMessage {
-                id: 77,
-                text: "hello".to_owned(),
-                ..DialogMessage::default()
-            },
-            model: "fallback-model".to_owned(),
-            max_output_tokens: 512,
-            ..DialogInput::default()
-        };
-        let error = openplotva_dialog::DialogTraceError::new(
-            Box::new(std::io::Error::other("provider failed")),
-            vec![openplotva_dialog::DialogTraceArtifacts {
-                provider: "aifarm".to_owned(),
-                request_kind: "openai.chat.completions".to_owned(),
-                source: "aifarm".to_owned(),
-                mode: "tools".to_owned(),
-                flow: "dialog".to_owned(),
-                iteration: 3,
-                model: "model-a".to_owned(),
-                raw_request: Some(json!({"messages": [{"role": "user"}]})),
-                raw_response: Some(json!({"error": {"message": "capacity"}})),
-                error: "aifarm provider unavailable: capacity".to_owned(),
-                prompt_chars: 333,
-                prompt_messages: 7,
-                docs_chars: 11,
-                ..openplotva_dialog::DialogTraceArtifacts::default()
-            }],
-        );
-
-        record_dialog_error_traces(
-            &buffer,
-            None,
-            "aifarm",
-            &input,
-            &error,
-            &error.to_string(),
-            77,
-        );
-
-        let traces = buffer
-            .llm_requests(RuntimeLlmRequestsFilter {
-                limit: 10,
-                ..RuntimeLlmRequestsFilter::default()
-            })
-            .expect("trace list");
-        assert_eq!(traces.len(), 1);
-        assert_eq!(traces[0].provider.as_deref(), Some("aifarm"));
-        assert_eq!(
-            traces[0].request_kind.as_deref(),
-            Some("openai.chat.completions")
-        );
-        assert_eq!(traces[0].source, "aifarm");
-        assert_eq!(traces[0].mode.as_deref(), Some("tools"));
-        assert_eq!(traces[0].iteration, 3);
-        assert_eq!(traces[0].model.as_deref(), Some("model-a"));
-        assert_eq!(
-            traces[0].raw_request,
-            Some(json!({"messages": [{"role": "user"}]}))
-        );
-        assert_eq!(
-            traces[0].raw_response,
-            Some(json!({"error": {"message": "capacity"}}))
-        );
-        assert_eq!(
-            traces[0].result.error.as_deref(),
-            Some("aifarm provider unavailable: capacity")
-        );
-        assert_eq!(traces[0].prompt_chars, 333);
-        assert_eq!(traces[0].prompt_messages, 7);
-        assert_eq!(traces[0].docs_chars, 11);
     }
 }

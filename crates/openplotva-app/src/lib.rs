@@ -8094,6 +8094,12 @@ async fn start_runtime_workers(
         );
     workers.handles.push(llm_event_recorder_worker);
     workers.llm_trace_buffer = Some(llm_trace_buffer.clone());
+    let llm_observer: Arc<dyn openplotva_llm::LlmCallObserver> =
+        Arc::new(runtime_llm::RuntimeLlmObserver::new(
+            llm_trace_buffer.clone(),
+            Some(llm_event_recorder.clone()),
+        ));
+    openplotva_llm::trace::set_observer(llm_observer);
     let memory_store = PostgresMemoryStore::new(service_clients.postgres.clone());
     let memory_restart_trigger = Arc::new(tokio::sync::Notify::new());
 
@@ -8984,10 +8990,9 @@ async fn start_runtime_workers(
                     ),
                 );
             }
-            let dialog_provider: openplotva_llm::ChatProviderHandle = Arc::new(
-                runtime_llm::TracingChatProvider::new(dialog_provider, llm_trace_buffer.clone())
-                    .with_event_recorder(llm_event_recorder.clone()),
-            );
+            // Trace rows are now emitted at the low-level model clients via the registered
+            // RuntimeLlmObserver; the dialog provider is used directly (no tracing wrap).
+            let dialog_provider: openplotva_llm::ChatProviderHandle = dialog_provider;
             dialog_provider_for_updates = Some(Arc::clone(&dialog_provider));
             let dialog_queue = Arc::clone(&task_queue_for_updates);
             let dialog_effects = dialog_jobs::DialogDispatcherEffects::new(
@@ -9060,13 +9065,8 @@ async fn start_runtime_workers(
             if fallback_worker_count > 0 {
                 if let Some(dialog_fallback_provider) = dialog_fallback_provider_for_runtime.clone()
                 {
-                    let dialog_fallback_provider: openplotva_llm::ChatProviderHandle = Arc::new(
-                        runtime_llm::TracingChatProvider::new(
-                            dialog_fallback_provider,
-                            llm_trace_buffer.clone(),
-                        )
-                        .with_event_recorder(llm_event_recorder.clone()),
-                    );
+                    let dialog_fallback_provider: openplotva_llm::ChatProviderHandle =
+                        dialog_fallback_provider;
                     let fallback_high = config
                         .persistent_queue
                         .dialog_aifarm_fallback_high_watermark;
