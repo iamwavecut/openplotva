@@ -2974,20 +2974,32 @@ impl AifarmDialogRunState {
     }
 }
 
-fn aifarm_dialog_trace_artifacts(
+/// Static routing tags for a low-level aifarm call trace.
+#[derive(Clone, Copy)]
+pub(crate) struct TraceTags<'a> {
+    pub provider: &'a str,
+    pub source: &'a str,
+    pub flow: &'a str,
+    pub mode: &'a str,
+    pub request_kind: &'a str,
+    pub iteration: usize,
+}
+
+/// Build a trace artifact for any aifarm completion (dialog or auxiliary). `docs_chars`
+/// is passed explicitly (0 for non-dialog flows).
+pub(crate) fn aifarm_call_trace_artifacts(
     request: &ChatCompletionRequest,
     result: &CompletionResult,
-    input: &DialogInput,
-    provider: &str,
-    iteration: usize,
+    docs_chars: i32,
+    tags: TraceTags<'_>,
 ) -> DialogTraceArtifacts {
     DialogTraceArtifacts {
-        provider: provider.trim().to_owned(),
-        request_kind: "openai.chat.completions".to_owned(),
-        source: provider.trim().to_owned(),
-        mode: "tools".to_owned(),
-        flow: "dialog".to_owned(),
-        iteration: i32::try_from(iteration).unwrap_or(i32::MAX),
+        provider: tags.provider.trim().to_owned(),
+        request_kind: tags.request_kind.to_owned(),
+        source: tags.source.trim().to_owned(),
+        mode: tags.mode.to_owned(),
+        flow: tags.flow.to_owned(),
+        iteration: i32::try_from(tags.iteration).unwrap_or(i32::MAX),
         model: request.model.trim().to_owned(),
         raw_request: serde_json::to_value(request).ok(),
         raw_response: aifarm_trace_raw_response(result),
@@ -2997,13 +3009,68 @@ fn aifarm_dialog_trace_artifacts(
         timings: result.response.as_ref().and_then(aifarm_trace_timings),
         prompt_chars: json_size(&request.messages),
         prompt_messages: i32::try_from(request.messages.len()).unwrap_or(i32::MAX),
-        docs_chars: input
-            .reference_context
-            .iter()
-            .map(String::len)
-            .sum::<usize>()
-            .min(i32::MAX as usize) as i32,
+        docs_chars,
         ..DialogTraceArtifacts::default()
+    }
+}
+
+fn aifarm_dialog_trace_artifacts(
+    request: &ChatCompletionRequest,
+    result: &CompletionResult,
+    input: &DialogInput,
+    provider: &str,
+    iteration: usize,
+) -> DialogTraceArtifacts {
+    let docs_chars = input
+        .reference_context
+        .iter()
+        .map(String::len)
+        .sum::<usize>()
+        .min(i32::MAX as usize) as i32;
+    aifarm_call_trace_artifacts(
+        request,
+        result,
+        docs_chars,
+        TraceTags {
+            provider,
+            source: provider,
+            flow: "dialog",
+            mode: "tools",
+            request_kind: "openai.chat.completions",
+            iteration,
+        },
+    )
+}
+
+#[cfg(test)]
+mod call_trace_artifact_tests {
+    use super::{ChatCompletionRequest, CompletionResult, TraceTags, aifarm_call_trace_artifacts};
+
+    #[test]
+    fn aifarm_call_trace_artifacts_tags_flow_and_model() {
+        let request = ChatCompletionRequest {
+            model: "vram.cloud/qwen3.6-27b".to_owned(),
+            ..ChatCompletionRequest::default()
+        };
+        let result = CompletionResult::default();
+        let artifact = aifarm_call_trace_artifacts(
+            &request,
+            &result,
+            0,
+            TraceTags {
+                provider: "aifarm",
+                source: "aifarm_memory_extractor",
+                flow: "memory_extraction",
+                mode: "json",
+                request_kind: "openai.chat.completions",
+                iteration: 1,
+            },
+        );
+        assert_eq!(artifact.flow, "memory_extraction");
+        assert_eq!(artifact.source, "aifarm_memory_extractor");
+        assert_eq!(artifact.model, "vram.cloud/qwen3.6-27b");
+        assert_eq!(artifact.request_kind, "openai.chat.completions");
+        assert_eq!(artifact.provider, "aifarm");
     }
 }
 
