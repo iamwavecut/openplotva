@@ -13,9 +13,18 @@ use std::{
 use time::OffsetDateTime;
 
 pub const GO_RATE_LIMIT_CACHE_TTL: time::Duration = time::Duration::minutes(30);
+pub const TASK_ENQUEUE_WINDOW: Duration = Duration::from_secs(60);
+pub const TASK_ENQUEUE_TTL: Duration = Duration::from_secs(10 * 60);
+pub const TASK_ENQUEUE_USER_CHAT_LIMIT: usize = 30;
+pub const TASK_ENQUEUE_CHAT_LIMIT: usize = 300;
+pub const TASK_ENQUEUE_GLOBAL_LIMIT: usize = 3_000;
 
 /// Boxed future returned by rate-limit persistence stores.
 pub type RateLimitStoreFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+pub type TaskEnqueueRateLimitFuture<'a> =
+    Pin<Box<dyn Future<Output = TaskEnqueueRateLimitReport> + Send + 'a>>;
+pub type TaskEnqueueRateLimitGrowFuture<'a> =
+    Pin<Box<dyn Future<Output = TaskEnqueueRateLimitGrowReport> + Send + 'a>>;
 
 /// Persistent store boundary for chat rate-limit expiries.
 pub trait RateLimitStore {
@@ -37,6 +46,45 @@ pub trait RateLimitStore {
     ) -> RateLimitStoreFuture<'a, Result<(), Self::Error>>;
 }
 
+pub trait TaskEnqueueRateLimitStore {
+    type Error: fmt::Display + Send + Sync + 'static;
+
+    /// Prune entries older than `cutoff_unix_ms` and return the current window count.
+    fn count_task_enqueue<'a>(
+        &'a self,
+        key: &'a str,
+        cutoff_unix_ms: i64,
+    ) -> RateLimitStoreFuture<'a, Result<usize, Self::Error>>;
+
+    /// Atomically add one entry (`member`, scored at `score_unix_ms`), prune entries
+    /// older than `cutoff_unix_ms`, refresh the TTL, and return the resulting count.
+    /// A sorted-set ADD is atomic, so concurrent enqueues never lose increments.
+    fn record_task_enqueue<'a>(
+        &'a self,
+        key: &'a str,
+        score_unix_ms: i64,
+        member: &'a str,
+        cutoff_unix_ms: i64,
+        ttl: Duration,
+    ) -> RateLimitStoreFuture<'a, Result<usize, Self::Error>>;
+}
+
+pub trait TaskEnqueueRateLimit: Send + Sync {
+    fn check_task_enqueue_rate_limit<'a>(
+        &'a self,
+        chat_id: i64,
+        user_id: i64,
+        now: OffsetDateTime,
+    ) -> TaskEnqueueRateLimitFuture<'a>;
+
+    fn grow_task_enqueue_rate_limit<'a>(
+        &'a self,
+        chat_id: i64,
+        user_id: i64,
+        now: OffsetDateTime,
+    ) -> TaskEnqueueRateLimitGrowFuture<'a>;
+}
+
 impl RateLimitStore for openplotva_storage::RedisRateLimitStore {
     type Error = openplotva_storage::StorageError;
 
@@ -54,6 +102,32 @@ impl RateLimitStore for openplotva_storage::RedisRateLimitStore {
         ttl: Duration,
     ) -> RateLimitStoreFuture<'a, Result<(), Self::Error>> {
         Box::pin(async move { self.set_chat_rate_limit(chat_id, expiry, ttl).await })
+    }
+}
+
+impl TaskEnqueueRateLimitStore for openplotva_storage::RedisTaskEnqueueRateLimitStore {
+    type Error = openplotva_storage::StorageError;
+
+    fn count_task_enqueue<'a>(
+        &'a self,
+        key: &'a str,
+        cutoff_unix_ms: i64,
+    ) -> RateLimitStoreFuture<'a, Result<usize, Self::Error>> {
+        Box::pin(async move { self.count_task_enqueue(key, cutoff_unix_ms).await })
+    }
+
+    fn record_task_enqueue<'a>(
+        &'a self,
+        key: &'a str,
+        score_unix_ms: i64,
+        member: &'a str,
+        cutoff_unix_ms: i64,
+        ttl: Duration,
+    ) -> RateLimitStoreFuture<'a, Result<usize, Self::Error>> {
+        Box::pin(async move {
+            self.record_task_enqueue(key, score_unix_ms, member, cutoff_unix_ms, ttl)
+                .await
+        })
     }
 }
 
@@ -85,6 +159,134 @@ pub struct RateLimitSetReport {
     pub expiry: OffsetDateTime,
     /// Persistent save error ignored after updating the in-memory policy cache.
     pub save_error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TaskEnqueueRateLimitScope {
+    UserChat,
+    Chat,
+    Global,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TaskEnqueueRateLimitReport {
+    pub limited: bool,
+    pub scope: Option<TaskEnqueueRateLimitScope>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TaskEnqueueRateLimitGrowReport {
+    pub save_errors: Vec<String>,
+}
+
+#[derive(Debug)]
+pub struct TaskEnqueueRateLimitPolicy<S> {
+    store: S,
+    // Random per-instance prefix so sorted-set members stay unique even if several
+    // processes ever share one Redis (HA / rolling deploy); within one process the
+    // monotonic seq alone is enough.
+    instance: u64,
+    member_seq: AtomicU64,
+}
+
+impl<S> TaskEnqueueRateLimitPolicy<S> {
+    pub fn new(store: S) -> Self {
+        Self {
+            store,
+            instance: rand::random(),
+            member_seq: AtomicU64::new(0),
+        }
+    }
+}
+
+impl<S> TaskEnqueueRateLimitPolicy<S>
+where
+    S: TaskEnqueueRateLimitStore + Send + Sync,
+{
+    pub async fn check_task_enqueue_rate_limit(
+        &self,
+        chat_id: i64,
+        user_id: i64,
+        now: OffsetDateTime,
+    ) -> TaskEnqueueRateLimitReport {
+        let cutoff = task_enqueue_cutoff_unix_ms(now);
+        let mut last_error = None;
+        for (scope, key, limit) in task_enqueue_rate_limit_keys(chat_id, user_id) {
+            match self.store.count_task_enqueue(&key, cutoff).await {
+                Ok(count) if count >= limit => {
+                    return TaskEnqueueRateLimitReport {
+                        limited: true,
+                        scope: Some(scope),
+                        error: last_error,
+                    };
+                }
+                Ok(_) => {}
+                // Fail open: a store outage must not drop legitimate enqueues.
+                Err(error) => last_error = Some(error.to_string()),
+            }
+        }
+        TaskEnqueueRateLimitReport {
+            limited: false,
+            scope: None,
+            error: last_error,
+        }
+    }
+
+    pub async fn grow_task_enqueue_rate_limit(
+        &self,
+        chat_id: i64,
+        user_id: i64,
+        now: OffsetDateTime,
+    ) -> TaskEnqueueRateLimitGrowReport {
+        let cutoff = task_enqueue_cutoff_unix_ms(now);
+        let score = unix_millis(now);
+        let mut save_errors = Vec::new();
+        for (_, key, _) in task_enqueue_rate_limit_keys(chat_id, user_id) {
+            let member = format!(
+                "{score}-{:x}-{}",
+                self.instance,
+                self.member_seq.fetch_add(1, Ordering::Relaxed)
+            );
+            if let Err(error) = self
+                .store
+                .record_task_enqueue(&key, score, &member, cutoff, TASK_ENQUEUE_TTL)
+                .await
+            {
+                save_errors.push(error.to_string());
+            }
+        }
+        TaskEnqueueRateLimitGrowReport { save_errors }
+    }
+}
+
+impl<S> TaskEnqueueRateLimit for TaskEnqueueRateLimitPolicy<S>
+where
+    S: TaskEnqueueRateLimitStore + Send + Sync,
+{
+    fn check_task_enqueue_rate_limit<'a>(
+        &'a self,
+        chat_id: i64,
+        user_id: i64,
+        now: OffsetDateTime,
+    ) -> TaskEnqueueRateLimitFuture<'a> {
+        Box::pin(async move {
+            TaskEnqueueRateLimitPolicy::check_task_enqueue_rate_limit(self, chat_id, user_id, now)
+                .await
+        })
+    }
+
+    fn grow_task_enqueue_rate_limit<'a>(
+        &'a self,
+        chat_id: i64,
+        user_id: i64,
+        now: OffsetDateTime,
+    ) -> TaskEnqueueRateLimitGrowFuture<'a> {
+        Box::pin(async move {
+            TaskEnqueueRateLimitPolicy::grow_task_enqueue_rate_limit(self, chat_id, user_id, now)
+                .await
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -219,6 +421,37 @@ where
     }
 }
 
+fn task_enqueue_rate_limit_keys(
+    chat_id: i64,
+    user_id: i64,
+) -> [(TaskEnqueueRateLimitScope, String, usize); 3] {
+    [
+        (
+            TaskEnqueueRateLimitScope::UserChat,
+            format!("user_chat:{chat_id}:{user_id}"),
+            TASK_ENQUEUE_USER_CHAT_LIMIT,
+        ),
+        (
+            TaskEnqueueRateLimitScope::Chat,
+            format!("chat:{chat_id}"),
+            TASK_ENQUEUE_CHAT_LIMIT,
+        ),
+        (
+            TaskEnqueueRateLimitScope::Global,
+            "global".to_owned(),
+            TASK_ENQUEUE_GLOBAL_LIMIT,
+        ),
+    ]
+}
+
+fn unix_millis(now: OffsetDateTime) -> i64 {
+    (now.unix_timestamp_nanos() / 1_000_000) as i64
+}
+
+fn task_enqueue_cutoff_unix_ms(now: OffsetDateTime) -> i64 {
+    unix_millis(now) - TASK_ENQUEUE_WINDOW.as_millis() as i64
+}
+
 fn time_duration(duration: Duration) -> time::Duration {
     time::Duration::try_from(duration).unwrap_or(time::Duration::MAX)
 }
@@ -237,6 +470,7 @@ pub fn telegram_retry_after_from_execute_error(
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::HashMap,
         error::Error,
         fmt,
         sync::{Arc, Mutex},
@@ -247,6 +481,8 @@ mod tests {
 
     use super::{
         ChatRateLimitPolicy, RateLimitCheckSource, RateLimitStore, RateLimitStoreFuture,
+        TASK_ENQUEUE_CHAT_LIMIT, TASK_ENQUEUE_GLOBAL_LIMIT, TASK_ENQUEUE_USER_CHAT_LIMIT,
+        TaskEnqueueRateLimitPolicy, TaskEnqueueRateLimitScope, TaskEnqueueRateLimitStore,
         telegram_retry_after_from_execute_error,
     };
 
@@ -365,6 +601,92 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn task_enqueue_policy_blocks_after_user_chat_limit_and_grows_after_success()
+    -> Result<(), Box<dyn Error>> {
+        let now = OffsetDateTime::from_unix_timestamp(1_710_000_000)?;
+        let store = TaskEnqueueRateLimitStoreStub::default();
+        let policy = TaskEnqueueRateLimitPolicy::new(store.clone());
+
+        for _ in 0..TASK_ENQUEUE_USER_CHAT_LIMIT {
+            let report = policy.check_task_enqueue_rate_limit(100, 7, now).await;
+            assert!(!report.limited);
+            policy.grow_task_enqueue_rate_limit(100, 7, now).await;
+        }
+
+        let limited = policy.check_task_enqueue_rate_limit(100, 7, now).await;
+
+        assert!(limited.limited);
+        assert_eq!(limited.scope, Some(TaskEnqueueRateLimitScope::UserChat));
+        assert_eq!(store.saved_count(), TASK_ENQUEUE_USER_CHAT_LIMIT * 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn task_enqueue_policy_uses_updated_chat_and_global_defaults()
+    -> Result<(), Box<dyn Error>> {
+        let now = OffsetDateTime::from_unix_timestamp(1_710_000_000)?;
+        let chat_policy = TaskEnqueueRateLimitPolicy::new(TaskEnqueueRateLimitStoreStub::default());
+        for user_id in 1..=TASK_ENQUEUE_CHAT_LIMIT {
+            assert!(
+                !chat_policy
+                    .check_task_enqueue_rate_limit(200, user_id as i64, now)
+                    .await
+                    .limited
+            );
+            chat_policy
+                .grow_task_enqueue_rate_limit(200, user_id as i64, now)
+                .await;
+        }
+        let chat_limited = chat_policy
+            .check_task_enqueue_rate_limit(200, 10_000, now)
+            .await;
+        assert!(chat_limited.limited);
+        assert_eq!(chat_limited.scope, Some(TaskEnqueueRateLimitScope::Chat));
+
+        let global_policy =
+            TaskEnqueueRateLimitPolicy::new(TaskEnqueueRateLimitStoreStub::default());
+        for index in 1..=TASK_ENQUEUE_GLOBAL_LIMIT {
+            assert!(
+                !global_policy
+                    .check_task_enqueue_rate_limit(index as i64, index as i64, now)
+                    .await
+                    .limited
+            );
+            global_policy
+                .grow_task_enqueue_rate_limit(index as i64, index as i64, now)
+                .await;
+        }
+        let global_limited = global_policy
+            .check_task_enqueue_rate_limit(10_000, 10_000, now)
+            .await;
+        assert!(global_limited.limited);
+        assert_eq!(
+            global_limited.scope,
+            Some(TaskEnqueueRateLimitScope::Global)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn task_enqueue_policy_fails_open_when_store_errors() -> Result<(), Box<dyn Error>> {
+        let now = OffsetDateTime::from_unix_timestamp(1_710_000_000)?;
+        let store = TaskEnqueueRateLimitStoreStub::default();
+        store.set_save_error(Some("redis down"));
+        let policy = TaskEnqueueRateLimitPolicy::new(store);
+
+        for _ in 0..TASK_ENQUEUE_USER_CHAT_LIMIT {
+            policy.grow_task_enqueue_rate_limit(100, 7, now).await;
+        }
+
+        // A store outage must not drop legitimate enqueues: fail open, surfacing the error.
+        let report = policy.check_task_enqueue_rate_limit(100, 7, now).await;
+
+        assert!(!report.limited);
+        assert!(report.error.is_some());
+        Ok(())
+    }
+
     fn response_error(json: &str) -> Result<carapax::api::ExecuteError, Box<dyn Error>> {
         let response: carapax::types::Response<serde_json::Value> = serde_json::from_str(json)?;
         match response.into_result() {
@@ -464,6 +786,76 @@ mod tests {
                     return Err(RateLimitStoreStubError(error));
                 }
                 Ok(())
+            })
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct TaskEnqueueRateLimitStoreStub {
+        state: Arc<Mutex<TaskEnqueueRateLimitStoreState>>,
+    }
+
+    #[derive(Default)]
+    struct TaskEnqueueRateLimitStoreState {
+        entries: HashMap<String, Vec<(i64, String)>>,
+        save_error: Option<&'static str>,
+        saved_count: usize,
+    }
+
+    impl TaskEnqueueRateLimitStoreStub {
+        fn set_save_error(&self, error: Option<&'static str>) {
+            self.state().save_error = error;
+        }
+
+        fn saved_count(&self) -> usize {
+            self.state().saved_count
+        }
+
+        fn state(&self) -> std::sync::MutexGuard<'_, TaskEnqueueRateLimitStoreState> {
+            match self.state.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            }
+        }
+    }
+
+    impl TaskEnqueueRateLimitStore for TaskEnqueueRateLimitStoreStub {
+        type Error = RateLimitStoreStubError;
+
+        fn count_task_enqueue<'a>(
+            &'a self,
+            key: &'a str,
+            cutoff_unix_ms: i64,
+        ) -> RateLimitStoreFuture<'a, Result<usize, Self::Error>> {
+            Box::pin(async move {
+                let mut state = self.state();
+                if let Some(error) = state.save_error {
+                    return Err(RateLimitStoreStubError(error));
+                }
+                let entries = state.entries.entry(key.to_owned()).or_default();
+                entries.retain(|(score, _)| *score >= cutoff_unix_ms);
+                Ok(entries.len())
+            })
+        }
+
+        fn record_task_enqueue<'a>(
+            &'a self,
+            key: &'a str,
+            score_unix_ms: i64,
+            member: &'a str,
+            cutoff_unix_ms: i64,
+            _ttl: Duration,
+        ) -> RateLimitStoreFuture<'a, Result<usize, Self::Error>> {
+            Box::pin(async move {
+                let mut state = self.state();
+                state.saved_count += 1;
+                if let Some(error) = state.save_error {
+                    return Err(RateLimitStoreStubError(error));
+                }
+                let entries = state.entries.entry(key.to_owned()).or_default();
+                entries.push((score_unix_ms, member.to_owned()));
+                entries.retain(|(score, _)| *score >= cutoff_unix_ms);
+                Ok(entries.len())
             })
         }
     }

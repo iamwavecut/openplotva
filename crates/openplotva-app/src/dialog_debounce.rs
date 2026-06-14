@@ -1,6 +1,8 @@
 use std::{
     collections::HashMap,
     fmt,
+    future::Future,
+    pin::Pin,
     sync::{
         Arc, Mutex, MutexGuard,
         atomic::{AtomicU64, Ordering},
@@ -14,6 +16,16 @@ use tokio::task::JoinHandle;
 use crate::edited::EditedDialogJobUpdate;
 
 pub const GO_DIALOG_DEBOUNCE_INTERVAL: Duration = Duration::from_secs(5);
+pub type DialogDebounceAssignObserverFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+
+pub trait DialogDebounceAssignObserver: Send + Sync {
+    fn assigned<'a>(
+        &'a self,
+        key: DialogDebounceKey,
+        queue_name: &'a str,
+        task_id: i64,
+    ) -> DialogDebounceAssignObserverFuture<'a>;
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct DialogDebounceKey {
@@ -131,6 +143,20 @@ impl InMemoryDialogDebounce {
         queue: InMemoryTaskQueue,
         delay: Duration,
     ) -> DialogDebounceScheduleReport {
+        self.schedule_with_assign_observer(key, message_id, queue_name, job, queue, delay, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn schedule_with_assign_observer(
+        self: &Arc<Self>,
+        key: DialogDebounceKey,
+        message_id: i32,
+        queue_name: impl Into<String>,
+        job: StatelessJobItem,
+        queue: InMemoryTaskQueue,
+        delay: Duration,
+        assign_observer: Option<Arc<dyn DialogDebounceAssignObserver>>,
+    ) -> DialogDebounceScheduleReport {
         let delay = Self::delay_or_default(delay);
         let queue_name = queue_name.into();
         let replaced = self.register(key, message_id, queue_name, job);
@@ -147,6 +173,11 @@ impl InMemoryDialogDebounce {
                     task_id = report.task_id,
                     "assigned dialog job after debounce"
                 );
+                if let Some(assign_observer) = assign_observer.as_deref() {
+                    assign_observer
+                        .assigned(key, &report.queue_name, report.task_id)
+                        .await;
+                }
             }
         });
 

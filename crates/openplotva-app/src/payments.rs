@@ -1,15 +1,14 @@
 use std::{
     collections::HashMap,
-    fmt, fs,
+    fmt,
     future::Future,
-    io::{self, Write},
-    path::{Path, PathBuf},
     pin::Pin,
     sync::{Arc, Mutex},
     time::Duration,
 };
 
 use crate::{
+    rate_limits::TaskEnqueueRateLimit,
     updates::{UpdateHandler, UpdateHandlerFuture},
     virtual_messages::{
         QueueTextRequest, VirtualIdFactory, VirtualMessageStore, monotonic_virtual_id_factory,
@@ -35,9 +34,8 @@ use openplotva_storage::{
 };
 use openplotva_taskman::{
     CONTROL_QUEUE_NAME, ControlJobData, ControlJobParams, ControlKind, ControlPayment,
-    HIGH_PRIORITY, InMemoryTaskQueue, JobStatus, JobType, StatelessJobItem,
-    TASK_QUEUE_SNAPSHOT_FORMAT, TaskQueueIdAllocator, TaskQueueRecord, TaskQueueSnapshot,
-    control_job_params_from_stateless_job, new_control_job_at,
+    HIGH_PRIORITY, InMemoryTaskQueue, JobStatus, JobType, StatelessJobItem, TaskQueueIdAllocator,
+    TaskQueueRecord, control_job_params_from_stateless_job, new_control_job_at,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -1186,10 +1184,6 @@ pub struct InMemoryPaymentControlJobQueue {
     completed_reports: Arc<Mutex<HashMap<i64, PaymentControlJobReport>>>,
 }
 
-/// Version marker for the approved Rust-native payment control-job snapshot codec.
-pub const PAYMENT_CONTROL_JOB_QUEUE_SNAPSHOT_FORMAT: &str =
-    "openplotva.payment-control-job-queue.v1+json";
-
 /// In-memory taskman status used by the current payment queue adapter.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum InMemoryPaymentControlJobStatus {
@@ -1218,17 +1212,6 @@ pub struct InMemoryPaymentControlJobRecord {
     pub error: Option<String>,
 }
 
-/// Versioned Rust-native snapshot of the in-memory payment control-job queue.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct InMemoryPaymentControlJobQueueSnapshot {
-    /// Snapshot codec marker.
-    pub format: String,
-    /// Next taskman job ID to assign after restore.
-    pub next_id: i64,
-    /// ID-ordered queue records.
-    pub records: Vec<InMemoryPaymentControlJobRecord>,
-}
-
 /// Error returned by the in-memory payment taskman adapter.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum InMemoryPaymentControlJobQueueError {
@@ -1239,21 +1222,6 @@ pub enum InMemoryPaymentControlJobQueueError {
     #[error("payment control job queue: {0}")]
     Taskman(String),
 }
-
-/// Error returned while decoding the Rust-native payment control-job snapshot.
-#[derive(Debug, Error)]
-pub enum PaymentControlJobQueueSnapshotError {
-    /// JSON decoding failed.
-    #[error("decode payment control-job queue snapshot: {0}")]
-    Json(#[from] serde_json::Error),
-    /// Snapshot uses another codec family.
-    #[error("unsupported payment control-job queue snapshot format: {0}")]
-    UnsupportedFormat(String),
-}
-
-pub const DEFAULT_PAYMENT_CONTROL_JOB_SNAPSHOT_FILE: &str = "openplotva-payment-control-jobs.snap";
-
-const PAYMENT_CONTROL_JOB_WAL_ARCHIVE_KEEP: usize = 3;
 
 impl InMemoryPaymentControlJobQueue {
     /// Build an empty in-memory payment control-job queue.
@@ -1270,6 +1238,14 @@ impl InMemoryPaymentControlJobQueue {
     pub fn new_with_id_allocator(ids: TaskQueueIdAllocator) -> Self {
         Self {
             queue: InMemoryTaskQueue::new_with_id_allocator(ids),
+            completed_reports: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    #[must_use]
+    pub fn from_task_queue(queue: InMemoryTaskQueue) -> Self {
+        Self {
+            queue,
             completed_reports: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -1323,47 +1299,6 @@ impl InMemoryPaymentControlJobQueue {
             .map_err(in_memory_payment_queue_error)
     }
 
-    /// Return a versioned Rust-native snapshot for durable queue persistence.
-    #[must_use]
-    pub fn persistence_snapshot(&self) -> InMemoryPaymentControlJobQueueSnapshot {
-        let snapshot = self.queue.snapshot();
-        let completed_reports = self.completed_reports();
-        InMemoryPaymentControlJobQueueSnapshot {
-            format: PAYMENT_CONTROL_JOB_QUEUE_SNAPSHOT_FORMAT.to_owned(),
-            next_id: snapshot.next_id,
-            records: payment_records_from_taskman(&snapshot.records, &completed_reports),
-        }
-    }
-
-    /// Restore an in-memory queue from a decoded Rust-native persistence snapshot.
-    #[must_use]
-    pub fn from_persistence_snapshot(snapshot: InMemoryPaymentControlJobQueueSnapshot) -> Self {
-        Self::from_persistence_snapshot_inner(snapshot, None)
-    }
-
-    /// Restore an in-memory queue using the shared runtime taskman ID allocator.
-    #[must_use]
-    pub fn from_persistence_snapshot_with_id_allocator(
-        snapshot: InMemoryPaymentControlJobQueueSnapshot,
-        ids: TaskQueueIdAllocator,
-    ) -> Self {
-        Self::from_persistence_snapshot_inner(snapshot, Some(ids))
-    }
-
-    fn from_persistence_snapshot_inner(
-        snapshot: InMemoryPaymentControlJobQueueSnapshot,
-        ids: Option<TaskQueueIdAllocator>,
-    ) -> Self {
-        let (snapshot, completed_reports) = payment_snapshot_into_taskman(snapshot);
-        Self {
-            queue: match ids {
-                Some(ids) => InMemoryTaskQueue::from_snapshot_with_id_allocator(snapshot, ids),
-                None => InMemoryTaskQueue::from_snapshot(snapshot),
-            },
-            completed_reports: Arc::new(Mutex::new(completed_reports)),
-        }
-    }
-
     fn completed_reports(
         &self,
     ) -> std::sync::MutexGuard<'_, HashMap<i64, PaymentControlJobReport>> {
@@ -1373,523 +1308,58 @@ impl InMemoryPaymentControlJobQueue {
     }
 }
 
-/// Encode a payment control-job queue snapshot as Rust-native JSON bytes.
-pub fn encode_payment_control_job_queue_snapshot(
-    snapshot: &InMemoryPaymentControlJobQueueSnapshot,
-) -> Result<Vec<u8>, serde_json::Error> {
-    serde_json::to_vec(snapshot)
-}
-
-/// Decode a payment control-job queue snapshot from Rust-native JSON bytes.
-pub fn decode_payment_control_job_queue_snapshot(
-    bytes: &[u8],
-) -> Result<InMemoryPaymentControlJobQueueSnapshot, PaymentControlJobQueueSnapshotError> {
-    let snapshot: InMemoryPaymentControlJobQueueSnapshot = serde_json::from_slice(bytes)?;
-    if snapshot.format != PAYMENT_CONTROL_JOB_QUEUE_SNAPSHOT_FORMAT {
-        return Err(PaymentControlJobQueueSnapshotError::UnsupportedFormat(
-            snapshot.format,
-        ));
-    }
-    Ok(snapshot)
-}
-
-/// Default Rust-native snapshot path for the payment control-job queue.
-#[must_use]
-pub fn default_payment_control_job_snapshot_path() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".plotva")
-        .join(DEFAULT_PAYMENT_CONTROL_JOB_SNAPSHOT_FILE)
-}
-
-/// File-backed store for Rust-native payment control-job queue snapshots.
-#[derive(Clone, Debug)]
-pub struct PaymentControlJobSnapshotFileStore {
-    path: PathBuf,
-    wal_path: PathBuf,
-    lock: Arc<Mutex<()>>,
-}
-
-/// Error returned by the payment control-job snapshot file store.
-#[derive(Debug, Error)]
-pub enum PaymentControlJobSnapshotFileStoreError {
-    /// Reading the snapshot file failed.
-    #[error("read payment control-job queue snapshot {path}: {source}")]
-    Read {
-        /// Snapshot file path.
-        path: PathBuf,
-        /// Underlying filesystem error.
-        #[source]
-        source: io::Error,
-    },
-    /// Decoding a read snapshot failed.
-    #[error("decode payment control-job queue snapshot {path}: {source}")]
-    Decode {
-        /// Snapshot file path.
-        path: PathBuf,
-        /// Underlying snapshot decode error.
-        #[source]
-        source: PaymentControlJobQueueSnapshotError,
-    },
-    /// Creating the snapshot directory failed.
-    #[error("create payment control-job queue snapshot directory {path}: {source}")]
-    CreateDir {
-        /// Snapshot directory path.
-        path: PathBuf,
-        /// Underlying filesystem error.
-        #[source]
-        source: io::Error,
-    },
-    /// Encoding the snapshot failed.
-    #[error("encode payment control-job queue snapshot {path}: {source}")]
-    Encode {
-        /// Snapshot file path.
-        path: PathBuf,
-        /// Underlying JSON error.
-        #[source]
-        source: serde_json::Error,
-    },
-    /// Writing the temporary snapshot file failed.
-    #[error("write payment control-job queue snapshot {path}: {source}")]
-    Write {
-        /// Temporary snapshot file path.
-        path: PathBuf,
-        /// Underlying filesystem error.
-        #[source]
-        source: io::Error,
-    },
-    /// Syncing the temporary snapshot file failed.
-    #[error("sync payment control-job queue snapshot {path}: {source}")]
-    Sync {
-        /// Temporary snapshot file path.
-        path: PathBuf,
-        /// Underlying filesystem error.
-        #[source]
-        source: io::Error,
-    },
-    /// Installing the temporary snapshot file failed.
-    #[error("install payment control-job queue snapshot {from} -> {to}: {source}")]
-    Rename {
-        /// Temporary snapshot path.
-        from: PathBuf,
-        /// Final snapshot path.
-        to: PathBuf,
-        /// Underlying filesystem error.
-        #[source]
-        source: io::Error,
-    },
-    /// Reading the snapshot WAL failed.
-    #[error("read payment control-job queue WAL {path}: {source}")]
-    WalRead {
-        /// WAL file path.
-        path: PathBuf,
-        /// Underlying filesystem error.
-        #[source]
-        source: io::Error,
-    },
-    /// Decoding a WAL line failed.
-    #[error("decode payment control-job queue WAL {path}: {source}")]
-    WalDecode {
-        /// WAL file path.
-        path: PathBuf,
-        /// Underlying snapshot decode error.
-        #[source]
-        source: PaymentControlJobQueueSnapshotError,
-    },
-    /// Opening the snapshot WAL failed.
-    #[error("open payment control-job queue WAL {path}: {source}")]
-    WalOpen {
-        /// WAL file path.
-        path: PathBuf,
-        /// Underlying filesystem error.
-        #[source]
-        source: io::Error,
-    },
-    /// Writing the snapshot WAL failed.
-    #[error("write payment control-job queue WAL {path}: {source}")]
-    WalWrite {
-        /// WAL file path.
-        path: PathBuf,
-        /// Underlying filesystem error.
-        #[source]
-        source: io::Error,
-    },
-    /// Syncing the snapshot WAL failed.
-    #[error("sync payment control-job queue WAL {path}: {source}")]
-    WalSync {
-        /// WAL file path.
-        path: PathBuf,
-        /// Underlying filesystem error.
-        #[source]
-        source: io::Error,
-    },
-    /// Rotating the compacted WAL failed.
-    #[error("rotate payment control-job queue WAL {from} -> {to}: {source}")]
-    WalRename {
-        /// Active WAL path.
-        from: PathBuf,
-        /// Archive WAL path.
-        to: PathBuf,
-        /// Underlying filesystem error.
-        #[source]
-        source: io::Error,
-    },
-    /// Pruning compacted WAL archives failed.
-    #[error("prune payment control-job queue WAL archives near {path}: {source}")]
-    WalArchive {
-        /// Active WAL path whose archives were being pruned.
-        path: PathBuf,
-        /// Underlying filesystem error.
-        #[source]
-        source: io::Error,
-    },
-}
-
-impl PaymentControlJobSnapshotFileStore {
-    /// Build a snapshot store for a concrete file path.
-    #[must_use]
-    pub fn new(path: impl Into<PathBuf>) -> Self {
-        let path = path.into();
-        let wal_path = payment_control_job_wal_path(&path);
-        Self {
-            path,
-            wal_path,
-            lock: Arc::new(Mutex::new(())),
-        }
-    }
-
-    /// Return the configured snapshot file path.
-    #[must_use]
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    /// Return the configured snapshot WAL path.
-    #[must_use]
-    pub fn wal_path(&self) -> &Path {
-        &self.wal_path
-    }
-
-    /// Load the Rust-native snapshot from disk, returning `None` when it does not exist yet.
-    pub fn load_snapshot(
-        &self,
-    ) -> Result<
-        Option<InMemoryPaymentControlJobQueueSnapshot>,
-        PaymentControlJobSnapshotFileStoreError,
-    > {
-        let _guard = self.file_lock();
-        let snapshot = match fs::read(&self.path) {
-            Ok(bytes) => decode_payment_control_job_queue_snapshot(&bytes)
-                .map(Some)
-                .map_err(|source| PaymentControlJobSnapshotFileStoreError::Decode {
-                    path: self.path.clone(),
-                    source,
-                })?,
-            Err(source) if source.kind() == io::ErrorKind::NotFound => None,
-            Err(source) => {
-                return Err(PaymentControlJobSnapshotFileStoreError::Read {
-                    path: self.path.clone(),
-                    source,
-                });
-            }
-        };
-
-        Ok(self.load_wal_snapshot()?.or(snapshot))
-    }
-
-    /// Save the Rust-native snapshot through WAL replay first, then an atomic sibling file.
-    pub fn save_snapshot(
-        &self,
-        snapshot: &InMemoryPaymentControlJobQueueSnapshot,
-    ) -> Result<(), PaymentControlJobSnapshotFileStoreError> {
-        let _guard = self.file_lock();
-        self.save_snapshot_locked(snapshot)
-    }
-
-    fn file_lock(&self) -> std::sync::MutexGuard<'_, ()> {
-        self.lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    fn save_snapshot_locked(
-        &self,
-        snapshot: &InMemoryPaymentControlJobQueueSnapshot,
-    ) -> Result<(), PaymentControlJobSnapshotFileStoreError> {
-        let bytes = encode_payment_control_job_queue_snapshot(snapshot).map_err(|source| {
-            PaymentControlJobSnapshotFileStoreError::Encode {
-                path: self.path.clone(),
-                source,
-            }
-        })?;
-        self.append_wal_snapshot_locked(snapshot)?;
-        if let Some(parent) = self
-            .path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            fs::create_dir_all(parent).map_err(|source| {
-                PaymentControlJobSnapshotFileStoreError::CreateDir {
-                    path: parent.to_path_buf(),
-                    source,
-                }
-            })?;
-        }
-
-        let tmp_path = payment_control_job_snapshot_tmp_path(&self.path);
-        let mut file = fs::File::create(&tmp_path).map_err(|source| {
-            PaymentControlJobSnapshotFileStoreError::Write {
-                path: tmp_path.clone(),
-                source,
-            }
-        })?;
-        file.write_all(&bytes).map_err(|source| {
-            PaymentControlJobSnapshotFileStoreError::Write {
-                path: tmp_path.clone(),
-                source,
-            }
-        })?;
-        file.sync_all()
-            .map_err(|source| PaymentControlJobSnapshotFileStoreError::Sync {
-                path: tmp_path.clone(),
-                source,
-            })?;
-        drop(file);
-
-        fs::rename(&tmp_path, &self.path).map_err(|source| {
-            PaymentControlJobSnapshotFileStoreError::Rename {
-                from: tmp_path,
-                to: self.path.clone(),
-                source,
-            }
-        })?;
-        self.rotate_wal_after_snapshot_locked()
-    }
-
-    fn load_wal_snapshot(
-        &self,
-    ) -> Result<
-        Option<InMemoryPaymentControlJobQueueSnapshot>,
-        PaymentControlJobSnapshotFileStoreError,
-    > {
-        let bytes = match fs::read(&self.wal_path) {
-            Ok(bytes) => bytes,
-            Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(source) => {
-                return Err(PaymentControlJobSnapshotFileStoreError::WalRead {
-                    path: self.wal_path.clone(),
-                    source,
-                });
-            }
-        };
-        if bytes.is_empty() {
-            return Ok(None);
-        }
-
-        let lines: Vec<&[u8]> = bytes.split(|byte| *byte == b'\n').collect();
-        let mut latest = None;
-        for (index, line) in lines.iter().enumerate() {
-            if line.is_empty() {
-                continue;
-            }
-            match decode_payment_control_job_queue_snapshot(line) {
-                Ok(snapshot) => latest = Some(snapshot),
-                Err(_source) if index + 1 == lines.len() => break,
-                Err(source) => {
-                    return Err(PaymentControlJobSnapshotFileStoreError::WalDecode {
-                        path: self.wal_path.clone(),
-                        source,
-                    });
-                }
-            }
-        }
-        Ok(latest)
-    }
-
-    #[cfg(test)]
-    fn append_wal_snapshot(
-        &self,
-        snapshot: &InMemoryPaymentControlJobQueueSnapshot,
-    ) -> Result<(), PaymentControlJobSnapshotFileStoreError> {
-        let _guard = self.file_lock();
-        self.append_wal_snapshot_locked(snapshot)
-    }
-
-    fn append_wal_snapshot_locked(
-        &self,
-        snapshot: &InMemoryPaymentControlJobQueueSnapshot,
-    ) -> Result<(), PaymentControlJobSnapshotFileStoreError> {
-        let bytes = encode_payment_control_job_queue_snapshot(snapshot).map_err(|source| {
-            PaymentControlJobSnapshotFileStoreError::Encode {
-                path: self.wal_path.clone(),
-                source,
-            }
-        })?;
-        if let Some(parent) = self
-            .wal_path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            fs::create_dir_all(parent).map_err(|source| {
-                PaymentControlJobSnapshotFileStoreError::CreateDir {
-                    path: parent.to_path_buf(),
-                    source,
-                }
-            })?;
-        }
-
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.wal_path)
-            .map_err(|source| PaymentControlJobSnapshotFileStoreError::WalOpen {
-                path: self.wal_path.clone(),
-                source,
-            })?;
-        file.write_all(&bytes).map_err(|source| {
-            PaymentControlJobSnapshotFileStoreError::WalWrite {
-                path: self.wal_path.clone(),
-                source,
-            }
-        })?;
-        file.write_all(b"\n").map_err(|source| {
-            PaymentControlJobSnapshotFileStoreError::WalWrite {
-                path: self.wal_path.clone(),
-                source,
-            }
-        })?;
-        file.sync_all()
-            .map_err(|source| PaymentControlJobSnapshotFileStoreError::WalSync {
-                path: self.wal_path.clone(),
-                source,
-            })
-    }
-
-    fn rotate_wal_after_snapshot_locked(
-        &self,
-    ) -> Result<(), PaymentControlJobSnapshotFileStoreError> {
-        match fs::metadata(&self.wal_path) {
-            Ok(metadata) if metadata.len() > 0 => {
-                let archive_path = payment_control_job_wal_archive_path(&self.wal_path);
-                fs::rename(&self.wal_path, &archive_path).map_err(|source| {
-                    PaymentControlJobSnapshotFileStoreError::WalRename {
-                        from: self.wal_path.clone(),
-                        to: archive_path,
-                        source,
-                    }
-                })?;
-                prune_payment_control_job_wal_archives(&self.wal_path).map_err(|source| {
-                    PaymentControlJobSnapshotFileStoreError::WalArchive {
-                        path: self.wal_path.clone(),
-                        source,
-                    }
-                })?;
-            }
-            Ok(_) => {}
-            Err(source) if source.kind() == io::ErrorKind::NotFound => {}
-            Err(source) => {
-                return Err(PaymentControlJobSnapshotFileStoreError::WalRead {
-                    path: self.wal_path.clone(),
-                    source,
-                });
-            }
-        }
-
-        let file = fs::File::create(&self.wal_path).map_err(|source| {
-            PaymentControlJobSnapshotFileStoreError::WalOpen {
-                path: self.wal_path.clone(),
-                source,
-            }
-        })?;
-        file.sync_all()
-            .map_err(|source| PaymentControlJobSnapshotFileStoreError::WalSync {
-                path: self.wal_path.clone(),
-                source,
-            })
-    }
-}
-
 /// Error returned by the persistent payment taskman adapter.
 #[derive(Debug, Error)]
 pub enum PersistentPaymentControlJobQueueError {
     /// The inner queue operation failed.
     #[error(transparent)]
     Queue(#[from] InMemoryPaymentControlJobQueueError),
-    /// Snapshot persistence failed.
-    #[error(transparent)]
-    Snapshot(#[from] PaymentControlJobSnapshotFileStoreError),
+    /// User/chat-originated control job creation was rejected by the task enqueue limiter.
+    #[error("task enqueue rate limited")]
+    TaskEnqueueRateLimited,
 }
 
-/// Payment control-job queue backed by Rust-native snapshots after every mutation.
-#[derive(Clone, Debug)]
+/// Payment control-job queue backed by the shared taskman queue.
+#[derive(Clone)]
 pub struct PersistentPaymentControlJobQueue {
     queue: InMemoryPaymentControlJobQueue,
-    snapshots: PaymentControlJobSnapshotFileStore,
+    task_enqueue_rate_limit: Option<Arc<dyn TaskEnqueueRateLimit>>,
+    db_journal: Option<
+        crate::task_queue::BufferedTaskQueueJournal<openplotva_storage::PostgresTaskQueueStore>,
+    >,
 }
 
 impl PersistentPaymentControlJobQueue {
-    /// Load a queue from the snapshot file, or start empty when no snapshot exists yet.
-    pub fn load_or_new(
-        snapshots: PaymentControlJobSnapshotFileStore,
-    ) -> Result<Self, PaymentControlJobSnapshotFileStoreError> {
-        Self::load_or_new_inner(snapshots, None)
-    }
-
-    /// Load a queue using the shared runtime taskman ID allocator.
-    pub fn load_or_new_with_id_allocator(
-        snapshots: PaymentControlJobSnapshotFileStore,
-        ids: TaskQueueIdAllocator,
-    ) -> Result<Self, PaymentControlJobSnapshotFileStoreError> {
-        Self::load_or_new_inner(snapshots, Some(ids))
-    }
-
-    fn load_or_new_inner(
-        snapshots: PaymentControlJobSnapshotFileStore,
-        ids: Option<TaskQueueIdAllocator>,
-    ) -> Result<Self, PaymentControlJobSnapshotFileStoreError> {
-        let queue = match snapshots.load_snapshot()? {
-            Some(mut snapshot) => {
-                if requeue_processing_payment_control_jobs_for_startup(&mut snapshot) > 0 {
-                    snapshots.save_snapshot(&snapshot)?;
-                }
-                match &ids {
-                    Some(ids) => {
-                        InMemoryPaymentControlJobQueue::from_persistence_snapshot_with_id_allocator(
-                            snapshot,
-                            ids.clone(),
-                        )
-                    }
-                    None => InMemoryPaymentControlJobQueue::from_persistence_snapshot(snapshot),
-                }
-            }
-            None => match ids {
-                Some(ids) => InMemoryPaymentControlJobQueue::new_with_id_allocator(ids),
-                None => InMemoryPaymentControlJobQueue::new(),
-            },
-        };
-        Ok(Self { queue, snapshots })
-    }
-
-    /// Build an empty queue with the provided snapshot store.
     #[must_use]
-    pub fn new_empty(snapshots: PaymentControlJobSnapshotFileStore) -> Self {
+    pub fn from_task_queue(queue: InMemoryTaskQueue) -> Self {
         Self {
-            queue: InMemoryPaymentControlJobQueue::new(),
-            snapshots,
+            queue: InMemoryPaymentControlJobQueue::from_task_queue(queue),
+            task_enqueue_rate_limit: None,
+            db_journal: None,
         }
     }
 
-    /// Build an empty queue with the shared runtime taskman ID allocator.
     #[must_use]
-    pub fn new_empty_with_id_allocator(
-        snapshots: PaymentControlJobSnapshotFileStore,
-        ids: TaskQueueIdAllocator,
+    pub fn with_task_enqueue_rate_limit(
+        mut self,
+        rate_limit: Arc<dyn TaskEnqueueRateLimit>,
     ) -> Self {
-        Self {
-            queue: InMemoryPaymentControlJobQueue::new_with_id_allocator(ids),
-            snapshots,
-        }
+        self.task_enqueue_rate_limit = Some(rate_limit);
+        self
+    }
+
+    /// Attach the shared Postgres journal so control/payment enqueues are flushed
+    /// to Postgres synchronously. Payment jobs (e.g. SuccessfulPayment) must be
+    /// durable before the update is acked: a lost enqueue would silently drop money.
+    #[must_use]
+    pub fn with_db_journal(
+        mut self,
+        journal: crate::task_queue::BufferedTaskQueueJournal<
+            openplotva_storage::PostgresTaskQueueStore,
+        >,
+    ) -> Self {
+        self.db_journal = Some(journal);
+        self
     }
 
     /// Return a stable ID-ordered snapshot of the queue state.
@@ -1910,7 +1380,6 @@ impl PersistentPaymentControlJobQueue {
         job_id: i64,
     ) -> Result<(), PersistentPaymentControlJobQueueError> {
         self.queue.cancel_taskman_job(job_id)?;
-        self.persist_snapshot()?;
         Ok(())
     }
 
@@ -1920,7 +1389,6 @@ impl PersistentPaymentControlJobQueue {
         job_id: i64,
     ) -> Result<TaskQueueRecord, PersistentPaymentControlJobQueueError> {
         let record = self.queue.delete_taskman_job(job_id)?;
-        self.persist_snapshot()?;
         Ok(record)
     }
 
@@ -1930,14 +1398,21 @@ impl PersistentPaymentControlJobQueue {
         job_id: i64,
     ) -> Result<i64, PersistentPaymentControlJobQueueError> {
         let new_id = self.queue.restart_taskman_job(job_id)?;
-        self.persist_snapshot()?;
         Ok(new_id)
     }
+}
 
-    fn persist_snapshot(&self) -> Result<(), PaymentControlJobSnapshotFileStoreError> {
-        self.snapshots
-            .save_snapshot(&self.queue.persistence_snapshot())
-    }
+/// Synchronous-flush retry budget for payment-flow control jobs before falling back
+/// to the background sync worker.
+const PAYMENT_CONTROL_FLUSH_ATTEMPTS: u32 = 3;
+const PAYMENT_CONTROL_FLUSH_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Payment-flow control kinds that must never be dropped by enqueue rate limiting.
+const fn control_kind_skips_task_enqueue_rate_limit(kind: ControlKind) -> bool {
+    matches!(
+        kind,
+        ControlKind::SuccessfulPayment | ControlKind::VipInvoice | ControlKind::DonateInvoice
+    )
 }
 
 impl PaymentControlJobQueue for PersistentPaymentControlJobQueue {
@@ -1949,10 +1424,96 @@ impl PaymentControlJobQueue for PersistentPaymentControlJobQueue {
         job: StatelessJobItem,
     ) -> PaymentControlJobQueueFuture<'a, Self::Error> {
         Box::pin(async move {
+            let params = control_job_params_from_stateless_job(&job)
+                .map_err(|error| InMemoryPaymentControlJobQueueError::Taskman(error.to_string()))?;
+            let chat_id = params.chat_id;
+            let user_id = params.user_id;
+            let control_kind = params.data.kind;
+            // Payment-flow control jobs are exempt from enqueue throttling: dropping a
+            // user's /vip or /donate (or a SuccessfulPayment) on a rate limit would
+            // silently lose payment intent with no feedback. They are rare, deliberate
+            // actions, not the dialog burst the limiter targets.
+            let rate_limit = if control_kind_skips_task_enqueue_rate_limit(control_kind) {
+                None
+            } else {
+                self.task_enqueue_rate_limit.as_ref()
+            };
+            if let Some(rate_limit) = rate_limit {
+                let now = OffsetDateTime::now_utc();
+                let report = rate_limit
+                    .check_task_enqueue_rate_limit(chat_id, user_id, now)
+                    .await;
+                if report.limited {
+                    tracing::warn!(
+                        queue_name,
+                        chat_id,
+                        user_id,
+                        control_kind = ?control_kind,
+                        rate_limit_scope = ?report.scope,
+                        rate_limit_error = ?report.error,
+                        "task enqueue rate limit rejected control job"
+                    );
+                    return Err(PersistentPaymentControlJobQueueError::TaskEnqueueRateLimited);
+                }
+                if let Some(error) = report.error {
+                    tracing::warn!(
+                        queue_name,
+                        chat_id,
+                        user_id,
+                        control_kind = ?control_kind,
+                        error,
+                        "task enqueue rate limit store check failed before control job assignment"
+                    );
+                }
+            }
             self.queue
                 .assign_payment_control_job(queue_name, job)
                 .await?;
-            self.persist_snapshot()?;
+            // Best-effort synchronous durability for the payment-flow job: retry the
+            // flush a few times to ride out a transient Postgres blip so the job is
+            // durable before the update is acked. If every attempt fails, the 1s
+            // background sync worker remains the durability backstop (a crash inside
+            // that residual window would re-deliver the update, which is idempotent).
+            if let Some(journal) = &self.db_journal {
+                let mut last_error = None;
+                for attempt in 0..PAYMENT_CONTROL_FLUSH_ATTEMPTS {
+                    match journal.flush_dirty().await {
+                        Ok(_) => {
+                            last_error = None;
+                            break;
+                        }
+                        Err(error) => {
+                            last_error = Some(error);
+                            if attempt + 1 < PAYMENT_CONTROL_FLUSH_ATTEMPTS {
+                                tokio::time::sleep(PAYMENT_CONTROL_FLUSH_RETRY_DELAY).await;
+                            }
+                        }
+                    }
+                }
+                if let Some(error) = last_error {
+                    tracing::error!(
+                        queue_name,
+                        control_kind = ?control_kind,
+                        %error,
+                        "control job not durably flushed after retries; relying on background sync worker"
+                    );
+                }
+            }
+            if let Some(rate_limit) = rate_limit {
+                let report = rate_limit
+                    .grow_task_enqueue_rate_limit(chat_id, user_id, OffsetDateTime::now_utc())
+                    .await;
+                for error in report.save_errors {
+                    tracing::warn!(
+                        queue_name,
+                        chat_id,
+                        user_id,
+                        control_kind = ?control_kind,
+                        error,
+                        "task enqueue rate limit store save failed after control job assignment"
+                    );
+                }
+            }
             Ok(())
         })
     }
@@ -1981,7 +1542,6 @@ impl PaymentControlJobWorkerQueue for PersistentPaymentControlJobQueue {
             self.queue
                 .complete_payment_control_job(job_id, report)
                 .await?;
-            self.persist_snapshot()?;
             Ok(())
         })
     }
@@ -2005,14 +1565,10 @@ impl SharedControlJobWorkerQueue for PersistentPaymentControlJobQueue {
         predicate: fn(&StatelessJobItem) -> bool,
     ) -> PaymentControlJobWorkerFuture<'a, Option<PaymentControlJobWorkItem>, Self::Error> {
         Box::pin(async move {
-            let work_item = self
-                .queue
+            self.queue
                 .dequeue_shared_control_job_matching(queue_name, worker_id, predicate)
-                .await?;
-            if work_item.is_some() {
-                self.persist_snapshot()?;
-            }
-            Ok(work_item)
+                .await
+                .map_err(Into::into)
         })
     }
 
@@ -2022,7 +1578,6 @@ impl SharedControlJobWorkerQueue for PersistentPaymentControlJobQueue {
     ) -> PaymentControlJobWorkerFuture<'a, (), Self::Error> {
         Box::pin(async move {
             self.queue.complete_shared_control_job(job_id).await?;
-            self.persist_snapshot()?;
             Ok(())
         })
     }
@@ -2034,96 +1589,9 @@ impl SharedControlJobWorkerQueue for PersistentPaymentControlJobQueue {
     ) -> PaymentControlJobWorkerFuture<'a, (), Self::Error> {
         Box::pin(async move {
             self.queue.fail_shared_control_job(job_id, error).await?;
-            self.persist_snapshot()?;
             Ok(())
         })
     }
-}
-
-fn requeue_processing_payment_control_jobs_for_startup(
-    snapshot: &mut InMemoryPaymentControlJobQueueSnapshot,
-) -> usize {
-    let mut requeued = 0;
-    for record in &mut snapshot.records {
-        if record.status == InMemoryPaymentControlJobStatus::Processing {
-            record.status = InMemoryPaymentControlJobStatus::Pending;
-            record.completed_report = None;
-            record.error = None;
-            requeued += 1;
-        }
-    }
-    requeued
-}
-
-fn payment_control_job_snapshot_tmp_path(path: &Path) -> PathBuf {
-    let file_name = path
-        .file_name()
-        .map(|name| name.to_string_lossy())
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| DEFAULT_PAYMENT_CONTROL_JOB_SNAPSHOT_FILE.into());
-    path.with_file_name(format!("{file_name}.tmp"))
-}
-
-fn payment_control_job_wal_path(path: &Path) -> PathBuf {
-    let file_name = path
-        .file_name()
-        .map(|name| name.to_string_lossy())
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| DEFAULT_PAYMENT_CONTROL_JOB_SNAPSHOT_FILE.into());
-    path.with_file_name(format!("{file_name}.wal"))
-}
-
-fn payment_control_job_wal_archive_path(path: &Path) -> PathBuf {
-    let file_name = path
-        .file_name()
-        .map(|name| name.to_string_lossy())
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| DEFAULT_PAYMENT_CONTROL_JOB_SNAPSHOT_FILE.into());
-    let timestamp = OffsetDateTime::now_utc().unix_timestamp_nanos();
-    let pid = std::process::id();
-    let mut suffix = 0_u32;
-    loop {
-        let candidate = if suffix == 0 {
-            path.with_file_name(format!("{file_name}.archive.{timestamp}.{pid}"))
-        } else {
-            path.with_file_name(format!("{file_name}.archive.{timestamp}.{pid}.{suffix}"))
-        };
-        if !candidate.exists() {
-            return candidate;
-        }
-        suffix = suffix.saturating_add(1);
-    }
-}
-
-fn prune_payment_control_job_wal_archives(wal_path: &Path) -> io::Result<()> {
-    let Some(parent) = wal_path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    else {
-        return Ok(());
-    };
-    let Some(file_name) = wal_path.file_name().map(|name| name.to_string_lossy()) else {
-        return Ok(());
-    };
-    let prefix = format!("{file_name}.archive.");
-    let mut archives = Vec::new();
-    for entry in fs::read_dir(parent)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_file() {
-            continue;
-        }
-        if entry.file_name().to_string_lossy().starts_with(&prefix) {
-            archives.push(entry.path());
-        }
-    }
-    archives.sort();
-    let remove_count = archives
-        .len()
-        .saturating_sub(PAYMENT_CONTROL_JOB_WAL_ARCHIVE_KEEP);
-    for archive in archives.into_iter().take(remove_count) {
-        fs::remove_file(archive)?;
-    }
-    Ok(())
 }
 
 impl Default for InMemoryPaymentControlJobQueue {
@@ -2276,61 +1744,12 @@ fn payment_records_from_taskman(
         .collect()
 }
 
-fn payment_snapshot_into_taskman(
-    snapshot: InMemoryPaymentControlJobQueueSnapshot,
-) -> (TaskQueueSnapshot, HashMap<i64, PaymentControlJobReport>) {
-    let mut completed_reports = HashMap::new();
-    let records = snapshot
-        .records
-        .into_iter()
-        .map(|record| {
-            if let Some(report) = record.completed_report {
-                completed_reports.insert(record.id, report);
-            }
-            TaskQueueRecord {
-                id: record.id,
-                queue_name: record.queue_name,
-                status: taskman_status_from_payment(record.status),
-                job: record.job,
-                worker_id: None,
-                started_at: None,
-                execution_started_at: None,
-                completed_at: None,
-                error: record.error,
-                progress_message_id: None,
-                queue_position_message_id: None,
-                result_message_id: None,
-                messages: Vec::new(),
-                events: Vec::new(),
-            }
-        })
-        .collect();
-    (
-        TaskQueueSnapshot {
-            format: TASK_QUEUE_SNAPSHOT_FORMAT.to_owned(),
-            next_id: snapshot.next_id,
-            next_message_id: 1,
-            records,
-        },
-        completed_reports,
-    )
-}
-
 fn payment_status_from_taskman(status: JobStatus) -> InMemoryPaymentControlJobStatus {
     match status {
         JobStatus::Pending => InMemoryPaymentControlJobStatus::Pending,
         JobStatus::Processing => InMemoryPaymentControlJobStatus::Processing,
         JobStatus::Completed => InMemoryPaymentControlJobStatus::Completed,
         JobStatus::Failed | JobStatus::Cancelled => InMemoryPaymentControlJobStatus::Failed,
-    }
-}
-
-fn taskman_status_from_payment(status: InMemoryPaymentControlJobStatus) -> JobStatus {
-    match status {
-        InMemoryPaymentControlJobStatus::Pending => JobStatus::Pending,
-        InMemoryPaymentControlJobStatus::Processing => JobStatus::Processing,
-        InMemoryPaymentControlJobStatus::Completed => JobStatus::Completed,
-        InMemoryPaymentControlJobStatus::Failed => JobStatus::Failed,
     }
 }
 
@@ -7003,7 +6422,8 @@ mod tests {
     };
     use openplotva_taskman::{
         CONTROL_QUEUE_NAME, ControlJobData, ControlJobParams, ControlKind, ControlPayment,
-        DEFAULT_PRIORITY, HIGH_PRIORITY, JobPayload, JobType, StatelessJobItem, new_control_job_at,
+        DEFAULT_PRIORITY, HIGH_PRIORITY, InMemoryTaskQueue, JobPayload, JobType, StatelessJobItem,
+        new_control_job_at,
     };
     use openplotva_updates::{UpdateConsumerConfig, UpdateStageOutcome};
     use serde_json::json;
@@ -7023,8 +6443,7 @@ mod tests {
         SuccessfulPaymentDispatcherEffects, SuccessfulPaymentEffects, SuccessfulPaymentMessage,
         SuccessfulPaymentOutcome, SuccessfulPaymentStore, SuccessfulPaymentUpdateRoute,
         VipCancellationCallbackOutcome, VipCancellationEffectFuture, VipCancellationEffects,
-        VipCancellationStore, encode_payment_control_job_queue_snapshot,
-        enqueue_payment_invoice_command_update_or_else_at,
+        VipCancellationStore, enqueue_payment_invoice_command_update_or_else_at,
         enqueue_payment_invoice_command_update_with_vip_status_or_else_at,
         enqueue_successful_payment_update_or_else_at, execute_donate_invoice_control_job,
         execute_payment_control_job_at, execute_vip_invoice_control_job,
@@ -12004,255 +11423,102 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn in_memory_payment_control_job_queue_snapshot_uses_rust_native_json_and_restores_state()
+    async fn persistent_control_queue_task_enqueue_limit_blocks_before_assignment()
     -> Result<(), Box<dyn Error>> {
-        let queue = super::InMemoryPaymentControlJobQueue::new();
+        let limiter = Arc::new(TaskEnqueueRateLimitStub::limited());
+        let queue =
+            super::PersistentPaymentControlJobQueue::from_task_queue(InMemoryTaskQueue::new())
+                .with_task_enqueue_rate_limit(limiter.clone());
         let created = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
-        let low_old = new_control_job_at(sample_invoice_job(ControlKind::DonateInvoice), created)
-            .with_name("donate invoice");
-        let high_new = new_control_job_at(
-            sample_invoice_job(ControlKind::SuccessfulPayment),
-            created + time::Duration::seconds(1),
-        )
-        .with_name("successful payment")
-        .with_priority(HIGH_PRIORITY);
+        let job = new_control_job_at(sample_invoice_job(ControlKind::Translate), created)
+            .with_name("translate")
+            .with_priority(HIGH_PRIORITY);
 
-        queue
-            .assign_payment_control_job(CONTROL_QUEUE_NAME, low_old)
-            .await?;
-        queue
-            .assign_payment_control_job(CONTROL_QUEUE_NAME, high_new)
-            .await?;
-        let processing = queue
-            .dequeue_payment_control_job(CONTROL_QUEUE_NAME)
-            .await?
-            .expect("high-priority job");
-        assert_eq!(processing.id, 2);
-        let report =
-            PaymentControlJobReport::new(super::PaymentControlJobOutcome::SuccessfulPayment(
-                SuccessfulPaymentOutcome::SubscriptionProcessed,
-            ));
-        queue
-            .complete_payment_control_job(processing.id, &report)
-            .await?;
+        let error = queue
+            .assign_payment_control_job(CONTROL_QUEUE_NAME, job)
+            .await
+            .expect_err("task enqueue limit should block assignment");
 
-        let snapshot = queue.persistence_snapshot();
-        let encoded = encode_payment_control_job_queue_snapshot(&snapshot)?;
-        let encoded_text = std::str::from_utf8(&encoded)?;
-        assert!(encoded_text.starts_with('{'));
-        assert!(encoded_text.contains(super::PAYMENT_CONTROL_JOB_QUEUE_SNAPSHOT_FORMAT));
-
-        let decoded = super::decode_payment_control_job_queue_snapshot(&encoded)?;
-        let restored = super::InMemoryPaymentControlJobQueue::from_persistence_snapshot(decoded);
-        assert_eq!(restored.snapshot(), queue.snapshot());
-
-        let next = new_control_job_at(sample_invoice_job(ControlKind::VipInvoice), created)
-            .with_name("vip invoice");
-        restored
-            .assign_payment_control_job(CONTROL_QUEUE_NAME, next)
-            .await?;
-        assert_eq!(
-            restored
-                .snapshot()
-                .iter()
-                .map(|record| record.id)
-                .collect::<Vec<_>>(),
-            vec![1, 2, 3]
-        );
-        let next_pending = restored
-            .dequeue_payment_control_job(CONTROL_QUEUE_NAME)
-            .await?
-            .expect("old pending job survives restore");
-        assert_eq!(next_pending.id, 1);
-
-        let wrong_format = serde_json::to_vec(&json!({
-            "format": "go-gob",
-            "next_id": 1,
-            "records": []
-        }))?;
         assert!(matches!(
-            super::decode_payment_control_job_queue_snapshot(&wrong_format),
-            Err(super::PaymentControlJobQueueSnapshotError::UnsupportedFormat(format))
-                if format == "go-gob"
+            error,
+            super::PersistentPaymentControlJobQueueError::TaskEnqueueRateLimited
         ));
+        assert!(queue.snapshot().is_empty());
+        assert_eq!(limiter.check_calls(), vec![(1000, 42)]);
+        assert!(limiter.grow_calls().is_empty());
         Ok(())
     }
 
     #[tokio::test]
-    async fn persistent_payment_control_job_queue_saves_mutations_and_requeues_processing_on_startup()
+    async fn persistent_control_queue_grows_task_enqueue_limit_after_assignment()
     -> Result<(), Box<dyn Error>> {
-        let path = unique_payment_queue_snapshot_path("persistent-payment-control");
-        remove_payment_queue_files(&path);
-        let store = super::PaymentControlJobSnapshotFileStore::new(path.clone());
-        let queue = super::PersistentPaymentControlJobQueue::load_or_new(store.clone())?;
+        let limiter = Arc::new(TaskEnqueueRateLimitStub::default());
+        let queue =
+            super::PersistentPaymentControlJobQueue::from_task_queue(InMemoryTaskQueue::new())
+                .with_task_enqueue_rate_limit(limiter.clone());
         let created = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
-        let low_old = new_control_job_at(sample_invoice_job(ControlKind::DonateInvoice), created)
-            .with_name("donate invoice");
-        let high_new = new_control_job_at(
-            sample_invoice_job(ControlKind::SuccessfulPayment),
-            created + time::Duration::seconds(1),
-        )
-        .with_name("successful payment")
-        .with_priority(HIGH_PRIORITY);
+        let job = new_control_job_at(sample_invoice_job(ControlKind::Translate), created)
+            .with_name("translate")
+            .with_priority(HIGH_PRIORITY);
 
         queue
-            .assign_payment_control_job(CONTROL_QUEUE_NAME, low_old)
-            .await?;
-        queue
-            .assign_payment_control_job(CONTROL_QUEUE_NAME, high_new)
+            .assign_payment_control_job(CONTROL_QUEUE_NAME, job)
             .await?;
 
-        let encoded_text = std::fs::read_to_string(&path)?;
-        assert!(encoded_text.starts_with('{'));
-        assert!(encoded_text.contains(super::PAYMENT_CONTROL_JOB_QUEUE_SNAPSHOT_FORMAT));
-        let wal_path = super::payment_control_job_wal_path(&path);
-        assert_eq!(std::fs::metadata(&wal_path)?.len(), 0);
-        assert!(!payment_control_job_wal_archives(&wal_path)?.is_empty());
-
-        let processing = queue
-            .dequeue_payment_control_job(CONTROL_QUEUE_NAME)
-            .await?
-            .expect("high-priority job");
-        assert_eq!(processing.id, 2);
-
-        let restarted = super::PersistentPaymentControlJobQueue::load_or_new(store.clone())?;
-        let restarted_item = restarted
-            .dequeue_payment_control_job(CONTROL_QUEUE_NAME)
-            .await?
-            .expect("processing job requeued on startup");
-        assert_eq!(restarted_item.id, 2);
-
-        let report =
-            PaymentControlJobReport::new(super::PaymentControlJobOutcome::SuccessfulPayment(
-                SuccessfulPaymentOutcome::SubscriptionProcessed,
-            ));
-        restarted
-            .complete_payment_control_job(restarted_item.id, &report)
-            .await?;
-
-        let restored = super::PersistentPaymentControlJobQueue::load_or_new(store)?;
-        assert_eq!(
-            restored.snapshot()[1].status,
-            super::InMemoryPaymentControlJobStatus::Completed
-        );
-        assert_eq!(restored.snapshot()[1].completed_report, Some(report));
-
-        remove_payment_queue_files(&path);
+        assert_eq!(queue.snapshot().len(), 1);
+        assert_eq!(limiter.check_calls(), vec![(1000, 42)]);
+        assert_eq!(limiter.grow_calls(), vec![(1000, 42)]);
         Ok(())
     }
 
     #[tokio::test]
-    async fn persistent_payment_control_job_queue_replays_wal_when_snapshot_lags()
+    async fn persistent_control_queue_does_not_rate_limit_payment_invoices()
     -> Result<(), Box<dyn Error>> {
-        let path = unique_payment_queue_snapshot_path("persistent-payment-control-wal-replay");
-        remove_payment_queue_files(&path);
-        let store = super::PaymentControlJobSnapshotFileStore::new(path.clone());
-        let queue = super::InMemoryPaymentControlJobQueue::new();
-        let created = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
-        queue
-            .assign_payment_control_job(
-                CONTROL_QUEUE_NAME,
-                new_control_job_at(sample_invoice_job(ControlKind::DonateInvoice), created)
-                    .with_name("donate invoice"),
-            )
-            .await?;
-        store.save_snapshot(&queue.persistence_snapshot())?;
-        queue
-            .assign_payment_control_job(
-                CONTROL_QUEUE_NAME,
-                new_control_job_at(
-                    sample_invoice_job(ControlKind::SuccessfulPayment),
-                    created + time::Duration::seconds(1),
-                )
-                .with_name("successful payment")
-                .with_priority(HIGH_PRIORITY),
-            )
-            .await?;
-        store.append_wal_snapshot(&queue.persistence_snapshot())?;
+        // Payment-intent commands (/vip, /donate) must never be dropped by the limiter.
+        for kind in [ControlKind::VipInvoice, ControlKind::DonateInvoice] {
+            let limiter = Arc::new(TaskEnqueueRateLimitStub::limited());
+            let queue =
+                super::PersistentPaymentControlJobQueue::from_task_queue(InMemoryTaskQueue::new())
+                    .with_task_enqueue_rate_limit(limiter.clone());
+            let created = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+            let job = new_control_job_at(sample_invoice_job(kind), created)
+                .with_name("payment invoice")
+                .with_priority(HIGH_PRIORITY);
 
-        let restored = super::PersistentPaymentControlJobQueue::load_or_new(store)?;
-        let snapshot = restored.snapshot();
-        assert_eq!(snapshot.len(), 2);
-        assert_eq!(snapshot[0].job.title, "donate invoice");
-        assert_eq!(snapshot[1].job.title, "successful payment");
-
-        remove_payment_queue_files(&path);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn persistent_payment_control_job_queue_prunes_wal_archives() -> Result<(), Box<dyn Error>>
-    {
-        let path = unique_payment_queue_snapshot_path("persistent-payment-control-wal-prune");
-        remove_payment_queue_files(&path);
-        let store = super::PaymentControlJobSnapshotFileStore::new(path.clone());
-        let queue = super::PersistentPaymentControlJobQueue::load_or_new(store)?;
-        let created = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
-
-        for index in 0..(super::PAYMENT_CONTROL_JOB_WAL_ARCHIVE_KEEP + 3) {
             queue
-                .assign_payment_control_job(
-                    CONTROL_QUEUE_NAME,
-                    new_control_job_at(
-                        sample_invoice_job(ControlKind::DonateInvoice),
-                        created + time::Duration::seconds(index as i64),
-                    )
-                    .with_name(format!("donate invoice {index}")),
-                )
+                .assign_payment_control_job(CONTROL_QUEUE_NAME, job)
                 .await?;
+
+            assert_eq!(queue.snapshot().len(), 1, "{kind:?} must be queued");
+            assert!(
+                limiter.check_calls().is_empty(),
+                "{kind:?} must skip the limiter"
+            );
+            assert!(limiter.grow_calls().is_empty());
         }
-
-        let wal_path = super::payment_control_job_wal_path(&path);
-        let archives = payment_control_job_wal_archives(&wal_path)?;
-        assert_eq!(archives.len(), super::PAYMENT_CONTROL_JOB_WAL_ARCHIVE_KEEP);
-        assert_eq!(std::fs::metadata(&wal_path)?.len(), 0);
-
-        remove_payment_queue_files(&path);
         Ok(())
     }
 
-    fn unique_payment_queue_snapshot_path(label: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "openplotva-{label}-{}-{}.json",
-            std::process::id(),
-            OffsetDateTime::now_utc().unix_timestamp_nanos()
-        ))
-    }
+    #[tokio::test]
+    async fn persistent_control_queue_does_not_rate_limit_successful_payment()
+    -> Result<(), Box<dyn Error>> {
+        let limiter = Arc::new(TaskEnqueueRateLimitStub::limited());
+        let queue =
+            super::PersistentPaymentControlJobQueue::from_task_queue(InMemoryTaskQueue::new())
+                .with_task_enqueue_rate_limit(limiter.clone());
+        let created = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let job = new_control_job_at(sample_invoice_job(ControlKind::SuccessfulPayment), created)
+            .with_name("successful payment")
+            .with_priority(HIGH_PRIORITY);
 
-    fn remove_payment_queue_files(path: &std::path::Path) {
-        let _ = std::fs::remove_file(path);
-        let _ = std::fs::remove_file(super::payment_control_job_snapshot_tmp_path(path));
-        let wal_path = super::payment_control_job_wal_path(path);
-        let _ = std::fs::remove_file(&wal_path);
-        if let Ok(archives) = payment_control_job_wal_archives(&wal_path) {
-            for archive in archives {
-                let _ = std::fs::remove_file(archive);
-            }
-        }
-    }
+        queue
+            .assign_payment_control_job(CONTROL_QUEUE_NAME, job)
+            .await?;
 
-    fn payment_control_job_wal_archives(
-        wal_path: &std::path::Path,
-    ) -> Result<Vec<std::path::PathBuf>, Box<dyn std::error::Error>> {
-        let Some(parent) = wal_path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        else {
-            return Ok(Vec::new());
-        };
-        let Some(file_name) = wal_path.file_name().map(|name| name.to_string_lossy()) else {
-            return Ok(Vec::new());
-        };
-        let prefix = format!("{file_name}.archive.");
-        let mut archives = Vec::new();
-        for entry in std::fs::read_dir(parent)? {
-            let entry = entry?;
-            if entry.file_name().to_string_lossy().starts_with(&prefix) {
-                archives.push(entry.path());
-            }
-        }
-        archives.sort();
-        Ok(archives)
+        assert_eq!(queue.snapshot().len(), 1);
+        assert!(limiter.check_calls().is_empty());
+        assert!(limiter.grow_calls().is_empty());
+        Ok(())
     }
 
     #[test]
@@ -12290,6 +11556,74 @@ mod tests {
         fn assert_impl<T: PaymentInvoiceEffects>() {}
 
         assert_impl::<openplotva_telegram::TelegramClient>();
+    }
+
+    #[derive(Default)]
+    struct TaskEnqueueRateLimitStub {
+        limited: bool,
+        check_calls: Mutex<Vec<(i64, i64)>>,
+        grow_calls: Mutex<Vec<(i64, i64)>>,
+    }
+
+    impl TaskEnqueueRateLimitStub {
+        fn limited() -> Self {
+            Self {
+                limited: true,
+                ..Self::default()
+            }
+        }
+
+        fn check_calls(&self) -> Vec<(i64, i64)> {
+            self.check_calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+
+        fn grow_calls(&self) -> Vec<(i64, i64)> {
+            self.grow_calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+    }
+
+    impl crate::rate_limits::TaskEnqueueRateLimit for TaskEnqueueRateLimitStub {
+        fn check_task_enqueue_rate_limit<'a>(
+            &'a self,
+            chat_id: i64,
+            user_id: i64,
+            _now: OffsetDateTime,
+        ) -> crate::rate_limits::TaskEnqueueRateLimitFuture<'a> {
+            Box::pin(async move {
+                self.check_calls
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push((chat_id, user_id));
+                crate::rate_limits::TaskEnqueueRateLimitReport {
+                    limited: self.limited,
+                    scope: self
+                        .limited
+                        .then_some(crate::rate_limits::TaskEnqueueRateLimitScope::UserChat),
+                    error: None,
+                }
+            })
+        }
+
+        fn grow_task_enqueue_rate_limit<'a>(
+            &'a self,
+            chat_id: i64,
+            user_id: i64,
+            _now: OffsetDateTime,
+        ) -> crate::rate_limits::TaskEnqueueRateLimitGrowFuture<'a> {
+            Box::pin(async move {
+                self.grow_calls
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push((chat_id, user_id));
+                crate::rate_limits::TaskEnqueueRateLimitGrowReport::default()
+            })
+        }
     }
 
     fn sample_message(payload: &str, total_amount: i64) -> SuccessfulPaymentMessage {

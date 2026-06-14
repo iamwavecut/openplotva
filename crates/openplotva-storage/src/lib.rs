@@ -18,6 +18,10 @@ use openplotva_history::{
     summary_source_id_for_storage,
 };
 use openplotva_shield::{Options as ShieldOptions, SearchRequest as ShieldSearchRequest};
+use openplotva_taskman::{
+    JobType, TASK_QUEUE_SNAPSHOT_FORMAT, TASK_QUEUE_WAL_DELETE_JOB, TASK_QUEUE_WAL_UPSERT_JOB,
+    TaskQueueRecord, TaskQueueSnapshot, TaskQueueWalRecord,
+};
 use pgvector::Vector;
 use redis::{
     Client as RedisClient, ConnectionAddr, ConnectionInfo, IntoConnectionInfo, RedisConnectionInfo,
@@ -26,7 +30,7 @@ use redis::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{
-    PgPool, Row,
+    PgPool, Postgres, Row, Transaction,
     migrate::{MigrateError, Migration, Migrator},
     postgres::{PgPoolOptions, PgRow},
 };
@@ -1048,6 +1052,7 @@ pub const RATE_LIMITED_CHAT_KEY_PREFIX: &str = "plotva:rate_limited_chat:";
 
 pub const DRAW_RATE_LIMIT_KEY_PREFIX: &str = "plotva:rate_limit:";
 pub const DRAW_RATE_LIMIT_TTL: Duration = Duration::from_secs(30 * 60);
+pub const TASK_ENQUEUE_RATE_LIMIT_KEY_PREFIX: &str = "plotva:task_enqueue_rate_limit:";
 
 pub const CHAT_ADMINS_KEY_PREFIX: &str = "chat:";
 
@@ -1406,6 +1411,13 @@ impl RedisStore {
         )
     }
 
+    pub fn task_enqueue_rate_limit_store(&self) -> RedisTaskEnqueueRateLimitStore {
+        RedisTaskEnqueueRateLimitStore::with_connection_pool(
+            self.connections.clone(),
+            TASK_ENQUEUE_RATE_LIMIT_KEY_PREFIX,
+        )
+    }
+
     /// Build the Redis-backed chat-admin cache store over this client.
     pub fn chat_admin_cache_store(&self) -> RedisChatAdminCacheStore {
         RedisChatAdminCacheStore::with_connection_pool(
@@ -1631,6 +1643,112 @@ impl RedisDrawRateLimitStore {
             .await
             .map_err(|source| StorageError::Redis { source })?;
         Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RedisTaskEnqueueRateLimitStore {
+    connections: RedisConnectionPool,
+    key_prefix: String,
+}
+
+impl RedisTaskEnqueueRateLimitStore {
+    pub fn new(client: RedisClient) -> Self {
+        Self::with_key_prefix(client, TASK_ENQUEUE_RATE_LIMIT_KEY_PREFIX)
+    }
+
+    pub fn with_key_prefix(client: RedisClient, key_prefix: impl Into<String>) -> Self {
+        Self::with_connection_pool(RedisConnectionPool::new(client), key_prefix)
+    }
+
+    fn with_connection_pool(
+        connections: RedisConnectionPool,
+        key_prefix: impl Into<String>,
+    ) -> Self {
+        Self {
+            connections,
+            key_prefix: key_prefix.into(),
+        }
+    }
+
+    pub fn key_for_scope(&self, scope_key: &str) -> String {
+        format!("{}{scope_key}", self.key_prefix)
+    }
+
+    /// Prune entries older than the window and return the current count. The scope is
+    /// a Redis sorted set scored by unix-millis, so counting is `ZCARD` after pruning.
+    pub async fn count_task_enqueue(
+        &self,
+        scope_key: &str,
+        cutoff_unix_ms: i64,
+    ) -> Result<usize, StorageError> {
+        let key = self.key_for_scope(scope_key);
+        let mut connection = self
+            .connections
+            .connection()
+            .await
+            .map_err(|source| StorageError::Redis { source })?;
+        let _: i64 = redis::cmd("ZREMRANGEBYSCORE")
+            .arg(&key)
+            .arg("-inf")
+            .arg(format!("({cutoff_unix_ms}"))
+            .query_async(&mut connection)
+            .await
+            .map_err(|source| StorageError::Redis { source })?;
+        let count: i64 = redis::cmd("ZCARD")
+            .arg(&key)
+            .query_async(&mut connection)
+            .await
+            .map_err(|source| StorageError::Redis { source })?;
+        Ok(count.max(0) as usize)
+    }
+
+    /// Add one scored member, prune the window, refresh the TTL, and return the
+    /// resulting count. Because each enqueue uses a distinct member (instance prefix +
+    /// monotonic seq), concurrent `ZADD`s accumulate instead of overwriting, so the
+    /// count is not subject to the read-modify-write lost-update of a blob counter.
+    pub async fn record_task_enqueue(
+        &self,
+        scope_key: &str,
+        score_unix_ms: i64,
+        member: &str,
+        cutoff_unix_ms: i64,
+        ttl: Duration,
+    ) -> Result<usize, StorageError> {
+        let key = self.key_for_scope(scope_key);
+        let mut connection = self
+            .connections
+            .connection()
+            .await
+            .map_err(|source| StorageError::Redis { source })?;
+        let _: i64 = redis::cmd("ZADD")
+            .arg(&key)
+            .arg(score_unix_ms)
+            .arg(member)
+            .query_async(&mut connection)
+            .await
+            .map_err(|source| StorageError::Redis { source })?;
+        let _: i64 = redis::cmd("ZREMRANGEBYSCORE")
+            .arg(&key)
+            .arg("-inf")
+            .arg(format!("({cutoff_unix_ms}"))
+            .query_async(&mut connection)
+            .await
+            .map_err(|source| StorageError::Redis { source })?;
+        if !ttl.is_zero() {
+            let _: i64 = redis::cmd("PEXPIRE")
+                .arg(&key)
+                .arg(redis_ttl_millis(ttl))
+                .query_async(&mut connection)
+                .await
+                .map_err(|source| StorageError::Redis { source })?;
+        }
+        let count: i64 = redis::cmd("ZCARD")
+            .arg(&key)
+            .query_async(&mut connection)
+            .await
+            .map_err(|source| StorageError::Redis { source })?;
+        Ok(count.max(0) as usize)
     }
 }
 
@@ -5315,6 +5433,294 @@ impl PostgresVipStore {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct PostgresTaskQueueStore {
+    pool: PgPool,
+}
+
+impl PostgresTaskQueueStore {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
+    pub async fn load_task_queue_snapshot(&self) -> Result<TaskQueueSnapshot, StorageError> {
+        // A connection/query failure here is transient and stays fatal (the caller
+        // aborts startup and a restart retries the load). But a single undeserializable
+        // row (schema drift, partial write) must NOT crash the boot, or one bad row
+        // would wedge the process in a restart loop — skip it and log instead. The id
+        // sequence still covers the skipped id, so nothing is reissued.
+        let rows = sqlx::query(
+            r#"
+            SELECT id, record
+            FROM taskman_jobs
+            WHERE deleted_at IS NULL
+            ORDER BY id ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut records = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id: i64 = row.try_get("id")?;
+            match task_queue_record_from_row(row) {
+                Ok(record) => records.push(record),
+                Err(error) => {
+                    tracing::warn!(job_id = id, %error, "skipping undeserializable taskman job row");
+                }
+            }
+        }
+        Ok(task_queue_snapshot_from_records(records))
+    }
+
+    pub async fn apply_task_queue_wal_batch(
+        &self,
+        batch: Vec<TaskQueueWalRecord>,
+    ) -> Result<(), StorageError> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SET LOCAL statement_timeout = 10000")
+            .execute(&mut *tx)
+            .await?;
+        let mut max_job_id: i64 = 0;
+        let mut max_message_id: i64 = 0;
+        for wal in batch {
+            max_job_id = max_job_id.max(wal.job_id);
+            match wal.op.as_str() {
+                TASK_QUEUE_WAL_UPSERT_JOB => {
+                    if let Some(record) = wal.record {
+                        if let Some(message_high) =
+                            record.messages.iter().map(|message| message.id).max()
+                        {
+                            max_message_id = max_message_id.max(message_high);
+                        }
+                        upsert_task_queue_record(&mut tx, &record).await?;
+                    }
+                }
+                TASK_QUEUE_WAL_DELETE_JOB => {
+                    delete_task_queue_record(&mut tx, wal.job_id).await?;
+                }
+                other => {
+                    tracing::warn!(op = other, "ignoring unknown taskman WAL op");
+                }
+            }
+        }
+        advance_task_queue_sequence(
+            &mut tx,
+            "SELECT setval('taskman_job_id_seq', GREATEST((SELECT last_value FROM taskman_job_id_seq), $1), true)",
+            max_job_id,
+        )
+        .await?;
+        advance_task_queue_sequence(
+            &mut tx,
+            "SELECT setval('taskman_message_id_seq', GREATEST((SELECT last_value FROM taskman_message_id_seq), $1), true)",
+            max_message_id,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Reconcile the durable id high-water with any existing rows and return the
+    /// next ids to seed the in-memory allocator. The sequences are the durable
+    /// source of truth: a restart can never reissue an id, even after the highest
+    /// rows were soft-deleted or purged.
+    pub async fn reserve_id_high_water(&self) -> Result<(i64, i64), StorageError> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                GREATEST(
+                    nextval('taskman_job_id_seq'),
+                    COALESCE((SELECT MAX(id) FROM taskman_jobs), 0) + 1,
+                    COALESCE((SELECT MAX(job_id) FROM taskman_job_history), 0) + 1
+                ) AS next_job_id,
+                nextval('taskman_message_id_seq') AS next_message_id
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let next_job_id: i64 = row.try_get("next_job_id")?;
+        let next_message_id: i64 = row.try_get("next_message_id")?;
+        Ok((next_job_id.max(1), next_message_id.max(1)))
+    }
+
+    /// Hard-delete soft-deleted jobs and history older than the cutoff. Returns the
+    /// number of rows reclaimed. Soft-deleted rows and history are retention-only;
+    /// without this the tables grow without bound.
+    pub async fn purge_task_queue_terminal(
+        &self,
+        older_than: OffsetDateTime,
+    ) -> Result<u64, StorageError> {
+        let jobs = sqlx::query(
+            "DELETE FROM taskman_jobs WHERE deleted_at IS NOT NULL AND deleted_at < $1",
+        )
+        .bind(older_than)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        let history = sqlx::query("DELETE FROM taskman_job_history WHERE at < $1")
+            .bind(older_than)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        Ok(jobs + history)
+    }
+}
+
+async fn upsert_task_queue_record(
+    tx: &mut Transaction<'_, Postgres>,
+    record: &TaskQueueRecord,
+) -> Result<(), StorageError> {
+    let record_json =
+        serde_json::to_value(record).map_err(|source| StorageError::TaskQueueCodec { source })?;
+    // The typed columns are bound from the record's typed Rust fields, so the SQL
+    // projection is checked by the compiler against the record struct (a field rename
+    // breaks the build) and timestamps project via sqlx's native encoding.
+    let (chat_id, user_id) = task_queue_record_chat_user(record);
+    sqlx::query(
+        r#"
+        INSERT INTO taskman_jobs (
+            id, record, updated_at, deleted_at, queue_name, status, job_type,
+            priority, chat_id, user_id, created_at, started_at, completed_at
+        )
+        VALUES ($1, $2, now(), NULL, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        ON CONFLICT (id) DO UPDATE SET
+            record = EXCLUDED.record,
+            updated_at = now(),
+            deleted_at = NULL,
+            queue_name = EXCLUDED.queue_name,
+            status = EXCLUDED.status,
+            job_type = EXCLUDED.job_type,
+            priority = EXCLUDED.priority,
+            chat_id = EXCLUDED.chat_id,
+            user_id = EXCLUDED.user_id,
+            created_at = EXCLUDED.created_at,
+            started_at = EXCLUDED.started_at,
+            completed_at = EXCLUDED.completed_at
+        "#,
+    )
+    .bind(record.id)
+    .bind(record_json)
+    .bind(&record.queue_name)
+    .bind(record.status.as_str())
+    .bind(task_queue_job_type_name(record.job.data.job_type))
+    .bind(record.job.priority)
+    .bind(chat_id)
+    .bind(user_id)
+    .bind(record.job.created)
+    .bind(record.started_at)
+    .bind(record.completed_at)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn advance_task_queue_sequence(
+    tx: &mut Transaction<'_, Postgres>,
+    statement: &'static str,
+    max_id: i64,
+) -> Result<(), StorageError> {
+    if max_id <= 0 {
+        return Ok(());
+    }
+    sqlx::query(statement)
+        .bind(max_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+async fn delete_task_queue_record(
+    tx: &mut Transaction<'_, Postgres>,
+    job_id: i64,
+) -> Result<(), StorageError> {
+    let row = sqlx::query(
+        r#"
+        UPDATE taskman_jobs
+        SET deleted_at = now(), updated_at = now()
+        WHERE id = $1 AND deleted_at IS NULL
+        RETURNING record
+        "#,
+    )
+    .bind(job_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some(row) = row {
+        let record: serde_json::Value = row.try_get("record")?;
+        sqlx::query(
+            r#"
+            INSERT INTO taskman_job_history (job_id, op, record)
+            VALUES ($1, $2, $3)
+            "#,
+        )
+        .bind(job_id)
+        .bind(TASK_QUEUE_WAL_DELETE_JOB)
+        .bind(record)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
+fn task_queue_record_from_row(row: PgRow) -> Result<TaskQueueRecord, StorageError> {
+    let record: serde_json::Value = row.try_get("record")?;
+    serde_json::from_value(record).map_err(|source| StorageError::TaskQueueCodec { source })
+}
+
+fn task_queue_snapshot_from_records(records: Vec<TaskQueueRecord>) -> TaskQueueSnapshot {
+    let next_id = records
+        .iter()
+        .map(|record| record.id.saturating_add(1))
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let next_message_id = records
+        .iter()
+        .flat_map(|record| {
+            record
+                .messages
+                .iter()
+                .map(|message| message.id.saturating_add(1))
+        })
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    TaskQueueSnapshot {
+        format: TASK_QUEUE_SNAPSHOT_FORMAT.to_owned(),
+        next_id,
+        next_message_id,
+        records,
+    }
+}
+
+fn task_queue_record_chat_user(record: &TaskQueueRecord) -> (Option<i64>, Option<i64>) {
+    record
+        .job
+        .data
+        .telegram_data
+        .as_ref()
+        .map_or((None, None), |data| {
+            (Some(data.chat_id), Some(data.user_id))
+        })
+}
+
+const fn task_queue_job_type_name(job_type: JobType) -> &'static str {
+    match job_type {
+        JobType::Dialog => "dialog",
+        JobType::ImageGen => "image_gen",
+        JobType::ImageEdit => "image_edit",
+        JobType::MusicGen => "music_gen",
+        JobType::Translation => "translation",
+        JobType::MemoryConsolidation => "memory_consolidation",
+        JobType::Control => "control",
+    }
+}
+
 /// Storage connection failures.
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -5353,6 +5759,11 @@ pub enum StorageError {
     /// Draw rate-limit timestamp JSON codec failed.
     #[error("decode draw rate limit timestamps: {source}")]
     DrawRateLimitCodec {
+        /// JSON codec error.
+        source: serde_json::Error,
+    },
+    #[error("encode or decode task queue record: {source}")]
+    TaskQueueCodec {
         /// JSON codec error.
         source: serde_json::Error,
     },
@@ -7772,6 +8183,120 @@ mod tests {
             .execute(&pool)
             .await;
         result
+    }
+
+    #[tokio::test]
+    async fn live_taskman_queue_round_trips_and_keeps_id_high_water_when_postgres_dsn_is_set()
+    -> Result<(), Box<dyn Error>> {
+        let Ok(dsn) = env::var("OPENPLOTVA_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&dsn)
+            .await?;
+        super::run_migrations_on(&pool).await?;
+        let store = super::PostgresTaskQueueStore::new(pool.clone());
+
+        // Reserve a fresh id from the durable sequence so the test does not collide
+        // with whatever the shared database already holds.
+        let (start_id, _) = store.reserve_id_high_water().await?;
+        let created = time::OffsetDateTime::from_unix_timestamp(1_770_000_000)?;
+        let record = openplotva_taskman::TaskQueueRecord {
+            id: start_id,
+            queue_name: "control".to_owned(),
+            status: openplotva_taskman::JobStatus::Pending,
+            job: openplotva_taskman::new_control_job_at(
+                openplotva_taskman::ControlJobParams {
+                    chat_id: -100,
+                    message_id: 1,
+                    user_id: 7,
+                    user_full_name: "live taskman test".to_owned(),
+                    thread_id: None,
+                    data: openplotva_taskman::ControlJobData::default(),
+                },
+                created,
+            ),
+            worker_id: None,
+            started_at: None,
+            execution_started_at: None,
+            completed_at: None,
+            error: None,
+            progress_message_id: None,
+            queue_position_message_id: None,
+            result_message_id: None,
+            messages: Vec::new(),
+            events: Vec::new(),
+        };
+        let upsert = openplotva_taskman::TaskQueueWalRecord {
+            format: openplotva_taskman::TASK_QUEUE_WAL_FORMAT.to_owned(),
+            op: openplotva_taskman::TASK_QUEUE_WAL_UPSERT_JOB.to_owned(),
+            job_id: record.id,
+            record: Some(record.clone()),
+        };
+        store.apply_task_queue_wal_batch(vec![upsert]).await?;
+
+        // The record round-trips through the JSONB column and the generated columns.
+        let snapshot = store.load_task_queue_snapshot().await?;
+        let loaded = snapshot
+            .records
+            .iter()
+            .find(|candidate| candidate.id == start_id)
+            .expect("inserted taskman job is loaded");
+        assert_eq!(loaded.queue_name, "control");
+        assert_eq!(loaded.status, openplotva_taskman::JobStatus::Pending);
+
+        // The typed columns are bound from the record at upsert time; assert they
+        // round-trip the projected values (the binding itself is compiler-checked).
+        use sqlx::Row as _;
+        let projected = sqlx::query(
+            "SELECT queue_name, status, job_type, chat_id, user_id FROM taskman_jobs WHERE id = $1",
+        )
+        .bind(start_id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(projected.try_get::<String, _>("queue_name")?, "control");
+        assert_eq!(projected.try_get::<String, _>("status")?, "pending");
+        assert_eq!(projected.try_get::<String, _>("job_type")?, "control");
+        assert_eq!(projected.try_get::<i64, _>("chat_id")?, -100);
+        assert_eq!(projected.try_get::<i64, _>("user_id")?, 7);
+
+        // The flush advanced the durable id sequence past the inserted id.
+        let (after_insert_id, _) = store.reserve_id_high_water().await?;
+        assert!(
+            after_insert_id > start_id,
+            "the id sequence must advance past the inserted id"
+        );
+
+        // Soft-delete moves the row to history and drops it from the active snapshot.
+        let delete = openplotva_taskman::TaskQueueWalRecord {
+            format: openplotva_taskman::TASK_QUEUE_WAL_FORMAT.to_owned(),
+            op: openplotva_taskman::TASK_QUEUE_WAL_DELETE_JOB.to_owned(),
+            job_id: start_id,
+            record: None,
+        };
+        store.apply_task_queue_wal_batch(vec![delete]).await?;
+        let after_delete = store.load_task_queue_snapshot().await?;
+        assert!(
+            after_delete.records.iter().all(|r| r.id != start_id),
+            "a soft-deleted job must not load"
+        );
+
+        // Purge hard-deletes the soft-deleted row and its history, yet the durable
+        // high-water must NOT regress: a restart can never reissue the id (#1).
+        let purged = store
+            .purge_task_queue_terminal(time::OffsetDateTime::now_utc() + time::Duration::days(1))
+            .await?;
+        assert!(
+            purged >= 1,
+            "purge removes the soft-deleted row and its history"
+        );
+        let (after_purge_id, _) = store.reserve_id_high_water().await?;
+        assert!(
+            after_purge_id > start_id,
+            "the id high-water must survive a hard purge"
+        );
+        Ok(())
     }
 
     #[test]

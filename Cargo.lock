@@ -2200,6 +2200,7 @@ dependencies = [
  "openplotva-history",
  "openplotva-memory",
  "openplotva-shield",
+ "openplotva-taskman",
  "pgvector",
  "redis",
  "serde",
@@ -2209,6 +2210,7 @@ dependencies = [
  "thiserror",
  "time",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

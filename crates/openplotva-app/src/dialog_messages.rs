@@ -43,7 +43,7 @@ use crate::{
         ImageGenerationError, ImageGenerationRequest, ImageGenerationResult, ImageGenerator,
     },
     permissions::{self, ChatPermissionPolicy, ChatPermissionStore},
-    rate_limits::{self, ChatRateLimitPolicy, RateLimitStore},
+    rate_limits::{self, ChatRateLimitPolicy, RateLimitStore, TaskEnqueueRateLimit},
     updates::{UpdateHandler, UpdateHandlerFuture},
     virtual_messages::{
         QueueStickerRequest, QueueTextRequest, VirtualIdFactory, VirtualMessageStore,
@@ -89,6 +89,7 @@ pub struct DialogMessageScheduleReport {
     pub queue_name: String,
     pub delay: Duration,
     pub replaced: bool,
+    pub rate_limited: bool,
 }
 
 pub trait DialogMessageScheduler {
@@ -939,6 +940,7 @@ pub struct TaskmanDialogMessageScheduler {
     debounce: Arc<InMemoryDialogDebounce>,
     debounce_delay: Duration,
     typing: Arc<dyn DialogTypingActionEffects + Send + Sync>,
+    task_enqueue_rate_limit: Option<Arc<dyn TaskEnqueueRateLimit>>,
 }
 
 impl TaskmanDialogMessageScheduler {
@@ -953,6 +955,7 @@ impl TaskmanDialogMessageScheduler {
             debounce,
             debounce_delay,
             typing: Arc::new(NoopDialogTypingActionEffects),
+            task_enqueue_rate_limit: None,
         }
     }
 
@@ -963,6 +966,44 @@ impl TaskmanDialogMessageScheduler {
     ) -> Self {
         self.typing = typing;
         self
+    }
+
+    #[must_use]
+    pub fn with_task_enqueue_rate_limit(
+        mut self,
+        rate_limit: Arc<dyn TaskEnqueueRateLimit>,
+    ) -> Self {
+        self.task_enqueue_rate_limit = Some(rate_limit);
+        self
+    }
+}
+
+struct TaskEnqueueGrowObserver {
+    rate_limit: Arc<dyn TaskEnqueueRateLimit>,
+}
+
+impl crate::dialog_debounce::DialogDebounceAssignObserver for TaskEnqueueGrowObserver {
+    fn assigned<'a>(
+        &'a self,
+        key: crate::dialog_debounce::DialogDebounceKey,
+        queue_name: &'a str,
+        _task_id: i64,
+    ) -> crate::dialog_debounce::DialogDebounceAssignObserverFuture<'a> {
+        Box::pin(async move {
+            let report = self
+                .rate_limit
+                .grow_task_enqueue_rate_limit(key.chat_id, key.user_id, OffsetDateTime::now_utc())
+                .await;
+            if !report.save_errors.is_empty() {
+                tracing::warn!(
+                    chat_id = key.chat_id,
+                    user_id = key.user_id,
+                    queue_name,
+                    errors = ?report.save_errors,
+                    "failed to persist task enqueue rate-limit timestamps"
+                );
+            }
+        })
     }
 }
 
@@ -988,6 +1029,36 @@ impl DialogMessageScheduler for TaskmanDialogMessageScheduler {
         schedule: DialogMessageSchedule<'a>,
     ) -> DialogMessageFuture<'a, DialogMessageScheduleReport, Self::Error> {
         Box::pin(async move {
+            let key = crate::dialog_debounce::DialogDebounceKey {
+                chat_id: schedule.chat_id,
+                user_id: schedule.sender_id,
+                thread_id: schedule.thread_id.unwrap_or_default().into(),
+            };
+            if let Some(rate_limit) = self.task_enqueue_rate_limit.as_deref() {
+                let report = rate_limit
+                    .check_task_enqueue_rate_limit(
+                        schedule.chat_id,
+                        schedule.sender_id,
+                        OffsetDateTime::now_utc(),
+                    )
+                    .await;
+                if report.limited {
+                    tracing::warn!(
+                        chat_id = schedule.chat_id,
+                        user_id = schedule.sender_id,
+                        queue_name = schedule.queue_name,
+                        scope = ?report.scope,
+                        error = ?report.error,
+                        "task enqueue rate limit blocked dialog job assignment"
+                    );
+                    return Ok(DialogMessageScheduleReport {
+                        queue_name: schedule.queue_name.to_owned(),
+                        delay: Duration::ZERO,
+                        replaced: false,
+                        rate_limited: true,
+                    });
+                }
+            }
             let mut job = new_dialog_job_at(
                 DialogJobParams {
                     chat_id: schedule.chat_id,
@@ -1025,23 +1096,26 @@ impl DialogMessageScheduler for TaskmanDialogMessageScheduler {
                 );
             }
 
-            let report = self.debounce.schedule(
-                crate::dialog_debounce::DialogDebounceKey {
-                    chat_id: schedule.chat_id,
-                    user_id: schedule.sender_id,
-                    thread_id: schedule.thread_id.unwrap_or_default().into(),
-                },
+            let assign_observer = self.task_enqueue_rate_limit.as_ref().map(|rate_limit| {
+                Arc::new(TaskEnqueueGrowObserver {
+                    rate_limit: Arc::clone(rate_limit),
+                }) as Arc<dyn crate::dialog_debounce::DialogDebounceAssignObserver>
+            });
+            let report = self.debounce.schedule_with_assign_observer(
+                key,
                 schedule.message_id,
                 schedule.queue_name,
                 job,
                 self.queue.as_ref().clone(),
                 self.debounce_delay,
+                assign_observer,
             );
 
             Ok(DialogMessageScheduleReport {
                 queue_name: schedule.queue_name.to_owned(),
                 delay: report.delay,
                 replaced: report.replaced,
+                rate_limited: false,
             })
         })
     }
@@ -1094,6 +1168,7 @@ pub enum DialogMessageUpdateRoute {
     IgnoredInvalidMessage,
     SkippedBotSampling,
     SkippedEmptyDialogTrigger,
+    SkippedTaskRateLimit,
     RandomSkippedReactivityOff,
     RandomSkippedGate,
     RandomSkippedUserDisabled,
@@ -1683,6 +1758,9 @@ where
         .map_err(|error| DialogMessageUpdateError::Schedule {
             message: error.to_string(),
         })?;
+    if report.rate_limited {
+        return Ok(DialogMessageUpdateRoute::SkippedTaskRateLimit);
+    }
 
     Ok(DialogMessageUpdateRoute::Scheduled {
         queue_name: report.queue_name,
@@ -1794,6 +1872,8 @@ const DIRECT_SONG_EMPTY_TOPIC_NOTICE: &str = "Не удалось определ
 const DIRECT_SONG_VIP_ONLY_NOTICE: &str = "Функция генерации музыки доступна только для <a href='https://t.me/PlotvoBot?start=vip'>VIP-пользователей</a>.";
 const DIRECT_SONG_ACTIVE_LIMIT_NOTICE: &str =
     "У вас уже 2 активных музыкальных задач (лимит VIP). Дождитесь завершения и попробуйте снова.";
+const DIRECT_SONG_RATE_LIMITED_NOTICE: &str =
+    "Слишком много запросов за короткое время. Подождите немного и попробуйте снова.";
 
 async fn send_direct_song_result_notices(
     effects: Option<&dyn DirectSongNoticeEffects>,
@@ -1824,6 +1904,11 @@ async fn send_direct_song_result_notices(
             ),
             SongScheduleRejection::ActiveLimit => (
                 DIRECT_SONG_ACTIVE_LIMIT_NOTICE,
+                String::new(),
+                Duration::from_secs(60),
+            ),
+            SongScheduleRejection::RateLimited => (
+                DIRECT_SONG_RATE_LIMITED_NOTICE,
                 String::new(),
                 Duration::from_secs(60),
             ),
@@ -2506,6 +2591,9 @@ where
         .map_err(|error| DialogMessageUpdateError::Schedule {
             message: error.to_string(),
         })?;
+    if report.rate_limited {
+        return Ok(DialogMessageUpdateRoute::SkippedTaskRateLimit);
+    }
 
     Ok(DialogMessageUpdateRoute::Scheduled {
         queue_name: report.queue_name,
@@ -2918,6 +3006,65 @@ mod tests {
         assert_eq!(dialog.max_output_tokens, 1024);
         assert_eq!(dialog.meta["sender_id"], 99);
         assert_eq!(typing.calls(), vec![(42, None)]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn addressed_private_message_task_rate_limit_skips_without_typing_or_job()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let queue = Arc::new(InMemoryTaskQueue::new());
+        let debounce = Arc::new(InMemoryDialogDebounce::new());
+        let typing = Arc::new(TypingEffectsStub::default());
+        let limiter = Arc::new(TaskEnqueueRateLimitStub::limited());
+        let scheduler = TaskmanDialogMessageScheduler::new(
+            Arc::clone(&queue),
+            Arc::clone(&debounce),
+            Duration::from_millis(1),
+        )
+        .with_typing_effects(typing.clone())
+        .with_task_enqueue_rate_limit(limiter.clone());
+
+        let route = handle_dialog_message_update_or_else(
+            &scheduler,
+            &test_config(),
+            message_update("hello there")?,
+            |_update| async { Err("should not delegate") },
+        )
+        .await?;
+
+        assert_eq!(route, DialogMessageUpdateRoute::SkippedTaskRateLimit);
+        assert!(queue.records().is_empty());
+        assert!(typing.calls().is_empty());
+        assert_eq!(limiter.checks(), vec![(42, 99)]);
+        assert!(limiter.grows().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn addressed_private_message_grows_task_rate_limit_after_debounce_assign()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let queue = Arc::new(InMemoryTaskQueue::new());
+        let debounce = Arc::new(InMemoryDialogDebounce::new());
+        let limiter = Arc::new(TaskEnqueueRateLimitStub::default());
+        let scheduler = TaskmanDialogMessageScheduler::new(
+            Arc::clone(&queue),
+            Arc::clone(&debounce),
+            Duration::from_millis(1),
+        )
+        .with_task_enqueue_rate_limit(limiter.clone());
+
+        let route = handle_dialog_message_update_or_else(
+            &scheduler,
+            &test_config(),
+            message_update("hello there")?,
+            |_update| async { Err("should not delegate") },
+        )
+        .await?;
+
+        assert!(matches!(route, DialogMessageUpdateRoute::Scheduled { .. }));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(queue.records().len(), 1);
+        assert_eq!(limiter.grows(), vec![(42, 99)]);
         Ok(())
     }
 
@@ -7886,6 +8033,7 @@ mod tests {
                     queue_name: schedule.queue_name.to_owned(),
                     delay: Duration::ZERO,
                     replaced: false,
+                    rate_limited: false,
                 })
             })
         }
@@ -9000,6 +9148,62 @@ mod tests {
             Box::pin(async move {
                 lock(&self.calls).push((chat_id, thread_id));
                 DialogTypingActionReport::Sent
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct TaskEnqueueRateLimitStub {
+        limited: bool,
+        checks: Mutex<Vec<(i64, i64)>>,
+        grows: Mutex<Vec<(i64, i64)>>,
+    }
+
+    impl TaskEnqueueRateLimitStub {
+        fn limited() -> Self {
+            Self {
+                limited: true,
+                ..Self::default()
+            }
+        }
+
+        fn checks(&self) -> Vec<(i64, i64)> {
+            lock(&self.checks).clone()
+        }
+
+        fn grows(&self) -> Vec<(i64, i64)> {
+            lock(&self.grows).clone()
+        }
+    }
+
+    impl TaskEnqueueRateLimit for TaskEnqueueRateLimitStub {
+        fn check_task_enqueue_rate_limit<'a>(
+            &'a self,
+            chat_id: i64,
+            user_id: i64,
+            _now: OffsetDateTime,
+        ) -> crate::rate_limits::TaskEnqueueRateLimitFuture<'a> {
+            Box::pin(async move {
+                lock(&self.checks).push((chat_id, user_id));
+                crate::rate_limits::TaskEnqueueRateLimitReport {
+                    limited: self.limited,
+                    scope: self
+                        .limited
+                        .then_some(crate::rate_limits::TaskEnqueueRateLimitScope::UserChat),
+                    error: None,
+                }
+            })
+        }
+
+        fn grow_task_enqueue_rate_limit<'a>(
+            &'a self,
+            chat_id: i64,
+            user_id: i64,
+            _now: OffsetDateTime,
+        ) -> crate::rate_limits::TaskEnqueueRateLimitGrowFuture<'a> {
+            Box::pin(async move {
+                lock(&self.grows).push((chat_id, user_id));
+                crate::rate_limits::TaskEnqueueRateLimitGrowReport::default()
             })
         }
     }

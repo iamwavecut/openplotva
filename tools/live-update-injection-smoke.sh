@@ -1388,31 +1388,16 @@ wait_history_image_count() {
   done
 }
 
+dump_taskman_jobs() {
+  compose exec -T postgres psql -U plotva -d plotva -Atc \
+    "SELECT id, status, record FROM taskman_jobs WHERE queue_name='$1' ORDER BY id DESC LIMIT 5" \
+    >&2 2>/dev/null || true
+}
+
 latest_music_job_status() {
-  local status=""
-  local wal_status=""
-  if [[ -s "$task_queue_snapshot_file" ]]; then
-    status="$(
-      jq -r \
-        --argjson user_id "$OPENPLOTVA_SMOKE_USER_ID" \
-        --argjson chat_id "$OPENPLOTVA_SMOKE_CHAT_ID" \
-        '[.records[]? | select(.queue_name == "music-vip" and .job.data.type == "music_gen" and .job.data.telegram_data.user_id == $user_id and .job.data.telegram_data.chat_id == $chat_id)] | sort_by(.id) | last | .status // empty' \
-        "$task_queue_snapshot_file" 2>/dev/null || true
-    )"
-  fi
-  if [[ -s "$task_queue_wal_file" ]]; then
-    wal_status="$(
-      jq -s -r \
-        --argjson user_id "$OPENPLOTVA_SMOKE_USER_ID" \
-        --argjson chat_id "$OPENPLOTVA_SMOKE_CHAT_ID" \
-        '[.[]?.record? | select(. != null and .queue_name == "music-vip" and .job.data.type == "music_gen" and .job.data.telegram_data.user_id == $user_id and .job.data.telegram_data.chat_id == $chat_id)] | last | .status // empty' \
-        "$task_queue_wal_file" 2>/dev/null || true
-    )"
-  fi
-  if [[ -n "$wal_status" && "$wal_status" != "null" ]]; then
-    status="$wal_status"
-  fi
-  printf '%s\n' "$status"
+  compose exec -T postgres psql -U plotva -d plotva -Atc \
+    "SELECT status FROM taskman_jobs WHERE queue_name='music-vip' AND job_type='music_gen' AND user_id=${OPENPLOTVA_SMOKE_USER_ID} AND chat_id=${OPENPLOTVA_SMOKE_CHAT_ID} ORDER BY id DESC LIMIT 1" \
+    2>/dev/null || true
 }
 
 wait_music_job_completed() {
@@ -1428,7 +1413,7 @@ wait_music_job_completed() {
       failed|cancelled)
         echo "music-vip task ended with status=${status}" >&2
         tail -n 120 "$app_log" >&2 || true
-        [[ -s "$task_queue_wal_file" ]] && tail -n 20 "$task_queue_wal_file" >&2 || true
+        dump_taskman_jobs music-vip
         exit 1
         ;;
     esac
@@ -1440,8 +1425,7 @@ wait_music_job_completed() {
     if [[ "$SECONDS" -ge "$deadline" ]]; then
       echo "timed out waiting for music-vip completion; current=${status:-<none>}" >&2
       tail -n 200 "$app_log" >&2 || true
-      [[ -s "$task_queue_snapshot_file" ]] && jq '.records[]? | select(.queue_name == "music-vip")' "$task_queue_snapshot_file" >&2 || true
-      [[ -s "$task_queue_wal_file" ]] && tail -n 40 "$task_queue_wal_file" >&2 || true
+      dump_taskman_jobs music-vip
       exit 1
     fi
     sleep 1
@@ -1449,57 +1433,15 @@ wait_music_job_completed() {
 }
 
 latest_image_edit_job_status() {
-  local status=""
-  local wal_status=""
-  if [[ -s "$task_queue_snapshot_file" ]]; then
-    status="$(
-      jq -r \
-        --argjson user_id "$OPENPLOTVA_SMOKE_USER_ID" \
-        --argjson chat_id "$OPENPLOTVA_SMOKE_CHAT_ID" \
-        '[.records[]? | select(.queue_name == "image-vip" and .job.data.type == "image_edit" and .job.data.telegram_data.user_id == $user_id and .job.data.telegram_data.chat_id == $chat_id)] | sort_by(.id) | last | .status // empty' \
-        "$task_queue_snapshot_file" 2>/dev/null || true
-    )"
-  fi
-  if [[ -s "$task_queue_wal_file" ]]; then
-    wal_status="$(
-      jq -s -r \
-        --argjson user_id "$OPENPLOTVA_SMOKE_USER_ID" \
-        --argjson chat_id "$OPENPLOTVA_SMOKE_CHAT_ID" \
-        '[.[]?.record? | select(. != null and .queue_name == "image-vip" and .job.data.type == "image_edit" and .job.data.telegram_data.user_id == $user_id and .job.data.telegram_data.chat_id == $chat_id)] | last | .status // empty' \
-        "$task_queue_wal_file" 2>/dev/null || true
-    )"
-  fi
-  if [[ -n "$wal_status" && "$wal_status" != "null" ]]; then
-    status="$wal_status"
-  fi
-  printf '%s\n' "$status"
+  compose exec -T postgres psql -U plotva -d plotva -Atc \
+    "SELECT status FROM taskman_jobs WHERE queue_name='image-vip' AND job_type='image_edit' AND user_id=${OPENPLOTVA_SMOKE_USER_ID} AND chat_id=${OPENPLOTVA_SMOKE_CHAT_ID} ORDER BY id DESC LIMIT 1" \
+    2>/dev/null || true
 }
 
 latest_image_edit_generated_url_count() {
-  local count="0"
-  local wal_count=""
-  if [[ -s "$task_queue_snapshot_file" ]]; then
-    count="$(
-      jq -r \
-        --argjson user_id "$OPENPLOTVA_SMOKE_USER_ID" \
-        --argjson chat_id "$OPENPLOTVA_SMOKE_CHAT_ID" \
-        '[.records[]? | select(.queue_name == "image-vip" and .job.data.type == "image_edit" and .job.data.telegram_data.user_id == $user_id and .job.data.telegram_data.chat_id == $chat_id)] | sort_by(.id) | last | (.job.data.image_data.image_urls // []) | length' \
-        "$task_queue_snapshot_file" 2>/dev/null || true
-    )"
-  fi
-  if [[ -s "$task_queue_wal_file" ]]; then
-    wal_count="$(
-      jq -s -r \
-        --argjson user_id "$OPENPLOTVA_SMOKE_USER_ID" \
-        --argjson chat_id "$OPENPLOTVA_SMOKE_CHAT_ID" \
-        '[.[]?.record? | select(. != null and .queue_name == "image-vip" and .job.data.type == "image_edit" and .job.data.telegram_data.user_id == $user_id and .job.data.telegram_data.chat_id == $chat_id)] | last | (.job.data.image_data.image_urls // []) | length' \
-        "$task_queue_wal_file" 2>/dev/null || true
-    )"
-  fi
-  if [[ -n "$wal_count" && "$wal_count" != "null" ]]; then
-    count="$wal_count"
-  fi
-  printf '%s\n' "${count:-0}"
+  compose exec -T postgres psql -U plotva -d plotva -Atc \
+    "SELECT COALESCE(jsonb_array_length(record->'job'->'data'->'image_data'->'image_urls'), 0) FROM taskman_jobs WHERE queue_name='image-vip' AND job_type='image_edit' AND user_id=${OPENPLOTVA_SMOKE_USER_ID} AND chat_id=${OPENPLOTVA_SMOKE_CHAT_ID} ORDER BY id DESC LIMIT 1" \
+    2>/dev/null || printf '0\n'
 }
 
 wait_image_edit_job_completed() {
@@ -1519,7 +1461,7 @@ wait_image_edit_job_completed() {
       failed|cancelled)
         echo "image-edit task ended with status=${status}" >&2
         tail -n 120 "$app_log" >&2 || true
-        [[ -s "$task_queue_wal_file" ]] && tail -n 20 "$task_queue_wal_file" >&2 || true
+        dump_taskman_jobs image-vip
         exit 1
         ;;
     esac
@@ -1531,8 +1473,7 @@ wait_image_edit_job_completed() {
     if [[ "$SECONDS" -ge "$deadline" ]]; then
       echo "timed out waiting for image-edit completion; current=${status:-<none>} generated_urls=${generated_count:-<none>}" >&2
       tail -n 200 "$app_log" >&2 || true
-      [[ -s "$task_queue_snapshot_file" ]] && jq '.records[]? | select(.queue_name == "image-vip")' "$task_queue_snapshot_file" >&2 || true
-      [[ -s "$task_queue_wal_file" ]] && tail -n 40 "$task_queue_wal_file" >&2 || true
+      dump_taskman_jobs image-vip
       exit 1
     fi
     sleep 1
@@ -2353,8 +2294,6 @@ telegram_getme_file="${log_dir}/telegram-getme.json"
 host_cargo_home="${CARGO_HOME:-${HOME}/.cargo}"
 host_rustup_home="${RUSTUP_HOME:-${HOME}/.rustup}"
 update_sequence=0
-task_queue_snapshot_file="${log_dir}/home/.plotva/openplotva-task-queue.snap"
-task_queue_wal_file="${task_queue_snapshot_file}.wal"
 
 mkdir -p "$log_dir/home"
 trap cleanup EXIT
@@ -2410,7 +2349,6 @@ echo "+ starting openplotva-app with update production disabled"
   export ACESTEP_REQUEST_TIMEOUT_SECONDS="${ACESTEP_REQUEST_TIMEOUT_SECONDS:-}"
   export ACESTEP_TASK_TIMEOUT_SECONDS="${ACESTEP_TASK_TIMEOUT_SECONDS:-}"
   export ACESTEP_POLL_INTERVAL_SECONDS="${ACESTEP_POLL_INTERVAL_SECONDS:-}"
-  export PERSISTENT_QUEUE_SNAPSHOT_INTERVAL_SECONDS="${PERSISTENT_QUEUE_SNAPSHOT_INTERVAL_SECONDS:-1}"
   export RUNTIME_API_ENABLED=false
   export BOT_WEBHOOK_ENABLED=false
   cargo run -q -p openplotva-app

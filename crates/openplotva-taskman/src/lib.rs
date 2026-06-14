@@ -659,6 +659,18 @@ impl TaskQueueIdAllocator {
             .max(1);
     }
 
+    /// Raise the allocator high-water to at least the given next ids. Seeded from
+    /// the durable Postgres id sequences on startup so issued ids never regress
+    /// below a value handed out before a restart, even after rows were purged.
+    pub fn seed_high_water(&self, next_id: i64, next_message_id: i64) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.next_id = state.next_id.max(next_id).max(1);
+        state.next_message_id = state.next_message_id.max(next_message_id).max(1);
+    }
+
     fn allocate_job_id(&self) -> (i64, i64) {
         let mut state = self
             .state
@@ -2565,7 +2577,7 @@ fn dialog_lane_blockers(records: &[TaskQueueRecord]) -> BTreeMap<(i64, i32), Dia
         match record.status {
             JobStatus::Processing => blocker.processing = true,
             JobStatus::Pending => {
-                let replace = blocker.best_pending_index.map_or(true, |best_index| {
+                let replace = blocker.best_pending_index.is_none_or(|best_index| {
                     compare_go_queue_records(record, &records[best_index]).is_lt()
                 });
                 if replace {

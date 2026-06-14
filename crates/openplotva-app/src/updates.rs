@@ -75,7 +75,7 @@ pub trait UpdateSource {
             let Some(update) = self.dequeue_update(timeout).await? else {
                 return Ok(Vec::new());
             };
-            let mut updates = Vec::with_capacity(max_count.max(1).min(1));
+            let mut updates = Vec::with_capacity(max_count.max(1));
             updates.push(update);
             Ok(updates)
         })
@@ -800,6 +800,7 @@ where
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn process_update_with_state_and_history_store_tracked_at<
     S,
     History,
@@ -936,6 +937,7 @@ where
     run_update_consumer_with_processor_until(source, config, processor, stop).await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_update_consumer_with_history_stage_tracker_until<Q, S, History, H, Tracker, Stop>(
     source: Arc<Q>,
     config: UpdateConsumerConfig,

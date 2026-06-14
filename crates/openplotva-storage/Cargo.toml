@@ -13,6 +13,7 @@ openplotva-core = { path = "../openplotva-core" }
 openplotva-history = { path = "../openplotva-history" }
 openplotva-memory = { path = "../openplotva-memory" }
 openplotva-shield = { path = "../openplotva-shield" }
+openplotva-taskman = { path = "../openplotva-taskman" }
 hex.workspace = true
 pgvector.workspace = true
 redis = { workspace = true, features = ["tokio-comp", "connection-manager"] }
@@ -23,6 +24,7 @@ sqlx = { workspace = true, features = ["macros", "migrate", "postgres", "runtime
 thiserror.workspace = true
 time.workspace = true
 tokio = { workspace = true, features = ["sync"] }
+tracing.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

@@ -2,484 +2,322 @@
 
 use std::{
     collections::BTreeMap,
-    fmt, fs,
+    fmt,
     future::Future,
-    io::{self, Write},
-    path::{Path, PathBuf},
     pin::Pin,
-    sync::{Arc, Mutex},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    sync::{Arc, Mutex, MutexGuard},
+    time::{Duration, Instant},
 };
 
 use openplotva_config::PersistentQueueConfig;
 use openplotva_taskman::{
-    InMemoryTaskQueue, TaskQueueIdAllocator, TaskQueueSnapshot, TaskQueueSnapshotError,
-    TaskQueueWalRecord, TaskQueueWalSink, decode_task_queue_snapshot, decode_task_queue_wal_record,
-    empty_task_queue_snapshot, encode_task_queue_snapshot, encode_task_queue_wal_record,
-    replay_task_queue_wal_records,
+    InMemoryTaskQueue, TaskQueueIdAllocator, TaskQueueSnapshot, TaskQueueWalRecord,
+    TaskQueueWalSink,
 };
 use openplotva_telegram::{
     DeleteMessageRequest, TelegramOutboundMethod, build_delete_message_method,
 };
-use thiserror::Error;
 use time::{Duration as TimeDuration, OffsetDateTime};
+use tokio::sync::Notify;
 
-pub const DEFAULT_SHARED_TASK_QUEUE_SNAPSHOT_FILE: &str = "openplotva-task-queue.snap";
-
-/// Periodic snapshot interval for the runtime shared queue.
-pub const SHARED_TASK_QUEUE_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(10);
-
-/// Shutdown snapshot timeout for the runtime shared queue.
+/// Shutdown dirty Postgres sync timeout for the runtime shared queue.
 pub const SHARED_TASK_QUEUE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 pub const SHARED_TASK_QUEUE_STUCK_SCAN_INTERVAL: Duration = Duration::from_secs(2 * 60);
 pub const SHARED_TASK_QUEUE_STUCK_DURATION: Duration = Duration::from_secs(4 * 60 * 60);
-/// Number of compacted shared task queue WAL archives retained for crash/audit inspection.
-pub const SHARED_TASK_QUEUE_WAL_ARCHIVE_KEEP: usize = 3;
+pub const TASK_QUEUE_DB_SYNC_INTERVAL: Duration = Duration::from_secs(1);
+pub const TASK_QUEUE_DB_SYNC_MUTATION_THRESHOLD: usize = 1_000;
 
-/// File-backed store for Rust-native shared task queue snapshots.
+pub type TaskQueueStoreFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+pub trait SharedTaskQueueDurableStore: Clone + Send + Sync + 'static {
+    type Error: fmt::Display + Send + Sync + 'static;
+
+    fn load_snapshot<'a>(
+        &'a self,
+    ) -> TaskQueueStoreFuture<'a, Result<TaskQueueSnapshot, Self::Error>>;
+
+    fn apply_wal_batch<'a>(
+        &'a self,
+        batch: Vec<TaskQueueWalRecord>,
+    ) -> TaskQueueStoreFuture<'a, Result<(), Self::Error>>;
+}
+
+impl SharedTaskQueueDurableStore for openplotva_storage::PostgresTaskQueueStore {
+    type Error = openplotva_storage::StorageError;
+
+    fn load_snapshot<'a>(
+        &'a self,
+    ) -> TaskQueueStoreFuture<'a, Result<TaskQueueSnapshot, Self::Error>> {
+        Box::pin(async move { self.load_task_queue_snapshot().await })
+    }
+
+    fn apply_wal_batch<'a>(
+        &'a self,
+        batch: Vec<TaskQueueWalRecord>,
+    ) -> TaskQueueStoreFuture<'a, Result<(), Self::Error>> {
+        Box::pin(async move { self.apply_task_queue_wal_batch(batch).await })
+    }
+}
+
+#[derive(Debug, Default)]
+struct BufferedTaskQueueJournalState {
+    dirty: BTreeMap<i64, TaskQueueWalRecord>,
+    dirty_since: Option<Instant>,
+    mutation_count: usize,
+}
+
 #[derive(Clone, Debug)]
-pub struct SharedTaskQueueSnapshotFileStore {
-    path: PathBuf,
+pub struct BufferedTaskQueueJournal<S> {
+    store: S,
+    state: Arc<Mutex<BufferedTaskQueueJournalState>>,
+    notify: Arc<Notify>,
+    // Serializes flushes so the background worker and synchronous (payment) flushes
+    // never run apply_wal_batch concurrently — that would race the mutation_count
+    // accounting and duplicate DB writes.
+    flush_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
-/// Error returned by the shared task queue snapshot file store.
-#[derive(Debug, Error)]
-pub enum SharedTaskQueueSnapshotFileStoreError {
-    /// Reading the snapshot file failed.
-    #[error("read shared task queue snapshot {path}: {source}")]
-    Read {
-        /// Snapshot file path.
-        path: PathBuf,
-        /// Underlying filesystem error.
-        #[source]
-        source: io::Error,
-    },
-    /// Decoding a read snapshot failed.
-    #[error("decode shared task queue snapshot {path}: {source}")]
-    Decode {
-        /// Snapshot file path.
-        path: PathBuf,
-        /// Underlying snapshot decode error.
-        #[source]
-        source: TaskQueueSnapshotError,
-    },
-    /// Creating the snapshot directory failed.
-    #[error("create shared task queue snapshot directory {path}: {source}")]
-    CreateDir {
-        /// Snapshot directory path.
-        path: PathBuf,
-        /// Underlying filesystem error.
-        #[source]
-        source: io::Error,
-    },
-    /// Encoding the snapshot failed.
-    #[error("encode shared task queue snapshot {path}: {source}")]
-    Encode {
-        /// Snapshot file path.
-        path: PathBuf,
-        /// Underlying JSON error.
-        #[source]
-        source: serde_json::Error,
-    },
-    /// Writing the temporary snapshot file failed.
-    #[error("write shared task queue snapshot {path}: {source}")]
-    Write {
-        /// Temporary snapshot file path.
-        path: PathBuf,
-        /// Underlying filesystem error.
-        #[source]
-        source: io::Error,
-    },
-    /// Syncing the temporary snapshot file failed.
-    #[error("sync shared task queue snapshot {path}: {source}")]
-    Sync {
-        /// Temporary snapshot file path.
-        path: PathBuf,
-        /// Underlying filesystem error.
-        #[source]
-        source: io::Error,
-    },
-    /// Installing the temporary snapshot file failed.
-    #[error("install shared task queue snapshot {from} -> {to}: {source}")]
-    Rename {
-        /// Temporary snapshot path.
-        from: PathBuf,
-        /// Final snapshot path.
-        to: PathBuf,
-        /// Underlying filesystem error.
-        #[source]
-        source: io::Error,
-    },
-    /// Reading or writing the Rust-native WAL failed during startup or journaling.
-    #[error("shared task queue WAL {path}: {source}")]
-    Wal {
-        /// WAL file path.
-        path: PathBuf,
-        /// Underlying WAL error.
-        #[source]
-        source: SharedTaskQueueWalFileStoreError,
-    },
-}
-
-/// File-backed append-only Rust-native WAL store for shared task queue mutations.
-#[derive(Clone, Debug)]
-pub struct SharedTaskQueueWalFileStore {
-    path: PathBuf,
-    lock: Arc<Mutex<()>>,
-}
-
-/// Error returned by the shared task queue WAL file store.
-#[derive(Debug, Error)]
-pub enum SharedTaskQueueWalFileStoreError {
-    /// Reading the WAL failed.
-    #[error("read {path}: {source}")]
-    Read {
-        /// WAL path.
-        path: PathBuf,
-        /// Underlying filesystem error.
-        #[source]
-        source: io::Error,
-    },
-    /// Creating the WAL parent directory failed.
-    #[error("create WAL directory {path}: {source}")]
-    CreateDir {
-        /// WAL parent path.
-        path: PathBuf,
-        /// Underlying filesystem error.
-        #[source]
-        source: io::Error,
-    },
-    /// Opening the WAL for append failed.
-    #[error("open {path}: {source}")]
-    Open {
-        /// WAL path.
-        path: PathBuf,
-        /// Underlying filesystem error.
-        #[source]
-        source: io::Error,
-    },
-    /// Encoding a WAL line failed.
-    #[error("encode {path}: {source}")]
-    Encode {
-        /// WAL path.
-        path: PathBuf,
-        /// Underlying JSON error.
-        #[source]
-        source: serde_json::Error,
-    },
-    /// Writing a WAL line failed.
-    #[error("write {path}: {source}")]
-    Write {
-        /// WAL path.
-        path: PathBuf,
-        /// Underlying filesystem error.
-        #[source]
-        source: io::Error,
-    },
-    /// Flushing a WAL line failed.
-    #[error("flush {path}: {source}")]
-    Flush {
-        /// WAL path.
-        path: PathBuf,
-        /// Underlying filesystem error.
-        #[source]
-        source: io::Error,
-    },
-    /// Syncing a compacted WAL failed.
-    #[error("sync compacted WAL {path}: {source}")]
-    Sync {
-        /// WAL path.
-        path: PathBuf,
-        /// Underlying filesystem error.
-        #[source]
-        source: io::Error,
-    },
-    /// Archiving a compacted WAL failed.
-    #[error("archive compacted WAL {from} -> {to}: {source}")]
-    Archive {
-        /// WAL path before archive rotation.
-        from: PathBuf,
-        /// Archive path.
-        to: PathBuf,
-        /// Underlying filesystem error.
-        #[source]
-        source: io::Error,
-    },
-}
-
-impl SharedTaskQueueSnapshotFileStore {
-    /// Build a snapshot store for a concrete file path.
+impl<S> BufferedTaskQueueJournal<S> {
     #[must_use]
-    pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
-    }
-
-    /// Return the configured snapshot file path.
-    #[must_use]
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    /// Load the Rust-native snapshot from disk, returning `None` when it does not exist yet.
-    pub fn load_snapshot(
-        &self,
-    ) -> Result<Option<TaskQueueSnapshot>, SharedTaskQueueSnapshotFileStoreError> {
-        let bytes = match fs::read(&self.path) {
-            Ok(bytes) => bytes,
-            Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(source) => {
-                return Err(SharedTaskQueueSnapshotFileStoreError::Read {
-                    path: self.path.clone(),
-                    source,
-                });
-            }
-        };
-
-        decode_task_queue_snapshot(&bytes)
-            .map(Some)
-            .map_err(|source| SharedTaskQueueSnapshotFileStoreError::Decode {
-                path: self.path.clone(),
-                source,
-            })
-    }
-
-    /// Save the Rust-native snapshot atomically through a sibling temporary file.
-    pub fn save_snapshot(
-        &self,
-        snapshot: &TaskQueueSnapshot,
-    ) -> Result<(), SharedTaskQueueSnapshotFileStoreError> {
-        let bytes = encode_task_queue_snapshot(snapshot).map_err(|source| {
-            SharedTaskQueueSnapshotFileStoreError::Encode {
-                path: self.path.clone(),
-                source,
-            }
-        })?;
-        if let Some(parent) = self
-            .path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            fs::create_dir_all(parent).map_err(|source| {
-                SharedTaskQueueSnapshotFileStoreError::CreateDir {
-                    path: parent.to_path_buf(),
-                    source,
-                }
-            })?;
-        }
-
-        let tmp_path = shared_task_queue_snapshot_tmp_path(&self.path);
-        let mut file = fs::File::create(&tmp_path).map_err(|source| {
-            SharedTaskQueueSnapshotFileStoreError::Write {
-                path: tmp_path.clone(),
-                source,
-            }
-        })?;
-        file.write_all(&bytes)
-            .map_err(|source| SharedTaskQueueSnapshotFileStoreError::Write {
-                path: tmp_path.clone(),
-                source,
-            })?;
-        file.sync_all()
-            .map_err(|source| SharedTaskQueueSnapshotFileStoreError::Sync {
-                path: tmp_path.clone(),
-                source,
-            })?;
-        drop(file);
-
-        fs::rename(&tmp_path, &self.path).map_err(|source| {
-            SharedTaskQueueSnapshotFileStoreError::Rename {
-                from: tmp_path,
-                to: self.path.clone(),
-                source,
-            }
-        })
-    }
-}
-
-impl SharedTaskQueueWalFileStore {
-    /// Build a WAL store next to the configured snapshot file.
-    #[must_use]
-    pub fn new(path: impl Into<PathBuf>) -> Self {
+    pub fn new(store: S) -> Self {
         Self {
-            path: path.into(),
-            lock: Arc::new(Mutex::new(())),
+            store,
+            state: Arc::new(Mutex::new(BufferedTaskQueueJournalState::default())),
+            notify: Arc::new(Notify::new()),
+            flush_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
-    /// Return the configured WAL path.
     #[must_use]
-    pub fn path(&self) -> &Path {
-        &self.path
+    pub fn should_flush_now(&self) -> bool {
+        self.lock().mutation_count >= TASK_QUEUE_DB_SYNC_MUTATION_THRESHOLD
     }
 
-    pub fn load_records(
-        &self,
-    ) -> Result<Vec<TaskQueueWalRecord>, SharedTaskQueueWalFileStoreError> {
-        let text = match fs::read_to_string(&self.path) {
-            Ok(text) => text,
-            Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(source) => {
-                return Err(SharedTaskQueueWalFileStoreError::Read {
-                    path: self.path.clone(),
-                    source,
-                });
+    #[must_use]
+    pub fn dirty_len(&self) -> usize {
+        self.lock().dirty.len()
+    }
+
+    async fn wait_for_dirty_or_stop(&self, stop: &mut (impl Future<Output = ()> + Unpin)) -> bool {
+        loop {
+            if self.dirty_len() > 0 {
+                return true;
             }
+            tokio::select! {
+                () = &mut *stop => return false,
+                () = self.notify.notified() => {}
+            }
+        }
+    }
+
+    fn flush_delay(&self) -> Option<Duration> {
+        let state = self.lock();
+        if state.dirty.is_empty() {
+            return None;
+        }
+        if state.mutation_count >= TASK_QUEUE_DB_SYNC_MUTATION_THRESHOLD {
+            return Some(Duration::ZERO);
+        }
+        let Some(dirty_since) = state.dirty_since else {
+            return Some(TASK_QUEUE_DB_SYNC_INTERVAL);
         };
-
-        let mut records = Vec::new();
-        for line in text.lines().filter(|line| !line.trim().is_empty()) {
-            let Ok(record) = decode_task_queue_wal_record(line.as_bytes()) else {
-                break;
-            };
-            records.push(record);
-        }
-        Ok(records)
+        Some(
+            TASK_QUEUE_DB_SYNC_INTERVAL
+                .checked_sub(dirty_since.elapsed())
+                .unwrap_or(Duration::ZERO),
+        )
     }
 
-    /// Append one WAL line and flush it so crash recovery is not tied to snapshot ticks.
-    pub fn append_record(
-        &self,
-        record: &TaskQueueWalRecord,
-    ) -> Result<(), SharedTaskQueueWalFileStoreError> {
-        let _guard = self
-            .lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(parent) = self
-            .path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            fs::create_dir_all(parent).map_err(|source| {
-                SharedTaskQueueWalFileStoreError::CreateDir {
-                    path: parent.to_path_buf(),
-                    source,
-                }
-            })?;
-        }
-        let bytes = encode_task_queue_wal_record(record).map_err(|source| {
-            SharedTaskQueueWalFileStoreError::Encode {
-                path: self.path.clone(),
-                source,
+    pub async fn flush_dirty(&self) -> Result<usize, S::Error>
+    where
+        S: SharedTaskQueueDurableStore,
+    {
+        let _flush_guard = self.flush_lock.lock().await;
+        let (batch, flushing_mutation_count) = {
+            let state = self.lock();
+            if state.dirty.is_empty() {
+                return Ok(0);
             }
-        })?;
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .map_err(|source| SharedTaskQueueWalFileStoreError::Open {
-                path: self.path.clone(),
-                source,
-            })?;
-        file.write_all(&bytes)
-            .and_then(|()| file.write_all(b"\n"))
-            .map_err(|source| SharedTaskQueueWalFileStoreError::Write {
-                path: self.path.clone(),
-                source,
-            })?;
-        file.flush()
-            .map_err(|source| SharedTaskQueueWalFileStoreError::Flush {
-                path: self.path.clone(),
-                source,
-            })
-    }
-
-    /// Truncate WAL after its mutations have been durably captured in the snapshot.
-    pub fn truncate_after_snapshot(&self) -> Result<(), SharedTaskQueueWalFileStoreError> {
-        let _guard = self
-            .lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(parent) = self
-            .path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            fs::create_dir_all(parent).map_err(|source| {
-                SharedTaskQueueWalFileStoreError::CreateDir {
-                    path: parent.to_path_buf(),
-                    source,
-                }
-            })?;
-        }
-        let archive_path = match fs::metadata(&self.path) {
-            Ok(metadata) if metadata.len() > 0 => {
-                Some(shared_task_queue_wal_archive_path(&self.path))
-            }
-            Ok(_) => None,
-            Err(source) if source.kind() == io::ErrorKind::NotFound => None,
-            Err(source) => {
-                return Err(SharedTaskQueueWalFileStoreError::Read {
-                    path: self.path.clone(),
-                    source,
-                });
-            }
+            (
+                state.dirty.values().cloned().collect::<Vec<_>>(),
+                state.mutation_count,
+            )
         };
-        if let Some(archive_path) = archive_path {
-            fs::rename(&self.path, &archive_path).map_err(|source| {
-                SharedTaskQueueWalFileStoreError::Archive {
-                    from: self.path.clone(),
-                    to: archive_path.clone(),
-                    source,
-                }
-            })?;
-            prune_shared_task_queue_wal_archives(&self.path, SHARED_TASK_QUEUE_WAL_ARCHIVE_KEEP);
+        if let Err(error) = self.store.apply_wal_batch(batch.clone()).await {
+            self.mark_flush_failed(flushing_mutation_count);
+            return Err(error);
         }
-        let file = fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&self.path)
-            .map_err(|source| SharedTaskQueueWalFileStoreError::Open {
-                path: self.path.clone(),
-                source,
-            })?;
-        file.sync_all()
-            .map_err(|source| SharedTaskQueueWalFileStoreError::Sync {
-                path: self.path.clone(),
-                source,
-            })
+        self.mark_flushed(&batch, flushing_mutation_count);
+        Ok(batch.len())
+    }
+
+    fn mark_flush_failed(&self, _flushing_mutation_count: usize) {
+        // Nothing was persisted, so keep dirty_since and mutation_count intact: both
+        // triggers must keep reflecting the true unpersisted backlog. The worker
+        // applies its own retry backoff (run_task_queue_db_sync_worker_until).
+        self.notify.notify_one();
+    }
+
+    fn mark_flushed(&self, batch: &[TaskQueueWalRecord], flushing_mutation_count: usize) {
+        let mut state = self.lock();
+        for flushed in batch {
+            if state
+                .dirty
+                .get(&flushed.job_id)
+                .is_some_and(|current| current == flushed)
+            {
+                state.dirty.remove(&flushed.job_id);
+            }
+        }
+        if state.dirty.is_empty() {
+            state.dirty_since = None;
+            state.mutation_count = 0;
+        } else {
+            state.dirty_since = Some(Instant::now());
+            state.mutation_count = state.mutation_count.saturating_sub(flushing_mutation_count);
+            self.notify.notify_one();
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, BufferedTaskQueueJournalState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
-impl TaskQueueWalSink for SharedTaskQueueWalFileStore {
+impl<S> TaskQueueWalSink for BufferedTaskQueueJournal<S>
+where
+    S: Send + Sync,
+{
     fn append_task_queue_wal_record(&self, record: &TaskQueueWalRecord) {
-        if let Err(error) = self.append_record(record) {
-            tracing::warn!(%error, path = %self.path.display(), "failed to append shared task queue WAL");
+        let mut state = self.lock();
+        if state.dirty_since.is_none() {
+            state.dirty_since = Some(Instant::now());
+        }
+        state.mutation_count = state.mutation_count.saturating_add(1);
+        state.dirty.insert(record.job_id, record.clone());
+        let notify = state.mutation_count == 1
+            || state.mutation_count >= TASK_QUEUE_DB_SYNC_MUTATION_THRESHOLD;
+        drop(state);
+        if notify {
+            self.notify.notify_one();
         }
     }
 }
 
-/// Runtime-owned shared task queue plus its durable snapshot store.
+/// Cap and shaping for the worker's exponential retry backoff on flush failure.
+const TASK_QUEUE_DB_SYNC_BACKOFF_CAP: Duration = Duration::from_secs(30);
+const TASK_QUEUE_DB_SYNC_BACKOFF_MAX_SHIFT: u32 = 5;
+/// After the first failure log, only re-log every Nth consecutive failure so a
+/// multi-minute Postgres outage does not spam the warn stream.
+const TASK_QUEUE_DB_SYNC_FAILURE_LOG_EVERY: u32 = 30;
+
+fn task_queue_db_sync_backoff(consecutive_failures: u32) -> Duration {
+    let shift = consecutive_failures
+        .saturating_sub(1)
+        .min(TASK_QUEUE_DB_SYNC_BACKOFF_MAX_SHIFT);
+    let capped =
+        (TASK_QUEUE_DB_SYNC_INTERVAL * (1u32 << shift)).min(TASK_QUEUE_DB_SYNC_BACKOFF_CAP);
+    // Full jitter in [capped/2, capped] decorrelates retries if several instances ever
+    // share the database, and avoids a synchronized retry pulse.
+    let half = (capped.as_millis() as u64) / 2;
+    Duration::from_millis(half + rand::random::<u64>() % (half + 1))
+}
+
+pub async fn run_task_queue_db_sync_worker_until<S>(
+    journal: BufferedTaskQueueJournal<S>,
+    stop: impl Future<Output = ()>,
+) -> SharedTaskQueueDbSyncWorkerReport
+where
+    S: SharedTaskQueueDurableStore,
+{
+    let mut report = SharedTaskQueueDbSyncWorkerReport::default();
+    let mut consecutive_failures: u32 = 0;
+    tokio::pin!(stop);
+
+    loop {
+        if !journal.wait_for_dirty_or_stop(&mut stop).await {
+            break;
+        }
+
+        while let Some(delay) = journal.flush_delay() {
+            if delay.is_zero() {
+                break;
+            }
+            tokio::select! {
+                () = &mut stop => {
+                    match journal.flush_dirty().await {
+                        Ok(flushed) => report.flushed += flushed,
+                        Err(error) => {
+                            report.errors += 1;
+                            report.last_error = Some(error.to_string());
+                            tracing::warn!(%error, "failed to flush shared taskman queue during shutdown");
+                        }
+                    }
+                    return report;
+                }
+                () = journal.notify.notified() => {}
+                () = tokio::time::sleep(delay) => break,
+            }
+        }
+
+        report.ticks += 1;
+        match journal.flush_dirty().await {
+            Ok(flushed) => {
+                report.flushed += flushed;
+                consecutive_failures = 0;
+            }
+            Err(error) => {
+                report.errors += 1;
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                report.last_error = Some(error.to_string());
+                if consecutive_failures == 1
+                    || consecutive_failures.is_multiple_of(TASK_QUEUE_DB_SYNC_FAILURE_LOG_EVERY)
+                {
+                    tracing::warn!(
+                        %error,
+                        consecutive_failures,
+                        "failed to flush shared taskman queue to Postgres"
+                    );
+                }
+                tokio::select! {
+                    () = &mut stop => break,
+                    () = tokio::time::sleep(task_queue_db_sync_backoff(consecutive_failures)) => {}
+                }
+            }
+        }
+    }
+
+    report
+}
+
+/// Runtime-owned shared task queue plus its buffered PostgreSQL journal.
 #[derive(Clone, Debug)]
 pub struct SharedTaskQueueRuntime {
     queue: Arc<InMemoryTaskQueue>,
-    snapshots: SharedTaskQueueSnapshotFileStore,
-    wal: SharedTaskQueueWalFileStore,
-    persist_lock: Arc<Mutex<()>>,
+    db_journal: Option<BufferedTaskQueueJournal<openplotva_storage::PostgresTaskQueueStore>>,
 }
 
 /// Startup restore report for the shared task queue.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SharedTaskQueueRestoreReport {
-    /// Number of records loaded from the snapshot.
+    /// Number of records loaded from PostgreSQL.
     pub restored: usize,
-    /// Number of Rust-native WAL lines replayed after the snapshot.
-    pub wal_replayed: usize,
     /// Number of processing jobs reset to pending during startup.
     pub requeued: usize,
 }
 
-/// Periodic snapshot worker report.
+/// Buffered PostgreSQL sync worker report.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct SharedTaskQueueSnapshotWorkerReport {
-    /// Number of snapshot ticks observed.
+pub struct SharedTaskQueueDbSyncWorkerReport {
+    /// Number of dirty flush attempts observed.
     pub ticks: usize,
-    /// Number of successful snapshot writes.
-    pub saved: usize,
-    /// Number of failed snapshot writes.
+    /// Number of coalesced dirty records flushed to PostgreSQL.
+    pub flushed: usize,
+    /// Number of failed flush attempts.
     pub errors: usize,
-    /// Last snapshot write error, if any.
+    /// Last PostgreSQL flush error, if any.
     pub last_error: Option<String>,
 }
 
@@ -490,12 +328,6 @@ pub struct SharedTaskQueueRecoveryWorkerReport {
     pub ticks: usize,
     /// Number of processing jobs moved back to pending.
     pub requeued: usize,
-    /// Number of successful snapshot writes after recovery.
-    pub saved: usize,
-    /// Number of failed snapshot writes after recovery.
-    pub errors: usize,
-    /// Last snapshot write error, if any.
-    pub last_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -504,11 +336,18 @@ pub struct SharedTaskQueueTerminalCleanupWorkerReport {
     pub ticks: usize,
     /// Number of terminal jobs deleted.
     pub deleted: usize,
-    /// Number of successful snapshot writes after cleanup.
-    pub saved: usize,
-    /// Number of failed snapshot writes after cleanup.
+}
+
+/// Periodic Postgres hard-purge worker report.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SharedTaskQueueDbPurgeWorkerReport {
+    /// Number of purge ticks observed.
+    pub ticks: usize,
+    /// Number of soft-deleted jobs and history rows physically removed.
+    pub purged: usize,
+    /// Number of failed purge attempts.
     pub errors: usize,
-    /// Last snapshot write error, if any.
+    /// Last Postgres purge error, if any.
     pub last_error: Option<String>,
 }
 
@@ -528,12 +367,6 @@ pub struct SharedTaskQueueStuckCleanupWorkerReport {
     pub ticks: usize,
     /// Number of processing jobs marked failed.
     pub failed: usize,
-    /// Number of successful snapshot writes after cleanup.
-    pub saved: usize,
-    /// Number of failed snapshot writes after cleanup.
-    pub errors: usize,
-    /// Last snapshot write error, if any.
-    pub last_error: Option<String>,
 }
 
 /// One placeholder cleanup pass report.
@@ -543,15 +376,11 @@ pub struct SharedTaskQueuePlaceholderCleanupReport {
     pub found: usize,
     /// Number of Telegram delete requests attempted.
     pub attempted: usize,
-    /// Number of taskman message rows removed from the snapshot queue.
+    /// Number of taskman message rows removed from the in-memory queue.
     pub cleaned: usize,
     /// Number of Telegram delete requests that failed.
     pub delete_errors: usize,
-    /// Number of successful snapshot writes after cleanup.
-    pub saved: usize,
-    /// Number of failed snapshot writes after cleanup.
-    pub errors: usize,
-    /// Last Telegram or snapshot write error, if any.
+    /// Last Telegram delete error, if any.
     pub last_error: Option<String>,
 }
 
@@ -564,15 +393,11 @@ pub struct SharedTaskQueuePlaceholderCleanupWorkerReport {
     pub found: usize,
     /// Number of Telegram delete requests attempted.
     pub attempted: usize,
-    /// Number of taskman message rows removed from the snapshot queue.
+    /// Number of taskman message rows removed from the in-memory queue.
     pub cleaned: usize,
     /// Number of Telegram delete requests that failed.
     pub delete_errors: usize,
-    /// Number of successful snapshot writes after cleanup.
-    pub saved: usize,
-    /// Number of failed snapshot writes after cleanup.
-    pub errors: usize,
-    /// Last Telegram or snapshot write error, if any.
+    /// Last Telegram delete error, if any.
     pub last_error: Option<String>,
 }
 
@@ -616,92 +441,48 @@ impl SharedTaskQueuePlaceholderDeleteEffects for openplotva_telegram::TelegramCl
 }
 
 impl SharedTaskQueueRuntime {
-    /// Load a queue from the snapshot file, or start empty when no snapshot exists yet.
-    pub fn load_or_new(
-        snapshots: SharedTaskQueueSnapshotFileStore,
-    ) -> Result<(Self, SharedTaskQueueRestoreReport), SharedTaskQueueSnapshotFileStoreError> {
-        Self::load_or_new_inner(snapshots, None)
-    }
-
-    /// Load a queue using the shared runtime taskman ID allocator.
-    pub fn load_or_new_with_id_allocator(
-        snapshots: SharedTaskQueueSnapshotFileStore,
+    pub async fn load_from_postgres_with_id_allocator(
+        store: openplotva_storage::PostgresTaskQueueStore,
         ids: TaskQueueIdAllocator,
-    ) -> Result<(Self, SharedTaskQueueRestoreReport), SharedTaskQueueSnapshotFileStoreError> {
-        Self::load_or_new_inner(snapshots, Some(ids))
-    }
-
-    fn load_or_new_inner(
-        snapshots: SharedTaskQueueSnapshotFileStore,
-        ids: Option<TaskQueueIdAllocator>,
-    ) -> Result<(Self, SharedTaskQueueRestoreReport), SharedTaskQueueSnapshotFileStoreError> {
-        let wal = SharedTaskQueueWalFileStore::new(shared_task_queue_wal_path(snapshots.path()));
-        let wal_records =
-            wal.load_records()
-                .map_err(|source| SharedTaskQueueSnapshotFileStoreError::Wal {
-                    path: wal.path().to_path_buf(),
-                    source,
-                })?;
-        let wal_replayed = wal_records.len();
-        let snapshot = snapshots
-            .load_snapshot()?
-            .unwrap_or_else(empty_task_queue_snapshot);
-        let snapshot = replay_task_queue_wal_records(snapshot, wal_records);
+    ) -> Result<(Self, SharedTaskQueueRestoreReport), openplotva_storage::StorageError> {
+        // Seed the allocator from the durable id sequences (reconciled with any rows)
+        // so issued ids never regress below a value handed out before this restart.
+        let (next_job_id, next_message_id) = store.reserve_id_high_water().await?;
+        ids.seed_high_water(next_job_id, next_message_id);
+        let snapshot = store.load_task_queue_snapshot().await?;
         let restored_before_requeue = snapshot.records.len();
-        let journal: Arc<dyn TaskQueueWalSink> = Arc::new(wal.clone());
-        let queue = Arc::new(match ids {
-            Some(ids) => InMemoryTaskQueue::from_snapshot_with_id_allocator_and_journal(
-                snapshot, ids, journal,
+        let journal = BufferedTaskQueueJournal::new(store);
+        let journal_sink: Arc<dyn TaskQueueWalSink> = Arc::new(journal.clone());
+        let queue = Arc::new(
+            InMemoryTaskQueue::from_snapshot_with_id_allocator_and_journal(
+                snapshot,
+                ids,
+                journal_sink,
             ),
-            None => InMemoryTaskQueue::from_snapshot_with_journal(snapshot, journal),
-        });
+        );
         let requeued = queue.requeue_processing_for_startup();
-        let mut report = SharedTaskQueueRestoreReport {
-            restored: restored_before_requeue,
-            wal_replayed,
+        if requeued > 0 {
+            journal.flush_dirty().await?;
+        }
+        let report = SharedTaskQueueRestoreReport {
+            restored: queue.records().len().max(restored_before_requeue),
             requeued,
         };
-        let runtime = Self {
-            queue,
-            snapshots,
-            wal,
-            persist_lock: Arc::new(Mutex::new(())),
-        };
-        if report.requeued > 0 {
-            runtime.persist_snapshot()?;
-        }
-        report.restored = runtime.queue.records().len();
-        Ok((runtime, report))
+        Ok((
+            Self {
+                queue,
+                db_journal: Some(journal),
+            },
+            report,
+        ))
     }
 
-    /// Build an empty queue with the provided snapshot store.
+    #[cfg(test)]
     #[must_use]
-    pub fn new_empty(snapshots: SharedTaskQueueSnapshotFileStore) -> Self {
-        let wal = SharedTaskQueueWalFileStore::new(shared_task_queue_wal_path(snapshots.path()));
-        let journal: Arc<dyn TaskQueueWalSink> = Arc::new(wal.clone());
+    fn new_for_test(queue: InMemoryTaskQueue) -> Self {
         Self {
-            queue: Arc::new(InMemoryTaskQueue::new_with_journal(journal)),
-            snapshots,
-            wal,
-            persist_lock: Arc::new(Mutex::new(())),
-        }
-    }
-
-    /// Build an empty queue using the shared runtime taskman ID allocator.
-    #[must_use]
-    pub fn new_empty_with_id_allocator(
-        snapshots: SharedTaskQueueSnapshotFileStore,
-        ids: TaskQueueIdAllocator,
-    ) -> Self {
-        let wal = SharedTaskQueueWalFileStore::new(shared_task_queue_wal_path(snapshots.path()));
-        let journal: Arc<dyn TaskQueueWalSink> = Arc::new(wal.clone());
-        Self {
-            queue: Arc::new(InMemoryTaskQueue::new_with_id_allocator_and_journal(
-                ids, journal,
-            )),
-            snapshots,
-            wal,
-            persist_lock: Arc::new(Mutex::new(())),
+            queue: Arc::new(queue),
+            db_journal: None,
         }
     }
 
@@ -709,35 +490,6 @@ impl SharedTaskQueueRuntime {
     #[must_use]
     pub fn queue(&self) -> Arc<InMemoryTaskQueue> {
         Arc::clone(&self.queue)
-    }
-
-    /// Return the snapshot path.
-    #[must_use]
-    pub fn snapshot_path(&self) -> &Path {
-        self.snapshots.path()
-    }
-
-    /// Return the Rust-native WAL path.
-    #[must_use]
-    pub fn wal_path(&self) -> &Path {
-        self.wal.path()
-    }
-
-    /// Persist a point-in-time queue snapshot.
-    pub fn persist_snapshot(&self) -> Result<(), SharedTaskQueueSnapshotFileStoreError> {
-        let _guard = self
-            .persist_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        self.queue.with_locked_snapshot(|snapshot| {
-            self.snapshots.save_snapshot(snapshot)?;
-            self.wal.truncate_after_snapshot().map_err(|source| {
-                SharedTaskQueueSnapshotFileStoreError::Wal {
-                    path: self.wal.path().to_path_buf(),
-                    source,
-                }
-            })
-        })
     }
 
     pub fn requeue_expired_processing(&self, now: OffsetDateTime) -> Vec<i64> {
@@ -756,31 +508,23 @@ impl SharedTaskQueueRuntime {
     pub fn prune_terminal_before(&self, cutoff: OffsetDateTime) -> Vec<i64> {
         self.queue.prune_terminal_before(cutoff)
     }
-}
 
-/// Default Rust-native snapshot path for the shared task queue.
-#[must_use]
-pub fn default_shared_task_queue_snapshot_path() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".plotva")
-        .join(DEFAULT_SHARED_TASK_QUEUE_SNAPSHOT_FILE)
-}
-
-#[must_use]
-pub fn shared_task_queue_snapshot_path_from_config(config: &PersistentQueueConfig) -> PathBuf {
-    let configured = config.snapshot_path.trim();
-    if configured.is_empty() {
-        default_shared_task_queue_snapshot_path()
-    } else {
-        PathBuf::from(configured)
+    #[must_use]
+    pub fn db_journal(
+        &self,
+    ) -> Option<BufferedTaskQueueJournal<openplotva_storage::PostgresTaskQueueStore>> {
+        self.db_journal.clone()
     }
-}
 
-#[must_use]
-pub fn shared_task_queue_snapshot_interval_from_config(config: &PersistentQueueConfig) -> Duration {
-    Duration::from_secs(config.snapshot_interval_seconds.max(1) as u64)
+    pub async fn flush_dirty(&self) -> Result<usize, String> {
+        match &self.db_journal {
+            Some(journal) => journal
+                .flush_dirty()
+                .await
+                .map_err(|error| error.to_string()),
+            None => Ok(0),
+        }
+    }
 }
 
 #[must_use]
@@ -829,37 +573,6 @@ pub fn shared_task_queue_worker_ids(worker_counts: &BTreeMap<String, i32>) -> Ve
             (0..(*count).max(0)).map(move |index| format!("{queue_name}-worker-{index}"))
         })
         .collect()
-}
-
-/// Persist the shared task queue periodically until shutdown is requested.
-pub async fn run_shared_task_queue_snapshot_worker_until(
-    runtime: SharedTaskQueueRuntime,
-    interval: Duration,
-    stop: impl std::future::Future<Output = ()>,
-) -> SharedTaskQueueSnapshotWorkerReport {
-    let mut report = SharedTaskQueueSnapshotWorkerReport::default();
-    let mut ticker = tokio::time::interval(interval);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    tokio::pin!(stop);
-
-    loop {
-        tokio::select! {
-            () = &mut stop => break,
-            _ = ticker.tick() => {
-                report.ticks += 1;
-                match runtime.persist_snapshot() {
-                    Ok(()) => report.saved += 1,
-                    Err(error) => {
-                        report.errors += 1;
-                        report.last_error = Some(error.to_string());
-                        tracing::warn!(%error, path = %runtime.snapshot_path().display(), "failed to persist shared task queue snapshot");
-                    }
-                }
-            }
-        }
-    }
-
-    report
 }
 
 /// Update shared taskman worker heartbeats periodically until shutdown is requested.
@@ -915,14 +628,6 @@ pub async fn run_shared_task_queue_recovery_worker_until(
                 }
                 report.requeued += requeued.len();
                 tracing::warn!(?requeued, "requeued expired shared taskman processing jobs");
-                match runtime.persist_snapshot() {
-                    Ok(()) => report.saved += 1,
-                    Err(error) => {
-                        report.errors += 1;
-                        report.last_error = Some(error.to_string());
-                        tracing::warn!(%error, path = %runtime.snapshot_path().display(), "failed to persist shared task queue snapshot after recovery");
-                    }
-                }
             }
         }
     }
@@ -953,12 +658,43 @@ pub async fn run_shared_task_queue_terminal_cleanup_worker_until(
                 }
                 report.deleted += deleted.len();
                 tracing::warn!(deleted = deleted.len(), "deleted old shared taskman terminal jobs");
-                match runtime.persist_snapshot() {
-                    Ok(()) => report.saved += 1,
+            }
+        }
+    }
+
+    report
+}
+
+/// Hard-delete soft-deleted jobs and old history from Postgres periodically. The
+/// in-memory prune only soft-deletes rows (via delete WAL); without this purge the
+/// `taskman_jobs` and `taskman_job_history` tables grow without bound.
+pub async fn run_shared_task_queue_db_purge_worker_until(
+    store: openplotva_storage::PostgresTaskQueueStore,
+    interval: Duration,
+    retention: TimeDuration,
+    stop: impl std::future::Future<Output = ()>,
+) -> SharedTaskQueueDbPurgeWorkerReport {
+    let mut report = SharedTaskQueueDbPurgeWorkerReport::default();
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    tokio::pin!(stop);
+
+    loop {
+        tokio::select! {
+            () = &mut stop => break,
+            _ = ticker.tick() => {
+                report.ticks += 1;
+                let cutoff = OffsetDateTime::now_utc() - retention;
+                match store.purge_task_queue_terminal(cutoff).await {
+                    Ok(0) => {}
+                    Ok(purged) => {
+                        report.purged += purged as usize;
+                        tracing::info!(purged, "purged old shared taskman rows from Postgres");
+                    }
                     Err(error) => {
                         report.errors += 1;
                         report.last_error = Some(error.to_string());
-                        tracing::warn!(%error, path = %runtime.snapshot_path().display(), "failed to persist shared task queue snapshot after terminal cleanup");
+                        tracing::warn!(%error, "failed to purge shared taskman rows from Postgres");
                     }
                 }
             }
@@ -991,14 +727,6 @@ pub async fn run_shared_task_queue_stuck_cleanup_worker_until(
                 }
                 report.failed += failed.len();
                 tracing::warn!(?failed, "marked stuck shared taskman processing jobs failed");
-                match runtime.persist_snapshot() {
-                    Ok(()) => report.saved += 1,
-                    Err(error) => {
-                        report.errors += 1;
-                        report.last_error = Some(error.to_string());
-                        tracing::warn!(%error, path = %runtime.snapshot_path().display(), "failed to persist shared task queue snapshot after stuck cleanup");
-                    }
-                }
             }
         }
     }
@@ -1045,17 +773,6 @@ where
         }
     }
 
-    if report.cleaned > 0 {
-        match runtime.persist_snapshot() {
-            Ok(()) => report.saved += 1,
-            Err(error) => {
-                report.errors += 1;
-                report.last_error = Some(error.to_string());
-                tracing::warn!(%error, path = %runtime.snapshot_path().display(), "failed to persist shared task queue snapshot after placeholder cleanup");
-            }
-        }
-    }
-
     report
 }
 
@@ -1092,8 +809,6 @@ where
                 report.attempted += pass.attempted;
                 report.cleaned += pass.cleaned;
                 report.delete_errors += pass.delete_errors;
-                report.saved += pass.saved;
-                report.errors += pass.errors;
                 if pass.last_error.is_some() {
                     report.last_error = pass.last_error;
                 }
@@ -1104,73 +819,13 @@ where
     report
 }
 
-fn shared_task_queue_snapshot_tmp_path(path: &Path) -> PathBuf {
-    let file_name = path
-        .file_name()
-        .map(|name| name.to_string_lossy())
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| DEFAULT_SHARED_TASK_QUEUE_SNAPSHOT_FILE.into());
-    path.with_file_name(format!("{file_name}.tmp"))
-}
-
-fn shared_task_queue_wal_path(path: &Path) -> PathBuf {
-    PathBuf::from(format!("{}.wal", path.display()))
-}
-
-fn shared_task_queue_wal_archive_path(path: &Path) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    let mut archive = PathBuf::from(format!("{}.archive.{nanos}", path.display()));
-    for suffix in 1..100 {
-        if !archive.exists() {
-            return archive;
-        }
-        archive = PathBuf::from(format!("{}.archive.{nanos}.{suffix}", path.display()));
-    }
-    archive
-}
-
-fn prune_shared_task_queue_wal_archives(path: &Path, keep: usize) {
-    let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    else {
-        return;
-    };
-    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
-        return;
-    };
-    let prefix = format!("{file_name}.archive.");
-    let Ok(entries) = fs::read_dir(parent) else {
-        return;
-    };
-    let mut archives: Vec<_> = entries
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|entry_path| {
-            entry_path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with(&prefix))
-        })
-        .collect();
-    archives.sort();
-    let remove_count = archives.len().saturating_sub(keep);
-    for archive in archives.into_iter().take(remove_count) {
-        if let Err(error) = fs::remove_file(&archive) {
-            tracing::warn!(%error, path = %archive.display(), "failed to prune shared task queue WAL archive");
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use openplotva_taskman::{
-        DEFAULT_PRIORITY, DialogJobParams, MESSAGE_STATUS_COMPLETED, MESSAGE_STATUS_PLACEHOLDER,
-        MESSAGE_TYPE_RESULT, TEXT_QUEUE_NAME, TaskQueueJobMessageParams, new_dialog_job_at,
+        DialogJobParams, MESSAGE_STATUS_COMPLETED, MESSAGE_STATUS_PLACEHOLDER, MESSAGE_TYPE_RESULT,
+        TEXT_QUEUE_NAME, TaskQueueJobMessageParams, TaskQueueRecord, empty_task_queue_snapshot,
+        new_dialog_job_at,
     };
     use std::{
         collections::BTreeMap,
@@ -1179,38 +834,8 @@ mod tests {
     use time::OffsetDateTime;
 
     #[test]
-    fn shared_task_queue_snapshot_path_uses_default_for_blank_go_config() {
-        let config = persistent_queue_config("", 60);
-
-        assert_eq!(
-            shared_task_queue_snapshot_path_from_config(&config),
-            default_shared_task_queue_snapshot_path()
-        );
-    }
-
-    #[test]
-    fn shared_task_queue_snapshot_path_uses_go_override_when_present() {
-        let config = persistent_queue_config("/tmp/openplotva-custom-task-queue.snap", 60);
-
-        assert_eq!(
-            shared_task_queue_snapshot_path_from_config(&config),
-            PathBuf::from("/tmp/openplotva-custom-task-queue.snap")
-        );
-    }
-
-    #[test]
-    fn shared_task_queue_snapshot_interval_uses_go_config_seconds() {
-        let config = persistent_queue_config("", 12);
-
-        assert_eq!(
-            shared_task_queue_snapshot_interval_from_config(&config),
-            Duration::from_secs(12)
-        );
-    }
-
-    #[test]
     fn shared_task_queue_recovery_interval_uses_go_config_seconds() {
-        let mut config = persistent_queue_config("", 60);
+        let mut config = persistent_queue_config();
         config.recovery_interval_seconds = 9;
 
         assert_eq!(
@@ -1221,7 +846,7 @@ mod tests {
 
     #[test]
     fn shared_task_queue_heartbeat_config_and_worker_ids_match_go_shape() {
-        let mut config = persistent_queue_config("", 60);
+        let mut config = persistent_queue_config();
         config.heartbeat_interval_seconds = 17;
         let worker_counts = BTreeMap::from([
             ("image-regular".to_owned(), 1),
@@ -1245,9 +870,7 @@ mod tests {
 
     #[test]
     fn shared_task_queue_runtime_updates_worker_heartbeat() {
-        let path = unique_task_queue_snapshot_path("heartbeat");
-        let store = SharedTaskQueueSnapshotFileStore::new(path.clone());
-        let runtime = SharedTaskQueueRuntime::new_empty(store);
+        let runtime = SharedTaskQueueRuntime::new_for_test(InMemoryTaskQueue::new());
         let now = OffsetDateTime::from_unix_timestamp(1_779_193_800).expect("timestamp");
 
         runtime.update_worker_heartbeat("text-worker-0", now);
@@ -1256,12 +879,11 @@ mod tests {
             runtime.queue().worker_heartbeat_at("text-worker-0"),
             Some(now)
         );
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]
     fn shared_task_queue_placeholder_cleanup_config_uses_go_seconds() {
-        let mut config = persistent_queue_config("", 60);
+        let mut config = persistent_queue_config();
         config.placeholder_cleanup_interval_seconds = 11;
         config.placeholder_max_age_seconds = 22;
 
@@ -1275,261 +897,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn shared_task_queue_runtime_round_trips_snapshot_and_requeues_processing()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let path = unique_task_queue_snapshot_path("round-trip");
-        let _ = std::fs::remove_file(&path);
-        let store = SharedTaskQueueSnapshotFileStore::new(path.clone());
-        let runtime = SharedTaskQueueRuntime::new_empty(store.clone());
-        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
-        let first = runtime.queue().assign(
-            TEXT_QUEUE_NAME,
-            new_dialog_job_at(dialog_params("first"), now),
-        );
-        let second = runtime.queue().assign(
-            TEXT_QUEUE_NAME,
-            new_dialog_job_at(dialog_params("second"), now).with_priority(DEFAULT_PRIORITY + 1),
-        );
-        assert_eq!(first, 1);
-        assert_eq!(second, 2);
-
-        let work = runtime
-            .queue()
-            .dequeue(TEXT_QUEUE_NAME, "dialog", now)
-            .expect("processing job");
-        assert_eq!(work.id, second);
-        runtime.persist_snapshot()?;
-
-        let (restored, report) = SharedTaskQueueRuntime::load_or_new(store)?;
-        assert_eq!(
-            report,
-            SharedTaskQueueRestoreReport {
-                restored: 2,
-                wal_replayed: 0,
-                requeued: 1,
-            }
-        );
-        let work = restored
-            .queue()
-            .dequeue(TEXT_QUEUE_NAME, "dialog", now)
-            .expect("requeued processing job");
-        assert_eq!(work.id, second);
-
-        let _ = std::fs::remove_file(path);
-        Ok(())
-    }
-
-    #[test]
-    fn shared_task_queue_runtime_recovers_expired_processing_and_persists()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let path = unique_task_queue_snapshot_path("recovery");
-        let _ = std::fs::remove_file(&path);
-        let store = SharedTaskQueueSnapshotFileStore::new(path.clone());
-        let runtime = SharedTaskQueueRuntime::new_empty(store.clone());
-        let start = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
-        let expired = start + time::Duration::seconds(61);
-        let id = runtime.queue().assign(
-            TEXT_QUEUE_NAME,
-            new_dialog_job_at(dialog_params("stale"), start).with_processing_timeout_seconds(60),
-        );
-        runtime.queue().dequeue(TEXT_QUEUE_NAME, "dialog", start);
-
-        assert_eq!(runtime.requeue_expired_processing(expired), vec![id]);
-        runtime.persist_snapshot()?;
-        let (restored, report) = SharedTaskQueueRuntime::load_or_new(store)?;
-
-        assert_eq!(
-            report,
-            SharedTaskQueueRestoreReport {
-                restored: 1,
-                wal_replayed: 0,
-                requeued: 0,
-            }
-        );
-        assert_eq!(
-            restored.queue().record(id).expect("job").status,
-            openplotva_taskman::JobStatus::Pending
-        );
-
-        let _ = std::fs::remove_file(path);
-        Ok(())
-    }
-
-    #[test]
-    fn shared_task_queue_runtime_fails_stuck_processing_and_persists()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let path = unique_task_queue_snapshot_path("stuck-cleanup");
-        let _ = std::fs::remove_file(&path);
-        let store = SharedTaskQueueSnapshotFileStore::new(path.clone());
-        let runtime = SharedTaskQueueRuntime::new_empty(store.clone());
-        let start = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
-        let stuck = start + time::Duration::hours(4) + time::Duration::seconds(1);
-        let id = runtime.queue().assign(
-            TEXT_QUEUE_NAME,
-            new_dialog_job_at(dialog_params("stuck"), start),
-        );
-        runtime.queue().dequeue(TEXT_QUEUE_NAME, "dialog", start);
-
-        assert_eq!(
-            runtime.fail_stuck_processing(stuck, SHARED_TASK_QUEUE_STUCK_DURATION),
-            vec![id]
-        );
-        runtime.persist_snapshot()?;
-        let (restored, report) = SharedTaskQueueRuntime::load_or_new(store)?;
-
-        assert_eq!(
-            report,
-            SharedTaskQueueRestoreReport {
-                restored: 1,
-                wal_replayed: 0,
-                requeued: 0,
-            }
-        );
-        let record = restored.queue().record(id).expect("job");
-        assert_eq!(record.status, openplotva_taskman::JobStatus::Failed);
-        assert_eq!(
-            record.error.as_deref(),
-            Some(openplotva_taskman::STUCK_JOB_ERROR_MESSAGE)
-        );
-
-        let _ = std::fs::remove_file(path);
-        Ok(())
-    }
-
-    #[test]
-    fn shared_task_queue_snapshot_compacts_wal_after_save() -> Result<(), Box<dyn std::error::Error>>
-    {
-        let path = unique_task_queue_snapshot_path("wal-compact");
-        remove_task_queue_files(&path);
-        let store = SharedTaskQueueSnapshotFileStore::new(path.clone());
-        let runtime = SharedTaskQueueRuntime::new_empty(store.clone());
-        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
-        let job_id = runtime.queue().assign(
-            TEXT_QUEUE_NAME,
-            new_dialog_job_at(dialog_params("compact"), now),
-        );
-        runtime
-            .queue()
-            .dequeue(TEXT_QUEUE_NAME, "text-worker-0", now);
-        assert!(runtime.wal_path().metadata()?.len() > 0);
-
-        runtime.persist_snapshot()?;
-
-        assert_eq!(runtime.wal_path().metadata()?.len(), 0);
-        let archives = shared_task_queue_wal_archives(runtime.wal_path())?;
-        assert_eq!(archives.len(), 1);
-        assert!(archives[0].metadata()?.len() > 0);
-        let (restored, report) = SharedTaskQueueRuntime::load_or_new(store)?;
-        assert_eq!(
-            report,
-            SharedTaskQueueRestoreReport {
-                restored: 1,
-                wal_replayed: 0,
-                requeued: 1,
-            }
-        );
-        assert_eq!(
-            restored.queue().record(job_id).expect("job").status,
-            openplotva_taskman::JobStatus::Pending
-        );
-
-        remove_task_queue_files(&path);
-        Ok(())
-    }
-
-    #[test]
-    fn shared_task_queue_snapshot_prunes_old_wal_archives() -> Result<(), Box<dyn std::error::Error>>
-    {
-        let path = unique_task_queue_snapshot_path("wal-archive-prune");
-        remove_task_queue_files(&path);
-        let store = SharedTaskQueueSnapshotFileStore::new(path.clone());
-        let runtime = SharedTaskQueueRuntime::new_empty(store);
-        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
-
-        for index in 0..(SHARED_TASK_QUEUE_WAL_ARCHIVE_KEEP + 2) {
-            runtime.queue().assign(
-                TEXT_QUEUE_NAME,
-                new_dialog_job_at(dialog_params(&format!("archive-{index}")), now),
-            );
-            runtime.persist_snapshot()?;
-        }
-
-        let archives = shared_task_queue_wal_archives(runtime.wal_path())?;
-        assert_eq!(archives.len(), SHARED_TASK_QUEUE_WAL_ARCHIVE_KEEP);
-        assert_eq!(runtime.wal_path().metadata()?.len(), 0);
-
-        remove_task_queue_files(&path);
-        Ok(())
-    }
-
-    #[test]
-    fn shared_task_queue_runtime_replays_wal_without_waiting_for_snapshot()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let path = unique_task_queue_snapshot_path("wal-replay");
-        remove_task_queue_files(&path);
-        let store = SharedTaskQueueSnapshotFileStore::new(path.clone());
-        let runtime = SharedTaskQueueRuntime::new_empty(store.clone());
-        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
-        let job_id = runtime.queue().assign(
-            TEXT_QUEUE_NAME,
-            new_dialog_job_at(dialog_params("wal"), now),
-        );
-        runtime
-            .queue()
-            .create_job_message(TaskQueueJobMessageParams {
-                job_id,
-                message_type: MESSAGE_TYPE_RESULT.to_owned(),
-                chat_id: 100,
-                message_id: 300,
-                created_at: now,
-                status: MESSAGE_STATUS_PLACEHOLDER.to_owned(),
-            })?;
-        runtime.queue().append_job_event(
-            job_id,
-            openplotva_taskman::TaskQueueJobEvent {
-                stage: "provider".to_owned(),
-                message: "started".to_owned(),
-                ..openplotva_taskman::TaskQueueJobEvent::default()
-            },
-            now,
-        )?;
-        runtime
-            .queue()
-            .dequeue(TEXT_QUEUE_NAME, "text-worker-0", now);
-        assert!(
-            !path.exists(),
-            "snapshot should not be needed for WAL recovery"
-        );
-        assert!(runtime.wal_path().exists());
-
-        let (restored, report) = SharedTaskQueueRuntime::load_or_new(store)?;
-
-        assert_eq!(
-            report,
-            SharedTaskQueueRestoreReport {
-                restored: 1,
-                wal_replayed: 4,
-                requeued: 1,
-            }
-        );
-        let record = restored.queue().record(job_id).expect("restored job");
-        assert_eq!(record.status, openplotva_taskman::JobStatus::Pending);
-        assert_eq!(record.messages.len(), 1);
-        assert_eq!(record.events.len(), 1);
-        assert_eq!(record.events[0].stage, "provider");
-
-        remove_task_queue_files(&path);
-        Ok(())
-    }
-
     #[tokio::test]
-    async fn shared_task_queue_placeholder_cleanup_deletes_and_persists_like_go()
+    async fn shared_task_queue_placeholder_cleanup_deletes_stale_rows()
     -> Result<(), Box<dyn std::error::Error>> {
-        let path = unique_task_queue_snapshot_path("placeholder-cleanup");
-        let _ = std::fs::remove_file(&path);
-        let store = SharedTaskQueueSnapshotFileStore::new(path.clone());
-        let runtime = SharedTaskQueueRuntime::new_empty(store.clone());
+        let runtime = SharedTaskQueueRuntime::new_for_test(InMemoryTaskQueue::new());
         let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
         let old = now - time::Duration::seconds(121);
         let boundary = now - time::Duration::seconds(120);
@@ -1585,7 +956,6 @@ mod tests {
                 found: 1,
                 attempted: 1,
                 cleaned: 1,
-                saved: 1,
                 ..SharedTaskQueuePlaceholderCleanupReport::default()
             }
         );
@@ -1599,20 +969,13 @@ mod tests {
         assert_eq!(remaining, vec![boundary_placeholder, completed]);
         assert!(!remaining.contains(&stale));
 
-        let (restored, _report) = SharedTaskQueueRuntime::load_or_new(store)?;
-        assert_eq!(restored.queue().job_messages(job_id).len(), 2);
-
-        let _ = std::fs::remove_file(path);
         Ok(())
     }
 
     #[tokio::test]
     async fn shared_task_queue_placeholder_cleanup_removes_row_after_delete_error()
     -> Result<(), Box<dyn std::error::Error>> {
-        let path = unique_task_queue_snapshot_path("placeholder-cleanup-error");
-        let _ = std::fs::remove_file(&path);
-        let store = SharedTaskQueueSnapshotFileStore::new(path.clone());
-        let runtime = SharedTaskQueueRuntime::new_empty(store);
+        let runtime = SharedTaskQueueRuntime::new_for_test(InMemoryTaskQueue::new());
         let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
         let old = now - time::Duration::seconds(121);
         let job_id = runtime.queue().assign(
@@ -1646,7 +1009,6 @@ mod tests {
         assert_eq!(report.delete_errors, 1);
         assert!(runtime.queue().job_messages(job_id).is_empty());
 
-        let _ = std::fs::remove_file(path);
         Ok(())
     }
 
@@ -1693,6 +1055,142 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    struct TaskQueueDurableStoreStub {
+        batches: Arc<Mutex<Vec<Vec<TaskQueueWalRecord>>>>,
+        fail_next: Arc<Mutex<bool>>,
+    }
+
+    impl TaskQueueDurableStoreStub {
+        fn batches(&self) -> Vec<Vec<TaskQueueWalRecord>> {
+            self.batches
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+
+        fn fail_next(&self) {
+            *self
+                .fail_next
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        }
+    }
+
+    impl SharedTaskQueueDurableStore for TaskQueueDurableStoreStub {
+        type Error = String;
+
+        fn load_snapshot<'a>(
+            &'a self,
+        ) -> TaskQueueStoreFuture<'a, Result<TaskQueueSnapshot, Self::Error>> {
+            Box::pin(async { Ok(empty_task_queue_snapshot()) })
+        }
+
+        fn apply_wal_batch<'a>(
+            &'a self,
+            batch: Vec<TaskQueueWalRecord>,
+        ) -> TaskQueueStoreFuture<'a, Result<(), Self::Error>> {
+            Box::pin(async move {
+                let mut fail_next = self
+                    .fail_next
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if *fail_next {
+                    *fail_next = false;
+                    return Err("db down".to_owned());
+                }
+                drop(fail_next);
+                self.batches
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(batch);
+                Ok(())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn buffered_task_queue_journal_flushes_on_thousandth_mutation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store = TaskQueueDurableStoreStub::default();
+        let journal = BufferedTaskQueueJournal::new(store.clone());
+        let now = OffsetDateTime::now_utc();
+
+        for job_id in 1..TASK_QUEUE_DB_SYNC_MUTATION_THRESHOLD {
+            let record = task_queue_record(job_id as i64, now, "queued");
+            journal.append_task_queue_wal_record(&task_queue_wal_upsert(record));
+        }
+
+        assert_eq!(store.batches().len(), 0);
+        assert!(!journal.should_flush_now());
+
+        let last = task_queue_record(TASK_QUEUE_DB_SYNC_MUTATION_THRESHOLD as i64, now, "last");
+        journal.append_task_queue_wal_record(&task_queue_wal_upsert(last.clone()));
+
+        assert!(journal.should_flush_now());
+        journal.flush_dirty().await?;
+
+        assert_eq!(store.batches().len(), 1);
+        assert_eq!(journal.dirty_len(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn buffered_task_queue_journal_coalesces_repeated_job_changes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store = TaskQueueDurableStoreStub::default();
+        let journal = BufferedTaskQueueJournal::new(store.clone());
+        let now = OffsetDateTime::now_utc();
+
+        journal
+            .append_task_queue_wal_record(&task_queue_wal_upsert(task_queue_record(1, now, "old")));
+        let latest = task_queue_record(1, now, "new");
+        journal.append_task_queue_wal_record(&task_queue_wal_upsert(latest.clone()));
+        journal.flush_dirty().await?;
+
+        let batches = store.batches();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].len(), 1);
+        assert_eq!(batches[0][0].record, Some(latest));
+        Ok(())
+    }
+
+    #[test]
+    fn buffered_task_queue_journal_keeps_new_mutation_count_after_overlapping_flush() {
+        let journal = BufferedTaskQueueJournal::new(TaskQueueDurableStoreStub::default());
+        let now = OffsetDateTime::now_utc();
+        let flushing = task_queue_wal_upsert(task_queue_record(1, now, "old"));
+        journal.append_task_queue_wal_record(&flushing);
+
+        for index in 0..TASK_QUEUE_DB_SYNC_MUTATION_THRESHOLD {
+            journal.append_task_queue_wal_record(&task_queue_wal_upsert(task_queue_record(
+                1,
+                now,
+                &format!("new-{index}"),
+            )));
+        }
+        journal.mark_flushed(&[flushing], 1);
+
+        assert_eq!(journal.dirty_len(), 1);
+        assert!(journal.should_flush_now());
+    }
+
+    #[tokio::test]
+    async fn buffered_task_queue_journal_keeps_dirty_records_after_failed_flush() {
+        let store = TaskQueueDurableStoreStub::default();
+        let journal = BufferedTaskQueueJournal::new(store.clone());
+        let now = OffsetDateTime::now_utc();
+
+        store.fail_next();
+        journal
+            .append_task_queue_wal_record(&task_queue_wal_upsert(task_queue_record(1, now, "x")));
+
+        assert!(journal.flush_dirty().await.is_err());
+        assert_eq!(journal.dirty_len(), 1);
+        assert!(!journal.should_flush_now());
+        assert_eq!(store.batches().len(), 0);
+    }
+
     fn dialog_params(message_text: &str) -> DialogJobParams {
         DialogJobParams {
             chat_id: 100,
@@ -1707,54 +1205,35 @@ mod tests {
         }
     }
 
-    fn unique_task_queue_snapshot_path(label: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "openplotva-shared-task-queue-{label}-{}-{}.json",
-            std::process::id(),
-            OffsetDateTime::now_utc().unix_timestamp_nanos()
-        ))
-    }
-
-    fn remove_task_queue_files(path: &Path) {
-        let _ = std::fs::remove_file(path);
-        let wal = shared_task_queue_wal_path(path);
-        let _ = std::fs::remove_file(&wal);
-        if let Ok(archives) = shared_task_queue_wal_archives(&wal) {
-            for archive in archives {
-                let _ = std::fs::remove_file(archive);
-            }
+    fn task_queue_record(id: i64, created: OffsetDateTime, title: &str) -> TaskQueueRecord {
+        TaskQueueRecord {
+            id,
+            queue_name: TEXT_QUEUE_NAME.to_owned(),
+            status: openplotva_taskman::JobStatus::Pending,
+            job: new_dialog_job_at(dialog_params(title), created).with_name(title),
+            worker_id: None,
+            started_at: None,
+            execution_started_at: None,
+            completed_at: None,
+            error: None,
+            progress_message_id: None,
+            queue_position_message_id: None,
+            result_message_id: None,
+            messages: Vec::new(),
+            events: Vec::new(),
         }
     }
 
-    fn shared_task_queue_wal_archives(
-        path: &Path,
-    ) -> Result<Vec<std::path::PathBuf>, std::io::Error> {
-        let Some(parent) = path.parent() else {
-            return Ok(Vec::new());
-        };
-        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
-            return Ok(Vec::new());
-        };
-        let prefix = format!("{file_name}.archive.");
-        let mut archives = Vec::new();
-        for entry in std::fs::read_dir(parent)? {
-            let path = entry?.path();
-            if path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with(&prefix))
-            {
-                archives.push(path);
-            }
+    fn task_queue_wal_upsert(record: TaskQueueRecord) -> TaskQueueWalRecord {
+        TaskQueueWalRecord {
+            format: openplotva_taskman::TASK_QUEUE_WAL_FORMAT.to_owned(),
+            op: openplotva_taskman::TASK_QUEUE_WAL_UPSERT_JOB.to_owned(),
+            job_id: record.id,
+            record: Some(record),
         }
-        archives.sort();
-        Ok(archives)
     }
 
-    fn persistent_queue_config(
-        snapshot_path: impl Into<String>,
-        snapshot_interval_seconds: i32,
-    ) -> PersistentQueueConfig {
+    fn persistent_queue_config() -> PersistentQueueConfig {
         PersistentQueueConfig {
             enabled: true,
             heartbeat_interval_seconds: 30,
@@ -1778,8 +1257,6 @@ mod tests {
             memory_consolidation_workers: 1,
             placeholder_cleanup_interval_seconds: 3600,
             placeholder_max_age_seconds: 7200,
-            snapshot_path: snapshot_path.into(),
-            snapshot_interval_seconds,
             llm_job_max_attempts: 5,
         }
     }

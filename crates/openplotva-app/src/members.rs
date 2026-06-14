@@ -2580,6 +2580,7 @@ mod tests {
                     queue_name: DIALOG_AIFARM_QUEUE_NAME.to_owned(),
                     delay: Duration::ZERO,
                     replaced: false,
+                    rate_limited: false,
                 })
             })
         }

@@ -124,10 +124,6 @@ pub const DEFAULT_PERSISTENT_QUEUE_PLACEHOLDER_CLEANUP_INTERVAL_SECONDS: i32 = 3
 
 pub const DEFAULT_PERSISTENT_QUEUE_PLACEHOLDER_MAX_AGE_SECONDS: i32 = 7200;
 
-pub const DEFAULT_PERSISTENT_QUEUE_SNAPSHOT_PATH: &str = "";
-
-pub const DEFAULT_PERSISTENT_QUEUE_SNAPSHOT_INTERVAL_SECONDS: i32 = 60;
-
 pub const DEFAULT_LLM_JOB_MAX_ATTEMPTS: i32 = 5;
 
 pub const DEFAULT_RBC_TIMEOUT_SECONDS: i32 = 15;
@@ -470,9 +466,6 @@ pub struct PersistentQueueConfig {
     pub placeholder_cleanup_interval_seconds: i32,
     /// Placeholder max age in seconds, from `PERSISTENT_QUEUE_PLACEHOLDER_MAX_AGE_SECONDS`.
     pub placeholder_max_age_seconds: i32,
-    pub snapshot_path: String,
-    /// Snapshot interval in seconds, from `PERSISTENT_QUEUE_SNAPSHOT_INTERVAL_SECONDS`.
-    pub snapshot_interval_seconds: i32,
     /// Retryable LLM job attempt limit, from `LLM_JOB_MAX_ATTEMPTS`.
     pub llm_job_max_attempts: i32,
 }
@@ -843,10 +836,6 @@ pub struct RawConfig {
     pub persistent_queue_placeholder_cleanup_interval_seconds: Option<String>,
     /// `PERSISTENT_QUEUE_PLACEHOLDER_MAX_AGE_SECONDS`.
     pub persistent_queue_placeholder_max_age_seconds: Option<String>,
-    /// `PERSISTENT_QUEUE_SNAPSHOT_PATH`.
-    pub persistent_queue_snapshot_path: Option<String>,
-    /// `PERSISTENT_QUEUE_SNAPSHOT_INTERVAL_SECONDS`.
-    pub persistent_queue_snapshot_interval_seconds: Option<String>,
     /// `LLM_JOB_MAX_ATTEMPTS`.
     pub llm_job_max_attempts: Option<String>,
     /// `RBC_TIMEOUT_SECONDS`.
@@ -1391,14 +1380,6 @@ impl AppConfig {
                 "PERSISTENT_QUEUE_PLACEHOLDER_MAX_AGE_SECONDS",
                 raw.persistent_queue_placeholder_max_age_seconds,
                 DEFAULT_PERSISTENT_QUEUE_PLACEHOLDER_MAX_AGE_SECONDS,
-            )?,
-            snapshot_path: raw
-                .persistent_queue_snapshot_path
-                .unwrap_or_else(|| DEFAULT_PERSISTENT_QUEUE_SNAPSHOT_PATH.to_owned()),
-            snapshot_interval_seconds: parse_i32(
-                "PERSISTENT_QUEUE_SNAPSHOT_INTERVAL_SECONDS",
-                raw.persistent_queue_snapshot_interval_seconds,
-                DEFAULT_PERSISTENT_QUEUE_SNAPSHOT_INTERVAL_SECONDS,
             )?,
             llm_job_max_attempts: parse_i32(
                 "LLM_JOB_MAX_ATTEMPTS",
@@ -2150,10 +2131,6 @@ impl RawConfig {
             persistent_queue_placeholder_max_age_seconds: env(
                 "PERSISTENT_QUEUE_PLACEHOLDER_MAX_AGE_SECONDS",
             ),
-            persistent_queue_snapshot_path: env("PERSISTENT_QUEUE_SNAPSHOT_PATH"),
-            persistent_queue_snapshot_interval_seconds: env(
-                "PERSISTENT_QUEUE_SNAPSHOT_INTERVAL_SECONDS",
-            ),
             llm_job_max_attempts: env("LLM_JOB_MAX_ATTEMPTS"),
             rbc_timeout_seconds: env("RBC_TIMEOUT_SECONDS"),
             serper_api_key: env("SERPER_API_KEY"),
@@ -2552,10 +2529,6 @@ fn validate_persistent_queue_config(config: &PersistentQueueConfig) -> Result<()
             "PERSISTENT_QUEUE_PLACEHOLDER_MAX_AGE_SECONDS",
             config.placeholder_max_age_seconds,
         ),
-        (
-            "PERSISTENT_QUEUE_SNAPSHOT_INTERVAL_SECONDS",
-            config.snapshot_interval_seconds,
-        ),
         ("LLM_JOB_MAX_ATTEMPTS", config.llm_job_max_attempts),
     ] {
         validate_positive_i32(name, value)?;
@@ -2626,15 +2599,13 @@ mod tests {
         DEFAULT_PERSISTENT_QUEUE_MUSIC_VIP_WORKERS,
         DEFAULT_PERSISTENT_QUEUE_PLACEHOLDER_CLEANUP_INTERVAL_SECONDS,
         DEFAULT_PERSISTENT_QUEUE_PLACEHOLDER_MAX_AGE_SECONDS,
-        DEFAULT_PERSISTENT_QUEUE_RECOVERY_INTERVAL_SECONDS,
-        DEFAULT_PERSISTENT_QUEUE_SNAPSHOT_INTERVAL_SECONDS, DEFAULT_PERSISTENT_QUEUE_SNAPSHOT_PATH,
-        DEFAULT_PERSISTENT_QUEUE_TEXT_WORKERS, DEFAULT_PRUNA_API_KEY, DEFAULT_PRUNA_BEARER,
-        DEFAULT_PRUNA_ENDPOINT, DEFAULT_PRUNA_MODEL, DEFAULT_PRUNA_TIMEOUT_SECONDS,
-        DEFAULT_RBC_TIMEOUT_SECONDS, DEFAULT_RUNTIME_API_HOST, DEFAULT_RUNTIME_API_LOG_BUFFER_SIZE,
-        DEFAULT_RUNTIME_API_PORT, DEFAULT_RUNTIME_API_SQL_RESULT_BYTES_LIMIT,
-        DEFAULT_RUNTIME_API_SQL_ROW_LIMIT, DEFAULT_RUNTIME_API_SQL_TIMEOUT_MS,
-        DEFAULT_SERPER_TIMEOUT_SECONDS, DEFAULT_SHIELD_EMBEDDING_DIM,
-        DEFAULT_SHIELD_LEXICAL_MIN_SCORE, DEFAULT_SHIELD_MAX_MATCHES,
+        DEFAULT_PERSISTENT_QUEUE_RECOVERY_INTERVAL_SECONDS, DEFAULT_PERSISTENT_QUEUE_TEXT_WORKERS,
+        DEFAULT_PRUNA_API_KEY, DEFAULT_PRUNA_BEARER, DEFAULT_PRUNA_ENDPOINT, DEFAULT_PRUNA_MODEL,
+        DEFAULT_PRUNA_TIMEOUT_SECONDS, DEFAULT_RBC_TIMEOUT_SECONDS, DEFAULT_RUNTIME_API_HOST,
+        DEFAULT_RUNTIME_API_LOG_BUFFER_SIZE, DEFAULT_RUNTIME_API_PORT,
+        DEFAULT_RUNTIME_API_SQL_RESULT_BYTES_LIMIT, DEFAULT_RUNTIME_API_SQL_ROW_LIMIT,
+        DEFAULT_RUNTIME_API_SQL_TIMEOUT_MS, DEFAULT_SERPER_TIMEOUT_SECONDS,
+        DEFAULT_SHIELD_EMBEDDING_DIM, DEFAULT_SHIELD_LEXICAL_MIN_SCORE, DEFAULT_SHIELD_MAX_MATCHES,
         DEFAULT_SHIELD_QUERY_MAX_CHARS, DEFAULT_SHIELD_RETRIEVAL_TIMEOUT_SECONDS,
         DEFAULT_SHIELD_VECTOR_MIN_SCORE, DEFAULT_UPDATE_QUEUE_BACKEND, DEFAULT_VIP_CHAT_ID,
         DEFAULT_VISION_DIRECT_IMAGE_LIMIT, DEFAULT_VISION_MAX_TOKENS, DEFAULT_VISION_MODEL,
@@ -2785,14 +2756,6 @@ mod tests {
         assert_eq!(
             config.persistent_queue.placeholder_max_age_seconds,
             DEFAULT_PERSISTENT_QUEUE_PLACEHOLDER_MAX_AGE_SECONDS
-        );
-        assert_eq!(
-            config.persistent_queue.snapshot_path,
-            DEFAULT_PERSISTENT_QUEUE_SNAPSHOT_PATH
-        );
-        assert_eq!(
-            config.persistent_queue.snapshot_interval_seconds,
-            DEFAULT_PERSISTENT_QUEUE_SNAPSHOT_INTERVAL_SECONDS
         );
         assert_eq!(
             config.persistent_queue.llm_job_max_attempts,
@@ -3147,8 +3110,6 @@ mod tests {
             persistent_queue_memory_consolidation_workers: Some("8".to_owned()),
             persistent_queue_placeholder_cleanup_interval_seconds: Some("3601".to_owned()),
             persistent_queue_placeholder_max_age_seconds: Some("7201".to_owned()),
-            persistent_queue_snapshot_path: Some("/tmp/plotva-taskman.snap".to_owned()),
-            persistent_queue_snapshot_interval_seconds: Some("62".to_owned()),
             llm_job_max_attempts: Some("9".to_owned()),
             ..RawConfig::default()
         })?;
@@ -3197,11 +3158,6 @@ mod tests {
             3601
         );
         assert_eq!(config.persistent_queue.placeholder_max_age_seconds, 7201);
-        assert_eq!(
-            config.persistent_queue.snapshot_path,
-            "/tmp/plotva-taskman.snap"
-        );
-        assert_eq!(config.persistent_queue.snapshot_interval_seconds, 62);
         assert_eq!(config.persistent_queue.llm_job_max_attempts, 9);
         Ok(())
     }
@@ -3209,7 +3165,7 @@ mod tests {
     #[test]
     fn persistent_queue_config_rejects_non_positive_go_intervals() {
         let error = AppConfig::from_raw(RawConfig {
-            persistent_queue_snapshot_interval_seconds: Some("0".to_owned()),
+            persistent_queue_heartbeat_interval_seconds: Some("0".to_owned()),
             ..RawConfig::default()
         })
         .err();
@@ -3217,7 +3173,7 @@ mod tests {
         assert!(matches!(
             error,
             Some(super::ConfigError::NonPositiveInteger {
-                name: "PERSISTENT_QUEUE_SNAPSHOT_INTERVAL_SECONDS",
+                name: "PERSISTENT_QUEUE_HEARTBEAT_INTERVAL_SECONDS",
                 value: 0,
             })
         ));

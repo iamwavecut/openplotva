@@ -28,6 +28,7 @@ use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 
 use crate::{
     permissions::{ChatPermissionPolicy, ChatPermissionStore},
+    rate_limits::TaskEnqueueRateLimit,
     rates::{RatesFetcher, RatesSideEffectDispatcher, currency_rates_tool},
     translate::{TextTranslator, TranslationResult, translate_text_tool},
 };
@@ -694,6 +695,8 @@ pub enum SongScheduleRejection {
     EmptyTopic,
     /// User already has the maximum number of active music jobs.
     ActiveLimit,
+    /// Enqueue throttled by the task-enqueue rate limit (distinct from a capacity limit).
+    RateLimited,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -783,6 +786,7 @@ pub struct TaskmanDialogToolAdapter {
     queue: Arc<InMemoryTaskQueue>,
     draw_image_vip_status: Option<Arc<dyn DrawImageVipStatus>>,
     draw_image_rate_limit: Option<Arc<dyn DrawImageRateLimit>>,
+    task_enqueue_rate_limit: Option<Arc<dyn TaskEnqueueRateLimit>>,
     draw_image_permission: Option<Arc<dyn DrawImagePermission>>,
     image_edit_file_resolver: Option<Arc<dyn ImageEditFileResolver>>,
     song_service_available: bool,
@@ -801,6 +805,10 @@ impl fmt::Debug for TaskmanDialogToolAdapter {
             .field(
                 "draw_image_rate_limit",
                 &self.draw_image_rate_limit.as_ref().map(|_| "configured"),
+            )
+            .field(
+                "task_enqueue_rate_limit",
+                &self.task_enqueue_rate_limit.as_ref().map(|_| "configured"),
             )
             .field(
                 "draw_image_permission",
@@ -827,6 +835,7 @@ impl TaskmanDialogToolAdapter {
             queue,
             draw_image_vip_status: None,
             draw_image_rate_limit: None,
+            task_enqueue_rate_limit: None,
             draw_image_permission: None,
             image_edit_file_resolver: None,
             song_service_available: true,
@@ -843,6 +852,15 @@ impl TaskmanDialogToolAdapter {
     #[must_use]
     pub fn with_draw_image_rate_limit(mut self, rate_limit: Arc<dyn DrawImageRateLimit>) -> Self {
         self.draw_image_rate_limit = Some(rate_limit);
+        self
+    }
+
+    #[must_use]
+    pub fn with_task_enqueue_rate_limit(
+        mut self,
+        rate_limit: Arc<dyn TaskEnqueueRateLimit>,
+    ) -> Self {
+        self.task_enqueue_rate_limit = Some(rate_limit);
         self
     }
 
@@ -958,6 +976,8 @@ impl ImageScheduler for TaskmanDialogToolAdapter {
                     });
                 }
             }
+            let chat_id = request.chat_id;
+            let user_id = request.user_id;
             let meta = draw_image_job_meta(&request);
             let job = new_image_gen_job_at(
                 ImageGenJobParams {
@@ -979,11 +999,19 @@ impl ImageScheduler for TaskmanDialogToolAdapter {
             .with_name("image")
             .with_priority(plan.priority);
 
+            if self
+                .task_enqueue_limited(plan.queue_name, chat_id, user_id)
+                .await
+            {
+                return Ok(not_scheduled_no_reply());
+            }
             match self
                 .queue
                 .assign_with_user_limit(plan.queue_name, job, plan.max_active_jobs)
             {
                 Ok(Some(_job_id)) => {
+                    self.grow_task_enqueue(plan.queue_name, chat_id, user_id)
+                        .await;
                     if let Some(rate_limit) = self.draw_image_rate_limit.as_deref() {
                         rate_limit
                             .grow_draw_image_rate_limit(request.user_id, OffsetDateTime::now_utc())
@@ -1053,6 +1081,8 @@ impl SongScheduler for TaskmanDialogToolAdapter {
             let reference_file_unique_id =
                 song_reference_unique_id(&request.reference_file_unique_id, &request.message_meta);
             let meta = serde_json::to_value(request.message_meta).unwrap_or_else(|_| json!({}));
+            let chat_id = request.chat_id;
+            let user_id = request.user_id;
             let queue_depth = self
                 .queue
                 .queue_depth_for_priority_or_higher(MUSIC_VIP_QUEUE_NAME, HIGHEST_PRIORITY);
@@ -1081,15 +1111,27 @@ impl SongScheduler for TaskmanDialogToolAdapter {
             .with_name("music")
             .with_priority(HIGHEST_PRIORITY);
 
+            if self
+                .task_enqueue_limited(MUSIC_VIP_QUEUE_NAME, chat_id, user_id)
+                .await
+            {
+                return Ok(not_scheduled_song_no_reply(
+                    SongScheduleRejection::RateLimited,
+                ));
+            }
             match self
                 .queue
                 .assign_with_user_limit(MUSIC_VIP_QUEUE_NAME, job, 2)
             {
-                Ok(Some(_job_id)) => Ok(SongScheduleResult {
-                    status: "scheduled".to_owned(),
-                    queue_notice,
-                    ..SongScheduleResult::default()
-                }),
+                Ok(Some(_job_id)) => {
+                    self.grow_task_enqueue(MUSIC_VIP_QUEUE_NAME, chat_id, user_id)
+                        .await;
+                    Ok(SongScheduleResult {
+                        status: "scheduled".to_owned(),
+                        queue_notice,
+                        ..SongScheduleResult::default()
+                    })
+                }
                 Ok(None) => Ok(not_scheduled_song_no_reply(
                     SongScheduleRejection::ActiveLimit,
                 )),
@@ -1128,6 +1170,8 @@ impl TaskmanDialogToolAdapter {
 
         let plan = image_gen_queue_plan(true);
         let prompt = request.prompt.trim().to_owned();
+        let chat_id = request.chat_id;
+        let user_id = request.user_id;
         let job = new_image_edit_job_at(
             ImageEditJobParams {
                 chat_id: request.chat_id,
@@ -1144,14 +1188,24 @@ impl TaskmanDialogToolAdapter {
         .with_name("image_edit")
         .with_priority(plan.priority);
 
+        if self
+            .task_enqueue_limited(plan.queue_name, chat_id, user_id)
+            .await
+        {
+            return Ok(not_scheduled_no_reply());
+        }
         match self
             .queue
             .assign_with_user_limit(plan.queue_name, job, plan.max_active_jobs)
         {
-            Ok(Some(_job_id)) => Ok(DrawImageScheduleResult {
-                status: "scheduled".to_owned(),
-                ..DrawImageScheduleResult::default()
-            }),
+            Ok(Some(_job_id)) => {
+                self.grow_task_enqueue(plan.queue_name, chat_id, user_id)
+                    .await;
+                Ok(DrawImageScheduleResult {
+                    status: "scheduled".to_owned(),
+                    ..DrawImageScheduleResult::default()
+                })
+            }
             Ok(None) => Ok(not_scheduled_no_reply()),
             Err(error) => Err(Box::new(error) as ToolboxError),
         }
@@ -1163,6 +1217,44 @@ impl TaskmanDialogToolAdapter {
     ) -> Option<DrawImageScheduleRejection> {
         let permission = self.draw_image_permission.as_deref()?;
         permission.draw_image_rejection(chat_id).await
+    }
+
+    async fn task_enqueue_limited(&self, queue_name: &str, chat_id: i64, user_id: i64) -> bool {
+        let Some(rate_limit) = self.task_enqueue_rate_limit.as_deref() else {
+            return false;
+        };
+        let report = rate_limit
+            .check_task_enqueue_rate_limit(chat_id, user_id, OffsetDateTime::now_utc())
+            .await;
+        if report.limited {
+            tracing::warn!(
+                chat_id,
+                user_id,
+                queue_name,
+                scope = ?report.scope,
+                error = ?report.error,
+                "task enqueue rate limit blocked job assignment"
+            );
+        }
+        report.limited
+    }
+
+    async fn grow_task_enqueue(&self, queue_name: &str, chat_id: i64, user_id: i64) {
+        let Some(rate_limit) = self.task_enqueue_rate_limit.as_deref() else {
+            return;
+        };
+        let report = rate_limit
+            .grow_task_enqueue_rate_limit(chat_id, user_id, OffsetDateTime::now_utc())
+            .await;
+        if !report.save_errors.is_empty() {
+            tracing::warn!(
+                chat_id,
+                user_id,
+                queue_name,
+                errors = ?report.save_errors,
+                "failed to persist task enqueue rate-limit timestamps"
+            );
+        }
     }
 }
 

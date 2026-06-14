@@ -16,11 +16,8 @@ use openplotva_taskman::{
 use serde_json::json;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
-use crate::payments;
-
 #[derive(Clone, Default)]
 pub(crate) struct RuntimeTaskmanInspectorHandle {
-    control_queue: Arc<Mutex<Option<payments::PersistentPaymentControlJobQueue>>>,
     shared_queue: Arc<Mutex<Option<Arc<InMemoryTaskQueue>>>>,
     worker_counts: Arc<Mutex<BTreeMap<String, i32>>>,
 }
@@ -28,17 +25,6 @@ pub(crate) struct RuntimeTaskmanInspectorHandle {
 impl RuntimeTaskmanInspectorHandle {
     pub(crate) fn is_configured(&self) -> bool {
         self.records().is_some()
-    }
-
-    pub(crate) fn set_control_queue(&self, queue: payments::PersistentPaymentControlJobQueue) {
-        *self
-            .control_queue
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(queue);
-        self.worker_counts
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(CONTROL_QUEUE_NAME.to_owned(), 1);
     }
 
     pub(crate) fn set_shared_queue(
@@ -57,36 +43,20 @@ impl RuntimeTaskmanInspectorHandle {
     }
 
     fn records(&self) -> Option<Vec<RuntimeTaskmanRecord>> {
-        let mut records = Vec::new();
-        let mut has_source = false;
-
-        if let Some(control_records) = self
-            .control_queue
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .as_ref()
-            .map(payments::PersistentPaymentControlJobQueue::taskman_records)
-        {
-            has_source = true;
-            records.extend(
-                control_records
-                    .into_iter()
-                    .map(RuntimeTaskmanRecord::control),
-            );
-        }
-
-        if let Some(shared_records) = self
+        // Control jobs ride the same shared queue, so the shared queue is the single
+        // source of truth for diagnostics.
+        let shared_records = self
             .shared_queue
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .as_ref()
-            .map(|queue| queue.records())
-        {
-            has_source = true;
-            records.extend(shared_records.into_iter().map(RuntimeTaskmanRecord::shared));
-        }
-
-        has_source.then_some(records)
+            .map(|queue| queue.records())?;
+        Some(
+            shared_records
+                .into_iter()
+                .map(RuntimeTaskmanRecord::new)
+                .collect(),
+        )
     }
 
     fn worker_count(&self, queue_name: &str) -> i32 {
@@ -99,29 +69,15 @@ impl RuntimeTaskmanInspectorHandle {
     }
 
     pub(crate) fn cancel_job(&self, id: i64) -> Result<(), String> {
-        match self.job_source(id)? {
-            RuntimeTaskmanSource::Shared => self
-                .shared_queue()?
-                .cancel(id, "cancelled by admin", OffsetDateTime::now_utc())
-                .map_err(|error| error.to_string()),
-            RuntimeTaskmanSource::Control => self
-                .control_queue()?
-                .cancel_taskman_job(id)
-                .map_err(|error| error.to_string()),
-        }
+        self.shared_queue()?
+            .cancel(id, "cancelled by admin", OffsetDateTime::now_utc())
+            .map_err(|error| error.to_string())
     }
 
     pub(crate) fn restart_job(&self, id: i64) -> Result<i64, String> {
-        match self.job_source(id)? {
-            RuntimeTaskmanSource::Shared => self
-                .shared_queue()?
-                .restart(id, OffsetDateTime::now_utc())
-                .map_err(|error| error.to_string()),
-            RuntimeTaskmanSource::Control => self
-                .control_queue()?
-                .restart_taskman_job(id)
-                .map_err(|error| error.to_string()),
-        }
+        self.shared_queue()?
+            .restart(id, OffsetDateTime::now_utc())
+            .map_err(|error| error.to_string())
     }
 
     pub(crate) fn delete_jobs(
@@ -148,36 +104,10 @@ impl RuntimeTaskmanInspectorHandle {
     }
 
     fn delete_record(&self, record: &RuntimeTaskmanRecord) -> Result<(), String> {
-        match record.source {
-            RuntimeTaskmanSource::Shared => {
-                self.shared_queue()?
-                    .delete(record.diagnostic_id)
-                    .map_err(|error| error.to_string())?;
-            }
-            RuntimeTaskmanSource::Control => {
-                self.control_queue()?
-                    .delete_taskman_job(record.diagnostic_id)
-                    .map_err(|error| error.to_string())?;
-            }
-        }
+        self.shared_queue()?
+            .delete(record.diagnostic_id)
+            .map_err(|error| error.to_string())?;
         Ok(())
-    }
-
-    fn job_source(&self, id: i64) -> Result<RuntimeTaskmanSource, String> {
-        self.records()
-            .ok_or_else(|| "task manager not configured".to_owned())?
-            .into_iter()
-            .find(|record| record.diagnostic_id == id)
-            .map(|record| record.source)
-            .ok_or_else(|| format!("task manager job {id} not found"))
-    }
-
-    fn control_queue(&self) -> Result<payments::PersistentPaymentControlJobQueue, String> {
-        self.control_queue
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
-            .ok_or_else(|| "task manager not configured".to_owned())
     }
 
     fn shared_queue(&self) -> Result<Arc<InMemoryTaskQueue>, String> {
@@ -189,32 +119,16 @@ impl RuntimeTaskmanInspectorHandle {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RuntimeTaskmanSource {
-    Control,
-    Shared,
-}
-
 #[derive(Clone, Debug)]
 struct RuntimeTaskmanRecord {
     diagnostic_id: i64,
-    source: RuntimeTaskmanSource,
     record: TaskQueueRecord,
 }
 
 impl RuntimeTaskmanRecord {
-    fn control(record: TaskQueueRecord) -> Self {
+    fn new(record: TaskQueueRecord) -> Self {
         Self {
             diagnostic_id: record.id,
-            source: RuntimeTaskmanSource::Control,
-            record,
-        }
-    }
-
-    fn shared(record: TaskQueueRecord) -> Self {
-        Self {
-            diagnostic_id: record.id,
-            source: RuntimeTaskmanSource::Shared,
             record,
         }
     }
@@ -885,28 +799,19 @@ fn count_processing(records: &[RuntimeTaskmanRecord], queue_name: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::payments::{
-        PaymentControlJobQueue, PaymentControlJobSnapshotFileStore,
-        PersistentPaymentControlJobQueue,
-    };
+    use crate::payments::{PaymentControlJobQueue, PersistentPaymentControlJobQueue};
     use openplotva_taskman::{
         CONTROL_QUEUE_NAME, ControlJobData, ControlJobParams, ControlKind, DialogJobParams,
         HIGH_PRIORITY, IMAGE_REGULAR_QUEUE_NAME, ImageGenJobParams, InMemoryTaskQueue,
         MESSAGE_STATUS_COMPLETED, MESSAGE_STATUS_PLACEHOLDER, MESSAGE_TYPE_RESULT, TEXT_QUEUE_NAME,
-        TaskQueueIdAllocator, TaskQueueJobEvent, TaskQueueJobMessageParams, new_control_job_at,
-        new_dialog_job_at, new_image_gen_job_at,
+        TaskQueueJobEvent, TaskQueueJobMessageParams, new_control_job_at, new_dialog_job_at,
+        new_image_gen_job_at,
     };
 
     #[tokio::test]
     async fn runtime_taskman_inspector_lists_live_persistent_control_queue() {
-        let snapshot_path = std::env::temp_dir().join(format!(
-            "openplotva-runtime-taskman-test-{}.json",
-            OffsetDateTime::now_utc().unix_timestamp_nanos()
-        ));
-        let _ = std::fs::remove_file(&snapshot_path);
-        let queue = PersistentPaymentControlJobQueue::new_empty(
-            PaymentControlJobSnapshotFileStore::new(snapshot_path.clone()),
-        );
+        let shared = Arc::new(InMemoryTaskQueue::new());
+        let queue = PersistentPaymentControlJobQueue::from_task_queue((*shared).clone());
         let created = OffsetDateTime::parse("2026-05-21T10:00:00Z", &Rfc3339).expect("created");
         let job = new_control_job_at(
             ControlJobParams {
@@ -930,7 +835,7 @@ mod tests {
             .expect("assign job");
 
         let inspector = RuntimeTaskmanInspectorHandle::default();
-        inspector.set_control_queue(queue);
+        inspector.set_shared_queue(shared, BTreeMap::from([(CONTROL_QUEUE_NAME.to_owned(), 1)]));
         let result = inspector
             .list_jobs(RuntimeTaskmanJobsFilter {
                 q: "vip".to_owned(),
@@ -960,7 +865,6 @@ mod tests {
 
         let details = inspector.job(1).expect("job lookup").expect("job");
         assert_eq!(details.job.payload.expect("payload")["type"], "control");
-        let _ = std::fs::remove_file(snapshot_path);
     }
 
     #[test]
@@ -1111,16 +1015,9 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_taskman_inspector_uses_one_manager_id_namespace() {
-        let snapshot_path = std::env::temp_dir().join(format!(
-            "openplotva-runtime-taskman-manager-ids-{}.json",
-            OffsetDateTime::now_utc().unix_timestamp_nanos()
-        ));
-        let _ = std::fs::remove_file(&snapshot_path);
-        let ids = TaskQueueIdAllocator::new();
-        let control_queue = PersistentPaymentControlJobQueue::new_empty_with_id_allocator(
-            PaymentControlJobSnapshotFileStore::new(snapshot_path.clone()),
-            ids.clone(),
-        );
+        let shared_queue = Arc::new(InMemoryTaskQueue::new());
+        let control_queue =
+            PersistentPaymentControlJobQueue::from_task_queue((*shared_queue).clone());
         let created = OffsetDateTime::parse("2026-05-21T10:00:00Z", &Rfc3339).expect("created");
         let control_job = new_control_job_at(
             ControlJobParams {
@@ -1141,7 +1038,6 @@ mod tests {
             .await
             .expect("assign control job");
 
-        let shared_queue = Arc::new(InMemoryTaskQueue::new_with_id_allocator(ids));
         let shared_id = shared_queue.assign(
             TEXT_QUEUE_NAME,
             new_dialog_job_at(
@@ -1161,10 +1057,12 @@ mod tests {
         );
 
         let inspector = RuntimeTaskmanInspectorHandle::default();
-        inspector.set_control_queue(control_queue);
         inspector.set_shared_queue(
             Arc::clone(&shared_queue),
-            BTreeMap::from([(TEXT_QUEUE_NAME.to_owned(), 1)]),
+            BTreeMap::from([
+                (TEXT_QUEUE_NAME.to_owned(), 1),
+                (CONTROL_QUEUE_NAME.to_owned(), 1),
+            ]),
         );
 
         let result = inspector
@@ -1183,6 +1081,5 @@ mod tests {
         let restarted = inspector.restart_job(shared_id).expect("restart shared");
         assert_eq!(restarted, 3);
         assert!(inspector.job(restarted).expect("lookup").is_some());
-        let _ = std::fs::remove_file(snapshot_path);
     }
 }

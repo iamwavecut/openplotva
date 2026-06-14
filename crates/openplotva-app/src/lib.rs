@@ -8383,40 +8383,6 @@ async fn start_runtime_workers(
     let payment_effects =
         payments::PaymentRuntimeEffects::new(telegram.clone(), payment_successful_effects);
     let taskman_ids = openplotva_taskman::TaskQueueIdAllocator::new();
-    let payment_snapshot_store = payments::PaymentControlJobSnapshotFileStore::new(
-        payments::default_payment_control_job_snapshot_path(),
-    );
-    let payment_snapshot_path = payment_snapshot_store.path().to_path_buf();
-    let (control_queue, control_queue_readiness) =
-        match payments::PersistentPaymentControlJobQueue::load_or_new_with_id_allocator(
-            payment_snapshot_store.clone(),
-            taskman_ids.clone(),
-        ) {
-            Ok(queue) => (
-                queue,
-                format!(
-                    "unified control-job worker started with Rust-native snapshot persistence at {}",
-                    payment_snapshot_path.display()
-                ),
-            ),
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    path = %payment_snapshot_path.display(),
-                    "failed to load payment control-job snapshot; starting empty"
-                );
-                (
-                    payments::PersistentPaymentControlJobQueue::new_empty_with_id_allocator(
-                        payment_snapshot_store,
-                        taskman_ids.clone(),
-                    ),
-                    format!(
-                        "unified control-job worker started with an empty queue after snapshot load failure: {error}"
-                    ),
-                )
-            }
-        };
-    taskman_inspector.set_control_queue(control_queue.clone());
     let translation_cache = service_clients.redis.translation_cache_store();
     let translator = match translate::t8_translator_from_app_config(config, translation_cache) {
         Ok(translator) => RuntimeTranslator::Ready(Box::new(translator)),
@@ -8475,11 +8441,6 @@ async fn start_runtime_workers(
     let bot_username = bot_identity.username.clone();
     let telegram_effects = Arc::new(telegram.clone());
     let payment_runtime_effects = Arc::new(payment_effects.clone());
-    let control_queue_for_updates = Arc::new(control_queue.clone());
-    let shared_task_queue_snapshot_path =
-        task_queue::shared_task_queue_snapshot_path_from_config(&config.persistent_queue);
-    let shared_task_queue_snapshot_interval =
-        task_queue::shared_task_queue_snapshot_interval_from_config(&config.persistent_queue);
     let shared_task_queue_recovery_interval =
         task_queue::shared_task_queue_recovery_interval_from_config(&config.persistent_queue);
     let shared_task_queue_cleanup_interval =
@@ -8495,65 +8456,63 @@ async fn start_runtime_workers(
     let shared_task_queue_placeholder_max_age =
         task_queue::shared_task_queue_placeholder_max_age_from_config(&config.persistent_queue);
     let shared_task_queue_store =
-        task_queue::SharedTaskQueueSnapshotFileStore::new(shared_task_queue_snapshot_path);
-    let shared_task_queue_path = shared_task_queue_store.path().to_path_buf();
-    let (shared_task_queue, shared_task_queue_readiness) =
-        match task_queue::SharedTaskQueueRuntime::load_or_new_with_id_allocator(
-            shared_task_queue_store.clone(),
+        openplotva_storage::PostgresTaskQueueStore::new(service_clients.postgres.clone());
+    // A load failure is fatal: starting empty would hide every durable in-flight job
+    // and let freshly issued ids overwrite still-pending rows. Fail startup so the
+    // process is restarted and retries the load instead of silently dropping work.
+    let (shared_task_queue, shared_task_queue_restore_report) =
+        task_queue::SharedTaskQueueRuntime::load_from_postgres_with_id_allocator(
+            shared_task_queue_store,
             taskman_ids.clone(),
-        ) {
-            Ok((runtime, report)) => (
-                runtime,
-                format!(
-                    "restored {} shared taskman jobs, requeued {} processing jobs from Rust-native snapshot at {}",
-                    report.restored,
-                    report.requeued,
-                    shared_task_queue_path.display()
-                ),
-            ),
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    path = %shared_task_queue_path.display(),
-                    "failed to load shared task queue snapshot; starting empty"
-                );
-                (
-                    task_queue::SharedTaskQueueRuntime::new_empty_with_id_allocator(
-                        shared_task_queue_store,
-                        taskman_ids,
-                    ),
-                    format!(
-                        "started an empty shared taskman queue after snapshot load failure: {error}"
-                    ),
-                )
-            }
-        };
+        )
+        .await
+        .context("load shared task queue from Postgres taskman v2")?;
+    let shared_task_queue_readiness = format!(
+        "restored {} shared taskman jobs and requeued {} processing jobs from Postgres taskman v2",
+        shared_task_queue_restore_report.restored, shared_task_queue_restore_report.requeued
+    );
     let task_queue_for_updates = shared_task_queue.queue();
+    let task_enqueue_rate_limit = Arc::new(rate_limits::TaskEnqueueRateLimitPolicy::new(
+        service_clients.redis.task_enqueue_rate_limit_store(),
+    ));
+    let control_queue = payments::PersistentPaymentControlJobQueue::from_task_queue(
+        task_queue_for_updates.as_ref().clone(),
+    )
+    .with_task_enqueue_rate_limit(task_enqueue_rate_limit.clone())
+    .with_db_journal(
+        shared_task_queue
+            .db_journal()
+            .expect("Postgres taskman runtime should have a DB journal"),
+    );
+    let control_queue_readiness =
+        "unified control-job worker uses the shared Postgres-backed taskman queue".to_owned();
+    let control_queue_for_updates = Arc::new(control_queue.clone());
     readiness_checks.push(ReadinessCheck::ok(
         "shared_task_queue_restore",
         shared_task_queue_readiness,
     ));
-    let shared_task_queue_snapshot_runtime = shared_task_queue.clone();
-    let shared_task_queue_snapshot_stop = stop.subscribe();
-    let shared_task_queue_snapshot_worker = tokio::spawn(async move {
-        let report = task_queue::run_shared_task_queue_snapshot_worker_until(
-            shared_task_queue_snapshot_runtime,
-            shared_task_queue_snapshot_interval,
-            wait_for_runtime_stop(shared_task_queue_snapshot_stop),
+    let shared_task_queue_db_journal = shared_task_queue
+        .db_journal()
+        .expect("Postgres taskman runtime should have a DB journal");
+    let shared_task_queue_db_sync_stop = stop.subscribe();
+    let shared_task_queue_db_sync_worker = tokio::spawn(async move {
+        let report = task_queue::run_task_queue_db_sync_worker_until(
+            shared_task_queue_db_journal,
+            wait_for_runtime_stop(shared_task_queue_db_sync_stop),
         )
         .await;
 
-        tracing::info!(?report, "shared taskman snapshot worker stopped");
+        tracing::info!(?report, "shared taskman Postgres sync worker stopped");
     });
     readiness_checks.push(ReadinessCheck::ok(
-        "shared_task_queue_snapshot",
+        "shared_task_queue_postgres_sync",
         format!(
-            "periodic Rust-native snapshots every {}s at {}",
-            shared_task_queue_snapshot_interval.as_secs(),
-            shared_task_queue_path.display()
+            "Postgres sync after {}s dirty window or {} mutations",
+            task_queue::TASK_QUEUE_DB_SYNC_INTERVAL.as_secs(),
+            task_queue::TASK_QUEUE_DB_SYNC_MUTATION_THRESHOLD
         ),
     ));
-    workers.handles.push(shared_task_queue_snapshot_worker);
+    workers.handles.push(shared_task_queue_db_sync_worker);
     let shared_task_queue_recovery_runtime = shared_task_queue.clone();
     let shared_task_queue_recovery_stop = stop.subscribe();
     let shared_task_queue_recovery_worker = tokio::spawn(async move {
@@ -8596,6 +8555,29 @@ async fn start_runtime_workers(
         ),
     ));
     workers.handles.push(shared_task_queue_cleanup_worker);
+    let shared_task_queue_purge_store =
+        openplotva_storage::PostgresTaskQueueStore::new(service_clients.postgres.clone());
+    let shared_task_queue_purge_stop = stop.subscribe();
+    let shared_task_queue_purge_worker = tokio::spawn(async move {
+        let report = task_queue::run_shared_task_queue_db_purge_worker_until(
+            shared_task_queue_purge_store,
+            shared_task_queue_cleanup_interval,
+            shared_task_queue_completed_retention,
+            wait_for_runtime_stop(shared_task_queue_purge_stop),
+        )
+        .await;
+
+        tracing::info!(?report, "shared taskman Postgres purge worker stopped");
+    });
+    readiness_checks.push(ReadinessCheck::ok(
+        "shared_task_queue_postgres_purge",
+        format!(
+            "Postgres purge every {}s, retention {}d",
+            shared_task_queue_cleanup_interval.as_secs(),
+            shared_task_queue_completed_retention.whole_days()
+        ),
+    ));
+    workers.handles.push(shared_task_queue_purge_worker);
     let shared_task_queue_stuck_runtime = shared_task_queue.clone();
     let shared_task_queue_stuck_stop = stop.subscribe();
     let shared_task_queue_stuck_worker = tokio::spawn(async move {
@@ -8645,6 +8627,7 @@ async fn start_runtime_workers(
     workers.handles.push(shared_task_queue_placeholder_worker);
     workers.shared_task_queue = Some(shared_task_queue.clone());
     let mut shared_taskman_worker_counts = BTreeMap::new();
+    shared_taskman_worker_counts.insert(openplotva_taskman::CONTROL_QUEUE_NAME.to_owned(), 1);
     if config.memory.enabled {
         match (
             memory_runtime::memory_extractor_from_app_config(config),
@@ -8819,6 +8802,7 @@ async fn start_runtime_workers(
             .with_draw_image_rate_limit(Arc::new(dialog_tools::DrawImageRateLimitPolicy::new(
                 service_clients.redis.draw_rate_limit_store(),
             )))
+            .with_task_enqueue_rate_limit(task_enqueue_rate_limit.clone())
             .with_draw_image_permission(permission_policy.clone())
             .with_song_service_available(music_service_available)
             .with_song_audio_permission(permission_policy.clone())
@@ -9563,7 +9547,8 @@ async fn start_runtime_workers(
                     telegram.clone(),
                     Arc::clone(&permission_policy),
                 ),
-            )),
+            ))
+            .with_task_enqueue_rate_limit(task_enqueue_rate_limit.clone()),
         );
         let random_dialog_effects = Arc::new(dialog_messages::RandomDialogDispatcherEffects::new(
             store.clone(),
@@ -10133,27 +10118,22 @@ async fn await_runtime_worker_shutdown(mut worker: JoinHandle<()>) {
 }
 
 async fn persist_shared_task_queue_on_shutdown(queue: task_queue::SharedTaskQueueRuntime) {
-    let path = queue.snapshot_path().to_path_buf();
     let save_result = timeout(task_queue::SHARED_TASK_QUEUE_SHUTDOWN_TIMEOUT, async {
-        queue.persist_snapshot()
+        queue.flush_dirty().await
     })
     .await;
 
     match save_result {
-        Ok(Ok(())) => {
-            tracing::info!(
-                path = %path.display(),
-                "saved shared taskman queue during shutdown"
-            );
+        Ok(Ok(flushed)) => {
+            tracing::info!(flushed, "flushed shared taskman queue during shutdown");
         }
         Ok(Err(error)) => {
-            tracing::warn!(%error, path = %path.display(), "failed to save shared taskman queue during shutdown");
+            tracing::warn!(%error, "failed to flush shared taskman queue during shutdown");
         }
         Err(_) => {
             tracing::warn!(
                 timeout_ms = task_queue::SHARED_TASK_QUEUE_SHUTDOWN_TIMEOUT.as_millis(),
-                path = %path.display(),
-                "timed out saving shared taskman queue during shutdown"
+                "timed out flushing shared taskman queue during shutdown"
             );
         }
     }
