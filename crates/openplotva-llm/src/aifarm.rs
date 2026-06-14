@@ -1740,6 +1740,23 @@ impl AifarmMemoryExtractor<ReqwestAifarmTransport> {
     }
 }
 
+/// Trace metadata for an auxiliary aifarm flow (memory/history/optimizers). Context is
+/// left default — these flows are attributed by flow/source/model, which drive analytics.
+fn aux_llm_call_trace(flow: &str, source: &str) -> crate::trace::LlmCallTrace {
+    crate::trace::LlmCallTrace {
+        context: crate::trace::LlmCallContext::default(),
+        tags: crate::trace::LlmCallTags {
+            provider: PROVIDER_AIFARM.to_owned(),
+            source: source.to_owned(),
+            flow: flow.to_owned(),
+            mode: "json".to_owned(),
+            request_kind: "openai.chat.completions".to_owned(),
+            iteration: 1,
+            docs_chars: 0,
+        },
+    }
+}
+
 impl AifarmStructuredJsonGenerator<ReqwestAifarmTransport> {
     /// Build a reqwest-backed structured JSON generator.
     #[must_use]
@@ -1768,9 +1785,12 @@ where
         request: AifarmStructuredJsonRequest,
         on_status: &mut (dyn FnMut(StatusUpdate) + Send),
     ) -> Result<String, AifarmStructuredJsonError> {
+        let flow = request.name.trim().to_owned();
+        let mut chat_request = self.request(request);
+        chat_request.trace = Some(aux_llm_call_trace(&flow, "aifarm_structured"));
         let result = self
             .client
-            .complete(self.request(request), on_status)
+            .complete(chat_request, on_status)
             .await
             .map_err(|source| AifarmStructuredJsonError::Completion { source })?;
         let Some(response) = result.response.as_ref() else {
@@ -2146,7 +2166,11 @@ where
         let system_prompt = openplotva_prompts::read("history/summary")?;
         let payload =
             serde_json::to_string_pretty(input).map_err(AifarmHistorySummaryError::Input)?;
-        let request = self.request(&system_prompt, &payload);
+        let mut request = self.request(&system_prompt, &payload);
+        request.trace = Some(aux_llm_call_trace(
+            "history_summary",
+            "aifarm_history_summary",
+        ));
         let result = self
             .client
             .complete(request, on_status)
@@ -2218,9 +2242,14 @@ where
         let system_prompt = openplotva_prompts::read("memory/extraction")?;
         let payload =
             serde_json::to_string_pretty(input).map_err(AifarmMemoryExtractorError::Input)?;
+        let mut request = self.request(&system_prompt, &payload);
+        request.trace = Some(aux_llm_call_trace(
+            "memory_extraction",
+            "aifarm_memory_extractor",
+        ));
         let result = self
             .client
-            .complete(self.request(&system_prompt, &payload), on_status)
+            .complete(request, on_status)
             .await
             .map_err(|source| AifarmMemoryExtractorError::Completion { source })?;
         let Some(response) = result.response.as_ref() else {
@@ -3140,7 +3169,19 @@ fn aifarm_dialog_trace_artifacts(
 
 #[cfg(test)]
 mod call_trace_artifact_tests {
-    use super::{ChatCompletionRequest, CompletionResult, TraceTags, aifarm_call_trace_artifacts};
+    use super::{
+        ChatCompletionRequest, CompletionResult, TraceTags, aifarm_call_trace_artifacts,
+        aux_llm_call_trace,
+    };
+
+    #[test]
+    fn aux_llm_call_trace_tags_match_go_for_memory() {
+        let trace = aux_llm_call_trace("memory_extraction", "aifarm_memory_extractor");
+        assert_eq!(trace.tags.flow, "memory_extraction");
+        assert_eq!(trace.tags.source, "aifarm_memory_extractor");
+        assert_eq!(trace.tags.provider, super::PROVIDER_AIFARM);
+        assert_eq!(trace.tags.request_kind, "openai.chat.completions");
+    }
 
     #[test]
     fn aifarm_call_trace_artifacts_tags_flow_and_model() {
