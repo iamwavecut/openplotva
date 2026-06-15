@@ -32,6 +32,7 @@ pub mod permissions;
 pub mod rate_limits;
 pub mod rates;
 pub mod reset;
+pub mod rich;
 pub mod runtime_api;
 mod runtime_cache;
 mod runtime_dispatcher;
