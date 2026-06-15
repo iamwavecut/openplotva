@@ -131,10 +131,46 @@ where
     telegram_auth_hash(pairs, bot_token).eq_ignore_ascii_case(provided_hash)
 }
 
+/// Constant-time byte-slice equality. Returns false immediately on length mismatch,
+/// then compares every remaining byte without early exit.
 #[must_use]
-pub fn admin_session_cookie(user_id: i64) -> String {
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// HMAC tag (hex) binding an admin user id to the server secret.
+#[must_use]
+pub fn admin_session_signature(user_id: i64, secret: &str) -> String {
+    hmac_sha256_hex(secret.as_bytes(), user_id.to_string().as_bytes())
+}
+
+/// Verify a signed admin-session cookie value of the form `<user_id>.<hex_sig>`.
+/// Returns the user id only when the signature verifies. Rejects unsigned legacy
+/// values (no `.`), tamper, and malformed input.
+#[must_use]
+pub fn verify_admin_session_value(value: &str, secret: &str) -> Option<i64> {
+    let (user_part, sig) = value.split_once('.')?;
+    let user_id = user_part.parse::<i64>().ok()?;
+    let expected = admin_session_signature(user_id, secret);
+    if constant_time_eq(expected.as_bytes(), sig.as_bytes()) {
+        Some(user_id)
+    } else {
+        None
+    }
+}
+
+#[must_use]
+pub fn admin_session_cookie(user_id: i64, secret: &str) -> String {
+    let sig = admin_session_signature(user_id, secret);
     format!(
-        "{ADMIN_SESSION_COOKIE_NAME}={user_id}; Path={ADMIN_SESSION_COOKIE_PATH}; Max-Age={ADMIN_SESSION_COOKIE_MAX_AGE_SECONDS}; HttpOnly; SameSite=Lax"
+        "{ADMIN_SESSION_COOKIE_NAME}={user_id}.{sig}; Path={ADMIN_SESSION_COOKIE_PATH}; Max-Age={ADMIN_SESSION_COOKIE_MAX_AGE_SECONDS}; HttpOnly; SameSite=Lax"
     )
 }
 
@@ -258,7 +294,7 @@ mod tests {
         settings_selection_base_url, settings_selection_chat_url, settings_selection_personal_url,
         settings_signature, static_asset, static_asset_sha256_hex, static_assets,
         telegram_auth_hash, truncate_custom_persona, validate_settings_access_signature,
-        validate_telegram_auth,
+        validate_telegram_auth, verify_admin_session_value,
     };
 
     #[test]
@@ -379,11 +415,21 @@ mod tests {
     }
 
     #[test]
-    fn admin_session_cookie_matches_go_cookie_shape() {
-        assert_eq!(
-            admin_session_cookie(7),
-            "admin_session=7; Path=/admin/; Max-Age=604800; HttpOnly; SameSite=Lax"
-        );
+    fn admin_session_cookie_is_signed_and_round_trips() {
+        let secret = "123:ABC";
+        let cookie = admin_session_cookie(7, secret);
+        // value is "7.<64 hex chars>"
+        let value = cookie
+            .split(';')
+            .next()
+            .expect("cookie pair")
+            .strip_prefix("admin_session=")
+            .expect("name prefix");
+        assert_eq!(verify_admin_session_value(value, secret), Some(7));
+        // tamper / wrong secret / legacy unsigned are rejected
+        assert_eq!(verify_admin_session_value("7", secret), None);
+        assert_eq!(verify_admin_session_value(value, "wrong"), None);
+        assert!(cookie.contains("HttpOnly; SameSite=Lax"));
     }
 
     #[test]
