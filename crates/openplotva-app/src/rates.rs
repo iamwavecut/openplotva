@@ -632,64 +632,60 @@ pub trait RatesEffects {
 /// Generator for virtual-message IDs used by rates command sends.
 pub type RatesVirtualIdFactory = VirtualIdFactory;
 
-/// Dispatcher-backed rates command side effects.
+/// Rich-message-backed rates command side effects.
 #[derive(Clone)]
-pub struct RatesDispatcherEffects<Store> {
-    store: Store,
-    queue: Arc<DispatcherQueue>,
-    next_virtual_id: RatesVirtualIdFactory,
+pub struct RatesRichEffects {
+    rich: Arc<dyn crate::rich::RichSender>,
 }
 
-impl<Store> RatesDispatcherEffects<Store> {
-    /// Build rates effects backed by the normal outbound dispatcher.
+impl RatesRichEffects {
+    /// Build rates effects that reply with a rich message.
     #[must_use]
-    pub fn new(store: Store, queue: Arc<DispatcherQueue>) -> Self {
-        Self {
-            store,
-            queue,
-            next_virtual_id: monotonic_virtual_id_factory("rates-vmsg"),
-        }
-    }
-
-    /// Override virtual-message ID generation for deterministic tests.
-    #[must_use]
-    pub fn with_virtual_id_factory(mut self, next_virtual_id: RatesVirtualIdFactory) -> Self {
-        self.next_virtual_id = next_virtual_id;
-        self
+    pub fn new(rich: Arc<dyn crate::rich::RichSender>) -> Self {
+        Self { rich }
     }
 }
 
-impl<Store> RatesEffects for RatesDispatcherEffects<Store>
-where
-    Store: VirtualMessageStore + Send + Sync,
-{
-    type Error = RatesDispatchEffectError;
+impl RatesEffects for RatesRichEffects {
+    type Error = RatesRichEffectError;
 
     fn send_rates_text<'a>(&'a self, plan: RatesTextPlan) -> RatesEffectFuture<'a, Self::Error> {
         Box::pin(async move {
-            queue_text_message_parts(
-                &self.store,
-                &self.queue,
-                QueueTextRequest {
-                    message: &plan.message,
-                    reply_to: Some(&plan.reply_to),
-                    immediate_first: false,
-                    bypass_chat_restrictions: false,
-                    ephemeral_delete_after: None,
+            let chat_id = plan
+                .message
+                .chat
+                .as_ref()
+                .map_or(plan.reply_to.chat.id, |chat| chat.id);
+            let options = openplotva_telegram::RichSendOptions {
+                message_thread_id: if plan.message.message_thread_id != 0 {
+                    Some(plan.message.message_thread_id)
+                } else if plan.reply_to.is_topic_message {
+                    Some(plan.reply_to.message_thread_id)
+                } else {
+                    None
                 },
-                || (self.next_virtual_id)(),
-            )
-            .await?;
+                reply_to_message_id: Some(plan.reply_to.message_id),
+                allow_sending_without_reply: plan
+                    .message
+                    .allow_sending_without_reply
+                    .unwrap_or(false),
+                disable_notification: plan.message.disable_notification,
+                reply_markup: None,
+            };
+            self.rich
+                .send_rich(chat_id, &plan.message.text, &options)
+                .await
+                .map_err(|err| RatesRichEffectError::Send(err.to_string()))?;
             Ok(())
         })
     }
 }
 
-/// Recoverable errors from dispatcher-backed rates effects.
+/// Recoverable errors from rich rates effects.
 #[derive(Debug, Error, Eq, PartialEq)]
-pub enum RatesDispatchEffectError {
-    #[error("failed to queue rates text: {0}")]
-    Queue(#[from] OutboundBuildError),
+pub enum RatesRichEffectError {
+    #[error("failed to send rates rich message: {0}")]
+    Send(String),
 }
 
 /// Generator for async rates side-effect ticket IDs.
@@ -1201,20 +1197,31 @@ pub fn dialog_rates_errors(rates: &RatesSnapshot) -> Vec<String> {
 
 #[must_use]
 pub fn format_rates_command_message(header: &str, rates: &RatesSnapshot) -> String {
-    let usd_pct = percent_change(rates.usd_prev, rates.usd) as f32 as f64;
-    let eur_pct = percent_change(rates.eur_prev, rates.eur) as f32 as f64;
-    let rate_usd = format_fiat_rate("💵", usd_pct, rates.usd, "₽");
-    let rate_eur = format_fiat_rate("💶", eur_pct, rates.eur, "₽");
-    let rate_usd_eur = format!(
-        "[ 💶 / 💵 = <code>{}</code> ]",
-        format_rate_value(rates.eur_usd, 4)
-    );
-    let crypto_line = if rates.btc_error.is_none() && rates.btc != 0.0 {
-        format_crypto_rate(rates.btc, 0.0, "BTC", "$")
-    } else {
-        String::new()
-    };
-    format!("{header}\n{rate_usd}    {rate_eur}\n{crypto_line}    {rate_usd_eur}")
+    let mut rows = vec![
+        crate::rich::RateRow {
+            label: "💵 USD/RUB".to_owned(),
+            value: format!("{} ₽", format_rate_value(rates.usd, 2)),
+            delta: format_rate_delta(rates.usd_prev, rates.usd),
+        },
+        crate::rich::RateRow {
+            label: "💶 EUR/RUB".to_owned(),
+            value: format!("{} ₽", format_rate_value(rates.eur, 2)),
+            delta: format_rate_delta(rates.eur_prev, rates.eur),
+        },
+        crate::rich::RateRow {
+            label: "💶/💵 EUR/USD".to_owned(),
+            value: format_rate_value(rates.eur_usd, 4),
+            delta: format_rate_delta(rates.eur_usd_prev, rates.eur_usd),
+        },
+    ];
+    if rates.btc_error.is_none() && rates.btc != 0.0 {
+        rows.push(crate::rich::RateRow {
+            label: "₿ BTC/USD".to_owned(),
+            value: format!("{} $", format_rate_value(rates.btc, 0)),
+            delta: String::new(),
+        });
+    }
+    crate::rich::compose_rates_table(header, &rows, "")
 }
 
 #[must_use]
@@ -1375,32 +1382,6 @@ where
     effects.send_rates_text(plan).await
 }
 
-fn format_fiat_rate(symbol: &str, percent: f64, rate: f64, unit: &str) -> String {
-    let chart = trend_emoji(percent);
-    format!(
-        "[ {symbol}{chart} <b>{}%</b> = <code>{} {unit}</code>]",
-        format_rate_value(percent, 1),
-        format_rate_value(rate, 2),
-    )
-}
-
-fn format_crypto_rate(rate: f64, percent: f64, symbol: &str, unit: &str) -> String {
-    let chart = trend_emoji(percent);
-    format!(
-        "[ <b>{symbol}</b>{chart} <b>{}%</b> = <code>{} {unit}</code> ]",
-        format_rate_value(percent, 1),
-        format_rate_value(rate, 0),
-    )
-}
-
-fn trend_emoji(percent: f64) -> &'static str {
-    match percent.total_cmp(&0.0) {
-        std::cmp::Ordering::Greater => "📈",
-        std::cmp::Ordering::Less => "📉",
-        std::cmp::Ordering::Equal => "",
-    }
-}
-
 fn format_rate_value(value: f64, precision: usize) -> String {
     format!("{value:.precision$}")
 }
@@ -1478,27 +1459,29 @@ mod tests {
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].message.render_as, TELEGRAM_PARSE_MODE_HTML);
         assert_eq!(sent[0].reply_to.message_id, 77);
-        assert_eq!(
-            sent[0].message.text,
-            "Header for Ada Lovelace\n[ 💵📈 <b>1.1%</b> = <code>90.00 ₽</code>]    [ 💶📈 <b>2.0%</b> = <code>100.00 ₽</code>]\n[ <b>BTC</b> <b>0.0%</b> = <code>65000 $</code> ]    [ 💶 / 💵 = <code>1.1111</code> ]"
+        assert!(
+            sent[0]
+                .message
+                .text
+                .starts_with("<h3>Header for Ada Lovelace</h3><table")
         );
+        assert!(sent[0].message.text.contains("<td>💵 USD/RUB</td>"));
+        assert!(sent[0].message.text.contains("90.00 ₽"));
+        assert!(sent[0].message.text.contains("65000 $"));
         Ok(())
     }
 
     #[tokio::test]
-    async fn rates_update_handler_queues_dispatcher_send_message_payload()
+    async fn rates_update_handler_sends_rich_message_payload()
     -> Result<(), Box<dyn std::error::Error>> {
-        let store = VirtualStoreStub::default();
-        let queue = Arc::new(openplotva_telegram::DispatcherQueue::new(Default::default()));
-        let effects = RatesDispatcherEffects::new(store.clone(), Arc::clone(&queue))
-            .with_virtual_id_factory(Arc::new(|| "rates-command-vmsg-1".to_owned()));
+        let mock = Arc::new(crate::rich::MockRichSender::default());
         let next = Arc::new(NextStub::default());
         let handler = RatesCommandUpdateHandler::new(
             bot_identity()?,
             Arc::new(PermissionStub::allowed()),
             Some(Arc::new(RatesFetcherStub::successful())),
             Arc::new(HeaderStub),
-            Arc::new(effects),
+            Arc::new(RatesRichEffects::new(mock.clone())),
             Arc::clone(&next),
         );
 
@@ -1507,39 +1490,19 @@ mod tests {
             .await?;
 
         assert!(next.calls().is_empty());
-        assert_eq!(
-            store.inserts(),
-            vec![("rates-command-vmsg-1".to_owned(), -10042, Some(0))]
+        let sent = mock.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].chat_id, -10042);
+        assert_eq!(sent[0].message_thread_id, Some(9));
+        assert_eq!(sent[0].reply_to_message_id, Some(82));
+        assert!(
+            sent[0]
+                .html
+                .starts_with("<h3>Header for Ada Lovelace</h3><table")
         );
-        assert!(queue.dequeue_immediate().is_none());
-        let item = queue
-            .dequeue_regular()
-            .ok_or_else(|| io::Error::other("expected queued rates message"))?;
-        assert_eq!(item.metadata().virtual_id, "rates-command-vmsg-1");
-        assert_eq!(item.metadata().chat_id, -10042);
-        assert_eq!(
-            item.method_kind(),
-            Some(openplotva_telegram::TelegramOutboundMethodKind::SendMessage)
-        );
-        assert!(!item.bypasses_chat_restrictions());
-        assert!(item.ephemeral_delete_after().is_none());
-
-        let method = item
-            .into_method()
-            .ok_or_else(|| io::Error::other("expected rates sendMessage payload"))?;
-        let value = method_as_value(method)?;
-        assert_eq!(value["chat_id"], json!(-10042));
-        assert_eq!(value["message_thread_id"], json!(9));
-        assert_eq!(value["reply_parameters"]["message_id"], json!(82));
-        assert_eq!(value["reply_parameters"]["chat_id"], json!(-10042));
-        assert_eq!(value["parse_mode"], json!("HTML"));
-        assert_eq!(
-            value["text"],
-            json!(
-                "Header for Ada Lovelace\n[ 💵📈 <b>1.1%</b> = <code>90.00 ₽</code>]    [ 💶📈 <b>2.0%</b> = <code>100.00 ₽</code>]\n[ <b>BTC</b> <b>0.0%</b> = <code>65000 $</code> ]    [ 💶 / 💵 = <code>1.1111</code> ]"
-            )
-        );
-        assert!(queue.dequeue_regular().is_none());
+        assert!(sent[0].html.contains("<td>💵 USD/RUB</td>"));
+        assert!(sent[0].html.contains("90.00 ₽"));
+        assert!(sent[0].html.contains("₿ BTC/USD"));
         Ok(())
     }
 
@@ -1711,10 +1674,11 @@ mod tests {
             eur_usd_prev: 1.1,
             ..RatesSnapshot::default()
         };
-        assert_eq!(
-            format_rates_command_message("H", &no_btc),
-            "H\n[ 💵 <b>0.0%</b> = <code>90.00 ₽</code>]    [ 💶 <b>0.0%</b> = <code>100.00 ₽</code>]\n    [ 💶 / 💵 = <code>1.1000</code> ]"
-        );
+        let rendered = format_rates_command_message("H", &no_btc);
+        assert!(rendered.starts_with("<h3>H</h3><table bordered striped>"));
+        assert!(rendered.contains("<td>💵 USD/RUB</td>"));
+        assert!(rendered.contains("90.00 ₽"));
+        assert!(!rendered.contains("BTC/USD"));
     }
 
     #[test]
@@ -1883,18 +1847,14 @@ mod tests {
             rbc_test_client()?.with_key_indicators_url_prefix_for_test(Arc::<str>::from(prefix)),
         );
 
-        let command_store = VirtualStoreStub::default();
-        let command_queue = Arc::new(openplotva_telegram::DispatcherQueue::new(Default::default()));
-        let command_effects =
-            RatesDispatcherEffects::new(command_store.clone(), Arc::clone(&command_queue))
-                .with_virtual_id_factory(Arc::new(|| "rates-command-rbc-vmsg-1".to_owned()));
+        let command_mock = Arc::new(crate::rich::MockRichSender::default());
         let next = Arc::new(NextStub::default());
         let handler = RatesCommandUpdateHandler::new(
             bot_identity()?,
             Arc::new(PermissionStub::allowed()),
             Some(Arc::clone(&provider)),
             Arc::new(HeaderStub),
-            Arc::new(command_effects),
+            Arc::new(RatesRichEffects::new(command_mock.clone())),
             Arc::clone(&next),
         );
 
@@ -1903,26 +1863,14 @@ mod tests {
             .await?;
 
         assert!(next.calls().is_empty());
-        assert_eq!(
-            command_store.inserts(),
-            vec![("rates-command-rbc-vmsg-1".to_owned(), -10042, Some(0))]
-        );
-        let command_item = command_queue
-            .dequeue_regular()
-            .ok_or_else(|| io::Error::other("expected queued RBC-backed command payload"))?;
-        let command_method = command_item
-            .into_method()
-            .ok_or_else(|| io::Error::other("expected queued RBC-backed command method"))?;
-        let command = method_as_value(command_method)?;
-        assert_eq!(command["chat_id"], json!(-10042));
-        assert_eq!(command["message_thread_id"], json!(9));
-        assert_eq!(command["reply_parameters"]["message_id"], json!(83));
-        assert_eq!(command["parse_mode"], json!("HTML"));
-        assert!(
-            command["text"]
-                .as_str()
-                .is_some_and(|text| text.contains("90.00 ₽") && text.contains("65000 $"))
-        );
+        {
+            let sent = command_mock.sent.lock().unwrap();
+            assert_eq!(sent.len(), 1);
+            assert_eq!(sent[0].chat_id, -10042);
+            assert_eq!(sent[0].message_thread_id, Some(9));
+            assert_eq!(sent[0].reply_to_message_id, Some(83));
+            assert!(sent[0].html.contains("90.00 ₽") && sent[0].html.contains("65000 $"));
+        }
 
         let tool_store = VirtualStoreStub::default();
         let tool_queue = Arc::new(openplotva_telegram::DispatcherQueue::new(Default::default()));
@@ -1969,10 +1917,7 @@ mod tests {
         let Ok(redis_url) = env::var("OPENPLOTVA_TEST_REDIS_URL") else {
             return Ok(());
         };
-        for (command, message_id, virtual_id) in [
-            ("$", 84, "rates-live-redis-vmsg-dollar"),
-            (";", 85, "rates-live-redis-vmsg-semicolon"),
-        ] {
+        for (command, message_id) in [("$", 84), (";", 85)] {
             let redis_client = redis::Client::open(redis_url.as_str())?;
             let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
             let key = format!("openplotva:test:decoded-rates:{suffix}");
@@ -1987,19 +1932,14 @@ mod tests {
                     .with_key_indicators_url_prefix_for_test(Arc::<str>::from(prefix)),
             );
             let state_store = UpdateStateStoreStub::default();
-            let virtual_store = VirtualStoreStub::default();
-            let dispatcher_queue =
-                Arc::new(openplotva_telegram::DispatcherQueue::new(Default::default()));
-            let effects =
-                RatesDispatcherEffects::new(virtual_store.clone(), Arc::clone(&dispatcher_queue))
-                    .with_virtual_id_factory(Arc::new(move || virtual_id.to_owned()));
+            let command_mock = Arc::new(crate::rich::MockRichSender::default());
             let next = Arc::new(NextStub::default());
             let handler = RatesCommandUpdateHandler::new(
                 bot_identity()?,
                 Arc::new(PermissionStub::allowed()),
                 Some(Arc::clone(&provider)),
                 Arc::new(HeaderStub),
-                Arc::new(effects),
+                Arc::new(RatesRichEffects::new(command_mock.clone())),
                 Arc::clone(&next),
             );
 
@@ -2043,27 +1983,14 @@ mod tests {
                 ]
             );
             assert!(next.calls().is_empty());
-            assert_eq!(
-                virtual_store.inserts(),
-                vec![(virtual_id.to_owned(), -10042, Some(0))]
-            );
-            let item = dispatcher_queue
-                .dequeue_regular()
-                .ok_or_else(|| io::Error::other("expected decoded rates payload"))?;
-            assert_eq!(item.metadata().virtual_id, virtual_id);
-            let value = method_as_value(
-                item.into_method()
-                    .ok_or_else(|| io::Error::other("expected sendMessage method"))?,
-            )?;
-            assert_eq!(value["chat_id"], json!(-10042));
-            assert_eq!(value["message_thread_id"], json!(9));
-            assert_eq!(value["reply_parameters"]["message_id"], json!(message_id));
-            assert_eq!(value["parse_mode"], json!("HTML"));
-            assert!(
-                value["text"]
-                    .as_str()
-                    .is_some_and(|text| text.contains("90.00 ₽") && text.contains("65000 $"))
-            );
+            {
+                let sent = command_mock.sent.lock().unwrap();
+                assert_eq!(sent.len(), 1);
+                assert_eq!(sent[0].chat_id, -10042);
+                assert_eq!(sent[0].message_thread_id, Some(9));
+                assert_eq!(sent[0].reply_to_message_id, Some(message_id));
+                assert!(sent[0].html.contains("90.00 ₽") && sent[0].html.contains("65000 $"));
+            }
             assert_eq!(update_queue.len().await?, 0);
 
             let request = server
@@ -2595,20 +2522,6 @@ mod tests {
                     state: "queued".to_owned(),
                 })
             })
-        }
-    }
-
-    fn method_as_value(
-        method: openplotva_telegram::TelegramOutboundMethod,
-    ) -> io::Result<serde_json::Value> {
-        match method {
-            openplotva_telegram::TelegramOutboundMethod::SendMessage(method) => {
-                serde_json::to_value(method.as_ref()).map_err(io::Error::other)
-            }
-            other => Err(io::Error::other(format!(
-                "unexpected Telegram method: {}",
-                other.method_name()
-            ))),
         }
     }
 

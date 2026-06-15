@@ -9697,10 +9697,7 @@ async fn start_runtime_workers(
             Arc::new(MessageGateCheckedRatesPermission),
             Some(Arc::clone(&rates_fetcher)),
             Arc::new(RuntimeRatesHeaderProvider),
-            Arc::new(rates::RatesDispatcherEffects::new(
-                store.clone(),
-                Arc::clone(&dispatcher_queue_for_updates),
-            )),
+            Arc::new(rates::RatesRichEffects::new(Arc::clone(&rich_sender))),
             translate_handler,
         ));
         let checkin_command = Arc::new(checkin::CheckinCommandUpdateHandler::new(
