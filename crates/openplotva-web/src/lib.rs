@@ -1,5 +1,6 @@
 //! Admin and settings WebApp backend helpers.
 
+use serde::Deserialize;
 use sha2::{Digest, Sha224, Sha256};
 
 /// Human-readable crate purpose used by scaffold tests and docs.
@@ -75,7 +76,7 @@ const SETTINGS_ASSETS: &[StaticAsset] = &[
         path: "index.js",
         content_type: "text/javascript; charset=utf-8",
         bytes: include_bytes!("../../../web/settings/index.js"),
-        sha256: "1e854fc52928bb34e0ec27891c842740611ffcbd4e2f71979a01dc17331070cb",
+        sha256: "8c798715212832b795e3c347714e734f0bfdc896dec9b15ed842c46f796661fd",
     },
     StaticAsset {
         path: "landing.html",
@@ -166,6 +167,80 @@ pub fn verify_admin_session_value(value: &str, secret: &str) -> Option<i64> {
     } else {
         None
     }
+}
+
+/// Telegram user identity extracted from a validated WebApp `initData` payload.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+pub struct TelegramWebAppUser {
+    pub id: i64,
+    #[serde(default)]
+    pub first_name: String,
+    #[serde(default)]
+    pub username: Option<String>,
+}
+
+/// Validate a Telegram WebApp `initData` payload and return the caller identity.
+///
+/// The WebApp key derivation differs from the Login Widget (`validate_telegram_auth`):
+/// `secret_key = HMAC_SHA256(key = "WebAppData", message = bot_token)`, then
+/// `hash = HMAC_SHA256(key = secret_key, message = data_check_string)`.
+///
+/// `now_unix` is passed in (not read from a clock) so freshness can be exercised in tests.
+/// Returns `None` when the payload is missing `hash`/`user`, the bot token is empty,
+/// the signature does not match (constant-time compare), or `auth_date` is older than
+/// `max_age_seconds`.
+#[must_use]
+pub fn validate_webapp_init_data(
+    init_data: &str,
+    bot_token: &str,
+    max_age_seconds: u64,
+    now_unix: i64,
+) -> Option<TelegramWebAppUser> {
+    if bot_token.is_empty() {
+        return None;
+    }
+
+    let mut provided_hash: Option<String> = None;
+    let mut auth_date: Option<i64> = None;
+    let mut user_field: Option<String> = None;
+    let mut check_pairs: Vec<(String, String)> = Vec::new();
+    for (key, value) in url::form_urlencoded::parse(init_data.as_bytes()) {
+        match key.as_ref() {
+            "hash" => provided_hash = Some(value.into_owned()),
+            other => {
+                if other == "auth_date" {
+                    auth_date = value.parse::<i64>().ok();
+                }
+                if other == "user" {
+                    user_field = Some(value.to_string());
+                }
+                check_pairs.push((other.to_owned(), value.into_owned()));
+            }
+        }
+    }
+
+    let provided_hash = provided_hash?;
+    let auth_date = auth_date?;
+    if now_unix.saturating_sub(auth_date) > max_age_seconds as i64 {
+        return None;
+    }
+    let user_field = user_field?;
+
+    check_pairs.sort_by(|left, right| left.0.cmp(&right.0));
+    let data_check_string = check_pairs
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let secret_key_hex = hmac_sha256_hex(b"WebAppData", bot_token.as_bytes());
+    let secret_key = hex::decode(secret_key_hex).ok()?;
+    let computed = hmac_sha256_hex(&secret_key, data_check_string.as_bytes());
+    if !constant_time_eq(computed.as_bytes(), provided_hash.as_bytes()) {
+        return None;
+    }
+
+    serde_json::from_str::<TelegramWebAppUser>(&user_field).ok()
 }
 
 #[must_use]
@@ -292,11 +367,12 @@ fn normalize_static_asset_path(path: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        StaticAssetGroup, admin_session_cookie, private_settings_web_app_url, settings_button_url,
-        settings_selection_base_url, settings_selection_chat_url, settings_selection_personal_url,
-        settings_signature, static_asset, static_asset_sha256_hex, static_assets,
-        telegram_auth_hash, truncate_custom_persona, validate_settings_access_signature,
-        validate_telegram_auth, verify_admin_session_value,
+        StaticAssetGroup, admin_session_cookie, constant_time_eq, hmac_sha256_hex,
+        private_settings_web_app_url, settings_button_url, settings_selection_base_url,
+        settings_selection_chat_url, settings_selection_personal_url, settings_signature,
+        static_asset, static_asset_sha256_hex, static_assets, telegram_auth_hash,
+        truncate_custom_persona, validate_settings_access_signature, validate_telegram_auth,
+        validate_webapp_init_data, verify_admin_session_value,
     };
 
     #[test]
@@ -448,6 +524,115 @@ mod tests {
         tampered.replace_range(0..1, if &hash[0..1] == "0" { "1" } else { "0" });
         assert!(!validate_telegram_auth(pairs, "123:ABC", &tampered)); // one char off
         assert!(!validate_telegram_auth(pairs, "123:ABC", "deadbeef")); // length mismatch
+    }
+
+    const WEBAPP_FIXTURE_TOKEN: &str = "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11";
+
+    fn webapp_init_data_fixture(auth_date: i64) -> String {
+        let user = r#"{"id":42,"first_name":"Ada","username":"ada"}"#;
+        let pairs = [
+            ("auth_date", auth_date.to_string()),
+            ("query_id", "AAEa".to_owned()),
+            ("user", user.to_owned()),
+        ];
+        let data_check_string = pairs
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let secret_key_hex = hmac_sha256_hex(b"WebAppData", WEBAPP_FIXTURE_TOKEN.as_bytes());
+        let secret_key = hex::decode(secret_key_hex).expect("hmac hex decodes to bytes");
+        let hash = hmac_sha256_hex(&secret_key, data_check_string.as_bytes());
+        let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+        for (key, value) in &pairs {
+            serializer.append_pair(key, value);
+        }
+        serializer.append_pair("hash", &hash);
+        serializer.finish()
+    }
+
+    #[test]
+    fn webapp_init_data_validates_with_webappdata_key_derivation() {
+        let init_data = webapp_init_data_fixture(1_700_000_000);
+        let user =
+            validate_webapp_init_data(&init_data, WEBAPP_FIXTURE_TOKEN, 3_600, 1_700_000_100)
+                .expect("freshly signed initData validates");
+        assert_eq!(user.id, 42);
+        assert_eq!(user.first_name, "Ada");
+        assert_eq!(user.username.as_deref(), Some("ada"));
+    }
+
+    #[test]
+    fn webapp_init_data_rejects_tampered_hash() {
+        let init_data = webapp_init_data_fixture(1_700_000_000);
+        let tampered = init_data.replace("hash=", "hash=00");
+        assert!(
+            validate_webapp_init_data(&tampered, WEBAPP_FIXTURE_TOKEN, 3_600, 1_700_000_100)
+                .is_none()
+        );
+        assert!(
+            validate_webapp_init_data(&init_data, "999999:WRONG", 3_600, 1_700_000_100).is_none()
+        );
+    }
+
+    #[test]
+    fn webapp_init_data_rejects_stale_auth_date() {
+        let init_data = webapp_init_data_fixture(1_700_000_000);
+        assert!(
+            validate_webapp_init_data(&init_data, WEBAPP_FIXTURE_TOKEN, 3_600, 1_700_003_601)
+                .is_none()
+        );
+        assert!(
+            validate_webapp_init_data(&init_data, WEBAPP_FIXTURE_TOKEN, 3_600, 1_700_003_600)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn webapp_init_data_rejects_missing_hash_or_user() {
+        let init_data = webapp_init_data_fixture(1_700_000_000);
+        let without_hash = init_data
+            .split('&')
+            .filter(|pair| !pair.starts_with("hash="))
+            .collect::<Vec<_>>()
+            .join("&");
+        assert!(
+            validate_webapp_init_data(&without_hash, WEBAPP_FIXTURE_TOKEN, 3_600, 1_700_000_100)
+                .is_none()
+        );
+
+        let no_user_pairs = [("auth_date", "1700000000"), ("query_id", "AAEa")];
+        let data_check_string = no_user_pairs
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let secret_key_hex = hmac_sha256_hex(b"WebAppData", WEBAPP_FIXTURE_TOKEN.as_bytes());
+        let secret_key = hex::decode(secret_key_hex).expect("hmac hex decodes to bytes");
+        let hash = hmac_sha256_hex(&secret_key, data_check_string.as_bytes());
+        let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+        for (key, value) in &no_user_pairs {
+            serializer.append_pair(key, value);
+        }
+        serializer.append_pair("hash", &hash);
+        let without_user = serializer.finish();
+        assert!(
+            validate_webapp_init_data(&without_user, WEBAPP_FIXTURE_TOKEN, 3_600, 1_700_000_100)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn webapp_init_data_rejects_empty_bot_token() {
+        let init_data = webapp_init_data_fixture(1_700_000_000);
+        assert!(validate_webapp_init_data(&init_data, "", 3_600, 1_700_000_100).is_none());
+    }
+
+    #[test]
+    fn constant_time_eq_matches_only_identical_slices() {
+        assert!(constant_time_eq(b"abc123", b"abc123"));
+        assert!(!constant_time_eq(b"abc123", b"abc124"));
+        assert!(!constant_time_eq(b"abc", b"abcd"));
     }
 
     #[test]

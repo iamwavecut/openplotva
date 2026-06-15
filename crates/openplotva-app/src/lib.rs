@@ -388,6 +388,7 @@ struct TelegramWebhookRoute {
 struct StaticWebRoutes {
     admin_ids: Arc<[i64]>,
     bot_token: Arc<str>,
+    require_settings_init_data: bool,
     webapp_url: Arc<str>,
     bot_username: Arc<str>,
     bot_id: Option<i64>,
@@ -438,6 +439,7 @@ fn static_web_routes(
     StaticWebRoutes {
         admin_ids: Arc::from(admin_ids),
         bot_token: Arc::from(bot_token.into()),
+        require_settings_init_data: false,
         webapp_url: Arc::from(webapp_url.into()),
         bot_username: Arc::from(bot_username.into()),
         bot_id: None,
@@ -488,6 +490,7 @@ fn static_web_routes_from_config(
         bot_username,
         service_clients.map(|clients| PostgresVirtualMessageStore::new(clients.postgres.clone())),
     );
+    routes.require_settings_init_data = config.server.require_settings_init_data;
     routes.default_log_level = Arc::from(config.observability.log_level.clone());
     routes.log_buffer = Some(log_buffer);
     routes.telegram = runtime_workers.telegram.clone();
@@ -773,27 +776,31 @@ async fn settings_asset(Path(path): Path<String>) -> Response {
 
 async fn settings_api(
     method: Method,
+    headers: HeaderMap,
     RawQuery(raw_query): RawQuery,
     Extension(routes): Extension<StaticWebRoutes>,
     body: Bytes,
 ) -> Response {
+    let init_data = settings_init_data_header(&headers);
     match method {
         Method::OPTIONS => settings_options_response(),
-        Method::GET => settings_get_response(&routes, raw_query.as_deref()).await,
-        Method::POST | Method::PUT => settings_update_response(&routes, &body).await,
+        Method::GET => settings_get_response(&routes, raw_query.as_deref(), init_data).await,
+        Method::POST | Method::PUT => settings_update_response(&routes, &body, init_data).await,
         _ => settings_error_response(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed"),
     }
 }
 
 async fn settings_deputies_api(
     method: Method,
+    headers: HeaderMap,
     RawQuery(_raw_query): RawQuery,
     Extension(routes): Extension<StaticWebRoutes>,
     body: Bytes,
 ) -> Response {
+    let init_data = settings_init_data_header(&headers);
     match method {
         Method::OPTIONS => settings_side_options_response("GET, PUT, OPTIONS"),
-        Method::PUT => settings_deputies_update_response(&routes, &body).await,
+        Method::PUT => settings_deputies_update_response(&routes, &body, init_data).await,
         _ => settings_side_error_response(
             StatusCode::METHOD_NOT_ALLOWED,
             "Method not allowed",
@@ -804,12 +811,16 @@ async fn settings_deputies_api(
 
 async fn settings_deputy_candidates_api(
     method: Method,
+    headers: HeaderMap,
     RawQuery(raw_query): RawQuery,
     Extension(routes): Extension<StaticWebRoutes>,
 ) -> Response {
+    let init_data = settings_init_data_header(&headers);
     match method {
         Method::OPTIONS => settings_side_options_response("GET, PUT, OPTIONS"),
-        Method::GET => settings_deputy_candidates_response(&routes, raw_query.as_deref()).await,
+        Method::GET => {
+            settings_deputy_candidates_response(&routes, raw_query.as_deref(), init_data).await
+        }
         _ => settings_side_error_response(
             StatusCode::METHOD_NOT_ALLOWED,
             "Method not allowed",
@@ -820,13 +831,17 @@ async fn settings_deputy_candidates_api(
 
 async fn settings_memory_api(
     method: Method,
+    headers: HeaderMap,
     RawQuery(raw_query): RawQuery,
     Extension(routes): Extension<StaticWebRoutes>,
 ) -> Response {
+    let init_data = settings_init_data_header(&headers);
     match method {
         Method::OPTIONS => settings_side_options_response("GET, DELETE, OPTIONS"),
-        Method::GET => settings_memory_get_response(&routes, raw_query.as_deref()).await,
-        Method::DELETE => settings_memory_delete_response(&routes, raw_query.as_deref()).await,
+        Method::GET => settings_memory_get_response(&routes, raw_query.as_deref(), init_data).await,
+        Method::DELETE => {
+            settings_memory_delete_response(&routes, raw_query.as_deref(), init_data).await
+        }
         _ => settings_side_error_response(
             StatusCode::METHOD_NOT_ALLOWED,
             "method not allowed",
@@ -837,13 +852,15 @@ async fn settings_memory_api(
 
 async fn settings_chats_api(
     method: Method,
+    headers: HeaderMap,
     RawQuery(raw_query): RawQuery,
     Extension(routes): Extension<StaticWebRoutes>,
 ) -> Response {
     if method != Method::GET {
         return (StatusCode::METHOD_NOT_ALLOWED, "Method not allowed\n").into_response();
     }
-    settings_chats_response(&routes, raw_query.as_deref()).await
+    let init_data = settings_init_data_header(&headers);
+    settings_chats_response(&routes, raw_query.as_deref(), init_data).await
 }
 
 async fn admin_auth(
@@ -1534,7 +1551,11 @@ struct SettingsMemoryResponse {
     cards: Vec<openplotva_memory::Card>,
 }
 
-async fn settings_get_response(routes: &StaticWebRoutes, raw_query: Option<&str>) -> Response {
+async fn settings_get_response(
+    routes: &StaticWebRoutes,
+    raw_query: Option<&str>,
+    init_data: Option<&str>,
+) -> Response {
     let Some(settings_store) = &routes.settings_store else {
         return settings_error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1549,6 +1570,13 @@ async fn settings_get_response(routes: &StaticWebRoutes, raw_query: Option<&str>
     };
 
     let values = admin_auth_query_values(raw_query);
+    let claimed_user_id = values
+        .get("user_id")
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(0);
+    if authenticate_settings_init_data(routes, init_data, claimed_user_id).is_err() {
+        return settings_error_response(StatusCode::UNAUTHORIZED, "Unauthorized");
+    }
     let access = match parse_settings_get_access(&values, &routes.admin_ids) {
         Ok(access) => access,
         Err(error) => return settings_access_error_response(error),
@@ -1586,7 +1614,11 @@ async fn settings_get_response(routes: &StaticWebRoutes, raw_query: Option<&str>
     settings_json_response(StatusCode::OK, &response)
 }
 
-async fn settings_update_response(routes: &StaticWebRoutes, body: &[u8]) -> Response {
+async fn settings_update_response(
+    routes: &StaticWebRoutes,
+    body: &[u8],
+    init_data: Option<&str>,
+) -> Response {
     let Some(settings_store) = &routes.settings_store else {
         return settings_error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1597,6 +1629,9 @@ async fn settings_update_response(routes: &StaticWebRoutes, body: &[u8]) -> Resp
         Ok(req) => req,
         Err(response) => return *response,
     };
+    if authenticate_settings_init_data(routes, init_data, req.user_id).is_err() {
+        return settings_error_response(StatusCode::UNAUTHORIZED, "Unauthorized");
+    }
     if let Err(error) = ensure_settings_chat_available(routes, req.chat_id, req.user_id).await {
         return error;
     }
@@ -1625,7 +1660,11 @@ async fn settings_update_response(routes: &StaticWebRoutes, body: &[u8]) -> Resp
     settings_json_response(StatusCode::OK, &serde_json::json!({ "status": "success" }))
 }
 
-async fn settings_chats_response(routes: &StaticWebRoutes, raw_query: Option<&str>) -> Response {
+async fn settings_chats_response(
+    routes: &StaticWebRoutes,
+    raw_query: Option<&str>,
+    init_data: Option<&str>,
+) -> Response {
     let values = admin_auth_query_values(raw_query);
     let Some(user_id_raw) = values.get("user_id") else {
         return settings_json_raw_response(
@@ -1639,6 +1678,9 @@ async fn settings_chats_response(routes: &StaticWebRoutes, raw_query: Option<&st
             r#"{"error":"invalid user_id"}"#,
         );
     };
+    if authenticate_settings_init_data(routes, init_data, user_id).is_err() {
+        return settings_json_raw_response(StatusCode::UNAUTHORIZED, r#"{"error":"unauthorized"}"#);
+    }
     let Some(signature) = values.get("signature").filter(|value| !value.is_empty()) else {
         return settings_json_raw_response(
             StatusCode::BAD_REQUEST,
@@ -1664,8 +1706,9 @@ async fn settings_chats_response(routes: &StaticWebRoutes, raw_query: Option<&st
 async fn settings_deputy_candidates_response(
     routes: &StaticWebRoutes,
     raw_query: Option<&str>,
+    init_data: Option<&str>,
 ) -> Response {
-    let access = match parse_deputy_owner_access(routes, raw_query).await {
+    let access = match parse_deputy_owner_access(routes, raw_query, init_data).await {
         Ok(access) => access,
         Err(response) => return response,
     };
@@ -1727,11 +1770,22 @@ async fn settings_deputy_candidates_response(
     )
 }
 
-async fn settings_deputies_update_response(routes: &StaticWebRoutes, body: &[u8]) -> Response {
+async fn settings_deputies_update_response(
+    routes: &StaticWebRoutes,
+    body: &[u8],
+    init_data: Option<&str>,
+) -> Response {
     let req = match parse_deputy_update_request(body) {
         Ok(req) => req,
         Err(response) => return *response,
     };
+    if authenticate_settings_init_data(routes, init_data, req.user_id).is_err() {
+        return settings_side_error_response(
+            StatusCode::UNAUTHORIZED,
+            "Unauthorized",
+            "GET, PUT, OPTIONS",
+        );
+    }
     if let Err(error) = ensure_settings_chat_available(routes, req.chat_id, req.user_id).await {
         return error;
     }
@@ -1780,11 +1834,13 @@ async fn settings_deputies_update_response(routes: &StaticWebRoutes, body: &[u8]
 async fn settings_memory_get_response(
     routes: &StaticWebRoutes,
     raw_query: Option<&str>,
+    init_data: Option<&str>,
 ) -> Response {
-    let (chat_id, user_id, scope) = match parse_settings_memory_access(routes, raw_query).await {
-        Ok(access) => access,
-        Err(response) => return response,
-    };
+    let (chat_id, user_id, scope) =
+        match parse_settings_memory_access(routes, raw_query, init_data).await {
+            Ok(access) => access,
+            Err(response) => return response,
+        };
     let limit = parse_memory_limit(
         admin_auth_query_values(raw_query)
             .get("limit")
@@ -1819,8 +1875,10 @@ async fn settings_memory_get_response(
 async fn settings_memory_delete_response(
     routes: &StaticWebRoutes,
     raw_query: Option<&str>,
+    init_data: Option<&str>,
 ) -> Response {
-    let (_, user_id, scope) = match parse_settings_memory_access(routes, raw_query).await {
+    let (_, user_id, scope) = match parse_settings_memory_access(routes, raw_query, init_data).await
+    {
         Ok(access) => access,
         Err(response) => return response,
     };
@@ -1867,6 +1925,90 @@ async fn settings_memory_delete_response(
         &serde_json::json!({ "ok": true }),
         "GET, DELETE, OPTIONS",
     )
+}
+
+/// Telegram WebApp `initData` freshness window (1 hour).
+const SETTINGS_INIT_DATA_MAX_AGE_SECONDS: u64 = 3_600;
+
+const SETTINGS_INIT_DATA_HEADER: &str = "x-telegram-init-data";
+
+/// Outcome of authenticating a settings request with Telegram WebApp `initData`.
+enum SettingsInitDataDecision {
+    /// `initData` was present and validated; the caller identity is established.
+    Authorized,
+    /// `initData` was absent and the soft-cutover flag is off; fall through to the
+    /// legacy signature check (which stays as a routing/defense-in-depth gate).
+    FellThrough,
+}
+
+fn settings_init_data_header(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(SETTINGS_INIT_DATA_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+/// Authenticate a settings WebApp request via Telegram `initData`.
+///
+/// `initData` is the authority for *who* the caller is; the existing per-target authorization
+/// (`authorize_settings_user`, admin/deputy membership) still governs *what* they may do.
+///
+/// - Header present: validate it; on failure or a caller/claim mismatch, reject. On success the
+///   caller is authenticated as `claimed_user_id`.
+/// - Header absent: reject when `require_settings_init_data` is set (hard cutover); otherwise warn
+///   and fall through to the legacy signature check (soft cutover for the cached front-end).
+///
+/// `Err(())` signals the gate should answer `401 Unauthorized`; the gate owns the response shape.
+fn authenticate_settings_init_data(
+    routes: &StaticWebRoutes,
+    init_data: Option<&str>,
+    claimed_user_id: i64,
+) -> Result<SettingsInitDataDecision, ()> {
+    let now_unix = current_unix_timestamp();
+    match init_data {
+        Some(init_data) => {
+            let Some(user) = openplotva_web::validate_webapp_init_data(
+                init_data,
+                &routes.bot_token,
+                SETTINGS_INIT_DATA_MAX_AGE_SECONDS,
+                now_unix,
+            ) else {
+                tracing::warn!(claimed_user_id, "settings initData failed validation");
+                return Err(());
+            };
+            if claimed_user_id != 0 && user.id != claimed_user_id {
+                tracing::warn!(
+                    caller_user_id = user.id,
+                    claimed_user_id,
+                    "settings initData caller does not match requested user_id"
+                );
+                return Err(());
+            }
+            Ok(SettingsInitDataDecision::Authorized)
+        }
+        None => {
+            if routes.require_settings_init_data {
+                tracing::warn!(
+                    claimed_user_id,
+                    "settings request rejected: initData required but absent"
+                );
+                return Err(());
+            }
+            tracing::warn!(
+                claimed_user_id,
+                "settings request without initData; falling through to legacy signature (soft cutover)"
+            );
+            Ok(SettingsInitDataDecision::FellThrough)
+        }
+    }
+}
+
+fn current_unix_timestamp() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 fn parse_settings_get_access(
@@ -1946,6 +2088,7 @@ fn parse_deputy_update_request(body: &[u8]) -> Result<DeputyUpdateRequest, Box<R
 async fn parse_deputy_owner_access(
     routes: &StaticWebRoutes,
     raw_query: Option<&str>,
+    init_data: Option<&str>,
 ) -> Result<DeputyOwnerAccess, Response> {
     let values = admin_auth_query_values(raw_query);
     let chat_id = values
@@ -1970,6 +2113,13 @@ async fn parse_deputy_owner_access(
                 "GET, PUT, OPTIONS",
             )
         })?;
+    if authenticate_settings_init_data(routes, init_data, user_id).is_err() {
+        return Err(settings_side_error_response(
+            StatusCode::UNAUTHORIZED,
+            "Unauthorized",
+            "GET, PUT, OPTIONS",
+        ));
+    }
     let signature = values
         .get("signature")
         .filter(|value| !value.trim().is_empty())
@@ -3017,6 +3167,7 @@ fn chat_list_title(chat: &openplotva_core::ChatState) -> String {
 async fn parse_settings_memory_access(
     routes: &StaticWebRoutes,
     raw_query: Option<&str>,
+    init_data: Option<&str>,
 ) -> Result<(i64, i64, openplotva_memory::RetrievalScope), Response> {
     let values = admin_auth_query_values(raw_query);
     let chat_id = values
@@ -3044,6 +3195,13 @@ async fn parse_settings_memory_access(
         .get("user_id")
         .and_then(|value| value.parse::<i64>().ok())
         .unwrap_or(0);
+    if authenticate_settings_init_data(routes, init_data, user_id).is_err() {
+        return Err(settings_side_error_response(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "GET, DELETE, OPTIONS",
+        ));
+    }
     if !openplotva_web::validate_settings_access_signature(chat_id, user_id, signature) {
         return Err(settings_side_error_response(
             StatusCode::FORBIDDEN,
@@ -10559,8 +10717,8 @@ mod tests {
     use super::{
         AdminMemoryOverride, GO_ADMIN_API_ROUTE_PATTERNS, GO_DISPATCHER_DEBOUNCE_CACHE_SIZE,
         GO_DISPATCHER_DEBOUNCE_WINDOW, GO_DISPATCHER_MAX_QUEUE_SIZE, RuntimeUnhandledUpdateHandler,
-        WebhookShutdownCleanupReport, admin_aifarm_pool_toggle_response, admin_auth_check,
-        admin_auth_date_is_fresh, admin_auth_query_values, admin_auth_response,
+        SettingsInitDataDecision, WebhookShutdownCleanupReport, admin_aifarm_pool_toggle_response,
+        admin_auth_check, admin_auth_date_is_fresh, admin_auth_query_values, admin_auth_response,
         admin_auth_user_state, admin_bootstrap, admin_chat_get_response,
         admin_chats_search_by_member_response, admin_i64_from_json,
         admin_llm_analytics_summary_json, admin_llm_requests_clear_response,
@@ -10575,14 +10733,16 @@ mod tests {
         admin_taskman_job_cancel_response, admin_taskman_job_response,
         admin_taskman_job_restart_response, admin_taskman_jobs_clear_response,
         admin_taskman_jobs_filter, admin_taskman_jobs_response, admin_user_grant_vip_response,
-        admin_vip_summary_json, apply_private_chat_response_defaults, build_deputy_display_name,
-        chat_list_title, chat_member_can_manage_settings, chat_member_record_from_upsert,
-        configure_telegram_bot_commands, delete_webhook_on_shutdown_if_enabled,
-        dialog_memory_context_enabled, found, go_dispatcher_config, new_settings_response,
-        normalize_deputy_ids, parse_admin_non_negative_i32, parse_admin_optional_bool,
-        parse_admin_positive_i32, parse_deputy_candidates_limit, parse_deputy_update_request,
-        parse_memory_limit, parse_optional_i32, parse_settings_get_access,
-        parse_settings_memory_access, parse_settings_update_request, parse_shield_limit,
+        admin_vip_summary_json, apply_private_chat_response_defaults,
+        authenticate_settings_init_data, build_deputy_display_name, chat_list_title,
+        chat_member_can_manage_settings, chat_member_record_from_upsert,
+        configure_telegram_bot_commands, current_unix_timestamp,
+        delete_webhook_on_shutdown_if_enabled, dialog_memory_context_enabled, found,
+        go_dispatcher_config, new_settings_response, normalize_deputy_ids,
+        parse_admin_non_negative_i32, parse_admin_optional_bool, parse_admin_positive_i32,
+        parse_deputy_candidates_limit, parse_deputy_update_request, parse_memory_limit,
+        parse_optional_i32, parse_settings_get_access, parse_settings_memory_access,
+        parse_settings_update_request, parse_shield_limit,
         run_long_poll_update_producer_after_delete_webhook,
         run_webhook_update_producer_after_set_webhook, runtime_api_graphql_snapshot,
         runtime_redis_prefix_groups_from_keys, runtime_redis_value_from_bytes,
@@ -11118,7 +11278,7 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await?;
         assert_eq!(
             openplotva_web::static_asset_sha256_hex(&body),
-            "1e854fc52928bb34e0ec27891c842740611ffcbd4e2f71979a01dc17331070cb"
+            "8c798715212832b795e3c347714e734f0bfdc896dec9b15ed842c46f796661fd"
         );
         Ok(())
     }
@@ -12168,7 +12328,8 @@ mod tests {
     async fn settings_api_without_services_fails_loud_with_go_cors_headers()
     -> Result<(), Box<dyn Error>> {
         let routes = static_web_routes(Vec::new(), "", "", "", None);
-        let response = settings_get_response(&routes, Some("chat_id=42&signature=780e28cf")).await;
+        let response =
+            settings_get_response(&routes, Some("chat_id=42&signature=780e28cf"), None).await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             response.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
@@ -12214,6 +12375,7 @@ mod tests {
         let response = match parse_settings_memory_access(
             &routes,
             Some("chat_id=-1001234567890&user_id=42&signature=780e28cf"),
+            None,
         )
         .await
         {
@@ -12225,6 +12387,95 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await?;
         assert_eq!(&body[..], b"{\"error\":\"permission check failed\"}\n");
         Ok(())
+    }
+
+    const SETTINGS_GATE_TOKEN: &str = "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11";
+
+    fn hmac_sha256_hex_for_test(key: &[u8], message: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        const BLOCK: usize = 64;
+        let mut normalized = [0_u8; BLOCK];
+        if key.len() > BLOCK {
+            normalized[..32].copy_from_slice(&Sha256::digest(key));
+        } else {
+            normalized[..key.len()].copy_from_slice(key);
+        }
+        let mut inner_pad = [0x36_u8; BLOCK];
+        let mut outer_pad = [0x5c_u8; BLOCK];
+        for index in 0..BLOCK {
+            inner_pad[index] ^= normalized[index];
+            outer_pad[index] ^= normalized[index];
+        }
+        let mut inner = Sha256::new();
+        inner.update(inner_pad);
+        inner.update(message);
+        let inner_hash = inner.finalize();
+        let mut outer = Sha256::new();
+        outer.update(outer_pad);
+        outer.update(inner_hash);
+        hex::encode(outer.finalize())
+    }
+
+    fn fresh_settings_init_data(user_id: i64) -> String {
+        let auth_date = current_unix_timestamp();
+        let user = format!(r#"{{"id":{user_id},"first_name":"Ada","username":"ada"}}"#);
+        let pairs = [("auth_date", auth_date.to_string()), ("user", user)];
+        let data_check_string = pairs
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let secret_key_hex =
+            hmac_sha256_hex_for_test(b"WebAppData", SETTINGS_GATE_TOKEN.as_bytes());
+        let secret_key = hex::decode(secret_key_hex).expect("hmac hex decodes to bytes");
+        let hash = hmac_sha256_hex_for_test(&secret_key, data_check_string.as_bytes());
+        let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+        for (key, value) in &pairs {
+            serializer.append_pair(key, value);
+        }
+        serializer.append_pair("hash", &hash);
+        serializer.finish()
+    }
+
+    #[test]
+    fn settings_init_data_authenticates_matching_caller() {
+        let routes = static_web_routes(Vec::new(), SETTINGS_GATE_TOKEN, "", "", None);
+        let init_data = fresh_settings_init_data(42);
+        assert!(matches!(
+            authenticate_settings_init_data(&routes, Some(&init_data), 42),
+            Ok(SettingsInitDataDecision::Authorized)
+        ));
+    }
+
+    #[test]
+    fn settings_init_data_rejects_caller_user_id_mismatch() {
+        let routes = static_web_routes(Vec::new(), SETTINGS_GATE_TOKEN, "", "", None);
+        let init_data = fresh_settings_init_data(42);
+        assert!(authenticate_settings_init_data(&routes, Some(&init_data), 99).is_err());
+    }
+
+    #[test]
+    fn settings_init_data_rejects_forged_header() {
+        let routes = static_web_routes(Vec::new(), SETTINGS_GATE_TOKEN, "", "", None);
+        let forged = "auth_date=1700000000&user=%7B%22id%22%3A42%7D&hash=deadbeef";
+        assert!(authenticate_settings_init_data(&routes, Some(forged), 42).is_err());
+    }
+
+    #[test]
+    fn settings_init_data_absent_with_flag_off_falls_through() {
+        let routes = static_web_routes(Vec::new(), SETTINGS_GATE_TOKEN, "", "", None);
+        assert!(!routes.require_settings_init_data);
+        assert!(matches!(
+            authenticate_settings_init_data(&routes, None, 42),
+            Ok(SettingsInitDataDecision::FellThrough)
+        ));
+    }
+
+    #[test]
+    fn settings_init_data_absent_with_flag_on_rejects() {
+        let mut routes = static_web_routes(Vec::new(), SETTINGS_GATE_TOKEN, "", "", None);
+        routes.require_settings_init_data = true;
+        assert!(authenticate_settings_init_data(&routes, None, 42).is_err());
     }
 
     #[test]

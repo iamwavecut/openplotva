@@ -1546,12 +1546,14 @@
 
       const user = tg.initDataUnsafe?.user || null;
       const userId = user?.id ?? null;
+      const initData = typeof tg.initData === 'string' ? tg.initData : '';
       const isDark = tg.colorScheme === 'dark';
       document.body.classList.toggle('theme-dark', isDark);
 
       return {
         tg,
         userId,
+        initData,
         isDark,
         theme: tg.platform === 'ios' || tg.platform === 'macos' ? 'ios' : 'auto',
         isTelegram: true,
@@ -1574,6 +1576,7 @@
       return {
         tg,
         userId: null,
+        initData: '',
         isDark: false,
         theme: 'auto',
         isTelegram: false,
@@ -1609,9 +1612,13 @@
   }
 
   async function apiRequestJSON(url, { method, body }) {
+    const headers = { 'Content-Type': 'application/json' };
+    if (tgCtx.initData) {
+      headers['X-Telegram-Init-Data'] = tgCtx.initData;
+    }
     const res = await fetch(url, {
       method,
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       body: body ? JSON.stringify(body) : undefined,
     });
     const raw = await res.text();
