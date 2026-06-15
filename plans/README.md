@@ -6,9 +6,16 @@ Plans 001–008 were then **executed in parallel isolated git worktrees** and re
 plan 010. Plan 011 was discovered during execution.
 
 Each plan is self-contained: read it fully before starting, honor its STOP conditions, run every
-verification command, and update your row when done. The advisor never edits source; executors do.
-**Merging the executed worktree branches is the user's decision — nothing here has been merged,
-pushed, or committed to `main`.**
+verification command, and update your row when done.
+
+**INTEGRATED 2026-06-15 (local, not pushed):** at the user's explicit request, all 8 executed
+worktree branches (001–008) were merged into `main` on top of `df4dfa5`, and the audit artifacts
+(plans/, docs/) committed. The merged workspace compiles (`cargo check --workspace` clean);
+`openplotva-app` is 806/806 green and the new web auth tests pass. The only remaining test failures
+are the 3 pre-existing ones tracked by **plan 011** (not introduced by these merges). Nothing was
+pushed. Rollback point: `git reset --hard df4dfa5`. Two trivial merge conflicts were resolved (a
+duplicate `constant_time_eq` from 002+006, and a stale one-arg cookie test); 002+007 auto-merged in
+`admin_auth_response` and both changes verified present + passing.
 
 ## Execution order & status
 
