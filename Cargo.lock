@@ -516,9 +516,9 @@ dependencies = [
 
 [[package]]
 name = "carapax"
-version = "0.37.0"
+version = "0.38.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c37999f62cd8168b5948ce3f65d5de3bf7b942ff0c7fc8580037567fbfddaa3"
+checksum = "7a10975ea02fe2e55b80e80bbb700d9ce19226d642b6f2beb9b8cbb5161b94a0"
 dependencies = [
  "futures-util",
  "log",
@@ -3617,9 +3617,9 @@ dependencies = [
 
 [[package]]
 name = "tgbot"
-version = "0.45.0"
+version = "0.46.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c98ae5d7c1e54dc7b897bd307082d2f444d26a327ac7462e5219490f145dc19f"
+checksum = "dc05e21aac7632767ffd5ef7d9573473ede11f77d7f68aa06b64cee747171433"
 dependencies = [
  "async-stream",
  "bytes",
