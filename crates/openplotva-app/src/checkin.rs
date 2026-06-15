@@ -694,16 +694,22 @@ pub enum CheckinGameSenderError {
 pub struct CheckinCommandDispatcherEffects<Store> {
     store: Store,
     queue: Arc<DispatcherQueue>,
+    rich: Arc<dyn crate::rich::RichSender>,
     next_virtual_id: VirtualIdFactory,
 }
 
 impl<Store> CheckinCommandDispatcherEffects<Store> {
     /// Build check-in command effects over an existing dispatcher queue.
     #[must_use]
-    pub fn new(store: Store, queue: Arc<DispatcherQueue>) -> Self {
+    pub fn new(
+        store: Store,
+        queue: Arc<DispatcherQueue>,
+        rich: Arc<dyn crate::rich::RichSender>,
+    ) -> Self {
         Self {
             store,
             queue,
+            rich,
             next_virtual_id: monotonic_virtual_id_factory("checkin-command-vmsg"),
         }
     }
@@ -716,11 +722,20 @@ impl<Store> CheckinCommandDispatcherEffects<Store> {
     }
 }
 
+/// Errors from dispatcher-backed check-in command effects.
+#[derive(Debug, thiserror::Error)]
+pub enum CheckinCommandEffectError {
+    #[error("failed to queue check-in message: {0}")]
+    Queue(#[from] OutboundBuildError),
+    #[error("failed to send check-in rich message: {0}")]
+    RichSend(String),
+}
+
 impl<Store> CheckinCommandEffects for CheckinCommandDispatcherEffects<Store>
 where
     Store: VirtualMessageStore + Send + Sync,
 {
-    type Error = OutboundBuildError;
+    type Error = CheckinCommandEffectError;
 
     fn send_checkin_today_winner_with_stats<'a>(
         &'a self,
@@ -728,10 +743,18 @@ where
         html: String,
     ) -> CheckinCommandEffectFuture<'a, Self::Error> {
         Box::pin(async move {
-            queue_checkin_text(&self.store, &self.queue, reply_to, html, None, None, || {
-                (self.next_virtual_id)()
-            })
-            .await
+            let options = openplotva_telegram::RichSendOptions {
+                message_thread_id: reply_to.thread_id.map(i64::from),
+                reply_to_message_id: Some(i64::from(reply_to.message_id)),
+                allow_sending_without_reply: true,
+                disable_notification: false,
+                reply_markup: None,
+            };
+            self.rich
+                .send_rich(reply_to.chat_id, &html, &options)
+                .await
+                .map_err(|error| CheckinCommandEffectError::RichSend(error.to_string()))?;
+            Ok(())
         })
     }
 
@@ -751,6 +774,7 @@ where
                 || (self.next_virtual_id)(),
             )
             .await
+            .map_err(CheckinCommandEffectError::from)
         })
     }
 
@@ -769,6 +793,7 @@ where
                 || (self.next_virtual_id)(),
             )
             .await
+            .map_err(CheckinCommandEffectError::from)
         })
     }
 }
@@ -1312,13 +1337,13 @@ where
     let theme = theme_by_key(&winner.theme);
     let name = winner_display_name(store, winner.user_id).await;
     let header = format!(
-        "🏁 Сегодня мы играли в <b>{}</b>\nПобедитель: {}",
-        theme.name,
+        "<p>🏁 Сегодня мы играли в <b>{}</b><br>Победитель: {}</p>",
+        escape_game_html_text(theme.name),
         escape_game_html_text(&name)
     );
     let yearly = store.get_yearly_top(chat_id, 30).await.unwrap_or_default();
     format!(
-        "{header}\n\n{}",
+        "{header}{}",
         render_yearly_top(&yearly, theme, OffsetDateTime::now_utc().date())
     )
 }
@@ -1329,20 +1354,18 @@ fn render_yearly_top(
     day: time::Date,
 ) -> String {
     if rows.is_empty() {
-        return "📊 Нет данных для отображения".to_owned();
+        return "<p>📊 Нет данных для отображения</p>".to_owned();
     }
-    let mut out = format!("🏆 {} — Лидеры года\n", theme.name);
-    for (index, row) in rows.iter().enumerate() {
-        out.push_str(&(index + 1).to_string());
-        out.push_str(". ");
-        out.push_str(daily_rank_title(theme, index, day));
-        out.push_str(" — ");
-        out.push_str(&escape_game_html_text(&top_user_display_name(&row.user)));
-        out.push_str(" (");
-        out.push_str(&row.wins_count.to_string());
-        out.push_str(")\n");
-    }
-    out
+    let entries: Vec<crate::rich::LeaderboardRow> = rows
+        .iter()
+        .enumerate()
+        .map(|(index, row)| crate::rich::LeaderboardRow {
+            rank_title: daily_rank_title(theme, index, day).to_owned(),
+            name: top_user_display_name(&row.user),
+            wins: i64::from(row.wins_count),
+        })
+        .collect();
+    crate::rich::compose_leaderboard(theme.name, &entries)
 }
 
 fn daily_rank_title(theme: CheckinGameTheme, index: usize, day: time::Date) -> &'static str {
@@ -3553,7 +3576,8 @@ mod tests {
         assert!(stats[0].contains("🏁 Сегодня мы играли в <b>Чиновник дня</b>"));
         assert!(stats[0].contains("Победитель: Alice Smith"));
         assert!(stats[0].contains("🏆 Чиновник дня — Лидеры года"));
-        assert!(stats[0].contains("Alice Smith (3)"));
+        assert!(stats[0].contains("<td>Alice Smith</td>"));
+        assert!(stats[0].contains(r#"<td align="right">3</td>"#));
         Ok(())
     }
 

@@ -9708,6 +9708,7 @@ async fn start_runtime_workers(
             Arc::new(checkin::CheckinCommandDispatcherEffects::new(
                 store.clone(),
                 Arc::clone(&dispatcher_queue_for_updates),
+                Arc::clone(&rich_sender),
             )),
             bot_identity.username.clone(),
             rates_handler,
