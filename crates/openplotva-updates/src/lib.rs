@@ -1078,11 +1078,10 @@ impl UpdateIngressGuard {
         let Some(chat_id) = update_chat_id(update).filter(|chat_id| *chat_id != 0) else {
             return UpdateIngressDecision::Allowed { chat_id: None };
         };
-        let Ok(mut chats) = self.chats.lock() else {
-            return UpdateIngressDecision::Allowed {
-                chat_id: Some(chat_id),
-            };
-        };
+        let mut chats = self
+            .chats
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let state = chats.entry(chat_id).or_default();
         if let Some(blocked_until) = state.blocked_until {
             if now < blocked_until {
@@ -3426,6 +3425,48 @@ mod tests {
             guard
                 .check_update_at(&update, now + Duration::from_secs(303))
                 .is_allowed()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ingress_guard_enforces_flood_limit_after_mutex_poison() -> Result<(), Box<dyn Error>> {
+        // Poison the mutex by panicking inside a thread while holding it, then verify
+        // that check_update_at still enforces flood limits (does not fail open).
+        // This mirrors the file-wide unwrap_or_else(|p| p.into_inner()) convention.
+        let guard = std::sync::Arc::new(super::UpdateIngressGuard::new(
+            super::UpdateIngressGuardConfig {
+                short_window: Duration::from_secs(10),
+                short_limit: 3,
+                long_window: Duration::from_secs(60),
+                long_limit: 100,
+                block_duration: Duration::from_secs(300),
+            },
+        ));
+        let guard_clone = std::sync::Arc::clone(&guard);
+        // Poison the inner mutex via a thread that panics while holding the lock.
+        let _ = std::thread::spawn(move || {
+            let _hold = guard_clone.chats.lock().expect("lock for poisoning");
+            panic!("intentional poison");
+        })
+        .join();
+        assert!(guard.chats.is_poisoned(), "mutex must be poisoned");
+
+        let now = UNIX_EPOCH + Duration::from_secs(1_710_000_000);
+        let update = sample_message_update()?;
+
+        // Two allowed, third triggers flood — guard must enforce limits even with
+        // a poisoned mutex, not return Allowed unconditionally.
+        assert!(guard.check_update_at(&update, now).is_allowed());
+        assert!(
+            guard
+                .check_update_at(&update, now + Duration::from_secs(1))
+                .is_allowed()
+        );
+        let decision = guard.check_update_at(&update, now + Duration::from_secs(2));
+        assert!(
+            decision.is_dropped(),
+            "expected DroppedFlood after poison; got: {decision:?}"
         );
         Ok(())
     }
