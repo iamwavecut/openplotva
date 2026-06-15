@@ -2,6 +2,7 @@
 
 pub mod acestep;
 pub mod pruna;
+pub mod uploader;
 
 use std::sync::LazyLock;
 
