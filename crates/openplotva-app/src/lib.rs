@@ -858,8 +858,8 @@ async fn admin_auth_check(
     Extension(routes): Extension<StaticWebRoutes>,
     headers: HeaderMap,
 ) -> Response {
-    let authenticated_user_id =
-        admin_session_user_id(&headers).filter(|user_id| routes.admin_ids.contains(user_id));
+    let authenticated_user_id = admin_session_user_id(&headers, &routes.bot_token)
+        .filter(|user_id| routes.admin_ids.contains(user_id));
     match authenticated_user_id {
         Some(user_id) => admin_json_response(
             StatusCode::OK,
@@ -936,7 +936,7 @@ async fn admin_logs_stream(
     headers: HeaderMap,
     Extension(routes): Extension<StaticWebRoutes>,
 ) -> Response {
-    if let Err(error) = require_admin_request(&headers, &routes.admin_ids) {
+    if let Err(error) = require_admin_request(&headers, &routes.admin_ids, &routes.bot_token) {
         return admin_auth_failure_response(error);
     }
     let Some(buffer) = routes.log_buffer.clone() else {
@@ -1096,7 +1096,7 @@ async fn admin_redis_list(
     if method != Method::GET {
         return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
     }
-    if let Err(error) = require_admin_request(&headers, &routes.admin_ids) {
+    if let Err(error) = require_admin_request(&headers, &routes.admin_ids, &routes.bot_token) {
         return admin_auth_failure_response(error);
     }
     let pattern = admin_auth_query_values(raw_query.as_deref())
@@ -1124,7 +1124,7 @@ async fn admin_redis_get(
     if method != Method::GET {
         return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
     }
-    if let Err(error) = require_admin_request(&headers, &routes.admin_ids) {
+    if let Err(error) = require_admin_request(&headers, &routes.admin_ids, &routes.bot_token) {
         return admin_auth_failure_response(error);
     }
     let values = admin_auth_query_values(raw_query.as_deref());
@@ -1156,7 +1156,7 @@ async fn admin_redis_delete_prefix(
     if method != Method::DELETE {
         return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
     }
-    if let Err(error) = require_admin_request(&headers, &routes.admin_ids) {
+    if let Err(error) = require_admin_request(&headers, &routes.admin_ids, &routes.bot_token) {
         return admin_auth_failure_response(error);
     }
     let values = admin_auth_query_values(raw_query.as_deref());
@@ -1184,7 +1184,7 @@ async fn admin_redis_prefixes(
     if method != Method::GET {
         return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
     }
-    if let Err(error) = require_admin_request(&headers, &routes.admin_ids) {
+    if let Err(error) = require_admin_request(&headers, &routes.admin_ids, &routes.bot_token) {
         return admin_auth_failure_response(error);
     }
     let prefix = admin_auth_query_values(raw_query.as_deref())
@@ -1214,7 +1214,7 @@ async fn admin_redis_delete_key(
     if method != Method::DELETE {
         return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
     }
-    if let Err(error) = require_admin_request(&headers, &routes.admin_ids) {
+    if let Err(error) = require_admin_request(&headers, &routes.admin_ids, &routes.bot_token) {
         return admin_auth_failure_response(error);
     }
     let values = admin_auth_query_values(raw_query.as_deref());
@@ -1241,7 +1241,7 @@ async fn admin_redis_flushdb(
     if method != Method::POST {
         return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
     }
-    if let Err(error) = require_admin_request(&headers, &routes.admin_ids) {
+    if let Err(error) = require_admin_request(&headers, &routes.admin_ids, &routes.bot_token) {
         return admin_auth_failure_response(error);
     }
     let Some(redis) = routes.redis_inspector() else {
@@ -1381,7 +1381,7 @@ async fn admin_asset(
 
 fn admin_web_asset_response(routes: &StaticWebRoutes, headers: &HeaderMap, path: &str) -> Response {
     if admin_static_asset_requires_auth(path)
-        && !admin_session_is_authorized(headers, &routes.admin_ids)
+        && !admin_session_is_authorized(headers, &routes.admin_ids, &routes.bot_token)
     {
         return found("/admin/login.html");
     }
@@ -3263,7 +3263,7 @@ async fn admin_auth_response(
             (header::LOCATION, "/admin/".to_owned()),
             (
                 header::SET_COOKIE,
-                openplotva_web::admin_session_cookie(user_id),
+                openplotva_web::admin_session_cookie(user_id, &routes.bot_token),
             ),
         ],
     )
@@ -3455,7 +3455,7 @@ async fn admin_memory_cards_list_response(
     headers: &HeaderMap,
     raw_query: Option<&str>,
 ) -> Response {
-    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids, &routes.bot_token) {
         return admin_auth_failure_response(error);
     }
     let Some(store) = routes
@@ -3489,7 +3489,7 @@ async fn admin_memory_card_delete_response(
     headers: &HeaderMap,
     raw_query: Option<&str>,
 ) -> Response {
-    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids, &routes.bot_token) {
         return admin_auth_failure_response(error);
     }
     let id = match admin_memory_required_id(raw_query, "id required") {
@@ -3501,7 +3501,7 @@ async fn admin_memory_card_delete_response(
         .as_ref()
         .filter(|_| routes.memory_admin_enabled)
         && let Err(error) = store
-            .soft_delete_card(id, current_admin_user_id(headers))
+            .soft_delete_card(id, current_admin_user_id(headers, &routes.bot_token))
             .await
     {
         tracing::warn!(%error, id, "failed to delete admin memory card");
@@ -3529,7 +3529,7 @@ async fn admin_memory_runs_list_response(
     headers: &HeaderMap,
     raw_query: Option<&str>,
 ) -> Response {
-    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids, &routes.bot_token) {
         return admin_auth_failure_response(error);
     }
     let Some(store) = routes
@@ -3568,7 +3568,7 @@ async fn admin_memory_run_retry_response(
     raw_query: Option<&str>,
     body: &[u8],
 ) -> Response {
-    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids, &routes.bot_token) {
         return admin_auth_failure_response(error);
     }
     let id = match admin_memory_required_id(raw_query, "id required") {
@@ -3588,7 +3588,7 @@ async fn admin_memory_restart_response(
     if method != Method::POST {
         return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
     }
-    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids, &routes.bot_token) {
         return admin_auth_failure_response(error);
     }
     let id = match admin_memory_optional_restart_id(raw_query) {
@@ -4083,7 +4083,7 @@ async fn admin_shield_documents_list_response(
     headers: &HeaderMap,
     raw_query: Option<&str>,
 ) -> Response {
-    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids, &routes.bot_token) {
         return admin_auth_failure_response(error);
     }
     let Some(store) = routes.shield_store.as_ref() else {
@@ -4122,7 +4122,7 @@ async fn admin_shield_document_create_response(
     headers: &HeaderMap,
     body: &[u8],
 ) -> Response {
-    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids, &routes.bot_token) {
         return admin_auth_failure_response(error);
     }
     let Some(store) = routes.shield_store.as_ref() else {
@@ -4152,7 +4152,7 @@ async fn admin_shield_document_update_response(
     raw_query: Option<&str>,
     body: &[u8],
 ) -> Response {
-    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids, &routes.bot_token) {
         return admin_auth_failure_response(error);
     }
     let Some(store) = routes.shield_store.as_ref() else {
@@ -4200,7 +4200,7 @@ async fn admin_shield_document_delete_response(
     headers: &HeaderMap,
     raw_query: Option<&str>,
 ) -> Response {
-    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids, &routes.bot_token) {
         return admin_auth_failure_response(error);
     }
     let values = admin_auth_query_values(raw_query);
@@ -4226,7 +4226,7 @@ async fn admin_shield_embeddings_rebuild_response(
     if method != Method::POST {
         return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
     }
-    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids, &routes.bot_token) {
         return admin_auth_failure_response(error);
     }
     let Some(store) = routes.shield_store.as_ref() else {
@@ -4295,7 +4295,7 @@ async fn admin_shield_test_response(
     if method != Method::POST {
         return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
     }
-    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids, &routes.bot_token) {
         return admin_auth_failure_response(error);
     }
     let Some(store) = routes.shield_store.as_ref() else {
@@ -4507,7 +4507,7 @@ fn admin_taskman_jobs_response(
     if method != Method::GET {
         return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
     }
-    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids, &routes.bot_token) {
         return admin_auth_failure_response(error);
     }
     if !routes.taskman_inspector.is_configured() {
@@ -4540,7 +4540,7 @@ fn admin_taskman_jobs_clear_response(
     if method != Method::POST && method != Method::DELETE {
         return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
     }
-    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids, &routes.bot_token) {
         return admin_auth_failure_response(error);
     }
     if !routes.taskman_inspector.is_configured() {
@@ -4582,7 +4582,7 @@ fn admin_taskman_job_response(
     if method != Method::GET {
         return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
     }
-    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids, &routes.bot_token) {
         return admin_auth_failure_response(error);
     }
     if !routes.taskman_inspector.is_configured() {
@@ -4616,7 +4616,7 @@ fn admin_taskman_job_cancel_response(
     if method != Method::POST && method != Method::PUT {
         return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
     }
-    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids, &routes.bot_token) {
         return admin_auth_failure_response(error);
     }
     if !routes.taskman_inspector.is_configured() {
@@ -4647,7 +4647,7 @@ fn admin_taskman_job_restart_response(
     if method != Method::POST && method != Method::PUT {
         return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
     }
-    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids, &routes.bot_token) {
         return admin_auth_failure_response(error);
     }
     if !routes.taskman_inspector.is_configured() {
@@ -5071,7 +5071,7 @@ async fn admin_chat_get_response(
     if method != Method::GET {
         return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
     }
-    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids, &routes.bot_token) {
         return admin_auth_failure_response(error);
     }
     let values = admin_auth_query_values(raw_query);
@@ -5145,7 +5145,7 @@ async fn admin_chat_settings_response(
     if method != Method::POST && method != Method::PUT {
         return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
     }
-    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids, &routes.bot_token) {
         return admin_auth_failure_response(error);
     }
     let Ok(mut req) = serde_json::from_slice::<AdminChatSettingsUpdateRequest>(body) else {
@@ -5211,7 +5211,7 @@ async fn admin_chat_block_response(
     if method != Method::POST {
         return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
     }
-    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids, &routes.bot_token) {
         return admin_auth_failure_response(error);
     }
     let values = admin_auth_query_values(raw_query);
@@ -5254,7 +5254,7 @@ async fn admin_chat_unblock_response(
     if method != Method::DELETE {
         return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
     }
-    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids, &routes.bot_token) {
         return admin_auth_failure_response(error);
     }
     let values = admin_auth_query_values(raw_query);
@@ -5288,7 +5288,7 @@ async fn admin_chat_members_response(
     if method != Method::GET {
         return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
     }
-    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids, &routes.bot_token) {
         return admin_auth_failure_response(error);
     }
     let values = admin_auth_query_values(raw_query);
@@ -5354,7 +5354,7 @@ async fn admin_chats_list_response(
     if method != Method::GET {
         return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
     }
-    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids, &routes.bot_token) {
         return admin_auth_failure_response(error);
     }
     let Some(pool) = routes.postgres.as_ref() else {
@@ -5402,7 +5402,7 @@ async fn admin_chats_search_by_member_response(
     if method != Method::GET {
         return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
     }
-    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids, &routes.bot_token) {
         return admin_auth_failure_response(error);
     }
     let values = admin_auth_query_values(raw_query);
@@ -5446,7 +5446,7 @@ async fn admin_users_list_response(
     if method != Method::GET {
         return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
     }
-    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids, &routes.bot_token) {
         return admin_auth_failure_response(error);
     }
     let Some(pool) = routes.postgres.as_ref() else {
@@ -5491,7 +5491,7 @@ async fn admin_user_get_response(
     if method != Method::GET {
         return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
     }
-    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids, &routes.bot_token) {
         return admin_auth_failure_response(error);
     }
     let values = admin_auth_query_values(raw_query);
@@ -5585,7 +5585,7 @@ async fn admin_user_grant_vip_response(
     if method != Method::POST && method != Method::PUT {
         return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
     }
-    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids, &routes.bot_token) {
         return admin_auth_failure_response(error);
     }
     let Ok(req) = serde_json::from_slice::<AdminVipGrantRequest>(body) else {
@@ -5616,7 +5616,7 @@ async fn admin_user_grant_vip_response(
     if !user_exists {
         return admin_error_response(StatusCode::NOT_FOUND, "user not found");
     }
-    let admin_id = current_admin_user_id(headers);
+    let admin_id = current_admin_user_id(headers, &routes.bot_token);
     let reason = admin_non_empty_string(&req.reason)
         .unwrap_or_else(|| format!("web admin adjustment by {admin_id}"));
     let actor_user_id = admin_existing_user_id(pool, admin_id).await;
@@ -5659,7 +5659,7 @@ async fn admin_user_revoke_vip_response(
     if method != Method::DELETE {
         return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
     }
-    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids, &routes.bot_token) {
         return admin_auth_failure_response(error);
     }
     let values = admin_auth_query_values(raw_query);
@@ -5690,7 +5690,7 @@ async fn admin_user_revoke_vip_response(
         );
     }
     let summary = summary.expect("checked");
-    let admin_id = current_admin_user_id(headers);
+    let admin_id = current_admin_user_id(headers, &routes.bot_token);
     let reason = values
         .get("reason")
         .and_then(|value| admin_non_empty_string(value))
@@ -5727,7 +5727,7 @@ async fn admin_user_delete_response(
     if method != Method::DELETE {
         return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
     }
-    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids, &routes.bot_token) {
         return admin_auth_failure_response(error);
     }
     let values = admin_auth_query_values(raw_query);
@@ -5799,12 +5799,12 @@ fn admin_required_i64(
         .map_err(|_| Box::new(admin_error_response(StatusCode::BAD_REQUEST, invalid)))
 }
 
-fn current_admin_user_id(headers: &HeaderMap) -> i64 {
+fn current_admin_user_id(headers: &HeaderMap, secret: &str) -> i64 {
     headers
         .get("X-Telegram-User-ID")
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.trim().parse::<i64>().ok())
-        .or_else(|| admin_session_user_id(headers))
+        .or_else(|| admin_session_user_id(headers, secret))
         .unwrap_or(0)
 }
 
@@ -6189,13 +6189,17 @@ fn admin_auth_failure_response(error: AdminAuthFailure) -> Response {
     }
 }
 
-fn require_admin_request(headers: &HeaderMap, admin_ids: &[i64]) -> Result<(), AdminAuthFailure> {
+fn require_admin_request(
+    headers: &HeaderMap,
+    admin_ids: &[i64],
+    secret: &str,
+) -> Result<(), AdminAuthFailure> {
     let user_id = headers
         .get("X-Telegram-User-ID")
         .and_then(|value| value.to_str().ok())
         .filter(|value| !value.trim().is_empty())
         .map(str::to_owned)
-        .or_else(|| admin_session_user_id(headers).map(|value| value.to_string()));
+        .or_else(|| admin_session_user_id(headers, secret).map(|value| value.to_string()));
     let Some(user_id) = user_id else {
         return Err(AdminAuthFailure::Unauthorized);
     };
@@ -6263,7 +6267,7 @@ async fn admin_loglevel_response(
     if method != Method::POST && method != Method::PUT {
         return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
     }
-    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids, &routes.bot_token) {
         return admin_auth_failure_response(error);
     }
     let Ok(req) = serde_json::from_slice::<AdminLogLevelRequest>(body) else {
@@ -6297,7 +6301,7 @@ async fn admin_aifarm_pool_toggle_response(
     if method != Method::POST && method != Method::PUT {
         return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
     }
-    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids, &routes.bot_token) {
         return admin_auth_failure_response(error);
     }
     let Ok(req) = serde_json::from_slice::<AdminAifarmPoolRequest>(body) else {
@@ -6329,7 +6333,7 @@ fn admin_llm_requests_response(
     if method != Method::GET {
         return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
     }
-    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids, &routes.bot_token) {
         return admin_auth_failure_response(error);
     }
     let requests = match routes.llm_trace_buffer.as_ref() {
@@ -6368,7 +6372,7 @@ fn admin_llm_requests_clear_response(
     if method != Method::POST {
         return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
     }
-    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids, &routes.bot_token) {
         return admin_auth_failure_response(error);
     }
     if let Some(buffer) = &routes.llm_trace_buffer {
@@ -6386,7 +6390,7 @@ async fn admin_safety_checks_response(
     if method != Method::GET {
         return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
     }
-    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids, &routes.bot_token) {
         return admin_auth_failure_response(error);
     }
     let Some(pool) = routes.postgres.clone() else {
@@ -6429,7 +6433,7 @@ async fn admin_llm_analytics_summary_response(
     if method != Method::GET {
         return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
     }
-    if let Err(error) = require_admin_request(headers, &routes.admin_ids) {
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids, &routes.bot_token) {
         return admin_auth_failure_response(error);
     }
     let Some(pool) = routes.postgres.clone() else {
@@ -7057,17 +7061,17 @@ impl StaticWebRoutes {
     }
 }
 
-fn admin_session_is_authorized(headers: &HeaderMap, admin_ids: &[i64]) -> bool {
-    admin_session_user_ids(headers)
+fn admin_session_is_authorized(headers: &HeaderMap, admin_ids: &[i64], secret: &str) -> bool {
+    admin_session_user_ids(headers, secret)
         .into_iter()
         .any(|user_id| admin_ids.contains(&user_id))
 }
 
-fn admin_session_user_id(headers: &HeaderMap) -> Option<i64> {
-    admin_session_user_ids(headers).into_iter().next()
+fn admin_session_user_id(headers: &HeaderMap, secret: &str) -> Option<i64> {
+    admin_session_user_ids(headers, secret).into_iter().next()
 }
 
-fn admin_session_user_ids(headers: &HeaderMap) -> Vec<i64> {
+fn admin_session_user_ids(headers: &HeaderMap, secret: &str) -> Vec<i64> {
     let Some(cookie) = headers
         .get(header::COOKIE)
         .and_then(|value| value.to_str().ok())
@@ -7081,7 +7085,7 @@ fn admin_session_user_ids(headers: &HeaderMap) -> Vec<i64> {
                 .strip_prefix(openplotva_web::ADMIN_SESSION_COOKIE_NAME)
                 .and_then(|value| value.strip_prefix('='))
         })
-        .filter_map(|value| value.parse::<i64>().ok())
+        .filter_map(|value| openplotva_web::verify_admin_session_value(value, secret))
         .collect()
 }
 
@@ -11100,11 +11104,20 @@ mod tests {
         assert!(admin_static_asset_requires_auth("/index.html"));
         assert!(!admin_static_asset_requires_auth("login.html"));
 
+        let secret = "test-bot-token";
+        let signed = openplotva_web::admin_session_cookie(7, secret);
+        let value = signed.split(';').next().expect("cookie pair");
+
         let mut headers = HeaderMap::new();
-        assert!(!admin_session_is_authorized(&headers, &[7]));
-        headers.insert(header::COOKIE, "theme=dark; admin_session=7".parse()?);
-        assert!(admin_session_is_authorized(&headers, &[7, 9]));
-        assert!(!admin_session_is_authorized(&headers, &[9]));
+        assert!(!admin_session_is_authorized(&headers, &[7], secret));
+        headers.insert(header::COOKIE, format!("theme=dark; {value}").parse()?);
+        assert!(admin_session_is_authorized(&headers, &[7, 9], secret));
+        assert!(!admin_session_is_authorized(&headers, &[9], secret));
+
+        // Unsigned/forged legacy cookie must be rejected
+        let mut forged_headers = HeaderMap::new();
+        forged_headers.insert(header::COOKIE, "admin_session=7".parse()?);
+        assert!(!admin_session_is_authorized(&forged_headers, &[7], secret));
 
         let redirect = found("/admin/login.html");
         assert_eq!(redirect.status(), StatusCode::FOUND);
@@ -11137,7 +11150,7 @@ mod tests {
         );
         assert_eq!(
             response.headers().get(header::SET_COOKIE),
-            Some(&"admin_session=7; Path=/admin/; Max-Age=604800; HttpOnly; SameSite=Lax".parse()?)
+            Some(&openplotva_web::admin_session_cookie(7, "123:ABC").parse()?)
         );
 
         let response = admin_auth_response(&routes, Method::PUT, Some(valid_query)).await;
@@ -11189,7 +11202,9 @@ mod tests {
         assert_eq!(&body[..], b"{\"authenticated\":false}\n");
 
         let mut headers = HeaderMap::new();
-        headers.insert(header::COOKIE, "admin_session=7".parse()?);
+        let signed = openplotva_web::admin_session_cookie(7, "123:ABC");
+        let value = signed.split(';').next().expect("cookie pair");
+        headers.insert(header::COOKIE, value.parse()?);
         let response = admin_auth_check(Extension(routes.clone()), headers).await;
         let body = to_bytes(response.into_body(), usize::MAX).await?;
         assert_eq!(&body[..], b"{\"authenticated\":true,\"user_id\":7}\n");
@@ -11232,7 +11247,11 @@ mod tests {
     {
         let routes = static_web_routes(vec![7], "123:ABC", "https://plotva.example", "", None);
         let mut headers = HeaderMap::new();
-        headers.insert(header::COOKIE, "admin_session=7".parse()?);
+        {
+            let signed = openplotva_web::admin_session_cookie(7, "123:ABC");
+            let value = signed.split(';').next().expect("cookie pair");
+            headers.insert(header::COOKIE, value.parse()?);
+        }
 
         let response =
             admin_loglevel_response(&routes, Method::POST, &headers, br#"{"level":" warning "}"#)
@@ -11287,7 +11306,11 @@ mod tests {
         openplotva_llm::aifarm::set_pool_reasoning_enabled(false);
         let routes = static_web_routes(vec![7], "123:ABC", "https://plotva.example", "", None);
         let mut headers = HeaderMap::new();
-        headers.insert(header::COOKIE, "admin_session=7".parse()?);
+        {
+            let signed = openplotva_web::admin_session_cookie(7, "123:ABC");
+            let value = signed.split(';').next().expect("cookie pair");
+            headers.insert(header::COOKIE, value.parse()?);
+        }
 
         let response = admin_aifarm_pool_toggle_response(
             &routes,
@@ -11377,7 +11400,11 @@ mod tests {
         });
         routes.llm_trace_buffer = Some(buffer);
         let mut headers = HeaderMap::new();
-        headers.insert(header::COOKIE, "admin_session=7".parse()?);
+        {
+            let signed = openplotva_web::admin_session_cookie(7, "123:ABC");
+            let value = signed.split(';').next().expect("cookie pair");
+            headers.insert(header::COOKIE, value.parse()?);
+        }
 
         let response =
             admin_llm_requests_response(&routes, Method::GET, &headers, Some("q=answer"));
@@ -11556,7 +11583,11 @@ mod tests {
     async fn admin_shield_rest_matches_go_disabled_contract() -> Result<(), Box<dyn Error>> {
         let routes = static_web_routes(vec![7], "123:ABC", "https://plotva.example", "", None);
         let mut headers = HeaderMap::new();
-        headers.insert(header::COOKIE, "admin_session=7".parse()?);
+        {
+            let signed = openplotva_web::admin_session_cookie(7, "123:ABC");
+            let value = signed.split(';').next().expect("cookie pair");
+            headers.insert(header::COOKIE, value.parse()?);
+        }
 
         let response = admin_shield_documents_response(
             &routes,
@@ -11699,7 +11730,11 @@ mod tests {
             .set_shared_queue(queue.clone(), BTreeMap::new());
         let diagnostic_id = job_id;
         let mut headers = HeaderMap::new();
-        headers.insert(header::COOKIE, "admin_session=7".parse()?);
+        {
+            let signed = openplotva_web::admin_session_cookie(7, "123:ABC");
+            let value = signed.split(';').next().expect("cookie pair");
+            headers.insert(header::COOKIE, value.parse()?);
+        }
 
         let response = admin_taskman_jobs_response(
             &routes,
@@ -11774,7 +11809,11 @@ mod tests {
     {
         let routes = static_web_routes(vec![7], "123:ABC", "https://plotva.example", "", None);
         let mut headers = HeaderMap::new();
-        headers.insert(header::COOKIE, "admin_session=7".parse()?);
+        {
+            let signed = openplotva_web::admin_session_cookie(7, "123:ABC");
+            let value = signed.split(';').next().expect("cookie pair");
+            headers.insert(header::COOKIE, value.parse()?);
+        }
 
         let response =
             admin_memory_cards_response(&routes, Method::GET, &headers, Some("limit=999")).await;
@@ -11919,7 +11958,11 @@ mod tests {
 
         let routes = static_web_routes(vec![7], "123:ABC", "https://plotva.example", "", None);
         let mut headers = HeaderMap::new();
-        headers.insert(header::COOKIE, "admin_session=7".parse()?);
+        {
+            let signed = openplotva_web::admin_session_cookie(7, "123:ABC");
+            let value = signed.split(';').next().expect("cookie pair");
+            headers.insert(header::COOKIE, value.parse()?);
+        }
         let response = admin_taskman_jobs_response(&routes, Method::GET, &headers, None);
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body = to_bytes(response.into_body(), usize::MAX).await?;
@@ -11951,7 +11994,11 @@ mod tests {
     -> Result<(), Box<dyn Error>> {
         let routes = static_web_routes(vec![7], "123:ABC", "https://plotva.example", "", None);
         let mut headers = HeaderMap::new();
-        headers.insert(header::COOKIE, "admin_session=7".parse()?);
+        {
+            let signed = openplotva_web::admin_session_cookie(7, "123:ABC");
+            let value = signed.split(';').next().expect("cookie pair");
+            headers.insert(header::COOKIE, value.parse()?);
+        }
 
         let response =
             admin_chat_get_response(&routes, Method::POST, &headers, Some("chat_id=1")).await;
