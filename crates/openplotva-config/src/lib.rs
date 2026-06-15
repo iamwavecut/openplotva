@@ -14,6 +14,10 @@ pub const DEFAULT_WEBAPP_PORT: u16 = 8080;
 
 pub const DEFAULT_WEBAPP_URL: &str = "http://127.0.0.1:8080";
 
+/// Soft-cutover default: settings WebApp requests without `initData` fall through to the
+/// legacy signature check until the new front-end ships. Flip to harden (reject missing data).
+pub const DEFAULT_SETTINGS_REQUIRE_INIT_DATA: bool = false;
+
 pub const DEFAULT_RUNTIME_API_ENABLED: bool = true;
 
 pub const DEFAULT_RUNTIME_API_HOST: &str = "127.0.0.1";
@@ -295,6 +299,9 @@ pub struct ServerConfig {
     pub bind_addr: String,
     /// Public WebApp URL, from `WEBAPP_URL`.
     pub url: String,
+    /// Reject settings WebApp requests without Telegram `initData`, from
+    /// `SETTINGS_REQUIRE_INIT_DATA`. Soft cutover: defaults to false (log and fall through).
+    pub require_settings_init_data: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -726,6 +733,8 @@ pub struct RawConfig {
     pub webapp_port: Option<String>,
     /// `WEBAPP_URL`.
     pub webapp_url: Option<String>,
+    /// `SETTINGS_REQUIRE_INIT_DATA`.
+    pub settings_require_init_data: Option<String>,
     /// `RUNTIME_API_ENABLED`.
     pub runtime_api_enabled: Option<String>,
     /// `RUNTIME_API_HOST`.
@@ -1470,6 +1479,11 @@ impl AppConfig {
                 url: raw
                     .webapp_url
                     .unwrap_or_else(|| DEFAULT_WEBAPP_URL.to_owned()),
+                require_settings_init_data: parse_bool(
+                    "SETTINGS_REQUIRE_INIT_DATA",
+                    raw.settings_require_init_data,
+                    DEFAULT_SETTINGS_REQUIRE_INIT_DATA,
+                )?,
             },
             runtime_api,
             observability: ObservabilityConfig {
@@ -2048,6 +2062,7 @@ impl RawConfig {
             webapp_host: env("WEBAPP_HOST"),
             webapp_port: env("WEBAPP_PORT"),
             webapp_url: env("WEBAPP_URL"),
+            settings_require_init_data: env("SETTINGS_REQUIRE_INIT_DATA"),
             runtime_api_enabled: env("RUNTIME_API_ENABLED"),
             runtime_api_host: env("RUNTIME_API_HOST"),
             runtime_api_port: env("RUNTIME_API_PORT"),
@@ -2621,6 +2636,7 @@ mod tests {
         assert_eq!(config.server.port, 8080);
         assert_eq!(config.server.bind_addr, "0.0.0.0:8080");
         assert_eq!(config.server.url, DEFAULT_WEBAPP_URL);
+        assert!(!config.server.require_settings_init_data);
         assert_eq!(config.vip.chat_id, DEFAULT_VIP_CHAT_ID);
         assert!(config.runtime_api.enabled);
         assert_eq!(config.runtime_api.host, DEFAULT_RUNTIME_API_HOST);
