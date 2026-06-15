@@ -3220,6 +3220,25 @@ fn add_settings_side_api_headers(headers: &mut HeaderMap, methods: &'static str)
     );
 }
 
+/// Maximum age of a Telegram Login `auth_date` accepted for admin authentication.
+const ADMIN_AUTH_MAX_AGE_SECONDS: i64 = 86_400; // 24h; tighten later if desired
+/// Small tolerance for clock skew on `auth_date` values slightly in the future.
+const ADMIN_AUTH_FUTURE_SKEW_SECONDS: i64 = 60;
+
+/// Returns true if `auth_date` (unix seconds) is within the accepted freshness window
+/// relative to `now`. Missing/unparseable dates and far-future dates are rejected.
+fn admin_auth_date_is_fresh(values: &BTreeMap<String, String>, now: OffsetDateTime) -> bool {
+    let Some(auth_date) = values
+        .get("auth_date")
+        .and_then(|v| v.trim().parse::<i64>().ok())
+    else {
+        return false;
+    };
+    let now_unix = now.unix_timestamp();
+    let age = now_unix - auth_date;
+    (-ADMIN_AUTH_FUTURE_SKEW_SECONDS..=ADMIN_AUTH_MAX_AGE_SECONDS).contains(&age)
+}
+
 async fn admin_auth_response(
     routes: &StaticWebRoutes,
     method: Method,
@@ -3249,6 +3268,11 @@ async fn admin_auth_response(
     if !openplotva_web::validate_telegram_auth(pairs, &routes.bot_token, hash) {
         tracing::error!("invalid admin auth signature");
         return admin_error_response(StatusCode::FORBIDDEN, "invalid auth");
+    }
+
+    if !admin_auth_date_is_fresh(&values, OffsetDateTime::now_utc()) {
+        tracing::error!("admin auth rejected: stale or missing auth_date");
+        return admin_error_response(StatusCode::FORBIDDEN, "auth expired");
     }
 
     if !routes.admin_ids.contains(&user_id) {
@@ -10536,8 +10560,9 @@ mod tests {
         AdminMemoryOverride, GO_ADMIN_API_ROUTE_PATTERNS, GO_DISPATCHER_DEBOUNCE_CACHE_SIZE,
         GO_DISPATCHER_DEBOUNCE_WINDOW, GO_DISPATCHER_MAX_QUEUE_SIZE, RuntimeUnhandledUpdateHandler,
         WebhookShutdownCleanupReport, admin_aifarm_pool_toggle_response, admin_auth_check,
-        admin_auth_query_values, admin_auth_response, admin_auth_user_state, admin_bootstrap,
-        admin_chat_get_response, admin_chats_search_by_member_response, admin_i64_from_json,
+        admin_auth_date_is_fresh, admin_auth_query_values, admin_auth_response,
+        admin_auth_user_state, admin_bootstrap, admin_chat_get_response,
+        admin_chats_search_by_member_response, admin_i64_from_json,
         admin_llm_analytics_summary_json, admin_llm_requests_clear_response,
         admin_llm_requests_filter, admin_llm_requests_response, admin_loglevel_response,
         admin_memory_cards_response, admin_memory_resolve_override, admin_memory_restart_override,
@@ -11137,12 +11162,18 @@ mod tests {
             "PlotvaBot",
             None,
         );
-        let valid_query = concat!(
-            "id=7&first_name=Ada&auth_date=1700000000&username=ada&hash=",
-            "c340b883eb8c3556a6f1c1b9086b792ffdd782f369b68777ca404488f89fcfec"
-        );
+        let auth_date = OffsetDateTime::now_utc().unix_timestamp().to_string();
+        let auth_pairs = [
+            ("auth_date", auth_date.as_str()),
+            ("first_name", "Ada"),
+            ("id", "7"),
+            ("username", "ada"),
+        ];
+        let hash = openplotva_web::telegram_auth_hash(auth_pairs.into_iter(), "123:ABC");
+        let valid_query =
+            format!("id=7&first_name=Ada&auth_date={auth_date}&username=ada&hash={hash}");
 
-        let response = admin_auth_response(&routes, Method::GET, Some(valid_query)).await;
+        let response = admin_auth_response(&routes, Method::GET, Some(valid_query.as_str())).await;
         assert_eq!(response.status(), StatusCode::FOUND);
         assert_eq!(
             response.headers().get(header::LOCATION),
@@ -11153,7 +11184,7 @@ mod tests {
             Some(&openplotva_web::admin_session_cookie(7, "123:ABC").parse()?)
         );
 
-        let response = admin_auth_response(&routes, Method::PUT, Some(valid_query)).await;
+        let response = admin_auth_response(&routes, Method::PUT, Some(valid_query.as_str())).await;
         assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
         let body = to_bytes(response.into_body(), usize::MAX).await?;
         assert_eq!(&body[..], b"{\"error\":\"method not allowed\"}\n");
@@ -11173,13 +11204,42 @@ mod tests {
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
         let non_admin_routes = static_web_routes(vec![9], "123:ABC", "", "", None);
-        let response = admin_auth_response(&non_admin_routes, Method::GET, Some(valid_query)).await;
+        let response =
+            admin_auth_response(&non_admin_routes, Method::GET, Some(valid_query.as_str())).await;
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
         let no_token_routes = static_web_routes(vec![7], "", "", "", None);
-        let response = admin_auth_response(&no_token_routes, Method::GET, Some(valid_query)).await;
+        let response =
+            admin_auth_response(&no_token_routes, Method::GET, Some(valid_query.as_str())).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         Ok(())
+    }
+
+    #[test]
+    fn admin_auth_date_freshness_window() {
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("ts");
+        let mut v = BTreeMap::new();
+        // fresh (just now)
+        v.insert("auth_date".to_owned(), "1700000000".to_owned());
+        assert!(admin_auth_date_is_fresh(&v, now));
+        // 23h ago: fresh
+        v.insert(
+            "auth_date".to_owned(),
+            (1_700_000_000 - 23 * 3600).to_string(),
+        );
+        assert!(admin_auth_date_is_fresh(&v, now));
+        // 25h ago: stale
+        v.insert(
+            "auth_date".to_owned(),
+            (1_700_000_000 - 25 * 3600).to_string(),
+        );
+        assert!(!admin_auth_date_is_fresh(&v, now));
+        // far future: rejected
+        v.insert("auth_date".to_owned(), (1_700_000_000 + 3600).to_string());
+        assert!(!admin_auth_date_is_fresh(&v, now));
+        // missing: rejected
+        v.remove("auth_date");
+        assert!(!admin_auth_date_is_fresh(&v, now));
     }
 
     #[tokio::test]
