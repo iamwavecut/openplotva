@@ -5,6 +5,7 @@ use std::{
     fmt,
     future::Future,
     pin::Pin,
+    sync::Arc,
     time::{Duration as StdDuration, SystemTime, UNIX_EPOCH},
 };
 
@@ -27,12 +28,8 @@ use openplotva_taskman::{
     image_gen_job_params_from_stateless_job,
 };
 use openplotva_telegram::{
-    ChatRef, DeleteMessageRequest, EditMediaMessageRequest, MediaGroupMessageRequest,
-    MediaGroupPhotoItem, PhotoMessageRequest, PhotoSource, ReplyMessageRef, ReplyParametersPlan,
-    StickerMessageRequest, TELEGRAM_PARSE_MODE_HTML, TelegramOutboundMethod,
-    TelegramOutboundResponse, TextMessageRequest, build_delete_message_method,
-    build_edit_media_message_method, build_media_group_message_method, build_photo_message_method,
-    build_sticker_message_method, build_text_message_methods, ensure_telegram_safe_text,
+    DeleteMessageRequest, PhotoSource, RichSendOptions, TelegramOutboundMethod,
+    TelegramOutboundResponse, build_delete_message_method, ensure_telegram_safe_text,
     escape_telegram_html_text, execute_telegram_method, strip_telegram_html,
 };
 use rand::RngExt;
@@ -59,18 +56,16 @@ pub const AIFARM_DRAW_API_ENDPOINT_NAME: &str = "generate";
 pub const AIFARM_DRAW_API_DEFAULT_BASE_URL: &str = "http://127.0.0.1:50051";
 pub const AIFARM_DRAW_API_DEFAULT_TIMEOUT: StdDuration = StdDuration::from_secs(600);
 pub const AIFARM_DRAW_API_DEFAULT_POLL_INTERVAL: StdDuration = StdDuration::from_secs(1);
-pub const STICKER_DRAW_FILE_ID: &str =
-    "CAACAgIAAxkBAAEeRZ5kDllSPdVQ_-kGLny406MDN5dDvAACCisAAksYcEhs6T-nxUJBVy8E";
 pub const STICKER_DOWN_FILE_ID: &str =
     "CAACAgIAAxkBAAEeROBkDjnz1i3WxxyNLBgWA_IKyjxbnQACuioAAqPicEh1C96_WINTHS8E";
-pub const DRAWING_STICKER_DELETE_AFTER: StdDuration = StdDuration::from_secs(30);
 pub const NSFW_BLOCKED_MESSAGE_TEXT: &str = "Ваш запрос заблокирован, так как содержит неприемлемый контент. Попробуйте переформулировать запрос.";
+const DRAW_STATUS_DRAWING: &str = "рисую…";
+const DRAW_FAILED_NOTICE_TEXT: &str =
+    "Не удалось нарисовать изображение. Попробуйте ещё раз чуть позже.";
 pub const IMAGE_JOB_POLL_INTERVAL: StdDuration = StdDuration::from_secs(1);
 pub const IMAGE_JOB_WORKER_QUEUES: [&str; 2] = [IMAGE_VIP_QUEUE_NAME, IMAGE_REGULAR_QUEUE_NAME];
 pub const IMAGE_VIP_JOB_WORKER_QUEUES: [&str; 1] = [IMAGE_VIP_QUEUE_NAME];
 pub const IMAGE_REGULAR_JOB_WORKER_QUEUES: [&str; 1] = [IMAGE_REGULAR_QUEUE_NAME];
-pub const IMAGE_PLACEHOLDER_FILE_ID: &str =
-    "AgACAgIAAxkBAAFhmg5oDV5-lLcooLSE8nKFLlF768nEygAC6O8xG2uvaUjfFg40SWg2rgEAAwIAA3kAAzYE";
 pub const DRAW_SUPPORT_ME_URL: &str = "https://t.me/PlotvoBot?start=donate";
 pub const DRAW_VIP_URL: &str = "https://t.me/PlotvoBot?start=vip";
 
@@ -1050,104 +1045,58 @@ pub trait ImageJobEffects {
         message_id: i32,
     ) -> ImageJobEffectFuture<'a, ()>;
 
-    /// Send the drawing sticker and return its Telegram message ID when available.
-    fn send_drawing_sticker<'a>(
-        &'a self,
-        chat_id: i64,
-        message_id: i32,
-        user_id: i64,
-        thread_id: Option<i32>,
-    ) -> ImageJobEffectFuture<'a, Option<i32>>;
-
-    /// Remove the drawing sticker.
-    fn remove_drawing_sticker<'a>(
-        &'a self,
-        chat_id: i64,
-        sticker_message_id: i32,
-    ) -> ImageJobEffectFuture<'a, ()>;
-
-    fn send_nsfw_blocked_message<'a>(
-        &'a self,
-        chat_id: i64,
-        message_id: i32,
-        user_id: i64,
-        thread_id: Option<i32>,
-    ) -> ImageJobEffectFuture<'a, ()>;
-
-    /// Send initial generated-image placeholders and return their Telegram message IDs.
-    fn send_initial_placeholders<'a>(
+    /// Send the initial rich draw placeholder; returns its Telegram message id.
+    fn send_draw_placeholder<'a>(
         &'a self,
         chat_id: i64,
         message_id: i32,
         thread_id: Option<i32>,
-        caption_text: String,
-        is_nsfw: bool,
-        count: usize,
-    ) -> ImageJobEffectFuture<'a, Result<Vec<i32>, String>>;
-
-    /// Replace one placeholder with generated media.
-    fn replace_placeholder_image<'a>(
-        &'a self,
-        chat_id: i64,
-        placeholder_message_id: i32,
-        thread_id: Option<i32>,
-        photo: PhotoSource,
-        caption_text: String,
-        is_nsfw: bool,
+        html: String,
     ) -> ImageJobEffectFuture<'a, Result<i32, String>>;
 
-    /// Delete an unused placeholder.
-    fn delete_placeholder_image<'a>(
+    /// Edit the draw message in place with new rich HTML (progress, final, or error).
+    fn edit_draw_message<'a>(
         &'a self,
         chat_id: i64,
-        placeholder_message_id: i32,
-    ) -> ImageJobEffectFuture<'a, ()>;
+        draw_message_id: i32,
+        html: String,
+    ) -> ImageJobEffectFuture<'a, Result<(), String>>;
 
-    /// Send a generated image and return the Telegram result message ID.
-    fn send_generated_image<'a>(
+    /// Publish generated photos to public HTTPS URLs (uploading raw bytes as needed).
+    fn publish_draw_images<'a>(
         &'a self,
-        chat_id: i64,
-        message_id: i32,
-        thread_id: Option<i32>,
-        photo: PhotoSource,
-    ) -> ImageJobEffectFuture<'a, Result<i32, String>>;
-
-    /// Send one or more generated images and return the first Telegram result message ID.
-    fn send_generated_images<'a>(
-        &'a self,
-        chat_id: i64,
-        message_id: i32,
-        thread_id: Option<i32>,
-        caption_text: String,
         photos: Vec<PhotoSource>,
-    ) -> ImageJobEffectFuture<'a, Result<i32, String>>;
+    ) -> ImageJobEffectFuture<'a, Result<Vec<String>, String>>;
 }
 
-/// Concrete image-job sticker effects over Redis and Telegram.
+/// Concrete image-job effects: clears the queued sticker and drives the single rich
+/// draw message (placeholder → progress → final gallery) plus media uploads.
 #[derive(Clone, Debug)]
-pub struct TelegramImageJobEffects<Queued, Ephemeral, Sender> {
+pub struct TelegramImageJobEffects<Queued, Sender> {
     queued_stickers: Queued,
-    ephemeral_messages: Ephemeral,
     telegram: Sender,
+    rich: Arc<dyn crate::rich::RichSender>,
 }
 
-impl<Queued, Ephemeral, Sender> TelegramImageJobEffects<Queued, Ephemeral, Sender> {
+impl<Queued, Sender> TelegramImageJobEffects<Queued, Sender> {
     /// Build concrete image-job effects.
     #[must_use]
-    pub fn new(queued_stickers: Queued, ephemeral_messages: Ephemeral, telegram: Sender) -> Self {
+    pub fn new(
+        queued_stickers: Queued,
+        telegram: Sender,
+        rich: Arc<dyn crate::rich::RichSender>,
+    ) -> Self {
         Self {
             queued_stickers,
-            ephemeral_messages,
             telegram,
+            rich,
         }
     }
 }
 
-impl<Queued, Ephemeral, Sender> ImageJobEffects
-    for TelegramImageJobEffects<Queued, Ephemeral, Sender>
+impl<Queued, Sender> ImageJobEffects for TelegramImageJobEffects<Queued, Sender>
 where
     Queued: QueuedStickerStore + Send + Sync,
-    Ephemeral: crate::virtual_messages::EphemeralMessageTracker + Send + Sync,
     Sender: ImageJobTelegramSender + Send + Sync,
 {
     fn remove_queued_sticker<'a>(
@@ -1174,251 +1123,74 @@ where
         })
     }
 
-    fn send_drawing_sticker<'a>(
+    fn send_draw_placeholder<'a>(
         &'a self,
         chat_id: i64,
         message_id: i32,
-        user_id: i64,
         thread_id: Option<i32>,
-    ) -> ImageJobEffectFuture<'a, Option<i32>> {
+        html: String,
+    ) -> ImageJobEffectFuture<'a, Result<i32, String>> {
         Box::pin(async move {
-            let (request, reply_to) =
-                drawing_sticker_message_request(chat_id, message_id, user_id, thread_id);
-            let Ok(method) = build_sticker_message_method(&request, Some(&reply_to)) else {
-                return None;
+            let options = RichSendOptions {
+                message_thread_id: thread_id.map(i64::from),
+                reply_to_message_id: Some(i64::from(message_id)),
+                allow_sending_without_reply: true,
+                disable_notification: false,
+                reply_markup: None,
             };
-            let Ok(response) = self
-                .telegram
-                .send_image_job_method(TelegramOutboundMethod::from(method))
+            let id = self
+                .rich
+                .send_rich(chat_id, &html, &options)
                 .await
-            else {
-                return None;
-            };
-            let sticker_message_id = image_job_response_message_id(&response)?;
-            let _ = self
-                .ephemeral_messages
-                .track_ephemeral_message(
-                    chat_id,
-                    sticker_message_id,
-                    DRAWING_STICKER_DELETE_AFTER,
-                    OffsetDateTime::now_utc(),
-                )
-                .await;
-            Some(sticker_message_id)
+                .map_err(|error| error.to_string())?;
+            i32::try_from(id).map_err(|_| format!("rich draw message id out of range: {id}"))
         })
     }
 
-    fn remove_drawing_sticker<'a>(
+    fn edit_draw_message<'a>(
         &'a self,
         chat_id: i64,
-        sticker_message_id: i32,
-    ) -> ImageJobEffectFuture<'a, ()> {
+        draw_message_id: i32,
+        html: String,
+    ) -> ImageJobEffectFuture<'a, Result<(), String>> {
         Box::pin(async move {
-            if sticker_message_id > 0 {
-                self.delete_telegram_message(chat_id, i64::from(sticker_message_id))
-                    .await;
-            }
+            self.rich
+                .edit_rich(chat_id, i64::from(draw_message_id), &html, None)
+                .await
+                .map_err(|error| error.to_string())
         })
     }
 
-    fn send_nsfw_blocked_message<'a>(
+    fn publish_draw_images<'a>(
         &'a self,
-        chat_id: i64,
-        message_id: i32,
-        _user_id: i64,
-        thread_id: Option<i32>,
-    ) -> ImageJobEffectFuture<'a, ()> {
-        Box::pin(async move {
-            let (request, reply_to) = nsfw_blocked_message_request(chat_id, message_id, thread_id);
-            let Ok(methods) = build_text_message_methods(&request, Some(&reply_to)) else {
-                return;
-            };
-            for method in methods {
-                let _ = self
-                    .telegram
-                    .send_image_job_method(TelegramOutboundMethod::from(method))
-                    .await;
-            }
-        })
-    }
-
-    fn send_initial_placeholders<'a>(
-        &'a self,
-        chat_id: i64,
-        message_id: i32,
-        thread_id: Option<i32>,
-        caption_text: String,
-        is_nsfw: bool,
-        count: usize,
-    ) -> ImageJobEffectFuture<'a, Result<Vec<i32>, String>> {
-        Box::pin(async move {
-            let count = count.clamp(1, TELEGRAM_MEDIA_GROUP_MAX_ITEMS);
-            let response = if count == 1 {
-                let request = placeholder_image_message_request(
-                    chat_id,
-                    message_id,
-                    thread_id,
-                    caption_text,
-                    is_nsfw,
-                );
-                let method =
-                    build_photo_message_method(&request).map_err(|error| error.to_string())?;
-                self.telegram
-                    .send_image_job_method(TelegramOutboundMethod::from(method))
-                    .await?
-            } else {
-                let request = placeholder_image_media_group_request(
-                    chat_id,
-                    message_id,
-                    thread_id,
-                    caption_text,
-                    is_nsfw,
-                    count,
-                );
-                let method = build_media_group_message_method(&request)
-                    .map_err(|error| error.to_string())?;
-                self.telegram
-                    .send_image_job_method(TelegramOutboundMethod::from(method))
-                    .await?
-            };
-            let ids = image_job_response_message_ids(&response);
-            if ids.is_empty() {
-                return Err("placeholder send returned no message response".to_owned());
-            }
-            Ok(ids)
-        })
-    }
-
-    fn replace_placeholder_image<'a>(
-        &'a self,
-        chat_id: i64,
-        placeholder_message_id: i32,
-        _thread_id: Option<i32>,
-        photo: PhotoSource,
-        caption_text: String,
-        is_nsfw: bool,
-    ) -> ImageJobEffectFuture<'a, Result<i32, String>> {
-        Box::pin(async move {
-            let request = replacement_image_message_request(
-                chat_id,
-                placeholder_message_id,
-                photo,
-                caption_text,
-                is_nsfw,
-            );
-            let method =
-                build_edit_media_message_method(&request).map_err(|error| error.to_string())?;
-            let response = self
-                .telegram
-                .send_image_job_method(TelegramOutboundMethod::from(method))
-                .await?;
-            match response {
-                TelegramOutboundResponse::EditMessage(_)
-                | TelegramOutboundResponse::Message(_)
-                | TelegramOutboundResponse::Boolean(true) => Ok(placeholder_message_id),
-                TelegramOutboundResponse::Boolean(false) => {
-                    Err("editMessageMedia returned false".to_owned())
-                }
-                TelegramOutboundResponse::Messages(_)
-                | TelegramOutboundResponse::SentGuestMessage(_)
-                | TelegramOutboundResponse::String(_) => {
-                    Err("editMessageMedia returned unexpected response".to_owned())
-                }
-            }
-        })
-    }
-
-    fn delete_placeholder_image<'a>(
-        &'a self,
-        chat_id: i64,
-        placeholder_message_id: i32,
-    ) -> ImageJobEffectFuture<'a, ()> {
-        Box::pin(async move {
-            self.delete_telegram_message(chat_id, i64::from(placeholder_message_id))
-                .await;
-        })
-    }
-
-    fn send_generated_image<'a>(
-        &'a self,
-        chat_id: i64,
-        message_id: i32,
-        thread_id: Option<i32>,
-        photo: PhotoSource,
-    ) -> ImageJobEffectFuture<'a, Result<i32, String>> {
-        Box::pin(async move {
-            let request = generated_image_message_request(
-                chat_id,
-                message_id,
-                thread_id,
-                String::new(),
-                photo,
-            );
-            let method = build_photo_message_method(&request).map_err(|error| error.to_string())?;
-            let response = self
-                .telegram
-                .send_image_job_method(TelegramOutboundMethod::from(method))
-                .await?;
-            image_job_response_message_id(&response)
-                .ok_or_else(|| "sendPhoto returned non-message response".to_owned())
-        })
-    }
-
-    fn send_generated_images<'a>(
-        &'a self,
-        chat_id: i64,
-        message_id: i32,
-        thread_id: Option<i32>,
-        caption_text: String,
         photos: Vec<PhotoSource>,
-    ) -> ImageJobEffectFuture<'a, Result<i32, String>> {
+    ) -> ImageJobEffectFuture<'a, Result<Vec<String>, String>> {
         Box::pin(async move {
-            let photos = photos
-                .into_iter()
-                .take(TELEGRAM_MEDIA_GROUP_MAX_ITEMS)
-                .collect::<Vec<_>>();
-            match photos.as_slice() {
-                [] => Err("image generation produced no image".to_owned()),
-                [photo] => {
-                    let request = generated_image_message_request(
-                        chat_id,
-                        message_id,
-                        thread_id,
-                        caption_text,
-                        photo.clone(),
-                    );
-                    let method =
-                        build_photo_message_method(&request).map_err(|error| error.to_string())?;
-                    let response = self
-                        .telegram
-                        .send_image_job_method(TelegramOutboundMethod::from(method))
-                        .await?;
-                    image_job_response_message_id(&response)
-                        .ok_or_else(|| "sendPhoto returned non-message response".to_owned())
-                }
-                _ => {
-                    let request = generated_image_media_group_request(
-                        chat_id,
-                        message_id,
-                        thread_id,
-                        caption_text,
-                        photos,
-                    );
-                    let method = build_media_group_message_method(&request)
-                        .map_err(|error| error.to_string())?;
-                    let response = self
-                        .telegram
-                        .send_image_job_method(TelegramOutboundMethod::from(method))
-                        .await?;
-                    image_job_response_message_id(&response)
-                        .ok_or_else(|| "sendMediaGroup returned no message response".to_owned())
-                }
+            let mut urls = Vec::with_capacity(photos.len());
+            for photo in photos {
+                let url = match photo {
+                    PhotoSource::Bytes { file_name, bytes } => self
+                        .rich
+                        .upload_bytes(bytes, guess_image_mime(&file_name), None)
+                        .await
+                        .map_err(|error| error.to_string())?,
+                    PhotoSource::Url(source) => self
+                        .rich
+                        .upload_url(&source, None)
+                        .await
+                        .map_err(|error| error.to_string())?,
+                    PhotoSource::FileId(_) => {
+                        return Err("cannot publish image from a telegram file id".to_owned());
+                    }
+                };
+                urls.push(url);
             }
+            Ok(urls)
         })
     }
 }
 
-impl<Queued, Ephemeral, Sender> TelegramImageJobEffects<Queued, Ephemeral, Sender>
+impl<Queued, Sender> TelegramImageJobEffects<Queued, Sender>
 where
     Sender: ImageJobTelegramSender + Send + Sync,
 {
@@ -1436,185 +1208,24 @@ where
     }
 }
 
-fn nsfw_blocked_message_request(
-    chat_id: i64,
-    message_id: i32,
-    thread_id: Option<i32>,
-) -> (TextMessageRequest, ReplyMessageRef) {
-    let message_thread_id = i64::from(thread_id.unwrap_or_default());
-    let is_topic_message = message_thread_id != 0;
-    (
-        TextMessageRequest {
-            chat: None,
-            message_thread_id,
-            disable_notification: false,
-            allow_sending_without_reply: Some(true),
-            text: NSFW_BLOCKED_MESSAGE_TEXT.to_owned(),
-            render_as: String::new(),
-            reply_markup: None,
-        },
-        ReplyMessageRef {
-            message_id: i64::from(message_id),
-            chat: ChatRef {
-                id: chat_id,
-                is_forum: is_topic_message,
-            },
-            is_topic_message,
-            message_thread_id,
-        },
-    )
-}
-
-fn generated_image_message_request(
-    chat_id: i64,
-    message_id: i32,
-    thread_id: Option<i32>,
-    caption_text: String,
-    photo: PhotoSource,
-) -> PhotoMessageRequest {
-    let message_thread_id = i64::from(thread_id.unwrap_or_default());
-    let is_topic_message = message_thread_id != 0;
-    PhotoMessageRequest {
-        chat: ChatRef {
-            id: chat_id,
-            is_forum: is_topic_message,
-        },
-        message_thread_id,
-        disable_notification: false,
-        photo,
-        caption: caption_text,
-        render_as: String::new(),
-        has_spoiler: false,
-        reply_parameters: Some(ReplyParametersPlan {
-            message_id: i64::from(message_id),
-            chat_id,
-            allow_sending_without_reply: true,
-        }),
+/// Best-effort image MIME from a file name; defaults to PNG.
+fn guess_image_mime(file_name: &str) -> &'static str {
+    let lower = file_name.to_ascii_lowercase();
+    if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
+        "image/jpeg"
+    } else if lower.ends_with(".webp") {
+        "image/webp"
+    } else if lower.ends_with(".gif") {
+        "image/gif"
+    } else {
+        "image/png"
     }
 }
 
-fn placeholder_image_message_request(
-    chat_id: i64,
-    message_id: i32,
-    thread_id: Option<i32>,
-    caption_text: String,
-    is_nsfw: bool,
-) -> PhotoMessageRequest {
-    let mut request = generated_image_message_request(
-        chat_id,
-        message_id,
-        thread_id,
-        caption_text,
-        PhotoSource::FileId(IMAGE_PLACEHOLDER_FILE_ID.to_owned()),
-    );
-    request.render_as = TELEGRAM_PARSE_MODE_HTML.to_owned();
-    request.has_spoiler = is_nsfw;
-    request
-}
-
-fn generated_image_media_group_request(
-    chat_id: i64,
-    message_id: i32,
-    thread_id: Option<i32>,
-    caption_text: String,
-    photos: Vec<PhotoSource>,
-) -> MediaGroupMessageRequest {
-    let message_thread_id = i64::from(thread_id.unwrap_or_default());
-    let is_topic_message = message_thread_id != 0;
-    MediaGroupMessageRequest {
-        chat: ChatRef {
-            id: chat_id,
-            is_forum: is_topic_message,
-        },
-        message_thread_id,
-        disable_notification: false,
-        items: photos
-            .into_iter()
-            .enumerate()
-            .map(|(index, photo)| MediaGroupPhotoItem {
-                photo,
-                caption: if index == 0 {
-                    caption_text.clone()
-                } else {
-                    String::new()
-                },
-                render_as: String::new(),
-                has_spoiler: false,
-            })
-            .collect(),
-        reply_parameters: Some(ReplyParametersPlan {
-            message_id: i64::from(message_id),
-            chat_id,
-            allow_sending_without_reply: true,
-        }),
-    }
-}
-
-fn placeholder_image_media_group_request(
-    chat_id: i64,
-    message_id: i32,
-    thread_id: Option<i32>,
-    caption_text: String,
-    is_nsfw: bool,
-    count: usize,
-) -> MediaGroupMessageRequest {
-    let message_thread_id = i64::from(thread_id.unwrap_or_default());
-    let is_topic_message = message_thread_id != 0;
-    MediaGroupMessageRequest {
-        chat: ChatRef {
-            id: chat_id,
-            is_forum: is_topic_message,
-        },
-        message_thread_id,
-        disable_notification: false,
-        items: (0..count)
-            .map(|index| MediaGroupPhotoItem {
-                photo: PhotoSource::FileId(IMAGE_PLACEHOLDER_FILE_ID.to_owned()),
-                caption: if index == 0 {
-                    caption_text.clone()
-                } else {
-                    String::new()
-                },
-                render_as: if index == 0 {
-                    TELEGRAM_PARSE_MODE_HTML.to_owned()
-                } else {
-                    String::new()
-                },
-                has_spoiler: is_nsfw,
-            })
-            .collect(),
-        reply_parameters: Some(ReplyParametersPlan {
-            message_id: i64::from(message_id),
-            chat_id,
-            allow_sending_without_reply: true,
-        }),
-    }
-}
-
-fn replacement_image_message_request(
-    chat_id: i64,
-    placeholder_message_id: i32,
-    photo: PhotoSource,
-    caption_text: String,
-    is_nsfw: bool,
-) -> EditMediaMessageRequest {
-    EditMediaMessageRequest {
-        chat: ChatRef {
-            id: chat_id,
-            is_forum: false,
-        },
-        message_id: i64::from(placeholder_message_id),
-        media: MediaGroupPhotoItem {
-            photo,
-            render_as: if caption_text.is_empty() {
-                String::new()
-            } else {
-                TELEGRAM_PARSE_MODE_HTML.to_owned()
-            },
-            caption: caption_text,
-            has_spoiler: is_nsfw,
-        },
-    }
+/// Convert a Telegram-HTML caption (which uses `\n`) into rich HTML, where bare
+/// newlines collapse and line breaks must be explicit.
+fn caption_to_rich(caption: &str) -> String {
+    caption.replace('\n', "<br>")
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1874,36 +1485,22 @@ where
         expected_image_count > 1,
         params.is_nsfw,
     );
+
     effects
         .remove_queued_sticker(params.chat_id, params.message_id)
         .await;
-    let drawing_sticker = effects
-        .send_drawing_sticker(
-            params.chat_id,
-            params.message_id,
-            params.user_id,
-            params.thread_id,
-        )
-        .await;
 
-    let placeholders = match effects
-        .send_initial_placeholders(
+    let draw_message_id = match effects
+        .send_draw_placeholder(
             params.chat_id,
             params.message_id,
             params.thread_id,
-            display_caption.clone(),
-            params.is_nsfw,
-            expected_image_count,
+            crate::rich::compose_draw_progress(DRAW_STATUS_DRAWING, 0, None, &[]),
         )
         .await
     {
-        Ok(placeholders) => placeholders,
+        Ok(draw_message_id) => draw_message_id,
         Err(error) => {
-            if let Some(sticker_id) = drawing_sticker.filter(|sticker_id| *sticker_id > 0) {
-                effects
-                    .remove_drawing_sticker(params.chat_id, sticker_id)
-                    .await;
-            }
             return ImageGenJobExecutionReport {
                 outcome: ImageGenJobExecutionOutcome::Failed,
                 prompt,
@@ -1911,7 +1508,7 @@ where
                 image_url: None,
                 image_urls: Vec::new(),
                 result_message_id: None,
-                error: Some(format!("send initial placeholders: {error}")),
+                error: Some(format!("send draw placeholder: {error}")),
             };
         }
     };
@@ -1932,47 +1529,49 @@ where
     };
 
     let result = generator.generate_image(request).await;
-    if let Some(sticker_id) = drawing_sticker.filter(|sticker_id| *sticker_id > 0) {
-        effects
-            .remove_drawing_sticker(params.chat_id, sticker_id)
-            .await;
-    }
 
     match result {
         Ok(result) => {
             let image_urls = image_generation_urls(&result);
             let image_url = image_urls.first().cloned();
-            let photos = image_generation_photo_sources(&result);
+            let photos = image_generation_photo_sources(&result)
+                .into_iter()
+                .take(TELEGRAM_MEDIA_GROUP_MAX_ITEMS)
+                .collect::<Vec<_>>();
             if photos.is_empty() {
-                cleanup_image_placeholders(effects, params.chat_id, &placeholders).await;
+                let _ = effects
+                    .edit_draw_message(
+                        params.chat_id,
+                        draw_message_id,
+                        crate::rich::compose_draw_notice(DRAW_FAILED_NOTICE_TEXT),
+                    )
+                    .await;
                 return ImageGenJobExecutionReport {
                     outcome: ImageGenJobExecutionOutcome::Failed,
                     prompt,
                     caption_text,
                     image_url: None,
                     image_urls,
-                    result_message_id: None,
+                    result_message_id: Some(draw_message_id),
                     error: Some("image generation produced no image".to_owned()),
                 };
             }
-            match fill_image_placeholders(
+            match deliver_draw_gallery(
                 effects,
                 params.chat_id,
-                params.thread_id,
-                &placeholders,
+                draw_message_id,
                 photos,
-                display_caption,
-                params.is_nsfw,
+                &display_caption,
             )
             .await
             {
-                Ok(result_message_id) => ImageGenJobExecutionReport {
+                Ok(()) => ImageGenJobExecutionReport {
                     outcome: ImageGenJobExecutionOutcome::Completed,
                     prompt,
                     caption_text,
                     image_url,
                     image_urls,
-                    result_message_id: Some(result_message_id),
+                    result_message_id: Some(draw_message_id),
                     error: None,
                 },
                 Err(error) => ImageGenJobExecutionReport {
@@ -1981,19 +1580,17 @@ where
                     caption_text,
                     image_url,
                     image_urls,
-                    result_message_id: None,
-                    error: Some(format!("send generated image: {error}")),
+                    result_message_id: Some(draw_message_id),
+                    error: Some(format!("publish draw gallery: {error}")),
                 },
             }
         }
         Err(ImageGenerationError::Forbidden) => {
-            cleanup_image_placeholders(effects, params.chat_id, &placeholders).await;
-            effects
-                .send_nsfw_blocked_message(
+            let _ = effects
+                .edit_draw_message(
                     params.chat_id,
-                    params.message_id,
-                    params.user_id,
-                    params.thread_id,
+                    draw_message_id,
+                    crate::rich::compose_draw_notice(NSFW_BLOCKED_MESSAGE_TEXT),
                 )
                 .await;
             ImageGenJobExecutionReport {
@@ -2002,80 +1599,50 @@ where
                 caption_text,
                 image_url: None,
                 image_urls: Vec::new(),
-                result_message_id: None,
+                result_message_id: Some(draw_message_id),
                 error: None,
             }
         }
         Err(error) => {
-            cleanup_image_placeholders(effects, params.chat_id, &placeholders).await;
+            let _ = effects
+                .edit_draw_message(
+                    params.chat_id,
+                    draw_message_id,
+                    crate::rich::compose_draw_notice(DRAW_FAILED_NOTICE_TEXT),
+                )
+                .await;
             ImageGenJobExecutionReport {
                 outcome: ImageGenJobExecutionOutcome::Failed,
                 prompt,
                 caption_text,
                 image_url: None,
                 image_urls: Vec::new(),
-                result_message_id: None,
+                result_message_id: Some(draw_message_id),
                 error: Some(error.message()),
             }
         }
     }
 }
 
-async fn fill_image_placeholders<Effects>(
+/// Publish generated photos and replace the draw message with the final gallery.
+async fn deliver_draw_gallery<Effects>(
     effects: &Effects,
     chat_id: i64,
-    thread_id: Option<i32>,
-    placeholders: &[i32],
+    draw_message_id: i32,
     photos: Vec<PhotoSource>,
-    caption_text: String,
-    is_nsfw: bool,
-) -> Result<i32, String>
+    display_caption: &str,
+) -> Result<(), String>
 where
     Effects: ImageJobEffects + Sync,
 {
-    if placeholders.is_empty() {
-        return Err("initial placeholders are empty".to_owned());
+    let urls = effects.publish_draw_images(photos).await?;
+    if urls.is_empty() {
+        return Err("no images were published".to_owned());
     }
-    let mut result_message_id = None;
-    let mut filled_count = 0usize;
-    for (index, (placeholder, photo)) in placeholders.iter().copied().zip(photos).enumerate() {
-        let caption = if index == 0 {
-            caption_text.clone()
-        } else {
-            String::new()
-        };
-        let message_id = match effects
-            .replace_placeholder_image(chat_id, placeholder, thread_id, photo, caption, is_nsfw)
-            .await
-        {
-            Ok(message_id) => message_id,
-            Err(error) => {
-                for placeholder in placeholders.iter().copied().skip(filled_count) {
-                    effects.delete_placeholder_image(chat_id, placeholder).await;
-                }
-                return Err(error);
-            }
-        };
-        if result_message_id.is_none() {
-            result_message_id = Some(message_id);
-        }
-        filled_count += 1;
-    }
-    for placeholder in placeholders.iter().copied().skip(filled_count) {
-        effects.delete_placeholder_image(chat_id, placeholder).await;
-    }
-    result_message_id.ok_or_else(|| "image generation produced no image".to_owned())
-}
-
-async fn cleanup_image_placeholders<Effects>(effects: &Effects, chat_id: i64, placeholders: &[i32])
-where
-    Effects: ImageJobEffects + Sync,
-{
-    for placeholder in placeholders {
-        effects
-            .delete_placeholder_image(chat_id, *placeholder)
-            .await;
-    }
+    let gallery = crate::rich::compose_gallery(&urls, &caption_to_rich(display_caption), None);
+    effects
+        .edit_draw_message(chat_id, draw_message_id, gallery)
+        .await
 }
 
 #[must_use]
@@ -2096,58 +1663,30 @@ where
     let params = sanitize_image_edit_job_params(params);
     let display_caption =
         build_image_generation_caption(&params.prompt, &params.user_full_name, true, false);
+
     effects
         .remove_queued_sticker(params.chat_id, params.message_id)
         .await;
-    let drawing_sticker = effects
-        .send_drawing_sticker(
-            params.chat_id,
-            params.message_id,
-            params.user_id,
-            params.thread_id,
-        )
-        .await;
 
-    let placeholders = match effects
-        .send_initial_placeholders(
+    let draw_message_id = match effects
+        .send_draw_placeholder(
             params.chat_id,
             params.message_id,
             params.thread_id,
-            display_caption.clone(),
-            false,
-            1,
+            crate::rich::compose_draw_progress(DRAW_STATUS_DRAWING, 0, None, &[]),
         )
         .await
     {
-        Ok(placeholders) => placeholders,
+        Ok(draw_message_id) => draw_message_id,
         Err(error) => {
-            if let Some(sticker_id) = drawing_sticker.filter(|sticker_id| *sticker_id > 0) {
-                effects
-                    .remove_drawing_sticker(params.chat_id, sticker_id)
-                    .await;
-            }
             return ImageEditJobExecutionReport {
                 outcome: ImageEditJobExecutionOutcome::Failed,
                 prompt: params.prompt,
                 image_urls: Vec::new(),
                 result_message_id: None,
-                error: Some(format!("send initial placeholders: {error}")),
+                error: Some(format!("send draw placeholder: {error}")),
             };
         }
-    };
-    let Some(placeholder_message_id) = placeholders.first().copied() else {
-        if let Some(sticker_id) = drawing_sticker.filter(|sticker_id| *sticker_id > 0) {
-            effects
-                .remove_drawing_sticker(params.chat_id, sticker_id)
-                .await;
-        }
-        return ImageEditJobExecutionReport {
-            outcome: ImageEditJobExecutionOutcome::Failed,
-            prompt: params.prompt,
-            image_urls: Vec::new(),
-            result_message_id: None,
-            error: Some("initial placeholders are empty".to_owned()),
-        };
     };
 
     let request = ImageEditRequest {
@@ -2162,11 +1701,6 @@ where
     };
 
     let result = editor.edit_image(request).await;
-    if let Some(sticker_id) = drawing_sticker.filter(|sticker_id| *sticker_id > 0) {
-        effects
-            .remove_drawing_sticker(params.chat_id, sticker_id)
-            .await;
-    }
 
     match result {
         Ok(result) => {
@@ -2180,83 +1714,102 @@ where
                 .into_iter()
                 .filter_map(non_empty)
                 .collect::<Vec<_>>();
-            let photo = image_bytes
-                .first()
-                .cloned()
-                .map(|bytes| PhotoSource::Bytes {
-                    file_name: "image.png".to_owned(),
-                    bytes,
-                })
-                .or_else(|| image_urls.first().cloned().map(PhotoSource::Url));
-            let Some(photo) = photo else {
-                cleanup_image_placeholders(effects, params.chat_id, &placeholders).await;
+            let photos = image_edit_photo_sources(&image_bytes, &image_urls)
+                .into_iter()
+                .take(TELEGRAM_MEDIA_GROUP_MAX_ITEMS)
+                .collect::<Vec<_>>();
+            if photos.is_empty() {
+                let _ = effects
+                    .edit_draw_message(
+                        params.chat_id,
+                        draw_message_id,
+                        crate::rich::compose_draw_notice(DRAW_FAILED_NOTICE_TEXT),
+                    )
+                    .await;
                 return ImageEditJobExecutionReport {
                     outcome: ImageEditJobExecutionOutcome::Failed,
                     prompt: params.prompt,
                     image_urls,
-                    result_message_id: None,
+                    result_message_id: Some(draw_message_id),
                     error: Some("image edit produced no image".to_owned()),
                 };
-            };
-            match effects
-                .replace_placeholder_image(
-                    params.chat_id,
-                    placeholder_message_id,
-                    params.thread_id,
-                    photo,
-                    display_caption,
-                    false,
-                )
-                .await
+            }
+            match deliver_draw_gallery(
+                effects,
+                params.chat_id,
+                draw_message_id,
+                photos,
+                &display_caption,
+            )
+            .await
             {
-                Ok(result_message_id) => ImageEditJobExecutionReport {
+                Ok(()) => ImageEditJobExecutionReport {
                     outcome: ImageEditJobExecutionOutcome::Completed,
                     prompt: params.prompt,
                     image_urls,
-                    result_message_id: Some(result_message_id),
+                    result_message_id: Some(draw_message_id),
                     error: None,
                 },
-                Err(error) => {
-                    cleanup_image_placeholders(effects, params.chat_id, &placeholders).await;
-                    ImageEditJobExecutionReport {
-                        outcome: ImageEditJobExecutionOutcome::Failed,
-                        prompt: params.prompt,
-                        image_urls,
-                        result_message_id: None,
-                        error: Some(format!("send generated image: {error}")),
-                    }
-                }
+                Err(error) => ImageEditJobExecutionReport {
+                    outcome: ImageEditJobExecutionOutcome::Failed,
+                    prompt: params.prompt,
+                    image_urls,
+                    result_message_id: Some(draw_message_id),
+                    error: Some(format!("publish draw gallery: {error}")),
+                },
             }
         }
         Err(ImageEditError::Forbidden) => {
-            cleanup_image_placeholders(effects, params.chat_id, &placeholders).await;
-            effects
-                .send_nsfw_blocked_message(
+            let _ = effects
+                .edit_draw_message(
                     params.chat_id,
-                    params.message_id,
-                    params.user_id,
-                    params.thread_id,
+                    draw_message_id,
+                    crate::rich::compose_draw_notice(NSFW_BLOCKED_MESSAGE_TEXT),
                 )
                 .await;
             ImageEditJobExecutionReport {
                 outcome: ImageEditJobExecutionOutcome::SafetyBlocked,
                 prompt: params.prompt,
                 image_urls: Vec::new(),
-                result_message_id: None,
+                result_message_id: Some(draw_message_id),
                 error: None,
             }
         }
         Err(error) => {
-            cleanup_image_placeholders(effects, params.chat_id, &placeholders).await;
+            let _ = effects
+                .edit_draw_message(
+                    params.chat_id,
+                    draw_message_id,
+                    crate::rich::compose_draw_notice(DRAW_FAILED_NOTICE_TEXT),
+                )
+                .await;
             ImageEditJobExecutionReport {
                 outcome: ImageEditJobExecutionOutcome::Failed,
                 prompt: params.prompt,
                 image_urls: Vec::new(),
-                result_message_id: None,
+                result_message_id: Some(draw_message_id),
                 error: Some(error.message()),
             }
         }
     }
+}
+
+/// Build photo sources for an edit result, preferring inline bytes then remote URLs.
+fn image_edit_photo_sources(image_bytes: &[Vec<u8>], image_urls: &[String]) -> Vec<PhotoSource> {
+    let single = image_bytes.len() == 1 && image_urls.is_empty();
+    let mut photos = Vec::with_capacity(image_bytes.len() + image_urls.len());
+    for (index, bytes) in image_bytes.iter().enumerate() {
+        photos.push(PhotoSource::Bytes {
+            file_name: if single {
+                "image.png".to_owned()
+            } else {
+                format!("image-{}.png", index + 1)
+            },
+            bytes: bytes.clone(),
+        });
+    }
+    photos.extend(image_urls.iter().cloned().map(PhotoSource::Url));
+    photos
 }
 
 /// Dequeue and process one image-generation job from a queue.
@@ -2924,61 +2477,6 @@ fn trace_image_edit_queue_tick(tick: &ImageEditQueuePollReport) {
 }
 
 #[must_use]
-pub fn drawing_sticker_message_request(
-    chat_id: i64,
-    message_id: i32,
-    _user_id: i64,
-    thread_id: Option<i32>,
-) -> (StickerMessageRequest, ReplyMessageRef) {
-    (
-        StickerMessageRequest {
-            chat: None,
-            message_thread_id: 0,
-            disable_notification: true,
-            file_id: STICKER_DRAW_FILE_ID.to_owned(),
-        },
-        ReplyMessageRef {
-            message_id: i64::from(message_id),
-            chat: ChatRef {
-                id: chat_id,
-                is_forum: false,
-            },
-            is_topic_message: false,
-            message_thread_id: i64::from(thread_id.unwrap_or_default()),
-        },
-    )
-}
-
-fn image_job_response_message_id(response: &TelegramOutboundResponse) -> Option<i32> {
-    match response {
-        TelegramOutboundResponse::Message(message) => i32::try_from(message.id).ok(),
-        TelegramOutboundResponse::Messages(messages) => messages
-            .first()
-            .and_then(|message| i32::try_from(message.id).ok()),
-        TelegramOutboundResponse::EditMessage(_)
-        | TelegramOutboundResponse::Boolean(_)
-        | TelegramOutboundResponse::SentGuestMessage(_)
-        | TelegramOutboundResponse::String(_) => None,
-    }
-}
-
-fn image_job_response_message_ids(response: &TelegramOutboundResponse) -> Vec<i32> {
-    match response {
-        TelegramOutboundResponse::Message(message) => {
-            i32::try_from(message.id).ok().into_iter().collect()
-        }
-        TelegramOutboundResponse::Messages(messages) => messages
-            .iter()
-            .filter_map(|message| i32::try_from(message.id).ok())
-            .collect(),
-        TelegramOutboundResponse::EditMessage(_)
-        | TelegramOutboundResponse::Boolean(_)
-        | TelegramOutboundResponse::SentGuestMessage(_)
-        | TelegramOutboundResponse::String(_) => Vec::new(),
-    }
-}
-
-#[must_use]
 pub fn build_image_generation_caption(
     prompt: &str,
     author: &str,
@@ -3596,7 +3094,7 @@ mod tests {
     #[tokio::test]
     async fn execute_image_gen_job_matches_go_sanitize_prompt_caption_and_effect_order() {
         let generator = GeneratorStub::success(" https://img.test/1.png ");
-        let effects = EffectsStub::new(Some(777));
+        let effects = EffectsStub::new();
         let report = execute_image_gen_job(
             &generator,
             &effects,
@@ -3644,15 +3142,13 @@ mod tests {
             }]
         );
         let calls = effects.calls();
+        assert_eq!(calls.len(), 4);
         assert_eq!(calls[0], "remove_queued:-100:20");
-        assert_eq!(calls[1], "send_drawing:-100:20:30:9");
-        assert!(
-            calls[2].starts_with("send_placeholders:-100:20:9:1:<code>original caption</code>")
-        );
-        assert_eq!(calls[3], "remove_drawing:-100:777");
-        assert!(calls[4].starts_with(
-            "replace_placeholder:-100:888:9:Url(\"https://img.test/1.png\"):<code>original caption</code>"
-        ));
+        assert_eq!(calls[1], "placeholder:-100:20:9:<p>✨ <i>рисую…</i></p>");
+        assert_eq!(calls[2], "publish:[Url(\"https://img.test/1.png\")]");
+        assert!(calls[3].starts_with("edit:-100:888:"));
+        assert!(calls[3].contains("<img src=\"https://img.test/1.png\"/>"));
+        assert!(calls[3].contains("original caption"));
     }
 
     #[tokio::test]
@@ -3662,7 +3158,7 @@ mod tests {
             "https://img.test/2.png".to_owned(),
         ])
         .with_expected_image_count(2);
-        let effects = EffectsStub::new(Some(777)).with_placeholder_ids(vec![888, 889]);
+        let effects = EffectsStub::new();
         let report = execute_image_gen_job(
             &generator,
             &effects,
@@ -3682,19 +3178,17 @@ mod tests {
         assert_eq!(report.outcome, ImageGenJobExecutionOutcome::Completed);
         assert_eq!(report.result_message_id, Some(888));
         let calls = effects.calls();
+        assert_eq!(calls.len(), 4);
         assert_eq!(calls[0], "remove_queued:-100:20");
-        assert_eq!(calls[1], "send_drawing:-100:20:30:9");
-        assert!(
-            calls[2].starts_with("send_placeholders:-100:20:9:2:<code>original caption</code>")
-        );
-        assert_eq!(calls[3], "remove_drawing:-100:777");
-        assert!(calls[4].starts_with(
-            "replace_placeholder:-100:888:9:Url(\"https://img.test/1.png\"):<code>original caption</code>"
-        ));
+        assert_eq!(calls[1], "placeholder:-100:20:9:<p>✨ <i>рисую…</i></p>");
         assert_eq!(
-            calls[5],
-            "replace_placeholder:-100:889:9:Url(\"https://img.test/2.png\"):"
+            calls[2],
+            "publish:[Url(\"https://img.test/1.png\"), Url(\"https://img.test/2.png\")]"
         );
+        assert!(calls[3].starts_with("edit:-100:888:<tg-slideshow>"));
+        assert!(calls[3].contains("<img src=\"https://img.test/1.png\"/>"));
+        assert!(calls[3].contains("<img src=\"https://img.test/2.png\"/>"));
+        assert!(calls[3].contains("original caption"));
     }
 
     #[test]
@@ -3722,7 +3216,7 @@ mod tests {
             "https://img.test/vip-2.png".to_owned(),
         ])
         .with_expected_image_count(2);
-        let effects = EffectsStub::new(Some(777)).with_placeholder_ids(vec![901, 902]);
+        let effects = EffectsStub::new();
         let report = execute_image_gen_job(
             &generator,
             &effects,
@@ -3739,25 +3233,25 @@ mod tests {
         .await;
 
         assert_eq!(report.outcome, ImageGenJobExecutionOutcome::Completed);
-        assert_eq!(report.result_message_id, Some(901));
+        assert_eq!(report.result_message_id, Some(888));
         let calls = effects.calls();
+        assert_eq!(calls.len(), 4);
         assert_eq!(calls[0], "remove_queued:-100:20");
-        assert_eq!(calls[1], "send_drawing:-100:20:30:9");
-        assert!(calls[2].starts_with("send_placeholders:-100:20:9:2:<code>castle</code>"));
-        assert_eq!(calls[3], "remove_drawing:-100:777");
-        assert!(calls[4].starts_with(
-            "replace_placeholder:-100:901:9:Url(\"https://img.test/vip-1.png\"):<code>castle</code>"
-        ));
+        assert_eq!(calls[1], "placeholder:-100:20:9:<p>✨ <i>рисую…</i></p>");
         assert_eq!(
-            calls[5],
-            "replace_placeholder:-100:902:9:Url(\"https://img.test/vip-2.png\"):"
+            calls[2],
+            "publish:[Url(\"https://img.test/vip-1.png\"), Url(\"https://img.test/vip-2.png\")]"
         );
+        assert!(calls[3].starts_with("edit:-100:888:<tg-slideshow>"));
+        assert!(calls[3].contains("<img src=\"https://img.test/vip-1.png\"/>"));
+        assert!(calls[3].contains("<img src=\"https://img.test/vip-2.png\"/>"));
+        assert!(calls[3].contains("castle"));
     }
 
     #[tokio::test]
     async fn execute_image_gen_job_uses_meta_prompt_and_completes_safety_blocks() {
         let generator = GeneratorStub::forbidden();
-        let effects = EffectsStub::new(None);
+        let effects = EffectsStub::new();
         let report = execute_image_gen_job(
             &generator,
             &effects,
@@ -3779,14 +3273,11 @@ mod tests {
         assert_eq!(report.caption_text, "рыжий\n\nкот");
         assert_eq!(report.error, None);
         let calls = effects.calls();
+        assert_eq!(calls.len(), 3);
         assert_eq!(calls[0], "remove_queued:-100:20");
-        assert_eq!(calls[1], "send_drawing:-100:20:30:0");
-        assert!(calls[2].starts_with("send_placeholders:-100:20:0:1:<code>рыжий\n\nкот</code>"));
-        assert_eq!(calls[3], "delete_placeholder:-100:888");
-        assert_eq!(
-            calls[4],
-            "send_nsfw_blocked:-100:20:30:0:Ваш запрос заблокирован, так как содержит неприемлемый контент. Попробуйте переформулировать запрос."
-        );
+        assert_eq!(calls[1], "placeholder:-100:20:0:<p>✨ <i>рисую…</i></p>");
+        assert!(calls[2].starts_with("edit:-100:888:"));
+        assert!(calls[2].contains(NSFW_BLOCKED_MESSAGE_TEXT));
     }
 
     #[tokio::test]
@@ -3796,7 +3287,7 @@ mod tests {
             String::new(),
             "https://img.test/edit-2.png".to_owned(),
         ]);
-        let effects = EffectsStub::new(Some(777));
+        let effects = EffectsStub::new();
         let report = execute_image_edit_job(
             &editor,
             &effects,
@@ -3837,22 +3328,23 @@ mod tests {
             }]
         );
         let calls = effects.calls();
-        assert_eq!(calls.len(), 5);
+        assert_eq!(calls.len(), 4);
         assert_eq!(calls[0], "remove_queued:-100:20");
-        assert_eq!(calls[1], "send_drawing:-100:20:30:9");
-        assert!(calls[2].starts_with(
-            "send_placeholders:-100:20:9:1:<code>make it night</code> \nза авторством <i><a href=\"https://t.me/PlotvoBot?start=vip\">VIP-персоны  👑</a> Alice</i>\n<a href=\"https://t.me/PlotvoBot?start=donate\">"
-        ));
-        assert_eq!(calls[3], "remove_drawing:-100:777");
-        assert!(calls[4].starts_with(
-            "replace_placeholder:-100:888:9:Url(\"https://img.test/edit-1.png\"):<code>make it night</code> \nза авторством <i><a href=\"https://t.me/PlotvoBot?start=vip\">VIP-персоны  👑</a> Alice</i>\n<a href=\"https://t.me/PlotvoBot?start=donate\">"
-        ));
+        assert_eq!(calls[1], "placeholder:-100:20:9:<p>✨ <i>рисую…</i></p>");
+        assert_eq!(
+            calls[2],
+            "publish:[Url(\"https://img.test/edit-1.png\"), Url(\"https://img.test/edit-2.png\")]"
+        );
+        assert!(calls[3].starts_with("edit:-100:888:<tg-slideshow>"));
+        assert!(calls[3].contains("<img src=\"https://img.test/edit-1.png\"/>"));
+        assert!(calls[3].contains("<img src=\"https://img.test/edit-2.png\"/>"));
+        assert!(calls[3].contains("make it night"));
     }
 
     #[tokio::test]
     async fn execute_image_edit_job_completes_safety_blocks() {
         let editor = EditorStub::forbidden();
-        let effects = EffectsStub::new(None);
+        let effects = EffectsStub::new();
         let report = execute_image_edit_job(
             &editor,
             &effects,
@@ -3871,23 +3363,17 @@ mod tests {
         assert!(report.image_urls.is_empty());
         assert_eq!(report.error, None);
         let calls = effects.calls();
-        assert_eq!(calls.len(), 5);
+        assert_eq!(calls.len(), 3);
         assert_eq!(calls[0], "remove_queued:-100:20");
-        assert_eq!(calls[1], "send_drawing:-100:20:30:0");
-        assert!(calls[2].starts_with(
-            "send_placeholders:-100:20:0:1:<code>edit</code> \nза авторством <i><a href=\"https://t.me/PlotvoBot?start=vip\">VIP-персоны  👑</a> </i>\n<a href=\"https://t.me/PlotvoBot?start=donate\">"
-        ));
-        assert_eq!(calls[3], "delete_placeholder:-100:888");
-        assert_eq!(
-            calls[4],
-            "send_nsfw_blocked:-100:20:30:0:Ваш запрос заблокирован, так как содержит неприемлемый контент. Попробуйте переформулировать запрос."
-        );
+        assert_eq!(calls[1], "placeholder:-100:20:0:<p>✨ <i>рисую…</i></p>");
+        assert!(calls[2].starts_with("edit:-100:888:"));
+        assert!(calls[2].contains(NSFW_BLOCKED_MESSAGE_TEXT));
     }
 
     #[tokio::test]
-    async fn execute_image_edit_job_deletes_placeholder_when_provider_fails() {
+    async fn execute_image_edit_job_edits_failure_notice_when_provider_fails() {
         let editor = EditorStub::error("draw api failed");
-        let effects = EffectsStub::new(Some(777));
+        let effects = EffectsStub::new();
         let report = execute_image_edit_job(
             &editor,
             &effects,
@@ -3907,14 +3393,11 @@ mod tests {
         assert_eq!(report.prompt, "make it night");
         assert_eq!(report.error, Some("draw api failed".to_owned()));
         let calls = effects.calls();
-        assert_eq!(calls.len(), 5);
+        assert_eq!(calls.len(), 3);
         assert_eq!(calls[0], "remove_queued:-100:20");
-        assert_eq!(calls[1], "send_drawing:-100:20:30:9");
-        assert!(calls[2].starts_with(
-            "send_placeholders:-100:20:9:1:<code>make it night</code> \nза авторством <i><a href=\"https://t.me/PlotvoBot?start=vip\">VIP-персоны  👑</a> Alice</i>\n<a href=\"https://t.me/PlotvoBot?start=donate\">"
-        ));
-        assert_eq!(calls[3], "remove_drawing:-100:777");
-        assert_eq!(calls[4], "delete_placeholder:-100:888");
+        assert_eq!(calls[1], "placeholder:-100:20:9:<p>✨ <i>рисую…</i></p>");
+        assert!(calls[2].starts_with("edit:-100:888:"));
+        assert!(calls[2].contains(DRAW_FAILED_NOTICE_TEXT));
     }
 
     #[tokio::test]
@@ -4199,7 +3682,7 @@ mod tests {
         let report = run_regular_image_gen_queue_once(
             &queue,
             &GeneratorStub::success("https://img.test/1.png"),
-            &EffectsStub::new(Some(777)),
+            &EffectsStub::new(),
             "image-worker-1",
             now,
         )
@@ -4251,7 +3734,7 @@ mod tests {
         let report = run_regular_image_gen_queue_once(
             &queue,
             &GeneratorStub::error("aifarm provider provider_unavailable: status 503"),
-            &EffectsStub::new(Some(777)),
+            &EffectsStub::new(),
             "image-worker-1",
             now,
         )
@@ -4314,7 +3797,7 @@ mod tests {
             &queue,
             IMAGE_VIP_QUEUE_NAME,
             &EditorStub::success(vec!["https://img.test/edit.png".to_owned()]),
-            &EffectsStub::new(Some(777)),
+            &EffectsStub::new(),
             "image-edit-worker-1",
             now,
         )
@@ -4370,7 +3853,7 @@ mod tests {
             &queue,
             IMAGE_VIP_QUEUE_NAME,
             &EditorStub::error("aifarm provider provider_unavailable: status 503"),
-            &EffectsStub::new(Some(777)),
+            &EffectsStub::new(),
             "image-edit-worker-1",
             now,
         )
@@ -4441,7 +3924,7 @@ mod tests {
             &gen_queue,
             IMAGE_REGULAR_QUEUE_NAME,
             &GeneratorStub::error("aifarm provider provider_unavailable: status 503"),
-            &EffectsStub::new(Some(777)),
+            &EffectsStub::new(),
             "image-worker-1",
             2,
             now,
@@ -4491,7 +3974,7 @@ mod tests {
             &edit_queue,
             IMAGE_VIP_QUEUE_NAME,
             &EditorStub::error("aifarm provider provider_unavailable: status 503"),
-            &EffectsStub::new(Some(777)),
+            &EffectsStub::new(),
             "image-edit-worker-1",
             2,
             now,
@@ -4556,7 +4039,7 @@ mod tests {
             &queue,
             IMAGE_VIP_QUEUE_NAME,
             &EditorStub::success(vec!["ignored".to_owned()]),
-            &EffectsStub::new(None),
+            &EffectsStub::new(),
             "image-edit-worker-1",
             now,
         )
@@ -4565,7 +4048,7 @@ mod tests {
             &queue,
             IMAGE_VIP_QUEUE_NAME,
             &EditorStub::error("provider down"),
-            &EffectsStub::new(None),
+            &EffectsStub::new(),
             "image-edit-worker-1",
             now,
         )
@@ -4644,7 +4127,7 @@ mod tests {
             &queue,
             IMAGE_VIP_QUEUE_NAME,
             &GeneratorStub::success("ignored"),
-            &EffectsStub::new(None),
+            &EffectsStub::new(),
             "image-worker-1",
             now,
         )
@@ -4653,7 +4136,7 @@ mod tests {
             &queue,
             IMAGE_VIP_QUEUE_NAME,
             &GeneratorStub::error("provider down"),
-            &EffectsStub::new(None),
+            &EffectsStub::new(),
             "image-worker-1",
             now,
         )
@@ -4697,7 +4180,7 @@ mod tests {
         let report = run_regular_image_gen_queue_once(
             &queue,
             &GeneratorStub::success("ignored"),
-            &EffectsStub::new(None),
+            &EffectsStub::new(),
             "image-worker-1",
             now,
         )
@@ -5009,7 +4492,7 @@ mod tests {
             },
             transport,
         );
-        let effects = EffectsStub::new(Some(777));
+        let effects = EffectsStub::new();
 
         let report = execute_image_edit_job(
             &editor,
@@ -5030,16 +4513,16 @@ mod tests {
         assert_eq!(report.outcome, ImageEditJobExecutionOutcome::Completed);
         assert_eq!(report.result_message_id, Some(888));
         let calls = effects.calls();
-        assert_eq!(calls.len(), 5);
+        assert_eq!(calls.len(), 4);
         assert_eq!(calls[0], "remove_queued:-100:20");
-        assert_eq!(calls[1], "send_drawing:-100:20:30:9");
-        assert!(calls[2].starts_with(
-            "send_placeholders:-100:20:9:1:<code>make it night</code> \nза авторством <i><a href=\"https://t.me/PlotvoBot?start=vip\">VIP-персоны  👑</a> Alice</i>\n<a href=\"https://t.me/PlotvoBot?start=donate\">"
-        ));
-        assert_eq!(calls[3], "remove_drawing:-100:777");
-        assert!(calls[4].starts_with(
-            "replace_placeholder:-100:888:9:Bytes { file_name: \"image.png\", bytes: [9, 8, 7] }:<code>make it night</code> \nза авторством <i><a href=\"https://t.me/PlotvoBot?start=vip\">VIP-персоны  👑</a> Alice</i>\n<a href=\"https://t.me/PlotvoBot?start=donate\">"
-        ));
+        assert_eq!(calls[1], "placeholder:-100:20:9:<p>✨ <i>рисую…</i></p>");
+        assert_eq!(
+            calls[2],
+            "publish:[Bytes { file_name: \"image.png\", bytes: [9, 8, 7] }]"
+        );
+        assert!(calls[3].starts_with("edit:-100:888:"));
+        assert!(calls[3].contains("<img src=\"https://up.test/image.png\"/>"));
+        assert!(calls[3].contains("make it night"));
     }
 
     #[tokio::test]
@@ -5101,153 +4584,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn drawing_sticker_request_matches_external_artifact_contract() {
-        let (request, reply) = drawing_sticker_message_request(-10042, 77, 30, Some(9));
-        let plan =
-            openplotva_telegram::build_sticker_message_plan(&request, Some(&reply)).expect("plan");
-
-        assert_eq!(plan.chat_id, -10042);
-        assert_eq!(plan.file_id, STICKER_DRAW_FILE_ID);
-        assert!(plan.disable_notification);
-        assert_eq!(
-            plan.message_thread_id, None,
-            "Image jobs construct a minimal reply message, so topic id is not copied here"
-        );
-        assert_eq!(
-            plan.reply_parameters,
-            Some(openplotva_telegram::ReplyParametersPlan {
-                message_id: 77,
-                chat_id: -10042,
-                allow_sending_without_reply: true,
-            })
-        );
-    }
-
-    #[tokio::test]
-    async fn telegram_image_job_effects_send_drawing_sticker_tracks_ephemeral_message() {
-        let queued = QueuedStickerStoreStub::default();
-        let ephemeral = EphemeralTrackerStub::default();
-        let telegram = TelegramSenderStub::new(vec![Ok(TelegramOutboundResponse::Message(
-            Box::new(telegram_message(-10042, 555)),
-        ))]);
-        let effects =
-            TelegramImageJobEffects::new(queued.clone(), ephemeral.clone(), telegram.clone());
-
-        let sticker_id = effects.send_drawing_sticker(-10042, 77, 30, Some(9)).await;
-
-        assert_eq!(sticker_id, Some(555));
-        assert_eq!(
-            telegram.kinds(),
-            vec![TelegramOutboundMethodKind::SendSticker]
-        );
-        assert_eq!(
-            ephemeral.tracked(),
-            vec![(-10042, 555, DRAWING_STICKER_DELETE_AFTER)]
-        );
-        assert!(queued.snapshot().loads.is_empty());
-    }
-
-    #[tokio::test]
-    async fn telegram_image_job_effects_send_generated_images_uses_media_group() {
-        let queued = QueuedStickerStoreStub::default();
-        let ephemeral = EphemeralTrackerStub::default();
-        let telegram = TelegramSenderStub::new(vec![Ok(TelegramOutboundResponse::Messages(vec![
-            telegram_message(-10042, 555),
-            telegram_message(-10042, 556),
-        ]))]);
-        let effects =
-            TelegramImageJobEffects::new(queued.clone(), ephemeral.clone(), telegram.clone());
-
-        let result_message_id = effects
-            .send_generated_images(
-                -10042,
-                77,
-                Some(9),
-                "caption".to_owned(),
-                vec![
-                    PhotoSource::Url("https://img.test/1.png".to_owned()),
-                    PhotoSource::Url("https://img.test/2.png".to_owned()),
-                ],
-            )
-            .await;
-
-        assert_eq!(result_message_id, Ok(555));
-        assert_eq!(
-            telegram.kinds(),
-            vec![TelegramOutboundMethodKind::SendMediaGroup]
-        );
-        assert!(queued.snapshot().loads.is_empty());
-        assert!(ephemeral.tracked().is_empty());
-    }
-
-    #[tokio::test]
-    async fn telegram_image_job_effects_send_initial_placeholders_uses_media_group_for_multi_slot()
-    {
-        let queued = QueuedStickerStoreStub::default();
-        let ephemeral = EphemeralTrackerStub::default();
-        let telegram = TelegramSenderStub::new(vec![Ok(TelegramOutboundResponse::Messages(vec![
-            telegram_message(-10042, 555),
-            telegram_message(-10042, 556),
-        ]))]);
-        let effects =
-            TelegramImageJobEffects::new(queued.clone(), ephemeral.clone(), telegram.clone());
-
-        let result = effects
-            .send_initial_placeholders(
-                -10042,
-                77,
-                Some(9),
-                "<code>caption</code>".to_owned(),
-                true,
-                2,
-            )
-            .await;
-
-        assert_eq!(result, Ok(vec![555, 556]));
-        assert_eq!(
-            telegram.kinds(),
-            vec![TelegramOutboundMethodKind::SendMediaGroup]
-        );
-        assert!(queued.snapshot().loads.is_empty());
-        assert!(ephemeral.tracked().is_empty());
-    }
-
-    #[tokio::test]
-    async fn telegram_image_job_effects_replace_placeholder_uses_edit_media() {
-        let queued = QueuedStickerStoreStub::default();
-        let ephemeral = EphemeralTrackerStub::default();
-        let telegram = TelegramSenderStub::new(vec![Ok(TelegramOutboundResponse::Boolean(true))]);
-        let effects =
-            TelegramImageJobEffects::new(queued.clone(), ephemeral.clone(), telegram.clone());
-
-        let result = effects
-            .replace_placeholder_image(
-                -10042,
-                555,
-                Some(9),
-                PhotoSource::Url("https://img.test/1.png".to_owned()),
-                "<code>caption</code>".to_owned(),
-                false,
-            )
-            .await;
-
-        assert_eq!(result, Ok(555));
-        assert_eq!(
-            telegram.kinds(),
-            vec![TelegramOutboundMethodKind::EditMessageMedia]
-        );
-        assert!(queued.snapshot().loads.is_empty());
-        assert!(ephemeral.tracked().is_empty());
-    }
-
     #[tokio::test]
     async fn telegram_image_job_effects_remove_queued_sticker_deletes_message_and_key() {
         let queued = QueuedStickerStoreStub::with_queued_id(Some(444));
-        let ephemeral = EphemeralTrackerStub::default();
         let telegram = TelegramSenderStub::new(vec![Ok(TelegramOutboundResponse::Boolean(true))]);
-        let effects =
-            TelegramImageJobEffects::new(queued.clone(), ephemeral.clone(), telegram.clone());
+        let effects = TelegramImageJobEffects::new(
+            queued.clone(),
+            telegram.clone(),
+            Arc::new(crate::rich::MockRichSender::default()),
+        );
 
         effects.remove_queued_sticker(-10042, 77).await;
 
@@ -5258,7 +4603,6 @@ mod tests {
             telegram.kinds(),
             vec![TelegramOutboundMethodKind::DeleteMessage]
         );
-        assert!(ephemeral.tracked().is_empty());
     }
 
     #[tokio::test]
@@ -5267,8 +4611,8 @@ mod tests {
         let telegram = TelegramSenderStub::new(Vec::new());
         let effects = TelegramImageJobEffects::new(
             queued.clone(),
-            EphemeralTrackerStub::default(),
             telegram.clone(),
+            Arc::new(crate::rich::MockRichSender::default()),
         );
 
         effects.remove_queued_sticker(-10042, 77).await;
@@ -5285,8 +4629,8 @@ mod tests {
         let telegram = TelegramSenderStub::new(Vec::new());
         let effects = TelegramImageJobEffects::new(
             queued.clone(),
-            EphemeralTrackerStub::default(),
             telegram.clone(),
+            Arc::new(crate::rich::MockRichSender::default()),
         );
 
         effects.remove_queued_sticker(-10042, 77).await;
@@ -5298,25 +4642,86 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn telegram_image_job_effects_send_nsfw_blocked_message_sends_reply() {
+    async fn telegram_image_job_effects_send_draw_placeholder_routes_through_rich() {
         let queued = QueuedStickerStoreStub::default();
-        let ephemeral = EphemeralTrackerStub::default();
-        let telegram = TelegramSenderStub::new(vec![Ok(TelegramOutboundResponse::Message(
-            Box::new(telegram_message(-10042, 556)),
-        ))]);
-        let effects =
-            TelegramImageJobEffects::new(queued.clone(), ephemeral.clone(), telegram.clone());
+        let telegram = TelegramSenderStub::new(Vec::new());
+        let rich = Arc::new(crate::rich::MockRichSender::default());
+        let effects = TelegramImageJobEffects::new(queued.clone(), telegram.clone(), rich.clone());
+
+        let id = effects
+            .send_draw_placeholder(-10042, 77, Some(9), "<p>draw</p>".to_owned())
+            .await
+            .expect("placeholder id");
+
+        assert_eq!(id, 1001);
+        let sent = rich.sent.lock().expect("sent");
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].chat_id, -10042);
+        assert_eq!(sent[0].reply_to_message_id, Some(77));
+        assert_eq!(sent[0].message_thread_id, Some(9));
+        assert!(sent[0].allow_sending_without_reply);
+        assert_eq!(sent[0].html, "<p>draw</p>");
+        assert!(telegram.kinds().is_empty());
+    }
+
+    #[tokio::test]
+    async fn telegram_image_job_effects_edit_draw_message_routes_through_rich() {
+        let queued = QueuedStickerStoreStub::default();
+        let telegram = TelegramSenderStub::new(Vec::new());
+        let rich = Arc::new(crate::rich::MockRichSender::default());
+        let effects = TelegramImageJobEffects::new(queued.clone(), telegram.clone(), rich.clone());
 
         effects
-            .send_nsfw_blocked_message(-10042, 77, 30, Some(9))
-            .await;
+            .edit_draw_message(-10042, 1001, "<img src=\"https://h/a.png\"/>".to_owned())
+            .await
+            .expect("edit");
 
         assert_eq!(
-            telegram.kinds(),
-            vec![TelegramOutboundMethodKind::SendMessage]
+            rich.edited.lock().expect("edited").as_slice(),
+            &[(-10042, 1001, "<img src=\"https://h/a.png\"/>".to_owned())]
         );
-        assert!(queued.snapshot().loads.is_empty());
-        assert!(ephemeral.tracked().is_empty());
+        assert!(telegram.kinds().is_empty());
+    }
+
+    #[tokio::test]
+    async fn telegram_image_job_effects_publish_draw_images_uploads_bytes_and_urls() {
+        let queued = QueuedStickerStoreStub::default();
+        let telegram = TelegramSenderStub::new(Vec::new());
+        let rich = Arc::new(crate::rich::MockRichSender::default());
+        let effects = TelegramImageJobEffects::new(queued.clone(), telegram.clone(), rich);
+
+        let urls = effects
+            .publish_draw_images(vec![
+                PhotoSource::Bytes {
+                    file_name: "image.png".to_owned(),
+                    bytes: vec![1, 2, 3],
+                },
+                PhotoSource::Url("https://img.test/a.png".to_owned()),
+            ])
+            .await
+            .expect("urls");
+
+        assert_eq!(
+            urls,
+            vec![
+                "https://plotva.geta.moe/media/mock.bin".to_owned(),
+                "https://img.test/a.png".to_owned(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn telegram_image_job_effects_publish_draw_images_rejects_file_id() {
+        let queued = QueuedStickerStoreStub::default();
+        let telegram = TelegramSenderStub::new(Vec::new());
+        let rich = Arc::new(crate::rich::MockRichSender::default());
+        let effects = TelegramImageJobEffects::new(queued.clone(), telegram.clone(), rich);
+
+        let result = effects
+            .publish_draw_images(vec![PhotoSource::FileId("file-1".to_owned())])
+            .await;
+
+        assert!(result.is_err());
     }
 
     #[derive(Clone, Debug)]
@@ -5465,38 +4870,6 @@ mod tests {
         }
     }
 
-    #[derive(Clone, Debug, Default)]
-    struct EphemeralTrackerStub {
-        tracked: Arc<Mutex<Vec<(i64, i32, StdDuration)>>>,
-    }
-
-    impl EphemeralTrackerStub {
-        fn tracked(&self) -> Vec<(i64, i32, StdDuration)> {
-            self.tracked.lock().expect("ephemeral state").clone()
-        }
-    }
-
-    impl crate::virtual_messages::EphemeralMessageTracker for EphemeralTrackerStub {
-        type Error = StubError;
-
-        fn track_ephemeral_message<'a>(
-            &'a self,
-            chat_id: i64,
-            message_id: i32,
-            delete_after: StdDuration,
-            _now: OffsetDateTime,
-        ) -> ImageJobEffectFuture<'a, Result<(), Self::Error>> {
-            Box::pin(async move {
-                self.tracked.lock().expect("ephemeral state").push((
-                    chat_id,
-                    message_id,
-                    delete_after,
-                ));
-                Ok(())
-            })
-        }
-    }
-
     #[derive(Clone, Debug)]
     struct TelegramSenderStub {
         state: Arc<Mutex<TelegramSenderState>>,
@@ -5537,24 +4910,6 @@ mod tests {
                     .unwrap_or(Ok(TelegramOutboundResponse::Boolean(true)))
             })
         }
-    }
-
-    fn telegram_message(chat_id: i64, message_id: i64) -> carapax::types::Message {
-        serde_json::from_value(json!({
-            "message_id": message_id,
-            "date": 0,
-            "chat": {
-                "type": "private",
-                "id": chat_id,
-                "first_name": "Plotva",
-            },
-            "from": {
-                "id": 1,
-                "is_bot": true,
-                "first_name": "Plotva",
-            },
-        }))
-        .expect("telegram message")
     }
 
     #[tokio::test]
@@ -5827,25 +5182,14 @@ mod tests {
         }
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, Default)]
     struct EffectsStub {
-        drawing_sticker: Option<i32>,
         calls: Mutex<Vec<String>>,
-        placeholder_ids: Vec<i32>,
     }
 
     impl EffectsStub {
-        fn new(drawing_sticker: Option<i32>) -> Self {
-            Self {
-                drawing_sticker,
-                calls: Mutex::new(Vec::new()),
-                placeholder_ids: vec![888],
-            }
-        }
-
-        fn with_placeholder_ids(mut self, placeholder_ids: Vec<i32>) -> Self {
-            self.placeholder_ids = placeholder_ids;
-            self
+        fn new() -> Self {
+            Self::default()
         }
 
         fn calls(&self) -> Vec<String> {
@@ -5868,120 +5212,48 @@ mod tests {
             Box::pin(async {})
         }
 
-        fn send_drawing_sticker<'a>(
+        fn send_draw_placeholder<'a>(
             &'a self,
             chat_id: i64,
             message_id: i32,
-            user_id: i64,
             thread_id: Option<i32>,
-        ) -> ImageJobEffectFuture<'a, Option<i32>> {
+            html: String,
+        ) -> ImageJobEffectFuture<'a, Result<i32, String>> {
             self.call_log().push(format!(
-                "send_drawing:{chat_id}:{message_id}:{user_id}:{}",
+                "placeholder:{chat_id}:{message_id}:{}:{html}",
                 thread_id.unwrap_or_default()
             ));
-            Box::pin(async move { self.drawing_sticker })
+            Box::pin(async { Ok(888) })
         }
 
-        fn remove_drawing_sticker<'a>(
+        fn edit_draw_message<'a>(
             &'a self,
             chat_id: i64,
-            sticker_message_id: i32,
-        ) -> ImageJobEffectFuture<'a, ()> {
+            draw_message_id: i32,
+            html: String,
+        ) -> ImageJobEffectFuture<'a, Result<(), String>> {
             self.call_log()
-                .push(format!("remove_drawing:{chat_id}:{sticker_message_id}"));
-            Box::pin(async {})
+                .push(format!("edit:{chat_id}:{draw_message_id}:{html}"));
+            Box::pin(async { Ok(()) })
         }
 
-        fn send_initial_placeholders<'a>(
+        fn publish_draw_images<'a>(
             &'a self,
-            chat_id: i64,
-            message_id: i32,
-            thread_id: Option<i32>,
-            caption_text: String,
-            _is_nsfw: bool,
-            count: usize,
-        ) -> ImageJobEffectFuture<'a, Result<Vec<i32>, String>> {
-            self.call_log().push(format!(
-                "send_placeholders:{chat_id}:{message_id}:{}:{count}:{caption_text}",
-                thread_id.unwrap_or_default()
-            ));
-            let placeholder_ids = self
-                .placeholder_ids
-                .iter()
-                .copied()
-                .take(count)
-                .collect::<Vec<_>>();
-            Box::pin(async move { Ok(placeholder_ids) })
-        }
-
-        fn replace_placeholder_image<'a>(
-            &'a self,
-            chat_id: i64,
-            placeholder_message_id: i32,
-            thread_id: Option<i32>,
-            photo: PhotoSource,
-            caption_text: String,
-            _is_nsfw: bool,
-        ) -> ImageJobEffectFuture<'a, Result<i32, String>> {
-            self.call_log().push(format!(
-                "replace_placeholder:{chat_id}:{placeholder_message_id}:{}:{photo:?}:{caption_text}",
-                thread_id.unwrap_or_default()
-            ));
-            Box::pin(async move { Ok(placeholder_message_id) })
-        }
-
-        fn delete_placeholder_image<'a>(
-            &'a self,
-            chat_id: i64,
-            placeholder_message_id: i32,
-        ) -> ImageJobEffectFuture<'a, ()> {
-            self.call_log().push(format!(
-                "delete_placeholder:{chat_id}:{placeholder_message_id}"
-            ));
-            Box::pin(async {})
-        }
-
-        fn send_generated_image<'a>(
-            &'a self,
-            chat_id: i64,
-            message_id: i32,
-            thread_id: Option<i32>,
-            photo: PhotoSource,
-        ) -> ImageJobEffectFuture<'a, Result<i32, String>> {
-            self.call_log().push(format!(
-                "send_image:{chat_id}:{message_id}:{}:{photo:?}",
-                thread_id.unwrap_or_default()
-            ));
-            Box::pin(async { Ok(888) })
-        }
-
-        fn send_generated_images<'a>(
-            &'a self,
-            chat_id: i64,
-            message_id: i32,
-            thread_id: Option<i32>,
-            caption_text: String,
             photos: Vec<PhotoSource>,
-        ) -> ImageJobEffectFuture<'a, Result<i32, String>> {
-            self.call_log().push(format!(
-                "send_images:{chat_id}:{message_id}:{}:{caption_text}:{photos:?}",
-                thread_id.unwrap_or_default()
-            ));
-            Box::pin(async { Ok(888) })
-        }
-
-        fn send_nsfw_blocked_message<'a>(
-            &'a self,
-            chat_id: i64,
-            message_id: i32,
-            user_id: i64,
-            thread_id: Option<i32>,
-        ) -> ImageJobEffectFuture<'a, ()> {
-            self.call_log().push(format!(
-                "send_nsfw_blocked:{chat_id}:{message_id}:{user_id}:{}:{NSFW_BLOCKED_MESSAGE_TEXT}",
-                thread_id.unwrap_or_default()
-            ));
-            Box::pin(async {})
+        ) -> ImageJobEffectFuture<'a, Result<Vec<String>, String>> {
+            self.call_log().push(format!("publish:{photos:?}"));
+            let urls = photos
+                .iter()
+                .enumerate()
+                .map(|(index, photo)| match photo {
+                    PhotoSource::Url(url) => url.clone(),
+                    PhotoSource::Bytes { file_name, .. } => {
+                        format!("https://up.test/{file_name}")
+                    }
+                    PhotoSource::FileId(_) => format!("https://up.test/file-{index}.png"),
+                })
+                .collect::<Vec<_>>();
+            Box::pin(async move { Ok(urls) })
         }
     }
 }

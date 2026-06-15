@@ -408,6 +408,42 @@ pub fn compose_draw_progress(
     sanitize_rich_html(&html)
 }
 
+/// Russian count word for `n`, e.g. `plural_ru(2, "заказ", "заказа", "заказов") == "2 заказа"`.
+fn plural_ru(n: usize, one: &str, few: &str, many: &str) -> String {
+    let n100 = n % 100;
+    let n10 = n % 10;
+    let word = if (11..=14).contains(&n100) {
+        many
+    } else if n10 == 1 {
+        one
+    } else if (2..=4).contains(&n10) {
+        few
+    } else {
+        many
+    };
+    format!("{n} {word}")
+}
+
+/// Queue-wait state for the draw message: how many orders are still ahead.
+#[must_use]
+pub fn compose_draw_waiting(ahead: usize) -> String {
+    let html = if ahead == 0 {
+        "<p>⏳ <i>ваш черёд подходит…</i></p>".to_owned()
+    } else {
+        format!(
+            "<p>⏳ <i>в очереди: {} впереди</i></p>",
+            plural_ru(ahead, "заказ", "заказа", "заказов")
+        )
+    };
+    sanitize_rich_html(&html)
+}
+
+/// A plain notice for the draw message (safety block, failure), as one rich paragraph.
+#[must_use]
+pub fn compose_draw_notice(text: &str) -> String {
+    sanitize_rich_html(&format!("<p>{}</p>", esc_multiline(text)))
+}
+
 /// One leaderboard standing for [`compose_leaderboard`].
 #[derive(Clone, Debug)]
 pub struct LeaderboardRow {
@@ -534,6 +570,36 @@ mod tests {
         assert!(html.contains(r#"<img src="https://h/a.png"/>"#));
         let queue = compose_draw_progress("ожидаю очереди", 0, None, &[]);
         assert_eq!(queue, "<p>✨ <i>ожидаю очереди</i></p>");
+    }
+
+    #[test]
+    fn draw_waiting_counts_and_pluralizes() {
+        assert_eq!(
+            compose_draw_waiting(0),
+            "<p>⏳ <i>ваш черёд подходит…</i></p>"
+        );
+        assert_eq!(
+            compose_draw_waiting(1),
+            "<p>⏳ <i>в очереди: 1 заказ впереди</i></p>"
+        );
+        assert_eq!(
+            compose_draw_waiting(2),
+            "<p>⏳ <i>в очереди: 2 заказа впереди</i></p>"
+        );
+        assert_eq!(
+            compose_draw_waiting(5),
+            "<p>⏳ <i>в очереди: 5 заказов впереди</i></p>"
+        );
+        assert_eq!(
+            compose_draw_waiting(11),
+            "<p>⏳ <i>в очереди: 11 заказов впереди</i></p>"
+        );
+    }
+
+    #[test]
+    fn draw_notice_escapes_and_breaks_lines() {
+        let html = compose_draw_notice("сбой <x>\nповтор");
+        assert_eq!(html, "<p>сбой &lt;x&gt;<br/>повтор</p>");
     }
 
     #[test]

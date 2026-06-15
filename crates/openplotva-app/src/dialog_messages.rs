@@ -4923,21 +4923,12 @@ mod tests {
             image_bytes: vec![b"png".to_vec()],
         });
         let image_queued = ImageQueuedStickerCapture::default();
-        let image_ephemeral = ImageEphemeralCapture::default();
-        let image_sender = ImageTelegramSenderCapture::new(vec![
-            Ok(TelegramOutboundResponse::Message(Box::new(
-                telegram_bot_message(-100, 869)?,
-            ))),
-            Ok(TelegramOutboundResponse::Message(Box::new(
-                telegram_bot_message(-100, 870)?,
-            ))),
-            Ok(TelegramOutboundResponse::Boolean(true)),
-            Ok(TelegramOutboundResponse::Boolean(true)),
-        ]);
+        let image_sender = ImageTelegramSenderCapture::new(Vec::new());
+        let image_rich = Arc::new(crate::rich::MockRichSender::default());
         let image_effects = crate::image_jobs::TelegramImageJobEffects::new(
             image_queued.clone(),
-            image_ephemeral.clone(),
             image_sender.clone(),
+            image_rich.clone(),
         );
         let worker_report = crate::image_jobs::run_image_gen_queue_once(
             &queue,
@@ -4976,35 +4967,34 @@ mod tests {
         );
         assert_eq!(image_queued.loads(), vec![(-100, 78)]);
         assert!(image_queued.deletes().is_empty());
-        assert_eq!(
-            image_ephemeral.tracked(),
-            vec![(-100, 869, crate::image_jobs::DRAWING_STICKER_DELETE_AFTER)]
+        assert!(image_sender.methods().is_empty());
+        let sent = image_rich.sent.lock().expect("rich sent");
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].chat_id, -100);
+        assert_eq!(sent[0].reply_to_message_id, Some(78));
+        assert_eq!(sent[0].html, "<p>✨ <i>рисую…</i></p>");
+        drop(sent);
+        let edited = image_rich.edited.lock().expect("rich edited");
+        assert_eq!(edited.len(), 1);
+        assert_eq!(edited[0].0, -100);
+        assert_eq!(edited[0].1, 1001);
+        assert!(edited[0].2.starts_with("<tg-slideshow>"));
+        assert!(
+            edited[0]
+                .2
+                .contains("<img src=\"https://img.test/neon-cat.png\"/>")
         );
-        let image_methods = image_sender.methods();
-        assert_eq!(
-            image_methods
-                .iter()
-                .map(|(kind, _)| *kind)
-                .collect::<Vec<_>>(),
-            vec![
-                TelegramOutboundMethodKind::SendSticker,
-                TelegramOutboundMethodKind::SendPhoto,
-                TelegramOutboundMethodKind::DeleteMessage,
-                TelegramOutboundMethodKind::EditMessageMedia,
-            ]
+        assert!(
+            edited[0]
+                .2
+                .contains("<img src=\"https://img.test/fallback.png\"/>")
         );
-        let sticker_debug = image_methods[0].1["debug"].as_str().expect("sticker debug");
-        assert!(sticker_debug.contains("-100"));
-        assert!(sticker_debug.contains(crate::image_jobs::STICKER_DRAW_FILE_ID));
-        assert!(sticker_debug.contains("disable_notification"));
-        assert!(sticker_debug.contains("reply_parameters"));
-        assert!(sticker_debug.contains("78"));
-        let placeholder_debug = image_methods[1].1["debug"]
-            .as_str()
-            .expect("placeholder debug");
-        assert!(placeholder_debug.contains("-100"));
-        assert_eq!(image_methods[2].1["chat_id"], json!(-100));
-        assert_eq!(image_methods[2].1["message_id"], json!(869));
+        assert!(
+            edited[0]
+                .2
+                .contains("<img src=\"https://plotva.geta.moe/media/mock.bin\"/>")
+        );
+        drop(edited);
         let records = queue.records();
         assert_eq!(records[0].status, JobStatus::Completed);
         assert_eq!(
@@ -7041,21 +7031,12 @@ mod tests {
             "https://img.test/edit-2.png".to_owned(),
         ]);
         let image_queued = ImageQueuedStickerCapture::default();
-        let image_ephemeral = ImageEphemeralCapture::default();
-        let image_sender = ImageTelegramSenderCapture::new(vec![
-            Ok(TelegramOutboundResponse::Message(Box::new(
-                telegram_bot_message(42, 879)?,
-            ))),
-            Ok(TelegramOutboundResponse::Message(Box::new(
-                telegram_bot_message(42, 880)?,
-            ))),
-            Ok(TelegramOutboundResponse::Boolean(true)),
-            Ok(TelegramOutboundResponse::Boolean(true)),
-        ]);
+        let image_sender = ImageTelegramSenderCapture::new(Vec::new());
+        let image_rich = Arc::new(crate::rich::MockRichSender::default());
         let image_effects = crate::image_jobs::TelegramImageJobEffects::new(
             image_queued.clone(),
-            image_ephemeral.clone(),
             image_sender.clone(),
+            image_rich.clone(),
         );
         let worker_report = crate::image_jobs::run_image_edit_queue_once(
             &queue,
@@ -7090,35 +7071,29 @@ mod tests {
         );
         assert_eq!(image_queued.loads(), vec![(42, 77)]);
         assert!(image_queued.deletes().is_empty());
-        assert_eq!(
-            image_ephemeral.tracked(),
-            vec![(42, 879, crate::image_jobs::DRAWING_STICKER_DELETE_AFTER)]
+        assert!(image_sender.methods().is_empty());
+        let sent = image_rich.sent.lock().expect("rich sent");
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].chat_id, 42);
+        assert_eq!(sent[0].reply_to_message_id, Some(77));
+        assert_eq!(sent[0].html, "<p>✨ <i>рисую…</i></p>");
+        drop(sent);
+        let edited = image_rich.edited.lock().expect("rich edited");
+        assert_eq!(edited.len(), 1);
+        assert_eq!(edited[0].0, 42);
+        assert_eq!(edited[0].1, 1001);
+        assert!(edited[0].2.starts_with("<tg-slideshow>"));
+        assert!(
+            edited[0]
+                .2
+                .contains("<img src=\"https://img.test/edit-1.png\"/>")
         );
-        let image_methods = image_sender.methods();
-        assert_eq!(
-            image_methods
-                .iter()
-                .map(|(kind, _)| *kind)
-                .collect::<Vec<_>>(),
-            vec![
-                TelegramOutboundMethodKind::SendSticker,
-                TelegramOutboundMethodKind::SendPhoto,
-                TelegramOutboundMethodKind::DeleteMessage,
-                TelegramOutboundMethodKind::EditMessageMedia,
-            ]
+        assert!(
+            edited[0]
+                .2
+                .contains("<img src=\"https://img.test/edit-2.png\"/>")
         );
-        let sticker_debug = image_methods[0].1["debug"].as_str().expect("sticker debug");
-        assert!(sticker_debug.contains("42"));
-        assert!(sticker_debug.contains(crate::image_jobs::STICKER_DRAW_FILE_ID));
-        assert!(sticker_debug.contains("disable_notification"));
-        assert!(sticker_debug.contains("reply_parameters"));
-        assert!(sticker_debug.contains("77"));
-        let placeholder_debug = image_methods[1].1["debug"]
-            .as_str()
-            .expect("placeholder debug");
-        assert!(placeholder_debug.contains("42"));
-        assert_eq!(image_methods[2].1["chat_id"], json!(42));
-        assert_eq!(image_methods[2].1["message_id"], json!(879));
+        drop(edited);
         let records = queue.records();
         assert_eq!(records[0].status, JobStatus::Completed);
         assert_eq!(
@@ -8248,34 +8223,6 @@ mod tests {
         }
     }
 
-    #[derive(Clone, Debug, Default)]
-    struct ImageEphemeralCapture {
-        tracked: Arc<Mutex<Vec<(i64, i32, Duration)>>>,
-    }
-
-    impl ImageEphemeralCapture {
-        fn tracked(&self) -> Vec<(i64, i32, Duration)> {
-            lock(&self.tracked).clone()
-        }
-    }
-
-    impl crate::virtual_messages::EphemeralMessageTracker for ImageEphemeralCapture {
-        type Error = TestEffectError;
-
-        fn track_ephemeral_message<'a>(
-            &'a self,
-            chat_id: i64,
-            message_id: i32,
-            delete_after: Duration,
-            _now: OffsetDateTime,
-        ) -> crate::image_jobs::ImageJobEffectFuture<'a, Result<(), Self::Error>> {
-            Box::pin(async move {
-                lock(&self.tracked).push((chat_id, message_id, delete_after));
-                Ok(())
-            })
-        }
-    }
-
     type ImageTelegramSenderCapture = TelegramMethodCapture;
     type MusicTelegramSenderCapture = TelegramMethodCapture;
 
@@ -9211,28 +9158,6 @@ mod tests {
                     "width": 512
                 }
             ]
-        }))
-    }
-
-    fn telegram_bot_message(
-        chat_id: i64,
-        message_id: i64,
-    ) -> Result<carapax::types::Message, serde_json::Error> {
-        serde_json::from_value(json!({
-            "message_id": message_id,
-            "date": 1_710_000_100,
-            "chat": {
-                "id": chat_id,
-                "type": if chat_id < 0 { "supergroup" } else { "private" },
-                "title": if chat_id < 0 { "Group" } else { "" },
-                "first_name": if chat_id < 0 { "" } else { "Ada" }
-            },
-            "from": {
-                "id": 555,
-                "is_bot": true,
-                "first_name": "Plotva",
-                "username": "plotva_bot"
-            }
         }))
     }
 

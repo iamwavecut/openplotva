@@ -9174,8 +9174,8 @@ async fn start_runtime_workers(
     );
     let vip_image_effects = image_jobs::TelegramImageJobEffects::new(
         service_clients.redis.queued_sticker_store(),
-        ephemeral_store.clone(),
         telegram.clone(),
+        Arc::clone(&rich_sender),
     );
     let vip_image_stop = stop.subscribe();
     let vip_image_worker = tokio::spawn(async move {
@@ -9206,8 +9206,8 @@ async fn start_runtime_workers(
     );
     let vip_image_edit_effects = image_jobs::TelegramImageJobEffects::new(
         service_clients.redis.queued_sticker_store(),
-        ephemeral_store.clone(),
         telegram.clone(),
+        Arc::clone(&rich_sender),
     );
     let vip_image_edit_stop = stop.subscribe();
     let vip_image_edit_worker = tokio::spawn(async move {
@@ -9235,8 +9235,8 @@ async fn start_runtime_workers(
     );
     let regular_image_effects = image_jobs::TelegramImageJobEffects::new(
         service_clients.redis.queued_sticker_store(),
-        ephemeral_store.clone(),
         telegram.clone(),
+        Arc::clone(&rich_sender),
     );
     let regular_image_stop = stop.subscribe();
     let regular_image_worker = tokio::spawn(async move {
