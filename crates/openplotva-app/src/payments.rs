@@ -2379,7 +2379,7 @@ pub fn payment_redirect_send_message_method(
         chat: Some(chat),
         message_thread_id: 0,
         disable_notification: false,
-        allow_sending_without_reply: Some(false),
+        allow_sending_without_reply: Some(true),
         text: message.text.clone(),
         render_as: String::new(),
         reply_markup: Some(reply_markup),
@@ -9405,10 +9405,9 @@ mod tests {
         assert_eq!(payload["message_thread_id"], json!(77));
         assert_eq!(payload["reply_parameters"]["message_id"], json!(555));
         assert_eq!(payload["reply_parameters"]["chat_id"], json!(-10042));
-        assert!(
-            payload["reply_parameters"]
-                .get("allow_sending_without_reply")
-                .is_none()
+        assert_eq!(
+            payload["reply_parameters"]["allow_sending_without_reply"],
+            json!(true)
         );
         assert_eq!(
             payload["reply_markup"]["inline_keyboard"][0][0]["text"],

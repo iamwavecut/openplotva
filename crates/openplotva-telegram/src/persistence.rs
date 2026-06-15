@@ -569,7 +569,7 @@ fn reply_parameters_plan(value: &Value, default_chat_id: i64) -> Option<ReplyPar
         message_id,
         chat_id: field_i64(reply, &["chat_id"]).unwrap_or(default_chat_id),
         allow_sending_without_reply: field_bool(reply, &["allow_sending_without_reply"])
-            .unwrap_or(false),
+            .unwrap_or(true),
     })
 }
 
@@ -1110,7 +1110,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let persisted = vec![
             PersistentDispatcherItem {
-                message: br#"{"ChatID":42,"MessageThreadID":77,"DisableNotification":true,"ReplyParameters":{"message_id":9,"chat_id":42,"allow_sending_without_reply":true},"Text":"<b>hello</b>","ParseMode":"HTML"}"#.to_vec(),
+                message: br#"{"ChatID":42,"MessageThreadID":77,"DisableNotification":true,"ReplyParameters":{"message_id":9,"chat_id":42},"Text":"<b>hello</b>","ParseMode":"HTML"}"#.to_vec(),
                 message_type: "*api.MessageConfig".to_owned(),
                 immediate: false,
                 enqueued_at: "2026-05-19T17:00:00Z".to_owned(),

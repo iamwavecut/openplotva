@@ -626,7 +626,7 @@ where
                 chat: Some(chat),
                 message_thread_id: params.thread_id.map(i64::from).unwrap_or_default(),
                 disable_notification: false,
-                allow_sending_without_reply: Some(false),
+                allow_sending_without_reply: Some(true),
                 text: answer.to_owned(),
                 render_as: TELEGRAM_PARSE_MODE_HTML.to_owned(),
                 reply_markup: None,
@@ -2537,7 +2537,7 @@ mod tests {
         sync::{Arc, Mutex},
     };
 
-    use openplotva_core::ChatAttachment;
+    use openplotva_core::{ChatAttachment, MessageIdMapping};
     use openplotva_dialog::DialogOutput;
     use openplotva_llm::{
         ChatProviderFuture, ContentBlockedError,
@@ -2678,6 +2678,46 @@ mod tests {
         assert_eq!(input.message.normalized, "hello");
         assert_eq!(input.max_output_tokens, 512);
         assert_eq!(record_status(&queue, job_id), JobStatus::Completed);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dialog_dispatcher_effects_allow_sending_without_deleted_reply_target()
+    -> Result<(), Box<dyn Error>> {
+        let queue = Arc::new(DispatcherQueue::new(
+            openplotva_telegram::DispatcherConfig::default(),
+        ));
+        let effects = DialogDispatcherEffects::new(DialogVirtualStoreStub, Arc::clone(&queue))
+            .with_virtual_id_factory(Arc::new(|| "dialog-answer-vmsg-test".to_owned()));
+
+        effects
+            .send_dialog_answer(&dialog_params("hello"), "pong")
+            .await?;
+
+        let item = queue
+            .dequeue_immediate()
+            .ok_or_else(|| io::Error::other("expected queued dialog answer"))?;
+        assert_eq!(item.metadata().virtual_id, "dialog-answer-vmsg-test");
+        let method = item
+            .into_method()
+            .ok_or_else(|| io::Error::other("expected dialog answer method"))?;
+        let openplotva_telegram::TelegramOutboundMethod::SendMessage(method) = method else {
+            panic!("expected sendMessage");
+        };
+        let payload = serde_json::to_value(&*method)?;
+
+        assert_eq!(
+            payload["reply_parameters"]["message_id"],
+            serde_json::json!(100)
+        );
+        assert_eq!(
+            payload["reply_parameters"]["chat_id"],
+            serde_json::json!(42)
+        );
+        assert_eq!(
+            payload["reply_parameters"]["allow_sending_without_reply"],
+            serde_json::json!(true)
+        );
         Ok(())
     }
 
@@ -3649,6 +3689,56 @@ mod tests {
                     .push((params.message_text.clone(), answer.to_owned()));
                 Ok(())
             })
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct DialogVirtualStoreStub;
+
+    impl VirtualMessageStore for DialogVirtualStoreStub {
+        type Error = std::convert::Infallible;
+
+        fn get_mapping_by_virtual<'a>(
+            &'a self,
+            _vmsg_id: String,
+        ) -> std::pin::Pin<
+            Box<dyn Future<Output = Result<Option<MessageIdMapping>, Self::Error>> + Send + 'a>,
+        > {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn insert_virtual_message<'a>(
+            &'a self,
+            _vmsg_id: String,
+            _chat_id: i64,
+            _thread_id: Option<i32>,
+        ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn resolve_virtual_message<'a>(
+            &'a self,
+            _vmsg_id: String,
+            _real_message_id: i32,
+        ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn enqueue_message_op<'a>(
+            &'a self,
+            _vmsg_id: String,
+            _chat_id: i64,
+            _op: &'static str,
+            _payload_json: Option<String>,
+        ) -> std::pin::Pin<Box<dyn Future<Output = Result<i64, Self::Error>> + Send + 'a>> {
+            Box::pin(async { Ok(1) })
+        }
+
+        fn delete_mapping_by_virtual<'a>(
+            &'a self,
+            _vmsg_id: String,
+        ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
         }
     }
 
