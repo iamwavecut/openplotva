@@ -123,16 +123,8 @@ where
     hmac_sha256_hex(&secret, data_check.as_bytes())
 }
 
-#[must_use]
-pub fn validate_telegram_auth<'src, I>(pairs: I, bot_token: &str, provided_hash: &str) -> bool
-where
-    I: IntoIterator<Item = (&'src str, &'src str)>,
-{
-    telegram_auth_hash(pairs, bot_token).eq_ignore_ascii_case(provided_hash)
-}
-
-/// Constant-time byte-slice equality. Returns false immediately on length mismatch,
-/// then compares every remaining byte without early exit.
+/// Constant-time byte-slice equality. Returns false on length mismatch, then compares
+/// every remaining byte without early exit.
 #[must_use]
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
@@ -143,6 +135,16 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         diff |= x ^ y;
     }
     diff == 0
+}
+
+#[must_use]
+pub fn validate_telegram_auth<'src, I>(pairs: I, bot_token: &str, provided_hash: &str) -> bool
+where
+    I: IntoIterator<Item = (&'src str, &'src str)>,
+{
+    let expected = telegram_auth_hash(pairs, bot_token); // lowercase hex
+    let provided = provided_hash.to_ascii_lowercase();
+    constant_time_eq(expected.as_bytes(), provided.as_bytes())
 }
 
 /// HMAC tag (hex) binding an admin user id to the server secret.
@@ -430,6 +432,22 @@ mod tests {
         assert_eq!(verify_admin_session_value("7", secret), None);
         assert_eq!(verify_admin_session_value(value, "wrong"), None);
         assert!(cookie.contains("HttpOnly; SameSite=Lax"));
+    }
+
+    #[test]
+    fn validate_telegram_auth_is_case_insensitive_and_constant_time() {
+        let pairs = [("id", "7"), ("auth_date", "1700000000")];
+        let hash = telegram_auth_hash(pairs, "123:ABC");
+        assert!(validate_telegram_auth(pairs, "123:ABC", &hash)); // lowercase
+        assert!(validate_telegram_auth(
+            pairs,
+            "123:ABC",
+            &hash.to_uppercase()
+        )); // uppercase
+        let mut tampered = hash.clone();
+        tampered.replace_range(0..1, if &hash[0..1] == "0" { "1" } else { "0" });
+        assert!(!validate_telegram_auth(pairs, "123:ABC", &tampered)); // one char off
+        assert!(!validate_telegram_auth(pairs, "123:ABC", "deadbeef")); // length mismatch
     }
 
     #[test]
