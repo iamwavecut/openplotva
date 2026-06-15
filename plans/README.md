@@ -8,20 +8,25 @@ plan 010. Plan 011 was discovered during execution.
 Each plan is self-contained: read it fully before starting, honor its STOP conditions, run every
 verification command, and update your row when done.
 
-**INTEGRATED 2026-06-15 (local, not pushed):** at the user's explicit request, all 8 executed
-worktree branches (001–008) were merged into `main` on top of `df4dfa5`, and the audit artifacts
-(plans/, docs/) committed. The merged workspace compiles (`cargo check --workspace` clean);
-`openplotva-app` is 806/806 green and the new web auth tests pass. The only remaining test failures
-are the 3 pre-existing ones tracked by **plan 011** (not introduced by these merges). Nothing was
-pushed. Rollback point: `git reset --hard df4dfa5`. Two trivial merge conflicts were resolved (a
-duplicate `constant_time_eq` from 002+006, and a stale one-arg cookie test); 002+007 auto-merged in
-`admin_auth_response` and both changes verified present + passing.
+**INTEGRATED & GREEN 2026-06-15 (local, not pushed):** at the user's explicit request, ALL plans
+(001–011) are merged into `main` and the full workspace is green. `tools/rust-fast-gate.sh` exits 0
+end-to-end: `cargo fmt --check` + `cargo check --workspace` + `cargo clippy --workspace ... -D warnings`
++ `cargo test --workspace` all pass. This includes plan 011 (the 3 pre-existing failures are fixed —
+notably a real Go-parity regression where `UPDATE_SIDE_EFFECT_MAX_AGE` was 300s vs Go's 60s) and plan
+010 (settings WebApp initData auth; the reviewer confirmed the WebAppData HMAC key derivation is
+correct). Nothing was pushed. Rollback point: `git reset --hard df4dfa5`.
+
+Merge conflicts resolved along the way (all trivial, union/dedup): duplicate `constant_time_eq`
+(002+006, then again 010), a stale one-arg cookie test, `use`-import unions in two test modules, and
+the `openplotva-web` Cargo.lock dep list. 002+007 auto-merged in `admin_auth_response` (both changes
+verified present + passing). Note: the 010 executor's worktree branched from `9f32c4b`, so its
+implementation was merged forward into the integrated `main` and re-verified there.
 
 ## Execution order & status
 
 | Plan | Title | Pri | Effort | Depends on | Status |
 |------|-------|-----|--------|------------|--------|
-| 011  | Fix 3 pre-existing failing tests (make `cargo test --workspace` green) | P1 | M | — | TODO |
+| 011  | Fix 3 pre-existing failing tests (make `cargo test --workspace` green) | P1 | M | — | DONE (merged `a7acca5`; workspace green) |
 | 001  | CI runs the fast quality gate (clippy + tests) | P1 | S | 011 (else CI goes red) | EXECUTED — code correct, uncommitted (disk ENOSPC during gate) |
 | 002  | Make the admin session cookie unforgeable (sign it) | P1 | M | — | EXECUTED — APPROVED (wt `…-788-3`) |
 | 003  | Bound the Postgres pool (acquire/idle timeouts) | P1 | S | — | EXECUTED — APPROVED (wt `…-788-4`) |
@@ -31,7 +36,7 @@ duplicate `constant_time_eq` from 002+006, and a stale one-arg cookie test); 002
 | 007  | Reject stale Telegram Login data on admin auth | P2 | S | 002 | EXECUTED — APPROVED (wt `…-788-8`) |
 | 008  | Move sqlx off the alpha pin onto stable 0.9.0 | P2 | M | 001 | EXECUTED — APPROVED; advisor re-verified: pin+lock `0.9.0`, storage 59/59 tests pass under stable sqlx (wt `…-788-9`) |
 | 009  | Design spike: settings WebApp initData auth | P1\* | M | — | DONE — produced `docs/settings-webapp-auth-design.md` + plan 010 |
-| 010  | Authenticate the settings WebApp with initData | P1 | L | 006, 009 | TODO |
+| 010  | Authenticate the settings WebApp with initData | P1 | L | 006, 009 | DONE (merged `6319da9`; reviewer APPROVE, HMAC derivation verified) |
 
 Status values: TODO | IN PROGRESS | EXECUTED (in a worktree, advisor verdict noted; not merged) |
 DONE | BLOCKED | REJECTED.
