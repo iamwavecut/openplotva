@@ -375,6 +375,11 @@ pub fn compose_gallery(
     sanitize_rich_html(&html)
 }
 
+/// Custom emoji used as the (required) pull-quote main content of the draw placeholders.
+/// The literal `⏳`/`✨` inside the tag is the fallback when the custom emoji can't render.
+const DRAW_WAITING_EMOJI_ID: &str = "5257960961616142305";
+const DRAW_PROGRESS_EMOJI_ID: &str = "5956143844457189176";
+
 /// Progressive draw state for the in-place updated draw message.
 #[must_use]
 pub fn compose_draw_progress(
@@ -389,8 +394,10 @@ pub fn compose_draw_progress(
         _ if done > 0 => format!(" {done}"),
         _ => String::new(),
     };
+    // Pull-quote (`<aside>`) with the status as the credit (`<cite>`) renders it centered and
+    // grey, matching the media-caption styling; the custom emoji is the required main content.
     html.push_str(&format!(
-        "<p>✨ <i>{}{}</i></p>",
+        "<aside><tg-emoji emoji-id=\"{DRAW_PROGRESS_EMOJI_ID}\">✨</tg-emoji><cite>{}{}</cite></aside>",
         esc(status),
         esc(&counter)
     ));
@@ -427,15 +434,20 @@ fn plural_ru(n: usize, one: &str, few: &str, many: &str) -> String {
 /// Queue-wait state for the draw message: how many orders are still ahead.
 #[must_use]
 pub fn compose_draw_waiting(ahead: usize) -> String {
-    let html = if ahead == 0 {
-        "<p>⏳ <i>ваш черёд подходит…</i></p>".to_owned()
+    let inner = if ahead == 0 {
+        "ваш черёд подходит…".to_owned()
     } else {
         format!(
-            "<p>⏳ <i>в очереди: {} впереди</i></p>",
+            "в очереди: {} впереди",
             plural_ru(ahead, "заказ", "заказа", "заказов")
         )
     };
-    sanitize_rich_html(&html)
+    // Grey centered status via the pull-quote credit (`<cite>` inside `<aside>`); the custom
+    // emoji (with `⏳` fallback) is the required main content.
+    sanitize_rich_html(&format!(
+        "<aside><tg-emoji emoji-id=\"{DRAW_WAITING_EMOJI_ID}\">⏳</tg-emoji><cite>{}</cite></aside>",
+        esc(&inner)
+    ))
 }
 
 /// A plain notice for the draw message (safety block, failure), as one rich paragraph.
@@ -566,33 +578,36 @@ mod tests {
     #[test]
     fn draw_progress_shows_counter_and_partial_media() {
         let html = compose_draw_progress("рисую…", 2, Some(3), &["https://h/a.png".to_owned()]);
-        assert!(html.contains("<p>✨ <i>рисую… 2 из 3</i></p>"));
+        assert!(html.contains("<aside><tg-emoji emoji-id=\"5956143844457189176\">✨</tg-emoji><cite>рисую… 2 из 3</cite></aside>"));
         assert!(html.contains(r#"<img src="https://h/a.png"/>"#));
         let queue = compose_draw_progress("ожидаю очереди", 0, None, &[]);
-        assert_eq!(queue, "<p>✨ <i>ожидаю очереди</i></p>");
+        assert_eq!(
+            queue,
+            "<aside><tg-emoji emoji-id=\"5956143844457189176\">✨</tg-emoji><cite>ожидаю очереди</cite></aside>"
+        );
     }
 
     #[test]
     fn draw_waiting_counts_and_pluralizes() {
         assert_eq!(
             compose_draw_waiting(0),
-            "<p>⏳ <i>ваш черёд подходит…</i></p>"
+            "<aside><tg-emoji emoji-id=\"5257960961616142305\">⏳</tg-emoji><cite>ваш черёд подходит…</cite></aside>"
         );
         assert_eq!(
             compose_draw_waiting(1),
-            "<p>⏳ <i>в очереди: 1 заказ впереди</i></p>"
+            "<aside><tg-emoji emoji-id=\"5257960961616142305\">⏳</tg-emoji><cite>в очереди: 1 заказ впереди</cite></aside>"
         );
         assert_eq!(
             compose_draw_waiting(2),
-            "<p>⏳ <i>в очереди: 2 заказа впереди</i></p>"
+            "<aside><tg-emoji emoji-id=\"5257960961616142305\">⏳</tg-emoji><cite>в очереди: 2 заказа впереди</cite></aside>"
         );
         assert_eq!(
             compose_draw_waiting(5),
-            "<p>⏳ <i>в очереди: 5 заказов впереди</i></p>"
+            "<aside><tg-emoji emoji-id=\"5257960961616142305\">⏳</tg-emoji><cite>в очереди: 5 заказов впереди</cite></aside>"
         );
         assert_eq!(
             compose_draw_waiting(11),
-            "<p>⏳ <i>в очереди: 11 заказов впереди</i></p>"
+            "<aside><tg-emoji emoji-id=\"5257960961616142305\">⏳</tg-emoji><cite>в очереди: 11 заказов впереди</cite></aside>"
         );
     }
 

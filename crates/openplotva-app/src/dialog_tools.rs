@@ -4090,7 +4090,10 @@ mod tests {
         assert_eq!(sent[0].reply_to_message_id, Some(11));
         assert_eq!(sent[0].message_thread_id, Some(7));
         assert!(sent[0].allow_sending_without_reply);
-        assert_eq!(sent[0].html, "<p>⏳ <i>ваш черёд подходит…</i></p>");
+        assert_eq!(
+            sent[0].html,
+            "<aside><tg-emoji emoji-id=\"5257960961616142305\">⏳</tg-emoji><cite>ваш черёд подходит…</cite></aside>"
+        );
         Ok(())
     }
 

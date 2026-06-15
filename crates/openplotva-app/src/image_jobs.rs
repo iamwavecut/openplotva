@@ -695,6 +695,70 @@ where
             }))
         })
     }
+
+    fn generate_image_streaming<'a>(
+        &'a self,
+        request: ImageGenerationRequest,
+        progress: ImageGenerationProgressSink,
+    ) -> ImageGenerationFuture<'a> {
+        Box::pin(async move {
+            let mut combined = ImageGenerationResult::default();
+            let mut last_provider_error = None;
+
+            match self
+                .first
+                .generate_image(image_generation_request_for_prompt_slot(&request, 0))
+                .await
+            {
+                Ok(result) if image_generation_result_has_images(&result) => {
+                    let _ = progress.send(result.clone());
+                    append_image_generation_result(&mut combined, result);
+                }
+                Ok(_) => {
+                    last_provider_error = Some(ImageGenerationError::Provider(
+                        "first image slot was empty".to_owned(),
+                    ));
+                }
+                Err(ImageGenerationError::Forbidden) => {
+                    return Err(ImageGenerationError::Forbidden);
+                }
+                Err(error) => last_provider_error = Some(error),
+            }
+
+            let second_slot = self.first.expected_image_count().max(1);
+            match self
+                .second
+                .generate_image(image_generation_request_for_prompt_slot(
+                    &request,
+                    second_slot,
+                ))
+                .await
+            {
+                Ok(result) if image_generation_result_has_images(&result) => {
+                    let _ = progress.send(result.clone());
+                    append_image_generation_result(&mut combined, result);
+                }
+                Ok(_) => {
+                    last_provider_error = Some(ImageGenerationError::Provider(
+                        "second image slot was empty".to_owned(),
+                    ));
+                }
+                Err(ImageGenerationError::Forbidden) => {
+                    return Err(ImageGenerationError::Forbidden);
+                }
+                Err(error) => last_provider_error = Some(error),
+            }
+
+            if image_generation_result_has_images(&combined) {
+                return Ok(combined);
+            }
+            Err(last_provider_error.unwrap_or_else(|| {
+                ImageGenerationError::Provider(
+                    "sequential image workflow produced no image".to_owned(),
+                )
+            }))
+        })
+    }
 }
 
 /// Image editor wrapper that resolves Telegram `file_id` inputs before draw-api submission.
@@ -740,6 +804,10 @@ where
     }
 }
 
+/// Sink for incremental image results: one send per provider slot as it completes, so the
+/// worker can publish and redraw the post progressively instead of waiting for all images.
+pub type ImageGenerationProgressSink = tokio::sync::mpsc::UnboundedSender<ImageGenerationResult>;
+
 pub trait ImageGenerator {
     /// Number of placeholder/result slots this workflow should reserve.
     fn expected_image_count(&self) -> usize {
@@ -748,6 +816,26 @@ pub trait ImageGenerator {
 
     /// Generate and send an image.
     fn generate_image<'a>(&'a self, request: ImageGenerationRequest) -> ImageGenerationFuture<'a>;
+
+    /// Generate, emitting each slot's result on `progress` as soon as it is ready. The
+    /// default emits the whole result once — correct for providers that return every image
+    /// at once; multi-slot combinators override this to emit per slot.
+    fn generate_image_streaming<'a>(
+        &'a self,
+        request: ImageGenerationRequest,
+        progress: ImageGenerationProgressSink,
+    ) -> ImageGenerationFuture<'a>
+    where
+        Self: Sync,
+    {
+        Box::pin(async move {
+            let result = self.generate_image(request).await?;
+            if image_generation_result_has_images(&result) {
+                let _ = progress.send(result.clone());
+            }
+            Ok(result)
+        })
+    }
 }
 
 pub trait ImageEditor {
@@ -793,6 +881,24 @@ where
             )
             .await?;
             self.generator.generate_image(request).await
+        })
+    }
+
+    fn generate_image_streaming<'a>(
+        &'a self,
+        request: ImageGenerationRequest,
+        progress: ImageGenerationProgressSink,
+    ) -> ImageGenerationFuture<'a> {
+        Box::pin(async move {
+            let request = optimized_image_generation_request(
+                &self.optimizer,
+                request,
+                self.generator.expected_image_count().max(1),
+            )
+            .await?;
+            self.generator
+                .generate_image_streaming(request, progress)
+                .await
         })
     }
 }
@@ -1450,20 +1556,57 @@ where
         seed: params.seed,
     };
 
-    let result = generator.generate_image(request).await;
+    // Generate progressively: publish each provider slot's image and redraw the post with
+    // "N из M" as soon as it is ready, instead of waiting for every image. Single-image
+    // draws skip the intermediate progress edit (no flicker).
+    let chat_id = params.chat_id;
+    let (progress_tx, mut progress_rx) =
+        tokio::sync::mpsc::unbounded_channel::<ImageGenerationResult>();
+    let generate = generator.generate_image_streaming(request, progress_tx);
+    let consume = async move {
+        let mut published_urls: Vec<String> = Vec::new();
+        while let Some(partial) = progress_rx.recv().await {
+            let photos = image_generation_photo_sources(&partial)
+                .into_iter()
+                .take(TELEGRAM_MEDIA_GROUP_MAX_ITEMS)
+                .collect::<Vec<_>>();
+            if photos.is_empty() {
+                continue;
+            }
+            match effects.publish_draw_images(photos).await {
+                Ok(urls) => {
+                    published_urls.extend(urls);
+                    published_urls.truncate(TELEGRAM_MEDIA_GROUP_MAX_ITEMS);
+                    if expected_image_count > 1 {
+                        let _ = effects
+                            .edit_draw_message(
+                                chat_id,
+                                draw_message_id,
+                                crate::rich::compose_draw_progress(
+                                    DRAW_STATUS_DRAWING,
+                                    published_urls.len(),
+                                    Some(expected_image_count),
+                                    &published_urls,
+                                ),
+                            )
+                            .await;
+                    }
+                }
+                Err(error) => tracing::debug!(%error, "publish draw image slot failed"),
+            }
+        }
+        published_urls
+    };
+    let (result, published_urls) = tokio::join!(generate, consume);
 
     match result {
         Ok(result) => {
             let image_urls = image_generation_urls(&result);
             let image_url = image_urls.first().cloned();
-            let photos = image_generation_photo_sources(&result)
-                .into_iter()
-                .take(TELEGRAM_MEDIA_GROUP_MAX_ITEMS)
-                .collect::<Vec<_>>();
-            if photos.is_empty() {
+            if published_urls.is_empty() {
                 let _ = effects
                     .edit_draw_message(
-                        params.chat_id,
+                        chat_id,
                         draw_message_id,
                         crate::rich::compose_draw_notice(DRAW_FAILED_NOTICE_TEXT),
                     )
@@ -1478,14 +1621,14 @@ where
                     error: Some("image generation produced no image".to_owned()),
                 };
             }
-            match deliver_draw_gallery(
-                effects,
-                params.chat_id,
-                draw_message_id,
-                photos,
-                &display_caption,
-            )
-            .await
+            let gallery = crate::rich::compose_gallery(
+                &published_urls,
+                &caption_to_rich(&display_caption),
+                None,
+            );
+            match effects
+                .edit_draw_message(chat_id, draw_message_id, gallery)
+                .await
             {
                 Ok(()) => ImageGenJobExecutionReport {
                     outcome: ImageGenJobExecutionOutcome::Completed,
@@ -3107,7 +3250,10 @@ mod tests {
         );
         let calls = effects.calls();
         assert_eq!(calls.len(), 3);
-        assert_eq!(calls[0], "placeholder:-100:20:9:<p>✨ <i>рисую…</i></p>");
+        assert_eq!(
+            calls[0],
+            "placeholder:-100:20:9:<aside><tg-emoji emoji-id=\"5956143844457189176\">✨</tg-emoji><cite>рисую…</cite></aside>"
+        );
         assert_eq!(calls[1], "publish:[Url(\"https://img.test/1.png\")]");
         assert!(calls[2].starts_with("edit:-100:888:"));
         assert!(calls[2].contains("<img src=\"https://img.test/1.png\"/>"));
@@ -3141,16 +3287,23 @@ mod tests {
         assert_eq!(report.outcome, ImageGenJobExecutionOutcome::Completed);
         assert_eq!(report.result_message_id, Some(888));
         let calls = effects.calls();
-        assert_eq!(calls.len(), 3);
-        assert_eq!(calls[0], "placeholder:-100:20:9:<p>✨ <i>рисую…</i></p>");
+        assert_eq!(calls.len(), 4);
+        assert_eq!(
+            calls[0],
+            "placeholder:-100:20:9:<aside><tg-emoji emoji-id=\"5956143844457189176\">✨</tg-emoji><cite>рисую…</cite></aside>"
+        );
         assert_eq!(
             calls[1],
             "publish:[Url(\"https://img.test/1.png\"), Url(\"https://img.test/2.png\")]"
         );
-        assert!(calls[2].starts_with("edit:-100:888:<tg-slideshow>"));
+        // progress redraw with "N из M" before the final gallery
+        assert!(calls[2].starts_with("edit:-100:888:"));
+        assert!(calls[2].contains("рисую… 2 из 2"));
         assert!(calls[2].contains("<img src=\"https://img.test/1.png\"/>"));
         assert!(calls[2].contains("<img src=\"https://img.test/2.png\"/>"));
-        assert!(calls[2].contains("original caption"));
+        assert!(calls[3].starts_with("edit:-100:888:<tg-slideshow>"));
+        assert!(calls[3].contains("<img src=\"https://img.test/2.png\"/>"));
+        assert!(calls[3].contains("original caption"));
     }
 
     #[test]
@@ -3197,16 +3350,59 @@ mod tests {
         assert_eq!(report.outcome, ImageGenJobExecutionOutcome::Completed);
         assert_eq!(report.result_message_id, Some(888));
         let calls = effects.calls();
-        assert_eq!(calls.len(), 3);
-        assert_eq!(calls[0], "placeholder:-100:20:9:<p>✨ <i>рисую…</i></p>");
+        assert_eq!(calls.len(), 4);
+        assert_eq!(
+            calls[0],
+            "placeholder:-100:20:9:<aside><tg-emoji emoji-id=\"5956143844457189176\">✨</tg-emoji><cite>рисую…</cite></aside>"
+        );
         assert_eq!(
             calls[1],
             "publish:[Url(\"https://img.test/vip-1.png\"), Url(\"https://img.test/vip-2.png\")]"
         );
-        assert!(calls[2].starts_with("edit:-100:888:<tg-slideshow>"));
+        assert!(calls[2].starts_with("edit:-100:888:"));
+        assert!(calls[2].contains("рисую… 2 из 2"));
         assert!(calls[2].contains("<img src=\"https://img.test/vip-1.png\"/>"));
-        assert!(calls[2].contains("<img src=\"https://img.test/vip-2.png\"/>"));
-        assert!(calls[2].contains("castle"));
+        assert!(calls[3].starts_with("edit:-100:888:<tg-slideshow>"));
+        assert!(calls[3].contains("<img src=\"https://img.test/vip-2.png\"/>"));
+        assert!(calls[3].contains("castle"));
+    }
+
+    #[tokio::test]
+    async fn execute_image_gen_job_redraws_progressively_per_slot() {
+        // Two sequential slots → the post is redrawn ("N из M") as each image lands,
+        // not only after both complete.
+        let generator = SequentialImageGenerator::new(
+            GeneratorStub::success("https://img.test/s1.png"),
+            GeneratorStub::success("https://img.test/s2.png"),
+        );
+        let effects = EffectsStub::new();
+        let report = execute_image_gen_job(
+            &generator,
+            &effects,
+            ImageGenJobParams {
+                chat_id: -100,
+                message_id: 20,
+                user_id: 30,
+                user_full_name: "Alice".to_owned(),
+                prompt: "castle".to_owned(),
+                thread_id: Some(9),
+                ..ImageGenJobParams::default()
+            },
+        )
+        .await;
+
+        assert_eq!(report.outcome, ImageGenJobExecutionOutcome::Completed);
+        let calls = effects.calls();
+        assert_eq!(calls.len(), 6);
+        assert_eq!(calls[1], "publish:[Url(\"https://img.test/s1.png\")]");
+        assert!(calls[2].contains("рисую… 1 из 2"));
+        assert!(calls[2].contains("<img src=\"https://img.test/s1.png\"/>"));
+        assert_eq!(calls[3], "publish:[Url(\"https://img.test/s2.png\")]");
+        assert!(calls[4].contains("рисую… 2 из 2"));
+        assert!(calls[4].contains("<img src=\"https://img.test/s2.png\"/>"));
+        assert!(calls[5].starts_with("edit:-100:888:<tg-slideshow>"));
+        assert!(calls[5].contains("<img src=\"https://img.test/s1.png\"/>"));
+        assert!(calls[5].contains("<img src=\"https://img.test/s2.png\"/>"));
     }
 
     #[tokio::test]
@@ -3235,7 +3431,10 @@ mod tests {
         assert_eq!(report.error, None);
         let calls = effects.calls();
         assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0], "placeholder:-100:20:0:<p>✨ <i>рисую…</i></p>");
+        assert_eq!(
+            calls[0],
+            "placeholder:-100:20:0:<aside><tg-emoji emoji-id=\"5956143844457189176\">✨</tg-emoji><cite>рисую…</cite></aside>"
+        );
         assert!(calls[1].starts_with("edit:-100:888:"));
         assert!(calls[1].contains(NSFW_BLOCKED_MESSAGE_TEXT));
     }
@@ -3289,7 +3488,10 @@ mod tests {
         );
         let calls = effects.calls();
         assert_eq!(calls.len(), 3);
-        assert_eq!(calls[0], "placeholder:-100:20:9:<p>✨ <i>рисую…</i></p>");
+        assert_eq!(
+            calls[0],
+            "placeholder:-100:20:9:<aside><tg-emoji emoji-id=\"5956143844457189176\">✨</tg-emoji><cite>рисую…</cite></aside>"
+        );
         assert_eq!(
             calls[1],
             "publish:[Url(\"https://img.test/edit-1.png\"), Url(\"https://img.test/edit-2.png\")]"
@@ -3323,7 +3525,10 @@ mod tests {
         assert_eq!(report.error, None);
         let calls = effects.calls();
         assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0], "placeholder:-100:20:0:<p>✨ <i>рисую…</i></p>");
+        assert_eq!(
+            calls[0],
+            "placeholder:-100:20:0:<aside><tg-emoji emoji-id=\"5956143844457189176\">✨</tg-emoji><cite>рисую…</cite></aside>"
+        );
         assert!(calls[1].starts_with("edit:-100:888:"));
         assert!(calls[1].contains(NSFW_BLOCKED_MESSAGE_TEXT));
     }
@@ -3352,7 +3557,10 @@ mod tests {
         assert_eq!(report.error, Some("draw api failed".to_owned()));
         let calls = effects.calls();
         assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0], "placeholder:-100:20:9:<p>✨ <i>рисую…</i></p>");
+        assert_eq!(
+            calls[0],
+            "placeholder:-100:20:9:<aside><tg-emoji emoji-id=\"5956143844457189176\">✨</tg-emoji><cite>рисую…</cite></aside>"
+        );
         assert!(calls[1].starts_with("edit:-100:888:"));
         assert!(calls[1].contains(DRAW_FAILED_NOTICE_TEXT));
     }
@@ -3715,12 +3923,15 @@ mod tests {
         // The job still waiting moves up to position 0 (its message is edited).
         assert_eq!(
             calls[0],
-            "edit:-200:702:<p>⏳ <i>ваш черёд подходит…</i></p>"
+            "edit:-200:702:<aside><tg-emoji emoji-id=\"5257960961616142305\">⏳</tg-emoji><cite>ваш черёд подходит…</cite></aside>"
         );
         // The drawn job's queue-position message is removed before drawing.
         assert_eq!(calls[1], "delete:-100:701");
         // Then a fresh drawing message is sent and turned into the gallery.
-        assert_eq!(calls[2], "placeholder:-100:20:0:<p>✨ <i>рисую…</i></p>");
+        assert_eq!(
+            calls[2],
+            "placeholder:-100:20:0:<aside><tg-emoji emoji-id=\"5956143844457189176\">✨</tg-emoji><cite>рисую…</cite></aside>"
+        );
         assert_eq!(calls[3], "publish:[Url(\"https://img.test/1.png\")]");
         assert!(calls[4].starts_with("edit:-100:888:"));
     }
@@ -4527,7 +4738,10 @@ mod tests {
         assert_eq!(report.result_message_id, Some(888));
         let calls = effects.calls();
         assert_eq!(calls.len(), 3);
-        assert_eq!(calls[0], "placeholder:-100:20:9:<p>✨ <i>рисую…</i></p>");
+        assert_eq!(
+            calls[0],
+            "placeholder:-100:20:9:<aside><tg-emoji emoji-id=\"5956143844457189176\">✨</tg-emoji><cite>рисую…</cite></aside>"
+        );
         assert_eq!(
             calls[1],
             "publish:[Bytes { file_name: \"image.png\", bytes: [9, 8, 7] }]"

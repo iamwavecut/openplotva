@@ -4968,7 +4968,10 @@ mod tests {
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].chat_id, -100);
         assert_eq!(sent[0].reply_to_message_id, Some(78));
-        assert_eq!(sent[0].html, "<p>✨ <i>рисую…</i></p>");
+        assert_eq!(
+            sent[0].html,
+            "<aside><tg-emoji emoji-id=\"5956143844457189176\">✨</tg-emoji><cite>рисую…</cite></aside>"
+        );
         drop(sent);
         let edited = image_rich.edited.lock().expect("rich edited");
         assert_eq!(edited.len(), 1);
@@ -7068,7 +7071,10 @@ mod tests {
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].chat_id, 42);
         assert_eq!(sent[0].reply_to_message_id, Some(77));
-        assert_eq!(sent[0].html, "<p>✨ <i>рисую…</i></p>");
+        assert_eq!(
+            sent[0].html,
+            "<aside><tg-emoji emoji-id=\"5956143844457189176\">✨</tg-emoji><cite>рисую…</cite></aside>"
+        );
         drop(sent);
         let edited = image_rich.edited.lock().expect("rich edited");
         assert_eq!(edited.len(), 1);
