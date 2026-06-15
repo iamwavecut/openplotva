@@ -9876,10 +9876,9 @@ async fn start_runtime_workers(
                 token: bot_key.to_owned(),
             },
             Arc::new(help::HelpDispatcherEffects::new(
-                store.clone(),
-                Arc::clone(&dispatcher_queue_for_updates),
                 telegram.clone(),
                 Arc::clone(&payment_handler),
+                Arc::clone(&rich_sender),
             )),
             diagnostics_handler,
         ));

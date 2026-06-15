@@ -10198,10 +10198,9 @@ mod tests {
         ));
         let telegram = openplotva_telegram::telegram_client("123:token")?;
         let help_effects = Arc::new(HelpDispatcherEffects::new(
-            virtual_store.clone(),
-            Arc::clone(&dispatcher),
             telegram,
             Arc::clone(&payment_handler),
+            Arc::new(crate::rich::MockRichSender::default()),
         ));
         let help_handler = HelpCommandUpdateHandler::new(
             HelpBotIdentity {

@@ -5255,10 +5255,9 @@ mod tests {
         );
         let telegram = openplotva_telegram::telegram_client("123:token")?;
         let help_effects = Arc::new(HelpDispatcherEffects::new(
-            store.as_ref().clone(),
-            Arc::clone(&help_dispatcher),
             telegram,
             Arc::clone(&settings_handler),
+            Arc::new(crate::rich::MockRichSender::default()),
         ));
         let help_handler = HelpCommandUpdateHandler::new(
             HelpBotIdentity {

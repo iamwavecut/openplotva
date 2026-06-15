@@ -9,7 +9,7 @@ use carapax::types::{
     UpdateType as TelegramUpdateType,
 };
 use openplotva_telegram::{
-    ChatRef, DispatcherQueue, HELP_COMMAND, OutboundBuildError, ReplyMarkup, ReplyMessageRef,
+    ChatRef, HELP_COMMAND, OutboundBuildError, ReplyMarkup, ReplyMessageRef,
     TELEGRAM_PARSE_MODE_HTML, TelegramClient, TelegramOutboundMethod, TextMessageRequest,
     build_inline_keyboard_button_url, build_inline_keyboard_markup, build_inline_keyboard_row,
     build_text_message_methods, escape_telegram_html_text, execute_telegram_method,
@@ -17,10 +17,7 @@ use openplotva_telegram::{
 use thiserror::Error;
 
 use crate::updates::{UpdateHandler, UpdateHandlerFuture};
-use crate::virtual_messages::{
-    QueueTextRequest, VirtualIdFactory, VirtualMessageStore, monotonic_virtual_id_factory,
-    queue_text_message_parts,
-};
+use crate::virtual_messages::VirtualIdFactory;
 
 const START_COMMAND: &str = "start";
 const SETTINGS_START_PAYLOAD: &str = "settings";
@@ -122,43 +119,30 @@ pub trait HelpCommandEffects {
 pub type HelpVirtualIdFactory = VirtualIdFactory;
 
 #[derive(Clone)]
-pub struct HelpDispatcherEffects<Store, Next> {
-    store: Store,
-    queue: Arc<DispatcherQueue>,
+pub struct HelpDispatcherEffects<Next> {
     telegram: TelegramClient,
     delegated_next: Arc<Next>,
-    next_virtual_id: HelpVirtualIdFactory,
+    rich: Arc<dyn crate::rich::RichSender>,
 }
 
-impl<Store, Next> HelpDispatcherEffects<Store, Next> {
-    /// Build help effects backed by the normal dispatcher and the next command handler.
+impl<Next> HelpDispatcherEffects<Next> {
+    /// Build help effects: rich private help + classic direct group redirect + delegation.
     #[must_use]
     pub fn new(
-        store: Store,
-        queue: Arc<DispatcherQueue>,
         telegram: TelegramClient,
         delegated_next: Arc<Next>,
+        rich: Arc<dyn crate::rich::RichSender>,
     ) -> Self {
         Self {
-            store,
-            queue,
             telegram,
             delegated_next,
-            next_virtual_id: monotonic_virtual_id_factory("help-vmsg"),
+            rich,
         }
-    }
-
-    /// Override virtual-message ID generation for deterministic tests.
-    #[must_use]
-    pub fn with_virtual_id_factory(mut self, next_virtual_id: HelpVirtualIdFactory) -> Self {
-        self.next_virtual_id = next_virtual_id;
-        self
     }
 }
 
-impl<Store, Next> HelpCommandEffects for HelpDispatcherEffects<Store, Next>
+impl<Next> HelpCommandEffects for HelpDispatcherEffects<Next>
 where
-    Store: VirtualMessageStore + Send + Sync,
     Next: UpdateHandler + Send + Sync,
 {
     type Error = HelpDispatchEffectError;
@@ -178,19 +162,35 @@ where
                 return Ok(());
             }
 
-            queue_text_message_parts(
-                &self.store,
-                &self.queue,
-                QueueTextRequest {
-                    message: &plan.message,
-                    reply_to: Some(&plan.reply_to),
-                    immediate_first: false,
-                    bypass_chat_restrictions: false,
-                    ephemeral_delete_after: None,
+            let chat_id = plan
+                .message
+                .chat
+                .as_ref()
+                .map_or(plan.reply_to.chat.id, |chat| chat.id);
+            let options = openplotva_telegram::RichSendOptions {
+                message_thread_id: if plan.message.message_thread_id != 0 {
+                    Some(plan.message.message_thread_id)
+                } else if plan.reply_to.is_topic_message {
+                    Some(plan.reply_to.message_thread_id)
+                } else {
+                    None
                 },
-                || (self.next_virtual_id)(),
-            )
-            .await?;
+                reply_to_message_id: Some(plan.reply_to.message_id),
+                allow_sending_without_reply: plan
+                    .message
+                    .allow_sending_without_reply
+                    .unwrap_or(false),
+                disable_notification: plan.message.disable_notification,
+                reply_markup: plan
+                    .message
+                    .reply_markup
+                    .as_ref()
+                    .and_then(|markup| serde_json::to_value(markup).ok()),
+            };
+            self.rich
+                .send_rich(chat_id, &plan.message.text, &options)
+                .await
+                .map_err(|error| HelpDispatchEffectError::RichSend(error.to_string()))?;
             Ok(())
         })
     }
@@ -221,6 +221,9 @@ pub enum HelpDispatchEffectError {
     /// Delegating private `/start ...` to the owning command module failed.
     #[error("failed to delegate private start command: {0}")]
     Delegate(String),
+    /// Sending the private help as a rich message failed.
+    #[error("failed to send help rich message: {0}")]
+    RichSend(String),
 }
 
 /// Result of one decoded update through the help/start wrapper.
