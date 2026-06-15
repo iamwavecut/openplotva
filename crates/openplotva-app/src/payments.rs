@@ -2417,6 +2417,104 @@ fn non_private_payment_command_targets_other_bot(
 }
 
 #[must_use]
+/// Payment effects that send the VIP status reply as a rich message while delegating
+/// pre-checkout answers and payment-redirect sends to the classic Telegram client.
+pub struct RichPaymentEffects {
+    inner: openplotva_telegram::TelegramClient,
+    rich: Arc<dyn crate::rich::RichSender>,
+}
+
+impl RichPaymentEffects {
+    #[must_use]
+    pub fn new(
+        inner: openplotva_telegram::TelegramClient,
+        rich: Arc<dyn crate::rich::RichSender>,
+    ) -> Self {
+        Self { inner, rich }
+    }
+}
+
+impl PreCheckoutPaymentEffects for RichPaymentEffects {
+    type Error = String;
+
+    fn answer_pre_checkout_query<'a>(
+        &'a self,
+        pre_checkout_query_id: &'a str,
+    ) -> PreCheckoutFuture<'a, Self::Error> {
+        Box::pin(async move {
+            self.inner
+                .answer_pre_checkout_query(pre_checkout_query_id)
+                .await
+                .map_err(|error| error.to_string())
+        })
+    }
+}
+
+impl PaymentRedirectEffects for RichPaymentEffects {
+    type Error = String;
+
+    fn send_payment_redirect_message<'a>(
+        &'a self,
+        message: PaymentRedirectMessage,
+    ) -> PaymentEffectsFuture<'a, Self::Error> {
+        Box::pin(async move {
+            self.inner
+                .send_payment_redirect_message(message)
+                .await
+                .map_err(|error| error.to_string())
+        })
+    }
+}
+
+impl VipStatusEffects for RichPaymentEffects {
+    type Error = String;
+
+    fn send_vip_status_message<'a>(
+        &'a self,
+        message: VipStatusMessage,
+    ) -> PaymentEffectsFuture<'a, Self::Error> {
+        Box::pin(async move {
+            let reply_markup = message.show_cancel_button.then(|| {
+                serde_json::json!({
+                    "inline_keyboard": [[{
+                        "text": "Отменить подписку",
+                        "callback_data": "{\"action\":\"cancel_vip\"}"
+                    }]]
+                })
+            });
+            let options = openplotva_telegram::RichSendOptions {
+                message_thread_id: message.message_thread_id.map(i64::from),
+                reply_to_message_id: Some(i64::from(message.reply_to_message_id)),
+                allow_sending_without_reply: true,
+                disable_notification: false,
+                reply_markup,
+            };
+            // Rich collapses bare newlines; turn the status body into <br> breaks.
+            let html = message.text.replace('\n', "<br>");
+            self.rich
+                .send_rich(message.chat_id, &html, &options)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(())
+        })
+    }
+
+    fn send_vip_status_error_text<'a>(
+        &'a self,
+        chat_id: i64,
+        reply_to_message_id: i32,
+        text: &'a str,
+        parse_mode: &'a str,
+    ) -> PaymentEffectsFuture<'a, Self::Error> {
+        Box::pin(async move {
+            self.inner
+                .send_vip_status_error_text(chat_id, reply_to_message_id, text, parse_mode)
+                .await
+                .map_err(|error| error.to_string())
+        })
+    }
+}
+
 pub fn active_vip_status_message_at(
     summary: &VipSummaryRecord,
     active_subscription: Option<&SubscriptionRecord>,

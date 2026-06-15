@@ -8464,6 +8464,10 @@ async fn start_runtime_workers(
     );
     let bot_username = bot_identity.username.clone();
     let telegram_effects = Arc::new(telegram.clone());
+    let payment_rich_effects = Arc::new(payments::RichPaymentEffects::new(
+        telegram.clone(),
+        Arc::clone(&rich_sender),
+    ));
     let payment_runtime_effects = Arc::new(payment_effects.clone());
     let shared_task_queue_recovery_interval =
         task_queue::shared_task_queue_recovery_interval_from_config(&config.persistent_queue);
@@ -9737,7 +9741,7 @@ async fn start_runtime_workers(
             payments::PaymentUpdateHandler::new(
                 Arc::clone(&control_queue_for_updates),
                 Arc::clone(&vip_status_for_updates),
-                Arc::clone(&telegram_effects),
+                Arc::clone(&payment_rich_effects),
                 settings_handler,
             )
             .with_bot_username(bot_identity.username.clone()),
