@@ -36,9 +36,8 @@ use openplotva_taskman::{
     dialog_job_params_from_stateless_job,
 };
 use openplotva_telegram::{
-    ChatRef, DispatcherQueue, OutboundBuildError, ReplyMessageRef, TELEGRAM_PARSE_MODE_HTML,
-    TextMessageRequest, clean_unicode_non_printables, decode_html_entities,
-    ensure_telegram_safe_text, sanitize_telegram_html,
+    clean_unicode_non_printables, decode_html_entities, ensure_telegram_safe_text,
+    sanitize_telegram_html,
 };
 use thiserror::Error;
 use time::{Duration as TimeDuration, OffsetDateTime, format_description::well_known::Rfc3339};
@@ -49,15 +48,10 @@ use crate::{
         dialog_reference_context_from_memory,
     },
     memory_runtime::{EmbeddingProvider, memory_retrieval_query_task},
-    virtual_messages::{
-        QueueTextRequest, VirtualIdFactory, VirtualMessageStore, monotonic_virtual_id_factory,
-        queue_text_message_parts,
-    },
     vision::DialogVisionInputMaterializer,
 };
 
 const DIALOG_JOB_WORKER_ID: &str = "dialog-job";
-const DIALOG_JOB_VIRTUAL_ID_PREFIX: &str = "dialog-answer-vmsg";
 const DIALOG_JOB_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const DIALOG_HISTORY_FETCH_LIMIT: i32 = 100;
 const DIALOG_HISTORY_TTL: TimeDuration = TimeDuration::days(7);
@@ -511,39 +505,26 @@ impl DialogInputMaterializer for PostgresDialogInputMaterializer {
     }
 }
 
-/// Dispatcher-backed dialog answer side effects.
+/// Rich-message-backed dialog answer side effects.
 #[derive(Clone)]
-pub struct DialogDispatcherEffects<Store> {
-    store: Store,
-    queue: Arc<DispatcherQueue>,
-    next_virtual_id: VirtualIdFactory,
+pub struct DialogDispatcherEffects {
+    rich: Arc<dyn crate::rich::RichSender>,
 }
 
-impl<Store> DialogDispatcherEffects<Store> {
-    /// Build dispatcher-backed dialog side effects.
+impl DialogDispatcherEffects {
+    /// Build dialog side effects that reply with rich messages.
     #[must_use]
-    pub fn new(store: Store, queue: Arc<DispatcherQueue>) -> Self {
-        Self {
-            store,
-            queue,
-            next_virtual_id: monotonic_virtual_id_factory(DIALOG_JOB_VIRTUAL_ID_PREFIX),
-        }
-    }
-
-    /// Override virtual ID generation for deterministic tests.
-    #[must_use]
-    pub fn with_virtual_id_factory(mut self, next_virtual_id: VirtualIdFactory) -> Self {
-        self.next_virtual_id = next_virtual_id;
-        self
+    pub fn new(rich: Arc<dyn crate::rich::RichSender>) -> Self {
+        Self { rich }
     }
 }
 
 /// Concrete dispatch failure.
 #[derive(Debug, Error)]
 pub enum DialogDispatchEffectError {
-    /// Dialog answer could not be queued as outbound Telegram text.
-    #[error("failed to queue dialog answer: {0}")]
-    Queue(#[from] OutboundBuildError),
+    /// Dialog answer could not be sent as a rich message.
+    #[error("failed to send dialog answer: {0}")]
+    RichSend(String),
 }
 
 impl DialogJobWorkerQueue for InMemoryTaskQueue {
@@ -606,10 +587,7 @@ impl DialogJobWorkerQueue for InMemoryTaskQueue {
     }
 }
 
-impl<Store> DialogJobEffects for DialogDispatcherEffects<Store>
-where
-    Store: VirtualMessageStore + Send + Sync,
-{
+impl DialogJobEffects for DialogDispatcherEffects {
     type Error = DialogDispatchEffectError;
 
     fn send_dialog_answer<'a>(
@@ -618,39 +596,17 @@ where
         answer: &'a str,
     ) -> DialogJobEffectFuture<'a, Self::Error> {
         Box::pin(async move {
-            let chat = ChatRef {
-                id: params.chat_id,
-                is_forum: params.thread_id.is_some(),
-            };
-            let message = TextMessageRequest {
-                chat: Some(chat),
-                message_thread_id: params.thread_id.map(i64::from).unwrap_or_default(),
+            let options = openplotva_telegram::RichSendOptions {
+                message_thread_id: params.thread_id.map(i64::from),
+                reply_to_message_id: Some(i64::from(params.message_id)),
+                allow_sending_without_reply: true,
                 disable_notification: false,
-                allow_sending_without_reply: Some(true),
-                text: answer.to_owned(),
-                render_as: TELEGRAM_PARSE_MODE_HTML.to_owned(),
                 reply_markup: None,
             };
-            let reply_to = ReplyMessageRef {
-                message_id: i64::from(params.message_id),
-                chat,
-                is_topic_message: params.thread_id.is_some(),
-                message_thread_id: params.thread_id.map(i64::from).unwrap_or_default(),
-            };
-
-            queue_text_message_parts(
-                &self.store,
-                &self.queue,
-                QueueTextRequest {
-                    message: &message,
-                    reply_to: Some(&reply_to),
-                    immediate_first: true,
-                    bypass_chat_restrictions: false,
-                    ephemeral_delete_after: None,
-                },
-                || (self.next_virtual_id)(),
-            )
-            .await?;
+            self.rich
+                .send_rich(params.chat_id, answer, &options)
+                .await
+                .map_err(|err| DialogDispatchEffectError::RichSend(err.to_string()))?;
             Ok(())
         })
     }
@@ -2537,7 +2493,7 @@ mod tests {
         sync::{Arc, Mutex},
     };
 
-    use openplotva_core::{ChatAttachment, MessageIdMapping};
+    use openplotva_core::ChatAttachment;
     use openplotva_dialog::DialogOutput;
     use openplotva_llm::{
         ChatProviderFuture, ContentBlockedError,
@@ -2684,40 +2640,19 @@ mod tests {
     #[tokio::test]
     async fn dialog_dispatcher_effects_allow_sending_without_deleted_reply_target()
     -> Result<(), Box<dyn Error>> {
-        let queue = Arc::new(DispatcherQueue::new(
-            openplotva_telegram::DispatcherConfig::default(),
-        ));
-        let effects = DialogDispatcherEffects::new(DialogVirtualStoreStub, Arc::clone(&queue))
-            .with_virtual_id_factory(Arc::new(|| "dialog-answer-vmsg-test".to_owned()));
+        let mock = Arc::new(crate::rich::MockRichSender::default());
+        let effects = DialogDispatcherEffects::new(mock.clone());
 
         effects
             .send_dialog_answer(&dialog_params("hello"), "pong")
             .await?;
 
-        let item = queue
-            .dequeue_immediate()
-            .ok_or_else(|| io::Error::other("expected queued dialog answer"))?;
-        assert_eq!(item.metadata().virtual_id, "dialog-answer-vmsg-test");
-        let method = item
-            .into_method()
-            .ok_or_else(|| io::Error::other("expected dialog answer method"))?;
-        let openplotva_telegram::TelegramOutboundMethod::SendMessage(method) = method else {
-            panic!("expected sendMessage");
-        };
-        let payload = serde_json::to_value(&*method)?;
-
-        assert_eq!(
-            payload["reply_parameters"]["message_id"],
-            serde_json::json!(100)
-        );
-        assert_eq!(
-            payload["reply_parameters"]["chat_id"],
-            serde_json::json!(42)
-        );
-        assert_eq!(
-            payload["reply_parameters"]["allow_sending_without_reply"],
-            serde_json::json!(true)
-        );
+        let sent = mock.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].chat_id, 42);
+        assert_eq!(sent[0].html, "pong");
+        assert_eq!(sent[0].reply_to_message_id, Some(100));
+        assert!(sent[0].allow_sending_without_reply);
         Ok(())
     }
 
@@ -3689,56 +3624,6 @@ mod tests {
                     .push((params.message_text.clone(), answer.to_owned()));
                 Ok(())
             })
-        }
-    }
-
-    #[derive(Clone, Default)]
-    struct DialogVirtualStoreStub;
-
-    impl VirtualMessageStore for DialogVirtualStoreStub {
-        type Error = std::convert::Infallible;
-
-        fn get_mapping_by_virtual<'a>(
-            &'a self,
-            _vmsg_id: String,
-        ) -> std::pin::Pin<
-            Box<dyn Future<Output = Result<Option<MessageIdMapping>, Self::Error>> + Send + 'a>,
-        > {
-            Box::pin(async { Ok(None) })
-        }
-
-        fn insert_virtual_message<'a>(
-            &'a self,
-            _vmsg_id: String,
-            _chat_id: i64,
-            _thread_id: Option<i32>,
-        ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
-            Box::pin(async { Ok(()) })
-        }
-
-        fn resolve_virtual_message<'a>(
-            &'a self,
-            _vmsg_id: String,
-            _real_message_id: i32,
-        ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
-            Box::pin(async { Ok(()) })
-        }
-
-        fn enqueue_message_op<'a>(
-            &'a self,
-            _vmsg_id: String,
-            _chat_id: i64,
-            _op: &'static str,
-            _payload_json: Option<String>,
-        ) -> std::pin::Pin<Box<dyn Future<Output = Result<i64, Self::Error>> + Send + 'a>> {
-            Box::pin(async { Ok(1) })
-        }
-
-        fn delete_mapping_by_virtual<'a>(
-            &'a self,
-            _vmsg_id: String,
-        ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
-            Box::pin(async { Ok(()) })
         }
     }
 

@@ -8285,6 +8285,23 @@ async fn start_runtime_workers(
         &config.bot.api_base_url,
     )
     .context("create Telegram Bot API client")?;
+    let rich_sender: Arc<dyn rich::RichSender> = Arc::new(rich::RichMessenger::new(
+        openplotva_telegram::RichApiClient::with_base_url(
+            bot_key.to_owned(),
+            &config.bot.api_base_url,
+        )
+        .context("create rich-message API client")?,
+        openplotva_media::uploader::UploaderClient::new(
+            openplotva_media::uploader::UploaderConfig {
+                base_url: config.uploader.base_url.clone(),
+                secret: config.uploader.secret.clone(),
+                timeout: std::time::Duration::from_secs(
+                    config.uploader.timeout_seconds.max(0) as u64
+                ),
+            },
+        )
+        .context("create media uploader client")?,
+    ));
     let bot_identity = telegram
         .execute(openplotva_telegram::build_get_bot_method())
         .await
@@ -8996,10 +9013,8 @@ async fn start_runtime_workers(
             let dialog_provider: openplotva_llm::ChatProviderHandle = dialog_provider;
             dialog_provider_for_updates = Some(Arc::clone(&dialog_provider));
             let dialog_queue = Arc::clone(&task_queue_for_updates);
-            let dialog_effects = dialog_jobs::DialogDispatcherEffects::new(
-                store.clone(),
-                Arc::clone(&dispatcher_queue),
-            );
+            let dialog_effects =
+                dialog_jobs::DialogDispatcherEffects::new(Arc::clone(&rich_sender));
             let mut dialog_materializer = dialog_jobs::PostgresDialogInputMaterializer::new(
                 chat_settings_store.clone(),
                 store.clone(),

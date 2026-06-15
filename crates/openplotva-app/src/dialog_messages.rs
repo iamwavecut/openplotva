@@ -3248,13 +3248,8 @@ mod tests {
         };
 
         let provider = DialogProviderStub::returning("  decoded <b>pong</b>  ");
-        let dispatcher_queue = Arc::new(DispatcherQueue::new(DispatcherConfig::default()));
-        let dispatch_store = VirtualStoreStub::default();
-        let effects = crate::dialog_jobs::DialogDispatcherEffects::new(
-            dispatch_store.clone(),
-            Arc::clone(&dispatcher_queue),
-        )
-        .with_virtual_id_factory(Arc::new(|| "dialog-vmsg-1".to_owned()));
+        let mock = Arc::new(crate::rich::MockRichSender::default());
+        let effects = crate::dialog_jobs::DialogDispatcherEffects::new(mock.clone());
         let worker_report = crate::dialog_jobs::process_dialog_job_once_in_queue_at(
             queue.as_ref(),
             DIALOG_AIFARM_QUEUE_NAME,
@@ -3268,34 +3263,14 @@ mod tests {
         assert!(worker_report.sent_answer);
         assert!(worker_report.completed);
         assert!(!worker_report.failed);
-        assert_eq!(
-            dispatch_store.inserted(),
-            vec![("dialog-vmsg-1".to_owned(), 42, None)]
-        );
-        let snapshot = dispatcher_queue.snapshot();
-        assert_eq!(snapshot.immediate.len(), 1);
-        assert!(snapshot.regular.is_empty());
-        assert_eq!(snapshot.immediate[0].virtual_id, "dialog-vmsg-1");
-        let mut drained = dispatcher_queue.drain_for_shutdown();
-        assert_eq!(drained.immediate.len(), 1);
-        let (metadata, method) = drained.immediate.remove(0).into_parts();
-        assert_eq!(metadata.virtual_id, "dialog-vmsg-1");
-        let method = method.expect("queued dialog answer method");
-        assert_eq!(method.kind(), TelegramOutboundMethodKind::SendMessage);
-        let TelegramOutboundMethod::SendMessage(method) = method else {
-            panic!("expected sendMessage")
-        };
-        let payload = serde_json::to_value(&*method)?;
-        assert_eq!(payload["chat_id"], json!(42));
-        assert_eq!(payload["text"], json!("decoded <b>pong</b>"));
-        assert_eq!(payload["parse_mode"], json!("HTML"));
-        assert_eq!(payload["reply_parameters"]["message_id"], json!(77));
-        assert_eq!(payload["reply_parameters"]["chat_id"], json!(42));
-        assert!(
-            payload["reply_parameters"]
-                .get("allow_sending_without_reply")
-                .is_none()
-        );
+        {
+            let sent = mock.sent.lock().unwrap();
+            assert_eq!(sent.len(), 1);
+            assert_eq!(sent[0].chat_id, 42);
+            assert_eq!(sent[0].html, "decoded <b>pong</b>");
+            assert_eq!(sent[0].reply_to_message_id, Some(77));
+            assert!(sent[0].allow_sending_without_reply);
+        }
         let provider_inputs = provider.inputs();
         assert_eq!(provider_inputs.len(), 1);
         assert_eq!(provider_inputs[0].context.chat_id, 42);
@@ -3430,13 +3405,8 @@ mod tests {
         };
 
         let provider = DialogProviderStub::returning("  random <b>pong</b>  ");
-        let dispatcher_queue = Arc::new(DispatcherQueue::new(DispatcherConfig::default()));
-        let dispatch_store = VirtualStoreStub::default();
-        let effects = crate::dialog_jobs::DialogDispatcherEffects::new(
-            dispatch_store.clone(),
-            Arc::clone(&dispatcher_queue),
-        )
-        .with_virtual_id_factory(Arc::new(|| "random-dialog-vmsg-1".to_owned()));
+        let mock = Arc::new(crate::rich::MockRichSender::default());
+        let effects = crate::dialog_jobs::DialogDispatcherEffects::new(mock.clone());
         let worker_report = crate::dialog_jobs::process_dialog_job_once_in_queue_at(
             queue.as_ref(),
             DIALOG_AIFARM_QUEUE_NAME,
@@ -3450,27 +3420,14 @@ mod tests {
         assert!(worker_report.sent_answer);
         assert!(worker_report.completed);
         assert!(!worker_report.failed);
-        assert_eq!(
-            dispatch_store.inserted(),
-            vec![("random-dialog-vmsg-1".to_owned(), -100, None)]
-        );
-        let snapshot = dispatcher_queue.snapshot();
-        assert_eq!(snapshot.immediate.len(), 1);
-        assert!(snapshot.regular.is_empty());
-        assert_eq!(snapshot.immediate[0].virtual_id, "random-dialog-vmsg-1");
-        let item = dispatcher_queue
-            .dequeue_immediate()
-            .ok_or_else(|| std::io::Error::other("expected random dialog answer"))?;
-        assert_eq!(item.metadata().virtual_id, "random-dialog-vmsg-1");
-        let method = item
-            .into_method()
-            .ok_or_else(|| std::io::Error::other("expected random dialog answer method"))?;
-        assert_eq!(method.kind(), TelegramOutboundMethodKind::SendMessage);
-        let payload = outbound_method_payload(&method);
-        assert_eq!(payload["chat_id"], json!(-100));
-        assert_eq!(payload["text"], json!("random <b>pong</b>"));
-        assert_eq!(payload["parse_mode"], json!("HTML"));
-        assert_eq!(payload["reply_parameters"]["message_id"], json!(78));
+        {
+            let sent = mock.sent.lock().unwrap();
+            assert_eq!(sent.len(), 1);
+            assert_eq!(sent[0].chat_id, -100);
+            assert_eq!(sent[0].html, "random <b>pong</b>");
+            assert_eq!(sent[0].reply_to_message_id, Some(78));
+            assert!(sent[0].allow_sending_without_reply);
+        }
         let provider_inputs = provider.inputs();
         assert_eq!(provider_inputs.len(), 1);
         assert_eq!(provider_inputs[0].context.chat_id, -100);
