@@ -284,9 +284,9 @@ impl TelegramHtmlSanitizer {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-struct CleanAttr {
-    key: &'static str,
-    value: Option<String>,
+pub(crate) struct CleanAttr {
+    pub(crate) key: &'static str,
+    pub(crate) value: Option<String>,
 }
 
 fn sanitize_tag(token: &Tag) -> Option<(&'static str, Vec<CleanAttr>)> {
@@ -311,7 +311,7 @@ fn sanitize_tag(token: &Tag) -> Option<(&'static str, Vec<CleanAttr>)> {
     }
 }
 
-fn telegram_attr(
+pub(crate) fn telegram_attr(
     token: &Tag,
     key: &'static str,
     required: bool,
@@ -331,7 +331,7 @@ fn telegram_attr(
     if required { None } else { Some(Vec::new()) }
 }
 
-fn telegram_flag_attr(token: &Tag, key: &'static str) -> Option<Vec<CleanAttr>> {
+pub(crate) fn telegram_flag_attr(token: &Tag, key: &'static str) -> Option<Vec<CleanAttr>> {
     token
         .attrs
         .iter()
@@ -383,7 +383,7 @@ fn clean_code_class(value: &str) -> Option<String> {
     }
 }
 
-fn attr_name_eq(attr: &Attribute, key: &str) -> bool {
+pub(crate) fn attr_name_eq(attr: &Attribute, key: &str) -> bool {
     attr.name.local.as_ref().eq_ignore_ascii_case(key)
 }
 
@@ -395,7 +395,7 @@ fn normalize_tag(tag: &str) -> Option<&'static str> {
         .map(|(_, normalized)| *normalized)
 }
 
-fn is_skipped_content_tag(tag: &str) -> bool {
+pub(crate) fn is_skipped_content_tag(tag: &str) -> bool {
     let trimmed = tag.trim();
     trimmed.eq_ignore_ascii_case("script")
         || trimmed.eq_ignore_ascii_case("style")
@@ -435,11 +435,11 @@ fn close_html_tags(out: &mut String, stack: &[String]) {
     }
 }
 
-fn last_stack_index(stack: &[String], tag: &str) -> Option<usize> {
+pub(crate) fn last_stack_index(stack: &[String], tag: &str) -> Option<usize> {
     stack.iter().rposition(|open| open == tag)
 }
 
-fn escape_html_attr(value: &str) -> String {
+pub(crate) fn escape_html_attr(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for ch in value.chars() {
         match ch {

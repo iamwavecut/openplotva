@@ -8,6 +8,7 @@ mod outbound;
 mod pending_ops;
 mod persistence;
 mod rate_limit;
+mod rich_html;
 mod transport;
 mod update_startup;
 
@@ -89,6 +90,10 @@ pub use persistence::{
     restore_persistent_queue_replay,
 };
 pub use rate_limit::{ChatLimiters, DEFAULT_DISPATCH_INTERVAL, DEFAULT_RATE_LIMITER_MAX_IDLE};
+pub use rich_html::{
+    RICH_MEDIA_MAX, RICH_MESSAGE_MAX_CHARS, is_valid_rich_html, rich_message_within_char_limit,
+    sanitize_rich_html,
+};
 pub use transport::{
     TelegramOutboundMethod, TelegramOutboundMethodKind, TelegramOutboundResponse,
     TelegramOutboundResponseKind, TelegramSendErrorClassification, classify_telegram_send_error,
