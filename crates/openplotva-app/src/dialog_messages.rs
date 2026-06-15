@@ -6256,18 +6256,13 @@ mod tests {
             permission_store.clone(),
         ));
         let music_files = MusicReferenceFileStoreCapture::default();
-        let music_sender = MusicTelegramSenderCapture::new(vec![
-            Ok(TelegramOutboundResponse::Message(Box::new(
-                telegram_bot_message(-100, 610)?,
-            ))),
-            Ok(TelegramOutboundResponse::Message(Box::new(
-                telegram_bot_message(-100, 611)?,
-            ))),
-        ]);
+        let music_sender = MusicTelegramSenderCapture::new(vec![]);
+        let music_rich = Arc::new(crate::rich::MockRichSender::default());
         let music_effects = crate::music_jobs::TelegramMusicJobEffects::new(
             permissions,
             music_files.clone(),
             music_sender.clone(),
+            music_rich.clone(),
         );
         let worker_report = crate::music_jobs::run_music_queue_once(
             &queue,
@@ -6310,42 +6305,19 @@ mod tests {
             Vec::<String>::new(),
             "no reference audio should be downloaded for plain !song"
         );
-        let music_methods = music_sender.methods();
-        assert_eq!(
-            music_methods
-                .iter()
-                .map(|(kind, _)| *kind)
-                .collect::<Vec<_>>(),
-            vec![
-                TelegramOutboundMethodKind::SendAudio,
-                TelegramOutboundMethodKind::SendMessage,
-            ]
-        );
-        let audio_debug = music_methods[0].1["debug"].as_str().expect("audio debug");
-        assert!(audio_debug.contains("-100"));
-        assert!(audio_debug.contains("caption"));
-        assert!(audio_debug.contains("<code>neon rain</code>"));
-        assert!(audio_debug.contains("reply_parameters"));
-        assert!(audio_debug.contains("78"));
-        assert!(audio_debug.contains("HTML"));
-        assert_eq!(music_methods[1].1["chat_id"], json!(-100));
-        assert_eq!(music_methods[1].1["parse_mode"], json!("HTML"));
-        assert_eq!(
-            music_methods[1].1["reply_parameters"]["message_id"],
-            json!(610)
-        );
         assert!(
-            music_methods[1].1["text"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("<b>Текст песни</b>")
+            music_sender.methods().is_empty(),
+            "song now sends one rich message, not classic audio + lyrics"
         );
-        assert!(
-            music_methods[1].1["text"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("neon rain")
-        );
+        let sent = music_rich.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].chat_id, -100);
+        assert_eq!(sent[0].reply_to_message_id, Some(78));
+        assert!(sent[0].html.contains(r#"<audio src="#));
+        assert!(sent[0].html.contains("Neon Rain"));
+        assert!(sent[0].html.contains("Synthwave"));
+        assert!(sent[0].html.contains("neon rain"));
+        drop(sent);
         assert_eq!(queue.records()[0].status, JobStatus::Completed);
         assert_eq!(update_queue.len().await?, 0);
 

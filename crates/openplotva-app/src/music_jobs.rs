@@ -23,10 +23,7 @@ use openplotva_taskman::{
     TaskQueueJobEvent, TaskQueueWorkItem, music_gen_job_params_from_stateless_job,
 };
 use openplotva_telegram::{
-    AudioMessageRequest, AudioSource, ChatRef, EditReplyMarkupMessageRequest, ReplyMessageRef,
-    ReplyParametersPlan, TELEGRAM_PARSE_MODE_HTML, TelegramOutboundMethod,
-    TelegramOutboundResponse, build_audio_message_method, build_edit_reply_markup_message_method,
-    build_lyrics_delete_keyboard, build_text_message_methods, ensure_telegram_safe_text,
+    TelegramOutboundMethod, TelegramOutboundResponse, ensure_telegram_safe_text,
     escape_telegram_html_text, execute_telegram_method,
 };
 use rand::RngExt;
@@ -43,7 +40,6 @@ pub const VIP_URL: &str = "https://t.me/PlotvoBot?start=vip";
 const MUSIC_WORKER_ID: &str = "music-vip-worker";
 const DEFAULT_SONG_STYLE: &str = "indie pop, clear vocal, acoustic guitar, emotional, 96 BPM";
 const REFERENCE_AUDIO_FILE_NAME: &str = "reference_audio.mp3";
-const LYRICS_KEYBOARD_DELETE_AFTER: StdDuration = StdDuration::from_secs(60);
 const SUPPORT_PHRASES: [&str; 15] = [
     "автору на вдохновение ✨",
     "Плотва в долгу ❤️",
@@ -484,21 +480,11 @@ pub trait MusicJobEffects {
         params: &'a MusicGenJobParams,
     ) -> MusicJobEffectFuture<'a, Option<MusicReferenceAudio>>;
 
-    /// Send generated song audio.
+    /// Send the generated song as one rich message (audio + styles + lyrics + author).
     fn send_generated_song<'a>(
         &'a self,
         plan: GeneratedSongSendPlan,
     ) -> MusicJobEffectFuture<'a, Result<Option<i32>, String>>;
-
-    /// Send generated lyrics sidecar.
-    fn send_song_lyrics<'a>(
-        &'a self,
-        chat_id: i64,
-        audio_message_id: i32,
-        user_id: i64,
-        thread_id: Option<i32>,
-        lyrics: &'a str,
-    ) -> MusicJobEffectFuture<'a, ()>;
 }
 
 /// Telegram download boundary for reference audio.
@@ -586,16 +572,23 @@ pub struct TelegramMusicJobEffects<Permissions, Files, Sender> {
     permissions: Arc<Permissions>,
     files: Files,
     telegram: Sender,
+    rich: Arc<dyn crate::rich::RichSender>,
 }
 
 impl<Permissions, Files, Sender> TelegramMusicJobEffects<Permissions, Files, Sender> {
     /// Build concrete effects.
     #[must_use]
-    pub fn new(permissions: Arc<Permissions>, files: Files, telegram: Sender) -> Self {
+    pub fn new(
+        permissions: Arc<Permissions>,
+        files: Files,
+        telegram: Sender,
+        rich: Arc<dyn crate::rich::RichSender>,
+    ) -> Self {
         Self {
             permissions,
             files,
             telegram,
+            rich,
         }
     }
 }
@@ -651,88 +644,37 @@ where
         plan: GeneratedSongSendPlan,
     ) -> MusicJobEffectFuture<'a, Result<Option<i32>, String>> {
         Box::pin(async move {
-            let method =
-                build_generated_song_audio_method(&plan).map_err(|error| error.to_string())?;
-            let response = self
-                .telegram
-                .send_music_method(TelegramOutboundMethod::from(method))
-                .await?;
-            Ok(telegram_response_message_id(&response))
-        })
-    }
-
-    fn send_song_lyrics<'a>(
-        &'a self,
-        chat_id: i64,
-        audio_message_id: i32,
-        user_id: i64,
-        thread_id: Option<i32>,
-        lyrics: &'a str,
-    ) -> MusicJobEffectFuture<'a, ()> {
-        Box::pin(async move {
-            let lyrics = lyrics.trim();
-            if lyrics.is_empty() {
-                return;
-            }
-            let escaped = escape_telegram_html_text(lyrics);
-            let text = format!("<b>Текст песни</b>\n<blockquote expandable>{escaped}</blockquote>");
-            let req = openplotva_telegram::TextMessageRequest {
-                chat: None,
-                message_thread_id: i64::from(thread_id.unwrap_or_default()),
+            let extension = song_file_extension(&plan.generated.file_name);
+            let title = song_file_title(&plan.material.title, &plan.topic);
+            let pretty_name = build_song_file_name(&plan.user_full_name, &title, &extension);
+            let mime = song_audio_mime(&extension);
+            let audio_url = self
+                .rich
+                .upload_bytes(plan.generated.data.clone(), mime, Some(&pretty_name))
+                .await
+                .map_err(|error| error.to_string())?;
+            let footer_html =
+                build_song_footer_html(&plan.user_full_name, plan.is_vip, random_support_phrase());
+            let html = crate::rich::compose_song_message(&crate::rich::SongMessage {
+                title: &title,
+                styles: &plan.material.raw_style,
+                audio_url: &audio_url,
+                lyrics: &plan.material.lyrics,
+                footer_html: &footer_html,
+            });
+            let options = openplotva_telegram::RichSendOptions {
+                message_thread_id: plan.thread_id.map(i64::from),
+                reply_to_message_id: Some(i64::from(plan.message_id)),
+                allow_sending_without_reply: true,
                 disable_notification: false,
-                allow_sending_without_reply: Some(true),
-                text,
-                render_as: TELEGRAM_PARSE_MODE_HTML.to_owned(),
-                reply_markup: Some(openplotva_telegram::ReplyMarkup::from(
-                    build_lyrics_delete_keyboard(user_id, chat_id),
-                )),
+                reply_markup: None,
             };
-            let reply = ReplyMessageRef {
-                message_id: i64::from(audio_message_id),
-                chat: ChatRef {
-                    id: chat_id,
-                    is_forum: false,
-                },
-                is_topic_message: false,
-                message_thread_id: i64::from(thread_id.unwrap_or_default()),
-            };
-            let Ok(methods) = build_text_message_methods(&req, Some(&reply)) else {
-                return;
-            };
-            let mut last_message_id = None;
-            for method in methods {
-                if let Ok(response) = self
-                    .telegram
-                    .send_music_method(TelegramOutboundMethod::from(method))
-                    .await
-                {
-                    last_message_id = telegram_response_message_id(&response).or(last_message_id);
-                }
-            }
-            if let Some(lyrics_message_id) = last_message_id {
-                let telegram = self.telegram.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(LYRICS_KEYBOARD_DELETE_AFTER).await;
-                    let Ok(method) =
-                        build_edit_reply_markup_message_method(&EditReplyMarkupMessageRequest {
-                            chat: ChatRef {
-                                id: chat_id,
-                                is_forum: false,
-                            },
-                            message_id: i64::from(lyrics_message_id),
-                            reply_markup: openplotva_telegram::build_inline_keyboard_markup(Vec::<
-                                Vec<carapax::types::InlineKeyboardButton>,
-                            >::new(
-                            )),
-                        })
-                    else {
-                        return;
-                    };
-                    let _ = telegram
-                        .send_music_method(TelegramOutboundMethod::from(method))
-                        .await;
-                });
-            }
+            let message_id = self
+                .rich
+                .send_rich(plan.chat_id, &html, &options)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(Some(message_id as i32))
         })
     }
 }
@@ -884,23 +826,12 @@ where
         })
         .await
     {
-        Ok(Some(audio_message_id)) => {
-            effects
-                .send_song_lyrics(
-                    params.chat_id,
-                    audio_message_id,
-                    params.user_id,
-                    params.thread_id,
-                    &material.lyrics,
-                )
-                .await;
-            MusicJobExecutionReport {
-                outcome: MusicJobExecutionOutcome::Completed,
-                topic,
-                error: None,
-                result_message_id: Some(audio_message_id),
-            }
-        }
+        Ok(Some(audio_message_id)) => MusicJobExecutionReport {
+            outcome: MusicJobExecutionOutcome::Completed,
+            topic,
+            error: None,
+            result_message_id: Some(audio_message_id),
+        },
         Ok(None) => MusicJobExecutionReport {
             outcome: MusicJobExecutionOutcome::Completed,
             topic,
@@ -1293,6 +1224,31 @@ pub fn build_song_caption(topic: &str, style: &str, author: &str, is_vip: bool) 
     build_song_caption_with_support(topic, style, author, is_vip, random_support_phrase())
 }
 
+/// Author + support footer fragment for the rich song message (title and styles are
+/// rendered as separate blocks by `rich::compose_song_message`).
+#[must_use]
+pub fn build_song_footer_html(author: &str, is_vip: bool, support_text: &str) -> String {
+    let cleaned_author = ensure_telegram_safe_text(author.trim());
+    let mut author_text = escape_telegram_html_text(&cleaned_author);
+    if is_vip && !cleaned_author.is_empty() {
+        author_text = format!("<a href=\"{VIP_URL}\">VIP-персоны  👑</a> {author_text}");
+    }
+    format!(
+        "за авторством <i>{author_text}</i> · <a href=\"{SUPPORT_ME_URL}\">{}</a>",
+        escape_telegram_html_text(support_text)
+    )
+}
+
+fn song_audio_mime(extension: &str) -> &'static str {
+    if extension.eq_ignore_ascii_case("ogg") {
+        "audio/ogg"
+    } else if extension.eq_ignore_ascii_case("wav") {
+        "audio/wav"
+    } else {
+        "audio/mpeg"
+    }
+}
+
 fn song_material_from_reprompt(
     params: &MusicGenJobParams,
     reprompt: SongPromptResult,
@@ -1415,39 +1371,6 @@ fn title_from_topic(topic: &str) -> String {
         .join(" ")
 }
 
-fn build_generated_song_audio_method(
-    plan: &GeneratedSongSendPlan,
-) -> Result<carapax::types::SendAudio, openplotva_telegram::OutboundBuildError> {
-    let ext = song_file_extension(&plan.generated.file_name);
-    let title = song_file_title(&plan.material.title, &plan.topic);
-    let pretty_name = build_song_file_name(&plan.user_full_name, &title, &ext);
-    let request = AudioMessageRequest {
-        chat: ChatRef {
-            id: plan.chat_id,
-            is_forum: false,
-        },
-        message_thread_id: i64::from(plan.thread_id.unwrap_or_default()),
-        disable_notification: false,
-        audio: AudioSource::Bytes {
-            file_name: pretty_name,
-            bytes: plan.generated.data.clone(),
-        },
-        caption: build_song_caption(
-            &plan.topic,
-            &plan.material.raw_style,
-            &plan.user_full_name,
-            plan.is_vip,
-        ),
-        render_as: TELEGRAM_PARSE_MODE_HTML.to_owned(),
-        reply_parameters: Some(ReplyParametersPlan {
-            message_id: i64::from(plan.message_id),
-            chat_id: plan.chat_id,
-            allow_sending_without_reply: true,
-        }),
-    };
-    build_audio_message_method(&request)
-}
-
 fn finalize_music_completed(
     queue: &InMemoryTaskQueue,
     job_id: i64,
@@ -1478,19 +1401,6 @@ fn trace_music_queue_tick(tick: &MusicQueuePollReport) {
         error = tick.error.as_deref(),
         "processed music generation taskman worker tick"
     );
-}
-
-fn telegram_response_message_id(response: &TelegramOutboundResponse) -> Option<i32> {
-    match response {
-        TelegramOutboundResponse::Message(message) => i32::try_from(message.id).ok(),
-        TelegramOutboundResponse::Messages(messages) => messages
-            .first()
-            .and_then(|message| i32::try_from(message.id).ok()),
-        TelegramOutboundResponse::EditMessage(_)
-        | TelegramOutboundResponse::Boolean(_)
-        | TelegramOutboundResponse::SentGuestMessage(_)
-        | TelegramOutboundResponse::String(_) => None,
-    }
 }
 
 fn task_queue_error_message(error: TaskQueueError) -> String {
@@ -1757,7 +1667,6 @@ mod tests {
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].chat_id, 42);
         assert_eq!(sent[0].thread_id, Some(77));
-        assert_eq!(effects.lyrics_count(), 1);
         assert_eq!(generator.requests()[0].topic, "ночной город");
         assert_eq!(
             build_song_release_prompt(
@@ -2070,7 +1979,6 @@ mod tests {
     struct EffectsStub {
         can_send: bool,
         sent: Arc<Mutex<Vec<GeneratedSongSendPlan>>>,
-        lyrics: Arc<Mutex<usize>>,
         refs: Arc<Mutex<VecDeque<Option<MusicReferenceAudio>>>>,
     }
 
@@ -2079,7 +1987,6 @@ mod tests {
             Self {
                 can_send: true,
                 sent: Arc::new(Mutex::new(Vec::new())),
-                lyrics: Arc::new(Mutex::new(0)),
                 refs: Arc::new(Mutex::new(VecDeque::new())),
             }
         }
@@ -2093,10 +2000,6 @@ mod tests {
 
         fn sent(&self) -> Vec<GeneratedSongSendPlan> {
             lock(&self.sent).clone()
-        }
-
-        fn lyrics_count(&self) -> usize {
-            *lock(&self.lyrics)
         }
     }
 
@@ -2119,19 +2022,6 @@ mod tests {
             Box::pin(async move {
                 lock(&self.sent).push(plan);
                 Ok(Some(100))
-            })
-        }
-
-        fn send_song_lyrics<'a>(
-            &'a self,
-            _chat_id: i64,
-            _audio_message_id: i32,
-            _user_id: i64,
-            _thread_id: Option<i32>,
-            _lyrics: &'a str,
-        ) -> MusicJobEffectFuture<'a, ()> {
-            Box::pin(async move {
-                *lock(&self.lyrics) += 1;
             })
         }
     }

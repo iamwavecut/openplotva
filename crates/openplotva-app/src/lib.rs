@@ -9295,6 +9295,7 @@ async fn start_runtime_workers(
                     Arc::clone(&permission_policy),
                     PostgresTelegramFileStore::new(service_clients.postgres.clone()),
                     telegram.clone(),
+                    Arc::clone(&rich_sender),
                 );
                 let music_stop = stop.subscribe();
                 let music_worker = tokio::spawn(async move {

@@ -88,7 +88,7 @@ pub type RichUploadFuture<'a> =
 
 /// Abstraction over rich sending so handlers/workers can be unit-tested with a mock
 /// instead of issuing real Bot API / uploader HTTP calls.
-pub trait RichSender: Send + Sync {
+pub trait RichSender: Send + Sync + std::fmt::Debug {
     /// Send a rich message; resolves to the sent message id.
     fn send_rich<'a>(
         &'a self,
@@ -193,7 +193,7 @@ pub(crate) struct RichSendCall {
 /// Test double capturing rich sends/edits/drafts/uploads without any HTTP. Shared
 /// across scenario handler tests so they assert composed HTML + reply options.
 #[cfg(test)]
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub(crate) struct MockRichSender {
     pub sent: std::sync::Mutex<Vec<RichSendCall>>,
     pub edited: std::sync::Mutex<Vec<(i64, i64, String)>>,
