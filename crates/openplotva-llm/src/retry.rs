@@ -202,8 +202,10 @@ const RETRYABLE_MESSAGE_RULES: &[(FailureReason, &[&str])] = &[
             "status: unavailable",
             "status unavailable",
             "service unavailable",
+            "service disabled",
             "connection refused",
             "connection reset",
+            "error sending request for url",
             "bad gateway",
             "gateway timeout",
             "error 503",
@@ -258,6 +260,14 @@ mod tests {
             ),
             (
                 "Error 503, Status: UNAVAILABLE".to_owned(),
+                FailureReason::ProviderUnavailable,
+            ),
+            (
+                "submit dialog job: status 409: {\"detail\":\"service disabled\"}".to_owned(),
+                FailureReason::ProviderUnavailable,
+            ),
+            (
+                "error sending request for url (http://aifarm.barb-gray.ts.net:50051/v1/jobs/blocking)".to_owned(),
                 FailureReason::ProviderUnavailable,
             ),
             (

@@ -251,9 +251,12 @@ where
                     })
                 }
                 MessageGateDecision::Skip(reason) => {
+                    let (chat_id, chat_type) = message_gate_update_chat_fields(&update);
                     tracing::debug!(
                         ?reason,
                         update_id = update.id,
+                        chat_id,
+                        chat_type,
                         "Telegram message skipped before fetcher routing"
                     );
                     Ok(())
@@ -491,6 +494,13 @@ fn chat_type_name(chat: &TelegramChat) -> &'static str {
         TelegramChat::Private(_) => "private",
         TelegramChat::Supergroup(_) => "supergroup",
     }
+}
+
+fn message_gate_update_chat_fields(update: &TelegramUpdate) -> (i64, &'static str) {
+    let TelegramUpdateType::Message(message) = &update.update_type else {
+        return (0, "");
+    };
+    (message.chat.get_id().into(), chat_type_name(&message.chat))
 }
 
 #[cfg(test)]
