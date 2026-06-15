@@ -38,6 +38,16 @@ Then pass `Arc::clone(&rich_messenger)` into each effects constructor below.
   rich through the dispatcher for parity. Streaming throttle uses `RichApiError::retry_after()`.
 - `RichMessenger.send` re-sanitizes; for the dialog path (already sanitized upstream) that's
   idempotent and safe.
+- **Scenarios depend on `Arc<dyn crate::rich::RichSender>`, NOT the concrete `RichMessenger`.**
+  `RichSender` (in `rich.rs`) abstracts send/edit/draft/upload so handler/worker unit tests
+  inject a mock instead of hitting HTTP — `RichMessenger` implements it. `send_rich` resolves to
+  the message id (`i64`). Each effects struct that currently holds `store`/`queue` for sending
+  should be slimmed to hold `Arc<dyn RichSender>` (drop the now-unused queue plumbing + `Store`
+  generic + `with_virtual_id_factory`) to avoid dead fields; update its `::new` call sites
+  (tests + composition root) accordingly. A `MockRichSender` test double exists in `rich.rs`'s
+  test module — relocate it to module-level `#[cfg(test)] pub(crate)` when the first scenario
+  test needs it cross-module.
+- Composition root: build `let rich_sender: Arc<dyn crate::rich::RichSender> = Arc::new(RichMessenger::new(rich_api_client, uploader_client));` once and `Arc::clone` into each effects.
 
 ## Per-scenario plan
 

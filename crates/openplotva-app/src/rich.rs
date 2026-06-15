@@ -7,7 +7,10 @@
 //! sanitized rich HTML; they are pure and unit-tested so the visual contract is pinned
 //! independently of the send path.
 
-use openplotva_media::uploader::UploaderClient;
+use std::future::Future;
+use std::pin::Pin;
+
+use openplotva_media::uploader::{UploaderClient, UploaderError};
 use openplotva_telegram::{
     RichApiClient, RichApiError, RichMessage, RichSendOptions, escape_telegram_html_text,
     sanitize_rich_html,
@@ -74,6 +77,105 @@ impl RichMessenger {
                 message_thread_id,
             )
             .await
+    }
+}
+
+/// Boxed future returned by [`RichSender`] send/edit/draft methods.
+pub type RichSendFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, RichApiError>> + Send + 'a>>;
+/// Boxed future returned by [`RichSender`] upload methods.
+pub type RichUploadFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<String, UploaderError>> + Send + 'a>>;
+
+/// Abstraction over rich sending so handlers/workers can be unit-tested with a mock
+/// instead of issuing real Bot API / uploader HTTP calls.
+pub trait RichSender: Send + Sync {
+    /// Send a rich message; resolves to the sent message id.
+    fn send_rich<'a>(
+        &'a self,
+        chat_id: i64,
+        html: &'a str,
+        options: &'a RichSendOptions,
+    ) -> RichSendFuture<'a, i64>;
+    /// Replace a message's rich content in place.
+    fn edit_rich<'a>(
+        &'a self,
+        chat_id: i64,
+        message_id: i64,
+        html: &'a str,
+        reply_markup: Option<Value>,
+    ) -> RichSendFuture<'a, ()>;
+    /// Stream a partial rich draft (private chats only).
+    fn draft_rich<'a>(
+        &'a self,
+        chat_id: i64,
+        draft_id: i64,
+        html: &'a str,
+        message_thread_id: Option<i64>,
+    ) -> RichSendFuture<'a, ()>;
+    /// Publish bytes to the media host; resolves to a public HTTPS URL.
+    fn upload_bytes<'a>(
+        &'a self,
+        bytes: Vec<u8>,
+        content_type: &'a str,
+        explicit_name: Option<&'a str>,
+    ) -> RichUploadFuture<'a>;
+    /// Hand a remote URL to the media host; resolves to a public HTTPS URL.
+    fn upload_url<'a>(
+        &'a self,
+        source_url: &'a str,
+        explicit_name: Option<&'a str>,
+    ) -> RichUploadFuture<'a>;
+}
+
+impl RichSender for RichMessenger {
+    fn send_rich<'a>(
+        &'a self,
+        chat_id: i64,
+        html: &'a str,
+        options: &'a RichSendOptions,
+    ) -> RichSendFuture<'a, i64> {
+        Box::pin(async move { Ok(self.send(chat_id, html, options).await?.id) })
+    }
+
+    fn edit_rich<'a>(
+        &'a self,
+        chat_id: i64,
+        message_id: i64,
+        html: &'a str,
+        reply_markup: Option<Value>,
+    ) -> RichSendFuture<'a, ()> {
+        Box::pin(async move { self.edit(chat_id, message_id, html, reply_markup).await })
+    }
+
+    fn draft_rich<'a>(
+        &'a self,
+        chat_id: i64,
+        draft_id: i64,
+        html: &'a str,
+        message_thread_id: Option<i64>,
+    ) -> RichSendFuture<'a, ()> {
+        Box::pin(async move { self.draft(chat_id, draft_id, html, message_thread_id).await })
+    }
+
+    fn upload_bytes<'a>(
+        &'a self,
+        bytes: Vec<u8>,
+        content_type: &'a str,
+        explicit_name: Option<&'a str>,
+    ) -> RichUploadFuture<'a> {
+        Box::pin(async move {
+            self.uploader
+                .upload_bytes(bytes, content_type, explicit_name)
+                .await
+        })
+    }
+
+    fn upload_url<'a>(
+        &'a self,
+        source_url: &'a str,
+        explicit_name: Option<&'a str>,
+    ) -> RichUploadFuture<'a> {
+        Box::pin(async move { self.uploader.upload_url(source_url, explicit_name).await })
     }
 }
 
@@ -258,6 +360,87 @@ pub fn compose_leaderboard(theme: &str, rows: &[LeaderboardRow]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Test double capturing rich sends/edits/uploads without any HTTP.
+    #[derive(Default)]
+    pub(crate) struct MockRichSender {
+        pub sent: Mutex<Vec<(i64, String)>>,
+        pub edited: Mutex<Vec<(i64, i64, String)>>,
+    }
+
+    impl RichSender for MockRichSender {
+        fn send_rich<'a>(
+            &'a self,
+            chat_id: i64,
+            html: &'a str,
+            _options: &'a RichSendOptions,
+        ) -> RichSendFuture<'a, i64> {
+            self.sent.lock().unwrap().push((chat_id, html.to_owned()));
+            Box::pin(async { Ok(1001) })
+        }
+
+        fn edit_rich<'a>(
+            &'a self,
+            chat_id: i64,
+            message_id: i64,
+            html: &'a str,
+            _reply_markup: Option<Value>,
+        ) -> RichSendFuture<'a, ()> {
+            self.edited
+                .lock()
+                .unwrap()
+                .push((chat_id, message_id, html.to_owned()));
+            Box::pin(async { Ok(()) })
+        }
+
+        fn draft_rich<'a>(
+            &'a self,
+            _chat_id: i64,
+            _draft_id: i64,
+            _html: &'a str,
+            _message_thread_id: Option<i64>,
+        ) -> RichSendFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn upload_bytes<'a>(
+            &'a self,
+            _bytes: Vec<u8>,
+            _content_type: &'a str,
+            _explicit_name: Option<&'a str>,
+        ) -> RichUploadFuture<'a> {
+            Box::pin(async { Ok("https://plotva.geta.moe/mock.bin".to_owned()) })
+        }
+
+        fn upload_url<'a>(
+            &'a self,
+            source_url: &'a str,
+            _explicit_name: Option<&'a str>,
+        ) -> RichUploadFuture<'a> {
+            let url = source_url.to_owned();
+            Box::pin(async move { Ok(url) })
+        }
+    }
+
+    #[tokio::test]
+    async fn mock_rich_sender_captures_send_and_edit() {
+        let mock = MockRichSender::default();
+        let id = mock
+            .send_rich(7, "<b>x</b>", &RichSendOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(id, 1001);
+        mock.edit_rich(7, id, "<i>y</i>", None).await.unwrap();
+        assert_eq!(
+            mock.sent.lock().unwrap().as_slice(),
+            &[(7, "<b>x</b>".to_owned())]
+        );
+        assert_eq!(
+            mock.edited.lock().unwrap().as_slice(),
+            &[(7, 1001, "<i>y</i>".to_owned())]
+        );
+    }
 
     #[test]
     fn rates_table_is_rich() {
