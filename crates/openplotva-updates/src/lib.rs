@@ -325,6 +325,9 @@ const BLOCKING_RESPONSE_TIMEOUT_GRACE: Duration = Duration::from_secs(2);
 const COMMAND_RESPONSE_TIMEOUT: Duration = Duration::from_secs(3);
 const REDIS_UPDATE_COMMAND_CLIENT_NAME: &str = "openplotva:updates:commands";
 const REDIS_UPDATE_BLOCKING_CLIENT_NAME: &str = "openplotva:updates:blocking";
+/// Cap on retained enqueue-error strings per producer run so a sustained queue
+/// outage cannot grow the report without bound.
+const MAX_ENQUEUE_ERRORS: usize = 64;
 
 fn command_connection_config() -> ConnectionManagerConfig {
     ConnectionManagerConfig::new().set_response_timeout(Some(COMMAND_RESPONSE_TIMEOUT))
@@ -597,6 +600,9 @@ pub struct UpdateProducerRunReport {
     pub skipped: usize,
     pub dropped_by_ingress_guard: usize,
     pub enqueue_errors: Vec<String>,
+    /// Count of enqueue errors that occurred beyond `MAX_ENQUEUE_ERRORS` and were not
+    /// retained in `enqueue_errors`.
+    pub dropped_enqueue_errors: usize,
     /// Whether the source closed before shutdown was requested.
     pub source_closed: bool,
 }
@@ -692,7 +698,11 @@ where
                         Err(error) => {
                             let error = error.to_string();
                             tracing::warn!(%error, "failed to enqueue Telegram update");
-                            report.enqueue_errors.push(error);
+                            if report.enqueue_errors.len() < MAX_ENQUEUE_ERRORS {
+                                report.enqueue_errors.push(error);
+                            } else {
+                                report.dropped_enqueue_errors += 1;
+                            }
                         }
                     },
                 }
@@ -3327,7 +3337,7 @@ mod tests {
 
     use super::{
         DEFAULT_UPDATE_QUEUE_KEY, EncodedUpdate, GO_ALLOWED_UPDATE_NAMES, GO_ALLOWED_UPDATES,
-        GoUpdateType, GuestChainMessage, GuestChainRole, RedisUpdateQueue,
+        GoUpdateType, GuestChainMessage, GuestChainRole, MAX_ENQUEUE_ERRORS, RedisUpdateQueue,
         TelegramMessageAttachmentOptions, UpdateCodecError, UpdateConsumerConfig,
         UpdateProducerQueue, UpdateProducerQueueFuture, UpdateProducerSource,
         UpdateProducerSourceFuture, UpdateStage, UpdateStageOutcome, UpdateStageReport,
@@ -3930,6 +3940,28 @@ mod tests {
         assert!(report.source_closed);
         assert_eq!(report.enqueue_errors, vec!["redis unavailable".to_owned()]);
         assert_eq!(queue.enqueued_ids(), vec![101]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_producer_enqueue_error_vec_is_bounded() -> Result<(), Box<dyn Error>> {
+        // Drive more than MAX_ENQUEUE_ERRORS failures so the cap and the dropped
+        // counter are both exercised.
+        let total_failures = MAX_ENQUEUE_ERRORS + 10;
+        let updates: Vec<TelegramUpdate> = (0..total_failures as i64)
+            .map(sample_message_update_with_id)
+            .collect::<Result<_, _>>()?;
+        let failures: Vec<&'static str> = vec!["queue full"; total_failures];
+        let source = ProducerSourceStub::new(updates);
+        let queue = ProducerQueueStub::default().with_failures(failures);
+
+        let report = run_update_producer_until(&source, &queue, std::future::pending()).await;
+
+        assert_eq!(report.enqueue_errors.len(), MAX_ENQUEUE_ERRORS);
+        assert_eq!(
+            report.dropped_enqueue_errors,
+            total_failures - MAX_ENQUEUE_ERRORS
+        );
         Ok(())
     }
 
