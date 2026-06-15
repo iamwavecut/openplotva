@@ -44,6 +44,13 @@ pub const PURPOSE: &str = "storage";
 const POSTGRES_MAX_CONNECTIONS: u32 = 50;
 const POSTGRES_MIN_CONNECTIONS: u32 = 10;
 const POSTGRES_MAX_CONNECTION_LIFETIME: Duration = Duration::from_secs(45 * 60);
+/// Max wait for a pooled connection before the caller gets an error instead of
+/// hanging. Kept below the dispatcher send budget so connection starvation surfaces
+/// as a fast, observable failure rather than a silent stall in the send path.
+const POSTGRES_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Recycle connections that have sat idle this long so the pool heals after a
+/// database restart/failover instead of pinning dead sockets.
+const POSTGRES_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const REDIS_COMMAND_RESPONSE_TIMEOUT: Duration = Duration::from_secs(3);
 const REDIS_STORAGE_CLIENT_NAME: &str = "openplotva:storage:general";
 
@@ -6770,6 +6777,8 @@ pub async fn connect_postgres(config: &PostgresConfig) -> Result<PgPool, Storage
         .max_connections(POSTGRES_MAX_CONNECTIONS)
         .min_connections(POSTGRES_MIN_CONNECTIONS)
         .max_lifetime(POSTGRES_MAX_CONNECTION_LIFETIME)
+        .acquire_timeout(POSTGRES_ACQUIRE_TIMEOUT)
+        .idle_timeout(POSTGRES_IDLE_TIMEOUT)
         .connect(&config.startup_dsn())
         .await
         .map_err(StorageError::from)

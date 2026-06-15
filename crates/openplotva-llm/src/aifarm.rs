@@ -7962,7 +7962,7 @@ mod tests {
     fn system_prompt_includes_tool_catalog() -> Result<(), AifarmMessageError> {
         let prompt = build_system_prompt_with_tool_prompt(&base_input(), ToolPromptMode::Native)?;
 
-        assert!(prompt.contains("ведёшь персонажа в живом Telegram-чате"));
+        assert!(prompt.contains("собеседник в живом Telegram-чате"));
         assert!(prompt.contains("Большинство реплик не требуют tool"));
         assert!(prompt.contains("Никогда не используй translate_text"));
         assert!(prompt.contains("<system_contract>"));
