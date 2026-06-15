@@ -970,51 +970,6 @@ fn append_image_generation_result(
     );
 }
 
-pub trait QueuedStickerStore {
-    /// Store error type.
-    type Error: std::fmt::Display + Send + Sync + 'static;
-
-    /// Load the queued sticker message ID for a source message.
-    fn queued_sticker_message_id<'a>(
-        &'a self,
-        chat_id: i64,
-        message_id: i32,
-    ) -> ImageJobEffectFuture<'a, Result<Option<i64>, Self::Error>>;
-
-    /// Delete the queued sticker record for a source message.
-    fn delete_queued_sticker<'a>(
-        &'a self,
-        chat_id: i64,
-        message_id: i32,
-    ) -> ImageJobEffectFuture<'a, Result<(), Self::Error>>;
-}
-
-impl QueuedStickerStore for openplotva_storage::RedisQueuedStickerStore {
-    type Error = openplotva_storage::StorageError;
-
-    fn queued_sticker_message_id<'a>(
-        &'a self,
-        chat_id: i64,
-        message_id: i32,
-    ) -> ImageJobEffectFuture<'a, Result<Option<i64>, Self::Error>> {
-        Box::pin(async move {
-            self.queued_sticker_message_id(chat_id, i64::from(message_id))
-                .await
-        })
-    }
-
-    fn delete_queued_sticker<'a>(
-        &'a self,
-        chat_id: i64,
-        message_id: i32,
-    ) -> ImageJobEffectFuture<'a, Result<(), Self::Error>> {
-        Box::pin(async move {
-            self.delete_queued_sticker(chat_id, i64::from(message_id))
-                .await
-        })
-    }
-}
-
 /// Telegram sender boundary for image-job stickers.
 pub trait ImageJobTelegramSender {
     /// Send one outbound Telegram method.
@@ -1038,12 +993,8 @@ impl ImageJobTelegramSender for openplotva_telegram::TelegramClient {
 }
 
 pub trait ImageJobEffects {
-    /// Remove the queued sticker tied to the source message.
-    fn remove_queued_sticker<'a>(
-        &'a self,
-        chat_id: i64,
-        message_id: i32,
-    ) -> ImageJobEffectFuture<'a, ()>;
+    /// Best-effort delete of a message (used to clear the queue-position message).
+    fn delete_message<'a>(&'a self, chat_id: i64, message_id: i32) -> ImageJobEffectFuture<'a, ()>;
 
     /// Send the initial rich draw placeholder; returns its Telegram message id.
     fn send_draw_placeholder<'a>(
@@ -1069,57 +1020,32 @@ pub trait ImageJobEffects {
     ) -> ImageJobEffectFuture<'a, Result<Vec<String>, String>>;
 }
 
-/// Concrete image-job effects: clears the queued sticker and drives the single rich
-/// draw message (placeholder → progress → final gallery) plus media uploads.
+/// Concrete image-job effects: drives the single rich draw message (placeholder →
+/// final gallery), clears the queue-position message, and uploads media.
 #[derive(Clone, Debug)]
-pub struct TelegramImageJobEffects<Queued, Sender> {
-    queued_stickers: Queued,
+pub struct TelegramImageJobEffects<Sender> {
     telegram: Sender,
     rich: Arc<dyn crate::rich::RichSender>,
 }
 
-impl<Queued, Sender> TelegramImageJobEffects<Queued, Sender> {
+impl<Sender> TelegramImageJobEffects<Sender> {
     /// Build concrete image-job effects.
     #[must_use]
-    pub fn new(
-        queued_stickers: Queued,
-        telegram: Sender,
-        rich: Arc<dyn crate::rich::RichSender>,
-    ) -> Self {
-        Self {
-            queued_stickers,
-            telegram,
-            rich,
-        }
+    pub fn new(telegram: Sender, rich: Arc<dyn crate::rich::RichSender>) -> Self {
+        Self { telegram, rich }
     }
 }
 
-impl<Queued, Sender> ImageJobEffects for TelegramImageJobEffects<Queued, Sender>
+impl<Sender> ImageJobEffects for TelegramImageJobEffects<Sender>
 where
-    Queued: QueuedStickerStore + Send + Sync,
     Sender: ImageJobTelegramSender + Send + Sync,
 {
-    fn remove_queued_sticker<'a>(
-        &'a self,
-        chat_id: i64,
-        message_id: i32,
-    ) -> ImageJobEffectFuture<'a, ()> {
+    fn delete_message<'a>(&'a self, chat_id: i64, message_id: i32) -> ImageJobEffectFuture<'a, ()> {
         Box::pin(async move {
-            let Ok(Some(sticker_message_id)) = self
-                .queued_stickers
-                .queued_sticker_message_id(chat_id, message_id)
-                .await
-            else {
-                return;
-            };
-            if sticker_message_id > 0 {
-                self.delete_telegram_message(chat_id, sticker_message_id)
+            if message_id > 0 {
+                self.delete_telegram_message(chat_id, i64::from(message_id))
                     .await;
             }
-            let _ = self
-                .queued_stickers
-                .delete_queued_sticker(chat_id, message_id)
-                .await;
         })
     }
 
@@ -1190,7 +1116,7 @@ where
     }
 }
 
-impl<Queued, Sender> TelegramImageJobEffects<Queued, Sender>
+impl<Sender> TelegramImageJobEffects<Sender>
 where
     Sender: ImageJobTelegramSender + Send + Sync,
 {
@@ -1486,10 +1412,6 @@ where
         params.is_nsfw,
     );
 
-    effects
-        .remove_queued_sticker(params.chat_id, params.message_id)
-        .await;
-
     let draw_message_id = match effects
         .send_draw_placeholder(
             params.chat_id,
@@ -1645,6 +1567,46 @@ where
         .await
 }
 
+/// Re-render the "waiting in queue" placeholder of every job still pending on this
+/// queue, so each shows its current position as the queue drains.
+async fn refresh_image_queue_positions<Effects>(
+    queue: &InMemoryTaskQueue,
+    queue_name: &str,
+    effects: &Effects,
+) where
+    Effects: ImageJobEffects + Sync,
+{
+    for (ahead, entry) in queue
+        .pending_image_queue_entries(queue_name)
+        .into_iter()
+        .enumerate()
+    {
+        if let Some(message_id) = entry.queue_position_message_id {
+            let _ = effects
+                .edit_draw_message(
+                    entry.chat_id,
+                    message_id,
+                    crate::rich::compose_draw_waiting(ahead),
+                )
+                .await;
+        }
+    }
+}
+
+/// Remove the queue-position message for the job that is about to start drawing; the
+/// drawing/result is then a fresh message so it surfaces near the end of the chat.
+async fn clear_drawn_job_queue_position<Effects>(
+    effects: &Effects,
+    chat_id: i64,
+    queue_position_message_id: Option<i32>,
+) where
+    Effects: ImageJobEffects + Sync,
+{
+    if let Some(message_id) = queue_position_message_id {
+        effects.delete_message(chat_id, message_id).await;
+    }
+}
+
 #[must_use]
 pub fn sanitize_image_edit_job_params(mut params: ImageEditJobParams) -> ImageEditJobParams {
     params.prompt = sanitize_tool_text(&params.prompt);
@@ -1663,10 +1625,6 @@ where
     let params = sanitize_image_edit_job_params(params);
     let display_caption =
         build_image_generation_caption(&params.prompt, &params.user_full_name, true, false);
-
-    effects
-        .remove_queued_sticker(params.chat_id, params.message_id)
-        .await;
 
     let draw_message_id = match effects
         .send_draw_placeholder(
@@ -1877,6 +1835,9 @@ where
     };
 
     let _ = queue.set_execution_started(work.id, now);
+    let queue_position_message_id = queue.job_queue_position_message_id(work.id);
+    refresh_image_queue_positions(queue, queue_name, effects).await;
+    clear_drawn_job_queue_position(effects, params.chat_id, queue_position_message_id).await;
     let execution = execute_image_gen_job(generator, effects, params).await;
     match execution.outcome {
         ImageGenJobExecutionOutcome::Completed => {
@@ -2100,6 +2061,9 @@ where
     };
 
     let _ = queue.set_execution_started(work.id, now);
+    let queue_position_message_id = queue.job_queue_position_message_id(work.id);
+    refresh_image_queue_positions(queue, queue_name, effects).await;
+    clear_drawn_job_queue_position(effects, params.chat_id, queue_position_message_id).await;
     let execution = execute_image_edit_job(editor, effects, params).await;
     match execution.outcome {
         ImageEditJobExecutionOutcome::Completed => {
@@ -3142,13 +3106,12 @@ mod tests {
             }]
         );
         let calls = effects.calls();
-        assert_eq!(calls.len(), 4);
-        assert_eq!(calls[0], "remove_queued:-100:20");
-        assert_eq!(calls[1], "placeholder:-100:20:9:<p>✨ <i>рисую…</i></p>");
-        assert_eq!(calls[2], "publish:[Url(\"https://img.test/1.png\")]");
-        assert!(calls[3].starts_with("edit:-100:888:"));
-        assert!(calls[3].contains("<img src=\"https://img.test/1.png\"/>"));
-        assert!(calls[3].contains("original caption"));
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0], "placeholder:-100:20:9:<p>✨ <i>рисую…</i></p>");
+        assert_eq!(calls[1], "publish:[Url(\"https://img.test/1.png\")]");
+        assert!(calls[2].starts_with("edit:-100:888:"));
+        assert!(calls[2].contains("<img src=\"https://img.test/1.png\"/>"));
+        assert!(calls[2].contains("original caption"));
     }
 
     #[tokio::test]
@@ -3178,17 +3141,16 @@ mod tests {
         assert_eq!(report.outcome, ImageGenJobExecutionOutcome::Completed);
         assert_eq!(report.result_message_id, Some(888));
         let calls = effects.calls();
-        assert_eq!(calls.len(), 4);
-        assert_eq!(calls[0], "remove_queued:-100:20");
-        assert_eq!(calls[1], "placeholder:-100:20:9:<p>✨ <i>рисую…</i></p>");
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0], "placeholder:-100:20:9:<p>✨ <i>рисую…</i></p>");
         assert_eq!(
-            calls[2],
+            calls[1],
             "publish:[Url(\"https://img.test/1.png\"), Url(\"https://img.test/2.png\")]"
         );
-        assert!(calls[3].starts_with("edit:-100:888:<tg-slideshow>"));
-        assert!(calls[3].contains("<img src=\"https://img.test/1.png\"/>"));
-        assert!(calls[3].contains("<img src=\"https://img.test/2.png\"/>"));
-        assert!(calls[3].contains("original caption"));
+        assert!(calls[2].starts_with("edit:-100:888:<tg-slideshow>"));
+        assert!(calls[2].contains("<img src=\"https://img.test/1.png\"/>"));
+        assert!(calls[2].contains("<img src=\"https://img.test/2.png\"/>"));
+        assert!(calls[2].contains("original caption"));
     }
 
     #[test]
@@ -3235,17 +3197,16 @@ mod tests {
         assert_eq!(report.outcome, ImageGenJobExecutionOutcome::Completed);
         assert_eq!(report.result_message_id, Some(888));
         let calls = effects.calls();
-        assert_eq!(calls.len(), 4);
-        assert_eq!(calls[0], "remove_queued:-100:20");
-        assert_eq!(calls[1], "placeholder:-100:20:9:<p>✨ <i>рисую…</i></p>");
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0], "placeholder:-100:20:9:<p>✨ <i>рисую…</i></p>");
         assert_eq!(
-            calls[2],
+            calls[1],
             "publish:[Url(\"https://img.test/vip-1.png\"), Url(\"https://img.test/vip-2.png\")]"
         );
-        assert!(calls[3].starts_with("edit:-100:888:<tg-slideshow>"));
-        assert!(calls[3].contains("<img src=\"https://img.test/vip-1.png\"/>"));
-        assert!(calls[3].contains("<img src=\"https://img.test/vip-2.png\"/>"));
-        assert!(calls[3].contains("castle"));
+        assert!(calls[2].starts_with("edit:-100:888:<tg-slideshow>"));
+        assert!(calls[2].contains("<img src=\"https://img.test/vip-1.png\"/>"));
+        assert!(calls[2].contains("<img src=\"https://img.test/vip-2.png\"/>"));
+        assert!(calls[2].contains("castle"));
     }
 
     #[tokio::test]
@@ -3273,11 +3234,10 @@ mod tests {
         assert_eq!(report.caption_text, "рыжий\n\nкот");
         assert_eq!(report.error, None);
         let calls = effects.calls();
-        assert_eq!(calls.len(), 3);
-        assert_eq!(calls[0], "remove_queued:-100:20");
-        assert_eq!(calls[1], "placeholder:-100:20:0:<p>✨ <i>рисую…</i></p>");
-        assert!(calls[2].starts_with("edit:-100:888:"));
-        assert!(calls[2].contains(NSFW_BLOCKED_MESSAGE_TEXT));
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0], "placeholder:-100:20:0:<p>✨ <i>рисую…</i></p>");
+        assert!(calls[1].starts_with("edit:-100:888:"));
+        assert!(calls[1].contains(NSFW_BLOCKED_MESSAGE_TEXT));
     }
 
     #[tokio::test]
@@ -3328,17 +3288,16 @@ mod tests {
             }]
         );
         let calls = effects.calls();
-        assert_eq!(calls.len(), 4);
-        assert_eq!(calls[0], "remove_queued:-100:20");
-        assert_eq!(calls[1], "placeholder:-100:20:9:<p>✨ <i>рисую…</i></p>");
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0], "placeholder:-100:20:9:<p>✨ <i>рисую…</i></p>");
         assert_eq!(
-            calls[2],
+            calls[1],
             "publish:[Url(\"https://img.test/edit-1.png\"), Url(\"https://img.test/edit-2.png\")]"
         );
-        assert!(calls[3].starts_with("edit:-100:888:<tg-slideshow>"));
-        assert!(calls[3].contains("<img src=\"https://img.test/edit-1.png\"/>"));
-        assert!(calls[3].contains("<img src=\"https://img.test/edit-2.png\"/>"));
-        assert!(calls[3].contains("make it night"));
+        assert!(calls[2].starts_with("edit:-100:888:<tg-slideshow>"));
+        assert!(calls[2].contains("<img src=\"https://img.test/edit-1.png\"/>"));
+        assert!(calls[2].contains("<img src=\"https://img.test/edit-2.png\"/>"));
+        assert!(calls[2].contains("make it night"));
     }
 
     #[tokio::test]
@@ -3363,11 +3322,10 @@ mod tests {
         assert!(report.image_urls.is_empty());
         assert_eq!(report.error, None);
         let calls = effects.calls();
-        assert_eq!(calls.len(), 3);
-        assert_eq!(calls[0], "remove_queued:-100:20");
-        assert_eq!(calls[1], "placeholder:-100:20:0:<p>✨ <i>рисую…</i></p>");
-        assert!(calls[2].starts_with("edit:-100:888:"));
-        assert!(calls[2].contains(NSFW_BLOCKED_MESSAGE_TEXT));
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0], "placeholder:-100:20:0:<p>✨ <i>рисую…</i></p>");
+        assert!(calls[1].starts_with("edit:-100:888:"));
+        assert!(calls[1].contains(NSFW_BLOCKED_MESSAGE_TEXT));
     }
 
     #[tokio::test]
@@ -3393,11 +3351,10 @@ mod tests {
         assert_eq!(report.prompt, "make it night");
         assert_eq!(report.error, Some("draw api failed".to_owned()));
         let calls = effects.calls();
-        assert_eq!(calls.len(), 3);
-        assert_eq!(calls[0], "remove_queued:-100:20");
-        assert_eq!(calls[1], "placeholder:-100:20:9:<p>✨ <i>рисую…</i></p>");
-        assert!(calls[2].starts_with("edit:-100:888:"));
-        assert!(calls[2].contains(DRAW_FAILED_NOTICE_TEXT));
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0], "placeholder:-100:20:9:<p>✨ <i>рисую…</i></p>");
+        assert!(calls[1].starts_with("edit:-100:888:"));
+        assert!(calls[1].contains(DRAW_FAILED_NOTICE_TEXT));
     }
 
     #[tokio::test]
@@ -3710,6 +3667,62 @@ mod tests {
                 .image_urls,
             vec!["https://img.test/1.png"]
         );
+    }
+
+    #[tokio::test]
+    async fn image_gen_queue_worker_refreshes_waiting_positions_and_clears_drawn_position() {
+        let queue = InMemoryTaskQueue::new();
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800).expect("time");
+        let make = |chat: i64, created| {
+            new_image_gen_job_at(
+                ImageGenJobParams {
+                    chat_id: chat,
+                    message_id: 20,
+                    user_id: 30,
+                    user_full_name: "Alice".to_owned(),
+                    prompt: "castle".to_owned(),
+                    ..ImageGenJobParams::default()
+                },
+                created,
+            )
+        };
+        let front = queue.assign(IMAGE_REGULAR_QUEUE_NAME, make(-100, now));
+        let behind = queue.assign(
+            IMAGE_REGULAR_QUEUE_NAME,
+            make(-200, now + time::Duration::seconds(1)),
+        );
+        queue
+            .set_queue_position_message_id(front, Some(701))
+            .expect("front position");
+        queue
+            .set_queue_position_message_id(behind, Some(702))
+            .expect("behind position");
+
+        let effects = EffectsStub::new();
+        let report = run_image_gen_queue_once(
+            &queue,
+            IMAGE_REGULAR_QUEUE_NAME,
+            &GeneratorStub::success("https://img.test/1.png"),
+            &effects,
+            "image-worker-1",
+            now,
+        )
+        .await;
+        assert_eq!(report.job_id, Some(front));
+        assert_eq!(report.outcome, ImageGenQueuePollOutcome::Completed);
+
+        let calls = effects.calls();
+        // The job still waiting moves up to position 0 (its message is edited).
+        assert_eq!(
+            calls[0],
+            "edit:-200:702:<p>⏳ <i>ваш черёд подходит…</i></p>"
+        );
+        // The drawn job's queue-position message is removed before drawing.
+        assert_eq!(calls[1], "delete:-100:701");
+        // Then a fresh drawing message is sent and turned into the gallery.
+        assert_eq!(calls[2], "placeholder:-100:20:0:<p>✨ <i>рисую…</i></p>");
+        assert_eq!(calls[3], "publish:[Url(\"https://img.test/1.png\")]");
+        assert!(calls[4].starts_with("edit:-100:888:"));
     }
 
     #[tokio::test]
@@ -4513,16 +4526,15 @@ mod tests {
         assert_eq!(report.outcome, ImageEditJobExecutionOutcome::Completed);
         assert_eq!(report.result_message_id, Some(888));
         let calls = effects.calls();
-        assert_eq!(calls.len(), 4);
-        assert_eq!(calls[0], "remove_queued:-100:20");
-        assert_eq!(calls[1], "placeholder:-100:20:9:<p>✨ <i>рисую…</i></p>");
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0], "placeholder:-100:20:9:<p>✨ <i>рисую…</i></p>");
         assert_eq!(
-            calls[2],
+            calls[1],
             "publish:[Bytes { file_name: \"image.png\", bytes: [9, 8, 7] }]"
         );
-        assert!(calls[3].starts_with("edit:-100:888:"));
-        assert!(calls[3].contains("<img src=\"https://up.test/image.png\"/>"));
-        assert!(calls[3].contains("make it night"));
+        assert!(calls[2].starts_with("edit:-100:888:"));
+        assert!(calls[2].contains("<img src=\"https://up.test/image.png\"/>"));
+        assert!(calls[2].contains("make it night"));
     }
 
     #[tokio::test]
@@ -4585,20 +4597,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn telegram_image_job_effects_remove_queued_sticker_deletes_message_and_key() {
-        let queued = QueuedStickerStoreStub::with_queued_id(Some(444));
+    async fn telegram_image_job_effects_delete_message_calls_delete() {
         let telegram = TelegramSenderStub::new(vec![Ok(TelegramOutboundResponse::Boolean(true))]);
         let effects = TelegramImageJobEffects::new(
-            queued.clone(),
             telegram.clone(),
             Arc::new(crate::rich::MockRichSender::default()),
         );
 
-        effects.remove_queued_sticker(-10042, 77).await;
+        effects.delete_message(-10042, 555).await;
 
-        let snapshot = queued.snapshot();
-        assert_eq!(snapshot.loads, vec![(-10042, 77)]);
-        assert_eq!(snapshot.deletes, vec![(-10042, 77)]);
         assert_eq!(
             telegram.kinds(),
             vec![TelegramOutboundMethodKind::DeleteMessage]
@@ -4606,47 +4613,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn telegram_image_job_effects_remove_queued_sticker_keeps_go_missing_record_behavior() {
-        let queued = QueuedStickerStoreStub::with_queued_id(None);
+    async fn telegram_image_job_effects_delete_message_skips_zero_id() {
         let telegram = TelegramSenderStub::new(Vec::new());
         let effects = TelegramImageJobEffects::new(
-            queued.clone(),
             telegram.clone(),
             Arc::new(crate::rich::MockRichSender::default()),
         );
 
-        effects.remove_queued_sticker(-10042, 77).await;
+        effects.delete_message(-10042, 0).await;
 
-        let snapshot = queued.snapshot();
-        assert_eq!(snapshot.loads, vec![(-10042, 77)]);
-        assert!(snapshot.deletes.is_empty());
-        assert!(telegram.kinds().is_empty());
-    }
-
-    #[tokio::test]
-    async fn telegram_image_job_effects_remove_queued_sticker_deletes_zero_id_key_only() {
-        let queued = QueuedStickerStoreStub::with_queued_id(Some(0));
-        let telegram = TelegramSenderStub::new(Vec::new());
-        let effects = TelegramImageJobEffects::new(
-            queued.clone(),
-            telegram.clone(),
-            Arc::new(crate::rich::MockRichSender::default()),
-        );
-
-        effects.remove_queued_sticker(-10042, 77).await;
-
-        let snapshot = queued.snapshot();
-        assert_eq!(snapshot.loads, vec![(-10042, 77)]);
-        assert_eq!(snapshot.deletes, vec![(-10042, 77)]);
         assert!(telegram.kinds().is_empty());
     }
 
     #[tokio::test]
     async fn telegram_image_job_effects_send_draw_placeholder_routes_through_rich() {
-        let queued = QueuedStickerStoreStub::default();
         let telegram = TelegramSenderStub::new(Vec::new());
         let rich = Arc::new(crate::rich::MockRichSender::default());
-        let effects = TelegramImageJobEffects::new(queued.clone(), telegram.clone(), rich.clone());
+        let effects = TelegramImageJobEffects::new(telegram.clone(), rich.clone());
 
         let id = effects
             .send_draw_placeholder(-10042, 77, Some(9), "<p>draw</p>".to_owned())
@@ -4666,10 +4649,9 @@ mod tests {
 
     #[tokio::test]
     async fn telegram_image_job_effects_edit_draw_message_routes_through_rich() {
-        let queued = QueuedStickerStoreStub::default();
         let telegram = TelegramSenderStub::new(Vec::new());
         let rich = Arc::new(crate::rich::MockRichSender::default());
-        let effects = TelegramImageJobEffects::new(queued.clone(), telegram.clone(), rich.clone());
+        let effects = TelegramImageJobEffects::new(telegram.clone(), rich.clone());
 
         effects
             .edit_draw_message(-10042, 1001, "<img src=\"https://h/a.png\"/>".to_owned())
@@ -4685,10 +4667,9 @@ mod tests {
 
     #[tokio::test]
     async fn telegram_image_job_effects_publish_draw_images_uploads_bytes_and_urls() {
-        let queued = QueuedStickerStoreStub::default();
         let telegram = TelegramSenderStub::new(Vec::new());
         let rich = Arc::new(crate::rich::MockRichSender::default());
-        let effects = TelegramImageJobEffects::new(queued.clone(), telegram.clone(), rich);
+        let effects = TelegramImageJobEffects::new(telegram.clone(), rich);
 
         let urls = effects
             .publish_draw_images(vec![
@@ -4712,10 +4693,9 @@ mod tests {
 
     #[tokio::test]
     async fn telegram_image_job_effects_publish_draw_images_rejects_file_id() {
-        let queued = QueuedStickerStoreStub::default();
         let telegram = TelegramSenderStub::new(Vec::new());
         let rich = Arc::new(crate::rich::MockRichSender::default());
-        let effects = TelegramImageJobEffects::new(queued.clone(), telegram.clone(), rich);
+        let effects = TelegramImageJobEffects::new(telegram.clone(), rich);
 
         let result = effects
             .publish_draw_images(vec![PhotoSource::FileId("file-1".to_owned())])
@@ -4809,64 +4789,6 @@ mod tests {
                 .push(latest_file_id.to_owned());
             let result = self.result.clone();
             Box::pin(async move { result })
-        }
-    }
-
-    #[derive(Clone, Debug, Default)]
-    struct QueuedStickerStoreStub {
-        state: Arc<Mutex<QueuedStickerState>>,
-    }
-
-    #[derive(Clone, Debug, Default)]
-    struct QueuedStickerState {
-        queued_id: Option<i64>,
-        loads: Vec<(i64, i32)>,
-        deletes: Vec<(i64, i32)>,
-    }
-
-    impl QueuedStickerStoreStub {
-        fn with_queued_id(queued_id: Option<i64>) -> Self {
-            Self {
-                state: Arc::new(Mutex::new(QueuedStickerState {
-                    queued_id,
-                    ..QueuedStickerState::default()
-                })),
-            }
-        }
-
-        fn snapshot(&self) -> QueuedStickerState {
-            self.state.lock().expect("queued sticker state").clone()
-        }
-    }
-
-    impl QueuedStickerStore for QueuedStickerStoreStub {
-        type Error = StubError;
-
-        fn queued_sticker_message_id<'a>(
-            &'a self,
-            chat_id: i64,
-            message_id: i32,
-        ) -> ImageJobEffectFuture<'a, Result<Option<i64>, Self::Error>> {
-            Box::pin(async move {
-                let mut state = self.state.lock().expect("queued sticker state");
-                state.loads.push((chat_id, message_id));
-                Ok(state.queued_id)
-            })
-        }
-
-        fn delete_queued_sticker<'a>(
-            &'a self,
-            chat_id: i64,
-            message_id: i32,
-        ) -> ImageJobEffectFuture<'a, Result<(), Self::Error>> {
-            Box::pin(async move {
-                self.state
-                    .lock()
-                    .expect("queued sticker state")
-                    .deletes
-                    .push((chat_id, message_id));
-                Ok(())
-            })
         }
     }
 
@@ -5202,13 +5124,13 @@ mod tests {
     }
 
     impl ImageJobEffects for EffectsStub {
-        fn remove_queued_sticker<'a>(
+        fn delete_message<'a>(
             &'a self,
             chat_id: i64,
             message_id: i32,
         ) -> ImageJobEffectFuture<'a, ()> {
             self.call_log()
-                .push(format!("remove_queued:{chat_id}:{message_id}"));
+                .push(format!("delete:{chat_id}:{message_id}"));
             Box::pin(async {})
         }
 

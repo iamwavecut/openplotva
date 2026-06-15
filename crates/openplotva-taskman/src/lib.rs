@@ -418,6 +418,16 @@ pub struct TaskQueueRecord {
     pub events: Vec<TaskQueueJobEvent>,
 }
 
+/// One pending image job's Telegram coordinates and queue-position placeholder,
+/// used to keep the "waiting in queue" message current as the queue drains.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingImageQueueEntry {
+    pub job_id: i64,
+    pub chat_id: i64,
+    pub thread_message_id: Option<i32>,
+    pub queue_position_message_id: Option<i32>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TaskQueueJobMessage {
     pub id: i64,
@@ -1446,6 +1456,67 @@ impl InMemoryTaskQueue {
         self.append_wal_record(task_queue_wal_upsert(record));
         drop(state);
         Ok(())
+    }
+
+    /// Set only the queue-position placeholder message id, preserving other message ids.
+    pub fn set_queue_position_message_id(
+        &self,
+        job_id: i64,
+        queue_position_message_id: Option<i32>,
+    ) -> Result<(), TaskQueueError> {
+        let mut state = self.lock();
+        let record = state
+            .records
+            .iter_mut()
+            .find(|record| record.id == job_id)
+            .ok_or(TaskQueueError::JobNotFound(job_id))?;
+        record.queue_position_message_id = queue_position_message_id;
+        let record = record.clone();
+        self.append_wal_record(task_queue_wal_upsert(record));
+        drop(state);
+        Ok(())
+    }
+
+    /// Read a job's queue-position placeholder message id, if any.
+    #[must_use]
+    pub fn job_queue_position_message_id(&self, job_id: i64) -> Option<i32> {
+        self.lock()
+            .records
+            .iter()
+            .find(|record| record.id == job_id)
+            .and_then(|record| record.queue_position_message_id)
+    }
+
+    /// Pending image jobs on one queue in dispatch order (front of queue first).
+    /// The `ahead` count for entry `i` is exactly `i`.
+    #[must_use]
+    pub fn pending_image_queue_entries(&self, queue_name: &str) -> Vec<PendingImageQueueEntry> {
+        let state = self.lock();
+        let mut pending: Vec<&TaskQueueRecord> = state
+            .records
+            .iter()
+            .filter(|record| {
+                record.queue_name == queue_name
+                    && record.status == JobStatus::Pending
+                    && matches!(
+                        record.job.data.job_type,
+                        JobType::ImageGen | JobType::ImageEdit
+                    )
+            })
+            .collect();
+        pending.sort_by(|left, right| compare_go_queue_records(left, right));
+        pending
+            .into_iter()
+            .map(|record| {
+                let telegram = record.job.data.telegram_data.as_ref();
+                PendingImageQueueEntry {
+                    job_id: record.id,
+                    chat_id: telegram.map_or(0, |telegram| telegram.chat_id),
+                    thread_message_id: telegram.and_then(|telegram| telegram.thread_message_id),
+                    queue_position_message_id: record.queue_position_message_id,
+                }
+            })
+            .collect()
     }
 
     pub fn update_job_result_message(
@@ -2775,13 +2846,14 @@ mod tests {
         ImageGenJobPayloadError, ImageJobData, InMemoryTaskQueue, JobPayload, JobStatus, JobType,
         LOWEST_PRIORITY, MAX_JOB_EVENTS, MESSAGE_STATUS_COMPLETED, MESSAGE_STATUS_FAILED,
         MESSAGE_STATUS_PLACEHOLDER, MESSAGE_TYPE_RESULT, MUSIC_VIP_QUEUE_NAME, MusicGenJobParams,
-        MusicGenJobPayloadError, STUCK_JOB_ERROR_MESSAGE, TASK_QUEUE_SNAPSHOT_FORMAT,
-        TEXT_QUEUE_NAME, TaskQueueError, TaskQueueJobEvent, TaskQueueJobMessageParams,
-        TaskQueueWalRecord, TaskQueueWalSink, decode_task_queue_snapshot,
-        encode_task_queue_snapshot, image_edit_job_params_from_stateless_job,
-        image_gen_job_params_from_stateless_job, music_gen_job_params_from_stateless_job,
-        new_control_job_at, new_dialog_job_at, new_image_edit_job_at, new_image_gen_job_at,
-        new_memory_consolidation_job_at, new_music_gen_job_at, replay_task_queue_wal_records,
+        MusicGenJobPayloadError, PendingImageQueueEntry, STUCK_JOB_ERROR_MESSAGE,
+        TASK_QUEUE_SNAPSHOT_FORMAT, TEXT_QUEUE_NAME, TaskQueueError, TaskQueueJobEvent,
+        TaskQueueJobMessageParams, TaskQueueWalRecord, TaskQueueWalSink,
+        decode_task_queue_snapshot, encode_task_queue_snapshot,
+        image_edit_job_params_from_stateless_job, image_gen_job_params_from_stateless_job,
+        music_gen_job_params_from_stateless_job, new_control_job_at, new_dialog_job_at,
+        new_image_edit_job_at, new_image_gen_job_at, new_memory_consolidation_job_at,
+        new_music_gen_job_at, replay_task_queue_wal_records,
     };
 
     #[derive(Default)]
@@ -3509,6 +3581,85 @@ mod tests {
             Some(low)
         );
         assert!(queue.dequeue(TEXT_QUEUE_NAME, "worker", now).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn pending_image_queue_entries_track_positions_as_queue_drains()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let queue = InMemoryTaskQueue::new();
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let image_job = |chat: i64, thread: Option<i32>, created| {
+            new_image_gen_job_at(
+                ImageGenJobParams {
+                    chat_id: chat,
+                    message_id: 20,
+                    user_id: 30,
+                    user_full_name: "Alice".to_owned(),
+                    prompt: "draw".to_owned(),
+                    thread_id: thread,
+                    ..ImageGenJobParams::default()
+                },
+                created,
+            )
+            .with_name("image")
+            .with_priority(DEFAULT_PRIORITY)
+        };
+
+        let first = queue.assign(IMAGE_REGULAR_QUEUE_NAME, image_job(-100, Some(7), now));
+        let second = queue.assign(
+            IMAGE_REGULAR_QUEUE_NAME,
+            image_job(-200, None, now + time::Duration::seconds(1)),
+        );
+        let third = queue.assign(
+            IMAGE_REGULAR_QUEUE_NAME,
+            image_job(-300, None, now + time::Duration::seconds(2)),
+        );
+
+        queue.set_queue_position_message_id(first, Some(901))?;
+        queue.set_queue_position_message_id(second, Some(902))?;
+        queue.set_queue_position_message_id(third, Some(903))?;
+        assert_eq!(queue.job_queue_position_message_id(second), Some(902));
+
+        assert_eq!(
+            queue.pending_image_queue_entries(IMAGE_REGULAR_QUEUE_NAME),
+            vec![
+                PendingImageQueueEntry {
+                    job_id: first,
+                    chat_id: -100,
+                    thread_message_id: Some(7),
+                    queue_position_message_id: Some(901),
+                },
+                PendingImageQueueEntry {
+                    job_id: second,
+                    chat_id: -200,
+                    thread_message_id: None,
+                    queue_position_message_id: Some(902),
+                },
+                PendingImageQueueEntry {
+                    job_id: third,
+                    chat_id: -300,
+                    thread_message_id: None,
+                    queue_position_message_id: Some(903),
+                },
+            ]
+        );
+
+        assert_eq!(
+            queue
+                .dequeue_matching(IMAGE_REGULAR_QUEUE_NAME, "worker", now, |job| job
+                    .data
+                    .job_type
+                    == JobType::ImageGen)
+                .map(|item| item.id),
+            Some(first)
+        );
+        let entries = queue.pending_image_queue_entries(IMAGE_REGULAR_QUEUE_NAME);
+        assert_eq!(
+            entries.iter().map(|entry| entry.job_id).collect::<Vec<_>>(),
+            vec![second, third]
+        );
+        assert_eq!(entries[0].queue_position_message_id, Some(902));
         Ok(())
     }
 

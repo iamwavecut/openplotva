@@ -4922,11 +4922,9 @@ mod tests {
             image_urls: vec!["https://img.test/fallback.png".to_owned()],
             image_bytes: vec![b"png".to_vec()],
         });
-        let image_queued = ImageQueuedStickerCapture::default();
         let image_sender = ImageTelegramSenderCapture::new(Vec::new());
         let image_rich = Arc::new(crate::rich::MockRichSender::default());
         let image_effects = crate::image_jobs::TelegramImageJobEffects::new(
-            image_queued.clone(),
             image_sender.clone(),
             image_rich.clone(),
         );
@@ -4965,8 +4963,6 @@ mod tests {
                 seed: String::new(),
             }]
         );
-        assert_eq!(image_queued.loads(), vec![(-100, 78)]);
-        assert!(image_queued.deletes().is_empty());
         assert!(image_sender.methods().is_empty());
         let sent = image_rich.sent.lock().expect("rich sent");
         assert_eq!(sent.len(), 1);
@@ -7030,11 +7026,9 @@ mod tests {
             String::new(),
             "https://img.test/edit-2.png".to_owned(),
         ]);
-        let image_queued = ImageQueuedStickerCapture::default();
         let image_sender = ImageTelegramSenderCapture::new(Vec::new());
         let image_rich = Arc::new(crate::rich::MockRichSender::default());
         let image_effects = crate::image_jobs::TelegramImageJobEffects::new(
-            image_queued.clone(),
             image_sender.clone(),
             image_rich.clone(),
         );
@@ -7069,8 +7063,6 @@ mod tests {
                 photo_urls: vec!["https://files.test/photo.png".to_owned()],
             }]
         );
-        assert_eq!(image_queued.loads(), vec![(42, 77)]);
-        assert!(image_queued.deletes().is_empty());
         assert!(image_sender.methods().is_empty());
         let sent = image_rich.sent.lock().expect("rich sent");
         assert_eq!(sent.len(), 1);
@@ -8177,49 +8169,6 @@ mod tests {
     impl fmt::Display for TestEffectError {
         fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
             formatter.write_str(self.0)
-        }
-    }
-
-    #[derive(Clone, Debug, Default)]
-    struct ImageQueuedStickerCapture {
-        queued_id: Arc<Mutex<Option<i64>>>,
-        loads: Arc<Mutex<Vec<(i64, i32)>>>,
-        deletes: Arc<Mutex<Vec<(i64, i32)>>>,
-    }
-
-    impl ImageQueuedStickerCapture {
-        fn loads(&self) -> Vec<(i64, i32)> {
-            lock(&self.loads).clone()
-        }
-
-        fn deletes(&self) -> Vec<(i64, i32)> {
-            lock(&self.deletes).clone()
-        }
-    }
-
-    impl crate::image_jobs::QueuedStickerStore for ImageQueuedStickerCapture {
-        type Error = TestEffectError;
-
-        fn queued_sticker_message_id<'a>(
-            &'a self,
-            chat_id: i64,
-            message_id: i32,
-        ) -> crate::image_jobs::ImageJobEffectFuture<'a, Result<Option<i64>, Self::Error>> {
-            Box::pin(async move {
-                lock(&self.loads).push((chat_id, message_id));
-                Ok(*lock(&self.queued_id))
-            })
-        }
-
-        fn delete_queued_sticker<'a>(
-            &'a self,
-            chat_id: i64,
-            message_id: i32,
-        ) -> crate::image_jobs::ImageJobEffectFuture<'a, Result<(), Self::Error>> {
-            Box::pin(async move {
-                lock(&self.deletes).push((chat_id, message_id));
-                Ok(())
-            })
         }
     }
 

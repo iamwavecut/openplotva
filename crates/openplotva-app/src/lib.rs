@@ -8826,6 +8826,7 @@ async fn start_runtime_workers(
     let music_service_available = matches!(music_client_result.as_ref(), Some(Ok(_)));
     let dialog_tool_adapter = Arc::new(
         dialog_tools::TaskmanDialogToolAdapter::new(Arc::clone(&task_queue_for_updates))
+            .with_queue_position_rich(Arc::clone(&rich_sender))
             .with_draw_image_vip_status(vip_status_for_updates.clone())
             .with_draw_image_rate_limit(Arc::new(dialog_tools::DrawImageRateLimitPolicy::new(
                 service_clients.redis.draw_rate_limit_store(),
@@ -9172,11 +9173,8 @@ async fn start_runtime_workers(
         ),
         media_prompt_optimizer.clone(),
     );
-    let vip_image_effects = image_jobs::TelegramImageJobEffects::new(
-        service_clients.redis.queued_sticker_store(),
-        telegram.clone(),
-        Arc::clone(&rich_sender),
-    );
+    let vip_image_effects =
+        image_jobs::TelegramImageJobEffects::new(telegram.clone(), Arc::clone(&rich_sender));
     let vip_image_stop = stop.subscribe();
     let vip_image_worker = tokio::spawn(async move {
         let report = image_jobs::run_image_gen_worker_every_until_with_max_attempts(
@@ -9204,11 +9202,8 @@ async fn start_runtime_workers(
         ),
         media_prompt_optimizer.clone(),
     );
-    let vip_image_edit_effects = image_jobs::TelegramImageJobEffects::new(
-        service_clients.redis.queued_sticker_store(),
-        telegram.clone(),
-        Arc::clone(&rich_sender),
-    );
+    let vip_image_edit_effects =
+        image_jobs::TelegramImageJobEffects::new(telegram.clone(), Arc::clone(&rich_sender));
     let vip_image_edit_stop = stop.subscribe();
     let vip_image_edit_worker = tokio::spawn(async move {
         let report = image_jobs::run_image_edit_worker_every_until_with_max_attempts(
@@ -9233,11 +9228,8 @@ async fn start_runtime_workers(
         ),
         media_prompt_optimizer,
     );
-    let regular_image_effects = image_jobs::TelegramImageJobEffects::new(
-        service_clients.redis.queued_sticker_store(),
-        telegram.clone(),
-        Arc::clone(&rich_sender),
-    );
+    let regular_image_effects =
+        image_jobs::TelegramImageJobEffects::new(telegram.clone(), Arc::clone(&rich_sender));
     let regular_image_stop = stop.subscribe();
     let regular_image_worker = tokio::spawn(async move {
         let report = image_jobs::run_image_gen_worker_every_until_with_max_attempts(

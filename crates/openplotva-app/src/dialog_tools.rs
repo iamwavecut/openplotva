@@ -791,6 +791,7 @@ pub struct TaskmanDialogToolAdapter {
     image_edit_file_resolver: Option<Arc<dyn ImageEditFileResolver>>,
     song_service_available: bool,
     song_audio_permission: Option<Arc<dyn SongAudioPermission>>,
+    queue_position_rich: Option<Arc<dyn crate::rich::RichSender>>,
 }
 
 impl fmt::Debug for TaskmanDialogToolAdapter {
@@ -823,6 +824,10 @@ impl fmt::Debug for TaskmanDialogToolAdapter {
                 "song_audio_permission",
                 &self.song_audio_permission.as_ref().map(|_| "configured"),
             )
+            .field(
+                "queue_position_rich",
+                &self.queue_position_rich.as_ref().map(|_| "configured"),
+            )
             .finish()
     }
 }
@@ -840,7 +845,16 @@ impl TaskmanDialogToolAdapter {
             image_edit_file_resolver: None,
             song_service_available: true,
             song_audio_permission: None,
+            queue_position_rich: None,
         }
+    }
+
+    /// Configure the rich sender used to post and persist the live "waiting in queue"
+    /// message when an image job is enqueued.
+    #[must_use]
+    pub fn with_queue_position_rich(mut self, rich: Arc<dyn crate::rich::RichSender>) -> Self {
+        self.queue_position_rich = Some(rich);
+        self
     }
 
     #[must_use]
@@ -978,6 +992,8 @@ impl ImageScheduler for TaskmanDialogToolAdapter {
             }
             let chat_id = request.chat_id;
             let user_id = request.user_id;
+            let message_id = request.message_id;
+            let thread_id = request.thread_id;
             let meta = draw_image_job_meta(&request);
             let job = new_image_gen_job_at(
                 ImageGenJobParams {
@@ -1009,7 +1025,7 @@ impl ImageScheduler for TaskmanDialogToolAdapter {
                 .queue
                 .assign_with_user_limit(plan.queue_name, job, plan.max_active_jobs)
             {
-                Ok(Some(_job_id)) => {
+                Ok(Some(job_id)) => {
                     self.grow_task_enqueue(plan.queue_name, chat_id, user_id)
                         .await;
                     if let Some(rate_limit) = self.draw_image_rate_limit.as_deref() {
@@ -1017,6 +1033,14 @@ impl ImageScheduler for TaskmanDialogToolAdapter {
                             .grow_draw_image_rate_limit(request.user_id, OffsetDateTime::now_utc())
                             .await;
                     }
+                    self.announce_queue_position(
+                        plan.queue_name,
+                        job_id,
+                        chat_id,
+                        message_id,
+                        thread_id,
+                    )
+                    .await;
                     Ok(DrawImageScheduleResult {
                         status: "scheduled".to_owned(),
                         ..DrawImageScheduleResult::default()
@@ -1172,6 +1196,8 @@ impl TaskmanDialogToolAdapter {
         let prompt = request.prompt.trim().to_owned();
         let chat_id = request.chat_id;
         let user_id = request.user_id;
+        let message_id = request.message_id;
+        let thread_id = request.thread_id;
         let job = new_image_edit_job_at(
             ImageEditJobParams {
                 chat_id: request.chat_id,
@@ -1198,9 +1224,17 @@ impl TaskmanDialogToolAdapter {
             .queue
             .assign_with_user_limit(plan.queue_name, job, plan.max_active_jobs)
         {
-            Ok(Some(_job_id)) => {
+            Ok(Some(job_id)) => {
                 self.grow_task_enqueue(plan.queue_name, chat_id, user_id)
                     .await;
+                self.announce_queue_position(
+                    plan.queue_name,
+                    job_id,
+                    chat_id,
+                    message_id,
+                    thread_id,
+                )
+                .await;
                 Ok(DrawImageScheduleResult {
                     status: "scheduled".to_owned(),
                     ..DrawImageScheduleResult::default()
@@ -1254,6 +1288,47 @@ impl TaskmanDialogToolAdapter {
                 errors = ?report.save_errors,
                 "failed to persist task enqueue rate-limit timestamps"
             );
+        }
+    }
+
+    /// Post the initial "waiting in queue" message for a freshly-enqueued image job and
+    /// persist its id so the worker can keep it current and delete it before drawing.
+    async fn announce_queue_position(
+        &self,
+        queue_name: &str,
+        job_id: i64,
+        chat_id: i64,
+        message_id: i32,
+        thread_id: Option<i32>,
+    ) {
+        let Some(rich) = self.queue_position_rich.as_deref() else {
+            return;
+        };
+        let ahead = self
+            .queue
+            .pending_image_queue_entries(queue_name)
+            .iter()
+            .position(|entry| entry.job_id == job_id)
+            .unwrap_or(0);
+        let options = openplotva_telegram::RichSendOptions {
+            message_thread_id: thread_id.map(i64::from),
+            reply_to_message_id: Some(i64::from(message_id)),
+            allow_sending_without_reply: true,
+            disable_notification: false,
+            reply_markup: None,
+        };
+        let html = crate::rich::compose_draw_waiting(ahead);
+        match rich.send_rich(chat_id, &html, &options).await {
+            Ok(message_id) => {
+                if let Ok(message_id) = i32::try_from(message_id) {
+                    let _ = self
+                        .queue
+                        .set_queue_position_message_id(job_id, Some(message_id));
+                }
+            }
+            Err(error) => {
+                tracing::warn!(chat_id, job_id, %error, "failed to post draw queue-position message");
+            }
         }
     }
 }
@@ -3981,6 +4056,41 @@ mod tests {
                 "sender_name": "Alice",
             })
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn taskman_dialog_tool_adapter_announces_queue_position_on_enqueue()
+    -> Result<(), ToolboxError> {
+        let queue = Arc::new(InMemoryTaskQueue::new());
+        let vip = Arc::new(DrawImageVipStatusStub::new(true));
+        let rich = Arc::new(crate::rich::MockRichSender::default());
+        let adapter = TaskmanDialogToolAdapter::new(Arc::clone(&queue))
+            .with_queue_position_rich(rich.clone())
+            .with_draw_image_vip_status(vip.clone());
+
+        let scheduled = adapter
+            .schedule_image(DrawImageScheduleRequest {
+                chat_id: -100,
+                message_id: 11,
+                user_id: 42,
+                user_full_name: "Alice".to_owned(),
+                prompt: "castle".to_owned(),
+                thread_id: Some(7),
+                ..DrawImageScheduleRequest::default()
+            })
+            .await?;
+
+        assert_eq!(scheduled.status, "scheduled");
+        let job_id = queue.records()[0].id;
+        assert_eq!(queue.job_queue_position_message_id(job_id), Some(1001));
+        let sent = rich.sent.lock().expect("rich sent");
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].chat_id, -100);
+        assert_eq!(sent[0].reply_to_message_id, Some(11));
+        assert_eq!(sent[0].message_thread_id, Some(7));
+        assert!(sent[0].allow_sending_without_reply);
+        assert_eq!(sent[0].html, "<p>⏳ <i>ваш черёд подходит…</i></p>");
         Ok(())
     }
 
