@@ -35,7 +35,7 @@ jobs:
 
       - name: Install Rust
         run: |
-          rustup toolchain install "$RUST_VERSION" --profile minimal --component rustfmt
+          rustup toolchain install "$RUST_VERSION" --profile minimal --component rustfmt --component clippy
           rustup default "$RUST_VERSION"
 
       - name: Cache Rust build artifacts
@@ -43,11 +43,8 @@ jobs:
         with:
           shared-key: rust-${{ runner.os }}-ubuntu-22.04-${{ env.RUST_VERSION }}-workspace
 
-      - name: Check Rust formatting
-        run: cargo fmt --all -- --check
-
-      - name: Check Rust workspace
-        run: cargo check --workspace --all-targets --all-features
+      - name: Run fast Rust quality gate
+        run: tools/rust-fast-gate.sh
 
       - name: Build release binary
         run: cargo build --locked --release -p openplotva-app
