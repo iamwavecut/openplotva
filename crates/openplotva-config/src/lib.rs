@@ -192,6 +192,9 @@ pub const DEFAULT_PRUNA_BEARER: &str = "";
 
 pub const DEFAULT_PRUNA_TIMEOUT_SECONDS: i32 = 120;
 
+/// Default media uploader request timeout, `PLOTVA_UPLOADER_TIMEOUT_SECONDS`.
+pub const DEFAULT_UPLOADER_TIMEOUT_SECONDS: i32 = 120;
+
 pub const DEFAULT_DIALOG_NVIDIA_URL: &str = "https://integrate.api.nvidia.com/v1/chat/completions";
 
 pub const DEFAULT_DIALOG_NVIDIA_MODEL: &str = "google/gemma-4-31b-it";
@@ -269,6 +272,8 @@ pub struct AppConfig {
     pub google_ai: GoogleAiConfig,
     pub open_router: OpenRouterConfig,
     pub pruna: PrunaConfig,
+    /// Media uploader (plotva.geta.moe) configuration.
+    pub uploader: UploaderConfig,
     pub white_circle: WhiteCircleConfig,
     /// Discovery/dialog LLM configuration.
     pub llm: LlmConfig,
@@ -523,6 +528,17 @@ pub struct PrunaConfig {
     /// Bearer token, from `PRUNA_BEARER`.
     pub bearer: String,
     /// Request timeout, from `PRUNA_TIMEOUT_SECONDS`.
+    pub timeout_seconds: i32,
+}
+
+/// Media uploader (plotva.geta.moe) configuration.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct UploaderConfig {
+    /// Public base URL, from `PLOTVA_UPLOADER_URL`.
+    pub base_url: String,
+    /// Shared upload secret, from `PLOTVA_UPLOADER_SECRET`.
+    pub secret: String,
+    /// Request timeout, from `PLOTVA_UPLOADER_TIMEOUT_SECONDS`.
     pub timeout_seconds: i32,
 }
 
@@ -866,6 +882,12 @@ pub struct RawConfig {
     pub pruna_bearer: Option<String>,
     /// `PRUNA_TIMEOUT_SECONDS`.
     pub pruna_timeout_seconds: Option<String>,
+    /// `PLOTVA_UPLOADER_URL`.
+    pub uploader_url: Option<String>,
+    /// `PLOTVA_UPLOADER_SECRET`.
+    pub uploader_secret: Option<String>,
+    /// `PLOTVA_UPLOADER_TIMEOUT_SECONDS`.
+    pub uploader_timeout_seconds: Option<String>,
     /// `WHITECIRCLE_ENABLED`.
     pub whitecircle_enabled: Option<String>,
     /// `WHITECIRCLE_API_KEY`.
@@ -1574,6 +1596,15 @@ impl AppConfig {
                     DEFAULT_PRUNA_TIMEOUT_SECONDS,
                 )?,
             },
+            uploader: UploaderConfig {
+                base_url: raw.uploader_url.unwrap_or_default(),
+                secret: raw.uploader_secret.unwrap_or_default(),
+                timeout_seconds: parse_i32(
+                    "PLOTVA_UPLOADER_TIMEOUT_SECONDS",
+                    raw.uploader_timeout_seconds,
+                    DEFAULT_UPLOADER_TIMEOUT_SECONDS,
+                )?,
+            },
             white_circle: WhiteCircleConfig {
                 enabled: parse_bool("WHITECIRCLE_ENABLED", raw.whitecircle_enabled, false)?,
                 api_key: raw.whitecircle_api_key.unwrap_or_default(),
@@ -2146,6 +2177,9 @@ impl RawConfig {
             pruna_api_key: env("PRUNA_API_KEY"),
             pruna_bearer: env("PRUNA_BEARER"),
             pruna_timeout_seconds: env("PRUNA_TIMEOUT_SECONDS"),
+            uploader_url: env("PLOTVA_UPLOADER_URL"),
+            uploader_secret: env("PLOTVA_UPLOADER_SECRET"),
+            uploader_timeout_seconds: env("PLOTVA_UPLOADER_TIMEOUT_SECONDS"),
             whitecircle_enabled: env("WHITECIRCLE_ENABLED"),
             whitecircle_api_key: env("WHITECIRCLE_API_KEY"),
             whitecircle_deployment_id: env("WHITECIRCLE_DEPLOYMENT_ID"),
