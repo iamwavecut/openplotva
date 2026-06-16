@@ -11,6 +11,7 @@ members = [
     "crates/openplotva-updates",
     "crates/openplotva-taskman",
     "crates/openplotva-dialog",
+    "crates/openplotva-agent",
     "crates/openplotva-llm",
     "crates/openplotva-prompts",
     "crates/openplotva-history",
