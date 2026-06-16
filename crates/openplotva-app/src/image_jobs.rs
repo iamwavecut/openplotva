@@ -3252,7 +3252,7 @@ mod tests {
         assert_eq!(calls.len(), 3);
         assert_eq!(
             calls[0],
-            "placeholder:-100:20:9:<aside><tg-emoji emoji-id=\"5956143844457189176\">✨</tg-emoji><cite>рисую…</cite></aside>"
+            "placeholder:-100:20:9:<aside><tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji><cite>рисую…</cite></aside>"
         );
         assert_eq!(calls[1], "publish:[Url(\"https://img.test/1.png\")]");
         assert!(calls[2].starts_with("edit:-100:888:"));
@@ -3290,7 +3290,7 @@ mod tests {
         assert_eq!(calls.len(), 4);
         assert_eq!(
             calls[0],
-            "placeholder:-100:20:9:<aside><tg-emoji emoji-id=\"5956143844457189176\">✨</tg-emoji><cite>рисую…</cite></aside>"
+            "placeholder:-100:20:9:<aside><tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji><cite>рисую…</cite></aside>"
         );
         assert_eq!(
             calls[1],
@@ -3353,7 +3353,7 @@ mod tests {
         assert_eq!(calls.len(), 4);
         assert_eq!(
             calls[0],
-            "placeholder:-100:20:9:<aside><tg-emoji emoji-id=\"5956143844457189176\">✨</tg-emoji><cite>рисую…</cite></aside>"
+            "placeholder:-100:20:9:<aside><tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji><cite>рисую…</cite></aside>"
         );
         assert_eq!(
             calls[1],
@@ -3433,7 +3433,7 @@ mod tests {
         assert_eq!(calls.len(), 2);
         assert_eq!(
             calls[0],
-            "placeholder:-100:20:0:<aside><tg-emoji emoji-id=\"5956143844457189176\">✨</tg-emoji><cite>рисую…</cite></aside>"
+            "placeholder:-100:20:0:<aside><tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji><cite>рисую…</cite></aside>"
         );
         assert!(calls[1].starts_with("edit:-100:888:"));
         assert!(calls[1].contains(NSFW_BLOCKED_MESSAGE_TEXT));
@@ -3490,7 +3490,7 @@ mod tests {
         assert_eq!(calls.len(), 3);
         assert_eq!(
             calls[0],
-            "placeholder:-100:20:9:<aside><tg-emoji emoji-id=\"5956143844457189176\">✨</tg-emoji><cite>рисую…</cite></aside>"
+            "placeholder:-100:20:9:<aside><tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji><cite>рисую…</cite></aside>"
         );
         assert_eq!(
             calls[1],
@@ -3527,7 +3527,7 @@ mod tests {
         assert_eq!(calls.len(), 2);
         assert_eq!(
             calls[0],
-            "placeholder:-100:20:0:<aside><tg-emoji emoji-id=\"5956143844457189176\">✨</tg-emoji><cite>рисую…</cite></aside>"
+            "placeholder:-100:20:0:<aside><tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji><cite>рисую…</cite></aside>"
         );
         assert!(calls[1].starts_with("edit:-100:888:"));
         assert!(calls[1].contains(NSFW_BLOCKED_MESSAGE_TEXT));
@@ -3559,7 +3559,7 @@ mod tests {
         assert_eq!(calls.len(), 2);
         assert_eq!(
             calls[0],
-            "placeholder:-100:20:9:<aside><tg-emoji emoji-id=\"5956143844457189176\">✨</tg-emoji><cite>рисую…</cite></aside>"
+            "placeholder:-100:20:9:<aside><tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji><cite>рисую…</cite></aside>"
         );
         assert!(calls[1].starts_with("edit:-100:888:"));
         assert!(calls[1].contains(DRAW_FAILED_NOTICE_TEXT));
@@ -3923,14 +3923,14 @@ mod tests {
         // The job still waiting moves up to position 0 (its message is edited).
         assert_eq!(
             calls[0],
-            "edit:-200:702:<aside><tg-emoji emoji-id=\"5257960961616142305\">⏳</tg-emoji><cite>ваш черёд подходит…</cite></aside>"
+            "edit:-200:702:<aside><tg-emoji emoji-id=\"5298571865969695917\">⏳</tg-emoji><cite>ваш черёд подходит…</cite></aside>"
         );
         // The drawn job's queue-position message is removed before drawing.
         assert_eq!(calls[1], "delete:-100:701");
         // Then a fresh drawing message is sent and turned into the gallery.
         assert_eq!(
             calls[2],
-            "placeholder:-100:20:0:<aside><tg-emoji emoji-id=\"5956143844457189176\">✨</tg-emoji><cite>рисую…</cite></aside>"
+            "placeholder:-100:20:0:<aside><tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji><cite>рисую…</cite></aside>"
         );
         assert_eq!(calls[3], "publish:[Url(\"https://img.test/1.png\")]");
         assert!(calls[4].starts_with("edit:-100:888:"));
@@ -4740,7 +4740,7 @@ mod tests {
         assert_eq!(calls.len(), 3);
         assert_eq!(
             calls[0],
-            "placeholder:-100:20:9:<aside><tg-emoji emoji-id=\"5956143844457189176\">✨</tg-emoji><cite>рисую…</cite></aside>"
+            "placeholder:-100:20:9:<aside><tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji><cite>рисую…</cite></aside>"
         );
         assert_eq!(
             calls[1],

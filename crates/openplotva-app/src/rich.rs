@@ -377,8 +377,8 @@ pub fn compose_gallery(
 
 /// Custom emoji used as the (required) pull-quote main content of the draw placeholders.
 /// The literal `⏳`/`✨` inside the tag is the fallback when the custom emoji can't render.
-const DRAW_WAITING_EMOJI_ID: &str = "5257960961616142305";
-const DRAW_PROGRESS_EMOJI_ID: &str = "5956143844457189176";
+const DRAW_WAITING_EMOJI_ID: &str = "5298571865969695917";
+const DRAW_PROGRESS_EMOJI_ID: &str = "5298651821080879865";
 
 /// Progressive draw state for the in-place updated draw message.
 #[must_use]
@@ -578,12 +578,12 @@ mod tests {
     #[test]
     fn draw_progress_shows_counter_and_partial_media() {
         let html = compose_draw_progress("рисую…", 2, Some(3), &["https://h/a.png".to_owned()]);
-        assert!(html.contains("<aside><tg-emoji emoji-id=\"5956143844457189176\">✨</tg-emoji><cite>рисую… 2 из 3</cite></aside>"));
+        assert!(html.contains("<aside><tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji><cite>рисую… 2 из 3</cite></aside>"));
         assert!(html.contains(r#"<img src="https://h/a.png"/>"#));
         let queue = compose_draw_progress("ожидаю очереди", 0, None, &[]);
         assert_eq!(
             queue,
-            "<aside><tg-emoji emoji-id=\"5956143844457189176\">✨</tg-emoji><cite>ожидаю очереди</cite></aside>"
+            "<aside><tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji><cite>ожидаю очереди</cite></aside>"
         );
     }
 
@@ -591,23 +591,23 @@ mod tests {
     fn draw_waiting_counts_and_pluralizes() {
         assert_eq!(
             compose_draw_waiting(0),
-            "<aside><tg-emoji emoji-id=\"5257960961616142305\">⏳</tg-emoji><cite>ваш черёд подходит…</cite></aside>"
+            "<aside><tg-emoji emoji-id=\"5298571865969695917\">⏳</tg-emoji><cite>ваш черёд подходит…</cite></aside>"
         );
         assert_eq!(
             compose_draw_waiting(1),
-            "<aside><tg-emoji emoji-id=\"5257960961616142305\">⏳</tg-emoji><cite>в очереди: 1 заказ впереди</cite></aside>"
+            "<aside><tg-emoji emoji-id=\"5298571865969695917\">⏳</tg-emoji><cite>в очереди: 1 заказ впереди</cite></aside>"
         );
         assert_eq!(
             compose_draw_waiting(2),
-            "<aside><tg-emoji emoji-id=\"5257960961616142305\">⏳</tg-emoji><cite>в очереди: 2 заказа впереди</cite></aside>"
+            "<aside><tg-emoji emoji-id=\"5298571865969695917\">⏳</tg-emoji><cite>в очереди: 2 заказа впереди</cite></aside>"
         );
         assert_eq!(
             compose_draw_waiting(5),
-            "<aside><tg-emoji emoji-id=\"5257960961616142305\">⏳</tg-emoji><cite>в очереди: 5 заказов впереди</cite></aside>"
+            "<aside><tg-emoji emoji-id=\"5298571865969695917\">⏳</tg-emoji><cite>в очереди: 5 заказов впереди</cite></aside>"
         );
         assert_eq!(
             compose_draw_waiting(11),
-            "<aside><tg-emoji emoji-id=\"5257960961616142305\">⏳</tg-emoji><cite>в очереди: 11 заказов впереди</cite></aside>"
+            "<aside><tg-emoji emoji-id=\"5298571865969695917\">⏳</tg-emoji><cite>в очереди: 11 заказов впереди</cite></aside>"
         );
     }
 

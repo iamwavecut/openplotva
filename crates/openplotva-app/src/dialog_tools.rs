@@ -4092,7 +4092,7 @@ mod tests {
         assert!(sent[0].allow_sending_without_reply);
         assert_eq!(
             sent[0].html,
-            "<aside><tg-emoji emoji-id=\"5257960961616142305\">⏳</tg-emoji><cite>ваш черёд подходит…</cite></aside>"
+            "<aside><tg-emoji emoji-id=\"5298571865969695917\">⏳</tg-emoji><cite>ваш черёд подходит…</cite></aside>"
         );
         Ok(())
     }

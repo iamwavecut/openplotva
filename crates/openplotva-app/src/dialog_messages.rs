@@ -4970,7 +4970,7 @@ mod tests {
         assert_eq!(sent[0].reply_to_message_id, Some(78));
         assert_eq!(
             sent[0].html,
-            "<aside><tg-emoji emoji-id=\"5956143844457189176\">✨</tg-emoji><cite>рисую…</cite></aside>"
+            "<aside><tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji><cite>рисую…</cite></aside>"
         );
         drop(sent);
         let edited = image_rich.edited.lock().expect("rich edited");
@@ -7073,7 +7073,7 @@ mod tests {
         assert_eq!(sent[0].reply_to_message_id, Some(77));
         assert_eq!(
             sent[0].html,
-            "<aside><tg-emoji emoji-id=\"5956143844457189176\">✨</tg-emoji><cite>рисую…</cite></aside>"
+            "<aside><tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji><cite>рисую…</cite></aside>"
         );
         drop(sent);
         let edited = image_rich.edited.lock().expect("rich edited");
