@@ -9442,6 +9442,53 @@ async fn start_runtime_workers(
         media::media_prompt_optimizer_from_app_config(config),
     );
     let media_max_llm_job_attempts = config.persistent_queue.llm_job_max_attempts;
+
+    // Drawing-prompt agent: refine the draw prompt with the user's memory and chat
+    // history before generation. Web search is intentionally stubbed until the search
+    // pipeline is reworked. Built once and wraps both the VIP and regular image
+    // generators; when disabled or the reasoner is missing it is a transparent
+    // pass-through that leaves the single-pass optimizer in charge.
+    let image_agent_settings = agent_runtime::ImageAgentSettings::from_app_config(
+        config,
+        agent_runtime::IMAGE_SYSTEM_PROMPT.to_owned(),
+    );
+    let (image_agent_reasoner, image_agent_tools) = if image_agent_settings.enabled {
+        let registry = agent_runtime::build_agent_provider_registry(config);
+        let reasoner = registry.get(&image_agent_settings.reasoner_provider);
+        let history: Arc<dyn agent_runtime::HistorySearcher> = Arc::new(
+            agent_runtime::PostgresHistorySearch::new(history_store.clone()),
+        );
+        let memory: Arc<dyn agent_runtime::MemorySearcher> = Arc::new(
+            agent_runtime::PostgresMemorySearch::new(memory_store.clone()),
+        );
+        let tools: Arc<dyn openplotva_agent::AgentTools> = Arc::new(
+            agent_runtime::AppAgentTools::new(
+                agent_runtime::unavailable_web_search(),
+                agent_runtime::unavailable_url_crawler(),
+            )
+            .with_history_searcher(history)
+            .with_memory_searcher(memory),
+        );
+        (reasoner, Some(tools))
+    } else {
+        (None, None)
+    };
+    if image_agent_settings.enabled && image_agent_reasoner.is_some() {
+        readiness_checks.push(ReadinessCheck::ok(
+            "image_agent",
+            "Drawing-prompt agent active (memory + chat history; web search stubbed) wrapping VIP and regular generators",
+        ));
+    } else if image_agent_settings.enabled {
+        readiness_checks.push(ReadinessCheck::skipped(
+            "image_agent",
+            "Drawing-prompt agent enabled but the reasoner provider is missing from the registry",
+        ));
+    } else {
+        readiness_checks.push(ReadinessCheck::skipped(
+            "image_agent",
+            "LLM_AGENTIC_IMAGE_ENABLED=false",
+        ));
+    }
     let vip_image_queue = Arc::clone(&task_queue_for_updates);
     let vip_draw_api_config = image_jobs::aifarm_draw_api_config_from_app_config(config);
     let vip_image_generator = image_jobs::OptimizingImageGenerator::new(
@@ -9456,6 +9503,12 @@ async fn start_runtime_workers(
             image_jobs::AifarmDrawApiImageGenerator::new(vip_draw_api_config),
         ),
         media_prompt_optimizer.clone(),
+    );
+    let vip_image_generator = agent_runtime::ImageAgentImageGenerator::new(
+        vip_image_generator,
+        image_agent_reasoner.clone(),
+        image_agent_tools.clone(),
+        image_agent_settings.clone(),
     );
     let draw_chat_counter: Arc<dyn image_jobs::ChatMessageCounter> =
         Arc::new(PostgresHistoryStore::new(service_clients.postgres.clone()));
@@ -9515,6 +9568,12 @@ async fn start_runtime_workers(
             image_jobs::aifarm_draw_api_config_from_app_config(config),
         ),
         media_prompt_optimizer,
+    );
+    let regular_image_generator = agent_runtime::ImageAgentImageGenerator::new(
+        regular_image_generator,
+        image_agent_reasoner,
+        image_agent_tools,
+        image_agent_settings,
     );
     let regular_image_effects =
         image_jobs::TelegramImageJobEffects::new(telegram.clone(), Arc::clone(&rich_sender))
