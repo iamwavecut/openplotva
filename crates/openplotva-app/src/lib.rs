@@ -9359,8 +9359,11 @@ async fn start_runtime_workers(
         ),
         media_prompt_optimizer.clone(),
     );
+    let draw_chat_counter: Arc<dyn image_jobs::ChatMessageCounter> =
+        Arc::new(PostgresHistoryStore::new(service_clients.postgres.clone()));
     let vip_image_effects =
-        image_jobs::TelegramImageJobEffects::new(telegram.clone(), Arc::clone(&rich_sender));
+        image_jobs::TelegramImageJobEffects::new(telegram.clone(), Arc::clone(&rich_sender))
+            .with_chat_counter(Arc::clone(&draw_chat_counter));
     let vip_image_stop = stop.subscribe();
     let vip_image_worker = tokio::spawn(async move {
         let report = image_jobs::run_image_gen_worker_every_until_with_max_attempts(
@@ -9389,7 +9392,8 @@ async fn start_runtime_workers(
         media_prompt_optimizer.clone(),
     );
     let vip_image_edit_effects =
-        image_jobs::TelegramImageJobEffects::new(telegram.clone(), Arc::clone(&rich_sender));
+        image_jobs::TelegramImageJobEffects::new(telegram.clone(), Arc::clone(&rich_sender))
+            .with_chat_counter(Arc::clone(&draw_chat_counter));
     let vip_image_edit_stop = stop.subscribe();
     let vip_image_edit_worker = tokio::spawn(async move {
         let report = image_jobs::run_image_edit_worker_every_until_with_max_attempts(
@@ -9415,7 +9419,8 @@ async fn start_runtime_workers(
         media_prompt_optimizer,
     );
     let regular_image_effects =
-        image_jobs::TelegramImageJobEffects::new(telegram.clone(), Arc::clone(&rich_sender));
+        image_jobs::TelegramImageJobEffects::new(telegram.clone(), Arc::clone(&rich_sender))
+            .with_chat_counter(Arc::clone(&draw_chat_counter));
     let regular_image_stop = stop.subscribe();
     let regular_image_worker = tokio::spawn(async move {
         let report = image_jobs::run_image_gen_worker_every_until_with_max_attempts(

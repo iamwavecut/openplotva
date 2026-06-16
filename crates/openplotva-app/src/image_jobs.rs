@@ -61,6 +61,10 @@ pub const STICKER_DOWN_FILE_ID: &str =
 pub const NSFW_BLOCKED_MESSAGE_TEXT: &str = "Ваш запрос заблокирован, так как содержит неприемлемый контент. Попробуйте переформулировать запрос.";
 const DRAW_FAILED_NOTICE_TEXT: &str =
     "Не удалось нарисовать изображение. Попробуйте ещё раз чуть позже.";
+/// Reuse the queue placeholder as the draw target when at most this many chat messages have
+/// arrived since it was posted; otherwise delete it and send a fresh message so the result
+/// is not buried.
+const DRAW_PLACEHOLDER_REUSE_MAX_MESSAGES: i64 = 10;
 pub const IMAGE_JOB_POLL_INTERVAL: StdDuration = StdDuration::from_secs(1);
 pub const IMAGE_JOB_WORKER_QUEUES: [&str; 2] = [IMAGE_VIP_QUEUE_NAME, IMAGE_REGULAR_QUEUE_NAME];
 pub const IMAGE_VIP_JOB_WORKER_QUEUES: [&str; 1] = [IMAGE_VIP_QUEUE_NAME];
@@ -1097,9 +1101,52 @@ impl ImageJobTelegramSender for openplotva_telegram::TelegramClient {
     }
 }
 
+/// Counts how many chat messages arrived after a given message id, to decide whether a draw
+/// placeholder is still near the bottom of the chat.
+pub trait ChatMessageCounter: Send + Sync + std::fmt::Debug {
+    /// Number of chat messages with an id greater than `message_id`, or `None` if unknown.
+    fn count_chat_messages_after<'a>(
+        &'a self,
+        chat_id: i64,
+        message_id: i64,
+    ) -> ImageJobEffectFuture<'a, Option<i64>>;
+}
+
+impl ChatMessageCounter for openplotva_storage::PostgresHistoryStore {
+    fn count_chat_messages_after<'a>(
+        &'a self,
+        chat_id: i64,
+        message_id: i64,
+    ) -> ImageJobEffectFuture<'a, Option<i64>> {
+        Box::pin(async move {
+            // Probe one past the threshold so we only learn "<= max" vs "more".
+            self.count_chat_messages_after(
+                chat_id,
+                message_id,
+                DRAW_PLACEHOLDER_REUSE_MAX_MESSAGES + 1,
+            )
+            .await
+            .ok()
+        })
+    }
+}
+
 pub trait ImageJobEffects {
     /// Best-effort delete of a message (used to clear the queue-position message).
     fn delete_message<'a>(&'a self, chat_id: i64, message_id: i32) -> ImageJobEffectFuture<'a, ()>;
+
+    /// Count chat messages newer than `message_id` (the placeholder), or `None` if unknown.
+    /// Used to choose between reusing the queue placeholder and posting a fresh message.
+    fn chat_messages_after<'a>(
+        &'a self,
+        _chat_id: i64,
+        _message_id: i32,
+    ) -> ImageJobEffectFuture<'a, Option<i64>>
+    where
+        Self: Sync,
+    {
+        Box::pin(async { None })
+    }
 
     /// Send the initial rich draw placeholder; returns its Telegram message id.
     fn send_draw_placeholder<'a>(
@@ -1131,13 +1178,25 @@ pub trait ImageJobEffects {
 pub struct TelegramImageJobEffects<Sender> {
     telegram: Sender,
     rich: Arc<dyn crate::rich::RichSender>,
+    chat_counter: Option<Arc<dyn ChatMessageCounter>>,
 }
 
 impl<Sender> TelegramImageJobEffects<Sender> {
     /// Build concrete image-job effects.
     #[must_use]
     pub fn new(telegram: Sender, rich: Arc<dyn crate::rich::RichSender>) -> Self {
-        Self { telegram, rich }
+        Self {
+            telegram,
+            rich,
+            chat_counter: None,
+        }
+    }
+
+    /// Provide the chat-activity counter used to decide whether to reuse the queue placeholder.
+    #[must_use]
+    pub fn with_chat_counter(mut self, chat_counter: Arc<dyn ChatMessageCounter>) -> Self {
+        self.chat_counter = Some(chat_counter);
+        self
     }
 }
 
@@ -1145,6 +1204,19 @@ impl<Sender> ImageJobEffects for TelegramImageJobEffects<Sender>
 where
     Sender: ImageJobTelegramSender + Send + Sync,
 {
+    fn chat_messages_after<'a>(
+        &'a self,
+        chat_id: i64,
+        message_id: i32,
+    ) -> ImageJobEffectFuture<'a, Option<i64>> {
+        Box::pin(async move {
+            let counter = self.chat_counter.as_ref()?;
+            counter
+                .count_chat_messages_after(chat_id, i64::from(message_id))
+                .await
+        })
+    }
+
     fn delete_message<'a>(&'a self, chat_id: i64, message_id: i32) -> ImageJobEffectFuture<'a, ()> {
         Box::pin(async move {
             if message_id > 0 {
@@ -1499,6 +1571,7 @@ pub async fn execute_image_gen_job<Generator, Effects>(
     generator: &Generator,
     effects: &Effects,
     params: ImageGenJobParams,
+    reuse_message_id: Option<i32>,
 ) -> ImageGenJobExecutionReport
 where
     Generator: ImageGenerator + Sync,
@@ -1517,27 +1590,40 @@ where
         params.is_nsfw,
     );
 
-    let draw_message_id = match effects
-        .send_draw_placeholder(
-            params.chat_id,
-            params.message_id,
-            params.thread_id,
-            crate::rich::compose_draw_progress(&[]),
-        )
-        .await
-    {
-        Ok(draw_message_id) => draw_message_id,
-        Err(error) => {
-            return ImageGenJobExecutionReport {
-                outcome: ImageGenJobExecutionOutcome::Failed,
-                prompt,
-                caption_text,
-                image_url: None,
-                image_urls: Vec::new(),
-                result_message_id: None,
-                error: Some(format!("send draw placeholder: {error}")),
-            };
+    // Reuse the queue placeholder in place when allowed, otherwise post a fresh message.
+    let draw_message_id = match reuse_message_id {
+        Some(reused) => {
+            let _ = effects
+                .edit_draw_message(
+                    params.chat_id,
+                    reused,
+                    crate::rich::compose_draw_progress(&[]),
+                )
+                .await;
+            reused
         }
+        None => match effects
+            .send_draw_placeholder(
+                params.chat_id,
+                params.message_id,
+                params.thread_id,
+                crate::rich::compose_draw_progress(&[]),
+            )
+            .await
+        {
+            Ok(draw_message_id) => draw_message_id,
+            Err(error) => {
+                return ImageGenJobExecutionReport {
+                    outcome: ImageGenJobExecutionOutcome::Failed,
+                    prompt,
+                    caption_text,
+                    image_url: None,
+                    image_urls: Vec::new(),
+                    result_message_id: None,
+                    error: Some(format!("send draw placeholder: {error}")),
+                };
+            }
+        },
     };
 
     let request = ImageGenerationRequest {
@@ -1704,17 +1790,27 @@ where
         .await
 }
 
-/// Remove the queue-position message for the job that is about to start drawing; the
-/// drawing/result is then a fresh message so it surfaces near the end of the chat.
-async fn clear_drawn_job_queue_position<Effects>(
+/// Decide how the queue placeholder becomes the draw target: reuse it in place when the chat
+/// is still quiet (few messages since it was posted), otherwise delete it and return `None` so
+/// the worker posts a fresh message that surfaces near the bottom of the chat.
+async fn draw_placeholder_reuse_target<Effects>(
     effects: &Effects,
     chat_id: i64,
     queue_position_message_id: Option<i32>,
-) where
+) -> Option<i32>
+where
     Effects: ImageJobEffects + Sync,
 {
-    if let Some(message_id) = queue_position_message_id {
-        effects.delete_message(chat_id, message_id).await;
+    let placeholder = queue_position_message_id.filter(|id| *id > 0)?;
+    let quiet = effects
+        .chat_messages_after(chat_id, placeholder)
+        .await
+        .map_or(true, |count| count <= DRAW_PLACEHOLDER_REUSE_MAX_MESSAGES);
+    if quiet {
+        Some(placeholder)
+    } else {
+        effects.delete_message(chat_id, placeholder).await;
+        None
     }
 }
 
@@ -1728,6 +1824,7 @@ pub async fn execute_image_edit_job<Editor, Effects>(
     editor: &Editor,
     effects: &Effects,
     params: ImageEditJobParams,
+    reuse_message_id: Option<i32>,
 ) -> ImageEditJobExecutionReport
 where
     Editor: ImageEditor + Sync,
@@ -1737,25 +1834,38 @@ where
     let display_caption =
         build_image_generation_caption(&params.prompt, &params.user_full_name, true, false);
 
-    let draw_message_id = match effects
-        .send_draw_placeholder(
-            params.chat_id,
-            params.message_id,
-            params.thread_id,
-            crate::rich::compose_draw_progress(&[]),
-        )
-        .await
-    {
-        Ok(draw_message_id) => draw_message_id,
-        Err(error) => {
-            return ImageEditJobExecutionReport {
-                outcome: ImageEditJobExecutionOutcome::Failed,
-                prompt: params.prompt,
-                image_urls: Vec::new(),
-                result_message_id: None,
-                error: Some(format!("send draw placeholder: {error}")),
-            };
+    // Reuse the queue placeholder in place when allowed, otherwise post a fresh message.
+    let draw_message_id = match reuse_message_id {
+        Some(reused) => {
+            let _ = effects
+                .edit_draw_message(
+                    params.chat_id,
+                    reused,
+                    crate::rich::compose_draw_progress(&[]),
+                )
+                .await;
+            reused
         }
+        None => match effects
+            .send_draw_placeholder(
+                params.chat_id,
+                params.message_id,
+                params.thread_id,
+                crate::rich::compose_draw_progress(&[]),
+            )
+            .await
+        {
+            Ok(draw_message_id) => draw_message_id,
+            Err(error) => {
+                return ImageEditJobExecutionReport {
+                    outcome: ImageEditJobExecutionOutcome::Failed,
+                    prompt: params.prompt,
+                    image_urls: Vec::new(),
+                    result_message_id: None,
+                    error: Some(format!("send draw placeholder: {error}")),
+                };
+            }
+        },
     };
 
     let request = ImageEditRequest {
@@ -1947,8 +2057,9 @@ where
 
     let _ = queue.set_execution_started(work.id, now);
     let queue_position_message_id = queue.job_queue_position_message_id(work.id);
-    clear_drawn_job_queue_position(effects, params.chat_id, queue_position_message_id).await;
-    let execution = execute_image_gen_job(generator, effects, params).await;
+    let reuse_target =
+        draw_placeholder_reuse_target(effects, params.chat_id, queue_position_message_id).await;
+    let execution = execute_image_gen_job(generator, effects, params, reuse_target).await;
     match execution.outcome {
         ImageGenJobExecutionOutcome::Completed => {
             if !execution.image_urls.is_empty() {
@@ -2172,8 +2283,9 @@ where
 
     let _ = queue.set_execution_started(work.id, now);
     let queue_position_message_id = queue.job_queue_position_message_id(work.id);
-    clear_drawn_job_queue_position(effects, params.chat_id, queue_position_message_id).await;
-    let execution = execute_image_edit_job(editor, effects, params).await;
+    let reuse_target =
+        draw_placeholder_reuse_target(effects, params.chat_id, queue_position_message_id).await;
+    let execution = execute_image_edit_job(editor, effects, params, reuse_target).await;
     match execution.outcome {
         ImageEditJobExecutionOutcome::Completed => {
             if !execution.image_urls.is_empty() {
@@ -3189,6 +3301,7 @@ mod tests {
                 thread_id: Some(9),
                 ..ImageGenJobParams::default()
             },
+            None,
         )
         .await;
 
@@ -3247,6 +3360,7 @@ mod tests {
                 thread_id: Some(9),
                 ..ImageGenJobParams::default()
             },
+            None,
         )
         .await;
 
@@ -3310,6 +3424,7 @@ mod tests {
                 thread_id: Some(9),
                 ..ImageGenJobParams::default()
             },
+            None,
         )
         .await;
 
@@ -3354,6 +3469,7 @@ mod tests {
                 thread_id: Some(9),
                 ..ImageGenJobParams::default()
             },
+            None,
         )
         .await;
 
@@ -3388,6 +3504,7 @@ mod tests {
                 }),
                 ..ImageGenJobParams::default()
             },
+            None,
         )
         .await;
 
@@ -3426,6 +3543,7 @@ mod tests {
                 photo_urls: vec!["https://telegram.test/original.png".to_owned()],
                 thread_id: Some(9),
             },
+            None,
         )
         .await;
 
@@ -3482,6 +3600,7 @@ mod tests {
                 prompt: " edit ".to_owned(),
                 ..ImageEditJobParams::default()
             },
+            None,
         )
         .await;
 
@@ -3515,6 +3634,7 @@ mod tests {
                 thread_id: Some(9),
                 ..ImageEditJobParams::default()
             },
+            None,
         )
         .await;
 
@@ -3843,35 +3963,34 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn image_gen_queue_worker_clears_drawn_placeholder_and_draws_fresh() {
-        let queue = InMemoryTaskQueue::new();
-        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800).expect("time");
-        let make = |chat: i64, created| {
+    fn draw_reuse_test_job(queue: &InMemoryTaskQueue, now: OffsetDateTime) -> i64 {
+        let job = queue.assign(
+            IMAGE_REGULAR_QUEUE_NAME,
             new_image_gen_job_at(
                 ImageGenJobParams {
-                    chat_id: chat,
+                    chat_id: -100,
                     message_id: 20,
                     user_id: 30,
                     user_full_name: "Alice".to_owned(),
                     prompt: "castle".to_owned(),
                     ..ImageGenJobParams::default()
                 },
-                created,
-            )
-        };
-        let front = queue.assign(IMAGE_REGULAR_QUEUE_NAME, make(-100, now));
-        let behind = queue.assign(
-            IMAGE_REGULAR_QUEUE_NAME,
-            make(-200, now + time::Duration::seconds(1)),
+                now,
+            ),
         );
         queue
-            .set_queue_position_message_id(front, Some(701))
-            .expect("front position");
-        queue
-            .set_queue_position_message_id(behind, Some(702))
-            .expect("behind position");
+            .set_queue_position_message_id(job, Some(701))
+            .expect("position");
+        job
+    }
 
+    #[tokio::test]
+    async fn image_gen_queue_worker_reuses_placeholder_when_chat_is_quiet() {
+        let queue = InMemoryTaskQueue::new();
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800).expect("time");
+        draw_reuse_test_job(&queue, now);
+
+        // Default stub reports an unknown (quiet) chat → reuse the placeholder in place.
         let effects = EffectsStub::new();
         let report = run_image_gen_queue_once(
             &queue,
@@ -3882,13 +4001,43 @@ mod tests {
             now,
         )
         .await;
-        assert_eq!(report.job_id, Some(front));
+        assert_eq!(report.outcome, ImageGenQueuePollOutcome::Completed);
+
+        let calls = effects.calls();
+        assert_eq!(calls.len(), 3);
+        // Placeholder 701 is edited in place to the drawing emoji (no delete, no fresh send),
+        // then turned into the gallery — still message 701.
+        assert_eq!(
+            calls[0],
+            "edit:-100:701:<tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji>"
+        );
+        assert_eq!(calls[1], "publish:[Url(\"https://img.test/1.png\")]");
+        assert!(calls[2].starts_with("edit:-100:701:"));
+        assert!(calls[2].contains("<img src=\"https://img.test/1.png\"/>"));
+    }
+
+    #[tokio::test]
+    async fn image_gen_queue_worker_deletes_placeholder_when_chat_is_busy() {
+        let queue = InMemoryTaskQueue::new();
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800).expect("time");
+        draw_reuse_test_job(&queue, now);
+
+        // More than the threshold of messages since the placeholder → delete it, post fresh.
+        let effects =
+            EffectsStub::with_chat_messages_after(DRAW_PLACEHOLDER_REUSE_MAX_MESSAGES + 1);
+        let report = run_image_gen_queue_once(
+            &queue,
+            IMAGE_REGULAR_QUEUE_NAME,
+            &GeneratorStub::success("https://img.test/1.png"),
+            &effects,
+            "image-worker-1",
+            now,
+        )
+        .await;
         assert_eq!(report.outcome, ImageGenQueuePollOutcome::Completed);
 
         let calls = effects.calls();
         assert_eq!(calls.len(), 4);
-        // The drawn job's queue placeholder is removed, then a fresh drawing message is sent.
-        // No live position refresh of other waiting jobs (status is a static bare emoji).
         assert_eq!(calls[0], "delete:-100:701");
         assert_eq!(
             calls[1],
@@ -4693,6 +4842,7 @@ mod tests {
                 thread_id: Some(9),
                 ..ImageEditJobParams::default()
             },
+            None,
         )
         .await;
 
@@ -5283,11 +5433,19 @@ mod tests {
     #[derive(Debug, Default)]
     struct EffectsStub {
         calls: Mutex<Vec<String>>,
+        chat_messages_after: Option<i64>,
     }
 
     impl EffectsStub {
         fn new() -> Self {
             Self::default()
+        }
+
+        fn with_chat_messages_after(count: i64) -> Self {
+            Self {
+                chat_messages_after: Some(count),
+                ..Self::default()
+            }
         }
 
         fn calls(&self) -> Vec<String> {
@@ -5300,6 +5458,15 @@ mod tests {
     }
 
     impl ImageJobEffects for EffectsStub {
+        fn chat_messages_after<'a>(
+            &'a self,
+            _chat_id: i64,
+            _message_id: i32,
+        ) -> ImageJobEffectFuture<'a, Option<i64>> {
+            let count = self.chat_messages_after;
+            Box::pin(async move { count })
+        }
+
         fn delete_message<'a>(
             &'a self,
             chat_id: i64,

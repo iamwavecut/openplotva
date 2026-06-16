@@ -665,6 +665,10 @@ pub const SQL_UPSERT_HISTORY_ENTRY: &str = "INSERT INTO chat_history_entries (bu
 
 pub const SQL_SELECT_CHAT_SUMMARY_ENTRY_PAYLOADS: &str = "SELECT payload::text AS payload FROM chat_history_entries WHERE chat_id = $1 AND occurred_at > $2 AND occurred_at <= $3 AND kind = 'text' ORDER BY occurred_at ASC, message_id ASC, entry_id ASC";
 
+/// Count (capped by `$3`) chat-history entries newer than a given message id, used to gauge
+/// how much the chat has moved on since a placeholder was posted.
+pub const SQL_COUNT_CHAT_MESSAGES_AFTER: &str = "SELECT count(*) FROM (SELECT 1 FROM chat_history_entries WHERE chat_id = $1 AND message_id > $2 LIMIT $3) sub";
+
 pub const SQL_SELECT_THREAD_SUMMARY_ENTRY_PAYLOADS: &str = "SELECT payload::text AS payload FROM chat_history_entries WHERE chat_id = $1 AND thread_id = $2 AND occurred_at > $3 AND occurred_at <= $4 AND kind = 'text' ORDER BY occurred_at ASC, message_id ASC, entry_id ASC";
 
 pub const SQL_SELECT_REUSABLE_HISTORY_SUMMARIES: &str = "SELECT id, chat_id, thread_id, scope, requested_by_user_id, range_start_at, range_end_at, first_message_id, last_message_id, first_entry_id, last_entry_id, raw_message_count, covered_message_count, source_summary_ids, summary_json::text AS summary_json, summary_html, model, prompt_version, input_hash, prompt_hash, input_token_estimate, output_token_estimate, cascade_depth, quality_score, quality_notes, created_at FROM chat_history_summaries WHERE chat_id = $1 AND thread_id = $2 AND scope = $3 AND range_start_at >= $4 AND range_end_at <= $5 AND created_at > $6 ORDER BY range_start_at ASC, range_end_at ASC, created_at DESC";
@@ -3663,6 +3667,23 @@ impl PostgresHistoryStore {
     /// Access the underlying Postgres pool.
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// Count chat-history entries with a message id greater than `message_id`, capped at
+    /// `cap`. Used to decide whether a draw placeholder is still near the bottom of the chat.
+    pub async fn count_chat_messages_after(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        cap: i64,
+    ) -> Result<i64, StorageError> {
+        let count: i64 = sqlx::query_scalar(SQL_COUNT_CHAT_MESSAGES_AFTER)
+            .bind(chat_id)
+            .bind(message_id)
+            .bind(cap)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(count)
     }
 
     pub async fn upsert_history_entry(
