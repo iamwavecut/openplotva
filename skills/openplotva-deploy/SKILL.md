@@ -88,7 +88,7 @@ gh run watch "$run_id" --repo iamwavecut/openplotva --exit-status
 Check production containers:
 
 ```bash
-ssh geta.moe 'docker ps --format "{{.Names}} {{.Status}} {{.Ports}}" | grep -E "openplotva|postgresql|dragonfly|embedder|token-estimator"'
+ssh geta.moe 'docker ps --format "{{.Names}} {{.Status}} {{.Ports}}" | grep -E "openplotva|postgresql|dragonfly|token-estimator"'
 ```
 
 Check health:

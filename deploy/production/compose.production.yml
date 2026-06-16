@@ -17,7 +17,6 @@ services:
       REDIS_DB: ${REDIS_DB:-0}
       UPDATE_QUEUE_BACKEND: ${UPDATE_QUEUE_BACKEND:-list}
       BOT_WEBHOOK_UPDATE_BUFFER_SIZE: ${BOT_WEBHOOK_UPDATE_BUFFER_SIZE:-10000}
-      MEMORY_EMBEDDER_URL: http://embedder:12500
       MEMORY_TOKEN_ESTIMATOR_URL: http://token-estimator:12600
       RUNTIME_API_ENABLED: "true"
       RUNTIME_API_HOST: 0.0.0.0
@@ -35,8 +34,6 @@ services:
       postgresql:
         condition: service_healthy
       dragonfly:
-        condition: service_healthy
-      embedder:
         condition: service_healthy
       token-estimator:
         condition: service_healthy
@@ -119,32 +116,6 @@ services:
         max-size: "10m"
         max-file: "3"
 
-  embedder:
-    build:
-      context: ./tools/embedder
-    environment:
-      EMBEDDER_MODEL: jinaai/jina-embeddings-v5-text-nano
-      EMBEDDER_DIMENSION: 512
-      EMBEDDER_DEVICE: cpu
-      EMBEDDER_BACKEND: auto
-      EMBEDDER_TASK: retrieval
-    volumes:
-      - embedder-cache:/models
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:12500/health', timeout=5).read()"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 120s
-    restart: unless-stopped
-    networks:
-      - plotva-net
-    logging:
-      driver: local
-      options:
-        max-size: "10m"
-        max-file: "3"
-
   token-estimator:
     build:
       context: ./tools/token-estimator
@@ -178,5 +149,4 @@ volumes:
   openplotva-state:
   postgres-data:
   dragonfly-data:
-  embedder-cache:
   token-estimator-cache:

@@ -113,10 +113,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          ssh "$GETA_SSH_TARGET" "install -d -m 755 '$GETA_DEPLOY_ROOT' '$GETA_DEPLOY_ROOT/tools/embedder' '$GETA_DEPLOY_ROOT/tools/token-estimator'"
+          ssh "$GETA_SSH_TARGET" "install -d -m 755 '$GETA_DEPLOY_ROOT' '$GETA_DEPLOY_ROOT/tools/token-estimator'"
           scp deploy/production/compose.production.yml "$GETA_SSH_TARGET:$GETA_DEPLOY_ROOT/compose.production.yml"
           scp deploy/production/deploy-production.sh "$GETA_SSH_TARGET:$GETA_DEPLOY_ROOT/deploy-production.sh"
-          tar -C tools/embedder -czf - . | ssh "$GETA_SSH_TARGET" "tar -xzf - -C '$GETA_DEPLOY_ROOT/tools/embedder'"
           tar -C tools/token-estimator -czf - . | ssh "$GETA_SSH_TARGET" "tar -xzf - -C '$GETA_DEPLOY_ROOT/tools/token-estimator'"
           ssh "$GETA_SSH_TARGET" "chmod 755 '$GETA_DEPLOY_ROOT/deploy-production.sh'"
 

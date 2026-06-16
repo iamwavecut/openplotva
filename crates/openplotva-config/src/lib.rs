@@ -247,7 +247,10 @@ pub const DEFAULT_MEMORY_TOKENIZER_MODEL: &str = "google/gemma-4-26B-A4B-it";
 
 pub const DEFAULT_MEMORY_TOKEN_ESTIMATOR_URL: &str = "http://token-estimator:12600";
 
-pub const DEFAULT_MEMORY_EMBEDDER_URL: &str = "http://embedder:12500";
+/// Discovery service name the embedder registers under on the AI Farm.
+pub const DEFAULT_EMBEDDER_DISCOVERY_SERVICE_NAME: &str = "embedder";
+/// Discovery endpoint name the embedder exposes (`POST /encode`).
+pub const DEFAULT_EMBEDDER_DISCOVERY_ENDPOINT_NAME: &str = "encode";
 
 pub const DEFAULT_MEMORY_EMBEDDING_MODEL: &str = "jinaai/jina-embeddings-v5-text-nano";
 
@@ -755,7 +758,8 @@ pub struct MemoryConfig {
     pub tokenizer_file: String,
     pub token_estimator_url: String,
     pub token_estimator_timeout_seconds: i32,
-    pub embedder_url: String,
+    pub embedder_service_name: String,
+    pub embedder_endpoint_name: String,
     pub embedding_model: String,
     pub embedding_dim: i32,
     pub aifarm_service_name: String,
@@ -782,7 +786,8 @@ pub struct MemoryConfig {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ShieldConfig {
     pub enabled: bool,
-    pub embedder_url: String,
+    pub embedder_service_name: String,
+    pub embedder_endpoint_name: String,
     pub embedding_dim: i32,
     pub max_matches: i32,
     pub vector_min_score: f64,
@@ -1170,8 +1175,10 @@ pub struct RawConfig {
     pub memory_token_estimator_url: Option<String>,
     /// `MEMORY_TOKEN_ESTIMATOR_TIMEOUT_SECONDS`.
     pub memory_token_estimator_timeout_seconds: Option<String>,
-    /// `MEMORY_EMBEDDER_URL`.
-    pub memory_embedder_url: Option<String>,
+    /// `MEMORY_EMBEDDER_DISCOVERY_SERVICE_NAME`.
+    pub memory_embedder_service_name: Option<String>,
+    /// `MEMORY_EMBEDDER_DISCOVERY_ENDPOINT_NAME`.
+    pub memory_embedder_endpoint_name: Option<String>,
     /// `MEMORY_EMBEDDING_MODEL`.
     pub memory_embedding_model: Option<String>,
     /// `MEMORY_EMBEDDING_DIM`.
@@ -1216,8 +1223,10 @@ pub struct RawConfig {
     pub memory_redaction_categories: Option<String>,
     /// `SHIELD_ENABLED`.
     pub shield_enabled: Option<String>,
-    /// `SHIELD_EMBEDDER_URL`.
-    pub shield_embedder_url: Option<String>,
+    /// `SHIELD_EMBEDDER_DISCOVERY_SERVICE_NAME`.
+    pub shield_embedder_service_name: Option<String>,
+    /// `SHIELD_EMBEDDER_DISCOVERY_ENDPOINT_NAME`.
+    pub shield_embedder_endpoint_name: Option<String>,
     /// `SHIELD_EMBEDDING_DIM`.
     pub shield_embedding_dim: Option<String>,
     /// `SHIELD_MAX_MATCHES`.
@@ -2148,9 +2157,12 @@ impl AppConfig {
                     raw.memory_token_estimator_timeout_seconds,
                     2,
                 )?,
-                embedder_url: raw
-                    .memory_embedder_url
-                    .unwrap_or_else(|| DEFAULT_MEMORY_EMBEDDER_URL.to_owned()),
+                embedder_service_name: raw
+                    .memory_embedder_service_name
+                    .unwrap_or_else(|| DEFAULT_EMBEDDER_DISCOVERY_SERVICE_NAME.to_owned()),
+                embedder_endpoint_name: raw
+                    .memory_embedder_endpoint_name
+                    .unwrap_or_else(|| DEFAULT_EMBEDDER_DISCOVERY_ENDPOINT_NAME.to_owned()),
                 embedding_model: raw
                     .memory_embedding_model
                     .unwrap_or_else(|| DEFAULT_MEMORY_EMBEDDING_MODEL.to_owned()),
@@ -2244,7 +2256,12 @@ impl AppConfig {
             },
             shield: ShieldConfig {
                 enabled: parse_bool("SHIELD_ENABLED", raw.shield_enabled, DEFAULT_SHIELD_ENABLED)?,
-                embedder_url: raw.shield_embedder_url.unwrap_or_default(),
+                embedder_service_name: raw
+                    .shield_embedder_service_name
+                    .unwrap_or_else(|| DEFAULT_EMBEDDER_DISCOVERY_SERVICE_NAME.to_owned()),
+                embedder_endpoint_name: raw
+                    .shield_embedder_endpoint_name
+                    .unwrap_or_else(|| DEFAULT_EMBEDDER_DISCOVERY_ENDPOINT_NAME.to_owned()),
                 embedding_dim: parse_i32(
                     "SHIELD_EMBEDDING_DIM",
                     raw.shield_embedding_dim,
@@ -2522,7 +2539,8 @@ impl RawConfig {
             memory_tokenizer_file: env("MEMORY_TOKENIZER_FILE"),
             memory_token_estimator_url: env("MEMORY_TOKEN_ESTIMATOR_URL"),
             memory_token_estimator_timeout_seconds: env("MEMORY_TOKEN_ESTIMATOR_TIMEOUT_SECONDS"),
-            memory_embedder_url: env("MEMORY_EMBEDDER_URL"),
+            memory_embedder_service_name: env("MEMORY_EMBEDDER_DISCOVERY_SERVICE_NAME"),
+            memory_embedder_endpoint_name: env("MEMORY_EMBEDDER_DISCOVERY_ENDPOINT_NAME"),
             memory_embedding_model: env("MEMORY_EMBEDDING_MODEL"),
             memory_embedding_dim: env("MEMORY_EMBEDDING_DIM"),
             memory_aifarm_service_name: env("MEMORY_AIFARM_SERVICE_NAME"),
@@ -2545,7 +2563,8 @@ impl RawConfig {
             memory_redaction_capacity_poll_seconds: env("MEMORY_REDACTION_CAPACITY_POLL_SECONDS"),
             memory_redaction_categories: env("MEMORY_REDACTION_CATEGORIES"),
             shield_enabled: env("SHIELD_ENABLED"),
-            shield_embedder_url: env("SHIELD_EMBEDDER_URL"),
+            shield_embedder_service_name: env("SHIELD_EMBEDDER_DISCOVERY_SERVICE_NAME"),
+            shield_embedder_endpoint_name: env("SHIELD_EMBEDDER_DISCOVERY_ENDPOINT_NAME"),
             shield_embedding_dim: env("SHIELD_EMBEDDING_DIM"),
             shield_max_matches: env("SHIELD_MAX_MATCHES"),
             shield_vector_min_score: env("SHIELD_VECTOR_MIN_SCORE"),
@@ -3196,7 +3215,8 @@ mod tests {
             "http://token-estimator:12600"
         );
         assert_eq!(config.memory.token_estimator_timeout_seconds, 2);
-        assert_eq!(config.memory.embedder_url, "http://embedder:12500");
+        assert_eq!(config.memory.embedder_service_name, "embedder");
+        assert_eq!(config.memory.embedder_endpoint_name, "encode");
         assert_eq!(
             config.memory.embedding_model,
             "jinaai/jina-embeddings-v5-text-nano"
@@ -3232,7 +3252,8 @@ mod tests {
             ]
         );
         assert!(config.shield.enabled);
-        assert_eq!(config.shield.embedder_url, "");
+        assert_eq!(config.shield.embedder_service_name, "embedder");
+        assert_eq!(config.shield.embedder_endpoint_name, "encode");
         assert_eq!(config.shield.embedding_dim, DEFAULT_SHIELD_EMBEDDING_DIM);
         assert_eq!(config.shield.max_matches, DEFAULT_SHIELD_MAX_MATCHES);
         assert_eq!(
@@ -3665,7 +3686,7 @@ mod tests {
             memory_tokenizer_file: Some("/tmp/tokenizer.json".to_owned()),
             memory_token_estimator_url: Some("http://tokens.test".to_owned()),
             memory_token_estimator_timeout_seconds: Some("4".to_owned()),
-            memory_embedder_url: Some("http://embedder.test".to_owned()),
+            memory_embedder_service_name: Some("memory-embedder".to_owned()),
             memory_embedding_model: Some("embedding".to_owned()),
             memory_embedding_dim: Some("512".to_owned()),
             memory_aifarm_service_name: Some("svc".to_owned()),
@@ -3704,7 +3725,7 @@ mod tests {
         assert_eq!(config.memory.tokenizer_file, "/tmp/tokenizer.json");
         assert_eq!(config.memory.token_estimator_url, "http://tokens.test");
         assert_eq!(config.memory.token_estimator_timeout_seconds, 4);
-        assert_eq!(config.memory.embedder_url, "http://embedder.test");
+        assert_eq!(config.memory.embedder_service_name, "memory-embedder");
         assert_eq!(config.memory.embedding_model, "embedding");
         assert_eq!(config.memory.embedding_dim, 512);
         assert_eq!(config.memory.aifarm_service_name, "svc");
@@ -3737,7 +3758,7 @@ mod tests {
     fn shield_config_loads_go_env_values() -> Result<(), super::ConfigError> {
         let config = AppConfig::from_raw(RawConfig {
             shield_enabled: Some("false".to_owned()),
-            shield_embedder_url: Some("http://shield-embedder.test".to_owned()),
+            shield_embedder_service_name: Some("shield-embedder".to_owned()),
             shield_embedding_dim: Some("256".to_owned()),
             shield_max_matches: Some("5".to_owned()),
             shield_vector_min_score: Some("0.51".to_owned()),
@@ -3749,7 +3770,7 @@ mod tests {
         })?;
 
         assert!(!config.shield.enabled);
-        assert_eq!(config.shield.embedder_url, "http://shield-embedder.test");
+        assert_eq!(config.shield.embedder_service_name, "shield-embedder");
         assert_eq!(config.shield.embedding_dim, 256);
         assert_eq!(config.shield.max_matches, 5);
         assert_eq!(config.shield.vector_min_score, 0.51);

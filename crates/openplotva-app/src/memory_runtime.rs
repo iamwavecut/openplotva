@@ -22,7 +22,7 @@ use openplotva_memory::{
     MemoryExtractor, MemoryExtractorFuture, RedactingMemoryExtractor, RunStats,
 };
 use openplotva_storage::{
-    DialogMemoryChatMeta, PgEmbeddingVector, PostgresMemoryStore, StorageError, pg_embedding_vector,
+    DialogMemoryChatMeta, PgEmbeddingVector, PostgresMemoryStore, StorageError,
 };
 use openplotva_taskman::{
     InMemoryTaskQueue, JobType, MEMORY_CONSOLIDATION_QUEUE_NAME, new_memory_consolidation_job_at,
@@ -31,20 +31,14 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use time::{OffsetDateTime, Time};
 
+use crate::embedder::DiscoveryEmbedderClient;
 use crate::media::aifarm_pool_config_from_app_config;
 use crate::runtime_gemini_cache::resolve_google_ai_key;
 
 pub const EMBEDDER_DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 pub const MEMORY_RETRIEVAL_EMBEDDING_TIMEOUT: Duration = Duration::from_secs(15);
-pub const MEMORY_RETRIEVAL_EMBEDDING_MAX_RETRIES: usize = 1;
-pub const EMBEDDER_DEFAULT_RETRY_DELAY: Duration = Duration::from_secs(1);
-pub const EMBEDDER_DEFAULT_MAX_RETRIES: usize = 3;
-pub const EMBEDDER_USER_AGENT: &str = "plotva-embedder-client/1.0";
 pub const MEMORY_CONSOLIDATION_JOB_POLL_INTERVAL: Duration = Duration::from_secs(1);
 pub const MEMORY_CONSOLIDATION_JOB_WORKER_PREFIX: &str = "memory-consolidation-worker";
-const EMBEDDER_DEFAULT_DIMENSION: i32 = 1024;
-const EMBEDDER_DEFAULT_TASK: &str =
-    "Given a web search query, retrieve relevant passages that answer the query";
 const MEMORY_RETRIEVAL_QUERY_TASK: &str = "Conversational query for scoped memory retrieval";
 const MEMORY_CARD_EMBEDDING_TASK: &str = "Memory card for scoped conversational retrieval";
 const MEMORY_EPISODE_EMBEDDING_TASK: &str =
@@ -70,6 +64,15 @@ pub type EmbeddingProviderFuture<'a> = Pin<
     Box<dyn Future<Output = Result<Option<PgEmbeddingVector>, EmbedderClientError>> + Send + 'a>,
 >;
 
+/// Boxed future returned by batch embedding providers.
+pub type EmbeddingBatchFuture<'a> = Pin<
+    Box<
+        dyn Future<Output = Result<Vec<Option<PgEmbeddingVector>>, EmbedderClientError>>
+            + Send
+            + 'a,
+    >,
+>;
+
 /// Runtime embedding provider used by dialog materialization.
 pub trait EmbeddingProvider: std::fmt::Debug + Send + Sync {
     fn embed_one<'a>(
@@ -78,6 +81,33 @@ pub trait EmbeddingProvider: std::fmt::Debug + Send + Sync {
         dimension: i32,
         task_description: &'a str,
     ) -> EmbeddingProviderFuture<'a>;
+
+    /// Embed a batch of texts, preserving input order; empty texts map to `None`.
+    ///
+    /// The default loops over [`EmbeddingProvider::embed_one`]; providers that
+    /// can batch natively (e.g. one Discovery job for all prompts) should
+    /// override this.
+    fn embed_batch<'a>(
+        &'a self,
+        texts: &'a [String],
+        dimension: i32,
+        task_description: &'a str,
+    ) -> EmbeddingBatchFuture<'a> {
+        Box::pin(async move {
+            let mut out = Vec::with_capacity(texts.len());
+            for text in texts {
+                out.push(self.embed_one(text, dimension, task_description).await?);
+            }
+            Ok(out)
+        })
+    }
+
+    /// Whether the embedder is currently reachable. Used to gate work that must
+    /// not start while the embedder is down (memory consolidation). Defaults to
+    /// always available for providers without a breaker.
+    fn is_available(&self) -> bool {
+        true
+    }
 }
 
 /// Boxed future returned by memory write stores.
@@ -174,6 +204,9 @@ pub trait MemoryRunStore: MemoryWriteStore {
         run_id: i64,
         cause: &'a str,
     ) -> MemoryWriteStoreFuture<'a, (), Self::Error>;
+
+    /// Release one claimed run back to the queue without consuming an attempt.
+    fn release_run<'a>(&'a self, run_id: i64) -> MemoryWriteStoreFuture<'a, (), Self::Error>;
 }
 
 /// Storage boundary needed by runtime API memory restart mutation.
@@ -306,6 +339,10 @@ impl MemoryRunStore for PostgresMemoryStore {
         cause: &'a str,
     ) -> MemoryWriteStoreFuture<'a, (), Self::Error> {
         Box::pin(async move { PostgresMemoryStore::fail_run(self, run_id, cause).await })
+    }
+
+    fn release_run<'a>(&'a self, run_id: i64) -> MemoryWriteStoreFuture<'a, (), Self::Error> {
+        Box::pin(async move { PostgresMemoryStore::release_run(self, run_id).await })
     }
 }
 
@@ -724,6 +761,26 @@ where
         #[source]
         source: StoreError,
     },
+    /// Embedder became unavailable mid-run; abort and keep the run for retry.
+    #[error("embedder unavailable during consolidation: {source}")]
+    EmbedderUnavailable {
+        /// Source embedder error.
+        #[source]
+        source: EmbedderClientError,
+    },
+}
+
+impl<ExtractorError, StoreError> MemoryExtractionWriteError<ExtractorError, StoreError>
+where
+    ExtractorError: StdError + Send + Sync + 'static,
+    StoreError: StdError + Send + Sync + 'static,
+{
+    /// Whether the run failed because the embedder was unavailable, meaning it
+    /// should be released back to the queue rather than counted as a failure.
+    #[must_use]
+    pub fn is_embedder_unavailable(&self) -> bool {
+        matches!(self, Self::EmbedderUnavailable { .. })
+    }
 }
 
 /// Memory run processing failure.
@@ -785,6 +842,12 @@ where
     Embedder: EmbeddingProvider,
 {
     let cfg = cfg.normalized();
+    // Gate: never start a consolidation run while the embedder is down. The run
+    // stays queued (no claim, no attempt consumed) and the cheap breaker check
+    // keeps AI Farm untouched until the embedder recovers.
+    if embedder.is_some_and(|provider| !provider.is_available()) {
+        return Ok(MemoryRunProcessReport::default());
+    }
     let Some(run) = store
         .claim_run(&cfg.owner, cfg.lease)
         .await
@@ -796,6 +859,20 @@ where
     let result = process_claimed_memory_run(extractor, store, embedder, &run, &cfg).await;
     match result {
         Ok(report) => Ok(report),
+        // Embedder died mid-run: abort without burning an attempt and leave the
+        // run queued for retry once the embedder is back.
+        Err(error) if error.is_embedder_unavailable() => {
+            tracing::warn!(
+                run_id,
+                error = %error,
+                "embedder unavailable mid-run; releasing memory run for retry"
+            );
+            store
+                .release_run(run_id)
+                .await
+                .map_err(|source| MemoryRunProcessError::Store { source })?;
+            Ok(MemoryRunProcessReport::default())
+        }
         Err(error) => {
             let text = error.to_string();
             store
@@ -2020,6 +2097,9 @@ where
         Some(provider) => {
             match embed_memory_cards(provider, &cards, cfg.embedding_dimension).await {
                 Ok(embeddings) => embeddings,
+                Err(error) if error.is_availability_failure() => {
+                    return Err(MemoryExtractionWriteError::EmbedderUnavailable { source: error });
+                }
                 Err(error) => {
                     report.card_embedding_error = Some(error.to_string());
                     Vec::new()
@@ -2102,6 +2182,9 @@ where
             .await
         {
             Ok(embedding) => embedding,
+            Err(error) if error.is_availability_failure() => {
+                return Err(MemoryExtractionWriteError::EmbedderUnavailable { source: error });
+            }
             Err(error) => {
                 report.episode_embedding_error = Some(error.to_string());
                 None
@@ -2135,15 +2218,10 @@ async fn embed_memory_cards<Embedder>(
 where
     Embedder: EmbeddingProvider,
 {
-    let mut embeddings = Vec::with_capacity(cards.len());
-    for card in cards {
-        embeddings.push(
-            provider
-                .embed_one(&card.fact_text, dimension, MEMORY_CARD_EMBEDDING_TASK)
-                .await?,
-        );
-    }
-    Ok(embeddings)
+    let texts: Vec<String> = cards.iter().map(|card| card.fact_text.clone()).collect();
+    provider
+        .embed_batch(&texts, dimension, MEMORY_CARD_EMBEDDING_TASK)
+        .await
 }
 
 fn episode_from_extraction_batch(input: &ExtractInput, output: &ExtractOutput) -> Episode {
@@ -2198,43 +2276,6 @@ fn unique_normalized_strings(values: &[String]) -> Vec<String> {
 #[error("memory extractor is unavailable")]
 pub struct MemoryExtractorUnavailableForWrite;
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct HttpEmbedderClientConfig {
-    /// Base embedder service URL.
-    pub base_url: String,
-    /// Whole-request timeout.
-    pub timeout: Duration,
-    /// Retry count after the first attempt.
-    pub max_retries: usize,
-    /// Base retry delay, doubled per attempt and capped at 10s.
-    pub retry_delay: Duration,
-}
-
-impl Default for HttpEmbedderClientConfig {
-    fn default() -> Self {
-        Self {
-            base_url: String::new(),
-            timeout: EMBEDDER_DEFAULT_TIMEOUT,
-            max_retries: EMBEDDER_DEFAULT_MAX_RETRIES,
-            retry_delay: EMBEDDER_DEFAULT_RETRY_DELAY,
-        }
-    }
-}
-
-impl HttpEmbedderClientConfig {
-    #[must_use]
-    pub fn with_defaults(mut self) -> Self {
-        self.base_url = self.base_url.trim().trim_end_matches('/').to_owned();
-        if self.timeout.is_zero() {
-            self.timeout = EMBEDDER_DEFAULT_TIMEOUT;
-        }
-        if self.retry_delay.is_zero() {
-            self.retry_delay = EMBEDDER_DEFAULT_RETRY_DELAY;
-        }
-        self
-    }
-}
-
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct EmbedderEncodeRequest {
     /// Input prompts.
@@ -2247,18 +2288,6 @@ pub struct EmbedderEncodeRequest {
     pub task_description: String,
 }
 
-impl EmbedderEncodeRequest {
-    fn with_defaults(mut self) -> Self {
-        if self.dimension == 0 {
-            self.dimension = EMBEDDER_DEFAULT_DIMENSION;
-        }
-        if self.task_description.is_empty() {
-            self.task_description = EMBEDDER_DEFAULT_TASK.to_owned();
-        }
-        self
-    }
-}
-
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 pub struct EmbedderEncodeResponse {
     /// Returned embeddings.
@@ -2269,12 +2298,7 @@ pub struct EmbedderEncodeResponse {
     pub count: i32,
 }
 
-#[derive(Deserialize)]
-struct EmbedderErrorResponse {
-    detail: String,
-}
-
-/// HTTP embedder failure.
+/// Embedder failure.
 #[derive(Debug, Error)]
 pub enum EmbedderClientError {
     /// Empty prompt batch.
@@ -2302,162 +2326,73 @@ pub enum EmbedderClientError {
         /// Last error string.
         last_error: String,
     },
+    /// Circuit breaker open; the embedder is treated as unavailable.
+    #[error("embedder unavailable (circuit breaker open)")]
+    Unavailable,
+    /// Discovery transport, submit, poll, or decode failure.
+    #[error("embedder discovery call failed: {message}")]
+    Discovery {
+        /// Failure detail.
+        message: String,
+    },
 }
 
-#[derive(Clone, Debug)]
-pub struct HttpEmbedderClient {
-    cfg: HttpEmbedderClientConfig,
-    client: reqwest::Client,
-}
-
-impl HttpEmbedderClient {
-    /// Build a reqwest-backed embedder client.
-    pub fn new(cfg: HttpEmbedderClientConfig) -> Result<Self, reqwest::Error> {
-        let cfg = cfg.with_defaults();
-        let client = reqwest::Client::builder().timeout(cfg.timeout).build()?;
-        Ok(Self { cfg, client })
-    }
-
-    /// Access normalized config.
+impl EmbedderClientError {
+    /// Build a discovery-stage failure.
     #[must_use]
-    pub fn config(&self) -> &HttpEmbedderClientConfig {
-        &self.cfg
+    pub fn discovery(message: String) -> Self {
+        Self::Discovery { message }
     }
 
-    pub async fn encode(
-        &self,
-        request: &EmbedderEncodeRequest,
-    ) -> Result<EmbedderEncodeResponse, EmbedderClientError> {
-        if request.prompts.is_empty() {
-            return Err(EmbedderClientError::EmptyPrompts);
+    /// Whether this failure means the embedder is unreachable/erroring (as
+    /// opposed to a caller-side error like an empty batch). Drives the breaker
+    /// and the consolidation abort decision.
+    #[must_use]
+    pub fn is_availability_failure(&self) -> bool {
+        match self {
+            Self::EmptyPrompts => false,
+            Self::Unavailable | Self::Discovery { .. } | Self::RetryExhausted { .. } => true,
+            Self::Request { .. } => retryable_embedder_error(self),
+            Self::Status { status, .. } => *status >= 500,
         }
-        let request = request.clone().with_defaults();
-        let mut last_error = String::new();
-        for attempt in 0..=self.cfg.max_retries {
-            if attempt > 0 {
-                tokio::time::sleep(self.retry_wait(attempt)).await;
-            }
-            match self.send_encode_once(&request).await {
-                Ok(response) => return Ok(response),
-                Err(error) if retryable_embedder_error(&error) => {
-                    last_error = error.to_string();
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        Err(EmbedderClientError::RetryExhausted {
-            attempts: self.cfg.max_retries + 1,
-            last_error,
-        })
-    }
-
-    fn retry_wait(&self, attempt: usize) -> Duration {
-        let shift = attempt.saturating_sub(1).min(30);
-        let factor = 1_u32.checked_shl(shift as u32).unwrap_or(u32::MAX);
-        (self.cfg.retry_delay * factor).min(Duration::from_secs(10))
-    }
-
-    async fn send_encode_once(
-        &self,
-        request: &EmbedderEncodeRequest,
-    ) -> Result<EmbedderEncodeResponse, EmbedderClientError> {
-        let response = self
-            .client
-            .post(format!("{}/encode", self.cfg.base_url))
-            .header(reqwest::header::CONNECTION, "keep-alive")
-            .header(reqwest::header::USER_AGENT, EMBEDDER_USER_AGENT)
-            .json(request)
-            .send()
-            .await?;
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            let detail = serde_json::from_str::<EmbedderErrorResponse>(&body)
-                .map(|value| value.detail)
-                .unwrap_or(body);
-            return Err(EmbedderClientError::Status { status, detail });
-        }
-        Ok(response.json::<EmbedderEncodeResponse>().await?)
-    }
-}
-
-impl EmbeddingProvider for HttpEmbedderClient {
-    fn embed_one<'a>(
-        &'a self,
-        text: &'a str,
-        dimension: i32,
-        task_description: &'a str,
-    ) -> EmbeddingProviderFuture<'a> {
-        Box::pin(async move {
-            let text = text.trim();
-            if text.is_empty() {
-                return Ok(None);
-            }
-            let response = self
-                .encode(&EmbedderEncodeRequest {
-                    prompts: vec![text.to_owned()],
-                    dimension,
-                    task_description: task_description.trim().to_owned(),
-                })
-                .await?;
-            Ok(response.embeddings.into_iter().next().map(|values| {
-                pg_embedding_vector(values.into_iter().map(|value| value as f32).collect())
-            }))
-        })
     }
 }
 
 pub fn memory_retrieval_embedder_from_config(
     config: &MemoryConfig,
-) -> Result<Option<HttpEmbedderClient>, reqwest::Error> {
-    http_embedder_from_url(
-        &config.embedder_url,
+    discovery_base_url: &str,
+) -> Result<Option<DiscoveryEmbedderClient>, reqwest::Error> {
+    DiscoveryEmbedderClient::with_budget(
+        discovery_base_url,
+        &config.embedder_service_name,
+        &config.embedder_endpoint_name,
         MEMORY_RETRIEVAL_EMBEDDING_TIMEOUT,
-        MEMORY_RETRIEVAL_EMBEDDING_MAX_RETRIES,
-        EMBEDDER_DEFAULT_RETRY_DELAY,
     )
 }
 
 pub fn memory_write_embedder_from_config(
     config: &MemoryConfig,
-) -> Result<Option<HttpEmbedderClient>, reqwest::Error> {
-    http_embedder_from_url(
-        &config.embedder_url,
+    discovery_base_url: &str,
+) -> Result<Option<DiscoveryEmbedderClient>, reqwest::Error> {
+    DiscoveryEmbedderClient::with_budget(
+        discovery_base_url,
+        &config.embedder_service_name,
+        &config.embedder_endpoint_name,
         EMBEDDER_DEFAULT_TIMEOUT,
-        EMBEDDER_DEFAULT_MAX_RETRIES,
-        EMBEDDER_DEFAULT_RETRY_DELAY,
     )
 }
 
 pub fn shield_embedder_from_config(
     config: &ShieldConfig,
-) -> Result<Option<HttpEmbedderClient>, reqwest::Error> {
+    discovery_base_url: &str,
+) -> Result<Option<DiscoveryEmbedderClient>, reqwest::Error> {
     let timeout = positive_seconds(config.retrieval_timeout_seconds).max(Duration::from_secs(1));
-    http_embedder_from_url(
-        &config.embedder_url,
+    DiscoveryEmbedderClient::with_budget(
+        discovery_base_url,
+        &config.embedder_service_name,
+        &config.embedder_endpoint_name,
         timeout,
-        EMBEDDER_DEFAULT_MAX_RETRIES,
-        EMBEDDER_DEFAULT_RETRY_DELAY,
     )
-}
-
-fn http_embedder_from_url(
-    base_url: &str,
-    timeout: Duration,
-    max_retries: usize,
-    retry_delay: Duration,
-) -> Result<Option<HttpEmbedderClient>, reqwest::Error> {
-    let base_url = base_url.trim();
-    if base_url.is_empty() {
-        return Ok(None);
-    }
-    HttpEmbedderClient::new(HttpEmbedderClientConfig {
-        base_url: base_url.to_owned(),
-        timeout,
-        max_retries,
-        retry_delay,
-    })
-    .map(Some)
 }
 
 fn is_zero_i32(value: &i32) -> bool {
@@ -2946,6 +2881,7 @@ fn runtime_memory_restart_model(model: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openplotva_storage::pg_embedding_vector;
     use std::sync::Mutex;
 
     #[derive(Debug, Error)]
@@ -2969,6 +2905,7 @@ mod tests {
         continuations: Mutex<Vec<(i32, i32)>>,
         completed: Mutex<Vec<(i64, RunStats)>>,
         failed: Mutex<Vec<(i64, String)>>,
+        released: Mutex<Vec<i64>>,
         retried_runs: Mutex<Vec<i64>>,
         retry_failed_count: u64,
         retry_failed_calls: Mutex<i32>,
@@ -3170,6 +3107,13 @@ mod tests {
                 Ok(())
             })
         }
+
+        fn release_run<'a>(&'a self, run_id: i64) -> MemoryWriteStoreFuture<'a, (), Self::Error> {
+            Box::pin(async move {
+                self.released.lock().expect("released").push(run_id);
+                Ok(())
+            })
+        }
     }
 
     #[derive(Debug, Default)]
@@ -3192,6 +3136,41 @@ mod tests {
                 ));
                 Ok(Some(pg_embedding_vector(vec![1.0, 0.5])))
             })
+        }
+    }
+
+    /// Embedder reporting itself unavailable; gates consolidation off.
+    #[derive(Debug, Default)]
+    struct UnavailableEmbedder;
+
+    impl EmbeddingProvider for UnavailableEmbedder {
+        fn embed_one<'a>(
+            &'a self,
+            _text: &'a str,
+            _dimension: i32,
+            _task_description: &'a str,
+        ) -> EmbeddingProviderFuture<'a> {
+            Box::pin(async move { Err(EmbedderClientError::Unavailable) })
+        }
+
+        fn is_available(&self) -> bool {
+            false
+        }
+    }
+
+    /// Embedder that passes the health gate but fails every embed with an
+    /// availability error, simulating the embedder dying mid-run.
+    #[derive(Debug, Default)]
+    struct MidRunFailingEmbedder;
+
+    impl EmbeddingProvider for MidRunFailingEmbedder {
+        fn embed_one<'a>(
+            &'a self,
+            _text: &'a str,
+            _dimension: i32,
+            _task_description: &'a str,
+        ) -> EmbeddingProviderFuture<'a> {
+            Box::pin(async move { Err(EmbedderClientError::Unavailable) })
         }
     }
 
@@ -3552,39 +3531,25 @@ mod tests {
     }
 
     #[test]
-    fn embedder_client_config_preserves_go_runtime_defaults() {
-        let cfg = HttpEmbedderClientConfig {
-            base_url: " http://embedder.test/// ".to_owned(),
-            timeout: Duration::ZERO,
-            max_retries: 2,
-            retry_delay: Duration::ZERO,
-        }
-        .with_defaults();
-
-        assert_eq!(cfg.base_url, "http://embedder.test");
-        assert_eq!(cfg.timeout, EMBEDDER_DEFAULT_TIMEOUT);
-        assert_eq!(cfg.max_retries, 2);
-        assert_eq!(cfg.retry_delay, EMBEDDER_DEFAULT_RETRY_DELAY);
-
-        let memory = AppConfig::from_raw(openplotva_config::RawConfig {
-            memory_embedder_url: Some("http://memory-embedder.test/".to_owned()),
-            ..openplotva_config::RawConfig::default()
-        })
-        .expect("config")
-        .memory;
-        let memory_client = memory_retrieval_embedder_from_config(&memory).expect("memory client");
-        let memory_client = memory_client.expect("memory embedder configured");
-        assert_eq!(
-            memory_client.config().base_url,
-            "http://memory-embedder.test"
+    fn memory_embedder_builds_discovery_client_with_defaults() {
+        let memory = AppConfig::from_raw(openplotva_config::RawConfig::default())
+            .expect("config")
+            .memory;
+        assert!(
+            memory_retrieval_embedder_from_config(&memory, "   ")
+                .expect("blank")
+                .is_none()
         );
+
+        let client = memory_retrieval_embedder_from_config(&memory, "http://discovery.test")
+            .expect("client")
+            .expect("memory embedder configured");
+        assert_eq!(client.config().base_url, "http://discovery.test");
+        assert_eq!(client.config().service_name, "embedder");
+        assert_eq!(client.config().endpoint_name, "encode");
         assert_eq!(
-            memory_client.config().timeout,
+            client.config().request_timeout,
             MEMORY_RETRIEVAL_EMBEDDING_TIMEOUT
-        );
-        assert_eq!(
-            memory_client.config().max_retries,
-            MEMORY_RETRIEVAL_EMBEDDING_MAX_RETRIES
         );
     }
 
@@ -3605,40 +3570,28 @@ mod tests {
                 "task_description": "task"
             })
         );
-
-        let defaulted = EmbedderEncodeRequest {
-            prompts: vec!["hello".to_owned()],
-            ..EmbedderEncodeRequest::default()
-        }
-        .with_defaults();
-        assert_eq!(defaulted.dimension, EMBEDDER_DEFAULT_DIMENSION);
-        assert_eq!(defaulted.task_description, EMBEDDER_DEFAULT_TASK);
     }
 
     #[test]
     fn shield_embedder_uses_shield_timeout_and_blank_url_disables() {
-        let blank = AppConfig::from_raw(openplotva_config::RawConfig::default())
-            .expect("config")
-            .shield;
-        assert!(
-            shield_embedder_from_config(&blank)
-                .expect("blank")
-                .is_none()
-        );
-
         let shield = AppConfig::from_raw(openplotva_config::RawConfig {
-            shield_embedder_url: Some("http://shield-embedder.test".to_owned()),
             shield_retrieval_timeout_seconds: Some("7".to_owned()),
             ..openplotva_config::RawConfig::default()
         })
         .expect("config")
         .shield;
-        let client = shield_embedder_from_config(&shield)
+        assert!(
+            shield_embedder_from_config(&shield, "")
+                .expect("blank")
+                .is_none()
+        );
+
+        let client = shield_embedder_from_config(&shield, "http://discovery.test")
             .expect("client")
             .expect("shield embedder configured");
-        assert_eq!(client.config().base_url, "http://shield-embedder.test");
-        assert_eq!(client.config().timeout, Duration::from_secs(7));
-        assert_eq!(client.config().max_retries, EMBEDDER_DEFAULT_MAX_RETRIES);
+        assert_eq!(client.config().base_url, "http://discovery.test");
+        assert_eq!(client.config().service_name, "embedder");
+        assert_eq!(client.config().request_timeout, Duration::from_secs(7));
     }
 
     #[tokio::test]
@@ -3869,6 +3822,114 @@ mod tests {
         assert_eq!(completed[0].1.cards_inserted, 1);
         assert_eq!(completed[0].1.episodes_inserted, 1);
         assert!(store.failed.lock().expect("failed").is_empty());
+    }
+
+    #[tokio::test]
+    async fn process_next_memory_run_skips_when_embedder_unavailable() {
+        let run = openplotva_memory::Run {
+            id: 7,
+            chat_id: 1,
+            prompt_version: openplotva_memory::PROMPT_VERSION.to_owned(),
+            ..openplotva_memory::Run::default()
+        };
+        let store = FakeMemoryWriteStore {
+            run: Mutex::new(Some(run)),
+            ..FakeMemoryWriteStore::default()
+        };
+        let extractor = FakeMemoryExtractor {
+            output: ExtractOutput::default(),
+            inputs: Mutex::new(Vec::new()),
+        };
+
+        let report = process_next_memory_run(
+            &extractor,
+            &store,
+            Some(&UnavailableEmbedder),
+            MemoryRunProcessConfig::default(),
+        )
+        .await
+        .expect("gated");
+
+        assert!(
+            !report.processed,
+            "consolidation must not run while the embedder is down"
+        );
+        assert!(
+            store.run.lock().expect("run").is_some(),
+            "run stays queued; it was never claimed"
+        );
+        assert!(store.completed.lock().expect("completed").is_empty());
+        assert!(store.failed.lock().expect("failed").is_empty());
+        assert!(store.released.lock().expect("released").is_empty());
+        assert!(extractor.inputs.lock().expect("inputs").is_empty());
+    }
+
+    #[tokio::test]
+    async fn process_next_memory_run_releases_run_when_embedder_fails_midrun() {
+        let run = openplotva_memory::Run {
+            id: 11,
+            chat_id: 42,
+            prompt_version: openplotva_memory::PROMPT_VERSION.to_owned(),
+            message_count: 1,
+            ..openplotva_memory::Run::default()
+        };
+        let messages = vec![openplotva_memory::Message {
+            entry_id: "msg:1".to_owned(),
+            message_id: 1,
+            text: "Alice likes Rust".to_owned(),
+            occurred_at: OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1),
+            ..openplotva_memory::Message::default()
+        }];
+        let store = FakeMemoryWriteStore {
+            ids: vec![101],
+            run: Mutex::new(Some(run)),
+            messages: Mutex::new(messages),
+            ..FakeMemoryWriteStore::default()
+        };
+        let extractor = FakeMemoryExtractor {
+            output: ExtractOutput {
+                episode_summary: "Summary".to_owned(),
+                candidate_cards: vec![openplotva_memory::CandidateCard {
+                    scope_type: openplotva_memory::CARD_KIND_CHAT.to_owned(),
+                    fact_text: "Alice likes Rust".to_owned(),
+                    source_entry_ids: vec!["msg:1".to_owned()],
+                    confidence: 0.8,
+                    salience: 0.9,
+                    ..openplotva_memory::CandidateCard::default()
+                }],
+                output_tokens: 7,
+                ..ExtractOutput::default()
+            },
+            inputs: Mutex::new(Vec::new()),
+        };
+
+        let report = process_next_memory_run(
+            &extractor,
+            &store,
+            Some(&MidRunFailingEmbedder),
+            MemoryRunProcessConfig {
+                max_messages_per_run: 10,
+                episode_model: "model".to_owned(),
+                ..MemoryRunProcessConfig::default()
+            },
+        )
+        .await
+        .expect("aborted without surfacing an error");
+
+        assert!(!report.processed);
+        assert_eq!(
+            store.released.lock().expect("released").as_slice(),
+            &[11],
+            "the run is released back to the queue"
+        );
+        assert!(
+            store.failed.lock().expect("failed").is_empty(),
+            "an embedder outage must not burn the run's retry budget"
+        );
+        assert!(
+            store.completed.lock().expect("completed").is_empty(),
+            "the run must not complete with partial data"
+        );
     }
 
     #[tokio::test]

@@ -895,6 +895,10 @@ WHERE id = $1"#;
 
 pub const SQL_ENQUEUE_MEMORY_RUN_CONTINUATION: &str = "INSERT INTO memory_runs (chat_id, thread_id, range_start_at, range_end_at, prompt_version, cursor_after_at, cursor_after_message_id, cursor_after_entry_id, message_count) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT (chat_id, thread_id, range_start_at, range_end_at, prompt_version, cursor_after_at, cursor_after_message_id, cursor_after_entry_id) DO NOTHING";
 
+/// Release a claimed run back to the queue without counting it as an attempt.
+/// Used when the embedder is unavailable mid-run: the run is kept for retry.
+pub const SQL_RELEASE_MEMORY_RUN: &str = "UPDATE memory_runs SET status = 'queued', lease_owner = '', leased_until = NULL, started_at = NULL, attempts = GREATEST(0, attempts - 1), updated_at = CURRENT_TIMESTAMP WHERE id = $1";
+
 pub const SQL_RETRY_MEMORY_RUN: &str = "UPDATE memory_runs SET status = 'queued', lease_owner = '', leased_until = NULL, attempts = 0, error = '', updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND status = 'failed'";
 
 pub const SQL_RETRY_FAILED_MEMORY_RUNS: &str = "UPDATE memory_runs SET status = 'queued', lease_owner = '', leased_until = NULL, attempts = 0, error = '', updated_at = CURRENT_TIMESTAMP WHERE status = 'failed'";
@@ -4441,6 +4445,18 @@ impl PostgresMemoryStore {
         sqlx::query(SQL_FAIL_MEMORY_RUN)
             .bind(run_id)
             .bind(cause)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Release a claimed run back to the queue without consuming an attempt.
+    pub async fn release_run(&self, run_id: i64) -> Result<(), StorageError> {
+        if run_id == 0 {
+            return Ok(());
+        }
+        sqlx::query(SQL_RELEASE_MEMORY_RUN)
+            .bind(run_id)
             .execute(&self.pool)
             .await?;
         Ok(())

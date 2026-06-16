@@ -18,6 +18,7 @@ pub mod dialog_messages;
 pub mod dialog_runtime;
 pub mod dialog_tools;
 pub mod edited;
+pub mod embedder;
 pub mod guest;
 pub mod help;
 pub mod history_summary;
@@ -543,7 +544,10 @@ fn static_web_routes_from_config(
         }
         if config.shield.enabled {
             routes.shield_store = Some(PostgresShieldStore::new(clients.postgres.clone()));
-            match memory_runtime::shield_embedder_from_config(&config.shield) {
+            match memory_runtime::shield_embedder_from_config(
+                &config.shield,
+                &config.llm.discovery.base_url,
+            ) {
                 Ok(Some(client)) => {
                     routes.shield_embedder =
                         Some(Arc::new(client) as Arc<dyn memory_runtime::EmbeddingProvider>);
@@ -3899,7 +3903,10 @@ async fn admin_memory_restart_override_execute_response(
             return admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed");
         }
     };
-    let embedder = match memory_runtime::memory_write_embedder_from_config(&runtime.config.memory) {
+    let embedder = match memory_runtime::memory_write_embedder_from_config(
+        &runtime.config.memory,
+        &runtime.config.llm.discovery.base_url,
+    ) {
         Ok(embedder) => embedder,
         Err(error) => {
             tracing::warn!(%error, provider, model, "failed to build admin memory override embedder");
@@ -3967,7 +3974,7 @@ async fn admin_memory_restart_override_execute_response(
 async fn admin_memory_override_drain(
     runtime: AdminMemoryOverrideRuntime,
     extractor: memory_runtime::AppMemoryExtractor,
-    embedder: Option<memory_runtime::HttpEmbedderClient>,
+    embedder: Option<embedder::DiscoveryEmbedderClient>,
     cfg: memory_runtime::MemoryRunProcessConfig,
     model: String,
     _guard: tokio::sync::OwnedMutexGuard<()>,
@@ -7281,6 +7288,10 @@ pub async fn run() -> anyhow::Result<()> {
         &config.observability,
         config.runtime_api.log_buffer_size,
     );
+    if let Some(token) = config.bot.key.as_deref() {
+        openplotva_observability::secrets::register_secret(token);
+    }
+    openplotva_observability::secrets::register_secret(&config.google_ai.key);
 
     let mut readiness_checks = Vec::new();
     let service_clients = connect_services(&config, &mut readiness_checks).await?;
@@ -7660,7 +7671,6 @@ fn shield_options_from_config(
 ) -> openplotva_shield::Options {
     openplotva_shield::Options {
         enabled: config.enabled,
-        embedder_url: config.embedder_url.clone(),
         embedding_dim: config.embedding_dim,
         max_matches: config.max_matches,
         vector_min_score: config.vector_min_score,
@@ -7732,11 +7742,12 @@ fn runtime_api_graphql_snapshot(
         runtime_api_port: i32::from(config.runtime_api.port),
         discovery_base_url: Some(config.llm.discovery.base_url.clone())
             .filter(|value| !value.trim().is_empty()),
-        embedder_enabled: !config.memory.embedder_url.trim().is_empty(),
-        embedder_url: Some(config.memory.embedder_url.clone())
+        embedder_enabled: !config.llm.discovery.base_url.trim().is_empty()
+            && !config.memory.embedder_service_name.trim().is_empty(),
+        embedder_url: Some(config.memory.embedder_service_name.clone())
             .filter(|value| !value.trim().is_empty()),
         shield_enabled: config.shield.enabled,
-        shield_embedder_url: Some(config.shield.embedder_url.clone())
+        shield_embedder_url: Some(config.shield.embedder_service_name.clone())
             .filter(|value| !value.trim().is_empty()),
         shield_max_matches: config.shield.max_matches,
         shield_vector_min_score: config.shield.vector_min_score,
@@ -8374,7 +8385,10 @@ async fn start_runtime_workers(
     if config.memory.enabled && config.bot.key.is_none() {
         match (
             memory_runtime::memory_extractor_from_app_config(config),
-            memory_runtime::memory_write_embedder_from_config(&config.memory),
+            memory_runtime::memory_write_embedder_from_config(
+                &config.memory,
+                &config.llm.discovery.base_url,
+            ),
         ) {
             (Ok(memory_extractor), Ok(memory_write_embedder)) => {
                 let memory_worker_store = memory_store.clone();
@@ -8847,7 +8861,10 @@ async fn start_runtime_workers(
     if config.memory.enabled {
         match (
             memory_runtime::memory_extractor_from_app_config(config),
-            memory_runtime::memory_write_embedder_from_config(&config.memory),
+            memory_runtime::memory_write_embedder_from_config(
+                &config.memory,
+                &config.llm.discovery.base_url,
+            ),
         ) {
             (Ok(_), Ok(memory_write_embedder)) => {
                 let memory_scheduler_store = memory_store.clone();
@@ -9256,13 +9273,19 @@ async fn start_runtime_workers(
         }
     }
     let memory_query_embedder = if dialog_memory_context_enabled(config) {
-        memory_runtime::memory_retrieval_embedder_from_config(&config.memory)?
-            .map(|client| Arc::new(client) as Arc<dyn memory_runtime::EmbeddingProvider>)
+        memory_runtime::memory_retrieval_embedder_from_config(
+            &config.memory,
+            &config.llm.discovery.base_url,
+        )?
+        .map(|client| Arc::new(client) as Arc<dyn memory_runtime::EmbeddingProvider>)
     } else {
         None
     };
-    let shield_query_embedder = memory_runtime::shield_embedder_from_config(&config.shield)?
-        .map(|client| Arc::new(client) as Arc<dyn memory_runtime::EmbeddingProvider>);
+    let shield_query_embedder = memory_runtime::shield_embedder_from_config(
+        &config.shield,
+        &config.llm.discovery.base_url,
+    )?
+    .map(|client| Arc::new(client) as Arc<dyn memory_runtime::EmbeddingProvider>);
     let genkit_fallback = dialog_runtime::genkit_dialog_provider_from_app_config_with_toolbox(
         config,
         Some(Arc::clone(&dialog_toolbox)),
@@ -10928,12 +10951,10 @@ mod tests {
     fn dialog_memory_runtime_wiring_follows_go_memory_service_gate() -> Result<(), Box<dyn Error>> {
         let disabled = openplotva_config::AppConfig::from_raw(openplotva_config::RawConfig {
             memory_enabled: Some("false".to_owned()),
-            memory_embedder_url: Some("http://embedder.test".to_owned()),
             ..openplotva_config::RawConfig::default()
         })?;
         let enabled = openplotva_config::AppConfig::from_raw(openplotva_config::RawConfig {
             memory_enabled: Some("true".to_owned()),
-            memory_embedder_url: Some("http://embedder.test".to_owned()),
             ..openplotva_config::RawConfig::default()
         })?;
 
@@ -10947,7 +10968,7 @@ mod tests {
     {
         let config = openplotva_config::AppConfig::from_raw(openplotva_config::RawConfig {
             shield_enabled: Some("true".to_owned()),
-            shield_embedder_url: Some("http://shield.test".to_owned()),
+            shield_embedder_service_name: Some("shield-svc".to_owned()),
             shield_embedding_dim: Some("256".to_owned()),
             shield_max_matches: Some("5".to_owned()),
             shield_vector_min_score: Some("0.51".to_owned()),
@@ -10972,7 +10993,6 @@ mod tests {
         let snapshot = runtime_api_graphql_snapshot(&config);
 
         assert!(options.enabled);
-        assert_eq!(options.embedder_url, "http://shield.test");
         assert_eq!(options.embedding_dim, 256);
         assert_eq!(options.max_matches, 5);
         assert_eq!(options.vector_min_score, 0.51);
@@ -10981,10 +11001,7 @@ mod tests {
         assert_eq!(options.retrieval_timeout_seconds, 7);
         assert_eq!(shield_history_tail_messages_from_config(&config.shield), 3);
         assert!(snapshot.shield_enabled);
-        assert_eq!(
-            snapshot.shield_embedder_url.as_deref(),
-            Some("http://shield.test")
-        );
+        assert_eq!(snapshot.shield_embedder_url.as_deref(), Some("shield-svc"));
         assert_eq!(snapshot.shield_max_matches, 5);
         assert_eq!(snapshot.shield_vector_min_score, 0.51);
         assert_eq!(snapshot.shield_lexical_min_score, 0.09);

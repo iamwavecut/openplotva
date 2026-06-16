@@ -36,7 +36,6 @@ env_file_value() {
 
 install_layout() {
   install -d -m 755 "$deploy_root" \
-    "${deploy_root}/tools/embedder" \
     "${deploy_root}/tools/token-estimator"
   cd "$deploy_root"
 }
@@ -132,7 +131,6 @@ effective_db_postgres_password() {
 legacy_import_needed() {
   legacy_volume_needs_import "go-plotva_postgres_data" "${project}_postgres-data" ||
     legacy_volume_needs_import "go-plotva_dragonflydata" "${project}_dragonfly-data" ||
-    legacy_volume_needs_import "go-plotva_embedder_cache" "${project}_embedder-cache" ||
     legacy_volume_needs_import "go-plotva_token_estimator_cache" "${project}_token-estimator-cache"
 }
 
@@ -168,7 +166,6 @@ import_file_volumes() {
     fi
     copy_volume "go-plotva_dragonflydata" "${project}_dragonfly-data"
   fi
-  copy_volume "go-plotva_embedder_cache" "${project}_embedder-cache"
   copy_volume "go-plotva_token_estimator_cache" "${project}_token-estimator-cache"
 }
 
@@ -313,8 +310,6 @@ start_dependencies() {
   fi
 
   ensure_dragonfly
-  ensure_service embedder
-  wait_for_service_health embedder
   ensure_service token-estimator
   wait_for_service_health token-estimator
 }

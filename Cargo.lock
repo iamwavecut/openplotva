@@ -2122,6 +2122,7 @@ name = "openplotva-observability"
 version = "0.1.0"
 dependencies = [
  "openplotva-config",
+ "regex",
  "serde_json",
  "tracing",
  "tracing-subscriber",

@@ -23,8 +23,6 @@ pub const QUERY_EMBEDDING_TASK: &str =
 pub struct Options {
     /// Whether Shield is enabled.
     pub enabled: bool,
-    /// Shared embedder URL.
-    pub embedder_url: String,
     /// Embedding dimension.
     pub embedding_dim: i32,
     /// Maximum matches injected into context.
@@ -45,7 +43,6 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             enabled: true,
-            embedder_url: String::new(),
             embedding_dim: SCHEMA_EMBEDDING_DIM,
             max_matches: DEFAULT_MAX_MATCHES,
             vector_min_score: DEFAULT_VECTOR_MIN_SCORE,
