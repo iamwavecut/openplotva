@@ -564,6 +564,36 @@ fn dialog_client_config_from_app_config(
     }
 }
 
+/// Build a single-completion client config for a named agentic provider, reusing
+/// the shared Discovery base settings and overriding only the fields the provider
+/// specifies. Keeps the Discovery payload shape identical to the dialog client.
+#[must_use]
+pub fn agent_client_config_from_named_provider(
+    config: &AppConfig,
+    spec: &openplotva_config::NamedProviderConfig,
+) -> AifarmClientConfig {
+    let mut client = discovery_client_config_from_app_config(config, &spec.model);
+    if !spec.discovery_service_name.is_empty() {
+        client.service_name = spec.discovery_service_name.clone();
+    }
+    if !spec.discovery_endpoint_name.is_empty() {
+        client.endpoint_name = spec.discovery_endpoint_name.clone();
+    }
+    if !spec.base_url.is_empty() {
+        client.base_url = spec.base_url.clone();
+    }
+    if !spec.url.is_empty() {
+        client.direct_url = spec.url.clone();
+    }
+    if !spec.api_key.is_empty() {
+        client.api_key = spec.api_key.clone();
+    }
+    if spec.task_timeout_seconds > 0 {
+        client.task_timeout = positive_seconds(spec.task_timeout_seconds);
+    }
+    client
+}
+
 fn discovery_client_config_from_app_config(config: &AppConfig, model: &str) -> AifarmClientConfig {
     let dialog = &config.llm.dialog;
     AifarmClientConfig {

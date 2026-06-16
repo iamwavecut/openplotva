@@ -5746,6 +5746,7 @@ const fn task_queue_job_type_name(job_type: JobType) -> &'static str {
         JobType::Translation => "translation",
         JobType::MemoryConsolidation => "memory_consolidation",
         JobType::Control => "control",
+        JobType::Agent => "agent",
     }
 }
 
@@ -8257,6 +8258,7 @@ mod tests {
             result_message_id: None,
             messages: Vec::new(),
             events: Vec::new(),
+            agent_state: None,
         };
         let upsert = openplotva_taskman::TaskQueueWalRecord {
             format: openplotva_taskman::TASK_QUEUE_WAL_FORMAT.to_owned(),

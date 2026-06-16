@@ -11342,6 +11342,7 @@ mod tests {
             music_data: None,
             dialog_data: None,
             control_data: None,
+            agent_data: None,
         };
         let queue = PaymentControlJobWorkerQueueStub::default().with_next_job(item);
         let store = StoreStub::new();

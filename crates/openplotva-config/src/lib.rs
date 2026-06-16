@@ -154,6 +154,30 @@ pub const DEFAULT_DIALOG_AIFARM_POOL_MODELS: &str = "";
 
 pub const DEFAULT_DIALOG_AIFARM_POOL_BASE_URLS: &str = "";
 
+pub const DEFAULT_LLM_PROVIDER_KIND: &str = "aifarm";
+
+pub const DEFAULT_LLM_PROVIDER_MAX_TOKENS: i32 = 8192;
+
+pub const DEFAULT_LLM_PROVIDER_TASK_TIMEOUT_SECONDS: i32 = 600;
+
+/// Agentic search is on by default; the app auto-registers a `qwen-reasoner`
+/// provider so it works without any `LLM_PROVIDERS_*` configuration.
+pub const DEFAULT_AGENTIC_SEARCH_ENABLED: bool = true;
+
+pub const DEFAULT_AGENTIC_SEARCH_REASONER_PROVIDER: &str = "qwen-reasoner";
+
+pub const DEFAULT_AGENTIC_SEARCH_WRITER_PROVIDER: &str = "conversational";
+
+pub const DEFAULT_AGENTIC_SEARCH_MAX_SEARCHES: i32 = 3;
+
+pub const DEFAULT_AGENTIC_SEARCH_MAX_CRAWLS: i32 = 4;
+
+pub const DEFAULT_AGENTIC_SEARCH_MAX_STEPS: i32 = 8;
+
+pub const DEFAULT_AGENTIC_SEARCH_MAX_TOTAL_TOKENS: i32 = 60000;
+
+pub const DEFAULT_AGENTIC_SEARCH_WALL_TIMEOUT_SECONDS: i32 = 120;
+
 pub const DEFAULT_DIALOG_AIFARM_POOL_REASONING_MAX_TOKENS: i32 = 8192;
 
 pub const DEFAULT_VISION_DISCOVERY_SERVICE_NAME: &str = DEFAULT_DIALOG_DISCOVERY_SERVICE_NAME;
@@ -565,6 +589,49 @@ pub struct LlmConfig {
     /// Dialog/provider configuration.
     pub dialog: DialogConfig,
     pub history_summary: HistorySummaryConfig,
+    /// Named LLM providers selectable per agentic flow. Empty by default.
+    pub providers: Vec<NamedProviderConfig>,
+    /// Agentic-workflow configuration.
+    pub agentic: AgenticConfig,
+}
+
+/// A named LLM provider that agentic flows can select by name. Built from the
+/// parallel-array `LLM_PROVIDERS_*` env lists; only the `aifarm` kind is wired today.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NamedProviderConfig {
+    pub name: String,
+    pub kind: String,
+    pub discovery_service_name: String,
+    pub discovery_endpoint_name: String,
+    pub model: String,
+    pub base_url: String,
+    pub url: String,
+    pub api_key: String,
+    pub include_reasoning: Option<bool>,
+    pub enable_thinking: Option<bool>,
+    pub max_tokens: i32,
+    pub temperature: Option<f64>,
+    pub task_timeout_seconds: i32,
+}
+
+/// Agentic-workflow configuration root.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AgenticConfig {
+    pub search: AgenticSearchConfig,
+}
+
+/// Search-agent profile configuration. Disabled by default so the existing naive
+/// `web_search` tool path is unchanged.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AgenticSearchConfig {
+    pub enabled: bool,
+    pub reasoner_provider: String,
+    pub writer_provider: String,
+    pub max_searches: i32,
+    pub max_crawls: i32,
+    pub max_steps: i32,
+    pub max_total_tokens: i32,
+    pub wall_timeout_seconds: i32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -987,6 +1054,48 @@ pub struct RawConfig {
     pub dialog_nvidia_enable_thinking: Option<String>,
     /// `DIALOG_NVIDIA_INCLUDE_REASONING`.
     pub dialog_nvidia_include_reasoning: Option<String>,
+    /// `LLM_PROVIDERS_NAMES` (comma list; primary key for the parallel arrays).
+    pub llm_provider_names: Option<String>,
+    /// `LLM_PROVIDERS_KINDS`.
+    pub llm_provider_kinds: Option<String>,
+    /// `LLM_PROVIDERS_DISCOVERY_SERVICE_NAMES`.
+    pub llm_provider_discovery_service_names: Option<String>,
+    /// `LLM_PROVIDERS_DISCOVERY_ENDPOINT_NAMES`.
+    pub llm_provider_discovery_endpoint_names: Option<String>,
+    /// `LLM_PROVIDERS_MODELS`.
+    pub llm_provider_models: Option<String>,
+    /// `LLM_PROVIDERS_BASE_URLS`.
+    pub llm_provider_base_urls: Option<String>,
+    /// `LLM_PROVIDERS_URLS`.
+    pub llm_provider_urls: Option<String>,
+    /// `LLM_PROVIDERS_API_KEYS`.
+    pub llm_provider_api_keys: Option<String>,
+    /// `LLM_PROVIDERS_INCLUDE_REASONING`.
+    pub llm_provider_include_reasoning: Option<String>,
+    /// `LLM_PROVIDERS_ENABLE_THINKING`.
+    pub llm_provider_enable_thinking: Option<String>,
+    /// `LLM_PROVIDERS_MAX_TOKENS`.
+    pub llm_provider_max_tokens: Option<String>,
+    /// `LLM_PROVIDERS_TEMPERATURES`.
+    pub llm_provider_temperatures: Option<String>,
+    /// `LLM_PROVIDERS_TASK_TIMEOUT_SECONDS`.
+    pub llm_provider_task_timeout_seconds: Option<String>,
+    /// `LLM_AGENTIC_SEARCH_ENABLED`.
+    pub llm_agentic_search_enabled: Option<String>,
+    /// `LLM_AGENTIC_SEARCH_REASONER_PROVIDER`.
+    pub llm_agentic_search_reasoner_provider: Option<String>,
+    /// `LLM_AGENTIC_SEARCH_WRITER_PROVIDER`.
+    pub llm_agentic_search_writer_provider: Option<String>,
+    /// `LLM_AGENTIC_SEARCH_MAX_SEARCHES`.
+    pub llm_agentic_search_max_searches: Option<String>,
+    /// `LLM_AGENTIC_SEARCH_MAX_CRAWLS`.
+    pub llm_agentic_search_max_crawls: Option<String>,
+    /// `LLM_AGENTIC_SEARCH_MAX_STEPS`.
+    pub llm_agentic_search_max_steps: Option<String>,
+    /// `LLM_AGENTIC_SEARCH_MAX_TOTAL_TOKENS`.
+    pub llm_agentic_search_max_total_tokens: Option<String>,
+    /// `LLM_AGENTIC_SEARCH_WALL_TIMEOUT_SECONDS`.
+    pub llm_agentic_search_wall_timeout_seconds: Option<String>,
     /// `GENKIT_DEFAULT_MODEL`.
     pub genkit_default_model: Option<String>,
     /// `GENKIT_HISTORY_SUMMARY_PROVIDER`.
@@ -1430,6 +1539,69 @@ impl AppConfig {
         if dialog_aifarm_pool_models.len() != dialog_aifarm_pool_base_urls.len() {
             return Err(ConfigError::AifarmPoolPairCount);
         }
+        let llm_providers = {
+            let names = parse_string_list(raw.llm_provider_names);
+            if names.is_empty() {
+                Vec::new()
+            } else {
+                let kinds = split_list_keep_empties(raw.llm_provider_kinds);
+                let services = split_list_keep_empties(raw.llm_provider_discovery_service_names);
+                let endpoints = split_list_keep_empties(raw.llm_provider_discovery_endpoint_names);
+                let models = split_list_keep_empties(raw.llm_provider_models);
+                let base_urls = split_list_keep_empties(raw.llm_provider_base_urls);
+                let urls = split_list_keep_empties(raw.llm_provider_urls);
+                let api_keys = split_list_keep_empties(raw.llm_provider_api_keys);
+                let include_reasoning = split_list_keep_empties(raw.llm_provider_include_reasoning);
+                let enable_thinking = split_list_keep_empties(raw.llm_provider_enable_thinking);
+                let max_tokens = split_list_keep_empties(raw.llm_provider_max_tokens);
+                let temperatures = split_list_keep_empties(raw.llm_provider_temperatures);
+                let task_timeouts = split_list_keep_empties(raw.llm_provider_task_timeout_seconds);
+                let mut providers = Vec::with_capacity(names.len());
+                for (index, name) in names.into_iter().enumerate() {
+                    let elem = |list: &[String]| -> Option<String> {
+                        list.get(index)
+                            .map(|value| value.trim())
+                            .filter(|value| !value.is_empty())
+                            .map(ToOwned::to_owned)
+                    };
+                    providers.push(NamedProviderConfig {
+                        name,
+                        kind: elem(&kinds).unwrap_or_else(|| DEFAULT_LLM_PROVIDER_KIND.to_owned()),
+                        discovery_service_name: elem(&services).unwrap_or_default(),
+                        discovery_endpoint_name: elem(&endpoints)
+                            .unwrap_or_else(|| DEFAULT_DIALOG_DISCOVERY_ENDPOINT_NAME.to_owned()),
+                        model: elem(&models).unwrap_or_default(),
+                        base_url: elem(&base_urls).unwrap_or_default(),
+                        url: elem(&urls).unwrap_or_default(),
+                        api_key: elem(&api_keys).unwrap_or_default(),
+                        include_reasoning: elem(&include_reasoning)
+                            .map(|value| {
+                                parse_bool("LLM_PROVIDERS_INCLUDE_REASONING", Some(value), false)
+                            })
+                            .transpose()?,
+                        enable_thinking: elem(&enable_thinking)
+                            .map(|value| {
+                                parse_bool("LLM_PROVIDERS_ENABLE_THINKING", Some(value), false)
+                            })
+                            .transpose()?,
+                        max_tokens: parse_i32(
+                            "LLM_PROVIDERS_MAX_TOKENS",
+                            elem(&max_tokens),
+                            DEFAULT_LLM_PROVIDER_MAX_TOKENS,
+                        )?,
+                        temperature: elem(&temperatures)
+                            .map(|value| parse_f64("LLM_PROVIDERS_TEMPERATURES", Some(value), 0.0))
+                            .transpose()?,
+                        task_timeout_seconds: parse_i32(
+                            "LLM_PROVIDERS_TASK_TIMEOUT_SECONDS",
+                            elem(&task_timeouts),
+                            DEFAULT_LLM_PROVIDER_TASK_TIMEOUT_SECONDS,
+                        )?,
+                    });
+                }
+                providers
+            }
+        };
         let history_summary_provider = raw
             .genkit_history_summary_provider
             .unwrap_or_else(|| DEFAULT_HISTORY_SUMMARY_PROVIDER.to_owned());
@@ -1798,6 +1970,47 @@ impl AppConfig {
                     provider: history_summary_provider,
                     model: raw.genkit_history_summary_model.unwrap_or_default(),
                     timeout_seconds: history_summary_timeout_seconds,
+                },
+                providers: llm_providers,
+                agentic: AgenticConfig {
+                    search: AgenticSearchConfig {
+                        enabled: parse_bool(
+                            "LLM_AGENTIC_SEARCH_ENABLED",
+                            raw.llm_agentic_search_enabled,
+                            DEFAULT_AGENTIC_SEARCH_ENABLED,
+                        )?,
+                        reasoner_provider: parse_scalar_value(
+                            raw.llm_agentic_search_reasoner_provider,
+                        )
+                        .unwrap_or_else(|| DEFAULT_AGENTIC_SEARCH_REASONER_PROVIDER.to_owned()),
+                        writer_provider: parse_scalar_value(raw.llm_agentic_search_writer_provider)
+                            .unwrap_or_else(|| DEFAULT_AGENTIC_SEARCH_WRITER_PROVIDER.to_owned()),
+                        max_searches: parse_i32(
+                            "LLM_AGENTIC_SEARCH_MAX_SEARCHES",
+                            raw.llm_agentic_search_max_searches,
+                            DEFAULT_AGENTIC_SEARCH_MAX_SEARCHES,
+                        )?,
+                        max_crawls: parse_i32(
+                            "LLM_AGENTIC_SEARCH_MAX_CRAWLS",
+                            raw.llm_agentic_search_max_crawls,
+                            DEFAULT_AGENTIC_SEARCH_MAX_CRAWLS,
+                        )?,
+                        max_steps: parse_i32(
+                            "LLM_AGENTIC_SEARCH_MAX_STEPS",
+                            raw.llm_agentic_search_max_steps,
+                            DEFAULT_AGENTIC_SEARCH_MAX_STEPS,
+                        )?,
+                        max_total_tokens: parse_i32(
+                            "LLM_AGENTIC_SEARCH_MAX_TOTAL_TOKENS",
+                            raw.llm_agentic_search_max_total_tokens,
+                            DEFAULT_AGENTIC_SEARCH_MAX_TOTAL_TOKENS,
+                        )?,
+                        wall_timeout_seconds: parse_i32(
+                            "LLM_AGENTIC_SEARCH_WALL_TIMEOUT_SECONDS",
+                            raw.llm_agentic_search_wall_timeout_seconds,
+                            DEFAULT_AGENTIC_SEARCH_WALL_TIMEOUT_SECONDS,
+                        )?,
+                    },
                 },
             },
             vision: VisionConfig {
@@ -2242,6 +2455,27 @@ impl RawConfig {
             dialog_nvidia_top_p: env("DIALOG_NVIDIA_TOP_P"),
             dialog_nvidia_enable_thinking: env("DIALOG_NVIDIA_ENABLE_THINKING"),
             dialog_nvidia_include_reasoning: env("DIALOG_NVIDIA_INCLUDE_REASONING"),
+            llm_provider_names: env("LLM_PROVIDERS_NAMES"),
+            llm_provider_kinds: env("LLM_PROVIDERS_KINDS"),
+            llm_provider_discovery_service_names: env("LLM_PROVIDERS_DISCOVERY_SERVICE_NAMES"),
+            llm_provider_discovery_endpoint_names: env("LLM_PROVIDERS_DISCOVERY_ENDPOINT_NAMES"),
+            llm_provider_models: env("LLM_PROVIDERS_MODELS"),
+            llm_provider_base_urls: env("LLM_PROVIDERS_BASE_URLS"),
+            llm_provider_urls: env("LLM_PROVIDERS_URLS"),
+            llm_provider_api_keys: env("LLM_PROVIDERS_API_KEYS"),
+            llm_provider_include_reasoning: env("LLM_PROVIDERS_INCLUDE_REASONING"),
+            llm_provider_enable_thinking: env("LLM_PROVIDERS_ENABLE_THINKING"),
+            llm_provider_max_tokens: env("LLM_PROVIDERS_MAX_TOKENS"),
+            llm_provider_temperatures: env("LLM_PROVIDERS_TEMPERATURES"),
+            llm_provider_task_timeout_seconds: env("LLM_PROVIDERS_TASK_TIMEOUT_SECONDS"),
+            llm_agentic_search_enabled: env("LLM_AGENTIC_SEARCH_ENABLED"),
+            llm_agentic_search_reasoner_provider: env("LLM_AGENTIC_SEARCH_REASONER_PROVIDER"),
+            llm_agentic_search_writer_provider: env("LLM_AGENTIC_SEARCH_WRITER_PROVIDER"),
+            llm_agentic_search_max_searches: env("LLM_AGENTIC_SEARCH_MAX_SEARCHES"),
+            llm_agentic_search_max_crawls: env("LLM_AGENTIC_SEARCH_MAX_CRAWLS"),
+            llm_agentic_search_max_steps: env("LLM_AGENTIC_SEARCH_MAX_STEPS"),
+            llm_agentic_search_max_total_tokens: env("LLM_AGENTIC_SEARCH_MAX_TOTAL_TOKENS"),
+            llm_agentic_search_wall_timeout_seconds: env("LLM_AGENTIC_SEARCH_WALL_TIMEOUT_SECONDS"),
             genkit_default_model: env("GENKIT_DEFAULT_MODEL"),
             genkit_history_summary_provider: env("GENKIT_HISTORY_SUMMARY_PROVIDER"),
             genkit_history_summary_model: env("GENKIT_HISTORY_SUMMARY_MODEL"),
@@ -2459,6 +2693,18 @@ fn parse_string_list(value: Option<String>) -> Vec<String> {
 
 fn parse_string_list_or_default(value: Option<String>, default: &'static str) -> Vec<String> {
     parse_string_list(Some(value.unwrap_or_else(|| default.to_owned())))
+}
+
+/// Split a comma list keeping empty positions, so parallel `LLM_PROVIDERS_*`
+/// arrays stay index-aligned even when some per-provider values are omitted.
+fn split_list_keep_empties(value: Option<String>) -> Vec<String> {
+    match value {
+        None => Vec::new(),
+        Some(value) => value
+            .split(',')
+            .map(|item| item.trim().to_owned())
+            .collect(),
+    }
 }
 
 fn parse_i64_list_or_default(
@@ -2886,6 +3132,13 @@ mod tests {
             config.vision.request_timeout_seconds,
             DEFAULT_VISION_REQUEST_TIMEOUT_SECONDS
         );
+        // Agentic search is on by default and points at the qwen reasoner; the
+        // qwen provider itself is auto-registered by the app, so the config-level
+        // providers list stays empty.
+        assert!(config.llm.agentic.search.enabled);
+        assert_eq!(config.llm.agentic.search.reasoner_provider, "qwen-reasoner");
+        assert_eq!(config.llm.agentic.search.writer_provider, "conversational");
+        assert!(config.llm.providers.is_empty());
         assert!(!config.music.acestep.enabled);
         assert_eq!(config.music.acestep.base_url, DEFAULT_ACESTEP_BASE_URL);
         assert_eq!(config.music.acestep.api_key, "");

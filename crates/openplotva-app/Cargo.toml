@@ -12,6 +12,7 @@ anyhow.workspace = true
 axum.workspace = true
 base64.workspace = true
 carapax.workspace = true
+openplotva-agent = { path = "../openplotva-agent" }
 openplotva-config = { path = "../openplotva-config" }
 openplotva-core = { path = "../openplotva-core" }
 openplotva-dialog = { path = "../openplotva-dialog" }

@@ -29,10 +29,16 @@ pub const IMAGE_VIP_QUEUE_NAME: &str = "image-vip";
 pub const MUSIC_VIP_QUEUE_NAME: &str = "music-vip";
 pub const DIALOG_AIFARM_QUEUE_NAME: &str = "dialog-aifarm";
 pub const MEMORY_CONSOLIDATION_QUEUE_NAME: &str = "memory-consolidation";
+/// Dedicated queue for agent-loop runs routed to the single-slot Qwen reasoner.
+pub const AGENT_QWEN_QUEUE_NAME: &str = "agent-qwen";
 
 pub const LLM_JOB_RETRY_STAGE: &str = "llm_job_retry";
 pub const LLM_JOB_RETRY_EXHAUSTED_STAGE: &str = "llm_job_retry_exhausted";
 pub const DEFAULT_LLM_JOB_MAX_ATTEMPTS: i32 = 5;
+/// Audit-only event stage written once per committed agent step.
+pub const AGENT_STEP_STAGE: &str = "agent_step";
+/// Serialized agent-state codec marker stored in `AgentRunStateBlob.format`.
+pub const AGENT_RUN_STATE_FORMAT: &str = "openplotva.agent-run-state.v1+json";
 
 /// Version marker for the approved Rust-native taskman snapshot codec.
 pub const TASK_QUEUE_SNAPSHOT_FORMAT: &str = "openplotva.taskman-queue.v1+json";
@@ -59,6 +65,7 @@ pub enum JobType {
     Translation,
     MemoryConsolidation,
     Control,
+    Agent,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -131,6 +138,9 @@ pub struct JobPayload {
     /// Control-job-specific payload.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub control_data: Option<ControlJobData>,
+    /// Agent-loop-job-specific payload.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_data: Option<AgentJobData>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -259,6 +269,21 @@ impl Default for DialogJobData {
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default)]
+pub struct AgentJobData {
+    /// Agent profile id (e.g. "search") resolved against the configured registry.
+    pub profile_id: String,
+    /// Natural-language goal the agent loop must satisfy.
+    pub goal: String,
+    /// Reasoner provider name; empty means resolve from the profile config.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub reasoner_provider: String,
+    /// Writer provider name; empty means resolve from the profile config.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub writer_provider: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
 pub struct ControlJobData {
     pub kind: ControlKind,
     #[serde(skip_serializing_if = "is_default_i64")]
@@ -325,6 +350,19 @@ pub struct DialogJobParams {
     pub thread_id: Option<i32>,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AgentJobParams {
+    pub chat_id: i64,
+    pub message_id: i32,
+    pub user_id: i64,
+    pub user_full_name: String,
+    pub thread_id: Option<i32>,
+    pub profile_id: String,
+    pub goal: String,
+    pub reasoner_provider: String,
+    pub writer_provider: String,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ImageGenJobParams {
     pub chat_id: i64,
@@ -380,6 +418,17 @@ pub struct StatelessJobItem {
     pub data: JobPayload,
 }
 
+/// Durable, opaque-to-taskman checkpoint of an agent run, persisted on the job
+/// record and journaled by the existing WAL upsert path. `state` is the serialized
+/// engine `AgentState` JSON; taskman never interprets it.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentRunStateBlob {
+    pub format: String,
+    pub committed_step: i32,
+    pub state: String,
+    pub resume_count: i32,
+}
+
 /// Durable Rust-native taskman row used by the generic queue core.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TaskQueueRecord {
@@ -416,6 +465,9 @@ pub struct TaskQueueRecord {
     pub messages: Vec<TaskQueueJobMessage>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub events: Vec<TaskQueueJobEvent>,
+    /// Durable agent-run checkpoint for `JobType::Agent` rows; `None` otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_state: Option<AgentRunStateBlob>,
 }
 
 /// One pending image job's Telegram coordinates and queue-position placeholder,
@@ -475,6 +527,26 @@ pub struct TaskQueueWorkItem {
     pub id: i64,
     pub job: StatelessJobItem,
     pub events: Vec<TaskQueueJobEvent>,
+}
+
+/// Work item for the agent worker: like `TaskQueueWorkItem` plus the durable
+/// checkpoint and whether this claim resumed an orphaned run.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskQueueAgentWorkItem {
+    pub id: i64,
+    pub job: StatelessJobItem,
+    pub events: Vec<TaskQueueJobEvent>,
+    pub agent_state: Option<AgentRunStateBlob>,
+    pub resumed: bool,
+}
+
+/// Outcome of `release_orphaned_processing_for_startup`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct StartupReleaseReport {
+    /// Non-agent jobs requeued to `Pending`.
+    pub requeued: usize,
+    /// Agent jobs kept `Processing` for resume (worker_id cleared).
+    pub agent_kept: usize,
 }
 
 /// Versioned Rust-native snapshot of the generic taskman queue.
@@ -904,6 +976,7 @@ impl InMemoryTaskQueue {
             result_message_id: None,
             messages: Vec::new(),
             events: Vec::new(),
+            agent_state: None,
         };
         state.records.push(record.clone());
         self.append_wal_record(task_queue_wal_upsert(record));
@@ -988,6 +1061,107 @@ impl InMemoryTaskQueue {
         self.append_wal_record(task_queue_wal_upsert(record));
         drop(state);
         Some(TaskQueueWorkItem { id, job, events })
+    }
+
+    /// Claim a fresh `Pending` agent job, or adopt an orphaned `Processing` agent
+    /// run (one whose owning worker died and was cleared at startup). Adopting
+    /// keeps the durable checkpoint and bumps its resume counter.
+    pub fn dequeue_or_adopt_agent(
+        &self,
+        queue_name: &str,
+        worker_id: impl Into<String>,
+        started_at: OffsetDateTime,
+    ) -> Option<TaskQueueAgentWorkItem> {
+        let mut state = self.lock();
+        let worker_id = worker_id.into();
+        let (index, resumed) = match next_pending_index(&state.records, queue_name) {
+            Some(index) => (index, false),
+            None => (next_orphaned_agent_index(&state.records, queue_name)?, true),
+        };
+        let (id, job, events, agent_state, record) = {
+            let record = &mut state.records[index];
+            record.status = JobStatus::Processing;
+            record.worker_id = Some(worker_id.clone());
+            if resumed {
+                if let Some(blob) = record.agent_state.as_mut() {
+                    blob.resume_count += 1;
+                }
+            } else {
+                record.started_at = Some(started_at);
+                record.execution_started_at = None;
+                record.completed_at = None;
+                record.error = None;
+            }
+            (
+                record.id,
+                record.job.clone(),
+                record.events.clone(),
+                record.agent_state.clone(),
+                record.clone(),
+            )
+        };
+        state.worker_heartbeats.insert(worker_id, started_at);
+        self.append_wal_record(task_queue_wal_upsert(record));
+        drop(state);
+        Some(TaskQueueAgentWorkItem {
+            id,
+            job,
+            events,
+            agent_state,
+            resumed,
+        })
+    }
+
+    /// Persist an agent-run checkpoint onto the job record. The whole record is
+    /// WAL-upserted, so the blob rides the existing durability path.
+    pub fn checkpoint_agent_state(
+        &self,
+        job_id: i64,
+        blob: AgentRunStateBlob,
+    ) -> Result<(), TaskQueueError> {
+        let mut state = self.lock();
+        let record = state
+            .records
+            .iter_mut()
+            .find(|record| record.id == job_id)
+            .ok_or(TaskQueueError::JobNotFound(job_id))?;
+        record.agent_state = Some(blob);
+        let record = record.clone();
+        self.append_wal_record(task_queue_wal_upsert(record));
+        drop(state);
+        Ok(())
+    }
+
+    /// Startup recovery that preserves agent runs: non-agent `Processing` jobs are
+    /// requeued to `Pending` (they have no checkpoint), while agent `Processing`
+    /// jobs keep their status and checkpoint and only drop the dead `worker_id`,
+    /// so a live worker re-adopts and resumes them mid-loop.
+    pub fn release_orphaned_processing_for_startup(&self) -> StartupReleaseReport {
+        let mut state = self.lock();
+        let mut report = StartupReleaseReport::default();
+        let mut ids = Vec::new();
+        for record in &mut state.records {
+            if record.status != JobStatus::Processing {
+                continue;
+            }
+            if is_agent_record(record) {
+                record.worker_id = None;
+                report.agent_kept += 1;
+            } else {
+                record.status = JobStatus::Pending;
+                record.worker_id = None;
+                record.started_at = None;
+                record.execution_started_at = None;
+                record.completed_at = None;
+                record.error = None;
+                report.requeued += 1;
+            }
+            ids.push(record.id);
+        }
+        let records = records_by_ids(&state.records, &ids);
+        self.append_wal_records(records.into_iter().map(task_queue_wal_upsert));
+        drop(state);
+        report
     }
 
     /// Mark a job completed.
@@ -1095,6 +1269,7 @@ impl InMemoryTaskQueue {
             result_message_id: None,
             messages: Vec::new(),
             events: Vec::new(),
+            agent_state: None,
         };
         state.records.push(record.clone());
         self.append_wal_record(task_queue_wal_upsert(record));
@@ -2015,6 +2190,7 @@ pub fn new_control_job_at(params: ControlJobParams, created: OffsetDateTime) -> 
             music_data: None,
             dialog_data: None,
             control_data: Some(params.data),
+            agent_data: None,
         },
     }
 }
@@ -2045,6 +2221,7 @@ pub fn new_dialog_job_at(params: DialogJobParams, created: OffsetDateTime) -> St
                 max_output_tokens: params.max_output_tokens,
             }),
             control_data: None,
+            agent_data: None,
         },
     }
 }
@@ -2052,6 +2229,42 @@ pub fn new_dialog_job_at(params: DialogJobParams, created: OffsetDateTime) -> St
 #[must_use]
 pub fn new_dialog_job(params: DialogJobParams) -> StatelessJobItem {
     new_dialog_job_at(params, OffsetDateTime::now_utc())
+}
+
+#[must_use]
+pub fn new_agent_job_at(params: AgentJobParams, created: OffsetDateTime) -> StatelessJobItem {
+    StatelessJobItem {
+        title: "agent".to_owned(),
+        created,
+        priority: DEFAULT_PRIORITY,
+        processing_timeout_seconds: 0,
+        data: JobPayload {
+            job_type: JobType::Agent,
+            telegram_data: Some(TelegramData {
+                chat_id: params.chat_id,
+                user_id: params.user_id,
+                message_id: params.message_id,
+                thread_message_id: params.thread_id,
+                user_full_name: clean_unicode_non_printables(&params.user_full_name),
+                chat_title: String::new(),
+            }),
+            image_data: None,
+            music_data: None,
+            dialog_data: None,
+            control_data: None,
+            agent_data: Some(AgentJobData {
+                profile_id: params.profile_id,
+                goal: clean_unicode_non_printables(&params.goal),
+                reasoner_provider: params.reasoner_provider,
+                writer_provider: params.writer_provider,
+            }),
+        },
+    }
+}
+
+#[must_use]
+pub fn new_agent_job(params: AgentJobParams) -> StatelessJobItem {
+    new_agent_job_at(params, OffsetDateTime::now_utc())
 }
 
 #[must_use]
@@ -2096,6 +2309,7 @@ pub fn new_image_gen_job_at(
             music_data: None,
             dialog_data: None,
             control_data: None,
+            agent_data: None,
         },
     }
 }
@@ -2139,6 +2353,7 @@ pub fn new_image_edit_job_at(
             music_data: None,
             dialog_data: None,
             control_data: None,
+            agent_data: None,
         },
     }
 }
@@ -2182,6 +2397,7 @@ pub fn new_music_gen_job_at(
             }),
             dialog_data: None,
             control_data: None,
+            agent_data: None,
         },
     }
 }
@@ -2205,6 +2421,7 @@ pub fn new_memory_consolidation_job_at(created: OffsetDateTime) -> StatelessJobI
             music_data: None,
             dialog_data: None,
             control_data: None,
+            agent_data: None,
         },
     }
 }
@@ -2577,6 +2794,26 @@ fn next_pending_index(records: &[TaskQueueRecord], queue_name: &str) -> Option<u
     next_pending_index_matching(records, queue_name, |_| true)
 }
 
+fn is_agent_record(record: &TaskQueueRecord) -> bool {
+    record.job.data.job_type == JobType::Agent
+}
+
+/// Find the best orphaned (worker-less) `Processing` agent job in a queue, so a
+/// live worker can re-adopt and resume it after a crash/restart.
+fn next_orphaned_agent_index(records: &[TaskQueueRecord], queue_name: &str) -> Option<usize> {
+    records
+        .iter()
+        .enumerate()
+        .filter(|(_index, record)| {
+            record.queue_name == queue_name
+                && record.status == JobStatus::Processing
+                && record.worker_id.is_none()
+                && is_agent_record(record)
+        })
+        .min_by(|(_left_index, left), (_right_index, right)| compare_go_queue_records(left, right))
+        .map(|(index, _record)| index)
+}
+
 fn next_pending_index_matching(
     records: &[TaskQueueRecord],
     queue_name: &str,
@@ -2714,7 +2951,10 @@ fn requeue_expired_processing_records(
 }
 
 fn processing_record_expired(record: &TaskQueueRecord, now: OffsetDateTime) -> bool {
-    if record.status != JobStatus::Processing || record.job.processing_timeout_seconds <= 0 {
+    if record.status != JobStatus::Processing
+        || record.job.processing_timeout_seconds <= 0
+        || is_agent_record(record)
+    {
         return false;
     }
     let Some(started_at) = processing_record_timeout_start_at(record) else {
@@ -2744,6 +2984,9 @@ fn fail_stuck_processing_records(
         TimeDuration::seconds(stuck_duration.as_secs().min(i64::MAX as u64) as i64);
     for record in records {
         if record.status != JobStatus::Processing {
+            continue;
+        }
+        if is_agent_record(record) {
             continue;
         }
         let Some(started_at) = processing_record_timeout_start_at(record) else {
@@ -2839,21 +3082,22 @@ mod tests {
     use time::{Duration as TimeDuration, OffsetDateTime};
 
     use super::{
-        CONTROL_QUEUE_NAME, ControlJobData, ControlJobParams, ControlJobPayloadError, ControlKind,
-        DEFAULT_PRIORITY, DIALOG_AIFARM_QUEUE_NAME, DialogJobData, DialogJobParams,
-        DialogJobPayloadError, HIGH_PRIORITY, HIGHEST_PRIORITY, IMAGE_REGULAR_QUEUE_NAME,
-        IMAGE_VIP_QUEUE_NAME, ImageEditJobParams, ImageEditJobPayloadError, ImageGenJobParams,
-        ImageGenJobPayloadError, ImageJobData, InMemoryTaskQueue, JobPayload, JobStatus, JobType,
-        LOWEST_PRIORITY, MAX_JOB_EVENTS, MESSAGE_STATUS_COMPLETED, MESSAGE_STATUS_FAILED,
+        AGENT_QWEN_QUEUE_NAME, AgentJobParams, AgentRunStateBlob, CONTROL_QUEUE_NAME,
+        ControlJobData, ControlJobParams, ControlJobPayloadError, ControlKind, DEFAULT_PRIORITY,
+        DIALOG_AIFARM_QUEUE_NAME, DialogJobData, DialogJobParams, DialogJobPayloadError,
+        HIGH_PRIORITY, HIGHEST_PRIORITY, IMAGE_REGULAR_QUEUE_NAME, IMAGE_VIP_QUEUE_NAME,
+        ImageEditJobParams, ImageEditJobPayloadError, ImageGenJobParams, ImageGenJobPayloadError,
+        ImageJobData, InMemoryTaskQueue, JobPayload, JobStatus, JobType, LOWEST_PRIORITY,
+        MAX_JOB_EVENTS, MESSAGE_STATUS_COMPLETED, MESSAGE_STATUS_FAILED,
         MESSAGE_STATUS_PLACEHOLDER, MESSAGE_TYPE_RESULT, MUSIC_VIP_QUEUE_NAME, MusicGenJobParams,
         MusicGenJobPayloadError, PendingImageQueueEntry, STUCK_JOB_ERROR_MESSAGE,
         TASK_QUEUE_SNAPSHOT_FORMAT, TEXT_QUEUE_NAME, TaskQueueError, TaskQueueJobEvent,
         TaskQueueJobMessageParams, TaskQueueWalRecord, TaskQueueWalSink,
         decode_task_queue_snapshot, encode_task_queue_snapshot,
         image_edit_job_params_from_stateless_job, image_gen_job_params_from_stateless_job,
-        music_gen_job_params_from_stateless_job, new_control_job_at, new_dialog_job_at,
-        new_image_edit_job_at, new_image_gen_job_at, new_memory_consolidation_job_at,
-        new_music_gen_job_at, replay_task_queue_wal_records,
+        music_gen_job_params_from_stateless_job, new_agent_job_at, new_control_job_at,
+        new_dialog_job_at, new_image_edit_job_at, new_image_gen_job_at,
+        new_memory_consolidation_job_at, new_music_gen_job_at, replay_task_queue_wal_records,
     };
 
     #[derive(Default)]
@@ -3362,6 +3606,7 @@ mod tests {
                 ..DialogJobData::default()
             }),
             control_data: None,
+            agent_data: None,
         };
         assert_eq!(
             super::dialog_job_params_from_payload(&payload_without_telegram),
@@ -3382,6 +3627,7 @@ mod tests {
             music_data: None,
             dialog_data: None,
             control_data: None,
+            agent_data: None,
         };
         assert_eq!(
             super::dialog_job_params_from_payload(&payload_without_dialog),
@@ -3503,6 +3749,7 @@ mod tests {
                 kind: ControlKind::VipInvoice,
                 ..ControlJobData::default()
             }),
+            agent_data: None,
         };
         assert_eq!(
             super::control_job_params_from_payload(&payload_without_telegram),
@@ -3523,6 +3770,7 @@ mod tests {
             music_data: None,
             dialog_data: None,
             control_data: None,
+            agent_data: None,
         };
         assert_eq!(
             super::control_job_params_from_payload(&payload_without_control),
@@ -4656,6 +4904,7 @@ mod tests {
                     ..DialogJobData::default()
                 }),
                 control_data: None,
+                agent_data: None,
             },
         }
     }
@@ -4715,7 +4964,146 @@ mod tests {
                 music_data: None,
                 dialog_data: None,
                 control_data: None,
+                agent_data: None,
             },
         }
+    }
+
+    fn agent_job(goal: &str) -> super::StatelessJobItem {
+        new_agent_job_at(
+            AgentJobParams {
+                chat_id: 1,
+                message_id: 2,
+                user_id: 3,
+                user_full_name: "User".to_owned(),
+                thread_id: None,
+                profile_id: "search".to_owned(),
+                goal: goal.to_owned(),
+                reasoner_provider: "qwen-reasoner".to_owned(),
+                writer_provider: "conversational".to_owned(),
+            },
+            OffsetDateTime::now_utc(),
+        )
+    }
+
+    fn blob(committed_step: i32, state: &str) -> AgentRunStateBlob {
+        AgentRunStateBlob {
+            format: "openplotva.agent-run-state.v1+json".to_owned(),
+            committed_step,
+            state: state.to_owned(),
+            resume_count: 0,
+        }
+    }
+
+    #[test]
+    fn agent_checkpoint_round_trips_through_snapshot() {
+        let queue = InMemoryTaskQueue::new();
+        let id = queue.assign(AGENT_QWEN_QUEUE_NAME, agent_job("find rust news"));
+        queue
+            .checkpoint_agent_state(id, blob(2, "{\"step\":2}"))
+            .expect("checkpoint");
+
+        let restored = InMemoryTaskQueue::from_snapshot(queue.snapshot());
+        let record = restored
+            .records()
+            .into_iter()
+            .find(|record| record.id == id)
+            .expect("record present after restore");
+        let agent_state = record.agent_state.expect("agent_state survives snapshot");
+        assert_eq!(agent_state.committed_step, 2);
+        assert_eq!(agent_state.state, "{\"step\":2}");
+    }
+
+    #[test]
+    fn agent_run_resumes_from_checkpoint_after_orphan_release() {
+        let now = OffsetDateTime::now_utc();
+        let queue = InMemoryTaskQueue::new();
+        let id = queue.assign(AGENT_QWEN_QUEUE_NAME, agent_job("research"));
+
+        let first = queue
+            .dequeue_or_adopt_agent(AGENT_QWEN_QUEUE_NAME, "worker-a", now)
+            .expect("fresh claim");
+        assert!(!first.resumed);
+        queue
+            .checkpoint_agent_state(id, blob(1, "{}"))
+            .expect("checkpoint");
+
+        // Crash: the owning worker dies; startup recovery releases the orphan.
+        let report = queue.release_orphaned_processing_for_startup();
+        assert_eq!(report.agent_kept, 1);
+        assert_eq!(report.requeued, 0);
+
+        // With no fresh Pending job, a live worker must re-adopt the orphan.
+        let second = queue
+            .dequeue_or_adopt_agent(AGENT_QWEN_QUEUE_NAME, "worker-b", now)
+            .expect("re-adopt orphan");
+        assert!(second.resumed);
+        assert_eq!(second.id, id);
+        let resumed = second.agent_state.expect("checkpoint preserved");
+        assert_eq!(resumed.committed_step, 1);
+        assert_eq!(resumed.resume_count, 1);
+    }
+
+    #[test]
+    fn startup_release_keeps_agent_processing_and_requeues_dialog() {
+        let now = OffsetDateTime::now_utc();
+        let queue = InMemoryTaskQueue::new();
+        let agent_id = queue.assign(AGENT_QWEN_QUEUE_NAME, agent_job("long run"));
+        let dialog_id = queue.assign(
+            DIALOG_AIFARM_QUEUE_NAME,
+            new_dialog_job_at(
+                DialogJobParams {
+                    chat_id: 1,
+                    message_id: 2,
+                    user_id: 3,
+                    user_full_name: "User".to_owned(),
+                    message_text: "hi".to_owned(),
+                    original_text: String::new(),
+                    meta: json!({}),
+                    max_output_tokens: 0,
+                    thread_id: None,
+                },
+                now,
+            ),
+        );
+        queue
+            .dequeue_or_adopt_agent(AGENT_QWEN_QUEUE_NAME, "w", now)
+            .expect("claim agent");
+        queue
+            .dequeue(DIALOG_AIFARM_QUEUE_NAME, "w", now)
+            .expect("claim dialog");
+
+        let report = queue.release_orphaned_processing_for_startup();
+        assert_eq!(report.agent_kept, 1);
+        assert_eq!(report.requeued, 1);
+
+        let records = queue.records();
+        let agent_record = records.iter().find(|r| r.id == agent_id).unwrap();
+        assert_eq!(agent_record.status, JobStatus::Processing);
+        assert!(agent_record.worker_id.is_none());
+        let dialog_record = records.iter().find(|r| r.id == dialog_id).unwrap();
+        assert_eq!(dialog_record.status, JobStatus::Pending);
+    }
+
+    #[test]
+    fn stuck_failer_excludes_agent_jobs() {
+        let now = OffsetDateTime::now_utc();
+        let queue = InMemoryTaskQueue::new();
+        let agent_id = queue.assign(AGENT_QWEN_QUEUE_NAME, agent_job("never stuck"));
+        queue
+            .dequeue_or_adopt_agent(AGENT_QWEN_QUEUE_NAME, "w", now)
+            .expect("claim agent");
+
+        let failed = queue.fail_stuck_processing(
+            now + TimeDuration::hours(1),
+            std::time::Duration::from_secs(1),
+        );
+        assert!(!failed.contains(&agent_id));
+        let record = queue
+            .records()
+            .into_iter()
+            .find(|r| r.id == agent_id)
+            .unwrap();
+        assert_eq!(record.status, JobStatus::Processing);
     }
 }

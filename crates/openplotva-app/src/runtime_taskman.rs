@@ -664,6 +664,7 @@ fn job_type_name(job_type: JobType) -> &'static str {
         JobType::Translation => "translation",
         JobType::MemoryConsolidation => "memory_consolidation",
         JobType::Control => "control",
+        JobType::Agent => "agent",
     }
 }
 
@@ -690,6 +691,10 @@ fn job_preview(payload: &JobPayload) -> Option<String> {
             .telegram_data
             .as_ref()
             .and_then(|data| first_preview([data.user_full_name.as_str(), ""])),
+        JobType::Agent => payload
+            .agent_data
+            .as_ref()
+            .and_then(|data| first_preview([data.goal.as_str(), data.profile_id.as_str()])),
     }
 }
 

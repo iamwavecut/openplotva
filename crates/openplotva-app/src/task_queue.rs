@@ -460,8 +460,11 @@ impl SharedTaskQueueRuntime {
                 journal_sink,
             ),
         );
-        let requeued = queue.requeue_processing_for_startup();
-        if requeued > 0 {
+        // Agent runs keep their Processing status + durable checkpoint and are
+        // re-adopted by a live worker; only non-agent jobs are requeued.
+        let release = queue.release_orphaned_processing_for_startup();
+        let requeued = release.requeued;
+        if release.requeued > 0 || release.agent_kept > 0 {
             journal.flush_dirty().await?;
         }
         let report = SharedTaskQueueRestoreReport {
@@ -1221,6 +1224,7 @@ mod tests {
             result_message_id: None,
             messages: Vec::new(),
             events: Vec::new(),
+            agent_state: None,
         }
     }
 

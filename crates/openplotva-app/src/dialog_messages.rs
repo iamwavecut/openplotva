@@ -92,6 +92,18 @@ pub struct DialogMessageScheduleReport {
     pub rate_limited: bool,
 }
 
+/// Routing + goal for a `/search` agent run scheduled from a command.
+pub struct SearchAgentScheduleRequest<'a> {
+    pub chat_id: i64,
+    pub message_id: i32,
+    pub user_id: i64,
+    pub user_full_name: &'a str,
+    pub thread_id: Option<i32>,
+    pub goal: &'a str,
+    pub reasoner_provider: &'a str,
+    pub writer_provider: &'a str,
+}
+
 pub trait DialogMessageScheduler {
     type Error: fmt::Display + Send + Sync + 'static;
 
@@ -99,6 +111,15 @@ pub trait DialogMessageScheduler {
         &'a self,
         schedule: DialogMessageSchedule<'a>,
     ) -> DialogMessageFuture<'a, DialogMessageScheduleReport, Self::Error>;
+
+    /// Enqueue a search-agent run. Default: not handled (returns `false`); only
+    /// the queue-backed scheduler implements it.
+    fn schedule_search_agent<'a>(
+        &'a self,
+        _request: SearchAgentScheduleRequest<'a>,
+    ) -> DialogMessageFuture<'a, bool, Self::Error> {
+        Box::pin(async { Ok(false) })
+    }
 }
 
 pub trait RandomDialogSettingsStore {
@@ -1119,6 +1140,27 @@ impl DialogMessageScheduler for TaskmanDialogMessageScheduler {
             })
         })
     }
+
+    fn schedule_search_agent<'a>(
+        &'a self,
+        request: SearchAgentScheduleRequest<'a>,
+    ) -> DialogMessageFuture<'a, bool, Self::Error> {
+        let params = openplotva_taskman::AgentJobParams {
+            chat_id: request.chat_id,
+            message_id: request.message_id,
+            user_id: request.user_id,
+            user_full_name: request.user_full_name.to_owned(),
+            thread_id: request.thread_id,
+            profile_id: "search".to_owned(),
+            goal: request.goal.to_owned(),
+            reasoner_provider: request.reasoner_provider.to_owned(),
+            writer_provider: request.writer_provider.to_owned(),
+        };
+        let job = openplotva_taskman::new_agent_job(params);
+        self.queue
+            .assign(openplotva_taskman::AGENT_QWEN_QUEUE_NAME, job);
+        Box::pin(async { Ok(true) })
+    }
 }
 
 /// Runtime config for addressed-dialog message scheduling.
@@ -1132,6 +1174,38 @@ pub struct DialogMessageUpdateConfig {
     pub aifarm_default_max_tokens: i32,
     pub aifarm_long_max_tokens: i32,
     pub processing_timeout_seconds: i32,
+    pub agentic_search: AgenticSearchTrigger,
+}
+
+/// Gated `/search` command trigger for the search agent. Disabled by default, so
+/// the command is ignored unless `LLM_AGENTIC_SEARCH_ENABLED` is set.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AgenticSearchTrigger {
+    pub enabled: bool,
+    pub reasoner_provider: String,
+    pub writer_provider: String,
+}
+
+impl AgenticSearchTrigger {
+    #[must_use]
+    pub fn from_app_config(config: &AppConfig) -> Self {
+        let search = &config.llm.agentic.search;
+        let reasoner_provider = if search.reasoner_provider.trim().is_empty() {
+            openplotva_config::DEFAULT_AGENTIC_SEARCH_REASONER_PROVIDER.to_owned()
+        } else {
+            search.reasoner_provider.clone()
+        };
+        let writer_provider = if search.writer_provider.trim().is_empty() {
+            openplotva_config::DEFAULT_AGENTIC_SEARCH_WRITER_PROVIDER.to_owned()
+        } else {
+            search.writer_provider.clone()
+        };
+        Self {
+            enabled: search.enabled,
+            reasoner_provider,
+            writer_provider,
+        }
+    }
 }
 
 impl DialogMessageUpdateConfig {
@@ -1157,6 +1231,7 @@ impl DialogMessageUpdateConfig {
                 .task_timeout_seconds
                 .max(300)
                 .max(config.llm.history_summary.timeout_seconds),
+            agentic_search: AgenticSearchTrigger::from_app_config(config),
         }
     }
 }
@@ -1165,6 +1240,7 @@ impl DialogMessageUpdateConfig {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DialogMessageUpdateRoute {
     Delegated,
+    AgentSearchScheduled,
     IgnoredInvalidMessage,
     SkippedBotSampling,
     SkippedEmptyDialogTrigger,
@@ -1469,6 +1545,37 @@ where
         .as_ref()
         .map(ToString::to_string)
         .unwrap_or_default();
+    if config.agentic_search.enabled
+        && is_search_command_for_bot(message, &first_word_lower, &bot_username)
+    {
+        let goal = parsed.rest_text.trim();
+        if !goal.is_empty() {
+            let thread_id = message
+                .message_thread_id
+                .and_then(|thread_id| i32::try_from(thread_id).ok())
+                .filter(|thread_id| *thread_id != 0);
+            let full_name = message_user_full_name(&sender);
+            let scheduled = schedulers
+                .0
+                .schedule_search_agent(SearchAgentScheduleRequest {
+                    chat_id,
+                    message_id,
+                    user_id: sender.id,
+                    user_full_name: &full_name,
+                    thread_id,
+                    goal,
+                    reasoner_provider: &config.agentic_search.reasoner_provider,
+                    writer_provider: &config.agentic_search.writer_provider,
+                })
+                .await
+                .map_err(|error| DialogMessageUpdateError::Schedule {
+                    message: error.to_string(),
+                })?;
+            if scheduled {
+                return Ok(DialogMessageUpdateRoute::AgentSearchScheduled);
+            }
+        }
+    }
     if (is_bang_song_shortcut(&first_word_lower)
         || is_song_command_for_bot(message, &first_word_lower, &bot_username)
         || !parsed.is_addressed)
@@ -2069,6 +2176,25 @@ fn is_song_command_for_bot(
         return false;
     };
     if command.0 != "song" {
+        return false;
+    }
+    if telegram_chat_is_private(&message.chat) {
+        return true;
+    }
+    command
+        .1
+        .is_some_and(|target| target.eq_ignore_ascii_case(bot_username))
+}
+
+fn is_search_command_for_bot(
+    message: &carapax::types::Message,
+    first_word_lower: &str,
+    bot_username: &str,
+) -> bool {
+    let Some(command) = slash_command_parts(first_word_lower) else {
+        return false;
+    };
+    if command.0 != "search" {
         return false;
     }
     if telegram_chat_is_private(&message.chat) {
@@ -2960,6 +3086,51 @@ mod tests {
     };
 
     use super::*;
+
+    #[tokio::test]
+    async fn schedule_search_agent_enqueues_agent_job() {
+        let queue = Arc::new(InMemoryTaskQueue::new());
+        let debounce = Arc::new(InMemoryDialogDebounce::new());
+        let scheduler = TaskmanDialogMessageScheduler::new(
+            Arc::clone(&queue),
+            debounce,
+            Duration::from_millis(1),
+        );
+        let scheduled = scheduler
+            .schedule_search_agent(SearchAgentScheduleRequest {
+                chat_id: 1,
+                message_id: 2,
+                user_id: 3,
+                user_full_name: "Ada",
+                thread_id: None,
+                goal: "latest rust news",
+                reasoner_provider: "qwen-reasoner",
+                writer_provider: "conversational",
+            })
+            .await
+            .expect("schedule search agent");
+        assert!(scheduled);
+
+        let records = queue.records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].queue_name,
+            openplotva_taskman::AGENT_QWEN_QUEUE_NAME
+        );
+        assert_eq!(
+            records[0].job.data.job_type,
+            openplotva_taskman::JobType::Agent
+        );
+        let agent = records[0]
+            .job
+            .data
+            .agent_data
+            .as_ref()
+            .expect("agent_data present");
+        assert_eq!(agent.goal, "latest rust news");
+        assert_eq!(agent.profile_id, "search");
+        assert_eq!(agent.reasoner_provider, "qwen-reasoner");
+    }
 
     #[tokio::test]
     async fn addressed_private_message_schedules_dialog_job()
@@ -9051,6 +9222,7 @@ mod tests {
             aifarm_default_max_tokens: 1024,
             aifarm_long_max_tokens: 2048,
             processing_timeout_seconds: 720,
+            agentic_search: AgenticSearchTrigger::default(),
         }
     }
 

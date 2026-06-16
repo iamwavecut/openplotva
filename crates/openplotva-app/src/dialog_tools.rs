@@ -4869,6 +4869,7 @@ mod tests {
                 music_data: None,
                 dialog_data: None,
                 control_data: None,
+                agent_data: None,
             },
         }
     }

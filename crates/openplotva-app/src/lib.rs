@@ -2,6 +2,8 @@
 
 pub mod activity;
 pub mod admin;
+pub mod agent_jobs;
+pub mod agent_runtime;
 pub mod callbacks;
 pub mod checkin;
 pub mod control_jobs;
@@ -9157,6 +9159,49 @@ async fn start_runtime_workers(
             .with_url_crawler(url_crawler);
     }
     let dialog_toolbox: Arc<dyn openplotva_dialog::DialogToolbox> = Arc::new(app_dialog_toolbox);
+    if config.llm.agentic.search.enabled {
+        let agent_registry = agent_runtime::build_agent_provider_registry(config);
+        let agent_settings = agent_runtime::SearchAgentSettings::from_app_config(
+            config,
+            agent_runtime::SEARCH_SYSTEM_PROMPT.to_owned(),
+            agent_runtime::SEARCH_SYNTHESIS_PROMPT.to_owned(),
+        );
+        if agent_registry.contains(&agent_settings.reasoner_provider)
+            && agent_registry.contains(&agent_settings.writer_provider)
+        {
+            let agent_tools: Arc<dyn openplotva_agent::AgentTools> = Arc::new(
+                agent_runtime::AppAgentTools::new(Arc::clone(&dialog_toolbox)),
+            );
+            let agent_worker = agent_jobs::AgentJobWorker::new(
+                Arc::clone(&task_queue_for_updates),
+                agent_registry,
+                agent_tools,
+                Arc::clone(&rich_sender),
+                agent_settings,
+            );
+            let agent_worker_stop = stop.subscribe();
+            let agent_worker_handle = tokio::spawn(async move {
+                let report = agent_jobs::run_agent_job_worker_until(
+                    &agent_worker,
+                    wait_for_runtime_stop(agent_worker_stop),
+                )
+                .await;
+                tracing::info!(?report, "agent taskman worker stopped");
+            });
+            shared_taskman_worker_counts
+                .insert(openplotva_taskman::AGENT_QWEN_QUEUE_NAME.to_owned(), 1);
+            workers.handles.push(agent_worker_handle);
+            readiness_checks.push(ReadinessCheck::ok(
+                "agent_jobs",
+                "Agent search worker started on the agent-qwen queue",
+            ));
+        } else {
+            readiness_checks.push(ReadinessCheck::skipped(
+                "agent_jobs",
+                "Agentic search enabled but the reasoner/writer provider is missing from the registry",
+            ));
+        }
+    }
     let memory_query_embedder = if dialog_memory_context_enabled(config) {
         memory_runtime::memory_retrieval_embedder_from_config(&config.memory)?
             .map(|client| Arc::new(client) as Arc<dyn memory_runtime::EmbeddingProvider>)
@@ -11957,6 +12002,7 @@ mod tests {
                     music_data: None,
                     dialog_data: None,
                     control_data: None,
+                    agent_data: None,
                 },
             },
         );
