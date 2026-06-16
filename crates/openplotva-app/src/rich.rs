@@ -336,15 +336,11 @@ pub fn compose_song_message(song: &SongMessage<'_>) -> String {
     sanitize_rich_html(&html)
 }
 
-/// Compose a finished image result: a single `<img>` for one image, a `<tg-slideshow>`
-/// for several. `caption_html` is pre-built rich HTML; `prompt_spoiler` is plain text.
-#[must_use]
-pub fn compose_gallery(
-    image_urls: &[String],
-    caption_html: &str,
-    prompt_spoiler: Option<&str>,
-) -> String {
-    let mut html = String::new();
+/// Append the gallery media body: a single `<img>` for one image, a `<tg-slideshow>` for
+/// several, with the caption inlined (`<p>` for one, `<figcaption>` for many). Shared by the
+/// final gallery and the progressive draw message so they render identically below the
+/// progress line.
+fn append_gallery_media(html: &mut String, image_urls: &[String], caption_html: &str) {
     match image_urls {
         [] => {}
         [single] => {
@@ -364,6 +360,18 @@ pub fn compose_gallery(
             html.push_str("</tg-slideshow>");
         }
     }
+}
+
+/// Compose a finished image result: a single `<img>` for one image, a `<tg-slideshow>`
+/// for several. `caption_html` is pre-built rich HTML; `prompt_spoiler` is plain text.
+#[must_use]
+pub fn compose_gallery(
+    image_urls: &[String],
+    caption_html: &str,
+    prompt_spoiler: Option<&str>,
+) -> String {
+    let mut html = String::new();
+    append_gallery_media(&mut html, image_urls, caption_html);
     if let Some(prompt) = prompt_spoiler {
         if !prompt.trim().is_empty() {
             html.push_str(&format!(
@@ -381,22 +389,31 @@ pub fn compose_gallery(
 const DRAW_WAITING_EMOJI_ID: &str = "5298571865969695917";
 const DRAW_PROGRESS_EMOJI_ID: &str = "5298651821080879865";
 
-/// Drawing state for the in-place updated draw message: the bare drawing emoji, followed by
-/// any images produced so far (progressive redraw).
+/// Drawing start state, before any image is ready: the bare drawing emoji, sent as the sole
+/// message content so Telegram renders it large (full-line).
 #[must_use]
-pub fn compose_draw_progress(image_urls: &[String]) -> String {
-    let mut html = format!("<tg-emoji emoji-id=\"{DRAW_PROGRESS_EMOJI_ID}\">✨</tg-emoji>");
-    match image_urls {
-        [] => {}
-        [single] => html.push_str(&format!("<img src=\"{}\"/>", esc(single))),
-        many => {
-            html.push_str("<tg-slideshow>");
-            for url in many {
-                html.push_str(&format!("<img src=\"{}\"/>", esc(url)));
-            }
-            html.push_str("</tg-slideshow>");
-        }
+pub fn compose_draw_started() -> String {
+    sanitize_rich_html(&format!(
+        "<tg-emoji emoji-id=\"{DRAW_PROGRESS_EMOJI_ID}\">✨</tg-emoji>"
+    ))
+}
+
+/// Progressive draw state, once images start arriving: a progress line (the drawing emoji
+/// followed by "N из M") above the exact same gallery layout the final message uses, so the
+/// only visible difference from the finished result is this leading progress line. The full
+/// caption is shown from the first image. With no images yet this falls back to the bare
+/// drawing emoji.
+#[must_use]
+pub fn compose_draw_progress(image_urls: &[String], total: usize, caption_html: &str) -> String {
+    if image_urls.is_empty() {
+        return compose_draw_started();
     }
+    let mut html = format!(
+        "<p><tg-emoji emoji-id=\"{DRAW_PROGRESS_EMOJI_ID}\">✨</tg-emoji> {} из {}</p>",
+        image_urls.len(),
+        total.max(image_urls.len()),
+    );
+    append_gallery_media(&mut html, image_urls, caption_html);
     sanitize_rich_html(&html)
 }
 
@@ -534,20 +551,42 @@ mod tests {
     }
 
     #[test]
-    fn draw_progress_is_bare_emoji_with_partial_media() {
-        // No images yet → just the bare drawing emoji (renders large).
+    fn draw_started_is_bare_emoji() {
         assert_eq!(
-            compose_draw_progress(&[]),
+            compose_draw_started(),
             "<tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji>"
         );
-        // With images → emoji + images-so-far.
-        let one = compose_draw_progress(&["https://h/a.png".to_owned()]);
-        assert!(one.starts_with("<tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji>"));
+    }
+
+    #[test]
+    fn draw_progress_has_count_line_then_gallery_with_caption() {
+        // No images yet → falls back to the bare drawing emoji (renders large).
+        assert_eq!(compose_draw_progress(&[], 2, "cap"), compose_draw_started());
+
+        // First of two → "1 из 2" line above the image, with the full caption already shown.
+        let one = compose_draw_progress(&["https://h/a.png".to_owned()], 2, "автор");
+        assert!(
+            one.starts_with(
+                "<p><tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji> 1 из 2</p>"
+            )
+        );
         assert!(one.contains(r#"<img src="https://h/a.png"/>"#));
-        let many =
-            compose_draw_progress(&["https://h/a.png".to_owned(), "https://h/b.png".to_owned()]);
+        assert!(one.contains("автор"));
+
+        // Several → the same slideshow layout as the final gallery, below the progress line.
+        let many = compose_draw_progress(
+            &["https://h/a.png".to_owned(), "https://h/b.png".to_owned()],
+            2,
+            "автор",
+        );
+        assert!(
+            many.starts_with(
+                "<p><tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji> 2 из 2</p>"
+            )
+        );
         assert!(many.contains("<tg-slideshow>"));
         assert!(many.contains(r#"<img src="https://h/b.png"/>"#));
+        assert!(many.contains("<figcaption>автор</figcaption>"));
     }
 
     #[test]

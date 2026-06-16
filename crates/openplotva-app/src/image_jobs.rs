@@ -1594,11 +1594,7 @@ where
     let draw_message_id = match reuse_message_id {
         Some(reused) => {
             let _ = effects
-                .edit_draw_message(
-                    params.chat_id,
-                    reused,
-                    crate::rich::compose_draw_progress(&[]),
-                )
+                .edit_draw_message(params.chat_id, reused, crate::rich::compose_draw_started())
                 .await;
             reused
         }
@@ -1607,7 +1603,7 @@ where
                 params.chat_id,
                 params.message_id,
                 params.thread_id,
-                crate::rich::compose_draw_progress(&[]),
+                crate::rich::compose_draw_started(),
             )
             .await
         {
@@ -1641,10 +1637,13 @@ where
         seed: params.seed,
     };
 
-    // Generate progressively: publish each provider slot's image and redraw the post with
-    // "N из M" as soon as it is ready, instead of waiting for every image. Single-image
-    // draws skip the intermediate progress edit (no flicker).
+    // Generate progressively: publish each provider slot's image and redraw the post as soon
+    // as it is ready, instead of waiting for every image. The progressive message is the final
+    // gallery (images so far + the full caption) with a single extra leading line, the drawing
+    // emoji + "N из M". Single-image draws and the final slot skip the progress edit so the
+    // last render is the clean final gallery without the progress line.
     let chat_id = params.chat_id;
+    let progress_caption = caption_to_rich(&display_caption);
     let (progress_tx, mut progress_rx) =
         tokio::sync::mpsc::unbounded_channel::<ImageGenerationResult>();
     let generate = generator.generate_image_streaming(request, progress_tx);
@@ -1662,12 +1661,16 @@ where
                 Ok(urls) => {
                     published_urls.extend(urls);
                     published_urls.truncate(TELEGRAM_MEDIA_GROUP_MAX_ITEMS);
-                    if expected_image_count > 1 {
+                    if expected_image_count > 1 && published_urls.len() < expected_image_count {
                         let _ = effects
                             .edit_draw_message(
                                 chat_id,
                                 draw_message_id,
-                                crate::rich::compose_draw_progress(&published_urls),
+                                crate::rich::compose_draw_progress(
+                                    &published_urls,
+                                    expected_image_count,
+                                    &progress_caption,
+                                ),
                             )
                             .await;
                     }
@@ -1838,11 +1841,7 @@ where
     let draw_message_id = match reuse_message_id {
         Some(reused) => {
             let _ = effects
-                .edit_draw_message(
-                    params.chat_id,
-                    reused,
-                    crate::rich::compose_draw_progress(&[]),
-                )
+                .edit_draw_message(params.chat_id, reused, crate::rich::compose_draw_started())
                 .await;
             reused
         }
@@ -1851,7 +1850,7 @@ where
                 params.chat_id,
                 params.message_id,
                 params.thread_id,
-                crate::rich::compose_draw_progress(&[]),
+                crate::rich::compose_draw_started(),
             )
             .await
         {
@@ -3367,7 +3366,7 @@ mod tests {
         assert_eq!(report.outcome, ImageGenJobExecutionOutcome::Completed);
         assert_eq!(report.result_message_id, Some(888));
         let calls = effects.calls();
-        assert_eq!(calls.len(), 4);
+        assert_eq!(calls.len(), 3);
         assert_eq!(
             calls[0],
             "placeholder:-100:20:9:<tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji>"
@@ -3376,14 +3375,12 @@ mod tests {
             calls[1],
             "publish:[Url(\"https://img.test/1.png\"), Url(\"https://img.test/2.png\")]"
         );
-        // progress redraw with "N из M" before the final gallery
-        assert!(calls[2].starts_with("edit:-100:888:"));
-        assert!(calls[2].contains("<tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji>"));
+        // A batch generator returns both images in one emission → no progress flicker, the
+        // post goes straight to the final captioned gallery.
+        assert!(calls[2].starts_with("edit:-100:888:<tg-slideshow>"));
         assert!(calls[2].contains("<img src=\"https://img.test/1.png\"/>"));
         assert!(calls[2].contains("<img src=\"https://img.test/2.png\"/>"));
-        assert!(calls[3].starts_with("edit:-100:888:<tg-slideshow>"));
-        assert!(calls[3].contains("<img src=\"https://img.test/2.png\"/>"));
-        assert!(calls[3].contains("original caption"));
+        assert!(calls[2].contains("original caption"));
     }
 
     #[test]
@@ -3405,12 +3402,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_vip_image_gen_job_sends_placeholders_and_edits_slots_in_order() {
-        let generator = GeneratorStub::success_many(vec![
-            "https://img.test/vip-1.png".to_owned(),
-            "https://img.test/vip-2.png".to_owned(),
-        ])
-        .with_expected_image_count(2);
+    async fn execute_image_gen_job_progress_line_carries_count_and_full_caption() {
+        // Two sequential slots → the first progressive redraw must already carry the full
+        // caption and a "1 из 2" progress line; the final render drops the progress line.
+        let generator = SequentialImageGenerator::new(
+            GeneratorStub::success("https://img.test/vip-1.png"),
+            GeneratorStub::success("https://img.test/vip-2.png"),
+        );
         let effects = EffectsStub::new();
         let report = execute_image_gen_job(
             &generator,
@@ -3431,27 +3429,30 @@ mod tests {
         assert_eq!(report.outcome, ImageGenJobExecutionOutcome::Completed);
         assert_eq!(report.result_message_id, Some(888));
         let calls = effects.calls();
-        assert_eq!(calls.len(), 4);
+        assert_eq!(calls.len(), 5);
         assert_eq!(
             calls[0],
             "placeholder:-100:20:9:<tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji>"
         );
-        assert_eq!(
-            calls[1],
-            "publish:[Url(\"https://img.test/vip-1.png\"), Url(\"https://img.test/vip-2.png\")]"
+        assert_eq!(calls[1], "publish:[Url(\"https://img.test/vip-1.png\")]");
+        // First image: progress line "1 из 2" + the full caption (prompt) already present.
+        assert!(
+            calls[2].contains("<tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji> 1 из 2")
         );
-        assert!(calls[2].starts_with("edit:-100:888:"));
-        assert!(calls[2].contains("<tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji>"));
         assert!(calls[2].contains("<img src=\"https://img.test/vip-1.png\"/>"));
-        assert!(calls[3].starts_with("edit:-100:888:<tg-slideshow>"));
-        assert!(calls[3].contains("<img src=\"https://img.test/vip-2.png\"/>"));
-        assert!(calls[3].contains("castle"));
+        assert!(calls[2].contains("castle"));
+        assert_eq!(calls[3], "publish:[Url(\"https://img.test/vip-2.png\")]");
+        // Final render: the same gallery without the leading progress line.
+        assert!(calls[4].starts_with("edit:-100:888:<tg-slideshow>"));
+        assert!(calls[4].contains("<img src=\"https://img.test/vip-1.png\"/>"));
+        assert!(calls[4].contains("<img src=\"https://img.test/vip-2.png\"/>"));
+        assert!(calls[4].contains("castle"));
     }
 
     #[tokio::test]
     async fn execute_image_gen_job_redraws_progressively_per_slot() {
-        // Two sequential slots → the post is redrawn (bare drawing emoji + images so far)
-        // as each image lands, not only after both complete.
+        // Two sequential slots → the post is redrawn ("N из M" progress + images so far) as
+        // each non-final image lands, not only after both complete.
         let generator = SequentialImageGenerator::new(
             GeneratorStub::success("https://img.test/s1.png"),
             GeneratorStub::success("https://img.test/s2.png"),
@@ -3475,16 +3476,18 @@ mod tests {
 
         assert_eq!(report.outcome, ImageGenJobExecutionOutcome::Completed);
         let calls = effects.calls();
-        assert_eq!(calls.len(), 6);
+        assert_eq!(calls.len(), 5);
         assert_eq!(calls[1], "publish:[Url(\"https://img.test/s1.png\")]");
-        assert!(calls[2].contains("<tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji>"));
+        // First slot lands → progress redraw "1 из 2" with the image so far.
+        assert!(
+            calls[2].contains("<tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji> 1 из 2")
+        );
         assert!(calls[2].contains("<img src=\"https://img.test/s1.png\"/>"));
+        // Second (final) slot lands → no extra "2 из 2" flicker; the final gallery follows.
         assert_eq!(calls[3], "publish:[Url(\"https://img.test/s2.png\")]");
-        assert!(calls[4].contains("<tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji>"));
+        assert!(calls[4].starts_with("edit:-100:888:<tg-slideshow>"));
+        assert!(calls[4].contains("<img src=\"https://img.test/s1.png\"/>"));
         assert!(calls[4].contains("<img src=\"https://img.test/s2.png\"/>"));
-        assert!(calls[5].starts_with("edit:-100:888:<tg-slideshow>"));
-        assert!(calls[5].contains("<img src=\"https://img.test/s1.png\"/>"));
-        assert!(calls[5].contains("<img src=\"https://img.test/s2.png\"/>"));
     }
 
     #[tokio::test]
