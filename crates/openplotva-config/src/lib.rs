@@ -1558,8 +1558,7 @@ impl AppConfig {
                     };
                     providers.push(NamedProviderConfig {
                         name,
-                        kind: elem(&kinds)
-                            .unwrap_or_else(|| DEFAULT_LLM_PROVIDER_KIND.to_owned()),
+                        kind: elem(&kinds).unwrap_or_else(|| DEFAULT_LLM_PROVIDER_KIND.to_owned()),
                         discovery_service_name: elem(&services).unwrap_or_default(),
                         discovery_endpoint_name: elem(&endpoints)
                             .unwrap_or_else(|| DEFAULT_DIALOG_DISCOVERY_ENDPOINT_NAME.to_owned()),
@@ -1975,9 +1974,7 @@ impl AppConfig {
                         reasoner_provider: raw
                             .llm_agentic_search_reasoner_provider
                             .unwrap_or_default(),
-                        writer_provider: raw
-                            .llm_agentic_search_writer_provider
-                            .unwrap_or_default(),
+                        writer_provider: raw.llm_agentic_search_writer_provider.unwrap_or_default(),
                         max_searches: parse_i32(
                             "LLM_AGENTIC_SEARCH_MAX_SEARCHES",
                             raw.llm_agentic_search_max_searches,
@@ -2693,7 +2690,10 @@ fn parse_string_list_or_default(value: Option<String>, default: &'static str) ->
 fn split_list_keep_empties(value: Option<String>) -> Vec<String> {
     match value {
         None => Vec::new(),
-        Some(value) => value.split(',').map(|item| item.trim().to_owned()).collect(),
+        Some(value) => value
+            .split(',')
+            .map(|item| item.trim().to_owned())
+            .collect(),
     }
 }
 

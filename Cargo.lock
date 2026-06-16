@@ -1970,6 +1970,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
+name = "openplotva-agent"
+version = "0.1.0"
+dependencies = [
+ "openplotva-dialog",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "openplotva-app"
 version = "0.1.0"
 dependencies = [
@@ -1980,6 +1991,7 @@ dependencies = [
  "futures-util",
  "hex",
  "image",
+ "openplotva-agent",
  "openplotva-config",
  "openplotva-core",
  "openplotva-dialog",
