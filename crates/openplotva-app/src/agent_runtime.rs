@@ -29,7 +29,10 @@ use time::{Duration as TimeDuration, OffsetDateTime};
 
 use openplotva_taskman::MusicGenJobParams;
 
-use crate::dialog_tools::{UrlCrawler, WebSearchProvider};
+use crate::dialog_tools::{CrawlUrlFuture, UrlCrawler, WebSearchFuture, WebSearchProvider};
+use crate::image_jobs::{
+    ImageGenerationFuture, ImageGenerationProgressSink, ImageGenerationRequest, ImageGenerator,
+};
 use crate::media::{agent_client_config_from_named_provider, aifarm_dialog_config_from_app_config};
 use crate::music_jobs::{SongMaterial, SongMaterialFuture, SongMaterialProvider};
 
@@ -52,6 +55,8 @@ pub const SEARCH_SYNTHESIS_PROMPT: &str =
     include_str!("../../../prompts/agentic/search_synthesis.prompt");
 /// System prompt for the song-writing agent.
 pub const SONG_SYSTEM_PROMPT: &str = include_str!("../../../prompts/agentic/song_system.prompt");
+/// System prompt for the image-prompt agent.
+pub const IMAGE_SYSTEM_PROMPT: &str = include_str!("../../../prompts/agentic/image_system.prompt");
 
 /// A single-completion LLM client plus the request defaults for one provider.
 #[derive(Clone)]
@@ -845,6 +850,267 @@ fn strip_label<'a>(line: &'a str, label: &str) -> Option<&'a str> {
         .map(|_| line[label.len()..].trim())
 }
 
+/// Notice returned by the stubbed search tools so the agent degrades gracefully
+/// instead of erroring when live web search is intentionally disabled.
+const SEARCH_UNAVAILABLE_NOTICE: &str = "Web search is currently unavailable. Continue using the user's memory, the chat \
+     history, and your own knowledge.";
+
+/// Web-search provider that performs no live search. Used by flows where search is
+/// intentionally stubbed (the image agent, until the search pipeline is reworked);
+/// swap it for the real Serper client to turn search on.
+pub(crate) struct UnavailableWebSearch;
+
+impl WebSearchProvider for UnavailableWebSearch {
+    fn search<'a>(&'a self, _query: &'a str) -> WebSearchFuture<'a> {
+        Box::pin(async { Ok(SEARCH_UNAVAILABLE_NOTICE.to_owned()) })
+    }
+}
+
+/// URL crawler counterpart to [`UnavailableWebSearch`]; performs no live fetch.
+pub(crate) struct UnavailableUrlCrawler;
+
+impl UrlCrawler for UnavailableUrlCrawler {
+    fn crawl<'a>(&'a self, _url: &'a str) -> CrawlUrlFuture<'a> {
+        Box::pin(async { Ok(SEARCH_UNAVAILABLE_NOTICE.to_owned()) })
+    }
+}
+
+/// Build the stubbed web searcher as a trait object.
+#[must_use]
+pub fn unavailable_web_search() -> Arc<dyn WebSearchProvider> {
+    Arc::new(UnavailableWebSearch)
+}
+
+/// Build the stubbed URL crawler as a trait object.
+#[must_use]
+pub fn unavailable_url_crawler() -> Arc<dyn UrlCrawler> {
+    Arc::new(UnavailableUrlCrawler)
+}
+
+/// Settings for the image-prompt agent (prompt + reasoner + budgets).
+#[derive(Clone)]
+pub struct ImageAgentSettings {
+    pub enabled: bool,
+    pub system_prompt: String,
+    pub reasoner_provider: String,
+    pub budgets: AgentBudgets,
+    pub reasoner_max_tokens: i32,
+}
+
+impl ImageAgentSettings {
+    #[must_use]
+    pub fn from_app_config(config: &AppConfig, system_prompt: String) -> Self {
+        let reasoner_provider = if config
+            .llm
+            .agentic
+            .search
+            .reasoner_provider
+            .trim()
+            .is_empty()
+        {
+            openplotva_config::DEFAULT_AGENTIC_SEARCH_REASONER_PROVIDER.to_owned()
+        } else {
+            config.llm.agentic.search.reasoner_provider.clone()
+        };
+        Self {
+            enabled: config.llm.agentic.image_enabled,
+            system_prompt,
+            reasoner_provider,
+            budgets: AgentBudgets {
+                max_steps: 6,
+                max_total_tokens: 30_000,
+                max_wall_ms: 90_000,
+                max_tool_calls: 3,
+                max_tool_errors: 2,
+            },
+            reasoner_max_tokens: 2048,
+        }
+    }
+
+    fn profile(&self, reasoner_model: String) -> AgentProfile {
+        AgentProfile {
+            id: "image".to_owned(),
+            system_prompt: self.system_prompt.clone(),
+            allowed_tools: vec![
+                STEP_MEMORY_SEARCH.to_owned(),
+                STEP_HISTORY_SEARCH.to_owned(),
+                STEP_WEB_SEARCH.to_owned(),
+                STEP_CRAWL_URL.to_owned(),
+            ],
+            reasoner_model: reasoner_model.clone(),
+            writer_model: reasoner_model,
+            budgets: self.budgets,
+            reasoner_max_tokens: self.reasoner_max_tokens,
+            writer_max_tokens: self.reasoner_max_tokens,
+        }
+    }
+}
+
+/// An [`ImageGenerator`] wrapper that refines the draw prompt with the multi-step
+/// image agent (using the user's memory and chat history; web search stubbed) before
+/// delegating to the inner generator. The refined prompt is written into
+/// `prompt_variants`, which makes the inner optimizing generator skip its own
+/// single-pass reprompt. When the agent is disabled, unavailable, or yields nothing
+/// usable, the request passes through unchanged and the inner optimizer runs as before.
+pub struct ImageAgentImageGenerator<Inner> {
+    inner: Inner,
+    reasoner: Option<Arc<AgentProviderClient>>,
+    tools: Option<Arc<dyn AgentTools>>,
+    settings: ImageAgentSettings,
+}
+
+impl<Inner> ImageAgentImageGenerator<Inner> {
+    #[must_use]
+    pub fn new(
+        inner: Inner,
+        reasoner: Option<Arc<AgentProviderClient>>,
+        tools: Option<Arc<dyn AgentTools>>,
+        settings: ImageAgentSettings,
+    ) -> Self {
+        Self {
+            inner,
+            reasoner,
+            tools,
+            settings,
+        }
+    }
+}
+
+impl<Inner> ImageAgentImageGenerator<Inner>
+where
+    Inner: ImageGenerator + Sync,
+{
+    async fn refine_prompt(
+        &self,
+        reasoner: &Arc<AgentProviderClient>,
+        tools: &Arc<dyn AgentTools>,
+        request: &ImageGenerationRequest,
+    ) -> Option<String> {
+        let origin = AgentOrigin {
+            chat_id: request.chat_id,
+            message_id: request.message_id,
+            user_id: request.user_id,
+            thread_id: request.thread_id,
+            user_full_name: request.user_full_name.clone(),
+        };
+        let profile = self.settings.profile(reasoner.model.clone());
+        let reasoner_adapter = AifarmReasoner::new(Arc::clone(reasoner));
+        let mut state = AgentState::new("image", request.prompt.as_str(), origin, now_unix_ms());
+        loop {
+            match advance_one_step(
+                &profile,
+                &reasoner_adapter,
+                tools.as_ref(),
+                state,
+                now_unix_ms(),
+            )
+            .await
+            {
+                Ok(StepProgress::Continue(next)) => state = next,
+                Ok(StepProgress::Terminal(next)) => {
+                    state = next;
+                    break;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "image agent step failed");
+                    return None;
+                }
+            }
+        }
+        match &state.outcome {
+            Some(AgentOutcome::Completed { answer }) => parse_image_prompt(answer),
+            Some(AgentOutcome::Stopped { partial, .. }) => parse_image_prompt(partial),
+            _ => None,
+        }
+    }
+
+    /// Run the agent when active and return the request with `prompt_variants` filled
+    /// by the refined prompt; otherwise return the request unchanged.
+    async fn maybe_refined_request(
+        &self,
+        mut request: ImageGenerationRequest,
+    ) -> ImageGenerationRequest {
+        if !self.settings.enabled || request.prompt.trim().is_empty() {
+            return request;
+        }
+        if request
+            .prompt_variants
+            .iter()
+            .any(|variant| !variant.trim().is_empty())
+        {
+            return request;
+        }
+        let (Some(reasoner), Some(tools)) = (&self.reasoner, &self.tools) else {
+            return request;
+        };
+        match self.refine_prompt(reasoner, tools, &request).await {
+            Some(refined) if !refined.trim().is_empty() => {
+                let count = self.inner.expected_image_count().max(1);
+                request.prompt_variants = vec![refined; count];
+            }
+            _ => tracing::debug!("image agent inactive or empty; using reprompt fallback"),
+        }
+        request
+    }
+}
+
+impl<Inner> ImageGenerator for ImageAgentImageGenerator<Inner>
+where
+    Inner: ImageGenerator + Sync,
+{
+    fn expected_image_count(&self) -> usize {
+        self.inner.expected_image_count()
+    }
+
+    fn generate_image<'a>(&'a self, request: ImageGenerationRequest) -> ImageGenerationFuture<'a> {
+        Box::pin(async move {
+            let request = self.maybe_refined_request(request).await;
+            self.inner.generate_image(request).await
+        })
+    }
+
+    fn generate_image_streaming<'a>(
+        &'a self,
+        request: ImageGenerationRequest,
+        progress: ImageGenerationProgressSink,
+    ) -> ImageGenerationFuture<'a> {
+        Box::pin(async move {
+            let request = self.maybe_refined_request(request).await;
+            self.inner.generate_image_streaming(request, progress).await
+        })
+    }
+}
+
+/// Parse the image agent's structured final answer into a refined prompt. Returns
+/// `None` when no `PROMPT:` block is present, so the caller falls back to the optimizer.
+fn parse_image_prompt(answer: &str) -> Option<String> {
+    let mut prompt = String::new();
+    let mut in_prompt = false;
+    for line in answer.lines() {
+        let trimmed = line.trim();
+        if in_prompt {
+            if strip_label(trimmed, "NEGATIVE:").is_some() {
+                break;
+            }
+            prompt.push_str(line);
+            prompt.push('\n');
+            continue;
+        }
+        if let Some(rest) = strip_label(trimmed, "PROMPT:") {
+            in_prompt = true;
+            if !rest.is_empty() {
+                prompt.push_str(rest);
+                prompt.push('\n');
+            }
+        }
+    }
+    let prompt = prompt.trim().to_owned();
+    if prompt.is_empty() {
+        return None;
+    }
+    Some(prompt)
+}
+
 /// Current unix time in milliseconds for budget accounting.
 #[must_use]
 pub fn now_unix_ms() -> u64 {
@@ -1018,6 +1284,41 @@ mod tests {
         assert!(parse_song_material("just prose, no structure").is_none());
         // Missing the LYRICS block.
         assert!(parse_song_material("STYLE: pop\nLANGUAGE: en\nTITLE: x").is_none());
+    }
+
+    #[test]
+    fn parses_image_prompt_block_and_drops_negative() {
+        let answer = "PROMPT: a red fox in a snowy pine forest, soft morning light, \
+                      watercolor, detailed\nNEGATIVE: blurry, text, watermark";
+        let prompt = parse_image_prompt(answer).expect("parsed");
+        assert!(prompt.starts_with("a red fox"));
+        assert!(prompt.contains("watercolor"));
+        assert!(!prompt.contains("NEGATIVE"));
+        assert!(!prompt.contains("watermark"));
+    }
+
+    #[test]
+    fn parses_multiline_image_prompt() {
+        let answer = "PROMPT:\na lighthouse at dusk\nstormy sea, dramatic clouds";
+        let prompt = parse_image_prompt(answer).expect("parsed");
+        assert!(prompt.contains("lighthouse"));
+        assert!(prompt.contains("stormy sea"));
+    }
+
+    #[test]
+    fn rejects_image_prompt_without_marker() {
+        assert!(parse_image_prompt("just some prose with no marker").is_none());
+        assert!(parse_image_prompt("PROMPT:\n   ").is_none());
+    }
+
+    #[tokio::test]
+    async fn stubbed_search_tools_return_unavailable_notice() {
+        let web = unavailable_web_search();
+        let crawl = unavailable_url_crawler();
+        let search = web.search("anything").await.expect("ok");
+        let fetched = crawl.crawl("https://example.com").await.expect("ok");
+        assert!(search.contains("unavailable"));
+        assert!(fetched.contains("unavailable"));
     }
 
     #[test]
