@@ -1033,14 +1033,8 @@ impl ImageScheduler for TaskmanDialogToolAdapter {
                             .grow_draw_image_rate_limit(request.user_id, OffsetDateTime::now_utc())
                             .await;
                     }
-                    self.announce_queue_position(
-                        plan.queue_name,
-                        job_id,
-                        chat_id,
-                        message_id,
-                        thread_id,
-                    )
-                    .await;
+                    self.announce_queue_position(job_id, chat_id, message_id, thread_id)
+                        .await;
                     Ok(DrawImageScheduleResult {
                         status: "scheduled".to_owned(),
                         ..DrawImageScheduleResult::default()
@@ -1227,14 +1221,8 @@ impl TaskmanDialogToolAdapter {
             Ok(Some(job_id)) => {
                 self.grow_task_enqueue(plan.queue_name, chat_id, user_id)
                     .await;
-                self.announce_queue_position(
-                    plan.queue_name,
-                    job_id,
-                    chat_id,
-                    message_id,
-                    thread_id,
-                )
-                .await;
+                self.announce_queue_position(job_id, chat_id, message_id, thread_id)
+                    .await;
                 Ok(DrawImageScheduleResult {
                     status: "scheduled".to_owned(),
                     ..DrawImageScheduleResult::default()
@@ -1291,11 +1279,10 @@ impl TaskmanDialogToolAdapter {
         }
     }
 
-    /// Post the initial "waiting in queue" message for a freshly-enqueued image job and
-    /// persist its id so the worker can keep it current and delete it before drawing.
+    /// Post the initial "waiting in queue" message (bare waiting emoji) for a freshly-enqueued
+    /// image job and persist its id so the worker can reuse or delete it when drawing starts.
     async fn announce_queue_position(
         &self,
-        queue_name: &str,
         job_id: i64,
         chat_id: i64,
         message_id: i32,
@@ -1304,12 +1291,6 @@ impl TaskmanDialogToolAdapter {
         let Some(rich) = self.queue_position_rich.as_deref() else {
             return;
         };
-        let ahead = self
-            .queue
-            .pending_image_queue_entries(queue_name)
-            .iter()
-            .position(|entry| entry.job_id == job_id)
-            .unwrap_or(0);
         let options = openplotva_telegram::RichSendOptions {
             message_thread_id: thread_id.map(i64::from),
             reply_to_message_id: Some(i64::from(message_id)),
@@ -1317,7 +1298,7 @@ impl TaskmanDialogToolAdapter {
             disable_notification: false,
             reply_markup: None,
         };
-        let html = crate::rich::compose_draw_waiting(ahead);
+        let html = crate::rich::compose_draw_waiting();
         match rich.send_rich(chat_id, &html, &options).await {
             Ok(message_id) => {
                 if let Ok(message_id) = i32::try_from(message_id) {
@@ -4092,7 +4073,7 @@ mod tests {
         assert!(sent[0].allow_sending_without_reply);
         assert_eq!(
             sent[0].html,
-            "<aside><tg-emoji emoji-id=\"5298571865969695917\">⏳</tg-emoji><cite>ваш черёд подходит…</cite></aside>"
+            "<tg-emoji emoji-id=\"5298571865969695917\">⏳</tg-emoji>"
         );
         Ok(())
     }

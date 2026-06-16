@@ -375,32 +375,17 @@ pub fn compose_gallery(
     sanitize_rich_html(&html)
 }
 
-/// Custom emoji used as the (required) pull-quote main content of the draw placeholders.
-/// The literal `⏳`/`✨` inside the tag is the fallback when the custom emoji can't render.
+/// Custom emoji statuses for the draw message. The literal `⏳`/`✨` inside the tag is the
+/// fallback when the custom emoji can't render. Each is sent as the sole message content so
+/// Telegram renders it large (full-line).
 const DRAW_WAITING_EMOJI_ID: &str = "5298571865969695917";
 const DRAW_PROGRESS_EMOJI_ID: &str = "5298651821080879865";
 
-/// Progressive draw state for the in-place updated draw message.
+/// Drawing state for the in-place updated draw message: the bare drawing emoji, followed by
+/// any images produced so far (progressive redraw).
 #[must_use]
-pub fn compose_draw_progress(
-    status: &str,
-    done: usize,
-    total: Option<usize>,
-    image_urls: &[String],
-) -> String {
-    let mut html = String::new();
-    let counter = match total {
-        Some(total) if total > 0 => format!(" {done} из {total}"),
-        _ if done > 0 => format!(" {done}"),
-        _ => String::new(),
-    };
-    // Pull-quote (`<aside>`) with the status as the credit (`<cite>`) renders it centered and
-    // grey, matching the media-caption styling; the custom emoji is the required main content.
-    html.push_str(&format!(
-        "<aside><tg-emoji emoji-id=\"{DRAW_PROGRESS_EMOJI_ID}\">✨</tg-emoji><cite>{}{}</cite></aside>",
-        esc(status),
-        esc(&counter)
-    ));
+pub fn compose_draw_progress(image_urls: &[String]) -> String {
+    let mut html = format!("<tg-emoji emoji-id=\"{DRAW_PROGRESS_EMOJI_ID}\">✨</tg-emoji>");
     match image_urls {
         [] => {}
         [single] => html.push_str(&format!("<img src=\"{}\"/>", esc(single))),
@@ -415,38 +400,11 @@ pub fn compose_draw_progress(
     sanitize_rich_html(&html)
 }
 
-/// Russian count word for `n`, e.g. `plural_ru(2, "заказ", "заказа", "заказов") == "2 заказа"`.
-fn plural_ru(n: usize, one: &str, few: &str, many: &str) -> String {
-    let n100 = n % 100;
-    let n10 = n % 10;
-    let word = if (11..=14).contains(&n100) {
-        many
-    } else if n10 == 1 {
-        one
-    } else if (2..=4).contains(&n10) {
-        few
-    } else {
-        many
-    };
-    format!("{n} {word}")
-}
-
-/// Queue-wait state for the draw message: how many orders are still ahead.
+/// Queue-wait state for the draw message: the bare waiting emoji.
 #[must_use]
-pub fn compose_draw_waiting(ahead: usize) -> String {
-    let inner = if ahead == 0 {
-        "ваш черёд подходит…".to_owned()
-    } else {
-        format!(
-            "в очереди: {} впереди",
-            plural_ru(ahead, "заказ", "заказа", "заказов")
-        )
-    };
-    // Grey centered status via the pull-quote credit (`<cite>` inside `<aside>`); the custom
-    // emoji (with `⏳` fallback) is the required main content.
+pub fn compose_draw_waiting() -> String {
     sanitize_rich_html(&format!(
-        "<aside><tg-emoji emoji-id=\"{DRAW_WAITING_EMOJI_ID}\">⏳</tg-emoji><cite>{}</cite></aside>",
-        esc(&inner)
+        "<tg-emoji emoji-id=\"{DRAW_WAITING_EMOJI_ID}\">⏳</tg-emoji>"
     ))
 }
 
@@ -576,38 +534,27 @@ mod tests {
     }
 
     #[test]
-    fn draw_progress_shows_counter_and_partial_media() {
-        let html = compose_draw_progress("рисую…", 2, Some(3), &["https://h/a.png".to_owned()]);
-        assert!(html.contains("<aside><tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji><cite>рисую… 2 из 3</cite></aside>"));
-        assert!(html.contains(r#"<img src="https://h/a.png"/>"#));
-        let queue = compose_draw_progress("ожидаю очереди", 0, None, &[]);
+    fn draw_progress_is_bare_emoji_with_partial_media() {
+        // No images yet → just the bare drawing emoji (renders large).
         assert_eq!(
-            queue,
-            "<aside><tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji><cite>ожидаю очереди</cite></aside>"
+            compose_draw_progress(&[]),
+            "<tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji>"
         );
+        // With images → emoji + images-so-far.
+        let one = compose_draw_progress(&["https://h/a.png".to_owned()]);
+        assert!(one.starts_with("<tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji>"));
+        assert!(one.contains(r#"<img src="https://h/a.png"/>"#));
+        let many =
+            compose_draw_progress(&["https://h/a.png".to_owned(), "https://h/b.png".to_owned()]);
+        assert!(many.contains("<tg-slideshow>"));
+        assert!(many.contains(r#"<img src="https://h/b.png"/>"#));
     }
 
     #[test]
-    fn draw_waiting_counts_and_pluralizes() {
+    fn draw_waiting_is_bare_emoji() {
         assert_eq!(
-            compose_draw_waiting(0),
-            "<aside><tg-emoji emoji-id=\"5298571865969695917\">⏳</tg-emoji><cite>ваш черёд подходит…</cite></aside>"
-        );
-        assert_eq!(
-            compose_draw_waiting(1),
-            "<aside><tg-emoji emoji-id=\"5298571865969695917\">⏳</tg-emoji><cite>в очереди: 1 заказ впереди</cite></aside>"
-        );
-        assert_eq!(
-            compose_draw_waiting(2),
-            "<aside><tg-emoji emoji-id=\"5298571865969695917\">⏳</tg-emoji><cite>в очереди: 2 заказа впереди</cite></aside>"
-        );
-        assert_eq!(
-            compose_draw_waiting(5),
-            "<aside><tg-emoji emoji-id=\"5298571865969695917\">⏳</tg-emoji><cite>в очереди: 5 заказов впереди</cite></aside>"
-        );
-        assert_eq!(
-            compose_draw_waiting(11),
-            "<aside><tg-emoji emoji-id=\"5298571865969695917\">⏳</tg-emoji><cite>в очереди: 11 заказов впереди</cite></aside>"
+            compose_draw_waiting(),
+            "<tg-emoji emoji-id=\"5298571865969695917\">⏳</tg-emoji>"
         );
     }
 

@@ -59,7 +59,6 @@ pub const AIFARM_DRAW_API_DEFAULT_POLL_INTERVAL: StdDuration = StdDuration::from
 pub const STICKER_DOWN_FILE_ID: &str =
     "CAACAgIAAxkBAAEeROBkDjnz1i3WxxyNLBgWA_IKyjxbnQACuioAAqPicEh1C96_WINTHS8E";
 pub const NSFW_BLOCKED_MESSAGE_TEXT: &str = "Ваш запрос заблокирован, так как содержит неприемлемый контент. Попробуйте переформулировать запрос.";
-const DRAW_STATUS_DRAWING: &str = "рисую…";
 const DRAW_FAILED_NOTICE_TEXT: &str =
     "Не удалось нарисовать изображение. Попробуйте ещё раз чуть позже.";
 pub const IMAGE_JOB_POLL_INTERVAL: StdDuration = StdDuration::from_secs(1);
@@ -1523,7 +1522,7 @@ where
             params.chat_id,
             params.message_id,
             params.thread_id,
-            crate::rich::compose_draw_progress(DRAW_STATUS_DRAWING, 0, None, &[]),
+            crate::rich::compose_draw_progress(&[]),
         )
         .await
     {
@@ -1582,12 +1581,7 @@ where
                             .edit_draw_message(
                                 chat_id,
                                 draw_message_id,
-                                crate::rich::compose_draw_progress(
-                                    DRAW_STATUS_DRAWING,
-                                    published_urls.len(),
-                                    Some(expected_image_count),
-                                    &published_urls,
-                                ),
+                                crate::rich::compose_draw_progress(&published_urls),
                             )
                             .await;
                     }
@@ -1710,32 +1704,6 @@ where
         .await
 }
 
-/// Re-render the "waiting in queue" placeholder of every job still pending on this
-/// queue, so each shows its current position as the queue drains.
-async fn refresh_image_queue_positions<Effects>(
-    queue: &InMemoryTaskQueue,
-    queue_name: &str,
-    effects: &Effects,
-) where
-    Effects: ImageJobEffects + Sync,
-{
-    for (ahead, entry) in queue
-        .pending_image_queue_entries(queue_name)
-        .into_iter()
-        .enumerate()
-    {
-        if let Some(message_id) = entry.queue_position_message_id {
-            let _ = effects
-                .edit_draw_message(
-                    entry.chat_id,
-                    message_id,
-                    crate::rich::compose_draw_waiting(ahead),
-                )
-                .await;
-        }
-    }
-}
-
 /// Remove the queue-position message for the job that is about to start drawing; the
 /// drawing/result is then a fresh message so it surfaces near the end of the chat.
 async fn clear_drawn_job_queue_position<Effects>(
@@ -1774,7 +1742,7 @@ where
             params.chat_id,
             params.message_id,
             params.thread_id,
-            crate::rich::compose_draw_progress(DRAW_STATUS_DRAWING, 0, None, &[]),
+            crate::rich::compose_draw_progress(&[]),
         )
         .await
     {
@@ -1979,7 +1947,6 @@ where
 
     let _ = queue.set_execution_started(work.id, now);
     let queue_position_message_id = queue.job_queue_position_message_id(work.id);
-    refresh_image_queue_positions(queue, queue_name, effects).await;
     clear_drawn_job_queue_position(effects, params.chat_id, queue_position_message_id).await;
     let execution = execute_image_gen_job(generator, effects, params).await;
     match execution.outcome {
@@ -2205,7 +2172,6 @@ where
 
     let _ = queue.set_execution_started(work.id, now);
     let queue_position_message_id = queue.job_queue_position_message_id(work.id);
-    refresh_image_queue_positions(queue, queue_name, effects).await;
     clear_drawn_job_queue_position(effects, params.chat_id, queue_position_message_id).await;
     let execution = execute_image_edit_job(editor, effects, params).await;
     match execution.outcome {
@@ -3252,7 +3218,7 @@ mod tests {
         assert_eq!(calls.len(), 3);
         assert_eq!(
             calls[0],
-            "placeholder:-100:20:9:<aside><tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji><cite>рисую…</cite></aside>"
+            "placeholder:-100:20:9:<tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji>"
         );
         assert_eq!(calls[1], "publish:[Url(\"https://img.test/1.png\")]");
         assert!(calls[2].starts_with("edit:-100:888:"));
@@ -3290,7 +3256,7 @@ mod tests {
         assert_eq!(calls.len(), 4);
         assert_eq!(
             calls[0],
-            "placeholder:-100:20:9:<aside><tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji><cite>рисую…</cite></aside>"
+            "placeholder:-100:20:9:<tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji>"
         );
         assert_eq!(
             calls[1],
@@ -3298,7 +3264,7 @@ mod tests {
         );
         // progress redraw with "N из M" before the final gallery
         assert!(calls[2].starts_with("edit:-100:888:"));
-        assert!(calls[2].contains("рисую… 2 из 2"));
+        assert!(calls[2].contains("<tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji>"));
         assert!(calls[2].contains("<img src=\"https://img.test/1.png\"/>"));
         assert!(calls[2].contains("<img src=\"https://img.test/2.png\"/>"));
         assert!(calls[3].starts_with("edit:-100:888:<tg-slideshow>"));
@@ -3353,14 +3319,14 @@ mod tests {
         assert_eq!(calls.len(), 4);
         assert_eq!(
             calls[0],
-            "placeholder:-100:20:9:<aside><tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji><cite>рисую…</cite></aside>"
+            "placeholder:-100:20:9:<tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji>"
         );
         assert_eq!(
             calls[1],
             "publish:[Url(\"https://img.test/vip-1.png\"), Url(\"https://img.test/vip-2.png\")]"
         );
         assert!(calls[2].starts_with("edit:-100:888:"));
-        assert!(calls[2].contains("рисую… 2 из 2"));
+        assert!(calls[2].contains("<tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji>"));
         assert!(calls[2].contains("<img src=\"https://img.test/vip-1.png\"/>"));
         assert!(calls[3].starts_with("edit:-100:888:<tg-slideshow>"));
         assert!(calls[3].contains("<img src=\"https://img.test/vip-2.png\"/>"));
@@ -3369,8 +3335,8 @@ mod tests {
 
     #[tokio::test]
     async fn execute_image_gen_job_redraws_progressively_per_slot() {
-        // Two sequential slots → the post is redrawn ("N из M") as each image lands,
-        // not only after both complete.
+        // Two sequential slots → the post is redrawn (bare drawing emoji + images so far)
+        // as each image lands, not only after both complete.
         let generator = SequentialImageGenerator::new(
             GeneratorStub::success("https://img.test/s1.png"),
             GeneratorStub::success("https://img.test/s2.png"),
@@ -3395,10 +3361,10 @@ mod tests {
         let calls = effects.calls();
         assert_eq!(calls.len(), 6);
         assert_eq!(calls[1], "publish:[Url(\"https://img.test/s1.png\")]");
-        assert!(calls[2].contains("рисую… 1 из 2"));
+        assert!(calls[2].contains("<tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji>"));
         assert!(calls[2].contains("<img src=\"https://img.test/s1.png\"/>"));
         assert_eq!(calls[3], "publish:[Url(\"https://img.test/s2.png\")]");
-        assert!(calls[4].contains("рисую… 2 из 2"));
+        assert!(calls[4].contains("<tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji>"));
         assert!(calls[4].contains("<img src=\"https://img.test/s2.png\"/>"));
         assert!(calls[5].starts_with("edit:-100:888:<tg-slideshow>"));
         assert!(calls[5].contains("<img src=\"https://img.test/s1.png\"/>"));
@@ -3433,7 +3399,7 @@ mod tests {
         assert_eq!(calls.len(), 2);
         assert_eq!(
             calls[0],
-            "placeholder:-100:20:0:<aside><tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji><cite>рисую…</cite></aside>"
+            "placeholder:-100:20:0:<tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji>"
         );
         assert!(calls[1].starts_with("edit:-100:888:"));
         assert!(calls[1].contains(NSFW_BLOCKED_MESSAGE_TEXT));
@@ -3490,7 +3456,7 @@ mod tests {
         assert_eq!(calls.len(), 3);
         assert_eq!(
             calls[0],
-            "placeholder:-100:20:9:<aside><tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji><cite>рисую…</cite></aside>"
+            "placeholder:-100:20:9:<tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji>"
         );
         assert_eq!(
             calls[1],
@@ -3527,7 +3493,7 @@ mod tests {
         assert_eq!(calls.len(), 2);
         assert_eq!(
             calls[0],
-            "placeholder:-100:20:0:<aside><tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji><cite>рисую…</cite></aside>"
+            "placeholder:-100:20:0:<tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji>"
         );
         assert!(calls[1].starts_with("edit:-100:888:"));
         assert!(calls[1].contains(NSFW_BLOCKED_MESSAGE_TEXT));
@@ -3559,7 +3525,7 @@ mod tests {
         assert_eq!(calls.len(), 2);
         assert_eq!(
             calls[0],
-            "placeholder:-100:20:9:<aside><tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji><cite>рисую…</cite></aside>"
+            "placeholder:-100:20:9:<tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji>"
         );
         assert!(calls[1].starts_with("edit:-100:888:"));
         assert!(calls[1].contains(DRAW_FAILED_NOTICE_TEXT));
@@ -3878,7 +3844,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn image_gen_queue_worker_refreshes_waiting_positions_and_clears_drawn_position() {
+    async fn image_gen_queue_worker_clears_drawn_placeholder_and_draws_fresh() {
         let queue = InMemoryTaskQueue::new();
         let now = OffsetDateTime::from_unix_timestamp(1_779_193_800).expect("time");
         let make = |chat: i64, created| {
@@ -3920,20 +3886,16 @@ mod tests {
         assert_eq!(report.outcome, ImageGenQueuePollOutcome::Completed);
 
         let calls = effects.calls();
-        // The job still waiting moves up to position 0 (its message is edited).
+        assert_eq!(calls.len(), 4);
+        // The drawn job's queue placeholder is removed, then a fresh drawing message is sent.
+        // No live position refresh of other waiting jobs (status is a static bare emoji).
+        assert_eq!(calls[0], "delete:-100:701");
         assert_eq!(
-            calls[0],
-            "edit:-200:702:<aside><tg-emoji emoji-id=\"5298571865969695917\">⏳</tg-emoji><cite>ваш черёд подходит…</cite></aside>"
+            calls[1],
+            "placeholder:-100:20:0:<tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji>"
         );
-        // The drawn job's queue-position message is removed before drawing.
-        assert_eq!(calls[1], "delete:-100:701");
-        // Then a fresh drawing message is sent and turned into the gallery.
-        assert_eq!(
-            calls[2],
-            "placeholder:-100:20:0:<aside><tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji><cite>рисую…</cite></aside>"
-        );
-        assert_eq!(calls[3], "publish:[Url(\"https://img.test/1.png\")]");
-        assert!(calls[4].starts_with("edit:-100:888:"));
+        assert_eq!(calls[2], "publish:[Url(\"https://img.test/1.png\")]");
+        assert!(calls[3].starts_with("edit:-100:888:"));
     }
 
     #[tokio::test]
@@ -4740,7 +4702,7 @@ mod tests {
         assert_eq!(calls.len(), 3);
         assert_eq!(
             calls[0],
-            "placeholder:-100:20:9:<aside><tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji><cite>рисую…</cite></aside>"
+            "placeholder:-100:20:9:<tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji>"
         );
         assert_eq!(
             calls[1],
