@@ -8237,6 +8237,7 @@ mod tests {
             result_message_id: None,
             messages: Vec::new(),
             events: Vec::new(),
+            agent_state: None,
         };
         let upsert = openplotva_taskman::TaskQueueWalRecord {
             format: openplotva_taskman::TASK_QUEUE_WAL_FORMAT.to_owned(),

@@ -1224,6 +1224,7 @@ mod tests {
             result_message_id: None,
             messages: Vec::new(),
             events: Vec::new(),
+            agent_state: None,
         }
     }
 
