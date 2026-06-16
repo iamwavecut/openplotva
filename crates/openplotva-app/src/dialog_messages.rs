@@ -1191,12 +1191,12 @@ impl AgenticSearchTrigger {
     pub fn from_app_config(config: &AppConfig) -> Self {
         let search = &config.llm.agentic.search;
         let reasoner_provider = if search.reasoner_provider.trim().is_empty() {
-            "conversational".to_owned()
+            openplotva_config::DEFAULT_AGENTIC_SEARCH_REASONER_PROVIDER.to_owned()
         } else {
             search.reasoner_provider.clone()
         };
         let writer_provider = if search.writer_provider.trim().is_empty() {
-            "conversational".to_owned()
+            openplotva_config::DEFAULT_AGENTIC_SEARCH_WRITER_PROVIDER.to_owned()
         } else {
             search.writer_provider.clone()
         };

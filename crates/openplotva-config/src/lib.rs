@@ -160,6 +160,14 @@ pub const DEFAULT_LLM_PROVIDER_MAX_TOKENS: i32 = 8192;
 
 pub const DEFAULT_LLM_PROVIDER_TASK_TIMEOUT_SECONDS: i32 = 600;
 
+/// Agentic search is on by default; the app auto-registers a `qwen-reasoner`
+/// provider so it works without any `LLM_PROVIDERS_*` configuration.
+pub const DEFAULT_AGENTIC_SEARCH_ENABLED: bool = true;
+
+pub const DEFAULT_AGENTIC_SEARCH_REASONER_PROVIDER: &str = "qwen-reasoner";
+
+pub const DEFAULT_AGENTIC_SEARCH_WRITER_PROVIDER: &str = "conversational";
+
 pub const DEFAULT_AGENTIC_SEARCH_MAX_SEARCHES: i32 = 3;
 
 pub const DEFAULT_AGENTIC_SEARCH_MAX_CRAWLS: i32 = 4;
@@ -1969,12 +1977,14 @@ impl AppConfig {
                         enabled: parse_bool(
                             "LLM_AGENTIC_SEARCH_ENABLED",
                             raw.llm_agentic_search_enabled,
-                            false,
+                            DEFAULT_AGENTIC_SEARCH_ENABLED,
                         )?,
-                        reasoner_provider: raw
-                            .llm_agentic_search_reasoner_provider
-                            .unwrap_or_default(),
-                        writer_provider: raw.llm_agentic_search_writer_provider.unwrap_or_default(),
+                        reasoner_provider: parse_scalar_value(
+                            raw.llm_agentic_search_reasoner_provider,
+                        )
+                        .unwrap_or_else(|| DEFAULT_AGENTIC_SEARCH_REASONER_PROVIDER.to_owned()),
+                        writer_provider: parse_scalar_value(raw.llm_agentic_search_writer_provider)
+                            .unwrap_or_else(|| DEFAULT_AGENTIC_SEARCH_WRITER_PROVIDER.to_owned()),
                         max_searches: parse_i32(
                             "LLM_AGENTIC_SEARCH_MAX_SEARCHES",
                             raw.llm_agentic_search_max_searches,
@@ -3122,6 +3132,13 @@ mod tests {
             config.vision.request_timeout_seconds,
             DEFAULT_VISION_REQUEST_TIMEOUT_SECONDS
         );
+        // Agentic search is on by default and points at the qwen reasoner; the
+        // qwen provider itself is auto-registered by the app, so the config-level
+        // providers list stays empty.
+        assert!(config.llm.agentic.search.enabled);
+        assert_eq!(config.llm.agentic.search.reasoner_provider, "qwen-reasoner");
+        assert_eq!(config.llm.agentic.search.writer_provider, "conversational");
+        assert!(config.llm.providers.is_empty());
         assert!(!config.music.acestep.enabled);
         assert_eq!(config.music.acestep.base_url, DEFAULT_ACESTEP_BASE_URL);
         assert_eq!(config.music.acestep.api_key, "");

@@ -25,6 +25,12 @@ use crate::media::{agent_client_config_from_named_provider, aifarm_dialog_config
 /// The implicit provider name that always maps to the primary dialog config.
 pub const CONVERSATIONAL_PROVIDER: &str = "conversational";
 
+/// Default Discovery service the auto-registered `qwen-reasoner` provider targets.
+pub const DEFAULT_QWEN_SERVICE_NAME: &str = "llm-openai-qwen35b-gguf";
+/// Default model label sent to the qwen llama.cpp server (it serves one model and
+/// is lenient about this field; override via `LLM_PROVIDERS_MODELS`).
+pub const DEFAULT_QWEN_MODEL: &str = "qwen3.6-35b-a3b";
+
 /// Reasoner orchestration prompt for the search agent.
 pub const SEARCH_SYSTEM_PROMPT: &str =
     include_str!("../../../prompts/agentic/search_system.prompt");
@@ -99,6 +105,40 @@ pub fn build_agent_provider_registry(config: &AppConfig) -> AgentProviderRegistr
         );
     }
 
+    // Auto-register the default qwen reasoner so the search agent works out of the
+    // box; an explicit `LLM_PROVIDERS_*` entry of the same name takes precedence.
+    let default_reasoner =
+        normalize_name(openplotva_config::DEFAULT_AGENTIC_SEARCH_REASONER_PROVIDER);
+    if !by_name.contains_key(&default_reasoner) {
+        let spec = openplotva_config::NamedProviderConfig {
+            name: openplotva_config::DEFAULT_AGENTIC_SEARCH_REASONER_PROVIDER.to_owned(),
+            kind: openplotva_config::DEFAULT_LLM_PROVIDER_KIND.to_owned(),
+            discovery_service_name: DEFAULT_QWEN_SERVICE_NAME.to_owned(),
+            discovery_endpoint_name: config.llm.dialog.discovery_endpoint_name.clone(),
+            model: DEFAULT_QWEN_MODEL.to_owned(),
+            base_url: String::new(),
+            url: String::new(),
+            api_key: String::new(),
+            include_reasoning: Some(false),
+            enable_thinking: Some(false),
+            max_tokens: openplotva_config::DEFAULT_LLM_PROVIDER_MAX_TOKENS,
+            temperature: None,
+            task_timeout_seconds: openplotva_config::DEFAULT_LLM_PROVIDER_TASK_TIMEOUT_SECONDS,
+        };
+        let client_config = agent_client_config_from_named_provider(config, &spec);
+        by_name.insert(
+            default_reasoner,
+            Arc::new(AgentProviderClient {
+                client: AifarmHttpClient::new(client_config),
+                model: spec.model.clone(),
+                include_reasoning: spec.include_reasoning,
+                enable_thinking: spec.enable_thinking,
+                temperature: spec.temperature,
+                max_tokens: spec.max_tokens,
+            }),
+        );
+    }
+
     AgentProviderRegistry { by_name }
 }
 
@@ -126,7 +166,7 @@ impl SearchAgentSettings {
         let search = &config.llm.agentic.search;
         let max_tool_calls = search.max_searches.saturating_add(search.max_crawls).max(1);
         let reasoner_provider = if search.reasoner_provider.trim().is_empty() {
-            CONVERSATIONAL_PROVIDER.to_owned()
+            openplotva_config::DEFAULT_AGENTIC_SEARCH_REASONER_PROVIDER.to_owned()
         } else {
             search.reasoner_provider.clone()
         };
@@ -438,5 +478,15 @@ mod tests {
         assert_eq!(chat.role, "user");
         assert!(chat.content.contains("web_search"));
         assert!(chat.content.contains("results"));
+    }
+
+    #[test]
+    fn registry_auto_registers_qwen_reasoner_by_default() {
+        let config =
+            openplotva_config::AppConfig::from_raw(openplotva_config::RawConfig::default())
+                .expect("default config");
+        let registry = build_agent_provider_registry(&config);
+        assert!(registry.contains(CONVERSATIONAL_PROVIDER));
+        assert!(registry.contains(openplotva_config::DEFAULT_AGENTIC_SEARCH_REASONER_PROVIDER));
     }
 }
