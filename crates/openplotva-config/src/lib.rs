@@ -164,6 +164,8 @@ pub const DEFAULT_LLM_PROVIDER_TASK_TIMEOUT_SECONDS: i32 = 600;
 /// provider so it works without any `LLM_PROVIDERS_*` configuration.
 pub const DEFAULT_AGENTIC_SEARCH_ENABLED: bool = true;
 
+pub const DEFAULT_AGENTIC_SONG_ENABLED: bool = true;
+
 pub const DEFAULT_AGENTIC_SEARCH_REASONER_PROVIDER: &str = "qwen-reasoner";
 
 pub const DEFAULT_AGENTIC_SEARCH_WRITER_PROVIDER: &str = "conversational";
@@ -618,6 +620,8 @@ pub struct NamedProviderConfig {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AgenticConfig {
     pub search: AgenticSearchConfig,
+    /// When true, song requests are written by the multi-step song agent.
+    pub song_enabled: bool,
 }
 
 /// Search-agent profile configuration. Disabled by default so the existing naive
@@ -1082,6 +1086,8 @@ pub struct RawConfig {
     pub llm_provider_task_timeout_seconds: Option<String>,
     /// `LLM_AGENTIC_SEARCH_ENABLED`.
     pub llm_agentic_search_enabled: Option<String>,
+    /// `LLM_AGENTIC_SONG_ENABLED`.
+    pub llm_agentic_song_enabled: Option<String>,
     /// `LLM_AGENTIC_SEARCH_REASONER_PROVIDER`.
     pub llm_agentic_search_reasoner_provider: Option<String>,
     /// `LLM_AGENTIC_SEARCH_WRITER_PROVIDER`.
@@ -2011,6 +2017,11 @@ impl AppConfig {
                             DEFAULT_AGENTIC_SEARCH_WALL_TIMEOUT_SECONDS,
                         )?,
                     },
+                    song_enabled: parse_bool(
+                        "LLM_AGENTIC_SONG_ENABLED",
+                        raw.llm_agentic_song_enabled,
+                        DEFAULT_AGENTIC_SONG_ENABLED,
+                    )?,
                 },
             },
             vision: VisionConfig {
@@ -2469,6 +2480,7 @@ impl RawConfig {
             llm_provider_temperatures: env("LLM_PROVIDERS_TEMPERATURES"),
             llm_provider_task_timeout_seconds: env("LLM_PROVIDERS_TASK_TIMEOUT_SECONDS"),
             llm_agentic_search_enabled: env("LLM_AGENTIC_SEARCH_ENABLED"),
+            llm_agentic_song_enabled: env("LLM_AGENTIC_SONG_ENABLED"),
             llm_agentic_search_reasoner_provider: env("LLM_AGENTIC_SEARCH_REASONER_PROVIDER"),
             llm_agentic_search_writer_provider: env("LLM_AGENTIC_SEARCH_WRITER_PROVIDER"),
             llm_agentic_search_max_searches: env("LLM_AGENTIC_SEARCH_MAX_SEARCHES"),

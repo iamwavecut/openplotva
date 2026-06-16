@@ -27,8 +27,11 @@ use openplotva_storage::{PostgresHistoryStore, PostgresMemoryStore};
 use serde_json::{Value, json};
 use time::{Duration as TimeDuration, OffsetDateTime};
 
+use openplotva_taskman::MusicGenJobParams;
+
 use crate::dialog_tools::{UrlCrawler, WebSearchProvider};
 use crate::media::{agent_client_config_from_named_provider, aifarm_dialog_config_from_app_config};
+use crate::music_jobs::{SongMaterial, SongMaterialFuture, SongMaterialProvider};
 
 /// The implicit provider name that always maps to the primary dialog config.
 pub const CONVERSATIONAL_PROVIDER: &str = "conversational";
@@ -47,6 +50,8 @@ pub const SEARCH_SYSTEM_PROMPT: &str =
 /// Writer synthesis prompt for the search agent.
 pub const SEARCH_SYNTHESIS_PROMPT: &str =
     include_str!("../../../prompts/agentic/search_synthesis.prompt");
+/// System prompt for the song-writing agent.
+pub const SONG_SYSTEM_PROMPT: &str = include_str!("../../../prompts/agentic/song_system.prompt");
 
 /// A single-completion LLM client plus the request defaults for one provider.
 #[derive(Clone)]
@@ -639,6 +644,207 @@ fn summarize_run(state: &AgentState) -> String {
     }
 }
 
+/// Settings for the song-writing agent (prompt + reasoner + budgets).
+#[derive(Clone)]
+pub struct SongAgentSettings {
+    pub enabled: bool,
+    pub system_prompt: String,
+    pub reasoner_provider: String,
+    pub budgets: AgentBudgets,
+    pub reasoner_max_tokens: i32,
+}
+
+impl SongAgentSettings {
+    #[must_use]
+    pub fn from_app_config(config: &AppConfig, system_prompt: String) -> Self {
+        let reasoner_provider = if config
+            .llm
+            .agentic
+            .search
+            .reasoner_provider
+            .trim()
+            .is_empty()
+        {
+            openplotva_config::DEFAULT_AGENTIC_SEARCH_REASONER_PROVIDER.to_owned()
+        } else {
+            config.llm.agentic.search.reasoner_provider.clone()
+        };
+        Self {
+            enabled: config.llm.agentic.song_enabled,
+            system_prompt,
+            reasoner_provider,
+            budgets: AgentBudgets {
+                max_steps: 10,
+                max_total_tokens: 60_000,
+                max_wall_ms: 180_000,
+                max_tool_calls: 5,
+                max_tool_errors: 3,
+            },
+            reasoner_max_tokens: 4096,
+        }
+    }
+
+    fn profile(&self, reasoner_model: String) -> AgentProfile {
+        AgentProfile {
+            id: "song".to_owned(),
+            system_prompt: self.system_prompt.clone(),
+            allowed_tools: vec![
+                STEP_WEB_SEARCH.to_owned(),
+                STEP_CRAWL_URL.to_owned(),
+                STEP_HISTORY_SEARCH.to_owned(),
+                STEP_MEMORY_SEARCH.to_owned(),
+            ],
+            reasoner_model: reasoner_model.clone(),
+            writer_model: reasoner_model,
+            budgets: self.budgets,
+            reasoner_max_tokens: self.reasoner_max_tokens,
+            writer_max_tokens: self.reasoner_max_tokens,
+        }
+    }
+}
+
+/// A `SongMaterialProvider` that writes lyrics with the multi-step song agent
+/// (gathering context via web/history/memory) and parses the structured result.
+/// Falls back to the wrapped provider (the single-pass reprompt) when the agent
+/// is disabled or produces nothing usable.
+pub struct SongAgentMaterialProvider {
+    reasoner: Option<Arc<AgentProviderClient>>,
+    settings: SongAgentSettings,
+    tools: Option<Arc<dyn AgentTools>>,
+    fallback: Arc<dyn SongMaterialProvider + Send + Sync>,
+}
+
+impl SongAgentMaterialProvider {
+    #[must_use]
+    pub fn new(
+        reasoner: Option<Arc<AgentProviderClient>>,
+        settings: SongAgentSettings,
+        tools: Option<Arc<dyn AgentTools>>,
+        fallback: Arc<dyn SongMaterialProvider + Send + Sync>,
+    ) -> Self {
+        Self {
+            reasoner,
+            settings,
+            tools,
+            fallback,
+        }
+    }
+
+    async fn run_agent(
+        &self,
+        reasoner: &Arc<AgentProviderClient>,
+        tools: &Arc<dyn AgentTools>,
+        params: &MusicGenJobParams,
+        topic: &str,
+    ) -> Option<SongMaterial> {
+        let origin = AgentOrigin {
+            chat_id: params.chat_id,
+            message_id: params.message_id,
+            user_id: params.user_id,
+            thread_id: params.thread_id,
+            user_full_name: params.user_full_name.clone(),
+        };
+        let profile = self.settings.profile(reasoner.model.clone());
+        let reasoner_adapter = AifarmReasoner::new(Arc::clone(reasoner));
+        let mut state = AgentState::new("song", topic, origin, now_unix_ms());
+        loop {
+            match advance_one_step(
+                &profile,
+                &reasoner_adapter,
+                tools.as_ref(),
+                state,
+                now_unix_ms(),
+            )
+            .await
+            {
+                Ok(StepProgress::Continue(next)) => state = next,
+                Ok(StepProgress::Terminal(next)) => {
+                    state = next;
+                    break;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "song agent step failed");
+                    return None;
+                }
+            }
+        }
+        match &state.outcome {
+            Some(AgentOutcome::Completed { answer }) => parse_song_material(answer),
+            Some(AgentOutcome::Stopped { partial, .. }) => parse_song_material(partial),
+            _ => None,
+        }
+    }
+}
+
+impl SongMaterialProvider for SongAgentMaterialProvider {
+    fn build_song_material<'a>(
+        &'a self,
+        params: &'a MusicGenJobParams,
+        topic: &'a str,
+    ) -> SongMaterialFuture<'a> {
+        Box::pin(async move {
+            if self.settings.enabled
+                && let (Some(reasoner), Some(tools)) = (&self.reasoner, &self.tools)
+                && let Some(material) = self.run_agent(reasoner, tools, params, topic).await
+            {
+                return Ok(material);
+            }
+            tracing::debug!("song agent inactive or empty; using reprompt fallback");
+            self.fallback.build_song_material(params, topic).await
+        })
+    }
+}
+
+/// Parse the song agent's structured final answer into `SongMaterial`. Returns
+/// `None` when the required parts are missing, so the caller falls back.
+fn parse_song_material(answer: &str) -> Option<SongMaterial> {
+    let mut style = String::new();
+    let mut language = String::new();
+    let mut title = String::new();
+    let mut lyrics = String::new();
+    let mut in_lyrics = false;
+    for line in answer.lines() {
+        if in_lyrics {
+            lyrics.push_str(line);
+            lyrics.push('\n');
+            continue;
+        }
+        let trimmed = line.trim();
+        if let Some(value) = strip_label(trimmed, "STYLE:") {
+            style = value.to_owned();
+        } else if let Some(value) = strip_label(trimmed, "LANGUAGE:") {
+            language = value.to_owned();
+        } else if let Some(value) = strip_label(trimmed, "TITLE:") {
+            title = value.to_owned();
+        } else if let Some(rest) = strip_label(trimmed, "LYRICS:") {
+            in_lyrics = true;
+            if !rest.is_empty() {
+                lyrics.push_str(rest);
+                lyrics.push('\n');
+            }
+        }
+    }
+    let lyrics = lyrics.trim().to_owned();
+    let style = style.trim().to_owned();
+    let language = language.trim().to_owned();
+    if lyrics.is_empty() || style.is_empty() || language.is_empty() {
+        return None;
+    }
+    Some(SongMaterial {
+        title: title.trim().to_owned(),
+        lyrics,
+        style: style.clone(),
+        raw_style: style,
+        vocal_language: language,
+    })
+}
+
+fn strip_label<'a>(line: &'a str, label: &str) -> Option<&'a str> {
+    line.get(..label.len())
+        .filter(|head| head.eq_ignore_ascii_case(label))
+        .map(|_| line[label.len()..].trim())
+}
+
 /// Current unix time in milliseconds for budget accounting.
 #[must_use]
 pub fn now_unix_ms() -> u64 {
@@ -794,6 +1000,24 @@ mod tests {
         assert_eq!(reply.tool_calls[0].function.name, "web_search");
         assert_eq!(reply.prompt_tokens, 12);
         assert_eq!(reply.completion_tokens, 5);
+    }
+
+    #[test]
+    fn parses_song_material_from_structured_answer() {
+        let answer = "STYLE: indie pop, acoustic guitar, warm, 96 BPM\nLANGUAGE: ru\nTITLE: Тёплый вечер\nLYRICS:\n[Verse 1]\nстрока раз\nстрока два\n[Chorus]\nприпев";
+        let material = parse_song_material(answer).expect("parsed");
+        assert_eq!(material.vocal_language, "ru");
+        assert_eq!(material.title, "Тёплый вечер");
+        assert!(material.style.contains("indie pop"));
+        assert!(material.lyrics.starts_with("[Verse 1]"));
+        assert!(material.lyrics.contains("припев"));
+    }
+
+    #[test]
+    fn rejects_song_material_without_required_parts() {
+        assert!(parse_song_material("just prose, no structure").is_none());
+        // Missing the LYRICS block.
+        assert!(parse_song_material("STYLE: pop\nLANGUAGE: en\nTITLE: x").is_none());
     }
 
     #[test]

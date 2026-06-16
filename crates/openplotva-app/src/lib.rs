@@ -9568,9 +9568,43 @@ async fn start_runtime_workers(
                     }
                     None => Arc::new(aifarm_song_prompt_generator),
                 };
-                let music_material_provider = music_jobs::AifarmSongMaterialProvider::new(
-                    music_song_prompt_generator,
-                    PostgresVirtualMessageStore::new(service_clients.postgres.clone()),
+                let base_song_material: Arc<dyn music_jobs::SongMaterialProvider + Send + Sync> =
+                    Arc::new(music_jobs::AifarmSongMaterialProvider::new(
+                        music_song_prompt_generator,
+                        PostgresVirtualMessageStore::new(service_clients.postgres.clone()),
+                    ));
+                let song_agent_settings = agent_runtime::SongAgentSettings::from_app_config(
+                    config,
+                    agent_runtime::SONG_SYSTEM_PROMPT.to_owned(),
+                );
+                let (song_agent_reasoner, song_agent_tools) = if song_agent_settings.enabled {
+                    let registry = agent_runtime::build_agent_provider_registry(config);
+                    let reasoner = registry.get(&song_agent_settings.reasoner_provider);
+                    let tools: Option<Arc<dyn openplotva_agent::AgentTools>> =
+                        serper_client.as_ref().map(|serper| {
+                            let web: Arc<dyn dialog_tools::WebSearchProvider> = serper.clone();
+                            let crawl: Arc<dyn dialog_tools::UrlCrawler> = serper.clone();
+                            let history: Arc<dyn agent_runtime::HistorySearcher> = Arc::new(
+                                agent_runtime::PostgresHistorySearch::new(history_store.clone()),
+                            );
+                            let memory: Arc<dyn agent_runtime::MemorySearcher> = Arc::new(
+                                agent_runtime::PostgresMemorySearch::new(memory_store.clone()),
+                            );
+                            Arc::new(
+                                agent_runtime::AppAgentTools::new(web, crawl)
+                                    .with_history_searcher(history)
+                                    .with_memory_searcher(memory),
+                            ) as Arc<dyn openplotva_agent::AgentTools>
+                        });
+                    (reasoner, tools)
+                } else {
+                    (None, None)
+                };
+                let music_material_provider = agent_runtime::SongAgentMaterialProvider::new(
+                    song_agent_reasoner,
+                    song_agent_settings,
+                    song_agent_tools,
+                    base_song_material,
                 );
                 let music_generator = music_jobs::AceStepMusicGenerator::new(
                     acestep_client,
