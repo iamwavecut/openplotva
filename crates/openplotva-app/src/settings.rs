@@ -6525,6 +6525,7 @@ mod tests {
             aifarm_default_max_tokens: 1024,
             aifarm_long_max_tokens: 2048,
             processing_timeout_seconds: 720,
+            agentic_search: crate::dialog_messages::AgenticSearchTrigger::default(),
         }
     }
 
