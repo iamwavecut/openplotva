@@ -1281,6 +1281,7 @@ fn taskman_job_type_string(job_type: JobType) -> &'static str {
         JobType::Translation => "translation",
         JobType::MemoryConsolidation => "memory_consolidation",
         JobType::Control => "control",
+        JobType::Agent => "agent",
     }
 }
 
