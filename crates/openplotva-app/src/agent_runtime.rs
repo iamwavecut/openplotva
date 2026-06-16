@@ -3,23 +3,27 @@
 //! real AIFarm client and dialog tool box, and the search-agent profile.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use openplotva_agent::{
-    AgentBudgets, AgentError, AgentMessage, AgentProfile, AgentRole, AgentTools, Reasoner,
-    ReasonerCall, ReasonerFuture, ReasonerReply, ToolDispatchFuture,
+    AgentBudgets, AgentError, AgentMessage, AgentOrigin, AgentOutcome, AgentProfile, AgentRole,
+    AgentState, AgentTools, Reasoner, ReasonerCall, ReasonerFuture, ReasonerReply, StepProgress,
+    ToolDispatchFuture, advance_one_step, render_evidence,
 };
 use openplotva_config::AppConfig;
 use openplotva_dialog::{
-    DialogToolbox, NativeToolCall, STEP_CRAWL_URL, STEP_WEB_SEARCH, ToolContext, ToolResult,
-    ToolStep,
+    NativeToolCall, STEP_CRAWL_URL, STEP_WEB_SEARCH, TOOL_RESULT_STATUS_OK, ToolContext,
+    ToolResult, ToolStep,
 };
 use openplotva_llm::aifarm::{
     AifarmHttpClient, ChatCompletionRequest, ChatMessage, CompletionResult, StatusUpdate,
 };
 use serde_json::{Value, json};
 
+use crate::dialog_tools::{UrlCrawler, WebSearchProvider};
 use crate::media::{agent_client_config_from_named_provider, aifarm_dialog_config_from_app_config};
 
 /// The implicit provider name that always maps to the primary dialog config.
@@ -270,34 +274,140 @@ pub async fn synthesize_answer(
     Ok(reply.text)
 }
 
-/// `AgentTools` adapter over the shared dialog tool box. Tool/transport failures
-/// become recoverable failed `ToolResult`s so the loop can react and continue.
+/// `AgentTools` adapter that calls the RAW Serper providers directly (not the
+/// dialog tool box). This keeps the agent loop independent of the conversational
+/// `web_search` tool — essential because that tool may itself be agentic, which
+/// would otherwise recurse. Transport failures become recoverable `ToolResult`s.
 pub struct AppAgentTools {
-    toolbox: Arc<dyn DialogToolbox>,
+    web_searcher: Arc<dyn WebSearchProvider>,
+    url_crawler: Arc<dyn UrlCrawler>,
 }
 
 impl AppAgentTools {
     #[must_use]
-    pub fn new(toolbox: Arc<dyn DialogToolbox>) -> Self {
-        Self { toolbox }
+    pub fn new(web_searcher: Arc<dyn WebSearchProvider>, url_crawler: Arc<dyn UrlCrawler>) -> Self {
+        Self {
+            web_searcher,
+            url_crawler,
+        }
+    }
+}
+
+fn ok_tool_result(message: String, data: Value) -> ToolResult {
+    ToolResult {
+        status: TOOL_RESULT_STATUS_OK.to_owned(),
+        message,
+        data: Some(data),
+        ..ToolResult::default()
     }
 }
 
 impl AgentTools for AppAgentTools {
     fn dispatch<'a>(&'a self, _ctx: ToolContext, step: ToolStep) -> ToolDispatchFuture<'a> {
         Box::pin(async move {
-            let outcome = match step.step.as_str() {
-                STEP_WEB_SEARCH => self.toolbox.web_search(step.query.clone()).await,
-                STEP_CRAWL_URL => self.toolbox.crawl_url(step.url.clone()).await,
-                other => {
-                    return Ok(ToolResult::failed(
-                        "tool_unsupported",
-                        format!("agent tool `{other}` is not supported"),
-                    ));
+            let result = match step.step.as_str() {
+                STEP_WEB_SEARCH => {
+                    let query = step.query.clone();
+                    match self.web_searcher.search(&query).await {
+                        Ok(results) => ok_tool_result(results, json!({ "query": query })),
+                        Err(error) => ToolResult::failed("web_search_failed", error.to_string()),
+                    }
                 }
+                STEP_CRAWL_URL => {
+                    let url = step.url.clone();
+                    match self.url_crawler.crawl(&url).await {
+                        Ok(content) => ok_tool_result(content, json!({ "url": url })),
+                        Err(error) => ToolResult::failed("crawl_url_failed", error.to_string()),
+                    }
+                }
+                other => ToolResult::failed(
+                    "tool_unsupported",
+                    format!("agent tool `{other}` is not supported"),
+                ),
             };
-            Ok(outcome.unwrap_or_else(|error| ToolResult::failed("tool_error", error.to_string())))
+            Ok(result)
         })
+    }
+}
+
+/// Boxed future returned by [`AgenticWebSearch`].
+pub type AgenticWebSearchFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<String, AgentError>> + Send + 'a>>;
+
+/// Runs the search agent for a single query and returns a summarized answer text.
+/// The conversational `web_search` tool uses this so the bot's brain gets a
+/// researched summary instead of raw single-pass results.
+pub trait AgenticWebSearch: Send + Sync {
+    fn search_summary<'a>(&'a self, query: String) -> AgenticWebSearchFuture<'a>;
+}
+
+/// Synchronous (within one call) search-agent run: drive the engine loop to a
+/// terminal state and return the reasoner's summary (plus gathered evidence).
+/// No durable checkpointing — it lives inside one dialog tool call.
+pub struct InlineSearchAgent {
+    reasoner: Arc<AgentProviderClient>,
+    settings: SearchAgentSettings,
+    tools: Arc<dyn AgentTools>,
+}
+
+impl InlineSearchAgent {
+    #[must_use]
+    pub fn new(
+        reasoner: Arc<AgentProviderClient>,
+        settings: SearchAgentSettings,
+        tools: Arc<dyn AgentTools>,
+    ) -> Self {
+        Self {
+            reasoner,
+            settings,
+            tools,
+        }
+    }
+}
+
+impl AgenticWebSearch for InlineSearchAgent {
+    fn search_summary<'a>(&'a self, query: String) -> AgenticWebSearchFuture<'a> {
+        Box::pin(async move {
+            let model = self.reasoner.model.clone();
+            let profile = self.settings.profile(model.clone(), model);
+            let reasoner = AifarmReasoner::new(Arc::clone(&self.reasoner));
+            let mut state = AgentState::new("search", query, AgentOrigin::default(), now_unix_ms());
+            loop {
+                match advance_one_step(
+                    &profile,
+                    &reasoner,
+                    self.tools.as_ref(),
+                    state,
+                    now_unix_ms(),
+                )
+                .await?
+                {
+                    StepProgress::Continue(next) => state = next,
+                    StepProgress::Terminal(next) => {
+                        state = next;
+                        break;
+                    }
+                }
+            }
+            Ok(summarize_run(&state))
+        })
+    }
+}
+
+fn summarize_run(state: &AgentState) -> String {
+    let evidence = render_evidence(state);
+    let summary = match &state.outcome {
+        Some(AgentOutcome::Completed { answer }) if !answer.trim().is_empty() => answer.clone(),
+        Some(AgentOutcome::Stopped { partial, .. }) if !partial.trim().is_empty() => {
+            partial.clone()
+        }
+        _ => String::new(),
+    };
+    match (summary.trim().is_empty(), evidence.trim().is_empty()) {
+        (true, true) => "No relevant results were found.".to_owned(),
+        (true, false) => evidence,
+        (false, true) => summary,
+        (false, false) => format!("{summary}\n\nGathered evidence:\n{evidence}"),
     }
 }
 

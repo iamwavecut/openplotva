@@ -293,7 +293,14 @@ impl AgentJobWorker {
             disable_notification: false,
             reply_markup: None,
         };
-        if let Err(error) = self.rich.send_rich(origin.chat_id, answer, &options).await {
+        // Sanitize to Telegram rich HTML exactly like the dialog flow, so the
+        // answer renders properly instead of showing raw markdown.
+        let prepared = crate::dialog_jobs::prepare_dialog_chat_response(answer);
+        if let Err(error) = self
+            .rich
+            .send_rich(origin.chat_id, &prepared, &options)
+            .await
+        {
             tracing::warn!(%error, chat_id = origin.chat_id, "agent answer send failed");
         }
     }

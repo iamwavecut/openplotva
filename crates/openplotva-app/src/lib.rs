@@ -9135,6 +9135,54 @@ async fn start_runtime_workers(
             None
         }
     };
+    // Build the search-agent machinery once (registry + settings), if enabled and
+    // the configured reasoner/writer providers resolve.
+    let agentic_search_setup = if config.llm.agentic.search.enabled {
+        let registry = agent_runtime::build_agent_provider_registry(config);
+        let settings = agent_runtime::SearchAgentSettings::from_app_config(
+            config,
+            agent_runtime::SEARCH_SYSTEM_PROMPT.to_owned(),
+            agent_runtime::SEARCH_SYNTHESIS_PROMPT.to_owned(),
+        );
+        if registry.contains(&settings.reasoner_provider)
+            && registry.contains(&settings.writer_provider)
+        {
+            Some((registry, settings))
+        } else {
+            readiness_checks.push(ReadinessCheck::skipped(
+                "agent_jobs",
+                "Agentic search enabled but the reasoner/writer provider is missing from the registry",
+            ));
+            None
+        }
+    } else {
+        None
+    };
+    // The agent's own tools call raw Serper directly (never the conversational
+    // web_search tool — that would recurse). Requires Serper to be configured.
+    let agent_serper_tools: Option<Arc<dyn openplotva_agent::AgentTools>> =
+        serper_client.as_ref().map(|serper| {
+            let web: Arc<dyn dialog_tools::WebSearchProvider> = serper.clone();
+            let crawl: Arc<dyn dialog_tools::UrlCrawler> = serper.clone();
+            Arc::new(agent_runtime::AppAgentTools::new(web, crawl))
+                as Arc<dyn openplotva_agent::AgentTools>
+        });
+    // Inline agentic web_search: when enabled + Serper present, the conversational
+    // web_search tool runs the research agent and returns a summary.
+    let inline_agentic_search: Option<Arc<dyn agent_runtime::AgenticWebSearch>> =
+        match (&agentic_search_setup, &agent_serper_tools) {
+            (Some((registry, settings)), Some(tools)) => {
+                registry.get(&settings.reasoner_provider).map(|reasoner| {
+                    Arc::new(agent_runtime::InlineSearchAgent::new(
+                        reasoner,
+                        settings.clone(),
+                        Arc::clone(tools),
+                    )) as Arc<dyn agent_runtime::AgenticWebSearch>
+                })
+            }
+            _ => None,
+        };
+
     let mut app_dialog_toolbox = dialog_tools::AppDialogToolbox::new(
         Some(Arc::clone(&rates_fetcher)),
         Some(rates_tool_dispatcher),
@@ -9151,55 +9199,51 @@ async fn start_runtime_workers(
     if let Some(youtube_summarizer) = youtube_summarizer {
         app_dialog_toolbox = app_dialog_toolbox.with_youtube_summarizer(youtube_summarizer);
     }
-    if let Some(serper_client) = serper_client {
-        let web_searcher: Arc<dyn dialog_tools::WebSearchProvider> = serper_client.clone();
-        let url_crawler: Arc<dyn dialog_tools::UrlCrawler> = serper_client;
+    if let Some(serper) = serper_client.as_ref() {
+        let web_searcher: Arc<dyn dialog_tools::WebSearchProvider> = serper.clone();
+        let url_crawler: Arc<dyn dialog_tools::UrlCrawler> = serper.clone();
         app_dialog_toolbox = app_dialog_toolbox
             .with_web_searcher(web_searcher)
             .with_url_crawler(url_crawler);
     }
+    if let Some(agent) = inline_agentic_search.clone() {
+        app_dialog_toolbox = app_dialog_toolbox.with_agentic_search(agent);
+    }
     let dialog_toolbox: Arc<dyn openplotva_dialog::DialogToolbox> = Arc::new(app_dialog_toolbox);
-    if config.llm.agentic.search.enabled {
-        let agent_registry = agent_runtime::build_agent_provider_registry(config);
-        let agent_settings = agent_runtime::SearchAgentSettings::from_app_config(
-            config,
-            agent_runtime::SEARCH_SYSTEM_PROMPT.to_owned(),
-            agent_runtime::SEARCH_SYNTHESIS_PROMPT.to_owned(),
-        );
-        if agent_registry.contains(&agent_settings.reasoner_provider)
-            && agent_registry.contains(&agent_settings.writer_provider)
-        {
-            let agent_tools: Arc<dyn openplotva_agent::AgentTools> = Arc::new(
-                agent_runtime::AppAgentTools::new(Arc::clone(&dialog_toolbox)),
-            );
-            let agent_worker = agent_jobs::AgentJobWorker::new(
-                Arc::clone(&task_queue_for_updates),
-                agent_registry,
-                agent_tools,
-                Arc::clone(&rich_sender),
-                agent_settings,
-            );
-            let agent_worker_stop = stop.subscribe();
-            let agent_worker_handle = tokio::spawn(async move {
-                let report = agent_jobs::run_agent_job_worker_until(
-                    &agent_worker,
-                    wait_for_runtime_stop(agent_worker_stop),
-                )
-                .await;
-                tracing::info!(?report, "agent taskman worker stopped");
-            });
-            shared_taskman_worker_counts
-                .insert(openplotva_taskman::AGENT_QWEN_QUEUE_NAME.to_owned(), 1);
-            workers.handles.push(agent_worker_handle);
-            readiness_checks.push(ReadinessCheck::ok(
-                "agent_jobs",
-                "Agent search worker started on the agent-qwen queue",
-            ));
-        } else {
-            readiness_checks.push(ReadinessCheck::skipped(
-                "agent_jobs",
-                "Agentic search enabled but the reasoner/writer provider is missing from the registry",
-            ));
+    // /search command worker: drives durable agent runs on the agent-qwen queue.
+    if let Some((registry, settings)) = agentic_search_setup {
+        match agent_serper_tools {
+            Some(agent_tools) => {
+                let agent_worker = agent_jobs::AgentJobWorker::new(
+                    Arc::clone(&task_queue_for_updates),
+                    registry,
+                    agent_tools,
+                    Arc::clone(&rich_sender),
+                    settings,
+                );
+                let agent_worker_stop = stop.subscribe();
+                let agent_worker_handle = tokio::spawn(async move {
+                    let report = agent_jobs::run_agent_job_worker_until(
+                        &agent_worker,
+                        wait_for_runtime_stop(agent_worker_stop),
+                    )
+                    .await;
+                    tracing::info!(?report, "agent taskman worker stopped");
+                });
+                shared_taskman_worker_counts
+                    .insert(openplotva_taskman::AGENT_QWEN_QUEUE_NAME.to_owned(), 1);
+                workers.handles.push(agent_worker_handle);
+                readiness_checks.push(ReadinessCheck::ok(
+                    "agent_jobs",
+                    "Agent search worker started on the agent-qwen queue",
+                ));
+            }
+            None => {
+                readiness_checks.push(ReadinessCheck::skipped(
+                    "agent_jobs",
+                    "Agentic search enabled but Serper (web search) is not configured",
+                ));
+            }
         }
     }
     let memory_query_embedder = if dialog_memory_context_enabled(config) {

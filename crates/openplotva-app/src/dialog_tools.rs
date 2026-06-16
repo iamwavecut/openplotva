@@ -27,6 +27,7 @@ use serde_json::json;
 use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 
 use crate::{
+    agent_runtime::AgenticWebSearch,
     permissions::{ChatPermissionPolicy, ChatPermissionStore},
     rate_limits::TaskEnqueueRateLimit,
     rates::{RatesFetcher, RatesSideEffectDispatcher, currency_rates_tool},
@@ -1759,6 +1760,7 @@ pub struct AppDialogToolbox<RatesFetcherT, RatesDispatcherT, TranslatorT> {
     drawing_canceller: Option<Arc<dyn DrawingJobCanceller>>,
     web_searcher: Option<Arc<dyn WebSearchProvider>>,
     url_crawler: Option<Arc<dyn UrlCrawler>>,
+    agentic_search: Option<Arc<dyn AgenticWebSearch>>,
     youtube_summarizer: Option<Arc<dyn YouTubeSummarizer>>,
     image_scheduler: Option<Arc<dyn ImageScheduler>>,
     song_scheduler: Option<Arc<dyn SongScheduler>>,
@@ -1783,6 +1785,7 @@ impl<RatesFetcherT, RatesDispatcherT, TranslatorT>
             drawing_canceller: None,
             web_searcher: None,
             url_crawler: None,
+            agentic_search: None,
             youtube_summarizer: None,
             image_scheduler: None,
             song_scheduler: None,
@@ -1818,6 +1821,14 @@ impl<RatesFetcherT, RatesDispatcherT, TranslatorT>
     #[must_use]
     pub fn with_url_crawler(mut self, url_crawler: Arc<dyn UrlCrawler>) -> Self {
         self.url_crawler = Some(url_crawler);
+        self
+    }
+
+    /// When set, the `web_search` tool runs the search agent (multi-step research
+    /// returning a summary) instead of a single-pass search.
+    #[must_use]
+    pub fn with_agentic_search(mut self, agentic_search: Arc<dyn AgenticWebSearch>) -> Self {
+        self.agentic_search = Some(agentic_search);
         self
     }
 
@@ -1986,13 +1997,23 @@ where
 
     fn web_search<'a>(&'a self, query: String) -> ToolboxFuture<'a> {
         Box::pin(async move {
+            let query = sanitize_tool_text(&query);
+            // Prefer the search agent (multi-step research → summary). On failure,
+            // fall back to a single-pass search so the model still gets something.
+            if let Some(agent) = self.agentic_search.as_deref() {
+                match agent.search_summary(query.clone()).await {
+                    Ok(summary) => return Ok(dialog_web_search_tool_result(&query, &summary)),
+                    Err(error) => {
+                        tracing::warn!(%error, "agentic web_search failed; falling back to direct search");
+                    }
+                }
+            }
             let Some(searcher) = self.web_searcher.as_deref() else {
                 return Ok(ToolResult::failed(
                     "web_search_unavailable",
                     "search service unavailable",
                 ));
             };
-            let query = sanitize_tool_text(&query);
             match searcher.search(&query).await {
                 Ok(results) => Ok(dialog_web_search_tool_result(&query, &results)),
                 Err(error) => Ok(ToolResult::failed("web_search_failed", error.to_string())),
