@@ -152,6 +152,7 @@ impl AgentJobWorker {
             .finalize_answer(&profile, writer_provider.as_ref(), &state)
             .await;
         self.send_answer(&origin, &answer).await;
+        self.record_completion(job_id, &profile, &state, resume_count);
         let now = OffsetDateTime::now_utc();
         let _ = self.queue.complete(job_id, now);
         if resumed {
@@ -227,6 +228,41 @@ impl AgentJobWorker {
             i32::try_from(state.step_index).unwrap_or(i32::MAX),
             None,
         );
+    }
+
+    /// Emit a durable per-run summary event, visible through the existing taskman
+    /// job diagnostics. Provides agent metrics without a separate metrics store.
+    fn record_completion(
+        &self,
+        job_id: i64,
+        profile: &openplotva_agent::AgentProfile,
+        state: &AgentState,
+        resume_count: i32,
+    ) {
+        let finish_reason = match &state.outcome {
+            Some(AgentOutcome::Completed { .. }) => "completed".to_owned(),
+            Some(AgentOutcome::Stopped { reason, .. }) => format!("stopped:{}", reason.as_str()),
+            Some(AgentOutcome::Failed { .. }) => "failed".to_owned(),
+            None => "incomplete".to_owned(),
+        };
+        let wall_ms = now_unix_ms().saturating_sub(state.started_at_unix_ms);
+        let mut data = BTreeMap::new();
+        data.insert("profile".to_owned(), profile.id.clone());
+        data.insert("finish_reason".to_owned(), finish_reason);
+        data.insert("steps".to_owned(), state.step_index.to_string());
+        data.insert("tool_calls".to_owned(), state.tool_calls_made.to_string());
+        data.insert("tokens".to_owned(), state.tokens_spent.to_string());
+        data.insert("wall_ms".to_owned(), wall_ms.to_string());
+        data.insert("resume_count".to_owned(), resume_count.to_string());
+        let event = TaskQueueJobEvent {
+            stage: "agent_complete".to_owned(),
+            attempt: i32::try_from(state.step_index).unwrap_or(i32::MAX),
+            data,
+            ..TaskQueueJobEvent::default()
+        };
+        let _ = self
+            .queue
+            .append_job_event(job_id, event, OffsetDateTime::now_utc());
     }
 
     fn append_event(&self, job_id: i64, stage: &str, attempt: i32, error: Option<&str>) {
