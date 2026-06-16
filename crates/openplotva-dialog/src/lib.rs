@@ -364,6 +364,8 @@ pub const STEP_QUEUE_STATUS: &str = "queue_status";
 pub const STEP_CANCEL_DRAWING: &str = "cancel_drawing";
 pub const STEP_TRANSLATE_TEXT: &str = "translate_text";
 pub const STEP_CHAT_HISTORY_SUMMARY: &str = "chat_history_summary";
+pub const STEP_HISTORY_SEARCH: &str = "history_search";
+pub const STEP_MEMORY_SEARCH: &str = "memory_search";
 
 const ALL_STEPS: &[&str] = &[
     STEP_DRAW_IMAGE,
@@ -377,6 +379,8 @@ const ALL_STEPS: &[&str] = &[
     STEP_CANCEL_DRAWING,
     STEP_TRANSLATE_TEXT,
     STEP_CHAT_HISTORY_SUMMARY,
+    STEP_HISTORY_SEARCH,
+    STEP_MEMORY_SEARCH,
 ];
 
 const INLINE_TOOL_ARG_KEYS: &[&str] = &[
@@ -499,6 +503,18 @@ const CRAWL_URL_ARGS: &[ToolArgSpec] = &[ToolArgSpec {
     description: "Full URL to fetch.",
 }];
 
+const HISTORY_SEARCH_ARGS: &[ToolArgSpec] = &[ToolArgSpec {
+    name: "query",
+    required: true,
+    description: "Keywords to find relevant earlier messages in THIS chat's history.",
+}];
+
+const MEMORY_SEARCH_ARGS: &[ToolArgSpec] = &[ToolArgSpec {
+    name: "query",
+    required: true,
+    description: "What to recall from long-term memory about the user or chat.",
+}];
+
 const YOUTUBE_SUMMARY_ARGS: &[ToolArgSpec] = &[ToolArgSpec {
     name: "video",
     required: true,
@@ -590,6 +606,20 @@ const ALTERNATIVE_DIALOG_TOOL_CATALOG: &[ToolSpec] = &[
         args: CRAWL_URL_ARGS,
     },
     ToolSpec {
+        name: STEP_HISTORY_SEARCH,
+        summary: "Search earlier messages in THIS chat by keywords.",
+        when_to_use: "Use to ground on what was said before — recall references, in-jokes, decisions, names, or context the user implies from past conversation.",
+        result: "Returns matching past messages (sender, time, text).",
+        args: HISTORY_SEARCH_ARGS,
+    },
+    ToolSpec {
+        name: STEP_MEMORY_SEARCH,
+        summary: "Search long-term memory for facts about the user or chat.",
+        when_to_use: "Use to personalize or ground on durable facts (preferences, identity, ongoing topics) the bot has remembered.",
+        result: "Returns relevant remembered facts and recent episode summaries.",
+        args: MEMORY_SEARCH_ARGS,
+    },
+    ToolSpec {
         name: STEP_YOUTUBE_SUMMARY,
         summary: "Fetch a YouTube transcript and summary.",
         when_to_use: "Use when the latest user message asks to summarize, explain, or review a YouTube video.",
@@ -631,11 +661,17 @@ pub fn alternative_dialog_tools() -> Vec<ToolSpec> {
     ALTERNATIVE_DIALOG_TOOL_CATALOG.to_vec()
 }
 
+/// Tools exposed only to the reasoning agent (via an explicit allow-list), not to
+/// the conversational model. Kept in the catalog so the agent can resolve their
+/// schemas, but filtered out of the conversational tool list.
+pub const AGENT_ONLY_TOOL_NAMES: &[&str] = &[STEP_HISTORY_SEARCH, STEP_MEMORY_SEARCH];
+
 #[must_use]
 pub fn alternative_dialog_tool_names() -> Vec<&'static str> {
     ALTERNATIVE_DIALOG_TOOL_CATALOG
         .iter()
         .map(|spec| spec.name)
+        .filter(|name| !AGENT_ONLY_TOOL_NAMES.contains(name))
         .collect()
 }
 

@@ -9164,8 +9164,17 @@ async fn start_runtime_workers(
         serper_client.as_ref().map(|serper| {
             let web: Arc<dyn dialog_tools::WebSearchProvider> = serper.clone();
             let crawl: Arc<dyn dialog_tools::UrlCrawler> = serper.clone();
-            Arc::new(agent_runtime::AppAgentTools::new(web, crawl))
-                as Arc<dyn openplotva_agent::AgentTools>
+            let history_searcher: Arc<dyn agent_runtime::HistorySearcher> = Arc::new(
+                agent_runtime::PostgresHistorySearch::new(history_store.clone()),
+            );
+            let memory_searcher: Arc<dyn agent_runtime::MemorySearcher> = Arc::new(
+                agent_runtime::PostgresMemorySearch::new(memory_store.clone()),
+            );
+            Arc::new(
+                agent_runtime::AppAgentTools::new(web, crawl)
+                    .with_history_searcher(history_searcher)
+                    .with_memory_searcher(memory_searcher),
+            ) as Arc<dyn openplotva_agent::AgentTools>
         });
     // Inline agentic web_search: when enabled + Serper present, the conversational
     // web_search tool runs the research agent and returns a summary.

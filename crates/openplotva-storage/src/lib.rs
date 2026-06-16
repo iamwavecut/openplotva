@@ -658,6 +658,10 @@ pub const SQL_SELECT_RECENT_CHAT_HISTORY_ENTRY_PAYLOADS: &str = "SELECT payload:
 
 pub const SQL_SELECT_RECENT_THREAD_HISTORY_ENTRY_PAYLOADS: &str = "SELECT payload::text AS payload FROM chat_history_entries WHERE chat_id = $1 AND thread_id = $2 AND occurred_at > $3 ORDER BY occurred_at DESC, message_id DESC, CASE kind WHEN 'text' THEN 1 WHEN 'tool_request' THEN 2 WHEN 'tool_response' THEN 3 ELSE 4 END DESC, entry_id DESC LIMIT $4";
 
+/// Keyword (ILIKE) search over a chat's recent text history. Scoped by chat and
+/// optional thread; bounded by a time cutoff and a row limit so the scan stays cheap.
+pub const SQL_SEARCH_CHAT_HISTORY_ENTRY_PAYLOADS: &str = "SELECT payload::text AS payload FROM chat_history_entries WHERE chat_id = $1 AND occurred_at > $2 AND ($3::integer = 0 OR thread_id = $3) AND kind = 'text' AND payload::text ILIKE $4 ORDER BY occurred_at DESC, message_id DESC, entry_id DESC LIMIT $5";
+
 pub const SQL_ENSURE_CHAT_HISTORY_PARTITION: &str =
     "SELECT ensure_chat_history_partition($1::date)";
 
@@ -4001,6 +4005,30 @@ impl PostgresHistoryStore {
             .bind(chat_id)
             .bind(thread_id)
             .bind(cutoff)
+            .bind(limit_count.max(1))
+            .fetch_all(&self.pool)
+            .await?;
+        summary_payload_rows_to_bytes(rows)
+    }
+
+    /// Keyword-search a chat's recent text history (ILIKE), newest first.
+    pub async fn search_history_entries(
+        &self,
+        chat_id: i64,
+        thread_id: i32,
+        query: &str,
+        cutoff: OffsetDateTime,
+        limit_count: i32,
+    ) -> Result<Vec<Vec<u8>>, StorageError> {
+        if chat_id == 0 || query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let pattern = format!("%{}%", query.trim());
+        let rows = sqlx::query(SQL_SEARCH_CHAT_HISTORY_ENTRY_PAYLOADS)
+            .bind(chat_id)
+            .bind(cutoff)
+            .bind(thread_id)
+            .bind(pattern)
             .bind(limit_count.max(1))
             .fetch_all(&self.pool)
             .await?;

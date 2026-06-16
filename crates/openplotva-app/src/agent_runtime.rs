@@ -15,13 +15,17 @@ use openplotva_agent::{
 };
 use openplotva_config::AppConfig;
 use openplotva_dialog::{
-    NativeToolCall, STEP_CRAWL_URL, STEP_WEB_SEARCH, TOOL_RESULT_STATUS_OK, ToolContext,
-    ToolResult, ToolStep,
+    NativeToolCall, STEP_CRAWL_URL, STEP_HISTORY_SEARCH, STEP_MEMORY_SEARCH, STEP_WEB_SEARCH,
+    TOOL_RESULT_STATUS_OK, ToolContext, ToolResult, ToolStep,
 };
+use openplotva_history::{SummaryMessageEntry, decode_summary_message_entry_payloads};
 use openplotva_llm::aifarm::{
     AifarmHttpClient, ChatCompletionRequest, ChatMessage, CompletionResult, StatusUpdate,
 };
+use openplotva_memory::{RetrievalRequest, RetrievalScope, RetrievedMemory};
+use openplotva_storage::{PostgresHistoryStore, PostgresMemoryStore};
 use serde_json::{Value, json};
+use time::{Duration as TimeDuration, OffsetDateTime};
 
 use crate::dialog_tools::{UrlCrawler, WebSearchProvider};
 use crate::media::{agent_client_config_from_named_provider, aifarm_dialog_config_from_app_config};
@@ -207,7 +211,12 @@ impl SearchAgentSettings {
         AgentProfile {
             id: "search".to_owned(),
             system_prompt: self.system_prompt.clone(),
-            allowed_tools: vec![STEP_WEB_SEARCH.to_owned(), STEP_CRAWL_URL.to_owned()],
+            allowed_tools: vec![
+                STEP_WEB_SEARCH.to_owned(),
+                STEP_CRAWL_URL.to_owned(),
+                STEP_HISTORY_SEARCH.to_owned(),
+                STEP_MEMORY_SEARCH.to_owned(),
+            ],
             reasoner_model,
             writer_model,
             budgets: self.budgets,
@@ -274,13 +283,40 @@ pub async fn synthesize_answer(
     Ok(reply.text)
 }
 
-/// `AgentTools` adapter that calls the RAW Serper providers directly (not the
-/// dialog tool box). This keeps the agent loop independent of the conversational
-/// `web_search` tool — essential because that tool may itself be agentic, which
-/// would otherwise recurse. Transport failures become recoverable `ToolResult`s.
+/// Boxed future returned by the context-gathering searchers.
+pub type ContextSearchFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<String, AgentError>> + Send + 'a>>;
+
+/// Searches THIS chat's past messages for relevant context.
+pub trait HistorySearcher: Send + Sync {
+    fn search<'a>(
+        &'a self,
+        chat_id: i64,
+        thread_id: Option<i32>,
+        query: String,
+    ) -> ContextSearchFuture<'a>;
+}
+
+/// Searches long-term memory (facts/episodes) for relevant context.
+pub trait MemorySearcher: Send + Sync {
+    fn search<'a>(
+        &'a self,
+        chat_id: i64,
+        user_id: i64,
+        thread_id: Option<i32>,
+        query: String,
+    ) -> ContextSearchFuture<'a>;
+}
+
+/// `AgentTools` adapter that calls RAW providers directly (Serper, history,
+/// memory) — never the conversational dialog tools — so the agent loop is
+/// independent of the (possibly agentic) `web_search` tool and cannot recurse.
+/// Transport failures become recoverable `ToolResult`s.
 pub struct AppAgentTools {
     web_searcher: Arc<dyn WebSearchProvider>,
     url_crawler: Arc<dyn UrlCrawler>,
+    history_searcher: Option<Arc<dyn HistorySearcher>>,
+    memory_searcher: Option<Arc<dyn MemorySearcher>>,
 }
 
 impl AppAgentTools {
@@ -289,7 +325,21 @@ impl AppAgentTools {
         Self {
             web_searcher,
             url_crawler,
+            history_searcher: None,
+            memory_searcher: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_history_searcher(mut self, searcher: Arc<dyn HistorySearcher>) -> Self {
+        self.history_searcher = Some(searcher);
+        self
+    }
+
+    #[must_use]
+    pub fn with_memory_searcher(mut self, searcher: Arc<dyn MemorySearcher>) -> Self {
+        self.memory_searcher = Some(searcher);
+        self
     }
 }
 
@@ -303,7 +353,7 @@ fn ok_tool_result(message: String, data: Value) -> ToolResult {
 }
 
 impl AgentTools for AppAgentTools {
-    fn dispatch<'a>(&'a self, _ctx: ToolContext, step: ToolStep) -> ToolDispatchFuture<'a> {
+    fn dispatch<'a>(&'a self, ctx: ToolContext, step: ToolStep) -> ToolDispatchFuture<'a> {
         Box::pin(async move {
             let result = match step.step.as_str() {
                 STEP_WEB_SEARCH => {
@@ -320,6 +370,40 @@ impl AgentTools for AppAgentTools {
                         Err(error) => ToolResult::failed("crawl_url_failed", error.to_string()),
                     }
                 }
+                STEP_HISTORY_SEARCH => match &self.history_searcher {
+                    Some(searcher) => {
+                        match searcher
+                            .search(ctx.chat_id, ctx.thread_id, step.query.clone())
+                            .await
+                        {
+                            Ok(text) => ok_tool_result(text, json!({ "query": step.query })),
+                            Err(error) => {
+                                ToolResult::failed("history_search_failed", error.to_string())
+                            }
+                        }
+                    }
+                    None => ToolResult::failed(
+                        "history_search_unavailable",
+                        "history search is not configured",
+                    ),
+                },
+                STEP_MEMORY_SEARCH => match &self.memory_searcher {
+                    Some(searcher) => {
+                        match searcher
+                            .search(ctx.chat_id, ctx.user_id, ctx.thread_id, step.query.clone())
+                            .await
+                        {
+                            Ok(text) => ok_tool_result(text, json!({ "query": step.query })),
+                            Err(error) => {
+                                ToolResult::failed("memory_search_failed", error.to_string())
+                            }
+                        }
+                    }
+                    None => ToolResult::failed(
+                        "memory_search_unavailable",
+                        "memory search is not configured",
+                    ),
+                },
                 other => ToolResult::failed(
                     "tool_unsupported",
                     format!("agent tool `{other}` is not supported"),
@@ -327,6 +411,150 @@ impl AgentTools for AppAgentTools {
             };
             Ok(result)
         })
+    }
+}
+
+/// History searcher backed by `PostgresHistoryStore` (keyword ILIKE search).
+pub struct PostgresHistorySearch {
+    store: PostgresHistoryStore,
+    window_hours: i64,
+    limit: i32,
+}
+
+impl PostgresHistorySearch {
+    #[must_use]
+    pub fn new(store: PostgresHistoryStore) -> Self {
+        Self {
+            store,
+            window_hours: 24 * 30,
+            limit: 40,
+        }
+    }
+}
+
+impl HistorySearcher for PostgresHistorySearch {
+    fn search<'a>(
+        &'a self,
+        chat_id: i64,
+        thread_id: Option<i32>,
+        query: String,
+    ) -> ContextSearchFuture<'a> {
+        Box::pin(async move {
+            let cutoff = OffsetDateTime::now_utc() - TimeDuration::hours(self.window_hours);
+            let payloads = self
+                .store
+                .search_history_entries(chat_id, thread_id.unwrap_or(0), &query, cutoff, self.limit)
+                .await
+                .map_err(|error| AgentError::ToolDispatch(error.to_string()))?;
+            let entries = decode_summary_message_entry_payloads(&payloads)
+                .map_err(|error| AgentError::ToolDispatch(error.to_string()))?;
+            Ok(format_history_entries(&entries))
+        })
+    }
+}
+
+fn format_history_entries(entries: &[SummaryMessageEntry]) -> String {
+    let mut out = String::new();
+    for entry in entries {
+        let text = if entry.text.trim().is_empty() {
+            entry.original_text.trim()
+        } else {
+            entry.text.trim()
+        };
+        if text.is_empty() {
+            continue;
+        }
+        let who = entry
+            .from
+            .as_ref()
+            .map(|user| user.first_name.trim())
+            .filter(|name| !name.is_empty())
+            .unwrap_or(entry.role.as_str());
+        out.push_str(&format!("- {who}: {text}\n"));
+    }
+    if out.trim().is_empty() {
+        "No matching messages found in this chat's history.".to_owned()
+    } else {
+        out.trim_end().to_owned()
+    }
+}
+
+/// Memory searcher backed by `PostgresMemoryStore`. v1 uses lexical retrieval
+/// (no query embedding); the engine still ranks/merges results.
+pub struct PostgresMemorySearch {
+    store: PostgresMemoryStore,
+    card_limit: i32,
+    episode_limit: i32,
+}
+
+impl PostgresMemorySearch {
+    #[must_use]
+    pub fn new(store: PostgresMemoryStore) -> Self {
+        Self {
+            store,
+            card_limit: 12,
+            episode_limit: 2,
+        }
+    }
+}
+
+impl MemorySearcher for PostgresMemorySearch {
+    fn search<'a>(
+        &'a self,
+        chat_id: i64,
+        user_id: i64,
+        thread_id: Option<i32>,
+        query: String,
+    ) -> ContextSearchFuture<'a> {
+        Box::pin(async move {
+            let request = RetrievalRequest {
+                scope: RetrievalScope {
+                    chat_id,
+                    thread_id: thread_id.unwrap_or(0),
+                    user_id,
+                    chat_type: String::new(),
+                    username: String::new(),
+                    active_usernames: Vec::new(),
+                },
+                query,
+                card_limit: self.card_limit,
+                episode_limit: self.episode_limit,
+            };
+            let memory = self
+                .store
+                .retrieve_with_vector(&request, None)
+                .await
+                .map_err(|error| AgentError::ToolDispatch(error.to_string()))?;
+            Ok(format_memory(&memory))
+        })
+    }
+}
+
+fn format_memory(memory: &RetrievedMemory) -> String {
+    let mut out = String::new();
+    for card in &memory.cards {
+        if card.fact_text.trim().is_empty() {
+            continue;
+        }
+        out.push_str(&format!(
+            "- {} (confidence {:.2})\n",
+            card.fact_text.trim(),
+            card.confidence
+        ));
+    }
+    for episode in &memory.episodes {
+        if episode.summary_text.trim().is_empty() {
+            continue;
+        }
+        out.push_str(&format!(
+            "- (recent episode) {}\n",
+            episode.summary_text.trim()
+        ));
+    }
+    if out.trim().is_empty() {
+        "No relevant long-term memory found.".to_owned()
+    } else {
+        out.trim_end().to_owned()
     }
 }
 
