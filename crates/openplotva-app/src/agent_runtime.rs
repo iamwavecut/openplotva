@@ -41,11 +41,13 @@ pub const CONVERSATIONAL_PROVIDER: &str = "conversational";
 
 /// Default Discovery service the auto-registered `qwen-reasoner` provider targets.
 pub const DEFAULT_QWEN_SERVICE_NAME: &str = "llm-openai-qwen35b-gguf";
-/// Default model id sent to the qwen llama.cpp router. The router exposes this
-/// model under the `[model.qwen3.6-35b-a3b-reasoning]` section in `llamacpp.ini`;
-/// override via `LLM_PROVIDERS_MODELS`. (Underlying GGUF:
-/// Qwen3.6-35B-A3B-Claude-4.6-Opus-Reasoning-Distilled-UD-Q3_K_XL.)
-pub const DEFAULT_QWEN_MODEL: &str = "qwen3.6-35b-a3b-reasoning";
+/// Default model id sent to the qwen llama.cpp router (the Discovery service is
+/// still named `llm-openai-qwen35b-gguf` but now serves a 27B model). The router
+/// exposes this model under the `[model.qwen3.6-27b-moq]` section in
+/// `llamacpp.ini`; override via `LLM_PROVIDERS_MODELS`. (Underlying GGUF:
+/// Qwen3.6-27B, kaitchup MoQ-4.75 — higher bits-per-weight than the prior
+/// 35B-A3B Q3_K_XL at a comparable file size.)
+pub const DEFAULT_QWEN_MODEL: &str = "qwen3.6-27b-moq";
 
 /// Reasoner orchestration prompt for the search agent.
 pub const SEARCH_SYSTEM_PROMPT: &str =
