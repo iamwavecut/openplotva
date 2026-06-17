@@ -1709,17 +1709,23 @@ where
                 &caption_to_rich(&display_caption),
                 None,
             );
-            match effects
-                .edit_draw_message(chat_id, draw_message_id, gallery)
-                .await
+            match render_final_gallery(
+                effects,
+                chat_id,
+                draw_message_id,
+                params.message_id,
+                params.thread_id,
+                gallery,
+            )
+            .await
             {
-                Ok(()) => ImageGenJobExecutionReport {
+                Ok(final_message_id) => ImageGenJobExecutionReport {
                     outcome: ImageGenJobExecutionOutcome::Completed,
                     prompt,
                     caption_text,
                     image_url,
                     image_urls,
-                    result_message_id: Some(draw_message_id),
+                    result_message_id: Some(final_message_id),
                     error: None,
                 },
                 Err(error) => ImageGenJobExecutionReport {
@@ -1773,13 +1779,56 @@ where
 }
 
 /// Publish generated photos and replace the draw message with the final gallery.
+/// True when a Telegram edit failed because the target message no longer exists.
+fn draw_message_is_gone(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("message to edit not found")
+        || error.contains("message to edit was not found")
+        || error.contains("message can't be edited")
+}
+
+/// Render the finished gallery on `draw_message_id`; if that message was deleted mid-flight,
+/// re-send the gallery as a fresh message so the result is never lost silently. Returns the id
+/// of the message that now holds the gallery.
+async fn render_final_gallery<Effects>(
+    effects: &Effects,
+    chat_id: i64,
+    draw_message_id: i32,
+    reply_to_message_id: i32,
+    thread_id: Option<i32>,
+    gallery_html: String,
+) -> Result<i32, String>
+where
+    Effects: ImageJobEffects + Sync,
+{
+    match effects
+        .edit_draw_message(chat_id, draw_message_id, gallery_html.clone())
+        .await
+    {
+        Ok(()) => Ok(draw_message_id),
+        Err(error) if draw_message_is_gone(&error) => {
+            tracing::warn!(
+                chat_id,
+                draw_message_id,
+                "draw message was gone; re-sending the finished gallery as a new message"
+            );
+            effects
+                .send_draw_placeholder(chat_id, reply_to_message_id, thread_id, gallery_html)
+                .await
+        }
+        Err(error) => Err(error),
+    }
+}
+
 async fn deliver_draw_gallery<Effects>(
     effects: &Effects,
     chat_id: i64,
     draw_message_id: i32,
+    reply_to_message_id: i32,
+    thread_id: Option<i32>,
     photos: Vec<PhotoSource>,
     display_caption: &str,
-) -> Result<(), String>
+) -> Result<i32, String>
 where
     Effects: ImageJobEffects + Sync,
 {
@@ -1788,33 +1837,32 @@ where
         return Err("no images were published".to_owned());
     }
     let gallery = crate::rich::compose_gallery(&urls, &caption_to_rich(display_caption), None);
-    effects
-        .edit_draw_message(chat_id, draw_message_id, gallery)
-        .await
+    render_final_gallery(
+        effects,
+        chat_id,
+        draw_message_id,
+        reply_to_message_id,
+        thread_id,
+        gallery,
+    )
+    .await
 }
 
-/// Decide how the queue placeholder becomes the draw target: reuse it in place when the chat
-/// is still quiet (few messages since it was posted), otherwise delete it and return `None` so
-/// the worker posts a fresh message that surfaces near the bottom of the chat.
+/// Reuse the queue placeholder in place as the draw target.
+///
+/// The placeholder is the message we later edit to show progress, the final gallery, or an
+/// error. Deleting a not-yet-finished placeholder (which is what the old "chat moved on" branch
+/// did) lost the draw silently, because the very message used to surface the result/error was
+/// gone. So we never delete an in-flight placeholder; we always reuse it.
 async fn draw_placeholder_reuse_target<Effects>(
-    effects: &Effects,
-    chat_id: i64,
+    _effects: &Effects,
+    _chat_id: i64,
     queue_position_message_id: Option<i32>,
 ) -> Option<i32>
 where
     Effects: ImageJobEffects + Sync,
 {
-    let placeholder = queue_position_message_id.filter(|id| *id > 0)?;
-    let quiet = effects
-        .chat_messages_after(chat_id, placeholder)
-        .await
-        .map_or(true, |count| count <= DRAW_PLACEHOLDER_REUSE_MAX_MESSAGES);
-    if quiet {
-        Some(placeholder)
-    } else {
-        effects.delete_message(chat_id, placeholder).await;
-        None
-    }
+    queue_position_message_id.filter(|id| *id > 0)
 }
 
 #[must_use]
@@ -1916,16 +1964,18 @@ where
                 effects,
                 params.chat_id,
                 draw_message_id,
+                params.message_id,
+                params.thread_id,
                 photos,
                 &display_caption,
             )
             .await
             {
-                Ok(()) => ImageEditJobExecutionReport {
+                Ok(final_message_id) => ImageEditJobExecutionReport {
                     outcome: ImageEditJobExecutionOutcome::Completed,
                     prompt: params.prompt,
                     image_urls,
-                    result_message_id: Some(draw_message_id),
+                    result_message_id: Some(final_message_id),
                     error: None,
                 },
                 Err(error) => ImageEditJobExecutionReport {
@@ -3590,6 +3640,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_image_edit_job_resends_gallery_when_draw_message_was_deleted() {
+        let editor = EditorStub::success(vec!["https://img.test/edit-1.png".to_owned()]);
+        // The draw message vanished mid-flight, so every edit returns "message to edit not found".
+        let effects = EffectsStub::with_edit_error("Bad Request: message to edit not found");
+        let report = execute_image_edit_job(
+            &editor,
+            &effects,
+            ImageEditJobParams {
+                chat_id: -100,
+                message_id: 20,
+                user_id: 30,
+                user_full_name: "Alice".to_owned(),
+                prompt: "make it night".to_owned(),
+                photo_file_id: "photo-file".to_owned(),
+                photo_urls: vec!["https://telegram.test/original.png".to_owned()],
+                thread_id: Some(9),
+            },
+            None,
+        )
+        .await;
+
+        // The finished draw must never be lost silently: it is re-sent as a fresh message.
+        assert_eq!(report.outcome, ImageEditJobExecutionOutcome::Completed);
+        assert_eq!(report.result_message_id, Some(888));
+        let calls = effects.calls();
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.starts_with("placeholder:-100:20:9:")
+                    && call.contains("<img src=\"https://img.test/edit-1.png\"/>")),
+            "gallery must be re-sent as a new message replying to the trigger: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn execute_image_edit_job_completes_safety_blocks() {
         let editor = EditorStub::forbidden();
         let effects = EffectsStub::new();
@@ -4020,12 +4105,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn image_gen_queue_worker_deletes_placeholder_when_chat_is_busy() {
+    async fn image_gen_queue_worker_reuses_placeholder_even_when_chat_is_busy() {
         let queue = InMemoryTaskQueue::new();
         let now = OffsetDateTime::from_unix_timestamp(1_779_193_800).expect("time");
         draw_reuse_test_job(&queue, now);
 
-        // More than the threshold of messages since the placeholder → delete it, post fresh.
+        // Even when the chat moved on, the not-yet-finished placeholder must NOT be deleted:
+        // the message we edit to show the result is the same one. Reuse it in place.
         let effects =
             EffectsStub::with_chat_messages_after(DRAW_PLACEHOLDER_REUSE_MAX_MESSAGES + 1);
         let report = run_image_gen_queue_once(
@@ -4040,14 +4126,17 @@ mod tests {
         assert_eq!(report.outcome, ImageGenQueuePollOutcome::Completed);
 
         let calls = effects.calls();
-        assert_eq!(calls.len(), 4);
-        assert_eq!(calls[0], "delete:-100:701");
-        assert_eq!(
-            calls[1],
-            "placeholder:-100:20:0:<tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji>"
+        assert!(
+            !calls.iter().any(|call| call.starts_with("delete:")),
+            "must not delete an in-flight placeholder: {calls:?}"
         );
-        assert_eq!(calls[2], "publish:[Url(\"https://img.test/1.png\")]");
-        assert!(calls[3].starts_with("edit:-100:888:"));
+        assert_eq!(calls.len(), 3);
+        assert_eq!(
+            calls[0],
+            "edit:-100:701:<tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji>"
+        );
+        assert_eq!(calls[1], "publish:[Url(\"https://img.test/1.png\")]");
+        assert!(calls[2].starts_with("edit:-100:701:"));
     }
 
     #[tokio::test]
@@ -5441,6 +5530,7 @@ mod tests {
     struct EffectsStub {
         calls: Mutex<Vec<String>>,
         chat_messages_after: Option<i64>,
+        edit_error: Option<String>,
     }
 
     impl EffectsStub {
@@ -5451,6 +5541,13 @@ mod tests {
         fn with_chat_messages_after(count: i64) -> Self {
             Self {
                 chat_messages_after: Some(count),
+                ..Self::default()
+            }
+        }
+
+        fn with_edit_error(error: impl Into<String>) -> Self {
+            Self {
+                edit_error: Some(error.into()),
                 ..Self::default()
             }
         }
@@ -5506,7 +5603,11 @@ mod tests {
         ) -> ImageJobEffectFuture<'a, Result<(), String>> {
             self.call_log()
                 .push(format!("edit:{chat_id}:{draw_message_id}:{html}"));
-            Box::pin(async { Ok(()) })
+            let result = match &self.edit_error {
+                Some(error) => Err(error.clone()),
+                None => Ok(()),
+            };
+            Box::pin(async move { result })
         }
 
         fn publish_draw_images<'a>(
