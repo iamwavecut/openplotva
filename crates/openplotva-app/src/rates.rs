@@ -1708,10 +1708,7 @@ fn user_full_name(user: &TelegramUser) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::updates::{
-        TelegramFileMetadataStoreFuture, UpdateHandler, UpdateHandlerFuture, UpdateStateStore,
-        UpdateStateStoreFuture,
-    };
+    use crate::updates::{UpdateHandler, UpdateHandlerFuture};
     use serde_json::json;
     use std::{
         io::{self, Read, Write},
@@ -2194,71 +2191,6 @@ mod tests {
             value["message_thread_id"] = json!(9);
         }
         serde_json::from_value(value)
-    }
-
-    #[derive(Clone, Default)]
-    struct UpdateStateStoreStub {
-        calls: Arc<Mutex<Vec<String>>>,
-    }
-
-    impl UpdateStateStoreStub {
-        fn calls(&self) -> Vec<String> {
-            self.calls.lock().expect("state calls").clone()
-        }
-    }
-
-    impl UpdateStateStore for UpdateStateStoreStub {
-        type Error = io::Error;
-
-        fn upsert_chat_state<'a>(
-            &'a self,
-            chat: &'a openplotva_core::ChatState,
-        ) -> UpdateStateStoreFuture<'a, Self::Error> {
-            Box::pin(async move {
-                self.calls
-                    .lock()
-                    .map_err(|err| io::Error::other(err.to_string()))?
-                    .push(format!(
-                        "chat:{}:{}:{}:{}",
-                        chat.id,
-                        chat.chat_type,
-                        chat.first_name.as_deref().unwrap_or_default(),
-                        chat.username.as_deref().unwrap_or_default()
-                    ));
-                Ok(())
-            })
-        }
-
-        fn upsert_user_state<'a>(
-            &'a self,
-            user: &'a openplotva_core::UserState,
-        ) -> UpdateStateStoreFuture<'a, Self::Error> {
-            Box::pin(async move {
-                self.calls
-                    .lock()
-                    .map_err(|err| io::Error::other(err.to_string()))?
-                    .push(format!(
-                        "user:{}:{}:{}",
-                        user.id,
-                        user.first_name,
-                        user.username.as_deref().unwrap_or_default()
-                    ));
-                Ok(())
-            })
-        }
-
-        fn upsert_telegram_file_metadata<'a>(
-            &'a self,
-            params: &'a openplotva_storage::TelegramFileMetadataUpsert,
-        ) -> TelegramFileMetadataStoreFuture<'a, Self::Error> {
-            Box::pin(async move {
-                self.calls
-                    .lock()
-                    .map_err(|err| io::Error::other(err.to_string()))?
-                    .push(format!("file:{}", params.file_unique_id));
-                Ok(())
-            })
-        }
     }
 
     fn tool_context() -> ToolContext {

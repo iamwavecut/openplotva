@@ -7163,7 +7163,7 @@ mod tests {
     impl DialogToolbox for FakeToolbox {
         fn currency_rates<'a>(
             &'a self,
-            _meta: ToolContext,
+            _meta: RatesRequest,
         ) -> openplotva_dialog::ToolboxFuture<'a> {
             let result = self.record(STEP_CURRENCY_RATES);
             Box::pin(async move { result })
