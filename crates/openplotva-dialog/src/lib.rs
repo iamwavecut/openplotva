@@ -243,6 +243,15 @@ pub struct VisionRequest {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct RatesRequest {
+    /// Tool context.
+    pub context: ToolContext,
+    /// Optional requested rate pairs/symbols, comma or space separated.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub pairs: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct HistorySummaryRequest {
     /// Tool context.
     pub context: ToolContext,
@@ -294,7 +303,7 @@ pub type ToolboxFuture<'a> =
 
 pub trait DialogToolbox: Send + Sync {
     /// Currency rates tool.
-    fn currency_rates<'a>(&'a self, _meta: ToolContext) -> ToolboxFuture<'a> {
+    fn currency_rates<'a>(&'a self, _req: RatesRequest) -> ToolboxFuture<'a> {
         unsupported_tool_future("currency_rates")
     }
 
@@ -491,6 +500,12 @@ const VISION_IMAGE_ARGS: &[ToolArgSpec] = &[ToolArgSpec {
     description: "Image attachment handle from attachments, for example message_123_image_1. Prefer the handle over opaque Telegram file_unique_id values. Omit only when the latest message has exactly one image.",
 }];
 
+const CURRENCY_RATES_ARGS: &[ToolArgSpec] = &[ToolArgSpec {
+    name: "pairs",
+    required: false,
+    description: "Optional comma-separated known pairs or symbols, for example USD/RUB, BTC/USD, gold, Brent. Omit for the default set.",
+}];
+
 const WEB_SEARCH_ARGS: &[ToolArgSpec] = &[ToolArgSpec {
     name: "query",
     required: true,
@@ -589,7 +604,7 @@ const ALTERNATIVE_DIALOG_TOOL_CATALOG: &[ToolSpec] = &[
         summary: "Fetch current fiat and crypto exchange rates.",
         when_to_use: "Use when the latest user message asks about exchange rates or recent currency movement.",
         result: "Returns fresh rate data and may queue a rates side-effect message.",
-        args: &[],
+        args: CURRENCY_RATES_ARGS,
     },
     ToolSpec {
         name: STEP_WEB_SEARCH,
@@ -951,6 +966,9 @@ pub struct ToolStep {
     /// YouTube URL or ID.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub video: String,
+    /// Optional requested currency/market pairs.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub pairs: String,
     /// Text to translate.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub text: String,
@@ -1761,6 +1779,9 @@ fn populate_tool_args(mut lookup: impl FnMut(&str) -> Option<String>, step: &mut
     if let Some(value) = lookup("video") {
         step.video = value;
     }
+    if let Some(value) = lookup("pairs") {
+        step.pairs = value;
+    }
     if let Some(value) = lookup("text") {
         step.text = value;
     }
@@ -1989,6 +2010,7 @@ fn step_contains_protocol_sentinel_argument(step: &ToolStep) -> bool {
         step.query.as_str(),
         step.url.as_str(),
         step.video.as_str(),
+        step.pairs.as_str(),
         step.text.as_str(),
         step.target_lang.as_str(),
         step.window.as_str(),
@@ -2082,6 +2104,22 @@ mod tests {
                 .iter()
                 .all(|tool| tool.function.name != "final_response")
         );
+    }
+
+    #[test]
+    fn currency_rates_tool_accepts_optional_pairs() -> Result<(), ToolParseError> {
+        let tools = chat_completion_tools_for_names(&[STEP_CURRENCY_RATES]);
+        let rates = tools.first().expect("rates tool");
+        assert!(rates.function.parameters["properties"]["pairs"].is_object());
+        assert!(rates.function.parameters.get("required").is_none());
+
+        let (step, decision) =
+            extract_content_tool_step(r#"<tool_call>currency_rates{pairs:"btc eth"}</tool_call>"#)?;
+        let step = step.expect("rates tool step");
+        assert_eq!(decision.outcome, "detected");
+        assert_eq!(step.step, STEP_CURRENCY_RATES);
+        assert_eq!(step.pairs, "btc eth");
+        Ok(())
     }
 
     #[test]

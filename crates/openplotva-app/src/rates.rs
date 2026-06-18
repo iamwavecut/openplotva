@@ -6,7 +6,7 @@ use std::{
     future::Future,
     pin::Pin,
     sync::Arc,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 use carapax::types::{
@@ -21,13 +21,11 @@ use openplotva_telegram::{
     ChatRef, DispatcherQueue, OutboundBuildError, ReplyMessageRef, TELEGRAM_PARSE_MODE_HTML,
     TextMessageRequest,
 };
-use reqwest::header::{
-    ACCEPT, ACCEPT_LANGUAGE, CACHE_CONTROL, HeaderMap, HeaderName, HeaderValue, PRAGMA, REFERER,
-    USER_AGENT,
-};
+use reqwest::header::USER_AGENT;
 use serde::Deserialize;
 use serde_json::json;
 use thiserror::Error;
+use time::format_description::well_known::Rfc3339;
 use tokio::sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock};
 
 use crate::updates::{UpdateHandler, UpdateHandlerFuture};
@@ -36,27 +34,34 @@ use crate::virtual_messages::{
     queue_text_message_parts,
 };
 
-const RATES_UNAVAILABLE_TEXT: &str = "❌ Сервис курсов временно недоступен (RBC не настроен)";
+const RATES_UNAVAILABLE_TEXT: &str = "❌ Сервис курсов временно недоступен";
 const RATES_FETCH_ERRORS_PREFIX: &str = "❌ Ошибки получения курсов:\n";
 pub const RATES_MESSAGE_KIND: &str = "rates_message";
 const RATES_TOOL_MODE_MULTI_TURN: &str = "multi_turn";
 const RATES_TOOL_MODE_LEGACY: &str = "legacy";
-const RBC_CACHE_TTL: Duration = Duration::from_secs(180);
-const RBC_DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
-const RBC_KEY_INDICATORS_URL_PREFIX: &str =
-    "https://www.rbc.ru/quote/ajax/key-indicator-update/?_=";
-const RBC_REFERER: &str = "https://www.rbc.ru/quote/ticker/338247";
-const RBC_HTTP_USER_AGENT: &str = "OpenPlotva/0.1";
-const RBC_CB_SUBNAME: &str = "ЦБ";
-const RBC_TICKER_CNYRUB: &str = "CNYRUB";
-const RBC_CURRENCY_USD: &str = "USD";
-const RBC_CURRENCY_EUR: &str = "EUR";
+const MARKET_RATES_YAHOO_TTL: Duration = Duration::from_secs(5 * 60);
+const MARKET_RATES_DAILY_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+const MARKET_RATES_DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
+const MARKET_RATES_USER_AGENT: &str = "OpenPlotva/0.1";
+const YAHOO_CHART_BASE_URL: &str = "https://query1.finance.yahoo.com/v8/finance/chart";
+const CBR_DAILY_XML_URL: &str = "https://www.cbr.ru/scripts/XML_daily.asp";
+const FRANKFURTER_RATES_URL: &str = "https://api.frankfurter.dev/v2/rates";
+const FRED_CSV_BASE_URL: &str = "https://fred.stlouisfed.org/graph/fredgraph.csv";
 
-/// Boxed future returned by rates daily-close providers.
-pub type RatesDailyFuture<'a, E> = Pin<Box<dyn Future<Output = Result<(f64, f64), E>> + Send + 'a>>;
+const RATE_ID_USD_RUB: &str = "usd_rub";
+const RATE_ID_EUR_RUB: &str = "eur_rub";
+const RATE_ID_EUR_USD: &str = "eur_usd";
+const RATE_ID_BTC_USD: &str = "btc_usd";
+const DEFAULT_RATE_IDS: &[&str] = &[
+    RATE_ID_USD_RUB,
+    RATE_ID_EUR_RUB,
+    RATE_ID_EUR_USD,
+    RATE_ID_BTC_USD,
+];
 
-/// Boxed future returned by rates spot providers.
-pub type RatesSpotFuture<'a, E> = Pin<Box<dyn Future<Output = Result<f64, E>> + Send + 'a>>;
+/// Boxed future returned by rates providers.
+pub type RatesFetchFuture<'a, E> =
+    Pin<Box<dyn Future<Output = Result<RatesSnapshot, E>> + Send + 'a>>;
 
 /// Boxed future returned by rates text side effects.
 pub type RatesEffectFuture<'a, E> = Pin<Box<dyn Future<Output = Result<(), E>> + Send + 'a>>;
@@ -69,547 +74,881 @@ pub trait RatesFetcher {
     /// Error returned by the provider.
     type Error: fmt::Display + Send + Sync + 'static;
 
-    /// Return current and previous daily closes for a fiat pair.
-    fn fx_daily_last_two_closes<'a>(
-        &'a self,
-        from: &'static str,
-        to: &'static str,
-    ) -> RatesDailyFuture<'a, Self::Error>;
-
-    /// Return latest spot exchange rate for a currency pair.
-    fn currency_exchange_rate<'a>(
-        &'a self,
-        from: &'static str,
-        to: &'static str,
-    ) -> RatesSpotFuture<'a, Self::Error>;
+    /// Return requested market-rate rows.
+    fn fetch_rates<'a>(&'a self, selection: RatesSelection) -> RatesFetchFuture<'a, Self::Error>;
 }
 
 #[derive(Clone)]
-pub struct RbcRatesClient {
+pub struct MarketRatesClient {
     http: reqwest::Client,
-    key_indicators_url_prefix: Arc<str>,
-    cache: Arc<AsyncRwLock<RbcRatesCache>>,
-    last_refresh: Arc<AsyncMutex<Option<Instant>>>,
+    urls: MarketRateUrls,
+    cache: Arc<AsyncRwLock<MarketRatesCache>>,
+    // ponytail: one global refresh lock is enough for this low-QPS command; split per URL if rates become hot.
+    refresh_lock: Arc<AsyncMutex<()>>,
 }
 
-impl RbcRatesClient {
-    pub fn from_timeout_seconds(timeout_seconds: i32) -> Result<Self, RbcRatesError> {
+impl MarketRatesClient {
+    pub fn from_timeout_seconds(timeout_seconds: i32) -> Result<Self, MarketRatesError> {
         let timeout = if timeout_seconds > 0 {
             Duration::from_secs(timeout_seconds as u64)
         } else {
-            RBC_DEFAULT_TIMEOUT
+            MARKET_RATES_DEFAULT_TIMEOUT
         };
         let http = reqwest::Client::builder()
             .timeout(timeout)
             .build()
-            .map_err(RbcRatesError::HttpClient)?;
+            .map_err(MarketRatesError::HttpClient)?;
         Ok(Self {
             http,
-            key_indicators_url_prefix: Arc::from(RBC_KEY_INDICATORS_URL_PREFIX),
-            cache: Arc::new(AsyncRwLock::new(RbcRatesCache::new(RBC_CACHE_TTL))),
-            last_refresh: Arc::new(AsyncMutex::new(None)),
+            urls: MarketRateUrls::default(),
+            cache: Arc::new(AsyncRwLock::new(MarketRatesCache::default())),
+            refresh_lock: Arc::new(AsyncMutex::new(())),
         })
     }
 
-    /// Build an RBC client from the app config.
-    pub fn from_config(config: &openplotva_config::RbcConfig) -> Result<Self, RbcRatesError> {
+    /// Build a market-rates client from the app config.
+    pub fn from_config(
+        config: &openplotva_config::MarketRatesConfig,
+    ) -> Result<Self, MarketRatesError> {
         Self::from_timeout_seconds(config.timeout_seconds)
     }
 
-    async fn fetch_fx_daily_last_two_closes(
+    async fn fetch_selection(
         &self,
-        from: &str,
-        to: &str,
-    ) -> Result<(f64, f64), RbcRatesError> {
-        let ticker = format!("{from}{to}");
-        if let Some((last, prev)) = self.cached_both(&ticker).await {
-            return Ok((last, prev));
+        selection: RatesSelection,
+    ) -> Result<RatesSnapshot, MarketRatesError> {
+        let mut snapshot = RatesSnapshot::default();
+        for unknown in selection.unknown {
+            snapshot.errors.push(RatesFetchProblem {
+                label: unknown,
+                message: "unknown rate alias".to_owned(),
+            });
         }
-        if let Some((last, prev)) = self.cross_both(from, to).await {
-            return Ok((last, prev));
+        for id in selection.ids {
+            let Some(instrument) = rate_instrument(&id) else {
+                snapshot.errors.push(RatesFetchProblem {
+                    label: id,
+                    message: "unknown rate id".to_owned(),
+                });
+                continue;
+            };
+            match self.fetch_instrument(instrument).await {
+                Ok(row) => snapshot.rows.push(row),
+                Err(error) => snapshot.errors.push(RatesFetchProblem {
+                    label: instrument.label.to_owned(),
+                    message: error.to_string(),
+                }),
+            }
         }
-        if let Some(stale) = self.stale_ticker(&ticker).await {
-            return Ok((stale.last_price, stale.prev_price));
-        }
-        Err(RbcRatesError::RateNotFound)
+        Ok(snapshot)
     }
 
-    async fn fetch_currency_exchange_rate(
+    async fn fetch_instrument(
         &self,
-        from: &str,
-        to: &str,
-    ) -> Result<f64, RbcRatesError> {
-        let ticker = format!("{from}{to}");
-        if let Some(rate) = self.cached_rate(&ticker).await {
-            return Ok(rate);
-        }
-        if let Some(rate) = self.cross_rate(from, to).await {
-            return Ok(rate);
-        }
-        if let Some(stale) = self.stale_ticker(&ticker).await {
-            return Ok(stale.last_price);
-        }
-        Err(RbcRatesError::RateNotFound)
-    }
-
-    async fn cached_rate(&self, ticker: &str) -> Option<f64> {
-        if let Some(data) = self.fresh_ticker(ticker).await {
-            return Some(data.last_price);
-        }
-        let _ = self.refresh_if_needed().await;
-        if let Some(data) = self.fresh_ticker(ticker).await {
-            return Some(data.last_price);
-        }
-        let cb_ticker = format!("{ticker}_CB");
-        self.fresh_ticker(&cb_ticker)
-            .await
-            .map(|data| data.last_price)
-    }
-
-    async fn cached_both(&self, ticker: &str) -> Option<(f64, f64)> {
-        if let Some(data) = self.fresh_ticker(ticker).await {
-            return Some((data.last_price, data.prev_price));
-        }
-        let _ = self.refresh_if_needed().await;
-        if let Some(data) = self.fresh_ticker(ticker).await {
-            return Some((data.last_price, data.prev_price));
-        }
-        let cb_ticker = format!("{ticker}_CB");
-        self.fresh_ticker(&cb_ticker)
-            .await
-            .map(|data| (data.last_price, data.prev_price))
-    }
-
-    async fn cross_rate(&self, from: &str, to: &str) -> Option<f64> {
-        match (from, to) {
-            (RBC_CURRENCY_EUR, RBC_CURRENCY_USD) => self.eur_usd_rate().await,
-            (RBC_CURRENCY_USD, RBC_CURRENCY_EUR) => {
-                let eur_usd = self.eur_usd_rate_for_inverse().await?;
-                inverse(eur_usd)
+        instrument: RateInstrument,
+    ) -> Result<RateQuote, MarketRatesError> {
+        if let Some(symbol) = instrument.yahoo_symbol {
+            match self.fetch_yahoo_quote(instrument, symbol).await {
+                Ok(row) => return Ok(row),
+                Err(yahoo_error) => {
+                    if let Some(series) = instrument.fred_series {
+                        return self.fetch_fred_quote(instrument, series).await;
+                    }
+                    if instrument.cbr_code.is_some() {
+                        return self.fetch_cbr_quote(instrument).await;
+                    }
+                    if let Some((base, quote)) = instrument.frankfurter_pair {
+                        return self.fetch_frankfurter_quote(instrument, base, quote).await;
+                    }
+                    return Err(yahoo_error);
+                }
             }
-            _ => None,
         }
+        if instrument.cbr_code.is_some() {
+            return self.fetch_cbr_quote(instrument).await;
+        }
+        if let Some((base, quote)) = instrument.frankfurter_pair {
+            return self.fetch_frankfurter_quote(instrument, base, quote).await;
+        }
+        Err(MarketRatesError::RateNotFound)
     }
 
-    async fn cross_both(&self, from: &str, to: &str) -> Option<(f64, f64)> {
-        match (from, to) {
-            (RBC_CURRENCY_EUR, RBC_CURRENCY_USD) => self.eur_usd_both().await,
-            (RBC_CURRENCY_USD, RBC_CURRENCY_EUR) => {
-                let (last, prev) = self.eur_usd_both_for_inverse().await?;
-                inverse_both(last, prev)
+    async fn fetch_yahoo_quote(
+        &self,
+        instrument: RateInstrument,
+        symbol: &str,
+    ) -> Result<RateQuote, MarketRatesError> {
+        let url = self.urls.yahoo_chart_url(symbol);
+        let (body, stale) = self.fetch_bytes(&url, MARKET_RATES_YAHOO_TTL).await?;
+        let response: YahooChartResponse = serde_json::from_slice(&body)
+            .map_err(|error| MarketRatesError::Decode(error.to_string()))?;
+        let chart = response.chart;
+        if let Some(error) = chart.error {
+            return Err(MarketRatesError::Source(error.to_string()));
+        }
+        let result = chart
+            .result
+            .and_then(|mut results| results.drain(..).next())
+            .ok_or(MarketRatesError::RateNotFound)?;
+        let meta = result.meta;
+        let closes = result
+            .indicators
+            .and_then(|indicators| indicators.quote)
+            .and_then(|mut quotes| quotes.drain(..).next())
+            .and_then(|quote| quote.close)
+            .unwrap_or_default()
+            .into_iter()
+            .flatten()
+            .filter(|value| value.is_finite())
+            .collect::<Vec<_>>();
+        let price = first_market_number([meta.regular_market_price, closes.last().copied()])
+            .ok_or(MarketRatesError::RateNotFound)?;
+        let range_start = first_market_number([closes.first().copied(), meta.chart_previous_close]);
+        let mut delta = range_start.and_then(|start| rate_delta(price, start, RateDeltaBasis::Day));
+        if delta.is_none()
+            && instrument.kind == RateInstrumentKind::ForexRub
+            && let Some(code) = instrument.cbr_code
+            && let Ok(cbr) = self.cbr_rate(code).await
+        {
+            delta = rate_delta(price, cbr.value, RateDeltaBasis::CbrOfficial);
+        }
+        Ok(RateQuote {
+            id: instrument.id.to_owned(),
+            label: instrument.label.to_owned(),
+            value: price,
+            precision: instrument.precision,
+            unit: instrument.unit.to_owned(),
+            delta,
+            source: "yahoo_chart".to_owned(),
+            timestamp: first_market_timestamp(meta.regular_market_time, result.timestamp),
+            stale,
+        })
+    }
+
+    async fn fetch_cbr_quote(
+        &self,
+        instrument: RateInstrument,
+    ) -> Result<RateQuote, MarketRatesError> {
+        let code = instrument.cbr_code.ok_or(MarketRatesError::RateNotFound)?;
+        let cbr = self.cbr_rate(code).await?;
+        Ok(RateQuote {
+            id: instrument.id.to_owned(),
+            label: instrument.label.to_owned(),
+            value: cbr.value,
+            precision: instrument.precision,
+            unit: instrument.unit.to_owned(),
+            delta: None,
+            source: "cbr".to_owned(),
+            timestamp: cbr.date,
+            stale: cbr.stale,
+        })
+    }
+
+    async fn fetch_frankfurter_quote(
+        &self,
+        instrument: RateInstrument,
+        base: &str,
+        quote: &str,
+    ) -> Result<RateQuote, MarketRatesError> {
+        let url = self.urls.frankfurter_url(base, quote);
+        let (body, stale) = self.fetch_bytes(&url, MARKET_RATES_DAILY_TTL).await?;
+        let value: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| MarketRatesError::Decode(error.to_string()))?;
+        let rate = frankfurter_rate(&value, quote).ok_or(MarketRatesError::RateNotFound)?;
+        Ok(RateQuote {
+            id: instrument.id.to_owned(),
+            label: instrument.label.to_owned(),
+            value: rate,
+            precision: instrument.precision,
+            unit: instrument.unit.to_owned(),
+            delta: None,
+            source: "frankfurter".to_owned(),
+            timestamp: frankfurter_date(&value),
+            stale,
+        })
+    }
+
+    async fn fetch_fred_quote(
+        &self,
+        instrument: RateInstrument,
+        series: &str,
+    ) -> Result<RateQuote, MarketRatesError> {
+        let url = self.urls.fred_url(series);
+        let (body, stale) = self.fetch_bytes(&url, MARKET_RATES_DAILY_TTL).await?;
+        let text =
+            String::from_utf8(body).map_err(|error| MarketRatesError::Decode(error.to_string()))?;
+        let (value, previous, date) = fred_last_two(&text, series)?;
+        Ok(RateQuote {
+            id: instrument.id.to_owned(),
+            label: instrument.label.to_owned(),
+            value,
+            precision: instrument.precision,
+            unit: instrument.unit.to_owned(),
+            delta: previous.and_then(|prev| rate_delta(value, prev, RateDeltaBasis::Day)),
+            source: "fred".to_owned(),
+            timestamp: date,
+            stale,
+        })
+    }
+
+    async fn cbr_rate(&self, code: &str) -> Result<CbrRate, MarketRatesError> {
+        let (body, stale) = self
+            .fetch_bytes(&self.urls.cbr_xml_url, MARKET_RATES_DAILY_TTL)
+            .await?;
+        let text =
+            String::from_utf8(body).map_err(|error| MarketRatesError::Decode(error.to_string()))?;
+        let parsed: CbrValCurs = quick_xml::de::from_str(&text)
+            .map_err(|error| MarketRatesError::Decode(error.to_string()))?;
+        parsed
+            .valutes
+            .into_iter()
+            .find(|item| item.char_code.eq_ignore_ascii_case(code))
+            .and_then(|item| item.rate(parsed.date.clone(), stale))
+            .ok_or(MarketRatesError::RateNotFound)
+    }
+
+    async fn fetch_bytes(
+        &self,
+        url: &str,
+        ttl: Duration,
+    ) -> Result<(Vec<u8>, bool), MarketRatesError> {
+        if let Some(body) = self.cache.read().await.fresh(url, ttl) {
+            return Ok((body, false));
+        }
+        let _guard = self.refresh_lock.lock().await;
+        if let Some(body) = self.cache.read().await.fresh(url, ttl) {
+            return Ok((body, false));
+        }
+        match self.fetch_uncached_bytes(url).await {
+            Ok(body) => {
+                self.cache.write().await.set(url, body.clone());
+                Ok((body, false))
             }
-            _ => None,
+            Err(error) => match self.cache.read().await.stale(url) {
+                Some(body) => Ok((body, true)),
+                None => Err(error),
+            },
         }
     }
 
-    async fn eur_usd_rate_for_inverse(&self) -> Option<f64> {
-        if let Some(rate) = self.cached_rate("EURUSD").await {
-            return Some(rate);
-        }
-        if let Some(rate) = self.eur_usd_rate().await {
-            return Some(rate);
-        }
-        self.stale_ticker("EURUSD")
-            .await
-            .map(|data| data.last_price)
-    }
-
-    async fn eur_usd_both_for_inverse(&self) -> Option<(f64, f64)> {
-        if let Some((last, prev)) = self.cached_both("EURUSD").await {
-            return Some((last, prev));
-        }
-        if let Some((last, prev)) = self.eur_usd_both().await {
-            return Some((last, prev));
-        }
-        self.stale_ticker("EURUSD")
-            .await
-            .map(|data| (data.last_price, data.prev_price))
-    }
-
-    async fn eur_usd_rate(&self) -> Option<f64> {
-        let eur_rub = self.lookup_last_with_cb("EURRUB", "EURRUB_CB").await?;
-        let usd_rub = self.lookup_last_with_cb("USDRUB", "USDRUB_CB").await?;
-        if usd_rub == 0.0 {
-            return None;
-        }
-        Some(eur_rub / usd_rub)
-    }
-
-    async fn eur_usd_both(&self) -> Option<(f64, f64)> {
-        let (eur_rub_last, eur_rub_prev) = self.lookup_both_with_cb("EURRUB", "EURRUB_CB").await?;
-        let (usd_rub_last, usd_rub_prev) = self.lookup_both_with_cb("USDRUB", "USDRUB_CB").await?;
-        if usd_rub_last == 0.0 {
-            return None;
-        }
-        let prev = if eur_rub_prev != 0.0 && usd_rub_prev != 0.0 {
-            eur_rub_prev / usd_rub_prev
-        } else {
-            0.0
-        };
-        Some((eur_rub_last / usd_rub_last, prev))
-    }
-
-    async fn lookup_last_with_cb(&self, symbol: &str, cb_symbol: &str) -> Option<f64> {
-        if let Some(value) = self.lookup_last(symbol).await {
-            return Some(value);
-        }
-        self.lookup_last(cb_symbol).await
-    }
-
-    async fn lookup_both_with_cb(&self, symbol: &str, cb_symbol: &str) -> Option<(f64, f64)> {
-        match self.lookup_both(symbol).await {
-            Some((last, prev)) if last != 0.0 => Some((last, prev)),
-            _ => self.lookup_both(cb_symbol).await,
-        }
-    }
-
-    async fn lookup_last(&self, symbol: &str) -> Option<f64> {
-        let data = match self.fresh_ticker(symbol).await {
-            Some(data) => data,
-            None => self.stale_ticker(symbol).await?,
-        };
-        Some(data.last_price)
-    }
-
-    async fn lookup_both(&self, symbol: &str) -> Option<(f64, f64)> {
-        let data = match self.fresh_ticker(symbol).await {
-            Some(data) => data,
-            None => self.stale_ticker(symbol).await?,
-        };
-        Some((data.last_price, data.prev_price))
-    }
-
-    async fn fresh_ticker(&self, symbol: &str) -> Option<RbcTickerData> {
-        self.cache.read().await.get(symbol)
-    }
-
-    async fn stale_ticker(&self, symbol: &str) -> Option<RbcTickerData> {
-        self.cache.read().await.get_stale(symbol)
-    }
-
-    async fn refresh_if_needed(&self) -> Result<(), RbcRatesError> {
-        let mut last_refresh = self.last_refresh.lock().await;
-        if last_refresh.is_some_and(|last| last.elapsed() < RBC_CACHE_TTL) {
-            return Ok(());
-        }
-        *last_refresh = Some(Instant::now());
-        drop(last_refresh);
-        self.fetch_key_indicators().await
-    }
-
-    async fn fetch_key_indicators(&self) -> Result<(), RbcRatesError> {
-        let url = self.key_indicators_url_for(rbc_timestamp_millis(SystemTime::now()));
+    async fn fetch_uncached_bytes(&self, url: &str) -> Result<Vec<u8>, MarketRatesError> {
         let response = self
             .http
             .get(url)
-            .headers(rbc_headers())
+            .header(USER_AGENT, MARKET_RATES_USER_AGENT)
             .send()
             .await
-            .map_err(RbcRatesError::Request)?;
+            .map_err(|error| MarketRatesError::Request(error.to_string()))?;
         let status = response.status();
         if !status.is_success() {
-            return Err(RbcRatesError::HttpStatus(status.as_u16()));
+            return Err(MarketRatesError::HttpStatus(status.as_u16()));
         }
-        let response = response
-            .json::<RbcKeyIndicatorsResponse>()
+        response
+            .bytes()
             .await
-            .map_err(RbcRatesError::Decode)?;
-        for wrapper in response.shared_key_indicators_under_topline {
-            self.cache_key_indicator(wrapper.item).await;
-        }
-        Ok(())
-    }
-
-    fn key_indicators_url_for(&self, timestamp_millis: u128) -> String {
-        rbc_key_indicators_url_for(&self.key_indicators_url_prefix, timestamp_millis)
-    }
-
-    async fn cache_key_indicator(&self, item: RbcKeyIndicatorItem) {
-        if item.closevalue <= 0.0 {
-            return;
-        }
-        let normalized = normalize_rbc_ticker(&item.ticker, &item.name, item.subname.as_deref());
-        let prev = compute_rbc_prev(&item);
-        let mut cache = self.cache.write().await;
-        match prev {
-            Some(prev) => {
-                cache.set_both(&item.ticker, item.closevalue, prev);
-                if normalized != item.ticker {
-                    cache.set_both(&normalized, item.closevalue, prev);
-                }
-            }
-            None => {
-                cache.set(&item.ticker, item.closevalue);
-                if normalized != item.ticker {
-                    cache.set(&normalized, item.closevalue);
-                }
-            }
-        }
+            .map(|bytes| bytes.to_vec())
+            .map_err(|error| MarketRatesError::Request(error.to_string()))
     }
 
     #[cfg(test)]
-    async fn mark_fresh_for_test(&self) {
-        *self.last_refresh.lock().await = Some(Instant::now());
-    }
-
-    #[cfg(test)]
-    async fn set_both_for_test(&self, symbol: &str, last: f64, prev: f64) {
-        self.cache.write().await.set_both(symbol, last, prev);
-    }
-
-    #[cfg(test)]
-    async fn get_stale_for_test(&self, symbol: &str) -> Option<RbcTickerData> {
-        self.cache.read().await.get_stale(symbol)
-    }
-
-    #[cfg(test)]
-    fn with_key_indicators_url_prefix_for_test(mut self, prefix: impl Into<Arc<str>>) -> Self {
-        self.key_indicators_url_prefix = prefix.into();
+    fn with_urls_for_test(mut self, urls: MarketRateUrls) -> Self {
+        self.urls = urls;
         self
     }
 }
 
-impl fmt::Debug for RbcRatesClient {
+impl fmt::Debug for MarketRatesClient {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RbcRatesClient").finish_non_exhaustive()
+        f.debug_struct("MarketRatesClient").finish_non_exhaustive()
     }
 }
 
-impl RatesFetcher for RbcRatesClient {
-    type Error = RbcRatesError;
+impl RatesFetcher for MarketRatesClient {
+    type Error = MarketRatesError;
 
-    fn fx_daily_last_two_closes<'a>(
-        &'a self,
-        from: &'static str,
-        to: &'static str,
-    ) -> RatesDailyFuture<'a, Self::Error> {
-        Box::pin(async move { self.fetch_fx_daily_last_two_closes(from, to).await })
-    }
-
-    fn currency_exchange_rate<'a>(
-        &'a self,
-        from: &'static str,
-        to: &'static str,
-    ) -> RatesSpotFuture<'a, Self::Error> {
-        Box::pin(async move { self.fetch_currency_exchange_rate(from, to).await })
+    fn fetch_rates<'a>(&'a self, selection: RatesSelection) -> RatesFetchFuture<'a, Self::Error> {
+        Box::pin(async move { self.fetch_selection(selection).await })
     }
 }
 
-/// so command/tool callers usually see only `rate not found`.
+/// Market-rates provider errors.
 #[derive(Debug, Error)]
-pub enum RbcRatesError {
+pub enum MarketRatesError {
     /// HTTP client construction failed.
-    #[error("failed to build RBC HTTP client: {0}")]
+    #[error("failed to build market-rates HTTP client: {0}")]
     HttpClient(reqwest::Error),
-    /// RBC request failed before an HTTP response arrived.
-    #[error("failed to execute RBC request: {0}")]
-    Request(reqwest::Error),
-    /// RBC returned a non-2xx response.
-    #[error("rbc http status {0}")]
+    /// Request failed before an HTTP response arrived.
+    #[error("failed to execute market-rates request: {0}")]
+    Request(String),
+    /// Source returned a non-2xx response.
+    #[error("market-rates http status {0}")]
     HttpStatus(u16),
-    /// RBC JSON body did not match the expected key-indicator response.
-    #[error("failed to decode RBC JSON: {0}")]
-    Decode(reqwest::Error),
-    /// No cached, refreshed, cross, or stale value is available.
+    /// Source returned a structured error.
+    #[error("market-rates source error: {0}")]
+    Source(String),
+    /// Source body did not match the expected response.
+    #[error("failed to decode market-rates response: {0}")]
+    Decode(String),
+    /// No cached, refreshed, or fallback value is available.
     #[error("rate not found")]
     RateNotFound,
 }
 
-#[derive(Clone, Debug)]
-struct RbcRatesCache {
-    ttl: Duration,
-    data: HashMap<String, RbcTickerData>,
+#[derive(Clone, Debug, Default)]
+struct MarketRatesCache {
+    bodies: HashMap<String, CachedBody>,
 }
 
-impl RbcRatesCache {
-    fn new(ttl: Duration) -> Self {
+impl MarketRatesCache {
+    fn set(&mut self, url: &str, body: Vec<u8>) {
+        self.bodies.insert(
+            url.to_owned(),
+            CachedBody {
+                body,
+                updated_at: Instant::now(),
+            },
+        );
+    }
+
+    fn fresh(&self, url: &str, ttl: Duration) -> Option<Vec<u8>> {
+        let item = self.bodies.get(url)?;
+        (item.updated_at.elapsed() <= ttl).then(|| item.body.clone())
+    }
+
+    fn stale(&self, url: &str) -> Option<Vec<u8>> {
+        self.bodies.get(url).map(|item| item.body.clone())
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CachedBody {
+    body: Vec<u8>,
+    updated_at: Instant,
+}
+
+#[derive(Clone, Debug)]
+struct MarketRateUrls {
+    yahoo_chart_base_url: String,
+    cbr_xml_url: String,
+    frankfurter_rates_url: String,
+    fred_csv_base_url: String,
+}
+
+impl Default for MarketRateUrls {
+    fn default() -> Self {
         Self {
-            ttl,
-            data: HashMap::new(),
+            yahoo_chart_base_url: YAHOO_CHART_BASE_URL.to_owned(),
+            cbr_xml_url: CBR_DAILY_XML_URL.to_owned(),
+            frankfurter_rates_url: FRANKFURTER_RATES_URL.to_owned(),
+            fred_csv_base_url: FRED_CSV_BASE_URL.to_owned(),
         }
     }
+}
 
-    fn set(&mut self, symbol: &str, price: f64) {
-        let prev_price = self
-            .data
-            .get(symbol)
-            .map_or(0.0, |existing| existing.last_price);
-        self.data.insert(
-            symbol.to_owned(),
-            RbcTickerData {
-                last_price: price,
-                prev_price,
-                last_update: Instant::now(),
-            },
-        );
+impl MarketRateUrls {
+    fn yahoo_chart_url(&self, symbol: &str) -> String {
+        let encoded: String = url::form_urlencoded::byte_serialize(symbol.as_bytes()).collect();
+        format!(
+            "{}/{encoded}?range=1d&interval=1m",
+            self.yahoo_chart_base_url.trim_end_matches('/')
+        )
     }
 
-    fn set_both(&mut self, symbol: &str, last: f64, prev: f64) {
-        self.data.insert(
-            symbol.to_owned(),
-            RbcTickerData {
-                last_price: last,
-                prev_price: prev,
-                last_update: Instant::now(),
-            },
-        );
+    fn frankfurter_url(&self, base: &str, quote: &str) -> String {
+        format!("{}?base={base}&quotes={quote}", self.frankfurter_rates_url)
     }
 
-    fn get(&self, symbol: &str) -> Option<RbcTickerData> {
-        let data = self.data.get(symbol)?;
-        if data.last_update.elapsed() > self.ttl {
-            return None;
-        }
-        Some(*data)
+    fn fred_url(&self, series: &str) -> String {
+        format!("{}?id={series}", self.fred_csv_base_url)
     }
+}
 
-    fn get_stale(&self, symbol: &str) -> Option<RbcTickerData> {
-        self.data.get(symbol).copied()
+#[derive(Debug, Deserialize)]
+struct YahooChartResponse {
+    chart: YahooChart,
+}
+
+#[derive(Debug, Deserialize)]
+struct YahooChart {
+    #[serde(default)]
+    result: Option<Vec<YahooChartResult>>,
+    #[serde(default)]
+    error: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct YahooChartResult {
+    meta: YahooChartMeta,
+    #[serde(default)]
+    timestamp: Option<Vec<i64>>,
+    #[serde(default)]
+    indicators: Option<YahooIndicators>,
+}
+
+#[derive(Debug, Deserialize)]
+struct YahooChartMeta {
+    #[serde(default, rename = "regularMarketPrice")]
+    regular_market_price: Option<f64>,
+    #[serde(default, rename = "regularMarketTime")]
+    regular_market_time: Option<i64>,
+    #[serde(default, rename = "chartPreviousClose")]
+    chart_previous_close: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct YahooIndicators {
+    #[serde(default)]
+    quote: Option<Vec<YahooQuote>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct YahooQuote {
+    #[serde(default)]
+    close: Option<Vec<Option<f64>>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CbrValCurs {
+    #[serde(default, rename = "@Date")]
+    date: Option<String>,
+    #[serde(default, rename = "Valute")]
+    valutes: Vec<CbrValute>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CbrValute {
+    #[serde(default, rename = "CharCode")]
+    char_code: String,
+    #[serde(default, rename = "Nominal")]
+    nominal: Option<f64>,
+    #[serde(default, rename = "Value")]
+    value: Option<String>,
+    #[serde(default, rename = "VunitRate")]
+    vunit_rate: Option<String>,
+}
+
+impl CbrValute {
+    fn rate(self, date: Option<String>, stale: bool) -> Option<CbrRate> {
+        let value = parse_source_number(self.vunit_rate.as_deref()).or_else(|| {
+            let nominal = self.nominal.unwrap_or(1.0);
+            parse_source_number(self.value.as_deref()).map(|value| value / nominal)
+        })?;
+        Some(CbrRate { value, date, stale })
     }
+}
+
+#[derive(Clone, Debug)]
+struct CbrRate {
+    value: f64,
+    date: Option<String>,
+    stale: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RateInstrumentKind {
+    ForexRub,
+    Forex,
+    Crypto,
+    Future,
+    Index,
+    Equity,
+    CbrRub,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RateInstrument {
+    id: &'static str,
+    label: &'static str,
+    yahoo_symbol: Option<&'static str>,
+    fred_series: Option<&'static str>,
+    cbr_code: Option<&'static str>,
+    frankfurter_pair: Option<(&'static str, &'static str)>,
+    precision: usize,
+    unit: &'static str,
+    kind: RateInstrumentKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RatesSelection {
+    pub ids: Vec<String>,
+    pub unknown: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RatesSnapshot {
+    pub rows: Vec<RateQuote>,
+    pub errors: Vec<RatesFetchProblem>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RateQuote {
+    pub id: String,
+    pub label: String,
+    pub value: f64,
+    pub precision: usize,
+    pub unit: String,
+    pub delta: Option<RateDelta>,
+    pub source: String,
+    pub timestamp: Option<String>,
+    pub stale: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct RbcTickerData {
-    last_price: f64,
-    prev_price: f64,
-    last_update: Instant,
+pub struct RateDelta {
+    pub percent: f64,
+    pub basis: RateDeltaBasis,
 }
 
-#[derive(Debug, Deserialize)]
-struct RbcKeyIndicatorsResponse {
-    #[serde(default)]
-    shared_key_indicators_under_topline: Vec<RbcKeyIndicatorWrapper>,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RateDeltaBasis {
+    Day,
+    CbrOfficial,
 }
 
-#[derive(Debug, Deserialize)]
-struct RbcKeyIndicatorWrapper {
-    item: RbcKeyIndicatorItem,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RatesFetchProblem {
+    pub label: String,
+    pub message: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct RbcKeyIndicatorItem {
-    #[serde(default)]
-    ticker: String,
-    #[serde(default)]
-    name: String,
-    #[serde(default)]
-    subname: Option<String>,
-    #[serde(default)]
-    change: f64,
-    #[serde(default)]
-    closevalue: f64,
-    #[serde(default)]
-    prepared: RbcPreparedValues,
+#[must_use]
+pub fn parse_rates_selection(raw: &str) -> RatesSelection {
+    let explicit = !raw.trim().is_empty();
+    let normalized = raw
+        .replace("S&P 500", "sp500")
+        .replace("s&p 500", "sp500")
+        .replace("S&P500", "sp500")
+        .replace("s&p500", "sp500");
+    let mut ids = Vec::new();
+    let mut unknown = Vec::new();
+    for token in normalized
+        .split(|ch: char| ch.is_whitespace() || matches!(ch, ',' | ';' | '\n'))
+        .map(normalize_rate_alias)
+        .filter(|token| !token.is_empty())
+    {
+        if ignored_rate_alias(&token) {
+            continue;
+        }
+        match rate_alias_to_id(&token) {
+            Some(id) if !ids.iter().any(|existing| existing == id) => ids.push(id.to_owned()),
+            Some(_) => {}
+            None if explicit => unknown.push(token),
+            None => {}
+        }
+    }
+    if ids.is_empty() && unknown.is_empty() {
+        ids.extend(DEFAULT_RATE_IDS.iter().map(|id| (*id).to_owned()));
+    }
+    RatesSelection { ids, unknown }
 }
 
-#[derive(Debug, Default, Deserialize)]
-struct RbcPreparedValues {
-    #[serde(default)]
-    change: String,
+fn normalize_rate_alias(raw: &str) -> String {
+    raw.trim()
+        .trim_matches(|ch: char| {
+            matches!(
+                ch,
+                '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | ':' | '!' | '?' | '.'
+            )
+        })
+        .to_lowercase()
+        .replace('₽', "rub")
 }
 
-fn rbc_key_indicators_url_for(prefix: &str, timestamp_millis: u128) -> String {
-    format!("{prefix}{timestamp_millis}")
+fn ignored_rate_alias(token: &str) -> bool {
+    matches!(
+        token,
+        "rub"
+            | "rub/rub"
+            | "руб"
+            | "рубль"
+            | "рубля"
+            | "курс"
+            | "курсы"
+            | "rates"
+            | "rate"
+            | "now"
+            | "сейчас"
+    )
 }
 
-fn rbc_timestamp_millis(now: SystemTime) -> u128 {
-    match now.duration_since(UNIX_EPOCH) {
-        Ok(duration) => duration.as_millis(),
-        Err(_) => 0,
+fn rate_alias_to_id(token: &str) -> Option<&'static str> {
+    match token {
+        "usd" | "dollar" | "доллар" | "долларов" | "usd/rub" | "usdrub" | "rub=x" | "usdrub=x" => {
+            Some(RATE_ID_USD_RUB)
+        }
+        "eur" | "euro" | "евро" | "eur/rub" | "eurrub" | "eurrub=x" => Some(RATE_ID_EUR_RUB),
+        "eur/usd" | "eurusd" | "eurusd=x" => Some(RATE_ID_EUR_USD),
+        "usd/pln" | "usdpln" | "usdpln=x" => Some("usd_pln"),
+        "btc" | "bitcoin" | "биткоин" | "btc/usd" | "btcusd" | "btc-usd" => {
+            Some(RATE_ID_BTC_USD)
+        }
+        "eth" | "ethereum" | "эфир" | "eth/usd" | "ethusd" | "eth-usd" => Some("eth_usd"),
+        "gold" | "золото" | "gc=f" => Some("gold"),
+        "wti" | "cl=f" => Some("wti"),
+        "brent" | "bz=f" => Some("brent"),
+        "sp500" | "s&p" | "^gspc" | "gspc" => Some("sp500"),
+        "nasdaq" | "^ixic" | "ixic" => Some("nasdaq"),
+        "dow" | "dji" | "^dji" => Some("dow"),
+        "aapl" | "apple" => Some("aapl"),
+        "msft" | "microsoft" => Some("msft"),
+        "nvda" | "nvidia" => Some("nvda"),
+        "tsla" | "tesla" => Some("tsla"),
+        "spcx" | "spacex" => Some("spcx"),
+        "cny" | "yuan" | "юань" | "юаня" | "cny/rub" | "cnyrub" => Some("cny_rub"),
+        _ => None,
     }
 }
 
-fn rbc_headers() -> HeaderMap {
-    let mut headers = HeaderMap::new();
-    headers.insert(ACCEPT, HeaderValue::from_static("*/*"));
-    headers.insert(
-        ACCEPT_LANGUAGE,
-        HeaderValue::from_static("ru,be;q=0.9,en-US;q=0.8,en;q=0.7"),
-    );
-    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
-    headers.insert(PRAGMA, HeaderValue::from_static("no-cache"));
-    headers.insert(USER_AGENT, HeaderValue::from_static(RBC_HTTP_USER_AGENT));
-    headers.insert(
-        HeaderName::from_static("sec-ch-ua"),
-        HeaderValue::from_static(
-            "\"Not;A=Brand\";v=\"99\", \"Google Chrome\";v=\"139\", \"Chromium\";v=\"139\"",
-        ),
-    );
-    headers.insert(
-        HeaderName::from_static("sec-ch-ua-mobile"),
-        HeaderValue::from_static("?0"),
-    );
-    headers.insert(
-        HeaderName::from_static("sec-ch-ua-platform"),
-        HeaderValue::from_static("\"macOS\""),
-    );
-    headers.insert(
-        HeaderName::from_static("sec-fetch-dest"),
-        HeaderValue::from_static("empty"),
-    );
-    headers.insert(
-        HeaderName::from_static("sec-fetch-mode"),
-        HeaderValue::from_static("cors"),
-    );
-    headers.insert(
-        HeaderName::from_static("sec-fetch-site"),
-        HeaderValue::from_static("same-origin"),
-    );
-    headers.insert(REFERER, HeaderValue::from_static(RBC_REFERER));
-    headers
-}
-
-fn normalize_rbc_ticker(ticker: &str, name: &str, subname: Option<&str>) -> String {
-    match ticker {
-        "USD/RUB F" => "USDRUB".to_owned(),
-        "EUR/RUB F" => "EURRUB".to_owned(),
-        "CNY Бирж" => RBC_TICKER_CNYRUB.to_owned(),
-        "BTC/USD" => "BTCUSD".to_owned(),
-        "ETH/USD" => "ETHUSD".to_owned(),
-        "USD ЦБ" => "USDRUB_CB".to_owned(),
-        "EUR ЦБ" => "EURRUB_CB".to_owned(),
-        "CNY ЦБ" => RBC_TICKER_CNYRUB.to_owned(),
-        _ if subname == Some(RBC_CB_SUBNAME) => match name {
-            RBC_CURRENCY_USD => "USDRUB_CB".to_owned(),
-            RBC_CURRENCY_EUR => "EURRUB_CB".to_owned(),
-            "CNY" => RBC_TICKER_CNYRUB.to_owned(),
-            _ => ticker.to_owned(),
+fn rate_instrument(id: &str) -> Option<RateInstrument> {
+    Some(match id {
+        RATE_ID_USD_RUB => RateInstrument {
+            id: RATE_ID_USD_RUB,
+            label: "💵 USD/RUB",
+            yahoo_symbol: Some("RUB=X"),
+            fred_series: None,
+            cbr_code: Some("USD"),
+            frankfurter_pair: None,
+            precision: 2,
+            unit: "₽",
+            kind: RateInstrumentKind::ForexRub,
         },
-        _ => ticker.to_owned(),
+        RATE_ID_EUR_RUB => RateInstrument {
+            id: RATE_ID_EUR_RUB,
+            label: "💶 EUR/RUB",
+            yahoo_symbol: Some("EURRUB=X"),
+            fred_series: None,
+            cbr_code: Some("EUR"),
+            frankfurter_pair: None,
+            precision: 2,
+            unit: "₽",
+            kind: RateInstrumentKind::ForexRub,
+        },
+        RATE_ID_EUR_USD => RateInstrument {
+            id: RATE_ID_EUR_USD,
+            label: "💶/💵 EUR/USD",
+            yahoo_symbol: Some("EURUSD=X"),
+            fred_series: None,
+            cbr_code: None,
+            frankfurter_pair: Some(("EUR", "USD")),
+            precision: 4,
+            unit: "",
+            kind: RateInstrumentKind::Forex,
+        },
+        "usd_pln" => RateInstrument {
+            id: "usd_pln",
+            label: "💵 USD/PLN",
+            yahoo_symbol: Some("USDPLN=X"),
+            fred_series: None,
+            cbr_code: None,
+            frankfurter_pair: Some(("USD", "PLN")),
+            precision: 4,
+            unit: "zł",
+            kind: RateInstrumentKind::Forex,
+        },
+        RATE_ID_BTC_USD => RateInstrument {
+            id: RATE_ID_BTC_USD,
+            label: "₿ BTC/USD",
+            yahoo_symbol: Some("BTC-USD"),
+            fred_series: None,
+            cbr_code: None,
+            frankfurter_pair: None,
+            precision: 0,
+            unit: "$",
+            kind: RateInstrumentKind::Crypto,
+        },
+        "eth_usd" => RateInstrument {
+            id: "eth_usd",
+            label: "◆ ETH/USD",
+            yahoo_symbol: Some("ETH-USD"),
+            fred_series: None,
+            cbr_code: None,
+            frankfurter_pair: None,
+            precision: 0,
+            unit: "$",
+            kind: RateInstrumentKind::Crypto,
+        },
+        "gold" => RateInstrument {
+            id: "gold",
+            label: "🥇 Gold",
+            yahoo_symbol: Some("GC=F"),
+            fred_series: None,
+            cbr_code: None,
+            frankfurter_pair: None,
+            precision: 2,
+            unit: "$",
+            kind: RateInstrumentKind::Future,
+        },
+        "wti" => RateInstrument {
+            id: "wti",
+            label: "🛢 WTI",
+            yahoo_symbol: Some("CL=F"),
+            fred_series: Some("DCOILWTICO"),
+            cbr_code: None,
+            frankfurter_pair: None,
+            precision: 2,
+            unit: "$",
+            kind: RateInstrumentKind::Future,
+        },
+        "brent" => RateInstrument {
+            id: "brent",
+            label: "🛢 Brent",
+            yahoo_symbol: Some("BZ=F"),
+            fred_series: Some("DCOILBRENTEU"),
+            cbr_code: None,
+            frankfurter_pair: None,
+            precision: 2,
+            unit: "$",
+            kind: RateInstrumentKind::Future,
+        },
+        "sp500" => RateInstrument {
+            id: "sp500",
+            label: "📈 S&P 500",
+            yahoo_symbol: Some("^GSPC"),
+            fred_series: Some("SP500"),
+            cbr_code: None,
+            frankfurter_pair: None,
+            precision: 2,
+            unit: "",
+            kind: RateInstrumentKind::Index,
+        },
+        "nasdaq" => RateInstrument {
+            id: "nasdaq",
+            label: "📈 Nasdaq",
+            yahoo_symbol: Some("^IXIC"),
+            fred_series: None,
+            cbr_code: None,
+            frankfurter_pair: None,
+            precision: 2,
+            unit: "",
+            kind: RateInstrumentKind::Index,
+        },
+        "dow" => RateInstrument {
+            id: "dow",
+            label: "📈 Dow Jones",
+            yahoo_symbol: Some("^DJI"),
+            fred_series: None,
+            cbr_code: None,
+            frankfurter_pair: None,
+            precision: 2,
+            unit: "",
+            kind: RateInstrumentKind::Index,
+        },
+        "aapl" => equity_instrument("aapl", " AAPL", "AAPL"),
+        "msft" => equity_instrument("msft", "🪟 MSFT", "MSFT"),
+        "nvda" => equity_instrument("nvda", "🟩 NVDA", "NVDA"),
+        "tsla" => equity_instrument("tsla", "🚗 TSLA", "TSLA"),
+        "spcx" => equity_instrument("spcx", "🚀 SPCX", "SPCX"),
+        "cny_rub" => RateInstrument {
+            id: "cny_rub",
+            label: "🇨🇳 CNY/RUB",
+            yahoo_symbol: None,
+            fred_series: None,
+            cbr_code: Some("CNY"),
+            frankfurter_pair: None,
+            precision: 2,
+            unit: "₽",
+            kind: RateInstrumentKind::CbrRub,
+        },
+        _ => return None,
+    })
+}
+
+fn equity_instrument(
+    id: &'static str,
+    label: &'static str,
+    symbol: &'static str,
+) -> RateInstrument {
+    RateInstrument {
+        id,
+        label,
+        yahoo_symbol: Some(symbol),
+        fred_series: None,
+        cbr_code: None,
+        frankfurter_pair: None,
+        precision: 2,
+        unit: "$",
+        kind: RateInstrumentKind::Equity,
     }
 }
 
-fn compute_rbc_prev(item: &RbcKeyIndicatorItem) -> Option<f64> {
-    let last = item.closevalue;
-    if last <= 0.0 {
+fn first_market_number<const N: usize>(values: [Option<f64>; N]) -> Option<f64> {
+    values.into_iter().flatten().find(|value| value.is_finite())
+}
+
+fn parse_source_number(value: Option<&str>) -> Option<f64> {
+    value?
+        .trim()
+        .replace(',', ".")
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite())
+}
+
+fn rate_delta(current: f64, previous: f64, basis: RateDeltaBasis) -> Option<RateDelta> {
+    if previous == 0.0 {
         return None;
     }
-    if item.prepared.change.contains('%') {
-        let percent = item.change / 100.0;
-        if percent <= -1.0 {
+    Some(RateDelta {
+        percent: (current - previous) / previous * 100.0,
+        basis,
+    })
+}
+
+fn first_market_timestamp(primary: Option<i64>, fallback: Option<Vec<i64>>) -> Option<String> {
+    primary
+        .or_else(|| fallback.and_then(|timestamps| timestamps.into_iter().last()))
+        .and_then(format_epoch_timestamp)
+}
+
+fn format_epoch_timestamp(value: i64) -> Option<String> {
+    time::OffsetDateTime::from_unix_timestamp(value)
+        .ok()
+        .and_then(|time| time.format(&Rfc3339).ok())
+}
+
+fn frankfurter_rate(value: &serde_json::Value, quote: &str) -> Option<f64> {
+    if let Some(rows) = value.as_array() {
+        return rows
+            .iter()
+            .find(|row| row.get("quote").and_then(serde_json::Value::as_str) == Some(quote))
+            .and_then(|row| row.get("rate").and_then(serde_json::Value::as_f64));
+    }
+    value
+        .get("rates")
+        .and_then(|rates| rates.get(quote))
+        .and_then(serde_json::Value::as_f64)
+}
+
+fn frankfurter_date(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("date")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+fn fred_last_two(
+    text: &str,
+    series: &str,
+) -> Result<(f64, Option<f64>, Option<String>), MarketRatesError> {
+    let mut rows = text.lines().filter_map(|line| {
+        let (date, raw) = line.split_once(',')?;
+        if date == "observation_date" || raw.trim() == "." {
             return None;
         }
-        return Some(last / (1.0 + percent));
+        parse_source_number(Some(raw)).map(|value| (date.to_owned(), value))
+    });
+    let mut previous = None;
+    let mut current = None;
+    for row in rows.by_ref() {
+        previous = current;
+        current = Some(row);
     }
-    if item.change != 0.0 {
-        return Some(last - item.change);
-    }
-    None
-}
-
-fn inverse(value: f64) -> Option<f64> {
-    if value == 0.0 {
-        return None;
-    }
-    Some(1.0 / value)
-}
-
-fn inverse_both(last: f64, prev: f64) -> Option<(f64, f64)> {
-    if last == 0.0 {
-        return None;
-    }
-    let prev = if prev == 0.0 { 0.0 } else { 1.0 / prev };
-    Some((1.0 / last, prev))
+    let Some((date, value)) = current else {
+        return Err(MarketRatesError::Source(format!(
+            "empty FRED series {series}"
+        )));
+    };
+    Ok((value, previous.map(|(_, value)| value), Some(date)))
 }
 
 pub trait RatesSendPermission {
@@ -840,33 +1179,6 @@ pub struct RatesTextPlan {
     pub reply_to: ReplyMessageRef,
 }
 
-/// Rates values and per-leg fetch errors.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct RatesSnapshot {
-    /// USD/RUB current daily close.
-    pub usd: f64,
-    /// USD/RUB previous daily close.
-    pub usd_prev: f64,
-    /// USD/RUB fetch error.
-    pub usd_error: Option<String>,
-    /// EUR/RUB current daily close.
-    pub eur: f64,
-    /// EUR/RUB previous daily close.
-    pub eur_prev: f64,
-    /// EUR/RUB fetch error.
-    pub eur_error: Option<String>,
-    /// EUR/USD current daily close.
-    pub eur_usd: f64,
-    /// EUR/USD previous daily close.
-    pub eur_usd_prev: f64,
-    /// EUR/USD fetch error.
-    pub eur_usd_error: Option<String>,
-    /// BTC/USD spot rate.
-    pub btc: f64,
-    /// BTC/USD fetch error.
-    pub btc_error: Option<String>,
-}
-
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RatesToolInvocationContext {
     /// Telegram chat ID.
@@ -905,7 +1217,7 @@ pub enum RatesCommandOutcome {
     Delegated,
     PermissionDenied,
     UnavailableSent,
-    /// RBC client was missing and the unavailable text send failed.
+    /// Rates client was missing and the unavailable text send failed.
     UnavailableSendError {
         message: String,
     },
@@ -1058,9 +1370,10 @@ where
             ));
     };
 
-    let snapshot = fetch_dialog_rates(fetcher).await;
+    let selection = rates_command_selection(message, &bot.user);
+    let snapshot = fetch_dialog_rates(fetcher, selection).await;
     let errors = command_rates_errors(&snapshot);
-    if !errors.is_empty() {
+    if snapshot.rows.is_empty() && !errors.is_empty() {
         let text = format!("{RATES_FETCH_ERRORS_PREFIX}{}", errors.join("\n"));
         return Ok(
             match send_rates_plan(effects, rates_text_plan(message, text)).await {
@@ -1093,47 +1406,35 @@ pub fn is_rates_command_message(message: &TelegramMessage, bot: &TelegramUser) -
     matches!(parsed.first_word.to_lowercase().as_str(), "$" | ";")
 }
 
-pub async fn fetch_dialog_rates<Fetcher>(fetcher: &Fetcher) -> RatesSnapshot
+fn rates_command_selection(message: &TelegramMessage, bot: &TelegramUser) -> RatesSelection {
+    let parsed = openplotva_updates::parse_if_addressed(message, bot);
+    parse_rates_selection(&parsed.rest_text)
+}
+
+pub async fn fetch_dialog_rates<Fetcher>(
+    fetcher: &Fetcher,
+    selection: RatesSelection,
+) -> RatesSnapshot
 where
     Fetcher: RatesFetcher + Sync,
 {
-    let (usd, usd_prev, usd_error) = match fetcher.fx_daily_last_two_closes("USD", "RUB").await {
-        Ok((last, prev)) => (last, prev, None),
-        Err(error) => (0.0, 0.0, Some(error.to_string())),
-    };
-    let (eur, eur_prev, eur_error) = match fetcher.fx_daily_last_two_closes("EUR", "RUB").await {
-        Ok((last, prev)) => (last, prev, None),
-        Err(error) => (0.0, 0.0, Some(error.to_string())),
-    };
-    let (eur_usd, eur_usd_prev, eur_usd_error) =
-        match fetcher.fx_daily_last_two_closes("EUR", "USD").await {
-            Ok((last, prev)) => (last, prev, None),
-            Err(error) => (0.0, 0.0, Some(error.to_string())),
-        };
-    let (btc, btc_error) = match fetcher.currency_exchange_rate("BTC", "USD").await {
-        Ok(rate) => (rate, None),
-        Err(error) => (0.0, Some(error.to_string())),
-    };
-
-    RatesSnapshot {
-        usd,
-        usd_prev,
-        usd_error,
-        eur,
-        eur_prev,
-        eur_error,
-        eur_usd,
-        eur_usd_prev,
-        eur_usd_error,
-        btc,
-        btc_error,
-    }
+    fetcher
+        .fetch_rates(selection)
+        .await
+        .unwrap_or_else(|error| RatesSnapshot {
+            rows: Vec::new(),
+            errors: vec![RatesFetchProblem {
+                label: "rates".to_owned(),
+                message: error.to_string(),
+            }],
+        })
 }
 
 pub async fn currency_rates_tool<Fetcher, Dispatcher>(
     fetcher: Option<&Fetcher>,
     dispatcher: &Dispatcher,
     meta: &ToolContext,
+    pairs: &str,
 ) -> ToolResult
 where
     Fetcher: RatesFetcher + Sync,
@@ -1143,15 +1444,16 @@ where
         return ToolResult::failed("currency_rates_unavailable", "rates service unavailable");
     };
 
-    let snapshot = fetch_dialog_rates(fetcher).await;
+    let snapshot = fetch_dialog_rates(fetcher, parse_rates_selection(pairs)).await;
     let errors = dialog_rates_errors(&snapshot);
-    if !errors.is_empty() {
+    if snapshot.rows.is_empty() && !errors.is_empty() {
         return dialog_rates_failure_result(&errors);
     }
 
     let text = format_dialog_rates_message(&snapshot);
+    let html = format_rates_command_message("Курсы", &snapshot);
     match dispatcher
-        .dispatch_rates(dialog_rates_tool_context(meta), text.clone())
+        .dispatch_rates(dialog_rates_tool_context(meta), html)
         .await
     {
         Ok(dispatch) => dialog_rates_queued_result(&text, &dispatch),
@@ -1161,90 +1463,51 @@ where
 
 #[must_use]
 pub fn command_rates_errors(rates: &RatesSnapshot) -> Vec<String> {
-    let mut errors = Vec::with_capacity(4);
-    if let Some(error) = &rates.usd_error {
-        errors.push(format!("USD/RUB: {error}"));
-    }
-    if let Some(error) = &rates.eur_error {
-        errors.push(format!("EUR/RUB: {error}"));
-    }
-    if let Some(error) = &rates.eur_usd_error {
-        errors.push(format!("EUR/USD: {error}"));
-    }
-    if let Some(error) = &rates.btc_error {
-        errors.push(format!("BTC: {error}"));
-    }
-    errors
+    rates_error_lines(rates)
 }
 
 #[must_use]
 pub fn dialog_rates_errors(rates: &RatesSnapshot) -> Vec<String> {
-    let mut errors = Vec::with_capacity(4);
-    if let Some(error) = &rates.usd_error {
-        errors.push(format!("USD/RUB: {error}"));
-    }
-    if let Some(error) = &rates.eur_error {
-        errors.push(format!("EUR/RUB: {error}"));
-    }
-    if let Some(error) = &rates.eur_usd_error {
-        errors.push(format!("EUR/USD: {error}"));
-    }
-    if let Some(error) = &rates.btc_error {
-        errors.push(format!("BTC/USD: {error}"));
-    }
-    errors
+    rates_error_lines(rates)
+}
+
+fn rates_error_lines(rates: &RatesSnapshot) -> Vec<String> {
+    rates
+        .errors
+        .iter()
+        .map(|error| format!("{}: {}", error.label, error.message))
+        .collect()
 }
 
 #[must_use]
 pub fn format_rates_command_message(header: &str, rates: &RatesSnapshot) -> String {
-    let mut rows = vec![
-        crate::rich::RateRow {
-            label: "💵 USD/RUB".to_owned(),
-            value: format!("{} ₽", format_rate_value(rates.usd, 2)),
-            delta: format_rate_delta(rates.usd_prev, rates.usd),
-        },
-        crate::rich::RateRow {
-            label: "💶 EUR/RUB".to_owned(),
-            value: format!("{} ₽", format_rate_value(rates.eur, 2)),
-            delta: format_rate_delta(rates.eur_prev, rates.eur),
-        },
-        crate::rich::RateRow {
-            label: "💶/💵 EUR/USD".to_owned(),
-            value: format_rate_value(rates.eur_usd, 4),
-            delta: format_rate_delta(rates.eur_usd_prev, rates.eur_usd),
-        },
-    ];
-    if rates.btc_error.is_none() && rates.btc != 0.0 {
-        rows.push(crate::rich::RateRow {
-            label: "₿ BTC/USD".to_owned(),
-            value: format!("{} $", format_rate_value(rates.btc, 0)),
-            delta: String::new(),
-        });
-    }
-    crate::rich::compose_rates_table(header, &rows, "")
+    let rows = rates
+        .rows
+        .iter()
+        .map(|row| crate::rich::RateRow {
+            label: row.label.clone(),
+            value: format_rate_quote_value(row),
+            delta: row.delta.map(format_rate_quote_delta).unwrap_or_default(),
+        })
+        .collect::<Vec<_>>();
+    crate::rich::compose_rates_table(header, &rows, &format_rates_footer(rates))
 }
 
 #[must_use]
 pub fn format_dialog_rates_message(rates: &RatesSnapshot) -> String {
-    [
-        format!(
-            "USD/RUB={} ({})",
-            format_rate_value(rates.usd, 2),
-            format_rate_delta(rates.usd_prev, rates.usd)
-        ),
-        format!(
-            "EUR/RUB={} ({})",
-            format_rate_value(rates.eur, 2),
-            format_rate_delta(rates.eur_prev, rates.eur)
-        ),
-        format!(
-            "EUR/USD={} ({})",
-            format_rate_value(rates.eur_usd, 4),
-            format_rate_delta(rates.eur_usd_prev, rates.eur_usd)
-        ),
-        format!("BTC/USD={}", format_rate_value(rates.btc, 0)),
-    ]
-    .join("\n")
+    rates
+        .rows
+        .iter()
+        .map(|row| {
+            let delta = row.delta.map(format_rate_quote_delta).unwrap_or_default();
+            if delta.is_empty() {
+                format!("{}={}", row.label, format_rate_quote_value(row))
+            } else {
+                format!("{}={} ({delta})", row.label, format_rate_quote_value(row))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[must_use]
@@ -1344,6 +1607,41 @@ pub fn format_rate_delta(prev: f64, curr: f64) -> String {
     }
 }
 
+fn format_rate_quote_value(row: &RateQuote) -> String {
+    let value = format_rate_value(row.value, row.precision);
+    if row.unit.is_empty() {
+        value
+    } else {
+        format!("{value} {}", row.unit)
+    }
+}
+
+fn format_rate_quote_delta(delta: RateDelta) -> String {
+    let base = match delta.percent.total_cmp(&0.0) {
+        std::cmp::Ordering::Greater => format!("+{}%", format_rate_value(delta.percent, 1)),
+        std::cmp::Ordering::Less => format!("{}%", format_rate_value(delta.percent, 1)),
+        std::cmp::Ordering::Equal => "0.0%".to_owned(),
+    };
+    match delta.basis {
+        RateDeltaBasis::Day => base,
+        RateDeltaBasis::CbrOfficial => format!("{base} к ЦБ"),
+    }
+}
+
+fn format_rates_footer(rates: &RatesSnapshot) -> String {
+    let mut parts = Vec::new();
+    if rates.rows.iter().any(|row| row.stale) {
+        parts.push("часть данных из кэша".to_owned());
+    }
+    if !rates.errors.is_empty() && !rates.rows.is_empty() {
+        parts.push(format!(
+            "не удалось: {}",
+            rates_error_lines(rates).join("; ")
+        ));
+    }
+    parts.join(" · ")
+}
+
 fn unavailable_rates_plan(message: &TelegramMessage) -> RatesTextPlan {
     rates_text_plan(message, RATES_UNAVAILABLE_TEXT.to_owned())
 }
@@ -1412,12 +1710,10 @@ mod tests {
     use super::*;
     use crate::updates::{
         TelegramFileMetadataStoreFuture, UpdateHandler, UpdateHandlerFuture, UpdateStateStore,
-        UpdateStateStoreFuture, process_update_with_state_store_at,
+        UpdateStateStoreFuture,
     };
-    use openplotva_updates::{UpdateConsumerConfig, UpdateStageOutcome};
     use serde_json::json;
     use std::{
-        env,
         io::{self, Read, Write},
         net::TcpListener,
         sync::{Arc, Mutex, MutexGuard},
@@ -1448,12 +1744,7 @@ mod tests {
         assert!(next.calls().is_empty());
         assert_eq!(
             fetcher.calls(),
-            vec![
-                "daily USD/RUB",
-                "daily EUR/RUB",
-                "daily EUR/USD",
-                "spot BTC/USD"
-            ]
+            vec!["fetch usd_rub,eur_rub,eur_usd,btc_usd"]
         );
         let sent = effects.sent();
         assert_eq!(sent.len(), 1);
@@ -1576,7 +1867,7 @@ mod tests {
             Some(&fetcher),
             &HeaderStub,
             &effects,
-            sample_update(private_message("$", 81)?)?,
+            sample_update(private_message("$ btc", 81)?)?,
             |_update| async { Ok::<(), io::Error>(()) },
         )
         .await?;
@@ -1584,12 +1875,12 @@ mod tests {
         assert_eq!(
             outcome,
             RatesCommandOutcome::FetchErrorsSent {
-                errors: vec!["BTC: btc down".to_owned()]
+                errors: vec!["₿ BTC/USD: btc down".to_owned()]
             }
         );
         assert_eq!(
             effects.sent()[0].message.text,
-            "❌ Ошибки получения курсов:\nBTC: btc down"
+            "❌ Ошибки получения курсов:\n₿ BTC/USD: btc down"
         );
         Ok(())
     }
@@ -1600,14 +1891,17 @@ mod tests {
         let dispatcher = DispatcherStub::default();
         let meta = tool_context();
 
-        let result =
-            currency_rates_tool(Some(&RatesFetcherStub::successful()), &dispatcher, &meta).await;
+        let result = currency_rates_tool(
+            Some(&RatesFetcherStub::successful()),
+            &dispatcher,
+            &meta,
+            "",
+        )
+        .await;
 
         assert_eq!(result.status, TOOL_RESULT_STATUS_QUEUED);
-        assert_eq!(
-            result.message,
-            "USD/RUB=90.00 (+1.1%)\nEUR/RUB=100.00 (+2.0%)\nEUR/USD=1.1111 (+1.0%)\nBTC/USD=65000"
-        );
+        assert!(result.message.contains("💵 USD/RUB=90.00 ₽ (+1.1%)"));
+        assert!(result.message.contains("₿ BTC/USD=65000 $"));
         assert_eq!(
             result.data,
             Some(json!({
@@ -1623,9 +1917,10 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0.mode, "multi_turn");
         assert_eq!(calls[0].0.thread_id, Some(9));
-        assert_eq!(calls[0].1, result.message);
+        assert!(calls[0].1.contains("<table"));
+        assert!(calls[0].1.contains("💵 USD/RUB"));
 
-        let missing = currency_rates_tool(None::<&RatesFetcherStub>, &dispatcher, &meta).await;
+        let missing = currency_rates_tool(None::<&RatesFetcherStub>, &dispatcher, &meta, "").await;
         assert_eq!(
             missing,
             ToolResult::failed("currency_rates_unavailable", "rates service unavailable")
@@ -1640,6 +1935,7 @@ mod tests {
             Some(&RatesFetcherStub::failing_btc()),
             &DispatcherStub::default(),
             &tool_context(),
+            "btc",
         )
         .await;
 
@@ -1647,13 +1943,13 @@ mod tests {
         assert_eq!(result.message, "rates fetch failed");
         assert_eq!(
             result.data,
-            Some(json!({ "errors": ["BTC/USD: btc down"] }))
+            Some(json!({ "errors": ["₿ BTC/USD: btc down"] }))
         );
         assert_eq!(
             result.error,
             Some(ToolError {
                 code: "currency_rates_failed".to_owned(),
-                reason: "BTC/USD: btc down".to_owned(),
+                reason: "₿ BTC/USD: btc down".to_owned(),
                 retryable: true,
             })
         );
@@ -1665,340 +1961,107 @@ mod tests {
         assert_eq!(format_rate_delta(0.0, 90.0), "flat");
         assert_eq!(format_rate_delta(100.0, 100.0), "0.0%");
         assert_eq!(format_rate_delta(100.0, 98.0), "-2.0%");
-        let no_btc = RatesSnapshot {
-            usd: 90.0,
-            usd_prev: 90.0,
-            eur: 100.0,
-            eur_prev: 100.0,
-            eur_usd: 1.1,
-            eur_usd_prev: 1.1,
-            ..RatesSnapshot::default()
-        };
-        let rendered = format_rates_command_message("H", &no_btc);
+        let rendered = format_rates_command_message("H", &RatesFetcherStub::successful_snapshot());
         assert!(rendered.starts_with("<h3>H</h3><table bordered striped>"));
         assert!(rendered.contains("<td>💵 USD/RUB</td>"));
         assert!(rendered.contains("90.00 ₽"));
-        assert!(!rendered.contains("BTC/USD"));
+        assert!(rendered.contains("BTC/USD"));
     }
 
     #[test]
-    fn rbc_request_shape_matches_go_key_indicator_fetch() {
+    fn rates_selection_uses_default_or_known_aliases_only() {
+        assert_eq!(parse_rates_selection("").ids, DEFAULT_RATE_IDS);
         assert_eq!(
-            rbc_key_indicators_url_for(RBC_KEY_INDICATORS_URL_PREFIX, 123),
-            "https://www.rbc.ru/quote/ajax/key-indicator-update/?_=123"
-        );
-        let headers = rbc_headers();
-        assert_eq!(headers.get(ACCEPT), Some(&HeaderValue::from_static("*/*")));
-        assert_eq!(
-            headers.get(ACCEPT_LANGUAGE),
-            Some(&HeaderValue::from_static(
-                "ru,be;q=0.9,en-US;q=0.8,en;q=0.7"
-            ))
+            parse_rates_selection("btc eth").ids,
+            vec!["btc_usd".to_owned(), "eth_usd".to_owned()]
         );
         assert_eq!(
-            headers.get(HeaderName::from_static("sec-ch-ua-platform")),
-            Some(&HeaderValue::from_static("\"macOS\""))
+            parse_rates_selection("usd eur").ids,
+            vec![RATE_ID_USD_RUB.to_owned(), RATE_ID_EUR_RUB.to_owned()]
         );
-        assert_eq!(
-            headers.get(REFERER),
-            Some(&HeaderValue::from_static(RBC_REFERER))
-        );
-        assert_eq!(
-            headers.get(USER_AGENT),
-            Some(&HeaderValue::from_static(RBC_HTTP_USER_AGENT))
-        );
-    }
-
-    #[test]
-    fn rbc_normalize_ticker_matches_go_aliases() {
-        let cases = [
-            ("USD/RUB F", "", None, "USDRUB"),
-            ("EUR/RUB F", "", None, "EURRUB"),
-            ("CNY Бирж", "", None, RBC_TICKER_CNYRUB),
-            ("BTC/USD", "", None, "BTCUSD"),
-            ("ETH/USD", "", None, "ETHUSD"),
-            ("USD ЦБ", "", None, "USDRUB_CB"),
-            ("EUR ЦБ", "", None, "EURRUB_CB"),
-            ("CNY ЦБ", "", None, RBC_TICKER_CNYRUB),
-            ("USD", RBC_CURRENCY_USD, Some(RBC_CB_SUBNAME), "USDRUB_CB"),
-            ("EUR", RBC_CURRENCY_EUR, Some(RBC_CB_SUBNAME), "EURRUB_CB"),
-            ("SBER", "SBER", None, "SBER"),
-        ];
-
-        for (ticker, name, subname, want) in cases {
-            assert_eq!(normalize_rbc_ticker(ticker, name, subname), want);
-        }
+        assert_eq!(parse_rates_selection("wat").unknown, vec!["wat".to_owned()]);
     }
 
     #[tokio::test]
-    async fn rbc_client_stores_raw_and_normalized_tickers() -> Result<(), Box<dyn std::error::Error>>
-    {
-        let client = rbc_test_client()?;
-
-        client
-            .cache_key_indicator(rbc_item("USD/RUB F", "", None, 100.0, 10.0, ""))
-            .await;
-
-        for ticker in ["USD/RUB F", "USDRUB"] {
-            let data = client
-                .get_stale_for_test(ticker)
-                .await
-                .ok_or_else(|| io::Error::other(format!("missing cached {ticker}")))?;
-            assert_eq!(data.last_price, 100.0);
-            assert_eq!(data.prev_price, 90.0);
-        }
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn rbc_client_uses_cb_and_eur_usd_cross_rates() -> Result<(), Box<dyn std::error::Error>>
-    {
-        let client = rbc_test_client()?;
-        client.mark_fresh_for_test().await;
-        client.set_both_for_test("USDRUB_CB", 90.0, 89.0).await;
-
-        assert_eq!(
-            client
-                .fetch_currency_exchange_rate(RBC_CURRENCY_USD, "RUB")
-                .await?,
-            90.0
-        );
-
-        client.set_both_for_test("EURRUB", 100.0, 98.0).await;
-        client.set_both_for_test("USDRUB", 80.0, 79.0).await;
-        assert_eq!(
-            client
-                .fetch_currency_exchange_rate(RBC_CURRENCY_EUR, RBC_CURRENCY_USD)
-                .await?,
-            1.25
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn rbc_client_daily_closes_use_go_inverse_cross_rate()
+    async fn market_rates_client_parses_yahoo_chart_and_uses_cache()
     -> Result<(), Box<dyn std::error::Error>> {
-        let client = rbc_test_client()?;
-        client.mark_fresh_for_test().await;
-        client.set_both_for_test("EURRUB", 100.0, 98.0).await;
-        client.set_both_for_test("USDRUB", 80.0, 70.0).await;
+        let (urls, server) =
+            spawn_market_fixture_server(vec![FixtureResponse::ok(yahoo_fixture())])?;
+        let client = market_test_client(urls)?;
 
-        let (last, prev) = client
-            .fetch_fx_daily_last_two_closes(RBC_CURRENCY_USD, RBC_CURRENCY_EUR)
-            .await?;
+        let first = fetch_dialog_rates(&client, parse_rates_selection("btc")).await;
+        let second = fetch_dialog_rates(&client, parse_rates_selection("btc")).await;
 
-        assert_eq!(last, 0.8);
-        assert_eq!(prev, 70.0 / 98.0);
-        Ok(())
-    }
-
-    #[tokio::test]
-    #[ignore = "live public RBC provider smoke"]
-    async fn rbc_rates_client_live_smoke_fetches_usd_rub() -> Result<(), Box<dyn std::error::Error>>
-    {
-        let client = rbc_test_client()?;
-
-        let (last, prev) = client
-            .fx_daily_last_two_closes(RBC_CURRENCY_USD, "RUB")
-            .await?;
-
-        assert!(
-            last.is_finite() && last > 0.0,
-            "expected positive finite USD/RUB last close, got {last}"
-        );
-        assert!(
-            prev.is_finite() && prev > 0.0,
-            "expected positive finite USD/RUB previous close, got {prev}"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn rbc_fixture_smoke_fetches_rates_with_go_headers()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let (prefix, server) = spawn_rbc_fixture_server(rbc_key_indicators_fixture())?;
-        let client =
-            rbc_test_client()?.with_key_indicators_url_prefix_for_test(Arc::<str>::from(prefix));
-
-        let snapshot = fetch_dialog_rates(&client).await;
-
-        assert_eq!(snapshot.usd_error, None);
-        assert_eq!(snapshot.eur_error, None);
-        assert_eq!(snapshot.eur_usd_error, None);
-        assert_eq!(snapshot.btc_error, None);
-        assert_eq!(snapshot.usd, 90.0);
-        assert_eq!(snapshot.eur, 100.0);
-        assert_eq!(snapshot.eur_usd, 100.0 / 90.0);
-        assert_eq!(snapshot.btc, 65_000.0);
-        assert!(snapshot.usd_prev > 0.0 && snapshot.eur_prev > 0.0 && snapshot.eur_usd_prev > 0.0);
-
-        let request = server
+        assert_eq!(first.rows[0].value, 65000.0);
+        assert_eq!(first.rows[0].source, "yahoo_chart");
+        assert_eq!(first.rows[0].delta.unwrap().basis, RateDeltaBasis::Day);
+        assert_eq!(second.rows[0].value, 65000.0);
+        let requests = server
             .join()
-            .map_err(|_| io::Error::other("RBC fixture server panicked"))??;
-        assert_rbc_fixture_request_matches_go(&request);
+            .map_err(|_| io::Error::other("market fixture server panicked"))??;
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("/chart/BTC-USD?"));
         Ok(())
     }
 
     #[tokio::test]
-    async fn rates_rbc_fixture_smoke_queues_command_and_tool_payloads()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let (prefix, server) = spawn_rbc_fixture_server(rbc_key_indicators_fixture())?;
-        let provider = Arc::new(
-            rbc_test_client()?.with_key_indicators_url_prefix_for_test(Arc::<str>::from(prefix)),
-        );
+    async fn market_rates_client_parses_cbr_xml() -> Result<(), Box<dyn std::error::Error>> {
+        let (urls, server) = spawn_market_fixture_server(vec![FixtureResponse::ok(cbr_fixture())])?;
+        let client = market_test_client(urls)?;
 
-        let command_mock = Arc::new(crate::rich::MockRichSender::default());
-        let next = Arc::new(NextStub::default());
-        let handler = RatesCommandUpdateHandler::new(
-            bot_identity()?,
-            Arc::new(PermissionStub::allowed()),
-            Some(Arc::clone(&provider)),
-            Arc::new(HeaderStub),
-            Arc::new(RatesRichEffects::new(command_mock.clone())),
-            Arc::clone(&next),
-        );
+        let snapshot = fetch_dialog_rates(&client, parse_rates_selection("cny")).await;
 
-        handler
-            .handle_update(sample_update(group_message("$", 83)?)?)
-            .await?;
-
-        assert!(next.calls().is_empty());
-        {
-            let sent = command_mock.sent.lock().unwrap();
-            assert_eq!(sent.len(), 1);
-            assert_eq!(sent[0].chat_id, -10042);
-            assert_eq!(sent[0].message_thread_id, Some(9));
-            assert_eq!(sent[0].reply_to_message_id, Some(83));
-            assert!(sent[0].html.contains("90.00 ₽") && sent[0].html.contains("65000 $"));
-        }
-
-        let tool_store = VirtualStoreStub::default();
-        let tool_queue = Arc::new(openplotva_telegram::DispatcherQueue::new(Default::default()));
-        let tool_dispatcher = RatesToolDispatcherEffects::new(tool_store.clone(), tool_queue)
-            .with_id_factories(
-                Arc::new(|| "rates-tool-rbc-vmsg-1".to_owned()),
-                Arc::new(|| "rbc-ticket-1".to_owned()),
-            );
-
-        let tool_result =
-            currency_rates_tool(Some(provider.as_ref()), &tool_dispatcher, &tool_context()).await;
-
-        assert_eq!(tool_result.status, TOOL_RESULT_STATUS_QUEUED);
-        assert_eq!(
-            tool_result.message,
-            "USD/RUB=90.00 (+1.1%)\nEUR/RUB=100.00 (+2.0%)\nEUR/USD=1.1111 (+0.9%)\nBTC/USD=65000"
-        );
-        assert_eq!(
-            tool_result.data,
-            Some(json!({
-                "rates_text": tool_result.message,
-                "dispatch": {
-                    "kind": "rates_message",
-                    "ticket_id": "rbc-ticket-1",
-                    "state": "queued",
-                },
-            }))
-        );
-        assert_eq!(
-            tool_store.inserts(),
-            vec![("rates-tool-rbc-vmsg-1".to_owned(), -10042, Some(9))]
-        );
-
-        let request = server
+        assert_eq!(snapshot.rows[0].label, "🇨🇳 CNY/RUB");
+        assert_eq!(snapshot.rows[0].value, 10.5);
+        assert_eq!(snapshot.rows[0].timestamp.as_deref(), Some("19.06.2026"));
+        let requests = server
             .join()
-            .map_err(|_| io::Error::other("RBC fixture server panicked"))??;
-        assert_rbc_fixture_request_matches_go(&request);
+            .map_err(|_| io::Error::other("market fixture server panicked"))??;
+        assert_eq!(requests, vec!["/cbr".to_owned()]);
         Ok(())
     }
 
     #[tokio::test]
-    async fn live_redis_decoded_rates_commands_queue_payload_when_url_is_set()
+    async fn market_rates_client_falls_back_to_frankfurter()
     -> Result<(), Box<dyn std::error::Error>> {
-        let Ok(redis_url) = env::var("OPENPLOTVA_TEST_REDIS_URL") else {
-            return Ok(());
-        };
-        for (command, message_id) in [("$", 84), (";", 85)] {
-            let redis_client = redis::Client::open(redis_url.as_str())?;
-            let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-            let key = format!("openplotva:test:decoded-rates:{suffix}");
-            let update_queue =
-                openplotva_updates::RedisUpdateQueue::with_key(redis_client.clone(), key.clone());
-            let mut redis = redis_client.get_multiplexed_async_connection().await?;
-            let _: i64 = redis::cmd("DEL").arg(&key).query_async(&mut redis).await?;
+        let (urls, server) = spawn_market_fixture_server(vec![
+            FixtureResponse::status(500, "{}"),
+            FixtureResponse::ok(r#"{"date":"2026-06-18","rates":{"PLN":3.7}}"#),
+        ])?;
+        let client = market_test_client(urls)?;
 
-            let (prefix, server) = spawn_rbc_fixture_server(rbc_key_indicators_fixture())?;
-            let provider = Arc::new(
-                rbc_test_client()?
-                    .with_key_indicators_url_prefix_for_test(Arc::<str>::from(prefix)),
-            );
-            let state_store = UpdateStateStoreStub::default();
-            let command_mock = Arc::new(crate::rich::MockRichSender::default());
-            let next = Arc::new(NextStub::default());
-            let handler = RatesCommandUpdateHandler::new(
-                bot_identity()?,
-                Arc::new(PermissionStub::allowed()),
-                Some(Arc::clone(&provider)),
-                Arc::new(HeaderStub),
-                Arc::new(RatesRichEffects::new(command_mock.clone())),
-                Arc::clone(&next),
-            );
+        let snapshot = fetch_dialog_rates(&client, parse_rates_selection("usd/pln")).await;
 
-            let now_secs = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-            let update = sample_update(group_message_at(command, message_id, now_secs as i64)?)?;
-            update_queue.enqueue_update(&update).await?;
-            assert_eq!(update_queue.len().await?, 1);
-            let decoded = update_queue
-                .dequeue_update(Duration::from_secs(1))
-                .await?
-                .ok_or_else(|| io::Error::other("expected decoded rates update"))?;
+        assert_eq!(snapshot.rows[0].source, "frankfurter");
+        assert_eq!(snapshot.rows[0].value, 3.7);
+        assert!(snapshot.errors.is_empty());
+        let requests = server
+            .join()
+            .map_err(|_| io::Error::other("market fixture server panicked"))??;
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].starts_with("/frankfurter?base=USD&quotes=PLN"));
+        Ok(())
+    }
 
-            let report = process_update_with_state_store_at(
-                decoded,
-                UpdateConsumerConfig {
-                    dequeue_timeout: Duration::from_millis(1),
-                    state_timeout: Duration::from_secs(1),
-                    handle_timeout: Duration::from_secs(1),
-                    side_effect_max_age: Duration::from_secs(60),
-                    worker_limit: 1,
-                },
-                UNIX_EPOCH + Duration::from_secs(now_secs),
-                &state_store,
-                |update| handler.handle_update(update),
-            )
-            .await;
+    #[tokio::test]
+    async fn market_rates_client_falls_back_to_fred_csv() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (urls, server) = spawn_market_fixture_server(vec![
+            FixtureResponse::status(500, "{}"),
+            FixtureResponse::ok("observation_date,DCOILWTICO\n2026-06-17,70\n2026-06-18,77\n"),
+        ])?;
+        let client = market_test_client(urls)?;
 
-            assert_eq!(report.update_id, 500);
-            assert_eq!(report.update_name, "message");
-            assert_eq!(report.state.outcome, UpdateStageOutcome::Completed);
-            assert_eq!(
-                report.handle.as_ref().map(|stage| &stage.outcome),
-                Some(&UpdateStageOutcome::Completed)
-            );
-            assert!(!report.skipped_handle);
-            assert_eq!(
-                state_store.calls(),
-                vec![
-                    "chat:-10042:supergroup::".to_owned(),
-                    "user:42:Ada:ada".to_owned()
-                ]
-            );
-            assert!(next.calls().is_empty());
-            {
-                let sent = command_mock.sent.lock().unwrap();
-                assert_eq!(sent.len(), 1);
-                assert_eq!(sent[0].chat_id, -10042);
-                assert_eq!(sent[0].message_thread_id, Some(9));
-                assert_eq!(sent[0].reply_to_message_id, Some(message_id));
-                assert!(sent[0].html.contains("90.00 ₽") && sent[0].html.contains("65000 $"));
-            }
-            assert_eq!(update_queue.len().await?, 0);
+        let snapshot = fetch_dialog_rates(&client, parse_rates_selection("wti")).await;
 
-            let request = server
-                .join()
-                .map_err(|_| io::Error::other("RBC fixture server panicked"))??;
-            assert_rbc_fixture_request_matches_go(&request);
-            let _: i64 = redis::cmd("DEL").arg(&key).query_async(&mut redis).await?;
-        }
+        assert_eq!(snapshot.rows[0].source, "fred");
+        assert_eq!(snapshot.rows[0].value, 77.0);
+        assert_eq!(snapshot.rows[0].delta.unwrap().percent, 10.0);
+        let requests = server
+            .join()
+            .map_err(|_| io::Error::other("market fixture server panicked"))??;
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].starts_with("/fred?id=DCOILWTICO"));
         Ok(())
     }
 
@@ -2213,84 +2276,86 @@ mod tests {
         }
     }
 
-    fn rbc_test_client() -> Result<RbcRatesClient, RbcRatesError> {
-        RbcRatesClient::from_timeout_seconds(15)
+    fn market_test_client(urls: MarketRateUrls) -> Result<MarketRatesClient, MarketRatesError> {
+        Ok(MarketRatesClient::from_timeout_seconds(15)?.with_urls_for_test(urls))
     }
 
-    fn rbc_key_indicators_fixture() -> &'static str {
-        r#"{"shared_key_indicators_under_topline":[{"item":{"ticker":"USD/RUB F","name":"","subname":null,"change":1.1,"closevalue":90.0,"prepared":{"change":"+1.1%"}}},{"item":{"ticker":"EUR/RUB F","name":"","subname":null,"change":2.0,"closevalue":100.0,"prepared":{"change":"+2.0%"}}},{"item":{"ticker":"BTC/USD","name":"","subname":null,"change":0.0,"closevalue":65000.0,"prepared":{"change":""}}}]}"#
-    }
-
-    fn spawn_rbc_fixture_server(
+    #[derive(Clone)]
+    struct FixtureResponse {
+        status: u16,
         body: &'static str,
-    ) -> io::Result<(String, thread::JoinHandle<io::Result<String>>)> {
+    }
+
+    impl FixtureResponse {
+        fn ok(body: &'static str) -> Self {
+            Self { status: 200, body }
+        }
+
+        fn status(status: u16, body: &'static str) -> Self {
+            Self { status, body }
+        }
+    }
+
+    fn spawn_market_fixture_server(
+        responses: Vec<FixtureResponse>,
+    ) -> io::Result<(MarketRateUrls, thread::JoinHandle<io::Result<Vec<String>>>)> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let addr = listener.local_addr()?;
         let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept()?;
-            stream.set_read_timeout(Some(StdDuration::from_secs(5)))?;
+            let mut requests = Vec::new();
+            for response in responses {
+                let (mut stream, _) = listener.accept()?;
+                stream.set_read_timeout(Some(StdDuration::from_secs(5)))?;
 
-            let mut request = Vec::new();
-            let mut chunk = [0_u8; 1024];
-            loop {
-                let read = stream.read(&mut chunk)?;
-                if read == 0 {
-                    break;
+                let mut request = Vec::new();
+                let mut chunk = [0_u8; 1024];
+                loop {
+                    let read = stream.read(&mut chunk)?;
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
                 }
-                request.extend_from_slice(&chunk[..read]);
-                if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                    break;
-                }
+                let request = String::from_utf8(request)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                requests.push(
+                    request
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or_default()
+                        .to_owned(),
+                );
+                write!(
+                    stream,
+                    "HTTP/1.1 {} OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    response.status,
+                    response.body.len(),
+                    response.body
+                )?;
             }
-
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            )?;
-
-            String::from_utf8(request)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+            Ok(requests)
         });
+        let base = format!("http://{addr}");
         Ok((
-            format!("http://{addr}/quote/ajax/key-indicator-update/?_="),
+            MarketRateUrls {
+                yahoo_chart_base_url: format!("{base}/chart"),
+                cbr_xml_url: format!("{base}/cbr"),
+                frankfurter_rates_url: format!("{base}/frankfurter"),
+                fred_csv_base_url: format!("{base}/fred"),
+            },
             handle,
         ))
     }
 
-    fn assert_rbc_fixture_request_matches_go(request: &str) {
-        let request_lower = request.to_ascii_lowercase();
-        assert!(request.starts_with("GET /quote/ajax/key-indicator-update/?_="));
-        assert!(request_lower.contains("\r\naccept: */*"));
-        assert!(request_lower.contains("\r\naccept-language: ru,be;q=0.9,en-us;q=0.8,en;q=0.7"));
-        assert!(request_lower.contains("\r\ncache-control: no-cache"));
-        assert!(request_lower.contains("\r\npragma: no-cache"));
-        assert!(request_lower.contains("\r\nreferer: https://www.rbc.ru/quote/ticker/338247"));
-        assert!(request_lower.contains(&format!(
-            "\r\nuser-agent: {}",
-            RBC_HTTP_USER_AGENT.to_ascii_lowercase()
-        )));
+    fn yahoo_fixture() -> &'static str {
+        r#"{"chart":{"result":[{"meta":{"regularMarketPrice":65000.0,"regularMarketTime":1781800000,"chartPreviousClose":64000.0},"timestamp":[1781799940,1781800000],"indicators":{"quote":[{"close":[64000.0,65000.0]}]}}],"error":null}}"#
     }
 
-    fn rbc_item(
-        ticker: &str,
-        name: &str,
-        subname: Option<&str>,
-        closevalue: f64,
-        change: f64,
-        prepared_change: &str,
-    ) -> RbcKeyIndicatorItem {
-        RbcKeyIndicatorItem {
-            ticker: ticker.to_owned(),
-            name: name.to_owned(),
-            subname: subname.map(str::to_owned),
-            change,
-            closevalue,
-            prepared: RbcPreparedValues {
-                change: prepared_change.to_owned(),
-            },
-        }
+    fn cbr_fixture() -> &'static str {
+        r#"<ValCurs Date="19.06.2026" name="Foreign Currency Market"><Valute ID="R01375"><NumCode>156</NumCode><CharCode>CNY</CharCode><Nominal>1</Nominal><Name>Юань</Name><Value>10,5000</Value><VunitRate>10,5000</VunitRate></Valute></ValCurs>"#
     }
 
     type VirtualInsertCalls = Arc<Mutex<Vec<(String, i64, Option<i32>)>>>;
@@ -2404,6 +2469,58 @@ mod tests {
             Self::default()
         }
 
+        fn successful_snapshot() -> RatesSnapshot {
+            RatesSnapshot {
+                rows: vec![
+                    RateQuote {
+                        id: RATE_ID_USD_RUB.to_owned(),
+                        label: "💵 USD/RUB".to_owned(),
+                        value: 90.0,
+                        precision: 2,
+                        unit: "₽".to_owned(),
+                        delta: rate_delta(90.0, 89.0, RateDeltaBasis::Day),
+                        source: "test".to_owned(),
+                        timestamp: None,
+                        stale: false,
+                    },
+                    RateQuote {
+                        id: RATE_ID_EUR_RUB.to_owned(),
+                        label: "💶 EUR/RUB".to_owned(),
+                        value: 100.0,
+                        precision: 2,
+                        unit: "₽".to_owned(),
+                        delta: rate_delta(100.0, 98.0, RateDeltaBasis::Day),
+                        source: "test".to_owned(),
+                        timestamp: None,
+                        stale: false,
+                    },
+                    RateQuote {
+                        id: RATE_ID_EUR_USD.to_owned(),
+                        label: "💶/💵 EUR/USD".to_owned(),
+                        value: 1.1111,
+                        precision: 4,
+                        unit: String::new(),
+                        delta: rate_delta(1.1111, 1.1, RateDeltaBasis::Day),
+                        source: "test".to_owned(),
+                        timestamp: None,
+                        stale: false,
+                    },
+                    RateQuote {
+                        id: RATE_ID_BTC_USD.to_owned(),
+                        label: "₿ BTC/USD".to_owned(),
+                        value: 65000.0,
+                        precision: 0,
+                        unit: "$".to_owned(),
+                        delta: None,
+                        source: "test".to_owned(),
+                        timestamp: None,
+                        stale: false,
+                    },
+                ],
+                errors: Vec::new(),
+            }
+        }
+
         fn failing_btc() -> Self {
             Self {
                 state: Mutex::new(RatesFetcherState {
@@ -2425,34 +2542,33 @@ mod tests {
     impl RatesFetcher for RatesFetcherStub {
         type Error = io::Error;
 
-        fn fx_daily_last_two_closes<'a>(
+        fn fetch_rates<'a>(
             &'a self,
-            from: &'static str,
-            to: &'static str,
-        ) -> RatesDailyFuture<'a, Self::Error> {
-            Box::pin(async move {
-                self.lock().calls.push(format!("daily {from}/{to}"));
-                Ok(match (from, to) {
-                    ("USD", "RUB") => (90.0, 89.0),
-                    ("EUR", "RUB") => (100.0, 98.0),
-                    ("EUR", "USD") => (1.1111, 1.1),
-                    _ => (0.0, 0.0),
-                })
-            })
-        }
-
-        fn currency_exchange_rate<'a>(
-            &'a self,
-            from: &'static str,
-            to: &'static str,
-        ) -> RatesSpotFuture<'a, Self::Error> {
+            selection: RatesSelection,
+        ) -> RatesFetchFuture<'a, Self::Error> {
             Box::pin(async move {
                 let mut state = self.lock();
-                state.calls.push(format!("spot {from}/{to}"));
-                if state.btc_error {
-                    return Err(io::Error::other("btc down"));
+                state
+                    .calls
+                    .push(format!("fetch {}", selection.ids.join(",")));
+                let mut snapshot = RatesFetcherStub::successful_snapshot();
+                snapshot
+                    .rows
+                    .retain(|row| selection.ids.iter().any(|id| id == &row.id));
+                if state.btc_error && selection.ids.iter().any(|id| id == RATE_ID_BTC_USD) {
+                    snapshot.rows.retain(|row| row.id != RATE_ID_BTC_USD);
+                    snapshot.errors.push(RatesFetchProblem {
+                        label: "₿ BTC/USD".to_owned(),
+                        message: "btc down".to_owned(),
+                    });
                 }
-                Ok(65000.0)
+                for unknown in selection.unknown {
+                    snapshot.errors.push(RatesFetchProblem {
+                        label: unknown,
+                        message: "unknown rate alias".to_owned(),
+                    });
+                }
+                Ok(snapshot)
             })
         }
     }

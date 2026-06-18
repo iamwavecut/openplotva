@@ -27,13 +27,13 @@ use openplotva_dialog::{
     DialogTraceError, DialogTraceUsage, DrawRequest, HistoryMessage, HistorySummaryRequest,
     MESSAGE_KIND_TEXT, MESSAGE_KIND_TOOL_REQUEST, MESSAGE_KIND_TOOL_RESPONSE, NativeToolCall,
     PROVIDER_AIFARM, PROVIDER_NVIDIA, PROVIDER_VMLX, ROLE_MODEL, ROLE_TOOL, ROLE_USER,
-    STEP_CANCEL_DRAWING, STEP_CHAT_HISTORY_SUMMARY, STEP_CRAWL_URL, STEP_CURRENCY_RATES,
-    STEP_DRAW_IMAGE, STEP_GENERATE_SONG, STEP_QUEUE_STATUS, STEP_TRANSLATE_TEXT, STEP_VISION_IMAGE,
-    STEP_WEB_SEARCH, STEP_YOUTUBE_SUMMARY, SongRequest, TOOL_RESULT_STATUS_EXECUTED,
-    TOOL_RESULT_STATUS_FAILED, TOOL_RESULT_STATUS_NOOP, TOOL_RESULT_STATUS_OK,
-    TOOL_RESULT_STATUS_QUEUED, ToolContext, ToolError, ToolParseDecision, ToolResult, ToolSpec,
-    ToolStep, VisionRequest, alternative_dialog_tool_names, alternative_dialog_tools,
-    chat_completion_tools_for_names, clone_history_messages,
+    RatesRequest, STEP_CANCEL_DRAWING, STEP_CHAT_HISTORY_SUMMARY, STEP_CRAWL_URL,
+    STEP_CURRENCY_RATES, STEP_DRAW_IMAGE, STEP_GENERATE_SONG, STEP_QUEUE_STATUS,
+    STEP_TRANSLATE_TEXT, STEP_VISION_IMAGE, STEP_WEB_SEARCH, STEP_YOUTUBE_SUMMARY, SongRequest,
+    TOOL_RESULT_STATUS_EXECUTED, TOOL_RESULT_STATUS_FAILED, TOOL_RESULT_STATUS_NOOP,
+    TOOL_RESULT_STATUS_OK, TOOL_RESULT_STATUS_QUEUED, ToolContext, ToolError, ToolParseDecision,
+    ToolResult, ToolSpec, ToolStep, VisionRequest, alternative_dialog_tool_names,
+    alternative_dialog_tools, chat_completion_tools_for_names, clone_history_messages,
     decode_plotva_final_response_with_salvage, extract_content_tool_step,
     has_leading_context_message, is_dialog_history_noise_tool_call_name,
     is_internal_not_scheduled_instruction, normalize_history_message, parse_native_tool_step,
@@ -2951,7 +2951,14 @@ pub(crate) async fn execute_dialog_tool(
                 })
                 .await
         }
-        STEP_CURRENCY_RATES => toolbox.currency_rates(meta.clone()).await,
+        STEP_CURRENCY_RATES => {
+            toolbox
+                .currency_rates(RatesRequest {
+                    context: meta.clone(),
+                    pairs: step.pairs.clone(),
+                })
+                .await
+        }
         STEP_WEB_SEARCH => {
             if step.query.trim().is_empty() {
                 return Err(Box::new(AifarmDialogError::Response(

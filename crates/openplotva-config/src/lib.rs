@@ -130,7 +130,7 @@ pub const DEFAULT_PERSISTENT_QUEUE_PLACEHOLDER_MAX_AGE_SECONDS: i32 = 7200;
 
 pub const DEFAULT_LLM_JOB_MAX_ATTEMPTS: i32 = 5;
 
-pub const DEFAULT_RBC_TIMEOUT_SECONDS: i32 = 15;
+pub const DEFAULT_MARKET_RATES_TIMEOUT_SECONDS: i32 = 15;
 
 pub const DEFAULT_SERPER_TIMEOUT_SECONDS: i32 = 30;
 
@@ -298,8 +298,8 @@ pub struct AppConfig {
     pub vip: VipConfig,
     /// Persistent task queue configuration.
     pub persistent_queue: PersistentQueueConfig,
-    /// RBC rates provider configuration.
-    pub rbc: RbcConfig,
+    /// Market rates provider configuration.
+    pub market_rates: MarketRatesConfig,
     /// Serper web search provider configuration.
     pub serper: SerperConfig,
     /// Translation provider configuration.
@@ -514,7 +514,7 @@ pub struct PersistentQueueConfig {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct RbcConfig {
+pub struct MarketRatesConfig {
     pub timeout_seconds: i32,
 }
 
@@ -943,7 +943,9 @@ pub struct RawConfig {
     pub persistent_queue_placeholder_max_age_seconds: Option<String>,
     /// `LLM_JOB_MAX_ATTEMPTS`.
     pub llm_job_max_attempts: Option<String>,
-    /// `RBC_TIMEOUT_SECONDS`.
+    /// `MARKET_RATES_TIMEOUT_SECONDS`.
+    pub market_rates_timeout_seconds: Option<String>,
+    /// Deprecated fallback for `MARKET_RATES_TIMEOUT_SECONDS`.
     pub rbc_timeout_seconds: Option<String>,
     /// `SERPER_API_KEY`.
     pub serper_api_key: Option<String>,
@@ -1760,11 +1762,11 @@ impl AppConfig {
                 },
             },
             persistent_queue,
-            rbc: RbcConfig {
+            market_rates: MarketRatesConfig {
                 timeout_seconds: parse_i32(
-                    "RBC_TIMEOUT_SECONDS",
-                    raw.rbc_timeout_seconds,
-                    DEFAULT_RBC_TIMEOUT_SECONDS,
+                    "MARKET_RATES_TIMEOUT_SECONDS",
+                    raw.market_rates_timeout_seconds.or(raw.rbc_timeout_seconds),
+                    DEFAULT_MARKET_RATES_TIMEOUT_SECONDS,
                 )?,
             },
             serper,
@@ -2430,6 +2432,7 @@ impl RawConfig {
                 "PERSISTENT_QUEUE_PLACEHOLDER_MAX_AGE_SECONDS",
             ),
             llm_job_max_attempts: env("LLM_JOB_MAX_ATTEMPTS"),
+            market_rates_timeout_seconds: env("MARKET_RATES_TIMEOUT_SECONDS"),
             rbc_timeout_seconds: env("RBC_TIMEOUT_SECONDS"),
             serper_api_key: env("SERPER_API_KEY"),
             serper_timeout_seconds: env("SERPER_TIMEOUT_SECONDS"),
@@ -2919,7 +2922,8 @@ mod tests {
         DEFAULT_DIALOG_AIFARM_POOL_MODELS, DEFAULT_DIALOG_AIFARM_POOL_REASONING_MAX_TOKENS,
         DEFAULT_DIALOG_MODEL, DEFAULT_DISCOVERY_BASE_URL, DEFAULT_HISTORY_SUMMARY_PROVIDER,
         DEFAULT_HISTORY_SUMMARY_TIMEOUT_SECONDS, DEFAULT_LLM_JOB_MAX_ATTEMPTS, DEFAULT_LOG_FILTER,
-        DEFAULT_MEMORY_CONSOLIDATION_MODEL, DEFAULT_OPENROUTER_REQUEST_TIMEOUT_SECONDS,
+        DEFAULT_MARKET_RATES_TIMEOUT_SECONDS, DEFAULT_MEMORY_CONSOLIDATION_MODEL,
+        DEFAULT_OPENROUTER_REQUEST_TIMEOUT_SECONDS,
         DEFAULT_PERSISTENT_QUEUE_CLEANUP_INTERVAL_SECONDS,
         DEFAULT_PERSISTENT_QUEUE_COMPLETED_JOB_RETENTION_DAYS,
         DEFAULT_PERSISTENT_QUEUE_CONTROL_WORKERS,
@@ -2939,7 +2943,7 @@ mod tests {
         DEFAULT_PERSISTENT_QUEUE_PLACEHOLDER_MAX_AGE_SECONDS,
         DEFAULT_PERSISTENT_QUEUE_RECOVERY_INTERVAL_SECONDS, DEFAULT_PERSISTENT_QUEUE_TEXT_WORKERS,
         DEFAULT_PRUNA_API_KEY, DEFAULT_PRUNA_BEARER, DEFAULT_PRUNA_ENDPOINT, DEFAULT_PRUNA_MODEL,
-        DEFAULT_PRUNA_TIMEOUT_SECONDS, DEFAULT_RBC_TIMEOUT_SECONDS, DEFAULT_RUNTIME_API_HOST,
+        DEFAULT_PRUNA_TIMEOUT_SECONDS, DEFAULT_RUNTIME_API_HOST,
         DEFAULT_RUNTIME_API_LOG_BUFFER_SIZE, DEFAULT_RUNTIME_API_PORT,
         DEFAULT_RUNTIME_API_SQL_RESULT_BYTES_LIMIT, DEFAULT_RUNTIME_API_SQL_ROW_LIMIT,
         DEFAULT_RUNTIME_API_SQL_TIMEOUT_MS, DEFAULT_SERPER_TIMEOUT_SECONDS,
@@ -3100,7 +3104,10 @@ mod tests {
             config.persistent_queue.llm_job_max_attempts,
             DEFAULT_LLM_JOB_MAX_ATTEMPTS
         );
-        assert_eq!(config.rbc.timeout_seconds, DEFAULT_RBC_TIMEOUT_SECONDS);
+        assert_eq!(
+            config.market_rates.timeout_seconds,
+            DEFAULT_MARKET_RATES_TIMEOUT_SECONDS
+        );
         assert_eq!(config.serper.api_key, "");
         assert_eq!(
             config.serper.timeout_seconds,
@@ -3597,13 +3604,25 @@ mod tests {
     }
 
     #[test]
-    fn rbc_config_loads_go_timeout_env_value() -> Result<(), super::ConfigError> {
+    fn market_rates_config_loads_timeout_env_value() -> Result<(), super::ConfigError> {
+        let config = AppConfig::from_raw(RawConfig {
+            market_rates_timeout_seconds: Some("9".to_owned()),
+            ..RawConfig::default()
+        })?;
+
+        assert_eq!(config.market_rates.timeout_seconds, 9);
+        Ok(())
+    }
+
+    #[test]
+    fn market_rates_config_accepts_deprecated_rbc_timeout_env_value()
+    -> Result<(), super::ConfigError> {
         let config = AppConfig::from_raw(RawConfig {
             rbc_timeout_seconds: Some("9".to_owned()),
             ..RawConfig::default()
         })?;
 
-        assert_eq!(config.rbc.timeout_seconds, 9);
+        assert_eq!(config.market_rates.timeout_seconds, 9);
         Ok(())
     }
 

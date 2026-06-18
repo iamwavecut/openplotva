@@ -16,7 +16,7 @@
     <tool name="draw_image">Создать или изменить изображение по описанию и цитате.</tool>
     <tool name="generate_song">Сгенерировать песню по теме.</tool>
     <tool name="vision_image">Описать изображение по file_id из контекста.</tool>
-    <tool name="currency_rates">Курсы USD/RUB, EUR/RUB, EUR/USD, BTC/USD с динамикой.</tool>
+    <tool name="currency_rates">Курсы USD/RUB, EUR/RUB, EUR/USD, BTC/USD с динамикой; можно передать pairs для конкретных известных пар.</tool>
     <tool name="web_search">Поиск в интернете.</tool>
     <tool name="crawl_url">Текст страницы по URL.</tool>
     <tool name="youtube_summary">Саммари YouTube с таймкодами.</tool>

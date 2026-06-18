@@ -9076,8 +9076,8 @@ async fn start_runtime_workers(
         dialog_context::dialog_vision_direct_image_limit(Some(config.vision.direct_image_limit)),
     ));
     let rates_fetcher = Arc::new(
-        rates::RbcRatesClient::from_config(&config.rbc)
-            .context("failed to initialize RBC rates provider")?,
+        rates::MarketRatesClient::from_config(&config.market_rates)
+            .context("failed to initialize market rates provider")?,
     );
     let rates_tool_dispatcher = Arc::new(rates::RatesToolDispatcherEffects::new(
         store.clone(),

@@ -10,10 +10,10 @@ use std::{
 use openplotva_core::{ChatAttachment, ChatMessageMeta, SENDER_TYPE_USER};
 use openplotva_dialog::{
     DialogToolbox, DrawRequest, HistorySummaryRequest, IMAGE_GENERATION_NOT_SCHEDULED_MESSAGE,
-    SONG_GENERATION_NOT_SCHEDULED_MESSAGE, SongRequest, TOOL_RESULT_STATUS_EXECUTED,
+    RatesRequest, SONG_GENERATION_NOT_SCHEDULED_MESSAGE, SongRequest, TOOL_RESULT_STATUS_EXECUTED,
     TOOL_RESULT_STATUS_FAILED, TOOL_RESULT_STATUS_NOOP, TOOL_RESULT_STATUS_OK,
-    TOOL_RESULT_STATUS_QUEUED, ToolContext, ToolError, ToolResult, ToolSideEffect, ToolboxError,
-    ToolboxFuture, VisionRequest, is_internal_not_scheduled_instruction, sanitize_tool_text,
+    TOOL_RESULT_STATUS_QUEUED, ToolError, ToolResult, ToolSideEffect, ToolboxError, ToolboxFuture,
+    VisionRequest, is_internal_not_scheduled_instruction, sanitize_tool_text,
     user_facing_not_scheduled_message,
 };
 use openplotva_history::{StoredSummary, SummaryContent};
@@ -1876,7 +1876,7 @@ where
     RatesDispatcherT: RatesSideEffectDispatcher + Send + Sync + 'static,
     TranslatorT: TextTranslator + Send + Sync + 'static,
 {
-    fn currency_rates<'a>(&'a self, meta: ToolContext) -> ToolboxFuture<'a> {
+    fn currency_rates<'a>(&'a self, req: RatesRequest) -> ToolboxFuture<'a> {
         Box::pin(async move {
             let Some(dispatcher) = self.rates_dispatcher.as_deref() else {
                 return Ok(ToolResult::failed(
@@ -1884,7 +1884,13 @@ where
                     "rates service unavailable",
                 ));
             };
-            Ok(currency_rates_tool(self.rates_fetcher.as_deref(), dispatcher, &meta).await)
+            Ok(currency_rates_tool(
+                self.rates_fetcher.as_deref(),
+                dispatcher,
+                &req.context,
+                &req.pairs,
+            )
+            .await)
         })
     }
 
@@ -2416,7 +2422,7 @@ mod tests {
     use openplotva_core::ChatMessageMeta;
     use openplotva_dialog::{
         TOOL_RESULT_STATUS_EXECUTED, TOOL_RESULT_STATUS_FAILED, TOOL_RESULT_STATUS_NOOP,
-        TOOL_RESULT_STATUS_QUEUED, ToolError, ToolSideEffect, ToolboxError,
+        TOOL_RESULT_STATUS_QUEUED, ToolContext, ToolError, ToolSideEffect, ToolboxError,
     };
     use openplotva_taskman::{
         DEFAULT_PRIORITY, IMAGE_REGULAR_QUEUE_NAME, IMAGE_VIP_QUEUE_NAME, JobPayload, JobType,
@@ -2427,8 +2433,8 @@ mod tests {
     use super::*;
     use crate::{
         rates::{
-            RatesDailyFuture, RatesDispatchFuture, RatesSideEffectDispatchResult, RatesSpotFuture,
-            RatesToolInvocationContext,
+            RateQuote, RatesDispatchFuture, RatesFetchFuture, RatesFetchProblem, RatesSelection,
+            RatesSideEffectDispatchResult, RatesSnapshot, RatesToolInvocationContext,
         },
         translate::TranslateProviderFuture,
     };
@@ -2450,30 +2456,40 @@ mod tests {
     impl RatesFetcher for RatesFetcherStub {
         type Error = TestError;
 
-        fn fx_daily_last_two_closes<'a>(
+        fn fetch_rates<'a>(
             &'a self,
-            from: &'static str,
-            to: &'static str,
-        ) -> RatesDailyFuture<'a, Self::Error> {
-            let result = match (from, to) {
-                ("USD", "RUB") => Ok((90.0, 89.0)),
-                ("EUR", "RUB") => Ok((100.0, 101.0)),
-                ("EUR", "USD") => Ok((1.1, 1.0)),
-                _ => Err(TestError(format!("unexpected pair {from}/{to}"))),
-            };
-            Box::pin(async move { result })
-        }
-
-        fn currency_exchange_rate<'a>(
-            &'a self,
-            from: &'static str,
-            to: &'static str,
-        ) -> RatesSpotFuture<'a, Self::Error> {
-            let result = match (from, to) {
-                ("BTC", "USD") => Ok(100_000.0),
-                _ => Err(TestError(format!("unexpected pair {from}/{to}"))),
-            };
-            Box::pin(async move { result })
+            selection: RatesSelection,
+        ) -> RatesFetchFuture<'a, Self::Error> {
+            Box::pin(async move {
+                let mut snapshot = RatesSnapshot::default();
+                for id in selection.ids {
+                    let (label, value, precision, unit) = match id.as_str() {
+                        "usd_rub" => ("💵 USD/RUB", 90.0, 2, "₽"),
+                        "eur_rub" => ("💶 EUR/RUB", 100.0, 2, "₽"),
+                        "eur_usd" => ("💶/💵 EUR/USD", 1.1, 4, ""),
+                        "btc_usd" => ("₿ BTC/USD", 100_000.0, 0, "$"),
+                        other => {
+                            snapshot.errors.push(RatesFetchProblem {
+                                label: other.to_owned(),
+                                message: "unexpected pair".to_owned(),
+                            });
+                            continue;
+                        }
+                    };
+                    snapshot.rows.push(RateQuote {
+                        id,
+                        label: label.to_owned(),
+                        value,
+                        precision,
+                        unit: unit.to_owned(),
+                        delta: None,
+                        source: "test".to_owned(),
+                        timestamp: None,
+                        stale: false,
+                    });
+                }
+                Ok(snapshot)
+            })
         }
     }
 
@@ -3192,13 +3208,16 @@ mod tests {
             })),
         );
 
-        let result = toolbox.currency_rates(context()).await?;
+        let result = toolbox
+            .currency_rates(RatesRequest {
+                context: context(),
+                pairs: String::new(),
+            })
+            .await?;
 
         assert_eq!(result.status, TOOL_RESULT_STATUS_QUEUED);
-        assert_eq!(
-            result.message,
-            "USD/RUB=90.00 (+1.1%)\nEUR/RUB=100.00 (-1.0%)\nEUR/USD=1.1000 (+10.0%)\nBTC/USD=100000"
-        );
+        assert!(result.message.contains("💵 USD/RUB=90.00 ₽"));
+        assert!(result.message.contains("₿ BTC/USD=100000 $"));
         assert_eq!(
             result.data.as_ref().expect("data")["rates_text"],
             result.message
@@ -3208,7 +3227,8 @@ mod tests {
         assert_eq!(calls[0].0.mode, "multi_turn");
         assert_eq!(calls[0].0.chat_id, -100);
         assert_eq!(calls[0].0.thread_id, Some(7));
-        assert_eq!(calls[0].1, result.message);
+        assert!(calls[0].1.contains("<table"));
+        assert!(calls[0].1.contains("💵 USD/RUB"));
         Ok(())
     }
 
