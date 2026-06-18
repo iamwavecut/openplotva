@@ -458,6 +458,9 @@ pub struct TaskQueueRecord {
     /// Telegram queue-position placeholder message ID.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue_position_message_id: Option<i32>,
+    /// Queue-position message send is in flight; workers must wait until it resolves.
+    #[serde(default, skip)]
+    pub queue_position_message_pending: bool,
     /// Telegram result message ID.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_message_id: Option<i32>,
@@ -957,8 +960,12 @@ impl InMemoryTaskQueue {
         }
     }
 
-    /// Assign a job to a named queue and return its taskman ID.
-    pub fn assign(&self, queue_name: impl Into<String>, job: StatelessJobItem) -> i64 {
+    fn assign_with_queue_position_pending(
+        &self,
+        queue_name: impl Into<String>,
+        job: StatelessJobItem,
+        queue_position_message_pending: bool,
+    ) -> i64 {
         let mut state = self.lock();
         let id = self.next_job_id(&mut state);
         let record = TaskQueueRecord {
@@ -973,6 +980,7 @@ impl InMemoryTaskQueue {
             error: None,
             progress_message_id: None,
             queue_position_message_id: None,
+            queue_position_message_pending,
             result_message_id: None,
             messages: Vec::new(),
             events: Vec::new(),
@@ -982,6 +990,11 @@ impl InMemoryTaskQueue {
         self.append_wal_record(task_queue_wal_upsert(record));
         drop(state);
         id
+    }
+
+    /// Assign a job to a named queue and return its taskman ID.
+    pub fn assign(&self, queue_name: impl Into<String>, job: StatelessJobItem) -> i64 {
+        self.assign_with_queue_position_pending(queue_name, job, false)
     }
 
     /// Assign a job only when the user has fewer than `max_active_jobs` active jobs.
@@ -1000,6 +1013,28 @@ impl InMemoryTaskQueue {
             return Ok(None);
         }
         Ok(Some(self.assign(queue_name, job)))
+    }
+
+    /// Assign a job with a queue-position message send pending.
+    pub fn assign_with_user_limit_and_queue_position_pending(
+        &self,
+        queue_name: impl Into<String>,
+        job: StatelessJobItem,
+        max_active_jobs: usize,
+    ) -> Result<Option<i64>, TaskQueueError> {
+        let queue_name = queue_name.into();
+        if max_active_jobs == 0 {
+            return Ok(Some(
+                self.assign_with_queue_position_pending(queue_name, job, true),
+            ));
+        }
+        let user_id = job_user_id(&job);
+        if self.user_active_count(&queue_name, user_id) >= max_active_jobs {
+            return Ok(None);
+        }
+        Ok(Some(
+            self.assign_with_queue_position_pending(queue_name, job, true),
+        ))
     }
 
     pub fn dequeue(
@@ -1266,6 +1301,7 @@ impl InMemoryTaskQueue {
             error: None,
             progress_message_id: None,
             queue_position_message_id: None,
+            queue_position_message_pending: false,
             result_message_id: None,
             messages: Vec::new(),
             events: Vec::new(),
@@ -1626,6 +1662,7 @@ impl InMemoryTaskQueue {
             .ok_or(TaskQueueError::JobNotFound(job_id))?;
         record.progress_message_id = progress_message_id;
         record.queue_position_message_id = queue_position_message_id;
+        record.queue_position_message_pending = false;
         record.result_message_id = result_message_id;
         let record = record.clone();
         self.append_wal_record(task_queue_wal_upsert(record));
@@ -1646,6 +1683,7 @@ impl InMemoryTaskQueue {
             .find(|record| record.id == job_id)
             .ok_or(TaskQueueError::JobNotFound(job_id))?;
         record.queue_position_message_id = queue_position_message_id;
+        record.queue_position_message_pending = false;
         let record = record.clone();
         self.append_wal_record(task_queue_wal_upsert(record));
         drop(state);
@@ -2825,7 +2863,9 @@ fn next_pending_index_matching(
         .iter()
         .enumerate()
         .filter(|(_index, record)| {
-            record.queue_name == queue_name && record.status == JobStatus::Pending
+            record.queue_name == queue_name
+                && record.status == JobStatus::Pending
+                && !record.queue_position_message_pending
         })
         .filter(|(index, record)| {
             !dialog_lane_blocked(lane_blockers.as_ref(), records, *index, record)
@@ -3908,6 +3948,53 @@ mod tests {
             vec![second, third]
         );
         assert_eq!(entries[0].queue_position_message_id, Some(902));
+        Ok(())
+    }
+
+    #[test]
+    fn queue_position_pending_job_counts_but_waits_for_message_id()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let queue = InMemoryTaskQueue::new();
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let job = new_image_gen_job_at(
+            ImageGenJobParams {
+                chat_id: -100,
+                message_id: 20,
+                user_id: 30,
+                user_full_name: "Alice".to_owned(),
+                prompt: "draw".to_owned(),
+                ..ImageGenJobParams::default()
+            },
+            now,
+        );
+        let job_id = queue
+            .assign_with_user_limit_and_queue_position_pending(IMAGE_REGULAR_QUEUE_NAME, job, 1)?
+            .expect("assigned");
+
+        assert_eq!(
+            queue.queue_depth_for_priority_or_higher(IMAGE_REGULAR_QUEUE_NAME, DEFAULT_PRIORITY),
+            1
+        );
+        assert_eq!(queue.user_active_count(IMAGE_REGULAR_QUEUE_NAME, 30), 1);
+        assert!(
+            queue
+                .dequeue_matching(IMAGE_REGULAR_QUEUE_NAME, "worker", now, |job| job
+                    .data
+                    .job_type
+                    == JobType::ImageGen)
+                .is_none()
+        );
+
+        queue.set_queue_position_message_id(job_id, Some(901))?;
+        assert_eq!(
+            queue
+                .dequeue_matching(IMAGE_REGULAR_QUEUE_NAME, "worker", now, |job| job
+                    .data
+                    .job_type
+                    == JobType::ImageGen)
+                .map(|item| item.id),
+            Some(job_id)
+        );
         Ok(())
     }
 

@@ -8299,6 +8299,7 @@ mod tests {
             error: None,
             progress_message_id: None,
             queue_position_message_id: None,
+            queue_position_message_pending: false,
             result_message_id: None,
             messages: Vec::new(),
             events: Vec::new(),

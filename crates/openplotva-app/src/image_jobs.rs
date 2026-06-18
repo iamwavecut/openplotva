@@ -1379,6 +1379,21 @@ pub struct ImageEditJobExecutionReport {
     pub error: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct DrawPlaceholderTarget {
+    reuse_message_id: Option<i32>,
+    delete_after_fresh_send_message_id: Option<i32>,
+}
+
+impl DrawPlaceholderTarget {
+    fn reuse(message_id: Option<i32>) -> Self {
+        Self {
+            reuse_message_id: message_id.filter(|id| *id > 0),
+            delete_after_fresh_send_message_id: None,
+        }
+    }
+}
+
 /// Result from one queue poll.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ImageGenQueuePollOutcome {
@@ -1577,6 +1592,25 @@ where
     Generator: ImageGenerator + Sync,
     Effects: ImageJobEffects + Sync,
 {
+    execute_image_gen_job_with_placeholder_target(
+        generator,
+        effects,
+        params,
+        DrawPlaceholderTarget::reuse(reuse_message_id),
+    )
+    .await
+}
+
+async fn execute_image_gen_job_with_placeholder_target<Generator, Effects>(
+    generator: &Generator,
+    effects: &Effects,
+    params: ImageGenJobParams,
+    placeholder_target: DrawPlaceholderTarget,
+) -> ImageGenJobExecutionReport
+where
+    Generator: ImageGenerator + Sync,
+    Effects: ImageJobEffects + Sync,
+{
     let params = sanitize_image_gen_job_params(params);
     let prompt = image_gen_prompt(&params);
     let caption_text = image_gen_caption_text(&params, &prompt);
@@ -1591,7 +1625,7 @@ where
     );
 
     // Reuse the queue placeholder in place when allowed, otherwise post a fresh message.
-    let draw_message_id = match reuse_message_id {
+    let draw_message_id = match placeholder_target.reuse_message_id {
         Some(reused) => {
             let _ = effects
                 .edit_draw_message(params.chat_id, reused, crate::rich::compose_draw_started())
@@ -1621,6 +1655,9 @@ where
             }
         },
     };
+    if let Some(stale) = placeholder_target.delete_after_fresh_send_message_id {
+        effects.delete_message(params.chat_id, stale).await;
+    }
 
     let request = ImageGenerationRequest {
         chat_id: params.chat_id,
@@ -1848,21 +1885,30 @@ where
     .await
 }
 
-/// Reuse the queue placeholder in place as the draw target.
-///
-/// The placeholder is the message we later edit to show progress, the final gallery, or an
-/// error. Deleting a not-yet-finished placeholder (which is what the old "chat moved on" branch
-/// did) lost the draw silently, because the very message used to surface the result/error was
-/// gone. So we never delete an in-flight placeholder; we always reuse it.
+/// Decide whether the queue placeholder becomes the draw target. If the chat moved on too far,
+/// send a fresh draw message first, then delete the stale waiting message.
 async fn draw_placeholder_reuse_target<Effects>(
-    _effects: &Effects,
-    _chat_id: i64,
+    effects: &Effects,
+    chat_id: i64,
     queue_position_message_id: Option<i32>,
-) -> Option<i32>
+) -> DrawPlaceholderTarget
 where
     Effects: ImageJobEffects + Sync,
 {
-    queue_position_message_id.filter(|id| *id > 0)
+    let Some(placeholder) = queue_position_message_id.filter(|id| *id > 0) else {
+        return DrawPlaceholderTarget::default();
+    };
+    let quiet = effects
+        .chat_messages_after(chat_id, placeholder)
+        .await
+        .map_or(true, |count| count <= DRAW_PLACEHOLDER_REUSE_MAX_MESSAGES);
+    if quiet {
+        return DrawPlaceholderTarget::reuse(Some(placeholder));
+    }
+    DrawPlaceholderTarget {
+        reuse_message_id: None,
+        delete_after_fresh_send_message_id: Some(placeholder),
+    }
 }
 
 #[must_use]
@@ -1881,12 +1927,31 @@ where
     Editor: ImageEditor + Sync,
     Effects: ImageJobEffects + Sync,
 {
+    execute_image_edit_job_with_placeholder_target(
+        editor,
+        effects,
+        params,
+        DrawPlaceholderTarget::reuse(reuse_message_id),
+    )
+    .await
+}
+
+async fn execute_image_edit_job_with_placeholder_target<Editor, Effects>(
+    editor: &Editor,
+    effects: &Effects,
+    params: ImageEditJobParams,
+    placeholder_target: DrawPlaceholderTarget,
+) -> ImageEditJobExecutionReport
+where
+    Editor: ImageEditor + Sync,
+    Effects: ImageJobEffects + Sync,
+{
     let params = sanitize_image_edit_job_params(params);
     let display_caption =
         build_image_generation_caption(&params.prompt, &params.user_full_name, true, false);
 
     // Reuse the queue placeholder in place when allowed, otherwise post a fresh message.
-    let draw_message_id = match reuse_message_id {
+    let draw_message_id = match placeholder_target.reuse_message_id {
         Some(reused) => {
             let _ = effects
                 .edit_draw_message(params.chat_id, reused, crate::rich::compose_draw_started())
@@ -1914,6 +1979,9 @@ where
             }
         },
     };
+    if let Some(stale) = placeholder_target.delete_after_fresh_send_message_id {
+        effects.delete_message(params.chat_id, stale).await;
+    }
 
     let request = ImageEditRequest {
         chat_id: params.chat_id,
@@ -2108,7 +2176,9 @@ where
     let queue_position_message_id = queue.job_queue_position_message_id(work.id);
     let reuse_target =
         draw_placeholder_reuse_target(effects, params.chat_id, queue_position_message_id).await;
-    let execution = execute_image_gen_job(generator, effects, params, reuse_target).await;
+    let execution =
+        execute_image_gen_job_with_placeholder_target(generator, effects, params, reuse_target)
+            .await;
     match execution.outcome {
         ImageGenJobExecutionOutcome::Completed => {
             if !execution.image_urls.is_empty() {
@@ -2334,7 +2404,8 @@ where
     let queue_position_message_id = queue.job_queue_position_message_id(work.id);
     let reuse_target =
         draw_placeholder_reuse_target(effects, params.chat_id, queue_position_message_id).await;
-    let execution = execute_image_edit_job(editor, effects, params, reuse_target).await;
+    let execution =
+        execute_image_edit_job_with_placeholder_target(editor, effects, params, reuse_target).await;
     match execution.outcome {
         ImageEditJobExecutionOutcome::Completed => {
             if !execution.image_urls.is_empty() {
@@ -4105,13 +4176,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn image_gen_queue_worker_reuses_placeholder_even_when_chat_is_busy() {
+    async fn image_gen_queue_worker_reposts_placeholder_when_chat_is_busy() {
         let queue = InMemoryTaskQueue::new();
         let now = OffsetDateTime::from_unix_timestamp(1_779_193_800).expect("time");
         draw_reuse_test_job(&queue, now);
 
-        // Even when the chat moved on, the not-yet-finished placeholder must NOT be deleted:
-        // the message we edit to show the result is the same one. Reuse it in place.
+        // More than the threshold of messages since the placeholder: surface the draw near
+        // the bottom, then delete the stale waiting message.
         let effects =
             EffectsStub::with_chat_messages_after(DRAW_PLACEHOLDER_REUSE_MAX_MESSAGES + 1);
         let report = run_image_gen_queue_once(
@@ -4126,17 +4197,14 @@ mod tests {
         assert_eq!(report.outcome, ImageGenQueuePollOutcome::Completed);
 
         let calls = effects.calls();
-        assert!(
-            !calls.iter().any(|call| call.starts_with("delete:")),
-            "must not delete an in-flight placeholder: {calls:?}"
-        );
-        assert_eq!(calls.len(), 3);
+        assert_eq!(calls.len(), 4);
         assert_eq!(
             calls[0],
-            "edit:-100:701:<tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji>"
+            "placeholder:-100:20:0:<tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji>"
         );
-        assert_eq!(calls[1], "publish:[Url(\"https://img.test/1.png\")]");
-        assert!(calls[2].starts_with("edit:-100:701:"));
+        assert_eq!(calls[1], "delete:-100:701");
+        assert_eq!(calls[2], "publish:[Url(\"https://img.test/1.png\")]");
+        assert!(calls[3].starts_with("edit:-100:888:"));
     }
 
     #[tokio::test]

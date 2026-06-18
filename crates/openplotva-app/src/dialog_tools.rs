@@ -1022,10 +1022,7 @@ impl ImageScheduler for TaskmanDialogToolAdapter {
             {
                 return Ok(not_scheduled_no_reply());
             }
-            match self
-                .queue
-                .assign_with_user_limit(plan.queue_name, job, plan.max_active_jobs)
-            {
+            match self.assign_image_job(plan.queue_name, job, plan.max_active_jobs) {
                 Ok(Some(job_id)) => {
                     self.grow_task_enqueue(plan.queue_name, chat_id, user_id)
                         .await;
@@ -1215,10 +1212,7 @@ impl TaskmanDialogToolAdapter {
         {
             return Ok(not_scheduled_no_reply());
         }
-        match self
-            .queue
-            .assign_with_user_limit(plan.queue_name, job, plan.max_active_jobs)
-        {
+        match self.assign_image_job(plan.queue_name, job, plan.max_active_jobs) {
             Ok(Some(job_id)) => {
                 self.grow_task_enqueue(plan.queue_name, chat_id, user_id)
                     .await;
@@ -1280,6 +1274,25 @@ impl TaskmanDialogToolAdapter {
         }
     }
 
+    fn assign_image_job(
+        &self,
+        queue_name: &str,
+        job: openplotva_taskman::StatelessJobItem,
+        max_active_jobs: usize,
+    ) -> Result<Option<i64>, openplotva_taskman::TaskQueueError> {
+        if self.queue_position_rich.is_some() {
+            return self
+                .queue
+                .assign_with_user_limit_and_queue_position_pending(
+                    queue_name,
+                    job,
+                    max_active_jobs,
+                );
+        }
+        self.queue
+            .assign_with_user_limit(queue_name, job, max_active_jobs)
+    }
+
     /// Post the initial "waiting in queue" message (bare waiting emoji) for a freshly-enqueued
     /// image job and persist its id so the worker can reuse or delete it when drawing starts.
     async fn announce_queue_position(
@@ -1306,9 +1319,18 @@ impl TaskmanDialogToolAdapter {
                     let _ = self
                         .queue
                         .set_queue_position_message_id(job_id, Some(message_id));
+                } else {
+                    let _ = self.queue.set_queue_position_message_id(job_id, None);
+                    tracing::warn!(
+                        chat_id,
+                        job_id,
+                        message_id,
+                        "draw queue-position message id is out of range"
+                    );
                 }
             }
             Err(error) => {
+                let _ = self.queue.set_queue_position_message_id(job_id, None);
                 tracing::warn!(chat_id, job_id, %error, "failed to post draw queue-position message");
             }
         }
@@ -4104,7 +4126,9 @@ mod tests {
             .await?;
 
         assert_eq!(scheduled.status, "scheduled");
-        let job_id = queue.records()[0].id;
+        let records = queue.records();
+        let job_id = records[0].id;
+        assert!(!records[0].queue_position_message_pending);
         assert_eq!(queue.job_queue_position_message_id(job_id), Some(1001));
         let sent = rich.sent.lock().expect("rich sent");
         assert_eq!(sent.len(), 1);
