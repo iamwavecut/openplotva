@@ -36,8 +36,9 @@ use openplotva_taskman::{
     dialog_job_params_from_stateless_job,
 };
 use openplotva_telegram::{
-    clean_unicode_non_printables, decode_html_entities, ensure_telegram_safe_text,
-    sanitize_telegram_html,
+    ChatRef, DispatcherQueue, ReplyMessageRef, RichMessageRequest, TELEGRAM_PARSE_MODE_HTML,
+    TextMessageRequest, clean_unicode_non_printables, decode_html_entities,
+    ensure_telegram_safe_text, sanitize_rich_html, sanitize_telegram_html,
 };
 use thiserror::Error;
 use time::{Duration as TimeDuration, OffsetDateTime, format_description::well_known::Rfc3339};
@@ -48,6 +49,10 @@ use crate::{
         dialog_reference_context_from_memory,
     },
     memory_runtime::{EmbeddingProvider, memory_retrieval_query_task},
+    virtual_messages::{
+        QueueRichRequest, QueueTextRequest, VirtualIdFactory, VirtualMessageStore,
+        monotonic_virtual_id_factory, queue_rich_message, queue_text_message_parts,
+    },
     vision::DialogVisionInputMaterializer,
 };
 
@@ -527,26 +532,35 @@ impl DialogInputMaterializer for PostgresDialogInputMaterializer {
     }
 }
 
-/// Rich-message-backed dialog answer side effects.
 #[derive(Clone)]
-pub struct DialogDispatcherEffects {
-    rich: Arc<dyn crate::rich::RichSender>,
+pub struct DialogDispatcherEffects<Store> {
+    store: Store,
+    queue: Arc<DispatcherQueue>,
+    next_virtual_id: VirtualIdFactory,
 }
 
-impl DialogDispatcherEffects {
-    /// Build dialog side effects that reply with rich messages.
+impl<Store> DialogDispatcherEffects<Store> {
     #[must_use]
-    pub fn new(rich: Arc<dyn crate::rich::RichSender>) -> Self {
-        Self { rich }
+    pub fn new(store: Store, queue: Arc<DispatcherQueue>) -> Self {
+        Self {
+            store,
+            queue,
+            next_virtual_id: monotonic_virtual_id_factory("dialog-vmsg"),
+        }
+    }
+
+    #[must_use]
+    pub fn with_virtual_id_factory(mut self, next_virtual_id: VirtualIdFactory) -> Self {
+        self.next_virtual_id = next_virtual_id;
+        self
     }
 }
 
 /// Concrete dispatch failure.
 #[derive(Debug, Error)]
 pub enum DialogDispatchEffectError {
-    /// Dialog answer could not be sent as a rich message.
-    #[error("failed to send dialog answer: {0}")]
-    RichSend(String),
+    #[error("failed to queue dialog answer: {0}")]
+    Queue(#[from] openplotva_telegram::OutboundBuildError),
 }
 
 impl DialogJobWorkerQueue for InMemoryTaskQueue {
@@ -609,7 +623,10 @@ impl DialogJobWorkerQueue for InMemoryTaskQueue {
     }
 }
 
-impl DialogJobEffects for DialogDispatcherEffects {
+impl<Store> DialogJobEffects for DialogDispatcherEffects<Store>
+where
+    Store: VirtualMessageStore + Send + Sync,
+{
     type Error = DialogDispatchEffectError;
 
     fn send_dialog_answer<'a>(
@@ -618,17 +635,62 @@ impl DialogJobEffects for DialogDispatcherEffects {
         answer: &'a str,
     ) -> DialogJobEffectFuture<'a, Self::Error> {
         Box::pin(async move {
-            let options = openplotva_telegram::RichSendOptions {
-                message_thread_id: params.thread_id.map(i64::from),
-                reply_to_message_id: Some(i64::from(params.message_id)),
-                allow_sending_without_reply: true,
-                disable_notification: false,
-                reply_markup: None,
+            let chat = ChatRef {
+                id: params.chat_id,
+                is_forum: params.thread_id.is_some(),
             };
-            self.rich
-                .send_rich(params.chat_id, answer, &options)
-                .await
-                .map_err(|err| DialogDispatchEffectError::RichSend(err.to_string()))?;
+            let reply_to = ReplyMessageRef {
+                message_id: i64::from(params.message_id),
+                chat,
+                is_topic_message: params.thread_id.is_some(),
+                message_thread_id: params.thread_id.map(i64::from).unwrap_or_default(),
+            };
+            if dialog_response_requires_rich(answer) {
+                let request = RichMessageRequest {
+                    chat: Some(chat),
+                    message_thread_id: params.thread_id.map(i64::from).unwrap_or_default(),
+                    disable_notification: false,
+                    allow_sending_without_reply: None,
+                    html: answer.to_owned(),
+                    reply_markup: None,
+                };
+                queue_rich_message(
+                    &self.store,
+                    &self.queue,
+                    QueueRichRequest {
+                        message: &request,
+                        reply_to: Some(&reply_to),
+                        immediate: true,
+                        bypass_chat_restrictions: false,
+                        ephemeral_delete_after: None,
+                    },
+                    || (self.next_virtual_id)(),
+                )
+                .await?;
+            } else {
+                let request = TextMessageRequest {
+                    chat: Some(chat),
+                    message_thread_id: params.thread_id.map(i64::from).unwrap_or_default(),
+                    disable_notification: false,
+                    allow_sending_without_reply: None,
+                    text: answer.to_owned(),
+                    render_as: TELEGRAM_PARSE_MODE_HTML.to_owned(),
+                    reply_markup: None,
+                };
+                queue_text_message_parts(
+                    &self.store,
+                    &self.queue,
+                    QueueTextRequest {
+                        message: &request,
+                        reply_to: Some(&reply_to),
+                        immediate_first: true,
+                        bypass_chat_restrictions: false,
+                        ephemeral_delete_after: None,
+                    },
+                    || (self.next_virtual_id)(),
+                )
+                .await?;
+            }
             Ok(())
         })
     }
@@ -1834,9 +1896,68 @@ pub fn prepare_dialog_chat_response(raw: &str) -> String {
         return String::new();
     }
 
-    sanitize_telegram_html(&decode_html_entities(&strip_code_fences(trimmed)))
-        .trim()
-        .to_owned()
+    let decoded = decode_html_entities(&strip_code_fences(trimmed));
+    if dialog_response_requires_rich(&decoded) {
+        sanitize_rich_html(&decoded).trim().to_owned()
+    } else {
+        sanitize_telegram_html(&decoded).trim().to_owned()
+    }
+}
+
+#[must_use]
+pub fn dialog_response_requires_rich(value: &str) -> bool {
+    const RICH_ONLY_TAGS: &[&str] = &[
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "p",
+        "footer",
+        "hr",
+        "ul",
+        "ol",
+        "li",
+        "table",
+        "tr",
+        "td",
+        "th",
+        "details",
+        "summary",
+        "figure",
+        "figcaption",
+        "img",
+        "video",
+        "audio",
+        "tg-math",
+        "tg-reference",
+    ];
+    let lower = value.to_ascii_lowercase();
+    RICH_ONLY_TAGS
+        .iter()
+        .any(|tag| html_contains_tag(&lower, tag))
+}
+
+fn html_contains_tag(lower_html: &str, tag: &str) -> bool {
+    let open = format!("<{tag}");
+    let close = format!("</{tag}>");
+    if lower_html.contains(&close) {
+        return true;
+    }
+    let mut search_from = 0;
+    while let Some(offset) = lower_html[search_from..].find(&open) {
+        let after_tag = search_from + offset + open.len();
+        match lower_html.as_bytes().get(after_tag) {
+            None | Some(b'>') | Some(b'/') | Some(b' ') | Some(b'\t' | b'\n' | b'\r') => {
+                return true;
+            }
+            Some(_) => {
+                search_from = after_tag;
+            }
+        }
+    }
+    false
 }
 
 fn strip_code_fences(value: &str) -> String {
@@ -2861,19 +2982,56 @@ mod tests {
     #[tokio::test]
     async fn dialog_dispatcher_effects_allow_sending_without_deleted_reply_target()
     -> Result<(), Box<dyn Error>> {
-        let mock = Arc::new(crate::rich::MockRichSender::default());
-        let effects = DialogDispatcherEffects::new(mock.clone());
+        let store = DialogVirtualStore;
+        let queue = Arc::new(DispatcherQueue::new(
+            openplotva_telegram::DispatcherConfig::default(),
+        ));
+        let effects = DialogDispatcherEffects::new(store, Arc::clone(&queue))
+            .with_virtual_id_factory(Arc::new(|| "dialog-v1".to_owned()));
 
         effects
             .send_dialog_answer(&dialog_params("hello"), "pong")
             .await?;
 
-        let sent = mock.sent.lock().unwrap();
-        assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].chat_id, 42);
-        assert_eq!(sent[0].html, "pong");
-        assert_eq!(sent[0].reply_to_message_id, Some(100));
-        assert!(sent[0].allow_sending_without_reply);
+        let item = queue.dequeue_immediate().expect("queued dialog answer");
+        assert_eq!(
+            item.method_kind(),
+            Some(openplotva_telegram::TelegramOutboundMethodKind::SendMessage)
+        );
+        let (_, method) = item.into_parts();
+        let Some(openplotva_telegram::TelegramOutboundMethod::SendMessage(method)) = method else {
+            return Err("expected sendMessage".into());
+        };
+        let value = serde_json::to_value(method.as_ref())?;
+        assert_eq!(value["chat_id"], 42);
+        assert_eq!(value["text"], "pong");
+        assert_eq!(value["reply_parameters"]["message_id"], 100);
+        assert_eq!(
+            value["reply_parameters"]["allow_sending_without_reply"],
+            true
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dialog_dispatcher_effects_routes_rich_only_html_to_rich_queue()
+    -> Result<(), Box<dyn Error>> {
+        let store = DialogVirtualStore;
+        let queue = Arc::new(DispatcherQueue::new(
+            openplotva_telegram::DispatcherConfig::default(),
+        ));
+        let effects = DialogDispatcherEffects::new(store, Arc::clone(&queue))
+            .with_virtual_id_factory(Arc::new(|| "dialog-v1".to_owned()));
+
+        effects
+            .send_dialog_answer(&dialog_params("hello"), "<h2>pong</h2>")
+            .await?;
+
+        let item = queue.dequeue_immediate().expect("queued dialog answer");
+        assert_eq!(
+            item.method_kind(),
+            Some(openplotva_telegram::TelegramOutboundMethodKind::SendRichMessage)
+        );
         Ok(())
     }
 
@@ -3498,6 +3656,19 @@ mod tests {
     }
 
     #[test]
+    fn dialog_rich_router_keeps_classic_telegram_html_classic() {
+        assert!(!dialog_response_requires_rich("<pre>code</pre>"));
+        assert!(!dialog_response_requires_rich(
+            "<a href='https://example.test'>link</a>"
+        ));
+        assert!(dialog_response_requires_rich("<p>paragraph</p>"));
+        assert!(dialog_response_requires_rich("<h2>Status</h2>"));
+        assert!(dialog_response_requires_rich(
+            "<table><tr><td>1</td></tr></table>"
+        ));
+    }
+
+    #[test]
     fn duplicate_guard_matches_go_normalization_and_latest_model_policy() {
         let history = vec![
             HistoryMessage {
@@ -3936,6 +4107,60 @@ mod tests {
             max_output_tokens: 0,
             thread_id: None,
             ..dialog_params("")
+        }
+    }
+
+    #[derive(Clone)]
+    struct DialogVirtualStore;
+
+    impl VirtualMessageStore for DialogVirtualStore {
+        type Error = std::convert::Infallible;
+
+        fn get_mapping_by_virtual<'a>(
+            &'a self,
+            _vmsg_id: String,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<Option<openplotva_core::MessageIdMapping>, Self::Error>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn insert_virtual_message<'a>(
+            &'a self,
+            _vmsg_id: String,
+            _chat_id: i64,
+            _thread_id: Option<i32>,
+        ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn resolve_virtual_message<'a>(
+            &'a self,
+            _vmsg_id: String,
+            _real_message_id: i32,
+        ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn enqueue_message_op<'a>(
+            &'a self,
+            _vmsg_id: String,
+            _chat_id: i64,
+            _op: &'static str,
+            _payload_json: Option<String>,
+        ) -> Pin<Box<dyn Future<Output = Result<i64, Self::Error>> + Send + 'a>> {
+            Box::pin(async { Ok(0) })
+        }
+
+        fn delete_mapping_by_virtual<'a>(
+            &'a self,
+            _vmsg_id: String,
+        ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
         }
     }
 

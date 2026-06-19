@@ -20,9 +20,9 @@ use openplotva_server::{
     RuntimeTaskmanJobsFilter, RuntimeToken, RuntimeUpdatesInspector, RuntimeUpdatesRuntimeData,
 };
 use openplotva_telegram::{
-    ChatRef, DispatcherQueue, OutboundBuildError, ReplyMarkup, ReplyMessageRef,
+    ChatRef, DispatcherQueue, OutboundBuildError, ReplyMarkup, ReplyMessageRef, RichMessageRequest,
     TELEGRAM_PARSE_MODE_HTML, TextMessageRequest, build_inline_keyboard_button_url,
-    build_inline_keyboard_markup, build_inline_keyboard_row,
+    build_inline_keyboard_markup, build_inline_keyboard_row, escape_telegram_html_text,
 };
 use openplotva_web::settings_selection_base_url;
 use thiserror::Error;
@@ -35,8 +35,8 @@ use crate::runtime_api::{IssuedRuntimeToken, RuntimeTokenManager, RuntimeTokenSt
 use crate::settings::{AdminChatSettingsTarget, AdminChatTargetResolver};
 use crate::updates::{UpdateHandler, UpdateHandlerFuture};
 use crate::virtual_messages::{
-    QueueTextRequest, VirtualIdFactory, VirtualMessageStore, monotonic_virtual_id_factory,
-    queue_text_message_parts,
+    QueueRichRequest, QueueTextRequest, VirtualIdFactory, VirtualMessageStore,
+    monotonic_virtual_id_factory, queue_rich_message, queue_text_message_parts,
 };
 
 const ADMIN_ENABLE_CHAT_COMMAND: &str = "admin_enable_chat";
@@ -271,6 +271,33 @@ where
         plan: AdminTextPlan,
     ) -> AdminCommandEffectFuture<'a, Self::Error> {
         Box::pin(async move {
+            if admin_text_should_use_rich(&plan) {
+                let rich = RichMessageRequest {
+                    chat: plan.message.chat,
+                    message_thread_id: plan.message.message_thread_id,
+                    disable_notification: plan.message.disable_notification,
+                    allow_sending_without_reply: plan.message.allow_sending_without_reply,
+                    html: admin_text_rich_html(&plan.message),
+                    reply_markup: None,
+                };
+                let queued = queue_rich_message(
+                    &self.store,
+                    &self.queue,
+                    QueueRichRequest {
+                        message: &rich,
+                        reply_to: Some(&plan.reply_to),
+                        immediate: plan.ephemeral_delete_after.is_some(),
+                        bypass_chat_restrictions: false,
+                        ephemeral_delete_after: plan.ephemeral_delete_after,
+                    },
+                    || (self.next_virtual_id)(),
+                )
+                .await;
+                if !matches!(queued, Err(OutboundBuildError::RichMessageTooLong(_, _))) {
+                    queued?;
+                    return Ok(());
+                }
+            }
             queue_text_message_parts(
                 &self.store,
                 &self.queue,
@@ -286,6 +313,22 @@ where
             .await?;
             Ok(())
         })
+    }
+}
+
+fn admin_text_should_use_rich(plan: &AdminTextPlan) -> bool {
+    plan.message.reply_markup.is_none()
+        && (plan.message.render_as == TELEGRAM_PARSE_MODE_HTML || plan.message.text.contains('\n'))
+}
+
+fn admin_text_rich_html(message: &TextMessageRequest) -> String {
+    if message.render_as == TELEGRAM_PARSE_MODE_HTML {
+        message.text.clone()
+    } else {
+        format!(
+            "<p>{}</p>",
+            escape_telegram_html_text(&message.text).replace('\n', "<br>")
+        )
     }
 }
 

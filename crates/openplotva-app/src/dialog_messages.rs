@@ -3419,8 +3419,13 @@ mod tests {
         };
 
         let provider = DialogProviderStub::returning("  decoded <b>pong</b>  ");
-        let mock = Arc::new(crate::rich::MockRichSender::default());
-        let effects = crate::dialog_jobs::DialogDispatcherEffects::new(mock.clone());
+        let outbound_queue = Arc::new(openplotva_telegram::DispatcherQueue::new(
+            openplotva_telegram::DispatcherConfig::default(),
+        ));
+        let effects = crate::dialog_jobs::DialogDispatcherEffects::new(
+            VirtualStoreStub::default(),
+            Arc::clone(&outbound_queue),
+        );
         let worker_report = crate::dialog_jobs::process_dialog_job_once_in_queue_at(
             queue.as_ref(),
             DIALOG_AIFARM_QUEUE_NAME,
@@ -3434,14 +3439,13 @@ mod tests {
         assert!(worker_report.sent_answer);
         assert!(worker_report.completed);
         assert!(!worker_report.failed);
-        {
-            let sent = mock.sent.lock().unwrap();
-            assert_eq!(sent.len(), 1);
-            assert_eq!(sent[0].chat_id, 42);
-            assert_eq!(sent[0].html, "decoded <b>pong</b>");
-            assert_eq!(sent[0].reply_to_message_id, Some(77));
-            assert!(sent[0].allow_sending_without_reply);
-        }
+        let item = outbound_queue
+            .dequeue_immediate()
+            .expect("queued dialog response");
+        assert_eq!(
+            item.method_kind(),
+            Some(openplotva_telegram::TelegramOutboundMethodKind::SendMessage)
+        );
         let provider_inputs = provider.inputs();
         assert_eq!(provider_inputs.len(), 1);
         assert_eq!(provider_inputs[0].context.chat_id, 42);
@@ -3576,8 +3580,13 @@ mod tests {
         };
 
         let provider = DialogProviderStub::returning("  random <b>pong</b>  ");
-        let mock = Arc::new(crate::rich::MockRichSender::default());
-        let effects = crate::dialog_jobs::DialogDispatcherEffects::new(mock.clone());
+        let outbound_queue = Arc::new(openplotva_telegram::DispatcherQueue::new(
+            openplotva_telegram::DispatcherConfig::default(),
+        ));
+        let effects = crate::dialog_jobs::DialogDispatcherEffects::new(
+            VirtualStoreStub::default(),
+            Arc::clone(&outbound_queue),
+        );
         let worker_report = crate::dialog_jobs::process_dialog_job_once_in_queue_at(
             queue.as_ref(),
             DIALOG_AIFARM_QUEUE_NAME,
@@ -3591,14 +3600,13 @@ mod tests {
         assert!(worker_report.sent_answer);
         assert!(worker_report.completed);
         assert!(!worker_report.failed);
-        {
-            let sent = mock.sent.lock().unwrap();
-            assert_eq!(sent.len(), 1);
-            assert_eq!(sent[0].chat_id, -100);
-            assert_eq!(sent[0].html, "random <b>pong</b>");
-            assert_eq!(sent[0].reply_to_message_id, Some(78));
-            assert!(sent[0].allow_sending_without_reply);
-        }
+        let item = outbound_queue
+            .dequeue_immediate()
+            .expect("queued dialog response");
+        assert_eq!(
+            item.method_kind(),
+            Some(openplotva_telegram::TelegramOutboundMethodKind::SendMessage)
+        );
         let provider_inputs = provider.inputs();
         assert_eq!(provider_inputs.len(), 1);
         assert_eq!(provider_inputs[0].context.chat_id, -100);

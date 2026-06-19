@@ -26,7 +26,7 @@ use openplotva_taskman::{
 };
 use openplotva_telegram::{
     ChatRef, DeleteMessageRequest, DispatcherConfig, DispatcherQueue, OutboundBuildError,
-    ReplyMarkup, ReplyMessageRef, TELEGRAM_PARSE_MODE_HTML, TextMessageRequest,
+    ReplyMarkup, ReplyMessageRef, RichMessageRequest, TextMessageRequest,
     build_delete_message_method, execute_telegram_method,
 };
 use thiserror::Error;
@@ -34,8 +34,8 @@ use time::OffsetDateTime;
 
 use crate::updates::{UpdateHandler, UpdateHandlerFuture};
 use crate::virtual_messages::{
-    QueueTextReport, QueueTextRequest, VirtualIdFactory, VirtualMessageStore,
-    monotonic_virtual_id_factory, queue_text_message_parts,
+    QueueRichRequest, QueueTextReport, QueueTextRequest, VirtualIdFactory, VirtualMessageStore,
+    monotonic_virtual_id_factory, queue_rich_message, queue_text_message_parts,
     send_work_item_and_resolve_with_ephemeral,
 };
 
@@ -607,6 +607,7 @@ pub struct TelegramJoinGreetingSender {
         crate::permissions::ChatPermissionPolicy<openplotva_storage::PostgresChatSettingsStore>,
     >,
     telegram: openplotva_telegram::TelegramClient,
+    rich: openplotva_telegram::RichApiClient,
     next_virtual_id: Arc<AtomicU64>,
 }
 
@@ -619,12 +620,14 @@ impl TelegramJoinGreetingSender {
             crate::permissions::ChatPermissionPolicy<openplotva_storage::PostgresChatSettingsStore>,
         >,
         telegram: openplotva_telegram::TelegramClient,
+        rich: openplotva_telegram::RichApiClient,
     ) -> Self {
         Self {
             virtual_store,
             ephemeral_store,
             permissions,
             telegram,
+            rich,
             next_virtual_id: Arc::new(AtomicU64::new(1)),
         }
     }
@@ -673,13 +676,12 @@ impl NewMembersGreetingSender for TelegramJoinGreetingSender {
                 id: message.chat_id,
                 is_forum: message.thread_id.is_some(),
             };
-            let request = TextMessageRequest {
+            let request = RichMessageRequest {
                 chat: Some(chat),
                 message_thread_id: message.thread_id.unwrap_or_default().into(),
                 disable_notification: message.disable_notification,
                 allow_sending_without_reply: None,
-                text: message.text,
-                render_as: TELEGRAM_PARSE_MODE_HTML.to_owned(),
+                html: message.text.clone(),
                 reply_markup: None,
             };
             let reply_to = ReplyMessageRef {
@@ -688,20 +690,20 @@ impl NewMembersGreetingSender for TelegramJoinGreetingSender {
                 is_topic_message: message.thread_id.is_some(),
                 message_thread_id: message.thread_id.unwrap_or_default().into(),
             };
-            if let Err(error) = queue_text_message_parts(
+            let queued = queue_rich_message(
                 &self.virtual_store,
                 &queue,
-                QueueTextRequest {
+                QueueRichRequest {
                     message: &request,
                     reply_to: Some(&reply_to),
-                    immediate_first: true,
+                    immediate: true,
                     bypass_chat_restrictions: false,
                     ephemeral_delete_after: Some(message.delete_after),
                 },
                 || self.next_virtual_id(),
             )
-            .await
-            {
+            .await;
+            if let Err(error) = queued {
                 tracing::warn!(%error, chat_id = chat.id, "failed to queue join greeting");
                 return None;
             }
@@ -716,7 +718,14 @@ impl NewMembersGreetingSender for TelegramJoinGreetingSender {
                     &self.ephemeral_store,
                     item,
                     OffsetDateTime::now_utc(),
-                    |method| async move { execute_telegram_method(&self.telegram, method).await },
+                    |method| async move {
+                        openplotva_telegram::execute_telegram_method_with_rich(
+                            &self.telegram,
+                            &self.rich,
+                            method,
+                        )
+                        .await
+                    },
                 )
                 .await;
                 if first_message_id.is_none() {
@@ -2687,10 +2696,7 @@ pub async fn compose_and_send_greeting_at<Cache, Settings, Members, Sender>(
         return;
     }
 
-    let text = join_greeting_text(
-        &names,
-        &openplotva_telegram::sanitize_telegram_html(html_body),
-    );
+    let text = join_greeting_text(&names, &openplotva_telegram::sanitize_rich_html(html_body));
     if let Ok(Some(previous_id)) = cache.previous_greeting_message_id(greeting.chat_id).await {
         sender
             .delete_previous_greeting_message(greeting.chat_id, previous_id)
@@ -2916,20 +2922,19 @@ fn format_user_link(user_id: i64, safe_name: &str) -> String {
 
 fn join_greeting_text(names: &[String], html_body: &str) -> String {
     if names.len() == 1 {
-        return format!("{}, добро пожаловать!\n{html_body}", names[0]);
+        return format!(
+            "<h3>Добро пожаловать</h3><p>{}, добро пожаловать!</p>{html_body}",
+            names[0]
+        );
     }
     format!(
-        "Новые участники:\n{}\n\n{html_body}",
-        numbered_greeting_names(names).join("\n")
+        "<h3>Новые участники</h3><ol>{}</ol>{html_body}",
+        names
+            .iter()
+            .map(|name| format!("<li>{name}</li>"))
+            .collect::<Vec<_>>()
+            .join("")
     )
-}
-
-fn numbered_greeting_names(names: &[String]) -> Vec<String> {
-    names
-        .iter()
-        .enumerate()
-        .map(|(index, name)| format!("{}) {name}", index + 1))
-        .collect()
 }
 
 fn is_active_participant_status(status: &str) -> bool {
@@ -4893,7 +4898,7 @@ mod tests {
                 chat_id: -10042,
                 reply_to_message_id: 88,
                 thread_id: Some(99),
-                text: "Новые участники:\n1) <a href='tg://user?id=7'>Alice</a>\n2) <a href='tg://user?id=8'>Bob Builder</a>\n\n<b>welcome</b>".to_owned(),
+                text: "<h3>Новые участники</h3><ol><li><a href='tg://user?id=7'>Alice</a></li><li><a href='tg://user?id=8'>Bob Builder</a></li></ol><b>welcome</b>".to_owned(),
                 disable_notification: true,
                 delete_after: Duration::from_secs(10 * 60),
             }]

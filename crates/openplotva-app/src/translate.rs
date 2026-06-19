@@ -12,7 +12,8 @@ use openplotva_taskman::{
     StatelessJobItem, control_job_params_from_stateless_job, new_control_job_at,
 };
 use openplotva_telegram::{
-    ChatRef, DispatcherQueue, OutboundBuildError, ReplyMessageRef, TextMessageRequest,
+    ChatRef, DispatcherQueue, OutboundBuildError, ReplyMessageRef, RichMessageRequest,
+    TextMessageRequest, escape_telegram_html_text,
 };
 use serde::Deserialize;
 use thiserror::Error;
@@ -21,8 +22,8 @@ use url::form_urlencoded;
 
 use crate::updates::{UpdateHandler, UpdateHandlerFuture};
 use crate::virtual_messages::{
-    QueueTextRequest, VirtualIdFactory, VirtualMessageStore, monotonic_virtual_id_factory,
-    queue_text_message_parts,
+    QueueRichRequest, QueueTextRequest, VirtualIdFactory, VirtualMessageStore,
+    monotonic_virtual_id_factory, queue_rich_message, queue_text_message_parts,
 };
 
 const TRANSLATE_CONTROL_JOB_TITLE: &str = "translate";
@@ -247,19 +248,36 @@ where
         plan: TranslateResultPlan,
     ) -> TranslateEffectFuture<'a, Self::Error> {
         Box::pin(async move {
-            queue_text_message_parts(
+            let rich = queue_rich_message(
                 &self.store,
                 &self.queue,
-                QueueTextRequest {
-                    message: &plan.message,
+                QueueRichRequest {
+                    message: &plan.rich_message,
                     reply_to: Some(&plan.reply_to),
-                    immediate_first: false,
+                    immediate: false,
                     bypass_chat_restrictions: false,
                     ephemeral_delete_after: None,
                 },
                 || (self.next_virtual_id)(),
             )
-            .await?;
+            .await;
+            if let Err(OutboundBuildError::RichMessageTooLong(_, _)) = rich {
+                queue_text_message_parts(
+                    &self.store,
+                    &self.queue,
+                    QueueTextRequest {
+                        message: &plan.message,
+                        reply_to: Some(&plan.reply_to),
+                        immediate_first: false,
+                        bypass_chat_restrictions: false,
+                        ephemeral_delete_after: None,
+                    },
+                    || (self.next_virtual_id)(),
+                )
+                .await?;
+            } else {
+                rich?;
+            }
             Ok(())
         })
     }
@@ -884,6 +902,7 @@ pub struct TranslateCommandMessage {
 #[derive(Clone, Debug, PartialEq)]
 pub struct TranslateResultPlan {
     pub message: TextMessageRequest,
+    pub rich_message: RichMessageRequest,
     pub reply_to: ReplyMessageRef,
 }
 
@@ -1308,8 +1327,16 @@ pub fn translate_result_plan_from_control_job(
             message_thread_id: 0,
             disable_notification: false,
             allow_sending_without_reply: None,
-            text: translated,
+            text: translated.clone(),
             render_as: String::new(),
+            reply_markup: None,
+        },
+        rich_message: RichMessageRequest {
+            chat: Some(chat),
+            message_thread_id: params.thread_id.map(i64::from).unwrap_or_default(),
+            disable_notification: false,
+            allow_sending_without_reply: None,
+            html: compose_translation_rich(&translated, &params.data.target_lang),
             reply_markup: None,
         },
         reply_to: ReplyMessageRef {
@@ -1319,6 +1346,21 @@ pub fn translate_result_plan_from_control_job(
             message_thread_id: params.thread_id.map(i64::from).unwrap_or_default(),
         },
     }
+}
+
+fn compose_translation_rich(translated: &str, target_lang: &str) -> String {
+    let mut html = format!(
+        "<h3>Перевод</h3><p>{}</p>",
+        escape_telegram_html_text(translated).replace('\n', "<br>")
+    );
+    let target = target_lang.trim();
+    if !target.is_empty() {
+        html.push_str(&format!(
+            "<footer>Язык: {}</footer>",
+            escape_telegram_html_text(target)
+        ));
+    }
+    html
 }
 
 pub async fn translate_text_tool<Translator>(
@@ -2181,6 +2223,14 @@ mod tests {
                     render_as: String::new(),
                     reply_markup: None,
                 },
+                rich_message: RichMessageRequest {
+                    chat: Some(chat),
+                    message_thread_id: 9,
+                    disable_notification: false,
+                    allow_sending_without_reply: None,
+                    html: compose_translation_rich("привет", "ru"),
+                    reply_markup: None,
+                },
                 reply_to: ReplyMessageRef {
                     message_id: 77,
                     chat,
@@ -2192,24 +2242,27 @@ mod tests {
 
         assert_eq!(
             store.inserted(),
-            vec![("translate-vmsg-1".to_owned(), -10042, Some(0))]
+            vec![("translate-vmsg-1".to_owned(), -10042, Some(9))]
         );
         assert!(queue.dequeue_immediate().is_none());
         let item = queue.dequeue_regular().expect("queued translation result");
         assert_eq!(
             item.method_kind(),
-            Some(TelegramOutboundMethodKind::SendMessage)
+            Some(TelegramOutboundMethodKind::SendRichMessage)
         );
         assert!(item.ephemeral_delete_after().is_none());
         assert!(!item.bypasses_chat_restrictions());
         let (_metadata, method) = item.into_parts();
         let payload = method_as_value(method.expect("queued method"))?;
         assert_eq!(payload["chat_id"], json!(-10042));
-        assert_eq!(payload["text"], json!("привет"));
-        assert_eq!(payload["reply_parameters"]["message_id"], json!(77));
-        assert_eq!(payload["reply_parameters"]["chat_id"], json!(-10042));
+        assert_eq!(payload["chat_id"], json!(-10042));
         assert_eq!(
-            payload["reply_parameters"]["allow_sending_without_reply"],
+            payload["html"],
+            json!("<h3>Перевод</h3><p>привет</p><footer>Язык: ru</footer>")
+        );
+        assert_eq!(payload["options"]["reply_to_message_id"], json!(77));
+        assert_eq!(
+            payload["options"]["allow_sending_without_reply"],
             json!(true)
         );
         Ok(())
@@ -2885,6 +2938,9 @@ mod tests {
     fn method_as_value(method: openplotva_telegram::TelegramOutboundMethod) -> io::Result<Value> {
         match method {
             openplotva_telegram::TelegramOutboundMethod::SendMessage(method) => {
+                serde_json::to_value(method.as_ref()).map_err(io::Error::other)
+            }
+            openplotva_telegram::TelegramOutboundMethod::SendRichMessage(method) => {
                 serde_json::to_value(method.as_ref()).map_err(io::Error::other)
             }
             other => Err(io::Error::other(format!(

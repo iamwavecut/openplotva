@@ -467,6 +467,12 @@ pub fn telegram_retry_after_from_execute_error(
     }
 }
 
+pub fn telegram_retry_after_from_outbound_error(
+    error: &openplotva_telegram::TelegramOutboundExecuteError,
+) -> Option<Duration> {
+    error.retry_after().map(Duration::from_secs)
+}
+
 #[cfg(test)]
 mod tests {
     use std::{

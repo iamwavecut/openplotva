@@ -12,8 +12,8 @@ use crate::{
     AudioMessagePlan, AudioSource, DispatcherDrain, DispatcherPersistencePayload, DispatcherQueue,
     DispatcherRestoredMessage, DispatcherWorkItem, EditMediaMessagePlan, EnqueueOutcome,
     MediaGroupMessagePlan, MediaGroupPhotoItem, MessageFingerprint, PhotoMessagePlan, PhotoSource,
-    ReplyParametersPlan, StickerMessagePlan, TelegramOutboundMethod, TelegramOutboundMethodKind,
-    hash_content, parse_mode_from_go,
+    ReplyParametersPlan, SendRichMessage, StickerMessagePlan, TelegramOutboundMethod,
+    TelegramOutboundMethodKind, hash_content, parse_mode_from_go,
 };
 
 pub const DEFAULT_DISPATCHER_QUEUE_KEY: &str = "plotva:message_queue";
@@ -321,6 +321,7 @@ fn replay_method_from_value(
 ) -> Option<TelegramOutboundMethod> {
     match method_kind {
         TelegramOutboundMethodKind::SendMessage => replay_text_method(value),
+        TelegramOutboundMethodKind::SendRichMessage => replay_rich_method(value),
         TelegramOutboundMethodKind::SendSticker => replay_sticker_method(value),
         TelegramOutboundMethodKind::SendPhoto => replay_photo_method(value),
         TelegramOutboundMethodKind::SendAudio => replay_audio_method(value),
@@ -339,6 +340,12 @@ fn replay_method_from_value(
         TelegramOutboundMethodKind::EditMessageMedia => replay_edit_media_method(value),
         TelegramOutboundMethodKind::DeleteMessage => replay_delete_method(value),
     }
+}
+
+fn replay_rich_method(value: &Value) -> Option<TelegramOutboundMethod> {
+    serde_json::from_value::<SendRichMessage>(value.clone())
+        .ok()
+        .map(TelegramOutboundMethod::from)
 }
 
 fn replay_text_method(value: &Value) -> Option<TelegramOutboundMethod> {
@@ -485,6 +492,12 @@ fn fingerprint_from_value(
             chat_id,
             message_type: "text".to_owned(),
             content_hash: hash_content(&field_string(value, &["Text", "text"]).unwrap_or_default()),
+            debounce_key: None,
+        },
+        TelegramOutboundMethodKind::SendRichMessage => MessageFingerprint {
+            chat_id,
+            message_type: "rich".to_owned(),
+            content_hash: hash_content(&field_string(value, &["html"]).unwrap_or_default()),
             debounce_key: None,
         },
         TelegramOutboundMethodKind::SendSticker => {
@@ -694,6 +707,9 @@ fn serialize_outbound_method(
         TelegramOutboundMethod::SendMessage(method) => {
             serde_json::to_vec(method.as_ref()).map(Some)
         }
+        TelegramOutboundMethod::SendRichMessage(method) => {
+            serde_json::to_vec(method.as_ref()).map(Some)
+        }
         TelegramOutboundMethod::EditMessageText(method) => {
             serde_json::to_vec(method.as_ref()).map(Some)
         }
@@ -719,6 +735,7 @@ fn serialize_outbound_method(
 fn go_message_type(kind: TelegramOutboundMethodKind) -> &'static str {
     match kind {
         TelegramOutboundMethodKind::SendMessage => "*api.MessageConfig",
+        TelegramOutboundMethodKind::SendRichMessage => "openplotva.RichMessageConfig",
         TelegramOutboundMethodKind::SendSticker => "*api.StickerConfig",
         TelegramOutboundMethodKind::SendPhoto => "*api.PhotoConfig",
         TelegramOutboundMethodKind::SendAudio => "*api.AudioConfig",
@@ -747,6 +764,7 @@ fn message_type_method_kind(message_type: &str) -> Option<TelegramOutboundMethod
         | "*api.MessageConfig"
         | "tgbotapi.MessageConfig"
         | "api.MessageConfig" => Some(TelegramOutboundMethodKind::SendMessage),
+        "openplotva.RichMessageConfig" => Some(TelegramOutboundMethodKind::SendRichMessage),
         "*tgbotapi.StickerConfig"
         | "*api.StickerConfig"
         | "tgbotapi.StickerConfig"
@@ -837,13 +855,14 @@ mod tests {
         AudioMessagePlan, AudioSource, DEFAULT_DISPATCHER_QUEUE_KEY,
         DEFAULT_DISPATCHER_SHUTDOWN_TIMEOUT, DebouncerConfig, DispatcherConfig, DispatcherMessage,
         DispatcherPersistenceError, DispatcherQueue, DispatcherRestoredMessage,
-        EditMediaMessagePlan, EnqueueOutcome, MESSAGE_TYPE_TEXT, MediaGroupMessagePlan,
-        MediaGroupPhotoItem, MessageFingerprint, PersistentDispatcherItem,
+        EditMediaMessagePlan, EnqueueOutcome, MESSAGE_TYPE_RICH, MESSAGE_TYPE_TEXT,
+        MediaGroupMessagePlan, MediaGroupPhotoItem, MessageFingerprint, PersistentDispatcherItem,
         PersistentDispatcherReplay, PhotoMessagePlan, PhotoSource, ReplyParametersPlan,
-        StickerMessagePlan, TELEGRAM_PARSE_MODE_HTML, TelegramOutboundMethod,
-        TelegramOutboundMethodKind, hash_content, persistent_queue_from_drain,
-        persistent_queue_redis_value_from_items, persistent_queue_replay_from_json,
-        persistent_queue_replay_from_redis_value, restore_persistent_queue_replay,
+        RichSendOptions, SendRichMessage, StickerMessagePlan, TELEGRAM_PARSE_MODE_HTML,
+        TelegramOutboundMethod, TelegramOutboundMethodKind, hash_content,
+        persistent_queue_from_drain, persistent_queue_redis_value_from_items,
+        persistent_queue_replay_from_json, persistent_queue_replay_from_redis_value,
+        restore_persistent_queue_replay,
     };
 
     fn text_message(chat_id: i64, text: &str, virtual_id: &str) -> DispatcherMessage {
@@ -860,6 +879,32 @@ mod tests {
 
     fn text_method(chat_id: i64, text: &str) -> TelegramOutboundMethod {
         TelegramOutboundMethod::from(carapax::types::SendMessage::new(chat_id, text))
+    }
+
+    fn rich_message(chat_id: i64, html: &str, virtual_id: &str) -> DispatcherMessage {
+        DispatcherMessage::new(
+            MessageFingerprint {
+                chat_id,
+                message_type: MESSAGE_TYPE_RICH.to_owned(),
+                content_hash: hash_content(html),
+                debounce_key: None,
+            },
+            virtual_id,
+        )
+    }
+
+    fn rich_method(chat_id: i64, html: &str) -> TelegramOutboundMethod {
+        TelegramOutboundMethod::from(SendRichMessage {
+            chat_id,
+            html: html.to_owned(),
+            options: RichSendOptions {
+                message_thread_id: Some(77),
+                reply_to_message_id: Some(9),
+                allow_sending_without_reply: true,
+                disable_notification: true,
+                reply_markup: None,
+            },
+        })
     }
 
     fn restored_text(
@@ -993,6 +1038,59 @@ mod tests {
             persisted.items[0].method_kind(),
             Some(TelegramOutboundMethodKind::SendMessage)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn rich_message_persistence_roundtrips_rust_owned_payload()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let queue = DispatcherQueue::new(DispatcherConfig::default());
+        queue.enqueue(
+            rich_message(42, "<h3>hello</h3>", "rich-1")
+                .with_method(rich_method(42, "<h3>hello</h3>")),
+            true,
+        );
+
+        let persisted = persistent_queue_from_drain(queue.drain_for_shutdown(), 100)?;
+
+        assert_eq!(persisted.skipped, 0);
+        assert_eq!(persisted.items.len(), 1);
+        assert_eq!(
+            persisted.items[0].message_type,
+            "openplotva.RichMessageConfig"
+        );
+        assert_eq!(
+            persisted.items[0].method_kind(),
+            Some(TelegramOutboundMethodKind::SendRichMessage)
+        );
+
+        let payload: Value = serde_json::from_slice(&persisted.items[0].message)?;
+        assert_eq!(payload["chat_id"], json!(42));
+        assert_eq!(payload["html"], json!("<h3>hello</h3>"));
+        assert_eq!(payload["options"]["message_thread_id"], json!(77));
+        assert_eq!(payload["options"]["reply_to_message_id"], json!(9));
+        assert_eq!(
+            payload["options"]["allow_sending_without_reply"],
+            json!(true)
+        );
+
+        let raw = serde_json::to_vec(&persisted.items)?;
+        let replay = persistent_queue_replay_from_json(&raw)?;
+        assert_eq!(replay.skipped, 0);
+        assert_eq!(replay.items.len(), 1);
+        assert_eq!(
+            replay.items[0].method.kind(),
+            TelegramOutboundMethodKind::SendRichMessage
+        );
+        let TelegramOutboundMethod::SendRichMessage(method) = &replay.items[0].method else {
+            panic!("expected sendRichMessage method");
+        };
+        assert_eq!(method.chat_id, 42);
+        assert_eq!(method.html, "<h3>hello</h3>");
+        assert_eq!(method.options.message_thread_id, Some(77));
+        assert_eq!(method.options.reply_to_message_id, Some(9));
+        assert!(method.options.allow_sending_without_reply);
+
         Ok(())
     }
 

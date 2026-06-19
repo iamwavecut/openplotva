@@ -301,9 +301,9 @@ pub fn dispatcher_required_actions(
     method_kind: TelegramOutboundMethodKind,
 ) -> &'static [&'static str] {
     match method_kind {
-        TelegramOutboundMethodKind::SendMessage | TelegramOutboundMethodKind::SendChatAction => {
-            &[ACTION_SEND_TEXT]
-        }
+        TelegramOutboundMethodKind::SendMessage
+        | TelegramOutboundMethodKind::SendRichMessage
+        | TelegramOutboundMethodKind::SendChatAction => &[ACTION_SEND_TEXT],
         TelegramOutboundMethodKind::SendSticker => &[ACTION_SEND_STICKER, ACTION_SEND_TEXT],
         TelegramOutboundMethodKind::EditMessageText => &[ACTION_EDIT_MESSAGE],
         _ => &[],
@@ -317,6 +317,7 @@ pub fn telegram_execute_error_is_permission_error(error: &carapax::api::ExecuteE
 fn permission_error_media_flag(method_kind: TelegramOutboundMethodKind) -> Option<bool> {
     match method_kind {
         TelegramOutboundMethodKind::SendMessage
+        | TelegramOutboundMethodKind::SendRichMessage
         | TelegramOutboundMethodKind::SendChatAction
         | TelegramOutboundMethodKind::EditMessageText => Some(false),
         TelegramOutboundMethodKind::SendSticker

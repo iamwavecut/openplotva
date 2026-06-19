@@ -18,13 +18,17 @@ use sha1::{Digest, Sha1};
 use thiserror::Error;
 
 use crate::{
-    DispatcherPersistencePayload, TELEGRAM_PARSE_MODE_HTML, escape_telegram_html_text,
-    extract_visible_text, sanitize_telegram_html, split_telegram_text, strip_telegram_html,
+    DispatcherPersistencePayload, RICH_MESSAGE_MAX_CHARS, RichSendOptions, SendRichMessage,
+    TELEGRAM_PARSE_MODE_HTML, escape_telegram_html_text, extract_visible_text,
+    rich_message_within_char_limit, sanitize_rich_html, sanitize_telegram_html,
+    split_telegram_text, strip_telegram_html,
 };
 
 pub const TELEGRAM_TEXT_MAX_BYTES: usize = 4096;
 
 pub const MESSAGE_TYPE_TEXT: &str = "text";
+
+pub const MESSAGE_TYPE_RICH: &str = "rich";
 
 pub const SETTINGS_BUTTON_TEXT: &str = "⚙️ Настройки";
 
@@ -121,6 +125,21 @@ pub struct TextMessageRequest {
     pub text: String,
     pub render_as: String,
     /// Markup attached only to the last split text part.
+    pub reply_markup: Option<ReplyMarkup>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RichMessageRequest {
+    /// Target chat when not replying to an existing message.
+    pub chat: Option<ChatRef>,
+    /// Target topic ID for forum chats.
+    pub message_thread_id: i64,
+    /// Whether Telegram should suppress user notification sound.
+    pub disable_notification: bool,
+    pub allow_sending_without_reply: Option<bool>,
+    /// Rich HTML payload.
+    pub html: String,
+    /// Markup attached to the rich message.
     pub reply_markup: Option<ReplyMarkup>,
 }
 
@@ -483,6 +502,8 @@ pub enum OutboundBuildError {
     InputMedia(String),
     #[error("failed to serialize Telegram persistence payload: {0}")]
     PersistencePayload(String),
+    #[error("rich message is too long: {0} chars, max {1}")]
+    RichMessageTooLong(usize, usize),
 }
 
 /// Build all outbound `sendMessage` methods for a text request.
@@ -535,6 +556,46 @@ pub fn build_text_message_method(
     }
 
     Ok(method)
+}
+
+/// Build one outbound `sendRichMessage` method.
+pub fn build_rich_message_method(
+    req: &RichMessageRequest,
+    chat: ChatRef,
+    reply_to: Option<&ReplyMessageRef>,
+) -> Result<SendRichMessage, OutboundBuildError> {
+    let html = sanitize_rich_html(&req.html);
+    if html.is_empty() {
+        return Err(OutboundBuildError::EmptyText);
+    }
+    let chars = html.chars().count();
+    if !rich_message_within_char_limit(&html) {
+        return Err(OutboundBuildError::RichMessageTooLong(
+            chars,
+            RICH_MESSAGE_MAX_CHARS,
+        ));
+    }
+    let reply_markup = req
+        .reply_markup
+        .as_ref()
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(|error| OutboundBuildError::PersistencePayload(error.to_string()))?;
+    let options = RichSendOptions {
+        message_thread_id: reply_to
+            .and_then(reply_thread_id)
+            .filter(|thread_id| *thread_id != 0)
+            .or_else(|| forum_thread_id(chat, req.message_thread_id).filter(|id| *id != 0)),
+        reply_to_message_id: reply_to.map(|reply| reply.message_id),
+        allow_sending_without_reply: allow_sending_without_reply(req.allow_sending_without_reply),
+        disable_notification: req.disable_notification,
+        reply_markup,
+    };
+    Ok(SendRichMessage {
+        chat_id: chat.id,
+        html,
+        options,
+    })
 }
 
 /// Build an outbound `editMessageText` method.
@@ -1060,6 +1121,10 @@ pub fn hash_content(content: &str) -> u32 {
 
 pub fn fingerprint_text_message_part(chat_id: i64, part: &str) -> MessageFingerprint {
     message_fingerprint(chat_id, MESSAGE_TYPE_TEXT, hash_content(part))
+}
+
+pub fn fingerprint_rich_message(chat_id: i64, html: &str) -> MessageFingerprint {
+    message_fingerprint(chat_id, MESSAGE_TYPE_RICH, hash_content(html))
 }
 
 pub fn fingerprint_sticker_message_plan(plan: &StickerMessagePlan) -> MessageFingerprint {

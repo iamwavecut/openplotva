@@ -9,8 +9,8 @@
 
 use std::fmt;
 
-use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::{TELEGRAM_HTTP_CONNECT_TIMEOUT, TELEGRAM_HTTP_REQUEST_TIMEOUT};
@@ -38,7 +38,7 @@ impl fmt::Debug for RichApiClient {
 }
 
 /// Optional parameters shared by rich-message sends.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Deserialize, PartialEq, Serialize)]
 pub struct RichSendOptions {
     pub message_thread_id: Option<i64>,
     pub reply_to_message_id: Option<i64>,
@@ -46,6 +46,15 @@ pub struct RichSendOptions {
     pub disable_notification: bool,
     /// A serialized `InlineKeyboardMarkup` (or compatible) object.
     pub reply_markup: Option<Value>,
+}
+
+/// Concrete raw Bot API payload for queued `sendRichMessage`.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct SendRichMessage {
+    pub chat_id: i64,
+    pub html: String,
+    #[serde(default)]
+    pub options: RichSendOptions,
 }
 
 /// Errors raised while calling the rich-message Bot API.
@@ -115,6 +124,15 @@ impl RichApiClient {
         options: &RichSendOptions,
     ) -> Result<RichMessage, RichApiError> {
         self.call("sendRichMessage", build_send_body(chat_id, html, options))
+            .await
+    }
+
+    /// Send a pre-built queued rich message.
+    pub async fn send_rich_message_request(
+        &self,
+        request: &SendRichMessage,
+    ) -> Result<RichMessage, RichApiError> {
+        self.send_rich_message(request.chat_id, &request.html, &request.options)
             .await
     }
 

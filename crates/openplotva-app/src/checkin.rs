@@ -20,10 +20,10 @@ use openplotva_taskman::{
     StatelessJobItem, control_job_params_from_stateless_job, new_control_job_at,
 };
 use openplotva_telegram::{
-    ChatRef, DispatcherConfig, DispatcherQueue, EditTextMessageRequest, InlineKeyboardMarkup,
-    OutboundBuildError, ReplyMarkup, ReplyMessageRef, TELEGRAM_PARSE_MODE_HTML,
+    ChatRef, DispatcherConfig, DispatcherQueue, InlineKeyboardMarkup, OutboundBuildError,
+    ReplyMarkup, ReplyMessageRef, RichMessageRequest, TELEGRAM_PARSE_MODE_HTML,
     TelegramOutboundMethod, TextMessageRequest, build_checkin_theme_selection_keyboard,
-    execute_telegram_method,
+    sanitize_rich_html,
 };
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -32,8 +32,8 @@ use crate::updates::{UpdateHandler, UpdateHandlerFuture};
 use crate::{
     permissions::{ChatPermissionPolicy, ChatPermissionStore},
     virtual_messages::{
-        QueueEditTextRequest, QueueTextRequest, VirtualIdFactory, VirtualMessageStore,
-        monotonic_virtual_id_factory, queue_edit_text_message, queue_text_message_parts,
+        QueueRichRequest, QueueTextRequest, VirtualIdFactory, VirtualMessageStore,
+        monotonic_virtual_id_factory, queue_rich_message, queue_text_message_parts,
         send_work_item_and_resolve, send_work_item_and_resolve_with_ephemeral,
     },
 };
@@ -568,6 +568,7 @@ pub struct TelegramCheckinGameSender {
     virtual_store: openplotva_storage::PostgresVirtualMessageStore,
     ephemeral_store: openplotva_storage::RedisEphemeralMessageStore,
     telegram: openplotva_telegram::TelegramClient,
+    rich: openplotva_telegram::RichApiClient,
     next_virtual_id: VirtualIdFactory,
 }
 
@@ -578,11 +579,13 @@ impl TelegramCheckinGameSender {
         virtual_store: openplotva_storage::PostgresVirtualMessageStore,
         ephemeral_store: openplotva_storage::RedisEphemeralMessageStore,
         telegram: openplotva_telegram::TelegramClient,
+        rich: openplotva_telegram::RichApiClient,
     ) -> Self {
         Self {
             virtual_store,
             ephemeral_store,
             telegram,
+            rich,
             next_virtual_id: monotonic_virtual_id_factory("checkin-game-vmsg"),
         }
     }
@@ -605,7 +608,7 @@ impl CheckinGameSender for TelegramCheckinGameSender {
     ) -> CheckinGameSendFuture<'a, Option<i32>, Self::Error> {
         Box::pin(async move {
             let queue = DispatcherQueue::new(DispatcherConfig::default());
-            queue_checkin_text(
+            queue_checkin_rich(
                 &self.virtual_store,
                 &queue,
                 reply_to,
@@ -615,7 +618,14 @@ impl CheckinGameSender for TelegramCheckinGameSender {
                 || (self.next_virtual_id)(),
             )
             .await?;
-            send_queued_checkin_items(&self.virtual_store, None, &queue, &self.telegram).await
+            send_queued_checkin_items(
+                &self.virtual_store,
+                None,
+                &queue,
+                &self.telegram,
+                &self.rich,
+            )
+            .await
         })
     }
 
@@ -626,26 +636,15 @@ impl CheckinGameSender for TelegramCheckinGameSender {
         html: String,
     ) -> CheckinGameSendFuture<'a, (), Self::Error> {
         Box::pin(async move {
-            let queue = DispatcherQueue::new(DispatcherConfig::default());
-            let chat = checkin_chat_ref(reply_to);
-            let request = EditTextMessageRequest {
-                chat,
-                message_id: i64::from(message_id),
-                text: html,
-                render_as: TELEGRAM_PARSE_MODE_HTML.to_owned(),
-                reply_markup: None,
-            };
-            queue_edit_text_message(
-                &queue,
-                QueueEditTextRequest {
-                    message: &request,
-                    immediate: true,
-                    bypass_chat_restrictions: false,
-                },
-            )?;
-            send_queued_checkin_items(&self.virtual_store, None, &queue, &self.telegram)
+            self.rich
+                .edit_message_text_rich(
+                    reply_to.chat_id,
+                    i64::from(message_id),
+                    &sanitize_rich_html(&html),
+                    None,
+                )
                 .await
-                .map(|_| ())
+                .map_err(|error| CheckinGameSenderError::Telegram(error.to_string()))
         })
     }
 
@@ -672,6 +671,7 @@ impl CheckinGameSender for TelegramCheckinGameSender {
                 Some(&self.ephemeral_store),
                 &queue,
                 &self.telegram,
+                &self.rich,
             )
             .await
             .map(|_| ())
@@ -764,11 +764,11 @@ where
         user_id: i64,
     ) -> CheckinCommandEffectFuture<'a, Self::Error> {
         Box::pin(async move {
-            queue_checkin_text(
+            queue_checkin_rich(
                 &self.store,
                 &self.queue,
                 reply_to,
-                CHECKIN_THEME_SELECTOR_TEXT.to_owned(),
+                format!("<h3>{CHECKIN_THEME_SELECTOR_TEXT}</h3>"),
                 Some(CHECKIN_THEME_SELECTOR_DELETE_AFTER),
                 Some(build_checkin_theme_selection_keyboard(user_id)),
                 || (self.next_virtual_id)(),
@@ -843,11 +843,56 @@ where
     Ok(())
 }
 
+async fn queue_checkin_rich<S, NextId>(
+    store: &S,
+    queue: &DispatcherQueue,
+    reply_to: CheckinGameMessage,
+    html: String,
+    ephemeral_delete_after: Option<Duration>,
+    reply_markup: Option<InlineKeyboardMarkup>,
+    next_virtual_id: NextId,
+) -> Result<(), OutboundBuildError>
+where
+    S: VirtualMessageStore + Sync,
+    NextId: FnMut() -> String,
+{
+    let chat = checkin_chat_ref(reply_to);
+    let request = RichMessageRequest {
+        chat: Some(chat),
+        message_thread_id: reply_to.thread_id.unwrap_or_default().into(),
+        disable_notification: false,
+        allow_sending_without_reply: None,
+        html,
+        reply_markup: reply_markup.map(ReplyMarkup::InlineKeyboardMarkup),
+    };
+    let reply = ReplyMessageRef {
+        message_id: i64::from(reply_to.message_id),
+        chat,
+        is_topic_message: reply_to.thread_id.is_some(),
+        message_thread_id: reply_to.thread_id.unwrap_or_default().into(),
+    };
+    queue_rich_message(
+        store,
+        queue,
+        QueueRichRequest {
+            message: &request,
+            reply_to: Some(&reply),
+            immediate: true,
+            bypass_chat_restrictions: false,
+            ephemeral_delete_after,
+        },
+        next_virtual_id,
+    )
+    .await?;
+    Ok(())
+}
+
 async fn send_queued_checkin_items<S>(
     store: &S,
     ephemeral: Option<&openplotva_storage::RedisEphemeralMessageStore>,
     queue: &DispatcherQueue,
     telegram: &openplotva_telegram::TelegramClient,
+    rich: &openplotva_telegram::RichApiClient,
 ) -> Result<Option<i32>, CheckinGameSenderError>
 where
     S: VirtualMessageStore + Sync,
@@ -863,12 +908,15 @@ where
                 ephemeral,
                 item,
                 OffsetDateTime::now_utc(),
-                |method| async move { execute_telegram_method(telegram, method).await },
+                |method| async move {
+                    openplotva_telegram::execute_telegram_method_with_rich(telegram, rich, method)
+                        .await
+                },
             )
             .await
         } else {
             send_work_item_and_resolve(store, item, |method| async move {
-                execute_telegram_method(telegram, method).await
+                openplotva_telegram::execute_telegram_method_with_rich(telegram, rich, method).await
             })
             .await
         };
@@ -1237,7 +1285,7 @@ where
     Pick: Fn(usize) -> usize + Sync + ?Sized,
 {
     let progress = checkin_progress_lines(theme, pick_index);
-    let mut text = progress[0].to_owned();
+    let mut text = progress[0].clone();
     let Some(message_id) = sender
         .send_checkin_html(message, text.clone())
         .await
@@ -1282,15 +1330,15 @@ where
     Ok(())
 }
 
-fn checkin_progress_lines<Pick>(theme: CheckinGameTheme, pick_index: &Pick) -> Vec<&'static str>
+fn checkin_progress_lines<Pick>(theme: CheckinGameTheme, pick_index: &Pick) -> Vec<String>
 where
     Pick: Fn(usize) -> usize + ?Sized,
 {
     let mut out = Vec::with_capacity(CHECKIN_PROGRESS_STEPS.len() + 1);
-    out.push(theme.today);
+    out.push(format!("<h2>{}</h2>", theme.today));
     out.extend(CHECKIN_PROGRESS_STEPS.iter().map(|step| {
         let index = pick_index(step.len()).min(step.len() - 1);
-        step[index]
+        format!("<h2>{}</h2>", step[index])
     }));
     out
 }
@@ -3316,7 +3364,7 @@ mod tests {
         assert_eq!(
             sender.sent_html(),
             vec![
-                "🐱 <b>День Котика дня!</b> Кто сегодня будет мурлыкать громче всех? 🐾😻"
+                "<h2>🐱 <b>День Котика дня!</b> Кто сегодня будет мурлыкать громче всех? 🐾😻</h2>"
                     .to_owned()
             ]
         );
@@ -3341,15 +3389,24 @@ mod tests {
         assert_eq!(progress.len(), CHECKIN_PROGRESS_STEPS.len() + 1);
         assert_eq!(
             progress[0],
-            "🏔️ <b>Сегодня взбираемся на гору!</b> Кто захватит вершину и станет легендой? 🔥🧗‍♂️"
+            "<h2>🏔️ <b>Сегодня взбираемся на гору!</b> Кто захватит вершину и станет легендой? 🔥🧗‍♂️</h2>"
         );
-        assert_eq!(progress[1], "Полируем хрустальный шар предсказаний... 🔮🧼");
-        assert_eq!(progress[2], "Катаем шар по лабиринту шансов... 🌀⚽");
+        assert_eq!(
+            progress[1],
+            "<h2>Полируем хрустальный шар предсказаний... 🔮🧼</h2>"
+        );
+        assert_eq!(
+            progress[2],
+            "<h2>Катаем шар по лабиринту шансов... 🌀⚽</h2>"
+        );
         assert_eq!(
             progress[3],
-            "Собираем букет из четырёхлистных клевера... 🍀💐"
+            "<h2>Собираем букет из четырёхлистных клевера... 🍀💐</h2>"
         );
-        assert_eq!(progress[4], "Завершаем с фейерверком эмоций... 🎆😍");
+        assert_eq!(
+            progress[4],
+            "<h2>Завершаем с фейерверком эмоций... 🎆😍</h2>"
+        );
         assert_eq!(checkin_animation_delay(&|_| 0), Duration::from_millis(1500));
         assert_eq!(
             checkin_animation_delay(&|_| 2999),

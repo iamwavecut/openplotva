@@ -17,16 +17,16 @@ use openplotva_telegram::{
     DispatcherSendStatus, DispatcherWorkItem, EditMediaMessageRequest, EditTextMessageRequest,
     EnqueueOutcome, MediaGroupMessageRequest, MediaGroupPhotoItem, MessageFingerprint,
     OutboundBuildError, PENDING_OP_DELETE, PENDING_OP_EDIT, PendingOpBuildError,
-    PhotoMessageRequest, ReplyMessageRef, StickerMessageRequest, TELEGRAM_TEXT_MAX_BYTES,
-    TelegramOutboundMethod, TelegramOutboundResponse, TextMessageRequest,
+    PhotoMessageRequest, ReplyMessageRef, RichMessageRequest, StickerMessageRequest,
+    TELEGRAM_TEXT_MAX_BYTES, TelegramOutboundMethod, TelegramOutboundResponse, TextMessageRequest,
     build_audio_message_method, build_audio_message_plan, build_delete_message_method,
     build_edit_media_message_method, build_edit_media_message_plan, build_edit_text_message_method,
     build_media_group_message_method, build_media_group_message_plan, build_pending_op_method,
-    build_photo_message_method, build_photo_message_plan, build_sticker_message_method,
-    build_sticker_message_plan, build_text_message_method, fingerprint_audio_message_plan,
-    fingerprint_photo_message_plan, fingerprint_sticker_message_plan,
-    fingerprint_text_message_part, forum_thread_id, hash_content, message_target_chat,
-    split_telegram_text, validate_text_message_text,
+    build_photo_message_method, build_photo_message_plan, build_rich_message_method,
+    build_sticker_message_method, build_sticker_message_plan, build_text_message_method,
+    fingerprint_audio_message_plan, fingerprint_photo_message_plan, fingerprint_rich_message,
+    fingerprint_sticker_message_plan, fingerprint_text_message_part, forum_thread_id, hash_content,
+    message_target_chat, split_telegram_text, validate_text_message_text,
 };
 use serde_json::json;
 use thiserror::Error;
@@ -334,6 +334,14 @@ pub struct QueueTextRequest<'a> {
     /// Optional replied-to message fields.
     pub reply_to: Option<&'a ReplyMessageRef>,
     pub immediate_first: bool,
+    pub bypass_chat_restrictions: bool,
+    pub ephemeral_delete_after: Option<Duration>,
+}
+
+pub struct QueueRichRequest<'a> {
+    pub message: &'a RichMessageRequest,
+    pub reply_to: Option<&'a ReplyMessageRef>,
+    pub immediate: bool,
     pub bypass_chat_restrictions: bool,
     pub ephemeral_delete_after: Option<Duration>,
 }
@@ -761,6 +769,44 @@ where
         });
     }
 
+    Ok(report)
+}
+
+pub async fn queue_rich_message<S, NextId>(
+    store: &S,
+    queue: &DispatcherQueue,
+    req: QueueRichRequest<'_>,
+    mut next_virtual_id: NextId,
+) -> Result<QueueTextReport, OutboundBuildError>
+where
+    S: VirtualMessageStore + Sync,
+    NextId: FnMut() -> String,
+{
+    let chat = message_target_chat(req.message.chat.as_ref(), req.reply_to)?;
+    let method = build_rich_message_method(req.message, chat, req.reply_to)?;
+    let virtual_id = next_virtual_id();
+    let thread_id = forum_thread_id(chat, req.message.message_thread_id).map(|id| id as i32);
+    let insert_error = store
+        .insert_virtual_message(virtual_id.clone(), chat.id, thread_id)
+        .await
+        .err()
+        .map(|error| error.to_string());
+    let mut dispatcher_message =
+        DispatcherMessage::new(fingerprint_rich_message(chat.id, &method.html), &virtual_id)
+            .with_method(TelegramOutboundMethod::from(method))
+            .with_bypass_chat_restrictions(req.bypass_chat_restrictions);
+    if let Some(delete_after) = req.ephemeral_delete_after {
+        dispatcher_message = dispatcher_message.with_ephemeral_delete_after(delete_after);
+    }
+    let enqueue_outcome = queue.enqueue(dispatcher_message, req.immediate);
+    let mut report = QueueTextReport::default();
+    report.parts.push(QueuedTextPartReport {
+        index: 0,
+        virtual_id,
+        enqueue_outcome,
+        immediate: req.immediate,
+        insert_error,
+    });
     Ok(report)
 }
 

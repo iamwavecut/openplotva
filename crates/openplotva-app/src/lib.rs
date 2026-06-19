@@ -8554,12 +8554,13 @@ async fn start_runtime_workers(
         &config.bot.api_base_url,
     )
     .context("create Telegram Bot API client")?;
+    let rich_api = openplotva_telegram::RichApiClient::with_base_url(
+        bot_key.to_owned(),
+        &config.bot.api_base_url,
+    )
+    .context("create rich-message API client")?;
     let rich_sender: Arc<dyn rich::RichSender> = Arc::new(rich::RichMessenger::new(
-        openplotva_telegram::RichApiClient::with_base_url(
-            bot_key.to_owned(),
-            &config.bot.api_base_url,
-        )
-        .context("create rich-message API client")?,
+        rich_api.clone(),
         openplotva_media::uploader::UploaderClient::new(
             openplotva_media::uploader::UploaderConfig {
                 base_url: config.uploader.base_url.clone(),
@@ -8699,6 +8700,7 @@ async fn start_runtime_workers(
         ephemeral_store.clone(),
         Arc::clone(&permission_policy),
         telegram.clone(),
+        rich_api.clone(),
     );
     let join_greeting_runtime = settings::NewMembersJoinGreetingRuntime::new(
         service_clients.redis.join_greeting_store(),
@@ -8727,6 +8729,7 @@ async fn start_runtime_workers(
             store.clone(),
             ephemeral_store.clone(),
             telegram.clone(),
+            rich_api.clone(),
         ),
         Arc::clone(&permission_policy),
         bot_identity.id,
@@ -9397,8 +9400,10 @@ async fn start_runtime_workers(
             // RuntimeLlmObserver; the dialog provider is used directly (no tracing wrap).
             let dialog_provider: openplotva_llm::ChatProviderHandle = dialog_provider;
             dialog_provider_for_updates = Some(Arc::clone(&dialog_provider));
-            let dialog_effects =
-                dialog_jobs::DialogDispatcherEffects::new(Arc::clone(&rich_sender));
+            let dialog_effects = dialog_jobs::DialogDispatcherEffects::new(
+                store.clone(),
+                Arc::clone(&dispatcher_queue),
+            );
             let mut dialog_materializer = dialog_jobs::PostgresDialogInputMaterializer::new(
                 chat_settings_store.clone(),
                 store.clone(),
@@ -9906,6 +9911,7 @@ async fn start_runtime_workers(
     let immediate_store = store.clone();
     let immediate_history = history_store.clone();
     let immediate_telegram = telegram.clone();
+    let immediate_rich = rich_api.clone();
     let immediate_ephemeral = ephemeral_store.clone();
     let immediate_rate_limits = Arc::clone(&rate_limit_policy);
     let immediate_permissions = Arc::clone(&permission_policy);
@@ -9918,6 +9924,7 @@ async fn start_runtime_workers(
                     immediate_store.clone(),
                     immediate_history.clone(),
                     immediate_telegram.clone(),
+                    immediate_rich.clone(),
                     immediate_ephemeral.clone(),
                     Arc::clone(&immediate_rate_limits),
                     Arc::clone(&immediate_permissions),
@@ -10436,6 +10443,7 @@ async fn start_runtime_workers(
     let regular_store = store;
     let regular_history = history_store;
     let regular_telegram = telegram;
+    let regular_rich = rich_api;
     let regular_ephemeral = ephemeral_store;
     let regular_rate_limits = Arc::clone(&rate_limit_policy);
     let regular_permissions = Arc::clone(&permission_policy);
@@ -10452,6 +10460,7 @@ async fn start_runtime_workers(
                         regular_store.clone(),
                         regular_history.clone(),
                         regular_telegram.clone(),
+                        regular_rich.clone(),
                         regular_ephemeral.clone(),
                         Arc::clone(&regular_rate_limits),
                         Arc::clone(&regular_permissions),
@@ -10649,6 +10658,7 @@ async fn send_dispatcher_work_item(
     store: PostgresVirtualMessageStore,
     history: PostgresHistoryStore,
     telegram: openplotva_telegram::TelegramClient,
+    rich: openplotva_telegram::RichApiClient,
     ephemeral: RedisEphemeralMessageStore,
     rate_limits: Arc<rate_limits::ChatRateLimitPolicy<RedisRateLimitStore>>,
     permissions: Arc<permissions::ChatPermissionPolicy<PostgresChatSettingsStore>>,
@@ -10661,7 +10671,9 @@ async fn send_dispatcher_work_item(
         rate_limits,
         permissions,
         item,
-        |method| async move { openplotva_telegram::execute_telegram_method(&telegram, method).await },
+        |method| async move {
+            openplotva_telegram::execute_telegram_method_with_rich(&telegram, &rich, method).await
+        },
     )
     .await
 }
@@ -10680,7 +10692,10 @@ where
     P: permissions::ChatPermissionStore + Send + Sync,
     SendFn: FnOnce(openplotva_telegram::TelegramOutboundMethod) -> SendFuture,
     SendFuture: Future<
-        Output = Result<openplotva_telegram::TelegramOutboundResponse, carapax::api::ExecuteError>,
+        Output = Result<
+            openplotva_telegram::TelegramOutboundResponse,
+            openplotva_telegram::TelegramOutboundExecuteError,
+        >,
     >,
 {
     send_dispatcher_work_item_with_transport_and_history(
@@ -10712,7 +10727,10 @@ where
     P: permissions::ChatPermissionStore + Send + Sync,
     SendFn: FnOnce(openplotva_telegram::TelegramOutboundMethod) -> SendFuture,
     SendFuture: Future<
-        Output = Result<openplotva_telegram::TelegramOutboundResponse, carapax::api::ExecuteError>,
+        Output = Result<
+            openplotva_telegram::TelegramOutboundResponse,
+            openplotva_telegram::TelegramOutboundExecuteError,
+        >,
     >,
 {
     let chat_id = item.metadata().chat_id;
@@ -10774,17 +10792,20 @@ where
                 match send(method).await {
                     Ok(response) => Ok(response),
                     Err(error) => {
-                        if method_kind == openplotva_telegram::TelegramOutboundMethodKind::SendMessage
-                            && openplotva_telegram::telegram_execute_error_is_reply_missing(&error)
+                        if matches!(
+                            method_kind,
+                            openplotva_telegram::TelegramOutboundMethodKind::SendMessage
+                                | openplotva_telegram::TelegramOutboundMethodKind::SendRichMessage
+                        ) && error.is_reply_missing()
                         {
                             tracing::warn!(
                                 chat_id,
-                                "reply target missing for Telegram sendMessage"
+                                "reply target missing for Telegram send"
                             );
                             return Ok(openplotva_telegram::TelegramOutboundResponse::Boolean(true));
                         }
                         if let Some(retry_after) =
-                            rate_limits::telegram_retry_after_from_execute_error(&error)
+                            rate_limits::telegram_retry_after_from_outbound_error(&error)
                         {
                             let report = rate_limits
                                 .set_rate_limit_at(chat_id, retry_after, OffsetDateTime::now_utc())
@@ -10799,7 +10820,7 @@ where
                             }
                         }
                         if chat_id != 0
-                            && permissions::telegram_execute_error_is_permission_error(&error)
+                            && error.is_permission_error()
                         {
                             let report = permissions
                                 .record_send_permission_error(chat_id, method_kind)
@@ -11013,8 +11034,8 @@ mod tests {
     use openplotva_core::{ChatSettings, ChatSettingsUpdate, MessageIdMapping};
     use openplotva_telegram::{
         DispatcherConfig, DispatcherMessage, DispatcherQueue, DispatcherSendStatus,
-        DispatcherWorkItem, MessageFingerprint, TelegramMessage, TelegramOutboundMethod,
-        TelegramOutboundResponse,
+        DispatcherWorkItem, MessageFingerprint, TelegramMessage, TelegramOutboundExecuteError,
+        TelegramOutboundMethod, TelegramOutboundResponse,
     };
     use openplotva_updates::{
         UpdateProducerQueue, UpdateProducerQueueFuture, UpdateProducerSource,
@@ -11308,7 +11329,7 @@ mod tests {
             move |_| {
                 *lock(&called_for_send) = true;
                 async {
-                    Ok::<_, carapax::api::ExecuteError>(TelegramOutboundResponse::Message(
+                    Ok::<_, TelegramOutboundExecuteError>(TelegramOutboundResponse::Message(
                         Box::new(telegram_message(42, 100)),
                     ))
                 }
@@ -13592,25 +13613,25 @@ mod tests {
         queue.dequeue_immediate().expect("queued work item")
     }
 
-    fn permission_error() -> carapax::api::ExecuteError {
+    fn permission_error() -> TelegramOutboundExecuteError {
         let response: carapax::types::Response<serde_json::Value> = serde_json::from_str(
             r#"{"ok":false,"error_code":400,"description":"Bad Request: CHAT_WRITE_FORBIDDEN"}"#,
         )
         .expect("permission error JSON");
         match response.into_result() {
             Ok(_) => panic!("test response unexpectedly succeeded"),
-            Err(error) => carapax::api::ExecuteError::Response(error),
+            Err(error) => carapax::api::ExecuteError::Response(error).into(),
         }
     }
 
-    fn reply_missing_error() -> carapax::api::ExecuteError {
+    fn reply_missing_error() -> TelegramOutboundExecuteError {
         let response: carapax::types::Response<serde_json::Value> = serde_json::from_str(
             r#"{"ok":false,"error_code":400,"description":"Bad Request: reply message not found"}"#,
         )
         .expect("reply missing error JSON");
         match response.into_result() {
             Ok(_) => panic!("test response unexpectedly succeeded"),
-            Err(error) => carapax::api::ExecuteError::Response(error),
+            Err(error) => carapax::api::ExecuteError::Response(error).into(),
         }
     }
 

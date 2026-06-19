@@ -13,8 +13,9 @@ use tokio::{
 
 use crate::rate_limit::DEFAULT_RATE_LIMITER_MAX_IDLE;
 use crate::{
-    ChatLimiters, Debouncer, DebouncerConfig, MessageFingerprint, TelegramOutboundMethod,
-    TelegramOutboundMethodKind, send_telegram_method_status,
+    ChatLimiters, Debouncer, DebouncerConfig, MessageFingerprint, RichApiClient,
+    TelegramOutboundMethod, TelegramOutboundMethodKind, send_telegram_method_status,
+    send_telegram_method_status_with_rich,
 };
 
 pub const DEFAULT_DISPATCHER_CLEANUP_INTERVAL: Duration = Duration::from_secs(10 * 60);
@@ -491,6 +492,18 @@ impl DispatcherQueue {
             .await
     }
 
+    /// Process one immediate item through Telegram and rich-message clients.
+    pub async fn process_immediate_telegram_once_with_rich(
+        &self,
+        client: &Client,
+        rich: &RichApiClient,
+    ) -> DispatcherWorkerOutcome {
+        self.process_immediate_method_once(|method| {
+            send_telegram_method_status_with_rich(client, rich, method)
+        })
+        .await
+    }
+
     /// Run the immediate worker loop until the provided stop future completes.
     pub async fn run_immediate_method_worker_until<F, Fut, Stop>(
         &self,
@@ -578,6 +591,19 @@ impl DispatcherQueue {
     ) -> DispatcherWorkerOutcome {
         self.process_regular_method_once(limiters, |method| {
             send_telegram_method_status(client, method)
+        })
+        .await
+    }
+
+    /// Process one regular item through Telegram and rich-message clients.
+    pub async fn process_regular_telegram_once_with_rich(
+        &self,
+        limiters: &ChatLimiters,
+        client: &Client,
+        rich: &RichApiClient,
+    ) -> DispatcherWorkerOutcome {
+        self.process_regular_method_once(limiters, |method| {
+            send_telegram_method_status_with_rich(client, rich, method)
         })
         .await
     }
@@ -695,6 +721,23 @@ impl DispatcherQueue {
     {
         self.run_method_workers_until(limiters, stop, |method| {
             send_telegram_method_status(client, method)
+        })
+        .await
+    }
+
+    /// Run both method workers against Telegram and rich-message clients until `stop` completes.
+    pub async fn run_telegram_workers_until_with_rich<Stop>(
+        &self,
+        limiters: &ChatLimiters,
+        client: &Client,
+        rich: &RichApiClient,
+        stop: Stop,
+    ) -> DispatcherWorkerLoopOutcome
+    where
+        Stop: Future<Output = ()>,
+    {
+        self.run_method_workers_until(limiters, stop, |method| {
+            send_telegram_method_status_with_rich(client, rich, method)
         })
         .await
     }

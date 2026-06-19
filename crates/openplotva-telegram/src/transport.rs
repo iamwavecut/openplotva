@@ -9,13 +9,15 @@ use carapax::{
     },
 };
 
-use crate::DispatcherSendStatus;
+use crate::{DispatcherSendStatus, RichApiClient, RichApiError, SendRichMessage};
 
 /// Concrete outbound Telegram methods currently queued by the Rust dispatcher.
 #[derive(Debug)]
 pub enum TelegramOutboundMethod {
     /// Telegram `sendMessage`.
     SendMessage(Box<SendMessage>),
+    /// Telegram `sendRichMessage`.
+    SendRichMessage(Box<SendRichMessage>),
     /// Telegram `sendSticker`.
     SendSticker(Box<SendSticker>),
     /// Telegram `sendPhoto`.
@@ -57,6 +59,8 @@ pub enum TelegramOutboundMethod {
 pub enum TelegramOutboundMethodKind {
     /// Telegram `sendMessage`.
     SendMessage,
+    /// Telegram `sendRichMessage`.
+    SendRichMessage,
     /// Telegram `sendSticker`.
     SendSticker,
     /// Telegram `sendPhoto`.
@@ -127,11 +131,59 @@ pub enum TelegramOutboundResponse {
     String(String),
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum TelegramOutboundExecuteError {
+    #[error("{0}")]
+    Telegram(#[from] ExecuteError),
+    #[error("{0}")]
+    Rich(#[from] RichApiError),
+}
+
+impl TelegramOutboundExecuteError {
+    pub fn retry_after(&self) -> Option<u64> {
+        match self {
+            Self::Telegram(ExecuteError::Response(response))
+                if response.error_code() == Some(429) =>
+            {
+                Some(response.retry_after().unwrap_or(60))
+            }
+            Self::Telegram(_) => None,
+            Self::Rich(error) => error.retry_after(),
+        }
+    }
+
+    pub fn is_reply_missing(&self) -> bool {
+        match self {
+            Self::Telegram(error) => telegram_execute_error_is_reply_missing(error),
+            Self::Rich(RichApiError::Api { description, .. }) => {
+                contains_any_ascii_fold(description, REPLY_MISSING_ERROR_FRAGMENTS)
+            }
+            Self::Rich(_) => false,
+        }
+    }
+
+    pub fn is_permission_error(&self) -> bool {
+        match self {
+            Self::Telegram(error) => classify_telegram_send_error(error).permission_error,
+            Self::Rich(RichApiError::Api {
+                code, description, ..
+            }) => {
+                *code == 403
+                    || (*code == 400
+                        && (is_permission_send_error(description)
+                            || description.contains("CHAT_WRITE_FORBIDDEN")))
+            }
+            Self::Rich(_) => false,
+        }
+    }
+}
+
 impl TelegramOutboundMethod {
     /// Return the stable method discriminator.
     pub fn kind(&self) -> TelegramOutboundMethodKind {
         match self {
             Self::SendMessage(_) => TelegramOutboundMethodKind::SendMessage,
+            Self::SendRichMessage(_) => TelegramOutboundMethodKind::SendRichMessage,
             Self::SendSticker(_) => TelegramOutboundMethodKind::SendSticker,
             Self::SendPhoto(_) => TelegramOutboundMethodKind::SendPhoto,
             Self::SendAudio(_) => TelegramOutboundMethodKind::SendAudio,
@@ -158,6 +210,7 @@ impl TelegramOutboundMethod {
     pub fn method_name(&self) -> &'static str {
         match self {
             Self::SendMessage(_) => "sendMessage",
+            Self::SendRichMessage(_) => "sendRichMessage",
             Self::SendSticker(_) => "sendSticker",
             Self::SendPhoto(_) => "sendPhoto",
             Self::SendAudio(_) => "sendAudio",
@@ -182,6 +235,7 @@ impl TelegramOutboundMethod {
     pub fn response_kind(&self) -> TelegramOutboundResponseKind {
         match self {
             Self::SendMessage(_)
+            | Self::SendRichMessage(_)
             | Self::SendSticker(_)
             | Self::SendPhoto(_)
             | Self::SendAudio(_) => TelegramOutboundResponseKind::Message,
@@ -221,6 +275,9 @@ pub async fn execute_telegram_method(
             .execute(*method)
             .await
             .map(|message| TelegramOutboundResponse::Message(Box::new(message))),
+        TelegramOutboundMethod::SendRichMessage(_) => {
+            panic!("sendRichMessage requires execute_telegram_method_with_rich")
+        }
         TelegramOutboundMethod::SendSticker(method) => client
             .execute(*method)
             .await
@@ -292,12 +349,40 @@ pub async fn execute_telegram_method(
     }
 }
 
+pub async fn execute_telegram_method_with_rich(
+    client: &Client,
+    rich: &RichApiClient,
+    method: TelegramOutboundMethod,
+) -> Result<TelegramOutboundResponse, TelegramOutboundExecuteError> {
+    match method {
+        TelegramOutboundMethod::SendRichMessage(method) => rich
+            .send_rich_message_request(&method)
+            .await
+            .map(|message| TelegramOutboundResponse::Message(Box::new(message)))
+            .map_err(TelegramOutboundExecuteError::from),
+        method => execute_telegram_method(client, method)
+            .await
+            .map_err(TelegramOutboundExecuteError::from),
+    }
+}
+
 /// Execute one outbound method and collapse the result into dispatcher accounting status.
 pub async fn send_telegram_method_status(
     client: &Client,
     method: TelegramOutboundMethod,
 ) -> DispatcherSendStatus {
     match execute_telegram_method(client, method).await {
+        Ok(_) => DispatcherSendStatus::Sent,
+        Err(_) => DispatcherSendStatus::Failed,
+    }
+}
+
+pub async fn send_telegram_method_status_with_rich(
+    client: &Client,
+    rich: &RichApiClient,
+    method: TelegramOutboundMethod,
+) -> DispatcherSendStatus {
+    match execute_telegram_method_with_rich(client, rich, method).await {
         Ok(_) => DispatcherSendStatus::Sent,
         Err(_) => DispatcherSendStatus::Failed,
     }
@@ -400,6 +485,12 @@ fn ascii_eq_fold(left: &[u8], right: &[u8]) -> bool {
 impl From<SendMessage> for TelegramOutboundMethod {
     fn from(value: SendMessage) -> Self {
         Self::SendMessage(Box::new(value))
+    }
+}
+
+impl From<SendRichMessage> for TelegramOutboundMethod {
+    fn from(value: SendRichMessage) -> Self {
+        Self::SendRichMessage(Box::new(value))
     }
 }
 
