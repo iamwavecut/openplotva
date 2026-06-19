@@ -5628,6 +5628,7 @@ impl PostgresTaskQueueStore {
         &self,
         older_than: OffsetDateTime,
     ) -> Result<u64, StorageError> {
+        self.rollup_task_queue_terminal(older_than).await?;
         let jobs = sqlx::query(
             "DELETE FROM taskman_jobs WHERE deleted_at IS NOT NULL AND deleted_at < $1",
         )
@@ -5642,7 +5643,72 @@ impl PostgresTaskQueueStore {
             .rows_affected();
         Ok(jobs + history)
     }
+
+    async fn rollup_task_queue_terminal(
+        &self,
+        older_than: OffsetDateTime,
+    ) -> Result<(), StorageError> {
+        for granularity in ["hour", "day"] {
+            sqlx::query(SQL_ROLLUP_TASK_QUEUE_TERMINAL)
+                .bind(granularity)
+                .bind(older_than)
+                .execute(&self.pool)
+                .await?;
+        }
+        Ok(())
+    }
 }
+
+const SQL_ROLLUP_TASK_QUEUE_TERMINAL: &str = r#"
+WITH grouped AS (
+    SELECT
+        date_trunc($1, COALESCE(completed_at, deleted_at, updated_at))::timestamptz AS bucket_start,
+        queue_name,
+        status,
+        job_type,
+        count(*)::int AS job_count,
+        count(*) FILTER (WHERE status = 'completed')::int AS completed_count,
+        count(*) FILTER (WHERE status = 'failed')::int AS failed_count,
+        count(*) FILTER (WHERE status = 'cancelled')::int AS cancelled_count,
+        COALESCE(avg(EXTRACT(EPOCH FROM (started_at - created_at)) * 1000) FILTER (WHERE started_at IS NOT NULL AND started_at >= created_at), 0)::int AS avg_wait_ms,
+        COALESCE(percentile_cont(0.95) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (started_at - created_at)) * 1000) FILTER (WHERE started_at IS NOT NULL AND started_at >= created_at), 0)::int AS p95_wait_ms,
+        COALESCE(avg(EXTRACT(EPOCH FROM (completed_at - started_at)) * 1000) FILTER (WHERE completed_at IS NOT NULL AND started_at IS NOT NULL AND completed_at >= started_at), 0)::int AS avg_processing_ms,
+        COALESCE(percentile_cont(0.95) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (completed_at - started_at)) * 1000) FILTER (WHERE completed_at IS NOT NULL AND started_at IS NOT NULL AND completed_at >= started_at), 0)::int AS p95_processing_ms
+    FROM taskman_jobs
+    WHERE deleted_at IS NOT NULL
+      AND deleted_at < $2
+    GROUP BY 1, queue_name, status, job_type
+),
+prepared AS (
+    SELECT
+        'taskman'::text AS source,
+        'job'::text AS kind,
+        $1::text AS granularity,
+        bucket_start,
+        bucket_start + CASE WHEN $1 = 'day' THEN interval '1 day' ELSE interval '1 hour' END AS bucket_end,
+        jsonb_build_object('queue_name', queue_name, 'status', status, 'job_type', job_type) AS dimensions,
+        jsonb_build_object(
+            'job_count', job_count,
+            'completed_count', completed_count,
+            'failed_count', failed_count,
+            'cancelled_count', cancelled_count,
+            'avg_wait_ms', avg_wait_ms,
+            'p95_wait_ms', p95_wait_ms,
+            'avg_processing_ms', avg_processing_ms,
+            'p95_processing_ms', p95_processing_ms
+        ) AS metrics
+    FROM grouped
+)
+INSERT INTO telemetry_rollups (
+    source, kind, granularity, bucket_start, bucket_end, dimensions_hash, dimensions, metrics
+)
+SELECT source, kind, granularity, bucket_start, bucket_end, md5(dimensions::text), dimensions, metrics
+FROM prepared
+ON CONFLICT (source, kind, granularity, bucket_start, dimensions_hash) DO UPDATE SET
+    bucket_end = EXCLUDED.bucket_end,
+    dimensions = EXCLUDED.dimensions,
+    metrics = EXCLUDED.metrics,
+    updated_at = CURRENT_TIMESTAMP"#;
 
 async fn upsert_task_queue_record(
     tx: &mut Transaction<'_, Postgres>,

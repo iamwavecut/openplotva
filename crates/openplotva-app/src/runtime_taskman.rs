@@ -176,16 +176,15 @@ impl RuntimeTaskmanInspector for RuntimeTaskmanInspectorHandle {
     }
 
     fn job(&self, id: i64) -> Result<Option<RuntimeTaskmanJobDetailsData>, String> {
-        Ok(self
-            .records()
-            .unwrap_or_default()
-            .into_iter()
-            .find(|record| record.diagnostic_id == id)
-            .map(|record| RuntimeTaskmanJobDetailsData {
-                job: taskman_job_from_record(&record),
-                messages: taskman_messages_from_record(&record),
-                events: taskman_events_from_record(&record),
-            }))
+        let Some(record) = self.shared_queue().ok().and_then(|queue| queue.record(id)) else {
+            return Ok(None);
+        };
+        let record = RuntimeTaskmanRecord::new(record);
+        Ok(Some(RuntimeTaskmanJobDetailsData {
+            job: taskman_job_from_record(&record),
+            messages: taskman_messages_from_record(&record),
+            events: taskman_events_from_record(&record),
+        }))
     }
 
     fn queue_diagnostics(

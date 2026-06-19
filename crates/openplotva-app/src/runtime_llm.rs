@@ -28,6 +28,7 @@ const LLM_EVENT_WRITER_CHANNEL_CAPACITY: usize = 10_000;
 const LLM_EVENT_WRITER_BATCH_SIZE: usize = 100;
 const LLM_EVENT_WRITER_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 pub const LLM_REQUEST_EVENTS_CLEANUP_BATCH_SIZE: i64 = 10_000;
+pub const LLM_REQUEST_EVENTS_CLEANUP_INTERVAL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const SQL_INSERT_LLM_REQUEST_EVENTS_PREFIX: &str = r#"INSERT INTO llm_request_events (
     created_at,
     provider,
@@ -72,13 +73,219 @@ const SQL_DELETE_OLD_LLM_REQUEST_EVENTS_BATCH: &str = r#"
 WITH doomed AS (
     SELECT id
     FROM llm_request_events
-    WHERE created_at < now() - ($1::int * interval '1 day')
+    WHERE NOT is_rollup
+      AND created_at < now() - ($1::int * interval '1 day')
     ORDER BY created_at ASC
     LIMIT $2
 )
 DELETE FROM llm_request_events e
 USING doomed
 WHERE e.id = doomed.id"#;
+const SQL_TRY_ANALYTICS_ROLLUP_LOCK: &str =
+    "SELECT pg_try_advisory_xact_lock(hashtext('openplotva.analytics_rollup_cleanup'))";
+const SQL_ROLLUP_OLD_LLM_REQUEST_EVENTS: &str = r#"
+WITH grouped AS (
+    SELECT
+        date_trunc($1, created_at)::timestamptz AS bucket_start,
+        COALESCE(NULLIF(source, ''), 'unknown')::text AS source,
+        NULLIF(provider, '')::text AS provider,
+        COALESCE(NULLIF(model, ''), 'unknown')::text AS model,
+        chat_id,
+        max_tokens,
+        temperature,
+        top_p,
+        top_k,
+        candidate_count,
+        COALESCE(NULLIF(tool_mode, ''), 'default')::text AS tool_mode,
+        COALESCE(NULLIF(response_format, ''), 'text')::text AS response_format,
+        count(*)::int AS request_count,
+        count(*) FILTER (WHERE error IS NOT NULL AND error <> '')::int AS error_count,
+        COALESCE(sum(duration_ms::bigint), 0)::bigint AS duration_ms_sum,
+        COALESCE(percentile_cont(0.50) WITHIN GROUP (ORDER BY duration_ms), 0)::int AS p50_duration_ms,
+        COALESCE(percentile_cont(0.95) WITHIN GROUP (ORDER BY duration_ms), 0)::int AS p95_duration_ms,
+        COALESCE(sum(input_tokens), 0)::bigint AS input_tokens_sum,
+        COALESCE(sum(output_tokens), 0)::bigint AS output_tokens_sum,
+        COALESCE(sum(total_tokens), 0)::bigint AS total_tokens_sum,
+        COALESCE(sum(generation_tps), 0)::double precision AS generation_tps_sum,
+        count(generation_tps)::int AS generation_tps_count,
+        COALESCE(sum(effective_output_tps), 0)::double precision AS effective_output_tps_sum,
+        count(effective_output_tps)::int AS effective_output_tps_count,
+        COALESCE(percentile_cont(0.50) WITHIN GROUP (ORDER BY effective_output_tps) FILTER (WHERE effective_output_tps IS NOT NULL), 0)::double precision AS p50_effective_output_tps,
+        COALESCE(percentile_cont(0.95) WITHIN GROUP (ORDER BY effective_output_tps) FILTER (WHERE effective_output_tps IS NOT NULL), 0)::double precision AS p95_effective_output_tps,
+        COALESCE(sum(iteration::bigint), 0)::bigint AS iteration_sum,
+        COALESCE(max(iteration), 0)::int AS iteration_max
+    FROM llm_request_events
+    WHERE NOT is_rollup
+      AND created_at < now() - ($2::int * interval '1 day')
+    GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12
+)
+INSERT INTO llm_request_events (
+    created_at,
+    provider,
+    source,
+    chat_id,
+    model,
+    iteration,
+    prompt_chars,
+    prompt_messages,
+    docs_chars,
+    duration_ms,
+    max_tokens,
+    temperature,
+    top_p,
+    top_k,
+    candidate_count,
+    tool_mode,
+    response_format,
+    inference_params,
+    error,
+    is_rollup,
+    rollup_granularity,
+    bucket_start,
+    bucket_end,
+    request_count,
+    error_count,
+    duration_ms_sum,
+    p50_duration_ms,
+    p95_duration_ms,
+    input_tokens_sum,
+    output_tokens_sum,
+    total_tokens_sum,
+    generation_tps_sum,
+    generation_tps_count,
+    effective_output_tps_sum,
+    effective_output_tps_count,
+    p50_effective_output_tps,
+    p95_effective_output_tps,
+    iteration_sum,
+    iteration_max
+)
+SELECT
+    bucket_start,
+    provider,
+    source,
+    chat_id,
+    model,
+    iteration_max,
+    0,
+    0,
+    0,
+    CASE WHEN request_count > 0 THEN (duration_ms_sum / request_count)::int ELSE 0 END,
+    max_tokens,
+    temperature,
+    top_p,
+    top_k,
+    candidate_count,
+    tool_mode,
+    response_format,
+    '{}'::jsonb,
+    '',
+    TRUE,
+    $1,
+    bucket_start,
+    bucket_start + CASE WHEN $1 = 'day' THEN interval '1 day' ELSE interval '1 hour' END,
+    request_count,
+    error_count,
+    duration_ms_sum,
+    p50_duration_ms,
+    p95_duration_ms,
+    input_tokens_sum,
+    output_tokens_sum,
+    total_tokens_sum,
+    generation_tps_sum,
+    generation_tps_count,
+    effective_output_tps_sum,
+    effective_output_tps_count,
+    p50_effective_output_tps,
+    p95_effective_output_tps,
+    iteration_sum,
+    iteration_max
+FROM grouped
+ON CONFLICT DO NOTHING"#;
+const SQL_ROLLUP_MEMORY_RUNS: &str = r#"
+WITH grouped AS (
+    SELECT
+        date_trunc($1, range_start_at)::timestamptz AS bucket_start,
+        status,
+        prompt_version,
+        count(*)::int AS run_count,
+        COALESCE(sum(message_count), 0)::int AS message_count,
+        COALESCE(sum(cards_inserted), 0)::int AS cards_inserted,
+        COALESCE(sum(cards_updated), 0)::int AS cards_updated,
+        COALESCE(sum(cards_superseded), 0)::int AS cards_superseded,
+        COALESCE(sum(episodes_inserted), 0)::int AS episodes_inserted,
+        COALESCE(sum(input_token_estimate), 0)::int AS input_tokens,
+        COALESCE(sum(output_token_estimate), 0)::int AS output_tokens
+    FROM memory_runs
+    WHERE range_start_at < now() - ($2::int * interval '1 day')
+    GROUP BY 1, status, prompt_version
+),
+prepared AS (
+    SELECT
+        'memory'::text AS source,
+        'run'::text AS kind,
+        $1::text AS granularity,
+        bucket_start,
+        bucket_start + CASE WHEN $1 = 'day' THEN interval '1 day' ELSE interval '1 hour' END AS bucket_end,
+        jsonb_build_object('status', status, 'prompt_version', prompt_version) AS dimensions,
+        jsonb_build_object(
+            'run_count', run_count,
+            'message_count', message_count,
+            'cards_inserted', cards_inserted,
+            'cards_updated', cards_updated,
+            'cards_superseded', cards_superseded,
+            'episodes_inserted', episodes_inserted,
+            'input_tokens', input_tokens,
+            'output_tokens', output_tokens
+        ) AS metrics
+    FROM grouped
+)
+INSERT INTO telemetry_rollups (
+    source, kind, granularity, bucket_start, bucket_end, dimensions_hash, dimensions, metrics
+)
+SELECT source, kind, granularity, bucket_start, bucket_end, md5(dimensions::text), dimensions, metrics
+FROM prepared
+ON CONFLICT (source, kind, granularity, bucket_start, dimensions_hash) DO UPDATE SET
+    bucket_end = EXCLUDED.bucket_end,
+    dimensions = EXCLUDED.dimensions,
+    metrics = EXCLUDED.metrics,
+    updated_at = CURRENT_TIMESTAMP"#;
+const SQL_ROLLUP_CHAT_HISTORY_INTERESTS: &str = r#"
+WITH grouped AS (
+    SELECT
+        date_trunc($1, e.range_end_at)::timestamptz AS bucket_start,
+        e.chat_id,
+        e.thread_id,
+        topic.topic,
+        count(*)::int AS episode_count,
+        COALESCE(sum(e.message_count), 0)::int AS message_count
+    FROM memory_episodes e
+    CROSS JOIN LATERAL unnest(e.topics) AS topic(topic)
+    WHERE e.range_end_at < now() - ($2::int * interval '1 day')
+      AND btrim(topic.topic) <> ''
+    GROUP BY 1, e.chat_id, e.thread_id, topic.topic
+),
+prepared AS (
+    SELECT
+        'chat_history'::text AS source,
+        'interest'::text AS kind,
+        $1::text AS granularity,
+        bucket_start,
+        bucket_start + CASE WHEN $1 = 'day' THEN interval '1 day' ELSE interval '1 hour' END AS bucket_end,
+        jsonb_build_object('chat_id', chat_id, 'thread_id', thread_id, 'topic', topic) AS dimensions,
+        jsonb_build_object('episode_count', episode_count, 'message_count', message_count) AS metrics
+    FROM grouped
+)
+INSERT INTO telemetry_rollups (
+    source, kind, granularity, bucket_start, bucket_end, dimensions_hash, dimensions, metrics
+)
+SELECT source, kind, granularity, bucket_start, bucket_end, md5(dimensions::text), dimensions, metrics
+FROM prepared
+ON CONFLICT (source, kind, granularity, bucket_start, dimensions_hash) DO UPDATE SET
+    bucket_end = EXCLUDED.bucket_end,
+    dimensions = EXCLUDED.dimensions,
+    metrics = EXCLUDED.metrics,
+    updated_at = CURRENT_TIMESTAMP"#;
 
 #[derive(Clone, Debug)]
 pub struct RuntimeLlmTraceBuffer {
@@ -420,11 +627,37 @@ pub async fn delete_old_llm_request_events_batch(
     if retention_days <= 0 || batch_size <= 0 {
         return Ok(0);
     }
+    let mut tx = pool.begin().await?;
+    let locked: bool = sqlx::query_scalar(SQL_TRY_ANALYTICS_ROLLUP_LOCK)
+        .fetch_one(&mut *tx)
+        .await?;
+    if !locked {
+        tx.commit().await?;
+        return Ok(0);
+    }
+    for granularity in ["hour", "day"] {
+        sqlx::query(SQL_ROLLUP_OLD_LLM_REQUEST_EVENTS)
+            .bind(granularity)
+            .bind(retention_days)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(SQL_ROLLUP_MEMORY_RUNS)
+            .bind(granularity)
+            .bind(retention_days)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(SQL_ROLLUP_CHAT_HISTORY_INTERESTS)
+            .bind(granularity)
+            .bind(retention_days)
+            .execute(&mut *tx)
+            .await?;
+    }
     let result = sqlx::query(SQL_DELETE_OLD_LLM_REQUEST_EVENTS_BATCH)
         .bind(retention_days)
         .bind(batch_size)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
     Ok(result.rows_affected())
 }
 
@@ -1103,6 +1336,11 @@ mod tests {
         assert!(sql.starts_with("INSERT INTO llm_request_events"));
         assert!(sql.contains("), ("));
         assert!(!sql.contains("VALUES (\n    $1,"));
+    }
+
+    #[test]
+    fn llm_request_event_cleanup_keeps_archived_rollups() {
+        assert!(SQL_DELETE_OLD_LLM_REQUEST_EVENTS_BATCH.contains("NOT is_rollup"));
     }
 
     #[test]

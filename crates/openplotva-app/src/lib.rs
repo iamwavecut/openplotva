@@ -8330,8 +8330,7 @@ async fn start_runtime_workers(
     if llm_request_events_retention_days > 0 {
         let llm_event_cleanup_pool = service_clients.postgres.clone();
         let llm_event_cleanup_stop = stop.subscribe();
-        let llm_event_cleanup_interval =
-            Duration::from_secs(config.persistent_queue.cleanup_interval_seconds.max(1) as u64);
+        let llm_event_cleanup_interval = runtime_llm::LLM_REQUEST_EVENTS_CLEANUP_INTERVAL;
         let llm_event_cleanup_worker = tokio::spawn(async move {
             let report = runtime_llm::run_llm_request_event_cleanup_worker_until(
                 llm_event_cleanup_pool,
@@ -8347,7 +8346,7 @@ async fn start_runtime_workers(
         readiness_checks.push(ReadinessCheck::ok(
             "llm_request_events_cleanup",
             format!(
-                "LLM raw request events cleanup every {}s, retention {}d",
+                "LLM analytics rollup and raw request events cleanup every {}s, retention {}d",
                 llm_event_cleanup_interval.as_secs(),
                 llm_request_events_retention_days
             ),

@@ -18,38 +18,53 @@ use sqlx::{PgConnection, PgPool, Row};
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use url::Url;
 
-const MAX_ANALYTICS_RANGE: Duration = Duration::days(14);
+const MAX_ANALYTICS_RANGE: Duration = Duration::days(30);
 const DEFAULT_ANALYTICS_RANGE: Duration = Duration::hours(24);
 const DISCOVERY_CAPACITY_TIMEOUT: StdDuration = StdDuration::from_secs(2);
 const DEFAULT_SQL_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 
 const SQL_LLM_TOTALS: &str = r#"
 SELECT
-    COUNT(*)::int AS total_count,
-    COUNT(*) FILTER (WHERE error IS NOT NULL AND error <> '')::int AS error_count,
-    COALESCE(AVG(duration_ms), 0)::int AS avg_duration_ms
+    COALESCE(SUM(CASE WHEN is_rollup THEN request_count ELSE 1 END), 0)::int AS total_count,
+    COALESCE(SUM(CASE WHEN is_rollup THEN error_count ELSE CASE WHEN error IS NOT NULL AND error <> '' THEN 1 ELSE 0 END END), 0)::int AS error_count,
+    COALESCE(
+        SUM(CASE WHEN is_rollup THEN duration_ms_sum ELSE duration_ms::bigint END)
+        / NULLIF(SUM(CASE WHEN is_rollup THEN request_count ELSE 1 END), 0),
+        0
+    )::int AS avg_duration_ms
 FROM llm_request_events
-WHERE created_at >= $1"#;
+WHERE created_at >= $1
+  AND (NOT is_rollup OR rollup_granularity = 'hour')"#;
 
 const SQL_LLM_SERIES_MINUTE: &str = r#"
 SELECT
     date_trunc('minute', created_at)::timestamptz AS bucket,
-    COUNT(*)::int AS total_count,
-    COUNT(*) FILTER (WHERE error IS NOT NULL AND error <> '')::int AS error_count,
-    COALESCE(AVG(duration_ms), 0)::int AS avg_duration_ms
+    COALESCE(SUM(CASE WHEN is_rollup THEN request_count ELSE 1 END), 0)::int AS total_count,
+    COALESCE(SUM(CASE WHEN is_rollup THEN error_count ELSE CASE WHEN error IS NOT NULL AND error <> '' THEN 1 ELSE 0 END END), 0)::int AS error_count,
+    COALESCE(
+        SUM(CASE WHEN is_rollup THEN duration_ms_sum ELSE duration_ms::bigint END)
+        / NULLIF(SUM(CASE WHEN is_rollup THEN request_count ELSE 1 END), 0),
+        0
+    )::int AS avg_duration_ms
 FROM llm_request_events
 WHERE created_at >= $1
+  AND (NOT is_rollup OR rollup_granularity = 'hour')
 GROUP BY bucket
 ORDER BY bucket"#;
 
 const SQL_LLM_SERIES_HOUR: &str = r#"
 SELECT
     date_trunc('hour', created_at)::timestamptz AS bucket,
-    COUNT(*)::int AS total_count,
-    COUNT(*) FILTER (WHERE error IS NOT NULL AND error <> '')::int AS error_count,
-    COALESCE(AVG(duration_ms), 0)::int AS avg_duration_ms
+    COALESCE(SUM(CASE WHEN is_rollup THEN request_count ELSE 1 END), 0)::int AS total_count,
+    COALESCE(SUM(CASE WHEN is_rollup THEN error_count ELSE CASE WHEN error IS NOT NULL AND error <> '' THEN 1 ELSE 0 END END), 0)::int AS error_count,
+    COALESCE(
+        SUM(CASE WHEN is_rollup THEN duration_ms_sum ELSE duration_ms::bigint END)
+        / NULLIF(SUM(CASE WHEN is_rollup THEN request_count ELSE 1 END), 0),
+        0
+    )::int AS avg_duration_ms
 FROM llm_request_events
 WHERE created_at >= $1
+  AND (NOT is_rollup OR rollup_granularity = 'hour')
 GROUP BY bucket
 ORDER BY bucket"#;
 
@@ -58,10 +73,11 @@ SELECT
     e.chat_id,
     c.title,
     c.username,
-    COUNT(*)::int AS request_count
+    COALESCE(SUM(CASE WHEN e.is_rollup THEN e.request_count ELSE 1 END), 0)::int AS request_count
 FROM llm_request_events e
 LEFT JOIN chats c ON c.id = e.chat_id
 WHERE e.created_at >= $1
+  AND (NOT e.is_rollup OR e.rollup_granularity = 'hour')
 GROUP BY e.chat_id, c.title, c.username
 ORDER BY request_count DESC
 LIMIT 20"#;
@@ -69,20 +85,33 @@ LIMIT 20"#;
 const SQL_LLM_MODELS: &str = r#"
 SELECT
     COALESCE(NULLIF(model, ''), 'unknown')::text AS model,
-    COUNT(*)::int AS request_count,
-    COUNT(*) FILTER (WHERE error IS NOT NULL AND error <> '')::int AS error_count,
-    COALESCE(AVG(duration_ms), 0)::int AS avg_duration_ms,
-    COALESCE(PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY duration_ms), 0)::int AS p50_duration_ms,
-    COALESCE(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY duration_ms), 0)::int AS p95_duration_ms,
-    COALESCE(SUM(input_tokens), 0)::bigint AS input_tokens,
-    COALESCE(SUM(output_tokens), 0)::bigint AS output_tokens,
-    COALESCE(SUM(total_tokens), 0)::bigint AS total_tokens,
-    COALESCE(AVG(generation_tps), 0)::double precision AS avg_generation_tps,
-    COALESCE(AVG(effective_output_tps), 0)::double precision AS avg_effective_output_tps,
-    COALESCE(PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY effective_output_tps) FILTER (WHERE effective_output_tps IS NOT NULL), 0)::double precision AS p50_effective_output_tps,
-    COALESCE(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY effective_output_tps) FILTER (WHERE effective_output_tps IS NOT NULL), 0)::double precision AS p95_effective_output_tps
+    COALESCE(SUM(CASE WHEN is_rollup THEN request_count ELSE 1 END), 0)::int AS request_count,
+    COALESCE(SUM(CASE WHEN is_rollup THEN error_count ELSE CASE WHEN error IS NOT NULL AND error <> '' THEN 1 ELSE 0 END END), 0)::int AS error_count,
+    COALESCE(
+        SUM(CASE WHEN is_rollup THEN duration_ms_sum ELSE duration_ms::bigint END)
+        / NULLIF(SUM(CASE WHEN is_rollup THEN request_count ELSE 1 END), 0),
+        0
+    )::int AS avg_duration_ms,
+    COALESCE(PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY CASE WHEN is_rollup THEN p50_duration_ms ELSE duration_ms END), 0)::int AS p50_duration_ms,
+    COALESCE(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY CASE WHEN is_rollup THEN p95_duration_ms ELSE duration_ms END), 0)::int AS p95_duration_ms,
+    COALESCE(SUM(CASE WHEN is_rollup THEN input_tokens_sum ELSE COALESCE(input_tokens, 0)::bigint END), 0)::bigint AS input_tokens,
+    COALESCE(SUM(CASE WHEN is_rollup THEN output_tokens_sum ELSE COALESCE(output_tokens, 0)::bigint END), 0)::bigint AS output_tokens,
+    COALESCE(SUM(CASE WHEN is_rollup THEN total_tokens_sum ELSE COALESCE(total_tokens, 0)::bigint END), 0)::bigint AS total_tokens,
+    COALESCE(
+        SUM(CASE WHEN is_rollup THEN generation_tps_sum ELSE COALESCE(generation_tps, 0) END)
+        / NULLIF(SUM(CASE WHEN is_rollup THEN generation_tps_count ELSE CASE WHEN generation_tps IS NULL THEN 0 ELSE 1 END END), 0),
+        0
+    )::double precision AS avg_generation_tps,
+    COALESCE(
+        SUM(CASE WHEN is_rollup THEN effective_output_tps_sum ELSE COALESCE(effective_output_tps, 0) END)
+        / NULLIF(SUM(CASE WHEN is_rollup THEN effective_output_tps_count ELSE CASE WHEN effective_output_tps IS NULL THEN 0 ELSE 1 END END), 0),
+        0
+    )::double precision AS avg_effective_output_tps,
+    COALESCE(PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY CASE WHEN is_rollup THEN p50_effective_output_tps ELSE effective_output_tps END) FILTER (WHERE (is_rollup AND effective_output_tps_count > 0) OR effective_output_tps IS NOT NULL), 0)::double precision AS p50_effective_output_tps,
+    COALESCE(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY CASE WHEN is_rollup THEN p95_effective_output_tps ELSE effective_output_tps END) FILTER (WHERE (is_rollup AND effective_output_tps_count > 0) OR effective_output_tps IS NOT NULL), 0)::double precision AS p95_effective_output_tps
 FROM llm_request_events
 WHERE created_at >= $1
+  AND (NOT is_rollup OR rollup_granularity = 'hour')
 GROUP BY COALESCE(NULLIF(model, ''), 'unknown')::text
 ORDER BY request_count DESC"#;
 
@@ -90,14 +119,27 @@ const SQL_LLM_MODEL_SERIES_HOUR: &str = r#"
 SELECT
     date_trunc('hour', created_at)::timestamptz AS bucket,
     COALESCE(NULLIF(model, ''), 'unknown')::text AS model,
-    COUNT(*)::int AS request_count,
-    COUNT(*) FILTER (WHERE error IS NOT NULL AND error <> '')::int AS error_count,
-    COALESCE(AVG(duration_ms), 0)::int AS avg_duration_ms,
-    COALESCE(AVG(generation_tps), 0)::double precision AS avg_generation_tps,
-    COALESCE(AVG(effective_output_tps), 0)::double precision AS avg_effective_output_tps,
-    COALESCE(SUM(output_tokens), 0)::bigint AS output_tokens
+    COALESCE(SUM(CASE WHEN is_rollup THEN request_count ELSE 1 END), 0)::int AS request_count,
+    COALESCE(SUM(CASE WHEN is_rollup THEN error_count ELSE CASE WHEN error IS NOT NULL AND error <> '' THEN 1 ELSE 0 END END), 0)::int AS error_count,
+    COALESCE(
+        SUM(CASE WHEN is_rollup THEN duration_ms_sum ELSE duration_ms::bigint END)
+        / NULLIF(SUM(CASE WHEN is_rollup THEN request_count ELSE 1 END), 0),
+        0
+    )::int AS avg_duration_ms,
+    COALESCE(
+        SUM(CASE WHEN is_rollup THEN generation_tps_sum ELSE COALESCE(generation_tps, 0) END)
+        / NULLIF(SUM(CASE WHEN is_rollup THEN generation_tps_count ELSE CASE WHEN generation_tps IS NULL THEN 0 ELSE 1 END END), 0),
+        0
+    )::double precision AS avg_generation_tps,
+    COALESCE(
+        SUM(CASE WHEN is_rollup THEN effective_output_tps_sum ELSE COALESCE(effective_output_tps, 0) END)
+        / NULLIF(SUM(CASE WHEN is_rollup THEN effective_output_tps_count ELSE CASE WHEN effective_output_tps IS NULL THEN 0 ELSE 1 END END), 0),
+        0
+    )::double precision AS avg_effective_output_tps,
+    COALESCE(SUM(CASE WHEN is_rollup THEN output_tokens_sum ELSE COALESCE(output_tokens, 0)::bigint END), 0)::bigint AS output_tokens
 FROM llm_request_events
 WHERE created_at >= $1
+  AND (NOT is_rollup OR rollup_granularity = 'hour')
 GROUP BY bucket, COALESCE(NULLIF(model, ''), 'unknown')::text
 ORDER BY bucket, request_count DESC"#;
 
@@ -127,23 +169,49 @@ WITH normalized AS (
         output_tokens,
         total_tokens,
         generation_tps,
-        effective_output_tps
+        effective_output_tps,
+        is_rollup,
+        request_count,
+        error_count,
+        duration_ms_sum,
+        p50_duration_ms,
+        p95_duration_ms,
+        input_tokens_sum,
+        output_tokens_sum,
+        total_tokens_sum,
+        generation_tps_sum,
+        generation_tps_count,
+        effective_output_tps_sum,
+        effective_output_tps_count
     FROM llm_request_events
     WHERE created_at >= $1
+      AND (NOT is_rollup OR rollup_granularity = 'hour')
 )
 SELECT
     provider,
     string_agg(DISTINCT source, ', ' ORDER BY source)::text AS source,
-    COUNT(*)::int AS request_count,
-    COUNT(*) FILTER (WHERE error IS NOT NULL AND error <> '')::int AS error_count,
-    COALESCE(AVG(duration_ms), 0)::int AS avg_duration_ms,
-    COALESCE(PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY duration_ms), 0)::int AS p50_duration_ms,
-    COALESCE(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY duration_ms), 0)::int AS p95_duration_ms,
-    COALESCE(SUM(input_tokens), 0)::bigint AS input_tokens,
-    COALESCE(SUM(output_tokens), 0)::bigint AS output_tokens,
-    COALESCE(SUM(total_tokens), 0)::bigint AS total_tokens,
-    COALESCE(AVG(generation_tps), 0)::double precision AS avg_generation_tps,
-    COALESCE(AVG(effective_output_tps), 0)::double precision AS avg_effective_output_tps
+    COALESCE(SUM(CASE WHEN is_rollup THEN request_count ELSE 1 END), 0)::int AS request_count,
+    COALESCE(SUM(CASE WHEN is_rollup THEN error_count ELSE CASE WHEN error IS NOT NULL AND error <> '' THEN 1 ELSE 0 END END), 0)::int AS error_count,
+    COALESCE(
+        SUM(CASE WHEN is_rollup THEN duration_ms_sum ELSE duration_ms::bigint END)
+        / NULLIF(SUM(CASE WHEN is_rollup THEN request_count ELSE 1 END), 0),
+        0
+    )::int AS avg_duration_ms,
+    COALESCE(PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY CASE WHEN is_rollup THEN p50_duration_ms ELSE duration_ms END), 0)::int AS p50_duration_ms,
+    COALESCE(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY CASE WHEN is_rollup THEN p95_duration_ms ELSE duration_ms END), 0)::int AS p95_duration_ms,
+    COALESCE(SUM(CASE WHEN is_rollup THEN input_tokens_sum ELSE COALESCE(input_tokens, 0)::bigint END), 0)::bigint AS input_tokens,
+    COALESCE(SUM(CASE WHEN is_rollup THEN output_tokens_sum ELSE COALESCE(output_tokens, 0)::bigint END), 0)::bigint AS output_tokens,
+    COALESCE(SUM(CASE WHEN is_rollup THEN total_tokens_sum ELSE COALESCE(total_tokens, 0)::bigint END), 0)::bigint AS total_tokens,
+    COALESCE(
+        SUM(CASE WHEN is_rollup THEN generation_tps_sum ELSE COALESCE(generation_tps, 0) END)
+        / NULLIF(SUM(CASE WHEN is_rollup THEN generation_tps_count ELSE CASE WHEN generation_tps IS NULL THEN 0 ELSE 1 END END), 0),
+        0
+    )::double precision AS avg_generation_tps,
+    COALESCE(
+        SUM(CASE WHEN is_rollup THEN effective_output_tps_sum ELSE COALESCE(effective_output_tps, 0) END)
+        / NULLIF(SUM(CASE WHEN is_rollup THEN effective_output_tps_count ELSE CASE WHEN effective_output_tps IS NULL THEN 0 ELSE 1 END END), 0),
+        0
+    )::double precision AS avg_effective_output_tps
 FROM normalized
 GROUP BY provider
 ORDER BY request_count DESC"#;
@@ -151,15 +219,24 @@ ORDER BY request_count DESC"#;
 const SQL_LLM_SOURCES: &str = r#"
 SELECT
     COALESCE(NULLIF(source, ''), 'unknown')::text AS source,
-    COUNT(*)::int AS request_count,
-    COUNT(*) FILTER (WHERE error IS NOT NULL AND error <> '')::int AS error_count,
-    COALESCE(AVG(duration_ms), 0)::int AS avg_duration_ms,
-    COALESCE(PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY duration_ms), 0)::int AS p50_duration_ms,
-    COALESCE(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY duration_ms), 0)::int AS p95_duration_ms,
-    COALESCE(AVG(iteration), 0)::int AS avg_iteration,
-    COALESCE(MAX(iteration), 0)::int AS max_iteration
+    COALESCE(SUM(CASE WHEN is_rollup THEN request_count ELSE 1 END), 0)::int AS request_count,
+    COALESCE(SUM(CASE WHEN is_rollup THEN error_count ELSE CASE WHEN error IS NOT NULL AND error <> '' THEN 1 ELSE 0 END END), 0)::int AS error_count,
+    COALESCE(
+        SUM(CASE WHEN is_rollup THEN duration_ms_sum ELSE duration_ms::bigint END)
+        / NULLIF(SUM(CASE WHEN is_rollup THEN request_count ELSE 1 END), 0),
+        0
+    )::int AS avg_duration_ms,
+    COALESCE(PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY CASE WHEN is_rollup THEN p50_duration_ms ELSE duration_ms END), 0)::int AS p50_duration_ms,
+    COALESCE(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY CASE WHEN is_rollup THEN p95_duration_ms ELSE duration_ms END), 0)::int AS p95_duration_ms,
+    COALESCE(
+        SUM(CASE WHEN is_rollup THEN iteration_sum ELSE iteration::bigint END)
+        / NULLIF(SUM(CASE WHEN is_rollup THEN request_count ELSE 1 END), 0),
+        0
+    )::int AS avg_iteration,
+    COALESCE(MAX(CASE WHEN is_rollup THEN iteration_max ELSE iteration END), 0)::int AS max_iteration
 FROM llm_request_events
 WHERE created_at >= $1
+  AND (NOT is_rollup OR rollup_granularity = 'hour')
 GROUP BY COALESCE(NULLIF(source, ''), 'unknown')::text
 ORDER BY request_count DESC"#;
 
@@ -190,12 +267,21 @@ SELECT
     candidate_count,
     COALESCE(NULLIF(tool_mode, ''), 'default')::text AS tool_mode,
     COALESCE(NULLIF(response_format, ''), 'text')::text AS response_format,
-    COUNT(*)::int AS request_count,
-    COUNT(*) FILTER (WHERE error IS NOT NULL AND error <> '')::int AS error_count,
-    COALESCE(AVG(duration_ms), 0)::int AS avg_duration_ms,
-    COALESCE(AVG(effective_output_tps), 0)::double precision AS avg_effective_output_tps
+    COALESCE(SUM(CASE WHEN is_rollup THEN request_count ELSE 1 END), 0)::int AS request_count,
+    COALESCE(SUM(CASE WHEN is_rollup THEN error_count ELSE CASE WHEN error IS NOT NULL AND error <> '' THEN 1 ELSE 0 END END), 0)::int AS error_count,
+    COALESCE(
+        SUM(CASE WHEN is_rollup THEN duration_ms_sum ELSE duration_ms::bigint END)
+        / NULLIF(SUM(CASE WHEN is_rollup THEN request_count ELSE 1 END), 0),
+        0
+    )::int AS avg_duration_ms,
+    COALESCE(
+        SUM(CASE WHEN is_rollup THEN effective_output_tps_sum ELSE COALESCE(effective_output_tps, 0) END)
+        / NULLIF(SUM(CASE WHEN is_rollup THEN effective_output_tps_count ELSE CASE WHEN effective_output_tps IS NULL THEN 0 ELSE 1 END END), 0),
+        0
+    )::double precision AS avg_effective_output_tps
 FROM llm_request_events
 WHERE created_at >= $1
+  AND (NOT is_rollup OR rollup_granularity = 'hour')
 GROUP BY
     provider,
     source,
@@ -1073,7 +1159,8 @@ mod tests {
         assert_eq!(analytics_range_duration(" 3d "), Duration::days(3));
         assert_eq!(analytics_range_duration("90m"), Duration::minutes(90));
         assert_eq!(analytics_range_duration("1h30m"), Duration::minutes(90));
-        assert_eq!(analytics_range_duration("200d"), Duration::days(14));
+        assert_eq!(analytics_range_duration("30d"), Duration::days(30));
+        assert_eq!(analytics_range_duration("200d"), Duration::days(30));
         assert_eq!(analytics_range_duration("garbage"), Duration::hours(24));
         assert_eq!(analytics_range_bucket(Duration::hours(48)), "minute");
         assert_eq!(analytics_range_bucket(Duration::hours(49)), "hour");
