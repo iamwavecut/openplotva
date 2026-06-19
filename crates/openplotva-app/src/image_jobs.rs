@@ -3498,7 +3498,7 @@ mod tests {
         );
         // A batch generator returns both images in one emission → no progress flicker, the
         // post goes straight to the final captioned gallery.
-        assert!(calls[2].starts_with("edit:-100:888:<tg-slideshow>"));
+        assert!(calls[2].starts_with("edit:-100:888:<tg-collage>"));
         assert!(calls[2].contains("<img src=\"https://img.test/1.png\"/>"));
         assert!(calls[2].contains("<img src=\"https://img.test/2.png\"/>"));
         assert!(calls[2].contains("original caption"));
@@ -3564,7 +3564,7 @@ mod tests {
         assert!(calls[2].contains("castle"));
         assert_eq!(calls[3], "publish:[Url(\"https://img.test/vip-2.png\")]");
         // Final render: the same gallery without the leading progress line.
-        assert!(calls[4].starts_with("edit:-100:888:<tg-slideshow>"));
+        assert!(calls[4].starts_with("edit:-100:888:<tg-collage>"));
         assert!(calls[4].contains("<img src=\"https://img.test/vip-1.png\"/>"));
         assert!(calls[4].contains("<img src=\"https://img.test/vip-2.png\"/>"));
         assert!(calls[4].contains("castle"));
@@ -3606,7 +3606,7 @@ mod tests {
         assert!(calls[2].contains("<img src=\"https://img.test/s1.png\"/>"));
         // Second (final) slot lands → no extra "2 из 2" flicker; the final gallery follows.
         assert_eq!(calls[3], "publish:[Url(\"https://img.test/s2.png\")]");
-        assert!(calls[4].starts_with("edit:-100:888:<tg-slideshow>"));
+        assert!(calls[4].starts_with("edit:-100:888:<tg-collage>"));
         assert!(calls[4].contains("<img src=\"https://img.test/s1.png\"/>"));
         assert!(calls[4].contains("<img src=\"https://img.test/s2.png\"/>"));
     }
@@ -3704,7 +3704,7 @@ mod tests {
             calls[1],
             "publish:[Url(\"https://img.test/edit-1.png\"), Url(\"https://img.test/edit-2.png\")]"
         );
-        assert!(calls[2].starts_with("edit:-100:888:<tg-slideshow>"));
+        assert!(calls[2].starts_with("edit:-100:888:<tg-collage>"));
         assert!(calls[2].contains("<img src=\"https://img.test/edit-1.png\"/>"));
         assert!(calls[2].contains("<img src=\"https://img.test/edit-2.png\"/>"));
         assert!(calls[2].contains("make it night"));

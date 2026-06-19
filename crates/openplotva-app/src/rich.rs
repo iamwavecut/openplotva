@@ -336,7 +336,7 @@ pub fn compose_song_message(song: &SongMessage<'_>) -> String {
     sanitize_rich_html(&html)
 }
 
-/// Append the gallery media body: a single `<img>` for one image, a `<tg-slideshow>` for
+/// Append the gallery media body: a single `<img>` for one image, a `<tg-collage>` for
 /// several, with the caption inlined (`<p>` for one, `<figcaption>` for many). Shared by the
 /// final gallery and the progressive draw message so they render identically below the
 /// progress line.
@@ -350,19 +350,19 @@ fn append_gallery_media(html: &mut String, image_urls: &[String], caption_html: 
             }
         }
         many => {
-            html.push_str("<tg-slideshow>");
+            html.push_str("<tg-collage>");
             for url in many {
                 html.push_str(&format!("<img src=\"{}\"/>", esc(url)));
             }
             if !caption_html.trim().is_empty() {
                 html.push_str(&format!("<figcaption>{caption_html}</figcaption>"));
             }
-            html.push_str("</tg-slideshow>");
+            html.push_str("</tg-collage>");
         }
     }
 }
 
-/// Compose a finished image result: a single `<img>` for one image, a `<tg-slideshow>`
+/// Compose a finished image result: a single `<img>` for one image, a `<tg-collage>`
 /// for several. `caption_html` is pre-built rich HTML; `prompt_spoiler` is plain text.
 #[must_use]
 pub fn compose_gallery(
@@ -537,7 +537,7 @@ mod tests {
     }
 
     #[test]
-    fn gallery_one_image_is_inline_many_is_slideshow() {
+    fn gallery_one_image_is_inline_many_is_collage() {
         let one = compose_gallery(&["https://h/a.png".to_owned()], "cap", None);
         assert_eq!(one, r#"<img src="https://h/a.png"/><p>cap</p>"#);
         let many = compose_gallery(
@@ -545,7 +545,7 @@ mod tests {
             "cap",
             Some("prompt"),
         );
-        assert!(many.starts_with("<tg-slideshow>"));
+        assert!(many.starts_with("<tg-collage>"));
         assert!(many.contains("<figcaption>cap</figcaption>"));
         assert!(many.contains("<tg-spoiler>prompt</tg-spoiler>"));
     }
@@ -573,7 +573,7 @@ mod tests {
         assert!(one.contains(r#"<img src="https://h/a.png"/>"#));
         assert!(one.contains("автор"));
 
-        // Several → the same slideshow layout as the final gallery, below the progress line.
+        // Several → the same collage layout as the final gallery, below the progress line.
         let many = compose_draw_progress(
             &["https://h/a.png".to_owned(), "https://h/b.png".to_owned()],
             2,
@@ -584,7 +584,7 @@ mod tests {
                 "<p><tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji> 2 из 2</p>"
             )
         );
-        assert!(many.contains("<tg-slideshow>"));
+        assert!(many.contains("<tg-collage>"));
         assert!(many.contains(r#"<img src="https://h/b.png"/>"#));
         assert!(many.contains("<figcaption>автор</figcaption>"));
     }

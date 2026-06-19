@@ -5148,7 +5148,7 @@ mod tests {
         assert_eq!(edited.len(), 1);
         assert_eq!(edited[0].0, -100);
         assert_eq!(edited[0].1, 1001);
-        assert!(edited[0].2.starts_with("<tg-slideshow>"));
+        assert!(edited[0].2.starts_with("<tg-collage>"));
         assert!(
             edited[0]
                 .2
@@ -7251,7 +7251,7 @@ mod tests {
         assert_eq!(edited.len(), 1);
         assert_eq!(edited[0].0, 42);
         assert_eq!(edited[0].1, 1001);
-        assert!(edited[0].2.starts_with("<tg-slideshow>"));
+        assert!(edited[0].2.starts_with("<tg-collage>"));
         assert!(
             edited[0]
                 .2
