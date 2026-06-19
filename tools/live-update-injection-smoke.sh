@@ -183,6 +183,7 @@ def bot_user():
         "has_main_web_app": False,
         "has_topics_enabled": False,
         "supports_guest_queries": True,
+        "supports_join_request_queries": True,
         "supports_inline_queries": True,
     }
 
@@ -421,7 +422,7 @@ def result_for(path, method, params):
         return [{"status": "creator", "user": {"id": int(os.environ.get("OPENPLOTVA_SMOKE_USER_ID", "424242")), "is_bot": False, "first_name": "OpenPlotva"}, "is_anonymous": False}]
     if method.startswith("editMessage"):
         return True
-    if method in {"sendMessage", "sendSticker", "sendPhoto", "sendAudio"}:
+    if method in {"sendMessage", "sendRichMessage", "sendSticker", "sendPhoto", "sendAudio"}:
         return next_message(params, method)
     return True
 
@@ -1693,12 +1694,8 @@ run_music_vip_case() {
   local update_json="${log_dir}/music-vip-update.json"
   local topic="${OPENPLOTVA_LIVE_UPDATE_SMOKE_SONG_TOPIC:-openplotva live smoke song}"
   local enqueue_result
-  local before_send_audio
-  local before_send_message
-  local before_delete_message
-  before_send_audio="$(telegram_api_method_count sendAudio)"
-  before_send_message="$(telegram_api_method_count sendMessage)"
-  before_delete_message="$(telegram_api_method_count deleteMessage)"
+  local before_send_rich
+  before_send_rich="$(telegram_api_method_count sendRichMessage)"
   seed_vip_for_smoke_user
   write_message_update "$update_json" "!song ${topic}"
   echo "+ enqueue music_vip update"
@@ -1711,10 +1708,9 @@ run_music_vip_case() {
   wait_queue_empty >/dev/null
   echo "+ update queue drained"
   if is_loopback_telegram_mode; then
-    wait_loopback_telegram_method_count_at_least sendAudio "$((before_send_audio + 1))"
-    wait_loopback_telegram_method_count_at_least sendMessage "$((before_send_message + 1))"
-    wait_loopback_telegram_method_count_at_least deleteMessage "$((before_delete_message + 1))"
-    echo "+ music-vip loopback ACE-Step/sendAudio/lyrics artifacts observed"
+    wait_loopback_telegram_method_count_at_least sendRichMessage "$((before_send_rich + 1))"
+    wait_music_job_completed
+    echo "+ music-vip loopback ACE-Step/sendRichMessage artifact observed"
   else
     wait_music_job_completed
   fi

@@ -12,6 +12,7 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde_json::json;
 use thiserror::Error;
+use url::Url;
 
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -165,10 +166,15 @@ fn parse_upload_response(success: bool, status: u16, text: &str) -> Result<Strin
     }
     let parsed: UploadResponse =
         serde_json::from_str(text).map_err(|err| UploaderError::Decode(err.to_string()))?;
-    if parsed.url.trim().is_empty() {
+    let url = parsed.url.trim();
+    if url.is_empty() {
         return Err(UploaderError::MissingUrl);
     }
-    Ok(parsed.url)
+    Ok(telegram_safe_upload_url(url))
+}
+
+fn telegram_safe_upload_url(url: &str) -> String {
+    Url::parse(url).map_or_else(|_| url.to_owned(), |parsed| parsed.to_string())
 }
 
 #[cfg(test)]
@@ -210,6 +216,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(url, "https://plotva.geta.moe/abc.png");
+    }
+
+    #[test]
+    fn parses_ok_response_as_telegram_safe_url() {
+        let url = parse_upload_response(
+            true,
+            200,
+            r#"{"url":"https://plotva.geta.moe/media/ЧиХПыХ - Величественная кошачья.mp3"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            url,
+            "https://plotva.geta.moe/media/%D0%A7%D0%B8%D0%A5%D0%9F%D1%8B%D0%A5%20-%20%D0%92%D0%B5%D0%BB%D0%B8%D1%87%D0%B5%D1%81%D1%82%D0%B2%D0%B5%D0%BD%D0%BD%D0%B0%D1%8F%20%D0%BA%D0%BE%D1%88%D0%B0%D1%87%D1%8C%D1%8F.mp3"
+        );
     }
 
     #[test]
