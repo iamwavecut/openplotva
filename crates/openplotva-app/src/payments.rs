@@ -2489,8 +2489,7 @@ impl VipStatusEffects for RichPaymentEffects {
                 disable_notification: false,
                 reply_markup,
             };
-            // Rich collapses bare newlines; turn the status body into <br> breaks.
-            let html = message.text.replace('\n', "<br>");
+            let html = vip_status_rich_html(&message.text);
             self.rich
                 .send_rich(message.chat_id, &html, &options)
                 .await
@@ -2513,6 +2512,38 @@ impl VipStatusEffects for RichPaymentEffects {
                 .map_err(|error| error.to_string())
         })
     }
+}
+
+fn vip_status_rich_html(text: &str) -> String {
+    let mut html = String::new();
+    for (index, block) in text
+        .split("\n\n")
+        .map(str::trim)
+        .filter(|block| !block.is_empty())
+        .enumerate()
+    {
+        if index > 0 {
+            html.push_str("\n\n");
+        }
+        if index == 0 {
+            html.push_str("<h3>");
+            html.push_str(block);
+            html.push_str("</h3>");
+        } else if let Some(items) = block.strip_prefix("Вы получаете:") {
+            html.push_str("<h3>Вы получаете</h3>\n\n<ul>");
+            for item in items.lines().map(str::trim).filter(|item| !item.is_empty()) {
+                html.push_str("<li>");
+                html.push_str(item);
+                html.push_str("</li>");
+            }
+            html.push_str("</ul>");
+        } else {
+            html.push_str("<p>");
+            html.push_str(&block.replace('\n', "<br/>"));
+            html.push_str("</p>");
+        }
+    }
+    html
 }
 
 pub fn active_vip_status_message_at(
@@ -9648,6 +9679,26 @@ mod tests {
             json!("{\"action\":\"cancel_vip\"}")
         );
         Ok(())
+    }
+
+    #[test]
+    fn vip_status_rich_html_uses_headings_paragraphs_and_list() {
+        let html = super::vip_status_rich_html(
+            "✅ У вас активен VIP статус.\n\n\
+             Доступ подтверждён через внешний источник.\n\n\
+             Вы получаете:\n\
+             ⚡ Приоритетное выполнение запросов вне очереди\n\
+             🔄 Вдвое больше рисунков за то же время",
+        );
+
+        assert_eq!(
+            html,
+            "<h3>✅ У вас активен VIP статус.</h3>\n\n\
+<p>Доступ подтверждён через внешний источник.</p>\n\n\
+<h3>Вы получаете</h3>\n\n\
+<ul><li>⚡ Приоритетное выполнение запросов вне очереди</li><li>🔄 Вдвое больше рисунков за то же время</li></ul>"
+        );
+        assert_eq!(openplotva_telegram::sanitize_rich_html(&html), html);
     }
 
     #[test]

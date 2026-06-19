@@ -9155,10 +9155,8 @@ async fn start_runtime_workers(
         rates::MarketRatesClient::from_config(&config.market_rates)
             .context("failed to initialize market rates provider")?,
     );
-    let rates_tool_dispatcher = Arc::new(rates::RatesToolDispatcherEffects::new(
-        store.clone(),
-        Arc::clone(&dispatcher_queue),
-    ));
+    let rates_tool_dispatcher =
+        Arc::new(rates::RatesToolRichEffects::new(Arc::clone(&rich_sender)));
     let history_summarizer = match history_summary::history_summary_service_from_app_config(
         config,
         Arc::new(history_store.clone()),

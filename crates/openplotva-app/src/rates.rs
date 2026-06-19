@@ -14,8 +14,8 @@ use carapax::types::{
     UpdateType as TelegramUpdateType, User as TelegramUser,
 };
 use openplotva_dialog::{
-    TOOL_RESULT_STATUS_FAILED, TOOL_RESULT_STATUS_QUEUED, ToolContext, ToolError, ToolResult,
-    ToolSideEffect,
+    TOOL_RESULT_STATUS_EXECUTED, TOOL_RESULT_STATUS_FAILED, TOOL_RESULT_STATUS_NOOP,
+    TOOL_RESULT_STATUS_QUEUED, ToolContext, ToolError, ToolResult, ToolSideEffect,
 };
 use openplotva_telegram::{
     ChatRef, DispatcherQueue, OutboundBuildError, ReplyMessageRef, TELEGRAM_PARSE_MODE_HTML,
@@ -57,6 +57,7 @@ const DEFAULT_RATE_IDS: &[&str] = &[
     RATE_ID_EUR_RUB,
     RATE_ID_EUR_USD,
     RATE_ID_BTC_USD,
+    "brent",
 ];
 
 /// Boxed future returned by rates providers.
@@ -1027,6 +1028,61 @@ pub enum RatesRichEffectError {
     Send(String),
 }
 
+/// Rich-message-backed dialog-tool rates side effects.
+#[derive(Clone)]
+pub struct RatesToolRichEffects {
+    rich: Arc<dyn crate::rich::RichSender>,
+}
+
+impl RatesToolRichEffects {
+    /// Build dialog rates effects that send the rich rates table directly.
+    #[must_use]
+    pub fn new(rich: Arc<dyn crate::rich::RichSender>) -> Self {
+        Self { rich }
+    }
+}
+
+impl RatesSideEffectDispatcher for RatesToolRichEffects {
+    type Error = RatesRichEffectError;
+
+    fn dispatch_rates<'a>(
+        &'a self,
+        meta: RatesToolInvocationContext,
+        text: String,
+    ) -> RatesDispatchFuture<'a, Self::Error> {
+        Box::pin(async move {
+            let trimmed = text.trim().to_owned();
+            if trimmed.is_empty() {
+                return Ok(RatesSideEffectDispatchResult {
+                    kind: RATES_MESSAGE_KIND.to_owned(),
+                    state: "noop".to_owned(),
+                    ..RatesSideEffectDispatchResult::default()
+                });
+            }
+
+            let options = openplotva_telegram::RichSendOptions {
+                message_thread_id: meta.thread_id.map(i64::from),
+                reply_to_message_id: Some(i64::from(meta.message_id)),
+                allow_sending_without_reply: true,
+                disable_notification: false,
+                reply_markup: None,
+            };
+            let sent_message_id = self
+                .rich
+                .send_rich(meta.chat_id, &trimmed, &options)
+                .await
+                .map_err(|err| RatesRichEffectError::Send(err.to_string()))?;
+
+            Ok(RatesSideEffectDispatchResult {
+                kind: RATES_MESSAGE_KIND.to_owned(),
+                ticket_id: sent_message_id.to_string(),
+                eta: String::new(),
+                state: "executed".to_owned(),
+            })
+        })
+    }
+}
+
 /// Generator for async rates side-effect ticket IDs.
 pub type RatesTicketFactory = Arc<dyn Fn() -> String + Send + Sync>;
 
@@ -1564,10 +1620,16 @@ pub fn dialog_rates_queued_result(
     text: &str,
     dispatch: &RatesSideEffectDispatchResult,
 ) -> ToolResult {
+    let status = match dispatch.state.trim().to_ascii_lowercase().as_str() {
+        "queued" => TOOL_RESULT_STATUS_QUEUED,
+        "noop" => TOOL_RESULT_STATUS_NOOP,
+        _ => TOOL_RESULT_STATUS_EXECUTED,
+    };
+    let no_reply = !dispatch.state.eq_ignore_ascii_case("noop");
     ToolResult {
-        status: TOOL_RESULT_STATUS_QUEUED.to_owned(),
+        status: status.to_owned(),
         message: text.to_owned(),
-        no_reply: false,
+        no_reply,
         side_effect: Some(ToolSideEffect {
             kind: dispatch.kind.clone(),
             ticket_id: dispatch.ticket_id.clone(),
@@ -1741,7 +1803,7 @@ mod tests {
         assert!(next.calls().is_empty());
         assert_eq!(
             fetcher.calls(),
-            vec!["fetch usd_rub,eur_rub,eur_usd,btc_usd"]
+            vec!["fetch usd_rub,eur_rub,eur_usd,btc_usd,brent"]
         );
         let sent = effects.sent();
         assert_eq!(sent.len(), 1);
@@ -1897,6 +1959,7 @@ mod tests {
         .await;
 
         assert_eq!(result.status, TOOL_RESULT_STATUS_QUEUED);
+        assert!(result.no_reply);
         assert!(result.message.contains("💵 USD/RUB=90.00 ₽ (+1.1%)"));
         assert!(result.message.contains("₿ BTC/USD=65000 $"));
         assert_eq!(
@@ -1963,6 +2026,7 @@ mod tests {
         assert!(rendered.contains("<td>💵 USD/RUB</td>"));
         assert!(rendered.contains("90.00 ₽"));
         assert!(rendered.contains("BTC/USD"));
+        assert!(rendered.contains("Brent"));
     }
 
     #[test]
@@ -2097,6 +2161,41 @@ mod tests {
         assert_eq!(snapshot.regular.len(), 1);
         assert_eq!(snapshot.regular[0].virtual_id, "rates-vmsg-1");
         assert!(snapshot.immediate.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rates_tool_rich_dispatcher_sends_trimmed_rich_side_effect()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mock = Arc::new(crate::rich::MockRichSender::default());
+        let dispatcher = RatesToolRichEffects::new(mock.clone());
+
+        let result = dispatcher
+            .dispatch_rates(
+                dialog_rates_tool_context(&tool_context()),
+                "  <h3>Rates</h3><table><tr><td>USD/PLN</td></tr></table>  ".to_owned(),
+            )
+            .await?;
+
+        assert_eq!(
+            result,
+            RatesSideEffectDispatchResult {
+                kind: RATES_MESSAGE_KIND.to_owned(),
+                ticket_id: "1001".to_owned(),
+                eta: String::new(),
+                state: "executed".to_owned(),
+            }
+        );
+        let sent = mock.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].chat_id, -10042);
+        assert_eq!(sent[0].message_thread_id, Some(9));
+        assert_eq!(sent[0].reply_to_message_id, Some(77));
+        assert!(sent[0].allow_sending_without_reply);
+        assert_eq!(
+            sent[0].html,
+            "<h3>Rates</h3><table><tr><td>USD/PLN</td></tr></table>"
+        );
         Ok(())
     }
 
@@ -2444,6 +2543,17 @@ mod tests {
                         precision: 0,
                         unit: "$".to_owned(),
                         delta: None,
+                        source: "test".to_owned(),
+                        timestamp: None,
+                        stale: false,
+                    },
+                    RateQuote {
+                        id: "brent".to_owned(),
+                        label: "🛢 Brent".to_owned(),
+                        value: 76.5,
+                        precision: 2,
+                        unit: "$".to_owned(),
+                        delta: rate_delta(76.5, 75.0, RateDeltaBasis::Day),
                         source: "test".to_owned(),
                         timestamp: None,
                         stale: false,

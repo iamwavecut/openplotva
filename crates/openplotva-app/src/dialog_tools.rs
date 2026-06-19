@@ -2490,6 +2490,7 @@ mod tests {
                         "eur_rub" => ("💶 EUR/RUB", 100.0, 2, "₽"),
                         "eur_usd" => ("💶/💵 EUR/USD", 1.1, 4, ""),
                         "btc_usd" => ("₿ BTC/USD", 100_000.0, 0, "$"),
+                        "brent" => ("🛢 Brent", 76.5, 2, "$"),
                         other => {
                             snapshot.errors.push(RatesFetchProblem {
                                 label: other.to_owned(),
@@ -3238,8 +3239,10 @@ mod tests {
             .await?;
 
         assert_eq!(result.status, TOOL_RESULT_STATUS_QUEUED);
+        assert!(result.no_reply);
         assert!(result.message.contains("💵 USD/RUB=90.00 ₽"));
         assert!(result.message.contains("₿ BTC/USD=100000 $"));
+        assert!(result.message.contains("🛢 Brent=76.50 $"));
         assert_eq!(
             result.data.as_ref().expect("data")["rates_text"],
             result.message
@@ -3251,6 +3254,7 @@ mod tests {
         assert_eq!(calls[0].0.thread_id, Some(7));
         assert!(calls[0].1.contains("<table"));
         assert!(calls[0].1.contains("💵 USD/RUB"));
+        assert!(calls[0].1.contains("🛢 Brent"));
         Ok(())
     }
 
