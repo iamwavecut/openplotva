@@ -14,13 +14,14 @@ use openplotva_server::{
 use openplotva_taskman::{IMAGE_REGULAR_QUEUE_NAME, IMAGE_VIP_QUEUE_NAME, MUSIC_VIP_QUEUE_NAME};
 use serde::Deserialize;
 use serde_json::Value;
-use sqlx::{PgPool, Row};
+use sqlx::{PgConnection, PgPool, Row};
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use url::Url;
 
-const MAX_ANALYTICS_RANGE: Duration = Duration::days(90);
+const MAX_ANALYTICS_RANGE: Duration = Duration::days(14);
 const DEFAULT_ANALYTICS_RANGE: Duration = Duration::hours(24);
 const DISCOVERY_CAPACITY_TIMEOUT: StdDuration = StdDuration::from_secs(2);
+const DEFAULT_SQL_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 
 const SQL_LLM_TOTALS: &str = r#"
 SELECT
@@ -223,6 +224,7 @@ pub struct PostgresRuntimeLlmAnalyticsReader {
     capacity: Option<RuntimeAifarmCapacitySnapshotData>,
     capacity_client: Option<DiscoveryCapacityClient>,
     taskman: Option<Arc<dyn RuntimeTaskmanInspector>>,
+    sql_timeout: StdDuration,
 }
 
 impl PostgresRuntimeLlmAnalyticsReader {
@@ -233,6 +235,7 @@ impl PostgresRuntimeLlmAnalyticsReader {
             capacity: None,
             capacity_client: None,
             taskman: None,
+            sql_timeout: DEFAULT_SQL_TIMEOUT,
         }
     }
 
@@ -248,25 +251,47 @@ impl PostgresRuntimeLlmAnalyticsReader {
         self.taskman = Some(taskman);
         self
     }
+
+    pub fn with_sql_timeout_ms(mut self, timeout_ms: i32) -> Self {
+        self.sql_timeout = positive_millis(timeout_ms, DEFAULT_SQL_TIMEOUT);
+        self
+    }
 }
 
 impl RuntimeLlmAnalyticsReader for PostgresRuntimeLlmAnalyticsReader {
     fn llm_analytics<'a>(&'a self, range: &'a str) -> RuntimeLlmAnalyticsReaderFuture<'a> {
-        Box::pin(async move { self.build_summary(range).await.map_err(error_text) })
+        Box::pin(async move {
+            match tokio::time::timeout(self.sql_timeout, self.build_summary(range)).await {
+                Ok(Ok(summary)) => Ok(summary),
+                Ok(Err(error)) => Err(error_text(error)),
+                Err(_) => Err(format!(
+                    "runtime LLM analytics timed out after {}ms",
+                    self.sql_timeout.as_millis()
+                )),
+            }
+        })
     }
 }
 
 impl PostgresRuntimeLlmAnalyticsReader {
     async fn build_summary(&self, range: &str) -> Result<RuntimeLlmAnalyticsData, sqlx::Error> {
         let spec = parse_analytics_range_at(range, OffsetDateTime::now_utc());
-        let totals = self.load_totals(spec.since_time).await?;
-        let series = self.load_series(&spec).await?;
-        let model_series = self.load_model_series(spec.since_time).await?;
-        let top_chats = self.load_top_chats(spec.since_time).await?;
-        let models = self.load_models(spec.since_time).await?;
-        let providers = self.load_providers(spec.since_time).await?;
-        let inference_params = self.load_inference_params(spec.since_time).await?;
-        let stage_metrics = self.load_stage_metrics(spec.since_time).await?;
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT set_config('statement_timeout', $1, true)")
+            .bind(statement_timeout_value(self.sql_timeout))
+            .execute(&mut *tx)
+            .await?;
+        let totals = self.load_totals(&mut *tx, spec.since_time).await?;
+        let series = self.load_series(&mut *tx, &spec).await?;
+        let model_series = self.load_model_series(&mut *tx, spec.since_time).await?;
+        let top_chats = self.load_top_chats(&mut *tx, spec.since_time).await?;
+        let models = self.load_models(&mut *tx, spec.since_time).await?;
+        let providers = self.load_providers(&mut *tx, spec.since_time).await?;
+        let inference_params = self
+            .load_inference_params(&mut *tx, spec.since_time)
+            .await?;
+        let stage_metrics = self.load_stage_metrics(&mut *tx, spec.since_time).await?;
+        tx.commit().await?;
         let (runtime_jobs, runtime_jobs_error) = self.load_runtime_jobs(&spec);
         let ai_farm_capacity = self.load_capacity().await;
 
@@ -290,11 +315,12 @@ impl PostgresRuntimeLlmAnalyticsReader {
 
     async fn load_totals(
         &self,
+        conn: &mut PgConnection,
         since: OffsetDateTime,
     ) -> Result<RuntimeLlmAnalyticsTotalsData, sqlx::Error> {
         let row = sqlx::query(SQL_LLM_TOTALS)
             .bind(since)
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *conn)
             .await?;
         Ok(RuntimeLlmAnalyticsTotalsData {
             total_count: row.try_get("total_count")?,
@@ -305,6 +331,7 @@ impl PostgresRuntimeLlmAnalyticsReader {
 
     async fn load_series(
         &self,
+        conn: &mut PgConnection,
         spec: &AnalyticsRange,
     ) -> Result<Vec<RuntimeLlmAnalyticsSeriesPointData>, sqlx::Error> {
         let sql = if spec.bucket == "hour" {
@@ -314,29 +341,31 @@ impl PostgresRuntimeLlmAnalyticsReader {
         };
         let rows = sqlx::query(sql)
             .bind(spec.since_time)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *conn)
             .await?;
         rows.into_iter().map(series_point_from_row).collect()
     }
 
     async fn load_model_series(
         &self,
+        conn: &mut PgConnection,
         since: OffsetDateTime,
     ) -> Result<Vec<RuntimeLlmAnalyticsModelSeriesPointData>, sqlx::Error> {
         let rows = sqlx::query(SQL_LLM_MODEL_SERIES_HOUR)
             .bind(since)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *conn)
             .await?;
         rows.into_iter().map(model_series_point_from_row).collect()
     }
 
     async fn load_top_chats(
         &self,
+        conn: &mut PgConnection,
         since: OffsetDateTime,
     ) -> Result<Vec<RuntimeLlmAnalyticsTopChatData>, sqlx::Error> {
         let rows = sqlx::query(SQL_LLM_TOP_CHATS)
             .bind(since)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *conn)
             .await?;
         let mut chats = Vec::with_capacity(rows.len());
         for row in rows {
@@ -349,33 +378,36 @@ impl PostgresRuntimeLlmAnalyticsReader {
 
     async fn load_models(
         &self,
+        conn: &mut PgConnection,
         since: OffsetDateTime,
     ) -> Result<Vec<RuntimeLlmAnalyticsModelStatData>, sqlx::Error> {
         let rows = sqlx::query(SQL_LLM_MODELS)
             .bind(since)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *conn)
             .await?;
         rows.into_iter().map(model_stat_from_row).collect()
     }
 
     async fn load_providers(
         &self,
+        conn: &mut PgConnection,
         since: OffsetDateTime,
     ) -> Result<Vec<RuntimeLlmAnalyticsProviderStatData>, sqlx::Error> {
         let rows = sqlx::query(SQL_LLM_PROVIDERS)
             .bind(since)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *conn)
             .await?;
         rows.into_iter().map(provider_stat_from_row).collect()
     }
 
     async fn load_inference_params(
         &self,
+        conn: &mut PgConnection,
         since: OffsetDateTime,
     ) -> Result<Vec<RuntimeLlmAnalyticsInferenceParamStatData>, sqlx::Error> {
         let rows = sqlx::query(SQL_LLM_INFERENCE_PARAMS)
             .bind(since)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *conn)
             .await?;
         rows.into_iter()
             .map(inference_param_stat_from_row)
@@ -384,11 +416,12 @@ impl PostgresRuntimeLlmAnalyticsReader {
 
     async fn load_stage_metrics(
         &self,
+        conn: &mut PgConnection,
         since: OffsetDateTime,
     ) -> Result<Vec<RuntimeLlmAnalyticsStageMetricData>, sqlx::Error> {
         let rows = sqlx::query(SQL_LLM_SOURCES)
             .bind(since)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *conn)
             .await?;
         let mut metrics = Vec::with_capacity(rows.len());
         for row in rows {
@@ -938,6 +971,18 @@ fn analytics_range_bucket(duration: Duration) -> &'static str {
     }
 }
 
+fn positive_millis(value: i32, default: StdDuration) -> StdDuration {
+    if value <= 0 {
+        default
+    } else {
+        StdDuration::from_millis(value as u64)
+    }
+}
+
+fn statement_timeout_value(timeout: StdDuration) -> String {
+    format!("{}ms", timeout.as_millis().max(1))
+}
+
 fn go_duration_string(duration: Duration) -> String {
     let total_ms = duration.whole_milliseconds().max(0);
     let total_seconds = total_ms / 1000;
@@ -1018,7 +1063,8 @@ mod tests {
     use super::{
         DiscoveryCapacityPayload, RuntimeTaskmanJobDetails, aggregate_runtime_job_analytics,
         analytics_range_bucket, analytics_range_duration, apply_discovery_capacity_payload,
-        discovery_capacity_endpoint, go_duration_string, parse_analytics_range_at,
+        discovery_capacity_endpoint, go_duration_string, parse_analytics_range_at, positive_millis,
+        statement_timeout_value,
     };
 
     #[test]
@@ -1027,7 +1073,7 @@ mod tests {
         assert_eq!(analytics_range_duration(" 3d "), Duration::days(3));
         assert_eq!(analytics_range_duration("90m"), Duration::minutes(90));
         assert_eq!(analytics_range_duration("1h30m"), Duration::minutes(90));
-        assert_eq!(analytics_range_duration("200d"), Duration::days(90));
+        assert_eq!(analytics_range_duration("200d"), Duration::days(14));
         assert_eq!(analytics_range_duration("garbage"), Duration::hours(24));
         assert_eq!(analytics_range_bucket(Duration::hours(48)), "minute");
         assert_eq!(analytics_range_bucket(Duration::hours(49)), "hour");
@@ -1040,6 +1086,17 @@ mod tests {
         assert_eq!(go_duration_string(Duration::minutes(90)), "1h30m0s");
         assert_eq!(go_duration_string(Duration::seconds(45)), "45s");
         assert_eq!(go_duration_string(Duration::milliseconds(500)), "500ms");
+    }
+
+    #[test]
+    fn runtime_llm_analytics_statement_timeout_uses_runtime_api_timeout_ms() {
+        let timeout = positive_millis(1500, std::time::Duration::from_secs(10));
+
+        assert_eq!(statement_timeout_value(timeout), "1500ms");
+        assert_eq!(
+            statement_timeout_value(positive_millis(0, std::time::Duration::from_secs(10))),
+            "10000ms"
+        );
     }
 
     #[test]

@@ -407,6 +407,7 @@ struct StaticWebRoutes {
     llm_trace_buffer: Option<runtime_llm::RuntimeLlmTraceBuffer>,
     llm_discovery_base_url: Arc<str>,
     llm_discovery_service_name: Arc<str>,
+    runtime_sql_timeout_ms: i32,
     state_store: Option<PostgresVirtualMessageStore>,
     settings_store: Option<PostgresChatSettingsStore>,
     member_store: Option<PostgresChatMemberStore>,
@@ -458,6 +459,7 @@ fn static_web_routes(
         llm_trace_buffer: None,
         llm_discovery_base_url: Arc::from(""),
         llm_discovery_service_name: Arc::from(""),
+        runtime_sql_timeout_ms: openplotva_config::DEFAULT_RUNTIME_API_SQL_TIMEOUT_MS,
         state_store,
         settings_store: None,
         member_store: None,
@@ -505,6 +507,7 @@ fn static_web_routes_from_config(
     routes.llm_trace_buffer = runtime_workers.llm_trace_buffer.clone();
     routes.llm_discovery_base_url = Arc::from(config.llm.discovery.base_url.clone());
     routes.llm_discovery_service_name = Arc::from(config.llm.dialog.discovery_service_name.clone());
+    routes.runtime_sql_timeout_ms = config.runtime_api.sql_timeout_ms;
     routes.memory_admin_enabled = config.memory.enabled;
     let memory_worker_config =
         memory_runtime::memory_service_worker_config_from_memory_config(&config.memory);
@@ -6638,6 +6641,7 @@ async fn admin_llm_analytics_summary_response(
             routes.llm_discovery_base_url.to_string(),
             routes.llm_discovery_service_name.to_string(),
         )
+        .with_sql_timeout_ms(routes.runtime_sql_timeout_ms)
         .with_taskman(taskman);
     let range = admin_auth_query_values(raw_query)
         .remove("range")
@@ -7690,6 +7694,35 @@ fn dialog_memory_context_enabled(config: &AppConfig) -> bool {
     config.memory.enabled
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DialogAifarmWorkerPlan {
+    primary_workers: i32,
+    overflow_workers: i32,
+    total_workers: i32,
+}
+
+fn dialog_aifarm_worker_plan(
+    configured_primary_workers: i32,
+    configured_overflow_workers: i32,
+    pool_enabled: bool,
+) -> DialogAifarmWorkerPlan {
+    let primary_workers = configured_primary_workers.max(0);
+    let overflow_workers = if pool_enabled {
+        configured_overflow_workers.max(0)
+    } else {
+        0
+    };
+    DialogAifarmWorkerPlan {
+        primary_workers,
+        overflow_workers,
+        total_workers: primary_workers + overflow_workers,
+    }
+}
+
+fn effective_memory_consolidation_workers(configured_workers: i32) -> i32 {
+    configured_workers.clamp(0, 1)
+}
+
 fn admin_queue_config_from_app_config(config: &AppConfig) -> admin::AdminQueueCommandConfig {
     let queue = &config.persistent_queue;
     admin::AdminQueueCommandConfig {
@@ -8293,6 +8326,39 @@ async fn start_runtime_workers(
             stop.subscribe(),
         );
     workers.handles.push(llm_event_recorder_worker);
+    let llm_request_events_retention_days = config.runtime_api.llm_request_events_retention_days;
+    if llm_request_events_retention_days > 0 {
+        let llm_event_cleanup_pool = service_clients.postgres.clone();
+        let llm_event_cleanup_stop = stop.subscribe();
+        let llm_event_cleanup_interval =
+            Duration::from_secs(config.persistent_queue.cleanup_interval_seconds.max(1) as u64);
+        let llm_event_cleanup_worker = tokio::spawn(async move {
+            let report = runtime_llm::run_llm_request_event_cleanup_worker_until(
+                llm_event_cleanup_pool,
+                llm_event_cleanup_interval,
+                llm_request_events_retention_days,
+                runtime_llm::LLM_REQUEST_EVENTS_CLEANUP_BATCH_SIZE,
+                wait_for_runtime_stop(llm_event_cleanup_stop),
+            )
+            .await;
+
+            tracing::info!(?report, "llm_request_events cleanup worker stopped");
+        });
+        readiness_checks.push(ReadinessCheck::ok(
+            "llm_request_events_cleanup",
+            format!(
+                "LLM raw request events cleanup every {}s, retention {}d",
+                llm_event_cleanup_interval.as_secs(),
+                llm_request_events_retention_days
+            ),
+        ));
+        workers.handles.push(llm_event_cleanup_worker);
+    } else {
+        readiness_checks.push(ReadinessCheck::skipped(
+            "llm_request_events_cleanup",
+            "LLM raw request events cleanup disabled",
+        ));
+    }
     workers.llm_trace_buffer = Some(llm_trace_buffer.clone());
     let llm_observer: Arc<dyn openplotva_llm::LlmCallObserver> =
         Arc::new(runtime_llm::RuntimeLlmObserver::new(
@@ -8341,6 +8407,7 @@ async fn start_runtime_workers(
                     config.llm.discovery.base_url.clone(),
                     config.llm.dialog.discovery_service_name.clone(),
                 )
+                .with_sql_timeout_ms(config.runtime_api.sql_timeout_ms)
                 .with_taskman(Arc::clone(&runtime_taskman_reader)),
             )),
             log_inspector: Some(Arc::new(RuntimeLogInspector::new(Arc::clone(&log_buffer)))),
@@ -8888,8 +8955,17 @@ async fn start_runtime_workers(
                 });
                 workers.handles.push(memory_scheduler);
 
+                let configured_memory_worker_count =
+                    config.persistent_queue.memory_consolidation_workers;
                 let memory_worker_count =
-                    config.persistent_queue.memory_consolidation_workers.max(0);
+                    effective_memory_consolidation_workers(configured_memory_worker_count);
+                if configured_memory_worker_count > memory_worker_count {
+                    tracing::warn!(
+                        configured_workers = configured_memory_worker_count,
+                        effective_workers = memory_worker_count,
+                        "memory-consolidation worker count clamped to one"
+                    );
+                }
                 for index in 0..memory_worker_count {
                     let memory_worker_extractor =
                         match memory_runtime::memory_extractor_from_app_config(config) {
@@ -9290,7 +9366,6 @@ async fn start_runtime_workers(
         config,
         Some(Arc::clone(&dialog_toolbox)),
     );
-    let dialog_fallback_provider_for_runtime = genkit_fallback.clone();
     let mut dialog_provider_for_updates: Option<openplotva_llm::ChatProviderHandle> = None;
     match dialog_runtime::dialog_provider_from_app_config_with_fallback(
         config,
@@ -9324,7 +9399,6 @@ async fn start_runtime_workers(
             // RuntimeLlmObserver; the dialog provider is used directly (no tracing wrap).
             let dialog_provider: openplotva_llm::ChatProviderHandle = dialog_provider;
             dialog_provider_for_updates = Some(Arc::clone(&dialog_provider));
-            let dialog_queue = Arc::clone(&task_queue_for_updates);
             let dialog_effects =
                 dialog_jobs::DialogDispatcherEffects::new(Arc::clone(&rich_sender));
             let mut dialog_materializer = dialog_jobs::PostgresDialogInputMaterializer::new(
@@ -9356,100 +9430,108 @@ async fn start_runtime_workers(
             dialog_materializer =
                 dialog_materializer.with_vision_materializer(dialog_context_vision);
             let dialog_tool_history = history_store.clone();
-            let fallback_materializer = dialog_materializer.clone();
-            let fallback_effects = dialog_effects.clone();
-            let fallback_tool_history = dialog_tool_history.clone();
-            let dialog_provider_for_worker = Arc::clone(&dialog_provider);
             let dialog_max_llm_job_attempts = config.persistent_queue.llm_job_max_attempts;
-            let dialog_stop = stop.subscribe();
-            let dialog_worker = tokio::spawn(async move {
-                let report =
-                    dialog_jobs::run_dialog_job_worker_with_materializer_and_history_until_with_max_attempts(
-                        dialog_queue.as_ref(),
-                        dialog_provider_for_worker.as_ref(),
-                        &dialog_effects,
-                        &dialog_materializer,
-                        &dialog_tool_history,
-                        dialog_max_llm_job_attempts,
-                        wait_for_runtime_stop(dialog_stop),
-                    )
-                    .await;
+            let dialog_worker_plan = dialog_aifarm_worker_plan(
+                config.persistent_queue.dialog_aifarm_workers,
+                config.persistent_queue.dialog_aifarm_fallback_workers,
+                openplotva_llm::aifarm::pool_enabled(),
+            );
+            for index in 0..dialog_worker_plan.primary_workers {
+                let worker_queue = Arc::clone(&task_queue_for_updates);
+                let worker_provider = Arc::clone(&dialog_provider);
+                let worker_effects = dialog_effects.clone();
+                let worker_materializer = dialog_materializer.clone();
+                let worker_tool_history = dialog_tool_history.clone();
+                let worker_stop = stop.subscribe();
+                let queue_names: &'static [&'static str] = if index == 0 {
+                    &dialog_jobs::DIALOG_JOB_WORKER_QUEUES
+                } else {
+                    &dialog_jobs::DIALOG_AIFARM_ONLY_WORKER_QUEUES
+                };
+                let dialog_worker = tokio::spawn(async move {
+                    let report =
+                        dialog_jobs::run_dialog_job_worker_with_materializer_and_history_every_until(
+                            worker_queue.as_ref(),
+                            worker_provider.as_ref(),
+                            &worker_effects,
+                            dialog_jobs::DialogJobWorkerLoopOptions {
+                                materializer: &worker_materializer,
+                                tool_history: &worker_tool_history,
+                                queue_names,
+                                interval: dialog_jobs::DIALOG_JOB_POLL_INTERVAL,
+                                max_llm_job_attempts: dialog_max_llm_job_attempts,
+                            },
+                            wait_for_runtime_stop(worker_stop),
+                        )
+                        .await;
 
-                tracing::info!(?report, "dialog taskman worker stopped");
-            });
+                    tracing::info!(?report, index, "dialog taskman worker stopped");
+                });
+                workers.handles.push(dialog_worker);
+            }
             readiness_checks.push(ReadinessCheck::ok(
                 "dialog_jobs",
-                "Dialog taskman worker started for text and dialog-aifarm queues with storage-backed input materialization",
+                format!(
+                    "Started {} primary dialog taskman workers with storage-backed input materialization",
+                    dialog_worker_plan.primary_workers
+                ),
             ));
-            for queue_name in dialog_jobs::DIALOG_JOB_WORKER_QUEUES {
-                shared_taskman_worker_counts.insert(queue_name.to_owned(), 1);
+            if dialog_worker_plan.primary_workers > 0 {
+                shared_taskman_worker_counts
+                    .insert(openplotva_taskman::TEXT_QUEUE_NAME.to_owned(), 1);
+                shared_taskman_worker_counts.insert(
+                    openplotva_taskman::DIALOG_AIFARM_QUEUE_NAME.to_owned(),
+                    dialog_worker_plan.primary_workers,
+                );
             }
-            workers.handles.push(dialog_worker);
 
-            let fallback_worker_count = config
-                .persistent_queue
-                .dialog_aifarm_fallback_workers
-                .max(0);
-            if fallback_worker_count > 0 {
-                if let Some(dialog_fallback_provider) = dialog_fallback_provider_for_runtime.clone()
-                {
-                    let dialog_fallback_provider: openplotva_llm::ChatProviderHandle =
-                        dialog_fallback_provider;
-                    let fallback_high = config
+            if dialog_worker_plan.overflow_workers > 0 {
+                let overflow_interval = Duration::from_secs(
+                    config
                         .persistent_queue
-                        .dialog_aifarm_fallback_high_watermark;
-                    let fallback_low = config.persistent_queue.dialog_aifarm_fallback_low_watermark;
-                    let fallback_interval = Duration::from_secs(
-                        config
-                            .persistent_queue
-                            .dialog_aifarm_fallback_poll_interval_seconds
-                            .max(1) as u64,
-                    );
-                    for index in 0..fallback_worker_count {
-                        let fallback_queue = Arc::clone(&task_queue_for_updates);
-                        let fallback_provider = Arc::clone(&dialog_fallback_provider);
-                        let fallback_effects = fallback_effects.clone();
-                        let fallback_materializer = fallback_materializer.clone();
-                        let fallback_tool_history = fallback_tool_history.clone();
-                        let fallback_stop = stop.subscribe();
-                        let fallback_worker = tokio::spawn(async move {
-                            let report =
-                                dialog_jobs::run_dialog_aifarm_fallback_worker_with_materializer_and_history_until_with_max_attempts(
-                                    fallback_queue.as_ref(),
-                                    fallback_provider.as_ref(),
-                                    &fallback_effects,
-                                    dialog_jobs::DialogAifarmFallbackWorkerOptions {
-                                        materializer: &fallback_materializer,
-                                        tool_history: &fallback_tool_history,
-                                        high_watermark: fallback_high,
-                                        low_watermark: fallback_low,
-                                        interval: fallback_interval,
-                                        max_llm_job_attempts: dialog_max_llm_job_attempts,
-                                    },
-                                    wait_for_runtime_stop(fallback_stop),
-                                )
-                                .await;
+                        .dialog_aifarm_fallback_poll_interval_seconds
+                        .max(1) as u64,
+                );
+                let overflow_min_pending_depth = dialog_worker_plan.primary_workers.max(1) as usize;
+                for index in 0..dialog_worker_plan.overflow_workers {
+                    let overflow_queue = Arc::clone(&task_queue_for_updates);
+                    let overflow_provider = Arc::clone(&dialog_provider);
+                    let overflow_effects = dialog_effects.clone();
+                    let overflow_materializer = dialog_materializer.clone();
+                    let overflow_tool_history = dialog_tool_history.clone();
+                    let overflow_stop = stop.subscribe();
+                    let overflow_worker = tokio::spawn(async move {
+                        let report =
+                            dialog_jobs::run_dialog_aifarm_overflow_worker_with_materializer_and_history_until_with_max_attempts(
+                                overflow_queue.as_ref(),
+                                overflow_provider.as_ref(),
+                                &overflow_effects,
+                                dialog_jobs::DialogAifarmOverflowWorkerOptions {
+                                    materializer: &overflow_materializer,
+                                    tool_history: &overflow_tool_history,
+                                    min_pending_depth: overflow_min_pending_depth,
+                                    interval: overflow_interval,
+                                    max_llm_job_attempts: dialog_max_llm_job_attempts,
+                                },
+                                wait_for_runtime_stop(overflow_stop),
+                            )
+                            .await;
 
-                            tracing::info!(?report, index, "dialog-aifarm fallback worker stopped");
-                        });
-                        workers.handles.push(fallback_worker);
-                    }
-                    readiness_checks.push(ReadinessCheck::ok(
-                        "dialog_aifarm_fallback_jobs",
-                        format!(
-                            "Started {fallback_worker_count} dialog-aifarm fallback workers with configured high/low watermarks {fallback_high}/{fallback_low}"
-                        ),
-                    ));
-                    shared_taskman_worker_counts
-                        .entry(openplotva_taskman::DIALOG_AIFARM_QUEUE_NAME.to_owned())
-                        .and_modify(|count| *count += fallback_worker_count)
-                        .or_insert(fallback_worker_count);
-                } else {
-                    readiness_checks.push(ReadinessCheck::skipped(
-                        "dialog_aifarm_fallback_jobs",
-                        "fallback provider unavailable",
-                    ));
+                        tracing::info!(?report, index, "dialog-aifarm overflow worker stopped");
+                    });
+                    workers.handles.push(overflow_worker);
                 }
+                readiness_checks.push(ReadinessCheck::ok(
+                    "dialog_aifarm_overflow_jobs",
+                    format!(
+                        "Started {} dialog-aifarm overflow workers gated by aifarm pool",
+                        dialog_worker_plan.overflow_workers
+                    ),
+                ));
+                shared_taskman_worker_counts
+                    .entry(openplotva_taskman::DIALOG_AIFARM_QUEUE_NAME.to_owned())
+                    .and_modify(|count| *count += dialog_worker_plan.overflow_workers)
+                    .or_insert(dialog_worker_plan.overflow_workers);
             }
         }
         Err(error) => {
@@ -10966,7 +11048,8 @@ mod tests {
         authenticate_settings_init_data, build_deputy_display_name, chat_list_title,
         chat_member_can_manage_settings, chat_member_record_from_upsert,
         configure_telegram_bot_commands, current_unix_timestamp,
-        delete_webhook_on_shutdown_if_enabled, dialog_memory_context_enabled, found,
+        delete_webhook_on_shutdown_if_enabled, dialog_aifarm_worker_plan,
+        dialog_memory_context_enabled, effective_memory_consolidation_workers, found,
         go_dispatcher_config, new_settings_response, normalize_deputy_ids,
         parse_admin_non_negative_i32, parse_admin_optional_bool, parse_admin_positive_i32,
         parse_deputy_candidates_limit, parse_deputy_update_request, parse_memory_limit,
@@ -11020,6 +11103,26 @@ mod tests {
         assert!(!dialog_memory_context_enabled(&disabled));
         assert!(dialog_memory_context_enabled(&enabled));
         Ok(())
+    }
+
+    #[test]
+    fn dialog_aifarm_worker_plan_enables_overflow_only_when_pool_is_enabled() {
+        let disabled = dialog_aifarm_worker_plan(2, 2, false);
+        assert_eq!(disabled.primary_workers, 2);
+        assert_eq!(disabled.overflow_workers, 0);
+        assert_eq!(disabled.total_workers, 2);
+
+        let enabled = dialog_aifarm_worker_plan(2, 2, true);
+        assert_eq!(enabled.primary_workers, 2);
+        assert_eq!(enabled.overflow_workers, 2);
+        assert_eq!(enabled.total_workers, 4);
+    }
+
+    #[test]
+    fn memory_consolidation_worker_count_is_clamped_to_one() {
+        assert_eq!(effective_memory_consolidation_workers(0), 0);
+        assert_eq!(effective_memory_consolidation_workers(1), 1);
+        assert_eq!(effective_memory_consolidation_workers(8), 1);
     }
 
     #[test]

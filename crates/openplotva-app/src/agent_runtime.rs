@@ -130,21 +130,7 @@ pub fn build_agent_provider_registry(config: &AppConfig) -> AgentProviderRegistr
     let default_reasoner =
         normalize_name(openplotva_config::DEFAULT_AGENTIC_SEARCH_REASONER_PROVIDER);
     if !by_name.contains_key(&default_reasoner) {
-        let spec = openplotva_config::NamedProviderConfig {
-            name: openplotva_config::DEFAULT_AGENTIC_SEARCH_REASONER_PROVIDER.to_owned(),
-            kind: openplotva_config::DEFAULT_LLM_PROVIDER_KIND.to_owned(),
-            discovery_service_name: DEFAULT_QWEN_SERVICE_NAME.to_owned(),
-            discovery_endpoint_name: config.llm.dialog.discovery_endpoint_name.clone(),
-            model: DEFAULT_QWEN_MODEL.to_owned(),
-            base_url: String::new(),
-            url: String::new(),
-            api_key: String::new(),
-            include_reasoning: Some(false),
-            enable_thinking: Some(false),
-            max_tokens: openplotva_config::DEFAULT_LLM_PROVIDER_MAX_TOKENS,
-            temperature: None,
-            task_timeout_seconds: openplotva_config::DEFAULT_LLM_PROVIDER_TASK_TIMEOUT_SECONDS,
-        };
+        let spec = qwen_reasoner_named_provider_config(config);
         let client_config = agent_client_config_from_named_provider(config, &spec);
         by_name.insert(
             default_reasoner,
@@ -160,6 +146,37 @@ pub fn build_agent_provider_registry(config: &AppConfig) -> AgentProviderRegistr
     }
 
     AgentProviderRegistry { by_name }
+}
+
+#[must_use]
+pub fn qwen_reasoner_named_provider_config(
+    config: &AppConfig,
+) -> openplotva_config::NamedProviderConfig {
+    let default_reasoner =
+        normalize_name(openplotva_config::DEFAULT_AGENTIC_SEARCH_REASONER_PROVIDER);
+    if let Some(spec) = config
+        .llm
+        .providers
+        .iter()
+        .find(|spec| normalize_name(&spec.name) == default_reasoner)
+    {
+        return spec.clone();
+    }
+    openplotva_config::NamedProviderConfig {
+        name: openplotva_config::DEFAULT_AGENTIC_SEARCH_REASONER_PROVIDER.to_owned(),
+        kind: openplotva_config::DEFAULT_LLM_PROVIDER_KIND.to_owned(),
+        discovery_service_name: DEFAULT_QWEN_SERVICE_NAME.to_owned(),
+        discovery_endpoint_name: config.llm.dialog.discovery_endpoint_name.clone(),
+        model: DEFAULT_QWEN_MODEL.to_owned(),
+        base_url: String::new(),
+        url: String::new(),
+        api_key: String::new(),
+        include_reasoning: Some(false),
+        enable_thinking: Some(false),
+        max_tokens: openplotva_config::DEFAULT_LLM_PROVIDER_MAX_TOKENS,
+        temperature: None,
+        task_timeout_seconds: openplotva_config::DEFAULT_LLM_PROVIDER_TASK_TIMEOUT_SECONDS,
+    }
 }
 
 /// Resolved search-agent settings (prompts + budgets + default providers), built

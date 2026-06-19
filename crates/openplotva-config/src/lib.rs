@@ -32,6 +32,8 @@ pub const DEFAULT_RUNTIME_API_SQL_ROW_LIMIT: i32 = 200;
 
 pub const DEFAULT_RUNTIME_API_SQL_RESULT_BYTES_LIMIT: i32 = 2_621_440;
 
+pub const DEFAULT_LLM_REQUEST_EVENTS_RETENTION_DAYS: i32 = 14;
+
 pub const DEFAULT_RUNTIME_API_CERT_FILE: &str = "";
 
 pub const DEFAULT_RUNTIME_API_KEY_FILE: &str = "";
@@ -356,6 +358,8 @@ pub struct RuntimeApiConfig {
     pub sql_row_limit: i32,
     /// Diagnostic SQL result byte ceiling, from `RUNTIME_API_SQL_RESULT_BYTES_LIMIT`.
     pub sql_result_bytes_limit: i32,
+    /// Raw LLM request telemetry retention in days, from `LLM_REQUEST_EVENTS_RETENTION_DAYS`.
+    pub llm_request_events_retention_days: i32,
     /// Optional certificate PEM file for the runtime TLS listener, from `RUNTIME_API_CERT_FILE`.
     pub cert_file: String,
     /// Optional private key PEM file for the runtime TLS listener, from `RUNTIME_API_KEY_FILE`.
@@ -845,6 +849,8 @@ pub struct RawConfig {
     pub runtime_api_sql_row_limit: Option<String>,
     /// `RUNTIME_API_SQL_RESULT_BYTES_LIMIT`.
     pub runtime_api_sql_result_bytes_limit: Option<String>,
+    /// `LLM_REQUEST_EVENTS_RETENTION_DAYS`.
+    pub llm_request_events_retention_days: Option<String>,
     /// `RUNTIME_API_CERT_FILE`.
     pub runtime_api_cert_file: Option<String>,
     /// `RUNTIME_API_KEY_FILE`.
@@ -923,6 +929,8 @@ pub struct RawConfig {
     pub persistent_queue_dialog_aifarm_workers: Option<String>,
     /// `PERSISTENT_QUEUE_DIALOG_AIFARM_FALLBACK_WORKERS`.
     pub persistent_queue_dialog_aifarm_fallback_workers: Option<String>,
+    /// Deprecated alias for `PERSISTENT_QUEUE_DIALOG_AIFARM_FALLBACK_WORKERS`.
+    pub persistent_queue_dialog_aifarm_overflow_workers: Option<String>,
     /// `PERSISTENT_QUEUE_DIALOG_AIFARM_FALLBACK_HIGH_WATERMARK`.
     pub persistent_queue_dialog_aifarm_fallback_high_watermark: Option<String>,
     /// `PERSISTENT_QUEUE_DIALOG_AIFARM_FALLBACK_LOW_WATERMARK`.
@@ -1409,6 +1417,11 @@ impl AppConfig {
                 raw.runtime_api_sql_result_bytes_limit,
                 DEFAULT_RUNTIME_API_SQL_RESULT_BYTES_LIMIT,
             )?,
+            llm_request_events_retention_days: parse_i32(
+                "LLM_REQUEST_EVENTS_RETENTION_DAYS",
+                raw.llm_request_events_retention_days,
+                DEFAULT_LLM_REQUEST_EVENTS_RETENTION_DAYS,
+            )?,
             cert_file: raw
                 .runtime_api_cert_file
                 .unwrap_or_else(|| DEFAULT_RUNTIME_API_CERT_FILE.to_owned()),
@@ -1495,8 +1508,12 @@ impl AppConfig {
                 DEFAULT_PERSISTENT_QUEUE_DIALOG_AIFARM_WORKERS,
             )?,
             dialog_aifarm_fallback_workers: parse_i32(
-                "PERSISTENT_QUEUE_DIALOG_AIFARM_FALLBACK_WORKERS",
-                raw.persistent_queue_dialog_aifarm_fallback_workers,
+                dialog_aifarm_fallback_workers_env_name(
+                    &raw.persistent_queue_dialog_aifarm_fallback_workers,
+                    &raw.persistent_queue_dialog_aifarm_overflow_workers,
+                ),
+                raw.persistent_queue_dialog_aifarm_fallback_workers
+                    .or(raw.persistent_queue_dialog_aifarm_overflow_workers),
                 DEFAULT_PERSISTENT_QUEUE_DIALOG_AIFARM_FALLBACK_WORKERS,
             )?,
             dialog_aifarm_fallback_high_watermark: parse_i32(
@@ -2355,6 +2372,7 @@ impl RawConfig {
             runtime_api_sql_timeout_ms: env("RUNTIME_API_SQL_TIMEOUT_MS"),
             runtime_api_sql_row_limit: env("RUNTIME_API_SQL_ROW_LIMIT"),
             runtime_api_sql_result_bytes_limit: env("RUNTIME_API_SQL_RESULT_BYTES_LIMIT"),
+            llm_request_events_retention_days: env("LLM_REQUEST_EVENTS_RETENTION_DAYS"),
             runtime_api_cert_file: env("RUNTIME_API_CERT_FILE"),
             runtime_api_key_file: env("RUNTIME_API_KEY_FILE"),
             runtime_api_tls_public_key_pin: env("RUNTIME_API_TLS_PUBLIC_KEY_PIN"),
@@ -2409,6 +2427,9 @@ impl RawConfig {
             persistent_queue_dialog_aifarm_workers: env("PERSISTENT_QUEUE_DIALOG_AIFARM_WORKERS"),
             persistent_queue_dialog_aifarm_fallback_workers: env(
                 "PERSISTENT_QUEUE_DIALOG_AIFARM_FALLBACK_WORKERS",
+            ),
+            persistent_queue_dialog_aifarm_overflow_workers: env(
+                "PERSISTENT_QUEUE_DIALOG_AIFARM_OVERFLOW_WORKERS",
             ),
             persistent_queue_dialog_aifarm_fallback_high_watermark: env(
                 "PERSISTENT_QUEUE_DIALOG_AIFARM_FALLBACK_HIGH_WATERMARK",
@@ -2678,6 +2699,27 @@ fn parse_i32(name: &'static str, value: Option<String>, default: i32) -> Result<
     })
 }
 
+fn dialog_aifarm_fallback_workers_env_name(
+    canonical: &Option<String>,
+    alias: &Option<String>,
+) -> &'static str {
+    if canonical
+        .as_ref()
+        .and_then(|value| parse_scalar_value(Some(value.clone())))
+        .is_some()
+    {
+        "PERSISTENT_QUEUE_DIALOG_AIFARM_FALLBACK_WORKERS"
+    } else if alias
+        .as_ref()
+        .and_then(|value| parse_scalar_value(Some(value.clone())))
+        .is_some()
+    {
+        "PERSISTENT_QUEUE_DIALOG_AIFARM_OVERFLOW_WORKERS"
+    } else {
+        "PERSISTENT_QUEUE_DIALOG_AIFARM_FALLBACK_WORKERS"
+    }
+}
+
 fn parse_f64(name: &'static str, value: Option<String>, default: f64) -> Result<f64, ConfigError> {
     let Some(value) = parse_scalar_value(value) else {
         return Ok(default);
@@ -2782,6 +2824,11 @@ fn validate_history_summary_provider(value: &str) -> Result<(), ConfigError> {
 }
 
 fn validate_runtime_api(config: &RuntimeApiConfig) -> Result<(), ConfigError> {
+    validate_non_negative_i32(
+        "LLM_REQUEST_EVENTS_RETENTION_DAYS",
+        config.llm_request_events_retention_days,
+    )?;
+
     if !config.enabled {
         return Ok(());
     }
@@ -3329,6 +3376,7 @@ mod tests {
             runtime_api_sql_timeout_ms: Some("1000".to_owned()),
             runtime_api_sql_row_limit: Some("100".to_owned()),
             runtime_api_sql_result_bytes_limit: Some("4096".to_owned()),
+            llm_request_events_retention_days: Some("9".to_owned()),
             runtime_api_cert_file: Some("/tmp/openplotva-runtime-api.crt".to_owned()),
             runtime_api_key_file: Some("/tmp/openplotva-runtime-api.key".to_owned()),
             runtime_api_tls_public_key_pin: Some("sha256//example".to_owned()),
@@ -3342,6 +3390,7 @@ mod tests {
         assert_eq!(config.runtime_api.sql_timeout_ms, 1000);
         assert_eq!(config.runtime_api.sql_row_limit, 100);
         assert_eq!(config.runtime_api.sql_result_bytes_limit, 4096);
+        assert_eq!(config.runtime_api.llm_request_events_retention_days, 9);
         assert_eq!(
             config.runtime_api.cert_file,
             "/tmp/openplotva-runtime-api.crt"
@@ -3351,6 +3400,27 @@ mod tests {
             "/tmp/openplotva-runtime-api.key"
         );
         assert_eq!(config.runtime_api.tls_public_key_pin, "sha256//example");
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_api_config_defaults_llm_raw_event_retention_to_14_days()
+    -> Result<(), super::ConfigError> {
+        let config = AppConfig::from_raw(RawConfig::default())?;
+
+        assert_eq!(config.runtime_api.llm_request_events_retention_days, 14);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_api_config_allows_disabling_llm_raw_event_cleanup() -> Result<(), super::ConfigError>
+    {
+        let config = AppConfig::from_raw(RawConfig {
+            llm_request_events_retention_days: Some("0".to_owned()),
+            ..RawConfig::default()
+        })?;
+
+        assert_eq!(config.runtime_api.llm_request_events_retention_days, 0);
         Ok(())
     }
 
@@ -3514,6 +3584,31 @@ mod tests {
         );
         assert_eq!(config.persistent_queue.placeholder_max_age_seconds, 7201);
         assert_eq!(config.persistent_queue.llm_job_max_attempts, 9);
+        Ok(())
+    }
+
+    #[test]
+    fn persistent_queue_dialog_overflow_workers_aliases_fallback_workers()
+    -> Result<(), super::ConfigError> {
+        let config = AppConfig::from_raw(RawConfig {
+            persistent_queue_dialog_aifarm_overflow_workers: Some("2".to_owned()),
+            ..RawConfig::default()
+        })?;
+
+        assert_eq!(config.persistent_queue.dialog_aifarm_fallback_workers, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn persistent_queue_dialog_fallback_workers_win_over_overflow_alias()
+    -> Result<(), super::ConfigError> {
+        let config = AppConfig::from_raw(RawConfig {
+            persistent_queue_dialog_aifarm_fallback_workers: Some("3".to_owned()),
+            persistent_queue_dialog_aifarm_overflow_workers: Some("2".to_owned()),
+            ..RawConfig::default()
+        })?;
+
+        assert_eq!(config.persistent_queue.dialog_aifarm_fallback_workers, 3);
         Ok(())
     }
 

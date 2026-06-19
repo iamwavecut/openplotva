@@ -6,9 +6,9 @@ use openplotva_config::{AppConfig, MemoryConfig, ShieldConfig};
 use openplotva_llm::{
     aifarm::{
         AifarmClientConfig, AifarmMemoryExtractor, AifarmMemoryExtractorConfig,
-        AifarmMemoryExtractorError, GenkitOpenAiCompatibleMemoryExtractor,
-        GenkitOpenAiCompatibleMemoryExtractorConfig, GenkitOpenAiCompatibleMemoryExtractorError,
-        ReqwestAifarmTransport,
+        AifarmMemoryExtractorError, AifarmPoolBackendConfig, AifarmPoolConfig,
+        GenkitOpenAiCompatibleMemoryExtractor, GenkitOpenAiCompatibleMemoryExtractorConfig,
+        GenkitOpenAiCompatibleMemoryExtractorError, ReqwestAifarmTransport,
     },
     gemini::{
         GeminiMemoryExtractor, GeminiMemoryExtractorConfig, GeminiMemoryExtractorError,
@@ -32,7 +32,7 @@ use thiserror::Error;
 use time::{OffsetDateTime, Time};
 
 use crate::embedder::DiscoveryEmbedderClient;
-use crate::media::aifarm_pool_config_from_app_config;
+use crate::media::{agent_client_config_from_named_provider, aifarm_pool_config_from_app_config};
 use crate::runtime_gemini_cache::resolve_google_ai_key;
 
 pub const EMBEDDER_DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -58,6 +58,9 @@ type AifarmGenkitMemoryExtractor = FallbackMemoryExtractor<
 
 type RedactingAifarmGenkitMemoryExtractor =
     RedactingMemoryExtractor<AifarmGenkitMemoryExtractor, DiscoveryRedactor>;
+
+type RedactingAifarmRouteMemoryExtractor =
+    RedactingMemoryExtractor<AifarmRouteMemoryExtractor, DiscoveryRedactor>;
 
 /// Boxed future returned by embedding providers.
 pub type EmbeddingProviderFuture<'a> = Pin<
@@ -2478,6 +2481,242 @@ pub fn aifarm_memory_extractor_from_app_config_with_model(
     ))
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AifarmMemoryRouteBackendPlan {
+    pub label: String,
+    pub model: String,
+    pub service_name: String,
+    pub direct_url: String,
+    pub requires_pool_enabled: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AifarmMemoryRoutePlan {
+    pub backends: Vec<AifarmMemoryRouteBackendPlan>,
+}
+
+struct AifarmRouteMemoryBackend {
+    plan: AifarmMemoryRouteBackendPlan,
+    extractor: AifarmMemoryExtractor<ReqwestAifarmTransport>,
+}
+
+pub struct AifarmRouteMemoryExtractor {
+    backends: Vec<AifarmRouteMemoryBackend>,
+}
+
+#[derive(Debug, Error)]
+pub enum AifarmRouteMemoryExtractorError {
+    #[error("memory extractor route has no available backends")]
+    NoBackends,
+    #[error("memory extractor backend {backend} failed: {source}")]
+    Backend {
+        backend: String,
+        #[source]
+        source: AifarmMemoryExtractorError,
+    },
+    #[error("memory extractor route exhausted retryable backends: {0}")]
+    Exhausted(String),
+}
+
+impl MemoryExtractor for AifarmRouteMemoryExtractor {
+    type Error = AifarmRouteMemoryExtractorError;
+
+    fn extract<'a>(&'a self, input: &'a ExtractInput) -> MemoryExtractorFuture<'a, Self::Error> {
+        Box::pin(async move {
+            let mut retryable_errors = Vec::new();
+            let mut attempted = false;
+            for backend in &self.backends {
+                if backend.plan.requires_pool_enabled && !openplotva_llm::aifarm::pool_enabled() {
+                    continue;
+                }
+                attempted = true;
+                match MemoryExtractor::extract(&backend.extractor, input).await {
+                    Ok(output) => return Ok(output),
+                    Err(source) if retryable_reason(&source).is_some() => {
+                        retryable_errors.push(format!("{}: {source}", backend.plan.label));
+                    }
+                    Err(source) => {
+                        return Err(AifarmRouteMemoryExtractorError::Backend {
+                            backend: backend.plan.label.clone(),
+                            source,
+                        });
+                    }
+                }
+            }
+            if !attempted {
+                return Err(AifarmRouteMemoryExtractorError::NoBackends);
+            }
+            Err(AifarmRouteMemoryExtractorError::Exhausted(
+                retryable_errors.join("\n"),
+            ))
+        })
+    }
+}
+
+#[must_use]
+pub fn aifarm_memory_route_plan_from_app_config(config: &AppConfig) -> AifarmMemoryRoutePlan {
+    let mut backends = Vec::new();
+    for backend in aifarm_pool_config_from_app_config(config).secondary_backends {
+        backends.push(AifarmMemoryRouteBackendPlan {
+            label: memory_pool_backend_label(&backend),
+            model: backend.model.clone(),
+            service_name: String::new(),
+            direct_url: pool_backend_direct_url(&backend),
+            requires_pool_enabled: true,
+        });
+    }
+    let qwen = crate::agent_runtime::qwen_reasoner_named_provider_config(config);
+    if qwen
+        .kind
+        .trim()
+        .eq_ignore_ascii_case(openplotva_config::DEFAULT_LLM_PROVIDER_KIND)
+    {
+        backends.push(AifarmMemoryRouteBackendPlan {
+            label: qwen.name.clone(),
+            model: qwen.model.clone(),
+            service_name: qwen.discovery_service_name.clone(),
+            direct_url: qwen.url.clone(),
+            requires_pool_enabled: false,
+        });
+    }
+    let primary = aifarm_memory_extractor_config_from_app_config(config);
+    backends.push(AifarmMemoryRouteBackendPlan {
+        label: "primary".to_owned(),
+        model: primary.model,
+        service_name: primary.client.service_name,
+        direct_url: primary.client.direct_url,
+        requires_pool_enabled: false,
+    });
+    AifarmMemoryRoutePlan { backends }
+}
+
+fn aifarm_route_memory_extractor_from_app_config_with_model(
+    config: &AppConfig,
+    model_override: Option<&str>,
+) -> AifarmRouteMemoryExtractor {
+    let pool = aifarm_pool_config_from_app_config(config);
+    let mut backends = Vec::new();
+    for backend in &pool.secondary_backends {
+        let cfg = memory_pool_backend_extractor_config(config, &pool, backend);
+        backends.push(AifarmRouteMemoryBackend {
+            plan: AifarmMemoryRouteBackendPlan {
+                label: memory_pool_backend_label(backend),
+                model: backend.model.clone(),
+                service_name: String::new(),
+                direct_url: pool_backend_direct_url(backend),
+                requires_pool_enabled: true,
+            },
+            extractor: AifarmMemoryExtractor::new(cfg),
+        });
+    }
+    let qwen = crate::agent_runtime::qwen_reasoner_named_provider_config(config);
+    if qwen
+        .kind
+        .trim()
+        .eq_ignore_ascii_case(openplotva_config::DEFAULT_LLM_PROVIDER_KIND)
+    {
+        let cfg = qwen_memory_extractor_config_from_app_config(config, &qwen);
+        backends.push(AifarmRouteMemoryBackend {
+            plan: AifarmMemoryRouteBackendPlan {
+                label: qwen.name.clone(),
+                model: qwen.model.clone(),
+                service_name: qwen.discovery_service_name.clone(),
+                direct_url: qwen.url.clone(),
+                requires_pool_enabled: false,
+            },
+            extractor: AifarmMemoryExtractor::new(cfg),
+        });
+    }
+    let mut primary =
+        aifarm_memory_extractor_config_from_app_config_with_model(config, model_override);
+    primary.pool = AifarmPoolConfig::default();
+    backends.push(AifarmRouteMemoryBackend {
+        plan: AifarmMemoryRouteBackendPlan {
+            label: "primary".to_owned(),
+            model: primary.model.clone(),
+            service_name: primary.client.service_name.clone(),
+            direct_url: primary.client.direct_url.clone(),
+            requires_pool_enabled: false,
+        },
+        extractor: AifarmMemoryExtractor::new(primary),
+    });
+    AifarmRouteMemoryExtractor { backends }
+}
+
+fn memory_pool_backend_extractor_config(
+    config: &AppConfig,
+    pool: &AifarmPoolConfig,
+    backend: &AifarmPoolBackendConfig,
+) -> AifarmMemoryExtractorConfig {
+    let memory = &config.memory;
+    AifarmMemoryExtractorConfig {
+        client: AifarmClientConfig {
+            direct_url: pool_backend_direct_url(backend),
+            api_key: default_string(backend.api_key.trim(), pool.secondary_api_key.trim()),
+            request_timeout: positive_seconds(memory.aifarm_request_timeout_seconds),
+            default_model: backend.model.clone(),
+            ..AifarmClientConfig::default()
+        },
+        model: backend.model.clone(),
+        max_output_tokens: memory.aifarm_max_output_tokens,
+        temperature: Some(memory.aifarm_temperature),
+        enable_thinking: Some(memory.aifarm_enable_thinking),
+        include_reasoning: Some(false),
+        pool: AifarmPoolConfig::default(),
+    }
+    .with_defaults()
+}
+
+fn qwen_memory_extractor_config_from_app_config(
+    config: &AppConfig,
+    spec: &openplotva_config::NamedProviderConfig,
+) -> AifarmMemoryExtractorConfig {
+    let memory = &config.memory;
+    AifarmMemoryExtractorConfig {
+        client: agent_client_config_from_named_provider(config, spec),
+        model: spec.model.clone(),
+        max_output_tokens: memory.aifarm_max_output_tokens,
+        temperature: spec.temperature.or(Some(memory.aifarm_temperature)),
+        enable_thinking: spec.enable_thinking.or(Some(false)),
+        include_reasoning: spec.include_reasoning.or(Some(false)),
+        pool: AifarmPoolConfig::default(),
+    }
+    .with_defaults()
+}
+
+fn memory_pool_backend_label(backend: &AifarmPoolBackendConfig) -> String {
+    default_string(
+        backend.name.trim(),
+        &format!("pool:{}", backend.model.trim()),
+    )
+}
+
+fn pool_backend_direct_url(backend: &AifarmPoolBackendConfig) -> String {
+    let direct = backend.url.trim();
+    if !direct.is_empty() {
+        return direct.to_owned();
+    }
+    normalize_chat_completions_url(&backend.base_url)
+}
+
+fn normalize_chat_completions_url(base_url: &str) -> String {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    if trimmed.is_empty() || trimmed.ends_with("/chat/completions") {
+        trimmed.to_owned()
+    } else {
+        format!("{trimmed}/chat/completions")
+    }
+}
+
+fn default_string(value: &str, default: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        default.trim().to_owned()
+    } else {
+        trimmed.to_owned()
+    }
+}
+
 /// App-owned GenKit memory extractor branch.
 pub enum AppGenkitMemoryExtractor {
     /// Direct Gemini implementation.
@@ -2527,6 +2766,8 @@ pub enum AppMemoryExtractor {
     ),
     AifarmFallback(AifarmGenkitMemoryExtractor),
     RedactingAifarmFallback(RedactingAifarmGenkitMemoryExtractor),
+    AifarmRoute(AifarmRouteMemoryExtractor),
+    RedactingAifarmRoute(RedactingAifarmRouteMemoryExtractor),
     /// Plain Gemini/GenKit extractor without redaction.
     GeminiPlain(AppGenkitMemoryExtractor),
     GeminiRedacting(RedactingMemoryExtractor<AppGenkitMemoryExtractor, DiscoveryRedactor>),
@@ -2566,6 +2807,8 @@ pub enum AppMemoryExtractorError {
         #[from]
         FallbackMemoryExtractorError<AifarmMemoryExtractorError, AppGenkitMemoryExtractorError>,
     ),
+    #[error(transparent)]
+    AifarmRoute(#[from] AifarmRouteMemoryExtractorError),
 }
 
 impl MemoryExtractor for AppMemoryExtractor {
@@ -2591,6 +2834,12 @@ impl MemoryExtractor for AppMemoryExtractor {
                         .await
                         .map_err(Into::into)
                 }
+                Self::AifarmRoute(extractor) => MemoryExtractor::extract(extractor, input)
+                    .await
+                    .map_err(Into::into),
+                Self::RedactingAifarmRoute(extractor) => MemoryExtractor::extract(extractor, input)
+                    .await
+                    .map_err(Into::into),
                 Self::GeminiPlain(extractor) => MemoryExtractor::extract(extractor, input)
                     .await
                     .map_err(Into::into),
@@ -2625,28 +2874,14 @@ pub fn memory_extractor_from_app_config_with_override(
     match provider.as_str() {
         "aifarm" => {
             let extractor =
-                aifarm_memory_extractor_from_app_config_with_model(config, model_override);
+                aifarm_route_memory_extractor_from_app_config_with_model(config, model_override);
             let redactor = discovery_redactor_from_app_config(config)?;
-            if let Ok(fallback) = genkit_memory_extractor_from_app_config_with_model(config, None) {
-                let extractor = FallbackMemoryExtractor::new(
-                    extractor,
-                    fallback,
-                    aifarm_memory_extractor_error_retryable
-                        as fn(&AifarmMemoryExtractorError) -> bool,
-                );
-                if let Some(redactor) = redactor {
-                    Ok(AppMemoryExtractor::RedactingAifarmFallback(
-                        RedactingMemoryExtractor::new(extractor, redactor),
-                    ))
-                } else {
-                    Ok(AppMemoryExtractor::AifarmFallback(extractor))
-                }
-            } else if let Some(redactor) = redactor {
-                Ok(AppMemoryExtractor::Redacting(
+            if let Some(redactor) = redactor {
+                Ok(AppMemoryExtractor::RedactingAifarmRoute(
                     RedactingMemoryExtractor::new(extractor, redactor),
                 ))
             } else {
-                Ok(AppMemoryExtractor::Plain(extractor))
+                Ok(AppMemoryExtractor::AifarmRoute(extractor))
             }
         }
         "genkit" | "gemini" => {
@@ -2664,10 +2899,6 @@ pub fn memory_extractor_from_app_config_with_override(
             other.to_owned(),
         )),
     }
-}
-
-fn aifarm_memory_extractor_error_retryable(error: &AifarmMemoryExtractorError) -> bool {
-    retryable_reason(error).is_some()
 }
 
 fn memory_extractor_provider(config: &AppConfig, provider_override: Option<&str>) -> String {
@@ -3282,6 +3513,46 @@ mod tests {
         assert_eq!(cfg.client.default_model, "override");
     }
 
+    #[test]
+    fn aifarm_memory_route_plan_orders_pool_qwen_primary() {
+        let config = AppConfig::from_raw(openplotva_config::RawConfig {
+            dialog_aifarm_pool_models: Some("pool-a,pool-b".to_owned()),
+            dialog_aifarm_pool_base_urls: Some(
+                "https://pool-a.test/v1,https://pool-b.test/v1/chat/completions".to_owned(),
+            ),
+            llm_provider_names: Some("qwen-reasoner".to_owned()),
+            llm_provider_kinds: Some("aifarm".to_owned()),
+            llm_provider_discovery_service_names: Some("custom-qwen".to_owned()),
+            llm_provider_models: Some("custom-qwen-model".to_owned()),
+            memory_consolidation_model: Some("primary-memory".to_owned()),
+            ..openplotva_config::RawConfig::default()
+        })
+        .expect("config");
+
+        let plan = aifarm_memory_route_plan_from_app_config(&config);
+
+        assert_eq!(
+            plan.backends
+                .iter()
+                .map(|backend| backend.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["pool-a", "pool-b", "qwen-reasoner", "primary"]
+        );
+        assert!(plan.backends[0].requires_pool_enabled);
+        assert_eq!(
+            plan.backends[0].direct_url,
+            "https://pool-a.test/v1/chat/completions"
+        );
+        assert_eq!(
+            plan.backends[1].direct_url,
+            "https://pool-b.test/v1/chat/completions"
+        );
+        assert_eq!(plan.backends[2].service_name, "custom-qwen");
+        assert_eq!(plan.backends[2].model, "custom-qwen-model");
+        assert_eq!(plan.backends[3].service_name, "llm-openai");
+        assert_eq!(plan.backends[3].model, "primary-memory");
+    }
+
     #[tokio::test]
     async fn runtime_memory_restarter_retries_specific_run_and_triggers_worker() {
         let trigger = Arc::new(tokio::sync::Notify::new());
@@ -3412,16 +3683,16 @@ mod tests {
 
         assert!(matches!(
             memory_extractor_from_app_config(&redacting).expect("redacting extractor"),
-            AppMemoryExtractor::Redacting(_)
+            AppMemoryExtractor::RedactingAifarmRoute(_)
         ));
         assert!(matches!(
             memory_extractor_from_app_config(&plain).expect("plain extractor"),
-            AppMemoryExtractor::Plain(_)
+            AppMemoryExtractor::AifarmRoute(_)
         ));
     }
 
     #[test]
-    fn app_memory_extractor_adds_go_genkit_fallback_to_aifarm_when_google_key_resolves() {
+    fn app_memory_extractor_keeps_aifarm_route_when_google_key_resolves() {
         let plain = AppConfig::from_raw(openplotva_config::RawConfig {
             googleai_key: Some(" google-key ".to_owned()),
             memory_redaction_enabled: Some("false".to_owned()),
@@ -3436,8 +3707,8 @@ mod tests {
         .expect("redacting config");
 
         assert!(matches!(
-            memory_extractor_from_app_config(&plain).expect("fallback extractor"),
-            AppMemoryExtractor::AifarmFallback(_)
+            memory_extractor_from_app_config(&plain).expect("route extractor"),
+            AppMemoryExtractor::AifarmRoute(_)
         ));
         assert!(matches!(
             memory_extractor_from_app_config_with_override(
@@ -3445,8 +3716,8 @@ mod tests {
                 Some("aifarm"),
                 Some(" override-model ")
             )
-            .expect("redacting fallback extractor"),
-            AppMemoryExtractor::RedactingAifarmFallback(_)
+            .expect("redacting route extractor"),
+            AppMemoryExtractor::RedactingAifarmRoute(_)
         ));
     }
 

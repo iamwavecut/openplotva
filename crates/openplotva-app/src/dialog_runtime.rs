@@ -1,13 +1,14 @@
 //! App-level dialog provider construction.
 
-use std::sync::Arc;
+use std::{fmt, sync::Arc};
 
 use openplotva_config::AppConfig;
 use openplotva_dialog::{
-    DialogToolbox, PROVIDER_AIFARM, PROVIDER_GENKIT, PROVIDER_NVIDIA, PROVIDER_VMLX,
+    DialogInput, DialogOutput, DialogToolbox, PROVIDER_AIFARM, PROVIDER_GENKIT, PROVIDER_NVIDIA,
+    PROVIDER_VMLX,
 };
 use openplotva_llm::{
-    ChatProvider,
+    ChatProvider, ChatProviderError,
     aifarm::{
         AifarmClientConfig, AifarmDialogConfig, AifarmDialogProvider, ReqwestAifarmTransport,
     },
@@ -15,14 +16,16 @@ use openplotva_llm::{
         GeminiDialogConfig, GeminiDialogProvider, GeminiExplicitCacheConfig,
         is_gemini_provider_model,
     },
+    retry::retryable_reason,
     whitecircle::{WhiteCircleClientConfig, WhiteCirclePreToolConfig},
     with_fallback,
 };
 use thiserror::Error;
 
+use crate::agent_runtime;
 use crate::media::{
-    aifarm_dialog_config_from_app_config, nvidia_dialog_config_from_app_config,
-    vmlx_dialog_config_from_app_config,
+    agent_client_config_from_named_provider, aifarm_dialog_config_from_app_config,
+    nvidia_dialog_config_from_app_config, vmlx_dialog_config_from_app_config,
 };
 use crate::runtime_gemini_cache::resolve_google_ai_key;
 
@@ -31,6 +34,96 @@ const OPENROUTER_CHAT_COMPLETIONS_URL: &str = "https://openrouter.ai/api/v1/chat
 
 /// Shared dialog provider handle.
 pub type DialogProviderHandle = Arc<dyn ChatProvider>;
+
+struct PoolGatedFallbackChatProvider {
+    primary: DialogProviderHandle,
+    fallback: DialogProviderHandle,
+    provider_name: String,
+}
+
+#[derive(Debug)]
+struct PoolGatedFallbackChatProviderError {
+    primary_provider: String,
+    primary_error: String,
+    fallback_provider: String,
+    fallback_error: String,
+}
+
+impl PoolGatedFallbackChatProvider {
+    fn new(primary: DialogProviderHandle, fallback: DialogProviderHandle) -> Self {
+        let provider_name = format!(
+            "{}+pool-fallback:{}",
+            primary.provider_name(),
+            fallback.provider_name()
+        );
+        Self {
+            primary,
+            fallback,
+            provider_name,
+        }
+    }
+
+    async fn run_fallback(
+        &self,
+        input: DialogInput,
+        primary_error: ChatProviderError,
+    ) -> Result<DialogOutput, ChatProviderError> {
+        match self.fallback.run_dialog(input).await {
+            Ok(mut output) => {
+                if output.provider.trim().is_empty() {
+                    output.provider = self.fallback.provider_name().to_owned();
+                }
+                output.fallback_from = self.primary.provider_name().to_owned();
+                output.fallback_error = primary_error.to_string();
+                Ok(output)
+            }
+            Err(fallback_error) => Err(Box::new(PoolGatedFallbackChatProviderError {
+                primary_provider: self.primary.provider_name().to_owned(),
+                primary_error: primary_error.to_string(),
+                fallback_provider: self.fallback.provider_name().to_owned(),
+                fallback_error: fallback_error.to_string(),
+            })),
+        }
+    }
+}
+
+impl fmt::Display for PoolGatedFallbackChatProviderError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "primary provider {}: {}; pool fallback provider {}: {}",
+            self.primary_provider, self.primary_error, self.fallback_provider, self.fallback_error
+        )
+    }
+}
+
+impl std::error::Error for PoolGatedFallbackChatProviderError {}
+
+impl ChatProvider for PoolGatedFallbackChatProvider {
+    fn provider_name(&self) -> &str {
+        &self.provider_name
+    }
+
+    fn run_dialog<'a>(&'a self, input: DialogInput) -> openplotva_llm::ChatProviderFuture<'a> {
+        Box::pin(async move {
+            let mut output = match self.primary.run_dialog(input.clone()).await {
+                Ok(output) => output,
+                Err(primary_error) => {
+                    if retryable_reason(primary_error.as_ref()).is_none()
+                        || !openplotva_llm::aifarm::pool_enabled()
+                    {
+                        return Err(primary_error);
+                    }
+                    return self.run_fallback(input, primary_error).await;
+                }
+            };
+            if output.provider.trim().is_empty() {
+                output.provider = self.primary.provider_name().to_owned();
+            }
+            Ok(output)
+        })
+    }
+}
 
 /// Error returned while building the configured dialog provider.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -72,7 +165,13 @@ pub fn dialog_provider_from_app_config_with_fallback(
     fallback: Option<DialogProviderHandle>,
 ) -> Result<DialogProviderHandle, DialogProviderBuildError> {
     let provider = configured_dialog_provider_name(config);
-    let primary = primary_dialog_provider_from_app_config(config, toolbox)?;
+    let primary = primary_dialog_provider_from_app_config(config, Arc::clone(&toolbox))?;
+    if provider == PROVIDER_AIFARM {
+        if let Some(qwen) = qwen_dialog_provider_from_app_config(config, toolbox) {
+            return Ok(Arc::new(PoolGatedFallbackChatProvider::new(primary, qwen)));
+        }
+        return Ok(primary);
+    }
     if provider != PROVIDER_GENKIT
         && config
             .llm
@@ -233,6 +332,42 @@ pub fn aifarm_dialog_provider_from_app_config(
     AifarmDialogProvider::new(aifarm_dialog_config_from_app_config(config)).with_toolbox(toolbox)
 }
 
+#[must_use]
+pub fn qwen_dialog_config_from_app_config(config: &AppConfig) -> Option<AifarmDialogConfig> {
+    let spec = agent_runtime::qwen_reasoner_named_provider_config(config);
+    if !spec
+        .kind
+        .trim()
+        .eq_ignore_ascii_case(openplotva_config::DEFAULT_LLM_PROVIDER_KIND)
+    {
+        return None;
+    }
+    Some(
+        AifarmDialogConfig {
+            provider_name: spec.name.clone(),
+            client: agent_client_config_from_named_provider(config, &spec),
+            model: spec.model.clone(),
+            max_tokens: spec.max_tokens,
+            temperature: spec.temperature,
+            use_tool_calls: Some(false),
+            enable_thinking: spec.enable_thinking,
+            include_reasoning: spec.include_reasoning,
+            ..AifarmDialogConfig::default()
+        }
+        .with_defaults(),
+    )
+}
+
+fn qwen_dialog_provider_from_app_config(
+    config: &AppConfig,
+    toolbox: Arc<dyn DialogToolbox>,
+) -> Option<DialogProviderHandle> {
+    let cfg = qwen_dialog_config_from_app_config(config)?;
+    Some(Arc::new(
+        AifarmDialogProvider::new(cfg).with_toolbox(toolbox),
+    ))
+}
+
 /// Build the reqwest-backed NVIDIA provider with the app-owned toolbox attached.
 #[must_use]
 pub fn nvidia_dialog_provider_from_app_config(
@@ -305,7 +440,13 @@ fn positive_seconds(seconds: i32) -> std::time::Duration {
 
 #[cfg(test)]
 mod tests {
-    use openplotva_dialog::{DialogInput, DialogToolbox};
+    use std::sync::Mutex;
+
+    use openplotva_dialog::{DialogInput, DialogOutput, DialogToolbox};
+    use openplotva_llm::{
+        ChatProviderError,
+        retry::{FailureReason, ProviderError},
+    };
 
     use super::*;
 
@@ -395,6 +536,7 @@ mod tests {
     #[test]
     fn dialog_provider_factory_attaches_supplied_genkit_fallback_when_configured() {
         let config = AppConfig::from_raw(openplotva_config::RawConfig {
+            dialog_provider: Some("nvidia".to_owned()),
             dialog_fallback_provider: Some(" GENKIT ".to_owned()),
             ..openplotva_config::RawConfig::default()
         })
@@ -408,12 +550,120 @@ mod tests {
             dialog_provider_from_app_config_with_fallback(&config, toolbox, Some(fallback))
                 .expect("provider");
 
-        assert_eq!(provider.provider_name(), "aifarm+fallback:genkit");
+        assert_eq!(provider.provider_name(), "nvidia+fallback:genkit");
+    }
+
+    #[test]
+    fn qwen_dialog_config_uses_default_reasoner_provider() {
+        let config = AppConfig::from_raw(openplotva_config::RawConfig::default()).expect("config");
+
+        let cfg = qwen_dialog_config_from_app_config(&config).expect("qwen config");
+
+        assert_eq!(
+            cfg.provider_name,
+            openplotva_config::DEFAULT_AGENTIC_SEARCH_REASONER_PROVIDER
+        );
+        assert_eq!(
+            cfg.client.service_name,
+            crate::agent_runtime::DEFAULT_QWEN_SERVICE_NAME
+        );
+        assert_eq!(cfg.model, crate::agent_runtime::DEFAULT_QWEN_MODEL);
+        assert_eq!(cfg.include_reasoning, Some(false));
+        assert_eq!(cfg.enable_thinking, Some(false));
+    }
+
+    #[test]
+    fn qwen_dialog_config_prefers_explicit_named_provider() {
+        let config = AppConfig::from_raw(openplotva_config::RawConfig {
+            llm_provider_names: Some("qwen-reasoner".to_owned()),
+            llm_provider_kinds: Some("aifarm".to_owned()),
+            llm_provider_discovery_service_names: Some("custom-qwen".to_owned()),
+            llm_provider_discovery_endpoint_names: Some("chat_completions".to_owned()),
+            llm_provider_models: Some("custom-model".to_owned()),
+            llm_provider_max_tokens: Some("4096".to_owned()),
+            llm_provider_temperatures: Some("0.4".to_owned()),
+            ..openplotva_config::RawConfig::default()
+        })
+        .expect("config");
+
+        let cfg = qwen_dialog_config_from_app_config(&config).expect("qwen config");
+
+        assert_eq!(cfg.client.service_name, "custom-qwen");
+        assert_eq!(cfg.model, "custom-model");
+        assert_eq!(cfg.max_tokens, 4096);
+        assert_eq!(cfg.temperature, Some(0.4));
+    }
+
+    #[tokio::test]
+    async fn pool_gated_fallback_skips_qwen_when_pool_disabled() {
+        let _guard = AIFARM_POOL_TEST_LOCK.lock().await;
+        openplotva_llm::aifarm::set_pool_enabled(false);
+        let primary: DialogProviderHandle = Arc::new(SequencedProvider::new(
+            "aifarm",
+            vec![Err(Box::new(ProviderError::new(
+                "aifarm",
+                FailureReason::CapacityUnavailable,
+                "capacity unavailable",
+            )))],
+        ));
+        let fallback = Arc::new(SequencedProvider::new(
+            "qwen-reasoner",
+            vec![Ok(DialogOutput {
+                provider: "qwen-reasoner".to_owned(),
+                answer: "fallback".to_owned(),
+                ..DialogOutput::default()
+            })],
+        ));
+        let fallback_dyn: DialogProviderHandle = fallback.clone();
+        let provider = PoolGatedFallbackChatProvider::new(primary, fallback_dyn);
+
+        let error = provider.run_dialog(DialogInput::default()).await.err();
+
+        assert!(error.is_some());
+        assert_eq!(fallback.calls(), 0);
+        openplotva_llm::aifarm::set_pool_enabled(true);
+    }
+
+    #[tokio::test]
+    async fn pool_gated_fallback_uses_qwen_after_retryable_primary_error_when_pool_enabled() {
+        let _guard = AIFARM_POOL_TEST_LOCK.lock().await;
+        openplotva_llm::aifarm::set_pool_enabled(true);
+        let primary: DialogProviderHandle = Arc::new(SequencedProvider::new(
+            "aifarm",
+            vec![Err(Box::new(ProviderError::new(
+                "aifarm",
+                FailureReason::CapacityUnavailable,
+                "capacity unavailable",
+            )))],
+        ));
+        let fallback = Arc::new(SequencedProvider::new(
+            "qwen-reasoner",
+            vec![Ok(DialogOutput {
+                provider: "qwen-reasoner".to_owned(),
+                answer: "fallback".to_owned(),
+                ..DialogOutput::default()
+            })],
+        ));
+        let fallback_dyn: DialogProviderHandle = fallback.clone();
+        let provider = PoolGatedFallbackChatProvider::new(primary, fallback_dyn);
+
+        let output = provider
+            .run_dialog(DialogInput::default())
+            .await
+            .expect("fallback output");
+
+        assert_eq!(output.provider, "qwen-reasoner");
+        assert_eq!(output.fallback_from, "aifarm");
+        assert_eq!(fallback.calls(), 1);
     }
 
     #[test]
     fn dialog_provider_factory_requires_real_genkit_fallback_handle() {
-        let config = AppConfig::from_raw(openplotva_config::RawConfig::default()).expect("config");
+        let config = AppConfig::from_raw(openplotva_config::RawConfig {
+            dialog_provider: Some("nvidia".to_owned()),
+            ..openplotva_config::RawConfig::default()
+        })
+        .expect("config");
         let toolbox: Arc<dyn DialogToolbox> = Arc::new(EmptyToolbox);
 
         let error = dialog_provider_from_app_config_with_fallback(&config, toolbox, None).err();
@@ -602,6 +852,49 @@ mod tests {
             _input: openplotva_dialog::DialogInput,
         ) -> openplotva_llm::ChatProviderFuture<'a> {
             Box::pin(async move { Ok(openplotva_dialog::DialogOutput::default()) })
+        }
+    }
+
+    static AIFARM_POOL_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    struct SequencedProvider {
+        name: &'static str,
+        results: Mutex<Vec<Result<DialogOutput, ChatProviderError>>>,
+        calls: Mutex<usize>,
+    }
+
+    impl SequencedProvider {
+        fn new(
+            name: &'static str,
+            mut results: Vec<Result<DialogOutput, ChatProviderError>>,
+        ) -> Self {
+            results.reverse();
+            Self {
+                name,
+                results: Mutex::new(results),
+                calls: Mutex::new(0),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            *self.calls.lock().expect("calls")
+        }
+    }
+
+    impl ChatProvider for SequencedProvider {
+        fn provider_name(&self) -> &str {
+            self.name
+        }
+
+        fn run_dialog<'a>(&'a self, _input: DialogInput) -> openplotva_llm::ChatProviderFuture<'a> {
+            Box::pin(async move {
+                *self.calls.lock().expect("calls") += 1;
+                self.results
+                    .lock()
+                    .expect("results")
+                    .pop()
+                    .unwrap_or_else(|| Ok(DialogOutput::default()))
+            })
         }
     }
 }

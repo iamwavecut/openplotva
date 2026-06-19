@@ -27,6 +27,7 @@ const GO_RESPONSE_PREVIEW_SIZE: usize = 500;
 const LLM_EVENT_WRITER_CHANNEL_CAPACITY: usize = 10_000;
 const LLM_EVENT_WRITER_BATCH_SIZE: usize = 100;
 const LLM_EVENT_WRITER_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
+pub const LLM_REQUEST_EVENTS_CLEANUP_BATCH_SIZE: i64 = 10_000;
 const SQL_INSERT_LLM_REQUEST_EVENTS_PREFIX: &str = r#"INSERT INTO llm_request_events (
     created_at,
     provider,
@@ -67,6 +68,17 @@ const SQL_INSERT_LLM_REQUEST_EVENTS_PREFIX: &str = r#"INSERT INTO llm_request_ev
     inference_params,
     error
 )"#;
+const SQL_DELETE_OLD_LLM_REQUEST_EVENTS_BATCH: &str = r#"
+WITH doomed AS (
+    SELECT id
+    FROM llm_request_events
+    WHERE created_at < now() - ($1::int * interval '1 day')
+    ORDER BY created_at ASC
+    LIMIT $2
+)
+DELETE FROM llm_request_events e
+USING doomed
+WHERE e.id = doomed.id"#;
 
 #[derive(Clone, Debug)]
 pub struct RuntimeLlmTraceBuffer {
@@ -79,6 +91,14 @@ struct RuntimeLlmTraceBufferInner {
     ring: Vec<Option<RuntimeLlmRequestData>>,
     write: usize,
     count: usize,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeLlmRequestEventCleanupReport {
+    pub enabled: bool,
+    pub ticks: u64,
+    pub deleted: u64,
+    pub errors: u64,
 }
 
 impl Default for RuntimeLlmTraceBuffer {
@@ -390,6 +410,69 @@ async fn insert_llm_request_events(
     let mut builder = llm_request_event_insert_builder(&events);
     builder.build().execute(pool).await?;
     Ok(())
+}
+
+pub async fn delete_old_llm_request_events_batch(
+    pool: &PgPool,
+    retention_days: i32,
+    batch_size: i64,
+) -> Result<u64, sqlx::Error> {
+    if retention_days <= 0 || batch_size <= 0 {
+        return Ok(0);
+    }
+    let result = sqlx::query(SQL_DELETE_OLD_LLM_REQUEST_EVENTS_BATCH)
+        .bind(retention_days)
+        .bind(batch_size)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
+pub async fn run_llm_request_event_cleanup_worker_until<Stop>(
+    pool: PgPool,
+    interval: Duration,
+    retention_days: i32,
+    batch_size: i64,
+    stop: Stop,
+) -> RuntimeLlmRequestEventCleanupReport
+where
+    Stop: std::future::Future<Output = ()>,
+{
+    let mut report = RuntimeLlmRequestEventCleanupReport {
+        enabled: retention_days > 0,
+        ..RuntimeLlmRequestEventCleanupReport::default()
+    };
+    if !report.enabled {
+        return report;
+    }
+
+    let stop = stop;
+    tokio::pin!(stop);
+    loop {
+        match delete_old_llm_request_events_batch(&pool, retention_days, batch_size).await {
+            Ok(deleted) => {
+                report.deleted += deleted;
+                tracing::debug!(
+                    deleted,
+                    retention_days,
+                    "deleted old llm_request_events batch"
+                );
+            }
+            Err(error) => {
+                report.errors += 1;
+                tracing::warn!(%error, retention_days, "failed to delete old llm_request_events batch");
+            }
+        }
+        report.ticks += 1;
+
+        let sleep = tokio::time::sleep(interval);
+        tokio::pin!(sleep);
+        tokio::select! {
+            () = &mut stop => break,
+            () = &mut sleep => {}
+        }
+    }
+    report
 }
 
 fn llm_request_event_insert_builder(events: &[LlmRequestEvent]) -> QueryBuilder<Postgres> {
