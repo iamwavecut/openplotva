@@ -7982,6 +7982,21 @@ mod tests {
     }
 
     #[test]
+    fn system_prompt_defines_base_voice_and_daily_persona_layers() -> Result<(), AifarmMessageError>
+    {
+        let prompt = build_system_prompt_with_tool_prompt(&base_input(), ToolPromptMode::Native)?;
+
+        assert!(prompt.contains("<base_voice>"));
+        assert!(prompt.contains("<persona_layers>"));
+        assert!(prompt.contains("не услужливость"));
+        assert!(prompt.contains("Не используй обращения и приветствия"));
+        assert!(prompt.contains("не больше одной черты"));
+        assert!(prompt.contains("custom_persona"));
+        assert!(prompt.contains("persona_boundaries"));
+        Ok(())
+    }
+
+    #[test]
     fn runtime_context_uses_names_custom_persona_and_raw_shield() {
         let input = DialogInput {
             context: DialogContext {
@@ -8017,9 +8032,16 @@ mod tests {
         assert!(context.contains("<chat_title>Main &lt;Chat&gt;</chat_title>"));
         assert!(context.contains("<thread_id>777</thread_id>"));
         assert!(context.contains("<custom_persona>Warm but precise</custom_persona>"));
-        assert!(!context.contains("Daily"));
+        assert!(!context.contains("<persona_name>"));
+        assert!(!context.contains("<persona_tone>"));
+        assert!(!context.contains("<persona_background>"));
+        assert!(!context.contains("<persona_boundaries>"));
         assert!(context.contains("<shield_context><document>support</document></shield_context>"));
         assert!(context.contains(r#"<chunk index="1">alpha &lt;one&gt;</chunk>"#));
+        assert!(
+            context.find("<custom_persona>").expect("custom persona")
+                < context.find("<shield_context>").expect("shield context")
+        );
         assert!(!context.contains("user_id"));
         assert!(!context.contains("chat_id"));
     }
@@ -8033,6 +8055,9 @@ mod tests {
             background: "Daily background".to_owned(),
             boundaries: "Daily boundaries".to_owned(),
         });
+        input.reference_context = vec!["reference".to_owned()];
+        input.shield_context =
+            "<shield_context><document>support</document></shield_context>".to_owned();
 
         let context = build_runtime_context(&input);
 
@@ -8040,6 +8065,17 @@ mod tests {
         assert!(context.contains("<persona_tone>Daily tone</persona_tone>"));
         assert!(context.contains("<persona_background>Daily background</persona_background>"));
         assert!(context.contains("<persona_boundaries>Daily boundaries</persona_boundaries>"));
+        assert!(!context.contains("<custom_persona>"));
+        assert!(
+            context.find("<persona_name>").expect("daily persona")
+                < context.find("<shield_context>").expect("shield context")
+        );
+        assert!(
+            context.find("<persona_name>").expect("daily persona")
+                < context
+                    .find("<reference_context>")
+                    .expect("reference context")
+        );
     }
 
     #[test]
