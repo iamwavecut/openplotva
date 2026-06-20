@@ -2948,10 +2948,6 @@ fn validate_persistent_queue_config(config: &PersistentQueueConfig) -> Result<()
             config.music_vip_workers,
         ),
         (
-            "PERSISTENT_QUEUE_MEMORY_CONSOLIDATION_WORKERS",
-            config.memory_consolidation_workers,
-        ),
-        (
             "PERSISTENT_QUEUE_PLACEHOLDER_CLEANUP_INTERVAL_SECONDS",
             config.placeholder_cleanup_interval_seconds,
         ),
@@ -2966,6 +2962,10 @@ fn validate_persistent_queue_config(config: &PersistentQueueConfig) -> Result<()
     validate_non_negative_i32(
         "PERSISTENT_QUEUE_DIALOG_AIFARM_FALLBACK_WORKERS",
         config.dialog_aifarm_fallback_workers,
+    )?;
+    validate_non_negative_i32(
+        "PERSISTENT_QUEUE_MEMORY_CONSOLIDATION_WORKERS",
+        config.memory_consolidation_workers,
     )?;
     if config.dialog_aifarm_fallback_low_watermark > config.dialog_aifarm_fallback_high_watermark {
         return Err(ConfigError::PersistentQueueFallbackWatermarkRange);
@@ -3667,6 +3667,18 @@ mod tests {
     }
 
     #[test]
+    fn persistent_queue_memory_consolidation_workers_allows_zero_for_maintenance()
+    -> Result<(), super::ConfigError> {
+        let config = AppConfig::from_raw(RawConfig {
+            persistent_queue_memory_consolidation_workers: Some("0".to_owned()),
+            ..RawConfig::default()
+        })?;
+
+        assert_eq!(config.persistent_queue.memory_consolidation_workers, 0);
+        Ok(())
+    }
+
+    #[test]
     fn persistent_queue_config_rejects_non_positive_go_intervals() {
         let error = AppConfig::from_raw(RawConfig {
             persistent_queue_heartbeat_interval_seconds: Some("0".to_owned()),
@@ -3679,6 +3691,23 @@ mod tests {
             Some(super::ConfigError::NonPositiveInteger {
                 name: "PERSISTENT_QUEUE_HEARTBEAT_INTERVAL_SECONDS",
                 value: 0,
+            })
+        ));
+    }
+
+    #[test]
+    fn persistent_queue_config_rejects_negative_memory_consolidation_worker_count() {
+        let error = AppConfig::from_raw(RawConfig {
+            persistent_queue_memory_consolidation_workers: Some("-1".to_owned()),
+            ..RawConfig::default()
+        })
+        .err();
+
+        assert!(matches!(
+            error,
+            Some(super::ConfigError::NegativeInteger {
+                name: "PERSISTENT_QUEUE_MEMORY_CONSOLIDATION_WORKERS",
+                value: -1,
             })
         ));
     }
