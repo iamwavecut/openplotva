@@ -18,6 +18,9 @@ use url::Url;
 pub const PURPOSE: &str = "memory";
 
 pub const DEFAULT_MEMORY_MAX_OUTPUT_TOKENS: i32 = 4096;
+pub const DEFAULT_MEMORY_MIN_MESSAGES_PER_RUN: i32 = 20;
+pub const DEFAULT_MEMORY_MAX_QUEUED_RUNS: i32 = 5_000;
+pub const DEFAULT_MEMORY_MAX_DAILY_ENQUEUED_RUNS: i32 = 2_000;
 pub const DISCOVERY_PRIORITY_MEMORY: i32 = 10;
 pub const DEFAULT_MEMORY_CONSOLIDATION_MODEL: &str = "Gemma 4 26B Heretic";
 pub const PROMPT_VERSION: &str = "chat_memory_daily_v2";
@@ -127,6 +130,47 @@ pub struct RetrievalScope {
     pub username: String,
     /// Active public usernames.
     pub active_usernames: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MemoryRunEnqueuePolicy {
+    pub min_messages_per_run: i32,
+    pub max_queued_runs: i32,
+    pub max_daily_enqueued_runs: i32,
+}
+
+impl Default for MemoryRunEnqueuePolicy {
+    fn default() -> Self {
+        Self {
+            min_messages_per_run: DEFAULT_MEMORY_MIN_MESSAGES_PER_RUN,
+            max_queued_runs: DEFAULT_MEMORY_MAX_QUEUED_RUNS,
+            max_daily_enqueued_runs: DEFAULT_MEMORY_MAX_DAILY_ENQUEUED_RUNS,
+        }
+    }
+}
+
+impl MemoryRunEnqueuePolicy {
+    #[must_use]
+    pub fn normalized(self) -> Self {
+        let fallback = Self::default();
+        Self {
+            min_messages_per_run: if self.min_messages_per_run <= 0 {
+                fallback.min_messages_per_run
+            } else {
+                self.min_messages_per_run
+            },
+            max_queued_runs: if self.max_queued_runs <= 0 {
+                fallback.max_queued_runs
+            } else {
+                self.max_queued_runs
+            },
+            max_daily_enqueued_runs: if self.max_daily_enqueued_runs <= 0 {
+                fallback.max_daily_enqueued_runs
+            } else {
+                self.max_daily_enqueued_runs
+            },
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -710,6 +754,14 @@ pub struct RunErrorStat {
         with = "time::serde::rfc3339::option"
     )]
     pub latest_updated_at: Option<OffsetDateTime>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct MemoryEnqueueRollupRecord {
+    pub dimensions: Value,
+    pub metrics: Value,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -2044,6 +2096,7 @@ pub fn chat_visibility(kind: &str, thread_id: i32) -> Visibility {
 pub fn build_visibility_for_observation(scope: &ObservationScope) -> Visibility {
     match scope.kind.as_str() {
         CARD_KIND_THREAD => return VISIBILITY_THREAD.to_owned(),
+        CARD_KIND_CHAT if scope.thread_id != 0 => return VISIBILITY_THREAD.to_owned(),
         CARD_KIND_CHAT => return VISIBILITY_CHAT.to_owned(),
         _ => {}
     }
@@ -2166,7 +2219,9 @@ fn candidate_scope_kind(input: &ExtractInput, candidate: &CandidateCard) -> Opti
                 Some(kind)
             }
         }
+        CARD_KIND_CHAT if input.run.thread_id != 0 => Some(CARD_KIND_THREAD.to_owned()),
         CARD_KIND_CHAT => Some(kind),
+        _ if input.run.thread_id != 0 => Some(CARD_KIND_THREAD.to_owned()),
         _ => Some(CARD_KIND_CHAT.to_owned()),
     }
 }
@@ -2905,6 +2960,16 @@ mod tests {
             VISIBILITY_CHAT_USER
         );
         assert_eq!(chat_visibility(CARD_KIND_CHAT, 9), VISIBILITY_THREAD);
+        assert_eq!(
+            build_visibility_for_observation(&ObservationScope {
+                chat_id: -1003,
+                thread_id: 9,
+                chat_type: "supergroup".to_owned(),
+                kind: CARD_KIND_CHAT.to_owned(),
+                ..ObservationScope::default()
+            }),
+            VISIBILITY_THREAD
+        );
         assert!(include_public_user_memory(&RetrievalScope {
             chat_type: "group".to_owned(),
             active_usernames: vec!["public_alias".to_owned()],
@@ -3017,6 +3082,43 @@ mod tests {
         assert_eq!(cards[0].observation_scope.kind, CARD_KIND_CHAT);
         assert_eq!(cards[0].observed_at, go_zero_time());
         assert_eq!(normalize_card_type("bad"), CARD_TYPE_PREFERENCE);
+    }
+
+    #[test]
+    fn chat_candidates_from_thread_runs_are_thread_scoped() {
+        let input = ExtractInput {
+            run: Run {
+                chat_id: -100,
+                thread_id: 77,
+                ..Run::default()
+            },
+            messages: vec![Message {
+                entry_id: "m1".to_owned(),
+                message_id: 1,
+                user_id: 42,
+                ..Message::default()
+            }],
+            ..ExtractInput::default()
+        };
+        let output = ExtractOutput {
+            candidate_cards: vec![CandidateCard {
+                scope_type: CARD_KIND_CHAT.to_owned(),
+                fact_text: "Thread-only project decision".to_owned(),
+                source_entry_ids: vec!["m1".to_owned()],
+                ..CandidateCard::default()
+            }],
+            ..ExtractOutput::default()
+        };
+
+        let cards = cards_from_extraction_at(&input, &output, go_zero_time());
+
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].observation_scope.kind, CARD_KIND_THREAD);
+        assert_eq!(cards[0].observation_scope.thread_id, 77);
+        assert_eq!(
+            build_visibility_for_observation(&cards[0].observation_scope),
+            VISIBILITY_THREAD
+        );
     }
 
     #[test]

@@ -247,6 +247,12 @@ pub const DEFAULT_MEMORY_CONSOLIDATION_PROVIDER: &str = "aifarm";
 
 pub const DEFAULT_MEMORY_CONSOLIDATION_MODEL: &str = "Gemma 4 26B Heretic";
 
+pub const DEFAULT_MEMORY_MIN_MESSAGES_PER_RUN: i32 = 20;
+
+pub const DEFAULT_MEMORY_MAX_QUEUED_RUNS: i32 = 5_000;
+
+pub const DEFAULT_MEMORY_MAX_DAILY_ENQUEUED_RUNS: i32 = 2_000;
+
 pub const DEFAULT_MEMORY_TOKENIZER_MODEL: &str = "google/gemma-4-26B-A4B-it";
 
 pub const DEFAULT_MEMORY_TOKEN_ESTIMATOR_URL: &str = "http://token-estimator:12600";
@@ -761,6 +767,9 @@ pub struct MemoryConfig {
     pub daily_window_hours: i32,
     pub worker_concurrency: i32,
     pub max_messages_per_run: i32,
+    pub min_messages_per_run: i32,
+    pub max_queued_runs: i32,
+    pub max_daily_enqueued_runs: i32,
     pub max_input_tokens: i32,
     pub tokenizer_model: String,
     pub tokenizer_file: String,
@@ -1181,6 +1190,12 @@ pub struct RawConfig {
     pub memory_worker_concurrency: Option<String>,
     /// `MEMORY_MAX_MESSAGES_PER_RUN`.
     pub memory_max_messages_per_run: Option<String>,
+    /// `MEMORY_MIN_MESSAGES_PER_RUN`.
+    pub memory_min_messages_per_run: Option<String>,
+    /// `MEMORY_MAX_QUEUED_RUNS`.
+    pub memory_max_queued_runs: Option<String>,
+    /// `MEMORY_MAX_DAILY_ENQUEUED_RUNS`.
+    pub memory_max_daily_enqueued_runs: Option<String>,
     /// `MEMORY_MAX_INPUT_TOKENS`.
     pub memory_max_input_tokens: Option<String>,
     /// `MEMORY_TOKENIZER_MODEL`.
@@ -2170,6 +2185,30 @@ impl AppConfig {
                     raw.memory_max_messages_per_run,
                     200,
                 )?,
+                min_messages_per_run: validate_positive_i32(
+                    "MEMORY_MIN_MESSAGES_PER_RUN",
+                    parse_i32(
+                        "MEMORY_MIN_MESSAGES_PER_RUN",
+                        raw.memory_min_messages_per_run,
+                        DEFAULT_MEMORY_MIN_MESSAGES_PER_RUN,
+                    )?,
+                )?,
+                max_queued_runs: validate_positive_i32(
+                    "MEMORY_MAX_QUEUED_RUNS",
+                    parse_i32(
+                        "MEMORY_MAX_QUEUED_RUNS",
+                        raw.memory_max_queued_runs,
+                        DEFAULT_MEMORY_MAX_QUEUED_RUNS,
+                    )?,
+                )?,
+                max_daily_enqueued_runs: validate_positive_i32(
+                    "MEMORY_MAX_DAILY_ENQUEUED_RUNS",
+                    parse_i32(
+                        "MEMORY_MAX_DAILY_ENQUEUED_RUNS",
+                        raw.memory_max_daily_enqueued_runs,
+                        DEFAULT_MEMORY_MAX_DAILY_ENQUEUED_RUNS,
+                    )?,
+                )?,
                 max_input_tokens: parse_i32(
                     "MEMORY_MAX_INPUT_TOKENS",
                     raw.memory_max_input_tokens,
@@ -2570,6 +2609,9 @@ impl RawConfig {
             memory_daily_window_hours: env("MEMORY_DAILY_WINDOW_HOURS"),
             memory_worker_concurrency: env("MEMORY_WORKER_CONCURRENCY"),
             memory_max_messages_per_run: env("MEMORY_MAX_MESSAGES_PER_RUN"),
+            memory_min_messages_per_run: env("MEMORY_MIN_MESSAGES_PER_RUN"),
+            memory_max_queued_runs: env("MEMORY_MAX_QUEUED_RUNS"),
+            memory_max_daily_enqueued_runs: env("MEMORY_MAX_DAILY_ENQUEUED_RUNS"),
             memory_max_input_tokens: env("MEMORY_MAX_INPUT_TOKENS"),
             memory_tokenizer_model: env("MEMORY_TOKENIZER_MODEL"),
             memory_tokenizer_file: env("MEMORY_TOKENIZER_FILE"),
@@ -3274,6 +3316,18 @@ mod tests {
         assert_eq!(config.memory.daily_window_hours, 24);
         assert_eq!(config.memory.worker_concurrency, 1);
         assert_eq!(config.memory.max_messages_per_run, 200);
+        assert_eq!(
+            config.memory.min_messages_per_run,
+            super::DEFAULT_MEMORY_MIN_MESSAGES_PER_RUN
+        );
+        assert_eq!(
+            config.memory.max_queued_runs,
+            super::DEFAULT_MEMORY_MAX_QUEUED_RUNS
+        );
+        assert_eq!(
+            config.memory.max_daily_enqueued_runs,
+            super::DEFAULT_MEMORY_MAX_DAILY_ENQUEUED_RUNS
+        );
         assert_eq!(config.memory.max_input_tokens, 10_000);
         assert_eq!(config.memory.tokenizer_model, "google/gemma-4-26B-A4B-it");
         assert_eq!(
@@ -3807,6 +3861,9 @@ mod tests {
             memory_daily_window_hours: Some("12".to_owned()),
             memory_worker_concurrency: Some("2".to_owned()),
             memory_max_messages_per_run: Some("55".to_owned()),
+            memory_min_messages_per_run: Some("20".to_owned()),
+            memory_max_queued_runs: Some("5000".to_owned()),
+            memory_max_daily_enqueued_runs: Some("2000".to_owned()),
             memory_max_input_tokens: Some("6000".to_owned()),
             memory_tokenizer_model: Some("tokenizer".to_owned()),
             memory_tokenizer_file: Some("/tmp/tokenizer.json".to_owned()),
@@ -3846,6 +3903,9 @@ mod tests {
         assert_eq!(config.memory.daily_window_hours, 12);
         assert_eq!(config.memory.worker_concurrency, 2);
         assert_eq!(config.memory.max_messages_per_run, 55);
+        assert_eq!(config.memory.min_messages_per_run, 20);
+        assert_eq!(config.memory.max_queued_runs, 5000);
+        assert_eq!(config.memory.max_daily_enqueued_runs, 2000);
         assert_eq!(config.memory.max_input_tokens, 6000);
         assert_eq!(config.memory.tokenizer_model, "tokenizer");
         assert_eq!(config.memory.tokenizer_file, "/tmp/tokenizer.json");
@@ -3876,6 +3936,55 @@ mod tests {
             config.memory.redaction_categories,
             vec!["private_email", "secret"]
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn memory_policy_defaults_and_rejects_non_positive_values() -> Result<(), super::ConfigError> {
+        let config = AppConfig::from_raw(RawConfig::default())?;
+        assert_eq!(config.memory.min_messages_per_run, 20);
+        assert_eq!(config.memory.max_queued_runs, 5000);
+        assert_eq!(config.memory.max_daily_enqueued_runs, 2000);
+
+        let error = AppConfig::from_raw(RawConfig {
+            memory_min_messages_per_run: Some("0".to_owned()),
+            ..RawConfig::default()
+        })
+        .err();
+        assert!(matches!(
+            error,
+            Some(super::ConfigError::NonPositiveInteger {
+                name: "MEMORY_MIN_MESSAGES_PER_RUN",
+                value: 0,
+            })
+        ));
+
+        let error = AppConfig::from_raw(RawConfig {
+            memory_max_queued_runs: Some("-1".to_owned()),
+            ..RawConfig::default()
+        })
+        .err();
+        assert!(matches!(
+            error,
+            Some(super::ConfigError::NonPositiveInteger {
+                name: "MEMORY_MAX_QUEUED_RUNS",
+                value: -1,
+            })
+        ));
+
+        let error = AppConfig::from_raw(RawConfig {
+            memory_max_daily_enqueued_runs: Some("0".to_owned()),
+            ..RawConfig::default()
+        })
+        .err();
+        assert!(matches!(
+            error,
+            Some(super::ConfigError::NonPositiveInteger {
+                name: "MEMORY_MAX_DAILY_ENQUEUED_RUNS",
+                value: 0,
+            })
+        ));
 
         Ok(())
     }
