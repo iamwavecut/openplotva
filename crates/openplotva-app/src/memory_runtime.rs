@@ -6,7 +6,7 @@ use openplotva_config::{AppConfig, MemoryConfig, ShieldConfig};
 use openplotva_llm::{
     aifarm::{
         AifarmClientConfig, AifarmMemoryExtractor, AifarmMemoryExtractorConfig,
-        AifarmMemoryExtractorError, AifarmPoolConfig, GenkitOpenAiCompatibleMemoryExtractor,
+        AifarmMemoryExtractorError, GenkitOpenAiCompatibleMemoryExtractor,
         GenkitOpenAiCompatibleMemoryExtractorConfig, GenkitOpenAiCompatibleMemoryExtractorError,
         ReqwestAifarmTransport,
     },
@@ -2468,7 +2468,7 @@ pub fn aifarm_memory_extractor_config_from_app_config_with_model(
         temperature: Some(memory.aifarm_temperature),
         enable_thinking: Some(memory.aifarm_enable_thinking),
         include_reasoning: Some(false),
-        pool: AifarmPoolConfig::default(),
+        pool: crate::media::aifarm_pool_config_from_app_config(config),
     }
     .with_defaults()
 }
@@ -2583,9 +2583,7 @@ fn aifarm_route_memory_extractor_from_app_config_with_model(
     config: &AppConfig,
     model_override: Option<&str>,
 ) -> AifarmRouteMemoryExtractor {
-    let mut primary =
-        aifarm_memory_extractor_config_from_app_config_with_model(config, model_override);
-    primary.pool = AifarmPoolConfig::default();
+    let primary = aifarm_memory_extractor_config_from_app_config_with_model(config, model_override);
     AifarmRouteMemoryExtractor {
         backends: vec![AifarmRouteMemoryBackend {
             plan: AifarmMemoryRouteBackendPlan {
@@ -3324,7 +3322,7 @@ mod tests {
     }
 
     #[test]
-    fn aifarm_memory_extractor_config_maps_memory_env_without_dialog_pool() {
+    fn aifarm_memory_extractor_config_maps_memory_env_with_optional_pool() {
         let config = AppConfig::from_raw(openplotva_config::RawConfig {
             discovery_base_url: Some("http://discovery.test".to_owned()),
             memory_consolidation_model: Some("memory-model".to_owned()),
@@ -3372,8 +3370,21 @@ mod tests {
         assert_eq!(cfg.temperature, Some(0.35));
         assert_eq!(cfg.enable_thinking, Some(false));
         assert_eq!(cfg.include_reasoning, Some(false));
-        assert!(cfg.pool.secondary_backends.is_empty());
-        assert!(cfg.pool.secondary_api_key.is_empty());
+        assert_eq!(cfg.pool.secondary_backends.len(), 2);
+        assert_eq!(cfg.pool.secondary_backends[0].name, "pool-a");
+        assert_eq!(cfg.pool.secondary_backends[0].model, "pool-a");
+        assert_eq!(
+            cfg.pool.secondary_backends[0].base_url,
+            "http://pool-a.test/v1"
+        );
+        assert_eq!(cfg.pool.secondary_backends[1].name, "pool-b");
+        assert_eq!(cfg.pool.secondary_backends[1].model, "pool-b");
+        assert_eq!(
+            cfg.pool.secondary_backends[1].base_url,
+            "http://pool-b.test"
+        );
+        assert_eq!(cfg.pool.secondary_api_key, "pool-token");
+        assert_eq!(cfg.pool.primary_capacity_wait, Duration::from_millis(250));
     }
 
     #[test]
