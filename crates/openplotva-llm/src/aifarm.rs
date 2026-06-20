@@ -5427,10 +5427,35 @@ fn write_runtime_persona(out: &mut String, input: &DialogInput) {
     let Some(persona) = input.persona.persona.as_ref() else {
         return;
     };
-    write_optional_text_element(out, "persona_name", &persona.name);
-    write_optional_text_element(out, "persona_tone", &persona.tone);
-    write_optional_text_element(out, "persona_background", &persona.background);
-    write_optional_text_element(out, "persona_boundaries", &persona.boundaries);
+    write_daily_persona_accent(out, persona);
+}
+
+fn write_daily_persona_accent(out: &mut String, persona: &openplotva_dialog::DailyPersona) {
+    let name = persona.name.trim();
+    let hint = persona.boundaries.trim();
+    if name.is_empty() && hint.is_empty() {
+        return;
+    }
+
+    out.push_str("  <daily_persona_accent>\n");
+    out.push_str("    ");
+    write_inline_text_element(
+        out,
+        "instruction",
+        "Слабая дневная окраска. Используй максимум одну мелкую черту и часто игнорируй её; отвечай по сути обычными словами.",
+    );
+    out.push('\n');
+    if !name.is_empty() {
+        out.push_str("    ");
+        write_inline_text_element(out, "name", name);
+        out.push('\n');
+    }
+    if !hint.is_empty() {
+        out.push_str("    ");
+        write_inline_text_element(out, "hint", hint);
+        out.push('\n');
+    }
+    out.push_str("  </daily_persona_accent>\n");
 }
 
 fn write_reference_context(out: &mut String, chunks: &[String]) {
@@ -5883,13 +5908,6 @@ fn write_text_element(out: &mut String, name: &str, value: &str) {
     out.push('\n');
 }
 
-fn write_optional_text_element(out: &mut String, name: &str, value: &str) {
-    if value.trim().is_empty() {
-        return;
-    }
-    write_text_element(out, name, value);
-}
-
 fn write_int_element(out: &mut String, indent: &str, name: &str, value: i64) {
     out.push_str(indent);
     out.push('<');
@@ -6008,7 +6026,7 @@ mod tests {
     use openplotva_core::{ChatAttachment, SENDER_TYPE_USER, ToolCall};
     use openplotva_dialog::{
         DailyPersona, DialogContext, DialogMessage, DialogUser, Persona, ROLE_TOOL,
-        TOOL_RESULT_STATUS_OK,
+        TOOL_RESULT_STATUS_OK, ToolSideEffect,
     };
 
     static POOL_REASONING_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -7824,6 +7842,11 @@ mod tests {
         let toolbox = FakeToolbox::new(vec![ToolResult {
             status: TOOL_RESULT_STATUS_QUEUED.to_owned(),
             message: "queued".to_owned(),
+            side_effect: Some(ToolSideEffect {
+                kind: "image_generation_job".to_owned(),
+                state: TOOL_RESULT_STATUS_QUEUED.to_owned(),
+                ..ToolSideEffect::default()
+            }),
             ..ToolResult::default()
         }]);
         let (provider, _transport, _) = direct_dialog_provider_with_toolbox(
@@ -7872,6 +7895,11 @@ mod tests {
     async fn dialog_provider_returns_immediate_queued_draw_answer() -> Result<(), CompletionError> {
         let toolbox = FakeToolbox::new(vec![ToolResult {
             status: TOOL_RESULT_STATUS_QUEUED.to_owned(),
+            side_effect: Some(ToolSideEffect {
+                kind: "image_generation_job".to_owned(),
+                state: TOOL_RESULT_STATUS_QUEUED.to_owned(),
+                ..ToolSideEffect::default()
+            }),
             ..ToolResult::default()
         }]);
         let (provider, transport, _) = direct_dialog_provider_with_toolbox(
@@ -8126,7 +8154,7 @@ mod tests {
         assert!(prompt.contains("Не используй обращения и приветствия"));
         assert!(prompt.contains("не больше одной черты"));
         assert!(prompt.contains("custom_persona"));
-        assert!(prompt.contains("persona_boundaries"));
+        assert!(prompt.contains("daily_persona_accent"));
         Ok(())
     }
 
@@ -8181,7 +8209,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_context_uses_daily_persona_without_custom() {
+    fn runtime_context_demotes_daily_persona_without_custom() {
         let mut input = base_input();
         input.persona.persona = Some(DailyPersona {
             name: "Daily Persona".to_owned(),
@@ -8195,17 +8223,27 @@ mod tests {
 
         let context = build_runtime_context(&input);
 
-        assert!(context.contains("<persona_name>Daily Persona</persona_name>"));
-        assert!(context.contains("<persona_tone>Daily tone</persona_tone>"));
-        assert!(context.contains("<persona_background>Daily background</persona_background>"));
-        assert!(context.contains("<persona_boundaries>Daily boundaries</persona_boundaries>"));
+        assert!(context.contains("<daily_persona_accent>"));
+        assert!(context.contains("<name>Daily Persona</name>"));
+        assert!(context.contains("<hint>Daily boundaries</hint>"));
+        assert!(context.contains("Слабая дневная окраска"));
+        assert!(!context.contains("Daily tone"));
+        assert!(!context.contains("Daily background"));
+        assert!(!context.contains("<persona_name>"));
+        assert!(!context.contains("<persona_tone>"));
+        assert!(!context.contains("<persona_background>"));
+        assert!(!context.contains("<persona_boundaries>"));
         assert!(!context.contains("<custom_persona>"));
         assert!(
-            context.find("<persona_name>").expect("daily persona")
+            context
+                .find("<daily_persona_accent>")
+                .expect("daily persona")
                 < context.find("<shield_context>").expect("shield context")
         );
         assert!(
-            context.find("<persona_name>").expect("daily persona")
+            context
+                .find("<daily_persona_accent>")
+                .expect("daily persona")
                 < context
                     .find("<reference_context>")
                     .expect("reference context")
