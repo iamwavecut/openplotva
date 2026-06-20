@@ -416,6 +416,7 @@ struct StaticWebRoutes {
     memory_store: Option<PostgresMemoryStore>,
     memory_admin_enabled: bool,
     memory_retention: Duration,
+    memory_enqueue_policy: openplotva_memory::MemoryRunEnqueuePolicy,
     memory_consolidation_model: Arc<str>,
     memory_max_input_tokens: i32,
     memory_max_messages_per_run: i32,
@@ -468,6 +469,7 @@ fn static_web_routes(
         memory_store: None,
         memory_admin_enabled: false,
         memory_retention: Duration::from_secs(7 * 24 * 60 * 60),
+        memory_enqueue_policy: openplotva_memory::MemoryRunEnqueuePolicy::default(),
         memory_consolidation_model: Arc::from(
             openplotva_memory::DEFAULT_MEMORY_CONSOLIDATION_MODEL,
         ),
@@ -512,6 +514,7 @@ fn static_web_routes_from_config(
     let memory_worker_config =
         memory_runtime::memory_service_worker_config_from_memory_config(&config.memory);
     routes.memory_retention = memory_worker_config.retention;
+    routes.memory_enqueue_policy = memory_worker_config.enqueue_policy;
     routes.memory_consolidation_model = Arc::from(config.memory.consolidation_model.clone());
     routes.memory_max_input_tokens = memory_worker_config.process.max_input_tokens;
     routes.memory_max_messages_per_run = memory_worker_config.process.max_messages_per_run;
@@ -3731,7 +3734,12 @@ async fn admin_memory_runs_list_response(
     else {
         return admin_json_response(
             StatusCode::OK,
-            serde_json::json!({ "count": 0, "runs": serde_json::Value::Null }),
+            serde_json::json!({
+                "count": 0,
+                "runs": serde_json::Value::Null,
+                "policy": admin_memory_policy_json(routes),
+                "enqueue_rollups": serde_json::Value::Null,
+            }),
         );
     };
     let limit = parse_memory_limit(
@@ -3739,19 +3747,40 @@ async fn admin_memory_runs_list_response(
             .get("limit")
             .map(String::as_str),
     );
-    match store.list_runs(limit as i32).await {
-        Ok(runs) => admin_json_response(
-            StatusCode::OK,
-            serde_json::json!({
-                "count": runs.len(),
-                "runs": runs,
-            }),
-        ),
+    let runs = match store.list_runs(limit as i32).await {
+        Ok(runs) => runs,
         Err(error) => {
             tracing::warn!(%error, "failed to list admin memory runs");
-            admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed")
+            return admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed");
         }
-    }
+    };
+    let enqueue_rollups = match store.list_enqueue_rollups(24).await {
+        Ok(rollups) => rollups,
+        Err(error) => {
+            tracing::warn!(%error, "failed to list admin memory enqueue rollups");
+            return admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed");
+        }
+    };
+    admin_json_response(
+        StatusCode::OK,
+        serde_json::json!({
+            "count": runs.len(),
+            "runs": runs,
+            "policy": admin_memory_policy_json(routes),
+            "enqueue_rollups": enqueue_rollups,
+        }),
+    )
+}
+
+fn admin_memory_policy_json(routes: &StaticWebRoutes) -> serde_json::Value {
+    serde_json::json!({
+        "min_messages_per_run": routes.memory_enqueue_policy.min_messages_per_run,
+        "max_queued_runs": routes.memory_enqueue_policy.max_queued_runs,
+        "max_daily_enqueued_runs": routes.memory_enqueue_policy.max_daily_enqueued_runs,
+        "max_messages_per_run": routes.memory_max_messages_per_run,
+        "max_input_tokens": routes.memory_max_input_tokens,
+        "consolidation_model": routes.memory_consolidation_model.as_ref(),
+    })
 }
 
 async fn admin_memory_run_retry_response(
@@ -3822,7 +3851,11 @@ async fn admin_memory_restart_execute_response(
     let mut queued_runs = 0_i64;
     let result = if run_now {
         store
-            .ensure_daily_runs(OffsetDateTime::now_utc(), routes.memory_retention)
+            .ensure_daily_runs(
+                OffsetDateTime::now_utc(),
+                routes.memory_retention,
+                routes.memory_enqueue_policy,
+            )
             .await
             .map(|queued| queued_runs = admin_u64_to_i64(queued))
     } else if id > 0 {
@@ -3924,7 +3957,11 @@ async fn admin_memory_restart_override_execute_response(
     let result = if run_now {
         runtime
             .store
-            .ensure_daily_runs(OffsetDateTime::now_utc(), routes.memory_retention)
+            .ensure_daily_runs(
+                OffsetDateTime::now_utc(),
+                routes.memory_retention,
+                routes.memory_enqueue_policy,
+            )
             .await
             .map(|queued| queued_runs = admin_u64_to_i64(queued))
     } else if id > 0 {
@@ -12425,6 +12462,10 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&body)?;
         assert_eq!(value["count"], 0);
         assert!(value["runs"].is_null());
+        assert_eq!(value["policy"]["min_messages_per_run"], 20);
+        assert_eq!(value["policy"]["max_queued_runs"], 5000);
+        assert_eq!(value["policy"]["max_daily_enqueued_runs"], 2000);
+        assert!(value["enqueue_rollups"].is_null());
 
         let response =
             admin_memory_runs_response(&routes, Method::POST, &headers, Some("id=42"), &[]).await;

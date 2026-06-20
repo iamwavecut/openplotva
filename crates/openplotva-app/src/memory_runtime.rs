@@ -158,6 +158,7 @@ pub trait MemoryRunStore: MemoryWriteStore {
         &'a self,
         now: OffsetDateTime,
         retention: Duration,
+        policy: openplotva_memory::MemoryRunEnqueuePolicy,
     ) -> MemoryWriteStoreFuture<'a, u64, Self::Error>;
 
     /// Claim one memory run.
@@ -277,8 +278,11 @@ impl MemoryRunStore for PostgresMemoryStore {
         &'a self,
         now: OffsetDateTime,
         retention: Duration,
+        policy: openplotva_memory::MemoryRunEnqueuePolicy,
     ) -> MemoryWriteStoreFuture<'a, u64, Self::Error> {
-        Box::pin(async move { PostgresMemoryStore::ensure_daily_runs(self, now, retention).await })
+        Box::pin(async move {
+            PostgresMemoryStore::ensure_daily_runs(self, now, retention, policy).await
+        })
     }
 
     fn claim_run<'a>(
@@ -545,6 +549,7 @@ pub struct MemoryServiceWorkerConfig {
     pub daily_schedule: String,
     pub daily_window: Duration,
     pub tick_interval: Duration,
+    pub enqueue_policy: openplotva_memory::MemoryRunEnqueuePolicy,
     /// Per-run processing config.
     pub process: MemoryRunProcessConfig,
 }
@@ -626,6 +631,7 @@ impl Default for MemoryServiceWorkerConfig {
             daily_schedule: "03:17".to_owned(),
             daily_window: Duration::from_secs(24 * 60 * 60),
             tick_interval: Duration::from_secs(60 * 60),
+            enqueue_policy: openplotva_memory::MemoryRunEnqueuePolicy::default(),
             process: MemoryRunProcessConfig::default(),
         }
     }
@@ -666,6 +672,7 @@ impl MemoryServiceWorkerConfig {
             } else {
                 self.tick_interval
             },
+            enqueue_policy: self.enqueue_policy.normalized(),
             process: self.process.normalized(),
         }
     }
@@ -1036,7 +1043,10 @@ where
     }
 
     if ensure_daily && (startup || report.daily_window_active) {
-        match store.ensure_daily_runs(now, cfg.retention).await {
+        match store
+            .ensure_daily_runs(now, cfg.retention, cfg.enqueue_policy)
+            .await
+        {
             Ok(queued) => report.queued_daily_runs = queued,
             Err(error) => {
                 report.store_errors += 1;
@@ -1090,7 +1100,10 @@ where
     }
 
     if ensure_daily && (startup || report.daily_window_active) {
-        match store.ensure_daily_runs(now, cfg.retention).await {
+        match store
+            .ensure_daily_runs(now, cfg.retention, cfg.enqueue_policy)
+            .await
+        {
             Ok(queued) => report.queued_daily_runs = queued,
             Err(error) => {
                 report.store_error = Some(error.to_string());
@@ -3014,6 +3027,11 @@ pub fn memory_service_worker_config_from_memory_config(
         daily_schedule: config.daily_schedule.clone(),
         daily_window: positive_hours(config.daily_window_hours, 24),
         tick_interval: Duration::from_secs(60 * 60),
+        enqueue_policy: openplotva_memory::MemoryRunEnqueuePolicy {
+            min_messages_per_run: config.min_messages_per_run,
+            max_queued_runs: config.max_queued_runs,
+            max_daily_enqueued_runs: config.max_daily_enqueued_runs,
+        },
         process: MemoryRunProcessConfig {
             lease: positive_seconds(config.consolidation_timeout_seconds),
             max_messages_per_run: config.max_messages_per_run,
@@ -3127,7 +3145,13 @@ mod tests {
     struct FakeMemoryWriteStore {
         ids: Vec<i64>,
         ensure_daily_count: u64,
-        ensured: Mutex<Vec<(OffsetDateTime, Duration)>>,
+        ensured: Mutex<
+            Vec<(
+                OffsetDateTime,
+                Duration,
+                openplotva_memory::MemoryRunEnqueuePolicy,
+            )>,
+        >,
         run: Mutex<Option<openplotva_memory::Run>>,
         chat_meta: Mutex<Option<DialogMemoryChatMeta>>,
         messages: Mutex<Vec<openplotva_memory::Message>>,
@@ -3252,9 +3276,13 @@ mod tests {
             &'a self,
             now: OffsetDateTime,
             retention: Duration,
+            policy: openplotva_memory::MemoryRunEnqueuePolicy,
         ) -> MemoryWriteStoreFuture<'a, u64, Self::Error> {
             Box::pin(async move {
-                self.ensured.lock().expect("ensured").push((now, retention));
+                self.ensured
+                    .lock()
+                    .expect("ensured")
+                    .push((now, retention, policy));
                 Ok(self.ensure_daily_count)
             })
         }
@@ -3511,6 +3539,39 @@ mod tests {
 
         assert_eq!(cfg.model, "override");
         assert_eq!(cfg.client.default_model, "override");
+    }
+
+    #[test]
+    fn memory_extractor_config_routes_vibethinker_to_qwen_service() {
+        let config = AppConfig::from_raw(openplotva_config::RawConfig {
+            memory_consolidation_model: Some("vibethinker-3b".to_owned()),
+            memory_aifarm_service_name: Some("llm-openai-qwen27b-gguf".to_owned()),
+            ..openplotva_config::RawConfig::default()
+        })
+        .expect("config");
+
+        let cfg = aifarm_memory_extractor_config_from_app_config(&config);
+
+        assert_eq!(cfg.model, "vibethinker-3b");
+        assert_eq!(cfg.client.default_model, "vibethinker-3b");
+        assert_eq!(cfg.client.service_name, "llm-openai-qwen27b-gguf");
+    }
+
+    #[test]
+    fn memory_service_worker_config_includes_enqueue_policy() {
+        let config = AppConfig::from_raw(openplotva_config::RawConfig {
+            memory_min_messages_per_run: Some("21".to_owned()),
+            memory_max_queued_runs: Some("4321".to_owned()),
+            memory_max_daily_enqueued_runs: Some("1234".to_owned()),
+            ..openplotva_config::RawConfig::default()
+        })
+        .expect("config");
+
+        let cfg = memory_service_worker_config_from_memory_config(&config.memory);
+
+        assert_eq!(cfg.enqueue_policy.min_messages_per_run, 21);
+        assert_eq!(cfg.enqueue_policy.max_queued_runs, 4321);
+        assert_eq!(cfg.enqueue_policy.max_daily_enqueued_runs, 1234);
     }
 
     #[test]

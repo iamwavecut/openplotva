@@ -389,6 +389,31 @@ fn positive_or_default(value: i32, default: i32) -> i32 {
     if value > 0 { value } else { default }
 }
 
+#[cfg(test)]
+fn memory_message_count_bucket(message_count: i32) -> &'static str {
+    match message_count {
+        ..=1 => "1",
+        2..=3 => "2_3",
+        4..=10 => "4_10",
+        11..=19 => "11_19",
+        20..=50 => "20_50",
+        _ => "51_plus",
+    }
+}
+
+fn memory_enqueue_remaining_capacity(
+    policy: openplotva_memory::MemoryRunEnqueuePolicy,
+    active_queue_depth: i64,
+    enqueued_today: u64,
+) -> Option<i32> {
+    let policy = policy.normalized();
+    let enqueued_today = i64::try_from(enqueued_today).unwrap_or(i64::MAX);
+    let queue_capacity = i64::from(policy.max_queued_runs) - active_queue_depth - enqueued_today;
+    let daily_capacity = i64::from(policy.max_daily_enqueued_runs) - enqueued_today;
+    let remaining = queue_capacity.min(daily_capacity);
+    (remaining > 0).then(|| i32::try_from(remaining).unwrap_or(i32::MAX))
+}
+
 fn optional_trimmed_string(value: &str) -> Option<String> {
     let value = value.trim();
     (!value.is_empty()).then(|| value.to_owned())
@@ -903,29 +928,162 @@ pub const SQL_RETRY_MEMORY_RUN: &str = "UPDATE memory_runs SET status = 'queued'
 
 pub const SQL_RETRY_FAILED_MEMORY_RUNS: &str = "UPDATE memory_runs SET status = 'queued', lease_owner = '', leased_until = NULL, attempts = 0, error = '', updated_at = CURRENT_TIMESTAMP WHERE status = 'failed'";
 
-pub const SQL_ENSURE_DAILY_MEMORY_RUNS: &str = r#"WITH grouped_windows AS (
+pub const SQL_COUNT_ACTIVE_MEMORY_RUNS: &str = "SELECT count(*)::bigint FROM memory_runs WHERE prompt_version = $1 AND status IN ('queued', 'processing')";
+
+pub const SQL_RECORD_MEMORY_ENQUEUE_BACKPRESSURE: &str = r#"WITH dims AS (
+    SELECT jsonb_build_object(
+        'decision', 'backpressure',
+        'scope', 'all',
+        'message_count_bucket', 'all'
+    ) AS dimensions
+)
+INSERT INTO telemetry_rollups (
+    source, kind, granularity, bucket_start, bucket_end, dimensions_hash, dimensions, metrics
+)
+SELECT
+    'memory',
+    'consolidation_enqueue',
+    'day',
+    $2::timestamptz,
+    $3::timestamptz,
+    md5(dimensions::text),
+    dimensions,
+    jsonb_build_object(
+        'window_count', 0,
+        'message_count', 0,
+        'min_range_start', $2::timestamptz,
+        'max_range_end', $3::timestamptz,
+        'prompt_version', $1::text,
+        'queue_depth', $4::bigint,
+        'min_messages_per_run', $5::int,
+        'max_queued_runs', $6::int,
+        'max_daily_enqueued_runs', $7::int
+    )
+FROM dims
+ON CONFLICT (source, kind, granularity, bucket_start, dimensions_hash) DO UPDATE SET
+    bucket_end = EXCLUDED.bucket_end,
+    dimensions = EXCLUDED.dimensions,
+    metrics = EXCLUDED.metrics,
+    updated_at = CURRENT_TIMESTAMP"#;
+
+pub const SQL_RECORD_MEMORY_ENQUEUE_ROLLUPS: &str = r#"WITH grouped_windows AS (
     SELECT
         h.chat_id,
-        h.thread_id,
+        CASE
+            WHEN COALESCE(c.is_forum, false) AND h.thread_id <> 0 THEN h.thread_id
+            ELSE 0
+        END AS canonical_thread_id,
         date_trunc('hour', h.occurred_at) AS range_start_at,
+        LEAST(date_trunc('hour', h.occurred_at) + interval '1 hour', $3::timestamptz) AS range_end_at,
         count(*)::int AS message_count
     FROM chat_history_entries h
+    LEFT JOIN chats c ON c.id = h.chat_id
     WHERE h.bucket_day >= GREATEST($2::timestamptz, $4::timestamptz)::date
       AND h.bucket_day < $3::timestamptz::date
       AND h.occurred_at >= GREATEST($2::timestamptz, $4::timestamptz)
       AND h.occurred_at < $3::timestamptz
       AND h.kind = 'text'
-    GROUP BY h.chat_id, h.thread_id, date_trunc('hour', h.occurred_at)
-    HAVING count(*) > 0
+    GROUP BY 1, 2, 3
+),
+ranked_windows AS (
+    SELECT
+        *,
+        row_number() OVER (
+            ORDER BY message_count DESC, range_start_at ASC, chat_id ASC, canonical_thread_id ASC
+        ) AS enqueue_rank
+    FROM grouped_windows
+),
+classified AS (
+    SELECT
+        CASE
+            WHEN message_count < $5 THEN 'below_threshold'
+            WHEN enqueue_rank <= $8 THEN 'enqueued'
+            ELSE 'daily_cap'
+        END AS decision,
+        CASE WHEN canonical_thread_id = 0 THEN 'chat' ELSE 'thread' END AS scope,
+        CASE
+            WHEN message_count <= 1 THEN '1'
+            WHEN message_count <= 3 THEN '2_3'
+            WHEN message_count <= 10 THEN '4_10'
+            WHEN message_count <= 19 THEN '11_19'
+            WHEN message_count <= 50 THEN '20_50'
+            ELSE '51_plus'
+        END AS message_count_bucket,
+        range_start_at,
+        range_end_at,
+        message_count
+    FROM ranked_windows
+),
+prepared AS (
+    SELECT
+        jsonb_build_object(
+            'decision', decision,
+            'scope', scope,
+            'message_count_bucket', message_count_bucket
+        ) AS dimensions,
+        jsonb_build_object(
+            'window_count', count(*)::bigint,
+            'message_count', COALESCE(sum(message_count), 0)::bigint,
+            'min_range_start', min(range_start_at),
+            'max_range_end', max(range_end_at),
+            'prompt_version', $1::text,
+            'queue_depth', $6::bigint,
+            'min_messages_per_run', $5::int,
+            'max_queued_runs', $7::int,
+            'max_daily_enqueued_runs', $9::int,
+            'effective_daily_limit', $8::int
+        ) AS metrics
+    FROM classified
+    GROUP BY decision, scope, message_count_bucket
+)
+INSERT INTO telemetry_rollups (
+    source, kind, granularity, bucket_start, bucket_end, dimensions_hash, dimensions, metrics
+)
+SELECT
+    'memory',
+    'consolidation_enqueue',
+    'day',
+    $2::timestamptz,
+    $3::timestamptz,
+    md5(dimensions::text),
+    dimensions,
+    metrics
+FROM prepared
+ON CONFLICT (source, kind, granularity, bucket_start, dimensions_hash) DO UPDATE SET
+    bucket_end = EXCLUDED.bucket_end,
+    dimensions = EXCLUDED.dimensions,
+    metrics = EXCLUDED.metrics,
+    updated_at = CURRENT_TIMESTAMP"#;
+
+pub const SQL_ENSURE_DAILY_MEMORY_RUNS: &str = r#"WITH grouped_windows AS (
+    SELECT
+        h.chat_id,
+        CASE
+            WHEN COALESCE(c.is_forum, false) AND h.thread_id <> 0 THEN h.thread_id
+            ELSE 0
+        END AS canonical_thread_id,
+        date_trunc('hour', h.occurred_at) AS range_start_at,
+        count(*)::int AS message_count
+    FROM chat_history_entries h
+    LEFT JOIN chats c ON c.id = h.chat_id
+    WHERE h.bucket_day >= GREATEST($2::timestamptz, $4::timestamptz)::date
+      AND h.bucket_day < $3::timestamptz::date
+      AND h.occurred_at >= GREATEST($2::timestamptz, $4::timestamptz)
+      AND h.occurred_at < $3::timestamptz
+      AND h.kind = 'text'
+    GROUP BY 1, 2, 3
+    HAVING count(*) >= $5
 ),
 active_windows AS (
     SELECT
         chat_id,
-        thread_id,
+        canonical_thread_id AS thread_id,
         range_start_at,
         LEAST(range_start_at + interval '1 hour', $3::timestamptz) AS range_end_at,
         message_count
     FROM grouped_windows
+    ORDER BY message_count DESC, range_start_at ASC, chat_id ASC, canonical_thread_id ASC
+    LIMIT $6
 )
 INSERT INTO memory_runs (
     chat_id,
@@ -937,14 +1095,19 @@ INSERT INTO memory_runs (
 )
 SELECT chat_id, thread_id, range_start_at, range_end_at, $1, message_count
 FROM active_windows
+WHERE $6 > 0
 ON CONFLICT (chat_id, thread_id, range_start_at, range_end_at, prompt_version, cursor_after_at, cursor_after_message_id, cursor_after_entry_id) DO NOTHING"#;
 
 pub const SQL_SKIP_SUPERSEDED_MEMORY_RUNS: &str = "UPDATE memory_runs SET status = 'skipped', lease_owner = '', leased_until = NULL, error = '', completed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE prompt_version <> $1 AND (status IN ('queued', 'failed') OR (status = 'processing' AND leased_until < CURRENT_TIMESTAMP))";
 
-pub const SQL_SELECT_MEMORY_RUN_MESSAGES: &str = r#"SELECT payload::text AS payload
+pub const SQL_SELECT_MEMORY_RUN_MESSAGES: &str = r#"SELECT e.payload::text AS payload
 FROM chat_history_entries AS e
+LEFT JOIN chats c ON c.id = e.chat_id
 WHERE e.chat_id = $1
-  AND e.thread_id = $2
+  AND CASE
+        WHEN COALESCE(c.is_forum, false) AND e.thread_id <> 0 THEN e.thread_id
+        ELSE 0
+      END = $2
   AND e.occurred_at >= $3
   AND e.occurred_at < $4
   AND e.kind = 'text'
@@ -966,6 +1129,8 @@ pub const SQL_LIST_VISIBLE_MEMORY_CARDS: &str = "SELECT id, visibility, card_typ
 pub const SQL_LIST_MEMORY_CARDS: &str = "SELECT id, visibility, card_type, status, subject, predicate, object, fact_text, confidence, salience, observation_count, origin_chat_id, origin_user_id, chat_id, thread_id, user_id, valid_from, valid_until, last_observed_at, last_used_at, use_count, created_at, updated_at FROM memory_cards WHERE ($1::bigint = 0 OR chat_id = $1 OR origin_chat_id = $1) AND ($2::integer IS NULL OR thread_id = $2 OR origin_thread_id = $2) AND ($3::bigint = 0 OR user_id = $3 OR origin_user_id = $3) AND ($4::text = '' OR status = $4) ORDER BY updated_at DESC, id DESC LIMIT $5";
 
 pub const SQL_LIST_MEMORY_RUNS: &str = "SELECT id, chat_id, thread_id, range_start_at, range_end_at, prompt_version, status, attempts, message_count, cards_inserted, cards_updated, cards_superseded, episodes_inserted, input_token_estimate, output_token_estimate, error, error_log::text AS error_log, created_at, updated_at FROM memory_runs ORDER BY range_start_at DESC, id DESC LIMIT $1";
+
+pub const SQL_LIST_MEMORY_ENQUEUE_ROLLUPS: &str = "SELECT dimensions, metrics, updated_at FROM telemetry_rollups WHERE source = 'memory' AND kind = 'consolidation_enqueue' ORDER BY bucket_start DESC, updated_at DESC LIMIT $1";
 
 pub const SQL_LIST_MEMORY_RUN_ANALYTICS: &str = r#"SELECT
     status,
@@ -4511,21 +4676,43 @@ impl PostgresMemoryStore {
         &self,
         now: OffsetDateTime,
         retention: Duration,
+        policy: openplotva_memory::MemoryRunEnqueuePolicy,
     ) -> Result<u64, StorageError> {
         let retention = if retention.is_zero() {
             Duration::from_secs(7 * 24 * 60 * 60)
         } else {
             retention
         };
+        let policy = policy.normalized();
         let now = now.to_offset(time::UtcOffset::UTC);
         let day_end = now.date().midnight().assume_utc();
         let earliest = now - duration_to_time(retention);
         let mut day_start = earliest.date().midnight().assume_utc();
         let mut total = 0;
+        let active_queue_depth = self.active_memory_run_count().await?;
+        if memory_enqueue_remaining_capacity(policy, active_queue_depth, total).is_none() {
+            self.record_memory_enqueue_backpressure(day_start, day_end, active_queue_depth, policy)
+                .await?;
+            self.skip_superseded_runs().await?;
+            return Ok(total);
+        }
         while day_start < day_end {
             let next_day = day_start + time::Duration::days(1);
+            let Some(limit) = memory_enqueue_remaining_capacity(policy, active_queue_depth, total)
+            else {
+                break;
+            };
+            self.record_memory_enqueue_rollups(
+                day_start,
+                next_day,
+                earliest,
+                active_queue_depth,
+                policy,
+                limit,
+            )
+            .await?;
             total += self
-                .ensure_daily_run_window(day_start, next_day, earliest)
+                .ensure_daily_run_window(day_start, next_day, earliest, policy, limit)
                 .await?;
             day_start = next_day;
         }
@@ -4533,17 +4720,72 @@ impl PostgresMemoryStore {
         Ok(total)
     }
 
+    async fn active_memory_run_count(&self) -> Result<i64, StorageError> {
+        Ok(sqlx::query_scalar(SQL_COUNT_ACTIVE_MEMORY_RUNS)
+            .bind(openplotva_memory::PROMPT_VERSION)
+            .fetch_one(&self.pool)
+            .await?)
+    }
+
+    async fn record_memory_enqueue_backpressure(
+        &self,
+        window_start: OffsetDateTime,
+        window_end: OffsetDateTime,
+        active_queue_depth: i64,
+        policy: openplotva_memory::MemoryRunEnqueuePolicy,
+    ) -> Result<(), StorageError> {
+        sqlx::query(SQL_RECORD_MEMORY_ENQUEUE_BACKPRESSURE)
+            .bind(openplotva_memory::PROMPT_VERSION)
+            .bind(window_start)
+            .bind(window_end)
+            .bind(active_queue_depth)
+            .bind(policy.min_messages_per_run)
+            .bind(policy.max_queued_runs)
+            .bind(policy.max_daily_enqueued_runs)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn record_memory_enqueue_rollups(
+        &self,
+        window_start: OffsetDateTime,
+        window_end: OffsetDateTime,
+        earliest: OffsetDateTime,
+        active_queue_depth: i64,
+        policy: openplotva_memory::MemoryRunEnqueuePolicy,
+        daily_limit: i32,
+    ) -> Result<(), StorageError> {
+        sqlx::query(SQL_RECORD_MEMORY_ENQUEUE_ROLLUPS)
+            .bind(openplotva_memory::PROMPT_VERSION)
+            .bind(window_start)
+            .bind(window_end)
+            .bind(earliest)
+            .bind(policy.min_messages_per_run)
+            .bind(active_queue_depth)
+            .bind(policy.max_queued_runs)
+            .bind(daily_limit)
+            .bind(policy.max_daily_enqueued_runs)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     async fn ensure_daily_run_window(
         &self,
         window_start: OffsetDateTime,
         window_end: OffsetDateTime,
         earliest: OffsetDateTime,
+        policy: openplotva_memory::MemoryRunEnqueuePolicy,
+        daily_limit: i32,
     ) -> Result<u64, StorageError> {
         Ok(sqlx::query(SQL_ENSURE_DAILY_MEMORY_RUNS)
             .bind(openplotva_memory::PROMPT_VERSION)
             .bind(window_start)
             .bind(window_end)
             .bind(earliest)
+            .bind(policy.min_messages_per_run)
+            .bind(daily_limit)
             .execute(&self.pool)
             .await?
             .rows_affected())
@@ -4674,6 +4916,20 @@ impl PostgresMemoryStore {
             .await?;
         rows.into_iter()
             .map(memory_run_record_from_row)
+            .collect::<Result<Vec<_>, _>>()
+    }
+
+    pub async fn list_enqueue_rollups(
+        &self,
+        limit: i32,
+    ) -> Result<Vec<openplotva_memory::MemoryEnqueueRollupRecord>, StorageError> {
+        let limit = positive_or_default(limit, 24).min(100);
+        let rows = sqlx::query(SQL_LIST_MEMORY_ENQUEUE_ROLLUPS)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter()
+            .map(memory_enqueue_rollup_from_row)
             .collect::<Result<Vec<_>, _>>()
     }
 
@@ -7205,6 +7461,16 @@ fn memory_run_error_stat_from_row(
     })
 }
 
+fn memory_enqueue_rollup_from_row(
+    row: PgRow,
+) -> Result<openplotva_memory::MemoryEnqueueRollupRecord, StorageError> {
+    Ok(openplotva_memory::MemoryEnqueueRollupRecord {
+        dimensions: row.try_get("dimensions")?,
+        metrics: row.try_get("metrics")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
 fn memory_episode_from_row(row: PgRow) -> Result<openplotva_memory::Episode, StorageError> {
     Ok(openplotva_memory::Episode {
         id: row.try_get("id")?,
@@ -7831,6 +8097,21 @@ mod tests {
         assert!(super::SQL_LIST_MEMORY_RUNS.contains("error_log::text AS error_log"));
         assert!(super::SQL_LIST_MEMORY_RUNS.contains("ORDER BY range_start_at DESC, id DESC"));
         assert!(super::SQL_ENSURE_DAILY_MEMORY_RUNS.contains("date_trunc('hour', h.occurred_at)"));
+        assert!(super::SQL_ENSURE_DAILY_MEMORY_RUNS.contains("COALESCE(c.is_forum, false)"));
+        assert!(super::SQL_ENSURE_DAILY_MEMORY_RUNS.contains("canonical_thread_id"));
+        assert!(super::SQL_ENSURE_DAILY_MEMORY_RUNS.contains("HAVING count(*) >= $5"));
+        assert!(super::SQL_ENSURE_DAILY_MEMORY_RUNS.contains("ORDER BY message_count DESC"));
+        assert!(super::SQL_ENSURE_DAILY_MEMORY_RUNS.contains("LIMIT $6"));
+        assert!(
+            super::SQL_SELECT_MEMORY_RUN_MESSAGES
+                .contains("WHEN COALESCE(c.is_forum, false) AND e.thread_id <> 0")
+        );
+        assert!(super::SQL_COUNT_ACTIVE_MEMORY_RUNS.contains("status IN ('queued', 'processing')"));
+        assert!(super::SQL_RECORD_MEMORY_ENQUEUE_ROLLUPS.contains("message_count_bucket"));
+        assert!(super::SQL_RECORD_MEMORY_ENQUEUE_ROLLUPS.contains("'below_threshold'"));
+        assert!(super::SQL_RECORD_MEMORY_ENQUEUE_BACKPRESSURE.contains("'backpressure'"));
+        assert!(super::SQL_RECORD_MEMORY_ENQUEUE_BACKPRESSURE.contains("'min_range_start'"));
+        assert!(super::SQL_LIST_MEMORY_ENQUEUE_ROLLUPS.contains("kind = 'consolidation_enqueue'"));
         assert!(super::SQL_ENSURE_DAILY_MEMORY_RUNS.contains("h.bucket_day >="));
         assert!(super::SQL_SKIP_SUPERSEDED_MEMORY_RUNS.contains("prompt_version <> $1"));
         assert!(
@@ -7849,6 +8130,34 @@ mod tests {
                 .contains("ORDER BY memory_cards.embedding <=> q.embedding")
         );
         assert!(super::SQL_RETRIEVE_MEMORY_EPISODES.contains("websearch_to_tsquery('simple'"));
+    }
+
+    #[test]
+    fn memory_enqueue_policy_normalizes_capacity_and_buckets_messages() {
+        assert_eq!(super::memory_message_count_bucket(1), "1");
+        assert_eq!(super::memory_message_count_bucket(3), "2_3");
+        assert_eq!(super::memory_message_count_bucket(10), "4_10");
+        assert_eq!(super::memory_message_count_bucket(19), "11_19");
+        assert_eq!(super::memory_message_count_bucket(20), "20_50");
+        assert_eq!(super::memory_message_count_bucket(51), "51_plus");
+
+        let policy = openplotva_memory::MemoryRunEnqueuePolicy {
+            min_messages_per_run: 20,
+            max_queued_runs: 5000,
+            max_daily_enqueued_runs: 2000,
+        };
+        assert_eq!(
+            super::memory_enqueue_remaining_capacity(policy, 4_900, 0),
+            Some(100)
+        );
+        assert_eq!(
+            super::memory_enqueue_remaining_capacity(policy, 4_900, 100),
+            None
+        );
+        assert_eq!(
+            super::memory_enqueue_remaining_capacity(policy, 5_000, 0),
+            None
+        );
     }
 
     #[test]
