@@ -4611,9 +4611,7 @@ pub(crate) fn immediate_tool_answer(step: &ToolStep, result: &ToolResult) -> Opt
             if result.no_reply || is_internal_not_scheduled_instruction(&result.message) {
                 return Some(String::new());
             }
-            if result.side_effect.is_none() {
-                return None;
-            }
+            result.side_effect.as_ref()?;
             if step.step == STEP_DRAW_IMAGE {
                 queued_tool_answer(result, "Готово, поставила изображение в очередь.")
             } else {

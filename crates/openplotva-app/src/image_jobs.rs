@@ -1901,7 +1901,7 @@ where
     let quiet = effects
         .chat_messages_after(chat_id, placeholder)
         .await
-        .map_or(true, |count| count <= DRAW_PLACEHOLDER_REUSE_MAX_MESSAGES);
+        .is_none_or(|count| count <= DRAW_PLACEHOLDER_REUSE_MAX_MESSAGES);
     if quiet {
         return DrawPlaceholderTarget::reuse(Some(placeholder));
     }

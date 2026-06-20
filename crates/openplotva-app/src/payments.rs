@@ -2425,7 +2425,6 @@ pub struct RichPaymentEffects {
 }
 
 impl RichPaymentEffects {
-    #[must_use]
     pub fn new(
         inner: openplotva_telegram::TelegramClient,
         rich: Arc<dyn crate::rich::RichSender>,

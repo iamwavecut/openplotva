@@ -129,20 +129,17 @@ pub fn build_agent_provider_registry(config: &AppConfig) -> AgentProviderRegistr
     // box; an explicit `LLM_PROVIDERS_*` entry of the same name takes precedence.
     let default_reasoner =
         normalize_name(openplotva_config::DEFAULT_AGENTIC_SEARCH_REASONER_PROVIDER);
-    if !by_name.contains_key(&default_reasoner) {
+    if let std::collections::hash_map::Entry::Vacant(entry) = by_name.entry(default_reasoner) {
         let spec = qwen_reasoner_named_provider_config(config);
         let client_config = agent_client_config_from_named_provider(config, &spec);
-        by_name.insert(
-            default_reasoner,
-            Arc::new(AgentProviderClient {
-                client: AifarmHttpClient::new(client_config),
-                model: spec.model.clone(),
-                include_reasoning: spec.include_reasoning,
-                enable_thinking: spec.enable_thinking,
-                temperature: spec.temperature,
-                max_tokens: spec.max_tokens,
-            }),
-        );
+        entry.insert(Arc::new(AgentProviderClient {
+            client: AifarmHttpClient::new(client_config),
+            model: spec.model.clone(),
+            include_reasoning: spec.include_reasoning,
+            enable_thinking: spec.enable_thinking,
+            temperature: spec.temperature,
+            max_tokens: spec.max_tokens,
+        }));
     }
 
     AgentProviderRegistry { by_name }

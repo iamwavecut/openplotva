@@ -2258,7 +2258,7 @@ mod tests {
         assert_eq!(payload["chat_id"], json!(-10042));
         assert_eq!(
             payload["html"],
-            json!("<h3>Перевод</h3><p>привет</p><footer>Язык: ru</footer>")
+            json!("<h3>Перевод</h3>\n\n<p>привет</p>\n\n<footer>Язык: ru</footer>")
         );
         assert_eq!(payload["options"]["reply_to_message_id"], json!(77));
         assert_eq!(

@@ -5143,36 +5143,38 @@ mod tests {
             }]
         );
         assert!(image_sender.methods().is_empty());
-        let sent = image_rich.sent.lock().expect("rich sent");
-        assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].chat_id, -100);
-        assert_eq!(sent[0].reply_to_message_id, Some(78));
-        assert_eq!(
-            sent[0].html,
-            "<tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji>"
-        );
-        drop(sent);
-        let edited = image_rich.edited.lock().expect("rich edited");
-        assert_eq!(edited.len(), 1);
-        assert_eq!(edited[0].0, -100);
-        assert_eq!(edited[0].1, 1001);
-        assert!(edited[0].2.starts_with("<tg-collage>"));
-        assert!(
-            edited[0]
-                .2
-                .contains("<img src=\"https://img.test/neon-cat.png\"/>")
-        );
-        assert!(
-            edited[0]
-                .2
-                .contains("<img src=\"https://img.test/fallback.png\"/>")
-        );
-        assert!(
-            edited[0]
-                .2
-                .contains("<img src=\"https://plotva.geta.moe/media/mock.bin\"/>")
-        );
-        drop(edited);
+        {
+            let sent = image_rich.sent.lock().expect("rich sent");
+            assert_eq!(sent.len(), 1);
+            assert_eq!(sent[0].chat_id, -100);
+            assert_eq!(sent[0].reply_to_message_id, Some(78));
+            assert_eq!(
+                sent[0].html,
+                "<tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji>"
+            );
+        }
+        {
+            let edited = image_rich.edited.lock().expect("rich edited");
+            assert_eq!(edited.len(), 1);
+            assert_eq!(edited[0].0, -100);
+            assert_eq!(edited[0].1, 1001);
+            assert!(edited[0].2.starts_with("<tg-collage>"));
+            assert!(
+                edited[0]
+                    .2
+                    .contains("<img src=\"https://img.test/neon-cat.png\"/>")
+            );
+            assert!(
+                edited[0]
+                    .2
+                    .contains("<img src=\"https://img.test/fallback.png\"/>")
+            );
+            assert!(
+                edited[0]
+                    .2
+                    .contains("<img src=\"https://plotva.geta.moe/media/mock.bin\"/>")
+            );
+        }
         let records = queue.records();
         assert_eq!(records[0].status, JobStatus::Completed);
         assert_eq!(
@@ -6477,15 +6479,16 @@ mod tests {
             music_sender.methods().is_empty(),
             "song now sends one rich message, not classic audio + lyrics"
         );
-        let sent = music_rich.sent.lock().unwrap();
-        assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].chat_id, -100);
-        assert_eq!(sent[0].reply_to_message_id, Some(78));
-        assert!(sent[0].html.contains(r#"<audio src="#));
-        assert!(sent[0].html.contains("Neon Rain"));
-        assert!(sent[0].html.contains("Synthwave"));
-        assert!(sent[0].html.contains("neon rain"));
-        drop(sent);
+        {
+            let sent = music_rich.sent.lock().expect("rich sent");
+            assert_eq!(sent.len(), 1);
+            assert_eq!(sent[0].chat_id, -100);
+            assert_eq!(sent[0].reply_to_message_id, Some(78));
+            assert!(sent[0].html.contains(r#"<audio src="#));
+            assert!(sent[0].html.contains("Neon Rain"));
+            assert!(sent[0].html.contains("Synthwave"));
+            assert!(sent[0].html.contains("neon rain"));
+        }
         assert_eq!(queue.records()[0].status, JobStatus::Completed);
         assert_eq!(update_queue.len().await?, 0);
 
@@ -7246,31 +7249,33 @@ mod tests {
             }]
         );
         assert!(image_sender.methods().is_empty());
-        let sent = image_rich.sent.lock().expect("rich sent");
-        assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].chat_id, 42);
-        assert_eq!(sent[0].reply_to_message_id, Some(77));
-        assert_eq!(
-            sent[0].html,
-            "<tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji>"
-        );
-        drop(sent);
-        let edited = image_rich.edited.lock().expect("rich edited");
-        assert_eq!(edited.len(), 1);
-        assert_eq!(edited[0].0, 42);
-        assert_eq!(edited[0].1, 1001);
-        assert!(edited[0].2.starts_with("<tg-collage>"));
-        assert!(
-            edited[0]
-                .2
-                .contains("<img src=\"https://img.test/edit-1.png\"/>")
-        );
-        assert!(
-            edited[0]
-                .2
-                .contains("<img src=\"https://img.test/edit-2.png\"/>")
-        );
-        drop(edited);
+        {
+            let sent = image_rich.sent.lock().expect("rich sent");
+            assert_eq!(sent.len(), 1);
+            assert_eq!(sent[0].chat_id, 42);
+            assert_eq!(sent[0].reply_to_message_id, Some(77));
+            assert_eq!(
+                sent[0].html,
+                "<tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji>"
+            );
+        }
+        {
+            let edited = image_rich.edited.lock().expect("rich edited");
+            assert_eq!(edited.len(), 1);
+            assert_eq!(edited[0].0, 42);
+            assert_eq!(edited[0].1, 1001);
+            assert!(edited[0].2.starts_with("<tg-collage>"));
+            assert!(
+                edited[0]
+                    .2
+                    .contains("<img src=\"https://img.test/edit-1.png\"/>")
+            );
+            assert!(
+                edited[0]
+                    .2
+                    .contains("<img src=\"https://img.test/edit-2.png\"/>")
+            );
+        }
         let records = queue.records();
         assert_eq!(records[0].status, JobStatus::Completed);
         assert_eq!(

@@ -203,7 +203,7 @@ mod tests {
             secret: "s".to_owned(),
             timeout: Duration::ZERO,
         })
-        .unwrap();
+        .expect("valid uploader config should create client");
         assert_eq!(client.endpoint(), "https://plotva.geta.moe/upload");
     }
 
@@ -214,7 +214,7 @@ mod tests {
             200,
             r#"{"url":"https://plotva.geta.moe/abc.png","name":"abc.png"}"#,
         )
-        .unwrap();
+        .expect("ok upload response should contain url");
         assert_eq!(url, "https://plotva.geta.moe/abc.png");
     }
 
@@ -225,7 +225,7 @@ mod tests {
             200,
             r#"{"url":"https://plotva.geta.moe/media/ЧиХПыХ - Величественная кошачья.mp3"}"#,
         )
-        .unwrap();
+        .expect("ok upload response should produce telegram-safe url");
 
         assert_eq!(
             url,
@@ -235,9 +235,11 @@ mod tests {
 
     #[test]
     fn errors_on_failure_and_empty_url() {
-        let err = parse_upload_response(false, 401, "unauthorized").unwrap_err();
+        let err = parse_upload_response(false, 401, "unauthorized")
+            .expect_err("failed upload response should return upstream error");
         assert!(matches!(err, UploaderError::Upstream { status: 401, .. }));
-        let err = parse_upload_response(true, 200, r#"{"url":""}"#).unwrap_err();
+        let err = parse_upload_response(true, 200, r#"{"url":""}"#)
+            .expect_err("empty upload url should return missing-url error");
         assert!(matches!(err, UploaderError::MissingUrl));
     }
 }

@@ -367,16 +367,14 @@ impl PostgresRuntimeLlmAnalyticsReader {
             .bind(statement_timeout_value(self.sql_timeout))
             .execute(&mut *tx)
             .await?;
-        let totals = self.load_totals(&mut *tx, spec.since_time).await?;
-        let series = self.load_series(&mut *tx, &spec).await?;
-        let model_series = self.load_model_series(&mut *tx, spec.since_time).await?;
-        let top_chats = self.load_top_chats(&mut *tx, spec.since_time).await?;
-        let models = self.load_models(&mut *tx, spec.since_time).await?;
-        let providers = self.load_providers(&mut *tx, spec.since_time).await?;
-        let inference_params = self
-            .load_inference_params(&mut *tx, spec.since_time)
-            .await?;
-        let stage_metrics = self.load_stage_metrics(&mut *tx, spec.since_time).await?;
+        let totals = self.load_totals(&mut tx, spec.since_time).await?;
+        let series = self.load_series(&mut tx, &spec).await?;
+        let model_series = self.load_model_series(&mut tx, spec.since_time).await?;
+        let top_chats = self.load_top_chats(&mut tx, spec.since_time).await?;
+        let models = self.load_models(&mut tx, spec.since_time).await?;
+        let providers = self.load_providers(&mut tx, spec.since_time).await?;
+        let inference_params = self.load_inference_params(&mut tx, spec.since_time).await?;
+        let stage_metrics = self.load_stage_metrics(&mut tx, spec.since_time).await?;
         tx.commit().await?;
         let (runtime_jobs, runtime_jobs_error) = self.load_runtime_jobs(&spec);
         let ai_farm_capacity = self.load_capacity().await;

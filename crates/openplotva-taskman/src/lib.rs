@@ -5165,10 +5165,16 @@ mod tests {
         assert_eq!(report.requeued, 1);
 
         let records = queue.records();
-        let agent_record = records.iter().find(|r| r.id == agent_id).unwrap();
+        let agent_record = records
+            .iter()
+            .find(|r| r.id == agent_id)
+            .expect("agent record should exist");
         assert_eq!(agent_record.status, JobStatus::Processing);
         assert!(agent_record.worker_id.is_none());
-        let dialog_record = records.iter().find(|r| r.id == dialog_id).unwrap();
+        let dialog_record = records
+            .iter()
+            .find(|r| r.id == dialog_id)
+            .expect("dialog record should exist");
         assert_eq!(dialog_record.status, JobStatus::Pending);
     }
 
@@ -5190,7 +5196,7 @@ mod tests {
             .records()
             .into_iter()
             .find(|r| r.id == agent_id)
-            .unwrap();
+            .expect("agent record should exist");
         assert_eq!(record.status, JobStatus::Processing);
     }
 }

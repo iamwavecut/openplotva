@@ -328,9 +328,11 @@ mod tests {
 
     #[test]
     fn parse_ok_value_and_bool() {
-        let value: Value = parse_api_response(r#"{"ok":true,"result":{"message_id":3}}"#).unwrap();
+        let value: Value = parse_api_response(r#"{"ok":true,"result":{"message_id":3}}"#)
+            .expect("ok API object response should parse result");
         assert_eq!(value, json!({"message_id": 3}));
-        let flag: bool = parse_api_response(r#"{"ok":true,"result":true}"#).unwrap();
+        let flag: bool = parse_api_response(r#"{"ok":true,"result":true}"#)
+            .expect("ok API bool response should parse result");
         assert!(flag);
     }
 
@@ -339,7 +341,7 @@ mod tests {
         let err = parse_api_response::<Value>(
             r#"{"ok":false,"error_code":429,"description":"Too Many Requests: retry after 5","parameters":{"retry_after":5}}"#,
         )
-        .unwrap_err();
+        .expect_err("API retry-after error should be surfaced");
         match &err {
             RichApiError::Api {
                 code,
@@ -360,7 +362,7 @@ mod tests {
         let err = parse_api_response::<Value>(
             r#"{"ok":false,"error_code":400,"description":"Bad Request: message is not modified"}"#,
         )
-        .unwrap_err();
+        .expect_err("not-modified API error should be surfaced");
         assert!(err.is_not_modified());
         assert_eq!(err.retry_after(), None);
     }

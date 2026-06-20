@@ -10715,6 +10715,7 @@ async fn wait_for_runtime_stop(mut stop: watch::Receiver<bool>) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_dispatcher_work_item(
     store: PostgresVirtualMessageStore,
     history: PostgresHistoryStore,

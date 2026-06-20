@@ -369,7 +369,7 @@ fn flag(token: &Tag, key: &'static str) -> Option<CleanAttr> {
         .attrs
         .iter()
         .any(|attr| attr_name_eq(attr, key))
-        .then(|| CleanAttr { key, value: None })
+        .then_some(CleanAttr { key, value: None })
 }
 
 fn normalize_rich_tag(tag: &str) -> Option<&'static str> {
@@ -573,14 +573,10 @@ fn rich_tag_boundary(html: &str, start: usize) -> Option<(usize, bool)> {
     let end = start + rest.find('>')? + 1;
     let body = html[start + 1..end - 1].trim();
     if let Some(closing) = body.strip_prefix('/') {
-        let tag = closing.trim_start().split_whitespace().next()?;
+        let tag = closing.split_whitespace().next()?;
         return Some((end, SPACED_RICH_BLOCK_TAGS.contains(&tag)));
     }
-    let tag = body
-        .trim_end_matches('/')
-        .trim_end()
-        .split_whitespace()
-        .next()?;
+    let tag = body.trim_end_matches('/').split_whitespace().next()?;
     Some((
         end,
         body.ends_with('/') && SPACED_RICH_VOID_BLOCK_TAGS.contains(&tag),

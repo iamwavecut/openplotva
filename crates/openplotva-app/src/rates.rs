@@ -1997,7 +1997,10 @@ mod tests {
             .await?;
 
         assert!(next.calls().is_empty());
-        let sent = mock.sent.lock().unwrap();
+        let sent = mock
+            .sent
+            .lock()
+            .expect("rates rich effects sent mutex should not be poisoned");
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].chat_id, -10042);
         assert_eq!(sent[0].message_thread_id, Some(9));
@@ -2226,7 +2229,13 @@ mod tests {
 
         assert_eq!(first.rows[0].value, 65000.0);
         assert_eq!(first.rows[0].source, "yahoo_chart");
-        assert_eq!(first.rows[0].delta.unwrap().basis, RateDeltaBasis::Day);
+        assert_eq!(
+            first.rows[0]
+                .delta
+                .expect("BTC row should include day delta")
+                .basis,
+            RateDeltaBasis::Day
+        );
         assert_eq!(second.rows[0].value, 65000.0);
         let requests = server
             .join()
@@ -2317,7 +2326,13 @@ mod tests {
 
         assert_eq!(snapshot.rows[0].source, "fred");
         assert_eq!(snapshot.rows[0].value, 77.0);
-        assert_eq!(snapshot.rows[0].delta.unwrap().percent, 10.0);
+        assert_eq!(
+            snapshot.rows[0]
+                .delta
+                .expect("WTI row should include delta")
+                .percent,
+            10.0
+        );
         let requests = server
             .join()
             .map_err(|_| io::Error::other("market fixture server panicked"))??;
@@ -2386,7 +2401,10 @@ mod tests {
                 state: "executed".to_owned(),
             }
         );
-        let sent = mock.sent.lock().unwrap();
+        let sent = mock
+            .sent
+            .lock()
+            .expect("rates rich effects sent mutex should not be poisoned");
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].chat_id, -10042);
         assert_eq!(sent[0].message_thread_id, Some(9));

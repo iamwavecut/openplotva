@@ -208,13 +208,16 @@ impl RichSender for MockRichSender {
         html: &'a str,
         options: &'a RichSendOptions,
     ) -> RichSendFuture<'a, i64> {
-        self.sent.lock().unwrap().push(RichSendCall {
-            chat_id,
-            html: html.to_owned(),
-            reply_to_message_id: options.reply_to_message_id,
-            allow_sending_without_reply: options.allow_sending_without_reply,
-            message_thread_id: options.message_thread_id,
-        });
+        self.sent
+            .lock()
+            .expect("mock rich sender sent mutex should not be poisoned")
+            .push(RichSendCall {
+                chat_id,
+                html: html.to_owned(),
+                reply_to_message_id: options.reply_to_message_id,
+                allow_sending_without_reply: options.allow_sending_without_reply,
+                message_thread_id: options.message_thread_id,
+            });
         Box::pin(async { Ok(1001) })
     }
 
@@ -227,7 +230,7 @@ impl RichSender for MockRichSender {
     ) -> RichSendFuture<'a, ()> {
         self.edited
             .lock()
-            .unwrap()
+            .expect("mock rich sender edited mutex should not be poisoned")
             .push((chat_id, message_id, html.to_owned()));
         Box::pin(async { Ok(()) })
     }
@@ -241,7 +244,7 @@ impl RichSender for MockRichSender {
     ) -> RichSendFuture<'a, ()> {
         self.drafts
             .lock()
-            .unwrap()
+            .expect("mock rich sender drafts mutex should not be poisoned")
             .push((chat_id, draft_id, html.to_owned()));
         Box::pin(async { Ok(()) })
     }
@@ -372,13 +375,13 @@ pub fn compose_gallery(
 ) -> String {
     let mut html = String::new();
     append_gallery_media(&mut html, image_urls, caption_html);
-    if let Some(prompt) = prompt_spoiler {
-        if !prompt.trim().is_empty() {
-            html.push_str(&format!(
-                "<p><b>Промпт:</b> <tg-spoiler>{}</tg-spoiler></p>",
-                esc(prompt),
-            ));
-        }
+    if let Some(prompt) = prompt_spoiler
+        && !prompt.trim().is_empty()
+    {
+        html.push_str(&format!(
+            "<p><b>Промпт:</b> <tg-spoiler>{}</tg-spoiler></p>",
+            esc(prompt),
+        ));
     }
     sanitize_rich_html(&html)
 }
@@ -478,17 +481,28 @@ mod tests {
             allow_sending_without_reply: true,
             ..RichSendOptions::default()
         };
-        let id = mock.send_rich(7, "<b>x</b>", &options).await.unwrap();
+        let id = mock
+            .send_rich(7, "<b>x</b>", &options)
+            .await
+            .expect("mock rich send should succeed");
         assert_eq!(id, 1001);
-        mock.edit_rich(7, id, "<i>y</i>", None).await.unwrap();
-        let sent = mock.sent.lock().unwrap();
+        mock.edit_rich(7, id, "<i>y</i>", None)
+            .await
+            .expect("mock rich edit should succeed");
+        let sent = mock
+            .sent
+            .lock()
+            .expect("mock rich sender sent mutex should not be poisoned");
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].chat_id, 7);
         assert_eq!(sent[0].html, "<b>x</b>");
         assert_eq!(sent[0].reply_to_message_id, Some(99));
         assert!(sent[0].allow_sending_without_reply);
         assert_eq!(
-            mock.edited.lock().unwrap().as_slice(),
+            mock.edited
+                .lock()
+                .expect("mock rich sender edited mutex should not be poisoned")
+                .as_slice(),
             &[(7, 1001, "<i>y</i>".to_owned())]
         );
     }
@@ -527,9 +541,9 @@ mod tests {
             footer_html: "за авторством <i>Автор</i>",
         };
         let html = compose_song_message(&song);
-        let audio = html.find("<audio").unwrap();
-        let details = html.find("<details>").unwrap();
-        let footer = html.find("<footer>").unwrap();
+        let audio = html.find("<audio").expect("song should include audio");
+        let details = html.find("<details>").expect("song should include details");
+        let footer = html.find("<footer>").expect("song should include footer");
         assert!(audio < details && details < footer);
         assert!(html.contains(r#"<audio src="https://plotva.geta.moe/x.mp3"></audio>"#));
         assert!(html.contains("<blockquote>строка 1<br/>строка 2</blockquote>"));
