@@ -1776,7 +1776,7 @@ fn usize_to_i64(value: usize) -> i64 {
 #[derive(Clone)]
 pub struct AppDialogToolbox<RatesFetcherT, RatesDispatcherT, TranslatorT> {
     rates_fetcher: Option<Arc<RatesFetcherT>>,
-    rates_dispatcher: Option<Arc<RatesDispatcherT>>,
+    _rates_dispatcher: Option<Arc<RatesDispatcherT>>,
     translator: Option<Arc<TranslatorT>>,
     queue_status: Option<Arc<dyn QueueStatusProvider>>,
     drawing_canceller: Option<Arc<dyn DrawingJobCanceller>>,
@@ -1801,7 +1801,7 @@ impl<RatesFetcherT, RatesDispatcherT, TranslatorT>
     ) -> Self {
         Self {
             rates_fetcher,
-            rates_dispatcher,
+            _rates_dispatcher: rates_dispatcher,
             translator,
             queue_status: None,
             drawing_canceller: None,
@@ -1900,19 +1900,7 @@ where
 {
     fn currency_rates<'a>(&'a self, req: RatesRequest) -> ToolboxFuture<'a> {
         Box::pin(async move {
-            let Some(dispatcher) = self.rates_dispatcher.as_deref() else {
-                return Ok(ToolResult::failed(
-                    "currency_rates_unavailable",
-                    "rates service unavailable",
-                ));
-            };
-            Ok(currency_rates_tool(
-                self.rates_fetcher.as_deref(),
-                dispatcher,
-                &req.context,
-                &req.pairs,
-            )
-            .await)
+            Ok(currency_rates_tool(self.rates_fetcher.as_deref(), &req.context, &req.pairs).await)
         })
     }
 
@@ -3221,7 +3209,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn app_dialog_toolbox_dispatches_currency_rates() -> Result<(), ToolboxError> {
+    async fn app_dialog_toolbox_dispatches_currency_rates_to_llm() -> Result<(), ToolboxError> {
         let dispatcher = Arc::new(RatesDispatcherStub::default());
         let toolbox = AppDialogToolbox::new(
             Some(Arc::new(RatesFetcherStub)),
@@ -3238,8 +3226,9 @@ mod tests {
             })
             .await?;
 
-        assert_eq!(result.status, TOOL_RESULT_STATUS_QUEUED);
-        assert!(result.no_reply);
+        assert_eq!(result.status, TOOL_RESULT_STATUS_OK);
+        assert!(!result.no_reply);
+        assert!(result.side_effect.is_none());
         assert!(result.message.contains("💵 USD/RUB=90.00 ₽"));
         assert!(result.message.contains("₿ BTC/USD=100000 $"));
         assert!(result.message.contains("🛢 Brent=76.50 $"));
@@ -3247,14 +3236,7 @@ mod tests {
             result.data.as_ref().expect("data")["rates_text"],
             result.message
         );
-        let calls = dispatcher.calls();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0.mode, "multi_turn");
-        assert_eq!(calls[0].0.chat_id, -100);
-        assert_eq!(calls[0].0.thread_id, Some(7));
-        assert!(calls[0].1.contains("<table"));
-        assert!(calls[0].1.contains("💵 USD/RUB"));
-        assert!(calls[0].1.contains("🛢 Brent"));
+        assert_eq!(dispatcher.calls().len(), 0);
         Ok(())
     }
 

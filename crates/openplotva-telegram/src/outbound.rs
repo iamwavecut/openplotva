@@ -19,9 +19,9 @@ use thiserror::Error;
 
 use crate::{
     DispatcherPersistencePayload, RICH_MESSAGE_MAX_CHARS, RichSendOptions, SendRichMessage,
-    TELEGRAM_PARSE_MODE_HTML, escape_telegram_html_text, extract_visible_text,
-    rich_message_within_char_limit, sanitize_rich_html, sanitize_telegram_html,
-    split_telegram_text, strip_telegram_html,
+    TELEGRAM_PARSE_MODE_HTML, escape_telegram_html_text, extract_visible_text, format_rich_html,
+    rich_message_within_char_limit, sanitize_telegram_html, split_telegram_text,
+    strip_telegram_html,
 };
 
 pub const TELEGRAM_TEXT_MAX_BYTES: usize = 4096;
@@ -564,7 +564,7 @@ pub fn build_rich_message_method(
     chat: ChatRef,
     reply_to: Option<&ReplyMessageRef>,
 ) -> Result<SendRichMessage, OutboundBuildError> {
-    let html = sanitize_rich_html(&req.html);
+    let html = format_rich_html(&req.html);
     if html.is_empty() {
         return Err(OutboundBuildError::EmptyText);
     }
@@ -1688,11 +1688,11 @@ mod tests {
         GuestQueryAnswerRequest, InlineArticleRequest, InlineQueryAnswerRequest, MESSAGE_TYPE_TEXT,
         MediaGroupMessagePlan, MediaGroupMessageRequest, MediaGroupPhotoItem, MessageFingerprint,
         OutboundBuildError, PaymentPayloadKind, PhotoMessagePlan, PhotoMessageRequest, PhotoSource,
-        ReplyMessageRef, ReplyParametersPlan, StickerMessagePlan, StickerMessageRequest,
-        SubscriptionInvoiceLinkRequest, TextMessageRequest, allow_sending_without_reply,
-        build_audio_message_method, build_audio_message_plan, build_callback_answer_method,
-        build_cancel_star_subscription_method, build_chat_action_method,
-        build_delete_message_method, build_donation_invoice_link_method,
+        ReplyMessageRef, ReplyParametersPlan, RichMessageRequest, StickerMessagePlan,
+        StickerMessageRequest, SubscriptionInvoiceLinkRequest, TextMessageRequest,
+        allow_sending_without_reply, build_audio_message_method, build_audio_message_plan,
+        build_callback_answer_method, build_cancel_star_subscription_method,
+        build_chat_action_method, build_delete_message_method, build_donation_invoice_link_method,
         build_edit_caption_message_method, build_edit_media_message_method,
         build_edit_media_message_plan, build_edit_reply_markup_message_method,
         build_edit_text_message_method, build_get_chat_administrators_method,
@@ -1704,10 +1704,10 @@ mod tests {
         build_inline_query_result_article, build_media_group_message_method,
         build_media_group_message_plan, build_photo_message_method, build_photo_message_plan,
         build_pre_checkout_ok_method, build_private_settings_keyboard,
-        build_refund_star_payment_method, build_sticker_message_method, build_sticker_message_plan,
-        build_subscription_invoice_link_method, build_text_message_method,
-        build_text_message_methods, classify_payment_payload, donation_invoice_payload,
-        fingerprint_audio_message_plan, fingerprint_photo_message_plan,
+        build_refund_star_payment_method, build_rich_message_method, build_sticker_message_method,
+        build_sticker_message_plan, build_subscription_invoice_link_method,
+        build_text_message_method, build_text_message_methods, classify_payment_payload,
+        donation_invoice_payload, fingerprint_audio_message_plan, fingerprint_photo_message_plan,
         fingerprint_sticker_message_plan, fingerprint_text_message_part, forum_thread_id,
         guest_add_to_chat_url, guest_dialog_fallback_html, guest_inline_description,
         guest_inline_result_id, guest_unsupported_feature_html, hash_content, message_target_chat,
@@ -2009,6 +2009,38 @@ mod tests {
 
         assert_eq!(payload["message_thread_id"], json!(77));
 
+        Ok(())
+    }
+
+    #[test]
+    fn build_rich_message_method_formats_block_spacing() -> Result<(), Box<dyn std::error::Error>> {
+        let req = RichMessageRequest {
+            chat: Some(forum_chat(42)),
+            message_thread_id: 55,
+            disable_notification: true,
+            allow_sending_without_reply: Some(false),
+            html: "<h3>Debug token</h3><p><code>secret</code></p><footer>keep private</footer>"
+                .to_owned(),
+            reply_markup: None,
+        };
+        let reply = ReplyMessageRef {
+            message_id: 9,
+            chat: forum_chat(42),
+            is_topic_message: true,
+            message_thread_id: 77,
+        };
+
+        let method = build_rich_message_method(&req, reply.chat, Some(&reply))?;
+
+        assert_eq!(method.chat_id, 42);
+        assert_eq!(
+            method.html,
+            "<h3>Debug token</h3>\n\n<p><code>secret</code></p>\n\n<footer>keep private</footer>"
+        );
+        assert_eq!(method.options.message_thread_id, Some(77));
+        assert_eq!(method.options.reply_to_message_id, Some(9));
+        assert!(!method.options.allow_sending_without_reply);
+        assert!(method.options.disable_notification);
         Ok(())
     }
 

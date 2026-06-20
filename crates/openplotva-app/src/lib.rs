@@ -7299,6 +7299,7 @@ pub async fn run() -> anyhow::Result<()> {
 
     let mut readiness_checks = Vec::new();
     let service_clients = connect_services(&config, &mut readiness_checks).await?;
+    record_dialog_tool_mode_readiness(&config, &mut readiness_checks);
     apply_runtime_aifarm_pool_settings(&config, service_clients.as_ref()).await;
     let runtime_workers = start_runtime_workers(
         &config,
@@ -7424,6 +7425,30 @@ async fn connect_services(
     }
     readiness_checks.push(ReadinessCheck::ok("redis", "startup ping succeeded"));
     Ok(Some(clients))
+}
+
+fn record_dialog_tool_mode_readiness(
+    config: &AppConfig,
+    readiness_checks: &mut Vec<ReadinessCheck>,
+) {
+    let dialog = &config.llm.dialog;
+    if !dialog
+        .provider
+        .eq_ignore_ascii_case(openplotva_dialog::PROVIDER_AIFARM)
+    {
+        return;
+    }
+    if dialog.aifarm_use_tool_calls {
+        readiness_checks.push(ReadinessCheck::ok(
+            "dialog_tool_mode",
+            "AIFarm native dialog tool calls enabled",
+        ));
+    } else {
+        readiness_checks.push(ReadinessCheck::skipped(
+            "dialog_tool_mode",
+            "AIFarm dialog tools are configured but native tool calls are disabled",
+        ));
+    }
 }
 
 pub async fn run_long_poll_update_producer_after_delete_webhook<Startup, Source, Queue, Stop>(

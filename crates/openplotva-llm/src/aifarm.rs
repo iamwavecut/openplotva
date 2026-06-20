@@ -30,11 +30,10 @@ use openplotva_dialog::{
     RatesRequest, STEP_CANCEL_DRAWING, STEP_CHAT_HISTORY_SUMMARY, STEP_CRAWL_URL,
     STEP_CURRENCY_RATES, STEP_DRAW_IMAGE, STEP_GENERATE_SONG, STEP_QUEUE_STATUS,
     STEP_TRANSLATE_TEXT, STEP_VISION_IMAGE, STEP_WEB_SEARCH, STEP_YOUTUBE_SUMMARY, SongRequest,
-    TOOL_RESULT_STATUS_EXECUTED, TOOL_RESULT_STATUS_FAILED, TOOL_RESULT_STATUS_NOOP,
-    TOOL_RESULT_STATUS_OK, TOOL_RESULT_STATUS_QUEUED, ToolContext, ToolError, ToolParseDecision,
-    ToolResult, ToolSpec, ToolStep, VisionRequest, alternative_dialog_tool_names,
-    alternative_dialog_tools, chat_completion_tools_for_names, clone_history_messages,
-    decode_plotva_final_response_with_salvage, extract_content_tool_step,
+    TOOL_RESULT_STATUS_FAILED, TOOL_RESULT_STATUS_NOOP, TOOL_RESULT_STATUS_QUEUED, ToolContext,
+    ToolError, ToolParseDecision, ToolResult, ToolSpec, ToolStep, VisionRequest,
+    alternative_dialog_tool_names, alternative_dialog_tools, chat_completion_tools_for_names,
+    clone_history_messages, decode_plotva_final_response_with_salvage, extract_content_tool_step,
     has_leading_context_message, is_dialog_history_noise_tool_call_name,
     is_internal_not_scheduled_instruction, normalize_history_message, parse_native_tool_step,
     sanitize_final_text, select_llm_history_messages_for_context, tool_telemetry,
@@ -2915,9 +2914,10 @@ pub(crate) async fn execute_dialog_tool(
     match step.step.as_str() {
         STEP_DRAW_IMAGE => {
             if step.prompt.trim().is_empty() {
-                return Err(Box::new(AifarmDialogError::Response(
-                    "tool protocol error: draw_image prompt is empty".to_owned(),
-                )));
+                return Ok(ToolResult::failed(
+                    "draw_image_prompt_empty",
+                    "draw_image prompt is empty",
+                ));
             }
             toolbox
                 .draw_image(DrawRequest {
@@ -2931,9 +2931,10 @@ pub(crate) async fn execute_dialog_tool(
         }
         STEP_GENERATE_SONG => {
             if step.topic.trim().is_empty() {
-                return Err(Box::new(AifarmDialogError::Response(
-                    "tool protocol error: generate_song topic is empty".to_owned(),
-                )));
+                return Ok(ToolResult::failed(
+                    "generate_song_topic_empty",
+                    "generate_song topic is empty",
+                ));
             }
             toolbox
                 .generate_song(SongRequest {
@@ -2943,7 +2944,15 @@ pub(crate) async fn execute_dialog_tool(
                 .await
         }
         STEP_VISION_IMAGE => {
-            let file_id = resolve_vision_tool_file_id(&step.file_id, meta)?;
+            let file_id = match resolve_vision_tool_file_id(&step.file_id, meta) {
+                Ok(file_id) => file_id,
+                Err(error) => {
+                    return Ok(ToolResult::failed(
+                        "vision_image_file_empty",
+                        error.to_string(),
+                    ));
+                }
+            };
             toolbox
                 .vision_image(VisionRequest {
                     context: meta.clone(),
@@ -2960,26 +2969,30 @@ pub(crate) async fn execute_dialog_tool(
                 .await
         }
         STEP_WEB_SEARCH => {
-            if step.query.trim().is_empty() {
-                return Err(Box::new(AifarmDialogError::Response(
-                    "tool protocol error: web_search query is empty".to_owned(),
-                )));
+            let query = default_string(&step.query, &meta.message_text);
+            if query.trim().is_empty() {
+                return Ok(ToolResult::failed(
+                    "web_search_query_empty",
+                    "web_search query is empty",
+                ));
             }
-            toolbox.web_search(step.query.clone()).await
+            toolbox.web_search(query).await
         }
         STEP_CRAWL_URL => {
             if step.url.trim().is_empty() {
-                return Err(Box::new(AifarmDialogError::Response(
-                    "tool protocol error: crawl_url url is empty".to_owned(),
-                )));
+                return Ok(ToolResult::failed(
+                    "crawl_url_url_empty",
+                    "crawl_url url is empty",
+                ));
             }
             toolbox.crawl_url(step.url.clone()).await
         }
         STEP_YOUTUBE_SUMMARY => {
             if step.video.trim().is_empty() {
-                return Err(Box::new(AifarmDialogError::Response(
-                    "tool protocol error: youtube_summary video is empty".to_owned(),
-                )));
+                return Ok(ToolResult::failed(
+                    "youtube_summary_video_empty",
+                    "youtube_summary video is empty",
+                ));
             }
             toolbox.youtube_summary(step.video.clone()).await
         }
@@ -2987,9 +3000,10 @@ pub(crate) async fn execute_dialog_tool(
         STEP_CANCEL_DRAWING => toolbox.cancel_drawing(meta.user_id, meta.chat_id).await,
         STEP_TRANSLATE_TEXT => {
             if step.text.trim().is_empty() {
-                return Err(Box::new(AifarmDialogError::Response(
-                    "tool protocol error: translate_text text is empty".to_owned(),
-                )));
+                return Ok(ToolResult::failed(
+                    "translate_text_empty",
+                    "translate_text text is empty",
+                ));
             }
             let target_lang = default_string(&step.target_lang, "ru");
             toolbox.translate_text(step.text.clone(), target_lang).await
@@ -3006,9 +3020,10 @@ pub(crate) async fn execute_dialog_tool(
                 })
                 .await
         }
-        other => Err(Box::new(AifarmDialogError::Response(format!(
-            "tool protocol error: unsupported step {other:?}"
-        )))),
+        other => Ok(ToolResult::failed(
+            "unsupported_tool",
+            format!("unsupported step {other:?}"),
+        )),
     }
 }
 
@@ -4591,13 +4606,20 @@ pub(crate) fn immediate_tool_answer(step: &ToolStep, result: &ToolResult) -> Opt
     {
         return None;
     }
-    if result.no_reply || is_internal_not_scheduled_instruction(&result.message) {
-        return Some(String::new());
-    }
     match step.step.as_str() {
-        STEP_DRAW_IMAGE => queued_tool_answer(result, "Готово, поставила изображение в очередь."),
-        STEP_GENERATE_SONG => queued_tool_answer(result, "Готово, поставила песню в очередь."),
-        STEP_CHAT_HISTORY_SUMMARY => completed_tool_answer(result),
+        STEP_DRAW_IMAGE | STEP_GENERATE_SONG => {
+            if result.no_reply || is_internal_not_scheduled_instruction(&result.message) {
+                return Some(String::new());
+            }
+            if result.side_effect.is_none() {
+                return None;
+            }
+            if step.step == STEP_DRAW_IMAGE {
+                queued_tool_answer(result, "Готово, поставила изображение в очередь.")
+            } else {
+                queued_tool_answer(result, "Готово, поставила песню в очередь.")
+            }
+        }
         _ => None,
     }
 }
@@ -4625,8 +4647,6 @@ fn single_effect_tool_name(name: &str) -> bool {
     name.eq_ignore_ascii_case(STEP_GENERATE_SONG)
         || name.eq_ignore_ascii_case(STEP_DRAW_IMAGE)
         || name.eq_ignore_ascii_case(STEP_CANCEL_DRAWING)
-        || name.eq_ignore_ascii_case(STEP_CURRENCY_RATES)
-        || name.eq_ignore_ascii_case(STEP_CHAT_HISTORY_SUMMARY)
 }
 
 pub(crate) fn duplicate_tool_result(tool_name: &str, first_ref: &str) -> ToolResult {
@@ -4652,22 +4672,6 @@ pub(crate) fn duplicate_tool_result(tool_name: &str, first_ref: &str) -> ToolRes
         }),
         ..ToolResult::default()
     }
-}
-
-fn completed_tool_answer(result: &ToolResult) -> Option<String> {
-    let message = result.message.trim();
-    if message.is_empty() {
-        return None;
-    }
-    let status = result.status.trim();
-    if status.eq_ignore_ascii_case(TOOL_RESULT_STATUS_OK)
-        || status.eq_ignore_ascii_case(TOOL_RESULT_STATUS_EXECUTED)
-        || status.eq_ignore_ascii_case(TOOL_RESULT_STATUS_FAILED)
-        || status.eq_ignore_ascii_case(TOOL_RESULT_STATUS_NOOP)
-    {
-        return Some(message.to_owned());
-    }
-    None
 }
 
 fn queued_tool_answer(result: &ToolResult, fallback: &str) -> Option<String> {
@@ -6004,6 +6008,7 @@ mod tests {
     use openplotva_core::{ChatAttachment, SENDER_TYPE_USER, ToolCall};
     use openplotva_dialog::{
         DailyPersona, DialogContext, DialogMessage, DialogUser, Persona, ROLE_TOOL,
+        TOOL_RESULT_STATUS_OK,
     };
 
     static POOL_REASONING_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -7531,12 +7536,141 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dialog_provider_feeds_data_tool_no_reply_result_to_llm() -> Result<(), CompletionError>
+    {
+        let toolbox = FakeToolbox::new(vec![ToolResult {
+            status: TOOL_RESULT_STATUS_QUEUED.to_owned(),
+            message: "rates ready".to_owned(),
+            no_reply: true,
+            ..ToolResult::default()
+        }]);
+        let (provider, transport, toolbox) = direct_dialog_provider_with_responses(
+            vec![
+                json!({
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": "<tool_call>currency_rates{pairs:\"BYN\"}</tool_call>"
+                        }
+                    }]
+                }),
+                json!({
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": "курс BYN уже в ответе"
+                        }
+                    }]
+                }),
+            ],
+            AifarmDialogConfig::default(),
+            toolbox,
+        );
+
+        let output = crate::ChatProvider::run_dialog(&provider, base_input()).await?;
+
+        assert_eq!(output.answer, "курс BYN уже в ответе");
+        assert_eq!(toolbox.calls(), vec![STEP_CURRENCY_RATES.to_owned()]);
+        assert_eq!(transport.requests().len(), 2);
+        let second_request: Value = serde_json::from_slice(&transport.requests()[1].body)?;
+        assert!(
+            second_request["messages"]
+                .as_array()
+                .expect("messages")
+                .iter()
+                .any(|message| message["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("<tool_result")))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dialog_provider_feeds_chat_history_summary_to_llm() -> Result<(), CompletionError> {
+        let toolbox = FakeToolbox::new(vec![ToolResult {
+            status: TOOL_RESULT_STATUS_OK.to_owned(),
+            message: "summary ready".to_owned(),
+            ..ToolResult::default()
+        }]);
+        let (provider, transport, toolbox) = direct_dialog_provider_with_responses(
+            vec![
+                json!({
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": "<tool_call>chat_history_summary{window:\"hours\", hours:1}</tool_call>"
+                        }
+                    }]
+                }),
+                json!({
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": "пересказ на основе summary"
+                        }
+                    }]
+                }),
+            ],
+            AifarmDialogConfig::default(),
+            toolbox,
+        );
+
+        let output = crate::ChatProvider::run_dialog(&provider, base_input()).await?;
+
+        assert_eq!(output.answer, "пересказ на основе summary");
+        assert_eq!(toolbox.calls(), vec![STEP_CHAT_HISTORY_SUMMARY.to_owned()]);
+        assert_eq!(transport.requests().len(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dialog_provider_feeds_empty_data_tool_arg_error_to_llm() -> Result<(), CompletionError>
+    {
+        let toolbox = FakeToolbox::new(Vec::new());
+        let (provider, transport, toolbox) = direct_dialog_provider_with_responses(
+            vec![
+                json!({
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": "<tool_call>web_search{query:\"\"}</tool_call>"
+                        }
+                    }]
+                }),
+                json!({
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": "не смогла поискать без запроса"
+                        }
+                    }]
+                }),
+            ],
+            AifarmDialogConfig::default(),
+            toolbox,
+        );
+        let mut input = base_input();
+        input.message.text = String::new();
+
+        let output = crate::ChatProvider::run_dialog(&provider, input).await?;
+
+        assert_eq!(output.answer, "не смогла поискать без запроса");
+        assert!(toolbox.calls().is_empty());
+        assert_eq!(transport.requests().len(), 2);
+        assert_eq!(
+            output.tool_calls[0].output.as_ref().expect("tool output")["error"]["code"],
+            "web_search_query_empty"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn dialog_provider_suppresses_duplicate_single_effect_tool_requests()
     -> Result<(), CompletionError> {
         let toolbox = FakeToolbox::new(vec![
             ToolResult {
                 status: TOOL_RESULT_STATUS_OK.to_owned(),
-                message: "rates ready".to_owned(),
+                message: "draw accepted".to_owned(),
                 ..ToolResult::default()
             },
             ToolResult {
@@ -7551,7 +7685,7 @@ mod tests {
                     "choices": [{
                         "message": {
                             "role": "assistant",
-                            "content": "<tool_call>currency_rates{}</tool_call>"
+                            "content": "<tool_call>draw_image{prompt:\"cat\"}</tool_call>"
                         }
                     }]
                 }),
@@ -7559,7 +7693,7 @@ mod tests {
                     "choices": [{
                         "message": {
                             "role": "assistant",
-                            "content": "<tool_call>currency_rates{}</tool_call>"
+                            "content": "<tool_call>draw_image{prompt:\"cat\"}</tool_call>"
                         }
                     }]
                 }),
@@ -7579,7 +7713,7 @@ mod tests {
         let output = crate::ChatProvider::run_dialog(&provider, base_input()).await?;
 
         assert_eq!(output.answer, "готово");
-        assert_eq!(toolbox.calls(), vec![STEP_CURRENCY_RATES.to_owned()]);
+        assert_eq!(toolbox.calls(), vec![STEP_DRAW_IMAGE.to_owned()]);
         assert_eq!(output.tool_calls.len(), 2);
         assert_eq!(
             output.tool_calls[1]

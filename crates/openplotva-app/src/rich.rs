@@ -13,7 +13,7 @@ use std::pin::Pin;
 use openplotva_media::uploader::{UploaderClient, UploaderError};
 use openplotva_telegram::{
     RichApiClient, RichApiError, RichMessage, RichSendOptions, escape_telegram_html_text,
-    sanitize_rich_html,
+    format_rich_html, sanitize_rich_html,
 };
 use serde_json::Value;
 
@@ -44,7 +44,7 @@ impl RichMessenger {
         options: &RichSendOptions,
     ) -> Result<RichMessage, RichApiError> {
         self.rich
-            .send_rich_message(chat_id, &sanitize_rich_html(html), options)
+            .send_rich_message(chat_id, &format_rich_html(html), options)
             .await
     }
 
@@ -57,7 +57,7 @@ impl RichMessenger {
         reply_markup: Option<Value>,
     ) -> Result<(), RichApiError> {
         self.rich
-            .edit_message_text_rich(chat_id, message_id, &sanitize_rich_html(html), reply_markup)
+            .edit_message_text_rich(chat_id, message_id, &format_rich_html(html), reply_markup)
             .await
     }
 
@@ -73,7 +73,7 @@ impl RichMessenger {
             .send_rich_message_draft(
                 chat_id,
                 draft_id,
-                &sanitize_rich_html(html),
+                &format_rich_html(html),
                 message_thread_id,
             )
             .await

@@ -1873,7 +1873,7 @@ impl AppConfig {
                     aifarm_use_tool_calls: parse_bool(
                         "DIALOG_AIFARM_USE_TOOL_CALLS",
                         raw.dialog_aifarm_use_tool_calls,
-                        false,
+                        true,
                     )?,
                     aifarm_max_tokens: parse_i32(
                         "DIALOG_AIFARM_MAX_TOKENS",

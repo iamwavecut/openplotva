@@ -100,6 +100,15 @@ pub fn sanitize_rich_html(input: &str) -> String {
     tokenizer.sink.finish()
 }
 
+/// Sanitize rich HTML and separate block-level rich elements with Telegram-visible blank lines.
+pub fn format_rich_html(input: &str) -> String {
+    let html = sanitize_rich_html(input);
+    if html.is_empty() {
+        return html;
+    }
+    add_rich_block_spacing(&html)
+}
+
 /// Return true when the input already conforms to the rich-message policy.
 pub fn is_valid_rich_html(input: &str) -> bool {
     sanitize_rich_html(input) == input.trim()
@@ -507,6 +516,88 @@ fn write_close_tag(out: &mut String, tag: &str) {
     out.push('>');
 }
 
+const SPACED_RICH_BLOCK_TAGS: &[&str] = &[
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "p",
+    "footer",
+    "blockquote",
+    "details",
+    "figure",
+    "table",
+    "ul",
+    "ol",
+    "audio",
+    "video",
+    "tg-slideshow",
+    "tg-collage",
+    "tg-math-block",
+    "tg-map",
+];
+const SPACED_RICH_VOID_BLOCK_TAGS: &[&str] = &["hr"];
+
+fn add_rich_block_spacing(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut i = 0;
+    while i < html.len() {
+        let Some((tag_end, closes_spaced_block)) = rich_tag_boundary(html, i) else {
+            let ch = html[i..].chars().next().expect("valid char boundary");
+            out.push(ch);
+            i += ch.len_utf8();
+            continue;
+        };
+
+        out.push_str(&html[i..tag_end]);
+        if closes_spaced_block {
+            let next = skip_ascii_space(html, tag_end);
+            if next < html.len() && !html[next..].starts_with("</") {
+                out.push_str("\n\n");
+                i = next;
+                continue;
+            }
+        }
+        i = tag_end;
+    }
+    out
+}
+
+fn rich_tag_boundary(html: &str, start: usize) -> Option<(usize, bool)> {
+    let rest = html.get(start..)?;
+    if !rest.starts_with('<') {
+        return None;
+    }
+    let end = start + rest.find('>')? + 1;
+    let body = html[start + 1..end - 1].trim();
+    if let Some(closing) = body.strip_prefix('/') {
+        let tag = closing.trim_start().split_whitespace().next()?;
+        return Some((end, SPACED_RICH_BLOCK_TAGS.contains(&tag)));
+    }
+    let tag = body
+        .trim_end_matches('/')
+        .trim_end()
+        .split_whitespace()
+        .next()?;
+    Some((
+        end,
+        body.ends_with('/') && SPACED_RICH_VOID_BLOCK_TAGS.contains(&tag),
+    ))
+}
+
+fn skip_ascii_space(value: &str, mut index: usize) -> usize {
+    while index < value.len() {
+        let byte = value.as_bytes()[index];
+        if !byte.is_ascii_whitespace() {
+            break;
+        }
+        index += 1;
+    }
+    index
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -632,6 +723,24 @@ mod tests {
         );
         assert_eq!(sanitize_rich_html("a<hr/>b"), "a<hr/>b");
         assert_eq!(sanitize_rich_html("a<br>b"), "a<br/>b");
+    }
+
+    #[test]
+    fn rich_formatter_separates_blocks_with_blank_lines() {
+        assert_eq!(
+            format_rich_html("<h3>Debug token</h3><p>body</p><footer>footer</footer>"),
+            "<h3>Debug token</h3>\n\n<p>body</p>\n\n<footer>footer</footer>"
+        );
+        assert_eq!(
+            format_rich_html("<h3>H</h3>\n<p>P</p><hr/>tail"),
+            "<h3>H</h3>\n\n<p>P</p>\n\n<hr/>\n\ntail"
+        );
+        assert_eq!(
+            format_rich_html(
+                r#"<tg-collage><img src="https://x.test/a.png"/><img src="https://x.test/b.png"/></tg-collage><p>done</p>"#
+            ),
+            "<tg-collage><img src=\"https://x.test/a.png\"/><img src=\"https://x.test/b.png\"/></tg-collage>\n\n<p>done</p>"
+        );
     }
 
     #[test]

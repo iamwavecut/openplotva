@@ -15,7 +15,8 @@ use carapax::types::{
 };
 use openplotva_dialog::{
     TOOL_RESULT_STATUS_EXECUTED, TOOL_RESULT_STATUS_FAILED, TOOL_RESULT_STATUS_NOOP,
-    TOOL_RESULT_STATUS_QUEUED, ToolContext, ToolError, ToolResult, ToolSideEffect,
+    TOOL_RESULT_STATUS_OK, TOOL_RESULT_STATUS_QUEUED, ToolContext, ToolError, ToolResult,
+    ToolSideEffect,
 };
 use openplotva_telegram::{
     ChatRef, DispatcherQueue, OutboundBuildError, ReplyMessageRef, TELEGRAM_PARSE_MODE_HTML,
@@ -125,6 +126,15 @@ impl MarketRatesClient {
                 message: "unknown rate alias".to_owned(),
             });
         }
+        for pair in selection.pairs {
+            match self.fetch_cbr_pair_quote(&pair).await {
+                Ok(row) => snapshot.rows.push(row),
+                Err(error) => snapshot.errors.push(RatesFetchProblem {
+                    label: pair.label(),
+                    message: error.to_string(),
+                }),
+            }
+        }
         for id in selection.ids {
             let Some(instrument) = rate_instrument(&id) else {
                 snapshot.errors.push(RatesFetchProblem {
@@ -142,6 +152,43 @@ impl MarketRatesClient {
             }
         }
         Ok(snapshot)
+    }
+
+    async fn fetch_cbr_pair_quote(
+        &self,
+        pair: &RatePairSelection,
+    ) -> Result<RateQuote, MarketRatesError> {
+        let base = self.cbr_or_rub_rate(&pair.base).await?;
+        let quote = self.cbr_or_rub_rate(&pair.quote).await?;
+        if quote.value == 0.0 {
+            return Err(MarketRatesError::RateNotFound);
+        }
+        Ok(RateQuote {
+            id: pair.id(),
+            label: pair.label(),
+            value: base.value / quote.value,
+            precision: if pair.quote == "RUB" { 2 } else { 4 },
+            unit: if pair.quote == "RUB" {
+                "₽".to_owned()
+            } else {
+                pair.quote.clone()
+            },
+            delta: None,
+            source: "cbr_cross".to_owned(),
+            timestamp: base.date.or(quote.date),
+            stale: base.stale || quote.stale,
+        })
+    }
+
+    async fn cbr_or_rub_rate(&self, code: &str) -> Result<CbrRate, MarketRatesError> {
+        if code.eq_ignore_ascii_case("RUB") {
+            return Ok(CbrRate {
+                value: 1.0,
+                date: None,
+                stale: false,
+            });
+        }
+        self.cbr_rate(code).await
     }
 
     async fn fetch_instrument(
@@ -572,7 +619,36 @@ struct RateInstrument {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RatesSelection {
     pub ids: Vec<String>,
+    pub pairs: Vec<RatePairSelection>,
     pub unknown: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RatePairSelection {
+    pub base: String,
+    pub quote: String,
+}
+
+impl RatePairSelection {
+    #[must_use]
+    pub fn new(base: &str, quote: &str) -> Self {
+        Self {
+            base: base.trim().to_ascii_uppercase(),
+            quote: quote.trim().to_ascii_uppercase(),
+        }
+    }
+
+    fn id(&self) -> String {
+        format!(
+            "{}_{}",
+            self.base.to_ascii_lowercase(),
+            self.quote.to_ascii_lowercase()
+        )
+    }
+
+    fn label(&self) -> String {
+        format!("💱 {}/{}", self.base, self.quote)
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -621,6 +697,7 @@ pub fn parse_rates_selection(raw: &str) -> RatesSelection {
         .replace("S&P500", "sp500")
         .replace("s&p500", "sp500");
     let mut ids = Vec::new();
+    let mut pairs = Vec::new();
     let mut unknown = Vec::new();
     for token in normalized
         .split(|ch: char| ch.is_whitespace() || matches!(ch, ',' | ';' | '\n'))
@@ -630,17 +707,41 @@ pub fn parse_rates_selection(raw: &str) -> RatesSelection {
         if ignored_rate_alias(&token) {
             continue;
         }
-        match rate_alias_to_id(&token) {
-            Some(id) if !ids.iter().any(|existing| existing == id) => ids.push(id.to_owned()),
-            Some(_) => {}
-            None if explicit => unknown.push(token),
-            None => {}
+        if let Some(pair) = cbr_pair_alias(&token) {
+            if !pairs.iter().any(|existing| existing == &pair) {
+                pairs.push(pair);
+            }
+            continue;
+        }
+        if let Some(id) = rate_alias_to_id(&token) {
+            if !ids.iter().any(|existing| existing == id) {
+                ids.push(id.to_owned());
+            }
+            continue;
+        }
+        if let Some(code) = cbr_quote_alias(&token) {
+            for pair in [
+                RatePairSelection::new("USD", &code),
+                RatePairSelection::new("EUR", &code),
+            ] {
+                if !pairs.iter().any(|existing| existing == &pair) {
+                    pairs.push(pair);
+                }
+            }
+            continue;
+        }
+        if explicit {
+            unknown.push(token);
         }
     }
-    if ids.is_empty() && unknown.is_empty() {
+    if ids.is_empty() && pairs.is_empty() && unknown.is_empty() {
         ids.extend(DEFAULT_RATE_IDS.iter().map(|id| (*id).to_owned()));
     }
-    RatesSelection { ids, unknown }
+    RatesSelection {
+        ids,
+        pairs,
+        unknown,
+    }
 }
 
 fn normalize_rate_alias(raw: &str) -> String {
@@ -697,6 +798,46 @@ fn rate_alias_to_id(token: &str) -> Option<&'static str> {
         "spcx" | "spacex" => Some("spcx"),
         "cny" | "yuan" | "юань" | "юаня" | "cny/rub" | "cnyrub" => Some("cny_rub"),
         _ => None,
+    }
+}
+
+fn cbr_pair_alias(token: &str) -> Option<RatePairSelection> {
+    let (base, quote) = token.split_once('/')?;
+    Some(RatePairSelection::new(
+        &supported_cbr_code(base)?,
+        &supported_cbr_code(quote)?,
+    ))
+}
+
+fn cbr_quote_alias(token: &str) -> Option<String> {
+    let code = supported_cbr_code(token)?;
+    if code == "RUB" || code == "USD" || code == "EUR" {
+        return None;
+    }
+    Some(code)
+}
+
+fn supported_cbr_code(token: &str) -> Option<String> {
+    let code = token.trim().to_ascii_uppercase();
+    if matches!(
+        code.as_str(),
+        "RUB"
+            | "USD"
+            | "EUR"
+            | "CNY"
+            | "AMD"
+            | "AZN"
+            | "BYN"
+            | "KGS"
+            | "KZT"
+            | "MDL"
+            | "TJS"
+            | "TMT"
+            | "UZS"
+    ) {
+        Some(code)
+    } else {
+        None
     }
 }
 
@@ -1486,15 +1627,13 @@ where
         })
 }
 
-pub async fn currency_rates_tool<Fetcher, Dispatcher>(
+pub async fn currency_rates_tool<Fetcher>(
     fetcher: Option<&Fetcher>,
-    dispatcher: &Dispatcher,
     meta: &ToolContext,
     pairs: &str,
 ) -> ToolResult
 where
     Fetcher: RatesFetcher + Sync,
-    Dispatcher: RatesSideEffectDispatcher + Sync,
 {
     let Some(fetcher) = fetcher else {
         return ToolResult::failed("currency_rates_unavailable", "rates service unavailable");
@@ -1507,14 +1646,32 @@ where
     }
 
     let text = format_dialog_rates_message(&snapshot);
-    let html = format_rates_command_message("Курсы", &snapshot);
-    match dispatcher
-        .dispatch_rates(dialog_rates_tool_context(meta), html)
-        .await
-    {
-        Ok(dispatch) => dialog_rates_queued_result(&text, &dispatch),
-        Err(error) => dialog_rates_dispatch_failure_result(&text, &error),
+    let _ = meta;
+    ToolResult {
+        status: TOOL_RESULT_STATUS_OK.to_owned(),
+        message: text.clone(),
+        no_reply: false,
+        side_effect: None,
+        data: Some(json!({
+            "rates_text": text,
+            "rows": snapshot.rows.iter().map(dialog_rate_row_json).collect::<Vec<_>>(),
+            "errors": errors,
+        })),
+        error: None,
     }
+}
+
+fn dialog_rate_row_json(row: &RateQuote) -> serde_json::Value {
+    json!({
+        "id": row.id.clone(),
+        "label": row.label.clone(),
+        "value": row.value,
+        "formatted": format_rate_quote_value(row),
+        "delta": row.delta.map(format_rate_quote_delta).unwrap_or_default(),
+        "source": row.source.clone(),
+        "timestamp": row.timestamp.clone(),
+        "stale": row.stale,
+    })
 }
 
 #[must_use]
@@ -1950,37 +2107,20 @@ mod tests {
         let dispatcher = DispatcherStub::default();
         let meta = tool_context();
 
-        let result = currency_rates_tool(
-            Some(&RatesFetcherStub::successful()),
-            &dispatcher,
-            &meta,
-            "",
-        )
-        .await;
+        let result = currency_rates_tool(Some(&RatesFetcherStub::successful()), &meta, "").await;
 
-        assert_eq!(result.status, TOOL_RESULT_STATUS_QUEUED);
-        assert!(result.no_reply);
+        assert_eq!(result.status, TOOL_RESULT_STATUS_OK);
+        assert!(!result.no_reply);
+        assert!(result.side_effect.is_none());
         assert!(result.message.contains("💵 USD/RUB=90.00 ₽ (+1.1%)"));
         assert!(result.message.contains("₿ BTC/USD=65000 $"));
         assert_eq!(
-            result.data,
-            Some(json!({
-                "rates_text": result.message,
-                "dispatch": {
-                    "kind": "rates_message",
-                    "ticket_id": "ticket-1",
-                    "state": "queued",
-                },
-            }))
+            result.data.as_ref().expect("data")["rates_text"],
+            result.message
         );
-        let calls = dispatcher.calls();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0.mode, "multi_turn");
-        assert_eq!(calls[0].0.thread_id, Some(9));
-        assert!(calls[0].1.contains("<table"));
-        assert!(calls[0].1.contains("💵 USD/RUB"));
+        assert_eq!(dispatcher.calls().len(), 0);
 
-        let missing = currency_rates_tool(None::<&RatesFetcherStub>, &dispatcher, &meta, "").await;
+        let missing = currency_rates_tool(None::<&RatesFetcherStub>, &meta, "").await;
         assert_eq!(
             missing,
             ToolResult::failed("currency_rates_unavailable", "rates service unavailable")
@@ -1993,7 +2133,6 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let result = currency_rates_tool(
             Some(&RatesFetcherStub::failing_btc()),
-            &DispatcherStub::default(),
             &tool_context(),
             "btc",
         )
@@ -2043,6 +2182,38 @@ mod tests {
         assert_eq!(parse_rates_selection("wat").unknown, vec!["wat".to_owned()]);
     }
 
+    #[test]
+    fn rates_selection_supports_cbr_cis_quote_and_pairs() {
+        let byn = parse_rates_selection("BYN");
+        assert!(byn.ids.is_empty());
+        assert_eq!(
+            byn.pairs,
+            vec![
+                RatePairSelection::new("USD", "BYN"),
+                RatePairSelection::new("EUR", "BYN"),
+            ]
+        );
+        assert!(byn.unknown.is_empty());
+
+        for code in [
+            "AMD", "AZN", "BYN", "KGS", "KZT", "MDL", "TJS", "TMT", "UZS",
+        ] {
+            let selection = parse_rates_selection(code);
+            assert_eq!(selection.pairs[0], RatePairSelection::new("USD", code));
+            assert_eq!(selection.pairs[1], RatePairSelection::new("EUR", code));
+        }
+
+        assert_eq!(
+            parse_rates_selection("USD/BYN").pairs,
+            vec![RatePairSelection::new("USD", "BYN")]
+        );
+        assert_eq!(
+            parse_rates_selection("BYN/USD").pairs,
+            vec![RatePairSelection::new("BYN", "USD")]
+        );
+        assert_eq!(parse_rates_selection("XYZ").unknown, vec!["xyz".to_owned()]);
+    }
+
     #[tokio::test]
     async fn market_rates_client_parses_yahoo_chart_and_uses_cache()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -2075,6 +2246,35 @@ mod tests {
         assert_eq!(snapshot.rows[0].label, "🇨🇳 CNY/RUB");
         assert_eq!(snapshot.rows[0].value, 10.5);
         assert_eq!(snapshot.rows[0].timestamp.as_deref(), Some("19.06.2026"));
+        let requests = server
+            .join()
+            .map_err(|_| io::Error::other("market fixture server panicked"))??;
+        assert_eq!(requests, vec!["/cbr".to_owned()]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn market_rates_client_fetches_cbr_cross_pairs() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (urls, server) = spawn_market_fixture_server(vec![FixtureResponse::ok(cbr_fixture())])?;
+        let client = market_test_client(urls)?;
+
+        let byn = fetch_dialog_rates(&client, parse_rates_selection("BYN")).await;
+        assert_eq!(
+            byn.rows
+                .iter()
+                .map(|row| row.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["💱 USD/BYN", "💱 EUR/BYN"]
+        );
+        assert_eq!(byn.rows[0].value, 3.0);
+        assert!((byn.rows[1].value - 100.0 / 30.0).abs() < 0.0001);
+
+        let pair = fetch_dialog_rates(&client, parse_rates_selection("BYN/USD")).await;
+        assert_eq!(pair.rows[0].label, "💱 BYN/USD");
+        assert!((pair.rows[0].value - 30.0 / 90.0).abs() < 0.0001);
+        assert!(pair.errors.is_empty());
+
         let requests = server
             .join()
             .map_err(|_| io::Error::other("market fixture server panicked"))??;
@@ -2386,7 +2586,7 @@ mod tests {
     }
 
     fn cbr_fixture() -> &'static str {
-        r#"<ValCurs Date="19.06.2026" name="Foreign Currency Market"><Valute ID="R01375"><NumCode>156</NumCode><CharCode>CNY</CharCode><Nominal>1</Nominal><Name>Юань</Name><Value>10,5000</Value><VunitRate>10,5000</VunitRate></Valute></ValCurs>"#
+        r#"<ValCurs Date="19.06.2026" name="Foreign Currency Market"><Valute ID="R01235"><CharCode>USD</CharCode><Nominal>1</Nominal><Name>Dollar</Name><Value>90,0000</Value></Valute><Valute ID="R01239"><CharCode>EUR</CharCode><Nominal>1</Nominal><Name>Euro</Name><Value>100,0000</Value></Valute><Valute ID="R01090B"><CharCode>BYN</CharCode><Nominal>1</Nominal><Name>Belarusian ruble</Name><Value>30,0000</Value></Valute><Valute ID="R01060"><CharCode>AMD</CharCode><Nominal>100</Nominal><Name>Armenian dram</Name><Value>23,0000</Value></Valute><Valute ID="R01020A"><CharCode>AZN</CharCode><Nominal>1</Nominal><Name>Azerbaijani manat</Name><Value>53,0000</Value></Valute><Valute ID="R01370"><CharCode>KGS</CharCode><Nominal>10</Nominal><Name>Kyrgyz som</Name><Value>10,0000</Value></Valute><Valute ID="R01335"><CharCode>KZT</CharCode><Nominal>100</Nominal><Name>Kazakhstani tenge</Name><Value>18,0000</Value></Valute><Valute ID="R01500"><CharCode>MDL</CharCode><Nominal>10</Nominal><Name>Moldovan leu</Name><Value>50,0000</Value></Valute><Valute ID="R01670"><CharCode>TJS</CharCode><Nominal>10</Nominal><Name>Tajikistani somoni</Name><Value>85,0000</Value></Valute><Valute ID="R01710A"><CharCode>TMT</CharCode><Nominal>1</Nominal><Name>Turkmen manat</Name><Value>25,0000</Value></Valute><Valute ID="R01717"><CharCode>UZS</CharCode><Nominal>10000</Nominal><Name>Uzbekistani sum</Name><Value>70,0000</Value></Valute><Valute ID="R01375"><CharCode>CNY</CharCode><Nominal>1</Nominal><Name>Yuan</Name><Value>10,5000</Value><VunitRate>10,5000</VunitRate></Valute></ValCurs>"#
     }
 
     type VirtualInsertCalls = Arc<Mutex<Vec<(String, i64, Option<i32>)>>>;

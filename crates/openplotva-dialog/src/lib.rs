@@ -1973,7 +1973,6 @@ fn normalize_and_validate_step(mut step: ToolStep) -> Result<ToolStep, ToolParse
     if !is_known_step(&step.step) {
         return Err(ToolParseError::new(format!("unknown step {:?}", step.step)));
     }
-    validate_required_step_arguments(&step)?;
     if step_contains_protocol_sentinel_argument(&step) {
         return Err(ToolParseError::new(format!(
             "{} tool argument contains protocol sentinel",
@@ -1981,25 +1980,6 @@ fn normalize_and_validate_step(mut step: ToolStep) -> Result<ToolStep, ToolParse
         )));
     }
     Ok(step)
-}
-
-fn validate_required_step_arguments(step: &ToolStep) -> Result<(), ToolParseError> {
-    match step.step.as_str() {
-        STEP_DRAW_IMAGE => require_step_argument(&step.step, "prompt", &step.prompt),
-        STEP_GENERATE_SONG => require_step_argument(&step.step, "topic", &step.topic),
-        STEP_WEB_SEARCH => require_step_argument(&step.step, "query", &step.query),
-        STEP_CRAWL_URL => require_step_argument(&step.step, "url", &step.url),
-        STEP_YOUTUBE_SUMMARY => require_step_argument(&step.step, "video", &step.video),
-        STEP_TRANSLATE_TEXT => require_step_argument(&step.step, "text", &step.text),
-        _ => Ok(()),
-    }
-}
-
-fn require_step_argument(step: &str, name: &str, value: &str) -> Result<(), ToolParseError> {
-    if value.trim().is_empty() {
-        return Err(ToolParseError::new(format!("{step} {name} is empty")));
-    }
-    Ok(())
 }
 
 fn step_contains_protocol_sentinel_argument(step: &ToolStep) -> bool {

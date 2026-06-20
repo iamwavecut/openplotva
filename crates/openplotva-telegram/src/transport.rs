@@ -9,7 +9,7 @@ use carapax::{
     },
 };
 
-use crate::{DispatcherSendStatus, RichApiClient, RichApiError, SendRichMessage};
+use crate::{DispatcherSendStatus, RichApiClient, RichApiError, SendRichMessage, format_rich_html};
 
 /// Concrete outbound Telegram methods currently queued by the Rust dispatcher.
 #[derive(Debug)]
@@ -355,11 +355,13 @@ pub async fn execute_telegram_method_with_rich(
     method: TelegramOutboundMethod,
 ) -> Result<TelegramOutboundResponse, TelegramOutboundExecuteError> {
     match method {
-        TelegramOutboundMethod::SendRichMessage(method) => rich
-            .send_rich_message_request(&method)
-            .await
-            .map(|message| TelegramOutboundResponse::Message(Box::new(message)))
-            .map_err(TelegramOutboundExecuteError::from),
+        TelegramOutboundMethod::SendRichMessage(mut method) => {
+            method.html = format_rich_html(&method.html);
+            rich.send_rich_message_request(&method)
+                .await
+                .map(|message| TelegramOutboundResponse::Message(Box::new(message)))
+                .map_err(TelegramOutboundExecuteError::from)
+        }
         method => execute_telegram_method(client, method)
             .await
             .map_err(TelegramOutboundExecuteError::from),

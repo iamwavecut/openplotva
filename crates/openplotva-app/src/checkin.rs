@@ -23,7 +23,7 @@ use openplotva_telegram::{
     ChatRef, DispatcherConfig, DispatcherQueue, InlineKeyboardMarkup, OutboundBuildError,
     ReplyMarkup, ReplyMessageRef, RichMessageRequest, TELEGRAM_PARSE_MODE_HTML,
     TelegramOutboundMethod, TextMessageRequest, build_checkin_theme_selection_keyboard,
-    sanitize_rich_html,
+    format_rich_html,
 };
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -640,7 +640,7 @@ impl CheckinGameSender for TelegramCheckinGameSender {
                 .edit_message_text_rich(
                     reply_to.chat_id,
                     i64::from(message_id),
-                    &sanitize_rich_html(&html),
+                    &format_rich_html(&html),
                     None,
                 )
                 .await
