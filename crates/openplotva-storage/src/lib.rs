@@ -408,7 +408,7 @@ fn memory_enqueue_remaining_capacity(
 ) -> Option<i32> {
     let policy = policy.normalized();
     let enqueued_today = i64::try_from(enqueued_today).unwrap_or(i64::MAX);
-    let queue_capacity = i64::from(policy.max_queued_runs) - active_queue_depth - enqueued_today;
+    let queue_capacity = i64::from(policy.max_queued_runs) - active_queue_depth;
     let daily_capacity = i64::from(policy.max_daily_enqueued_runs) - enqueued_today;
     let remaining = queue_capacity.min(daily_capacity);
     (remaining > 0).then(|| i32::try_from(remaining).unwrap_or(i32::MAX))
@@ -929,6 +929,9 @@ pub const SQL_RETRY_MEMORY_RUN: &str = "UPDATE memory_runs SET status = 'queued'
 pub const SQL_RETRY_FAILED_MEMORY_RUNS: &str = "UPDATE memory_runs SET status = 'queued', lease_owner = '', leased_until = NULL, attempts = 0, error = '', updated_at = CURRENT_TIMESTAMP WHERE status = 'failed'";
 
 pub const SQL_COUNT_ACTIVE_MEMORY_RUNS: &str = "SELECT count(*)::bigint FROM memory_runs WHERE prompt_version = $1 AND status IN ('queued', 'processing')";
+
+pub const SQL_COUNT_MEMORY_RUNS_CREATED_SINCE: &str =
+    "SELECT count(*)::bigint FROM memory_runs WHERE prompt_version = $1 AND created_at >= $2";
 
 pub const SQL_RECORD_MEMORY_ENQUEUE_BACKPRESSURE: &str = r#"WITH dims AS (
     SELECT jsonb_build_object(
@@ -4690,7 +4693,8 @@ impl PostgresMemoryStore {
         let mut day_start = earliest.date().midnight().assume_utc();
         let mut total = 0;
         let active_queue_depth = self.active_memory_run_count().await?;
-        if memory_enqueue_remaining_capacity(policy, active_queue_depth, total).is_none() {
+        let enqueued_today = self.memory_run_count_created_since(day_end).await?;
+        if memory_enqueue_remaining_capacity(policy, active_queue_depth, enqueued_today).is_none() {
             self.record_memory_enqueue_backpressure(day_start, day_end, active_queue_depth, policy)
                 .await?;
             self.skip_superseded_runs().await?;
@@ -4698,8 +4702,11 @@ impl PostgresMemoryStore {
         }
         while day_start < day_end {
             let next_day = day_start + time::Duration::days(1);
-            let Some(limit) = memory_enqueue_remaining_capacity(policy, active_queue_depth, total)
-            else {
+            let Some(limit) = memory_enqueue_remaining_capacity(
+                policy,
+                active_queue_depth,
+                enqueued_today.saturating_add(total),
+            ) else {
                 break;
             };
             self.record_memory_enqueue_rollups(
@@ -4725,6 +4732,18 @@ impl PostgresMemoryStore {
             .bind(openplotva_memory::PROMPT_VERSION)
             .fetch_one(&self.pool)
             .await?)
+    }
+
+    async fn memory_run_count_created_since(
+        &self,
+        created_since: OffsetDateTime,
+    ) -> Result<u64, StorageError> {
+        let count: i64 = sqlx::query_scalar(SQL_COUNT_MEMORY_RUNS_CREATED_SINCE)
+            .bind(openplotva_memory::PROMPT_VERSION)
+            .bind(created_since)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(u64::try_from(count).unwrap_or(u64::MAX))
     }
 
     async fn record_memory_enqueue_backpressure(
@@ -8107,6 +8126,7 @@ mod tests {
                 .contains("WHEN COALESCE(c.is_forum, false) AND e.thread_id <> 0")
         );
         assert!(super::SQL_COUNT_ACTIVE_MEMORY_RUNS.contains("status IN ('queued', 'processing')"));
+        assert!(super::SQL_COUNT_MEMORY_RUNS_CREATED_SINCE.contains("created_at >= $2"));
         assert!(super::SQL_RECORD_MEMORY_ENQUEUE_ROLLUPS.contains("message_count_bucket"));
         assert!(super::SQL_RECORD_MEMORY_ENQUEUE_ROLLUPS.contains("'below_threshold'"));
         assert!(super::SQL_RECORD_MEMORY_ENQUEUE_BACKPRESSURE.contains("'backpressure'"));
@@ -8152,6 +8172,14 @@ mod tests {
         );
         assert_eq!(
             super::memory_enqueue_remaining_capacity(policy, 4_900, 100),
+            Some(100)
+        );
+        assert_eq!(
+            super::memory_enqueue_remaining_capacity(policy, 0, 1_999),
+            Some(1)
+        );
+        assert_eq!(
+            super::memory_enqueue_remaining_capacity(policy, 0, 2_000),
             None
         );
         assert_eq!(
