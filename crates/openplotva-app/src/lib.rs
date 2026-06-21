@@ -9357,6 +9357,10 @@ async fn start_runtime_workers(
     .with_image_scheduler(dialog_tool_adapter.clone())
     .with_song_scheduler(dialog_tool_adapter.clone())
     .with_vision_describer(dialog_tool_vision);
+    let dialog_history_searcher: Arc<dyn agent_runtime::HistorySearcher> = Arc::new(
+        agent_runtime::PostgresHistorySearch::new(history_store.clone()),
+    );
+    app_dialog_toolbox = app_dialog_toolbox.with_history_searcher(dialog_history_searcher);
     if let Some(history_summarizer) = history_summarizer {
         app_dialog_toolbox = app_dialog_toolbox.with_history_summarizer(history_summarizer);
     }

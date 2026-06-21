@@ -9,12 +9,12 @@ use std::{
 
 use openplotva_core::{ChatAttachment, ChatMessageMeta, SENDER_TYPE_USER};
 use openplotva_dialog::{
-    DialogToolbox, DrawRequest, HistorySummaryRequest, IMAGE_GENERATION_NOT_SCHEDULED_MESSAGE,
-    RatesRequest, SONG_GENERATION_NOT_SCHEDULED_MESSAGE, SongRequest, TOOL_RESULT_STATUS_EXECUTED,
-    TOOL_RESULT_STATUS_FAILED, TOOL_RESULT_STATUS_NOOP, TOOL_RESULT_STATUS_OK,
-    TOOL_RESULT_STATUS_QUEUED, ToolError, ToolResult, ToolSideEffect, ToolboxError, ToolboxFuture,
-    VisionRequest, is_internal_not_scheduled_instruction, sanitize_tool_text,
-    user_facing_not_scheduled_message,
+    DialogToolbox, DrawRequest, HistorySearchRequest, HistorySummaryRequest,
+    IMAGE_GENERATION_NOT_SCHEDULED_MESSAGE, RatesRequest, SONG_GENERATION_NOT_SCHEDULED_MESSAGE,
+    SongRequest, TOOL_RESULT_STATUS_EXECUTED, TOOL_RESULT_STATUS_FAILED, TOOL_RESULT_STATUS_NOOP,
+    TOOL_RESULT_STATUS_OK, TOOL_RESULT_STATUS_QUEUED, ToolError, ToolResult, ToolSideEffect,
+    ToolboxError, ToolboxFuture, VisionRequest, is_internal_not_scheduled_instruction,
+    sanitize_tool_text, user_facing_not_scheduled_message,
 };
 use openplotva_history::{StoredSummary, SummaryContent};
 use openplotva_taskman::{
@@ -27,7 +27,7 @@ use serde_json::json;
 use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 
 use crate::{
-    agent_runtime::AgenticWebSearch,
+    agent_runtime::{AgenticWebSearch, HistorySearcher},
     permissions::{ChatPermissionPolicy, ChatPermissionStore},
     rate_limits::TaskEnqueueRateLimit,
     rates::{RatesFetcher, RatesSideEffectDispatcher, currency_rates_tool},
@@ -1788,6 +1788,7 @@ pub struct AppDialogToolbox<RatesFetcherT, RatesDispatcherT, TranslatorT> {
     song_scheduler: Option<Arc<dyn SongScheduler>>,
     vision_describer: Option<Arc<dyn VisionDescriber>>,
     history_summarizer: Option<Arc<dyn ChatHistorySummarizer>>,
+    history_searcher: Option<Arc<dyn HistorySearcher>>,
 }
 
 impl<RatesFetcherT, RatesDispatcherT, TranslatorT>
@@ -1813,6 +1814,7 @@ impl<RatesFetcherT, RatesDispatcherT, TranslatorT>
             song_scheduler: None,
             vision_describer: None,
             history_summarizer: None,
+            history_searcher: None,
         }
     }
 
@@ -1887,6 +1889,12 @@ impl<RatesFetcherT, RatesDispatcherT, TranslatorT>
         history_summarizer: Arc<dyn ChatHistorySummarizer>,
     ) -> Self {
         self.history_summarizer = Some(history_summarizer);
+        self
+    }
+
+    #[must_use]
+    pub fn with_history_searcher(mut self, history_searcher: Arc<dyn HistorySearcher>) -> Self {
+        self.history_searcher = Some(history_searcher);
         self
     }
 }
@@ -2096,6 +2104,28 @@ where
         })
     }
 
+    fn history_search<'a>(&'a self, req: HistorySearchRequest) -> ToolboxFuture<'a> {
+        Box::pin(async move {
+            let Some(searcher) = self.history_searcher.as_deref() else {
+                return Ok(ToolResult::failed(
+                    "history_search_unavailable",
+                    "history search is not configured",
+                ));
+            };
+            let query = sanitize_tool_text(&req.query);
+            match searcher
+                .search(req.context.chat_id, req.context.thread_id, query.clone())
+                .await
+            {
+                Ok(results) => Ok(dialog_history_search_tool_result(&query, &results)),
+                Err(error) => Ok(ToolResult::failed(
+                    "history_search_failed",
+                    error.to_string(),
+                )),
+            }
+        })
+    }
+
     fn queue_status<'a>(&'a self, user_id: i64) -> ToolboxFuture<'a> {
         Box::pin(async move {
             let Some(provider) = self.queue_status.as_deref() else {
@@ -2246,6 +2276,20 @@ fn dialog_chat_history_summary_tool_result(result: &ChatHistorySummaryResult) ->
             "summary_html": result.summary_html,
             "summary_json": result.summary_json,
             "model": result.model,
+        })),
+        error: None,
+    }
+}
+
+fn dialog_history_search_tool_result(query: &str, results: &str) -> ToolResult {
+    ToolResult {
+        status: TOOL_RESULT_STATUS_OK.to_owned(),
+        message: "history search results ready".to_owned(),
+        no_reply: false,
+        side_effect: None,
+        data: Some(json!({
+            "query": query,
+            "results": results,
         })),
         error: None,
     }
@@ -2695,6 +2739,48 @@ mod tests {
                 self.result
                     .clone()
                     .map_err(|message| Box::new(TestError(message)) as ToolboxError)
+            };
+            Box::pin(async move { result })
+        }
+    }
+
+    #[derive(Debug)]
+    struct HistorySearchStub {
+        result: Result<String, String>,
+        calls: Mutex<Vec<(i64, Option<i32>, String)>>,
+    }
+
+    impl HistorySearchStub {
+        fn successful(result: impl Into<String>) -> Self {
+            Self {
+                result: Ok(result.into()),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<(i64, Option<i32>, String)> {
+            match self.calls.lock() {
+                Ok(calls) => calls.clone(),
+                Err(err) => panic!("history search calls poisoned: {err}"),
+            }
+        }
+    }
+
+    impl HistorySearcher for HistorySearchStub {
+        fn search<'a>(
+            &'a self,
+            chat_id: i64,
+            thread_id: Option<i32>,
+            query: String,
+        ) -> crate::agent_runtime::ContextSearchFuture<'a> {
+            let result = {
+                match self.calls.lock() {
+                    Ok(mut calls) => calls.push((chat_id, thread_id, query)),
+                    Err(err) => panic!("history search calls poisoned: {err}"),
+                }
+                self.result
+                    .clone()
+                    .map_err(openplotva_agent::AgentError::ToolDispatch)
             };
             Box::pin(async move { result })
         }
@@ -3306,6 +3392,37 @@ mod tests {
             }))
         );
         assert_eq!(searcher.calls(), vec!["cats"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn app_dialog_toolbox_formats_history_search_result() -> Result<(), ToolboxError> {
+        let searcher = Arc::new(HistorySearchStub::successful("- Cherry: hello"));
+        let toolbox = toolbox(Some(TranslatorStub {
+            result: Ok("ignored".to_owned()),
+        }))
+        .with_history_searcher(searcher.clone());
+
+        let result = toolbox
+            .history_search(HistorySearchRequest {
+                context: context(),
+                query: "  CherryCherry123  ".to_owned(),
+            })
+            .await?;
+
+        assert_eq!(result.status, TOOL_RESULT_STATUS_OK);
+        assert_eq!(result.message, "history search results ready");
+        assert_eq!(
+            result.data,
+            Some(json!({
+                "query": "CherryCherry123",
+                "results": "- Cherry: hello",
+            }))
+        );
+        assert_eq!(
+            searcher.calls(),
+            vec![(-100, Some(7), "CherryCherry123".to_owned())]
+        );
         Ok(())
     }
 

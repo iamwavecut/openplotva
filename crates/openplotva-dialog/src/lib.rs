@@ -272,6 +272,15 @@ pub struct HistorySummaryRequest {
     pub scope: String,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct HistorySearchRequest {
+    /// Tool context.
+    pub context: ToolContext,
+    /// Keyword query for chat history search.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub query: String,
+}
+
 /// Dialog toolbox error.
 #[derive(Debug)]
 pub struct DialogToolboxError {
@@ -355,6 +364,11 @@ pub trait DialogToolbox: Send + Sync {
     /// Chat history summary tool.
     fn chat_history_summary<'a>(&'a self, _req: HistorySummaryRequest) -> ToolboxFuture<'a> {
         unsupported_tool_future(STEP_CHAT_HISTORY_SUMMARY)
+    }
+
+    /// Chat history keyword search tool.
+    fn history_search<'a>(&'a self, _req: HistorySearchRequest) -> ToolboxFuture<'a> {
+        unsupported_tool_future(STEP_HISTORY_SEARCH)
     }
 }
 
@@ -679,7 +693,7 @@ pub fn alternative_dialog_tools() -> Vec<ToolSpec> {
 /// Tools exposed only to the reasoning agent (via an explicit allow-list), not to
 /// the conversational model. Kept in the catalog so the agent can resolve their
 /// schemas, but filtered out of the conversational tool list.
-pub const AGENT_ONLY_TOOL_NAMES: &[&str] = &[STEP_HISTORY_SEARCH, STEP_MEMORY_SEARCH];
+pub const AGENT_ONLY_TOOL_NAMES: &[&str] = &[STEP_MEMORY_SEARCH];
 
 #[must_use]
 pub fn alternative_dialog_tool_names() -> Vec<&'static str> {
@@ -1588,6 +1602,9 @@ fn parse_xmlish_tool_call_step(raw: &str) -> Result<(ToolStep, bool), ToolParseE
     if let Some(call) = xmlish_tool_attr(&tag, "call") {
         return parse_bare_tool_call_step(&call);
     }
+    if let Some(step) = parse_xmlish_tool_attrs(&tag)? {
+        return Ok((step, true));
+    }
     let trimmed = tag.trim();
     if trimmed.starts_with("<tool:") {
         let payload = trimmed
@@ -1604,19 +1621,23 @@ fn parse_xmlish_tool_call_step(raw: &str) -> Result<(ToolStep, bool), ToolParseE
         }
         return parse_bare_tool_call_step(&payload);
     }
-    let Some(name) = xmlish_tool_attr(&tag, "name") else {
-        return Ok((ToolStep::default(), false));
+    Ok((ToolStep::default(), false))
+}
+
+fn parse_xmlish_tool_attrs(tag: &str) -> Result<Option<ToolStep>, ToolParseError> {
+    let Some(name) = xmlish_tool_attr(tag, "name") else {
+        return Ok(None);
     };
     let name = name.trim();
     if !is_known_step(name) {
-        return Ok((ToolStep::default(), false));
+        return Ok(None);
     }
     let mut step = ToolStep {
         step: name.to_owned(),
         ..ToolStep::default()
     };
-    populate_xmlish_tool_attrs(&tag, &mut step);
-    normalize_and_validate_step(step).map(|step| (step, true))
+    populate_xmlish_tool_attrs(tag, &mut step)?;
+    normalize_and_validate_step(step).map(Some)
 }
 
 fn first_xmlish_tool_tag(raw: &str) -> Option<String> {
@@ -1752,8 +1773,15 @@ fn find_inline_tool_call_start(raw: &str) -> Option<(usize, usize)> {
         .min_by_key(|(idx, _)| *idx)
 }
 
-fn populate_xmlish_tool_attrs(tag: &str, step: &mut ToolStep) {
+fn populate_xmlish_tool_attrs(tag: &str, step: &mut ToolStep) -> Result<(), ToolParseError> {
     populate_tool_args(|key| xmlish_tool_attr(tag, key), step);
+    if let Some(arg) = xmlish_tool_attr(tag, "arg") {
+        populate_jsonish_or_inline_args(&arg, step)?;
+    }
+    if let Some(args) = xmlish_tool_attr(tag, "args") {
+        populate_jsonish_or_inline_args(&args, step)?;
+    }
+    Ok(())
 }
 
 fn populate_inline_tool_args(args: &str, step: &mut ToolStep) {
@@ -2051,6 +2079,7 @@ mod tests {
                 STEP_CURRENCY_RATES,
                 STEP_WEB_SEARCH,
                 STEP_CRAWL_URL,
+                STEP_HISTORY_SEARCH,
                 STEP_YOUTUBE_SUMMARY,
                 STEP_QUEUE_STATUS,
                 STEP_CANCEL_DRAWING,
@@ -2303,6 +2332,24 @@ mod tests {
                 ToolStep {
                     step: STEP_WEB_SEARCH.to_owned(),
                     query: "weather St. Petersburg June 2026 forecast".to_owned(),
+                    ..ToolStep::default()
+                },
+                "xmlish",
+            ),
+            (
+                "<tool_calls>\n  <tool_call name=\"history_search\" arg=\"query: CherryCherry123\"></tool_call>\n</tool_calls>".to_owned(),
+                ToolStep {
+                    step: STEP_HISTORY_SEARCH.to_owned(),
+                    query: "CherryCherry123".to_owned(),
+                    ..ToolStep::default()
+                },
+                "xmlish",
+            ),
+            (
+                "<tool_call name=\"history_search\" args='{\"query\":\"CherryCherry123\"}' />".to_owned(),
+                ToolStep {
+                    step: STEP_HISTORY_SEARCH.to_owned(),
+                    query: "CherryCherry123".to_owned(),
                     ..ToolStep::default()
                 },
                 "xmlish",

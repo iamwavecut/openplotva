@@ -24,16 +24,17 @@ use url::Url;
 use openplotva_core::{ChatAttachment, ChatMessageMeta, ToolCall};
 use openplotva_dialog::{
     DEFAULT_CONTEXT_HISTORY_LIMIT, DialogInput, DialogToolbox, DialogTraceArtifacts,
-    DialogTraceError, DialogTraceUsage, DrawRequest, HistoryMessage, HistorySummaryRequest,
-    MESSAGE_KIND_TEXT, MESSAGE_KIND_TOOL_REQUEST, MESSAGE_KIND_TOOL_RESPONSE, NativeToolCall,
-    PROVIDER_AIFARM, PROVIDER_NVIDIA, PROVIDER_VMLX, ROLE_MODEL, ROLE_TOOL, ROLE_USER,
-    RatesRequest, STEP_CANCEL_DRAWING, STEP_CHAT_HISTORY_SUMMARY, STEP_CRAWL_URL,
-    STEP_CURRENCY_RATES, STEP_DRAW_IMAGE, STEP_GENERATE_SONG, STEP_QUEUE_STATUS,
-    STEP_TRANSLATE_TEXT, STEP_VISION_IMAGE, STEP_WEB_SEARCH, STEP_YOUTUBE_SUMMARY, SongRequest,
-    TOOL_RESULT_STATUS_FAILED, TOOL_RESULT_STATUS_NOOP, TOOL_RESULT_STATUS_QUEUED, ToolContext,
-    ToolError, ToolParseDecision, ToolResult, ToolSpec, ToolStep, VisionRequest,
-    alternative_dialog_tool_names, alternative_dialog_tools, chat_completion_tools_for_names,
-    clone_history_messages, decode_plotva_final_response_with_salvage, extract_content_tool_step,
+    DialogTraceError, DialogTraceUsage, DrawRequest, HistoryMessage, HistorySearchRequest,
+    HistorySummaryRequest, MESSAGE_KIND_TEXT, MESSAGE_KIND_TOOL_REQUEST,
+    MESSAGE_KIND_TOOL_RESPONSE, NativeToolCall, PROVIDER_AIFARM, PROVIDER_NVIDIA, PROVIDER_VMLX,
+    ROLE_MODEL, ROLE_TOOL, ROLE_USER, RatesRequest, STEP_CANCEL_DRAWING, STEP_CHAT_HISTORY_SUMMARY,
+    STEP_CRAWL_URL, STEP_CURRENCY_RATES, STEP_DRAW_IMAGE, STEP_GENERATE_SONG, STEP_HISTORY_SEARCH,
+    STEP_QUEUE_STATUS, STEP_TRANSLATE_TEXT, STEP_VISION_IMAGE, STEP_WEB_SEARCH,
+    STEP_YOUTUBE_SUMMARY, SongRequest, TOOL_RESULT_STATUS_FAILED, TOOL_RESULT_STATUS_NOOP,
+    TOOL_RESULT_STATUS_QUEUED, ToolContext, ToolError, ToolParseDecision, ToolResult, ToolSpec,
+    ToolStep, VisionRequest, alternative_dialog_tool_names, alternative_dialog_tools,
+    chat_completion_tools_for_names, clone_history_messages,
+    decode_plotva_final_response_with_salvage, extract_content_tool_step,
     has_leading_context_message, is_dialog_history_noise_tool_call_name,
     is_internal_not_scheduled_instruction, normalize_history_message, parse_native_tool_step,
     sanitize_final_text, select_llm_history_messages_for_context, tool_telemetry,
@@ -3020,6 +3021,20 @@ pub(crate) async fn execute_dialog_tool(
                 })
                 .await
         }
+        STEP_HISTORY_SEARCH => {
+            if step.query.trim().is_empty() {
+                return Ok(ToolResult::failed(
+                    "history_search_query_empty",
+                    "history_search query is empty",
+                ));
+            }
+            toolbox
+                .history_search(HistorySearchRequest {
+                    context: meta.clone(),
+                    query: step.query.clone(),
+                })
+                .await
+        }
         other => Ok(ToolResult::failed(
             "unsupported_tool",
             format!("unsupported step {other:?}"),
@@ -4028,7 +4043,12 @@ pub fn build_system_prompt_with_tool_prompt(
 
 #[must_use]
 pub fn render_alternative_tool_catalog() -> String {
-    render_tool_catalog(&alternative_dialog_tools())
+    let names = alternative_dialog_tool_names();
+    let tools = alternative_dialog_tools()
+        .into_iter()
+        .filter(|spec| names.contains(&spec.name))
+        .collect::<Vec<_>>();
+    render_tool_catalog(&tools)
 }
 
 #[must_use]
@@ -7131,6 +7151,7 @@ mod tests {
         draw_requests: Vec<DrawRequest>,
         vision_requests: Vec<VisionRequest>,
         web_search_queries: Vec<String>,
+        history_search_queries: Vec<String>,
         results: VecDeque<ToolResult>,
     }
 
@@ -7158,6 +7179,10 @@ mod tests {
 
         fn web_search_queries(&self) -> Vec<String> {
             self.state().web_search_queries.clone()
+        }
+
+        fn history_search_queries(&self) -> Vec<String> {
+            self.state().history_search_queries.clone()
         }
 
         fn record(
@@ -7223,6 +7248,23 @@ mod tests {
                 let mut state = self.state();
                 state.calls.push(STEP_WEB_SEARCH.to_owned());
                 state.web_search_queries.push(query);
+                Ok(state.results.pop_front().unwrap_or_else(|| ToolResult {
+                    status: TOOL_RESULT_STATUS_OK.to_owned(),
+                    message: "ok".to_owned(),
+                    ..ToolResult::default()
+                }))
+            };
+            Box::pin(async move { result })
+        }
+
+        fn history_search<'a>(
+            &'a self,
+            req: HistorySearchRequest,
+        ) -> openplotva_dialog::ToolboxFuture<'a> {
+            let result = {
+                let mut state = self.state();
+                state.calls.push(STEP_HISTORY_SEARCH.to_owned());
+                state.history_search_queries.push(req.query);
                 Ok(state.results.pop_front().unwrap_or_else(|| ToolResult {
                     status: TOOL_RESULT_STATUS_OK.to_owned(),
                     message: "ok".to_owned(),
@@ -7546,6 +7588,66 @@ mod tests {
         assert_eq!(
             toolbox.web_search_queries(),
             vec!["weather St. Petersburg June 2026 forecast".to_owned()]
+        );
+        assert_eq!(transport.requests().len(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dialog_provider_executes_xml_attribute_history_search_then_continues_to_final_text()
+    -> Result<(), CompletionError> {
+        let toolbox = FakeToolbox::new(vec![ToolResult {
+            status: TOOL_RESULT_STATUS_OK.to_owned(),
+            message: "history ready".to_owned(),
+            data: Some(json!({
+                "query": "CherryCherry123",
+                "results": "- Cherry: hello",
+            })),
+            ..ToolResult::default()
+        }]);
+        let (provider, transport, toolbox) = direct_dialog_provider_with_responses(
+            vec![
+                json!({
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": "<tool_calls>\n  <tool_call name=\"history_search\" arg=\"query: CherryCherry123\"></tool_call>\n</tool_calls>"
+                        }
+                    }]
+                }),
+                json!({
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": "Cherry выглядит разговорчивой и живой."
+                        }
+                    }]
+                }),
+            ],
+            AifarmDialogConfig::default(),
+            toolbox,
+        );
+        let mut input = base_input();
+        input.message = DialogMessage {
+            id: 194564,
+            text: "Плотва, найди все сообщения в чате от @CherryCherry123 и дай ей характеристику"
+                .to_owned(),
+            ..DialogMessage::default()
+        };
+
+        let output = crate::ChatProvider::run_dialog(&provider, input).await?;
+
+        assert_eq!(output.answer, "Cherry выглядит разговорчивой и живой.");
+        assert_eq!(output.tool_calls.len(), 1);
+        assert_eq!(output.tool_calls[0].name, STEP_HISTORY_SEARCH);
+        assert_eq!(
+            output.tool_calls[0].input.as_ref().expect("tool input")["query"],
+            "CherryCherry123"
+        );
+        assert_eq!(toolbox.calls(), vec![STEP_HISTORY_SEARCH.to_owned()]);
+        assert_eq!(
+            toolbox.history_search_queries(),
+            vec!["CherryCherry123".to_owned()]
         );
         assert_eq!(transport.requests().len(), 2);
         Ok(())
@@ -8134,10 +8236,15 @@ mod tests {
         assert!(prompt.contains("Никогда не используй translate_text"));
         assert!(prompt.contains("<system_contract>"));
         assert!(prompt.contains("<tools>"));
-        for spec in alternative_dialog_tools() {
+        let names = alternative_dialog_tool_names();
+        for spec in alternative_dialog_tools()
+            .into_iter()
+            .filter(|spec| names.contains(&spec.name))
+        {
             assert!(prompt.contains(&format!("name=\"{}\"", spec.name)));
             assert!(prompt.contains(spec.summary.trim()));
         }
+        assert!(!prompt.contains("name=\"memory_search\""));
         Ok(())
     }
 

@@ -8,7 +8,7 @@ use openplotva_llm::{
         AifarmClientConfig, AifarmMemoryExtractor, AifarmMemoryExtractorConfig,
         AifarmMemoryExtractorError, GenkitOpenAiCompatibleMemoryExtractor,
         GenkitOpenAiCompatibleMemoryExtractorConfig, GenkitOpenAiCompatibleMemoryExtractorError,
-        ReqwestAifarmTransport,
+        ReqwestAifarmTransport, normalize_chat_completions_url,
     },
     gemini::{
         GeminiMemoryExtractor, GeminiMemoryExtractorConfig, GeminiMemoryExtractorError,
@@ -2567,15 +2567,11 @@ impl MemoryExtractor for AifarmRouteMemoryExtractor {
 
 #[must_use]
 pub fn aifarm_memory_route_plan_from_app_config(config: &AppConfig) -> AifarmMemoryRoutePlan {
-    let primary = aifarm_memory_extractor_config_from_app_config(config);
     AifarmMemoryRoutePlan {
-        backends: vec![AifarmMemoryRouteBackendPlan {
-            label: "primary".to_owned(),
-            model: primary.model,
-            service_name: primary.client.service_name,
-            direct_url: primary.client.direct_url,
-            requires_pool_enabled: false,
-        }],
+        backends: aifarm_memory_route_backend_configs_from_app_config(config, None)
+            .into_iter()
+            .map(|(plan, _)| plan)
+            .collect(),
     }
 }
 
@@ -2583,18 +2579,91 @@ fn aifarm_route_memory_extractor_from_app_config_with_model(
     config: &AppConfig,
     model_override: Option<&str>,
 ) -> AifarmRouteMemoryExtractor {
-    let primary = aifarm_memory_extractor_config_from_app_config_with_model(config, model_override);
     AifarmRouteMemoryExtractor {
-        backends: vec![AifarmRouteMemoryBackend {
-            plan: AifarmMemoryRouteBackendPlan {
-                label: "primary".to_owned(),
-                model: primary.model.clone(),
-                service_name: primary.client.service_name.clone(),
-                direct_url: primary.client.direct_url.clone(),
-                requires_pool_enabled: false,
-            },
-            extractor: AifarmMemoryExtractor::new(primary),
-        }],
+        backends: aifarm_memory_route_backend_configs_from_app_config(config, model_override)
+            .into_iter()
+            .map(|(plan, cfg)| AifarmRouteMemoryBackend {
+                plan,
+                extractor: AifarmMemoryExtractor::new(cfg),
+            })
+            .collect(),
+    }
+}
+
+fn aifarm_memory_route_backend_configs_from_app_config(
+    config: &AppConfig,
+    model_override: Option<&str>,
+) -> Vec<(AifarmMemoryRouteBackendPlan, AifarmMemoryExtractorConfig)> {
+    let primary = aifarm_memory_extractor_config_from_app_config_with_model(config, model_override);
+    let mut backends = aifarm_memory_pool_route_backend_configs(&primary);
+    let mut primary_without_pool = primary;
+    primary_without_pool.pool = Default::default();
+    backends.push((
+        aifarm_memory_route_backend_plan("primary", &primary_without_pool, false),
+        primary_without_pool,
+    ));
+    backends
+}
+
+fn aifarm_memory_pool_route_backend_configs(
+    primary: &AifarmMemoryExtractorConfig,
+) -> Vec<(AifarmMemoryRouteBackendPlan, AifarmMemoryExtractorConfig)> {
+    primary
+        .pool
+        .secondary_backends
+        .iter()
+        .filter_map(|backend| {
+            let model = backend.model.trim();
+            if model.is_empty() {
+                return None;
+            }
+            let direct_url = if backend.url.trim().is_empty() {
+                normalize_chat_completions_url(&backend.base_url)
+            } else {
+                backend.url.trim().to_owned()
+            };
+            if direct_url.trim().is_empty() {
+                return None;
+            }
+            let api_key = if backend.api_key.trim().is_empty() {
+                primary.pool.secondary_api_key.trim()
+            } else {
+                backend.api_key.trim()
+            };
+            if api_key.is_empty() {
+                return None;
+            }
+            let label_name = if backend.name.trim().is_empty() {
+                model
+            } else {
+                backend.name.trim()
+            };
+            let mut cfg = primary.clone();
+            cfg.model = model.to_owned();
+            cfg.client.default_model = model.to_owned();
+            cfg.client.direct_url = direct_url;
+            cfg.client.api_key = api_key.to_owned();
+            cfg.client.fail_fast_on_capacity_unavailable = false;
+            cfg.pool = Default::default();
+            Some((
+                aifarm_memory_route_backend_plan(format!("pool:{label_name}"), &cfg, true),
+                cfg,
+            ))
+        })
+        .collect()
+}
+
+fn aifarm_memory_route_backend_plan(
+    label: impl Into<String>,
+    cfg: &AifarmMemoryExtractorConfig,
+    requires_pool_enabled: bool,
+) -> AifarmMemoryRouteBackendPlan {
+    AifarmMemoryRouteBackendPlan {
+        label: label.into(),
+        model: cfg.model.clone(),
+        service_name: cfg.client.service_name.clone(),
+        direct_url: cfg.client.direct_url.clone(),
+        requires_pool_enabled,
     }
 }
 
@@ -3450,12 +3519,13 @@ mod tests {
     }
 
     #[test]
-    fn aifarm_memory_route_plan_uses_primary_only() {
+    fn aifarm_memory_route_plan_prioritizes_pool_before_primary() {
         let config = AppConfig::from_raw(openplotva_config::RawConfig {
             dialog_aifarm_pool_models: Some("pool-a,pool-b".to_owned()),
             dialog_aifarm_pool_base_urls: Some(
                 "https://pool-a.test/v1,https://pool-b.test/v1/chat/completions".to_owned(),
             ),
+            dialog_aifarm_pool_api_key: Some("pool-key".to_owned()),
             llm_provider_names: Some("qwen-reasoner".to_owned()),
             llm_provider_kinds: Some("aifarm".to_owned()),
             llm_provider_discovery_service_names: Some("custom-qwen".to_owned()),
@@ -3472,11 +3542,23 @@ mod tests {
                 .iter()
                 .map(|backend| backend.label.as_str())
                 .collect::<Vec<_>>(),
-            vec!["primary"]
+            vec!["pool:pool-a", "pool:pool-b", "primary"]
         );
-        assert!(!plan.backends[0].requires_pool_enabled);
-        assert_eq!(plan.backends[0].service_name, "llm-openai");
-        assert_eq!(plan.backends[0].model, "primary-memory");
+        assert!(plan.backends[0].requires_pool_enabled);
+        assert_eq!(plan.backends[0].model, "pool-a");
+        assert_eq!(
+            plan.backends[0].direct_url,
+            "https://pool-a.test/v1/chat/completions"
+        );
+        assert!(plan.backends[1].requires_pool_enabled);
+        assert_eq!(plan.backends[1].model, "pool-b");
+        assert_eq!(
+            plan.backends[1].direct_url,
+            "https://pool-b.test/v1/chat/completions"
+        );
+        assert!(!plan.backends[2].requires_pool_enabled);
+        assert_eq!(plan.backends[2].service_name, "llm-openai");
+        assert_eq!(plan.backends[2].model, "primary-memory");
     }
 
     #[tokio::test]
