@@ -51,6 +51,7 @@ mod runtime_updates;
 pub mod serper;
 pub mod settings;
 pub mod skipped;
+pub mod subscription_sync;
 pub mod task_queue;
 pub mod translate;
 pub mod updates;
@@ -701,6 +702,7 @@ fn install_static_web_routes(router: axum::Router, static_web: StaticWebRoutes) 
             any(admin_chats_search_by_member),
         )
         .route("/admin/api/users", any(admin_users_list))
+        .route("/admin/api/vip/users", any(admin_vip_users_list))
         .route("/admin/api/user", any(admin_user_get))
         .route("/admin/api/user/grant_vip", any(admin_user_grant_vip))
         .route("/admin/api/user/revoke_vip", any(admin_user_revoke_vip))
@@ -760,6 +762,7 @@ const GO_ADMIN_API_ROUTE_PATTERNS: &[&str] = &[
     "/admin/api/chats",
     "/admin/api/chats/search_by_member",
     "/admin/api/users",
+    "/admin/api/vip/users",
     "/admin/api/user",
     "/admin/api/user/grant_vip",
     "/admin/api/user/revoke_vip",
@@ -1356,6 +1359,15 @@ async fn admin_users_list(
     Extension(routes): Extension<StaticWebRoutes>,
 ) -> Response {
     admin_users_list_response(&routes, method, &headers, raw_query.as_deref()).await
+}
+
+async fn admin_vip_users_list(
+    method: Method,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Extension(routes): Extension<StaticWebRoutes>,
+) -> Response {
+    admin_vip_users_list_response(&routes, method, &headers, raw_query.as_deref()).await
 }
 
 async fn admin_user_get(
@@ -3548,6 +3560,8 @@ const ADMIN_PAGE_LIMIT: i64 = 1000;
 const SQL_ADMIN_LIST_USERS_FILTERED: &str = "SELECT * FROM users WHERE ($1::text IS NULL OR username ILIKE '%' || $1::text || '%' OR first_name ILIKE '%' || $1::text || '%' OR last_name ILIKE '%' || $1::text || '%') ORDER BY id LIMIT $2 OFFSET $3";
 const SQL_ADMIN_GET_USER: &str = "SELECT * FROM users WHERE id = $1";
 const SQL_ADMIN_GET_USER_BY_USERNAME: &str = "SELECT * FROM users WHERE username = $1 LIMIT 1";
+const SQL_ADMIN_ENSURE_USER: &str = "INSERT INTO users (id, first_name, is_premium, is_vip) VALUES ($1, $2, FALSE, FALSE) ON CONFLICT (id) DO NOTHING";
+const SQL_ADMIN_LIST_VIP_USERS: &str = "WITH latest_vip AS (SELECT DISTINCT ON (user_id) id, user_id, event_type, delta_seconds, effective_expires_at, reason, created_at FROM vip_events ORDER BY user_id, id DESC), subscription_stats AS (SELECT user_id, COUNT(*)::bigint AS subscriptions_count, MAX(expires_at) AS latest_subscription_expires_at FROM subscriptions GROUP BY user_id) SELECT u.*, latest_vip.id AS latest_event_id, latest_vip.event_type AS latest_event_type, latest_vip.delta_seconds AS latest_delta_seconds, latest_vip.effective_expires_at AS vip_expires_at, latest_vip.reason AS latest_reason, latest_vip.created_at AS latest_created_at, (latest_vip.effective_expires_at > CURRENT_TIMESTAMP) AS vip_active, CASE WHEN latest_vip.effective_expires_at > CURRENT_TIMESTAMP THEN FLOOR(EXTRACT(EPOCH FROM (latest_vip.effective_expires_at - CURRENT_TIMESTAMP)))::bigint ELSE 0::bigint END AS remaining_seconds, COALESCE(subscription_stats.subscriptions_count, 0)::bigint AS subscriptions_count, subscription_stats.latest_subscription_expires_at AS latest_subscription_expires_at FROM latest_vip JOIN users u ON u.id = latest_vip.user_id LEFT JOIN subscription_stats ON subscription_stats.user_id = u.id WHERE ($1::text = 'all' OR ($1::text = 'active' AND latest_vip.effective_expires_at > CURRENT_TIMESTAMP) OR ($1::text = 'expired' AND latest_vip.effective_expires_at <= CURRENT_TIMESTAMP)) AND ($2::text IS NULL OR CAST(u.id AS text) LIKE '%' || $2::text || '%' OR u.username ILIKE '%' || $2::text || '%' OR u.first_name ILIKE '%' || $2::text || '%' OR u.last_name ILIKE '%' || $2::text || '%') ORDER BY latest_vip.effective_expires_at DESC, latest_vip.id DESC LIMIT $3 OFFSET $4";
 const SQL_ADMIN_SAFE_DELETE_USER: &str = "WITH deleted_memberships AS (DELETE FROM chat_members WHERE user_id = $1 RETURNING user_id), deleted_vip AS (DELETE FROM vip_cache WHERE user_id = $1 RETURNING user_id) DELETE FROM users WHERE id = $1";
 const SQL_ADMIN_LIST_CHATS: &str = "SELECT * FROM chats ORDER BY id LIMIT $1 OFFSET $2";
 const SQL_ADMIN_LIST_CHATS_FILTERED: &str = "SELECT * FROM chats WHERE ($1::text IS NULL OR CAST(id AS text) LIKE '%' || $1::text || '%' OR title ILIKE '%' || $1::text || '%' OR username ILIKE '%' || $1::text || '%' OR first_name ILIKE '%' || $1::text || '%' OR last_name ILIKE '%' || $1::text || '%') ORDER BY id LIMIT $2 OFFSET $3";
@@ -5714,6 +5728,50 @@ async fn admin_users_list_response(
     }
 }
 
+async fn admin_vip_users_list_response(
+    routes: &StaticWebRoutes,
+    method: Method,
+    headers: &HeaderMap,
+    raw_query: Option<&str>,
+) -> Response {
+    if method != Method::GET {
+        return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+    }
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids, &routes.bot_token) {
+        return admin_auth_failure_response(error);
+    }
+    let Some(pool) = routes.postgres.as_ref() else {
+        return admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "database error");
+    };
+    let values = admin_auth_query_values(raw_query);
+    let status = values
+        .get("status")
+        .map(|value| value.trim().to_lowercase())
+        .filter(|value| matches!(value.as_str(), "active" | "expired" | "all"))
+        .unwrap_or_else(|| "active".to_owned());
+    let q = values
+        .get("q")
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    match sqlx::query(SQL_ADMIN_LIST_VIP_USERS)
+        .bind(status)
+        .bind(q.as_deref())
+        .bind(ADMIN_PAGE_LIMIT)
+        .bind(0_i64)
+        .fetch_all(pool)
+        .await
+    {
+        Ok(rows) => admin_json_response(
+            StatusCode::OK,
+            serde_json::json!({ "users": rows.iter().map(admin_vip_user_json).collect::<Vec<_>>() }),
+        ),
+        Err(error) => {
+            tracing::warn!(%error, "failed to list admin vip users");
+            admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "database error")
+        }
+    }
+}
+
 async fn admin_user_get_response(
     routes: &StaticWebRoutes,
     method: Method,
@@ -5838,15 +5896,15 @@ async fn admin_user_grant_vip_response(
     let Some(pool) = routes.postgres.as_ref() else {
         return admin_error_response(StatusCode::NOT_FOUND, "user not found");
     };
-    let user_exists = sqlx::query(SQL_ADMIN_GET_USER)
+    let placeholder_name = format!("Telegram user {user_id}");
+    if let Err(error) = sqlx::query(SQL_ADMIN_ENSURE_USER)
         .bind(user_id)
-        .fetch_optional(pool)
+        .bind(&placeholder_name)
+        .execute(pool)
         .await
-        .ok()
-        .flatten()
-        .is_some();
-    if !user_exists {
-        return admin_error_response(StatusCode::NOT_FOUND, "user not found");
+    {
+        tracing::warn!(%error, user_id, "failed to ensure admin vip user");
+        return admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "user not found");
     }
     let admin_id = current_admin_user_id(headers, &routes.bot_token);
     let reason = admin_non_empty_string(&req.reason)
@@ -5867,14 +5925,24 @@ async fn admin_user_grant_vip_response(
         })
         .await
     {
-        Ok(event) => admin_json_response(
-            StatusCode::OK,
-            serde_json::json!({
-                "ok": true,
-                "event_id": event.id,
-                "expires_at": admin_format_time(event.effective_expires_at),
-            }),
-        ),
+        Ok(event) => {
+            let cache_invalidated = match vip_store.delete_vip_cache(user_id).await {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::warn!(%error, user_id, "failed to invalidate admin vip cache");
+                    false
+                }
+            };
+            admin_json_response(
+                StatusCode::OK,
+                serde_json::json!({
+                    "ok": true,
+                    "event_id": event.id,
+                    "expires_at": admin_format_time(event.effective_expires_at),
+                    "cache_invalidated": cache_invalidated,
+                }),
+            )
+        }
         Err(error) => {
             tracing::warn!(%error, user_id, "failed to grant admin vip");
             admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed")
@@ -5916,9 +5984,20 @@ async fn admin_user_revoke_vip_response(
         .ok()
         .flatten();
     if !admin_vip_summary_can_be_revoked(summary.as_ref()) {
+        let cache_invalidated = match vip_store.delete_vip_cache(user_id).await {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(%error, user_id, "failed to invalidate inactive admin vip cache");
+                false
+            }
+        };
         return admin_json_response(
             StatusCode::OK,
-            serde_json::json!({ "ok": true, "revoked": false }),
+            serde_json::json!({
+                "ok": true,
+                "revoked": false,
+                "cache_invalidated": cache_invalidated,
+            }),
         );
     }
     let summary = summary.expect("checked");
@@ -5939,10 +6018,23 @@ async fn admin_user_revoke_vip_response(
         })
         .await
     {
-        Ok(_) => admin_json_response(
-            StatusCode::OK,
-            serde_json::json!({ "ok": true, "revoked": true }),
-        ),
+        Ok(_) => {
+            let cache_invalidated = match vip_store.delete_vip_cache(user_id).await {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::warn!(%error, user_id, "failed to invalidate revoked admin vip cache");
+                    false
+                }
+            };
+            admin_json_response(
+                StatusCode::OK,
+                serde_json::json!({
+                    "ok": true,
+                    "revoked": true,
+                    "cache_invalidated": cache_invalidated,
+                }),
+            )
+        }
         Err(error) => {
             tracing::warn!(%error, user_id, "failed to revoke admin vip");
             admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed")
@@ -6164,6 +6256,34 @@ fn admin_user_json(row: &PgRow) -> serde_json::Value {
         "settings": admin_jsonb_base64(row, "settings"),
         "discovered": admin_row_time(row, "discovered"),
         "updated": admin_row_time(row, "updated"),
+    })
+}
+
+fn admin_vip_user_json(row: &PgRow) -> serde_json::Value {
+    let remaining_seconds = row
+        .try_get::<Option<i64>, _>("remaining_seconds")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let remaining_days = ((remaining_seconds as f64 / openplotva_core::VIP_SECONDS_PER_DAY as f64)
+        .ceil() as i64)
+        .max(0);
+    serde_json::json!({
+        "user": admin_user_json(row),
+        "vip_summary": {
+            "active": row.try_get::<Option<bool>, _>("vip_active").ok().flatten().unwrap_or(false),
+            "has_history": true,
+            "expires_at": admin_row_time(row, "vip_expires_at"),
+            "remaining_seconds": remaining_seconds,
+            "remaining_days": remaining_days,
+            "latest_event_id": row.try_get::<Option<i64>, _>("latest_event_id").ok().flatten(),
+            "latest_event_type": admin_string_json(row, "latest_event_type"),
+            "latest_delta_seconds": row.try_get::<Option<i64>, _>("latest_delta_seconds").ok().flatten().unwrap_or_default(),
+            "latest_reason": admin_string_json(row, "latest_reason"),
+            "latest_created_at": admin_row_time(row, "latest_created_at"),
+        },
+        "subscriptions_count": row.try_get::<Option<i64>, _>("subscriptions_count").ok().flatten().unwrap_or_default(),
+        "latest_subscription_expires_at": admin_row_time(row, "latest_subscription_expires_at"),
     })
 }
 
@@ -7825,6 +7945,17 @@ fn admin_queue_config_from_app_config(config: &AppConfig) -> admin::AdminQueueCo
     }
 }
 
+fn subscription_sync_config_from_app_config(
+    config: &AppConfig,
+) -> subscription_sync::SubscriptionSyncConfig {
+    subscription_sync::SubscriptionSyncConfig {
+        enabled: config.subscription_sync.enabled,
+        interval: Duration::from_secs(config.subscription_sync.interval_seconds.max(1) as u64),
+        dry_run: config.subscription_sync.dry_run,
+        page_limit: i64::from(config.subscription_sync.page_limit.max(1)),
+    }
+}
+
 fn runtime_api_graphql_snapshot(
     config: &AppConfig,
 ) -> openplotva_server::RuntimeApiGraphqlSnapshot {
@@ -8737,6 +8868,49 @@ async fn start_runtime_workers(
     );
     let payment_effects =
         payments::PaymentRuntimeEffects::new(telegram.clone(), payment_successful_effects);
+    let subscription_sync_config = subscription_sync_config_from_app_config(config);
+    if subscription_sync_config.enabled {
+        let subscription_sync_source = subscription_sync::TelegramStarSubscriptionSyncSource::new(
+            openplotva_telegram::StarTransactionsClient::new(
+                bot_key.to_owned(),
+                &config.bot.api_base_url,
+            ),
+        );
+        let subscription_sync_store = subscription_sync::PostgresSubscriptionSyncStore::new(
+            payments::PostgresSuccessfulPaymentStore::new(
+                store.clone(),
+                PostgresPaymentStore::new(service_clients.postgres.clone()),
+                PostgresVipStore::new(service_clients.postgres.clone()),
+            ),
+            PostgresVipStore::new(service_clients.postgres.clone()),
+        );
+        let subscription_sync_stop = stop.subscribe();
+        let subscription_sync_worker = tokio::spawn(async move {
+            let report = subscription_sync::run_subscription_sync_worker_until(
+                &subscription_sync_source,
+                &subscription_sync_store,
+                subscription_sync_config,
+                wait_for_runtime_stop(subscription_sync_stop),
+            )
+            .await;
+            tracing::info!(?report, "subscription sync worker stopped");
+        });
+        readiness_checks.push(ReadinessCheck::ok(
+            "subscription_sync",
+            format!(
+                "enabled every {}s, page_limit {}, dry_run {}",
+                subscription_sync_config.interval.as_secs(),
+                subscription_sync_config.page_limit,
+                subscription_sync_config.dry_run
+            ),
+        ));
+        workers.handles.push(subscription_sync_worker);
+    } else {
+        readiness_checks.push(ReadinessCheck::skipped(
+            "subscription_sync",
+            "SUBSCRIPTION_SYNC_ENABLED=false",
+        ));
+    }
     let taskman_ids = openplotva_taskman::TaskQueueIdAllocator::new();
     let translation_cache = service_clients.redis.translation_cache_store();
     let translator = match translate::t8_translator_from_app_config(config, translation_cache) {
@@ -13125,6 +13299,7 @@ mod tests {
                 "/admin/api/chats",
                 "/admin/api/chats/search_by_member",
                 "/admin/api/users",
+                "/admin/api/vip/users",
                 "/admin/api/user",
                 "/admin/api/user/grant_vip",
                 "/admin/api/user/revoke_vip",

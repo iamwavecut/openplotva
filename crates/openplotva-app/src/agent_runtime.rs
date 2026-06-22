@@ -465,16 +465,44 @@ impl HistorySearcher for PostgresHistorySearch {
     ) -> ContextSearchFuture<'a> {
         Box::pin(async move {
             let cutoff = OffsetDateTime::now_utc() - TimeDuration::hours(self.window_hours);
-            let payloads = self
-                .store
-                .search_history_entries(chat_id, thread_id.unwrap_or(0), &query, cutoff, self.limit)
-                .await
-                .map_err(|error| AgentError::ToolDispatch(error.to_string()))?;
+            let thread_id = thread_id.unwrap_or(0);
+            let payloads = if let Some(username) = author_username_from_history_query(&query) {
+                match self
+                    .store
+                    .user_id_by_username(&username)
+                    .await
+                    .map_err(|error| AgentError::ToolDispatch(error.to_string()))?
+                {
+                    Some(sender_id) => self
+                        .store
+                        .search_history_entries_by_sender_id(
+                            chat_id, thread_id, sender_id, cutoff, self.limit,
+                        )
+                        .await
+                        .map_err(|error| AgentError::ToolDispatch(error.to_string()))?,
+                    None => Vec::new(),
+                }
+            } else {
+                self.store
+                    .search_history_entries(chat_id, thread_id, &query, cutoff, self.limit)
+                    .await
+                    .map_err(|error| AgentError::ToolDispatch(error.to_string()))?
+            };
             let entries = decode_summary_message_entry_payloads(&payloads)
                 .map_err(|error| AgentError::ToolDispatch(error.to_string()))?;
             Ok(format_history_entries(&entries))
         })
     }
+}
+
+fn author_username_from_history_query(query: &str) -> Option<String> {
+    let at = query.find('@')?;
+    let candidate = query[at + 1..]
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+        .collect::<String>();
+    let len = candidate.len();
+    (5..=32).contains(&len).then_some(candidate)
 }
 
 fn format_history_entries(entries: &[SummaryMessageEntry]) -> String {
@@ -1323,6 +1351,20 @@ mod tests {
     fn rejects_image_prompt_without_marker() {
         assert!(parse_image_prompt("just some prose with no marker").is_none());
         assert!(parse_image_prompt("PROMPT:\n   ").is_none());
+    }
+
+    #[test]
+    fn history_search_query_detects_author_username_mentions() {
+        assert_eq!(
+            author_username_from_history_query("@CherryCherry123"),
+            Some("CherryCherry123".to_owned())
+        );
+        assert_eq!(
+            author_username_from_history_query("сообщения от @CherryCherry123"),
+            Some("CherryCherry123".to_owned())
+        );
+        assert_eq!(author_username_from_history_query("CherryCherry123"), None);
+        assert_eq!(author_username_from_history_query("@"), None);
     }
 
     #[tokio::test]

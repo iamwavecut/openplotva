@@ -126,6 +126,8 @@ pub struct DialogJobWorkerReport {
     pub provider_error: Option<String>,
     /// Answer side effect failed.
     pub send_error: Option<String>,
+    /// Provider returned content that became empty after outbound sanitization.
+    pub empty_answer_error: Option<String>,
     /// Provider tool calls were persisted to chat history.
     pub persisted_tool_call_history: bool,
     /// Tool-call history persistence failed non-fatally.
@@ -957,7 +959,14 @@ where
         }
     }
 
-    let answer = prepare_dialog_chat_response(&dialog_job_answer(&output));
+    let raw_answer = dialog_job_answer(&output);
+    let answer = prepare_dialog_chat_response(&raw_answer);
+    if !raw_answer.trim().is_empty() && answer.is_empty() {
+        let error = "dialog answer became empty after sanitization".to_owned();
+        report.empty_answer_error = Some(error.clone());
+        mark_dialog_job_failed(queue, item.id, &error, &mut report).await;
+        return report;
+    }
     if !answer.is_empty() {
         let (duplicate_message_id, suppressed) =
             should_suppress_duplicate_bot_reply(&duplicate_guard_history, &answer);
@@ -2703,6 +2712,7 @@ fn trace_dialog_job_tick(tick: &DialogJobWorkerReport) {
         && tick.decode_error.is_none()
         && tick.provider_error.is_none()
         && tick.send_error.is_none()
+        && tick.empty_answer_error.is_none()
         && tick.dialog_fallback_event_error.is_none()
         && tick.status_error.is_none()
     {
@@ -2733,6 +2743,7 @@ fn trace_dialog_job_tick(tick: &DialogJobWorkerReport) {
         retryable_provider_error = tick.retryable_provider_error.as_deref(),
         provider_error = tick.provider_error.as_deref(),
         send_error = tick.send_error.as_deref(),
+        empty_answer_error = tick.empty_answer_error.as_deref(),
         tool_call_history_error = tick.tool_call_history_error.as_deref(),
         dialog_fallback_event_error = tick.dialog_fallback_event_error.as_deref(),
         status_error = tick.status_error.as_deref(),
@@ -3299,6 +3310,36 @@ mod tests {
         assert!(report.completed);
         assert!(!report.failed);
         assert_eq!(record_status(&queue, job_id), JobStatus::Completed);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dialog_worker_fails_when_provider_answer_sanitizes_to_empty()
+    -> Result<(), Box<dyn Error>> {
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let queue = InMemoryTaskQueue::new();
+        let job_id = queue.assign(
+            DIALOG_AIFARM_QUEUE_NAME,
+            new_dialog_job_at(dialog_params("найди сообщения"), now),
+        );
+        let provider = ProviderStub::returning(DialogOutput {
+            answer: "<tool_calls><tool_call name=\"history_search\"></tool_call></tool_calls>"
+                .to_owned(),
+            ..DialogOutput::default()
+        });
+        let effects = EffectsStub::default();
+
+        let report = process_dialog_job_once_at(&queue, &provider, &effects, now).await;
+
+        assert!(report.failed);
+        assert!(!report.completed);
+        assert!(!report.sent_answer);
+        assert!(effects.sent().is_empty());
+        assert_eq!(
+            report.empty_answer_error,
+            Some("dialog answer became empty after sanitization".to_owned())
+        );
+        assert_eq!(record_status(&queue, job_id), JobStatus::Failed);
         Ok(())
     }
 

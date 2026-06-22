@@ -10,6 +10,7 @@ mod persistence;
 mod rate_limit;
 mod rich_api;
 mod rich_html;
+mod stars;
 mod transport;
 mod update_startup;
 
@@ -96,6 +97,10 @@ pub use rich_api::{RichApiClient, RichApiError, RichMessage, RichSendOptions, Se
 pub use rich_html::{
     RICH_MEDIA_MAX, RICH_MESSAGE_MAX_CHARS, format_rich_html, is_valid_rich_html,
     rich_message_within_char_limit, sanitize_rich_html,
+};
+pub use stars::{
+    StarSubscriptionPayment, StarSubscriptionPaymentsPage, StarTransactionsClient,
+    StarTransactionsError, parse_star_subscription_payment,
 };
 pub use transport::{
     TelegramOutboundExecuteError, TelegramOutboundMethod, TelegramOutboundMethodKind,
@@ -714,7 +719,7 @@ mod tests {
         checkin_theme_callback_theme, checkin_theme_selection_ack_method,
         checkin_theme_selection_alert, delete_drawing_callback_data, delete_lyrics_callback_data,
         delete_my_commands_method, empty_context, parse_callback_action, parse_callback_i64,
-        set_my_commands_methods, settings_callback_ack_method,
+        parse_star_subscription_payment, set_my_commands_methods, settings_callback_ack_method,
     };
 
     #[test]
@@ -764,6 +769,40 @@ mod tests {
                 "settings"
             ]
         );
+    }
+
+    #[test]
+    fn star_transactions_parse_invoice_subscription_payments() {
+        let value = json!({
+            "id": "stx-charge",
+            "amount": 300,
+            "date": 1_779_193_800,
+            "source": {
+                "type": "user",
+                "transaction_type": "invoice_payment",
+                "user": {
+                    "id": 42,
+                    "is_bot": false,
+                    "first_name": "Alice",
+                    "last_name": "Smith",
+                    "username": "alice",
+                    "language_code": "en",
+                    "is_premium": true
+                },
+                "invoice_payload": "subscription_42",
+                "subscription_period": 2592000
+            }
+        });
+
+        let payment = parse_star_subscription_payment(value).expect("subscription payment");
+
+        assert_eq!(payment.telegram_payment_charge_id, "stx-charge");
+        assert_eq!(payment.user_id, 42);
+        assert_eq!(payment.invoice_payload, "subscription_42");
+        assert_eq!(payment.amount_stars, 300);
+        assert_eq!(payment.paid_at_unix, 1_779_193_800);
+        assert_eq!(payment.subscription_period_seconds, 2_592_000);
+        assert_eq!(payment.username.as_deref(), Some("alice"));
     }
 
     #[test]

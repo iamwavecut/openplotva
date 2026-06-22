@@ -86,6 +86,14 @@ pub const DEFAULT_ADMINS_ADMIN_IDS: &str = "";
 
 pub const DEFAULT_VIP_CHAT_ID: i64 = -1001998670656;
 
+pub const DEFAULT_SUBSCRIPTION_SYNC_ENABLED: bool = true;
+
+pub const DEFAULT_SUBSCRIPTION_SYNC_INTERVAL_SECONDS: i32 = 3_600;
+
+pub const DEFAULT_SUBSCRIPTION_SYNC_DRY_RUN: bool = false;
+
+pub const DEFAULT_SUBSCRIPTION_SYNC_PAGE_LIMIT: i32 = 100;
+
 pub const DEFAULT_PERSISTENT_QUEUE_ENABLED: bool = true;
 
 pub const DEFAULT_PERSISTENT_QUEUE_HEARTBEAT_INTERVAL_SECONDS: i32 = 30;
@@ -304,6 +312,8 @@ pub struct AppConfig {
     pub admins: AdminConfig,
     /// VIP status configuration.
     pub vip: VipConfig,
+    /// Telegram Stars subscription reconciliation configuration.
+    pub subscription_sync: SubscriptionSyncConfig,
     /// Persistent task queue configuration.
     pub persistent_queue: PersistentQueueConfig,
     /// Market rates provider configuration.
@@ -475,6 +485,14 @@ pub struct AdminConfig {
 pub struct VipConfig {
     /// Telegram chat whose active members receive VIP status, from `VIP_CHAT_ID` or legacy `CHAT_ID`.
     pub chat_id: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SubscriptionSyncConfig {
+    pub enabled: bool,
+    pub interval_seconds: i32,
+    pub dry_run: bool,
+    pub page_limit: i32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -912,6 +930,14 @@ pub struct RawConfig {
     pub vip_chat_id: Option<String>,
     /// Legacy Go-era VIP chat id variable, `CHAT_ID`.
     pub legacy_vip_chat_id: Option<String>,
+    /// `SUBSCRIPTION_SYNC_ENABLED`.
+    pub subscription_sync_enabled: Option<String>,
+    /// `SUBSCRIPTION_SYNC_INTERVAL_SECONDS`.
+    pub subscription_sync_interval_seconds: Option<String>,
+    /// `SUBSCRIPTION_SYNC_DRY_RUN`.
+    pub subscription_sync_dry_run: Option<String>,
+    /// `SUBSCRIPTION_SYNC_PAGE_LIMIT`.
+    pub subscription_sync_page_limit: Option<String>,
     /// `PERSISTENT_QUEUE_ENABLED`.
     pub persistent_queue_enabled: Option<String>,
     /// `PERSISTENT_QUEUE_HEARTBEAT_INTERVAL_SECONDS`.
@@ -1793,6 +1819,28 @@ impl AppConfig {
                     )?
                 },
             },
+            subscription_sync: SubscriptionSyncConfig {
+                enabled: parse_bool(
+                    "SUBSCRIPTION_SYNC_ENABLED",
+                    raw.subscription_sync_enabled,
+                    DEFAULT_SUBSCRIPTION_SYNC_ENABLED,
+                )?,
+                interval_seconds: parse_i32(
+                    "SUBSCRIPTION_SYNC_INTERVAL_SECONDS",
+                    raw.subscription_sync_interval_seconds,
+                    DEFAULT_SUBSCRIPTION_SYNC_INTERVAL_SECONDS,
+                )?,
+                dry_run: parse_bool(
+                    "SUBSCRIPTION_SYNC_DRY_RUN",
+                    raw.subscription_sync_dry_run,
+                    DEFAULT_SUBSCRIPTION_SYNC_DRY_RUN,
+                )?,
+                page_limit: parse_i32(
+                    "SUBSCRIPTION_SYNC_PAGE_LIMIT",
+                    raw.subscription_sync_page_limit,
+                    DEFAULT_SUBSCRIPTION_SYNC_PAGE_LIMIT,
+                )?,
+            },
             persistent_queue,
             market_rates: MarketRatesConfig {
                 timeout_seconds: parse_i32(
@@ -2438,6 +2486,10 @@ impl RawConfig {
             admins_admin_ids: env("ADMINS_ADMIN_IDS"),
             vip_chat_id: env("VIP_CHAT_ID"),
             legacy_vip_chat_id: env("CHAT_ID"),
+            subscription_sync_enabled: env("SUBSCRIPTION_SYNC_ENABLED"),
+            subscription_sync_interval_seconds: env("SUBSCRIPTION_SYNC_INTERVAL_SECONDS"),
+            subscription_sync_dry_run: env("SUBSCRIPTION_SYNC_DRY_RUN"),
+            subscription_sync_page_limit: env("SUBSCRIPTION_SYNC_PAGE_LIMIT"),
             persistent_queue_enabled: env("PERSISTENT_QUEUE_ENABLED"),
             persistent_queue_heartbeat_interval_seconds: env(
                 "PERSISTENT_QUEUE_HEARTBEAT_INTERVAL_SECONDS",
@@ -4357,6 +4409,24 @@ mod tests {
         assert_eq!(config.bot.webhook.secret_token, "webhook-secret");
         assert_eq!(config.bot.webhook.update_buffer_size, 256);
         assert_eq!(config.admins.admin_ids, vec![1_001, 42]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn subscription_sync_config_loads_env_values() -> Result<(), super::ConfigError> {
+        let config = AppConfig::from_raw(RawConfig {
+            subscription_sync_enabled: Some("false".to_owned()),
+            subscription_sync_interval_seconds: Some("120".to_owned()),
+            subscription_sync_dry_run: Some("true".to_owned()),
+            subscription_sync_page_limit: Some("50".to_owned()),
+            ..RawConfig::default()
+        })?;
+
+        assert!(!config.subscription_sync.enabled);
+        assert_eq!(config.subscription_sync.interval_seconds, 120);
+        assert!(config.subscription_sync.dry_run);
+        assert_eq!(config.subscription_sync.page_limit, 50);
 
         Ok(())
     }

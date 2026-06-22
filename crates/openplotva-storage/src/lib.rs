@@ -551,7 +551,8 @@ pub const SQL_LIST_USERS_BY_IDS: &str = "SELECT id, first_name, last_name, usern
 
 pub const SQL_SEARCH_CHAT_MEMBER_CANDIDATES: &str = "SELECT u.id, u.first_name, u.last_name, u.username, cm.status, cm.last_message_at, cm.updated_at FROM chat_members cm JOIN users u ON u.id = cm.user_id WHERE cm.chat_id = $1 AND cm.status IN ('creator', 'administrator', 'member') AND ($2 = '' OR LOWER(COALESCE(u.username, '')) LIKE '%' || LOWER($2) || '%' OR LOWER(u.first_name) LIKE '%' || LOWER($2) || '%' OR LOWER(COALESCE(u.last_name, '')) LIKE '%' || LOWER($2) || '%') ORDER BY cm.last_message_at DESC NULLS LAST, cm.updated_at DESC, u.id LIMIT $3";
 
-pub const SQL_GET_USER_ID_BY_USERNAME: &str = "SELECT id FROM users WHERE username = $1 LIMIT 1";
+pub const SQL_GET_USER_ID_BY_USERNAME: &str =
+    "SELECT id FROM users WHERE lower(username) = lower($1) LIMIT 1";
 
 pub const SQL_CREATE_RUNTIME_API_TOKEN: &str =
     "INSERT INTO runtime_api_tokens (id, token_hash) VALUES ($1, $2) RETURNING *";
@@ -686,6 +687,7 @@ pub const SQL_SELECT_RECENT_THREAD_HISTORY_ENTRY_PAYLOADS: &str = "SELECT payloa
 /// Keyword (ILIKE) search over a chat's recent text history. Scoped by chat and
 /// optional thread; bounded by a time cutoff and a row limit so the scan stays cheap.
 pub const SQL_SEARCH_CHAT_HISTORY_ENTRY_PAYLOADS: &str = "SELECT payload::text AS payload FROM chat_history_entries WHERE chat_id = $1 AND occurred_at > $2 AND ($3::integer = 0 OR thread_id = $3) AND kind = 'text' AND payload::text ILIKE $4 ORDER BY occurred_at DESC, message_id DESC, entry_id DESC LIMIT $5";
+pub const SQL_SELECT_RECENT_CHAT_HISTORY_BY_SENDER_PAYLOADS: &str = "SELECT payload::text AS payload FROM chat_history_entries WHERE bucket_day >= $2::date AND chat_id = $1 AND occurred_at > $3 AND ($4::integer = 0 OR thread_id = $4) AND kind = 'text' AND sender_id = $5 ORDER BY occurred_at DESC, message_id DESC, entry_id DESC LIMIT $6";
 
 pub const SQL_ENSURE_CHAT_HISTORY_PARTITION: &str =
     "SELECT ensure_chat_history_partition($1::date)";
@@ -1222,6 +1224,8 @@ pub const SQL_DELETE_DONATION: &str = "DELETE FROM donations WHERE id = $1 RETUR
 pub const SQL_UPSERT_VIP_CACHE: &str = "INSERT INTO vip_cache (user_id, is_vip, expires_at) VALUES ($1, $2, $3) ON CONFLICT (user_id) DO UPDATE SET is_vip = COALESCE(EXCLUDED.is_vip, vip_cache.is_vip), expires_at = COALESCE(EXCLUDED.expires_at, vip_cache.expires_at), updated_at = CURRENT_TIMESTAMP";
 
 pub const SQL_CREATE_VIP_EVENT: &str = "SELECT id, user_id, event_type, delta_seconds, effective_expires_at, subscription_id, actor_user_id, reason, created_at FROM vip_create_event($1, $2, $3, $4, $5, $6)";
+
+pub const SQL_GET_VIP_EVENT_BY_SUBSCRIPTION_ID: &str = "SELECT id, user_id, event_type, delta_seconds, effective_expires_at, subscription_id, actor_user_id, reason, created_at FROM vip_events WHERE subscription_id = $1 AND event_type = 'payment' ORDER BY id DESC LIMIT 1";
 
 pub const SQL_GET_VIP_SUMMARY_BY_USER: &str = "SELECT id AS latest_event_id, user_id, event_type AS latest_event_type, delta_seconds AS latest_delta_seconds, effective_expires_at, effective_expires_at > CURRENT_TIMESTAMP AS is_active, CASE WHEN effective_expires_at > CURRENT_TIMESTAMP THEN FLOOR(EXTRACT(EPOCH FROM (effective_expires_at - CURRENT_TIMESTAMP)))::bigint ELSE 0::bigint END AS remaining_seconds, subscription_id AS latest_subscription_id, actor_user_id AS latest_actor_user_id, reason AS latest_reason, created_at AS latest_created_at FROM vip_events WHERE user_id = $1 ORDER BY id DESC LIMIT 1";
 
@@ -4207,6 +4211,42 @@ impl PostgresHistoryStore {
         summary_payload_rows_to_bytes(rows)
     }
 
+    pub async fn user_id_by_username(&self, username: &str) -> Result<Option<i64>, StorageError> {
+        let username = username.trim().trim_start_matches('@');
+        if username.is_empty() {
+            return Ok(None);
+        }
+        sqlx::query_scalar(SQL_GET_USER_ID_BY_USERNAME)
+            .bind(username)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(StorageError::from)
+    }
+
+    /// Search a chat's recent text history by Telegram sender id, newest first.
+    pub async fn search_history_entries_by_sender_id(
+        &self,
+        chat_id: i64,
+        thread_id: i32,
+        sender_id: i64,
+        cutoff: OffsetDateTime,
+        limit_count: i32,
+    ) -> Result<Vec<Vec<u8>>, StorageError> {
+        if chat_id == 0 || sender_id == 0 {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(SQL_SELECT_RECENT_CHAT_HISTORY_BY_SENDER_PAYLOADS)
+            .bind(chat_id)
+            .bind(cutoff.date())
+            .bind(cutoff)
+            .bind(thread_id)
+            .bind(sender_id)
+            .bind(limit_count.max(1))
+            .fetch_all(&self.pool)
+            .await?;
+        summary_payload_rows_to_bytes(rows)
+    }
+
     pub async fn chat_summary_entry_payloads(
         &self,
         chat_id: i64,
@@ -5751,6 +5791,18 @@ impl PostgresVipStore {
             .fetch_one(&self.pool)
             .await?;
         vip_event_from_row(row).map_err(StorageError::from)
+    }
+
+    /// Load an existing VIP payment event tied to a subscription row.
+    pub async fn get_vip_event_by_subscription_id(
+        &self,
+        subscription_id: i64,
+    ) -> Result<Option<VipEventRecord>, StorageError> {
+        let row = sqlx::query(SQL_GET_VIP_EVENT_BY_SUBSCRIPTION_ID)
+            .bind(subscription_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(vip_event_from_row).transpose()?)
     }
 
     /// Load the latest VIP ledger summary for a user.
@@ -9602,7 +9654,7 @@ mod tests {
         );
         assert_eq!(
             super::SQL_GET_USER_ID_BY_USERNAME,
-            "SELECT id FROM users WHERE username = $1 LIMIT 1"
+            "SELECT id FROM users WHERE lower(username) = lower($1) LIMIT 1"
         );
         assert_eq!(
             super::SQL_UPSERT_CHAT,
@@ -9880,6 +9932,10 @@ mod tests {
         assert_eq!(
             super::SQL_GET_VIP_SUMMARY_BY_USER,
             "SELECT id AS latest_event_id, user_id, event_type AS latest_event_type, delta_seconds AS latest_delta_seconds, effective_expires_at, effective_expires_at > CURRENT_TIMESTAMP AS is_active, CASE WHEN effective_expires_at > CURRENT_TIMESTAMP THEN FLOOR(EXTRACT(EPOCH FROM (effective_expires_at - CURRENT_TIMESTAMP)))::bigint ELSE 0::bigint END AS remaining_seconds, subscription_id AS latest_subscription_id, actor_user_id AS latest_actor_user_id, reason AS latest_reason, created_at AS latest_created_at FROM vip_events WHERE user_id = $1 ORDER BY id DESC LIMIT 1"
+        );
+        assert_eq!(
+            super::SQL_GET_VIP_EVENT_BY_SUBSCRIPTION_ID,
+            "SELECT id, user_id, event_type, delta_seconds, effective_expires_at, subscription_id, actor_user_id, reason, created_at FROM vip_events WHERE subscription_id = $1 AND event_type = 'payment' ORDER BY id DESC LIMIT 1"
         );
         assert_eq!(
             super::SQL_LIST_VIP_EVENTS_BY_USER,
@@ -10242,6 +10298,15 @@ mod tests {
                 )
                 .await?;
             assert!(wrong_thread_payloads.is_empty());
+
+            let sender_payloads = store
+                .search_history_entries_by_sender_id(chat_id, 77, 100, range_start, 10)
+                .await?;
+            assert_eq!(sender_payloads.len(), 1);
+            let wrong_sender_payloads = store
+                .search_history_entries_by_sender_id(chat_id, 77, 101, range_start, 10)
+                .await?;
+            assert!(wrong_sender_payloads.is_empty());
 
             assert!(store
                 .update_text_entry(chat_id, message_id, "new text")

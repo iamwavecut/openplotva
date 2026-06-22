@@ -319,12 +319,40 @@ pub struct ControlJobData {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
 pub struct ControlPayment {
     pub currency: String,
     pub total_amount: i32,
     pub invoice_payload: String,
     pub telegram_payment_charge_id: String,
     pub provider_payment_charge_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paid_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subscription_period_seconds: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subscription_expiration_date: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_recurring: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_first_recurring: Option<bool>,
+}
+
+impl Default for ControlPayment {
+    fn default() -> Self {
+        Self {
+            currency: String::new(),
+            total_amount: 0,
+            invoice_payload: String::new(),
+            telegram_payment_charge_id: String::new(),
+            provider_payment_charge_id: String::new(),
+            paid_at: None,
+            subscription_period_seconds: None,
+            subscription_expiration_date: None,
+            is_recurring: None,
+            is_first_recurring: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3699,6 +3727,7 @@ mod tests {
                 invoice_payload: "subscription_42".to_owned(),
                 telegram_payment_charge_id: "telegram-charge".to_owned(),
                 provider_payment_charge_id: "provider-charge".to_owned(),
+                ..super::ControlPayment::default()
             }),
             ..ControlJobData::default()
         };
@@ -3715,6 +3744,47 @@ mod tests {
                 }
             })
         );
+        Ok(())
+    }
+
+    #[test]
+    fn control_payment_preserves_recurring_subscription_metadata()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payment: super::ControlPayment = serde_json::from_value(json!({
+            "currency": "XTR",
+            "total_amount": 300,
+            "invoice_payload": "subscription_42",
+            "telegram_payment_charge_id": "telegram-charge",
+            "provider_payment_charge_id": "provider-charge",
+            "paid_at": "2026-06-17T16:14:02Z",
+            "subscription_period_seconds": 2592000,
+            "subscription_expiration_date": "2026-07-17T16:14:02Z",
+            "is_recurring": true,
+            "is_first_recurring": false
+        }))?;
+
+        assert_eq!(payment.paid_at.as_deref(), Some("2026-06-17T16:14:02Z"));
+        assert_eq!(payment.subscription_period_seconds, Some(2_592_000));
+        assert_eq!(
+            payment.subscription_expiration_date.as_deref(),
+            Some("2026-07-17T16:14:02Z")
+        );
+        assert_eq!(payment.is_recurring, Some(true));
+        assert_eq!(payment.is_first_recurring, Some(false));
+
+        let legacy: super::ControlPayment = serde_json::from_value(json!({
+            "currency": "XTR",
+            "total_amount": 300,
+            "invoice_payload": "subscription_42",
+            "telegram_payment_charge_id": "telegram-charge",
+            "provider_payment_charge_id": "provider-charge"
+        }))?;
+        assert_eq!(legacy.paid_at, None);
+        assert_eq!(legacy.subscription_period_seconds, None);
+        assert_eq!(legacy.subscription_expiration_date, None);
+        assert_eq!(legacy.is_recurring, None);
+        assert_eq!(legacy.is_first_recurring, None);
+
         Ok(())
     }
 

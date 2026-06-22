@@ -39,7 +39,7 @@ use openplotva_taskman::{
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use time::{Duration as TimeDuration, OffsetDateTime};
+use time::{Duration as TimeDuration, OffsetDateTime, format_description::well_known::Rfc3339};
 
 /// Boxed future returned by payment storage calls.
 pub type PaymentStoreFuture<'a, T, E> = Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'a>>;
@@ -89,6 +89,18 @@ pub struct SuccessfulPayment {
     pub telegram_payment_charge_id: String,
     /// Provider-side charge ID.
     pub provider_payment_charge_id: String,
+    /// Telegram message/transaction time.
+    pub paid_at: Option<OffsetDateTime>,
+    /// Paid subscription period in seconds, when Telegram reports it.
+    pub subscription_period_seconds: Option<i64>,
+    /// Telegram subscription expiry timestamp, when Telegram reports it.
+    pub subscription_expiration_date: Option<OffsetDateTime>,
+    /// Internal VIP ledger target. Used for database-only compensation on reconciled payments.
+    pub vip_target_expires_at: Option<OffsetDateTime>,
+    /// Whether this payment is a recurring subscription payment.
+    pub is_recurring: Option<bool>,
+    /// Whether this payment is the first recurring subscription payment.
+    pub is_first_recurring: Option<bool>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -655,6 +667,18 @@ pub trait SuccessfulPaymentStore {
         &'a self,
         telegram_payment_charge_id: &'a str,
     ) -> PaymentStoreFuture<'a, Option<SubscriptionRecord>, Self::Error>;
+
+    /// Load the latest VIP ledger summary for payment activation math.
+    fn get_vip_summary_by_user<'a>(
+        &'a self,
+        user_id: i64,
+    ) -> PaymentStoreFuture<'a, Option<VipSummaryRecord>, Self::Error>;
+
+    /// Load an already-created VIP payment event for a subscription row.
+    fn get_vip_event_by_subscription_id<'a>(
+        &'a self,
+        subscription_id: i64,
+    ) -> PaymentStoreFuture<'a, Option<VipEventRecord>, Self::Error>;
 
     /// Create a donation row.
     fn create_donation<'a>(
@@ -3300,6 +3324,24 @@ impl SuccessfulPaymentStore for PostgresSuccessfulPaymentStore {
         })
     }
 
+    fn get_vip_summary_by_user<'a>(
+        &'a self,
+        user_id: i64,
+    ) -> PaymentStoreFuture<'a, Option<VipSummaryRecord>, Self::Error> {
+        Box::pin(async move { self.vip.get_vip_summary_by_user(user_id).await })
+    }
+
+    fn get_vip_event_by_subscription_id<'a>(
+        &'a self,
+        subscription_id: i64,
+    ) -> PaymentStoreFuture<'a, Option<VipEventRecord>, Self::Error> {
+        Box::pin(async move {
+            self.vip
+                .get_vip_event_by_subscription_id(subscription_id)
+                .await
+        })
+    }
+
     fn create_donation<'a>(
         &'a self,
         donation: DonationCreate<'a>,
@@ -3704,6 +3746,14 @@ fn successful_payment_control_job_from_message_at(
     let TelegramMessageData::SuccessfulPayment(payment) = &message.data else {
         return None;
     };
+    let paid_at = OffsetDateTime::from_unix_timestamp(message.date).ok();
+    let subscription_expiration_date =
+        payment_subscription_expiration_date(payment).or_else(|| {
+            paid_at.and_then(|paid_at| {
+                payment_subscription_period_seconds_from_expiration(payment, paid_at)
+                    .map(|seconds| paid_at + TimeDuration::seconds(seconds))
+            })
+        });
 
     let mut data = ControlJobData {
         kind: ControlKind::SuccessfulPayment,
@@ -3714,6 +3764,14 @@ fn successful_payment_control_job_from_message_at(
             invoice_payload: payment.invoice_payload.clone(),
             telegram_payment_charge_id: payment.telegram_payment_charge_id.clone(),
             provider_payment_charge_id: payment.provider_payment_charge_id.clone(),
+            paid_at: paid_at.map(format_payment_timestamp),
+            subscription_period_seconds: paid_at.and_then(|paid_at| {
+                payment_subscription_period_seconds_from_expiration(payment, paid_at)
+            }),
+            subscription_expiration_date: subscription_expiration_date
+                .map(format_payment_timestamp),
+            is_recurring: payment.is_recurring,
+            is_first_recurring: payment.is_first_recurring,
         }),
         ..ControlJobData::default()
     };
@@ -6001,6 +6059,14 @@ pub fn successful_payment_message_from_control_job(
             invoice_payload: payment.invoice_payload.clone(),
             telegram_payment_charge_id: payment.telegram_payment_charge_id.clone(),
             provider_payment_charge_id: payment.provider_payment_charge_id.clone(),
+            paid_at: parse_payment_timestamp(payment.paid_at.as_deref()),
+            subscription_period_seconds: payment.subscription_period_seconds,
+            subscription_expiration_date: parse_payment_timestamp(
+                payment.subscription_expiration_date.as_deref(),
+            ),
+            vip_target_expires_at: None,
+            is_recurring: payment.is_recurring,
+            is_first_recurring: payment.is_first_recurring,
         },
     })
 }
@@ -6038,11 +6104,19 @@ fn successful_payment_message_from_message(
         return None;
     };
     let user = message.sender.get_user()?;
+    let mut payment = successful_payment_from_telegram(payment);
+    payment.paid_at = OffsetDateTime::from_unix_timestamp(message.date).ok();
+    if payment.subscription_period_seconds.is_none()
+        && let (Some(paid_at), Some(expires_at)) =
+            (payment.paid_at, payment.subscription_expiration_date)
+    {
+        payment.subscription_period_seconds = Some((expires_at - paid_at).whole_seconds());
+    }
     Some(SuccessfulPaymentMessage {
         chat_id: message.chat.get_id().into(),
         message_id: i32::try_from(message.id).ok()?,
         user: user_state_from_telegram_user(user),
-        payment: successful_payment_from_telegram(payment),
+        payment,
     })
 }
 
@@ -6064,7 +6138,40 @@ fn successful_payment_from_telegram(payment: &TelegramSuccessfulPayment) -> Succ
         invoice_payload: payment.invoice_payload.clone(),
         telegram_payment_charge_id: payment.telegram_payment_charge_id.clone(),
         provider_payment_charge_id: payment.provider_payment_charge_id.clone(),
+        paid_at: None,
+        subscription_period_seconds: None,
+        subscription_expiration_date: payment_subscription_expiration_date(payment),
+        vip_target_expires_at: None,
+        is_recurring: payment.is_recurring,
+        is_first_recurring: payment.is_first_recurring,
     }
+}
+
+fn payment_subscription_expiration_date(
+    payment: &TelegramSuccessfulPayment,
+) -> Option<OffsetDateTime> {
+    payment
+        .subscription_expiration_date
+        .and_then(|timestamp| OffsetDateTime::from_unix_timestamp(timestamp).ok())
+}
+
+fn payment_subscription_period_seconds_from_expiration(
+    payment: &TelegramSuccessfulPayment,
+    paid_at: OffsetDateTime,
+) -> Option<i64> {
+    payment_subscription_expiration_date(payment)
+        .map(|expires_at| (expires_at - paid_at).whole_seconds())
+        .filter(|seconds| *seconds > 0)
+}
+
+fn format_payment_timestamp(timestamp: OffsetDateTime) -> String {
+    timestamp
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| timestamp.unix_timestamp().to_string())
+}
+
+fn parse_payment_timestamp(value: Option<&str>) -> Option<OffsetDateTime> {
+    value.and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
 }
 
 #[must_use]
@@ -6168,7 +6275,8 @@ where
     Effects: SuccessfulPaymentEffects + Sync,
 {
     persist_payment_user(store, &message.user).await;
-    let expires_at = now + time::Duration::days(openplotva_telegram::SUBSCRIPTION_DURATION_DAYS);
+    let expires_at = subscription_payment_target_expires_at(&message.payment, now);
+    let vip_target_expires_at = message.payment.vip_target_expires_at.unwrap_or(expires_at);
     let mut duplicate_subscription = false;
     let subscription = match store
         .create_subscription(subscription_create(
@@ -6232,12 +6340,66 @@ where
         }
     };
 
+    match store
+        .get_vip_event_by_subscription_id(subscription.id)
+        .await
+    {
+        Ok(Some(event)) => {
+            send_payment_text(
+                effects,
+                message,
+                &subscription_success_text(event.effective_expires_at),
+                "",
+            )
+            .await;
+            let _ = effects.invalidate_vip_cache(message.user.id).await;
+            return SuccessfulPaymentReport::new(
+                SuccessfulPaymentOutcome::SubscriptionDuplicateProcessed,
+            );
+        }
+        Ok(None) => {}
+        Err(error) => {
+            send_payment_text(
+                effects,
+                message,
+                SUBSCRIPTION_DETAILS_ERROR_TEXT,
+                openplotva_telegram::TELEGRAM_PARSE_MODE_HTML,
+            )
+            .await;
+            return SuccessfulPaymentReport::with_error(
+                SuccessfulPaymentOutcome::SubscriptionStorageError,
+                error,
+            );
+        }
+    }
+
+    let current_effective_expires_at = match store.get_vip_summary_by_user(message.user.id).await {
+        Ok(summary) => summary.map(|summary| summary.effective_expires_at),
+        Err(error) => {
+            send_payment_text(
+                effects,
+                message,
+                SUBSCRIPTION_DETAILS_ERROR_TEXT,
+                openplotva_telegram::TELEGRAM_PARSE_MODE_HTML,
+            )
+            .await;
+            return SuccessfulPaymentReport::with_error(
+                SuccessfulPaymentOutcome::SubscriptionStorageError,
+                error,
+            );
+        }
+    };
+    let delta_seconds = subscription_delta_seconds_to_target(
+        vip_target_expires_at,
+        now,
+        current_effective_expires_at,
+    );
     let reason = subscription_payment_reason(&message.payment.telegram_payment_charge_id);
     let event = match store
         .create_vip_event(VipEventCreate {
             user_id: message.user.id,
             event_type: VIP_EVENT_TYPE_PAYMENT,
-            delta_seconds: vip_days_to_seconds(openplotva_telegram::SUBSCRIPTION_DURATION_DAYS),
+            delta_seconds,
             subscription_id: Some(subscription.id),
             actor_user_id: None,
             reason: Some(&reason),
@@ -6393,6 +6555,40 @@ fn subscription_create<'a>(
         provider_payment_charge_id: &payment.provider_payment_charge_id,
         expires_at,
     }
+}
+
+#[must_use]
+pub fn subscription_payment_target_expires_at(
+    payment: &SuccessfulPayment,
+    now: OffsetDateTime,
+) -> OffsetDateTime {
+    if let Some(expires_at) = payment.subscription_expiration_date
+        && expires_at > now
+    {
+        return expires_at;
+    }
+    let paid_at = payment.paid_at.unwrap_or(now);
+    paid_at + TimeDuration::seconds(subscription_payment_period_seconds(payment))
+}
+
+#[must_use]
+pub fn subscription_payment_period_seconds(payment: &SuccessfulPayment) -> i64 {
+    payment
+        .subscription_period_seconds
+        .filter(|seconds| *seconds > 0)
+        .unwrap_or(openplotva_telegram::SUBSCRIPTION_PERIOD_SECONDS)
+}
+
+#[must_use]
+pub fn subscription_delta_seconds_to_target(
+    target_expires_at: OffsetDateTime,
+    now: OffsetDateTime,
+    current_effective_expires_at: Option<OffsetDateTime>,
+) -> i64 {
+    let base = current_effective_expires_at
+        .filter(|expires_at| *expires_at > now)
+        .unwrap_or(now);
+    (target_expires_at - base).whole_seconds().max(0)
 }
 
 fn donation_create(message: &SuccessfulPaymentMessage) -> DonationCreate<'_> {
@@ -6646,6 +6842,155 @@ mod tests {
                 reason: Some("payment telegram-charge"),
             }]
         );
+        assert_eq!(
+            effects.sent_texts(),
+            vec![subscription_success_text(expires_at)]
+        );
+        assert_eq!(effects.invalidated_vip_users(), vec![42]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn subscription_payment_uses_payment_time_for_delayed_processing()
+    -> Result<(), Box<dyn Error>> {
+        let paid_at = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let now = paid_at + time::Duration::days(2);
+        let expires_at = paid_at + time::Duration::days(30);
+        let store = StoreStub::new().with_next_vip_event(VipEventRecord {
+            id: 77,
+            user_id: 42,
+            event_type: VIP_EVENT_TYPE_PAYMENT.to_owned(),
+            delta_seconds: vip_days_to_seconds(28),
+            effective_expires_at: expires_at,
+            subscription_id: Some(10),
+            actor_user_id: None,
+            reason: "payment telegram-charge".to_owned(),
+            created_at: now,
+        });
+        let effects = EffectsStub::default();
+        let mut message = sample_message("subscription_42", 300);
+        message.payment.paid_at = Some(paid_at);
+        message.payment.subscription_period_seconds =
+            Some(openplotva_telegram::SUBSCRIPTION_PERIOD_SECONDS);
+
+        let report = process_successful_payment_at(&store, &effects, &message, now).await;
+
+        assert_eq!(
+            report.outcome,
+            SuccessfulPaymentOutcome::SubscriptionProcessed
+        );
+        assert_eq!(
+            store.subscriptions(),
+            vec![SubscriptionCreate {
+                user_id: 42,
+                telegram_payment_charge_id: "telegram-charge",
+                provider_payment_charge_id: "provider-charge",
+                expires_at,
+            }]
+        );
+        assert_eq!(
+            store.vip_events(),
+            vec![VipEventCreate {
+                user_id: 42,
+                event_type: VIP_EVENT_TYPE_PAYMENT,
+                delta_seconds: vip_days_to_seconds(28),
+                subscription_id: Some(10),
+                actor_user_id: None,
+                reason: Some("payment telegram-charge"),
+            }]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn subscription_payment_extends_from_current_effective_expiry()
+    -> Result<(), Box<dyn Error>> {
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let current_expires_at = now + time::Duration::days(10);
+        let target_expires_at = now + time::Duration::days(30);
+        let store = StoreStub::new()
+            .with_successful_payment_summary(Some(VipSummaryRecord {
+                latest_event_id: 76,
+                user_id: 42,
+                latest_event_type: VIP_EVENT_TYPE_PAYMENT.to_owned(),
+                latest_delta_seconds: vip_days_to_seconds(10),
+                effective_expires_at: current_expires_at,
+                is_active: true,
+                remaining_seconds: vip_days_to_seconds(10),
+                latest_subscription_id: Some(9),
+                latest_actor_user_id: None,
+                latest_reason: "payment previous-charge".to_owned(),
+                latest_created_at: now - time::Duration::days(20),
+            }))
+            .with_next_vip_event(VipEventRecord {
+                id: 77,
+                user_id: 42,
+                event_type: VIP_EVENT_TYPE_PAYMENT.to_owned(),
+                delta_seconds: vip_days_to_seconds(20),
+                effective_expires_at: target_expires_at,
+                subscription_id: Some(10),
+                actor_user_id: None,
+                reason: "payment telegram-charge".to_owned(),
+                created_at: now,
+            });
+        let effects = EffectsStub::default();
+        let mut message = sample_message("subscription_42", 300);
+        message.payment.paid_at = Some(now);
+        message.payment.subscription_period_seconds =
+            Some(openplotva_telegram::SUBSCRIPTION_PERIOD_SECONDS);
+
+        let report = process_successful_payment_at(&store, &effects, &message, now).await;
+
+        assert_eq!(
+            report.outcome,
+            SuccessfulPaymentOutcome::SubscriptionProcessed
+        );
+        assert_eq!(
+            store.vip_events(),
+            vec![VipEventCreate {
+                user_id: 42,
+                event_type: VIP_EVENT_TYPE_PAYMENT,
+                delta_seconds: vip_days_to_seconds(20),
+                subscription_id: Some(10),
+                actor_user_id: None,
+                reason: Some("payment telegram-charge"),
+            }]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn subscription_payment_does_not_duplicate_existing_subscription_vip_event()
+    -> Result<(), Box<dyn Error>> {
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let expires_at = now + time::Duration::days(30);
+        let existing_event = VipEventRecord {
+            id: 77,
+            user_id: 42,
+            event_type: VIP_EVENT_TYPE_PAYMENT.to_owned(),
+            delta_seconds: vip_days_to_seconds(30),
+            effective_expires_at: expires_at,
+            subscription_id: Some(10),
+            actor_user_id: None,
+            reason: "payment telegram-charge".to_owned(),
+            created_at: now,
+        };
+        let store = StoreStub::new().with_existing_vip_event_by_subscription(existing_event);
+        let effects = EffectsStub::default();
+
+        let report = process_successful_payment_at(
+            &store,
+            &effects,
+            &sample_message("subscription_42", 300),
+            now,
+        )
+        .await;
+
+        assert_eq!(
+            report.outcome,
+            SuccessfulPaymentOutcome::SubscriptionDuplicateProcessed
+        );
+        assert!(store.vip_events().is_empty());
         assert_eq!(
             effects.sent_texts(),
             vec![subscription_success_text(expires_at)]
@@ -6949,8 +7294,52 @@ mod tests {
                 invoice_payload: "subscription_42".to_owned(),
                 telegram_payment_charge_id: "telegram-charge".to_owned(),
                 provider_payment_charge_id: "provider-charge".to_owned(),
+                ..ControlPayment::default()
             })
         );
+        Ok(())
+    }
+
+    #[test]
+    fn successful_payment_update_preserves_recurring_subscription_metadata()
+    -> Result<(), Box<dyn Error>> {
+        let update = sample_recurring_successful_payment_update("subscription_42", 300)?;
+
+        let message = successful_payment_message_from_update(&update)
+            .expect("successful payment should be extracted");
+
+        assert_eq!(
+            message.payment.paid_at,
+            Some(OffsetDateTime::from_unix_timestamp(1_710_000_000)?)
+        );
+        assert_eq!(
+            message.payment.subscription_expiration_date,
+            Some(OffsetDateTime::from_unix_timestamp(1_712_592_000)?)
+        );
+        assert_eq!(message.payment.is_recurring, Some(true));
+        assert_eq!(message.payment.is_first_recurring, Some(false));
+
+        let job = successful_payment_control_job_from_update_at(
+            &update,
+            OffsetDateTime::from_unix_timestamp(1_779_193_800)?,
+        )
+        .expect("successful payment should build control job");
+        let control_payment = job
+            .data
+            .control_data
+            .as_ref()
+            .and_then(|data| data.payment.as_ref())
+            .expect("control payment");
+        assert_eq!(
+            control_payment.paid_at.as_deref(),
+            Some("2024-03-09T16:00:00Z")
+        );
+        assert_eq!(
+            control_payment.subscription_expiration_date.as_deref(),
+            Some("2024-04-08T16:00:00Z")
+        );
+        assert_eq!(control_payment.is_recurring, Some(true));
+        assert_eq!(control_payment.is_first_recurring, Some(false));
         Ok(())
     }
 
@@ -11791,6 +12180,12 @@ mod tests {
                 invoice_payload: payload.to_owned(),
                 telegram_payment_charge_id: "telegram-charge".to_owned(),
                 provider_payment_charge_id: "provider-charge".to_owned(),
+                paid_at: None,
+                subscription_period_seconds: None,
+                subscription_expiration_date: None,
+                vip_target_expires_at: None,
+                is_recurring: None,
+                is_first_recurring: None,
             },
         }
     }
@@ -11826,6 +12221,7 @@ mod tests {
             invoice_payload: "subscription_42".to_owned(),
             telegram_payment_charge_id: "telegram-charge".to_owned(),
             provider_payment_charge_id: "provider-charge".to_owned(),
+            ..ControlPayment::default()
         });
         params
     }
@@ -11931,6 +12327,26 @@ mod tests {
             "update_id": 999,
             "message": message
         }))
+    }
+
+    fn sample_recurring_successful_payment_update(
+        payload: &str,
+        total_amount: i64,
+    ) -> Result<TelegramUpdate, serde_json::Error> {
+        let mut update =
+            serde_json::to_value(sample_successful_payment_update(payload, total_amount)?)?;
+        if let Some(payment) = update
+            .pointer_mut("/message/successful_payment")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            payment.insert("is_recurring".to_owned(), json!(true));
+            payment.insert("is_first_recurring".to_owned(), json!(false));
+            payment.insert(
+                "subscription_expiration_date".to_owned(),
+                json!(1_712_592_000),
+            );
+        }
+        serde_json::from_value(update)
     }
 
     fn sample_text_update() -> Result<TelegramUpdate, serde_json::Error> {
@@ -12357,6 +12773,8 @@ mod tests {
         next_subscription_id: i64,
         next_subscription_error: Option<StubError>,
         existing_subscription: Option<SubscriptionRecord>,
+        successful_payment_summaries: VecDeque<Result<Option<VipSummaryRecord>, StubError>>,
+        existing_vip_event_by_subscription: Option<VipEventRecord>,
         next_donations: VecDeque<DonationRecord>,
         next_vip_events: VecDeque<VipEventRecord>,
         admin_cancel_summaries: VecDeque<Result<Option<VipSummaryRecord>, StubError>>,
@@ -12396,6 +12814,18 @@ mod tests {
 
         fn with_existing_subscription(self, subscription: SubscriptionRecord) -> Self {
             self.lock().existing_subscription = Some(subscription);
+            self
+        }
+
+        fn with_successful_payment_summary(self, summary: Option<VipSummaryRecord>) -> Self {
+            self.lock()
+                .successful_payment_summaries
+                .push_back(Ok(summary));
+            self
+        }
+
+        fn with_existing_vip_event_by_subscription(self, event: VipEventRecord) -> Self {
+            self.lock().existing_vip_event_by_subscription = Some(event);
             self
         }
 
@@ -12547,6 +12977,27 @@ mod tests {
             _telegram_payment_charge_id: &'a str,
         ) -> PaymentStoreFuture<'a, Option<SubscriptionRecord>, Self::Error> {
             Box::pin(async move { Ok(self.lock().existing_subscription.clone()) })
+        }
+
+        fn get_vip_summary_by_user<'a>(
+            &'a self,
+            _user_id: i64,
+        ) -> PaymentStoreFuture<'a, Option<VipSummaryRecord>, Self::Error> {
+            Box::pin(async move {
+                Ok(self
+                    .lock()
+                    .successful_payment_summaries
+                    .pop_front()
+                    .transpose()?
+                    .flatten())
+            })
+        }
+
+        fn get_vip_event_by_subscription_id<'a>(
+            &'a self,
+            _subscription_id: i64,
+        ) -> PaymentStoreFuture<'a, Option<VipEventRecord>, Self::Error> {
+            Box::pin(async move { Ok(self.lock().existing_vip_event_by_subscription.clone()) })
         }
 
         fn create_donation<'a>(

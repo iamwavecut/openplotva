@@ -49,6 +49,9 @@
                 <button class="nav-item" onclick="switchTab('users')">
                     <span>Users</span>
                 </button>
+                <button class="nav-item" onclick="switchTab('vip')">
+                    <span>VIP</span>
+                </button>
                 <button class="nav-item" onclick="switchTab('memory')">
                     <span>Memory</span>
                 </button>
@@ -614,6 +617,63 @@
                         </div>
                     </div>
                     <!-- Memory Tab -->
+                    <div id="vip" class="tab-pane">
+                        <div class="grid-2">
+                            <div class="card">
+                                <div class="card-header">
+                                    <span>VIP Users</span>
+                                    <button type="button" class="btn btn-outline btn-sm" onclick="loadVIPUsers()" data-search-btn>Refresh</button>
+                                </div>
+                                <div class="card-body">
+                                    <form onsubmit="event.preventDefault(); loadVIPUsers();">
+                                        <div class="grid-2 mb-4">
+                                            <div class="form-group">
+                                                <label class="form-label">Search</label>
+                                                <input type="text" id="vip-search-input" class="form-control" placeholder="id, username, name">
+                                            </div>
+                                            <div class="form-group">
+                                                <label class="form-label">Status</label>
+                                                <select id="vip-status-filter" class="form-control">
+                                                    <option value="active" selected>Active</option>
+                                                    <option value="expired">Expired</option>
+                                                    <option value="all">All history</option>
+                                                </select>
+                                            </div>
+                                        </div>
+                                        <button type="submit" class="btn btn-primary btn-block mb-4" data-search-btn>Search VIP</button>
+                                    </form>
+                                    <div id="vip-users-list" class="table-container text-muted">No VIP users loaded</div>
+                                </div>
+                            </div>
+
+                            <div class="card">
+                                <div class="card-header">VIP Operations</div>
+                                <div class="card-body">
+                                    <div class="form-group">
+                                        <label class="form-label">Telegram User ID</label>
+                                        <input type="text" id="vip-target-user-id" class="form-control" placeholder="1259816497">
+                                    </div>
+                                    <div class="form-group">
+                                        <label class="form-label">Days</label>
+                                        <input type="number" id="vip-adjust-days" class="form-control" value="30" min="1">
+                                    </div>
+                                    <div class="form-group">
+                                        <label class="form-label">Reason</label>
+                                        <input type="text" id="vip-adjust-reason" class="form-control" placeholder="manual bonus / downtime compensation">
+                                    </div>
+                                    <div class="d-flex gap-2 mb-4">
+                                        <button class="btn btn-success" onclick="adjustVIPDays(1)">Add Days</button>
+                                        <button class="btn btn-primary" onclick="adjustVIPDays(-1)">Subtract Days</button>
+                                        <button class="btn btn-danger" onclick="revokeVIPFromPanel()">Revoke All</button>
+                                    </div>
+                                    <div class="text-muted" style="font-size: 0.82rem;">
+                                        Operations write VIP ledger events in Postgres and invalidate VIP cache. Telegram Stars renewal dates are not changed.
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
                     <div id="memory" class="tab-pane">
                         <div class="card">
                             <div class="card-header">
@@ -1094,6 +1154,7 @@
                 'redis': 'Redis',
                 'chats': 'Chats',
                 'users': 'Users',
+                'vip': 'VIP',
                 'memory': 'Memory',
                 'shield': 'Shield',
                 'llm': 'LLM Context',
@@ -1122,6 +1183,9 @@
             if (tabId === 'memory') {
                 loadMemoryCards();
                 loadMemoryRuns();
+            }
+            if (tabId === 'vip') {
+                loadVIPUsers();
             }
             if (tabId === 'shield') {
                 loadShieldDocuments();
@@ -1585,7 +1649,7 @@
             }
 
             const header = `
-                <table>
+                <table class="table">
                     <thead>
                         <tr>
                             <th>ID</th>
@@ -1687,6 +1751,101 @@
             document.getElementById('user-vip-events').innerHTML = '<div class="text-muted">No VIP events</div>';
             document.getElementById('user-subscriptions').innerHTML = '<div class="text-muted">No subscriptions</div>';
             searchUsers();
+        }
+
+        // --- VIP ---
+        async function loadVIPUsers() {
+            const q = (document.getElementById('vip-search-input')?.value || '').trim();
+            const status = document.getElementById('vip-status-filter')?.value || 'active';
+            const params = new URLSearchParams({ status });
+            if (q) params.set('q', q);
+            const data = await apiCall(`/vip/users?${params.toString()}`);
+            if (!data) return;
+            renderVIPUsers(data.users || []);
+        }
+
+        function renderVIPUsers(items) {
+            const container = document.getElementById('vip-users-list');
+            if (!Array.isArray(items) || items.length === 0) {
+                container.innerHTML = '<div class="text-muted">No VIP users found</div>';
+                return;
+            }
+            const header = `
+                <table>
+                    <thead>
+                        <tr>
+                            <th>User</th>
+                            <th>Status</th>
+                            <th>VIP until</th>
+                            <th>Remaining</th>
+                            <th>Last event</th>
+                            <th>Subscriptions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+            `;
+            const body = items.map(item => {
+                const user = item.user || {};
+                const summary = item.vip_summary || {};
+                const username = user.username ? `@${user.username}` : '---';
+                const displayName = `${user.first_name || ''} ${user.last_name || ''}`.trim() || `User ${user.id}`;
+                const statusClass = summary.active ? 'badge-success' : 'badge-danger';
+                const remaining = `${summary.remaining_days || 0}d / ${summary.remaining_seconds || 0}s`;
+                const latest = `${escapeHtml(summary.latest_event_type || '—')}<br><span class="text-muted">${escapeHtml(summary.latest_reason || '—')}</span>`;
+                return `
+                    <tr class="clickable" onclick="openVIPUser('${escapeHtml(String(user.id || ''))}')">
+                        <td>
+                            <div style="font-weight: 600;">${escapeHtml(displayName)}</div>
+                            <div class="text-muted mono">${escapeHtml(username)} | ${escapeHtml(String(user.id || '—'))}</div>
+                        </td>
+                        <td><span class="badge ${statusClass}">${summary.active ? 'active' : 'expired'}</span></td>
+                        <td>${escapeHtml(formatDateValue(summary.expires_at))}</td>
+                        <td class="mono">${escapeHtml(remaining)}</td>
+                        <td>${latest}</td>
+                        <td>
+                            <div class="mono">${escapeHtml(String(item.subscriptions_count || 0))}</div>
+                            <div class="text-muted">${escapeHtml(formatDateValue(item.latest_subscription_expires_at))}</div>
+                        </td>
+                    </tr>
+                `;
+            }).join('');
+            container.innerHTML = header + body + '</tbody></table>';
+        }
+
+        function openVIPUser(userId) {
+            if (!userId) return;
+            document.getElementById('user-id-input').value = userId;
+            document.getElementById('vip-target-user-id').value = userId;
+            switchTab('users');
+            const detailsPane = document.getElementById('pane-users-details');
+            const resizer = document.getElementById('resizer-users');
+            const listPane = document.querySelector('#pane-users .pane-list');
+            detailsPane.classList.remove('hidden');
+            resizer.classList.remove('hidden');
+            listPane.style.flex = '0 0 33%';
+            loadUser();
+        }
+
+        async function adjustVIPDays(sign) {
+            const id = (document.getElementById('vip-target-user-id').value || '').trim();
+            const rawDays = parseInt(document.getElementById('vip-adjust-days').value, 10);
+            const reason = (document.getElementById('vip-adjust-reason').value || '').trim();
+            if (!id || !rawDays) return;
+            const days = Math.abs(rawDays) * sign;
+            const result = await apiCall('/user/grant_vip', { method: 'POST', body: { user_id: id, days, reason } });
+            if (!result) return;
+            alert(`VIP adjusted. Effective until: ${formatDateValue(result.expires_at)}`);
+            loadVIPUsers();
+        }
+
+        async function revokeVIPFromPanel() {
+            const id = (document.getElementById('vip-target-user-id').value || '').trim();
+            const reason = (document.getElementById('vip-adjust-reason').value || '').trim();
+            if (!id || !confirm(`Revoke VIP for ${id}?`)) return;
+            const result = await apiCall(`/user/revoke_vip?user_id=${encodeURIComponent(id)}&reason=${encodeURIComponent(reason)}`, { method: 'DELETE' });
+            if (!result) return;
+            alert(result.revoked ? 'VIP revoked' : 'User has no active VIP');
+            loadVIPUsers();
         }
 
         // --- Memory ---

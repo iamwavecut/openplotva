@@ -898,7 +898,8 @@ where
 {
     let update_id = update.id;
     let name = update_name(&update);
-    let skip_handle = should_skip_side_effects_at(&update, config.side_effect_max_age, now);
+    let skip_handle = should_skip_side_effects_at(&update, config.side_effect_max_age, now)
+        && !stale_update_requires_handle(&update);
     let state_task = run_tracked_stage(
         &update,
         UpdateStage::State,
@@ -1795,6 +1796,15 @@ pub fn should_skip_side_effects_at(
     };
     let now_secs = unix_timestamp_seconds(now);
     i128::from(update_date) + i128::from(max_age.as_secs()) <= now_secs
+}
+
+#[must_use]
+pub fn stale_update_requires_handle(update: &TelegramUpdate) -> bool {
+    matches!(
+        &update.update_type,
+        TelegramUpdateType::Message(message)
+            if matches!(message.data, TelegramMessageData::SuccessfulPayment(_))
+    )
 }
 
 fn extract_update_chat(update: &TelegramUpdate) -> Option<&TelegramChat> {
@@ -6505,6 +6515,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_consumer_handles_stale_successful_payment() -> Result<(), Box<dyn Error>> {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let state_calls = calls.clone();
+        let handle_calls = calls.clone();
+        let update = sample_successful_payment_update_with_date(1_710_000_000)?;
+        let now = UNIX_EPOCH + Duration::from_secs(1_710_000_060);
+
+        let report = process_update_at(
+            update,
+            UpdateConsumerConfig::default(),
+            now,
+            move |_| async move {
+                push_call(&state_calls, "state")?;
+                Ok::<_, io::Error>(())
+            },
+            move |_| async move {
+                push_call(&handle_calls, "handle")?;
+                Ok::<_, io::Error>(())
+            },
+        )
+        .await;
+
+        assert_eq!(
+            calls
+                .lock()
+                .map_err(|err| io::Error::other(err.to_string()))?
+                .as_slice(),
+            ["state", "handle"]
+        );
+        assert_eq!(report.state.outcome, UpdateStageOutcome::Completed);
+        assert_eq!(
+            report.handle.as_ref().map(|stage| &stage.outcome),
+            Some(&UpdateStageOutcome::Completed)
+        );
+        assert!(!report.skipped_handle);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn update_consumer_reports_stage_timeouts() -> Result<(), Box<dyn Error>> {
         let update = sample_message_update()?;
         let config = UpdateConsumerConfig {
@@ -6796,6 +6846,32 @@ mod tests {
         serde_json::from_value(json!({
             "update_id": 12345,
             "message": sample_message_json(77, date, "/start hello")
+        }))
+    }
+
+    fn sample_successful_payment_update_with_date(
+        date: i64,
+    ) -> Result<TelegramUpdate, serde_json::Error> {
+        serde_json::from_value(json!({
+            "update_id": 12346,
+            "message": {
+                "message_id": 78,
+                "date": date,
+                "chat": {
+                    "id": 42,
+                    "type": "private",
+                    "first_name": "Alice",
+                    "username": "alice"
+                },
+                "from": sample_user_json(),
+                "successful_payment": {
+                    "currency": "XTR",
+                    "total_amount": 300,
+                    "invoice_payload": "subscription_42",
+                    "telegram_payment_charge_id": "telegram-charge",
+                    "provider_payment_charge_id": "provider-charge"
+                }
+            }
         }))
     }
 
