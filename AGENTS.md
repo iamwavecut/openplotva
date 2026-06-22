@@ -39,6 +39,14 @@
 - Sanitize Telegram-visible HTML at the boundary before sending, splitting, deduping, or persisting.
 - Treat Settings WebApp state, Telegram login data, payment callbacks, provider credentials, and admin/runtime tokens as security boundaries.
 
+## Web UI / Design System
+
+- The admin UI (`web/admin/`) is a token-driven component library. Route every interactive element through the `pl-*` custom elements (`web/admin/components.js`) and token-backed classes; never write raw `<button>/<input>/<select>/<textarea>/<table>`, `onclick=`/`onsubmit=`, `el.onclick =`, inline `style=`, hex/`rgb()` colors, or native `alert()/confirm()` in `web/admin/`.
+- Feedback is non-blocking via `PL.toast`; dialogs use `PL.alert`/`PL.confirm`. Every async load shows loading (skeleton/`pl-table` state), empty, and error states.
+- Colors/spacing/type/motion/elevation/z-index live only in `web/admin/tokens.css`. `admin.css`/`components.css` reference tokens; no literals.
+- Editing or adding any `web/` asset requires updating the matching `sha256` constant in `crates/openplotva-web/src/lib.rs` and running `cargo test -p openplotva-web` (the guard + hash tests enforce all of the above).
+- Run the `openplotva-design-system-review` skill before merging admin UI changes. The Settings WebApp (`web/settings/`, Framework7 + Telegram theme) is a separate boundary, out of scope for this library.
+
 ## Useful Checks
 
 - Formatting: `cargo fmt --all`.

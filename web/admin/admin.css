@@ -1,72 +1,6 @@
-:root {
-    --c-bg-app: #0f172a;
-    --c-bg-sidebar: #1e293b;
-    --c-bg-card: #1e293b;
-    --c-bg-card-hover: #334155;
-    --c-bg-input: #0f172a;
-
-    --c-border: #334155;
-    --c-border-light: #475569;
-
-    --c-primary: #6366f1;
-    --c-primary-hover: #4f46e5;
-    --c-primary-light: rgba(99, 102, 241, 0.15);
-    --c-accent: #22d3ee;
-
-    --c-success: #10b981;
-    --c-warning: #f59e0b;
-    --c-danger: #ef4444;
-
-    --c-text-main: #f8fafc;
-    --c-text-sec: #94a3b8;
-    --c-text-muted: #64748b;
-    --sp-1: 0.25rem;
-    --sp-2: 0.5rem;
-    --sp-3: 0.75rem;
-    --sp-4: 1rem;
-    --sp-6: 1.5rem;
-    --sp-8: 2rem;
-    --w-sidebar: 280px;
-    --h-header: 64px;
-    --rad-sm: 4px;
-    --rad-md: 8px;
-    --rad-lg: 12px;
-    --rad-full: 9999px;
-    --font-sans: 'Inter', system-ui, sans-serif;
-    --font-mono: 'JetBrains Mono', monospace;
-    --trans-fast: 0.15s ease;
-    --trans-norm: 0.25s ease;
-}
-
-*,
-*::before,
-*::after {
-    box-sizing: border-box;
-}
-
-body {
-    margin: 0;
-    font-family: var(--font-sans);
-    background-color: var(--c-bg-app);
-    color: var(--c-text-main);
-    line-height: 1.5;
-    -webkit-font-smoothing: antialiased;
-}
-
-[data-theme="light"] {
-    --c-bg-app: #f1f5f9;
-    --c-bg-sidebar: #ffffff;
-    --c-bg-card: #ffffff;
-    --c-bg-card-hover: #f8fafc;
-    --c-bg-input: #f8fafc;
-
-    --c-border: #e2e8f0;
-    --c-border-light: #cbd5e1;
-
-    --c-text-main: #0f172a;
-    --c-text-sec: #64748b;
-    --c-text-muted: #94a3b8;
-}
+/* Design tokens (colors, spacing, type, motion, z-index, elevation) live in tokens.css,
+   which is linked before this file. This stylesheet owns layout + legacy component classes
+   and references tokens only — no raw color literals. */
 
 *,
 *::before,
@@ -123,11 +57,11 @@ body {
 }
 
 [data-theme="dark"] ::-webkit-scrollbar-thumb {
-    background: rgba(255, 255, 255, 0.1);
+    background: var(--c-scrollbar-thumb);
 }
 
 [data-theme="dark"] ::-webkit-scrollbar-thumb:hover {
-    background: rgba(255, 255, 255, 0.2);
+    background: var(--c-scrollbar-thumb-hover);
 }
 
 .app-layout {
@@ -162,13 +96,11 @@ body {
     align-items: center;
     justify-content: center;
     flex: 0 0 auto;
-    background:
-        linear-gradient(135deg, rgba(34, 211, 238, 0.92), rgba(99, 102, 241, 0.95)),
-        #0f172a;
-    color: white;
-    font-weight: 800;
+    background: var(--grad-brand);
+    color: var(--c-text-on-primary);
+    font-weight: var(--fw-extrabold);
     letter-spacing: 0;
-    box-shadow: 0 12px 30px rgba(34, 211, 238, 0.18);
+    box-shadow: var(--elev-glow-brand);
 }
 
 .brand-mark-lg {
@@ -297,7 +229,7 @@ body {
     border-radius: var(--rad-lg);
     overflow: hidden;
     margin-bottom: var(--sp-6);
-    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+    box-shadow: var(--elev-1);
 }
 
 .card-header {
@@ -726,7 +658,7 @@ textarea.form-control {
 .loader-overlay {
     position: fixed;
     inset: 0;
-    background: rgba(15, 23, 42, 0.5);
+    background: var(--c-scrim);
     backdrop-filter: blur(2px);
     display: flex;
     align-items: center;
@@ -778,22 +710,22 @@ textarea.form-control {
 }
 
 .btn-danger {
-    background-color: rgba(239, 68, 68, 0.1);
+    background-color: var(--c-danger-bg);
     color: var(--c-danger);
     border: 1px solid transparent;
 }
 
 .btn-danger:hover {
-    background-color: rgba(239, 68, 68, 0.2);
+    background-color: var(--c-danger-bg-strong);
 }
 
 .btn-success {
-    background-color: rgba(16, 185, 129, 0.1);
+    background-color: var(--c-success-bg);
     color: var(--c-success);
 }
 
 .btn-success:hover {
-    background-color: rgba(16, 185, 129, 0.2);
+    background-color: var(--c-success-bg-strong);
 }
 
 .btn-sm {
@@ -983,11 +915,11 @@ textarea.form-control {
 }
 
 .json-node.is-active {
-    border-left-color: rgba(99, 102, 241, 0.75);
+    border-left-color: color-mix(in srgb, var(--c-primary) 75%, transparent);
 }
 
 .json-node.is-active-ancestor {
-    border-left-color: rgba(99, 102, 241, 0.45);
+    border-left-color: color-mix(in srgb, var(--c-primary) 45%, transparent);
 }
 
 .json-node-text .json-node-header {
@@ -1054,63 +986,63 @@ textarea.form-control {
 }
 
 .badge-success {
-    background-color: rgba(16, 185, 129, 0.15);
+    background-color: var(--c-success-bg);
     color: var(--c-success);
 }
 
 .badge-danger {
-    background-color: rgba(239, 68, 68, 0.15);
+    background-color: var(--c-danger-bg);
     color: var(--c-danger);
 }
 
 .badge-private {
-    background-color: rgba(99, 102, 241, 0.15);
+    background-color: var(--c-primary-bg);
     color: var(--c-primary);
 }
 
 .badge-group {
-    background-color: rgba(16, 185, 129, 0.15);
+    background-color: var(--c-success-bg);
     color: var(--c-success);
 }
 
 .badge-supergroup {
-    background-color: rgba(245, 158, 11, 0.15);
+    background-color: var(--c-warning-bg);
     color: var(--c-warning);
 }
 
 .badge-channel {
-    background-color: rgba(239, 68, 68, 0.15);
+    background-color: var(--c-danger-bg);
     color: var(--c-danger);
 }
 
 .badge-shield-red {
-    background-color: rgba(239, 68, 68, 0.16);
-    color: #f87171;
+    background-color: color-mix(in srgb, var(--c-shield-red) 16%, transparent);
+    color: var(--c-shield-red);
 }
 
 .badge-shield-orange {
-    background-color: rgba(249, 115, 22, 0.16);
-    color: #fb923c;
+    background-color: color-mix(in srgb, var(--c-shield-orange) 16%, transparent);
+    color: var(--c-shield-orange);
 }
 
 .badge-shield-yellow {
-    background-color: rgba(245, 158, 11, 0.16);
-    color: var(--c-warning);
+    background-color: color-mix(in srgb, var(--c-shield-yellow) 16%, transparent);
+    color: var(--c-shield-yellow);
 }
 
 .badge-shield-violet {
-    background-color: rgba(139, 92, 246, 0.16);
-    color: #a78bfa;
+    background-color: color-mix(in srgb, var(--c-shield-violet) 16%, transparent);
+    color: var(--c-shield-violet);
 }
 
 .badge-shield-cyan {
-    background-color: rgba(34, 211, 238, 0.16);
-    color: var(--c-accent);
+    background-color: color-mix(in srgb, var(--c-shield-cyan) 16%, transparent);
+    color: var(--c-shield-cyan);
 }
 
 .badge-shield-neutral {
-    background-color: rgba(148, 163, 184, 0.16);
-    color: var(--c-text-sec);
+    background-color: color-mix(in srgb, var(--c-shield-neutral) 16%, transparent);
+    color: var(--c-shield-neutral);
 }
 
 .checkbox-row {
@@ -1132,12 +1064,17 @@ textarea.form-control {
     color: var(--c-text-sec);
     width: 36px;
     height: 36px;
+    padding: 0;
     border-radius: var(--rad-full);
     display: flex;
     align-items: center;
     justify-content: center;
     cursor: pointer;
     transition: var(--trans-fast);
+}
+
+.app-version {
+    font-size: var(--fs-sm);
 }
 
 .theme-toggle:hover {
@@ -1182,10 +1119,7 @@ textarea.form-control {
     display: flex;
     align-items: center;
     justify-content: center;
-    background:
-        radial-gradient(circle at top right, rgba(34, 211, 238, 0.16), transparent 34rem),
-        radial-gradient(circle at bottom left, rgba(99, 102, 241, 0.18), transparent 30rem),
-        #0f172a;
+    background: var(--grad-login);
 }
 
 .login-card {
@@ -1196,7 +1130,7 @@ textarea.form-control {
     border-radius: var(--rad-lg);
     padding: var(--sp-8);
     text-align: center;
-    box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.3);
+    box-shadow: var(--elev-3);
 }
 
 .login-brand {
@@ -1286,11 +1220,11 @@ textarea.form-control {
 }
 
 .log-entry:hover {
-    background: rgba(255, 255, 255, 0.03);
+    background: var(--c-row-hover-overlay);
 }
 
 .log-entry.expanded {
-    background: rgba(255, 255, 255, 0.05);
+    background: var(--c-row-active-overlay);
 }
 
 .log-time {
@@ -1308,7 +1242,7 @@ textarea.form-control {
     margin-right: 10px;
     min-width: 50px;
     text-align: center;
-    background: rgba(128, 128, 128, 0.1);
+    background: color-mix(in srgb, var(--c-text-sec) 14%, transparent);
 }
 
 .log-msg {
@@ -1316,30 +1250,30 @@ textarea.form-control {
 }
 
 .log-debug .log-level {
-    color: #888;
-    background: rgba(136, 136, 136, 0.1);
+    color: var(--c-log-debug);
+    background: color-mix(in srgb, var(--c-log-debug) 12%, transparent);
 }
 
 .log-info .log-level {
-    color: #3498db;
-    background: rgba(52, 152, 219, 0.1);
+    color: var(--c-log-info);
+    background: color-mix(in srgb, var(--c-log-info) 12%, transparent);
 }
 
 .log-warn .log-level {
-    color: #f39c12;
-    background: rgba(243, 156, 18, 0.1);
+    color: var(--c-log-warn);
+    background: color-mix(in srgb, var(--c-log-warn) 12%, transparent);
 }
 
 .log-error .log-level {
-    color: #e74c3c;
-    background: rgba(231, 76, 60, 0.1);
+    color: var(--c-log-error);
+    background: color-mix(in srgb, var(--c-log-error) 12%, transparent);
 }
 
 .log-details {
     display: none;
     padding: 10px;
     margin-top: 5px;
-    background: rgba(0, 0, 0, 0.2);
+    background: color-mix(in srgb, var(--p-slate-950) 45%, transparent);
     border-radius: 4px;
     overflow-x: auto;
     font-size: 0.8rem;
@@ -1354,43 +1288,43 @@ textarea.form-control {
     width: 8px;
     height: 8px;
     border-radius: 50%;
-    background: #ccc;
+    background: var(--c-status-idle);
     margin-left: 10px;
 }
 
 .status-connected {
-    background: #2ecc71;
-    box-shadow: 0 0 5px #2ecc71;
+    background: var(--c-status-ok);
+    box-shadow: 0 0 5px var(--c-status-ok);
 }
 
 .status-connecting {
-    background: #f1c40f;
+    background: var(--c-status-warn);
 }
 
 .status-error {
-    background: #e74c3c;
-    box-shadow: 0 0 5px #e74c3c;
+    background: var(--c-status-err);
+    box-shadow: 0 0 5px var(--c-status-err);
 }
 
 /* JSON Highlighting */
 .json-key {
-    color: #e06c75;
+    color: var(--c-json-key);
 }
 
 .json-string {
-    color: #98c379;
+    color: var(--c-json-string);
 }
 
 .json-number {
-    color: #d19a66;
+    color: var(--c-json-number);
 }
 
 .json-boolean {
-    color: #61afef;
+    color: var(--c-json-boolean);
 }
 
 .json-null {
-    color: #c678dd;
+    color: var(--c-json-null);
 }
 
 @media (min-width: 769px) {

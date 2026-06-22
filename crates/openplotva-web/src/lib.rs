@@ -34,10 +34,28 @@ pub struct StaticAsset {
 
 const ADMIN_ASSETS: &[StaticAsset] = &[
     StaticAsset {
+        path: "tokens.css",
+        content_type: "text/css; charset=utf-8",
+        bytes: include_bytes!("../../../web/admin/tokens.css"),
+        sha256: "d00160897b126937b4e7c65d85319532187431d0aa7572ddefebcef7648c800e",
+    },
+    StaticAsset {
         path: "admin.css",
         content_type: "text/css; charset=utf-8",
         bytes: include_bytes!("../../../web/admin/admin.css"),
-        sha256: "fabe22a83932e1670f2174f64ee39ef82f0bea9d86d501c31ea92584881f8b7b",
+        sha256: "935139a851f69b7bceb6d49dd2df38a75117a3851066ac757d0ea0cb27000b50",
+    },
+    StaticAsset {
+        path: "components.css",
+        content_type: "text/css; charset=utf-8",
+        bytes: include_bytes!("../../../web/admin/components.css"),
+        sha256: "77cdacfc8df29362d64140757b642265a1e1afc91791e4aa6e1715f287e2b03e",
+    },
+    StaticAsset {
+        path: "components.js",
+        content_type: "text/javascript; charset=utf-8",
+        bytes: include_bytes!("../../../web/admin/components.js"),
+        sha256: "e49f05b17a536d4c91a3e2bd6ad131e7ea3a29616a594baa5f798c3e33e806c9",
     },
     StaticAsset {
         path: "favicon.svg",
@@ -49,7 +67,7 @@ const ADMIN_ASSETS: &[StaticAsset] = &[
         path: "index.html",
         content_type: "text/html; charset=utf-8",
         bytes: include_bytes!("../../../web/admin/index.html"),
-        sha256: "d898eb994099b57b6b4234933aa8fb5ae60f30972c335880f80195fcdef3b8af",
+        sha256: "684b7530ba8a981fd3d5ce8d8dccd57124a80edf5092806d8601768e93b3a444",
     },
     StaticAsset {
         path: "login.html",
@@ -455,6 +473,86 @@ mod tests {
                 );
             }
         }
+    }
+
+    // --- Design-system enforcement ("no bypassing") ---
+    // The admin UI must route every interactive element through the pl-* component
+    // library (web/admin/components.js) and tokens (web/admin/tokens.css). These tests
+    // fail the build if hand-rolled controls, inline handlers/styles, native dialogs,
+    // or hardcoded colors creep back into the shipped admin assets.
+
+    const ADMIN_INDEX_HTML: &str = include_str!("../../../web/admin/index.html");
+    const ADMIN_COMPONENTS_CSS: &str = include_str!("../../../web/admin/components.css");
+    const ADMIN_CSS: &str = include_str!("../../../web/admin/admin.css");
+
+    #[test]
+    fn admin_markup_routes_through_design_system() {
+        let html = ADMIN_INDEX_HTML;
+        // No inline event handlers or styles in the app markup.
+        assert!(
+            !html.contains("onclick="),
+            "index.html must not use inline onclick= (wire actions via data-action)"
+        );
+        assert!(
+            !html.contains("onsubmit="),
+            "index.html must not use inline onsubmit= (use <form data-action>)"
+        );
+        assert!(
+            !html.contains("style=\""),
+            "index.html must not use inline style= (use token-backed classes)"
+        );
+        assert!(
+            !html.contains(".onclick ="),
+            "use addEventListener, not el.onclick ="
+        );
+
+        // Native dialogs are forbidden: every alert(/confirm( must be a PL.* call.
+        assert_eq!(
+            html.matches("alert(").count(),
+            html.matches("PL.alert(").count(),
+            "index.html must use PL.toast/PL.alert, not native alert()"
+        );
+        assert_eq!(
+            html.matches("confirm(").count(),
+            html.matches("PL.confirm(").count(),
+            "index.html must use PL.confirm, not native confirm()"
+        );
+
+        // Interactive controls come from the pl-* library, not raw HTML tags.
+        for tag in ["<button", "<input", "<select", "<textarea", "<table"] {
+            assert!(
+                !html.contains(tag),
+                "index.html must not contain a raw {tag} — use the matching pl-* component"
+            );
+        }
+
+        // The library + tokens must stay wired in.
+        for asset in ["tokens.css", "components.css", "components.js"] {
+            assert!(html.contains(asset), "index.html must link {asset}");
+        }
+    }
+
+    #[test]
+    fn admin_styles_keep_colors_in_tokens() {
+        // components.css and admin.css reference tokens only — color literals live in tokens.css.
+        for (name, css) in [
+            ("components.css", ADMIN_COMPONENTS_CSS),
+            ("admin.css", ADMIN_CSS),
+        ] {
+            assert!(
+                !css.contains(": #") && !css.contains(":#"),
+                "{name} must not hardcode hex color values — use var(--c-*) tokens from tokens.css"
+            );
+            assert!(
+                !css.contains("rgba(") && !css.contains("rgb("),
+                "{name} must not hardcode rgb/rgba colors — use tokens or color-mix(var(--c-*))"
+            );
+        }
+        // The token layer was extracted out of admin.css into tokens.css.
+        assert!(
+            !ADMIN_CSS.contains("--c-primary:"),
+            "design tokens must be defined in tokens.css, not admin.css"
+        );
     }
 
     #[test]

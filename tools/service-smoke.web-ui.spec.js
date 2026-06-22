@@ -107,21 +107,18 @@ test('admin login gate and authenticated shell render', async ({ page, context }
     return response.url().endsWith('/admin/api/loglevel')
       && response.request().method() === 'POST';
   });
-  page.once('dialog', async (dialog) => {
-    expect(dialog.message()).toBe('Log level updated');
-    await dialog.accept();
-  });
-  await page.locator('button', { hasText: 'Apply' }).first().click();
+  await page.locator('pl-button[data-action="saveLogLevel"]').click();
   await expect((await loglevelResponse).status()).toBe(200);
+  await expect(page.locator('.pl-toast', { hasText: 'Log level updated to debug.' })).toBeVisible();
 
-  await page.locator('.nav-item', { hasText: 'Redis' }).click();
+  await page.locator('pl-button[data-tab="redis"]').click();
   await expect(page.locator('#page-title')).toHaveText('Redis');
   await page.locator('#redis-pattern-search').fill('*');
   const redisListResponse = page.waitForResponse((response) => {
     return response.url().includes('/admin/api/redis/list?')
       && response.request().method() === 'GET';
   });
-  await page.locator('#redis button[onclick="loadRedisKeys()"]').click();
+  await page.locator('#redis pl-button[data-action="loadRedisKeys"]').click();
   const redisList = await (await redisListResponse).json();
   expect(Array.isArray(redisList.keys)).toBe(true);
 
@@ -133,7 +130,7 @@ test('admin login gate and authenticated shell render', async ({ page, context }
     return response.url().endsWith('/admin/api/memory/runs?limit=100')
       && response.request().method() === 'GET';
   });
-  await page.locator('.nav-item', { hasText: 'Memory' }).click();
+  await page.locator('pl-button[data-tab="memory"]').click();
   const memoryCards = await (await memoryCardsResponse).json();
   await memoryRunsResponse;
   expect(Array.isArray(memoryCards.cards)).toBe(true);
@@ -145,12 +142,12 @@ test('admin login gate and authenticated shell render', async ({ page, context }
     return response.url().includes('/admin/api/shield/documents?')
       && response.request().method() === 'GET';
   });
-  await page.locator('.nav-item', { hasText: 'Shield' }).click();
+  await page.locator('pl-button[data-tab="shield"]').click();
   const shieldDocs = await (await shieldResponse).json();
   expect(Array.isArray(shieldDocs.documents)).toBe(true);
   await expect(page.locator('#shield-meta')).toContainText('documents');
 
-  await page.locator('.nav-item', { hasText: 'Logs' }).click();
+  await page.locator('pl-button[data-tab="logs"]').click();
   await expect(page.locator('#page-title')).toHaveText('Real-time Logs');
   await expect(page.locator('#logs-status')).toHaveClass(/status-connected/);
 
@@ -158,7 +155,7 @@ test('admin login gate and authenticated shell render', async ({ page, context }
     return response.url().includes('/admin/api/chats/search_by_member?user_id=7')
       && response.request().method() === 'GET';
   });
-  await page.locator('.nav-item', { hasText: 'Chats' }).click();
+  await page.locator('pl-button[data-tab="chats"]').click();
   await page.locator('#chat-search-mode').selectOption('member');
   await page.locator('#chat-search-input').fill('7');
   await page.locator('#btn-search-chats').click();
@@ -178,7 +175,7 @@ test('admin login gate and authenticated shell render', async ({ page, context }
     return response.url().includes('/admin/api/chat/members?chat_id=-100777')
       && response.request().method() === 'GET';
   });
-  await page.locator('#pane-chats-details button', { hasText: 'Load Members' }).click();
+  await page.locator('#pane-chats-details pl-button', { hasText: 'Load Members' }).click();
   await chatMembersResponse;
   await expect(page.locator('#chat-members-list')).toContainText('Owner');
 
@@ -188,24 +185,26 @@ test('admin login gate and authenticated shell render', async ({ page, context }
   await page.locator('#chat-proactivity').fill('22');
   await page.locator('#chat-daily-theme').fill('browser-smoke-theme');
   await page.locator('#chat-greeting-html').fill('<b>browser hello</b>');
-  await page.locator('#chat-draw-reply').setChecked(true);
-  await page.locator('#chat-obscenifier').setChecked(true);
-  await page.locator('#chat-profanity').setChecked(false);
+  // pl-toggle is an accessible switch (role=switch), not a native checkbox input:
+  // click it to the desired state rather than using setChecked().
+  for (const [id, want] of [['chat-draw-reply', true], ['chat-obscenifier', true], ['chat-profanity', false]]) {
+    const toggle = page.locator(`#${id}`);
+    if ((await toggle.getAttribute('aria-checked')) !== String(want)) {
+      await toggle.click();
+    }
+  }
   const chatSettingsResponse = page.waitForResponse((response) => {
     return response.url().endsWith('/admin/api/chat/settings')
       && response.request().method() === 'POST';
   });
-  page.once('dialog', async (dialog) => {
-    expect(dialog.message()).toBe('Settings saved');
-    await dialog.accept();
-  });
-  await page.locator('#pane-chats-details button', { hasText: 'Save Settings' }).click();
+  await page.locator('#pane-chats-details pl-button', { hasText: 'Save Settings' }).click();
   expect(await (await chatSettingsResponse).json()).toMatchObject({ ok: true });
+  await expect(page.locator('.pl-toast', { hasText: 'Settings saved' })).toBeVisible();
   const chatReloadAfterSettings = page.waitForResponse((response) => {
     return response.url().includes('/admin/api/chat?chat_id=-100777')
       && response.request().method() === 'GET';
   });
-  await page.locator('#pane-chats-details button').filter({ hasText: /^Load$/ }).click();
+  await page.locator('#pane-chats-details pl-button').filter({ hasText: /^Load$/ }).click();
   await chatReloadAfterSettings;
   await expect(page.locator('#chat-mood')).toHaveValue('browser-smoke-mood');
   await expect(page.locator('#chat-persona')).toHaveValue('browser smoke persona');
@@ -219,12 +218,9 @@ test('admin login gate and authenticated shell render', async ({ page, context }
     return response.url().includes('/admin/api/chat?chat_id=-100777')
       && response.request().method() === 'GET';
   });
-  page.once('dialog', async (dialog) => {
-    expect(dialog.message()).toBe('Chat blocked');
-    await dialog.accept();
-  });
-  await page.locator('#pane-chats-details button', { hasText: 'Block 10m' }).click();
+  await page.locator('#pane-chats-details pl-button', { hasText: 'Block 10m' }).click();
   expect(await (await chatBlockResponse).json()).toHaveProperty('ok', true);
+  await expect(page.locator('.pl-toast', { hasText: 'Chat blocked' })).toBeVisible();
   await chatReloadAfterBlock;
   await expect(page.locator('#chat-details')).toContainText('"blocked": true');
 
@@ -236,12 +232,9 @@ test('admin login gate and authenticated shell render', async ({ page, context }
     return response.url().includes('/admin/api/chat?chat_id=-100777')
       && response.request().method() === 'GET';
   });
-  page.once('dialog', async (dialog) => {
-    expect(dialog.message()).toBe('Chat unblocked');
-    await dialog.accept();
-  });
-  await page.locator('#pane-chats-details button', { hasText: 'Unblock' }).click();
+  await page.locator('#pane-chats-details pl-button', { hasText: 'Unblock' }).click();
   expect(await (await chatUnblockResponse).json()).toMatchObject({ ok: true });
+  await expect(page.locator('.pl-toast', { hasText: 'Chat unblocked' })).toBeVisible();
   await chatReloadAfterUnblock;
   await expect(page.locator('#chat-details')).toContainText('"blocked": false');
 
@@ -249,7 +242,7 @@ test('admin login gate and authenticated shell render', async ({ page, context }
     return response.url().includes('/admin/api/users?q=owner')
       && response.request().method() === 'GET';
   });
-  await page.locator('.nav-item', { hasText: 'Users' }).click();
+  await page.locator('pl-button[data-tab="users"]').click();
   await page.locator('#user-search-input').fill('owner');
   await page.locator('#btn-search-users').click();
   const users = await (await usersResponse).json();
@@ -274,12 +267,9 @@ test('admin login gate and authenticated shell render', async ({ page, context }
     return response.url().includes('/admin/api/user?id=7')
       && response.request().method() === 'GET';
   });
-  page.once('dialog', async (dialog) => {
-    expect(dialog.message()).toBe('VIP adjustment recorded');
-    await dialog.accept();
-  });
-  await page.locator('#pane-users-details button', { hasText: 'Grant VIP' }).click();
+  await page.locator('#pane-users-details pl-button', { hasText: 'Grant VIP' }).click();
   expect(await (await grantVipResponse).json()).toHaveProperty('ok', true);
+  await expect(page.locator('.pl-toast', { hasText: 'VIP adjustment recorded' })).toBeVisible();
   await userReloadAfterGrant;
   await expect(page.locator('#user-vip-summary')).toContainText('Active');
   await expect(page.locator('#user-vip-summary')).toContainText('yes');
@@ -295,12 +285,9 @@ test('admin login gate and authenticated shell render', async ({ page, context }
     return response.url().includes('/admin/api/user?id=7')
       && response.request().method() === 'GET';
   });
-  page.once('dialog', async (dialog) => {
-    expect(dialog.message()).toBe('VIP revoked');
-    await dialog.accept();
-  });
-  await page.locator('#pane-users-details button', { hasText: 'Revoke VIP' }).click();
+  await page.locator('#pane-users-details pl-button', { hasText: 'Revoke VIP' }).click();
   expect(await (await revokeVipResponse).json()).toMatchObject({ ok: true, revoked: true });
+  await expect(page.locator('.pl-toast', { hasText: 'VIP revoked' })).toBeVisible();
   await userReloadAfterRevoke;
   await expect(page.locator('#user-vip-events')).toContainText('admin_revoke');
   await expect(page.locator('#user-vip-events')).toContainText('browser vip revoke');
@@ -309,7 +296,7 @@ test('admin login gate and authenticated shell render', async ({ page, context }
     return response.url().includes('/admin/api/safety/checks?')
       && response.request().method() === 'GET';
   });
-  await page.locator('.nav-item', { hasText: 'Safety Checks' }).click();
+  await page.locator('pl-button[data-tab="safety"]').click();
   const safety = await (await safetyResponse).json();
   expect(Array.isArray(safety.checks)).toBe(true);
   const seededSafety = safety.checks.find((check) => check.external_session_id === 'wc-smoke-ext');
@@ -331,7 +318,7 @@ test('admin login gate and authenticated shell render', async ({ page, context }
     return response.url().includes('/admin/api/analytics/llm/summary?')
       && response.request().method() === 'GET';
   });
-  await page.locator('.nav-item', { hasText: 'Analytics' }).click();
+  await page.locator('pl-button[data-tab="analytics"]').click();
   const analytics = await (await analyticsResponse).json();
   expect(analytics).toHaveProperty('range');
   expect(analytics.totals).toMatchObject({ total_count: 2, error_count: 1 });
@@ -458,7 +445,7 @@ test('admin LLM context detail renders trace artifacts', async ({ page, context 
     return response.url().endsWith('/admin/api/llm/requests')
       && response.request().method() === 'GET';
   });
-  await page.locator('.nav-item', { hasText: 'LLM Context' }).click();
+  await page.locator('pl-button[data-tab="llm"]').click();
   const payload = await (await llmResponse).json();
   expect(payload.requests).toHaveLength(1);
 

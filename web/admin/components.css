@@ -1,0 +1,999 @@
+/*
+ * Plotva Admin — Component Library styles
+ *
+ * Pairs with components.js (the pl-* custom elements) and tokens.css (the only color source).
+ * Two layers:
+ *   - Web Components: pl-button, pl-input, pl-select, pl-textarea, pl-toggle, pl-table,
+ *     pl-modal, pl-toast, pl-tab-nav. Interactive, accessible, keyboard-operable.
+ *   - CSS-class primitives: .skeleton, .empty-state, .error-state, .status-pill — static surfaces.
+ *
+ * Colors come only from var(--c-*)/var(--p-*) or color-mix of those. No raw hex here.
+ */
+
+/* ============================================================
+   Global interaction states
+   ============================================================ */
+
+:where(a, button, [tabindex], pl-button, pl-input, pl-select, pl-textarea, pl-toggle,
+    .nav-item, .list-item, input, select, textarea):focus-visible {
+    outline: var(--focus-ring-width) solid var(--c-focus-ring);
+    outline-offset: var(--focus-ring-offset);
+    border-radius: var(--rad-sm);
+}
+
+/* Never show the focus ring for pointer interactions, only keyboard */
+:where(button, pl-button, .nav-item):focus:not(:focus-visible) {
+    outline: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+
+    *,
+    *::before,
+    *::after {
+        animation-duration: 0.001ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.001ms !important;
+        scroll-behavior: auto !important;
+    }
+}
+
+/* ============================================================
+   pl-button
+   The host IS the button: role=button + tabindex set by JS.
+   ============================================================ */
+
+pl-button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: var(--sp-2);
+    padding: var(--sp-2) var(--sp-4);
+    border-radius: var(--rad-md);
+    border: 1px solid transparent;
+    font-family: inherit;
+    font-weight: var(--fw-medium);
+    font-size: var(--fs-base);
+    line-height: var(--lh-tight);
+    cursor: pointer;
+    user-select: none;
+    text-decoration: none;
+    white-space: nowrap;
+    transition: background-color var(--dur-quick) var(--ease-standard),
+        border-color var(--dur-quick) var(--ease-standard),
+        color var(--dur-quick) var(--ease-standard),
+        transform var(--dur-instant) var(--ease-standard);
+}
+
+pl-button:active {
+    transform: translateY(1px);
+}
+
+/* default = outline */
+pl-button,
+pl-button[variant="outline"] {
+    background: transparent;
+    border-color: var(--c-border);
+    color: var(--c-text-main);
+}
+
+pl-button[variant="outline"]:hover {
+    border-color: var(--c-text-sec);
+    background-color: var(--c-bg-card-hover);
+}
+
+pl-button[variant="primary"] {
+    background-color: var(--c-primary);
+    border-color: var(--c-primary);
+    color: var(--c-text-on-primary);
+}
+
+pl-button[variant="primary"]:hover {
+    background-color: var(--c-primary-hover);
+    border-color: var(--c-primary-hover);
+}
+
+pl-button[variant="danger"] {
+    background-color: var(--c-danger-bg);
+    color: var(--c-danger);
+}
+
+pl-button[variant="danger"]:hover {
+    background-color: var(--c-danger-bg-strong);
+}
+
+pl-button[variant="success"] {
+    background-color: var(--c-success-bg);
+    color: var(--c-success);
+}
+
+pl-button[variant="success"]:hover {
+    background-color: var(--c-success-bg-strong);
+}
+
+pl-button[variant="ghost"] {
+    background: transparent;
+    color: var(--c-text-sec);
+}
+
+pl-button[variant="ghost"]:hover {
+    background-color: var(--c-bg-card-hover);
+    color: var(--c-text-main);
+}
+
+pl-button[size="sm"] {
+    padding: var(--sp-1) var(--sp-3);
+    font-size: var(--fs-sm);
+}
+
+pl-button[size="lg"] {
+    padding: var(--sp-3) var(--sp-6);
+    font-size: var(--fs-md);
+}
+
+pl-button[block] {
+    display: flex;
+    width: 100%;
+}
+
+pl-button[disabled],
+pl-button[aria-disabled="true"] {
+    opacity: var(--opacity-disabled);
+    cursor: not-allowed;
+    pointer-events: none;
+}
+
+pl-button[loading] {
+    cursor: progress;
+    pointer-events: none;
+    color: transparent !important;
+    position: relative;
+}
+
+pl-button[loading]::after {
+    content: "";
+    position: absolute;
+    width: 1em;
+    height: 1em;
+    border: 2px solid currentcolor;
+    border-right-color: transparent;
+    border-radius: 50%;
+    animation: pl-spin 0.7s linear infinite;
+    /* currentcolor is transparent on the host, so paint the spinner from the variant's ink */
+    color: var(--c-text-main);
+}
+
+pl-button[loading][variant="primary"]::after {
+    color: var(--c-text-on-primary);
+}
+
+pl-button[loading][variant="danger"]::after {
+    color: var(--c-danger);
+}
+
+pl-button[loading][variant="success"]::after {
+    color: var(--c-success);
+}
+
+/* nav variant — sidebar entries */
+pl-button[variant="nav"] {
+    justify-content: flex-start;
+    width: 100%;
+    padding: var(--sp-3) var(--sp-4);
+    color: var(--c-text-sec);
+    font-size: var(--fs-base);
+    border-color: transparent;
+}
+
+pl-button[variant="nav"]:hover {
+    background-color: var(--c-bg-card-hover);
+    color: var(--c-text-main);
+}
+
+pl-button[variant="nav"][aria-current="page"],
+pl-button[variant="nav"].active {
+    background-color: var(--c-primary-bg);
+    color: var(--c-primary);
+}
+
+pl-button-group {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--sp-2);
+    flex-wrap: wrap;
+}
+
+pl-button-group[block] {
+    display: flex;
+}
+
+pl-button-group[block] pl-button {
+    flex: 1;
+}
+
+/* ============================================================
+   pl-input / pl-select / pl-textarea
+   Host wraps a real native control (rendered by JS).
+   ============================================================ */
+
+pl-input,
+pl-select,
+pl-textarea {
+    display: block;
+    width: 100%;
+}
+
+pl-input .pl-field,
+pl-select .pl-field,
+pl-textarea .pl-field {
+    width: 100%;
+    padding: var(--sp-2) var(--sp-3);
+    background-color: var(--c-bg-input);
+    border: 1px solid var(--c-border);
+    border-radius: var(--rad-md);
+    color: var(--c-text-main);
+    font-family: inherit;
+    font-size: var(--fs-base);
+    transition: border-color var(--dur-quick) var(--ease-standard),
+        box-shadow var(--dur-quick) var(--ease-standard);
+}
+
+pl-input .pl-field::placeholder,
+pl-textarea .pl-field::placeholder {
+    color: var(--c-text-muted);
+}
+
+pl-input .pl-field:focus,
+pl-select .pl-field:focus,
+pl-textarea .pl-field:focus {
+    outline: none;
+    border-color: var(--c-primary);
+    box-shadow: 0 0 0 var(--focus-ring-width) var(--c-primary-light);
+}
+
+pl-textarea .pl-field {
+    resize: vertical;
+    min-height: 100px;
+    font-family: var(--font-mono);
+    font-size: var(--fs-sm);
+}
+
+pl-input[invalid] .pl-field,
+pl-select[invalid] .pl-field,
+pl-textarea[invalid] .pl-field {
+    border-color: var(--c-danger);
+}
+
+pl-input[disabled] .pl-field,
+pl-select[disabled] .pl-field,
+pl-textarea[disabled] .pl-field {
+    opacity: var(--opacity-disabled);
+    cursor: not-allowed;
+}
+
+/* ============================================================
+   pl-field-group — label + control + help/error wiring
+   ============================================================ */
+
+pl-field-group {
+    display: block;
+    margin-bottom: var(--sp-4);
+}
+
+pl-field-group .pl-field-label {
+    display: block;
+    margin-bottom: var(--sp-2);
+    color: var(--c-text-sec);
+    font-weight: var(--fw-medium);
+    font-size: var(--fs-sm);
+}
+
+pl-field-group .pl-field-label .pl-required {
+    color: var(--c-danger);
+    margin-left: 2px;
+}
+
+pl-field-group .pl-field-help {
+    margin-top: var(--sp-2);
+    color: var(--c-text-muted);
+    font-size: var(--fs-xs);
+}
+
+pl-field-group .pl-field-error {
+    margin-top: var(--sp-2);
+    color: var(--c-danger);
+    font-size: var(--fs-xs);
+    display: none;
+}
+
+pl-field-group[invalid] .pl-field-error {
+    display: block;
+}
+
+/* ============================================================
+   pl-toggle — accessible switch (host is the control)
+   ============================================================ */
+
+pl-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--sp-2);
+    cursor: pointer;
+    user-select: none;
+    color: var(--c-text-sec);
+    font-size: var(--fs-base);
+}
+
+pl-toggle .pl-toggle-track {
+    position: relative;
+    flex: 0 0 auto;
+    width: 38px;
+    height: 22px;
+    border-radius: var(--rad-full);
+    background-color: var(--c-border-light);
+    transition: background-color var(--dur-base) var(--ease-out);
+}
+
+pl-toggle .pl-toggle-thumb {
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    background-color: var(--p-white);
+    box-shadow: var(--elev-1);
+    transition: transform var(--dur-base) var(--ease-out);
+}
+
+pl-toggle[checked] .pl-toggle-track {
+    background-color: var(--c-primary);
+}
+
+pl-toggle[checked] .pl-toggle-thumb {
+    transform: translateX(16px);
+}
+
+pl-toggle[disabled] {
+    opacity: var(--opacity-disabled);
+    cursor: not-allowed;
+}
+
+/* ============================================================
+   Status pill + badge extensions (CSS-class primitives)
+   ============================================================ */
+
+.status-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--sp-2);
+    padding: 2px var(--sp-2);
+    border-radius: var(--rad-full);
+    font-size: var(--fs-xs);
+    font-weight: var(--fw-semibold);
+    background-color: var(--c-bg-elevated);
+    color: var(--c-text-sec);
+}
+
+.status-pill::before {
+    content: "";
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background-color: var(--c-status-idle);
+    flex: 0 0 auto;
+}
+
+.status-pill[data-status="ok"]::before {
+    background-color: var(--c-status-ok);
+    box-shadow: 0 0 6px var(--c-status-ok);
+}
+
+.status-pill[data-status="warn"]::before {
+    background-color: var(--c-status-warn);
+}
+
+.status-pill[data-status="error"]::before {
+    background-color: var(--c-status-err);
+    box-shadow: 0 0 6px var(--c-status-err);
+}
+
+.badge-info {
+    background-color: var(--c-info-bg);
+    color: var(--c-info);
+}
+
+.badge-warning {
+    background-color: var(--c-warning-bg);
+    color: var(--c-warning);
+}
+
+.badge-neutral {
+    background-color: color-mix(in srgb, var(--c-text-sec) 16%, transparent);
+    color: var(--c-text-sec);
+}
+
+/* ============================================================
+   Skeleton (loading) — CSS-class primitive
+   ============================================================ */
+
+.skeleton {
+    display: block;
+    border-radius: var(--rad-sm);
+    background: linear-gradient(90deg,
+            var(--c-bg-card-hover) 25%,
+            var(--c-bg-elevated) 37%,
+            var(--c-bg-card-hover) 63%);
+    background-size: 400% 100%;
+    animation: pl-shimmer 1.4s ease infinite;
+}
+
+.skeleton-text {
+    height: 0.8em;
+    margin: 0.35em 0;
+}
+
+.skeleton-line {
+    height: 14px;
+    margin-bottom: var(--sp-2);
+}
+
+.skeleton-row {
+    height: 40px;
+    margin-bottom: var(--sp-2);
+    border-radius: var(--rad-md);
+}
+
+.skeleton-block {
+    width: 100%;
+    height: 100%;
+}
+
+@keyframes pl-shimmer {
+    0% {
+        background-position: 100% 50%;
+    }
+
+    100% {
+        background-position: 0 50%;
+    }
+}
+
+@keyframes pl-spin {
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+/* ============================================================
+   Empty + Error states — CSS-class primitives
+   ============================================================ */
+
+.empty-state,
+.error-state {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: var(--sp-3);
+    padding: var(--sp-8) var(--sp-6);
+    text-align: center;
+    color: var(--c-text-sec);
+}
+
+.empty-state .pl-state-icon,
+.error-state .pl-state-icon {
+    width: 44px;
+    height: 44px;
+    border-radius: var(--rad-full);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: var(--fs-xl);
+    background-color: var(--c-bg-elevated);
+}
+
+.error-state .pl-state-icon {
+    background-color: var(--c-danger-bg);
+    color: var(--c-danger);
+}
+
+.empty-state .pl-state-title,
+.error-state .pl-state-title {
+    font-weight: var(--fw-semibold);
+    font-size: var(--fs-md);
+    color: var(--c-text-main);
+}
+
+.empty-state .pl-state-desc,
+.error-state .pl-state-desc {
+    font-size: var(--fs-sm);
+    color: var(--c-text-muted);
+    max-width: 42ch;
+}
+
+.inline-spinner {
+    display: inline-block;
+    width: 1em;
+    height: 1em;
+    border: 2px solid var(--c-primary-light);
+    border-top-color: var(--c-primary);
+    border-radius: 50%;
+    animation: pl-spin 0.7s linear infinite;
+    vertical-align: -0.15em;
+}
+
+/* ============================================================
+   pl-table — data table with idle/loading/empty/error states
+   ============================================================ */
+
+pl-table {
+    display: block;
+    width: 100%;
+    overflow-x: auto;
+}
+
+pl-table table {
+    width: 100%;
+    border-collapse: collapse;
+}
+
+pl-table th,
+pl-table td {
+    padding: var(--sp-3) var(--sp-4);
+    text-align: left;
+    border-bottom: 1px solid var(--c-border);
+}
+
+pl-table[dense] th,
+pl-table[dense] td {
+    padding: var(--sp-2) var(--sp-3);
+    font-size: var(--fs-sm);
+}
+
+pl-table th {
+    color: var(--c-text-sec);
+    font-weight: var(--fw-semibold);
+    font-size: var(--fs-sm);
+    background-color: var(--c-bg-card-hover);
+    position: sticky;
+    top: 0;
+}
+
+pl-table th.sortable {
+    cursor: pointer;
+    user-select: none;
+    white-space: nowrap;
+}
+
+pl-table th.sortable::after {
+    content: "↕";
+    margin-left: var(--sp-1);
+    opacity: 0.4;
+    font-size: 0.9em;
+}
+
+pl-table th[aria-sort="ascending"]::after {
+    content: "↑";
+    opacity: 1;
+}
+
+pl-table th[aria-sort="descending"]::after {
+    content: "↓";
+    opacity: 1;
+}
+
+pl-table tbody tr {
+    transition: background-color var(--dur-quick) var(--ease-standard);
+}
+
+pl-table tbody tr:last-child td {
+    border-bottom: none;
+}
+
+pl-table tbody tr:hover td {
+    background-color: var(--c-bg-card-hover);
+}
+
+pl-table tr.clickable {
+    cursor: pointer;
+}
+
+pl-table tr.active td {
+    background-color: var(--c-primary-bg);
+}
+
+pl-table td.mono {
+    font-family: var(--font-mono);
+    font-size: var(--fs-sm);
+    overflow-wrap: anywhere;
+}
+
+pl-table td.num {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+}
+
+/* ============================================================
+   pl-modal — dialog (alert / confirm / custom)
+   ============================================================ */
+
+pl-modal {
+    position: fixed;
+    inset: 0;
+    z-index: var(--z-modal);
+    display: none;
+    align-items: center;
+    justify-content: center;
+    padding: var(--sp-4);
+}
+
+pl-modal[open] {
+    display: flex;
+}
+
+pl-modal .pl-modal-scrim {
+    position: absolute;
+    inset: 0;
+    background: var(--c-scrim);
+    backdrop-filter: blur(2px);
+    animation: pl-fade-in var(--dur-quick) var(--ease-out);
+}
+
+pl-modal .pl-modal-card {
+    position: relative;
+    width: 100%;
+    max-width: 440px;
+    background: var(--c-bg-card);
+    border: 1px solid var(--c-border);
+    border-radius: var(--rad-lg);
+    box-shadow: var(--elev-modal);
+    padding: var(--sp-6);
+    animation: pl-modal-in var(--dur-base) var(--ease-out);
+}
+
+pl-modal .pl-modal-title {
+    font-size: var(--fs-md);
+    font-weight: var(--fw-semibold);
+    color: var(--c-text-main);
+    margin-bottom: var(--sp-3);
+}
+
+pl-modal .pl-modal-body {
+    color: var(--c-text-sec);
+    font-size: var(--fs-base);
+    line-height: var(--lh-normal);
+    margin-bottom: var(--sp-6);
+    overflow-wrap: anywhere;
+}
+
+pl-modal .pl-modal-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: var(--sp-2);
+}
+
+@keyframes pl-fade-in {
+    from {
+        opacity: 0;
+    }
+
+    to {
+        opacity: 1;
+    }
+}
+
+@keyframes pl-modal-in {
+    from {
+        opacity: 0;
+        transform: translateY(8px) scale(0.98);
+    }
+
+    to {
+        opacity: 1;
+        transform: translateY(0) scale(1);
+    }
+}
+
+/* ============================================================
+   pl-toast — non-blocking feedback
+   ============================================================ */
+
+pl-toast-host {
+    position: fixed;
+    bottom: var(--sp-6);
+    right: var(--sp-6);
+    z-index: var(--z-toast);
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-2);
+    max-width: min(420px, calc(100vw - var(--sp-8)));
+    pointer-events: none;
+}
+
+.pl-toast {
+    pointer-events: auto;
+    display: flex;
+    align-items: flex-start;
+    gap: var(--sp-3);
+    padding: var(--sp-3) var(--sp-4);
+    background: var(--c-bg-elevated);
+    border: 1px solid var(--c-border);
+    border-left: 3px solid var(--c-text-sec);
+    border-radius: var(--rad-md);
+    box-shadow: var(--elev-2);
+    color: var(--c-text-main);
+    font-size: var(--fs-sm);
+    animation: pl-toast-in var(--dur-base) var(--ease-out);
+}
+
+.pl-toast[data-leaving] {
+    animation: pl-toast-out var(--dur-base) var(--ease-out) forwards;
+}
+
+.pl-toast[data-tone="success"] {
+    border-left-color: var(--c-success);
+}
+
+.pl-toast[data-tone="error"] {
+    border-left-color: var(--c-danger);
+}
+
+.pl-toast[data-tone="warning"] {
+    border-left-color: var(--c-warning);
+}
+
+.pl-toast[data-tone="info"] {
+    border-left-color: var(--c-info);
+}
+
+.pl-toast .pl-toast-icon {
+    flex: 0 0 auto;
+    font-weight: var(--fw-bold);
+    line-height: var(--lh-normal);
+}
+
+.pl-toast[data-tone="success"] .pl-toast-icon {
+    color: var(--c-success);
+}
+
+.pl-toast[data-tone="error"] .pl-toast-icon {
+    color: var(--c-danger);
+}
+
+.pl-toast[data-tone="warning"] .pl-toast-icon {
+    color: var(--c-warning);
+}
+
+.pl-toast[data-tone="info"] .pl-toast-icon {
+    color: var(--c-info);
+}
+
+.pl-toast .pl-toast-msg {
+    flex: 1;
+    min-width: 0;
+    overflow-wrap: anywhere;
+    line-height: var(--lh-snug);
+}
+
+.pl-toast .pl-toast-close {
+    flex: 0 0 auto;
+    background: none;
+    border: none;
+    color: var(--c-text-muted);
+    cursor: pointer;
+    font-size: var(--fs-md);
+    line-height: 1;
+    padding: 0;
+}
+
+.pl-toast .pl-toast-close:hover {
+    color: var(--c-text-main);
+}
+
+@keyframes pl-toast-in {
+    from {
+        opacity: 0;
+        transform: translateX(16px);
+    }
+
+    to {
+        opacity: 1;
+        transform: translateX(0);
+    }
+}
+
+@keyframes pl-toast-out {
+    to {
+        opacity: 0;
+        transform: translateX(16px);
+    }
+}
+
+/* ============================================================
+   Small content utilities (token-backed, replace inline styles)
+   ============================================================ */
+
+.cell-strong {
+    font-weight: var(--fw-semibold);
+    color: var(--c-text-main);
+}
+
+.helper-text {
+    font-size: var(--fs-sm);
+    color: var(--c-text-muted);
+    line-height: var(--lh-snug);
+}
+
+.field-inline {
+    display: flex;
+    align-items: flex-end;
+    gap: var(--sp-2);
+}
+
+.field-inline pl-field-group {
+    margin-bottom: 0;
+    flex: 1;
+}
+
+.w-narrow {
+    max-width: 200px;
+}
+
+pl-select.w-narrow,
+pl-input.w-narrow {
+    flex: 0 0 auto;
+}
+
+.badge-count {
+    background-color: var(--c-bg-app);
+    color: var(--c-text-sec);
+    padding: 2px 6px;
+    border-radius: var(--rad-sm);
+    font-size: var(--fs-xs);
+    font-weight: var(--fw-semibold);
+}
+
+.list-scroll {
+    max-height: 500px;
+    overflow-y: auto;
+}
+
+pl-textarea.redis-value .pl-field {
+    height: 400px;
+}
+
+.list-item:focus-visible {
+    outline: var(--focus-ring-width) solid var(--c-focus-ring);
+    outline-offset: -2px;
+}
+
+/* Visually-hidden helper for screen-reader-only text */
+.pl-sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+}
+
+/* ============================================================
+   Per-tab utilities (token-backed replacements for removed inline styles)
+   ============================================================ */
+
+/* Inset / sunken sub-card surfaces (one concept, several names used across tabs) */
+.card-inset,
+.card-subpanel,
+.card-sunken,
+.llm-context-bg {
+    background-color: var(--c-bg-app);
+}
+
+/* Pre-formatted detail / JSON dump blocks */
+.detail-pre,
+.user-details-json,
+.analytics-pre {
+    white-space: pre-wrap;
+    font-size: var(--fs-sm);
+}
+
+/* List-item metadata rows */
+.list-item-meta {
+    font-size: var(--fs-sm);
+    margin-top: 4px;
+    color: var(--c-text-muted);
+}
+
+.chat-username {
+    color: var(--c-primary);
+}
+
+.section-divider {
+    border: 0;
+    border-top: 1px solid var(--c-border);
+    margin: var(--sp-6) 0;
+}
+
+.subpanel-title {
+    margin-top: 0;
+}
+
+.summary-label {
+    width: 180px;
+}
+
+/* Width helpers for compact filter controls */
+.w-xs {
+    max-width: 110px;
+    flex: 0 0 auto;
+}
+
+.w-range {
+    max-width: 140px;
+    flex: 0 0 auto;
+}
+
+.w-label {
+    min-width: 44px;
+}
+
+/* Analytics charts */
+.chart-box {
+    height: 320px;
+    position: relative;
+}
+
+/* LLM list rows */
+#llm .llm-list-time {
+    font-weight: var(--fw-semibold);
+}
+
+#llm .llm-list-meta {
+    font-size: var(--fs-sm);
+    margin-top: 4px;
+}
+
+/* Logs viewer fill/scroll layout */
+.logs-card-fill {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+    margin-bottom: 0;
+}
+
+.logs-header {
+    flex-shrink: 0;
+}
+
+.logs-level-select {
+    max-width: 120px;
+    flex: 0 0 auto;
+}
+
+.logs-search {
+    max-width: 300px;
+    flex: 0 0 auto;
+}
+
+.logs-count {
+    font-size: var(--fs-sm);
+}
+
+.logs-body {
+    flex: 1;
+    overflow: hidden;
+    position: relative;
+    background: var(--c-bg-app);
+}
+
+.logs-container-abs {
+    position: absolute;
+    inset: 0;
+    overflow-y: auto;
+    padding: 10px;
+}

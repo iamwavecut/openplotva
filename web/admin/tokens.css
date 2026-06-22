@@ -1,0 +1,240 @@
+/*
+ * Plotva Admin — Design Tokens (single source of truth)
+ *
+ * Three tiers:
+ *   1. Primitives (--p-*)   raw, theme-agnostic palette. Never referenced by components directly.
+ *   2. Semantic   (--c-*, --sp-*, --rad-*, --fs-* ...)   meaning-based aliases. The only tier components use.
+ *   3. Extended   (--c-json-*, --c-log-*, --c-shield-* ...)   domain palettes for syntax/log/status surfaces.
+ *
+ * Theme model: :root holds the dark theme (default). [data-theme="light"] overrides semantic color only.
+ * Scale tokens (space, radius, type, motion, z-index, elevation) are theme-agnostic and live once in :root.
+ */
+
+:root {
+    /* ---- PRIMITIVES: neutrals (slate) ---- */
+    --p-slate-950: #0b1120;
+    --p-slate-900: #0f172a;
+    --p-slate-800: #1e293b;
+    --p-slate-700: #334155;
+    --p-slate-600: #475569;
+    --p-slate-500: #64748b;
+    --p-slate-400: #94a3b8;
+    --p-slate-300: #cbd5e1;
+    --p-slate-200: #e2e8f0;
+    --p-slate-100: #f1f5f9;
+    --p-slate-50: #f8fafc;
+    --p-white: #ffffff;
+
+    /* ---- PRIMITIVES: brand + state hues ---- */
+    --p-indigo-500: #6366f1;
+    --p-indigo-600: #4f46e5;
+    --p-cyan-400: #22d3ee;
+    --p-green-500: #10b981;
+    --p-amber-500: #f59e0b;
+    --p-red-500: #ef4444;
+    --p-red-400: #f87171;
+    --p-orange-400: #fb923c;
+    --p-violet-400: #a78bfa;
+    --p-sky-500: #0ea5e9;
+
+    /* ============================================================
+       SEMANTIC: scale (theme-agnostic)
+       ============================================================ */
+
+    /* Spacing — 4px rhythm */
+    --sp-1: 0.25rem;
+    --sp-2: 0.5rem;
+    --sp-3: 0.75rem;
+    --sp-4: 1rem;
+    --sp-5: 1.25rem;
+    --sp-6: 1.5rem;
+    --sp-8: 2rem;
+    --sp-10: 2.5rem;
+    --sp-12: 3rem;
+
+    /* Radius */
+    --rad-sm: 4px;
+    --rad-md: 8px;
+    --rad-lg: 12px;
+    --rad-full: 9999px;
+
+    /* Type families */
+    --font-sans: 'Inter', system-ui, -apple-system, sans-serif;
+    --font-mono: 'JetBrains Mono', ui-monospace, 'SFMono-Regular', monospace;
+
+    /* Type scale */
+    --fs-xs: 0.72rem;
+    --fs-sm: 0.8rem;
+    --fs-base: 0.9rem;
+    --fs-md: 1rem;
+    --fs-lg: 1.05rem;
+    --fs-xl: 1.25rem;
+    --fs-2xl: 1.5rem;
+
+    /* Weights */
+    --fw-normal: 400;
+    --fw-medium: 500;
+    --fw-semibold: 600;
+    --fw-bold: 700;
+    --fw-extrabold: 800;
+
+    /* Line heights */
+    --lh-tight: 1.15;
+    --lh-snug: 1.35;
+    --lh-normal: 1.5;
+
+    /* Letter spacing for eyebrow/label treatments */
+    --ls-wide: 0.08em;
+
+    /* Layout */
+    --w-sidebar: 280px;
+    --h-header: 64px;
+
+    /* Motion */
+    --dur-instant: 80ms;
+    --dur-quick: 150ms;
+    --dur-base: 250ms;
+    --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+    --ease-standard: ease;
+    /* Legacy aliases kept so existing rules referencing them keep resolving */
+    --trans-fast: var(--dur-quick) var(--ease-standard);
+    --trans-norm: var(--dur-base) var(--ease-standard);
+
+    /* Elevation */
+    --elev-0: none;
+    --elev-1: 0 1px 3px rgba(0, 0, 0, 0.1);
+    --elev-2: 0 4px 12px rgba(0, 0, 0, 0.12);
+    --elev-3: 0 10px 25px -5px rgba(0, 0, 0, 0.3);
+    --elev-modal: 0 24px 60px rgba(0, 0, 0, 0.45);
+    --elev-glow-brand: 0 12px 30px rgba(34, 211, 238, 0.18);
+
+    /* Z-index ladder (formalizes the old 5/10/100/9999 magic numbers) */
+    --z-base: 0;
+    --z-resizer: 5;
+    --z-sidebar: 10;
+    --z-mobile-sidebar: 100;
+    --z-dropdown: 1000;
+    --z-overlay: 1100;
+    --z-modal: 1200;
+    --z-toast: 1300;
+
+    /* Focus ring width — color is semantic (themed) below */
+    --focus-ring-width: 2px;
+    --focus-ring-offset: 2px;
+
+    /* ============================================================
+       SEMANTIC: color — DARK theme (default)
+       ============================================================ */
+
+    --c-bg-app: var(--p-slate-900);
+    --c-bg-sidebar: var(--p-slate-800);
+    --c-bg-card: var(--p-slate-800);
+    --c-bg-card-hover: var(--p-slate-700);
+    --c-bg-input: var(--p-slate-900);
+    --c-bg-elevated: var(--p-slate-700);
+
+    --c-border: var(--p-slate-700);
+    --c-border-light: var(--p-slate-600);
+
+    --c-primary: var(--p-indigo-500);
+    --c-primary-hover: var(--p-indigo-600);
+    --c-primary-light: rgba(99, 102, 241, 0.15);
+    --c-accent: var(--p-cyan-400);
+
+    --c-success: var(--p-green-500);
+    --c-warning: var(--p-amber-500);
+    --c-danger: var(--p-red-500);
+    --c-info: var(--p-sky-500);
+
+    /* Tinted state surfaces (replace ad-hoc rgba()) */
+    --c-primary-bg: color-mix(in srgb, var(--c-primary) 15%, transparent);
+    --c-primary-bg-strong: color-mix(in srgb, var(--c-primary) 24%, transparent);
+    --c-success-bg: color-mix(in srgb, var(--c-success) 15%, transparent);
+    --c-success-bg-strong: color-mix(in srgb, var(--c-success) 22%, transparent);
+    --c-warning-bg: color-mix(in srgb, var(--c-warning) 15%, transparent);
+    --c-danger-bg: color-mix(in srgb, var(--c-danger) 12%, transparent);
+    --c-danger-bg-strong: color-mix(in srgb, var(--c-danger) 22%, transparent);
+    --c-info-bg: color-mix(in srgb, var(--c-info) 15%, transparent);
+
+    --c-text-main: var(--p-slate-50);
+    --c-text-sec: var(--p-slate-400);
+    --c-text-muted: var(--p-slate-500);
+    --c-text-on-primary: var(--p-white);
+    --c-text-on-accent: var(--p-slate-900);
+
+    /* Interaction */
+    --c-focus-ring: color-mix(in srgb, var(--c-primary) 70%, transparent);
+    --c-scrim: rgba(15, 23, 42, 0.6);
+    --c-row-hover-overlay: rgba(255, 255, 255, 0.03);
+    --c-row-active-overlay: rgba(255, 255, 255, 0.05);
+    --c-scrollbar-thumb: rgba(255, 255, 255, 0.1);
+    --c-scrollbar-thumb-hover: rgba(255, 255, 255, 0.2);
+
+    /* Disabled */
+    --opacity-disabled: 0.55;
+
+    /* ============================================================
+       EXTENDED: domain palettes
+       ============================================================ */
+
+    /* Brand mark gradient */
+    --grad-brand: linear-gradient(135deg, rgba(34, 211, 238, 0.92), rgba(99, 102, 241, 0.95)), var(--p-slate-900);
+    --grad-login:
+        radial-gradient(circle at top right, rgba(34, 211, 238, 0.16), transparent 34rem),
+        radial-gradient(circle at bottom left, rgba(99, 102, 241, 0.18), transparent 30rem),
+        var(--p-slate-900);
+
+    /* Shield category text colors (surfaces are tinted from these) */
+    --c-shield-red: var(--p-red-400);
+    --c-shield-orange: var(--p-orange-400);
+    --c-shield-yellow: var(--c-warning);
+    --c-shield-violet: var(--p-violet-400);
+    --c-shield-cyan: var(--c-accent);
+    --c-shield-neutral: var(--c-text-sec);
+
+    /* Log levels */
+    --c-log-debug: #8a93a3;
+    --c-log-info: #3498db;
+    --c-log-warn: #f39c12;
+    --c-log-error: #e74c3c;
+
+    /* Live status dots */
+    --c-status-ok: #2ecc71;
+    --c-status-warn: #f1c40f;
+    --c-status-err: #e74c3c;
+    --c-status-idle: var(--p-slate-400);
+
+    /* JSON syntax highlighting (One Dark palette) */
+    --c-json-key: #e06c75;
+    --c-json-string: #98c379;
+    --c-json-number: #d19a66;
+    --c-json-boolean: #61afef;
+    --c-json-null: #c678dd;
+}
+
+/* ============================================================
+   SEMANTIC: color — LIGHT theme overrides
+   ============================================================ */
+[data-theme="light"] {
+    --c-bg-app: var(--p-slate-100);
+    --c-bg-sidebar: var(--p-white);
+    --c-bg-card: var(--p-white);
+    --c-bg-card-hover: var(--p-slate-50);
+    --c-bg-input: var(--p-slate-50);
+    --c-bg-elevated: var(--p-white);
+
+    --c-border: var(--p-slate-200);
+    --c-border-light: var(--p-slate-300);
+
+    --c-text-main: var(--p-slate-900);
+    --c-text-sec: var(--p-slate-500);
+    --c-text-muted: var(--p-slate-400);
+
+    --c-scrim: rgba(15, 23, 42, 0.4);
+    --c-row-hover-overlay: rgba(15, 23, 42, 0.03);
+    --c-row-active-overlay: rgba(15, 23, 42, 0.05);
+    --c-scrollbar-thumb: rgba(15, 23, 42, 0.15);
+    --c-scrollbar-thumb-hover: rgba(15, 23, 42, 0.3);
+
+    --c-log-debug: #6b7280;
+}
