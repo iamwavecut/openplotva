@@ -10037,6 +10037,11 @@ async fn start_runtime_workers(
     {
         tracing::warn!(%error, "failed to seed LLM routing tables; continuing with existing rows");
     }
+    if let Err(error) =
+        model_routing::backfill_pool_from_env(&service_clients.postgres, config).await
+    {
+        tracing::warn!(%error, "failed to backfill AI Farm pool into routing tables");
+    }
     let router_handle = match model_routing::load_routing_table(&service_clients.postgres).await {
         Ok(table) => openplotva_llm::router::RouterHandle::new(table),
         Err(error) => {

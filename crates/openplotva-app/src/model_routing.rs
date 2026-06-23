@@ -19,7 +19,7 @@ use openplotva_storage::StorageError;
 use openplotva_storage::llm_routing::{
     AssignmentInput, AssignmentRecord, ModelInput, ModelRecord, ProviderInput, RoutingSnapshot,
     TriggerInput, TriggerRecord, WorkflowRecord, insert_assignment, insert_model, insert_provider,
-    insert_trigger, load_snapshot,
+    insert_trigger, list_providers, load_snapshot,
 };
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -345,6 +345,77 @@ pub async fn seed_routing_from_env(
 
     mark_seeded(pool).await?;
     tracing::info!("seeded LLM routing tables from env configuration");
+    Ok(true)
+}
+
+/// Provider name for the AI Farm pool endpoint; matches `dialog_runtime::POOL_PROVIDER_NAME`
+/// so DB pool models resolve to the direct pool client at runtime.
+const POOL_PROVIDER: &str = "vram-cloud";
+
+/// Lift the env-configured AI Farm pool (`DIALOG_AIFARM_POOL_*`) into managed DB rows so
+/// the optional pool models show up in the admin and join the weighted dialog allocation.
+/// Idempotent: skips once the pool provider exists, so it backfills an already-seeded
+/// database on the next boot without duplicating rows. Pool models default to weight 33
+/// against the Gemma primary's 100 (~60/20/20); the operator rebalances in the admin.
+pub async fn backfill_pool_from_env(
+    pool: &PgPool,
+    config: &AppConfig,
+) -> Result<bool, StorageError> {
+    let dialog = &config.llm.dialog;
+    if dialog.aifarm_pool_models.is_empty() {
+        return Ok(false);
+    }
+    if list_providers(pool)
+        .await?
+        .iter()
+        .any(|p| p.name == POOL_PROVIDER)
+    {
+        return Ok(false);
+    }
+
+    let provider_id = insert_provider(
+        pool,
+        &ProviderInput {
+            name: POOL_PROVIDER.to_owned(),
+            kind: "chat".to_owned(),
+            endpoint: dialog.aifarm_pool_base_urls.first().cloned(),
+            discovery_service_name: None,
+            discovery_endpoint_name: None,
+            api_key_ref: Some("DIALOG_AIFARM_POOL_API_KEY".to_owned()),
+            api_key_encrypted: None,
+            enabled: true,
+            config: json!({}),
+        },
+    )
+    .await?;
+
+    for (i, model_name) in dialog.aifarm_pool_models.iter().enumerate() {
+        let base_url = dialog
+            .aifarm_pool_base_urls
+            .get(i)
+            .or_else(|| dialog.aifarm_pool_base_urls.first())
+            .cloned();
+        let model_id = insert_model(
+            pool,
+            &ModelInput {
+                provider_id,
+                model_name: model_name.clone(),
+                display_name: None,
+                base_url,
+                capabilities: vec!["chat".to_owned(), "tools".to_owned()],
+                embedding_dim: None,
+                enabled: true,
+                config: json!({}),
+            },
+        )
+        .await?;
+        seed_primary(pool, "dialog", model_id, Some(33)).await?;
+    }
+
+    tracing::info!(
+        models = dialog.aifarm_pool_models.len(),
+        "backfilled AI Farm pool into routing tables"
+    );
     Ok(true)
 }
 

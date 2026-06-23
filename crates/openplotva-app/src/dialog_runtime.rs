@@ -10,7 +10,8 @@ use openplotva_dialog::{
 use openplotva_llm::{
     ChatProvider, ChatProviderError, ChatProviderFuture,
     aifarm::{
-        AifarmClientConfig, AifarmDialogConfig, AifarmDialogProvider, ReqwestAifarmTransport,
+        AifarmClientConfig, AifarmDialogConfig, AifarmDialogProvider, AifarmPoolConfig,
+        ReqwestAifarmTransport, normalize_chat_completions_url,
     },
     gemini::{
         GeminiDialogConfig, GeminiDialogProvider, GeminiExplicitCacheConfig,
@@ -167,12 +168,17 @@ pub fn router_dialog_provider(
     triggers: Arc<TriggerState>,
     genkit_fallback: Option<DialogProviderHandle>,
 ) -> DialogProviderHandle {
-    let aifarm: DialogProviderHandle = Arc::new(aifarm_dialog_provider_from_app_config(
-        config,
-        Arc::clone(&toolbox),
-    ));
-    let genkit = genkit_fallback
-        .or_else(|| genkit_dialog_provider_from_app_config_with_toolbox(config, Some(toolbox)));
+    // The aifarm primary is built WITHOUT its env pool: the pool secondaries are now
+    // first-class DB models routed through their own `vram-cloud` client below, so the
+    // weights set in the admin actually control them (no hidden internal pool).
+    let mut aifarm_cfg = aifarm_dialog_config_from_app_config(config);
+    aifarm_cfg.pool = AifarmPoolConfig::default();
+    let aifarm: DialogProviderHandle =
+        Arc::new(AifarmDialogProvider::new(aifarm_cfg).with_toolbox(Arc::clone(&toolbox)));
+
+    let genkit = genkit_fallback.or_else(|| {
+        genkit_dialog_provider_from_app_config_with_toolbox(config, Some(Arc::clone(&toolbox)))
+    });
 
     let mut clients: HashMap<String, DialogProviderHandle> = HashMap::new();
     clients.insert(PROVIDER_AIFARM.to_owned(), Arc::clone(&aifarm));
@@ -180,9 +186,41 @@ pub fn router_dialog_provider(
         clients.insert(PROVIDER_GENKIT.to_owned(), Arc::clone(&genkit));
         clients.insert("gemini".to_owned(), genkit);
     }
+    if let Some(pool) = pool_dialog_provider(config, Arc::clone(&toolbox)) {
+        clients.insert(POOL_PROVIDER_NAME.to_owned(), pool);
+    }
 
     Arc::new(RouterChatProvider::new(
         handle, breakers, triggers, clients, aifarm,
+    ))
+}
+
+/// Provider name under which the AI Farm pool endpoint is registered, shared with
+/// the routing-table backfill so DB pool models resolve to the client below.
+pub const POOL_PROVIDER_NAME: &str = "vram-cloud";
+
+/// Build a single-backend, direct OpenAI-compatible client for the configured AI Farm
+/// pool endpoint. Each DB pool model selects itself via the per-attempt model override,
+/// so one client serves every pool model on that endpoint.
+fn pool_dialog_provider(
+    config: &AppConfig,
+    toolbox: Arc<dyn DialogToolbox>,
+) -> Option<DialogProviderHandle> {
+    let dialog = &config.llm.dialog;
+    let model = dialog.aifarm_pool_models.first()?;
+    let base = dialog.aifarm_pool_base_urls.first()?;
+    if model.trim().is_empty() || base.trim().is_empty() {
+        return None;
+    }
+    let mut cfg = aifarm_dialog_config_from_app_config(config);
+    cfg.provider_name = POOL_PROVIDER_NAME.to_owned();
+    cfg.client.direct_url = normalize_chat_completions_url(base);
+    cfg.client.api_key = dialog.aifarm_pool_api_key.clone();
+    cfg.client.default_model = model.clone();
+    cfg.model = model.clone();
+    cfg.pool = AifarmPoolConfig::default();
+    Some(Arc::new(
+        AifarmDialogProvider::new(cfg).with_toolbox(toolbox),
     ))
 }
 
