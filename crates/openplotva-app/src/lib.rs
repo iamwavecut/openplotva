@@ -28,6 +28,7 @@ pub mod media;
 pub mod members;
 pub mod memory_runtime;
 pub mod message_gate;
+pub mod model_routing;
 pub mod music_jobs;
 pub mod payments;
 pub mod pending_ops;
@@ -91,6 +92,7 @@ use openplotva_storage::{
     RedisBlockedChatStore, RedisEphemeralMessageStore, RedisRateLimitStore, ServiceClients,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use sqlx::{PgPool, Row, postgres::PgRow};
 use thiserror::Error;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -123,6 +125,7 @@ struct RuntimeWorkers {
     memory_restart_trigger: Option<Arc<tokio::sync::Notify>>,
     llm_trace_buffer: Option<runtime_llm::RuntimeLlmTraceBuffer>,
     runtime_api_tls_public_key_pin: Option<String>,
+    router_handle: Option<Arc<openplotva_llm::router::RouterHandle>>,
 }
 
 struct DispatcherRuntime {
@@ -427,6 +430,7 @@ struct StaticWebRoutes {
     shield_store: Option<PostgresShieldStore>,
     shield_options: openplotva_shield::Options,
     shield_embedder: Option<Arc<dyn memory_runtime::EmbeddingProvider>>,
+    router_handle: Option<Arc<openplotva_llm::router::RouterHandle>>,
 }
 
 #[derive(Clone)]
@@ -482,6 +486,7 @@ fn static_web_routes(
         shield_store: None,
         shield_options: openplotva_shield::Options::default(),
         shield_embedder: None,
+        router_handle: None,
     }
 }
 
@@ -521,6 +526,7 @@ fn static_web_routes_from_config(
     routes.memory_max_messages_per_run = memory_worker_config.process.max_messages_per_run;
     routes.memory_token_estimator_source = Arc::from(memory_token_estimator_source(config));
     routes.memory_restart_trigger = runtime_workers.memory_restart_trigger.clone();
+    routes.router_handle = runtime_workers.router_handle.clone();
     routes.shield_options = shield_options_from_config(&config.shield);
     if let Some(clients) = service_clients {
         routes.postgres = Some(clients.postgres.clone());
@@ -660,6 +666,7 @@ fn install_static_web_routes(router: axum::Router, static_web: StaticWebRoutes) 
             "/admin/api/aifarm/pool/reasoning",
             any(admin_aifarm_pool_reasoning),
         )
+        .route("/admin/api/routing", any(admin_routing))
         .route("/admin/api/logs/stream", any(admin_logs_stream))
         .route("/admin/api/bootstrap", get(admin_bootstrap))
         .route("/admin/api/metrics", any(admin_state))
@@ -7363,6 +7370,406 @@ async fn admin_upsert_app_setting(
     Ok(())
 }
 
+fn routing_master_secret() -> String {
+    std::env::var("MASTER_KEY").unwrap_or_default()
+}
+
+fn routing_json_str(value: &serde_json::Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+}
+
+fn routing_json_i32(value: &serde_json::Value, key: &str) -> Option<i32> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_i64)
+        .map(|n| n as i32)
+}
+
+fn routing_json_bool(value: &serde_json::Value, key: &str, default: bool) -> bool {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(default)
+}
+
+fn routing_capabilities(value: &serde_json::Value) -> Vec<String> {
+    value
+        .get("capabilities")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn provider_key_state(provider: &openplotva_storage::llm_routing::ProviderRecord) -> &'static str {
+    if provider.api_key_encrypted.is_some() {
+        "encrypted"
+    } else if provider.api_key_ref.is_some() {
+        "ref"
+    } else {
+        "unset"
+    }
+}
+
+/// Build a provider input from admin JSON, sealing a plaintext `api_key` under the
+/// master key. The plaintext is never persisted or echoed; only the ciphertext is
+/// stored, and `api_key_ref`/`api_key_encrypted` are mutually exclusive.
+fn provider_input_from_json(
+    value: &serde_json::Value,
+) -> Result<openplotva_storage::llm_routing::ProviderInput, String> {
+    let mut input = openplotva_storage::llm_routing::ProviderInput {
+        name: routing_json_str(value, "name").ok_or("name is required")?,
+        kind: routing_json_str(value, "kind").unwrap_or_else(|| "chat".to_owned()),
+        endpoint: routing_json_str(value, "endpoint"),
+        discovery_service_name: routing_json_str(value, "discovery_service_name"),
+        discovery_endpoint_name: routing_json_str(value, "discovery_endpoint_name"),
+        api_key_ref: routing_json_str(value, "api_key_ref"),
+        api_key_encrypted: None,
+        enabled: routing_json_bool(value, "enabled", true),
+        config: value.get("config").cloned().unwrap_or_else(|| json!({})),
+    };
+    if let Some(plaintext) = routing_json_str(value, "api_key")
+        && !plaintext.trim().is_empty()
+    {
+        let sealed =
+            openplotva_storage::llm_routing::seal_key(&routing_master_secret(), &plaintext)
+                .map_err(|error| error.to_string())?;
+        input.api_key_encrypted = Some(sealed);
+        input.api_key_ref = None;
+    }
+    Ok(input)
+}
+
+fn model_input_from_json(
+    value: &serde_json::Value,
+) -> Result<openplotva_storage::llm_routing::ModelInput, String> {
+    Ok(openplotva_storage::llm_routing::ModelInput {
+        provider_id: value
+            .get("provider_id")
+            .and_then(serde_json::Value::as_i64)
+            .ok_or("provider_id is required")?,
+        model_name: routing_json_str(value, "model_name").ok_or("model_name is required")?,
+        display_name: routing_json_str(value, "display_name"),
+        base_url: routing_json_str(value, "base_url"),
+        capabilities: routing_capabilities(value),
+        embedding_dim: routing_json_i32(value, "embedding_dim"),
+        enabled: routing_json_bool(value, "enabled", true),
+        config: value.get("config").cloned().unwrap_or_else(|| json!({})),
+    })
+}
+
+fn assignment_input_from_json(
+    value: &serde_json::Value,
+) -> Result<openplotva_storage::llm_routing::AssignmentInput, String> {
+    Ok(openplotva_storage::llm_routing::AssignmentInput {
+        workflow_key: routing_json_str(value, "workflow_key").ok_or("workflow_key is required")?,
+        scope: routing_json_str(value, "scope").unwrap_or_else(|| "global".to_owned()),
+        role: routing_json_str(value, "role").unwrap_or_else(|| "primary".to_owned()),
+        provider_model_id: value
+            .get("provider_model_id")
+            .and_then(serde_json::Value::as_i64)
+            .ok_or("provider_model_id is required")?,
+        weight: routing_json_i32(value, "weight"),
+        fallback_order: routing_json_i32(value, "fallback_order"),
+        canary_percent: routing_json_i32(value, "canary_percent"),
+        enabled: routing_json_bool(value, "enabled", true),
+        inference_overrides: value
+            .get("inference_overrides")
+            .cloned()
+            .unwrap_or_else(|| json!({})),
+        cb_failure_threshold: routing_json_i32(value, "cb_failure_threshold").unwrap_or(5),
+        cb_cooldown_ms: routing_json_i32(value, "cb_cooldown_ms").unwrap_or(30_000),
+    })
+}
+
+fn trigger_input_from_json(
+    value: &serde_json::Value,
+) -> Result<openplotva_storage::llm_routing::TriggerInput, String> {
+    Ok(openplotva_storage::llm_routing::TriggerInput {
+        workflow_key: routing_json_str(value, "workflow_key").ok_or("workflow_key is required")?,
+        trigger_type: routing_json_str(value, "trigger_type").ok_or("trigger_type is required")?,
+        engage_assignment_id: value
+            .get("engage_assignment_id")
+            .and_then(serde_json::Value::as_i64)
+            .ok_or("engage_assignment_id is required")?,
+        enabled: routing_json_bool(value, "enabled", true),
+        queue_name: routing_json_str(value, "queue_name"),
+        high_watermark: routing_json_i32(value, "high_watermark"),
+        low_watermark: routing_json_i32(value, "low_watermark"),
+        params: value.get("params").cloned().unwrap_or_else(|| json!({})),
+    })
+}
+
+async fn admin_routing_snapshot_json(pool: &PgPool) -> Result<serde_json::Value, String> {
+    let snapshot = openplotva_storage::llm_routing::load_snapshot(pool)
+        .await
+        .map_err(|error| error.to_string())?;
+    let providers: Vec<serde_json::Value> = snapshot
+        .providers
+        .iter()
+        .map(|provider| {
+            json!({
+                "id": provider.id,
+                "name": provider.name,
+                "kind": provider.kind,
+                "endpoint": provider.endpoint,
+                "discovery_service_name": provider.discovery_service_name,
+                "discovery_endpoint_name": provider.discovery_endpoint_name,
+                "key_state": provider_key_state(provider),
+                "api_key_ref": provider.api_key_ref,
+                "enabled": provider.enabled,
+                "config": provider.config,
+            })
+        })
+        .collect();
+    let models: Vec<serde_json::Value> = snapshot
+        .models
+        .iter()
+        .map(|model| {
+            json!({
+                "id": model.id,
+                "provider_id": model.provider_id,
+                "model_name": model.model_name,
+                "display_name": model.display_name,
+                "base_url": model.base_url,
+                "capabilities": model.capabilities,
+                "embedding_dim": model.embedding_dim,
+                "enabled": model.enabled,
+            })
+        })
+        .collect();
+    let workflows: Vec<serde_json::Value> = snapshot
+        .workflows
+        .iter()
+        .map(|workflow| {
+            json!({
+                "key": workflow.key,
+                "kind": workflow.kind,
+                "full_routing": workflow.full_routing,
+                "retry_max_hops": workflow.retry_max_hops,
+                "retry_wall_ms": workflow.retry_wall_ms,
+                "enabled": workflow.enabled,
+            })
+        })
+        .collect();
+    let assignments: Vec<serde_json::Value> = snapshot
+        .assignments
+        .iter()
+        .map(|assignment| {
+            json!({
+                "id": assignment.id,
+                "workflow_key": assignment.workflow_key,
+                "scope": assignment.scope,
+                "role": assignment.role,
+                "provider_model_id": assignment.provider_model_id,
+                "weight": assignment.weight,
+                "fallback_order": assignment.fallback_order,
+                "canary_percent": assignment.canary_percent,
+                "enabled": assignment.enabled,
+                "inference_overrides": assignment.inference_overrides,
+                "cb_failure_threshold": assignment.cb_failure_threshold,
+                "cb_cooldown_ms": assignment.cb_cooldown_ms,
+            })
+        })
+        .collect();
+    let triggers: Vec<serde_json::Value> = snapshot
+        .triggers
+        .iter()
+        .map(|trigger| {
+            json!({
+                "id": trigger.id,
+                "workflow_key": trigger.workflow_key,
+                "trigger_type": trigger.trigger_type,
+                "engage_assignment_id": trigger.engage_assignment_id,
+                "enabled": trigger.enabled,
+                "queue_name": trigger.queue_name,
+                "high_watermark": trigger.high_watermark,
+                "low_watermark": trigger.low_watermark,
+                "params": trigger.params,
+            })
+        })
+        .collect();
+    Ok(json!({
+        "providers": providers,
+        "models": models,
+        "workflows": workflows,
+        "assignments": assignments,
+        "triggers": triggers,
+    }))
+}
+
+async fn admin_routing_apply_action(
+    pool: &PgPool,
+    routes: &StaticWebRoutes,
+    body: &serde_json::Value,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let action = body
+        .get("action")
+        .and_then(serde_json::Value::as_str)
+        .ok_or((StatusCode::BAD_REQUEST, "action is required".to_owned()))?;
+    let bad = |error: String| (StatusCode::BAD_REQUEST, error);
+    let storage_err = |error: openplotva_storage::StorageError| {
+        (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+    };
+    let id_of = |body: &serde_json::Value| body.get("id").and_then(serde_json::Value::as_i64);
+
+    use openplotva_storage::llm_routing as routing;
+    let result = match action {
+        "create_provider" => {
+            let input = provider_input_from_json(body).map_err(bad)?;
+            let id = routing::insert_provider(pool, &input)
+                .await
+                .map_err(storage_err)?;
+            json!({ "ok": true, "id": id })
+        }
+        "update_provider" => {
+            let id = id_of(body).ok_or(bad("id is required".to_owned()))?;
+            let input = provider_input_from_json(body).map_err(bad)?;
+            routing::update_provider(pool, id, &input)
+                .await
+                .map_err(storage_err)?;
+            json!({ "ok": true })
+        }
+        "delete_provider" => {
+            let id = id_of(body).ok_or(bad("id is required".to_owned()))?;
+            routing::delete_provider(pool, id)
+                .await
+                .map_err(storage_err)?;
+            json!({ "ok": true })
+        }
+        "create_model" => {
+            let input = model_input_from_json(body).map_err(bad)?;
+            let id = routing::insert_model(pool, &input)
+                .await
+                .map_err(storage_err)?;
+            json!({ "ok": true, "id": id })
+        }
+        "update_model" => {
+            let id = id_of(body).ok_or(bad("id is required".to_owned()))?;
+            let input = model_input_from_json(body).map_err(bad)?;
+            routing::update_model(pool, id, &input)
+                .await
+                .map_err(storage_err)?;
+            json!({ "ok": true })
+        }
+        "delete_model" => {
+            let id = id_of(body).ok_or(bad("id is required".to_owned()))?;
+            routing::delete_model(pool, id).await.map_err(storage_err)?;
+            json!({ "ok": true })
+        }
+        "create_assignment" => {
+            let input = assignment_input_from_json(body).map_err(bad)?;
+            let id = routing::insert_assignment(pool, &input)
+                .await
+                .map_err(storage_err)?;
+            json!({ "ok": true, "id": id })
+        }
+        "delete_assignment" => {
+            let id = id_of(body).ok_or(bad("id is required".to_owned()))?;
+            routing::delete_assignment(pool, id)
+                .await
+                .map_err(storage_err)?;
+            json!({ "ok": true })
+        }
+        "delete_assignments_for_scope" => {
+            let workflow = routing_json_str(body, "workflow_key")
+                .ok_or(bad("workflow_key is required".to_owned()))?;
+            let scope = routing_json_str(body, "scope").unwrap_or_else(|| "global".to_owned());
+            routing::delete_assignments_for_scope(pool, &workflow, &scope)
+                .await
+                .map_err(storage_err)?;
+            json!({ "ok": true })
+        }
+        "create_trigger" => {
+            let input = trigger_input_from_json(body).map_err(bad)?;
+            let id = routing::insert_trigger(pool, &input)
+                .await
+                .map_err(storage_err)?;
+            json!({ "ok": true, "id": id })
+        }
+        "delete_trigger" => {
+            let id = id_of(body).ok_or(bad("id is required".to_owned()))?;
+            routing::delete_trigger(pool, id)
+                .await
+                .map_err(storage_err)?;
+            json!({ "ok": true })
+        }
+        "update_workflow" => {
+            let key = routing_json_str(body, "key").ok_or(bad("key is required".to_owned()))?;
+            routing::update_workflow(
+                pool,
+                &key,
+                routing_json_bool(body, "full_routing", true),
+                routing_json_i32(body, "retry_max_hops").unwrap_or(3),
+                routing_json_i32(body, "retry_wall_ms").unwrap_or(60_000),
+                routing_json_bool(body, "enabled", true),
+            )
+            .await
+            .map_err(storage_err)?;
+            json!({ "ok": true })
+        }
+        "reload" => json!({ "ok": true }),
+        other => return Err(bad(format!("unknown action {other}"))),
+    };
+
+    // Every mutating action bumps the revision and atomically reloads the router so
+    // the change takes effect without a restart.
+    if action != "reload" {
+        let revision = admin_app_setting(routes, "llm.routing.revision")
+            .await
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        let _ =
+            admin_upsert_app_setting(routes, "llm.routing.revision", &(revision + 1).to_string())
+                .await;
+    }
+    if let Some(handle) = routes.router_handle.as_ref()
+        && let Err(error) = model_routing::reload_router(handle, pool).await
+    {
+        tracing::warn!(%error, "failed to reload router after admin routing change");
+    }
+    Ok(result)
+}
+
+async fn admin_routing(
+    method: Method,
+    headers: HeaderMap,
+    Extension(routes): Extension<StaticWebRoutes>,
+    body: Bytes,
+) -> Response {
+    if let Err(error) = require_admin_request(&headers, &routes.admin_ids, &routes.bot_token) {
+        return admin_auth_failure_response(error);
+    }
+    let Some(pool) = routes.postgres.clone() else {
+        return admin_error_response(StatusCode::SERVICE_UNAVAILABLE, "database unavailable");
+    };
+
+    if method == Method::GET {
+        return match admin_routing_snapshot_json(&pool).await {
+            Ok(value) => admin_json_response(StatusCode::OK, value),
+            Err(error) => admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, &error),
+        };
+    }
+    if method != Method::POST && method != Method::PUT {
+        return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+    }
+    let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return admin_error_response(StatusCode::BAD_REQUEST, "invalid json");
+    };
+    match admin_routing_apply_action(&pool, &routes, &parsed).await {
+        Ok(value) => admin_json_response(StatusCode::OK, value),
+        Err((status, error)) => admin_error_response(status, &error),
+    }
+}
+
 #[derive(Debug)]
 struct AdminLogStreamState {
     buffer: Arc<openplotva_observability::RuntimeLogBuffer>,
@@ -8505,6 +8912,7 @@ async fn start_runtime_workers(
         memory_restart_trigger: None,
         llm_trace_buffer: None,
         runtime_api_tls_public_key_pin: None,
+        router_handle: None,
     };
     let update_queue =
         openplotva_updates::RedisUpdateQueue::new(service_clients.redis.client().clone());
@@ -9602,16 +10010,64 @@ async fn start_runtime_workers(
         &config.llm.discovery.base_url,
     )?
     .map(|client| Arc::new(client) as Arc<dyn memory_runtime::EmbeddingProvider>);
+    // DB-backed dialog routing: seed the tables from env on first boot, load the
+    // routing table, and publish it behind an ArcSwap. The trigger poller keeps the
+    // queue-depth/error-rate/time-of-day engagement state current, replacing the
+    // hardcoded dialog-aifarm watermark gate.
+    let router_breakers = Arc::new(openplotva_llm::router::BreakerSet::new());
+    let router_triggers = Arc::new(openplotva_llm::router::TriggerState::new());
+    if let Err(error) =
+        model_routing::seed_routing_from_env(&service_clients.postgres, config).await
+    {
+        tracing::warn!(%error, "failed to seed LLM routing tables; continuing with existing rows");
+    }
+    let router_handle = match model_routing::load_routing_table(&service_clients.postgres).await {
+        Ok(table) => openplotva_llm::router::RouterHandle::new(table),
+        Err(error) => {
+            tracing::warn!(%error, "failed to load LLM routing table; starting with an empty table");
+            openplotva_llm::router::RouterHandle::new(
+                openplotva_llm::router::RoutingTable::default(),
+            )
+        }
+    };
+    workers.router_handle = Some(Arc::clone(&router_handle));
+    {
+        let poller_handle = Arc::clone(&router_handle);
+        let poller_triggers = Arc::clone(&router_triggers);
+        let poller_breakers = Arc::clone(&router_breakers);
+        let poller_queue = Arc::clone(&task_queue_for_updates);
+        let poller_stop = stop.subscribe();
+        let poller_interval = Duration::from_secs(
+            config
+                .persistent_queue
+                .dialog_aifarm_fallback_poll_interval_seconds
+                .max(1) as u64,
+        );
+        workers.handles.push(tokio::spawn(async move {
+            dialog_jobs::run_router_trigger_poller(
+                poller_handle,
+                poller_triggers,
+                poller_breakers,
+                poller_queue,
+                poller_interval,
+                wait_for_runtime_stop(poller_stop),
+            )
+            .await;
+        }));
+    }
     let genkit_fallback = dialog_runtime::genkit_dialog_provider_from_app_config_with_toolbox(
         config,
         Some(Arc::clone(&dialog_toolbox)),
     );
     let mut dialog_provider_for_updates: Option<openplotva_llm::ChatProviderHandle> = None;
-    match dialog_runtime::dialog_provider_from_app_config_with_fallback(
+    match Ok::<_, dialog_runtime::DialogProviderBuildError>(dialog_runtime::router_dialog_provider(
         config,
         Arc::clone(&dialog_toolbox),
+        Arc::clone(&router_handle),
+        Arc::clone(&router_breakers),
+        Arc::clone(&router_triggers),
         genkit_fallback,
-    ) {
+    )) {
         Ok(mut dialog_provider) => {
             if dialog_runtime::white_circle_effective_enabled(config) {
                 let white_circle_client = openplotva_llm::whitecircle::WhiteCircleClient::new(
@@ -10761,6 +11217,7 @@ async fn shutdown_runtime_workers(workers: RuntimeWorkers) {
         memory_restart_trigger: _,
         llm_trace_buffer: _,
         runtime_api_tls_public_key_pin: _,
+        router_handle: _,
     } = workers;
 
     if let Some(stop) = stop {

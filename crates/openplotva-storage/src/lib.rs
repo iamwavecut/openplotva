@@ -38,6 +38,8 @@ use thiserror::Error;
 use time::OffsetDateTime;
 use tokio::sync::OnceCell;
 
+pub mod llm_routing;
+
 /// Human-readable crate purpose used by scaffold tests and docs.
 pub const PURPOSE: &str = "storage";
 
@@ -6310,6 +6312,27 @@ pub enum StorageError {
     /// Telegram file metadata JSON codec failed.
     #[error("decode telegram file metadata: {source}")]
     TelegramFileCodec {
+        /// JSON codec error.
+        source: serde_json::Error,
+    },
+    /// Provider key encryption is requested but `MASTER_KEY` is not configured.
+    #[error("LLM routing master key is not configured")]
+    RoutingMasterKeyMissing,
+    /// AES-GCM sealing of a provider key failed.
+    #[error("encrypt provider key: {message}")]
+    RoutingKeyEncrypt {
+        /// Stringified AEAD error.
+        message: String,
+    },
+    /// AES-GCM opening of a stored provider key failed.
+    #[error("decrypt provider key: {message}")]
+    RoutingKeyDecrypt {
+        /// Stringified AEAD or UTF-8 error.
+        message: String,
+    },
+    /// Routing config JSON column codec failed.
+    #[error("decode routing config json: {source}")]
+    RoutingJsonCodec {
         /// JSON codec error.
         source: serde_json::Error,
     },

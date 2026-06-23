@@ -7,6 +7,7 @@ use openplotva_dialog::{DialogInput, DialogOutput};
 pub mod aifarm;
 pub mod gemini;
 pub mod retry;
+pub mod router;
 pub mod trace;
 pub mod whitecircle;
 

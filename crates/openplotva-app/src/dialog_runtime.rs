@@ -1,6 +1,6 @@
 //! App-level dialog provider construction.
 
-use std::{fmt, sync::Arc};
+use std::{collections::HashMap, fmt, sync::Arc};
 
 use openplotva_config::AppConfig;
 use openplotva_dialog::{
@@ -8,7 +8,7 @@ use openplotva_dialog::{
     PROVIDER_VMLX,
 };
 use openplotva_llm::{
-    ChatProvider, ChatProviderError,
+    ChatProvider, ChatProviderError, ChatProviderFuture,
     aifarm::{
         AifarmClientConfig, AifarmDialogConfig, AifarmDialogProvider, ReqwestAifarmTransport,
     },
@@ -17,6 +17,7 @@ use openplotva_llm::{
         is_gemini_provider_model,
     },
     retry::retryable_reason,
+    router::{BreakerLiveness, BreakerSet, RouterHandle, TriggerState, select},
     whitecircle::{WhiteCircleClientConfig, WhiteCirclePreToolConfig},
     with_fallback,
 };
@@ -34,6 +35,156 @@ const OPENROUTER_CHAT_COMPLETIONS_URL: &str = "https://openrouter.ai/api/v1/chat
 
 /// Shared dialog provider handle.
 pub type DialogProviderHandle = Arc<dyn ChatProvider>;
+
+/// Workflow key the dialog worker routes through.
+const DIALOG_WORKFLOW_KEY: &str = "dialog";
+
+/// Dialog provider that selects its concrete backend per request from the
+/// DB-backed routing table (weighted primaries, ordered fallback, trigger-engaged
+/// overflow), recording circuit-breaker outcomes. Underlying transport clients are
+/// reused from the existing per-provider factories, keyed by provider name.
+pub struct RouterChatProvider {
+    handle: Arc<RouterHandle>,
+    breakers: Arc<BreakerSet>,
+    triggers: Arc<TriggerState>,
+    clients: HashMap<String, DialogProviderHandle>,
+    default_client: DialogProviderHandle,
+    provider_name: String,
+}
+
+impl RouterChatProvider {
+    #[must_use]
+    pub fn new(
+        handle: Arc<RouterHandle>,
+        breakers: Arc<BreakerSet>,
+        triggers: Arc<TriggerState>,
+        clients: HashMap<String, DialogProviderHandle>,
+        default_client: DialogProviderHandle,
+    ) -> Self {
+        Self {
+            handle,
+            breakers,
+            triggers,
+            clients,
+            default_client,
+            provider_name: "router".to_owned(),
+        }
+    }
+
+    fn client_for(&self, name: &str) -> DialogProviderHandle {
+        self.clients
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| Arc::clone(&self.default_client))
+    }
+}
+
+impl ChatProvider for RouterChatProvider {
+    fn provider_name(&self) -> &str {
+        &self.provider_name
+    }
+
+    fn run_dialog<'a>(&'a self, input: DialogInput) -> ChatProviderFuture<'a> {
+        Box::pin(async move {
+            // Owned snapshot: Send and safe to hold across the provider awaits.
+            let table = self.handle.snapshot();
+            let Some(route) = table.resolve(DIALOG_WORKFLOW_KEY, false) else {
+                return self.default_client.run_dialog(input).await;
+            };
+
+            // Compute the attempt chain synchronously; the RNG is dropped before any await.
+            let attempts = {
+                let liveness = BreakerLiveness::new(&self.breakers, std::time::Instant::now());
+                let mut rng = rand::rng();
+                select(route, &liveness, self.triggers.as_ref(), &mut rng)
+            };
+            if attempts.is_empty() {
+                return self.default_client.run_dialog(input).await;
+            }
+
+            let mut last_error: Option<ChatProviderError> = None;
+            for attempt in attempts {
+                let provider_name = table
+                    .provider(attempt.provider)
+                    .map(|provider| provider.name.clone());
+                let client = match provider_name.as_deref() {
+                    Some(name) => self.client_for(name),
+                    None => Arc::clone(&self.default_client),
+                };
+
+                let mut request = input.clone();
+                if let Some(model) = table.model(attempt.model)
+                    && !model.model_name.trim().is_empty()
+                {
+                    request.model = model.model_name.clone();
+                }
+                if let Some(max_tokens) = attempt.overrides.max_tokens
+                    && max_tokens > 0
+                {
+                    request.max_output_tokens = max_tokens;
+                }
+
+                match client.run_dialog(request).await {
+                    Ok(mut output) => {
+                        self.breakers
+                            .record_success(attempt.provider, attempt.model);
+                        if output.provider.trim().is_empty() {
+                            output.provider = client.provider_name().to_owned();
+                        }
+                        return Ok(output);
+                    }
+                    Err(error) => {
+                        if retryable_reason(error.as_ref()).is_none() {
+                            return Err(error);
+                        }
+                        self.breakers.record_failure(
+                            attempt.provider,
+                            attempt.model,
+                            attempt.breaker,
+                        );
+                        last_error = Some(error);
+                    }
+                }
+            }
+
+            Err(last_error.unwrap_or_else(|| {
+                Box::new(std::io::Error::other(
+                    "router: all dialog attempts exhausted",
+                ))
+            }))
+        })
+    }
+}
+
+/// Build the DB-backed dialog provider, reusing the existing aifarm and genkit
+/// transport clients keyed by provider name (`gemini` overflow shares the Google
+/// AI / genkit client). Falls back to the aifarm primary when no route resolves.
+pub fn router_dialog_provider(
+    config: &AppConfig,
+    toolbox: Arc<dyn DialogToolbox>,
+    handle: Arc<RouterHandle>,
+    breakers: Arc<BreakerSet>,
+    triggers: Arc<TriggerState>,
+    genkit_fallback: Option<DialogProviderHandle>,
+) -> DialogProviderHandle {
+    let aifarm: DialogProviderHandle = Arc::new(aifarm_dialog_provider_from_app_config(
+        config,
+        Arc::clone(&toolbox),
+    ));
+    let genkit = genkit_fallback
+        .or_else(|| genkit_dialog_provider_from_app_config_with_toolbox(config, Some(toolbox)));
+
+    let mut clients: HashMap<String, DialogProviderHandle> = HashMap::new();
+    clients.insert(PROVIDER_AIFARM.to_owned(), Arc::clone(&aifarm));
+    if let Some(genkit) = genkit {
+        clients.insert(PROVIDER_GENKIT.to_owned(), Arc::clone(&genkit));
+        clients.insert("gemini".to_owned(), genkit);
+    }
+
+    Arc::new(RouterChatProvider::new(
+        handle, breakers, triggers, clients, aifarm,
+    ))
+}
 
 struct PoolGatedFallbackChatProvider {
     primary: DialogProviderHandle,

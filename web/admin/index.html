@@ -53,6 +53,8 @@
                     data-args='["shield"]'>Shield</pl-button>
                 <pl-button variant="nav" data-tab="llm" data-action="switchTab"
                     data-args='["llm"]'>LLM Context</pl-button>
+                <pl-button variant="nav" data-tab="providers" data-action="switchTab"
+                    data-args='["providers"]'>Model Providers</pl-button>
                 <pl-button variant="nav" data-tab="safety" data-action="switchTab"
                     data-args='["safety"]'>Safety Checks</pl-button>
                 <pl-button variant="nav" data-tab="analytics" data-action="switchTab"
@@ -1023,6 +1025,88 @@
                         </div>
                     </div>
 
+                    <div id="providers" class="tab-pane">
+                        <div class="card">
+                            <div class="d-flex gap-2 align-center justify-between">
+                                <p class="muted">DB-backed LLM routing. Edit providers, models, per-workflow
+                                    assignments and triggers; changes apply live on reload.</p>
+                                <div class="d-flex gap-2 align-center">
+                                    <pl-button data-action="loadRouting">Refresh</pl-button>
+                                    <pl-button variant="primary" data-action="reloadRouting">Reload router</pl-button>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="card">
+                            <h3>Providers</h3>
+                            <pl-table id="routing-providers-table" dense></pl-table>
+                            <div class="d-flex gap-2 align-center">
+                                <pl-input id="rp-name" placeholder="name"></pl-input>
+                                <pl-select id="rp-kind" class="w-narrow">
+                                    <option value="chat">chat</option>
+                                    <option value="vision">vision</option>
+                                    <option value="embedding">embedding</option>
+                                    <option value="image">image</option>
+                                    <option value="music">music</option>
+                                </pl-select>
+                                <pl-input id="rp-endpoint" placeholder="endpoint (optional)"></pl-input>
+                                <pl-input id="rp-keyref" placeholder="api_key_ref env var"></pl-input>
+                                <pl-input id="rp-key" type="password" placeholder="api key (stored encrypted)"></pl-input>
+                                <pl-button data-action="addRoutingProvider">Add provider</pl-button>
+                            </div>
+                        </div>
+                        <div class="card">
+                            <h3>Models</h3>
+                            <pl-table id="routing-models-table" dense></pl-table>
+                            <div class="d-flex gap-2 align-center">
+                                <pl-input id="rm-provider" placeholder="provider_id"></pl-input>
+                                <pl-input id="rm-model" placeholder="model_name"></pl-input>
+                                <pl-input id="rm-baseurl" placeholder="base_url (optional)"></pl-input>
+                                <pl-input id="rm-caps" placeholder="capabilities csv (chat,tools)"></pl-input>
+                                <pl-input id="rm-dim" placeholder="embedding_dim (512 for embeddings)"></pl-input>
+                                <pl-button data-action="addRoutingModel">Add model</pl-button>
+                            </div>
+                        </div>
+                        <div class="card">
+                            <h3>Workflow assignments</h3>
+                            <pl-table id="routing-assignments-table" dense></pl-table>
+                            <div class="d-flex gap-2 align-center">
+                                <pl-input id="ra-workflow" placeholder="workflow_key"></pl-input>
+                                <pl-select id="ra-scope" class="w-narrow">
+                                    <option value="global">global</option>
+                                    <option value="vip">vip</option>
+                                </pl-select>
+                                <pl-select id="ra-role" class="w-narrow">
+                                    <option value="primary">primary</option>
+                                    <option value="fallback">fallback</option>
+                                    <option value="overflow">overflow</option>
+                                    <option value="canary">canary</option>
+                                    <option value="shadow">shadow</option>
+                                </pl-select>
+                                <pl-input id="ra-model" placeholder="provider_model_id"></pl-input>
+                                <pl-input id="ra-weight" placeholder="weight"></pl-input>
+                                <pl-input id="ra-order" placeholder="fallback_order"></pl-input>
+                                <pl-button data-action="addRoutingAssignment">Add assignment</pl-button>
+                            </div>
+                        </div>
+                        <div class="card">
+                            <h3>Triggers</h3>
+                            <pl-table id="routing-triggers-table" dense></pl-table>
+                            <div class="d-flex gap-2 align-center">
+                                <pl-input id="rt-workflow" placeholder="workflow_key"></pl-input>
+                                <pl-select id="rt-type" class="w-narrow">
+                                    <option value="queue_depth">queue_depth</option>
+                                    <option value="error_rate">error_rate</option>
+                                    <option value="time_of_day">time_of_day</option>
+                                </pl-select>
+                                <pl-input id="rt-engage" placeholder="engage_assignment_id"></pl-input>
+                                <pl-input id="rt-queue" placeholder="queue_name (dialog-aifarm)"></pl-input>
+                                <pl-input id="rt-high" placeholder="high_watermark"></pl-input>
+                                <pl-input id="rt-low" placeholder="low_watermark"></pl-input>
+                                <pl-button data-action="addRoutingTrigger">Add trigger</pl-button>
+                            </div>
+                        </div>
+                    </div>
+
                     <div id="logs" class="tab-pane">
                         <div class="card logs-card logs-card-fill">
                             <div class="card-header sticky-header logs-header">
@@ -1104,6 +1188,7 @@
                 'memory': 'Memory',
                 'shield': 'Shield',
                 'llm': 'LLM Context',
+                'providers': 'Model Providers',
                 'safety': 'Safety Checks',
                 'analytics': 'Analytics',
                 'logs': 'Real-time Logs'
@@ -1116,6 +1201,9 @@
 
             if (tabId === 'llm') {
                 loadLLMRequests(false);
+            }
+            if (tabId === 'providers') {
+                loadRouting();
             }
             if (tabId === 'safety') {
                 loadSafetyChecks(false);
@@ -1181,6 +1269,127 @@
                 if (loader) loader.classList.remove('active');
                 searchButtons.forEach(btn => btn.disabled = false);
             }
+        }
+
+        // --- Model Providers (DB-backed routing) ---
+        const ROUTING_DELETE = (action) => ({
+            key: 'actions', label: '', render: (r) => PL.el('pl-button',
+                { variant: 'danger', 'data-action': action, 'data-args': JSON.stringify([r.id]) }, 'Delete')
+        });
+        const ROUTING_PROVIDER_COLUMNS = [
+            { key: 'id', label: 'ID', mono: true, render: (r) => String(r.id) },
+            { key: 'name', label: 'Name' },
+            { key: 'kind', label: 'Kind' },
+            { key: 'endpoint', label: 'Endpoint', render: (r) => r.endpoint || '—' },
+            { key: 'key_state', label: 'Key', render: (r) => PL.badge(r.key_state, r.key_state === 'unset' ? 'danger' : 'success') },
+            { key: 'enabled', label: 'State', render: (r) => PL.badge(r.enabled ? 'enabled' : 'disabled', r.enabled ? 'success' : 'danger') },
+            ROUTING_DELETE('deleteRoutingProvider'),
+        ];
+        const ROUTING_MODEL_COLUMNS = [
+            { key: 'id', label: 'ID', mono: true, render: (r) => String(r.id) },
+            { key: 'provider_id', label: 'Provider', mono: true, render: (r) => String(r.provider_id) },
+            { key: 'model_name', label: 'Model' },
+            { key: 'base_url', label: 'Base URL', render: (r) => r.base_url || '—' },
+            { key: 'capabilities', label: 'Capabilities', render: (r) => (r.capabilities || []).join(', ') || '—' },
+            { key: 'embedding_dim', label: 'Dim', mono: true, render: (r) => r.embedding_dim == null ? '—' : String(r.embedding_dim) },
+            ROUTING_DELETE('deleteRoutingModel'),
+        ];
+        const ROUTING_ASSIGNMENT_COLUMNS = [
+            { key: 'id', label: 'ID', mono: true, render: (r) => String(r.id) },
+            { key: 'workflow_key', label: 'Workflow' },
+            { key: 'scope', label: 'Scope', render: (r) => PL.badge(r.scope, r.scope === 'vip' ? 'warning' : 'neutral') },
+            { key: 'role', label: 'Role' },
+            { key: 'provider_model_id', label: 'Model', mono: true, render: (r) => String(r.provider_model_id) },
+            { key: 'weight', label: 'Weight', mono: true, render: (r) => r.weight == null ? '—' : String(r.weight) },
+            { key: 'fallback_order', label: 'Order', mono: true, render: (r) => r.fallback_order == null ? '—' : String(r.fallback_order) },
+            ROUTING_DELETE('deleteRoutingAssignment'),
+        ];
+        const ROUTING_TRIGGER_COLUMNS = [
+            { key: 'id', label: 'ID', mono: true, render: (r) => String(r.id) },
+            { key: 'workflow_key', label: 'Workflow' },
+            { key: 'trigger_type', label: 'Type' },
+            { key: 'engage_assignment_id', label: 'Engages', mono: true, render: (r) => String(r.engage_assignment_id) },
+            { key: 'high_watermark', label: 'High', mono: true, render: (r) => r.high_watermark == null ? '—' : String(r.high_watermark) },
+            { key: 'low_watermark', label: 'Low', mono: true, render: (r) => r.low_watermark == null ? '—' : String(r.low_watermark) },
+            ROUTING_DELETE('deleteRoutingTrigger'),
+        ];
+
+        async function loadRouting() {
+            const data = await apiCall('/routing');
+            if (!data) return;
+            const fill = (id, cols, rows) => {
+                const t = document.getElementById(id);
+                if (t) { t.columns = cols; t.rows = Array.isArray(rows) ? rows : []; }
+            };
+            fill('routing-providers-table', ROUTING_PROVIDER_COLUMNS, data.providers);
+            fill('routing-models-table', ROUTING_MODEL_COLUMNS, data.models);
+            fill('routing-assignments-table', ROUTING_ASSIGNMENT_COLUMNS, data.assignments);
+            fill('routing-triggers-table', ROUTING_TRIGGER_COLUMNS, data.triggers);
+        }
+
+        async function reloadRouting() {
+            const r = await apiCall('/routing', { method: 'POST', body: { action: 'reload' } });
+            if (r) PL.toast('Router reloaded from database.', 'success');
+        }
+
+        async function routingAction(body, okMsg) {
+            const r = await apiCall('/routing', { method: 'POST', body });
+            if (r) { PL.toast(okMsg, 'success'); loadRouting(); }
+            return r;
+        }
+
+        function routingVal(id) { return (document.getElementById(id)?.value || '').trim(); }
+        function routingNum(id) { const v = routingVal(id); return v === '' ? undefined : Number(v); }
+
+        async function addRoutingProvider() {
+            const body = { action: 'create_provider', name: routingVal('rp-name'), kind: routingVal('rp-kind') };
+            const endpoint = routingVal('rp-endpoint'); if (endpoint) body.endpoint = endpoint;
+            const key = routingVal('rp-key'); const keyref = routingVal('rp-keyref');
+            if (key) body.api_key = key; else if (keyref) body.api_key_ref = keyref;
+            if (!body.name) { PL.toast('Provider name is required.', 'error'); return; }
+            await routingAction(body, 'Provider added.');
+        }
+        async function addRoutingModel() {
+            const caps = routingVal('rm-caps').split(',').map(s => s.trim()).filter(Boolean);
+            const body = {
+                action: 'create_model', provider_id: routingNum('rm-provider'),
+                model_name: routingVal('rm-model'), capabilities: caps, embedding_dim: routingNum('rm-dim'),
+            };
+            const baseUrl = routingVal('rm-baseurl'); if (baseUrl) body.base_url = baseUrl;
+            if (!body.provider_id || !body.model_name) { PL.toast('provider_id and model_name are required.', 'error'); return; }
+            await routingAction(body, 'Model added.');
+        }
+        async function addRoutingAssignment() {
+            const body = {
+                action: 'create_assignment', workflow_key: routingVal('ra-workflow'),
+                scope: routingVal('ra-scope'), role: routingVal('ra-role'),
+                provider_model_id: routingNum('ra-model'), weight: routingNum('ra-weight'),
+                fallback_order: routingNum('ra-order'),
+            };
+            if (!body.workflow_key || !body.provider_model_id) { PL.toast('workflow_key and provider_model_id are required.', 'error'); return; }
+            await routingAction(body, 'Assignment added.');
+        }
+        async function addRoutingTrigger() {
+            const body = {
+                action: 'create_trigger', workflow_key: routingVal('rt-workflow'),
+                trigger_type: routingVal('rt-type'), engage_assignment_id: routingNum('rt-engage'),
+                high_watermark: routingNum('rt-high'), low_watermark: routingNum('rt-low'),
+            };
+            const queue = routingVal('rt-queue'); if (queue) body.queue_name = queue;
+            if (!body.workflow_key || !body.engage_assignment_id) { PL.toast('workflow_key and engage_assignment_id are required.', 'error'); return; }
+            await routingAction(body, 'Trigger added.');
+        }
+        async function deleteRoutingProvider(id) {
+            if (await PL.confirm('Delete provider ' + id + ' and its models?')) routingAction({ action: 'delete_provider', id }, 'Provider deleted.');
+        }
+        async function deleteRoutingModel(id) {
+            if (await PL.confirm('Delete model ' + id + '?')) routingAction({ action: 'delete_model', id }, 'Model deleted.');
+        }
+        async function deleteRoutingAssignment(id) {
+            if (await PL.confirm('Delete assignment ' + id + '?')) routingAction({ action: 'delete_assignment', id }, 'Assignment deleted.');
+        }
+        async function deleteRoutingTrigger(id) {
+            if (await PL.confirm('Delete trigger ' + id + '?')) routingAction({ action: 'delete_trigger', id }, 'Trigger deleted.');
         }
 
         // --- Settings ---

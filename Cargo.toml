@@ -30,7 +30,9 @@ license = "MIT"
 repository = "https://github.com/iamwavecut/openplotva"
 
 [workspace.dependencies]
+aes-gcm = "0.10.3"
 anyhow = "1.0.102"
+arc-swap = "1.7.1"
 async-graphql = "8.0.0-rc.5"
 async-openai = "0.38.2"
 axum = "0.8.9"

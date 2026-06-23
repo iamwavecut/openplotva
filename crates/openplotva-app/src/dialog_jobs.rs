@@ -311,6 +311,106 @@ impl DialogAifarmFallbackGate {
     }
 }
 
+/// True when the current UTC time is inside the daily `[start, end)` minute window,
+/// supporting windows that wrap past midnight (`start > end`).
+fn in_utc_minute_window(start_minute: u32, end_minute: u32) -> bool {
+    let now = OffsetDateTime::now_utc();
+    let minute = u32::from(now.hour()) * 60 + u32::from(now.minute());
+    if start_minute <= end_minute {
+        minute >= start_minute && minute < end_minute
+    } else {
+        minute >= start_minute || minute < end_minute
+    }
+}
+
+/// Evaluate every workflow's triggers once and publish their engagement state.
+/// queue_depth applies hysteresis (engage at `high`, disengage below `low`);
+/// error_rate compares the breaker's windowed ratio; time_of_day checks the UTC
+/// window. Only the known dialog queue is polled for depth in this version.
+async fn evaluate_router_triggers_once<Queue>(
+    handle: &openplotva_llm::router::RouterHandle,
+    triggers: &openplotva_llm::router::TriggerState,
+    breakers: &openplotva_llm::router::BreakerSet,
+    queue: &Queue,
+) where
+    Queue: DialogJobWorkerQueue + Sync + ?Sized,
+{
+    let table = handle.snapshot();
+    let keys: Vec<String> = table.workflow_keys().map(str::to_owned).collect();
+    for key in keys {
+        let Some(route) = table.resolve(&key, false) else {
+            continue;
+        };
+        for spec in &route.triggers {
+            let engaged = match &spec.condition {
+                openplotva_llm::router::TriggerCondition::QueueDepth {
+                    queue: queue_name,
+                    high,
+                    low,
+                } => {
+                    if queue_name != DIALOG_AIFARM_QUEUE_NAME {
+                        continue;
+                    }
+                    let Ok(depth) = queue
+                        .pending_dialog_job_depth(DIALOG_AIFARM_QUEUE_NAME, LOWEST_PRIORITY)
+                        .await
+                    else {
+                        continue;
+                    };
+                    if triggers.is_engaged(spec.id) {
+                        depth >= *low
+                    } else {
+                        depth >= *high
+                    }
+                }
+                openplotva_llm::router::TriggerCondition::ErrorRate {
+                    provider,
+                    model,
+                    threshold,
+                    window,
+                } => {
+                    breakers.error_rate(*provider, *model, *window, std::time::Instant::now())
+                        >= *threshold
+                }
+                openplotva_llm::router::TriggerCondition::TimeOfDay {
+                    start_minute,
+                    end_minute,
+                } => in_utc_minute_window(*start_minute, *end_minute),
+            };
+            triggers.set_engaged(spec.id, engaged);
+        }
+    }
+}
+
+/// Background task that keeps the router's trigger-engagement state current,
+/// generalizing the dialog-aifarm watermark gate to all DB-configured triggers.
+pub async fn run_router_trigger_poller<Queue, Stop>(
+    handle: Arc<openplotva_llm::router::RouterHandle>,
+    triggers: Arc<openplotva_llm::router::TriggerState>,
+    breakers: Arc<openplotva_llm::router::BreakerSet>,
+    queue: Arc<Queue>,
+    interval: Duration,
+    stop: Stop,
+) where
+    Queue: DialogJobWorkerQueue + Sync + ?Sized,
+    Stop: Future<Output = ()>,
+{
+    let interval = if interval.is_zero() {
+        Duration::from_secs(1)
+    } else {
+        interval
+    };
+    let mut stop = std::pin::pin!(stop);
+    loop {
+        tokio::select! {
+            () = &mut stop => break,
+            () = tokio::time::sleep(interval) => {
+                evaluate_router_triggers_once(&handle, &triggers, &breakers, queue.as_ref()).await;
+            }
+        }
+    }
+}
+
 /// Queue/status boundary for the dialog-owned taskman worker.
 pub trait DialogJobWorkerQueue {
     /// Error returned by the concrete queue implementation.
