@@ -1026,85 +1026,19 @@
                     </div>
 
                     <div id="providers" class="tab-pane">
-                        <div class="card">
-                            <div class="d-flex gap-2 align-center justify-between">
-                                <p class="muted">DB-backed LLM routing. Edit providers, models, per-workflow
-                                    assignments and triggers; changes apply live on reload.</p>
-                                <div class="d-flex gap-2 align-center">
-                                    <pl-button data-action="loadRouting">Refresh</pl-button>
-                                    <pl-button variant="primary" data-action="reloadRouting">Reload router</pl-button>
-                                </div>
+                        <div class="mp-topbar">
+                            <div class="mp-viewtabs">
+                                <pl-button id="mp-tab-overview" variant="nav" class="active" data-action="mpView" data-args='["overview"]'>Overview</pl-button>
+                                <pl-button id="mp-tab-library" variant="nav" data-action="mpView" data-args='["library"]'>Library</pl-button>
+                            </div>
+                            <div class="mp-topbar-actions">
+                                <pl-button data-action="loadRouting">Refresh</pl-button>
+                                <pl-button variant="primary" data-action="reloadRouting">Reload router</pl-button>
                             </div>
                         </div>
-                        <div class="card">
-                            <h3>Providers</h3>
-                            <pl-table id="routing-providers-table" dense></pl-table>
-                            <div class="d-flex gap-2 align-center">
-                                <pl-input id="rp-name" placeholder="name"></pl-input>
-                                <pl-select id="rp-kind" class="w-narrow">
-                                    <option value="chat">chat</option>
-                                    <option value="vision">vision</option>
-                                    <option value="embedding">embedding</option>
-                                    <option value="image">image</option>
-                                    <option value="music">music</option>
-                                </pl-select>
-                                <pl-input id="rp-endpoint" placeholder="endpoint (optional)"></pl-input>
-                                <pl-input id="rp-keyref" placeholder="api_key_ref env var"></pl-input>
-                                <pl-input id="rp-key" type="password" placeholder="api key (stored encrypted)"></pl-input>
-                                <pl-button data-action="addRoutingProvider">Add provider</pl-button>
-                            </div>
-                        </div>
-                        <div class="card">
-                            <h3>Models</h3>
-                            <pl-table id="routing-models-table" dense></pl-table>
-                            <div class="d-flex gap-2 align-center">
-                                <pl-input id="rm-provider" placeholder="provider_id"></pl-input>
-                                <pl-input id="rm-model" placeholder="model_name"></pl-input>
-                                <pl-input id="rm-baseurl" placeholder="base_url (optional)"></pl-input>
-                                <pl-input id="rm-caps" placeholder="capabilities csv (chat,tools)"></pl-input>
-                                <pl-input id="rm-dim" placeholder="embedding_dim (512 for embeddings)"></pl-input>
-                                <pl-button data-action="addRoutingModel">Add model</pl-button>
-                            </div>
-                        </div>
-                        <div class="card">
-                            <h3>Workflow assignments</h3>
-                            <pl-table id="routing-assignments-table" dense></pl-table>
-                            <div class="d-flex gap-2 align-center">
-                                <pl-input id="ra-workflow" placeholder="workflow_key"></pl-input>
-                                <pl-select id="ra-scope" class="w-narrow">
-                                    <option value="global">global</option>
-                                    <option value="vip">vip</option>
-                                </pl-select>
-                                <pl-select id="ra-role" class="w-narrow">
-                                    <option value="primary">primary</option>
-                                    <option value="fallback">fallback</option>
-                                    <option value="overflow">overflow</option>
-                                    <option value="canary">canary</option>
-                                    <option value="shadow">shadow</option>
-                                </pl-select>
-                                <pl-input id="ra-model" placeholder="provider_model_id"></pl-input>
-                                <pl-input id="ra-weight" placeholder="weight"></pl-input>
-                                <pl-input id="ra-order" placeholder="fallback_order"></pl-input>
-                                <pl-button data-action="addRoutingAssignment">Add assignment</pl-button>
-                            </div>
-                        </div>
-                        <div class="card">
-                            <h3>Triggers</h3>
-                            <pl-table id="routing-triggers-table" dense></pl-table>
-                            <div class="d-flex gap-2 align-center">
-                                <pl-input id="rt-workflow" placeholder="workflow_key"></pl-input>
-                                <pl-select id="rt-type" class="w-narrow">
-                                    <option value="queue_depth">queue_depth</option>
-                                    <option value="error_rate">error_rate</option>
-                                    <option value="time_of_day">time_of_day</option>
-                                </pl-select>
-                                <pl-input id="rt-engage" placeholder="engage_assignment_id"></pl-input>
-                                <pl-input id="rt-queue" placeholder="queue_name (dialog-aifarm)"></pl-input>
-                                <pl-input id="rt-high" placeholder="high_watermark"></pl-input>
-                                <pl-input id="rt-low" placeholder="low_watermark"></pl-input>
-                                <pl-button data-action="addRoutingTrigger">Add trigger</pl-button>
-                            </div>
-                        </div>
+                        <div id="mp-overview" class="mp-view"></div>
+                        <div id="mp-board" class="mp-view mp-hidden"></div>
+                        <div id="mp-library" class="mp-view mp-hidden"></div>
                     </div>
 
                     <div id="logs" class="tab-pane">
@@ -1271,126 +1205,488 @@
             }
         }
 
-        // --- Model Providers (DB-backed routing) ---
-        const ROUTING_DELETE = (action) => ({
-            key: 'actions', label: '', render: (r) => PL.el('pl-button',
-                { variant: 'danger', 'data-action': action, 'data-args': JSON.stringify([r.id]) }, 'Delete')
-        });
-        const ROUTING_PROVIDER_COLUMNS = [
-            { key: 'id', label: 'ID', mono: true, render: (r) => String(r.id) },
-            { key: 'name', label: 'Name' },
-            { key: 'kind', label: 'Kind' },
-            { key: 'endpoint', label: 'Endpoint', render: (r) => r.endpoint || '—' },
-            { key: 'key_state', label: 'Key', render: (r) => PL.badge(r.key_state, r.key_state === 'unset' ? 'danger' : 'success') },
-            { key: 'enabled', label: 'State', render: (r) => PL.badge(r.enabled ? 'enabled' : 'disabled', r.enabled ? 'success' : 'danger') },
-            ROUTING_DELETE('deleteRoutingProvider'),
-        ];
-        const ROUTING_MODEL_COLUMNS = [
-            { key: 'id', label: 'ID', mono: true, render: (r) => String(r.id) },
-            { key: 'provider_id', label: 'Provider', mono: true, render: (r) => String(r.provider_id) },
-            { key: 'model_name', label: 'Model' },
-            { key: 'base_url', label: 'Base URL', render: (r) => r.base_url || '—' },
-            { key: 'capabilities', label: 'Capabilities', render: (r) => (r.capabilities || []).join(', ') || '—' },
-            { key: 'embedding_dim', label: 'Dim', mono: true, render: (r) => r.embedding_dim == null ? '—' : String(r.embedding_dim) },
-            ROUTING_DELETE('deleteRoutingModel'),
-        ];
-        const ROUTING_ASSIGNMENT_COLUMNS = [
-            { key: 'id', label: 'ID', mono: true, render: (r) => String(r.id) },
-            { key: 'workflow_key', label: 'Workflow' },
-            { key: 'scope', label: 'Scope', render: (r) => PL.badge(r.scope, r.scope === 'vip' ? 'warning' : 'neutral') },
-            { key: 'role', label: 'Role' },
-            { key: 'provider_model_id', label: 'Model', mono: true, render: (r) => String(r.provider_model_id) },
-            { key: 'weight', label: 'Weight', mono: true, render: (r) => r.weight == null ? '—' : String(r.weight) },
-            { key: 'fallback_order', label: 'Order', mono: true, render: (r) => r.fallback_order == null ? '—' : String(r.fallback_order) },
-            ROUTING_DELETE('deleteRoutingAssignment'),
-        ];
-        const ROUTING_TRIGGER_COLUMNS = [
-            { key: 'id', label: 'ID', mono: true, render: (r) => String(r.id) },
-            { key: 'workflow_key', label: 'Workflow' },
-            { key: 'trigger_type', label: 'Type' },
-            { key: 'engage_assignment_id', label: 'Engages', mono: true, render: (r) => String(r.engage_assignment_id) },
-            { key: 'high_watermark', label: 'High', mono: true, render: (r) => r.high_watermark == null ? '—' : String(r.high_watermark) },
-            { key: 'low_watermark', label: 'Low', mono: true, render: (r) => r.low_watermark == null ? '—' : String(r.low_watermark) },
-            ROUTING_DELETE('deleteRoutingTrigger'),
-        ];
+        // --- Model Providers — routing studio (overview map + drill-in board) ---
+        const mpState = { snap: null, view: 'overview', wf: null, scope: 'global' };
 
-        async function loadRouting() {
-            const data = await apiCall('/routing');
-            if (!data) return;
-            const fill = (id, cols, rows) => {
-                const t = document.getElementById(id);
-                if (t) { t.columns = cols; t.rows = Array.isArray(rows) ? rows : []; }
-            };
-            fill('routing-providers-table', ROUTING_PROVIDER_COLUMNS, data.providers);
-            fill('routing-models-table', ROUTING_MODEL_COLUMNS, data.models);
-            fill('routing-assignments-table', ROUTING_ASSIGNMENT_COLUMNS, data.assignments);
-            fill('routing-triggers-table', ROUTING_TRIGGER_COLUMNS, data.triggers);
+        function mpEl(tag, attrs, children) {
+            const e = document.createElement(tag);
+            const a = attrs || {};
+            for (const k in a) {
+                if (k === '_on') { for (const ev in a._on) e.addEventListener(ev, a._on[ev]); }
+                else if (k === 'text') e.textContent = a[k];
+                else if (k === 'class') e.className = a[k];
+                else if (a[k] === true) e.setAttribute(k, '');
+                else if (a[k] != null && a[k] !== false) e.setAttribute(k, a[k]);
+            }
+            const kids = children == null ? [] : (Array.isArray(children) ? children : [children]);
+            for (const c of kids) {
+                if (c == null) continue;
+                e.appendChild(typeof c === 'string' ? document.createTextNode(c) : c);
+            }
+            return e;
         }
+        function mpIcon(name) { return mpEl('i', { class: 'ti ti-' + name, 'aria-hidden': 'true' }); }
+        function mpClear(el) { while (el.firstChild) el.removeChild(el.firstChild); }
 
+        function mpProviderById(id) { return (mpState.snap.providers || []).find(p => p.id === id); }
+        function mpModelById(id) { return (mpState.snap.models || []).find(m => m.id === id); }
+        function mpProviderOfModel(id) { const m = mpModelById(id); return m ? mpProviderById(m.provider_id) : null; }
+        function mpModelLabel(id) { const m = mpModelById(id); return m ? m.model_name : ('#' + id); }
+        function mpProviderName(modelId) { const p = mpProviderOfModel(modelId); return p ? p.name : ''; }
+
+        function mpAssignments(wfKey, scope, role) {
+            return (mpState.snap.assignments || [])
+                .filter(a => a.workflow_key === wfKey && a.scope === scope && a.role === role && a.enabled);
+        }
+        function mpWorkflow(key) { return (mpState.snap.workflows || []).find(w => w.key === key); }
+
+        async function mpApply(body, okMsg) {
+            const r = await apiCall('/routing', { method: 'POST', body });
+            if (r) { if (okMsg) PL.toast(okMsg, 'success'); await loadRouting(); }
+            return r;
+        }
         async function reloadRouting() {
             const r = await apiCall('/routing', { method: 'POST', body: { action: 'reload' } });
             if (r) PL.toast('Router reloaded from database.', 'success');
         }
 
-        async function routingAction(body, okMsg) {
-            const r = await apiCall('/routing', { method: 'POST', body });
-            if (r) { PL.toast(okMsg, 'success'); loadRouting(); }
-            return r;
+        async function loadRouting() {
+            const data = await apiCall('/routing');
+            if (!data) return;
+            mpState.snap = data;
+            mpRenderActiveView();
         }
 
-        function routingVal(id) { return (document.getElementById(id)?.value || '').trim(); }
-        function routingNum(id) { const v = routingVal(id); return v === '' ? undefined : Number(v); }
+        function mpView(v) {
+            mpState.view = v;
+            if (v !== 'board') mpState.wf = null;
+            mpRenderActiveView();
+        }
+        function mpRenderActiveView() {
+            const panes = { overview: 'mp-overview', board: 'mp-board', library: 'mp-library' };
+            for (const key in panes) {
+                document.getElementById(panes[key]).classList.toggle('mp-hidden', mpState.view !== key);
+            }
+            document.getElementById('mp-tab-overview').classList.toggle('active', mpState.view === 'overview');
+            document.getElementById('mp-tab-library').classList.toggle('active', mpState.view === 'library');
+            if (!mpState.snap) return;
+            if (mpState.view === 'overview') mpRenderOverview();
+            else if (mpState.view === 'board') mpRenderBoard();
+            else mpRenderLibrary();
+        }
 
-        async function addRoutingProvider() {
-            const body = { action: 'create_provider', name: routingVal('rp-name'), kind: routingVal('rp-kind') };
-            const endpoint = routingVal('rp-endpoint'); if (endpoint) body.endpoint = endpoint;
-            const key = routingVal('rp-key'); const keyref = routingVal('rp-keyref');
-            if (key) body.api_key = key; else if (keyref) body.api_key_ref = keyref;
-            if (!body.name) { PL.toast('Provider name is required.', 'error'); return; }
-            await routingAction(body, 'Provider added.');
+        // ---- mini allocation bar (overview cards) ----
+        function mpAllocBar(primaries, big) {
+            const total = primaries.reduce((s, a) => s + Math.max(0, a.weight || 0), 0) || 1;
+            const bar = mpEl('div', { class: big ? 'mp-alloc mp-alloc--lg' : 'mp-alloc mp-alloc--mini' });
+            primaries.forEach((a, i) => {
+                const pct = Math.round((Math.max(0, a.weight || 0) / total) * 100);
+                const seg = mpEl('div', { class: 'mp-seg mp-seg-' + (i % 6) });
+                seg.style.flexBasis = pct + '%';
+                seg.style.flexGrow = '0';
+                if (big && pct >= 14) {
+                    seg.appendChild(mpEl('span', { text: mpModelLabel(a.provider_model_id) + ' · ' + pct + '%' }));
+                } else if (big && pct >= 6) {
+                    seg.appendChild(mpEl('span', { text: pct + '%' }));
+                }
+                bar.appendChild(seg);
+            });
+            return bar;
         }
-        async function addRoutingModel() {
-            const caps = routingVal('rm-caps').split(',').map(s => s.trim()).filter(Boolean);
-            const body = {
-                action: 'create_model', provider_id: routingNum('rm-provider'),
-                model_name: routingVal('rm-model'), capabilities: caps, embedding_dim: routingNum('rm-dim'),
-            };
-            const baseUrl = routingVal('rm-baseurl'); if (baseUrl) body.base_url = baseUrl;
-            if (!body.provider_id || !body.model_name) { PL.toast('provider_id and model_name are required.', 'error'); return; }
-            await routingAction(body, 'Model added.');
+
+        // ---- OVERVIEW: providers rail + workflow grid ----
+        function mpRenderOverview() {
+            const root = document.getElementById('mp-overview');
+            mpClear(root);
+
+            root.appendChild(mpEl('div', { class: 'mp-eyebrow', text: 'Providers' }));
+            const rail = mpEl('div', { class: 'mp-rail' });
+            (mpState.snap.providers || []).forEach(p => {
+                const chip = mpEl('div', { class: 'mp-chip', 'data-off': p.enabled ? '0' : '1',
+                    _on: { click: () => mpView('library') } }, [
+                    mpEl('span', { class: 'mp-dot mp-dot-' + (['chat', 'vision', 'embedding', 'image', 'music'].indexOf(p.kind) % 6 + 6) % 6 }),
+                    mpEl('span', { text: p.name }),
+                    mpEl('span', { class: 'mp-row-sub', text: p.kind }),
+                ]);
+                rail.appendChild(chip);
+            });
+            if (!(mpState.snap.providers || []).length) rail.appendChild(mpEl('span', { class: 'mp-empty', text: 'No providers yet.' }));
+            root.appendChild(rail);
+
+            root.appendChild(mpEl('div', { class: 'mp-eyebrow', text: 'Workflows' }));
+            root.appendChild(mpEl('div', { class: 'mp-hint', text: 'Pick a workflow to shape how its requests route across models.' }));
+            const grid = mpEl('div', { class: 'mp-grid' });
+            (mpState.snap.workflows || []).forEach(w => {
+                const primaries = mpAssignments(w.key, 'global', 'primary');
+                const fb = mpAssignments(w.key, 'global', 'fallback').length;
+                const trg = (mpState.snap.triggers || []).filter(t => t.workflow_key === w.key && t.enabled).length;
+                const card = mpEl('div', { class: 'mp-wf', _on: { click: () => mpOpenBoard(w.key) } }, [
+                    mpEl('div', { class: 'mp-wf-head' }, [
+                        mpEl('span', { class: 'mp-wf-title', text: mpTitle(w.key) }),
+                        mpEl('span', { class: 'mp-tag mp-tag--accent', text: w.kind }),
+                        w.full_routing ? null : mpEl('span', { class: 'mp-tag mp-tag--muted', text: 'config-only' }),
+                    ]),
+                    primaries.length ? mpAllocBar(primaries, false)
+                        : mpEl('div', { class: 'mp-empty', text: 'No models assigned' }),
+                    mpEl('div', { class: 'mp-wf-meta' }, [
+                        mpEl('span', {}, [mpIcon('layout-grid'), ' ' + primaries.length + ' primary']),
+                        mpEl('span', {}, [mpIcon('arrow-down'), ' ' + fb + ' fallback']),
+                        mpEl('span', {}, [mpIcon('bolt'), ' ' + trg + ' trigger']),
+                    ]),
+                ]);
+                grid.appendChild(card);
+            });
+            root.appendChild(grid);
         }
-        async function addRoutingAssignment() {
-            const body = {
-                action: 'create_assignment', workflow_key: routingVal('ra-workflow'),
-                scope: routingVal('ra-scope'), role: routingVal('ra-role'),
-                provider_model_id: routingNum('ra-model'), weight: routingNum('ra-weight'),
-                fallback_order: routingNum('ra-order'),
-            };
-            if (!body.workflow_key || !body.provider_model_id) { PL.toast('workflow_key and provider_model_id are required.', 'error'); return; }
-            await routingAction(body, 'Assignment added.');
+
+        function mpTitle(key) {
+            return key.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
         }
-        async function addRoutingTrigger() {
-            const body = {
-                action: 'create_trigger', workflow_key: routingVal('rt-workflow'),
-                trigger_type: routingVal('rt-type'), engage_assignment_id: routingNum('rt-engage'),
-                high_watermark: routingNum('rt-high'), low_watermark: routingNum('rt-low'),
-            };
-            const queue = routingVal('rt-queue'); if (queue) body.queue_name = queue;
-            if (!body.workflow_key || !body.engage_assignment_id) { PL.toast('workflow_key and engage_assignment_id are required.', 'error'); return; }
-            await routingAction(body, 'Trigger added.');
+
+        // ---- BOARD ----
+        function mpOpenBoard(key) { mpState.wf = key; mpState.scope = 'global'; mpView('board'); }
+
+        function mpRenderBoard() {
+            const root = document.getElementById('mp-board');
+            mpClear(root);
+            const w = mpWorkflow(mpState.wf);
+            if (!w) { root.appendChild(mpEl('div', { class: 'mp-empty', text: 'Workflow not found.' })); return; }
+
+            const head = mpEl('div', { class: 'mp-board-head' }, [
+                mpEl('span', { class: 'mp-back', _on: { click: () => mpView('overview') } }, [mpIcon('arrow-left'), ' Overview']),
+                mpEl('span', { class: 'mp-wf-title', text: mpTitle(w.key) }),
+                mpEl('span', { class: 'mp-tag mp-tag--accent', text: w.kind }),
+                w.full_routing ? mpEl('span', { class: 'mp-tag', text: 'full routing' }) : mpEl('span', { class: 'mp-tag mp-tag--muted', text: 'config-only' }),
+            ]);
+            const scope = mpEl('div', { class: 'mp-scope' }, ['global', 'vip'].map(s =>
+                mpEl('span', { class: 'mp-scope-opt' + (mpState.scope === s ? ' active' : ''), text: s === 'vip' ? 'VIP' : 'Global',
+                    _on: { click: () => { mpState.scope = s; mpRenderBoard(); } } })));
+            head.appendChild(scope);
+            root.appendChild(head);
+
+            // PRIMARY ALLOCATION
+            const primaries = mpAssignments(w.key, mpState.scope, 'primary');
+            const sec1 = mpEl('div', { class: 'mp-section' });
+            sec1.appendChild(mpEl('div', { class: 'mp-eyebrow', text: 'Primary allocation' }));
+            sec1.appendChild(mpEl('div', { class: 'mp-hint', text: w.full_routing ? 'Each request is drawn by weight. Drag a divider to rebalance, or use the steppers.' : 'Config-only workflow: the first model is used; weights are ignored.' }));
+            if (w.full_routing && primaries.length) {
+                sec1.appendChild(mpEl('div', { class: 'mp-flow-label' }, [mpIcon('arrow-down'), ' Incoming request fans out']));
+                sec1.appendChild(mpAllocBarEditable(primaries));
+            }
+            const legend = mpEl('div', { class: 'mp-legend' });
+            primaries.forEach((a, i) => legend.appendChild(mpPrimaryRow(a, i, primaries)));
+            if (!primaries.length) legend.appendChild(mpEl('div', { class: 'mp-empty', text: 'No primary models. Add one below.' }));
+            sec1.appendChild(legend);
+            sec1.appendChild(mpAddPicker(w, 'primary'));
+            root.appendChild(sec1);
+
+            // FALLBACK CHAIN
+            const fbs = mpAssignments(w.key, mpState.scope, 'fallback').sort((x, y) => (x.fallback_order || 0) - (y.fallback_order || 0));
+            const sec2 = mpEl('div', { class: 'mp-section' });
+            sec2.appendChild(mpEl('div', { class: 'mp-eyebrow', text: 'Fallback chain' }));
+            sec2.appendChild(mpEl('div', { class: 'mp-hint', text: 'Tried in order when every primary is exhausted.' }));
+            const chain = mpEl('div', { class: 'mp-fallback' });
+            fbs.forEach((a, i) => chain.appendChild(mpFallbackRow(a, i, fbs)));
+            if (!fbs.length) chain.appendChild(mpEl('div', { class: 'mp-empty', text: 'No fallback models.' }));
+            sec2.appendChild(chain);
+            sec2.appendChild(mpAddPicker(w, 'fallback'));
+            root.appendChild(sec2);
+
+            // TRIGGERS
+            if (w.full_routing) {
+                const trgs = (mpState.snap.triggers || []).filter(t => t.workflow_key === w.key);
+                const sec3 = mpEl('div', { class: 'mp-section' });
+                sec3.appendChild(mpEl('div', { class: 'mp-eyebrow', text: 'Triggers' }));
+                sec3.appendChild(mpEl('div', { class: 'mp-hint', text: 'Open an overflow branch while a condition holds.' }));
+                trgs.forEach(t => sec3.appendChild(mpTriggerCard(t, w)));
+                if (!trgs.length) sec3.appendChild(mpEl('div', { class: 'mp-empty', text: 'No triggers.' }));
+                sec3.appendChild(mpTriggerEditor(w, null));
+                root.appendChild(sec3);
+            }
+
+            // WORKFLOW SETTINGS
+            const sec4 = mpEl('div', { class: 'mp-section' });
+            sec4.appendChild(mpEl('div', { class: 'mp-eyebrow', text: 'Retry budget' }));
+            const hops = mpEl('pl-input', { type: 'number', value: w.retry_max_hops, class: 'w-narrow' });
+            const wall = mpEl('pl-input', { type: 'number', value: w.retry_wall_ms, class: 'w-narrow' });
+            sec4.appendChild(mpEl('div', { class: 'mp-add' }, [
+                mpEl('span', { class: 'mp-hint', text: 'Max hops' }), hops,
+                mpEl('span', { class: 'mp-hint', text: 'Wall-clock ms' }), wall,
+                mpEl('pl-button', { _on: { click: () => mpApply({ action: 'update_workflow', key: w.key, full_routing: w.full_routing, retry_max_hops: Number(hops.value), retry_wall_ms: Number(wall.value), enabled: w.enabled }, 'Retry budget saved.') } }, 'Save'),
+            ]));
+            root.appendChild(sec4);
         }
-        async function deleteRoutingProvider(id) {
-            if (await PL.confirm('Delete provider ' + id + ' and its models?')) routingAction({ action: 'delete_provider', id }, 'Provider deleted.');
+
+        function mpStepper(value, onDelta) {
+            return mpEl('div', { class: 'mp-stepper' }, [
+                mpEl('span', { class: 'mp-stepper-btn', _on: { click: () => onDelta(-5) } }, [mpIcon('minus')]),
+                mpEl('span', { class: 'mp-stepper-val', text: String(value) }),
+                mpEl('span', { class: 'mp-stepper-btn', _on: { click: () => onDelta(5) } }, [mpIcon('plus')]),
+            ]);
         }
-        async function deleteRoutingModel(id) {
-            if (await PL.confirm('Delete model ' + id + '?')) routingAction({ action: 'delete_model', id }, 'Model deleted.');
+
+        function mpPrimaryRow(a, i, primaries) {
+            const weight = a.weight == null ? 0 : a.weight;
+            return mpEl('div', { class: 'mp-row' }, [
+                mpEl('span', { class: 'mp-dot mp-dot-' + (i % 6) }),
+                mpEl('span', { class: 'mp-row-name', text: mpModelLabel(a.provider_model_id) }),
+                mpEl('span', { class: 'mp-row-sub', text: mpProviderName(a.provider_model_id) }),
+                mpEl('div', { class: 'mp-row-actions' }, [
+                    mpStepper(weight, (d) => {
+                        const nw = Math.max(0, weight + d);
+                        mpApply(mpAssignBody('update_assignment', a, { weight: nw }), null);
+                    }),
+                    mpEl('span', { class: 'mp-icon-btn mp-icon-btn--danger', title: 'Remove', _on: { click: () => mpRemoveAssignment(a) } }, [mpIcon('x')]),
+                ]),
+            ]);
         }
-        async function deleteRoutingAssignment(id) {
-            if (await PL.confirm('Delete assignment ' + id + '?')) routingAction({ action: 'delete_assignment', id }, 'Assignment deleted.');
+
+        function mpFallbackRow(a, i, fbs) {
+            const body = mpEl('div', { class: 'mp-fb-body' }, [
+                mpEl('div', { class: 'mp-row' }, [
+                    mpEl('span', { class: 'mp-row-name', text: mpModelLabel(a.provider_model_id) }),
+                    mpEl('span', { class: 'mp-row-sub', text: mpProviderName(a.provider_model_id) }),
+                    mpEl('div', { class: 'mp-row-actions' }, [
+                        mpEl('span', { class: 'mp-icon-btn', title: 'Move up', _on: { click: () => mpReorderFallback(fbs, i, -1) } }, [mpIcon('chevron-up')]),
+                        mpEl('span', { class: 'mp-icon-btn', title: 'Move down', _on: { click: () => mpReorderFallback(fbs, i, 1) } }, [mpIcon('chevron-down')]),
+                        mpEl('span', { class: 'mp-icon-btn mp-icon-btn--danger', title: 'Remove', _on: { click: () => mpRemoveAssignment(a) } }, [mpIcon('x')]),
+                    ]),
+                ]),
+            ]);
+            const rail = mpEl('div', { class: 'mp-fb-rail' }, [
+                mpEl('span', { class: 'mp-fb-index', text: String(i + 1) }),
+                i < fbs.length - 1 ? mpEl('span', { class: 'mp-fb-line' }) : null,
+            ]);
+            return mpEl('div', { class: 'mp-fb' }, [rail, body]);
         }
-        async function deleteRoutingTrigger(id) {
-            if (await PL.confirm('Delete trigger ' + id + '?')) routingAction({ action: 'delete_trigger', id }, 'Trigger deleted.');
+
+        async function mpReorderFallback(fbs, i, dir) {
+            const j = i + dir;
+            if (j < 0 || j >= fbs.length) return;
+            const a = fbs[i], b = fbs[j];
+            await apiCall('/routing', { method: 'POST', body: mpAssignBody('update_assignment', a, { fallback_order: b.fallback_order || 0 }) });
+            await mpApply(mpAssignBody('update_assignment', b, { fallback_order: a.fallback_order || 0 }), null);
         }
+
+        // Build an update/create body from an assignment plus overrides.
+        function mpAssignBody(action, a, over) {
+            const o = over || {};
+            return Object.assign({
+                action, id: a.id, workflow_key: a.workflow_key, scope: a.scope, role: a.role,
+                provider_model_id: a.provider_model_id, weight: a.weight, fallback_order: a.fallback_order,
+                canary_percent: a.canary_percent, enabled: a.enabled, inference_overrides: a.inference_overrides,
+                cb_failure_threshold: a.cb_failure_threshold, cb_cooldown_ms: a.cb_cooldown_ms,
+            }, o);
+        }
+        async function mpRemoveAssignment(a) {
+            if (await PL.confirm('Remove ' + mpModelLabel(a.provider_model_id) + ' from this workflow?')) {
+                mpApply({ action: 'delete_assignment', id: a.id }, 'Removed.');
+            }
+        }
+
+        // Editable allocation bar with drag-to-rebalance handles.
+        function mpAllocBarEditable(primaries) {
+            const total = primaries.reduce((s, a) => s + Math.max(0, a.weight || 0), 0) || 1;
+            const bar = mpEl('div', { class: 'mp-alloc mp-alloc--lg' });
+            const segs = [];
+            primaries.forEach((a, i) => {
+                const pct = (Math.max(0, a.weight || 0) / total) * 100;
+                const seg = mpEl('div', { class: 'mp-seg mp-seg-' + (i % 6) });
+                seg.style.flexBasis = pct + '%';
+                seg.style.flexGrow = '0';
+                if (pct >= 12) seg.appendChild(mpEl('span', { text: Math.round(pct) + '%' }));
+                segs.push(seg);
+                bar.appendChild(seg);
+                if (i < primaries.length - 1) bar.appendChild(mpHandle(bar, segs, primaries, i, total));
+            });
+            return bar;
+        }
+        function mpHandle(bar, segs, primaries, i, total) {
+            const handle = mpEl('div', { class: 'mp-handle' });
+            handle.addEventListener('pointerdown', (ev) => {
+                ev.preventDefault();
+                handle.classList.add('dragging');
+                handle.setPointerCapture(ev.pointerId);
+                const rect = bar.getBoundingClientRect();
+                const a = primaries[i], b = primaries[i + 1];
+                const w0 = Math.max(0, a.weight || 0), w1 = Math.max(0, b.weight || 0);
+                const pair = w0 + w1;
+                const startX = ev.clientX;
+                let na = w0, nb = w1;
+                const move = (e) => {
+                    const dWeight = ((e.clientX - startX) / rect.width) * total;
+                    na = Math.min(pair - 1, Math.max(1, Math.round(w0 + dWeight)));
+                    nb = pair - na;
+                    segs[i].style.flexBasis = (na / total * 100) + '%';
+                    segs[i + 1].style.flexBasis = (nb / total * 100) + '%';
+                };
+                const up = async (e) => {
+                    handle.releasePointerCapture(ev.pointerId);
+                    handle.classList.remove('dragging');
+                    handle.removeEventListener('pointermove', move);
+                    handle.removeEventListener('pointerup', up);
+                    if (na !== w0) {
+                        await apiCall('/routing', { method: 'POST', body: mpAssignBody('update_assignment', a, { weight: na }) });
+                        await mpApply(mpAssignBody('update_assignment', b, { weight: nb }), null);
+                    }
+                };
+                handle.addEventListener('pointermove', move);
+                handle.addEventListener('pointerup', up);
+            });
+            return handle;
+        }
+
+        // Inline picker to add a primary/fallback assignment.
+        function mpAddPicker(w, role) {
+            const compatible = (mpState.snap.models || []).filter(m => m.enabled);
+            const sel = mpEl('pl-select', { class: 'w-narrow' }, compatible.map(m =>
+                mpEl('option', { value: m.id }, mpModelLabel(m.id) + ' (' + mpProviderName(m.id) + ')')));
+            return mpEl('div', { class: 'mp-add' }, [
+                sel,
+                mpEl('pl-button', { _on: { click: () => {
+                    const id = Number(sel.value);
+                    if (!id) { PL.toast('Pick a model first.', 'error'); return; }
+                    const body = { action: 'create_assignment', workflow_key: w.key, scope: mpState.scope, role,
+                        provider_model_id: id };
+                    if (role === 'primary') body.weight = 50;
+                    else body.fallback_order = mpAssignments(w.key, mpState.scope, 'fallback').length;
+                    mpApply(body, role === 'primary' ? 'Primary added.' : 'Fallback added.');
+                } } }, [mpIcon('plus'), ' Add ' + role]),
+            ]);
+        }
+
+        // ---- Triggers ----
+        function mpTriggerCard(t, w) {
+            const target = mpEl('div', { class: 'mp-trigger-target' });
+            const eng = (mpState.snap.assignments || []).find(a => a.id === t.engage_assignment_id);
+            if (eng) {
+                target.appendChild(mpEl('span', { class: 'mp-dot mp-dot-5' }));
+                target.appendChild(mpEl('span', { text: mpModelLabel(eng.provider_model_id) }));
+                target.appendChild(mpEl('span', { class: 'mp-row-sub', text: mpProviderName(eng.provider_model_id) }));
+            } else { target.appendChild(mpEl('span', { class: 'mp-row-sub', text: 'assignment #' + t.engage_assignment_id })); }
+            let cond;
+            if (t.trigger_type === 'queue_depth') {
+                cond = mpEl('span', { class: 'mp-trigger-cond' }, [
+                    'When queue ', mpEl('span', { class: 'mp-trigger-mono', text: t.queue_name || '?' }),
+                    ' reaches ', mpEl('span', { class: 'mp-trigger-num', text: String(t.high_watermark) }),
+                    ', hold until ', mpEl('span', { class: 'mp-trigger-mono', text: String(t.low_watermark) }),
+                ]);
+            } else {
+                cond = mpEl('span', { class: 'mp-trigger-cond', text: t.trigger_type + ' · ' + JSON.stringify(t.params || {}) });
+            }
+            return mpEl('div', { class: 'mp-trigger' }, [
+                mpIcon('bolt'), cond, mpIcon('arrow-right'), target,
+                mpEl('div', { class: 'mp-row-actions' }, [
+                    mpEl('span', { class: 'mp-icon-btn mp-icon-btn--danger', title: 'Remove', _on: { click: async () => {
+                        if (await PL.confirm('Delete this trigger?')) mpApply({ action: 'delete_trigger', id: t.id }, 'Trigger deleted.');
+                    } } }, [mpIcon('x')]),
+                ]),
+            ]);
+        }
+
+        function mpTriggerEditor(w) {
+            const overflow = mpAssignments(w.key, mpState.scope, 'overflow');
+            const allModels = (mpState.snap.models || []).filter(m => m.enabled);
+            const typeSel = mpEl('pl-select', { class: 'w-narrow' }, ['queue_depth', 'error_rate', 'time_of_day'].map(x => mpEl('option', { value: x }, x)));
+            const qname = mpEl('pl-input', { value: 'dialog-aifarm', placeholder: 'queue_name' });
+            const high = mpEl('pl-input', { type: 'number', value: 30, placeholder: 'high', class: 'w-narrow' });
+            const low = mpEl('pl-input', { type: 'number', value: 20, placeholder: 'low', class: 'w-narrow' });
+            const modelSel = mpEl('pl-select', { class: 'w-narrow' }, allModels.map(m => mpEl('option', { value: m.id }, mpModelLabel(m.id) + ' (' + mpProviderName(m.id) + ')')));
+            return mpEl('div', { class: 'mp-add' }, [
+                typeSel, qname, high, low,
+                mpEl('span', { class: 'mp-hint', text: '→ engage' }), modelSel,
+                mpEl('pl-button', { variant: 'primary', _on: { click: async () => {
+                    const mid = Number(modelSel.value);
+                    if (!mid) { PL.toast('Pick an overflow model.', 'error'); return; }
+                    // Ensure an overflow assignment exists for this model, then point the trigger at it.
+                    let target = overflow.find(o => o.provider_model_id === mid);
+                    if (!target) {
+                        const created = await apiCall('/routing', { method: 'POST', body: { action: 'create_assignment', workflow_key: w.key, scope: mpState.scope, role: 'overflow', provider_model_id: mid, weight: 100 } });
+                        if (!created || !created.id) return;
+                        target = { id: created.id };
+                    }
+                    const body = { action: 'create_trigger', workflow_key: w.key, trigger_type: typeSel.value, engage_assignment_id: target.id };
+                    if (typeSel.value === 'queue_depth') { body.queue_name = qname.value || 'dialog-aifarm'; body.high_watermark = Number(high.value); body.low_watermark = Number(low.value); }
+                    mpApply(body, 'Trigger added.');
+                } } }, [mpIcon('bolt'), ' Add trigger']),
+            ]);
+        }
+
+        // ---- LIBRARY: providers + models ----
+        function mpRenderLibrary() {
+            const root = document.getElementById('mp-library');
+            mpClear(root);
+
+            root.appendChild(mpEl('div', { class: 'mp-eyebrow', text: 'Providers' }));
+            root.appendChild(mpEl('div', { class: 'mp-hint', text: 'Credentialed inference endpoints. Keys are stored by reference or encrypted; never shown.' }));
+            const plist = mpEl('div', { class: 'mp-legend' });
+            (mpState.snap.providers || []).forEach(p => plist.appendChild(mpEl('div', { class: 'mp-row' }, [
+                mpEl('span', { class: 'mp-row-name', text: p.name }),
+                mpEl('span', { class: 'mp-tag mp-tag--accent', text: p.kind }),
+                mpEl('span', { class: 'mp-row-sub', text: p.endpoint || (p.discovery_service_name || '') }),
+                mpEl('span', { class: 'mp-tag', text: 'key: ' + p.key_state }),
+                mpEl('div', { class: 'mp-row-actions' }, [
+                    mpEl('span', { class: 'mp-tag', text: p.enabled ? 'enabled' : 'disabled' }),
+                    mpEl('span', { class: 'mp-icon-btn mp-icon-btn--danger', title: 'Delete', _on: { click: async () => {
+                        if (await PL.confirm('Delete provider ' + p.name + ' and its models?')) mpApply({ action: 'delete_provider', id: p.id }, 'Provider deleted.');
+                    } } }, [mpIcon('trash')]),
+                ]),
+            ])));
+            if (!(mpState.snap.providers || []).length) plist.appendChild(mpEl('div', { class: 'mp-empty', text: 'No providers.' }));
+            root.appendChild(plist);
+            root.appendChild(mpProviderForm());
+
+            root.appendChild(mpEl('div', { class: 'mp-eyebrow', text: 'Models' }));
+            const mlist = mpEl('div', { class: 'mp-legend' });
+            (mpState.snap.models || []).forEach(m => mlist.appendChild(mpEl('div', { class: 'mp-row' }, [
+                mpEl('span', { class: 'mp-row-name', text: m.model_name }),
+                mpEl('span', { class: 'mp-row-sub', text: (mpProviderById(m.provider_id) || {}).name || ('#' + m.provider_id) }),
+                mpEl('span', { class: 'mp-tag', text: (m.capabilities || []).join(', ') || '—' }),
+                m.embedding_dim != null ? mpEl('span', { class: 'mp-tag', text: 'dim ' + m.embedding_dim }) : null,
+                mpEl('div', { class: 'mp-row-actions' }, [
+                    mpEl('span', { class: 'mp-icon-btn mp-icon-btn--danger', title: 'Delete', _on: { click: async () => {
+                        if (await PL.confirm('Delete model ' + m.model_name + '?')) mpApply({ action: 'delete_model', id: m.id }, 'Model deleted.');
+                    } } }, [mpIcon('trash')]),
+                ]),
+            ])));
+            if (!(mpState.snap.models || []).length) mlist.appendChild(mpEl('div', { class: 'mp-empty', text: 'No models.' }));
+            root.appendChild(mlist);
+            root.appendChild(mpModelForm());
+        }
+
+        function mpProviderForm() {
+            const name = mpEl('pl-input', { placeholder: 'name' });
+            const kind = mpEl('pl-select', { class: 'w-narrow' }, ['chat', 'vision', 'embedding', 'image', 'music'].map(x => mpEl('option', { value: x }, x)));
+            const endpoint = mpEl('pl-input', { placeholder: 'endpoint (optional)' });
+            const keyref = mpEl('pl-input', { placeholder: 'api_key_ref env var' });
+            const key = mpEl('pl-input', { type: 'password', placeholder: 'api key (encrypted)' });
+            return mpEl('div', { class: 'mp-add' }, [name, kind, endpoint, keyref, key,
+                mpEl('pl-button', { variant: 'primary', _on: { click: () => {
+                    if (!name.value.trim()) { PL.toast('Provider name is required.', 'error'); return; }
+                    const body = { action: 'create_provider', name: name.value.trim(), kind: kind.value };
+                    if (endpoint.value.trim()) body.endpoint = endpoint.value.trim();
+                    if (key.value) body.api_key = key.value; else if (keyref.value.trim()) body.api_key_ref = keyref.value.trim();
+                    mpApply(body, 'Provider added.');
+                } } }, [mpIcon('plus'), ' Add provider'])]);
+        }
+
+        function mpModelForm() {
+            const prov = mpEl('pl-select', { class: 'w-narrow' }, (mpState.snap.providers || []).map(p => mpEl('option', { value: p.id }, p.name)));
+            const model = mpEl('pl-input', { placeholder: 'model_name' });
+            const baseUrl = mpEl('pl-input', { placeholder: 'base_url (optional)' });
+            const caps = mpEl('pl-input', { placeholder: 'capabilities csv' });
+            const dim = mpEl('pl-input', { type: 'number', placeholder: 'embedding_dim', class: 'w-narrow' });
+            return mpEl('div', { class: 'mp-add' }, [prov, model, baseUrl, caps, dim,
+                mpEl('pl-button', { variant: 'primary', _on: { click: () => {
+                    if (!prov.value || !model.value.trim()) { PL.toast('Provider and model_name are required.', 'error'); return; }
+                    const body = { action: 'create_model', provider_id: Number(prov.value), model_name: model.value.trim(),
+                        capabilities: caps.value.split(',').map(s => s.trim()).filter(Boolean) };
+                    if (baseUrl.value.trim()) body.base_url = baseUrl.value.trim();
+                    if (dim.value) body.embedding_dim = Number(dim.value);
+                    mpApply(body, 'Model added.');
+                } } }, [mpIcon('plus'), ' Add model'])]);
+        }
+
 
         // --- Settings ---
         async function saveLogLevel() {

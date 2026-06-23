@@ -164,12 +164,14 @@ const SQL_UPDATE_WORKFLOW: &str = "UPDATE workflows SET full_routing = $2, retry
 
 const SQL_LIST_ASSIGNMENTS: &str = "SELECT id, workflow_key, scope, role, provider_model_id, weight, fallback_order, canary_percent, enabled, inference_overrides::text AS inference_overrides, cb_failure_threshold, cb_cooldown_ms FROM workflow_assignments ORDER BY id ASC";
 const SQL_INSERT_ASSIGNMENT: &str = "INSERT INTO workflow_assignments (workflow_key, scope, role, provider_model_id, weight, fallback_order, canary_percent, enabled, inference_overrides, cb_failure_threshold, cb_cooldown_ms) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11) RETURNING id";
+const SQL_UPDATE_ASSIGNMENT: &str = "UPDATE workflow_assignments SET workflow_key = $2, scope = $3, role = $4, provider_model_id = $5, weight = $6, fallback_order = $7, canary_percent = $8, enabled = $9, inference_overrides = $10::jsonb, cb_failure_threshold = $11, cb_cooldown_ms = $12 WHERE id = $1";
 const SQL_DELETE_ASSIGNMENT: &str = "DELETE FROM workflow_assignments WHERE id = $1";
 const SQL_DELETE_ASSIGNMENTS_FOR_SCOPE: &str =
     "DELETE FROM workflow_assignments WHERE workflow_key = $1 AND scope = $2";
 
 const SQL_LIST_TRIGGERS: &str = "SELECT id, workflow_key, trigger_type, engage_assignment_id, enabled, queue_name, high_watermark, low_watermark, params::text AS params FROM workflow_triggers ORDER BY id ASC";
 const SQL_INSERT_TRIGGER: &str = "INSERT INTO workflow_triggers (workflow_key, trigger_type, engage_assignment_id, enabled, queue_name, high_watermark, low_watermark, params) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb) RETURNING id";
+const SQL_UPDATE_TRIGGER: &str = "UPDATE workflow_triggers SET workflow_key = $2, trigger_type = $3, engage_assignment_id = $4, enabled = $5, queue_name = $6, high_watermark = $7, low_watermark = $8, params = $9::jsonb WHERE id = $1";
 const SQL_DELETE_TRIGGER: &str = "DELETE FROM workflow_triggers WHERE id = $1";
 
 fn parse_json(text: Option<String>) -> Result<Value, StorageError> {
@@ -472,6 +474,29 @@ pub async fn insert_assignment(
     Ok(row.try_get::<i64, _>("id")?)
 }
 
+pub async fn update_assignment(
+    pool: &PgPool,
+    id: i64,
+    input: &AssignmentInput,
+) -> Result<(), StorageError> {
+    sqlx::query(SQL_UPDATE_ASSIGNMENT)
+        .bind(id)
+        .bind(&input.workflow_key)
+        .bind(&input.scope)
+        .bind(&input.role)
+        .bind(input.provider_model_id)
+        .bind(input.weight)
+        .bind(input.fallback_order)
+        .bind(input.canary_percent)
+        .bind(input.enabled)
+        .bind(json_text(&input.inference_overrides))
+        .bind(input.cb_failure_threshold)
+        .bind(input.cb_cooldown_ms)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 pub async fn delete_assignment(pool: &PgPool, id: i64) -> Result<(), StorageError> {
     sqlx::query(SQL_DELETE_ASSIGNMENT)
         .bind(id)
@@ -515,6 +540,26 @@ pub async fn insert_trigger(pool: &PgPool, input: &TriggerInput) -> Result<i64, 
         .fetch_one(pool)
         .await?;
     Ok(row.try_get::<i64, _>("id")?)
+}
+
+pub async fn update_trigger(
+    pool: &PgPool,
+    id: i64,
+    input: &TriggerInput,
+) -> Result<(), StorageError> {
+    sqlx::query(SQL_UPDATE_TRIGGER)
+        .bind(id)
+        .bind(&input.workflow_key)
+        .bind(&input.trigger_type)
+        .bind(input.engage_assignment_id)
+        .bind(input.enabled)
+        .bind(input.queue_name.as_deref())
+        .bind(input.high_watermark)
+        .bind(input.low_watermark)
+        .bind(json_text(&input.params))
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 pub async fn delete_trigger(pool: &PgPool, id: i64) -> Result<(), StorageError> {

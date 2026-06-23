@@ -7672,6 +7672,14 @@ async fn admin_routing_apply_action(
                 .map_err(storage_err)?;
             json!({ "ok": true, "id": id })
         }
+        "update_assignment" => {
+            let id = id_of(body).ok_or(bad("id is required".to_owned()))?;
+            let input = assignment_input_from_json(body).map_err(bad)?;
+            routing::update_assignment(pool, id, &input)
+                .await
+                .map_err(storage_err)?;
+            json!({ "ok": true })
+        }
         "delete_assignment" => {
             let id = id_of(body).ok_or(bad("id is required".to_owned()))?;
             routing::delete_assignment(pool, id)
@@ -7694,6 +7702,14 @@ async fn admin_routing_apply_action(
                 .await
                 .map_err(storage_err)?;
             json!({ "ok": true, "id": id })
+        }
+        "update_trigger" => {
+            let id = id_of(body).ok_or(bad("id is required".to_owned()))?;
+            let input = trigger_input_from_json(body).map_err(bad)?;
+            routing::update_trigger(pool, id, &input)
+                .await
+                .map_err(storage_err)?;
+            json!({ "ok": true })
         }
         "delete_trigger" => {
             let id = id_of(body).ok_or(bad("id is required".to_owned()))?;
