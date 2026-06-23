@@ -1968,30 +1968,35 @@ impl AppConfig {
                         raw.dialog_aifarm_repeat_penalty,
                         1.1,
                     )?,
+                    // Anti-loop defaults: DRY plus moderate frequency/presence penalties
+                    // break the phrase-level repetition ("Главное, чтобы…" loops) that low
+                    // temperature alone encourages. Temperature stays low on purpose so
+                    // tool-calling remains reliable; DRY carries the anti-repetition load and
+                    // the backend's default DRY sequence breakers spare structural tokens.
                     aifarm_frequency_penalty: parse_f64(
                         "DIALOG_AIFARM_FREQUENCY_PENALTY",
                         raw.dialog_aifarm_frequency_penalty,
-                        0.0,
+                        0.3,
                     )?,
                     aifarm_presence_penalty: parse_f64(
                         "DIALOG_AIFARM_PRESENCE_PENALTY",
                         raw.dialog_aifarm_presence_penalty,
-                        0.0,
+                        0.2,
                     )?,
                     aifarm_dry_multiplier: parse_f64(
                         "DIALOG_AIFARM_DRY_MULTIPLIER",
                         raw.dialog_aifarm_dry_multiplier,
-                        0.0,
+                        0.8,
                     )?,
                     aifarm_dry_base: parse_f64(
                         "DIALOG_AIFARM_DRY_BASE",
                         raw.dialog_aifarm_dry_base,
-                        0.0,
+                        1.75,
                     )?,
                     aifarm_dry_allowed_length: parse_i32(
                         "DIALOG_AIFARM_DRY_ALLOWED_LENGTH",
                         raw.dialog_aifarm_dry_allowed_length,
-                        0,
+                        2,
                     )?,
                     request_timeout_seconds: parse_i32(
                         "DIALOG_REQUEST_TIMEOUT_SECONDS",
@@ -3274,6 +3279,12 @@ mod tests {
         assert_eq!(config.llm.dialog.aifarm_random_max_tokens, 768);
         assert_eq!(config.llm.dialog.aifarm_temperature, 0.2);
         assert_eq!(config.llm.dialog.aifarm_repeat_penalty, 1.1);
+        // Anti-loop sampling defaults (DRY + moderate frequency/presence penalties).
+        assert_eq!(config.llm.dialog.aifarm_frequency_penalty, 0.3);
+        assert_eq!(config.llm.dialog.aifarm_presence_penalty, 0.2);
+        assert_eq!(config.llm.dialog.aifarm_dry_multiplier, 0.8);
+        assert_eq!(config.llm.dialog.aifarm_dry_base, 1.75);
+        assert_eq!(config.llm.dialog.aifarm_dry_allowed_length, 2);
         assert_eq!(config.llm.dialog.request_timeout_seconds, 30);
         assert_eq!(config.llm.dialog.task_timeout_seconds, 720);
         assert_eq!(config.llm.dialog.aifarm_capacity_wait_seconds, 60);

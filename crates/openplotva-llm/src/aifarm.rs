@@ -5450,8 +5450,11 @@ fn write_runtime_persona(out: &mut String, input: &DialogInput) {
 
 fn write_daily_persona_accent(out: &mut String, persona: &openplotva_dialog::DailyPersona) {
     let name = persona.name.trim();
-    let hint = persona.boundaries.trim();
-    if name.is_empty() && hint.is_empty() {
+    // Surface the speech-style `tone` as the accent, not the behavioural `boundaries`:
+    // tone distinguishes the day with a light vocal tint, whereas boundaries reads as
+    // "what the character does" and pushes role-play into the answer itself.
+    let accent = persona.tone.trim();
+    if name.is_empty() && accent.is_empty() {
         return;
     }
 
@@ -5460,7 +5463,7 @@ fn write_daily_persona_accent(out: &mut String, persona: &openplotva_dialog::Dai
     write_inline_text_element(
         out,
         "instruction",
-        "Слабая дневная окраска. Используй максимум одну мелкую черту и часто игнорируй её; отвечай по сути обычными словами.",
+        "Слабая дневная окраска голоса. Возьми максимум одну мелкую чёрточку манеры и часто игнорируй её; отвечай по сути обычными словами, без отыгрыша роли.",
     );
     out.push('\n');
     if !name.is_empty() {
@@ -5468,9 +5471,9 @@ fn write_daily_persona_accent(out: &mut String, persona: &openplotva_dialog::Dai
         write_inline_text_element(out, "name", name);
         out.push('\n');
     }
-    if !hint.is_empty() {
+    if !accent.is_empty() {
         out.push_str("    ");
-        write_inline_text_element(out, "hint", hint);
+        write_inline_text_element(out, "accent", accent);
         out.push('\n');
     }
     out.push_str("  </daily_persona_accent>\n");
@@ -8330,10 +8333,12 @@ mod tests {
 
         assert!(context.contains("<daily_persona_accent>"));
         assert!(context.contains("<name>Daily Persona</name>"));
-        assert!(context.contains("<hint>Daily boundaries</hint>"));
+        // The accent is the speech-style `tone`, not the behavioural `boundaries`.
+        assert!(context.contains("<accent>Daily tone</accent>"));
         assert!(context.contains("Слабая дневная окраска"));
-        assert!(!context.contains("Daily tone"));
+        assert!(!context.contains("Daily boundaries"));
         assert!(!context.contains("Daily background"));
+        assert!(!context.contains("<hint>"));
         assert!(!context.contains("<persona_name>"));
         assert!(!context.contains("<persona_tone>"));
         assert!(!context.contains("<persona_background>"));
