@@ -1152,7 +1152,10 @@ pub fn acestep_config_from_app_config(config: &openplotva_config::AppConfig) -> 
         poll_interval: seconds_or_zero(config.music.acestep.poll_interval_seconds),
         task_timeout: seconds_or_zero(config.music.acestep.task_timeout_seconds),
         audio_format: config.music.acestep.audio_format.clone(),
-        model: config.music.acestep.model.clone(),
+        // Prefer the model selected in the admin for the `music` workflow (ACE-Step has no
+        // discovery service, so this is unconditional; behavior-neutral against the seed).
+        model: crate::model_routing::resolved_model_any("music")
+            .unwrap_or_else(|| config.music.acestep.model.clone()),
     }
     .with_defaults()
 }

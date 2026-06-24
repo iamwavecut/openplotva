@@ -98,11 +98,18 @@ pub fn build_agent_provider_registry(config: &AppConfig) -> AgentProviderRegistr
     let mut by_name = HashMap::new();
 
     let dialog = aifarm_dialog_config_from_app_config(config);
+    // The conversational client serves agentic_search_writer / song / image; they share
+    // this model. Prefer the admin's choice for agentic_search_writer (same service).
+    let conversational_model = crate::model_routing::resolved_model_for(
+        "agentic_search_writer",
+        config.llm.dialog.discovery_service_name.trim(),
+    )
+    .unwrap_or_else(|| dialog.model.clone());
     by_name.insert(
         CONVERSATIONAL_PROVIDER.to_owned(),
         Arc::new(AgentProviderClient {
             client: AifarmHttpClient::new(dialog.client),
-            model: dialog.model,
+            model: conversational_model,
             include_reasoning: dialog.include_reasoning,
             enable_thinking: dialog.enable_thinking,
             temperature: dialog.temperature,

@@ -187,6 +187,12 @@ pub fn aifarm_vision_captioner_config_from_app_config(
     config: &AppConfig,
 ) -> AifarmVisionCaptionerConfig {
     let timeout = positive_seconds(config.vision.request_timeout_seconds);
+    // Prefer the model selected in the admin for the `vision` workflow (same service).
+    let model = crate::model_routing::resolved_model_for(
+        "vision",
+        config.vision.discovery_service_name.trim(),
+    )
+    .unwrap_or_else(|| config.vision.model.clone());
     AifarmVisionCaptionerConfig {
         client: AifarmClientConfig {
             base_url: config.llm.discovery.base_url.clone(),
@@ -197,11 +203,11 @@ pub fn aifarm_vision_captioner_config_from_app_config(
             task_timeout: timeout,
             capacity_wait: vision_capacity_wait(timeout),
             capacity_poll_interval: Duration::from_secs(1),
-            default_model: config.vision.model.clone(),
+            default_model: model.clone(),
             workload: AIFARM_VISION_WORKLOAD.to_owned(),
             ..AifarmClientConfig::default()
         },
-        model: config.vision.model.clone(),
+        model,
         max_tokens: config.vision.max_tokens,
         temperature: config.vision.temperature,
     }

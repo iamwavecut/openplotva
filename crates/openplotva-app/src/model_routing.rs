@@ -46,6 +46,7 @@ pub struct ResolvedTarget {
     pub discovery_service_name: Option<String>,
     pub discovery_endpoint_name: Option<String>,
     pub base_url: Option<String>,
+    pub embedding_dim: Option<i32>,
 }
 
 /// Published once at startup (after seed/backfill) so the per-flow factories for the
@@ -68,6 +69,7 @@ fn resolve_target(table: &RoutingTable, key: &str) -> Option<ResolvedTarget> {
         discovery_service_name: provider.discovery_service_name.clone(),
         discovery_endpoint_name: provider.discovery_endpoint_name.clone(),
         base_url: model.base_url.clone().or_else(|| provider.endpoint.clone()),
+        embedding_dim: model.embedding_dim,
     })
 }
 
@@ -93,6 +95,39 @@ pub fn init_routing_resolver(snapshot: &RoutingSnapshot) {
 pub fn resolved_model_for(key: &str, expected_service: &str) -> Option<String> {
     let target = CONFIG_ONLY_RESOLVER.get()?.get(key)?;
     if target.discovery_service_name.as_deref() == Some(expected_service)
+        && !target.model.trim().is_empty()
+    {
+        Some(target.model.clone())
+    } else {
+        None
+    }
+}
+
+/// The DB-resolved model for a workflow whose provider has no discovery service (a
+/// direct endpoint like ACE-Step). Behavior-neutral because the seed captures the env
+/// model; lets the admin change it.
+#[must_use]
+pub fn resolved_model_any(key: &str) -> Option<String> {
+    let model = CONFIG_ONLY_RESOLVER.get()?.get(key)?.model.trim();
+    if model.is_empty() {
+        None
+    } else {
+        Some(model.to_owned())
+    }
+}
+
+/// The DB-resolved embedding model for a workflow, returned only when BOTH the
+/// discovery service and the embedding dimension match — embedding dimension is
+/// schema-bound (`vector(512)`), so a mismatched model would corrupt vector search.
+#[must_use]
+pub fn resolved_embedding_model(
+    key: &str,
+    expected_service: &str,
+    expected_dim: i32,
+) -> Option<String> {
+    let target = CONFIG_ONLY_RESOLVER.get()?.get(key)?;
+    if target.discovery_service_name.as_deref() == Some(expected_service)
+        && target.embedding_dim == Some(expected_dim)
         && !target.model.trim().is_empty()
     {
         Some(target.model.clone())

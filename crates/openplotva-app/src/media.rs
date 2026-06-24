@@ -434,9 +434,15 @@ pub fn nvidia_dialog_config_from_app_config(config: &AppConfig) -> AifarmDialogC
 pub fn aifarm_structured_json_config_from_app_config(
     config: &AppConfig,
 ) -> AifarmStructuredJsonConfig {
+    // Prefer the model selected in the admin for `media_prompt_optimizer` (same service).
+    let model = crate::model_routing::resolved_model_for(
+        "media_prompt_optimizer",
+        config.llm.dialog.discovery_service_name.trim(),
+    )
+    .unwrap_or_else(|| config.llm.dialog.model.clone());
     AifarmStructuredJsonConfig {
-        client: discovery_client_config_from_app_config(config, &config.llm.dialog.model),
-        model: config.llm.dialog.model.clone(),
+        client: discovery_client_config_from_app_config(config, &model),
+        model,
         max_tokens: 1024,
     }
     .with_defaults()
