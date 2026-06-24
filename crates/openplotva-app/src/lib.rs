@@ -8930,6 +8930,29 @@ async fn start_runtime_workers(
         runtime_api_tls_public_key_pin: None,
         router_handle: None,
     };
+    // Seed and correct the routing tables, then publish the config-only flow resolver
+    // BEFORE the per-flow workers are built, so memory / history / agentic-reasoner pick
+    // up the DB-selected model. Every step is idempotent (flag/existence guarded).
+    if let Err(error) =
+        model_routing::seed_routing_from_env(&service_clients.postgres, config).await
+    {
+        tracing::warn!(%error, "failed to seed LLM routing tables; continuing with existing rows");
+    }
+    if let Err(error) =
+        model_routing::backfill_pool_from_env(&service_clients.postgres, config).await
+    {
+        tracing::warn!(%error, "failed to backfill AI Farm pool into routing tables");
+    }
+    if let Err(error) = model_routing::backfill_gpu_models(&service_clients.postgres, config).await
+    {
+        tracing::warn!(%error, "failed to backfill GPU Qwen models into routing tables");
+    }
+    match openplotva_storage::llm_routing::load_snapshot(&service_clients.postgres).await {
+        Ok(snapshot) => model_routing::init_routing_resolver(&snapshot),
+        Err(error) => {
+            tracing::warn!(%error, "failed to load routing snapshot for config-only flow resolver");
+        }
+    }
     let update_queue =
         openplotva_updates::RedisUpdateQueue::new(service_clients.redis.client().clone());
     let update_queue_backend = config.update_queue.backend.as_str();

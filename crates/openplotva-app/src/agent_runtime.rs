@@ -151,29 +151,35 @@ pub fn qwen_reasoner_named_provider_config(
 ) -> openplotva_config::NamedProviderConfig {
     let default_reasoner =
         normalize_name(openplotva_config::DEFAULT_AGENTIC_SEARCH_REASONER_PROVIDER);
-    if let Some(spec) = config
+    let mut spec = config
         .llm
         .providers
         .iter()
         .find(|spec| normalize_name(&spec.name) == default_reasoner)
-    {
-        return spec.clone();
+        .cloned()
+        .unwrap_or_else(|| openplotva_config::NamedProviderConfig {
+            name: openplotva_config::DEFAULT_AGENTIC_SEARCH_REASONER_PROVIDER.to_owned(),
+            kind: openplotva_config::DEFAULT_LLM_PROVIDER_KIND.to_owned(),
+            discovery_service_name: DEFAULT_QWEN_SERVICE_NAME.to_owned(),
+            discovery_endpoint_name: config.llm.dialog.discovery_endpoint_name.clone(),
+            model: DEFAULT_QWEN_MODEL.to_owned(),
+            base_url: String::new(),
+            url: String::new(),
+            api_key: String::new(),
+            include_reasoning: Some(false),
+            enable_thinking: Some(false),
+            max_tokens: openplotva_config::DEFAULT_LLM_PROVIDER_MAX_TOKENS,
+            temperature: None,
+            task_timeout_seconds: openplotva_config::DEFAULT_LLM_PROVIDER_TASK_TIMEOUT_SECONDS,
+        });
+    // Prefer the model selected in the admin for `agentic_search_reasoner` (same service).
+    if let Some(model) = crate::model_routing::resolved_model_for(
+        "agentic_search_reasoner",
+        spec.discovery_service_name.trim(),
+    ) {
+        spec.model = model;
     }
-    openplotva_config::NamedProviderConfig {
-        name: openplotva_config::DEFAULT_AGENTIC_SEARCH_REASONER_PROVIDER.to_owned(),
-        kind: openplotva_config::DEFAULT_LLM_PROVIDER_KIND.to_owned(),
-        discovery_service_name: DEFAULT_QWEN_SERVICE_NAME.to_owned(),
-        discovery_endpoint_name: config.llm.dialog.discovery_endpoint_name.clone(),
-        model: DEFAULT_QWEN_MODEL.to_owned(),
-        base_url: String::new(),
-        url: String::new(),
-        api_key: String::new(),
-        include_reasoning: Some(false),
-        enable_thinking: Some(false),
-        max_tokens: openplotva_config::DEFAULT_LLM_PROVIDER_MAX_TOKENS,
-        temperature: None,
-        task_timeout_seconds: openplotva_config::DEFAULT_LLM_PROVIDER_TASK_TIMEOUT_SECONDS,
-    }
+    spec
 }
 
 /// Resolved search-agent settings (prompts + budgets + default providers), built

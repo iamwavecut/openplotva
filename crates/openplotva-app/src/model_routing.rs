@@ -38,6 +38,69 @@ pub async fn reload_router(handle: &RouterHandle, pool: &PgPool) -> Result<(), S
     Ok(())
 }
 
+/// A config-only workflow's resolved single target: the model name plus its provider's
+/// discovery coordinates, read from the routing table.
+#[derive(Clone, Debug)]
+pub struct ResolvedTarget {
+    pub model: String,
+    pub discovery_service_name: Option<String>,
+    pub discovery_endpoint_name: Option<String>,
+    pub base_url: Option<String>,
+}
+
+/// Published once at startup (after seed/backfill) so the per-flow factories for the
+/// config-only workflows can override their env-built model with the DB selection
+/// without threading the routing table through every construction site.
+static CONFIG_ONLY_RESOLVER: std::sync::OnceLock<
+    std::collections::HashMap<String, ResolvedTarget>,
+> = std::sync::OnceLock::new();
+
+fn resolve_target(table: &RoutingTable, key: &str) -> Option<ResolvedTarget> {
+    let route = table.resolve(key, false)?;
+    let candidate = route
+        .primary
+        .first()
+        .or_else(|| route.fallback_tail.first())?;
+    let model = table.model(candidate.model)?;
+    let provider = table.provider(model.provider)?;
+    Some(ResolvedTarget {
+        model: model.model_name.clone(),
+        discovery_service_name: provider.discovery_service_name.clone(),
+        discovery_endpoint_name: provider.discovery_endpoint_name.clone(),
+        base_url: model.base_url.clone().or_else(|| provider.endpoint.clone()),
+    })
+}
+
+/// Resolve every workflow's primary target from a snapshot and publish them for the
+/// config-only flow factories. Idempotent; only the first call wins (set once at boot).
+pub fn init_routing_resolver(snapshot: &RoutingSnapshot) {
+    let table = build_routing_table(snapshot);
+    let keys: Vec<String> = table.workflow_keys().map(str::to_owned).collect();
+    let mut map = std::collections::HashMap::new();
+    for key in keys {
+        if let Some(target) = resolve_target(&table, &key) {
+            map.insert(key, target);
+        }
+    }
+    let _ = CONFIG_ONLY_RESOLVER.set(map);
+}
+
+/// The DB-resolved model for a config-only workflow, returned only when its provider's
+/// discovery service matches `expected_service`. The match keeps the override
+/// behavior-neutral (same endpoint) and lets admin edits that keep the service take
+/// effect on the next restart; a service change is ignored so the env path stays safe.
+#[must_use]
+pub fn resolved_model_for(key: &str, expected_service: &str) -> Option<String> {
+    let target = CONFIG_ONLY_RESOLVER.get()?.get(key)?;
+    if target.discovery_service_name.as_deref() == Some(expected_service)
+        && !target.model.trim().is_empty()
+    {
+        Some(target.model.clone())
+    } else {
+        None
+    }
+}
+
 const SEEDED_KEY: &str = "llm.routing.seeded";
 
 async fn app_setting_present(pool: &PgPool, key: &str) -> Result<bool, StorageError> {
@@ -1018,5 +1081,43 @@ mod tests {
             table.resolve("dialog", false).expect("global").primary[0].provider,
             1
         );
+    }
+
+    #[test]
+    fn resolve_target_reads_primary_model_and_service() {
+        let mut snapshot = dialog_snapshot();
+        snapshot.providers.push(provider(7, "aifarm-qwen", "chat"));
+        snapshot
+            .providers
+            .last_mut()
+            .unwrap()
+            .discovery_service_name = Some("llm-openai-qwen27b-gguf".to_owned());
+        snapshot.models.push(model(70, 7, "vibethinker-3b"));
+        snapshot.workflows.push(WorkflowRecord {
+            key: "memory_consolidation".to_owned(),
+            kind: "chat".to_owned(),
+            full_routing: false,
+            retry_max_hops: 3,
+            retry_wall_ms: 60_000,
+            enabled: true,
+        });
+        snapshot.assignments.push(assignment(
+            700,
+            "memory_consolidation",
+            "global",
+            "primary",
+            70,
+            None,
+        ));
+
+        let table = build_routing_table(&snapshot);
+        let target = resolve_target(&table, "memory_consolidation").expect("resolved target");
+        assert_eq!(target.model, "vibethinker-3b");
+        assert_eq!(
+            target.discovery_service_name.as_deref(),
+            Some("llm-openai-qwen27b-gguf")
+        );
+        // Unrouted workflow yields nothing.
+        assert!(resolve_target(&table, "nonexistent").is_none());
     }
 }

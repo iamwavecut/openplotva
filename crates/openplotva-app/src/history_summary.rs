@@ -384,6 +384,12 @@ pub fn aifarm_history_summary_config_from_app_config(
         &memory.consolidation_model,
         None,
     );
+    // Prefer the model selected in the admin for `history_summary` (same service).
+    let model = crate::model_routing::resolved_model_for(
+        "history_summary",
+        memory.aifarm_service_name.trim(),
+    )
+    .unwrap_or(model);
     AifarmHistorySummaryConfig {
         client: AifarmClientConfig {
             base_url: config.llm.discovery.base_url.clone(),

@@ -2821,6 +2821,17 @@ pub fn memory_extractor_from_app_config_with_override(
     model_override: Option<&str>,
 ) -> Result<AppMemoryExtractor, AppMemoryExtractorBuildError> {
     let provider = memory_extractor_provider(config, provider_override);
+    // Prefer the model selected in the admin for the `memory_consolidation` workflow
+    // (same discovery service, so behavior-neutral); an explicit override still wins.
+    let resolved_model = if provider == "aifarm" {
+        crate::model_routing::resolved_model_for(
+            "memory_consolidation",
+            config.memory.aifarm_service_name.trim(),
+        )
+    } else {
+        None
+    };
+    let model_override = model_override.or(resolved_model.as_deref());
     match provider.as_str() {
         "aifarm" => {
             let extractor =
