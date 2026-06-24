@@ -19,7 +19,8 @@ use openplotva_storage::StorageError;
 use openplotva_storage::llm_routing::{
     AssignmentInput, AssignmentRecord, ModelInput, ModelRecord, ProviderInput, RoutingSnapshot,
     TriggerInput, TriggerRecord, WorkflowRecord, insert_assignment, insert_model, insert_provider,
-    insert_trigger, list_providers, load_snapshot,
+    insert_trigger, list_assignments, list_models, list_providers, load_snapshot,
+    update_assignment,
 };
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -39,23 +40,31 @@ pub async fn reload_router(handle: &RouterHandle, pool: &PgPool) -> Result<(), S
 
 const SEEDED_KEY: &str = "llm.routing.seeded";
 
-async fn already_seeded(pool: &PgPool) -> Result<bool, StorageError> {
+async fn app_setting_present(pool: &PgPool, key: &str) -> Result<bool, StorageError> {
     let row = sqlx::query("SELECT value FROM app_settings WHERE key = $1")
-        .bind(SEEDED_KEY)
+        .bind(key)
         .fetch_optional(pool)
         .await?;
     Ok(row.is_some())
 }
 
-async fn mark_seeded(pool: &PgPool) -> Result<(), StorageError> {
+async fn mark_app_setting(pool: &PgPool, key: &str) -> Result<(), StorageError> {
     sqlx::query(
         "INSERT INTO app_settings (key, value, updated_at) VALUES ($1, '1', NOW()) \
          ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()",
     )
-    .bind(SEEDED_KEY)
+    .bind(key)
     .execute(pool)
     .await?;
     Ok(())
+}
+
+async fn already_seeded(pool: &PgPool) -> Result<bool, StorageError> {
+    app_setting_present(pool, SEEDED_KEY).await
+}
+
+async fn mark_seeded(pool: &PgPool) -> Result<(), StorageError> {
+    mark_app_setting(pool, SEEDED_KEY).await
 }
 
 /// Insert one provider plus one model and return their ids.
@@ -416,6 +425,164 @@ pub async fn backfill_pool_from_env(
         models = dialog.aifarm_pool_models.len(),
         "backfilled AI Farm pool into routing tables"
     );
+    Ok(true)
+}
+
+const GPU_BACKFILL_KEY: &str = "llm.routing.gpu_backfilled";
+
+/// Provider name for a discovery service: the default dialog service stays on the
+/// existing `aifarm` provider; other services (the GPU2 llama.cpp Qwen multiserver)
+/// get a deterministic `aifarm-<service>` provider so their models are collision-free.
+fn gpu_provider_name(service: &str, config: &AppConfig) -> String {
+    if service == config.llm.dialog.discovery_service_name {
+        "aifarm".to_owned()
+    } else {
+        format!(
+            "aifarm-{}",
+            service
+                .trim_start_matches("llm-openai-")
+                .trim_start_matches("llm-")
+        )
+    }
+}
+
+fn assignment_input_from_record(
+    record: &AssignmentRecord,
+    provider_model_id: i64,
+) -> AssignmentInput {
+    AssignmentInput {
+        workflow_key: record.workflow_key.clone(),
+        scope: record.scope.clone(),
+        role: record.role.clone(),
+        provider_model_id,
+        weight: record.weight,
+        fallback_order: record.fallback_order,
+        canary_percent: record.canary_percent,
+        enabled: record.enabled,
+        inference_overrides: record.inference_overrides.clone(),
+        cb_failure_threshold: record.cb_failure_threshold,
+        cb_cooldown_ms: record.cb_cooldown_ms,
+    }
+}
+
+/// Lift the GPU-served Qwen/llama.cpp models that the agentic reasoner and the memory
+/// pipeline actually use into managed DB rows, and repoint those config-only workflows
+/// at them. The initial seed flattened these to the dialog Gemma model; this corrects an
+/// already-seeded database (idempotent via the `gpu_backfilled` flag) so the GPU2 models
+/// (`vibethinker-3b` for memory/history, `qwen3.6-27b-moq` for the search reasoner)
+/// show up in the admin and drive the right workflows. Values are read from config, so it
+/// adapts to whatever each flow is configured to use.
+pub async fn backfill_gpu_models(pool: &PgPool, config: &AppConfig) -> Result<bool, StorageError> {
+    if app_setting_present(pool, GPU_BACKFILL_KEY).await? {
+        return Ok(false);
+    }
+
+    let memory = &config.memory;
+    let reasoner = crate::agent_runtime::qwen_reasoner_named_provider_config(config);
+    // (workflow, discovery service, endpoint, model) each flow really resolves to.
+    let targets: Vec<(&str, String, String, String)> = vec![
+        (
+            "memory_consolidation",
+            memory.aifarm_service_name.clone(),
+            memory.aifarm_endpoint_name.clone(),
+            memory.consolidation_model.clone(),
+        ),
+        (
+            "history_summary",
+            memory.aifarm_service_name.clone(),
+            memory.aifarm_endpoint_name.clone(),
+            memory.consolidation_model.clone(),
+        ),
+        (
+            "agentic_search_reasoner",
+            reasoner.discovery_service_name.clone(),
+            reasoner.discovery_endpoint_name.clone(),
+            reasoner.model.clone(),
+        ),
+    ]
+    .into_iter()
+    .filter(|(_, service, _, model)| !service.trim().is_empty() && !model.trim().is_empty())
+    .collect();
+    if targets.is_empty() {
+        return Ok(false);
+    }
+
+    let mut provider_ids: std::collections::HashMap<String, i64> = list_providers(pool)
+        .await?
+        .into_iter()
+        .map(|p| (p.name, p.id))
+        .collect();
+    let mut model_ids: std::collections::HashMap<(i64, String), i64> = list_models(pool)
+        .await?
+        .into_iter()
+        .map(|m| ((m.provider_id, m.model_name), m.id))
+        .collect();
+    let assignments = list_assignments(pool).await?;
+
+    for (workflow, service, endpoint, model) in &targets {
+        let provider_name = gpu_provider_name(service, config);
+        let provider_id = match provider_ids.get(&provider_name) {
+            Some(id) => *id,
+            None => {
+                let id = insert_provider(
+                    pool,
+                    &ProviderInput {
+                        name: provider_name.clone(),
+                        kind: "chat".to_owned(),
+                        endpoint: None,
+                        discovery_service_name: Some(service.clone()),
+                        discovery_endpoint_name: Some(endpoint.clone()),
+                        api_key_ref: Some("DIALOG_API_KEY".to_owned()),
+                        api_key_encrypted: None,
+                        enabled: true,
+                        config: json!({}),
+                    },
+                )
+                .await?;
+                provider_ids.insert(provider_name.clone(), id);
+                id
+            }
+        };
+
+        let model_key = (provider_id, model.clone());
+        let model_id = match model_ids.get(&model_key) {
+            Some(id) => *id,
+            None => {
+                let id = insert_model(
+                    pool,
+                    &ModelInput {
+                        provider_id,
+                        model_name: model.clone(),
+                        display_name: None,
+                        base_url: None,
+                        capabilities: vec!["chat".to_owned(), "tools".to_owned()],
+                        embedding_dim: None,
+                        enabled: true,
+                        config: json!({}),
+                    },
+                )
+                .await?;
+                model_ids.insert(model_key, id);
+                id
+            }
+        };
+
+        if let Some(assignment) = assignments
+            .iter()
+            .find(|a| a.workflow_key == *workflow && a.scope == "global" && a.role == "primary")
+            && assignment.provider_model_id != model_id
+        {
+            update_assignment(
+                pool,
+                assignment.id,
+                &assignment_input_from_record(assignment, model_id),
+            )
+            .await?;
+        }
+    }
+
+    mark_app_setting(pool, GPU_BACKFILL_KEY).await?;
+    tracing::info!("backfilled GPU Qwen models and repointed config-only workflows");
     Ok(true)
 }
 

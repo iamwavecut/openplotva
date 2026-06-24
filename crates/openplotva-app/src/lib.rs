@@ -10042,6 +10042,10 @@ async fn start_runtime_workers(
     {
         tracing::warn!(%error, "failed to backfill AI Farm pool into routing tables");
     }
+    if let Err(error) = model_routing::backfill_gpu_models(&service_clients.postgres, config).await
+    {
+        tracing::warn!(%error, "failed to backfill GPU Qwen models into routing tables");
+    }
     let router_handle = match model_routing::load_routing_table(&service_clients.postgres).await {
         Ok(table) => openplotva_llm::router::RouterHandle::new(table),
         Err(error) => {
