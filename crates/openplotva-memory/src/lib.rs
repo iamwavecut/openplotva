@@ -23,7 +23,7 @@ pub const DEFAULT_MEMORY_MAX_QUEUED_RUNS: i32 = 5_000;
 pub const DEFAULT_MEMORY_MAX_DAILY_ENQUEUED_RUNS: i32 = 2_000;
 pub const DISCOVERY_PRIORITY_MEMORY: i32 = 10;
 pub const DEFAULT_MEMORY_CONSOLIDATION_MODEL: &str = "Gemma 4 26B Heretic";
-pub const PROMPT_VERSION: &str = "chat_memory_daily_v2";
+pub const PROMPT_VERSION: &str = "chat_memory_daily_v4";
 pub const DEFAULT_DISCOVERY_BASE_URL: &str = "http://127.0.0.1:50051";
 pub const DEFAULT_MEMORY_REDACTION_SERVICE_NAME: &str = "privacy-filter";
 pub const DEFAULT_MEMORY_REDACTION_ENDPOINT_NAME: &str = "redact";
@@ -63,6 +63,9 @@ pub const CARD_TYPE_EVENT: &str = "event";
 pub const CARD_STATUS_ACTIVE: &str = "active";
 pub const CARD_STATUS_SUPERSEDED: &str = "superseded";
 pub const CARD_STATUS_DELETED: &str = "deleted";
+/// Two facts that contradict each other but neither clearly wins. Both stay
+/// retrievable so the bot can hedge instead of asserting a stale fact.
+pub const CARD_STATUS_COMPETING: &str = "competing";
 
 pub const DEFAULT_MEMORY_REDACTION_CATEGORIES: &[&str] = &[
     "account_number",
@@ -114,6 +117,10 @@ pub struct ObservationScope {
     pub active_usernames: Vec<String>,
     /// Card kind.
     pub kind: CardKind,
+    /// Whether a user-scoped fact is durable enough to follow the user across
+    /// audiences. Only portable user facts become `public_user`; the rest stay
+    /// bound to their origin group as `chat_user`.
+    pub portable: bool,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -273,9 +280,12 @@ pub struct ExtractOutput {
     /// Candidate memory cards.
     #[serde(default)]
     pub candidate_cards: Vec<CandidateCard>,
-    /// Supersession hints.
+    /// Supersession hints (legacy shape; superseded by `resolutions`).
     #[serde(default)]
     pub supersessions: Vec<Supersession>,
+    /// Scored conflict resolutions (supersede vs competing).
+    #[serde(default)]
+    pub resolutions: Vec<Resolution>,
     /// Candidate links.
     #[serde(default)]
     pub links: Vec<CandidateLink>,
@@ -322,6 +332,10 @@ pub struct CandidateCard {
     /// Source Telegram message IDs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_message_ids: Vec<i32>,
+    /// Whether a user-scoped fact is durable enough to follow the user across
+    /// audiences (stable identity, language, long-term role). Defaults to false.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub portable: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -332,6 +346,47 @@ pub struct Supersession {
     pub new_fact_text: String,
     /// Supersession reason.
     pub reason: String,
+}
+
+/// How the model wants to reconcile a new fact with an existing card.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ResolutionDecision {
+    /// The new fact clearly invalidates the old one.
+    #[default]
+    Supersede,
+    /// Both facts are plausible yet contradictory; keep both as `competing`.
+    Competing,
+}
+
+/// A scored decision on how a freshly extracted fact relates to an existing card.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct Resolution {
+    /// Existing card being reconciled.
+    pub old_card_id: i64,
+    /// Exact fact_text of the replacement candidate card.
+    pub new_fact_text: String,
+    /// Chosen reconciliation.
+    #[serde(default)]
+    pub decision: ResolutionDecision,
+    /// Model-estimated closeness of the conflict.
+    #[serde(default)]
+    pub conflict_score: f64,
+    /// Reasoning.
+    #[serde(default)]
+    pub reason: String,
+}
+
+impl Resolution {
+    /// View this resolution through the supersession id-resolution machinery.
+    #[must_use]
+    pub fn as_supersession(&self) -> Supersession {
+        Supersession {
+            old_card_id: self.old_card_id,
+            new_fact_text: self.new_fact_text.clone(),
+            reason: self.reason.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
@@ -432,6 +487,32 @@ pub struct Card {
         with = "time::serde::rfc3339::option"
     )]
     pub updated_at: Option<OffsetDateTime>,
+    /// Origin thread ID.
+    #[serde(default, skip_serializing_if = "is_zero_i32")]
+    pub origin_thread_id: i32,
+    /// Staleness penalty.
+    #[serde(default)]
+    pub decay_score: f64,
+    /// Whether the fact may travel across audiences.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub portable: bool,
+    /// Conflict group for competing cards.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conflict_group: Option<i64>,
+    /// Transaction-time: when the bot recorded the fact.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "time::serde::rfc3339::option"
+    )]
+    pub recorded_at: Option<OffsetDateTime>,
+    /// Transaction-time: when the bot stopped believing the fact.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "time::serde::rfc3339::option"
+    )]
+    pub retracted_at: Option<OffsetDateTime>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -570,6 +651,8 @@ pub struct RunStats {
     pub cards_updated: i32,
     /// Superseded card count.
     pub cards_superseded: i32,
+    /// Cards flagged as competing (contradictory, both kept).
+    pub cards_competing: i32,
     /// Inserted episode count.
     pub episodes_inserted: i32,
     /// Input token estimate.
@@ -638,6 +721,26 @@ pub struct RunRecord {
     /// Updated timestamp.
     #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
+    /// Worker that leased the run.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub lease_owner: String,
+    /// Telegram chat type (joined from chats).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub chat_type: String,
+    /// Started timestamp.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "time::serde::rfc3339::option"
+    )]
+    pub started_at: Option<OffsetDateTime>,
+    /// Completed timestamp.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "time::serde::rfc3339::option"
+    )]
+    pub completed_at: Option<OffsetDateTime>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -786,8 +889,72 @@ pub struct CardFilter {
     pub user_id: i64,
     /// Status filter.
     pub status: CardStatus,
+    /// Card-type filter.
+    pub card_type: CardType,
+    /// Visibility filter.
+    pub visibility: Visibility,
+    /// Point-in-time replay (transaction time).
+    pub as_of: Option<OffsetDateTime>,
     /// Limit.
     pub limit: i32,
+}
+
+/// One edge of a card's graph neighbourhood, with the peer card denormalized.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct CardLink {
+    /// Link ID.
+    pub id: i64,
+    /// Source card ID.
+    pub from_card_id: i64,
+    /// Target card ID.
+    pub to_card_id: i64,
+    /// Relation.
+    pub relation: String,
+    /// Edge weight.
+    pub confidence: f64,
+    /// The other card in the edge (relative to the queried card).
+    pub peer_card_id: i64,
+    /// Peer fact text.
+    pub peer_fact_text: String,
+    /// Peer card type.
+    pub peer_card_type: CardType,
+}
+
+/// A keyed count for an overview breakdown.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct MemoryGroupCount {
+    /// Group key (status, visibility, or card_type).
+    pub key: String,
+    /// Row count.
+    pub count: i64,
+}
+
+/// A per-chat memory count for the overview.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct MemoryChatCount {
+    /// Chat ID.
+    pub chat_id: i64,
+    /// Telegram chat type.
+    pub chat_type: String,
+    /// Card count.
+    pub count: i64,
+}
+
+/// Aggregates for the admin Memory overview (cockpit).
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct MemoryOverview {
+    /// Card counts by status.
+    pub by_status: Vec<MemoryGroupCount>,
+    /// Active+competing card counts by visibility.
+    pub by_visibility: Vec<MemoryGroupCount>,
+    /// Active+competing card counts by card type.
+    pub by_card_type: Vec<MemoryGroupCount>,
+    /// Top chats by active+competing card count.
+    pub top_chats: Vec<MemoryChatCount>,
+    /// Total link edges.
+    pub links_total: i64,
+    /// Runs created since midnight UTC.
+    pub runs_today: i64,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -1666,6 +1833,21 @@ pub fn normalize_card_type(value: &str) -> CardType {
     }
 }
 
+/// Card types whose meaning belongs to the chat (or thread), never to a single
+/// participant. Forcing their scope keeps shared group events out of one user's
+/// pool and stops symmetric relationship facts from leaking as a user-scoped card.
+#[must_use]
+fn is_chat_bound_card_type(card_type: &str) -> bool {
+    matches!(
+        normalize_card_type(card_type).as_str(),
+        CARD_TYPE_EVENT
+            | CARD_TYPE_DECISION
+            | CARD_TYPE_JOKE
+            | CARD_TYPE_RECURRING_TOPIC
+            | CARD_TYPE_RELATIONSHIP
+    )
+}
+
 #[must_use]
 pub fn looks_like_secret(value: &str) -> bool {
     contains_any_ascii_fold(value, SECRET_MARKERS)
@@ -2007,6 +2189,9 @@ pub fn format_context(memory: &RetrievedMemory) -> String {
         out.push_str(&card.card_type);
         out.push(' ');
         out.push_str(&format_memory_confidence(card.confidence));
+        if card.status == CARD_STATUS_COMPETING {
+            out.push_str(" disputed");
+        }
         out.push_str("] ");
         out.push_str(text);
         out.push('\n');
@@ -2083,6 +2268,16 @@ pub fn include_public_user_memory(scope: &RetrievalScope) -> bool {
     is_public_group(&scope.chat_type, &scope.username, &scope.active_usernames)
 }
 
+/// Whether `public_user` cards may surface purely because we are in the user's
+/// own DM. Cross-audience travel of a `public_user` card into other groups is
+/// decided per card by the retrieval query (the `portable` flag or a matching
+/// origin chat), never by this scope-level gate. This keeps a user fact from
+/// silently jumping between unrelated group audiences.
+#[must_use]
+pub fn public_user_in_own_dm(scope: &RetrievalScope) -> bool {
+    is_private_chat(&scope.chat_type, scope.chat_id, scope.user_id)
+}
+
 #[must_use]
 pub fn chat_visibility(kind: &str, thread_id: i32) -> Visibility {
     if kind == CARD_KIND_THREAD || thread_id != 0 {
@@ -2103,7 +2298,11 @@ pub fn build_visibility_for_observation(scope: &ObservationScope) -> Visibility 
     if is_private_chat(&scope.chat_type, scope.chat_id, scope.user_id) {
         return VISIBILITY_PRIVATE_CHAT.to_owned();
     }
-    if is_public_group(&scope.chat_type, &scope.username, &scope.active_usernames) {
+    // A user fact in a public group only becomes globally portable (`public_user`)
+    // when the observation is marked portable; otherwise it stays bound to the
+    // origin group as `chat_user`, so it cannot leak into unrelated audiences.
+    if scope.portable && is_public_group(&scope.chat_type, &scope.username, &scope.active_usernames)
+    {
         return VISIBILITY_PUBLIC_USER.to_owned();
     }
     VISIBILITY_CHAT_USER.to_owned()
@@ -2194,6 +2393,7 @@ fn card_from_candidate(
             username: input.chat_username.clone(),
             active_usernames: input.chat_active_usernames.clone(),
             kind,
+            portable: candidate.portable,
         },
         card_type: normalize_card_type(&candidate.card_type),
         subject: candidate.subject.clone(),
@@ -2209,6 +2409,13 @@ fn card_from_candidate(
 }
 
 fn candidate_scope_kind(input: &ExtractInput, candidate: &CandidateCard) -> Option<CardKind> {
+    if is_chat_bound_card_type(&candidate.card_type) {
+        return Some(if input.run.thread_id != 0 {
+            CARD_KIND_THREAD.to_owned()
+        } else {
+            CARD_KIND_CHAT.to_owned()
+        });
+    }
     let kind = normalize_card_kind(&candidate.scope_type);
     match kind.as_str() {
         CARD_KIND_USER => candidate_user_allowed(input, candidate).then_some(kind),
@@ -2935,6 +3142,7 @@ mod tests {
                 chat_type: "supergroup".to_owned(),
                 username: "public_chat".to_owned(),
                 kind: CARD_KIND_USER.to_owned(),
+                portable: true,
                 ..ObservationScope::default()
             }),
             VISIBILITY_PUBLIC_USER
@@ -2975,6 +3183,187 @@ mod tests {
             active_usernames: vec!["public_alias".to_owned()],
             ..RetrievalScope::default()
         }));
+    }
+
+    #[test]
+    fn format_context_marks_competing_cards_as_disputed() {
+        let memory = RetrievedMemory {
+            cards: vec![
+                Card {
+                    card_type: CARD_TYPE_PREFERENCE.to_owned(),
+                    status: CARD_STATUS_COMPETING.to_owned(),
+                    fact_text: "Alice uses Postgres".to_owned(),
+                    confidence: 0.9,
+                    ..Card::default()
+                },
+                Card {
+                    card_type: CARD_TYPE_PREFERENCE.to_owned(),
+                    status: CARD_STATUS_ACTIVE.to_owned(),
+                    fact_text: "Bob likes tea".to_owned(),
+                    confidence: 0.8,
+                    ..Card::default()
+                },
+            ],
+            episodes: Vec::new(),
+        };
+
+        let out = format_context(&memory);
+
+        let alice_line = out
+            .lines()
+            .find(|line| line.contains("Alice uses Postgres"))
+            .expect("alice line present");
+        assert!(
+            alice_line.contains("disputed"),
+            "competing card must be flagged disputed: {alice_line}"
+        );
+        let bob_line = out
+            .lines()
+            .find(|line| line.contains("Bob likes tea"))
+            .expect("bob line present");
+        assert!(
+            !bob_line.contains("disputed"),
+            "active card must not be flagged: {bob_line}"
+        );
+    }
+
+    #[test]
+    fn public_user_in_own_dm_is_true_only_in_private_chat() {
+        // A user's own DM: their portable facts continue into the quiet channel.
+        assert!(public_user_in_own_dm(&RetrievalScope {
+            chat_id: 42,
+            user_id: 42,
+            chat_type: "private".to_owned(),
+            ..RetrievalScope::default()
+        }));
+        // A public group is NOT the user's DM: cross-group travel is decided
+        // per card, so the scope-level gate must be false here.
+        assert!(!public_user_in_own_dm(&RetrievalScope {
+            chat_id: -1001,
+            user_id: 42,
+            chat_type: "supergroup".to_owned(),
+            username: "public_chat".to_owned(),
+            ..RetrievalScope::default()
+        }));
+        // A private group is likewise not the user's DM.
+        assert!(!public_user_in_own_dm(&RetrievalScope {
+            chat_id: -1002,
+            user_id: 42,
+            chat_type: "supergroup".to_owned(),
+            ..RetrievalScope::default()
+        }));
+    }
+
+    #[test]
+    fn public_group_user_fact_defaults_to_chat_user_unless_portable() {
+        let base = ObservationScope {
+            chat_id: -1001,
+            user_id: 42,
+            chat_type: "supergroup".to_owned(),
+            username: "public_chat".to_owned(),
+            kind: CARD_KIND_USER.to_owned(),
+            ..ObservationScope::default()
+        };
+
+        // Not portable: a user fact observed in a public group stays local to it.
+        assert_eq!(
+            build_visibility_for_observation(&ObservationScope {
+                portable: false,
+                ..base.clone()
+            }),
+            VISIBILITY_CHAT_USER
+        );
+
+        // Portable: a stable identity/language fact follows the user everywhere.
+        assert_eq!(
+            build_visibility_for_observation(&ObservationScope {
+                portable: true,
+                ..base
+            }),
+            VISIBILITY_PUBLIC_USER
+        );
+    }
+
+    #[test]
+    fn chat_bound_card_types_force_chat_scope_regardless_of_model() {
+        let input = ExtractInput {
+            run: Run {
+                chat_id: -100,
+                thread_id: 0,
+                ..Run::default()
+            },
+            ..ExtractInput::default()
+        };
+
+        // An event the model mislabeled as user-scoped must stay bound to the chat.
+        let event_as_user = CandidateCard {
+            scope_type: CARD_KIND_USER.to_owned(),
+            user_id: 42,
+            card_type: CARD_TYPE_EVENT.to_owned(),
+            ..CandidateCard::default()
+        };
+        assert_eq!(
+            candidate_scope_kind(&input, &event_as_user),
+            Some(CARD_KIND_CHAT.to_owned())
+        );
+
+        // A relationship is symmetric and belongs to the chat, never one user.
+        let relationship_as_user = CandidateCard {
+            scope_type: CARD_KIND_USER.to_owned(),
+            user_id: 42,
+            card_type: CARD_TYPE_RELATIONSHIP.to_owned(),
+            ..CandidateCard::default()
+        };
+        assert_eq!(
+            candidate_scope_kind(&input, &relationship_as_user),
+            Some(CARD_KIND_CHAT.to_owned())
+        );
+
+        // Inside a forum thread, chat-bound kinds resolve to the thread scope.
+        let threaded = ExtractInput {
+            run: Run {
+                chat_id: -100,
+                thread_id: 9,
+                ..Run::default()
+            },
+            ..ExtractInput::default()
+        };
+        let joke = CandidateCard {
+            scope_type: CARD_KIND_USER.to_owned(),
+            user_id: 42,
+            card_type: CARD_TYPE_JOKE.to_owned(),
+            ..CandidateCard::default()
+        };
+        assert_eq!(
+            candidate_scope_kind(&threaded, &joke),
+            Some(CARD_KIND_THREAD.to_owned())
+        );
+
+        // A genuine user preference with a valid source stays user-scoped.
+        let pref_input = ExtractInput {
+            run: Run {
+                chat_id: -100,
+                thread_id: 0,
+                ..Run::default()
+            },
+            messages: vec![Message {
+                message_id: 10,
+                user_id: 42,
+                ..Message::default()
+            }],
+            ..ExtractInput::default()
+        };
+        let preference = CandidateCard {
+            scope_type: CARD_KIND_USER.to_owned(),
+            user_id: 42,
+            card_type: CARD_TYPE_PREFERENCE.to_owned(),
+            source_message_ids: vec![10],
+            ..CandidateCard::default()
+        };
+        assert_eq!(
+            candidate_scope_kind(&pref_input, &preference),
+            Some(CARD_KIND_USER.to_owned())
+        );
     }
 
     #[test]

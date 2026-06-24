@@ -547,6 +547,205 @@
         });
     });
 
+    /* ============================================================
+       SVG helper (el() only creates HTML elements)
+       ============================================================ */
+    const SVG_NS = 'http://www.w3.org/2000/svg';
+    function svgEl(tag, attrs, children) {
+        const node = document.createElementNS(SVG_NS, tag);
+        if (attrs) for (const k in attrs) node.setAttribute(k, attrs[k]);
+        if (children != null) {
+            (Array.isArray(children) ? children : [children]).forEach(function (c) {
+                if (c != null) node.appendChild(c instanceof Node ? c : document.createTextNode(String(c)));
+            });
+        }
+        return node;
+    }
+    function clamp01(n) { n = Number(n); return n < 0 ? 0 : (n > 1 ? 1 : (isNaN(n) ? 0 : n)); }
+
+    /* ============================================================
+       pl-slider — accessible range with live readout
+       attrs: min, max, step, value, label, format (ratio|int), disabled
+       ============================================================ */
+    class PlSlider extends HTMLElement {
+        connectedCallback() {
+            if (this._built) return;
+            this._built = true;
+            this.classList.add('pl-slider');
+            const id = this.getAttribute('id');
+            if (id) this.removeAttribute('id');
+            const label = this.getAttribute('label');
+            if (label) this.appendChild(el('span', { class: 'pl-slider-label' }, label));
+            this._input = el('input', {
+                type: 'range',
+                min: this.getAttribute('min') || '0',
+                max: this.getAttribute('max') || '100',
+                step: this.getAttribute('step') || '1',
+                value: this.getAttribute('value') || this.getAttribute('min') || '0'
+            });
+            if (id) this._input.id = id;
+            if (this.hasAttribute('disabled')) this._input.disabled = true;
+            this._out = el('span', { class: 'pl-slider-out' }, this._fmt(this._input.value));
+            this.appendChild(this._input);
+            this.appendChild(this._out);
+            this._input.addEventListener('input', () => {
+                this._out.textContent = this._fmt(this._input.value);
+                this.dispatchEvent(new CustomEvent('pl:input', { bubbles: true, detail: { value: this.value } }));
+            });
+            this._input.addEventListener('change', () => {
+                this.dispatchEvent(new CustomEvent('pl:change', { bubbles: true, detail: { value: this.value } }));
+            });
+        }
+        _fmt(v) {
+            return this.getAttribute('format') === 'ratio' ? (Number(v) / 100).toFixed(2) : String(Math.round(Number(v)));
+        }
+        get value() { return this._input ? Number(this._input.value) : Number(this.getAttribute('value') || 0); }
+        set value(v) {
+            if (this._input) { this._input.value = v; this._out.textContent = this._fmt(v); }
+            else this.setAttribute('value', v);
+        }
+    }
+
+    /* ============================================================
+       pl-drawer — normal-flow side panel (no position:fixed)
+       ============================================================ */
+    class PlDrawer extends HTMLElement {
+        connectedCallback() {
+            if (this._built) return;
+            this._built = true;
+            this.classList.add('pl-drawer');
+            if (!this.hasAttribute('open')) this.hidden = true;
+            this.addEventListener('keydown', (e) => {
+                if (e.key === 'Escape' && this.open) { this.open = false; this.dispatchEvent(new CustomEvent('pl:close', { bubbles: true })); }
+            });
+        }
+        get open() { return !this.hidden; }
+        set open(v) {
+            this.hidden = !v;
+            if (v) this.setAttribute('open', ''); else this.removeAttribute('open');
+        }
+    }
+
+    /* ============================================================
+       pl-graph — SVG one-hop neighbourhood (data prop: {nodes, edges, center})
+       node: {id, label, card_type, salience, competing}
+       edge: {from, to, relation, confidence}
+       emits pl:node-click {id}
+       ============================================================ */
+    class PlGraph extends HTMLElement {
+        connectedCallback() { this.classList.add('pl-graph'); if (this._data) this.render(); }
+        set data(d) { this._data = d; if (this.isConnected) this.render(); }
+        get data() { return this._data; }
+        render() {
+            this.textContent = '';
+            const d = this._data || {};
+            const nodes = d.nodes || [];
+            if (!nodes.length) return;
+            const W = 680, H = 360, cx = W / 2, cy = H / 2, R = 128;
+            const svg = svgEl('svg', { viewBox: '0 0 ' + W + ' ' + H, role: 'img', 'aria-label': 'Memory graph neighbourhood' });
+            const centerId = d.center != null ? d.center : nodes[0].id;
+            const peers = nodes.filter((n) => n.id !== centerId);
+            const pos = {};
+            pos[centerId] = { x: cx, y: cy };
+            peers.forEach((n, i) => {
+                const a = (i / Math.max(1, peers.length)) * Math.PI * 2 - Math.PI / 2;
+                pos[n.id] = { x: cx + Math.cos(a) * R, y: cy + Math.sin(a) * R };
+            });
+            (d.edges || []).forEach((e) => {
+                const a = pos[e.from], b = pos[e.to];
+                if (!a || !b) return;
+                const w = (1.5 + clamp01(e.confidence) * 3).toFixed(1);
+                svg.appendChild(svgEl('line', { x1: a.x, y1: a.y, x2: b.x, y2: b.y, style: 'stroke: var(--c-relation-' + (e.relation || 'same_topic') + '); stroke-width: ' + w }));
+                svg.appendChild(svgEl('text', { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 - 3, 'text-anchor': 'middle', class: 'pl-graph-edge-label' }, clamp01(e.confidence).toFixed(2)));
+            });
+            nodes.forEach((n) => {
+                const p = pos[n.id];
+                if (!p) return;
+                const r = 16 + clamp01(n.salience == null ? 0.5 : n.salience) * 14;
+                const g = svgEl('g', { class: 'pl-graph-node' });
+                let style = 'fill: var(--c-cardtype-' + (n.card_type || 'preference') + ')';
+                if (n.competing) style += '; stroke: var(--c-status-competing); stroke-width: 3';
+                g.appendChild(svgEl('circle', { cx: p.x, cy: p.y, r: r.toFixed(1), style: style }));
+                const lbl = String(n.label || '');
+                g.appendChild(svgEl('text', { x: p.x, y: p.y + r + 13, 'text-anchor': 'middle', class: 'pl-graph-node-label' }, lbl.length > 18 ? lbl.slice(0, 17) + '…' : lbl));
+                g.addEventListener('click', () => this.dispatchEvent(new CustomEvent('pl:node-click', { bubbles: true, detail: { id: n.id } })));
+                svg.appendChild(g);
+            });
+            this.appendChild(svg);
+        }
+    }
+
+    /* ============================================================
+       pl-timeline — SVG bitemporal swimlanes (data prop)
+       data: {lanes:[{key,label}], items:[{id,lane,label,card_type,validFrom,validUntil,recordedAt,status,competing}], now, asOf}
+       emits pl:item-click {id}, pl:asof-change {date}
+       ============================================================ */
+    class PlTimeline extends HTMLElement {
+        connectedCallback() { this.classList.add('pl-timeline'); if (this._data) this.render(); }
+        set data(d) { this._data = d; if (this.isConnected) this.render(); }
+        get data() { return this._data; }
+        render() {
+            this.textContent = '';
+            const d = this._data || {};
+            const lanes = d.lanes || [];
+            const items = d.items || [];
+            if (!lanes.length) return;
+            const W = 680, gutter = 100, top = 26, laneH = 34;
+            const H = top + lanes.length * laneH + 22;
+            const nowMs = d.now ? Date.parse(d.now) : Date.now();
+            const times = [nowMs];
+            items.forEach((it) => {
+                if (it.validFrom) times.push(Date.parse(it.validFrom));
+                if (it.validUntil) times.push(Date.parse(it.validUntil));
+                if (it.recordedAt) times.push(Date.parse(it.recordedAt));
+            });
+            let tmin = Math.min.apply(null, times), tmax = Math.max.apply(null, times);
+            if (!(tmax > tmin)) tmax = tmin + 86400000;
+            const pad = (tmax - tmin) * 0.05;
+            tmin -= pad; tmax += pad;
+            const span = tmax - tmin, plot = W - gutter - 12;
+            const x = (t) => gutter + ((t - tmin) / span) * plot;
+            const laneIndex = {};
+            lanes.forEach((l, i) => { laneIndex[l.key] = i; });
+            const svg = svgEl('svg', { viewBox: '0 0 ' + W + ' ' + H, role: 'img', 'aria-label': 'Memory bitemporal timeline' });
+            lanes.forEach((l, i) => {
+                svg.appendChild(svgEl('text', { x: 8, y: top + i * laneH + laneH / 2 + 3, class: 'pl-timeline-label' }, l.label));
+            });
+            items.forEach((it) => {
+                const li = laneIndex[it.lane];
+                if (li == null) return;
+                const y = top + li * laneH + 8;
+                const x1 = x(Date.parse(it.validFrom || d.now) || nowMs);
+                const x2 = x(it.validUntil ? Date.parse(it.validUntil) : nowMs);
+                const muted = it.status === 'superseded' || it.status === 'deleted';
+                let style = muted ? 'fill: var(--c-text-muted)' : 'fill: var(--c-cardtype-' + (it.card_type || 'preference') + ')';
+                if (it.competing) style += '; stroke: var(--c-status-competing); stroke-width: 2';
+                const rect = svgEl('rect', { x: x1, y: y, width: Math.max(3, x2 - x1).toFixed(1), height: 18, rx: 4, style: style });
+                rect.style.cursor = 'pointer';
+                rect.addEventListener('click', (e) => { e.stopPropagation(); this.dispatchEvent(new CustomEvent('pl:item-click', { bubbles: true, detail: { id: it.id } })); });
+                svg.appendChild(rect);
+                if (it.recordedAt) {
+                    const rx = x(Date.parse(it.recordedAt));
+                    svg.appendChild(svgEl('polygon', { points: (rx - 4) + ',' + (y - 6) + ' ' + (rx + 4) + ',' + (y - 6) + ' ' + rx + ',' + y, style: 'fill: var(--c-text-sec)' }));
+                }
+            });
+            const nx = x(nowMs);
+            svg.appendChild(svgEl('line', { x1: nx, y1: top - 8, x2: nx, y2: H - 14, class: 'pl-timeline-now' }));
+            if (d.asOf) {
+                const ax = x(Date.parse(d.asOf));
+                svg.appendChild(svgEl('line', { x1: ax, y1: top - 8, x2: ax, y2: H - 14, class: 'pl-timeline-asof' }));
+            }
+            svg.addEventListener('click', (e) => {
+                const box = svg.getBoundingClientRect();
+                const px = (e.clientX - box.left) / box.width * W;
+                if (px < gutter) return;
+                const t = tmin + ((px - gutter) / plot) * span;
+                this.dispatchEvent(new CustomEvent('pl:asof-change', { bubbles: true, detail: { date: new Date(t).toISOString() } }));
+            });
+            this.appendChild(svg);
+        }
+    }
+
     /* ---------- register ---------- */
     customElements.define('pl-button', PlButton);
     customElements.define('pl-button-group', PlButtonGroup);
@@ -558,4 +757,8 @@
     customElements.define('pl-table', PlTable);
     customElements.define('pl-modal', class extends HTMLElement { });
     customElements.define('pl-toast-host', class extends HTMLElement { });
+    customElements.define('pl-slider', PlSlider);
+    customElements.define('pl-drawer', PlDrawer);
+    customElements.define('pl-graph', PlGraph);
+    customElements.define('pl-timeline', PlTimeline);
 })();

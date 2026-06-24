@@ -7,6 +7,9 @@ Do not force weak memories. If the window contains only spam/noise or no durable
 Only create cards from human-authored messages that remain in the input and cite their source_entry_ids or source_message_ids.
 Write each fact_text in the same language as the source message it came from.
 Prefer compact atomic cards. Jokes are memory-worthy only if recurring or socially important.
+When a new fact conflicts with an existing card, add a resolution: use decision=supersede only when the new fact clearly invalidates the old one (an explicit change or a newer date); use decision=competing when both are plausible and you cannot tell which is true, so both are kept and the bot can hedge. Set conflict_score to how close the conflict is.
+Bind shared group memory to the chat, not to one person: use scope_type=chat for events, decisions, recurring jokes/topics, and group-wide warnings. Use scope_type=user only for a single participant's preference or identity, and set user_id for those. A relationship describes a pair and is always scope_type=chat.
+For scope_type=user cards, set portable=true only for stable facts a person clearly carries across every chat (their name, language, long-term role); leave portable=false (the default) to keep a user fact inside the group where it was said.
 Return exactly one JSON object with:
 {
   "episode_summary": "short daily summary",
@@ -23,10 +26,11 @@ Return exactly one JSON object with:
       "fact_text": "...",
       "confidence": 0.0,
       "salience": 0.0,
+      "portable": false,
       "source_entry_ids": ["..."],
       "source_message_ids": [1]
     }
   ],
-	  "supersessions": [{"old_card_id": 1, "new_fact_text": "exact fact_text of the replacement candidate card", "reason": "..."}],
+	  "resolutions": [{"old_card_id": 1, "new_fact_text": "exact fact_text of the replacement candidate card", "decision": "supersede|competing", "conflict_score": 0.0, "reason": "..."}],
   "links": []
 }

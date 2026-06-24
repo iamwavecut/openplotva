@@ -628,8 +628,27 @@
                     <div id="memory" class="tab-pane">
                         <div class="card">
                             <div class="card-header">
+                                <span>Overview</span>
+                                <pl-button variant="outline" size="sm" data-action="loadMemoryOverview" data-search-btn>Refresh</pl-button>
+                            </div>
+                            <div class="card-body">
+                                <div id="memory-overview-kpis" class="grid-3 mb-4"></div>
+                                <div class="text-muted mb-2">by visibility</div>
+                                <div id="memory-overview-visibility" class="mb-4"></div>
+                                <div class="text-muted mb-2">by type</div>
+                                <div id="memory-overview-cardtype" class="mb-4"></div>
+                                <div class="text-muted mb-2">top chats</div>
+                                <div id="memory-overview-chats"></div>
+                            </div>
+                        </div>
+                        <div class="card mt-4">
+                            <div class="card-header">
                                 <span>Memory Cards</span>
-                                <pl-button variant="outline" size="sm" data-action="loadMemoryCards" data-search-btn>Load</pl-button>
+                                <pl-button-group>
+                                    <pl-button variant="outline" size="sm" data-action="setMemoryView" data-args='["list"]'>List</pl-button>
+                                    <pl-button variant="outline" size="sm" data-action="setMemoryView" data-args='["timeline"]'>Timeline</pl-button>
+                                    <pl-button variant="outline" size="sm" data-action="loadMemoryCards" data-search-btn>Load</pl-button>
+                                </pl-button-group>
                             </div>
                             <div class="card-body">
                                 <form data-action="loadMemoryCards" role="search">
@@ -644,9 +663,47 @@
                                             <pl-input type="number" id="memory-limit" min="1" max="500" value="100"></pl-input>
                                         </pl-field-group>
                                     </div>
+                                    <div class="grid-3 mb-4">
+                                        <pl-field-group label="Visibility">
+                                            <pl-select id="memory-visibility">
+                                                <option value="">any</option>
+                                                <option value="chat">chat</option>
+                                                <option value="chat_user">chat_user</option>
+                                                <option value="public_user">public_user</option>
+                                                <option value="private_chat">private_chat</option>
+                                                <option value="thread">thread</option>
+                                            </pl-select>
+                                        </pl-field-group>
+                                        <pl-field-group label="Type">
+                                            <pl-select id="memory-cardtype">
+                                                <option value="">any</option>
+                                                <option value="preference">preference</option>
+                                                <option value="identity">identity</option>
+                                                <option value="project">project</option>
+                                                <option value="decision">decision</option>
+                                                <option value="relationship">relationship</option>
+                                                <option value="recurring_topic">recurring_topic</option>
+                                                <option value="joke">joke</option>
+                                                <option value="warning">warning</option>
+                                                <option value="technical_fact">technical_fact</option>
+                                                <option value="event">event</option>
+                                            </pl-select>
+                                        </pl-field-group>
+                                        <pl-field-group label="Status">
+                                            <pl-select id="memory-status">
+                                                <option value="">any</option>
+                                                <option value="active">active</option>
+                                                <option value="competing">competing</option>
+                                                <option value="superseded">superseded</option>
+                                                <option value="deleted">deleted</option>
+                                            </pl-select>
+                                        </pl-field-group>
+                                    </div>
                                 </form>
                                 <div id="memory-meta" class="text-muted mb-3"></div>
                                 <pl-table id="memory-table-body"></pl-table>
+                                <pl-timeline id="memory-timeline" hidden></pl-timeline>
+                                <div id="memory-asof" class="text-muted mt-2"></div>
                             </div>
                         </div>
                         <div class="card mt-4">
@@ -680,6 +737,13 @@
                                 <pl-table id="memory-runs-table-body"></pl-table>
                             </div>
                         </div>
+                        <pl-drawer id="memory-drawer" class="card mt-4">
+                            <div class="pl-drawer-head">
+                                <span>Fact detail</span>
+                                <pl-button variant="ghost" size="sm" data-action="closeMemoryDrawer">Close</pl-button>
+                            </div>
+                            <div id="memory-drawer-body" class="pl-drawer-body"></div>
+                        </pl-drawer>
                     </div>
 
                     <!-- Shield Tab -->
@@ -1149,6 +1213,7 @@
                 loadTaskmanJobs(false);
             }
             if (tabId === 'memory') {
+                loadMemoryOverview();
                 loadMemoryCards();
                 loadMemoryRuns();
             }
@@ -2318,18 +2383,41 @@
         // --- Memory ---
         let memoryCards = [];
         let memoryRuns = [];
+        let memoryView = 'list';
+        let memoryAsOf = '';
+
+        function memoryTag(kind, value) {
+            if (!value) return '';
+            return PL.el('span', { class: `tag tag--${kind}`, dataset: { value: value } }, value);
+        }
+
+        function memoryMeter(value) {
+            const fill = PL.el('span');
+            fill.style.width = Math.round(Math.max(0, Math.min(1, Number(value) || 0)) * 100) + '%';
+            return PL.el('span', { class: 'meter' }, fill);
+        }
 
         const MEMORY_CARD_COLUMNS = [
             { key: 'id', label: 'ID', mono: true, render: (card) => card?.id ?? '' },
-            { key: 'visibility', label: 'Visibility', render: (card) => card?.visibility || '' },
-            { key: 'card_type', label: 'Type', render: (card) => card?.card_type || '' },
-            { key: 'fact_text', label: 'Text', render: (card) => card?.fact_text || '' },
-            { key: 'confidence', label: 'Conf', render: (card) => Number(card?.confidence || 0).toFixed(2) },
+            { key: 'card_type', label: 'Type', render: (card) => memoryTag('cardtype', card?.card_type) },
+            {
+                key: 'fact_text', label: 'Fact', render: (card) => {
+                    const wrap = PL.el('div');
+                    wrap.appendChild(PL.el('div', null, card?.fact_text || ''));
+                    const meta = PL.el('div', { class: 'list-item-meta' });
+                    if (card?.visibility) meta.appendChild(memoryTag('visibility', card.visibility));
+                    if (card?.status === 'competing') meta.appendChild(PL.el('span', { class: 'status-pill', dataset: { status: 'competing' } }, 'competing'));
+                    if (card?.portable) meta.appendChild(PL.el('span', { class: 'text-muted' }, 'portable'));
+                    wrap.appendChild(meta);
+                    return wrap;
+                }
+            },
+            { key: 'confidence', label: 'Conf', render: (card) => memoryMeter(card?.confidence) },
+            { key: 'salience', label: 'Salience', render: (card) => memoryMeter(card?.salience) },
             { key: 'updated_at', label: 'Updated', render: (card) => formatDateValue(card?.updated_at) },
             {
-                key: 'actions', label: 'Actions', render: (card) => {
-                    const btn = PL.el('pl-button', { variant: 'danger', size: 'sm', dataset: { action: 'deleteMemoryCard', args: JSON.stringify([Number(card?.id || 0)]) } }, 'Delete');
-                    return btn;
+                key: 'actions', label: '', render: (card) => {
+                    return PL.el('pl-button', { variant: 'outline', size: 'sm', dataset: { action: 'openMemoryCard', args: JSON.stringify([Number(card?.id || 0)]) } }, 'Open');
                 }
             },
         ];
@@ -2380,10 +2468,222 @@
             const chatID = (document.getElementById('memory-chat-id')?.value || '').trim();
             const userID = (document.getElementById('memory-user-id')?.value || '').trim();
             const limit = Math.max(1, Math.min(500, parseInt(document.getElementById('memory-limit')?.value || '100', 10) || 100));
+            const visibility = (document.getElementById('memory-visibility')?.value || '').trim();
+            const cardType = (document.getElementById('memory-cardtype')?.value || '').trim();
+            const status = (document.getElementById('memory-status')?.value || '').trim();
             if (chatID) params.set('chat_id', chatID);
             if (userID) params.set('user_id', userID);
+            if (visibility) params.set('visibility', visibility);
+            if (cardType) params.set('card_type', cardType);
+            if (status) params.set('status', status);
+            if (memoryAsOf) params.set('as_of', memoryAsOf);
             params.set('limit', String(limit));
             return params.toString();
+        }
+
+        function memoryMetricCard(label, value) {
+            return PL.el('div', { class: 'metric-card' }, [
+                PL.el('div', { class: 'metric-label' }, label),
+                PL.el('div', { class: 'metric-value' }, formatAnalyticsCount(Number(value) || 0))
+            ]);
+        }
+
+        function memoryBarRow(label, value, max) {
+            const fill = PL.el('span', { class: 'bar-fill' });
+            const pct = max > 0 ? Math.round((Number(value) / max) * 100) : 0;
+            fill.style.width = pct + '%';
+            return PL.el('div', { class: 'bar-row' }, [
+                PL.el('span', { class: 'bar-label' }, label),
+                PL.el('span', { class: 'bar-track' }, fill),
+                PL.el('span', { class: 'bar-value' }, formatAnalyticsCount(Number(value) || 0))
+            ]);
+        }
+
+        function renderMemoryBars(containerId, rows) {
+            const box = document.getElementById(containerId);
+            if (!box) return;
+            box.textContent = '';
+            const max = Math.max(1, ...rows.map((r) => Number(r.count) || 0));
+            rows.forEach((r) => box.appendChild(memoryBarRow(r.key, r.count, max)));
+        }
+
+        async function loadMemoryOverview() {
+            const data = await apiCall('/memory/overview');
+            if (!data) return;
+            renderMemoryOverview(data);
+        }
+
+        function renderMemoryOverview(d) {
+            const byStatus = {};
+            (d.by_status || []).forEach((s) => { byStatus[s.key] = s.count; });
+            const total = (d.by_status || []).reduce((a, s) => a + (Number(s.count) || 0), 0);
+            const kpis = document.getElementById('memory-overview-kpis');
+            if (kpis) {
+                kpis.textContent = '';
+                [['total facts', total], ['active', byStatus.active || 0], ['competing', byStatus.competing || 0], ['links', d.links_total || 0], ['runs today', d.runs_today || 0]]
+                    .forEach((pair) => kpis.appendChild(memoryMetricCard(pair[0], pair[1])));
+            }
+            renderMemoryBars('memory-overview-visibility', d.by_visibility || []);
+            renderMemoryBars('memory-overview-cardtype', d.by_card_type || []);
+            const chats = document.getElementById('memory-overview-chats');
+            if (chats) {
+                chats.textContent = '';
+                const max = Math.max(1, ...(d.top_chats || []).map((c) => Number(c.count) || 0));
+                (d.top_chats || []).forEach((c) => {
+                    const label = `${c.chat_type || 'chat'} ${c.chat_id}`;
+                    const row = memoryBarRow(label, c.count, max);
+                    row.style.cursor = 'pointer';
+                    row.addEventListener('click', () => {
+                        const input = document.getElementById('memory-chat-id');
+                        if (input) input.value = c.chat_id;
+                        loadMemoryCards();
+                    });
+                    chats.appendChild(row);
+                });
+            }
+        }
+
+        function setMemoryView(view) {
+            memoryView = view === 'timeline' ? 'timeline' : 'list';
+            const table = document.getElementById('memory-table-body');
+            const tl = document.getElementById('memory-timeline');
+            if (table) table.hidden = memoryView !== 'list';
+            if (tl) tl.hidden = memoryView !== 'timeline';
+            if (memoryView === 'timeline') renderMemoryTimeline();
+        }
+
+        function renderMemoryTimeline() {
+            const tl = document.getElementById('memory-timeline');
+            if (!tl) return;
+            const laneMap = {};
+            const lanes = [];
+            const items = (memoryCards || []).map((c) => {
+                const laneKey = c.user_id ? String(c.user_id) : 'chat';
+                if (!laneMap[laneKey]) { laneMap[laneKey] = true; lanes.push({ key: laneKey, label: c.user_id ? ('user ' + c.user_id) : 'chat' }); }
+                return {
+                    id: c.id, lane: laneKey, label: c.fact_text, card_type: c.card_type,
+                    validFrom: c.valid_from || c.created_at, validUntil: c.valid_until,
+                    recordedAt: c.recorded_at, status: c.status, competing: c.status === 'competing'
+                };
+            });
+            if (!tl._wired) {
+                tl._wired = true;
+                tl.addEventListener('pl:item-click', (e) => { if (e.detail) openMemoryCard(e.detail.id); });
+                tl.addEventListener('pl:asof-change', (e) => { memoryAsOf = e.detail.date; loadMemoryCards(); });
+            }
+            tl.data = { lanes: lanes, items: items, now: new Date().toISOString(), asOf: memoryAsOf || null };
+        }
+
+        function updateMemoryAsOfLabel() {
+            const box = document.getElementById('memory-asof');
+            if (!box) return;
+            box.textContent = '';
+            if (!memoryAsOf) return;
+            box.appendChild(PL.el('span', null, `as of ${formatDateValue(memoryAsOf)} · `));
+            const clear = PL.el('span', { class: 'filter-chip-x' }, 'clear');
+            clear.style.cursor = 'pointer';
+            clear.addEventListener('click', () => { memoryAsOf = ''; loadMemoryCards(); });
+            box.appendChild(clear);
+        }
+
+        async function openMemoryCard(id) {
+            const drawer = document.getElementById('memory-drawer');
+            const body = document.getElementById('memory-drawer-body');
+            if (!drawer || !body) return;
+            drawer.open = true;
+            body.textContent = '';
+            body.appendChild(PL.el('div', { class: 'text-muted' }, 'Loading…'));
+            const data = await apiCall(`/memory/card?id=${encodeURIComponent(id)}`);
+            if (!data || !data.card) {
+                body.textContent = '';
+                body.appendChild(PL.el('div', { class: 'text-muted' }, 'Not found.'));
+                return;
+            }
+            renderMemoryDrawer(data.card, data.links || []);
+        }
+
+        function closeMemoryDrawer() {
+            const drawer = document.getElementById('memory-drawer');
+            if (drawer) drawer.open = false;
+        }
+
+        function renderMemoryDrawer(card, links) {
+            const body = document.getElementById('memory-drawer-body');
+            if (!body) return;
+            body.textContent = '';
+            const head = PL.el('div', { class: 'list-item-meta mb-2' });
+            if (card.card_type) head.appendChild(memoryTag('cardtype', card.card_type));
+            if (card.visibility) head.appendChild(memoryTag('visibility', card.visibility));
+            if (card.status === 'competing') head.appendChild(PL.el('span', { class: 'status-pill', dataset: { status: 'competing' } }, 'competing'));
+            if (card.portable) head.appendChild(PL.el('span', { class: 'text-muted' }, 'portable'));
+            body.appendChild(head);
+            body.appendChild(PL.el('div', { class: 'cell-strong mb-3' }, card.fact_text || ''));
+            const meta = PL.el('div', { class: 'mb-3' });
+            const rows = [
+                ['subject', card.subject], ['predicate', card.predicate], ['object', card.object],
+                ['confidence', Number(card.confidence || 0).toFixed(2)], ['salience', Number(card.salience || 0).toFixed(2)],
+                ['observed', `${card.observation_count || 0}×`], ['used', `${card.use_count || 0}×`],
+                ['valid', `${formatDateValue(card.valid_from)} → ${card.valid_until ? formatDateValue(card.valid_until) : 'open'}`],
+                ['recorded', `${formatDateValue(card.recorded_at)}${card.retracted_at ? ' → ' + formatDateValue(card.retracted_at) : ''}`],
+                ['scope', `${card.chat_id || 0} / ${card.thread_id || 0} / ${card.user_id || 0}`]
+            ];
+            rows.forEach((pair) => {
+                if (pair[1] == null || pair[1] === '') return;
+                const row = PL.el('div', { class: 'list-item-meta' });
+                row.appendChild(PL.el('span', { class: 'text-muted' }, pair[0]));
+                row.appendChild(PL.el('span', null, String(pair[1])));
+                meta.appendChild(row);
+            });
+            body.appendChild(meta);
+            const edit = PL.el('div', { class: 'mb-3' });
+            const confSlider = PL.el('pl-slider', { min: '0', max: '100', step: '1', value: String(Math.round((Number(card.confidence) || 0) * 100)), format: 'ratio', label: 'confidence' });
+            const salSlider = PL.el('pl-slider', { min: '0', max: '100', step: '1', value: String(Math.round((Number(card.salience) || 0) * 100)), format: 'ratio', label: 'salience' });
+            const portableToggle = PL.el('pl-toggle', { label: 'portable' });
+            if (card.portable) portableToggle.setAttribute('checked', '');
+            edit.appendChild(confSlider);
+            edit.appendChild(salSlider);
+            edit.appendChild(PL.el('div', { class: 'mt-2' }, portableToggle));
+            const actions = PL.el('pl-button-group', { class: 'mt-3' });
+            const saveBtn = PL.el('pl-button', { variant: 'primary', size: 'sm' }, 'Save');
+            saveBtn.addEventListener('click', async () => {
+                const res = await apiCall('/memory/card', { method: 'PATCH', body: { id: card.id, confidence: confSlider.value / 100, salience: salSlider.value / 100, portable: portableToggle.checked } });
+                if (res) { PL.toast('Saved', 'success'); loadMemoryCards(); openMemoryCard(card.id); }
+            });
+            actions.appendChild(saveBtn);
+            if (card.status === 'deleted') {
+                const restoreBtn = PL.el('pl-button', { variant: 'outline', size: 'sm' }, 'Restore');
+                restoreBtn.addEventListener('click', async () => {
+                    const res = await apiCall('/memory/card', { method: 'PATCH', body: { id: card.id, status: 'active' } });
+                    if (res) { PL.toast('Restored', 'success'); loadMemoryCards(); openMemoryCard(card.id); }
+                });
+                actions.appendChild(restoreBtn);
+            } else {
+                const deleteBtn = PL.el('pl-button', { variant: 'danger', size: 'sm' }, 'Soft-delete');
+                deleteBtn.addEventListener('click', async () => {
+                    const ok = await PL.confirm({ title: 'Soft-delete fact', body: 'Hide this fact from retrieval? It can be restored later.', danger: true, okLabel: 'Soft-delete' });
+                    if (!ok) return;
+                    const res = await apiCall('/memory/card', { method: 'PATCH', body: { id: card.id, status: 'deleted' } });
+                    if (res) { PL.toast('Soft-deleted', 'success'); loadMemoryCards(); closeMemoryDrawer(); }
+                });
+                actions.appendChild(deleteBtn);
+            }
+            edit.appendChild(actions);
+            body.appendChild(edit);
+            if (links.length) {
+                body.appendChild(PL.el('div', { class: 'text-muted mb-2' }, 'connections'));
+                const nodes = [{ id: card.id, label: card.fact_text, card_type: card.card_type, salience: card.salience, competing: card.status === 'competing' }];
+                const edges = [];
+                links.forEach((l) => {
+                    nodes.push({ id: l.peer_card_id, label: l.peer_fact_text, card_type: l.peer_card_type, salience: 0.5 });
+                    edges.push({ from: card.id, to: l.peer_card_id, relation: l.relation, confidence: l.confidence });
+                });
+                const graph = PL.el('pl-graph');
+                body.appendChild(graph);
+                graph.data = { nodes: nodes, edges: edges, center: card.id };
+                graph.addEventListener('pl:node-click', (e) => {
+                    if (e.detail && e.detail.id !== card.id) openMemoryCard(e.detail.id);
+                });
+            }
         }
 
         async function loadMemoryCards() {
@@ -2399,6 +2699,8 @@
             memoryCards = Array.isArray(data?.cards) ? data.cards : [];
             if (meta) meta.textContent = `${memoryCards.length} cards`;
             renderMemoryCards();
+            if (memoryView === 'timeline') renderMemoryTimeline();
+            updateMemoryAsOfLabel();
         }
 
         function renderMemoryCards() {

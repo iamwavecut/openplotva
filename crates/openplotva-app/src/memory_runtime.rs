@@ -140,6 +140,13 @@ pub trait MemoryWriteStore: std::fmt::Debug + Send + Sync {
         new_id: i64,
     ) -> MemoryWriteStoreFuture<'a, (), Self::Error>;
 
+    /// Flag two contradictory cards as competing (both kept so the bot hedges).
+    fn mark_cards_competing<'a>(
+        &'a self,
+        old_id: i64,
+        new_id: i64,
+    ) -> MemoryWriteStoreFuture<'a, (), Self::Error>;
+
     /// Insert the run episode and optional embedding.
     fn insert_episode_with_embedding<'a>(
         &'a self,
@@ -250,6 +257,16 @@ impl MemoryWriteStore for PostgresMemoryStore {
         new_id: i64,
     ) -> MemoryWriteStoreFuture<'a, (), Self::Error> {
         Box::pin(async move { PostgresMemoryStore::supersede_card(self, old_id, new_id).await })
+    }
+
+    fn mark_cards_competing<'a>(
+        &'a self,
+        old_id: i64,
+        new_id: i64,
+    ) -> MemoryWriteStoreFuture<'a, (), Self::Error> {
+        Box::pin(
+            async move { PostgresMemoryStore::mark_cards_competing(self, old_id, new_id).await },
+        )
     }
 
     fn insert_episode_with_embedding<'a>(
@@ -388,6 +405,10 @@ pub struct MemoryExtractionWriteReport {
     pub link_error: Option<String>,
     /// Non-fatal supersession write failures.
     pub supersession_errors: Vec<String>,
+    /// Competing pairs attempted.
+    pub competing: Vec<(i64, i64)>,
+    /// Non-fatal competing write failures.
+    pub competing_errors: Vec<String>,
 }
 
 /// Result of one memory run processing tick.
@@ -2086,6 +2107,8 @@ struct CardExtractionWriteReport {
     card_embedding_error: Option<String>,
     link_error: Option<String>,
     supersession_errors: Vec<String>,
+    competing: Vec<(i64, i64)>,
+    competing_errors: Vec<String>,
 }
 
 async fn write_memory_extraction_cards<ExtractorError, Store, Embedder>(
@@ -2137,10 +2160,26 @@ where
         report.link_error = Some(error.to_string());
     }
 
+    // The model's scored resolutions split into outright supersessions (the new
+    // fact invalidates the old) and competing pairs (both plausible, keep both).
+    // Legacy `supersessions` are treated as supersede for backward compatibility.
+    let mut supersede_inputs = output.supersessions.clone();
+    let mut competing_inputs = Vec::new();
+    for resolution in &output.resolutions {
+        match resolution.decision {
+            openplotva_memory::ResolutionDecision::Competing => {
+                competing_inputs.push(resolution.as_supersession());
+            }
+            openplotva_memory::ResolutionDecision::Supersede => {
+                supersede_inputs.push(resolution.as_supersession());
+            }
+        }
+    }
+
     report.superseded = openplotva_memory::supersession_pairs_from_extraction(
         &cards,
         &report.card_ids,
-        &output.supersessions,
+        &supersede_inputs,
     );
     for (old_id, new_id) in &report.superseded {
         match store.supersede_card(*old_id, *new_id).await {
@@ -2148,6 +2187,20 @@ where
             Err(error) => report
                 .supersession_errors
                 .push(format!("{old_id}->{new_id}: {error}")),
+        }
+    }
+
+    report.competing = openplotva_memory::supersession_pairs_from_extraction(
+        &cards,
+        &report.card_ids,
+        &competing_inputs,
+    );
+    for (old_id, new_id) in &report.competing {
+        match store.mark_cards_competing(*old_id, *new_id).await {
+            Ok(()) => report.stats.cards_competing += 1,
+            Err(error) => report
+                .competing_errors
+                .push(format!("{old_id}<>{new_id}: {error}")),
         }
     }
 
@@ -2161,9 +2214,11 @@ fn merge_card_report(
     report.stats.cards_inserted += card_report.stats.cards_inserted;
     report.stats.cards_updated += card_report.stats.cards_updated;
     report.stats.cards_superseded += card_report.stats.cards_superseded;
+    report.stats.cards_competing += card_report.stats.cards_competing;
     report.card_ids.extend(card_report.card_ids);
     report.links_inserted += card_report.links_inserted;
     report.superseded.extend(card_report.superseded);
+    report.competing.extend(card_report.competing);
     if report.card_embedding_error.is_none() {
         report.card_embedding_error = card_report.card_embedding_error;
     }
@@ -2173,6 +2228,7 @@ fn merge_card_report(
     report
         .supersession_errors
         .extend(card_report.supersession_errors);
+    report.competing_errors.extend(card_report.competing_errors);
 }
 
 async fn insert_memory_episode<ExtractorError, Store, Embedder>(
@@ -3183,6 +3239,14 @@ mod tests {
             })
         }
 
+        fn mark_cards_competing<'a>(
+            &'a self,
+            _old_id: i64,
+            _new_id: i64,
+        ) -> MemoryWriteStoreFuture<'a, (), Self::Error> {
+            Box::pin(async move { Ok(()) })
+        }
+
         fn insert_episode_with_embedding<'a>(
             &'a self,
             episode: Episode,
@@ -3946,6 +4010,13 @@ mod tests {
                 new_fact_text: "Bob likes Rust".to_owned(),
                 reason: "new".to_owned(),
             }],
+            resolutions: vec![openplotva_memory::Resolution {
+                old_card_id: 88,
+                new_fact_text: "Alice likes Rust".to_owned(),
+                decision: openplotva_memory::ResolutionDecision::Competing,
+                conflict_score: 0.5,
+                reason: "both plausible".to_owned(),
+            }],
             input_tokens: 11,
             output_tokens: 12,
         };
@@ -3979,6 +4050,9 @@ mod tests {
         assert_eq!(report.card_ids, vec![101, 102]);
         assert_eq!(report.links_inserted, 1);
         assert_eq!(report.superseded, vec![(77, 102)]);
+        // A competing resolution keeps both facts (new fact resolves to card 101).
+        assert_eq!(report.competing, vec![(88, 101)]);
+        assert_eq!(report.stats.cards_competing, 1);
         assert_eq!(
             store
                 .card_embedding_slots
@@ -4749,6 +4823,7 @@ mod tests {
             use_count: 0,
             created_at: None,
             updated_at: None,
+            ..Card::default()
         }
     }
 }

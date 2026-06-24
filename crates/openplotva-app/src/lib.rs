@@ -683,6 +683,8 @@ fn install_static_web_routes(router: axum::Router, static_web: StaticWebRoutes) 
         .route("/admin/api/memory/cards", any(admin_memory_cards))
         .route("/admin/api/memory/runs", any(admin_memory_runs))
         .route("/admin/api/memory/restart", any(admin_memory_restart))
+        .route("/admin/api/memory/card", any(admin_memory_card))
+        .route("/admin/api/memory/overview", any(admin_memory_overview))
         .route("/admin/api/shield/documents", any(admin_shield_documents))
         .route(
             "/admin/api/shield/embeddings/rebuild",
@@ -752,6 +754,8 @@ const GO_ADMIN_API_ROUTE_PATTERNS: &[&str] = &[
     "/admin/api/memory/cards",
     "/admin/api/memory/runs",
     "/admin/api/memory/restart",
+    "/admin/api/memory/card",
+    "/admin/api/memory/overview",
     "/admin/api/shield/documents",
     "/admin/api/shield/embeddings/rebuild",
     "/admin/api/shield/test",
@@ -1033,6 +1037,27 @@ async fn admin_memory_cards(
     Extension(routes): Extension<StaticWebRoutes>,
 ) -> Response {
     admin_memory_cards_response(&routes, method, &headers, raw_query.as_deref()).await
+}
+
+async fn admin_memory_card(
+    method: Method,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Extension(routes): Extension<StaticWebRoutes>,
+    body: Bytes,
+) -> Response {
+    admin_memory_card_response(&routes, method, &headers, raw_query.as_deref(), &body).await
+}
+
+async fn admin_memory_overview(
+    method: Method,
+    headers: HeaderMap,
+    Extension(routes): Extension<StaticWebRoutes>,
+) -> Response {
+    if method != Method::GET {
+        return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+    }
+    admin_memory_overview_response(&routes, &headers).await
 }
 
 async fn admin_memory_runs(
@@ -3666,6 +3691,145 @@ async fn admin_memory_cards_response(
     }
 }
 
+async fn admin_memory_card_response(
+    routes: &StaticWebRoutes,
+    method: Method,
+    headers: &HeaderMap,
+    raw_query: Option<&str>,
+    body: &[u8],
+) -> Response {
+    match method {
+        Method::GET => admin_memory_card_detail_response(routes, headers, raw_query).await,
+        Method::PATCH => admin_memory_card_update_response(routes, headers, body).await,
+        _ => admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed"),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct MemoryCardUpdate {
+    #[serde(default)]
+    id: i64,
+    #[serde(default)]
+    confidence: Option<f64>,
+    #[serde(default)]
+    salience: Option<f64>,
+    #[serde(default)]
+    portable: Option<bool>,
+    #[serde(default)]
+    status: Option<String>,
+}
+
+async fn admin_memory_card_update_response(
+    routes: &StaticWebRoutes,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Response {
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids, &routes.bot_token) {
+        return admin_auth_failure_response(error);
+    }
+    let req: MemoryCardUpdate = match serde_json::from_slice(body) {
+        Ok(req) => req,
+        Err(_) => return admin_error_response(StatusCode::BAD_REQUEST, "invalid body"),
+    };
+    if req.id == 0 {
+        return admin_error_response(StatusCode::BAD_REQUEST, "id required");
+    }
+    let Some(store) = routes
+        .memory_store
+        .as_ref()
+        .filter(|_| routes.memory_admin_enabled)
+    else {
+        return admin_error_response(StatusCode::SERVICE_UNAVAILABLE, "memory disabled");
+    };
+    let confidence = req.confidence.map(|v| v.clamp(0.0, 1.0));
+    let salience = req.salience.map(|v| v.clamp(0.0, 1.0));
+    if confidence.is_some() || salience.is_some() || req.portable.is_some() {
+        if let Err(error) = store
+            .update_card_fields(req.id, confidence, salience, req.portable)
+            .await
+        {
+            tracing::warn!(%error, id = req.id, "failed to update memory card fields");
+            return admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed");
+        }
+    }
+    if let Some(status) = req.status.as_deref() {
+        let result = match status {
+            "deleted" => {
+                store
+                    .soft_delete_card(req.id, current_admin_user_id(headers, &routes.bot_token))
+                    .await
+            }
+            "active" => store.restore_card(req.id).await,
+            _ => Ok(()),
+        };
+        if let Err(error) = result {
+            tracing::warn!(%error, id = req.id, "failed to change memory card status");
+            return admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed");
+        }
+    }
+    admin_json_response(StatusCode::OK, serde_json::json!({ "ok": true }))
+}
+
+async fn admin_memory_card_detail_response(
+    routes: &StaticWebRoutes,
+    headers: &HeaderMap,
+    raw_query: Option<&str>,
+) -> Response {
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids, &routes.bot_token) {
+        return admin_auth_failure_response(error);
+    }
+    let id = match admin_memory_required_id(raw_query, "id required") {
+        Ok(id) => id,
+        Err(response) => return *response,
+    };
+    let Some(store) = routes
+        .memory_store
+        .as_ref()
+        .filter(|_| routes.memory_admin_enabled)
+    else {
+        return admin_json_response(
+            StatusCode::OK,
+            serde_json::json!({ "card": serde_json::Value::Null, "links": [] }),
+        );
+    };
+    let card = match store.get_card(id).await {
+        Ok(Some(card)) => card,
+        Ok(None) => return admin_error_response(StatusCode::NOT_FOUND, "not found"),
+        Err(error) => {
+            tracing::warn!(%error, id, "failed to load admin memory card");
+            return admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed");
+        }
+    };
+    let links = store.list_card_links(id).await.unwrap_or_default();
+    admin_json_response(
+        StatusCode::OK,
+        serde_json::json!({ "card": card, "links": links }),
+    )
+}
+
+async fn admin_memory_overview_response(routes: &StaticWebRoutes, headers: &HeaderMap) -> Response {
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids, &routes.bot_token) {
+        return admin_auth_failure_response(error);
+    }
+    let Some(store) = routes
+        .memory_store
+        .as_ref()
+        .filter(|_| routes.memory_admin_enabled)
+    else {
+        return admin_json_response(StatusCode::OK, serde_json::json!({}));
+    };
+    match store.memory_overview().await {
+        Ok(overview) => admin_json_response(
+            StatusCode::OK,
+            serde_json::to_value(&overview).unwrap_or(serde_json::Value::Null),
+        ),
+        Err(error) => {
+            tracing::warn!(%error, "failed to load admin memory overview");
+            admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed")
+        }
+    }
+}
+
 async fn admin_memory_cards_list_response(
     routes: &StaticWebRoutes,
     headers: &HeaderMap,
@@ -4160,6 +4324,21 @@ fn admin_memory_card_filter(raw_query: Option<&str>) -> openplotva_memory::CardF
             .get("status")
             .map(|value| value.trim().to_owned())
             .unwrap_or_default(),
+        card_type: values
+            .get("card_type")
+            .map(|value| value.trim().to_owned())
+            .unwrap_or_default(),
+        visibility: values
+            .get("visibility")
+            .map(|value| value.trim().to_owned())
+            .unwrap_or_default(),
+        as_of: values.get("as_of").and_then(|value| {
+            time::OffsetDateTime::parse(
+                value.trim(),
+                &time::format_description::well_known::Rfc3339,
+            )
+            .ok()
+        }),
         limit: parse_memory_limit(values.get("limit").map(String::as_str)) as i32,
     }
 }
@@ -13787,6 +13966,8 @@ mod tests {
                 "/admin/api/memory/cards",
                 "/admin/api/memory/runs",
                 "/admin/api/memory/restart",
+                "/admin/api/memory/card",
+                "/admin/api/memory/overview",
                 "/admin/api/shield/documents",
                 "/admin/api/shield/embeddings/rebuild",
                 "/admin/api/shield/test",

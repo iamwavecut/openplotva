@@ -111,7 +111,7 @@ Three tiers. Components reference **only** the semantic/extended tiers.
 |---|---|---|---|
 | Primitive | `--p-*` | Raw, theme-agnostic palette. Never referenced by components. | `--p-slate-900`, `--p-indigo-500`, `--p-cyan-400`, `--p-red-500` |
 | Semantic | `--c-*`, `--sp-*`, `--rad-*`, `--fs-*`, `--fw-*`, `--lh-*`, `--elev-*`, `--dur-*`, `--ease-*`, `--z-*` | Meaning-based aliases — the vocabulary components use. | `--c-bg-card`, `--c-primary`, `--c-danger`, `--c-text-main`, `--c-focus-ring`, `--sp-4`, `--rad-md`, `--fs-base`, `--elev-2`, `--z-modal` |
-| Extended | `--c-json-*`, `--c-log-*`, `--c-status-*`, `--c-shield-*`, `--grad-*` | Domain palettes (syntax highlighting, log levels, status dots, shield categories, brand gradients). | `--c-log-error`, `--c-status-ok`, `--c-shield-red`, `--grad-brand` |
+| Extended | `--c-json-*`, `--c-log-*`, `--c-status-*`, `--c-shield-*`, `--c-cardtype-*`, `--c-relation-*`, `--c-visibility-*`, `--grad-*` | Domain palettes (syntax highlighting, log levels, status dots, shield categories, memory card-type/relation/visibility categories, brand gradients). | `--c-log-error`, `--c-status-ok`, `--c-shield-red`, `--c-cardtype-event`, `--c-relation-contradicts`, `--grad-brand` |
 
 Token families:
 
@@ -149,6 +149,10 @@ working — tokens were only added, never renamed.
 | `pl-table` | JS string-built `<table>` | JS props `columns` (`{key,label,sortable,mono,num,render}`) and `rows`; `state=idle\|loading\|empty\|error`; `row-clickable`, `dense`; `emptyTitle`/`emptyDesc`/`onRetry`; `showError(msg)`; emits `pl:row-click`/`pl:sort` | internal text-node escaping (kills the manual `escapeHtml` bug class); skeleton rows / empty / error+retry; `aria-sort`, keyboard-reachable sortable headers + clickable rows |
 | `pl-modal` | `.loader-overlay` + native `confirm()` | imperative via `PL.alert`/`PL.confirm`; declarative `open` | `role=dialog`, `aria-modal`, focus trap, Esc/backdrop close, focus restore |
 | `pl-toast-host` | — | singleton container | `aria-live`; hosts toasts |
+| `pl-slider` | raw `<input type=range>` | attrs `min/max/step/value/label/format(ratio\|int)/disabled`; `.value` get/set; emits `pl:input`/`pl:change` | inner native range (id moved onto it like `pl-input`); live readout; focus ring |
+| `pl-drawer` | ad-hoc detail panes | normal-flow slide-in panel (no `position:fixed`); `.open` get/set; emits `pl:close` | Esc closes when open; `.pl-drawer-head`/`-body` slots |
+| `pl-graph` | — (memory graph) | JS prop `data = {nodes:[{id,label,card_type,salience,competing}], edges:[{from,to,relation,confidence}], center}`; emits `pl:node-click {id}` | SVG one-hop neighbourhood; node fill `--c-cardtype-*`, r∝salience, competing ring; edge `--c-relation-*`, width∝confidence; `role=img` |
+| `pl-timeline` | — (bitemporal) | JS prop `data = {lanes:[{key,label}], items:[{id,lane,label,card_type,validFrom,validUntil,recordedAt,status,competing}], now, asOf}`; emits `pl:item-click {id}`, `pl:asof-change {date}` | SVG swimlanes; valid bars, recorded markers, superseded muted, competing ring, now + as-of lines; click-to-set as-of; `role=img` |
 
 Actions are wired by **event delegation**: a single document listener maps `[data-action="fn"]`
 (optionally `data-args='[...]'`, `data-confirm="…"`) to a global function, awaiting promises and
@@ -161,7 +165,9 @@ Static surfaces stay as classes used on plain elements: `.card`/`.card-header`/`
 `.badge-*`/`.status-pill[data-status]`, `.skeleton`/`.skeleton-row`/`.skeleton-text` (shimmer),
 `.empty-state`/`.error-state`, `.spinner`/`.inline-spinner`, layout grids, `.split-pane`/`.pane-*`,
 `.json-tree*`, plus token-backed content utilities (`.cell-strong`, `.detail-pre`, `.list-item-meta`,
-`.w-narrow/.w-xs/.w-range`, `.card-inset`, …). Global interaction states (`:focus-visible` rings via
+`.w-narrow/.w-xs/.w-range`, `.card-inset`, …). The Memory section adds `.metric-card`, `.bar-row`,
+`.meter`, `.facet-bar`/`.filter-chip`, and categorical `.tag--cardtype/--relation/--visibility[data-value]`
+(coloured from the `--c-cardtype/relation/visibility-*` tokens). Global interaction states (`:focus-visible` rings via
 `--c-focus-ring`, `[disabled]`, hover transitions) and `prefers-reduced-motion` handling are defined
 once here.
 

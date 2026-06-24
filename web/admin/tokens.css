@@ -36,6 +36,8 @@
     --p-orange-400: #fb923c;
     --p-violet-400: #a78bfa;
     --p-sky-500: #0ea5e9;
+    --p-pink-400: #f472b6;
+    --p-teal-400: #2dd4bf;
 
     /* ============================================================
        SEMANTIC: scale (theme-agnostic)
@@ -203,6 +205,34 @@
     --c-status-warn: #f1c40f;
     --c-status-err: #e74c3c;
     --c-status-idle: var(--p-slate-400);
+    /* Memory: competing conflict status */
+    --c-status-competing: var(--p-orange-400);
+
+    /* Memory: card-type categories (property names match the DB enum spellings) */
+    --c-cardtype-preference: var(--p-indigo-500);
+    --c-cardtype-identity: var(--p-cyan-400);
+    --c-cardtype-project: var(--p-green-500);
+    --c-cardtype-decision: var(--p-violet-400);
+    --c-cardtype-relationship: var(--p-pink-400);
+    --c-cardtype-recurring_topic: var(--p-amber-500);
+    --c-cardtype-joke: var(--p-orange-400);
+    --c-cardtype-warning: var(--p-red-400);
+    --c-cardtype-technical_fact: var(--p-sky-500);
+    --c-cardtype-event: var(--p-teal-400);
+
+    /* Memory: link relations */
+    --c-relation-supports: var(--p-green-500);
+    --c-relation-contradicts: var(--p-red-400);
+    --c-relation-same_topic: var(--p-sky-500);
+    --c-relation-supersedes: var(--p-violet-400);
+    --c-relation-mentions_same_entity: var(--p-slate-400);
+
+    /* Memory: visibility scopes */
+    --c-visibility-chat: var(--p-sky-500);
+    --c-visibility-chat_user: var(--p-cyan-400);
+    --c-visibility-public_user: var(--p-amber-500);
+    --c-visibility-private_chat: var(--p-violet-400);
+    --c-visibility-thread: var(--p-pink-400);
 
     /* JSON syntax highlighting (One Dark palette) */
     --c-json-key: #e06c75;
