@@ -8231,6 +8231,33 @@ mod tests {
     }
 
     #[test]
+    fn last_message_wrapper_embeds_prerendered_block_without_re_escaping() {
+        // `message` is a pre-rendered, already-single-escaped XML block, exactly
+        // as format_message_body produces for the current turn. The wrapper must
+        // embed it verbatim, never HTML-escape it a second time.
+        let block = "<message id=\"7\">\n  <original>A &amp; B &lt; C</original>\n</message>";
+        let rendered =
+            openplotva_prompts::render("aifarm/last_message_wrapper", &json!({ "message": block }))
+                .expect("render last_message_wrapper");
+        assert!(
+            !rendered.contains("&amp;amp;"),
+            "ampersand was re-escaped: {rendered}"
+        );
+        assert!(
+            !rendered.contains("&amp;lt;"),
+            "&lt; was re-escaped: {rendered}"
+        );
+        assert!(
+            !rendered.contains("&lt;message"),
+            "structural <message> tag was escaped: {rendered}"
+        );
+        assert!(
+            rendered.contains(block),
+            "wrapper must embed the pre-rendered block verbatim: {rendered}"
+        );
+    }
+
+    #[test]
     fn system_prompt_includes_tool_catalog() -> Result<(), AifarmMessageError> {
         let prompt = build_system_prompt_with_tool_prompt(&base_input(), ToolPromptMode::Native)?;
 
