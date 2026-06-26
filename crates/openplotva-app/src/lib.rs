@@ -9126,6 +9126,11 @@ async fn start_runtime_workers(
     {
         tracing::warn!(%error, "failed to backfill GPU Qwen models into routing tables");
     }
+    if let Err(error) =
+        model_routing::backfill_genkit_flash_model(&service_clients.postgres, config).await
+    {
+        tracing::warn!(%error, "failed to correct genkit dialog fallback model");
+    }
     match openplotva_storage::llm_routing::load_snapshot(&service_clients.postgres).await {
         Ok(snapshot) => model_routing::init_routing_resolver(&snapshot),
         Err(error) => {
@@ -10247,6 +10252,11 @@ async fn start_runtime_workers(
     if let Err(error) = model_routing::backfill_gpu_models(&service_clients.postgres, config).await
     {
         tracing::warn!(%error, "failed to backfill GPU Qwen models into routing tables");
+    }
+    if let Err(error) =
+        model_routing::backfill_genkit_flash_model(&service_clients.postgres, config).await
+    {
+        tracing::warn!(%error, "failed to correct genkit dialog fallback model");
     }
     let router_handle = match model_routing::load_routing_table(&service_clients.postgres).await {
         Ok(table) => openplotva_llm::router::RouterHandle::new(table),

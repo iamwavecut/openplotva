@@ -20,7 +20,7 @@ use openplotva_storage::llm_routing::{
     AssignmentInput, AssignmentRecord, ModelInput, ModelRecord, ProviderInput, RoutingSnapshot,
     TriggerInput, TriggerRecord, WorkflowRecord, insert_assignment, insert_model, insert_provider,
     insert_trigger, list_assignments, list_models, list_providers, load_snapshot,
-    update_assignment,
+    update_assignment, update_model,
 };
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -243,9 +243,11 @@ async fn seed_primary(
 /// big-bang cutover is behavior-neutral. Guarded by `app_settings['llm.routing.seeded']`;
 /// returns `Ok(true)` if it seeded, `Ok(false)` if already seeded. Reproduces the
 /// current dialog behavior (aifarm primary, genkit fallback, genkit overflow at the
-/// 30/20 watermark) and seeds a primary for every other workflow. A `gemini`
-/// provider with `gemini-2.5-flash` is seeded but unassigned so an operator can
-/// switch the dialog overflow to it from the admin panel in one step.
+/// 30/20 watermark) and seeds a primary for every other workflow. The genkit fallback
+/// model mirrors `genkit_runtime_default_model` (the flash-lite default every other
+/// genkit flow already uses), never the heavier `gemini-2.5-flash`. A `gemini` provider
+/// mirroring that model is seeded but unassigned so an operator can switch the dialog
+/// overflow to it from the admin panel in one step.
 pub async fn seed_routing_from_env(
     pool: &PgPool,
     config: &AppConfig,
@@ -276,10 +278,13 @@ pub async fn seed_routing_from_env(
     )
     .await?;
 
+    // The genkit dialog fallback uses the same model every other genkit flow resolves to
+    // (flash-lite by default), so the cutover never introduces the heavier gemini-2.5-flash.
+    let genkit_default = crate::memory_runtime::genkit_runtime_default_model(config);
     let genkit_model = seed_provider_model(
         pool,
         chat_provider("genkit", "GOOGLEAI_KEY", None),
-        "gemini-2.5-flash",
+        genkit_default.as_str(),
         None,
         &["chat", "tools"],
         None,
@@ -290,7 +295,7 @@ pub async fn seed_routing_from_env(
     let _gemini_model = seed_provider_model(
         pool,
         chat_provider("gemini", "GOOGLEAI_KEY", None),
-        "gemini-2.5-flash",
+        genkit_default.as_str(),
         None,
         &["chat", "tools"],
         None,
@@ -681,6 +686,70 @@ pub async fn backfill_gpu_models(pool: &PgPool, config: &AppConfig) -> Result<bo
 
     mark_app_setting(pool, GPU_BACKFILL_KEY).await?;
     tracing::info!("backfilled GPU Qwen models and repointed config-only workflows");
+    Ok(true)
+}
+
+const GENKIT_FLASH_FIX_KEY: &str = "llm.routing.genkit_flash_fixed";
+
+/// The non-lite model the original seed wrongly hardcoded for the dialog genkit fallback.
+const STALE_GENKIT_FLASH_MODEL: &str = "gemini-2.5-flash";
+
+fn model_input_from_record(record: &ModelRecord, model_name: String) -> ModelInput {
+    ModelInput {
+        provider_id: record.provider_id,
+        model_name,
+        display_name: record.display_name.clone(),
+        base_url: record.base_url.clone(),
+        capabilities: record.capabilities.clone(),
+        embedding_dim: record.embedding_dim,
+        enabled: record.enabled,
+        config: record.config.clone(),
+    }
+}
+
+/// Correct the dialog genkit fallback/overflow model that the original seed hardcoded to
+/// the heavier `gemini-2.5-flash`. Every other genkit flow resolves its model via
+/// `genkit_runtime_default_model` (flash-lite by default), so an already-seeded database
+/// keeps serving `gemini-2.5-flash` on dialog fallback while the rest of the bot uses
+/// flash-lite. This repoints the `genkit`/`gemini` provider models to the canonical value.
+/// Idempotent via the `genkit_flash_fixed` flag; behavior-neutral on a fresh DB because the
+/// seed now writes the correct model directly.
+pub async fn backfill_genkit_flash_model(
+    pool: &PgPool,
+    config: &AppConfig,
+) -> Result<bool, StorageError> {
+    if app_setting_present(pool, GENKIT_FLASH_FIX_KEY).await? {
+        return Ok(false);
+    }
+    let canonical = crate::memory_runtime::genkit_runtime_default_model(config);
+    if canonical.trim().is_empty() || canonical == STALE_GENKIT_FLASH_MODEL {
+        return Ok(false);
+    }
+    let provider_ids: std::collections::HashSet<i64> = list_providers(pool)
+        .await?
+        .into_iter()
+        .filter(|p| p.name == "genkit" || p.name == "gemini")
+        .map(|p| p.id)
+        .collect();
+    let mut fixed = 0usize;
+    for model in list_models(pool).await? {
+        if provider_ids.contains(&model.provider_id) && model.model_name == STALE_GENKIT_FLASH_MODEL
+        {
+            update_model(
+                pool,
+                model.id,
+                &model_input_from_record(&model, canonical.clone()),
+            )
+            .await?;
+            fixed += 1;
+        }
+    }
+    mark_app_setting(pool, GENKIT_FLASH_FIX_KEY).await?;
+    tracing::info!(
+        fixed,
+        canonical = %canonical,
+        "corrected genkit dialog fallback off gemini-2.5-flash"
+    );
     Ok(true)
 }
 
