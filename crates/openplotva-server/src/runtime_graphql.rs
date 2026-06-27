@@ -120,6 +120,14 @@ pub trait RuntimeLlmTraceInspector: Send + Sync {
     ) -> Result<Vec<RuntimeLlmRequestData>, String>;
 }
 
+/// Runtime API LLM routing event read boundary.
+pub trait RuntimeRoutingEventInspector: Send + Sync {
+    fn routing_events(
+        &self,
+        filter: RuntimeRoutingEventsFilter,
+    ) -> Result<Vec<RuntimeRoutingEventData>, String>;
+}
+
 /// Runtime API LLM analytics read boundary.
 pub trait RuntimeLlmAnalyticsReader: Send + Sync {
     fn llm_analytics<'a>(&'a self, range: &'a str) -> RuntimeLlmAnalyticsReaderFuture<'a>;
@@ -185,6 +193,7 @@ pub struct RuntimeApiLiveDiagnostics {
     pub pending_ops_reader: Option<Arc<dyn RuntimePendingOpsReader>>,
     pub safety_check_reader: Option<Arc<dyn RuntimeSafetyCheckReader>>,
     pub llm_trace_inspector: Option<Arc<dyn RuntimeLlmTraceInspector>>,
+    pub routing_event_inspector: Option<Arc<dyn RuntimeRoutingEventInspector>>,
     pub llm_analytics_reader: Option<Arc<dyn RuntimeLlmAnalyticsReader>>,
     pub log_inspector: Option<Arc<dyn RuntimeLogInspector>>,
     pub taskman_inspector: Option<Arc<dyn RuntimeTaskmanInspector>>,
@@ -683,6 +692,35 @@ pub struct RuntimeLlmRequestsFilter {
     pub limit: i32,
 }
 
+/// Runtime API LLM routing event filter after GraphQL/default shaping.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeRoutingEventsFilter {
+    pub q: String,
+    pub workflow_key: String,
+    pub event_type: String,
+    pub limit: i32,
+}
+
+/// Runtime API LLM routing event.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RuntimeRoutingEventData {
+    pub id: i64,
+    pub at: String,
+    pub severity: String,
+    pub event_type: String,
+    pub workflow_key: String,
+    pub provider_id: Option<i64>,
+    pub model_id: Option<i64>,
+    pub queue_name: Option<String>,
+    pub job_id: Option<i64>,
+    pub chat_id: Option<i64>,
+    pub thread_id: Option<i32>,
+    pub message_id: Option<i32>,
+    pub dedupe_key: String,
+    pub summary: String,
+    pub detail: Value,
+}
+
 /// Runtime API LLM request trace.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RuntimeLlmRequestData {
@@ -1034,6 +1072,7 @@ pub fn runtime_api_graphql_schema_with_live_diagnostics(
             pending_ops_reader: diagnostics.pending_ops_reader,
             safety_check_reader: diagnostics.safety_check_reader,
             llm_trace_inspector: diagnostics.llm_trace_inspector,
+            routing_event_inspector: diagnostics.routing_event_inspector,
             llm_analytics_reader: diagnostics.llm_analytics_reader,
             log_inspector: diagnostics.log_inspector,
             taskman_inspector: diagnostics.taskman_inspector,
@@ -1058,6 +1097,7 @@ pub struct RuntimeQuery {
     pending_ops_reader: Option<Arc<dyn RuntimePendingOpsReader>>,
     safety_check_reader: Option<Arc<dyn RuntimeSafetyCheckReader>>,
     llm_trace_inspector: Option<Arc<dyn RuntimeLlmTraceInspector>>,
+    routing_event_inspector: Option<Arc<dyn RuntimeRoutingEventInspector>>,
     llm_analytics_reader: Option<Arc<dyn RuntimeLlmAnalyticsReader>>,
     log_inspector: Option<Arc<dyn RuntimeLogInspector>>,
     taskman_inspector: Option<Arc<dyn RuntimeTaskmanInspector>>,
@@ -1272,6 +1312,19 @@ impl RuntimeQuery {
             .map_err(async_graphql::Error::new)
     }
 
+    async fn llm_routing_events(
+        &self,
+        filter: Option<RoutingEventsFilterInput>,
+    ) -> async_graphql::Result<Vec<RoutingEvent>> {
+        let Some(inspector) = self.routing_event_inspector.as_deref() else {
+            return Ok(Vec::new());
+        };
+        inspector
+            .routing_events(routing_events_filter_from_input(filter))
+            .map(|items| items.into_iter().map(RoutingEvent::from).collect())
+            .map_err(async_graphql::Error::new)
+    }
+
     async fn llm_analytics(&self, range: Option<String>) -> async_graphql::Result<LlmAnalytics> {
         let Some(reader) = self.llm_analytics_reader.as_deref() else {
             return Err("runtime LLM analytics reader is not configured".into());
@@ -1475,6 +1528,23 @@ fn llm_requests_filter_from_input(
         user_id: parse_optional_id(input.user_id, "userID")?,
         limit: clamp_positive_range_i32(input.limit.unwrap_or(0), 100, 1000),
     })
+}
+
+fn routing_events_filter_from_input(
+    input: Option<RoutingEventsFilterInput>,
+) -> RuntimeRoutingEventsFilter {
+    let Some(input) = input else {
+        return RuntimeRoutingEventsFilter {
+            limit: 100,
+            ..RuntimeRoutingEventsFilter::default()
+        };
+    };
+    RuntimeRoutingEventsFilter {
+        q: trim_optional(input.q),
+        workflow_key: trim_optional(input.workflow_key),
+        event_type: trim_optional(input.event_type),
+        limit: clamp_positive_range_i32(input.limit.unwrap_or(0), 100, 1000),
+    }
 }
 
 fn clamp_non_negative_i32(value: i32) -> i32 {
@@ -1763,6 +1833,17 @@ struct LlmRequestsFilterInput {
     chat_id: Option<ID>,
     #[graphql(name = "userID")]
     user_id: Option<ID>,
+    limit: Option<i32>,
+}
+
+#[derive(InputObject)]
+#[allow(dead_code)]
+struct RoutingEventsFilterInput {
+    q: Option<String>,
+    #[graphql(name = "workflowKey")]
+    workflow_key: Option<String>,
+    #[graphql(name = "eventType")]
+    event_type: Option<String>,
     limit: Option<i32>,
 }
 
@@ -2582,6 +2663,53 @@ impl From<RuntimeLlmRequestData> for LlmRequest {
             docs_chars: request.docs_chars,
             duration_ms: request.duration_ms,
             result: LlmRequestResult::from(request.result),
+        }
+    }
+}
+
+#[derive(Clone, SimpleObject)]
+struct RoutingEvent {
+    id: ID,
+    at: String,
+    severity: String,
+    event_type: String,
+    workflow_key: String,
+    #[graphql(name = "providerID")]
+    provider_id: Option<ID>,
+    #[graphql(name = "modelID")]
+    model_id: Option<ID>,
+    queue_name: Option<String>,
+    #[graphql(name = "jobID")]
+    job_id: Option<ID>,
+    #[graphql(name = "chatID")]
+    chat_id: Option<ID>,
+    #[graphql(name = "threadID")]
+    thread_id: Option<i32>,
+    #[graphql(name = "messageID")]
+    message_id: Option<i32>,
+    dedupe_key: String,
+    summary: String,
+    detail: Json<Value>,
+}
+
+impl From<RuntimeRoutingEventData> for RoutingEvent {
+    fn from(event: RuntimeRoutingEventData) -> Self {
+        Self {
+            id: ID(event.id.to_string()),
+            at: event.at,
+            severity: event.severity,
+            event_type: event.event_type,
+            workflow_key: event.workflow_key,
+            provider_id: event.provider_id.map(|id| ID(id.to_string())),
+            model_id: event.model_id.map(|id| ID(id.to_string())),
+            queue_name: event.queue_name,
+            job_id: event.job_id.map(|id| ID(id.to_string())),
+            chat_id: event.chat_id.map(|id| ID(id.to_string())),
+            thread_id: event.thread_id,
+            message_id: event.message_id,
+            dedupe_key: event.dedupe_key,
+            summary: event.summary,
+            detail: Json(event.detail),
         }
     }
 }

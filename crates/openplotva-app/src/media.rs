@@ -5,14 +5,17 @@ use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 use openplotva_config::AppConfig;
 use openplotva_dialog::{PROVIDER_AIFARM, PROVIDER_NVIDIA, PROVIDER_VMLX};
 use openplotva_llm::aifarm::{
-    AifarmClientConfig, AifarmDialogConfig, AifarmHttpTransport, AifarmPoolConfig,
-    AifarmStructuredJsonConfig, AifarmStructuredJsonGenerator, ReqwestAifarmTransport,
-    StatusUpdate,
+    AifarmClientConfig, AifarmDialogConfig, AifarmHttpTransport, AifarmStructuredJsonConfig,
+    AifarmStructuredJsonGenerator, ReqwestAifarmTransport, StatusUpdate,
 };
 use openplotva_llm::gemini::{GeminiMediaPromptOptimizer, GeminiMediaPromptOptimizerConfig};
+use openplotva_llm::retry::{FailureReason, retryable_reason_from_message};
 use openplotva_media::{ImageEditOptimize, ImageOptimize, OptimizePromptOptions};
 use thiserror::Error;
 
+use crate::routed_attempts::{
+    RoutedAttempt, RoutedAttemptRunError, RoutedAttemptWalker, RoutedRequestContext,
+};
 use crate::runtime_gemini_cache::resolve_google_ai_key;
 
 const OPENROUTER_MODEL_PREFIX: &str = "openrouter/";
@@ -175,6 +178,189 @@ where
                     }),
             }
         })
+    }
+}
+
+#[derive(Clone)]
+pub struct RoutedMediaPromptOptimizer {
+    walker: RoutedAttemptWalker,
+    config: AppConfig,
+}
+
+impl RoutedMediaPromptOptimizer {
+    #[must_use]
+    pub fn new(walker: RoutedAttemptWalker, config: &AppConfig) -> Self {
+        Self {
+            walker,
+            config: config.clone(),
+        }
+    }
+}
+
+impl MediaPromptOptimizer for RoutedMediaPromptOptimizer {
+    fn optimize_image_prompt<'a>(
+        &'a self,
+        text: &'a str,
+        options: OptimizePromptOptions,
+    ) -> ImagePromptOptimizeFuture<'a> {
+        Box::pin(async move {
+            let config = self.config.clone();
+            let text = text.to_owned();
+            let result = self
+                .walker
+                .run(
+                    routed_media_context(),
+                    move |attempt| {
+                        let config = config.clone();
+                        let text = text.clone();
+                        async move {
+                            let optimizer = media_optimizer_for_attempt(&config, &attempt)?;
+                            optimizer.optimize_image_prompt(&text, options).await
+                        }
+                    },
+                    media_optimizer_retryable_reason,
+                )
+                .await;
+            match result {
+                Ok(value) => Ok(value),
+                Err(RoutedAttemptRunError::Attempt(error)) => Err(error),
+                Err(RoutedAttemptRunError::Routing(error)) => {
+                    Err(MediaPromptOptimizerError::Provider(error.to_string()))
+                }
+            }
+        })
+    }
+
+    fn optimize_image_edit_prompt<'a>(
+        &'a self,
+        text: &'a str,
+        options: OptimizePromptOptions,
+    ) -> ImageEditPromptOptimizeFuture<'a> {
+        Box::pin(async move {
+            let config = self.config.clone();
+            let text = text.to_owned();
+            let result = self
+                .walker
+                .run(
+                    routed_media_context(),
+                    move |attempt| {
+                        let config = config.clone();
+                        let text = text.clone();
+                        async move {
+                            let optimizer = media_optimizer_for_attempt(&config, &attempt)?;
+                            optimizer.optimize_image_edit_prompt(&text, options).await
+                        }
+                    },
+                    media_optimizer_retryable_reason,
+                )
+                .await;
+            match result {
+                Ok(value) => Ok(value),
+                Err(RoutedAttemptRunError::Attempt(error)) => Err(error),
+                Err(RoutedAttemptRunError::Routing(error)) => {
+                    Err(MediaPromptOptimizerError::Provider(error.to_string()))
+                }
+            }
+        })
+    }
+}
+
+fn routed_media_context() -> RoutedRequestContext {
+    RoutedRequestContext {
+        workflow_key: "media_prompt_optimizer".to_owned(),
+        ..RoutedRequestContext::default()
+    }
+}
+
+pub(crate) fn media_optimizer_for_attempt(
+    config: &AppConfig,
+    attempt: &RoutedAttempt,
+) -> Result<AppMediaPromptOptimizer, MediaPromptOptimizerError> {
+    if routed_attempt_is_genkit(attempt) {
+        let model = genkit_model_for_attempt(attempt);
+        if let Some((cfg, _)) =
+            genkit_openai_compatible_media_prompt_optimizer_config_from_app_config(config, &model)
+        {
+            return Ok(Arc::new(AifarmStructuredJsonGenerator::new(cfg)) as AppMediaPromptOptimizer);
+        }
+        return gemini_media_prompt_optimizer_from_app_config_with_model(config, &model)
+            .map(|optimizer| Arc::new(optimizer) as AppMediaPromptOptimizer)
+            .ok_or_else(|| {
+                MediaPromptOptimizerError::Provider(format!(
+                    "media prompt provider {} is unavailable",
+                    attempt.provider_name
+                ))
+            });
+    }
+
+    let cfg = aifarm_structured_json_config_for_attempt(config, attempt);
+    Ok(Arc::new(AifarmStructuredJsonGenerator::new(cfg)) as AppMediaPromptOptimizer)
+}
+
+pub(crate) fn routed_attempt_is_genkit(attempt: &RoutedAttempt) -> bool {
+    attempt.provider_name.eq_ignore_ascii_case("genkit")
+        || attempt.provider_name.eq_ignore_ascii_case("gemini")
+        || attempt.provider_name.eq_ignore_ascii_case("openrouter")
+}
+
+pub(crate) fn genkit_model_for_attempt(attempt: &RoutedAttempt) -> String {
+    if attempt.provider_name.eq_ignore_ascii_case("openrouter")
+        && !attempt
+            .model_name
+            .get(..OPENROUTER_MODEL_PREFIX.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(OPENROUTER_MODEL_PREFIX))
+    {
+        format!("{OPENROUTER_MODEL_PREFIX}{}", attempt.model_name.trim())
+    } else {
+        attempt.model_name.clone()
+    }
+}
+
+pub(crate) fn aifarm_structured_json_config_for_attempt(
+    config: &AppConfig,
+    attempt: &RoutedAttempt,
+) -> AifarmStructuredJsonConfig {
+    let mut cfg = aifarm_structured_json_config_from_app_config(config);
+    cfg.model = attempt.model_name.clone();
+    cfg.client.default_model = attempt.model_name.clone();
+    cfg.client.direct_url.clear();
+    if let Some(endpoint) = attempt
+        .model_base_url
+        .as_deref()
+        .or(attempt.provider_endpoint.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if attempt.discovery_service_name.is_some() || attempt.discovery_endpoint_name.is_some() {
+            cfg.client.base_url = endpoint.to_owned();
+        } else {
+            cfg.client.direct_url =
+                openplotva_llm::aifarm::normalize_chat_completions_url(endpoint);
+            if attempt
+                .provider_name
+                .eq_ignore_ascii_case(crate::dialog_runtime::VRAM_CLOUD_PROVIDER_NAME)
+            {
+                cfg.client.api_key = config.llm.dialog.aifarm_pool_api_key.clone();
+            }
+        }
+    }
+    if let Some(service) = attempt.discovery_service_name.as_deref() {
+        cfg.client.service_name = service.to_owned();
+    }
+    if let Some(endpoint) = attempt.discovery_endpoint_name.as_deref() {
+        cfg.client.endpoint_name = endpoint.to_owned();
+    }
+    if let Some(max_tokens) = attempt.overrides.max_tokens
+        && max_tokens > 0
+    {
+        cfg.max_tokens = max_tokens;
+    }
+    cfg.with_defaults()
+}
+
+fn media_optimizer_retryable_reason(error: &MediaPromptOptimizerError) -> Option<FailureReason> {
+    match error {
+        MediaPromptOptimizerError::Provider(message) => retryable_reason_from_message(message),
     }
 }
 
@@ -377,20 +563,8 @@ pub fn aifarm_dialog_config_from_app_config(config: &AppConfig) -> AifarmDialogC
         use_tool_calls: Some(dialog.aifarm_use_tool_calls),
         enable_thinking: Some(dialog.aifarm_enable_thinking),
         include_reasoning: Some(false),
-        pool: aifarm_pool_config_from_app_config(config),
         ..AifarmDialogConfig::default()
     }
-}
-
-#[must_use]
-pub fn aifarm_pool_config_from_app_config(config: &AppConfig) -> AifarmPoolConfig {
-    let dialog = &config.llm.dialog;
-    AifarmPoolConfig::from_go_lists(
-        &dialog.aifarm_pool_models,
-        &dialog.aifarm_pool_base_urls,
-        &dialog.aifarm_pool_api_key,
-        Duration::from_millis(dialog.aifarm_pool_primary_capacity_wait_ms.max(0) as u64),
-    )
 }
 
 #[must_use]
@@ -434,12 +608,7 @@ pub fn nvidia_dialog_config_from_app_config(config: &AppConfig) -> AifarmDialogC
 pub fn aifarm_structured_json_config_from_app_config(
     config: &AppConfig,
 ) -> AifarmStructuredJsonConfig {
-    // Prefer the model selected in the admin for `media_prompt_optimizer` (same service).
-    let model = crate::model_routing::resolved_model_for(
-        "media_prompt_optimizer",
-        config.llm.dialog.discovery_service_name.trim(),
-    )
-    .unwrap_or_else(|| config.llm.dialog.model.clone());
+    let model = config.llm.dialog.model.clone();
     AifarmStructuredJsonConfig {
         client: discovery_client_config_from_app_config(config, &model),
         model,
@@ -461,14 +630,22 @@ pub fn aifarm_media_prompt_optimizer_from_app_config(
 pub fn gemini_media_prompt_optimizer_from_app_config(
     config: &AppConfig,
 ) -> Option<GeminiMediaPromptOptimizer<ReqwestAifarmTransport>> {
+    let model = crate::memory_runtime::genkit_runtime_default_model(config);
+    gemini_media_prompt_optimizer_from_app_config_with_model(config, &model)
+}
+
+pub(crate) fn gemini_media_prompt_optimizer_from_app_config_with_model(
+    config: &AppConfig,
+    model: &str,
+) -> Option<GeminiMediaPromptOptimizer<ReqwestAifarmTransport>> {
     let api_key = resolve_google_ai_key(&config.google_ai);
-    if api_key.trim().is_empty() {
+    if api_key.trim().is_empty() || model.trim().is_empty() {
         return None;
     }
     Some(GeminiMediaPromptOptimizer::new(
         GeminiMediaPromptOptimizerConfig {
             api_key,
-            model: crate::memory_runtime::genkit_runtime_default_model(config),
+            model: model.to_owned(),
             request_timeout: Duration::from_secs(
                 config.llm.dialog.request_timeout_seconds.max(1) as u64
             ),
@@ -501,7 +678,7 @@ fn genkit_media_prompt_optimizer_from_app_config(
     })
 }
 
-fn genkit_openai_compatible_media_prompt_optimizer_config_from_app_config(
+pub(crate) fn genkit_openai_compatible_media_prompt_optimizer_config_from_app_config(
     config: &AppConfig,
     model: &str,
 ) -> Option<(AifarmStructuredJsonConfig, &'static str)> {
@@ -758,15 +935,6 @@ mod tests {
         assert_eq!(cfg.use_tool_calls, Some(true));
         assert_eq!(cfg.enable_thinking, Some(false));
         assert_eq!(cfg.include_reasoning, Some(false));
-        assert_eq!(cfg.pool.secondary_backends.len(), 2);
-        assert_eq!(cfg.pool.secondary_backends[0].name, "secondary-a");
-        assert_eq!(
-            cfg.pool.secondary_backends[0].base_url,
-            "http://secondary-a.test/v1"
-        );
-        assert_eq!(cfg.pool.secondary_backends[0].model, "secondary-a");
-        assert_eq!(cfg.pool.secondary_api_key, "pool-key");
-        assert_eq!(cfg.pool.primary_capacity_wait, Duration::from_millis(750));
     }
 
     #[test]

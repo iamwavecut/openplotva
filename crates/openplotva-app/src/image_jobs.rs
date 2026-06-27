@@ -19,6 +19,7 @@ use openplotva_llm::aifarm::{
     decode_discovery_body, is_failure_status, is_queued_status, is_running_status,
     is_success_status, parse_job_error,
 };
+use openplotva_llm::retry::{FailureReason, retryable_reason_from_message};
 use openplotva_media::pruna::{PrunaClient, PrunaConfig, PrunaRequest};
 use openplotva_taskman::{
     DEFAULT_LLM_JOB_MAX_ATTEMPTS, IMAGE_REGULAR_QUEUE_NAME, IMAGE_VIP_QUEUE_NAME,
@@ -39,6 +40,9 @@ use time::OffsetDateTime;
 use tokio::time::Instant;
 
 use crate::media::{MediaPromptOptimizer, MediaPromptOptimizerService};
+use crate::routed_attempts::{
+    RoutedAttempt, RoutedAttemptRunError, RoutedAttemptWalker, RoutedRequestContext,
+};
 use crate::vision::TelegramVisionDataUrlProvider;
 
 /// Boxed future returned by image generation providers.
@@ -69,6 +73,8 @@ pub const IMAGE_JOB_POLL_INTERVAL: StdDuration = StdDuration::from_secs(1);
 pub const IMAGE_JOB_WORKER_QUEUES: [&str; 2] = [IMAGE_VIP_QUEUE_NAME, IMAGE_REGULAR_QUEUE_NAME];
 pub const IMAGE_VIP_JOB_WORKER_QUEUES: [&str; 1] = [IMAGE_VIP_QUEUE_NAME];
 pub const IMAGE_REGULAR_JOB_WORKER_QUEUES: [&str; 1] = [IMAGE_REGULAR_QUEUE_NAME];
+pub const IMAGE_EDIT_WORKFLOW_KEY: &str = "image_edit";
+pub const IMAGE_GENERATION_WORKFLOW_KEY: &str = "image_generation";
 pub const DRAW_SUPPORT_ME_URL: &str = "https://t.me/PlotvoBot?start=donate";
 pub const DRAW_VIP_URL: &str = "https://t.me/PlotvoBot?start=vip";
 
@@ -844,6 +850,275 @@ pub trait ImageGenerator {
 pub trait ImageEditor {
     /// Edit and send an image.
     fn edit_image<'a>(&'a self, request: ImageEditRequest) -> ImageEditFuture<'a>;
+}
+
+#[derive(Clone)]
+pub struct RoutedImageGenerator {
+    walker: RoutedAttemptWalker,
+    pruna_config: PrunaConfig,
+    draw_api_config: AifarmDrawApiConfig,
+    workflow_key: String,
+    expected_image_count: usize,
+}
+
+impl RoutedImageGenerator {
+    #[must_use]
+    pub fn new(
+        walker: RoutedAttemptWalker,
+        pruna_config: PrunaConfig,
+        draw_api_config: AifarmDrawApiConfig,
+    ) -> Self {
+        Self {
+            walker,
+            pruna_config: pruna_config.with_defaults(),
+            draw_api_config: draw_api_config.with_defaults(),
+            workflow_key: IMAGE_GENERATION_WORKFLOW_KEY.to_owned(),
+            expected_image_count: 1,
+        }
+    }
+
+    #[must_use]
+    pub fn with_expected_image_count(mut self, expected_image_count: usize) -> Self {
+        self.expected_image_count = expected_image_count.max(1);
+        self
+    }
+}
+
+impl ImageGenerator for RoutedImageGenerator {
+    fn expected_image_count(&self) -> usize {
+        self.expected_image_count
+    }
+
+    fn generate_image<'a>(&'a self, request: ImageGenerationRequest) -> ImageGenerationFuture<'a> {
+        Box::pin(async move {
+            let request_for_attempts = request.clone();
+            let pruna_config = self.pruna_config.clone();
+            let draw_api_config = self.draw_api_config.clone();
+            let result = self
+                .walker
+                .run(
+                    image_generation_context(&self.workflow_key, &request),
+                    move |attempt| {
+                        let request = request_for_attempts.clone();
+                        let pruna_config = pruna_config.clone();
+                        let draw_api_config = draw_api_config.clone();
+                        async move {
+                            generate_image_with_routed_attempt(
+                                attempt,
+                                request,
+                                pruna_config,
+                                draw_api_config,
+                            )
+                            .await
+                        }
+                    },
+                    image_generation_retryable_reason,
+                )
+                .await;
+            match result {
+                Ok(result) => Ok(result),
+                Err(RoutedAttemptRunError::Attempt(error)) => Err(error),
+                Err(RoutedAttemptRunError::Routing(error)) => {
+                    Err(ImageGenerationError::Provider(error.to_string()))
+                }
+            }
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct RoutedImageEditor<DataUrl> {
+    walker: RoutedAttemptWalker,
+    data_urls: DataUrl,
+    draw_api_config: AifarmDrawApiConfig,
+}
+
+impl<DataUrl> RoutedImageEditor<DataUrl> {
+    #[must_use]
+    pub fn new(
+        walker: RoutedAttemptWalker,
+        data_urls: DataUrl,
+        draw_api_config: AifarmDrawApiConfig,
+    ) -> Self {
+        Self {
+            walker,
+            data_urls,
+            draw_api_config: draw_api_config.with_defaults(),
+        }
+    }
+}
+
+impl<DataUrl> ImageEditor for RoutedImageEditor<DataUrl>
+where
+    DataUrl: TelegramVisionDataUrlProvider + Clone + Send + Sync + 'static,
+    DataUrl::Error: fmt::Display,
+{
+    fn edit_image<'a>(&'a self, request: ImageEditRequest) -> ImageEditFuture<'a> {
+        Box::pin(async move {
+            let request_for_attempts = request.clone();
+            let data_urls = self.data_urls.clone();
+            let draw_api_config = self.draw_api_config.clone();
+            let result = self
+                .walker
+                .run(
+                    image_edit_context(&request),
+                    move |attempt| {
+                        let request = request_for_attempts.clone();
+                        let data_urls = data_urls.clone();
+                        let draw_api_config = draw_api_config.clone();
+                        async move {
+                            edit_image_with_routed_attempt(
+                                attempt,
+                                request,
+                                data_urls,
+                                draw_api_config,
+                            )
+                            .await
+                        }
+                    },
+                    image_edit_retryable_reason,
+                )
+                .await;
+            match result {
+                Ok(result) => Ok(result),
+                Err(RoutedAttemptRunError::Attempt(error)) => Err(error),
+                Err(RoutedAttemptRunError::Routing(error)) => {
+                    Err(ImageEditError::Provider(error.to_string()))
+                }
+            }
+        })
+    }
+}
+
+fn image_generation_context(
+    workflow_key: &str,
+    request: &ImageGenerationRequest,
+) -> RoutedRequestContext {
+    RoutedRequestContext {
+        workflow_key: workflow_key.to_owned(),
+        chat_id: (request.chat_id != 0).then_some(request.chat_id),
+        thread_id: request.thread_id,
+        message_id: (request.message_id != 0).then_some(request.message_id),
+        ..RoutedRequestContext::default()
+    }
+}
+
+fn image_edit_context(request: &ImageEditRequest) -> RoutedRequestContext {
+    RoutedRequestContext {
+        workflow_key: IMAGE_EDIT_WORKFLOW_KEY.to_owned(),
+        chat_id: (request.chat_id != 0).then_some(request.chat_id),
+        thread_id: request.thread_id,
+        message_id: (request.message_id != 0).then_some(request.message_id),
+        ..RoutedRequestContext::default()
+    }
+}
+
+async fn generate_image_with_routed_attempt(
+    attempt: RoutedAttempt,
+    request: ImageGenerationRequest,
+    pruna_config: PrunaConfig,
+    draw_api_config: AifarmDrawApiConfig,
+) -> Result<ImageGenerationResult, ImageGenerationError> {
+    if routed_attempt_is_pruna(&attempt) {
+        let generator = PrunaImageGenerator::new(pruna_config_for_attempt(pruna_config, &attempt))?;
+        return generator.generate_image(request).await;
+    }
+    if routed_attempt_is_draw_api(&attempt) {
+        let generator = AifarmDrawApiImageGenerator::new(draw_api_config_for_attempt(
+            draw_api_config,
+            &attempt,
+        ));
+        return generator.generate_image(request).await;
+    }
+    Err(ImageGenerationError::Provider(format!(
+        "unsupported image provider {}",
+        attempt.provider_name
+    )))
+}
+
+async fn edit_image_with_routed_attempt<DataUrl>(
+    attempt: RoutedAttempt,
+    request: ImageEditRequest,
+    data_urls: DataUrl,
+    draw_api_config: AifarmDrawApiConfig,
+) -> Result<ImageEditResult, ImageEditError>
+where
+    DataUrl: TelegramVisionDataUrlProvider + Send + Sync,
+    DataUrl::Error: fmt::Display,
+{
+    if !routed_attempt_is_draw_api(&attempt) {
+        return Err(ImageEditError::Provider(format!(
+            "unsupported image edit provider {}",
+            attempt.provider_name
+        )));
+    }
+    let editor = ResolvingImageEditor::new(
+        data_urls,
+        AifarmDrawApiImageGenerator::new(draw_api_config_for_attempt(draw_api_config, &attempt)),
+    );
+    editor.edit_image(request).await
+}
+
+fn routed_attempt_is_pruna(attempt: &RoutedAttempt) -> bool {
+    attempt.provider_name.eq_ignore_ascii_case("pruna")
+        || attempt
+            .provider_config
+            .get("provider")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.eq_ignore_ascii_case("pruna"))
+}
+
+fn routed_attempt_is_draw_api(attempt: &RoutedAttempt) -> bool {
+    attempt.provider_name.eq_ignore_ascii_case("aifarm-draw")
+        || attempt.provider_name.eq_ignore_ascii_case("draw-api")
+        || attempt
+            .discovery_service_name
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case(AIFARM_DRAW_API_SERVICE_NAME))
+}
+
+fn pruna_config_for_attempt(mut config: PrunaConfig, attempt: &RoutedAttempt) -> PrunaConfig {
+    if let Some(endpoint) = routed_endpoint(attempt) {
+        config.endpoint = endpoint;
+    }
+    if !attempt.model_name.trim().is_empty() {
+        config.model = attempt.model_name.clone();
+    }
+    config.with_defaults()
+}
+
+fn draw_api_config_for_attempt(
+    mut config: AifarmDrawApiConfig,
+    attempt: &RoutedAttempt,
+) -> AifarmDrawApiConfig {
+    if let Some(endpoint) = routed_endpoint(attempt) {
+        config.base_url = endpoint;
+    }
+    config.with_defaults()
+}
+
+fn routed_endpoint(attempt: &RoutedAttempt) -> Option<String> {
+    attempt
+        .model_base_url
+        .as_deref()
+        .or(attempt.provider_endpoint.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn image_generation_retryable_reason(error: &ImageGenerationError) -> Option<FailureReason> {
+    match error {
+        ImageGenerationError::Forbidden => None,
+        ImageGenerationError::Provider(message) => retryable_reason_from_message(message),
+    }
+}
+
+fn image_edit_retryable_reason(error: &ImageEditError) -> Option<FailureReason> {
+    match error {
+        ImageEditError::Forbidden => None,
+        ImageEditError::Provider(message) => retryable_reason_from_message(message),
+    }
 }
 
 #[derive(Clone, Debug)]

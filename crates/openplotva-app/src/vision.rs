@@ -11,6 +11,7 @@ use openplotva_llm::aifarm::{
     AifarmClientConfig, AifarmHttpClient, AifarmHttpTransport, ChatCompletionRequest,
     ChatContentPart, ChatImageUrlPart, ChatMessage, ReqwestAifarmTransport,
 };
+use openplotva_llm::retry::{FailureReason, retryable_reason_from_message};
 use openplotva_storage::{
     PostgresHistoryStore, PostgresTelegramFileStore, TELEGRAM_FILE_VISION_REQUEST_TIMEOUT,
     TELEGRAM_FILE_VISION_STATUS_COMPLETED, TELEGRAM_FILE_VISION_STATUS_FAILED,
@@ -28,6 +29,9 @@ use crate::{
     },
     dialog_tools::{
         VisionDescribeRequest, VisionDescribeResult, VisionDescriber, VisionImageFuture,
+    },
+    routed_attempts::{
+        RoutedAttempt, RoutedAttemptRunError, RoutedAttemptWalker, RoutedRequestContext,
     },
 };
 
@@ -187,12 +191,7 @@ pub fn aifarm_vision_captioner_config_from_app_config(
     config: &AppConfig,
 ) -> AifarmVisionCaptionerConfig {
     let timeout = positive_seconds(config.vision.request_timeout_seconds);
-    // Prefer the model selected in the admin for the `vision` workflow (same service).
-    let model = crate::model_routing::resolved_model_for(
-        "vision",
-        config.vision.discovery_service_name.trim(),
-    )
-    .unwrap_or_else(|| config.vision.model.clone());
+    let model = config.vision.model.clone();
     AifarmVisionCaptionerConfig {
         client: AifarmClientConfig {
             base_url: config.llm.discovery.base_url.clone(),
@@ -315,6 +314,128 @@ where
                 processing_time_seconds: started.elapsed().as_secs_f64(),
             })
         })
+    }
+}
+
+#[derive(Clone)]
+pub struct RoutedVisionCaptioner<DataUrl> {
+    walker: RoutedAttemptWalker,
+    base_config: AifarmVisionCaptionerConfig,
+    data_url: DataUrl,
+}
+
+impl<DataUrl> fmt::Debug for RoutedVisionCaptioner<DataUrl> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RoutedVisionCaptioner")
+            .field("base_model", &self.base_config.model)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<DataUrl> RoutedVisionCaptioner<DataUrl> {
+    #[must_use]
+    pub fn new(
+        walker: RoutedAttemptWalker,
+        base_config: AifarmVisionCaptionerConfig,
+        data_url: DataUrl,
+    ) -> Self {
+        Self {
+            walker,
+            base_config: base_config.with_defaults(),
+            data_url,
+        }
+    }
+}
+
+impl<DataUrl> TelegramVisionCaptioner for RoutedVisionCaptioner<DataUrl>
+where
+    DataUrl: TelegramVisionDataUrlProvider + Clone + Send + Sync + 'static,
+{
+    type Error = AifarmVisionCaptionerError;
+
+    fn caption_telegram_file<'a>(
+        &'a self,
+        request: TelegramVisionCaptionRequest,
+    ) -> TelegramVisionCaptionFuture<'a, Self::Error> {
+        Box::pin(async move {
+            let request_for_attempts = request.clone();
+            let base_config = self.base_config.clone();
+            let data_url = self.data_url.clone();
+            let result = self
+                .walker
+                .run(
+                    RoutedRequestContext {
+                        workflow_key: "vision".to_owned(),
+                        ..RoutedRequestContext::default()
+                    },
+                    move |attempt| {
+                        let request = request_for_attempts.clone();
+                        let base_config = base_config.clone();
+                        let data_url = data_url.clone();
+                        async move {
+                            let captioner = AifarmVisionCaptioner::new(
+                                vision_config_for_attempt(base_config, &attempt),
+                                data_url,
+                            );
+                            captioner.caption_telegram_file(request).await
+                        }
+                    },
+                    vision_retryable_reason,
+                )
+                .await;
+            match result {
+                Ok(result) => Ok(result),
+                Err(RoutedAttemptRunError::Attempt(error)) => Err(error),
+                Err(RoutedAttemptRunError::Routing(error)) => {
+                    Err(AifarmVisionCaptionerError::Provider(error.to_string()))
+                }
+            }
+        })
+    }
+}
+
+fn vision_config_for_attempt(
+    mut config: AifarmVisionCaptionerConfig,
+    attempt: &RoutedAttempt,
+) -> AifarmVisionCaptionerConfig {
+    config.model = attempt.model_name.clone();
+    config.client.default_model = attempt.model_name.clone();
+    if let Some(endpoint) = attempt
+        .model_base_url
+        .as_deref()
+        .or(attempt.provider_endpoint.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if attempt.discovery_service_name.is_some() || attempt.discovery_endpoint_name.is_some() {
+            config.client.base_url = endpoint.to_owned();
+        } else {
+            config.client.direct_url =
+                openplotva_llm::aifarm::normalize_chat_completions_url(endpoint);
+        }
+    }
+    if let Some(service) = attempt.discovery_service_name.as_deref() {
+        config.client.service_name = service.to_owned();
+    }
+    if let Some(endpoint) = attempt.discovery_endpoint_name.as_deref() {
+        config.client.endpoint_name = endpoint.to_owned();
+    }
+    if let Some(max_tokens) = attempt.overrides.max_tokens
+        && max_tokens > 0
+    {
+        config.max_tokens = max_tokens;
+    }
+    if let Some(temperature) = attempt.overrides.temperature {
+        config.temperature = temperature;
+    }
+    config.with_defaults()
+}
+
+fn vision_retryable_reason(error: &AifarmVisionCaptionerError) -> Option<FailureReason> {
+    match error {
+        AifarmVisionCaptionerError::Provider(message) => retryable_reason_from_message(message),
+        _ => None,
     }
 }
 

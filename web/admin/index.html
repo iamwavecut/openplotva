@@ -104,27 +104,6 @@
                                         <pl-button variant="primary" data-action="saveLogLevel">Apply</pl-button>
                                     </div>
                                 </pl-field-group>
-                                <pl-field-group label="AI Farm Priority Pool"
-                                    help="When disabled, the bot behaves as before the priority-pool feature: AI Farm primary only, with Gemini as the upstream fallback.">
-                                    <div class="d-flex gap-2 align-center">
-                                        <pl-select id="aifarm-pool-enabled" class="w-narrow">
-                                            <option value="enabled">Enabled</option>
-                                            <option value="disabled">Disabled</option>
-                                        </pl-select>
-                                        <pl-button variant="primary" data-action="saveAIFarmPool">Apply</pl-button>
-                                    </div>
-                                </pl-field-group>
-                                <pl-field-group label="VRAM Cloud Reasoning (Qwen3.6)"
-                                    help="Controls chat_template_kwargs.enable_thinking for pooled reasoning models. When enabled, max_tokens is automatically lifted to DIALOG_AIFARM_POOL_REASONING_MAX_TOKENS (default 8192) so the model exits the thinking block into a final content payload.">
-                                    <div class="d-flex gap-2 align-center">
-                                        <pl-select id="aifarm-pool-reasoning-enabled" class="w-narrow">
-                                            <option value="enabled">Enabled</option>
-                                            <option value="disabled">Disabled</option>
-                                        </pl-select>
-                                        <pl-button variant="primary"
-                                            data-action="saveAIFarmPoolReasoning">Apply</pl-button>
-                                    </div>
-                                </pl-field-group>
                             </div>
                         </div>
                     </div>
@@ -1292,12 +1271,46 @@
         }
         function mpIcon(name) { return mpEl('i', { class: 'ti ti-' + name, 'aria-hidden': 'true' }); }
         function mpClear(el) { while (el.firstChild) el.removeChild(el.firstChild); }
+        const mpKinds = ['chat', 'vision', 'embedding', 'image', 'music', 'privacy_filter'];
 
         function mpProviderById(id) { return (mpState.snap.providers || []).find(p => p.id === id); }
         function mpModelById(id) { return (mpState.snap.models || []).find(m => m.id === id); }
         function mpProviderOfModel(id) { const m = mpModelById(id); return m ? mpProviderById(m.provider_id) : null; }
         function mpModelLabel(id) { const m = mpModelById(id); return m ? m.model_name : ('#' + id); }
         function mpProviderName(modelId) { const p = mpProviderOfModel(modelId); return p ? p.name : ''; }
+        function mpKindDot(kind) { return 'mp-dot mp-dot-' + ((mpKinds.indexOf(kind) % 6 + 6) % 6); }
+
+        function mpToggleControl(checked, label, onChange) {
+            const attrs = {
+                label: label || '',
+                _on: {
+                    click: ev => ev.stopPropagation(),
+                    'pl:change': ev => { ev.stopPropagation(); onChange(!!ev.detail.checked); },
+                },
+            };
+            if (checked) attrs.checked = true;
+            return mpEl('pl-toggle', attrs);
+        }
+
+        async function mpEditConfig(action, id, current) {
+            const input = mpEl('pl-textarea', { rows: '8' });
+            input.value = JSON.stringify(current && typeof current === 'object' ? current : {}, null, 2);
+            const body = mpEl('div', { class: 'mp-config-editor' }, [input]);
+            const ok = await PL.confirm({ title: 'Patch config', body, okLabel: 'Patch' });
+            if (!ok) return;
+            let patch;
+            try {
+                patch = JSON.parse(input.value || '{}');
+            } catch (err) {
+                PL.toast('Config must be valid JSON.', 'error');
+                return;
+            }
+            if (!patch || Array.isArray(patch) || typeof patch !== 'object') {
+                PL.toast('Config patch must be a JSON object.', 'error');
+                return;
+            }
+            await mpApply({ action, id, config: patch }, 'Config patched.');
+        }
 
         function mpAssignments(wfKey, scope, role) {
             return (mpState.snap.assignments || [])
@@ -1369,7 +1382,7 @@
             (mpState.snap.providers || []).forEach(p => {
                 const chip = mpEl('div', { class: 'mp-chip', 'data-off': p.enabled ? '0' : '1',
                     _on: { click: () => mpView('library') } }, [
-                    mpEl('span', { class: 'mp-dot mp-dot-' + (['chat', 'vision', 'embedding', 'image', 'music'].indexOf(p.kind) % 6 + 6) % 6 }),
+                    mpEl('span', { class: mpKindDot(p.kind) }),
                     mpEl('span', { text: p.name }),
                     mpEl('span', { class: 'mp-row-sub', text: p.kind }),
                 ]);
@@ -1390,6 +1403,7 @@
                         mpEl('span', { class: 'mp-wf-title', text: mpTitle(w.key) }),
                         mpEl('span', { class: 'mp-tag mp-tag--accent', text: w.kind }),
                         w.full_routing ? null : mpEl('span', { class: 'mp-tag mp-tag--muted', text: 'config-only' }),
+                        mpToggleControl(w.enabled, '', enabled => mpApply({ action: 'set_workflow_enabled', key: w.key, enabled }, enabled ? 'Workflow enabled.' : 'Workflow disabled.')),
                     ]),
                     primaries.length ? mpAllocBar(primaries, false)
                         : mpEl('div', { class: 'mp-empty', text: 'No models assigned' }),
@@ -1422,6 +1436,7 @@
                 mpEl('span', { class: 'mp-wf-title', text: mpTitle(w.key) }),
                 mpEl('span', { class: 'mp-tag mp-tag--accent', text: w.kind }),
                 w.full_routing ? mpEl('span', { class: 'mp-tag', text: 'full routing' }) : mpEl('span', { class: 'mp-tag mp-tag--muted', text: 'config-only' }),
+                mpToggleControl(w.enabled, 'enabled', enabled => mpApply({ action: 'set_workflow_enabled', key: w.key, enabled }, enabled ? 'Workflow enabled.' : 'Workflow disabled.')),
             ]);
             const scope = mpEl('div', { class: 'mp-scope' }, ['global', 'vip'].map(s =>
                 mpEl('span', { class: 'mp-scope-opt' + (mpState.scope === s ? ' active' : ''), text: s === 'vip' ? 'VIP' : 'Global',
@@ -1691,7 +1706,8 @@
                 mpEl('span', { class: 'mp-row-sub', text: p.endpoint || (p.discovery_service_name || '') }),
                 mpEl('span', { class: 'mp-tag', text: 'key: ' + p.key_state }),
                 mpEl('div', { class: 'mp-row-actions' }, [
-                    mpEl('span', { class: 'mp-tag', text: p.enabled ? 'enabled' : 'disabled' }),
+                    mpToggleControl(p.enabled, 'enabled', enabled => mpApply({ action: 'set_provider_enabled', id: p.id, enabled }, enabled ? 'Provider enabled.' : 'Provider disabled.')),
+                    mpEl('pl-button', { size: 'sm', variant: 'outline', _on: { click: () => mpEditConfig('patch_provider_config', p.id, p.config || {}) } }, [mpIcon('braces'), ' Config']),
                     mpEl('span', { class: 'mp-icon-btn mp-icon-btn--danger', title: 'Delete', _on: { click: async () => {
                         if (await PL.confirm('Delete provider ' + p.name + ' and its models?')) mpApply({ action: 'delete_provider', id: p.id }, 'Provider deleted.');
                     } } }, [mpIcon('trash')]),
@@ -1709,6 +1725,8 @@
                 mpEl('span', { class: 'mp-tag', text: (m.capabilities || []).join(', ') || '—' }),
                 m.embedding_dim != null ? mpEl('span', { class: 'mp-tag', text: 'dim ' + m.embedding_dim }) : null,
                 mpEl('div', { class: 'mp-row-actions' }, [
+                    mpToggleControl(m.enabled, 'enabled', enabled => mpApply({ action: 'set_model_enabled', id: m.id, enabled }, enabled ? 'Model enabled.' : 'Model disabled.')),
+                    mpEl('pl-button', { size: 'sm', variant: 'outline', _on: { click: () => mpEditConfig('patch_model_config', m.id, m.config || {}) } }, [mpIcon('braces'), ' Config']),
                     mpEl('span', { class: 'mp-icon-btn mp-icon-btn--danger', title: 'Delete', _on: { click: async () => {
                         if (await PL.confirm('Delete model ' + m.model_name + '?')) mpApply({ action: 'delete_model', id: m.id }, 'Model deleted.');
                     } } }, [mpIcon('trash')]),
@@ -1721,7 +1739,7 @@
 
         function mpProviderForm() {
             const name = mpEl('pl-input', { placeholder: 'name' });
-            const kind = mpEl('pl-select', { class: 'w-narrow' }, ['chat', 'vision', 'embedding', 'image', 'music'].map(x => mpEl('option', { value: x }, x)));
+            const kind = mpEl('pl-select', { class: 'w-narrow' }, mpKinds.map(x => mpEl('option', { value: x }, x)));
             const endpoint = mpEl('pl-input', { placeholder: 'endpoint (optional)' });
             const keyref = mpEl('pl-input', { placeholder: 'api_key_ref env var' });
             const key = mpEl('pl-input', { type: 'password', placeholder: 'api key (encrypted)' });
@@ -1739,7 +1757,7 @@
             const prov = mpEl('pl-select', { class: 'w-narrow' }, (mpState.snap.providers || []).map(p => mpEl('option', { value: p.id }, p.name)));
             const model = mpEl('pl-input', { placeholder: 'model_name' });
             const baseUrl = mpEl('pl-input', { placeholder: 'base_url (optional)' });
-            const caps = mpEl('pl-input', { placeholder: 'capabilities csv' });
+            const caps = mpEl('pl-input', { placeholder: 'capabilities csv: chat, privacy_filter' });
             const dim = mpEl('pl-input', { type: 'number', placeholder: 'embedding_dim', class: 'w-narrow' });
             return mpEl('div', { class: 'mp-add' }, [prov, model, baseUrl, caps, dim,
                 mpEl('pl-button', { variant: 'primary', _on: { click: () => {
@@ -1760,18 +1778,6 @@
             if (result) PL.toast(`Log level updated to ${level}.`, 'success');
         }
 
-        async function saveAIFarmPool() {
-            const enabled = document.getElementById('aifarm-pool-enabled').value === 'enabled';
-            const result = await apiCall('/aifarm/pool', { method: 'POST', body: { enabled } });
-            if (result) PL.toast('AI Farm priority pool ' + (enabled ? 'enabled.' : 'disabled.'), 'success');
-        }
-
-        async function saveAIFarmPoolReasoning() {
-            const enabled = document.getElementById('aifarm-pool-reasoning-enabled').value === 'enabled';
-            const result = await apiCall('/aifarm/pool/reasoning', { method: 'POST', body: { enabled } });
-            if (result) PL.toast('VRAM Cloud reasoning ' + (enabled ? 'enabled.' : 'disabled.'), 'success');
-        }
-
         // --- Metrics ---
         const METRIC_PANES = ['queue-stats', 'cache-stats', 'planner-stats'];
         async function refreshState() {
@@ -1784,14 +1790,6 @@
             METRIC_PANES.forEach(id => document.getElementById(id).removeAttribute('aria-busy'));
 
             document.getElementById('log-level').value = data.log_level;
-            const poolSelect = document.getElementById('aifarm-pool-enabled');
-            if (poolSelect && typeof data.aifarm_pool_enabled === 'boolean') {
-                poolSelect.value = data.aifarm_pool_enabled ? 'enabled' : 'disabled';
-            }
-            const reasoningSelect = document.getElementById('aifarm-pool-reasoning-enabled');
-            if (reasoningSelect && typeof data.aifarm_pool_reasoning_enabled === 'boolean') {
-                reasoningSelect.value = data.aifarm_pool_reasoning_enabled ? 'enabled' : 'disabled';
-            }
             document.getElementById('queue-stats').textContent = JSON.stringify(data.queue, null, 2);
             document.getElementById('cache-stats').textContent = JSON.stringify(data.cache, null, 2);
             document.getElementById('planner-stats').textContent = JSON.stringify(data.planner, null, 2);

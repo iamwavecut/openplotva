@@ -5,9 +5,11 @@ use std::{
 };
 
 use futures_util::StreamExt;
+use openplotva_config::AppConfig;
 use openplotva_llm::{
     aifarm::{AifarmHttpTransport, AifarmStructuredJsonGenerator, StatusUpdate},
     gemini::GeminiMediaPromptOptimizer,
+    retry::{FailureReason, retryable_reason_from_message},
 };
 use openplotva_media::acestep::{
     AceStepApiMode, AceStepClient, AceStepConfig, AceStepError, CompletionRequest,
@@ -29,10 +31,15 @@ use openplotva_telegram::{
 use rand::RngExt;
 use time::OffsetDateTime;
 
+use crate::media;
 use crate::permissions::{ChatPermissionPolicy, ChatPermissionStore};
+use crate::routed_attempts::{
+    RoutedAttempt, RoutedAttemptRunError, RoutedAttemptWalker, RoutedRequestContext,
+};
 
 pub const MUSIC_JOB_POLL_INTERVAL: StdDuration = StdDuration::from_secs(1);
 pub const MUSIC_JOB_WORKER_QUEUES: [&str; 1] = [MUSIC_VIP_QUEUE_NAME];
+pub const MUSIC_WORKFLOW_KEY: &str = "music";
 pub const GO_MUSIC_GENERATION_TIMEOUT: StdDuration = StdDuration::from_secs(360);
 pub const SUPPORT_ME_URL: &str = "https://t.me/PlotvoBot?start=donate";
 pub const VIP_URL: &str = "https://t.me/PlotvoBot?start=vip";
@@ -285,6 +292,96 @@ where
     }
 }
 
+#[derive(Clone)]
+pub struct RoutedSongPromptGenerator {
+    walker: RoutedAttemptWalker,
+    config: AppConfig,
+}
+
+impl RoutedSongPromptGenerator {
+    #[must_use]
+    pub fn new(walker: RoutedAttemptWalker, config: &AppConfig) -> Self {
+        Self {
+            walker,
+            config: config.clone(),
+        }
+    }
+}
+
+impl SongPromptGenerator for RoutedSongPromptGenerator {
+    fn build_song_prompt<'a>(&'a self, request: SongPromptRequest) -> SongPromptFuture<'a> {
+        Box::pin(async move {
+            let config = self.config.clone();
+            let result =
+                self.walker
+                    .run(
+                        RoutedRequestContext {
+                            workflow_key: "media_prompt_optimizer".to_owned(),
+                            queue_name: Some(MUSIC_VIP_QUEUE_NAME.to_owned()),
+                            message_id: (request.message_id != 0).then_some(request.message_id),
+                            ..RoutedRequestContext::default()
+                        },
+                        move |attempt| {
+                            let config = config.clone();
+                            let request = request.clone();
+                            async move {
+                                build_song_prompt_with_attempt(&config, attempt, request).await
+                            }
+                        },
+                        song_prompt_retryable_reason,
+                    )
+                    .await;
+            match result {
+                Ok(result) => Ok(result),
+                Err(RoutedAttemptRunError::Attempt(error)) => Err(error),
+                Err(RoutedAttemptRunError::Routing(error)) => {
+                    Err(MusicGenerationError::Material(error.to_string()))
+                }
+            }
+        })
+    }
+}
+
+async fn build_song_prompt_with_attempt(
+    config: &AppConfig,
+    attempt: RoutedAttempt,
+    request: SongPromptRequest,
+) -> Result<SongPromptResult, MusicGenerationError> {
+    if media::routed_attempt_is_genkit(&attempt) {
+        let model = media::genkit_model_for_attempt(&attempt);
+        if let Some((cfg, _)) =
+            media::genkit_openai_compatible_media_prompt_optimizer_config_from_app_config(
+                config, &model,
+            )
+        {
+            return AifarmStructuredJsonGenerator::new(cfg)
+                .build_song_prompt(request)
+                .await;
+        }
+        let Some(gemini) =
+            media::gemini_media_prompt_optimizer_from_app_config_with_model(config, &model)
+        else {
+            return Err(MusicGenerationError::Material(format!(
+                "song reprompt provider {} is unavailable",
+                attempt.provider_name
+            )));
+        };
+        return gemini.build_song_prompt(request).await;
+    }
+
+    let cfg = media::aifarm_structured_json_config_for_attempt(config, &attempt);
+    AifarmStructuredJsonGenerator::new(cfg)
+        .build_song_prompt(request)
+        .await
+}
+
+fn song_prompt_retryable_reason(error: &MusicGenerationError) -> Option<FailureReason> {
+    match error {
+        MusicGenerationError::EmptyTopic | MusicGenerationError::Provider(_) => None,
+        MusicGenerationError::Material(message) => retryable_reason_from_message(message),
+    }
+}
+
 pub trait SongLanguageHintStore {
     /// Load a non-empty user language code.
     fn song_language_hint<'a>(&'a self, user_id: i64) -> SongLanguageHintFuture<'a>;
@@ -467,6 +564,112 @@ impl MusicGenerator for AceStepMusicGenerator {
                 file_name: audio.file_name,
             })
         })
+    }
+}
+
+#[derive(Clone)]
+pub struct RoutedMusicGenerator {
+    walker: RoutedAttemptWalker,
+    base_config: AceStepConfig,
+}
+
+impl RoutedMusicGenerator {
+    #[must_use]
+    pub fn new(walker: RoutedAttemptWalker, base_config: AceStepConfig) -> Self {
+        Self {
+            walker,
+            base_config: base_config.with_defaults(),
+        }
+    }
+}
+
+impl MusicGenerator for RoutedMusicGenerator {
+    fn generate_song<'a>(&'a self, request: MusicGenerationRequest) -> MusicGenerationFuture<'a> {
+        Box::pin(async move {
+            let request_for_attempts = request.clone();
+            let base_config = self.base_config.clone();
+            let result = self
+                .walker
+                .run(
+                    RoutedRequestContext {
+                        workflow_key: MUSIC_WORKFLOW_KEY.to_owned(),
+                        queue_name: Some(MUSIC_VIP_QUEUE_NAME.to_owned()),
+                        ..RoutedRequestContext::default()
+                    },
+                    move |attempt| {
+                        let request = request_for_attempts.clone();
+                        let base_config = base_config.clone();
+                        async move {
+                            generate_song_with_routed_attempt(attempt, request, base_config).await
+                        }
+                    },
+                    music_retryable_reason,
+                )
+                .await;
+            match result {
+                Ok(result) => Ok(result),
+                Err(RoutedAttemptRunError::Attempt(error)) => Err(error),
+                Err(RoutedAttemptRunError::Routing(error)) => {
+                    Err(MusicGenerationError::Provider(error.to_string()))
+                }
+            }
+        })
+    }
+}
+
+async fn generate_song_with_routed_attempt(
+    attempt: RoutedAttempt,
+    request: MusicGenerationRequest,
+    base_config: AceStepConfig,
+) -> Result<GeneratedSongAudio, MusicGenerationError> {
+    if !attempt.provider_name.eq_ignore_ascii_case("acestep")
+        && !attempt
+            .provider_config
+            .get("provider")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| value.eq_ignore_ascii_case("acestep"))
+    {
+        return Err(MusicGenerationError::Provider(format!(
+            "unsupported music provider {}",
+            attempt.provider_name
+        )));
+    }
+    let config = acestep_config_for_attempt(base_config, &attempt);
+    let audio_format = config.audio_format.clone();
+    let client = AceStepClient::new(config)?;
+    AceStepMusicGenerator::new(client, audio_format)
+        .generate_song(request)
+        .await
+}
+
+fn acestep_config_for_attempt(mut config: AceStepConfig, attempt: &RoutedAttempt) -> AceStepConfig {
+    if let Some(endpoint) = attempt
+        .model_base_url
+        .as_deref()
+        .or(attempt.provider_endpoint.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        config.base_url = endpoint.to_owned();
+    }
+    if !attempt.model_name.trim().is_empty() {
+        config.model = attempt.model_name.clone();
+    }
+    if let Some(mode) = attempt
+        .provider_config
+        .get("api_mode")
+        .or_else(|| attempt.model_config.get("api_mode"))
+        .and_then(serde_json::Value::as_str)
+    {
+        config.api_mode = AceStepApiMode::from_go(mode);
+    }
+    config.with_defaults()
+}
+
+fn music_retryable_reason(error: &MusicGenerationError) -> Option<FailureReason> {
+    match error {
+        MusicGenerationError::EmptyTopic | MusicGenerationError::Material(_) => None,
+        MusicGenerationError::Provider(message) => retryable_reason_from_message(message),
     }
 }
 
@@ -1152,10 +1355,7 @@ pub fn acestep_config_from_app_config(config: &openplotva_config::AppConfig) -> 
         poll_interval: seconds_or_zero(config.music.acestep.poll_interval_seconds),
         task_timeout: seconds_or_zero(config.music.acestep.task_timeout_seconds),
         audio_format: config.music.acestep.audio_format.clone(),
-        // Prefer the model selected in the admin for the `music` workflow (ACE-Step has no
-        // discovery service, so this is unconditional; behavior-neutral against the seed).
-        model: crate::model_routing::resolved_model_any("music")
-            .unwrap_or_else(|| config.music.acestep.model.clone()),
+        model: config.music.acestep.model.clone(),
     }
     .with_defaults()
 }

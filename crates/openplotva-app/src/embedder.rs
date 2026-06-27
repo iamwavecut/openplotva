@@ -17,11 +17,15 @@ use openplotva_llm::aifarm::{
     DiscoveryInvocation, DiscoveryJob, DiscoveryJobEnvelope, DiscoveryJobRequest,
     DiscoveryJobResponse,
 };
+use openplotva_llm::retry::FailureReason;
 use openplotva_storage::pg_embedding_vector;
 
 use crate::memory_runtime::{
     EmbedderClientError, EmbedderEncodeRequest, EmbedderEncodeResponse, EmbeddingBatchFuture,
     EmbeddingProvider, EmbeddingProviderFuture,
+};
+use crate::routed_attempts::{
+    RoutedAttempt, RoutedAttemptRunError, RoutedAttemptWalker, RoutedRequestContext,
 };
 
 pub const DEFAULT_EMBEDDER_BREAKER_FAILURE_THRESHOLD: usize = 5;
@@ -381,6 +385,198 @@ impl EmbeddingProvider for DiscoveryEmbedderClient {
 
     fn is_available(&self) -> bool {
         self.breaker.is_available()
+    }
+}
+
+#[derive(Clone)]
+pub struct RoutedDiscoveryEmbedder {
+    walker: RoutedAttemptWalker,
+    base_config: DiscoveryEmbedderConfig,
+}
+
+impl std::fmt::Debug for RoutedDiscoveryEmbedder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RoutedDiscoveryEmbedder")
+            .field("base_url", &self.base_config.base_url)
+            .field("service_name", &self.base_config.service_name)
+            .field("endpoint_name", &self.base_config.endpoint_name)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RoutedDiscoveryEmbedder {
+    #[must_use]
+    pub fn new(walker: RoutedAttemptWalker, base_config: DiscoveryEmbedderConfig) -> Self {
+        Self {
+            walker,
+            base_config,
+        }
+    }
+}
+
+impl EmbeddingProvider for RoutedDiscoveryEmbedder {
+    fn embed_one<'a>(
+        &'a self,
+        text: &'a str,
+        dimension: i32,
+        task_description: &'a str,
+    ) -> EmbeddingProviderFuture<'a> {
+        Box::pin(async move {
+            let text = text.trim().to_owned();
+            if text.is_empty() {
+                return Ok(None);
+            }
+            let task_description = task_description.trim().to_owned();
+            let base_config = self.base_config.clone();
+            let result = self
+                .walker
+                .run(
+                    embedding_context(),
+                    move |attempt| {
+                        let text = text.clone();
+                        let task_description = task_description.clone();
+                        let base_config = base_config.clone();
+                        async move {
+                            let client = routed_embedder_client(base_config, &attempt, dimension)?;
+                            client.embed_one(&text, dimension, &task_description).await
+                        }
+                    },
+                    embedder_retryable_reason,
+                )
+                .await;
+            match result {
+                Ok(result) => Ok(result),
+                Err(RoutedAttemptRunError::Attempt(error)) => Err(error),
+                Err(RoutedAttemptRunError::Routing(error)) => {
+                    Err(EmbedderClientError::discovery(error.to_string()))
+                }
+            }
+        })
+    }
+
+    fn embed_batch<'a>(
+        &'a self,
+        texts: &'a [String],
+        dimension: i32,
+        task_description: &'a str,
+    ) -> EmbeddingBatchFuture<'a> {
+        Box::pin(async move {
+            if texts.is_empty() {
+                return Ok(Vec::new());
+            }
+            let texts = texts.to_vec();
+            let task_description = task_description.trim().to_owned();
+            let base_config = self.base_config.clone();
+            let result = self
+                .walker
+                .run(
+                    embedding_context(),
+                    move |attempt| {
+                        let texts = texts.clone();
+                        let task_description = task_description.clone();
+                        let base_config = base_config.clone();
+                        async move {
+                            let client = routed_embedder_client(base_config, &attempt, dimension)?;
+                            client
+                                .embed_batch(&texts, dimension, &task_description)
+                                .await
+                        }
+                    },
+                    embedder_retryable_reason,
+                )
+                .await;
+            match result {
+                Ok(result) => Ok(result),
+                Err(RoutedAttemptRunError::Attempt(error)) => Err(error),
+                Err(RoutedAttemptRunError::Routing(error)) => {
+                    Err(EmbedderClientError::discovery(error.to_string()))
+                }
+            }
+        })
+    }
+}
+
+fn embedding_context() -> RoutedRequestContext {
+    RoutedRequestContext {
+        workflow_key: "embedding".to_owned(),
+        ..RoutedRequestContext::default()
+    }
+}
+
+fn routed_embedder_client(
+    mut config: DiscoveryEmbedderConfig,
+    attempt: &RoutedAttempt,
+    dimension: i32,
+) -> Result<DiscoveryEmbedderClient, EmbedderClientError> {
+    if let Some(embedding_dim) = attempt.embedding_dim
+        && embedding_dim != dimension
+    {
+        return Err(EmbedderClientError::discovery(format!(
+            "embedding dimension mismatch: route has {embedding_dim}, request needs {dimension}"
+        )));
+    }
+    if let Some(endpoint) = attempt
+        .model_base_url
+        .as_deref()
+        .or(attempt.provider_endpoint.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        config.base_url = endpoint.to_owned();
+    }
+    if let Some(service_name) = attempt
+        .discovery_service_name
+        .as_deref()
+        .or_else(|| {
+            attempt
+                .provider_config
+                .get("service_name")
+                .and_then(serde_json::Value::as_str)
+        })
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        config.service_name = service_name.to_owned();
+    }
+    if let Some(endpoint_name) = attempt
+        .discovery_endpoint_name
+        .as_deref()
+        .or_else(|| {
+            attempt
+                .provider_config
+                .get("endpoint_name")
+                .and_then(serde_json::Value::as_str)
+        })
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        config.endpoint_name = endpoint_name.to_owned();
+    }
+    if attempt.model_name.trim().is_empty() {
+        return Err(EmbedderClientError::discovery(
+            "embedding route model is empty".to_owned(),
+        ));
+    }
+    DiscoveryEmbedderClient::new(config)
+        .map_err(|error| EmbedderClientError::discovery(format!("build routed embedder: {error}")))
+}
+
+fn embedder_retryable_reason(error: &EmbedderClientError) -> Option<FailureReason> {
+    match error {
+        EmbedderClientError::EmptyPrompts => None,
+        EmbedderClientError::Status { status, .. } if *status >= 500 => {
+            Some(FailureReason::ProviderUnavailable)
+        }
+        EmbedderClientError::Unavailable
+        | EmbedderClientError::Discovery { .. }
+        | EmbedderClientError::RetryExhausted { .. } => Some(FailureReason::ProviderUnavailable),
+        EmbedderClientError::Request { source } if source.is_timeout() => {
+            Some(FailureReason::ProviderTimeout)
+        }
+        EmbedderClientError::Request { source } if source.is_connect() => {
+            Some(FailureReason::ProviderUnavailable)
+        }
+        EmbedderClientError::Request { .. } | EmbedderClientError::Status { .. } => None,
     }
 }
 

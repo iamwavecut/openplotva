@@ -2,10 +2,7 @@
 
 use std::error::Error;
 use std::fmt::Write as _;
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, AtomicI64, Ordering},
-};
+use std::sync::Arc;
 use std::{
     collections::BTreeMap,
     future::Future,
@@ -14,7 +11,6 @@ use std::{
 };
 
 use base64::{Engine as _, engine::general_purpose};
-use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -56,46 +52,12 @@ const DEFAULT_SERVICE_NAME: &str = "llm-openai";
 const DEFAULT_ENDPOINT_NAME: &str = "chat_completions";
 const DEFAULT_MODEL_NAME: &str = "Gemma 4 26B Heretic";
 const DEFAULT_HISTORY_SUMMARY_MAX_OUTPUT_TOKENS: i32 = 1024;
-const DEFAULT_POOL_PRIMARY_CAPACITY_WAIT: StdDuration = StdDuration::from_millis(500);
-pub const DEFAULT_POOL_REASONING_MAX_TOKENS: i32 = 8192;
 const DEFAULT_VRAM_CLOUD_TEMPERATURE: f64 = 0.7;
 const DEFAULT_VRAM_CLOUD_TOP_P: f64 = 0.8;
 const DEFAULT_VRAM_CLOUD_TOP_K: f64 = 20.0;
 const DEFAULT_VRAM_CLOUD_PRESENCE_PENALTY: f64 = 1.5;
 const DEFAULT_VRAM_CLOUD_REPETITION_PENALTY: f64 = 1.0;
 const DEFAULT_VRAM_CLOUD_MAX_TOKENS: i32 = 768;
-
-static POOL_ENABLED: AtomicBool = AtomicBool::new(true);
-static POOL_REASONING_ENABLED: AtomicBool = AtomicBool::new(false);
-static POOL_REASONING_MAX_TOKENS: AtomicI64 =
-    AtomicI64::new(DEFAULT_POOL_REASONING_MAX_TOKENS as i64);
-
-pub fn set_pool_enabled(enabled: bool) {
-    POOL_ENABLED.store(enabled, Ordering::SeqCst);
-}
-
-#[must_use]
-pub fn pool_enabled() -> bool {
-    POOL_ENABLED.load(Ordering::SeqCst)
-}
-
-pub fn set_pool_reasoning_enabled(enabled: bool) {
-    POOL_REASONING_ENABLED.store(enabled, Ordering::SeqCst);
-}
-
-#[must_use]
-pub fn pool_reasoning_enabled() -> bool {
-    POOL_REASONING_ENABLED.load(Ordering::SeqCst)
-}
-
-pub fn set_pool_reasoning_max_tokens(max_tokens: i32) {
-    POOL_REASONING_MAX_TOKENS.store(i64::from(max_tokens.max(0)), Ordering::SeqCst);
-}
-
-#[must_use]
-pub fn pool_reasoning_max_tokens() -> i32 {
-    i32::try_from(POOL_REASONING_MAX_TOKENS.load(Ordering::SeqCst)).unwrap_or(i32::MAX)
-}
 
 pub const DISCOVERY_PRIORITY_INTERACTIVE: i32 = 0;
 pub const DISCOVERY_PRIORITY_MEMORY: i32 = 10;
@@ -674,8 +636,7 @@ where
     }
 
     /// Emit one trace record per model round-trip when the request carries trace
-    /// metadata. Fires on success and error; the pool calls this per backend attempt, so
-    /// per-attempt + per-backend model labelling is automatic.
+    /// metadata. Fires on success and error.
     fn emit_call_trace(
         &self,
         request: &ChatCompletionRequest,
@@ -1213,31 +1174,6 @@ pub struct AifarmDialogConfig {
     pub enable_thinking: Option<bool>,
     /// Whether reasoning output is included.
     pub include_reasoning: Option<bool>,
-    pub pool: AifarmPoolConfig,
-}
-
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct AifarmPoolConfig {
-    /// Secondary backends.
-    pub secondary_backends: Vec<AifarmPoolBackendConfig>,
-    /// Fallback API key for secondary backends.
-    pub secondary_api_key: String,
-    /// Primary queued-capacity wait before falling through to secondaries.
-    pub primary_capacity_wait: StdDuration,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct AifarmPoolBackendConfig {
-    /// Backend status/trace name.
-    pub name: String,
-    /// Base URL normalized to `/chat/completions` when `url` is empty.
-    pub base_url: String,
-    /// Explicit direct chat-completions URL.
-    pub url: String,
-    /// Per-backend API key.
-    pub api_key: String,
-    /// Secondary model.
-    pub model: String,
 }
 
 /// AIFarm history-summary generator configuration.
@@ -1255,7 +1191,6 @@ pub struct AifarmHistorySummaryConfig {
     pub enable_thinking: Option<bool>,
     /// Whether reasoning output is included.
     pub include_reasoning: Option<bool>,
-    pub pool: AifarmPoolConfig,
 }
 
 /// AIFarm memory extractor configuration.
@@ -1273,7 +1208,6 @@ pub struct AifarmMemoryExtractorConfig {
     pub enable_thinking: Option<bool>,
     /// Whether reasoning output is included.
     pub include_reasoning: Option<bool>,
-    pub pool: AifarmPoolConfig,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1541,44 +1475,6 @@ impl AifarmStructuredJsonConfig {
     }
 }
 
-impl AifarmPoolConfig {
-    #[must_use]
-    pub fn from_go_lists(
-        models: &[String],
-        base_urls: &[String],
-        api_key: &str,
-        primary_capacity_wait: StdDuration,
-    ) -> Self {
-        let count = models.len().min(base_urls.len());
-        let mut secondary_backends = Vec::with_capacity(count);
-        for index in 0..count {
-            let model = models[index].trim();
-            let base_url = base_urls[index].trim();
-            if model.is_empty() || base_url.is_empty() {
-                continue;
-            }
-            secondary_backends.push(AifarmPoolBackendConfig {
-                name: model.to_owned(),
-                base_url: base_url.to_owned(),
-                model: model.to_owned(),
-                ..AifarmPoolBackendConfig::default()
-            });
-        }
-        Self {
-            secondary_backends,
-            secondary_api_key: api_key.trim().to_owned(),
-            primary_capacity_wait: default_duration(
-                primary_capacity_wait,
-                DEFAULT_POOL_PRIMARY_CAPACITY_WAIT,
-            ),
-        }
-    }
-
-    fn enabled(&self) -> bool {
-        !self.secondary_backends.is_empty()
-    }
-}
-
 impl AifarmDialogConfig {
     #[must_use]
     pub fn with_defaults(mut self) -> Self {
@@ -1651,44 +1547,23 @@ impl AifarmDialogConfig {
 #[derive(Clone)]
 pub struct AifarmDialogProvider<T = ReqwestAifarmTransport> {
     cfg: AifarmDialogConfig,
-    client: AifarmCompletionClient<T>,
+    client: AifarmHttpClient<T>,
     provider_name: String,
     toolbox: Option<Arc<dyn DialogToolbox>>,
-}
-
-#[derive(Clone, Debug)]
-enum AifarmCompletionClient<T = ReqwestAifarmTransport> {
-    Single(Box<AifarmHttpClient<T>>),
-    Pooled(Box<AifarmHttpPoolClient<T>>),
-}
-
-#[derive(Clone, Debug)]
-struct AifarmHttpPoolClient<T = ReqwestAifarmTransport> {
-    primary: AifarmHttpClient<T>,
-    primary_wait: AifarmHttpClient<T>,
-    primary_name: String,
-    secondaries: Vec<AifarmHttpPoolBackend<T>>,
-}
-
-#[derive(Clone, Debug)]
-struct AifarmHttpPoolBackend<T = ReqwestAifarmTransport> {
-    name: String,
-    model: String,
-    client: AifarmHttpClient<T>,
 }
 
 /// HTTP-backed AIFarm history-summary generator.
 #[derive(Clone)]
 pub struct AifarmHistorySummaryGenerator<T = ReqwestAifarmTransport> {
     cfg: AifarmHistorySummaryConfig,
-    client: AifarmCompletionClient<T>,
+    client: AifarmHttpClient<T>,
 }
 
 /// HTTP-backed AIFarm memory extractor.
 #[derive(Clone)]
 pub struct AifarmMemoryExtractor<T = ReqwestAifarmTransport> {
     cfg: AifarmMemoryExtractorConfig,
-    client: AifarmCompletionClient<T>,
+    client: AifarmHttpClient<T>,
 }
 
 /// HTTP-backed GenKit OpenAI-compatible memory extractor.
@@ -1717,11 +1592,8 @@ impl AifarmHistorySummaryGenerator<ReqwestAifarmTransport> {
     #[must_use]
     pub fn new(cfg: AifarmHistorySummaryConfig) -> Self {
         let cfg = cfg.with_defaults();
-        let client = AifarmCompletionClient::with_transport(
-            cfg.client.clone(),
-            cfg.pool.clone(),
-            ReqwestAifarmTransport::default(),
-        );
+        let client =
+            AifarmHttpClient::with_transport(cfg.client.clone(), ReqwestAifarmTransport::default());
         Self { cfg, client }
     }
 }
@@ -1731,11 +1603,8 @@ impl AifarmMemoryExtractor<ReqwestAifarmTransport> {
     #[must_use]
     pub fn new(cfg: AifarmMemoryExtractorConfig) -> Self {
         let cfg = cfg.with_defaults();
-        let client = AifarmCompletionClient::with_transport(
-            cfg.client.clone(),
-            cfg.pool.clone(),
-            ReqwestAifarmTransport::default(),
-        );
+        let client =
+            AifarmHttpClient::with_transport(cfg.client.clone(), ReqwestAifarmTransport::default());
         Self { cfg, client }
     }
 }
@@ -1958,193 +1827,6 @@ fn optimizer_messages(system_prompt: &str, text: &str) -> Vec<AifarmStructuredJs
     ]
 }
 
-impl<T> AifarmCompletionClient<T>
-where
-    T: AifarmHttpTransport + Clone,
-{
-    fn with_transport(cfg: AifarmClientConfig, pool: AifarmPoolConfig, transport: T) -> Self {
-        if !pool.enabled() {
-            return Self::Single(Box::new(AifarmHttpClient::with_transport(cfg, transport)));
-        }
-        let pooled = AifarmHttpPoolClient::with_transport(cfg.clone(), pool, transport.clone());
-        if pooled.secondaries.is_empty() {
-            Self::Single(Box::new(AifarmHttpClient::with_transport(cfg, transport)))
-        } else {
-            Self::Pooled(Box::new(pooled))
-        }
-    }
-
-    async fn complete(
-        &self,
-        request: ChatCompletionRequest,
-        on_status: &mut (dyn FnMut(StatusUpdate) + Send),
-    ) -> Result<CompletionResult, CompletionError> {
-        match self {
-            Self::Single(client) => client.complete(request, on_status).await,
-            Self::Pooled(client) => client.complete(request, on_status).await,
-        }
-    }
-}
-
-impl<T> AifarmHttpPoolClient<T>
-where
-    T: AifarmHttpTransport + Clone,
-{
-    fn with_transport(cfg: AifarmClientConfig, pool: AifarmPoolConfig, transport: T) -> Self {
-        let mut primary_cfg = cfg.clone();
-        primary_cfg.fail_fast_on_capacity_unavailable = true;
-        primary_cfg.capacity_wait = default_duration(
-            pool.primary_capacity_wait,
-            DEFAULT_POOL_PRIMARY_CAPACITY_WAIT,
-        );
-        let primary = AifarmHttpClient::with_transport(primary_cfg, transport.clone());
-        let primary_wait = AifarmHttpClient::with_transport(cfg.clone(), transport.clone());
-        let secondaries = pool
-            .secondary_backends
-            .into_iter()
-            .filter_map(|backend| {
-                let model = backend.model.trim().to_owned();
-                if model.is_empty() {
-                    return None;
-                }
-                let direct_url = if backend.url.trim().is_empty() {
-                    normalize_chat_completions_url(&backend.base_url)
-                } else {
-                    backend.url.trim().to_owned()
-                };
-                if direct_url.trim().is_empty() {
-                    return None;
-                }
-                let api_key = default_string(&backend.api_key, &pool.secondary_api_key);
-                if api_key.trim().is_empty() {
-                    return None;
-                }
-                let name = default_string(&backend.name, &model);
-                let mut secondary_cfg = cfg.clone();
-                secondary_cfg.direct_url = direct_url;
-                secondary_cfg.api_key = api_key;
-                secondary_cfg.default_model = model.clone();
-                secondary_cfg.fail_fast_on_capacity_unavailable = false;
-                Some(AifarmHttpPoolBackend {
-                    name,
-                    model,
-                    client: AifarmHttpClient::with_transport(secondary_cfg, transport.clone()),
-                })
-            })
-            .collect();
-        Self {
-            primary,
-            primary_wait,
-            primary_name: PROVIDER_AIFARM.to_owned(),
-            secondaries,
-        }
-    }
-
-    async fn complete(
-        &self,
-        request: ChatCompletionRequest,
-        on_status: &mut (dyn FnMut(StatusUpdate) + Send),
-    ) -> Result<CompletionResult, CompletionError> {
-        if !pool_enabled() {
-            return self.primary_wait.complete(request, on_status).await;
-        }
-
-        let primary_name = self.resolved_primary_name().to_owned();
-        let primary_result = {
-            let mut status = |status| {
-                emit_backend_status(on_status, &primary_name, &request.model, status);
-            };
-            self.primary.complete(request.clone(), &mut status).await
-        };
-        let primary_err = match primary_result {
-            Ok(result) => return Ok(result),
-            Err(err) if self.secondaries.is_empty() => return Err(err),
-            Err(err) => err,
-        };
-        let Some(primary_reason) = retryable_reason(primary_err.as_ref()) else {
-            return Err(primary_err);
-        };
-        let mut errors = vec![format!("{primary_name}: {primary_err}")];
-        emit_pool_fallback(on_status, &primary_name, &request.model);
-
-        if let Some(result) = self
-            .try_secondary_backends(&request, on_status, primary_reason, &mut errors)
-            .await?
-        {
-            return Ok(result);
-        }
-
-        if primary_reason == FailureReason::CapacityUnavailable {
-            emit_primary_wait(on_status, &primary_name, &request.model);
-            let mut status =
-                |status| emit_backend_status(on_status, &primary_name, &request.model, status);
-            match self
-                .primary_wait
-                .complete(request.clone(), &mut status)
-                .await
-            {
-                Ok(result) => return Ok(result),
-                Err(err) => {
-                    if retryable_reason(err.as_ref()).is_none() {
-                        return Err(err);
-                    }
-                    errors.push(format!("{primary_name} queued wait: {err}"));
-                }
-            }
-        }
-
-        Err(Box::new(ProviderError::new(
-            "aifarm_pool",
-            FailureReason::ProviderUnavailable,
-            errors.join("\n"),
-        )))
-    }
-
-    async fn try_secondary_backends(
-        &self,
-        request: &ChatCompletionRequest,
-        on_status: &mut (dyn FnMut(StatusUpdate) + Send),
-        primary_reason: FailureReason,
-        errors: &mut Vec<String>,
-    ) -> Result<Option<CompletionResult>, CompletionError> {
-        for index in self.shuffled_secondary_indices() {
-            let Some(backend) = self.secondaries.get(index) else {
-                continue;
-            };
-            let direct_request = direct_compatible_request(request, &backend.model);
-            let mut status = |status| {
-                emit_backend_status(on_status, &backend.name, &backend.model, status);
-            };
-            match backend.client.complete(direct_request, &mut status).await {
-                Ok(result) => return Ok(Some(result)),
-                Err(err) => {
-                    let retryable = retryable_reason(err.as_ref()).is_some();
-                    if !retryable && primary_reason != FailureReason::CapacityUnavailable {
-                        return Err(err);
-                    }
-                    errors.push(format!("{}: {err}", backend.name));
-                    emit_pool_fallback(on_status, &backend.name, &backend.model);
-                }
-            }
-        }
-        Ok(None)
-    }
-
-    fn shuffled_secondary_indices(&self) -> Vec<usize> {
-        let mut indices = (0..self.secondaries.len()).collect::<Vec<_>>();
-        indices.shuffle(&mut rand::rng());
-        indices
-    }
-
-    fn resolved_primary_name(&self) -> &str {
-        if self.primary_name.trim().is_empty() {
-            PROVIDER_AIFARM
-        } else {
-            self.primary_name.trim()
-        }
-    }
-}
-
 impl<T> AifarmHistorySummaryGenerator<T>
 where
     T: AifarmHttpTransport + Clone,
@@ -2153,8 +1835,7 @@ where
     #[must_use]
     pub fn with_transport(cfg: AifarmHistorySummaryConfig, transport: T) -> Self {
         let cfg = cfg.with_defaults();
-        let client =
-            AifarmCompletionClient::with_transport(cfg.client.clone(), cfg.pool.clone(), transport);
+        let client = AifarmHttpClient::with_transport(cfg.client.clone(), transport);
         Self { cfg, client }
     }
 
@@ -2229,8 +1910,7 @@ where
     #[must_use]
     pub fn with_transport(cfg: AifarmMemoryExtractorConfig, transport: T) -> Self {
         let cfg = cfg.with_defaults();
-        let client =
-            AifarmCompletionClient::with_transport(cfg.client.clone(), cfg.pool.clone(), transport);
+        let client = AifarmHttpClient::with_transport(cfg.client.clone(), transport);
         Self { cfg, client }
     }
 
@@ -2548,11 +2228,8 @@ impl AifarmDialogProvider<ReqwestAifarmTransport> {
     pub fn new(cfg: AifarmDialogConfig) -> Self {
         let cfg = cfg.with_defaults();
         let provider_name = cfg.provider();
-        let client = AifarmCompletionClient::with_transport(
-            cfg.client.clone(),
-            cfg.pool.clone(),
-            ReqwestAifarmTransport::default(),
-        );
+        let client =
+            AifarmHttpClient::with_transport(cfg.client.clone(), ReqwestAifarmTransport::default());
         Self {
             cfg,
             client,
@@ -2571,8 +2248,7 @@ where
     pub fn with_transport(cfg: AifarmDialogConfig, transport: T) -> Self {
         let cfg = cfg.with_defaults();
         let provider_name = cfg.provider();
-        let client =
-            AifarmCompletionClient::with_transport(cfg.client.clone(), cfg.pool.clone(), transport);
+        let client = AifarmHttpClient::with_transport(cfg.client.clone(), transport);
         Self {
             cfg,
             client,
@@ -3765,198 +3441,6 @@ pub struct DiscoveryInvocation {
     pub timeout_ms: i32,
 }
 
-/// Completion client boundary used by pure pool routing.
-pub trait CompletionClient {
-    /// Complete a request.
-    fn complete(
-        &mut self,
-        request: ChatCompletionRequest,
-        on_status: &mut (dyn FnMut(StatusUpdate) + Send),
-    ) -> Result<CompletionResult, CompletionError>;
-}
-
-/// Secondary backend in the text pool.
-pub struct PooledBackend {
-    name: String,
-    model: String,
-    client: Box<dyn CompletionClient>,
-}
-
-impl PooledBackend {
-    /// Build a pooled backend.
-    #[must_use]
-    pub fn new(
-        name: impl Into<String>,
-        model: impl Into<String>,
-        client: Box<dyn CompletionClient>,
-    ) -> Self {
-        Self {
-            name: name.into().trim().to_owned(),
-            model: model.into().trim().to_owned(),
-            client,
-        }
-    }
-}
-
-pub struct PooledClient {
-    primary: Box<dyn CompletionClient>,
-    primary_wait: Option<Box<dyn CompletionClient>>,
-    primary_name: String,
-    secondaries: Vec<PooledBackend>,
-    secondary_order: Option<Vec<usize>>,
-}
-
-impl PooledClient {
-    /// Build a pooled client.
-    #[must_use]
-    pub fn new(primary: Box<dyn CompletionClient>, secondaries: Vec<PooledBackend>) -> Self {
-        Self {
-            primary,
-            primary_wait: None,
-            primary_name: "aifarm".to_owned(),
-            secondaries,
-            secondary_order: None,
-        }
-    }
-
-    /// Override queued primary-wait client.
-    #[must_use]
-    pub fn with_primary_wait(mut self, primary_wait: Box<dyn CompletionClient>) -> Self {
-        self.primary_wait = Some(primary_wait);
-        self
-    }
-
-    /// Override primary backend label.
-    #[must_use]
-    pub fn with_primary_name(mut self, primary_name: impl Into<String>) -> Self {
-        self.primary_name = primary_name.into().trim().to_owned();
-        self
-    }
-
-    #[must_use]
-    pub fn with_secondary_order(mut self, secondary_order: Vec<usize>) -> Self {
-        self.secondary_order = Some(secondary_order);
-        self
-    }
-
-    pub fn complete(
-        &mut self,
-        request: ChatCompletionRequest,
-        on_status: &mut (dyn FnMut(StatusUpdate) + Send),
-    ) -> Result<CompletionResult, CompletionError> {
-        if !pool_enabled() {
-            return match self.primary_wait.as_deref_mut() {
-                Some(primary_wait) => primary_wait.complete(request, on_status),
-                None => self.primary.complete(request, on_status),
-            };
-        }
-
-        let primary_name = self.resolved_primary_name().to_owned();
-        let primary_result = {
-            let mut status = |status| {
-                emit_backend_status(on_status, &primary_name, &request.model, status);
-            };
-            self.primary.complete(request.clone(), &mut status)
-        };
-        let primary_err = match primary_result {
-            Ok(result) => return Ok(result),
-            Err(err) if self.secondaries.is_empty() => return Err(err),
-            Err(err) => err,
-        };
-
-        let Some(primary_reason) = retryable_reason(primary_err.as_ref()) else {
-            return Err(primary_err);
-        };
-
-        let mut errors = vec![format!("{primary_name}: {primary_err}")];
-        emit_pool_fallback(on_status, &primary_name, &request.model);
-
-        if let Some(result) =
-            self.try_secondary_backends(&request, on_status, primary_reason, &mut errors)?
-        {
-            return Ok(result);
-        }
-
-        if primary_reason == FailureReason::CapacityUnavailable {
-            emit_primary_wait(on_status, &primary_name, &request.model);
-            match self.complete_primary_wait(request.clone(), on_status, &primary_name) {
-                Ok(result) => return Ok(result),
-                Err(err) => {
-                    if retryable_reason(err.as_ref()).is_none() {
-                        return Err(err);
-                    }
-                    errors.push(format!("{primary_name} queued wait: {err}"));
-                }
-            }
-        }
-
-        Err(Box::new(ProviderError::new(
-            "aifarm_pool",
-            FailureReason::ProviderUnavailable,
-            errors.join("\n"),
-        )))
-    }
-
-    fn resolved_primary_name(&self) -> &str {
-        if self.primary_name.trim().is_empty() {
-            "aifarm"
-        } else {
-            self.primary_name.trim()
-        }
-    }
-
-    fn try_secondary_backends(
-        &mut self,
-        request: &ChatCompletionRequest,
-        on_status: &mut (dyn FnMut(StatusUpdate) + Send),
-        primary_reason: FailureReason,
-        errors: &mut Vec<String>,
-    ) -> Result<Option<CompletionResult>, CompletionError> {
-        for index in self.ordered_secondary_indices() {
-            let Some(backend) = self.secondaries.get_mut(index) else {
-                continue;
-            };
-            let direct_request = direct_compatible_request(request, &backend.model);
-            let mut status = |status| {
-                emit_backend_status(on_status, &backend.name, &backend.model, status);
-            };
-            let result = backend.client.complete(direct_request, &mut status);
-            match result {
-                Ok(result) => return Ok(Some(result)),
-                Err(err) => {
-                    let retryable = retryable_reason(err.as_ref()).is_some();
-                    if !retryable && primary_reason != FailureReason::CapacityUnavailable {
-                        return Err(err);
-                    }
-                    errors.push(format!("{}: {err}", backend.name));
-                    emit_pool_fallback(on_status, &backend.name, &backend.model);
-                }
-            }
-        }
-        Ok(None)
-    }
-
-    fn complete_primary_wait(
-        &mut self,
-        request: ChatCompletionRequest,
-        on_status: &mut (dyn FnMut(StatusUpdate) + Send),
-        primary_name: &str,
-    ) -> Result<CompletionResult, CompletionError> {
-        let model = request.model.clone();
-        let mut status = |status| emit_backend_status(on_status, primary_name, &model, status);
-        match self.primary_wait.as_deref_mut() {
-            Some(primary_wait) => primary_wait.complete(request, &mut status),
-            None => self.primary.complete(request, &mut status),
-        }
-    }
-
-    fn ordered_secondary_indices(&self) -> Vec<usize> {
-        self.secondary_order
-            .clone()
-            .unwrap_or_else(|| (0..self.secondaries.len()).collect())
-    }
-}
-
 /// AIFarm tool prompt mode.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ToolPromptMode {
@@ -4082,7 +3566,6 @@ pub fn direct_compatible_request(
     model: &str,
 ) -> ChatCompletionRequest {
     let mut out = request.clone();
-    let caller_max_tokens = request.max_tokens;
     out.model = model.trim().to_owned();
     out.max_tokens = DEFAULT_VRAM_CLOUD_MAX_TOKENS;
     out.temperature = Some(DEFAULT_VRAM_CLOUD_TEMPERATURE);
@@ -4096,22 +3579,7 @@ pub fn direct_compatible_request(
     out.frequency_penalty = None;
     out.presence_penalty = Some(DEFAULT_VRAM_CLOUD_PRESENCE_PENALTY);
     out.include_reasoning = None;
-    let mut kwargs = request
-        .chat_template_kwargs
-        .as_ref()
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    let reasoning_on = pool_reasoning_enabled();
-    kwargs.insert("enable_thinking".to_owned(), json!(reasoning_on));
-    out.chat_template_kwargs = Some(Value::Object(kwargs));
-    if reasoning_on {
-        out.max_tokens = caller_max_tokens;
-        let floor = pool_reasoning_max_tokens();
-        if floor > 0 && out.max_tokens < floor {
-            out.max_tokens = floor;
-        }
-    }
+    out.chat_template_kwargs = request.chat_template_kwargs.clone();
     out
 }
 
@@ -5311,46 +4779,6 @@ fn saturating_i32(value: u128) -> i32 {
     i32::try_from(value).unwrap_or(i32::MAX)
 }
 
-fn emit_backend_status(
-    on_status: &mut (dyn FnMut(StatusUpdate) + Send),
-    backend: &str,
-    model: &str,
-    mut status: StatusUpdate,
-) {
-    if status.backend.is_empty() {
-        status.backend = backend.trim().to_owned();
-    }
-    if status.model.is_empty() {
-        status.model = model.trim().to_owned();
-    }
-    on_status(status);
-}
-
-fn emit_pool_fallback(
-    on_status: &mut (dyn FnMut(StatusUpdate) + Send),
-    backend: &str,
-    model: &str,
-) {
-    on_status(StatusUpdate {
-        status: STATUS_QUEUED.to_owned(),
-        message: "text llm pool backend failed, trying next backend".to_owned(),
-        backend: backend.trim().to_owned(),
-        model: model.trim().to_owned(),
-        ..StatusUpdate::default()
-    });
-}
-
-fn emit_primary_wait(on_status: &mut (dyn FnMut(StatusUpdate) + Send), backend: &str, model: &str) {
-    on_status(StatusUpdate {
-        status: STATUS_QUEUED.to_owned(),
-        message: "text llm pool secondaries unavailable, waiting for primary backend capacity"
-            .to_owned(),
-        backend: backend.trim().to_owned(),
-        model: model.trim().to_owned(),
-        ..StatusUpdate::default()
-    });
-}
-
 fn render_tool_catalog(tools: &[ToolSpec]) -> String {
     let mut out = String::new();
     out.push_str("    <tools>\n");
@@ -6050,14 +5478,6 @@ mod tests {
         TOOL_RESULT_STATUS_OK, ToolSideEffect,
     };
 
-    static POOL_REASONING_TEST_LOCK: Mutex<()> = Mutex::new(());
-
-    fn lock_pool_reasoning_test() -> MutexGuard<'static, ()> {
-        POOL_REASONING_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
     fn at(hour: u8, minute: u8) -> OffsetDateTime {
         time::Date::from_calendar_date(2026, Month::May, 1)
             .expect("date")
@@ -6078,58 +5498,6 @@ mod tests {
                 full_name: "Alice".to_owned(),
             },
             ..DialogInput::default()
-        }
-    }
-
-    #[derive(Clone, Debug)]
-    struct FakeCompletionClient {
-        state: Arc<Mutex<FakeCompletionClientState>>,
-    }
-
-    #[derive(Debug, Default)]
-    struct FakeCompletionClientState {
-        requests: Vec<ChatCompletionRequest>,
-        results: VecDeque<Result<CompletionResult, CompletionError>>,
-    }
-
-    impl FakeCompletionClient {
-        fn new(results: Vec<Result<CompletionResult, CompletionError>>) -> Self {
-            Self {
-                state: Arc::new(Mutex::new(FakeCompletionClientState {
-                    requests: Vec::new(),
-                    results: results.into(),
-                })),
-            }
-        }
-
-        fn request_count(&self) -> usize {
-            self.state().requests.len()
-        }
-
-        fn request_at(&self, index: usize) -> ChatCompletionRequest {
-            self.state().requests[index].clone()
-        }
-
-        fn state(&self) -> MutexGuard<'_, FakeCompletionClientState> {
-            match self.state.lock() {
-                Ok(state) => state,
-                Err(err) => panic!("fake completion client state poisoned: {err}"),
-            }
-        }
-    }
-
-    impl CompletionClient for FakeCompletionClient {
-        fn complete(
-            &mut self,
-            request: ChatCompletionRequest,
-            _on_status: &mut (dyn FnMut(StatusUpdate) + Send),
-        ) -> Result<CompletionResult, CompletionError> {
-            let mut state = self.state();
-            state.requests.push(request);
-            state
-                .results
-                .pop_front()
-                .unwrap_or_else(|| Ok(CompletionResult::default()))
         }
     }
 
@@ -6514,95 +5882,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn aifarm_history_summary_generator_uses_pool_client() -> Result<(), Box<dyn Error>> {
-        let content = serde_json::to_string(&json!({
-            "summary_json": {
-                "events": ["pooled summary"],
-                "event_details": [],
-                "actors": [],
-                "recap": "secondary",
-                "open_questions": [],
-                "source_style": "log",
-                "quality_score": 0.5
-            }
-        }))?;
-        let response = json!({
-            "choices": [{"message": {"role": "assistant", "content": content}}],
-        });
-        let transport = FakeTransport::new(vec![
-            Ok(AifarmHttpResponse {
-                status_code: 503,
-                status_text: "Service Unavailable".to_owned(),
-                body: br#"{"error":"capacity slot unavailable"}"#.to_vec(),
-                ..AifarmHttpResponse::default()
-            }),
-            Ok(AifarmHttpResponse {
-                status_code: 200,
-                status_text: "OK".to_owned(),
-                body: serde_json::to_vec(&response)?,
-                ..AifarmHttpResponse::default()
-            }),
-        ]);
-        let generator = AifarmHistorySummaryGenerator::with_transport(
-            AifarmHistorySummaryConfig {
-                client: AifarmClientConfig {
-                    base_url: "https://primary-summary.example.test".to_owned(),
-                    default_model: "summary-primary".to_owned(),
-                    poll_interval: StdDuration::from_nanos(1),
-                    task_timeout: StdDuration::from_secs(1),
-                    ..AifarmClientConfig::default()
-                },
-                model: "summary-primary".to_owned(),
-                pool: AifarmPoolConfig {
-                    secondary_backends: vec![AifarmPoolBackendConfig {
-                        base_url: "https://secondary-summary.example.test/v1".to_owned(),
-                        model: "summary-secondary".to_owned(),
-                        ..AifarmPoolBackendConfig::default()
-                    }],
-                    secondary_api_key: "summary-pool-key".to_owned(),
-                    primary_capacity_wait: StdDuration::from_millis(500),
-                },
-                ..AifarmHistorySummaryConfig::default()
-            },
-            transport.clone(),
-        );
-        let mut statuses = Vec::new();
-
-        let doc = generator
-            .generate_document(
-                &openplotva_history::SummaryInput {
-                    input_hash: "pool-input".to_owned(),
-                    ..openplotva_history::SummaryInput::default()
-                },
-                &mut |status| statuses.push(status),
-            )
-            .await?;
-
-        assert_eq!(doc.content.events, vec!["pooled summary"]);
-        let requests = transport.requests();
-        assert_eq!(requests.len(), 2);
-        assert_eq!(
-            requests[0].url,
-            "https://primary-summary.example.test/v1/jobs/blocking"
-        );
-        assert_eq!(
-            requests[1].url,
-            "https://secondary-summary.example.test/v1/chat/completions"
-        );
-        assert_eq!(
-            requests[1].headers["Authorization"],
-            "Bearer summary-pool-key"
-        );
-        let body: Value = serde_json::from_slice(&requests[1].body)?;
-        assert_eq!(body["model"], "summary-secondary");
-        assert_eq!(
-            statuses.first().map(|status| status.message.as_str()),
-            Some("text llm pool backend failed, trying next backend")
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn aifarm_memory_extractor_matches_go_request_and_decode() -> Result<(), Box<dyn Error>> {
         let completion_payload = serde_json::to_string(&json!({
             "usage": {"prompt_tokens": 111, "completion_tokens": 22},
@@ -6747,81 +6026,6 @@ mod tests {
 
         assert_eq!(out.input_tokens, 13);
         assert_eq!(out.output_tokens, 7);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn aifarm_memory_extractor_uses_pool_client() -> Result<(), Box<dyn Error>> {
-        let response = json!({
-            "choices": [{
-                "message": {
-                    "role": "assistant",
-                    "content": "{\"episode_summary\":\"pooled\",\"topics\":[],\"participants\":[],\"candidate_cards\":[],\"supersessions\":[],\"links\":[]}"
-                }
-            }]
-        });
-        let transport = FakeTransport::new(vec![
-            Ok(AifarmHttpResponse {
-                status_code: 503,
-                status_text: "Service Unavailable".to_owned(),
-                body: br#"{"error":"capacity slot unavailable"}"#.to_vec(),
-                ..AifarmHttpResponse::default()
-            }),
-            Ok(AifarmHttpResponse {
-                status_code: 200,
-                status_text: "OK".to_owned(),
-                body: serde_json::to_vec(&response)?,
-                ..AifarmHttpResponse::default()
-            }),
-        ]);
-        let extractor = AifarmMemoryExtractor::with_transport(
-            AifarmMemoryExtractorConfig {
-                client: AifarmClientConfig {
-                    base_url: "https://primary-memory.example.test".to_owned(),
-                    default_model: "memory-primary".to_owned(),
-                    poll_interval: StdDuration::from_nanos(1),
-                    task_timeout: StdDuration::from_secs(1),
-                    ..AifarmClientConfig::default()
-                },
-                model: "memory-primary".to_owned(),
-                pool: AifarmPoolConfig {
-                    secondary_backends: vec![AifarmPoolBackendConfig {
-                        base_url: "https://secondary-memory.example.test/v1".to_owned(),
-                        model: "memory-secondary".to_owned(),
-                        ..AifarmPoolBackendConfig::default()
-                    }],
-                    secondary_api_key: "memory-pool-key".to_owned(),
-                    primary_capacity_wait: StdDuration::from_millis(500),
-                },
-                ..AifarmMemoryExtractorConfig::default()
-            },
-            transport.clone(),
-        );
-        let mut statuses = Vec::new();
-
-        let out = extractor
-            .extract(&ExtractInput::default(), &mut |status| {
-                statuses.push(status)
-            })
-            .await?;
-
-        assert_eq!(out.episode_summary, "pooled");
-        let requests = transport.requests();
-        assert_eq!(requests.len(), 2);
-        assert_eq!(
-            requests[1].url,
-            "https://secondary-memory.example.test/v1/chat/completions"
-        );
-        assert_eq!(
-            requests[1].headers["Authorization"],
-            "Bearer memory-pool-key"
-        );
-        let body: Value = serde_json::from_slice(&requests[1].body)?;
-        assert_eq!(body["model"], "memory-secondary");
-        assert_eq!(
-            statuses.first().map(|status| status.message.as_str()),
-            Some("text llm pool backend failed, trying next backend")
-        );
         Ok(())
     }
 
@@ -8558,10 +7762,6 @@ mod tests {
 
     #[test]
     fn direct_compatible_request_strips_llama_only_controls() {
-        let _guard = lock_pool_reasoning_test();
-        let previous_reasoning = pool_reasoning_enabled();
-        let previous_floor = pool_reasoning_max_tokens();
-        set_pool_reasoning_enabled(false);
         let request = ChatCompletionRequest {
             model: "primary".to_owned(),
             messages: vec![ChatMessage {
@@ -8586,8 +7786,6 @@ mod tests {
 
         let direct = direct_compatible_request(&request, " second-model ");
 
-        set_pool_reasoning_enabled(previous_reasoning);
-        set_pool_reasoning_max_tokens(previous_floor);
         assert_eq!(direct.model, "second-model");
         assert_eq!(direct.max_tokens, DEFAULT_VRAM_CLOUD_MAX_TOKENS);
         assert_eq!(direct.temperature, Some(DEFAULT_VRAM_CLOUD_TEMPERATURE));
@@ -8616,54 +7814,6 @@ mod tests {
         assert_eq!(body["repetition_penalty"], json!(1.0));
         assert!(body.get("repeat_penalty").is_none());
         assert!(body.get("frequency_penalty").is_none());
-    }
-
-    #[test]
-    fn direct_compatible_request_reasoning_restores_caller_tokens_with_floor() {
-        let _guard = lock_pool_reasoning_test();
-        let previous_reasoning = pool_reasoning_enabled();
-        let previous_floor = pool_reasoning_max_tokens();
-        set_pool_reasoning_enabled(true);
-        set_pool_reasoning_max_tokens(4096);
-        let request = ChatCompletionRequest {
-            model: "primary".to_owned(),
-            messages: vec![ChatMessage {
-                role: "user".to_owned(),
-                content: "ping".to_owned(),
-                content_parts: Vec::new(),
-            }],
-            max_tokens: 2048,
-            temperature: Some(0.2),
-            top_p: Some(0.95),
-            repeat_penalty: Some(1.1),
-            frequency_penalty: Some(0.2),
-            presence_penalty: Some(0.3),
-            chat_template_kwargs: Some(json!({"enable_thinking": false})),
-            ..ChatCompletionRequest::default()
-        };
-
-        let direct = direct_compatible_request(&request, "second-model");
-
-        set_pool_reasoning_enabled(previous_reasoning);
-        set_pool_reasoning_max_tokens(previous_floor);
-        assert_eq!(direct.max_tokens, 4096);
-        assert_eq!(direct.temperature, Some(DEFAULT_VRAM_CLOUD_TEMPERATURE));
-        assert_eq!(direct.top_p, Some(DEFAULT_VRAM_CLOUD_TOP_P));
-        assert_eq!(direct.top_k, Some(DEFAULT_VRAM_CLOUD_TOP_K));
-        assert_eq!(direct.repeat_penalty, None);
-        assert_eq!(direct.frequency_penalty, None);
-        assert_eq!(
-            direct.repetition_penalty,
-            Some(DEFAULT_VRAM_CLOUD_REPETITION_PENALTY)
-        );
-        assert_eq!(
-            direct.presence_penalty,
-            Some(DEFAULT_VRAM_CLOUD_PRESENCE_PENALTY)
-        );
-        assert_eq!(
-            direct.chat_template_kwargs,
-            Some(json!({ "enable_thinking": true }))
-        );
     }
 
     #[test]
@@ -8794,38 +7944,6 @@ mod tests {
         assert_eq!(job.wait_for_capacity_ms, 1);
         assert_eq!(job.capacity_poll_ms, 25);
         assert_eq!(job.invocation.timeout_ms, DEFAULT_TIMEOUT_MS);
-    }
-
-    #[test]
-    fn aifarm_pool_config_from_go_lists_trims_skips_and_defaults() {
-        let models = vec![
-            " first-model ".to_owned(),
-            " ".to_owned(),
-            "third-model".to_owned(),
-        ];
-        let base_urls = vec![
-            " http://first.test/v1 ".to_owned(),
-            "http://skip.test/v1".to_owned(),
-            " ".to_owned(),
-        ];
-
-        let pool =
-            AifarmPoolConfig::from_go_lists(&models, &base_urls, " pool-key ", StdDuration::ZERO);
-
-        assert_eq!(
-            pool.secondary_backends,
-            vec![AifarmPoolBackendConfig {
-                name: "first-model".to_owned(),
-                base_url: "http://first.test/v1".to_owned(),
-                model: "first-model".to_owned(),
-                ..AifarmPoolBackendConfig::default()
-            }]
-        );
-        assert_eq!(pool.secondary_api_key, "pool-key");
-        assert_eq!(
-            pool.primary_capacity_wait,
-            DEFAULT_POOL_PRIMARY_CAPACITY_WAIT
-        );
     }
 
     #[tokio::test]
@@ -8966,104 +8084,6 @@ mod tests {
             Some("waiting for Discovery service capacity")
         );
         assert_eq!(probe.requests().len(), 3);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn http_dialog_pool_falls_through_capacity_to_secondary_direct_endpoint()
-    -> Result<(), CompletionError> {
-        let transport = FakeTransport::new(vec![
-            Ok(AifarmHttpResponse {
-                status_code: 503,
-                status_text: "Service Unavailable".to_owned(),
-                body: br#"{"error":"capacity slot unavailable"}"#.to_vec(),
-                ..AifarmHttpResponse::default()
-            }),
-            Ok(AifarmHttpResponse {
-                status_code: 200,
-                status_text: "OK".to_owned(),
-                body: br#"{"id":"cmpl-1","choices":[{"message":{"role":"assistant","content":"secondary-ok"}}]}"#.to_vec(),
-                ..AifarmHttpResponse::default()
-            }),
-        ]);
-        let probe = transport.clone();
-        let client = AifarmCompletionClient::with_transport(
-            AifarmClientConfig {
-                base_url: "https://primary.example.test".to_owned(),
-                default_model: "primary-model".to_owned(),
-                poll_interval: StdDuration::from_nanos(1),
-                task_timeout: StdDuration::from_secs(1),
-                ..AifarmClientConfig::default()
-            },
-            AifarmPoolConfig {
-                secondary_backends: vec![AifarmPoolBackendConfig {
-                    base_url: "https://secondary.example.test/v1".to_owned(),
-                    model: "secondary-model".to_owned(),
-                    ..AifarmPoolBackendConfig::default()
-                }],
-                secondary_api_key: "pool-key".to_owned(),
-                primary_capacity_wait: StdDuration::from_millis(750),
-            },
-            transport,
-        );
-        let mut statuses = Vec::new();
-
-        let result = client
-            .complete(
-                ChatCompletionRequest {
-                    model: "primary-model".to_owned(),
-                    messages: vec![ChatMessage {
-                        role: "user".to_owned(),
-                        content: "ping".to_owned(),
-                        content_parts: Vec::new(),
-                    }],
-                    repeat_penalty: Some(1.1),
-                    include_reasoning: Some(false),
-                    chat_template_kwargs: Some(json!({"enable_thinking": false})),
-                    ..ChatCompletionRequest::default()
-                },
-                &mut |status| statuses.push(status),
-            )
-            .await?;
-
-        assert_eq!(completion_text(&result), Some("secondary-ok"));
-        let requests = probe.requests();
-        assert_eq!(requests.len(), 2);
-        assert_eq!(
-            requests[0].url,
-            "https://primary.example.test/v1/jobs/blocking"
-        );
-        let job: DiscoveryJobRequest =
-            serde_json::from_slice(&requests[0].body).expect("discovery job request");
-        assert_eq!(job.wait_for_capacity_ms, 750);
-        assert_eq!(
-            requests[1].url,
-            "https://secondary.example.test/v1/chat/completions"
-        );
-        assert_eq!(requests[1].headers["Authorization"], "Bearer pool-key");
-        let direct_request: ChatCompletionRequest =
-            serde_json::from_slice(&requests[1].body).expect("direct chat request");
-        assert_eq!(direct_request.model, "secondary-model");
-        assert_eq!(direct_request.repeat_penalty, None);
-        assert_eq!(direct_request.include_reasoning, None);
-        assert_eq!(
-            direct_request.chat_template_kwargs,
-            Some(json!({ "enable_thinking": false }))
-        );
-        assert_eq!(
-            statuses.first(),
-            Some(&StatusUpdate {
-                status: STATUS_QUEUED.to_owned(),
-                message: "text llm pool backend failed, trying next backend".to_owned(),
-                backend: "aifarm".to_owned(),
-                model: "primary-model".to_owned(),
-                ..StatusUpdate::default()
-            })
-        );
-        assert_eq!(
-            statuses.last().map(|status| status.backend.as_str()),
-            Some("secondary-model")
-        );
         Ok(())
     }
 
@@ -9305,252 +8325,6 @@ mod tests {
         assert_eq!(status.http_status, 503);
         assert_eq!(status.message, "upstream unavailable");
         Ok(())
-    }
-
-    #[test]
-    fn priority_pool_uses_primary_when_accepted() -> Result<(), CompletionError> {
-        let primary = FakeCompletionClient::new(vec![ok_completion("primary")]);
-        let primary_probe = primary.clone();
-        let secondary = FakeCompletionClient::new(vec![ok_completion("secondary")]);
-        let secondary_probe = secondary.clone();
-        let mut client = PooledClient::new(
-            Box::new(primary),
-            vec![PooledBackend::new(
-                "pooled-model-a",
-                "pooled-model-a",
-                Box::new(secondary),
-            )],
-        );
-        let mut statuses = Vec::new();
-
-        let result = client.complete(
-            ChatCompletionRequest {
-                model: "primary-model".to_owned(),
-                messages: vec![ChatMessage {
-                    role: "user".to_owned(),
-                    content: "ping".to_owned(),
-                    content_parts: Vec::new(),
-                }],
-                ..ChatCompletionRequest::default()
-            },
-            &mut |status| statuses.push(status),
-        )?;
-
-        assert_eq!(completion_text(&result), Some("primary"));
-        assert_eq!(primary_probe.request_count(), 1);
-        assert_eq!(secondary_probe.request_count(), 0);
-        assert!(statuses.is_empty());
-        Ok(())
-    }
-
-    #[test]
-    fn priority_pool_falls_through_capacity_to_ordered_secondary() -> Result<(), CompletionError> {
-        let primary = FakeCompletionClient::new(vec![provider_failure(
-            "aifarm",
-            FailureReason::CapacityUnavailable,
-            "no slots",
-        )]);
-        let primary_probe = primary.clone();
-        let first = FakeCompletionClient::new(vec![ok_completion("first")]);
-        let first_probe = first.clone();
-        let second = FakeCompletionClient::new(vec![ok_completion("second")]);
-        let second_probe = second.clone();
-        let mut client = PooledClient::new(
-            Box::new(primary),
-            vec![
-                PooledBackend::new("first", "first-model", Box::new(first)),
-                PooledBackend::new("second", "second-model", Box::new(second)),
-            ],
-        )
-        .with_secondary_order(vec![1, 0]);
-        let mut statuses = Vec::new();
-
-        let result = client.complete(
-            ChatCompletionRequest {
-                model: "primary-model".to_owned(),
-                messages: vec![ChatMessage {
-                    role: "user".to_owned(),
-                    content: "ping".to_owned(),
-                    content_parts: Vec::new(),
-                }],
-                repeat_penalty: Some(1.1),
-                include_reasoning: Some(false),
-                chat_template_kwargs: Some(json!({"enable_thinking": false})),
-                ..ChatCompletionRequest::default()
-            },
-            &mut |status| statuses.push(status),
-        )?;
-
-        assert_eq!(completion_text(&result), Some("second"));
-        assert_eq!(primary_probe.request_count(), 1);
-        assert_eq!(first_probe.request_count(), 0);
-        assert_eq!(second_probe.request_count(), 1);
-        let second_request = second_probe.request_at(0);
-        assert_eq!(second_request.model, "second-model");
-        assert_eq!(second_request.repeat_penalty, None);
-        assert_eq!(second_request.include_reasoning, None);
-        assert_eq!(
-            second_request.chat_template_kwargs,
-            Some(json!({ "enable_thinking": false }))
-        );
-        assert_eq!(
-            statuses,
-            vec![StatusUpdate {
-                status: STATUS_QUEUED.to_owned(),
-                message: "text llm pool backend failed, trying next backend".to_owned(),
-                backend: "aifarm".to_owned(),
-                model: "primary-model".to_owned(),
-                ..StatusUpdate::default()
-            }]
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn priority_pool_waits_for_primary_capacity_when_secondaries_unavailable()
-    -> Result<(), CompletionError> {
-        let primary = FakeCompletionClient::new(vec![provider_failure(
-            "aifarm",
-            FailureReason::CapacityUnavailable,
-            "no slots",
-        )]);
-        let primary_probe = primary.clone();
-        let primary_wait = FakeCompletionClient::new(vec![ok_completion("primary-after-queue")]);
-        let primary_wait_probe = primary_wait.clone();
-        let first = FakeCompletionClient::new(vec![provider_failure(
-            "first",
-            FailureReason::ProviderUnavailable,
-            "connection refused",
-        )]);
-        let first_probe = first.clone();
-        let second = FakeCompletionClient::new(vec![simple_failure("context deadline exceeded")]);
-        let second_probe = second.clone();
-        let mut client = PooledClient::new(
-            Box::new(primary),
-            vec![
-                PooledBackend::new("first", "first-model", Box::new(first)),
-                PooledBackend::new("second", "second-model", Box::new(second)),
-            ],
-        )
-        .with_primary_wait(Box::new(primary_wait));
-        let mut statuses = Vec::new();
-
-        let result = client.complete(
-            ChatCompletionRequest {
-                model: "primary-model".to_owned(),
-                messages: vec![ChatMessage {
-                    role: "user".to_owned(),
-                    content: "ping".to_owned(),
-                    content_parts: Vec::new(),
-                }],
-                ..ChatCompletionRequest::default()
-            },
-            &mut |status| statuses.push(status),
-        )?;
-
-        assert_eq!(completion_text(&result), Some("primary-after-queue"));
-        assert_eq!(primary_probe.request_count(), 1);
-        assert_eq!(primary_wait_probe.request_count(), 1);
-        assert_eq!(first_probe.request_count(), 1);
-        assert_eq!(second_probe.request_count(), 1);
-        assert_eq!(
-            statuses.last(),
-            Some(&StatusUpdate {
-                status: STATUS_QUEUED.to_owned(),
-                message:
-                    "text llm pool secondaries unavailable, waiting for primary backend capacity"
-                        .to_owned(),
-                backend: "aifarm".to_owned(),
-                model: "primary-model".to_owned(),
-                ..StatusUpdate::default()
-            })
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn priority_pool_skips_secondaries_on_nonretryable_primary_error() {
-        let primary =
-            FakeCompletionClient::new(vec![simple_failure("validation failed: empty prompt")]);
-        let secondary = FakeCompletionClient::new(vec![ok_completion("secondary")]);
-        let secondary_probe = secondary.clone();
-        let mut client = PooledClient::new(
-            Box::new(primary),
-            vec![PooledBackend::new(
-                "pooled-model-a",
-                "pooled-model-a",
-                Box::new(secondary),
-            )],
-        );
-        let mut statuses = Vec::new();
-
-        let err = client
-            .complete(
-                ChatCompletionRequest {
-                    model: "primary-model".to_owned(),
-                    messages: vec![ChatMessage {
-                        role: "user".to_owned(),
-                        content: "ping".to_owned(),
-                        content_parts: Vec::new(),
-                    }],
-                    ..ChatCompletionRequest::default()
-                },
-                &mut |status| statuses.push(status),
-            )
-            .err()
-            .map(|err| err.to_string());
-
-        assert_eq!(err.as_deref(), Some("validation failed: empty prompt"));
-        assert_eq!(secondary_probe.request_count(), 0);
-        assert!(statuses.is_empty());
-    }
-
-    #[test]
-    fn priority_pool_returns_retryable_error_after_all_backends_and_primary_wait_fail() {
-        let primary = FakeCompletionClient::new(vec![provider_failure(
-            "aifarm",
-            FailureReason::CapacityUnavailable,
-            "no slots",
-        )]);
-        let primary_wait =
-            FakeCompletionClient::new(vec![simple_failure("context deadline exceeded")]);
-        let first = FakeCompletionClient::new(vec![provider_failure(
-            "first",
-            FailureReason::ProviderUnavailable,
-            "connection refused",
-        )]);
-        let second = FakeCompletionClient::new(vec![simple_failure("context deadline exceeded")]);
-        let mut client = PooledClient::new(
-            Box::new(primary),
-            vec![
-                PooledBackend::new("first", "first-model", Box::new(first)),
-                PooledBackend::new("second", "second-model", Box::new(second)),
-            ],
-        )
-        .with_primary_wait(Box::new(primary_wait));
-        let mut statuses = Vec::new();
-
-        let err = client
-            .complete(
-                ChatCompletionRequest {
-                    model: "primary-model".to_owned(),
-                    messages: vec![ChatMessage {
-                        role: "user".to_owned(),
-                        content: "ping".to_owned(),
-                        content_parts: Vec::new(),
-                    }],
-                    ..ChatCompletionRequest::default()
-                },
-                &mut |status| statuses.push(status),
-            )
-            .expect_err("pool should fail");
-
-        assert_eq!(
-            retryable_reason(err.as_ref()),
-            Some(FailureReason::ProviderUnavailable)
-        );
-        assert!(err.to_string().contains("aifarm_pool provider"));
-        assert_eq!(statuses.len(), 4);
     }
 
     #[test]

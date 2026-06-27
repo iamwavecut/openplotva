@@ -192,8 +192,6 @@ pub const DEFAULT_AGENTIC_SEARCH_MAX_TOTAL_TOKENS: i32 = 60000;
 
 pub const DEFAULT_AGENTIC_SEARCH_WALL_TIMEOUT_SECONDS: i32 = 120;
 
-pub const DEFAULT_DIALOG_AIFARM_POOL_REASONING_MAX_TOKENS: i32 = 8192;
-
 pub const DEFAULT_VISION_DISCOVERY_SERVICE_NAME: &str = DEFAULT_DIALOG_DISCOVERY_SERVICE_NAME;
 
 pub const DEFAULT_VISION_DISCOVERY_ENDPOINT_NAME: &str = DEFAULT_DIALOG_DISCOVERY_ENDPOINT_NAME;
@@ -723,7 +721,6 @@ pub struct DialogConfig {
     pub aifarm_pool_base_urls: Vec<String>,
     pub aifarm_pool_api_key: String,
     pub aifarm_pool_primary_capacity_wait_ms: i32,
-    pub aifarm_pool_reasoning_max_tokens: i32,
     pub vmlx_url: String,
     pub vmlx_api_key: String,
     pub vmlx_model: String,
@@ -1088,8 +1085,6 @@ pub struct RawConfig {
     pub dialog_aifarm_pool_api_key: Option<String>,
     /// `DIALOG_AIFARM_POOL_PRIMARY_CAPACITY_WAIT_MS`.
     pub dialog_aifarm_pool_primary_capacity_wait_ms: Option<String>,
-    /// `DIALOG_AIFARM_POOL_REASONING_MAX_TOKENS`.
-    pub dialog_aifarm_pool_reasoning_max_tokens: Option<String>,
     /// `DIALOG_VMLX_URL`.
     pub dialog_vmlx_url: Option<String>,
     /// `DIALOG_VMLX_API_KEY`.
@@ -2031,11 +2026,6 @@ impl AppConfig {
                         raw.dialog_aifarm_pool_primary_capacity_wait_ms,
                         500,
                     )?,
-                    aifarm_pool_reasoning_max_tokens: parse_i32(
-                        "DIALOG_AIFARM_POOL_REASONING_MAX_TOKENS",
-                        raw.dialog_aifarm_pool_reasoning_max_tokens,
-                        DEFAULT_DIALOG_AIFARM_POOL_REASONING_MAX_TOKENS,
-                    )?,
                     vmlx_url: raw
                         .dialog_vmlx_url
                         .unwrap_or_else(|| DEFAULT_DIALOG_VMLX_URL.to_owned()),
@@ -2602,7 +2592,6 @@ impl RawConfig {
             dialog_aifarm_pool_primary_capacity_wait_ms: env(
                 "DIALOG_AIFARM_POOL_PRIMARY_CAPACITY_WAIT_MS",
             ),
-            dialog_aifarm_pool_reasoning_max_tokens: env("DIALOG_AIFARM_POOL_REASONING_MAX_TOKENS"),
             dialog_vmlx_url: env("DIALOG_VMLX_URL"),
             dialog_vmlx_api_key: env("DIALOG_VMLX_API_KEY"),
             dialog_vmlx_model: env("DIALOG_VMLX_MODEL"),
@@ -3065,11 +3054,10 @@ mod tests {
         DEFAULT_ACESTEP_BASE_URL, DEFAULT_ACESTEP_MODEL, DEFAULT_ACESTEP_POLL_INTERVAL_SECONDS,
         DEFAULT_ACESTEP_REQUEST_TIMEOUT_SECONDS, DEFAULT_ACESTEP_TASK_TIMEOUT_SECONDS,
         DEFAULT_BOT_WEBHOOK_UPDATE_BUFFER_SIZE, DEFAULT_DIALOG_AIFARM_POOL_BASE_URLS,
-        DEFAULT_DIALOG_AIFARM_POOL_MODELS, DEFAULT_DIALOG_AIFARM_POOL_REASONING_MAX_TOKENS,
-        DEFAULT_DIALOG_MODEL, DEFAULT_DISCOVERY_BASE_URL, DEFAULT_HISTORY_SUMMARY_PROVIDER,
-        DEFAULT_HISTORY_SUMMARY_TIMEOUT_SECONDS, DEFAULT_LLM_JOB_MAX_ATTEMPTS, DEFAULT_LOG_FILTER,
-        DEFAULT_MARKET_RATES_TIMEOUT_SECONDS, DEFAULT_MEMORY_CONSOLIDATION_MODEL,
-        DEFAULT_OPENROUTER_REQUEST_TIMEOUT_SECONDS,
+        DEFAULT_DIALOG_AIFARM_POOL_MODELS, DEFAULT_DIALOG_MODEL, DEFAULT_DISCOVERY_BASE_URL,
+        DEFAULT_HISTORY_SUMMARY_PROVIDER, DEFAULT_HISTORY_SUMMARY_TIMEOUT_SECONDS,
+        DEFAULT_LLM_JOB_MAX_ATTEMPTS, DEFAULT_LOG_FILTER, DEFAULT_MARKET_RATES_TIMEOUT_SECONDS,
+        DEFAULT_MEMORY_CONSOLIDATION_MODEL, DEFAULT_OPENROUTER_REQUEST_TIMEOUT_SECONDS,
         DEFAULT_PERSISTENT_QUEUE_CLEANUP_INTERVAL_SECONDS,
         DEFAULT_PERSISTENT_QUEUE_COMPLETED_JOB_RETENTION_DAYS,
         DEFAULT_PERSISTENT_QUEUE_CONTROL_WORKERS,
@@ -3297,10 +3285,6 @@ mod tests {
         assert_eq!(
             config.llm.dialog.aifarm_pool_base_urls,
             parse_string_list_or_default(None, DEFAULT_DIALOG_AIFARM_POOL_BASE_URLS)
-        );
-        assert_eq!(
-            config.llm.dialog.aifarm_pool_reasoning_max_tokens,
-            DEFAULT_DIALOG_AIFARM_POOL_REASONING_MAX_TOKENS
         );
         assert_eq!(
             config.llm.dialog.nvidia_url,
@@ -4334,7 +4318,6 @@ mod tests {
             dialog_aifarm_pool_models: Some("primary, secondary ".to_owned()),
             dialog_aifarm_pool_base_urls: Some("http://one.test, http://two.test".to_owned()),
             dialog_aifarm_pool_api_key: Some("pool-key".to_owned()),
-            dialog_aifarm_pool_reasoning_max_tokens: Some("4096".to_owned()),
             dialog_nvidia_temperature: Some("0.7".to_owned()),
             ..RawConfig::default()
         })?;
@@ -4353,7 +4336,6 @@ mod tests {
             vec!["http://one.test", "http://two.test"]
         );
         assert_eq!(config.llm.dialog.aifarm_pool_api_key, "pool-key");
-        assert_eq!(config.llm.dialog.aifarm_pool_reasoning_max_tokens, 4096);
         assert_eq!(config.llm.dialog.nvidia_temperature, 0.7);
 
         Ok(())
