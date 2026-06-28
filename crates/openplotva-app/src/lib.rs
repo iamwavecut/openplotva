@@ -45,6 +45,7 @@ mod runtime_gemini_cache;
 mod runtime_llm;
 mod runtime_llm_analytics;
 mod runtime_pending_ops;
+mod runtime_retention;
 mod runtime_safety;
 mod runtime_sql;
 mod runtime_taskman;
