@@ -20,7 +20,6 @@ use openplotva_llm::aifarm::{
     is_success_status, parse_job_error,
 };
 use openplotva_llm::retry::{FailureReason, retryable_reason_from_message};
-use openplotva_media::pruna::{PrunaClient, PrunaConfig, PrunaRequest};
 use openplotva_taskman::{
     DEFAULT_LLM_JOB_MAX_ATTEMPTS, IMAGE_REGULAR_QUEUE_NAME, IMAGE_VIP_QUEUE_NAME,
     ImageEditJobParams, ImageGenJobParams, InMemoryTaskQueue, JobType,
@@ -275,19 +274,6 @@ pub fn aifarm_draw_api_config_from_app_config(config: &AppConfig) -> AifarmDrawA
     .with_defaults()
 }
 
-/// Build Pruna config from app config.
-#[must_use]
-pub fn pruna_config_from_app_config(config: &AppConfig) -> PrunaConfig {
-    PrunaConfig {
-        endpoint: config.pruna.endpoint.clone(),
-        model: config.pruna.model.clone(),
-        api_key: config.pruna.api_key.clone(),
-        bearer: config.pruna.bearer.clone(),
-        timeout: duration_seconds_or_zero(config.pruna.timeout_seconds),
-    }
-    .with_defaults()
-}
-
 /// Generated draw-api result.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DrawApiGenerateResult {
@@ -530,60 +516,6 @@ where
         Box::pin(async move {
             self.edit_image_with_job_id(request, &generated_draw_job_id())
                 .await
-        })
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct PrunaImageGenerator {
-    client: PrunaClient,
-}
-
-impl PrunaImageGenerator {
-    /// Build a Pruna image generator.
-    pub fn new(config: PrunaConfig) -> Result<Self, ImageGenerationError> {
-        Ok(Self {
-            client: PrunaClient::new(config)
-                .map_err(|error| ImageGenerationError::Provider(error.to_string()))?,
-        })
-    }
-}
-
-impl ImageGenerator for PrunaImageGenerator {
-    fn generate_image<'a>(&'a self, request: ImageGenerationRequest) -> ImageGenerationFuture<'a> {
-        Box::pin(async move {
-            let prompt = draw_api_prompt_text(&request);
-            if prompt.trim().is_empty() {
-                return Ok(ImageGenerationResult::default());
-            }
-            let result = self
-                .client
-                .generate(PrunaRequest {
-                    prompt,
-                    aspect_ratio: request.aspect_ratio,
-                    visitor_id: String::new(),
-                })
-                .await
-                .map_err(|error| ImageGenerationError::Provider(error.to_string()))?;
-            Ok(ImageGenerationResult {
-                image_url: result.url.clone(),
-                image_urls: if result.urls.is_empty() {
-                    (!result.url.is_empty())
-                        .then_some(result.url)
-                        .into_iter()
-                        .collect()
-                } else {
-                    result.urls
-                },
-                image_bytes: if result.images.is_empty() {
-                    (!result.image.is_empty())
-                        .then_some(result.image)
-                        .into_iter()
-                        .collect()
-                } else {
-                    result.images
-                },
-            })
         })
     }
 }
@@ -855,7 +787,6 @@ pub trait ImageEditor {
 #[derive(Clone)]
 pub struct RoutedImageGenerator {
     walker: RoutedAttemptWalker,
-    pruna_config: PrunaConfig,
     draw_api_config: AifarmDrawApiConfig,
     workflow_key: String,
     expected_image_count: usize,
@@ -863,14 +794,9 @@ pub struct RoutedImageGenerator {
 
 impl RoutedImageGenerator {
     #[must_use]
-    pub fn new(
-        walker: RoutedAttemptWalker,
-        pruna_config: PrunaConfig,
-        draw_api_config: AifarmDrawApiConfig,
-    ) -> Self {
+    pub fn new(walker: RoutedAttemptWalker, draw_api_config: AifarmDrawApiConfig) -> Self {
         Self {
             walker,
-            pruna_config: pruna_config.with_defaults(),
             draw_api_config: draw_api_config.with_defaults(),
             workflow_key: IMAGE_GENERATION_WORKFLOW_KEY.to_owned(),
             expected_image_count: 1,
@@ -892,7 +818,6 @@ impl ImageGenerator for RoutedImageGenerator {
     fn generate_image<'a>(&'a self, request: ImageGenerationRequest) -> ImageGenerationFuture<'a> {
         Box::pin(async move {
             let request_for_attempts = request.clone();
-            let pruna_config = self.pruna_config.clone();
             let draw_api_config = self.draw_api_config.clone();
             let result = self
                 .walker
@@ -900,16 +825,10 @@ impl ImageGenerator for RoutedImageGenerator {
                     image_generation_context(&self.workflow_key, &request),
                     move |attempt| {
                         let request = request_for_attempts.clone();
-                        let pruna_config = pruna_config.clone();
                         let draw_api_config = draw_api_config.clone();
                         async move {
-                            generate_image_with_routed_attempt(
-                                attempt,
-                                request,
-                                pruna_config,
-                                draw_api_config,
-                            )
-                            .await
+                            generate_image_with_routed_attempt(attempt, request, draw_api_config)
+                                .await
                         }
                     },
                     image_generation_retryable_reason,
@@ -1016,13 +935,8 @@ fn image_edit_context(request: &ImageEditRequest) -> RoutedRequestContext {
 async fn generate_image_with_routed_attempt(
     attempt: RoutedAttempt,
     request: ImageGenerationRequest,
-    pruna_config: PrunaConfig,
     draw_api_config: AifarmDrawApiConfig,
 ) -> Result<ImageGenerationResult, ImageGenerationError> {
-    if routed_attempt_is_pruna(&attempt) {
-        let generator = PrunaImageGenerator::new(pruna_config_for_attempt(pruna_config, &attempt))?;
-        return generator.generate_image(request).await;
-    }
     if routed_attempt_is_draw_api(&attempt) {
         let generator = AifarmDrawApiImageGenerator::new(draw_api_config_for_attempt(
             draw_api_config,
@@ -1059,15 +973,6 @@ where
     editor.edit_image(request).await
 }
 
-fn routed_attempt_is_pruna(attempt: &RoutedAttempt) -> bool {
-    attempt.provider_name.eq_ignore_ascii_case("pruna")
-        || attempt
-            .provider_config
-            .get("provider")
-            .and_then(Value::as_str)
-            .is_some_and(|value| value.eq_ignore_ascii_case("pruna"))
-}
-
 fn routed_attempt_is_draw_api(attempt: &RoutedAttempt) -> bool {
     attempt.provider_name.eq_ignore_ascii_case("aifarm-draw")
         || attempt.provider_name.eq_ignore_ascii_case("draw-api")
@@ -1075,16 +980,6 @@ fn routed_attempt_is_draw_api(attempt: &RoutedAttempt) -> bool {
             .discovery_service_name
             .as_deref()
             .is_some_and(|value| value.eq_ignore_ascii_case(AIFARM_DRAW_API_SERVICE_NAME))
-}
-
-fn pruna_config_for_attempt(mut config: PrunaConfig, attempt: &RoutedAttempt) -> PrunaConfig {
-    if let Some(endpoint) = routed_endpoint(attempt) {
-        config.endpoint = endpoint;
-    }
-    if !attempt.model_name.trim().is_empty() {
-        config.model = attempt.model_name.clone();
-    }
-    config.with_defaults()
 }
 
 fn draw_api_config_for_attempt(
@@ -3645,13 +3540,6 @@ fn duration_ms(duration: StdDuration) -> i32 {
     duration.as_millis().min(i32::MAX as u128) as i32
 }
 
-fn duration_seconds_or_zero(seconds: i32) -> StdDuration {
-    u64::try_from(seconds)
-        .ok()
-        .filter(|seconds| *seconds > 0)
-        .map_or(StdDuration::ZERO, StdDuration::from_secs)
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -5047,29 +4935,6 @@ mod tests {
     }
 
     #[test]
-    fn pruna_config_from_app_config_maps_go_pruna_env() -> Result<(), openplotva_config::ConfigError>
-    {
-        let config = AppConfig::from_raw(openplotva_config::RawConfig {
-            pruna_endpoint: Some(" https://pruna.test/replicate ".to_owned()),
-            pruna_model: Some(" test/pruna ".to_owned()),
-            pruna_api_key: Some(" api-key ".to_owned()),
-            pruna_bearer: Some(" bearer-token ".to_owned()),
-            pruna_timeout_seconds: Some("45".to_owned()),
-            ..openplotva_config::RawConfig::default()
-        })?;
-
-        let pruna = pruna_config_from_app_config(&config);
-
-        assert_eq!(pruna.endpoint, "https://pruna.test/replicate");
-        assert_eq!(pruna.model, "test/pruna");
-        assert_eq!(pruna.api_key, "api-key");
-        assert_eq!(pruna.bearer, "bearer-token");
-        assert_eq!(pruna.timeout, StdDuration::from_secs(45));
-        assert!(pruna.configured());
-        Ok(())
-    }
-
-    #[test]
     fn decode_draw_api_result_payload_accepts_go_shapes() {
         let image = general_purpose::STANDARD.encode([1_u8, 2, 3]);
         let images = decode_draw_api_result_payload(
@@ -5601,7 +5466,7 @@ mod tests {
 
     #[tokio::test]
     async fn fallback_image_generator_uses_primary_success_without_fallback() {
-        let primary = GeneratorStub::success("https://pruna.test/1.png");
+        let primary = GeneratorStub::success("https://primary-image.test/1.png");
         let fallback = GeneratorStub::success("https://drawapi.test/1.png");
         let generator = FallbackImageGenerator::new(primary.clone(), fallback.clone());
 
@@ -5614,14 +5479,14 @@ mod tests {
             .await
             .expect("primary result");
 
-        assert_eq!(result.image_url, "https://pruna.test/1.png");
+        assert_eq!(result.image_url, "https://primary-image.test/1.png");
         assert_eq!(primary.requests().len(), 1);
         assert!(fallback.requests().is_empty());
     }
 
     #[tokio::test]
     async fn fallback_image_generator_falls_back_after_primary_provider_failure() {
-        let primary = GeneratorStub::error("pruna unavailable");
+        let primary = GeneratorStub::error("primary image provider unavailable");
         let fallback = GeneratorStub::success("https://drawapi.test/1.png");
         let generator = FallbackImageGenerator::new(primary.clone(), fallback.clone());
 

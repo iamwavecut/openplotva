@@ -12,7 +12,7 @@ Never commit:
 
 - Telegram bot tokens or webhook secrets.
 - Provider API keys.
-- Gemini, OpenRouter, AIFarm, ACE-Step, Pruna, Serper, or database credentials.
+- Gemini, OpenRouter, AIFarm, ACE-Step, Serper, or database credentials.
 - `.env` files with live values.
 - Production database dumps or Redis snapshots.
 - Private Telegram file IDs or chat/user IDs used for live smokes.

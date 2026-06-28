@@ -20,7 +20,7 @@ use openplotva_storage::llm_routing::{
     AssignmentInput, AssignmentRecord, ModelInput, ModelRecord, ProviderInput, ProviderRecord,
     RoutingSnapshot, TriggerInput, TriggerRecord, WorkflowRecord, insert_assignment, insert_model,
     insert_provider, insert_trigger, insert_workflow_if_missing, list_assignments, list_models,
-    list_providers, load_snapshot, update_assignment, update_model,
+    list_providers, load_snapshot, update_assignment, update_model, update_provider,
 };
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -268,17 +268,24 @@ pub async fn seed_routing_from_env(
     let image_model = seed_provider_model(
         pool,
         ProviderInput {
-            name: "pruna".to_owned(),
+            name: DRAW_API_PROVIDER.to_owned(),
             kind: "image".to_owned(),
-            endpoint: Some(config.pruna.endpoint.clone()),
-            discovery_service_name: None,
-            discovery_endpoint_name: None,
-            api_key_ref: Some("PRUNA_BEARER".to_owned()),
+            endpoint: Some(config.llm.discovery.base_url.clone()),
+            discovery_service_name: Some(
+                crate::image_jobs::AIFARM_DRAW_API_SERVICE_NAME.to_owned(),
+            ),
+            discovery_endpoint_name: Some(
+                crate::image_jobs::AIFARM_DRAW_API_ENDPOINT_NAME.to_owned(),
+            ),
+            api_key_ref: None,
             api_key_encrypted: None,
             enabled: true,
-            config: json!({}),
+            config: json!({
+                "service_name": crate::image_jobs::AIFARM_DRAW_API_SERVICE_NAME,
+                "endpoint_name": crate::image_jobs::AIFARM_DRAW_API_ENDPOINT_NAME,
+            }),
         },
-        config.pruna.model.as_str(),
+        DRAW_API_MODEL,
         None,
         &["image"],
         None,
@@ -593,6 +600,7 @@ pub async fn backfill_gpu_models(pool: &PgPool, config: &AppConfig) -> Result<bo
 
 const GENKIT_FLASH_FIX_KEY: &str = "llm.routing.genkit_flash_fixed";
 const DECLARATIVE_V2_KEY: &str = "llm.routing.declarative_v2";
+const IMAGE_DRAW_API_PRIMARY_KEY: &str = "llm.routing.image_draw_api_primary";
 const DRAW_API_PROVIDER: &str = "aifarm-draw";
 const DRAW_API_MODEL: &str = "draw-api";
 const IMAGE_EDIT_WORKFLOW: &str = "image_edit";
@@ -795,6 +803,106 @@ async fn ensure_primary_assignment(
     .await
 }
 
+async fn ensure_draw_api_model(
+    pool: &PgPool,
+    providers: &mut Vec<ProviderRecord>,
+    models: &mut Vec<ModelRecord>,
+    config: &AppConfig,
+) -> Result<i64, StorageError> {
+    let provider_input = ProviderInput {
+        name: DRAW_API_PROVIDER.to_owned(),
+        kind: "image".to_owned(),
+        endpoint: Some(config.llm.discovery.base_url.clone()),
+        discovery_service_name: Some(crate::image_jobs::AIFARM_DRAW_API_SERVICE_NAME.to_owned()),
+        discovery_endpoint_name: Some(crate::image_jobs::AIFARM_DRAW_API_ENDPOINT_NAME.to_owned()),
+        api_key_ref: None,
+        api_key_encrypted: None,
+        enabled: true,
+        config: json!({
+            "service_name": crate::image_jobs::AIFARM_DRAW_API_SERVICE_NAME,
+            "endpoint_name": crate::image_jobs::AIFARM_DRAW_API_ENDPOINT_NAME,
+        }),
+    };
+    let draw_provider_id = ensure_provider(pool, providers, provider_input.clone()).await?;
+    update_provider(pool, draw_provider_id, &provider_input).await?;
+    if let Some(provider) = providers
+        .iter_mut()
+        .find(|provider| provider.id == draw_provider_id)
+    {
+        provider.name = provider_input.name;
+        provider.kind = provider_input.kind;
+        provider.endpoint = provider_input.endpoint;
+        provider.discovery_service_name = provider_input.discovery_service_name;
+        provider.discovery_endpoint_name = provider_input.discovery_endpoint_name;
+        provider.api_key_ref = provider_input.api_key_ref;
+        provider.api_key_encrypted = provider_input.api_key_encrypted;
+        provider.enabled = provider_input.enabled;
+        provider.config = provider_input.config;
+    }
+
+    let model_input = ModelInput {
+        provider_id: draw_provider_id,
+        model_name: DRAW_API_MODEL.to_owned(),
+        display_name: Some("AI Farm draw-api".to_owned()),
+        base_url: None,
+        capabilities: vec!["image".to_owned()],
+        embedding_dim: None,
+        enabled: true,
+        config: json!({
+            "service_name": crate::image_jobs::AIFARM_DRAW_API_SERVICE_NAME,
+            "endpoint_name": crate::image_jobs::AIFARM_DRAW_API_ENDPOINT_NAME,
+        }),
+    };
+    let draw_model_id = ensure_model(pool, models, model_input.clone()).await?;
+    update_model(pool, draw_model_id, &model_input).await?;
+    if let Some(model) = models.iter_mut().find(|model| model.id == draw_model_id) {
+        model.provider_id = model_input.provider_id;
+        model.model_name = model_input.model_name;
+        model.display_name = model_input.display_name;
+        model.base_url = model_input.base_url;
+        model.capabilities = model_input.capabilities;
+        model.embedding_dim = model_input.embedding_dim;
+        model.enabled = model_input.enabled;
+        model.config = model_input.config;
+    }
+    Ok(draw_model_id)
+}
+
+async fn ensure_image_generation_draw_api_primary_assignment(
+    pool: &PgPool,
+    assignments: &mut Vec<AssignmentRecord>,
+    draw_model_id: i64,
+) -> Result<(), StorageError> {
+    ensure_primary_assignment(
+        pool,
+        assignments,
+        "image_generation",
+        draw_model_id,
+        Some(100),
+    )
+    .await?;
+    for assignment in assignments.iter_mut().filter(|assignment| {
+        assignment.workflow_key == "image_generation"
+            && assignment.scope == "global"
+            && assignment.role == "primary"
+    }) {
+        let should_enable = assignment.provider_model_id == draw_model_id;
+        if assignment.enabled == should_enable && (!should_enable || assignment.weight == Some(100))
+        {
+            continue;
+        }
+        let mut input = assignment_input_from_record(assignment, assignment.provider_model_id);
+        input.enabled = should_enable;
+        if should_enable {
+            input.weight = Some(100);
+        }
+        update_assignment(pool, assignment.id, &input).await?;
+        assignment.enabled = input.enabled;
+        assignment.weight = input.weight;
+    }
+    Ok(())
+}
+
 fn trigger_exists(
     triggers: &[TriggerRecord],
     workflow: &str,
@@ -826,47 +934,7 @@ pub async fn backfill_declarative_v2(
     let mut assignments = list_assignments(pool).await?;
     let triggers = openplotva_storage::llm_routing::list_triggers(pool).await?;
 
-    let draw_provider_id = ensure_provider(
-        pool,
-        &mut providers,
-        ProviderInput {
-            name: DRAW_API_PROVIDER.to_owned(),
-            kind: "image".to_owned(),
-            endpoint: Some(config.llm.discovery.base_url.clone()),
-            discovery_service_name: Some(
-                crate::image_jobs::AIFARM_DRAW_API_SERVICE_NAME.to_owned(),
-            ),
-            discovery_endpoint_name: Some(
-                crate::image_jobs::AIFARM_DRAW_API_ENDPOINT_NAME.to_owned(),
-            ),
-            api_key_ref: None,
-            api_key_encrypted: None,
-            enabled: true,
-            config: json!({
-                "service_name": crate::image_jobs::AIFARM_DRAW_API_SERVICE_NAME,
-                "endpoint_name": crate::image_jobs::AIFARM_DRAW_API_ENDPOINT_NAME,
-            }),
-        },
-    )
-    .await?;
-    let draw_model_id = ensure_model(
-        pool,
-        &mut models,
-        ModelInput {
-            provider_id: draw_provider_id,
-            model_name: DRAW_API_MODEL.to_owned(),
-            display_name: Some("AI Farm draw-api".to_owned()),
-            base_url: None,
-            capabilities: vec!["image".to_owned()],
-            embedding_dim: None,
-            enabled: true,
-            config: json!({
-                "service_name": crate::image_jobs::AIFARM_DRAW_API_SERVICE_NAME,
-                "endpoint_name": crate::image_jobs::AIFARM_DRAW_API_ENDPOINT_NAME,
-            }),
-        },
-    )
-    .await?;
+    let draw_model_id = ensure_draw_api_model(pool, &mut providers, &mut models, config).await?;
     ensure_primary_assignment(
         pool,
         &mut assignments,
@@ -875,6 +943,8 @@ pub async fn backfill_declarative_v2(
         Some(100),
     )
     .await?;
+    ensure_image_generation_draw_api_primary_assignment(pool, &mut assignments, draw_model_id)
+        .await?;
     if !assignment_exists(&assignments, "image_generation", "fallback", draw_model_id) {
         ensure_assignment(
             pool,
@@ -1018,6 +1088,27 @@ pub async fn backfill_declarative_v2(
 
     mark_app_setting(pool, DECLARATIVE_V2_KEY).await?;
     tracing::info!("backfilled declarative routing v2 rows");
+    Ok(true)
+}
+
+pub async fn backfill_image_generation_draw_api_primary(
+    pool: &PgPool,
+    config: &AppConfig,
+) -> Result<bool, StorageError> {
+    if app_setting_present(pool, IMAGE_DRAW_API_PRIMARY_KEY).await? {
+        return Ok(false);
+    }
+
+    insert_workflow_if_missing(pool, "image_generation", "image", true, 3, 60_000, true).await?;
+    let mut providers = list_providers(pool).await?;
+    let mut models = list_models(pool).await?;
+    let mut assignments = list_assignments(pool).await?;
+    let draw_model_id = ensure_draw_api_model(pool, &mut providers, &mut models, config).await?;
+    ensure_image_generation_draw_api_primary_assignment(pool, &mut assignments, draw_model_id)
+        .await?;
+
+    mark_app_setting(pool, IMAGE_DRAW_API_PRIMARY_KEY).await?;
+    tracing::info!("backfilled image_generation primary to draw-api");
     Ok(true)
 }
 

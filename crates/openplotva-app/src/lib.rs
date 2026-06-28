@@ -8561,8 +8561,6 @@ fn runtime_api_graphql_snapshot(
         dialog_provider: config.llm.dialog.provider.clone(),
         dialog_fallback_provider: Some(config.llm.dialog.fallback_provider.clone())
             .filter(|value| !value.trim().is_empty()),
-        pruna_endpoint: Some(config.pruna.endpoint.trim().to_owned())
-            .filter(|value| !value.is_empty()),
         persistent_queue_enabled: config.persistent_queue.enabled,
         active_draw_providers: runtime_active_draw_providers(config),
         sql_timeout_ms: config.runtime_api.sql_timeout_ms,
@@ -8577,9 +8575,6 @@ fn runtime_active_draw_providers(config: &AppConfig) -> Vec<String> {
     let mut providers = Vec::new();
     if !config.llm.discovery.base_url.trim().is_empty() {
         providers.push("drawapi".to_owned());
-    }
-    if !config.pruna.endpoint.trim().is_empty() {
-        providers.push("pruna".to_owned());
     }
     providers.sort();
     providers
@@ -9139,6 +9134,16 @@ async fn start_runtime_workers(
             &error.to_string(),
         ));
         tracing::warn!(%error, "failed to backfill declarative routing v2 rows");
+    }
+    if let Err(error) =
+        model_routing::backfill_image_generation_draw_api_primary(&service_clients.postgres, config)
+            .await
+    {
+        routing_event_reporter.record(runtime_routing::routing_backfill_failed_event(
+            "backfill_image_generation_draw_api_primary",
+            &error.to_string(),
+        ));
+        tracing::warn!(%error, "failed to backfill image generation draw-api primary");
     }
     let router_breakers = Arc::new(openplotva_llm::router::BreakerSet::new());
     let router_triggers = Arc::new(openplotva_llm::router::TriggerState::new());
@@ -10639,7 +10644,6 @@ async fn start_runtime_workers(
     .with_reporter(routing_event_reporter.clone());
     let routed_vip_image_generator = image_jobs::RoutedImageGenerator::new(
         image_attempt_walker.clone(),
-        image_jobs::pruna_config_from_app_config(config),
         image_jobs::aifarm_draw_api_config_from_app_config(config),
     );
     let vip_image_generator = image_jobs::OptimizingImageGenerator::new(
@@ -10710,7 +10714,6 @@ async fn start_runtime_workers(
     let regular_image_generator = image_jobs::OptimizingImageGenerator::new(
         image_jobs::RoutedImageGenerator::new(
             image_attempt_walker,
-            image_jobs::pruna_config_from_app_config(config),
             image_jobs::aifarm_draw_api_config_from_app_config(config),
         ),
         media_prompt_optimizer,
@@ -10742,7 +10745,7 @@ async fn start_runtime_workers(
     workers.handles.push(regular_image_worker);
     readiness_checks.push(ReadinessCheck::ok(
         "image_jobs",
-        "Image taskman workers started for VIP generation/edit and regular generation queues with VIP Pruna-or-draw-api first slot plus draw-api second slot/edit/regular providers",
+        "Image taskman workers started for VIP generation/edit and regular generation queues with draw-api providers",
     ));
     for queue_name in image_jobs::IMAGE_VIP_JOB_WORKER_QUEUES {
         shared_taskman_worker_counts
@@ -12214,7 +12217,6 @@ mod tests {
             vision_request_timeout_seconds: Some("88".to_owned()),
             acestep_enabled: Some("true".to_owned()),
             acestep_base_url: Some(" https://ace.test ".to_owned()),
-            pruna_endpoint: Some(" https://pruna.test/replicate ".to_owned()),
             ..openplotva_config::RawConfig::default()
         })?;
 
@@ -12248,14 +12250,7 @@ mod tests {
             snapshot.ace_step_base_url.as_deref(),
             Some("https://ace.test")
         );
-        assert_eq!(
-            snapshot.active_draw_providers,
-            vec!["drawapi".to_owned(), "pruna".to_owned()]
-        );
-        assert_eq!(
-            snapshot.pruna_endpoint.as_deref(),
-            Some("https://pruna.test/replicate")
-        );
+        assert_eq!(snapshot.active_draw_providers, vec!["drawapi".to_owned()]);
         Ok(())
     }
 

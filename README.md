@@ -60,7 +60,7 @@ The app reads `.env` files and environment variables. Important groups:
 - `ADMINS_ADMIN_IDS` for administrative Telegram users.
 - `RUNTIME_API_*` for the optional diagnostic API.
 - `PERSISTENT_QUEUE_*` for worker and queue behavior.
-- `DISCOVERY_*`, `DIALOG_*`, `GOOGLEAI_*`, `OPENROUTER_*`, `PRUNA_*`, `ACESTEP_*`, `MEMORY_*`, `SHIELD_*`, `VISION_*`, and `SERPER_*` for provider integrations.
+- `DISCOVERY_*`, `DIALOG_*`, `GOOGLEAI_*`, `OPENROUTER_*`, `ACESTEP_*`, `MEMORY_*`, `SHIELD_*`, `VISION_*`, and `SERPER_*` for provider integrations.
 
 Service connections are opt-in by default for local shell runs:
 

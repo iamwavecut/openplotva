@@ -228,16 +228,6 @@ pub const DEFAULT_ACESTEP_AUDIO_FORMAT: &str = "mp3";
 
 pub const DEFAULT_ACESTEP_MODEL: &str = "acemusic/acestep-v1.5-turbo";
 
-pub const DEFAULT_PRUNA_ENDPOINT: &str = "";
-
-pub const DEFAULT_PRUNA_MODEL: &str = "prunaai/p-image";
-
-pub const DEFAULT_PRUNA_API_KEY: &str = "";
-
-pub const DEFAULT_PRUNA_BEARER: &str = "";
-
-pub const DEFAULT_PRUNA_TIMEOUT_SECONDS: i32 = 120;
-
 /// Default media uploader request timeout, `PLOTVA_UPLOADER_TIMEOUT_SECONDS`.
 pub const DEFAULT_UPLOADER_TIMEOUT_SECONDS: i32 = 120;
 
@@ -328,7 +318,6 @@ pub struct AppConfig {
     pub translation: TranslationConfig,
     pub google_ai: GoogleAiConfig,
     pub open_router: OpenRouterConfig,
-    pub pruna: PrunaConfig,
     /// Media uploader (plotva.geta.moe) configuration.
     pub uploader: UploaderConfig,
     pub white_circle: WhiteCircleConfig,
@@ -585,20 +574,6 @@ pub struct OpenRouterConfig {
     pub key: String,
     /// Request timeout, from `OPENROUTER_REQUEST_TIMEOUT_SECONDS`.
     pub request_timeout_seconds: i32,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct PrunaConfig {
-    /// Supabase function endpoint, from `PRUNA_ENDPOINT`.
-    pub endpoint: String,
-    /// Replicate model endpoint, from `PRUNA_MODEL`.
-    pub model: String,
-    /// Supabase API key, from `PRUNA_API_KEY`.
-    pub api_key: String,
-    /// Bearer token, from `PRUNA_BEARER`.
-    pub bearer: String,
-    /// Request timeout, from `PRUNA_TIMEOUT_SECONDS`.
-    pub timeout_seconds: i32,
 }
 
 /// Media uploader (plotva.geta.moe) configuration.
@@ -1018,16 +993,6 @@ pub struct RawConfig {
     pub openrouter_key: Option<String>,
     /// `OPENROUTER_REQUEST_TIMEOUT_SECONDS`.
     pub openrouter_request_timeout_seconds: Option<String>,
-    /// `PRUNA_ENDPOINT`.
-    pub pruna_endpoint: Option<String>,
-    /// `PRUNA_MODEL`.
-    pub pruna_model: Option<String>,
-    /// `PRUNA_API_KEY`.
-    pub pruna_api_key: Option<String>,
-    /// `PRUNA_BEARER`.
-    pub pruna_bearer: Option<String>,
-    /// `PRUNA_TIMEOUT_SECONDS`.
-    pub pruna_timeout_seconds: Option<String>,
     /// `PLOTVA_UPLOADER_URL`.
     pub uploader_url: Option<String>,
     /// `PLOTVA_UPLOADER_SECRET`.
@@ -1882,25 +1847,6 @@ impl AppConfig {
                 key: raw.openrouter_key.unwrap_or_default(),
                 request_timeout_seconds: openrouter_request_timeout_seconds,
             },
-            pruna: PrunaConfig {
-                endpoint: raw
-                    .pruna_endpoint
-                    .unwrap_or_else(|| DEFAULT_PRUNA_ENDPOINT.to_owned()),
-                model: raw
-                    .pruna_model
-                    .unwrap_or_else(|| DEFAULT_PRUNA_MODEL.to_owned()),
-                api_key: raw
-                    .pruna_api_key
-                    .unwrap_or_else(|| DEFAULT_PRUNA_API_KEY.to_owned()),
-                bearer: raw
-                    .pruna_bearer
-                    .unwrap_or_else(|| DEFAULT_PRUNA_BEARER.to_owned()),
-                timeout_seconds: parse_i32(
-                    "PRUNA_TIMEOUT_SECONDS",
-                    raw.pruna_timeout_seconds,
-                    DEFAULT_PRUNA_TIMEOUT_SECONDS,
-                )?,
-            },
             uploader: UploaderConfig {
                 base_url: raw.uploader_url.unwrap_or_default(),
                 secret: raw.uploader_secret.unwrap_or_default(),
@@ -2585,11 +2531,6 @@ impl RawConfig {
             googleai_key_stats_file: env("GOOGLEAI_KEY_STATS_FILE"),
             openrouter_key: env("OPENROUTER_KEY"),
             openrouter_request_timeout_seconds: env("OPENROUTER_REQUEST_TIMEOUT_SECONDS"),
-            pruna_endpoint: env("PRUNA_ENDPOINT"),
-            pruna_model: env("PRUNA_MODEL"),
-            pruna_api_key: env("PRUNA_API_KEY"),
-            pruna_bearer: env("PRUNA_BEARER"),
-            pruna_timeout_seconds: env("PRUNA_TIMEOUT_SECONDS"),
             uploader_url: env("PLOTVA_UPLOADER_URL"),
             uploader_secret: env("PLOTVA_UPLOADER_SECRET"),
             uploader_timeout_seconds: env("PLOTVA_UPLOADER_TIMEOUT_SECONDS"),
@@ -3115,9 +3056,7 @@ mod tests {
         DEFAULT_PERSISTENT_QUEUE_PLACEHOLDER_CLEANUP_INTERVAL_SECONDS,
         DEFAULT_PERSISTENT_QUEUE_PLACEHOLDER_MAX_AGE_SECONDS,
         DEFAULT_PERSISTENT_QUEUE_RECOVERY_INTERVAL_SECONDS, DEFAULT_PERSISTENT_QUEUE_TEXT_WORKERS,
-        DEFAULT_PRUNA_API_KEY, DEFAULT_PRUNA_BEARER, DEFAULT_PRUNA_ENDPOINT, DEFAULT_PRUNA_MODEL,
-        DEFAULT_PRUNA_TIMEOUT_SECONDS, DEFAULT_RUNTIME_API_HOST,
-        DEFAULT_RUNTIME_API_LOG_BUFFER_SIZE, DEFAULT_RUNTIME_API_PORT,
+        DEFAULT_RUNTIME_API_HOST, DEFAULT_RUNTIME_API_LOG_BUFFER_SIZE, DEFAULT_RUNTIME_API_PORT,
         DEFAULT_RUNTIME_API_SQL_RESULT_BYTES_LIMIT, DEFAULT_RUNTIME_API_SQL_ROW_LIMIT,
         DEFAULT_RUNTIME_API_SQL_TIMEOUT_MS, DEFAULT_SERPER_TIMEOUT_SECONDS,
         DEFAULT_SHIELD_EMBEDDING_DIM, DEFAULT_SHIELD_LEXICAL_MIN_SCORE, DEFAULT_SHIELD_MAX_MATCHES,
@@ -3385,11 +3324,6 @@ mod tests {
             DEFAULT_ACESTEP_AUDIO_FORMAT
         );
         assert_eq!(config.music.acestep.model, DEFAULT_ACESTEP_MODEL);
-        assert_eq!(config.pruna.endpoint, DEFAULT_PRUNA_ENDPOINT);
-        assert_eq!(config.pruna.model, DEFAULT_PRUNA_MODEL);
-        assert_eq!(config.pruna.api_key, DEFAULT_PRUNA_API_KEY);
-        assert_eq!(config.pruna.bearer, DEFAULT_PRUNA_BEARER);
-        assert_eq!(config.pruna.timeout_seconds, DEFAULT_PRUNA_TIMEOUT_SECONDS);
         assert!(config.memory.enabled);
         assert_eq!(config.memory.retention_hours, 168);
         assert_eq!(config.llm.history_summary.chat_history_retention_days, 8);
@@ -3927,25 +3861,6 @@ mod tests {
 
         assert_eq!(config.open_router.key, " openrouter-key ");
         assert_eq!(config.open_router.request_timeout_seconds, 123);
-        Ok(())
-    }
-
-    #[test]
-    fn pruna_config_loads_env_values() -> Result<(), super::ConfigError> {
-        let config = AppConfig::from_raw(RawConfig {
-            pruna_endpoint: Some(" https://pruna.test/replicate ".to_owned()),
-            pruna_model: Some(" test/pruna ".to_owned()),
-            pruna_api_key: Some(" api-key ".to_owned()),
-            pruna_bearer: Some(" bearer-token ".to_owned()),
-            pruna_timeout_seconds: Some("45".to_owned()),
-            ..RawConfig::default()
-        })?;
-
-        assert_eq!(config.pruna.endpoint, " https://pruna.test/replicate ");
-        assert_eq!(config.pruna.model, " test/pruna ");
-        assert_eq!(config.pruna.api_key, " api-key ");
-        assert_eq!(config.pruna.bearer, " bearer-token ");
-        assert_eq!(config.pruna.timeout_seconds, 45);
         Ok(())
     }
 

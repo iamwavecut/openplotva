@@ -283,8 +283,6 @@ run_media_provider_contract_smoke() {
   cargo test -p openplotva-app vision -- --nocapture
   echo "+ offline ACE-Step client contract smokes"
   cargo test -p openplotva-media client_ -- --nocapture
-  echo "+ offline Pruna image provider contract smokes"
-  cargo test -p openplotva-media pruna -- --nocapture
 }
 
 run_llm_provider_contract_smoke() {
