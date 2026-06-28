@@ -724,6 +724,33 @@ pub const SQL_SELECT_RECENT_CHAT_HISTORY_BY_SENDER_PAYLOADS: &str = "SELECT payl
 pub const SQL_ENSURE_CHAT_HISTORY_PARTITION: &str =
     "SELECT ensure_chat_history_partition($1::date)";
 
+pub const SQL_DROP_EXPIRED_CHAT_HISTORY_PARTITIONS: &str =
+    "SELECT drop_expired_chat_history_partitions((current_date - $1::int))";
+
+pub const SQL_DELETE_OLD_TELEGRAM_FILES_BATCH: &str = r#"
+WITH doomed AS (
+    SELECT file_unique_id
+    FROM telegram_files
+    WHERE last_seen_at < now() - ($1::int * interval '1 day')
+    ORDER BY last_seen_at ASC
+    LIMIT $2
+)
+DELETE FROM telegram_files t
+USING doomed
+WHERE t.file_unique_id = doomed.file_unique_id"#;
+
+pub const SQL_DELETE_OLD_WHITECIRCLE_CHECKS_BATCH: &str = r#"
+WITH doomed AS (
+    SELECT id
+    FROM whitecircle_checks
+    WHERE created_at < now() - ($1::int * interval '1 day')
+    ORDER BY created_at ASC
+    LIMIT $2
+)
+DELETE FROM whitecircle_checks w
+USING doomed
+WHERE w.id = doomed.id"#;
+
 pub const SQL_UPSERT_HISTORY_ENTRY: &str = "INSERT INTO chat_history_entries (bucket_day, chat_id, thread_id, message_id, entry_id, kind, role, occurred_at, sender_id, payload) VALUES ($1::date, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb) ON CONFLICT (bucket_day, chat_id, entry_id) DO UPDATE SET thread_id = EXCLUDED.thread_id, message_id = EXCLUDED.message_id, kind = EXCLUDED.kind, role = EXCLUDED.role, occurred_at = EXCLUDED.occurred_at, sender_id = EXCLUDED.sender_id, payload = EXCLUDED.payload, updated_at = CURRENT_TIMESTAMP";
 
 pub const SQL_SELECT_CHAT_SUMMARY_ENTRY_PAYLOADS: &str = "SELECT payload::text AS payload FROM chat_history_entries WHERE chat_id = $1 AND occurred_at > $2 AND occurred_at <= $3 AND kind = 'text' ORDER BY occurred_at ASC, message_id ASC, entry_id ASC";
@@ -7467,6 +7494,65 @@ pub async fn run_migrations_on(pool: &PgPool) -> Result<(), StorageError> {
     MIGRATOR.run(pool).await.map_err(StorageError::from)
 }
 
+/// Drop `chat_history_entries` daily partitions older than `retention_days`,
+/// returning the names of the partitions that were dropped. No-op when
+/// `retention_days <= 0`. Delegates to the `drop_expired_chat_history_partitions`
+/// SQL function (migration 102), which only ever touches
+/// `chat_history_entries_YYYYMMDD` partitions strictly older than the cutoff.
+pub async fn drop_expired_chat_history_partitions(
+    pool: &PgPool,
+    retention_days: i32,
+) -> Result<Vec<String>, sqlx::Error> {
+    if retention_days <= 0 {
+        return Ok(Vec::new());
+    }
+    let dropped: Vec<String> = sqlx::query_scalar(SQL_DROP_EXPIRED_CHAT_HISTORY_PARTITIONS)
+        .bind(retention_days)
+        .fetch_one(pool)
+        .await?;
+    Ok(dropped)
+}
+
+/// Delete up to `batch_size` `telegram_files` rows whose `last_seen_at` is older
+/// than `retention_days`, returning the number removed. No-op when either
+/// argument is <= 0. A deleted row is transparently re-resolved via Telegram
+/// `getFile` on next reference.
+pub async fn delete_old_telegram_files_batch(
+    pool: &PgPool,
+    retention_days: i32,
+    batch_size: i64,
+) -> Result<u64, sqlx::Error> {
+    if retention_days <= 0 || batch_size <= 0 {
+        return Ok(0);
+    }
+    let result = sqlx::query(SQL_DELETE_OLD_TELEGRAM_FILES_BATCH)
+        .bind(retention_days)
+        .bind(batch_size)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
+/// Delete up to `batch_size` `whitecircle_checks` rows older than
+/// `retention_days`, returning the number removed. No-op when either argument is
+/// <= 0. The row is an async audit record; deletion does not affect the inline
+/// moderation verdict.
+pub async fn delete_old_whitecircle_checks_batch(
+    pool: &PgPool,
+    retention_days: i32,
+    batch_size: i64,
+) -> Result<u64, sqlx::Error> {
+    if retention_days <= 0 || batch_size <= 0 {
+        return Ok(0);
+    }
+    let result = sqlx::query(SQL_DELETE_OLD_WHITECIRCLE_CHECKS_BATCH)
+        .bind(retention_days)
+        .bind(batch_size)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
 pub async fn bridge_existing_migration_history(pool: &PgPool) -> Result<usize, StorageError> {
     let has_go_table: bool = sqlx::query_scalar(LEGACY_MIGRATION_TABLE_EXISTS_SQL)
         .fetch_one(pool)
@@ -8097,6 +8183,110 @@ mod tests {
 
         assert_eq!(config.response_timeout(), Some(Duration::from_secs(3)));
         assert!(config.response_timeout() > Some(Duration::from_millis(500)));
+    }
+
+    #[tokio::test]
+    async fn delete_old_telegram_files_batch_removes_only_aged_rows() -> Result<(), Box<dyn Error>>
+    {
+        let Ok(dsn) = env::var("OPENPLOTVA_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&dsn)
+            .await?;
+        super::run_migrations_on(&pool).await?;
+        sqlx::query("DELETE FROM telegram_files WHERE file_unique_id IN ('test_ret_fresh', 'test_ret_stale')")
+            .execute(&pool)
+            .await?;
+        sqlx::query(
+            "INSERT INTO telegram_files (file_unique_id, latest_file_id, media_kind, last_seen_at) \
+             VALUES ('test_ret_fresh', 'f', 'photo', now()), \
+                    ('test_ret_stale', 'f', 'photo', now() - interval '30 days')",
+        )
+        .execute(&pool)
+        .await?;
+        let deleted = super::delete_old_telegram_files_batch(&pool, 7, 10_000).await?;
+        assert!(deleted >= 1);
+        let stale: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM telegram_files WHERE file_unique_id = 'test_ret_stale'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        let fresh: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM telegram_files WHERE file_unique_id = 'test_ret_fresh'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(stale, 0);
+        assert_eq!(fresh, 1);
+        sqlx::query("DELETE FROM telegram_files WHERE file_unique_id = 'test_ret_fresh'")
+            .execute(&pool)
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delete_old_whitecircle_checks_batch_removes_only_aged_rows()
+    -> Result<(), Box<dyn Error>> {
+        let Ok(dsn) = env::var("OPENPLOTVA_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&dsn)
+            .await?;
+        super::run_migrations_on(&pool).await?;
+        sqlx::query("DELETE FROM whitecircle_checks WHERE source = 'test_ret_marker'")
+            .execute(&pool)
+            .await?;
+        sqlx::query(
+            "INSERT INTO whitecircle_checks (source, deployment_id, created_at) \
+             VALUES ('test_ret_marker', 'd', now()), \
+                    ('test_ret_marker', 'd', now() - interval '120 days')",
+        )
+        .execute(&pool)
+        .await?;
+        let deleted = super::delete_old_whitecircle_checks_batch(&pool, 30, 10_000).await?;
+        assert!(deleted >= 1);
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM whitecircle_checks WHERE source = 'test_ret_marker'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(remaining, 1);
+        sqlx::query("DELETE FROM whitecircle_checks WHERE source = 'test_ret_marker'")
+            .execute(&pool)
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn drop_expired_chat_history_partitions_drops_old_partition() -> Result<(), Box<dyn Error>>
+    {
+        let Ok(dsn) = env::var("OPENPLOTVA_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&dsn)
+            .await?;
+        super::run_migrations_on(&pool).await?;
+        // A partition far in the past so the test never touches real recent data.
+        sqlx::query("SELECT ensure_chat_history_partition((current_date - 9999))")
+            .execute(&pool)
+            .await?;
+        let expected: String = sqlx::query_scalar(
+            "SELECT 'chat_history_entries_' || to_char((current_date - 9999), 'YYYYMMDD')",
+        )
+        .fetch_one(&pool)
+        .await?;
+        let dropped = super::drop_expired_chat_history_partitions(&pool, 8).await?;
+        assert!(
+            dropped.contains(&expected),
+            "expected {expected} in {dropped:?}"
+        );
+        Ok(())
     }
 
     #[test]
