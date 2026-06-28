@@ -9183,6 +9183,91 @@ async fn start_runtime_workers(
             "LLM raw request events cleanup disabled",
         ));
     }
+    let chat_history_retention_days = config.llm.history_summary.chat_history_retention_days;
+    if chat_history_retention_days > 0 {
+        let pool = service_clients.postgres.clone();
+        let stop_rx = stop.subscribe();
+        let worker = tokio::spawn(async move {
+            let report = runtime_retention::run_chat_history_partition_retention_worker_until(
+                pool,
+                runtime_retention::RETENTION_CLEANUP_INTERVAL,
+                chat_history_retention_days,
+                wait_for_runtime_stop(stop_rx),
+            )
+            .await;
+            tracing::info!(?report, "chat_history partition retention worker stopped");
+        });
+        readiness_checks.push(ReadinessCheck::ok(
+            "chat_history_retention",
+            format!(
+                "chat_history partitions dropped daily, retention {chat_history_retention_days}d"
+            ),
+        ));
+        workers.handles.push(worker);
+    } else {
+        readiness_checks.push(ReadinessCheck::skipped(
+            "chat_history_retention",
+            "chat_history partition retention disabled",
+        ));
+    }
+    let telegram_files_retention_days = config.vision.telegram_files_retention_days;
+    if telegram_files_retention_days > 0 {
+        let pool = service_clients.postgres.clone();
+        let stop_rx = stop.subscribe();
+        let worker = tokio::spawn(async move {
+            let report = runtime_retention::run_telegram_files_retention_worker_until(
+                pool,
+                runtime_retention::RETENTION_CLEANUP_INTERVAL,
+                telegram_files_retention_days,
+                runtime_retention::RETENTION_DELETE_BATCH_SIZE,
+                runtime_retention::RETENTION_INTER_BATCH_PAUSE,
+                wait_for_runtime_stop(stop_rx),
+            )
+            .await;
+            tracing::info!(?report, "telegram_files retention worker stopped");
+        });
+        readiness_checks.push(ReadinessCheck::ok(
+            "telegram_files_retention",
+            format!(
+                "telegram_files deleted by last_seen_at daily, retention {telegram_files_retention_days}d"
+            ),
+        ));
+        workers.handles.push(worker);
+    } else {
+        readiness_checks.push(ReadinessCheck::skipped(
+            "telegram_files_retention",
+            "telegram_files retention disabled",
+        ));
+    }
+    let whitecircle_checks_retention_days = config.white_circle.whitecircle_checks_retention_days;
+    if whitecircle_checks_retention_days > 0 {
+        let pool = service_clients.postgres.clone();
+        let stop_rx = stop.subscribe();
+        let worker = tokio::spawn(async move {
+            let report = runtime_retention::run_whitecircle_checks_retention_worker_until(
+                pool,
+                runtime_retention::RETENTION_CLEANUP_INTERVAL,
+                whitecircle_checks_retention_days,
+                runtime_retention::RETENTION_DELETE_BATCH_SIZE,
+                runtime_retention::RETENTION_INTER_BATCH_PAUSE,
+                wait_for_runtime_stop(stop_rx),
+            )
+            .await;
+            tracing::info!(?report, "whitecircle_checks retention worker stopped");
+        });
+        readiness_checks.push(ReadinessCheck::ok(
+            "whitecircle_checks_retention",
+            format!(
+                "whitecircle_checks deleted by created_at daily, retention {whitecircle_checks_retention_days}d"
+            ),
+        ));
+        workers.handles.push(worker);
+    } else {
+        readiness_checks.push(ReadinessCheck::skipped(
+            "whitecircle_checks_retention",
+            "whitecircle_checks retention disabled",
+        ));
+    }
     workers.llm_trace_buffer = Some(llm_trace_buffer.clone());
     let llm_observer: Arc<dyn openplotva_llm::LlmCallObserver> =
         Arc::new(runtime_llm::RuntimeLlmObserver::new(
