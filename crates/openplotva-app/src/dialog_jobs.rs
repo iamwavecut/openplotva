@@ -980,9 +980,29 @@ where
     let raw_answer = dialog_job_answer(&output);
     let answer = prepare_dialog_chat_response(&raw_answer);
     if !raw_answer.trim().is_empty() && answer.is_empty() {
+        // The model returned visible text, but it collapses to nothing once the
+        // send boundary decodes entities and strips disallowed markup (typically a
+        // tool call leaked as plain text). Treat it like a retryable protocol error
+        // instead of dropping the turn silently: requeue for another attempt, which
+        // reselects a backend, and only fail loudly once attempts are exhausted.
         let error = "dialog answer became empty after sanitization".to_owned();
         report.empty_answer_error = Some(error.clone());
-        mark_dialog_job_failed(queue, item.id, &error, &mut report).await;
+        handle_retryable_dialog_provider_error(
+            queue,
+            &item,
+            &params,
+            options.routing_events,
+            RetryableDialogProviderFailure {
+                queue_name: options.queue_name,
+                provider_name: output.provider.as_str(),
+                reason: openplotva_llm::retry::FailureReason::ProviderProtocolError,
+                error: &error,
+                max_attempts: options.max_llm_job_attempts.max(1),
+                now: options.now,
+            },
+            &mut report,
+        )
+        .await;
         return report;
     }
     if !answer.is_empty() {
@@ -2599,6 +2619,17 @@ fn trace_dialog_job_tick(tick: &DialogJobWorkerReport) {
         status_error = tick.status_error.as_deref(),
         "processed dialog taskman worker tick"
     );
+
+    if tick.empty_answer_error.is_some() && tick.retry_exhausted {
+        tracing::warn!(
+            queue_name = tick.queue_name,
+            job_id = tick.job_id,
+            provider = tick.provider.as_deref(),
+            retry_attempt = tick.retry_attempt,
+            empty_answer_error = tick.empty_answer_error.as_deref(),
+            "dialog turn produced no sendable answer after retries; no reply sent"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2981,7 +3012,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dialog_worker_fails_when_provider_answer_sanitizes_to_empty()
+    async fn dialog_worker_fails_when_answer_sanitizes_to_empty_after_attempts_exhausted()
+    -> Result<(), Box<dyn Error>> {
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let queue = InMemoryTaskQueue::new();
+        let job_id = queue.assign(
+            DIALOG_AIFARM_QUEUE_NAME,
+            new_dialog_job_at(dialog_params("найди сообщения"), now),
+        );
+        let provider = ProviderStub::returning(DialogOutput {
+            answer: "<tool_calls><tool_call name=\"history_search\"></tool_call></tool_calls>"
+                .to_owned(),
+            ..DialogOutput::default()
+        });
+        let effects = EffectsStub::default();
+
+        let report = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+            &queue,
+            &provider,
+            &effects,
+            &BasicDialogInputMaterializer,
+            &NoopDialogToolCallHistoryStore,
+            DialogJobProcessOptions {
+                queue_name: DIALOG_AIFARM_QUEUE_NAME,
+                max_llm_job_attempts: 1,
+                now,
+                routing_events: None,
+            },
+        )
+        .await;
+
+        assert!(report.failed);
+        assert!(report.retry_exhausted);
+        assert!(!report.completed);
+        assert!(!report.sent_answer);
+        assert!(effects.sent().is_empty());
+        assert_eq!(
+            report.empty_answer_error,
+            Some("dialog answer became empty after sanitization".to_owned())
+        );
+        assert_eq!(record_status(&queue, job_id), JobStatus::Failed);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dialog_worker_requeues_when_provider_answer_sanitizes_to_empty()
     -> Result<(), Box<dyn Error>> {
         let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
         let queue = InMemoryTaskQueue::new();
@@ -2998,15 +3073,12 @@ mod tests {
 
         let report = process_dialog_job_once_at(&queue, &provider, &effects, now).await;
 
-        assert!(report.failed);
-        assert!(!report.completed);
+        assert!(report.retry_requeued);
+        assert!(!report.failed);
         assert!(!report.sent_answer);
         assert!(effects.sent().is_empty());
-        assert_eq!(
-            report.empty_answer_error,
-            Some("dialog answer became empty after sanitization".to_owned())
-        );
-        assert_eq!(record_status(&queue, job_id), JobStatus::Failed);
+        assert_eq!(report.retry_attempt, Some(1));
+        assert_eq!(record_status(&queue, job_id), JobStatus::Pending);
         Ok(())
     }
 

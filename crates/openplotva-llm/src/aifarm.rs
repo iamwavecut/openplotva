@@ -6861,6 +6861,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dialog_provider_executes_entity_encoded_history_search_then_continues_to_final_text()
+    -> Result<(), CompletionError> {
+        let toolbox = FakeToolbox::new(vec![ToolResult {
+            status: TOOL_RESULT_STATUS_OK.to_owned(),
+            message: "history ready".to_owned(),
+            data: Some(json!({
+                "query": "CherryCherry123",
+                "results": "- Cherry: hello",
+            })),
+            ..ToolResult::default()
+        }]);
+        let (provider, transport, toolbox) = direct_dialog_provider_with_responses(
+            vec![
+                json!({
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": "&lt;tool_calls&gt;\n  &lt;tool_call name=\"history_search\" arg=\"query: CherryCherry123\"&gt;&lt;/tool_call&gt;\n&lt;/tool_calls&gt;"
+                        }
+                    }]
+                }),
+                json!({
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": "Cherry выглядит разговорчивой и живой."
+                        }
+                    }]
+                }),
+            ],
+            AifarmDialogConfig::default(),
+            toolbox,
+        );
+        let mut input = base_input();
+        input.message = DialogMessage {
+            id: 194565,
+            text: "Плотва, найди все сообщения в чате от @CherryCherry123 и дай ей характеристику"
+                .to_owned(),
+            ..DialogMessage::default()
+        };
+
+        let output = crate::ChatProvider::run_dialog(&provider, input).await?;
+
+        assert_eq!(output.answer, "Cherry выглядит разговорчивой и живой.");
+        assert_eq!(output.tool_calls.len(), 1);
+        assert_eq!(output.tool_calls[0].name, STEP_HISTORY_SEARCH);
+        assert_eq!(
+            output.tool_calls[0].input.as_ref().expect("tool input")["query"],
+            "CherryCherry123"
+        );
+        assert_eq!(toolbox.calls(), vec![STEP_HISTORY_SEARCH.to_owned()]);
+        assert_eq!(transport.requests().len(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn dialog_provider_feeds_data_tool_no_reply_result_to_llm() -> Result<(), CompletionError>
     {
         let toolbox = FakeToolbox::new(vec![ToolResult {
