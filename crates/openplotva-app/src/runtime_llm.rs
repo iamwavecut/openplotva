@@ -250,6 +250,14 @@ ON CONFLICT (source, kind, granularity, bucket_start, dimensions_hash) DO UPDATE
     dimensions = EXCLUDED.dimensions,
     metrics = EXCLUDED.metrics,
     updated_at = CURRENT_TIMESTAMP"#;
+// Purge terminal memory_runs after they are rolled up. Cutoff = retention_days,
+// which (default 14) MUST stay >= the memory pipeline's ensure_daily window
+// (MEMORY_RETENTION_HOURS=168=7d) so re-creation never violates the runs' UNIQUE
+// idempotency constraint. Never touches queued/processing runs.
+const SQL_DELETE_OLD_MEMORY_RUNS: &str = r#"
+DELETE FROM memory_runs
+WHERE status IN ('completed','skipped','failed')
+  AND range_start_at < now() - ($1::int * interval '1 day')"#;
 const SQL_ROLLUP_CHAT_HISTORY_INTERESTS: &str = r#"
 WITH grouped AS (
     SELECT
@@ -652,6 +660,10 @@ pub async fn delete_old_llm_request_events_batch(
             .execute(&mut *tx)
             .await?;
     }
+    sqlx::query(SQL_DELETE_OLD_MEMORY_RUNS)
+        .bind(retention_days)
+        .execute(&mut *tx)
+        .await?;
     let result = sqlx::query(SQL_DELETE_OLD_LLM_REQUEST_EVENTS_BATCH)
         .bind(retention_days)
         .bind(batch_size)
@@ -1341,6 +1353,12 @@ mod tests {
     #[test]
     fn llm_request_event_cleanup_keeps_archived_rollups() {
         assert!(SQL_DELETE_OLD_LLM_REQUEST_EVENTS_BATCH.contains("NOT is_rollup"));
+    }
+
+    #[test]
+    fn delete_old_memory_runs_targets_only_terminal_runs() {
+        assert!(SQL_DELETE_OLD_MEMORY_RUNS.contains("status IN ('completed','skipped','failed')"));
+        assert!(SQL_DELETE_OLD_MEMORY_RUNS.contains("range_start_at <"));
     }
 
     #[test]
