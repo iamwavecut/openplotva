@@ -2936,82 +2936,60 @@ impl PostgresVirtualMessageStore {
         chat_id: i64,
         thread_id: Option<i32>,
     ) -> Result<(), StorageError> {
-        sqlx::query(SQL_INSERT_VIRTUAL_MESSAGE)
-            .bind(vmsg_id)
-            .bind(chat_id)
-            .bind(thread_id)
-            .execute(&self.pool)
-            .await?;
+        // Retired: message_id_map is dropped (migration 140). Outbound sends
+        // resolve the real Telegram message id inline, so this persistence is a
+        // no-op. The signatures are kept until the dispatcher's vmsg plumbing is
+        // fully removed in a follow-up.
+        let _ = (vmsg_id, chat_id, thread_id);
         Ok(())
     }
 
-    /// Resolve a virtual message to its real Telegram message ID.
+    /// Retired: no-op (message_id_map dropped, migration 140).
     pub async fn resolve_virtual_message(
         &self,
         vmsg_id: &str,
         real_message_id: i32,
         resolved_at: Option<OffsetDateTime>,
     ) -> Result<(), StorageError> {
-        sqlx::query(SQL_RESOLVE_VIRTUAL_MESSAGE)
-            .bind(real_message_id)
-            .bind(resolved_at)
-            .bind(vmsg_id)
-            .execute(&self.pool)
-            .await?;
+        let _ = (vmsg_id, real_message_id, resolved_at);
         Ok(())
     }
 
-    /// Get a virtual-message mapping by virtual ID.
+    /// Retired: no-op (message_id_map dropped, migration 140).
     pub async fn get_mapping_by_virtual(
         &self,
         vmsg_id: &str,
     ) -> Result<Option<MessageIdMapping>, StorageError> {
-        let row = sqlx::query(SQL_GET_MAPPING_BY_VIRTUAL)
-            .bind(vmsg_id)
-            .fetch_optional(&self.pool)
-            .await?;
-        Ok(row.map(message_id_mapping_from_row).transpose()?)
+        let _ = vmsg_id;
+        Ok(None)
     }
 
-    /// List virtual-message mappings by virtual IDs.
+    /// Retired: no-op (message_id_map dropped, migration 140).
     pub async fn list_mappings_by_virtual_ids(
         &self,
         vmsg_ids: &[String],
     ) -> Result<Vec<MessageIdMapping>, StorageError> {
-        let rows = sqlx::query(SQL_LIST_MAPPINGS_BY_VIRTUAL_IDS)
-            .bind(vmsg_ids)
-            .fetch_all(&self.pool)
-            .await?;
-        rows.into_iter()
-            .map(message_id_mapping_from_row)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(StorageError::from)
+        let _ = vmsg_ids;
+        Ok(Vec::new())
     }
 
-    /// Get a virtual-message mapping by real Telegram message ID.
+    /// Retired: no-op (message_id_map dropped, migration 140).
     pub async fn get_mapping_by_real(
         &self,
         chat_id: i64,
         real_message_id: i32,
     ) -> Result<Option<MessageIdMapping>, StorageError> {
-        let row = sqlx::query(SQL_GET_MAPPING_BY_REAL)
-            .bind(chat_id)
-            .bind(real_message_id)
-            .fetch_optional(&self.pool)
-            .await?;
-        Ok(row.map(message_id_mapping_from_row).transpose()?)
+        let _ = (chat_id, real_message_id);
+        Ok(None)
     }
 
-    /// Delete a virtual-message mapping by virtual ID.
+    /// Retired: no-op (message_id_map dropped, migration 140).
     pub async fn delete_mapping_by_virtual(&self, vmsg_id: &str) -> Result<(), StorageError> {
-        sqlx::query(SQL_DELETE_MAPPING_BY_VIRTUAL)
-            .bind(vmsg_id)
-            .execute(&self.pool)
-            .await?;
+        let _ = vmsg_id;
         Ok(())
     }
 
-    /// Enqueue a pending operation for a virtual message.
+    /// Retired: no-op (message_ops_queue dropped, migration 140).
     pub async fn enqueue_message_op(
         &self,
         vmsg_id: &str,
@@ -3019,25 +2997,14 @@ impl PostgresVirtualMessageStore {
         op: &str,
         payload_json: Option<&str>,
     ) -> Result<i64, StorageError> {
-        let row = sqlx::query(SQL_ENQUEUE_MESSAGE_OP)
-            .bind(vmsg_id)
-            .bind(chat_id)
-            .bind(op)
-            .bind(payload_json)
-            .fetch_one(&self.pool)
-            .await?;
-        Ok(row.try_get::<i64, _>("id")?)
+        let _ = (vmsg_id, chat_id, op, payload_json);
+        Ok(0)
     }
 
+    /// Retired: always empty (message_ops_queue dropped, migration 140).
     pub async fn list_pending_ops(&self, limit: i32) -> Result<Vec<PendingOp>, StorageError> {
-        let rows = sqlx::query(SQL_LIST_PENDING_OPS)
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await?;
-        rows.into_iter()
-            .map(pending_op_from_row)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(StorageError::from)
+        let _ = limit;
+        Ok(Vec::new())
     }
 
     /// Mark a pending operation as done.
@@ -7642,15 +7609,6 @@ fn redis_connection_info(config: &RedisConfig) -> redis::RedisResult<ConnectionI
         .map(|info| info.set_redis_settings(redis_settings))
 }
 
-fn message_id_mapping_from_row(row: PgRow) -> Result<MessageIdMapping, sqlx::Error> {
-    Ok(MessageIdMapping {
-        vmsg_id: row.try_get("vmsg_id")?,
-        chat_id: row.try_get("chat_id")?,
-        thread_id: row.try_get("thread_id")?,
-        real_message_id: row.try_get("real_message_id")?,
-    })
-}
-
 fn telegram_file_from_row(row: PgRow) -> Result<TelegramFileRecord, StorageError> {
     let extra: String = row.try_get("extra")?;
     let extra = serde_json::from_str(&extra)
@@ -7677,18 +7635,6 @@ fn telegram_file_from_row(row: PgRow) -> Result<TelegramFileRecord, StorageError
         extra,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
-    })
-}
-
-fn pending_op_from_row(row: PgRow) -> Result<PendingOp, sqlx::Error> {
-    let payload: String = row.try_get("payload")?;
-    Ok(PendingOp {
-        id: row.try_get("id")?,
-        vmsg_id: row.try_get("vmsg_id")?,
-        chat_id: row.try_get("chat_id")?,
-        op: row.try_get("op")?,
-        payload: payload.into_bytes(),
-        attempts: row.try_get("attempts")?,
     })
 }
 
@@ -10668,94 +10614,6 @@ mod tests {
             .execute(&pool)
             .await;
         result
-    }
-
-    #[tokio::test]
-    async fn live_virtual_message_store_round_trips_when_postgres_dsn_is_set()
-    -> Result<(), Box<dyn Error>> {
-        let Ok(dsn) = env::var("OPENPLOTVA_TEST_POSTGRES_DSN") else {
-            return Ok(());
-        };
-
-        let pool = PgPoolOptions::new()
-            .max_connections(1)
-            .connect(&dsn)
-            .await?;
-        let store = super::PostgresVirtualMessageStore::new(pool);
-        let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-        let vmsg_id = format!("t{suffix}");
-        let chat_id = -9_001_234_567_890_i64;
-        let real_message_id = 321_987_i32;
-        let _ = store.delete_mapping_by_virtual(&vmsg_id).await;
-
-        let result: Result<(), Box<dyn Error>> = async {
-            store
-                .insert_virtual_message(&vmsg_id, chat_id, Some(77))
-                .await?;
-            let mapping = store
-                .get_mapping_by_virtual(&vmsg_id)
-                .await?
-                .ok_or_else(|| std::io::Error::other("inserted mapping was not readable"))?;
-            assert_eq!(mapping.vmsg_id, vmsg_id);
-            assert_eq!(mapping.chat_id, chat_id);
-            assert_eq!(mapping.thread_id, Some(77));
-            assert_eq!(mapping.real_message_id, None);
-
-            let op_id = store
-                .enqueue_message_op(
-                    &vmsg_id,
-                    chat_id,
-                    "edit",
-                    Some(r#"{"text":"edited","parse_mode":"HTML"}"#),
-                )
-                .await?;
-            let pending = store.list_pending_ops(1_000).await?;
-            let op = pending
-                .iter()
-                .find(|row| row.id == op_id)
-                .ok_or_else(|| std::io::Error::other("enqueued op was not listed as pending"))?;
-            assert_eq!(op.vmsg_id, vmsg_id);
-            assert_eq!(op.chat_id, chat_id);
-            assert_eq!(op.op, "edit");
-            let payload: serde_json::Value = serde_json::from_slice(&op.payload)?;
-            assert_eq!(
-                payload,
-                serde_json::json!({"text": "edited", "parse_mode": "HTML"})
-            );
-            assert_eq!(op.attempts, 0);
-
-            store.mark_op_failed(op_id, "temporary failure").await?;
-            let pending = store.list_pending_ops(1_000).await?;
-            let op = pending
-                .iter()
-                .find(|row| row.id == op_id)
-                .ok_or_else(|| std::io::Error::other("failed op was not still pending"))?;
-            assert_eq!(op.attempts, 1);
-
-            store
-                .resolve_virtual_message(&vmsg_id, real_message_id, None)
-                .await?;
-            let mapping = store
-                .get_mapping_by_real(chat_id, real_message_id)
-                .await?
-                .ok_or_else(|| std::io::Error::other("resolved mapping was not readable"))?;
-            assert_eq!(mapping.vmsg_id, vmsg_id);
-            assert_eq!(mapping.real_message_id, Some(real_message_id));
-
-            store.mark_op_done(op_id).await?;
-            let pending = store.list_pending_ops(1_000).await?;
-            assert!(pending.iter().all(|row| row.id != op_id));
-
-            Ok(())
-        }
-        .await;
-
-        let cleanup = store.delete_mapping_by_virtual(&vmsg_id).await;
-        result?;
-        cleanup?;
-        assert!(store.get_mapping_by_virtual(&vmsg_id).await?.is_none());
-
-        Ok(())
     }
 
     #[tokio::test]
