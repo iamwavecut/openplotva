@@ -1,0 +1,21 @@
+# OpenPlotva plotva-uploader media retention (TEMPORARY).
+#
+# The uploader stores every generated /draw image and song forever; Rich Messages
+# embed media only by HTTPS URL, so nothing prunes the volume (≈ +570 MB/day).
+# This is a stop-gap until the uploader platform gains a CDN + native retention.
+#
+# Maintainer-approved horizon: 7 days. NOTE: the embedded https://plotva.geta.moe
+# URLs are canonical in already-sent messages; Telegram may re-fetch on cache
+# miss/forward, so files newer than ~the Telegram media TTL must survive. 7 days
+# is the chosen floor.
+#
+# Install on the host (geta.moe) as root crontab, e.g.:
+#   sudo crontab -e   # then paste the line below
+#
+# Volume mount (verified): /var/lib/docker/volumes/plotva-uploader_uploader-data/_data
+#
+# Run daily at 04:30 UTC: delete media files not modified in the last 7 days.
+30 4 * * * find /var/lib/docker/volumes/plotva-uploader_uploader-data/_data -type f -mtime +7 -delete
+
+# Optional: also prune now-empty directories left behind (uncomment if used):
+# 35 4 * * * find /var/lib/docker/volumes/plotva-uploader_uploader-data/_data -mindepth 1 -type d -empty -delete
