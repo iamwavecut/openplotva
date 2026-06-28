@@ -8272,7 +8272,9 @@ mod tests {
             .connect(&dsn)
             .await?;
         super::run_migrations_on(&pool).await?;
-        // A partition far in the past so the test never touches real recent data.
+        // A partition ~9999 days in the past, dropped with a 1000-day cutoff, so
+        // the test removes only this synthetic ancient partition and never the
+        // recent / fixed-date partitions other live tests rely on.
         sqlx::query("SELECT ensure_chat_history_partition((current_date - 9999))")
             .execute(&pool)
             .await?;
@@ -8281,7 +8283,7 @@ mod tests {
         )
         .fetch_one(&pool)
         .await?;
-        let dropped = super::drop_expired_chat_history_partitions(&pool, 8).await?;
+        let dropped = super::drop_expired_chat_history_partitions(&pool, 1000).await?;
         assert!(
             dropped.contains(&expected),
             "expected {expected} in {dropped:?}"
