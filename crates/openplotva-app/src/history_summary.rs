@@ -24,7 +24,7 @@ use openplotva_llm::aifarm::{
     ReqwestAifarmTransport,
 };
 use openplotva_llm::gemini::{GeminiHistorySummaryConfig, GeminiHistorySummaryGenerator};
-use openplotva_llm::retry::retryable_reason;
+use openplotva_llm::retry::{FailureReason, retryable_reason, retryable_reason_from_message};
 use openplotva_storage::{PostgresHistoryStore, StorageError};
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -32,7 +32,9 @@ use time::OffsetDateTime;
 use crate::dialog_tools::{
     ChatHistorySummarizer, ChatHistorySummaryFuture, ChatHistorySummaryResult,
 };
-use crate::media::aifarm_pool_config_from_app_config;
+use crate::routed_attempts::{
+    RoutedAttempt, RoutedAttemptRunError, RoutedAttemptWalker, RoutedRequestContext,
+};
 use crate::runtime_gemini_cache::resolve_google_ai_key;
 
 const OPENROUTER_MODEL_PREFIX: &str = "openrouter/";
@@ -210,6 +212,22 @@ pub enum AppGenkitHistorySummaryError {
     OpenAiCompatible(#[from] GenkitOpenAiCompatibleHistorySummaryError),
 }
 
+#[derive(Clone)]
+pub struct RoutedHistorySummaryGenerator {
+    walker: RoutedAttemptWalker,
+    config: AppConfig,
+}
+
+impl RoutedHistorySummaryGenerator {
+    #[must_use]
+    pub fn new(walker: RoutedAttemptWalker, config: &AppConfig) -> Self {
+        Self {
+            walker,
+            config: config.clone(),
+        }
+    }
+}
+
 /// App-level `chat_history_summary` service over injected store and generator boundaries.
 #[derive(Clone)]
 pub struct ChatHistorySummaryService<Store, Generator> {
@@ -384,12 +402,6 @@ pub fn aifarm_history_summary_config_from_app_config(
         &memory.consolidation_model,
         None,
     );
-    // Prefer the model selected in the admin for `history_summary` (same service).
-    let model = crate::model_routing::resolved_model_for(
-        "history_summary",
-        memory.aifarm_service_name.trim(),
-    )
-    .unwrap_or(model);
     AifarmHistorySummaryConfig {
         client: AifarmClientConfig {
             base_url: config.llm.discovery.base_url.clone(),
@@ -408,7 +420,6 @@ pub fn aifarm_history_summary_config_from_app_config(
         temperature: Some(memory.aifarm_temperature),
         enable_thinking: Some(false),
         include_reasoning: Some(false),
-        pool: aifarm_pool_config_from_app_config(config),
     }
     .with_defaults()
 }
@@ -539,6 +550,18 @@ pub fn history_summary_service_from_app_config(
         Arc::new(generator),
         options,
     ))
+}
+
+pub fn routed_history_summary_service_from_app_config(
+    config: &AppConfig,
+    store: Arc<PostgresHistoryStore>,
+    walker: RoutedAttemptWalker,
+) -> ChatHistorySummaryService<PostgresHistoryStore, RoutedHistorySummaryGenerator> {
+    let generator = RoutedHistorySummaryGenerator::new(walker, config);
+    let options = HistorySummaryServiceOptions::default()
+        .with_max_input_tokens(config.memory.max_input_tokens)
+        .with_timeout_seconds(config.llm.history_summary.timeout_seconds);
+    ChatHistorySummaryService::new_with_options(store, Arc::new(generator), options)
 }
 
 /// Build the concrete provider generator without binding storage.
@@ -845,6 +868,152 @@ impl HistorySummaryGenerator for AppGenkitHistorySummaryGenerator {
                 }
             }
         })
+    }
+}
+
+impl HistorySummaryGenerator for RoutedHistorySummaryGenerator {
+    fn generate_history_summary<'a>(
+        &'a self,
+        input: &'a SummaryInput,
+    ) -> HistorySummaryGenerateFuture<'a> {
+        Box::pin(async move {
+            let config = self.config.clone();
+            let result = self
+                .walker
+                .run(
+                    RoutedRequestContext {
+                        workflow_key: "history_summary".to_owned(),
+                        ..RoutedRequestContext::default()
+                    },
+                    move |attempt| {
+                        let config = config.clone();
+                        async move {
+                            generate_history_summary_with_attempt(&config, attempt, input).await
+                        }
+                    },
+                    history_summary_service_retryable_reason,
+                )
+                .await;
+            match result {
+                Ok(doc) => Ok(doc),
+                Err(RoutedAttemptRunError::Attempt(error)) => Err(error),
+                Err(RoutedAttemptRunError::Routing(error)) => {
+                    Err(HistorySummaryServiceError::Generate {
+                        message: error.to_string(),
+                    })
+                }
+            }
+        })
+    }
+}
+
+async fn generate_history_summary_with_attempt(
+    config: &AppConfig,
+    attempt: RoutedAttempt,
+    input: &SummaryInput,
+) -> Result<SummaryDocument, HistorySummaryServiceError> {
+    if routed_attempt_is_genkit(&attempt) {
+        let model = genkit_model_for_attempt(&attempt);
+        let generator = genkit_history_summary_generator_from_app_config(config, Some(&model))
+            .map_err(|error| HistorySummaryServiceError::Generate {
+                message: error.to_string(),
+            })?;
+        return generator.generate_history_summary(input).await;
+    }
+    let generator =
+        AifarmHistorySummaryGenerator::new(aifarm_history_config_for_attempt(config, &attempt));
+    generator.generate_history_summary(input).await
+}
+
+fn routed_attempt_is_genkit(attempt: &RoutedAttempt) -> bool {
+    attempt.provider_name.eq_ignore_ascii_case("genkit")
+        || attempt.provider_name.eq_ignore_ascii_case("gemini")
+        || attempt.provider_name.eq_ignore_ascii_case("openrouter")
+}
+
+fn genkit_model_for_attempt(attempt: &RoutedAttempt) -> String {
+    if attempt.provider_name.eq_ignore_ascii_case("openrouter")
+        && !attempt
+            .model_name
+            .get(..OPENROUTER_MODEL_PREFIX.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(OPENROUTER_MODEL_PREFIX))
+    {
+        format!("{OPENROUTER_MODEL_PREFIX}{}", attempt.model_name.trim())
+    } else {
+        attempt.model_name.clone()
+    }
+}
+
+fn aifarm_history_config_for_attempt(
+    config: &AppConfig,
+    attempt: &RoutedAttempt,
+) -> AifarmHistorySummaryConfig {
+    let mut cfg = aifarm_history_summary_config_from_app_config(config);
+    cfg.model = attempt.model_name.clone();
+    cfg.client.default_model = attempt.model_name.clone();
+    if let Some(endpoint) = routed_attempt_endpoint(attempt) {
+        if attempt.discovery_service_name.is_some() || attempt.discovery_endpoint_name.is_some() {
+            cfg.client.base_url = endpoint;
+        } else {
+            cfg.client.direct_url =
+                openplotva_llm::aifarm::normalize_chat_completions_url(&endpoint);
+            if attempt
+                .provider_name
+                .eq_ignore_ascii_case(crate::dialog_runtime::VRAM_CLOUD_PROVIDER_NAME)
+            {
+                cfg.client.api_key = config.llm.dialog.aifarm_pool_api_key.clone();
+            }
+        }
+    }
+    if let Some(service) = attempt.discovery_service_name.as_deref() {
+        cfg.client.service_name = service.to_owned();
+    }
+    if let Some(endpoint) = attempt.discovery_endpoint_name.as_deref() {
+        cfg.client.endpoint_name = endpoint.to_owned();
+    }
+    if let Some(max_tokens) = attempt.overrides.max_tokens
+        && max_tokens > 0
+    {
+        cfg.max_output_tokens = max_tokens;
+    }
+    if let Some(temperature) = attempt.overrides.temperature {
+        cfg.temperature = Some(temperature);
+    }
+    if let Some(enable_thinking) = attempt
+        .overrides
+        .extra
+        .get("enable_thinking")
+        .and_then(serde_json::Value::as_bool)
+    {
+        cfg.enable_thinking = Some(enable_thinking);
+    }
+    if let Some(include_reasoning) = attempt
+        .overrides
+        .extra
+        .get("include_reasoning")
+        .and_then(serde_json::Value::as_bool)
+    {
+        cfg.include_reasoning = Some(include_reasoning);
+    }
+    cfg.with_defaults()
+}
+
+fn routed_attempt_endpoint(attempt: &RoutedAttempt) -> Option<String> {
+    attempt
+        .model_base_url
+        .as_deref()
+        .or(attempt.provider_endpoint.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn history_summary_service_retryable_reason(
+    error: &HistorySummaryServiceError,
+) -> Option<FailureReason> {
+    match error {
+        HistorySummaryServiceError::Generate { message } => retryable_reason_from_message(message),
+        _ => None,
     }
 }
 
@@ -1355,10 +1524,6 @@ mod tests {
         assert_eq!(cfg.temperature, Some(0.35));
         assert_eq!(cfg.enable_thinking, Some(false));
         assert_eq!(cfg.include_reasoning, Some(false));
-        assert_eq!(cfg.pool.secondary_backends.len(), 1);
-        assert_eq!(cfg.pool.secondary_backends[0].model, "pool-a");
-        assert_eq!(cfg.pool.secondary_api_key, "pool-token");
-        assert_eq!(cfg.pool.primary_capacity_wait, Duration::from_millis(250));
 
         let options = HistorySummaryServiceOptions::default()
             .with_max_input_tokens(config.memory.max_input_tokens)

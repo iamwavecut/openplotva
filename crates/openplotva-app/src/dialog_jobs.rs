@@ -4,10 +4,7 @@ use std::{
     fmt,
     future::Future,
     pin::Pin,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering as AtomicOrdering},
-    },
+    sync::Arc,
     time::Duration,
 };
 
@@ -62,7 +59,6 @@ const DIALOG_HISTORY_FETCH_LIMIT: i32 = 100;
 const DIALOG_HISTORY_TTL: TimeDuration = TimeDuration::days(7);
 
 pub const DIALOG_JOB_WORKER_QUEUES: [&str; 2] = [DIALOG_AIFARM_QUEUE_NAME, TEXT_QUEUE_NAME];
-pub const DIALOG_AIFARM_ONLY_WORKER_QUEUES: [&str; 1] = [DIALOG_AIFARM_QUEUE_NAME];
 
 /// Boxed future returned by dialog taskman queue calls.
 pub type DialogJobWorkerFuture<'a, T, E> = Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'a>>;
@@ -216,99 +212,12 @@ impl DialogJobWorkerRunReport {
 pub struct DialogJobWorkerLoopOptions<'a, Materializer: ?Sized, ToolHistory: ?Sized> {
     pub materializer: &'a Materializer,
     pub tool_history: &'a ToolHistory,
+    pub routing_events: Option<&'a crate::runtime_routing::RoutingEventReporter>,
     /// Queue names to poll in order.
     pub queue_names: &'static [&'static str],
     /// Poll interval.
     pub interval: Duration,
     pub max_llm_job_attempts: i32,
-}
-
-/// Shared controls for one dialog-aifarm fallback worker tick.
-#[derive(Clone, Copy)]
-pub struct DialogAifarmFallbackProcessOptions<'a, Materializer: ?Sized, ToolHistory: ?Sized> {
-    pub materializer: &'a Materializer,
-    pub tool_history: &'a ToolHistory,
-    pub gate: &'a DialogAifarmFallbackGate,
-    pub max_llm_job_attempts: i32,
-    /// Tick timestamp.
-    pub now: OffsetDateTime,
-}
-
-/// Shared controls for the long-running dialog-aifarm fallback worker.
-#[derive(Clone, Copy)]
-pub struct DialogAifarmFallbackWorkerOptions<'a, Materializer: ?Sized, ToolHistory: ?Sized> {
-    pub materializer: &'a Materializer,
-    pub tool_history: &'a ToolHistory,
-    pub high_watermark: i32,
-    pub low_watermark: i32,
-    pub interval: Duration,
-    pub max_llm_job_attempts: i32,
-}
-
-/// Shared controls for one dialog-aifarm overflow worker tick.
-#[derive(Clone, Copy)]
-pub struct DialogAifarmOverflowProcessOptions<'a, Materializer: ?Sized, ToolHistory: ?Sized> {
-    pub materializer: &'a Materializer,
-    pub tool_history: &'a ToolHistory,
-    pub min_pending_depth: usize,
-    pub max_llm_job_attempts: i32,
-    /// Tick timestamp.
-    pub now: OffsetDateTime,
-}
-
-/// Shared controls for the long-running dialog-aifarm overflow worker.
-#[derive(Clone, Copy)]
-pub struct DialogAifarmOverflowWorkerOptions<'a, Materializer: ?Sized, ToolHistory: ?Sized> {
-    pub materializer: &'a Materializer,
-    pub tool_history: &'a ToolHistory,
-    pub min_pending_depth: usize,
-    pub interval: Duration,
-    pub max_llm_job_attempts: i32,
-}
-
-#[derive(Debug)]
-pub struct DialogAifarmFallbackGate {
-    active: AtomicBool,
-    high_watermark: usize,
-    low_watermark: usize,
-}
-
-impl DialogAifarmFallbackGate {
-    #[must_use]
-    pub fn new(high_watermark: i32, low_watermark: i32) -> Self {
-        Self {
-            active: AtomicBool::new(false),
-            high_watermark: high_watermark.max(1) as usize,
-            low_watermark: low_watermark.max(1) as usize,
-        }
-    }
-
-    /// Whether fallback is currently active.
-    #[must_use]
-    pub fn is_active(&self) -> bool {
-        self.active.load(AtomicOrdering::Relaxed)
-    }
-
-    pub async fn should_run<Queue>(&self, queue: &Queue) -> Result<bool, Queue::Error>
-    where
-        Queue: DialogJobWorkerQueue + Sync + ?Sized,
-    {
-        let depth = queue
-            .pending_dialog_job_depth(DIALOG_AIFARM_QUEUE_NAME, LOWEST_PRIORITY)
-            .await?;
-        if self.is_active() {
-            if depth < self.low_watermark {
-                self.active.store(false, AtomicOrdering::Relaxed);
-                return Ok(false);
-            }
-            return Ok(true);
-        }
-        if depth >= self.high_watermark {
-            self.active.store(true, AtomicOrdering::Relaxed);
-            return Ok(true);
-        }
-        Ok(false)
-    }
 }
 
 /// True when the current UTC time is inside the daily `[start, end)` minute window,
@@ -376,6 +285,11 @@ async fn evaluate_router_triggers_once<Queue>(
                     start_minute,
                     end_minute,
                 } => in_utc_minute_window(*start_minute, *end_minute),
+                openplotva_llm::router::TriggerCondition::ProviderCapacity {
+                    provider,
+                    model,
+                    ..
+                } => triggers.provider_capacity_unavailable(*provider, *model),
             };
             triggers.set_engaged(spec.id, engaged);
         }
@@ -931,16 +845,18 @@ where
             queue_name,
             max_llm_job_attempts: DEFAULT_LLM_JOB_MAX_ATTEMPTS,
             now,
+            routing_events: None,
         },
     )
     .await
 }
 
 #[derive(Clone, Copy)]
-struct DialogJobProcessOptions {
+struct DialogJobProcessOptions<'a> {
     queue_name: &'static str,
     max_llm_job_attempts: i32,
     now: OffsetDateTime,
+    routing_events: Option<&'a crate::runtime_routing::RoutingEventReporter>,
 }
 
 async fn process_dialog_job_once_in_queue_with_materializer_history_and_retry_at<
@@ -955,7 +871,7 @@ async fn process_dialog_job_once_in_queue_with_materializer_history_and_retry_at
     effects: &Effects,
     materializer: &Materializer,
     tool_history: &ToolHistory,
-    options: DialogJobProcessOptions,
+    options: DialogJobProcessOptions<'_>,
 ) -> DialogJobWorkerReport
 where
     Queue: DialogJobWorkerQueue + Sync + ?Sized,
@@ -1025,6 +941,8 @@ where
                 handle_retryable_dialog_provider_error(
                     queue,
                     &item,
+                    &params,
+                    options.routing_events,
                     RetryableDialogProviderFailure {
                         queue_name: options.queue_name,
                         provider_name: &retry_provider,
@@ -1062,9 +980,29 @@ where
     let raw_answer = dialog_job_answer(&output);
     let answer = prepare_dialog_chat_response(&raw_answer);
     if !raw_answer.trim().is_empty() && answer.is_empty() {
+        // The model returned visible text, but it collapses to nothing once the
+        // send boundary decodes entities and strips disallowed markup (typically a
+        // tool call leaked as plain text). Treat it like a retryable protocol error
+        // instead of dropping the turn silently: requeue for another attempt, which
+        // reselects a backend, and only fail loudly once attempts are exhausted.
         let error = "dialog answer became empty after sanitization".to_owned();
         report.empty_answer_error = Some(error.clone());
-        mark_dialog_job_failed(queue, item.id, &error, &mut report).await;
+        handle_retryable_dialog_provider_error(
+            queue,
+            &item,
+            &params,
+            options.routing_events,
+            RetryableDialogProviderFailure {
+                queue_name: options.queue_name,
+                provider_name: output.provider.as_str(),
+                reason: openplotva_llm::retry::FailureReason::ProviderProtocolError,
+                error: &error,
+                max_attempts: options.max_llm_job_attempts.max(1),
+                now: options.now,
+            },
+            &mut report,
+        )
+        .await;
         return report;
     }
     if !answer.is_empty() {
@@ -1151,6 +1089,7 @@ where
         DialogJobWorkerLoopOptions {
             materializer,
             tool_history: &noop,
+            routing_events: None,
             queue_names,
             interval,
             max_llm_job_attempts: DEFAULT_LLM_JOB_MAX_ATTEMPTS,
@@ -1201,227 +1140,12 @@ where
                             queue_name,
                             max_llm_job_attempts: options.max_llm_job_attempts,
                             now: OffsetDateTime::now_utc(),
+                            routing_events: options.routing_events,
                         },
                     ).await;
                     trace_dialog_job_tick(&tick);
                     report.record_tick(&tick);
                 }
-            }
-        }
-    }
-
-    report
-}
-
-pub async fn process_dialog_aifarm_fallback_job_once_with_materializer_history_and_retry_at<
-    Queue,
-    Provider,
-    Effects,
-    Materializer,
-    ToolHistory,
->(
-    queue: &Queue,
-    provider: &Provider,
-    effects: &Effects,
-    options: DialogAifarmFallbackProcessOptions<'_, Materializer, ToolHistory>,
-) -> DialogJobWorkerReport
-where
-    Queue: DialogJobWorkerQueue + Sync + ?Sized,
-    Provider: ChatProvider + Sync + ?Sized,
-    Effects: DialogJobEffects + Sync + ?Sized,
-    Materializer: DialogInputMaterializer + Sync + ?Sized,
-    ToolHistory: DialogToolCallHistoryStore + Sync + ?Sized,
-{
-    let should_run = match options.gate.should_run(queue).await {
-        Ok(should_run) => should_run,
-        Err(error) => {
-            tracing::warn!(%error, "failed to read dialog-aifarm fallback depth");
-            options.gate.is_active()
-        }
-    };
-    if !should_run {
-        return DialogJobWorkerReport {
-            queue_name: DIALOG_AIFARM_QUEUE_NAME.to_owned(),
-            ..DialogJobWorkerReport::default()
-        };
-    }
-
-    process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
-        queue,
-        provider,
-        effects,
-        options.materializer,
-        options.tool_history,
-        DialogJobProcessOptions {
-            queue_name: DIALOG_AIFARM_QUEUE_NAME,
-            max_llm_job_attempts: options.max_llm_job_attempts,
-            now: options.now,
-        },
-    )
-    .await
-}
-
-pub async fn run_dialog_aifarm_fallback_worker_with_materializer_and_history_until_with_max_attempts<
-    Queue,
-    Provider,
-    Effects,
-    Materializer,
-    ToolHistory,
-    Stop,
->(
-    queue: &Queue,
-    provider: &Provider,
-    effects: &Effects,
-    options: DialogAifarmFallbackWorkerOptions<'_, Materializer, ToolHistory>,
-    stop: Stop,
-) -> DialogJobWorkerRunReport
-where
-    Queue: DialogJobWorkerQueue + Sync + ?Sized,
-    Provider: ChatProvider + Sync + ?Sized,
-    Effects: DialogJobEffects + Sync + ?Sized,
-    Materializer: DialogInputMaterializer + Sync + ?Sized,
-    ToolHistory: DialogToolCallHistoryStore + Sync + ?Sized,
-    Stop: Future<Output = ()>,
-{
-    let gate = DialogAifarmFallbackGate::new(options.high_watermark, options.low_watermark);
-    let mut report = DialogJobWorkerRunReport::default();
-    let mut stop = std::pin::pin!(stop);
-    let interval = if options.interval.is_zero() {
-        Duration::from_secs(1)
-    } else {
-        options.interval
-    };
-
-    loop {
-        tokio::select! {
-            () = &mut stop => break,
-            () = tokio::time::sleep(interval) => {
-                let tick = process_dialog_aifarm_fallback_job_once_with_materializer_history_and_retry_at(
-                    queue,
-                    provider,
-                    effects,
-                    DialogAifarmFallbackProcessOptions {
-                        materializer: options.materializer,
-                        tool_history: options.tool_history,
-                        gate: &gate,
-                        max_llm_job_attempts: options.max_llm_job_attempts,
-                        now: OffsetDateTime::now_utc(),
-                    },
-                ).await;
-                trace_dialog_job_tick(&tick);
-                report.record_tick(&tick);
-            }
-        }
-    }
-
-    report
-}
-
-pub async fn process_dialog_aifarm_overflow_job_once_with_materializer_history_and_retry_at<
-    Queue,
-    Provider,
-    Effects,
-    Materializer,
-    ToolHistory,
->(
-    queue: &Queue,
-    provider: &Provider,
-    effects: &Effects,
-    options: DialogAifarmOverflowProcessOptions<'_, Materializer, ToolHistory>,
-) -> DialogJobWorkerReport
-where
-    Queue: DialogJobWorkerQueue + Sync + ?Sized,
-    Provider: ChatProvider + Sync + ?Sized,
-    Effects: DialogJobEffects + Sync + ?Sized,
-    Materializer: DialogInputMaterializer + Sync + ?Sized,
-    ToolHistory: DialogToolCallHistoryStore + Sync + ?Sized,
-{
-    if !openplotva_llm::aifarm::pool_enabled() {
-        return DialogJobWorkerReport {
-            queue_name: DIALOG_AIFARM_QUEUE_NAME.to_owned(),
-            ..DialogJobWorkerReport::default()
-        };
-    }
-    let pending_depth = match queue
-        .pending_dialog_job_depth(DIALOG_AIFARM_QUEUE_NAME, LOWEST_PRIORITY)
-        .await
-    {
-        Ok(depth) => depth,
-        Err(error) => {
-            tracing::warn!(%error, "failed to read dialog-aifarm overflow depth");
-            0
-        }
-    };
-    if pending_depth < options.min_pending_depth.max(1) {
-        return DialogJobWorkerReport {
-            queue_name: DIALOG_AIFARM_QUEUE_NAME.to_owned(),
-            ..DialogJobWorkerReport::default()
-        };
-    }
-
-    process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
-        queue,
-        provider,
-        effects,
-        options.materializer,
-        options.tool_history,
-        DialogJobProcessOptions {
-            queue_name: DIALOG_AIFARM_QUEUE_NAME,
-            max_llm_job_attempts: options.max_llm_job_attempts,
-            now: options.now,
-        },
-    )
-    .await
-}
-
-pub async fn run_dialog_aifarm_overflow_worker_with_materializer_and_history_until_with_max_attempts<
-    Queue,
-    Provider,
-    Effects,
-    Materializer,
-    ToolHistory,
-    Stop,
->(
-    queue: &Queue,
-    provider: &Provider,
-    effects: &Effects,
-    options: DialogAifarmOverflowWorkerOptions<'_, Materializer, ToolHistory>,
-    stop: Stop,
-) -> DialogJobWorkerRunReport
-where
-    Queue: DialogJobWorkerQueue + Sync + ?Sized,
-    Provider: ChatProvider + Sync + ?Sized,
-    Effects: DialogJobEffects + Sync + ?Sized,
-    Materializer: DialogInputMaterializer + Sync + ?Sized,
-    ToolHistory: DialogToolCallHistoryStore + Sync + ?Sized,
-    Stop: Future<Output = ()>,
-{
-    let mut report = DialogJobWorkerRunReport::default();
-    let mut stop = std::pin::pin!(stop);
-    let interval = if options.interval.is_zero() {
-        Duration::from_secs(1)
-    } else {
-        options.interval
-    };
-
-    loop {
-        tokio::select! {
-            () = &mut stop => break,
-            () = tokio::time::sleep(interval) => {
-                let tick = process_dialog_aifarm_overflow_job_once_with_materializer_history_and_retry_at(
-                    queue,
-                    provider,
-                    effects,
-                    DialogAifarmOverflowProcessOptions {
-                        materializer: options.materializer,
-                        tool_history: options.tool_history,
-                        min_pending_depth: options.min_pending_depth,
-                        max_llm_job_attempts: options.max_llm_job_attempts,
-                        now: OffsetDateTime::now_utc(),
-                    },
-                ).await;
-                trace_dialog_job_tick(&tick);
-                report.record_tick(&tick);
             }
         }
     }
@@ -1551,6 +1275,7 @@ where
         DialogJobWorkerLoopOptions {
             materializer,
             tool_history,
+            routing_events: None,
             queue_names: &DIALOG_JOB_WORKER_QUEUES,
             interval: DIALOG_JOB_POLL_INTERVAL,
             max_llm_job_attempts,
@@ -2642,6 +2367,8 @@ struct RetryableDialogProviderFailure<'a> {
 async fn handle_retryable_dialog_provider_error<Queue>(
     queue: &Queue,
     item: &DialogJobWorkItem,
+    params: &DialogJobParams,
+    routing_events: Option<&crate::runtime_routing::RoutingEventReporter>,
     failure: RetryableDialogProviderFailure<'_>,
     report: &mut DialogJobWorkerReport,
 ) where
@@ -2688,6 +2415,17 @@ async fn handle_retryable_dialog_provider_error<Queue>(
 
     if exhausted {
         report.retry_exhausted = true;
+        if let Some(reporter) = routing_events {
+            reporter.record(dialog_retry_exhausted_routing_event(
+                item,
+                params,
+                &provider,
+                &target_queue,
+                &failure,
+                attempt,
+                max_attempts,
+            ));
+        }
         mark_dialog_job_failed(queue, item.id, failure.error, report).await;
         return;
     }
@@ -2806,6 +2544,38 @@ fn dialog_retry_job_event(
     }
 }
 
+fn dialog_retry_exhausted_routing_event(
+    item: &DialogJobWorkItem,
+    params: &DialogJobParams,
+    provider: &str,
+    target_queue: &str,
+    failure: &RetryableDialogProviderFailure<'_>,
+    attempt: i32,
+    max_attempts: i32,
+) -> crate::runtime_routing::RoutingEvent {
+    crate::runtime_routing::RoutingEvent {
+        severity: "error".to_owned(),
+        event_type: "all_attempts_exhausted".to_owned(),
+        workflow_key: "dialog".to_owned(),
+        provider_id: None,
+        model_id: None,
+        queue_name: Some(failure.queue_name.to_owned()),
+        job_id: Some(item.id),
+        chat_id: (params.chat_id != 0).then_some(params.chat_id),
+        thread_id: params.thread_id,
+        message_id: (params.message_id != 0).then_some(params.message_id),
+        dedupe_key: format!("all_attempts_exhausted:dialog:job_retry_exhausted:{provider}"),
+        summary: "dialog job retry budget exhausted".to_owned(),
+        detail: serde_json::json!({
+            "job_attempts": attempt,
+            "max_attempts": max_attempts,
+            "last_retryable_reason": failure.reason.as_str(),
+            "provider": provider,
+            "target_queue": target_queue,
+        }),
+    }
+}
+
 fn trace_dialog_job_tick(tick: &DialogJobWorkerReport) {
     if !tick.dequeued
         && tick.dequeue_error.is_none()
@@ -2849,6 +2619,17 @@ fn trace_dialog_job_tick(tick: &DialogJobWorkerReport) {
         status_error = tick.status_error.as_deref(),
         "processed dialog taskman worker tick"
     );
+
+    if tick.empty_answer_error.is_some() && tick.retry_exhausted {
+        tracing::warn!(
+            queue_name = tick.queue_name,
+            job_id = tick.job_id,
+            provider = tick.provider.as_deref(),
+            retry_attempt = tick.retry_attempt,
+            empty_answer_error = tick.empty_answer_error.as_deref(),
+            "dialog turn produced no sendable answer after retries; no reply sent"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2868,189 +2649,6 @@ mod tests {
     use openplotva_taskman::{DialogJobParams, HIGH_PRIORITY, JobStatus, new_dialog_job_at};
 
     use super::*;
-
-    static AIFARM_POOL_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-    #[tokio::test]
-    async fn dialog_aifarm_fallback_gate_uses_go_high_low_watermarks() -> Result<(), Box<dyn Error>>
-    {
-        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
-        let queue = InMemoryTaskQueue::new();
-        let gate = DialogAifarmFallbackGate::new(3, 2);
-
-        for text in ["one", "two"] {
-            queue.assign(
-                DIALOG_AIFARM_QUEUE_NAME,
-                new_dialog_job_at(dialog_params(text), now),
-            );
-        }
-        assert!(!gate.should_run(&queue).await?);
-
-        queue.assign(
-            DIALOG_AIFARM_QUEUE_NAME,
-            new_dialog_job_at(dialog_params("three"), now),
-        );
-        assert!(gate.should_run(&queue).await?);
-
-        let first = queue
-            .dequeue(DIALOG_AIFARM_QUEUE_NAME, "primary", now)
-            .expect("first dequeued");
-        assert!(
-            gate.should_run(&queue).await?,
-            "fallback stays active at the low watermark"
-        );
-        queue.complete(first.id, now)?;
-
-        queue
-            .dequeue(DIALOG_AIFARM_QUEUE_NAME, "primary", now)
-            .expect("second dequeued");
-        assert!(
-            !gate.should_run(&queue).await?,
-            "fallback stops below the low watermark"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn dialog_aifarm_fallback_worker_reads_same_queue_fifo_with_fallback_provider()
-    -> Result<(), Box<dyn Error>> {
-        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
-        let queue = InMemoryTaskQueue::new();
-        let first = queue.assign(
-            DIALOG_AIFARM_QUEUE_NAME,
-            new_dialog_job_at(dialog_params("first"), now),
-        );
-        let second = queue.assign(
-            DIALOG_AIFARM_QUEUE_NAME,
-            new_dialog_job_at(dialog_params("second"), now),
-        );
-        let provider = ProviderStub::returning(DialogOutput {
-            provider: "genkit".to_owned(),
-            answer: "fallback pong".to_owned(),
-            ..DialogOutput::default()
-        });
-        let effects = EffectsStub::default();
-        let gate = DialogAifarmFallbackGate::new(1, 1);
-
-        let report =
-            process_dialog_aifarm_fallback_job_once_with_materializer_history_and_retry_at(
-                &queue,
-                &provider,
-                &effects,
-                DialogAifarmFallbackProcessOptions {
-                    materializer: &BasicDialogInputMaterializer,
-                    tool_history: &NoopDialogToolCallHistoryStore,
-                    gate: &gate,
-                    max_llm_job_attempts: DEFAULT_LLM_JOB_MAX_ATTEMPTS,
-                    now,
-                },
-            )
-            .await;
-
-        assert_eq!(report.job_id, Some(first));
-        assert_eq!(record_status(&queue, first), JobStatus::Completed);
-        assert_eq!(
-            provider
-                .inputs()
-                .first()
-                .map(|input| input.message.text.as_str()),
-            Some("first")
-        );
-        assert_eq!(
-            effects.sent(),
-            vec![("first".to_owned(), "fallback pong".to_owned())]
-        );
-        let next = queue
-            .dequeue(DIALOG_AIFARM_QUEUE_NAME, "primary", now)
-            .expect("second still pending");
-        assert_eq!(next.id, second);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn dialog_aifarm_overflow_worker_is_idle_when_pool_disabled() -> Result<(), Box<dyn Error>>
-    {
-        let _guard = AIFARM_POOL_TEST_LOCK.lock().await;
-        openplotva_llm::aifarm::set_pool_enabled(false);
-        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
-        let queue = InMemoryTaskQueue::new();
-        let job_id = queue.assign(
-            DIALOG_AIFARM_QUEUE_NAME,
-            new_dialog_job_at(dialog_params("first"), now),
-        );
-        let provider = ProviderStub::returning(DialogOutput {
-            provider: "aifarm".to_owned(),
-            answer: "pong".to_owned(),
-            ..DialogOutput::default()
-        });
-        let effects = EffectsStub::default();
-
-        let report =
-            process_dialog_aifarm_overflow_job_once_with_materializer_history_and_retry_at(
-                &queue,
-                &provider,
-                &effects,
-                DialogAifarmOverflowProcessOptions {
-                    materializer: &BasicDialogInputMaterializer,
-                    tool_history: &NoopDialogToolCallHistoryStore,
-                    min_pending_depth: 1,
-                    max_llm_job_attempts: DEFAULT_LLM_JOB_MAX_ATTEMPTS,
-                    now,
-                },
-            )
-            .await;
-
-        assert!(!report.dequeued);
-        assert_eq!(record_status(&queue, job_id), JobStatus::Pending);
-        assert!(provider.inputs().is_empty());
-        openplotva_llm::aifarm::set_pool_enabled(true);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn dialog_aifarm_overflow_worker_dequeues_when_pool_enabled() -> Result<(), Box<dyn Error>>
-    {
-        let _guard = AIFARM_POOL_TEST_LOCK.lock().await;
-        openplotva_llm::aifarm::set_pool_enabled(true);
-        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
-        let queue = InMemoryTaskQueue::new();
-        let job_id = queue.assign(
-            DIALOG_AIFARM_QUEUE_NAME,
-            new_dialog_job_at(dialog_params("first"), now),
-        );
-        let provider = ProviderStub::returning(DialogOutput {
-            provider: "aifarm".to_owned(),
-            answer: "pong".to_owned(),
-            ..DialogOutput::default()
-        });
-        let effects = EffectsStub::default();
-
-        let report =
-            process_dialog_aifarm_overflow_job_once_with_materializer_history_and_retry_at(
-                &queue,
-                &provider,
-                &effects,
-                DialogAifarmOverflowProcessOptions {
-                    materializer: &BasicDialogInputMaterializer,
-                    tool_history: &NoopDialogToolCallHistoryStore,
-                    min_pending_depth: 1,
-                    max_llm_job_attempts: DEFAULT_LLM_JOB_MAX_ATTEMPTS,
-                    now,
-                },
-            )
-            .await;
-
-        assert_eq!(report.job_id, Some(job_id));
-        assert_eq!(record_status(&queue, job_id), JobStatus::Completed);
-        assert_eq!(
-            provider
-                .inputs()
-                .first()
-                .map(|input| input.message.text.as_str()),
-            Some("first")
-        );
-        Ok(())
-    }
 
     #[tokio::test]
     async fn dialog_worker_runs_provider_sends_answer_and_completes_job()
@@ -3414,7 +3012,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dialog_worker_fails_when_provider_answer_sanitizes_to_empty()
+    async fn dialog_worker_fails_when_answer_sanitizes_to_empty_after_attempts_exhausted()
+    -> Result<(), Box<dyn Error>> {
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let queue = InMemoryTaskQueue::new();
+        let job_id = queue.assign(
+            DIALOG_AIFARM_QUEUE_NAME,
+            new_dialog_job_at(dialog_params("найди сообщения"), now),
+        );
+        let provider = ProviderStub::returning(DialogOutput {
+            answer: "<tool_calls><tool_call name=\"history_search\"></tool_call></tool_calls>"
+                .to_owned(),
+            ..DialogOutput::default()
+        });
+        let effects = EffectsStub::default();
+
+        let report = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+            &queue,
+            &provider,
+            &effects,
+            &BasicDialogInputMaterializer,
+            &NoopDialogToolCallHistoryStore,
+            DialogJobProcessOptions {
+                queue_name: DIALOG_AIFARM_QUEUE_NAME,
+                max_llm_job_attempts: 1,
+                now,
+                routing_events: None,
+            },
+        )
+        .await;
+
+        assert!(report.failed);
+        assert!(report.retry_exhausted);
+        assert!(!report.completed);
+        assert!(!report.sent_answer);
+        assert!(effects.sent().is_empty());
+        assert_eq!(
+            report.empty_answer_error,
+            Some("dialog answer became empty after sanitization".to_owned())
+        );
+        assert_eq!(record_status(&queue, job_id), JobStatus::Failed);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dialog_worker_requeues_when_provider_answer_sanitizes_to_empty()
     -> Result<(), Box<dyn Error>> {
         let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
         let queue = InMemoryTaskQueue::new();
@@ -3431,15 +3073,12 @@ mod tests {
 
         let report = process_dialog_job_once_at(&queue, &provider, &effects, now).await;
 
-        assert!(report.failed);
-        assert!(!report.completed);
+        assert!(report.retry_requeued);
+        assert!(!report.failed);
         assert!(!report.sent_answer);
         assert!(effects.sent().is_empty());
-        assert_eq!(
-            report.empty_answer_error,
-            Some("dialog answer became empty after sanitization".to_owned())
-        );
-        assert_eq!(record_status(&queue, job_id), JobStatus::Failed);
+        assert_eq!(report.retry_attempt, Some(1));
+        assert_eq!(record_status(&queue, job_id), JobStatus::Pending);
         Ok(())
     }
 
@@ -3644,13 +3283,25 @@ mod tests {
         let provider =
             RetryableProviderStub::new("aifarm", FailureReason::ProviderUnavailable, "status 503");
         let effects = EffectsStub::default();
+        let reporter = crate::runtime_routing::RoutingEventReporter::new(
+            crate::runtime_routing::RoutingEventBuffer::new(8),
+            None,
+            None,
+            Duration::from_secs(600),
+        );
 
-        let report = process_dialog_job_once_in_queue_at(
+        let report = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
             &queue,
-            DIALOG_AIFARM_QUEUE_NAME,
             &provider,
             &effects,
-            now,
+            &BasicDialogInputMaterializer,
+            &NoopDialogToolCallHistoryStore,
+            DialogJobProcessOptions {
+                queue_name: DIALOG_AIFARM_QUEUE_NAME,
+                max_llm_job_attempts: DEFAULT_LLM_JOB_MAX_ATTEMPTS,
+                now,
+                routing_events: Some(&reporter),
+            },
         )
         .await;
 
@@ -3672,6 +3323,21 @@ mod tests {
             "retryable LLM provider error exhausted job attempts"
         );
         assert_eq!(event.data["fallback_reason"], "provider_unavailable");
+        let routing_events = reporter.buffer().routing_events(10);
+        assert_eq!(routing_events.len(), 1);
+        assert_eq!(routing_events[0].event_type, "all_attempts_exhausted");
+        assert_eq!(routing_events[0].workflow_key, "dialog");
+        assert_eq!(
+            routing_events[0].queue_name.as_deref(),
+            Some(DIALOG_AIFARM_QUEUE_NAME)
+        );
+        assert_eq!(routing_events[0].job_id, Some(job_id));
+        assert_eq!(routing_events[0].chat_id, Some(42));
+        assert_eq!(routing_events[0].message_id, Some(100));
+        assert_eq!(
+            routing_events[0].detail["last_retryable_reason"],
+            "provider_unavailable"
+        );
         Ok(())
     }
 
@@ -3697,6 +3363,7 @@ mod tests {
                 queue_name: DIALOG_AIFARM_QUEUE_NAME,
                 max_llm_job_attempts: 2,
                 now,
+                routing_events: None,
             },
         )
         .await;
@@ -3713,6 +3380,7 @@ mod tests {
                 queue_name: DIALOG_AIFARM_QUEUE_NAME,
                 max_llm_job_attempts: 2,
                 now,
+                routing_events: None,
             },
         )
         .await;

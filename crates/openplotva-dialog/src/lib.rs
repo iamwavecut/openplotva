@@ -1112,22 +1112,18 @@ pub fn extract_content_tool_step(
     raw_content: &str,
 ) -> Result<(Option<ToolStep>, ToolParseDecision), ToolParseError> {
     let raw_content = raw_content.trim();
-    for parser in [
-        parse_xmlish_tool_step_attempt,
-        parse_inline_tool_step_attempt,
-        parse_normalized_tool_step_attempt,
-        parse_bare_tool_step_attempt,
-    ] {
-        let (step, ok, form) = parser(raw_content)?;
-        if ok {
-            let decision = ToolParseDecision {
-                form,
-                tool: step.step.clone(),
-                outcome: "detected".to_owned(),
-                reason: String::new(),
-            };
-            return Ok((Some(step), decision));
-        }
+    if let Some((step, decision)) = detect_tool_step_in(raw_content)? {
+        return Ok((Some(step), decision));
+    }
+    // Some backends leak a tool call as HTML-entity-encoded markup in the
+    // assistant text (e.g. `&lt;tool_calls&gt;web_search{...}&lt;/tool_calls&gt;`).
+    // Decoding lets the same parsers recognize and execute it instead of letting
+    // the markup reach the send boundary, where sanitization strips it to empty.
+    let decoded = unescape_xmlish(raw_content);
+    if decoded.trim() != raw_content
+        && let Some((step, decision)) = detect_tool_step_in(decoded.trim())?
+    {
+        return Ok((Some(step), decision));
     }
     if let Some(decision) = detect_ignored_tool_call(raw_content) {
         return Ok((None, decision));
@@ -1140,6 +1136,29 @@ pub fn extract_content_tool_step(
             ..ToolParseDecision::default()
         },
     ))
+}
+
+fn detect_tool_step_in(
+    content: &str,
+) -> Result<Option<(ToolStep, ToolParseDecision)>, ToolParseError> {
+    for parser in [
+        parse_xmlish_tool_step_attempt,
+        parse_inline_tool_step_attempt,
+        parse_normalized_tool_step_attempt,
+        parse_bare_tool_step_attempt,
+    ] {
+        let (step, ok, form) = parser(content)?;
+        if ok {
+            let decision = ToolParseDecision {
+                form,
+                tool: step.step.clone(),
+                outcome: "detected".to_owned(),
+                reason: String::new(),
+            };
+            return Ok(Some((step, decision)));
+        }
+    }
+    Ok(None)
 }
 
 fn parse_xmlish_tool_step_attempt(raw: &str) -> Result<(ToolStep, bool, String), ToolParseError> {
@@ -2382,6 +2401,23 @@ mod tests {
             assert_eq!(decision.outcome, "ignored");
             assert_eq!(decision.reason, "unknown_tool");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn content_parser_decodes_entity_encoded_tool_call() -> Result<(), ToolParseError> {
+        let (step, decision) = extract_content_tool_step(
+            r#"&lt;tool_calls&gt;&lt;tool_call&gt;web_search{query: "rust async runtime"}&lt;/tool_call&gt;&lt;/tool_calls&gt;"#,
+        )?;
+        assert_eq!(
+            step,
+            Some(ToolStep {
+                step: STEP_WEB_SEARCH.to_owned(),
+                query: "rust async runtime".to_owned(),
+                ..ToolStep::default()
+            })
+        );
+        assert_eq!(decision.outcome, "detected");
         Ok(())
     }
 

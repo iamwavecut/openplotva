@@ -54,6 +54,7 @@ pub use runtime_graphql::{
     RuntimeMemoryRestartResultData, RuntimeMemoryRestarter, RuntimePendingOpData,
     RuntimePendingOpsReader, RuntimePendingOpsReaderFuture, RuntimeRedisInspector,
     RuntimeRedisInspectorFuture, RuntimeRedisPrefixGroup, RuntimeRedisValue,
+    RuntimeRoutingEventData, RuntimeRoutingEventInspector, RuntimeRoutingEventsFilter,
     RuntimeSafetyCheckConnectionData, RuntimeSafetyCheckData, RuntimeSafetyCheckReader,
     RuntimeSafetyCheckReaderFuture, RuntimeSafetyChecksFilter, RuntimeSqlReadRequest,
     RuntimeSqlReadResult, RuntimeSqlReader, RuntimeSqlReaderFuture, RuntimeSubscriptionData,
@@ -980,7 +981,8 @@ mod tests {
         RuntimeMemoryRestartFuture, RuntimeMemoryRestartResultData, RuntimeMemoryRestarter,
         RuntimePendingOpData, RuntimePendingOpsReader, RuntimePendingOpsReaderFuture,
         RuntimeRedisInspector, RuntimeRedisInspectorFuture, RuntimeRedisPrefixGroup,
-        RuntimeRedisValue, RuntimeSafetyCheckConnectionData, RuntimeSafetyCheckData,
+        RuntimeRedisValue, RuntimeRoutingEventData, RuntimeRoutingEventInspector,
+        RuntimeRoutingEventsFilter, RuntimeSafetyCheckConnectionData, RuntimeSafetyCheckData,
         RuntimeSafetyCheckReader, RuntimeSafetyCheckReaderFuture, RuntimeSafetyChecksFilter,
         RuntimeSqlReadRequest, RuntimeSqlReadResult, RuntimeSqlReader, RuntimeSqlReaderFuture,
         RuntimeSubscriptionData, RuntimeTaskmanDiagnosticsData, RuntimeTaskmanInspector,
@@ -2234,6 +2236,73 @@ mod tests {
         assert_eq!(request["genConfig"]["maxOutputTokens"], 512);
         assert_eq!(request["rawResponse"]["content"], "answer");
         assert_eq!(request["result"]["responseTextPreview"], "answer");
+    }
+
+    #[tokio::test]
+    async fn runtime_api_graphql_serves_llm_routing_events() {
+        struct RoutingEventInspector;
+
+        impl RuntimeRoutingEventInspector for RoutingEventInspector {
+            fn routing_events(
+                &self,
+                filter: RuntimeRoutingEventsFilter,
+            ) -> Result<Vec<RuntimeRoutingEventData>, String> {
+                assert_eq!(filter.workflow_key, "dialog");
+                assert_eq!(filter.event_type, "route_unavailable");
+                assert_eq!(filter.limit, 10);
+                Ok(vec![RuntimeRoutingEventData {
+                    id: 9,
+                    at: "2026-06-27T12:00:00Z".to_owned(),
+                    severity: "error".to_owned(),
+                    event_type: "route_unavailable".to_owned(),
+                    workflow_key: "dialog".to_owned(),
+                    provider_id: Some(10),
+                    model_id: Some(20),
+                    queue_name: Some("text".to_owned()),
+                    job_id: Some(30),
+                    chat_id: Some(-100),
+                    thread_id: Some(5),
+                    message_id: Some(77),
+                    dedupe_key: "route:dialog".to_owned(),
+                    summary: "dialog route unavailable".to_owned(),
+                    detail: serde_json::json!({"admin_report": {"action": "sent"}}),
+                }])
+            }
+        }
+
+        let schema = runtime_api_graphql_schema_with_live_diagnostics(
+            RuntimeApiGraphqlSnapshot::default(),
+            RuntimeApiLiveDiagnostics {
+                routing_event_inspector: Some(Arc::new(RoutingEventInspector)),
+                ..RuntimeApiLiveDiagnostics::default()
+            },
+        );
+        let response = schema
+            .execute(
+                r#"
+                query {
+                    llmRoutingEvents(filter: { workflowKey: "dialog", eventType: "route_unavailable", limit: 10 }) {
+                        id at severity eventType workflowKey providerID modelID queueName jobID chatID threadID messageID dedupeKey summary detail
+                    }
+                }
+                "#,
+            )
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "runtime routing events GraphQL returned errors: {:?}",
+            response.errors
+        );
+        let payload = serde_json::to_value(&response)
+            .unwrap_or_else(|error| panic!("serialize GraphQL response: {error}"));
+        let event = &payload["data"]["llmRoutingEvents"][0];
+        assert_eq!(event["id"], "9");
+        assert_eq!(event["eventType"], "route_unavailable");
+        assert_eq!(event["workflowKey"], "dialog");
+        assert_eq!(event["providerID"], "10");
+        assert_eq!(event["modelID"], "20");
+        assert_eq!(event["detail"]["admin_report"]["action"], "sent");
     }
 
     #[tokio::test]

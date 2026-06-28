@@ -1,34 +1,33 @@
 //! App-level dialog provider construction.
 
-use std::{collections::HashMap, fmt, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 
 use openplotva_config::AppConfig;
 use openplotva_dialog::{
-    DialogInput, DialogOutput, DialogToolbox, PROVIDER_AIFARM, PROVIDER_GENKIT, PROVIDER_NVIDIA,
-    PROVIDER_VMLX,
+    DialogInput, DialogToolbox, PROVIDER_AIFARM, PROVIDER_GENKIT, PROVIDER_NVIDIA, PROVIDER_VMLX,
 };
 use openplotva_llm::{
     ChatProvider, ChatProviderError, ChatProviderFuture,
     aifarm::{
-        AifarmClientConfig, AifarmDialogConfig, AifarmDialogProvider, AifarmPoolConfig,
-        ReqwestAifarmTransport, normalize_chat_completions_url,
+        AifarmClientConfig, AifarmDialogConfig, AifarmDialogProvider, ReqwestAifarmTransport,
+        normalize_chat_completions_url,
     },
     gemini::{
         GeminiDialogConfig, GeminiDialogProvider, GeminiExplicitCacheConfig,
         is_gemini_provider_model,
     },
     retry::retryable_reason,
-    router::{BreakerLiveness, BreakerSet, RouterHandle, TriggerState, select},
+    router::{BreakerSet, RouterHandle, TriggerState},
     whitecircle::{WhiteCircleClientConfig, WhiteCirclePreToolConfig},
     with_fallback,
 };
 use thiserror::Error;
 
-use crate::agent_runtime;
 use crate::media::{
-    agent_client_config_from_named_provider, aifarm_dialog_config_from_app_config,
-    nvidia_dialog_config_from_app_config, vmlx_dialog_config_from_app_config,
+    aifarm_dialog_config_from_app_config, nvidia_dialog_config_from_app_config,
+    vmlx_dialog_config_from_app_config,
 };
+use crate::routed_attempts::{RoutedAttemptRunError, RoutedAttemptWalker, RoutedRequestContext};
 use crate::runtime_gemini_cache::resolve_google_ai_key;
 
 const OPENROUTER_MODEL_PREFIX: &str = "openrouter/";
@@ -45,9 +44,7 @@ const DIALOG_WORKFLOW_KEY: &str = "dialog";
 /// overflow), recording circuit-breaker outcomes. Underlying transport clients are
 /// reused from the existing per-provider factories, keyed by provider name.
 pub struct RouterChatProvider {
-    handle: Arc<RouterHandle>,
-    breakers: Arc<BreakerSet>,
-    triggers: Arc<TriggerState>,
+    walker: RoutedAttemptWalker,
     clients: HashMap<String, DialogProviderHandle>,
     default_client: DialogProviderHandle,
     provider_name: String,
@@ -63,20 +60,20 @@ impl RouterChatProvider {
         default_client: DialogProviderHandle,
     ) -> Self {
         Self {
-            handle,
-            breakers,
-            triggers,
+            walker: RoutedAttemptWalker::new(handle, breakers, triggers),
             clients,
             default_client,
             provider_name: "router".to_owned(),
         }
     }
 
-    fn client_for(&self, name: &str) -> DialogProviderHandle {
-        self.clients
-            .get(name)
-            .cloned()
-            .unwrap_or_else(|| Arc::clone(&self.default_client))
+    #[must_use]
+    pub fn with_routing_event_reporter(
+        mut self,
+        reporter: crate::runtime_routing::RoutingEventReporter,
+    ) -> Self {
+        self.walker = self.walker.with_reporter(reporter);
+        self
     }
 }
 
@@ -87,72 +84,58 @@ impl ChatProvider for RouterChatProvider {
 
     fn run_dialog<'a>(&'a self, input: DialogInput) -> ChatProviderFuture<'a> {
         Box::pin(async move {
-            // Owned snapshot: Send and safe to hold across the provider awaits.
-            let table = self.handle.snapshot();
-            let Some(route) = table.resolve(DIALOG_WORKFLOW_KEY, false) else {
-                return self.default_client.run_dialog(input).await;
-            };
-
-            // Compute the attempt chain synchronously; the RNG is dropped before any await.
-            let attempts = {
-                let liveness = BreakerLiveness::new(&self.breakers, std::time::Instant::now());
-                let mut rng = rand::rng();
-                select(route, &liveness, self.triggers.as_ref(), &mut rng)
-            };
-            if attempts.is_empty() {
-                return self.default_client.run_dialog(input).await;
-            }
-
-            let mut last_error: Option<ChatProviderError> = None;
-            for attempt in attempts {
-                let provider_name = table
-                    .provider(attempt.provider)
-                    .map(|provider| provider.name.clone());
-                let client = match provider_name.as_deref() {
-                    Some(name) => self.client_for(name),
-                    None => Arc::clone(&self.default_client),
-                };
-
-                let mut request = input.clone();
-                if let Some(model) = table.model(attempt.model)
-                    && !model.model_name.trim().is_empty()
-                {
-                    request.model = model.model_name.clone();
-                }
-                if let Some(max_tokens) = attempt.overrides.max_tokens
-                    && max_tokens > 0
-                {
-                    request.max_output_tokens = max_tokens;
-                }
-
-                match client.run_dialog(request).await {
-                    Ok(mut output) => {
-                        self.breakers
-                            .record_success(attempt.provider, attempt.model);
-                        if output.provider.trim().is_empty() {
-                            output.provider = client.provider_name().to_owned();
+            let input_for_attempts = input.clone();
+            let clients = self.clients.clone();
+            let default_client = Arc::clone(&self.default_client);
+            let result = self
+                .walker
+                .run(
+                    RoutedRequestContext {
+                        workflow_key: DIALOG_WORKFLOW_KEY.to_owned(),
+                        queue_name: Some("dialog".to_owned()),
+                        chat_id: (input.context.chat_id != 0).then_some(input.context.chat_id),
+                        thread_id: input.context.thread_id,
+                        message_id: (input.message.id != 0).then_some(input.message.id),
+                        suppress_all_attempts_exhausted_admin_report: true,
+                        ..RoutedRequestContext::default()
+                    },
+                    move |attempt| {
+                        let client = clients
+                            .get(&attempt.provider_name)
+                            .cloned()
+                            .unwrap_or_else(|| Arc::clone(&default_client));
+                        let mut request = input_for_attempts.clone();
+                        if !attempt.model_name.trim().is_empty() {
+                            request.model = attempt.model_name.clone();
                         }
-                        return Ok(output);
-                    }
-                    Err(error) => {
-                        if retryable_reason(error.as_ref()).is_none() {
-                            return Err(error);
+                        if let Some(max_tokens) = attempt.overrides.max_tokens
+                            && max_tokens > 0
+                        {
+                            request.max_output_tokens = max_tokens;
                         }
-                        self.breakers.record_failure(
-                            attempt.provider,
-                            attempt.model,
-                            attempt.breaker,
-                        );
-                        last_error = Some(error);
-                    }
+                        async move {
+                            match client.run_dialog(request).await {
+                                Ok(mut output) => {
+                                    if output.provider.trim().is_empty() {
+                                        output.provider = client.provider_name().to_owned();
+                                    }
+                                    Ok(output)
+                                }
+                                Err(error) => Err(error),
+                            }
+                        }
+                    },
+                    |error| retryable_reason(error.as_ref()),
+                )
+                .await;
+            match result {
+                Ok(output) => Ok(output),
+                Err(RoutedAttemptRunError::Attempt(error)) => Err(error),
+                Err(RoutedAttemptRunError::Routing(error)) => {
+                    let error: ChatProviderError = Box::new(error);
+                    Err(error)
                 }
             }
-
-            Err(last_error.unwrap_or_else(|| {
-                Box::new(std::io::Error::other(
-                    "router: all dialog attempts exhausted",
-                ))
-            }))
         })
     }
 }
@@ -167,12 +150,11 @@ pub fn router_dialog_provider(
     breakers: Arc<BreakerSet>,
     triggers: Arc<TriggerState>,
     genkit_fallback: Option<DialogProviderHandle>,
+    routing_events: Option<crate::runtime_routing::RoutingEventReporter>,
 ) -> DialogProviderHandle {
-    // The aifarm primary is built WITHOUT its env pool: the pool secondaries are now
-    // first-class DB models routed through their own `vram-cloud` client below, so the
-    // weights set in the admin actually control them (no hidden internal pool).
-    let mut aifarm_cfg = aifarm_dialog_config_from_app_config(config);
-    aifarm_cfg.pool = AifarmPoolConfig::default();
+    // Env pool secondaries are first-class DB models routed through their own
+    // `vram-cloud` client below, so admin weights control them without a hidden pool.
+    let aifarm_cfg = aifarm_dialog_config_from_app_config(config);
     let aifarm: DialogProviderHandle =
         Arc::new(AifarmDialogProvider::new(aifarm_cfg).with_toolbox(Arc::clone(&toolbox)));
 
@@ -186,23 +168,25 @@ pub fn router_dialog_provider(
         clients.insert(PROVIDER_GENKIT.to_owned(), Arc::clone(&genkit));
         clients.insert("gemini".to_owned(), genkit);
     }
-    if let Some(pool) = pool_dialog_provider(config, Arc::clone(&toolbox)) {
-        clients.insert(POOL_PROVIDER_NAME.to_owned(), pool);
+    if let Some(vram_cloud) = vram_cloud_dialog_provider(config, Arc::clone(&toolbox)) {
+        clients.insert(VRAM_CLOUD_PROVIDER_NAME.to_owned(), vram_cloud);
     }
 
-    Arc::new(RouterChatProvider::new(
-        handle, breakers, triggers, clients, aifarm,
-    ))
+    let provider = RouterChatProvider::new(handle, breakers, triggers, clients, aifarm);
+    let provider = match routing_events {
+        Some(reporter) => provider.with_routing_event_reporter(reporter),
+        None => provider,
+    };
+    Arc::new(provider)
 }
 
-/// Provider name under which the AI Farm pool endpoint is registered, shared with
-/// the routing-table backfill so DB pool models resolve to the client below.
-pub const POOL_PROVIDER_NAME: &str = "vram-cloud";
+/// Provider name for the direct OpenAI-compatible VRAM Cloud endpoint.
+pub const VRAM_CLOUD_PROVIDER_NAME: &str = "vram-cloud";
 
-/// Build a single-backend, direct OpenAI-compatible client for the configured AI Farm
-/// pool endpoint. Each DB pool model selects itself via the per-attempt model override,
-/// so one client serves every pool model on that endpoint.
-fn pool_dialog_provider(
+/// Build a single-backend, direct OpenAI-compatible client for the configured
+/// VRAM Cloud endpoint. Each DB model selects itself via the per-attempt model
+/// override, so one client serves every model on that endpoint.
+fn vram_cloud_dialog_provider(
     config: &AppConfig,
     toolbox: Arc<dyn DialogToolbox>,
 ) -> Option<DialogProviderHandle> {
@@ -213,105 +197,14 @@ fn pool_dialog_provider(
         return None;
     }
     let mut cfg = aifarm_dialog_config_from_app_config(config);
-    cfg.provider_name = POOL_PROVIDER_NAME.to_owned();
+    cfg.provider_name = VRAM_CLOUD_PROVIDER_NAME.to_owned();
     cfg.client.direct_url = normalize_chat_completions_url(base);
     cfg.client.api_key = dialog.aifarm_pool_api_key.clone();
     cfg.client.default_model = model.clone();
     cfg.model = model.clone();
-    cfg.pool = AifarmPoolConfig::default();
     Some(Arc::new(
         AifarmDialogProvider::new(cfg).with_toolbox(toolbox),
     ))
-}
-
-struct PoolGatedFallbackChatProvider {
-    primary: DialogProviderHandle,
-    fallback: DialogProviderHandle,
-    provider_name: String,
-}
-
-#[derive(Debug)]
-struct PoolGatedFallbackChatProviderError {
-    primary_provider: String,
-    primary_error: String,
-    fallback_provider: String,
-    fallback_error: String,
-}
-
-impl PoolGatedFallbackChatProvider {
-    fn new(primary: DialogProviderHandle, fallback: DialogProviderHandle) -> Self {
-        let provider_name = format!(
-            "{}+pool-fallback:{}",
-            primary.provider_name(),
-            fallback.provider_name()
-        );
-        Self {
-            primary,
-            fallback,
-            provider_name,
-        }
-    }
-
-    async fn run_fallback(
-        &self,
-        input: DialogInput,
-        primary_error: ChatProviderError,
-    ) -> Result<DialogOutput, ChatProviderError> {
-        match self.fallback.run_dialog(input).await {
-            Ok(mut output) => {
-                if output.provider.trim().is_empty() {
-                    output.provider = self.fallback.provider_name().to_owned();
-                }
-                output.fallback_from = self.primary.provider_name().to_owned();
-                output.fallback_error = primary_error.to_string();
-                Ok(output)
-            }
-            Err(fallback_error) => Err(Box::new(PoolGatedFallbackChatProviderError {
-                primary_provider: self.primary.provider_name().to_owned(),
-                primary_error: primary_error.to_string(),
-                fallback_provider: self.fallback.provider_name().to_owned(),
-                fallback_error: fallback_error.to_string(),
-            })),
-        }
-    }
-}
-
-impl fmt::Display for PoolGatedFallbackChatProviderError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "primary provider {}: {}; pool fallback provider {}: {}",
-            self.primary_provider, self.primary_error, self.fallback_provider, self.fallback_error
-        )
-    }
-}
-
-impl std::error::Error for PoolGatedFallbackChatProviderError {}
-
-impl ChatProvider for PoolGatedFallbackChatProvider {
-    fn provider_name(&self) -> &str {
-        &self.provider_name
-    }
-
-    fn run_dialog<'a>(&'a self, input: DialogInput) -> openplotva_llm::ChatProviderFuture<'a> {
-        Box::pin(async move {
-            let mut output = match self.primary.run_dialog(input.clone()).await {
-                Ok(output) => output,
-                Err(primary_error) => {
-                    if retryable_reason(primary_error.as_ref()).is_none()
-                        || !openplotva_llm::aifarm::pool_enabled()
-                    {
-                        return Err(primary_error);
-                    }
-                    return self.run_fallback(input, primary_error).await;
-                }
-            };
-            if output.provider.trim().is_empty() {
-                output.provider = self.primary.provider_name().to_owned();
-            }
-            Ok(output)
-        })
-    }
 }
 
 /// Error returned while building the configured dialog provider.
@@ -355,12 +248,6 @@ pub fn dialog_provider_from_app_config_with_fallback(
 ) -> Result<DialogProviderHandle, DialogProviderBuildError> {
     let provider = configured_dialog_provider_name(config);
     let primary = primary_dialog_provider_from_app_config(config, Arc::clone(&toolbox))?;
-    if provider == PROVIDER_AIFARM {
-        if let Some(qwen) = qwen_dialog_provider_from_app_config(config, toolbox) {
-            return Ok(Arc::new(PoolGatedFallbackChatProvider::new(primary, qwen)));
-        }
-        return Ok(primary);
-    }
     if provider != PROVIDER_GENKIT
         && config
             .llm
@@ -521,42 +408,6 @@ pub fn aifarm_dialog_provider_from_app_config(
     AifarmDialogProvider::new(aifarm_dialog_config_from_app_config(config)).with_toolbox(toolbox)
 }
 
-#[must_use]
-pub fn qwen_dialog_config_from_app_config(config: &AppConfig) -> Option<AifarmDialogConfig> {
-    let spec = agent_runtime::qwen_reasoner_named_provider_config(config);
-    if !spec
-        .kind
-        .trim()
-        .eq_ignore_ascii_case(openplotva_config::DEFAULT_LLM_PROVIDER_KIND)
-    {
-        return None;
-    }
-    Some(
-        AifarmDialogConfig {
-            provider_name: spec.name.clone(),
-            client: agent_client_config_from_named_provider(config, &spec),
-            model: spec.model.clone(),
-            max_tokens: spec.max_tokens,
-            temperature: spec.temperature,
-            use_tool_calls: Some(false),
-            enable_thinking: spec.enable_thinking,
-            include_reasoning: spec.include_reasoning,
-            ..AifarmDialogConfig::default()
-        }
-        .with_defaults(),
-    )
-}
-
-fn qwen_dialog_provider_from_app_config(
-    config: &AppConfig,
-    toolbox: Arc<dyn DialogToolbox>,
-) -> Option<DialogProviderHandle> {
-    let cfg = qwen_dialog_config_from_app_config(config)?;
-    Some(Arc::new(
-        AifarmDialogProvider::new(cfg).with_toolbox(toolbox),
-    ))
-}
-
 /// Build the reqwest-backed NVIDIA provider with the app-owned toolbox attached.
 #[must_use]
 pub fn nvidia_dialog_provider_from_app_config(
@@ -636,6 +487,10 @@ mod tests {
         ChatProviderError,
         retry::{FailureReason, ProviderError},
     };
+    use openplotva_storage::llm_routing::{
+        AssignmentRecord, ModelRecord, ProviderRecord, RoutingSnapshot, WorkflowRecord,
+    };
+    use serde_json::json;
 
     use super::*;
 
@@ -742,82 +597,113 @@ mod tests {
         assert_eq!(provider.provider_name(), "nvidia+fallback:genkit");
     }
 
-    #[test]
-    fn qwen_dialog_config_uses_default_reasoner_provider() {
-        let config = AppConfig::from_raw(openplotva_config::RawConfig::default()).expect("config");
-
-        let cfg = qwen_dialog_config_from_app_config(&config).expect("qwen config");
-
-        assert_eq!(
-            cfg.provider_name,
-            openplotva_config::DEFAULT_AGENTIC_SEARCH_REASONER_PROVIDER
-        );
-        assert_eq!(
-            cfg.client.service_name,
-            crate::agent_runtime::DEFAULT_QWEN_SERVICE_NAME
-        );
-        assert_eq!(cfg.model, crate::agent_runtime::DEFAULT_QWEN_MODEL);
-        assert_eq!(cfg.include_reasoning, Some(false));
-        assert_eq!(cfg.enable_thinking, Some(false));
-    }
-
-    #[test]
-    fn qwen_dialog_config_prefers_explicit_named_provider() {
-        let config = AppConfig::from_raw(openplotva_config::RawConfig {
-            llm_provider_names: Some("qwen-reasoner".to_owned()),
-            llm_provider_kinds: Some("aifarm".to_owned()),
-            llm_provider_discovery_service_names: Some("custom-qwen".to_owned()),
-            llm_provider_discovery_endpoint_names: Some("chat_completions".to_owned()),
-            llm_provider_models: Some("custom-model".to_owned()),
-            llm_provider_max_tokens: Some("4096".to_owned()),
-            llm_provider_temperatures: Some("0.4".to_owned()),
-            ..openplotva_config::RawConfig::default()
-        })
-        .expect("config");
-
-        let cfg = qwen_dialog_config_from_app_config(&config).expect("qwen config");
-
-        assert_eq!(cfg.client.service_name, "custom-qwen");
-        assert_eq!(cfg.model, "custom-model");
-        assert_eq!(cfg.max_tokens, 4096);
-        assert_eq!(cfg.temperature, Some(0.4));
-    }
-
     #[tokio::test]
-    async fn pool_gated_fallback_skips_qwen_when_pool_disabled() {
-        let _guard = AIFARM_POOL_TEST_LOCK.lock().await;
-        openplotva_llm::aifarm::set_pool_enabled(false);
-        let primary: DialogProviderHandle = Arc::new(SequencedProvider::new(
+    async fn router_chat_provider_emits_route_unavailable_without_default_fallback() {
+        let default_provider = Arc::new(SequencedProvider::new(
             "aifarm",
-            vec![Err(Box::new(ProviderError::new(
-                "aifarm",
-                FailureReason::CapacityUnavailable,
-                "capacity unavailable",
-            )))],
-        ));
-        let fallback = Arc::new(SequencedProvider::new(
-            "qwen-reasoner",
             vec![Ok(DialogOutput {
-                provider: "qwen-reasoner".to_owned(),
-                answer: "fallback".to_owned(),
+                provider: "aifarm".to_owned(),
+                answer: "should not be used".to_owned(),
                 ..DialogOutput::default()
             })],
         ));
-        let fallback_dyn: DialogProviderHandle = fallback.clone();
-        let provider = PoolGatedFallbackChatProvider::new(primary, fallback_dyn);
+        let reporter = crate::runtime_routing::RoutingEventReporter::new(
+            crate::runtime_routing::RoutingEventBuffer::new(8),
+            None,
+            None,
+            std::time::Duration::from_secs(600),
+        );
+        let provider = router_provider_for_test(
+            RoutingSnapshot::default(),
+            default_provider.clone(),
+            HashMap::new(),
+            reporter.clone(),
+        );
 
         let error = provider.run_dialog(DialogInput::default()).await.err();
 
         assert!(error.is_some());
-        assert_eq!(fallback.calls(), 0);
-        openplotva_llm::aifarm::set_pool_enabled(true);
+        assert_eq!(default_provider.calls(), 0);
+        let events = reporter.buffer().routing_events(10);
+        assert_eq!(events[0].event_type, "route_unavailable");
+        assert_eq!(events[0].workflow_key, "dialog");
     }
 
     #[tokio::test]
-    async fn pool_gated_fallback_uses_qwen_after_retryable_primary_error_when_pool_enabled() {
-        let _guard = AIFARM_POOL_TEST_LOCK.lock().await;
-        openplotva_llm::aifarm::set_pool_enabled(true);
-        let primary: DialogProviderHandle = Arc::new(SequencedProvider::new(
+    async fn router_chat_provider_emits_no_candidates_for_empty_route() {
+        let default_provider = Arc::new(SequencedProvider::new("aifarm", vec![]));
+        let reporter = crate::runtime_routing::RoutingEventReporter::new(
+            crate::runtime_routing::RoutingEventBuffer::new(8),
+            None,
+            None,
+            std::time::Duration::from_secs(600),
+        );
+        let mut snapshot = routed_dialog_snapshot();
+        snapshot.providers[0].enabled = false;
+        let provider = router_provider_for_test(
+            snapshot,
+            default_provider.clone(),
+            HashMap::new(),
+            reporter.clone(),
+        );
+
+        let error = provider.run_dialog(DialogInput::default()).await.err();
+
+        assert!(error.is_some());
+        assert_eq!(default_provider.calls(), 0);
+        let events = reporter.buffer().routing_events(10);
+        assert_eq!(events[0].event_type, "no_candidates");
+        assert_eq!(events[0].workflow_key, "dialog");
+    }
+
+    #[tokio::test]
+    async fn router_chat_provider_emits_all_attempts_exhausted() {
+        let default_provider = Arc::new(SequencedProvider::new("unused", vec![]));
+        let routed_provider = Arc::new(SequencedProvider::new(
+            "aifarm",
+            vec![Err(Box::new(ProviderError::new(
+                "aifarm",
+                FailureReason::ProviderUnavailable,
+                "provider unavailable",
+            )))],
+        ));
+        let routed_provider_dyn: DialogProviderHandle = routed_provider.clone();
+        let mut clients = HashMap::new();
+        clients.insert("aifarm".to_owned(), routed_provider_dyn);
+        let reporter = crate::runtime_routing::RoutingEventReporter::new(
+            crate::runtime_routing::RoutingEventBuffer::new(8),
+            None,
+            None,
+            std::time::Duration::from_secs(600),
+        );
+        let provider = router_provider_for_test(
+            routed_dialog_snapshot(),
+            default_provider,
+            clients,
+            reporter.clone(),
+        );
+
+        let error = provider.run_dialog(DialogInput::default()).await.err();
+
+        assert!(error.is_some());
+        assert_eq!(routed_provider.calls(), 1);
+        let events = reporter.buffer().routing_events(10);
+        assert_eq!(events[0].event_type, "all_attempts_exhausted");
+        assert_eq!(events[0].severity, "warn");
+        assert_eq!(events[0].workflow_key, "dialog");
+        assert_eq!(events[0].provider_id, Some(1));
+        assert_eq!(events[0].model_id, Some(10));
+        assert_eq!(events[0].detail["admin_actionable"], false);
+        assert_eq!(
+            events[0].detail["admin_actionable_reason"],
+            "handled_by_job_retry_budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn router_chat_provider_marks_provider_capacity_cooldown() {
+        let default_provider = Arc::new(SequencedProvider::new("unused", vec![]));
+        let routed_provider = Arc::new(SequencedProvider::new(
             "aifarm",
             vec![Err(Box::new(ProviderError::new(
                 "aifarm",
@@ -825,25 +711,107 @@ mod tests {
                 "capacity unavailable",
             )))],
         ));
-        let fallback = Arc::new(SequencedProvider::new(
-            "qwen-reasoner",
+        let routed_provider_dyn: DialogProviderHandle = routed_provider.clone();
+        let mut clients = HashMap::new();
+        clients.insert("aifarm".to_owned(), routed_provider_dyn);
+        let reporter = crate::runtime_routing::RoutingEventReporter::new(
+            crate::runtime_routing::RoutingEventBuffer::new(8),
+            None,
+            None,
+            std::time::Duration::from_secs(600),
+        );
+        let mut snapshot = routed_dialog_snapshot();
+        snapshot.assignments.push(AssignmentRecord {
+            id: 101,
+            workflow_key: DIALOG_WORKFLOW_KEY.to_owned(),
+            scope: "global".to_owned(),
+            role: "overflow".to_owned(),
+            provider_model_id: 10,
+            weight: Some(100),
+            fallback_order: None,
+            canary_percent: None,
+            enabled: true,
+            inference_overrides: json!({}),
+            cb_failure_threshold: 5,
+            cb_cooldown_ms: 30_000,
+        });
+        snapshot
+            .triggers
+            .push(openplotva_storage::llm_routing::TriggerRecord {
+                id: 200,
+                workflow_key: DIALOG_WORKFLOW_KEY.to_owned(),
+                trigger_type: "provider_capacity".to_owned(),
+                engage_assignment_id: 101,
+                enabled: true,
+                queue_name: None,
+                high_watermark: None,
+                low_watermark: None,
+                params: json!({
+                    "provider_id": 1,
+                    "model_id": 10,
+                    "cooldown_ms": 30_000,
+                }),
+            });
+        let triggers = Arc::new(TriggerState::new());
+        let provider = RouterChatProvider::new(
+            RouterHandle::new(crate::model_routing::build_routing_table(&snapshot)),
+            Arc::new(BreakerSet::new()),
+            Arc::clone(&triggers),
+            clients,
+            default_provider,
+        )
+        .with_routing_event_reporter(reporter.clone());
+
+        let error = provider.run_dialog(DialogInput::default()).await.err();
+
+        assert!(error.is_some());
+        assert!(triggers.provider_capacity_unavailable(1, 10));
+        let events = reporter.buffer().routing_events(10);
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_type == "capacity_unavailable")
+        );
+    }
+
+    #[tokio::test]
+    async fn router_chat_provider_applies_model_config_overrides() {
+        let default_provider = Arc::new(SequencedProvider::new("unused", vec![]));
+        let routed_provider = Arc::new(SequencedProvider::new(
+            "aifarm",
             vec![Ok(DialogOutput {
-                provider: "qwen-reasoner".to_owned(),
-                answer: "fallback".to_owned(),
+                provider: "aifarm".to_owned(),
+                answer: "ok".to_owned(),
                 ..DialogOutput::default()
             })],
         ));
-        let fallback_dyn: DialogProviderHandle = fallback.clone();
-        let provider = PoolGatedFallbackChatProvider::new(primary, fallback_dyn);
+        let routed_provider_dyn: DialogProviderHandle = routed_provider.clone();
+        let mut clients = HashMap::new();
+        clients.insert("aifarm".to_owned(), routed_provider_dyn);
+        let mut snapshot = routed_dialog_snapshot();
+        snapshot.models[0].model_name = "openrouter/provider/model".to_owned();
+        snapshot.models[0].config = json!({ "max_tokens": 123 });
+        let provider = router_provider_for_test(
+            snapshot,
+            default_provider,
+            clients,
+            crate::runtime_routing::RoutingEventReporter::new(
+                crate::runtime_routing::RoutingEventBuffer::new(8),
+                None,
+                None,
+                std::time::Duration::from_secs(600),
+            ),
+        );
 
         let output = provider
             .run_dialog(DialogInput::default())
             .await
-            .expect("fallback output");
+            .expect("dialog output");
 
-        assert_eq!(output.provider, "qwen-reasoner");
-        assert_eq!(output.fallback_from, "aifarm");
-        assert_eq!(fallback.calls(), 1);
+        assert_eq!(output.answer, "ok");
+        let inputs = routed_provider.inputs();
+        assert_eq!(inputs[0].model, "openrouter/provider/model");
+        assert_eq!(inputs[0].max_output_tokens, 123);
     }
 
     #[test]
@@ -1044,12 +1012,78 @@ mod tests {
         }
     }
 
-    static AIFARM_POOL_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    fn router_provider_for_test(
+        snapshot: RoutingSnapshot,
+        default_provider: Arc<SequencedProvider>,
+        clients: HashMap<String, DialogProviderHandle>,
+        reporter: crate::runtime_routing::RoutingEventReporter,
+    ) -> RouterChatProvider {
+        RouterChatProvider::new(
+            RouterHandle::new(crate::model_routing::build_routing_table(&snapshot)),
+            Arc::new(BreakerSet::new()),
+            Arc::new(TriggerState::new()),
+            clients,
+            default_provider,
+        )
+        .with_routing_event_reporter(reporter)
+    }
+
+    fn routed_dialog_snapshot() -> RoutingSnapshot {
+        RoutingSnapshot {
+            providers: vec![ProviderRecord {
+                id: 1,
+                name: "aifarm".to_owned(),
+                kind: "chat".to_owned(),
+                endpoint: None,
+                discovery_service_name: None,
+                discovery_endpoint_name: None,
+                api_key_ref: Some("REF".to_owned()),
+                api_key_encrypted: None,
+                enabled: true,
+                config: json!({}),
+            }],
+            models: vec![ModelRecord {
+                id: 10,
+                provider_id: 1,
+                model_name: "db/model".to_owned(),
+                display_name: None,
+                base_url: None,
+                capabilities: vec!["chat".to_owned()],
+                embedding_dim: None,
+                enabled: true,
+                config: json!({}),
+            }],
+            workflows: vec![WorkflowRecord {
+                key: DIALOG_WORKFLOW_KEY.to_owned(),
+                kind: "chat".to_owned(),
+                full_routing: true,
+                retry_max_hops: 1,
+                retry_wall_ms: 60_000,
+                enabled: true,
+            }],
+            assignments: vec![AssignmentRecord {
+                id: 100,
+                workflow_key: DIALOG_WORKFLOW_KEY.to_owned(),
+                scope: "global".to_owned(),
+                role: "primary".to_owned(),
+                provider_model_id: 10,
+                weight: Some(100),
+                fallback_order: None,
+                canary_percent: None,
+                enabled: true,
+                inference_overrides: json!({}),
+                cb_failure_threshold: 5,
+                cb_cooldown_ms: 30_000,
+            }],
+            triggers: vec![],
+        }
+    }
 
     struct SequencedProvider {
         name: &'static str,
         results: Mutex<Vec<Result<DialogOutput, ChatProviderError>>>,
         calls: Mutex<usize>,
+        inputs: Mutex<Vec<DialogInput>>,
     }
 
     impl SequencedProvider {
@@ -1062,11 +1096,16 @@ mod tests {
                 name,
                 results: Mutex::new(results),
                 calls: Mutex::new(0),
+                inputs: Mutex::new(Vec::new()),
             }
         }
 
         fn calls(&self) -> usize {
             *self.calls.lock().expect("calls")
+        }
+
+        fn inputs(&self) -> Vec<DialogInput> {
+            self.inputs.lock().expect("inputs").clone()
         }
     }
 
@@ -1075,9 +1114,10 @@ mod tests {
             self.name
         }
 
-        fn run_dialog<'a>(&'a self, _input: DialogInput) -> openplotva_llm::ChatProviderFuture<'a> {
+        fn run_dialog<'a>(&'a self, input: DialogInput) -> openplotva_llm::ChatProviderFuture<'a> {
             Box::pin(async move {
                 *self.calls.lock().expect("calls") += 1;
+                self.inputs.lock().expect("inputs").push(input);
                 self.results
                     .lock()
                     .expect("results")

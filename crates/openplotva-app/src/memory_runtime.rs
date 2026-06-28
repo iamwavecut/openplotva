@@ -14,12 +14,13 @@ use openplotva_llm::{
         GeminiMemoryExtractor, GeminiMemoryExtractorConfig, GeminiMemoryExtractorError,
         MODEL_GEMINI_FLASH_FALLBACK, MODEL_GEMINI_FLASH_LITE,
     },
-    retry::retryable_reason,
+    retry::{FailureReason, retryable_reason, retryable_reason_from_message},
 };
 use openplotva_memory::{
-    Card, CardInput, DiscoveryRedactor, DiscoveryRedactorConfig, Episode, ExtractInput,
-    ExtractOutput, FallbackMemoryExtractor, FallbackMemoryExtractorError, LinkInput,
-    MemoryExtractor, MemoryExtractorFuture, RedactingMemoryExtractor, RunStats,
+    Card, CardInput, DiscoveryRedactor, DiscoveryRedactorConfig, DiscoveryRedactorError, Episode,
+    ExtractInput, ExtractOutput, FallbackMemoryExtractor, FallbackMemoryExtractorError, LinkInput,
+    MemoryExtractor, MemoryExtractorFuture, RedactingMemoryExtractor, RunStats, TextRedactor,
+    TextRedactorFuture, redact_extract_output_with_async,
 };
 use openplotva_storage::{
     DialogMemoryChatMeta, PgEmbeddingVector, PostgresMemoryStore, StorageError,
@@ -28,10 +29,15 @@ use openplotva_taskman::{
     InMemoryTaskQueue, JobType, MEMORY_CONSOLIDATION_QUEUE_NAME, new_memory_consolidation_job_at,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use thiserror::Error;
 use time::{OffsetDateTime, Time};
 
 use crate::embedder::DiscoveryEmbedderClient;
+use crate::routed_attempts::{
+    RoutedAttempt, RoutedAttemptRunError, RoutedAttemptWalker, RoutedRequestContext,
+    RoutedRoutingError,
+};
 use crate::runtime_gemini_cache::resolve_google_ai_key;
 
 pub const EMBEDDER_DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -2524,7 +2530,6 @@ pub fn aifarm_memory_extractor_config_from_app_config_with_model(
         temperature: Some(memory.aifarm_temperature),
         enable_thinking: Some(memory.aifarm_enable_thinking),
         include_reasoning: Some(false),
-        pool: crate::media::aifarm_pool_config_from_app_config(config),
     }
     .with_defaults()
 }
@@ -2555,7 +2560,6 @@ pub struct AifarmMemoryRouteBackendPlan {
     pub model: String,
     pub service_name: String,
     pub direct_url: String,
-    pub requires_pool_enabled: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2594,9 +2598,6 @@ impl MemoryExtractor for AifarmRouteMemoryExtractor {
             let mut retryable_errors = Vec::new();
             let mut attempted = false;
             for backend in &self.backends {
-                if backend.plan.requires_pool_enabled && !openplotva_llm::aifarm::pool_enabled() {
-                    continue;
-                }
                 attempted = true;
                 match MemoryExtractor::extract(&backend.extractor, input).await {
                     Ok(output) => return Ok(output),
@@ -2651,75 +2652,21 @@ fn aifarm_memory_route_backend_configs_from_app_config(
     model_override: Option<&str>,
 ) -> Vec<(AifarmMemoryRouteBackendPlan, AifarmMemoryExtractorConfig)> {
     let primary = aifarm_memory_extractor_config_from_app_config_with_model(config, model_override);
-    let mut backends = aifarm_memory_pool_route_backend_configs(&primary);
-    let mut primary_without_pool = primary;
-    primary_without_pool.pool = Default::default();
-    backends.push((
-        aifarm_memory_route_backend_plan("primary", &primary_without_pool, false),
-        primary_without_pool,
-    ));
-    backends
-}
-
-fn aifarm_memory_pool_route_backend_configs(
-    primary: &AifarmMemoryExtractorConfig,
-) -> Vec<(AifarmMemoryRouteBackendPlan, AifarmMemoryExtractorConfig)> {
-    primary
-        .pool
-        .secondary_backends
-        .iter()
-        .filter_map(|backend| {
-            let model = backend.model.trim();
-            if model.is_empty() {
-                return None;
-            }
-            let direct_url = if backend.url.trim().is_empty() {
-                normalize_chat_completions_url(&backend.base_url)
-            } else {
-                backend.url.trim().to_owned()
-            };
-            if direct_url.trim().is_empty() {
-                return None;
-            }
-            let api_key = if backend.api_key.trim().is_empty() {
-                primary.pool.secondary_api_key.trim()
-            } else {
-                backend.api_key.trim()
-            };
-            if api_key.is_empty() {
-                return None;
-            }
-            let label_name = if backend.name.trim().is_empty() {
-                model
-            } else {
-                backend.name.trim()
-            };
-            let mut cfg = primary.clone();
-            cfg.model = model.to_owned();
-            cfg.client.default_model = model.to_owned();
-            cfg.client.direct_url = direct_url;
-            cfg.client.api_key = api_key.to_owned();
-            cfg.client.fail_fast_on_capacity_unavailable = false;
-            cfg.pool = Default::default();
-            Some((
-                aifarm_memory_route_backend_plan(format!("pool:{label_name}"), &cfg, true),
-                cfg,
-            ))
-        })
-        .collect()
+    vec![(
+        aifarm_memory_route_backend_plan("primary", &primary),
+        primary,
+    )]
 }
 
 fn aifarm_memory_route_backend_plan(
     label: impl Into<String>,
     cfg: &AifarmMemoryExtractorConfig,
-    requires_pool_enabled: bool,
 ) -> AifarmMemoryRouteBackendPlan {
     AifarmMemoryRouteBackendPlan {
         label: label.into(),
         model: cfg.model.clone(),
         service_name: cfg.client.service_name.clone(),
         direct_url: cfg.client.direct_url.clone(),
-        requires_pool_enabled,
     }
 }
 
@@ -2777,6 +2724,272 @@ pub enum AppMemoryExtractor {
     /// Plain Gemini/GenKit extractor without redaction.
     GeminiPlain(AppGenkitMemoryExtractor),
     GeminiRedacting(RedactingMemoryExtractor<AppGenkitMemoryExtractor, DiscoveryRedactor>),
+}
+
+#[derive(Clone)]
+pub struct RoutedMemoryExtractor {
+    walker: RoutedAttemptWalker,
+    config: AppConfig,
+    redactor: Option<RoutedDiscoveryRedactor>,
+}
+
+impl RoutedMemoryExtractor {
+    #[must_use]
+    pub fn new(walker: RoutedAttemptWalker, config: &AppConfig) -> Self {
+        let redactor = config
+            .memory
+            .redaction_enabled
+            .then(|| RoutedDiscoveryRedactor::new(walker.clone(), config));
+        Self {
+            walker,
+            config: config.clone(),
+            redactor,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct RoutedDiscoveryRedactor {
+    walker: RoutedAttemptWalker,
+    config: AppConfig,
+}
+
+impl RoutedDiscoveryRedactor {
+    #[must_use]
+    pub fn new(walker: RoutedAttemptWalker, config: &AppConfig) -> Self {
+        Self {
+            walker,
+            config: config.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum RoutedDiscoveryRedactorError {
+    #[error(transparent)]
+    Build(#[from] reqwest::Error),
+    #[error(transparent)]
+    Redactor(#[from] DiscoveryRedactorError),
+    #[error(transparent)]
+    Routing(#[from] RoutedRoutingError),
+}
+
+impl TextRedactor for RoutedDiscoveryRedactor {
+    type Error = RoutedDiscoveryRedactorError;
+
+    fn redact_text<'a>(&'a self, text: String) -> TextRedactorFuture<'a, Self::Error> {
+        Box::pin(async move {
+            let config = self.config.clone();
+            let result = self
+                .walker
+                .run(
+                    RoutedRequestContext {
+                        workflow_key: "redaction".to_owned(),
+                        queue_name: Some(MEMORY_CONSOLIDATION_QUEUE_NAME.to_owned()),
+                        suppress_all_attempts_exhausted_admin_report: true,
+                        suppressed_all_attempts_exhausted_reason: Some(
+                            "redaction_fail_open".to_owned(),
+                        ),
+                        ..RoutedRequestContext::default()
+                    },
+                    move |attempt| {
+                        let config = config.clone();
+                        let text = text.clone();
+                        async move { redact_text_with_routed_attempt(&config, attempt, &text).await }
+                    },
+                    routed_redactor_retryable_reason,
+                )
+                .await;
+            match result {
+                Ok(redacted) => Ok(redacted),
+                Err(RoutedAttemptRunError::Attempt(error)) => Err(error),
+                Err(RoutedAttemptRunError::Routing(error)) => Err(error.into()),
+            }
+        })
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum RoutedMemoryExtractorError {
+    #[error(transparent)]
+    Build(#[from] AppMemoryExtractorBuildError),
+    #[error(transparent)]
+    Aifarm(#[from] AifarmMemoryExtractorError),
+    #[error(transparent)]
+    Genkit(#[from] AppGenkitMemoryExtractorError),
+    #[error(transparent)]
+    Routing(#[from] RoutedRoutingError),
+}
+
+impl MemoryExtractor for RoutedMemoryExtractor {
+    type Error = RoutedMemoryExtractorError;
+
+    fn extract<'a>(&'a self, input: &'a ExtractInput) -> MemoryExtractorFuture<'a, Self::Error> {
+        Box::pin(async move {
+            let config = self.config.clone();
+            let result =
+                self.walker
+                    .run(
+                        RoutedRequestContext {
+                            workflow_key: "memory_consolidation".to_owned(),
+                            queue_name: Some(MEMORY_CONSOLIDATION_QUEUE_NAME.to_owned()),
+                            ..RoutedRequestContext::default()
+                        },
+                        move |attempt| {
+                            let config = config.clone();
+                            async move {
+                                extract_memory_with_routed_attempt(&config, attempt, input).await
+                            }
+                        },
+                        |error| retryable_reason(error),
+                    )
+                    .await;
+            let output = match result {
+                Ok(output) => Ok(output),
+                Err(RoutedAttemptRunError::Attempt(error)) => Err(error),
+                Err(RoutedAttemptRunError::Routing(error)) => Err(error.into()),
+            }?;
+            let Some(redactor) = &self.redactor else {
+                return Ok(output);
+            };
+            let original = output.clone();
+            match redact_extract_output_with_async(output, |value| redactor.redact_text(value))
+                .await
+            {
+                Ok(redacted) => Ok(redacted),
+                Err(_) => Ok(original),
+            }
+        })
+    }
+}
+
+async fn redact_text_with_routed_attempt(
+    config: &AppConfig,
+    attempt: RoutedAttempt,
+    text: &str,
+) -> Result<String, RoutedDiscoveryRedactorError> {
+    let Some(mut cfg) = discovery_redactor_config_from_app_config(config) else {
+        return Ok(text.to_owned());
+    };
+    if let Some(endpoint) = routed_attempt_endpoint(&attempt) {
+        cfg.base_url = endpoint;
+    }
+    if let Some(service) = attempt.discovery_service_name.as_deref() {
+        cfg.service_name = service.to_owned();
+    }
+    if let Some(endpoint) = attempt.discovery_endpoint_name.as_deref() {
+        cfg.endpoint_name = endpoint.to_owned();
+    }
+    let redactor = DiscoveryRedactor::new(cfg)?;
+    redactor.redact_text(text).await.map_err(Into::into)
+}
+
+fn routed_redactor_retryable_reason(error: &RoutedDiscoveryRedactorError) -> Option<FailureReason> {
+    match error {
+        RoutedDiscoveryRedactorError::Build(_) => Some(FailureReason::ProviderUnavailable),
+        RoutedDiscoveryRedactorError::Redactor(error) => {
+            retryable_reason_from_message(&error.to_string())
+        }
+        RoutedDiscoveryRedactorError::Routing(_) => None,
+    }
+}
+
+async fn extract_memory_with_routed_attempt(
+    config: &AppConfig,
+    attempt: RoutedAttempt,
+    input: &ExtractInput,
+) -> Result<ExtractOutput, RoutedMemoryExtractorError> {
+    if routed_attempt_is_genkit(&attempt) {
+        let model = genkit_model_for_attempt(&attempt);
+        let extractor = genkit_memory_extractor_from_app_config_with_model(config, Some(&model))?;
+        return MemoryExtractor::extract(&extractor, input)
+            .await
+            .map_err(Into::into);
+    }
+
+    let extractor = AifarmMemoryExtractor::new(aifarm_memory_config_for_attempt(config, &attempt));
+    MemoryExtractor::extract(&extractor, input)
+        .await
+        .map_err(Into::into)
+}
+
+fn routed_attempt_is_genkit(attempt: &RoutedAttempt) -> bool {
+    attempt.provider_name.eq_ignore_ascii_case("genkit")
+        || attempt.provider_name.eq_ignore_ascii_case("gemini")
+        || attempt.provider_name.eq_ignore_ascii_case("openrouter")
+}
+
+fn genkit_model_for_attempt(attempt: &RoutedAttempt) -> String {
+    if attempt.provider_name.eq_ignore_ascii_case("openrouter")
+        && !attempt
+            .model_name
+            .get(..OPENROUTER_MODEL_PREFIX.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(OPENROUTER_MODEL_PREFIX))
+    {
+        format!("{OPENROUTER_MODEL_PREFIX}{}", attempt.model_name.trim())
+    } else {
+        attempt.model_name.clone()
+    }
+}
+
+fn aifarm_memory_config_for_attempt(
+    config: &AppConfig,
+    attempt: &RoutedAttempt,
+) -> AifarmMemoryExtractorConfig {
+    let mut cfg = aifarm_memory_extractor_config_from_app_config_with_model(
+        config,
+        Some(attempt.model_name.trim()),
+    );
+    cfg.client.default_model = attempt.model_name.clone();
+
+    if let Some(endpoint) = routed_attempt_endpoint(attempt) {
+        if attempt.discovery_service_name.is_some() || attempt.discovery_endpoint_name.is_some() {
+            cfg.client.base_url = endpoint;
+        } else {
+            cfg.client.direct_url = normalize_chat_completions_url(&endpoint);
+            if attempt
+                .provider_name
+                .eq_ignore_ascii_case(crate::dialog_runtime::VRAM_CLOUD_PROVIDER_NAME)
+            {
+                cfg.client.api_key = config.llm.dialog.aifarm_pool_api_key.clone();
+            }
+        }
+    }
+    if let Some(service) = attempt.discovery_service_name.as_deref() {
+        cfg.client.service_name = service.to_owned();
+    }
+    if let Some(endpoint) = attempt.discovery_endpoint_name.as_deref() {
+        cfg.client.endpoint_name = endpoint.to_owned();
+    }
+    if let Some(max_tokens) = attempt.overrides.max_tokens
+        && max_tokens > 0
+    {
+        cfg.max_output_tokens = max_tokens;
+    }
+    if let Some(temperature) = attempt.overrides.temperature {
+        cfg.temperature = Some(temperature);
+    }
+    if let Some(enable_thinking) = routed_bool_override(attempt, "enable_thinking") {
+        cfg.enable_thinking = Some(enable_thinking);
+    }
+    if let Some(include_reasoning) = routed_bool_override(attempt, "include_reasoning") {
+        cfg.include_reasoning = Some(include_reasoning);
+    }
+    cfg.with_defaults()
+}
+
+fn routed_attempt_endpoint(attempt: &RoutedAttempt) -> Option<String> {
+    attempt
+        .model_base_url
+        .as_deref()
+        .or(attempt.provider_endpoint.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn routed_bool_override(attempt: &RoutedAttempt, key: &str) -> Option<bool> {
+    attempt.overrides.extra.get(key).and_then(Value::as_bool)
 }
 
 /// App memory extractor build error.
@@ -2863,6 +3076,14 @@ pub fn memory_extractor_from_app_config(
     memory_extractor_from_app_config_with_override(config, None, None)
 }
 
+#[must_use]
+pub fn routed_memory_extractor_from_app_config(
+    config: &AppConfig,
+    walker: RoutedAttemptWalker,
+) -> RoutedMemoryExtractor {
+    RoutedMemoryExtractor::new(walker, config)
+}
+
 pub fn memory_extractor_from_app_config_with_model(
     config: &AppConfig,
     model_override: Option<&str>,
@@ -2877,17 +3098,6 @@ pub fn memory_extractor_from_app_config_with_override(
     model_override: Option<&str>,
 ) -> Result<AppMemoryExtractor, AppMemoryExtractorBuildError> {
     let provider = memory_extractor_provider(config, provider_override);
-    // Prefer the model selected in the admin for the `memory_consolidation` workflow
-    // (same discovery service, so behavior-neutral); an explicit override still wins.
-    let resolved_model = if provider == "aifarm" {
-        crate::model_routing::resolved_model_for(
-            "memory_consolidation",
-            config.memory.aifarm_service_name.trim(),
-        )
-    } else {
-        None
-    };
-    let model_override = model_override.or(resolved_model.as_deref());
     match provider.as_str() {
         "aifarm" => {
             let extractor =
@@ -3514,21 +3724,6 @@ mod tests {
         assert_eq!(cfg.temperature, Some(0.35));
         assert_eq!(cfg.enable_thinking, Some(false));
         assert_eq!(cfg.include_reasoning, Some(false));
-        assert_eq!(cfg.pool.secondary_backends.len(), 2);
-        assert_eq!(cfg.pool.secondary_backends[0].name, "pool-a");
-        assert_eq!(cfg.pool.secondary_backends[0].model, "pool-a");
-        assert_eq!(
-            cfg.pool.secondary_backends[0].base_url,
-            "http://pool-a.test/v1"
-        );
-        assert_eq!(cfg.pool.secondary_backends[1].name, "pool-b");
-        assert_eq!(cfg.pool.secondary_backends[1].model, "pool-b");
-        assert_eq!(
-            cfg.pool.secondary_backends[1].base_url,
-            "http://pool-b.test"
-        );
-        assert_eq!(cfg.pool.secondary_api_key, "pool-token");
-        assert_eq!(cfg.pool.primary_capacity_wait, Duration::from_millis(250));
     }
 
     #[test]
@@ -3594,7 +3789,7 @@ mod tests {
     }
 
     #[test]
-    fn aifarm_memory_route_plan_prioritizes_pool_before_primary() {
+    fn aifarm_memory_route_plan_ignores_hidden_pool_backends() {
         let config = AppConfig::from_raw(openplotva_config::RawConfig {
             dialog_aifarm_pool_models: Some("pool-a,pool-b".to_owned()),
             dialog_aifarm_pool_base_urls: Some(
@@ -3617,23 +3812,10 @@ mod tests {
                 .iter()
                 .map(|backend| backend.label.as_str())
                 .collect::<Vec<_>>(),
-            vec!["pool:pool-a", "pool:pool-b", "primary"]
+            vec!["primary"]
         );
-        assert!(plan.backends[0].requires_pool_enabled);
-        assert_eq!(plan.backends[0].model, "pool-a");
-        assert_eq!(
-            plan.backends[0].direct_url,
-            "https://pool-a.test/v1/chat/completions"
-        );
-        assert!(plan.backends[1].requires_pool_enabled);
-        assert_eq!(plan.backends[1].model, "pool-b");
-        assert_eq!(
-            plan.backends[1].direct_url,
-            "https://pool-b.test/v1/chat/completions"
-        );
-        assert!(!plan.backends[2].requires_pool_enabled);
-        assert_eq!(plan.backends[2].service_name, "llm-openai");
-        assert_eq!(plan.backends[2].model, "primary-memory");
+        assert_eq!(plan.backends[0].service_name, "llm-openai");
+        assert_eq!(plan.backends[0].model, "primary-memory");
     }
 
     #[tokio::test]

@@ -19,15 +19,20 @@ use openplotva_dialog::{
     TOOL_RESULT_STATUS_OK, ToolContext, ToolResult, ToolStep,
 };
 use openplotva_history::{SummaryMessageEntry, decode_summary_message_entry_payloads};
-use openplotva_llm::aifarm::{
-    AifarmHttpClient, ChatCompletionRequest, ChatMessage, CompletionResult, StatusUpdate,
+use openplotva_llm::{
+    aifarm::{
+        AIFARM_WORKLOAD_DIALOG, AifarmClientConfig, AifarmHttpClient, ChatCompletionRequest,
+        ChatMessage, CompletionResult, DISCOVERY_PRIORITY_INTERACTIVE, StatusUpdate,
+        normalize_chat_completions_url,
+    },
+    retry::{FailureReason, retryable_reason_from_message},
 };
 use openplotva_memory::{RetrievalRequest, RetrievalScope, RetrievedMemory};
 use openplotva_storage::{PostgresHistoryStore, PostgresMemoryStore};
 use serde_json::{Value, json};
 use time::{Duration as TimeDuration, OffsetDateTime};
 
-use openplotva_taskman::MusicGenJobParams;
+use openplotva_taskman::{MUSIC_VIP_QUEUE_NAME, MusicGenJobParams};
 
 use crate::dialog_tools::{CrawlUrlFuture, UrlCrawler, WebSearchFuture, WebSearchProvider};
 use crate::image_jobs::{
@@ -35,6 +40,14 @@ use crate::image_jobs::{
 };
 use crate::media::{agent_client_config_from_named_provider, aifarm_dialog_config_from_app_config};
 use crate::music_jobs::{SongMaterial, SongMaterialFuture, SongMaterialProvider};
+use crate::routed_attempts::{
+    RoutedAttempt, RoutedAttemptRunError, RoutedAttemptWalker, RoutedRequestContext,
+};
+
+const AGENTIC_SEARCH_REASONER_WORKFLOW: &str = "agentic_search_reasoner";
+const AGENTIC_SEARCH_WRITER_WORKFLOW: &str = "agentic_search_writer";
+const AGENTIC_SONG_WORKFLOW: &str = "agentic_song";
+const AGENTIC_IMAGE_WORKFLOW: &str = "agentic_image";
 
 /// The implicit provider name that always maps to the primary dialog config.
 pub const CONVERSATIONAL_PROVIDER: &str = "conversational";
@@ -67,6 +80,13 @@ pub struct AgentProviderClient {
     pub enable_thinking: Option<bool>,
     pub temperature: Option<f64>,
     pub max_tokens: i32,
+    routed: Option<RoutedAgentExecution>,
+}
+
+#[derive(Clone)]
+struct RoutedAgentExecution {
+    walker: RoutedAttemptWalker,
+    config: AppConfig,
 }
 
 /// Name-keyed registry of providers selectable per agent profile.
@@ -98,22 +118,16 @@ pub fn build_agent_provider_registry(config: &AppConfig) -> AgentProviderRegistr
     let mut by_name = HashMap::new();
 
     let dialog = aifarm_dialog_config_from_app_config(config);
-    // The conversational client serves agentic_search_writer / song / image; they share
-    // this model. Prefer the admin's choice for agentic_search_writer (same service).
-    let conversational_model = crate::model_routing::resolved_model_for(
-        "agentic_search_writer",
-        config.llm.dialog.discovery_service_name.trim(),
-    )
-    .unwrap_or_else(|| dialog.model.clone());
     by_name.insert(
         CONVERSATIONAL_PROVIDER.to_owned(),
         Arc::new(AgentProviderClient {
             client: AifarmHttpClient::new(dialog.client),
-            model: conversational_model,
+            model: dialog.model.clone(),
             include_reasoning: dialog.include_reasoning,
             enable_thinking: dialog.enable_thinking,
             temperature: dialog.temperature,
             max_tokens: dialog.max_tokens,
+            routed: None,
         }),
     );
 
@@ -128,6 +142,7 @@ pub fn build_agent_provider_registry(config: &AppConfig) -> AgentProviderRegistr
                 enable_thinking: spec.enable_thinking,
                 temperature: spec.temperature,
                 max_tokens: spec.max_tokens,
+                routed: None,
             }),
         );
     }
@@ -146,10 +161,27 @@ pub fn build_agent_provider_registry(config: &AppConfig) -> AgentProviderRegistr
             enable_thinking: spec.enable_thinking,
             temperature: spec.temperature,
             max_tokens: spec.max_tokens,
+            routed: None,
         }));
     }
 
     AgentProviderRegistry { by_name }
+}
+
+#[must_use]
+pub fn build_routed_agent_provider_registry(
+    config: &AppConfig,
+    walker: RoutedAttemptWalker,
+) -> AgentProviderRegistry {
+    let mut registry = build_agent_provider_registry(config);
+    let routed = RoutedAgentExecution {
+        walker,
+        config: config.clone(),
+    };
+    for provider in registry.by_name.values_mut() {
+        Arc::make_mut(provider).routed = Some(routed.clone());
+    }
+    registry
 }
 
 #[must_use]
@@ -158,7 +190,7 @@ pub fn qwen_reasoner_named_provider_config(
 ) -> openplotva_config::NamedProviderConfig {
     let default_reasoner =
         normalize_name(openplotva_config::DEFAULT_AGENTIC_SEARCH_REASONER_PROVIDER);
-    let mut spec = config
+    config
         .llm
         .providers
         .iter()
@@ -178,15 +210,7 @@ pub fn qwen_reasoner_named_provider_config(
             max_tokens: openplotva_config::DEFAULT_LLM_PROVIDER_MAX_TOKENS,
             temperature: None,
             task_timeout_seconds: openplotva_config::DEFAULT_LLM_PROVIDER_TASK_TIMEOUT_SECONDS,
-        });
-    // Prefer the model selected in the admin for `agentic_search_reasoner` (same service).
-    if let Some(model) = crate::model_routing::resolved_model_for(
-        "agentic_search_reasoner",
-        spec.discovery_service_name.trim(),
-    ) {
-        spec.model = model;
-    }
-    spec
+        })
 }
 
 /// Resolved search-agent settings (prompts + budgets + default providers), built
@@ -266,12 +290,32 @@ impl SearchAgentSettings {
 /// `Reasoner` adapter that performs one chat round-trip via the AIFarm client.
 pub struct AifarmReasoner {
     provider: Arc<AgentProviderClient>,
+    context: RoutedRequestContext,
 }
 
 impl AifarmReasoner {
     #[must_use]
     pub fn new(provider: Arc<AgentProviderClient>) -> Self {
-        Self { provider }
+        Self::for_workflow(provider, AGENTIC_SEARCH_REASONER_WORKFLOW)
+    }
+
+    #[must_use]
+    pub fn for_workflow(
+        provider: Arc<AgentProviderClient>,
+        workflow_key: impl Into<String>,
+    ) -> Self {
+        Self {
+            provider,
+            context: RoutedRequestContext {
+                workflow_key: workflow_key.into(),
+                ..RoutedRequestContext::default()
+            },
+        }
+    }
+
+    #[must_use]
+    pub fn with_context(provider: Arc<AgentProviderClient>, context: RoutedRequestContext) -> Self {
+        Self { provider, context }
     }
 }
 
@@ -279,6 +323,45 @@ impl Reasoner for AifarmReasoner {
     fn complete<'a>(&'a self, call: ReasonerCall) -> ReasonerFuture<'a> {
         Box::pin(async move {
             let request = build_request(&self.provider, &call, true);
+            if let Some(routed) = self.provider.routed.clone() {
+                let base_provider = Arc::clone(&self.provider);
+                let base_request = request;
+                let config = routed.config.clone();
+                let result = routed
+                    .walker
+                    .run(
+                        self.context.clone(),
+                        move |attempt| {
+                            let base_provider = Arc::clone(&base_provider);
+                            let mut request = base_request.clone();
+                            let config = config.clone();
+                            async move {
+                                let provider = agent_provider_client_for_attempt(
+                                    &config,
+                                    &base_provider,
+                                    &attempt,
+                                );
+                                apply_agent_attempt_to_request(&mut request, &provider, &attempt);
+                                let mut sink = |_status: StatusUpdate| {};
+                                let result = provider
+                                    .client
+                                    .complete(request, &mut sink)
+                                    .await
+                                    .map_err(|error| AgentError::Reasoner(error.to_string()))?;
+                                parse_reply(&result)
+                            }
+                        },
+                        agent_retryable_reason,
+                    )
+                    .await;
+                return match result {
+                    Ok(reply) => Ok(reply),
+                    Err(RoutedAttemptRunError::Attempt(error)) => Err(error),
+                    Err(RoutedAttemptRunError::Routing(error)) => {
+                        Err(AgentError::Reasoner(error.to_string()))
+                    }
+                };
+            }
             let mut sink = |_status: StatusUpdate| {};
             let result = self
                 .provider
@@ -309,14 +392,9 @@ pub async fn synthesize_answer(
         ],
         tools: Vec::new(),
     };
-    let request = build_request(provider, &call, false);
-    let mut sink = |_status: StatusUpdate| {};
-    let result = provider
-        .client
-        .complete(request, &mut sink)
-        .await
-        .map_err(|error| AgentError::Reasoner(error.to_string()))?;
-    let reply = parse_reply(&result)?;
+    let reasoner =
+        AifarmReasoner::for_workflow(Arc::new(provider.clone()), AGENTIC_SEARCH_WRITER_WORKFLOW);
+    let reply = reasoner.complete(call).await?;
     Ok(reply.text)
 }
 
@@ -663,7 +741,10 @@ impl AgenticWebSearch for InlineSearchAgent {
         Box::pin(async move {
             let model = self.reasoner.model.clone();
             let profile = self.settings.profile(model.clone(), model);
-            let reasoner = AifarmReasoner::new(Arc::clone(&self.reasoner));
+            let reasoner = AifarmReasoner::for_workflow(
+                Arc::clone(&self.reasoner),
+                AGENTIC_SEARCH_REASONER_WORKFLOW,
+            );
             let mut state = AgentState::new("search", query, AgentOrigin::default(), now_unix_ms());
             loop {
                 match advance_one_step(
@@ -805,7 +886,17 @@ impl SongAgentMaterialProvider {
             user_full_name: params.user_full_name.clone(),
         };
         let profile = self.settings.profile(reasoner.model.clone());
-        let reasoner_adapter = AifarmReasoner::new(Arc::clone(reasoner));
+        let reasoner_adapter = AifarmReasoner::with_context(
+            Arc::clone(reasoner),
+            RoutedRequestContext {
+                workflow_key: AGENTIC_SONG_WORKFLOW.to_owned(),
+                queue_name: Some(MUSIC_VIP_QUEUE_NAME.to_owned()),
+                chat_id: (params.chat_id != 0).then_some(params.chat_id),
+                thread_id: params.thread_id,
+                message_id: (params.message_id != 0).then_some(params.message_id),
+                ..RoutedRequestContext::default()
+            },
+        );
         let mut state = AgentState::new("song", topic, origin, now_unix_ms());
         loop {
             match advance_one_step(
@@ -1049,7 +1140,18 @@ where
             user_full_name: request.user_full_name.clone(),
         };
         let profile = self.settings.profile(reasoner.model.clone());
-        let reasoner_adapter = AifarmReasoner::new(Arc::clone(reasoner));
+        let reasoner_adapter = AifarmReasoner::with_context(
+            Arc::clone(reasoner),
+            RoutedRequestContext {
+                workflow_key: AGENTIC_IMAGE_WORKFLOW.to_owned(),
+                chat_id: (request.chat_id != 0).then_some(request.chat_id),
+                thread_id: request.thread_id,
+                message_id: (request.message_id != 0).then_some(request.message_id),
+                suppress_all_attempts_exhausted_admin_report: true,
+                suppressed_all_attempts_exhausted_reason: Some("image_agent_fallback".to_owned()),
+                ..RoutedRequestContext::default()
+            },
+        );
         let mut state = AgentState::new("image", request.prompt.as_str(), origin, now_unix_ms());
         loop {
             match advance_one_step(
@@ -1173,6 +1275,129 @@ pub fn now_unix_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or(0)
+}
+
+fn agent_provider_client_for_attempt(
+    config: &AppConfig,
+    base: &AgentProviderClient,
+    attempt: &RoutedAttempt,
+) -> AgentProviderClient {
+    let model = attempt.model_name.clone();
+    AgentProviderClient {
+        client: AifarmHttpClient::new(agent_client_config_from_attempt(config, attempt)),
+        model,
+        include_reasoning: bool_override(attempt, "include_reasoning").or(base.include_reasoning),
+        enable_thinking: bool_override(attempt, "enable_thinking").or(base.enable_thinking),
+        temperature: attempt.overrides.temperature.or(base.temperature),
+        max_tokens: attempt.overrides.max_tokens.unwrap_or(base.max_tokens),
+        routed: None,
+    }
+}
+
+fn agent_client_config_from_attempt(
+    config: &AppConfig,
+    attempt: &RoutedAttempt,
+) -> AifarmClientConfig {
+    let dialog = &config.llm.dialog;
+    let mut client = AifarmClientConfig {
+        base_url: config.llm.discovery.base_url.clone(),
+        service_name: dialog.discovery_service_name.clone(),
+        endpoint_name: dialog.discovery_endpoint_name.clone(),
+        request_timeout: positive_seconds(dialog.request_timeout_seconds),
+        poll_interval: positive_seconds(dialog.poll_interval_seconds),
+        task_timeout: positive_seconds(dialog.task_timeout_seconds),
+        capacity_wait: positive_seconds(dialog.aifarm_capacity_wait_seconds),
+        capacity_poll_interval: positive_seconds(dialog.aifarm_capacity_poll_seconds),
+        default_model: attempt.model_name.clone(),
+        priority: DISCOVERY_PRIORITY_INTERACTIVE,
+        workload: AIFARM_WORKLOAD_DIALOG.to_owned(),
+        ..AifarmClientConfig::default()
+    };
+    if let Some(service) = attempt.discovery_service_name.as_deref() {
+        client.service_name = service.to_owned();
+    }
+    if let Some(endpoint) = attempt.discovery_endpoint_name.as_deref() {
+        client.endpoint_name = endpoint.to_owned();
+    }
+    if let Some(endpoint) = attempt
+        .model_base_url
+        .as_deref()
+        .or(attempt.provider_endpoint.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if attempt.discovery_service_name.is_some() || attempt.discovery_endpoint_name.is_some() {
+            client.base_url = endpoint.to_owned();
+        } else {
+            client.direct_url = normalize_chat_completions_url(endpoint);
+        }
+    }
+    if attempt.provider_name.eq_ignore_ascii_case("openrouter") {
+        client.direct_url = "https://openrouter.ai/api/v1/chat/completions".to_owned();
+        client.api_key = config.open_router.key.clone();
+    } else if attempt
+        .provider_name
+        .eq_ignore_ascii_case(crate::dialog_runtime::VRAM_CLOUD_PROVIDER_NAME)
+    {
+        client.api_key = dialog.aifarm_pool_api_key.clone();
+    }
+    client.with_defaults()
+}
+
+fn apply_agent_attempt_to_request(
+    request: &mut ChatCompletionRequest,
+    provider: &AgentProviderClient,
+    attempt: &RoutedAttempt,
+) {
+    if !provider.model.trim().is_empty() {
+        request.model = provider.model.clone();
+    }
+    if provider.max_tokens > 0 {
+        request.max_tokens = provider.max_tokens;
+    }
+    request.temperature = provider.temperature;
+    request.include_reasoning = provider.include_reasoning;
+    if let Some(frequency_penalty) = attempt.overrides.frequency_penalty {
+        request.frequency_penalty = Some(frequency_penalty);
+    }
+    if let Some(presence_penalty) = attempt.overrides.presence_penalty {
+        request.presence_penalty = Some(presence_penalty);
+    }
+    if let Some(repeat_penalty) = attempt.overrides.repeat_penalty {
+        request.repeat_penalty = Some(repeat_penalty);
+    }
+    if let Some(top_p) = f64_override(attempt, "top_p") {
+        request.top_p = Some(top_p);
+    }
+    if let Some(top_k) = f64_override(attempt, "top_k") {
+        request.top_k = Some(top_k);
+    }
+    if let Some(enable) = provider.enable_thinking {
+        request.chat_template_kwargs = Some(json!({ "enable_thinking": enable }));
+    }
+}
+
+fn bool_override(attempt: &RoutedAttempt, key: &str) -> Option<bool> {
+    attempt.overrides.extra.get(key).and_then(Value::as_bool)
+}
+
+fn f64_override(attempt: &RoutedAttempt, key: &str) -> Option<f64> {
+    attempt.overrides.extra.get(key).and_then(Value::as_f64)
+}
+
+fn agent_retryable_reason(error: &AgentError) -> Option<FailureReason> {
+    match error {
+        AgentError::Reasoner(message) => retryable_reason_from_message(message),
+        AgentError::ToolDispatch(_) | AgentError::ToolParse(_) => None,
+    }
+}
+
+fn positive_seconds(seconds: i32) -> std::time::Duration {
+    if seconds <= 0 {
+        std::time::Duration::ZERO
+    } else {
+        std::time::Duration::from_secs(seconds as u64)
+    }
 }
 
 fn build_request(
@@ -1321,6 +1546,31 @@ mod tests {
         assert_eq!(reply.tool_calls[0].function.name, "web_search");
         assert_eq!(reply.prompt_tokens, 12);
         assert_eq!(reply.completion_tokens, 5);
+    }
+
+    #[test]
+    fn build_request_includes_native_tools_when_call_has_tools() {
+        let provider = AgentProviderClient {
+            client: AifarmHttpClient::new(AifarmClientConfig::default()),
+            model: "model".to_owned(),
+            include_reasoning: None,
+            enable_thinking: None,
+            temperature: None,
+            max_tokens: 100,
+            routed: None,
+        };
+        let call = ReasonerCall {
+            model: "model".to_owned(),
+            max_tokens: 100,
+            messages: vec![AgentMessage::new(AgentRole::User, "draw a fish")],
+            tools: openplotva_dialog::chat_completion_tools_for_names(&[STEP_HISTORY_SEARCH]),
+        };
+
+        let request = build_request(&provider, &call, true);
+
+        assert!(!request.tools.is_empty());
+        assert_eq!(request.tool_choice, Some(json!("auto")));
+        assert_eq!(request.parallel_tool_calls, Some(false));
     }
 
     #[test]

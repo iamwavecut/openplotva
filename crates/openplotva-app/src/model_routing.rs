@@ -17,10 +17,10 @@ use openplotva_llm::router::{
 };
 use openplotva_storage::StorageError;
 use openplotva_storage::llm_routing::{
-    AssignmentInput, AssignmentRecord, ModelInput, ModelRecord, ProviderInput, RoutingSnapshot,
-    TriggerInput, TriggerRecord, WorkflowRecord, insert_assignment, insert_model, insert_provider,
-    insert_trigger, list_assignments, list_models, list_providers, load_snapshot,
-    update_assignment, update_model,
+    AssignmentInput, AssignmentRecord, ModelInput, ModelRecord, ProviderInput, ProviderRecord,
+    RoutingSnapshot, TriggerInput, TriggerRecord, WorkflowRecord, insert_assignment, insert_model,
+    insert_provider, insert_trigger, insert_workflow_if_missing, list_assignments, list_models,
+    list_providers, load_snapshot, update_assignment, update_model,
 };
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -36,104 +36,6 @@ pub async fn reload_router(handle: &RouterHandle, pool: &PgPool) -> Result<(), S
     let table = load_routing_table(pool).await?;
     handle.store(table);
     Ok(())
-}
-
-/// A config-only workflow's resolved single target: the model name plus its provider's
-/// discovery coordinates, read from the routing table.
-#[derive(Clone, Debug)]
-pub struct ResolvedTarget {
-    pub model: String,
-    pub discovery_service_name: Option<String>,
-    pub discovery_endpoint_name: Option<String>,
-    pub base_url: Option<String>,
-    pub embedding_dim: Option<i32>,
-}
-
-/// Published once at startup (after seed/backfill) so the per-flow factories for the
-/// config-only workflows can override their env-built model with the DB selection
-/// without threading the routing table through every construction site.
-static CONFIG_ONLY_RESOLVER: std::sync::OnceLock<
-    std::collections::HashMap<String, ResolvedTarget>,
-> = std::sync::OnceLock::new();
-
-fn resolve_target(table: &RoutingTable, key: &str) -> Option<ResolvedTarget> {
-    let route = table.resolve(key, false)?;
-    let candidate = route
-        .primary
-        .first()
-        .or_else(|| route.fallback_tail.first())?;
-    let model = table.model(candidate.model)?;
-    let provider = table.provider(model.provider)?;
-    Some(ResolvedTarget {
-        model: model.model_name.clone(),
-        discovery_service_name: provider.discovery_service_name.clone(),
-        discovery_endpoint_name: provider.discovery_endpoint_name.clone(),
-        base_url: model.base_url.clone().or_else(|| provider.endpoint.clone()),
-        embedding_dim: model.embedding_dim,
-    })
-}
-
-/// Resolve every workflow's primary target from a snapshot and publish them for the
-/// config-only flow factories. Idempotent; only the first call wins (set once at boot).
-pub fn init_routing_resolver(snapshot: &RoutingSnapshot) {
-    let table = build_routing_table(snapshot);
-    let keys: Vec<String> = table.workflow_keys().map(str::to_owned).collect();
-    let mut map = std::collections::HashMap::new();
-    for key in keys {
-        if let Some(target) = resolve_target(&table, &key) {
-            map.insert(key, target);
-        }
-    }
-    let _ = CONFIG_ONLY_RESOLVER.set(map);
-}
-
-/// The DB-resolved model for a config-only workflow, returned only when its provider's
-/// discovery service matches `expected_service`. The match keeps the override
-/// behavior-neutral (same endpoint) and lets admin edits that keep the service take
-/// effect on the next restart; a service change is ignored so the env path stays safe.
-#[must_use]
-pub fn resolved_model_for(key: &str, expected_service: &str) -> Option<String> {
-    let target = CONFIG_ONLY_RESOLVER.get()?.get(key)?;
-    if target.discovery_service_name.as_deref() == Some(expected_service)
-        && !target.model.trim().is_empty()
-    {
-        Some(target.model.clone())
-    } else {
-        None
-    }
-}
-
-/// The DB-resolved model for a workflow whose provider has no discovery service (a
-/// direct endpoint like ACE-Step). Behavior-neutral because the seed captures the env
-/// model; lets the admin change it.
-#[must_use]
-pub fn resolved_model_any(key: &str) -> Option<String> {
-    let model = CONFIG_ONLY_RESOLVER.get()?.get(key)?.model.trim();
-    if model.is_empty() {
-        None
-    } else {
-        Some(model.to_owned())
-    }
-}
-
-/// The DB-resolved embedding model for a workflow, returned only when BOTH the
-/// discovery service and the embedding dimension match — embedding dimension is
-/// schema-bound (`vector(512)`), so a mismatched model would corrupt vector search.
-#[must_use]
-pub fn resolved_embedding_model(
-    key: &str,
-    expected_service: &str,
-    expected_dim: i32,
-) -> Option<String> {
-    let target = CONFIG_ONLY_RESOLVER.get()?.get(key)?;
-    if target.discovery_service_name.as_deref() == Some(expected_service)
-        && target.embedding_dim == Some(expected_dim)
-        && !target.model.trim().is_empty()
-    {
-        Some(target.model.clone())
-    } else {
-        None
-    }
 }
 
 const SEEDED_KEY: &str = "llm.routing.seeded";
@@ -460,16 +362,16 @@ pub async fn seed_routing_from_env(
     Ok(true)
 }
 
-/// Provider name for the AI Farm pool endpoint; matches `dialog_runtime::POOL_PROVIDER_NAME`
-/// so DB pool models resolve to the direct pool client at runtime.
-const POOL_PROVIDER: &str = "vram-cloud";
+/// Provider name for the direct OpenAI-compatible VRAM Cloud endpoint.
+const VRAM_CLOUD_PROVIDER: &str = "vram-cloud";
 
-/// Lift the env-configured AI Farm pool (`DIALOG_AIFARM_POOL_*`) into managed DB rows so
-/// the optional pool models show up in the admin and join the weighted dialog allocation.
-/// Idempotent: skips once the pool provider exists, so it backfills an already-seeded
-/// database on the next boot without duplicating rows. Pool models default to weight 33
-/// against the Gemma primary's 100 (~60/20/20); the operator rebalances in the admin.
-pub async fn backfill_pool_from_env(
+/// Lift the env-configured VRAM Cloud model list (`DIALOG_AIFARM_POOL_*`) into
+/// managed DB rows so the models show up in Studio and join the weighted dialog
+/// allocation. Idempotent: skips once the provider exists, so it backfills an
+/// already-seeded database on the next boot without duplicating rows. Imported
+/// models default to weight 33 against the Gemma primary's 100 (~60/20/20); the
+/// operator rebalances in Studio.
+pub async fn backfill_vram_cloud_from_env(
     pool: &PgPool,
     config: &AppConfig,
 ) -> Result<bool, StorageError> {
@@ -480,7 +382,7 @@ pub async fn backfill_pool_from_env(
     if list_providers(pool)
         .await?
         .iter()
-        .any(|p| p.name == POOL_PROVIDER)
+        .any(|p| p.name == VRAM_CLOUD_PROVIDER)
     {
         return Ok(false);
     }
@@ -488,7 +390,7 @@ pub async fn backfill_pool_from_env(
     let provider_id = insert_provider(
         pool,
         &ProviderInput {
-            name: POOL_PROVIDER.to_owned(),
+            name: VRAM_CLOUD_PROVIDER.to_owned(),
             kind: "chat".to_owned(),
             endpoint: dialog.aifarm_pool_base_urls.first().cloned(),
             discovery_service_name: None,
@@ -526,7 +428,7 @@ pub async fn backfill_pool_from_env(
 
     tracing::info!(
         models = dialog.aifarm_pool_models.len(),
-        "backfilled AI Farm pool into routing tables"
+        "backfilled VRAM Cloud models into routing tables"
     );
     Ok(true)
 }
@@ -690,6 +592,13 @@ pub async fn backfill_gpu_models(pool: &PgPool, config: &AppConfig) -> Result<bo
 }
 
 const GENKIT_FLASH_FIX_KEY: &str = "llm.routing.genkit_flash_fixed";
+const DECLARATIVE_V2_KEY: &str = "llm.routing.declarative_v2";
+const DRAW_API_PROVIDER: &str = "aifarm-draw";
+const DRAW_API_MODEL: &str = "draw-api";
+const IMAGE_EDIT_WORKFLOW: &str = "image_edit";
+const PRIVACY_FILTER_PROVIDER: &str = "privacy-filter";
+const OPENROUTER_PROVIDER: &str = "openrouter";
+const OPENROUTER_CHAT_COMPLETIONS_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 
 /// The non-lite model the original seed wrongly hardcoded for the dialog genkit fallback.
 const STALE_GENKIT_FLASH_MODEL: &str = "gemini-2.5-flash";
@@ -753,6 +662,365 @@ pub async fn backfill_genkit_flash_model(
     Ok(true)
 }
 
+fn existing_provider_id(providers: &[ProviderRecord], name: &str) -> Option<i64> {
+    providers
+        .iter()
+        .find(|provider| provider.name == name)
+        .map(|provider| provider.id)
+}
+
+fn existing_model_id(models: &[ModelRecord], provider_id: i64, model_name: &str) -> Option<i64> {
+    models
+        .iter()
+        .find(|model| model.provider_id == provider_id && model.model_name == model_name)
+        .map(|model| model.id)
+}
+
+fn assignment_exists(
+    assignments: &[AssignmentRecord],
+    workflow: &str,
+    role: &str,
+    model_id: i64,
+) -> bool {
+    assignments.iter().any(|assignment| {
+        assignment.workflow_key == workflow
+            && assignment.scope == "global"
+            && assignment.role == role
+            && assignment.provider_model_id == model_id
+    })
+}
+
+async fn ensure_provider(
+    pool: &PgPool,
+    providers: &mut Vec<ProviderRecord>,
+    input: ProviderInput,
+) -> Result<i64, StorageError> {
+    if let Some(id) = existing_provider_id(providers, &input.name) {
+        return Ok(id);
+    }
+    let id = insert_provider(pool, &input).await?;
+    providers.push(ProviderRecord {
+        id,
+        name: input.name,
+        kind: input.kind,
+        endpoint: input.endpoint,
+        discovery_service_name: input.discovery_service_name,
+        discovery_endpoint_name: input.discovery_endpoint_name,
+        api_key_ref: input.api_key_ref,
+        api_key_encrypted: input.api_key_encrypted,
+        enabled: input.enabled,
+        config: input.config,
+    });
+    Ok(id)
+}
+
+async fn ensure_model(
+    pool: &PgPool,
+    models: &mut Vec<ModelRecord>,
+    input: ModelInput,
+) -> Result<i64, StorageError> {
+    if let Some(id) = existing_model_id(models, input.provider_id, &input.model_name) {
+        return Ok(id);
+    }
+    let id = insert_model(pool, &input).await?;
+    models.push(ModelRecord {
+        id,
+        provider_id: input.provider_id,
+        model_name: input.model_name,
+        display_name: input.display_name,
+        base_url: input.base_url,
+        capabilities: input.capabilities,
+        embedding_dim: input.embedding_dim,
+        enabled: input.enabled,
+        config: input.config,
+    });
+    Ok(id)
+}
+
+async fn ensure_assignment(
+    pool: &PgPool,
+    assignments: &mut Vec<AssignmentRecord>,
+    input: AssignmentInput,
+) -> Result<i64, StorageError> {
+    if let Some(existing) = assignments.iter().find(|assignment| {
+        assignment.workflow_key == input.workflow_key
+            && assignment.scope == input.scope
+            && assignment.role == input.role
+            && assignment.provider_model_id == input.provider_model_id
+    }) {
+        return Ok(existing.id);
+    }
+    let id = insert_assignment(pool, &input).await?;
+    assignments.push(AssignmentRecord {
+        id,
+        workflow_key: input.workflow_key,
+        scope: input.scope,
+        role: input.role,
+        provider_model_id: input.provider_model_id,
+        weight: input.weight,
+        fallback_order: input.fallback_order,
+        canary_percent: input.canary_percent,
+        enabled: input.enabled,
+        inference_overrides: input.inference_overrides,
+        cb_failure_threshold: input.cb_failure_threshold,
+        cb_cooldown_ms: input.cb_cooldown_ms,
+    });
+    Ok(id)
+}
+
+async fn ensure_primary_assignment(
+    pool: &PgPool,
+    assignments: &mut Vec<AssignmentRecord>,
+    workflow: &str,
+    model_id: i64,
+    weight: Option<i32>,
+) -> Result<i64, StorageError> {
+    ensure_assignment(
+        pool,
+        assignments,
+        AssignmentInput {
+            workflow_key: workflow.to_owned(),
+            scope: "global".to_owned(),
+            role: "primary".to_owned(),
+            provider_model_id: model_id,
+            weight,
+            fallback_order: None,
+            canary_percent: None,
+            enabled: true,
+            inference_overrides: json!({}),
+            cb_failure_threshold: 5,
+            cb_cooldown_ms: 30_000,
+        },
+    )
+    .await
+}
+
+fn trigger_exists(
+    triggers: &[TriggerRecord],
+    workflow: &str,
+    trigger_type: &str,
+    params: &Value,
+) -> bool {
+    triggers.iter().any(|trigger| {
+        trigger.workflow_key == workflow
+            && trigger.trigger_type == trigger_type
+            && trigger.params.get("provider_id") == params.get("provider_id")
+            && trigger.params.get("model_id") == params.get("model_id")
+    })
+}
+
+/// Add the routing rows needed by the full declarative data-plane migration. Existing
+/// operator-owned rows are preserved; this only fills gaps left by the earlier seed.
+pub async fn backfill_declarative_v2(
+    pool: &PgPool,
+    config: &AppConfig,
+) -> Result<bool, StorageError> {
+    if app_setting_present(pool, DECLARATIVE_V2_KEY).await? {
+        return Ok(false);
+    }
+
+    insert_workflow_if_missing(pool, IMAGE_EDIT_WORKFLOW, "image", true, 3, 60_000, true).await?;
+
+    let mut providers = list_providers(pool).await?;
+    let mut models = list_models(pool).await?;
+    let mut assignments = list_assignments(pool).await?;
+    let triggers = openplotva_storage::llm_routing::list_triggers(pool).await?;
+
+    let draw_provider_id = ensure_provider(
+        pool,
+        &mut providers,
+        ProviderInput {
+            name: DRAW_API_PROVIDER.to_owned(),
+            kind: "image".to_owned(),
+            endpoint: Some(config.llm.discovery.base_url.clone()),
+            discovery_service_name: Some(
+                crate::image_jobs::AIFARM_DRAW_API_SERVICE_NAME.to_owned(),
+            ),
+            discovery_endpoint_name: Some(
+                crate::image_jobs::AIFARM_DRAW_API_ENDPOINT_NAME.to_owned(),
+            ),
+            api_key_ref: None,
+            api_key_encrypted: None,
+            enabled: true,
+            config: json!({
+                "service_name": crate::image_jobs::AIFARM_DRAW_API_SERVICE_NAME,
+                "endpoint_name": crate::image_jobs::AIFARM_DRAW_API_ENDPOINT_NAME,
+            }),
+        },
+    )
+    .await?;
+    let draw_model_id = ensure_model(
+        pool,
+        &mut models,
+        ModelInput {
+            provider_id: draw_provider_id,
+            model_name: DRAW_API_MODEL.to_owned(),
+            display_name: Some("AI Farm draw-api".to_owned()),
+            base_url: None,
+            capabilities: vec!["image".to_owned()],
+            embedding_dim: None,
+            enabled: true,
+            config: json!({
+                "service_name": crate::image_jobs::AIFARM_DRAW_API_SERVICE_NAME,
+                "endpoint_name": crate::image_jobs::AIFARM_DRAW_API_ENDPOINT_NAME,
+            }),
+        },
+    )
+    .await?;
+    ensure_primary_assignment(
+        pool,
+        &mut assignments,
+        IMAGE_EDIT_WORKFLOW,
+        draw_model_id,
+        Some(100),
+    )
+    .await?;
+    if !assignment_exists(&assignments, "image_generation", "fallback", draw_model_id) {
+        ensure_assignment(
+            pool,
+            &mut assignments,
+            AssignmentInput {
+                workflow_key: "image_generation".to_owned(),
+                scope: "global".to_owned(),
+                role: "fallback".to_owned(),
+                provider_model_id: draw_model_id,
+                weight: None,
+                fallback_order: Some(0),
+                canary_percent: None,
+                enabled: true,
+                inference_overrides: json!({}),
+                cb_failure_threshold: 5,
+                cb_cooldown_ms: 30_000,
+            },
+        )
+        .await?;
+    }
+
+    let redaction_service = config.memory.redaction_service_name.trim();
+    if !redaction_service.is_empty() {
+        let privacy_provider_id = ensure_provider(
+            pool,
+            &mut providers,
+            ProviderInput {
+                name: PRIVACY_FILTER_PROVIDER.to_owned(),
+                kind: "privacy_filter".to_owned(),
+                endpoint: Some(config.llm.discovery.base_url.clone()),
+                discovery_service_name: Some(redaction_service.to_owned()),
+                discovery_endpoint_name: Some(config.memory.redaction_endpoint_name.clone()),
+                api_key_ref: None,
+                api_key_encrypted: None,
+                enabled: config.memory.redaction_enabled,
+                config: json!({}),
+            },
+        )
+        .await?;
+        let privacy_model_id = ensure_model(
+            pool,
+            &mut models,
+            ModelInput {
+                provider_id: privacy_provider_id,
+                model_name: redaction_service.to_owned(),
+                display_name: Some("Discovery privacy filter".to_owned()),
+                base_url: None,
+                capabilities: vec!["privacy_filter".to_owned()],
+                embedding_dim: None,
+                enabled: config.memory.redaction_enabled,
+                config: json!({}),
+            },
+        )
+        .await?;
+        ensure_primary_assignment(pool, &mut assignments, "redaction", privacy_model_id, None)
+            .await?;
+    }
+
+    let openrouter_model = crate::memory_runtime::genkit_runtime_default_model(config)
+        .strip_prefix("openrouter/")
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(str::to_owned);
+    if let Some(openrouter_model) = openrouter_model {
+        let openrouter_provider_id = ensure_provider(
+            pool,
+            &mut providers,
+            ProviderInput {
+                name: OPENROUTER_PROVIDER.to_owned(),
+                kind: "chat".to_owned(),
+                endpoint: Some(OPENROUTER_CHAT_COMPLETIONS_URL.to_owned()),
+                discovery_service_name: None,
+                discovery_endpoint_name: None,
+                api_key_ref: Some("OPENROUTER_API_KEY".to_owned()),
+                api_key_encrypted: None,
+                enabled: !config.open_router.key.trim().is_empty(),
+                config: json!({ "direct_url": OPENROUTER_CHAT_COMPLETIONS_URL }),
+            },
+        )
+        .await?;
+        let _ = ensure_model(
+            pool,
+            &mut models,
+            ModelInput {
+                provider_id: openrouter_provider_id,
+                model_name: openrouter_model,
+                display_name: Some("OpenRouter default".to_owned()),
+                base_url: Some(OPENROUTER_CHAT_COMPLETIONS_URL.to_owned()),
+                capabilities: vec!["chat".to_owned(), "tools".to_owned()],
+                embedding_dim: None,
+                enabled: !config.open_router.key.trim().is_empty(),
+                config: json!({
+                    "request_timeout_seconds": config.open_router.request_timeout_seconds,
+                    "include_reasoning": false,
+                }),
+            },
+        )
+        .await?;
+    }
+
+    let overflow_assignment = assignments
+        .iter()
+        .find(|assignment| {
+            assignment.workflow_key == "dialog"
+                && assignment.scope == "global"
+                && assignment.role == "overflow"
+                && assignment.enabled
+        })
+        .map(|assignment| assignment.id);
+    if let Some(engage_assignment_id) = overflow_assignment {
+        let pool_provider = existing_provider_id(&providers, VRAM_CLOUD_PROVIDER);
+        if let Some(pool_provider) = pool_provider {
+            for model in models
+                .iter()
+                .filter(|model| model.provider_id == pool_provider && model.enabled)
+            {
+                let params = json!({
+                    "provider_id": pool_provider,
+                    "model_id": model.id,
+                    "cooldown_ms": 30_000,
+                });
+                if !trigger_exists(&triggers, "dialog", "provider_capacity", &params) {
+                    insert_trigger(
+                        pool,
+                        &TriggerInput {
+                            workflow_key: "dialog".to_owned(),
+                            trigger_type: "provider_capacity".to_owned(),
+                            engage_assignment_id,
+                            enabled: true,
+                            queue_name: None,
+                            high_watermark: None,
+                            low_watermark: None,
+                            params,
+                        },
+                    )
+                    .await?;
+                }
+            }
+        }
+    }
+
+    mark_app_setting(pool, DECLARATIVE_V2_KEY).await?;
+    tracing::info!("backfilled declarative routing v2 rows");
+    Ok(true)
+}
+
 fn overrides_from_json(value: &Value) -> InferenceOverrides {
     let object = value.as_object();
     let get_f64 = |key: &str| object.and_then(|map| map.get(key)).and_then(Value::as_f64);
@@ -791,8 +1059,17 @@ fn experiment_variant(record: &AssignmentRecord) -> Option<String> {
 fn candidate_from_assignment(
     record: &AssignmentRecord,
     models: &HashMap<i64, &ModelRecord>,
+    providers: &HashMap<i64, ProviderRow>,
+    kind: Kind,
 ) -> Option<Candidate> {
     let model = models.get(&record.provider_model_id)?;
+    if !model.enabled || !model_matches_kind(model, kind) {
+        return None;
+    }
+    let provider = providers.get(&model.provider_id)?;
+    if !provider.enabled || provider.kind != kind {
+        return None;
+    }
     let role = Role::from_db(&record.role)?;
     Some(Candidate {
         provider: model.provider_id,
@@ -808,6 +1085,24 @@ fn candidate_from_assignment(
             cooldown: Duration::from_millis(record.cb_cooldown_ms.max(0) as u64),
         },
     })
+}
+
+fn model_matches_kind(model: &ModelRecord, kind: Kind) -> bool {
+    let capability = match kind {
+        Kind::Chat => "chat",
+        Kind::Vision => "vision",
+        Kind::Embedding => "embedding",
+        Kind::Image => "image",
+        Kind::Music => "music",
+        Kind::PrivacyFilter => "privacy_filter",
+    };
+    if !model.capabilities.iter().any(|c| c == capability) {
+        return false;
+    }
+    if kind == Kind::Embedding && model.embedding_dim != Some(512) {
+        return false;
+    }
+    true
 }
 
 fn trigger_condition(record: &TriggerRecord) -> Option<TriggerCondition> {
@@ -855,6 +1150,24 @@ fn trigger_condition(record: &TriggerRecord) -> Option<TriggerCondition> {
                 end_minute: end,
             })
         }
+        "provider_capacity" => {
+            let params = record.params.as_object();
+            let provider = params
+                .and_then(|map| map.get("provider_id"))
+                .and_then(Value::as_i64)?;
+            let model = params
+                .and_then(|map| map.get("model_id"))
+                .and_then(Value::as_i64)?;
+            let cooldown_ms = params
+                .and_then(|map| map.get("cooldown_ms"))
+                .and_then(Value::as_u64)
+                .unwrap_or(30_000);
+            Some(TriggerCondition::ProviderCapacity {
+                provider,
+                model,
+                cooldown: Duration::from_millis(cooldown_ms),
+            })
+        }
         _ => None,
     }
 }
@@ -875,6 +1188,9 @@ fn parse_hh_mm(value: &str) -> Option<u32> {
 pub fn build_routing_table(snapshot: &RoutingSnapshot) -> RoutingTable {
     let mut providers: HashMap<i64, ProviderRow> = HashMap::new();
     for record in &snapshot.providers {
+        if !record.enabled {
+            continue;
+        }
         let Some(kind) = Kind::from_db(&record.kind) else {
             tracing::warn!(provider = %record.name, kind = %record.kind, "skipping provider with unknown kind");
             continue;
@@ -898,6 +1214,9 @@ pub fn build_routing_table(snapshot: &RoutingSnapshot) -> RoutingTable {
     let model_records: HashMap<i64, &ModelRecord> =
         snapshot.models.iter().map(|m| (m.id, m)).collect();
     for record in &snapshot.models {
+        if !record.enabled || !providers.contains_key(&record.provider_id) {
+            continue;
+        }
         model_rows.insert(
             record.id,
             ModelRow {
@@ -941,18 +1260,26 @@ pub fn build_routing_table(snapshot: &RoutingSnapshot) -> RoutingTable {
         }
     }
 
-    let mut table = RoutingTable::new(providers, model_rows);
+    let mut table = RoutingTable::new(providers.clone(), model_rows);
 
     for (&(workflow_key, scope_str), assignments) in &by_key_scope {
         let Some(workflow) = workflows.get(workflow_key) else {
             continue;
         };
+        if !workflow.enabled {
+            continue;
+        }
         let scope = match scope_str {
             "vip" => Scope::Vip,
             _ => Scope::Global,
         };
-        let Some(route) = build_route(workflow, assignments, &triggers_by_workflow, &model_records)
-        else {
+        let Some(route) = build_route(
+            workflow,
+            assignments,
+            &triggers_by_workflow,
+            &model_records,
+            &providers,
+        ) else {
             continue;
         };
         table.set_route(scope, route);
@@ -966,6 +1293,7 @@ fn build_route(
     assignments: &[&AssignmentRecord],
     triggers_by_workflow: &HashMap<&str, Vec<&TriggerRecord>>,
     models: &HashMap<i64, &ModelRecord>,
+    providers: &HashMap<i64, ProviderRow>,
 ) -> Option<WorkflowRoute> {
     let kind = Kind::from_db(&workflow.kind)?;
     let mut primary = Vec::new();
@@ -974,7 +1302,7 @@ fn build_route(
     let mut shadow = Vec::new();
 
     for record in assignments {
-        let Some(candidate) = candidate_from_assignment(record, models) else {
+        let Some(candidate) = candidate_from_assignment(record, models, providers, kind) else {
             continue;
         };
         match candidate.role {
@@ -1003,7 +1331,9 @@ fn build_route(
                 // The engaged assignment may be a different scope; skip if absent here.
                 continue;
             };
-            let Some(mut engage) = candidate_from_assignment(engage_record, models) else {
+            let Some(mut engage) =
+                candidate_from_assignment(engage_record, models, providers, kind)
+            else {
                 continue;
             };
             engage.role = Role::Overflow;
@@ -1188,40 +1518,134 @@ mod tests {
     }
 
     #[test]
-    fn resolve_target_reads_primary_model_and_service() {
+    fn disabled_workflow_is_not_routed() {
         let mut snapshot = dialog_snapshot();
-        snapshot.providers.push(provider(7, "aifarm-qwen", "chat"));
-        snapshot
-            .providers
-            .last_mut()
-            .unwrap()
-            .discovery_service_name = Some("llm-openai-qwen27b-gguf".to_owned());
-        snapshot.models.push(model(70, 7, "vibethinker-3b"));
-        snapshot.workflows.push(WorkflowRecord {
-            key: "memory_consolidation".to_owned(),
-            kind: "chat".to_owned(),
-            full_routing: false,
-            retry_max_hops: 3,
-            retry_wall_ms: 60_000,
-            enabled: true,
-        });
-        snapshot.assignments.push(assignment(
-            700,
-            "memory_consolidation",
-            "global",
-            "primary",
-            70,
-            None,
-        ));
+        snapshot.workflows[0].enabled = false;
 
         let table = build_routing_table(&snapshot);
-        let target = resolve_target(&table, "memory_consolidation").expect("resolved target");
-        assert_eq!(target.model, "vibethinker-3b");
-        assert_eq!(
-            target.discovery_service_name.as_deref(),
-            Some("llm-openai-qwen27b-gguf")
+
+        assert!(table.resolve("dialog", false).is_none());
+    }
+
+    #[test]
+    fn disabled_provider_is_not_eligible_for_route_candidates() {
+        let mut snapshot = dialog_snapshot();
+        snapshot.providers[0].enabled = false;
+
+        let table = build_routing_table(&snapshot);
+        let route = table.resolve("dialog", false).expect("dialog route");
+
+        assert!(
+            route
+                .primary
+                .iter()
+                .all(|candidate| candidate.provider != 1)
         );
-        // Unrouted workflow yields nothing.
-        assert!(resolve_target(&table, "nonexistent").is_none());
+        assert!(
+            route
+                .triggers
+                .iter()
+                .all(|trigger| trigger.engage.provider != 1)
+        );
+        assert!(
+            route
+                .fallback_tail
+                .iter()
+                .all(|candidate| candidate.provider != 1)
+        );
+    }
+
+    #[test]
+    fn disabled_model_is_not_eligible_for_route_candidates() {
+        let mut snapshot = dialog_snapshot();
+        snapshot.models[0].enabled = false;
+
+        let table = build_routing_table(&snapshot);
+        let route = table.resolve("dialog", false).expect("dialog route");
+
+        assert!(route.primary.iter().all(|candidate| candidate.model != 10));
+        assert!(
+            route
+                .triggers
+                .iter()
+                .all(|trigger| trigger.engage.model != 10)
+        );
+        assert!(
+            route
+                .fallback_tail
+                .iter()
+                .all(|candidate| candidate.model != 10)
+        );
+    }
+
+    #[test]
+    fn workflow_kind_requires_matching_model_capability() {
+        let mut snapshot = dialog_snapshot();
+        snapshot.models[0].capabilities = vec!["embedding".to_owned()];
+
+        let table = build_routing_table(&snapshot);
+        let route = table.resolve("dialog", false).expect("dialog route");
+
+        assert!(route.primary.iter().all(|candidate| candidate.model != 10));
+    }
+
+    #[test]
+    fn embedding_workflow_requires_512_dimensions() {
+        let mut snapshot = RoutingSnapshot {
+            providers: vec![provider(1, "aifarm-embed", "embedding")],
+            models: vec![ModelRecord {
+                capabilities: vec!["embedding".to_owned()],
+                embedding_dim: Some(768),
+                ..model(10, 1, "embedder")
+            }],
+            workflows: vec![WorkflowRecord {
+                key: "embedding".to_owned(),
+                kind: "embedding".to_owned(),
+                full_routing: false,
+                retry_max_hops: 1,
+                retry_wall_ms: 10_000,
+                enabled: true,
+            }],
+            assignments: vec![assignment(100, "embedding", "global", "primary", 10, None)],
+            triggers: vec![],
+        };
+
+        let table = build_routing_table(&snapshot);
+        let route = table.resolve("embedding", false).expect("embedding route");
+        assert!(route.primary.is_empty());
+
+        snapshot.models[0].embedding_dim = Some(512);
+        let table = build_routing_table(&snapshot);
+        let route = table.resolve("embedding", false).expect("embedding route");
+        assert_eq!(route.primary.len(), 1);
+    }
+
+    #[test]
+    fn parses_provider_capacity_trigger_params() {
+        let mut snapshot = dialog_snapshot();
+        snapshot.triggers[0].trigger_type = "provider_capacity".to_owned();
+        snapshot.triggers[0].queue_name = None;
+        snapshot.triggers[0].high_watermark = None;
+        snapshot.triggers[0].low_watermark = None;
+        snapshot.triggers[0].params = json!({
+            "provider_id": 1,
+            "model_id": 10,
+            "cooldown_ms": 45_000,
+        });
+
+        let table = build_routing_table(&snapshot);
+        let route = table.resolve("dialog", false).expect("dialog route");
+
+        match &route.triggers[0].condition {
+            TriggerCondition::ProviderCapacity {
+                provider,
+                model,
+                cooldown,
+            } => {
+                assert_eq!((*provider, *model), (1, 10));
+                assert_eq!(*cooldown, Duration::from_millis(45_000));
+            }
+            other => panic!("unexpected trigger condition: {other:?}"),
+        }
     }
 }

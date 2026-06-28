@@ -37,6 +37,7 @@ pub mod rate_limits;
 pub mod rates;
 pub mod reset;
 pub mod rich;
+mod routed_attempts;
 pub mod runtime_api;
 mod runtime_cache;
 mod runtime_dispatcher;
@@ -46,6 +47,7 @@ mod runtime_llm;
 mod runtime_llm_analytics;
 mod runtime_pending_ops;
 mod runtime_retention;
+mod runtime_routing;
 mod runtime_safety;
 mod runtime_sql;
 mod runtime_taskman;
@@ -125,8 +127,12 @@ struct RuntimeWorkers {
     taskman_inspector: runtime_taskman::RuntimeTaskmanInspectorHandle,
     memory_restart_trigger: Option<Arc<tokio::sync::Notify>>,
     llm_trace_buffer: Option<runtime_llm::RuntimeLlmTraceBuffer>,
+    routing_event_buffer: Option<runtime_routing::RoutingEventBuffer>,
+    routing_event_reporter: Option<runtime_routing::RoutingEventReporter>,
     runtime_api_tls_public_key_pin: Option<String>,
     router_handle: Option<Arc<openplotva_llm::router::RouterHandle>>,
+    router_breakers: Option<Arc<openplotva_llm::router::BreakerSet>>,
+    router_triggers: Option<Arc<openplotva_llm::router::TriggerState>>,
 }
 
 struct DispatcherRuntime {
@@ -410,6 +416,8 @@ struct StaticWebRoutes {
     cache_inspector: runtime_cache::RuntimeCacheInspectorHandle,
     taskman_inspector: runtime_taskman::RuntimeTaskmanInspectorHandle,
     llm_trace_buffer: Option<runtime_llm::RuntimeLlmTraceBuffer>,
+    routing_event_buffer: Option<runtime_routing::RoutingEventBuffer>,
+    routing_event_reporter: Option<runtime_routing::RoutingEventReporter>,
     llm_discovery_base_url: Arc<str>,
     llm_discovery_service_name: Arc<str>,
     runtime_sql_timeout_ms: i32,
@@ -432,6 +440,8 @@ struct StaticWebRoutes {
     shield_options: openplotva_shield::Options,
     shield_embedder: Option<Arc<dyn memory_runtime::EmbeddingProvider>>,
     router_handle: Option<Arc<openplotva_llm::router::RouterHandle>>,
+    router_breakers: Option<Arc<openplotva_llm::router::BreakerSet>>,
+    router_triggers: Option<Arc<openplotva_llm::router::TriggerState>>,
 }
 
 #[derive(Clone)]
@@ -439,6 +449,10 @@ struct AdminMemoryOverrideRuntime {
     config: Arc<AppConfig>,
     store: PostgresMemoryStore,
     lock: Arc<tokio::sync::Mutex<()>>,
+    router_handle: Arc<openplotva_llm::router::RouterHandle>,
+    router_breakers: Arc<openplotva_llm::router::BreakerSet>,
+    router_triggers: Arc<openplotva_llm::router::TriggerState>,
+    routing_event_reporter: Option<runtime_routing::RoutingEventReporter>,
 }
 
 fn static_web_routes(
@@ -464,6 +478,8 @@ fn static_web_routes(
         cache_inspector: runtime_cache::RuntimeCacheInspectorHandle::default(),
         taskman_inspector: runtime_taskman::RuntimeTaskmanInspectorHandle::default(),
         llm_trace_buffer: None,
+        routing_event_buffer: None,
+        routing_event_reporter: None,
         llm_discovery_base_url: Arc::from(""),
         llm_discovery_service_name: Arc::from(""),
         runtime_sql_timeout_ms: openplotva_config::DEFAULT_RUNTIME_API_SQL_TIMEOUT_MS,
@@ -488,6 +504,8 @@ fn static_web_routes(
         shield_options: openplotva_shield::Options::default(),
         shield_embedder: None,
         router_handle: None,
+        router_breakers: None,
+        router_triggers: None,
     }
 }
 
@@ -514,6 +532,8 @@ fn static_web_routes_from_config(
     routes.cache_inspector = runtime_workers.cache_inspector.clone();
     routes.taskman_inspector = runtime_workers.taskman_inspector.clone();
     routes.llm_trace_buffer = runtime_workers.llm_trace_buffer.clone();
+    routes.routing_event_buffer = runtime_workers.routing_event_buffer.clone();
+    routes.routing_event_reporter = runtime_workers.routing_event_reporter.clone();
     routes.llm_discovery_base_url = Arc::from(config.llm.discovery.base_url.clone());
     routes.llm_discovery_service_name = Arc::from(config.llm.dialog.discovery_service_name.clone());
     routes.runtime_sql_timeout_ms = config.runtime_api.sql_timeout_ms;
@@ -528,6 +548,8 @@ fn static_web_routes_from_config(
     routes.memory_token_estimator_source = Arc::from(memory_token_estimator_source(config));
     routes.memory_restart_trigger = runtime_workers.memory_restart_trigger.clone();
     routes.router_handle = runtime_workers.router_handle.clone();
+    routes.router_breakers = runtime_workers.router_breakers.clone();
+    routes.router_triggers = runtime_workers.router_triggers.clone();
     routes.shield_options = shield_options_from_config(&config.shield);
     if let Some(clients) = service_clients {
         routes.postgres = Some(clients.postgres.clone());
@@ -550,11 +572,21 @@ fn static_web_routes_from_config(
         let memory_store = PostgresMemoryStore::new(clients.postgres.clone());
         routes.memory_store = Some(memory_store.clone());
         if config.memory.enabled {
-            routes.memory_override_runtime = Some(AdminMemoryOverrideRuntime {
-                config: Arc::new(config.clone()),
-                store: memory_store,
-                lock: Arc::new(tokio::sync::Mutex::new(())),
-            });
+            if let (Some(router_handle), Some(router_breakers), Some(router_triggers)) = (
+                routes.router_handle.clone(),
+                routes.router_breakers.clone(),
+                routes.router_triggers.clone(),
+            ) {
+                routes.memory_override_runtime = Some(AdminMemoryOverrideRuntime {
+                    config: Arc::new(config.clone()),
+                    store: memory_store,
+                    lock: Arc::new(tokio::sync::Mutex::new(())),
+                    router_handle,
+                    router_breakers,
+                    router_triggers,
+                    routing_event_reporter: routes.routing_event_reporter.clone(),
+                });
+            }
         }
         if config.shield.enabled {
             routes.shield_store = Some(PostgresShieldStore::new(clients.postgres.clone()));
@@ -662,11 +694,6 @@ fn install_static_web_routes(router: axum::Router, static_web: StaticWebRoutes) 
         .route("/admin/api/auth_check", get(admin_auth_check))
         .route("/admin/api/state", any(admin_state))
         .route("/admin/api/loglevel", any(admin_loglevel))
-        .route("/admin/api/aifarm/pool", any(admin_aifarm_pool))
-        .route(
-            "/admin/api/aifarm/pool/reasoning",
-            any(admin_aifarm_pool_reasoning),
-        )
         .route("/admin/api/routing", any(admin_routing))
         .route("/admin/api/logs/stream", any(admin_logs_stream))
         .route("/admin/api/bootstrap", get(admin_bootstrap))
@@ -743,8 +770,6 @@ const GO_ADMIN_API_ROUTE_PATTERNS: &[&str] = &[
     "/admin/api/auth_check",
     "/admin/api/state",
     "/admin/api/loglevel",
-    "/admin/api/aifarm/pool",
-    "/admin/api/aifarm/pool/reasoning",
     "/admin/api/logs/stream",
     "/admin/api/bootstrap",
     "/admin/api/metrics",
@@ -941,40 +966,6 @@ async fn admin_loglevel(
     body: Bytes,
 ) -> Response {
     admin_loglevel_response(&routes, method, &headers, &body).await
-}
-
-async fn admin_aifarm_pool(
-    method: Method,
-    headers: HeaderMap,
-    Extension(routes): Extension<StaticWebRoutes>,
-    body: Bytes,
-) -> Response {
-    admin_aifarm_pool_toggle_response(
-        &routes,
-        method,
-        &headers,
-        &body,
-        "aifarm.pool.enabled",
-        openplotva_llm::aifarm::set_pool_enabled,
-    )
-    .await
-}
-
-async fn admin_aifarm_pool_reasoning(
-    method: Method,
-    headers: HeaderMap,
-    Extension(routes): Extension<StaticWebRoutes>,
-    body: Bytes,
-) -> Response {
-    admin_aifarm_pool_toggle_response(
-        &routes,
-        method,
-        &headers,
-        &body,
-        "aifarm.pool.reasoning_enabled",
-        openplotva_llm::aifarm::set_pool_reasoning_enabled,
-    )
-    .await
 }
 
 async fn admin_logs_stream(
@@ -4114,22 +4105,30 @@ async fn admin_memory_restart_override_execute_response(
             return admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed");
         }
     };
-    let extractor = match memory_runtime::memory_extractor_from_app_config_with_override(
+    let extractor = memory_runtime::routed_memory_extractor_from_app_config(
         &runtime.config,
-        Some(&provider),
-        Some(&model),
-    ) {
-        Ok(extractor) => extractor,
-        Err(error) => {
-            tracing::warn!(%error, provider, model, "failed to build admin memory override extractor");
-            return admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed");
-        }
-    };
+        routed_attempts::RoutedAttemptWalker::new(
+            Arc::clone(&runtime.router_handle),
+            Arc::clone(&runtime.router_breakers),
+            Arc::clone(&runtime.router_triggers),
+        )
+        .with_reporter_opt(runtime.routing_event_reporter.clone()),
+    );
     let embedder = match memory_runtime::memory_write_embedder_from_config(
         &runtime.config.memory,
         &runtime.config.llm.discovery.base_url,
     ) {
-        Ok(embedder) => embedder,
+        Ok(embedder) => embedder.map(|client| {
+            embedder::RoutedDiscoveryEmbedder::new(
+                routed_attempts::RoutedAttemptWalker::new(
+                    Arc::clone(&runtime.router_handle),
+                    Arc::clone(&runtime.router_breakers),
+                    Arc::clone(&runtime.router_triggers),
+                )
+                .with_reporter_opt(runtime.routing_event_reporter.clone()),
+                client.config().clone(),
+            )
+        }),
         Err(error) => {
             tracing::warn!(%error, provider, model, "failed to build admin memory override embedder");
             return admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed");
@@ -4199,8 +4198,8 @@ async fn admin_memory_restart_override_execute_response(
 
 async fn admin_memory_override_drain(
     runtime: AdminMemoryOverrideRuntime,
-    extractor: memory_runtime::AppMemoryExtractor,
-    embedder: Option<embedder::DiscoveryEmbedderClient>,
+    extractor: memory_runtime::RoutedMemoryExtractor,
+    embedder: Option<embedder::RoutedDiscoveryEmbedder>,
     cfg: memory_runtime::MemoryRunProcessConfig,
     model: String,
     _guard: tokio::sync::OwnedMutexGuard<()>,
@@ -6756,11 +6755,6 @@ struct AdminLogLevelRequest {
     level: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct AdminAifarmPoolRequest {
-    enabled: bool,
-}
-
 async fn admin_state_response(routes: &StaticWebRoutes) -> Response {
     let level = admin_app_setting(routes, "log_level")
         .await
@@ -6781,8 +6775,6 @@ async fn admin_state_response(routes: &StaticWebRoutes) -> Response {
             },
             "cache": admin_cache_stats_json(cache_stats.cache),
             "planner": admin_cache_stats_json(cache_stats.planner_cache),
-            "aifarm_pool_enabled": openplotva_llm::aifarm::pool_enabled(),
-            "aifarm_pool_reasoning_enabled": openplotva_llm::aifarm::pool_reasoning_enabled(),
         }),
     )
 }
@@ -6826,40 +6818,6 @@ async fn admin_loglevel_response(
     admin_json_response(
         StatusCode::OK,
         serde_json::json!({ "ok": true, "level": level }),
-    )
-}
-
-async fn admin_aifarm_pool_toggle_response(
-    routes: &StaticWebRoutes,
-    method: Method,
-    headers: &HeaderMap,
-    body: &[u8],
-    setting_key: &'static str,
-    set_enabled: fn(bool),
-) -> Response {
-    if method != Method::POST && method != Method::PUT {
-        return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
-    }
-    if let Err(error) = require_admin_request(headers, &routes.admin_ids, &routes.bot_token) {
-        return admin_auth_failure_response(error);
-    }
-    let Ok(req) = serde_json::from_slice::<AdminAifarmPoolRequest>(body) else {
-        return admin_error_response(StatusCode::BAD_REQUEST, "bad request");
-    };
-    set_enabled(req.enabled);
-    if let Err(error) =
-        admin_upsert_app_setting(routes, setting_key, &req.enabled.to_string()).await
-    {
-        tracing::warn!(
-            %error,
-            setting_key,
-            enabled = req.enabled,
-            "failed to persist admin AI Farm pool setting"
-        );
-    }
-    admin_json_response(
-        StatusCode::OK,
-        serde_json::json!({ "ok": true, "enabled": req.enabled }),
     )
 }
 
@@ -7575,6 +7533,25 @@ fn routing_json_bool(value: &serde_json::Value, key: &str, default: bool) -> boo
         .unwrap_or(default)
 }
 
+fn routing_json_required_bool(value: &serde_json::Value, key: &str) -> Result<bool, String> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| format!("{key} is required"))
+}
+
+fn routing_json_config_patch(value: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let patch = value
+        .get("config")
+        .or_else(|| value.get("patch"))
+        .cloned()
+        .ok_or_else(|| "config patch is required".to_owned())?;
+    if !patch.is_object() {
+        return Err("config patch must be a JSON object".to_owned());
+    }
+    Ok(patch)
+}
+
 fn routing_capabilities(value: &serde_json::Value) -> Vec<String> {
     value
         .get("capabilities")
@@ -7723,6 +7700,7 @@ async fn admin_routing_snapshot_json(pool: &PgPool) -> Result<serde_json::Value,
                 "capabilities": model.capabilities,
                 "embedding_dim": model.embedding_dim,
                 "enabled": model.enabled,
+                "config": model.config,
             })
         })
         .collect();
@@ -7818,6 +7796,22 @@ async fn admin_routing_apply_action(
                 .map_err(storage_err)?;
             json!({ "ok": true })
         }
+        "set_provider_enabled" => {
+            let id = id_of(body).ok_or(bad("id is required".to_owned()))?;
+            let enabled = routing_json_required_bool(body, "enabled").map_err(bad)?;
+            routing::set_provider_enabled(pool, id, enabled)
+                .await
+                .map_err(storage_err)?;
+            json!({ "ok": true })
+        }
+        "patch_provider_config" => {
+            let id = id_of(body).ok_or(bad("id is required".to_owned()))?;
+            let patch = routing_json_config_patch(body).map_err(bad)?;
+            routing::patch_provider_config(pool, id, &patch)
+                .await
+                .map_err(storage_err)?;
+            json!({ "ok": true })
+        }
         "delete_provider" => {
             let id = id_of(body).ok_or(bad("id is required".to_owned()))?;
             routing::delete_provider(pool, id)
@@ -7836,6 +7830,22 @@ async fn admin_routing_apply_action(
             let id = id_of(body).ok_or(bad("id is required".to_owned()))?;
             let input = model_input_from_json(body).map_err(bad)?;
             routing::update_model(pool, id, &input)
+                .await
+                .map_err(storage_err)?;
+            json!({ "ok": true })
+        }
+        "set_model_enabled" => {
+            let id = id_of(body).ok_or(bad("id is required".to_owned()))?;
+            let enabled = routing_json_required_bool(body, "enabled").map_err(bad)?;
+            routing::set_model_enabled(pool, id, enabled)
+                .await
+                .map_err(storage_err)?;
+            json!({ "ok": true })
+        }
+        "patch_model_config" => {
+            let id = id_of(body).ok_or(bad("id is required".to_owned()))?;
+            let patch = routing_json_config_patch(body).map_err(bad)?;
+            routing::patch_model_config(pool, id, &patch)
                 .await
                 .map_err(storage_err)?;
             json!({ "ok": true })
@@ -7912,6 +7922,14 @@ async fn admin_routing_apply_action(
             .map_err(storage_err)?;
             json!({ "ok": true })
         }
+        "set_workflow_enabled" => {
+            let key = routing_json_str(body, "key").ok_or(bad("key is required".to_owned()))?;
+            let enabled = routing_json_required_bool(body, "enabled").map_err(bad)?;
+            routing::set_workflow_enabled(pool, &key, enabled)
+                .await
+                .map_err(storage_err)?;
+            json!({ "ok": true })
+        }
         "reload" => json!({ "ok": true }),
         other => return Err(bad(format!("unknown action {other}"))),
     };
@@ -7930,6 +7948,12 @@ async fn admin_routing_apply_action(
     if let Some(handle) = routes.router_handle.as_ref()
         && let Err(error) = model_routing::reload_router(handle, pool).await
     {
+        if let Some(reporter) = routes.routing_event_reporter.as_ref() {
+            reporter.record(runtime_routing::router_reload_failed_event(
+                "admin_routing_reload",
+                &error.to_string(),
+            ));
+        }
         tracing::warn!(%error, "failed to reload router after admin routing change");
     }
     Ok(result)
@@ -8060,7 +8084,6 @@ pub async fn run() -> anyhow::Result<()> {
     let mut readiness_checks = Vec::new();
     let service_clients = connect_services(&config, &mut readiness_checks).await?;
     record_dialog_tool_mode_readiness(&config, &mut readiness_checks);
-    apply_runtime_aifarm_pool_settings(&config, service_clients.as_ref()).await;
     let runtime_workers = start_runtime_workers(
         &config,
         service_clients.as_ref(),
@@ -8109,40 +8132,6 @@ pub async fn run() -> anyhow::Result<()> {
     serve_result?;
     drop(service_clients);
     Ok(())
-}
-
-async fn apply_runtime_aifarm_pool_settings(
-    config: &AppConfig,
-    service_clients: Option<&ServiceClients>,
-) {
-    if config.llm.dialog.aifarm_pool_reasoning_max_tokens > 0 {
-        openplotva_llm::aifarm::set_pool_reasoning_max_tokens(
-            config.llm.dialog.aifarm_pool_reasoning_max_tokens,
-        );
-    }
-    let Some(service_clients) = service_clients else {
-        return;
-    };
-    if let Some(enabled) =
-        postgres_bool_app_setting(&service_clients.postgres, "aifarm.pool.enabled").await
-    {
-        openplotva_llm::aifarm::set_pool_enabled(enabled);
-    }
-    if let Some(enabled) =
-        postgres_bool_app_setting(&service_clients.postgres, "aifarm.pool.reasoning_enabled").await
-    {
-        openplotva_llm::aifarm::set_pool_reasoning_enabled(enabled);
-    }
-}
-
-async fn postgres_bool_app_setting(pool: &PgPool, key: &str) -> Option<bool> {
-    let value = sqlx::query_scalar::<_, String>("SELECT value FROM app_settings WHERE key = $1")
-        .bind(key)
-        .fetch_optional(pool)
-        .await
-        .ok()
-        .flatten()?;
-    value.trim().parse::<bool>().ok()
 }
 
 async fn connect_services(
@@ -8477,31 +8466,6 @@ fn shield_history_tail_messages_from_config(config: &openplotva_config::ShieldCo
 
 fn dialog_memory_context_enabled(config: &AppConfig) -> bool {
     config.memory.enabled
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct DialogAifarmWorkerPlan {
-    primary_workers: i32,
-    overflow_workers: i32,
-    total_workers: i32,
-}
-
-fn dialog_aifarm_worker_plan(
-    configured_primary_workers: i32,
-    configured_overflow_workers: i32,
-    pool_enabled: bool,
-) -> DialogAifarmWorkerPlan {
-    let primary_workers = configured_primary_workers.max(0);
-    let overflow_workers = if pool_enabled {
-        configured_overflow_workers.max(0)
-    } else {
-        0
-    };
-    DialogAifarmWorkerPlan {
-        primary_workers,
-        overflow_workers,
-        total_workers: primary_workers + overflow_workers,
-    }
 }
 
 fn effective_memory_consolidation_workers(configured_workers: i32) -> i32 {
@@ -9107,37 +9071,93 @@ async fn start_runtime_workers(
         taskman_inspector: taskman_inspector.clone(),
         memory_restart_trigger: None,
         llm_trace_buffer: None,
+        routing_event_buffer: None,
+        routing_event_reporter: None,
         runtime_api_tls_public_key_pin: None,
         router_handle: None,
+        router_breakers: None,
+        router_triggers: None,
     };
+    let routing_event_buffer = runtime_routing::RoutingEventBuffer::default();
+    let (routing_event_recorder, routing_event_recorder_worker) =
+        runtime_routing::PostgresRoutingEventRecorder::spawn(
+            service_clients.postgres.clone(),
+            stop.subscribe(),
+        );
+    workers.handles.push(routing_event_recorder_worker);
+    let mut routing_event_reporter = runtime_routing::RoutingEventReporter::new(
+        routing_event_buffer.clone(),
+        Some(routing_event_recorder.clone()),
+        None,
+        runtime_routing::DEFAULT_ROUTING_ADMIN_REPORT_COOLDOWN,
+    );
+    workers.routing_event_buffer = Some(routing_event_buffer.clone());
+    workers.routing_event_reporter = Some(routing_event_reporter.clone());
     // Seed and correct the routing tables, then publish the config-only flow resolver
     // BEFORE the per-flow workers are built, so memory / history / agentic-reasoner pick
     // up the DB-selected model. Every step is idempotent (flag/existence guarded).
     if let Err(error) =
         model_routing::seed_routing_from_env(&service_clients.postgres, config).await
     {
+        routing_event_reporter.record(runtime_routing::routing_backfill_failed_event(
+            "seed_routing_from_env",
+            &error.to_string(),
+        ));
         tracing::warn!(%error, "failed to seed LLM routing tables; continuing with existing rows");
     }
     if let Err(error) =
-        model_routing::backfill_pool_from_env(&service_clients.postgres, config).await
+        model_routing::backfill_vram_cloud_from_env(&service_clients.postgres, config).await
     {
+        routing_event_reporter.record(runtime_routing::routing_backfill_failed_event(
+            "backfill_vram_cloud_from_env",
+            &error.to_string(),
+        ));
         tracing::warn!(%error, "failed to backfill AI Farm pool into routing tables");
     }
     if let Err(error) = model_routing::backfill_gpu_models(&service_clients.postgres, config).await
     {
+        routing_event_reporter.record(runtime_routing::routing_backfill_failed_event(
+            "backfill_gpu_models",
+            &error.to_string(),
+        ));
         tracing::warn!(%error, "failed to backfill GPU Qwen models into routing tables");
     }
     if let Err(error) =
         model_routing::backfill_genkit_flash_model(&service_clients.postgres, config).await
     {
+        routing_event_reporter.record(runtime_routing::routing_backfill_failed_event(
+            "backfill_genkit_flash_model",
+            &error.to_string(),
+        ));
         tracing::warn!(%error, "failed to correct genkit dialog fallback model");
     }
-    match openplotva_storage::llm_routing::load_snapshot(&service_clients.postgres).await {
-        Ok(snapshot) => model_routing::init_routing_resolver(&snapshot),
-        Err(error) => {
-            tracing::warn!(%error, "failed to load routing snapshot for config-only flow resolver");
-        }
+    if let Err(error) =
+        model_routing::backfill_declarative_v2(&service_clients.postgres, config).await
+    {
+        routing_event_reporter.record(runtime_routing::routing_backfill_failed_event(
+            "backfill_declarative_v2",
+            &error.to_string(),
+        ));
+        tracing::warn!(%error, "failed to backfill declarative routing v2 rows");
     }
+    let router_breakers = Arc::new(openplotva_llm::router::BreakerSet::new());
+    let router_triggers = Arc::new(openplotva_llm::router::TriggerState::new());
+    let router_handle = match model_routing::load_routing_table(&service_clients.postgres).await {
+        Ok(table) => openplotva_llm::router::RouterHandle::new(table),
+        Err(error) => {
+            routing_event_reporter.record(runtime_routing::router_reload_failed_event(
+                "load_routing_table",
+                &error.to_string(),
+            ));
+            tracing::warn!(%error, "failed to load LLM routing table; starting with an empty table");
+            openplotva_llm::router::RouterHandle::new(
+                openplotva_llm::router::RoutingTable::default(),
+            )
+        }
+    };
+    workers.router_handle = Some(Arc::clone(&router_handle));
+    workers.router_breakers = Some(Arc::clone(&router_breakers));
+    workers.router_triggers = Some(Arc::clone(&router_triggers));
     let update_queue =
         openplotva_updates::RedisUpdateQueue::new(service_clients.redis.client().clone());
     let update_queue_backend = config.update_queue.backend.as_str();
@@ -9268,6 +9288,37 @@ async fn start_runtime_workers(
             "whitecircle_checks retention disabled",
         ));
     }
+    if llm_request_events_retention_days > 0 {
+        let routing_event_cleanup_pool = service_clients.postgres.clone();
+        let routing_event_cleanup_stop = stop.subscribe();
+        let routing_event_cleanup_interval = runtime_routing::LLM_ROUTING_EVENTS_CLEANUP_INTERVAL;
+        let routing_event_cleanup_worker = tokio::spawn(async move {
+            let report = runtime_routing::run_llm_routing_event_cleanup_worker_until(
+                routing_event_cleanup_pool,
+                routing_event_cleanup_interval,
+                llm_request_events_retention_days,
+                runtime_routing::LLM_ROUTING_EVENTS_CLEANUP_BATCH_SIZE,
+                wait_for_runtime_stop(routing_event_cleanup_stop),
+            )
+            .await;
+
+            tracing::info!(?report, "llm_routing_events cleanup worker stopped");
+        });
+        readiness_checks.push(ReadinessCheck::ok(
+            "llm_routing_events_cleanup",
+            format!(
+                "LLM routing events cleanup every {}s, retention {}d",
+                routing_event_cleanup_interval.as_secs(),
+                llm_request_events_retention_days
+            ),
+        ));
+        workers.handles.push(routing_event_cleanup_worker);
+    } else {
+        readiness_checks.push(ReadinessCheck::skipped(
+            "llm_routing_events_cleanup",
+            "LLM routing events cleanup disabled",
+        ));
+    }
     workers.llm_trace_buffer = Some(llm_trace_buffer.clone());
     let llm_observer: Arc<dyn openplotva_llm::LlmCallObserver> =
         Arc::new(runtime_llm::RuntimeLlmObserver::new(
@@ -9308,6 +9359,7 @@ async fn start_runtime_workers(
                 ),
             )),
             llm_trace_inspector: Some(Arc::new(llm_trace_buffer.clone())),
+            routing_event_inspector: Some(Arc::new(routing_event_buffer.clone())),
             llm_analytics_reader: Some(Arc::new(
                 runtime_llm_analytics::PostgresRuntimeLlmAnalyticsReader::new(
                     service_clients.postgres.clone(),
@@ -9359,54 +9411,56 @@ async fn start_runtime_workers(
     }
 
     if config.memory.enabled && config.bot.key.is_none() {
-        match (
-            memory_runtime::memory_extractor_from_app_config(config),
-            memory_runtime::memory_write_embedder_from_config(
-                &config.memory,
-                &config.llm.discovery.base_url,
-            ),
-        ) {
-            (Ok(memory_extractor), Ok(memory_write_embedder)) => {
-                let memory_worker_store = memory_store.clone();
-                let memory_worker_config =
-                    memory_runtime::memory_service_worker_config_from_memory_config(&config.memory);
-                let memory_worker_stop = stop.subscribe();
-                let memory_worker_trigger = Arc::clone(&memory_restart_trigger);
-                let memory_worker = tokio::spawn(async move {
-                    let report = memory_runtime::run_memory_service_worker_with_trigger_until(
-                        &memory_extractor,
-                        &memory_worker_store,
-                        memory_write_embedder.as_ref(),
-                        memory_worker_config,
-                        memory_worker_trigger,
-                        wait_for_runtime_stop(memory_worker_stop),
-                    )
-                    .await;
+        let memory_write_embedder = Some(embedder::RoutedDiscoveryEmbedder::new(
+            routed_attempts::RoutedAttemptWalker::new(
+                Arc::clone(&router_handle),
+                Arc::clone(&router_breakers),
+                Arc::clone(&router_triggers),
+            )
+            .with_reporter(routing_event_reporter.clone()),
+            embedder::DiscoveryEmbedderConfig {
+                base_url: config.llm.discovery.base_url.clone(),
+                service_name: config.memory.embedder_service_name.clone(),
+                endpoint_name: config.memory.embedder_endpoint_name.clone(),
+                request_timeout: memory_runtime::EMBEDDER_DEFAULT_TIMEOUT,
+                task_timeout: memory_runtime::EMBEDDER_DEFAULT_TIMEOUT,
+                poll_interval: Duration::from_millis(100),
+                capacity_wait: Duration::from_secs(2),
+            },
+        ));
+        let memory_extractor = memory_runtime::routed_memory_extractor_from_app_config(
+            config,
+            routed_attempts::RoutedAttemptWalker::new(
+                Arc::clone(&router_handle),
+                Arc::clone(&router_breakers),
+                Arc::clone(&router_triggers),
+            )
+            .with_reporter(routing_event_reporter.clone()),
+        );
+        let memory_worker_store = memory_store.clone();
+        let memory_worker_config =
+            memory_runtime::memory_service_worker_config_from_memory_config(&config.memory);
+        let memory_worker_stop = stop.subscribe();
+        let memory_worker_trigger = Arc::clone(&memory_restart_trigger);
+        let memory_worker = tokio::spawn(async move {
+            let report = memory_runtime::run_memory_service_worker_with_trigger_until(
+                &memory_extractor,
+                &memory_worker_store,
+                memory_write_embedder.as_ref(),
+                memory_worker_config,
+                memory_worker_trigger,
+                wait_for_runtime_stop(memory_worker_stop),
+            )
+            .await;
 
-                    tracing::info!(?report, "memory service worker stopped");
-                });
-                readiness_checks.push(ReadinessCheck::ok(
-                    "memory_service",
-                    "Memory service worker started with daily-run ensure, queue drain, AIFarm extraction, and SQLx persistence",
-                ));
-                workers.memory_restart_trigger = Some(Arc::clone(&memory_restart_trigger));
-                workers.handles.push(memory_worker);
-            }
-            (Err(error), _) => {
-                tracing::warn!(%error, "memory extractor unavailable for memory service worker");
-                readiness_checks.push(ReadinessCheck::skipped(
-                    "memory_service",
-                    format!("memory extractor unavailable: {error}"),
-                ));
-            }
-            (_, Err(error)) => {
-                tracing::warn!(%error, "memory embedder unavailable for memory service worker");
-                readiness_checks.push(ReadinessCheck::skipped(
-                    "memory_service",
-                    format!("memory embedder unavailable: {error}"),
-                ));
-            }
-        }
+            tracing::info!(?report, "memory service worker stopped");
+        });
+        readiness_checks.push(ReadinessCheck::ok(
+            "memory_service",
+            "Memory service worker started with daily-run ensure, queue drain, routed extraction, routed embeddings, and SQLx persistence",
+        ));
+        workers.memory_restart_trigger = Some(Arc::clone(&memory_restart_trigger));
+        workers.handles.push(memory_worker);
     } else if !config.memory.enabled {
         readiness_checks.push(ReadinessCheck::skipped(
             "memory_service",
@@ -9519,6 +9573,18 @@ async fn start_runtime_workers(
     let dispatcher_queue = Arc::new(openplotva_telegram::DispatcherQueue::new(
         go_dispatcher_config(),
     ));
+    let routing_admin_notifier: Arc<dyn runtime_routing::RoutingAdminNotifier> =
+        Arc::new(runtime_routing::DispatcherRoutingAdminNotifier::new(
+            Arc::<[i64]>::from(config.admins.admin_ids.clone()),
+            Arc::clone(&dispatcher_queue),
+        ));
+    routing_event_reporter = runtime_routing::RoutingEventReporter::new(
+        routing_event_buffer.clone(),
+        Some(routing_event_recorder.clone()),
+        Some(routing_admin_notifier),
+        runtime_routing::DEFAULT_ROUTING_ADMIN_REPORT_COOLDOWN,
+    );
+    workers.routing_event_reporter = Some(routing_event_reporter.clone());
     dispatcher_inspector.set_queue(Arc::clone(&dispatcher_queue));
     let restore_report = dispatcher_persistence
         .load_into_queue(&dispatcher_queue)
@@ -9881,119 +9947,106 @@ async fn start_runtime_workers(
     let mut shared_taskman_worker_counts = BTreeMap::new();
     shared_taskman_worker_counts.insert(openplotva_taskman::CONTROL_QUEUE_NAME.to_owned(), 1);
     if config.memory.enabled {
-        match (
-            memory_runtime::memory_extractor_from_app_config(config),
-            memory_runtime::memory_write_embedder_from_config(
-                &config.memory,
-                &config.llm.discovery.base_url,
-            ),
-        ) {
-            (Ok(_), Ok(memory_write_embedder)) => {
-                let memory_scheduler_store = memory_store.clone();
-                let memory_scheduler_queue = Arc::clone(&task_queue_for_updates);
-                let memory_scheduler_config =
-                    memory_runtime::memory_service_worker_config_from_memory_config(&config.memory);
-                let memory_scheduler_trigger = Arc::clone(&memory_restart_trigger);
-                let memory_scheduler_stop = stop.subscribe();
-                let memory_scheduler = tokio::spawn(async move {
-                    let report =
-                        memory_runtime::run_memory_consolidation_taskman_scheduler_with_trigger_until(
-                            &memory_scheduler_store,
-                            memory_scheduler_queue.as_ref(),
-                            memory_scheduler_config,
-                            memory_scheduler_trigger,
-                            wait_for_runtime_stop(memory_scheduler_stop),
-                        )
-                        .await;
+        let memory_write_embedder = Some(embedder::RoutedDiscoveryEmbedder::new(
+            routed_attempts::RoutedAttemptWalker::new(
+                Arc::clone(&router_handle),
+                Arc::clone(&router_breakers),
+                Arc::clone(&router_triggers),
+            )
+            .with_reporter(routing_event_reporter.clone()),
+            embedder::DiscoveryEmbedderConfig {
+                base_url: config.llm.discovery.base_url.clone(),
+                service_name: config.memory.embedder_service_name.clone(),
+                endpoint_name: config.memory.embedder_endpoint_name.clone(),
+                request_timeout: memory_runtime::EMBEDDER_DEFAULT_TIMEOUT,
+                task_timeout: memory_runtime::EMBEDDER_DEFAULT_TIMEOUT,
+                poll_interval: Duration::from_millis(100),
+                capacity_wait: Duration::from_secs(2),
+            },
+        ));
+        let memory_scheduler_store = memory_store.clone();
+        let memory_scheduler_queue = Arc::clone(&task_queue_for_updates);
+        let memory_scheduler_config =
+            memory_runtime::memory_service_worker_config_from_memory_config(&config.memory);
+        let memory_scheduler_trigger = Arc::clone(&memory_restart_trigger);
+        let memory_scheduler_stop = stop.subscribe();
+        let memory_scheduler = tokio::spawn(async move {
+            let report =
+                memory_runtime::run_memory_consolidation_taskman_scheduler_with_trigger_until(
+                    &memory_scheduler_store,
+                    memory_scheduler_queue.as_ref(),
+                    memory_scheduler_config,
+                    memory_scheduler_trigger,
+                    wait_for_runtime_stop(memory_scheduler_stop),
+                )
+                .await;
 
-                    tracing::info!(?report, "memory-consolidation taskman scheduler stopped");
-                });
-                workers.handles.push(memory_scheduler);
+            tracing::info!(?report, "memory-consolidation taskman scheduler stopped");
+        });
+        workers.handles.push(memory_scheduler);
 
-                let configured_memory_worker_count =
-                    config.persistent_queue.memory_consolidation_workers;
-                let memory_worker_count =
-                    effective_memory_consolidation_workers(configured_memory_worker_count);
-                if configured_memory_worker_count > memory_worker_count {
-                    tracing::warn!(
-                        configured_workers = configured_memory_worker_count,
-                        effective_workers = memory_worker_count,
-                        "memory-consolidation worker count clamped to one"
-                    );
-                }
-                for index in 0..memory_worker_count {
-                    let memory_worker_extractor =
-                        match memory_runtime::memory_extractor_from_app_config(config) {
-                            Ok(extractor) => extractor,
-                            Err(error) => {
-                                tracing::warn!(
-                                    %error,
-                                    index,
-                                    "memory extractor unavailable for memory-consolidation taskman worker"
-                                );
-                                break;
-                            }
-                        };
-                    let memory_worker_store = memory_store.clone();
-                    let memory_worker_embedder = memory_write_embedder.clone();
-                    let memory_worker_queue = Arc::clone(&task_queue_for_updates);
-                    let memory_worker_id = format!(
-                        "{}-{index}",
-                        memory_runtime::MEMORY_CONSOLIDATION_JOB_WORKER_PREFIX
-                    );
-                    let memory_worker_config =
-                        memory_runtime::MemoryConsolidationQueueWorkerConfig {
-                            process:
-                                memory_runtime::memory_service_worker_config_from_memory_config(
-                                    &config.memory,
-                                )
-                                .process,
-                            worker_id: memory_worker_id.clone(),
-                            interval: memory_runtime::MEMORY_CONSOLIDATION_JOB_POLL_INTERVAL,
-                        };
-                    let memory_worker_stop = stop.subscribe();
-                    let memory_worker = tokio::spawn(async move {
-                        let report = memory_runtime::run_memory_consolidation_taskman_worker_until(
-                            memory_worker_queue.as_ref(),
-                            &memory_worker_extractor,
-                            &memory_worker_store,
-                            memory_worker_embedder.as_ref(),
-                            memory_worker_config,
-                            wait_for_runtime_stop(memory_worker_stop),
-                        )
-                        .await;
-
-                        tracing::info!(?report, worker_id = %memory_worker_id, "memory-consolidation taskman worker stopped");
-                    });
-                    workers.handles.push(memory_worker);
-                }
-                readiness_checks.push(ReadinessCheck::ok(
-                    "memory_service",
-                    format!(
-                        "Memory service schedules memory-consolidation taskman jobs and starts {memory_worker_count} workers over SQLx persistence"
-                    ),
-                ));
-                workers.memory_restart_trigger = Some(Arc::clone(&memory_restart_trigger));
-                shared_taskman_worker_counts.insert(
-                    openplotva_taskman::MEMORY_CONSOLIDATION_QUEUE_NAME.to_owned(),
-                    memory_worker_count,
-                );
-            }
-            (Err(error), _) => {
-                tracing::warn!(%error, "memory extractor unavailable for memory-consolidation taskman worker");
-                readiness_checks.push(ReadinessCheck::skipped(
-                    "memory_service",
-                    format!("memory extractor unavailable: {error}"),
-                ));
-            }
-            (_, Err(error)) => {
-                tracing::warn!(%error, "memory embedder unavailable for memory-consolidation taskman worker");
-                readiness_checks.push(ReadinessCheck::skipped(
-                    "memory_service",
-                    format!("memory embedder unavailable: {error}"),
-                ));
-            }
+        let configured_memory_worker_count = config.persistent_queue.memory_consolidation_workers;
+        let memory_worker_count =
+            effective_memory_consolidation_workers(configured_memory_worker_count);
+        if configured_memory_worker_count > memory_worker_count {
+            tracing::warn!(
+                configured_workers = configured_memory_worker_count,
+                effective_workers = memory_worker_count,
+                "memory-consolidation worker count clamped to one"
+            );
         }
+        for index in 0..memory_worker_count {
+            let memory_worker_extractor = memory_runtime::routed_memory_extractor_from_app_config(
+                config,
+                routed_attempts::RoutedAttemptWalker::new(
+                    Arc::clone(&router_handle),
+                    Arc::clone(&router_breakers),
+                    Arc::clone(&router_triggers),
+                )
+                .with_reporter(routing_event_reporter.clone()),
+            );
+            let memory_worker_store = memory_store.clone();
+            let memory_worker_embedder = memory_write_embedder.clone();
+            let memory_worker_queue = Arc::clone(&task_queue_for_updates);
+            let memory_worker_id = format!(
+                "{}-{index}",
+                memory_runtime::MEMORY_CONSOLIDATION_JOB_WORKER_PREFIX
+            );
+            let memory_worker_config = memory_runtime::MemoryConsolidationQueueWorkerConfig {
+                process: memory_runtime::memory_service_worker_config_from_memory_config(
+                    &config.memory,
+                )
+                .process,
+                worker_id: memory_worker_id.clone(),
+                interval: memory_runtime::MEMORY_CONSOLIDATION_JOB_POLL_INTERVAL,
+            };
+            let memory_worker_stop = stop.subscribe();
+            let memory_worker = tokio::spawn(async move {
+                let report = memory_runtime::run_memory_consolidation_taskman_worker_until(
+                    memory_worker_queue.as_ref(),
+                    &memory_worker_extractor,
+                    &memory_worker_store,
+                    memory_worker_embedder.as_ref(),
+                    memory_worker_config,
+                    wait_for_runtime_stop(memory_worker_stop),
+                )
+                .await;
+
+                tracing::info!(?report, worker_id = %memory_worker_id, "memory-consolidation taskman worker stopped");
+            });
+            workers.handles.push(memory_worker);
+        }
+        readiness_checks.push(ReadinessCheck::ok(
+            "memory_service",
+            format!(
+                "Memory service schedules memory-consolidation taskman jobs and starts {memory_worker_count} routed workers over SQLx persistence"
+            ),
+        ));
+        workers.memory_restart_trigger = Some(Arc::clone(&memory_restart_trigger));
+        shared_taskman_worker_counts.insert(
+            openplotva_taskman::MEMORY_CONSOLIDATION_QUEUE_NAME.to_owned(),
+            memory_worker_count,
+        );
     }
     let payment_store_for_updates = Arc::new(payment_store.clone());
     let vip_status_for_updates = Arc::new(payments::VipStatusWithExternalMembership::new(
@@ -10054,12 +10107,7 @@ async fn start_runtime_workers(
     readiness_checks.push(ReadinessCheck::ok("control_jobs", control_queue_readiness));
     workers.handles.push(control_worker);
 
-    let music_client_result = config.music.acestep.enabled.then(|| {
-        openplotva_media::acestep::AceStepClient::new(music_jobs::acestep_config_from_app_config(
-            config,
-        ))
-    });
-    let music_service_available = matches!(music_client_result.as_ref(), Some(Ok(_)));
+    let music_service_available = config.music.acestep.enabled;
     let dialog_tool_adapter = Arc::new(
         dialog_tools::TaskmanDialogToolAdapter::new(Arc::clone(&task_queue_for_updates))
             .with_queue_position_rich(Arc::clone(&rich_sender))
@@ -10085,7 +10133,13 @@ async fn start_runtime_workers(
     let dialog_tool_vision = Arc::new(
         vision::TelegramVisionDescriber::new(
             PostgresTelegramFileStore::new(service_clients.postgres.clone()),
-            vision::AifarmVisionCaptioner::new(
+            vision::RoutedVisionCaptioner::new(
+                routed_attempts::RoutedAttemptWalker::new(
+                    Arc::clone(&router_handle),
+                    Arc::clone(&router_breakers),
+                    Arc::clone(&router_triggers),
+                )
+                .with_reporter(routing_event_reporter.clone()),
                 vision::aifarm_vision_captioner_config_from_app_config(config),
                 vision_data_urls.clone(),
             ),
@@ -10096,7 +10150,13 @@ async fn start_runtime_workers(
     let dialog_context_vision = Arc::new(vision::TelegramDialogVisionInputMaterializer::new(
         vision::TelegramVisionDescriber::new(
             PostgresTelegramFileStore::new(service_clients.postgres.clone()),
-            vision::AifarmVisionCaptioner::new(
+            vision::RoutedVisionCaptioner::new(
+                routed_attempts::RoutedAttemptWalker::new(
+                    Arc::clone(&router_handle),
+                    Arc::clone(&router_breakers),
+                    Arc::clone(&router_triggers),
+                )
+                .with_reporter(routing_event_reporter.clone()),
                 vision::aifarm_vision_captioner_config_from_app_config(config),
                 vision_data_urls.clone(),
             ),
@@ -10112,26 +10172,22 @@ async fn start_runtime_workers(
     );
     let rates_tool_dispatcher =
         Arc::new(rates::RatesToolRichEffects::new(Arc::clone(&rich_sender)));
-    let history_summarizer = match history_summary::history_summary_service_from_app_config(
-        config,
-        Arc::new(history_store.clone()),
-    ) {
-        Ok(service) => {
-            readiness_checks.push(ReadinessCheck::ok(
-                "history_summary",
-                "Chat history summary dialog tool wired to Postgres history store and configured provider",
-            ));
-            Some(Arc::new(service) as Arc<dyn dialog_tools::ChatHistorySummarizer>)
-        }
-        Err(error) => {
-            tracing::warn!(%error, "history summary service unavailable for dialog toolbox");
-            readiness_checks.push(ReadinessCheck::skipped(
-                "history_summary",
-                format!("history summary service unavailable: {error}"),
-            ));
-            None
-        }
-    };
+    let history_summarizer = Some(Arc::new(
+        history_summary::routed_history_summary_service_from_app_config(
+            config,
+            Arc::new(history_store.clone()),
+            routed_attempts::RoutedAttemptWalker::new(
+                Arc::clone(&router_handle),
+                Arc::clone(&router_breakers),
+                Arc::clone(&router_triggers),
+            )
+            .with_reporter(routing_event_reporter.clone()),
+        ),
+    ) as Arc<dyn dialog_tools::ChatHistorySummarizer>);
+    readiness_checks.push(ReadinessCheck::ok(
+        "history_summary",
+        "Chat history summary dialog tool wired to Postgres history store and routed provider",
+    ));
     let youtube_summarizer = match youtube::RuntimeYouTubeSummarizer::from_app_config(config) {
         Ok(Some(summarizer)) => {
             let provider = summarizer.provider_label();
@@ -10184,7 +10240,15 @@ async fn start_runtime_workers(
     // Build the search-agent machinery once (registry + settings), if enabled and
     // the configured reasoner/writer providers resolve.
     let agentic_search_setup = if config.llm.agentic.search.enabled {
-        let registry = agent_runtime::build_agent_provider_registry(config);
+        let registry = agent_runtime::build_routed_agent_provider_registry(
+            config,
+            routed_attempts::RoutedAttemptWalker::new(
+                Arc::clone(&router_handle),
+                Arc::clone(&router_breakers),
+                Arc::clone(&router_triggers),
+            )
+            .with_reporter(routing_event_reporter.clone()),
+        );
         let settings = agent_runtime::SearchAgentSettings::from_app_config(
             config,
             agent_runtime::SEARCH_SYSTEM_PROMPT.to_owned(),
@@ -10305,55 +10369,42 @@ async fn start_runtime_workers(
             }
         }
     }
+    let embedding_attempt_walker = routed_attempts::RoutedAttemptWalker::new(
+        Arc::clone(&router_handle),
+        Arc::clone(&router_breakers),
+        Arc::clone(&router_triggers),
+    )
+    .with_reporter(routing_event_reporter.clone());
     let memory_query_embedder = if dialog_memory_context_enabled(config) {
-        memory_runtime::memory_retrieval_embedder_from_config(
-            &config.memory,
-            &config.llm.discovery.base_url,
-        )?
-        .map(|client| Arc::new(client) as Arc<dyn memory_runtime::EmbeddingProvider>)
+        Some(Arc::new(embedder::RoutedDiscoveryEmbedder::new(
+            embedding_attempt_walker.clone(),
+            embedder::DiscoveryEmbedderConfig {
+                base_url: config.llm.discovery.base_url.clone(),
+                service_name: config.memory.embedder_service_name.clone(),
+                endpoint_name: config.memory.embedder_endpoint_name.clone(),
+                request_timeout: memory_runtime::MEMORY_RETRIEVAL_EMBEDDING_TIMEOUT,
+                task_timeout: memory_runtime::MEMORY_RETRIEVAL_EMBEDDING_TIMEOUT,
+                poll_interval: Duration::from_millis(100),
+                capacity_wait: Duration::from_secs(2),
+            },
+        )) as Arc<dyn memory_runtime::EmbeddingProvider>)
     } else {
         None
     };
-    let shield_query_embedder = memory_runtime::shield_embedder_from_config(
-        &config.shield,
-        &config.llm.discovery.base_url,
-    )?
-    .map(|client| Arc::new(client) as Arc<dyn memory_runtime::EmbeddingProvider>);
-    // DB-backed dialog routing: seed the tables from env on first boot, load the
-    // routing table, and publish it behind an ArcSwap. The trigger poller keeps the
-    // queue-depth/error-rate/time-of-day engagement state current, replacing the
-    // hardcoded dialog-aifarm watermark gate.
-    let router_breakers = Arc::new(openplotva_llm::router::BreakerSet::new());
-    let router_triggers = Arc::new(openplotva_llm::router::TriggerState::new());
-    if let Err(error) =
-        model_routing::seed_routing_from_env(&service_clients.postgres, config).await
-    {
-        tracing::warn!(%error, "failed to seed LLM routing tables; continuing with existing rows");
-    }
-    if let Err(error) =
-        model_routing::backfill_pool_from_env(&service_clients.postgres, config).await
-    {
-        tracing::warn!(%error, "failed to backfill AI Farm pool into routing tables");
-    }
-    if let Err(error) = model_routing::backfill_gpu_models(&service_clients.postgres, config).await
-    {
-        tracing::warn!(%error, "failed to backfill GPU Qwen models into routing tables");
-    }
-    if let Err(error) =
-        model_routing::backfill_genkit_flash_model(&service_clients.postgres, config).await
-    {
-        tracing::warn!(%error, "failed to correct genkit dialog fallback model");
-    }
-    let router_handle = match model_routing::load_routing_table(&service_clients.postgres).await {
-        Ok(table) => openplotva_llm::router::RouterHandle::new(table),
-        Err(error) => {
-            tracing::warn!(%error, "failed to load LLM routing table; starting with an empty table");
-            openplotva_llm::router::RouterHandle::new(
-                openplotva_llm::router::RoutingTable::default(),
-            )
-        }
-    };
-    workers.router_handle = Some(Arc::clone(&router_handle));
+    let shield_query_timeout =
+        Duration::from_secs(config.shield.retrieval_timeout_seconds.max(1) as u64);
+    let shield_query_embedder = Some(Arc::new(embedder::RoutedDiscoveryEmbedder::new(
+        embedding_attempt_walker,
+        embedder::DiscoveryEmbedderConfig {
+            base_url: config.llm.discovery.base_url.clone(),
+            service_name: config.shield.embedder_service_name.clone(),
+            endpoint_name: config.shield.embedder_endpoint_name.clone(),
+            request_timeout: shield_query_timeout,
+            task_timeout: shield_query_timeout,
+            poll_interval: Duration::from_millis(100),
+            capacity_wait: Duration::from_secs(2),
+        },
+    )) as Arc<dyn memory_runtime::EmbeddingProvider>);
     {
         let poller_handle = Arc::clone(&router_handle);
         let poller_triggers = Arc::clone(&router_triggers);
@@ -10390,6 +10441,7 @@ async fn start_runtime_workers(
         Arc::clone(&router_breakers),
         Arc::clone(&router_triggers),
         genkit_fallback,
+        Some(routing_event_reporter.clone()),
     )) {
         Ok(mut dialog_provider) => {
             if dialog_runtime::white_circle_effective_enabled(config) {
@@ -10452,23 +10504,15 @@ async fn start_runtime_workers(
                 dialog_materializer.with_vision_materializer(dialog_context_vision);
             let dialog_tool_history = history_store.clone();
             let dialog_max_llm_job_attempts = config.persistent_queue.llm_job_max_attempts;
-            let dialog_worker_plan = dialog_aifarm_worker_plan(
-                config.persistent_queue.dialog_aifarm_workers,
-                config.persistent_queue.dialog_aifarm_fallback_workers,
-                openplotva_llm::aifarm::pool_enabled(),
-            );
-            for index in 0..dialog_worker_plan.primary_workers {
+            let dialog_worker_count = config.persistent_queue.dialog_aifarm_workers.max(0);
+            for index in 0..dialog_worker_count {
                 let worker_queue = Arc::clone(&task_queue_for_updates);
                 let worker_provider = Arc::clone(&dialog_provider);
                 let worker_effects = dialog_effects.clone();
                 let worker_materializer = dialog_materializer.clone();
                 let worker_tool_history = dialog_tool_history.clone();
+                let worker_routing_events = routing_event_reporter.clone();
                 let worker_stop = stop.subscribe();
-                let queue_names: &'static [&'static str] = if index == 0 {
-                    &dialog_jobs::DIALOG_JOB_WORKER_QUEUES
-                } else {
-                    &dialog_jobs::DIALOG_AIFARM_ONLY_WORKER_QUEUES
-                };
                 let dialog_worker = tokio::spawn(async move {
                     let report =
                         dialog_jobs::run_dialog_job_worker_with_materializer_and_history_every_until(
@@ -10478,7 +10522,8 @@ async fn start_runtime_workers(
                             dialog_jobs::DialogJobWorkerLoopOptions {
                                 materializer: &worker_materializer,
                                 tool_history: &worker_tool_history,
-                                queue_names,
+                                routing_events: Some(&worker_routing_events),
+                                queue_names: &dialog_jobs::DIALOG_JOB_WORKER_QUEUES,
                                 interval: dialog_jobs::DIALOG_JOB_POLL_INTERVAL,
                                 max_llm_job_attempts: dialog_max_llm_job_attempts,
                             },
@@ -10493,66 +10538,19 @@ async fn start_runtime_workers(
             readiness_checks.push(ReadinessCheck::ok(
                 "dialog_jobs",
                 format!(
-                    "Started {} primary dialog taskman workers with storage-backed input materialization",
-                    dialog_worker_plan.primary_workers
+                    "Started {} routed dialog taskman workers with storage-backed input materialization",
+                    dialog_worker_count
                 ),
             ));
-            if dialog_worker_plan.primary_workers > 0 {
-                shared_taskman_worker_counts
-                    .insert(openplotva_taskman::TEXT_QUEUE_NAME.to_owned(), 1);
+            if dialog_worker_count > 0 {
+                shared_taskman_worker_counts.insert(
+                    openplotva_taskman::TEXT_QUEUE_NAME.to_owned(),
+                    dialog_worker_count,
+                );
                 shared_taskman_worker_counts.insert(
                     openplotva_taskman::DIALOG_AIFARM_QUEUE_NAME.to_owned(),
-                    dialog_worker_plan.primary_workers,
+                    dialog_worker_count,
                 );
-            }
-
-            if dialog_worker_plan.overflow_workers > 0 {
-                let overflow_interval = Duration::from_secs(
-                    config
-                        .persistent_queue
-                        .dialog_aifarm_fallback_poll_interval_seconds
-                        .max(1) as u64,
-                );
-                let overflow_min_pending_depth = dialog_worker_plan.primary_workers.max(1) as usize;
-                for index in 0..dialog_worker_plan.overflow_workers {
-                    let overflow_queue = Arc::clone(&task_queue_for_updates);
-                    let overflow_provider = Arc::clone(&dialog_provider);
-                    let overflow_effects = dialog_effects.clone();
-                    let overflow_materializer = dialog_materializer.clone();
-                    let overflow_tool_history = dialog_tool_history.clone();
-                    let overflow_stop = stop.subscribe();
-                    let overflow_worker = tokio::spawn(async move {
-                        let report =
-                            dialog_jobs::run_dialog_aifarm_overflow_worker_with_materializer_and_history_until_with_max_attempts(
-                                overflow_queue.as_ref(),
-                                overflow_provider.as_ref(),
-                                &overflow_effects,
-                                dialog_jobs::DialogAifarmOverflowWorkerOptions {
-                                    materializer: &overflow_materializer,
-                                    tool_history: &overflow_tool_history,
-                                    min_pending_depth: overflow_min_pending_depth,
-                                    interval: overflow_interval,
-                                    max_llm_job_attempts: dialog_max_llm_job_attempts,
-                                },
-                                wait_for_runtime_stop(overflow_stop),
-                            )
-                            .await;
-
-                        tracing::info!(?report, index, "dialog-aifarm overflow worker stopped");
-                    });
-                    workers.handles.push(overflow_worker);
-                }
-                readiness_checks.push(ReadinessCheck::ok(
-                    "dialog_aifarm_overflow_jobs",
-                    format!(
-                        "Started {} dialog-aifarm overflow workers gated by aifarm pool",
-                        dialog_worker_plan.overflow_workers
-                    ),
-                ));
-                shared_taskman_worker_counts
-                    .entry(openplotva_taskman::DIALOG_AIFARM_QUEUE_NAME.to_owned())
-                    .and_modify(|count| *count += dialog_worker_plan.overflow_workers)
-                    .or_insert(dialog_worker_plan.overflow_workers);
             }
         }
         Err(error) => {
@@ -10564,9 +10562,18 @@ async fn start_runtime_workers(
         }
     }
 
-    let media_prompt_optimizer = media::MediaPromptOptimizerService::new(
-        media::media_prompt_optimizer_from_app_config(config),
-    );
+    let media_prompt_optimizer = media::MediaPromptOptimizerService::new(Some(Arc::new(
+        media::RoutedMediaPromptOptimizer::new(
+            routed_attempts::RoutedAttemptWalker::new(
+                Arc::clone(&router_handle),
+                Arc::clone(&router_breakers),
+                Arc::clone(&router_triggers),
+            )
+            .with_reporter(routing_event_reporter.clone()),
+            config,
+        ),
+    )
+        as media::AppMediaPromptOptimizer));
     let media_max_llm_job_attempts = config.persistent_queue.llm_job_max_attempts;
 
     // Drawing-prompt agent: refine the draw prompt with the user's memory and chat
@@ -10579,7 +10586,15 @@ async fn start_runtime_workers(
         agent_runtime::IMAGE_SYSTEM_PROMPT.to_owned(),
     );
     let (image_agent_reasoner, image_agent_tools) = if image_agent_settings.enabled {
-        let registry = agent_runtime::build_agent_provider_registry(config);
+        let registry = agent_runtime::build_routed_agent_provider_registry(
+            config,
+            routed_attempts::RoutedAttemptWalker::new(
+                Arc::clone(&router_handle),
+                Arc::clone(&router_breakers),
+                Arc::clone(&router_triggers),
+            )
+            .with_reporter(routing_event_reporter.clone()),
+        );
         let reasoner = registry.get(&image_agent_settings.reasoner_provider);
         let history: Arc<dyn agent_runtime::HistorySearcher> = Arc::new(
             agent_runtime::PostgresHistorySearch::new(history_store.clone()),
@@ -10616,17 +10631,21 @@ async fn start_runtime_workers(
         ));
     }
     let vip_image_queue = Arc::clone(&task_queue_for_updates);
-    let vip_draw_api_config = image_jobs::aifarm_draw_api_config_from_app_config(config);
+    let image_attempt_walker = routed_attempts::RoutedAttemptWalker::new(
+        Arc::clone(&router_handle),
+        Arc::clone(&router_breakers),
+        Arc::clone(&router_triggers),
+    )
+    .with_reporter(routing_event_reporter.clone());
+    let routed_vip_image_generator = image_jobs::RoutedImageGenerator::new(
+        image_attempt_walker.clone(),
+        image_jobs::pruna_config_from_app_config(config),
+        image_jobs::aifarm_draw_api_config_from_app_config(config),
+    );
     let vip_image_generator = image_jobs::OptimizingImageGenerator::new(
         image_jobs::SequentialImageGenerator::new(
-            image_jobs::FallbackImageGenerator::new(
-                image_jobs::PrunaImageGenerator::new(image_jobs::pruna_config_from_app_config(
-                    config,
-                ))
-                .map_err(|error| anyhow::anyhow!("build Pruna image generator: {error:?}"))?,
-                image_jobs::AifarmDrawApiImageGenerator::new(vip_draw_api_config.clone()),
-            ),
-            image_jobs::AifarmDrawApiImageGenerator::new(vip_draw_api_config),
+            routed_vip_image_generator.clone(),
+            routed_vip_image_generator,
         ),
         media_prompt_optimizer.clone(),
     );
@@ -10660,11 +10679,10 @@ async fn start_runtime_workers(
 
     let vip_image_edit_queue = Arc::clone(&task_queue_for_updates);
     let vip_image_edit_provider = image_jobs::OptimizingImageEditor::new(
-        image_jobs::ResolvingImageEditor::new(
+        image_jobs::RoutedImageEditor::new(
+            image_attempt_walker.clone(),
             vision_data_urls.clone(),
-            image_jobs::AifarmDrawApiImageGenerator::new(
-                image_jobs::aifarm_draw_api_config_from_app_config(config),
-            ),
+            image_jobs::aifarm_draw_api_config_from_app_config(config),
         ),
         media_prompt_optimizer.clone(),
     );
@@ -10690,7 +10708,9 @@ async fn start_runtime_workers(
 
     let regular_image_queue = Arc::clone(&task_queue_for_updates);
     let regular_image_generator = image_jobs::OptimizingImageGenerator::new(
-        image_jobs::AifarmDrawApiImageGenerator::new(
+        image_jobs::RoutedImageGenerator::new(
+            image_attempt_walker,
+            image_jobs::pruna_config_from_app_config(config),
             image_jobs::aifarm_draw_api_config_from_app_config(config),
         ),
         media_prompt_optimizer,
@@ -10736,105 +10756,105 @@ async fn start_runtime_workers(
             .and_modify(|count| *count += 1)
             .or_insert(1);
     }
-    if let Some(music_client_result) = music_client_result {
-        match music_client_result {
-            Ok(acestep_client) => {
-                let music_queue = Arc::clone(&task_queue_for_updates);
-                let aifarm_song_prompt_generator =
-                    media::aifarm_media_prompt_optimizer_from_app_config(config);
-                let music_song_prompt_generator: Arc<
-                    dyn music_jobs::SongPromptGenerator + Send + Sync,
-                > = match media::gemini_media_prompt_optimizer_from_app_config(config) {
-                    Some(gemini_song_prompt_generator) => {
-                        Arc::new(music_jobs::FallbackSongPromptGenerator::go_aifarm_gemini(
-                            aifarm_song_prompt_generator,
-                            gemini_song_prompt_generator,
-                        ))
-                    }
-                    None => Arc::new(aifarm_song_prompt_generator),
-                };
-                let base_song_material: Arc<dyn music_jobs::SongMaterialProvider + Send + Sync> =
-                    Arc::new(music_jobs::AifarmSongMaterialProvider::new(
-                        music_song_prompt_generator,
-                        PostgresVirtualMessageStore::new(service_clients.postgres.clone()),
-                    ));
-                let song_agent_settings = agent_runtime::SongAgentSettings::from_app_config(
-                    config,
-                    agent_runtime::SONG_SYSTEM_PROMPT.to_owned(),
-                );
-                let (song_agent_reasoner, song_agent_tools) = if song_agent_settings.enabled {
-                    let registry = agent_runtime::build_agent_provider_registry(config);
-                    let reasoner = registry.get(&song_agent_settings.reasoner_provider);
-                    let tools: Option<Arc<dyn openplotva_agent::AgentTools>> =
-                        serper_client.as_ref().map(|serper| {
-                            let web: Arc<dyn dialog_tools::WebSearchProvider> = serper.clone();
-                            let crawl: Arc<dyn dialog_tools::UrlCrawler> = serper.clone();
-                            let history: Arc<dyn agent_runtime::HistorySearcher> = Arc::new(
-                                agent_runtime::PostgresHistorySearch::new(history_store.clone()),
-                            );
-                            let memory: Arc<dyn agent_runtime::MemorySearcher> = Arc::new(
-                                agent_runtime::PostgresMemorySearch::new(memory_store.clone()),
-                            );
-                            Arc::new(
-                                agent_runtime::AppAgentTools::new(web, crawl)
-                                    .with_history_searcher(history)
-                                    .with_memory_searcher(memory),
-                            ) as Arc<dyn openplotva_agent::AgentTools>
-                        });
-                    (reasoner, tools)
-                } else {
-                    (None, None)
-                };
-                let music_material_provider = agent_runtime::SongAgentMaterialProvider::new(
-                    song_agent_reasoner,
-                    song_agent_settings,
-                    song_agent_tools,
-                    base_song_material,
-                );
-                let music_generator = music_jobs::AceStepMusicGenerator::new(
-                    acestep_client,
-                    config.music.acestep.audio_format.clone(),
-                );
-                let music_effects = music_jobs::TelegramMusicJobEffects::new(
-                    Arc::clone(&permission_policy),
-                    PostgresTelegramFileStore::new(service_clients.postgres.clone()),
-                    telegram.clone(),
-                    Arc::clone(&rich_sender),
-                );
-                let music_stop = stop.subscribe();
-                let music_worker = tokio::spawn(async move {
-                    let report = music_jobs::run_music_worker_every_until_with_max_attempts(
-                        music_queue.as_ref(),
-                        &music_material_provider,
-                        &music_generator,
-                        &music_effects,
-                        music_jobs::MUSIC_JOB_POLL_INTERVAL,
-                        media_max_llm_job_attempts,
-                        wait_for_runtime_stop(music_stop),
-                    )
-                    .await;
-
-                    tracing::info!(?report, "music generation taskman worker stopped");
+    if config.music.acestep.enabled {
+        let music_queue = Arc::clone(&task_queue_for_updates);
+        let music_song_prompt_generator: Arc<dyn music_jobs::SongPromptGenerator + Send + Sync> =
+            Arc::new(music_jobs::RoutedSongPromptGenerator::new(
+                routed_attempts::RoutedAttemptWalker::new(
+                    Arc::clone(&router_handle),
+                    Arc::clone(&router_breakers),
+                    Arc::clone(&router_triggers),
+                )
+                .with_reporter(routing_event_reporter.clone()),
+                config,
+            ));
+        let base_song_material: Arc<dyn music_jobs::SongMaterialProvider + Send + Sync> =
+            Arc::new(music_jobs::AifarmSongMaterialProvider::new(
+                music_song_prompt_generator,
+                PostgresVirtualMessageStore::new(service_clients.postgres.clone()),
+            ));
+        let song_agent_settings = agent_runtime::SongAgentSettings::from_app_config(
+            config,
+            agent_runtime::SONG_SYSTEM_PROMPT.to_owned(),
+        );
+        let (song_agent_reasoner, song_agent_tools) = if song_agent_settings.enabled {
+            let registry = agent_runtime::build_routed_agent_provider_registry(
+                config,
+                routed_attempts::RoutedAttemptWalker::new(
+                    Arc::clone(&router_handle),
+                    Arc::clone(&router_breakers),
+                    Arc::clone(&router_triggers),
+                )
+                .with_reporter(routing_event_reporter.clone()),
+            );
+            let reasoner = registry.get(&song_agent_settings.reasoner_provider);
+            let tools: Option<Arc<dyn openplotva_agent::AgentTools>> =
+                serper_client.as_ref().map(|serper| {
+                    let web: Arc<dyn dialog_tools::WebSearchProvider> = serper.clone();
+                    let crawl: Arc<dyn dialog_tools::UrlCrawler> = serper.clone();
+                    let history: Arc<dyn agent_runtime::HistorySearcher> = Arc::new(
+                        agent_runtime::PostgresHistorySearch::new(history_store.clone()),
+                    );
+                    let memory: Arc<dyn agent_runtime::MemorySearcher> = Arc::new(
+                        agent_runtime::PostgresMemorySearch::new(memory_store.clone()),
+                    );
+                    Arc::new(
+                        agent_runtime::AppAgentTools::new(web, crawl)
+                            .with_history_searcher(history)
+                            .with_memory_searcher(memory),
+                    ) as Arc<dyn openplotva_agent::AgentTools>
                 });
-                workers.handles.push(music_worker);
-                readiness_checks.push(ReadinessCheck::ok(
+            (reasoner, tools)
+        } else {
+            (None, None)
+        };
+        let music_material_provider = agent_runtime::SongAgentMaterialProvider::new(
+            song_agent_reasoner,
+            song_agent_settings,
+            song_agent_tools,
+            base_song_material,
+        );
+        let music_attempt_walker = routed_attempts::RoutedAttemptWalker::new(
+            Arc::clone(&router_handle),
+            Arc::clone(&router_breakers),
+            Arc::clone(&router_triggers),
+        )
+        .with_reporter(routing_event_reporter.clone());
+        let music_generator = music_jobs::RoutedMusicGenerator::new(
+            music_attempt_walker,
+            music_jobs::acestep_config_from_app_config(config),
+        );
+        let music_effects = music_jobs::TelegramMusicJobEffects::new(
+            Arc::clone(&permission_policy),
+            PostgresTelegramFileStore::new(service_clients.postgres.clone()),
+            telegram.clone(),
+            Arc::clone(&rich_sender),
+        );
+        let music_stop = stop.subscribe();
+        let music_worker = tokio::spawn(async move {
+            let report = music_jobs::run_music_worker_every_until_with_max_attempts(
+                music_queue.as_ref(),
+                &music_material_provider,
+                &music_generator,
+                &music_effects,
+                music_jobs::MUSIC_JOB_POLL_INTERVAL,
+                media_max_llm_job_attempts,
+                wait_for_runtime_stop(music_stop),
+            )
+            .await;
+
+            tracing::info!(?report, "music generation taskman worker stopped");
+        });
+        workers.handles.push(music_worker);
+        readiness_checks.push(ReadinessCheck::ok(
                     "music_jobs",
-                    "Music taskman worker started for music-vip queue with AIFarm song reprompt, optional Gemini fallback, and ACE-Step provider",
+                    "Music taskman worker started for music-vip queue with routed song reprompt and routed ACE-Step provider",
                 ));
-                for queue_name in music_jobs::MUSIC_JOB_WORKER_QUEUES {
-                    shared_taskman_worker_counts
-                        .entry(queue_name.to_owned())
-                        .and_modify(|count| *count += 1)
-                        .or_insert(1);
-                }
-            }
-            Err(error) => {
-                tracing::warn!(%error, "ACE-Step client unavailable for music taskman worker");
-                readiness_checks.push(ReadinessCheck::skipped(
-                    "music_jobs",
-                    format!("ACE-Step client unavailable: {error}"),
-                ));
-            }
+        for queue_name in music_jobs::MUSIC_JOB_WORKER_QUEUES {
+            shared_taskman_worker_counts
+                .entry(queue_name.to_owned())
+                .and_modify(|count| *count += 1)
+                .or_insert(1);
         }
     } else {
         readiness_checks.push(ReadinessCheck::skipped(
@@ -11539,8 +11559,12 @@ async fn shutdown_runtime_workers(workers: RuntimeWorkers) {
         taskman_inspector: _,
         memory_restart_trigger: _,
         llm_trace_buffer: _,
+        routing_event_buffer: _,
+        routing_event_reporter: _,
         runtime_api_tls_public_key_pin: _,
         router_handle: _,
+        router_breakers: _,
+        router_triggers: _,
     } = workers;
 
     if let Some(stop) = stop {
@@ -12067,8 +12091,8 @@ mod tests {
     use super::{
         AdminMemoryOverride, GO_ADMIN_API_ROUTE_PATTERNS, GO_DISPATCHER_DEBOUNCE_CACHE_SIZE,
         GO_DISPATCHER_DEBOUNCE_WINDOW, GO_DISPATCHER_MAX_QUEUE_SIZE, RuntimeUnhandledUpdateHandler,
-        SettingsInitDataDecision, WebhookShutdownCleanupReport, admin_aifarm_pool_toggle_response,
-        admin_auth_check, admin_auth_date_is_fresh, admin_auth_query_values, admin_auth_response,
+        SettingsInitDataDecision, WebhookShutdownCleanupReport, admin_auth_check,
+        admin_auth_date_is_fresh, admin_auth_query_values, admin_auth_response,
         admin_auth_user_state, admin_bootstrap, admin_chat_get_response,
         admin_chats_search_by_member_response, admin_i64_from_json,
         admin_llm_analytics_summary_json, admin_llm_requests_clear_response,
@@ -12087,14 +12111,13 @@ mod tests {
         authenticate_settings_init_data, build_deputy_display_name, chat_list_title,
         chat_member_can_manage_settings, chat_member_record_from_upsert,
         configure_telegram_bot_commands, current_unix_timestamp,
-        delete_webhook_on_shutdown_if_enabled, dialog_aifarm_worker_plan,
-        dialog_memory_context_enabled, effective_memory_consolidation_workers, found,
-        go_dispatcher_config, new_settings_response, normalize_deputy_ids,
-        parse_admin_non_negative_i32, parse_admin_optional_bool, parse_admin_positive_i32,
-        parse_deputy_candidates_limit, parse_deputy_update_request, parse_memory_limit,
-        parse_optional_i32, parse_settings_get_access, parse_settings_memory_access,
-        parse_settings_update_request, parse_shield_limit,
-        run_long_poll_update_producer_after_delete_webhook,
+        delete_webhook_on_shutdown_if_enabled, dialog_memory_context_enabled,
+        effective_memory_consolidation_workers, found, go_dispatcher_config, new_settings_response,
+        normalize_deputy_ids, parse_admin_non_negative_i32, parse_admin_optional_bool,
+        parse_admin_positive_i32, parse_deputy_candidates_limit, parse_deputy_update_request,
+        parse_memory_limit, parse_optional_i32, parse_settings_get_access,
+        parse_settings_memory_access, parse_settings_update_request, parse_shield_limit,
+        routing_json_config_patch, run_long_poll_update_producer_after_delete_webhook,
         run_webhook_update_producer_after_set_webhook, runtime_api_graphql_snapshot,
         runtime_redis_prefix_groups_from_keys, runtime_redis_value_from_bytes,
         send_dispatcher_work_item_with_transport, settings_chat_display,
@@ -12109,8 +12132,6 @@ mod tests {
     use crate::rate_limits::{ChatRateLimitPolicy, RateLimitStore, RateLimitStoreFuture};
     use crate::updates::UpdateHandler;
     use crate::virtual_messages::VirtualMessageStore;
-
-    static AIFARM_POOL_SETTINGS_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[test]
     fn go_dispatcher_config_matches_server_runtime_defaults() {
@@ -12129,6 +12150,26 @@ mod tests {
     }
 
     #[test]
+    fn routing_config_patch_accepts_object_only() {
+        let patch = routing_json_config_patch(&json!({
+            "config": {
+                "temperature": 0.2,
+                "enable_thinking": false
+            }
+        }))
+        .expect("config patch");
+
+        assert_eq!(patch["temperature"], json!(0.2));
+        assert_eq!(patch["enable_thinking"], json!(false));
+    }
+
+    #[test]
+    fn routing_config_patch_rejects_non_object_payloads() {
+        assert!(routing_json_config_patch(&json!({"config": ["bad"]})).is_err());
+        assert!(routing_json_config_patch(&json!({})).is_err());
+    }
+
+    #[test]
     fn dialog_memory_runtime_wiring_follows_go_memory_service_gate() -> Result<(), Box<dyn Error>> {
         let disabled = openplotva_config::AppConfig::from_raw(openplotva_config::RawConfig {
             memory_enabled: Some("false".to_owned()),
@@ -12142,19 +12183,6 @@ mod tests {
         assert!(!dialog_memory_context_enabled(&disabled));
         assert!(dialog_memory_context_enabled(&enabled));
         Ok(())
-    }
-
-    #[test]
-    fn dialog_aifarm_worker_plan_enables_overflow_only_when_pool_is_enabled() {
-        let disabled = dialog_aifarm_worker_plan(2, 2, false);
-        assert_eq!(disabled.primary_workers, 2);
-        assert_eq!(disabled.overflow_workers, 0);
-        assert_eq!(disabled.total_workers, 2);
-
-        let enabled = dialog_aifarm_worker_plan(2, 2, true);
-        assert_eq!(enabled.primary_workers, 2);
-        assert_eq!(enabled.overflow_workers, 2);
-        assert_eq!(enabled.total_workers, 4);
     }
 
     #[test]
@@ -12806,9 +12834,6 @@ mod tests {
     #[tokio::test]
     async fn admin_state_matches_go_json_shape_without_live_services() -> Result<(), Box<dyn Error>>
     {
-        let _guard = AIFARM_POOL_SETTINGS_LOCK.lock().await;
-        openplotva_llm::aifarm::set_pool_enabled(true);
-        openplotva_llm::aifarm::set_pool_reasoning_enabled(false);
         let routes = static_web_routes(vec![7], "123:ABC", "https://plotva.example", "", None);
         let response = admin_state_response(&routes).await;
 
@@ -12822,8 +12847,6 @@ mod tests {
         assert_eq!(value["queue"]["dedupedTotal"], 0);
         assert_eq!(value["cache"]["Size"], 0);
         assert_eq!(value["planner"]["Capacity"], 0);
-        assert_eq!(value["aifarm_pool_enabled"], true);
-        assert_eq!(value["aifarm_pool_reasoning_enabled"], false);
         Ok(())
     }
 
@@ -12880,74 +12903,6 @@ mod tests {
         let response =
             admin_loglevel_response(&routes, Method::POST, &headers, br#"{"level":"trace"}"#).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn admin_aifarm_pool_toggles_match_go_auth_and_body_contract()
-    -> Result<(), Box<dyn Error>> {
-        let _guard = AIFARM_POOL_SETTINGS_LOCK.lock().await;
-        openplotva_llm::aifarm::set_pool_enabled(true);
-        openplotva_llm::aifarm::set_pool_reasoning_enabled(false);
-        let routes = static_web_routes(vec![7], "123:ABC", "https://plotva.example", "", None);
-        let mut headers = HeaderMap::new();
-        {
-            let signed = openplotva_web::admin_session_cookie(7, "123:ABC");
-            let value = signed.split(';').next().expect("cookie pair");
-            headers.insert(header::COOKIE, value.parse()?);
-        }
-
-        let response = admin_aifarm_pool_toggle_response(
-            &routes,
-            Method::POST,
-            &headers,
-            br#"{"enabled":false}"#,
-            "aifarm.pool.enabled",
-            openplotva_llm::aifarm::set_pool_enabled,
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), usize::MAX).await?;
-        let value: serde_json::Value = serde_json::from_slice(&body)?;
-        assert_eq!(value, json!({ "ok": true, "enabled": false }));
-        assert!(!openplotva_llm::aifarm::pool_enabled());
-
-        let response = admin_aifarm_pool_toggle_response(
-            &routes,
-            Method::PUT,
-            &headers,
-            br#"{"enabled":true}"#,
-            "aifarm.pool.reasoning_enabled",
-            openplotva_llm::aifarm::set_pool_reasoning_enabled,
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::OK);
-        assert!(openplotva_llm::aifarm::pool_reasoning_enabled());
-
-        let response = admin_aifarm_pool_toggle_response(
-            &routes,
-            Method::GET,
-            &headers,
-            br#"{"enabled":true}"#,
-            "aifarm.pool.enabled",
-            openplotva_llm::aifarm::set_pool_enabled,
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
-
-        let response = admin_aifarm_pool_toggle_response(
-            &routes,
-            Method::POST,
-            &HeaderMap::new(),
-            br#"{"enabled":true}"#,
-            "aifarm.pool.enabled",
-            openplotva_llm::aifarm::set_pool_enabled,
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-
-        openplotva_llm::aifarm::set_pool_enabled(true);
-        openplotva_llm::aifarm::set_pool_reasoning_enabled(false);
         Ok(())
     }
 
@@ -14050,8 +14005,6 @@ mod tests {
                 "/admin/api/auth_check",
                 "/admin/api/state",
                 "/admin/api/loglevel",
-                "/admin/api/aifarm/pool",
-                "/admin/api/aifarm/pool/reasoning",
                 "/admin/api/logs/stream",
                 "/admin/api/bootstrap",
                 "/admin/api/metrics",

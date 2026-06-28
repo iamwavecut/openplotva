@@ -1437,12 +1437,15 @@ textarea.form-control {
     align-items: center;
     gap: var(--sp-2);
     margin-bottom: var(--sp-3);
+    flex-wrap: wrap;
 }
 
 .mp-wf-title {
     font-weight: var(--fw-semibold);
     font-size: var(--fs-md);
     color: var(--c-text-main);
+    flex: 1 1 auto;
+    min-width: 0;
 }
 
 .mp-wf-meta {
@@ -1635,6 +1638,7 @@ textarea.form-control {
     border: 1px solid var(--c-border);
     border-radius: var(--rad-md);
     padding: var(--sp-2) var(--sp-3);
+    flex-wrap: wrap;
 }
 
 .mp-row-name {
@@ -1654,6 +1658,8 @@ textarea.form-control {
     display: flex;
     align-items: center;
     gap: var(--sp-3);
+    flex-wrap: wrap;
+    justify-content: flex-end;
 }
 
 .mp-icon-btn {
@@ -1798,6 +1804,18 @@ textarea.form-control {
     gap: var(--sp-2);
     align-items: center;
     margin-top: var(--sp-3);
+}
+
+.mp-config-editor {
+    display: grid;
+    gap: var(--sp-2);
+    min-width: min(620px, 78vw);
+}
+
+.mp-config-editor pl-textarea {
+    width: 100%;
+    min-height: 260px;
+    font-family: var(--font-mono);
 }
 
 .mp-form {
