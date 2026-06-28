@@ -268,6 +268,8 @@ impl MediaPromptOptimizer for RoutedMediaPromptOptimizer {
 fn routed_media_context() -> RoutedRequestContext {
     RoutedRequestContext {
         workflow_key: "media_prompt_optimizer".to_owned(),
+        suppress_all_attempts_exhausted_admin_report: true,
+        suppressed_all_attempts_exhausted_reason: Some("prompt_optimizer_fallback".to_owned()),
         ..RoutedRequestContext::default()
     }
 }

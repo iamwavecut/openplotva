@@ -221,11 +221,12 @@ fn all_attempts_exhausted_detail(
     if context.suppress_all_attempts_exhausted_admin_report
         && let Some(object) = detail.as_object_mut()
     {
+        let reason = context
+            .suppressed_all_attempts_exhausted_reason
+            .as_deref()
+            .unwrap_or("handled_by_job_retry_budget");
         object.insert("admin_actionable".to_owned(), json!(false));
-        object.insert(
-            "admin_actionable_reason".to_owned(),
-            json!("handled_by_job_retry_budget"),
-        );
+        object.insert("admin_actionable_reason".to_owned(), json!(reason));
     }
     detail
 }
@@ -240,6 +241,7 @@ pub struct RoutedRequestContext {
     pub message_id: Option<i32>,
     pub vip: bool,
     pub suppress_all_attempts_exhausted_admin_report: bool,
+    pub suppressed_all_attempts_exhausted_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

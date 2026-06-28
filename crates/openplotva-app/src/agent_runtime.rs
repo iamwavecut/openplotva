@@ -1147,6 +1147,8 @@ where
                 chat_id: (request.chat_id != 0).then_some(request.chat_id),
                 thread_id: request.thread_id,
                 message_id: (request.message_id != 0).then_some(request.message_id),
+                suppress_all_attempts_exhausted_admin_report: true,
+                suppressed_all_attempts_exhausted_reason: Some("image_agent_fallback".to_owned()),
                 ..RoutedRequestContext::default()
             },
         );
@@ -1544,6 +1546,31 @@ mod tests {
         assert_eq!(reply.tool_calls[0].function.name, "web_search");
         assert_eq!(reply.prompt_tokens, 12);
         assert_eq!(reply.completion_tokens, 5);
+    }
+
+    #[test]
+    fn build_request_includes_native_tools_when_call_has_tools() {
+        let provider = AgentProviderClient {
+            client: AifarmHttpClient::new(AifarmClientConfig::default()),
+            model: "model".to_owned(),
+            include_reasoning: None,
+            enable_thinking: None,
+            temperature: None,
+            max_tokens: 100,
+            routed: None,
+        };
+        let call = ReasonerCall {
+            model: "model".to_owned(),
+            max_tokens: 100,
+            messages: vec![AgentMessage::new(AgentRole::User, "draw a fish")],
+            tools: openplotva_dialog::chat_completion_tools_for_names(&[STEP_HISTORY_SEARCH]),
+        };
+
+        let request = build_request(&provider, &call, true);
+
+        assert!(!request.tools.is_empty());
+        assert_eq!(request.tool_choice, Some(json!("auto")));
+        assert_eq!(request.parallel_tool_calls, Some(false));
     }
 
     #[test]
