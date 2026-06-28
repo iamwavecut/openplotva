@@ -212,6 +212,7 @@ impl DialogJobWorkerRunReport {
 pub struct DialogJobWorkerLoopOptions<'a, Materializer: ?Sized, ToolHistory: ?Sized> {
     pub materializer: &'a Materializer,
     pub tool_history: &'a ToolHistory,
+    pub routing_events: Option<&'a crate::runtime_routing::RoutingEventReporter>,
     /// Queue names to poll in order.
     pub queue_names: &'static [&'static str],
     /// Poll interval.
@@ -844,16 +845,18 @@ where
             queue_name,
             max_llm_job_attempts: DEFAULT_LLM_JOB_MAX_ATTEMPTS,
             now,
+            routing_events: None,
         },
     )
     .await
 }
 
 #[derive(Clone, Copy)]
-struct DialogJobProcessOptions {
+struct DialogJobProcessOptions<'a> {
     queue_name: &'static str,
     max_llm_job_attempts: i32,
     now: OffsetDateTime,
+    routing_events: Option<&'a crate::runtime_routing::RoutingEventReporter>,
 }
 
 async fn process_dialog_job_once_in_queue_with_materializer_history_and_retry_at<
@@ -868,7 +871,7 @@ async fn process_dialog_job_once_in_queue_with_materializer_history_and_retry_at
     effects: &Effects,
     materializer: &Materializer,
     tool_history: &ToolHistory,
-    options: DialogJobProcessOptions,
+    options: DialogJobProcessOptions<'_>,
 ) -> DialogJobWorkerReport
 where
     Queue: DialogJobWorkerQueue + Sync + ?Sized,
@@ -938,6 +941,8 @@ where
                 handle_retryable_dialog_provider_error(
                     queue,
                     &item,
+                    &params,
+                    options.routing_events,
                     RetryableDialogProviderFailure {
                         queue_name: options.queue_name,
                         provider_name: &retry_provider,
@@ -1064,6 +1069,7 @@ where
         DialogJobWorkerLoopOptions {
             materializer,
             tool_history: &noop,
+            routing_events: None,
             queue_names,
             interval,
             max_llm_job_attempts: DEFAULT_LLM_JOB_MAX_ATTEMPTS,
@@ -1114,6 +1120,7 @@ where
                             queue_name,
                             max_llm_job_attempts: options.max_llm_job_attempts,
                             now: OffsetDateTime::now_utc(),
+                            routing_events: options.routing_events,
                         },
                     ).await;
                     trace_dialog_job_tick(&tick);
@@ -1248,6 +1255,7 @@ where
         DialogJobWorkerLoopOptions {
             materializer,
             tool_history,
+            routing_events: None,
             queue_names: &DIALOG_JOB_WORKER_QUEUES,
             interval: DIALOG_JOB_POLL_INTERVAL,
             max_llm_job_attempts,
@@ -2339,6 +2347,8 @@ struct RetryableDialogProviderFailure<'a> {
 async fn handle_retryable_dialog_provider_error<Queue>(
     queue: &Queue,
     item: &DialogJobWorkItem,
+    params: &DialogJobParams,
+    routing_events: Option<&crate::runtime_routing::RoutingEventReporter>,
     failure: RetryableDialogProviderFailure<'_>,
     report: &mut DialogJobWorkerReport,
 ) where
@@ -2385,6 +2395,17 @@ async fn handle_retryable_dialog_provider_error<Queue>(
 
     if exhausted {
         report.retry_exhausted = true;
+        if let Some(reporter) = routing_events {
+            reporter.record(dialog_retry_exhausted_routing_event(
+                item,
+                params,
+                &provider,
+                &target_queue,
+                &failure,
+                attempt,
+                max_attempts,
+            ));
+        }
         mark_dialog_job_failed(queue, item.id, failure.error, report).await;
         return;
     }
@@ -2500,6 +2521,38 @@ fn dialog_retry_job_event(
         error: error.to_owned(),
         data,
         ..TaskQueueJobEvent::default()
+    }
+}
+
+fn dialog_retry_exhausted_routing_event(
+    item: &DialogJobWorkItem,
+    params: &DialogJobParams,
+    provider: &str,
+    target_queue: &str,
+    failure: &RetryableDialogProviderFailure<'_>,
+    attempt: i32,
+    max_attempts: i32,
+) -> crate::runtime_routing::RoutingEvent {
+    crate::runtime_routing::RoutingEvent {
+        severity: "error".to_owned(),
+        event_type: "all_attempts_exhausted".to_owned(),
+        workflow_key: "dialog".to_owned(),
+        provider_id: None,
+        model_id: None,
+        queue_name: Some(failure.queue_name.to_owned()),
+        job_id: Some(item.id),
+        chat_id: (params.chat_id != 0).then_some(params.chat_id),
+        thread_id: params.thread_id,
+        message_id: (params.message_id != 0).then_some(params.message_id),
+        dedupe_key: format!("all_attempts_exhausted:dialog:job_retry_exhausted:{provider}"),
+        summary: "dialog job retry budget exhausted".to_owned(),
+        detail: serde_json::json!({
+            "job_attempts": attempt,
+            "max_attempts": max_attempts,
+            "last_retryable_reason": failure.reason.as_str(),
+            "provider": provider,
+            "target_queue": target_queue,
+        }),
     }
 }
 
@@ -3158,13 +3211,25 @@ mod tests {
         let provider =
             RetryableProviderStub::new("aifarm", FailureReason::ProviderUnavailable, "status 503");
         let effects = EffectsStub::default();
+        let reporter = crate::runtime_routing::RoutingEventReporter::new(
+            crate::runtime_routing::RoutingEventBuffer::new(8),
+            None,
+            None,
+            Duration::from_secs(600),
+        );
 
-        let report = process_dialog_job_once_in_queue_at(
+        let report = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
             &queue,
-            DIALOG_AIFARM_QUEUE_NAME,
             &provider,
             &effects,
-            now,
+            &BasicDialogInputMaterializer,
+            &NoopDialogToolCallHistoryStore,
+            DialogJobProcessOptions {
+                queue_name: DIALOG_AIFARM_QUEUE_NAME,
+                max_llm_job_attempts: DEFAULT_LLM_JOB_MAX_ATTEMPTS,
+                now,
+                routing_events: Some(&reporter),
+            },
         )
         .await;
 
@@ -3186,6 +3251,21 @@ mod tests {
             "retryable LLM provider error exhausted job attempts"
         );
         assert_eq!(event.data["fallback_reason"], "provider_unavailable");
+        let routing_events = reporter.buffer().routing_events(10);
+        assert_eq!(routing_events.len(), 1);
+        assert_eq!(routing_events[0].event_type, "all_attempts_exhausted");
+        assert_eq!(routing_events[0].workflow_key, "dialog");
+        assert_eq!(
+            routing_events[0].queue_name.as_deref(),
+            Some(DIALOG_AIFARM_QUEUE_NAME)
+        );
+        assert_eq!(routing_events[0].job_id, Some(job_id));
+        assert_eq!(routing_events[0].chat_id, Some(42));
+        assert_eq!(routing_events[0].message_id, Some(100));
+        assert_eq!(
+            routing_events[0].detail["last_retryable_reason"],
+            "provider_unavailable"
+        );
         Ok(())
     }
 
@@ -3211,6 +3291,7 @@ mod tests {
                 queue_name: DIALOG_AIFARM_QUEUE_NAME,
                 max_llm_job_attempts: 2,
                 now,
+                routing_events: None,
             },
         )
         .await;
@@ -3227,6 +3308,7 @@ mod tests {
                 queue_name: DIALOG_AIFARM_QUEUE_NAME,
                 max_llm_job_attempts: 2,
                 now,
+                routing_events: None,
             },
         )
         .await;

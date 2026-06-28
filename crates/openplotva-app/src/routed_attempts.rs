@@ -192,10 +192,7 @@ impl RoutedAttemptWalker {
             (provider_id != 0).then_some(provider_id),
             (model_id != 0).then_some(model_id),
             "routed attempts exhausted",
-            json!({
-                "failed_attempts": failed_attempts,
-                "last_retryable_reason": last_reason,
-            }),
+            all_attempts_exhausted_detail(&context, failed_attempts, last_reason),
         ));
         match last_error {
             Some(error) => Err(RoutedAttemptRunError::Attempt(error)),
@@ -212,6 +209,27 @@ impl RoutedAttemptWalker {
     }
 }
 
+fn all_attempts_exhausted_detail(
+    context: &RoutedRequestContext,
+    failed_attempts: usize,
+    last_reason: Option<String>,
+) -> Value {
+    let mut detail = json!({
+        "failed_attempts": failed_attempts,
+        "last_retryable_reason": last_reason,
+    });
+    if context.suppress_all_attempts_exhausted_admin_report
+        && let Some(object) = detail.as_object_mut()
+    {
+        object.insert("admin_actionable".to_owned(), json!(false));
+        object.insert(
+            "admin_actionable_reason".to_owned(),
+            json!("handled_by_job_retry_budget"),
+        );
+    }
+    detail
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RoutedRequestContext {
     pub workflow_key: String,
@@ -221,6 +239,7 @@ pub struct RoutedRequestContext {
     pub thread_id: Option<i32>,
     pub message_id: Option<i32>,
     pub vip: bool,
+    pub suppress_all_attempts_exhausted_admin_report: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -275,8 +294,15 @@ fn routing_event(
     summary: &str,
     detail: Value,
 ) -> crate::runtime_routing::RoutingEvent {
+    let severity = if event_type == "all_attempts_exhausted"
+        && context.suppress_all_attempts_exhausted_admin_report
+    {
+        "warn"
+    } else {
+        "error"
+    };
     crate::runtime_routing::RoutingEvent {
-        severity: "error".to_owned(),
+        severity: severity.to_owned(),
         event_type: event_type.to_owned(),
         workflow_key: context.workflow_key.clone(),
         provider_id,

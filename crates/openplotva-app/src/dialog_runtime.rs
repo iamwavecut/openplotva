@@ -96,6 +96,7 @@ impl ChatProvider for RouterChatProvider {
                         chat_id: (input.context.chat_id != 0).then_some(input.context.chat_id),
                         thread_id: input.context.thread_id,
                         message_id: (input.message.id != 0).then_some(input.message.id),
+                        suppress_all_attempts_exhausted_admin_report: true,
                         ..RoutedRequestContext::default()
                     },
                     move |attempt| {
@@ -688,9 +689,15 @@ mod tests {
         assert_eq!(routed_provider.calls(), 1);
         let events = reporter.buffer().routing_events(10);
         assert_eq!(events[0].event_type, "all_attempts_exhausted");
+        assert_eq!(events[0].severity, "warn");
         assert_eq!(events[0].workflow_key, "dialog");
         assert_eq!(events[0].provider_id, Some(1));
         assert_eq!(events[0].model_id, Some(10));
+        assert_eq!(events[0].detail["admin_actionable"], false);
+        assert_eq!(
+            events[0].detail["admin_actionable_reason"],
+            "handled_by_job_retry_budget"
+        );
     }
 
     #[tokio::test]

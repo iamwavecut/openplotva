@@ -319,6 +319,14 @@ impl RoutingEventReporter {
         if self.admin_notifier.is_none() {
             return AdminPageDecision::NotConfigured;
         }
+        if event
+            .detail
+            .get("admin_actionable")
+            .and_then(Value::as_bool)
+            == Some(false)
+        {
+            return AdminPageDecision::NotActionable;
+        }
         if !is_actionable_event(&event.event_type) {
             return AdminPageDecision::NotActionable;
         }
@@ -866,6 +874,29 @@ mod tests {
 
         assert!(notifier.messages().is_empty());
         assert_eq!(reporter.buffer().routing_events(10).len(), 1);
+    }
+
+    #[test]
+    fn non_actionable_detail_suppresses_admin_page_for_actionable_event_type() {
+        let notifier = Arc::new(CapturingAdminNotifier::default());
+        let reporter = RoutingEventReporter::new(
+            RoutingEventBuffer::new(8),
+            None,
+            Some(notifier.clone()),
+            Duration::from_millis(600_000),
+        );
+        let mut event = event("all_attempts_exhausted");
+        event.detail = json!({
+            "admin_actionable": false,
+            "admin_actionable_reason": "handled_by_job_retry_budget"
+        });
+
+        reporter.record_at_millis(event, 0);
+
+        assert!(notifier.messages().is_empty());
+        let events = reporter.buffer().routing_events(10);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].detail["admin_report"]["action"], "none");
     }
 
     #[test]

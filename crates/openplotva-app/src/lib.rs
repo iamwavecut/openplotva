@@ -10425,6 +10425,7 @@ async fn start_runtime_workers(
                 let worker_effects = dialog_effects.clone();
                 let worker_materializer = dialog_materializer.clone();
                 let worker_tool_history = dialog_tool_history.clone();
+                let worker_routing_events = routing_event_reporter.clone();
                 let worker_stop = stop.subscribe();
                 let dialog_worker = tokio::spawn(async move {
                     let report =
@@ -10435,6 +10436,7 @@ async fn start_runtime_workers(
                             dialog_jobs::DialogJobWorkerLoopOptions {
                                 materializer: &worker_materializer,
                                 tool_history: &worker_tool_history,
+                                routing_events: Some(&worker_routing_events),
                                 queue_names: &dialog_jobs::DIALOG_JOB_WORKER_QUEUES,
                                 interval: dialog_jobs::DIALOG_JOB_POLL_INTERVAL,
                                 max_llm_job_attempts: dialog_max_llm_job_attempts,
