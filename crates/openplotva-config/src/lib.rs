@@ -34,6 +34,12 @@ pub const DEFAULT_RUNTIME_API_SQL_RESULT_BYTES_LIMIT: i32 = 2_621_440;
 
 pub const DEFAULT_LLM_REQUEST_EVENTS_RETENTION_DAYS: i32 = 14;
 
+pub const DEFAULT_CHAT_HISTORY_RETENTION_DAYS: i32 = 8;
+
+pub const DEFAULT_TELEGRAM_FILES_RETENTION_DAYS: i32 = 7;
+
+pub const DEFAULT_WHITECIRCLE_CHECKS_RETENTION_DAYS: i32 = 30;
+
 pub const DEFAULT_RUNTIME_API_CERT_FILE: &str = "";
 
 pub const DEFAULT_RUNTIME_API_KEY_FILE: &str = "";
@@ -613,6 +619,8 @@ pub struct WhiteCircleConfig {
     pub enabled: bool,
     pub api_key: String,
     pub deployment_id: String,
+    /// Audit-log retention in days, from `WHITECIRCLE_CHECKS_RETENTION_DAYS` (0 disables).
+    pub whitecircle_checks_retention_days: i32,
 }
 
 /// LLM and provider routing configuration.
@@ -742,6 +750,10 @@ pub struct HistorySummaryConfig {
     pub provider: String,
     pub model: String,
     pub timeout_seconds: i32,
+    /// Raw chat_history_entries retention in days (drops daily partitions older
+    /// than this), from `CHAT_HISTORY_RETENTION_DAYS` (0 disables). Floor is the
+    /// memory pipeline window (`MEMORY_RETENTION_HOURS`/24) plus slack.
+    pub chat_history_retention_days: i32,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -753,6 +765,9 @@ pub struct VisionConfig {
     pub temperature: f64,
     pub direct_image_limit: i32,
     pub request_timeout_seconds: i32,
+    /// telegram_files media-cache retention in days by `last_seen_at`, from
+    /// `TELEGRAM_FILES_RETENTION_DAYS` (0 disables).
+    pub telegram_files_retention_days: i32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1028,6 +1043,8 @@ pub struct RawConfig {
     pub whitecircle_api_key: Option<String>,
     /// `WHITECIRCLE_DEPLOYMENT_ID`.
     pub whitecircle_deployment_id: Option<String>,
+    /// `WHITECIRCLE_CHECKS_RETENTION_DAYS`.
+    pub whitecircle_checks_retention_days: Option<String>,
     /// `DISCOVERY_BASE_URL`.
     pub discovery_base_url: Option<String>,
     /// `DIALOG_PROVIDER`.
@@ -1166,6 +1183,8 @@ pub struct RawConfig {
     pub genkit_history_summary_model: Option<String>,
     /// `GENKIT_HISTORY_SUMMARY_TIMEOUT_SECONDS`.
     pub genkit_history_summary_timeout_seconds: Option<String>,
+    /// `CHAT_HISTORY_RETENTION_DAYS`.
+    pub chat_history_retention_days: Option<String>,
     /// `VISION_DISCOVERY_SERVICE_NAME`.
     pub vision_discovery_service_name: Option<String>,
     /// `VISION_DISCOVERY_ENDPOINT_NAME`.
@@ -1180,6 +1199,8 @@ pub struct RawConfig {
     pub vision_direct_image_limit: Option<String>,
     /// `VISION_REQUEST_TIMEOUT_SECONDS`.
     pub vision_request_timeout_seconds: Option<String>,
+    /// `TELEGRAM_FILES_RETENTION_DAYS`.
+    pub telegram_files_retention_days: Option<String>,
     /// `ACESTEP_ENABLED`.
     pub acestep_enabled: Option<String>,
     /// `ACESTEP_BASE_URL`.
@@ -1898,6 +1919,11 @@ impl AppConfig {
                 enabled: parse_bool("WHITECIRCLE_ENABLED", raw.whitecircle_enabled, false)?,
                 api_key: raw.whitecircle_api_key.unwrap_or_default(),
                 deployment_id: raw.whitecircle_deployment_id.unwrap_or_default(),
+                whitecircle_checks_retention_days: parse_i32(
+                    "WHITECIRCLE_CHECKS_RETENTION_DAYS",
+                    raw.whitecircle_checks_retention_days,
+                    DEFAULT_WHITECIRCLE_CHECKS_RETENTION_DAYS,
+                )?,
             },
             llm: LlmConfig {
                 discovery: DiscoveryConfig {
@@ -2078,6 +2104,11 @@ impl AppConfig {
                     provider: history_summary_provider,
                     model: raw.genkit_history_summary_model.unwrap_or_default(),
                     timeout_seconds: history_summary_timeout_seconds,
+                    chat_history_retention_days: parse_i32(
+                        "CHAT_HISTORY_RETENTION_DAYS",
+                        raw.chat_history_retention_days,
+                        DEFAULT_CHAT_HISTORY_RETENTION_DAYS,
+                    )?,
                 },
                 providers: llm_providers,
                 agentic: AgenticConfig {
@@ -2141,6 +2172,11 @@ impl AppConfig {
                 model: raw
                     .vision_model
                     .unwrap_or_else(|| DEFAULT_VISION_MODEL.to_owned()),
+                telegram_files_retention_days: parse_i32(
+                    "TELEGRAM_FILES_RETENTION_DAYS",
+                    raw.telegram_files_retention_days,
+                    DEFAULT_TELEGRAM_FILES_RETENTION_DAYS,
+                )?,
                 max_tokens: parse_i32(
                     "VISION_MAX_TOKENS",
                     raw.vision_max_tokens,
@@ -2570,6 +2606,7 @@ impl RawConfig {
             whitecircle_enabled: env("WHITECIRCLE_ENABLED"),
             whitecircle_api_key: env("WHITECIRCLE_API_KEY"),
             whitecircle_deployment_id: env("WHITECIRCLE_DEPLOYMENT_ID"),
+            whitecircle_checks_retention_days: env("WHITECIRCLE_CHECKS_RETENTION_DAYS"),
             discovery_base_url: env("DISCOVERY_BASE_URL"),
             dialog_provider: env("DIALOG_PROVIDER"),
             dialog_fallback_provider: env("DIALOG_FALLBACK_PROVIDER"),
@@ -2641,6 +2678,7 @@ impl RawConfig {
             genkit_history_summary_provider: env("GENKIT_HISTORY_SUMMARY_PROVIDER"),
             genkit_history_summary_model: env("GENKIT_HISTORY_SUMMARY_MODEL"),
             genkit_history_summary_timeout_seconds: env("GENKIT_HISTORY_SUMMARY_TIMEOUT_SECONDS"),
+            chat_history_retention_days: env("CHAT_HISTORY_RETENTION_DAYS"),
             vision_discovery_service_name: env("VISION_DISCOVERY_SERVICE_NAME"),
             vision_discovery_endpoint_name: env("VISION_DISCOVERY_ENDPOINT_NAME"),
             vision_model: env("VISION_MODEL"),
@@ -2648,6 +2686,7 @@ impl RawConfig {
             vision_temperature: env("VISION_TEMPERATURE"),
             vision_direct_image_limit: env("VISION_DIRECT_IMAGE_LIMIT"),
             vision_request_timeout_seconds: env("VISION_REQUEST_TIMEOUT_SECONDS"),
+            telegram_files_retention_days: env("TELEGRAM_FILES_RETENTION_DAYS"),
             acestep_enabled: env("ACESTEP_ENABLED"),
             acestep_base_url: env("ACESTEP_BASE_URL"),
             acestep_api_key: env("ACESTEP_API_KEY"),
@@ -3369,6 +3408,9 @@ mod tests {
         assert_eq!(config.pruna.timeout_seconds, DEFAULT_PRUNA_TIMEOUT_SECONDS);
         assert!(config.memory.enabled);
         assert_eq!(config.memory.retention_hours, 168);
+        assert_eq!(config.llm.history_summary.chat_history_retention_days, 8);
+        assert_eq!(config.vision.telegram_files_retention_days, 7);
+        assert_eq!(config.white_circle.whitecircle_checks_retention_days, 30);
         assert_eq!(config.memory.consolidation_provider, "aifarm");
         assert_eq!(
             config.memory.consolidation_model,
