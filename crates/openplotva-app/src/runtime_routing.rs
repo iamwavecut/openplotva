@@ -327,6 +327,15 @@ impl RoutingEventReporter {
         {
             return AdminPageDecision::NotActionable;
         }
+        if event
+            .detail
+            .get("admin_actionable")
+            .and_then(Value::as_bool)
+            != Some(true)
+            && is_single_retryable_all_attempts_exhausted(event)
+        {
+            return AdminPageDecision::NotActionable;
+        }
         if !is_actionable_event(&event.event_type) {
             return AdminPageDecision::NotActionable;
         }
@@ -440,6 +449,16 @@ fn is_actionable_event(event_type: &str) -> bool {
             | "router_reload_failed"
             | "routing_backfill_failed"
     )
+}
+
+fn is_single_retryable_all_attempts_exhausted(event: &RoutingEvent) -> bool {
+    event.event_type == "all_attempts_exhausted"
+        && event.detail.get("failed_attempts").and_then(Value::as_u64) == Some(1)
+        && event
+            .detail
+            .get("last_retryable_reason")
+            .and_then(Value::as_str)
+            .is_some_and(|reason| !reason.trim().is_empty())
 }
 
 fn enrich_detail_for_admin_page(detail: Value, page: &AdminPageDecision) -> Value {
@@ -897,6 +916,52 @@ mod tests {
         let events = reporter.buffer().routing_events(10);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].detail["admin_report"]["action"], "none");
+    }
+
+    #[test]
+    fn single_retryable_exhaustion_is_recorded_but_does_not_page_admins() {
+        let notifier = Arc::new(CapturingAdminNotifier::default());
+        let reporter = RoutingEventReporter::new(
+            RoutingEventBuffer::new(8),
+            None,
+            Some(notifier.clone()),
+            Duration::from_millis(600_000),
+        );
+        let mut event = event("all_attempts_exhausted");
+        event.detail = json!({
+            "failed_attempts": 1,
+            "last_retryable_reason": "provider_unavailable"
+        });
+
+        reporter.record_at_millis(event, 0);
+
+        assert!(notifier.messages().is_empty());
+        let events = reporter.buffer().routing_events(10);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].detail["admin_report"]["action"], "none");
+    }
+
+    #[test]
+    fn multi_attempt_exhaustion_still_pages_admins() {
+        let notifier = Arc::new(CapturingAdminNotifier::default());
+        let reporter = RoutingEventReporter::new(
+            RoutingEventBuffer::new(8),
+            None,
+            Some(notifier.clone()),
+            Duration::from_millis(600_000),
+        );
+        let mut event = event("all_attempts_exhausted");
+        event.detail = json!({
+            "failed_attempts": 2,
+            "last_retryable_reason": "provider_unavailable"
+        });
+
+        reporter.record_at_millis(event, 0);
+
+        assert_eq!(notifier.messages().len(), 1);
+        let events = reporter.buffer().routing_events(10);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].detail["admin_report"]["action"], "sent");
     }
 
     #[test]
