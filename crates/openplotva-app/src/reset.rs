@@ -14,8 +14,8 @@ use time::OffsetDateTime;
 
 use crate::updates::{UpdateHandler, UpdateHandlerFuture};
 use crate::virtual_messages::{
-    QueueTextReport, QueueTextRequest, VirtualIdFactory, VirtualMessageStore,
-    monotonic_virtual_id_factory, queue_text_message_parts,
+    QueueTextReport, QueueTextRequest, VirtualIdFactory, monotonic_virtual_id_factory,
+    queue_text_message_parts,
 };
 
 const RESET_COMMAND: &str = "reset";
@@ -88,10 +88,8 @@ pub enum ResetCommandError {
 
 /// Boundaries used by one reset-command update pass.
 #[derive(Clone, Copy, Debug)]
-pub struct ResetCommandPorts<'a, History, Store> {
+pub struct ResetCommandPorts<'a, History> {
     pub history: &'a History,
-    /// Virtual-message storage for the confirmation.
-    pub store: &'a Store,
     /// Outbound dispatcher queue for the confirmation.
     pub dispatcher_queue: &'a DispatcherQueue,
 }
@@ -106,27 +104,24 @@ pub struct ResetCommandContext<'a> {
 }
 
 #[derive(Clone)]
-pub struct ResetCommandUpdateHandler<History, Store, Next> {
+pub struct ResetCommandUpdateHandler<History, Next> {
     history: Arc<History>,
-    store: Arc<Store>,
     dispatcher_queue: Arc<DispatcherQueue>,
     bot_username: String,
     next_virtual_id: VirtualIdFactory,
     next: Arc<Next>,
 }
 
-impl<History, Store, Next> ResetCommandUpdateHandler<History, Store, Next> {
+impl<History, Next> ResetCommandUpdateHandler<History, Next> {
     /// Build a reset handler around the real downstream update handler.
     pub fn new(
         history: Arc<History>,
-        store: Arc<Store>,
         dispatcher_queue: Arc<DispatcherQueue>,
         bot_username: impl Into<String>,
         next: Arc<Next>,
     ) -> Self {
         Self {
             history,
-            store,
             dispatcher_queue,
             bot_username: bot_username.into(),
             next_virtual_id: monotonic_virtual_id_factory("reset-vmsg"),
@@ -142,10 +137,9 @@ impl<History, Store, Next> ResetCommandUpdateHandler<History, Store, Next> {
     }
 }
 
-impl<History, Store, Next> UpdateHandler for ResetCommandUpdateHandler<History, Store, Next>
+impl<History, Next> UpdateHandler for ResetCommandUpdateHandler<History, Next>
 where
     History: ResetHistoryStore + Send + Sync,
-    Store: VirtualMessageStore + Send + Sync,
     Next: UpdateHandler + Send + Sync,
 {
     type Error = ResetCommandError;
@@ -155,7 +149,6 @@ where
             handle_reset_command_update_or_else_at(
                 ResetCommandPorts {
                     history: self.history.as_ref(),
-                    store: self.store.as_ref(),
                     dispatcher_queue: self.dispatcher_queue.as_ref(),
                 },
                 update,
@@ -174,13 +167,12 @@ where
 
 pub async fn handle_reset_command_update_or_else_at<
     History,
-    Store,
     NextId,
     HandleFn,
     HandleFuture,
     HandleError,
 >(
-    ports: ResetCommandPorts<'_, History, Store>,
+    ports: ResetCommandPorts<'_, History>,
     update: TelegramUpdate,
     context: ResetCommandContext<'_>,
     next_virtual_id: NextId,
@@ -188,7 +180,6 @@ pub async fn handle_reset_command_update_or_else_at<
 ) -> Result<ResetCommandOutcome, ResetCommandError>
 where
     History: ResetHistoryStore + Sync,
-    Store: VirtualMessageStore + Sync,
     NextId: FnMut() -> String,
     HandleFn: FnOnce(TelegramUpdate) -> HandleFuture,
     HandleFuture: Future<Output = Result<(), HandleError>>,
@@ -220,14 +211,7 @@ where
         .err()
         .map(|error| error.to_string());
 
-    match queue_reset_confirmation(
-        ports.store,
-        ports.dispatcher_queue,
-        message,
-        next_virtual_id,
-    )
-    .await
-    {
+    match queue_reset_confirmation(ports.dispatcher_queue, message, next_virtual_id).await {
         Ok(confirmation) => Ok(ResetCommandOutcome::Reset {
             scope,
             history_error,
@@ -268,14 +252,12 @@ pub fn reset_scope(message: &TelegramMessage) -> ResetScope {
     }
 }
 
-pub async fn queue_reset_confirmation<Store, NextId>(
-    store: &Store,
+pub async fn queue_reset_confirmation<NextId>(
     dispatcher_queue: &DispatcherQueue,
     message: &TelegramMessage,
     next_virtual_id: NextId,
 ) -> Result<QueueTextReport, openplotva_telegram::OutboundBuildError>
 where
-    Store: VirtualMessageStore + Sync,
     NextId: FnMut() -> String,
 {
     let chat = message_chat_ref(message);
@@ -295,7 +277,6 @@ where
         message_thread_id: message.message_thread_id.unwrap_or_default(),
     };
     queue_text_message_parts(
-        store,
         dispatcher_queue,
         QueueTextRequest {
             message: &request,
@@ -387,12 +368,11 @@ impl ResetHistoryStore for openplotva_storage::PostgresHistoryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openplotva_core::MessageIdMapping;
     use openplotva_telegram::{DispatcherConfig, TelegramOutboundMethodKind};
     use openplotva_updates::{UpdateConsumerConfig, UpdateStageOutcome};
     use std::{
         env, io,
-        sync::{Arc, Mutex, MutexGuard},
+        sync::{Arc, Mutex},
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -531,13 +511,11 @@ mod tests {
     async fn reset_update_resets_chat_and_queues_ephemeral_confirmation()
     -> Result<(), Box<dyn std::error::Error>> {
         let history = HistoryStub::default();
-        let store = StoreStub::default();
         let queue = DispatcherQueue::new(DispatcherConfig::default());
         let now = OffsetDateTime::from_unix_timestamp(1_710_000_000)?;
         let outcome = handle_reset_command_update_or_else_at(
             ResetCommandPorts {
                 history: &history,
-                store: &store,
                 dispatcher_queue: &queue,
             },
             update_from_message(private_reset_message()?)?,
@@ -570,7 +548,6 @@ mod tests {
             snapshot.immediate[0].ephemeral_delete_after,
             Some(Duration::from_secs(60))
         );
-        assert_eq!(store.inserts(), vec![("reset-v1".to_owned(), 42, None)]);
 
         Ok(())
     }
@@ -582,13 +559,11 @@ mod tests {
             reset_error: Some("db down".to_owned()),
             ..HistoryStub::default()
         };
-        let store = StoreStub::default();
         let queue = DispatcherQueue::new(DispatcherConfig::default());
         let now = OffsetDateTime::from_unix_timestamp(1_710_000_000)?;
         let outcome = handle_reset_command_update_or_else_at(
             ResetCommandPorts {
                 history: &history,
-                store: &store,
                 dispatcher_queue: &queue,
             },
             update_from_message(group_reset_message("/reset@PlotvaBot", 16, Some(9))?)?,
@@ -621,14 +596,12 @@ mod tests {
     #[tokio::test]
     async fn reset_update_delegates_non_reset_messages() -> Result<(), Box<dyn std::error::Error>> {
         let history = HistoryStub::default();
-        let store = StoreStub::default();
         let queue = DispatcherQueue::new(DispatcherConfig::default());
         let delegated = Arc::new(Mutex::new(0usize));
         let delegated_for_handler = Arc::clone(&delegated);
         let outcome = handle_reset_command_update_or_else_at(
             ResetCommandPorts {
                 history: &history,
-                store: &store,
                 dispatcher_queue: &queue,
             },
             update_from_message(group_reset_message("/reset", 6, None)?)?,
@@ -659,12 +632,10 @@ mod tests {
     async fn reset_update_handler_consumes_reset_before_wrapped_handler()
     -> Result<(), Box<dyn std::error::Error>> {
         let history = Arc::new(HistoryStub::default());
-        let store = Arc::new(StoreStub::default());
         let queue = Arc::new(DispatcherQueue::new(DispatcherConfig::default()));
         let next = Arc::new(UpdateHandlerStub::default());
         let handler = ResetCommandUpdateHandler::new(
             Arc::clone(&history),
-            Arc::clone(&store),
             Arc::clone(&queue),
             "PlotvaBot",
             Arc::clone(&next),
@@ -698,12 +669,10 @@ mod tests {
 
         let state_store = UpdateStateStoreStub::default();
         let history = Arc::new(HistoryStub::default());
-        let store = Arc::new(StoreStub::default());
         let queue = Arc::new(DispatcherQueue::new(DispatcherConfig::default()));
         let next = Arc::new(UpdateHandlerStub::default());
         let handler = ResetCommandUpdateHandler::new(
             Arc::clone(&history),
-            Arc::clone(&store),
             Arc::clone(&queue),
             "PlotvaBot",
             Arc::clone(&next),
@@ -755,10 +724,6 @@ mod tests {
         let resets = history.resets();
         assert_eq!(resets.len(), 1);
         assert_eq!((resets[0].0, resets[0].1), (-42, 9));
-        assert_eq!(
-            store.inserts(),
-            vec![("reset-live-redis-vmsg-1".to_owned(), -42, Some(0))]
-        );
         let item = queue
             .dequeue_immediate()
             .ok_or_else(|| io::Error::other("expected reset confirmation payload"))?;
@@ -892,70 +857,6 @@ mod tests {
                     .push(format!("file:{}", params.file_unique_id));
                 Ok(())
             })
-        }
-    }
-
-    #[derive(Default)]
-    struct StoreStub {
-        inserts: Mutex<Vec<(String, i64, Option<i32>)>>,
-    }
-
-    impl StoreStub {
-        fn inserts(&self) -> Vec<(String, i64, Option<i32>)> {
-            self.inserts.lock().expect("inserts").clone()
-        }
-
-        fn lock_inserts(&self) -> MutexGuard<'_, Vec<(String, i64, Option<i32>)>> {
-            self.inserts.lock().expect("inserts")
-        }
-    }
-
-    impl VirtualMessageStore for StoreStub {
-        type Error = io::Error;
-
-        fn get_mapping_by_virtual<'a>(
-            &'a self,
-            _vmsg_id: String,
-        ) -> Pin<Box<dyn Future<Output = Result<Option<MessageIdMapping>, Self::Error>> + Send + 'a>>
-        {
-            Box::pin(async { Ok(None) })
-        }
-
-        fn insert_virtual_message<'a>(
-            &'a self,
-            vmsg_id: String,
-            chat_id: i64,
-            thread_id: Option<i32>,
-        ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
-            Box::pin(async move {
-                self.lock_inserts().push((vmsg_id, chat_id, thread_id));
-                Ok(())
-            })
-        }
-
-        fn resolve_virtual_message<'a>(
-            &'a self,
-            _vmsg_id: String,
-            _real_message_id: i32,
-        ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
-            Box::pin(async { Ok(()) })
-        }
-
-        fn enqueue_message_op<'a>(
-            &'a self,
-            _vmsg_id: String,
-            _chat_id: i64,
-            _op: &'static str,
-            _payload_json: Option<String>,
-        ) -> Pin<Box<dyn Future<Output = Result<i64, Self::Error>> + Send + 'a>> {
-            Box::pin(async { Ok(1) })
-        }
-
-        fn delete_mapping_by_virtual<'a>(
-            &'a self,
-            _vmsg_id: String,
-        ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
-            Box::pin(async { Ok(()) })
         }
     }
 

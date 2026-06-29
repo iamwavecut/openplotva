@@ -32,9 +32,9 @@ use crate::updates::{UpdateHandler, UpdateHandlerFuture};
 use crate::{
     permissions::{ChatPermissionPolicy, ChatPermissionStore},
     virtual_messages::{
-        QueueRichRequest, QueueTextRequest, VirtualIdFactory, VirtualMessageStore,
-        monotonic_virtual_id_factory, queue_rich_message, queue_text_message_parts,
-        send_work_item_and_resolve, send_work_item_and_resolve_with_ephemeral,
+        QueueRichRequest, QueueTextRequest, VirtualIdFactory, monotonic_virtual_id_factory,
+        queue_rich_message, queue_text_message_parts, send_work_item,
+        send_work_item_with_ephemeral,
     },
 };
 
@@ -565,7 +565,6 @@ pub struct CheckinGameRuntimeEffects<Store, Sender> {
 
 #[derive(Clone)]
 pub struct TelegramCheckinGameSender {
-    virtual_store: openplotva_storage::PostgresVirtualMessageStore,
     ephemeral_store: openplotva_storage::RedisEphemeralMessageStore,
     telegram: openplotva_telegram::TelegramClient,
     rich: openplotva_telegram::RichApiClient,
@@ -576,13 +575,11 @@ impl TelegramCheckinGameSender {
     /// Build a concrete check-in sender.
     #[must_use]
     pub fn new(
-        virtual_store: openplotva_storage::PostgresVirtualMessageStore,
         ephemeral_store: openplotva_storage::RedisEphemeralMessageStore,
         telegram: openplotva_telegram::TelegramClient,
         rich: openplotva_telegram::RichApiClient,
     ) -> Self {
         Self {
-            virtual_store,
             ephemeral_store,
             telegram,
             rich,
@@ -608,24 +605,11 @@ impl CheckinGameSender for TelegramCheckinGameSender {
     ) -> CheckinGameSendFuture<'a, Option<i32>, Self::Error> {
         Box::pin(async move {
             let queue = DispatcherQueue::new(DispatcherConfig::default());
-            queue_checkin_rich(
-                &self.virtual_store,
-                &queue,
-                reply_to,
-                html,
-                None,
-                None,
-                || (self.next_virtual_id)(),
-            )
+            queue_checkin_rich(&queue, reply_to, html, None, None, || {
+                (self.next_virtual_id)()
+            })
             .await?;
-            send_queued_checkin_items(
-                &self.virtual_store,
-                None,
-                &queue,
-                &self.telegram,
-                &self.rich,
-            )
-            .await
+            send_queued_checkin_items(None, &queue, &self.telegram, &self.rich).await
         })
     }
 
@@ -656,18 +640,11 @@ impl CheckinGameSender for TelegramCheckinGameSender {
     ) -> CheckinGameSendFuture<'a, (), Self::Error> {
         Box::pin(async move {
             let queue = DispatcherQueue::new(DispatcherConfig::default());
-            queue_checkin_text(
-                &self.virtual_store,
-                &queue,
-                reply_to,
-                text,
-                Some(delete_after),
-                None,
-                || (self.next_virtual_id)(),
-            )
+            queue_checkin_text(&queue, reply_to, text, Some(delete_after), None, || {
+                (self.next_virtual_id)()
+            })
             .await?;
             send_queued_checkin_items(
-                &self.virtual_store,
                 Some(&self.ephemeral_store),
                 &queue,
                 &self.telegram,
@@ -691,23 +668,17 @@ pub enum CheckinGameSenderError {
 }
 
 #[derive(Clone)]
-pub struct CheckinCommandDispatcherEffects<Store> {
-    store: Store,
+pub struct CheckinCommandDispatcherEffects {
     queue: Arc<DispatcherQueue>,
     rich: Arc<dyn crate::rich::RichSender>,
     next_virtual_id: VirtualIdFactory,
 }
 
-impl<Store> CheckinCommandDispatcherEffects<Store> {
+impl CheckinCommandDispatcherEffects {
     /// Build check-in command effects over an existing dispatcher queue.
     #[must_use]
-    pub fn new(
-        store: Store,
-        queue: Arc<DispatcherQueue>,
-        rich: Arc<dyn crate::rich::RichSender>,
-    ) -> Self {
+    pub fn new(queue: Arc<DispatcherQueue>, rich: Arc<dyn crate::rich::RichSender>) -> Self {
         Self {
-            store,
             queue,
             rich,
             next_virtual_id: monotonic_virtual_id_factory("checkin-command-vmsg"),
@@ -731,10 +702,7 @@ pub enum CheckinCommandEffectError {
     RichSend(String),
 }
 
-impl<Store> CheckinCommandEffects for CheckinCommandDispatcherEffects<Store>
-where
-    Store: VirtualMessageStore + Send + Sync,
-{
+impl CheckinCommandEffects for CheckinCommandDispatcherEffects {
     type Error = CheckinCommandEffectError;
 
     fn send_checkin_today_winner_with_stats<'a>(
@@ -765,7 +733,6 @@ where
     ) -> CheckinCommandEffectFuture<'a, Self::Error> {
         Box::pin(async move {
             queue_checkin_rich(
-                &self.store,
                 &self.queue,
                 reply_to,
                 format!("<h3>{CHECKIN_THEME_SELECTOR_TEXT}</h3>"),
@@ -784,7 +751,6 @@ where
     ) -> CheckinCommandEffectFuture<'a, Self::Error> {
         Box::pin(async move {
             queue_checkin_text(
-                &self.store,
                 &self.queue,
                 reply_to,
                 CHECKIN_QUEUE_ERROR_TEXT.to_owned(),
@@ -798,8 +764,7 @@ where
     }
 }
 
-async fn queue_checkin_text<S, NextId>(
-    store: &S,
+async fn queue_checkin_text<NextId>(
     queue: &DispatcherQueue,
     reply_to: CheckinGameMessage,
     text: String,
@@ -808,7 +773,6 @@ async fn queue_checkin_text<S, NextId>(
     next_virtual_id: NextId,
 ) -> Result<(), OutboundBuildError>
 where
-    S: VirtualMessageStore + Sync,
     NextId: FnMut() -> String,
 {
     let chat = checkin_chat_ref(reply_to);
@@ -828,7 +792,6 @@ where
         message_thread_id: reply_to.thread_id.unwrap_or_default().into(),
     };
     queue_text_message_parts(
-        store,
         queue,
         QueueTextRequest {
             message: &request,
@@ -843,8 +806,7 @@ where
     Ok(())
 }
 
-async fn queue_checkin_rich<S, NextId>(
-    store: &S,
+async fn queue_checkin_rich<NextId>(
     queue: &DispatcherQueue,
     reply_to: CheckinGameMessage,
     html: String,
@@ -853,7 +815,6 @@ async fn queue_checkin_rich<S, NextId>(
     next_virtual_id: NextId,
 ) -> Result<(), OutboundBuildError>
 where
-    S: VirtualMessageStore + Sync,
     NextId: FnMut() -> String,
 {
     let chat = checkin_chat_ref(reply_to);
@@ -872,7 +833,6 @@ where
         message_thread_id: reply_to.thread_id.unwrap_or_default().into(),
     };
     queue_rich_message(
-        store,
         queue,
         QueueRichRequest {
             message: &request,
@@ -887,24 +847,19 @@ where
     Ok(())
 }
 
-async fn send_queued_checkin_items<S>(
-    store: &S,
+async fn send_queued_checkin_items(
     ephemeral: Option<&openplotva_storage::RedisEphemeralMessageStore>,
     queue: &DispatcherQueue,
     telegram: &openplotva_telegram::TelegramClient,
     rich: &openplotva_telegram::RichApiClient,
-) -> Result<Option<i32>, CheckinGameSenderError>
-where
-    S: VirtualMessageStore + Sync,
-{
+) -> Result<Option<i32>, CheckinGameSenderError> {
     let mut first_message_id = None;
     let mut next = queue
         .dequeue_immediate()
         .or_else(|| queue.dequeue_regular());
     while let Some(item) = next {
         let report = if let Some(ephemeral) = ephemeral {
-            send_work_item_and_resolve_with_ephemeral(
-                store,
+            send_work_item_with_ephemeral(
                 ephemeral,
                 item,
                 OffsetDateTime::now_utc(),
@@ -915,13 +870,13 @@ where
             )
             .await
         } else {
-            send_work_item_and_resolve(store, item, |method| async move {
+            send_work_item(item, |method| async move {
                 openplotva_telegram::execute_telegram_method_with_rich(telegram, rich, method).await
             })
             .await
         };
         if first_message_id.is_none() {
-            first_message_id = report.resolved_message_id;
+            first_message_id = report.sent_message_id;
         }
         if let Some(error) = report.send_error {
             return Err(CheckinGameSenderError::Telegram(error));
@@ -1953,19 +1908,17 @@ pub type CheckinThemeVirtualIdFactory = VirtualIdFactory;
 
 /// Concrete check-in callback effects backed by direct Telegram calls and the dispatcher.
 #[derive(Clone)]
-pub struct CheckinThemeRuntimeEffects<Store, Executor> {
-    store: Store,
+pub struct CheckinThemeRuntimeEffects<Executor> {
     queue: Arc<DispatcherQueue>,
     executor: Executor,
     next_virtual_id: CheckinThemeVirtualIdFactory,
 }
 
-impl<Store, Executor> CheckinThemeRuntimeEffects<Store, Executor> {
+impl<Executor> CheckinThemeRuntimeEffects<Executor> {
     /// Build runtime check-in theme effects.
     #[must_use]
-    pub fn new(store: Store, queue: Arc<DispatcherQueue>, executor: Executor) -> Self {
+    pub fn new(queue: Arc<DispatcherQueue>, executor: Executor) -> Self {
         Self {
-            store,
             queue,
             executor,
             next_virtual_id: monotonic_virtual_id_factory("checkin-vmsg"),
@@ -1983,9 +1936,8 @@ impl<Store, Executor> CheckinThemeRuntimeEffects<Store, Executor> {
     }
 }
 
-impl<Store, Executor> CheckinThemeEffects for CheckinThemeRuntimeEffects<Store, Executor>
+impl<Executor> CheckinThemeEffects for CheckinThemeRuntimeEffects<Executor>
 where
-    Store: VirtualMessageStore + Send + Sync,
     Executor: CheckinCallbackMethodExecutor + Send + Sync,
 {
     type Error = CheckinThemeRuntimeEffectError;
@@ -2030,7 +1982,6 @@ where
                 message_thread_id: message.thread_id.map(i64::from).unwrap_or_default(),
             };
             queue_text_message_parts(
-                &self.store,
                 &self.queue,
                 QueueTextRequest {
                     message: &request,
@@ -2824,8 +2775,6 @@ mod tests {
         TelegramFileMetadataStoreFuture, UpdateHandler, UpdateHandlerFuture, UpdateStateStore,
         UpdateStateStoreFuture, process_update_with_state_store_at,
     };
-    use crate::virtual_messages::VirtualMessageStore;
-    use openplotva_core::MessageIdMapping;
     use openplotva_taskman::{JobPayload, JobType};
     use openplotva_telegram::{
         CallbackHandlerKind, DispatcherConfig, DispatcherQueue, TelegramOutboundMethodKind,
@@ -2834,10 +2783,7 @@ mod tests {
     use serde_json::{Value, json};
     use std::{
         collections::{HashMap, HashSet},
-        env,
-        future::Future,
-        io,
-        pin::Pin,
+        env, io,
         sync::{Arc, Mutex, MutexGuard},
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
@@ -3458,15 +3404,10 @@ mod tests {
     #[tokio::test]
     async fn checkin_theme_runtime_effects_execute_ack_method_directly()
     -> Result<(), Box<dyn std::error::Error>> {
-        let store = VirtualStoreStub::default();
         let dispatcher = Arc::new(DispatcherQueue::new(DispatcherConfig::default()));
         let executor = MethodExecutorStub::default();
-        let effects = CheckinThemeRuntimeEffects::new(
-            store.clone(),
-            Arc::clone(&dispatcher),
-            executor.clone(),
-        )
-        .with_virtual_id_factory(Arc::new(|| "checkin-vmsg-1".to_owned()));
+        let effects = CheckinThemeRuntimeEffects::new(Arc::clone(&dispatcher), executor.clone())
+            .with_virtual_id_factory(Arc::new(|| "checkin-vmsg-1".to_owned()));
         let openplotva_telegram::CallbackActionParse::Action { data, .. } =
             openplotva_telegram::parse_callback_action(
                 r#"{"action":"checkin_theme_select","init":"42","theme":"classic"}"#,
@@ -3484,7 +3425,6 @@ mod tests {
             executor.method_kinds(),
             vec![TelegramOutboundMethodKind::AnswerCallbackQuery]
         );
-        assert!(store.inserted().is_empty());
         assert!(dispatcher.snapshot().immediate.is_empty());
         Ok(())
     }
@@ -3492,12 +3432,10 @@ mod tests {
     #[tokio::test]
     async fn checkin_theme_runtime_effects_queue_error_notice_as_ephemeral_immediate()
     -> Result<(), Box<dyn std::error::Error>> {
-        let store = VirtualStoreStub::default();
         let dispatcher = Arc::new(DispatcherQueue::new(DispatcherConfig::default()));
         let executor = MethodExecutorStub::default();
-        let effects =
-            CheckinThemeRuntimeEffects::new(store.clone(), Arc::clone(&dispatcher), executor)
-                .with_virtual_id_factory(Arc::new(|| "checkin-notice-vmsg-1".to_owned()));
+        let effects = CheckinThemeRuntimeEffects::new(Arc::clone(&dispatcher), executor)
+            .with_virtual_id_factory(Arc::new(|| "checkin-notice-vmsg-1".to_owned()));
 
         effects
             .send_checkin_queue_error_notice(
@@ -3510,10 +3448,6 @@ mod tests {
             )
             .await?;
 
-        assert_eq!(
-            store.inserted(),
-            vec![("checkin-notice-vmsg-1".to_owned(), -10042, Some(0))]
-        );
         let item = dispatcher
             .dequeue_immediate()
             .expect("queued check-in queue-error notice");
@@ -4369,69 +4303,6 @@ mod tests {
                     .push(method.kind());
                 Ok(())
             })
-        }
-    }
-
-    type InsertedVirtualMessages = Arc<Mutex<Vec<(String, i64, Option<i32>)>>>;
-
-    #[derive(Clone, Default)]
-    struct VirtualStoreStub {
-        inserted: InsertedVirtualMessages,
-    }
-
-    impl VirtualStoreStub {
-        fn inserted(&self) -> Vec<(String, i64, Option<i32>)> {
-            self.inserted.lock().expect("inserted virtual ids").clone()
-        }
-    }
-
-    impl VirtualMessageStore for VirtualStoreStub {
-        type Error = io::Error;
-
-        fn get_mapping_by_virtual<'a>(
-            &'a self,
-            _vmsg_id: String,
-        ) -> Pin<Box<dyn Future<Output = Result<Option<MessageIdMapping>, Self::Error>> + Send + 'a>>
-        {
-            Box::pin(async { Ok(None) })
-        }
-
-        fn insert_virtual_message<'a>(
-            &'a self,
-            vmsg_id: String,
-            chat_id: i64,
-            thread_id: Option<i32>,
-        ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
-            self.inserted
-                .lock()
-                .expect("inserted virtual ids")
-                .push((vmsg_id, chat_id, thread_id));
-            Box::pin(async { Ok(()) })
-        }
-
-        fn resolve_virtual_message<'a>(
-            &'a self,
-            _vmsg_id: String,
-            _real_message_id: i32,
-        ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
-            Box::pin(async { Ok(()) })
-        }
-
-        fn enqueue_message_op<'a>(
-            &'a self,
-            _vmsg_id: String,
-            _chat_id: i64,
-            _op: &'static str,
-            _payload_json: Option<String>,
-        ) -> Pin<Box<dyn Future<Output = Result<i64, Self::Error>> + Send + 'a>> {
-            Box::pin(async { Ok(1) })
-        }
-
-        fn delete_mapping_by_virtual<'a>(
-            &'a self,
-            _vmsg_id: String,
-        ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
-            Box::pin(async { Ok(()) })
         }
     }
 

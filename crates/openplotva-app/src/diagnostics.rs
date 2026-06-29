@@ -21,8 +21,7 @@ use time::OffsetDateTime;
 
 use crate::updates::{UpdateHandler, UpdateHandlerFuture};
 use crate::virtual_messages::{
-    QueueTextRequest, VirtualIdFactory, VirtualMessageStore, monotonic_virtual_id_factory,
-    queue_text_message_parts,
+    QueueTextRequest, VirtualIdFactory, monotonic_virtual_id_factory, queue_text_message_parts,
 };
 
 const PING_COMMAND: &str = "ping";
@@ -96,25 +95,22 @@ pub trait DiagnosticsCommandEffects {
 pub type DiagnosticsVirtualIdFactory = VirtualIdFactory;
 
 #[derive(Clone)]
-pub struct DiagnosticsDispatcherEffects<Store> {
-    store: Store,
+pub struct DiagnosticsDispatcherEffects {
     queue: Arc<DispatcherQueue>,
     telegram: TelegramClient,
     redis: redis::Client,
     next_virtual_id: DiagnosticsVirtualIdFactory,
 }
 
-impl<Store> DiagnosticsDispatcherEffects<Store> {
+impl DiagnosticsDispatcherEffects {
     /// Build diagnostics effects backed by the normal dispatcher, direct Telegram, and Redis ping.
     #[must_use]
     pub fn new(
-        store: Store,
         queue: Arc<DispatcherQueue>,
         telegram: TelegramClient,
         redis: redis::Client,
     ) -> Self {
         Self {
-            store,
             queue,
             telegram,
             redis,
@@ -130,10 +126,7 @@ impl<Store> DiagnosticsDispatcherEffects<Store> {
     }
 }
 
-impl<Store> DiagnosticsCommandEffects for DiagnosticsDispatcherEffects<Store>
-where
-    Store: Clone + VirtualMessageStore + Send + Sync + 'static,
-{
+impl DiagnosticsCommandEffects for DiagnosticsDispatcherEffects {
     type Error = DiagnosticsDispatchEffectError;
 
     fn send_diagnostics_text<'a>(
@@ -141,14 +134,8 @@ where
         plan: DiagnosticsTextPlan,
     ) -> DiagnosticsEffectFuture<'a, Self::Error> {
         Box::pin(async move {
-            send_diagnostics_text_plan(
-                &self.store,
-                &self.queue,
-                &self.telegram,
-                &self.next_virtual_id,
-                plan,
-            )
-            .await
+            send_diagnostics_text_plan(&self.queue, &self.telegram, &self.next_virtual_id, plan)
+                .await
         })
     }
 
@@ -158,7 +145,6 @@ where
     ) -> DiagnosticsEffectFuture<'a, Self::Error> {
         Box::pin(async move {
             send_diagnostics_text_plan(
-                &self.store,
                 &self.queue,
                 &self.telegram,
                 &self.next_virtual_id,
@@ -166,7 +152,6 @@ where
             )
             .await?;
 
-            let store = self.store.clone();
             let queue = Arc::clone(&self.queue);
             let telegram = self.telegram.clone();
             let redis = self.redis.clone();
@@ -180,7 +165,6 @@ where
                     }
                 };
                 if let Err(error) = send_diagnostics_text_plan(
-                    &store,
                     &queue,
                     &telegram,
                     &next_virtual_id,
@@ -206,16 +190,12 @@ pub enum DiagnosticsDispatchEffectError {
     Direct(String),
 }
 
-async fn send_diagnostics_text_plan<Store>(
-    store: &Store,
+async fn send_diagnostics_text_plan(
     queue: &DispatcherQueue,
     telegram: &TelegramClient,
     next_virtual_id: &DiagnosticsVirtualIdFactory,
     plan: DiagnosticsTextPlan,
-) -> Result<(), DiagnosticsDispatchEffectError>
-where
-    Store: VirtualMessageStore + Sync,
-{
+) -> Result<(), DiagnosticsDispatchEffectError> {
     if plan.direct_chattable {
         let methods = build_text_message_methods(&plan.message, Some(&plan.reply_to))?;
         for method in methods {
@@ -227,7 +207,6 @@ where
     }
 
     queue_text_message_parts(
-        store,
         queue,
         QueueTextRequest {
             message: &plan.message,
@@ -598,7 +577,6 @@ fn escape_go_html_string(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openplotva_core::MessageIdMapping;
     use openplotva_telegram::{DispatcherConfig, TelegramOutboundMethodKind};
     use openplotva_updates::{UpdateConsumerConfig, UpdateStageOutcome};
     use std::{
@@ -911,17 +889,11 @@ mod tests {
         let _: i64 = redis::cmd("DEL").arg(&key).query_async(&mut redis).await?;
 
         let state_store = UpdateStateStoreStub::default();
-        let store = StoreStub::default();
         let queue = Arc::new(DispatcherQueue::new(DispatcherConfig::default()));
         let telegram = openplotva_telegram::telegram_client("123456:TEST")?;
         let effects = Arc::new(
-            DiagnosticsDispatcherEffects::new(
-                store.clone(),
-                Arc::clone(&queue),
-                telegram,
-                redis_client.clone(),
-            )
-            .with_virtual_id_factory(Arc::new(|| "diagnostics-live-vmsg-1".to_owned())),
+            DiagnosticsDispatcherEffects::new(Arc::clone(&queue), telegram, redis_client.clone())
+                .with_virtual_id_factory(Arc::new(|| "diagnostics-live-vmsg-1".to_owned())),
         );
         let next = Arc::new(UpdateHandlerStub::default());
         let handler = DiagnosticsCommandUpdateHandler::new(bot(), effects, Arc::clone(&next));
@@ -968,10 +940,6 @@ mod tests {
             vec!["chat:-42:supergroup::".to_owned(), "user:5:Ada:".to_owned()]
         );
         assert_eq!(next.handled_count(), 0);
-        assert_eq!(
-            store.inserts(),
-            vec![("diagnostics-live-vmsg-1".to_owned(), -42, Some(0))]
-        );
         let item = queue
             .dequeue_immediate()
             .ok_or_else(|| io::Error::other("expected debug error payload"))?;
@@ -1017,21 +985,15 @@ mod tests {
         let _: i64 = redis::cmd("DEL").arg(&key).query_async(&mut redis).await?;
 
         let state_store = UpdateStateStoreStub::default();
-        let store = StoreStub::default();
         let queue = Arc::new(DispatcherQueue::new(DispatcherConfig::default()));
         let telegram = openplotva_telegram::telegram_client("123456:TEST")?;
         let next_id = Arc::new(AtomicUsize::new(0));
         let effects = Arc::new(
-            DiagnosticsDispatcherEffects::new(
-                store.clone(),
-                Arc::clone(&queue),
-                telegram,
-                redis_client.clone(),
-            )
-            .with_virtual_id_factory(Arc::new(move || {
-                let id = next_id.fetch_add(1, Ordering::Relaxed) + 1;
-                format!("diagnostics-ping-live-vmsg-{id}")
-            })),
+            DiagnosticsDispatcherEffects::new(Arc::clone(&queue), telegram, redis_client.clone())
+                .with_virtual_id_factory(Arc::new(move || {
+                    let id = next_id.fetch_add(1, Ordering::Relaxed) + 1;
+                    format!("diagnostics-ping-live-vmsg-{id}")
+                })),
         );
         let next = Arc::new(UpdateHandlerStub::default());
         let handler = DiagnosticsCommandUpdateHandler::new(bot(), effects, Arc::clone(&next));
@@ -1086,13 +1048,6 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
 
-        assert_eq!(
-            store.inserts(),
-            vec![
-                ("diagnostics-ping-live-vmsg-1".to_owned(), -42, Some(0)),
-                ("diagnostics-ping-live-vmsg-2".to_owned(), -42, Some(0)),
-            ]
-        );
         let start = queue
             .dequeue_regular()
             .ok_or_else(|| io::Error::other("expected ping start payload"))?;
@@ -1192,72 +1147,6 @@ mod tests {
                     .push(format!("file:{}", params.file_unique_id));
                 Ok(())
             })
-        }
-    }
-
-    type VirtualInsertLog = Arc<Mutex<Vec<(String, i64, Option<i32>)>>>;
-
-    #[derive(Clone, Default)]
-    struct StoreStub {
-        inserts: VirtualInsertLog,
-    }
-
-    impl StoreStub {
-        fn inserts(&self) -> Vec<(String, i64, Option<i32>)> {
-            self.inserts.lock().expect("inserts").clone()
-        }
-
-        fn lock_inserts(&self) -> MutexGuard<'_, Vec<(String, i64, Option<i32>)>> {
-            self.inserts.lock().expect("inserts")
-        }
-    }
-
-    impl VirtualMessageStore for StoreStub {
-        type Error = io::Error;
-
-        fn get_mapping_by_virtual<'a>(
-            &'a self,
-            _vmsg_id: String,
-        ) -> Pin<Box<dyn Future<Output = Result<Option<MessageIdMapping>, Self::Error>> + Send + 'a>>
-        {
-            Box::pin(async { Ok(None) })
-        }
-
-        fn insert_virtual_message<'a>(
-            &'a self,
-            vmsg_id: String,
-            chat_id: i64,
-            thread_id: Option<i32>,
-        ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
-            Box::pin(async move {
-                self.lock_inserts().push((vmsg_id, chat_id, thread_id));
-                Ok(())
-            })
-        }
-
-        fn resolve_virtual_message<'a>(
-            &'a self,
-            _vmsg_id: String,
-            _real_message_id: i32,
-        ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
-            Box::pin(async { Ok(()) })
-        }
-
-        fn enqueue_message_op<'a>(
-            &'a self,
-            _vmsg_id: String,
-            _chat_id: i64,
-            _op: &'static str,
-            _payload_json: Option<String>,
-        ) -> Pin<Box<dyn Future<Output = Result<i64, Self::Error>> + Send + 'a>> {
-            Box::pin(async { Ok(1) })
-        }
-
-        fn delete_mapping_by_virtual<'a>(
-            &'a self,
-            _vmsg_id: String,
-        ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
-            Box::pin(async { Ok(()) })
         }
     }
 

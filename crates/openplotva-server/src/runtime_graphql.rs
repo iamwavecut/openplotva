@@ -20,10 +20,6 @@ pub type RuntimeSqlReaderFuture<'a> =
 pub type RuntimeEntityReaderFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, String>> + Send + 'a>>;
 
-/// Boxed future returned by runtime pending-operation readers.
-pub type RuntimePendingOpsReaderFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<Vec<RuntimePendingOpData>, String>> + Send + 'a>>;
-
 /// Boxed future returned by runtime safety-check readers.
 pub type RuntimeSafetyCheckReaderFuture<'a> =
     Pin<Box<dyn Future<Output = Result<RuntimeSafetyCheckConnectionData, String>> + Send + 'a>>;
@@ -97,11 +93,6 @@ pub trait RuntimeEntityReader: Send + Sync {
         &'a self,
         chat_id: i64,
     ) -> RuntimeEntityReaderFuture<'a, Vec<RuntimeChatMemberWithUserData>>;
-}
-
-/// Runtime API pending virtual-message operation read boundary.
-pub trait RuntimePendingOpsReader: Send + Sync {
-    fn pending_ops<'a>(&'a self, limit: i32) -> RuntimePendingOpsReaderFuture<'a>;
 }
 
 /// Runtime API safety-check read boundary.
@@ -190,7 +181,6 @@ pub struct RuntimeApiLiveDiagnostics {
     pub redis_inspector: Option<Arc<dyn RuntimeRedisInspector>>,
     pub sql_reader: Option<Arc<dyn RuntimeSqlReader>>,
     pub entity_reader: Option<Arc<dyn RuntimeEntityReader>>,
-    pub pending_ops_reader: Option<Arc<dyn RuntimePendingOpsReader>>,
     pub safety_check_reader: Option<Arc<dyn RuntimeSafetyCheckReader>>,
     pub llm_trace_inspector: Option<Arc<dyn RuntimeLlmTraceInspector>>,
     pub routing_event_inspector: Option<Arc<dyn RuntimeRoutingEventInspector>>,
@@ -627,19 +617,6 @@ pub struct RuntimeChatMemberWithUserData {
     pub user: Option<RuntimeUserData>,
 }
 
-/// Runtime API pending virtual-message operation from a live reader.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct RuntimePendingOpData {
-    pub id: i64,
-    pub vmsg_id: String,
-    pub chat_id: i64,
-    pub op: String,
-    pub payload: Option<Value>,
-    pub status: String,
-    pub created_at: String,
-    pub attempts: i32,
-}
-
 /// Runtime API safety-check list filter after GraphQL/default shaping.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RuntimeSafetyChecksFilter {
@@ -1067,7 +1044,6 @@ pub fn runtime_api_graphql_schema_with_live_diagnostics(
             redis_inspector: diagnostics.redis_inspector,
             sql_reader: diagnostics.sql_reader,
             entity_reader: diagnostics.entity_reader,
-            pending_ops_reader: diagnostics.pending_ops_reader,
             safety_check_reader: diagnostics.safety_check_reader,
             llm_trace_inspector: diagnostics.llm_trace_inspector,
             routing_event_inspector: diagnostics.routing_event_inspector,
@@ -1092,7 +1068,6 @@ pub struct RuntimeQuery {
     redis_inspector: Option<Arc<dyn RuntimeRedisInspector>>,
     sql_reader: Option<Arc<dyn RuntimeSqlReader>>,
     entity_reader: Option<Arc<dyn RuntimeEntityReader>>,
-    pending_ops_reader: Option<Arc<dyn RuntimePendingOpsReader>>,
     safety_check_reader: Option<Arc<dyn RuntimeSafetyCheckReader>>,
     llm_trace_inspector: Option<Arc<dyn RuntimeLlmTraceInspector>>,
     routing_event_inspector: Option<Arc<dyn RuntimeRoutingEventInspector>>,
@@ -1269,17 +1244,6 @@ impl RuntimeQuery {
                 priority.unwrap_or(RUNTIME_TASKMAN_LOWEST_PRIORITY),
             )
             .map(TaskmanDiagnostics::from)
-            .map_err(async_graphql::Error::new)
-    }
-
-    async fn pending_ops(&self, limit: Option<i32>) -> async_graphql::Result<Vec<PendingOp>> {
-        let Some(reader) = self.pending_ops_reader.as_deref() else {
-            return Err("runtime pending-op reader is not configured".into());
-        };
-        reader
-            .pending_ops(clamp_positive_range_i32(limit.unwrap_or(0), 50, 200))
-            .await
-            .map(|items| items.into_iter().map(PendingOp::from).collect())
             .map_err(async_graphql::Error::new)
     }
 
@@ -2487,35 +2451,6 @@ impl From<RuntimeTaskmanQueueDiagnosticsData> for TaskmanQueueDiagnostics {
             active: queue.active,
             worker_count: queue.worker_count,
             eta_seconds: queue.eta_seconds,
-        }
-    }
-}
-
-#[derive(Clone, SimpleObject)]
-struct PendingOp {
-    id: ID,
-    #[graphql(name = "vmsgID")]
-    vmsg_id: String,
-    #[graphql(name = "chatID")]
-    chat_id: ID,
-    op: String,
-    payload: Option<Json<Value>>,
-    status: String,
-    created_at: String,
-    attempts: i32,
-}
-
-impl From<RuntimePendingOpData> for PendingOp {
-    fn from(op: RuntimePendingOpData) -> Self {
-        Self {
-            id: ID(op.id.to_string()),
-            vmsg_id: op.vmsg_id,
-            chat_id: ID(op.chat_id.to_string()),
-            op: op.op,
-            payload: op.payload.map(Json),
-            status: op.status,
-            created_at: op.created_at,
-            attempts: op.attempts,
         }
     }
 }

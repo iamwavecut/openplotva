@@ -46,8 +46,8 @@ use crate::{
     rate_limits::{self, ChatRateLimitPolicy, RateLimitStore, TaskEnqueueRateLimit},
     updates::{UpdateHandler, UpdateHandlerFuture},
     virtual_messages::{
-        QueueStickerRequest, QueueTextRequest, VirtualIdFactory, VirtualMessageStore,
-        monotonic_virtual_id_factory, queue_sticker_message, queue_text_message_parts,
+        QueueStickerRequest, QueueTextRequest, VirtualIdFactory, monotonic_virtual_id_factory,
+        queue_sticker_message, queue_text_message_parts,
     },
 };
 
@@ -663,18 +663,16 @@ impl<Generator, Sender> DirectDrawApiRuntimeEffects<Generator, Sender> {
 
 /// Dispatcher-backed random-response effects.
 #[derive(Clone)]
-pub struct RandomDialogDispatcherEffects<Store> {
-    store: Store,
+pub struct RandomDialogDispatcherEffects {
     queue: Arc<DispatcherQueue>,
     next_virtual_id: VirtualIdFactory,
 }
 
-impl<Store> RandomDialogDispatcherEffects<Store> {
+impl RandomDialogDispatcherEffects {
     /// Build random-response effects backed by the normal outbound dispatcher.
     #[must_use]
-    pub fn new(store: Store, queue: Arc<DispatcherQueue>) -> Self {
+    pub fn new(queue: Arc<DispatcherQueue>) -> Self {
         Self {
-            store,
             queue,
             next_virtual_id: monotonic_virtual_id_factory("random-dialog-vmsg"),
         }
@@ -688,21 +686,14 @@ impl<Store> RandomDialogDispatcherEffects<Store> {
     }
 }
 
-impl<Store> fmt::Debug for RandomDialogDispatcherEffects<Store>
-where
-    Store: fmt::Debug,
-{
+impl fmt::Debug for RandomDialogDispatcherEffects {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RandomDialogDispatcherEffects")
-            .field("store", &self.store)
             .finish_non_exhaustive()
     }
 }
 
-impl<Store> RandomDialogEffects for RandomDialogDispatcherEffects<Store>
-where
-    Store: VirtualMessageStore + Send + Sync,
-{
+impl RandomDialogEffects for RandomDialogDispatcherEffects {
     type Error = RandomDialogEffectError;
 
     fn send_random_obscenified_text<'a>(
@@ -711,7 +702,6 @@ where
     ) -> DialogMessageFuture<'a, (), Self::Error> {
         Box::pin(async move {
             queue_text_message_parts(
-                &self.store,
                 &self.queue,
                 QueueTextRequest {
                     message: &plan.message,
@@ -728,17 +718,13 @@ where
     }
 }
 
-impl<Store> DirectSongNoticeEffects for RandomDialogDispatcherEffects<Store>
-where
-    Store: VirtualMessageStore + Send + Sync,
-{
+impl DirectSongNoticeEffects for RandomDialogDispatcherEffects {
     fn send_direct_song_notice<'a>(
         &'a self,
         plan: DirectSongNoticePlan,
     ) -> DirectSongNoticeFuture<'a> {
         Box::pin(async move {
             queue_text_message_parts(
-                &self.store,
                 &self.queue,
                 QueueTextRequest {
                     message: &plan.message,
@@ -761,7 +747,6 @@ where
     ) -> DirectDrawFailureFuture<'a> {
         Box::pin(async move {
             queue_sticker_message(
-                &self.store,
                 &self.queue,
                 QueueStickerRequest {
                     message: &plan.sticker,
@@ -775,7 +760,6 @@ where
             .await
             .map_err(|error| error.to_string())?;
             queue_text_message_parts(
-                &self.store,
                 &self.queue,
                 QueueTextRequest {
                     message: &plan.failure_notice.message,
@@ -789,7 +773,6 @@ where
             .await
             .map_err(|error| error.to_string())?;
             queue_text_message_parts(
-                &self.store,
                 &self.queue,
                 QueueTextRequest {
                     message: &plan.restriction_notice.message,
@@ -3068,7 +3051,6 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use openplotva_core::MessageIdMapping;
     use openplotva_taskman::{
         DEFAULT_PRIORITY, HIGHEST_PRIORITY, IMAGE_REGULAR_QUEUE_NAME, IMAGE_VIP_QUEUE_NAME,
         JobStatus, MUSIC_VIP_QUEUE_NAME, MusicGenJobParams, new_music_gen_job_at,
@@ -3422,10 +3404,7 @@ mod tests {
         let outbound_queue = Arc::new(openplotva_telegram::DispatcherQueue::new(
             openplotva_telegram::DispatcherConfig::default(),
         ));
-        let effects = crate::dialog_jobs::DialogDispatcherEffects::new(
-            VirtualStoreStub::default(),
-            Arc::clone(&outbound_queue),
-        );
+        let effects = crate::dialog_jobs::DialogDispatcherEffects::new(Arc::clone(&outbound_queue));
         let worker_report = crate::dialog_jobs::process_dialog_job_once_in_queue_at(
             queue.as_ref(),
             DIALOG_AIFARM_QUEUE_NAME,
@@ -3583,10 +3562,7 @@ mod tests {
         let outbound_queue = Arc::new(openplotva_telegram::DispatcherQueue::new(
             openplotva_telegram::DispatcherConfig::default(),
         ));
-        let effects = crate::dialog_jobs::DialogDispatcherEffects::new(
-            VirtualStoreStub::default(),
-            Arc::clone(&outbound_queue),
-        );
+        let effects = crate::dialog_jobs::DialogDispatcherEffects::new(Arc::clone(&outbound_queue));
         let worker_report = crate::dialog_jobs::process_dialog_job_once_in_queue_at(
             queue.as_ref(),
             DIALOG_AIFARM_QUEUE_NAME,
@@ -3646,13 +3622,9 @@ mod tests {
         let state_store = UpdateStateStoreStub::default();
         let scheduler = SchedulerStub::default();
         let settings = SettingsStoreStub::with_chat(random_chat_settings(100, true));
-        let dispatch_store = VirtualStoreStub::default();
         let dispatcher_queue = Arc::new(DispatcherQueue::new(DispatcherConfig::default()));
-        let effects = RandomDialogDispatcherEffects::new(
-            dispatch_store.clone(),
-            Arc::clone(&dispatcher_queue),
-        )
-        .with_virtual_id_factory(Arc::new(|| "random-obscenifier-vmsg-1".to_owned()));
+        let effects = RandomDialogDispatcherEffects::new(Arc::clone(&dispatcher_queue))
+            .with_virtual_id_factory(Arc::new(|| "random-obscenifier-vmsg-1".to_owned()));
         let rng = RngStub {
             random_response: 99,
             obscenifier: 0,
@@ -3715,10 +3687,6 @@ mod tests {
             })
         );
         assert!(scheduler.calls().is_empty());
-        assert_eq!(
-            dispatch_store.inserted(),
-            vec![("random-obscenifier-vmsg-1".to_owned(), -100, None)]
-        );
 
         let snapshot = dispatcher_queue.snapshot();
         assert!(snapshot.immediate.is_empty());
@@ -6612,14 +6580,10 @@ mod tests {
             .with_song_audio_permission(Arc::new(SongAudioPermissionStub(case.audio_allowed)));
         let scheduler = SchedulerStub::default();
         let settings = SettingsStoreStub::default();
-        let dispatch_store = VirtualStoreStub::default();
         let dispatcher_queue = Arc::new(DispatcherQueue::new(DispatcherConfig::default()));
         let virtual_id = case.virtual_id;
-        let effects = RandomDialogDispatcherEffects::new(
-            dispatch_store.clone(),
-            Arc::clone(&dispatcher_queue),
-        )
-        .with_virtual_id_factory(Arc::new(move || virtual_id.to_owned()));
+        let effects = RandomDialogDispatcherEffects::new(Arc::clone(&dispatcher_queue))
+            .with_virtual_id_factory(Arc::new(move || virtual_id.to_owned()));
         let rng = RngStub {
             random_response: 0,
             obscenifier: 0,
@@ -6676,10 +6640,6 @@ mod tests {
         );
         assert_eq!(*lock(&route), Some(case.expected_route));
         assert!(queue.records().is_empty());
-        assert_eq!(
-            dispatch_store.inserted(),
-            vec![(case.virtual_id.to_owned(), -100, None)]
-        );
         let snapshot = dispatcher_queue.snapshot();
         assert_eq!(snapshot.immediate.len(), 1);
         assert!(snapshot.regular.is_empty());
@@ -7602,14 +7562,10 @@ mod tests {
                 .with_image_edit_file_resolver(resolver.clone());
         let scheduler = SchedulerStub::default();
         let settings = SettingsStoreStub::default();
-        let dispatch_store = VirtualStoreStub::default();
         let dispatcher_queue = Arc::new(DispatcherQueue::new(DispatcherConfig::default()));
         let virtual_id = case.virtual_id;
-        let effects = RandomDialogDispatcherEffects::new(
-            dispatch_store.clone(),
-            Arc::clone(&dispatcher_queue),
-        )
-        .with_virtual_id_factory(Arc::new(move || virtual_id.to_owned()));
+        let effects = RandomDialogDispatcherEffects::new(Arc::clone(&dispatcher_queue))
+            .with_virtual_id_factory(Arc::new(move || virtual_id.to_owned()));
         let rng = RngStub {
             random_response: 0,
             obscenifier: 0,
@@ -7669,10 +7625,6 @@ mod tests {
         assert!(queue.records().is_empty());
         assert!(resolver.calls().is_empty());
         assert!(resolver.capture_calls().is_empty());
-        assert_eq!(
-            dispatch_store.inserted(),
-            vec![(case.virtual_id.to_owned(), 42, None)]
-        );
 
         let snapshot = dispatcher_queue.snapshot();
         assert_eq!(snapshot.immediate.len(), 1);
@@ -8624,68 +8576,6 @@ mod tests {
             let output = self.output.clone();
             lock(&self.inputs).push(input);
             Box::pin(async move { Ok(output) })
-        }
-    }
-
-    #[derive(Clone, Default)]
-    struct VirtualStoreStub {
-        inserted: Arc<Mutex<VirtualInsertCalls>>,
-    }
-
-    type VirtualInsertCalls = Vec<(String, i64, Option<i32>)>;
-
-    impl VirtualStoreStub {
-        fn inserted(&self) -> Vec<(String, i64, Option<i32>)> {
-            lock(&self.inserted).clone()
-        }
-    }
-
-    impl crate::virtual_messages::VirtualMessageStore for VirtualStoreStub {
-        type Error = std::io::Error;
-
-        fn get_mapping_by_virtual<'a>(
-            &'a self,
-            _vmsg_id: String,
-        ) -> Pin<Box<dyn Future<Output = Result<Option<MessageIdMapping>, Self::Error>> + Send + 'a>>
-        {
-            Box::pin(async { Ok(None) })
-        }
-
-        fn insert_virtual_message<'a>(
-            &'a self,
-            vmsg_id: String,
-            chat_id: i64,
-            thread_id: Option<i32>,
-        ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
-            Box::pin(async move {
-                lock(&self.inserted).push((vmsg_id, chat_id, thread_id));
-                Ok(())
-            })
-        }
-
-        fn resolve_virtual_message<'a>(
-            &'a self,
-            _vmsg_id: String,
-            _real_message_id: i32,
-        ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
-            Box::pin(async { Ok(()) })
-        }
-
-        fn enqueue_message_op<'a>(
-            &'a self,
-            _vmsg_id: String,
-            _chat_id: i64,
-            _op: &'static str,
-            _payload_json: Option<String>,
-        ) -> Pin<Box<dyn Future<Output = Result<i64, Self::Error>> + Send + 'a>> {
-            Box::pin(async { Ok(1) })
-        }
-
-        fn delete_mapping_by_virtual<'a>(
-            &'a self,
-            _vmsg_id: String,
-        ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
-            Box::pin(async { Ok(()) })
         }
     }
 

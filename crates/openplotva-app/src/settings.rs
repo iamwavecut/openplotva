@@ -34,9 +34,9 @@ use time::OffsetDateTime;
 
 use crate::updates::{UpdateHandler, UpdateHandlerFuture};
 use crate::virtual_messages::{
-    QueueRichRequest, QueueTextReport, QueueTextRequest, VirtualIdFactory, VirtualMessageStore,
+    QueueRichRequest, QueueTextReport, QueueTextRequest, VirtualIdFactory,
     monotonic_virtual_id_factory, queue_rich_message, queue_text_message_parts,
-    send_work_item_and_resolve_with_ephemeral,
+    send_work_item_with_ephemeral,
 };
 
 const GROUP_SETTINGS_CONTROL_JOB_TITLE: &str = "group settings";
@@ -601,7 +601,6 @@ where
 
 #[derive(Clone, Debug)]
 pub struct TelegramJoinGreetingSender {
-    virtual_store: openplotva_storage::PostgresVirtualMessageStore,
     ephemeral_store: openplotva_storage::RedisEphemeralMessageStore,
     permissions: Arc<
         crate::permissions::ChatPermissionPolicy<openplotva_storage::PostgresChatSettingsStore>,
@@ -614,7 +613,6 @@ pub struct TelegramJoinGreetingSender {
 impl TelegramJoinGreetingSender {
     /// Build a concrete join-greeting sender for runtime effects.
     pub fn new(
-        virtual_store: openplotva_storage::PostgresVirtualMessageStore,
         ephemeral_store: openplotva_storage::RedisEphemeralMessageStore,
         permissions: Arc<
             crate::permissions::ChatPermissionPolicy<openplotva_storage::PostgresChatSettingsStore>,
@@ -623,7 +621,6 @@ impl TelegramJoinGreetingSender {
         rich: openplotva_telegram::RichApiClient,
     ) -> Self {
         Self {
-            virtual_store,
             ephemeral_store,
             permissions,
             telegram,
@@ -691,7 +688,6 @@ impl NewMembersGreetingSender for TelegramJoinGreetingSender {
                 message_thread_id: message.thread_id.unwrap_or_default().into(),
             };
             let queued = queue_rich_message(
-                &self.virtual_store,
                 &queue,
                 QueueRichRequest {
                     message: &request,
@@ -713,8 +709,7 @@ impl NewMembersGreetingSender for TelegramJoinGreetingSender {
                 .dequeue_immediate()
                 .or_else(|| queue.dequeue_regular());
             while let Some(item) = next {
-                let report = send_work_item_and_resolve_with_ephemeral(
-                    &self.virtual_store,
+                let report = send_work_item_with_ephemeral(
                     &self.ephemeral_store,
                     item,
                     OffsetDateTime::now_utc(),
@@ -729,7 +724,7 @@ impl NewMembersGreetingSender for TelegramJoinGreetingSender {
                 )
                 .await;
                 if first_message_id.is_none() {
-                    first_message_id = report.resolved_message_id;
+                    first_message_id = report.sent_message_id;
                 }
                 if let Some(error) = report.send_error {
                     tracing::warn!(
@@ -1058,9 +1053,7 @@ pub struct NewMembersFollowupUpdateInput<'a> {
 
 /// Borrowed ports used by the settings-owned decoded-update slice.
 #[derive(Clone, Copy, Debug)]
-pub struct SettingsUpdatePorts<'a, Store, Members, Queue> {
-    /// Virtual-message mapping store used by outbound text queueing.
-    pub store: &'a Store,
+pub struct SettingsUpdatePorts<'a, Members, Queue> {
     /// Dispatcher queue used for immediate/future sends.
     pub dispatcher_queue: &'a DispatcherQueue,
     /// Chat-member store used by new-member service messages.
@@ -1142,8 +1135,7 @@ impl SettingsUpdateHandlerConfig {
 
 /// `UpdateHandler` adapter for settings-owned decoded update behavior.
 #[derive(Clone)]
-pub struct SettingsUpdateHandler<Store, Members, Queue, Next> {
-    store: Arc<Store>,
+pub struct SettingsUpdateHandler<Members, Queue, Next> {
     dispatcher_queue: Arc<DispatcherQueue>,
     member_store: Arc<Members>,
     control_queue: Arc<Queue>,
@@ -1154,10 +1146,9 @@ pub struct SettingsUpdateHandler<Store, Members, Queue, Next> {
     next: Arc<Next>,
 }
 
-impl<Store, Members, Queue, Next> SettingsUpdateHandler<Store, Members, Queue, Next> {
+impl<Members, Queue, Next> SettingsUpdateHandler<Members, Queue, Next> {
     /// Build a settings-aware handler around the real downstream update handler.
     pub fn new(
-        store: Arc<Store>,
         dispatcher_queue: Arc<DispatcherQueue>,
         member_store: Arc<Members>,
         control_queue: Arc<Queue>,
@@ -1165,7 +1156,6 @@ impl<Store, Members, Queue, Next> SettingsUpdateHandler<Store, Members, Queue, N
         next: Arc<Next>,
     ) -> Self {
         Self {
-            store,
             dispatcher_queue,
             member_store,
             control_queue,
@@ -1185,10 +1175,8 @@ impl<Store, Members, Queue, Next> SettingsUpdateHandler<Store, Members, Queue, N
     }
 }
 
-impl<Store, Members, Queue, Next> UpdateHandler
-    for SettingsUpdateHandler<Store, Members, Queue, Next>
+impl<Members, Queue, Next> UpdateHandler for SettingsUpdateHandler<Members, Queue, Next>
 where
-    Store: VirtualMessageStore + Send + Sync,
     Members: NewMembersFollowupMemberStore + Send + Sync,
     Queue: SettingsControlJobQueue + Send + Sync,
     Next: UpdateHandler + Send + Sync,
@@ -1199,7 +1187,6 @@ where
         Box::pin(async move {
             handle_settings_update_or_else_at(
                 SettingsUpdatePorts {
-                    store: self.store.as_ref(),
                     dispatcher_queue: self.dispatcher_queue.as_ref(),
                     member_store: self.member_store.as_ref(),
                     control_queue: self.control_queue.as_ref(),
@@ -1310,8 +1297,7 @@ pub enum AdminChatSettingsCommandUpdateOutcome {
 }
 
 #[derive(Clone)]
-pub struct AdminChatSettingsCommandUpdateHandler<Store, Resolver, Next> {
-    store: Arc<Store>,
+pub struct AdminChatSettingsCommandUpdateHandler<Resolver, Next> {
     dispatcher_queue: Arc<DispatcherQueue>,
     resolver: Arc<Resolver>,
     admin_ids: Arc<[i64]>,
@@ -1321,11 +1307,10 @@ pub struct AdminChatSettingsCommandUpdateHandler<Store, Resolver, Next> {
     next: Arc<Next>,
 }
 
-impl<Store, Resolver, Next> AdminChatSettingsCommandUpdateHandler<Store, Resolver, Next> {
+impl<Resolver, Next> AdminChatSettingsCommandUpdateHandler<Resolver, Next> {
     /// Build the admin chat-settings command handler around a real downstream handler.
     #[must_use]
     pub fn new(
-        store: Arc<Store>,
         dispatcher_queue: Arc<DispatcherQueue>,
         resolver: Arc<Resolver>,
         admin_ids: Vec<i64>,
@@ -1334,7 +1319,6 @@ impl<Store, Resolver, Next> AdminChatSettingsCommandUpdateHandler<Store, Resolve
         next: Arc<Next>,
     ) -> Self {
         Self {
-            store,
             dispatcher_queue,
             resolver,
             admin_ids: Arc::from(admin_ids.into_boxed_slice()),
@@ -1353,10 +1337,8 @@ impl<Store, Resolver, Next> AdminChatSettingsCommandUpdateHandler<Store, Resolve
     }
 }
 
-impl<Store, Resolver, Next> UpdateHandler
-    for AdminChatSettingsCommandUpdateHandler<Store, Resolver, Next>
+impl<Resolver, Next> UpdateHandler for AdminChatSettingsCommandUpdateHandler<Resolver, Next>
 where
-    Store: VirtualMessageStore + Send + Sync,
     Resolver: AdminChatTargetResolver + Send + Sync,
     Next: UpdateHandler + Send + Sync,
 {
@@ -1366,7 +1348,6 @@ where
         Box::pin(async move {
             handle_admin_chat_settings_command_update_or_else_at(
                 AdminChatSettingsCommandUpdateRuntime {
-                    store: self.store.as_ref(),
                     dispatcher_queue: self.dispatcher_queue.as_ref(),
                     resolver: self.resolver.as_ref(),
                     admin_ids: &self.admin_ids,
@@ -1384,8 +1365,7 @@ where
 }
 
 #[derive(Clone, Copy)]
-pub struct AdminChatSettingsCommandUpdateRuntime<'a, Store, Resolver> {
-    pub store: &'a Store,
+pub struct AdminChatSettingsCommandUpdateRuntime<'a, Resolver> {
     pub dispatcher_queue: &'a DispatcherQueue,
     pub resolver: &'a Resolver,
     /// Authorized Telegram admin user IDs.
@@ -1399,18 +1379,16 @@ pub struct AdminChatSettingsCommandUpdateRuntime<'a, Store, Resolver> {
 }
 
 pub async fn handle_admin_chat_settings_command_update_or_else_at<
-    Store,
     Resolver,
     HandleFn,
     HandleFuture,
     HandleError,
 >(
-    runtime: AdminChatSettingsCommandUpdateRuntime<'_, Store, Resolver>,
+    runtime: AdminChatSettingsCommandUpdateRuntime<'_, Resolver>,
     update: TelegramUpdate,
     handle_other: HandleFn,
 ) -> Result<AdminChatSettingsCommandUpdateOutcome, HandleError>
 where
-    Store: VirtualMessageStore + Sync,
     Resolver: AdminChatTargetResolver + Sync,
     HandleFn: FnOnce(TelegramUpdate) -> HandleFuture,
     HandleFuture: Future<Output = Result<(), HandleError>>,
@@ -1436,7 +1414,6 @@ where
         .unwrap_or_default();
     if !runtime.admin_ids.contains(&actor_user_id) {
         return match queue_admin_chat_settings_ephemeral_text(
-            runtime.store,
             runtime.dispatcher_queue,
             message,
             ADMIN_COMMAND_UNAUTHORIZED_TEXT,
@@ -1457,7 +1434,6 @@ where
     }
 
     let outcome = handle_admin_chat_settings_command_update(
-        runtime.store,
         runtime.dispatcher_queue,
         runtime.resolver,
         &update,
@@ -1476,8 +1452,7 @@ where
     }
 }
 
-pub async fn handle_private_settings_command_update<S, NextId>(
-    store: &S,
+pub async fn handle_private_settings_command_update<NextId>(
     queue: &DispatcherQueue,
     update: &TelegramUpdate,
     bot_username: &str,
@@ -1485,7 +1460,6 @@ pub async fn handle_private_settings_command_update<S, NextId>(
     next_virtual_id: NextId,
 ) -> Result<SettingsCommandOutcome, OutboundBuildError>
 where
-    S: VirtualMessageStore + Sync,
     NextId: FnMut() -> String,
 {
     let UpdateType::Message(message) = &update.update_type else {
@@ -1528,7 +1502,6 @@ where
         message_thread_id: 0,
     };
     let report = queue_text_message_parts(
-        store,
         queue,
         QueueTextRequest {
             message: &request,
@@ -1544,8 +1517,7 @@ where
     Ok(SettingsCommandOutcome::Queued(report))
 }
 
-pub async fn handle_admin_chat_settings_command_update<S, Resolver, NextId>(
-    store: &S,
+pub async fn handle_admin_chat_settings_command_update<Resolver, NextId>(
     dispatcher_queue: &DispatcherQueue,
     resolver: &Resolver,
     update: &TelegramUpdate,
@@ -1553,7 +1525,6 @@ pub async fn handle_admin_chat_settings_command_update<S, Resolver, NextId>(
     next_virtual_id: NextId,
 ) -> Result<AdminChatSettingsCommandOutcome, OutboundBuildError>
 where
-    S: VirtualMessageStore + Sync,
     Resolver: AdminChatTargetResolver + Sync,
     NextId: FnMut() -> String,
 {
@@ -1570,7 +1541,6 @@ where
     let target_identifier = command.arguments.trim();
     if target_identifier.is_empty() {
         let report = queue_admin_chat_settings_text(
-            store,
             dispatcher_queue,
             message,
             AdminChatSettingsText {
@@ -1591,7 +1561,6 @@ where
             let text =
                 format!("Could not find or access chat: {target_identifier}. Error: {error}");
             let report = queue_admin_chat_settings_text(
-                store,
                 dispatcher_queue,
                 message,
                 AdminChatSettingsText {
@@ -1609,7 +1578,6 @@ where
 
     let Some(button_url) = openplotva_web::settings_button_url(web_app_url, target.id) else {
         let report = queue_admin_chat_settings_text(
-            store,
             dispatcher_queue,
             message,
             AdminChatSettingsText {
@@ -1631,7 +1599,6 @@ where
     );
     let keyboard = openplotva_telegram::build_private_settings_keyboard(button_url);
     let report = queue_admin_chat_settings_text(
-        store,
         dispatcher_queue,
         message,
         AdminChatSettingsText {
@@ -1646,8 +1613,7 @@ where
     Ok(AdminChatSettingsCommandOutcome::Queued(report))
 }
 
-pub async fn execute_group_settings_control_job_at<S, Effects, NextId>(
-    store: &S,
+pub async fn execute_group_settings_control_job_at<Effects, NextId>(
     dispatcher_queue: &DispatcherQueue,
     effects: &Effects,
     params: &ControlJobParams,
@@ -1655,7 +1621,6 @@ pub async fn execute_group_settings_control_job_at<S, Effects, NextId>(
     next_virtual_id: NextId,
 ) -> Result<GroupSettingsControlJobOutcome, OutboundBuildError>
 where
-    S: VirtualMessageStore + Sync,
     Effects: GroupSettingsControlJobEffects + Sync,
     NextId: FnMut() -> String,
 {
@@ -1672,7 +1637,6 @@ where
         Ok(true) => {}
         Ok(false) => {
             queue_group_settings_control_text(
-                store,
                 dispatcher_queue,
                 params,
                 GROUP_SETTINGS_PERMISSION_DENIED_TEXT,
@@ -1686,7 +1650,6 @@ where
         Err(error) => {
             let error = error.to_string();
             queue_group_settings_control_text(
-                store,
                 dispatcher_queue,
                 params,
                 GROUP_SETTINGS_CHECK_FAILED_TEXT,
@@ -1711,7 +1674,6 @@ where
         &deep_link,
     );
     queue_group_settings_control_text(
-        store,
         dispatcher_queue,
         params,
         GROUP_SETTINGS_OPEN_PRIVATE_TEXT,
@@ -1723,8 +1685,7 @@ where
     Ok(GroupSettingsControlJobOutcome::SentLink)
 }
 
-pub async fn execute_new_members_followup_control_job_at<S, Effects, NextId>(
-    store: &S,
+pub async fn execute_new_members_followup_control_job_at<Effects, NextId>(
     dispatcher_queue: &DispatcherQueue,
     effects: &Effects,
     params: &ControlJobParams,
@@ -1732,7 +1693,6 @@ pub async fn execute_new_members_followup_control_job_at<S, Effects, NextId>(
     next_virtual_id: NextId,
 ) -> Result<NewMembersFollowupControlJobOutcome, OutboundBuildError>
 where
-    S: VirtualMessageStore + Sync,
     Effects: NewMembersFollowupControlJobEffects + Sync,
     NextId: FnMut() -> String,
 {
@@ -1756,7 +1716,6 @@ where
                 bot_url,
             );
             queue_new_members_followup_control_text(
-                store,
                 dispatcher_queue,
                 params,
                 Some(ReplyMarkup::from([[button]])),
@@ -1776,9 +1735,8 @@ where
 }
 
 /// Process one settings-owned taskman control job, if available.
-pub async fn process_settings_control_job_once_at<Queue, Store, GroupEffects, NewEffects, NextId>(
+pub async fn process_settings_control_job_once_at<Queue, GroupEffects, NewEffects, NextId>(
     queue: &Queue,
-    store: &Store,
     dispatcher_queue: &DispatcherQueue,
     group_effects: &GroupEffects,
     new_members_effects: &NewEffects,
@@ -1787,7 +1745,6 @@ pub async fn process_settings_control_job_once_at<Queue, Store, GroupEffects, Ne
 ) -> SettingsControlJobWorkerReport
 where
     Queue: SettingsControlJobWorkerQueue + Sync,
-    Store: VirtualMessageStore + Sync,
     GroupEffects: GroupSettingsControlJobEffects + Sync,
     NewEffects: NewMembersFollowupControlJobEffects + Sync,
     NextId: FnMut() -> String,
@@ -1819,7 +1776,6 @@ where
 
     let execution = match params.data.kind {
         ControlKind::GroupSettings => execute_group_settings_control_job_at(
-            store,
             dispatcher_queue,
             group_effects,
             &params,
@@ -1829,7 +1785,6 @@ where
         .await
         .map(SettingsControlJobExecution::GroupSettings),
         ControlKind::NewMembersFollowup => execute_new_members_followup_control_job_at(
-            store,
             dispatcher_queue,
             new_members_effects,
             &params,
@@ -1937,8 +1892,7 @@ pub fn new_members_followup_control_job_from_update_at(
     new_members_followup_control_job_from_message_at(message, bot_id, created)
 }
 
-pub async fn handle_group_settings_command_update_at<S, Queue, NextId>(
-    store: &S,
+pub async fn handle_group_settings_command_update_at<Queue, NextId>(
     dispatcher_queue: &DispatcherQueue,
     control_queue: &Queue,
     update: &TelegramUpdate,
@@ -1947,7 +1901,6 @@ pub async fn handle_group_settings_command_update_at<S, Queue, NextId>(
     next_virtual_id: NextId,
 ) -> Result<GroupSettingsCommandOutcome, OutboundBuildError>
 where
-    S: VirtualMessageStore + Sync,
     Queue: SettingsControlJobQueue + Sync,
     NextId: FnMut() -> String,
 {
@@ -1962,7 +1915,6 @@ where
         GroupSettingsControlJobBuild::PrivateChat => Ok(GroupSettingsCommandOutcome::PrivateChat),
         GroupSettingsControlJobBuild::UnsupportedSameChatSender => {
             let report = queue_group_settings_notice(
-                store,
                 dispatcher_queue,
                 message,
                 SETTINGS_SAME_CHAT_DECLINE_TEXT,
@@ -1977,7 +1929,6 @@ where
         }
         GroupSettingsControlJobBuild::UnsupportedChannelSender => {
             let report = queue_group_settings_notice(
-                store,
                 dispatcher_queue,
                 message,
                 SETTINGS_CHANNEL_DECLINE_TEXT,
@@ -2003,7 +1954,6 @@ where
             {
                 Ok(()) => {
                     let notice = queue_group_settings_notice(
-                        store,
                         dispatcher_queue,
                         message,
                         GROUP_SETTINGS_WAIT_NOTICE_TEXT,
@@ -2017,7 +1967,6 @@ where
                 Err(error) => {
                     tracing::warn!(%error, "failed to assign group settings control job");
                     let report = queue_group_settings_notice(
-                        store,
                         dispatcher_queue,
                         message,
                         SETTINGS_QUEUE_ERROR_TEXT,
@@ -2033,8 +1982,7 @@ where
     }
 }
 
-pub async fn handle_new_members_followup_update_at<S, Members, Queue, NextId>(
-    store: &S,
+pub async fn handle_new_members_followup_update_at<Members, Queue, NextId>(
     dispatcher_queue: &DispatcherQueue,
     member_store: &Members,
     control_queue: &Queue,
@@ -2042,7 +1990,6 @@ pub async fn handle_new_members_followup_update_at<S, Members, Queue, NextId>(
     next_virtual_id: NextId,
 ) -> Result<NewMembersFollowupUpdateOutcome, OutboundBuildError>
 where
-    S: VirtualMessageStore + Sync,
     Members: NewMembersFollowupMemberStore + Sync,
     Queue: SettingsControlJobQueue + Sync,
     NextId: FnMut() -> String,
@@ -2074,7 +2021,6 @@ where
                 Err(error) => {
                     tracing::warn!(%error, "failed to assign new-members follow-up control job");
                     let notice = queue_group_settings_notice(
-                        store,
                         dispatcher_queue,
                         message,
                         SETTINGS_QUEUE_ERROR_TEXT,
@@ -2095,7 +2041,6 @@ where
 
 /// Handle settings-owned decoded-update behavior, delegating the rest.
 pub async fn handle_settings_update_or_else_at<
-    Store,
     Members,
     Queue,
     NextId,
@@ -2103,14 +2048,13 @@ pub async fn handle_settings_update_or_else_at<
     HandleFuture,
     HandleError,
 >(
-    ports: SettingsUpdatePorts<'_, Store, Members, Queue>,
+    ports: SettingsUpdatePorts<'_, Members, Queue>,
     update: TelegramUpdate,
     context: SettingsUpdateContext<'_>,
     next_virtual_id: NextId,
     handle_other: HandleFn,
 ) -> Result<SettingsUpdateRoute, SettingsUpdateError>
 where
-    Store: VirtualMessageStore + Sync,
     Members: NewMembersFollowupMemberStore + Sync,
     Queue: SettingsControlJobQueue + Sync,
     NextId: Fn() -> String,
@@ -2124,7 +2068,6 @@ where
         .expect("delegated update should remain available until delegation");
 
     let new_members = handle_new_members_followup_update_at(
-        ports.store,
         ports.dispatcher_queue,
         ports.member_store,
         ports.control_queue,
@@ -2145,7 +2088,6 @@ where
     );
 
     let private_settings = handle_private_settings_command_update(
-        ports.store,
         ports.dispatcher_queue,
         update_ref,
         context.bot_username,
@@ -2162,7 +2104,6 @@ where
     }
 
     let group_settings = handle_group_settings_command_update_at(
-        ports.store,
         ports.dispatcher_queue,
         ports.control_queue,
         update_ref,
@@ -2367,8 +2308,7 @@ fn settings_outbound_error(error: OutboundBuildError) -> SettingsUpdateError {
     }
 }
 
-async fn queue_group_settings_notice<S, NextId>(
-    store: &S,
+async fn queue_group_settings_notice<NextId>(
     queue: &DispatcherQueue,
     message: &TelegramMessage,
     text: &str,
@@ -2377,7 +2317,6 @@ async fn queue_group_settings_notice<S, NextId>(
     next_virtual_id: NextId,
 ) -> Result<QueueTextReport, OutboundBuildError>
 where
-    S: VirtualMessageStore + Sync,
     NextId: FnMut() -> String,
 {
     let chat = message_chat_ref(message);
@@ -2397,7 +2336,6 @@ where
         message_thread_id: message.message_thread_id.unwrap_or_default(),
     };
     queue_text_message_parts(
-        store,
         queue,
         QueueTextRequest {
             message: &request,
@@ -2411,8 +2349,7 @@ where
     .await
 }
 
-async fn queue_group_settings_control_text<S, NextId>(
-    store: &S,
+async fn queue_group_settings_control_text<NextId>(
     queue: &DispatcherQueue,
     params: &ControlJobParams,
     text: &str,
@@ -2421,7 +2358,6 @@ async fn queue_group_settings_control_text<S, NextId>(
     next_virtual_id: NextId,
 ) -> Result<QueueTextReport, OutboundBuildError>
 where
-    S: VirtualMessageStore + Sync,
     NextId: FnMut() -> String,
 {
     let chat = ChatRef {
@@ -2444,7 +2380,6 @@ where
         message_thread_id: 0,
     };
     queue_text_message_parts(
-        store,
         queue,
         QueueTextRequest {
             message: &request,
@@ -2458,15 +2393,13 @@ where
     .await
 }
 
-async fn queue_new_members_followup_control_text<S, NextId>(
-    store: &S,
+async fn queue_new_members_followup_control_text<NextId>(
     queue: &DispatcherQueue,
     params: &ControlJobParams,
     reply_markup: Option<ReplyMarkup>,
     next_virtual_id: NextId,
 ) -> Result<QueueTextReport, OutboundBuildError>
 where
-    S: VirtualMessageStore + Sync,
     NextId: FnMut() -> String,
 {
     let chat = ChatRef {
@@ -2489,7 +2422,6 @@ where
         message_thread_id: 0,
     };
     queue_text_message_parts(
-        store,
         queue,
         QueueTextRequest {
             message: &request,
@@ -2503,15 +2435,13 @@ where
     .await
 }
 
-async fn queue_admin_chat_settings_text<S, NextId>(
-    store: &S,
+async fn queue_admin_chat_settings_text<NextId>(
     queue: &DispatcherQueue,
     message: &TelegramMessage,
     text: AdminChatSettingsText<'_>,
     next_virtual_id: NextId,
 ) -> Result<QueueTextReport, OutboundBuildError>
 where
-    S: VirtualMessageStore + Sync,
     NextId: FnMut() -> String,
 {
     let chat = message_chat_ref(message);
@@ -2531,7 +2461,6 @@ where
         message_thread_id: message.message_thread_id.unwrap_or_default(),
     };
     queue_text_message_parts(
-        store,
         queue,
         QueueTextRequest {
             message: &request,
@@ -2545,15 +2474,13 @@ where
     .await
 }
 
-async fn queue_admin_chat_settings_ephemeral_text<S, NextId>(
-    store: &S,
+async fn queue_admin_chat_settings_ephemeral_text<NextId>(
     queue: &DispatcherQueue,
     message: &TelegramMessage,
     text: &str,
     next_virtual_id: NextId,
 ) -> Result<QueueTextReport, OutboundBuildError>
 where
-    S: VirtualMessageStore + Sync,
     NextId: FnMut() -> String,
 {
     let chat = message_chat_ref(message);
@@ -2573,7 +2500,6 @@ where
         message_thread_id: message.message_thread_id.unwrap_or_default(),
     };
     queue_text_message_parts(
-        store,
         queue,
         QueueTextRequest {
             message: &request,
@@ -3623,10 +3549,7 @@ mod tests {
     use std::{
         env,
         error::Error,
-        fmt,
-        future::Future,
-        io,
-        pin::Pin,
+        fmt, io,
         sync::{
             Arc, Mutex,
             atomic::{AtomicU64, Ordering},
@@ -3637,7 +3560,7 @@ mod tests {
     use carapax::types::{
         ChatMember, ChatMemberAdministrator, ChatMemberCreator, Update as TelegramUpdate, User,
     };
-    use openplotva_core::{ChatSettings, MessageIdMapping, UserSettings, UserState};
+    use openplotva_core::{ChatSettings, UserSettings, UserState};
     use openplotva_storage::{ChatMemberRecord, ChatMemberUpsert};
     use openplotva_taskman::{
         CONTROL_QUEUE_NAME, ControlJobData, ControlJobParams, ControlKind,
@@ -3659,7 +3582,7 @@ mod tests {
         TelegramFileMetadataStoreFuture, UpdateHandler, UpdateHandlerFuture, UpdateStateStore,
         UpdateStateStoreFuture, process_update_with_state_store_at,
     };
-    use crate::virtual_messages::{VirtualIdFactory, VirtualMessageStore};
+    use crate::virtual_messages::VirtualIdFactory;
     use openplotva_updates::{UpdateConsumerConfig, UpdateStageOutcome};
 
     use super::{
@@ -3723,7 +3646,6 @@ mod tests {
     async fn settings_control_worker_skips_payment_job_and_completes_group_settings_job()
     -> Result<(), Box<dyn Error>> {
         let queue = InMemoryPaymentControlJobQueue::new();
-        let store = StoreStub::default();
         let dispatcher_queue = DispatcherQueue::new(DispatcherConfig::default());
         let group_effects = GroupSettingsEffectsStub::allowing();
         let new_members_effects = NewMembersFollowupEffectsStub::blocked();
@@ -3738,7 +3660,6 @@ mod tests {
 
         let report = process_settings_control_job_once_at(
             &queue,
-            &store,
             &dispatcher_queue,
             &group_effects,
             &new_members_effects,
@@ -3776,7 +3697,6 @@ mod tests {
     async fn settings_control_worker_completes_new_members_followup_job()
     -> Result<(), Box<dyn Error>> {
         let queue = InMemoryPaymentControlJobQueue::new();
-        let store = StoreStub::default();
         let dispatcher_queue = DispatcherQueue::new(DispatcherConfig::default());
         let group_effects = GroupSettingsEffectsStub::allowing();
         let new_members_effects = NewMembersFollowupEffectsStub::blocked();
@@ -3792,7 +3712,6 @@ mod tests {
 
         let report = process_settings_control_job_once_at(
             &queue,
-            &store,
             &dispatcher_queue,
             &group_effects,
             &new_members_effects,
@@ -3828,12 +3747,10 @@ mod tests {
     #[tokio::test]
     async fn private_settings_command_queues_go_webapp_button_with_bypass_and_immediate()
     -> Result<(), Box<dyn Error>> {
-        let store = StoreStub::default();
         let queue = DispatcherQueue::new(DispatcherConfig::default());
         let update = private_settings_update()?;
 
         let outcome = handle_private_settings_command_update(
-            &store,
             &queue,
             &update,
             "PlotvaBot",
@@ -3848,7 +3765,6 @@ mod tests {
         assert_eq!(report.enqueued_count(), 1);
         assert_eq!(report.parts[0].virtual_id, "settings-v1");
         assert!(report.parts[0].immediate);
-        assert_eq!(store.inserted(), vec![("settings-v1".to_owned(), 42, None)]);
 
         let item = queue
             .dequeue_immediate()
@@ -3885,35 +3801,27 @@ mod tests {
     #[tokio::test]
     async fn private_settings_command_skips_blank_webapp_url_like_go() -> Result<(), Box<dyn Error>>
     {
-        let store = StoreStub::default();
         let queue = DispatcherQueue::new(DispatcherConfig::default());
         let update = private_settings_update()?;
 
-        let outcome = handle_private_settings_command_update(
-            &store,
-            &queue,
-            &update,
-            "PlotvaBot",
-            "",
-            || "settings-v1".to_owned(),
-        )
-        .await?;
+        let outcome =
+            handle_private_settings_command_update(&queue, &update, "PlotvaBot", "", || {
+                "settings-v1".to_owned()
+            })
+            .await?;
 
         assert_eq!(outcome, SettingsCommandOutcome::WebAppUrlMissing);
         assert!(queue.snapshot().immediate.is_empty());
-        assert!(store.inserted().is_empty());
         Ok(())
     }
 
     #[tokio::test]
     async fn private_settings_handler_leaves_group_settings_to_group_path()
     -> Result<(), Box<dyn Error>> {
-        let store = StoreStub::default();
         let queue = DispatcherQueue::new(DispatcherConfig::default());
         let update = group_settings_update()?;
 
         let outcome = handle_private_settings_command_update(
-            &store,
             &queue,
             &update,
             "PlotvaBot",
@@ -3924,7 +3832,6 @@ mod tests {
 
         assert_eq!(outcome, SettingsCommandOutcome::NonPrivateChat);
         assert!(queue.snapshot().immediate.is_empty());
-        assert!(store.inserted().is_empty());
         Ok(())
     }
 
@@ -3967,14 +3874,12 @@ mod tests {
     #[tokio::test]
     async fn group_settings_command_assigns_control_job_and_sends_wait_notice()
     -> Result<(), Box<dyn Error>> {
-        let store = StoreStub::default();
         let dispatcher = DispatcherQueue::new(DispatcherConfig::default());
         let control_queue = SettingsControlJobQueueStub::default();
         let update = group_settings_update()?;
         let created = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
 
         let outcome = handle_group_settings_command_update_at(
-            &store,
             &dispatcher,
             &control_queue,
             &update,
@@ -3994,10 +3899,6 @@ mod tests {
         assert_eq!(assigned[0].0, CONTROL_QUEUE_NAME);
         assert_eq!(assigned[0].1.title, "group settings");
 
-        assert_eq!(
-            store.inserted(),
-            vec![("group-settings-v1".to_owned(), -10042, Some(0))]
-        );
         let item = dispatcher
             .dequeue_immediate()
             .expect("group settings wait notice should enqueue immediately");
@@ -4029,14 +3930,12 @@ mod tests {
     #[tokio::test]
     async fn group_settings_command_declines_same_chat_sender_without_queueing_job()
     -> Result<(), Box<dyn Error>> {
-        let store = StoreStub::default();
         let dispatcher = DispatcherQueue::new(DispatcherConfig::default());
         let control_queue = SettingsControlJobQueueStub::default();
         let update = same_chat_settings_update()?;
         let created = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
 
         let outcome = handle_group_settings_command_update_at(
-            &store,
             &dispatcher,
             &control_queue,
             &update,
@@ -4067,21 +3966,18 @@ mod tests {
             )
         );
         assert_eq!(value["reply_parameters"]["message_id"], json!(78));
-        assert!(store.inserted().len() == 1);
         Ok(())
     }
 
     #[tokio::test]
     async fn group_settings_command_queue_error_sends_go_failure_notice()
     -> Result<(), Box<dyn Error>> {
-        let store = StoreStub::default();
         let dispatcher = DispatcherQueue::new(DispatcherConfig::default());
         let control_queue = SettingsControlJobQueueStub::failing();
         let update = group_settings_update()?;
         let created = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
 
         let outcome = handle_group_settings_command_update_at(
-            &store,
             &dispatcher,
             &control_queue,
             &update,
@@ -4127,7 +4023,6 @@ mod tests {
     #[tokio::test]
     async fn admin_chat_settings_command_queues_target_settings_button_with_bypass_and_immediate()
     -> Result<(), Box<dyn Error>> {
-        let store = StoreStub::default();
         let dispatcher = DispatcherQueue::new(DispatcherConfig::default());
         let resolver = AdminChatTargetResolverStub::with_target(super::AdminChatSettingsTarget {
             id: -100777,
@@ -4139,7 +4034,6 @@ mod tests {
         let update = admin_chat_settings_update("/admin_chat_settings @target_lab")?;
 
         let outcome = super::handle_admin_chat_settings_command_update(
-            &store,
             &dispatcher,
             &resolver,
             &update,
@@ -4153,10 +4047,6 @@ mod tests {
         };
         assert_eq!(report.enqueued_count(), 1);
         assert_eq!(resolver.calls(), vec!["@target_lab".to_owned()]);
-        assert_eq!(
-            store.inserted(),
-            vec![("admin-settings-v1".to_owned(), 42, None)]
-        );
 
         let item = dispatcher
             .dequeue_immediate()
@@ -4187,13 +4077,11 @@ mod tests {
     #[tokio::test]
     async fn admin_chat_settings_command_sends_usage_without_target() -> Result<(), Box<dyn Error>>
     {
-        let store = StoreStub::default();
         let dispatcher = DispatcherQueue::new(DispatcherConfig::default());
         let resolver = AdminChatTargetResolverStub::default();
         let update = admin_chat_settings_update("/admin_chat_settings   ")?;
 
         let outcome = super::handle_admin_chat_settings_command_update(
-            &store,
             &dispatcher,
             &resolver,
             &update,
@@ -4224,13 +4112,11 @@ mod tests {
     #[tokio::test]
     async fn admin_chat_settings_command_reports_resolve_error_like_go()
     -> Result<(), Box<dyn Error>> {
-        let store = StoreStub::default();
         let dispatcher = DispatcherQueue::new(DispatcherConfig::default());
         let resolver = AdminChatTargetResolverStub::failing();
         let update = admin_chat_settings_update("/admin_chat_settings missing_chat")?;
 
         let outcome = super::handle_admin_chat_settings_command_update(
-            &store,
             &dispatcher,
             &resolver,
             &update,
@@ -4261,7 +4147,6 @@ mod tests {
     #[tokio::test]
     async fn admin_chat_settings_update_wrapper_rejects_unauthorized_with_ephemeral_denial()
     -> Result<(), Box<dyn Error>> {
-        let store = StoreStub::default();
         let dispatcher = DispatcherQueue::new(DispatcherConfig::default());
         let resolver = AdminChatTargetResolverStub::default();
         let next = UpdateHandlerStub::default();
@@ -4271,7 +4156,6 @@ mod tests {
 
         let outcome = handle_admin_chat_settings_command_update_or_else_at(
             AdminChatSettingsCommandUpdateRuntime {
-                store: &store,
                 dispatcher_queue: &dispatcher,
                 resolver: &resolver,
                 admin_ids: &admin_ids,
@@ -4287,10 +4171,6 @@ mod tests {
         assert_eq!(outcome, AdminChatSettingsCommandUpdateOutcome::Unauthorized);
         assert!(next.calls().is_empty());
         assert!(resolver.calls().is_empty());
-        assert_eq!(
-            store.inserted(),
-            vec![("admin-chat-settings-denial-v1".to_owned(), 42, None)]
-        );
         let item = dispatcher
             .dequeue_immediate()
             .expect("admin chat settings denial should enqueue immediately");
@@ -4308,7 +4188,6 @@ mod tests {
     #[tokio::test]
     async fn admin_chat_settings_update_wrapper_handles_authorized_command_before_next()
     -> Result<(), Box<dyn Error>> {
-        let store = StoreStub::default();
         let dispatcher = DispatcherQueue::new(DispatcherConfig::default());
         let resolver = AdminChatTargetResolverStub::with_target(super::AdminChatSettingsTarget {
             id: -100777,
@@ -4323,7 +4202,6 @@ mod tests {
 
         let outcome = handle_admin_chat_settings_command_update_or_else_at(
             AdminChatSettingsCommandUpdateRuntime {
-                store: &store,
                 dispatcher_queue: &dispatcher,
                 resolver: &resolver,
                 admin_ids: &admin_ids,
@@ -4344,10 +4222,6 @@ mod tests {
         ));
         assert!(next.calls().is_empty());
         assert_eq!(resolver.calls(), vec!["@target_lab".to_owned()]);
-        assert_eq!(
-            store.inserted(),
-            vec![("admin-chat-settings-v1".to_owned(), 42, None)]
-        );
         assert!(dispatcher.dequeue_immediate().is_some());
         Ok(())
     }
@@ -4355,12 +4229,10 @@ mod tests {
     #[tokio::test]
     async fn admin_chat_settings_update_handler_delegates_group_command_without_bot_target()
     -> Result<(), Box<dyn Error>> {
-        let store = Arc::new(StoreStub::default());
         let dispatcher = Arc::new(DispatcherQueue::new(DispatcherConfig::default()));
         let resolver = Arc::new(AdminChatTargetResolverStub::default());
         let next = Arc::new(UpdateHandlerStub::default());
         let handler = AdminChatSettingsCommandUpdateHandler::new(
-            Arc::clone(&store),
             dispatcher,
             resolver,
             vec![42],
@@ -4376,7 +4248,6 @@ mod tests {
             .await?;
 
         assert_eq!(next.calls(), vec![12351]);
-        assert!(store.inserted().is_empty());
         Ok(())
     }
 
@@ -4406,7 +4277,6 @@ mod tests {
             .await?;
         assert_eq!(update_queue.len().await?, 2);
 
-        let store = Arc::new(StoreStub::default());
         let dispatcher = Arc::new(DispatcherQueue::new(DispatcherConfig::default()));
         let resolver = Arc::new(AdminChatTargetResolverStub::with_target(
             super::AdminChatSettingsTarget {
@@ -4425,7 +4295,6 @@ mod tests {
             format!("admin-chat-settings-live-v{id}")
         });
         let handler = AdminChatSettingsCommandUpdateHandler::new(
-            Arc::clone(&store),
             Arc::clone(&dispatcher),
             Arc::clone(&resolver),
             vec![42],
@@ -4479,14 +4348,6 @@ mod tests {
             resolver.calls(),
             vec!["@target_lab".to_owned(), "@target_lab".to_owned()]
         );
-        assert_eq!(
-            store.inserted(),
-            vec![
-                ("admin-chat-settings-live-v1".to_owned(), 42, None),
-                ("admin-chat-settings-live-v2".to_owned(), -10042, Some(0)),
-            ]
-        );
-
         let private_item = dispatcher
             .dequeue_immediate()
             .expect("private admin chat settings should enqueue immediately");
@@ -4540,13 +4401,11 @@ mod tests {
     #[tokio::test]
     async fn group_settings_executor_syncs_admins_and_sends_deep_link_when_allowed()
     -> Result<(), Box<dyn Error>> {
-        let store = StoreStub::default();
         let dispatcher = DispatcherQueue::new(DispatcherConfig::default());
         let effects = GroupSettingsEffectsStub::allowing();
         let params = group_settings_control_params();
 
         let outcome = execute_group_settings_control_job_at(
-            &store,
             &dispatcher,
             &effects,
             &params,
@@ -4558,10 +4417,6 @@ mod tests {
         assert_eq!(outcome, super::GroupSettingsControlJobOutcome::SentLink);
         assert_eq!(effects.permission_checks(), vec![(-10042, 42)]);
         assert_eq!(effects.synced_admin_chats(), vec![-10042]);
-        assert_eq!(
-            store.inserted(),
-            vec![("settings-link-v1".to_owned(), -10042, None)]
-        );
 
         let item = dispatcher
             .dequeue_immediate()
@@ -4597,13 +4452,11 @@ mod tests {
     #[tokio::test]
     async fn group_settings_executor_sends_rights_decline_when_not_allowed()
     -> Result<(), Box<dyn Error>> {
-        let store = StoreStub::default();
         let dispatcher = DispatcherQueue::new(DispatcherConfig::default());
         let effects = GroupSettingsEffectsStub::denying();
         let params = group_settings_control_params();
 
         let outcome = execute_group_settings_control_job_at(
-            &store,
             &dispatcher,
             &effects,
             &params,
@@ -4636,13 +4489,11 @@ mod tests {
     #[tokio::test]
     async fn group_settings_executor_sends_check_failure_and_reports_error()
     -> Result<(), Box<dyn Error>> {
-        let store = StoreStub::default();
         let dispatcher = DispatcherQueue::new(DispatcherConfig::default());
         let effects = GroupSettingsEffectsStub::failing_permission_check();
         let params = group_settings_control_params();
 
         let outcome = execute_group_settings_control_job_at(
-            &store,
             &dispatcher,
             &effects,
             &params,
@@ -4676,20 +4527,15 @@ mod tests {
     #[tokio::test]
     async fn group_settings_executor_rejects_blank_bot_username_before_sync_or_send()
     -> Result<(), Box<dyn Error>> {
-        let store = StoreStub::default();
         let dispatcher = DispatcherQueue::new(DispatcherConfig::default());
         let effects = GroupSettingsEffectsStub::allowing();
         let params = group_settings_control_params();
 
-        let outcome = execute_group_settings_control_job_at(
-            &store,
-            &dispatcher,
-            &effects,
-            &params,
-            "",
-            || "settings-link-v1".to_owned(),
-        )
-        .await?;
+        let outcome =
+            execute_group_settings_control_job_at(&dispatcher, &effects, &params, "", || {
+                "settings-link-v1".to_owned()
+            })
+            .await?;
 
         assert_eq!(
             outcome,
@@ -4698,20 +4544,17 @@ mod tests {
         assert_eq!(effects.permission_checks(), vec![(-10042, 42)]);
         assert!(effects.synced_admin_chats().is_empty());
         assert!(dispatcher.snapshot().immediate.is_empty());
-        assert!(store.inserted().is_empty());
         Ok(())
     }
 
     #[tokio::test]
     async fn new_members_followup_executor_enables_chat_and_queues_blocked_notice_when_bot_added()
     -> Result<(), Box<dyn Error>> {
-        let store = StoreStub::default();
         let dispatcher = DispatcherQueue::new(DispatcherConfig::default());
         let effects = NewMembersFollowupEffectsStub::blocked();
         let params = new_members_followup_control_params(true);
 
         let outcome = execute_new_members_followup_control_job_at(
-            &store,
             &dispatcher,
             &effects,
             &params,
@@ -4737,11 +4580,6 @@ mod tests {
                 new_chat_member_ids: vec![7, 8],
             }]
         );
-        assert_eq!(
-            store.inserted(),
-            vec![("new-members-unblock-v1".to_owned(), -10042, None)]
-        );
-
         let item = dispatcher
             .dequeue_immediate()
             .expect("blocked bot-added follow-up should enqueue the bypass notice immediately");
@@ -4776,13 +4614,11 @@ mod tests {
     #[tokio::test]
     async fn new_members_followup_executor_skips_blocked_notice_when_bot_was_not_added()
     -> Result<(), Box<dyn Error>> {
-        let store = StoreStub::default();
         let dispatcher = DispatcherQueue::new(DispatcherConfig::default());
         let effects = NewMembersFollowupEffectsStub::blocked();
         let params = new_members_followup_control_params(false);
 
         let outcome = execute_new_members_followup_control_job_at(
-            &store,
             &dispatcher,
             &effects,
             &params,
@@ -4808,7 +4644,6 @@ mod tests {
                 new_chat_member_ids: vec![7, 8],
             }]
         );
-        assert!(store.inserted().is_empty());
         assert!(dispatcher.snapshot().immediate.is_empty());
         assert!(dispatcher.snapshot().regular.is_empty());
         Ok(())
@@ -4817,20 +4652,15 @@ mod tests {
     #[tokio::test]
     async fn new_members_followup_executor_keeps_empty_settings_url_when_username_missing()
     -> Result<(), Box<dyn Error>> {
-        let store = StoreStub::default();
         let dispatcher = DispatcherQueue::new(DispatcherConfig::default());
         let effects = NewMembersFollowupEffectsStub::blocked();
         let params = new_members_followup_control_params(true);
 
-        let outcome = execute_new_members_followup_control_job_at(
-            &store,
-            &dispatcher,
-            &effects,
-            &params,
-            "",
-            || "new-members-empty-url-v1".to_owned(),
-        )
-        .await?;
+        let outcome =
+            execute_new_members_followup_control_job_at(&dispatcher, &effects, &params, "", || {
+                "new-members-empty-url-v1".to_owned()
+            })
+            .await?;
 
         assert_eq!(
             outcome,
@@ -4971,14 +4801,12 @@ mod tests {
     #[tokio::test]
     async fn new_members_followup_update_upserts_members_and_assigns_control_job()
     -> Result<(), Box<dyn Error>> {
-        let store = StoreStub::default();
         let dispatcher = DispatcherQueue::new(DispatcherConfig::default());
         let member_store = GroupSettingsMemberStoreStub::default();
         let control_queue = SettingsControlJobQueueStub::default();
         let update = new_members_update()?;
 
         let outcome = handle_new_members_followup_update_at(
-            &store,
             &dispatcher,
             &member_store,
             &control_queue,
@@ -5013,7 +4841,6 @@ mod tests {
         assert_eq!(assigned.len(), 1);
         assert_eq!(assigned[0].0, CONTROL_QUEUE_NAME);
         assert_eq!(assigned[0].1.title, "new members followup");
-        assert!(store.inserted().is_empty());
         assert!(dispatcher.snapshot().immediate.is_empty());
         assert!(dispatcher.snapshot().regular.is_empty());
         Ok(())
@@ -5022,14 +4849,12 @@ mod tests {
     #[tokio::test]
     async fn new_members_followup_update_queue_error_sends_go_failure_notice()
     -> Result<(), Box<dyn Error>> {
-        let store = StoreStub::default();
         let dispatcher = DispatcherQueue::new(DispatcherConfig::default());
         let member_store = GroupSettingsMemberStoreStub::default();
         let control_queue = SettingsControlJobQueueStub::failing();
         let update = new_members_update()?;
 
         let outcome = handle_new_members_followup_update_at(
-            &store,
             &dispatcher,
             &member_store,
             &control_queue,
@@ -5051,10 +4876,6 @@ mod tests {
         };
         assert_eq!(member_upsert_errors, 0);
         assert_eq!(notice.enqueued_count(), 1);
-        assert_eq!(
-            store.inserted(),
-            vec![("new-members-queue-error-v1".to_owned(), -10042, Some(0))]
-        );
         let item = dispatcher
             .dequeue_immediate()
             .expect("new-members queue failure should enqueue ephemeral failure text");
@@ -5073,7 +4894,6 @@ mod tests {
     #[tokio::test]
     async fn settings_update_wrapper_handles_private_settings_without_delegation()
     -> Result<(), Box<dyn Error>> {
-        let store = StoreStub::default();
         let dispatcher = DispatcherQueue::new(DispatcherConfig::default());
         let member_store = GroupSettingsMemberStoreStub::default();
         let control_queue = SettingsControlJobQueueStub::default();
@@ -5083,7 +4903,6 @@ mod tests {
 
         let route = handle_settings_update_or_else_at(
             SettingsUpdatePorts {
-                store: &store,
                 dispatcher_queue: &dispatcher,
                 member_store: &member_store,
                 control_queue: &control_queue,
@@ -5123,7 +4942,6 @@ mod tests {
     #[tokio::test]
     async fn settings_update_wrapper_runs_new_members_then_delegates_like_go()
     -> Result<(), Box<dyn Error>> {
-        let store = StoreStub::default();
         let dispatcher = DispatcherQueue::new(DispatcherConfig::default());
         let member_store = GroupSettingsMemberStoreStub::default();
         let control_queue = SettingsControlJobQueueStub::default();
@@ -5133,7 +4951,6 @@ mod tests {
 
         let route = handle_settings_update_or_else_at(
             SettingsUpdatePorts {
-                store: &store,
                 dispatcher_queue: &dispatcher,
                 member_store: &member_store,
                 control_queue: &control_queue,
@@ -5173,7 +4990,6 @@ mod tests {
         );
         assert_eq!(member_store.upserts().len(), 2);
         assert_eq!(control_queue.assigned().len(), 1);
-        assert!(store.inserted().is_empty());
         assert!(dispatcher.snapshot().immediate.is_empty());
         Ok(())
     }
@@ -5181,14 +4997,12 @@ mod tests {
     #[tokio::test]
     async fn settings_update_handler_intercepts_group_settings_before_wrapped_handler()
     -> Result<(), Box<dyn Error>> {
-        let store = Arc::new(StoreStub::default());
         let dispatcher = Arc::new(DispatcherQueue::new(DispatcherConfig::default()));
         let member_store = Arc::new(GroupSettingsMemberStoreStub::default());
         let control_queue = Arc::new(SettingsControlJobQueueStub::default());
         let next = Arc::new(UpdateHandlerStub::default());
         let ids: VirtualIdFactory = Arc::new(|| "settings-handler-v1".to_owned());
         let handler = SettingsUpdateHandler::new(
-            Arc::clone(&store),
             Arc::clone(&dispatcher),
             Arc::clone(&member_store),
             Arc::clone(&control_queue),
@@ -5205,10 +5019,6 @@ mod tests {
         assert!(next.calls().is_empty());
         assert_eq!(control_queue.assigned().len(), 1);
         assert_eq!(control_queue.assigned()[0].1.title, "group settings");
-        assert_eq!(
-            store.inserted(),
-            vec![("settings-handler-v1".to_owned(), -10042, Some(0))]
-        );
         assert_eq!(dispatcher.snapshot().immediate.len(), 1);
         Ok(())
     }
@@ -5232,7 +5042,6 @@ mod tests {
             .await?;
         assert_eq!(update_queue.len().await?, 1);
 
-        let store = Arc::new(StoreStub::default());
         let settings_dispatcher = Arc::new(DispatcherQueue::new(DispatcherConfig::default()));
         let help_dispatcher = Arc::new(DispatcherQueue::new(DispatcherConfig::default()));
         let member_store = Arc::new(GroupSettingsMemberStoreStub::default());
@@ -5249,7 +5058,6 @@ mod tests {
         let ids: VirtualIdFactory = Arc::new(|| "start-settings-v1".to_owned());
         let settings_handler = Arc::new(
             SettingsUpdateHandler::new(
-                Arc::clone(&store),
                 Arc::clone(&settings_dispatcher),
                 Arc::clone(&member_store),
                 Arc::clone(&control_queue),
@@ -5306,10 +5114,6 @@ mod tests {
             state_store.calls(),
             vec!["chat:42:private".to_owned(), "user:42:Ada".to_owned()]
         );
-        assert_eq!(
-            store.inserted(),
-            vec![("start-settings-v1".to_owned(), 42, None)]
-        );
         assert!(terminal.calls().is_empty());
         assert!(member_store.upserts().is_empty());
         assert!(control_queue.snapshot().is_empty());
@@ -5363,7 +5167,6 @@ mod tests {
         update_queue.enqueue_update(&new_members_update()?).await?;
         assert_eq!(update_queue.len().await?, 3);
 
-        let store = Arc::new(StoreStub::default());
         let dispatcher = Arc::new(DispatcherQueue::new(DispatcherConfig::default()));
         let member_store = Arc::new(GroupSettingsMemberStoreStub::default());
         let control_queue = Arc::new(InMemoryPaymentControlJobQueue::new());
@@ -5383,7 +5186,6 @@ mod tests {
             format!("settings-live-v{id}")
         });
         let handler = SettingsUpdateHandler::new(
-            Arc::clone(&store),
             Arc::clone(&dispatcher),
             Arc::clone(&member_store),
             Arc::clone(&control_queue),
@@ -5432,13 +5234,6 @@ mod tests {
                 "user:42:Ada".to_owned(),
                 "chat:-10042:supergroup".to_owned(),
                 "user:42:Ada".to_owned(),
-            ]
-        );
-        assert_eq!(
-            store.inserted(),
-            vec![
-                ("settings-live-v1".to_owned(), 42, None),
-                ("settings-live-v2".to_owned(), -10042, Some(0)),
             ]
         );
         assert!(terminal.calls().is_empty());
@@ -5913,71 +5708,6 @@ mod tests {
             );
         }
         Ok(())
-    }
-
-    type RecordedVirtualInsert = (String, i64, Option<i32>);
-
-    #[derive(Clone, Default)]
-    struct StoreStub {
-        inserted: Arc<Mutex<Vec<RecordedVirtualInsert>>>,
-    }
-
-    impl StoreStub {
-        fn inserted(&self) -> Vec<RecordedVirtualInsert> {
-            self.inserted.lock().expect("inserted virtual ids").clone()
-        }
-    }
-
-    impl VirtualMessageStore for StoreStub {
-        type Error = io::Error;
-
-        fn get_mapping_by_virtual<'a>(
-            &'a self,
-            _vmsg_id: String,
-        ) -> Pin<Box<dyn Future<Output = Result<Option<MessageIdMapping>, Self::Error>> + Send + 'a>>
-        {
-            Box::pin(async { Ok(None) })
-        }
-
-        fn insert_virtual_message<'a>(
-            &'a self,
-            vmsg_id: String,
-            chat_id: i64,
-            thread_id: Option<i32>,
-        ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
-            Box::pin(async move {
-                self.inserted
-                    .lock()
-                    .map_err(|error| io::Error::other(error.to_string()))?
-                    .push((vmsg_id, chat_id, thread_id));
-                Ok(())
-            })
-        }
-
-        fn resolve_virtual_message<'a>(
-            &'a self,
-            _vmsg_id: String,
-            _real_message_id: i32,
-        ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
-            Box::pin(async { Ok(()) })
-        }
-
-        fn enqueue_message_op<'a>(
-            &'a self,
-            _vmsg_id: String,
-            _chat_id: i64,
-            _op: &'static str,
-            _payload_json: Option<String>,
-        ) -> Pin<Box<dyn Future<Output = Result<i64, Self::Error>> + Send + 'a>> {
-            Box::pin(async { Ok(1) })
-        }
-
-        fn delete_mapping_by_virtual<'a>(
-            &'a self,
-            _vmsg_id: String,
-        ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
-            Box::pin(async { Ok(()) })
-        }
     }
 
     #[derive(Clone, Debug, Default)]

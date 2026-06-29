@@ -47,8 +47,8 @@ use crate::{
     },
     memory_runtime::{EmbeddingProvider, memory_retrieval_query_task},
     virtual_messages::{
-        QueueRichRequest, QueueTextRequest, VirtualIdFactory, VirtualMessageStore,
-        monotonic_virtual_id_factory, queue_rich_message, queue_text_message_parts,
+        QueueRichRequest, QueueTextRequest, VirtualIdFactory, monotonic_virtual_id_factory,
+        queue_rich_message, queue_text_message_parts,
     },
     vision::DialogVisionInputMaterializer,
 };
@@ -549,17 +549,15 @@ impl DialogInputMaterializer for PostgresDialogInputMaterializer {
 }
 
 #[derive(Clone)]
-pub struct DialogDispatcherEffects<Store> {
-    store: Store,
+pub struct DialogDispatcherEffects {
     queue: Arc<DispatcherQueue>,
     next_virtual_id: VirtualIdFactory,
 }
 
-impl<Store> DialogDispatcherEffects<Store> {
+impl DialogDispatcherEffects {
     #[must_use]
-    pub fn new(store: Store, queue: Arc<DispatcherQueue>) -> Self {
+    pub fn new(queue: Arc<DispatcherQueue>) -> Self {
         Self {
-            store,
             queue,
             next_virtual_id: monotonic_virtual_id_factory("dialog-vmsg"),
         }
@@ -639,10 +637,7 @@ impl DialogJobWorkerQueue for InMemoryTaskQueue {
     }
 }
 
-impl<Store> DialogJobEffects for DialogDispatcherEffects<Store>
-where
-    Store: VirtualMessageStore + Send + Sync,
-{
+impl DialogJobEffects for DialogDispatcherEffects {
     type Error = DialogDispatchEffectError;
 
     fn send_dialog_answer<'a>(
@@ -671,7 +666,6 @@ where
                     reply_markup: None,
                 };
                 queue_rich_message(
-                    &self.store,
                     &self.queue,
                     QueueRichRequest {
                         message: &request,
@@ -694,7 +688,6 @@ where
                     reply_markup: None,
                 };
                 queue_text_message_parts(
-                    &self.store,
                     &self.queue,
                     QueueTextRequest {
                         message: &request,
@@ -2691,11 +2684,10 @@ mod tests {
     #[tokio::test]
     async fn dialog_dispatcher_effects_allow_sending_without_deleted_reply_target()
     -> Result<(), Box<dyn Error>> {
-        let store = DialogVirtualStore;
         let queue = Arc::new(DispatcherQueue::new(
             openplotva_telegram::DispatcherConfig::default(),
         ));
-        let effects = DialogDispatcherEffects::new(store, Arc::clone(&queue))
+        let effects = DialogDispatcherEffects::new(Arc::clone(&queue))
             .with_virtual_id_factory(Arc::new(|| "dialog-v1".to_owned()));
 
         effects
@@ -2725,11 +2717,10 @@ mod tests {
     #[tokio::test]
     async fn dialog_dispatcher_effects_routes_rich_only_html_to_rich_queue()
     -> Result<(), Box<dyn Error>> {
-        let store = DialogVirtualStore;
         let queue = Arc::new(DispatcherQueue::new(
             openplotva_telegram::DispatcherConfig::default(),
         ));
-        let effects = DialogDispatcherEffects::new(store, Arc::clone(&queue))
+        let effects = DialogDispatcherEffects::new(Arc::clone(&queue))
             .with_virtual_id_factory(Arc::new(|| "dialog-v1".to_owned()));
 
         effects
@@ -3916,60 +3907,6 @@ mod tests {
             max_output_tokens: 0,
             thread_id: None,
             ..dialog_params("")
-        }
-    }
-
-    #[derive(Clone)]
-    struct DialogVirtualStore;
-
-    impl VirtualMessageStore for DialogVirtualStore {
-        type Error = std::convert::Infallible;
-
-        fn get_mapping_by_virtual<'a>(
-            &'a self,
-            _vmsg_id: String,
-        ) -> Pin<
-            Box<
-                dyn Future<Output = Result<Option<openplotva_core::MessageIdMapping>, Self::Error>>
-                    + Send
-                    + 'a,
-            >,
-        > {
-            Box::pin(async { Ok(None) })
-        }
-
-        fn insert_virtual_message<'a>(
-            &'a self,
-            _vmsg_id: String,
-            _chat_id: i64,
-            _thread_id: Option<i32>,
-        ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
-            Box::pin(async { Ok(()) })
-        }
-
-        fn resolve_virtual_message<'a>(
-            &'a self,
-            _vmsg_id: String,
-            _real_message_id: i32,
-        ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
-            Box::pin(async { Ok(()) })
-        }
-
-        fn enqueue_message_op<'a>(
-            &'a self,
-            _vmsg_id: String,
-            _chat_id: i64,
-            _op: &'static str,
-            _payload_json: Option<String>,
-        ) -> Pin<Box<dyn Future<Output = Result<i64, Self::Error>> + Send + 'a>> {
-            Box::pin(async { Ok(0) })
-        }
-
-        fn delete_mapping_by_virtual<'a>(
-            &'a self,
-            _vmsg_id: String,
-        ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
-            Box::pin(async { Ok(()) })
         }
     }
 

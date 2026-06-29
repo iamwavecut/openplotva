@@ -8,8 +8,7 @@ use std::{
 
 use openplotva_config::{PostgresConfig, RedisConfig};
 use openplotva_core::{
-    ChatMessageMeta, ChatSettings, ChatSettingsUpdate, ChatState, MessageIdMapping, PendingOp,
-    ToolCall, UserSettings, UserState,
+    ChatMessageMeta, ChatSettings, ChatSettingsUpdate, ChatState, ToolCall, UserSettings, UserState,
 };
 use openplotva_history::{
     PrepareStoredSummaryError, StoredSummary, SummaryDocument, SummaryInput, SummaryMessageEntry,
@@ -572,9 +571,6 @@ fn memory_cursor_after_at(value: OffsetDateTime) -> OffsetDateTime {
     }
 }
 
-pub const SQL_INSERT_VIRTUAL_MESSAGE: &str =
-    "INSERT INTO message_id_map (vmsg_id, chat_id, thread_id) VALUES ($1, $2, $3)";
-
 pub const SQL_UPSERT_USER: &str = "INSERT INTO users (id, first_name, last_name, username, language_code, is_premium, settings) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb) ON CONFLICT (id) DO UPDATE SET first_name = COALESCE(EXCLUDED.first_name, users.first_name), last_name = COALESCE(EXCLUDED.last_name, users.last_name), username = COALESCE(EXCLUDED.username, users.username), language_code = COALESCE(EXCLUDED.language_code, users.language_code), is_premium = COALESCE(EXCLUDED.is_premium, users.is_premium), settings = COALESCE(EXCLUDED.settings, users.settings), updated = CURRENT_TIMESTAMP";
 
 pub const SQL_GET_USER: &str = "SELECT id, first_name, last_name, username, language_code, is_premium FROM users WHERE id = $1";
@@ -598,27 +594,6 @@ pub const SQL_DELETE_RUNTIME_API_TOKENS_OLDER_THAN: &str =
     "DELETE FROM runtime_api_tokens WHERE created_at < $1";
 
 pub const SQL_UPSERT_CHAT: &str = "INSERT INTO chats (id, type, title, username, first_name, last_name, is_forum, active_usernames, available_reactions, bio, has_private_forwards, has_restricted_voice_and_video_messages, join_to_send_messages, join_by_request, description, invite_link, pinned_message, permissions, slow_mode_delay, message_auto_delete_time, has_aggressive_anti_spam_enabled, has_hidden_members, has_protected_content, has_visible_history, sticker_set_name, can_set_sticker_set, linked_chat_id, location) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb, $10, $11, $12, $13, $14, $15, $16, $17::jsonb, $18::jsonb, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28::jsonb) ON CONFLICT (id) DO UPDATE SET type = COALESCE(EXCLUDED.type, chats.type), title = COALESCE(EXCLUDED.title, chats.title), username = COALESCE(EXCLUDED.username, chats.username), first_name = COALESCE(EXCLUDED.first_name, chats.first_name), last_name = COALESCE(EXCLUDED.last_name, chats.last_name), is_forum = COALESCE(EXCLUDED.is_forum, chats.is_forum), active_usernames = COALESCE(EXCLUDED.active_usernames, chats.active_usernames), available_reactions = COALESCE(EXCLUDED.available_reactions, chats.available_reactions), bio = COALESCE(EXCLUDED.bio, chats.bio), has_private_forwards = COALESCE(EXCLUDED.has_private_forwards, chats.has_private_forwards), has_restricted_voice_and_video_messages = COALESCE(EXCLUDED.has_restricted_voice_and_video_messages, chats.has_restricted_voice_and_video_messages), join_to_send_messages = COALESCE(EXCLUDED.join_to_send_messages, chats.join_to_send_messages), join_by_request = COALESCE(EXCLUDED.join_by_request, chats.join_by_request), description = COALESCE(EXCLUDED.description, chats.description), invite_link = COALESCE(EXCLUDED.invite_link, chats.invite_link), pinned_message = COALESCE(EXCLUDED.pinned_message, chats.pinned_message), permissions = COALESCE(EXCLUDED.permissions, chats.permissions), slow_mode_delay = COALESCE(EXCLUDED.slow_mode_delay, chats.slow_mode_delay), message_auto_delete_time = COALESCE(EXCLUDED.message_auto_delete_time, chats.message_auto_delete_time), has_aggressive_anti_spam_enabled = COALESCE(EXCLUDED.has_aggressive_anti_spam_enabled, chats.has_aggressive_anti_spam_enabled), has_hidden_members = COALESCE(EXCLUDED.has_hidden_members, chats.has_hidden_members), has_protected_content = COALESCE(EXCLUDED.has_protected_content, chats.has_protected_content), has_visible_history = COALESCE(EXCLUDED.has_visible_history, chats.has_visible_history), sticker_set_name = COALESCE(EXCLUDED.sticker_set_name, chats.sticker_set_name), can_set_sticker_set = COALESCE(EXCLUDED.can_set_sticker_set, chats.can_set_sticker_set), linked_chat_id = COALESCE(EXCLUDED.linked_chat_id, chats.linked_chat_id), location = COALESCE(EXCLUDED.location, chats.location), updated = CURRENT_TIMESTAMP";
-
-pub const SQL_RESOLVE_VIRTUAL_MESSAGE: &str = "UPDATE message_id_map SET real_message_id = $1, resolved_at = COALESCE($2, NOW()) WHERE vmsg_id = $3";
-
-pub const SQL_GET_MAPPING_BY_VIRTUAL: &str =
-    "SELECT vmsg_id, chat_id, thread_id, real_message_id FROM message_id_map WHERE vmsg_id = $1";
-
-pub const SQL_LIST_MAPPINGS_BY_VIRTUAL_IDS: &str = "SELECT vmsg_id, chat_id, thread_id, real_message_id FROM message_id_map WHERE vmsg_id = ANY($1::text[])";
-
-pub const SQL_GET_MAPPING_BY_REAL: &str = "SELECT vmsg_id, chat_id, thread_id, real_message_id FROM message_id_map WHERE chat_id = $1 AND real_message_id = $2";
-
-pub const SQL_DELETE_MAPPING_BY_VIRTUAL: &str = "DELETE FROM message_id_map WHERE vmsg_id = $1";
-
-pub const SQL_ENQUEUE_MESSAGE_OP: &str = "INSERT INTO message_ops_queue (vmsg_id, chat_id, op, payload) VALUES ($1, $2, $3, $4::jsonb) RETURNING id";
-
-pub const SQL_LIST_PENDING_OPS: &str = "SELECT id, vmsg_id, chat_id, op, COALESCE(payload::text, '') AS payload, attempts FROM message_ops_queue WHERE status = 'pending' ORDER BY created_at ASC LIMIT $1";
-
-pub const SQL_MARK_OP_DONE: &str =
-    "UPDATE message_ops_queue SET status = 'done', executed_at = NOW() WHERE id = $1";
-
-pub const SQL_MARK_OP_FAILED: &str =
-    "UPDATE message_ops_queue SET attempts = attempts + 1, last_error = $2 WHERE id = $1";
 
 pub const SQL_GET_CHAT_TYPE: &str = "SELECT type FROM chats WHERE id = $1";
 
@@ -2925,102 +2900,6 @@ impl PostgresVirtualMessageStore {
             .bind(Option::<bool>::None)
             .bind(Option::<i64>::None)
             .bind(Option::<&str>::None)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
-    pub async fn insert_virtual_message(
-        &self,
-        vmsg_id: &str,
-        chat_id: i64,
-        thread_id: Option<i32>,
-    ) -> Result<(), StorageError> {
-        // Retired: message_id_map is dropped (migration 140). Outbound sends
-        // resolve the real Telegram message id inline, so this persistence is a
-        // no-op. The signatures are kept until the dispatcher's vmsg plumbing is
-        // fully removed in a follow-up.
-        let _ = (vmsg_id, chat_id, thread_id);
-        Ok(())
-    }
-
-    /// Retired: no-op (message_id_map dropped, migration 140).
-    pub async fn resolve_virtual_message(
-        &self,
-        vmsg_id: &str,
-        real_message_id: i32,
-        resolved_at: Option<OffsetDateTime>,
-    ) -> Result<(), StorageError> {
-        let _ = (vmsg_id, real_message_id, resolved_at);
-        Ok(())
-    }
-
-    /// Retired: no-op (message_id_map dropped, migration 140).
-    pub async fn get_mapping_by_virtual(
-        &self,
-        vmsg_id: &str,
-    ) -> Result<Option<MessageIdMapping>, StorageError> {
-        let _ = vmsg_id;
-        Ok(None)
-    }
-
-    /// Retired: no-op (message_id_map dropped, migration 140).
-    pub async fn list_mappings_by_virtual_ids(
-        &self,
-        vmsg_ids: &[String],
-    ) -> Result<Vec<MessageIdMapping>, StorageError> {
-        let _ = vmsg_ids;
-        Ok(Vec::new())
-    }
-
-    /// Retired: no-op (message_id_map dropped, migration 140).
-    pub async fn get_mapping_by_real(
-        &self,
-        chat_id: i64,
-        real_message_id: i32,
-    ) -> Result<Option<MessageIdMapping>, StorageError> {
-        let _ = (chat_id, real_message_id);
-        Ok(None)
-    }
-
-    /// Retired: no-op (message_id_map dropped, migration 140).
-    pub async fn delete_mapping_by_virtual(&self, vmsg_id: &str) -> Result<(), StorageError> {
-        let _ = vmsg_id;
-        Ok(())
-    }
-
-    /// Retired: no-op (message_ops_queue dropped, migration 140).
-    pub async fn enqueue_message_op(
-        &self,
-        vmsg_id: &str,
-        chat_id: i64,
-        op: &str,
-        payload_json: Option<&str>,
-    ) -> Result<i64, StorageError> {
-        let _ = (vmsg_id, chat_id, op, payload_json);
-        Ok(0)
-    }
-
-    /// Retired: always empty (message_ops_queue dropped, migration 140).
-    pub async fn list_pending_ops(&self, limit: i32) -> Result<Vec<PendingOp>, StorageError> {
-        let _ = limit;
-        Ok(Vec::new())
-    }
-
-    /// Mark a pending operation as done.
-    pub async fn mark_op_done(&self, id: i64) -> Result<(), StorageError> {
-        sqlx::query(SQL_MARK_OP_DONE)
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
-    /// Record a failed pending operation attempt.
-    pub async fn mark_op_failed(&self, id: i64, message: &str) -> Result<(), StorageError> {
-        sqlx::query(SQL_MARK_OP_FAILED)
-            .bind(id)
-            .bind(message)
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -9812,58 +9691,6 @@ mod tests {
             .is_none()
         );
         Ok(())
-    }
-
-    #[test]
-    fn virtual_message_sql_matches_go_query_contracts() {
-        let _mapping = openplotva_core::MessageIdMapping::resolved("v1", 42, 77);
-
-        assert_eq!(
-            super::SQL_INSERT_VIRTUAL_MESSAGE,
-            "INSERT INTO message_id_map (vmsg_id, chat_id, thread_id) VALUES ($1, $2, $3)"
-        );
-        assert_eq!(
-            super::SQL_RESOLVE_VIRTUAL_MESSAGE,
-            "UPDATE message_id_map SET real_message_id = $1, resolved_at = COALESCE($2, NOW()) WHERE vmsg_id = $3"
-        );
-        assert_eq!(
-            super::SQL_GET_MAPPING_BY_VIRTUAL,
-            "SELECT vmsg_id, chat_id, thread_id, real_message_id FROM message_id_map WHERE vmsg_id = $1"
-        );
-        assert_eq!(
-            super::SQL_LIST_MAPPINGS_BY_VIRTUAL_IDS,
-            "SELECT vmsg_id, chat_id, thread_id, real_message_id FROM message_id_map WHERE vmsg_id = ANY($1::text[])"
-        );
-        assert_eq!(
-            super::SQL_GET_MAPPING_BY_REAL,
-            "SELECT vmsg_id, chat_id, thread_id, real_message_id FROM message_id_map WHERE chat_id = $1 AND real_message_id = $2"
-        );
-        assert_eq!(
-            super::SQL_DELETE_MAPPING_BY_VIRTUAL,
-            "DELETE FROM message_id_map WHERE vmsg_id = $1"
-        );
-    }
-
-    #[test]
-    fn pending_message_op_sql_matches_go_query_contracts() {
-        let _op = openplotva_core::PendingOp::new(1, "v1", 42, "edit");
-
-        assert_eq!(
-            super::SQL_ENQUEUE_MESSAGE_OP,
-            "INSERT INTO message_ops_queue (vmsg_id, chat_id, op, payload) VALUES ($1, $2, $3, $4::jsonb) RETURNING id"
-        );
-        assert_eq!(
-            super::SQL_LIST_PENDING_OPS,
-            "SELECT id, vmsg_id, chat_id, op, COALESCE(payload::text, '') AS payload, attempts FROM message_ops_queue WHERE status = 'pending' ORDER BY created_at ASC LIMIT $1"
-        );
-        assert_eq!(
-            super::SQL_MARK_OP_DONE,
-            "UPDATE message_ops_queue SET status = 'done', executed_at = NOW() WHERE id = $1"
-        );
-        assert_eq!(
-            super::SQL_MARK_OP_FAILED,
-            "UPDATE message_ops_queue SET attempts = attempts + 1, last_error = $2 WHERE id = $1"
-        );
     }
 
     #[test]

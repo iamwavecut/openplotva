@@ -11,8 +11,7 @@ use crate::{
     rate_limits::TaskEnqueueRateLimit,
     updates::{UpdateHandler, UpdateHandlerFuture},
     virtual_messages::{
-        QueueTextRequest, VirtualIdFactory, VirtualMessageStore, monotonic_virtual_id_factory,
-        queue_text_message_parts,
+        QueueTextRequest, VirtualIdFactory, monotonic_virtual_id_factory, queue_text_message_parts,
     },
 };
 use carapax::types::{
@@ -1970,22 +1969,16 @@ impl PaymentRedirectEffects for openplotva_telegram::TelegramClient {
 pub type PaymentVirtualIdFactory = VirtualIdFactory;
 
 #[derive(Clone)]
-pub struct SuccessfulPaymentDispatcherEffects<Store, Invalidator = NoopVipCacheInvalidator> {
-    store: Store,
+pub struct SuccessfulPaymentDispatcherEffects<Invalidator = NoopVipCacheInvalidator> {
     queue: Arc<openplotva_telegram::DispatcherQueue>,
     invalidator: Invalidator,
     next_virtual_id: PaymentVirtualIdFactory,
 }
 
-impl<Store, Invalidator> SuccessfulPaymentDispatcherEffects<Store, Invalidator> {
+impl<Invalidator> SuccessfulPaymentDispatcherEffects<Invalidator> {
     /// Build successful-payment effects backed by the normal outbound dispatcher.
-    pub fn new(
-        store: Store,
-        queue: Arc<openplotva_telegram::DispatcherQueue>,
-        invalidator: Invalidator,
-    ) -> Self {
+    pub fn new(queue: Arc<openplotva_telegram::DispatcherQueue>, invalidator: Invalidator) -> Self {
         Self {
-            store,
             queue,
             invalidator,
             next_virtual_id: monotonic_payment_virtual_id_factory(),
@@ -2000,10 +1993,8 @@ impl<Store, Invalidator> SuccessfulPaymentDispatcherEffects<Store, Invalidator> 
     }
 }
 
-impl<Store, Invalidator> SuccessfulPaymentEffects
-    for SuccessfulPaymentDispatcherEffects<Store, Invalidator>
+impl<Invalidator> SuccessfulPaymentEffects for SuccessfulPaymentDispatcherEffects<Invalidator>
 where
-    Store: crate::virtual_messages::VirtualMessageStore + Send + Sync,
     Invalidator: VipCacheInvalidator + Send + Sync,
 {
     type Error = SuccessfulPaymentDispatchEffectError;
@@ -2033,7 +2024,6 @@ where
                 message_thread_id: 0,
             };
             crate::virtual_messages::queue_text_message_parts(
-                &self.store,
                 &self.queue,
                 crate::virtual_messages::QueueTextRequest {
                     message: &request,
@@ -4223,8 +4213,7 @@ pub enum AdminVipCommandUpdateOutcome {
 }
 
 #[derive(Clone)]
-pub struct AdminVipCommandUpdateHandler<Store, Vip, Effects, Next> {
-    store: Arc<Store>,
+pub struct AdminVipCommandUpdateHandler<Vip, Effects, Next> {
     queue: Arc<openplotva_telegram::DispatcherQueue>,
     vip: Arc<Vip>,
     effects: Arc<Effects>,
@@ -4234,11 +4223,10 @@ pub struct AdminVipCommandUpdateHandler<Store, Vip, Effects, Next> {
     next_virtual_id: VirtualIdFactory,
 }
 
-impl<Store, Vip, Effects, Next> AdminVipCommandUpdateHandler<Store, Vip, Effects, Next> {
+impl<Vip, Effects, Next> AdminVipCommandUpdateHandler<Vip, Effects, Next> {
     /// Build an admin VIP command handler around the real downstream update handler.
     #[must_use]
     pub fn new(
-        store: Arc<Store>,
         queue: Arc<openplotva_telegram::DispatcherQueue>,
         vip: Arc<Vip>,
         effects: Arc<Effects>,
@@ -4247,7 +4235,6 @@ impl<Store, Vip, Effects, Next> AdminVipCommandUpdateHandler<Store, Vip, Effects
         next: Arc<Next>,
     ) -> Self {
         Self {
-            store,
             queue,
             vip,
             effects,
@@ -4266,10 +4253,8 @@ impl<Store, Vip, Effects, Next> AdminVipCommandUpdateHandler<Store, Vip, Effects
     }
 }
 
-impl<Store, Vip, Effects, Next> UpdateHandler
-    for AdminVipCommandUpdateHandler<Store, Vip, Effects, Next>
+impl<Vip, Effects, Next> UpdateHandler for AdminVipCommandUpdateHandler<Vip, Effects, Next>
 where
-    Store: VirtualMessageStore + Send + Sync,
     Vip: AdminGrantVipStore + AdminCancelVipStore + AdminRefundStore + Send + Sync,
     Effects: AdminGrantVipEffects + AdminCancelVipEffects + AdminRefundEffects + Send + Sync,
     Next: UpdateHandler + Send + Sync,
@@ -4280,7 +4265,6 @@ where
         Box::pin(async move {
             handle_admin_vip_command_update_or_else_at(
                 AdminVipCommandUpdateRuntime {
-                    store: self.store.as_ref(),
                     queue: self.queue.as_ref(),
                     vip: self.vip.as_ref(),
                     effects: self.effects.as_ref(),
@@ -4299,8 +4283,7 @@ where
 }
 
 #[derive(Clone, Copy)]
-pub struct AdminVipCommandUpdateRuntime<'a, Store, Vip, Effects> {
-    pub store: &'a Store,
+pub struct AdminVipCommandUpdateRuntime<'a, Vip, Effects> {
     pub queue: &'a openplotva_telegram::DispatcherQueue,
     /// Payment/VIP storage boundary.
     pub vip: &'a Vip,
@@ -4317,19 +4300,17 @@ pub struct AdminVipCommandUpdateRuntime<'a, Store, Vip, Effects> {
 }
 
 pub async fn handle_admin_vip_command_update_or_else_at<
-    Store,
     Vip,
     Effects,
     HandleFn,
     HandleFuture,
     HandleError,
 >(
-    runtime: AdminVipCommandUpdateRuntime<'_, Store, Vip, Effects>,
+    runtime: AdminVipCommandUpdateRuntime<'_, Vip, Effects>,
     update: TelegramUpdate,
     handle_other: HandleFn,
 ) -> Result<AdminVipCommandUpdateOutcome, HandleError>
 where
-    Store: VirtualMessageStore + Sync,
     Vip: AdminGrantVipStore + AdminCancelVipStore + AdminRefundStore + Sync,
     Effects: AdminGrantVipEffects + AdminCancelVipEffects + AdminRefundEffects + Sync,
     HandleFn: FnOnce(TelegramUpdate) -> HandleFuture,
@@ -4351,7 +4332,6 @@ where
         .unwrap_or_default();
     if !runtime.admin_ids.contains(&actor_user_id) {
         return match send_admin_command_unauthorized_text(
-            runtime.store,
             runtime.queue,
             runtime.next_virtual_id,
             message,
@@ -4404,7 +4384,6 @@ where
             let Some(telegram_payment_charge_id) = first_admin_refund_charge_id(command.arguments)
             else {
                 return match send_admin_command_ephemeral_text(
-                    runtime.store,
                     runtime.queue,
                     runtime.next_virtual_id,
                     message,
@@ -4620,17 +4599,12 @@ fn admin_reply_user_id(message: &TelegramMessage) -> Option<i64> {
     reply.sender.get_user().map(|user| user.id.into())
 }
 
-async fn send_admin_command_unauthorized_text<Store>(
-    store: &Store,
+async fn send_admin_command_unauthorized_text(
     queue: &openplotva_telegram::DispatcherQueue,
     next_virtual_id: &VirtualIdFactory,
     message: &TelegramMessage,
-) -> Result<(), openplotva_telegram::OutboundBuildError>
-where
-    Store: VirtualMessageStore + Sync,
-{
+) -> Result<(), openplotva_telegram::OutboundBuildError> {
     send_admin_command_ephemeral_text(
-        store,
         queue,
         next_virtual_id,
         message,
@@ -4639,16 +4613,12 @@ where
     .await
 }
 
-async fn send_admin_command_ephemeral_text<Store>(
-    store: &Store,
+async fn send_admin_command_ephemeral_text(
     queue: &openplotva_telegram::DispatcherQueue,
     next_virtual_id: &VirtualIdFactory,
     message: &TelegramMessage,
     text: &str,
-) -> Result<(), openplotva_telegram::OutboundBuildError>
-where
-    Store: VirtualMessageStore + Sync,
-{
+) -> Result<(), openplotva_telegram::OutboundBuildError> {
     let chat = openplotva_telegram::ChatRef {
         id: message.chat.get_id().into(),
         is_forum: message.message_thread_id.is_some(),
@@ -4669,7 +4639,6 @@ where
         message_thread_id: message.message_thread_id.unwrap_or_default(),
     };
     queue_text_message_parts(
-        store,
         queue,
         QueueTextRequest {
             message: &request,
@@ -6709,10 +6678,7 @@ mod tests {
         collections::VecDeque,
         env,
         error::Error,
-        fmt,
-        future::Future,
-        io,
-        pin::Pin,
+        fmt, io,
         sync::atomic::{AtomicU64, Ordering},
         sync::{Arc, Mutex, MutexGuard},
         time::{Duration as StdDuration, SystemTime, UNIX_EPOCH},
@@ -8591,7 +8557,6 @@ mod tests {
     #[tokio::test]
     async fn admin_refund_update_missing_charge_queues_go_ephemeral_usage()
     -> Result<(), Box<dyn Error>> {
-        let virtual_store = VirtualMessageStoreStub::default();
         let dispatcher = openplotva_telegram::DispatcherQueue::new(
             openplotva_telegram::DispatcherConfig::default(),
         );
@@ -8612,7 +8577,6 @@ mod tests {
 
         let outcome = handle_admin_vip_command_update_or_else_at(
             AdminVipCommandUpdateRuntime {
-                store: &virtual_store,
                 queue: &dispatcher,
                 vip: &store,
                 effects: &effects,
@@ -8633,10 +8597,6 @@ mod tests {
         ));
         assert!(next.calls().is_empty());
         assert!(effects.sent_texts().is_empty());
-        assert_eq!(
-            virtual_store.inserted(),
-            vec![("admin-refund-vmsg-1".to_owned(), 42, Some(77))]
-        );
         let item = dispatcher
             .dequeue_immediate()
             .expect("queued admin refund usage");
@@ -9679,7 +9639,6 @@ mod tests {
     #[tokio::test]
     async fn admin_vip_handler_rejects_unauthorized_command_with_go_ephemeral_text()
     -> Result<(), Box<dyn Error>> {
-        let virtual_store = VirtualMessageStoreStub::default();
         let dispatcher = Arc::new(openplotva_telegram::DispatcherQueue::new(
             openplotva_telegram::DispatcherConfig::default(),
         ));
@@ -9688,7 +9647,6 @@ mod tests {
         let next = Arc::new(UpdateHandlerStub::default());
         let next_id = Arc::new(AtomicU64::new(1));
         let handler = AdminVipCommandUpdateHandler::new(
-            Arc::new(virtual_store.clone()),
             Arc::clone(&dispatcher),
             store,
             effects.clone(),
@@ -9707,10 +9665,6 @@ mod tests {
 
         assert!(next.calls().is_empty());
         assert!(effects.sent_texts().is_empty());
-        assert_eq!(
-            virtual_store.inserted(),
-            vec![("admin-vmsg-1".to_owned(), 42, Some(77))]
-        );
         let item = dispatcher.dequeue_immediate().expect("queued admin denial");
         assert_eq!(
             item.ephemeral_delete_after(),
@@ -9745,7 +9699,6 @@ mod tests {
             reason: "manual test".to_owned(),
             created_at: now,
         });
-        let virtual_store = VirtualMessageStoreStub::default();
         let dispatcher = openplotva_telegram::DispatcherQueue::new(
             openplotva_telegram::DispatcherConfig::default(),
         );
@@ -9757,7 +9710,6 @@ mod tests {
             crate::virtual_messages::monotonic_virtual_id_factory("admin-test-vmsg");
         let outcome = handle_admin_vip_command_update_or_else_at(
             AdminVipCommandUpdateRuntime {
-                store: &virtual_store,
                 queue: &dispatcher,
                 vip: &store,
                 effects: &effects,
@@ -9797,7 +9749,6 @@ mod tests {
 
     #[tokio::test]
     async fn group_admin_vip_command_without_bot_target_delegates() -> Result<(), Box<dyn Error>> {
-        let virtual_store = VirtualMessageStoreStub::default();
         let dispatcher = openplotva_telegram::DispatcherQueue::new(
             openplotva_telegram::DispatcherConfig::default(),
         );
@@ -9810,7 +9761,6 @@ mod tests {
             crate::virtual_messages::monotonic_virtual_id_factory("admin-test-vmsg");
         let outcome = handle_admin_vip_command_update_or_else_at(
             AdminVipCommandUpdateRuntime {
-                store: &virtual_store,
                 queue: &dispatcher,
                 vip: &store,
                 effects: &effects,
@@ -9833,21 +9783,19 @@ mod tests {
     #[tokio::test]
     async fn successful_payment_dispatcher_effects_queue_text_reply_and_invalidate_vip_cache()
     -> Result<(), Box<dyn Error>> {
-        let store = VirtualMessageStoreStub::default();
         let queue = Arc::new(openplotva_telegram::DispatcherQueue::new(
             openplotva_telegram::DispatcherConfig::default(),
         ));
         let invalidator = VipCacheInvalidatorStub::default();
         let next_id = Arc::new(AtomicU64::new(1));
-        let effects = SuccessfulPaymentDispatcherEffects::new(
-            store.clone(),
-            Arc::clone(&queue),
-            invalidator.clone(),
-        )
-        .with_virtual_id_factory({
-            let next_id = Arc::clone(&next_id);
-            Arc::new(move || format!("payment-vmsg-{}", next_id.fetch_add(1, Ordering::Relaxed)))
-        });
+        let effects =
+            SuccessfulPaymentDispatcherEffects::new(Arc::clone(&queue), invalidator.clone())
+                .with_virtual_id_factory({
+                    let next_id = Arc::clone(&next_id);
+                    Arc::new(move || {
+                        format!("payment-vmsg-{}", next_id.fetch_add(1, Ordering::Relaxed))
+                    })
+                });
 
         effects
             .send_text(PaymentTextMessage {
@@ -9859,10 +9807,6 @@ mod tests {
             .await?;
         effects.invalidate_vip_cache(42).await?;
 
-        assert_eq!(
-            store.inserted(),
-            vec![("payment-vmsg-1".to_owned(), 42, None)]
-        );
         assert_eq!(invalidator.invalidated_users(), vec![42]);
 
         let snapshot = queue.snapshot();
@@ -10729,7 +10673,6 @@ mod tests {
             Arc::clone(&effects),
             Arc::clone(&terminal),
         ));
-        let virtual_store = VirtualMessageStoreStub::default();
         let dispatcher = Arc::new(openplotva_telegram::DispatcherQueue::new(
             openplotva_telegram::DispatcherConfig::default(),
         ));
@@ -10796,7 +10739,6 @@ mod tests {
         let dispatcher_snapshot = dispatcher.snapshot();
         assert!(dispatcher_snapshot.immediate.is_empty());
         assert!(dispatcher_snapshot.regular.is_empty());
-        assert!(virtual_store.inserted().is_empty());
         assert!(effects.vip_status_messages().is_empty());
         assert!(effects.payment_redirect_messages().is_empty());
 
@@ -10996,7 +10938,6 @@ mod tests {
         assert_eq!(update_queue.len().await?, 3);
 
         let state_store = UpdateStateStoreStub::default();
-        let virtual_store = VirtualMessageStoreStub::default();
         let dispatcher = openplotva_telegram::DispatcherQueue::new(
             openplotva_telegram::DispatcherConfig::default(),
         );
@@ -11067,7 +11008,6 @@ mod tests {
                 |update| async {
                     let outcome = handle_admin_vip_command_update_or_else_at(
                         AdminVipCommandUpdateRuntime {
-                            store: &virtual_store,
                             queue: &dispatcher,
                             vip: &store,
                             effects: &effects,
@@ -11109,7 +11049,6 @@ mod tests {
             ]
         );
         assert!(next.calls().is_empty());
-        assert!(virtual_store.inserted().is_empty());
         assert!(dispatcher.dequeue_immediate().is_none());
         assert_eq!(outcomes.len(), 3);
         assert!(matches!(
@@ -13217,84 +13156,6 @@ mod tests {
                     created_at: OffsetDateTime::UNIX_EPOCH,
                 })
             })
-        }
-    }
-
-    #[derive(Clone, Default)]
-    struct VirtualMessageStoreStub {
-        state: Arc<Mutex<VirtualMessageStoreState>>,
-    }
-
-    #[derive(Default)]
-    struct VirtualMessageStoreState {
-        inserted: Vec<(String, i64, Option<i32>)>,
-    }
-
-    impl VirtualMessageStoreStub {
-        fn inserted(&self) -> Vec<(String, i64, Option<i32>)> {
-            self.state
-                .lock()
-                .expect("virtual message store state")
-                .inserted
-                .clone()
-        }
-    }
-
-    impl crate::virtual_messages::VirtualMessageStore for VirtualMessageStoreStub {
-        type Error = StubError;
-
-        fn get_mapping_by_virtual<'a>(
-            &'a self,
-            _vmsg_id: String,
-        ) -> Pin<
-            Box<
-                dyn Future<Output = Result<Option<openplotva_core::MessageIdMapping>, Self::Error>>
-                    + Send
-                    + 'a,
-            >,
-        > {
-            Box::pin(async { Ok(None) })
-        }
-
-        fn insert_virtual_message<'a>(
-            &'a self,
-            vmsg_id: String,
-            chat_id: i64,
-            thread_id: Option<i32>,
-        ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
-            Box::pin(async move {
-                self.state
-                    .lock()
-                    .expect("virtual message store state")
-                    .inserted
-                    .push((vmsg_id, chat_id, thread_id));
-                Ok(())
-            })
-        }
-
-        fn resolve_virtual_message<'a>(
-            &'a self,
-            _vmsg_id: String,
-            _real_message_id: i32,
-        ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
-            Box::pin(async { Ok(()) })
-        }
-
-        fn enqueue_message_op<'a>(
-            &'a self,
-            _vmsg_id: String,
-            _chat_id: i64,
-            _op: &'static str,
-            _payload_json: Option<String>,
-        ) -> Pin<Box<dyn Future<Output = Result<i64, Self::Error>> + Send + 'a>> {
-            Box::pin(async { Ok(1) })
-        }
-
-        fn delete_mapping_by_virtual<'a>(
-            &'a self,
-            _vmsg_id: String,
-        ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
-            Box::pin(async { Ok(()) })
         }
     }
 

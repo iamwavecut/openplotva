@@ -31,8 +31,7 @@ use tokio::sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock};
 
 use crate::updates::{UpdateHandler, UpdateHandlerFuture};
 use crate::virtual_messages::{
-    QueueTextRequest, VirtualIdFactory, VirtualMessageStore, monotonic_virtual_id_factory,
-    queue_text_message_parts,
+    QueueTextRequest, VirtualIdFactory, monotonic_virtual_id_factory, queue_text_message_parts,
 };
 
 const RATES_UNAVAILABLE_TEXT: &str = "❌ Сервис курсов временно недоступен";
@@ -1229,19 +1228,17 @@ pub type RatesTicketFactory = Arc<dyn Fn() -> String + Send + Sync>;
 
 /// Dispatcher-backed dialog-tool rates side effects.
 #[derive(Clone)]
-pub struct RatesToolDispatcherEffects<Store> {
-    store: Store,
+pub struct RatesToolDispatcherEffects {
     queue: Arc<DispatcherQueue>,
     next_virtual_id: RatesVirtualIdFactory,
     next_ticket_id: RatesTicketFactory,
 }
 
-impl<Store> RatesToolDispatcherEffects<Store> {
+impl RatesToolDispatcherEffects {
     /// Build dialog rates effects backed by the normal outbound dispatcher.
     #[must_use]
-    pub fn new(store: Store, queue: Arc<DispatcherQueue>) -> Self {
+    pub fn new(queue: Arc<DispatcherQueue>) -> Self {
         Self {
-            store,
             queue,
             next_virtual_id: monotonic_virtual_id_factory("rates-tool-vmsg"),
             next_ticket_id: Arc::new(|| {
@@ -1265,17 +1262,14 @@ impl<Store> RatesToolDispatcherEffects<Store> {
     }
 }
 
-impl<Store> fmt::Debug for RatesToolDispatcherEffects<Store> {
+impl fmt::Debug for RatesToolDispatcherEffects {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RatesToolDispatcherEffects")
             .finish_non_exhaustive()
     }
 }
 
-impl<Store> RatesSideEffectDispatcher for RatesToolDispatcherEffects<Store>
-where
-    Store: VirtualMessageStore + Send + Sync,
-{
+impl RatesSideEffectDispatcher for RatesToolDispatcherEffects {
     type Error = RatesToolDispatchEffectError;
 
     fn dispatch_rates<'a>(
@@ -1313,7 +1307,6 @@ where
                 message_thread_id: i64::from(meta.thread_id.unwrap_or_default()),
             };
             queue_text_message_parts(
-                &self.store,
                 &self.queue,
                 QueueTextRequest {
                     message: &message,
@@ -2344,13 +2337,11 @@ mod tests {
     #[tokio::test]
     async fn rates_tool_dispatcher_queues_trimmed_html_side_effect()
     -> Result<(), Box<dyn std::error::Error>> {
-        let store = VirtualStoreStub::default();
         let queue = Arc::new(DispatcherQueue::new(Default::default()));
-        let dispatcher = RatesToolDispatcherEffects::new(store.clone(), Arc::clone(&queue))
-            .with_id_factories(
-                Arc::new(|| "rates-vmsg-1".to_owned()),
-                Arc::new(|| "123456789".to_owned()),
-            );
+        let dispatcher = RatesToolDispatcherEffects::new(Arc::clone(&queue)).with_id_factories(
+            Arc::new(|| "rates-vmsg-1".to_owned()),
+            Arc::new(|| "123456789".to_owned()),
+        );
 
         let result = dispatcher
             .dispatch_rates(
@@ -2367,10 +2358,6 @@ mod tests {
                 eta: String::new(),
                 state: "queued".to_owned(),
             }
-        );
-        assert_eq!(
-            store.inserts(),
-            vec![("rates-vmsg-1".to_owned(), -10042, Some(9))]
         );
         let snapshot = queue.snapshot();
         assert_eq!(snapshot.regular.len(), 1);
@@ -2420,10 +2407,8 @@ mod tests {
     #[tokio::test]
     async fn rates_tool_dispatcher_empty_text_is_go_noop() -> Result<(), Box<dyn std::error::Error>>
     {
-        let dispatcher = RatesToolDispatcherEffects::new(
-            VirtualStoreStub::default(),
-            Arc::new(DispatcherQueue::new(Default::default())),
-        );
+        let dispatcher =
+            RatesToolDispatcherEffects::new(Arc::new(DispatcherQueue::new(Default::default())));
 
         let result = dispatcher
             .dispatch_rates(
@@ -2605,76 +2590,6 @@ mod tests {
 
     fn cbr_fixture() -> &'static str {
         r#"<ValCurs Date="19.06.2026" name="Foreign Currency Market"><Valute ID="R01235"><CharCode>USD</CharCode><Nominal>1</Nominal><Name>Dollar</Name><Value>90,0000</Value></Valute><Valute ID="R01239"><CharCode>EUR</CharCode><Nominal>1</Nominal><Name>Euro</Name><Value>100,0000</Value></Valute><Valute ID="R01090B"><CharCode>BYN</CharCode><Nominal>1</Nominal><Name>Belarusian ruble</Name><Value>30,0000</Value></Valute><Valute ID="R01060"><CharCode>AMD</CharCode><Nominal>100</Nominal><Name>Armenian dram</Name><Value>23,0000</Value></Valute><Valute ID="R01020A"><CharCode>AZN</CharCode><Nominal>1</Nominal><Name>Azerbaijani manat</Name><Value>53,0000</Value></Valute><Valute ID="R01370"><CharCode>KGS</CharCode><Nominal>10</Nominal><Name>Kyrgyz som</Name><Value>10,0000</Value></Valute><Valute ID="R01335"><CharCode>KZT</CharCode><Nominal>100</Nominal><Name>Kazakhstani tenge</Name><Value>18,0000</Value></Valute><Valute ID="R01500"><CharCode>MDL</CharCode><Nominal>10</Nominal><Name>Moldovan leu</Name><Value>50,0000</Value></Valute><Valute ID="R01670"><CharCode>TJS</CharCode><Nominal>10</Nominal><Name>Tajikistani somoni</Name><Value>85,0000</Value></Valute><Valute ID="R01710A"><CharCode>TMT</CharCode><Nominal>1</Nominal><Name>Turkmen manat</Name><Value>25,0000</Value></Valute><Valute ID="R01717"><CharCode>UZS</CharCode><Nominal>10000</Nominal><Name>Uzbekistani sum</Name><Value>70,0000</Value></Valute><Valute ID="R01375"><CharCode>CNY</CharCode><Nominal>1</Nominal><Name>Yuan</Name><Value>10,5000</Value><VunitRate>10,5000</VunitRate></Valute></ValCurs>"#
-    }
-
-    type VirtualInsertCalls = Arc<Mutex<Vec<(String, i64, Option<i32>)>>>;
-
-    #[derive(Clone, Default)]
-    struct VirtualStoreStub {
-        inserts: VirtualInsertCalls,
-    }
-
-    impl VirtualStoreStub {
-        fn inserts(&self) -> Vec<(String, i64, Option<i32>)> {
-            self.inserts.lock().expect("virtual store inserts").clone()
-        }
-    }
-
-    impl VirtualMessageStore for VirtualStoreStub {
-        type Error = io::Error;
-
-        fn get_mapping_by_virtual<'a>(
-            &'a self,
-            _vmsg_id: String,
-        ) -> Pin<
-            Box<
-                dyn Future<Output = Result<Option<openplotva_core::MessageIdMapping>, Self::Error>>
-                    + Send
-                    + 'a,
-            >,
-        > {
-            Box::pin(async { Ok(None) })
-        }
-
-        fn insert_virtual_message<'a>(
-            &'a self,
-            vmsg_id: String,
-            chat_id: i64,
-            thread_id: Option<i32>,
-        ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
-            Box::pin(async move {
-                self.inserts
-                    .lock()
-                    .expect("virtual store inserts")
-                    .push((vmsg_id, chat_id, thread_id));
-                Ok(())
-            })
-        }
-
-        fn resolve_virtual_message<'a>(
-            &'a self,
-            _vmsg_id: String,
-            _real_message_id: i32,
-        ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
-            Box::pin(async { Ok(()) })
-        }
-
-        fn enqueue_message_op<'a>(
-            &'a self,
-            _vmsg_id: String,
-            _chat_id: i64,
-            _op: &'static str,
-            _payload_json: Option<String>,
-        ) -> Pin<Box<dyn Future<Output = Result<i64, Self::Error>> + Send + 'a>> {
-            Box::pin(async { Ok(1) })
-        }
-
-        fn delete_mapping_by_virtual<'a>(
-            &'a self,
-            _vmsg_id: String,
-        ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
-            Box::pin(async { Ok(()) })
-        }
     }
 
     #[derive(Clone, Copy)]

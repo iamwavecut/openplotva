@@ -405,97 +405,6 @@ pub struct UserSettings {
     pub updated: time::OffsetDateTime,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PendingOp {
-    /// Pending operation ID.
-    pub id: i64,
-    /// Virtual message ID the operation targets.
-    pub vmsg_id: String,
-    /// Telegram chat ID.
-    pub chat_id: i64,
-    pub op: String,
-    /// Operation payload, if any.
-    pub payload: Vec<u8>,
-    pub attempts: i32,
-}
-
-impl PendingOp {
-    pub fn new(id: i64, vmsg_id: impl Into<String>, chat_id: i64, op: impl Into<String>) -> Self {
-        Self {
-            id,
-            vmsg_id: vmsg_id.into(),
-            chat_id,
-            op: op.into(),
-            payload: Vec::new(),
-            attempts: 0,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MessageIdMapping {
-    /// Virtual message ID.
-    pub vmsg_id: String,
-    /// Telegram chat ID.
-    pub chat_id: i64,
-    /// Telegram forum thread ID, when present.
-    pub thread_id: Option<i32>,
-    /// Resolved real Telegram message ID, when the send finished.
-    pub real_message_id: Option<i32>,
-}
-
-impl MessageIdMapping {
-    /// Build an unresolved virtual-message mapping.
-    pub fn unresolved(vmsg_id: impl Into<String>, chat_id: i64) -> Self {
-        Self {
-            vmsg_id: vmsg_id.into(),
-            chat_id,
-            thread_id: None,
-            real_message_id: None,
-        }
-    }
-
-    /// Build a resolved virtual-message mapping.
-    pub fn resolved(vmsg_id: impl Into<String>, chat_id: i64, real_message_id: i32) -> Self {
-        Self {
-            vmsg_id: vmsg_id.into(),
-            chat_id,
-            thread_id: None,
-            real_message_id: Some(real_message_id),
-        }
-    }
-}
-
-/// Pending operation that has a resolved real Telegram message ID.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ReadyPendingOp {
-    /// Pending operation ID.
-    pub id: i64,
-    /// Virtual message ID the operation targets.
-    pub vmsg_id: String,
-    /// Telegram chat ID.
-    pub chat_id: i64,
-    pub op: String,
-    /// Operation payload, if any.
-    pub payload: Vec<u8>,
-    /// Real Telegram message ID from `message_id_map`.
-    pub real_message_id: i32,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
-pub struct PendingEditPayload {
-    /// Edited text.
-    #[serde(default)]
-    pub text: String,
-    /// Telegram parse mode, such as `HTML`.
-    #[serde(default)]
-    pub parse_mode: String,
-}
-
-pub fn pending_edit_payload(payload: &[u8]) -> PendingEditPayload {
-    serde_json::from_slice(payload).unwrap_or_default()
-}
-
 fn non_blank_string(value: Option<String>) -> Option<String> {
     value.filter(|value| !value.trim().is_empty())
 }
@@ -511,11 +420,11 @@ fn is_false(value: &bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChatSettings, ChatState, MessageSender, PendingEditPayload, ToolCall, UserState,
+        ChatSettings, ChatState, MessageSender, ToolCall, UserState,
         VIP_EVENT_TYPE_ADMIN_ADJUSTMENT, VIP_EVENT_TYPE_ADMIN_REVOKE,
         VIP_EVENT_TYPE_LEGACY_SUBSCRIPTION_BACKFILL, VIP_EVENT_TYPE_LEGACY_VIP_CACHE_BACKFILL,
         VIP_EVENT_TYPE_PAYMENT, VIP_EVENT_TYPE_REFUND_REVERSAL, filter_non_terminator_tool_calls,
-        is_synthetic_subscription_charge_id, is_terminator_tool_call_name, pending_edit_payload,
+        is_synthetic_subscription_charge_id, is_terminator_tool_call_name,
         subscription_delta_seconds, vip_days_to_seconds,
     };
 
@@ -598,23 +507,6 @@ mod tests {
                 ..ToolCall::default()
             }])
             .is_empty()
-        );
-    }
-
-    #[test]
-    fn pending_edit_payload_decodes_text_and_parse_mode_like_go() {
-        let payload = br#"{"text":"<b>edited</b>","parse_mode":"HTML"}"#;
-
-        assert_eq!(
-            pending_edit_payload(payload),
-            PendingEditPayload {
-                text: "<b>edited</b>".to_owned(),
-                parse_mode: "HTML".to_owned(),
-            }
-        );
-        assert_eq!(
-            pending_edit_payload(b"not-json"),
-            PendingEditPayload::default()
         );
     }
 

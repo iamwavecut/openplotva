@@ -35,8 +35,8 @@ use crate::runtime_api::{IssuedRuntimeToken, RuntimeTokenManager, RuntimeTokenSt
 use crate::settings::{AdminChatSettingsTarget, AdminChatTargetResolver};
 use crate::updates::{UpdateHandler, UpdateHandlerFuture};
 use crate::virtual_messages::{
-    QueueRichRequest, QueueTextRequest, VirtualIdFactory, VirtualMessageStore,
-    monotonic_virtual_id_factory, queue_rich_message, queue_text_message_parts,
+    QueueRichRequest, QueueTextRequest, VirtualIdFactory, monotonic_virtual_id_factory,
+    queue_rich_message, queue_text_message_parts,
 };
 
 const ADMIN_ENABLE_CHAT_COMMAND: &str = "admin_enable_chat";
@@ -235,18 +235,16 @@ impl AdminRedisCacheFlusher for redis::Client {
 }
 
 #[derive(Clone)]
-pub struct AdminDispatcherEffects<Store> {
-    store: Store,
+pub struct AdminDispatcherEffects {
     queue: Arc<DispatcherQueue>,
     next_virtual_id: VirtualIdFactory,
 }
 
-impl<Store> AdminDispatcherEffects<Store> {
+impl AdminDispatcherEffects {
     /// Build admin effects backed by the normal dispatcher.
     #[must_use]
-    pub fn new(store: Store, queue: Arc<DispatcherQueue>) -> Self {
+    pub fn new(queue: Arc<DispatcherQueue>) -> Self {
         Self {
-            store,
             queue,
             next_virtual_id: monotonic_virtual_id_factory("admin-vmsg"),
         }
@@ -260,10 +258,7 @@ impl<Store> AdminDispatcherEffects<Store> {
     }
 }
 
-impl<Store> AdminCommandEffects for AdminDispatcherEffects<Store>
-where
-    Store: VirtualMessageStore + Send + Sync,
-{
+impl AdminCommandEffects for AdminDispatcherEffects {
     type Error = AdminDispatchEffectError;
 
     fn send_admin_text<'a>(
@@ -281,7 +276,6 @@ where
                     reply_markup: None,
                 };
                 let queued = queue_rich_message(
-                    &self.store,
                     &self.queue,
                     QueueRichRequest {
                         message: &rich,
@@ -299,7 +293,6 @@ where
                 }
             }
             queue_text_message_parts(
-                &self.store,
                 &self.queue,
                 QueueTextRequest {
                     message: &plan.message,

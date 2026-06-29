@@ -25,8 +25,7 @@ use time::OffsetDateTime;
 
 use crate::updates::{UpdateHandler, UpdateHandlerFuture};
 use crate::virtual_messages::{
-    QueueTextRequest, VirtualIdFactory, VirtualMessageStore, monotonic_virtual_id_factory,
-    queue_text_message_parts,
+    QueueTextRequest, VirtualIdFactory, monotonic_virtual_id_factory, queue_text_message_parts,
 };
 
 const DELETE_DRAWING_COMMAND: &str = "delete_drawing";
@@ -227,18 +226,16 @@ pub trait DeleteDrawingCommandEffects {
 }
 
 #[derive(Clone)]
-pub struct DeleteDrawingCommandDispatcherEffects<Store> {
-    store: Store,
+pub struct DeleteDrawingCommandDispatcherEffects {
     queue: Arc<DispatcherQueue>,
     next_virtual_id: VirtualIdFactory,
 }
 
-impl<Store> DeleteDrawingCommandDispatcherEffects<Store> {
+impl DeleteDrawingCommandDispatcherEffects {
     /// Build delete-drawing command effects over the normal outbound dispatcher.
     #[must_use]
-    pub fn new(store: Store, queue: Arc<DispatcherQueue>) -> Self {
+    pub fn new(queue: Arc<DispatcherQueue>) -> Self {
         Self {
-            store,
             queue,
             next_virtual_id: monotonic_virtual_id_factory("delete-drawing-vmsg"),
         }
@@ -252,10 +249,7 @@ impl<Store> DeleteDrawingCommandDispatcherEffects<Store> {
     }
 }
 
-impl<Store> DeleteDrawingCommandEffects for DeleteDrawingCommandDispatcherEffects<Store>
-where
-    Store: VirtualMessageStore + Send + Sync,
-{
+impl DeleteDrawingCommandEffects for DeleteDrawingCommandDispatcherEffects {
     type Error = OutboundBuildError;
 
     fn send_delete_drawing_text<'a>(
@@ -264,7 +258,6 @@ where
     ) -> DeleteDrawingEffectFuture<'a, Self::Error> {
         Box::pin(async move {
             queue_text_message_parts(
-                &self.store,
                 &self.queue,
                 QueueTextRequest {
                     message: &plan.message,
@@ -1408,7 +1401,6 @@ fn text_entity_content(text: &str, position: TelegramTextEntityPosition) -> Opti
 mod tests {
     use super::*;
     use carapax::types::{ChatMember, ChatMemberAdministrator, ChatMemberCreator, User};
-    use openplotva_core::MessageIdMapping;
     use openplotva_telegram::{CallbackHandlerKind, DispatcherConfig, TelegramOutboundMethodKind};
     use openplotva_updates::{UpdateConsumerConfig, UpdateStageOutcome};
     use std::{
@@ -1688,10 +1680,9 @@ mod tests {
 
         let state_store = UpdateStateStoreStub::default();
         let last_generation_store = Arc::new(StoreStub::default());
-        let virtual_store = VirtualStoreStub::default();
         let queue = Arc::new(DispatcherQueue::new(DispatcherConfig::default()));
         let effects = Arc::new(
-            DeleteDrawingCommandDispatcherEffects::new(virtual_store.clone(), Arc::clone(&queue))
+            DeleteDrawingCommandDispatcherEffects::new(Arc::clone(&queue))
                 .with_virtual_id_factory(Arc::new(|| "delete-drawing-live-vmsg-1".to_owned())),
         );
         let next = Arc::new(UpdateHandlerStub::default());
@@ -1743,10 +1734,6 @@ mod tests {
             vec!["chat:-42:supergroup::".to_owned(), "user:5:Ada:".to_owned()]
         );
         assert_eq!(next.handled_count(), 0);
-        assert_eq!(
-            virtual_store.inserts(),
-            vec![("delete-drawing-live-vmsg-1".to_owned(), -42, Some(0))]
-        );
         let item = queue
             .dequeue_immediate()
             .ok_or_else(|| io::Error::other("expected delete_drawing error payload"))?;
@@ -2285,72 +2272,6 @@ mod tests {
                     .push(format!("file:{}", params.file_unique_id));
                 Ok(())
             })
-        }
-    }
-
-    type VirtualInsertLog = Arc<Mutex<Vec<(String, i64, Option<i32>)>>>;
-
-    #[derive(Clone, Default)]
-    struct VirtualStoreStub {
-        inserts: VirtualInsertLog,
-    }
-
-    impl VirtualStoreStub {
-        fn inserts(&self) -> Vec<(String, i64, Option<i32>)> {
-            self.inserts.lock().expect("inserts").clone()
-        }
-
-        fn lock_inserts(&self) -> MutexGuard<'_, Vec<(String, i64, Option<i32>)>> {
-            self.inserts.lock().expect("inserts")
-        }
-    }
-
-    impl VirtualMessageStore for VirtualStoreStub {
-        type Error = io::Error;
-
-        fn get_mapping_by_virtual<'a>(
-            &'a self,
-            _vmsg_id: String,
-        ) -> Pin<Box<dyn Future<Output = Result<Option<MessageIdMapping>, Self::Error>> + Send + 'a>>
-        {
-            Box::pin(async { Ok(None) })
-        }
-
-        fn insert_virtual_message<'a>(
-            &'a self,
-            vmsg_id: String,
-            chat_id: i64,
-            thread_id: Option<i32>,
-        ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
-            Box::pin(async move {
-                self.lock_inserts().push((vmsg_id, chat_id, thread_id));
-                Ok(())
-            })
-        }
-
-        fn resolve_virtual_message<'a>(
-            &'a self,
-            _vmsg_id: String,
-            _real_message_id: i32,
-        ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
-            Box::pin(async { Ok(()) })
-        }
-
-        fn enqueue_message_op<'a>(
-            &'a self,
-            _vmsg_id: String,
-            _chat_id: i64,
-            _op: &'static str,
-            _payload_json: Option<String>,
-        ) -> Pin<Box<dyn Future<Output = Result<i64, Self::Error>> + Send + 'a>> {
-            Box::pin(async { Ok(1) })
-        }
-
-        fn delete_mapping_by_virtual<'a>(
-            &'a self,
-            _vmsg_id: String,
-        ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
-            Box::pin(async { Ok(()) })
         }
     }
 

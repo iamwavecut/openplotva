@@ -22,7 +22,6 @@ use crate::{
     translate::{
         TextTranslator, TranslateControlJobOutcome, TranslateEffects, execute_translate_control_job,
     },
-    virtual_messages::VirtualMessageStore,
 };
 
 pub const CONTROL_JOB_WORKER_ID: &str = "control-job-dispatcher";
@@ -115,7 +114,6 @@ pub struct AppControlJobExecutors<
     'a,
     PaymentStore,
     PaymentEffects,
-    SettingsStore,
     GroupEffects,
     NewMembersEffects,
     Translator,
@@ -128,8 +126,6 @@ pub struct AppControlJobExecutors<
     pub payment_store: &'a PaymentStore,
     /// Payment Telegram/dispatcher effects.
     pub payment_effects: &'a PaymentEffects,
-    /// Virtual message storage used by settings sends.
-    pub settings_store: &'a SettingsStore,
     /// Outbound dispatcher queue.
     pub dispatcher_queue: &'a DispatcherQueue,
     /// Group settings side effects.
@@ -153,7 +149,6 @@ pub struct AppControlJobExecutors<
 impl<
     PaymentStore,
     PaymentEffects,
-    SettingsStore,
     GroupEffects,
     NewMembersEffects,
     Translator,
@@ -166,7 +161,6 @@ impl<
         '_,
         PaymentStore,
         PaymentEffects,
-        SettingsStore,
         GroupEffects,
         NewMembersEffects,
         Translator,
@@ -179,7 +173,6 @@ where
     PaymentStore: SuccessfulPaymentStore + Sync,
     PaymentEffects:
         crate::payments::PaymentInvoiceEffects + crate::payments::SuccessfulPaymentEffects + Sync,
-    SettingsStore: VirtualMessageStore + Sync,
     GroupEffects: GroupSettingsControlJobEffects + Sync,
     NewMembersEffects: NewMembersFollowupControlJobEffects + Sync,
     Translator: TextTranslator + Sync,
@@ -218,7 +211,6 @@ where
                 ControlKind::GroupSettings => {
                     let mut next_virtual_id = || (self.next_virtual_id)();
                     match execute_group_settings_control_job_at(
-                        self.settings_store,
                         self.dispatcher_queue,
                         self.group_settings_effects,
                         params,
@@ -240,7 +232,6 @@ where
                 ControlKind::NewMembersFollowup => {
                     let mut next_virtual_id = || (self.next_virtual_id)();
                     match execute_new_members_followup_control_job_at(
-                        self.settings_store,
                         self.dispatcher_queue,
                         self.new_members_effects,
                         params,

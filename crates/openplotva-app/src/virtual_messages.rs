@@ -11,28 +11,23 @@ use std::{
     time::Duration,
 };
 
-use openplotva_core::{MessageIdMapping, ReadyPendingOp};
 use openplotva_telegram::{
     AudioMessageRequest, DeleteMessageRequest, DispatcherMessage, DispatcherQueue,
     DispatcherSendStatus, DispatcherWorkItem, EditMediaMessageRequest, EditTextMessageRequest,
     EnqueueOutcome, MediaGroupMessageRequest, MediaGroupPhotoItem, MessageFingerprint,
-    OutboundBuildError, PENDING_OP_DELETE, PENDING_OP_EDIT, PendingOpBuildError,
-    PhotoMessageRequest, ReplyMessageRef, RichMessageRequest, StickerMessageRequest,
-    TELEGRAM_TEXT_MAX_BYTES, TelegramOutboundMethod, TelegramOutboundResponse, TextMessageRequest,
-    build_audio_message_method, build_audio_message_plan, build_delete_message_method,
-    build_edit_media_message_method, build_edit_media_message_plan, build_edit_text_message_method,
-    build_media_group_message_method, build_media_group_message_plan, build_pending_op_method,
-    build_photo_message_method, build_photo_message_plan, build_rich_message_method,
-    build_sticker_message_method, build_sticker_message_plan, build_text_message_method,
-    fingerprint_audio_message_plan, fingerprint_photo_message_plan, fingerprint_rich_message,
-    fingerprint_sticker_message_plan, fingerprint_text_message_part, forum_thread_id, hash_content,
-    message_target_chat, split_telegram_text, validate_text_message_text,
+    OutboundBuildError, PhotoMessageRequest, ReplyMessageRef, RichMessageRequest,
+    StickerMessageRequest, TELEGRAM_TEXT_MAX_BYTES, TelegramOutboundMethod,
+    TelegramOutboundResponse, TextMessageRequest, build_audio_message_method,
+    build_audio_message_plan, build_delete_message_method, build_edit_media_message_method,
+    build_edit_media_message_plan, build_edit_text_message_method,
+    build_media_group_message_method, build_media_group_message_plan, build_photo_message_method,
+    build_photo_message_plan, build_rich_message_method, build_sticker_message_method,
+    build_sticker_message_plan, build_text_message_method, fingerprint_audio_message_plan,
+    fingerprint_photo_message_plan, fingerprint_rich_message, fingerprint_sticker_message_plan,
+    fingerprint_text_message_part, hash_content, message_target_chat, split_telegram_text,
+    validate_text_message_text,
 };
-use serde_json::json;
-use thiserror::Error;
 use time::OffsetDateTime;
-
-use crate::pending_ops::{NoopPendingOpHistory, PendingOpHistory};
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -49,101 +44,6 @@ pub fn monotonic_virtual_id_factory(prefix: &'static str) -> VirtualIdFactory {
         let id = next_id.fetch_add(1, Ordering::Relaxed);
         format!("{prefix}-{process_id:x}-{started_at:x}-{id:x}")
     })
-}
-
-pub trait VirtualMessageStore {
-    /// Store error type.
-    type Error: fmt::Display + Send + Sync + 'static;
-
-    /// Load a virtual-message mapping by virtual ID.
-    fn get_mapping_by_virtual<'a>(
-        &'a self,
-        vmsg_id: String,
-    ) -> BoxFuture<'a, Result<Option<MessageIdMapping>, Self::Error>>;
-
-    /// Insert an unresolved virtual-message mapping before queueing a send.
-    fn insert_virtual_message<'a>(
-        &'a self,
-        vmsg_id: String,
-        chat_id: i64,
-        thread_id: Option<i32>,
-    ) -> BoxFuture<'a, Result<(), Self::Error>>;
-
-    /// Resolve a virtual message to the real Telegram message ID after send success.
-    fn resolve_virtual_message<'a>(
-        &'a self,
-        vmsg_id: String,
-        real_message_id: i32,
-    ) -> BoxFuture<'a, Result<(), Self::Error>>;
-
-    /// Enqueue a pending virtual-message operation.
-    fn enqueue_message_op<'a>(
-        &'a self,
-        vmsg_id: String,
-        chat_id: i64,
-        op: &'static str,
-        payload_json: Option<String>,
-    ) -> BoxFuture<'a, Result<i64, Self::Error>>;
-
-    /// Delete a resolved virtual-message mapping.
-    fn delete_mapping_by_virtual<'a>(
-        &'a self,
-        vmsg_id: String,
-    ) -> BoxFuture<'a, Result<(), Self::Error>>;
-}
-
-impl VirtualMessageStore for openplotva_storage::PostgresVirtualMessageStore {
-    type Error = openplotva_storage::StorageError;
-
-    fn get_mapping_by_virtual<'a>(
-        &'a self,
-        vmsg_id: String,
-    ) -> BoxFuture<'a, Result<Option<MessageIdMapping>, Self::Error>> {
-        Box::pin(async move { self.get_mapping_by_virtual(&vmsg_id).await })
-    }
-
-    fn insert_virtual_message<'a>(
-        &'a self,
-        vmsg_id: String,
-        chat_id: i64,
-        thread_id: Option<i32>,
-    ) -> BoxFuture<'a, Result<(), Self::Error>> {
-        Box::pin(async move {
-            self.insert_virtual_message(&vmsg_id, chat_id, thread_id)
-                .await
-        })
-    }
-
-    fn resolve_virtual_message<'a>(
-        &'a self,
-        vmsg_id: String,
-        real_message_id: i32,
-    ) -> BoxFuture<'a, Result<(), Self::Error>> {
-        Box::pin(async move {
-            self.resolve_virtual_message(&vmsg_id, real_message_id, None)
-                .await
-        })
-    }
-
-    fn enqueue_message_op<'a>(
-        &'a self,
-        vmsg_id: String,
-        chat_id: i64,
-        op: &'static str,
-        payload_json: Option<String>,
-    ) -> BoxFuture<'a, Result<i64, Self::Error>> {
-        Box::pin(async move {
-            self.enqueue_message_op(&vmsg_id, chat_id, op, payload_json.as_deref())
-                .await
-        })
-    }
-
-    fn delete_mapping_by_virtual<'a>(
-        &'a self,
-        vmsg_id: String,
-    ) -> BoxFuture<'a, Result<(), Self::Error>> {
-        Box::pin(async move { self.delete_mapping_by_virtual(&vmsg_id).await })
-    }
 }
 
 pub trait EphemeralMessageTracker {
@@ -241,90 +141,53 @@ impl EphemeralMessageTracker for NoopEphemeralMessageTracker {
     }
 }
 
-/// Observable result of a virtual-message edit/delete request.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum VirtualMessageAction {
-    /// The mapping was resolved and a Telegram method was sent immediately.
-    SentNow,
-    /// The mapping was missing or unresolved, so a pending operation was queued.
-    Queued,
+/// History side effect triggered after a successful dispatcher edit.
+pub trait EditHistorySink {
+    /// Record an edited message's new text in chat history.
+    fn update_text<'a>(
+        &'a self,
+        chat_id: i64,
+        message_id: i32,
+        text: &'a str,
+        parse_mode: &'a str,
+    ) -> BoxFuture<'a, ()>;
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct VirtualMessageReport {
-    /// Whether the operation was sent immediately or queued for later.
-    pub action: VirtualMessageAction,
-    /// Real Telegram message ID used by immediate sends.
-    pub real_message_id: Option<i32>,
-    /// Pending operation row ID, when enqueue succeeded.
-    pub enqueued_op_id: Option<i64>,
-    pub lookup_error: Option<String>,
-    pub enqueue_error: Option<String>,
-    /// Number of queued dispatcher items removed by virtual ID.
-    pub canceled: usize,
-    /// Whether a successful edit was reflected into history.
-    pub history_updated: bool,
-    /// Whether a successful delete was reflected into history.
-    pub history_deleted: bool,
-    /// Whether a successful delete removed its virtual-message mapping.
-    pub mapping_deleted: bool,
-    pub delete_mapping_error: Option<String>,
-}
+/// No-op history sink for call sites that intentionally skip persistence.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NoopEditHistorySink;
 
-impl VirtualMessageReport {
-    fn sent_now(real_message_id: i32) -> Self {
-        Self {
-            action: VirtualMessageAction::SentNow,
-            real_message_id: Some(real_message_id),
-            enqueued_op_id: None,
-            lookup_error: None,
-            enqueue_error: None,
-            canceled: 0,
-            history_updated: false,
-            history_deleted: false,
-            mapping_deleted: false,
-            delete_mapping_error: None,
-        }
-    }
-
-    fn queued(
-        enqueued_op_id: Option<i64>,
-        enqueue_error: Option<String>,
-        lookup_error: Option<String>,
-        canceled: usize,
-    ) -> Self {
-        Self {
-            action: VirtualMessageAction::Queued,
-            real_message_id: None,
-            enqueued_op_id,
-            lookup_error,
-            enqueue_error,
-            canceled,
-            history_updated: false,
-            history_deleted: false,
-            mapping_deleted: false,
-            delete_mapping_error: None,
-        }
+impl EditHistorySink for NoopEditHistorySink {
+    fn update_text<'a>(
+        &'a self,
+        _chat_id: i64,
+        _message_id: i32,
+        _text: &'a str,
+        _parse_mode: &'a str,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async {})
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct VirtualEditRequest<'a> {
-    /// Telegram chat ID.
-    pub chat_id: i64,
-    /// Virtual message ID.
-    pub vmsg_id: &'a str,
-    /// New message text.
-    pub text: &'a str,
-    pub parse_mode: &'a str,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct VirtualDeleteRequest<'a> {
-    /// Telegram chat ID.
-    pub chat_id: i64,
-    /// Virtual message ID.
-    pub vmsg_id: &'a str,
+impl EditHistorySink for openplotva_storage::PostgresHistoryStore {
+    fn update_text<'a>(
+        &'a self,
+        chat_id: i64,
+        message_id: i32,
+        text: &'a str,
+        _parse_mode: &'a str,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            if let Err(error) = self.update_text_entry(chat_id, message_id, text).await {
+                tracing::warn!(
+                    chat_id,
+                    message_id,
+                    %error,
+                    "failed to update chat history entry after Telegram edit"
+                );
+            }
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -408,7 +271,6 @@ pub struct QueuedTextPartReport {
     pub enqueue_outcome: EnqueueOutcome,
     /// Whether this part went to the immediate queue.
     pub immediate: bool,
-    pub insert_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -424,7 +286,6 @@ pub struct QueueStickerReport {
     pub enqueue_outcome: EnqueueOutcome,
     /// Whether this sticker went to the immediate queue.
     pub immediate: bool,
-    pub insert_error: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -481,20 +342,15 @@ impl QueueTextReport {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DispatchResolveReport {
+pub struct DispatchSendReport {
     pub status: DispatcherSendStatus,
     /// Virtual message ID carried by the dispatcher item.
     pub virtual_id: String,
     /// Real Telegram message ID extracted from a successful send response.
-    pub resolved_message_id: Option<i32>,
-    /// Whether the dispatcher item had no Telegram method payload to send.
-    pub missing_method: bool,
+    pub sent_message_id: Option<i32>,
     /// Telegram send error returned by the transport callback.
     pub send_error: Option<String>,
-    pub resolve_error: Option<String>,
     pub ephemeral_track_error: Option<String>,
-    /// Whether a direct edit-text item was reflected into history after send success.
-    pub history_updated: bool,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -698,27 +554,12 @@ fn trace_ephemeral_cleanup_tick(tick: &EphemeralCleanupReport) {
     );
 }
 
-/// Recoverable errors from immediate virtual-message handling.
-#[derive(Debug, Error, Eq, PartialEq)]
-pub enum VirtualMessageError {
-    #[error("text is empty")]
-    EmptyText,
-    /// The resolved operation could not be converted into a Telegram method.
-    #[error("failed to build Telegram method: {0}")]
-    Build(String),
-    /// Telegram rejected the immediate operation.
-    #[error("Telegram send failed: {0}")]
-    Send(String),
-}
-
-pub async fn queue_text_message_parts<S, NextId>(
-    store: &S,
+pub async fn queue_text_message_parts<NextId>(
     queue: &DispatcherQueue,
     req: QueueTextRequest<'_>,
     mut next_virtual_id: NextId,
 ) -> Result<QueueTextReport, OutboundBuildError>
 where
-    S: VirtualMessageStore + Sync,
     NextId: FnMut() -> String,
 {
     validate_text_message_text(&req.message.text, &req.message.render_as)?;
@@ -736,12 +577,6 @@ where
     let total_parts = parts.len();
     for (index, part) in parts.into_iter().enumerate() {
         let virtual_id = next_virtual_id();
-        let thread_id = forum_thread_id(chat, req.message.message_thread_id).map(|id| id as i32);
-        let insert_error = store
-            .insert_virtual_message(virtual_id.clone(), chat.id, thread_id)
-            .await
-            .err()
-            .map(|error| error.to_string());
         let method = build_text_message_method(
             req.message,
             chat,
@@ -765,32 +600,23 @@ where
             virtual_id,
             enqueue_outcome,
             immediate,
-            insert_error,
         });
     }
 
     Ok(report)
 }
 
-pub async fn queue_rich_message<S, NextId>(
-    store: &S,
+pub async fn queue_rich_message<NextId>(
     queue: &DispatcherQueue,
     req: QueueRichRequest<'_>,
     mut next_virtual_id: NextId,
 ) -> Result<QueueTextReport, OutboundBuildError>
 where
-    S: VirtualMessageStore + Sync,
     NextId: FnMut() -> String,
 {
     let chat = message_target_chat(req.message.chat.as_ref(), req.reply_to)?;
     let method = build_rich_message_method(req.message, chat, req.reply_to)?;
     let virtual_id = next_virtual_id();
-    let thread_id = forum_thread_id(chat, req.message.message_thread_id).map(|id| id as i32);
-    let insert_error = store
-        .insert_virtual_message(virtual_id.clone(), chat.id, thread_id)
-        .await
-        .err()
-        .map(|error| error.to_string());
     let mut dispatcher_message =
         DispatcherMessage::new(fingerprint_rich_message(chat.id, &method.html), &virtual_id)
             .with_method(TelegramOutboundMethod::from(method))
@@ -805,30 +631,20 @@ where
         virtual_id,
         enqueue_outcome,
         immediate: req.immediate,
-        insert_error,
     });
     Ok(report)
 }
 
-pub async fn queue_sticker_message<S, NextId>(
-    store: &S,
+pub async fn queue_sticker_message<NextId>(
     queue: &DispatcherQueue,
     req: QueueStickerRequest<'_>,
     mut next_virtual_id: NextId,
 ) -> Result<QueueStickerReport, OutboundBuildError>
 where
-    S: VirtualMessageStore + Sync,
     NextId: FnMut() -> String,
 {
-    let chat = message_target_chat(req.message.chat.as_ref(), req.reply_to)?;
+    message_target_chat(req.message.chat.as_ref(), req.reply_to)?;
     let virtual_id = next_virtual_id();
-    let thread_id =
-        forum_thread_id(chat, req.message.message_thread_id).map(|thread_id| thread_id as i32);
-    let insert_error = store
-        .insert_virtual_message(virtual_id.clone(), chat.id, thread_id)
-        .await
-        .err()
-        .map(|error| error.to_string());
     let plan = build_sticker_message_plan(req.message, req.reply_to)?;
     let method = build_sticker_message_method(req.message, req.reply_to)?;
     let persistence_payload = plan
@@ -850,7 +666,6 @@ where
         virtual_id,
         enqueue_outcome,
         immediate: req.immediate,
-        insert_error,
     })
 }
 
@@ -1001,21 +816,18 @@ fn edit_text_identity_fingerprint(req: &EditTextMessageRequest) -> MessageFinger
     }
 }
 
-/// Send one dispatcher item and resolve its virtual-message mapping from the Telegram response.
-pub async fn send_work_item_and_resolve<S, Send, SendFuture, SendError>(
-    store: &S,
+/// Send one dispatcher item and report the real Telegram message ID from the response.
+pub async fn send_work_item<Send, SendFuture, SendError>(
     item: DispatcherWorkItem,
     send: Send,
-) -> DispatchResolveReport
+) -> DispatchSendReport
 where
-    S: VirtualMessageStore + Sync,
     Send: FnOnce(TelegramOutboundMethod) -> SendFuture,
     SendFuture: Future<Output = Result<TelegramOutboundResponse, SendError>>,
     SendError: fmt::Display,
 {
-    send_work_item_and_resolve_inner(
-        store,
-        None::<&NoopPendingOpHistory>,
+    send_work_item_inner(
+        None::<&NoopEditHistorySink>,
         None::<&NoopEphemeralMessageTracker>,
         item,
         OffsetDateTime::now_utc(),
@@ -1024,49 +836,21 @@ where
     .await
 }
 
-/// Send one dispatcher item, resolve virtual-message mappings, and apply direct edit history.
-pub async fn send_work_item_and_resolve_with_history<S, H, Send, SendFuture, SendError>(
-    store: &S,
-    history: &H,
-    item: DispatcherWorkItem,
-    send: Send,
-) -> DispatchResolveReport
-where
-    S: VirtualMessageStore + Sync,
-    H: PendingOpHistory,
-    Send: FnOnce(TelegramOutboundMethod) -> SendFuture,
-    SendFuture: Future<Output = Result<TelegramOutboundResponse, SendError>>,
-    SendError: fmt::Display,
-{
-    send_work_item_and_resolve_inner(
-        store,
-        Some(history),
-        None::<&NoopEphemeralMessageTracker>,
-        item,
-        OffsetDateTime::now_utc(),
-        send,
-    )
-    .await
-}
-
-/// Send one dispatcher item, resolve virtual-message mappings, and track ephemeral sends.
-pub async fn send_work_item_and_resolve_with_ephemeral<S, E, Send, SendFuture, SendError>(
-    store: &S,
+/// Send one dispatcher item, report its real message ID, and track ephemeral sends.
+pub async fn send_work_item_with_ephemeral<E, Send, SendFuture, SendError>(
     ephemeral: &E,
     item: DispatcherWorkItem,
     now: OffsetDateTime,
     send: Send,
-) -> DispatchResolveReport
+) -> DispatchSendReport
 where
-    S: VirtualMessageStore + Sync,
     E: EphemeralMessageTracker + Sync,
     Send: FnOnce(TelegramOutboundMethod) -> SendFuture,
     SendFuture: Future<Output = Result<TelegramOutboundResponse, SendError>>,
     SendError: fmt::Display,
 {
-    send_work_item_and_resolve_inner(
-        store,
-        None::<&NoopPendingOpHistory>,
+    send_work_item_inner(
+        None::<&NoopEditHistorySink>,
         Some(ephemeral),
         item,
         now,
@@ -1075,44 +859,33 @@ where
     .await
 }
 
-/// Send one dispatcher item, resolve mappings, update history, and track ephemeral sends.
-pub async fn send_work_item_and_resolve_with_history_and_ephemeral<
-    S,
-    H,
-    E,
-    Send,
-    SendFuture,
-    SendError,
->(
-    store: &S,
+/// Send one dispatcher item, update history on direct edits, and track ephemeral sends.
+pub async fn send_work_item_with_history_and_ephemeral<H, E, Send, SendFuture, SendError>(
     history: &H,
     ephemeral: &E,
     item: DispatcherWorkItem,
     now: OffsetDateTime,
     send: Send,
-) -> DispatchResolveReport
+) -> DispatchSendReport
 where
-    S: VirtualMessageStore + Sync,
-    H: PendingOpHistory,
+    H: EditHistorySink,
     E: EphemeralMessageTracker + Sync,
     Send: FnOnce(TelegramOutboundMethod) -> SendFuture,
     SendFuture: Future<Output = Result<TelegramOutboundResponse, SendError>>,
     SendError: fmt::Display,
 {
-    send_work_item_and_resolve_inner(store, Some(history), Some(ephemeral), item, now, send).await
+    send_work_item_inner(Some(history), Some(ephemeral), item, now, send).await
 }
 
-async fn send_work_item_and_resolve_inner<S, H, E, Send, SendFuture, SendError>(
-    store: &S,
+async fn send_work_item_inner<H, E, Send, SendFuture, SendError>(
     history: Option<&H>,
     ephemeral: Option<&E>,
     item: DispatcherWorkItem,
     now: OffsetDateTime,
     send: Send,
-) -> DispatchResolveReport
+) -> DispatchSendReport
 where
-    S: VirtualMessageStore + Sync,
-    H: PendingOpHistory,
+    H: EditHistorySink,
     E: EphemeralMessageTracker + Sync,
     Send: FnOnce(TelegramOutboundMethod) -> SendFuture,
     SendFuture: Future<Output = Result<TelegramOutboundResponse, SendError>>,
@@ -1122,15 +895,12 @@ where
     let ephemeral_delete_after = metadata.ephemeral_delete_after;
     let chat_id = metadata.chat_id;
     let Some(method) = method else {
-        return DispatchResolveReport {
+        return DispatchSendReport {
             status: DispatcherSendStatus::Failed,
             virtual_id: metadata.virtual_id,
-            resolved_message_id: None,
-            missing_method: true,
+            sent_message_id: None,
             send_error: None,
-            resolve_error: None,
             ephemeral_track_error: None,
-            history_updated: false,
         };
     };
     let direct_edit_history =
@@ -1139,45 +909,27 @@ where
     let response = match send(method).await {
         Ok(response) => response,
         Err(error) => {
-            return DispatchResolveReport {
+            return DispatchSendReport {
                 status: DispatcherSendStatus::Failed,
                 virtual_id: metadata.virtual_id,
-                resolved_message_id: None,
-                missing_method: false,
+                sent_message_id: None,
                 send_error: Some(error.to_string()),
-                resolve_error: None,
                 ephemeral_track_error: None,
-                history_updated: false,
             };
         }
     };
 
-    let mut report = DispatchResolveReport {
+    let mut report = DispatchSendReport {
         status: DispatcherSendStatus::Sent,
         virtual_id: metadata.virtual_id,
-        resolved_message_id: response_message_id(&response),
-        missing_method: false,
+        sent_message_id: response_message_id(&response),
         send_error: None,
-        resolve_error: None,
         ephemeral_track_error: None,
-        history_updated: false,
     };
 
-    if !report.virtual_id.is_empty()
-        && let Some(message_id) = report.resolved_message_id
+    if let (Some(ephemeral), Some(delete_after), Some(message_id)) =
+        (ephemeral, ephemeral_delete_after, report.sent_message_id)
     {
-        report.resolve_error = store
-            .resolve_virtual_message(report.virtual_id.clone(), message_id)
-            .await
-            .err()
-            .map(|error| error.to_string());
-    }
-
-    if let (Some(ephemeral), Some(delete_after), Some(message_id)) = (
-        ephemeral,
-        ephemeral_delete_after,
-        report.resolved_message_id,
-    ) {
         report.ephemeral_track_error = ephemeral
             .track_ephemeral_message(chat_id, message_id, delete_after, now)
             .await
@@ -1189,7 +941,6 @@ where
         history
             .update_text(edit.chat_id, edit.message_id, &edit.text, &edit.parse_mode)
             .await;
-        report.history_updated = true;
     }
 
     report
@@ -1239,123 +990,6 @@ fn direct_edit_text_history_update(
     })
 }
 
-pub async fn edit_text_virtual<S, H, Send, SendFuture, SendError, Cancel>(
-    store: &S,
-    history: &H,
-    req: VirtualEditRequest<'_>,
-    send: Send,
-    cancel: Cancel,
-) -> Result<VirtualMessageReport, VirtualMessageError>
-where
-    S: VirtualMessageStore + Sync,
-    H: PendingOpHistory,
-    Send: FnMut(TelegramOutboundMethod) -> SendFuture,
-    SendFuture: Future<Output = Result<(), SendError>>,
-    SendError: fmt::Display,
-    Cancel: FnMut(&str) -> usize,
-{
-    if req.text.is_empty() {
-        return Err(VirtualMessageError::EmptyText);
-    }
-
-    let payload_json = pending_edit_payload_json(req.text, req.parse_mode);
-    let mapping = load_mapping(store, req.vmsg_id).await;
-    let Some(real_message_id) = resolved_message_id(&mapping) else {
-        return Ok(queue_virtual_message_op(
-            store,
-            req.vmsg_id,
-            req.chat_id,
-            PENDING_OP_EDIT,
-            Some(payload_json),
-            mapping.err().map(|error| error.to_string()),
-            cancel,
-        )
-        .await);
-    };
-
-    let op = ready_virtual_op(
-        req.vmsg_id,
-        req.chat_id,
-        PENDING_OP_EDIT,
-        payload_json.into_bytes(),
-        real_message_id,
-    );
-    send_ready_virtual_op(&op, send).await?;
-    history
-        .update_text(req.chat_id, real_message_id, req.text, req.parse_mode)
-        .await;
-
-    let mut report = VirtualMessageReport::sent_now(real_message_id);
-    report.history_updated = true;
-    Ok(report)
-}
-
-pub async fn delete_message_virtual<S, H, Send, SendFuture, SendError, Cancel>(
-    store: &S,
-    history: &H,
-    req: VirtualDeleteRequest<'_>,
-    send: Send,
-    cancel: Cancel,
-) -> Result<VirtualMessageReport, VirtualMessageError>
-where
-    S: VirtualMessageStore + Sync,
-    H: PendingOpHistory,
-    Send: FnMut(TelegramOutboundMethod) -> SendFuture,
-    SendFuture: Future<Output = Result<(), SendError>>,
-    SendError: fmt::Display,
-    Cancel: FnMut(&str) -> usize,
-{
-    let mapping = load_mapping(store, req.vmsg_id).await;
-    let Some(real_message_id) = resolved_message_id(&mapping) else {
-        return Ok(queue_virtual_message_op(
-            store,
-            req.vmsg_id,
-            req.chat_id,
-            PENDING_OP_DELETE,
-            None,
-            mapping.err().map(|error| error.to_string()),
-            cancel,
-        )
-        .await);
-    };
-
-    let op = ready_virtual_op(
-        req.vmsg_id,
-        req.chat_id,
-        PENDING_OP_DELETE,
-        Vec::new(),
-        real_message_id,
-    );
-    send_ready_virtual_op(&op, send).await?;
-    history.delete_message(req.chat_id, real_message_id).await;
-
-    let delete_mapping_result = store
-        .delete_mapping_by_virtual(req.vmsg_id.to_owned())
-        .await;
-    let mut report = VirtualMessageReport::sent_now(real_message_id);
-    report.history_deleted = true;
-    match delete_mapping_result {
-        Ok(()) => report.mapping_deleted = true,
-        Err(error) => report.delete_mapping_error = Some(error.to_string()),
-    }
-    Ok(report)
-}
-
-async fn load_mapping<S>(store: &S, vmsg_id: &str) -> Result<Option<MessageIdMapping>, S::Error>
-where
-    S: VirtualMessageStore + Sync,
-{
-    store.get_mapping_by_virtual(vmsg_id.to_owned()).await
-}
-
-fn resolved_message_id<E>(mapping: &Result<Option<MessageIdMapping>, E>) -> Option<i32> {
-    mapping
-        .as_ref()
-        .ok()
-        .and_then(|mapping| mapping.as_ref())
-        .and_then(|mapping| mapping.real_message_id)
-}
-
 fn response_message_id(response: &TelegramOutboundResponse) -> Option<i32> {
     let raw = match response {
         TelegramOutboundResponse::Message(message) => Some(message.id),
@@ -1368,79 +1002,6 @@ fn response_message_id(response: &TelegramOutboundResponse) -> Option<i32> {
     i32::try_from(raw).ok()
 }
 
-async fn queue_virtual_message_op<S, Cancel>(
-    store: &S,
-    vmsg_id: &str,
-    chat_id: i64,
-    op: &'static str,
-    payload_json: Option<String>,
-    lookup_error: Option<String>,
-    mut cancel: Cancel,
-) -> VirtualMessageReport
-where
-    S: VirtualMessageStore + Sync,
-    Cancel: FnMut(&str) -> usize,
-{
-    let enqueue_result = store
-        .enqueue_message_op(vmsg_id.to_owned(), chat_id, op, payload_json)
-        .await;
-    let (enqueued_op_id, enqueue_error) = match enqueue_result {
-        Ok(id) => (Some(id), None),
-        Err(error) => (None, Some(error.to_string())),
-    };
-    let canceled = cancel(vmsg_id);
-
-    VirtualMessageReport::queued(enqueued_op_id, enqueue_error, lookup_error, canceled)
-}
-
-async fn send_ready_virtual_op<Send, SendFuture, SendError>(
-    op: &ReadyPendingOp,
-    mut send: Send,
-) -> Result<(), VirtualMessageError>
-where
-    Send: FnMut(TelegramOutboundMethod) -> SendFuture,
-    SendFuture: Future<Output = Result<(), SendError>>,
-    SendError: fmt::Display,
-{
-    let method = build_pending_op_method(op)
-        .map_err(|error| VirtualMessageError::Build(pending_build_error_message(error)))?;
-    send(method)
-        .await
-        .map_err(|error| VirtualMessageError::Send(error.to_string()))
-}
-
-fn ready_virtual_op(
-    vmsg_id: &str,
-    chat_id: i64,
-    op: &str,
-    payload: Vec<u8>,
-    real_message_id: i32,
-) -> ReadyPendingOp {
-    ReadyPendingOp {
-        id: 0,
-        vmsg_id: vmsg_id.to_owned(),
-        chat_id,
-        op: op.to_owned(),
-        payload,
-        real_message_id,
-    }
-}
-
-fn pending_edit_payload_json(text: &str, parse_mode: &str) -> String {
-    json!({
-        "parse_mode": parse_mode,
-        "text": text,
-    })
-    .to_string()
-}
-
-fn pending_build_error_message(error: PendingOpBuildError) -> String {
-    match error {
-        PendingOpBuildError::UnknownOp(_) => "unknown op".to_owned(),
-        error => error.to_string(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1451,31 +1012,26 @@ mod tests {
     };
 
     use carapax::types::EditMessageResult;
-    use openplotva_core::MessageIdMapping;
     use openplotva_storage::EphemeralMessage;
     use openplotva_telegram::{
         AudioMessageRequest, AudioSource, ChatRef, DispatcherConfig, DispatcherMessage,
         DispatcherQueue, DispatcherSendStatus, EditMediaMessageRequest, EditTextMessageRequest,
         EnqueueOutcome, MediaGroupMessageRequest, MediaGroupPhotoItem, PhotoMessageRequest,
-        PhotoSource, ReplyMessageRef, TELEGRAM_PARSE_MODE_HTML, TelegramMessage,
-        TelegramOutboundMethod, TelegramOutboundMethodKind, TelegramOutboundResponse,
-        TextMessageRequest, build_text_message_method, fingerprint_text_message_part,
-        persistent_queue_from_drain,
+        PhotoSource, TELEGRAM_PARSE_MODE_HTML, TelegramMessage, TelegramOutboundMethod,
+        TelegramOutboundMethodKind, TelegramOutboundResponse, TextMessageRequest,
+        build_text_message_method, fingerprint_text_message_part, persistent_queue_from_drain,
     };
     use serde_json::json;
     use time::OffsetDateTime;
 
-    use crate::pending_ops::PendingOpHistory;
+    use super::EditHistorySink;
 
     use super::{
-        PENDING_OP_DELETE, PENDING_OP_EDIT, QueueAudioRequest, QueueEditMediaRequest,
-        QueueEditTextRequest, QueueMediaGroupRequest, QueuePhotoRequest, QueueStickerRequest,
-        QueueTextRequest, VirtualDeleteRequest, VirtualEditRequest, VirtualMessageAction,
-        VirtualMessageError, VirtualMessageReport, VirtualMessageStore, delete_message_virtual,
-        edit_text_virtual, queue_audio_message, queue_edit_media_message, queue_edit_text_message,
-        queue_media_group_message, queue_photo_message, queue_sticker_message,
-        queue_text_message_parts, send_work_item_and_resolve,
-        send_work_item_and_resolve_with_ephemeral, send_work_item_and_resolve_with_history,
+        QueueAudioRequest, QueueEditMediaRequest, QueueEditTextRequest, QueueMediaGroupRequest,
+        QueuePhotoRequest, QueueStickerRequest, QueueTextRequest, queue_audio_message,
+        queue_edit_media_message, queue_edit_text_message, queue_media_group_message,
+        queue_photo_message, queue_sticker_message, queue_text_message_parts, send_work_item,
+        send_work_item_with_ephemeral, send_work_item_with_history_and_ephemeral,
     };
 
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1491,23 +1047,12 @@ mod tests {
 
     #[derive(Default)]
     struct StoreState {
-        mapping: Option<MessageIdMapping>,
-        lookup_error: Option<StubError>,
-        insert_error: Option<StubError>,
-        enqueue_error: Option<StubError>,
-        resolve_error: Option<StubError>,
         ephemeral_error: Option<StubError>,
         ephemeral_list_error: Option<StubError>,
         ephemeral_delete_error: Option<StubError>,
-        delete_mapping_error: Option<StubError>,
         ephemeral_messages: Vec<EphemeralMessage>,
-        lookup_calls: Vec<String>,
-        inserted: Vec<(String, i64, Option<i32>)>,
-        resolved: Vec<(String, i32)>,
         ephemeral_tracked: Vec<(i64, i32, Duration, OffsetDateTime)>,
         ephemeral_deleted: Vec<Vec<EphemeralMessage>>,
-        enqueued: Vec<(String, i64, &'static str, Option<String>)>,
-        deleted_mappings: Vec<String>,
         events: Vec<String>,
     }
 
@@ -1540,7 +1085,7 @@ mod tests {
         state: Arc<Mutex<StoreState>>,
     }
 
-    impl PendingOpHistory for HistoryStub {
+    impl EditHistorySink for HistoryStub {
         fn update_text<'a>(
             &'a self,
             chat_id: i64,
@@ -1552,105 +1097,6 @@ mod tests {
                 "history:update:{chat_id}:{message_id}:{text}:{parse_mode}"
             ));
             Box::pin(async {})
-        }
-
-        fn delete_message<'a>(&'a self, chat_id: i64, message_id: i32) -> super::BoxFuture<'a, ()> {
-            self.state
-                .lock()
-                .expect("store state")
-                .events
-                .push(format!("history:delete:{chat_id}:{message_id}"));
-            Box::pin(async {})
-        }
-    }
-
-    impl VirtualMessageStore for StoreStub {
-        type Error = StubError;
-
-        fn get_mapping_by_virtual<'a>(
-            &'a self,
-            vmsg_id: String,
-        ) -> super::BoxFuture<'a, Result<Option<MessageIdMapping>, Self::Error>> {
-            let result = {
-                let mut state = self.state.lock().expect("store state");
-                state.lookup_calls.push(vmsg_id);
-                if let Some(error) = &state.lookup_error {
-                    Err(error.clone())
-                } else {
-                    Ok(state.mapping.clone())
-                }
-            };
-            Box::pin(async move { result })
-        }
-
-        fn insert_virtual_message<'a>(
-            &'a self,
-            vmsg_id: String,
-            chat_id: i64,
-            thread_id: Option<i32>,
-        ) -> super::BoxFuture<'a, Result<(), Self::Error>> {
-            let result = {
-                let mut state = self.state.lock().expect("store state");
-                state.inserted.push((vmsg_id, chat_id, thread_id));
-                if let Some(error) = &state.insert_error {
-                    Err(error.clone())
-                } else {
-                    Ok(())
-                }
-            };
-            Box::pin(async move { result })
-        }
-
-        fn resolve_virtual_message<'a>(
-            &'a self,
-            vmsg_id: String,
-            real_message_id: i32,
-        ) -> super::BoxFuture<'a, Result<(), Self::Error>> {
-            let result = {
-                let mut state = self.state.lock().expect("store state");
-                state.resolved.push((vmsg_id, real_message_id));
-                if let Some(error) = &state.resolve_error {
-                    Err(error.clone())
-                } else {
-                    Ok(())
-                }
-            };
-            Box::pin(async move { result })
-        }
-
-        fn enqueue_message_op<'a>(
-            &'a self,
-            vmsg_id: String,
-            chat_id: i64,
-            op: &'static str,
-            payload_json: Option<String>,
-        ) -> super::BoxFuture<'a, Result<i64, Self::Error>> {
-            let result = {
-                let mut state = self.state.lock().expect("store state");
-                state.enqueued.push((vmsg_id, chat_id, op, payload_json));
-                if let Some(error) = &state.enqueue_error {
-                    Err(error.clone())
-                } else {
-                    Ok(i64::try_from(state.enqueued.len()).expect("enqueued len fits i64"))
-                }
-            };
-            Box::pin(async move { result })
-        }
-
-        fn delete_mapping_by_virtual<'a>(
-            &'a self,
-            vmsg_id: String,
-        ) -> super::BoxFuture<'a, Result<(), Self::Error>> {
-            let result = {
-                let mut state = self.state.lock().expect("store state");
-                state.deleted_mappings.push(vmsg_id);
-                if let Some(error) = &state.delete_mapping_error {
-                    Err(error.clone())
-                } else {
-                    Ok(())
-                }
-            };
-            Box::pin(async move { result })
         }
     }
 
@@ -1717,14 +1163,12 @@ mod tests {
     #[tokio::test]
     async fn queue_text_message_parts_inserts_virtual_ids_before_dispatch_enqueue()
     -> Result<(), Box<dyn Error>> {
-        let store = StoreStub::default();
         let queue = DispatcherQueue::new(DispatcherConfig::default());
         let text = format!("{}b", "a".repeat(4096));
         let request = text_request(&text);
         let mut ids = ["v1".to_owned(), "v2".to_owned()].into_iter();
 
         let report = queue_text_message_parts(
-            &store,
             &queue,
             QueueTextRequest {
                 message: &request,
@@ -1744,12 +1188,6 @@ mod tests {
         assert!(report.parts[0].immediate);
         assert_eq!(report.parts[1].virtual_id, "v2");
         assert!(!report.parts[1].immediate);
-        store.snapshot(|state| {
-            assert_eq!(
-                state.inserted,
-                vec![("v1".to_owned(), 42, None), ("v2".to_owned(), 42, None)]
-            );
-        });
         let snapshot = queue.snapshot();
         assert_eq!(snapshot.immediate.len(), 1);
         assert_eq!(snapshot.immediate[0].virtual_id, "v1");
@@ -1760,51 +1198,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn queue_text_message_parts_reports_insert_errors_but_still_queues()
-    -> Result<(), Box<dyn Error>> {
-        let store = StoreStub::with_state(StoreState {
-            insert_error: Some(StubError("insert failed")),
-            ..StoreState::default()
-        });
-        let queue = DispatcherQueue::new(DispatcherConfig::default());
-        let request = text_request("hello");
-
-        let report = queue_text_message_parts(
-            &store,
-            &queue,
-            QueueTextRequest {
-                message: &request,
-                reply_to: None,
-                immediate_first: false,
-                bypass_chat_restrictions: false,
-                ephemeral_delete_after: None,
-            },
-            || "v1".to_owned(),
-        )
-        .await?;
-
-        assert_eq!(report.enqueued_count(), 1);
-        assert_eq!(
-            report.parts[0].insert_error,
-            Some("insert failed".to_owned())
-        );
-        assert_eq!(queue.snapshot().regular[0].virtual_id, "v1");
-        store.snapshot(|state| {
-            assert_eq!(state.inserted, vec![("v1".to_owned(), 42, None)]);
-        });
-
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn queue_text_message_parts_marks_bypass_chat_restrictions_for_dispatcher()
     -> Result<(), Box<dyn Error>> {
-        let store = StoreStub::default();
         let queue = DispatcherQueue::new(DispatcherConfig::default());
         let request = text_request("settings link");
 
         let report = queue_text_message_parts(
-            &store,
             &queue,
             QueueTextRequest {
                 message: &request,
@@ -1826,14 +1225,12 @@ mod tests {
     #[tokio::test]
     async fn queue_text_message_parts_marks_only_first_part_ephemeral_like_go()
     -> Result<(), Box<dyn Error>> {
-        let store = StoreStub::default();
         let queue = DispatcherQueue::new(DispatcherConfig::default());
         let text = format!("{}b", "a".repeat(4096));
         let request = text_request(&text);
         let mut ids = ["v1".to_owned(), "v2".to_owned()].into_iter();
 
         let report = queue_text_message_parts(
-            &store,
             &queue,
             QueueTextRequest {
                 message: &request,
@@ -1859,7 +1256,6 @@ mod tests {
     #[tokio::test]
     async fn queue_sticker_message_inserts_virtual_id_and_enqueues_immediate_like_go()
     -> Result<(), Box<dyn Error>> {
-        let store = StoreStub::default();
         let queue = DispatcherQueue::new(DispatcherConfig::default());
         let request = openplotva_telegram::StickerMessageRequest {
             chat: Some(ChatRef {
@@ -1872,7 +1268,6 @@ mod tests {
         };
 
         let report = queue_sticker_message(
-            &store,
             &queue,
             QueueStickerRequest {
                 message: &request,
@@ -1888,10 +1283,6 @@ mod tests {
         assert_eq!(report.virtual_id, "sticker-v1");
         assert_eq!(report.enqueue_outcome, EnqueueOutcome::Enqueued);
         assert!(report.immediate);
-        assert_eq!(report.insert_error, None);
-        store.snapshot(|state| {
-            assert_eq!(state.inserted, vec![("sticker-v1".to_owned(), 42, Some(7))]);
-        });
         let snapshot = queue.snapshot();
         assert_eq!(snapshot.immediate.len(), 1);
         assert_eq!(snapshot.immediate[0].virtual_id, "sticker-v1");
@@ -1909,61 +1300,6 @@ mod tests {
         assert_eq!(payload["ChatID"], 42);
         assert_eq!(payload["MessageThreadID"], 7);
         assert_eq!(payload["File"], "sticker-file-id");
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn queue_sticker_message_reports_insert_errors_but_still_queues()
-    -> Result<(), Box<dyn Error>> {
-        let store = StoreStub::with_state(StoreState {
-            insert_error: Some(StubError("insert failed")),
-            ..StoreState::default()
-        });
-        let queue = DispatcherQueue::new(DispatcherConfig::default());
-        let reply = ReplyMessageRef {
-            chat: ChatRef {
-                id: -100,
-                is_forum: true,
-            },
-            message_id: 99,
-            is_topic_message: true,
-            message_thread_id: 11,
-        };
-        let request = openplotva_telegram::StickerMessageRequest {
-            chat: None,
-            message_thread_id: 0,
-            disable_notification: false,
-            file_id: "reply-sticker".to_owned(),
-        };
-
-        let report = queue_sticker_message(
-            &store,
-            &queue,
-            QueueStickerRequest {
-                message: &request,
-                reply_to: Some(&reply),
-                immediate: false,
-                bypass_chat_restrictions: false,
-                ephemeral_delete_after: None,
-            },
-            || "sticker-v2".to_owned(),
-        )
-        .await?;
-
-        assert_eq!(report.enqueue_outcome, EnqueueOutcome::Enqueued);
-        assert!(!report.immediate);
-        assert_eq!(report.insert_error, Some("insert failed".to_owned()));
-        store.snapshot(|state| {
-            assert_eq!(
-                state.inserted,
-                vec![("sticker-v2".to_owned(), -100, Some(0))]
-            );
-        });
-        let snapshot = queue.snapshot();
-        assert!(snapshot.immediate.is_empty());
-        assert_eq!(snapshot.regular.len(), 1);
-        assert_eq!(snapshot.regular[0].virtual_id, "sticker-v2");
 
         Ok(())
     }
@@ -2269,12 +1605,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_work_item_and_resolve_records_mapping_from_successful_message_response()
+    async fn send_work_item_records_mapping_from_successful_message_response()
     -> Result<(), Box<dyn Error>> {
-        let store = StoreStub::default();
         let item = queued_text_item("v1");
 
-        let report = send_work_item_and_resolve(&store, item, |_| async {
+        let report = send_work_item(item, |_| async {
             Ok::<_, StubError>(TelegramOutboundResponse::Message(Box::new(
                 telegram_message(42, 77),
             )))
@@ -2283,35 +1618,29 @@ mod tests {
 
         assert_eq!(report.status, DispatcherSendStatus::Sent);
         assert_eq!(report.virtual_id, "v1");
-        assert_eq!(report.resolved_message_id, Some(77));
-        assert_eq!(report.resolve_error, None);
-        store.snapshot(|state| {
-            assert_eq!(state.resolved, vec![("v1".to_owned(), 77)]);
-        });
+        assert_eq!(report.sent_message_id, Some(77));
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn send_work_item_and_resolve_tracks_ephemeral_after_successful_first_message()
+    async fn send_work_item_tracks_ephemeral_after_successful_first_message()
     -> Result<(), Box<dyn Error>> {
         let store = StoreStub::default();
         let now = OffsetDateTime::from_unix_timestamp(1_710_000_000)?;
         let item = queued_ephemeral_text_item("v1", Duration::from_secs(60));
 
-        let report =
-            send_work_item_and_resolve_with_ephemeral(&store, &store, item, now, |_| async {
-                Ok::<_, StubError>(TelegramOutboundResponse::Message(Box::new(
-                    telegram_message(42, 77),
-                )))
-            })
-            .await;
+        let report = send_work_item_with_ephemeral(&store, item, now, |_| async {
+            Ok::<_, StubError>(TelegramOutboundResponse::Message(Box::new(
+                telegram_message(42, 77),
+            )))
+        })
+        .await;
 
         assert_eq!(report.status, DispatcherSendStatus::Sent);
-        assert_eq!(report.resolved_message_id, Some(77));
+        assert_eq!(report.sent_message_id, Some(77));
         assert_eq!(report.ephemeral_track_error, None);
         store.snapshot(|state| {
-            assert_eq!(state.resolved, vec![("v1".to_owned(), 77)]);
             assert_eq!(
                 state.ephemeral_tracked,
                 vec![(42, 77, Duration::from_secs(60), now)]
@@ -2322,21 +1651,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_work_item_and_resolve_does_not_track_ephemeral_after_send_failure()
+    async fn send_work_item_does_not_track_ephemeral_after_send_failure()
     -> Result<(), Box<dyn Error>> {
         let store = StoreStub::default();
         let now = OffsetDateTime::from_unix_timestamp(1_710_000_000)?;
         let item = queued_ephemeral_text_item("v1", Duration::from_secs(60));
 
-        let report =
-            send_work_item_and_resolve_with_ephemeral(&store, &store, item, now, |_| async {
-                Err::<TelegramOutboundResponse, _>(StubError("telegram failed"))
-            })
-            .await;
+        let report = send_work_item_with_ephemeral(&store, item, now, |_| async {
+            Err::<TelegramOutboundResponse, _>(StubError("telegram failed"))
+        })
+        .await;
 
         assert_eq!(report.status, DispatcherSendStatus::Failed);
         store.snapshot(|state| {
-            assert!(state.resolved.is_empty());
             assert!(state.ephemeral_tracked.is_empty());
         });
 
@@ -2472,51 +1799,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_work_item_and_resolve_keeps_send_success_when_mapping_resolution_fails()
-    -> Result<(), Box<dyn Error>> {
-        let store = StoreStub::with_state(StoreState {
-            resolve_error: Some(StubError("resolve failed")),
-            ..StoreState::default()
-        });
+    async fn send_work_item_does_not_resolve_after_send_failure() {
         let item = queued_text_item("v1");
 
-        let report = send_work_item_and_resolve(&store, item, |_| async {
-            Ok::<_, StubError>(TelegramOutboundResponse::Message(Box::new(
-                telegram_message(42, 77),
-            )))
-        })
-        .await;
-
-        assert_eq!(report.status, DispatcherSendStatus::Sent);
-        assert_eq!(report.resolved_message_id, Some(77));
-        assert_eq!(report.resolve_error, Some("resolve failed".to_owned()));
-        store.snapshot(|state| {
-            assert_eq!(state.resolved, vec![("v1".to_owned(), 77)]);
-        });
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn send_work_item_and_resolve_does_not_resolve_after_send_failure() {
-        let store = StoreStub::default();
-        let item = queued_text_item("v1");
-
-        let report = send_work_item_and_resolve(&store, item, |_| async {
+        let report = send_work_item(item, |_| async {
             Err::<TelegramOutboundResponse, _>(StubError("telegram failed"))
         })
         .await;
 
         assert_eq!(report.status, DispatcherSendStatus::Failed);
         assert_eq!(report.send_error, Some("telegram failed".to_owned()));
-        assert_eq!(report.resolved_message_id, None);
-        store.snapshot(|state| {
-            assert!(state.resolved.is_empty());
-        });
+        assert_eq!(report.sent_message_id, None);
     }
 
     #[tokio::test]
-    async fn send_work_item_and_resolve_with_history_updates_direct_edit_text_after_success()
+    async fn send_work_item_with_history_updates_direct_edit_text_after_success()
     -> Result<(), Box<dyn Error>> {
         let store = StoreStub::default();
         let history = store.history();
@@ -2541,18 +1838,22 @@ mod tests {
         )?;
         let item = queue.dequeue_regular().expect("queued edit item");
 
-        let report = send_work_item_and_resolve_with_history(&store, &history, item, |_| async {
-            Ok::<_, StubError>(TelegramOutboundResponse::EditMessage(
-                EditMessageResult::Message(Box::new(telegram_message(42, 99))),
-            ))
-        })
+        let report = send_work_item_with_history_and_ephemeral(
+            &history,
+            &super::NoopEphemeralMessageTracker,
+            item,
+            OffsetDateTime::now_utc(),
+            |_| async {
+                Ok::<_, StubError>(TelegramOutboundResponse::EditMessage(
+                    EditMessageResult::Message(Box::new(telegram_message(42, 99))),
+                ))
+            },
+        )
         .await;
 
         assert_eq!(report.status, DispatcherSendStatus::Sent);
-        assert!(report.history_updated);
-        assert_eq!(report.resolved_message_id, None);
+        assert_eq!(report.sent_message_id, None);
         store.snapshot(|state| {
-            assert!(state.resolved.is_empty());
             assert_eq!(
                 state.events,
                 vec!["history:update:42:99:<b>updated</b>:HTML"]
@@ -2560,324 +1861,6 @@ mod tests {
         });
 
         Ok(())
-    }
-
-    #[tokio::test]
-    async fn edit_text_virtual_sends_now_when_mapping_is_resolved() -> Result<(), Box<dyn Error>> {
-        let store = StoreStub::with_state(StoreState {
-            mapping: Some(MessageIdMapping::resolved("v1", 42, 77)),
-            ..StoreState::default()
-        });
-        let history = store.history();
-        let mut sent = Vec::new();
-        let mut canceled = Vec::new();
-
-        let report = edit_text_virtual(
-            &store,
-            &history,
-            VirtualEditRequest {
-                chat_id: 42,
-                vmsg_id: "v1",
-                text: "<b>edited</b>",
-                parse_mode: "HTML",
-            },
-            |method| {
-                sent.push(method_payload(method));
-                async { Ok::<(), StubError>(()) }
-            },
-            |vmsg_id| {
-                canceled.push(vmsg_id.to_owned());
-                0
-            },
-        )
-        .await?;
-
-        assert_eq!(
-            report,
-            VirtualMessageReport {
-                action: VirtualMessageAction::SentNow,
-                real_message_id: Some(77),
-                history_updated: true,
-                enqueued_op_id: None,
-                lookup_error: None,
-                enqueue_error: None,
-                canceled: 0,
-                history_deleted: false,
-                mapping_deleted: false,
-                delete_mapping_error: None,
-            }
-        );
-        assert_eq!(
-            sent,
-            vec![(
-                TelegramOutboundMethodKind::EditMessageText,
-                json!({
-                    "chat_id": 42,
-                    "message_id": 77,
-                    "parse_mode": "HTML",
-                    "text": "<b>edited</b>",
-                })
-            )]
-        );
-        assert!(canceled.is_empty());
-        store.snapshot(|state| {
-            assert_eq!(state.lookup_calls, vec!["v1"]);
-            assert!(state.enqueued.is_empty());
-            assert_eq!(
-                state.events,
-                vec!["history:update:42:77:<b>edited</b>:HTML"]
-            );
-        });
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn edit_text_virtual_rejects_empty_text_like_go() {
-        let store = StoreStub::default();
-        let history = store.history();
-
-        let error = edit_text_virtual(
-            &store,
-            &history,
-            VirtualEditRequest {
-                chat_id: 42,
-                vmsg_id: "v1",
-                text: "",
-                parse_mode: "",
-            },
-            |_| async { Ok::<(), StubError>(()) },
-            |_| 0,
-        )
-        .await
-        .expect_err("empty virtual edit should fail");
-
-        assert_eq!(error, VirtualMessageError::EmptyText);
-        assert_eq!(error.to_string(), "text is empty");
-        store.snapshot(|state| {
-            assert!(state.lookup_calls.is_empty());
-            assert!(state.enqueued.is_empty());
-        });
-    }
-
-    #[tokio::test]
-    async fn edit_text_virtual_queues_and_cancels_when_mapping_is_unresolved()
-    -> Result<(), Box<dyn Error>> {
-        let store = StoreStub::with_state(StoreState {
-            mapping: Some(MessageIdMapping::unresolved("v1", 42)),
-            ..StoreState::default()
-        });
-        let history = store.history();
-        let mut sent = Vec::new();
-        let mut canceled = Vec::new();
-
-        let report = edit_text_virtual(
-            &store,
-            &history,
-            VirtualEditRequest {
-                chat_id: 42,
-                vmsg_id: "v1",
-                text: "edited",
-                parse_mode: "HTML",
-            },
-            |method| {
-                sent.push(method.kind());
-                async { Ok::<(), StubError>(()) }
-            },
-            |vmsg_id| {
-                canceled.push(vmsg_id.to_owned());
-                1
-            },
-        )
-        .await?;
-
-        assert_eq!(
-            report,
-            VirtualMessageReport {
-                action: VirtualMessageAction::Queued,
-                enqueued_op_id: Some(1),
-                canceled: 1,
-                real_message_id: None,
-                lookup_error: None,
-                enqueue_error: None,
-                history_updated: false,
-                history_deleted: false,
-                mapping_deleted: false,
-                delete_mapping_error: None,
-            }
-        );
-        assert!(sent.is_empty());
-        assert_eq!(canceled, vec!["v1"]);
-        store.snapshot(|state| {
-            assert_eq!(state.lookup_calls, vec!["v1"]);
-            assert_eq!(state.enqueued.len(), 1);
-            let (vmsg_id, chat_id, op, payload) = &state.enqueued[0];
-            assert_eq!(vmsg_id, "v1");
-            assert_eq!(*chat_id, 42);
-            assert_eq!(*op, PENDING_OP_EDIT);
-            let payload = payload.as_deref().expect("edit payload");
-            assert_eq!(
-                serde_json::from_str::<serde_json::Value>(payload).expect("payload json"),
-                json!({
-                    "parse_mode": "HTML",
-                    "text": "edited",
-                })
-            );
-            assert!(state.events.is_empty());
-        });
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn delete_message_virtual_sends_now_updates_history_and_deletes_mapping()
-    -> Result<(), Box<dyn Error>> {
-        let store = StoreStub::with_state(StoreState {
-            mapping: Some(MessageIdMapping::resolved("v2", 42, 78)),
-            ..StoreState::default()
-        });
-        let history = store.history();
-        let mut sent = Vec::new();
-
-        let report = delete_message_virtual(
-            &store,
-            &history,
-            VirtualDeleteRequest {
-                chat_id: 42,
-                vmsg_id: "v2",
-            },
-            |method| {
-                sent.push(method_payload(method));
-                async { Ok::<(), StubError>(()) }
-            },
-            |_| 0,
-        )
-        .await?;
-
-        assert_eq!(
-            report,
-            VirtualMessageReport {
-                action: VirtualMessageAction::SentNow,
-                real_message_id: Some(78),
-                history_deleted: true,
-                mapping_deleted: true,
-                enqueued_op_id: None,
-                lookup_error: None,
-                enqueue_error: None,
-                canceled: 0,
-                history_updated: false,
-                delete_mapping_error: None,
-            }
-        );
-        assert_eq!(
-            sent,
-            vec![(
-                TelegramOutboundMethodKind::DeleteMessage,
-                json!({
-                    "chat_id": 42,
-                    "message_id": 78,
-                })
-            )]
-        );
-        store.snapshot(|state| {
-            assert_eq!(state.lookup_calls, vec!["v2"]);
-            assert_eq!(state.deleted_mappings, vec!["v2"]);
-            assert_eq!(state.events, vec!["history:delete:42:78"]);
-            assert!(state.enqueued.is_empty());
-        });
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn delete_message_virtual_queues_after_mapping_lookup_failure()
-    -> Result<(), Box<dyn Error>> {
-        let store = StoreStub::with_state(StoreState {
-            lookup_error: Some(StubError("db lookup")),
-            enqueue_error: Some(StubError("enqueue failed")),
-            ..StoreState::default()
-        });
-        let history = store.history();
-        let mut sent = Vec::new();
-        let mut canceled = Vec::new();
-
-        let report = delete_message_virtual(
-            &store,
-            &history,
-            VirtualDeleteRequest {
-                chat_id: 42,
-                vmsg_id: "v2",
-            },
-            |method| {
-                sent.push(method.kind());
-                async { Ok::<(), StubError>(()) }
-            },
-            |vmsg_id| {
-                canceled.push(vmsg_id.to_owned());
-                2
-            },
-        )
-        .await?;
-
-        assert_eq!(
-            report,
-            VirtualMessageReport {
-                action: VirtualMessageAction::Queued,
-                lookup_error: Some("db lookup".to_owned()),
-                enqueue_error: Some("enqueue failed".to_owned()),
-                canceled: 2,
-                real_message_id: None,
-                enqueued_op_id: None,
-                history_updated: false,
-                history_deleted: false,
-                mapping_deleted: false,
-                delete_mapping_error: None,
-            }
-        );
-        assert!(sent.is_empty());
-        assert_eq!(canceled, vec!["v2"]);
-        store.snapshot(|state| {
-            assert_eq!(
-                state.enqueued,
-                vec![("v2".to_owned(), 42, PENDING_OP_DELETE, None)]
-            );
-            assert!(state.events.is_empty());
-            assert!(state.deleted_mappings.is_empty());
-        });
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn immediate_send_error_returns_before_history_and_mapping_delete() {
-        let store = StoreStub::with_state(StoreState {
-            mapping: Some(MessageIdMapping::resolved("v2", 42, 78)),
-            ..StoreState::default()
-        });
-        let history = store.history();
-
-        let error = delete_message_virtual(
-            &store,
-            &history,
-            VirtualDeleteRequest {
-                chat_id: 42,
-                vmsg_id: "v2",
-            },
-            |_| async { Err::<(), StubError>(StubError("telegram failed")) },
-            |_| 0,
-        )
-        .await
-        .expect_err("Telegram delete failure should propagate");
-
-        assert_eq!(
-            error,
-            VirtualMessageError::Send("telegram failed".to_owned())
-        );
-        store.snapshot(|state| {
-            assert!(state.events.is_empty());
-            assert!(state.deleted_mappings.is_empty());
-            assert!(state.enqueued.is_empty());
-        });
     }
 
     fn method_payload(

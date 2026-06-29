@@ -5,7 +5,6 @@ mod dedup;
 mod dispatcher;
 mod html;
 mod outbound;
-mod pending_ops;
 mod persistence;
 mod rate_limit;
 mod rich_api;
@@ -80,9 +79,6 @@ pub use outbound::{
     parse_mode_from_go, prepare_guest_html, subscription_invoice_payload,
     subscription_invoice_price_stars, telegram_member_can_open_group_settings,
     validate_text_message_text,
-};
-pub use pending_ops::{
-    PENDING_OP_DELETE, PENDING_OP_EDIT, PendingOpBuildError, build_pending_op_method,
 };
 pub use persistence::{
     DEFAULT_DISPATCHER_QUEUE_KEY, DEFAULT_DISPATCHER_SHUTDOWN_TIMEOUT, DispatcherPersistenceError,

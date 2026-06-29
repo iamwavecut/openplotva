@@ -31,7 +31,6 @@ pub mod message_gate;
 pub mod model_routing;
 pub mod music_jobs;
 pub mod payments;
-pub mod pending_ops;
 pub mod permissions;
 pub mod rate_limits;
 pub mod rates;
@@ -45,7 +44,6 @@ mod runtime_entities;
 mod runtime_gemini_cache;
 mod runtime_llm;
 mod runtime_llm_analytics;
-mod runtime_pending_ops;
 mod runtime_retention;
 mod runtime_routing;
 mod runtime_safety;
@@ -9353,11 +9351,6 @@ async fn start_runtime_workers(
                     service_clients.postgres.clone(),
                 ),
             )),
-            pending_ops_reader: Some(Arc::new(
-                runtime_pending_ops::PostgresRuntimePendingOpsReader::new(
-                    service_clients.postgres.clone(),
-                ),
-            )),
             safety_check_reader: Some(Arc::new(
                 runtime_safety::PostgresRuntimeSafetyCheckReader::new(
                     service_clients.postgres.clone(),
@@ -9650,7 +9643,6 @@ async fn start_runtime_workers(
         PostgresVipStore::new(service_clients.postgres.clone()),
     );
     let payment_successful_effects = payments::SuccessfulPaymentDispatcherEffects::new(
-        store.clone(),
         Arc::clone(&dispatcher_queue),
         payments::NoopVipCacheInvalidator,
     );
@@ -9709,7 +9701,7 @@ async fn start_runtime_workers(
         }
     };
     let translate_effects =
-        translate::TranslateDispatcherEffects::new(store.clone(), Arc::clone(&dispatcher_queue));
+        translate::TranslateDispatcherEffects::new(Arc::clone(&dispatcher_queue));
     let admin_cache_store = service_clients.redis.chat_admin_cache_store();
     let group_settings_effects = settings::GroupSettingsRuntimeEffects::new(
         chat_member_store.clone(),
@@ -9719,7 +9711,6 @@ async fn start_runtime_workers(
         admin_cache_store.clone(),
     );
     let join_greeting_sender = settings::TelegramJoinGreetingSender::new(
-        store.clone(),
         ephemeral_store.clone(),
         Arc::clone(&permission_policy),
         telegram.clone(),
@@ -9749,7 +9740,6 @@ async fn start_runtime_workers(
     let checkin_effects = checkin::CheckinGameRuntimeEffects::new(
         checkin_game_store.clone(),
         checkin::TelegramCheckinGameSender::new(
-            store.clone(),
             ephemeral_store.clone(),
             telegram.clone(),
             rich_api.clone(),
@@ -10073,7 +10063,6 @@ async fn start_runtime_workers(
     let rate_limits_for_updates = Arc::clone(&rate_limit_policy);
     let permission_policy_for_updates = Arc::clone(&permission_policy);
     let dispatcher_queue_for_updates = Arc::clone(&dispatcher_queue);
-    let control_store = store.clone();
     let control_dispatcher_queue = Arc::clone(&dispatcher_queue);
     let dialog_translator = Arc::new(translator.clone());
     let control_stop = stop.subscribe();
@@ -10089,7 +10078,6 @@ async fn start_runtime_workers(
         let registry = control_jobs::AppControlJobExecutors {
             payment_store: &payment_store,
             payment_effects: &payment_effects,
-            settings_store: &control_store,
             dispatcher_queue: &control_dispatcher_queue,
             group_settings_effects: &group_settings_effects,
             new_members_effects: &new_members_effects,
@@ -10475,10 +10463,8 @@ async fn start_runtime_workers(
             // RuntimeLlmObserver; the dialog provider is used directly (no tracing wrap).
             let dialog_provider: openplotva_llm::ChatProviderHandle = dialog_provider;
             dialog_provider_for_updates = Some(Arc::clone(&dialog_provider));
-            let dialog_effects = dialog_jobs::DialogDispatcherEffects::new(
-                store.clone(),
-                Arc::clone(&dispatcher_queue),
-            );
+            let dialog_effects =
+                dialog_jobs::DialogDispatcherEffects::new(Arc::clone(&dispatcher_queue));
             let mut dialog_materializer = dialog_jobs::PostgresDialogInputMaterializer::new(
                 chat_settings_store.clone(),
                 store.clone(),
@@ -10895,34 +10881,6 @@ async fn start_runtime_workers(
     ));
     workers.handles.push(shared_task_queue_heartbeat_worker);
 
-    let pending_store = store.clone();
-    let pending_history = history_store.clone();
-    let pending_telegram = telegram.clone();
-    let pending_stop = stop.subscribe();
-    let pending_worker = tokio::spawn(async move {
-        let report = pending_ops::run_pending_op_worker_with_history_until(
-            &pending_store,
-            &pending_history,
-            |method| {
-                let telegram = pending_telegram.clone();
-                async move {
-                    openplotva_telegram::execute_telegram_method(&telegram, method)
-                        .await
-                        .map(|_| ())
-                }
-            },
-            wait_for_runtime_stop(pending_stop),
-        )
-        .await;
-
-        tracing::info!(?report, "pending operation worker stopped");
-    });
-    readiness_checks.push(ReadinessCheck::ok(
-        "pending_ops",
-        "Telegram pending-operation worker started",
-    ));
-    workers.handles.push(pending_worker);
-
     let ephemeral_cleanup_store = ephemeral_store.clone();
     let ephemeral_cleanup_telegram = telegram.clone();
     let ephemeral_cleanup_stop = stop.subscribe();
@@ -10949,7 +10907,6 @@ async fn start_runtime_workers(
     ));
     workers.handles.push(ephemeral_cleanup_worker);
 
-    let immediate_store = store.clone();
     let immediate_history = history_store.clone();
     let immediate_telegram = telegram.clone();
     let immediate_rich = rich_api.clone();
@@ -10962,7 +10919,6 @@ async fn start_runtime_workers(
         let outcome = immediate_queue
             .run_immediate_worker_until(wait_for_runtime_stop(immediate_stop), |item| {
                 send_dispatcher_work_item(
-                    immediate_store.clone(),
                     immediate_history.clone(),
                     immediate_telegram.clone(),
                     immediate_rich.clone(),
@@ -11097,7 +11053,6 @@ async fn start_runtime_workers(
             .with_task_enqueue_rate_limit(task_enqueue_rate_limit.clone()),
         );
         let random_dialog_effects = Arc::new(dialog_messages::RandomDialogDispatcherEffects::new(
-            store.clone(),
             Arc::clone(&dispatcher_queue_for_updates),
         ));
         let mut direct_draw_api_config = image_jobs::aifarm_draw_api_config_from_app_config(config);
@@ -11162,7 +11117,6 @@ async fn start_runtime_workers(
         let checkin_theme = Arc::new(checkin::CheckinThemeCallbackUpdateHandler::new(
             Arc::clone(&control_queue_for_updates),
             Arc::new(checkin::CheckinThemeRuntimeEffects::new(
-                store.clone(),
                 Arc::clone(&dispatcher_queue_for_updates),
                 telegram.clone(),
             )),
@@ -11194,7 +11148,6 @@ async fn start_runtime_workers(
             ));
         let reset_handler = Arc::new(reset::ResetCommandUpdateHandler::new(
             Arc::clone(&history_store_for_updates),
-            Arc::clone(&store_for_updates),
             Arc::clone(&dispatcher_queue_for_updates),
             bot_identity.username.clone(),
             text_reply_settings_gate,
@@ -11203,7 +11156,6 @@ async fn start_runtime_workers(
             Arc::new(delete_drawing::DeleteDrawingCommandUpdateHandler::new(
                 Arc::new(service_clients.redis.last_generation_store()),
                 Arc::new(delete_drawing::DeleteDrawingCommandDispatcherEffects::new(
-                    store.clone(),
                     Arc::clone(&dispatcher_queue_for_updates),
                 )),
                 reset_handler,
@@ -11214,10 +11166,9 @@ async fn start_runtime_workers(
             },
             Arc::new(MessageGateCheckedTranslatePermission),
             Arc::clone(&control_queue_for_updates),
-            Arc::new(translate::TranslateDispatcherEffects::new(
-                store.clone(),
-                Arc::clone(&dispatcher_queue_for_updates),
-            )),
+            Arc::new(translate::TranslateDispatcherEffects::new(Arc::clone(
+                &dispatcher_queue_for_updates,
+            ))),
             delete_drawing_command,
         ));
         let rates_handler = Arc::new(rates::RatesCommandUpdateHandler::new(
@@ -11235,7 +11186,6 @@ async fn start_runtime_workers(
             checkin_game_store_for_updates,
             Arc::clone(&permission_policy),
             Arc::new(checkin::CheckinCommandDispatcherEffects::new(
-                store.clone(),
                 Arc::clone(&dispatcher_queue_for_updates),
                 Arc::clone(&rich_sender),
             )),
@@ -11248,7 +11198,6 @@ async fn start_runtime_workers(
                 checkin_command,
             ));
         let settings_handler = Arc::new(settings::SettingsUpdateHandler::new(
-            Arc::clone(&store_for_updates),
             Arc::clone(&dispatcher_queue_for_updates),
             Arc::clone(&chat_members_for_updates),
             Arc::clone(&control_queue_for_updates),
@@ -11273,7 +11222,6 @@ async fn start_runtime_workers(
         );
         let admin_chat_settings_handler =
             Arc::new(settings::AdminChatSettingsCommandUpdateHandler::new(
-                Arc::clone(&store_for_updates),
                 Arc::clone(&dispatcher_queue_for_updates),
                 Arc::new(telegram.clone()),
                 config.admins.admin_ids.clone(),
@@ -11282,10 +11230,9 @@ async fn start_runtime_workers(
                 Arc::clone(&payment_handler),
             ));
         let admin_settings_handler = Arc::new(admin::AdminSettingsCommandUpdateHandler::new(
-            Arc::new(admin::AdminDispatcherEffects::new(
-                store.clone(),
-                Arc::clone(&dispatcher_queue_for_updates),
-            )),
+            Arc::new(admin::AdminDispatcherEffects::new(Arc::clone(
+                &dispatcher_queue_for_updates,
+            ))),
             config.admins.admin_ids.clone(),
             bot_identity.username.clone(),
             config.server.url.clone(),
@@ -11294,10 +11241,9 @@ async fn start_runtime_workers(
         let admin_enable_chat_handler = Arc::new(admin::AdminEnableChatCommandUpdateHandler::new(
             Arc::new(telegram.clone()),
             Arc::clone(&chat_communication),
-            Arc::new(admin::AdminDispatcherEffects::new(
-                store.clone(),
-                Arc::clone(&dispatcher_queue_for_updates),
-            )),
+            Arc::new(admin::AdminDispatcherEffects::new(Arc::clone(
+                &dispatcher_queue_for_updates,
+            ))),
             config.admins.admin_ids.clone(),
             bot_identity.username.clone(),
             admin_settings_handler,
@@ -11308,20 +11254,18 @@ async fn start_runtime_workers(
         let admin_gemini_cache_handler =
             Arc::new(admin::AdminGeminiCacheCommandUpdateHandler::new(
                 admin_gemini_cache_purger,
-                Arc::new(admin::AdminDispatcherEffects::new(
-                    store.clone(),
-                    Arc::clone(&dispatcher_queue_for_updates),
-                )),
+                Arc::new(admin::AdminDispatcherEffects::new(Arc::clone(
+                    &dispatcher_queue_for_updates,
+                ))),
                 config.admins.admin_ids.clone(),
                 bot_identity.username.clone(),
                 admin_enable_chat_handler,
             ));
         let admin_redis_cache_handler = Arc::new(admin::AdminRedisCacheCommandUpdateHandler::new(
             Arc::new(service_clients.redis.client().clone()),
-            Arc::new(admin::AdminDispatcherEffects::new(
-                store.clone(),
-                Arc::clone(&dispatcher_queue_for_updates),
-            )),
+            Arc::new(admin::AdminDispatcherEffects::new(Arc::clone(
+                &dispatcher_queue_for_updates,
+            ))),
             config.admins.admin_ids.clone(),
             bot_identity.username.clone(),
             admin_gemini_cache_handler,
@@ -11338,20 +11282,18 @@ async fn start_runtime_workers(
         let admin_runtime_token_handler =
             Arc::new(admin::AdminRuntimeTokenCommandUpdateHandler::new(
                 admin_runtime_token_manager,
-                Arc::new(admin::AdminDispatcherEffects::new(
-                    store.clone(),
-                    Arc::clone(&dispatcher_queue_for_updates),
-                )),
+                Arc::new(admin::AdminDispatcherEffects::new(Arc::clone(
+                    &dispatcher_queue_for_updates,
+                ))),
                 config.admins.admin_ids.clone(),
                 bot_identity.username.clone(),
                 runtime_api_tls_public_key_pin,
                 admin_redis_cache_handler,
             ));
         let admin_help_handler = Arc::new(admin::AdminHelpCommandUpdateHandler::new(
-            Arc::new(admin::AdminDispatcherEffects::new(
-                store.clone(),
-                Arc::clone(&dispatcher_queue_for_updates),
-            )),
+            Arc::new(admin::AdminDispatcherEffects::new(Arc::clone(
+                &dispatcher_queue_for_updates,
+            ))),
             config.admins.admin_ids.clone(),
             bot_identity.username.clone(),
             admin_runtime_token_handler,
@@ -11369,16 +11311,14 @@ async fn start_runtime_workers(
                 .with_dispatcher(admin_dispatcher_inspector)
                 .with_updates(admin_updates_inspector)
                 .with_dialog_debounce_len(Arc::new(move || admin_dialog_debounce.len())),
-            Arc::new(admin::AdminDispatcherEffects::new(
-                store.clone(),
-                Arc::clone(&dispatcher_queue_for_updates),
-            )),
+            Arc::new(admin::AdminDispatcherEffects::new(Arc::clone(
+                &dispatcher_queue_for_updates,
+            ))),
             config.admins.admin_ids.clone(),
             bot_identity.username.clone(),
             admin_help_handler,
         ));
         let admin_vip_handler = Arc::new(payments::AdminVipCommandUpdateHandler::new(
-            Arc::clone(&store_for_updates),
             Arc::clone(&dispatcher_queue_for_updates),
             Arc::clone(&payment_store_for_updates),
             Arc::clone(&payment_runtime_effects),
@@ -11391,7 +11331,6 @@ async fn start_runtime_workers(
                 username: bot_identity.username.clone(),
             },
             Arc::new(diagnostics::DiagnosticsDispatcherEffects::new(
-                store.clone(),
                 Arc::clone(&dispatcher_queue_for_updates),
                 telegram.clone(),
                 service_clients.redis.client().clone(),
@@ -11481,7 +11420,6 @@ async fn start_runtime_workers(
         ));
     }
 
-    let regular_store = store;
     let regular_history = history_store;
     let regular_telegram = telegram;
     let regular_rich = rich_api;
@@ -11498,7 +11436,6 @@ async fn start_runtime_workers(
                 wait_for_runtime_stop(regular_stop),
                 |item| {
                     send_dispatcher_work_item(
-                        regular_store.clone(),
                         regular_history.clone(),
                         regular_telegram.clone(),
                         regular_rich.clone(),
@@ -11702,7 +11639,6 @@ async fn wait_for_runtime_stop(mut stop: watch::Receiver<bool>) {
 
 #[allow(clippy::too_many_arguments)]
 async fn send_dispatcher_work_item(
-    store: PostgresVirtualMessageStore,
     history: PostgresHistoryStore,
     telegram: openplotva_telegram::TelegramClient,
     rich: openplotva_telegram::RichApiClient,
@@ -11712,7 +11648,6 @@ async fn send_dispatcher_work_item(
     item: openplotva_telegram::DispatcherWorkItem,
 ) -> openplotva_telegram::DispatcherSendStatus {
     send_dispatcher_work_item_with_transport_and_history(
-        store,
         history,
         ephemeral,
         rate_limits,
@@ -11726,15 +11661,13 @@ async fn send_dispatcher_work_item(
 }
 
 #[cfg(test)]
-async fn send_dispatcher_work_item_with_transport<V, R, P, SendFn, SendFuture>(
-    store: V,
+async fn send_dispatcher_work_item_with_transport<R, P, SendFn, SendFuture>(
     rate_limits: Arc<rate_limits::ChatRateLimitPolicy<R>>,
     permissions: Arc<permissions::ChatPermissionPolicy<P>>,
     item: openplotva_telegram::DispatcherWorkItem,
     send: SendFn,
 ) -> openplotva_telegram::DispatcherSendStatus
 where
-    V: virtual_messages::VirtualMessageStore + Sync,
     R: rate_limits::RateLimitStore + Send + Sync,
     P: permissions::ChatPermissionStore + Send + Sync,
     SendFn: FnOnce(openplotva_telegram::TelegramOutboundMethod) -> SendFuture,
@@ -11746,8 +11679,7 @@ where
     >,
 {
     send_dispatcher_work_item_with_transport_and_history(
-        store,
-        pending_ops::NoopPendingOpHistory,
+        virtual_messages::NoopEditHistorySink,
         virtual_messages::NoopEphemeralMessageTracker,
         rate_limits,
         permissions,
@@ -11757,8 +11689,7 @@ where
     .await
 }
 
-async fn send_dispatcher_work_item_with_transport_and_history<V, H, E, R, P, SendFn, SendFuture>(
-    store: V,
+async fn send_dispatcher_work_item_with_transport_and_history<H, E, R, P, SendFn, SendFuture>(
     history: H,
     ephemeral: E,
     rate_limits: Arc<rate_limits::ChatRateLimitPolicy<R>>,
@@ -11767,8 +11698,7 @@ async fn send_dispatcher_work_item_with_transport_and_history<V, H, E, R, P, Sen
     send: SendFn,
 ) -> openplotva_telegram::DispatcherSendStatus
 where
-    V: virtual_messages::VirtualMessageStore + Sync,
-    H: pending_ops::PendingOpHistory,
+    H: virtual_messages::EditHistorySink,
     E: virtual_messages::EphemeralMessageTracker + Sync,
     R: rate_limits::RateLimitStore + Send + Sync,
     P: permissions::ChatPermissionStore + Send + Sync,
@@ -11825,8 +11755,7 @@ where
         }
     }
 
-    let report = virtual_messages::send_work_item_and_resolve_with_history_and_ephemeral(
-        &store,
+    let report = virtual_messages::send_work_item_with_history_and_ephemeral(
         &history,
         &ephemeral,
         item,
@@ -11896,18 +11825,10 @@ where
         },
     )
     .await;
-    if report.resolve_error.is_some() {
-        tracing::warn!(
-            virtual_id = report.virtual_id,
-            real_message_id = ?report.resolved_message_id,
-            resolve_error = ?report.resolve_error,
-            "failed to resolve outbound virtual message"
-        );
-    }
     if report.ephemeral_track_error.is_some() {
         tracing::warn!(
             virtual_id = report.virtual_id,
-            real_message_id = ?report.resolved_message_id,
+            real_message_id = ?report.sent_message_id,
             ephemeral_track_error = ?report.ephemeral_track_error,
             "failed to track outbound ephemeral message"
         );
@@ -12067,7 +11988,6 @@ mod tests {
         collections::{BTreeMap, VecDeque},
         error::Error,
         fmt,
-        pin::Pin,
         sync::{Arc, Mutex, MutexGuard},
         time::Duration,
     };
@@ -12078,7 +11998,7 @@ mod tests {
         http::{HeaderMap, Method, StatusCode, header},
     };
     use carapax::types::{InputFile, SendMessage, SendPhoto, Update as TelegramUpdate};
-    use openplotva_core::{ChatSettings, ChatSettingsUpdate, MessageIdMapping};
+    use openplotva_core::{ChatSettings, ChatSettingsUpdate};
     use openplotva_telegram::{
         DispatcherConfig, DispatcherMessage, DispatcherQueue, DispatcherSendStatus,
         DispatcherWorkItem, MessageFingerprint, TelegramMessage, TelegramOutboundExecuteError,
@@ -12134,7 +12054,6 @@ mod tests {
     };
     use crate::rate_limits::{ChatRateLimitPolicy, RateLimitStore, RateLimitStoreFuture};
     use crate::updates::UpdateHandler;
-    use crate::virtual_messages::VirtualMessageStore;
 
     #[test]
     fn go_dispatcher_config_matches_server_runtime_defaults() {
@@ -12315,7 +12234,6 @@ mod tests {
     #[tokio::test]
     async fn dispatcher_send_checks_permissions_before_telegram_transport()
     -> Result<(), Box<dyn Error>> {
-        let store = VirtualMessageStoreStub;
         let rate_limits = Arc::new(ChatRateLimitPolicy::new(RateLimitStoreStub));
         let permission_store = PermissionStoreStub::with_context(ChatPermissionContext {
             chat_type: Some("supergroup".to_owned()),
@@ -12329,17 +12247,12 @@ mod tests {
         let called = Arc::new(Mutex::new(false));
         let called_for_send = Arc::clone(&called);
 
-        let status = send_dispatcher_work_item_with_transport(
-            store,
-            rate_limits,
-            permissions,
-            item,
-            move |_| {
+        let status =
+            send_dispatcher_work_item_with_transport(rate_limits, permissions, item, move |_| {
                 *lock(&called_for_send) = true;
                 async { Err::<TelegramOutboundResponse, _>(permission_error()) }
-            },
-        )
-        .await;
+            })
+            .await;
 
         assert_eq!(status, DispatcherSendStatus::Failed);
         assert!(!*lock(&called));
@@ -12349,7 +12262,6 @@ mod tests {
     #[tokio::test]
     async fn dispatcher_send_respects_go_bypass_chat_restrictions_flag()
     -> Result<(), Box<dyn Error>> {
-        let store = VirtualMessageStoreStub;
         let rate_limits = Arc::new(ChatRateLimitPolicy::new(RateLimitStoreStub));
         let permission_store = PermissionStoreStub::with_context(ChatPermissionContext {
             chat_type: Some("supergroup".to_owned()),
@@ -12364,21 +12276,16 @@ mod tests {
         let called = Arc::new(Mutex::new(false));
         let called_for_send = Arc::clone(&called);
 
-        let status = send_dispatcher_work_item_with_transport(
-            store,
-            rate_limits,
-            permissions,
-            item,
-            move |_| {
+        let status =
+            send_dispatcher_work_item_with_transport(rate_limits, permissions, item, move |_| {
                 *lock(&called_for_send) = true;
                 async {
                     Ok::<_, TelegramOutboundExecuteError>(TelegramOutboundResponse::Message(
                         Box::new(telegram_message(42, 100)),
                     ))
                 }
-            },
-        )
-        .await;
+            })
+            .await;
 
         assert_eq!(status, DispatcherSendStatus::Sent);
         assert!(*lock(&called));
@@ -12389,7 +12296,6 @@ mod tests {
     #[tokio::test]
     async fn dispatcher_send_auto_disables_settings_after_permission_error()
     -> Result<(), Box<dyn Error>> {
-        let store = VirtualMessageStoreStub;
         let rate_limits = Arc::new(ChatRateLimitPolicy::new(RateLimitStoreStub));
         let permission_store = PermissionStoreStub::with_context(ChatPermissionContext {
             chat_type: Some("supergroup".to_owned()),
@@ -12401,14 +12307,11 @@ mod tests {
             InputFile::file_id("photo-id"),
         )));
 
-        let status = send_dispatcher_work_item_with_transport(
-            store,
-            rate_limits,
-            permissions,
-            item,
-            |_| async { Err::<TelegramOutboundResponse, _>(permission_error()) },
-        )
-        .await;
+        let status =
+            send_dispatcher_work_item_with_transport(rate_limits, permissions, item, |_| async {
+                Err::<TelegramOutboundResponse, _>(permission_error())
+            })
+            .await;
 
         assert_eq!(status, DispatcherSendStatus::Failed);
         assert_eq!(
@@ -12426,7 +12329,6 @@ mod tests {
     #[tokio::test]
     async fn dispatcher_send_consumes_reply_missing_send_message_like_go_dialog_response()
     -> Result<(), Box<dyn Error>> {
-        let store = VirtualMessageStoreStub;
         let rate_limits = Arc::new(ChatRateLimitPolicy::new(RateLimitStoreStub));
         let permission_store = PermissionStoreStub::with_context(ChatPermissionContext {
             chat_type: Some("supergroup".to_owned()),
@@ -12435,14 +12337,11 @@ mod tests {
         let permissions = Arc::new(ChatPermissionPolicy::new(permission_store.clone()));
         let item = queued_method_item(TelegramOutboundMethod::from(SendMessage::new(42, "hello")));
 
-        let status = send_dispatcher_work_item_with_transport(
-            store,
-            rate_limits,
-            permissions,
-            item,
-            |_| async { Err::<TelegramOutboundResponse, _>(reply_missing_error()) },
-        )
-        .await;
+        let status =
+            send_dispatcher_work_item_with_transport(rate_limits, permissions, item, |_| async {
+                Err::<TelegramOutboundResponse, _>(reply_missing_error())
+            })
+            .await;
 
         assert_eq!(status, DispatcherSendStatus::Sent);
         assert!(permission_store.saved_updates().is_empty());
@@ -14420,63 +14319,6 @@ mod tests {
                 .lock()
                 .expect("enqueued updates")
                 .push(update.clone());
-            Box::pin(async { Ok(()) })
-        }
-    }
-
-    struct VirtualMessageStoreStub;
-
-    impl VirtualMessageStore for VirtualMessageStoreStub {
-        type Error = StartupError;
-
-        fn get_mapping_by_virtual<'a>(
-            &'a self,
-            _vmsg_id: String,
-        ) -> Pin<
-            Box<
-                dyn std::future::Future<Output = Result<Option<MessageIdMapping>, Self::Error>>
-                    + Send
-                    + 'a,
-            >,
-        > {
-            Box::pin(async { Ok(None) })
-        }
-
-        fn insert_virtual_message<'a>(
-            &'a self,
-            _vmsg_id: String,
-            _chat_id: i64,
-            _thread_id: Option<i32>,
-        ) -> Pin<Box<dyn std::future::Future<Output = Result<(), Self::Error>> + Send + 'a>>
-        {
-            Box::pin(async { Ok(()) })
-        }
-
-        fn resolve_virtual_message<'a>(
-            &'a self,
-            _vmsg_id: String,
-            _real_message_id: i32,
-        ) -> Pin<Box<dyn std::future::Future<Output = Result<(), Self::Error>> + Send + 'a>>
-        {
-            Box::pin(async { Ok(()) })
-        }
-
-        fn enqueue_message_op<'a>(
-            &'a self,
-            _vmsg_id: String,
-            _chat_id: i64,
-            _op: &'static str,
-            _payload_json: Option<String>,
-        ) -> Pin<Box<dyn std::future::Future<Output = Result<i64, Self::Error>> + Send + 'a>>
-        {
-            Box::pin(async { Ok(1) })
-        }
-
-        fn delete_mapping_by_virtual<'a>(
-            &'a self,
-            _vmsg_id: String,
-        ) -> Pin<Box<dyn std::future::Future<Output = Result<(), Self::Error>> + Send + 'a>>
-        {
             Box::pin(async { Ok(()) })
         }
     }

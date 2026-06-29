@@ -22,8 +22,8 @@ use url::form_urlencoded;
 
 use crate::updates::{UpdateHandler, UpdateHandlerFuture};
 use crate::virtual_messages::{
-    QueueRichRequest, QueueTextRequest, VirtualIdFactory, VirtualMessageStore,
-    monotonic_virtual_id_factory, queue_rich_message, queue_text_message_parts,
+    QueueRichRequest, QueueTextRequest, VirtualIdFactory, monotonic_virtual_id_factory,
+    queue_rich_message, queue_text_message_parts,
 };
 
 const TRANSLATE_CONTROL_JOB_TITLE: &str = "translate";
@@ -168,18 +168,16 @@ pub trait TranslateEffects {
 pub type TranslateVirtualIdFactory = VirtualIdFactory;
 
 #[derive(Clone)]
-pub struct TranslateDispatcherEffects<Store> {
-    store: Store,
+pub struct TranslateDispatcherEffects {
     queue: Arc<DispatcherQueue>,
     next_virtual_id: TranslateVirtualIdFactory,
 }
 
-impl<Store> TranslateDispatcherEffects<Store> {
+impl TranslateDispatcherEffects {
     /// Build translation effects backed by the normal outbound dispatcher.
     #[must_use]
-    pub fn new(store: Store, queue: Arc<DispatcherQueue>) -> Self {
+    pub fn new(queue: Arc<DispatcherQueue>) -> Self {
         Self {
-            store,
             queue,
             next_virtual_id: monotonic_virtual_id_factory("translate-vmsg"),
         }
@@ -193,10 +191,7 @@ impl<Store> TranslateDispatcherEffects<Store> {
     }
 }
 
-impl<Store> TranslateEffects for TranslateDispatcherEffects<Store>
-where
-    Store: VirtualMessageStore + Send + Sync,
-{
+impl TranslateEffects for TranslateDispatcherEffects {
     type Error = TranslateDispatchEffectError;
 
     fn send_translate_notice<'a>(
@@ -227,7 +222,6 @@ where
             };
 
             queue_text_message_parts(
-                &self.store,
                 &self.queue,
                 QueueTextRequest {
                     message: &request,
@@ -249,7 +243,6 @@ where
     ) -> TranslateEffectFuture<'a, Self::Error> {
         Box::pin(async move {
             let rich = queue_rich_message(
-                &self.store,
                 &self.queue,
                 QueueRichRequest {
                     message: &plan.rich_message,
@@ -263,7 +256,6 @@ where
             .await;
             if let Err(OutboundBuildError::RichMessageTooLong(_, _)) = rich {
                 queue_text_message_parts(
-                    &self.store,
                     &self.queue,
                     QueueTextRequest {
                         message: &plan.message,
@@ -1560,17 +1552,12 @@ mod tests {
         TelegramFileMetadataStoreFuture, UpdateHandler, UpdateHandlerFuture, UpdateStateStore,
         UpdateStateStoreFuture, process_update_with_state_store_at,
     };
-    use crate::virtual_messages::VirtualMessageStore;
-    use openplotva_core::MessageIdMapping;
     use openplotva_taskman::{JobPayload, JobType, control_job_params_from_stateless_job};
     use openplotva_telegram::{DispatcherConfig, DispatcherQueue, TelegramOutboundMethodKind};
     use openplotva_updates::{UpdateConsumerConfig, UpdateStageOutcome};
     use serde_json::{Value, json};
     use std::{
-        env,
-        future::Future,
-        io,
-        pin::Pin,
+        env, io,
         sync::{Arc, Mutex, MutexGuard},
         time::{SystemTime, UNIX_EPOCH},
     };
@@ -1898,11 +1885,9 @@ mod tests {
 
         let state_store = UpdateStateStoreStub::default();
         let control_queue = Arc::new(InMemoryPaymentControlJobQueue::new());
-        let virtual_store = VirtualStoreStub::default();
         let dispatcher_queue = Arc::new(DispatcherQueue::new(DispatcherConfig::default()));
-        let effects =
-            TranslateDispatcherEffects::new(virtual_store.clone(), Arc::clone(&dispatcher_queue))
-                .with_virtual_id_factory(Arc::new(|| "translate-live-redis-vmsg-1".to_owned()));
+        let effects = TranslateDispatcherEffects::new(Arc::clone(&dispatcher_queue))
+            .with_virtual_id_factory(Arc::new(|| "translate-live-redis-vmsg-1".to_owned()));
         let effects = Arc::new(effects);
         let next = Arc::new(NextStub::default());
         let handler = TranslateCommandUpdateHandler::new(
@@ -1988,10 +1973,6 @@ mod tests {
         assert_eq!(
             control_queue.snapshot()[0].status,
             InMemoryPaymentControlJobStatus::Completed
-        );
-        assert_eq!(
-            virtual_store.inserted(),
-            vec![("translate-live-redis-vmsg-1".to_owned(), -10042, Some(0))]
         );
         let item = dispatcher_queue
             .dequeue_regular()
@@ -2203,9 +2184,8 @@ mod tests {
     #[tokio::test]
     async fn translate_dispatcher_effects_queue_result_through_regular_send_text()
     -> Result<(), Box<dyn std::error::Error>> {
-        let store = VirtualStoreStub::default();
         let queue = Arc::new(DispatcherQueue::new(DispatcherConfig::default()));
-        let effects = TranslateDispatcherEffects::new(store.clone(), Arc::clone(&queue))
+        let effects = TranslateDispatcherEffects::new(Arc::clone(&queue))
             .with_virtual_id_factory(Arc::new(|| "translate-vmsg-1".to_owned()));
         let chat = ChatRef {
             id: -10042,
@@ -2240,10 +2220,6 @@ mod tests {
             })
             .await?;
 
-        assert_eq!(
-            store.inserted(),
-            vec![("translate-vmsg-1".to_owned(), -10042, Some(9))]
-        );
         assert!(queue.dequeue_immediate().is_none());
         let item = queue.dequeue_regular().expect("queued translation result");
         assert_eq!(
@@ -2271,9 +2247,8 @@ mod tests {
     #[tokio::test]
     async fn translate_dispatcher_effects_queue_unknown_language_notice_as_ephemeral_immediate()
     -> Result<(), Box<dyn std::error::Error>> {
-        let store = VirtualStoreStub::default();
         let queue = Arc::new(DispatcherQueue::new(DispatcherConfig::default()));
-        let effects = TranslateDispatcherEffects::new(store.clone(), Arc::clone(&queue))
+        let effects = TranslateDispatcherEffects::new(Arc::clone(&queue))
             .with_virtual_id_factory(Arc::new(|| "translate-notice-vmsg-1".to_owned()));
 
         effects
@@ -2288,10 +2263,6 @@ mod tests {
             )
             .await?;
 
-        assert_eq!(
-            store.inserted(),
-            vec![("translate-notice-vmsg-1".to_owned(), -10042, Some(0))]
-        );
         let item = queue
             .dequeue_immediate()
             .expect("queued translation notice");
@@ -2869,69 +2840,6 @@ mod tests {
                 self.calls.lock().expect("next calls").push(update.id);
                 Ok(())
             })
-        }
-    }
-
-    type InsertedVirtualMessages = Arc<Mutex<Vec<(String, i64, Option<i32>)>>>;
-
-    #[derive(Clone, Default)]
-    struct VirtualStoreStub {
-        inserted: InsertedVirtualMessages,
-    }
-
-    impl VirtualStoreStub {
-        fn inserted(&self) -> Vec<(String, i64, Option<i32>)> {
-            self.inserted.lock().expect("inserted virtual ids").clone()
-        }
-    }
-
-    impl VirtualMessageStore for VirtualStoreStub {
-        type Error = io::Error;
-
-        fn get_mapping_by_virtual<'a>(
-            &'a self,
-            _vmsg_id: String,
-        ) -> Pin<Box<dyn Future<Output = Result<Option<MessageIdMapping>, Self::Error>> + Send + 'a>>
-        {
-            Box::pin(async { Ok(None) })
-        }
-
-        fn insert_virtual_message<'a>(
-            &'a self,
-            vmsg_id: String,
-            chat_id: i64,
-            thread_id: Option<i32>,
-        ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
-            self.inserted
-                .lock()
-                .expect("inserted virtual ids")
-                .push((vmsg_id, chat_id, thread_id));
-            Box::pin(async { Ok(()) })
-        }
-
-        fn resolve_virtual_message<'a>(
-            &'a self,
-            _vmsg_id: String,
-            _real_message_id: i32,
-        ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
-            Box::pin(async { Ok(()) })
-        }
-
-        fn enqueue_message_op<'a>(
-            &'a self,
-            _vmsg_id: String,
-            _chat_id: i64,
-            _op: &'static str,
-            _payload_json: Option<String>,
-        ) -> Pin<Box<dyn Future<Output = Result<i64, Self::Error>> + Send + 'a>> {
-            Box::pin(async { Ok(1) })
-        }
-
-        fn delete_mapping_by_virtual<'a>(
-            &'a self,
-            _vmsg_id: String,
-        ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
-            Box::pin(async { Ok(()) })
         }
     }
 

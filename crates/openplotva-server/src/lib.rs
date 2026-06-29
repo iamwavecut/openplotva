@@ -3,7 +3,6 @@
 mod runtime_graphql;
 
 use std::{
-    collections::{HashMap, HashSet},
     env,
     future::Future,
     net::SocketAddr,
@@ -21,10 +20,7 @@ use axum::{
     routing::{any, get},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-pub use openplotva_core::{
-    ChatSettings, ChatSettingsUpdate, MessageIdMapping, PendingEditPayload, PendingOp,
-    ReadyPendingOp, pending_edit_payload,
-};
+pub use openplotva_core::{ChatSettings, ChatSettingsUpdate};
 use rcgen::{CertifiedKey, generate_simple_self_signed};
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use serde::Serialize;
@@ -51,8 +47,7 @@ pub use runtime_graphql::{
     RuntimeLlmRequestData, RuntimeLlmRequestMessageData, RuntimeLlmRequestResultData,
     RuntimeLlmRequestUserData, RuntimeLlmRequestsFilter, RuntimeLlmTraceInspector, RuntimeLogEntry,
     RuntimeLogInspector, RuntimeLogQuery, RuntimeMemoryRestartFuture,
-    RuntimeMemoryRestartResultData, RuntimeMemoryRestarter, RuntimePendingOpData,
-    RuntimePendingOpsReader, RuntimePendingOpsReaderFuture, RuntimeRedisInspector,
+    RuntimeMemoryRestartResultData, RuntimeMemoryRestarter, RuntimeRedisInspector,
     RuntimeRedisInspectorFuture, RuntimeRedisPrefixGroup, RuntimeRedisValue,
     RuntimeRoutingEventData, RuntimeRoutingEventInspector, RuntimeRoutingEventsFilter,
     RuntimeSafetyCheckConnectionData, RuntimeSafetyCheckData, RuntimeSafetyCheckReader,
@@ -147,14 +142,6 @@ pub const ACTION_SEND_POLL: &str = "send_poll";
 pub const ACTION_SEND_MESSAGE: &str = "send_message";
 pub const ACTION_PIN_MESSAGE: &str = "pin_message";
 pub const ACTION_EDIT_MESSAGE: &str = "edit_message";
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PendingOpMappingError {
-    /// Batch lookup failed.
-    BatchLookup,
-    /// Single virtual-message lookup failed.
-    SingleLookup,
-}
 
 /// Runtime API token metadata stored in Postgres.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -726,91 +713,6 @@ fn runtime_api_pprof_text(profile: &str, note: &str) -> String {
     )
 }
 
-pub trait PendingOpMappingStore {
-    /// Batch-load virtual-message mappings.
-    fn list_mappings_by_virtual_ids(
-        &mut self,
-        vmsg_ids: &[String],
-    ) -> Result<Vec<MessageIdMapping>, PendingOpMappingError>;
-
-    /// Load one virtual-message mapping.
-    fn get_mapping_by_virtual(
-        &mut self,
-        vmsg_id: &str,
-    ) -> Result<Option<MessageIdMapping>, PendingOpMappingError>;
-}
-
-pub fn pending_op_virtual_ids(rows: &[PendingOp]) -> Vec<String> {
-    let mut seen = HashSet::new();
-    let mut ids = Vec::new();
-    for row in rows {
-        if row.vmsg_id.is_empty() || !seen.insert(row.vmsg_id.clone()) {
-            continue;
-        }
-        ids.push(row.vmsg_id.clone());
-    }
-    ids
-}
-
-pub fn index_mappings_by_virtual_id(
-    mappings: &[MessageIdMapping],
-) -> HashMap<String, MessageIdMapping> {
-    let mut index = HashMap::with_capacity(mappings.len());
-    for mapping in mappings {
-        if mapping.vmsg_id.is_empty() {
-            continue;
-        }
-        index.insert(mapping.vmsg_id.clone(), mapping.clone());
-    }
-    index
-}
-
-pub fn load_pending_op_mappings(
-    store: &mut impl PendingOpMappingStore,
-    rows: &[PendingOp],
-) -> HashMap<String, MessageIdMapping> {
-    let ids = pending_op_virtual_ids(rows);
-    if ids.is_empty() {
-        return HashMap::new();
-    }
-
-    match store.list_mappings_by_virtual_ids(&ids) {
-        Ok(mappings) => index_mappings_by_virtual_id(&mappings),
-        Err(_) => {
-            let mut index = HashMap::with_capacity(ids.len());
-            for id in ids {
-                if let Ok(Some(mapping)) = store.get_mapping_by_virtual(&id)
-                    && !mapping.vmsg_id.is_empty()
-                {
-                    index.insert(mapping.vmsg_id.clone(), mapping);
-                }
-            }
-            index
-        }
-    }
-}
-
-/// Return pending ops whose virtual message has a resolved real Telegram message ID.
-pub fn pending_ops_ready_for_execution(
-    rows: &[PendingOp],
-    mappings: &HashMap<String, MessageIdMapping>,
-) -> Vec<ReadyPendingOp> {
-    rows.iter()
-        .filter_map(|row| {
-            let mapping = mappings.get(&row.vmsg_id)?;
-            let real_message_id = mapping.real_message_id?;
-            Some(ReadyPendingOp {
-                id: row.id,
-                vmsg_id: row.vmsg_id.clone(),
-                chat_id: row.chat_id,
-                op: row.op.clone(),
-                payload: row.payload.clone(),
-                real_message_id,
-            })
-        })
-        .collect()
-}
-
 #[derive(Clone, Debug)]
 struct AppState {
     readiness: ReadinessResponse,
@@ -962,14 +864,12 @@ async fn ready(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Readines
 mod tests {
     use super::{
         ACTION_EDIT_MESSAGE, ACTION_SEND_STICKER, ACTION_SEND_TEXT, ACTION_SEND_VIDEO,
-        HealthResponse, MessageIdMapping, PendingEditPayload, PendingOp, PendingOpMappingError,
-        PendingOpMappingStore, ReadinessCheck, ReadinessResponse,
-        RuntimeAifarmCapacitySnapshotData, RuntimeApiGraphqlSnapshot, RuntimeApiLiveDiagnostics,
-        RuntimeCacheInspector, RuntimeCacheSnapshotData, RuntimeCacheStatsData,
-        RuntimeChatConnectionData, RuntimeChatData, RuntimeChatMemberData,
-        RuntimeChatMemberWithUserData, RuntimeChatsFilter, RuntimeDispatcherInspector,
-        RuntimeDispatcherStatsData, RuntimeEntityReader, RuntimeEntityReaderFuture,
-        RuntimeGeminiCachePurgeResultData, RuntimeGeminiCachePurger,
+        HealthResponse, ReadinessCheck, ReadinessResponse, RuntimeAifarmCapacitySnapshotData,
+        RuntimeApiGraphqlSnapshot, RuntimeApiLiveDiagnostics, RuntimeCacheInspector,
+        RuntimeCacheSnapshotData, RuntimeCacheStatsData, RuntimeChatConnectionData,
+        RuntimeChatData, RuntimeChatMemberData, RuntimeChatMemberWithUserData, RuntimeChatsFilter,
+        RuntimeDispatcherInspector, RuntimeDispatcherStatsData, RuntimeEntityReader,
+        RuntimeEntityReaderFuture, RuntimeGeminiCachePurgeResultData, RuntimeGeminiCachePurger,
         RuntimeGeminiCachePurgerFuture, RuntimeJobAnalyticsStatData, RuntimeLlmAnalyticsData,
         RuntimeLlmAnalyticsModelStatData, RuntimeLlmAnalyticsProviderStatData,
         RuntimeLlmAnalyticsReader, RuntimeLlmAnalyticsReaderFuture,
@@ -979,7 +879,6 @@ mod tests {
         RuntimeLlmRequestResultData, RuntimeLlmRequestUserData, RuntimeLlmRequestsFilter,
         RuntimeLlmTraceInspector, RuntimeLogEntry, RuntimeLogInspector, RuntimeLogQuery,
         RuntimeMemoryRestartFuture, RuntimeMemoryRestartResultData, RuntimeMemoryRestarter,
-        RuntimePendingOpData, RuntimePendingOpsReader, RuntimePendingOpsReaderFuture,
         RuntimeRedisInspector, RuntimeRedisInspectorFuture, RuntimeRedisPrefixGroup,
         RuntimeRedisValue, RuntimeRoutingEventData, RuntimeRoutingEventInspector,
         RuntimeRoutingEventsFilter, RuntimeSafetyCheckConnectionData, RuntimeSafetyCheckData,
@@ -993,10 +892,8 @@ mod tests {
         RuntimeUpdatesRuntimeData, RuntimeUpdatesTaskData, RuntimeUserConnectionData,
         RuntimeUserData, RuntimeUserDetailsData, RuntimeUserLookup, RuntimeUsersFilter,
         RuntimeVipCacheData, RuntimeVipEventData, RuntimeVipSummaryData, can_perform_action,
-        format_runtime_token, hash_runtime_token_secret, health_response,
-        index_mappings_by_virtual_id, load_pending_op_mappings, parse_bearer_token,
-        parse_runtime_token, pending_edit_payload, pending_op_virtual_ids,
-        pending_ops_ready_for_execution, permission_cache_key, permission_error_chat_type,
+        format_runtime_token, hash_runtime_token_secret, health_response, parse_bearer_token,
+        parse_runtime_token, permission_cache_key, permission_error_chat_type,
         permission_error_settings_update, rate_limit_key, rate_limited_chat_key,
         runtime_api_graphql_schema, runtime_api_graphql_schema_with_diagnostics,
         runtime_api_graphql_schema_with_live_diagnostics, runtime_api_graphql_schema_with_redis,
@@ -1942,86 +1839,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_api_graphql_serves_pending_ops_like_go_shape() {
-        #[derive(Default)]
-        struct PendingOpsReader;
-
-        impl RuntimePendingOpsReader for PendingOpsReader {
-            fn pending_ops<'a>(&'a self, limit: i32) -> RuntimePendingOpsReaderFuture<'a> {
-                assert_eq!(limit, 200);
-                Box::pin(async {
-                    Ok(vec![
-                        RuntimePendingOpData {
-                            id: 11,
-                            vmsg_id: "vmsg-1".to_owned(),
-                            chat_id: -100,
-                            op: "edit".to_owned(),
-                            payload: Some(serde_json::json!({
-                                "text": "edited",
-                                "parse_mode": "HTML",
-                            })),
-                            status: "pending".to_owned(),
-                            created_at: "2026-05-21T00:00:00Z".to_owned(),
-                            attempts: 2,
-                        },
-                        RuntimePendingOpData {
-                            id: 12,
-                            vmsg_id: "vmsg-2".to_owned(),
-                            chat_id: -100,
-                            op: "delete".to_owned(),
-                            payload: None,
-                            status: "pending".to_owned(),
-                            created_at: "2026-05-21T00:00:01Z".to_owned(),
-                            attempts: 0,
-                        },
-                    ])
-                })
-            }
-        }
-
-        let schema = runtime_api_graphql_schema_with_live_diagnostics(
-            RuntimeApiGraphqlSnapshot::default(),
-            RuntimeApiLiveDiagnostics {
-                pending_ops_reader: Some(Arc::new(PendingOpsReader)),
-                ..RuntimeApiLiveDiagnostics::default()
-            },
-        );
-        let response = schema
-            .execute(
-                r#"
-                query {
-                    pendingOps(limit: 999) {
-                        id
-                        vmsgID
-                        chatID
-                        op
-                        payload
-                        status
-                        createdAt
-                        attempts
-                    }
-                }
-                "#,
-            )
-            .await;
-
-        assert!(
-            response.errors.is_empty(),
-            "runtime pending-op GraphQL returned errors: {:?}",
-            response.errors
-        );
-        let payload = serde_json::to_value(&response)
-            .unwrap_or_else(|error| panic!("serialize GraphQL response: {error}"));
-        let ops = &payload["data"]["pendingOps"];
-        assert_eq!(ops[0]["id"], "11");
-        assert_eq!(ops[0]["vmsgID"], "vmsg-1");
-        assert_eq!(ops[0]["chatID"], "-100");
-        assert_eq!(ops[0]["payload"]["parse_mode"], "HTML");
-        assert_eq!(ops[0]["attempts"], 2);
-        assert!(ops[1]["payload"].is_null());
-    }
-
-    #[tokio::test]
     async fn runtime_api_graphql_serves_safety_checks_like_go_shape() {
         #[derive(Default)]
         struct SafetyReader;
@@ -2755,136 +2572,6 @@ mod tests {
         assert_eq!(
             permission_error_chat_type(Some(" supergroup ")),
             "supergroup"
-        );
-    }
-
-    #[derive(Default)]
-    struct PendingOpMappingStoreStub {
-        batch_calls: usize,
-        batch_ids: Vec<String>,
-        batch_rows: Vec<MessageIdMapping>,
-        batch_error: bool,
-        single_calls: Vec<String>,
-        single_rows: Vec<MessageIdMapping>,
-    }
-
-    impl PendingOpMappingStore for PendingOpMappingStoreStub {
-        fn list_mappings_by_virtual_ids(
-            &mut self,
-            vmsg_ids: &[String],
-        ) -> Result<Vec<MessageIdMapping>, PendingOpMappingError> {
-            self.batch_calls += 1;
-            self.batch_ids = vmsg_ids.to_vec();
-            if self.batch_error {
-                return Err(PendingOpMappingError::BatchLookup);
-            }
-            Ok(self.batch_rows.clone())
-        }
-
-        fn get_mapping_by_virtual(
-            &mut self,
-            vmsg_id: &str,
-        ) -> Result<Option<MessageIdMapping>, PendingOpMappingError> {
-            self.single_calls.push(vmsg_id.to_owned());
-            Ok(self
-                .single_rows
-                .iter()
-                .find(|mapping| mapping.vmsg_id == vmsg_id)
-                .cloned())
-        }
-    }
-
-    #[test]
-    fn pending_op_virtual_ids_batch_unique_non_empty_values_like_go() {
-        let rows = vec![
-            PendingOp::new(1, "v1", 42, "edit"),
-            PendingOp::new(2, "v2", 42, "delete"),
-            PendingOp::new(3, "v1", 42, "edit"),
-            PendingOp::new(4, "", 42, "delete"),
-        ];
-
-        assert_eq!(pending_op_virtual_ids(&rows), vec!["v1", "v2"]);
-    }
-
-    #[test]
-    fn load_pending_op_mappings_batches_unique_virtual_ids() {
-        let mut store = PendingOpMappingStoreStub {
-            batch_rows: vec![
-                MessageIdMapping::unresolved("v1", 42),
-                MessageIdMapping::unresolved("v2", 42),
-            ],
-            ..PendingOpMappingStoreStub::default()
-        };
-        let rows = vec![
-            PendingOp::new(1, "v1", 42, "edit"),
-            PendingOp::new(2, "v2", 42, "delete"),
-            PendingOp::new(3, "v1", 42, "edit"),
-            PendingOp::new(4, "", 42, "delete"),
-        ];
-
-        let index = load_pending_op_mappings(&mut store, &rows);
-
-        assert_eq!(store.batch_calls, 1);
-        assert_eq!(store.batch_ids, vec!["v1", "v2"]);
-        assert!(store.single_calls.is_empty());
-        assert!(index.contains_key("v1"));
-        assert!(index.contains_key("v2"));
-    }
-
-    #[test]
-    fn load_pending_op_mappings_falls_back_to_single_lookups() {
-        let mut store = PendingOpMappingStoreStub {
-            batch_error: true,
-            single_rows: vec![MessageIdMapping::unresolved("v1", 42)],
-            ..PendingOpMappingStoreStub::default()
-        };
-        let rows = vec![
-            PendingOp::new(1, "v1", 42, "edit"),
-            PendingOp::new(2, "v2", 42, "delete"),
-        ];
-
-        let index = load_pending_op_mappings(&mut store, &rows);
-
-        assert_eq!(store.batch_calls, 1);
-        assert_eq!(store.single_calls, vec!["v1", "v2"]);
-        assert!(index.contains_key("v1"));
-        assert!(!index.contains_key("v2"));
-    }
-
-    #[test]
-    fn pending_ops_ready_for_execution_skips_unresolved_mappings_like_go() {
-        let rows = vec![
-            PendingOp::new(1, "v1", 42, "edit"),
-            PendingOp::new(2, "v2", 42, "delete"),
-            PendingOp::new(3, "missing", 42, "delete"),
-        ];
-        let mappings = index_mappings_by_virtual_id(&[
-            MessageIdMapping::resolved("v1", 42, 77),
-            MessageIdMapping::unresolved("v2", 42),
-            MessageIdMapping::unresolved("", 42),
-        ]);
-
-        let ready = pending_ops_ready_for_execution(&rows, &mappings);
-
-        assert_eq!(ready.len(), 1);
-        assert_eq!(ready[0].id, 1);
-        assert_eq!(ready[0].real_message_id, 77);
-    }
-
-    #[test]
-    fn pending_edit_payload_decodes_text_and_parse_mode_like_go() {
-        let payload = br#"{"text":"<b>edited</b>","parse_mode":"HTML"}"#;
-
-        assert_eq!(
-            pending_edit_payload(payload),
-            PendingEditPayload {
-                text: "<b>edited</b>".to_owned(),
-                parse_mode: "HTML".to_owned(),
-            }
-        );
-        assert_eq!(
-            pending_edit_payload(b"not-json"),
-            PendingEditPayload::default()
         );
     }
 }
