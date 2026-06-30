@@ -2286,3 +2286,105 @@ body:has(.pane-details:not(.hidden)) .drawer-scrim {
     color: var(--c-text-sec);
     font-weight: var(--fw-normal);
 }
+
+/* KPI cards with sparklines + health strip */
+.kpi-card {
+    background: var(--c-bg-card);
+    border: 1px solid var(--c-border);
+    border-radius: var(--rad-lg);
+    box-shadow: var(--elev-1);
+    padding: var(--sp-5);
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-3);
+    overflow: hidden;
+}
+.kpi-head {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+}
+.kpi-icon {
+    width: 32px;
+    height: 32px;
+    border-radius: var(--rad-md);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--c-primary-bg);
+    color: var(--c-primary);
+    flex: 0 0 auto;
+}
+.kpi-label {
+    color: var(--c-text-sec);
+    font-size: var(--fs-sm);
+    font-weight: var(--fw-semibold);
+}
+.kpi-row {
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: var(--sp-3);
+}
+.kpi-value {
+    font-size: 1.9rem;
+    font-weight: var(--fw-extrabold);
+    letter-spacing: -0.02em;
+    line-height: 1;
+}
+.kpi-value--accent {
+    color: var(--c-accent);
+    font-family: var(--font-mono);
+    text-transform: uppercase;
+    font-size: 1.4rem;
+}
+.kpi-spark {
+    width: 96px;
+    height: 40px;
+    flex: 0 0 auto;
+    position: relative;
+}
+.kpi-sub {
+    color: var(--c-text-muted);
+    font-size: var(--fs-xs);
+    font-family: var(--font-mono);
+}
+.dash-health {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+    gap: var(--sp-3);
+    background: var(--c-bg-card);
+    border: 1px solid var(--c-border);
+    border-radius: var(--rad-lg);
+    box-shadow: var(--elev-1);
+    padding: var(--sp-4) var(--sp-5);
+    margin-bottom: var(--sp-6);
+}
+.health-item {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+}
+.health-dot {
+    width: 9px;
+    height: 9px;
+    border-radius: var(--rad-full);
+    flex: 0 0 auto;
+}
+.health-dot.ok {
+    background: var(--c-status-ok);
+    box-shadow: 0 0 0 4px var(--c-success-bg);
+}
+.health-dot.idle {
+    background: var(--c-text-muted);
+}
+.health-name {
+    font-weight: var(--fw-semibold);
+    font-size: var(--fs-sm);
+    flex: 1;
+}
+.health-status {
+    color: var(--c-text-muted);
+    font-size: var(--fs-xs);
+    font-family: var(--font-mono);
+}

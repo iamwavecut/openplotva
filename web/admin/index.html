@@ -4731,8 +4731,112 @@
             } else { body.textContent = obj == null ? '—' : String(obj); }
             card.appendChild(body); return card;
         }
-        if (document.readyState !== 'loading') loadDashboard();
-        else document.addEventListener('DOMContentLoaded', loadDashboard);
+        // (initial render handled by the modern dashboard script below)
+    </script>
+    <script>
+        // --- Modern dashboard: live KPI cards with sparklines + health strip ---
+        (function () {
+            const charts = {}, buffers = {};
+            let pollTimer = null;
+            function accent(varName) { const el = document.createElement('span'); el.style.color = 'var(' + varName + ')'; document.body.appendChild(el); const c = getComputedStyle(el).color; el.remove(); return c; }
+            function fmt(n) { if (typeof n !== 'number') return String(n); if (Math.abs(n) >= 1000) return (n / 1000).toFixed(n >= 10000 ? 0 : 1) + 'k'; return Number.isInteger(n) ? String(n) : n.toFixed(2); }
+            function headline(obj) {
+                if (obj == null) return { v: '—', n: null };
+                if (typeof obj !== 'object') return { v: String(obj), n: (typeof obj === 'number' ? obj : null) };
+                const prefer = ['depth', 'pending', 'queued', 'backlog', 'size', 'count', 'hit_rate', 'hit_ratio', 'hits', 'active', 'in_flight', 'plans', 'steps', 'total', 'rate', 'used'];
+                for (const k of prefer) { if (typeof obj[k] === 'number') return { v: fmt(obj[k]), n: obj[k], k: k }; }
+                for (const k in obj) { if (typeof obj[k] === 'number') return { v: fmt(obj[k]), n: obj[k], k: k }; }
+                return { v: Object.keys(obj).length + ' fields', n: null };
+            }
+            const SPEC = [
+                { id: 'queue', label: 'Message queue', icon: 'ti-stack-2', src: 'queue' },
+                { id: 'cache', label: 'Cache', icon: 'ti-database', src: 'cache' },
+                { id: 'planner', label: 'Planner', icon: 'ti-route', src: 'planner' }
+            ];
+            function kpiCard(spec) {
+                const card = document.createElement('div'); card.className = 'kpi-card';
+                const head = document.createElement('div'); head.className = 'kpi-head';
+                const ic = document.createElement('span'); ic.className = 'kpi-icon'; const ii = document.createElement('i'); ii.className = 'ti ' + spec.icon; ii.setAttribute('aria-hidden', 'true'); ic.appendChild(ii); head.appendChild(ic);
+                const lab = document.createElement('span'); lab.className = 'kpi-label'; lab.textContent = spec.label; head.appendChild(lab);
+                card.appendChild(head);
+                const row = document.createElement('div'); row.className = 'kpi-row';
+                const val = document.createElement('div'); val.className = 'kpi-value'; val.textContent = '—'; row.appendChild(val);
+                const sp = document.createElement('div'); sp.className = 'kpi-spark'; const cv = document.createElement('canvas'); sp.appendChild(cv); row.appendChild(sp);
+                card.appendChild(row);
+                const sub = document.createElement('div'); sub.className = 'kpi-sub'; sub.textContent = 'live'; card.appendChild(sub);
+                return { card: card, val: val, canvas: cv, sub: sub };
+            }
+            function build() {
+                const wrap = document.getElementById('dash-kpis'); if (!wrap) return null;
+                if (wrap._built) return wrap;
+                wrap.textContent = ''; wrap._built = true; wrap._refs = {};
+                SPEC.forEach(function (s) { const r = kpiCard(s); wrap.appendChild(r.card); wrap._refs[s.id] = r; buffers[s.id] = []; });
+                const lc = document.createElement('div'); lc.className = 'kpi-card';
+                const lh = document.createElement('div'); lh.className = 'kpi-head';
+                const lic = document.createElement('span'); lic.className = 'kpi-icon'; const lii = document.createElement('i'); lii.className = 'ti ti-adjustments-alt'; lic.appendChild(lii); lh.appendChild(lic);
+                const llab = document.createElement('span'); llab.className = 'kpi-label'; llab.textContent = 'Log level'; lh.appendChild(llab); lc.appendChild(lh);
+                const lv = document.createElement('div'); lv.className = 'kpi-value kpi-value--accent'; lv.textContent = '—'; lc.appendChild(lv);
+                wrap.appendChild(lc); wrap._refs.level = { val: lv };
+                return wrap;
+            }
+            function ensureHealth() {
+                let h = document.getElementById('dash-health'); if (h) return h;
+                h = document.createElement('div'); h.id = 'dash-health'; h.className = 'dash-health';
+                const kpis = document.getElementById('dash-kpis'); if (kpis && kpis.parentNode) kpis.parentNode.insertBefore(h, kpis);
+                return h;
+            }
+            function renderHealth(data) {
+                const h = ensureHealth(); if (!h) return; h.textContent = '';
+                [['PostgreSQL', !!(data.planner || data.queue)], ['Redis', !!data.cache], ['Queue', !!data.queue], ['Planner', !!data.planner]].forEach(function (s) {
+                    const item = document.createElement('div'); item.className = 'health-item';
+                    const dot = document.createElement('span'); dot.className = 'health-dot ' + (s[1] ? 'ok' : 'idle');
+                    const nm = document.createElement('span'); nm.className = 'health-name'; nm.textContent = s[0];
+                    const st = document.createElement('span'); st.className = 'health-status'; st.textContent = s[1] ? 'operational' : 'n/a';
+                    item.appendChild(dot); item.appendChild(nm); item.appendChild(st); h.appendChild(item);
+                });
+            }
+            function spark(canvas, color) {
+                if (typeof Chart === 'undefined') return null;
+                return new Chart(canvas, {
+                    type: 'line',
+                    data: { labels: [], datasets: [{ data: [], borderColor: color, borderWidth: 2, pointRadius: 0, fill: true, tension: 0.4, backgroundColor: function (c) { const g = c.chart.ctx.createLinearGradient(0, 0, 0, 44); g.addColorStop(0, color.replace('rgb', 'rgba').replace(')', ',0.28)')); g.addColorStop(1, color.replace('rgb', 'rgba').replace(')', ',0)')); return g; } }] },
+                    options: { responsive: true, maintainAspectRatio: false, animation: false, plugins: { legend: { display: false }, tooltip: { enabled: false } }, scales: { x: { display: false }, y: { display: false } } }
+                });
+            }
+            function update(data) {
+                const wrap = build(); if (!wrap) return;
+                const col = accent('--c-primary');
+                SPEC.forEach(function (s) {
+                    const r = wrap._refs[s.id]; const hl = headline(data[s.src]);
+                    r.val.textContent = hl.v; if (hl.k) r.sub.textContent = hl.k;
+                    const buf = buffers[s.id]; buf.push(hl.n == null ? 0 : hl.n); if (buf.length > 24) buf.shift();
+                    if (!charts[s.id]) charts[s.id] = spark(r.canvas, col);
+                    const ch = charts[s.id]; if (ch) { ch.data.labels = buf.map(function (_, i) { return i; }); ch.data.datasets[0].data = buf.slice(); ch.update('none'); }
+                });
+                if (wrap._refs.level) wrap._refs.level.val.textContent = (data.log_level || '—');
+                renderHealth(data);
+            }
+            function silentState() { return fetch('/admin/api/state').then(function (r) { return r.ok ? r.json() : null; }).catch(function () { return null; }); }
+            async function modernLoad() {
+                const wrap = document.getElementById('dash-kpis'); if (!wrap) return;
+                build(); renderHealth({});
+                const data = await apiCall('/state');
+                if (!data) return;
+                wrap.removeAttribute('aria-busy');
+                update(data);
+                clearTimeout(pollTimer);
+                (function loop() {
+                    pollTimer = setTimeout(function () {
+                        const d = document.getElementById('dashboard');
+                        if (d && d.classList.contains('active')) { silentState().then(function (s) { if (s) update(s); }); }
+                        loop();
+                    }, 5000);
+                })();
+            }
+            window.loadDashboard = modernLoad;
+            if (document.readyState !== 'loading') modernLoad();
+            else document.addEventListener('DOMContentLoaded', modernLoad);
+        })();
     </script>
 </body>
 
