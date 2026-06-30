@@ -1,5 +1,5 @@
 /*
- * Plotva Admin — Design Tokens (single source of truth)
+ * Plotva Admin — Design Tokens (single source of truth)  ·  "Nocturne" direction
  *
  * Three tiers:
  *   1. Primitives (--p-*)   raw, theme-agnostic palette. Never referenced by components directly.
@@ -7,35 +7,35 @@
  *   3. Extended   (--c-json-*, --c-log-*, --c-shield-* ...)   domain palettes for syntax/log/status surfaces.
  *
  * Theme model: :root holds the dark theme (default). [data-theme="light"] overrides semantic color only.
- * Scale tokens (space, radius, type, motion, z-index, elevation) are theme-agnostic and live once in :root.
+ * Only this file may hold raw color literals; admin.css / components.css reference var(--c-*) tokens.
  */
 
 :root {
-    /* ---- PRIMITIVES: neutrals (slate) ---- */
-    --p-slate-950: #0b1120;
-    --p-slate-900: #0f172a;
-    --p-slate-800: #1e293b;
-    --p-slate-700: #334155;
-    --p-slate-600: #475569;
-    --p-slate-500: #64748b;
-    --p-slate-400: #94a3b8;
-    --p-slate-300: #cbd5e1;
-    --p-slate-200: #e2e8f0;
-    --p-slate-100: #f1f5f9;
-    --p-slate-50: #f8fafc;
+    /* ---- PRIMITIVES: neutrals (cool blue-black ramp) ---- */
+    --p-slate-950: #06080e;
+    --p-slate-900: #0a0c12;
+    --p-slate-800: #12151e;
+    --p-slate-700: #1e2330;
+    --p-slate-600: #2b3242;
+    --p-slate-500: #616b7d;
+    --p-slate-400: #9aa4b6;
+    --p-slate-300: #cbd2de;
+    --p-slate-200: #dfe4ec;
+    --p-slate-100: #eef1f6;
+    --p-slate-50: #f6f8fb;
     --p-white: #ffffff;
 
     /* ---- PRIMITIVES: brand + state hues ---- */
-    --p-indigo-500: #6366f1;
-    --p-indigo-600: #4f46e5;
-    --p-cyan-400: #22d3ee;
-    --p-green-500: #10b981;
-    --p-amber-500: #f59e0b;
-    --p-red-500: #ef4444;
-    --p-red-400: #f87171;
+    --p-indigo-500: #7c7bff;
+    --p-indigo-600: #6a68f0;
+    --p-cyan-400: #3fd0e0;
+    --p-green-500: #34d399;
+    --p-amber-500: #fbbf24;
+    --p-red-500: #fb7185;
+    --p-red-400: #f87199;
     --p-orange-400: #fb923c;
     --p-violet-400: #a78bfa;
-    --p-sky-500: #0ea5e9;
+    --p-sky-500: #60a5fa;
     --p-pink-400: #f472b6;
     --p-teal-400: #2dd4bf;
 
@@ -54,10 +54,10 @@
     --sp-10: 2.5rem;
     --sp-12: 3rem;
 
-    /* Radius */
-    --rad-sm: 4px;
-    --rad-md: 8px;
-    --rad-lg: 12px;
+    /* Radius — slightly rounder for the Nocturne feel */
+    --rad-sm: 6px;
+    --rad-md: 10px;
+    --rad-lg: 14px;
     --rad-full: 9999px;
 
     /* Type families */
@@ -89,8 +89,8 @@
     --ls-wide: 0.08em;
 
     /* Layout */
-    --w-sidebar: 280px;
-    --h-header: 64px;
+    --w-sidebar: 252px;
+    --h-header: 60px;
 
     /* Motion */
     --dur-instant: 80ms;
@@ -98,19 +98,18 @@
     --dur-base: 250ms;
     --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
     --ease-standard: ease;
-    /* Legacy aliases kept so existing rules referencing them keep resolving */
-    --trans-fast: var(--dur-quick) var(--ease-standard);
-    --trans-norm: var(--dur-base) var(--ease-standard);
+    --trans-fast: var(--dur-quick) var(--ease-out);
+    --trans-norm: var(--dur-base) var(--ease-out);
 
-    /* Elevation */
+    /* Elevation — softer, lower, premium */
     --elev-0: none;
-    --elev-1: 0 1px 3px rgba(0, 0, 0, 0.1);
-    --elev-2: 0 4px 12px rgba(0, 0, 0, 0.12);
-    --elev-3: 0 10px 25px -5px rgba(0, 0, 0, 0.3);
-    --elev-modal: 0 24px 60px rgba(0, 0, 0, 0.45);
-    --elev-glow-brand: 0 12px 30px rgba(34, 211, 238, 0.18);
+    --elev-1: 0 1px 2px rgba(0, 0, 0, 0.4);
+    --elev-2: 0 4px 14px rgba(0, 0, 0, 0.4);
+    --elev-3: 0 12px 30px -8px rgba(0, 0, 0, 0.55);
+    --elev-modal: 0 24px 60px rgba(0, 0, 0, 0.6);
+    --elev-glow-brand: 0 10px 30px rgba(124, 123, 255, 0.22);
 
-    /* Z-index ladder (formalizes the old 5/10/100/9999 magic numbers) */
+    /* Z-index ladder */
     --z-base: 0;
     --z-resizer: 5;
     --z-sidebar: 10;
@@ -120,7 +119,7 @@
     --z-modal: 1200;
     --z-toast: 1300;
 
-    /* Focus ring width — color is semantic (themed) below */
+    /* Focus ring */
     --focus-ring-width: 2px;
     --focus-ring-offset: 2px;
 
@@ -128,19 +127,19 @@
        SEMANTIC: color — DARK theme (default)
        ============================================================ */
 
-    --c-bg-app: var(--p-slate-900);
-    --c-bg-sidebar: var(--p-slate-800);
-    --c-bg-card: var(--p-slate-800);
-    --c-bg-card-hover: var(--p-slate-700);
-    --c-bg-input: var(--p-slate-900);
-    --c-bg-elevated: var(--p-slate-700);
+    --c-bg-app: #0a0c12;
+    --c-bg-sidebar: #0e1119;
+    --c-bg-card: #12151e;
+    --c-bg-card-hover: #1a1f2b;
+    --c-bg-input: #0e1119;
+    --c-bg-elevated: #161b26;
 
-    --c-border: var(--p-slate-700);
-    --c-border-light: var(--p-slate-600);
+    --c-border: #1e2330;
+    --c-border-light: #2b3242;
 
     --c-primary: var(--p-indigo-500);
     --c-primary-hover: var(--p-indigo-600);
-    --c-primary-light: rgba(99, 102, 241, 0.15);
+    --c-primary-light: color-mix(in srgb, var(--c-primary) 16%, transparent);
     --c-accent: var(--p-cyan-400);
 
     --c-success: var(--p-green-500);
@@ -148,29 +147,29 @@
     --c-danger: var(--p-red-500);
     --c-info: var(--p-sky-500);
 
-    /* Tinted state surfaces (replace ad-hoc rgba()) */
+    /* Tinted state surfaces */
     --c-primary-bg: color-mix(in srgb, var(--c-primary) 15%, transparent);
-    --c-primary-bg-strong: color-mix(in srgb, var(--c-primary) 24%, transparent);
+    --c-primary-bg-strong: color-mix(in srgb, var(--c-primary) 26%, transparent);
     --c-success-bg: color-mix(in srgb, var(--c-success) 15%, transparent);
-    --c-success-bg-strong: color-mix(in srgb, var(--c-success) 22%, transparent);
+    --c-success-bg-strong: color-mix(in srgb, var(--c-success) 24%, transparent);
     --c-warning-bg: color-mix(in srgb, var(--c-warning) 15%, transparent);
-    --c-danger-bg: color-mix(in srgb, var(--c-danger) 12%, transparent);
-    --c-danger-bg-strong: color-mix(in srgb, var(--c-danger) 22%, transparent);
+    --c-danger-bg: color-mix(in srgb, var(--c-danger) 14%, transparent);
+    --c-danger-bg-strong: color-mix(in srgb, var(--c-danger) 24%, transparent);
     --c-info-bg: color-mix(in srgb, var(--c-info) 15%, transparent);
 
-    --c-text-main: var(--p-slate-50);
-    --c-text-sec: var(--p-slate-400);
-    --c-text-muted: var(--p-slate-500);
-    --c-text-on-primary: var(--p-white);
-    --c-text-on-accent: var(--p-slate-900);
+    --c-text-main: #e8ebf2;
+    --c-text-sec: #9aa4b6;
+    --c-text-muted: #616b7d;
+    --c-text-on-primary: #ffffff;
+    --c-text-on-accent: #062028;
 
     /* Interaction */
     --c-focus-ring: color-mix(in srgb, var(--c-primary) 70%, transparent);
-    --c-scrim: rgba(15, 23, 42, 0.6);
-    --c-row-hover-overlay: rgba(255, 255, 255, 0.03);
-    --c-row-active-overlay: rgba(255, 255, 255, 0.05);
-    --c-scrollbar-thumb: rgba(255, 255, 255, 0.1);
-    --c-scrollbar-thumb-hover: rgba(255, 255, 255, 0.2);
+    --c-scrim: rgba(4, 6, 12, 0.62);
+    --c-row-hover-overlay: rgba(255, 255, 255, 0.035);
+    --c-row-active-overlay: rgba(124, 123, 255, 0.10);
+    --c-scrollbar-thumb: rgba(255, 255, 255, 0.12);
+    --c-scrollbar-thumb-hover: rgba(255, 255, 255, 0.22);
 
     /* Disabled */
     --opacity-disabled: 0.55;
@@ -180,14 +179,14 @@
        ============================================================ */
 
     /* Brand mark gradient */
-    --grad-brand: linear-gradient(135deg, rgba(34, 211, 238, 0.92), rgba(99, 102, 241, 0.95)), var(--p-slate-900);
+    --grad-brand: linear-gradient(135deg, #7c7bff, #3fd0e0);
     --grad-login:
-        radial-gradient(circle at top right, rgba(34, 211, 238, 0.16), transparent 34rem),
-        radial-gradient(circle at bottom left, rgba(99, 102, 241, 0.18), transparent 30rem),
-        var(--p-slate-900);
+        radial-gradient(circle at top right, rgba(124, 123, 255, 0.20), transparent 34rem),
+        radial-gradient(circle at bottom left, rgba(63, 208, 224, 0.16), transparent 30rem),
+        #0a0c12;
 
-    /* Shield category text colors (surfaces are tinted from these) */
-    --c-shield-red: var(--p-red-400);
+    /* Shield category text colors */
+    --c-shield-red: var(--p-red-500);
     --c-shield-orange: var(--p-orange-400);
     --c-shield-yellow: var(--c-warning);
     --c-shield-violet: var(--p-violet-400);
@@ -195,20 +194,19 @@
     --c-shield-neutral: var(--c-text-sec);
 
     /* Log levels */
-    --c-log-debug: #8a93a3;
-    --c-log-info: #3498db;
-    --c-log-warn: #f39c12;
-    --c-log-error: #e74c3c;
+    --c-log-debug: #6b7488;
+    --c-log-info: var(--p-sky-500);
+    --c-log-warn: var(--p-amber-500);
+    --c-log-error: var(--p-red-500);
 
     /* Live status dots */
-    --c-status-ok: #2ecc71;
-    --c-status-warn: #f1c40f;
-    --c-status-err: #e74c3c;
+    --c-status-ok: var(--p-green-500);
+    --c-status-warn: var(--p-amber-500);
+    --c-status-err: var(--p-red-500);
     --c-status-idle: var(--p-slate-400);
-    /* Memory: competing conflict status */
     --c-status-competing: var(--p-orange-400);
 
-    /* Memory: card-type categories (property names match the DB enum spellings) */
+    /* Memory: card-type categories (names match DB enum spellings) */
     --c-cardtype-preference: var(--p-indigo-500);
     --c-cardtype-identity: var(--p-cyan-400);
     --c-cardtype-project: var(--p-green-500);
@@ -216,13 +214,13 @@
     --c-cardtype-relationship: var(--p-pink-400);
     --c-cardtype-recurring_topic: var(--p-amber-500);
     --c-cardtype-joke: var(--p-orange-400);
-    --c-cardtype-warning: var(--p-red-400);
+    --c-cardtype-warning: var(--p-red-500);
     --c-cardtype-technical_fact: var(--p-sky-500);
     --c-cardtype-event: var(--p-teal-400);
 
     /* Memory: link relations */
     --c-relation-supports: var(--p-green-500);
-    --c-relation-contradicts: var(--p-red-400);
+    --c-relation-contradicts: var(--p-red-500);
     --c-relation-same_topic: var(--p-sky-500);
     --c-relation-supersedes: var(--p-violet-400);
     --c-relation-mentions_same_entity: var(--p-slate-400);
@@ -246,25 +244,36 @@
    SEMANTIC: color — LIGHT theme overrides
    ============================================================ */
 [data-theme="light"] {
-    --c-bg-app: var(--p-slate-100);
-    --c-bg-sidebar: var(--p-white);
-    --c-bg-card: var(--p-white);
-    --c-bg-card-hover: var(--p-slate-50);
-    --c-bg-input: var(--p-slate-50);
-    --c-bg-elevated: var(--p-white);
+    --c-bg-app: #f5f6f9;
+    --c-bg-sidebar: #ffffff;
+    --c-bg-card: #ffffff;
+    --c-bg-card-hover: #eff1f6;
+    --c-bg-input: #f3f5f8;
+    --c-bg-elevated: #ffffff;
 
-    --c-border: var(--p-slate-200);
-    --c-border-light: var(--p-slate-300);
+    --c-border: #e4e8ef;
+    --c-border-light: #d0d8e3;
 
-    --c-text-main: var(--p-slate-900);
-    --c-text-sec: var(--p-slate-500);
-    --c-text-muted: var(--p-slate-400);
+    --c-primary: #5b59f0;
+    --c-primary-hover: #4a48e0;
+    --c-accent: #0e9bb0;
 
-    --c-scrim: rgba(15, 23, 42, 0.4);
-    --c-row-hover-overlay: rgba(15, 23, 42, 0.03);
-    --c-row-active-overlay: rgba(15, 23, 42, 0.05);
-    --c-scrollbar-thumb: rgba(15, 23, 42, 0.15);
-    --c-scrollbar-thumb-hover: rgba(15, 23, 42, 0.3);
+    --c-text-main: #10131a;
+    --c-text-sec: #586275;
+    --c-text-muted: #8a94a6;
+    --c-text-on-accent: #ffffff;
+
+    --c-scrim: rgba(16, 24, 40, 0.4);
+    --c-row-hover-overlay: rgba(16, 24, 40, 0.035);
+    --c-row-active-overlay: rgba(91, 89, 240, 0.09);
+    --c-scrollbar-thumb: rgba(16, 24, 40, 0.16);
+    --c-scrollbar-thumb-hover: rgba(16, 24, 40, 0.3);
+
+    --elev-1: 0 1px 2px rgba(16, 24, 40, 0.05), 0 1px 3px rgba(16, 24, 40, 0.08);
+    --elev-2: 0 4px 14px rgba(16, 24, 40, 0.08);
+    --elev-3: 0 12px 30px -8px rgba(16, 24, 40, 0.16);
+    --elev-modal: 0 24px 60px rgba(16, 24, 40, 0.18);
+    --elev-glow-brand: 0 10px 30px rgba(124, 123, 255, 0.18);
 
     --c-log-debug: #6b7280;
 }

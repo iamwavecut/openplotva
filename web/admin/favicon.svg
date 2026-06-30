@@ -1,16 +1,16 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Plotva Admin">
   <defs>
     <linearGradient id="bg" x1="10" y1="8" x2="54" y2="56" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#22d3ee"/>
-      <stop offset="1" stop-color="#6366f1"/>
+      <stop offset="0" stop-color="#22d3ee"></stop>
+      <stop offset="1" stop-color="#6366f1"></stop>
     </linearGradient>
     <linearGradient id="wave" x1="14" y1="45" x2="50" y2="45" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#f8fafc" stop-opacity="0.45"/>
-      <stop offset="1" stop-color="#f8fafc" stop-opacity="0.95"/>
+      <stop offset="0" stop-color="#f8fafc" stop-opacity="0.45"></stop>
+      <stop offset="1" stop-color="#f8fafc" stop-opacity="0.95"></stop>
     </linearGradient>
   </defs>
-  <rect width="64" height="64" rx="16" fill="#0f172a"/>
-  <rect x="6" y="6" width="52" height="52" rx="13" fill="url(#bg)"/>
-  <path d="M22 45c5.8-5 14.2 5 20 0 2-1.7 3.8-2.5 5.7-2.6" fill="none" stroke="url(#wave)" stroke-width="4" stroke-linecap="round"/>
-  <path d="M22 19h13.5c7.2 0 11.5 4 11.5 10.1 0 6.4-4.5 10.5-11.7 10.5H29v8.2h-7V19Zm7 6.1v8.5h5.7c3.2 0 5.2-1.6 5.2-4.3 0-2.6-1.9-4.2-5.2-4.2H29Z" fill="#f8fafc"/>
+  <rect width="64" height="64" rx="16" fill="#0f172a"></rect>
+  <rect x="6" y="6" width="52" height="52" rx="13" fill="url(#bg)"></rect>
+  <path d="M22 45c5.8-5 14.2 5 20 0 2-1.7 3.8-2.5 5.7-2.6" fill="none" stroke="url(#wave)" stroke-width="4" stroke-linecap="round"></path>
+  <path d="M22 19h13.5c7.2 0 11.5 4 11.5 10.1 0 6.4-4.5 10.5-11.7 10.5H29v8.2h-7V19Zm7 6.1v8.5h5.7c3.2 0 5.2-1.6 5.2-4.3 0-2.6-1.9-4.2-5.2-4.2H29Z" fill="#f8fafc"></path>
 </svg>

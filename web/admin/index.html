@@ -5,7 +5,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="application-name" content="Plotva Admin">
-    <meta name="theme-color" content="#0f172a">
+    <meta name="theme-color" content="#0a0c12">
     <title>Plotva Admin</title>
     <link rel="icon" href="favicon.svg" type="image/svg+xml">
     <link rel="manifest" href="site.webmanifest">
@@ -14,6 +14,7 @@
     <link
         href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
         rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@3.31.0/dist/tabler-icons.min.css">
     <link rel="stylesheet" href="tokens.css">
     <link rel="stylesheet" href="admin.css">
     <link rel="stylesheet" href="components.css">
@@ -33,34 +34,39 @@
             </div>
 
             <nav class="nav-menu" aria-label="Admin sections">
-                <pl-button variant="nav" class="active" aria-current="page" data-tab="settings"
-                    data-action="switchTab" data-args='["settings"]'>Settings</pl-button>
-                <pl-button variant="nav" data-tab="metrics" data-action="switchTab"
-                    data-args='["metrics"]'>Metrics</pl-button>
-                <pl-button variant="nav" data-tab="taskman" data-action="switchTab"
-                    data-args='["taskman"]'>Tasks</pl-button>
-                <pl-button variant="nav" data-tab="redis" data-action="switchTab"
-                    data-args='["redis"]'>Redis</pl-button>
-                <pl-button variant="nav" data-tab="chats" data-action="switchTab"
-                    data-args='["chats"]'>Chats</pl-button>
-                <pl-button variant="nav" data-tab="users" data-action="switchTab"
-                    data-args='["users"]'>Users</pl-button>
-                <pl-button variant="nav" data-tab="vip" data-action="switchTab"
-                    data-args='["vip"]'>VIP</pl-button>
-                <pl-button variant="nav" data-tab="memory" data-action="switchTab"
-                    data-args='["memory"]'>Memory</pl-button>
-                <pl-button variant="nav" data-tab="shield" data-action="switchTab"
-                    data-args='["shield"]'>Shield</pl-button>
-                <pl-button variant="nav" data-tab="llm" data-action="switchTab"
-                    data-args='["llm"]'>LLM Context</pl-button>
-                <pl-button variant="nav" data-tab="providers" data-action="switchTab"
-                    data-args='["providers"]'>Model Providers</pl-button>
-                <pl-button variant="nav" data-tab="safety" data-action="switchTab"
-                    data-args='["safety"]'>Safety Checks</pl-button>
-                <pl-button variant="nav" data-tab="analytics" data-action="switchTab"
-                    data-args='["analytics"]'>Analytics</pl-button>
-                <pl-button variant="nav" data-tab="logs" data-action="switchTab"
-                    data-args='["logs"]'>Logs</pl-button>
+                <div class="nav-group">
+                    <div class="nav-group-label">Overview</div>
+                    <pl-button variant="nav" class="active" aria-current="page" data-tab="dashboard" data-action="switchTab" data-args='["dashboard"]'><i class="ti ti-layout-dashboard" aria-hidden="true"></i><span>Dashboard</span></pl-button>
+                </div>
+                <div class="nav-group">
+                    <div class="nav-group-label">Operations</div>
+                    <pl-button variant="nav" data-tab="metrics" data-action="switchTab" data-args='["metrics"]'><i class="ti ti-activity-heartbeat" aria-hidden="true"></i><span>Metrics</span></pl-button>
+                    <pl-button variant="nav" data-tab="taskman" data-action="switchTab" data-args='["taskman"]'><i class="ti ti-list-check" aria-hidden="true"></i><span>Tasks</span></pl-button>
+                    <pl-button variant="nav" data-tab="redis" data-action="switchTab" data-args='["redis"]'><i class="ti ti-database" aria-hidden="true"></i><span>Redis</span></pl-button>
+                    <pl-button variant="nav" data-tab="logs" data-action="switchTab" data-args='["logs"]'><i class="ti ti-terminal-2" aria-hidden="true"></i><span>Logs</span></pl-button>
+                </div>
+                <div class="nav-group">
+                    <div class="nav-group-label">Community</div>
+                    <pl-button variant="nav" data-tab="chats" data-action="switchTab" data-args='["chats"]'><i class="ti ti-messages" aria-hidden="true"></i><span>Chats</span></pl-button>
+                    <pl-button variant="nav" data-tab="users" data-action="switchTab" data-args='["users"]'><i class="ti ti-users" aria-hidden="true"></i><span>Users</span></pl-button>
+                    <pl-button variant="nav" data-tab="vip" data-action="switchTab" data-args='["vip"]'><i class="ti ti-crown" aria-hidden="true"></i><span>VIP</span></pl-button>
+                    <pl-button variant="nav" data-tab="memory" data-action="switchTab" data-args='["memory"]'><i class="ti ti-brain" aria-hidden="true"></i><span>Memory</span></pl-button>
+                </div>
+                <div class="nav-group">
+                    <div class="nav-group-label">Intelligence</div>
+                    <pl-button variant="nav" data-tab="providers" data-action="switchTab" data-args='["providers"]'><i class="ti ti-route" aria-hidden="true"></i><span>Model Providers</span></pl-button>
+                    <pl-button variant="nav" data-tab="llm" data-action="switchTab" data-args='["llm"]'><i class="ti ti-message-code" aria-hidden="true"></i><span>LLM Context</span></pl-button>
+                    <pl-button variant="nav" data-tab="analytics" data-action="switchTab" data-args='["analytics"]'><i class="ti ti-chart-dots-3" aria-hidden="true"></i><span>Analytics</span></pl-button>
+                </div>
+                <div class="nav-group">
+                    <div class="nav-group-label">Trust &amp; Safety</div>
+                    <pl-button variant="nav" data-tab="shield" data-action="switchTab" data-args='["shield"]'><i class="ti ti-shield-half-filled" aria-hidden="true"></i><span>Shield</span></pl-button>
+                    <pl-button variant="nav" data-tab="safety" data-action="switchTab" data-args='["safety"]'><i class="ti ti-alert-triangle" aria-hidden="true"></i><span>Safety Checks</span></pl-button>
+                </div>
+                <div class="nav-group">
+                    <div class="nav-group-label">System</div>
+                    <pl-button variant="nav" data-tab="settings" data-action="switchTab" data-args='["settings"]'><i class="ti ti-settings" aria-hidden="true"></i><span>Settings</span></pl-button>
+                </div>
             </nav>
 
             <div class="sidebar-footer">
@@ -81,15 +87,44 @@
             <header class="header">
                 <pl-button class="mobile-menu-toggle" variant="outline" size="sm" data-action="toggleSidebar"
                     aria-label="Toggle navigation">Menu</pl-button>
-                <div id="page-title" class="page-title">Settings</div>
-                <div class="user-info text-muted">Administrator</div>
+                <div id="page-title" class="page-title">Dashboard</div>
+                <div class="header-right">
+                    <button type="button" class="cmd-trigger" data-action="openPalette" aria-label="Search and commands">
+                        <i class="ti ti-search" aria-hidden="true"></i><span class="cmd-trigger-text">Search</span><span class="cmd-kbd">⌘K</span>
+                    </button>
+                    <div class="user-info text-muted">Administrator</div>
+                </div>
             </header>
 
             <div class="content-scroll">
                 <div class="container-fluid">
 
+                    <!-- Dashboard Tab -->
+                    <div id="dashboard" class="tab-pane active">
+                        <div class="dash-hero">
+                            <div class="dash-hero-text">
+                                <div class="dash-hero-eyebrow">Runtime overview</div>
+                                <div class="dash-hero-title">Plotva control center</div>
+                                <div class="dash-hero-sub">Live runtime health and quick access across every section.</div>
+                            </div>
+                            <pl-button variant="outline" size="sm" data-action="loadDashboard"><i class="ti ti-refresh" aria-hidden="true"></i><span>Refresh</span></pl-button>
+                        </div>
+                        <div id="dash-kpis" class="dash-kpis"></div>
+                        <div class="dash-section-label">Jump to</div>
+                        <div class="dash-nav-grid">
+                            <pl-button class="dash-nav-card" data-action="switchTab" data-args='["chats"]'><i class="ti ti-messages" aria-hidden="true"></i><span class="dash-nav-title">Chats</span><span class="dash-nav-desc">Persona, behavior &amp; members</span></pl-button>
+                            <pl-button class="dash-nav-card" data-action="switchTab" data-args='["users"]'><i class="ti ti-users" aria-hidden="true"></i><span class="dash-nav-title">Users</span><span class="dash-nav-desc">Lookup &amp; access</span></pl-button>
+                            <pl-button class="dash-nav-card" data-action="switchTab" data-args='["vip"]'><i class="ti ti-crown" aria-hidden="true"></i><span class="dash-nav-title">VIP</span><span class="dash-nav-desc">Grants &amp; ledger</span></pl-button>
+                            <pl-button class="dash-nav-card" data-action="switchTab" data-args='["memory"]'><i class="ti ti-brain" aria-hidden="true"></i><span class="dash-nav-title">Memory</span><span class="dash-nav-desc">Cards &amp; pipeline</span></pl-button>
+                            <pl-button class="dash-nav-card" data-action="switchTab" data-args='["providers"]'><i class="ti ti-route" aria-hidden="true"></i><span class="dash-nav-title">Model Providers</span><span class="dash-nav-desc">Routing &amp; weights</span></pl-button>
+                            <pl-button class="dash-nav-card" data-action="switchTab" data-args='["logs"]'><i class="ti ti-terminal-2" aria-hidden="true"></i><span class="dash-nav-title">Logs</span><span class="dash-nav-desc">Live stream</span></pl-button>
+                            <pl-button class="dash-nav-card" data-action="switchTab" data-args='["shield"]'><i class="ti ti-shield-half-filled" aria-hidden="true"></i><span class="dash-nav-title">Shield</span><span class="dash-nav-desc">Moderation KB</span></pl-button>
+                            <pl-button class="dash-nav-card" data-action="switchTab" data-args='["metrics"]'><i class="ti ti-activity-heartbeat" aria-hidden="true"></i><span class="dash-nav-title">Metrics</span><span class="dash-nav-desc">Queue, cache, planner</span></pl-button>
+                        </div>
+                    </div>
+
                     <!-- Settings Tab -->
-                    <div id="settings" class="tab-pane active">
+                    <div id="settings" class="tab-pane">
                         <div class="card">
                             <div class="card-header">General Settings</div>
                             <div class="card-body">
@@ -1155,6 +1190,7 @@
 
             // Update Title
             const titles = {
+                'dashboard': 'Dashboard',
                 'settings': 'Settings',
                 'metrics': 'Metrics',
                 'taskman': 'Tasks',
@@ -1176,6 +1212,9 @@
             // Close mobile sidebar if open
             document.getElementById('sidebar').classList.remove('open');
 
+            if (tabId === 'dashboard' && typeof loadDashboard === 'function') {
+                loadDashboard();
+            }
             if (tabId === 'llm') {
                 loadLLMRequests(false);
             }
@@ -4515,6 +4554,185 @@
             initResizer('resizer-llm', 'pane-llm');
             initResizer('resizer-safety', 'pane-safety');
         });
+    </script>
+
+    <script>
+        // --- Command palette (⌘K) — built from the live nav + key actions ---
+        (function () {
+            let overlay, input, list, cmds = [], filtered = [], idx = 0, isOpen = false;
+            function ensure() {
+                if (overlay) return;
+                overlay = document.createElement('div');
+                overlay.className = 'cmd-overlay';
+                overlay.hidden = true;
+                overlay.innerHTML = '<div class="cmd-panel" role="dialog" aria-modal="true" aria-label="Command palette">'
+                    + '<div class="cmd-head"><i class="ti ti-search" aria-hidden="true"></i>'
+                    + '<input class="cmd-input" type="text" placeholder="Search pages and actions…" aria-label="Command palette">'
+                    + '<span class="cmd-kbd">ESC</span></div>'
+                    + '<div class="cmd-list" role="listbox"></div></div>';
+                document.body.appendChild(overlay);
+                input = overlay.querySelector('.cmd-input');
+                list = overlay.querySelector('.cmd-list');
+                overlay.addEventListener('click', function (e) { if (e.target === overlay) close(); });
+                input.addEventListener('input', function () { idx = 0; render(); });
+            }
+            function build() {
+                const out = [];
+                document.querySelectorAll('.nav-menu pl-button[data-tab]').forEach(function (btn) {
+                    const span = btn.querySelector('span'); const ic = btn.querySelector('.ti');
+                    const grp = btn.closest('.nav-group') ? btn.closest('.nav-group').querySelector('.nav-group-label') : null;
+                    out.push({
+                        label: 'Go to ' + (span ? span.textContent.trim() : btn.dataset.tab),
+                        icon: ic ? ic.className.replace(/\bti\b/, '').trim() : 'ti-arrow-right',
+                        group: grp ? grp.textContent.trim() : 'Navigate',
+                        run: function () { switchTab(btn.dataset.tab); }
+                    });
+                });
+                out.push({ label: 'Toggle dark / light theme', icon: 'ti-contrast-2', group: 'Appearance', run: function () { toggleTheme(); } });
+                if (typeof refreshState === 'function') out.push({ label: 'Refresh metrics', icon: 'ti-refresh', group: 'Action', run: function () { switchTab('metrics'); refreshState(); } });
+                if (typeof reloadRouting === 'function') out.push({ label: 'Reload model router', icon: 'ti-route', group: 'Action', run: function () { switchTab('providers'); reloadRouting(); } });
+                return out;
+            }
+            function subseq(q, s) { s = s.toLowerCase(); let i = 0; for (const c of q) { i = s.indexOf(c, i); if (i < 0) return false; i++; } return true; }
+            function render() {
+                const q = input.value.trim().toLowerCase();
+                filtered = q ? cmds.filter(function (c) { return subseq(q, c.label) || subseq(q, c.group); }) : cmds;
+                if (idx >= filtered.length) idx = Math.max(0, filtered.length - 1);
+                list.innerHTML = '';
+                if (!filtered.length) { const e = document.createElement('div'); e.className = 'cmd-empty'; e.textContent = 'No matches.'; list.appendChild(e); return; }
+                filtered.forEach(function (c, i) {
+                    const b = document.createElement('button');
+                    b.type = 'button'; b.className = 'cmd-item' + (i === idx ? ' active' : ''); b.setAttribute('role', 'option');
+                    const ic = document.createElement('i'); ic.className = 'ti ' + c.icon; ic.setAttribute('aria-hidden', 'true');
+                    const lab = document.createElement('span'); lab.className = 'cmd-item-label'; lab.textContent = c.label;
+                    const grp = document.createElement('span'); grp.className = 'cmd-item-group'; grp.textContent = c.group;
+                    b.appendChild(ic); b.appendChild(lab); b.appendChild(grp);
+                    b.addEventListener('mouseenter', function () { idx = i; mark(); });
+                    b.addEventListener('click', function () { exec(c); });
+                    list.appendChild(b);
+                });
+            }
+            function mark() { const items = list.querySelectorAll('.cmd-item'); items.forEach(function (el, i) { el.classList.toggle('active', i === idx); }); scrollActive(); }
+            function scrollActive() { const el = list.querySelectorAll('.cmd-item')[idx]; if (!el) return; const lr = list.getBoundingClientRect(), er = el.getBoundingClientRect(); if (er.bottom > lr.bottom) list.scrollTop += er.bottom - lr.bottom; else if (er.top < lr.top) list.scrollTop -= lr.top - er.top; }
+            function exec(c) { close(); try { c.run(); } catch (e) { console.error(e); } }
+            window.openPalette = function () { ensure(); cmds = build(); idx = 0; overlay.hidden = false; isOpen = true; input.value = ''; render(); setTimeout(function () { input.focus(); }, 0); };
+            function close() { if (overlay) { overlay.hidden = true; } isOpen = false; }
+            document.addEventListener('keydown', function (e) {
+                const k = (e.key || '').toLowerCase();
+                if ((e.metaKey || e.ctrlKey) && k === 'k') { e.preventDefault(); isOpen ? close() : window.openPalette(); return; }
+                if (!isOpen) return;
+                if (e.key === 'Escape') { e.preventDefault(); close(); }
+                else if (e.key === 'ArrowDown') { e.preventDefault(); idx = Math.min(filtered.length - 1, idx + 1); mark(); }
+                else if (e.key === 'ArrowUp') { e.preventDefault(); idx = Math.max(0, idx - 1); mark(); }
+                else if (e.key === 'Enter') { e.preventDefault(); if (filtered[idx]) exec(filtered[idx]); }
+            });
+        })();
+    </script>
+    <script>
+        // --- Unified resizable right drawer (replaces split-pane details) ---
+        (function () {
+            const KEY = 'pl_drawer_w';
+            function clampW(w) { return Math.max(360, Math.min(Math.min(760, window.innerWidth - 60), w)); }
+            function setW(w) {
+                w = clampW(w);
+                document.documentElement.style.setProperty('--drawer-w', w + 'px');
+                try { localStorage.setItem(KEY, String(Math.round(w))); } catch (e) { }
+            }
+            let init = 520;
+            try { const s = parseInt(localStorage.getItem(KEY) || '', 10); if (s) init = s; } catch (e) { }
+            setW(init);
+
+            function closeDrawer() {
+                document.querySelectorAll('.pane-details').forEach(function (p) { p.classList.add('hidden'); });
+                document.querySelectorAll('.resizer').forEach(function (r) { r.classList.add('hidden'); });
+            }
+            window.closeDrawer = closeDrawer;
+            // The original markup wires these Close buttons but never defined them.
+            ['toggleChatDetails', 'toggleUserDetails', 'toggleLLMDetails', 'toggleTaskmanDetails', 'toggleSafetyDetails'].forEach(function (n) {
+                if (typeof window[n] !== 'function') window[n] = closeDrawer;
+            });
+
+            // Resize: dragging the fixed edge handle changes --drawer-w.
+            window.initResizer = function (resizerId) {
+                const r = document.getElementById(resizerId);
+                if (!r || r._wiredDrawer) return;
+                r._wiredDrawer = true;
+                r.addEventListener('pointerdown', function (e) {
+                    e.preventDefault();
+                    r.classList.add('active');
+                    document.body.classList.add('dragging');
+                    try { r.setPointerCapture(e.pointerId); } catch (_) { }
+                    function move(ev) { setW(window.innerWidth - ev.clientX); }
+                    function up() {
+                        r.classList.remove('active');
+                        document.body.classList.remove('dragging');
+                        r.removeEventListener('pointermove', move);
+                        r.removeEventListener('pointerup', up);
+                    }
+                    r.addEventListener('pointermove', move);
+                    r.addEventListener('pointerup', up);
+                });
+            };
+
+            function ensureScrim() {
+                if (document.querySelector('.drawer-scrim')) return;
+                const s = document.createElement('div');
+                s.className = 'drawer-scrim';
+                s.addEventListener('click', closeDrawer);
+                document.body.appendChild(s);
+            }
+            if (document.readyState !== 'loading') ensureScrim();
+            else document.addEventListener('DOMContentLoaded', ensureScrim);
+
+            document.addEventListener('keydown', function (e) {
+                if (e.key === 'Escape' && document.querySelector('.pane-details:not(.hidden)')) closeDrawer();
+            });
+        })();
+    </script>
+    <script>
+        // --- Dashboard landing: live /state summary + quick-nav ---
+        async function loadDashboard() {
+            const wrap = document.getElementById('dash-kpis');
+            if (!wrap) return;
+            if (window.PL && PL.skeleton) PL.skeleton(wrap, { rows: 1 });
+            const data = await apiCall('/state');
+            if (!data) { if (window.PL && PL.error) PL.error(wrap, { message: 'Could not load runtime state.', onRetry: loadDashboard }); return; }
+            wrap.removeAttribute('aria-busy');
+            wrap.textContent = '';
+            const level = document.createElement('div');
+            level.className = 'dash-stat';
+            const lh = document.createElement('div'); lh.className = 'dash-stat-title';
+            const li = document.createElement('i'); li.className = 'ti ti-adjustments-alt'; li.setAttribute('aria-hidden', 'true'); lh.appendChild(li);
+            const lt = document.createElement('span'); lt.textContent = 'Log level'; lh.appendChild(lt);
+            level.appendChild(lh);
+            const lv = document.createElement('div'); lv.className = 'dash-level-val'; lv.textContent = (data.log_level || '—');
+            level.appendChild(lv);
+            wrap.appendChild(level);
+            [['Message queue', data.queue, 'ti-stack-2'], ['Cache', data.cache, 'ti-database'], ['Planner', data.planner, 'ti-route']].forEach(function (t) {
+                wrap.appendChild(dashMiniStat(t[0], t[1], t[2]));
+            });
+        }
+        function dashMiniStat(title, obj, icon) {
+            const card = document.createElement('div'); card.className = 'dash-stat';
+            const head = document.createElement('div'); head.className = 'dash-stat-title';
+            const ic = document.createElement('i'); ic.className = 'ti ' + icon; ic.setAttribute('aria-hidden', 'true'); head.appendChild(ic);
+            const tt = document.createElement('span'); tt.textContent = title; head.appendChild(tt);
+            card.appendChild(head);
+            const body = document.createElement('div'); body.className = 'dash-stat-body';
+            if (obj && typeof obj === 'object') {
+                const entries = Object.entries(obj).slice(0, 4);
+                if (!entries.length) body.textContent = 'no data';
+                entries.forEach(function (e) {
+                    const row = document.createElement('div'); row.className = 'dash-stat-row';
+                    const k = document.createElement('span'); k.className = 'dash-stat-k'; k.textContent = e[0];
+                    const v = document.createElement('span'); v.className = 'dash-stat-v'; v.textContent = (typeof e[1] === 'object' ? JSON.stringify(e[1]) : String(e[1]));
+                    row.appendChild(k); row.appendChild(v); body.appendChild(row);
+                });
+            } else { body.textContent = obj == null ? '—' : String(obj); }
+            card.appendChild(body); return card;
+        }
+        if (document.readyState !== 'loading') loadDashboard();
+        else document.addEventListener('DOMContentLoaded', loadDashboard);
     </script>
 </body>
 
