@@ -50,6 +50,7 @@ mod runtime_safety;
 mod runtime_sql;
 mod runtime_taskman;
 mod runtime_updates;
+mod runtime_virtual_dialog;
 pub mod serper;
 pub mod settings;
 pub mod skipped;
@@ -88,8 +89,8 @@ use openplotva_config::AppConfig;
 use openplotva_server::{ReadinessCheck, ReadinessResponse};
 use openplotva_storage::{
     PostgresChatMemberStore, PostgresChatSettingsStore, PostgresHistoryStore, PostgresMemoryStore,
-    PostgresPaymentStore, PostgresRuntimeTokenStore, PostgresShieldStore,
-    PostgresTelegramFileStore, PostgresVipStore, PostgresVirtualMessageStore,
+    PostgresPaymentStore, PostgresRuntimeTokenStore, PostgresRuntimeVirtualDialogStore,
+    PostgresShieldStore, PostgresTelegramFileStore, PostgresVipStore, PostgresVirtualMessageStore,
     RedisBlockedChatStore, RedisEphemeralMessageStore, RedisRateLimitStore, ServiceClients,
 };
 use serde::{Deserialize, Serialize};
@@ -569,22 +570,22 @@ fn static_web_routes_from_config(
         }
         let memory_store = PostgresMemoryStore::new(clients.postgres.clone());
         routes.memory_store = Some(memory_store.clone());
-        if config.memory.enabled {
-            if let (Some(router_handle), Some(router_breakers), Some(router_triggers)) = (
+        if config.memory.enabled
+            && let (Some(router_handle), Some(router_breakers), Some(router_triggers)) = (
                 routes.router_handle.clone(),
                 routes.router_breakers.clone(),
                 routes.router_triggers.clone(),
-            ) {
-                routes.memory_override_runtime = Some(AdminMemoryOverrideRuntime {
-                    config: Arc::new(config.clone()),
-                    store: memory_store,
-                    lock: Arc::new(tokio::sync::Mutex::new(())),
-                    router_handle,
-                    router_breakers,
-                    router_triggers,
-                    routing_event_reporter: routes.routing_event_reporter.clone(),
-                });
-            }
+            )
+        {
+            routes.memory_override_runtime = Some(AdminMemoryOverrideRuntime {
+                config: Arc::new(config.clone()),
+                store: memory_store,
+                lock: Arc::new(tokio::sync::Mutex::new(())),
+                router_handle,
+                router_breakers,
+                router_triggers,
+                routing_event_reporter: routes.routing_event_reporter.clone(),
+            });
         }
         if config.shield.enabled {
             routes.shield_store = Some(PostgresShieldStore::new(clients.postgres.clone()));
@@ -3733,14 +3734,13 @@ async fn admin_memory_card_update_response(
     };
     let confidence = req.confidence.map(|v| v.clamp(0.0, 1.0));
     let salience = req.salience.map(|v| v.clamp(0.0, 1.0));
-    if confidence.is_some() || salience.is_some() || req.portable.is_some() {
-        if let Err(error) = store
+    if (confidence.is_some() || salience.is_some() || req.portable.is_some())
+        && let Err(error) = store
             .update_card_fields(req.id, confidence, salience, req.portable)
             .await
-        {
-            tracing::warn!(%error, id = req.id, "failed to update memory card fields");
-            return admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed");
-        }
+    {
+        tracing::warn!(%error, id = req.id, "failed to update memory card fields");
+        return admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed");
     }
     if let Some(status) = req.status.as_deref() {
         let result = match status {
@@ -9046,6 +9046,8 @@ async fn start_runtime_workers(
 
     let (stop, _) = watch::channel(false);
     let taskman_inspector = runtime_taskman::RuntimeTaskmanInspectorHandle::default();
+    let virtual_dialog_manager =
+        runtime_virtual_dialog::RuntimeVirtualDialogManagerHandle::default();
     let dispatcher_inspector = runtime_dispatcher::RuntimeDispatcherInspectorHandle::default();
     let cache_inspector = runtime_cache::RuntimeCacheInspectorHandle::default();
     let mut workers = RuntimeWorkers {
@@ -9340,6 +9342,8 @@ async fn start_runtime_workers(
     openplotva_llm::trace::set_observer(llm_observer);
     let memory_store = PostgresMemoryStore::new(service_clients.postgres.clone());
     let memory_restart_trigger = Arc::new(tokio::sync::Notify::new());
+    let virtual_dialog_store =
+        PostgresRuntimeVirtualDialogStore::new(service_clients.postgres.clone());
 
     if config.runtime_api.enabled {
         let runtime_taskman_reader: Arc<dyn openplotva_server::RuntimeTaskmanInspector> =
@@ -9391,6 +9395,7 @@ async fn start_runtime_workers(
                 )) as Arc<dyn openplotva_server::RuntimeMemoryRestarter>
             }),
             gemini_cache_purger,
+            virtual_dialog_manager: Some(Arc::new(virtual_dialog_manager.clone())),
         };
         let (worker, local_addr, tls_public_key_pin) = start_runtime_api_worker(
             config,
@@ -9570,6 +9575,35 @@ async fn start_runtime_workers(
     let store = PostgresVirtualMessageStore::new(service_clients.postgres.clone());
     let history_store = PostgresHistoryStore::new(service_clients.postgres.clone())
         .with_redis_client(service_clients.redis.client().clone());
+    {
+        let cleanup_store = virtual_dialog_store.clone();
+        let cleanup_history = history_store.clone();
+        let cleanup_taskman = taskman_inspector.clone();
+        let cleanup_llm_traces = llm_trace_buffer.clone();
+        let cleanup_stop = stop.subscribe();
+        let cleanup_interval = runtime_virtual_dialog::RUNTIME_VIRTUAL_DIALOG_CLEANUP_INTERVAL;
+        let cleanup_worker = tokio::spawn(async move {
+            let deleted = runtime_virtual_dialog::run_runtime_virtual_dialog_cleanup_worker_until(
+                cleanup_store,
+                cleanup_history,
+                cleanup_taskman,
+                cleanup_llm_traces,
+                cleanup_interval,
+                cleanup_stop,
+            )
+            .await;
+
+            tracing::info!(deleted, "runtime virtual dialog cleanup worker stopped");
+        });
+        readiness_checks.push(ReadinessCheck::ok(
+            "runtime_virtual_dialog_cleanup",
+            format!(
+                "Runtime virtual dialogs expire after 24h inactivity; cleanup every {}s",
+                cleanup_interval.as_secs()
+            ),
+        ));
+        workers.handles.push(cleanup_worker);
+    }
     let ephemeral_store = service_clients.redis.ephemeral_message_store();
 
     let dispatcher_persistence = openplotva_telegram::RedisDispatcherQueueStore::new(
@@ -10502,6 +10536,65 @@ async fn start_runtime_workers(
             }
             dialog_materializer =
                 dialog_materializer.with_vision_materializer(dialog_context_vision);
+            let safe_dialog_toolbox: Arc<dyn openplotva_dialog::DialogToolbox> = Arc::new(
+                runtime_virtual_dialog::RuntimeVirtualSafeToolbox::new(Arc::clone(&dialog_toolbox)),
+            );
+            let safe_genkit_fallback =
+                dialog_runtime::genkit_dialog_provider_from_app_config_with_toolbox(
+                    config,
+                    Some(Arc::clone(&safe_dialog_toolbox)),
+                );
+            let mut safe_dialog_provider = dialog_runtime::router_dialog_provider(
+                config,
+                safe_dialog_toolbox,
+                Arc::clone(&router_handle),
+                Arc::clone(&router_breakers),
+                Arc::clone(&router_triggers),
+                safe_genkit_fallback,
+                Some(routing_event_reporter.clone()),
+            );
+            if dialog_runtime::white_circle_effective_enabled(config) {
+                let white_circle_client = openplotva_llm::whitecircle::WhiteCircleClient::new(
+                    dialog_runtime::white_circle_client_config_from_app_config(config),
+                );
+                let (white_circle_recorder, white_circle_recorder_worker) =
+                    runtime_safety::PostgresWhiteCircleCheckEventRecorder::spawn(
+                        service_clients.postgres.clone(),
+                        stop.subscribe(),
+                    );
+                workers.handles.push(white_circle_recorder_worker);
+                let white_circle_recorder: Arc<
+                    dyn openplotva_llm::whitecircle::WhiteCircleCheckEventRecorder,
+                > = Arc::new(white_circle_recorder);
+                safe_dialog_provider = Arc::new(
+                    openplotva_llm::whitecircle::WhiteCirclePreToolChatProvider::new(
+                        safe_dialog_provider,
+                        white_circle_client,
+                        Some(white_circle_recorder),
+                        dialog_runtime::white_circle_pre_tool_config_from_app_config(config),
+                    ),
+                );
+            }
+            virtual_dialog_manager.set_executor(Arc::new(
+                runtime_virtual_dialog::RuntimeVirtualDialogExecutor::new(
+                    virtual_dialog_store.clone(),
+                    store.clone(),
+                    history_store.clone(),
+                    dialog_materializer.clone(),
+                    safe_dialog_provider,
+                    Arc::clone(&dialog_provider),
+                    taskman_inspector.clone(),
+                    llm_trace_buffer.clone(),
+                    dialog_jobs::DialogBotIdentity::new(
+                        bot_identity.id,
+                        bot_identity.first_name.clone(),
+                    ),
+                ),
+            ));
+            readiness_checks.push(ReadinessCheck::ok(
+                "runtime_virtual_dialogs",
+                "Runtime virtual dialogs wired to routed dialog provider, storage history, and SAFE/REAL tool modes",
+            ));
             let dialog_tool_history = history_store.clone();
             let dialog_max_llm_job_attempts = config.persistent_queue.llm_job_max_attempts;
             let dialog_worker_count = config.persistent_queue.dialog_aifarm_workers.max(0);
@@ -10557,6 +10650,10 @@ async fn start_runtime_workers(
             tracing::warn!(%error, "dialog provider unavailable for dialog taskman worker");
             readiness_checks.push(ReadinessCheck::skipped(
                 "dialog_jobs",
+                format!("dialog provider unavailable: {error}"),
+            ));
+            readiness_checks.push(ReadinessCheck::skipped(
+                "runtime_virtual_dialogs",
                 format!("dialog provider unavailable: {error}"),
             ));
         }

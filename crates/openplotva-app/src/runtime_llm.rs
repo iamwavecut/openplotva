@@ -364,6 +364,47 @@ impl RuntimeLlmTraceBuffer {
         inner.count = 0;
     }
 
+    pub fn prune_chat(&self, chat_id: i64) -> i32 {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if chat_id == 0 || inner.count == 0 || inner.ring.is_empty() {
+            return 0;
+        }
+
+        let capacity = inner.ring.len();
+        let start = if inner.count == capacity {
+            inner.write
+        } else {
+            0
+        };
+        let mut kept = Vec::with_capacity(inner.count);
+        let mut removed = 0i32;
+        for offset in 0..inner.count {
+            let idx = (start + offset) % capacity;
+            let Some(trace) = inner.ring[idx].take() else {
+                continue;
+            };
+            if trace.chat.chat_id == chat_id {
+                removed = removed.saturating_add(1);
+            } else {
+                kept.push(trace);
+            }
+        }
+
+        inner.ring.fill(None);
+        inner.write = 0;
+        inner.count = 0;
+        for trace in kept {
+            let write = inner.write;
+            inner.ring[write] = Some(trace);
+            inner.write = (write + 1) % capacity;
+            inner.count += 1;
+        }
+        removed
+    }
+
     fn list(&self) -> Vec<RuntimeLlmRequestData> {
         let inner = self
             .inner
@@ -1243,6 +1284,34 @@ mod tests {
             })
             .expect("trace list after rerecord");
         assert_eq!(traces[0].id, 3);
+    }
+
+    #[test]
+    fn runtime_llm_trace_buffer_prunes_virtual_chat_traces() {
+        let buffer = RuntimeLlmTraceBuffer::new(4);
+        for chat_id in [10, 20, 10] {
+            buffer.record(RuntimeLlmRequestData {
+                source: "dialog".to_owned(),
+                chat: RuntimeLlmRequestChatData {
+                    chat_id,
+                    ..RuntimeLlmRequestChatData::default()
+                },
+                ..RuntimeLlmRequestData::default()
+            });
+        }
+
+        assert_eq!(buffer.prune_chat(10), 2);
+        let traces = buffer
+            .llm_requests(RuntimeLlmRequestsFilter {
+                limit: 100,
+                ..RuntimeLlmRequestsFilter::default()
+            })
+            .expect("trace list after prune");
+
+        assert_eq!(traces.len(), 1);
+        assert_eq!(traces[0].chat.chat_id, 20);
+        assert_eq!(traces[0].id, 2);
+        assert_eq!(buffer.prune_chat(10), 0);
     }
 
     #[test]

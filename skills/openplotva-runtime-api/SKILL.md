@@ -244,6 +244,117 @@ query {
 }
 ```
 
+## Virtual Dialogs
+
+Runtime virtual dialogs are disposable dialog sessions addressed only by
+caller-chosen `sessionID: String!`. There is no default owner, no global active
+dialog, and no list endpoint. Use a unique session ID per experiment, for
+example `codex-intent-tools-20260630-01`.
+
+Start or replace a session:
+
+```graphql
+mutation {
+  startVirtualDialog(input: { sessionID: "codex-test-session", replaceExisting: true }) {
+    sessionID
+    chatID
+    userID
+    nextMessageID
+    expiresAt
+  }
+}
+```
+
+Send a cleanup-friendly tool-calling message. `SAFE` mode uses normal routing,
+history, memory, shield, and tool-calling, but side-effect tools such as drawing
+and music return synthetic queued results instead of starting real jobs:
+
+```graphql
+mutation {
+  sendVirtualDialogMessage(input: {
+    sessionID: "codex-test-session"
+    text: "Нарисуй маленькую плотву в стиле стикера"
+    toolMode: SAFE
+  }) {
+    messageID
+    role
+    text
+    provider
+    toolMode
+    toolCalls
+  }
+}
+```
+
+Use `REAL` only when real taskman/tool side effects are intended. Those effects
+run under generated negative virtual `chatID`/`userID`; deleting the virtual
+dialog cleans local metadata/history/taskman rows/traces but cannot recall an
+external provider request that has already started.
+
+Inspect the session history without extending its lifetime:
+
+```graphql
+query {
+  virtualDialog(sessionID: "codex-test-session") {
+    sessionID
+    chatID
+    userID
+    lastActivityAt
+    expiresAt
+    messages {
+      messageID
+      role
+      text
+      provider
+      toolMode
+      toolCalls
+    }
+  }
+}
+```
+
+Inspect LLM traces for the returned virtual `chatID`:
+
+```graphql
+query {
+  llmRequests(filter: { chatID: -9100000000001, limit: 20 }) {
+    id
+    at
+    provider
+    source
+    flow
+    model
+    message { messageID }
+    result { durationMs error responseTextPreview }
+  }
+}
+```
+
+Delete the session and its cleanup-friendly artifacts:
+
+```graphql
+mutation {
+  deleteVirtualDialog(sessionID: "codex-test-session") {
+    found
+    deleted
+    historyDeleted
+    taskmanDeleted
+    llmTracesDeleted
+  }
+}
+```
+
+Expiration behavior:
+
+- `sessionID` is required, trimmed, non-empty, and capped by the runtime API.
+- `startVirtualDialog` fails if a non-expired session exists unless
+  `replaceExisting: true`.
+- Successful `startVirtualDialog` and `sendVirtualDialogMessage` refresh
+  `lastActivityAt`/`expiresAt`; reads do not refresh TTL.
+- Sessions expire after 24 hours of inactivity. Runtime cleanup removes expired
+  sessions periodically, and each access lazily expires the requested session
+  before continuing.
+
 Read-only SQL:
 
 ```graphql

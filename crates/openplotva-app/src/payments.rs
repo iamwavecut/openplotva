@@ -7260,6 +7260,7 @@ mod tests {
                 invoice_payload: "subscription_42".to_owned(),
                 telegram_payment_charge_id: "telegram-charge".to_owned(),
                 provider_payment_charge_id: "provider-charge".to_owned(),
+                paid_at: Some("2024-03-09T16:00:00Z".to_owned()),
                 ..ControlPayment::default()
             })
         );

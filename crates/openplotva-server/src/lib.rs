@@ -59,7 +59,10 @@ pub use runtime_graphql::{
     RuntimeTaskmanQueueDiagnosticsData, RuntimeUpdatesInspector, RuntimeUpdatesInspectorFuture,
     RuntimeUpdatesRuntimeData, RuntimeUpdatesTaskData, RuntimeUserConnectionData, RuntimeUserData,
     RuntimeUserDetailsData, RuntimeUserLookup, RuntimeUsersFilter, RuntimeVipCacheData,
-    RuntimeVipEventData, RuntimeVipSummaryData, runtime_api_graphql_schema,
+    RuntimeVipEventData, RuntimeVipSummaryData, RuntimeVirtualDialogData,
+    RuntimeVirtualDialogDeleteResultData, RuntimeVirtualDialogFuture, RuntimeVirtualDialogManager,
+    RuntimeVirtualDialogMessageData, RuntimeVirtualDialogSendRequest,
+    RuntimeVirtualDialogStartRequest, RuntimeVirtualDialogToolMode, runtime_api_graphql_schema,
     runtime_api_graphql_schema_with_diagnostics, runtime_api_graphql_schema_with_live_diagnostics,
     runtime_api_graphql_schema_with_redis,
 };
@@ -891,11 +894,15 @@ mod tests {
         RuntimeTokenParseError, RuntimeUpdatesInspector, RuntimeUpdatesInspectorFuture,
         RuntimeUpdatesRuntimeData, RuntimeUpdatesTaskData, RuntimeUserConnectionData,
         RuntimeUserData, RuntimeUserDetailsData, RuntimeUserLookup, RuntimeUsersFilter,
-        RuntimeVipCacheData, RuntimeVipEventData, RuntimeVipSummaryData, can_perform_action,
-        format_runtime_token, hash_runtime_token_secret, health_response, parse_bearer_token,
-        parse_runtime_token, permission_cache_key, permission_error_chat_type,
-        permission_error_settings_update, rate_limit_key, rate_limited_chat_key,
-        runtime_api_graphql_schema, runtime_api_graphql_schema_with_diagnostics,
+        RuntimeVipCacheData, RuntimeVipEventData, RuntimeVipSummaryData, RuntimeVirtualDialogData,
+        RuntimeVirtualDialogDeleteResultData, RuntimeVirtualDialogFuture,
+        RuntimeVirtualDialogManager, RuntimeVirtualDialogMessageData,
+        RuntimeVirtualDialogSendRequest, RuntimeVirtualDialogStartRequest,
+        RuntimeVirtualDialogToolMode, can_perform_action, format_runtime_token,
+        hash_runtime_token_secret, health_response, parse_bearer_token, parse_runtime_token,
+        permission_cache_key, permission_error_chat_type, permission_error_settings_update,
+        rate_limit_key, rate_limited_chat_key, runtime_api_graphql_schema,
+        runtime_api_graphql_schema_with_diagnostics,
         runtime_api_graphql_schema_with_live_diagnostics, runtime_api_graphql_schema_with_redis,
         runtime_api_method_not_allowed_response, runtime_api_pprof_response,
         runtime_api_tls_config_from_pem, runtime_api_unauthorized_response,
@@ -2257,6 +2264,185 @@ mod tests {
         assert_eq!(analytics["runtimeJobs"][0]["provider"], "aifarm");
         assert_eq!(analytics["runtimeJobsError"], "taskman unavailable");
         assert_eq!(analytics["aiFarmCapacity"]["available"], 5);
+    }
+
+    #[tokio::test]
+    async fn runtime_api_graphql_serves_session_virtual_dialogs() {
+        #[derive(Default)]
+        struct VirtualDialogs;
+
+        impl RuntimeVirtualDialogManager for VirtualDialogs {
+            fn virtual_dialog<'a>(
+                &'a self,
+                session_id: &'a str,
+            ) -> RuntimeVirtualDialogFuture<'a, Option<RuntimeVirtualDialogData>> {
+                assert_eq!(session_id, "agent-session");
+                Box::pin(async {
+                    Ok(Some(RuntimeVirtualDialogData {
+                        session_id: "agent-session".to_owned(),
+                        chat_id: -9001,
+                        user_id: -9002,
+                        next_message_id: 4,
+                        message_count: 3,
+                        last_activity_at: Some("2026-06-30T10:00:00Z".to_owned()),
+                        expires_at: Some("2026-07-01T10:00:00Z".to_owned()),
+                        messages: vec![RuntimeVirtualDialogMessageData {
+                            message_id: 3,
+                            role: "model".to_owned(),
+                            text: "answer".to_owned(),
+                            at: "2026-06-30T10:00:01Z".to_owned(),
+                            provider: Some("aifarm".to_owned()),
+                            tool_mode: Some(RuntimeVirtualDialogToolMode::Safe),
+                            tool_calls: Some(serde_json::json!([{"name": "web_search"}])),
+                        }],
+                    }))
+                })
+            }
+
+            fn start_virtual_dialog<'a>(
+                &'a self,
+                request: RuntimeVirtualDialogStartRequest,
+            ) -> RuntimeVirtualDialogFuture<'a, RuntimeVirtualDialogData> {
+                assert_eq!(request.session_id, "agent-session");
+                assert!(request.replace_existing);
+                Box::pin(async {
+                    Ok(RuntimeVirtualDialogData {
+                        session_id: "agent-session".to_owned(),
+                        chat_id: -9001,
+                        user_id: -9002,
+                        next_message_id: 1,
+                        message_count: 0,
+                        last_activity_at: Some("2026-06-30T10:00:00Z".to_owned()),
+                        expires_at: Some("2026-07-01T10:00:00Z".to_owned()),
+                        messages: Vec::new(),
+                    })
+                })
+            }
+
+            fn send_virtual_dialog_message<'a>(
+                &'a self,
+                request: RuntimeVirtualDialogSendRequest,
+            ) -> RuntimeVirtualDialogFuture<'a, RuntimeVirtualDialogMessageData> {
+                assert_eq!(request.session_id, "agent-session");
+                assert_eq!(request.text, "привет");
+                assert_eq!(request.tool_mode, RuntimeVirtualDialogToolMode::Real);
+                Box::pin(async {
+                    Ok(RuntimeVirtualDialogMessageData {
+                        message_id: 2,
+                        role: "model".to_owned(),
+                        text: "answer".to_owned(),
+                        at: "2026-06-30T10:00:01Z".to_owned(),
+                        provider: Some("aifarm".to_owned()),
+                        tool_mode: Some(RuntimeVirtualDialogToolMode::Real),
+                        tool_calls: Some(serde_json::json!([{"name": "draw_image"}])),
+                    })
+                })
+            }
+
+            fn delete_virtual_dialog<'a>(
+                &'a self,
+                session_id: &'a str,
+            ) -> RuntimeVirtualDialogFuture<'a, RuntimeVirtualDialogDeleteResultData> {
+                assert_eq!(session_id, "agent-session");
+                Box::pin(async {
+                    Ok(RuntimeVirtualDialogDeleteResultData {
+                        found: true,
+                        deleted: true,
+                        history_deleted: 3,
+                        taskman_deleted: 1,
+                        llm_traces_deleted: 2,
+                    })
+                })
+            }
+        }
+
+        let schema = runtime_api_graphql_schema_with_live_diagnostics(
+            RuntimeApiGraphqlSnapshot::default(),
+            RuntimeApiLiveDiagnostics {
+                virtual_dialog_manager: Some(Arc::new(VirtualDialogs)),
+                ..RuntimeApiLiveDiagnostics::default()
+            },
+        );
+        let response = schema
+            .execute(
+                r#"
+                mutation {
+                    startVirtualDialog(input: { sessionID: "agent-session", replaceExisting: true }) {
+                        sessionID
+                        chatID
+                        userID
+                        nextMessageID
+                        messageCount
+                        expiresAt
+                    }
+                    sendVirtualDialogMessage(input: { sessionID: "agent-session", text: "привет", toolMode: REAL }) {
+                        messageID
+                        role
+                        text
+                        provider
+                        toolMode
+                        toolCalls
+                    }
+                    deleteVirtualDialog(sessionID: "agent-session") {
+                        found
+                        deleted
+                        historyDeleted
+                        taskmanDeleted
+                        llmTracesDeleted
+                    }
+                }
+                "#,
+            )
+            .await;
+        assert!(
+            response.errors.is_empty(),
+            "runtime virtual dialog mutation GraphQL returned errors: {:?}",
+            response.errors
+        );
+        let payload = serde_json::to_value(&response)
+            .unwrap_or_else(|error| panic!("serialize GraphQL response: {error}"));
+        assert_eq!(
+            payload["data"]["startVirtualDialog"]["sessionID"],
+            "agent-session"
+        );
+        assert_eq!(payload["data"]["startVirtualDialog"]["chatID"], "-9001");
+        assert_eq!(
+            payload["data"]["sendVirtualDialogMessage"]["toolMode"],
+            "REAL"
+        );
+        assert_eq!(
+            payload["data"]["sendVirtualDialogMessage"]["toolCalls"][0]["name"],
+            "draw_image"
+        );
+        assert_eq!(payload["data"]["deleteVirtualDialog"]["deleted"], true);
+
+        let response = schema
+            .execute(
+                r#"
+                query {
+                    virtualDialog(sessionID: "agent-session") {
+                        sessionID
+                        chatID
+                        userID
+                        messageCount
+                        messages { messageID role text provider toolMode toolCalls }
+                    }
+                }
+                "#,
+            )
+            .await;
+        assert!(
+            response.errors.is_empty(),
+            "runtime virtual dialog query GraphQL returned errors: {:?}",
+            response.errors
+        );
+        let payload = serde_json::to_value(&response)
+            .unwrap_or_else(|error| panic!("serialize GraphQL response: {error}"));
+        assert_eq!(payload["data"]["virtualDialog"]["messageCount"], 3);
+        assert_eq!(
+            payload["data"]["virtualDialog"]["messages"][0]["toolMode"],
+            "SAFE"
+        );
     }
 
     #[tokio::test]

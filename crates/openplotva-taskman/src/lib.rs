@@ -318,7 +318,7 @@ pub struct ControlJobData {
     pub payment: Option<ControlPayment>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default)]
 pub struct ControlPayment {
     pub currency: String,
@@ -336,23 +336,6 @@ pub struct ControlPayment {
     pub is_recurring: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_first_recurring: Option<bool>,
-}
-
-impl Default for ControlPayment {
-    fn default() -> Self {
-        Self {
-            currency: String::new(),
-            total_amount: 0,
-            invoice_payload: String::new(),
-            telegram_payment_charge_id: String::new(),
-            provider_payment_charge_id: String::new(),
-            paid_at: None,
-            subscription_period_seconds: None,
-            subscription_expiration_date: None,
-            is_recurring: None,
-            is_first_recurring: None,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

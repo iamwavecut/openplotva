@@ -5464,7 +5464,6 @@ fn is_zero_i32(value: &i32) -> bool {
 mod tests {
     use std::{
         collections::VecDeque,
-        fmt,
         sync::{Arc, Mutex, MutexGuard},
     };
 
@@ -5499,40 +5498,6 @@ mod tests {
             },
             ..DialogInput::default()
         }
-    }
-
-    #[derive(Debug)]
-    struct SimpleError(String);
-
-    impl fmt::Display for SimpleError {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.write_str(&self.0)
-        }
-    }
-
-    impl Error for SimpleError {}
-
-    fn ok_completion(text: &str) -> Result<CompletionResult, CompletionError> {
-        Ok(CompletionResult {
-            response: Some(json!({
-                "choices": [{
-                    "message": {"role": "assistant", "content": text}
-                }]
-            })),
-            ..CompletionResult::default()
-        })
-    }
-
-    fn provider_failure(
-        provider: &str,
-        reason: FailureReason,
-        message: &str,
-    ) -> Result<CompletionResult, CompletionError> {
-        Err(Box::new(ProviderError::new(provider, reason, message)))
-    }
-
-    fn simple_failure(message: &str) -> Result<CompletionResult, CompletionError> {
-        Err(Box::new(SimpleError(message.to_owned())))
     }
 
     fn completion_text(result: &CompletionResult) -> Option<&str> {
