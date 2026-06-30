@@ -7295,6 +7295,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dialog_provider_returns_immediate_queued_draw_answer_from_direct_xml_element()
+    -> Result<(), CompletionError> {
+        let toolbox = FakeToolbox::new(vec![ToolResult {
+            status: TOOL_RESULT_STATUS_QUEUED.to_owned(),
+            side_effect: Some(ToolSideEffect {
+                kind: "image_generation_job".to_owned(),
+                state: TOOL_RESULT_STATUS_QUEUED.to_owned(),
+                ..ToolSideEffect::default()
+            }),
+            ..ToolResult::default()
+        }]);
+        let (provider, transport, toolbox) = direct_dialog_provider_with_toolbox(
+            json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "<draw_image prompt=\"cat in space\" />"
+                    }
+                }]
+            }),
+            AifarmDialogConfig::default(),
+            toolbox,
+        );
+        let mut input = base_input();
+        input.message = DialogMessage {
+            id: 103,
+            text: "нарисуй кота".to_owned(),
+            ..DialogMessage::default()
+        };
+
+        let output = crate::ChatProvider::run_dialog(&provider, input).await?;
+
+        assert_eq!(output.answer, "Готово, поставила изображение в очередь.");
+        assert_eq!(output.tool_calls.len(), 1);
+        assert_eq!(output.tool_calls[0].name, STEP_DRAW_IMAGE);
+        assert_eq!(toolbox.draw_requests()[0].prompt, "cat in space");
+        assert_eq!(output.trace_events.len(), 1);
+        assert_eq!(transport.requests().len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn dialog_provider_wraps_provider_error_with_trace_events() -> Result<(), CompletionError>
     {
         let transport = FakeTransport::new(vec![Err(Box::new(ProviderError::new(

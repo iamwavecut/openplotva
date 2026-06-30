@@ -1615,6 +1615,9 @@ fn is_tool_like_name(name: &str) -> bool {
 }
 
 fn parse_xmlish_tool_call_step(raw: &str) -> Result<(ToolStep, bool), ToolParseError> {
+    if let Some(step) = parse_xmlish_direct_tool_tag(raw)? {
+        return Ok((step, true));
+    }
     let Some(tag) = first_xmlish_tool_tag(raw) else {
         return Ok((ToolStep::default(), false));
     };
@@ -1657,6 +1660,51 @@ fn parse_xmlish_tool_attrs(tag: &str) -> Result<Option<ToolStep>, ToolParseError
     };
     populate_xmlish_tool_attrs(tag, &mut step)?;
     normalize_and_validate_step(step).map(Some)
+}
+
+fn parse_xmlish_direct_tool_tag(raw: &str) -> Result<Option<ToolStep>, ToolParseError> {
+    let Some(tag) = first_xmlish_direct_tool_tag(raw) else {
+        return Ok(None);
+    };
+    let Some(name) = canonical_known_step(&xmlish_tool_tag_name(&tag)) else {
+        return Ok(None);
+    };
+    if !xmlish_direct_tool_tag_has_args(&tag, name) {
+        return Ok(None);
+    }
+    let mut step = ToolStep {
+        step: name.to_owned(),
+        ..ToolStep::default()
+    };
+    populate_xmlish_tool_attrs(&tag, &mut step)?;
+    normalize_and_validate_step(step).map(Some)
+}
+
+fn first_xmlish_direct_tool_tag(raw: &str) -> Option<String> {
+    let mut offset = 0;
+    while let Some(idx) = raw[offset..].find('<') {
+        let start = offset + idx;
+        if raw[start..].starts_with("</") {
+            offset = start + 2;
+            continue;
+        }
+        let end = raw[start..].find('>')?;
+        let tag = &raw[start..start + end + 1];
+        if canonical_known_step(&xmlish_tool_tag_name(tag)).is_some() {
+            return Some(tag.to_owned());
+        }
+        offset = start + 1;
+    }
+    None
+}
+
+fn xmlish_direct_tool_tag_has_args(tag: &str, step: &str) -> bool {
+    matches!(step, STEP_QUEUE_STATUS | STEP_CANCEL_DRAWING)
+        || INLINE_TOOL_ARG_KEYS
+            .iter()
+            .any(|key| xmlish_tool_attr(tag, key).is_some())
+        || xmlish_tool_attr(tag, "arg").is_some()
+        || xmlish_tool_attr(tag, "args").is_some()
 }
 
 fn first_xmlish_tool_tag(raw: &str) -> Option<String> {
@@ -2072,6 +2120,13 @@ fn is_known_step_fold(step: &str) -> bool {
         .any(|known| known.eq_ignore_ascii_case(step))
 }
 
+fn canonical_known_step(step: &str) -> Option<&'static str> {
+    ALL_STEPS
+        .iter()
+        .copied()
+        .find(|known| known.eq_ignore_ascii_case(step.trim()))
+}
+
 fn has_prefix_fold(value: &str, prefix: &str) -> bool {
     value
         .get(..prefix.len())
@@ -2312,6 +2367,16 @@ mod tests {
                 ToolStep {
                     step: STEP_VISION_IMAGE.to_owned(),
                     file_id: "message_177164_image_1".to_owned(),
+                    ..ToolStep::default()
+                },
+                "xmlish",
+            ),
+            (
+                r#"<draw_image prompt="cat in space" negative_prompt="blur" />"#.to_owned(),
+                ToolStep {
+                    step: STEP_DRAW_IMAGE.to_owned(),
+                    prompt: "cat in space".to_owned(),
+                    negative_prompt: "blur".to_owned(),
                     ..ToolStep::default()
                 },
                 "xmlish",
