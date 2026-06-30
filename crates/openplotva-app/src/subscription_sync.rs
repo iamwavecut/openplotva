@@ -679,7 +679,8 @@ mod tests {
 
     #[test]
     fn compensation_doubles_uncovered_subscription_time() {
-        let paid_at = OffsetDateTime::from_unix_timestamp(1_779_193_800).unwrap();
+        let paid_at = OffsetDateTime::from_unix_timestamp(1_779_193_800)
+            .expect("sample payment timestamp is valid");
         let now = paid_at + TimeDuration::days(2);
         let payment = sample_payment(paid_at);
 
@@ -696,7 +697,8 @@ mod tests {
 
     #[tokio::test]
     async fn subscription_sync_dry_run_reports_repair_without_writing() {
-        let paid_at = OffsetDateTime::from_unix_timestamp(1_779_193_800).unwrap();
+        let paid_at = OffsetDateTime::from_unix_timestamp(1_779_193_800)
+            .expect("sample payment timestamp is valid");
         let now = paid_at + TimeDuration::days(2);
         let source = SourceStub::new(vec![sample_payment(paid_at)]);
         let store = StoreStub::new();
@@ -728,7 +730,8 @@ mod tests {
 
     #[tokio::test]
     async fn subscription_sync_repairs_missing_subscription_with_compensation() {
-        let paid_at = OffsetDateTime::from_unix_timestamp(1_779_193_800).unwrap();
+        let paid_at = OffsetDateTime::from_unix_timestamp(1_779_193_800)
+            .expect("sample payment timestamp is valid");
         let now = paid_at + TimeDuration::days(2);
         let source = SourceStub::new(vec![sample_payment(paid_at)]);
         let paid_expires_at = paid_at + TimeDuration::days(30);
@@ -762,7 +765,8 @@ mod tests {
 
     #[tokio::test]
     async fn subscription_sync_skips_already_synced_charge() {
-        let paid_at = OffsetDateTime::from_unix_timestamp(1_779_193_800).unwrap();
+        let paid_at = OffsetDateTime::from_unix_timestamp(1_779_193_800)
+            .expect("sample payment timestamp is valid");
         let source = SourceStub::new(vec![sample_payment(paid_at)]);
         let subscription = sample_subscription(paid_at + TimeDuration::days(30));
         let event = VipEventRecord {
@@ -967,7 +971,10 @@ mod tests {
             Box::pin(async move {
                 let mut state = self.lock();
                 state.vip_events.push(vip_event_create_into_owned(event));
-                Ok(state.next_vip_events.pop_front().unwrap())
+                Ok(state
+                    .next_vip_events
+                    .pop_front()
+                    .expect("test store has a queued VIP event"))
             })
         }
     }

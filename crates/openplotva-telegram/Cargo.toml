@@ -13,7 +13,6 @@ carapax.workspace = true
 crc.workspace = true
 html-escape.workspace = true
 html5ever.workspace = true
-openplotva-core = { path = "../openplotva-core" }
 openplotva-updates = { path = "../openplotva-updates" }
 redis = { workspace = true, features = ["tokio-comp"] }
 reqwest.workspace = true

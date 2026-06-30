@@ -1,12 +1,13 @@
 use std::{future::Future, pin::Pin, sync::Arc};
 
-use async_graphql::{EmptySubscription, ID, InputObject, Json, Object, Schema, SimpleObject};
+use async_graphql::{EmptySubscription, Enum, ID, InputObject, Json, Object, Schema, SimpleObject};
 use serde_json::{Value, json};
 
 /// Runtime API GraphQL schema type.
 pub type RuntimeApiSchema = Schema<RuntimeQuery, RuntimeMutation, EmptySubscription>;
 
 const RUNTIME_TASKMAN_LOWEST_PRIORITY: i32 = -4;
+const RUNTIME_VIRTUAL_DIALOG_SESSION_ID_MAX_CHARS: usize = 128;
 
 /// Boxed future returned by runtime Redis diagnostic inspectors.
 pub type RuntimeRedisInspectorFuture<'a, T> =
@@ -39,6 +40,10 @@ pub type RuntimeGeminiCachePurgerFuture<'a> =
 /// Boxed future returned by runtime LLM analytics readers.
 pub type RuntimeLlmAnalyticsReaderFuture<'a> =
     Pin<Box<dyn Future<Output = Result<RuntimeLlmAnalyticsData, String>> + Send + 'a>>;
+
+/// Boxed future returned by runtime virtual-dialog managers.
+pub type RuntimeVirtualDialogFuture<'a, T> =
+    Pin<Box<dyn Future<Output = Result<T, String>> + Send + 'a>>;
 
 /// Runtime API Redis diagnostics boundary.
 pub trait RuntimeRedisInspector: Send + Sync {
@@ -175,6 +180,33 @@ pub trait RuntimeTaskmanInspector: Send + Sync {
     ) -> Result<RuntimeTaskmanDiagnosticsData, String>;
 }
 
+/// Runtime API virtual-dialog mutation/read boundary.
+pub trait RuntimeVirtualDialogManager: Send + Sync {
+    /// Read one virtual dialog by caller-provided session ID.
+    fn virtual_dialog<'a>(
+        &'a self,
+        session_id: &'a str,
+    ) -> RuntimeVirtualDialogFuture<'a, Option<RuntimeVirtualDialogData>>;
+
+    /// Start a virtual dialog for a caller-provided session ID.
+    fn start_virtual_dialog<'a>(
+        &'a self,
+        request: RuntimeVirtualDialogStartRequest,
+    ) -> RuntimeVirtualDialogFuture<'a, RuntimeVirtualDialogData>;
+
+    /// Send one user message into a virtual dialog.
+    fn send_virtual_dialog_message<'a>(
+        &'a self,
+        request: RuntimeVirtualDialogSendRequest,
+    ) -> RuntimeVirtualDialogFuture<'a, RuntimeVirtualDialogMessageData>;
+
+    /// Delete one virtual dialog and its cleanup-friendly artifacts.
+    fn delete_virtual_dialog<'a>(
+        &'a self,
+        session_id: &'a str,
+    ) -> RuntimeVirtualDialogFuture<'a, RuntimeVirtualDialogDeleteResultData>;
+}
+
 /// Optional live runtime diagnostic providers used by the GraphQL route shell.
 #[derive(Clone, Default)]
 pub struct RuntimeApiLiveDiagnostics {
@@ -192,6 +224,7 @@ pub struct RuntimeApiLiveDiagnostics {
     pub cache_inspector: Option<Arc<dyn RuntimeCacheInspector>>,
     pub memory_restarter: Option<Arc<dyn RuntimeMemoryRestarter>>,
     pub gemini_cache_purger: Option<Arc<dyn RuntimeGeminiCachePurger>>,
+    pub virtual_dialog_manager: Option<Arc<dyn RuntimeVirtualDialogManager>>,
 }
 
 /// Runtime API log replay query after GraphQL/default shaping.
@@ -261,6 +294,66 @@ pub struct RuntimeGeminiCachePurgeResultData {
     pub matched: i32,
     pub deleted: i32,
     pub failed: i32,
+}
+
+/// Runtime virtual-dialog tool mode.
+#[derive(Clone, Copy, Debug, Default, Enum, Eq, PartialEq)]
+pub enum RuntimeVirtualDialogToolMode {
+    /// Use a cleanup-friendly toolbox that does not run side-effect tools.
+    #[default]
+    Safe,
+    /// Use the normal toolbox; external side effects may start.
+    Real,
+}
+
+/// Runtime virtual-dialog start request after GraphQL/default shaping.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeVirtualDialogStartRequest {
+    pub session_id: String,
+    pub replace_existing: bool,
+}
+
+/// Runtime virtual-dialog send request after GraphQL/default shaping.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeVirtualDialogSendRequest {
+    pub session_id: String,
+    pub text: String,
+    pub tool_mode: RuntimeVirtualDialogToolMode,
+}
+
+/// Runtime virtual-dialog row returned by a live manager.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeVirtualDialogData {
+    pub session_id: String,
+    pub chat_id: i64,
+    pub user_id: i64,
+    pub next_message_id: i32,
+    pub message_count: i32,
+    pub last_activity_at: Option<String>,
+    pub expires_at: Option<String>,
+    pub messages: Vec<RuntimeVirtualDialogMessageData>,
+}
+
+/// Runtime virtual-dialog message returned by a live manager.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeVirtualDialogMessageData {
+    pub message_id: i32,
+    pub role: String,
+    pub text: String,
+    pub at: String,
+    pub provider: Option<String>,
+    pub tool_mode: Option<RuntimeVirtualDialogToolMode>,
+    pub tool_calls: Option<Value>,
+}
+
+/// Runtime virtual-dialog delete result returned by a live manager.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeVirtualDialogDeleteResultData {
+    pub found: bool,
+    pub deleted: bool,
+    pub history_deleted: i32,
+    pub taskman_deleted: i32,
+    pub llm_traces_deleted: i32,
 }
 
 /// Runtime API taskman job list filter after GraphQL/default shaping.
@@ -1053,10 +1146,12 @@ pub fn runtime_api_graphql_schema_with_live_diagnostics(
             updates_inspector: diagnostics.updates_inspector,
             dispatcher_inspector: diagnostics.dispatcher_inspector,
             cache_inspector: diagnostics.cache_inspector,
+            virtual_dialog_manager: diagnostics.virtual_dialog_manager.clone(),
         },
         RuntimeMutation {
             memory_restarter: diagnostics.memory_restarter,
             gemini_cache_purger: diagnostics.gemini_cache_purger,
+            virtual_dialog_manager: diagnostics.virtual_dialog_manager,
         },
         EmptySubscription,
     )
@@ -1077,11 +1172,13 @@ pub struct RuntimeQuery {
     updates_inspector: Option<Arc<dyn RuntimeUpdatesInspector>>,
     dispatcher_inspector: Option<Arc<dyn RuntimeDispatcherInspector>>,
     cache_inspector: Option<Arc<dyn RuntimeCacheInspector>>,
+    virtual_dialog_manager: Option<Arc<dyn RuntimeVirtualDialogManager>>,
 }
 
 pub struct RuntimeMutation {
     memory_restarter: Option<Arc<dyn RuntimeMemoryRestarter>>,
     gemini_cache_purger: Option<Arc<dyn RuntimeGeminiCachePurger>>,
+    virtual_dialog_manager: Option<Arc<dyn RuntimeVirtualDialogManager>>,
 }
 
 #[Object]
@@ -1295,6 +1392,21 @@ impl RuntimeQuery {
             .llm_analytics(range.as_deref().unwrap_or_default())
             .await
             .map(LlmAnalytics::from)
+            .map_err(async_graphql::Error::new)
+    }
+
+    async fn virtual_dialog(
+        &self,
+        #[graphql(name = "sessionID")] session_id: String,
+    ) -> async_graphql::Result<Option<VirtualDialog>> {
+        let Some(manager) = self.virtual_dialog_manager.as_deref() else {
+            return Err("runtime virtual dialog manager is not configured".into());
+        };
+        let session_id = normalize_virtual_dialog_session_id(session_id)?;
+        manager
+            .virtual_dialog(&session_id)
+            .await
+            .map(|dialog| dialog.map(VirtualDialog::from))
             .map_err(async_graphql::Error::new)
     }
 
@@ -1570,6 +1682,28 @@ fn trim_vec(value: Option<Vec<String>>) -> Vec<String> {
         .collect()
 }
 
+fn normalize_virtual_dialog_session_id(value: String) -> async_graphql::Result<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("sessionID is required".into());
+    }
+    if value.chars().count() > RUNTIME_VIRTUAL_DIALOG_SESSION_ID_MAX_CHARS {
+        return Err(format!(
+            "sessionID must be at most {RUNTIME_VIRTUAL_DIALOG_SESSION_ID_MAX_CHARS} characters"
+        )
+        .into());
+    }
+    Ok(value.to_owned())
+}
+
+fn normalize_virtual_dialog_text(value: String) -> async_graphql::Result<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("text is required".into());
+    }
+    Ok(value.to_owned())
+}
+
 #[Object]
 impl RuntimeMutation {
     async fn restart_memory(
@@ -1600,6 +1734,58 @@ impl RuntimeMutation {
             .purge()
             .await
             .map(GeminiExplicitCachePurgeResult::from)
+            .map_err(async_graphql::Error::new)
+    }
+
+    async fn start_virtual_dialog(
+        &self,
+        input: StartVirtualDialogInput,
+    ) -> async_graphql::Result<VirtualDialog> {
+        let Some(manager) = self.virtual_dialog_manager.as_deref() else {
+            return Err("runtime virtual dialog manager is not configured".into());
+        };
+        let request = RuntimeVirtualDialogStartRequest {
+            session_id: normalize_virtual_dialog_session_id(input.session_id)?,
+            replace_existing: input.replace_existing.unwrap_or(false),
+        };
+        manager
+            .start_virtual_dialog(request)
+            .await
+            .map(VirtualDialog::from)
+            .map_err(async_graphql::Error::new)
+    }
+
+    async fn send_virtual_dialog_message(
+        &self,
+        input: SendVirtualDialogMessageInput,
+    ) -> async_graphql::Result<VirtualDialogMessage> {
+        let Some(manager) = self.virtual_dialog_manager.as_deref() else {
+            return Err("runtime virtual dialog manager is not configured".into());
+        };
+        let request = RuntimeVirtualDialogSendRequest {
+            session_id: normalize_virtual_dialog_session_id(input.session_id)?,
+            text: normalize_virtual_dialog_text(input.text)?,
+            tool_mode: input.tool_mode.unwrap_or_default(),
+        };
+        manager
+            .send_virtual_dialog_message(request)
+            .await
+            .map(VirtualDialogMessage::from)
+            .map_err(async_graphql::Error::new)
+    }
+
+    async fn delete_virtual_dialog(
+        &self,
+        #[graphql(name = "sessionID")] session_id: String,
+    ) -> async_graphql::Result<VirtualDialogDeleteResult> {
+        let Some(manager) = self.virtual_dialog_manager.as_deref() else {
+            return Err("runtime virtual dialog manager is not configured".into());
+        };
+        let session_id = normalize_virtual_dialog_session_id(session_id)?;
+        manager
+            .delete_virtual_dialog(&session_id)
+            .await
+            .map(VirtualDialogDeleteResult::from)
             .map_err(async_graphql::Error::new)
     }
 }
@@ -1824,6 +2010,107 @@ struct TaskmanJobsFilterInput {
     sort_dir: Option<String>,
     offset: Option<i32>,
     limit: Option<i32>,
+}
+
+#[derive(InputObject)]
+#[allow(dead_code)]
+struct StartVirtualDialogInput {
+    #[graphql(name = "sessionID")]
+    session_id: String,
+    #[graphql(name = "replaceExisting")]
+    replace_existing: Option<bool>,
+}
+
+#[derive(InputObject)]
+#[allow(dead_code)]
+struct SendVirtualDialogMessageInput {
+    #[graphql(name = "sessionID")]
+    session_id: String,
+    text: String,
+    #[graphql(name = "toolMode")]
+    tool_mode: Option<RuntimeVirtualDialogToolMode>,
+}
+
+#[derive(Clone, SimpleObject)]
+struct VirtualDialog {
+    #[graphql(name = "sessionID")]
+    session_id: String,
+    #[graphql(name = "chatID")]
+    chat_id: ID,
+    #[graphql(name = "userID")]
+    user_id: ID,
+    #[graphql(name = "nextMessageID")]
+    next_message_id: i32,
+    message_count: i32,
+    last_activity_at: Option<String>,
+    expires_at: Option<String>,
+    messages: Vec<VirtualDialogMessage>,
+}
+
+impl From<RuntimeVirtualDialogData> for VirtualDialog {
+    fn from(data: RuntimeVirtualDialogData) -> Self {
+        Self {
+            session_id: data.session_id,
+            chat_id: ID(data.chat_id.to_string()),
+            user_id: ID(data.user_id.to_string()),
+            next_message_id: data.next_message_id,
+            message_count: data.message_count,
+            last_activity_at: data.last_activity_at,
+            expires_at: data.expires_at,
+            messages: data
+                .messages
+                .into_iter()
+                .map(VirtualDialogMessage::from)
+                .collect(),
+        }
+    }
+}
+
+#[derive(Clone, SimpleObject)]
+struct VirtualDialogMessage {
+    #[graphql(name = "messageID")]
+    message_id: i32,
+    role: String,
+    text: String,
+    at: String,
+    provider: Option<String>,
+    tool_mode: Option<RuntimeVirtualDialogToolMode>,
+    tool_calls: Option<Json<Value>>,
+}
+
+impl From<RuntimeVirtualDialogMessageData> for VirtualDialogMessage {
+    fn from(data: RuntimeVirtualDialogMessageData) -> Self {
+        Self {
+            message_id: data.message_id,
+            role: data.role,
+            text: data.text,
+            at: data.at,
+            provider: data.provider,
+            tool_mode: data.tool_mode,
+            tool_calls: data.tool_calls.map(Json),
+        }
+    }
+}
+
+#[derive(Clone, SimpleObject)]
+struct VirtualDialogDeleteResult {
+    found: bool,
+    deleted: bool,
+    history_deleted: i32,
+    taskman_deleted: i32,
+    llm_traces_deleted: i32,
+}
+
+impl From<RuntimeVirtualDialogDeleteResultData> for VirtualDialogDeleteResult {
+    fn from(data: RuntimeVirtualDialogDeleteResultData) -> Self {
+        Self {
+            found: data.found,
+            deleted: data.deleted,
+            history_deleted: data.history_deleted,
+            taskman_deleted: data.taskman_deleted,
+            llm_traces_deleted: data.llm_traces_deleted,
+        }
+    }
 }
 
 #[derive(Clone, SimpleObject)]
