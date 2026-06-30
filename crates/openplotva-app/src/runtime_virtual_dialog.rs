@@ -20,11 +20,11 @@ use openplotva_server::{
 };
 use openplotva_storage::{
     HistoryEntryUpsert, PostgresHistoryStore, PostgresRuntimeVirtualDialogStore,
-    PostgresVirtualMessageStore, RuntimeVirtualDialogDeleteReport, RuntimeVirtualDialogRecord,
+    PostgresVirtualMessageStore, RuntimeVirtualDialogDeleteReport,
+    RuntimeVirtualDialogMessageRecord, RuntimeVirtualDialogRecord,
 };
 use openplotva_taskman::DialogJobParams;
 use serde_json::{Value, json};
-use sqlx::{PgPool, Row, postgres::PgRow};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::watch;
 
@@ -237,17 +237,15 @@ impl RuntimeVirtualDialogExecutor {
             .map_err(|error| error.to_string())?;
         let raw_answer = dialog_jobs::dialog_job_answer(&output);
         let answer = dialog_jobs::prepare_dialog_chat_response(&raw_answer);
-        if !answer.is_empty() {
-            self.persist_model_message(
-                &record,
-                model_message_id,
-                &answer,
-                &output.provider,
-                request.tool_mode,
-                now,
-            )
-            .await?;
-        }
+        self.persist_model_message(
+            &record,
+            model_message_id,
+            &answer,
+            &output.provider,
+            request.tool_mode,
+            now,
+        )
+        .await?;
         self.store
             .touch_session(&request.session_id, now)
             .await
@@ -269,7 +267,9 @@ impl RuntimeVirtualDialogExecutor {
         session_id: &str,
     ) -> Result<RuntimeVirtualDialogDeleteResultData, String> {
         let now = OffsetDateTime::now_utc();
-        let existing = load_virtual_dialog_record(self.store.pool(), session_id)
+        let existing = self
+            .store
+            .session_record(session_id)
             .await
             .map_err(|error| error.to_string())?;
         let mut live_taskman_deleted = 0;
@@ -302,7 +302,9 @@ impl RuntimeVirtualDialogExecutor {
         session_id: &str,
         now: OffsetDateTime,
     ) -> Result<Option<RuntimeVirtualDialogRecord>, String> {
-        let Some(record) = load_virtual_dialog_record(self.store.pool(), session_id)
+        let Some(record) = self
+            .store
+            .session_record(session_id)
             .await
             .map_err(|error| error.to_string())?
         else {
@@ -328,7 +330,12 @@ impl RuntimeVirtualDialogExecutor {
         &self,
         record: RuntimeVirtualDialogRecord,
     ) -> Result<RuntimeVirtualDialogData, String> {
-        let messages = load_dialog_messages(self.history.pool(), &record, self.bot.id).await?;
+        let messages = self
+            .store
+            .dialog_messages(record.chat_id, RUNTIME_VIRTUAL_DIALOG_MESSAGES_QUERY_LIMIT)
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|records| dialog_message_data_from_records(records, self.bot.id))?;
         Ok(RuntimeVirtualDialogData {
             session_id: record.session_id,
             chat_id: record.chat_id,
@@ -593,7 +600,7 @@ pub(crate) async fn run_runtime_virtual_dialog_cleanup_worker_until(
         tokio::select! {
             _ = ticker.tick() => {
                 let now = OffsetDateTime::now_utc();
-                match load_expired_virtual_dialog_records(store.pool(), now).await {
+                match store.expired_sessions(now).await {
                     Ok(records) => {
                         for record in &records {
                             let _ = cleanup_runtime_virtual_live_artifacts(record, &taskman, &llm_trace_buffer);
@@ -640,98 +647,30 @@ fn cleanup_runtime_virtual_live_artifacts(
     }
 }
 
-async fn load_virtual_dialog_record(
-    pool: &PgPool,
-    session_id: &str,
-) -> Result<Option<RuntimeVirtualDialogRecord>, sqlx::Error> {
-    let row = sqlx::query(
-        "SELECT * FROM runtime_virtual_dialogs WHERE session_id = $1 AND deleted_at IS NULL",
-    )
-    .bind(session_id)
-    .fetch_optional(pool)
-    .await?;
-    row.map(runtime_virtual_dialog_record_from_row).transpose()
-}
-
-async fn load_expired_virtual_dialog_records(
-    pool: &PgPool,
-    now: OffsetDateTime,
-) -> Result<Vec<RuntimeVirtualDialogRecord>, sqlx::Error> {
-    let rows = sqlx::query(
-        "SELECT * FROM runtime_virtual_dialogs WHERE deleted_at IS NULL AND expires_at <= $1 ORDER BY expires_at ASC",
-    )
-    .bind(now)
-    .fetch_all(pool)
-    .await?;
-    rows.into_iter()
-        .map(runtime_virtual_dialog_record_from_row)
-        .collect()
-}
-
-fn runtime_virtual_dialog_record_from_row(
-    row: PgRow,
-) -> Result<RuntimeVirtualDialogRecord, sqlx::Error> {
-    Ok(RuntimeVirtualDialogRecord {
-        session_id: row.try_get("session_id")?,
-        chat_id: row.try_get("chat_id")?,
-        user_id: row.try_get("user_id")?,
-        next_message_id: row.try_get("next_message_id")?,
-        last_activity_at: row.try_get("last_activity_at")?,
-        expires_at: row.try_get("expires_at")?,
-        deleted_at: row.try_get("deleted_at")?,
-        created_at: row.try_get("created_at")?,
-        updated_at: row.try_get("updated_at")?,
-    })
-}
-
-async fn load_dialog_messages(
-    pool: &PgPool,
-    record: &RuntimeVirtualDialogRecord,
+fn dialog_message_data_from_records(
+    records: Vec<RuntimeVirtualDialogMessageRecord>,
     bot_id: i64,
 ) -> Result<Vec<RuntimeVirtualDialogMessageData>, String> {
-    let rows = sqlx::query(
-        r#"
-SELECT message_id, role, occurred_at, payload::text AS payload
-FROM chat_history_entries
-WHERE chat_id = $1
-ORDER BY occurred_at ASC,
-         message_id ASC,
-         CASE kind WHEN 'text' THEN 1 WHEN 'tool_request' THEN 2 WHEN 'tool_response' THEN 3 ELSE 4 END ASC,
-         entry_id ASC
-LIMIT $2"#,
-    )
-    .bind(record.chat_id)
-    .bind(RUNTIME_VIRTUAL_DIALOG_MESSAGES_QUERY_LIMIT)
-    .fetch_all(pool)
-    .await
-    .map_err(|error| error.to_string())?;
-
-    rows.into_iter()
-        .map(|row| {
-            let message_id: i32 = row
-                .try_get("message_id")
-                .map_err(|error| error.to_string())?;
-            let stored_role: String = row.try_get("role").map_err(|error| error.to_string())?;
-            let occurred_at: OffsetDateTime = row
-                .try_get("occurred_at")
-                .map_err(|error| error.to_string())?;
-            let payload: String = row.try_get("payload").map_err(|error| error.to_string())?;
-            let value: Value = serde_json::from_str(&payload).map_err(|error| error.to_string())?;
-            let role = virtual_message_role(&value, &stored_role, bot_id);
+    records
+        .into_iter()
+        .map(|record| {
+            let role = virtual_message_role(&record.payload, &record.role, bot_id);
             Ok(RuntimeVirtualDialogMessageData {
-                message_id,
+                message_id: record.message_id,
                 role,
-                text: string_value(&value, "text"),
-                at: format_time(occurred_at),
-                provider: value
+                text: string_value(&record.payload, "text"),
+                at: format_time(record.occurred_at),
+                provider: record
+                    .payload
                     .get("provider")
                     .and_then(Value::as_str)
                     .map(str::to_owned),
-                tool_mode: value
+                tool_mode: record
+                    .payload
                     .get("tool_mode")
                     .and_then(Value::as_str)
                     .and_then(parse_tool_mode),
-                tool_calls: payload_tool_calls(&value),
+                tool_calls: payload_tool_calls(&record.payload),
             })
         })
         .collect()
@@ -941,6 +880,55 @@ mod tests {
             .expect_err("unconfigured handle should error");
 
         assert_eq!(error, "runtime virtual dialog manager is not configured");
+    }
+
+    #[test]
+    fn runtime_virtual_dialog_message_records_keep_empty_model_turns() {
+        let at = OffsetDateTime::UNIX_EPOCH;
+        let dialog = RuntimeVirtualDialogRecord {
+            session_id: "empty-model-turn".to_owned(),
+            chat_id: -9_100_000_000_001,
+            user_id: -9_200_000_000_001,
+            next_message_id: 3,
+            last_activity_at: at,
+            expires_at: at + time::Duration::hours(24),
+            deleted_at: None,
+            created_at: at,
+            updated_at: at,
+        };
+        let payload = history_text_payload(HistoryPayloadInput {
+            record: &dialog,
+            message_id: 2,
+            role: ROLE_MODEL,
+            sender_id: 42,
+            sender_name: "Plotva",
+            text: "",
+            at,
+            meta: ChatMessageMeta {
+                sender_type: SENDER_TYPE_USER.to_owned(),
+                sender_id: 42,
+                sender_name: "Plotva".to_owned(),
+                ..ChatMessageMeta::default()
+            },
+            provider: Some("test-provider"),
+            tool_mode: Some(RuntimeVirtualDialogToolMode::Safe),
+        });
+        let messages = dialog_message_data_from_records(
+            vec![RuntimeVirtualDialogMessageRecord {
+                message_id: 2,
+                role: ROLE_MODEL.to_owned(),
+                occurred_at: at,
+                payload,
+            }],
+            42,
+        )
+        .expect("empty model message should decode");
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message_id, 2);
+        assert_eq!(messages[0].role, ROLE_MODEL);
+        assert_eq!(messages[0].text, "");
+        assert_eq!(messages[0].provider.as_deref(), Some("test-provider"));
     }
 
     #[test]

@@ -594,9 +594,13 @@ pub const SQL_DELETE_RUNTIME_API_TOKENS_OLDER_THAN: &str =
     "DELETE FROM runtime_api_tokens WHERE created_at < $1";
 
 pub const RUNTIME_VIRTUAL_DIALOG_TTL: time::Duration = time::Duration::hours(24);
+pub const RUNTIME_VIRTUAL_DIALOG_CHAT_ID_BASE: i64 = -9_100_000_000_000;
+pub const RUNTIME_VIRTUAL_DIALOG_USER_ID_BASE: i64 = -9_200_000_000_000;
 
 pub const SQL_GET_RUNTIME_VIRTUAL_DIALOG: &str =
     "SELECT * FROM runtime_virtual_dialogs WHERE session_id = $1 AND deleted_at IS NULL";
+
+pub const SQL_LIST_EXPIRED_RUNTIME_VIRTUAL_DIALOGS: &str = "SELECT * FROM runtime_virtual_dialogs WHERE deleted_at IS NULL AND expires_at <= $1 ORDER BY expires_at ASC";
 
 pub const SQL_GET_RUNTIME_VIRTUAL_DIALOG_FOR_UPDATE: &str =
     "SELECT * FROM runtime_virtual_dialogs WHERE session_id = $1 FOR UPDATE";
@@ -645,6 +649,16 @@ SET last_activity_at = $2,
 WHERE session_id = $1
   AND deleted_at IS NULL
 RETURNING *"#;
+
+pub const SQL_LIST_RUNTIME_VIRTUAL_DIALOG_MESSAGES: &str = r#"
+SELECT message_id, role, occurred_at, payload::text AS payload
+FROM chat_history_entries
+WHERE chat_id = $1
+ORDER BY occurred_at ASC,
+         message_id ASC,
+         CASE kind WHEN 'text' THEN 1 WHEN 'tool_request' THEN 2 WHEN 'tool_response' THEN 3 ELSE 4 END ASC,
+         entry_id ASC
+LIMIT $2"#;
 
 pub const SQL_UPSERT_CHAT: &str = "INSERT INTO chats (id, type, title, username, first_name, last_name, is_forum, active_usernames, available_reactions, bio, has_private_forwards, has_restricted_voice_and_video_messages, join_to_send_messages, join_by_request, description, invite_link, pinned_message, permissions, slow_mode_delay, message_auto_delete_time, has_aggressive_anti_spam_enabled, has_hidden_members, has_protected_content, has_visible_history, sticker_set_name, can_set_sticker_set, linked_chat_id, location) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb, $10, $11, $12, $13, $14, $15, $16, $17::jsonb, $18::jsonb, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28::jsonb) ON CONFLICT (id) DO UPDATE SET type = COALESCE(EXCLUDED.type, chats.type), title = COALESCE(EXCLUDED.title, chats.title), username = COALESCE(EXCLUDED.username, chats.username), first_name = COALESCE(EXCLUDED.first_name, chats.first_name), last_name = COALESCE(EXCLUDED.last_name, chats.last_name), is_forum = COALESCE(EXCLUDED.is_forum, chats.is_forum), active_usernames = COALESCE(EXCLUDED.active_usernames, chats.active_usernames), available_reactions = COALESCE(EXCLUDED.available_reactions, chats.available_reactions), bio = COALESCE(EXCLUDED.bio, chats.bio), has_private_forwards = COALESCE(EXCLUDED.has_private_forwards, chats.has_private_forwards), has_restricted_voice_and_video_messages = COALESCE(EXCLUDED.has_restricted_voice_and_video_messages, chats.has_restricted_voice_and_video_messages), join_to_send_messages = COALESCE(EXCLUDED.join_to_send_messages, chats.join_to_send_messages), join_by_request = COALESCE(EXCLUDED.join_by_request, chats.join_by_request), description = COALESCE(EXCLUDED.description, chats.description), invite_link = COALESCE(EXCLUDED.invite_link, chats.invite_link), pinned_message = COALESCE(EXCLUDED.pinned_message, chats.pinned_message), permissions = COALESCE(EXCLUDED.permissions, chats.permissions), slow_mode_delay = COALESCE(EXCLUDED.slow_mode_delay, chats.slow_mode_delay), message_auto_delete_time = COALESCE(EXCLUDED.message_auto_delete_time, chats.message_auto_delete_time), has_aggressive_anti_spam_enabled = COALESCE(EXCLUDED.has_aggressive_anti_spam_enabled, chats.has_aggressive_anti_spam_enabled), has_hidden_members = COALESCE(EXCLUDED.has_hidden_members, chats.has_hidden_members), has_protected_content = COALESCE(EXCLUDED.has_protected_content, chats.has_protected_content), has_visible_history = COALESCE(EXCLUDED.has_visible_history, chats.has_visible_history), sticker_set_name = COALESCE(EXCLUDED.sticker_set_name, chats.sticker_set_name), can_set_sticker_set = COALESCE(EXCLUDED.can_set_sticker_set, chats.can_set_sticker_set), linked_chat_id = COALESCE(EXCLUDED.linked_chat_id, chats.linked_chat_id), location = COALESCE(EXCLUDED.location, chats.location), updated = CURRENT_TIMESTAMP";
 
@@ -2824,6 +2838,14 @@ pub struct RuntimeVirtualDialogRecord {
     pub updated_at: OffsetDateTime,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeVirtualDialogMessageRecord {
+    pub message_id: i32,
+    pub role: String,
+    pub occurred_at: OffsetDateTime,
+    pub payload: serde_json::Value,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RuntimeVirtualDialogDeleteReport {
     pub found: bool,
@@ -2912,19 +2934,25 @@ impl PostgresRuntimeVirtualDialogStore {
         &self.pool
     }
 
-    pub async fn session(
+    pub async fn session_record(
         &self,
         session_id: &str,
-        now: OffsetDateTime,
     ) -> Result<Option<RuntimeVirtualDialogRecord>, StorageError> {
         let row = sqlx::query(SQL_GET_RUNTIME_VIRTUAL_DIALOG)
             .bind(session_id)
             .fetch_optional(&self.pool)
             .await?;
-        let Some(row) = row else {
+        row.map(runtime_virtual_dialog_from_row).transpose()
+    }
+
+    pub async fn session(
+        &self,
+        session_id: &str,
+        now: OffsetDateTime,
+    ) -> Result<Option<RuntimeVirtualDialogRecord>, StorageError> {
+        let Some(record) = self.session_record(session_id).await? else {
             return Ok(None);
         };
-        let record = runtime_virtual_dialog_from_row(row)?;
         if record.expires_at <= now {
             let _ = self.delete_session(session_id, now).await?;
             return Ok(None);
@@ -3068,12 +3096,10 @@ impl PostgresRuntimeVirtualDialogStore {
     }
 
     pub async fn delete_expired_sessions(&self, now: OffsetDateTime) -> Result<i32, StorageError> {
-        let rows = sqlx::query(
-            "SELECT session_id FROM runtime_virtual_dialogs WHERE deleted_at IS NULL AND expires_at <= $1 ORDER BY expires_at ASC",
-        )
-        .bind(now)
-        .fetch_all(&self.pool)
-        .await?;
+        let rows = sqlx::query(SQL_LIST_EXPIRED_RUNTIME_VIRTUAL_DIALOGS)
+            .bind(now)
+            .fetch_all(&self.pool)
+            .await?;
         let mut deleted = 0;
         for row in rows {
             let session_id: String = row.try_get("session_id")?;
@@ -3083,6 +3109,34 @@ impl PostgresRuntimeVirtualDialogStore {
             }
         }
         Ok(deleted)
+    }
+
+    pub async fn expired_sessions(
+        &self,
+        now: OffsetDateTime,
+    ) -> Result<Vec<RuntimeVirtualDialogRecord>, StorageError> {
+        let rows = sqlx::query(SQL_LIST_EXPIRED_RUNTIME_VIRTUAL_DIALOGS)
+            .bind(now)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter()
+            .map(runtime_virtual_dialog_from_row)
+            .collect()
+    }
+
+    pub async fn dialog_messages(
+        &self,
+        chat_id: i64,
+        limit: i64,
+    ) -> Result<Vec<RuntimeVirtualDialogMessageRecord>, StorageError> {
+        let rows = sqlx::query(SQL_LIST_RUNTIME_VIRTUAL_DIALOG_MESSAGES)
+            .bind(chat_id)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter()
+            .map(runtime_virtual_dialog_message_from_row)
+            .collect()
     }
 }
 
@@ -7812,6 +7866,20 @@ fn runtime_virtual_dialog_from_row(row: PgRow) -> Result<RuntimeVirtualDialogRec
     })
 }
 
+fn runtime_virtual_dialog_message_from_row(
+    row: PgRow,
+) -> Result<RuntimeVirtualDialogMessageRecord, StorageError> {
+    let payload: String = row.try_get("payload")?;
+    let payload = serde_json::from_str(&payload)
+        .map_err(|source| StorageError::HistoryPayloadCodec { source })?;
+    Ok(RuntimeVirtualDialogMessageRecord {
+        message_id: row.try_get("message_id")?,
+        role: row.try_get("role")?,
+        occurred_at: row.try_get("occurred_at")?,
+        payload,
+    })
+}
+
 async fn next_runtime_virtual_dialog_id(
     tx: &mut Transaction<'_, Postgres>,
 ) -> Result<i64, StorageError> {
@@ -7854,6 +7922,19 @@ async fn cleanup_runtime_virtual_dialog_artifacts(
     .bind(user_id)
     .execute(&mut **tx)
     .await?;
+
+    if chat_id <= RUNTIME_VIRTUAL_DIALOG_CHAT_ID_BASE
+        && user_id <= RUNTIME_VIRTUAL_DIALOG_USER_ID_BASE
+    {
+        sqlx::query("DELETE FROM chats WHERE id = $1")
+            .bind(chat_id)
+            .execute(&mut **tx)
+            .await?;
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&mut **tx)
+            .await?;
+    }
 
     Ok(RuntimeVirtualDialogDeleteReport {
         found: true,
@@ -10966,6 +11047,29 @@ mod tests {
             assert_eq!(touched.last_activity_at, touched_at);
             assert_eq!(touched.expires_at, touched_at + super::RUNTIME_VIRTUAL_DIALOG_TTL);
 
+            let identity = super::PostgresVirtualMessageStore::new(pool.clone());
+            identity
+                .upsert_chat_state(&openplotva_core::ChatState::new(
+                    created.chat_id,
+                    "private",
+                    None,
+                    None,
+                    Some("Runtime Debug".to_owned()),
+                    None,
+                    Some(false),
+                ))
+                .await?;
+            identity
+                .upsert_user_state(&openplotva_core::UserState::new(
+                    created.user_id,
+                    "Runtime Debug".to_owned(),
+                    None,
+                    None,
+                    Some("en".to_owned()),
+                    Some(false),
+                ))
+                .await?;
+
             let history = super::PostgresHistoryStore::new(pool.clone());
             let payload = serde_json::json!({
                 "entry_id": "msg:1",
@@ -11018,14 +11122,59 @@ mod tests {
             assert_eq!(deleted.taskman_deleted, 1);
             assert_eq!(deleted.llm_traces_deleted, 1);
             assert!(store.session(&session_id, now).await?.is_none());
+            let deleted_chat_count: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM chats WHERE id = $1")
+                    .bind(created.chat_id)
+                    .fetch_one(&pool)
+                    .await?;
+            let deleted_user_count: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM users WHERE id = $1")
+                    .bind(created.user_id)
+                    .fetch_one(&pool)
+                    .await?;
+            assert_eq!(deleted_chat_count, 0);
+            assert_eq!(deleted_user_count, 0);
 
             let recreated = store.start_session(&session_id, true, now).await?;
             assert_ne!(recreated.chat_id, created.chat_id);
+            identity
+                .upsert_chat_state(&openplotva_core::ChatState::new(
+                    recreated.chat_id,
+                    "private",
+                    None,
+                    None,
+                    Some("Runtime Debug".to_owned()),
+                    None,
+                    Some(false),
+                ))
+                .await?;
+            identity
+                .upsert_user_state(&openplotva_core::UserState::new(
+                    recreated.user_id,
+                    "Runtime Debug".to_owned(),
+                    None,
+                    None,
+                    Some("en".to_owned()),
+                    Some(false),
+                ))
+                .await?;
 
             let expired_at = now + super::RUNTIME_VIRTUAL_DIALOG_TTL + time::Duration::seconds(1);
             let cleaned = store.delete_expired_sessions(expired_at).await?;
             assert_eq!(cleaned, 1);
             assert!(store.session(&session_id, expired_at).await?.is_none());
+            let expired_chat_count: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM chats WHERE id = $1")
+                    .bind(recreated.chat_id)
+                    .fetch_one(&pool)
+                    .await?;
+            let expired_user_count: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM users WHERE id = $1")
+                    .bind(recreated.user_id)
+                    .fetch_one(&pool)
+                    .await?;
+            assert_eq!(expired_chat_count, 0);
+            assert_eq!(expired_user_count, 0);
 
             Ok(())
         }
