@@ -690,11 +690,11 @@ where
         let answer = final_text.answer;
         if answer.trim().is_empty() {
             if has_leading_context_message(&final_text.content) {
-                return Ok(DialogOutput {
-                    provider: PROVIDER_GENKIT.to_owned(),
-                    tool_calls: state.tool_calls.clone(),
-                    ..DialogOutput::default()
-                });
+                return Err(Box::new(ProviderError::new(
+                    PROVIDER_GENKIT,
+                    FailureReason::ProviderProtocolError,
+                    "chat completion returned only copied context messages",
+                )));
             }
             return Err(Box::new(ProviderError::new(
                 PROVIDER_GENKIT,
@@ -3933,7 +3933,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gemini_dialog_provider_suppresses_leading_context_leak_like_go()
+    async fn gemini_dialog_provider_treats_leading_context_leak_as_retryable_protocol_error()
     -> Result<(), ChatProviderError> {
         let leaked_context = "<assistant_message id=\"99\">old answer</assistant_message>";
         let transport = FakeTransport::new(vec![Ok(json_response(json!({
@@ -3953,10 +3953,16 @@ mod tests {
             transport.clone(),
         );
 
-        let output = provider.run_dialog(sample_input()).await?;
+        let error = provider
+            .run_dialog(sample_input())
+            .await
+            .expect_err("context leak should fail loudly");
 
-        assert_eq!(output.answer, "");
-        assert_eq!(output.response, "");
+        assert_eq!(
+            retryable_reason(error.as_ref()),
+            Some(FailureReason::ProviderProtocolError)
+        );
+        assert!(error.to_string().contains("copied context"));
         assert_eq!(transport.state().requests.len(), 1);
         Ok(())
     }
