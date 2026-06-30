@@ -441,6 +441,7 @@ pub async fn backfill_vram_cloud_from_env(
 }
 
 const GPU_BACKFILL_KEY: &str = "llm.routing.gpu_backfilled";
+const DIALOG_QWEN_FALLBACK_KEY: &str = "llm.routing.dialog_qwen_fallback";
 
 /// Provider name for a discovery service: the default dialog service stays on the
 /// existing `aifarm` provider; other services (the GPU2 llama.cpp Qwen multiserver)
@@ -595,6 +596,84 @@ pub async fn backfill_gpu_models(pool: &PgPool, config: &AppConfig) -> Result<bo
 
     mark_app_setting(pool, GPU_BACKFILL_KEY).await?;
     tracing::info!("backfilled GPU Qwen models and repointed config-only workflows");
+    Ok(true)
+}
+
+/// Add the GPU2 Qwen reasoner as an ordered dialog fallback. The route can then
+/// use a live local chat/tools model before probing dead external primaries.
+pub async fn backfill_dialog_qwen_fallback(
+    pool: &PgPool,
+    config: &AppConfig,
+) -> Result<bool, StorageError> {
+    if app_setting_present(pool, DIALOG_QWEN_FALLBACK_KEY).await? {
+        return Ok(false);
+    }
+
+    let reasoner = crate::agent_runtime::qwen_reasoner_named_provider_config(config);
+    if reasoner.discovery_service_name.trim().is_empty() || reasoner.model.trim().is_empty() {
+        return Ok(false);
+    }
+
+    let mut providers = list_providers(pool).await?;
+    let mut models = list_models(pool).await?;
+    let mut assignments = list_assignments(pool).await?;
+    let provider_name = gpu_provider_name(&reasoner.discovery_service_name, config);
+    if provider_name == "aifarm" {
+        return Ok(false);
+    }
+
+    let provider_id = ensure_provider(
+        pool,
+        &mut providers,
+        ProviderInput {
+            name: provider_name,
+            kind: "chat".to_owned(),
+            endpoint: None,
+            discovery_service_name: Some(reasoner.discovery_service_name),
+            discovery_endpoint_name: Some(reasoner.discovery_endpoint_name),
+            api_key_ref: Some("DIALOG_API_KEY".to_owned()),
+            api_key_encrypted: None,
+            enabled: true,
+            config: json!({}),
+        },
+    )
+    .await?;
+    let model_id = ensure_model(
+        pool,
+        &mut models,
+        ModelInput {
+            provider_id,
+            model_name: reasoner.model,
+            display_name: None,
+            base_url: None,
+            capabilities: vec!["chat".to_owned(), "tools".to_owned()],
+            embedding_dim: None,
+            enabled: true,
+            config: json!({}),
+        },
+    )
+    .await?;
+    ensure_assignment(
+        pool,
+        &mut assignments,
+        AssignmentInput {
+            workflow_key: "dialog".to_owned(),
+            scope: "global".to_owned(),
+            role: "fallback".to_owned(),
+            provider_model_id: model_id,
+            weight: None,
+            fallback_order: Some(1),
+            canary_percent: None,
+            enabled: true,
+            inference_overrides: json!({}),
+            cb_failure_threshold: 5,
+            cb_cooldown_ms: 30_000,
+        },
+    )
+    .await?;
+
+    mark_app_setting(pool, DIALOG_QWEN_FALLBACK_KEY).await?;
+    tracing::info!("backfilled dialog GPU Qwen fallback");
     Ok(true)
 }
 

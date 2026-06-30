@@ -24,8 +24,8 @@ use openplotva_llm::{
 use thiserror::Error;
 
 use crate::media::{
-    aifarm_dialog_config_from_app_config, nvidia_dialog_config_from_app_config,
-    vmlx_dialog_config_from_app_config,
+    agent_client_config_from_named_provider, aifarm_dialog_config_from_app_config,
+    nvidia_dialog_config_from_app_config, vmlx_dialog_config_from_app_config,
 };
 use crate::routed_attempts::{RoutedAttemptRunError, RoutedAttemptWalker, RoutedRequestContext};
 use crate::runtime_gemini_cache::resolve_google_ai_key;
@@ -171,6 +171,9 @@ pub fn router_dialog_provider(
     if let Some(vram_cloud) = vram_cloud_dialog_provider(config, Arc::clone(&toolbox)) {
         clients.insert(VRAM_CLOUD_PROVIDER_NAME.to_owned(), vram_cloud);
     }
+    if let Some(qwen_reasoner) = qwen_reasoner_dialog_provider(config, Arc::clone(&toolbox)) {
+        clients.insert(qwen_reasoner.provider_name().to_owned(), qwen_reasoner);
+    }
 
     let provider = RouterChatProvider::new(handle, breakers, triggers, clients, aifarm);
     let provider = match routing_events {
@@ -205,6 +208,49 @@ fn vram_cloud_dialog_provider(
     Some(Arc::new(
         AifarmDialogProvider::new(cfg).with_toolbox(toolbox),
     ))
+}
+
+fn qwen_reasoner_dialog_provider(
+    config: &AppConfig,
+    toolbox: Arc<dyn DialogToolbox>,
+) -> Option<DialogProviderHandle> {
+    let cfg = qwen_reasoner_dialog_config_from_app_config(config);
+    if cfg.provider_name.eq_ignore_ascii_case(PROVIDER_AIFARM) {
+        return None;
+    }
+    Some(Arc::new(
+        AifarmDialogProvider::new(cfg).with_toolbox(toolbox),
+    ))
+}
+
+fn qwen_reasoner_dialog_config_from_app_config(config: &AppConfig) -> AifarmDialogConfig {
+    let spec = crate::agent_runtime::qwen_reasoner_named_provider_config(config);
+    let mut cfg = aifarm_dialog_config_from_app_config(config);
+    cfg.provider_name = aifarm_discovery_provider_name(&spec.discovery_service_name, config);
+    cfg.client = agent_client_config_from_named_provider(config, &spec);
+    if cfg.client.api_key.trim().is_empty() {
+        cfg.client.api_key = config.llm.dialog.api_key.clone();
+    }
+    cfg.model = spec.model.clone();
+    cfg.max_tokens = spec.max_tokens;
+    cfg.temperature = spec.temperature;
+    cfg.use_tool_calls = Some(true);
+    cfg.enable_thinking = spec.enable_thinking;
+    cfg.include_reasoning = spec.include_reasoning.or(Some(false));
+    cfg.with_defaults()
+}
+
+fn aifarm_discovery_provider_name(service: &str, config: &AppConfig) -> String {
+    let service = service.trim();
+    if service.is_empty() || service == config.llm.dialog.discovery_service_name {
+        return PROVIDER_AIFARM.to_owned();
+    }
+    format!(
+        "aifarm-{}",
+        service
+            .trim_start_matches("llm-openai-")
+            .trim_start_matches("llm-")
+    )
 }
 
 /// Error returned while building the configured dialog provider.
@@ -558,6 +604,21 @@ mod tests {
         let provider = dialog_provider_from_app_config(&config, toolbox).expect("provider");
 
         assert_eq!(provider.provider_name(), PROVIDER_GENKIT);
+    }
+
+    #[test]
+    fn qwen_reasoner_dialog_config_targets_gpu_discovery_service_with_tools() {
+        let config = AppConfig::from_raw(openplotva_config::RawConfig::default()).expect("config");
+
+        let cfg = qwen_reasoner_dialog_config_from_app_config(&config);
+
+        assert_eq!(cfg.provider_name, "aifarm-qwen27b-gguf");
+        assert_eq!(cfg.client.service_name, "llm-openai-qwen27b-gguf");
+        assert_eq!(cfg.client.endpoint_name, "chat_completions");
+        assert_eq!(cfg.model, "qwen3.6-27b-moq");
+        assert_eq!(cfg.client.default_model, "qwen3.6-27b-moq");
+        assert_eq!(cfg.use_tool_calls, Some(true));
+        assert_eq!(cfg.include_reasoning, Some(false));
     }
 
     #[test]
