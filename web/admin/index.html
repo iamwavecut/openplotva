@@ -89,9 +89,9 @@
                     aria-label="Toggle navigation">Menu</pl-button>
                 <div id="page-title" class="page-title">Dashboard</div>
                 <div class="header-right">
-                    <button type="button" class="cmd-trigger" data-action="openPalette" aria-label="Search and commands">
+                    <pl-button class="cmd-trigger" data-action="openPalette" aria-label="Search and commands">
                         <i class="ti ti-search" aria-hidden="true"></i><span class="cmd-trigger-text">Search</span><span class="cmd-kbd">⌘K</span>
-                    </button>
+                    </pl-button>
                     <div class="user-info text-muted">Administrator</div>
                 </div>
             </header>
@@ -4567,7 +4567,7 @@
                 overlay.hidden = true;
                 overlay.innerHTML = '<div class="cmd-panel" role="dialog" aria-modal="true" aria-label="Command palette">'
                     + '<div class="cmd-head"><i class="ti ti-search" aria-hidden="true"></i>'
-                    + '<input class="cmd-input" type="text" placeholder="Search pages and actions…" aria-label="Command palette">'
+                    + '<pl-input class="cmd-input" type="text" placeholder="Search pages and actions…" aria-label="Command palette"></pl-input>'
                     + '<span class="cmd-kbd">ESC</span></div>'
                     + '<div class="cmd-list" role="listbox"></div></div>';
                 document.body.appendChild(overlay);
@@ -4601,8 +4601,8 @@
                 list.innerHTML = '';
                 if (!filtered.length) { const e = document.createElement('div'); e.className = 'cmd-empty'; e.textContent = 'No matches.'; list.appendChild(e); return; }
                 filtered.forEach(function (c, i) {
-                    const b = document.createElement('button');
-                    b.type = 'button'; b.className = 'cmd-item' + (i === idx ? ' active' : ''); b.setAttribute('role', 'option');
+                    const b = document.createElement('pl-button');
+                    b.className = 'cmd-item' + (i === idx ? ' active' : ''); b.setAttribute('role', 'option');
                     const ic = document.createElement('i'); ic.className = 'ti ' + c.icon; ic.setAttribute('aria-hidden', 'true');
                     const lab = document.createElement('span'); lab.className = 'cmd-item-label'; lab.textContent = c.label;
                     const grp = document.createElement('span'); grp.className = 'cmd-item-group'; grp.textContent = c.group;
