@@ -10738,10 +10738,18 @@ async fn start_runtime_workers(
         image_attempt_walker.clone(),
         image_jobs::aifarm_draw_api_config_from_app_config(config),
     );
+    let boogu_image_provider = image_jobs::BooguGradioImageClient::new(
+        image_jobs::boogu_gradio_image_config_from_app_config(config),
+        image_jobs::boogu_gradio_edit_config_from_app_config(config),
+        vision_data_urls.clone(),
+    );
     let vip_image_generator = image_jobs::OptimizingImageGenerator::new(
-        image_jobs::SequentialImageGenerator::new(
-            routed_vip_image_generator.clone(),
-            routed_vip_image_generator,
+        image_jobs::ParallelImageGenerator::new(
+            image_jobs::SequentialImageGenerator::new(
+                routed_vip_image_generator.clone(),
+                routed_vip_image_generator,
+            ),
+            boogu_image_provider.clone(),
         ),
         media_prompt_optimizer.clone(),
     );
@@ -10775,10 +10783,13 @@ async fn start_runtime_workers(
 
     let vip_image_edit_queue = Arc::clone(&task_queue_for_updates);
     let vip_image_edit_provider = image_jobs::OptimizingImageEditor::new(
-        image_jobs::RoutedImageEditor::new(
-            image_attempt_walker.clone(),
-            vision_data_urls.clone(),
-            image_jobs::aifarm_draw_api_config_from_app_config(config),
+        image_jobs::ParallelImageEditor::new(
+            image_jobs::RoutedImageEditor::new(
+                image_attempt_walker.clone(),
+                vision_data_urls.clone(),
+                image_jobs::aifarm_draw_api_config_from_app_config(config),
+            ),
+            boogu_image_provider,
         ),
         media_prompt_optimizer.clone(),
     );
@@ -10837,7 +10848,7 @@ async fn start_runtime_workers(
     workers.handles.push(regular_image_worker);
     readiness_checks.push(ReadinessCheck::ok(
         "image_jobs",
-        "Image taskman workers started for VIP generation/edit and regular generation queues with draw-api providers",
+        "Image taskman workers started for VIP generation/edit and regular generation queues with draw-api providers and optional Boogu add-ons",
     ));
     for queue_name in image_jobs::IMAGE_VIP_JOB_WORKER_QUEUES {
         shared_taskman_worker_counts

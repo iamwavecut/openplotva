@@ -32,9 +32,9 @@ use openplotva_telegram::{
     TelegramOutboundResponse, build_delete_message_method, ensure_telegram_safe_text,
     escape_telegram_html_text, execute_telegram_method, strip_telegram_html,
 };
-use rand::RngExt;
+use rand::{Rng, RngExt};
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 use time::OffsetDateTime;
 use tokio::time::Instant;
 
@@ -76,6 +76,7 @@ pub const IMAGE_EDIT_WORKFLOW_KEY: &str = "image_edit";
 pub const IMAGE_GENERATION_WORKFLOW_KEY: &str = "image_generation";
 pub const DRAW_SUPPORT_ME_URL: &str = "https://t.me/PlotvoBot?start=donate";
 pub const DRAW_VIP_URL: &str = "https://t.me/PlotvoBot?start=vip";
+pub const BOOGU_GRADIO_RESOLUTION_MODE: &str = "Recommended resolutions";
 
 const IMAGE_REGULAR_WORKER_ID: &str = "image-regular-worker";
 const IMAGE_VIP_WORKER_ID: &str = "image-vip-worker";
@@ -83,6 +84,10 @@ const TELEGRAM_MEDIA_GROUP_MAX_ITEMS: usize = 10;
 const DRAW_CAPTION_WORD_THRESHOLD: usize = 25;
 const TELEGRAM_CAPTION_MAX_VISIBLE: usize = 1024;
 const DRAW_CAPTION_ELLIPSIS: &str = "…";
+const BOOGU_GRADIO_FN_INDEX: i32 = 2;
+const BOOGU_GRADIO_DEFAULT_SEED: i64 = 42;
+const BOOGU_GRADIO_USER_AGENT: &str =
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) OpenPlotva/1.0";
 const IMAGE_SUPPORT_PHRASES: [&str; 15] = [
     "автору на вдохновение ✨",
     "Плотва в долгу ❤️",
@@ -272,6 +277,388 @@ pub fn aifarm_draw_api_config_from_app_config(config: &AppConfig) -> AifarmDrawA
         ..AifarmDrawApiConfig::default()
     }
     .with_defaults()
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BooguGradioImageConfig {
+    pub enabled: bool,
+    pub base_url: String,
+    pub timeout: StdDuration,
+    pub steps: i32,
+    pub resolution: String,
+    pub width: i32,
+    pub height: i32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BooguGradioEditConfig {
+    pub enabled: bool,
+    pub base_url: String,
+    pub timeout: StdDuration,
+    pub steps: i32,
+    pub resolution_category: String,
+    pub resolution: String,
+    pub width: i32,
+    pub height: i32,
+}
+
+#[must_use]
+pub fn boogu_gradio_image_config_from_app_config(config: &AppConfig) -> BooguGradioImageConfig {
+    let provider = &config.image_providers.boogu_turbo;
+    BooguGradioImageConfig {
+        enabled: provider.enabled,
+        base_url: provider.base_url.clone(),
+        timeout: StdDuration::from_secs(provider.timeout_seconds.max(1) as u64),
+        steps: provider.steps.max(1),
+        resolution: provider.resolution.clone(),
+        width: provider.width.max(1),
+        height: provider.height.max(1),
+    }
+}
+
+#[must_use]
+pub fn boogu_gradio_edit_config_from_app_config(config: &AppConfig) -> BooguGradioEditConfig {
+    let provider = &config.image_providers.boogu_edit_turbo;
+    BooguGradioEditConfig {
+        enabled: provider.enabled,
+        base_url: provider.base_url.clone(),
+        timeout: StdDuration::from_secs(provider.timeout_seconds.max(1) as u64),
+        steps: provider.steps.max(1),
+        resolution_category: provider.resolution_category.clone(),
+        resolution: provider.resolution.clone(),
+        width: provider.width.max(1),
+        height: provider.height.max(1),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BooguHttpMethod {
+    Get,
+    Post,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BooguHttpRequest {
+    pub method: BooguHttpMethod,
+    pub url: String,
+    pub headers: BTreeMap<String, String>,
+    pub body: Vec<u8>,
+    pub timeout: StdDuration,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct BooguHttpResponse {
+    pub status_code: u16,
+    pub body: Vec<u8>,
+}
+
+pub type BooguHttpFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<BooguHttpResponse, String>> + Send + 'a>>;
+
+pub trait BooguHttpTransport: Send + Sync {
+    fn send<'a>(&'a self, request: BooguHttpRequest) -> BooguHttpFuture<'a>;
+}
+
+#[derive(Clone, Debug)]
+pub struct ReqwestBooguTransport {
+    client: reqwest::Client,
+}
+
+impl Default for ReqwestBooguTransport {
+    fn default() -> Self {
+        Self {
+            client: reqwest::Client::new(),
+        }
+    }
+}
+
+impl BooguHttpTransport for ReqwestBooguTransport {
+    fn send<'a>(&'a self, request: BooguHttpRequest) -> BooguHttpFuture<'a> {
+        Box::pin(async move {
+            let method = match request.method {
+                BooguHttpMethod::Get => reqwest::Method::GET,
+                BooguHttpMethod::Post => reqwest::Method::POST,
+            };
+            let mut builder = self
+                .client
+                .request(method, &request.url)
+                .timeout(request.timeout);
+            for (name, value) in &request.headers {
+                builder = builder.header(name, value);
+            }
+            if !request.body.is_empty() {
+                builder = builder.body(request.body);
+            }
+            let response = builder
+                .send()
+                .await
+                .map_err(|error| format!("request failed: {error}"))?;
+            let status_code = response.status().as_u16();
+            let body = response
+                .bytes()
+                .await
+                .map_err(|error| format!("read response body: {error}"))?
+                .to_vec();
+            Ok(BooguHttpResponse { status_code, body })
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct BooguGradioImageClient<DataUrl, Transport = ReqwestBooguTransport> {
+    image_config: BooguGradioImageConfig,
+    edit_config: BooguGradioEditConfig,
+    data_urls: DataUrl,
+    transport: Transport,
+}
+
+impl<DataUrl, Transport> fmt::Debug for BooguGradioImageClient<DataUrl, Transport>
+where
+    DataUrl: fmt::Debug,
+    Transport: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BooguGradioImageClient")
+            .field("image_config", &self.image_config)
+            .field("edit_config", &self.edit_config)
+            .field("data_urls", &self.data_urls)
+            .field("transport", &self.transport)
+            .finish()
+    }
+}
+
+impl<DataUrl> BooguGradioImageClient<DataUrl, ReqwestBooguTransport> {
+    #[must_use]
+    pub fn new(
+        image_config: BooguGradioImageConfig,
+        edit_config: BooguGradioEditConfig,
+        data_urls: DataUrl,
+    ) -> Self {
+        Self::with_transport(
+            image_config,
+            edit_config,
+            data_urls,
+            ReqwestBooguTransport::default(),
+        )
+    }
+}
+
+impl<DataUrl, Transport> BooguGradioImageClient<DataUrl, Transport>
+where
+    Transport: BooguHttpTransport,
+{
+    #[must_use]
+    pub fn with_transport(
+        image_config: BooguGradioImageConfig,
+        edit_config: BooguGradioEditConfig,
+        data_urls: DataUrl,
+        transport: Transport,
+    ) -> Self {
+        Self {
+            image_config,
+            edit_config,
+            data_urls,
+            transport,
+        }
+    }
+
+    pub async fn generate_image_with_session_hash(
+        &self,
+        request: ImageGenerationRequest,
+        session_hash: &str,
+    ) -> Result<ImageGenerationResult, ImageGenerationError> {
+        let config = &self.image_config;
+        if !config.enabled {
+            return Ok(ImageGenerationResult::default());
+        }
+        let prompt = boogu_generation_prompt(&request);
+        if prompt.trim().is_empty() {
+            return Ok(ImageGenerationResult::default());
+        }
+        let (seed, randomize_seed) = boogu_generation_seed(&request.seed);
+        let session_hash =
+            non_empty(session_hash.to_owned()).unwrap_or_else(generated_boogu_session_hash);
+        let payload = json!({
+            "fn_index": BOOGU_GRADIO_FN_INDEX,
+            "data": [
+                prompt,
+                seed,
+                randomize_seed,
+                false,
+                BOOGU_GRADIO_RESOLUTION_MODE,
+                config.resolution,
+                config.width,
+                config.height,
+                config.steps,
+                null
+            ],
+            "session_hash": session_hash
+        });
+        let image_url = self
+            .run_gradio_queue(&config.base_url, config.timeout, &session_hash, payload)
+            .await
+            .map_err(|error| ImageGenerationError::Provider(format!("boogu provider {error}")))?;
+        Ok(ImageGenerationResult {
+            image_url: image_url.clone(),
+            image_urls: vec![image_url],
+            image_bytes: Vec::new(),
+        })
+    }
+
+    async fn run_gradio_queue(
+        &self,
+        base_url: &str,
+        timeout: StdDuration,
+        session_hash: &str,
+        payload: Value,
+    ) -> Result<String, String> {
+        let join_url = boogu_endpoint(base_url, "/gradio_api/queue/join")?;
+        let body = serde_json::to_vec(&payload).map_err(|error| error.to_string())?;
+        let join_response = self
+            .transport
+            .send(BooguHttpRequest {
+                method: BooguHttpMethod::Post,
+                url: join_url,
+                headers: boogu_headers(base_url, Some("application/json"), None)?,
+                body,
+                timeout,
+            })
+            .await?;
+        if !(200..300).contains(&join_response.status_code) {
+            return Err(boogu_http_status_error(
+                "join",
+                join_response.status_code,
+                &join_response.body,
+            ));
+        }
+        let join_payload = serde_json::from_slice::<Value>(&join_response.body)
+            .map_err(|error| format!("decode join response: {error}"))?;
+        let _event_id = join_payload
+            .get("event_id")
+            .and_then(Value::as_str)
+            .and_then(|value| non_empty(value.to_owned()))
+            .ok_or_else(|| "join response did not include event_id".to_owned())?;
+
+        let data_url = boogu_queue_data_url(base_url, session_hash)?;
+        let data_response = self
+            .transport
+            .send(BooguHttpRequest {
+                method: BooguHttpMethod::Get,
+                url: data_url,
+                headers: boogu_headers(base_url, None, Some("text/event-stream"))?,
+                body: Vec::new(),
+                timeout,
+            })
+            .await?;
+        if !(200..300).contains(&data_response.status_code) {
+            return Err(boogu_http_status_error(
+                "queue data",
+                data_response.status_code,
+                &data_response.body,
+            ));
+        }
+        let data_text = String::from_utf8_lossy(&data_response.body);
+        parse_boogu_completed_url(&data_text)
+    }
+}
+
+impl<DataUrl, Transport> ImageGenerator for BooguGradioImageClient<DataUrl, Transport>
+where
+    DataUrl: Send + Sync,
+    Transport: BooguHttpTransport,
+{
+    fn expected_image_count(&self) -> usize {
+        usize::from(self.image_config.enabled)
+    }
+
+    fn generate_image<'a>(&'a self, request: ImageGenerationRequest) -> ImageGenerationFuture<'a> {
+        Box::pin(async move {
+            self.generate_image_with_session_hash(request, &generated_boogu_session_hash())
+                .await
+        })
+    }
+}
+
+impl<DataUrl, Transport> BooguGradioImageClient<DataUrl, Transport>
+where
+    DataUrl: TelegramVisionDataUrlProvider + Send + Sync,
+    DataUrl::Error: fmt::Display,
+    Transport: BooguHttpTransport,
+{
+    pub async fn edit_image_with_session_hash(
+        &self,
+        request: ImageEditRequest,
+        session_hash: &str,
+    ) -> Result<ImageEditResult, ImageEditError> {
+        let config = &self.edit_config;
+        if !config.enabled {
+            return Ok(ImageEditResult::default());
+        }
+        let prompt = request.prompt.trim().to_owned();
+        if prompt.is_empty() {
+            return Err(ImageEditError::Provider(
+                "boogu provider image edit prompt is empty".to_owned(),
+            ));
+        }
+        let photo_file_id = request.photo_file_id.trim();
+        if photo_file_id.is_empty() {
+            return Err(ImageEditError::Provider(
+                "boogu provider image edit requires Telegram file_id".to_owned(),
+            ));
+        }
+        let data_url = self
+            .data_urls
+            .telegram_file_data_url(photo_file_id)
+            .await
+            .map_err(|error| ImageEditError::Provider(format!("boogu provider {error}")))?;
+        let session_hash =
+            non_empty(session_hash.to_owned()).unwrap_or_else(generated_boogu_session_hash);
+        let payload = json!({
+            "fn_index": BOOGU_GRADIO_FN_INDEX,
+            "data": [
+                prompt,
+                {
+                    "url": data_url,
+                    "orig_name": "image.png",
+                    "meta": {"_type": "gradio.FileData"}
+                },
+                "",
+                BOOGU_GRADIO_DEFAULT_SEED,
+                false,
+                false,
+                config.resolution_category,
+                BOOGU_GRADIO_RESOLUTION_MODE,
+                config.resolution,
+                config.width,
+                config.height,
+                config.steps,
+                null
+            ],
+            "session_hash": session_hash
+        });
+        let image_url = self
+            .run_gradio_queue(&config.base_url, config.timeout, &session_hash, payload)
+            .await
+            .map_err(|error| ImageEditError::Provider(format!("boogu provider {error}")))?;
+        Ok(ImageEditResult {
+            image_urls: vec![image_url],
+            image_bytes: Vec::new(),
+        })
+    }
+}
+
+impl<DataUrl, Transport> ImageEditor for BooguGradioImageClient<DataUrl, Transport>
+where
+    DataUrl: TelegramVisionDataUrlProvider + Send + Sync,
+    DataUrl::Error: fmt::Display,
+    Transport: BooguHttpTransport,
+{
+    fn edit_image<'a>(&'a self, request: ImageEditRequest) -> ImageEditFuture<'a> {
+        Box::pin(async move {
+            self.edit_image_with_session_hash(request, &generated_boogu_session_hash())
+                .await
+        })
+    }
 }
 
 /// Generated draw-api result.
@@ -698,6 +1085,94 @@ where
                     "sequential image workflow produced no image".to_owned(),
                 )
             }))
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ParallelImageGenerator<First, Second> {
+    first: First,
+    second: Second,
+}
+
+impl<First, Second> ParallelImageGenerator<First, Second> {
+    #[must_use]
+    pub const fn new(first: First, second: Second) -> Self {
+        Self { first, second }
+    }
+}
+
+impl<First, Second> ImageGenerator for ParallelImageGenerator<First, Second>
+where
+    First: ImageGenerator + Sync,
+    Second: ImageGenerator + Sync,
+{
+    fn expected_image_count(&self) -> usize {
+        self.first.expected_image_count() + self.second.expected_image_count()
+    }
+
+    fn generate_image<'a>(&'a self, request: ImageGenerationRequest) -> ImageGenerationFuture<'a> {
+        Box::pin(async move {
+            let first_slot = 0;
+            let second_slot = self.first.expected_image_count();
+            let first_request = image_generation_request_for_prompt_slot(&request, first_slot);
+            let second_request = image_generation_request_for_prompt_slot(&request, second_slot);
+            let (first, second) = tokio::join!(
+                self.first.generate_image(first_request),
+                self.second.generate_image(second_request)
+            );
+            combine_parallel_image_generation_results(first, second)
+        })
+    }
+
+    fn generate_image_streaming<'a>(
+        &'a self,
+        request: ImageGenerationRequest,
+        progress: ImageGenerationProgressSink,
+    ) -> ImageGenerationFuture<'a> {
+        Box::pin(async move {
+            let first_slot = 0;
+            let second_slot = self.first.expected_image_count();
+            let first_request = image_generation_request_for_prompt_slot(&request, first_slot);
+            let second_request = image_generation_request_for_prompt_slot(&request, second_slot);
+            let first_progress = progress.clone();
+            let second_progress = progress;
+            let (first, second) = tokio::join!(
+                self.first
+                    .generate_image_streaming(first_request, first_progress),
+                self.second
+                    .generate_image_streaming(second_request, second_progress)
+            );
+            combine_parallel_image_generation_results(first, second)
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ParallelImageEditor<First, Second> {
+    first: First,
+    second: Second,
+}
+
+impl<First, Second> ParallelImageEditor<First, Second> {
+    #[must_use]
+    pub const fn new(first: First, second: Second) -> Self {
+        Self { first, second }
+    }
+}
+
+impl<First, Second> ImageEditor for ParallelImageEditor<First, Second>
+where
+    First: ImageEditor + Sync,
+    Second: ImageEditor + Sync,
+{
+    fn edit_image<'a>(&'a self, request: ImageEditRequest) -> ImageEditFuture<'a> {
+        Box::pin(async move {
+            let (first, second) = tokio::join!(
+                self.first.edit_image(request.clone()),
+                self.second.edit_image(request)
+            );
+            combine_parallel_image_edit_results(first, second)
         })
     }
 }
@@ -1247,6 +1722,83 @@ fn append_image_generation_result(
             .into_iter()
             .filter(|image| !image.is_empty()),
     );
+}
+
+fn combine_parallel_image_generation_results(
+    first: Result<ImageGenerationResult, ImageGenerationError>,
+    second: Result<ImageGenerationResult, ImageGenerationError>,
+) -> Result<ImageGenerationResult, ImageGenerationError> {
+    let mut combined = ImageGenerationResult::default();
+    let mut last_provider_error = None;
+
+    for result in [first, second] {
+        match result {
+            Ok(result) if image_generation_result_has_images(&result) => {
+                append_image_generation_result(&mut combined, result);
+            }
+            Ok(_) => {
+                last_provider_error = Some(ImageGenerationError::Provider(
+                    "parallel image provider returned no image".to_owned(),
+                ));
+            }
+            Err(ImageGenerationError::Forbidden) => return Err(ImageGenerationError::Forbidden),
+            Err(error) => last_provider_error = Some(error),
+        }
+    }
+
+    if image_generation_result_has_images(&combined) {
+        return Ok(combined);
+    }
+    Err(last_provider_error.unwrap_or_else(|| {
+        ImageGenerationError::Provider("parallel image workflow produced no image".to_owned())
+    }))
+}
+
+fn image_edit_result_has_images(result: &ImageEditResult) -> bool {
+    result.image_urls.iter().any(|url| !url.trim().is_empty())
+        || result.image_bytes.iter().any(|image| !image.is_empty())
+}
+
+fn append_image_edit_result(combined: &mut ImageEditResult, result: ImageEditResult) {
+    combined
+        .image_urls
+        .extend(result.image_urls.into_iter().filter_map(non_empty));
+    combined.image_bytes.extend(
+        result
+            .image_bytes
+            .into_iter()
+            .filter(|image| !image.is_empty()),
+    );
+}
+
+fn combine_parallel_image_edit_results(
+    first: Result<ImageEditResult, ImageEditError>,
+    second: Result<ImageEditResult, ImageEditError>,
+) -> Result<ImageEditResult, ImageEditError> {
+    let mut combined = ImageEditResult::default();
+    let mut last_provider_error = None;
+
+    for result in [first, second] {
+        match result {
+            Ok(result) if image_edit_result_has_images(&result) => {
+                append_image_edit_result(&mut combined, result);
+            }
+            Ok(_) => {
+                last_provider_error = Some(ImageEditError::Provider(
+                    "parallel image edit provider returned no image".to_owned(),
+                ));
+            }
+            Err(ImageEditError::Forbidden) => return Err(ImageEditError::Forbidden),
+            Err(error) => last_provider_error = Some(error),
+        }
+    }
+
+    if image_edit_result_has_images(&combined) {
+        return Ok(combined);
+    }
+    Err(last_provider_error.unwrap_or_else(|| {
+        ImageEditError::Provider("parallel image edit workflow produced no image".to_owned())
+    }))
 }
 
 /// Telegram sender boundary for image-job stickers.
@@ -2924,6 +3476,164 @@ fn non_empty(value: String) -> Option<String> {
     }
 }
 
+fn generated_boogu_session_hash() -> String {
+    let mut random = [0_u8; 8];
+    rand::rng().fill_bytes(&mut random);
+    format!("openplotva-{}-{}", now_unix_millis(), hex::encode(random))
+}
+
+fn now_unix_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+fn boogu_generation_prompt(request: &ImageGenerationRequest) -> String {
+    request
+        .prompt_variants
+        .iter()
+        .find_map(|variant| non_empty(variant.clone()))
+        .or_else(|| non_empty(request.prompt.clone()))
+        .or_else(|| non_empty(request.caption_text.clone()))
+        .unwrap_or_default()
+}
+
+fn boogu_generation_seed(seed: &str) -> (i64, bool) {
+    match seed.trim().parse::<i64>() {
+        Ok(seed) => (seed, false),
+        Err(_) => (BOOGU_GRADIO_DEFAULT_SEED, true),
+    }
+}
+
+fn boogu_endpoint(base_url: &str, path: &str) -> Result<String, String> {
+    let base_url = base_url.trim().trim_end_matches('/');
+    if base_url.is_empty() {
+        return Err("base URL is empty".to_owned());
+    }
+    Ok(format!("{base_url}{path}"))
+}
+
+fn boogu_queue_data_url(base_url: &str, session_hash: &str) -> Result<String, String> {
+    let mut url = url::Url::parse(&boogu_endpoint(base_url, "/gradio_api/queue/data")?)
+        .map_err(|error| format!("invalid queue data URL: {error}"))?;
+    url.query_pairs_mut()
+        .append_pair("session_hash", session_hash);
+    Ok(url.into())
+}
+
+fn boogu_headers(
+    base_url: &str,
+    content_type: Option<&str>,
+    accept: Option<&str>,
+) -> Result<BTreeMap<String, String>, String> {
+    let mut headers = BTreeMap::new();
+    headers.insert("User-Agent".to_owned(), BOOGU_GRADIO_USER_AGENT.to_owned());
+    headers.insert("Origin".to_owned(), boogu_origin(base_url)?);
+    headers.insert("Referer".to_owned(), boogu_referer(base_url)?);
+    if let Some(content_type) = content_type {
+        headers.insert("Content-Type".to_owned(), content_type.to_owned());
+    }
+    if let Some(accept) = accept {
+        headers.insert("Accept".to_owned(), accept.to_owned());
+    }
+    Ok(headers)
+}
+
+fn boogu_origin(base_url: &str) -> Result<String, String> {
+    let url = url::Url::parse(base_url.trim())
+        .map_err(|error| format!("invalid Boogu base URL: {error}"))?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| "Boogu base URL host is empty".to_owned())?;
+    let port = url
+        .port()
+        .map(|port| format!(":{port}"))
+        .unwrap_or_default();
+    Ok(format!("{}://{}{}", url.scheme(), host, port))
+}
+
+fn boogu_referer(base_url: &str) -> Result<String, String> {
+    Ok(format!("{}/", boogu_origin(base_url)?))
+}
+
+fn boogu_http_status_error(context: &str, status_code: u16, body: &[u8]) -> String {
+    let reason = if status_code == 429 || status_code >= 500 {
+        "provider_unavailable"
+    } else {
+        "request_failed"
+    };
+    let body = String::from_utf8_lossy(body);
+    format!("{reason}: {context} status {status_code}: {}", body.trim())
+}
+
+fn parse_boogu_completed_url(sse: &str) -> Result<String, String> {
+    let mut saw_completed = false;
+    for data in boogu_sse_data_messages(sse) {
+        let Ok(value) = serde_json::from_str::<Value>(&data) else {
+            continue;
+        };
+        let completed = value
+            .get("msg")
+            .and_then(Value::as_str)
+            .is_some_and(|msg| msg == "process_completed")
+            || value.get("output").is_some();
+        if !completed {
+            continue;
+        }
+        saw_completed = true;
+        if value.get("success").and_then(Value::as_bool) == Some(false) {
+            return Err(format!("queue completed without success: {value}"));
+        }
+        if let Some(url) = value
+            .get("output")
+            .and_then(|output| output.get("data"))
+            .and_then(find_first_boogu_url)
+        {
+            return Ok(url);
+        }
+    }
+    if saw_completed {
+        Err("queue completed without image URL".to_owned())
+    } else {
+        Err("queue data stream ended before process_completed".to_owned())
+    }
+}
+
+fn boogu_sse_data_messages(sse: &str) -> Vec<String> {
+    let mut messages = Vec::new();
+    let mut current = Vec::new();
+    for line in sse.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            if !current.is_empty() {
+                messages.push(current.join("\n"));
+                current.clear();
+            }
+            continue;
+        }
+        if let Some(data) = line.strip_prefix("data:") {
+            current.push(data.trim_start().to_owned());
+        }
+    }
+    if !current.is_empty() {
+        messages.push(current.join("\n"));
+    }
+    messages
+}
+
+fn find_first_boogu_url(value: &Value) -> Option<String> {
+    match value {
+        Value::Object(map) => map
+            .get("url")
+            .and_then(Value::as_str)
+            .and_then(|url| non_empty(url.to_owned()))
+            .or_else(|| map.values().find_map(find_first_boogu_url)),
+        Value::Array(items) => items.iter().find_map(find_first_boogu_url),
+        _ => None,
+    }
+}
+
 fn trace_image_edit_queue_tick(tick: &ImageEditQueuePollReport) {
     match tick.outcome {
         ImageEditQueuePollOutcome::Idle => {}
@@ -4191,6 +4901,328 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn boogu_generation_submits_gradio_payload_and_reads_sse_url() {
+        let transport = BooguTransportStub::new(vec![
+            Ok(boogu_json_response(json!({"event_id": "evt-gen"}))),
+            Ok(boogu_text_response(
+                "event: process_completed\n\
+                 data: {\"msg\":\"process_completed\",\"success\":true,\"output\":{\"data\":[{\"url\":\"https://demo-turbo.boogu.org/gradio_api/file=/tmp/gradio/image.png\"}]}}\n\n",
+            )),
+        ]);
+        let probe = transport.clone();
+        let client = BooguGradioImageClient::with_transport(
+            boogu_image_test_config(),
+            boogu_edit_test_config(),
+            DataUrlStub::success("data:image/png;base64,ZmFrZQ=="),
+            transport,
+        );
+
+        let result = client
+            .generate_image_with_session_hash(
+                ImageGenerationRequest {
+                    prompt: "fallback prompt".to_owned(),
+                    prompt_variants: vec!["  small red square icon ".to_owned()],
+                    seed: "123".to_owned(),
+                    ..ImageGenerationRequest::default()
+                },
+                "session-gen",
+            )
+            .await
+            .expect("boogu generation result");
+
+        assert_eq!(
+            result.image_url,
+            "https://demo-turbo.boogu.org/gradio_api/file=/tmp/gradio/image.png"
+        );
+        let requests = probe.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].method, BooguHttpMethod::Post);
+        assert_eq!(
+            requests[0].url,
+            "https://demo-turbo.boogu.org/gradio_api/queue/join"
+        );
+        assert_eq!(requests[0].headers["Content-Type"], "application/json");
+        assert_eq!(
+            requests[0].headers["Origin"],
+            "https://demo-turbo.boogu.org"
+        );
+        assert_eq!(
+            requests[0].headers["Referer"],
+            "https://demo-turbo.boogu.org/"
+        );
+        assert!(requests[0].headers["User-Agent"].contains("Mozilla/5.0"));
+        let payload: Value = serde_json::from_slice(&requests[0].body).expect("join payload");
+        assert_eq!(payload["fn_index"], 2);
+        assert_eq!(payload["session_hash"], "session-gen");
+        assert_eq!(
+            payload["data"],
+            json!([
+                "small red square icon",
+                123,
+                false,
+                false,
+                "Recommended resolutions",
+                "1024x1024 ( 1:1 )",
+                1024,
+                1024,
+                3,
+                null
+            ])
+        );
+        assert_eq!(requests[1].method, BooguHttpMethod::Get);
+        assert_eq!(
+            requests[1].url,
+            "https://demo-turbo.boogu.org/gradio_api/queue/data?session_hash=session-gen"
+        );
+        assert_eq!(requests[1].headers["Accept"], "text/event-stream");
+    }
+
+    #[tokio::test]
+    async fn boogu_edit_uses_telegram_data_url_instead_of_photo_urls() {
+        let transport = BooguTransportStub::new(vec![
+            Ok(boogu_json_response(json!({"event_id": "evt-edit"}))),
+            Ok(boogu_text_response(
+                "event: process_completed\n\
+                 data: {\"msg\":\"process_completed\",\"success\":true,\"output\":{\"data\":[{\"url\":\"https://demo-edit-turbo-1k5.boogu.org/gradio_api/file=/tmp/gradio/edit.png\"}]}}\n\n",
+            )),
+        ]);
+        let probe = transport.clone();
+        let data_urls = DataUrlStub::success("data:image/png;base64,ZmFrZS1wbmc=");
+        let client = BooguGradioImageClient::with_transport(
+            boogu_image_test_config(),
+            boogu_edit_test_config(),
+            data_urls.clone(),
+            transport,
+        );
+
+        let result = client
+            .edit_image_with_session_hash(
+                ImageEditRequest {
+                    prompt: " make the square blue ".to_owned(),
+                    photo_file_id: "telegram-file-id".to_owned(),
+                    photo_urls: vec![
+                        "https://api.telegram.org/file/botSECRET/photos/leak.png".to_owned(),
+                    ],
+                    ..ImageEditRequest::default()
+                },
+                "session-edit",
+            )
+            .await
+            .expect("boogu edit result");
+
+        assert_eq!(
+            result.image_urls,
+            vec!["https://demo-edit-turbo-1k5.boogu.org/gradio_api/file=/tmp/gradio/edit.png"]
+        );
+        assert_eq!(data_urls.requested(), vec!["telegram-file-id"]);
+        let requests = probe.requests();
+        assert_eq!(requests[0].method, BooguHttpMethod::Post);
+        assert_eq!(
+            requests[0].url,
+            "https://demo-edit-turbo-1k5.boogu.org/gradio_api/queue/join"
+        );
+        let body = String::from_utf8(requests[0].body.clone()).expect("utf8 body");
+        assert!(!body.contains("api.telegram.org/file/botSECRET"));
+        let payload: Value = serde_json::from_str(&body).expect("join payload");
+        assert_eq!(payload["fn_index"], 2);
+        assert_eq!(payload["session_hash"], "session-edit");
+        assert_eq!(payload["data"][0], "make the square blue");
+        assert_eq!(
+            payload["data"][1]["url"],
+            "data:image/png;base64,ZmFrZS1wbmc="
+        );
+        assert_eq!(payload["data"][1]["orig_name"], "image.png");
+        assert_eq!(payload["data"][1]["meta"]["_type"], "gradio.FileData");
+        assert_eq!(
+            payload["data"],
+            json!([
+                "make the square blue",
+                {
+                    "url": "data:image/png;base64,ZmFrZS1wbmc=",
+                    "orig_name": "image.png",
+                    "meta": {"_type": "gradio.FileData"}
+                },
+                "",
+                42,
+                false,
+                false,
+                "1.5K",
+                "Recommended resolutions",
+                "1536x1536 ( 1:1 )",
+                1536,
+                1536,
+                3,
+                null
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_image_generator_streams_second_provider_without_waiting_for_first() {
+        let first_notify = Arc::new(tokio::sync::Notify::new());
+        let first =
+            WaitingGeneratorStub::success("https://img.test/slow.png", Arc::clone(&first_notify));
+        let second = GeneratorStub::success("https://img.test/fast.png");
+        let generator = ParallelImageGenerator::new(first.clone(), second.clone());
+        let (progress_tx, mut progress_rx) =
+            tokio::sync::mpsc::unbounded_channel::<ImageGenerationResult>();
+
+        let mut generate = generator.generate_image_streaming(
+            ImageGenerationRequest {
+                prompt_variants: vec!["slow prompt".to_owned(), "fast prompt".to_owned()],
+                ..ImageGenerationRequest::default()
+            },
+            progress_tx,
+        );
+
+        let partial = tokio::time::timeout(StdDuration::from_millis(100), async {
+            tokio::select! {
+                partial = progress_rx.recv() => partial,
+                result = &mut generate => panic!("parallel generation completed before slow provider was released: {result:?}"),
+            }
+        })
+            .await
+            .expect("fast provider should stream before slow provider is released")
+            .expect("progress result");
+        assert_eq!(partial.image_url, "https://img.test/fast.png");
+        assert_eq!(first.requests().len(), 1);
+        assert_eq!(second.requests().len(), 1);
+
+        first_notify.notify_waiters();
+        let result = generate.await.expect("parallel result");
+        assert_eq!(
+            image_generation_urls(&result),
+            vec![
+                "https://img.test/slow.png".to_owned(),
+                "https://img.test/fast.png".to_owned()
+            ]
+        );
+        assert_eq!(
+            first.requests()[0].prompt_variants,
+            vec!["slow prompt".to_owned()]
+        );
+        assert_eq!(
+            second.requests()[0].prompt_variants,
+            vec!["fast prompt".to_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_image_generator_completes_with_partial_success_and_fails_when_all_fail() {
+        let first = GeneratorStub::error("aifarm provider provider_unavailable: status 503");
+        let second = GeneratorStub::success("https://img.test/boogu.png");
+        let generator = ParallelImageGenerator::new(first.clone(), second.clone());
+
+        let result = generator
+            .generate_image(ImageGenerationRequest {
+                prompt: "castle".to_owned(),
+                ..ImageGenerationRequest::default()
+            })
+            .await
+            .expect("partial success");
+
+        assert_eq!(result.image_url, "https://img.test/boogu.png");
+        assert_eq!(first.requests().len(), 1);
+        assert_eq!(second.requests().len(), 1);
+
+        let all_failed = ParallelImageGenerator::new(
+            GeneratorStub::error("aifarm provider provider_unavailable: status 503"),
+            GeneratorStub::error("boogu provider provider_unavailable: status 503"),
+        )
+        .generate_image(ImageGenerationRequest::default())
+        .await;
+        assert_eq!(
+            all_failed,
+            Err(ImageGenerationError::Provider(
+                "boogu provider provider_unavailable: status 503".to_owned()
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_image_editor_combines_partial_success_and_preserves_forbidden() {
+        let first = EditorStub::error("draw api failed");
+        let second = EditorStub::success(vec!["https://img.test/boogu-edit.png".to_owned()]);
+        let editor = ParallelImageEditor::new(first.clone(), second.clone());
+
+        let result = editor
+            .edit_image(ImageEditRequest {
+                prompt: "make it night".to_owned(),
+                ..ImageEditRequest::default()
+            })
+            .await
+            .expect("partial edit success");
+
+        assert_eq!(
+            result.image_urls,
+            vec!["https://img.test/boogu-edit.png".to_owned()]
+        );
+        assert_eq!(first.requests().len(), 1);
+        assert_eq!(second.requests().len(), 1);
+
+        let forbidden = ParallelImageEditor::new(
+            EditorStub::forbidden(),
+            EditorStub::success(vec!["https://img.test/ignored.png".to_owned()]),
+        )
+        .edit_image(ImageEditRequest::default())
+        .await;
+        assert_eq!(forbidden, Err(ImageEditError::Forbidden));
+    }
+
+    #[tokio::test]
+    async fn parallel_image_provider_all_failure_requeues_retryable_jobs() {
+        let queue = InMemoryTaskQueue::new();
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800).expect("time");
+        queue.assign(
+            IMAGE_VIP_QUEUE_NAME,
+            new_image_gen_job_at(
+                ImageGenJobParams {
+                    chat_id: -100,
+                    message_id: 20,
+                    user_id: 30,
+                    user_full_name: "Alice".to_owned(),
+                    prompt: "castle".to_owned(),
+                    ..ImageGenJobParams::default()
+                },
+                now,
+            ),
+        );
+        let generator = ParallelImageGenerator::new(
+            GeneratorStub::error("aifarm provider provider_unavailable: status 503"),
+            GeneratorStub::error("boogu provider provider_unavailable: status 503"),
+        );
+
+        let report = run_image_gen_queue_once(
+            &queue,
+            IMAGE_VIP_QUEUE_NAME,
+            &generator,
+            &EffectsStub::new(),
+            "image-worker-1",
+            now,
+        )
+        .await;
+
+        assert_eq!(report.outcome, ImageGenQueuePollOutcome::RetryRequeued);
+        assert_eq!(queue.records()[0].status, JobStatus::Pending);
+        assert_eq!(queue.records()[0].events[0].provider, "boogu");
+    }
+
+    #[test]
+    fn vip_parallel_generation_has_three_slots_while_regular_stays_single_slot() {
+        let vip = ParallelImageGenerator::new(
+            SequentialImageGenerator::new(
+                GeneratorStub::success("https://img.test/vip-1.png"),
+                GeneratorStub::success("https://img.test/vip-2.png"),
+            ),
+            GeneratorStub::success("https://img.test/boogu.png"),
+        );
+        let regular = GeneratorStub::success("https://img.test/regular.png");
+
+        assert_eq!(vip.expected_image_count(), 3);
+        assert_eq!(regular.expected_image_count(), 1);
+    }
+
+    #[tokio::test]
     async fn optimizing_image_editor_applies_go_edit_optimizer_before_provider() {
         let editor = EditorStub::success(vec!["https://img.test/edit.png".to_owned()]);
         let optimizer =
@@ -5335,6 +6367,84 @@ mod tests {
     }
 
     #[derive(Clone, Debug)]
+    struct BooguTransportStub {
+        state: Arc<Mutex<BooguTransportState>>,
+    }
+
+    #[derive(Debug)]
+    struct BooguTransportState {
+        requests: Vec<BooguHttpRequest>,
+        responses: VecDeque<Result<BooguHttpResponse, String>>,
+    }
+
+    impl BooguTransportStub {
+        fn new(responses: Vec<Result<BooguHttpResponse, String>>) -> Self {
+            Self {
+                state: Arc::new(Mutex::new(BooguTransportState {
+                    requests: Vec::new(),
+                    responses: responses.into(),
+                })),
+            }
+        }
+
+        fn requests(&self) -> Vec<BooguHttpRequest> {
+            self.state.lock().expect("boogu state").requests.clone()
+        }
+    }
+
+    impl BooguHttpTransport for BooguTransportStub {
+        fn send<'a>(&'a self, request: BooguHttpRequest) -> BooguHttpFuture<'a> {
+            Box::pin(async move {
+                let mut state = self.state.lock().expect("boogu state");
+                state.requests.push(request);
+                state
+                    .responses
+                    .pop_front()
+                    .unwrap_or_else(|| Ok(BooguHttpResponse::default()))
+            })
+        }
+    }
+
+    fn boogu_json_response(value: Value) -> BooguHttpResponse {
+        BooguHttpResponse {
+            status_code: 200,
+            body: serde_json::to_vec(&value).expect("json response"),
+        }
+    }
+
+    fn boogu_text_response(value: &str) -> BooguHttpResponse {
+        BooguHttpResponse {
+            status_code: 200,
+            body: value.as_bytes().to_vec(),
+        }
+    }
+
+    fn boogu_image_test_config() -> BooguGradioImageConfig {
+        BooguGradioImageConfig {
+            enabled: true,
+            base_url: "https://demo-turbo.boogu.org".to_owned(),
+            timeout: StdDuration::from_secs(5),
+            steps: 3,
+            resolution: "1024x1024 ( 1:1 )".to_owned(),
+            width: 1024,
+            height: 1024,
+        }
+    }
+
+    fn boogu_edit_test_config() -> BooguGradioEditConfig {
+        BooguGradioEditConfig {
+            enabled: true,
+            base_url: "https://demo-edit-turbo-1k5.boogu.org".to_owned(),
+            timeout: StdDuration::from_secs(5),
+            steps: 3,
+            resolution_category: "1.5K".to_owned(),
+            resolution: "1536x1536 ( 1:1 )".to_owned(),
+            width: 1536,
+            height: 1536,
+        }
+    }
+
+    #[derive(Clone, Debug)]
     struct AifarmTransportStub {
         state: Arc<Mutex<AifarmTransportState>>,
     }
@@ -5403,6 +6513,10 @@ mod tests {
                 result: Ok(data_url.into()),
                 requested: Arc::new(Mutex::new(Vec::new())),
             }
+        }
+
+        fn requested(&self) -> Vec<String> {
+            self.requested.lock().expect("requested files").clone()
         }
     }
 
@@ -5597,6 +6711,45 @@ mod tests {
             let result = self.result.clone();
             self.requests.lock().expect("requests").push(request);
             Box::pin(async move { result })
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct WaitingGeneratorStub {
+        image_url: String,
+        notify: Arc<tokio::sync::Notify>,
+        requests: Arc<Mutex<Vec<ImageGenerationRequest>>>,
+    }
+
+    impl WaitingGeneratorStub {
+        fn success(image_url: impl Into<String>, notify: Arc<tokio::sync::Notify>) -> Self {
+            Self {
+                image_url: image_url.into(),
+                notify,
+                requests: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn requests(&self) -> Vec<ImageGenerationRequest> {
+            self.requests.lock().expect("requests").clone()
+        }
+    }
+
+    impl ImageGenerator for WaitingGeneratorStub {
+        fn generate_image<'a>(
+            &'a self,
+            request: ImageGenerationRequest,
+        ) -> ImageGenerationFuture<'a> {
+            self.requests.lock().expect("requests").push(request);
+            let image_url = self.image_url.clone();
+            let notify = Arc::clone(&self.notify);
+            Box::pin(async move {
+                notify.notified().await;
+                Ok(ImageGenerationResult {
+                    image_url,
+                    ..ImageGenerationResult::default()
+                })
+            })
         }
     }
 

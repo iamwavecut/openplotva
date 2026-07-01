@@ -212,6 +212,34 @@ pub const DEFAULT_VISION_DIRECT_IMAGE_LIMIT: i32 = 2;
 
 pub const DEFAULT_VISION_REQUEST_TIMEOUT_SECONDS: i32 = 120;
 
+pub const DEFAULT_BOOGU_IMAGE_TURBO_ENABLED: bool = true;
+
+pub const DEFAULT_BOOGU_IMAGE_TURBO_BASE_URL: &str = "https://demo-turbo.boogu.org";
+
+pub const DEFAULT_BOOGU_IMAGE_EDIT_TURBO_ENABLED: bool = true;
+
+pub const DEFAULT_BOOGU_IMAGE_EDIT_TURBO_BASE_URL: &str = "https://demo-edit-turbo-1k5.boogu.org";
+
+pub const DEFAULT_BOOGU_IMAGE_TIMEOUT_SECONDS: i32 = 600;
+
+pub const DEFAULT_BOOGU_IMAGE_TURBO_STEPS: i32 = 3;
+
+pub const DEFAULT_BOOGU_IMAGE_TURBO_RESOLUTION: &str = "1024x1024 ( 1:1 )";
+
+pub const DEFAULT_BOOGU_IMAGE_TURBO_WIDTH: i32 = 1024;
+
+pub const DEFAULT_BOOGU_IMAGE_TURBO_HEIGHT: i32 = 1024;
+
+pub const DEFAULT_BOOGU_IMAGE_EDIT_TURBO_STEPS: i32 = 3;
+
+pub const DEFAULT_BOOGU_IMAGE_EDIT_TURBO_RESOLUTION_CATEGORY: &str = "1.5K";
+
+pub const DEFAULT_BOOGU_IMAGE_EDIT_TURBO_RESOLUTION: &str = "1536x1536 ( 1:1 )";
+
+pub const DEFAULT_BOOGU_IMAGE_EDIT_TURBO_WIDTH: i32 = 1536;
+
+pub const DEFAULT_BOOGU_IMAGE_EDIT_TURBO_HEIGHT: i32 = 1536;
+
 pub const DEFAULT_ACESTEP_ENABLED: bool = false;
 
 pub const DEFAULT_ACESTEP_BASE_URL: &str = "http://127.0.0.1:8001";
@@ -325,6 +353,8 @@ pub struct AppConfig {
     pub llm: LlmConfig,
     /// Vision captioning and direct-image configuration.
     pub vision: VisionConfig,
+    /// External image provider add-ons.
+    pub image_providers: ImageProvidersConfig,
     /// Music and ACE-Step configuration.
     pub music: MusicConfig,
     /// Memory pipeline configuration.
@@ -740,6 +770,35 @@ pub struct VisionConfig {
     /// telegram_files media-cache retention in days by `last_seen_at`, from
     /// `TELEGRAM_FILES_RETENTION_DAYS` (0 disables).
     pub telegram_files_retention_days: i32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ImageProvidersConfig {
+    pub boogu_turbo: BooguImageTurboConfig,
+    pub boogu_edit_turbo: BooguImageEditTurboConfig,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BooguImageTurboConfig {
+    pub enabled: bool,
+    pub base_url: String,
+    pub timeout_seconds: i32,
+    pub steps: i32,
+    pub resolution: String,
+    pub width: i32,
+    pub height: i32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BooguImageEditTurboConfig {
+    pub enabled: bool,
+    pub base_url: String,
+    pub timeout_seconds: i32,
+    pub steps: i32,
+    pub resolution_category: String,
+    pub resolution: String,
+    pub width: i32,
+    pub height: i32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1161,6 +1220,34 @@ pub struct RawConfig {
     pub vision_request_timeout_seconds: Option<String>,
     /// `TELEGRAM_FILES_RETENTION_DAYS`.
     pub telegram_files_retention_days: Option<String>,
+    /// `BOOGU_IMAGE_TURBO_ENABLED`.
+    pub boogu_image_turbo_enabled: Option<String>,
+    /// `BOOGU_IMAGE_TURBO_BASE_URL`.
+    pub boogu_image_turbo_base_url: Option<String>,
+    /// `BOOGU_IMAGE_EDIT_TURBO_ENABLED`.
+    pub boogu_image_edit_turbo_enabled: Option<String>,
+    /// `BOOGU_IMAGE_EDIT_TURBO_BASE_URL`.
+    pub boogu_image_edit_turbo_base_url: Option<String>,
+    /// `BOOGU_IMAGE_TIMEOUT_SECONDS`.
+    pub boogu_image_timeout_seconds: Option<String>,
+    /// `BOOGU_IMAGE_TURBO_STEPS`.
+    pub boogu_image_turbo_steps: Option<String>,
+    /// `BOOGU_IMAGE_TURBO_RESOLUTION`.
+    pub boogu_image_turbo_resolution: Option<String>,
+    /// `BOOGU_IMAGE_TURBO_WIDTH`.
+    pub boogu_image_turbo_width: Option<String>,
+    /// `BOOGU_IMAGE_TURBO_HEIGHT`.
+    pub boogu_image_turbo_height: Option<String>,
+    /// `BOOGU_IMAGE_EDIT_TURBO_STEPS`.
+    pub boogu_image_edit_turbo_steps: Option<String>,
+    /// `BOOGU_IMAGE_EDIT_TURBO_RESOLUTION_CATEGORY`.
+    pub boogu_image_edit_turbo_resolution_category: Option<String>,
+    /// `BOOGU_IMAGE_EDIT_TURBO_RESOLUTION`.
+    pub boogu_image_edit_turbo_resolution: Option<String>,
+    /// `BOOGU_IMAGE_EDIT_TURBO_WIDTH`.
+    pub boogu_image_edit_turbo_width: Option<String>,
+    /// `BOOGU_IMAGE_EDIT_TURBO_HEIGHT`.
+    pub boogu_image_edit_turbo_height: Option<String>,
     /// `ACESTEP_ENABLED`.
     pub acestep_enabled: Option<String>,
     /// `ACESTEP_BASE_URL`.
@@ -1703,6 +1790,102 @@ impl AppConfig {
                 DEFAULT_SERPER_TIMEOUT_SECONDS,
             )?,
         };
+        let boogu_image_timeout_seconds = validate_positive_i32(
+            "BOOGU_IMAGE_TIMEOUT_SECONDS",
+            parse_i32(
+                "BOOGU_IMAGE_TIMEOUT_SECONDS",
+                raw.boogu_image_timeout_seconds,
+                DEFAULT_BOOGU_IMAGE_TIMEOUT_SECONDS,
+            )?,
+        )?;
+        let image_providers = ImageProvidersConfig {
+            boogu_turbo: BooguImageTurboConfig {
+                enabled: parse_bool(
+                    "BOOGU_IMAGE_TURBO_ENABLED",
+                    raw.boogu_image_turbo_enabled,
+                    DEFAULT_BOOGU_IMAGE_TURBO_ENABLED,
+                )?,
+                base_url: raw
+                    .boogu_image_turbo_base_url
+                    .and_then(|value| parse_scalar_value(Some(value)))
+                    .unwrap_or_else(|| DEFAULT_BOOGU_IMAGE_TURBO_BASE_URL.to_owned()),
+                timeout_seconds: boogu_image_timeout_seconds,
+                steps: validate_positive_i32(
+                    "BOOGU_IMAGE_TURBO_STEPS",
+                    parse_i32(
+                        "BOOGU_IMAGE_TURBO_STEPS",
+                        raw.boogu_image_turbo_steps,
+                        DEFAULT_BOOGU_IMAGE_TURBO_STEPS,
+                    )?,
+                )?,
+                resolution: raw
+                    .boogu_image_turbo_resolution
+                    .and_then(|value| parse_scalar_value(Some(value)))
+                    .unwrap_or_else(|| DEFAULT_BOOGU_IMAGE_TURBO_RESOLUTION.to_owned()),
+                width: validate_positive_i32(
+                    "BOOGU_IMAGE_TURBO_WIDTH",
+                    parse_i32(
+                        "BOOGU_IMAGE_TURBO_WIDTH",
+                        raw.boogu_image_turbo_width,
+                        DEFAULT_BOOGU_IMAGE_TURBO_WIDTH,
+                    )?,
+                )?,
+                height: validate_positive_i32(
+                    "BOOGU_IMAGE_TURBO_HEIGHT",
+                    parse_i32(
+                        "BOOGU_IMAGE_TURBO_HEIGHT",
+                        raw.boogu_image_turbo_height,
+                        DEFAULT_BOOGU_IMAGE_TURBO_HEIGHT,
+                    )?,
+                )?,
+            },
+            boogu_edit_turbo: BooguImageEditTurboConfig {
+                enabled: parse_bool(
+                    "BOOGU_IMAGE_EDIT_TURBO_ENABLED",
+                    raw.boogu_image_edit_turbo_enabled,
+                    DEFAULT_BOOGU_IMAGE_EDIT_TURBO_ENABLED,
+                )?,
+                base_url: raw
+                    .boogu_image_edit_turbo_base_url
+                    .and_then(|value| parse_scalar_value(Some(value)))
+                    .unwrap_or_else(|| DEFAULT_BOOGU_IMAGE_EDIT_TURBO_BASE_URL.to_owned()),
+                timeout_seconds: boogu_image_timeout_seconds,
+                steps: validate_positive_i32(
+                    "BOOGU_IMAGE_EDIT_TURBO_STEPS",
+                    parse_i32(
+                        "BOOGU_IMAGE_EDIT_TURBO_STEPS",
+                        raw.boogu_image_edit_turbo_steps,
+                        DEFAULT_BOOGU_IMAGE_EDIT_TURBO_STEPS,
+                    )?,
+                )?,
+                resolution_category: raw
+                    .boogu_image_edit_turbo_resolution_category
+                    .and_then(|value| parse_scalar_value(Some(value)))
+                    .unwrap_or_else(|| {
+                        DEFAULT_BOOGU_IMAGE_EDIT_TURBO_RESOLUTION_CATEGORY.to_owned()
+                    }),
+                resolution: raw
+                    .boogu_image_edit_turbo_resolution
+                    .and_then(|value| parse_scalar_value(Some(value)))
+                    .unwrap_or_else(|| DEFAULT_BOOGU_IMAGE_EDIT_TURBO_RESOLUTION.to_owned()),
+                width: validate_positive_i32(
+                    "BOOGU_IMAGE_EDIT_TURBO_WIDTH",
+                    parse_i32(
+                        "BOOGU_IMAGE_EDIT_TURBO_WIDTH",
+                        raw.boogu_image_edit_turbo_width,
+                        DEFAULT_BOOGU_IMAGE_EDIT_TURBO_WIDTH,
+                    )?,
+                )?,
+                height: validate_positive_i32(
+                    "BOOGU_IMAGE_EDIT_TURBO_HEIGHT",
+                    parse_i32(
+                        "BOOGU_IMAGE_EDIT_TURBO_HEIGHT",
+                        raw.boogu_image_edit_turbo_height,
+                        DEFAULT_BOOGU_IMAGE_EDIT_TURBO_HEIGHT,
+                    )?,
+                )?,
+            },
+        };
 
         let postgres = PostgresConfig {
             host: raw
@@ -2137,6 +2320,7 @@ impl AppConfig {
                     DEFAULT_VISION_REQUEST_TIMEOUT_SECONDS,
                 )?,
             },
+            image_providers,
             music: MusicConfig {
                 acestep: AceStepConfig {
                     enabled: parse_bool(
@@ -2617,6 +2801,22 @@ impl RawConfig {
             vision_direct_image_limit: env("VISION_DIRECT_IMAGE_LIMIT"),
             vision_request_timeout_seconds: env("VISION_REQUEST_TIMEOUT_SECONDS"),
             telegram_files_retention_days: env("TELEGRAM_FILES_RETENTION_DAYS"),
+            boogu_image_turbo_enabled: env("BOOGU_IMAGE_TURBO_ENABLED"),
+            boogu_image_turbo_base_url: env("BOOGU_IMAGE_TURBO_BASE_URL"),
+            boogu_image_edit_turbo_enabled: env("BOOGU_IMAGE_EDIT_TURBO_ENABLED"),
+            boogu_image_edit_turbo_base_url: env("BOOGU_IMAGE_EDIT_TURBO_BASE_URL"),
+            boogu_image_timeout_seconds: env("BOOGU_IMAGE_TIMEOUT_SECONDS"),
+            boogu_image_turbo_steps: env("BOOGU_IMAGE_TURBO_STEPS"),
+            boogu_image_turbo_resolution: env("BOOGU_IMAGE_TURBO_RESOLUTION"),
+            boogu_image_turbo_width: env("BOOGU_IMAGE_TURBO_WIDTH"),
+            boogu_image_turbo_height: env("BOOGU_IMAGE_TURBO_HEIGHT"),
+            boogu_image_edit_turbo_steps: env("BOOGU_IMAGE_EDIT_TURBO_STEPS"),
+            boogu_image_edit_turbo_resolution_category: env(
+                "BOOGU_IMAGE_EDIT_TURBO_RESOLUTION_CATEGORY",
+            ),
+            boogu_image_edit_turbo_resolution: env("BOOGU_IMAGE_EDIT_TURBO_RESOLUTION"),
+            boogu_image_edit_turbo_width: env("BOOGU_IMAGE_EDIT_TURBO_WIDTH"),
+            boogu_image_edit_turbo_height: env("BOOGU_IMAGE_EDIT_TURBO_HEIGHT"),
             acestep_enabled: env("ACESTEP_ENABLED"),
             acestep_base_url: env("ACESTEP_BASE_URL"),
             acestep_api_key: env("ACESTEP_API_KEY"),
@@ -3033,6 +3233,13 @@ mod tests {
         AppConfig, DEFAULT_ACESTEP_API_MODE, DEFAULT_ACESTEP_AUDIO_FORMAT,
         DEFAULT_ACESTEP_BASE_URL, DEFAULT_ACESTEP_MODEL, DEFAULT_ACESTEP_POLL_INTERVAL_SECONDS,
         DEFAULT_ACESTEP_REQUEST_TIMEOUT_SECONDS, DEFAULT_ACESTEP_TASK_TIMEOUT_SECONDS,
+        DEFAULT_BOOGU_IMAGE_EDIT_TURBO_BASE_URL, DEFAULT_BOOGU_IMAGE_EDIT_TURBO_ENABLED,
+        DEFAULT_BOOGU_IMAGE_EDIT_TURBO_HEIGHT, DEFAULT_BOOGU_IMAGE_EDIT_TURBO_RESOLUTION,
+        DEFAULT_BOOGU_IMAGE_EDIT_TURBO_RESOLUTION_CATEGORY, DEFAULT_BOOGU_IMAGE_EDIT_TURBO_STEPS,
+        DEFAULT_BOOGU_IMAGE_EDIT_TURBO_WIDTH, DEFAULT_BOOGU_IMAGE_TIMEOUT_SECONDS,
+        DEFAULT_BOOGU_IMAGE_TURBO_BASE_URL, DEFAULT_BOOGU_IMAGE_TURBO_ENABLED,
+        DEFAULT_BOOGU_IMAGE_TURBO_HEIGHT, DEFAULT_BOOGU_IMAGE_TURBO_RESOLUTION,
+        DEFAULT_BOOGU_IMAGE_TURBO_STEPS, DEFAULT_BOOGU_IMAGE_TURBO_WIDTH,
         DEFAULT_BOT_WEBHOOK_UPDATE_BUFFER_SIZE, DEFAULT_DIALOG_AIFARM_POOL_BASE_URLS,
         DEFAULT_DIALOG_AIFARM_POOL_MODELS, DEFAULT_DIALOG_MODEL, DEFAULT_DISCOVERY_BASE_URL,
         DEFAULT_HISTORY_SUMMARY_PROVIDER, DEFAULT_HISTORY_SUMMARY_TIMEOUT_SECONDS,
@@ -3421,6 +3628,126 @@ mod tests {
         assert!(config.service_probe.produce_updates);
         assert!(config.service_probe.consume_updates);
 
+        Ok(())
+    }
+
+    #[test]
+    fn boogu_image_provider_defaults_are_enabled() -> Result<(), super::ConfigError> {
+        let config = AppConfig::from_raw(RawConfig::default())?;
+
+        assert_eq!(
+            config.image_providers.boogu_turbo.enabled,
+            DEFAULT_BOOGU_IMAGE_TURBO_ENABLED
+        );
+        assert_eq!(
+            config.image_providers.boogu_turbo.base_url,
+            DEFAULT_BOOGU_IMAGE_TURBO_BASE_URL
+        );
+        assert_eq!(
+            config.image_providers.boogu_turbo.timeout_seconds,
+            DEFAULT_BOOGU_IMAGE_TIMEOUT_SECONDS
+        );
+        assert_eq!(
+            config.image_providers.boogu_turbo.steps,
+            DEFAULT_BOOGU_IMAGE_TURBO_STEPS
+        );
+        assert_eq!(
+            config.image_providers.boogu_turbo.resolution,
+            DEFAULT_BOOGU_IMAGE_TURBO_RESOLUTION
+        );
+        assert_eq!(
+            config.image_providers.boogu_turbo.width,
+            DEFAULT_BOOGU_IMAGE_TURBO_WIDTH
+        );
+        assert_eq!(
+            config.image_providers.boogu_turbo.height,
+            DEFAULT_BOOGU_IMAGE_TURBO_HEIGHT
+        );
+        assert_eq!(
+            config.image_providers.boogu_edit_turbo.enabled,
+            DEFAULT_BOOGU_IMAGE_EDIT_TURBO_ENABLED
+        );
+        assert_eq!(
+            config.image_providers.boogu_edit_turbo.base_url,
+            DEFAULT_BOOGU_IMAGE_EDIT_TURBO_BASE_URL
+        );
+        assert_eq!(
+            config.image_providers.boogu_edit_turbo.timeout_seconds,
+            DEFAULT_BOOGU_IMAGE_TIMEOUT_SECONDS
+        );
+        assert_eq!(
+            config.image_providers.boogu_edit_turbo.resolution_category,
+            DEFAULT_BOOGU_IMAGE_EDIT_TURBO_RESOLUTION_CATEGORY
+        );
+        assert_eq!(
+            config.image_providers.boogu_edit_turbo.resolution,
+            DEFAULT_BOOGU_IMAGE_EDIT_TURBO_RESOLUTION
+        );
+        assert_eq!(
+            config.image_providers.boogu_edit_turbo.steps,
+            DEFAULT_BOOGU_IMAGE_EDIT_TURBO_STEPS
+        );
+        assert_eq!(
+            config.image_providers.boogu_edit_turbo.width,
+            DEFAULT_BOOGU_IMAGE_EDIT_TURBO_WIDTH
+        );
+        assert_eq!(
+            config.image_providers.boogu_edit_turbo.height,
+            DEFAULT_BOOGU_IMAGE_EDIT_TURBO_HEIGHT
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn boogu_image_provider_env_overrides_are_parsed() -> Result<(), super::ConfigError> {
+        let config = AppConfig::from_raw(RawConfig {
+            boogu_image_turbo_enabled: Some("false".to_owned()),
+            boogu_image_turbo_base_url: Some("https://draw.example.test".to_owned()),
+            boogu_image_timeout_seconds: Some("321".to_owned()),
+            boogu_image_turbo_steps: Some("4".to_owned()),
+            boogu_image_turbo_resolution: Some("1280x720 ( 16:9 )".to_owned()),
+            boogu_image_turbo_width: Some("1280".to_owned()),
+            boogu_image_turbo_height: Some("720".to_owned()),
+            boogu_image_edit_turbo_enabled: Some("false".to_owned()),
+            boogu_image_edit_turbo_base_url: Some("https://edit.example.test".to_owned()),
+            boogu_image_edit_turbo_resolution_category: Some("1K".to_owned()),
+            boogu_image_edit_turbo_resolution: Some("1024x1024 ( 1:1 )".to_owned()),
+            boogu_image_edit_turbo_steps: Some("4".to_owned()),
+            boogu_image_edit_turbo_width: Some("1024".to_owned()),
+            boogu_image_edit_turbo_height: Some("1024".to_owned()),
+            ..RawConfig::default()
+        })?;
+
+        assert!(!config.image_providers.boogu_turbo.enabled);
+        assert_eq!(
+            config.image_providers.boogu_turbo.base_url,
+            "https://draw.example.test"
+        );
+        assert_eq!(config.image_providers.boogu_turbo.timeout_seconds, 321);
+        assert_eq!(config.image_providers.boogu_turbo.steps, 4);
+        assert_eq!(
+            config.image_providers.boogu_turbo.resolution,
+            "1280x720 ( 16:9 )"
+        );
+        assert_eq!(config.image_providers.boogu_turbo.width, 1280);
+        assert_eq!(config.image_providers.boogu_turbo.height, 720);
+        assert!(!config.image_providers.boogu_edit_turbo.enabled);
+        assert_eq!(
+            config.image_providers.boogu_edit_turbo.base_url,
+            "https://edit.example.test"
+        );
+        assert_eq!(config.image_providers.boogu_edit_turbo.timeout_seconds, 321);
+        assert_eq!(
+            config.image_providers.boogu_edit_turbo.resolution_category,
+            "1K"
+        );
+        assert_eq!(
+            config.image_providers.boogu_edit_turbo.resolution,
+            "1024x1024 ( 1:1 )"
+        );
+        assert_eq!(config.image_providers.boogu_edit_turbo.steps, 4);
+        assert_eq!(config.image_providers.boogu_edit_turbo.width, 1024);
+        assert_eq!(config.image_providers.boogu_edit_turbo.height, 1024);
         Ok(())
     }
 
