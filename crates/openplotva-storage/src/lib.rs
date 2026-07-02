@@ -6448,6 +6448,247 @@ ON CONFLICT (source, kind, granularity, bucket_start, dimensions_hash) DO UPDATE
     metrics = EXCLUDED.metrics,
     updated_at = CURRENT_TIMESTAMP"#;
 
+/// Obligation waits for its generation ticket to resolve.
+pub const DELIVERY_OBLIGATION_STATE_PENDING: &str = "pending";
+/// Deadline was pushed once with a single "taking longer" notice.
+pub const DELIVERY_OBLIGATION_STATE_EXTENDED_ONCE: &str = "extended_once";
+/// The generated artifact reached the chat; the obligation is fulfilled silently.
+pub const DELIVERY_OBLIGATION_STATE_DELIVERED: &str = "delivered";
+/// The ticket failed and the user was notified.
+pub const DELIVERY_OBLIGATION_STATE_FAILED_NOTIFIED: &str = "failed_notified";
+/// The ticket outlived its (already extended) deadline and the user was notified.
+pub const DELIVERY_OBLIGATION_STATE_EXPIRED_NOTIFIED: &str = "expired_notified";
+/// The ticket vanished or completed without an artifact; the user was notified.
+pub const DELIVERY_OBLIGATION_STATE_ORPHANED_NOTIFIED: &str = "orphaned_notified";
+
+/// Placeholder `dialog_job_id` written at schedule time; turn finalization
+/// annotates the real dialog taskman job id afterwards.
+pub const DELIVERY_OBLIGATION_DIALOG_JOB_UNKNOWN: i64 = 0;
+
+/// One durable promise that a queued generation job will visibly resolve.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DeliveryObligationRecord {
+    pub id: i64,
+    pub created_at: OffsetDateTime,
+    pub chat_id: i64,
+    pub thread_id: Option<i32>,
+    pub user_id: i64,
+    /// User message that triggered the generation; notices reply to it.
+    pub trigger_message_id: i32,
+    /// Dialog taskman job that delegated the reply (0 until annotated).
+    pub dialog_job_id: i64,
+    /// `image_generation_job` or `music_generation_job`.
+    pub kind: String,
+    /// Generation taskman ticket id (unique per obligation).
+    pub ticket_job_id: i64,
+    pub deadline_at: OffsetDateTime,
+    pub state: String,
+    pub result_message_id: Option<i32>,
+    pub resolved_at: Option<OffsetDateTime>,
+    pub detail: serde_json::Value,
+}
+
+/// Insert payload recorded by the schedulers right after ticket assignment.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NewDeliveryObligation {
+    pub chat_id: i64,
+    pub thread_id: Option<i32>,
+    pub user_id: i64,
+    pub trigger_message_id: i32,
+    pub dialog_job_id: i64,
+    pub kind: String,
+    pub ticket_job_id: i64,
+    pub deadline_at: OffsetDateTime,
+}
+
+/// SQLx store for `dialog_delivery_obligations`. Transitions are idempotent
+/// winner-notifies updates: `UPDATE ... WHERE state IN (open states) RETURNING id`
+/// so only one watcher tick can win a transition and send the notice.
+#[derive(Clone, Debug)]
+pub struct PostgresDeliveryObligationStore {
+    pool: PgPool,
+}
+
+impl PostgresDeliveryObligationStore {
+    #[must_use]
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
+    /// Record one obligation at schedule time. Returns false when the ticket
+    /// already has an obligation (`ON CONFLICT (ticket_job_id) DO NOTHING`).
+    pub async fn insert_delivery_obligation(
+        &self,
+        obligation: &NewDeliveryObligation,
+    ) -> Result<bool, StorageError> {
+        let result = sqlx::query(
+            "INSERT INTO dialog_delivery_obligations \
+             (chat_id, thread_id, user_id, trigger_message_id, dialog_job_id, kind, ticket_job_id, deadline_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+             ON CONFLICT (ticket_job_id) DO NOTHING",
+        )
+        .bind(obligation.chat_id)
+        .bind(obligation.thread_id)
+        .bind(obligation.user_id)
+        .bind(obligation.trigger_message_id)
+        .bind(obligation.dialog_job_id)
+        .bind(&obligation.kind)
+        .bind(obligation.ticket_job_id)
+        .bind(obligation.deadline_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// List obligations still awaiting resolution (pending or extended once),
+    /// oldest deadline first.
+    pub async fn list_open_delivery_obligations(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<DeliveryObligationRecord>, StorageError> {
+        let rows = sqlx::query(
+            "SELECT id, created_at, chat_id, thread_id, user_id, trigger_message_id, \
+                    dialog_job_id, kind, ticket_job_id, deadline_at, state, \
+                    result_message_id, resolved_at, detail \
+             FROM dialog_delivery_obligations \
+             WHERE state IN ($1, $2) \
+             ORDER BY deadline_at ASC \
+             LIMIT $3",
+        )
+        .bind(DELIVERY_OBLIGATION_STATE_PENDING)
+        .bind(DELIVERY_OBLIGATION_STATE_EXTENDED_ONCE)
+        .bind(limit.max(1))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(delivery_obligation_from_row)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
+    }
+
+    /// Resolve one open obligation as delivered. Returns true only for the
+    /// transition winner.
+    pub async fn mark_delivery_obligation_delivered(
+        &self,
+        id: i64,
+        result_message_id: Option<i32>,
+        detail: &str,
+        now: OffsetDateTime,
+    ) -> Result<bool, StorageError> {
+        let row = sqlx::query(
+            "UPDATE dialog_delivery_obligations \
+             SET state = $2, result_message_id = $3, resolved_at = $4, \
+                 detail = detail || jsonb_build_object('resolution', $5::text) \
+             WHERE id = $1 AND state IN ($6, $7) \
+             RETURNING id",
+        )
+        .bind(id)
+        .bind(DELIVERY_OBLIGATION_STATE_DELIVERED)
+        .bind(result_message_id)
+        .bind(now)
+        .bind(detail)
+        .bind(DELIVERY_OBLIGATION_STATE_PENDING)
+        .bind(DELIVERY_OBLIGATION_STATE_EXTENDED_ONCE)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.is_some())
+    }
+
+    /// Resolve one open obligation into a notified terminal state
+    /// (`failed_notified`, `orphaned_notified`, or `expired_notified`).
+    /// Returns true only for the transition winner, which sends the notice.
+    pub async fn mark_delivery_obligation_notified(
+        &self,
+        id: i64,
+        state: &str,
+        detail: &str,
+        now: OffsetDateTime,
+    ) -> Result<bool, StorageError> {
+        let row = sqlx::query(
+            "UPDATE dialog_delivery_obligations \
+             SET state = $2, resolved_at = $3, \
+                 detail = detail || jsonb_build_object('resolution', $4::text) \
+             WHERE id = $1 AND state IN ($5, $6) \
+             RETURNING id",
+        )
+        .bind(id)
+        .bind(state)
+        .bind(now)
+        .bind(detail)
+        .bind(DELIVERY_OBLIGATION_STATE_PENDING)
+        .bind(DELIVERY_OBLIGATION_STATE_EXTENDED_ONCE)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.is_some())
+    }
+
+    /// Push the deadline once for a still-running ticket. Only pending
+    /// obligations can extend, so the "taking longer" notice is sent at most
+    /// once. Returns true only for the transition winner.
+    pub async fn extend_delivery_obligation_once(
+        &self,
+        id: i64,
+        new_deadline: OffsetDateTime,
+        now: OffsetDateTime,
+    ) -> Result<bool, StorageError> {
+        let row = sqlx::query(
+            "UPDATE dialog_delivery_obligations \
+             SET state = $2, deadline_at = $3, \
+                 detail = detail || jsonb_build_object('extended_at', $4::timestamptz) \
+             WHERE id = $1 AND state = $5 \
+             RETURNING id",
+        )
+        .bind(id)
+        .bind(DELIVERY_OBLIGATION_STATE_EXTENDED_ONCE)
+        .bind(new_deadline)
+        .bind(now)
+        .bind(DELIVERY_OBLIGATION_STATE_PENDING)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.is_some())
+    }
+
+    /// Backfill the dialog taskman job id after turn finalization
+    /// (update-if-placeholder; never overwrites a known id).
+    pub async fn annotate_delivery_obligation_dialog_job(
+        &self,
+        ticket_job_id: i64,
+        dialog_job_id: i64,
+    ) -> Result<bool, StorageError> {
+        let row = sqlx::query(
+            "UPDATE dialog_delivery_obligations \
+             SET dialog_job_id = $2 \
+             WHERE ticket_job_id = $1 AND dialog_job_id = $3 \
+             RETURNING id",
+        )
+        .bind(ticket_job_id)
+        .bind(dialog_job_id)
+        .bind(DELIVERY_OBLIGATION_DIALOG_JOB_UNKNOWN)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.is_some())
+    }
+}
+
+fn delivery_obligation_from_row(row: PgRow) -> Result<DeliveryObligationRecord, sqlx::Error> {
+    Ok(DeliveryObligationRecord {
+        id: row.try_get("id")?,
+        created_at: row.try_get("created_at")?,
+        chat_id: row.try_get("chat_id")?,
+        thread_id: row.try_get("thread_id")?,
+        user_id: row.try_get("user_id")?,
+        trigger_message_id: row.try_get("trigger_message_id")?,
+        dialog_job_id: row.try_get("dialog_job_id")?,
+        kind: row.try_get("kind")?,
+        ticket_job_id: row.try_get("ticket_job_id")?,
+        deadline_at: row.try_get("deadline_at")?,
+        state: row.try_get("state")?,
+        result_message_id: row.try_get("result_message_id")?,
+        resolved_at: row.try_get("resolved_at")?,
+        detail: row.try_get("detail")?,
+    })
+}
+
 async fn upsert_task_queue_record(
     tx: &mut Transaction<'_, Postgres>,
     record: &TaskQueueRecord,

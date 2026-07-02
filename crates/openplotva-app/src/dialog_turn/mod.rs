@@ -11,6 +11,7 @@
 mod budget;
 mod engine;
 mod ledger;
+mod obligations;
 mod outcome;
 mod signal;
 
@@ -24,6 +25,15 @@ pub use ledger::{
     RuntimeTurnOutcomeBuffer, TURN_OUTCOME_NO_REPLY_INTENTIONAL, TURN_OUTCOME_RETRY_SCHEDULED,
     TURN_OUTCOME_SENT, TURN_OUTCOME_SIDE_EFFECT_DELEGATED, TURN_OUTCOME_SKIPPED,
     TURN_OUTCOME_TERMINAL_FAILED, delete_old_turn_outcomes_batch,
+};
+pub use obligations::{
+    DEFAULT_DIALOG_IMAGE_DELIVERY_TIMEOUT_SECS, DEFAULT_DIALOG_MUSIC_DELIVERY_TIMEOUT_SECS,
+    DEFAULT_DIALOG_OBLIGATION_WATCH_INTERVAL_SECS, DeliveryObligationAnnotator,
+    DeliveryObligationNotifier, DeliveryObligationRecorder, DeliveryObligationStore,
+    DeliveryObligationTimeouts, DispatcherDeliveryObligationNotifier, FallbackTicketRecordSource,
+    OBLIGATION_EXTENDED_NOTICE, OBLIGATION_FAILURE_NOTICE, ObligationError, ObligationFuture,
+    ObligationNoticeResult, ObligationNoticeTarget, ObligationWatchTickReport, TicketRecordSource,
+    process_delivery_obligations_once, run_delivery_obligation_watcher,
 };
 pub use outcome::{
     JobDisposition, REASON_QUEUE_BACKLOG_EXPIRED, TurnOutcome, TurnResolution, UserSignalPlan,
