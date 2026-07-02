@@ -1,3 +1,5 @@
+use std::{future::Future, time::Duration};
+
 use carapax::{
     api::{Client, ExecuteError},
     types::{
@@ -5,11 +7,20 @@ use carapax::{
         CreateInvoiceLink, DeleteMessage, EditMessageCaption, EditMessageMedia,
         EditMessageReplyMarkup, EditMessageResult, EditMessageText, EditUserStarSubscription,
         Message, RefundStarPayment, SendAudio, SendChatAction, SendMediaGroup, SendMessage,
-        SendPhoto, SendSticker, SentGuestMessage,
+        SendPhoto, SendSticker, SentGuestMessage, SetMessageReaction,
     },
 };
 
-use crate::{DispatcherSendStatus, RichApiClient, RichApiError, SendRichMessage, format_rich_html};
+use crate::{
+    DispatcherSendStatus, RichApiClient, RichApiError, SendRichMessage, format_rich_html,
+    replay_outbound_method, snapshot_outbound_method,
+};
+
+/// Maximum attempts (including the first) made by [`send_outbound_method_with_bounded_retry`].
+pub const OUTBOUND_SEND_MAX_ATTEMPTS: u32 = 3;
+
+/// Longest Telegram `retry_after` hint honored by the inline bounded retry.
+pub const OUTBOUND_RETRY_AFTER_INLINE_CAP_SECS: u64 = 5;
 
 /// Concrete outbound Telegram methods currently queued by the Rust dispatcher.
 #[derive(Debug)]
@@ -52,6 +63,8 @@ pub enum TelegramOutboundMethod {
     EditMessageMedia(Box<EditMessageMedia>),
     /// Telegram `deleteMessage`.
     DeleteMessage(Box<DeleteMessage>),
+    /// Telegram `setMessageReaction`.
+    SetMessageReaction(Box<SetMessageReaction>),
 }
 
 /// Stable method discriminator for tests, metrics, and future persistence metadata.
@@ -95,6 +108,8 @@ pub enum TelegramOutboundMethodKind {
     EditMessageMedia,
     /// Telegram `deleteMessage`.
     DeleteMessage,
+    /// Telegram `setMessageReaction`.
+    SetMessageReaction,
 }
 
 /// Response shape returned by a concrete Telegram outbound method.
@@ -139,7 +154,73 @@ pub enum TelegramOutboundExecuteError {
     Rich(#[from] RichApiError),
 }
 
+/// Retry/terminal classification of one outbound Telegram send failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OutboundSendErrorClass {
+    /// Telegram flood control (429) with its wait hint.
+    RetryableRateLimited { retry_after_secs: u64 },
+    /// Failure that provably happened before the request reached Telegram.
+    RetryableTransient,
+    /// 403 or permission-shaped 400: the bot cannot post in this chat.
+    TerminalPermission,
+    /// Other 400s, including empty-text rejections.
+    TerminalBadRequest,
+    /// Everything else, including mid-response transport failures that may double-send.
+    TerminalOther,
+}
+
+impl OutboundSendErrorClass {
+    /// Stable string form for logs and diagnostics.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RetryableRateLimited { .. } => "retryable_rate_limited",
+            Self::RetryableTransient => "retryable_transient",
+            Self::TerminalPermission => "terminal_permission",
+            Self::TerminalBadRequest => "terminal_bad_request",
+            Self::TerminalOther => "terminal_other",
+        }
+    }
+}
+
 impl TelegramOutboundExecuteError {
+    pub fn classification(&self) -> OutboundSendErrorClass {
+        match self {
+            Self::Telegram(ExecuteError::Response(response))
+                if response.error_code() == Some(429) =>
+            {
+                OutboundSendErrorClass::RetryableRateLimited {
+                    retry_after_secs: response.retry_after().unwrap_or(60),
+                }
+            }
+            Self::Rich(RichApiError::Api {
+                code: 429,
+                retry_after,
+                ..
+            }) => OutboundSendErrorClass::RetryableRateLimited {
+                retry_after_secs: retry_after.unwrap_or(60),
+            },
+            _ if self.is_permission_error() => OutboundSendErrorClass::TerminalPermission,
+            Self::Telegram(ExecuteError::Response(response))
+                if response.error_code() == Some(400) =>
+            {
+                OutboundSendErrorClass::TerminalBadRequest
+            }
+            Self::Rich(RichApiError::Api { code: 400, .. }) => {
+                OutboundSendErrorClass::TerminalBadRequest
+            }
+            // Only connect-phase failures are provably pre-request; mid-response
+            // failures ("connection closed before message completed" style) may have
+            // been accepted by Telegram, so replaying them could double-send.
+            Self::Telegram(ExecuteError::Http(error)) if error.is_connect() => {
+                OutboundSendErrorClass::RetryableTransient
+            }
+            Self::Rich(RichApiError::Http(error)) if error.is_connect() => {
+                OutboundSendErrorClass::RetryableTransient
+            }
+            _ => OutboundSendErrorClass::TerminalOther,
+        }
+    }
+
     pub fn retry_after(&self) -> Option<u64> {
         match self {
             Self::Telegram(ExecuteError::Response(response))
@@ -203,6 +284,7 @@ impl TelegramOutboundMethod {
             Self::EditMessageReplyMarkup(_) => TelegramOutboundMethodKind::EditMessageReplyMarkup,
             Self::EditMessageMedia(_) => TelegramOutboundMethodKind::EditMessageMedia,
             Self::DeleteMessage(_) => TelegramOutboundMethodKind::DeleteMessage,
+            Self::SetMessageReaction(_) => TelegramOutboundMethodKind::SetMessageReaction,
         }
     }
 
@@ -228,6 +310,7 @@ impl TelegramOutboundMethod {
             Self::EditMessageReplyMarkup(_) => "editMessageReplyMarkup",
             Self::EditMessageMedia(_) => "editMessageMedia",
             Self::DeleteMessage(_) => "deleteMessage",
+            Self::SetMessageReaction(_) => "setMessageReaction",
         }
     }
 
@@ -252,7 +335,9 @@ impl TelegramOutboundMethod {
             | Self::EditMessageCaption(_)
             | Self::EditMessageReplyMarkup(_)
             | Self::EditMessageMedia(_) => TelegramOutboundResponseKind::EditMessage,
-            Self::DeleteMessage(_) => TelegramOutboundResponseKind::Boolean,
+            Self::DeleteMessage(_) | Self::SetMessageReaction(_) => {
+                TelegramOutboundResponseKind::Boolean
+            }
         }
     }
 
@@ -346,6 +431,10 @@ pub async fn execute_telegram_method(
             .execute(*method)
             .await
             .map(TelegramOutboundResponse::Boolean),
+        TelegramOutboundMethod::SetMessageReaction(method) => client
+            .execute(*method)
+            .await
+            .map(TelegramOutboundResponse::Boolean),
     }
 }
 
@@ -387,6 +476,65 @@ pub async fn send_telegram_method_status_with_rich(
     match execute_telegram_method_with_rich(client, rich, method).await {
         Ok(_) => DispatcherSendStatus::Sent,
         Err(_) => DispatcherSendStatus::Failed,
+    }
+}
+
+/// Send one outbound method, replaying it from a serialized snapshot on short 429s
+/// and pre-request connect failures, up to [`OUTBOUND_SEND_MAX_ATTEMPTS`] attempts.
+///
+/// Any other failure — including mid-response transport errors that may have already
+/// been accepted by Telegram — returns immediately, as does a method whose payload
+/// cannot be snapshot/replayed (photo/audio/media-group and other form-backed sends).
+pub async fn send_outbound_method_with_bounded_retry<Send, Fut>(
+    send: Send,
+    method: TelegramOutboundMethod,
+    virtual_id: &str,
+    chat_id: i64,
+) -> Result<TelegramOutboundResponse, TelegramOutboundExecuteError>
+where
+    Send: Fn(TelegramOutboundMethod) -> Fut,
+    Fut: Future<Output = Result<TelegramOutboundResponse, TelegramOutboundExecuteError>>,
+{
+    let snapshot = snapshot_outbound_method(&method);
+    let mut current = method;
+    let mut attempt: u32 = 1;
+    loop {
+        let error = match send(current).await {
+            Ok(response) => return Ok(response),
+            Err(error) => error,
+        };
+        let class = error.classification();
+        let delay = match class {
+            OutboundSendErrorClass::RetryableRateLimited { retry_after_secs }
+                if retry_after_secs <= OUTBOUND_RETRY_AFTER_INLINE_CAP_SECS =>
+            {
+                Duration::from_secs(retry_after_secs)
+            }
+            OutboundSendErrorClass::RetryableTransient => {
+                Duration::from_millis(500).saturating_mul(attempt)
+            }
+            _ => return Err(error),
+        };
+        if attempt >= OUTBOUND_SEND_MAX_ATTEMPTS {
+            return Err(error);
+        }
+        let Some(replayed) = snapshot
+            .as_ref()
+            .and_then(|(kind, bytes)| replay_outbound_method(*kind, bytes))
+        else {
+            return Err(error);
+        };
+        tracing::warn!(
+            virtual_id,
+            chat_id,
+            attempt,
+            class = class.as_str(),
+            error = %error,
+            "retrying outbound Telegram send"
+        );
+        tokio::time::sleep(delay).await;
+        current = replayed;
+        attempt += 1;
     }
 }
 
@@ -598,11 +746,26 @@ impl From<DeleteMessage> for TelegramOutboundMethod {
     }
 }
 
+impl From<SetMessageReaction> for TelegramOutboundMethod {
+    fn from(value: SetMessageReaction) -> Self {
+        Self::SetMessageReaction(Box::new(value))
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::{
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
+
+    use serde_json::json;
+
     use super::{
-        TelegramOutboundMethod, TelegramOutboundMethodKind, TelegramOutboundResponseKind,
-        classify_telegram_send_error, telegram_execute_error_is_reply_missing,
+        OutboundSendErrorClass, TelegramOutboundExecuteError, TelegramOutboundMethod,
+        TelegramOutboundMethodKind, TelegramOutboundResponse, TelegramOutboundResponseKind,
+        classify_telegram_send_error, send_outbound_method_with_bounded_retry,
+        telegram_execute_error_is_reply_missing,
     };
     use crate::{
         AudioMessageRequest, AudioSource, CallbackAnswerRequest, ChatActionRequest, ChatRef,
@@ -610,17 +773,17 @@ mod tests {
         EditReplyMarkupMessageRequest, EditTextMessageRequest, GuestQueryAnswerRequest,
         InlineArticleRequest, InlineKeyboardButton, InlineKeyboardMarkup, InlineQueryAnswerRequest,
         MediaGroupMessageRequest, MediaGroupPhotoItem, PhotoMessageRequest, PhotoSource,
-        StickerMessageRequest, SubscriptionInvoiceLinkRequest, TELEGRAM_PARSE_MODE_HTML,
-        TextMessageRequest, build_audio_message_method, build_callback_answer_method,
-        build_cancel_star_subscription_method, build_chat_action_method,
-        build_delete_message_method, build_donation_invoice_link_method,
+        RichApiError, StickerMessageRequest, SubscriptionInvoiceLinkRequest,
+        TELEGRAM_PARSE_MODE_HTML, TextMessageRequest, build_audio_message_method,
+        build_callback_answer_method, build_cancel_star_subscription_method,
+        build_chat_action_method, build_delete_message_method, build_donation_invoice_link_method,
         build_edit_caption_message_method, build_edit_media_message_method,
         build_edit_reply_markup_message_method, build_edit_text_message_method,
         build_guest_query_answer_method, build_inline_query_answer_method,
         build_inline_query_result_article, build_media_group_message_method,
-        build_photo_message_method, build_pre_checkout_ok_method, build_refund_star_payment_method,
-        build_sticker_message_method, build_subscription_invoice_link_method,
-        build_text_message_method,
+        build_message_reaction_method, build_photo_message_method, build_pre_checkout_ok_method,
+        build_refund_star_payment_method, build_sticker_message_method,
+        build_subscription_invoice_link_method, build_text_message_method,
     };
 
     fn chat(id: i64) -> ChatRef {
@@ -808,6 +971,7 @@ mod tests {
                 message_id: 7,
             },
         )?);
+        let message_reaction = build_message_reaction_method(42, 7, "🤔");
 
         let cases = [
             (
@@ -924,6 +1088,12 @@ mod tests {
                 "deleteMessage",
                 TelegramOutboundResponseKind::Boolean,
             ),
+            (
+                message_reaction,
+                TelegramOutboundMethodKind::SetMessageReaction,
+                "setMessageReaction",
+                TelegramOutboundResponseKind::Boolean,
+            ),
         ];
 
         for (method, kind, name, response_kind) in cases {
@@ -1016,6 +1186,370 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn message_reaction_builder_serializes_set_message_reaction_payload()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let method = build_message_reaction_method(42, 7, "🤔");
+
+        assert_eq!(
+            method.kind(),
+            TelegramOutboundMethodKind::SetMessageReaction
+        );
+        assert_eq!(method.method_name(), "setMessageReaction");
+        assert_eq!(
+            method.response_kind(),
+            TelegramOutboundResponseKind::Boolean
+        );
+
+        let TelegramOutboundMethod::SetMessageReaction(method) = method else {
+            panic!("expected setMessageReaction method");
+        };
+        let payload = serde_json::to_value(method.as_ref())?;
+        assert_eq!(payload["chat_id"], json!(42));
+        assert_eq!(payload["message_id"], json!(7));
+        assert_eq!(
+            payload["reaction"],
+            json!([{"type": "emoji", "emoji": "🤔"}])
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn classification_maps_429_403_400_and_transport_errors()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let cases: Vec<(TelegramOutboundExecuteError, OutboundSendErrorClass)> = vec![
+            (
+                rate_limited_error(2)?.into(),
+                OutboundSendErrorClass::RetryableRateLimited {
+                    retry_after_secs: 2,
+                },
+            ),
+            (
+                response_error(429, "Too Many Requests")?.into(),
+                OutboundSendErrorClass::RetryableRateLimited {
+                    retry_after_secs: 60,
+                },
+            ),
+            (
+                response_error(403, "Forbidden: bot was kicked from the group chat")?.into(),
+                OutboundSendErrorClass::TerminalPermission,
+            ),
+            (
+                response_error(400, "Bad Request: not enough rights to send text messages")?.into(),
+                OutboundSendErrorClass::TerminalPermission,
+            ),
+            (
+                response_error(400, "Bad Request: message text is empty")?.into(),
+                OutboundSendErrorClass::TerminalBadRequest,
+            ),
+            (
+                response_error(400, "Bad Request: chat not found")?.into(),
+                OutboundSendErrorClass::TerminalBadRequest,
+            ),
+            (
+                response_error(500, "Internal Server Error")?.into(),
+                OutboundSendErrorClass::TerminalOther,
+            ),
+            (
+                RichApiError::Api {
+                    code: 429,
+                    description: "Too Many Requests: retry after 3".to_owned(),
+                    retry_after: Some(3),
+                }
+                .into(),
+                OutboundSendErrorClass::RetryableRateLimited {
+                    retry_after_secs: 3,
+                },
+            ),
+            (
+                RichApiError::Api {
+                    code: 403,
+                    description: "Forbidden: bot was blocked by the user".to_owned(),
+                    retry_after: None,
+                }
+                .into(),
+                OutboundSendErrorClass::TerminalPermission,
+            ),
+            (
+                RichApiError::Api {
+                    code: 400,
+                    description: "Bad Request: message is too long".to_owned(),
+                    retry_after: None,
+                }
+                .into(),
+                OutboundSendErrorClass::TerminalBadRequest,
+            ),
+            (
+                RichApiError::Decode("connection closed before message completed".to_owned())
+                    .into(),
+                OutboundSendErrorClass::TerminalOther,
+            ),
+        ];
+
+        for (error, expected) in cases {
+            assert_eq!(error.classification(), expected, "{error}");
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn classification_marks_connect_failures_retryable_and_mid_response_terminal() {
+        let connect_error = reqwest::Client::new()
+            .get("http://127.0.0.1:1/")
+            .send()
+            .await
+            .expect_err("connecting to a closed port must fail");
+        assert!(connect_error.is_connect());
+        let error =
+            TelegramOutboundExecuteError::from(carapax::api::ExecuteError::Http(connect_error));
+        assert_eq!(
+            error.classification(),
+            OutboundSendErrorClass::RetryableTransient
+        );
+
+        // A listener that never answers: the connection succeeds (kernel backlog),
+        // so the timeout fires after the request left the process — mid-response.
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind local hung listener");
+        let addr = listener.local_addr().expect("hung listener address");
+        let mid_response_error = reqwest::Client::new()
+            .get(format!("http://{addr}/"))
+            .timeout(Duration::from_millis(200))
+            .send()
+            .await
+            .expect_err("request against a hung listener must time out");
+        assert!(!mid_response_error.is_connect());
+        let error = TelegramOutboundExecuteError::from(carapax::api::ExecuteError::Http(
+            mid_response_error,
+        ));
+        assert_eq!(
+            error.classification(),
+            OutboundSendErrorClass::TerminalOther
+        );
+        drop(listener);
+    }
+
+    fn text_send_method(chat_id: i64, text: &str) -> TelegramOutboundMethod {
+        TelegramOutboundMethod::from(carapax::types::SendMessage::new(chat_id, text))
+    }
+
+    fn rich_rate_limited(retry_after_secs: u64) -> TelegramOutboundExecuteError {
+        RichApiError::Api {
+            code: 429,
+            description: format!("Too Many Requests: retry after {retry_after_secs}"),
+            retry_after: Some(retry_after_secs),
+        }
+        .into()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bounded_retry_retries_short_429_then_succeeds() {
+        let sent_texts = Arc::new(Mutex::new(Vec::new()));
+
+        let result = send_outbound_method_with_bounded_retry(
+            {
+                let sent_texts = Arc::clone(&sent_texts);
+                move |method: TelegramOutboundMethod| {
+                    let sent_texts = Arc::clone(&sent_texts);
+                    async move {
+                        let TelegramOutboundMethod::SendMessage(send) = &method else {
+                            panic!("expected sendMessage method");
+                        };
+                        let payload =
+                            serde_json::to_value(send.as_ref()).expect("payload serializes");
+                        let attempts = {
+                            let mut sent_texts = sent_texts.lock().expect("sent texts lock");
+                            sent_texts.push(payload["text"].clone());
+                            sent_texts.len()
+                        };
+                        if attempts == 1 {
+                            Err(rich_rate_limited(2))
+                        } else {
+                            Ok(TelegramOutboundResponse::Boolean(true))
+                        }
+                    }
+                }
+            },
+            text_send_method(42, "hello"),
+            "vmsg-retry",
+            42,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Ok(TelegramOutboundResponse::Boolean(true))
+        ));
+        assert_eq!(
+            *sent_texts.lock().expect("sent texts lock"),
+            vec![json!("hello"), json!("hello")]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bounded_retry_stops_after_max_attempts() {
+        let attempts = Arc::new(Mutex::new(0u32));
+
+        let result = send_outbound_method_with_bounded_retry(
+            {
+                let attempts = Arc::clone(&attempts);
+                move |_method: TelegramOutboundMethod| {
+                    let attempts = Arc::clone(&attempts);
+                    async move {
+                        *attempts.lock().expect("attempts lock") += 1;
+                        Err::<TelegramOutboundResponse, _>(rich_rate_limited(1))
+                    }
+                }
+            },
+            text_send_method(42, "hello"),
+            "vmsg-exhausted",
+            42,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            *attempts.lock().expect("attempts lock"),
+            super::OUTBOUND_SEND_MAX_ATTEMPTS
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_retry_gives_up_on_permission_error() {
+        let attempts = Arc::new(Mutex::new(0u32));
+
+        let result = send_outbound_method_with_bounded_retry(
+            {
+                let attempts = Arc::clone(&attempts);
+                move |_method: TelegramOutboundMethod| {
+                    let attempts = Arc::clone(&attempts);
+                    async move {
+                        *attempts.lock().expect("attempts lock") += 1;
+                        Err::<TelegramOutboundResponse, _>(
+                            RichApiError::Api {
+                                code: 403,
+                                description: "Forbidden: bot was blocked by the user".to_owned(),
+                                retry_after: None,
+                            }
+                            .into(),
+                        )
+                    }
+                }
+            },
+            text_send_method(42, "hello"),
+            "vmsg-permission",
+            42,
+        )
+        .await;
+
+        let error = result.expect_err("permission error is terminal");
+        assert_eq!(
+            error.classification(),
+            OutboundSendErrorClass::TerminalPermission
+        );
+        assert_eq!(*attempts.lock().expect("attempts lock"), 1);
+    }
+
+    #[tokio::test]
+    async fn bounded_retry_does_not_replay_mid_response_transport_failures() {
+        let attempts = Arc::new(Mutex::new(0u32));
+
+        let result = send_outbound_method_with_bounded_retry(
+            {
+                let attempts = Arc::clone(&attempts);
+                move |_method: TelegramOutboundMethod| {
+                    let attempts = Arc::clone(&attempts);
+                    async move {
+                        *attempts.lock().expect("attempts lock") += 1;
+                        Err::<TelegramOutboundResponse, _>(
+                            RichApiError::Decode(
+                                "connection closed before message completed".to_owned(),
+                            )
+                            .into(),
+                        )
+                    }
+                }
+            },
+            text_send_method(42, "hello"),
+            "vmsg-mid-response",
+            42,
+        )
+        .await;
+
+        let error = result.expect_err("mid-response failure is terminal");
+        assert_eq!(
+            error.classification(),
+            OutboundSendErrorClass::TerminalOther
+        );
+        assert_eq!(*attempts.lock().expect("attempts lock"), 1);
+    }
+
+    #[tokio::test]
+    async fn bounded_retry_does_not_honor_long_retry_after() {
+        let attempts = Arc::new(Mutex::new(0u32));
+
+        let result = send_outbound_method_with_bounded_retry(
+            {
+                let attempts = Arc::clone(&attempts);
+                move |_method: TelegramOutboundMethod| {
+                    let attempts = Arc::clone(&attempts);
+                    async move {
+                        *attempts.lock().expect("attempts lock") += 1;
+                        Err::<TelegramOutboundResponse, _>(rich_rate_limited(30))
+                    }
+                }
+            },
+            text_send_method(42, "hello"),
+            "vmsg-long-wait",
+            42,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(*attempts.lock().expect("attempts lock"), 1);
+    }
+
+    #[tokio::test]
+    async fn bounded_retry_returns_error_when_method_cannot_be_replayed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let sticker = TelegramOutboundMethod::from(
+            build_sticker_message_method(
+                &StickerMessageRequest {
+                    chat: Some(chat(42)),
+                    message_thread_id: 0,
+                    disable_notification: false,
+                    file_id: "sticker-id".to_owned(),
+                },
+                None,
+            )
+            .expect("sticker method"),
+        );
+        let attempts = Arc::new(Mutex::new(0u32));
+
+        let result = send_outbound_method_with_bounded_retry(
+            {
+                let attempts = Arc::clone(&attempts);
+                move |_method: TelegramOutboundMethod| {
+                    let attempts = Arc::clone(&attempts);
+                    async move {
+                        *attempts.lock().expect("attempts lock") += 1;
+                        Err::<TelegramOutboundResponse, _>(rich_rate_limited(1))
+                    }
+                }
+            },
+            sticker,
+            "vmsg-no-replay",
+            42,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(*attempts.lock().expect("attempts lock"), 1);
+        Ok(())
+    }
+
     fn response_error(
         code: i64,
         description: &str,
@@ -1025,6 +1559,22 @@ mod tests {
                 "ok": false,
                 "error_code": code,
                 "description": description,
+            }))?;
+        match response.into_result() {
+            Ok(_) => panic!("test response unexpectedly succeeded"),
+            Err(error) => Ok(carapax::api::ExecuteError::Response(error)),
+        }
+    }
+
+    fn rate_limited_error(
+        retry_after: u64,
+    ) -> Result<carapax::api::ExecuteError, Box<dyn std::error::Error>> {
+        let response: carapax::types::Response<serde_json::Value> =
+            serde_json::from_value(serde_json::json!({
+                "ok": false,
+                "error_code": 429,
+                "description": format!("Too Many Requests: retry after {retry_after}"),
+                "parameters": {"retry_after": retry_after},
             }))?;
         match response.into_result() {
             Ok(_) => panic!("test response unexpectedly succeeded"),

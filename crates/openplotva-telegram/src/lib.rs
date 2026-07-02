@@ -67,14 +67,15 @@ pub use outbound::{
     build_inline_keyboard_button_data, build_inline_keyboard_button_url,
     build_inline_keyboard_button_web_app, build_inline_keyboard_markup, build_inline_keyboard_row,
     build_inline_query_answer_method, build_inline_query_result_article,
-    build_media_group_message_method, build_media_group_message_plan, build_photo_message_method,
-    build_photo_message_plan, build_pre_checkout_ok_method, build_private_settings_keyboard,
+    build_media_group_message_method, build_media_group_message_plan,
+    build_message_reaction_method, build_photo_message_method, build_photo_message_plan,
+    build_pre_checkout_ok_method, build_private_settings_keyboard,
     build_refund_star_payment_method, build_rich_message_method, build_sticker_message_method,
     build_sticker_message_plan, build_subscription_invoice_link_method, build_text_message_method,
     build_text_message_methods, classify_payment_payload, donation_invoice_payload,
-    fingerprint_audio_message_plan, fingerprint_photo_message_plan, fingerprint_rich_message,
-    fingerprint_sticker_message_plan, fingerprint_text_message_part, forum_thread_id,
-    guest_add_to_chat_url, guest_dialog_fallback_html, guest_inline_description,
+    fingerprint_audio_message_plan, fingerprint_message_reaction, fingerprint_photo_message_plan,
+    fingerprint_rich_message, fingerprint_sticker_message_plan, fingerprint_text_message_part,
+    forum_thread_id, guest_add_to_chat_url, guest_dialog_fallback_html, guest_inline_description,
     guest_inline_result_id, guest_unsupported_feature_html, hash_content, message_target_chat,
     parse_mode_from_go, prepare_guest_html, subscription_invoice_payload,
     subscription_invoice_price_stars, telegram_member_can_open_group_settings,
@@ -86,7 +87,7 @@ pub use persistence::{
     PersistentDispatcherRestoreReport, RedisDispatcherQueueStore, persistent_queue_from_drain,
     persistent_queue_redis_value_from_items, persistent_queue_replay_from_items,
     persistent_queue_replay_from_json, persistent_queue_replay_from_redis_value,
-    restore_persistent_queue_replay,
+    replay_outbound_method, restore_persistent_queue_replay, snapshot_outbound_method,
 };
 pub use rate_limit::{ChatLimiters, DEFAULT_DISPATCH_INTERVAL, DEFAULT_RATE_LIMITER_MAX_IDLE};
 pub use rich_api::{RichApiClient, RichApiError, RichMessage, RichSendOptions, SendRichMessage};
@@ -99,11 +100,12 @@ pub use stars::{
     StarTransactionsError, parse_star_subscription_payment,
 };
 pub use transport::{
+    OUTBOUND_RETRY_AFTER_INLINE_CAP_SECS, OUTBOUND_SEND_MAX_ATTEMPTS, OutboundSendErrorClass,
     TelegramOutboundExecuteError, TelegramOutboundMethod, TelegramOutboundMethodKind,
     TelegramOutboundResponse, TelegramOutboundResponseKind, TelegramSendErrorClassification,
     classify_telegram_send_error, execute_telegram_method, execute_telegram_method_with_rich,
-    send_telegram_method_status, send_telegram_method_status_with_rich,
-    telegram_execute_error_is_reply_missing,
+    send_outbound_method_with_bounded_retry, send_telegram_method_status,
+    send_telegram_method_status_with_rich, telegram_execute_error_is_reply_missing,
 };
 pub use update_startup::{
     GO_LONG_POLL_RETRY_DELAY, GO_LONG_POLL_TIMEOUT, GO_WEBHOOK_UPDATE_BUFFER_SIZE,

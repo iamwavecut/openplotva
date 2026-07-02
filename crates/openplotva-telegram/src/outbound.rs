@@ -8,9 +8,9 @@ use carapax::types::{
     GetChatAdministrators, GetChatMember, InlineKeyboardButton, InlineKeyboardMarkup,
     InlineQueryResult, InlineQueryResultArticle, InputFile, InputFileReader, InputMedia,
     InputMediaError, InputMediaPhoto, InputMessageContentText, InvoiceParameters, LabeledPrice,
-    MediaGroup, MediaGroupError, MediaGroupItem, ParseMode, RefundStarPayment, ReplyMarkup,
-    ReplyParameters, ReplyParametersError, SendAudio, SendChatAction, SendMediaGroup, SendMessage,
-    SendPhoto, SendSticker, WebAppInfo,
+    MediaGroup, MediaGroupError, MediaGroupItem, ParseMode, ReactionType, RefundStarPayment,
+    ReplyMarkup, ReplyParameters, ReplyParametersError, SendAudio, SendChatAction, SendMediaGroup,
+    SendMessage, SendPhoto, SendSticker, SetMessageReaction, WebAppInfo,
 };
 use crc::{CRC_32_ISCSI, Crc};
 use serde_json::{Map, Value, json};
@@ -19,9 +19,9 @@ use thiserror::Error;
 
 use crate::{
     DispatcherPersistencePayload, RICH_MESSAGE_MAX_CHARS, RichSendOptions, SendRichMessage,
-    TELEGRAM_PARSE_MODE_HTML, escape_telegram_html_text, extract_visible_text, format_rich_html,
-    rich_message_within_char_limit, sanitize_telegram_html, split_telegram_text,
-    strip_telegram_html,
+    TELEGRAM_PARSE_MODE_HTML, TelegramOutboundMethod, escape_telegram_html_text,
+    extract_visible_text, format_rich_html, rich_message_within_char_limit, sanitize_telegram_html,
+    split_telegram_text, strip_telegram_html,
 };
 
 pub const TELEGRAM_TEXT_MAX_BYTES: usize = 4096;
@@ -64,6 +64,7 @@ pub const DONATION_DESCRIPTION: &str = "Поддержите разработк�
 const MESSAGE_TYPE_STICKER: &str = "sticker";
 const MESSAGE_TYPE_PHOTO: &str = "photo";
 const MESSAGE_TYPE_AUDIO: &str = "audio";
+pub(crate) const MESSAGE_TYPE_REACTION: &str = "reaction";
 const CRC32_CASTAGNOLI: Crc<u32> = Crc::<u32>::new(&CRC_32_ISCSI);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1117,6 +1118,34 @@ pub fn build_edit_media_message_plan(req: &EditMediaMessageRequest) -> EditMedia
 
 pub fn hash_content(content: &str) -> u32 {
     CRC32_CASTAGNOLI.checksum(content.as_bytes())
+}
+
+/// Build an outbound `setMessageReaction` method with a single emoji reaction.
+pub fn build_message_reaction_method(
+    chat_id: i64,
+    message_id: i64,
+    emoji: &str,
+) -> TelegramOutboundMethod {
+    TelegramOutboundMethod::from(
+        SetMessageReaction::new(chat_id, message_id)
+            .with_reaction([ReactionType::Emoji(emoji.to_owned())]),
+    )
+}
+
+pub fn fingerprint_message_reaction(
+    chat_id: i64,
+    message_id: i64,
+    emoji: &str,
+) -> MessageFingerprint {
+    message_fingerprint(
+        chat_id,
+        MESSAGE_TYPE_REACTION,
+        hash_content(&reaction_fingerprint_content(message_id, emoji)),
+    )
+}
+
+pub(crate) fn reaction_fingerprint_content(message_id: i64, emoji: &str) -> String {
+    format!("{message_id}:{emoji}")
 }
 
 pub fn fingerprint_text_message_part(chat_id: i64, part: &str) -> MessageFingerprint {
