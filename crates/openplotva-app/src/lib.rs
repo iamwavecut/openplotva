@@ -7976,16 +7976,23 @@ async fn admin_routing_apply_action(
             admin_upsert_app_setting(routes, "llm.routing.revision", &(revision + 1).to_string())
                 .await;
     }
-    if let Some(handle) = routes.router_handle.as_ref()
-        && let Err(error) = model_routing::reload_router(handle, pool).await
-    {
-        if let Some(reporter) = routes.routing_event_reporter.as_ref() {
-            reporter.record(runtime_routing::router_reload_failed_event(
-                "admin_routing_reload",
-                &error.to_string(),
-            ));
+    if let Some(handle) = routes.router_handle.as_ref() {
+        match model_routing::reload_router(handle, pool).await {
+            Ok(()) => {
+                if let Some(pools) = routes.router_pools.as_ref() {
+                    pools.apply(&handle.snapshot().pool_specs());
+                }
+            }
+            Err(error) => {
+                if let Some(reporter) = routes.routing_event_reporter.as_ref() {
+                    reporter.record(runtime_routing::router_reload_failed_event(
+                        "admin_routing_reload",
+                        &error.to_string(),
+                    ));
+                }
+                tracing::warn!(%error, "failed to reload router after admin routing change");
+            }
         }
-        tracing::warn!(%error, "failed to reload router after admin routing change");
     }
     Ok(result)
 }
@@ -9197,6 +9204,25 @@ async fn start_runtime_workers(
             &error.to_string(),
         ));
         tracing::warn!(%error, "failed to backfill Boogu image slot workflows");
+    }
+    if let Err(error) = model_routing::backfill_provider_protocols(&service_clients.postgres).await
+    {
+        routing_event_reporter.record(runtime_routing::routing_backfill_failed_event(
+            "backfill_provider_protocols",
+            &error.to_string(),
+        ));
+        tracing::warn!(%error, "failed to backfill provider protocols");
+    }
+    // Runs after every provider/model backfill above so the pools can attach
+    // to whatever those steps created.
+    if let Err(error) =
+        model_routing::backfill_capacity_pools(&service_clients.postgres, config).await
+    {
+        routing_event_reporter.record(runtime_routing::routing_backfill_failed_event(
+            "backfill_capacity_pools",
+            &error.to_string(),
+        ));
+        tracing::warn!(%error, "failed to backfill capacity pools");
     }
     let router_breakers = Arc::new(openplotva_llm::router::BreakerSet::new());
     let router_triggers = Arc::new(openplotva_llm::router::TriggerState::new());
