@@ -722,6 +722,8 @@ fn install_static_web_routes(router: axum::Router, static_web: StaticWebRoutes) 
         .route("/admin/api/state", any(admin_state))
         .route("/admin/api/loglevel", any(admin_loglevel))
         .route("/admin/api/routing", any(admin_routing))
+        .route("/admin/api/routing/status", any(admin_routing_status))
+        .route("/admin/api/routing/events", any(admin_routing_events))
         .route("/admin/api/logs/stream", any(admin_logs_stream))
         .route("/admin/api/bootstrap", get(admin_bootstrap))
         .route("/admin/api/metrics", any(admin_state))
@@ -7619,11 +7621,26 @@ fn provider_key_state(provider: &openplotva_storage::llm_routing::ProviderRecord
 fn provider_input_from_json(
     value: &serde_json::Value,
 ) -> Result<openplotva_storage::llm_routing::ProviderInput, String> {
+    let protocol = routing_json_str(value, "protocol");
+    if let Some(protocol) = protocol.as_deref() {
+        let Some(parsed) = openplotva_llm::provider_schema::Protocol::from_db(protocol) else {
+            return Err(format!("unknown protocol {protocol}"));
+        };
+        let config = value.get("config").cloned().unwrap_or_else(|| json!({}));
+        openplotva_llm::provider_schema::validate_provider_config(parsed, &config)
+            .map_err(|error| error.to_string())?;
+    }
+    let runtime_hint = routing_json_str(value, "runtime_hint");
+    if let Some(hint) = runtime_hint.as_deref()
+        && openplotva_llm::provider_schema::RuntimeHint::from_db(hint).is_none()
+    {
+        return Err(format!("unknown runtime_hint {hint}"));
+    }
     let mut input = openplotva_storage::llm_routing::ProviderInput {
         name: routing_json_str(value, "name").ok_or("name is required")?,
         kind: routing_json_str(value, "kind").unwrap_or_else(|| "chat".to_owned()),
-        protocol: routing_json_str(value, "protocol"),
-        runtime_hint: routing_json_str(value, "runtime_hint"),
+        protocol,
+        runtime_hint,
         endpoint: routing_json_str(value, "endpoint"),
         discovery_service_name: routing_json_str(value, "discovery_service_name"),
         discovery_endpoint_name: routing_json_str(value, "discovery_endpoint_name"),
@@ -7647,6 +7664,10 @@ fn provider_input_from_json(
 fn model_input_from_json(
     value: &serde_json::Value,
 ) -> Result<openplotva_storage::llm_routing::ModelInput, String> {
+    if let Some(config) = value.get("config") {
+        openplotva_llm::provider_schema::validate_model_config(config)
+            .map_err(|error| error.to_string())?;
+    }
     Ok(openplotva_storage::llm_routing::ModelInput {
         provider_id: value
             .get("provider_id")
@@ -7690,19 +7711,114 @@ fn assignment_input_from_json(
 fn trigger_input_from_json(
     value: &serde_json::Value,
 ) -> Result<openplotva_storage::llm_routing::TriggerInput, String> {
+    let mut input = trigger_input_from_json_without_engage(value)?;
+    input.engage_assignment_id = value
+        .get("engage_assignment_id")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or("engage_assignment_id is required")?;
+    Ok(input)
+}
+
+/// Trigger fields without the engage target, for the atomic
+/// assignment-plus-trigger create where the target id does not exist yet.
+fn trigger_input_from_json_without_engage(
+    value: &serde_json::Value,
+) -> Result<openplotva_storage::llm_routing::TriggerInput, String> {
     Ok(openplotva_storage::llm_routing::TriggerInput {
         workflow_key: routing_json_str(value, "workflow_key").ok_or("workflow_key is required")?,
         trigger_type: routing_json_str(value, "trigger_type").ok_or("trigger_type is required")?,
-        engage_assignment_id: value
-            .get("engage_assignment_id")
-            .and_then(serde_json::Value::as_i64)
-            .ok_or("engage_assignment_id is required")?,
+        engage_assignment_id: 0,
         enabled: routing_json_bool(value, "enabled", true),
         queue_name: routing_json_str(value, "queue_name"),
         high_watermark: routing_json_i32(value, "high_watermark"),
         low_watermark: routing_json_i32(value, "low_watermark"),
         params: value.get("params").cloned().unwrap_or_else(|| json!({})),
     })
+}
+
+/// Server-side model-list fetch for the admin "Fetch models" flow: calls the
+/// provider's listing endpoint and returns a diff against its imported models
+/// (`new` / `existing` / `gone`). Read-only: import is a separate action.
+async fn admin_fetch_provider_models(
+    pool: &PgPool,
+    provider_id: i64,
+    body: &serde_json::Value,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let bad = |error: String| (StatusCode::BAD_REQUEST, error);
+    let provider = openplotva_storage::llm_routing::get_provider(pool, provider_id)
+        .await
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .ok_or_else(|| bad(format!("unknown provider {provider_id}")))?;
+    let protocol = provider
+        .protocol
+        .as_deref()
+        .and_then(openplotva_llm::provider_schema::Protocol::from_db)
+        .ok_or_else(|| bad("provider has no protocol; set one first".to_owned()))?;
+    if !protocol.supports_model_listing() {
+        return Err(bad(format!(
+            "protocol {} has no model listing endpoint; add models manually",
+            protocol.as_str()
+        )));
+    }
+    let base_url = routing_json_str(body, "base_url")
+        .or_else(|| provider.endpoint.clone())
+        .filter(|url| !url.trim().is_empty())
+        .ok_or_else(|| bad("provider has no endpoint to list models from".to_owned()))?;
+    let api_key = provider
+        .api_key_ref
+        .as_deref()
+        .filter(|reference| !reference.trim().is_empty())
+        .and_then(|reference| std::env::var(reference.trim()).ok())
+        .or_else(|| {
+            provider.api_key_encrypted.as_deref().and_then(|sealed| {
+                openplotva_storage::llm_routing::open_key(&routing_master_secret(), sealed).ok()
+            })
+        });
+    let remote = openplotva_llm::model_listing::list_openai_compat_models(
+        &base_url,
+        api_key.as_deref(),
+        Duration::from_secs(10),
+    )
+    .await
+    .map_err(|error| (StatusCode::BAD_GATEWAY, error.to_string()))?;
+
+    let imported: Vec<(i64, String)> = openplotva_storage::llm_routing::list_models(pool)
+        .await
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .into_iter()
+        .filter(|model| model.provider_id == provider_id)
+        .map(|model| (model.id, model.model_name))
+        .collect();
+    let imported_names: std::collections::HashSet<&str> =
+        imported.iter().map(|(_, name)| name.as_str()).collect();
+    let remote_names: std::collections::HashSet<&str> =
+        remote.iter().map(|model| model.name.as_str()).collect();
+
+    let new: Vec<&str> = remote
+        .iter()
+        .map(|model| model.name.as_str())
+        .filter(|name| !imported_names.contains(name))
+        .collect();
+    let existing: Vec<serde_json::Value> = imported
+        .iter()
+        .filter(|(_, name)| remote_names.contains(name.as_str()))
+        .map(|(id, name)| json!({ "id": id, "model_name": name }))
+        .collect();
+    let gone: Vec<serde_json::Value> = imported
+        .iter()
+        .filter(|(_, name)| !remote_names.contains(name.as_str()))
+        .map(|(id, name)| json!({ "id": id, "model_name": name }))
+        .collect();
+    Ok(json!({
+        "ok": true,
+        "provider_id": provider_id,
+        "base_url": base_url,
+        "models": remote
+            .iter()
+            .map(|model| json!({ "model_name": model.name, "meta": model.raw }))
+            .collect::<Vec<_>>(),
+        "diff": { "new": new, "existing": existing, "gone": gone },
+    }))
 }
 
 async fn admin_routing_snapshot_json(pool: &PgPool) -> Result<serde_json::Value, String> {
@@ -7717,6 +7833,8 @@ async fn admin_routing_snapshot_json(pool: &PgPool) -> Result<serde_json::Value,
                 "id": provider.id,
                 "name": provider.name,
                 "kind": provider.kind,
+                "protocol": provider.protocol,
+                "runtime_hint": provider.runtime_hint,
                 "endpoint": provider.endpoint,
                 "discovery_service_name": provider.discovery_service_name,
                 "discovery_endpoint_name": provider.discovery_endpoint_name,
@@ -7739,6 +7857,7 @@ async fn admin_routing_snapshot_json(pool: &PgPool) -> Result<serde_json::Value,
                 "base_url": model.base_url,
                 "capabilities": model.capabilities,
                 "embedding_dim": model.embedding_dim,
+                "pool_id": model.pool_id,
                 "enabled": model.enabled,
                 "config": model.config,
             })
@@ -7795,13 +7914,43 @@ async fn admin_routing_snapshot_json(pool: &PgPool) -> Result<serde_json::Value,
             })
         })
         .collect();
+    let pools: Vec<serde_json::Value> = snapshot
+        .pools
+        .iter()
+        .map(|pool| {
+            json!({
+                "id": pool.id,
+                "name": pool.name,
+                "max_concurrency": pool.max_concurrency,
+                "description": pool.description,
+            })
+        })
+        .collect();
     Ok(json!({
         "providers": providers,
         "models": models,
         "workflows": workflows,
         "assignments": assignments,
         "triggers": triggers,
+        "pools": pools,
+        "param_descriptors": routing_param_descriptors(),
     }))
+}
+
+/// Static parameter-form descriptors for every (protocol, runtime hint) pair,
+/// so the admin UI renders typed provider/model forms without hardcoding them.
+fn routing_param_descriptors() -> serde_json::Value {
+    use openplotva_llm::provider_schema::{Protocol, RuntimeHint, param_descriptor};
+    let mut descriptors = Vec::new();
+    for protocol in Protocol::all() {
+        descriptors.push(param_descriptor(*protocol, None));
+        if *protocol == Protocol::OpenAiCompat {
+            for hint in RuntimeHint::all() {
+                descriptors.push(param_descriptor(*protocol, Some(*hint)));
+            }
+        }
+    }
+    serde_json::Value::Array(descriptors)
 }
 
 async fn admin_routing_apply_action(
@@ -7970,6 +8119,167 @@ async fn admin_routing_apply_action(
                 .map_err(storage_err)?;
             json!({ "ok": true })
         }
+        "create_pool" => {
+            let name = routing_json_str(body, "name").ok_or(bad("name is required".to_owned()))?;
+            let input = openplotva_storage::llm_routing::PoolInput {
+                name,
+                max_concurrency: routing_json_i32(body, "max_concurrency"),
+                description: routing_json_str(body, "description"),
+            };
+            if input.max_concurrency.is_some_and(|max| max < 1) {
+                return Err(bad("max_concurrency must be positive or null".to_owned()));
+            }
+            let id = routing::insert_pool(pool, &input)
+                .await
+                .map_err(storage_err)?;
+            json!({ "ok": true, "id": id })
+        }
+        "update_pool" => {
+            let id = id_of(body).ok_or(bad("id is required".to_owned()))?;
+            let name = routing_json_str(body, "name").ok_or(bad("name is required".to_owned()))?;
+            let input = openplotva_storage::llm_routing::PoolInput {
+                name,
+                max_concurrency: routing_json_i32(body, "max_concurrency"),
+                description: routing_json_str(body, "description"),
+            };
+            if input.max_concurrency.is_some_and(|max| max < 1) {
+                return Err(bad("max_concurrency must be positive or null".to_owned()));
+            }
+            routing::update_pool(pool, id, &input)
+                .await
+                .map_err(storage_err)?;
+            json!({ "ok": true })
+        }
+        "delete_pool" => {
+            let id = id_of(body).ok_or(bad("id is required".to_owned()))?;
+            // FK is ON DELETE SET NULL: attached models degrade to unpooled.
+            routing::delete_pool(pool, id).await.map_err(storage_err)?;
+            json!({ "ok": true })
+        }
+        "set_model_pool" => {
+            let id = id_of(body).ok_or(bad("id is required".to_owned()))?;
+            let pool_id = body.get("pool_id").and_then(serde_json::Value::as_i64);
+            routing::set_model_pool(pool, id, pool_id)
+                .await
+                .map_err(storage_err)?;
+            json!({ "ok": true })
+        }
+        "set_primary_weights" => {
+            let weights = body
+                .get("weights")
+                .and_then(serde_json::Value::as_array)
+                .ok_or(bad("weights array is required".to_owned()))?
+                .iter()
+                .map(|entry| {
+                    let id = entry
+                        .get("id")
+                        .and_then(serde_json::Value::as_i64)
+                        .ok_or_else(|| "each weight entry needs an id".to_owned())?;
+                    let weight = routing_json_i32(entry, "weight");
+                    if weight.is_some_and(|weight| !(0..=100).contains(&weight)) {
+                        return Err(format!("weight for assignment {id} must be 0..=100"));
+                    }
+                    Ok((id, weight))
+                })
+                .collect::<Result<Vec<_>, String>>()
+                .map_err(bad)?;
+            routing::set_assignment_weights(pool, &weights)
+                .await
+                .map_err(storage_err)?;
+            json!({ "ok": true, "updated": weights.len() })
+        }
+        "set_fallback_order" => {
+            let ordered_ids = body
+                .get("ordered_ids")
+                .and_then(serde_json::Value::as_array)
+                .ok_or(bad("ordered_ids array is required".to_owned()))?
+                .iter()
+                .map(|entry| {
+                    entry
+                        .as_i64()
+                        .ok_or_else(|| "ordered_ids must be assignment ids".to_owned())
+                })
+                .collect::<Result<Vec<_>, String>>()
+                .map_err(bad)?;
+            routing::set_assignment_fallback_orders(pool, &ordered_ids)
+                .await
+                .map_err(storage_err)?;
+            json!({ "ok": true, "updated": ordered_ids.len() })
+        }
+        "create_trigger_with_assignment" => {
+            let mut assignment = assignment_input_from_json(body).map_err(bad)?;
+            assignment.role = "overflow".to_owned();
+            if assignment.weight.is_none() {
+                assignment.weight = Some(100);
+            }
+            let mut trigger = trigger_input_from_json_without_engage(body).map_err(bad)?;
+            trigger.workflow_key = assignment.workflow_key.clone();
+            let (assignment_id, trigger_id) =
+                routing::insert_trigger_with_assignment(pool, &assignment, &trigger)
+                    .await
+                    .map_err(storage_err)?;
+            json!({ "ok": true, "assignment_id": assignment_id, "trigger_id": trigger_id })
+        }
+        "fetch_provider_models" => {
+            let id = id_of(body).ok_or(bad("id is required".to_owned()))?;
+            return admin_fetch_provider_models(pool, id, body).await;
+        }
+        "import_models" => {
+            let provider_id = body
+                .get("provider_id")
+                .and_then(serde_json::Value::as_i64)
+                .ok_or(bad("provider_id is required".to_owned()))?;
+            let names: Vec<String> = body
+                .get("names")
+                .and_then(serde_json::Value::as_array)
+                .ok_or(bad("names array is required".to_owned()))?
+                .iter()
+                .filter_map(|name| name.as_str())
+                .map(str::to_owned)
+                .collect();
+            if names.is_empty() {
+                return Err(bad("names must contain at least one model name".to_owned()));
+            }
+            let defaults = body.get("defaults").cloned().unwrap_or_else(|| json!({}));
+            let capabilities = routing_capabilities(&defaults);
+            let capabilities = if capabilities.is_empty() {
+                vec!["chat".to_owned()]
+            } else {
+                capabilities
+            };
+            let pool_id = defaults.get("pool_id").and_then(serde_json::Value::as_i64);
+            let existing: std::collections::HashSet<String> = routing::list_models(pool)
+                .await
+                .map_err(storage_err)?
+                .into_iter()
+                .filter(|model| model.provider_id == provider_id)
+                .map(|model| model.model_name)
+                .collect();
+            let mut created = Vec::new();
+            for name in names {
+                if existing.contains(&name) {
+                    continue;
+                }
+                let id = routing::insert_model(
+                    pool,
+                    &openplotva_storage::llm_routing::ModelInput {
+                        provider_id,
+                        model_name: name,
+                        display_name: None,
+                        base_url: None,
+                        capabilities: capabilities.clone(),
+                        embedding_dim: None,
+                        pool_id,
+                        enabled: true,
+                        config: json!({}),
+                    },
+                )
+                .await
+                .map_err(storage_err)?;
+                created.push(id);
+            }
+            json!({ "ok": true, "created_ids": created })
+        }
         "reload" => json!({ "ok": true }),
         other => return Err(bad(format!("unknown action {other}"))),
     };
@@ -8039,6 +8349,200 @@ async fn admin_routing(
         Ok(value) => admin_json_response(StatusCode::OK, value),
         Err((status, error)) => admin_error_response(status, &error),
     }
+}
+
+/// Cheap, poll-safe live view for the routing cockpit: pool occupancy,
+/// breaker states, trigger engagement, capacity cooldowns, worker scale, and
+/// the in-process event ring. No database round-trip.
+async fn admin_routing_status(
+    method: Method,
+    headers: HeaderMap,
+    Extension(routes): Extension<StaticWebRoutes>,
+) -> Response {
+    if method != Method::GET {
+        return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+    }
+    if let Err(error) = require_admin_request(&headers, &routes.admin_ids, &routes.bot_token) {
+        return admin_auth_failure_response(error);
+    }
+    let now = std::time::Instant::now();
+    let pools: Vec<serde_json::Value> = routes
+        .router_pools
+        .as_ref()
+        .map(|pools| pools.occupancy())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|occupancy| {
+            json!({
+                "id": occupancy.id,
+                "max_concurrency": occupancy.max_concurrency,
+                "in_flight": occupancy.in_flight,
+            })
+        })
+        .collect();
+    let breakers: Vec<serde_json::Value> = routes
+        .router_breakers
+        .as_ref()
+        .map(|breakers| breakers.states_at(now))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|state| {
+            json!({
+                "provider_id": state.provider,
+                "model_id": state.model,
+                "consecutive_failures": state.consecutive_failures,
+                "open": state.open,
+                "cooldown_remaining_ms": state
+                    .cooldown_remaining
+                    .map(|left| u64::try_from(left.as_millis()).unwrap_or(u64::MAX)),
+            })
+        })
+        .collect();
+    let engaged_triggers = routes
+        .router_triggers
+        .as_ref()
+        .map(|triggers| triggers.engaged_ids())
+        .unwrap_or_default();
+    let capacity_cooldowns: Vec<serde_json::Value> = routes
+        .router_triggers
+        .as_ref()
+        .map(|triggers| triggers.capacity_snapshot_at(now))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(provider, model, left)| {
+            json!({
+                "provider_id": provider,
+                "model_id": model,
+                "remaining_ms": u64::try_from(left.as_millis()).unwrap_or(u64::MAX),
+            })
+        })
+        .collect();
+    let workers = routes
+        .dialog_worker_gauge
+        .as_ref()
+        .map(|gauge| {
+            json!({
+                "dialog": { "desired": gauge.desired(), "running": gauge.running() }
+            })
+        })
+        .unwrap_or_else(|| json!({}));
+    let recent_events: Vec<serde_json::Value> = routes
+        .routing_event_buffer
+        .as_ref()
+        .map(|buffer| buffer.routing_events(20))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|event| routing_event_data_json(&event))
+        .collect();
+    let revision = admin_app_setting(&routes, "llm.routing.revision")
+        .await
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(0);
+    admin_json_no_cache_response(
+        StatusCode::OK,
+        json!({
+            "revision": revision,
+            "pools": pools,
+            "breakers": breakers,
+            "engaged_triggers": engaged_triggers,
+            "capacity_cooldowns": capacity_cooldowns,
+            "workers": workers,
+            "recent_events": recent_events,
+        }),
+    )
+}
+
+/// Keyset-paginated journal over `llm_routing_events` with optional
+/// `workflow` / `severity` filters and a `before_id` cursor.
+async fn admin_routing_events(
+    method: Method,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Extension(routes): Extension<StaticWebRoutes>,
+) -> Response {
+    if method != Method::GET {
+        return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+    }
+    if let Err(error) = require_admin_request(&headers, &routes.admin_ids, &routes.bot_token) {
+        return admin_auth_failure_response(error);
+    }
+    let Some(pool) = routes.postgres.clone() else {
+        return admin_error_response(StatusCode::SERVICE_UNAVAILABLE, "database unavailable");
+    };
+    let values = admin_auth_query_values(raw_query.as_deref());
+    let limit = values
+        .get("limit")
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(50);
+    let before_id = values
+        .get("before_id")
+        .and_then(|value| value.parse::<i64>().ok());
+    let workflow = values
+        .get("workflow")
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    let severity = values
+        .get("severity")
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    match openplotva_storage::llm_routing::list_routing_events_page(
+        &pool,
+        limit,
+        before_id,
+        workflow.as_deref(),
+        severity.as_deref(),
+    )
+    .await
+    {
+        Ok(events) => {
+            let next_before_id = events.last().map(|event| event.id);
+            let events: Vec<serde_json::Value> = events
+                .iter()
+                .map(|event| {
+                    json!({
+                        "id": event.id,
+                        "created_at": event
+                            .created_at
+                            .format(&time::format_description::well_known::Rfc3339)
+                            .unwrap_or_default(),
+                        "severity": event.severity,
+                        "event_type": event.event_type,
+                        "workflow_key": event.workflow_key,
+                        "provider_id": event.provider_id,
+                        "model_id": event.model_id,
+                        "queue_name": event.queue_name,
+                        "job_id": event.job_id,
+                        "chat_id": event.chat_id,
+                        "summary": event.summary,
+                        "detail": event.detail,
+                    })
+                })
+                .collect();
+            admin_json_no_cache_response(
+                StatusCode::OK,
+                json!({ "events": events, "next_before_id": next_before_id }),
+            )
+        }
+        Err(error) => {
+            tracing::warn!(%error, "failed to list routing events");
+            admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed")
+        }
+    }
+}
+
+fn routing_event_data_json(event: &runtime_routing::RoutingEventData) -> serde_json::Value {
+    json!({
+        "id": event.id,
+        "at_millis": event.at_millis,
+        "severity": event.severity,
+        "event_type": event.event_type,
+        "workflow_key": event.workflow_key,
+        "provider_id": event.provider_id,
+        "model_id": event.model_id,
+        "queue_name": event.queue_name,
+        "summary": event.summary,
+        "detail": event.detail,
+    })
 }
 
 #[derive(Debug)]
@@ -12504,6 +13008,86 @@ mod tests {
         sync::{Arc, Mutex, MutexGuard},
         time::Duration,
     };
+
+    mod routing_admin_inputs {
+        use serde_json::json;
+
+        use crate::{model_input_from_json, provider_input_from_json, routing_param_descriptors};
+
+        #[test]
+        fn provider_input_accepts_typed_protocol_and_hint() {
+            let input = provider_input_from_json(&json!({
+                "name": "my-sglang",
+                "kind": "chat",
+                "protocol": "openai_compat",
+                "runtime_hint": "sglang",
+                "endpoint": "https://sglang.local/v1",
+                "api_key_ref": "MY_KEY",
+            }))
+            .expect("valid provider input");
+            assert_eq!(input.protocol.as_deref(), Some("openai_compat"));
+            assert_eq!(input.runtime_hint.as_deref(), Some("sglang"));
+        }
+
+        #[test]
+        fn provider_input_rejects_unknown_protocol_and_hint() {
+            let error = provider_input_from_json(&json!({
+                "name": "x",
+                "protocol": "grpc",
+            }))
+            .expect_err("unknown protocol must be rejected");
+            assert!(error.contains("unknown protocol"));
+
+            let error = provider_input_from_json(&json!({
+                "name": "x",
+                "runtime_hint": "llamacpp",
+            }))
+            .expect_err("unknown runtime hint must be rejected");
+            assert!(error.contains("unknown runtime_hint"));
+        }
+
+        #[test]
+        fn provider_input_validates_config_against_schema() {
+            let error = provider_input_from_json(&json!({
+                "name": "x",
+                "protocol": "openai_compat",
+                "config": { "timeout_ms": 0 },
+            }))
+            .expect_err("zero timeout must be rejected");
+            assert!(error.contains("timeout_ms"));
+        }
+
+        #[test]
+        fn model_input_parses_pool_id_and_validates_config() {
+            let input = model_input_from_json(&json!({
+                "provider_id": 5,
+                "model_name": "qwen3.6-35b-a3b",
+                "pool_id": 7,
+                "config": { "temperature": 0.4 },
+            }))
+            .expect("valid model input");
+            assert_eq!(input.pool_id, Some(7));
+
+            let error = model_input_from_json(&json!({
+                "provider_id": 5,
+                "model_name": "x",
+                "config": { "temperature": 9.0 },
+            }))
+            .expect_err("out-of-range temperature must be rejected");
+            assert!(error.contains("temperature"));
+        }
+
+        #[test]
+        fn param_descriptors_cover_every_protocol() {
+            let descriptors = routing_param_descriptors();
+            let list = descriptors.as_array().expect("array");
+            assert!(list.len() >= 6, "one descriptor per protocol at minimum");
+            assert!(
+                list.iter()
+                    .any(|entry| entry["runtime_hint"] == json!("sglang"))
+            );
+        }
+    }
 
     use axum::{
         body::{Bytes, to_bytes},

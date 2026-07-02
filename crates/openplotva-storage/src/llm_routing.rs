@@ -251,6 +251,9 @@ const SQL_UPDATE_ASSIGNMENT: &str = "UPDATE workflow_assignments SET workflow_ke
 const SQL_DELETE_ASSIGNMENT: &str = "DELETE FROM workflow_assignments WHERE id = $1";
 const SQL_DELETE_ASSIGNMENTS_FOR_SCOPE: &str =
     "DELETE FROM workflow_assignments WHERE workflow_key = $1 AND scope = $2";
+const SQL_SET_ASSIGNMENT_WEIGHT: &str = "UPDATE workflow_assignments SET weight = $2 WHERE id = $1";
+const SQL_SET_ASSIGNMENT_FALLBACK_ORDER: &str =
+    "UPDATE workflow_assignments SET fallback_order = $2 WHERE id = $1";
 
 const SQL_LIST_TRIGGERS: &str = "SELECT id, workflow_key, trigger_type, engage_assignment_id, enabled, queue_name, high_watermark, low_watermark, params::text AS params FROM workflow_triggers ORDER BY id ASC";
 const SQL_INSERT_TRIGGER: &str = "INSERT INTO workflow_triggers (workflow_key, trigger_type, engage_assignment_id, enabled, queue_name, high_watermark, low_watermark, params) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb) RETURNING id";
@@ -879,6 +882,81 @@ pub async fn delete_assignments_for_scope(
     Ok(())
 }
 
+/// Batched weight save: update every (id, weight) pair in one transaction so a
+/// draft rebalance lands atomically and triggers exactly one router reload.
+pub async fn set_assignment_weights(
+    pool: &PgPool,
+    weights: &[(i64, Option<i32>)],
+) -> Result<(), StorageError> {
+    let mut tx = pool.begin().await?;
+    for (id, weight) in weights {
+        sqlx::query(SQL_SET_ASSIGNMENT_WEIGHT)
+            .bind(id)
+            .bind(weight)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Batched fallback reorder: assign ascending `fallback_order` following the
+/// given id order, in one transaction (fixes the old two-POST swap race).
+pub async fn set_assignment_fallback_orders(
+    pool: &PgPool,
+    ordered_ids: &[i64],
+) -> Result<(), StorageError> {
+    let mut tx = pool.begin().await?;
+    for (position, id) in ordered_ids.iter().enumerate() {
+        sqlx::query(SQL_SET_ASSIGNMENT_FALLBACK_ORDER)
+            .bind(id)
+            .bind(i32::try_from(position).unwrap_or(i32::MAX))
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Create an overflow assignment and its trigger in one transaction, so a
+/// failed trigger insert can never strand an orphan assignment.
+pub async fn insert_trigger_with_assignment(
+    pool: &PgPool,
+    assignment: &AssignmentInput,
+    trigger: &TriggerInput,
+) -> Result<(i64, i64), StorageError> {
+    let mut tx = pool.begin().await?;
+    let assignment_id = sqlx::query(SQL_INSERT_ASSIGNMENT)
+        .bind(&assignment.workflow_key)
+        .bind(&assignment.scope)
+        .bind(&assignment.role)
+        .bind(assignment.provider_model_id)
+        .bind(assignment.weight)
+        .bind(assignment.fallback_order)
+        .bind(assignment.canary_percent)
+        .bind(assignment.enabled)
+        .bind(json_text(&assignment.inference_overrides))
+        .bind(assignment.cb_failure_threshold)
+        .bind(assignment.cb_cooldown_ms)
+        .fetch_one(&mut *tx)
+        .await?
+        .try_get::<i64, _>("id")?;
+    let trigger_id = sqlx::query(SQL_INSERT_TRIGGER)
+        .bind(&trigger.workflow_key)
+        .bind(&trigger.trigger_type)
+        .bind(assignment_id)
+        .bind(trigger.enabled)
+        .bind(trigger.queue_name.as_deref())
+        .bind(trigger.high_watermark)
+        .bind(trigger.low_watermark)
+        .bind(json_text(&trigger.params))
+        .fetch_one(&mut *tx)
+        .await?
+        .try_get::<i64, _>("id")?;
+    tx.commit().await?;
+    Ok((assignment_id, trigger_id))
+}
+
 pub async fn list_triggers(pool: &PgPool) -> Result<Vec<TriggerRecord>, StorageError> {
     sqlx::query(SQL_LIST_TRIGGERS)
         .fetch_all(pool)
@@ -973,6 +1051,51 @@ pub async fn list_routing_events(
     let limit = limit.clamp(1, 1_000);
     sqlx::query(SQL_LIST_ROUTING_EVENTS)
         .bind(limit)
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .map(routing_event_from_row)
+        .collect()
+}
+
+const SQL_LIST_ROUTING_EVENTS_PAGE: &str = r#"SELECT
+    id,
+    created_at,
+    severity,
+    event_type,
+    workflow_key,
+    provider_id,
+    model_id,
+    queue_name,
+    job_id,
+    chat_id,
+    thread_id,
+    message_id,
+    dedupe_key,
+    summary,
+    detail::text AS detail
+FROM llm_routing_events
+WHERE ($2::bigint IS NULL OR id < $2)
+  AND ($3::text IS NULL OR workflow_key = $3)
+  AND ($4::text IS NULL OR severity = $4)
+ORDER BY id DESC
+LIMIT $1"#;
+
+/// Keyset-paginated event feed for the admin UI: newest first, `before_id`
+/// continues past the previous page, optional workflow/severity filters.
+pub async fn list_routing_events_page(
+    pool: &PgPool,
+    limit: i64,
+    before_id: Option<i64>,
+    workflow_key: Option<&str>,
+    severity: Option<&str>,
+) -> Result<Vec<RoutingEventRecord>, StorageError> {
+    let limit = limit.clamp(1, 500);
+    sqlx::query(SQL_LIST_ROUTING_EVENTS_PAGE)
+        .bind(limit)
+        .bind(before_id)
+        .bind(workflow_key)
+        .bind(severity)
         .fetch_all(pool)
         .await?
         .into_iter()
@@ -1171,6 +1294,22 @@ mod tests {
     fn backfill_helpers_never_overwrite_operator_values() {
         assert!(SQL_SET_PROVIDER_PROTOCOL_IF_NULL.contains("AND protocol IS NULL"));
         assert!(SQL_SET_PROVIDER_MODELS_POOL_IF_NULL.contains("AND pool_id IS NULL"));
+    }
+
+    #[test]
+    fn batched_assignment_updates_touch_only_their_column() {
+        assert!(SQL_SET_ASSIGNMENT_WEIGHT.contains("SET weight = $2"));
+        assert!(!SQL_SET_ASSIGNMENT_WEIGHT.contains("fallback_order"));
+        assert!(SQL_SET_ASSIGNMENT_FALLBACK_ORDER.contains("SET fallback_order = $2"));
+        assert!(!SQL_SET_ASSIGNMENT_FALLBACK_ORDER.contains("weight ="));
+    }
+
+    #[test]
+    fn routing_events_page_sql_uses_keyset_pagination_and_filters() {
+        assert!(SQL_LIST_ROUTING_EVENTS_PAGE.contains("id < $2"));
+        assert!(SQL_LIST_ROUTING_EVENTS_PAGE.contains("workflow_key = $3"));
+        assert!(SQL_LIST_ROUTING_EVENTS_PAGE.contains("severity = $4"));
+        assert!(SQL_LIST_ROUTING_EVENTS_PAGE.contains("ORDER BY id DESC"));
     }
 
     #[test]
