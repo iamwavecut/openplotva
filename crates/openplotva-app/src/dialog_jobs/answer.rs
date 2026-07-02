@@ -28,10 +28,17 @@ pub fn prepare_dialog_chat_response(raw: &str) -> String {
 
     let decoded = decode_html_entities(&strip_code_fences(trimmed));
     if dialog_response_requires_rich(&decoded) {
-        sanitize_rich_html(&decoded).trim().to_owned()
-    } else {
-        sanitize_telegram_html(&decoded).trim().to_owned()
+        let rich = sanitize_rich_html(&decoded).trim().to_owned();
+        if dialog_response_requires_rich(&rich) {
+            return rich;
+        }
+        // Rich sanitization can drop the only rich-only construct (e.g. a
+        // stray `</li>`), flipping the answer onto the plain send path while
+        // rich-only inline tags survive; re-sanitize for the narrower plain
+        // tag set so Telegram accepts the send.
+        return sanitize_telegram_html(&rich).trim().to_owned();
     }
+    sanitize_telegram_html(&decoded).trim().to_owned()
 }
 
 /// Mirror of the outbound boundary checks: will `queue_text_message_parts` /
@@ -60,6 +67,9 @@ pub fn validate_dialog_answer_deliverable(
 
 #[must_use]
 pub fn dialog_response_requires_rich(value: &str) -> bool {
+    // Every tag the rich sanitizer accepts that the plain Telegram HTML
+    // sanitizer would strip; answers using them must ride sendRichMessage or
+    // the markup (subscripts, highlights, tables, media) is lost.
     const RICH_ONLY_TAGS: &[&str] = &[
         "h1",
         "h2",
@@ -74,6 +84,7 @@ pub fn dialog_response_requires_rich(value: &str) -> bool {
         "ol",
         "li",
         "table",
+        "caption",
         "tr",
         "td",
         "th",
@@ -84,8 +95,19 @@ pub fn dialog_response_requires_rich(value: &str) -> bool {
         "img",
         "video",
         "audio",
+        "sub",
+        "sup",
+        "mark",
+        "cite",
+        "aside",
+        "input",
+        "tg-time",
         "tg-math",
+        "tg-math-block",
         "tg-reference",
+        "tg-slideshow",
+        "tg-collage",
+        "tg-map",
     ];
     let lower = value.to_ascii_lowercase();
     RICH_ONLY_TAGS

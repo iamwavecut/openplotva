@@ -1830,6 +1830,33 @@ fn dialog_rich_router_keeps_classic_telegram_html_classic() {
     assert!(dialog_response_requires_rich(
         "<table><tr><td>1</td></tr></table>"
     ));
+    assert!(dialog_response_requires_rich("H<sub>2</sub>O"));
+    assert!(dialog_response_requires_rich("x<sup>2</sup>"));
+    assert!(dialog_response_requires_rich("<mark>note</mark>"));
+}
+
+#[test]
+fn prepare_dialog_chat_response_keeps_routing_and_sanitizer_consistent() {
+    use openplotva_telegram::is_valid_telegram_html;
+
+    // A stray rich-only close tag selects the rich sanitizer, which then
+    // drops it; surviving rich-only inline markup must not leak onto the
+    // plain send path (prod send failure 2026-07-02: raw `<sub>` reached
+    // sendMessage and Telegram rejected the reply).
+    let degenerate = "Ответ. <b><i></b><i><sub></i></i><i><sub></li></code>";
+    let out = prepare_dialog_chat_response(degenerate);
+    assert!(
+        dialog_response_requires_rich(&out) || is_valid_telegram_html(&out),
+        "plain-routed answer must satisfy the plain sanitizer: {out}"
+    );
+
+    // `<br>` renders in rich messages but is not a rich trigger: once the
+    // stray `</ul>` is dropped the answer re-routes to plain and must be
+    // re-sanitized for the plain tag set.
+    let flipped = "line1<br>line2</ul>";
+    let out = prepare_dialog_chat_response(flipped);
+    assert!(!dialog_response_requires_rich(&out));
+    assert!(is_valid_telegram_html(&out), "{out}");
 }
 
 #[test]
