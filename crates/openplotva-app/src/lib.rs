@@ -10215,6 +10215,9 @@ async fn start_runtime_workers(
     workers.handles.push(control_worker);
 
     let music_service_available = config.music.acestep.enabled;
+    let delivery_obligation_store = Arc::new(
+        openplotva_storage::PostgresDeliveryObligationStore::new(service_clients.postgres.clone()),
+    );
     let dialog_tool_adapter = Arc::new(
         dialog_tools::TaskmanDialogToolAdapter::new(Arc::clone(&task_queue_for_updates))
             .with_queue_position_rich(Arc::clone(&rich_sender))
@@ -10226,6 +10229,12 @@ async fn start_runtime_workers(
             .with_draw_image_permission(permission_policy.clone())
             .with_song_service_available(music_service_available)
             .with_song_audio_permission(permission_policy.clone())
+            .with_delivery_obligations(
+                Arc::clone(&delivery_obligation_store)
+                    as Arc<dyn dialog_turn::DeliveryObligationRecorder>,
+                config.llm.dialog.image_delivery_timeout_secs,
+                config.llm.dialog.music_delivery_timeout_secs,
+            )
             .with_image_edit_file_resolver(Arc::new(
                 dialog_tools::TelegramImageEditFileResolver::new(
                     PostgresTelegramFileStore::new(service_clients.postgres.clone()),
@@ -10236,6 +10245,52 @@ async fn start_runtime_workers(
                 ),
             )),
     );
+    {
+        let watcher_store: Arc<dyn dialog_turn::DeliveryObligationStore> =
+            Arc::clone(&delivery_obligation_store) as _;
+        let watcher_tickets: Arc<dyn dialog_turn::TicketRecordSource> =
+            Arc::new(dialog_turn::FallbackTicketRecordSource::new(
+                Arc::clone(&task_queue_for_updates),
+                Some(openplotva_storage::PostgresTaskQueueStore::new(
+                    service_clients.postgres.clone(),
+                )),
+            ));
+        let watcher_notifier: Arc<dyn dialog_turn::DeliveryObligationNotifier> =
+            Arc::new(dialog_turn::DispatcherDeliveryObligationNotifier::new(
+                Arc::clone(&dispatcher_queue),
+                dialog_turn::DispatcherTerminalUserSignal::new(
+                    telegram.clone(),
+                    Arc::clone(&dispatcher_queue),
+                ),
+            ));
+        let watcher_timeouts = dialog_turn::DeliveryObligationTimeouts::from_secs(
+            config.llm.dialog.image_delivery_timeout_secs,
+            config.llm.dialog.music_delivery_timeout_secs,
+        );
+        let watcher_interval =
+            Duration::from_secs(config.llm.dialog.obligation_watch_interval_secs.max(1) as u64);
+        let watcher_stop = stop.subscribe();
+        workers.handles.push(tokio::spawn(async move {
+            dialog_turn::run_delivery_obligation_watcher(
+                watcher_store,
+                watcher_tickets,
+                watcher_notifier,
+                watcher_timeouts,
+                watcher_interval,
+                wait_for_runtime_stop(watcher_stop),
+            )
+            .await;
+        }));
+        readiness_checks.push(ReadinessCheck::ok(
+            "dialog_delivery_obligations",
+            format!(
+                "Delivery-obligation watcher every {}s (image deadline {}s, music deadline {}s)",
+                config.llm.dialog.obligation_watch_interval_secs.max(1),
+                config.llm.dialog.image_delivery_timeout_secs,
+                config.llm.dialog.music_delivery_timeout_secs,
+            ),
+        ));
+    }
     let vision_data_urls = vision::TelegramClientVisionDataUrlProvider::new(telegram.clone());
     let dialog_tool_vision = Arc::new(
         vision::TelegramVisionDescriber::new(
@@ -10689,6 +10744,7 @@ async fn start_runtime_workers(
                 let worker_turn_outcomes = turn_outcome_observer.clone();
                 let worker_terminal_signal = dialog_terminal_signal.clone();
                 let worker_reaction_emoji = dialog_terminal_reaction_emoji.clone();
+                let worker_obligations = Arc::clone(&delivery_obligation_store);
                 let worker_stop = stop.subscribe();
                 let dialog_worker = tokio::spawn(async move {
                     let report =
@@ -10712,6 +10768,7 @@ async fn start_runtime_workers(
                                     &worker_reaction_emoji,
                                     dialog_terminal_signal_max_age_secs,
                                 ),
+                                obligations: Some(worker_obligations.as_ref()),
                             },
                             wait_for_runtime_stop(worker_stop),
                         )

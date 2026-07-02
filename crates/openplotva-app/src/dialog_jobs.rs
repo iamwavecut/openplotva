@@ -15,9 +15,8 @@ use openplotva_core::{
 use openplotva_dialog::{
     DialogContext, DialogInput, DialogMessage, DialogOutput, DialogUser, HistoryMessage,
     MESSAGE_KIND_TEXT, MESSAGE_KIND_TOOL_REQUEST, MESSAGE_KIND_TOOL_RESPONSE, Persona, ROLE_MODEL,
-    ROLE_TOOL, ROLE_USER, TOOL_RESULT_STATUS_QUEUED, ToolResult, conversation_projection,
-    daily_persona_for_unix_timestamp, filter_dialog_tool_calls_for_history,
-    is_dialog_history_noise_tool_call_name,
+    ROLE_TOOL, ROLE_USER, conversation_projection, daily_persona_for_unix_timestamp,
+    filter_dialog_tool_calls_for_history, is_dialog_history_noise_tool_call_name,
 };
 use openplotva_llm::ChatProvider;
 use openplotva_memory::format_context as format_memory_context;
@@ -253,6 +252,9 @@ pub struct DialogJobWorkerLoopOptions<'a, Materializer: ?Sized, ToolHistory: ?Si
     pub max_regenerations: i32,
     /// Terminal-failure user signal wiring (reaction with text fallback).
     pub terminal_signal: crate::dialog_turn::TurnSignalPolicy<'a>,
+    /// Delivery-obligation annotator: finalize backfills the dialog job id on
+    /// obligations recorded by the schedulers (annotation only, never creates).
+    pub obligations: Option<&'a dyn crate::dialog_turn::DeliveryObligationAnnotator>,
 }
 
 /// True when the current UTC time is inside the daily `[start, end)` minute window,
@@ -725,6 +727,8 @@ impl DialogJobEffects for DialogDispatcherEffects {
                 queue_text_message_parts(
                     &self.queue,
                     QueueTextRequest {
+                        protected: false,
+                        debounce_key: None,
                         message: &request,
                         reply_to: Some(&reply_to),
                         immediate_first: true,
@@ -879,6 +883,7 @@ where
             routing_events: None,
             turn_outcomes: None,
             terminal_signal: crate::dialog_turn::TurnSignalPolicy::default(),
+            obligations: None,
         },
     )
     .await
@@ -895,6 +900,7 @@ struct DialogJobProcessOptions<'a> {
     routing_events: Option<&'a crate::runtime_routing::RoutingEventReporter>,
     turn_outcomes: Option<&'a crate::dialog_turn::DialogTurnObserver>,
     terminal_signal: crate::dialog_turn::TurnSignalPolicy<'a>,
+    obligations: Option<&'a dyn crate::dialog_turn::DeliveryObligationAnnotator>,
 }
 
 async fn process_dialog_job_once_in_queue_with_materializer_history_and_retry_at<
@@ -962,6 +968,7 @@ where
                 options.now,
                 options.turn_outcomes,
                 options.terminal_signal,
+                options.obligations,
                 &mut report,
             )
             .await;
@@ -1002,6 +1009,7 @@ where
         options.now,
         options.turn_outcomes,
         options.terminal_signal,
+        options.obligations,
         &mut report,
     )
     .await;
@@ -1073,6 +1081,7 @@ where
             turn_max_queue_age_secs: DEFAULT_DIALOG_TURN_MAX_QUEUE_AGE_SECS,
             max_regenerations: DEFAULT_DIALOG_TURN_MAX_REGENERATIONS,
             terminal_signal: crate::dialog_turn::TurnSignalPolicy::default(),
+            obligations: None,
         },
         stop,
     )
@@ -1126,6 +1135,7 @@ where
                             routing_events: options.routing_events,
                             turn_outcomes: options.turn_outcomes,
                             terminal_signal: options.terminal_signal,
+                            obligations: options.obligations,
                         },
                     ).await;
                     trace_dialog_job_tick(&tick);
@@ -1269,6 +1279,7 @@ where
             turn_max_queue_age_secs: DEFAULT_DIALOG_TURN_MAX_QUEUE_AGE_SECS,
             max_regenerations: DEFAULT_DIALOG_TURN_MAX_REGENERATIONS,
             terminal_signal: crate::dialog_turn::TurnSignalPolicy::default(),
+            obligations: None,
         },
         stop,
     )
@@ -1666,43 +1677,16 @@ pub fn dialog_input_from_materialized_context(
     input
 }
 
+/// Answer text of one provider round. Queued generation results deliberately
+/// contribute nothing here: the artifact is the reply, and
+/// `classify_reply_material` resolves such turns as `Delegated`.
 #[must_use]
 pub fn dialog_job_answer(output: &DialogOutput) -> String {
     let answer = output.answer.trim();
     if !answer.is_empty() {
         return answer.to_owned();
     }
-    let response = output.response.trim();
-    if !response.is_empty() {
-        return response.to_owned();
-    }
-    queued_generation_tool_message(&output.tool_calls).unwrap_or_default()
-}
-
-fn queued_generation_tool_message(calls: &[ToolCall]) -> Option<String> {
-    calls.iter().find_map(|call| {
-        let output = call.output.as_ref()?;
-        let result: ToolResult = serde_json::from_value(output.clone()).ok()?;
-        if result.no_reply
-            || !result
-                .status
-                .eq_ignore_ascii_case(TOOL_RESULT_STATUS_QUEUED)
-        {
-            return None;
-        }
-        let side_effect = result.side_effect.as_ref()?;
-        if !side_effect.state.eq_ignore_ascii_case("queued") {
-            return None;
-        }
-        if !matches!(
-            side_effect.kind.as_str(),
-            "image_generation_job" | "music_generation_job"
-        ) {
-            return None;
-        }
-        let message = result.message.trim();
-        (!message.is_empty()).then(|| message.to_owned())
-    })
+    output.response.trim().to_owned()
 }
 
 #[must_use]
@@ -2887,7 +2871,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dialog_worker_sends_queued_tool_message_when_provider_has_no_answer()
+    async fn dialog_worker_completes_delegated_queued_song_without_sending_text()
     -> Result<(), Box<dyn Error>> {
         let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
         let queue = InMemoryTaskQueue::new();
@@ -2902,9 +2886,9 @@ mod tests {
                 r#ref: "generate_song-1".to_owned(),
                 output: Some(serde_json::json!({
                     "status": "queued",
-                    "message": "Задача на генерацию песни поставлена в очередь.",
                     "side_effect": {
                         "kind": "music_generation_job",
+                        "ticket_id": "9001",
                         "state": "queued"
                     }
                 })),
@@ -2914,31 +2898,60 @@ mod tests {
         });
         let effects = EffectsStub::default();
         let history = ToolHistoryStub::default();
+        let outcomes = crate::dialog_turn::DialogTurnObserver::new(
+            crate::dialog_turn::RuntimeTurnOutcomeBuffer::new(8),
+            None,
+        );
 
-        let report = process_dialog_job_once_in_queue_with_materializer_and_history_at(
+        let report = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
             &queue,
-            DIALOG_AIFARM_QUEUE_NAME,
             &provider,
             &effects,
             &BasicDialogInputMaterializer,
             &history,
-            now,
+            DialogJobProcessOptions {
+                queue_name: DIALOG_AIFARM_QUEUE_NAME,
+                max_llm_job_attempts: DEFAULT_LLM_JOB_MAX_ATTEMPTS,
+                turn_budget_secs: DEFAULT_DIALOG_TURN_BUDGET_SECS,
+                turn_max_queue_age_secs: DEFAULT_DIALOG_TURN_MAX_QUEUE_AGE_SECS,
+                max_regenerations: DEFAULT_DIALOG_TURN_MAX_REGENERATIONS,
+                now,
+                routing_events: None,
+                turn_outcomes: Some(&outcomes),
+                terminal_signal: crate::dialog_turn::TurnSignalPolicy::default(),
+                obligations: None,
+            },
         )
         .await;
 
         assert_eq!(report.job_id, Some(job_id));
         assert!(report.persisted_tool_call_history);
-        assert!(report.sent_answer);
+        assert!(
+            !report.sent_answer,
+            "queued schedule is silent: the artifact is the reply"
+        );
         assert!(report.completed);
         assert!(!report.failed);
-        assert_eq!(
-            effects.sent(),
-            vec![(
-                "напиши песню".to_owned(),
-                "Задача на генерацию песни поставлена в очередь.".to_owned()
-            )]
-        );
+        assert!(effects.sent().is_empty(), "no confirmation text is sent");
         assert_eq!(record_status(&queue, job_id), JobStatus::Completed);
+        use openplotva_server::{RuntimeTurnOutcomeInspector, RuntimeTurnOutcomesFilter};
+        let recorded = outcomes
+            .buffer()
+            .turn_outcomes(RuntimeTurnOutcomesFilter {
+                limit: 10,
+                ..RuntimeTurnOutcomesFilter::default()
+            })
+            .expect("turn outcomes");
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(
+            recorded[0].outcome,
+            crate::dialog_turn::TURN_OUTCOME_SIDE_EFFECT_DELEGATED
+        );
+        assert_eq!(
+            recorded[0].side_effect_ticket_id,
+            Some(9001),
+            "delegated turn records the generation ticket"
+        );
         Ok(())
     }
 
@@ -3054,6 +3067,7 @@ mod tests {
                 turn_max_queue_age_secs: DEFAULT_DIALOG_TURN_MAX_QUEUE_AGE_SECS,
                 max_regenerations: DEFAULT_DIALOG_TURN_MAX_REGENERATIONS,
                 terminal_signal: crate::dialog_turn::TurnSignalPolicy::default(),
+                obligations: None,
                 now,
                 routing_events: None,
                 turn_outcomes: Some(&outcomes),
@@ -3131,6 +3145,7 @@ mod tests {
                     "🤔",
                     600,
                 ),
+                obligations: None,
                 now,
                 routing_events: None,
                 turn_outcomes: Some(&outcomes),
@@ -3213,6 +3228,7 @@ mod tests {
                     "🤔",
                     600,
                 ),
+                obligations: None,
                 now,
                 routing_events: None,
                 turn_outcomes: Some(&outcomes),
@@ -3274,6 +3290,7 @@ mod tests {
                     "🤔",
                     600,
                 ),
+                obligations: None,
                 now,
                 routing_events: None,
                 turn_outcomes: Some(&outcomes),
@@ -3355,6 +3372,7 @@ mod tests {
                     "🤔",
                     600,
                 ),
+                obligations: None,
                 now,
                 routing_events: None,
                 turn_outcomes: Some(&outcomes),
@@ -3416,6 +3434,7 @@ mod tests {
                     "🤔",
                     600,
                 ),
+                obligations: None,
                 now,
                 routing_events: None,
                 turn_outcomes: None,
@@ -3473,6 +3492,7 @@ mod tests {
                 turn_max_queue_age_secs: DEFAULT_DIALOG_TURN_MAX_QUEUE_AGE_SECS,
                 max_regenerations: DEFAULT_DIALOG_TURN_MAX_REGENERATIONS,
                 terminal_signal: crate::dialog_turn::TurnSignalPolicy::default(),
+                obligations: None,
                 now,
                 routing_events: None,
                 turn_outcomes: Some(&outcomes),
@@ -3584,6 +3604,7 @@ mod tests {
                 turn_max_queue_age_secs: DEFAULT_DIALOG_TURN_MAX_QUEUE_AGE_SECS,
                 max_regenerations: DEFAULT_DIALOG_TURN_MAX_REGENERATIONS,
                 terminal_signal: crate::dialog_turn::TurnSignalPolicy::default(),
+                obligations: None,
                 now,
                 routing_events: None,
                 turn_outcomes: Some(&outcomes),
@@ -3696,6 +3717,7 @@ mod tests {
                 turn_max_queue_age_secs: DEFAULT_DIALOG_TURN_MAX_QUEUE_AGE_SECS,
                 max_regenerations: DEFAULT_DIALOG_TURN_MAX_REGENERATIONS,
                 terminal_signal: crate::dialog_turn::TurnSignalPolicy::default(),
+                obligations: None,
                 now,
                 routing_events: None,
                 turn_outcomes: Some(&outcomes),
@@ -3746,6 +3768,7 @@ mod tests {
             turn_max_queue_age_secs: DEFAULT_DIALOG_TURN_MAX_QUEUE_AGE_SECS,
             max_regenerations: DEFAULT_DIALOG_TURN_MAX_REGENERATIONS,
             terminal_signal: crate::dialog_turn::TurnSignalPolicy::default(),
+            obligations: None,
             now,
             routing_events: None,
             turn_outcomes: Some(&outcomes),
@@ -3819,6 +3842,7 @@ mod tests {
             turn_max_queue_age_secs: DEFAULT_DIALOG_TURN_MAX_QUEUE_AGE_SECS,
             max_regenerations: DEFAULT_DIALOG_TURN_MAX_REGENERATIONS,
             terminal_signal: crate::dialog_turn::TurnSignalPolicy::default(),
+            obligations: None,
             now,
             routing_events: None,
             turn_outcomes: Some(&outcomes),
@@ -4172,6 +4196,7 @@ mod tests {
                 turn_max_queue_age_secs: DEFAULT_DIALOG_TURN_MAX_QUEUE_AGE_SECS,
                 max_regenerations: DEFAULT_DIALOG_TURN_MAX_REGENERATIONS,
                 terminal_signal: crate::dialog_turn::TurnSignalPolicy::default(),
+                obligations: None,
                 now,
                 routing_events: Some(&reporter),
                 turn_outcomes: None,
@@ -4247,6 +4272,7 @@ mod tests {
                 turn_max_queue_age_secs: DEFAULT_DIALOG_TURN_MAX_QUEUE_AGE_SECS,
                 max_regenerations: DEFAULT_DIALOG_TURN_MAX_REGENERATIONS,
                 terminal_signal: crate::dialog_turn::TurnSignalPolicy::default(),
+                obligations: None,
                 now,
                 routing_events: None,
                 turn_outcomes: None,
@@ -4269,6 +4295,7 @@ mod tests {
                 turn_max_queue_age_secs: DEFAULT_DIALOG_TURN_MAX_QUEUE_AGE_SECS,
                 max_regenerations: DEFAULT_DIALOG_TURN_MAX_REGENERATIONS,
                 terminal_signal: crate::dialog_turn::TurnSignalPolicy::default(),
+                obligations: None,
                 now,
                 routing_events: None,
                 turn_outcomes: None,

@@ -412,7 +412,9 @@ async fn append_regeneration_event<Queue>(
 }
 
 /// The single writer of job status, `turn_outcome` job event, ledger row, and
-/// terminal user signal.
+/// terminal user signal. Delivery obligations were already inserted by the
+/// schedulers at ticket-assignment time; finalize only annotates them with the
+/// dialog job id (best-effort).
 pub(crate) async fn finalize_turn<Queue>(
     queue: &Queue,
     item: &DialogJobWorkItem,
@@ -421,10 +423,14 @@ pub(crate) async fn finalize_turn<Queue>(
     now: OffsetDateTime,
     observer: Option<&DialogTurnObserver>,
     signals: TurnSignalPolicy<'_>,
+    obligations: Option<&dyn super::obligations::DeliveryObligationAnnotator>,
     report: &mut DialogJobWorkerReport,
 ) where
     Queue: DialogJobWorkerQueue + Sync + ?Sized,
 {
+    if let Some(annotator) = obligations {
+        annotate_delegated_obligations(annotator, item.id, &resolution).await;
+    }
     // (a) Durable budget anchor on first processing. Skipped for backlog drops:
     // those turns never started. Append failure must not block the status write.
     if turn_started_at(&item.events).is_none()
@@ -617,6 +623,36 @@ fn side_effect_tickets(side_effects: &[QueuedSideEffect]) -> Vec<i64> {
         .iter()
         .filter_map(|side_effect| side_effect.ticket_job_id)
         .collect()
+}
+
+/// Backfill the dialog job id onto obligations recorded at schedule time.
+/// Annotation is diagnostics-only linkage; failure never affects the turn.
+async fn annotate_delegated_obligations(
+    annotator: &dyn super::obligations::DeliveryObligationAnnotator,
+    dialog_job_id: i64,
+    resolution: &TurnResolution,
+) {
+    let tickets: &[i64] = match &resolution.outcome {
+        TurnOutcome::SideEffectDelegated { tickets, .. } => tickets,
+        TurnOutcome::Sent {
+            side_effect_tickets,
+            ..
+        } => side_effect_tickets,
+        _ => return,
+    };
+    for ticket_job_id in tickets {
+        if let Err(error) = annotator
+            .annotate_dialog_job(*ticket_job_id, dialog_job_id)
+            .await
+        {
+            tracing::debug!(
+                ticket_job_id,
+                dialog_job_id,
+                %error,
+                "failed to annotate delivery obligation with dialog job id"
+            );
+        }
+    }
 }
 
 fn record_from_resolution(

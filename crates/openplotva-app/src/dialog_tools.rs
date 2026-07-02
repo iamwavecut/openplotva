@@ -623,15 +623,75 @@ pub struct DrawImageScheduleResult {
     /// Whether no dialog reply should be sent.
     pub no_reply: bool,
     pub rejection: Option<DrawImageScheduleRejection>,
+    /// Taskman ticket id assigned to a scheduled generation job.
+    pub job_id: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DrawImageScheduleRejection {
     /// Caller is not VIP.
     VipOnly,
+    /// Draw-image (generation) rate limit fired for this prompt/user.
     RateLimited,
     DrawDisabled,
     ImageNotAllowed,
+    /// Caller already runs the maximum number of active image jobs.
+    ActiveJobLimit,
+    /// Enqueue throttled by the task-enqueue rate limit (flood gate).
+    EnqueueRateLimited,
+    /// The queue refused the assignment.
+    QueueFull,
+    /// Image-edit source photo could not be resolved.
+    EditSourceUnavailable,
+}
+
+impl DrawImageScheduleRejection {
+    /// Stable machine-readable rejection code carried in `ToolResult.data["reason"]`.
+    #[must_use]
+    pub const fn reason_code(self) -> &'static str {
+        match self {
+            Self::VipOnly => "vip_only",
+            Self::RateLimited => "generation_rate_limited",
+            Self::DrawDisabled => "draw_disabled",
+            Self::ImageNotAllowed => "image_not_allowed",
+            Self::ActiveJobLimit => "active_job_limit",
+            Self::EnqueueRateLimited => "enqueue_rate_limited",
+            Self::QueueFull => "queue_full",
+            Self::EditSourceUnavailable => "edit_source_unavailable",
+        }
+    }
+
+    /// Model-facing refusal description; the model composes the user-visible
+    /// in-character reply from it.
+    #[must_use]
+    pub const fn model_facing_message(self) -> &'static str {
+        match self {
+            Self::VipOnly => {
+                "Эта функция доступна только VIP-пользователям. Задача не поставлена в очередь."
+            }
+            Self::RateLimited => {
+                "Сработал лимит частоты генерации изображений. Задача не поставлена в очередь."
+            }
+            Self::DrawDisabled => {
+                "Рисование отключено в настройках этого чата. Задача не поставлена в очередь."
+            }
+            Self::ImageNotAllowed => {
+                "В этот чат нельзя отправлять изображения. Задача не поставлена в очередь."
+            }
+            Self::ActiveJobLimit => {
+                "У пользователя уже выполняется максимум задач генерации изображений. Новая задача не поставлена в очередь."
+            }
+            Self::EnqueueRateLimited => {
+                "Слишком много запросов подряд, сработал лимит очереди. Задача не поставлена в очередь."
+            }
+            Self::QueueFull => {
+                "Очередь генерации изображений сейчас переполнена. Задача не поставлена в очередь."
+            }
+            Self::EditSourceUnavailable => {
+                "Не удалось получить исходное изображение для редактирования. Задача не поставлена в очередь."
+            }
+        }
+    }
 }
 
 /// Draw-image rate-limit decision.
@@ -683,6 +743,8 @@ pub struct SongScheduleResult {
     pub no_reply: bool,
     pub rejection: Option<SongScheduleRejection>,
     pub queue_notice: Option<SongQueueNotice>,
+    /// Taskman ticket id assigned to a scheduled generation job.
+    pub job_id: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -698,6 +760,47 @@ pub enum SongScheduleRejection {
     ActiveLimit,
     /// Enqueue throttled by the task-enqueue rate limit (distinct from a capacity limit).
     RateLimited,
+}
+
+impl SongScheduleRejection {
+    /// Stable machine-readable rejection code carried in `ToolResult.data["reason"]`.
+    #[must_use]
+    pub const fn reason_code(self) -> &'static str {
+        match self {
+            Self::ServiceUnavailable => "service_unavailable",
+            Self::AudioNotAllowed => "audio_not_allowed",
+            Self::VipOnly => "vip_only",
+            Self::EmptyTopic => "empty_topic",
+            Self::ActiveLimit => "active_job_limit",
+            Self::RateLimited => "enqueue_rate_limited",
+        }
+    }
+
+    /// Model-facing refusal description; the model composes the user-visible
+    /// in-character reply from it.
+    #[must_use]
+    pub const fn model_facing_message(self) -> &'static str {
+        match self {
+            Self::ServiceUnavailable => {
+                "Сервис генерации музыки сейчас недоступен. Задача не поставлена в очередь."
+            }
+            Self::AudioNotAllowed => {
+                "В этот чат нельзя отправлять аудио. Песня не поставлена в очередь."
+            }
+            Self::VipOnly => {
+                "Генерация песен доступна только VIP-пользователям. Задача не поставлена в очередь."
+            }
+            Self::EmptyTopic => {
+                "Тема песни пустая, задача не поставлена в очередь. Уточни тему и повтори вызов инструмента."
+            }
+            Self::ActiveLimit => {
+                "У пользователя уже выполняется максимум музыкальных задач. Новая задача не поставлена в очередь."
+            }
+            Self::RateLimited => {
+                "Слишком много запросов подряд, сработал лимит очереди. Задача не поставлена в очередь."
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -793,6 +896,9 @@ pub struct TaskmanDialogToolAdapter {
     song_service_available: bool,
     song_audio_permission: Option<Arc<dyn SongAudioPermission>>,
     queue_position_rich: Option<Arc<dyn crate::rich::RichSender>>,
+    delivery_obligations: Option<Arc<dyn crate::dialog_turn::DeliveryObligationRecorder>>,
+    image_delivery_timeout: time::Duration,
+    music_delivery_timeout: time::Duration,
 }
 
 impl fmt::Debug for TaskmanDialogToolAdapter {
@@ -829,6 +935,10 @@ impl fmt::Debug for TaskmanDialogToolAdapter {
                 "queue_position_rich",
                 &self.queue_position_rich.as_ref().map(|_| "configured"),
             )
+            .field(
+                "delivery_obligations",
+                &self.delivery_obligations.as_ref().map(|_| "configured"),
+            )
             .finish()
     }
 }
@@ -847,7 +957,30 @@ impl TaskmanDialogToolAdapter {
             song_service_available: true,
             song_audio_permission: None,
             queue_position_rich: None,
+            delivery_obligations: None,
+            image_delivery_timeout: time::Duration::seconds(i64::from(
+                crate::dialog_turn::DEFAULT_DIALOG_IMAGE_DELIVERY_TIMEOUT_SECS,
+            )),
+            music_delivery_timeout: time::Duration::seconds(i64::from(
+                crate::dialog_turn::DEFAULT_DIALOG_MUSIC_DELIVERY_TIMEOUT_SECS,
+            )),
         }
+    }
+
+    /// Configure delivery-obligation recording: every successfully assigned
+    /// generation ticket inserts a watched obligation with a kind-specific
+    /// deadline. Insert failures log a warning and never block scheduling.
+    #[must_use]
+    pub fn with_delivery_obligations(
+        mut self,
+        recorder: Arc<dyn crate::dialog_turn::DeliveryObligationRecorder>,
+        image_timeout_secs: i32,
+        music_timeout_secs: i32,
+    ) -> Self {
+        self.delivery_obligations = Some(recorder);
+        self.image_delivery_timeout = time::Duration::seconds(i64::from(image_timeout_secs.max(1)));
+        self.music_delivery_timeout = time::Duration::seconds(i64::from(music_timeout_secs.max(1)));
+        self
     }
 
     /// Configure the rich sender used to post and persist the live "waiting in queue"
@@ -958,7 +1091,7 @@ impl ImageScheduler for TaskmanDialogToolAdapter {
                 return self.schedule_image_edit(request).await;
             }
             if let Some(rejection) = self.draw_image_permission_rejection(request.chat_id).await {
-                return Ok(not_scheduled_draw_no_reply(rejection));
+                return Ok(not_scheduled_draw(rejection));
             }
             let has_vip = match self.draw_image_vip_status.as_deref() {
                 Some(vip_status) => vip_status.is_draw_image_vip(request.user_id).await,
@@ -970,7 +1103,9 @@ impl ImageScheduler for TaskmanDialogToolAdapter {
                 .user_active_count(plan.queue_name, request.user_id)
                 >= plan.max_active_jobs
             {
-                return Ok(not_scheduled_no_reply());
+                return Ok(not_scheduled_draw(
+                    DrawImageScheduleRejection::ActiveJobLimit,
+                ));
             }
             let base_prompt = request.prompt.trim().to_owned();
             if let Some(rate_limit) = self.draw_image_rate_limit.as_deref() {
@@ -986,8 +1121,9 @@ impl ImageScheduler for TaskmanDialogToolAdapter {
                     return Ok(DrawImageScheduleResult {
                         status: "not_scheduled".to_owned(),
                         message: draw_rate_limit_response_text(&report.notice_text, has_vip),
-                        no_reply: true,
+                        no_reply: false,
                         rejection: Some(DrawImageScheduleRejection::RateLimited),
+                        job_id: None,
                     });
                 }
             }
@@ -1020,7 +1156,9 @@ impl ImageScheduler for TaskmanDialogToolAdapter {
                 .task_enqueue_limited(plan.queue_name, chat_id, user_id)
                 .await
             {
-                return Ok(not_scheduled_no_reply());
+                return Ok(not_scheduled_draw(
+                    DrawImageScheduleRejection::EnqueueRateLimited,
+                ));
             }
             match self.assign_image_job(plan.queue_name, job, plan.max_active_jobs) {
                 Ok(Some(job_id)) => {
@@ -1031,18 +1169,24 @@ impl ImageScheduler for TaskmanDialogToolAdapter {
                             .grow_draw_image_rate_limit(request.user_id, OffsetDateTime::now_utc())
                             .await;
                     }
+                    self.record_delivery_obligation(
+                        openplotva_dialog::turn::SIDE_EFFECT_KIND_IMAGE,
+                        job_id,
+                        chat_id,
+                        thread_id,
+                        user_id,
+                        message_id,
+                    )
+                    .await;
                     self.announce_queue_position(job_id, chat_id, message_id, thread_id)
                         .await;
                     Ok(DrawImageScheduleResult {
                         status: "scheduled".to_owned(),
+                        job_id: Some(job_id),
                         ..DrawImageScheduleResult::default()
                     })
                 }
-                Ok(None) => Ok(DrawImageScheduleResult {
-                    status: "not_scheduled".to_owned(),
-                    no_reply: true,
-                    ..DrawImageScheduleResult::default()
-                }),
+                Ok(None) => Ok(not_scheduled_draw(DrawImageScheduleRejection::QueueFull)),
                 Err(error) => Err(Box::new(error) as ToolboxError),
             }
         })
@@ -1070,29 +1214,25 @@ impl SongScheduler for TaskmanDialogToolAdapter {
     fn schedule_song<'a>(&'a self, request: SongScheduleRequest) -> GenerateSongFuture<'a> {
         Box::pin(async move {
             if !self.song_service_available {
-                return Ok(not_scheduled_song_no_reply(
+                return Ok(not_scheduled_song(
                     SongScheduleRejection::ServiceUnavailable,
                 ));
             }
             if let Some(permission) = self.song_audio_permission.as_deref()
                 && !permission.can_send_song_audio(request.chat_id).await
             {
-                return Ok(not_scheduled_song_no_reply(
-                    SongScheduleRejection::AudioNotAllowed,
-                ));
+                return Ok(not_scheduled_song(SongScheduleRejection::AudioNotAllowed));
             }
             let has_vip = match self.draw_image_vip_status.as_deref() {
                 Some(vip_status) => vip_status.is_draw_image_vip(request.user_id).await,
                 None => false,
             };
             if !has_vip {
-                return Ok(not_scheduled_song_no_reply(SongScheduleRejection::VipOnly));
+                return Ok(not_scheduled_song(SongScheduleRejection::VipOnly));
             }
             let topic = request.topic.trim().to_owned();
             if topic.is_empty() {
-                return Ok(not_scheduled_song_no_reply(
-                    SongScheduleRejection::EmptyTopic,
-                ));
+                return Ok(not_scheduled_song(SongScheduleRejection::EmptyTopic));
             }
             let reference_file_unique_id =
                 song_reference_unique_id(&request.reference_file_unique_id, &request.message_meta);
@@ -1131,26 +1271,32 @@ impl SongScheduler for TaskmanDialogToolAdapter {
                 .task_enqueue_limited(MUSIC_VIP_QUEUE_NAME, chat_id, user_id)
                 .await
             {
-                return Ok(not_scheduled_song_no_reply(
-                    SongScheduleRejection::RateLimited,
-                ));
+                return Ok(not_scheduled_song(SongScheduleRejection::RateLimited));
             }
             match self
                 .queue
                 .assign_with_user_limit(MUSIC_VIP_QUEUE_NAME, job, 2)
             {
-                Ok(Some(_job_id)) => {
+                Ok(Some(job_id)) => {
                     self.grow_task_enqueue(MUSIC_VIP_QUEUE_NAME, chat_id, user_id)
                         .await;
+                    self.record_delivery_obligation(
+                        openplotva_dialog::turn::SIDE_EFFECT_KIND_MUSIC,
+                        job_id,
+                        chat_id,
+                        request.thread_id,
+                        user_id,
+                        request.message_id,
+                    )
+                    .await;
                     Ok(SongScheduleResult {
                         status: "scheduled".to_owned(),
                         queue_notice,
+                        job_id: Some(job_id),
                         ..SongScheduleResult::default()
                     })
                 }
-                Ok(None) => Ok(not_scheduled_song_no_reply(
-                    SongScheduleRejection::ActiveLimit,
-                )),
+                Ok(None) => Ok(not_scheduled_song(SongScheduleRejection::ActiveLimit)),
                 Err(error) => Err(Box::new(error) as ToolboxError),
             }
         })
@@ -1163,25 +1309,27 @@ impl TaskmanDialogToolAdapter {
         request: DrawImageScheduleRequest,
     ) -> Result<DrawImageScheduleResult, ToolboxError> {
         let Some(resolver) = self.image_edit_file_resolver.as_deref() else {
-            return Ok(not_scheduled_no_reply());
+            return Ok(not_scheduled_draw(
+                DrawImageScheduleRejection::EditSourceUnavailable,
+            ));
         };
         let files = resolver
             .resolve_image_edit_files(&request.attachments, &request.edit_media_group_id)
             .await?;
         if files.photo_file_id.trim().is_empty() {
-            return Ok(not_scheduled_no_reply());
+            return Ok(not_scheduled_draw(
+                DrawImageScheduleRejection::EditSourceUnavailable,
+            ));
         }
         if let Some(rejection) = self.draw_image_permission_rejection(request.chat_id).await {
-            return Ok(not_scheduled_draw_no_reply(rejection));
+            return Ok(not_scheduled_draw(rejection));
         }
         let has_vip = match self.draw_image_vip_status.as_deref() {
             Some(vip_status) => vip_status.is_draw_image_vip(request.user_id).await,
             None => false,
         };
         if !has_vip {
-            return Ok(not_scheduled_draw_no_reply(
-                DrawImageScheduleRejection::VipOnly,
-            ));
+            return Ok(not_scheduled_draw(DrawImageScheduleRejection::VipOnly));
         }
 
         let plan = image_gen_queue_plan(true);
@@ -1210,20 +1358,32 @@ impl TaskmanDialogToolAdapter {
             .task_enqueue_limited(plan.queue_name, chat_id, user_id)
             .await
         {
-            return Ok(not_scheduled_no_reply());
+            return Ok(not_scheduled_draw(
+                DrawImageScheduleRejection::EnqueueRateLimited,
+            ));
         }
         match self.assign_image_job(plan.queue_name, job, plan.max_active_jobs) {
             Ok(Some(job_id)) => {
                 self.grow_task_enqueue(plan.queue_name, chat_id, user_id)
                     .await;
+                self.record_delivery_obligation(
+                    openplotva_dialog::turn::SIDE_EFFECT_KIND_IMAGE,
+                    job_id,
+                    chat_id,
+                    thread_id,
+                    user_id,
+                    message_id,
+                )
+                .await;
                 self.announce_queue_position(job_id, chat_id, message_id, thread_id)
                     .await;
                 Ok(DrawImageScheduleResult {
                     status: "scheduled".to_owned(),
+                    job_id: Some(job_id),
                     ..DrawImageScheduleResult::default()
                 })
             }
-            Ok(None) => Ok(not_scheduled_no_reply()),
+            Ok(None) => Ok(not_scheduled_draw(DrawImageScheduleRejection::QueueFull)),
             Err(error) => Err(Box::new(error) as ToolboxError),
         }
     }
@@ -1271,6 +1431,51 @@ impl TaskmanDialogToolAdapter {
                 errors = ?report.save_errors,
                 "failed to persist task enqueue rate-limit timestamps"
             );
+        }
+    }
+
+    /// Record the delivery obligation for a freshly assigned generation ticket.
+    /// Runs at schedule time (punch #5): the promise is durable even if the
+    /// dialog turn later fails, retries, or crashes. Failure is logged and
+    /// never blocks scheduling.
+    async fn record_delivery_obligation(
+        &self,
+        kind: &'static str,
+        ticket_job_id: i64,
+        chat_id: i64,
+        thread_id: Option<i32>,
+        user_id: i64,
+        trigger_message_id: i32,
+    ) {
+        let Some(recorder) = self.delivery_obligations.as_deref() else {
+            return;
+        };
+        let timeout = if kind == openplotva_dialog::turn::SIDE_EFFECT_KIND_MUSIC {
+            self.music_delivery_timeout
+        } else {
+            self.image_delivery_timeout
+        };
+        let obligation = openplotva_storage::NewDeliveryObligation {
+            chat_id,
+            thread_id,
+            user_id,
+            trigger_message_id,
+            dialog_job_id: openplotva_storage::DELIVERY_OBLIGATION_DIALOG_JOB_UNKNOWN,
+            kind: kind.to_owned(),
+            ticket_job_id,
+            deadline_at: OffsetDateTime::now_utc() + timeout,
+        };
+        match recorder.record_delivery_obligation(obligation).await {
+            Ok(_inserted) => {}
+            Err(error) => {
+                tracing::warn!(
+                    chat_id,
+                    ticket_job_id,
+                    kind,
+                    %error,
+                    "failed to record delivery obligation; generation delivery is unwatched"
+                );
+            }
         }
     }
 
@@ -1365,18 +1570,14 @@ fn request_has_image_attachment(request: &DrawImageScheduleRequest) -> bool {
     })
 }
 
-fn not_scheduled_no_reply() -> DrawImageScheduleResult {
+/// Rejections always feed back to the model (`no_reply: false`): the tool
+/// result carries a model-facing refusal message plus a machine-readable
+/// reason code, and the model composes the user-visible reply.
+fn not_scheduled_draw(rejection: DrawImageScheduleRejection) -> DrawImageScheduleResult {
     DrawImageScheduleResult {
         status: "not_scheduled".to_owned(),
-        no_reply: true,
-        ..DrawImageScheduleResult::default()
-    }
-}
-
-fn not_scheduled_draw_no_reply(rejection: DrawImageScheduleRejection) -> DrawImageScheduleResult {
-    DrawImageScheduleResult {
-        status: "not_scheduled".to_owned(),
-        no_reply: true,
+        message: rejection.model_facing_message().to_owned(),
+        no_reply: false,
         rejection: Some(rejection),
         ..DrawImageScheduleResult::default()
     }
@@ -1629,10 +1830,14 @@ fn is_draw_prompt_whitelisted(prompt: &str, whitelist: &[String]) -> bool {
     whitelist.iter().any(|phrase| prompt.contains(phrase))
 }
 
-fn not_scheduled_song_no_reply(rejection: SongScheduleRejection) -> SongScheduleResult {
+/// Rejections always feed back to the model (`no_reply: false`): the tool
+/// result carries a model-facing refusal message plus a machine-readable
+/// reason code, and the model composes the user-visible reply.
+fn not_scheduled_song(rejection: SongScheduleRejection) -> SongScheduleResult {
     SongScheduleResult {
         status: "not_scheduled".to_owned(),
-        no_reply: true,
+        message: rejection.model_facing_message().to_owned(),
+        no_reply: false,
         rejection: Some(rejection),
         ..SongScheduleResult::default()
     }
@@ -2174,69 +2379,87 @@ fn dialog_draw_image_tool_result(result: &DrawImageScheduleResult) -> ToolResult
             error: None,
         };
     }
-    scheduled_generation_tool_result(
-        &result.status,
-        &result.message,
-        result.no_reply,
-        "image_generation_job",
-        "Задача на генерацию изображения поставлена в очередь.",
-        IMAGE_GENERATION_NOT_SCHEDULED_MESSAGE,
-        "draw_image_not_scheduled",
-    )
+    scheduled_generation_tool_result(GenerationToolResultArgs {
+        scheduler_status: &result.status,
+        scheduler_message: &result.message,
+        scheduler_no_reply: result.no_reply,
+        reason_code: result
+            .rejection
+            .map(DrawImageScheduleRejection::reason_code),
+        side_effect_kind: "image_generation_job",
+        ticket_job_id: result.job_id,
+        not_scheduled_fallback: IMAGE_GENERATION_NOT_SCHEDULED_MESSAGE,
+        not_scheduled_error_code: "draw_image_not_scheduled",
+    })
 }
 
 fn dialog_generate_song_tool_result(result: &SongScheduleResult) -> ToolResult {
-    scheduled_generation_tool_result(
-        &result.status,
-        &result.message,
-        result.no_reply,
-        "music_generation_job",
-        "Задача на генерацию песни поставлена в очередь.",
-        SONG_GENERATION_NOT_SCHEDULED_MESSAGE,
-        "generate_song_not_scheduled",
-    )
+    scheduled_generation_tool_result(GenerationToolResultArgs {
+        scheduler_status: &result.status,
+        scheduler_message: &result.message,
+        scheduler_no_reply: result.no_reply,
+        reason_code: result.rejection.map(SongScheduleRejection::reason_code),
+        side_effect_kind: "music_generation_job",
+        ticket_job_id: result.job_id,
+        not_scheduled_fallback: SONG_GENERATION_NOT_SCHEDULED_MESSAGE,
+        not_scheduled_error_code: "generate_song_not_scheduled",
+    })
 }
 
-fn scheduled_generation_tool_result(
-    scheduler_status: &str,
-    scheduler_message: &str,
+struct GenerationToolResultArgs<'a> {
+    scheduler_status: &'a str,
+    scheduler_message: &'a str,
     scheduler_no_reply: bool,
-    side_effect_kind: &str,
-    queued_message: &str,
-    not_scheduled_fallback: &str,
-    not_scheduled_error_code: &str,
-) -> ToolResult {
-    let trimmed_status = scheduler_status.trim();
+    reason_code: Option<&'static str>,
+    side_effect_kind: &'a str,
+    ticket_job_id: Option<i64>,
+    not_scheduled_fallback: &'a str,
+    not_scheduled_error_code: &'a str,
+}
+
+/// Map a scheduler result onto the tool protocol. Queued results keep an EMPTY
+/// message (silent-but-guaranteed: the artifact is the reply) and carry the
+/// ticket id on the side effect; rejections stay `no_reply: false` with a
+/// model-facing message plus a `data["reason"]` code so the model composes the
+/// user-visible refusal.
+fn scheduled_generation_tool_result(args: GenerationToolResultArgs<'_>) -> ToolResult {
+    let trimmed_status = args.scheduler_status.trim();
     let mut status = TOOL_RESULT_STATUS_QUEUED;
-    let mut message = scheduler_message.trim().to_owned();
-    let no_reply = scheduler_no_reply || is_internal_not_scheduled_instruction(&message);
+    let mut message = args.scheduler_message.trim().to_owned();
+    let no_reply = args.scheduler_no_reply || is_internal_not_scheduled_instruction(&message);
     let mut side_effect_state = "queued";
     let mut error = None;
-    if message.is_empty() {
-        message = queued_message.to_owned();
-    }
     if no_reply {
         status = TOOL_RESULT_STATUS_NOOP;
         message.clear();
         side_effect_state = "noop";
     } else if trimmed_status.eq_ignore_ascii_case("not_scheduled") {
         status = TOOL_RESULT_STATUS_FAILED;
-        message = user_facing_not_scheduled_message(&message, not_scheduled_fallback);
+        message = user_facing_not_scheduled_message(&message, args.not_scheduled_fallback);
         side_effect_state = "failed";
         error = Some(ToolError {
-            code: not_scheduled_error_code.to_owned(),
+            code: args.not_scheduled_error_code.to_owned(),
             reason: message.clone(),
             retryable: false,
         });
+    }
+    let mut side_effect = tool_side_effect(args.side_effect_kind, side_effect_state);
+    if status == TOOL_RESULT_STATUS_QUEUED
+        && let Some(ticket_job_id) = args.ticket_job_id
+    {
+        side_effect.ticket_id = ticket_job_id.to_string();
+    }
+    let mut data = serde_json::Map::new();
+    data.insert("status".to_owned(), json!(trimmed_status));
+    if let Some(reason) = args.reason_code {
+        data.insert("reason".to_owned(), json!(reason));
     }
     ToolResult {
         status: status.to_owned(),
         message,
         no_reply,
-        side_effect: Some(tool_side_effect(side_effect_kind, side_effect_state)),
-        data: Some(json!({
-            "status": trimmed_status,
-        })),
+        side_effect: Some(side_effect),
+        data: Some(serde_json::Value::Object(data)),
         error,
     }
 }
@@ -4297,7 +4520,15 @@ mod tests {
             .await?;
 
         assert_eq!(blocked.status, "not_scheduled");
-        assert!(blocked.no_reply);
+        assert!(!blocked.no_reply, "rejection feeds back to the model");
+        assert_eq!(
+            blocked.rejection,
+            Some(DrawImageScheduleRejection::ActiveJobLimit)
+        );
+        assert_eq!(
+            blocked.message,
+            DrawImageScheduleRejection::ActiveJobLimit.model_facing_message()
+        );
         assert_eq!(queue.records().len(), 10);
         Ok(())
     }
@@ -4328,7 +4559,7 @@ mod tests {
             .await?;
 
         assert_eq!(blocked.status, "not_scheduled");
-        assert!(blocked.no_reply);
+        assert!(!blocked.no_reply, "rejection feeds back to the model");
         assert_eq!(
             blocked.rejection,
             Some(DrawImageScheduleRejection::RateLimited)
@@ -4441,10 +4672,14 @@ mod tests {
             .await?;
 
         assert_eq!(blocked.status, "not_scheduled");
-        assert!(blocked.no_reply);
+        assert!(!blocked.no_reply, "rejection feeds back to the model");
         assert_eq!(
             blocked.rejection,
             Some(DrawImageScheduleRejection::DrawDisabled)
+        );
+        assert_eq!(
+            blocked.message,
+            DrawImageScheduleRejection::DrawDisabled.model_facing_message()
         );
         assert_eq!(permission.calls(), vec![-100]);
         assert!(vip.calls().is_empty());
@@ -4488,7 +4723,7 @@ mod tests {
             .await?;
 
         assert_eq!(blocked.status, "not_scheduled");
-        assert!(blocked.no_reply);
+        assert!(!blocked.no_reply, "rejection feeds back to the model");
         assert_eq!(
             blocked.rejection,
             Some(DrawImageScheduleRejection::ImageNotAllowed)
@@ -4572,7 +4807,12 @@ mod tests {
             .await?;
 
         assert_eq!(blocked.status, "not_scheduled");
-        assert!(blocked.no_reply);
+        assert!(!blocked.no_reply, "rejection feeds back to the model");
+        assert_eq!(blocked.rejection, Some(SongScheduleRejection::ActiveLimit));
+        assert_eq!(
+            blocked.message,
+            SongScheduleRejection::ActiveLimit.model_facing_message()
+        );
         assert_eq!(queue.records().len(), 2);
         Ok(())
     }
@@ -4637,7 +4877,10 @@ mod tests {
             .await?;
 
         assert_eq!(blocked_service.status, "not_scheduled");
-        assert!(blocked_service.no_reply);
+        assert!(
+            !blocked_service.no_reply,
+            "rejection feeds back to the model"
+        );
         assert_eq!(
             blocked_service.rejection,
             Some(SongScheduleRejection::ServiceUnavailable)
@@ -4661,7 +4904,7 @@ mod tests {
             .await?;
 
         assert_eq!(blocked_audio.status, "not_scheduled");
-        assert!(blocked_audio.no_reply);
+        assert!(!blocked_audio.no_reply, "rejection feeds back to the model");
         assert_eq!(
             blocked_audio.rejection,
             Some(SongScheduleRejection::AudioNotAllowed)
@@ -4691,7 +4934,12 @@ mod tests {
             .await?;
 
         assert_eq!(blocked.status, "not_scheduled");
-        assert!(blocked.no_reply);
+        assert!(!blocked.no_reply, "rejection feeds back to the model");
+        assert_eq!(blocked.rejection, Some(SongScheduleRejection::VipOnly));
+        assert_eq!(
+            blocked.message,
+            SongScheduleRejection::VipOnly.model_facing_message()
+        );
         assert_eq!(vip.calls(), vec![42]);
         assert!(queue.records().is_empty());
         Ok(())
@@ -4720,7 +4968,11 @@ mod tests {
             .await?;
 
         assert_eq!(result.status, "not_scheduled");
-        assert!(result.no_reply);
+        assert!(!result.no_reply, "rejection feeds back to the model");
+        assert_eq!(
+            result.rejection,
+            Some(DrawImageScheduleRejection::EditSourceUnavailable)
+        );
         assert!(queue.records().is_empty());
         Ok(())
     }
@@ -4887,12 +5139,266 @@ mod tests {
             .await?;
 
         assert_eq!(result.status, "not_scheduled");
-        assert!(result.no_reply);
+        assert!(!result.no_reply, "rejection feeds back to the model");
         assert_eq!(result.rejection, Some(DrawImageScheduleRejection::VipOnly));
         assert_eq!(vip.calls(), vec![42]);
         assert_eq!(resolver.calls().len(), 1);
         assert!(queue.records().is_empty());
         Ok(())
+    }
+
+    #[derive(Default)]
+    struct ObligationRecorderStub {
+        recorded: Mutex<Vec<openplotva_storage::NewDeliveryObligation>>,
+        duplicate: bool,
+        fail: bool,
+    }
+
+    impl ObligationRecorderStub {
+        fn duplicate() -> Self {
+            Self {
+                duplicate: true,
+                ..Self::default()
+            }
+        }
+
+        fn failing() -> Self {
+            Self {
+                fail: true,
+                ..Self::default()
+            }
+        }
+
+        fn recorded(&self) -> Vec<openplotva_storage::NewDeliveryObligation> {
+            lock_mutex(&self.recorded).clone()
+        }
+    }
+
+    impl crate::dialog_turn::DeliveryObligationRecorder for ObligationRecorderStub {
+        fn record_delivery_obligation<'a>(
+            &'a self,
+            obligation: openplotva_storage::NewDeliveryObligation,
+        ) -> crate::dialog_turn::ObligationFuture<'a, bool> {
+            if self.fail {
+                return Box::pin(async {
+                    Err(Box::new(TestError("obligations down".to_owned()))
+                        as crate::dialog_turn::ObligationError)
+                });
+            }
+            lock_mutex(&self.recorded).push(obligation);
+            let inserted = !self.duplicate;
+            Box::pin(async move { Ok(inserted) })
+        }
+    }
+
+    #[tokio::test]
+    async fn taskman_dialog_tool_adapter_records_obligations_at_schedule_time()
+    -> Result<(), ToolboxError> {
+        let queue = Arc::new(InMemoryTaskQueue::new());
+        let recorder = Arc::new(ObligationRecorderStub::default());
+        let adapter = TaskmanDialogToolAdapter::new(Arc::clone(&queue))
+            .with_draw_image_vip_status(Arc::new(DrawImageVipStatusStub::new(true)))
+            .with_delivery_obligations(recorder.clone(), 1200, 1800);
+        let before = OffsetDateTime::now_utc();
+
+        let image = adapter
+            .schedule_image(DrawImageScheduleRequest {
+                chat_id: -100,
+                thread_id: Some(7),
+                message_id: 11,
+                user_id: 42,
+                user_full_name: "Alice".to_owned(),
+                prompt: "castle".to_owned(),
+                ..DrawImageScheduleRequest::default()
+            })
+            .await?;
+        let song = adapter
+            .schedule_song(SongScheduleRequest {
+                chat_id: -100,
+                message_id: 12,
+                user_id: 42,
+                user_full_name: "Alice".to_owned(),
+                topic: "night city".to_owned(),
+                ..SongScheduleRequest::default()
+            })
+            .await?;
+
+        let records = queue.records();
+        assert_eq!(records.len(), 2);
+        assert_eq!(
+            image.job_id,
+            Some(records[0].id),
+            "scheduler returns the ticket id"
+        );
+        assert_eq!(song.job_id, Some(records[1].id));
+        let recorded = recorder.recorded();
+        assert_eq!(recorded.len(), 2, "one obligation per assigned ticket");
+        assert_eq!(recorded[0].chat_id, -100);
+        assert_eq!(recorded[0].thread_id, Some(7));
+        assert_eq!(recorded[0].user_id, 42);
+        assert_eq!(recorded[0].trigger_message_id, 11);
+        assert_eq!(
+            recorded[0].dialog_job_id,
+            openplotva_storage::DELIVERY_OBLIGATION_DIALOG_JOB_UNKNOWN
+        );
+        assert_eq!(recorded[0].kind, "image_generation_job");
+        assert_eq!(recorded[0].ticket_job_id, records[0].id);
+        assert!(recorded[0].deadline_at >= before + time::Duration::seconds(1200));
+        assert_eq!(recorded[1].kind, "music_generation_job");
+        assert_eq!(recorded[1].ticket_job_id, records[1].id);
+        assert_eq!(recorded[1].trigger_message_id, 12);
+        assert!(recorded[1].deadline_at >= before + time::Duration::seconds(1800));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn taskman_dialog_tool_adapter_obligation_conflict_or_failure_never_blocks_scheduling()
+    -> Result<(), ToolboxError> {
+        for recorder in [
+            Arc::new(ObligationRecorderStub::duplicate()),
+            Arc::new(ObligationRecorderStub::failing()),
+        ] {
+            let queue = Arc::new(InMemoryTaskQueue::new());
+            let adapter = TaskmanDialogToolAdapter::new(Arc::clone(&queue))
+                .with_draw_image_vip_status(Arc::new(DrawImageVipStatusStub::new(true)))
+                .with_delivery_obligations(recorder.clone(), 1200, 1800);
+
+            let scheduled = adapter
+                .schedule_image(DrawImageScheduleRequest {
+                    chat_id: -100,
+                    message_id: 11,
+                    user_id: 42,
+                    user_full_name: "Alice".to_owned(),
+                    prompt: "castle".to_owned(),
+                    ..DrawImageScheduleRequest::default()
+                })
+                .await?;
+
+            assert_eq!(scheduled.status, "scheduled");
+            assert!(scheduled.job_id.is_some());
+            assert_eq!(queue.records().len(), 1, "scheduling always proceeds");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn scheduled_generation_tool_result_carries_ticket_and_reason_codes() {
+        let queued = dialog_draw_image_tool_result(&DrawImageScheduleResult {
+            status: "scheduled".to_owned(),
+            job_id: Some(777),
+            ..DrawImageScheduleResult::default()
+        });
+        assert_eq!(queued.status, TOOL_RESULT_STATUS_QUEUED);
+        assert_eq!(queued.message, "", "queued schedules stay silent");
+        assert!(!queued.no_reply);
+        let side_effect = queued.side_effect.expect("side effect");
+        assert_eq!(side_effect.kind, "image_generation_job");
+        assert_eq!(side_effect.ticket_id, "777");
+        assert_eq!(side_effect.state, "queued");
+        assert_eq!(queued.data, Some(json!({"status": "scheduled"})));
+
+        let queued_song = dialog_generate_song_tool_result(&SongScheduleResult {
+            status: "scheduled".to_owned(),
+            job_id: Some(778),
+            ..SongScheduleResult::default()
+        });
+        assert_eq!(queued_song.status, TOOL_RESULT_STATUS_QUEUED);
+        assert_eq!(queued_song.message, "");
+        assert_eq!(
+            queued_song.side_effect.expect("side effect").ticket_id,
+            "778"
+        );
+
+        let draw_cases = [
+            (DrawImageScheduleRejection::VipOnly, "vip_only"),
+            (
+                DrawImageScheduleRejection::RateLimited,
+                "generation_rate_limited",
+            ),
+            (DrawImageScheduleRejection::DrawDisabled, "draw_disabled"),
+            (
+                DrawImageScheduleRejection::ImageNotAllowed,
+                "image_not_allowed",
+            ),
+            (
+                DrawImageScheduleRejection::ActiveJobLimit,
+                "active_job_limit",
+            ),
+            (
+                DrawImageScheduleRejection::EnqueueRateLimited,
+                "enqueue_rate_limited",
+            ),
+            (DrawImageScheduleRejection::QueueFull, "queue_full"),
+            (
+                DrawImageScheduleRejection::EditSourceUnavailable,
+                "edit_source_unavailable",
+            ),
+        ];
+        for (rejection, code) in draw_cases {
+            let result = dialog_draw_image_tool_result(&not_scheduled_draw(rejection));
+            assert_eq!(result.status, TOOL_RESULT_STATUS_FAILED, "code: {code}");
+            assert!(
+                !result.no_reply,
+                "rejections feed back to the model: {code}"
+            );
+            assert_eq!(
+                result.message,
+                rejection.model_facing_message(),
+                "code: {code}"
+            );
+            assert_eq!(
+                result.data.as_ref().expect("data")["reason"],
+                json!(code),
+                "code: {code}"
+            );
+            assert_eq!(
+                result.side_effect.as_ref().expect("side effect").ticket_id,
+                "",
+                "rejections never carry a ticket: {code}"
+            );
+        }
+
+        let song_cases = [
+            (
+                SongScheduleRejection::ServiceUnavailable,
+                "service_unavailable",
+            ),
+            (SongScheduleRejection::AudioNotAllowed, "audio_not_allowed"),
+            (SongScheduleRejection::VipOnly, "vip_only"),
+            (SongScheduleRejection::EmptyTopic, "empty_topic"),
+            (SongScheduleRejection::ActiveLimit, "active_job_limit"),
+            (SongScheduleRejection::RateLimited, "enqueue_rate_limited"),
+        ];
+        for (rejection, code) in song_cases {
+            let result = dialog_generate_song_tool_result(&not_scheduled_song(rejection));
+            assert_eq!(result.status, TOOL_RESULT_STATUS_FAILED, "code: {code}");
+            assert!(
+                !result.no_reply,
+                "rejections feed back to the model: {code}"
+            );
+            assert_eq!(
+                result.message,
+                rejection.model_facing_message(),
+                "code: {code}"
+            );
+            assert_eq!(
+                result.data.as_ref().expect("data")["reason"],
+                json!(code),
+                "code: {code}"
+            );
+        }
+
+        // Every rejection code round-trips into the turn classifier's catalog.
+        for code in draw_cases
+            .iter()
+            .map(|(_, code)| *code)
+            .chain(song_cases.iter().map(|(_, code)| *code))
+        {
+            assert!(
+                openplotva_dialog::turn::NoReplyReason::from_code(code).is_some(),
+                "classifier must recognize {code}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -1309,6 +1309,8 @@ impl RatesSideEffectDispatcher for RatesToolDispatcherEffects {
             queue_text_message_parts(
                 &self.queue,
                 QueueTextRequest {
+                    protected: false,
+                    debounce_key: None,
                     message: &message,
                     reply_to: Some(&reply_to),
                     immediate_first: false,

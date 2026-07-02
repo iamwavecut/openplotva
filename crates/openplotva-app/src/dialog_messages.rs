@@ -704,6 +704,8 @@ impl RandomDialogEffects for RandomDialogDispatcherEffects {
             queue_text_message_parts(
                 &self.queue,
                 QueueTextRequest {
+                    protected: false,
+                    debounce_key: None,
                     message: &plan.message,
                     reply_to: Some(&plan.reply_to),
                     immediate_first: false,
@@ -727,6 +729,8 @@ impl DirectSongNoticeEffects for RandomDialogDispatcherEffects {
             queue_text_message_parts(
                 &self.queue,
                 QueueTextRequest {
+                    protected: false,
+                    debounce_key: None,
                     message: &plan.message,
                     reply_to: Some(&plan.reply_to),
                     immediate_first: true,
@@ -762,6 +766,8 @@ impl DirectSongNoticeEffects for RandomDialogDispatcherEffects {
             queue_text_message_parts(
                 &self.queue,
                 QueueTextRequest {
+                    protected: false,
+                    debounce_key: None,
                     message: &plan.failure_notice.message,
                     reply_to: Some(&plan.failure_notice.reply_to),
                     immediate_first: true,
@@ -775,6 +781,8 @@ impl DirectSongNoticeEffects for RandomDialogDispatcherEffects {
             queue_text_message_parts(
                 &self.queue,
                 QueueTextRequest {
+                    protected: false,
+                    debounce_key: None,
                     message: &plan.restriction_notice.message,
                     reply_to: Some(&plan.restriction_notice.reply_to),
                     immediate_first: true,
@@ -1926,6 +1934,7 @@ async fn schedule_direct_song_shortcut(
             no_reply: true,
             queue_notice: None,
             rejection: Some(SongScheduleRejection::ServiceUnavailable),
+            job_id: None,
         };
         send_direct_song_result_notices(song_notice_effects, request.message, &result).await;
         return Ok(Some(DialogMessageUpdateRoute::SongScheduled {
@@ -2448,7 +2457,15 @@ async fn schedule_direct_image_shortcut(
         ) => {
             send_direct_draw_failure_notice(notice_effects, request.message, rejection).await;
         }
-        None => {}
+        // Dialog-loop-only rejection classes: the direct command path
+        // historically sent nothing for them, and still does not.
+        Some(
+            DrawImageScheduleRejection::ActiveJobLimit
+            | DrawImageScheduleRejection::EnqueueRateLimited
+            | DrawImageScheduleRejection::QueueFull
+            | DrawImageScheduleRejection::EditSourceUnavailable,
+        )
+        | None => {}
     }
 
     Ok(Some(DialogMessageUpdateRoute::DrawImageScheduled {
@@ -2500,7 +2517,12 @@ fn draw_failure_restriction_notice(
         DrawImageScheduleRejection::ImageNotAllowed => {
             Some((DIRECT_IMAGE_NOT_ALLOWED_NOTICE, Duration::from_secs(120)))
         }
-        DrawImageScheduleRejection::VipOnly | DrawImageScheduleRejection::RateLimited => None,
+        DrawImageScheduleRejection::VipOnly
+        | DrawImageScheduleRejection::RateLimited
+        | DrawImageScheduleRejection::ActiveJobLimit
+        | DrawImageScheduleRejection::EnqueueRateLimited
+        | DrawImageScheduleRejection::QueueFull
+        | DrawImageScheduleRejection::EditSourceUnavailable => None,
     }
 }
 
@@ -6720,7 +6742,7 @@ mod tests {
             route,
             DialogMessageUpdateRoute::SongScheduled {
                 status: "not_scheduled".to_owned(),
-                no_reply: true,
+                no_reply: false,
             }
         );
         assert!(queue.records().is_empty());

@@ -2026,6 +2026,8 @@ where
             crate::virtual_messages::queue_text_message_parts(
                 &self.queue,
                 crate::virtual_messages::QueueTextRequest {
+                    protected: false,
+                    debounce_key: None,
                     message: &request,
                     reply_to: Some(&reply_to),
                     immediate_first: false,
@@ -4641,6 +4643,8 @@ async fn send_admin_command_ephemeral_text(
     queue_text_message_parts(
         queue,
         QueueTextRequest {
+            protected: false,
+            debounce_key: None,
             message: &request,
             reply_to: Some(&reply_to),
             immediate_first: true,

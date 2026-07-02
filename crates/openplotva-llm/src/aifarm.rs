@@ -26,14 +26,13 @@ use openplotva_dialog::{
     ROLE_MODEL, ROLE_TOOL, ROLE_USER, RatesRequest, STEP_CANCEL_DRAWING, STEP_CHAT_HISTORY_SUMMARY,
     STEP_CRAWL_URL, STEP_CURRENCY_RATES, STEP_DRAW_IMAGE, STEP_GENERATE_SONG, STEP_HISTORY_SEARCH,
     STEP_QUEUE_STATUS, STEP_TRANSLATE_TEXT, STEP_VISION_IMAGE, STEP_WEB_SEARCH,
-    STEP_YOUTUBE_SUMMARY, SongRequest, TOOL_RESULT_STATUS_FAILED, TOOL_RESULT_STATUS_NOOP,
-    TOOL_RESULT_STATUS_QUEUED, ToolContext, ToolError, ToolParseDecision, ToolResult, ToolSpec,
-    ToolStep, VisionRequest, alternative_dialog_tool_names, alternative_dialog_tools,
-    chat_completion_tools_for_names, clone_history_messages,
-    decode_plotva_final_response_with_salvage, extract_content_tool_step,
-    has_leading_context_message, is_dialog_history_noise_tool_call_name,
-    is_internal_not_scheduled_instruction, normalize_history_message, parse_native_tool_step,
-    sanitize_final_text, select_llm_history_messages_for_context, tool_telemetry,
+    STEP_YOUTUBE_SUMMARY, SongRequest, TOOL_RESULT_STATUS_NOOP, TOOL_RESULT_STATUS_QUEUED,
+    ToolContext, ToolError, ToolParseDecision, ToolResult, ToolSpec, ToolStep, VisionRequest,
+    alternative_dialog_tool_names, alternative_dialog_tools, chat_completion_tools_for_names,
+    clone_history_messages, decode_plotva_final_response_with_salvage, extract_content_tool_step,
+    has_leading_context_message, is_dialog_history_noise_tool_call_name, normalize_history_message,
+    parse_native_tool_step, sanitize_final_text, select_llm_history_messages_for_context,
+    tool_telemetry,
 };
 use openplotva_history::{
     AIFARM_DEFAULT_HISTORY_SUMMARY_MODEL, HistorySummaryDecodeError, SummaryDocument, SummaryInput,
@@ -4107,15 +4106,11 @@ pub(crate) fn immediate_tool_answer(step: &ToolStep, result: &ToolResult) -> Opt
     }
     match step.step.as_str() {
         STEP_DRAW_IMAGE | STEP_GENERATE_SONG => {
-            if result.no_reply || is_internal_not_scheduled_instruction(&result.message) {
+            if result.no_reply {
                 return Some(String::new());
             }
             result.side_effect.as_ref()?;
-            if step.step == STEP_DRAW_IMAGE {
-                queued_tool_answer(result, "Готово, поставила изображение в очередь.")
-            } else {
-                queued_tool_answer(result, "Готово, поставила песню в очередь.")
-            }
+            queued_tool_answer(result)
         }
         _ => None,
     }
@@ -4171,24 +4166,17 @@ pub(crate) fn duplicate_tool_result(tool_name: &str, first_ref: &str) -> ToolRes
     }
 }
 
-fn queued_tool_answer(result: &ToolResult, fallback: &str) -> Option<String> {
-    let status = result.status.trim();
-    if status.eq_ignore_ascii_case(TOOL_RESULT_STATUS_QUEUED) {
-        let message = result.message.trim();
-        if message.is_empty() {
-            return Some(fallback.to_owned());
-        }
-        return Some(message.to_owned());
-    }
-    if status.eq_ignore_ascii_case(TOOL_RESULT_STATUS_FAILED)
-        || status.eq_ignore_ascii_case(TOOL_RESULT_STATUS_NOOP)
-    {
-        let message = result.message.trim();
-        if !message.is_empty() {
-            return Some(message.to_owned());
-        }
-    }
-    None
+/// QUEUED schedules short-circuit the tool loop with an empty answer: the
+/// generated artifact is the reply (silent-but-guaranteed), so the model never
+/// gets a chance to narrate the confirmation. Rejections (failed/noop) return
+/// None so the loop continues and the model composes the user-visible refusal
+/// from the tool result's message and `data.reason` code.
+fn queued_tool_answer(result: &ToolResult) -> Option<String> {
+    result
+        .status
+        .trim()
+        .eq_ignore_ascii_case(TOOL_RESULT_STATUS_QUEUED)
+        .then(String::new)
 }
 
 fn resolve_vision_tool_file_id(
@@ -7258,11 +7246,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dialog_provider_returns_immediate_queued_draw_answer() -> Result<(), CompletionError> {
+    async fn dialog_provider_short_circuits_queued_draw_with_empty_answer()
+    -> Result<(), CompletionError> {
         let toolbox = FakeToolbox::new(vec![ToolResult {
             status: TOOL_RESULT_STATUS_QUEUED.to_owned(),
             side_effect: Some(ToolSideEffect {
                 kind: "image_generation_job".to_owned(),
+                ticket_id: "777".to_owned(),
                 state: TOOL_RESULT_STATUS_QUEUED.to_owned(),
                 ..ToolSideEffect::default()
             }),
@@ -7289,16 +7279,94 @@ mod tests {
 
         let output = crate::ChatProvider::run_dialog(&provider, input).await?;
 
-        assert_eq!(output.answer, "Готово, поставила изображение в очередь.");
+        assert_eq!(
+            output.answer, "",
+            "queued schedule is silent: the artifact is the reply"
+        );
         assert_eq!(output.tool_calls.len(), 1);
+        let recorded: ToolResult =
+            serde_json::from_value(output.tool_calls[0].output.clone().expect("tool output"))
+                .expect("tool result");
+        let side_effect = recorded.side_effect.expect("side effect preserved");
+        assert_eq!(side_effect.kind, "image_generation_job");
+        assert_eq!(side_effect.ticket_id, "777");
+        assert_eq!(side_effect.state, TOOL_RESULT_STATUS_QUEUED);
         assert_eq!(output.trace_events.len(), 1);
         assert_eq!(output.trace_events[0].iteration, 1);
-        assert_eq!(transport.requests().len(), 1);
+        assert_eq!(
+            transport.requests().len(),
+            1,
+            "queued schedule still short-circuits the tool loop"
+        );
         Ok(())
     }
 
     #[tokio::test]
-    async fn dialog_provider_returns_immediate_queued_draw_answer_from_direct_xml_element()
+    async fn dialog_provider_feeds_draw_rejection_back_to_model() -> Result<(), CompletionError> {
+        let toolbox = FakeToolbox::new(vec![ToolResult {
+            status: "failed".to_owned(),
+            message: "Генерация доступна только VIP-пользователям. Задача не поставлена в очередь."
+                .to_owned(),
+            side_effect: Some(ToolSideEffect {
+                kind: "image_generation_job".to_owned(),
+                state: "failed".to_owned(),
+                ..ToolSideEffect::default()
+            }),
+            data: Some(json!({"status": "not_scheduled", "reason": "vip_only"})),
+            ..ToolResult::default()
+        }]);
+        let (provider, transport, _) = direct_dialog_provider_with_responses(
+            vec![
+                json!({
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": "<tool_call>draw_image{prompt:\"cat\"}</tool_call>"
+                        }
+                    }]
+                }),
+                json!({
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": "Рисование сейчас только для VIP, извини 😿"
+                        }
+                    }]
+                }),
+            ],
+            AifarmDialogConfig::default(),
+            toolbox,
+        );
+        let mut input = base_input();
+        input.message = DialogMessage {
+            id: 103,
+            text: "нарисуй кота".to_owned(),
+            ..DialogMessage::default()
+        };
+
+        let output = crate::ChatProvider::run_dialog(&provider, input).await?;
+
+        assert_eq!(
+            transport.requests().len(),
+            2,
+            "rejection must not short-circuit: the model composes the refusal"
+        );
+        assert_eq!(output.answer, "Рисование сейчас только для VIP, извини 😿");
+        assert_eq!(output.tool_calls.len(), 1);
+        let recorded: ToolResult =
+            serde_json::from_value(output.tool_calls[0].output.clone().expect("tool output"))
+                .expect("tool result");
+        assert_eq!(recorded.status, "failed");
+        assert_eq!(
+            recorded.data.expect("data")["reason"],
+            json!("vip_only"),
+            "machine-readable reason code rides ToolResult.data"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dialog_provider_short_circuits_queued_draw_from_direct_xml_element()
     -> Result<(), CompletionError> {
         let toolbox = FakeToolbox::new(vec![ToolResult {
             status: TOOL_RESULT_STATUS_QUEUED.to_owned(),
@@ -7330,7 +7398,10 @@ mod tests {
 
         let output = crate::ChatProvider::run_dialog(&provider, input).await?;
 
-        assert_eq!(output.answer, "Готово, поставила изображение в очередь.");
+        assert_eq!(
+            output.answer, "",
+            "queued schedule is silent: the artifact is the reply"
+        );
         assert_eq!(output.tool_calls.len(), 1);
         assert_eq!(output.tool_calls[0].name, STEP_DRAW_IMAGE);
         assert_eq!(toolbox.draw_requests()[0].prompt, "cat in space");

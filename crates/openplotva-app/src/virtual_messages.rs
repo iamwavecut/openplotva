@@ -199,6 +199,11 @@ pub struct QueueTextRequest<'a> {
     pub immediate_first: bool,
     pub bypass_chat_restrictions: bool,
     pub ephemeral_delete_after: Option<Duration>,
+    /// Protect the queued parts from dispatcher queue-overflow trimming.
+    pub protected: bool,
+    /// Namespace the dedupe fingerprint (e.g. reply-scoped `r{message_id}`)
+    /// so identical text in different contexts is not deduped away.
+    pub debounce_key: Option<&'a str>,
 }
 
 pub struct QueueRichRequest<'a> {
@@ -587,7 +592,11 @@ where
         let mut dispatcher_message =
             DispatcherMessage::new(fingerprint_text_message_part(chat.id, &part), &virtual_id)
                 .with_method(TelegramOutboundMethod::from(method))
-                .with_bypass_chat_restrictions(req.bypass_chat_restrictions);
+                .with_bypass_chat_restrictions(req.bypass_chat_restrictions)
+                .with_protected(req.protected);
+        if let Some(debounce_key) = req.debounce_key {
+            dispatcher_message = dispatcher_message.with_debounce_key(debounce_key);
+        }
         if index == 0
             && let Some(delete_after) = req.ephemeral_delete_after
         {
@@ -1171,6 +1180,8 @@ mod tests {
         let report = queue_text_message_parts(
             &queue,
             QueueTextRequest {
+                protected: false,
+                debounce_key: None,
                 message: &request,
                 reply_to: None,
                 immediate_first: true,
@@ -1206,6 +1217,8 @@ mod tests {
         let report = queue_text_message_parts(
             &queue,
             QueueTextRequest {
+                protected: false,
+                debounce_key: None,
                 message: &request,
                 reply_to: None,
                 immediate_first: true,
@@ -1233,6 +1246,8 @@ mod tests {
         let report = queue_text_message_parts(
             &queue,
             QueueTextRequest {
+                protected: false,
+                debounce_key: None,
                 message: &request,
                 reply_to: None,
                 immediate_first: true,

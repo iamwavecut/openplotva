@@ -753,6 +753,15 @@ pub struct DialogConfig {
     /// (prevents reaction storms on post-downtime backlogs), from
     /// `DIALOG_TERMINAL_SIGNAL_MAX_AGE_SECS`.
     pub terminal_signal_max_age_secs: i32,
+    /// Image generation delivery deadline in seconds, from
+    /// `DIALOG_IMAGE_DELIVERY_TIMEOUT_SECS`.
+    pub image_delivery_timeout_secs: i32,
+    /// Music generation delivery deadline in seconds, from
+    /// `DIALOG_MUSIC_DELIVERY_TIMEOUT_SECS`.
+    pub music_delivery_timeout_secs: i32,
+    /// Delivery-obligation watcher poll interval in seconds, from
+    /// `DIALOG_OBLIGATION_WATCH_INTERVAL_SECS`.
+    pub obligation_watch_interval_secs: i32,
     pub vmlx_url: String,
     pub vmlx_api_key: String,
     pub vmlx_model: String,
@@ -1157,6 +1166,12 @@ pub struct RawConfig {
     pub dialog_terminal_reaction_emoji: Option<String>,
     /// `DIALOG_TERMINAL_SIGNAL_MAX_AGE_SECS`.
     pub dialog_terminal_signal_max_age_secs: Option<String>,
+    /// `DIALOG_IMAGE_DELIVERY_TIMEOUT_SECS`.
+    pub dialog_image_delivery_timeout_secs: Option<String>,
+    /// `DIALOG_MUSIC_DELIVERY_TIMEOUT_SECS`.
+    pub dialog_music_delivery_timeout_secs: Option<String>,
+    /// `DIALOG_OBLIGATION_WATCH_INTERVAL_SECS`.
+    pub dialog_obligation_watch_interval_secs: Option<String>,
     /// `DIALOG_VMLX_URL`.
     pub dialog_vmlx_url: Option<String>,
     /// `DIALOG_VMLX_API_KEY`.
@@ -2242,6 +2257,21 @@ impl AppConfig {
                         raw.dialog_terminal_signal_max_age_secs,
                         600,
                     )?,
+                    image_delivery_timeout_secs: parse_i32(
+                        "DIALOG_IMAGE_DELIVERY_TIMEOUT_SECS",
+                        raw.dialog_image_delivery_timeout_secs,
+                        1200,
+                    )?,
+                    music_delivery_timeout_secs: parse_i32(
+                        "DIALOG_MUSIC_DELIVERY_TIMEOUT_SECS",
+                        raw.dialog_music_delivery_timeout_secs,
+                        1800,
+                    )?,
+                    obligation_watch_interval_secs: parse_i32(
+                        "DIALOG_OBLIGATION_WATCH_INTERVAL_SECS",
+                        raw.dialog_obligation_watch_interval_secs,
+                        15,
+                    )?,
                     vmlx_url: raw
                         .dialog_vmlx_url
                         .unwrap_or_else(|| DEFAULT_DIALOG_VMLX_URL.to_owned()),
@@ -2821,6 +2851,9 @@ impl RawConfig {
             dialog_turn_max_regenerations: env("DIALOG_TURN_MAX_REGENERATIONS"),
             dialog_terminal_reaction_emoji: env("DIALOG_TERMINAL_REACTION_EMOJI"),
             dialog_terminal_signal_max_age_secs: env("DIALOG_TERMINAL_SIGNAL_MAX_AGE_SECS"),
+            dialog_image_delivery_timeout_secs: env("DIALOG_IMAGE_DELIVERY_TIMEOUT_SECS"),
+            dialog_music_delivery_timeout_secs: env("DIALOG_MUSIC_DELIVERY_TIMEOUT_SECS"),
+            dialog_obligation_watch_interval_secs: env("DIALOG_OBLIGATION_WATCH_INTERVAL_SECS"),
             dialog_vmlx_url: env("DIALOG_VMLX_URL"),
             dialog_vmlx_api_key: env("DIALOG_VMLX_API_KEY"),
             dialog_vmlx_model: env("DIALOG_VMLX_MODEL"),

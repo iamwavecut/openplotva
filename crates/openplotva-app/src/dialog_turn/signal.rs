@@ -183,6 +183,8 @@ impl DispatcherTerminalUserSignal {
         queue_text_message_parts(
             &self.queue,
             QueueTextRequest {
+                protected: false,
+                debounce_key: None,
                 message: &request,
                 reply_to: Some(&reply_to),
                 immediate_first: true,
