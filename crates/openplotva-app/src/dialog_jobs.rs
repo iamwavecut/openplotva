@@ -693,6 +693,11 @@ impl DialogJobEffects for DialogDispatcherEffects {
                 is_topic_message: params.thread_id.is_some(),
                 message_thread_id: params.thread_id.map(i64::from).unwrap_or_default(),
             };
+            // Dialog answers must survive queue trims, and the reply-scoped
+            // debounce key stops identical answers to different trigger
+            // messages from deduping each other (a duplicate reply to the
+            // same message is still suppressed).
+            let debounce_key = format!("r{}", params.message_id);
             if dialog_response_requires_rich(answer) {
                 let request = RichMessageRequest {
                     chat: Some(chat),
@@ -710,6 +715,8 @@ impl DialogJobEffects for DialogDispatcherEffects {
                         immediate: true,
                         bypass_chat_restrictions: false,
                         ephemeral_delete_after: None,
+                        protected: true,
+                        debounce_key: Some(&debounce_key),
                     },
                     || (self.next_virtual_id)(),
                 )
@@ -727,8 +734,8 @@ impl DialogJobEffects for DialogDispatcherEffects {
                 queue_text_message_parts(
                     &self.queue,
                     QueueTextRequest {
-                        protected: false,
-                        debounce_key: None,
+                        protected: true,
+                        debounce_key: Some(&debounce_key),
                         message: &request,
                         reply_to: Some(&reply_to),
                         immediate_first: true,
@@ -2722,6 +2729,15 @@ mod tests {
             item.method_kind(),
             Some(openplotva_telegram::TelegramOutboundMethodKind::SendMessage)
         );
+        assert!(
+            item.metadata().protected,
+            "dialog answers must survive queue trims"
+        );
+        assert!(
+            item.metadata().fingerprint_key.ends_with(":r100"),
+            "debounce key is reply-scoped, got {}",
+            item.metadata().fingerprint_key
+        );
         let (_, method) = item.into_parts();
         let Some(openplotva_telegram::TelegramOutboundMethod::SendMessage(method)) = method else {
             return Err("expected sendMessage".into());
@@ -2754,6 +2770,15 @@ mod tests {
         assert_eq!(
             item.method_kind(),
             Some(openplotva_telegram::TelegramOutboundMethodKind::SendRichMessage)
+        );
+        assert!(
+            item.metadata().protected,
+            "rich dialog answers must survive queue trims"
+        );
+        assert!(
+            item.metadata().fingerprint_key.ends_with(":r100"),
+            "debounce key is reply-scoped, got {}",
+            item.metadata().fingerprint_key
         );
         Ok(())
     }

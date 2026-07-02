@@ -152,6 +152,12 @@ pub trait RuntimeDispatcherInspector: Send + Sync {
     fn stats(&self) -> RuntimeDispatcherStatsData;
 }
 
+/// Runtime API dispatcher terminal-send-failure read boundary.
+pub trait RuntimeDispatcherFailureInspector: Send + Sync {
+    /// Most recent terminal outbound send failures, newest first.
+    fn send_failures(&self, limit: i32) -> Vec<RuntimeDispatchFailureData>;
+}
+
 /// Runtime API cache diagnostics boundary.
 pub trait RuntimeCacheInspector: Send + Sync {
     fn stats(&self) -> RuntimeCacheSnapshotData;
@@ -236,6 +242,7 @@ pub struct RuntimeApiLiveDiagnostics {
     pub taskman_inspector: Option<Arc<dyn RuntimeTaskmanInspector>>,
     pub updates_inspector: Option<Arc<dyn RuntimeUpdatesInspector>>,
     pub dispatcher_inspector: Option<Arc<dyn RuntimeDispatcherInspector>>,
+    pub dispatcher_failure_inspector: Option<Arc<dyn RuntimeDispatcherFailureInspector>>,
     pub cache_inspector: Option<Arc<dyn RuntimeCacheInspector>>,
     pub memory_restarter: Option<Arc<dyn RuntimeMemoryRestarter>>,
     pub gemini_cache_purger: Option<Arc<dyn RuntimeGeminiCachePurger>>,
@@ -270,6 +277,20 @@ pub struct RuntimeDispatcherStatsData {
     pub deduped_total: i64,
     pub oldest_regular_age_ms: i32,
     pub oldest_immediate_age_ms: i32,
+}
+
+/// Runtime API terminal outbound dispatcher send failure from a live inspector.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeDispatchFailureData {
+    pub at: String,
+    pub virtual_id: String,
+    pub chat_id: i64,
+    pub method_kind: String,
+    pub error: String,
+    pub class: String,
+    pub protected: bool,
+    /// Trigger message id recovered from a reply-scoped debounce key, if any.
+    pub reply_to_message_id: Option<i64>,
 }
 
 /// Runtime API cache stats from a live inspector.
@@ -1216,6 +1237,7 @@ pub fn runtime_api_graphql_schema_with_live_diagnostics(
             taskman_inspector: diagnostics.taskman_inspector,
             updates_inspector: diagnostics.updates_inspector,
             dispatcher_inspector: diagnostics.dispatcher_inspector,
+            dispatcher_failure_inspector: diagnostics.dispatcher_failure_inspector,
             cache_inspector: diagnostics.cache_inspector,
             virtual_dialog_manager: diagnostics.virtual_dialog_manager.clone(),
         },
@@ -1243,6 +1265,7 @@ pub struct RuntimeQuery {
     taskman_inspector: Option<Arc<dyn RuntimeTaskmanInspector>>,
     updates_inspector: Option<Arc<dyn RuntimeUpdatesInspector>>,
     dispatcher_inspector: Option<Arc<dyn RuntimeDispatcherInspector>>,
+    dispatcher_failure_inspector: Option<Arc<dyn RuntimeDispatcherFailureInspector>>,
     cache_inspector: Option<Arc<dyn RuntimeCacheInspector>>,
     virtual_dialog_manager: Option<Arc<dyn RuntimeVirtualDialogManager>>,
 }
@@ -1465,6 +1488,21 @@ impl RuntimeQuery {
             .turn_outcomes(turn_outcomes_filter_from_input(filter)?)
             .map(|items| items.into_iter().map(DialogTurnOutcome::from).collect())
             .map_err(async_graphql::Error::new)
+    }
+
+    async fn dispatcher_send_failures(
+        &self,
+        limit: Option<i32>,
+    ) -> async_graphql::Result<Vec<DispatcherSendFailure>> {
+        let Some(inspector) = self.dispatcher_failure_inspector.as_deref() else {
+            return Ok(Vec::new());
+        };
+        let limit = clamp_positive_range_i32(limit.unwrap_or(0), 100, 1024);
+        Ok(inspector
+            .send_failures(limit)
+            .into_iter()
+            .map(DispatcherSendFailure::from)
+            .collect())
     }
 
     async fn llm_routing_events(
@@ -1954,6 +1992,36 @@ impl From<RuntimeDispatcherStatsData> for DispatcherStats {
             deduped_total: stats.deduped_total.to_string(),
             oldest_regular_age_ms: stats.oldest_regular_age_ms,
             oldest_immediate_age_ms: stats.oldest_immediate_age_ms,
+        }
+    }
+}
+
+#[derive(Clone, SimpleObject)]
+struct DispatcherSendFailure {
+    at: String,
+    #[graphql(name = "virtualID")]
+    virtual_id: String,
+    #[graphql(name = "chatID")]
+    chat_id: ID,
+    method_kind: String,
+    error: String,
+    class: String,
+    protected: bool,
+    #[graphql(name = "replyToMessageID")]
+    reply_to_message_id: Option<i64>,
+}
+
+impl From<RuntimeDispatchFailureData> for DispatcherSendFailure {
+    fn from(failure: RuntimeDispatchFailureData) -> Self {
+        Self {
+            at: failure.at,
+            virtual_id: failure.virtual_id,
+            chat_id: ID(failure.chat_id.to_string()),
+            method_kind: failure.method_kind,
+            error: failure.error,
+            class: failure.class,
+            protected: failure.protected,
+            reply_to_message_id: failure.reply_to_message_id,
         }
     }
 }

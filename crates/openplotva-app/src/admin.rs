@@ -283,6 +283,8 @@ impl AdminCommandEffects for AdminDispatcherEffects {
                         immediate: plan.ephemeral_delete_after.is_some(),
                         bypass_chat_restrictions: false,
                         ephemeral_delete_after: plan.ephemeral_delete_after,
+                        protected: false,
+                        debounce_key: None,
                     },
                     || (self.next_virtual_id)(),
                 )

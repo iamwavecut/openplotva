@@ -212,6 +212,11 @@ pub struct QueueRichRequest<'a> {
     pub immediate: bool,
     pub bypass_chat_restrictions: bool,
     pub ephemeral_delete_after: Option<Duration>,
+    /// Protect the queued message from dispatcher queue-overflow trimming.
+    pub protected: bool,
+    /// Namespace the dedupe fingerprint (e.g. reply-scoped `r{message_id}`)
+    /// so identical HTML in different contexts is not deduped away.
+    pub debounce_key: Option<&'a str>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -355,7 +360,25 @@ pub struct DispatchSendReport {
     pub sent_message_id: Option<i32>,
     /// Telegram send error returned by the transport callback.
     pub send_error: Option<String>,
+    /// Stable classification of the send error (`OutboundSendErrorClass::as_str`).
+    pub error_class: Option<&'static str>,
+    /// Whether the item was protected from dispatcher queue trimming.
+    pub protected: bool,
     pub ephemeral_track_error: Option<String>,
+}
+
+/// Send-error surface consumed by dispatcher reporting: display for the
+/// operator string plus the stable retry/terminal class when the transport
+/// knows it.
+pub trait ClassifiedSendError: fmt::Display {
+    /// Stable class string, `None` when the error type carries no classification.
+    fn error_class(&self) -> Option<&'static str>;
+}
+
+impl ClassifiedSendError for openplotva_telegram::TelegramOutboundExecuteError {
+    fn error_class(&self) -> Option<&'static str> {
+        Some(self.classification().as_str())
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -629,7 +652,11 @@ where
     let mut dispatcher_message =
         DispatcherMessage::new(fingerprint_rich_message(chat.id, &method.html), &virtual_id)
             .with_method(TelegramOutboundMethod::from(method))
-            .with_bypass_chat_restrictions(req.bypass_chat_restrictions);
+            .with_bypass_chat_restrictions(req.bypass_chat_restrictions)
+            .with_protected(req.protected);
+    if let Some(debounce_key) = req.debounce_key {
+        dispatcher_message = dispatcher_message.with_debounce_key(debounce_key);
+    }
     if let Some(delete_after) = req.ephemeral_delete_after {
         dispatcher_message = dispatcher_message.with_ephemeral_delete_after(delete_after);
     }
@@ -833,7 +860,7 @@ pub async fn send_work_item<Send, SendFuture, SendError>(
 where
     Send: FnOnce(TelegramOutboundMethod) -> SendFuture,
     SendFuture: Future<Output = Result<TelegramOutboundResponse, SendError>>,
-    SendError: fmt::Display,
+    SendError: ClassifiedSendError,
 {
     send_work_item_inner(
         None::<&NoopEditHistorySink>,
@@ -856,7 +883,7 @@ where
     E: EphemeralMessageTracker + Sync,
     Send: FnOnce(TelegramOutboundMethod) -> SendFuture,
     SendFuture: Future<Output = Result<TelegramOutboundResponse, SendError>>,
-    SendError: fmt::Display,
+    SendError: ClassifiedSendError,
 {
     send_work_item_inner(
         None::<&NoopEditHistorySink>,
@@ -881,7 +908,7 @@ where
     E: EphemeralMessageTracker + Sync,
     Send: FnOnce(TelegramOutboundMethod) -> SendFuture,
     SendFuture: Future<Output = Result<TelegramOutboundResponse, SendError>>,
-    SendError: fmt::Display,
+    SendError: ClassifiedSendError,
 {
     send_work_item_inner(Some(history), Some(ephemeral), item, now, send).await
 }
@@ -898,17 +925,20 @@ where
     E: EphemeralMessageTracker + Sync,
     Send: FnOnce(TelegramOutboundMethod) -> SendFuture,
     SendFuture: Future<Output = Result<TelegramOutboundResponse, SendError>>,
-    SendError: fmt::Display,
+    SendError: ClassifiedSendError,
 {
     let (metadata, method) = item.into_parts();
     let ephemeral_delete_after = metadata.ephemeral_delete_after;
     let chat_id = metadata.chat_id;
+    let protected = metadata.protected;
     let Some(method) = method else {
         return DispatchSendReport {
             status: DispatcherSendStatus::Failed,
             virtual_id: metadata.virtual_id,
             sent_message_id: None,
             send_error: None,
+            error_class: None,
+            protected,
             ephemeral_track_error: None,
         };
     };
@@ -922,7 +952,9 @@ where
                 status: DispatcherSendStatus::Failed,
                 virtual_id: metadata.virtual_id,
                 sent_message_id: None,
+                error_class: error.error_class(),
                 send_error: Some(error.to_string()),
+                protected,
                 ephemeral_track_error: None,
             };
         }
@@ -933,6 +965,8 @@ where
         virtual_id: metadata.virtual_id,
         sent_message_id: response_message_id(&response),
         send_error: None,
+        error_class: None,
+        protected,
         ephemeral_track_error: None,
     };
 
@@ -1036,11 +1070,12 @@ mod tests {
     use super::EditHistorySink;
 
     use super::{
-        QueueAudioRequest, QueueEditMediaRequest, QueueEditTextRequest, QueueMediaGroupRequest,
-        QueuePhotoRequest, QueueStickerRequest, QueueTextRequest, queue_audio_message,
-        queue_edit_media_message, queue_edit_text_message, queue_media_group_message,
-        queue_photo_message, queue_sticker_message, queue_text_message_parts, send_work_item,
-        send_work_item_with_ephemeral, send_work_item_with_history_and_ephemeral,
+        ClassifiedSendError, QueueAudioRequest, QueueEditMediaRequest, QueueEditTextRequest,
+        QueueMediaGroupRequest, QueuePhotoRequest, QueueStickerRequest, QueueTextRequest,
+        queue_audio_message, queue_edit_media_message, queue_edit_text_message,
+        queue_media_group_message, queue_photo_message, queue_sticker_message,
+        queue_text_message_parts, send_work_item, send_work_item_with_ephemeral,
+        send_work_item_with_history_and_ephemeral,
     };
 
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1053,6 +1088,12 @@ mod tests {
     }
 
     impl Error for StubError {}
+
+    impl ClassifiedSendError for StubError {
+        fn error_class(&self) -> Option<&'static str> {
+            None
+        }
+    }
 
     #[derive(Default)]
     struct StoreState {
@@ -1825,6 +1866,51 @@ mod tests {
         assert_eq!(report.status, DispatcherSendStatus::Failed);
         assert_eq!(report.send_error, Some("telegram failed".to_owned()));
         assert_eq!(report.sent_message_id, None);
+        assert_eq!(report.error_class, None, "stub errors carry no class");
+    }
+
+    #[tokio::test]
+    async fn send_report_carries_error_class_and_protected() {
+        let queue = DispatcherQueue::new(DispatcherConfig::default());
+        let method = build_text_message_method(
+            &text_request("hello"),
+            ChatRef {
+                id: 42,
+                is_forum: false,
+            },
+            None,
+            "hello",
+            true,
+        )
+        .expect("text method");
+        queue.enqueue(
+            DispatcherMessage::new(fingerprint_text_message_part(42, "hello"), "v-protected")
+                .with_method(TelegramOutboundMethod::from(method))
+                .with_protected(true),
+            false,
+        );
+        let item = queue.dequeue_regular().expect("queued work item");
+
+        let report = send_work_item(item, |_| async {
+            Err::<TelegramOutboundResponse, _>(
+                openplotva_telegram::TelegramOutboundExecuteError::from(
+                    openplotva_telegram::RichApiError::Api {
+                        code: 403,
+                        description: "Forbidden: bot was blocked by the user".to_owned(),
+                        retry_after: None,
+                    },
+                ),
+            )
+        })
+        .await;
+
+        assert_eq!(report.status, DispatcherSendStatus::Failed);
+        assert_eq!(report.error_class, Some("terminal_permission"));
+        assert!(report.protected, "protection flag survives into the report");
+        assert_eq!(
+            report.send_error,
+            Some("rich api error 403: Forbidden: bot was blocked by the user".to_owned())
+        );
     }
 
     #[tokio::test]
