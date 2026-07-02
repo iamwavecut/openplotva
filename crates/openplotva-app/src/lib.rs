@@ -9154,6 +9154,15 @@ async fn start_runtime_workers(
         ));
         tracing::warn!(%error, "failed to backfill image generation draw-api primary");
     }
+    if let Err(error) =
+        model_routing::backfill_boogu_image_slots(&service_clients.postgres, config).await
+    {
+        routing_event_reporter.record(runtime_routing::routing_backfill_failed_event(
+            "backfill_boogu_image_slots",
+            &error.to_string(),
+        ));
+        tracing::warn!(%error, "failed to backfill Boogu image slot workflows");
+    }
     let router_breakers = Arc::new(openplotva_llm::router::BreakerSet::new());
     let router_triggers = Arc::new(openplotva_llm::router::TriggerState::new());
     let router_handle = match model_routing::load_routing_table(&service_clients.postgres).await {
@@ -10734,22 +10743,20 @@ async fn start_runtime_workers(
         Arc::clone(&router_triggers),
     )
     .with_reporter(routing_event_reporter.clone());
-    let routed_vip_image_generator = image_jobs::RoutedImageGenerator::new(
+    let routed_vip_flux_image_generator = image_jobs::RoutedImageGenerator::new(
         image_attempt_walker.clone(),
         image_jobs::aifarm_draw_api_config_from_app_config(config),
-    );
-    let boogu_image_provider = image_jobs::BooguGradioImageClient::new(
-        image_jobs::boogu_gradio_image_config_from_app_config(config),
-        image_jobs::boogu_gradio_edit_config_from_app_config(config),
-        vision_data_urls.clone(),
-    );
+    )
+    .with_workflow_key(image_jobs::IMAGE_GENERATION_FLUX_WORKFLOW_KEY);
+    let routed_vip_boogu_image_generator = image_jobs::RoutedImageGenerator::new(
+        image_attempt_walker.clone(),
+        image_jobs::aifarm_draw_api_config_from_app_config(config),
+    )
+    .with_workflow_key(image_jobs::IMAGE_GENERATION_BOOGU_TURBO_WORKFLOW_KEY);
     let vip_image_generator = image_jobs::OptimizingImageGenerator::new(
         image_jobs::ParallelImageGenerator::new(
-            image_jobs::SequentialImageGenerator::new(
-                routed_vip_image_generator.clone(),
-                routed_vip_image_generator,
-            ),
-            boogu_image_provider.clone(),
+            routed_vip_flux_image_generator,
+            routed_vip_boogu_image_generator,
         ),
         media_prompt_optimizer.clone(),
     );
@@ -10788,8 +10795,14 @@ async fn start_runtime_workers(
                 image_attempt_walker.clone(),
                 vision_data_urls.clone(),
                 image_jobs::aifarm_draw_api_config_from_app_config(config),
-            ),
-            boogu_image_provider,
+            )
+            .with_workflow_key(image_jobs::IMAGE_EDIT_FLUX_WORKFLOW_KEY),
+            image_jobs::RoutedImageEditor::new(
+                image_attempt_walker.clone(),
+                vision_data_urls.clone(),
+                image_jobs::aifarm_draw_api_config_from_app_config(config),
+            )
+            .with_workflow_key(image_jobs::IMAGE_EDIT_BOOGU_TURBO_WORKFLOW_KEY),
         ),
         media_prompt_optimizer.clone(),
     );

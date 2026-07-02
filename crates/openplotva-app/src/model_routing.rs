@@ -680,8 +680,11 @@ pub async fn backfill_dialog_qwen_fallback(
 const GENKIT_FLASH_FIX_KEY: &str = "llm.routing.genkit_flash_fixed";
 const DECLARATIVE_V2_KEY: &str = "llm.routing.declarative_v2";
 const IMAGE_DRAW_API_PRIMARY_KEY: &str = "llm.routing.image_draw_api_primary";
+const BOOGU_IMAGE_SLOTS_KEY: &str = "llm.routing.boogu_image_slots_v1";
 const DRAW_API_PROVIDER: &str = "aifarm-draw";
 const DRAW_API_MODEL: &str = "draw-api";
+const BOOGU_TURBO_MODEL: &str = "boogu-image-turbo-sdnq";
+const BOOGU_EDIT_MODEL: &str = "boogu-image-edit-turbo-sdnq";
 const IMAGE_EDIT_WORKFLOW: &str = "image_edit";
 const PRIVACY_FILTER_PROVIDER: &str = "privacy-filter";
 const OPENROUTER_PROVIDER: &str = "openrouter";
@@ -882,10 +885,9 @@ async fn ensure_primary_assignment(
     .await
 }
 
-async fn ensure_draw_api_model(
+async fn ensure_draw_api_provider(
     pool: &PgPool,
     providers: &mut Vec<ProviderRecord>,
-    models: &mut Vec<ModelRecord>,
     config: &AppConfig,
 ) -> Result<i64, StorageError> {
     let provider_input = ProviderInput {
@@ -918,20 +920,22 @@ async fn ensure_draw_api_model(
         provider.enabled = provider_input.enabled;
         provider.config = provider_input.config;
     }
+    Ok(draw_provider_id)
+}
 
-    let model_input = ModelInput {
-        provider_id: draw_provider_id,
-        model_name: DRAW_API_MODEL.to_owned(),
-        display_name: Some("AI Farm draw-api".to_owned()),
-        base_url: None,
-        capabilities: vec!["image".to_owned()],
-        embedding_dim: None,
-        enabled: true,
-        config: json!({
-            "service_name": crate::image_jobs::AIFARM_DRAW_API_SERVICE_NAME,
-            "endpoint_name": crate::image_jobs::AIFARM_DRAW_API_ENDPOINT_NAME,
-        }),
-    };
+async fn ensure_draw_api_model(
+    pool: &PgPool,
+    providers: &mut Vec<ProviderRecord>,
+    models: &mut Vec<ModelRecord>,
+    config: &AppConfig,
+) -> Result<i64, StorageError> {
+    let draw_provider_id = ensure_draw_api_provider(pool, providers, config).await?;
+    let model_input = draw_api_model_input(
+        draw_provider_id,
+        DRAW_API_MODEL,
+        "AI Farm draw-api",
+        crate::image_jobs::AIFARM_DRAW_API_ENDPOINT_NAME,
+    );
     let draw_model_id = ensure_model(pool, models, model_input.clone()).await?;
     update_model(pool, draw_model_id, &model_input).await?;
     if let Some(model) = models.iter_mut().find(|model| model.id == draw_model_id) {
@@ -945,6 +949,51 @@ async fn ensure_draw_api_model(
         model.config = model_input.config;
     }
     Ok(draw_model_id)
+}
+
+fn draw_api_model_input(
+    provider_id: i64,
+    model_name: &str,
+    display_name: &str,
+    endpoint_name: &str,
+) -> ModelInput {
+    ModelInput {
+        provider_id,
+        model_name: model_name.to_owned(),
+        display_name: Some(display_name.to_owned()),
+        base_url: None,
+        capabilities: vec!["image".to_owned()],
+        embedding_dim: None,
+        enabled: true,
+        config: json!({
+            "service_name": crate::image_jobs::AIFARM_DRAW_API_SERVICE_NAME,
+            "endpoint_name": endpoint_name,
+        }),
+    }
+}
+
+async fn ensure_draw_api_endpoint_model(
+    pool: &PgPool,
+    models: &mut Vec<ModelRecord>,
+    provider_id: i64,
+    model_name: &str,
+    display_name: &str,
+    endpoint_name: &str,
+) -> Result<i64, StorageError> {
+    let model_input = draw_api_model_input(provider_id, model_name, display_name, endpoint_name);
+    let model_id = ensure_model(pool, models, model_input.clone()).await?;
+    update_model(pool, model_id, &model_input).await?;
+    if let Some(model) = models.iter_mut().find(|model| model.id == model_id) {
+        model.provider_id = model_input.provider_id;
+        model.model_name = model_input.model_name;
+        model.display_name = model_input.display_name;
+        model.base_url = model_input.base_url;
+        model.capabilities = model_input.capabilities;
+        model.embedding_dim = model_input.embedding_dim;
+        model.enabled = model_input.enabled;
+        model.config = model_input.config;
+    }
+    Ok(model_id)
 }
 
 async fn ensure_image_generation_draw_api_primary_assignment(
@@ -1188,6 +1237,85 @@ pub async fn backfill_image_generation_draw_api_primary(
 
     mark_app_setting(pool, IMAGE_DRAW_API_PRIMARY_KEY).await?;
     tracing::info!("backfilled image_generation primary to draw-api");
+    Ok(true)
+}
+
+pub async fn backfill_boogu_image_slots(
+    pool: &PgPool,
+    config: &AppConfig,
+) -> Result<bool, StorageError> {
+    if app_setting_present(pool, BOOGU_IMAGE_SLOTS_KEY).await? {
+        return Ok(false);
+    }
+
+    for workflow in [
+        crate::image_jobs::IMAGE_GENERATION_FLUX_WORKFLOW_KEY,
+        crate::image_jobs::IMAGE_GENERATION_BOOGU_TURBO_WORKFLOW_KEY,
+        crate::image_jobs::IMAGE_EDIT_FLUX_WORKFLOW_KEY,
+        crate::image_jobs::IMAGE_EDIT_BOOGU_TURBO_WORKFLOW_KEY,
+    ] {
+        insert_workflow_if_missing(pool, workflow, "image", true, 3, 60_000, true).await?;
+    }
+
+    let mut providers = list_providers(pool).await?;
+    let mut models = list_models(pool).await?;
+    let mut assignments = list_assignments(pool).await?;
+    let draw_model_id = ensure_draw_api_model(pool, &mut providers, &mut models, config).await?;
+    let draw_provider_id = ensure_draw_api_provider(pool, &mut providers, config).await?;
+    let boogu_turbo_model_id = ensure_draw_api_endpoint_model(
+        pool,
+        &mut models,
+        draw_provider_id,
+        BOOGU_TURBO_MODEL,
+        "Boogu Image 0.1 Turbo SDNQ",
+        crate::image_jobs::AIFARM_DRAW_API_BOOGU_TURBO_ENDPOINT_NAME,
+    )
+    .await?;
+    let boogu_edit_model_id = ensure_draw_api_endpoint_model(
+        pool,
+        &mut models,
+        draw_provider_id,
+        BOOGU_EDIT_MODEL,
+        "Boogu Image 0.1 Edit Turbo SDNQ",
+        crate::image_jobs::AIFARM_DRAW_API_BOOGU_EDIT_ENDPOINT_NAME,
+    )
+    .await?;
+
+    ensure_primary_assignment(
+        pool,
+        &mut assignments,
+        crate::image_jobs::IMAGE_GENERATION_FLUX_WORKFLOW_KEY,
+        draw_model_id,
+        Some(100),
+    )
+    .await?;
+    ensure_primary_assignment(
+        pool,
+        &mut assignments,
+        crate::image_jobs::IMAGE_GENERATION_BOOGU_TURBO_WORKFLOW_KEY,
+        boogu_turbo_model_id,
+        Some(100),
+    )
+    .await?;
+    ensure_primary_assignment(
+        pool,
+        &mut assignments,
+        crate::image_jobs::IMAGE_EDIT_FLUX_WORKFLOW_KEY,
+        draw_model_id,
+        Some(100),
+    )
+    .await?;
+    ensure_primary_assignment(
+        pool,
+        &mut assignments,
+        crate::image_jobs::IMAGE_EDIT_BOOGU_TURBO_WORKFLOW_KEY,
+        boogu_edit_model_id,
+        Some(100),
+    )
+    .await?;
+
+    mark_app_setting(pool, BOOGU_IMAGE_SLOTS_KEY).await?;
+    tracing::info!("backfilled Boogu image slot workflows");
     Ok(true)
 }
 
@@ -1788,6 +1916,154 @@ mod tests {
         let table = build_routing_table(&snapshot);
         let route = table.resolve("embedding", false).expect("embedding route");
         assert_eq!(route.primary.len(), 1);
+    }
+
+    #[test]
+    fn image_slot_workflows_route_to_distinct_draw_api_models() {
+        let snapshot = RoutingSnapshot {
+            providers: vec![ProviderRecord {
+                api_key_ref: None,
+                discovery_service_name: Some(
+                    crate::image_jobs::AIFARM_DRAW_API_SERVICE_NAME.to_owned(),
+                ),
+                discovery_endpoint_name: Some(
+                    crate::image_jobs::AIFARM_DRAW_API_ENDPOINT_NAME.to_owned(),
+                ),
+                config: json!({
+                    "service_name": crate::image_jobs::AIFARM_DRAW_API_SERVICE_NAME,
+                    "endpoint_name": crate::image_jobs::AIFARM_DRAW_API_ENDPOINT_NAME,
+                }),
+                ..provider(1, DRAW_API_PROVIDER, "image")
+            }],
+            models: vec![
+                ModelRecord {
+                    capabilities: vec!["image".to_owned()],
+                    config: json!({
+                        "service_name": crate::image_jobs::AIFARM_DRAW_API_SERVICE_NAME,
+                        "endpoint_name": crate::image_jobs::AIFARM_DRAW_API_ENDPOINT_NAME,
+                    }),
+                    ..model(10, 1, DRAW_API_MODEL)
+                },
+                ModelRecord {
+                    capabilities: vec!["image".to_owned()],
+                    config: json!({
+                        "service_name": crate::image_jobs::AIFARM_DRAW_API_SERVICE_NAME,
+                        "endpoint_name": crate::image_jobs::AIFARM_DRAW_API_BOOGU_TURBO_ENDPOINT_NAME,
+                    }),
+                    ..model(20, 1, BOOGU_TURBO_MODEL)
+                },
+                ModelRecord {
+                    capabilities: vec!["image".to_owned()],
+                    config: json!({
+                        "service_name": crate::image_jobs::AIFARM_DRAW_API_SERVICE_NAME,
+                        "endpoint_name": crate::image_jobs::AIFARM_DRAW_API_BOOGU_EDIT_ENDPOINT_NAME,
+                    }),
+                    ..model(30, 1, BOOGU_EDIT_MODEL)
+                },
+            ],
+            workflows: vec![
+                WorkflowRecord {
+                    key: crate::image_jobs::IMAGE_GENERATION_FLUX_WORKFLOW_KEY.to_owned(),
+                    kind: "image".to_owned(),
+                    full_routing: true,
+                    retry_max_hops: 3,
+                    retry_wall_ms: 60_000,
+                    enabled: true,
+                },
+                WorkflowRecord {
+                    key: crate::image_jobs::IMAGE_GENERATION_BOOGU_TURBO_WORKFLOW_KEY.to_owned(),
+                    kind: "image".to_owned(),
+                    full_routing: true,
+                    retry_max_hops: 3,
+                    retry_wall_ms: 60_000,
+                    enabled: true,
+                },
+                WorkflowRecord {
+                    key: crate::image_jobs::IMAGE_EDIT_FLUX_WORKFLOW_KEY.to_owned(),
+                    kind: "image".to_owned(),
+                    full_routing: true,
+                    retry_max_hops: 3,
+                    retry_wall_ms: 60_000,
+                    enabled: true,
+                },
+                WorkflowRecord {
+                    key: crate::image_jobs::IMAGE_EDIT_BOOGU_TURBO_WORKFLOW_KEY.to_owned(),
+                    kind: "image".to_owned(),
+                    full_routing: true,
+                    retry_max_hops: 3,
+                    retry_wall_ms: 60_000,
+                    enabled: true,
+                },
+            ],
+            assignments: vec![
+                assignment(
+                    100,
+                    crate::image_jobs::IMAGE_GENERATION_FLUX_WORKFLOW_KEY,
+                    "global",
+                    "primary",
+                    10,
+                    Some(100),
+                ),
+                assignment(
+                    101,
+                    crate::image_jobs::IMAGE_GENERATION_BOOGU_TURBO_WORKFLOW_KEY,
+                    "global",
+                    "primary",
+                    20,
+                    Some(100),
+                ),
+                assignment(
+                    102,
+                    crate::image_jobs::IMAGE_EDIT_FLUX_WORKFLOW_KEY,
+                    "global",
+                    "primary",
+                    10,
+                    Some(100),
+                ),
+                assignment(
+                    103,
+                    crate::image_jobs::IMAGE_EDIT_BOOGU_TURBO_WORKFLOW_KEY,
+                    "global",
+                    "primary",
+                    30,
+                    Some(100),
+                ),
+            ],
+            triggers: vec![],
+        };
+
+        let table = build_routing_table(&snapshot);
+
+        assert_eq!(
+            table
+                .resolve(crate::image_jobs::IMAGE_GENERATION_FLUX_WORKFLOW_KEY, false)
+                .expect("flux draw")
+                .primary[0]
+                .model,
+            10
+        );
+        assert_eq!(
+            table
+                .resolve(
+                    crate::image_jobs::IMAGE_GENERATION_BOOGU_TURBO_WORKFLOW_KEY,
+                    false
+                )
+                .expect("boogu draw")
+                .primary[0]
+                .model,
+            20
+        );
+        assert_eq!(
+            table
+                .resolve(
+                    crate::image_jobs::IMAGE_EDIT_BOOGU_TURBO_WORKFLOW_KEY,
+                    false
+                )
+                .expect("boogu edit")
+                .primary[0]
+                .model,
+            30
+        );
     }
 
     #[test]

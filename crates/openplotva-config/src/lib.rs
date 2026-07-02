@@ -212,11 +212,11 @@ pub const DEFAULT_VISION_DIRECT_IMAGE_LIMIT: i32 = 2;
 
 pub const DEFAULT_VISION_REQUEST_TIMEOUT_SECONDS: i32 = 120;
 
-pub const DEFAULT_BOOGU_IMAGE_TURBO_ENABLED: bool = true;
+pub const DEFAULT_BOOGU_IMAGE_TURBO_ENABLED: bool = false;
 
 pub const DEFAULT_BOOGU_IMAGE_TURBO_BASE_URL: &str = "https://demo-turbo.boogu.org";
 
-pub const DEFAULT_BOOGU_IMAGE_EDIT_TURBO_ENABLED: bool = true;
+pub const DEFAULT_BOOGU_IMAGE_EDIT_TURBO_ENABLED: bool = false;
 
 pub const DEFAULT_BOOGU_IMAGE_EDIT_TURBO_BASE_URL: &str = "https://demo-edit-turbo-1k5.boogu.org";
 
@@ -3632,7 +3632,7 @@ mod tests {
     }
 
     #[test]
-    fn boogu_image_provider_defaults_are_enabled() -> Result<(), super::ConfigError> {
+    fn boogu_image_provider_defaults_are_disabled() -> Result<(), super::ConfigError> {
         let config = AppConfig::from_raw(RawConfig::default())?;
 
         assert_eq!(

@@ -56,6 +56,8 @@ pub type ImageJobEffectFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + '
 
 pub const AIFARM_DRAW_API_SERVICE_NAME: &str = "draw-api";
 pub const AIFARM_DRAW_API_ENDPOINT_NAME: &str = "generate";
+pub const AIFARM_DRAW_API_BOOGU_TURBO_ENDPOINT_NAME: &str = "boogu_turbo_generate";
+pub const AIFARM_DRAW_API_BOOGU_EDIT_ENDPOINT_NAME: &str = "boogu_edit_generate";
 pub const AIFARM_DRAW_API_DEFAULT_BASE_URL: &str = "http://127.0.0.1:50051";
 pub const AIFARM_DRAW_API_DEFAULT_TIMEOUT: StdDuration = StdDuration::from_secs(600);
 pub const AIFARM_DRAW_API_DEFAULT_POLL_INTERVAL: StdDuration = StdDuration::from_secs(1);
@@ -74,6 +76,10 @@ pub const IMAGE_VIP_JOB_WORKER_QUEUES: [&str; 1] = [IMAGE_VIP_QUEUE_NAME];
 pub const IMAGE_REGULAR_JOB_WORKER_QUEUES: [&str; 1] = [IMAGE_REGULAR_QUEUE_NAME];
 pub const IMAGE_EDIT_WORKFLOW_KEY: &str = "image_edit";
 pub const IMAGE_GENERATION_WORKFLOW_KEY: &str = "image_generation";
+pub const IMAGE_GENERATION_FLUX_WORKFLOW_KEY: &str = "image_generation_flux";
+pub const IMAGE_GENERATION_BOOGU_TURBO_WORKFLOW_KEY: &str = "image_generation_boogu_turbo";
+pub const IMAGE_EDIT_FLUX_WORKFLOW_KEY: &str = "image_edit_flux";
+pub const IMAGE_EDIT_BOOGU_TURBO_WORKFLOW_KEY: &str = "image_edit_boogu_turbo";
 pub const DRAW_SUPPORT_ME_URL: &str = "https://t.me/PlotvoBot?start=donate";
 pub const DRAW_VIP_URL: &str = "https://t.me/PlotvoBot?start=vip";
 pub const BOOGU_GRADIO_RESOLUTION_MODE: &str = "Recommended resolutions";
@@ -229,6 +235,10 @@ impl ImageGenerationError {
 pub struct AifarmDrawApiConfig {
     /// Discovery base URL.
     pub base_url: String,
+    /// Discovery service name.
+    pub service_name: String,
+    /// Discovery endpoint name.
+    pub endpoint_name: String,
     /// Upstream draw task timeout.
     pub timeout: StdDuration,
     /// Poll interval for `/v1/jobs/{id}`.
@@ -239,6 +249,8 @@ impl Default for AifarmDrawApiConfig {
     fn default() -> Self {
         Self {
             base_url: String::new(),
+            service_name: String::new(),
+            endpoint_name: String::new(),
             timeout: StdDuration::ZERO,
             poll_interval: StdDuration::ZERO,
         }
@@ -252,6 +264,16 @@ impl AifarmDrawApiConfig {
             AIFARM_DRAW_API_DEFAULT_BASE_URL.to_owned()
         } else {
             self.base_url.trim().to_owned()
+        };
+        self.service_name = if self.service_name.trim().is_empty() {
+            AIFARM_DRAW_API_SERVICE_NAME.to_owned()
+        } else {
+            self.service_name.trim().to_owned()
+        };
+        self.endpoint_name = if self.endpoint_name.trim().is_empty() {
+            AIFARM_DRAW_API_ENDPOINT_NAME.to_owned()
+        } else {
+            self.endpoint_name.trim().to_owned()
         };
         if self.timeout == StdDuration::ZERO {
             self.timeout = AIFARM_DRAW_API_DEFAULT_TIMEOUT;
@@ -781,8 +803,8 @@ where
         };
         let request = DiscoveryJobRequest {
             invocation: DiscoveryInvocation {
-                service_name: AIFARM_DRAW_API_SERVICE_NAME.to_owned(),
-                endpoint_name: AIFARM_DRAW_API_ENDPOINT_NAME.to_owned(),
+                service_name: self.cfg.service_name.clone(),
+                endpoint_name: self.cfg.endpoint_name.clone(),
                 headers: [("X-Request-Id".to_owned(), job_id.clone())].into(),
                 query: BTreeMap::new(),
                 body: general_purpose::STANDARD.encode(payload),
@@ -1283,6 +1305,12 @@ impl RoutedImageGenerator {
         self.expected_image_count = expected_image_count.max(1);
         self
     }
+
+    #[must_use]
+    pub fn with_workflow_key(mut self, workflow_key: impl Into<String>) -> Self {
+        self.workflow_key = workflow_key.into();
+        self
+    }
 }
 
 impl ImageGenerator for RoutedImageGenerator {
@@ -1325,6 +1353,7 @@ pub struct RoutedImageEditor<DataUrl> {
     walker: RoutedAttemptWalker,
     data_urls: DataUrl,
     draw_api_config: AifarmDrawApiConfig,
+    workflow_key: String,
 }
 
 impl<DataUrl> RoutedImageEditor<DataUrl> {
@@ -1338,7 +1367,14 @@ impl<DataUrl> RoutedImageEditor<DataUrl> {
             walker,
             data_urls,
             draw_api_config: draw_api_config.with_defaults(),
+            workflow_key: IMAGE_EDIT_WORKFLOW_KEY.to_owned(),
         }
+    }
+
+    #[must_use]
+    pub fn with_workflow_key(mut self, workflow_key: impl Into<String>) -> Self {
+        self.workflow_key = workflow_key.into();
+        self
     }
 }
 
@@ -1355,7 +1391,7 @@ where
             let result = self
                 .walker
                 .run(
-                    image_edit_context(&request),
+                    image_edit_context(&self.workflow_key, &request),
                     move |attempt| {
                         let request = request_for_attempts.clone();
                         let data_urls = data_urls.clone();
@@ -1397,9 +1433,9 @@ fn image_generation_context(
     }
 }
 
-fn image_edit_context(request: &ImageEditRequest) -> RoutedRequestContext {
+fn image_edit_context(workflow_key: &str, request: &ImageEditRequest) -> RoutedRequestContext {
     RoutedRequestContext {
-        workflow_key: IMAGE_EDIT_WORKFLOW_KEY.to_owned(),
+        workflow_key: workflow_key.to_owned(),
         chat_id: (request.chat_id != 0).then_some(request.chat_id),
         thread_id: request.thread_id,
         message_id: (request.message_id != 0).then_some(request.message_id),
@@ -1464,6 +1500,16 @@ fn draw_api_config_for_attempt(
     if let Some(endpoint) = routed_endpoint(attempt) {
         config.base_url = endpoint;
     }
+    if let Some(service_name) = routed_config_value(attempt, "service_name")
+        .or_else(|| routed_discovery_value(attempt.discovery_service_name.as_deref()))
+    {
+        config.service_name = service_name;
+    }
+    if let Some(endpoint_name) = routed_config_value(attempt, "endpoint_name")
+        .or_else(|| routed_discovery_value(attempt.discovery_endpoint_name.as_deref()))
+    {
+        config.endpoint_name = endpoint_name;
+    }
     config.with_defaults()
 }
 
@@ -1472,6 +1518,27 @@ fn routed_endpoint(attempt: &RoutedAttempt) -> Option<String> {
         .model_base_url
         .as_deref()
         .or(attempt.provider_endpoint.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn routed_config_value(attempt: &RoutedAttempt, key: &str) -> Option<String> {
+    attempt
+        .model_config
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            attempt
+                .provider_config
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+        })
+        .and_then(|value| routed_discovery_value(Some(value)))
+}
+
+fn routed_discovery_value(value: Option<&str>) -> Option<String> {
+    value
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
@@ -4258,6 +4325,7 @@ mod tests {
     };
 
     use openplotva_llm::aifarm::{AifarmHttpFuture, AifarmHttpResponse, CompletionError};
+    use openplotva_llm::router::{BreakerSet, RouterHandle, RoutingTable, TriggerState};
     use openplotva_taskman::{
         DEFAULT_LLM_JOB_MAX_ATTEMPTS, DEFAULT_PRIORITY, HIGHEST_PRIORITY, IMAGE_REGULAR_QUEUE_NAME,
         IMAGE_VIP_QUEUE_NAME, ImageEditJobParams, ImageGenJobParams, ImageJobData, JobPayload,
@@ -5170,6 +5238,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parallel_image_editor_returns_both_slot_results_when_both_succeed() {
+        let first = EditorStub::success(vec!["https://img.test/flux-edit.png".to_owned()]);
+        let second = EditorStub::success(vec!["https://img.test/boogu-edit.png".to_owned()]);
+        let editor = ParallelImageEditor::new(first.clone(), second.clone());
+
+        let result = editor
+            .edit_image(ImageEditRequest {
+                prompt: "make it night".to_owned(),
+                ..ImageEditRequest::default()
+            })
+            .await
+            .expect("parallel edit result");
+
+        assert_eq!(
+            result.image_urls,
+            vec![
+                "https://img.test/flux-edit.png".to_owned(),
+                "https://img.test/boogu-edit.png".to_owned()
+            ]
+        );
+        assert_eq!(first.requests().len(), 1);
+        assert_eq!(second.requests().len(), 1);
+    }
+
+    #[tokio::test]
     async fn parallel_image_provider_all_failure_requeues_retryable_jobs() {
         let queue = InMemoryTaskQueue::new();
         let now = OffsetDateTime::from_unix_timestamp(1_779_193_800).expect("time");
@@ -5208,18 +5301,49 @@ mod tests {
     }
 
     #[test]
-    fn vip_parallel_generation_has_three_slots_while_regular_stays_single_slot() {
+    fn vip_parallel_generation_has_two_slots_while_regular_stays_single_slot() {
         let vip = ParallelImageGenerator::new(
-            SequentialImageGenerator::new(
-                GeneratorStub::success("https://img.test/vip-1.png"),
-                GeneratorStub::success("https://img.test/vip-2.png"),
-            ),
+            GeneratorStub::success("https://img.test/flux.png"),
             GeneratorStub::success("https://img.test/boogu.png"),
         );
         let regular = GeneratorStub::success("https://img.test/regular.png");
 
-        assert_eq!(vip.expected_image_count(), 3);
+        assert_eq!(vip.expected_image_count(), 2);
         assert_eq!(regular.expected_image_count(), 1);
+    }
+
+    fn empty_routed_attempt_walker() -> RoutedAttemptWalker {
+        RoutedAttemptWalker::new(
+            RouterHandle::new(RoutingTable::default()),
+            Arc::new(BreakerSet::new()),
+            Arc::new(TriggerState::new()),
+        )
+    }
+
+    #[test]
+    fn routed_image_generator_accepts_slot_workflow_key() {
+        let generator = RoutedImageGenerator::new(
+            empty_routed_attempt_walker(),
+            AifarmDrawApiConfig::default(),
+        )
+        .with_workflow_key(IMAGE_GENERATION_BOOGU_TURBO_WORKFLOW_KEY);
+
+        assert_eq!(
+            generator.workflow_key,
+            IMAGE_GENERATION_BOOGU_TURBO_WORKFLOW_KEY
+        );
+    }
+
+    #[test]
+    fn routed_image_editor_accepts_slot_workflow_key() {
+        let editor = RoutedImageEditor::new(
+            empty_routed_attempt_walker(),
+            DataUrlStub::success("data:image/png;base64,ZmFrZS1wbmc="),
+            AifarmDrawApiConfig::default(),
+        )
+        .with_workflow_key(IMAGE_EDIT_BOOGU_TURBO_WORKFLOW_KEY);
+
+        assert_eq!(editor.workflow_key, IMAGE_EDIT_BOOGU_TURBO_WORKFLOW_KEY);
     }
 
     #[tokio::test]
@@ -6018,6 +6142,8 @@ mod tests {
         let generator = AifarmDrawApiImageGenerator::with_transport(
             AifarmDrawApiConfig {
                 base_url: "https://draw.example.test".to_owned(),
+                service_name: AIFARM_DRAW_API_SERVICE_NAME.to_owned(),
+                endpoint_name: AIFARM_DRAW_API_ENDPOINT_NAME.to_owned(),
                 timeout: StdDuration::from_secs(5),
                 poll_interval: StdDuration::from_nanos(1),
             },
@@ -6068,6 +6194,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn aifarm_draw_api_generator_uses_configured_discovery_endpoint() {
+        let draw_payload =
+            serde_json::to_vec(&json!({"image_url": ["https://img.test/boogu.png"]}))
+                .expect("draw payload");
+        let response_body = general_purpose::STANDARD.encode(draw_payload);
+        let transport = AifarmTransportStub::new(vec![
+            Ok(json_response(
+                json!({"job_id": "boogu-1", "state": "queued"}),
+            )),
+            Ok(json_response(json!({
+                "job": {
+                    "job_id": "boogu-1",
+                    "state": "completed",
+                    "result": {
+                        "response": {
+                            "status_code": 200,
+                            "body": response_body
+                        }
+                    }
+                }
+            }))),
+        ]);
+        let probe = transport.clone();
+        let generator = AifarmDrawApiImageGenerator::with_transport(
+            AifarmDrawApiConfig {
+                base_url: "https://draw.example.test".to_owned(),
+                service_name: AIFARM_DRAW_API_SERVICE_NAME.to_owned(),
+                endpoint_name: AIFARM_DRAW_API_BOOGU_TURBO_ENDPOINT_NAME.to_owned(),
+                timeout: StdDuration::from_secs(5),
+                poll_interval: StdDuration::from_nanos(1),
+            },
+            transport,
+        );
+
+        let _result = generator
+            .generate_image_with_job_id(
+                ImageGenerationRequest {
+                    prompt: "boogu prompt".to_owned(),
+                    caption_text: "boogu prompt".to_owned(),
+                    ..ImageGenerationRequest::default()
+                },
+                "boogu-123",
+            )
+            .await
+            .expect("draw result");
+
+        let requests = probe.requests();
+        let job: DiscoveryJobRequest =
+            serde_json::from_slice(&requests[0].body).expect("job request");
+        assert_eq!(job.invocation.service_name, AIFARM_DRAW_API_SERVICE_NAME);
+        assert_eq!(
+            job.invocation.endpoint_name,
+            AIFARM_DRAW_API_BOOGU_TURBO_ENDPOINT_NAME
+        );
+    }
+
+    #[test]
+    fn routed_draw_api_config_prefers_model_endpoint_over_provider_endpoint() {
+        let attempt = RoutedAttempt {
+            provider_id: 1,
+            model_id: 2,
+            provider_name: "aifarm-draw".to_owned(),
+            model_name: "boogu-image-turbo-sdnq".to_owned(),
+            provider_endpoint: None,
+            discovery_service_name: Some(AIFARM_DRAW_API_SERVICE_NAME.to_owned()),
+            discovery_endpoint_name: Some(AIFARM_DRAW_API_ENDPOINT_NAME.to_owned()),
+            model_base_url: None,
+            embedding_dim: None,
+            provider_config: json!({
+                "service_name": AIFARM_DRAW_API_SERVICE_NAME,
+                "endpoint_name": AIFARM_DRAW_API_ENDPOINT_NAME,
+            }),
+            model_config: json!({
+                "service_name": AIFARM_DRAW_API_SERVICE_NAME,
+                "endpoint_name": AIFARM_DRAW_API_BOOGU_TURBO_ENDPOINT_NAME,
+            }),
+            overrides: openplotva_llm::router::InferenceOverrides::default(),
+            variant: None,
+        };
+
+        let cfg = draw_api_config_for_attempt(AifarmDrawApiConfig::default(), &attempt);
+
+        assert_eq!(cfg.service_name, AIFARM_DRAW_API_SERVICE_NAME);
+        assert_eq!(cfg.endpoint_name, AIFARM_DRAW_API_BOOGU_TURBO_ENDPOINT_NAME);
+    }
+
+    #[tokio::test]
     async fn aifarm_draw_api_editor_submits_go_shaped_image_url_payload() {
         let draw_payload = serde_json::to_vec(&json!({"image_url": "https://img.test/edit.png"}))
             .expect("draw payload");
@@ -6093,6 +6306,8 @@ mod tests {
         let editor = AifarmDrawApiImageGenerator::with_transport(
             AifarmDrawApiConfig {
                 base_url: "https://draw.example.test".to_owned(),
+                service_name: AIFARM_DRAW_API_SERVICE_NAME.to_owned(),
+                endpoint_name: AIFARM_DRAW_API_ENDPOINT_NAME.to_owned(),
                 timeout: StdDuration::from_secs(5),
                 poll_interval: StdDuration::from_nanos(1),
             },
@@ -6158,6 +6373,8 @@ mod tests {
         let editor = AifarmDrawApiImageGenerator::with_transport(
             AifarmDrawApiConfig {
                 base_url: "https://draw.example.test".to_owned(),
+                service_name: AIFARM_DRAW_API_SERVICE_NAME.to_owned(),
+                endpoint_name: AIFARM_DRAW_API_ENDPOINT_NAME.to_owned(),
                 timeout: StdDuration::from_secs(5),
                 poll_interval: StdDuration::from_nanos(1),
             },
@@ -6227,6 +6444,8 @@ mod tests {
             AifarmDrawApiImageGenerator::with_transport(
                 AifarmDrawApiConfig {
                     base_url: "https://draw.example.test".to_owned(),
+                    service_name: AIFARM_DRAW_API_SERVICE_NAME.to_owned(),
+                    endpoint_name: AIFARM_DRAW_API_ENDPOINT_NAME.to_owned(),
                     timeout: StdDuration::from_secs(5),
                     poll_interval: StdDuration::from_nanos(1),
                 },
