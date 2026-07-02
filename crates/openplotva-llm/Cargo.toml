@@ -24,7 +24,7 @@ serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 time = { workspace = true, features = ["formatting"] }
-tokio = { workspace = true, features = ["rt", "time"] }
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
 url.workspace = true
 
 [dev-dependencies]

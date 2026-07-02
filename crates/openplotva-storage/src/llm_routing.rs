@@ -25,6 +25,8 @@ pub struct ProviderRecord {
     pub id: i64,
     pub name: String,
     pub kind: String,
+    pub protocol: Option<String>,
+    pub runtime_hint: Option<String>,
     pub endpoint: Option<String>,
     pub discovery_service_name: Option<String>,
     pub discovery_endpoint_name: Option<String>,
@@ -43,8 +45,19 @@ pub struct ModelRecord {
     pub base_url: Option<String>,
     pub capabilities: Vec<String>,
     pub embedding_dim: Option<i32>,
+    pub pool_id: Option<i64>,
     pub enabled: bool,
     pub config: Value,
+}
+
+/// A capacity pool: a shared concurrency budget over one physical resource.
+/// `max_concurrency` NULL means unlimited (gauge-only, never blocks).
+#[derive(Clone, Debug, PartialEq)]
+pub struct PoolRecord {
+    pub id: i64,
+    pub name: String,
+    pub max_concurrency: Option<i32>,
+    pub description: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -91,6 +104,8 @@ pub struct TriggerRecord {
 pub struct ProviderInput {
     pub name: String,
     pub kind: String,
+    pub protocol: Option<String>,
+    pub runtime_hint: Option<String>,
     pub endpoint: Option<String>,
     pub discovery_service_name: Option<String>,
     pub discovery_endpoint_name: Option<String>,
@@ -108,8 +123,16 @@ pub struct ModelInput {
     pub base_url: Option<String>,
     pub capabilities: Vec<String>,
     pub embedding_dim: Option<i32>,
+    pub pool_id: Option<i64>,
     pub enabled: bool,
     pub config: Value,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct PoolInput {
+    pub name: String,
+    pub max_concurrency: Option<i32>,
+    pub description: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -147,6 +170,7 @@ pub struct RoutingSnapshot {
     pub workflows: Vec<WorkflowRecord>,
     pub assignments: Vec<AssignmentRecord>,
     pub triggers: Vec<TriggerRecord>,
+    pub pools: Vec<PoolRecord>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -185,22 +209,36 @@ pub struct RoutingEventInput {
     pub detail: Value,
 }
 
-const SQL_LIST_PROVIDERS: &str = "SELECT id, name, kind, endpoint, discovery_service_name, discovery_endpoint_name, api_key_ref, api_key_encrypted, enabled, config::text AS config FROM llm_providers ORDER BY id ASC";
-const SQL_GET_PROVIDER: &str = "SELECT id, name, kind, endpoint, discovery_service_name, discovery_endpoint_name, api_key_ref, api_key_encrypted, enabled, config::text AS config FROM llm_providers WHERE id = $1";
-const SQL_INSERT_PROVIDER: &str = "INSERT INTO llm_providers (name, kind, endpoint, discovery_service_name, discovery_endpoint_name, api_key_ref, api_key_encrypted, enabled, config) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb) RETURNING id";
-const SQL_UPDATE_PROVIDER: &str = "UPDATE llm_providers SET name = $2, kind = $3, endpoint = $4, discovery_service_name = $5, discovery_endpoint_name = $6, api_key_ref = $7, api_key_encrypted = $8, enabled = $9, config = $10::jsonb, updated_at = now() WHERE id = $1";
+const SQL_LIST_PROVIDERS: &str = "SELECT id, name, kind, protocol, runtime_hint, endpoint, discovery_service_name, discovery_endpoint_name, api_key_ref, api_key_encrypted, enabled, config::text AS config FROM llm_providers ORDER BY id ASC";
+const SQL_GET_PROVIDER: &str = "SELECT id, name, kind, protocol, runtime_hint, endpoint, discovery_service_name, discovery_endpoint_name, api_key_ref, api_key_encrypted, enabled, config::text AS config FROM llm_providers WHERE id = $1";
+const SQL_INSERT_PROVIDER: &str = "INSERT INTO llm_providers (name, kind, protocol, runtime_hint, endpoint, discovery_service_name, discovery_endpoint_name, api_key_ref, api_key_encrypted, enabled, config) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb) RETURNING id";
+const SQL_UPDATE_PROVIDER: &str = "UPDATE llm_providers SET name = $2, kind = $3, protocol = $4, runtime_hint = $5, endpoint = $6, discovery_service_name = $7, discovery_endpoint_name = $8, api_key_ref = $9, api_key_encrypted = $10, enabled = $11, config = $12::jsonb, updated_at = now() WHERE id = $1";
+const SQL_SET_PROVIDER_PROTOCOL_IF_NULL: &str =
+    "UPDATE llm_providers SET protocol = $2, updated_at = now() WHERE id = $1 AND protocol IS NULL";
 const SQL_SET_PROVIDER_ENABLED: &str =
     "UPDATE llm_providers SET enabled = $2, updated_at = now() WHERE id = $1";
 const SQL_PATCH_PROVIDER_CONFIG: &str = "UPDATE llm_providers SET config = COALESCE(config, '{}'::jsonb) || $2::jsonb, updated_at = now() WHERE id = $1";
 const SQL_DELETE_PROVIDER: &str = "DELETE FROM llm_providers WHERE id = $1";
 
-const SQL_LIST_MODELS: &str = "SELECT id, provider_id, model_name, display_name, base_url, capabilities, embedding_dim, enabled, config::text AS config FROM provider_models ORDER BY id ASC";
-const SQL_INSERT_MODEL: &str = "INSERT INTO provider_models (provider_id, model_name, display_name, base_url, capabilities, embedding_dim, enabled, config) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb) RETURNING id";
-const SQL_UPDATE_MODEL: &str = "UPDATE provider_models SET provider_id = $2, model_name = $3, display_name = $4, base_url = $5, capabilities = $6, embedding_dim = $7, enabled = $8, config = $9::jsonb WHERE id = $1";
+const SQL_LIST_MODELS: &str = "SELECT id, provider_id, model_name, display_name, base_url, capabilities, embedding_dim, pool_id, enabled, config::text AS config FROM provider_models ORDER BY id ASC";
+const SQL_INSERT_MODEL: &str = "INSERT INTO provider_models (provider_id, model_name, display_name, base_url, capabilities, embedding_dim, pool_id, enabled, config) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb) RETURNING id";
+const SQL_UPDATE_MODEL: &str = "UPDATE provider_models SET provider_id = $2, model_name = $3, display_name = $4, base_url = $5, capabilities = $6, embedding_dim = $7, pool_id = $8, enabled = $9, config = $10::jsonb WHERE id = $1";
+const SQL_SET_MODEL_POOL: &str = "UPDATE provider_models SET pool_id = $2 WHERE id = $1";
+const SQL_SET_PROVIDER_MODELS_POOL_IF_NULL: &str =
+    "UPDATE provider_models SET pool_id = $2 WHERE provider_id = $1 AND pool_id IS NULL";
 const SQL_SET_MODEL_ENABLED: &str = "UPDATE provider_models SET enabled = $2 WHERE id = $1";
 const SQL_PATCH_MODEL_CONFIG: &str =
     "UPDATE provider_models SET config = COALESCE(config, '{}'::jsonb) || $2::jsonb WHERE id = $1";
 const SQL_DELETE_MODEL: &str = "DELETE FROM provider_models WHERE id = $1";
+
+const SQL_LIST_POOLS: &str =
+    "SELECT id, name, max_concurrency, description FROM llm_capacity_pools ORDER BY id ASC";
+const SQL_INSERT_POOL: &str = "INSERT INTO llm_capacity_pools (name, max_concurrency, description) VALUES ($1, $2, $3) RETURNING id";
+const SQL_INSERT_POOL_IF_MISSING: &str = "INSERT INTO llm_capacity_pools (name, max_concurrency, description) VALUES ($1, $2, $3) ON CONFLICT (name) DO NOTHING";
+const SQL_GET_POOL_BY_NAME: &str =
+    "SELECT id, name, max_concurrency, description FROM llm_capacity_pools WHERE name = $1";
+const SQL_UPDATE_POOL: &str = "UPDATE llm_capacity_pools SET name = $2, max_concurrency = $3, description = $4, updated_at = now() WHERE id = $1";
+const SQL_DELETE_POOL: &str = "DELETE FROM llm_capacity_pools WHERE id = $1";
 
 const SQL_LIST_WORKFLOWS: &str = "SELECT key, kind, full_routing, retry_max_hops, retry_wall_ms, enabled FROM workflows ORDER BY key ASC";
 const SQL_INSERT_WORKFLOW_IF_MISSING: &str = "INSERT INTO workflows (key, kind, full_routing, retry_max_hops, retry_wall_ms, enabled) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (key) DO NOTHING";
@@ -213,6 +251,9 @@ const SQL_UPDATE_ASSIGNMENT: &str = "UPDATE workflow_assignments SET workflow_ke
 const SQL_DELETE_ASSIGNMENT: &str = "DELETE FROM workflow_assignments WHERE id = $1";
 const SQL_DELETE_ASSIGNMENTS_FOR_SCOPE: &str =
     "DELETE FROM workflow_assignments WHERE workflow_key = $1 AND scope = $2";
+const SQL_SET_ASSIGNMENT_WEIGHT: &str = "UPDATE workflow_assignments SET weight = $2 WHERE id = $1";
+const SQL_SET_ASSIGNMENT_FALLBACK_ORDER: &str =
+    "UPDATE workflow_assignments SET fallback_order = $2 WHERE id = $1";
 
 const SQL_LIST_TRIGGERS: &str = "SELECT id, workflow_key, trigger_type, engage_assignment_id, enabled, queue_name, high_watermark, low_watermark, params::text AS params FROM workflow_triggers ORDER BY id ASC";
 const SQL_INSERT_TRIGGER: &str = "INSERT INTO workflow_triggers (workflow_key, trigger_type, engage_assignment_id, enabled, queue_name, high_watermark, low_watermark, params) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb) RETURNING id";
@@ -294,6 +335,8 @@ fn provider_from_row(row: PgRow) -> Result<ProviderRecord, StorageError> {
         id: row.try_get("id")?,
         name: row.try_get("name")?,
         kind: row.try_get("kind")?,
+        protocol: row.try_get("protocol")?,
+        runtime_hint: row.try_get("runtime_hint")?,
         endpoint: row.try_get("endpoint")?,
         discovery_service_name: row.try_get("discovery_service_name")?,
         discovery_endpoint_name: row.try_get("discovery_endpoint_name")?,
@@ -313,8 +356,18 @@ fn model_from_row(row: PgRow) -> Result<ModelRecord, StorageError> {
         base_url: row.try_get("base_url")?,
         capabilities: row.try_get("capabilities")?,
         embedding_dim: row.try_get("embedding_dim")?,
+        pool_id: row.try_get("pool_id")?,
         enabled: row.try_get("enabled")?,
         config: parse_json(row.try_get("config")?)?,
+    })
+}
+
+fn pool_from_row(row: PgRow) -> Result<PoolRecord, StorageError> {
+    Ok(PoolRecord {
+        id: row.try_get("id")?,
+        name: row.try_get("name")?,
+        max_concurrency: row.try_get("max_concurrency")?,
+        description: row.try_get("description")?,
     })
 }
 
@@ -419,6 +472,12 @@ pub async fn load_snapshot(pool: &PgPool) -> Result<RoutingSnapshot, StorageErro
         .into_iter()
         .map(trigger_from_row)
         .collect::<Result<Vec<_>, _>>()?;
+    let pools = sqlx::query(SQL_LIST_POOLS)
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .map(pool_from_row)
+        .collect::<Result<Vec<_>, _>>()?;
 
     tx.commit().await?;
     Ok(RoutingSnapshot {
@@ -427,6 +486,7 @@ pub async fn load_snapshot(pool: &PgPool) -> Result<RoutingSnapshot, StorageErro
         workflows,
         assignments,
         triggers,
+        pools,
     })
 }
 
@@ -456,6 +516,8 @@ pub async fn insert_provider(pool: &PgPool, input: &ProviderInput) -> Result<i64
     let row = sqlx::query(SQL_INSERT_PROVIDER)
         .bind(&input.name)
         .bind(&input.kind)
+        .bind(input.protocol.as_deref())
+        .bind(input.runtime_hint.as_deref())
         .bind(input.endpoint.as_deref())
         .bind(input.discovery_service_name.as_deref())
         .bind(input.discovery_endpoint_name.as_deref())
@@ -477,6 +539,8 @@ pub async fn update_provider(
         .bind(id)
         .bind(&input.name)
         .bind(&input.kind)
+        .bind(input.protocol.as_deref())
+        .bind(input.runtime_hint.as_deref())
         .bind(input.endpoint.as_deref())
         .bind(input.discovery_service_name.as_deref())
         .bind(input.discovery_endpoint_name.as_deref())
@@ -540,6 +604,7 @@ pub async fn insert_model(pool: &PgPool, input: &ModelInput) -> Result<i64, Stor
         .bind(input.base_url.as_deref())
         .bind(&input.capabilities)
         .bind(input.embedding_dim)
+        .bind(input.pool_id)
         .bind(input.enabled)
         .bind(json_text(&input.config))
         .fetch_one(pool)
@@ -556,10 +621,105 @@ pub async fn update_model(pool: &PgPool, id: i64, input: &ModelInput) -> Result<
         .bind(input.base_url.as_deref())
         .bind(&input.capabilities)
         .bind(input.embedding_dim)
+        .bind(input.pool_id)
         .bind(input.enabled)
         .bind(json_text(&input.config))
         .execute(pool)
         .await?;
+    Ok(())
+}
+
+pub async fn set_model_pool(
+    pool: &PgPool,
+    id: i64,
+    pool_id: Option<i64>,
+) -> Result<(), StorageError> {
+    sqlx::query(SQL_SET_MODEL_POOL)
+        .bind(id)
+        .bind(pool_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Attach every still-unpooled model of a provider to a pool. Backfill helper:
+/// never overwrites an operator-set pool.
+pub async fn attach_provider_models_to_pool_if_unpooled(
+    pool: &PgPool,
+    provider_id: i64,
+    pool_id: i64,
+) -> Result<u64, StorageError> {
+    let result = sqlx::query(SQL_SET_PROVIDER_MODELS_POOL_IF_NULL)
+        .bind(provider_id)
+        .bind(pool_id)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
+/// Fill a provider's protocol only when unset. Backfill helper: never
+/// overwrites an operator-set protocol.
+pub async fn set_provider_protocol_if_null(
+    pool: &PgPool,
+    id: i64,
+    protocol: &str,
+) -> Result<(), StorageError> {
+    sqlx::query(SQL_SET_PROVIDER_PROTOCOL_IF_NULL)
+        .bind(id)
+        .bind(protocol)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn list_pools(pool: &PgPool) -> Result<Vec<PoolRecord>, StorageError> {
+    sqlx::query(SQL_LIST_POOLS)
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .map(pool_from_row)
+        .collect()
+}
+
+pub async fn insert_pool(pool: &PgPool, input: &PoolInput) -> Result<i64, StorageError> {
+    let row = sqlx::query(SQL_INSERT_POOL)
+        .bind(&input.name)
+        .bind(input.max_concurrency)
+        .bind(input.description.as_deref())
+        .fetch_one(pool)
+        .await?;
+    Ok(row.try_get::<i64, _>("id")?)
+}
+
+/// Idempotent pool creation for seeds/backfills; returns the pool id whether it
+/// was just created or already existed.
+pub async fn insert_pool_if_missing(pool: &PgPool, input: &PoolInput) -> Result<i64, StorageError> {
+    sqlx::query(SQL_INSERT_POOL_IF_MISSING)
+        .bind(&input.name)
+        .bind(input.max_concurrency)
+        .bind(input.description.as_deref())
+        .execute(pool)
+        .await?;
+    let row = sqlx::query(SQL_GET_POOL_BY_NAME)
+        .bind(&input.name)
+        .fetch_one(pool)
+        .await?;
+    Ok(row.try_get::<i64, _>("id")?)
+}
+
+pub async fn update_pool(pool: &PgPool, id: i64, input: &PoolInput) -> Result<(), StorageError> {
+    sqlx::query(SQL_UPDATE_POOL)
+        .bind(id)
+        .bind(&input.name)
+        .bind(input.max_concurrency)
+        .bind(input.description.as_deref())
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn delete_pool(pool: &PgPool, id: i64) -> Result<(), StorageError> {
+    sqlx::query(SQL_DELETE_POOL).bind(id).execute(pool).await?;
     Ok(())
 }
 
@@ -722,6 +882,81 @@ pub async fn delete_assignments_for_scope(
     Ok(())
 }
 
+/// Batched weight save: update every (id, weight) pair in one transaction so a
+/// draft rebalance lands atomically and triggers exactly one router reload.
+pub async fn set_assignment_weights(
+    pool: &PgPool,
+    weights: &[(i64, Option<i32>)],
+) -> Result<(), StorageError> {
+    let mut tx = pool.begin().await?;
+    for (id, weight) in weights {
+        sqlx::query(SQL_SET_ASSIGNMENT_WEIGHT)
+            .bind(id)
+            .bind(weight)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Batched fallback reorder: assign ascending `fallback_order` following the
+/// given id order, in one transaction (fixes the old two-POST swap race).
+pub async fn set_assignment_fallback_orders(
+    pool: &PgPool,
+    ordered_ids: &[i64],
+) -> Result<(), StorageError> {
+    let mut tx = pool.begin().await?;
+    for (position, id) in ordered_ids.iter().enumerate() {
+        sqlx::query(SQL_SET_ASSIGNMENT_FALLBACK_ORDER)
+            .bind(id)
+            .bind(i32::try_from(position).unwrap_or(i32::MAX))
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Create an overflow assignment and its trigger in one transaction, so a
+/// failed trigger insert can never strand an orphan assignment.
+pub async fn insert_trigger_with_assignment(
+    pool: &PgPool,
+    assignment: &AssignmentInput,
+    trigger: &TriggerInput,
+) -> Result<(i64, i64), StorageError> {
+    let mut tx = pool.begin().await?;
+    let assignment_id = sqlx::query(SQL_INSERT_ASSIGNMENT)
+        .bind(&assignment.workflow_key)
+        .bind(&assignment.scope)
+        .bind(&assignment.role)
+        .bind(assignment.provider_model_id)
+        .bind(assignment.weight)
+        .bind(assignment.fallback_order)
+        .bind(assignment.canary_percent)
+        .bind(assignment.enabled)
+        .bind(json_text(&assignment.inference_overrides))
+        .bind(assignment.cb_failure_threshold)
+        .bind(assignment.cb_cooldown_ms)
+        .fetch_one(&mut *tx)
+        .await?
+        .try_get::<i64, _>("id")?;
+    let trigger_id = sqlx::query(SQL_INSERT_TRIGGER)
+        .bind(&trigger.workflow_key)
+        .bind(&trigger.trigger_type)
+        .bind(assignment_id)
+        .bind(trigger.enabled)
+        .bind(trigger.queue_name.as_deref())
+        .bind(trigger.high_watermark)
+        .bind(trigger.low_watermark)
+        .bind(json_text(&trigger.params))
+        .fetch_one(&mut *tx)
+        .await?
+        .try_get::<i64, _>("id")?;
+    tx.commit().await?;
+    Ok((assignment_id, trigger_id))
+}
+
 pub async fn list_triggers(pool: &PgPool) -> Result<Vec<TriggerRecord>, StorageError> {
     sqlx::query(SQL_LIST_TRIGGERS)
         .fetch_all(pool)
@@ -816,6 +1051,51 @@ pub async fn list_routing_events(
     let limit = limit.clamp(1, 1_000);
     sqlx::query(SQL_LIST_ROUTING_EVENTS)
         .bind(limit)
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .map(routing_event_from_row)
+        .collect()
+}
+
+const SQL_LIST_ROUTING_EVENTS_PAGE: &str = r#"SELECT
+    id,
+    created_at,
+    severity,
+    event_type,
+    workflow_key,
+    provider_id,
+    model_id,
+    queue_name,
+    job_id,
+    chat_id,
+    thread_id,
+    message_id,
+    dedupe_key,
+    summary,
+    detail::text AS detail
+FROM llm_routing_events
+WHERE ($2::bigint IS NULL OR id < $2)
+  AND ($3::text IS NULL OR workflow_key = $3)
+  AND ($4::text IS NULL OR severity = $4)
+ORDER BY id DESC
+LIMIT $1"#;
+
+/// Keyset-paginated event feed for the admin UI: newest first, `before_id`
+/// continues past the previous page, optional workflow/severity filters.
+pub async fn list_routing_events_page(
+    pool: &PgPool,
+    limit: i64,
+    before_id: Option<i64>,
+    workflow_key: Option<&str>,
+    severity: Option<&str>,
+) -> Result<Vec<RoutingEventRecord>, StorageError> {
+    let limit = limit.clamp(1, 500);
+    sqlx::query(SQL_LIST_ROUTING_EVENTS_PAGE)
+        .bind(limit)
+        .bind(before_id)
+        .bind(workflow_key)
+        .bind(severity)
         .fetch_all(pool)
         .await?
         .into_iter()
@@ -982,6 +1262,54 @@ mod tests {
     #[test]
     fn model_list_sql_exposes_config_for_runtime_snapshots() {
         assert!(SQL_LIST_MODELS.contains("config::text AS config"));
+    }
+
+    #[test]
+    fn pool_sql_targets_capacity_pools_table() {
+        assert!(SQL_LIST_POOLS.contains("FROM llm_capacity_pools"));
+        assert!(SQL_INSERT_POOL.contains("INSERT INTO llm_capacity_pools"));
+        assert!(SQL_INSERT_POOL_IF_MISSING.contains("ON CONFLICT (name) DO NOTHING"));
+        assert!(SQL_UPDATE_POOL.contains("max_concurrency = $3"));
+        assert!(SQL_DELETE_POOL.contains("DELETE FROM llm_capacity_pools"));
+    }
+
+    #[test]
+    fn model_sql_carries_pool_id() {
+        assert!(SQL_LIST_MODELS.contains("pool_id"));
+        assert!(SQL_INSERT_MODEL.contains("pool_id"));
+        assert!(SQL_UPDATE_MODEL.contains("pool_id = $8"));
+        assert!(SQL_SET_MODEL_POOL.contains("SET pool_id = $2"));
+    }
+
+    #[test]
+    fn provider_sql_carries_protocol_and_runtime_hint() {
+        assert!(SQL_LIST_PROVIDERS.contains("protocol"));
+        assert!(SQL_LIST_PROVIDERS.contains("runtime_hint"));
+        assert!(SQL_INSERT_PROVIDER.contains("protocol"));
+        assert!(SQL_UPDATE_PROVIDER.contains("protocol = $4"));
+        assert!(SQL_UPDATE_PROVIDER.contains("runtime_hint = $5"));
+    }
+
+    #[test]
+    fn backfill_helpers_never_overwrite_operator_values() {
+        assert!(SQL_SET_PROVIDER_PROTOCOL_IF_NULL.contains("AND protocol IS NULL"));
+        assert!(SQL_SET_PROVIDER_MODELS_POOL_IF_NULL.contains("AND pool_id IS NULL"));
+    }
+
+    #[test]
+    fn batched_assignment_updates_touch_only_their_column() {
+        assert!(SQL_SET_ASSIGNMENT_WEIGHT.contains("SET weight = $2"));
+        assert!(!SQL_SET_ASSIGNMENT_WEIGHT.contains("fallback_order"));
+        assert!(SQL_SET_ASSIGNMENT_FALLBACK_ORDER.contains("SET fallback_order = $2"));
+        assert!(!SQL_SET_ASSIGNMENT_FALLBACK_ORDER.contains("weight ="));
+    }
+
+    #[test]
+    fn routing_events_page_sql_uses_keyset_pagination_and_filters() {
+        assert!(SQL_LIST_ROUTING_EVENTS_PAGE.contains("id < $2"));
+        assert!(SQL_LIST_ROUTING_EVENTS_PAGE.contains("workflow_key = $3"));
+        assert!(SQL_LIST_ROUTING_EVENTS_PAGE.contains("severity = $4"));
+        assert!(SQL_LIST_ROUTING_EVENTS_PAGE.contains("ORDER BY id DESC"));
     }
 
     #[test]

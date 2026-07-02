@@ -6,14 +6,15 @@
 //! wrap it with the storage read and the atomic `ArcSwap` publish.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use openplotva_config::AppConfig;
 use openplotva_llm::router::table::Role;
 use openplotva_llm::router::triggers::{TriggerCondition, TriggerSpec};
 use openplotva_llm::router::{
-    BreakerConfig, Candidate, InferenceOverrides, Kind, ModelRow, ProviderRow, RetryBudget,
-    RouterHandle, RoutingTable, Scope, WorkflowRoute,
+    BreakerConfig, Candidate, InferenceOverrides, Kind, ModelRow, PoolSpec, ProviderRow,
+    RetryBudget, RouterHandle, RoutingTable, Scope, WorkflowRoute,
 };
 use openplotva_storage::StorageError;
 use openplotva_storage::llm_routing::{
@@ -39,6 +40,16 @@ pub async fn reload_router(handle: &RouterHandle, pool: &PgPool) -> Result<(), S
 }
 
 const SEEDED_KEY: &str = "llm.routing.seeded";
+
+/// Wire-payload protocols a provider can speak. Discovery resolution stays
+/// orthogonal (presence of `discovery_service_name`); these name the request
+/// shape the runtime sends.
+pub const PROTOCOL_OPENAI_COMPAT: &str = "openai_compat";
+pub const PROTOCOL_GENKIT: &str = "genkit";
+pub const PROTOCOL_ACESTEP: &str = "acestep";
+pub const PROTOCOL_DISCOVERY_JOBS: &str = "discovery_jobs";
+pub const PROTOCOL_DISCOVERY_DRAW: &str = "discovery_draw";
+pub const PROTOCOL_PRIVACY_FILTER: &str = "privacy_filter";
 
 async fn app_setting_present(pool: &PgPool, key: &str) -> Result<bool, StorageError> {
     let row = sqlx::query("SELECT value FROM app_settings WHERE key = $1")
@@ -84,6 +95,7 @@ async fn seed_provider_model(
         base_url: base_url.map(str::to_owned),
         capabilities: capabilities.iter().map(|c| (*c).to_owned()).collect(),
         embedding_dim,
+        pool_id: None,
         enabled: true,
         config: json!({}),
     };
@@ -92,6 +104,7 @@ async fn seed_provider_model(
 
 fn chat_provider(
     name: &str,
+    protocol: &str,
     api_key_ref: &str,
     discovery: Option<(&str, &str, &str)>,
 ) -> ProviderInput {
@@ -106,6 +119,8 @@ fn chat_provider(
     ProviderInput {
         name: name.to_owned(),
         kind: "chat".to_owned(),
+        protocol: Some(protocol.to_owned()),
+        runtime_hint: None,
         endpoint,
         discovery_service_name: service,
         discovery_endpoint_name: ep,
@@ -166,6 +181,7 @@ pub async fn seed_routing_from_env(
         pool,
         chat_provider(
             "aifarm",
+            PROTOCOL_OPENAI_COMPAT,
             "DIALOG_API_KEY",
             Some((
                 discovery_base,
@@ -185,7 +201,7 @@ pub async fn seed_routing_from_env(
     let genkit_default = crate::memory_runtime::genkit_runtime_default_model(config);
     let genkit_model = seed_provider_model(
         pool,
-        chat_provider("genkit", "GOOGLEAI_KEY", None),
+        chat_provider("genkit", PROTOCOL_GENKIT, "GOOGLEAI_KEY", None),
         genkit_default.as_str(),
         None,
         &["chat", "tools"],
@@ -196,7 +212,7 @@ pub async fn seed_routing_from_env(
     // Proprietary Gemini overflow target, available for the operator to assign.
     let _gemini_model = seed_provider_model(
         pool,
-        chat_provider("gemini", "GOOGLEAI_KEY", None),
+        chat_provider("gemini", PROTOCOL_GENKIT, "GOOGLEAI_KEY", None),
         genkit_default.as_str(),
         None,
         &["chat", "tools"],
@@ -210,6 +226,8 @@ pub async fn seed_routing_from_env(
         ProviderInput {
             name: "aifarm-vision".to_owned(),
             kind: "vision".to_owned(),
+            protocol: Some(PROTOCOL_OPENAI_COMPAT.to_owned()),
+            runtime_hint: None,
             endpoint: Some(discovery_base.to_owned()),
             discovery_service_name: Some(config.vision.discovery_service_name.clone()),
             discovery_endpoint_name: Some(config.vision.discovery_endpoint_name.clone()),
@@ -230,6 +248,8 @@ pub async fn seed_routing_from_env(
         ProviderInput {
             name: "aifarm-embed".to_owned(),
             kind: "embedding".to_owned(),
+            protocol: Some(PROTOCOL_DISCOVERY_JOBS.to_owned()),
+            runtime_hint: None,
             endpoint: Some(discovery_base.to_owned()),
             discovery_service_name: Some(config.memory.embedder_service_name.clone()),
             discovery_endpoint_name: Some(config.memory.embedder_endpoint_name.clone()),
@@ -250,6 +270,8 @@ pub async fn seed_routing_from_env(
         ProviderInput {
             name: "acestep".to_owned(),
             kind: "music".to_owned(),
+            protocol: Some(PROTOCOL_ACESTEP.to_owned()),
+            runtime_hint: None,
             endpoint: Some(config.music.acestep.base_url.clone()),
             discovery_service_name: None,
             discovery_endpoint_name: None,
@@ -270,6 +292,8 @@ pub async fn seed_routing_from_env(
         ProviderInput {
             name: DRAW_API_PROVIDER.to_owned(),
             kind: "image".to_owned(),
+            protocol: Some(PROTOCOL_DISCOVERY_DRAW.to_owned()),
+            runtime_hint: None,
             endpoint: Some(config.llm.discovery.base_url.clone()),
             discovery_service_name: Some(
                 crate::image_jobs::AIFARM_DRAW_API_SERVICE_NAME.to_owned(),
@@ -399,6 +423,8 @@ pub async fn backfill_vram_cloud_from_env(
         &ProviderInput {
             name: VRAM_CLOUD_PROVIDER.to_owned(),
             kind: "chat".to_owned(),
+            protocol: Some(PROTOCOL_OPENAI_COMPAT.to_owned()),
+            runtime_hint: None,
             endpoint: dialog.aifarm_pool_base_urls.first().cloned(),
             discovery_service_name: None,
             discovery_endpoint_name: None,
@@ -425,6 +451,7 @@ pub async fn backfill_vram_cloud_from_env(
                 base_url,
                 capabilities: vec!["chat".to_owned(), "tools".to_owned()],
                 embedding_dim: None,
+                pool_id: None,
                 enabled: true,
                 config: json!({}),
             },
@@ -542,6 +569,8 @@ pub async fn backfill_gpu_models(pool: &PgPool, config: &AppConfig) -> Result<bo
                     &ProviderInput {
                         name: provider_name.clone(),
                         kind: "chat".to_owned(),
+                        protocol: Some(PROTOCOL_OPENAI_COMPAT.to_owned()),
+                        runtime_hint: Some("llama_cpp".to_owned()),
                         endpoint: None,
                         discovery_service_name: Some(service.clone()),
                         discovery_endpoint_name: Some(endpoint.clone()),
@@ -570,6 +599,7 @@ pub async fn backfill_gpu_models(pool: &PgPool, config: &AppConfig) -> Result<bo
                         base_url: None,
                         capabilities: vec!["chat".to_owned(), "tools".to_owned()],
                         embedding_dim: None,
+                        pool_id: None,
                         enabled: true,
                         config: json!({}),
                     },
@@ -628,6 +658,8 @@ pub async fn backfill_dialog_qwen_fallback(
         ProviderInput {
             name: provider_name,
             kind: "chat".to_owned(),
+            protocol: Some(PROTOCOL_OPENAI_COMPAT.to_owned()),
+            runtime_hint: Some("llama_cpp".to_owned()),
             endpoint: None,
             discovery_service_name: Some(reasoner.discovery_service_name),
             discovery_endpoint_name: Some(reasoner.discovery_endpoint_name),
@@ -648,6 +680,7 @@ pub async fn backfill_dialog_qwen_fallback(
             base_url: None,
             capabilities: vec!["chat".to_owned(), "tools".to_owned()],
             embedding_dim: None,
+            pool_id: None,
             enabled: true,
             config: json!({}),
         },
@@ -701,6 +734,7 @@ fn model_input_from_record(record: &ModelRecord, model_name: String) -> ModelInp
         base_url: record.base_url.clone(),
         capabilities: record.capabilities.clone(),
         embedding_dim: record.embedding_dim,
+        pool_id: record.pool_id,
         enabled: record.enabled,
         config: record.config.clone(),
     }
@@ -793,6 +827,8 @@ async fn ensure_provider(
         id,
         name: input.name,
         kind: input.kind,
+        protocol: input.protocol,
+        runtime_hint: input.runtime_hint,
         endpoint: input.endpoint,
         discovery_service_name: input.discovery_service_name,
         discovery_endpoint_name: input.discovery_endpoint_name,
@@ -821,6 +857,7 @@ async fn ensure_model(
         base_url: input.base_url,
         capabilities: input.capabilities,
         embedding_dim: input.embedding_dim,
+        pool_id: input.pool_id,
         enabled: input.enabled,
         config: input.config,
     });
@@ -893,6 +930,8 @@ async fn ensure_draw_api_provider(
     let provider_input = ProviderInput {
         name: DRAW_API_PROVIDER.to_owned(),
         kind: "image".to_owned(),
+        protocol: Some(PROTOCOL_DISCOVERY_DRAW.to_owned()),
+        runtime_hint: None,
         endpoint: Some(config.llm.discovery.base_url.clone()),
         discovery_service_name: Some(crate::image_jobs::AIFARM_DRAW_API_SERVICE_NAME.to_owned()),
         discovery_endpoint_name: Some(crate::image_jobs::AIFARM_DRAW_API_ENDPOINT_NAME.to_owned()),
@@ -912,6 +951,8 @@ async fn ensure_draw_api_provider(
     {
         provider.name = provider_input.name;
         provider.kind = provider_input.kind;
+        provider.protocol = provider_input.protocol;
+        provider.runtime_hint = provider_input.runtime_hint;
         provider.endpoint = provider_input.endpoint;
         provider.discovery_service_name = provider_input.discovery_service_name;
         provider.discovery_endpoint_name = provider_input.discovery_endpoint_name;
@@ -945,6 +986,7 @@ async fn ensure_draw_api_model(
         model.base_url = model_input.base_url;
         model.capabilities = model_input.capabilities;
         model.embedding_dim = model_input.embedding_dim;
+        model.pool_id = model_input.pool_id;
         model.enabled = model_input.enabled;
         model.config = model_input.config;
     }
@@ -964,6 +1006,7 @@ fn draw_api_model_input(
         base_url: None,
         capabilities: vec!["image".to_owned()],
         embedding_dim: None,
+        pool_id: None,
         enabled: true,
         config: json!({
             "service_name": crate::image_jobs::AIFARM_DRAW_API_SERVICE_NAME,
@@ -1102,6 +1145,8 @@ pub async fn backfill_declarative_v2(
             ProviderInput {
                 name: PRIVACY_FILTER_PROVIDER.to_owned(),
                 kind: "privacy_filter".to_owned(),
+                protocol: Some(PROTOCOL_PRIVACY_FILTER.to_owned()),
+                runtime_hint: None,
                 endpoint: Some(config.llm.discovery.base_url.clone()),
                 discovery_service_name: Some(redaction_service.to_owned()),
                 discovery_endpoint_name: Some(config.memory.redaction_endpoint_name.clone()),
@@ -1122,6 +1167,7 @@ pub async fn backfill_declarative_v2(
                 base_url: None,
                 capabilities: vec!["privacy_filter".to_owned()],
                 embedding_dim: None,
+                pool_id: None,
                 enabled: config.memory.redaction_enabled,
                 config: json!({}),
             },
@@ -1143,6 +1189,8 @@ pub async fn backfill_declarative_v2(
             ProviderInput {
                 name: OPENROUTER_PROVIDER.to_owned(),
                 kind: "chat".to_owned(),
+                protocol: Some(PROTOCOL_OPENAI_COMPAT.to_owned()),
+                runtime_hint: None,
                 endpoint: Some(OPENROUTER_CHAT_COMPLETIONS_URL.to_owned()),
                 discovery_service_name: None,
                 discovery_endpoint_name: None,
@@ -1163,6 +1211,7 @@ pub async fn backfill_declarative_v2(
                 base_url: Some(OPENROUTER_CHAT_COMPLETIONS_URL.to_owned()),
                 capabilities: vec!["chat".to_owned(), "tools".to_owned()],
                 embedding_dim: None,
+                pool_id: None,
                 enabled: !config.open_router.key.trim().is_empty(),
                 config: json!({
                     "request_timeout_seconds": config.open_router.request_timeout_seconds,
@@ -1317,6 +1366,159 @@ pub async fn backfill_boogu_image_slots(
     mark_app_setting(pool, BOOGU_IMAGE_SLOTS_KEY).await?;
     tracing::info!("backfilled Boogu image slot workflows");
     Ok(true)
+}
+
+const CAPACITY_POOLS_KEY: &str = "llm.routing.capacity_pools_v1";
+const PROVIDER_PROTOCOL_KEY: &str = "llm.routing.provider_protocol_v1";
+const VRAM_CLOUD_POOL_SLOTS: i32 = 16;
+
+/// Classify a provider row's wire protocol from its seeded shape. Pure so it
+/// is table-testable; used only to fill NULL protocols, never to overwrite an
+/// operator-set value.
+fn derive_protocol(kind: &str, name: &str, has_discovery: bool) -> &'static str {
+    match kind {
+        "embedding" => PROTOCOL_DISCOVERY_JOBS,
+        "image" => PROTOCOL_DISCOVERY_DRAW,
+        "music" => PROTOCOL_ACESTEP,
+        "privacy_filter" => PROTOCOL_PRIVACY_FILTER,
+        // chat / vision: genkit-family providers speak the Google AI API;
+        // everything else (aifarm and friends via discovery, vram-cloud,
+        // openrouter, nvidia, vmlx direct) is OpenAI-compatible.
+        _ => {
+            if !has_discovery && matches!(name, "genkit" | "gemini") {
+                PROTOCOL_GENKIT
+            } else {
+                PROTOCOL_OPENAI_COMPAT
+            }
+        }
+    }
+}
+
+/// Fill NULL provider protocols from the classifier. Guarded, idempotent, and
+/// never overwrites an operator-set protocol (SQL is `WHERE protocol IS NULL`).
+pub async fn backfill_provider_protocols(pool: &PgPool) -> Result<bool, StorageError> {
+    if app_setting_present(pool, PROVIDER_PROTOCOL_KEY).await? {
+        return Ok(false);
+    }
+    let providers = list_providers(pool).await?;
+    let mut filled = 0usize;
+    for provider in &providers {
+        if provider.protocol.is_some() {
+            continue;
+        }
+        let protocol = derive_protocol(
+            &provider.kind,
+            &provider.name,
+            provider.discovery_service_name.is_some(),
+        );
+        openplotva_storage::llm_routing::set_provider_protocol_if_null(pool, provider.id, protocol)
+            .await?;
+        filled += 1;
+    }
+    mark_app_setting(pool, PROVIDER_PROTOCOL_KEY).await?;
+    tracing::info!(filled, "backfilled provider protocols");
+    Ok(true)
+}
+
+/// Create the capacity pools that capture today's effective concurrency and
+/// attach the matching providers' models. Boogu draw models share one GPU and
+/// therefore one 1-slot pool; vram-cloud takes 16 parallel requests; the
+/// aifarm dialog service takes as many as the dialog worker pool used to run.
+/// Attach is `WHERE pool_id IS NULL`, so operator re-assignments survive.
+pub async fn backfill_capacity_pools(
+    pool: &PgPool,
+    config: &AppConfig,
+) -> Result<bool, StorageError> {
+    if app_setting_present(pool, CAPACITY_POOLS_KEY).await? {
+        return Ok(false);
+    }
+    let providers = list_providers(pool).await?;
+    let targets = [
+        (
+            "aifarm-dialog",
+            config.persistent_queue.dialog_aifarm_workers.max(1),
+            "AI Farm dialog service parallel request budget",
+            "aifarm",
+        ),
+        (
+            "vram-cloud",
+            VRAM_CLOUD_POOL_SLOTS,
+            "vram.cloud endpoint parallel request budget",
+            VRAM_CLOUD_PROVIDER,
+        ),
+        (
+            "boogu-gpu",
+            1,
+            "Draw GPU: flux + Boogu turbo/edit render strictly one at a time",
+            DRAW_API_PROVIDER,
+        ),
+    ];
+    for (pool_name, slots, description, provider_name) in targets {
+        let Some(provider_id) = existing_provider_id(&providers, provider_name) else {
+            continue;
+        };
+        let pool_id = openplotva_storage::llm_routing::insert_pool_if_missing(
+            pool,
+            &openplotva_storage::llm_routing::PoolInput {
+                name: pool_name.to_owned(),
+                max_concurrency: Some(slots),
+                description: Some(description.to_owned()),
+            },
+        )
+        .await?;
+        let attached = openplotva_storage::llm_routing::attach_provider_models_to_pool_if_unpooled(
+            pool,
+            provider_id,
+            pool_id,
+        )
+        .await?;
+        tracing::info!(pool = pool_name, slots, attached, "seeded capacity pool");
+    }
+    mark_app_setting(pool, CAPACITY_POOLS_KEY).await?;
+    Ok(true)
+}
+
+/// Everything the runtime rebuilds when the routing configuration changes:
+/// the published table, the capacity-pool registry, and (once wired) the
+/// derived dialog worker scale. Breakers/triggers are deliberately absent —
+/// their state must survive a reload untouched.
+pub struct RouterRuntime {
+    pub handle: Arc<RouterHandle>,
+    pub pools: Arc<openplotva_llm::router::PoolRegistry>,
+    pub dialog_scale: Option<tokio::sync::watch::Sender<u32>>,
+    pub dialog_unpooled_share: u32,
+    pub dialog_worker_cap: u32,
+}
+
+impl RouterRuntime {
+    /// Reconcile the live pool registry and worker scale with the currently
+    /// published table.
+    pub fn apply_published_table(&self) {
+        let table = self.handle.snapshot();
+        self.pools.apply(&table.pool_specs());
+        if let Some(scale) = &self.dialog_scale
+            && let Some(desired) = openplotva_llm::router::derived_worker_count(
+                &table,
+                "dialog",
+                self.dialog_unpooled_share,
+                self.dialog_worker_cap,
+            )
+        {
+            let _ = scale.send(desired);
+        }
+    }
+}
+
+/// Rebuild the table from the database, publish it atomically, and reconcile
+/// the pool registry / worker scale with it.
+pub async fn reload_router_runtime(
+    runtime: &RouterRuntime,
+    pool: &PgPool,
+) -> Result<(), StorageError> {
+    let table = load_routing_table(pool).await?;
+    runtime.handle.store(table);
+    runtime.apply_published_table();
+    Ok(())
 }
 
 fn overrides_from_json(value: &Value) -> InferenceOverrides {
@@ -1499,9 +1701,12 @@ pub fn build_routing_table(snapshot: &RoutingSnapshot) -> RoutingTable {
                 id: record.id,
                 name: record.name.clone(),
                 kind,
+                protocol: record.protocol.clone(),
                 endpoint: record.endpoint.clone(),
                 discovery_service_name: record.discovery_service_name.clone(),
                 discovery_endpoint_name: record.discovery_endpoint_name.clone(),
+                api_key_ref: record.api_key_ref.clone(),
+                api_key_encrypted: record.api_key_encrypted.clone(),
                 enabled: record.enabled,
                 config: record.config.clone(),
             },
@@ -1524,11 +1729,26 @@ pub fn build_routing_table(snapshot: &RoutingSnapshot) -> RoutingTable {
                 base_url: record.base_url.clone(),
                 capabilities: record.capabilities.clone(),
                 embedding_dim: record.embedding_dim,
+                pool_id: record.pool_id,
                 enabled: record.enabled,
                 config: record.config.clone(),
             },
         );
     }
+
+    let pool_specs: HashMap<i64, PoolSpec> = snapshot
+        .pools
+        .iter()
+        .map(|pool| {
+            (
+                pool.id,
+                PoolSpec {
+                    id: pool.id,
+                    max_concurrency: pool.max_concurrency.and_then(|max| u32::try_from(max).ok()),
+                },
+            )
+        })
+        .collect();
 
     let workflows: HashMap<&str, &WorkflowRecord> = snapshot
         .workflows
@@ -1559,6 +1779,7 @@ pub fn build_routing_table(snapshot: &RoutingSnapshot) -> RoutingTable {
     }
 
     let mut table = RoutingTable::new(providers.clone(), model_rows);
+    table.set_pools(pool_specs);
 
     for (&(workflow_key, scope_str), assignments) in &by_key_scope {
         let Some(workflow) = workflows.get(workflow_key) else {
@@ -1677,6 +1898,8 @@ mod tests {
             id,
             name: name.to_owned(),
             kind: kind.to_owned(),
+            protocol: None,
+            runtime_hint: None,
             endpoint: None,
             discovery_service_name: None,
             discovery_endpoint_name: None,
@@ -1696,6 +1919,7 @@ mod tests {
             base_url: None,
             capabilities: vec!["chat".to_owned()],
             embedding_dim: None,
+            pool_id: None,
             enabled: true,
             config: json!({}),
         }
@@ -1761,6 +1985,7 @@ mod tests {
                 low_watermark: Some(20),
                 params: json!({}),
             }],
+            pools: vec![],
         }
     }
 
@@ -1774,6 +1999,78 @@ mod tests {
         assert_eq!(route.fallback_tail[0].provider, 2);
         assert_eq!(route.triggers.len(), 1);
         assert_eq!(route.triggers[0].engage.provider, 3);
+    }
+
+    #[test]
+    fn derive_protocol_classifies_every_seeded_provider() {
+        // (kind, name, has_discovery) -> protocol, over the exact seeded rows.
+        let cases = [
+            ("chat", "aifarm", true, PROTOCOL_OPENAI_COMPAT),
+            ("chat", "genkit", false, PROTOCOL_GENKIT),
+            ("chat", "gemini", false, PROTOCOL_GENKIT),
+            ("chat", "vram-cloud", false, PROTOCOL_OPENAI_COMPAT),
+            ("chat", "openrouter", false, PROTOCOL_OPENAI_COMPAT),
+            ("chat", "nvidia", false, PROTOCOL_OPENAI_COMPAT),
+            ("chat", "vmlx", false, PROTOCOL_OPENAI_COMPAT),
+            ("chat", "aifarm-qwen27b-gguf", true, PROTOCOL_OPENAI_COMPAT),
+            ("vision", "aifarm-vision", true, PROTOCOL_OPENAI_COMPAT),
+            ("embedding", "aifarm-embed", true, PROTOCOL_DISCOVERY_JOBS),
+            ("image", "aifarm-draw", true, PROTOCOL_DISCOVERY_DRAW),
+            ("music", "acestep", false, PROTOCOL_ACESTEP),
+            (
+                "privacy_filter",
+                "privacy-filter",
+                true,
+                PROTOCOL_PRIVACY_FILTER,
+            ),
+        ];
+        for (kind, name, has_discovery, expected) in cases {
+            assert_eq!(
+                derive_protocol(kind, name, has_discovery),
+                expected,
+                "provider {name} (kind {kind})"
+            );
+        }
+    }
+
+    #[test]
+    fn build_routing_table_carries_pool_specs_and_model_pool_ids() {
+        let mut snapshot = dialog_snapshot();
+        snapshot.models[0].pool_id = Some(7);
+        snapshot.pools = vec![
+            openplotva_storage::llm_routing::PoolRecord {
+                id: 7,
+                name: "aifarm-dialog".to_owned(),
+                max_concurrency: Some(2),
+                description: None,
+            },
+            openplotva_storage::llm_routing::PoolRecord {
+                id: 8,
+                name: "unlimited".to_owned(),
+                max_concurrency: None,
+                description: None,
+            },
+        ];
+
+        let table = build_routing_table(&snapshot);
+        assert_eq!(table.model(10).and_then(|m| m.pool_id), Some(7));
+        assert_eq!(
+            table.pool(7),
+            Some(&PoolSpec {
+                id: 7,
+                max_concurrency: Some(2)
+            })
+        );
+        assert_eq!(
+            table.pool(8),
+            Some(&PoolSpec {
+                id: 8,
+                max_concurrency: None
+            })
+        );
+        let mut specs = table.pool_specs();
+        specs.sort_by_key(|spec| spec.id);
+        assert_eq!(specs.len(), 2);
     }
 
     #[test]
@@ -1906,6 +2203,7 @@ mod tests {
             }],
             assignments: vec![assignment(100, "embedding", "global", "primary", 10, None)],
             triggers: vec![],
+            pools: vec![],
         };
 
         let table = build_routing_table(&snapshot);
@@ -2030,6 +2328,7 @@ mod tests {
                 ),
             ],
             triggers: vec![],
+            pools: vec![],
         };
 
         let table = build_routing_table(&snapshot);

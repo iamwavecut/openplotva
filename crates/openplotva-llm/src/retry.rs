@@ -111,9 +111,6 @@ impl Error for ProviderError {
 
 #[must_use]
 pub fn retryable_reason(err: &(dyn Error + 'static)) -> Option<FailureReason> {
-    if let Some(fallback_error) = err.downcast_ref::<crate::FallbackChatProviderError>() {
-        return fallback_error.retryable_reason();
-    }
     if let Some(provider_error) = find_provider_error(err) {
         return Some(provider_error.reason());
     }

@@ -122,7 +122,9 @@ pub const DEFAULT_PERSISTENT_QUEUE_TEXT_WORKERS: i32 = 4;
 
 pub const DEFAULT_PERSISTENT_QUEUE_DIALOG_AIFARM_WORKERS: i32 = 2;
 
-pub const DEFAULT_PERSISTENT_QUEUE_DIALOG_AIFARM_FALLBACK_WORKERS: i32 = 1;
+pub const DEFAULT_PERSISTENT_QUEUE_DIALOG_WORKERS_CAP: i32 = 24;
+
+pub const DEFAULT_PERSISTENT_QUEUE_DIALOG_UNPOOLED_SHARE: i32 = 2;
 
 pub const DEFAULT_PERSISTENT_QUEUE_DIALOG_AIFARM_FALLBACK_HIGH_WATERMARK: i32 = 30;
 
@@ -542,9 +544,14 @@ pub struct PersistentQueueConfig {
     pub control_workers: i32,
     /// Worker count for the `text` queue.
     pub text_workers: i32,
-    /// Worker count for the `dialog-aifarm` queue.
+    /// Worker count for the `dialog-aifarm` queue. With capacity pools active
+    /// this is only the fallback when the routing table has no dialog route.
     pub dialog_aifarm_workers: i32,
-    pub dialog_aifarm_fallback_workers: i32,
+    /// Upper bound for the pool-derived dialog worker count.
+    pub dialog_workers_cap: i32,
+    /// Slot contribution of an unpooled/unlimited-pool dialog model when
+    /// deriving the worker count.
+    pub dialog_unpooled_share: i32,
     pub dialog_aifarm_fallback_high_watermark: i32,
     pub dialog_aifarm_fallback_low_watermark: i32,
     pub dialog_aifarm_fallback_poll_interval_seconds: i32,
@@ -1033,10 +1040,8 @@ pub struct RawConfig {
     pub persistent_queue_text_workers: Option<String>,
     /// `PERSISTENT_QUEUE_DIALOG_AIFARM_WORKERS`.
     pub persistent_queue_dialog_aifarm_workers: Option<String>,
-    /// `PERSISTENT_QUEUE_DIALOG_AIFARM_FALLBACK_WORKERS`.
-    pub persistent_queue_dialog_aifarm_fallback_workers: Option<String>,
-    /// Deprecated alias for `PERSISTENT_QUEUE_DIALOG_AIFARM_FALLBACK_WORKERS`.
-    pub persistent_queue_dialog_aifarm_overflow_workers: Option<String>,
+    pub persistent_queue_dialog_workers_cap: Option<String>,
+    pub persistent_queue_dialog_unpooled_share: Option<String>,
     /// `PERSISTENT_QUEUE_DIALOG_AIFARM_FALLBACK_HIGH_WATERMARK`.
     pub persistent_queue_dialog_aifarm_fallback_high_watermark: Option<String>,
     /// `PERSISTENT_QUEUE_DIALOG_AIFARM_FALLBACK_LOW_WATERMARK`.
@@ -1657,14 +1662,15 @@ impl AppConfig {
                 raw.persistent_queue_dialog_aifarm_workers,
                 DEFAULT_PERSISTENT_QUEUE_DIALOG_AIFARM_WORKERS,
             )?,
-            dialog_aifarm_fallback_workers: parse_i32(
-                dialog_aifarm_fallback_workers_env_name(
-                    &raw.persistent_queue_dialog_aifarm_fallback_workers,
-                    &raw.persistent_queue_dialog_aifarm_overflow_workers,
-                ),
-                raw.persistent_queue_dialog_aifarm_fallback_workers
-                    .or(raw.persistent_queue_dialog_aifarm_overflow_workers),
-                DEFAULT_PERSISTENT_QUEUE_DIALOG_AIFARM_FALLBACK_WORKERS,
+            dialog_workers_cap: parse_i32(
+                "PERSISTENT_QUEUE_DIALOG_WORKERS_CAP",
+                raw.persistent_queue_dialog_workers_cap,
+                DEFAULT_PERSISTENT_QUEUE_DIALOG_WORKERS_CAP,
+            )?,
+            dialog_unpooled_share: parse_i32(
+                "PERSISTENT_QUEUE_DIALOG_UNPOOLED_SHARE",
+                raw.persistent_queue_dialog_unpooled_share,
+                DEFAULT_PERSISTENT_QUEUE_DIALOG_UNPOOLED_SHARE,
             )?,
             dialog_aifarm_fallback_high_watermark: parse_i32(
                 "PERSISTENT_QUEUE_DIALOG_AIFARM_FALLBACK_HIGH_WATERMARK",
@@ -2758,12 +2764,8 @@ impl RawConfig {
             persistent_queue_control_workers: env("PERSISTENT_QUEUE_CONTROL_WORKERS"),
             persistent_queue_text_workers: env("PERSISTENT_QUEUE_TEXT_WORKERS"),
             persistent_queue_dialog_aifarm_workers: env("PERSISTENT_QUEUE_DIALOG_AIFARM_WORKERS"),
-            persistent_queue_dialog_aifarm_fallback_workers: env(
-                "PERSISTENT_QUEUE_DIALOG_AIFARM_FALLBACK_WORKERS",
-            ),
-            persistent_queue_dialog_aifarm_overflow_workers: env(
-                "PERSISTENT_QUEUE_DIALOG_AIFARM_OVERFLOW_WORKERS",
-            ),
+            persistent_queue_dialog_workers_cap: env("PERSISTENT_QUEUE_DIALOG_WORKERS_CAP"),
+            persistent_queue_dialog_unpooled_share: env("PERSISTENT_QUEUE_DIALOG_UNPOOLED_SHARE"),
             persistent_queue_dialog_aifarm_fallback_high_watermark: env(
                 "PERSISTENT_QUEUE_DIALOG_AIFARM_FALLBACK_HIGH_WATERMARK",
             ),
@@ -3056,27 +3058,6 @@ fn parse_i32(name: &'static str, value: Option<String>, default: i32) -> Result<
     })
 }
 
-fn dialog_aifarm_fallback_workers_env_name(
-    canonical: &Option<String>,
-    alias: &Option<String>,
-) -> &'static str {
-    if canonical
-        .as_ref()
-        .and_then(|value| parse_scalar_value(Some(value.clone())))
-        .is_some()
-    {
-        "PERSISTENT_QUEUE_DIALOG_AIFARM_FALLBACK_WORKERS"
-    } else if alias
-        .as_ref()
-        .and_then(|value| parse_scalar_value(Some(value.clone())))
-        .is_some()
-    {
-        "PERSISTENT_QUEUE_DIALOG_AIFARM_OVERFLOW_WORKERS"
-    } else {
-        "PERSISTENT_QUEUE_DIALOG_AIFARM_FALLBACK_WORKERS"
-    }
-}
-
 fn parse_f64(name: &'static str, value: Option<String>, default: f64) -> Result<f64, ConfigError> {
     let Some(value) = parse_scalar_value(value) else {
         return Ok(default);
@@ -3275,10 +3256,6 @@ fn validate_persistent_queue_config(config: &PersistentQueueConfig) -> Result<()
         validate_positive_i32(name, value)?;
     }
     validate_non_negative_i32(
-        "PERSISTENT_QUEUE_DIALOG_AIFARM_FALLBACK_WORKERS",
-        config.dialog_aifarm_fallback_workers,
-    )?;
-    validate_non_negative_i32(
         "PERSISTENT_QUEUE_MEMORY_CONSOLIDATION_WORKERS",
         config.memory_consolidation_workers,
     )?;
@@ -3341,7 +3318,6 @@ mod tests {
         DEFAULT_PERSISTENT_QUEUE_DIALOG_AIFARM_FALLBACK_HIGH_WATERMARK,
         DEFAULT_PERSISTENT_QUEUE_DIALOG_AIFARM_FALLBACK_LOW_WATERMARK,
         DEFAULT_PERSISTENT_QUEUE_DIALOG_AIFARM_FALLBACK_POLL_INTERVAL_SECONDS,
-        DEFAULT_PERSISTENT_QUEUE_DIALOG_AIFARM_FALLBACK_WORKERS,
         DEFAULT_PERSISTENT_QUEUE_DIALOG_AIFARM_WORKERS,
         DEFAULT_PERSISTENT_QUEUE_HEARTBEAT_INTERVAL_SECONDS,
         DEFAULT_PERSISTENT_QUEUE_IMAGE_REGULAR_WORKERS, DEFAULT_PERSISTENT_QUEUE_IMAGE_VIP_WORKERS,
@@ -3463,10 +3439,6 @@ mod tests {
         assert_eq!(
             config.persistent_queue.dialog_aifarm_workers,
             DEFAULT_PERSISTENT_QUEUE_DIALOG_AIFARM_WORKERS
-        );
-        assert_eq!(
-            config.persistent_queue.dialog_aifarm_fallback_workers,
-            DEFAULT_PERSISTENT_QUEUE_DIALOG_AIFARM_FALLBACK_WORKERS
         );
         assert_eq!(
             config
@@ -4018,7 +3990,6 @@ mod tests {
             persistent_queue_control_workers: Some("3".to_owned()),
             persistent_queue_text_workers: Some("6".to_owned()),
             persistent_queue_dialog_aifarm_workers: Some("4".to_owned()),
-            persistent_queue_dialog_aifarm_fallback_workers: Some("1".to_owned()),
             persistent_queue_dialog_aifarm_fallback_high_watermark: Some("40".to_owned()),
             persistent_queue_dialog_aifarm_fallback_low_watermark: Some("10".to_owned()),
             persistent_queue_dialog_aifarm_fallback_poll_interval_seconds: Some("2".to_owned()),
@@ -4050,7 +4021,6 @@ mod tests {
         assert_eq!(config.persistent_queue.control_workers, 3);
         assert_eq!(config.persistent_queue.text_workers, 6);
         assert_eq!(config.persistent_queue.dialog_aifarm_workers, 4);
-        assert_eq!(config.persistent_queue.dialog_aifarm_fallback_workers, 1);
         assert_eq!(
             config
                 .persistent_queue
@@ -4077,31 +4047,6 @@ mod tests {
         );
         assert_eq!(config.persistent_queue.placeholder_max_age_seconds, 7201);
         assert_eq!(config.persistent_queue.llm_job_max_attempts, 9);
-        Ok(())
-    }
-
-    #[test]
-    fn persistent_queue_dialog_overflow_workers_aliases_fallback_workers()
-    -> Result<(), super::ConfigError> {
-        let config = AppConfig::from_raw(RawConfig {
-            persistent_queue_dialog_aifarm_overflow_workers: Some("2".to_owned()),
-            ..RawConfig::default()
-        })?;
-
-        assert_eq!(config.persistent_queue.dialog_aifarm_fallback_workers, 2);
-        Ok(())
-    }
-
-    #[test]
-    fn persistent_queue_dialog_fallback_workers_win_over_overflow_alias()
-    -> Result<(), super::ConfigError> {
-        let config = AppConfig::from_raw(RawConfig {
-            persistent_queue_dialog_aifarm_fallback_workers: Some("3".to_owned()),
-            persistent_queue_dialog_aifarm_overflow_workers: Some("2".to_owned()),
-            ..RawConfig::default()
-        })?;
-
-        assert_eq!(config.persistent_queue.dialog_aifarm_fallback_workers, 3);
         Ok(())
     }
 
@@ -4146,23 +4091,6 @@ mod tests {
             error,
             Some(super::ConfigError::NegativeInteger {
                 name: "PERSISTENT_QUEUE_MEMORY_CONSOLIDATION_WORKERS",
-                value: -1,
-            })
-        ));
-    }
-
-    #[test]
-    fn persistent_queue_config_rejects_negative_fallback_worker_count() {
-        let error = AppConfig::from_raw(RawConfig {
-            persistent_queue_dialog_aifarm_fallback_workers: Some("-1".to_owned()),
-            ..RawConfig::default()
-        })
-        .err();
-
-        assert!(matches!(
-            error,
-            Some(super::ConfigError::NegativeInteger {
-                name: "PERSISTENT_QUEUE_DIALOG_AIFARM_FALLBACK_WORKERS",
                 value: -1,
             })
         ));

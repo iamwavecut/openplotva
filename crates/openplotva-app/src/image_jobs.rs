@@ -4325,7 +4325,9 @@ mod tests {
     };
 
     use openplotva_llm::aifarm::{AifarmHttpFuture, AifarmHttpResponse, CompletionError};
-    use openplotva_llm::router::{BreakerSet, RouterHandle, RoutingTable, TriggerState};
+    use openplotva_llm::router::{
+        BreakerSet, PoolRegistry, RouterHandle, RoutingTable, TriggerState,
+    };
     use openplotva_taskman::{
         DEFAULT_LLM_JOB_MAX_ATTEMPTS, DEFAULT_PRIORITY, HIGHEST_PRIORITY, IMAGE_REGULAR_QUEUE_NAME,
         IMAGE_VIP_QUEUE_NAME, ImageEditJobParams, ImageGenJobParams, ImageJobData, JobPayload,
@@ -5317,6 +5319,7 @@ mod tests {
             RouterHandle::new(RoutingTable::default()),
             Arc::new(BreakerSet::new()),
             Arc::new(TriggerState::new()),
+            Arc::new(PoolRegistry::new()),
         )
     }
 

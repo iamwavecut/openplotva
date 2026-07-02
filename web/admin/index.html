@@ -1105,18 +1105,22 @@
 
                     <div id="providers" class="tab-pane">
                         <div class="mp-topbar">
-                            <div class="mp-viewtabs">
-                                <pl-button id="mp-tab-overview" variant="nav" class="active" data-action="mpView" data-args='["overview"]'>Overview</pl-button>
-                                <pl-button id="mp-tab-library" variant="nav" data-action="mpView" data-args='["library"]'>Library</pl-button>
-                            </div>
+                            <pl-button-group class="mp-viewtabs" aria-label="Routing views">
+                                <pl-button id="mp-tab-cockpit" variant="nav" class="active" data-action="mpView" data-args='["cockpit"]'>Cockpit</pl-button>
+                                <pl-button id="mp-tab-catalog" variant="nav" data-action="mpView" data-args='["catalog"]'>Catalog</pl-button>
+                                <pl-button id="mp-tab-pools" variant="nav" data-action="mpView" data-args='["pools"]'>Pools</pl-button>
+                                <pl-button id="mp-tab-graph" variant="nav" data-action="mpView" data-args='["graph"]'>Graph</pl-button>
+                            </pl-button-group>
                             <div class="mp-topbar-actions">
                                 <pl-button data-action="loadRouting">Refresh</pl-button>
                                 <pl-button variant="primary" data-action="reloadRouting">Reload router</pl-button>
                             </div>
                         </div>
-                        <div id="mp-overview" class="mp-view"></div>
-                        <div id="mp-board" class="mp-view mp-hidden"></div>
-                        <div id="mp-library" class="mp-view mp-hidden"></div>
+                        <div id="mp-cockpit" class="mp-view" data-testid="mp-cockpit"></div>
+                        <div id="mp-board" class="mp-view mp-hidden" data-testid="mp-board"></div>
+                        <div id="mp-catalog" class="mp-view mp-hidden" data-testid="mp-catalog"></div>
+                        <div id="mp-pools" class="mp-view mp-hidden" data-testid="mp-pools"></div>
+                        <div id="mp-graph" class="mp-view mp-hidden" data-testid="mp-graph"></div>
                     </div>
 
                     <div id="logs" class="tab-pane">
@@ -1288,8 +1292,24 @@
             }
         }
 
-        // --- Model Providers — routing studio (overview map + drill-in board) ---
-        const mpState = { snap: null, view: 'overview', wf: null, scope: 'global' };
+        // --- Model Providers — Routing Ops (cockpit / board / catalog / pools / graph) ---
+        const mpState = {
+            snap: null, status: null, view: 'cockpit', wf: null, scope: 'global',
+            draft: null, loading: false, error: null, eventsCursor: null, pollTimer: null,
+            statusUnavailable: false, events: [],
+            eventsFilter: { severity: '', workflow: '' },
+            catalog: { drawer: null, search: '', caps: [] },
+            graph: { wf: '', scope: 'global', activeOnly: false },
+        };
+        const mpKinds = ['chat', 'vision', 'embedding', 'image', 'music', 'privacy_filter'];
+        const MP_CAPS = ['chat', 'tools', 'vision', 'embedding', 'image', 'music', 'privacy_filter'];
+        const MP_WF_LABELS = {
+            dialog: 'Dialog', vision: 'Vision', image_generation: 'Image Generation', image_edit: 'Image Edit',
+            memory_consolidation: 'Memory Consolidation', history_summary: 'History Summary', embedding: 'Embedding',
+            agentic_search_reasoner: 'Agentic Search — Reasoner', agentic_search_writer: 'Agentic Search — Writer',
+            agentic_song: 'Agentic Song', agentic_image: 'Agentic Image', media_prompt_optimizer: 'Media Prompt Optimizer',
+            redaction: 'Redaction', music: 'Music',
+        };
 
         function mpEl(tag, attrs, children) {
             const e = document.createElement(tag);
@@ -1310,15 +1330,223 @@
         }
         function mpIcon(name) { return mpEl('i', { class: 'ti ti-' + name, 'aria-hidden': 'true' }); }
         function mpClear(el) { while (el.firstChild) el.removeChild(el.firstChild); }
-        const mpKinds = ['chat', 'vision', 'embedding', 'image', 'music', 'privacy_filter'];
+        function mpBtn(label, attrs, onClick) {
+            const b = mpEl('pl-button', attrs || {}, label);
+            if (onClick) b.addEventListener('click', onClick);
+            return b;
+        }
+        function mpTextareaWithValue(attrs, value) {
+            const t = mpEl('pl-textarea', attrs);
+            if (value != null) queueMicrotask(() => { t.value = value; });
+            return t;
+        }
+        function mpClickable(node, handler) {
+            node.setAttribute('role', 'button');
+            node.setAttribute('tabindex', '0');
+            node.addEventListener('click', handler);
+            node.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') { ev.preventDefault(); handler(ev); } });
+            return node;
+        }
+        function mpTime(value) {
+            if (value == null) return '—';
+            const d = new Date(typeof value === 'number' ? value : String(value));
+            return isNaN(d.getTime()) ? String(value) : d.toLocaleString();
+        }
+        function mpNumOrNull(raw) {
+            const s = String(raw == null ? '' : raw).trim();
+            if (s === '') return null;
+            const n = Number(s);
+            return isNaN(n) ? null : n;
+        }
+        function mpSetSliderDisabled(slider, disabled) {
+            if (disabled) slider.setAttribute('disabled', ''); else slider.removeAttribute('disabled');
+            const inner = slider.querySelector('input');
+            if (inner) inner.disabled = disabled;
+        }
 
+        // ---- lookups over the config snapshot ----
         function mpProviderById(id) { return (mpState.snap.providers || []).find(p => p.id === id); }
         function mpModelById(id) { return (mpState.snap.models || []).find(m => m.id === id); }
+        function mpPoolById(id) { return (mpState.snap.pools || []).find(p => p.id === id); }
         function mpProviderOfModel(id) { const m = mpModelById(id); return m ? mpProviderById(m.provider_id) : null; }
-        function mpModelLabel(id) { const m = mpModelById(id); return m ? m.model_name : ('#' + id); }
+        function mpModelLabel(id) { const m = mpModelById(id); return m ? (m.display_name || m.model_name) : ('#' + id); }
         function mpProviderName(modelId) { const p = mpProviderOfModel(modelId); return p ? p.name : ''; }
-        function mpKindDot(kind) { return 'mp-dot mp-dot-' + ((mpKinds.indexOf(kind) % 6 + 6) % 6); }
+        function mpWorkflow(key) { return (mpState.snap.workflows || []).find(w => w.key === key); }
+        function mpAssignments(wfKey, scope, role) {
+            return (mpState.snap.assignments || [])
+                .filter(a => a.workflow_key === wfKey && a.scope === scope && a.role === role);
+        }
+        function mpWfLabel(key) {
+            return MP_WF_LABELS[key] || String(key).replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+        }
+        function mpDescriptors() { return mpState.snap.param_descriptors || []; }
+        function mpDescriptorFor(protocol, hint) {
+            const ds = mpDescriptors();
+            return ds.find(d => d.protocol === protocol && d.runtime_hint === (hint || null))
+                || ds.find(d => d.protocol === protocol && d.runtime_hint == null)
+                || null;
+        }
+        function mpModelUsedBy(modelId) {
+            return (mpState.snap.assignments || []).filter(a => a.provider_model_id === modelId).length;
+        }
+        function mpEligibleModels(kind) {
+            return (mpState.snap.models || []).filter(m => m.enabled && (m.capabilities || []).includes(kind));
+        }
 
+        // ---- API wrappers ----
+        function mpApi(action, fields) {
+            return apiCall('/routing', { method: 'POST', body: Object.assign({ action }, fields || {}) });
+        }
+        function mpGet(path) { return apiCall(path); }
+        async function mpReloadSnap() {
+            const data = await mpGet('/routing');
+            if (data) mpState.snap = data;
+            return data;
+        }
+        async function mpApply(action, fields, okMsg) {
+            const r = await mpApi(action, fields);
+            if (r) {
+                if (okMsg) PL.toast(okMsg, 'success');
+                await mpReloadSnap();
+                if (mpState.view === 'board') mpInitDraft(true);
+                mpRenderActiveView();
+            }
+            return r;
+        }
+        async function reloadRouting() {
+            const r = await mpApi('reload');
+            if (r) {
+                PL.toast('Router reloaded from database.', 'success');
+                await loadRouting();
+            }
+        }
+
+        // ---- live status (poll-safe endpoint; feature-detected) ----
+        function mpStatus() { return mpState.status || {}; }
+        function mpPoolLive(id) { return (mpStatus().pools || []).find(p => p.id === id) || null; }
+        function mpBreakerOpenModel(modelId) {
+            return (mpStatus().breakers || []).some(b => b.model_id === modelId && b.open);
+        }
+        function mpBreakerOpenProvider(providerId) {
+            return (mpStatus().breakers || []).some(b => b.provider_id === providerId && b.open);
+        }
+        function mpTriggerEngaged(id) { return (mpStatus().engaged_triggers || []).includes(id); }
+        function mpCapacityBlockedModel(modelId) {
+            return (mpStatus().capacity_cooldowns || []).some(c => c.model_id === modelId);
+        }
+        async function mpFetchStatus() {
+            if (mpState.statusUnavailable) return null;
+            if (!mpState.snap || !Array.isArray(mpState.snap.pools)) { mpState.statusUnavailable = true; return null; }
+            try {
+                const res = await fetch('/admin/api/routing/status');
+                if (res.status === 404) { mpState.statusUnavailable = true; return null; }
+                if (!res.ok) return null;
+                mpState.status = await res.json();
+                return mpState.status;
+            } catch (_) { return null; }
+        }
+        function mpStopPoll() {
+            if (mpState.pollTimer) { clearTimeout(mpState.pollTimer); mpState.pollTimer = null; }
+        }
+        function mpStartPoll() {
+            mpStopPoll();
+            if (mpState.statusUnavailable) return;
+            mpState.pollTimer = setTimeout(async () => {
+                const pane = document.getElementById('providers');
+                if (!pane || !pane.classList.contains('active')) { mpStopPoll(); return; }
+                const status = await mpFetchStatus();
+                if (status) mpApplyLiveStatus();
+                mpStartPoll();
+            }, 5000);
+        }
+        function mpApplyLiveStatus() {
+            const s = mpStatus();
+            const setText = (key, val) => {
+                const n = document.querySelector('[data-mp-health="' + key + '"]');
+                if (n) n.textContent = val;
+            };
+            setText('revision', String(s.revision != null ? s.revision : '—'));
+            setText('breakers', String((s.breakers || []).filter(b => b.open).length + ' open'));
+            setText('triggers', String((s.engaged_triggers || []).length + ' engaged'));
+            const dw = (s.workers || {}).dialog;
+            setText('workers', dw ? dw.running + '/' + dw.desired : '—');
+            document.querySelectorAll('[data-mp-pool-slot]').forEach(bar => {
+                const id = Number(bar.getAttribute('data-mp-pool-slot'));
+                const live = mpPoolLive(id);
+                const p = mpPoolById(id);
+                bar.capacity = live ? live.max_concurrency : (p ? p.max_concurrency : null);
+                bar.busy = live ? live.in_flight : 0;
+            });
+            document.querySelectorAll('[data-mp-wf-badges]').forEach(span => {
+                const key = span.getAttribute('data-mp-wf-badges');
+                mpClear(span);
+                mpWfBadges(key).forEach(b => span.appendChild(b));
+            });
+            document.querySelectorAll('[data-mp-trigger-live]').forEach(pill => {
+                const id = Number(pill.getAttribute('data-mp-trigger-live'));
+                pill.classList.toggle('mp-hidden', !mpTriggerEngaged(id));
+            });
+            const cascade = document.querySelector('[data-mp-cascade]');
+            if (cascade && mpState.view === 'board' && mpState.wf) {
+                cascade.data = mpFlowData({ workflows: [mpState.wf], scope: mpState.scope, activeOnly: false });
+            }
+            const gflow = document.querySelector('[data-mp-graph-flow]');
+            if (gflow && mpState.view === 'graph') gflow.data = mpGraphFlowData();
+        }
+
+        // ---- entry + view switching ----
+        async function loadRouting() {
+            mpState.loading = true;
+            mpState.error = null;
+            mpRenderActiveView();
+            const data = await mpGet('/routing');
+            mpState.loading = false;
+            if (!data) {
+                mpState.error = 'Could not load routing configuration.';
+                mpRenderActiveView();
+                return;
+            }
+            mpState.snap = data;
+            mpState.statusUnavailable = false;
+            await mpFetchStatus();
+            if (mpState.view === 'board') mpInitDraft(true);
+            mpRenderActiveView();
+            mpStartPoll();
+        }
+        function mpView(v) {
+            mpState.view = v;
+            if (v !== 'board') { mpState.wf = null; mpState.draft = null; }
+            mpRenderActiveView();
+            mpStartPoll();
+        }
+        function mpOpenBoard(key) {
+            mpState.wf = key;
+            mpState.scope = 'global';
+            mpState.draft = null;
+            mpView('board');
+        }
+        function mpRenderActiveView() {
+            const panes = { cockpit: 'mp-cockpit', board: 'mp-board', catalog: 'mp-catalog', pools: 'mp-pools', graph: 'mp-graph' };
+            for (const key in panes) {
+                document.getElementById(panes[key]).classList.toggle('mp-hidden', mpState.view !== key);
+            }
+            const activeTab = mpState.view === 'board' ? 'cockpit' : mpState.view;
+            ['cockpit', 'catalog', 'pools', 'graph'].forEach(t => {
+                document.getElementById('mp-tab-' + t).classList.toggle('active', activeTab === t);
+            });
+            const root = document.getElementById(panes[mpState.view]);
+            if (mpState.loading) { PL.skeleton(root, { rows: 6 }); return; }
+            if (mpState.error) { PL.error(root, { message: mpState.error, onRetry: loadRouting }); return; }
+            if (!mpState.snap) { PL.skeleton(root, { rows: 6 }); return; }
+            root.removeAttribute('aria-busy');
+            if (mpState.view === 'cockpit') mpRenderCockpit();
+            else if (mpState.view === 'board') mpRenderBoard();
+            else if (mpState.view === 'catalog') mpRenderCatalog();
+            else if (mpState.view === 'pools') mpRenderPools();
+            else mpRenderGraph();
+        }
+
+        // ---- shared UI bits ----
         function mpToggleControl(checked, label, onChange) {
             const attrs = {
                 label: label || '',
@@ -1330,485 +1558,1500 @@
             if (checked) attrs.checked = true;
             return mpEl('pl-toggle', attrs);
         }
-
-        async function mpEditConfig(action, id, current) {
-            const input = mpEl('pl-textarea', { rows: '8' });
-            input.value = JSON.stringify(current && typeof current === 'object' ? current : {}, null, 2);
-            const body = mpEl('div', { class: 'mp-config-editor' }, [input]);
-            const ok = await PL.confirm({ title: 'Patch config', body, okLabel: 'Patch' });
-            if (!ok) return;
-            let patch;
-            try {
-                patch = JSON.parse(input.value || '{}');
-            } catch (err) {
-                PL.toast('Config must be valid JSON.', 'error');
-                return;
-            }
-            if (!patch || Array.isArray(patch) || typeof patch !== 'object') {
-                PL.toast('Config patch must be a JSON object.', 'error');
-                return;
-            }
-            await mpApply({ action, id, config: patch }, 'Config patched.');
+        function mpStatePill(state, label) {
+            return mpEl('span', { class: 'mp-state', 'data-state': state, text: label || state });
         }
-
-        function mpAssignments(wfKey, scope, role) {
-            return (mpState.snap.assignments || [])
-                .filter(a => a.workflow_key === wfKey && a.scope === scope && a.role === role && a.enabled);
+        function mpSlotbarFor(poolId, size) {
+            const bar = mpEl('pl-slotbar', { size: size || 'card', 'data-mp-pool-slot': poolId });
+            const live = mpPoolLive(poolId);
+            const p = mpPoolById(poolId);
+            bar.capacity = live ? live.max_concurrency : (p ? p.max_concurrency : null);
+            bar.busy = live ? live.in_flight : 0;
+            return bar;
         }
-        function mpWorkflow(key) { return (mpState.snap.workflows || []).find(w => w.key === key); }
-
-        async function mpApply(body, okMsg) {
-            const r = await apiCall('/routing', { method: 'POST', body });
-            if (r) { if (okMsg) PL.toast(okMsg, 'success'); await loadRouting(); }
-            return r;
+        function mpPoolChip(poolId, size) {
+            const p = mpPoolById(poolId);
+            if (!p) return null;
+            const chip = mpEl('span', { class: 'mp-pool-chip', title: 'Pool: ' + p.name }, [
+                mpEl('span', { text: p.name }),
+            ]);
+            if (!mpState.statusUnavailable) chip.appendChild(mpSlotbarFor(poolId, size || 'mini'));
+            return chip;
         }
-        async function reloadRouting() {
-            const r = await apiCall('/routing', { method: 'POST', body: { action: 'reload' } });
-            if (r) PL.toast('Router reloaded from database.', 'success');
-        }
-
-        async function loadRouting() {
-            const data = await apiCall('/routing');
-            if (!data) return;
-            mpState.snap = data;
-            mpRenderActiveView();
-        }
-
-        function mpView(v) {
-            mpState.view = v;
-            if (v !== 'board') mpState.wf = null;
-            mpRenderActiveView();
-        }
-        function mpRenderActiveView() {
-            const panes = { overview: 'mp-overview', board: 'mp-board', library: 'mp-library' };
-            for (const key in panes) {
-                document.getElementById(panes[key]).classList.toggle('mp-hidden', mpState.view !== key);
-            }
-            document.getElementById('mp-tab-overview').classList.toggle('active', mpState.view === 'overview');
-            document.getElementById('mp-tab-library').classList.toggle('active', mpState.view === 'library');
-            if (!mpState.snap) return;
-            if (mpState.view === 'overview') mpRenderOverview();
-            else if (mpState.view === 'board') mpRenderBoard();
-            else mpRenderLibrary();
-        }
-
-        // ---- mini allocation bar (overview cards) ----
-        function mpAllocBar(primaries, big) {
-            const total = primaries.reduce((s, a) => s + Math.max(0, a.weight || 0), 0) || 1;
+        function mpAllocBar(entries, big) {
+            // entries: [{label, weight}]
+            const total = entries.reduce((s, e) => s + Math.max(0, e.weight || 0), 0) || 1;
             const bar = mpEl('div', { class: big ? 'mp-alloc mp-alloc--lg' : 'mp-alloc mp-alloc--mini' });
-            primaries.forEach((a, i) => {
-                const pct = Math.round((Math.max(0, a.weight || 0) / total) * 100);
+            entries.forEach((e, i) => {
+                const pct = (Math.max(0, e.weight || 0) / total) * 100;
                 const seg = mpEl('div', { class: 'mp-seg mp-seg-' + (i % 6) });
                 seg.style.flexBasis = pct + '%';
                 seg.style.flexGrow = '0';
-                if (big && pct >= 14) {
-                    seg.appendChild(mpEl('span', { text: mpModelLabel(a.provider_model_id) + ' · ' + pct + '%' }));
-                } else if (big && pct >= 6) {
-                    seg.appendChild(mpEl('span', { text: pct + '%' }));
-                }
+                if (big && pct >= 14) seg.appendChild(mpEl('span', { text: e.label + ' · ' + Math.round(pct) + '%' }));
+                else if (big && pct >= 6) seg.appendChild(mpEl('span', { text: Math.round(pct) + '%' }));
                 bar.appendChild(seg);
             });
             return bar;
         }
+        function mpWfBadges(key) {
+            const w = mpWorkflow(key);
+            const out = [];
+            if (!w) return out;
+            if (!w.enabled) out.push(mpStatePill('disabled', 'disabled'));
+            if (!mpState.statusUnavailable) {
+                const asgs = (mpState.snap.assignments || []).filter(a => a.workflow_key === key);
+                if (asgs.some(a => mpBreakerOpenModel(a.provider_model_id))) out.push(mpStatePill('breaker-open', 'breaker'));
+                const trgs = (mpState.snap.triggers || []).filter(t => t.workflow_key === key);
+                if (trgs.some(t => mpTriggerEngaged(t.id))) out.push(mpStatePill('engaged', 'overflow engaged'));
+            }
+            return out;
+        }
+        function mpJsonPre(obj) {
+            let textOut;
+            try { textOut = JSON.stringify(obj, null, 2); } catch (_) { textOut = String(obj); }
+            return mpEl('pre', { class: 'detail-pre mp-event-detail', text: textOut });
+        }
 
-        // ---- OVERVIEW: providers rail + workflow grid ----
-        function mpRenderOverview() {
-            const root = document.getElementById('mp-overview');
+        // ============ COCKPIT ============
+        function mpRenderCockpit() {
+            const root = document.getElementById('mp-cockpit');
             mpClear(root);
-
-            root.appendChild(mpEl('div', { class: 'mp-eyebrow', text: 'Providers' }));
-            const rail = mpEl('div', { class: 'mp-rail' });
-            (mpState.snap.providers || []).forEach(p => {
-                const chip = mpEl('div', { class: 'mp-chip', 'data-off': p.enabled ? '0' : '1',
-                    _on: { click: () => mpView('library') } }, [
-                    mpEl('span', { class: mpKindDot(p.kind) }),
-                    mpEl('span', { text: p.name }),
-                    mpEl('span', { class: 'mp-row-sub', text: p.kind }),
-                ]);
-                rail.appendChild(chip);
-            });
-            if (!(mpState.snap.providers || []).length) rail.appendChild(mpEl('span', { class: 'mp-empty', text: 'No providers yet.' }));
-            root.appendChild(rail);
-
+            if (mpState.statusUnavailable) {
+                root.appendChild(mpEl('div', { class: 'mp-hint', text: 'Live status unavailable — showing configuration only.' }));
+            } else {
+                root.appendChild(mpHealthStrip());
+                const pools = mpState.snap.pools || [];
+                if (pools.length) {
+                    root.appendChild(mpEl('div', { class: 'mp-eyebrow', text: 'Pools' }));
+                    const row = mpEl('div', { class: 'mp-pools-row' });
+                    pools.forEach(p => row.appendChild(mpPoolTile(p)));
+                    root.appendChild(row);
+                }
+            }
             root.appendChild(mpEl('div', { class: 'mp-eyebrow', text: 'Workflows' }));
             root.appendChild(mpEl('div', { class: 'mp-hint', text: 'Pick a workflow to shape how its requests route across models.' }));
             const grid = mpEl('div', { class: 'mp-grid' });
-            (mpState.snap.workflows || []).forEach(w => {
-                const primaries = mpAssignments(w.key, 'global', 'primary');
-                const fb = mpAssignments(w.key, 'global', 'fallback').length;
-                const trg = (mpState.snap.triggers || []).filter(t => t.workflow_key === w.key && t.enabled).length;
-                const card = mpEl('div', { class: 'mp-wf', _on: { click: () => mpOpenBoard(w.key) } }, [
-                    mpEl('div', { class: 'mp-wf-head' }, [
-                        mpEl('span', { class: 'mp-wf-title', text: mpTitle(w.key) }),
-                        mpEl('span', { class: 'mp-tag mp-tag--accent', text: w.kind }),
-                        w.full_routing ? null : mpEl('span', { class: 'mp-tag mp-tag--muted', text: 'config-only' }),
-                        mpToggleControl(w.enabled, '', enabled => mpApply({ action: 'set_workflow_enabled', key: w.key, enabled }, enabled ? 'Workflow enabled.' : 'Workflow disabled.')),
-                    ]),
-                    primaries.length ? mpAllocBar(primaries, false)
-                        : mpEl('div', { class: 'mp-empty', text: 'No models assigned' }),
-                    mpEl('div', { class: 'mp-wf-meta' }, [
-                        mpEl('span', {}, [mpIcon('layout-grid'), ' ' + primaries.length + ' primary']),
-                        mpEl('span', {}, [mpIcon('arrow-down'), ' ' + fb + ' fallback']),
-                        mpEl('span', {}, [mpIcon('bolt'), ' ' + trg + ' trigger']),
-                    ]),
-                ]);
-                grid.appendChild(card);
-            });
+            (mpState.snap.workflows || []).forEach(w => grid.appendChild(mpWorkflowCard(w)));
+            if (!(mpState.snap.workflows || []).length) grid.appendChild(mpEl('div', { class: 'mp-empty', text: 'No workflows.' }));
             root.appendChild(grid);
+            root.appendChild(mpEventsSection());
+            mpLoadEvents(true);
+        }
+        function mpHealthStrip() {
+            const s = mpStatus();
+            const openBreakers = (s.breakers || []).filter(b => b.open).length;
+            const engaged = (s.engaged_triggers || []).length;
+            const dw = (s.workers || {}).dialog;
+            const strip = mpEl('div', { class: 'dash-health' });
+            [
+                ['Router revision', String(s.revision != null ? s.revision : '—'), 'revision', true],
+                ['Breakers', openBreakers + ' open', 'breakers', openBreakers === 0],
+                ['Triggers', engaged + ' engaged', 'triggers', engaged === 0],
+                ['Dialog workers', dw ? dw.running + '/' + dw.desired : '—', 'workers', !dw || dw.running >= dw.desired],
+            ].forEach(([name, value, key, ok]) => {
+                strip.appendChild(mpEl('div', { class: 'health-item' }, [
+                    mpEl('span', { class: 'health-dot ' + (ok ? 'ok' : 'idle') }),
+                    mpEl('span', { class: 'health-name', text: name }),
+                    mpEl('span', { class: 'health-status', 'data-mp-health': key, text: value }),
+                ]));
+            });
+            return strip;
+        }
+        function mpPoolTile(p) {
+            const tile = mpEl('div', { class: 'mp-pool-tile', 'aria-label': 'Pool ' + p.name }, [
+                mpEl('div', { class: 'mp-pool-tile-name' }, [
+                    mpEl('span', { text: p.name }),
+                    mpEl('span', { class: 'mp-row-sub', text: p.max_concurrency == null ? '∞ slots' : p.max_concurrency + ' slots' }),
+                ]),
+                mpSlotbarFor(p.id, 'card'),
+            ]);
+            return mpClickable(tile, () => mpView('pools'));
+        }
+        function mpWorkflowCard(w) {
+            const primaries = mpAssignments(w.key, 'global', 'primary').filter(a => a.enabled);
+            const names = primaries.map(a => {
+                const total = primaries.reduce((s, x) => s + Math.max(0, x.weight || 0), 0) || 1;
+                const pct = Math.round((Math.max(0, a.weight || 0) / total) * 100);
+                return mpModelLabel(a.provider_model_id) + ' ' + pct + '%';
+            }).join(' · ');
+            const badges = mpEl('span', { class: 'mp-wf-meta', 'data-mp-wf-badges': w.key });
+            mpWfBadges(w.key).forEach(b => badges.appendChild(b));
+            const card = mpEl('div', { class: 'mp-wf', 'data-testid': 'mp-wf-' + w.key }, [
+                mpEl('div', { class: 'mp-wf-head' }, [
+                    mpEl('span', { class: 'mp-wf-title', text: mpWfLabel(w.key) }),
+                    mpEl('span', { class: 'mp-tag mp-tag--accent', text: w.kind }),
+                    w.full_routing ? null : mpEl('span', { class: 'mp-tag mp-tag--muted', text: 'config-only' }),
+                ]),
+                primaries.length
+                    ? mpAllocBar(primaries.map(a => ({ label: mpModelLabel(a.provider_model_id), weight: a.weight })), false)
+                    : mpEl('div', { class: 'mp-empty', text: 'No models assigned' }),
+                mpEl('div', { class: 'mp-wf-meta', text: names || '' }),
+                badges,
+            ]);
+            return mpClickable(card, () => mpOpenBoard(w.key));
         }
 
-        function mpTitle(key) {
-            return key.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+        // ---- Events feed ----
+        const MP_EVENT_COLUMNS = [
+            { key: 'created_at', label: 'Time', mono: true, render: e => mpTime(e.created_at) },
+            {
+                key: 'severity', label: 'Severity', render: e => {
+                    const tone = e.severity === 'error' ? 'danger' : (e.severity === 'warn' ? 'warning' : 'info');
+                    return PL.badge(e.severity || 'info', tone);
+                }
+            },
+            { key: 'event_type', label: 'Type', mono: true },
+            { key: 'workflow_key', label: 'Workflow', render: e => e.workflow_key || '—' },
+            { key: 'summary', label: 'Summary' },
+        ];
+        function mpEventsSection() {
+            const sec = mpEl('div', { class: 'mp-section' });
+            sec.appendChild(mpEl('div', { class: 'mp-eyebrow', text: 'Events' }));
+            const sevSel = mpEl('pl-select', { class: 'w-narrow', 'aria-label': 'Severity filter' },
+                [['', 'All severities'], ['info', 'Info'], ['warn', 'Warn'], ['error', 'Error']].map(([v, l]) =>
+                    mpEl('option', Object.assign({ value: v }, mpState.eventsFilter.severity === v ? { selected: true } : {}), l)));
+            const wfSel = mpEl('pl-select', { class: 'w-narrow', 'aria-label': 'Workflow filter' },
+                [mpEl('option', { value: '' }, 'All workflows')].concat((mpState.snap.workflows || []).map(w =>
+                    mpEl('option', Object.assign({ value: w.key }, mpState.eventsFilter.workflow === w.key ? { selected: true } : {}), mpWfLabel(w.key)))));
+            sevSel.addEventListener('pl:change', () => { mpState.eventsFilter.severity = sevSel.value; mpLoadEvents(true); });
+            wfSel.addEventListener('pl:change', () => { mpState.eventsFilter.workflow = wfSel.value; mpLoadEvents(true); });
+            sec.appendChild(mpEl('div', { class: 'mp-events-filters' }, [sevSel, wfSel]));
+            const table = mpEl('pl-table', { id: 'mp-events-table', dense: true, 'row-clickable': true, 'skeleton-rows': '5' });
+            table.addEventListener('pl:row-click', e => {
+                PL.alert({ title: (e.detail.row.event_type || 'event') + ' #' + e.detail.row.id, body: mpJsonPre(e.detail.row) });
+            });
+            sec.appendChild(table);
+            const more = mpBtn('Load more', { variant: 'outline', size: 'sm', id: 'mp-events-more' }, () => mpLoadEvents(false));
+            sec.appendChild(mpEl('div', { class: 'mp-events-foot' }, [more]));
+            return sec;
+        }
+        async function mpLoadEvents(reset) {
+            const table = document.getElementById('mp-events-table');
+            if (!table) return;
+            table.columns = MP_EVENT_COLUMNS;
+            table.emptyTitle = 'No routing events';
+            table.emptyDesc = 'Router decisions and incidents will appear here.';
+            table.onRetry = () => mpLoadEvents(true);
+            if (reset) { mpState.events = []; mpState.eventsCursor = null; table.state = 'loading'; }
+            const params = new URLSearchParams({ limit: '30' });
+            if (mpState.eventsCursor != null) params.set('before_id', String(mpState.eventsCursor));
+            if (mpState.eventsFilter.severity) params.set('severity', mpState.eventsFilter.severity);
+            if (mpState.eventsFilter.workflow) params.set('workflow', mpState.eventsFilter.workflow);
+            const data = await mpGet('/routing/events?' + params.toString());
+            if (!data) { if (reset) table.showError('Could not load routing events.'); return; }
+            const page = data.events || [];
+            mpState.events = mpState.events.concat(page);
+            mpState.eventsCursor = data.next_before_id;
+            table.rows = mpState.events;
+            const more = document.getElementById('mp-events-more');
+            if (more) more.disabled = !data.next_before_id || !page.length;
         }
 
-        // ---- BOARD ----
-        function mpOpenBoard(key) { mpState.wf = key; mpState.scope = 'global'; mpView('board'); }
-
+        // ============ BOARD ============
+        function mpInitDraft(preserveEdits) {
+            const old = preserveEdits ? mpState.draft : null;
+            const primaries = mpAssignments(mpState.wf, mpState.scope, 'primary');
+            const fbs = mpAssignments(mpState.wf, mpState.scope, 'fallback')
+                .slice().sort((a, b) => (a.fallback_order || 0) - (b.fallback_order || 0));
+            const draft = { weights: {}, baseWeights: {}, fbOrder: fbs.map(a => a.id), baseFbOrder: fbs.map(a => a.id) };
+            primaries.forEach(a => {
+                const base = a.weight == null ? 0 : a.weight;
+                draft.baseWeights[a.id] = base;
+                let val = base;
+                if (old && old.weights[a.id] != null && old.weights[a.id] !== old.baseWeights[a.id]) val = old.weights[a.id];
+                draft.weights[a.id] = val;
+            });
+            if (old && old.fbOrder.join(',') !== old.baseFbOrder.join(',')) {
+                const stillThere = old.fbOrder.filter(id => draft.baseFbOrder.includes(id));
+                const added = draft.baseFbOrder.filter(id => !stillThere.includes(id));
+                draft.fbOrder = stillThere.concat(added);
+            }
+            mpState.draft = draft;
+        }
+        function mpWeightsDirty() {
+            const d = mpState.draft;
+            return d && Object.keys(d.weights).some(id => d.weights[id] !== d.baseWeights[id]);
+        }
+        function mpFbDirty() {
+            const d = mpState.draft;
+            return d && d.fbOrder.join(',') !== d.baseFbOrder.join(',');
+        }
         function mpRenderBoard() {
             const root = document.getElementById('mp-board');
             mpClear(root);
             const w = mpWorkflow(mpState.wf);
-            if (!w) { root.appendChild(mpEl('div', { class: 'mp-empty', text: 'Workflow not found.' })); return; }
-
-            const head = mpEl('div', { class: 'mp-board-head' }, [
-                mpEl('span', { class: 'mp-back', _on: { click: () => mpView('overview') } }, [mpIcon('arrow-left'), ' Overview']),
-                mpEl('span', { class: 'mp-wf-title', text: mpTitle(w.key) }),
+            if (!w) { PL.empty(root, { title: 'Workflow not found', desc: 'It may have been removed.' }); return; }
+            if (!mpState.draft) mpInitDraft();
+            const scopeGroup = mpEl('pl-button-group', { 'aria-label': 'Scope' }, ['global', 'vip'].map(s =>
+                mpBtn(s === 'vip' ? 'VIP' : 'Global',
+                    { variant: 'nav', size: 'sm', class: mpState.scope === s ? 'active' : '' },
+                    () => { mpState.scope = s; mpState.draft = null; mpRenderBoard(); })));
+            root.appendChild(mpEl('div', { class: 'mp-board-head' }, [
+                mpBtn('← Cockpit', { variant: 'ghost', size: 'sm' }, () => mpView('cockpit')),
+                mpEl('span', { class: 'mp-wf-title', text: mpWfLabel(w.key) }),
                 mpEl('span', { class: 'mp-tag mp-tag--accent', text: w.kind }),
                 w.full_routing ? mpEl('span', { class: 'mp-tag', text: 'full routing' }) : mpEl('span', { class: 'mp-tag mp-tag--muted', text: 'config-only' }),
-                mpToggleControl(w.enabled, 'enabled', enabled => mpApply({ action: 'set_workflow_enabled', key: w.key, enabled }, enabled ? 'Workflow enabled.' : 'Workflow disabled.')),
-            ]);
-            const scope = mpEl('div', { class: 'mp-scope' }, ['global', 'vip'].map(s =>
-                mpEl('span', { class: 'mp-scope-opt' + (mpState.scope === s ? ' active' : ''), text: s === 'vip' ? 'VIP' : 'Global',
-                    _on: { click: () => { mpState.scope = s; mpRenderBoard(); } } })));
-            head.appendChild(scope);
-            root.appendChild(head);
-
-            // PRIMARY ALLOCATION
-            const primaries = mpAssignments(w.key, mpState.scope, 'primary');
-            const sec1 = mpEl('div', { class: 'mp-section' });
-            sec1.appendChild(mpEl('div', { class: 'mp-eyebrow', text: 'Primary allocation' }));
-            sec1.appendChild(mpEl('div', { class: 'mp-hint', text: w.full_routing ? 'Each request is drawn by weight. Drag a divider to rebalance, or use the steppers.' : 'Config-only workflow: the first model is used; weights are ignored.' }));
-            if (w.full_routing && primaries.length) {
-                sec1.appendChild(mpEl('div', { class: 'mp-flow-label' }, [mpIcon('arrow-down'), ' Incoming request fans out']));
-                sec1.appendChild(mpAllocBarEditable(primaries));
-            }
-            const legend = mpEl('div', { class: 'mp-legend' });
-            primaries.forEach((a, i) => legend.appendChild(mpPrimaryRow(a, i, primaries)));
-            if (!primaries.length) legend.appendChild(mpEl('div', { class: 'mp-empty', text: 'No primary models. Add one below.' }));
-            sec1.appendChild(legend);
-            sec1.appendChild(mpAddPicker(w, 'primary'));
-            root.appendChild(sec1);
-
-            // FALLBACK CHAIN
-            const fbs = mpAssignments(w.key, mpState.scope, 'fallback').sort((x, y) => (x.fallback_order || 0) - (y.fallback_order || 0));
-            const sec2 = mpEl('div', { class: 'mp-section' });
-            sec2.appendChild(mpEl('div', { class: 'mp-eyebrow', text: 'Fallback chain' }));
-            sec2.appendChild(mpEl('div', { class: 'mp-hint', text: 'Tried in order when every primary is exhausted.' }));
-            const chain = mpEl('div', { class: 'mp-fallback' });
-            fbs.forEach((a, i) => chain.appendChild(mpFallbackRow(a, i, fbs)));
-            if (!fbs.length) chain.appendChild(mpEl('div', { class: 'mp-empty', text: 'No fallback models.' }));
-            sec2.appendChild(chain);
-            sec2.appendChild(mpAddPicker(w, 'fallback'));
-            root.appendChild(sec2);
-
-            // TRIGGERS
-            if (w.full_routing) {
-                const trgs = (mpState.snap.triggers || []).filter(t => t.workflow_key === w.key);
-                const sec3 = mpEl('div', { class: 'mp-section' });
-                sec3.appendChild(mpEl('div', { class: 'mp-eyebrow', text: 'Triggers' }));
-                sec3.appendChild(mpEl('div', { class: 'mp-hint', text: 'Open an overflow branch while a condition holds.' }));
-                trgs.forEach(t => sec3.appendChild(mpTriggerCard(t, w)));
-                if (!trgs.length) sec3.appendChild(mpEl('div', { class: 'mp-empty', text: 'No triggers.' }));
-                sec3.appendChild(mpTriggerEditor(w, null));
-                root.appendChild(sec3);
-            }
-
-            // WORKFLOW SETTINGS
-            const sec4 = mpEl('div', { class: 'mp-section' });
-            sec4.appendChild(mpEl('div', { class: 'mp-eyebrow', text: 'Retry budget' }));
-            const hops = mpEl('pl-input', { type: 'number', value: w.retry_max_hops, class: 'w-narrow' });
-            const wall = mpEl('pl-input', { type: 'number', value: w.retry_wall_ms, class: 'w-narrow' });
-            sec4.appendChild(mpEl('div', { class: 'mp-add' }, [
-                mpEl('span', { class: 'mp-hint', text: 'Max hops' }), hops,
-                mpEl('span', { class: 'mp-hint', text: 'Wall-clock ms' }), wall,
-                mpEl('pl-button', { _on: { click: () => mpApply({ action: 'update_workflow', key: w.key, full_routing: w.full_routing, retry_max_hops: Number(hops.value), retry_wall_ms: Number(wall.value), enabled: w.enabled }, 'Retry budget saved.') } }, 'Save'),
+                mpToggleControl(w.enabled, 'enabled', enabled =>
+                    mpApply('set_workflow_enabled', { key: w.key, enabled }, enabled ? 'Workflow enabled.' : 'Workflow disabled.')),
+                scopeGroup,
+                mpEl('span', { class: 'mp-board-budget', text: 'retry ≤ ' + w.retry_max_hops + ' hops · ' + w.retry_wall_ms + ' ms wall' }),
             ]));
-            root.appendChild(sec4);
+            root.appendChild(mpBoardSplitSection(w));
+            root.appendChild(mpBoardFallbackSection(w));
+            if (w.full_routing) {
+                root.appendChild(mpBoardExperimentsSection(w));
+                root.appendChild(mpBoardTriggersSection(w));
+            }
+            root.appendChild(mpBoardBudgetSection(w));
+            root.appendChild(mpBoardCascadeSection(w));
         }
 
-        function mpStepper(value, onDelta) {
-            return mpEl('div', { class: 'mp-stepper' }, [
-                mpEl('span', { class: 'mp-stepper-btn', _on: { click: () => onDelta(-5) } }, [mpIcon('minus')]),
-                mpEl('span', { class: 'mp-stepper-val', text: String(value) }),
-                mpEl('span', { class: 'mp-stepper-btn', _on: { click: () => onDelta(5) } }, [mpIcon('plus')]),
-            ]);
-        }
-
-        function mpPrimaryRow(a, i, primaries) {
-            const weight = a.weight == null ? 0 : a.weight;
-            return mpEl('div', { class: 'mp-row' }, [
-                mpEl('span', { class: 'mp-dot mp-dot-' + (i % 6) }),
-                mpEl('span', { class: 'mp-row-name', text: mpModelLabel(a.provider_model_id) }),
-                mpEl('span', { class: 'mp-row-sub', text: mpProviderName(a.provider_model_id) }),
-                mpEl('div', { class: 'mp-row-actions' }, [
-                    mpStepper(weight, (d) => {
-                        const nw = Math.max(0, weight + d);
-                        mpApply(mpAssignBody('update_assignment', a, { weight: nw }), null);
-                    }),
-                    mpEl('span', { class: 'mp-icon-btn mp-icon-btn--danger', title: 'Remove', _on: { click: () => mpRemoveAssignment(a) } }, [mpIcon('x')]),
-                ]),
-            ]);
-        }
-
-        function mpFallbackRow(a, i, fbs) {
-            const body = mpEl('div', { class: 'mp-fb-body' }, [
-                mpEl('div', { class: 'mp-row' }, [
+        // ---- Traffic split (draft weights, batched save) ----
+        function mpBoardSplitSection(w) {
+            const sec = mpEl('div', { class: 'mp-section' });
+            sec.appendChild(mpEl('div', { class: 'mp-eyebrow', text: 'Traffic split' }));
+            sec.appendChild(mpEl('div', {
+                class: 'mp-hint',
+                text: w.full_routing
+                    ? 'Each request is drawn by weight. Adjust the sliders, then save once.'
+                    : 'Config-only workflow: the first model is used; weights are ignored.'
+            }));
+            const primaries = mpAssignments(w.key, mpState.scope, 'primary');
+            const d = mpState.draft;
+            const allocWrap = mpEl('div');
+            const legend = mpEl('div', { class: 'mp-legend' });
+            const pctEls = {};
+            const sumWrap = mpEl('div', { class: 'mp-sum' });
+            const sumVal = mpEl('span', { class: 'mp-sum-value' });
+            const saveBtn = mpBtn('Save', { variant: 'primary', size: 'sm', 'data-testid': 'mp-save-weights' }, async () => {
+                const weights = Object.keys(d.weights).map(id => ({ id: Number(id), weight: d.weights[id] }));
+                const r = await mpApi('set_primary_weights', { workflow_key: w.key, scope: mpState.scope, weights });
+                if (r) {
+                    PL.toast('Weights saved.', 'success');
+                    await mpReloadSnap();
+                    mpState.draft = null;
+                    mpRenderBoard();
+                }
+            });
+            const resetBtn = mpBtn('Reset', { variant: 'outline', size: 'sm' }, () => {
+                d.weights = Object.assign({}, d.baseWeights);
+                mpRenderBoard();
+            });
+            const refresh = () => {
+                mpClear(allocWrap);
+                const entries = primaries.map(a => ({ label: mpModelLabel(a.provider_model_id), weight: d.weights[a.id] || 0 }));
+                if (entries.length) allocWrap.appendChild(mpAllocBar(entries, true));
+                const total = entries.reduce((s, e) => s + Math.max(0, e.weight || 0), 0);
+                primaries.forEach(a => {
+                    const pct = total > 0 ? Math.round((Math.max(0, d.weights[a.id] || 0) / total) * 100) : 0;
+                    if (pctEls[a.id]) pctEls[a.id].textContent = (d.weights[a.id] || 0) + ' → ' + pct + '%';
+                });
+                const sum = Object.keys(d.weights).reduce((s, id) => s + (d.weights[id] || 0), 0);
+                sumVal.textContent = 'Σ ' + sum;
+                if (sum !== 100) sumWrap.setAttribute('data-warn', ''); else sumWrap.removeAttribute('data-warn');
+                saveBtn.disabled = !mpWeightsDirty();
+                resetBtn.disabled = !mpWeightsDirty();
+            };
+            primaries.forEach((a, i) => {
+                const slider = mpEl('pl-slider', {
+                    min: '0', max: '100', step: '1', value: String(d.weights[a.id] || 0),
+                    'aria-label': 'Weight for ' + mpModelLabel(a.provider_model_id),
+                });
+                slider.addEventListener('pl:input', ev => { d.weights[a.id] = Number(ev.detail.value); refresh(); });
+                const pct = mpEl('span', { class: 'mp-row-pct' });
+                pctEls[a.id] = pct;
+                const m = mpModelById(a.provider_model_id);
+                const relBtn = mpBtn('Reliability', { variant: 'ghost', size: 'sm' }, () => {
+                    rel.classList.toggle('mp-hidden');
+                });
+                const rel = mpReliabilityRow(a);
+                rel.classList.add('mp-hidden');
+                const row = mpEl('div', { class: 'mp-row' }, [
+                    mpEl('span', { class: 'mp-dot mp-dot-' + (i % 6) }),
                     mpEl('span', { class: 'mp-row-name', text: mpModelLabel(a.provider_model_id) }),
                     mpEl('span', { class: 'mp-row-sub', text: mpProviderName(a.provider_model_id) }),
+                    m && m.pool_id != null ? mpPoolChip(m.pool_id, 'mini') : null,
+                    a.enabled ? null : mpStatePill('disabled', 'disabled'),
+                    !mpState.statusUnavailable && mpBreakerOpenModel(a.provider_model_id) ? mpStatePill('breaker-open', 'breaker') : null,
+                    slider,
+                    pct,
                     mpEl('div', { class: 'mp-row-actions' }, [
-                        mpEl('span', { class: 'mp-icon-btn', title: 'Move up', _on: { click: () => mpReorderFallback(fbs, i, -1) } }, [mpIcon('chevron-up')]),
-                        mpEl('span', { class: 'mp-icon-btn', title: 'Move down', _on: { click: () => mpReorderFallback(fbs, i, 1) } }, [mpIcon('chevron-down')]),
-                        mpEl('span', { class: 'mp-icon-btn mp-icon-btn--danger', title: 'Remove', _on: { click: () => mpRemoveAssignment(a) } }, [mpIcon('x')]),
+                        relBtn,
+                        mpClickable(mpEl('span', { class: 'mp-icon-btn mp-icon-btn--danger', title: 'Remove', 'aria-label': 'Remove ' + mpModelLabel(a.provider_model_id) }, [mpIcon('x')]),
+                            () => mpRemoveAssignment(a)),
                     ]),
-                ]),
-            ]);
-            const rail = mpEl('div', { class: 'mp-fb-rail' }, [
-                mpEl('span', { class: 'mp-fb-index', text: String(i + 1) }),
-                i < fbs.length - 1 ? mpEl('span', { class: 'mp-fb-line' }) : null,
-            ]);
-            return mpEl('div', { class: 'mp-fb' }, [rail, body]);
+                    rel,
+                ]);
+                legend.appendChild(row);
+            });
+            if (!primaries.length) legend.appendChild(mpEl('div', { class: 'mp-empty', text: 'No primary models. Add one below.' }));
+            sumWrap.appendChild(sumVal);
+            sumWrap.appendChild(mpBtn('Normalize', { variant: 'outline', size: 'sm' }, () => { mpNormalizeDraft(); }));
+            sumWrap.appendChild(saveBtn);
+            sumWrap.appendChild(resetBtn);
+            sec.appendChild(allocWrap);
+            sec.appendChild(legend);
+            if (primaries.length) sec.appendChild(sumWrap);
+            sec.appendChild(mpAddAssignmentPicker(w, 'primary'));
+            refresh();
+            return sec;
         }
-
-        async function mpReorderFallback(fbs, i, dir) {
-            const j = i + dir;
-            if (j < 0 || j >= fbs.length) return;
-            const a = fbs[i], b = fbs[j];
-            await apiCall('/routing', { method: 'POST', body: mpAssignBody('update_assignment', a, { fallback_order: b.fallback_order || 0 }) });
-            await mpApply(mpAssignBody('update_assignment', b, { fallback_order: a.fallback_order || 0 }), null);
+        function mpNormalizeDraft() {
+            const d = mpState.draft;
+            const ids = Object.keys(d.weights);
+            if (!ids.length) return;
+            const sum = ids.reduce((s, id) => s + Math.max(0, d.weights[id] || 0), 0);
+            if (sum <= 0) {
+                const eq = Math.floor(100 / ids.length);
+                ids.forEach((id, i) => { d.weights[id] = eq + (i < 100 - eq * ids.length ? 1 : 0); });
+            } else {
+                const exact = ids.map(id => (Math.max(0, d.weights[id] || 0) * 100) / sum);
+                let acc = 0;
+                ids.forEach((id, i) => { d.weights[id] = Math.floor(exact[i]); acc += d.weights[id]; });
+                const rem = ids.map((id, i) => ({ id, r: exact[i] - Math.floor(exact[i]) })).sort((a, b) => b.r - a.r);
+                for (let i = 0; acc < 100 && i < rem.length; i++, acc++) d.weights[rem[i].id]++;
+            }
+            mpRenderBoard();
         }
-
-        // Build an update/create body from an assignment plus overrides.
-        function mpAssignBody(action, a, over) {
-            const o = over || {};
+        function mpReliabilityRow(a) {
+            const thr = mpEl('pl-input', { type: 'number', min: '1', value: String(a.cb_failure_threshold != null ? a.cb_failure_threshold : 5) });
+            const cool = mpEl('pl-input', { type: 'number', min: '0', step: '500', value: String(a.cb_cooldown_ms != null ? a.cb_cooldown_ms : 30000) });
+            return mpEl('div', { class: 'mp-rel' }, [
+                mpEl('pl-field-group', { label: 'Breaker failure threshold' }, [thr]),
+                mpEl('pl-field-group', { label: 'Breaker cooldown (ms)' }, [cool]),
+                mpBtn('Save reliability', { variant: 'outline', size: 'sm' }, () =>
+                    mpApply('update_assignment', mpAssignFields(a, {
+                        cb_failure_threshold: Number(thr.value) || 5,
+                        cb_cooldown_ms: Number(cool.value) || 30000,
+                    }), 'Reliability settings saved.')),
+            ]);
+        }
+        // Full update/create field set for an assignment, with overrides.
+        function mpAssignFields(a, over) {
             return Object.assign({
-                action, id: a.id, workflow_key: a.workflow_key, scope: a.scope, role: a.role,
+                id: a.id, workflow_key: a.workflow_key, scope: a.scope, role: a.role,
                 provider_model_id: a.provider_model_id, weight: a.weight, fallback_order: a.fallback_order,
                 canary_percent: a.canary_percent, enabled: a.enabled, inference_overrides: a.inference_overrides,
                 cb_failure_threshold: a.cb_failure_threshold, cb_cooldown_ms: a.cb_cooldown_ms,
-            }, o);
+            }, over || {});
         }
         async function mpRemoveAssignment(a) {
-            if (await PL.confirm('Remove ' + mpModelLabel(a.provider_model_id) + ' from this workflow?')) {
-                mpApply({ action: 'delete_assignment', id: a.id }, 'Removed.');
-            }
-        }
-
-        // Editable allocation bar with drag-to-rebalance handles.
-        function mpAllocBarEditable(primaries) {
-            const total = primaries.reduce((s, a) => s + Math.max(0, a.weight || 0), 0) || 1;
-            const bar = mpEl('div', { class: 'mp-alloc mp-alloc--lg' });
-            const segs = [];
-            primaries.forEach((a, i) => {
-                const pct = (Math.max(0, a.weight || 0) / total) * 100;
-                const seg = mpEl('div', { class: 'mp-seg mp-seg-' + (i % 6) });
-                seg.style.flexBasis = pct + '%';
-                seg.style.flexGrow = '0';
-                if (pct >= 12) seg.appendChild(mpEl('span', { text: Math.round(pct) + '%' }));
-                segs.push(seg);
-                bar.appendChild(seg);
-                if (i < primaries.length - 1) bar.appendChild(mpHandle(bar, segs, primaries, i, total));
+            const ok = await PL.confirm({
+                body: 'Remove ' + mpModelLabel(a.provider_model_id) + ' (' + a.role + ') from ' + mpWfLabel(a.workflow_key) + '?',
+                danger: true, okLabel: 'Remove',
             });
-            return bar;
+            if (ok) await mpApply('delete_assignment', { id: a.id }, 'Assignment removed.');
         }
-        function mpHandle(bar, segs, primaries, i, total) {
-            const handle = mpEl('div', { class: 'mp-handle' });
-            handle.addEventListener('pointerdown', (ev) => {
-                ev.preventDefault();
-                handle.classList.add('dragging');
-                handle.setPointerCapture(ev.pointerId);
-                const rect = bar.getBoundingClientRect();
-                const a = primaries[i], b = primaries[i + 1];
-                const w0 = Math.max(0, a.weight || 0), w1 = Math.max(0, b.weight || 0);
-                const pair = w0 + w1;
-                const startX = ev.clientX;
-                let na = w0, nb = w1;
-                const move = (e) => {
-                    const dWeight = ((e.clientX - startX) / rect.width) * total;
-                    na = Math.min(pair - 1, Math.max(1, Math.round(w0 + dWeight)));
-                    nb = pair - na;
-                    segs[i].style.flexBasis = (na / total * 100) + '%';
-                    segs[i + 1].style.flexBasis = (nb / total * 100) + '%';
-                };
-                const up = async (e) => {
-                    handle.releasePointerCapture(ev.pointerId);
-                    handle.classList.remove('dragging');
-                    handle.removeEventListener('pointermove', move);
-                    handle.removeEventListener('pointerup', up);
-                    if (na !== w0) {
-                        await apiCall('/routing', { method: 'POST', body: mpAssignBody('update_assignment', a, { weight: na }) });
-                        await mpApply(mpAssignBody('update_assignment', b, { weight: nb }), null);
-                    }
-                };
-                handle.addEventListener('pointermove', move);
-                handle.addEventListener('pointerup', up);
+        function mpAddAssignmentPicker(w, role) {
+            const eligible = mpEligibleModels(w.kind);
+            const sel = mpEl('pl-select', { class: 'w-narrow', 'aria-label': 'Model to add' },
+                [mpEl('option', { value: '' }, 'Pick a model…')].concat(eligible.map(m =>
+                    mpEl('option', { value: m.id }, mpModelLabel(m.id) + ' (' + mpProviderName(m.id) + ')'))));
+            const add = mpBtn('Add ' + role, {}, async () => {
+                const id = Number(sel.value);
+                if (!id) { PL.toast('Pick a model first.', 'warning'); return; }
+                const fields = { workflow_key: w.key, scope: mpState.scope, role, provider_model_id: id };
+                if (role === 'primary') fields.weight = 0;
+                else fields.fallback_order = mpAssignments(w.key, mpState.scope, 'fallback').length;
+                await mpApply('create_assignment', fields, role === 'primary' ? 'Primary added at weight 0 — adjust and save.' : 'Fallback added.');
             });
-            return handle;
+            const picker = mpEl('div', { class: 'mp-add' }, [sel, add]);
+            if (!eligible.length) picker.appendChild(mpEl('span', { class: 'mp-hint', text: 'No enabled models expose the "' + w.kind + '" capability.' }));
+            return picker;
         }
 
-        // Inline picker to add a primary/fallback assignment.
-        function mpAddPicker(w, role) {
-            const compatible = (mpState.snap.models || []).filter(m => m.enabled);
-            const sel = mpEl('pl-select', { class: 'w-narrow' }, compatible.map(m =>
-                mpEl('option', { value: m.id }, mpModelLabel(m.id) + ' (' + mpProviderName(m.id) + ')')));
-            return mpEl('div', { class: 'mp-add' }, [
-                sel,
-                mpEl('pl-button', { _on: { click: () => {
-                    const id = Number(sel.value);
-                    if (!id) { PL.toast('Pick a model first.', 'error'); return; }
-                    const body = { action: 'create_assignment', workflow_key: w.key, scope: mpState.scope, role,
-                        provider_model_id: id };
-                    if (role === 'primary') body.weight = 50;
-                    else body.fallback_order = mpAssignments(w.key, mpState.scope, 'fallback').length;
-                    mpApply(body, role === 'primary' ? 'Primary added.' : 'Fallback added.');
-                } } }, [mpIcon('plus'), ' Add ' + role]),
-            ]);
-        }
-
-        // ---- Triggers ----
-        function mpTriggerCard(t, w) {
-            const target = mpEl('div', { class: 'mp-trigger-target' });
-            const eng = (mpState.snap.assignments || []).find(a => a.id === t.engage_assignment_id);
-            if (eng) {
-                target.appendChild(mpEl('span', { class: 'mp-dot mp-dot-5' }));
-                target.appendChild(mpEl('span', { text: mpModelLabel(eng.provider_model_id) }));
-                target.appendChild(mpEl('span', { class: 'mp-row-sub', text: mpProviderName(eng.provider_model_id) }));
-            } else { target.appendChild(mpEl('span', { class: 'mp-row-sub', text: 'assignment #' + t.engage_assignment_id })); }
-            let cond;
-            if (t.trigger_type === 'queue_depth') {
-                cond = mpEl('span', { class: 'mp-trigger-cond' }, [
-                    'When queue ', mpEl('span', { class: 'mp-trigger-mono', text: t.queue_name || '?' }),
-                    ' reaches ', mpEl('span', { class: 'mp-trigger-num', text: String(t.high_watermark) }),
-                    ', hold until ', mpEl('span', { class: 'mp-trigger-mono', text: String(t.low_watermark) }),
+        // ---- Fallback chain (draft order, batched save) ----
+        function mpBoardFallbackSection(w) {
+            const sec = mpEl('div', { class: 'mp-section' });
+            sec.appendChild(mpEl('div', { class: 'mp-eyebrow', text: 'Fallback chain' }));
+            sec.appendChild(mpEl('div', { class: 'mp-hint', text: 'Tried in order when every primary is exhausted.' }));
+            const d = mpState.draft;
+            const byId = {};
+            mpAssignments(w.key, mpState.scope, 'fallback').forEach(a => { byId[a.id] = a; });
+            const chain = mpEl('div', { class: 'mp-fallback' });
+            d.fbOrder.forEach((id, i) => {
+                const a = byId[id];
+                if (!a) return;
+                const move = (dir) => {
+                    const j = i + dir;
+                    if (j < 0 || j >= d.fbOrder.length) return;
+                    const tmp = d.fbOrder[i]; d.fbOrder[i] = d.fbOrder[j]; d.fbOrder[j] = tmp;
+                    mpRenderBoard();
+                };
+                const body = mpEl('div', { class: 'mp-fb-body' }, [
+                    mpEl('div', { class: 'mp-row' }, [
+                        mpEl('span', { class: 'mp-row-name', text: mpModelLabel(a.provider_model_id) }),
+                        mpEl('span', { class: 'mp-row-sub', text: mpProviderName(a.provider_model_id) }),
+                        a.enabled ? null : mpStatePill('disabled', 'disabled'),
+                        mpEl('div', { class: 'mp-row-actions' }, [
+                            mpBtn('↑', { variant: 'ghost', size: 'sm', 'aria-label': 'Move up', disabled: i === 0 ? true : null }, () => move(-1)),
+                            mpBtn('↓', { variant: 'ghost', size: 'sm', 'aria-label': 'Move down', disabled: i === d.fbOrder.length - 1 ? true : null }, () => move(1)),
+                            mpClickable(mpEl('span', { class: 'mp-icon-btn mp-icon-btn--danger', title: 'Remove', 'aria-label': 'Remove fallback' }, [mpIcon('x')]),
+                                () => mpRemoveAssignment(a)),
+                        ]),
+                    ]),
                 ]);
-            } else {
-                cond = mpEl('span', { class: 'mp-trigger-cond', text: t.trigger_type + ' · ' + JSON.stringify(t.params || {}) });
-            }
-            return mpEl('div', { class: 'mp-trigger' }, [
-                mpIcon('bolt'), cond, mpIcon('arrow-right'), target,
-                mpEl('div', { class: 'mp-row-actions' }, [
-                    mpEl('span', { class: 'mp-icon-btn mp-icon-btn--danger', title: 'Remove', _on: { click: async () => {
-                        if (await PL.confirm('Delete this trigger?')) mpApply({ action: 'delete_trigger', id: t.id }, 'Trigger deleted.');
-                    } } }, [mpIcon('x')]),
-                ]),
-            ]);
-        }
-
-        function mpTriggerEditor(w) {
-            const overflow = mpAssignments(w.key, mpState.scope, 'overflow');
-            const allModels = (mpState.snap.models || []).filter(m => m.enabled);
-            const typeSel = mpEl('pl-select', { class: 'w-narrow' }, ['queue_depth', 'error_rate', 'time_of_day'].map(x => mpEl('option', { value: x }, x)));
-            const qname = mpEl('pl-input', { value: 'dialog-aifarm', placeholder: 'queue_name' });
-            const high = mpEl('pl-input', { type: 'number', value: 30, placeholder: 'high', class: 'w-narrow' });
-            const low = mpEl('pl-input', { type: 'number', value: 20, placeholder: 'low', class: 'w-narrow' });
-            const modelSel = mpEl('pl-select', { class: 'w-narrow' }, allModels.map(m => mpEl('option', { value: m.id }, mpModelLabel(m.id) + ' (' + mpProviderName(m.id) + ')')));
-            return mpEl('div', { class: 'mp-add' }, [
-                typeSel, qname, high, low,
-                mpEl('span', { class: 'mp-hint', text: '→ engage' }), modelSel,
-                mpEl('pl-button', { variant: 'primary', _on: { click: async () => {
-                    const mid = Number(modelSel.value);
-                    if (!mid) { PL.toast('Pick an overflow model.', 'error'); return; }
-                    // Ensure an overflow assignment exists for this model, then point the trigger at it.
-                    let target = overflow.find(o => o.provider_model_id === mid);
-                    if (!target) {
-                        const created = await apiCall('/routing', { method: 'POST', body: { action: 'create_assignment', workflow_key: w.key, scope: mpState.scope, role: 'overflow', provider_model_id: mid, weight: 100 } });
-                        if (!created || !created.id) return;
-                        target = { id: created.id };
+                const rail = mpEl('div', { class: 'mp-fb-rail' }, [
+                    mpEl('span', { class: 'mp-fb-index', text: String(i + 1) }),
+                    i < d.fbOrder.length - 1 ? mpEl('span', { class: 'mp-fb-line' }) : null,
+                ]);
+                chain.appendChild(mpEl('div', { class: 'mp-fb' }, [rail, body]));
+            });
+            if (!d.fbOrder.length) chain.appendChild(mpEl('div', { class: 'mp-empty', text: 'No fallback models.' }));
+            sec.appendChild(chain);
+            if (d.fbOrder.length) {
+                const save = mpBtn('Save order', { variant: 'primary', size: 'sm' }, async () => {
+                    const r = await mpApi('set_fallback_order', { workflow_key: w.key, scope: mpState.scope, ordered_ids: d.fbOrder });
+                    if (r) {
+                        PL.toast('Fallback order saved.', 'success');
+                        await mpReloadSnap();
+                        mpState.draft = null;
+                        mpRenderBoard();
                     }
-                    const body = { action: 'create_trigger', workflow_key: w.key, trigger_type: typeSel.value, engage_assignment_id: target.id };
-                    if (typeSel.value === 'queue_depth') { body.queue_name = qname.value || 'dialog-aifarm'; body.high_watermark = Number(high.value); body.low_watermark = Number(low.value); }
-                    mpApply(body, 'Trigger added.');
-                } } }, [mpIcon('bolt'), ' Add trigger']),
+                });
+                const reset = mpBtn('Reset', { variant: 'outline', size: 'sm' }, () => {
+                    d.fbOrder = d.baseFbOrder.slice();
+                    mpRenderBoard();
+                });
+                save.disabled = !mpFbDirty();
+                reset.disabled = !mpFbDirty();
+                sec.appendChild(mpEl('div', { class: 'mp-sum' }, [save, reset]));
+            }
+            sec.appendChild(mpAddAssignmentPicker(w, 'fallback'));
+            return sec;
+        }
+
+        // ---- Experiments (canary / shadow) ----
+        function mpBoardExperimentsSection(w) {
+            const sec = mpEl('div', { class: 'mp-section' });
+            sec.appendChild(mpEl('div', { class: 'mp-eyebrow', text: 'Experiments' }));
+            sec.appendChild(mpEl('div', { class: 'mp-hint', text: 'Canary skims a percentage of live traffic; shadow mirrors requests without serving responses.' }));
+            const legend = mpEl('div', { class: 'mp-legend' });
+            mpAssignments(w.key, mpState.scope, 'canary').forEach(a => {
+                const slider = mpEl('pl-slider', {
+                    min: '0', max: '100', step: '1', value: String(a.canary_percent || 0),
+                    label: 'canary %', 'aria-label': 'Canary percent for ' + mpModelLabel(a.provider_model_id),
+                });
+                slider.addEventListener('pl:change', ev =>
+                    mpApply('update_assignment', mpAssignFields(a, { canary_percent: Number(ev.detail.value) }), 'Canary percent saved.'));
+                legend.appendChild(mpEl('div', { class: 'mp-row' }, [
+                    mpStatePill('engaged', 'canary'),
+                    mpEl('span', { class: 'mp-row-name', text: mpModelLabel(a.provider_model_id) }),
+                    mpEl('span', { class: 'mp-row-sub', text: mpProviderName(a.provider_model_id) }),
+                    slider,
+                    mpEl('div', { class: 'mp-row-actions' }, [
+                        mpClickable(mpEl('span', { class: 'mp-icon-btn mp-icon-btn--danger', title: 'Remove', 'aria-label': 'Remove canary' }, [mpIcon('x')]),
+                            () => mpRemoveAssignment(a)),
+                    ]),
+                ]));
+            });
+            mpAssignments(w.key, mpState.scope, 'shadow').forEach(a => {
+                legend.appendChild(mpEl('div', { class: 'mp-row' }, [
+                    mpStatePill('stale', 'shadow'),
+                    mpEl('span', { class: 'mp-row-name', text: mpModelLabel(a.provider_model_id) }),
+                    mpEl('span', { class: 'mp-row-sub', text: mpProviderName(a.provider_model_id) }),
+                    mpEl('div', { class: 'mp-row-actions' }, [
+                        mpClickable(mpEl('span', { class: 'mp-icon-btn mp-icon-btn--danger', title: 'Remove', 'aria-label': 'Remove shadow' }, [mpIcon('x')]),
+                            () => mpRemoveAssignment(a)),
+                    ]),
+                ]));
+            });
+            if (!legend.childNodes.length) legend.appendChild(mpEl('div', { class: 'mp-empty', text: 'No experiments running.' }));
+            sec.appendChild(legend);
+            const roleSel = mpEl('pl-select', { class: 'w-xs', 'aria-label': 'Experiment role' },
+                [mpEl('option', { value: 'canary' }, 'canary'), mpEl('option', { value: 'shadow' }, 'shadow')]);
+            const modelSel = mpEl('pl-select', { class: 'w-narrow', 'aria-label': 'Experiment model' },
+                [mpEl('option', { value: '' }, 'Pick a model…')].concat(mpEligibleModels(w.kind).map(m =>
+                    mpEl('option', { value: m.id }, mpModelLabel(m.id) + ' (' + mpProviderName(m.id) + ')'))));
+            sec.appendChild(mpEl('div', { class: 'mp-add' }, [
+                roleSel, modelSel,
+                mpBtn('Add experiment', {}, async () => {
+                    const id = Number(modelSel.value);
+                    if (!id) { PL.toast('Pick a model first.', 'warning'); return; }
+                    const fields = { workflow_key: w.key, scope: mpState.scope, role: roleSel.value, provider_model_id: id };
+                    if (roleSel.value === 'canary') fields.canary_percent = 5;
+                    await mpApply('create_assignment', fields, roleSel.value + ' added.');
+                }),
+            ]));
+            return sec;
+        }
+
+        // ---- Overflow & triggers ----
+        function mpBoardTriggersSection(w) {
+            const sec = mpEl('div', { class: 'mp-section' });
+            sec.appendChild(mpEl('div', { class: 'mp-eyebrow', text: 'Overflow & triggers' }));
+            sec.appendChild(mpEl('div', { class: 'mp-hint', text: 'Open an overflow branch while a condition holds; release with hysteresis.' }));
+            const trgs = (mpState.snap.triggers || []).filter(t => t.workflow_key === w.key);
+            trgs.forEach(t => sec.appendChild(mpTriggerCard(t)));
+            if (!trgs.length) sec.appendChild(mpEl('div', { class: 'mp-empty', text: 'No triggers.' }));
+            const formWrap = mpEl('div', { class: 'mp-hidden' });
+            formWrap.appendChild(mpTriggerForm(w, formWrap));
+            sec.appendChild(mpEl('div', { class: 'mp-add' }, [
+                mpBtn('Add trigger', { variant: 'outline' }, () => formWrap.classList.toggle('mp-hidden')),
+            ]));
+            sec.appendChild(formWrap);
+            return sec;
+        }
+        function mpTriggerSentence(t) {
+            const asg = (mpState.snap.assignments || []).find(a => a.id === t.engage_assignment_id);
+            const model = asg ? mpModelLabel(asg.provider_model_id) : ('assignment #' + t.engage_assignment_id);
+            const parts = [mpEl('span', { class: 'mp-trigger-cond' }, ['Engage ']), mpEl('span', { class: 'mp-trigger-mono', text: model })];
+            const p = t.params || {};
+            if (t.trigger_type === 'queue_depth') {
+                parts.push(mpEl('span', { class: 'mp-trigger-cond' }, [
+                    ' while queue ', mpEl('span', { class: 'mp-trigger-mono', text: t.queue_name || '?' }),
+                    ' ≥ ', mpEl('span', { class: 'mp-trigger-num', text: String(t.high_watermark) }),
+                    ', release < ', mpEl('span', { class: 'mp-trigger-num', text: String(t.low_watermark) }),
+                ]));
+            } else if (t.trigger_type === 'error_rate') {
+                parts.push(mpEl('span', { class: 'mp-trigger-cond' }, [
+                    ' when ', mpEl('span', { class: 'mp-trigger-mono', text: p.model_id != null ? mpModelLabel(p.model_id) : '?' }),
+                    ' error rate ≥ ', mpEl('span', { class: 'mp-trigger-num', text: String(p.threshold != null ? p.threshold : '?') }),
+                    ' over ', mpEl('span', { class: 'mp-trigger-num', text: String(p.window_s != null ? p.window_s : '?') }), ' s',
+                ]));
+            } else if (t.trigger_type === 'time_of_day') {
+                parts.push(mpEl('span', { class: 'mp-trigger-cond' }, [
+                    ' between ', mpEl('span', { class: 'mp-trigger-num', text: String(p.start != null ? p.start : '?') }),
+                    ' and ', mpEl('span', { class: 'mp-trigger-num', text: String(p.end != null ? p.end : '?') }), ' UTC',
+                ]));
+            } else if (t.trigger_type === 'provider_capacity') {
+                parts.push(mpEl('span', { class: 'mp-trigger-cond' }, [
+                    ' when ', mpEl('span', { class: 'mp-trigger-mono', text: p.model_id != null ? mpModelLabel(p.model_id) : '?' }),
+                    ' reports no capacity (cooldown ',
+                    mpEl('span', { class: 'mp-trigger-num', text: String(p.cooldown_ms != null ? p.cooldown_ms : '?') }), ' ms)',
+                ]));
+            } else {
+                parts.push(mpEl('span', { class: 'mp-trigger-cond', text: ' on ' + t.trigger_type }));
+            }
+            return mpEl('span', {}, parts);
+        }
+        function mpTriggerCard(t) {
+            const engagedPill = mpStatePill('engaged', 'engaged');
+            engagedPill.setAttribute('data-mp-trigger-live', t.id);
+            if (mpState.statusUnavailable || !mpTriggerEngaged(t.id)) engagedPill.classList.add('mp-hidden');
+            return mpEl('div', { class: 'mp-trigger' }, [
+                mpIcon('bolt'),
+                mpTriggerSentence(t),
+                engagedPill,
+                mpEl('div', { class: 'mp-row-actions' }, [
+                    mpToggleControl(t.enabled, 'enabled', enabled =>
+                        mpApply('update_trigger', {
+                            id: t.id, workflow_key: t.workflow_key, trigger_type: t.trigger_type,
+                            engage_assignment_id: t.engage_assignment_id, enabled,
+                            queue_name: t.queue_name, high_watermark: t.high_watermark, low_watermark: t.low_watermark,
+                            params: t.params || {},
+                        }, enabled ? 'Trigger enabled.' : 'Trigger disabled.')),
+                    mpClickable(mpEl('span', { class: 'mp-icon-btn mp-icon-btn--danger', title: 'Delete trigger', 'aria-label': 'Delete trigger' }, [mpIcon('trash')]),
+                        async () => {
+                            const ok = await PL.confirm({ body: 'Delete this trigger? Its overflow assignment stays.', danger: true, okLabel: 'Delete' });
+                            if (ok) await mpApply('delete_trigger', { id: t.id }, 'Trigger deleted.');
+                        }),
+                ]),
             ]);
         }
+        function mpTriggerForm(w, host) {
+            const form = mpEl('div', { class: 'mp-trigger-form' });
+            const typeSel = mpEl('pl-select', {}, ['queue_depth', 'error_rate', 'time_of_day', 'provider_capacity'].map(x =>
+                mpEl('option', { value: x }, x)));
+            const modelSel = mpEl('pl-select', {},
+                [mpEl('option', { value: '' }, 'Pick a model…')].concat(mpEligibleModels(w.kind).map(m =>
+                    mpEl('option', { value: m.id }, mpModelLabel(m.id) + ' (' + mpProviderName(m.id) + ')'))));
+            const typeGroup = mpEl('pl-field-group', { label: 'Trigger type' }, [typeSel]);
+            const modelGroup = mpEl('pl-field-group', { label: 'Engage model', required: true }, [modelSel]);
+            const dyn = mpEl('div', { class: 'mp-trigger-form' });
+            const fields = {};
+            const buildDyn = () => {
+                mpClear(dyn);
+                for (const k in fields) delete fields[k];
+                const add = (key, label, control, help) => {
+                    const attrs = { label };
+                    if (help) attrs.help = help;
+                    const group = mpEl('pl-field-group', attrs, [control]);
+                    fields[key] = { control, group };
+                    dyn.appendChild(group);
+                };
+                const t = typeSel.value;
+                // The watched target: the model whose error rate / capacity the
+                // poller inspects — normally the workflow's primary, distinct
+                // from the model the trigger engages.
+                const watchSelect = () => {
+                    const primaries = mpAssignments(w.key, mpState.scope, 'primary');
+                    const seen = new Set();
+                    const options = [];
+                    primaries.concat(mpAssignments(w.key, mpState.scope, 'fallback')).forEach(a => {
+                        if (seen.has(a.provider_model_id)) return;
+                        seen.add(a.provider_model_id);
+                        options.push(mpEl('option', { value: a.provider_model_id },
+                            mpModelLabel(a.provider_model_id) + ' (' + mpProviderName(a.provider_model_id) + ')'));
+                    });
+                    return mpEl('pl-select', {}, options);
+                };
+                if (t === 'queue_depth') {
+                    add('queue_name', 'Queue name', mpEl('pl-input', { value: 'dialog-aifarm' }));
+                    add('high', 'Engage at depth ≥', mpEl('pl-input', { type: 'number', value: '30' }));
+                    add('low', 'Release below', mpEl('pl-input', { type: 'number', value: '20' }), 'Must be lower than the engage watermark.');
+                } else if (t === 'error_rate') {
+                    add('watch', 'Watch model', watchSelect(), 'Whose error rate engages the trigger.');
+                    add('threshold', 'Error-rate threshold (0–1)', mpEl('pl-input', { type: 'number', step: '0.05', min: '0', max: '1', value: '0.3' }));
+                    add('window_s', 'Window (seconds)', mpEl('pl-input', { type: 'number', min: '1', value: '60' }));
+                } else if (t === 'time_of_day') {
+                    add('start', 'Start (HH:MM, UTC)', mpEl('pl-input', { value: '00:00' }));
+                    add('end', 'End (HH:MM, UTC)', mpEl('pl-input', { value: '06:00' }), 'A window that wraps past midnight is allowed.');
+                } else if (t === 'provider_capacity') {
+                    add('watch', 'Watch model', watchSelect(), 'Whose capacity exhaustion engages the trigger.');
+                    add('cooldown_ms', 'Capacity cooldown (ms)', mpEl('pl-input', { type: 'number', min: '0', step: '500', value: '30000' }));
+                }
+            };
+            typeSel.addEventListener('pl:change', buildDyn);
+            queueMicrotask(buildDyn);
+            const create = mpBtn('Create trigger', { variant: 'primary' }, async () => {
+                const mid = Number(modelSel.value);
+                modelGroup.setError(mid ? '' : 'Pick the model to engage.');
+                if (!mid) return;
+                const t = typeSel.value;
+                const body = { workflow_key: w.key, scope: mpState.scope, provider_model_id: mid, trigger_type: t };
+                if (t === 'queue_depth') {
+                    const q = fields.queue_name.control.value.trim();
+                    const high = mpNumOrNull(fields.high.control.value);
+                    const low = mpNumOrNull(fields.low.control.value);
+                    fields.queue_name.group.setError(q ? '' : 'Queue name is required.');
+                    const rangeBad = high == null || low == null || !(high > low);
+                    fields.high.group.setError(rangeBad ? 'Engage watermark must be greater than release.' : '');
+                    if (!q || rangeBad) return;
+                    body.queue_name = q;
+                    body.high_watermark = high;
+                    body.low_watermark = low;
+                } else if (t === 'error_rate') {
+                    const watched = mpModelById(Number(fields.watch.control.value));
+                    const threshold = mpNumOrNull(fields.threshold.control.value);
+                    const windowS = mpNumOrNull(fields.window_s.control.value);
+                    fields.watch.group.setError(watched ? '' : 'Pick the model to watch.');
+                    fields.threshold.group.setError(threshold == null ? 'Threshold is required.' : '');
+                    fields.window_s.group.setError(windowS == null ? 'Window is required.' : '');
+                    if (!watched || threshold == null || windowS == null) return;
+                    body.params = {
+                        provider_id: watched.provider_id, model_id: watched.id,
+                        threshold, window_s: windowS,
+                    };
+                } else if (t === 'time_of_day') {
+                    // The runtime parses "HH:MM" UTC strings (model_routing.rs
+                    // trigger_condition); minutes-of-day numbers are rejected.
+                    const hhmm = /^([01]?\d|2[0-3]):[0-5]\d$/;
+                    const start = fields.start.control.value.trim();
+                    const end = fields.end.control.value.trim();
+                    fields.start.group.setError(hhmm.test(start) ? '' : 'Use HH:MM (UTC).');
+                    fields.end.group.setError(hhmm.test(end) ? '' : 'Use HH:MM (UTC).');
+                    if (!hhmm.test(start) || !hhmm.test(end)) return;
+                    body.params = { start, end };
+                } else if (t === 'provider_capacity') {
+                    const watched = mpModelById(Number(fields.watch.control.value));
+                    const cooldown = mpNumOrNull(fields.cooldown_ms.control.value);
+                    fields.watch.group.setError(watched ? '' : 'Pick the model to watch.');
+                    fields.cooldown_ms.group.setError(cooldown == null ? 'Cooldown is required.' : '');
+                    if (!watched || cooldown == null) return;
+                    body.params = {
+                        provider_id: watched.provider_id, model_id: watched.id,
+                        cooldown_ms: cooldown,
+                    };
+                }
+                const r = await mpApply('create_trigger_with_assignment', body, 'Trigger and overflow assignment created.');
+                if (r && host) host.classList.add('mp-hidden');
+            });
+            form.appendChild(typeGroup);
+            form.appendChild(modelGroup);
+            form.appendChild(dyn);
+            form.appendChild(mpEl('div', { class: 'mp-trigger-form-actions' }, [create]));
+            return form;
+        }
 
-        // ---- LIBRARY: providers + models ----
-        function mpRenderLibrary() {
-            const root = document.getElementById('mp-library');
+        // ---- Retry budget ----
+        function mpBoardBudgetSection(w) {
+            const sec = mpEl('div', { class: 'mp-section' });
+            sec.appendChild(mpEl('div', { class: 'mp-eyebrow', text: 'Retry budget' }));
+            const hops = mpEl('pl-input', { type: 'number', min: '1', value: String(w.retry_max_hops) });
+            const wall = mpEl('pl-input', { type: 'number', min: '1000', step: '1000', value: String(w.retry_wall_ms) });
+            sec.appendChild(mpEl('div', { class: 'mp-trigger-form' }, [
+                mpEl('pl-field-group', { label: 'Max hops' }, [hops]),
+                mpEl('pl-field-group', { label: 'Wall clock (ms)' }, [wall]),
+                mpEl('div', { class: 'mp-trigger-form-actions' }, [
+                    mpBtn('Save budget', { variant: 'outline', size: 'sm' }, () =>
+                        mpApply('update_workflow', {
+                            key: w.key, full_routing: w.full_routing, enabled: w.enabled,
+                            retry_max_hops: Number(hops.value) || 3, retry_wall_ms: Number(wall.value) || 60000,
+                        }, 'Retry budget saved.')),
+                ]),
+            ]));
+            return sec;
+        }
+
+        // ---- Mini cascade ----
+        function mpBoardCascadeSection(w) {
+            const sec = mpEl('div', { class: 'mp-section' });
+            sec.appendChild(mpEl('div', { class: 'mp-eyebrow', text: 'Cascade' }));
+            sec.appendChild(mpEl('div', { class: 'mp-hint', text: 'This workflow’s request path: weighted primaries, ordered fallbacks, dashed overflow.' }));
+            const flow = mpEl('pl-flow', { 'data-mp-cascade': '' });
+            flow.data = mpFlowData({ workflows: [w.key], scope: mpState.scope, activeOnly: false });
+            flow.addEventListener('pl:node-click', e => mpFlowNav(e.detail));
+            sec.appendChild(flow);
+            return sec;
+        }
+
+        // ============ CATALOG ============
+        function mpRenderCatalog() {
+            const root = document.getElementById('mp-catalog');
             mpClear(root);
+            const wrap = mpEl('div', { class: 'mp-catalog' });
+            const main = mpEl('div');
 
-            root.appendChild(mpEl('div', { class: 'mp-eyebrow', text: 'Providers' }));
-            root.appendChild(mpEl('div', { class: 'mp-hint', text: 'Credentialed inference endpoints. Keys are stored by reference or encrypted; never shown.' }));
-            const plist = mpEl('div', { class: 'mp-legend' });
-            (mpState.snap.providers || []).forEach(p => plist.appendChild(mpEl('div', { class: 'mp-row' }, [
-                mpEl('span', { class: 'mp-row-name', text: p.name }),
-                mpEl('span', { class: 'mp-tag mp-tag--accent', text: p.kind }),
-                mpEl('span', { class: 'mp-row-sub', text: p.endpoint || (p.discovery_service_name || '') }),
-                mpEl('span', { class: 'mp-tag', text: 'key: ' + p.key_state }),
-                mpEl('div', { class: 'mp-row-actions' }, [
-                    mpToggleControl(p.enabled, 'enabled', enabled => mpApply({ action: 'set_provider_enabled', id: p.id, enabled }, enabled ? 'Provider enabled.' : 'Provider disabled.')),
-                    mpEl('pl-button', { size: 'sm', variant: 'outline', _on: { click: () => mpEditConfig('patch_provider_config', p.id, p.config || {}) } }, [mpIcon('braces'), ' Config']),
-                    mpEl('span', { class: 'mp-icon-btn mp-icon-btn--danger', title: 'Delete', _on: { click: async () => {
-                        if (await PL.confirm('Delete provider ' + p.name + ' and its models?')) mpApply({ action: 'delete_provider', id: p.id }, 'Provider deleted.');
-                    } } }, [mpIcon('trash')]),
+            // Providers
+            const phead = mpEl('div', { class: 'mp-events-filters' }, [
+                mpEl('div', { class: 'mp-eyebrow', text: 'Providers' }),
+                mpBtn('+ Provider', { variant: 'primary', size: 'sm' }, () => mpOpenDrawer({ type: 'provider', id: null })),
+            ]);
+            main.appendChild(phead);
+            const ptable = mpEl('pl-table', { dense: true, 'row-clickable': true });
+            ptable.columns = [
+                {
+                    key: 'name', label: 'Provider', render: p =>
+                        mpEl('span', { class: 'cell-strong', 'data-testid': 'mp-provider-row-' + p.id, text: p.name })
+                },
+                {
+                    key: 'protocol', label: 'Protocol', render: p => mpEl('span', {}, [
+                        mpEl('span', { class: 'mp-tag', text: p.protocol || '—' }),
+                        p.runtime_hint ? mpEl('span', { class: 'mp-tag mp-tag--muted', text: p.runtime_hint }) : null,
+                    ].filter(Boolean))
+                },
+                {
+                    key: 'endpoint', label: 'Endpoint', render: p =>
+                        mpEl('span', { class: 'mp-endpoint', title: p.endpoint || '', text: p.endpoint || (p.discovery_service_name ? 'discovery: ' + p.discovery_service_name : '—') })
+                },
+                {
+                    key: 'key_state', label: 'Key', render: p =>
+                        p.key_state === 'unset' ? mpStatePill('no-key', 'no key') : mpStatePill('key-ok', p.key_state)
+                },
+                {
+                    key: 'models', label: 'Models', num: true, render: p =>
+                        String((mpState.snap.models || []).filter(m => m.provider_id === p.id).length)
+                },
+                {
+                    key: 'enabled', label: 'Enabled', render: p =>
+                        mpToggleControl(p.enabled, '', enabled =>
+                            mpApply('set_provider_enabled', { id: p.id, enabled }, enabled ? 'Provider enabled.' : 'Provider disabled.'))
+                },
+            ];
+            ptable.emptyTitle = 'No providers yet';
+            ptable.emptyDesc = 'Add a provider to start routing models through it.';
+            ptable.rows = mpState.snap.providers || [];
+            ptable.addEventListener('pl:row-click', e => mpOpenDrawer({ type: 'provider', id: e.detail.row.id }));
+            main.appendChild(ptable);
+
+            // Models
+            main.appendChild(mpEl('div', { class: 'mp-events-filters' }, [
+                mpEl('div', { class: 'mp-eyebrow', text: 'Models' }),
+                mpBtn('+ Model', { variant: 'primary', size: 'sm', 'data-testid': 'mp-add-model' }, () =>
+                    mpOpenDrawer({ type: 'model', id: null, providerId: mpState.catalog.drawer && mpState.catalog.drawer.type === 'provider' ? mpState.catalog.drawer.id : null })),
+            ]));
+            const search = mpEl('pl-input', { class: 'logs-search', placeholder: 'Search models…', value: mpState.catalog.search, 'aria-label': 'Search models' });
+            const capChips = mpEl('div', { class: 'mp-caps' }, MP_CAPS.map(cap => {
+                const chip = mpEl('span', Object.assign({ class: 'mp-cap' }, mpState.catalog.caps.includes(cap) ? { 'data-on': true } : {}), cap);
+                return mpClickable(chip, () => {
+                    const i = mpState.catalog.caps.indexOf(cap);
+                    if (i >= 0) { mpState.catalog.caps.splice(i, 1); chip.removeAttribute('data-on'); }
+                    else { mpState.catalog.caps.push(cap); chip.setAttribute('data-on', ''); }
+                    mtable.rows = mpModelRows();
+                });
+            }));
+            main.appendChild(mpEl('div', { class: 'mp-events-filters' }, [search, capChips]));
+            const mtable = mpEl('pl-table', { dense: true, 'row-clickable': true });
+            mtable.columns = [
+                {
+                    key: 'model_name', label: 'Model', render: m => {
+                        const wrap2 = mpEl('span', {}, [mpEl('span', { class: 'cell-strong', text: m.model_name })]);
+                        if (m.display_name) wrap2.appendChild(mpEl('span', { class: 'mp-row-sub', text: ' ' + m.display_name }));
+                        return wrap2;
+                    }
+                },
+                { key: 'provider', label: 'Provider', render: m => (mpProviderById(m.provider_id) || {}).name || ('#' + m.provider_id) },
+                {
+                    key: 'capabilities', label: 'Capabilities', render: m =>
+                        mpEl('span', { class: 'mp-caps' }, (m.capabilities || []).map(c =>
+                            mpEl('span', { class: 'mp-cap', 'data-static': true, 'data-on': true, text: c })))
+                },
+                { key: 'pool', label: 'Pool', render: m => m.pool_id != null ? mpPoolChip(m.pool_id, 'mini') : mpEl('span', { class: 'mp-row-sub', text: '—' }) },
+                { key: 'used', label: 'Used by', num: true, render: m => String(mpModelUsedBy(m.id)) },
+                {
+                    key: 'enabled', label: 'Enabled', render: m =>
+                        mpToggleControl(m.enabled, '', enabled =>
+                            mpApply('set_model_enabled', { id: m.id, enabled }, enabled ? 'Model enabled.' : 'Model disabled.'))
+                },
+            ];
+            mtable.emptyTitle = 'No models';
+            mtable.emptyDesc = 'Import models from a provider or add one manually.';
+            mtable.rows = mpModelRows();
+            mtable.addEventListener('pl:row-click', e => mpOpenDrawer({ type: 'model', id: e.detail.row.id }));
+            search.addEventListener('pl:input', () => { mpState.catalog.search = search.value; mtable.rows = mpModelRows(); });
+            main.appendChild(mtable);
+
+            wrap.appendChild(main);
+            if (mpState.catalog.drawer) {
+                wrap.setAttribute('data-drawer', '');
+                wrap.appendChild(mpCatalogDrawer());
+            }
+            root.appendChild(wrap);
+        }
+        function mpModelRows() {
+            const q = (mpState.catalog.search || '').trim().toLowerCase();
+            const caps = mpState.catalog.caps;
+            return (mpState.snap.models || []).filter(m => {
+                if (q && !(m.model_name || '').toLowerCase().includes(q) && !(m.display_name || '').toLowerCase().includes(q)) return false;
+                if (caps.length && !caps.every(c => (m.capabilities || []).includes(c))) return false;
+                return true;
+            });
+        }
+        function mpOpenDrawer(drawer) {
+            mpState.catalog.drawer = drawer;
+            if (mpState.view !== 'catalog') mpState.view = 'catalog';
+            mpRenderActiveView();
+        }
+        function mpCloseDrawer() {
+            mpState.catalog.drawer = null;
+            mpRenderCatalog();
+        }
+        function mpCatalogDrawer() {
+            const d = mpState.catalog.drawer;
+            const drawer = mpEl('pl-drawer', { open: true });
+            drawer.addEventListener('pl:close', mpCloseDrawer);
+            let title;
+            let body;
+            if (d.type === 'provider') {
+                const p = d.id != null ? mpProviderById(d.id) : null;
+                title = p ? p.name : 'New provider';
+                body = mpProviderForm(p);
+            } else {
+                const m = d.id != null ? mpModelById(d.id) : null;
+                title = m ? (m.display_name || m.model_name) : 'New model';
+                body = mpModelForm(m, d.providerId);
+            }
+            drawer.appendChild(mpEl('div', { class: 'pl-drawer-head' }, [
+                mpEl('span', { class: 'cell-strong', text: title }),
+                mpBtn('✕', { variant: 'ghost', size: 'sm', 'aria-label': 'Close' }, mpCloseDrawer),
+            ]));
+            drawer.appendChild(mpEl('div', { class: 'pl-drawer-body' }, [body]));
+            return drawer;
+        }
+        function mpProtocolOptions(current) {
+            const seen = [];
+            mpDescriptors().forEach(desc => { if (!seen.includes(desc.protocol)) seen.push(desc.protocol); });
+            return [mpEl('option', Object.assign({ value: '' }, !current ? { selected: true } : {}), '— none —')]
+                .concat(seen.map(proto => mpEl('option', Object.assign({ value: proto }, current === proto ? { selected: true } : {}), proto)));
+        }
+        function mpRuntimeOptions(current) {
+            const hints = [];
+            mpDescriptors().forEach(desc => {
+                if (desc.protocol === 'openai_compat' && desc.runtime_hint && !hints.includes(desc.runtime_hint)) hints.push(desc.runtime_hint);
+            });
+            return [mpEl('option', Object.assign({ value: '' }, !current ? { selected: true } : {}), '— generic —')]
+                .concat(hints.map(h => mpEl('option', Object.assign({ value: h }, current === h ? { selected: true } : {}), h)));
+        }
+        // Typed config fields from a param descriptor list; returns {node, collect(cfg)}.
+        function mpTypedConfigFields(fieldDefs, config) {
+            const cfg = config || {};
+            const node = mpEl('div');
+            const collectors = [];
+            (fieldDefs || []).forEach(f => {
+                if (f.kind === 'bool') {
+                    const toggle = mpEl('pl-toggle', Object.assign({ label: f.label || f.key }, cfg[f.key] ? { checked: true } : {}));
+                    let touched = cfg[f.key] != null;
+                    toggle.addEventListener('pl:change', () => { touched = true; });
+                    node.appendChild(mpEl('pl-field-group', {}, [toggle]));
+                    collectors.push(out => { if (touched || toggle.checked) out[f.key] = toggle.checked; });
+                    return;
+                }
+                if (f.kind === 'json') {
+                    const area = mpTextareaWithValue({ rows: '3' }, cfg[f.key] != null ? JSON.stringify(cfg[f.key], null, 2) : '');
+                    const group = mpEl('pl-field-group', { label: f.label || f.key, help: 'JSON object' }, [area]);
+                    node.appendChild(group);
+                    collectors.push(out => {
+                        const raw = (area.value || '').trim();
+                        if (!raw) { delete out[f.key]; group.setError(''); return; }
+                        try {
+                            const parsed = JSON.parse(raw);
+                            out[f.key] = parsed;
+                            group.setError('');
+                        } catch (_) { group.setError('Invalid JSON.'); throw new Error('invalid-json'); }
+                    });
+                    return;
+                }
+                const attrs = { type: 'number' };
+                if (f.kind === 'float') attrs.step = 'any';
+                if (f.min != null) attrs.min = String(f.min);
+                if (f.max != null) attrs.max = String(f.max);
+                if (cfg[f.key] != null) attrs.value = String(cfg[f.key]);
+                const input = mpEl('pl-input', attrs);
+                node.appendChild(mpEl('pl-field-group', { label: f.label || f.key }, [input]));
+                collectors.push(out => {
+                    const v = mpNumOrNull(input.value);
+                    if (v == null) delete out[f.key]; else out[f.key] = v;
+                });
+            });
+            return {
+                node,
+                collect(out) { collectors.forEach(fn => fn(out)); },
+                keys: (fieldDefs || []).map(f => f.key),
+            };
+        }
+        function mpAdvancedJsonField(config, excludeKeys) {
+            const rest = {};
+            for (const k in (config || {})) { if (!excludeKeys.includes(k)) rest[k] = config[k]; }
+            const area = mpTextareaWithValue({ rows: '5' }, JSON.stringify(rest, null, 2));
+            const group = mpEl('pl-field-group', { label: 'Advanced config (JSON)', help: 'Extra config keys merged into the typed fields above.' }, [area]);
+            area.addEventListener('pl:input', () => {
+                try { JSON.parse(area.value || '{}'); group.setError(''); }
+                catch (_) { group.setError('Invalid JSON.'); }
+            });
+            return {
+                node: group,
+                parse() {
+                    const raw = (area.value || '{}').trim() || '{}';
+                    let parsed;
+                    try { parsed = JSON.parse(raw); }
+                    catch (_) { group.setError('Invalid JSON.'); throw new Error('invalid-json'); }
+                    if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') {
+                        group.setError('Must be a JSON object.');
+                        throw new Error('invalid-json');
+                    }
+                    group.setError('');
+                    return parsed;
+                },
+            };
+        }
+        function mpProviderForm(p) {
+            const form = mpEl('div', { class: 'mp-drawer-form' });
+            const name = mpEl('pl-input', { value: p ? p.name : '', placeholder: 'provider name' });
+            const kind = mpEl('pl-select', {}, mpKinds.map(x =>
+                mpEl('option', Object.assign({ value: x }, (p ? p.kind : 'chat') === x ? { selected: true } : {}), x)));
+            const protoSel = mpEl('pl-select', {}, mpProtocolOptions(p ? p.protocol : null));
+            const runtimeSel = mpEl('pl-select', {}, mpRuntimeOptions(p ? p.runtime_hint : null));
+            const runtimeGroup = mpEl('pl-field-group', { label: 'Runtime hint', help: 'Serving engine behind the endpoint; unlocks engine-specific model params.' }, [runtimeSel]);
+            const endpoint = mpEl('pl-input', { value: p && p.endpoint ? p.endpoint : '', placeholder: 'https://…' });
+            const discSvc = mpEl('pl-input', { value: p && p.discovery_service_name ? p.discovery_service_name : '' });
+            const discEp = mpEl('pl-input', { value: p && p.discovery_endpoint_name ? p.discovery_endpoint_name : '' });
+            const keyRef = mpEl('pl-input', { value: p && p.api_key_ref ? p.api_key_ref : '', placeholder: 'ENV_VAR_NAME' });
+            const keyNew = mpEl('pl-input', { type: 'password', placeholder: p && p.key_state === 'encrypted' ? 'stored encrypted — enter to replace' : 'plaintext key (sealed server-side)' });
+            const enabledToggle = mpEl('pl-toggle', Object.assign({ label: 'enabled' }, (!p || p.enabled) ? { checked: true } : {}));
+            const nameGroup = mpEl('pl-field-group', { label: 'Name', required: true }, [name]);
+            form.appendChild(nameGroup);
+            form.appendChild(mpEl('pl-field-group', { label: 'Kind' }, [kind]));
+            form.appendChild(mpEl('pl-field-group', { label: 'Protocol' }, [protoSel]));
+            form.appendChild(runtimeGroup);
+            form.appendChild(mpEl('pl-field-group', { label: 'Endpoint' }, [endpoint]));
+            form.appendChild(mpEl('pl-field-group', { label: 'Discovery service', help: 'Resolved via Discovery when set; overrides the endpoint.' }, [discSvc]));
+            form.appendChild(mpEl('pl-field-group', { label: 'Discovery endpoint name' }, [discEp]));
+            form.appendChild(mpEl('pl-field-group', { label: 'API key ref', help: 'Environment variable holding the key.' }, [keyRef]));
+            form.appendChild(mpEl('pl-field-group', { label: 'New API key', help: 'Stored encrypted; replaces the key ref when set.' }, [keyNew]));
+            form.appendChild(mpEl('pl-field-group', {}, [enabledToggle]));
+            const typedWrap = mpEl('div');
+            let typed = { node: mpEl('div'), collect() { }, keys: [] };
+            let advanced = mpAdvancedJsonField(p ? p.config : {}, []);
+            const advWrap = mpEl('div');
+            const rebuildTyped = () => {
+                mpClear(typedWrap);
+                mpClear(advWrap);
+                const desc = mpDescriptorFor(protoSel.value, protoSel.value === 'openai_compat' ? (runtimeSel.value || null) : null);
+                typed = mpTypedConfigFields(desc ? desc.provider_fields : [], p ? p.config : {});
+                typedWrap.appendChild(typed.node);
+                advanced = mpAdvancedJsonField(p ? p.config : {}, typed.keys);
+                advWrap.appendChild(advanced.node);
+                runtimeGroup.classList.toggle('mp-hidden', protoSel.value !== 'openai_compat');
+            };
+            protoSel.addEventListener('pl:change', rebuildTyped);
+            runtimeSel.addEventListener('pl:change', rebuildTyped);
+            queueMicrotask(rebuildTyped);
+            form.appendChild(typedWrap);
+            form.appendChild(advWrap);
+
+            const desc = () => mpDescriptorFor(protoSel.value, protoSel.value === 'openai_compat' ? (runtimeSel.value || null) : null);
+            const canList = () => { const dd = desc(); return !!(dd && dd.supports_model_listing); };
+            const fetchBtn = mpBtn('Fetch models', { 'data-testid': 'mp-fetch-models', title: '' }, async () => {
+                if (!p) { PL.toast('Save the provider first.', 'warning'); return; }
+                await mpFetchProviderModels(p, endpoint.value.trim() || null);
+            });
+            const syncFetchBtn = () => {
+                const ok = canList() && !!p;
+                fetchBtn.disabled = !ok;
+                fetchBtn.setAttribute('title', ok ? 'List models from the provider endpoint'
+                    : (!p ? 'Save the provider first' : 'This protocol has no model listing endpoint — add models manually'));
+            };
+            protoSel.addEventListener('pl:change', syncFetchBtn);
+            queueMicrotask(syncFetchBtn);
+            const addModelBtn = mpBtn('Add model', {}, () => {
+                if (!p) { PL.toast('Save the provider first.', 'warning'); return; }
+                mpOpenDrawer({ type: 'model', id: null, providerId: p.id });
+            });
+            if (!p) addModelBtn.disabled = true;
+            const saveBtn = mpBtn(p ? 'Save provider' : 'Create provider', { variant: 'primary' }, async () => {
+                const nm = name.value.trim();
+                nameGroup.setError(nm ? '' : 'Name is required.');
+                if (!nm) return;
+                let config;
+                try {
+                    config = advanced.parse();
+                    typed.collect(config);
+                } catch (_) { return; }
+                const body = {
+                    name: nm, kind: kind.value, enabled: enabledToggle.checked, config,
+                    protocol: protoSel.value || null,
+                    runtime_hint: protoSel.value === 'openai_compat' && runtimeSel.value ? runtimeSel.value : null,
+                    endpoint: endpoint.value.trim() || null,
+                    discovery_service_name: discSvc.value.trim() || null,
+                    discovery_endpoint_name: discEp.value.trim() || null,
+                    api_key_ref: keyRef.value.trim() || null,
+                };
+                if (keyNew.value) body.api_key = keyNew.value;
+                if (p && p.key_state === 'encrypted' && !keyNew.value && !body.api_key_ref) {
+                    const ok = await PL.confirm({
+                        body: 'This provider has an encrypted key stored. Saving without entering a key or a key ref will clear it. Continue?',
+                        danger: true, okLabel: 'Save anyway',
+                    });
+                    if (!ok) return;
+                }
+                if (p) body.id = p.id;
+                const r = await mpApply(p ? 'update_provider' : 'create_provider', body, p ? 'Provider saved.' : 'Provider created.');
+                if (r && !p && r.id != null) mpOpenDrawer({ type: 'provider', id: r.id });
+            });
+            const actions = mpEl('div', { class: 'mp-form-actions' }, [
+                saveBtn,
+                mpEl('div', { class: 'mp-form-actions-end' }, [fetchBtn, addModelBtn]),
+            ]);
+            form.appendChild(actions);
+            if (p) {
+                const models = (mpState.snap.models || []).filter(m => m.provider_id === p.id);
+                const usedBy = models.reduce((s, m) => s + mpModelUsedBy(m.id), 0);
+                form.appendChild(mpEl('div', { class: 'mp-danger-zone' }, [
+                    mpEl('div', {
+                        class: 'mp-danger-copy',
+                        text: 'Deleting this provider removes ' + models.length + ' model' + (models.length === 1 ? '' : 's')
+                            + ' used by ' + usedBy + ' assignment' + (usedBy === 1 ? '' : 's') + '.'
+                    }),
+                    mpBtn('Delete provider', { variant: 'danger', size: 'sm' }, async () => {
+                        const ok = await PL.confirm({
+                            body: 'Delete provider ' + p.name + '? Removes ' + models.length + ' models used by ' + usedBy + ' assignments.',
+                            danger: true, okLabel: 'Delete',
+                        });
+                        if (!ok) return;
+                        mpState.catalog.drawer = null;
+                        await mpApply('delete_provider', { id: p.id }, 'Provider deleted.');
+                    }),
+                ]));
+            }
+            return form;
+        }
+        async function mpFetchProviderModels(p, baseUrl) {
+            const fields = { id: p.id };
+            if (baseUrl && baseUrl !== p.endpoint) fields.base_url = baseUrl;
+            const r = await mpApi('fetch_provider_models', fields);
+            if (!r) return; // apiCall already surfaced the error message (e.g. protocol has no listing)
+            const diffData = r.diff || { new: [], existing: [], gone: [] };
+            const diff = mpEl('pl-diff-list');
+            diff.data = {
+                groups: [
+                    { key: 'new', title: 'New at provider', items: (diffData.new || []).map(n => ({ name: n })) },
+                    { key: 'imported', title: 'Already imported', items: (diffData.existing || []).map(x => ({ name: x.model_name })) },
+                    { key: 'gone', title: 'Gone from provider', items: (diffData.gone || []).map(x => ({ name: x.model_name })) },
+                ],
+            };
+            let selected = (diffData.new || []).slice();
+            diff.addEventListener('pl:diff-change', e => { selected = e.detail.selected; });
+            const capState = ['chat'];
+            const capChips = mpEl('div', { class: 'mp-caps' }, MP_CAPS.map(cap => {
+                const chip = mpEl('span', Object.assign({ class: 'mp-cap' }, capState.includes(cap) ? { 'data-on': true } : {}), cap);
+                return mpClickable(chip, () => {
+                    const i = capState.indexOf(cap);
+                    if (i >= 0) { capState.splice(i, 1); chip.removeAttribute('data-on'); }
+                    else { capState.push(cap); chip.setAttribute('data-on', ''); }
+                });
+            }));
+            const poolSel = mpEl('pl-select', {}, [mpEl('option', { value: '' }, '— no pool —')]
+                .concat((mpState.snap.pools || []).map(pl2 => mpEl('option', { value: pl2.id }, pl2.name))));
+            const body = mpEl('div', { class: 'mp-diff-shell' }, [
+                mpEl('div', { class: 'mp-hint', text: 'Listed from ' + (r.base_url || p.endpoint || '') }),
+                diff,
+                mpEl('div', { class: 'mp-diff-defaults' }, [
+                    mpEl('div', { class: 'mp-eyebrow', text: 'Defaults for imported models' }),
+                    capChips,
+                    mpEl('pl-field-group', { label: 'Pool' }, [poolSel]),
                 ]),
-            ])));
-            if (!(mpState.snap.providers || []).length) plist.appendChild(mpEl('div', { class: 'mp-empty', text: 'No providers.' }));
-            root.appendChild(plist);
-            root.appendChild(mpProviderForm());
+            ]);
+            const ok = await PL.confirm({ title: 'Import models from ' + p.name, body, okLabel: 'Import' });
+            if (!ok) return;
+            if (!selected.length) { PL.toast('No new models selected.', 'warning'); return; }
+            const defaults = { capabilities: capState.slice() };
+            if (poolSel.value) defaults.pool_id = Number(poolSel.value);
+            const res = await mpApply('import_models', { provider_id: p.id, names: selected, defaults },
+                'Imported ' + selected.length + ' model' + (selected.length === 1 ? '' : 's') + '.');
+            return res;
+        }
+        function mpModelForm(m, presetProviderId) {
+            const form = mpEl('div', { class: 'mp-drawer-form' });
+            const providerId = m ? m.provider_id : presetProviderId;
+            const provSel = mpEl('pl-select', {}, (mpState.snap.providers || []).map(p =>
+                mpEl('option', Object.assign({ value: p.id }, providerId === p.id ? { selected: true } : {}), p.name)));
+            const nameIn = mpEl('pl-input', { value: m ? m.model_name : '', placeholder: 'model id at the provider' });
+            const displayIn = mpEl('pl-input', { value: m && m.display_name ? m.display_name : '' });
+            const baseUrlIn = mpEl('pl-input', { value: m && m.base_url ? m.base_url : '', placeholder: 'overrides the provider endpoint' });
+            const caps = (m && m.capabilities ? m.capabilities : ['chat']).slice();
+            const dimIn = mpEl('pl-input', { type: 'number', value: m && m.embedding_dim != null ? String(m.embedding_dim) : '' });
+            const dimGroup = mpEl('pl-field-group', { label: 'Embedding dim', required: true, help: 'Must match the memory store: 512.' }, [dimIn]);
+            const poolSel = mpEl('pl-select', {}, [mpEl('option', Object.assign({ value: '' }, (!m || m.pool_id == null) ? { selected: true } : {}), '— no pool —')]
+                .concat((mpState.snap.pools || []).map(p =>
+                    mpEl('option', Object.assign({ value: p.id }, m && m.pool_id === p.id ? { selected: true } : {}), p.name))));
+            const enabledToggle = mpEl('pl-toggle', Object.assign({ label: 'enabled' }, (!m || m.enabled) ? { checked: true } : {}));
+            const nameGroup = mpEl('pl-field-group', { label: 'Model name', required: true }, [nameIn]);
+            const syncDim = () => dimGroup.classList.toggle('mp-hidden', !caps.includes('embedding'));
+            const capChips = mpEl('div', { class: 'mp-caps' }, MP_CAPS.map(cap => {
+                const chip = mpEl('span', Object.assign({ class: 'mp-cap' }, caps.includes(cap) ? { 'data-on': true } : {}), cap);
+                return mpClickable(chip, () => {
+                    const i = caps.indexOf(cap);
+                    if (i >= 0) { caps.splice(i, 1); chip.removeAttribute('data-on'); }
+                    else { caps.push(cap); chip.setAttribute('data-on', ''); }
+                    syncDim();
+                });
+            }));
+            form.appendChild(mpEl('pl-field-group', { label: 'Provider' }, [provSel]));
+            form.appendChild(nameGroup);
+            form.appendChild(mpEl('pl-field-group', { label: 'Display name' }, [displayIn]));
+            form.appendChild(mpEl('pl-field-group', { label: 'Base URL' }, [baseUrlIn]));
+            form.appendChild(mpEl('pl-field-group', { label: 'Capabilities' }, [capChips]));
+            form.appendChild(dimGroup);
+            form.appendChild(mpEl('pl-field-group', { label: 'Pool', help: 'Models sharing a pool share its concurrency slots.' }, [poolSel]));
+            form.appendChild(mpEl('pl-field-group', {}, [enabledToggle]));
+            syncDim();
+            const typedWrap = mpEl('div');
+            const advWrap = mpEl('div');
+            let typed = { node: mpEl('div'), collect() { }, keys: [] };
+            let advanced = mpAdvancedJsonField(m ? m.config : {}, []);
+            const rebuildParams = () => {
+                mpClear(typedWrap);
+                mpClear(advWrap);
+                const p = mpProviderById(Number(provSel.value));
+                const desc = p ? mpDescriptorFor(p.protocol, p.protocol === 'openai_compat' ? p.runtime_hint : null) : null;
+                const fieldDefs = desc ? (desc.model_fields || []).concat(desc.runtime_fields || []) : [];
+                if (fieldDefs.length) typedWrap.appendChild(mpEl('div', { class: 'mp-eyebrow', text: 'Inference params' }));
+                typed = mpTypedConfigFields(fieldDefs, m ? m.config : {});
+                typedWrap.appendChild(typed.node);
+                advanced = mpAdvancedJsonField(m ? m.config : {}, typed.keys);
+                advWrap.appendChild(advanced.node);
+            };
+            provSel.addEventListener('pl:change', rebuildParams);
+            queueMicrotask(rebuildParams);
+            form.appendChild(typedWrap);
+            form.appendChild(advWrap);
+            form.appendChild(mpEl('div', { class: 'mp-form-actions' }, [
+                mpBtn(m ? 'Save model' : 'Create model', { variant: 'primary' }, async () => {
+                    const nm = nameIn.value.trim();
+                    nameGroup.setError(nm ? '' : 'Model name is required.');
+                    if (!nm) return;
+                    const dim = mpNumOrNull(dimIn.value);
+                    if (caps.includes('embedding')) {
+                        dimGroup.setError(dim == null ? 'Required for embedding models (512 expected).' : '');
+                        if (dim == null) return;
+                    } else dimGroup.setError('');
+                    let config;
+                    try {
+                        config = advanced.parse();
+                        typed.collect(config);
+                    } catch (_) { return; }
+                    const body = {
+                        provider_id: Number(provSel.value),
+                        model_name: nm,
+                        display_name: displayIn.value.trim() || null,
+                        base_url: baseUrlIn.value.trim() || null,
+                        capabilities: caps.slice(),
+                        embedding_dim: caps.includes('embedding') ? dim : null,
+                        pool_id: poolSel.value ? Number(poolSel.value) : null,
+                        enabled: enabledToggle.checked,
+                        config,
+                    };
+                    if (m) body.id = m.id;
+                    const r = await mpApply(m ? 'update_model' : 'create_model', body, m ? 'Model saved.' : 'Model created.');
+                    if (r && !m && r.id != null) mpOpenDrawer({ type: 'model', id: r.id });
+                }),
+            ]));
+            if (m) {
+                const used = mpModelUsedBy(m.id);
+                form.appendChild(mpEl('div', { class: 'mp-danger-zone' }, [
+                    mpEl('div', {
+                        class: 'mp-danger-copy',
+                        text: used > 0
+                            ? 'This model is referenced by ' + used + ' assignment' + (used === 1 ? '' : 's') + '; deleting it removes them.'
+                            : 'This model is not referenced by any assignment.'
+                    }),
+                    mpBtn('Delete model', { variant: 'danger', size: 'sm' }, async () => {
+                        const ok = await PL.confirm({
+                            body: 'Delete model ' + m.model_name + '? It is used by ' + used + ' assignment' + (used === 1 ? '' : 's') + '.',
+                            danger: true, okLabel: 'Delete',
+                        });
+                        if (!ok) return;
+                        mpState.catalog.drawer = null;
+                        await mpApply('delete_model', { id: m.id }, 'Model deleted.');
+                    }),
+                ]));
+            }
+            return form;
+        }
 
-            root.appendChild(mpEl('div', { class: 'mp-eyebrow', text: 'Models' }));
-            const mlist = mpEl('div', { class: 'mp-legend' });
-            (mpState.snap.models || []).forEach(m => mlist.appendChild(mpEl('div', { class: 'mp-row' }, [
-                mpEl('span', { class: 'mp-row-name', text: m.model_name }),
-                mpEl('span', { class: 'mp-row-sub', text: (mpProviderById(m.provider_id) || {}).name || ('#' + m.provider_id) }),
-                mpEl('span', { class: 'mp-tag', text: (m.capabilities || []).join(', ') || '—' }),
-                m.embedding_dim != null ? mpEl('span', { class: 'mp-tag', text: 'dim ' + m.embedding_dim }) : null,
+        // ============ POOLS ============
+        function mpRenderPools() {
+            const root = document.getElementById('mp-pools');
+            mpClear(root);
+            if (!Array.isArray(mpState.snap.pools)) {
+                PL.empty(root, { title: 'Pools unavailable', desc: 'This backend does not expose concurrency pools yet.' });
+                return;
+            }
+            root.appendChild(mpEl('div', { class: 'mp-eyebrow', text: 'Concurrency pools' }));
+            root.appendChild(mpEl('div', { class: 'mp-hint', text: 'Models sharing a pool share its slots — e.g. three image models on one GPU = one 1-slot pool.' }));
+            const pools = mpState.snap.pools || [];
+            const grid = mpEl('div', { class: 'mp-pool-grid' });
+            pools.forEach(p => grid.appendChild(mpPoolCard(p)));
+            grid.appendChild(mpCreatePoolCard());
+            root.appendChild(grid);
+            if (!pools.length) {
+                PL.empty(root.appendChild(mpEl('div')), {
+                    title: 'No pools yet',
+                    desc: 'Models sharing a pool share its slots — e.g. three image models on one GPU = one 1-slot pool.',
+                });
+            }
+            const unpooled = (mpState.snap.models || []).filter(m => m.pool_id == null);
+            root.appendChild(mpEl('div', { class: 'mp-eyebrow', text: 'Unpooled models' }));
+            if (!unpooled.length) {
+                root.appendChild(mpEl('div', { class: 'mp-empty', text: 'Every model is attached to a pool.' }));
+            } else {
+                const legend = mpEl('div', { class: 'mp-legend' });
+                unpooled.forEach(m => {
+                    const sel = mpEl('pl-select', { class: 'w-narrow', 'aria-label': 'Pool for ' + m.model_name },
+                        [mpEl('option', { value: '' }, 'Attach to…')].concat(pools.map(p => mpEl('option', { value: p.id }, p.name))));
+                    legend.appendChild(mpEl('div', { class: 'mp-row' }, [
+                        mpEl('span', { class: 'mp-row-name', text: mpModelLabel(m.id) }),
+                        mpEl('span', { class: 'mp-row-sub', text: (mpProviderById(m.provider_id) || {}).name || '' }),
+                        mpEl('div', { class: 'mp-row-actions' }, [
+                            sel,
+                            mpBtn('Attach', { size: 'sm' }, async () => {
+                                if (!sel.value) { PL.toast('Pick a pool first.', 'warning'); return; }
+                                await mpApply('set_model_pool', { id: m.id, pool_id: Number(sel.value) }, 'Model attached.');
+                            }),
+                        ]),
+                    ]));
+                });
+                root.appendChild(legend);
+            }
+        }
+        function mpPoolCard(p) {
+            const card = mpEl('div', { class: 'mp-pool-card' });
+            const nameIn = mpEl('pl-input', { value: p.name, 'aria-label': 'Pool name' });
+            const descIn = mpEl('pl-input', { value: p.description || '', placeholder: 'description', 'aria-label': 'Pool description' });
+            const unlimited = mpEl('pl-toggle', Object.assign({ label: 'Unlimited' }, p.max_concurrency == null ? { checked: true } : {}));
+            const slider = mpEl('pl-slider', {
+                min: '1', max: '32', step: '1',
+                value: String(p.max_concurrency != null ? p.max_concurrency : 8),
+                label: 'slots', 'data-testid': 'mp-pool-slider-' + p.id,
+                'aria-label': 'Max concurrency for ' + p.name,
+            });
+            if (p.max_concurrency == null) slider.setAttribute('disabled', '');
+            unlimited.addEventListener('pl:change', ev => mpSetSliderDisabled(slider, !!ev.detail.checked));
+            const head = mpEl('div', { class: 'mp-pool-head' }, [
+                mpEl('span', { class: 'cell-strong', text: p.name }),
+                mpState.statusUnavailable ? null : mpSlotbarFor(p.id, 'card'),
                 mpEl('div', { class: 'mp-row-actions' }, [
-                    mpToggleControl(m.enabled, 'enabled', enabled => mpApply({ action: 'set_model_enabled', id: m.id, enabled }, enabled ? 'Model enabled.' : 'Model disabled.')),
-                    mpEl('pl-button', { size: 'sm', variant: 'outline', _on: { click: () => mpEditConfig('patch_model_config', m.id, m.config || {}) } }, [mpIcon('braces'), ' Config']),
-                    mpEl('span', { class: 'mp-icon-btn mp-icon-btn--danger', title: 'Delete', _on: { click: async () => {
-                        if (await PL.confirm('Delete model ' + m.model_name + '?')) mpApply({ action: 'delete_model', id: m.id }, 'Model deleted.');
-                    } } }, [mpIcon('trash')]),
+                    mpClickable(mpEl('span', { class: 'mp-icon-btn mp-icon-btn--danger', title: 'Delete pool', 'aria-label': 'Delete pool ' + p.name }, [mpIcon('trash')]),
+                        async () => {
+                            const ok = await PL.confirm({
+                                body: 'Delete pool ' + p.name + '? Attached models degrade to unpooled/unlimited.',
+                                danger: true, okLabel: 'Delete',
+                            });
+                            if (ok) await mpApply('delete_pool', { id: p.id }, 'Pool deleted.');
+                        }),
                 ]),
-            ])));
-            if (!(mpState.snap.models || []).length) mlist.appendChild(mpEl('div', { class: 'mp-empty', text: 'No models.' }));
-            root.appendChild(mlist);
-            root.appendChild(mpModelForm());
+            ]);
+            card.appendChild(head);
+            card.appendChild(mpEl('pl-field-group', { label: 'Name' }, [nameIn]));
+            card.appendChild(mpEl('pl-field-group', { label: 'Description' }, [descIn]));
+            card.appendChild(mpEl('div', { class: 'mp-pool-actions' }, [unlimited, slider]));
+            const attached = (mpState.snap.models || []).filter(m => m.pool_id === p.id);
+            const chips = mpEl('div', { class: 'mp-pool-chips' });
+            attached.forEach(m => {
+                const x = mpClickable(mpEl('span', { class: 'mp-chip-x', 'aria-label': 'Detach ' + m.model_name, title: 'Detach' }, '×'),
+                    async () => { await mpApply('set_model_pool', { id: m.id, pool_id: null }, 'Model detached.'); });
+                chips.appendChild(mpEl('span', { class: 'mp-pool-chip' }, [mpEl('span', { text: mpModelLabel(m.id) }), x]));
+            });
+            if (!attached.length) chips.appendChild(mpEl('span', { class: 'mp-row-sub', text: 'no models attached' }));
+            card.appendChild(chips);
+            const attachable = (mpState.snap.models || []).filter(m => m.pool_id !== p.id);
+            const attachSel = mpEl('pl-select', { class: 'w-narrow', 'aria-label': 'Attach model to ' + p.name },
+                [mpEl('option', { value: '' }, '+ attach model…')].concat(attachable.map(m =>
+                    mpEl('option', { value: m.id }, mpModelLabel(m.id) + ' (' + mpProviderName(m.id) + ')'))));
+            attachSel.addEventListener('pl:change', async () => {
+                const id = Number(attachSel.value);
+                if (!id) return;
+                await mpApply('set_model_pool', { id, pool_id: p.id }, 'Model attached.');
+            });
+            const save = mpBtn('Save', { variant: 'primary', size: 'sm' }, async () => {
+                const nm = nameIn.value.trim();
+                if (!nm) { PL.toast('Pool name is required.', 'warning'); return; }
+                const max = unlimited.checked ? null : Number(slider.value);
+                const live = mpPoolLive(p.id);
+                if (max != null && live && max < live.in_flight) {
+                    const ok = await PL.confirm({
+                        body: 'Lowering to ' + max + ' slots while ' + live.in_flight + ' requests are in flight will delay new work until they drain. Continue?',
+                        okLabel: 'Lower capacity',
+                    });
+                    if (!ok) return;
+                }
+                await mpApply('update_pool', { id: p.id, name: nm, max_concurrency: max, description: descIn.value.trim() || null }, 'Pool saved.');
+            });
+            card.appendChild(mpEl('div', { class: 'mp-pool-actions' }, [
+                attachSel,
+                mpEl('div', { class: 'mp-pool-actions-end' }, [save]),
+            ]));
+            return card;
+        }
+        function mpCreatePoolCard() {
+            const card = mpEl('div', { class: 'mp-pool-card' });
+            card.appendChild(mpEl('div', { class: 'mp-eyebrow', text: 'Create pool' }));
+            const nameIn = mpEl('pl-input', { placeholder: 'pool name' });
+            const descIn = mpEl('pl-input', { placeholder: 'description (optional)' });
+            const unlimited = mpEl('pl-toggle', { label: 'Unlimited' });
+            const slider = mpEl('pl-slider', { min: '1', max: '32', step: '1', value: '1', label: 'slots', 'aria-label': 'Max concurrency for new pool' });
+            unlimited.addEventListener('pl:change', ev => mpSetSliderDisabled(slider, !!ev.detail.checked));
+            card.appendChild(mpEl('pl-field-group', { label: 'Name', required: true }, [nameIn]));
+            card.appendChild(mpEl('pl-field-group', { label: 'Description' }, [descIn]));
+            card.appendChild(mpEl('div', { class: 'mp-pool-actions' }, [unlimited, slider]));
+            card.appendChild(mpEl('div', { class: 'mp-pool-actions' }, [
+                mpEl('div', { class: 'mp-pool-actions-end' }, [
+                    mpBtn('Create pool', { variant: 'primary', size: 'sm' }, async () => {
+                        const nm = nameIn.value.trim();
+                        if (!nm) { PL.toast('Pool name is required.', 'warning'); return; }
+                        await mpApply('create_pool', {
+                            name: nm,
+                            max_concurrency: unlimited.checked ? null : Number(slider.value),
+                            description: descIn.value.trim() || null,
+                        }, 'Pool created.');
+                    }),
+                ]),
+            ]));
+            return card;
         }
 
-        function mpProviderForm() {
-            const name = mpEl('pl-input', { placeholder: 'name' });
-            const kind = mpEl('pl-select', { class: 'w-narrow' }, mpKinds.map(x => mpEl('option', { value: x }, x)));
-            const endpoint = mpEl('pl-input', { placeholder: 'endpoint (optional)' });
-            const keyref = mpEl('pl-input', { placeholder: 'api_key_ref env var' });
-            const key = mpEl('pl-input', { type: 'password', placeholder: 'api key (encrypted)' });
-            return mpEl('div', { class: 'mp-add' }, [name, kind, endpoint, keyref, key,
-                mpEl('pl-button', { variant: 'primary', _on: { click: () => {
-                    if (!name.value.trim()) { PL.toast('Provider name is required.', 'error'); return; }
-                    const body = { action: 'create_provider', name: name.value.trim(), kind: kind.value };
-                    if (endpoint.value.trim()) body.endpoint = endpoint.value.trim();
-                    if (key.value) body.api_key = key.value; else if (keyref.value.trim()) body.api_key_ref = keyref.value.trim();
-                    mpApply(body, 'Provider added.');
-                } } }, [mpIcon('plus'), ' Add provider'])]);
+        // ============ GRAPH ============
+        function mpModelFlowState(m) {
+            if (!m.enabled) return 'disabled';
+            if (!mpState.statusUnavailable) {
+                if (mpBreakerOpenModel(m.id)) return 'breaker-open';
+                if (mpCapacityBlockedModel(m.id)) return 'capacity-blocked';
+            }
+            return 'ok';
         }
-
-        function mpModelForm() {
-            const prov = mpEl('pl-select', { class: 'w-narrow' }, (mpState.snap.providers || []).map(p => mpEl('option', { value: p.id }, p.name)));
-            const model = mpEl('pl-input', { placeholder: 'model_name' });
-            const baseUrl = mpEl('pl-input', { placeholder: 'base_url (optional)' });
-            const caps = mpEl('pl-input', { placeholder: 'capabilities csv: chat, privacy_filter' });
-            const dim = mpEl('pl-input', { type: 'number', placeholder: 'embedding_dim', class: 'w-narrow' });
-            return mpEl('div', { class: 'mp-add' }, [prov, model, baseUrl, caps, dim,
-                mpEl('pl-button', { variant: 'primary', _on: { click: () => {
-                    if (!prov.value || !model.value.trim()) { PL.toast('Provider and model_name are required.', 'error'); return; }
-                    const body = { action: 'create_model', provider_id: Number(prov.value), model_name: model.value.trim(),
-                        capabilities: caps.value.split(',').map(s => s.trim()).filter(Boolean) };
-                    if (baseUrl.value.trim()) body.base_url = baseUrl.value.trim();
-                    if (dim.value) body.embedding_dim = Number(dim.value);
-                    mpApply(body, 'Model added.');
-                } } }, [mpIcon('plus'), ' Add model'])]);
+        function mpProviderFlowState(p) {
+            if (!p.enabled) return 'disabled';
+            if (!mpState.statusUnavailable && mpBreakerOpenProvider(p.id)) return 'breaker-open';
+            return 'ok';
         }
-
+        function mpPoolFlowState(p) {
+            const live = mpPoolLive(p.id);
+            if (live && live.max_concurrency != null && live.in_flight >= live.max_concurrency) return 'capacity-blocked';
+            return 'ok';
+        }
+        function mpFlowData(opts) {
+            const snap = mpState.snap;
+            const nodes = [], edges = [];
+            const seenNodes = {}, seenEdges = {};
+            const addNode = (id, kind, label, state, badge) => {
+                if (seenNodes[id]) return;
+                seenNodes[id] = true;
+                nodes.push({ id, kind, label, state, badge });
+            };
+            const addEdgeOnce = (edge) => {
+                const key = edge.from + '→' + edge.to + '·' + edge.kind;
+                if (seenEdges[key]) return;
+                seenEdges[key] = true;
+                edges.push(edge);
+            };
+            (snap.workflows || []).filter(w => opts.workflows.includes(w.key)).forEach(w => {
+                const wfId = 'wf:' + w.key;
+                addNode(wfId, 'workflow', mpWfLabel(w.key), w.enabled ? 'ok' : 'disabled');
+                let asgs = (snap.assignments || []).filter(a => a.workflow_key === w.key && a.scope === opts.scope);
+                if (opts.activeOnly) asgs = asgs.filter(a => a.enabled && !(a.role === 'primary' && !(a.weight > 0)));
+                asgs.forEach(a => {
+                    const m = mpModelById(a.provider_model_id);
+                    if (!m) return;
+                    if (opts.activeOnly && !m.enabled) return;
+                    const mId = 'm:' + m.id;
+                    addNode(mId, 'model', mpModelLabel(m.id), mpModelFlowState(m));
+                    const edge = { from: wfId, to: mId, kind: a.role };
+                    if (a.role === 'primary') edge.weight = a.weight || 0;
+                    if (a.role === 'fallback') edge.order = (a.fallback_order || 0) + 1;
+                    if (a.role === 'overflow') {
+                        const trg = (snap.triggers || []).find(t => t.engage_assignment_id === a.id);
+                        edge.engaged = !!(trg && mpTriggerEngaged(trg.id));
+                    }
+                    edges.push(edge);
+                    const p = mpProviderById(m.provider_id);
+                    if (p) {
+                        const pId = 'p:' + p.id;
+                        addNode(pId, 'provider', p.name, mpProviderFlowState(p));
+                        addEdgeOnce({ from: mId, to: pId, kind: 'attach' });
+                        if (m.pool_id != null) {
+                            const pool = mpPoolById(m.pool_id);
+                            if (pool) {
+                                addNode('pool:' + pool.id, 'pool', pool.name, mpPoolFlowState(pool));
+                                addEdgeOnce({ from: pId, to: 'pool:' + pool.id, kind: 'attach' });
+                            }
+                        }
+                    }
+                });
+            });
+            return { nodes, edges };
+        }
+        function mpGraphFlowData() {
+            const g = mpState.graph;
+            const keys = g.wf ? [g.wf] : (mpState.snap.workflows || []).map(w => w.key);
+            return mpFlowData({ workflows: keys, scope: g.scope, activeOnly: g.activeOnly });
+        }
+        function mpFlowNav(detail) {
+            const sep = detail.id.indexOf(':');
+            const type = detail.id.slice(0, sep);
+            const rawId = detail.id.slice(sep + 1);
+            if (type === 'wf') mpOpenBoard(rawId);
+            else if (type === 'm') mpOpenDrawer({ type: 'model', id: Number(rawId) });
+            else if (type === 'p') mpOpenDrawer({ type: 'provider', id: Number(rawId) });
+            else if (type === 'pool') mpView('pools');
+        }
+        function mpRenderGraph() {
+            const root = document.getElementById('mp-graph');
+            mpClear(root);
+            const g = mpState.graph;
+            const wfSel = mpEl('pl-select', { class: 'w-narrow', 'aria-label': 'Workflow filter' },
+                [mpEl('option', Object.assign({ value: '' }, !g.wf ? { selected: true } : {}), 'All workflows')]
+                    .concat((mpState.snap.workflows || []).map(w =>
+                        mpEl('option', Object.assign({ value: w.key }, g.wf === w.key ? { selected: true } : {}), mpWfLabel(w.key)))));
+            wfSel.addEventListener('pl:change', () => { g.wf = wfSel.value; mpRenderGraph(); });
+            const scopeGroup = mpEl('pl-button-group', { 'aria-label': 'Scope' }, ['global', 'vip'].map(s =>
+                mpBtn(s === 'vip' ? 'VIP' : 'Global',
+                    { variant: 'nav', size: 'sm', class: g.scope === s ? 'active' : '' },
+                    () => { g.scope = s; mpRenderGraph(); })));
+            const activeToggle = mpEl('pl-toggle', Object.assign({ label: 'Active paths only' }, g.activeOnly ? { checked: true } : {}));
+            activeToggle.addEventListener('pl:change', ev => { g.activeOnly = !!ev.detail.checked; mpRenderGraph(); });
+            root.appendChild(mpEl('div', { class: 'mp-graph-controls' }, [wfSel, scopeGroup, activeToggle]));
+            if (mpState.statusUnavailable) root.appendChild(mpEl('div', { class: 'mp-hint', text: 'Live status unavailable — topology shows configuration only.' }));
+            const data = mpGraphFlowData();
+            if (!data.nodes.length) {
+                PL.empty(root.appendChild(mpEl('div')), { title: 'Nothing to draw', desc: 'No assignments match this filter.' });
+                return;
+            }
+            const flow = mpEl('pl-flow', { 'data-mp-graph-flow': '' });
+            flow.data = data;
+            flow.addEventListener('pl:node-click', e => mpFlowNav(e.detail));
+            root.appendChild(flow);
+        }
 
         // --- Settings ---
         async function saveLogLevel() {

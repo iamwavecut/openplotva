@@ -4,10 +4,17 @@ use std::time::{Duration, Instant};
 
 use openplotva_llm::retry::FailureReason;
 use openplotva_llm::router::{
-    BreakerLiveness, BreakerSet, InferenceOverrides, RouterHandle, TriggerState, WorkflowRoute,
-    select,
+    BreakerLiveness, BreakerSet, InferenceOverrides, PoolRegistry, RouterHandle, TriggerState,
+    WorkflowRoute, select_chain,
 };
 use serde_json::{Value, json};
+
+/// Upper bound on how long one walker run waits for a capacity-pool slot when
+/// every candidate's pool is full. Slot waiting deliberately does not count
+/// against the workflow's `retry_wall_ms` (which budgets attempt execution):
+/// pool queueing replaces the server-side queueing some backends did before,
+/// so it is bounded only by the request deadline and this sanity cap.
+const DEFAULT_MAX_SLOT_WAIT: Duration = Duration::from_secs(300);
 
 /// Minimum share of the caller's budget an attempt must have received for a
 /// deadline cut to count against the provider's circuit breaker.
@@ -18,6 +25,8 @@ pub struct RoutedAttemptWalker {
     handle: Arc<RouterHandle>,
     breakers: Arc<BreakerSet>,
     triggers: Arc<TriggerState>,
+    pools: Arc<PoolRegistry>,
+    max_slot_wait: Duration,
     reporter: Option<crate::runtime_routing::RoutingEventReporter>,
 }
 
@@ -27,11 +36,14 @@ impl RoutedAttemptWalker {
         handle: Arc<RouterHandle>,
         breakers: Arc<BreakerSet>,
         triggers: Arc<TriggerState>,
+        pools: Arc<PoolRegistry>,
     ) -> Self {
         Self {
             handle,
             breakers,
             triggers,
+            pools,
+            max_slot_wait: DEFAULT_MAX_SLOT_WAIT,
             reporter: None,
         }
     }
@@ -48,6 +60,12 @@ impl RoutedAttemptWalker {
         reporter: Option<crate::runtime_routing::RoutingEventReporter>,
     ) -> Self {
         self.reporter = reporter;
+        self
+    }
+
+    #[must_use]
+    pub fn with_max_slot_wait(mut self, max_slot_wait: Duration) -> Self {
+        self.max_slot_wait = max_slot_wait;
         self
     }
 
@@ -74,168 +92,263 @@ impl RoutedAttemptWalker {
                 json!({ "reason": "missing_route" }),
             ));
             return Err(RoutedAttemptRunError::Routing(RoutedRoutingError::new(
+                RoutedRoutingErrorKind::RouteUnavailable,
                 "workflow route is unavailable",
             )));
         };
 
-        let selection_now = Instant::now();
-        let attempts = {
-            let liveness = BreakerLiveness::new(&self.breakers, selection_now);
-            let mut rng = rand::rng();
-            select(route, &liveness, self.triggers.as_ref(), &mut rng)
-        };
-        if attempts.is_empty() {
-            self.record_event(routing_event(
-                "no_candidates",
-                &context,
-                None,
-                None,
-                "workflow route has no eligible candidates",
-                json!({ "reason": "zero_selected_attempts" }),
-            ));
-            return Err(RoutedAttemptRunError::Routing(RoutedRoutingError::new(
-                "workflow route has no eligible candidates",
-            )));
-        }
-        if attempts.iter().all(|attempt| {
-            !self
-                .breakers
-                .is_live_at(attempt.provider, attempt.model, selection_now)
-        }) {
-            self.record_event(routing_event(
-                "circuit_open_exhaustion",
-                &context,
-                None,
-                None,
-                "all routed attempts are inside circuit cooldown",
-                json!({ "attempts": attempts.len() }),
-            ));
-        }
-
         let started = Instant::now();
+        let max_hops = route.retry.max_hops.max(1) as usize;
+        let mut started_attempts = 0usize;
+        let mut total_slot_wait = Duration::ZERO;
+        let mut wait_reported = false;
+        let mut first_pass = true;
         let mut last_error = None;
         let mut last_provider_model = None;
         let mut failed_attempts = 0usize;
         let mut last_reason = None;
         let mut deadline_cut = false;
-        for attempt in attempts {
-            if started.elapsed() > route.retry.wall_clock {
-                break;
-            }
-            if context
-                .deadline
-                .is_some_and(|deadline| Instant::now() >= deadline)
-            {
-                break;
-            }
-            let provider = table.provider(attempt.provider);
-            let model = table.model(attempt.model);
-            let routed = RoutedAttempt {
-                provider_id: attempt.provider,
-                model_id: attempt.model,
-                provider_name: provider.map(|row| row.name.clone()).unwrap_or_default(),
-                model_name: model.map(|row| row.model_name.clone()).unwrap_or_default(),
-                provider_endpoint: provider.and_then(|row| row.endpoint.clone()),
-                discovery_service_name: provider.and_then(|row| row.discovery_service_name.clone()),
-                discovery_endpoint_name: provider
-                    .and_then(|row| row.discovery_endpoint_name.clone()),
-                model_base_url: model.and_then(|row| row.base_url.clone()),
-                embedding_dim: model.and_then(|row| row.embedding_dim),
-                provider_config: provider
-                    .map(|row| row.config.clone())
-                    .unwrap_or_else(|| json!({})),
-                model_config: model
-                    .map(|row| row.config.clone())
-                    .unwrap_or_else(|| json!({})),
-                overrides: model
-                    .map(|row| {
-                        merge_model_and_assignment_overrides(&row.config, &attempt.overrides)
-                    })
-                    .unwrap_or_else(|| attempt.overrides.clone()),
-                variant: attempt.variant.clone(),
-            };
-            last_provider_model = Some((routed.provider_id, routed.model_id));
 
-            // A started attempt must not outlive the caller's deadline either:
-            // a hung provider connection otherwise pins the worker long past
-            // the turn budget (2026-07-02 latency incident).
-            let attempt_result = match context.deadline {
-                Some(deadline) => {
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    match tokio::time::timeout(remaining, execute(routed)).await {
-                        Ok(result) => result,
-                        Err(_) => {
-                            // Charge the breaker only when the provider had a
-                            // meaningful slice of the budget; a fallback handed
-                            // the last few seconds of a turn is not unhealthy,
-                            // and penalizing it opens its circuit in lockstep
-                            // with a degraded primary.
-                            let charged = remaining >= ATTEMPT_BREAKER_MIN_SLICE;
-                            if charged {
-                                self.breakers.record_failure(
-                                    attempt.provider,
-                                    attempt.model,
-                                    attempt.breaker,
-                                );
+        // Selection-pass loop: walk a fresh chain, skipping candidates whose
+        // capacity pool is full. A busy skip touches neither the breaker nor
+        // the hop budget (busy is not dead). When a whole pass is busy, wait
+        // for any slot to free and re-select; only execution time counts
+        // against the wall clock, so pool queueing never eats the retry budget.
+        'passes: loop {
+            let selection_now = Instant::now();
+            let attempts = {
+                let liveness = BreakerLiveness::new(&self.breakers, selection_now);
+                let mut rng = rand::rng();
+                select_chain(route, &liveness, self.triggers.as_ref(), &mut rng)
+            };
+            if attempts.is_empty() {
+                self.record_event(routing_event(
+                    "no_candidates",
+                    &context,
+                    None,
+                    None,
+                    "workflow route has no eligible candidates",
+                    json!({ "reason": "zero_selected_attempts" }),
+                ));
+                return Err(RoutedAttemptRunError::Routing(RoutedRoutingError::new(
+                    RoutedRoutingErrorKind::NoCandidates,
+                    "workflow route has no eligible candidates",
+                )));
+            }
+            if first_pass
+                && attempts.iter().all(|attempt| {
+                    !self
+                        .breakers
+                        .is_live_at(attempt.provider, attempt.model, selection_now)
+                })
+            {
+                self.record_event(routing_event(
+                    "circuit_open_exhaustion",
+                    &context,
+                    None,
+                    None,
+                    "all routed attempts are inside circuit cooldown",
+                    json!({ "attempts": attempts.len() }),
+                ));
+            }
+            first_pass = false;
+
+            let mut busy_skips = 0usize;
+            let mut executed_this_pass = 0usize;
+            for attempt in attempts {
+                if started.elapsed().saturating_sub(total_slot_wait) > route.retry.wall_clock {
+                    break 'passes;
+                }
+                if context
+                    .deadline
+                    .is_some_and(|deadline| Instant::now() >= deadline)
+                {
+                    break 'passes;
+                }
+                if started_attempts >= max_hops {
+                    break 'passes;
+                }
+                let provider = table.provider(attempt.provider);
+                let model = table.model(attempt.model);
+                let Some(permit) = self.pools.try_acquire(model.and_then(|row| row.pool_id)) else {
+                    busy_skips += 1;
+                    continue;
+                };
+                let routed = RoutedAttempt {
+                    provider_id: attempt.provider,
+                    model_id: attempt.model,
+                    provider_name: provider.map(|row| row.name.clone()).unwrap_or_default(),
+                    model_name: model.map(|row| row.model_name.clone()).unwrap_or_default(),
+                    provider_endpoint: provider.and_then(|row| row.endpoint.clone()),
+                    discovery_service_name: provider
+                        .and_then(|row| row.discovery_service_name.clone()),
+                    discovery_endpoint_name: provider
+                        .and_then(|row| row.discovery_endpoint_name.clone()),
+                    model_base_url: model.and_then(|row| row.base_url.clone()),
+                    embedding_dim: model.and_then(|row| row.embedding_dim),
+                    provider_config: provider
+                        .map(|row| row.config.clone())
+                        .unwrap_or_else(|| json!({})),
+                    model_config: model
+                        .map(|row| row.config.clone())
+                        .unwrap_or_else(|| json!({})),
+                    overrides: model
+                        .map(|row| {
+                            merge_model_and_assignment_overrides(&row.config, &attempt.overrides)
+                        })
+                        .unwrap_or_else(|| attempt.overrides.clone()),
+                    variant: attempt.variant.clone(),
+                };
+                last_provider_model = Some((routed.provider_id, routed.model_id));
+                started_attempts += 1;
+                executed_this_pass += 1;
+
+                // A started attempt must not outlive the caller's deadline
+                // either: a hung provider connection otherwise pins the worker
+                // long past the turn budget (2026-07-02 latency incident).
+                let result = match context.deadline {
+                    Some(deadline) => {
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        match tokio::time::timeout(remaining, execute(routed)).await {
+                            Ok(result) => result,
+                            Err(_) => {
+                                drop(permit);
+                                // Charge the breaker only when the provider had
+                                // a meaningful slice of the budget; a fallback
+                                // handed the last few seconds of a turn is not
+                                // unhealthy, and penalizing it opens its circuit
+                                // in lockstep with a degraded primary.
+                                let charged = remaining >= ATTEMPT_BREAKER_MIN_SLICE;
+                                if charged {
+                                    self.breakers.record_failure(
+                                        attempt.provider,
+                                        attempt.model,
+                                        attempt.breaker,
+                                    );
+                                }
+                                failed_attempts += 1;
+                                last_reason = Some("attempt_deadline_exceeded".to_owned());
+                                deadline_cut = true;
+                                self.record_event(routing_event(
+                                    "attempt_deadline_exceeded",
+                                    &context,
+                                    Some(attempt.provider),
+                                    Some(attempt.model),
+                                    "attempt aborted at the caller deadline",
+                                    json!({
+                                        "failed_attempts": failed_attempts,
+                                        "attempt_slice_ms": remaining.as_millis(),
+                                        "breaker_charged": charged,
+                                    }),
+                                ));
+                                break 'passes;
                             }
-                            failed_attempts += 1;
-                            last_reason = Some("attempt_deadline_exceeded".to_owned());
-                            deadline_cut = true;
+                        }
+                    }
+                    None => execute(routed).await,
+                };
+                drop(permit);
+                match result {
+                    Ok(output) => {
+                        self.breakers
+                            .record_success(attempt.provider, attempt.model);
+                        return Ok(output);
+                    }
+                    Err(error) => {
+                        let Some(reason) = retryable(&error) else {
+                            return Err(RoutedAttemptRunError::Attempt(error));
+                        };
+                        self.breakers.record_failure(
+                            attempt.provider,
+                            attempt.model,
+                            attempt.breaker,
+                        );
+                        if reason == FailureReason::CapacityUnavailable
+                            && let Some(cooldown) =
+                                provider_capacity_cooldown(route, attempt.provider, attempt.model)
+                        {
+                            self.triggers.mark_capacity_unavailable(
+                                attempt.provider,
+                                attempt.model,
+                                cooldown,
+                            );
                             self.record_event(routing_event(
-                                "attempt_deadline_exceeded",
+                                "capacity_unavailable",
                                 &context,
                                 Some(attempt.provider),
                                 Some(attempt.model),
-                                "attempt aborted at the caller deadline",
+                                "provider capacity unavailable",
                                 json!({
-                                    "failed_attempts": failed_attempts,
-                                    "attempt_slice_ms": remaining.as_millis(),
-                                    "breaker_charged": charged,
+                                    "cooldown_ms": cooldown.as_millis(),
+                                    "retryable_reason": reason.as_str(),
                                 }),
                             ));
-                            break;
                         }
+                        failed_attempts += 1;
+                        last_reason = Some(reason.as_str().to_owned());
+                        last_error = Some(error);
                     }
                 }
-                None => execute(routed).await,
+            }
+
+            if busy_skips == 0 || started_attempts >= max_hops {
+                break;
+            }
+            if executed_this_pass > 0 {
+                // Something ran and failed while other candidates were busy:
+                // re-select immediately, a slot may have freed meanwhile.
+                continue;
+            }
+
+            // Every candidate in the pass was pool-busy: wait for any slot.
+            let wait_budget = match context.deadline {
+                Some(deadline) => deadline
+                    .checked_duration_since(Instant::now())
+                    .unwrap_or(Duration::ZERO)
+                    .min(self.max_slot_wait),
+                None => self.max_slot_wait,
             };
-            match attempt_result {
-                Ok(output) => {
-                    self.breakers
-                        .record_success(attempt.provider, attempt.model);
-                    return Ok(output);
-                }
-                Err(error) => {
-                    let Some(reason) = retryable(&error) else {
-                        return Err(RoutedAttemptRunError::Attempt(error));
-                    };
-                    self.breakers
-                        .record_failure(attempt.provider, attempt.model, attempt.breaker);
-                    if reason == FailureReason::CapacityUnavailable
-                        && let Some(cooldown) =
-                            provider_capacity_cooldown(route, attempt.provider, attempt.model)
-                    {
-                        self.triggers.mark_capacity_unavailable(
-                            attempt.provider,
-                            attempt.model,
-                            cooldown,
-                        );
-                        self.record_event(routing_event(
-                            "capacity_unavailable",
-                            &context,
-                            Some(attempt.provider),
-                            Some(attempt.model),
-                            "provider capacity unavailable",
-                            json!({
-                                "cooldown_ms": cooldown.as_millis(),
-                                "retryable_reason": reason.as_str(),
-                            }),
-                        ));
-                    }
-                    failed_attempts += 1;
-                    last_reason = Some(reason.as_str().to_owned());
-                    last_error = Some(error);
-                }
+            if !wait_reported {
+                wait_reported = true;
+                self.record_event(routing_event_with_severity(
+                    "capacity_pool_wait",
+                    "warn",
+                    &context,
+                    None,
+                    None,
+                    "all candidate capacity pools are busy; waiting for a slot",
+                    json!({
+                        "busy_candidates": busy_skips,
+                        "wait_budget_ms": wait_budget.as_millis(),
+                    }),
+                ));
+            }
+            let wait_started = Instant::now();
+            let released = if wait_budget.is_zero() {
+                false
+            } else {
+                self.pools.wait_for_release(wait_budget).await
+            };
+            total_slot_wait += wait_started.elapsed();
+            if !released {
+                self.record_event(routing_event(
+                    "capacity_wait_timeout",
+                    &context,
+                    None,
+                    None,
+                    "workflow capacity unavailable: slot wait timed out",
+                    json!({
+                        "busy_candidates": busy_skips,
+                        "waited_ms": total_slot_wait.as_millis(),
+                    }),
+                ));
+                return Err(RoutedAttemptRunError::Routing(RoutedRoutingError::new(
+                    RoutedRoutingErrorKind::CapacityWaitTimeout,
+                    format!(
+                        "workflow capacity unavailable: all pools busy after {}ms slot wait",
+                        total_slot_wait.as_millis()
+                    ),
+                )));
             }
         }
 
@@ -251,9 +364,11 @@ impl RoutedAttemptWalker {
         match last_error {
             Some(error) => Err(RoutedAttemptRunError::Attempt(error)),
             None if deadline_cut => Err(RoutedAttemptRunError::Routing(RoutedRoutingError::new(
+                RoutedRoutingErrorKind::DeadlineExceeded,
                 "routed attempt exceeded the caller deadline",
             ))),
             None => Err(RoutedAttemptRunError::Routing(RoutedRoutingError::new(
+                RoutedRoutingErrorKind::Exhausted,
                 "routed attempts exhausted",
             ))),
         }
@@ -327,16 +442,39 @@ pub enum RoutedAttemptRunError<E> {
     Attempt(E),
 }
 
+/// Why the walker itself (not a provider attempt) failed a run.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RoutedRoutingErrorKind {
+    RouteUnavailable,
+    NoCandidates,
+    Exhausted,
+    /// The in-flight attempt was aborted at the caller's deadline (turn
+    /// budget); the worker is freed instead of pinned by a hung connection.
+    DeadlineExceeded,
+    /// Every candidate's capacity pool stayed full for the whole slot-wait
+    /// budget. The `Display` message contains the phrase "capacity
+    /// unavailable" on purpose: `retry.rs` message rules classify it as
+    /// `FailureReason::CapacityUnavailable`, so every call site requeues.
+    CapacityWaitTimeout,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RoutedRoutingError {
+    kind: RoutedRoutingErrorKind,
     message: String,
 }
 
 impl RoutedRoutingError {
-    fn new(message: impl Into<String>) -> Self {
+    fn new(kind: RoutedRoutingErrorKind, message: impl Into<String>) -> Self {
         Self {
+            kind,
             message: message.into(),
         }
+    }
+
+    #[must_use]
+    pub fn kind(&self) -> RoutedRoutingErrorKind {
+        self.kind
     }
 }
 
@@ -363,6 +501,26 @@ fn routing_event(
     } else {
         "error"
     };
+    routing_event_with_severity(
+        event_type,
+        severity,
+        context,
+        provider_id,
+        model_id,
+        summary,
+        detail,
+    )
+}
+
+fn routing_event_with_severity(
+    event_type: &str,
+    severity: &str,
+    context: &RoutedRequestContext,
+    provider_id: Option<i64>,
+    model_id: Option<i64>,
+    summary: &str,
+    detail: Value,
+) -> crate::runtime_routing::RoutingEvent {
     crate::runtime_routing::RoutingEvent {
         severity: severity.to_owned(),
         event_type: event_type.to_owned(),
@@ -442,7 +600,9 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
 
-    use openplotva_llm::router::{BreakerConfig, BreakerSet, RouterHandle, TriggerState};
+    use openplotva_llm::router::{
+        BreakerConfig, BreakerSet, PoolRegistry, RouterHandle, TriggerState,
+    };
     use openplotva_storage::llm_routing::{
         AssignmentRecord, ModelRecord, ProviderRecord, RoutingSnapshot, WorkflowRecord,
     };
@@ -455,6 +615,8 @@ mod tests {
             id,
             name: name.to_owned(),
             kind: "chat".to_owned(),
+            protocol: None,
+            runtime_hint: None,
             endpoint: None,
             discovery_service_name: None,
             discovery_endpoint_name: None,
@@ -474,6 +636,7 @@ mod tests {
             base_url: None,
             capabilities: vec!["chat".to_owned()],
             embedding_dim: None,
+            pool_id: None,
             enabled: true,
             config,
         }
@@ -513,6 +676,7 @@ mod tests {
             }],
             assignments: vec![assignment(assignment_overrides)],
             triggers: vec![],
+            pools: vec![],
         }
     }
 
@@ -528,6 +692,7 @@ mod tests {
             RouterHandle::new(crate::model_routing::build_routing_table(&snapshot)),
             breakers,
             Arc::new(TriggerState::new()),
+            Arc::new(PoolRegistry::new()),
         )
     }
 
@@ -659,6 +824,7 @@ mod tests {
 
         match result {
             Err(RoutedAttemptRunError::Routing(error)) => {
+                assert_eq!(error.kind(), RoutedRoutingErrorKind::DeadlineExceeded);
                 assert!(error.to_string().contains("deadline"), "{error}");
             }
             other => panic!("expected a deadline routing error, got {other:?}"),
@@ -692,6 +858,33 @@ mod tests {
         assert!(
             !breakers.is_live_at(1, 10, Instant::now()),
             "a forty-second slice that never returned must open the breaker"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deadline_cut_attempt_returns_its_pool_permit() {
+        let mut snapshot = pooled_snapshot(3);
+        snapshot.models.truncate(1);
+        snapshot.assignments.truncate(1);
+        let pools = Arc::new(PoolRegistry::new());
+        let walker = walker_with_pools(&snapshot, Arc::clone(&pools));
+
+        let result = walker
+            .run(
+                RoutedRequestContext {
+                    workflow_key: "dialog".to_owned(),
+                    deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(5)),
+                    ..RoutedRequestContext::default()
+                },
+                |_attempt| std::future::pending::<Result<&str, std::io::Error>>(),
+                |_error| None,
+            )
+            .await;
+
+        assert!(matches!(result, Err(RoutedAttemptRunError::Routing(_))));
+        assert!(
+            pools.try_acquire(Some(1)).is_some(),
+            "the aborted attempt must free its slot"
         );
     }
 
@@ -733,6 +926,242 @@ mod tests {
             events
                 .iter()
                 .any(|event| event.event_type == "circuit_open_exhaustion")
+        );
+    }
+
+    use openplotva_storage::llm_routing::PoolRecord;
+
+    /// Two chat primaries: model 10 draws from 1-slot pool 1, model 20 is
+    /// unpooled. `max_hops` bounds started attempts.
+    fn pooled_snapshot(max_hops: i32) -> RoutingSnapshot {
+        let mut second = assignment(json!({}));
+        second.id = 101;
+        second.provider_model_id = 20;
+        second.weight = Some(50);
+        let mut first = assignment(json!({}));
+        first.weight = Some(50);
+        RoutingSnapshot {
+            providers: vec![provider(1, "aifarm"), provider(2, "vram-cloud")],
+            models: vec![
+                ModelRecord {
+                    pool_id: Some(1),
+                    ..model(10, 1, json!({}))
+                },
+                ModelRecord {
+                    model_name: "free/model".to_owned(),
+                    ..model(20, 2, json!({}))
+                },
+            ],
+            workflows: vec![WorkflowRecord {
+                key: "dialog".to_owned(),
+                kind: "chat".to_owned(),
+                full_routing: true,
+                retry_max_hops: max_hops,
+                retry_wall_ms: 60_000,
+                enabled: true,
+            }],
+            assignments: vec![first, second],
+            triggers: vec![],
+            pools: vec![PoolRecord {
+                id: 1,
+                name: "gpu".to_owned(),
+                max_concurrency: Some(1),
+                description: None,
+            }],
+        }
+    }
+
+    fn walker_with_pools(
+        snapshot: &RoutingSnapshot,
+        pools: Arc<PoolRegistry>,
+    ) -> RoutedAttemptWalker {
+        let table = crate::model_routing::build_routing_table(snapshot);
+        pools.apply(&table.pool_specs());
+        RoutedAttemptWalker::new(
+            RouterHandle::new(table),
+            Arc::new(BreakerSet::new()),
+            Arc::new(TriggerState::new()),
+            pools,
+        )
+    }
+
+    #[tokio::test]
+    async fn busy_pool_skips_to_free_candidate_without_breaker_mutation() {
+        let snapshot = pooled_snapshot(3);
+        let pools = Arc::new(PoolRegistry::new());
+        let breakers = Arc::new(BreakerSet::new());
+        let table = crate::model_routing::build_routing_table(&snapshot);
+        pools.apply(&table.pool_specs());
+        let walker = RoutedAttemptWalker::new(
+            RouterHandle::new(table),
+            Arc::clone(&breakers),
+            Arc::new(TriggerState::new()),
+            Arc::clone(&pools),
+        );
+        let _busy = pools.try_acquire(Some(1)).expect("occupy the gpu pool");
+
+        let executed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let executed_models = Arc::clone(&executed);
+        let output = walker
+            .run(
+                RoutedRequestContext {
+                    workflow_key: "dialog".to_owned(),
+                    ..RoutedRequestContext::default()
+                },
+                move |attempt| {
+                    let executed_models = Arc::clone(&executed_models);
+                    async move {
+                        executed_models
+                            .lock()
+                            .expect("models")
+                            .push(attempt.model_id);
+                        Ok::<_, std::io::Error>("ok")
+                    }
+                },
+                |_error| None,
+            )
+            .await
+            .expect("free candidate output");
+
+        assert_eq!(output, "ok");
+        assert_eq!(*executed.lock().expect("models"), vec![20]);
+        assert!(
+            breakers.is_live_at(1, 10, std::time::Instant::now()),
+            "a busy skip must not trip the breaker"
+        );
+    }
+
+    #[tokio::test]
+    async fn busy_skips_do_not_consume_the_hop_budget() {
+        let snapshot = pooled_snapshot(1);
+        let pools = Arc::new(PoolRegistry::new());
+        let walker = walker_with_pools(&snapshot, Arc::clone(&pools));
+        let _busy = pools.try_acquire(Some(1)).expect("occupy the gpu pool");
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let call_count = Arc::clone(&calls);
+        let output = walker
+            .run(
+                RoutedRequestContext {
+                    workflow_key: "dialog".to_owned(),
+                    ..RoutedRequestContext::default()
+                },
+                move |_attempt| {
+                    let call_count = Arc::clone(&call_count);
+                    async move {
+                        call_count.fetch_add(1, Ordering::Relaxed);
+                        Ok::<_, std::io::Error>("ok")
+                    }
+                },
+                |_error| None,
+            )
+            .await
+            .expect("the single hop must go to the free candidate");
+
+        assert_eq!(output, "ok");
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn all_busy_waits_for_release_then_succeeds() {
+        let mut snapshot = pooled_snapshot(3);
+        snapshot.models.truncate(1);
+        snapshot.assignments.truncate(1);
+        let pools = Arc::new(PoolRegistry::new());
+        let walker = walker_with_pools(&snapshot, Arc::clone(&pools));
+        let busy = pools.try_acquire(Some(1)).expect("occupy the gpu pool");
+
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            drop(busy);
+        });
+
+        let output = walker
+            .run(
+                RoutedRequestContext {
+                    workflow_key: "dialog".to_owned(),
+                    ..RoutedRequestContext::default()
+                },
+                |_attempt| async { Ok::<_, std::io::Error>("after wait") },
+                |_error| None,
+            )
+            .await
+            .expect("walker must wake on the released slot");
+
+        assert_eq!(output, "after wait");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slot_wait_timeout_classifies_as_capacity_unavailable() {
+        let mut snapshot = pooled_snapshot(3);
+        snapshot.models.truncate(1);
+        snapshot.assignments.truncate(1);
+        let pools = Arc::new(PoolRegistry::new());
+        let walker = walker_with_pools(&snapshot, Arc::clone(&pools))
+            .with_max_slot_wait(std::time::Duration::from_millis(50));
+        let _busy = pools.try_acquire(Some(1)).expect("occupy the gpu pool");
+
+        let result = walker
+            .run(
+                RoutedRequestContext {
+                    workflow_key: "dialog".to_owned(),
+                    ..RoutedRequestContext::default()
+                },
+                |_attempt| async { Ok::<_, std::io::Error>("unreachable") },
+                |_error| None,
+            )
+            .await;
+
+        let Err(RoutedAttemptRunError::Routing(error)) = result else {
+            panic!("expected a routing error");
+        };
+        assert_eq!(error.kind(), RoutedRoutingErrorKind::CapacityWaitTimeout);
+        // Contract with retry.rs: the rendered message classifies as a
+        // retryable CapacityUnavailable, so every call site requeues the job.
+        assert_eq!(
+            openplotva_llm::retry::retryable_reason_from_message(&error.to_string()),
+            Some(FailureReason::CapacityUnavailable)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropped_run_future_returns_the_permit() {
+        let mut snapshot = pooled_snapshot(3);
+        snapshot.models.truncate(1);
+        snapshot.assignments.truncate(1);
+        let pools = Arc::new(PoolRegistry::new());
+        let walker = walker_with_pools(&snapshot, Arc::clone(&pools));
+
+        let run = walker.run(
+            RoutedRequestContext {
+                workflow_key: "dialog".to_owned(),
+                ..RoutedRequestContext::default()
+            },
+            |_attempt| async {
+                // Hold the permit across an await that never resolves.
+                std::future::pending::<()>().await;
+                Ok::<_, std::io::Error>("never")
+            },
+            |_error| None,
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), run)
+                .await
+                .is_err(),
+            "run must still be executing when the timeout drops it"
+        );
+
+        assert!(
+            pools.try_acquire(Some(1)).is_some(),
+            "cancelling the in-flight attempt must free its slot"
+        );
+        assert_eq!(
+            pools.occupancy(),
+            vec![openplotva_llm::router::PoolOccupancy {
+                id: 1,
+                max_concurrency: Some(1),
+                in_flight: 0,
+            }]
         );
     }
 }

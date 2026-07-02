@@ -125,6 +125,31 @@ impl BreakerSet {
         }
     }
 
+    /// Point-in-time view of every tracked target, for the admin status
+    /// endpoint. Targets that never failed are not tracked and not reported.
+    #[must_use]
+    pub fn states_at(&self, now: Instant) -> Vec<BreakerStateView> {
+        let guard = self.lock();
+        let mut out: Vec<BreakerStateView> = guard
+            .iter()
+            .map(|((provider, model), state)| {
+                let cooldown_remaining = state
+                    .opened_at
+                    .and_then(|opened| state.cooldown.checked_sub(now.duration_since(opened)));
+                BreakerStateView {
+                    provider: *provider,
+                    model: *model,
+                    consecutive_failures: state.consecutive_failures,
+                    open: cooldown_remaining.is_some_and(|left| !left.is_zero()),
+                    cooldown_remaining,
+                }
+            })
+            .collect();
+        drop(guard);
+        out.sort_by_key(|view| (view.provider, view.model));
+        out
+    }
+
     /// Failure ratio over the configured window, recomputed when the window
     /// elapses. Returns `0.0` for an unknown target or an empty window.
     #[must_use]
@@ -150,6 +175,18 @@ impl BreakerSet {
         }
         f64::from(state.window_failures) / f64::from(state.window_total)
     }
+}
+
+/// Point-in-time breaker state of one target, for operator diagnostics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BreakerStateView {
+    pub provider: ProviderId,
+    pub model: ModelId,
+    pub consecutive_failures: u32,
+    /// `true` while the circuit is open and inside its cooldown.
+    pub open: bool,
+    /// Time left until a half-open probe is allowed, when open.
+    pub cooldown_remaining: Option<Duration>,
 }
 
 /// Snapshot liveness view at a fixed instant, so a single `select()` pass sees a
