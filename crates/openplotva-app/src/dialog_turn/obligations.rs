@@ -21,10 +21,14 @@ use openplotva_telegram::{
 };
 use time::{Duration as TimeDuration, OffsetDateTime};
 
-use super::signal::{DispatcherTerminalUserSignal, SignalTarget, TerminalUserSignal};
+use super::signal::{
+    DEFAULT_DIALOG_TERMINAL_REACTION_EMOJI, DispatcherTerminalUserSignal, SignalTarget,
+    TerminalUserSignal, UserSignalResult,
+};
 use crate::virtual_messages::{
     QueueTextRequest, VirtualIdFactory, monotonic_virtual_id_factory, queue_text_message_parts,
 };
+use crate::{DispatchFailureRecord, DispatchFailureRing};
 
 /// Visible in-character text when a promised generation failed, vanished, or
 /// expired. Sent as a protected reply to the trigger message.
@@ -630,13 +634,134 @@ async fn send_notice(
     }
 }
 
+/// Post-queue silence closer (review punch #4): the dispatcher failure ring
+/// plus the terminal signal that reacts on the trigger message of protected
+/// items (dialog answers, watcher notices) whose Telegram send failed
+/// terminally after they were already queued and ledger-recorded.
+pub struct DispatchFailureSignalScan {
+    pub ring: Arc<DispatchFailureRing>,
+    pub signal: Arc<dyn TerminalUserSignal>,
+}
+
+/// Counters from one dispatch-failure scan.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DispatchFailureSignalReport {
+    pub scanned: usize,
+    pub signaled: usize,
+    pub signal_failures: usize,
+    /// Permission-class failures: if the bot cannot send it cannot react
+    /// either, so these are recorded (`user_signal=failed`) without a signal.
+    pub permission_recorded: usize,
+    /// Protected failures with no recoverable trigger message id.
+    pub unaddressable: usize,
+}
+
+impl DispatchFailureSignalReport {
+    fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// Consume protected dispatcher failures recorded after `cursor` and fire the
+/// terminal reaction for each. Returns the report and the next cursor. There
+/// is no job context at dispatcher level, so the diagnostic trail is the WARN
+/// plus the ring record — no ledger row.
+pub async fn process_dispatch_failure_signals_once(
+    ring: &DispatchFailureRing,
+    signal: &dyn TerminalUserSignal,
+    cursor: u64,
+) -> (DispatchFailureSignalReport, u64) {
+    let mut report = DispatchFailureSignalReport::default();
+    let (failures, next_cursor) = ring.protected_failures_since(cursor);
+    for failure in failures {
+        report.scanned += 1;
+        signal_dispatch_failure(signal, &failure, &mut report).await;
+    }
+    (report, next_cursor)
+}
+
+async fn signal_dispatch_failure(
+    signal: &dyn TerminalUserSignal,
+    failure: &DispatchFailureRecord,
+    report: &mut DispatchFailureSignalReport,
+) {
+    let permission_class = openplotva_telegram::OutboundSendErrorClass::TerminalPermission.as_str();
+    if failure.class == permission_class {
+        report.permission_recorded += 1;
+        tracing::warn!(
+            virtual_id = failure.virtual_id,
+            chat_id = failure.chat_id,
+            class = failure.class,
+            error = failure.error,
+            user_signal = "failed",
+            "protected outbound send failed terminally; bot cannot signal in this chat"
+        );
+        return;
+    }
+    let message_id = failure
+        .reply_to_message_id
+        .and_then(|id| i32::try_from(id).ok());
+    let Some(message_id) = message_id else {
+        report.unaddressable += 1;
+        tracing::warn!(
+            virtual_id = failure.virtual_id,
+            chat_id = failure.chat_id,
+            class = failure.class,
+            error = failure.error,
+            user_signal = "failed",
+            "protected outbound send failed terminally; no trigger message to react to"
+        );
+        return;
+    };
+    let result = signal
+        .signal_turn_failure(SignalTarget {
+            chat_id: failure.chat_id,
+            thread_id: None,
+            message_id,
+            emoji: DEFAULT_DIALOG_TERMINAL_REACTION_EMOJI.to_owned(),
+            // A text fallback through the same failing dispatcher path would
+            // just re-enter the ring; the direct reaction is the only channel.
+            text_fallback_allowed: false,
+        })
+        .await;
+    match result {
+        UserSignalResult::ReactionSent => {
+            report.signaled += 1;
+            tracing::warn!(
+                virtual_id = failure.virtual_id,
+                chat_id = failure.chat_id,
+                message_id,
+                class = failure.class,
+                error = failure.error,
+                user_signal = "reaction_sent",
+                "protected outbound send failed terminally; user signaled with reaction"
+            );
+        }
+        other => {
+            report.signal_failures += 1;
+            tracing::warn!(
+                virtual_id = failure.virtual_id,
+                chat_id = failure.chat_id,
+                message_id,
+                class = failure.class,
+                error = failure.error,
+                user_signal = other.ledger_value(),
+                "protected outbound send failed terminally; terminal signal did not land"
+            );
+        }
+    }
+}
+
 /// Periodic watcher loop (poller pattern, like `run_router_trigger_poller`).
+/// Each tick resolves open obligations and, when wired, consumes protected
+/// dispatcher send failures from the failure ring (punch #4).
 pub async fn run_delivery_obligation_watcher<Stop>(
     store: Arc<dyn DeliveryObligationStore>,
     tickets: Arc<dyn TicketRecordSource>,
     notifier: Arc<dyn DeliveryObligationNotifier>,
     timeouts: DeliveryObligationTimeouts,
     interval: Duration,
+    dispatch_failures: Option<DispatchFailureSignalScan>,
     stop: Stop,
 ) where
     Stop: Future<Output = ()>,
@@ -649,6 +774,7 @@ pub async fn run_delivery_obligation_watcher<Stop>(
         interval
     };
     let mut stop = std::pin::pin!(stop);
+    let mut failure_cursor: u64 = 0;
     loop {
         tokio::select! {
             () = &mut stop => break,
@@ -663,6 +789,21 @@ pub async fn run_delivery_obligation_watcher<Stop>(
                 .await;
                 if !report.is_empty() {
                     tracing::debug!(?report, "processed delivery obligation tick");
+                }
+                if let Some(scan) = &dispatch_failures {
+                    let (failure_report, next_cursor) = process_dispatch_failure_signals_once(
+                        scan.ring.as_ref(),
+                        scan.signal.as_ref(),
+                        failure_cursor,
+                    )
+                    .await;
+                    failure_cursor = next_cursor;
+                    if !failure_report.is_empty() {
+                        tracing::debug!(
+                            ?failure_report,
+                            "processed dispatcher failure signal scan"
+                        );
+                    }
                 }
             }
         }
@@ -1062,6 +1203,103 @@ mod tests {
         assert_eq!(store.state_of(1), DELIVERY_OBLIGATION_STATE_DELIVERED);
         assert_eq!(store.row(1).result_message_id, Some(9000));
         assert!(notifier.notices().is_empty());
+    }
+
+    #[derive(Default)]
+    struct FakeSignal {
+        targets: Mutex<Vec<SignalTarget>>,
+    }
+
+    impl FakeSignal {
+        fn targets(&self) -> Vec<SignalTarget> {
+            lock(&self.targets).clone()
+        }
+    }
+
+    impl TerminalUserSignal for FakeSignal {
+        fn signal_turn_failure<'a>(
+            &'a self,
+            target: SignalTarget,
+        ) -> super::super::signal::UserSignalFuture<'a> {
+            lock(&self.targets).push(target);
+            Box::pin(async move { UserSignalResult::ReactionSent })
+        }
+    }
+
+    fn dispatch_failure(
+        virtual_id: &str,
+        class: &'static str,
+        protected: bool,
+        reply_to_message_id: Option<i64>,
+    ) -> DispatchFailureRecord {
+        DispatchFailureRecord {
+            at: base_time(),
+            virtual_id: virtual_id.to_owned(),
+            chat_id: 42,
+            method_kind: "SendMessage".to_owned(),
+            error: "send failed".to_owned(),
+            class,
+            protected,
+            reply_to_message_id,
+        }
+    }
+
+    #[tokio::test]
+    async fn failure_scan_signals_non_permission_protected_failures_and_skips_permission() {
+        let ring = DispatchFailureRing::default();
+        ring.record(dispatch_failure(
+            "v-other",
+            "terminal_other",
+            true,
+            Some(100),
+        ));
+        ring.record(dispatch_failure(
+            "v-permission",
+            "terminal_permission",
+            true,
+            Some(101),
+        ));
+        ring.record(dispatch_failure(
+            "v-unprotected",
+            "terminal_other",
+            false,
+            Some(102),
+        ));
+        ring.record(dispatch_failure("v-no-reply", "terminal_other", true, None));
+        let signal = FakeSignal::default();
+
+        let (report, cursor) = process_dispatch_failure_signals_once(&ring, &signal, 0).await;
+
+        assert_eq!(
+            report,
+            DispatchFailureSignalReport {
+                scanned: 3,
+                signaled: 1,
+                signal_failures: 0,
+                permission_recorded: 1,
+                unaddressable: 1,
+            },
+            "permission failures are recorded without a signal; \
+             unprotected records are ignored"
+        );
+        let targets = signal.targets();
+        assert_eq!(
+            targets.len(),
+            1,
+            "only the addressable non-permission failure signals"
+        );
+        assert_eq!(targets[0].chat_id, 42);
+        assert_eq!(targets[0].message_id, 100);
+        assert!(
+            !targets[0].text_fallback_allowed,
+            "dispatcher-level signals must not re-enter the failing dispatcher with text"
+        );
+
+        // The cursor consumed everything: a second scan is a no-op even though
+        // the records are still visible to GraphQL snapshots.
+        let (second, _) = process_dispatch_failure_signals_once(&ring, &signal, cursor).await;
+        assert_eq!(second, DispatchFailureSignalReport::default());
+        assert_eq!(signal.targets().len(), 1);
     }
 
     #[tokio::test]

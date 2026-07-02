@@ -35,10 +35,11 @@ pub use runtime_graphql::{
     RuntimeAifarmCapacitySnapshotData, RuntimeApiGraphqlSnapshot, RuntimeApiLiveDiagnostics,
     RuntimeApiSchema, RuntimeCacheInspector, RuntimeCacheSnapshotData, RuntimeCacheStatsData,
     RuntimeChatConnectionData, RuntimeChatData, RuntimeChatMemberData,
-    RuntimeChatMemberWithUserData, RuntimeChatsFilter, RuntimeDispatcherInspector,
-    RuntimeDispatcherStatsData, RuntimeEntityReader, RuntimeEntityReaderFuture,
-    RuntimeGeminiCachePurgeResultData, RuntimeGeminiCachePurger, RuntimeGeminiCachePurgerFuture,
-    RuntimeIngestionGatesData, RuntimeJobAnalyticsStatData, RuntimeLlmAnalyticsData,
+    RuntimeChatMemberWithUserData, RuntimeChatsFilter, RuntimeDispatchFailureData,
+    RuntimeDispatcherFailureInspector, RuntimeDispatcherInspector, RuntimeDispatcherStatsData,
+    RuntimeEntityReader, RuntimeEntityReaderFuture, RuntimeGeminiCachePurgeResultData,
+    RuntimeGeminiCachePurger, RuntimeGeminiCachePurgerFuture, RuntimeIngestionGatesData,
+    RuntimeJobAnalyticsStatData, RuntimeLlmAnalyticsData,
     RuntimeLlmAnalyticsInferenceParamStatData, RuntimeLlmAnalyticsModelSeriesPointData,
     RuntimeLlmAnalyticsModelStatData, RuntimeLlmAnalyticsProviderStatData,
     RuntimeLlmAnalyticsReader, RuntimeLlmAnalyticsReaderFuture, RuntimeLlmAnalyticsSeriesPointData,
@@ -872,8 +873,9 @@ mod tests {
         RuntimeApiGraphqlSnapshot, RuntimeApiLiveDiagnostics, RuntimeCacheInspector,
         RuntimeCacheSnapshotData, RuntimeCacheStatsData, RuntimeChatConnectionData,
         RuntimeChatData, RuntimeChatMemberData, RuntimeChatMemberWithUserData, RuntimeChatsFilter,
-        RuntimeDispatcherInspector, RuntimeDispatcherStatsData, RuntimeEntityReader,
-        RuntimeEntityReaderFuture, RuntimeGeminiCachePurgeResultData, RuntimeGeminiCachePurger,
+        RuntimeDispatchFailureData, RuntimeDispatcherFailureInspector, RuntimeDispatcherInspector,
+        RuntimeDispatcherStatsData, RuntimeEntityReader, RuntimeEntityReaderFuture,
+        RuntimeGeminiCachePurgeResultData, RuntimeGeminiCachePurger,
         RuntimeGeminiCachePurgerFuture, RuntimeJobAnalyticsStatData, RuntimeLlmAnalyticsData,
         RuntimeLlmAnalyticsModelStatData, RuntimeLlmAnalyticsProviderStatData,
         RuntimeLlmAnalyticsReader, RuntimeLlmAnalyticsReaderFuture,
@@ -2065,6 +2067,61 @@ mod tests {
         assert_eq!(request["genConfig"]["maxOutputTokens"], 512);
         assert_eq!(request["rawResponse"]["content"], "answer");
         assert_eq!(request["result"]["responseTextPreview"], "answer");
+    }
+
+    #[tokio::test]
+    async fn runtime_api_graphql_serves_dispatcher_send_failures() {
+        struct DispatcherFailureInspector;
+
+        impl RuntimeDispatcherFailureInspector for DispatcherFailureInspector {
+            fn send_failures(&self, limit: i32) -> Vec<RuntimeDispatchFailureData> {
+                assert_eq!(limit, 10);
+                vec![RuntimeDispatchFailureData {
+                    at: "2026-07-02T12:00:00Z".to_owned(),
+                    virtual_id: "dialog-vmsg-1".to_owned(),
+                    chat_id: -100,
+                    method_kind: "SendMessage".to_owned(),
+                    error: "Forbidden: bot was blocked by the user".to_owned(),
+                    class: "terminal_permission".to_owned(),
+                    protected: true,
+                    reply_to_message_id: Some(77),
+                }]
+            }
+        }
+
+        let schema = runtime_api_graphql_schema_with_live_diagnostics(
+            RuntimeApiGraphqlSnapshot::default(),
+            RuntimeApiLiveDiagnostics {
+                dispatcher_failure_inspector: Some(Arc::new(DispatcherFailureInspector)),
+                ..RuntimeApiLiveDiagnostics::default()
+            },
+        );
+        let response = schema
+            .execute(
+                r#"
+                query {
+                    dispatcherSendFailures(limit: 10) {
+                        at virtualID chatID methodKind error class protected replyToMessageID
+                    }
+                }
+                "#,
+            )
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "runtime dispatcher failure GraphQL returned errors: {:?}",
+            response.errors
+        );
+        let payload = serde_json::to_value(&response)
+            .unwrap_or_else(|error| panic!("serialize GraphQL response: {error}"));
+        let failure = &payload["data"]["dispatcherSendFailures"][0];
+        assert_eq!(failure["virtualID"], "dialog-vmsg-1");
+        assert_eq!(failure["chatID"], "-100");
+        assert_eq!(failure["methodKind"], "SendMessage");
+        assert_eq!(failure["class"], "terminal_permission");
+        assert_eq!(failure["protected"], true);
+        assert_eq!(failure["replyToMessageID"], 77);
     }
 
     #[tokio::test]

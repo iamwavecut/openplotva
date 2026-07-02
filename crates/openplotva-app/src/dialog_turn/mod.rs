@@ -30,10 +30,12 @@ pub use obligations::{
     DEFAULT_DIALOG_IMAGE_DELIVERY_TIMEOUT_SECS, DEFAULT_DIALOG_MUSIC_DELIVERY_TIMEOUT_SECS,
     DEFAULT_DIALOG_OBLIGATION_WATCH_INTERVAL_SECS, DeliveryObligationAnnotator,
     DeliveryObligationNotifier, DeliveryObligationRecorder, DeliveryObligationStore,
-    DeliveryObligationTimeouts, DispatcherDeliveryObligationNotifier, FallbackTicketRecordSource,
-    OBLIGATION_EXTENDED_NOTICE, OBLIGATION_FAILURE_NOTICE, ObligationError, ObligationFuture,
-    ObligationNoticeResult, ObligationNoticeTarget, ObligationWatchTickReport, TicketRecordSource,
-    process_delivery_obligations_once, run_delivery_obligation_watcher,
+    DeliveryObligationTimeouts, DispatchFailureSignalReport, DispatchFailureSignalScan,
+    DispatcherDeliveryObligationNotifier, FallbackTicketRecordSource, OBLIGATION_EXTENDED_NOTICE,
+    OBLIGATION_FAILURE_NOTICE, ObligationError, ObligationFuture, ObligationNoticeResult,
+    ObligationNoticeTarget, ObligationWatchTickReport, TicketRecordSource,
+    process_delivery_obligations_once, process_dispatch_failure_signals_once,
+    run_delivery_obligation_watcher,
 };
 pub use outcome::{
     JobDisposition, REASON_QUEUE_BACKLOG_EXPIRED, TurnOutcome, TurnResolution, UserSignalPlan,

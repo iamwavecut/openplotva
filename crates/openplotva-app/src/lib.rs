@@ -64,6 +64,11 @@ pub mod virtual_messages;
 pub mod vision;
 pub mod youtube;
 
+pub use runtime_dispatcher::{
+    DISPATCH_FAILURE_CLASS_CHAT_RATE_LIMITED, DISPATCH_FAILURE_CLASS_MISSING_METHOD,
+    DispatchFailureRecord, DispatchFailureRing, reply_message_id_from_fingerprint_key,
+};
+
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     convert::Infallible,
@@ -9060,6 +9065,7 @@ async fn start_runtime_workers(
     let virtual_dialog_manager =
         runtime_virtual_dialog::RuntimeVirtualDialogManagerHandle::default();
     let dispatcher_inspector = runtime_dispatcher::RuntimeDispatcherInspectorHandle::default();
+    let dispatch_failure_ring = Arc::new(DispatchFailureRing::default());
     let cache_inspector = runtime_cache::RuntimeCacheInspectorHandle::default();
     let mut workers = RuntimeWorkers {
         handles: Vec::new(),
@@ -9230,6 +9236,9 @@ async fn start_runtime_workers(
     let turn_outcome_cleanup_pool = service_clients.postgres.clone();
     let turn_outcome_cleanup_stop = stop.subscribe();
     let turn_outcome_cleanup_worker = tokio::spawn(async move {
+        let obligation_store = openplotva_storage::PostgresDeliveryObligationStore::new(
+            turn_outcome_cleanup_pool.clone(),
+        );
         let mut stop = std::pin::pin!(wait_for_runtime_stop(turn_outcome_cleanup_stop));
         loop {
             tokio::select! {
@@ -9248,6 +9257,24 @@ async fn start_runtime_workers(
                         Ok(_) => {}
                         Err(error) => {
                             tracing::warn!(%error, "dialog turn outcome cleanup failed");
+                        }
+                    }
+                    match obligation_store
+                        .delete_resolved_delivery_obligations_batch(30, 5_000)
+                        .await
+                    {
+                        Ok(deleted) if deleted > 0 => {
+                            tracing::info!(
+                                deleted,
+                                "deleted old resolved dialog delivery obligations"
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            tracing::warn!(
+                                %error,
+                                "dialog delivery obligation cleanup failed"
+                            );
                         }
                     }
                 }
@@ -9457,6 +9484,8 @@ async fn start_runtime_workers(
             taskman_inspector: Some(runtime_taskman_reader),
             updates_inspector: Some(Arc::new(updates_inspector.clone())),
             dispatcher_inspector: Some(Arc::new(dispatcher_inspector.clone())),
+            dispatcher_failure_inspector: Some(Arc::clone(&dispatch_failure_ring)
+                as Arc<dyn openplotva_server::RuntimeDispatcherFailureInspector>),
             cache_inspector: Some(Arc::new(cache_inspector.clone())),
             memory_restarter: config.memory.enabled.then(|| {
                 Arc::new(memory_runtime::RuntimeMemoryRestarter::new(
@@ -10255,14 +10284,19 @@ async fn start_runtime_workers(
                     service_clients.postgres.clone(),
                 )),
             ));
+        let watcher_signal = dialog_turn::DispatcherTerminalUserSignal::new(
+            telegram.clone(),
+            Arc::clone(&dispatcher_queue),
+        );
         let watcher_notifier: Arc<dyn dialog_turn::DeliveryObligationNotifier> =
             Arc::new(dialog_turn::DispatcherDeliveryObligationNotifier::new(
                 Arc::clone(&dispatcher_queue),
-                dialog_turn::DispatcherTerminalUserSignal::new(
-                    telegram.clone(),
-                    Arc::clone(&dispatcher_queue),
-                ),
+                watcher_signal.clone(),
             ));
+        let watcher_dispatch_failures = dialog_turn::DispatchFailureSignalScan {
+            ring: Arc::clone(&dispatch_failure_ring),
+            signal: Arc::new(watcher_signal),
+        };
         let watcher_timeouts = dialog_turn::DeliveryObligationTimeouts::from_secs(
             config.llm.dialog.image_delivery_timeout_secs,
             config.llm.dialog.music_delivery_timeout_secs,
@@ -10277,6 +10311,7 @@ async fn start_runtime_workers(
                 watcher_notifier,
                 watcher_timeouts,
                 watcher_interval,
+                Some(watcher_dispatch_failures),
                 wait_for_runtime_stop(watcher_stop),
             )
             .await;
@@ -11188,6 +11223,7 @@ async fn start_runtime_workers(
     let immediate_rate_limits = Arc::clone(&rate_limit_policy);
     let immediate_permissions = Arc::clone(&permission_policy);
     let immediate_queue = Arc::clone(&dispatcher_queue);
+    let immediate_failure_ring = Arc::clone(&dispatch_failure_ring);
     let immediate_stop = stop.subscribe();
     let immediate_worker = tokio::spawn(async move {
         let outcome = immediate_queue
@@ -11199,6 +11235,7 @@ async fn start_runtime_workers(
                     immediate_ephemeral.clone(),
                     Arc::clone(&immediate_rate_limits),
                     Arc::clone(&immediate_permissions),
+                    Some(Arc::clone(&immediate_failure_ring)),
                     item,
                 )
             })
@@ -11703,6 +11740,7 @@ async fn start_runtime_workers(
     let regular_permissions = Arc::clone(&permission_policy);
     let regular_queue = Arc::clone(&dispatcher_queue);
     let regular_limiters = Arc::clone(&dispatcher_limiters);
+    let regular_failure_ring = Arc::clone(&dispatch_failure_ring);
     let regular_stop = stop.subscribe();
     let regular_worker = tokio::spawn(async move {
         let outcome = regular_queue
@@ -11717,6 +11755,7 @@ async fn start_runtime_workers(
                         regular_ephemeral.clone(),
                         Arc::clone(&regular_rate_limits),
                         Arc::clone(&regular_permissions),
+                        Some(Arc::clone(&regular_failure_ring)),
                         item,
                     )
                 },
@@ -11920,6 +11959,7 @@ async fn send_dispatcher_work_item(
     ephemeral: RedisEphemeralMessageStore,
     rate_limits: Arc<rate_limits::ChatRateLimitPolicy<RedisRateLimitStore>>,
     permissions: Arc<permissions::ChatPermissionPolicy<PostgresChatSettingsStore>>,
+    failure_ring: Option<Arc<DispatchFailureRing>>,
     item: openplotva_telegram::DispatcherWorkItem,
 ) -> openplotva_telegram::DispatcherSendStatus {
     send_dispatcher_work_item_with_transport_and_history(
@@ -11927,9 +11967,15 @@ async fn send_dispatcher_work_item(
         ephemeral,
         rate_limits,
         permissions,
+        failure_ring,
         item,
-        |method| async move {
-            openplotva_telegram::execute_telegram_method_with_rich(&telegram, &rich, method).await
+        |method| {
+            let telegram = telegram.clone();
+            let rich = rich.clone();
+            async move {
+                openplotva_telegram::execute_telegram_method_with_rich(&telegram, &rich, method)
+                    .await
+            }
         },
     )
     .await
@@ -11945,7 +11991,7 @@ async fn send_dispatcher_work_item_with_transport<R, P, SendFn, SendFuture>(
 where
     R: rate_limits::RateLimitStore + Send + Sync,
     P: permissions::ChatPermissionStore + Send + Sync,
-    SendFn: FnOnce(openplotva_telegram::TelegramOutboundMethod) -> SendFuture,
+    SendFn: Fn(openplotva_telegram::TelegramOutboundMethod) -> SendFuture,
     SendFuture: Future<
         Output = Result<
             openplotva_telegram::TelegramOutboundResponse,
@@ -11958,17 +12004,20 @@ where
         virtual_messages::NoopEphemeralMessageTracker,
         rate_limits,
         permissions,
+        None,
         item,
         send,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_dispatcher_work_item_with_transport_and_history<H, E, R, P, SendFn, SendFuture>(
     history: H,
     ephemeral: E,
     rate_limits: Arc<rate_limits::ChatRateLimitPolicy<R>>,
     permissions: Arc<permissions::ChatPermissionPolicy<P>>,
+    failure_ring: Option<Arc<DispatchFailureRing>>,
     item: openplotva_telegram::DispatcherWorkItem,
     send: SendFn,
 ) -> openplotva_telegram::DispatcherSendStatus
@@ -11977,7 +12026,7 @@ where
     E: virtual_messages::EphemeralMessageTracker + Sync,
     R: rate_limits::RateLimitStore + Send + Sync,
     P: permissions::ChatPermissionStore + Send + Sync,
-    SendFn: FnOnce(openplotva_telegram::TelegramOutboundMethod) -> SendFuture,
+    SendFn: Fn(openplotva_telegram::TelegramOutboundMethod) -> SendFuture,
     SendFuture: Future<
         Output = Result<
             openplotva_telegram::TelegramOutboundResponse,
@@ -11987,6 +12036,28 @@ where
 {
     let chat_id = item.metadata().chat_id;
     let bypass_chat_restrictions = item.bypasses_chat_restrictions();
+    let virtual_id = item.metadata().virtual_id.clone();
+    let protected = item.metadata().protected;
+    let reply_to_message_id =
+        reply_message_id_from_fingerprint_key(&item.metadata().fingerprint_key);
+    let method_kind_label = item
+        .method_kind()
+        .map(|kind| format!("{kind:?}"))
+        .unwrap_or_else(|| "none".to_owned());
+    let record_failure = |error: String, class: &'static str| {
+        if let Some(ring) = failure_ring.as_deref() {
+            ring.record(DispatchFailureRecord {
+                at: OffsetDateTime::now_utc(),
+                virtual_id: virtual_id.clone(),
+                chat_id,
+                method_kind: method_kind_label.clone(),
+                error,
+                class,
+                protected,
+                reply_to_message_id,
+            });
+        }
+    };
     if chat_id != 0 {
         let check = rate_limits
             .is_rate_limited_at(chat_id, OffsetDateTime::now_utc())
@@ -12000,6 +12071,10 @@ where
         }
         if check.rate_limited {
             tracing::debug!(chat_id, "skipping Telegram send for rate-limited chat");
+            record_failure(
+                "skipped send for rate-limited chat".to_owned(),
+                DISPATCH_FAILURE_CLASS_CHAT_RATE_LIMITED,
+            );
             return openplotva_telegram::DispatcherSendStatus::Failed;
         }
     }
@@ -12025,11 +12100,16 @@ where
                     action,
                     "skipping Telegram send for chat permission settings"
                 );
+                record_failure(
+                    format!("skipped send: chat permission settings deny {action}"),
+                    openplotva_telegram::OutboundSendErrorClass::TerminalPermission.as_str(),
+                );
                 return openplotva_telegram::DispatcherSendStatus::Failed;
             }
         }
     }
 
+    let retry_virtual_id = virtual_id.clone();
     let report = virtual_messages::send_work_item_with_history_and_ephemeral(
         &history,
         &ephemeral,
@@ -12040,7 +12120,14 @@ where
             let permissions = Arc::clone(&permissions);
             async move {
                 let method_kind = method.kind();
-                match send(method).await {
+                match openplotva_telegram::send_outbound_method_with_bounded_retry(
+                    &send,
+                    method,
+                    &retry_virtual_id,
+                    chat_id,
+                )
+                .await
+                {
                     Ok(response) => Ok(response),
                     Err(error) => {
                         if matches!(
@@ -12107,6 +12194,24 @@ where
             ephemeral_track_error = ?report.ephemeral_track_error,
             "failed to track outbound ephemeral message"
         );
+    }
+    if matches!(
+        report.status,
+        openplotva_telegram::DispatcherSendStatus::Failed
+    ) {
+        let error_class = report
+            .error_class
+            .unwrap_or(DISPATCH_FAILURE_CLASS_MISSING_METHOD);
+        let send_error = report.send_error.clone().unwrap_or_default();
+        tracing::warn!(
+            virtual_id = report.virtual_id,
+            chat_id,
+            error_class,
+            send_error,
+            method_kind = method_kind_label,
+            "outbound dispatcher send failed"
+        );
+        record_failure(send_error, error_class);
     }
     report.status
 }
@@ -12287,12 +12392,12 @@ mod tests {
     use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
     use super::{
-        AdminMemoryOverride, GO_ADMIN_API_ROUTE_PATTERNS, GO_DISPATCHER_DEBOUNCE_CACHE_SIZE,
-        GO_DISPATCHER_DEBOUNCE_WINDOW, GO_DISPATCHER_MAX_QUEUE_SIZE, RuntimeUnhandledUpdateHandler,
-        SettingsInitDataDecision, WebhookShutdownCleanupReport, admin_auth_check,
-        admin_auth_date_is_fresh, admin_auth_query_values, admin_auth_response,
-        admin_auth_user_state, admin_bootstrap, admin_chat_get_response,
-        admin_chats_search_by_member_response, admin_i64_from_json,
+        AdminMemoryOverride, DispatchFailureRing, GO_ADMIN_API_ROUTE_PATTERNS,
+        GO_DISPATCHER_DEBOUNCE_CACHE_SIZE, GO_DISPATCHER_DEBOUNCE_WINDOW,
+        GO_DISPATCHER_MAX_QUEUE_SIZE, RuntimeUnhandledUpdateHandler, SettingsInitDataDecision,
+        WebhookShutdownCleanupReport, admin_auth_check, admin_auth_date_is_fresh,
+        admin_auth_query_values, admin_auth_response, admin_auth_user_state, admin_bootstrap,
+        admin_chat_get_response, admin_chats_search_by_member_response, admin_i64_from_json,
         admin_llm_analytics_summary_json, admin_llm_requests_clear_response,
         admin_llm_requests_filter, admin_llm_requests_response, admin_loglevel_response,
         admin_memory_cards_response, admin_memory_resolve_override, admin_memory_restart_override,
@@ -12318,11 +12423,12 @@ mod tests {
         routing_json_config_patch, run_long_poll_update_producer_after_delete_webhook,
         run_webhook_update_producer_after_set_webhook, runtime_api_graphql_snapshot,
         runtime_redis_prefix_groups_from_keys, runtime_redis_value_from_bytes,
-        send_dispatcher_work_item_with_transport, settings_chat_display,
+        send_dispatcher_work_item_with_transport,
+        send_dispatcher_work_item_with_transport_and_history, settings_chat_display,
         settings_chat_full_info_type_name, settings_chat_state_from_full_info,
         settings_get_response, settings_reply_flags, shield_history_tail_messages_from_config,
         shield_options_from_config, static_web_asset_response, static_web_routes,
-        telegram_webhook_response,
+        telegram_webhook_response, virtual_messages,
     };
     use crate::permissions::{
         ChatPermissionContext, ChatPermissionPolicy, ChatPermissionStore, ChatPermissionStoreFuture,
@@ -12565,6 +12671,98 @@ mod tests {
         assert_eq!(status, DispatcherSendStatus::Sent);
         assert!(*lock(&called));
         assert!(permission_store.saved_updates().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dispatcher_send_retries_short_rate_limit_then_succeeds() -> Result<(), Box<dyn Error>>
+    {
+        let rate_limits = Arc::new(ChatRateLimitPolicy::new(RateLimitStoreStub));
+        let permission_store = PermissionStoreStub::with_context(ChatPermissionContext {
+            chat_type: Some("supergroup".to_owned()),
+            settings: Some(ChatSettings::defaults(42)),
+        });
+        let permissions = Arc::new(ChatPermissionPolicy::new(permission_store));
+        let item = queued_method_item(TelegramOutboundMethod::from(SendMessage::new(42, "hello")));
+        let calls = Arc::new(Mutex::new(0u32));
+        let calls_for_send = Arc::clone(&calls);
+
+        let status =
+            send_dispatcher_work_item_with_transport(rate_limits, permissions, item, move |_| {
+                let attempt = {
+                    let mut calls = lock(&calls_for_send);
+                    *calls += 1;
+                    *calls
+                };
+                async move {
+                    if attempt == 1 {
+                        Err(openplotva_telegram::TelegramOutboundExecuteError::from(
+                            openplotva_telegram::RichApiError::Api {
+                                code: 429,
+                                description: "Too Many Requests: retry after 1".to_owned(),
+                                retry_after: Some(1),
+                            },
+                        ))
+                    } else {
+                        Ok(TelegramOutboundResponse::Message(Box::new(
+                            telegram_message(42, 100),
+                        )))
+                    }
+                }
+            })
+            .await;
+
+        assert_eq!(status, DispatcherSendStatus::Sent);
+        assert_eq!(*lock(&calls), 2, "one inline retry after the short 429");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dispatcher_send_records_terminal_failure_in_ring() -> Result<(), Box<dyn Error>> {
+        let rate_limits = Arc::new(ChatRateLimitPolicy::new(RateLimitStoreStub));
+        let permission_store = PermissionStoreStub::with_context(ChatPermissionContext {
+            chat_type: Some("supergroup".to_owned()),
+            settings: Some(ChatSettings::defaults(42)),
+        });
+        let permissions = Arc::new(ChatPermissionPolicy::new(permission_store));
+        let ring = Arc::new(DispatchFailureRing::default());
+        let queue = DispatcherQueue::new(DispatcherConfig::default());
+        queue.enqueue(
+            DispatcherMessage::new(
+                MessageFingerprint {
+                    chat_id: 42,
+                    message_type: "text".to_owned(),
+                    content_hash: 7,
+                    debounce_key: Some("r100".to_owned()),
+                },
+                "v-protected",
+            )
+            .with_method(TelegramOutboundMethod::from(SendMessage::new(42, "hello")))
+            .with_protected(true),
+            true,
+        );
+        let item = queue.dequeue_immediate().expect("queued work item");
+
+        let status = send_dispatcher_work_item_with_transport_and_history(
+            virtual_messages::NoopEditHistorySink,
+            virtual_messages::NoopEphemeralMessageTracker,
+            rate_limits,
+            permissions,
+            Some(Arc::clone(&ring)),
+            item,
+            |_| async { Err::<TelegramOutboundResponse, _>(permission_error()) },
+        )
+        .await;
+
+        assert_eq!(status, DispatcherSendStatus::Failed);
+        let failures = ring.snapshot(10);
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].virtual_id, "v-protected");
+        assert_eq!(failures[0].chat_id, 42);
+        assert_eq!(failures[0].method_kind, "SendMessage");
+        assert_eq!(failures[0].class, "terminal_permission");
+        assert!(failures[0].protected);
+        assert_eq!(failures[0].reply_to_message_id, Some(100));
         Ok(())
     }
 

@@ -842,6 +842,8 @@ where
             immediate: true,
             bypass_chat_restrictions: false,
             ephemeral_delete_after,
+            protected: false,
+            debounce_key: None,
         },
         next_virtual_id,
     )

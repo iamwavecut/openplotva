@@ -695,6 +695,8 @@ impl NewMembersGreetingSender for TelegramJoinGreetingSender {
                     immediate: true,
                     bypass_chat_restrictions: false,
                     ephemeral_delete_after: Some(message.delete_after),
+                    protected: false,
+                    debounce_key: None,
                 },
                 || self.next_virtual_id(),
             )

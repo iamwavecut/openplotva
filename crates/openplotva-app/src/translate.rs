@@ -252,6 +252,8 @@ impl TranslateEffects for TranslateDispatcherEffects {
                     immediate: false,
                     bypass_chat_restrictions: false,
                     ephemeral_delete_after: None,
+                    protected: false,
+                    debounce_key: None,
                 },
                 || (self.next_virtual_id)(),
             )

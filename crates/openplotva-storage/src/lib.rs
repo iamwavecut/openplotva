@@ -6648,6 +6648,31 @@ impl PostgresDeliveryObligationStore {
         Ok(row.is_some())
     }
 
+    /// Delete resolved obligations older than the retention window, in bounded
+    /// batches. Open rows (pending/extended) have `resolved_at IS NULL` and are
+    /// never touched regardless of age.
+    pub async fn delete_resolved_delivery_obligations_batch(
+        &self,
+        retention_days: i32,
+        batch_size: i64,
+    ) -> Result<u64, StorageError> {
+        if retention_days <= 0 || batch_size <= 0 {
+            return Ok(0);
+        }
+        let result = sqlx::query(
+            "DELETE FROM dialog_delivery_obligations WHERE id IN (\
+                 SELECT id FROM dialog_delivery_obligations \
+                 WHERE resolved_at IS NOT NULL \
+                   AND resolved_at < now() - make_interval(days => $1) \
+                 ORDER BY id ASC LIMIT $2)",
+        )
+        .bind(retention_days)
+        .bind(batch_size)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     /// Backfill the dialog taskman job id after turn finalization
     /// (update-if-placeholder; never overwrites a known id).
     pub async fn annotate_delivery_obligation_dialog_job(
@@ -8770,6 +8795,88 @@ mod tests {
         sqlx::query("DELETE FROM whitecircle_checks WHERE source = 'test_ret_marker'")
             .execute(&pool)
             .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delete_resolved_delivery_obligations_batch_short_circuits_disabled_retention()
+    -> Result<(), Box<dyn Error>> {
+        // The lazy pool never connects; any query would fail, so a clean Ok(0)
+        // proves the disabled-retention guard returns before touching Postgres.
+        let pool = PgPoolOptions::new().connect_lazy("postgres://guard@127.0.0.1:1/never")?;
+        let store = super::PostgresDeliveryObligationStore::new(pool);
+
+        assert_eq!(
+            store
+                .delete_resolved_delivery_obligations_batch(0, 5_000)
+                .await?,
+            0
+        );
+        assert_eq!(
+            store
+                .delete_resolved_delivery_obligations_batch(30, 0)
+                .await?,
+            0
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delete_resolved_delivery_obligations_batch_removes_only_resolved_aged_rows()
+    -> Result<(), Box<dyn Error>> {
+        let Ok(dsn) = env::var("OPENPLOTVA_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&dsn)
+            .await?;
+        super::run_migrations_on(&pool).await?;
+        sqlx::query(
+            "DELETE FROM dialog_delivery_obligations \
+             WHERE ticket_job_id IN (900101, 900102, 900103)",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO dialog_delivery_obligations \
+             (chat_id, thread_id, user_id, trigger_message_id, dialog_job_id, kind, \
+              ticket_job_id, deadline_at, state, resolved_at) \
+             VALUES \
+             (42, NULL, 7, 100, 0, 'image_generation_job', 900101, now(), \
+              'delivered', now() - interval '45 days'), \
+             (42, NULL, 7, 101, 0, 'image_generation_job', 900102, now(), \
+              'delivered', now()), \
+             (42, NULL, 7, 102, 0, 'image_generation_job', 900103, \
+              now() - interval '45 days', 'pending', NULL)",
+        )
+        .execute(&pool)
+        .await?;
+        let store = super::PostgresDeliveryObligationStore::new(pool.clone());
+
+        let deleted = store
+            .delete_resolved_delivery_obligations_batch(30, 5_000)
+            .await?;
+
+        assert!(deleted >= 1);
+        let remaining: Vec<i64> = sqlx::query_scalar(
+            "SELECT ticket_job_id FROM dialog_delivery_obligations \
+             WHERE ticket_job_id IN (900101, 900102, 900103) ORDER BY ticket_job_id",
+        )
+        .fetch_all(&pool)
+        .await?;
+        assert_eq!(
+            remaining,
+            vec![900102, 900103],
+            "only the resolved row past retention is deleted; \
+             fresh-resolved and open rows survive"
+        );
+        sqlx::query(
+            "DELETE FROM dialog_delivery_obligations \
+             WHERE ticket_job_id IN (900101, 900102, 900103)",
+        )
+        .execute(&pool)
+        .await?;
         Ok(())
     }
 
