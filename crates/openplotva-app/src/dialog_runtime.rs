@@ -96,6 +96,7 @@ impl ChatProvider for RouterChatProvider {
                         chat_id: (input.context.chat_id != 0).then_some(input.context.chat_id),
                         thread_id: input.context.thread_id,
                         message_id: (input.message.id != 0).then_some(input.message.id),
+                        deadline: crate::dialog_turn::current_turn_deadline(),
                         suppress_all_attempts_exhausted_admin_report: true,
                         ..RoutedRequestContext::default()
                     },
@@ -890,6 +891,49 @@ mod tests {
         let inputs = routed_provider.inputs();
         assert_eq!(inputs[0].model, "openrouter/provider/model");
         assert_eq!(inputs[0].max_output_tokens, 123);
+    }
+
+    #[tokio::test]
+    async fn router_chat_provider_honors_turn_deadline_task_local() {
+        let default_provider = Arc::new(SequencedProvider::new("unused", vec![]));
+        let routed_provider = Arc::new(SequencedProvider::new(
+            "aifarm",
+            vec![Ok(DialogOutput {
+                provider: "aifarm".to_owned(),
+                answer: "should not run".to_owned(),
+                ..DialogOutput::default()
+            })],
+        ));
+        let routed_provider_dyn: DialogProviderHandle = routed_provider.clone();
+        let mut clients = HashMap::new();
+        clients.insert("aifarm".to_owned(), routed_provider_dyn);
+        let provider = router_provider_for_test(
+            routed_dialog_snapshot(),
+            default_provider,
+            clients,
+            crate::runtime_routing::RoutingEventReporter::new(
+                crate::runtime_routing::RoutingEventBuffer::new(8),
+                None,
+                None,
+                std::time::Duration::from_secs(600),
+            ),
+        );
+
+        let expired = std::time::Instant::now();
+        let error = crate::dialog_turn::TURN_DEADLINE
+            .scope(Some(expired), provider.run_dialog(DialogInput::default()))
+            .await
+            .err();
+
+        assert!(error.is_some(), "expired deadline must stop the walker");
+        assert_eq!(routed_provider.calls(), 0);
+
+        let output = provider
+            .run_dialog(DialogInput::default())
+            .await
+            .expect("dialog output without a deadline");
+        assert_eq!(output.answer, "should not run");
+        assert_eq!(routed_provider.calls(), 1);
     }
 
     #[tokio::test]

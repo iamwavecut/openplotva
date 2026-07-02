@@ -86,6 +86,7 @@ pub struct DispatcherMessage {
     persistence_payload: Option<DispatcherPersistencePayload>,
     bypass_chat_restrictions: bool,
     ephemeral_delete_after: Option<Duration>,
+    protected: bool,
 }
 
 impl DispatcherMessage {
@@ -98,6 +99,7 @@ impl DispatcherMessage {
             persistence_payload: None,
             bypass_chat_restrictions: false,
             ephemeral_delete_after: None,
+            protected: false,
         }
     }
 
@@ -119,6 +121,19 @@ impl DispatcherMessage {
 
     pub fn with_ephemeral_delete_after(mut self, duration: Duration) -> Self {
         self.ephemeral_delete_after = Some(duration);
+        self
+    }
+
+    /// Mark this message as protected from queue-overflow trimming.
+    pub fn with_protected(mut self, protected: bool) -> Self {
+        self.protected = protected;
+        self
+    }
+
+    /// Namespace the dedupe fingerprint so identical content in different
+    /// contexts (e.g. replies to different messages) does not collide.
+    pub fn with_debounce_key(mut self, debounce_key: impl Into<String>) -> Self {
+        self.fingerprint.debounce_key = Some(debounce_key.into());
         self
     }
 }
@@ -215,6 +230,8 @@ pub struct DispatcherQueuedMessage {
     pub added_at: Instant,
     pub enqueued_at: SystemTime,
     pub ephemeral_delete_after: Option<Duration>,
+    /// Whether the item is protected from queue-overflow trimming.
+    pub protected: bool,
 }
 
 /// Worker-owned queue item containing cloneable metadata plus the send payload.
@@ -328,6 +345,8 @@ pub struct DispatcherStats {
     /// Number of successfully processed messages.
     pub processed_total: i64,
     pub deduped_total: i64,
+    /// Number of queued messages dropped by queue-overflow trimming.
+    pub trimmed_total: u64,
     /// Age of the oldest regular queue item.
     pub oldest_regular_age: Duration,
     /// Age of the oldest immediate queue item.
@@ -349,6 +368,7 @@ struct DispatcherQueueState {
     immediate: VecDeque<DispatcherQueueItem>,
     processed_total: i64,
     deduped_total: i64,
+    trimmed_total: u64,
 }
 
 #[derive(Debug)]
@@ -810,10 +830,17 @@ impl DispatcherQueue {
             persistence_payload,
             bypass_chat_restrictions,
             ephemeral_delete_after,
+            protected,
         } = message;
 
         if !immediate && !self.debouncer.should_process_at(&fingerprint, now) {
             self.state().deduped_total += 1;
+            tracing::debug!(
+                virtual_id = %virtual_id,
+                chat_id = fingerprint.chat_id,
+                fingerprint = %fingerprint,
+                "outbound message deduped"
+            );
             return EnqueueOutcome::Deduped;
         }
 
@@ -826,6 +853,7 @@ impl DispatcherQueue {
                 added_at: now,
                 enqueued_at: SystemTime::now(),
                 ephemeral_delete_after,
+                protected,
             },
             method,
             persistence_payload,
@@ -833,22 +861,7 @@ impl DispatcherQueue {
             ephemeral_delete_after,
         };
 
-        {
-            let mut state = self.state();
-            if immediate {
-                state.immediate.push_back(queued);
-                trim_queue(&mut state.immediate, self.config.max_queue_size);
-            } else {
-                state.regular.push_back(queued);
-                trim_queue(&mut state.regular, self.config.max_queue_size);
-            }
-        }
-
-        if immediate {
-            self.immediate_notify.notify_one();
-        } else {
-            self.regular_notify.notify_one();
-        }
+        self.push_queue_item_at(queued, now);
 
         if !immediate {
             self.debouncer.record_sent_at(&fingerprint, now);
@@ -891,6 +904,7 @@ impl DispatcherQueue {
                 added_at: added_instant_for_enqueued_at(enqueued_at, now, wall_now),
                 enqueued_at,
                 ephemeral_delete_after,
+                protected: false,
             },
             method: Some(method),
             persistence_payload,
@@ -898,23 +912,26 @@ impl DispatcherQueue {
             ephemeral_delete_after,
         };
 
-        self.push_queue_item(queued);
+        self.push_queue_item_at(queued, now);
 
         EnqueueOutcome::Enqueued
     }
 
-    fn push_queue_item(&self, queued: DispatcherQueueItem) {
+    fn push_queue_item_at(&self, queued: DispatcherQueueItem, now: Instant) {
         let immediate = queued.metadata.immediate;
-        {
+        let dropped = {
             let mut state = self.state();
-            if immediate {
+            let dropped = if immediate {
                 state.immediate.push_back(queued);
-                trim_queue(&mut state.immediate, self.config.max_queue_size);
+                trim_queue(&mut state.immediate, self.config.max_queue_size)
             } else {
                 state.regular.push_back(queued);
-                trim_queue(&mut state.regular, self.config.max_queue_size);
-            }
-        }
+                trim_queue(&mut state.regular, self.config.max_queue_size)
+            };
+            state.trimmed_total += dropped.len() as u64;
+            dropped
+        };
+        log_trimmed_items(&dropped, now);
 
         if immediate {
             self.immediate_notify.notify_one();
@@ -1027,6 +1044,7 @@ impl DispatcherQueue {
             immediate_queue_size: state.immediate.len(),
             processed_total: state.processed_total,
             deduped_total: state.deduped_total + self.debouncer.deduped_count(),
+            trimmed_total: state.trimmed_total,
             oldest_regular_age: oldest_age(&state.regular, now),
             oldest_immediate_age: oldest_age(&state.immediate, now),
         }
@@ -1068,12 +1086,73 @@ impl DispatcherQueue {
     }
 }
 
-fn trim_queue(queue: &mut VecDeque<DispatcherQueueItem>, max_queue_size: usize) {
+struct TrimmedQueueItem {
+    metadata: DispatcherQueuedMessage,
+    /// Whether the drop ignored trim protection because of the hard cap.
+    forced: bool,
+}
+
+fn trim_queue(
+    queue: &mut VecDeque<DispatcherQueueItem>,
+    max_queue_size: usize,
+) -> Vec<TrimmedQueueItem> {
+    let mut dropped = Vec::new();
     if max_queue_size == 0 {
-        return;
+        return dropped;
     }
+    let mut scan_from = 0;
     while queue.len() > max_queue_size {
-        queue.pop_front();
+        let Some(index) = queue
+            .iter()
+            .skip(scan_from)
+            .position(|item| !item.metadata.protected)
+            .map(|offset| offset + scan_from)
+        else {
+            break;
+        };
+        // Everything before `index` is protected and stays protected; resume there.
+        scan_from = index;
+        if let Some(item) = queue.remove(index) {
+            dropped.push(TrimmedQueueItem {
+                metadata: item.metadata,
+                forced: false,
+            });
+        }
+    }
+    // A fully protected backlog must not grow without bound: past twice the
+    // limit, drop oldest items regardless of protection.
+    while queue.len() > max_queue_size.saturating_mul(2) {
+        if let Some(item) = queue.pop_front() {
+            dropped.push(TrimmedQueueItem {
+                metadata: item.metadata,
+                forced: true,
+            });
+        }
+    }
+    dropped
+}
+
+fn log_trimmed_items(dropped: &[TrimmedQueueItem], now: Instant) {
+    for trimmed in dropped {
+        let metadata = &trimmed.metadata;
+        let age_ms = now.saturating_duration_since(metadata.added_at).as_millis() as u64;
+        if trimmed.forced {
+            tracing::error!(
+                virtual_id = %metadata.virtual_id,
+                chat_id = metadata.chat_id,
+                immediate = metadata.immediate,
+                age_ms,
+                "dispatcher queue exceeded hard cap; dropped protected outbound message"
+            );
+        } else {
+            tracing::warn!(
+                virtual_id = %metadata.virtual_id,
+                chat_id = metadata.chat_id,
+                immediate = metadata.immediate,
+                age_ms,
+                "dispatcher queue full; dropped outbound message"
+            );
+        }
     }
 }
 
@@ -2073,6 +2152,7 @@ mod tests {
         assert_eq!(stats.immediate_queue_size, 1);
         assert_eq!(stats.processed_total, 0);
         assert_eq!(stats.deduped_total, 0);
+        assert_eq!(stats.trimmed_total, 0);
         assert!(stats.oldest_regular_age >= Duration::from_secs(12));
         assert!(stats.oldest_immediate_age >= Duration::from_secs(7));
     }
@@ -2216,6 +2296,112 @@ mod tests {
             virtual_ids(queue.snapshot()),
             (vec!["regular-2".to_owned()], vec!["immediate-2".to_owned()])
         );
+    }
+
+    #[test]
+    fn trim_queue_skips_protected_items_and_counts_drops() {
+        let queue = DispatcherQueue::new(DispatcherConfig {
+            max_queue_size: 2,
+            ..DispatcherConfig::default()
+        });
+        let now = std::time::Instant::now();
+
+        queue.enqueue_at(
+            text_message(42, "protected", "protected-1").with_protected(true),
+            false,
+            now,
+        );
+        queue.enqueue_at(
+            text_message(42, "first", "regular-1"),
+            false,
+            now + Duration::from_secs(1),
+        );
+        queue.enqueue_at(
+            text_message(42, "second", "regular-2"),
+            false,
+            now + Duration::from_secs(2),
+        );
+
+        assert_eq!(
+            virtual_ids(queue.snapshot()).0,
+            vec!["protected-1".to_owned(), "regular-2".to_owned()]
+        );
+        assert_eq!(queue.stats_at(now).trimmed_total, 1);
+        let protected = queue.dequeue_regular().expect("protected item kept");
+        assert!(protected.metadata().protected);
+    }
+
+    #[test]
+    fn trim_hard_cap_drops_protected_items_beyond_double_limit() {
+        let queue = DispatcherQueue::new(DispatcherConfig {
+            max_queue_size: 1,
+            ..DispatcherConfig::default()
+        });
+        let now = std::time::Instant::now();
+
+        for (index, virtual_id) in ["protected-1", "protected-2", "protected-3"]
+            .into_iter()
+            .enumerate()
+        {
+            queue.enqueue_at(
+                text_message(42, virtual_id, virtual_id).with_protected(true),
+                false,
+                now + Duration::from_secs(index as u64),
+            );
+        }
+
+        assert_eq!(
+            virtual_ids(queue.snapshot()).0,
+            vec!["protected-2".to_owned(), "protected-3".to_owned()]
+        );
+        assert_eq!(queue.stats_at(now).trimmed_total, 1);
+    }
+
+    #[test]
+    fn debounce_key_namespaces_regular_dedupe() {
+        let queue = DispatcherQueue::new(DispatcherConfig {
+            max_queue_size: 0,
+            dedupe_config: DebouncerConfig {
+                enabled: true,
+                default_window: Duration::from_secs(30),
+                max_cache_size: 1000,
+                per_chat_settings: HashMap::new(),
+            },
+            ..DispatcherConfig::default()
+        });
+        let now = std::time::Instant::now();
+
+        assert_eq!(
+            queue.enqueue_at(
+                text_message(42, "same", "reply-1").with_debounce_key("r1"),
+                false,
+                now,
+            ),
+            EnqueueOutcome::Enqueued
+        );
+        assert_eq!(
+            queue.enqueue_at(
+                text_message(42, "same", "reply-2").with_debounce_key("r2"),
+                false,
+                now + Duration::from_secs(1),
+            ),
+            EnqueueOutcome::Enqueued
+        );
+        assert_eq!(
+            queue.enqueue_at(
+                text_message(42, "same", "reply-1-dup").with_debounce_key("r1"),
+                false,
+                now + Duration::from_secs(2),
+            ),
+            EnqueueOutcome::Deduped
+        );
+
+        assert_eq!(
+            virtual_ids(queue.snapshot()).0,
+            vec!["reply-1".to_owned(), "reply-2".to_owned()]
+        );
+        // One suppression counts in both the queue counter and the debouncer counter.
+        assert_eq!(queue.stats_at(now).deduped_total, 2);
     }
 
     #[test]

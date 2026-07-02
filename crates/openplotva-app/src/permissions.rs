@@ -334,7 +334,8 @@ fn permission_error_media_flag(method_kind: TelegramOutboundMethodKind) -> Optio
         | TelegramOutboundMethodKind::CreateInvoiceLink
         | TelegramOutboundMethodKind::RefundStarPayment
         | TelegramOutboundMethodKind::EditUserStarSubscription
-        | TelegramOutboundMethodKind::DeleteMessage => None,
+        | TelegramOutboundMethodKind::DeleteMessage
+        | TelegramOutboundMethodKind::SetMessageReaction => None,
     }
 }
 

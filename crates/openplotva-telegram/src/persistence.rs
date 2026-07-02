@@ -1,7 +1,10 @@
 use std::time::{Duration, SystemTime};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use carapax::types::{DeleteMessage, EditMessageText, ReplyMarkup, ReplyParameters, SendMessage};
+use carapax::types::{
+    DeleteMessage, EditMessageText, ReactionType, ReplyMarkup, ReplyParameters, SendMessage,
+    SetMessageReaction,
+};
 use redis::Client as RedisClient;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -13,7 +16,9 @@ use crate::{
     DispatcherRestoredMessage, DispatcherWorkItem, EditMediaMessagePlan, EnqueueOutcome,
     MediaGroupMessagePlan, MediaGroupPhotoItem, MessageFingerprint, PhotoMessagePlan, PhotoSource,
     ReplyParametersPlan, SendRichMessage, StickerMessagePlan, TelegramOutboundMethod,
-    TelegramOutboundMethodKind, hash_content, parse_mode_from_go,
+    TelegramOutboundMethodKind, hash_content,
+    outbound::{MESSAGE_TYPE_REACTION, reaction_fingerprint_content},
+    parse_mode_from_go,
 };
 
 pub const DEFAULT_DISPATCHER_QUEUE_KEY: &str = "plotva:message_queue";
@@ -339,7 +344,26 @@ fn replay_method_from_value(
         | TelegramOutboundMethodKind::EditMessageReplyMarkup => None,
         TelegramOutboundMethodKind::EditMessageMedia => replay_edit_media_method(value),
         TelegramOutboundMethodKind::DeleteMessage => replay_delete_method(value),
+        TelegramOutboundMethodKind::SetMessageReaction => replay_set_message_reaction_method(value),
     }
+}
+
+/// Serialize a queued outbound method into replayable bytes, when the method
+/// round-trips through the persistence codec.
+pub fn snapshot_outbound_method(
+    method: &TelegramOutboundMethod,
+) -> Option<(TelegramOutboundMethodKind, Vec<u8>)> {
+    let bytes = serialize_outbound_method(method).ok()??;
+    Some((method.kind(), bytes))
+}
+
+/// Rebuild an outbound method from bytes produced by [`snapshot_outbound_method`].
+pub fn replay_outbound_method(
+    kind: TelegramOutboundMethodKind,
+    bytes: &[u8],
+) -> Option<TelegramOutboundMethod> {
+    let value: Value = serde_json::from_slice(bytes).ok()?;
+    replay_method_from_value(kind, &value)
 }
 
 fn replay_rich_method(value: &Value) -> Option<TelegramOutboundMethod> {
@@ -395,6 +419,25 @@ fn replay_delete_method(value: &Value) -> Option<TelegramOutboundMethod> {
     Some(TelegramOutboundMethod::from(DeleteMessage::new(
         chat_id, message_id,
     )))
+}
+
+fn replay_set_message_reaction_method(value: &Value) -> Option<TelegramOutboundMethod> {
+    let chat_id = field_i64(value, &["ChatID", "chat_id"])?;
+    let message_id = field_i64(value, &["MessageID", "message_id"])?;
+    let emoji = reaction_emoji(value)?;
+    let mut method =
+        SetMessageReaction::new(chat_id, message_id).with_reaction([ReactionType::Emoji(emoji)]);
+    if field_bool(value, &["IsBig", "is_big"]).unwrap_or(false) {
+        method = method.with_is_big(true);
+    }
+    Some(TelegramOutboundMethod::from(method))
+}
+
+fn reaction_emoji(value: &Value) -> Option<String> {
+    field_value(value, &["Reaction", "reaction"])?
+        .as_array()?
+        .iter()
+        .find_map(|entry| field_string(entry, &["emoji"]))
 }
 
 fn replay_sticker_method(value: &Value) -> Option<TelegramOutboundMethod> {
@@ -513,6 +556,15 @@ fn fingerprint_from_value(
             chat_id,
             message_type: "media_group".to_owned(),
             content_hash: hash_content(&value.to_string()),
+            debounce_key: None,
+        },
+        TelegramOutboundMethodKind::SetMessageReaction => MessageFingerprint {
+            chat_id,
+            message_type: MESSAGE_TYPE_REACTION.to_owned(),
+            content_hash: hash_content(&reaction_fingerprint_content(
+                field_i64(value, &["MessageID", "message_id"]).unwrap_or_default(),
+                &reaction_emoji(value).unwrap_or_default(),
+            )),
             debounce_key: None,
         },
         TelegramOutboundMethodKind::SendChatAction
@@ -713,6 +765,9 @@ fn serialize_outbound_method(
         TelegramOutboundMethod::EditMessageText(method) => {
             serde_json::to_vec(method.as_ref()).map(Some)
         }
+        TelegramOutboundMethod::SetMessageReaction(method) => {
+            serde_json::to_vec(method.as_ref()).map(Some)
+        }
         TelegramOutboundMethod::SendSticker(_)
         | TelegramOutboundMethod::SendPhoto(_)
         | TelegramOutboundMethod::SendAudio(_)
@@ -755,6 +810,7 @@ fn go_message_type(kind: TelegramOutboundMethodKind) -> &'static str {
         TelegramOutboundMethodKind::EditMessageReplyMarkup => "*api.EditMessageReplyMarkupConfig",
         TelegramOutboundMethodKind::EditMessageMedia => "*api.EditMessageMediaConfig",
         TelegramOutboundMethodKind::DeleteMessage => "*api.DeleteMessageConfig",
+        TelegramOutboundMethodKind::SetMessageReaction => "openplotva.SetMessageReactionConfig",
     }
 }
 
@@ -811,6 +867,9 @@ fn message_type_method_kind(message_type: &str) -> Option<TelegramOutboundMethod
         | "*api.DeleteMessageConfig"
         | "tgbotapi.DeleteMessageConfig"
         | "api.DeleteMessageConfig" => Some(TelegramOutboundMethodKind::DeleteMessage),
+        "openplotva.SetMessageReactionConfig" => {
+            Some(TelegramOutboundMethodKind::SetMessageReaction)
+        }
         _ => None,
     }
 }
@@ -859,10 +918,11 @@ mod tests {
         MediaGroupMessagePlan, MediaGroupPhotoItem, MessageFingerprint, PersistentDispatcherItem,
         PersistentDispatcherReplay, PhotoMessagePlan, PhotoSource, ReplyParametersPlan,
         RichSendOptions, SendRichMessage, StickerMessagePlan, TELEGRAM_PARSE_MODE_HTML,
-        TelegramOutboundMethod, TelegramOutboundMethodKind, hash_content,
-        persistent_queue_from_drain, persistent_queue_redis_value_from_items,
-        persistent_queue_replay_from_json, persistent_queue_replay_from_redis_value,
-        restore_persistent_queue_replay,
+        TelegramOutboundMethod, TelegramOutboundMethodKind, build_message_reaction_method,
+        fingerprint_message_reaction, hash_content, persistent_queue_from_drain,
+        persistent_queue_redis_value_from_items, persistent_queue_replay_from_json,
+        persistent_queue_replay_from_redis_value, replay_outbound_method,
+        restore_persistent_queue_replay, snapshot_outbound_method,
     };
 
     fn text_message(chat_id: i64, text: &str, virtual_id: &str) -> DispatcherMessage {
@@ -1090,6 +1150,116 @@ mod tests {
         assert_eq!(method.options.message_thread_id, Some(77));
         assert_eq!(method.options.reply_to_message_id, Some(9));
         assert!(method.options.allow_sending_without_reply);
+
+        Ok(())
+    }
+
+    #[test]
+    fn set_message_reaction_persistence_roundtrips_rust_owned_payload()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let queue = DispatcherQueue::new(DispatcherConfig::default());
+        queue.enqueue(
+            DispatcherMessage::new(fingerprint_message_reaction(42, 7, "🤔"), "reaction-1")
+                .with_method(build_message_reaction_method(42, 7, "🤔")),
+            true,
+        );
+
+        let persisted = persistent_queue_from_drain(queue.drain_for_shutdown(), 100)?;
+
+        assert_eq!(persisted.skipped, 0);
+        assert_eq!(persisted.items.len(), 1);
+        assert_eq!(
+            persisted.items[0].message_type,
+            "openplotva.SetMessageReactionConfig"
+        );
+        assert_eq!(
+            persisted.items[0].method_kind(),
+            Some(TelegramOutboundMethodKind::SetMessageReaction)
+        );
+
+        let payload: Value = serde_json::from_slice(&persisted.items[0].message)?;
+        assert_eq!(payload["chat_id"], json!(42));
+        assert_eq!(payload["message_id"], json!(7));
+        assert_eq!(
+            payload["reaction"],
+            json!([{"type": "emoji", "emoji": "🤔"}])
+        );
+
+        let raw = serde_json::to_vec(&persisted.items)?;
+        let replay = persistent_queue_replay_from_json(&raw)?;
+        assert_eq!(replay.skipped, 0);
+        assert_eq!(replay.items.len(), 1);
+        let TelegramOutboundMethod::SetMessageReaction(method) = &replay.items[0].method else {
+            panic!("expected setMessageReaction method");
+        };
+        let replayed_payload = serde_json::to_value(method.as_ref())?;
+        assert_eq!(replayed_payload, payload);
+
+        Ok(())
+    }
+
+    #[test]
+    fn replay_reconstructs_reaction_fingerprint_when_key_is_missing()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (kind, bytes) = snapshot_outbound_method(&build_message_reaction_method(42, 7, "🤔"))
+            .expect("reaction snapshot");
+        assert_eq!(kind, TelegramOutboundMethodKind::SetMessageReaction);
+
+        let persisted = vec![PersistentDispatcherItem {
+            message: bytes,
+            message_type: "openplotva.SetMessageReactionConfig".to_owned(),
+            immediate: true,
+            enqueued_at: "2026-05-19T17:00:00Z".to_owned(),
+            fingerprint: String::new(),
+            chat_id: 42,
+            virtual_id: "reaction-1".to_owned(),
+            bypass_chat_restrictions: false,
+            ephemeral_delete_after_ms: None,
+        }];
+        let raw = serde_json::to_vec(&persisted)?;
+
+        let replay = persistent_queue_replay_from_json(&raw)?;
+
+        assert_eq!(replay.skipped, 0);
+        assert_eq!(replay.items.len(), 1);
+        assert_eq!(
+            replay.items[0].fingerprint,
+            fingerprint_message_reaction(42, 7, "🤔")
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_and_replay_round_trips_send_message_and_rich()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (text_kind, text_bytes) =
+            snapshot_outbound_method(&text_method(42, "hello")).expect("text snapshot");
+        assert_eq!(text_kind, TelegramOutboundMethodKind::SendMessage);
+        let TelegramOutboundMethod::SendMessage(replayed_text) =
+            replay_outbound_method(text_kind, &text_bytes).expect("text replay")
+        else {
+            panic!("expected sendMessage method");
+        };
+        let text_payload = serde_json::to_value(replayed_text.as_ref())?;
+        assert_eq!(text_payload["chat_id"], json!(42));
+        assert_eq!(text_payload["text"], json!("hello"));
+
+        let (rich_kind, rich_bytes) =
+            snapshot_outbound_method(&rich_method(42, "<h3>hello</h3>")).expect("rich snapshot");
+        assert_eq!(rich_kind, TelegramOutboundMethodKind::SendRichMessage);
+        let TelegramOutboundMethod::SendRichMessage(replayed_rich) =
+            replay_outbound_method(rich_kind, &rich_bytes).expect("rich replay")
+        else {
+            panic!("expected sendRichMessage method");
+        };
+        assert_eq!(replayed_rich.chat_id, 42);
+        assert_eq!(replayed_rich.html, "<h3>hello</h3>");
+        assert_eq!(replayed_rich.options.message_thread_id, Some(77));
+        assert_eq!(replayed_rich.options.reply_to_message_id, Some(9));
+        assert!(replayed_rich.options.allow_sending_without_reply);
+
+        assert!(snapshot_outbound_method(&sticker_method(42, "sticker-file-id")).is_none());
 
         Ok(())
     }

@@ -58,6 +58,12 @@ pub const DIALOG_JOB_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const DIALOG_HISTORY_FETCH_LIMIT: i32 = 100;
 const DIALOG_HISTORY_TTL: TimeDuration = TimeDuration::days(7);
 
+/// Default per-turn wall-clock budget (`DIALOG_TURN_BUDGET_SECS`).
+pub const DEFAULT_DIALOG_TURN_BUDGET_SECS: i32 = 120;
+/// Default pending age beyond which never-processed dialog jobs are dropped
+/// (`DIALOG_TURN_MAX_QUEUE_AGE_SECS`).
+pub const DEFAULT_DIALOG_TURN_MAX_QUEUE_AGE_SECS: i32 = 600;
+
 pub const DIALOG_JOB_WORKER_QUEUES: [&str; 2] = [DIALOG_AIFARM_QUEUE_NAME, TEXT_QUEUE_NAME];
 
 /// Boxed future returned by dialog taskman queue calls.
@@ -94,7 +100,8 @@ pub struct DialogJobWorkerReport {
     /// Provider chosen for execution.
     pub provider: Option<String>,
     pub skipped_empty_payload: bool,
-    pub skipped_stale: bool,
+    /// Never-processed job outlived the queue-age gate and was dropped.
+    pub skipped_queue_backlog: bool,
     pub content_blocked: bool,
     pub sent_answer: bool,
     /// Dialog answer matched the latest comparable bot reply and was suppressed.
@@ -140,8 +147,8 @@ pub struct DialogJobWorkerReport {
     pub user_id: Option<i64>,
     /// Trigger message ID.
     pub message_id: Option<i32>,
-    /// answer, response, and queued tool material were all empty: the job
-    /// completed without any send attempt (the fully-silent branch).
+    /// answer, response, and queued tool material were all empty; the turn
+    /// engine retries this class instead of completing silently.
     pub answer_empty_all_sources: bool,
 }
 
@@ -158,8 +165,8 @@ pub struct DialogJobWorkerRunReport {
     pub failed: u64,
     /// Number of empty-payload jobs skipped.
     pub skipped_empty_payload: u64,
-    /// Number of stale jobs completed without provider execution.
-    pub skipped_stale: u64,
+    /// Number of expired-backlog jobs dropped without provider execution.
+    pub skipped_queue_backlog: u64,
     /// Number of content-blocked provider results treated as completed.
     pub content_blocked: u64,
     /// Number of answers queued.
@@ -191,8 +198,8 @@ impl DialogJobWorkerRunReport {
         if tick.skipped_empty_payload {
             self.skipped_empty_payload += 1;
         }
-        if tick.skipped_stale {
-            self.skipped_stale += 1;
+        if tick.skipped_queue_backlog {
+            self.skipped_queue_backlog += 1;
         }
         if tick.content_blocked {
             self.content_blocked += 1;
@@ -231,6 +238,10 @@ pub struct DialogJobWorkerLoopOptions<'a, Materializer: ?Sized, ToolHistory: ?Si
     /// Poll interval.
     pub interval: Duration,
     pub max_llm_job_attempts: i32,
+    /// Per-turn wall-clock budget in seconds, anchored at first processing start.
+    pub turn_budget_secs: i32,
+    /// Pending age in seconds beyond which never-processed jobs are dropped.
+    pub turn_max_queue_age_secs: i32,
 }
 
 /// True when the current UTC time is inside the daily `[start, end)` minute window,
@@ -850,8 +861,11 @@ where
         DialogJobProcessOptions {
             queue_name,
             max_llm_job_attempts: DEFAULT_LLM_JOB_MAX_ATTEMPTS,
+            turn_budget_secs: DEFAULT_DIALOG_TURN_BUDGET_SECS,
+            turn_max_queue_age_secs: DEFAULT_DIALOG_TURN_MAX_QUEUE_AGE_SECS,
             now,
             routing_events: None,
+            turn_outcomes: None,
         },
     )
     .await
@@ -861,8 +875,11 @@ where
 struct DialogJobProcessOptions<'a> {
     queue_name: &'static str,
     max_llm_job_attempts: i32,
+    turn_budget_secs: i32,
+    turn_max_queue_age_secs: i32,
     now: OffsetDateTime,
     routing_events: Option<&'a crate::runtime_routing::RoutingEventReporter>,
+    turn_outcomes: Option<&'a crate::dialog_turn::DialogTurnObserver>,
 }
 
 async fn process_dialog_job_once_in_queue_with_materializer_history_and_retry_at<
@@ -905,12 +922,33 @@ where
     report.job_id = Some(item.id);
     report.provider = Some(provider.provider_name().to_owned());
 
+    let budget = crate::dialog_turn::TurnBudget::from_events(
+        &item.events,
+        options.turn_budget_secs,
+        options.now,
+    );
+
     let params = match dialog_job_params_from_stateless_job(&item.job) {
         Ok(params) => params,
         Err(error) => {
             let error = error.to_string();
             report.decode_error = Some(error.clone());
-            mark_dialog_job_failed(queue, item.id, &error, &mut report).await;
+            let resolution = crate::dialog_turn::TurnResolution {
+                outcome: crate::dialog_turn::TurnOutcome::SkippedDecodeError {
+                    error: error.clone(),
+                },
+                disposition: crate::dialog_turn::JobDisposition::Fail(error),
+            };
+            crate::dialog_turn::finalize_turn(
+                queue,
+                &item,
+                resolution,
+                &budget,
+                options.now,
+                options.turn_outcomes,
+                &mut report,
+            )
+            .await;
             return report;
         }
     };
@@ -919,132 +957,36 @@ where
     report.user_id = (params.user_id != 0).then_some(params.user_id);
     report.message_id = (params.message_id != 0).then_some(params.message_id);
 
-    if dialog_job_is_stale(&item.job, options.now) {
-        report.skipped_stale = true;
-        mark_dialog_job_completed(queue, item.id, &mut report).await;
-        return report;
-    }
+    let resolution = crate::dialog_turn::execute_dialog_turn(
+        crate::dialog_turn::TurnContext {
+            item: &item,
+            params: &params,
+            queue_name: options.queue_name,
+            max_llm_job_attempts: options.max_llm_job_attempts,
+            max_queue_age: TimeDuration::seconds(i64::from(options.turn_max_queue_age_secs.max(1))),
+            budget,
+            now: options.now,
+            routing_events: options.routing_events,
+        },
+        queue,
+        provider,
+        effects,
+        materializer,
+        tool_history,
+        &mut report,
+    )
+    .await;
 
-    if !dialog_job_has_payload(&params) {
-        report.skipped_empty_payload = true;
-        mark_dialog_job_completed(queue, item.id, &mut report).await;
-        return report;
-    }
-
-    let input = materializer
-        .materialize_dialog_input(&params, options.now)
-        .await;
-    let duplicate_guard_history = input.history.clone();
-    let output = match provider.run_dialog(input).await {
-        Ok(output) => output,
-        Err(error) if openplotva_llm::is_content_blocked_error(error.as_ref()) => {
-            report.content_blocked = true;
-            mark_dialog_job_completed(queue, item.id, &mut report).await;
-            return report;
-        }
-        Err(error) => {
-            let retryable_reason = openplotva_llm::retry::retryable_reason(error.as_ref());
-            let retry_provider = openplotva_llm::retry::provider_name(error.as_ref()).to_owned();
-            let error = error.to_string();
-            report.provider_error = Some(error.clone());
-            if let Some(reason) = retryable_reason {
-                handle_retryable_dialog_provider_error(
-                    queue,
-                    &item,
-                    &params,
-                    options.routing_events,
-                    RetryableDialogProviderFailure {
-                        queue_name: options.queue_name,
-                        provider_name: &retry_provider,
-                        reason,
-                        error: &error,
-                        max_attempts: options.max_llm_job_attempts.max(1),
-                        now: options.now,
-                    },
-                    &mut report,
-                )
-                .await;
-                return report;
-            }
-            mark_dialog_job_failed(queue, item.id, &error, &mut report).await;
-            return report;
-        }
-    };
-
-    record_dialog_fallback_event(queue, item.id, &output, options.now, &mut report).await;
-
-    match persist_dialog_tool_calls(tool_history, &params, &output.tool_calls).await {
-        Ok(persisted) => report.persisted_tool_call_history = persisted,
-        Err(error) => {
-            let error = error.to_string();
-            tracing::debug!(
-                %error,
-                chat_id = params.chat_id,
-                message_id = params.message_id,
-                "failed to persist dialog tool-call history"
-            );
-            report.tool_call_history_error = Some(error);
-        }
-    }
-
-    let raw_answer = dialog_job_answer(&output);
-    let answer = prepare_dialog_chat_response(&raw_answer);
-    if !raw_answer.trim().is_empty() && answer.is_empty() {
-        // The model returned visible text, but it collapses to nothing once the
-        // send boundary decodes entities and strips disallowed markup (typically a
-        // tool call leaked as plain text). Treat it like a retryable protocol error
-        // instead of dropping the turn silently: requeue for another attempt, which
-        // reselects a backend, and only fail loudly once attempts are exhausted.
-        let error = "dialog answer became empty after sanitization".to_owned();
-        report.empty_answer_error = Some(error.clone());
-        handle_retryable_dialog_provider_error(
-            queue,
-            &item,
-            &params,
-            options.routing_events,
-            RetryableDialogProviderFailure {
-                queue_name: options.queue_name,
-                provider_name: output.provider.as_str(),
-                reason: openplotva_llm::retry::FailureReason::ProviderProtocolError,
-                error: &error,
-                max_attempts: options.max_llm_job_attempts.max(1),
-                now: options.now,
-            },
-            &mut report,
-        )
-        .await;
-        return report;
-    }
-    if answer.is_empty() {
-        // The fully-silent branch: no text, no queued tool message. Phase 1
-        // only measures it; the turn engine will make it retryable.
-        report.answer_empty_all_sources = true;
-    }
-    if !answer.is_empty() {
-        let (duplicate_message_id, suppressed) =
-            should_suppress_duplicate_bot_reply(&duplicate_guard_history, &answer);
-        if suppressed {
-            report.suppressed_duplicate_message_id = Some(duplicate_message_id);
-            tracing::warn!(
-                chat_id = params.chat_id,
-                message_id = params.message_id,
-                duplicate_message_id,
-                "suppressed duplicate dialog answer"
-            );
-        } else {
-            match effects.send_dialog_answer(&params, &answer).await {
-                Ok(()) => report.sent_answer = true,
-                Err(error) => {
-                    let error = error.to_string();
-                    report.send_error = Some(error.clone());
-                    mark_dialog_job_failed(queue, item.id, &error, &mut report).await;
-                    return report;
-                }
-            }
-        }
-    }
-
-    mark_dialog_job_completed(queue, item.id, &mut report).await;
+    crate::dialog_turn::finalize_turn(
+        queue,
+        &item,
+        resolution,
+        &budget,
+        options.now,
+        options.turn_outcomes,
+        &mut report,
+    )
+    .await;
     report
 }
 
@@ -1109,6 +1051,8 @@ where
             queue_names,
             interval,
             max_llm_job_attempts: DEFAULT_LLM_JOB_MAX_ATTEMPTS,
+            turn_budget_secs: DEFAULT_DIALOG_TURN_BUDGET_SECS,
+            turn_max_queue_age_secs: DEFAULT_DIALOG_TURN_MAX_QUEUE_AGE_SECS,
         },
         stop,
     )
@@ -1155,19 +1099,14 @@ where
                         DialogJobProcessOptions {
                             queue_name,
                             max_llm_job_attempts: options.max_llm_job_attempts,
+                            turn_budget_secs: options.turn_budget_secs,
+                            turn_max_queue_age_secs: options.turn_max_queue_age_secs,
                             now: OffsetDateTime::now_utc(),
                             routing_events: options.routing_events,
+                            turn_outcomes: options.turn_outcomes,
                         },
                     ).await;
                     trace_dialog_job_tick(&tick);
-                    if let Some(observer) = options.turn_outcomes
-                        && let Some(record) = crate::dialog_turn::outcome_from_report(
-                            &tick,
-                            OffsetDateTime::now_utc(),
-                        )
-                    {
-                        observer.record(record);
-                    }
                     report.record_tick(&tick);
                 }
             }
@@ -1304,6 +1243,8 @@ where
             queue_names: &DIALOG_JOB_WORKER_QUEUES,
             interval: DIALOG_JOB_POLL_INTERVAL,
             max_llm_job_attempts,
+            turn_budget_secs: DEFAULT_DIALOG_TURN_BUDGET_SECS,
+            turn_max_queue_age_secs: DEFAULT_DIALOG_TURN_MAX_QUEUE_AGE_SECS,
         },
         stop,
     )
@@ -1319,20 +1260,6 @@ pub fn dialog_job_has_payload(params: &DialogJobParams) -> bool {
         || !meta.annotation.trim().is_empty()
         || !meta.vision_description.trim().is_empty()
         || !meta.attachments.is_empty()
-}
-
-fn dialog_job_is_stale(job: &StatelessJobItem, now: OffsetDateTime) -> bool {
-    now - job.created >= dialog_job_response_max_age()
-}
-
-/// Dialog jobs outlive the 60s update-side-effect window by design: retryable
-/// provider failures requeue the job, and observed recovered retries finish at
-/// p95 ≈ 114s from creation. Keep this above the retry envelope so late
-/// attempts answer instead of completing silently as stale.
-const DIALOG_JOB_RESPONSE_MAX_AGE_SECS: i64 = 180;
-
-fn dialog_job_response_max_age() -> TimeDuration {
-    TimeDuration::seconds(DIALOG_JOB_RESPONSE_MAX_AGE_SECS)
 }
 
 #[must_use]
@@ -1769,6 +1696,30 @@ pub fn prepare_dialog_chat_response(raw: &str) -> String {
     }
 }
 
+/// Mirror of the outbound boundary checks: will `queue_text_message_parts` /
+/// `queue_rich_message` accept this answer verbatim? The turn engine verifies
+/// deliverability before queueing so rejected answers regenerate instead of
+/// failing terminally at send time.
+pub fn validate_dialog_answer_deliverable(
+    answer: &str,
+) -> Result<(), openplotva_telegram::OutboundBuildError> {
+    if dialog_response_requires_rich(answer) {
+        let html = openplotva_telegram::format_rich_html(answer);
+        if html.is_empty() {
+            return Err(openplotva_telegram::OutboundBuildError::EmptyText);
+        }
+        if !openplotva_telegram::rich_message_within_char_limit(&html) {
+            return Err(openplotva_telegram::OutboundBuildError::RichMessageTooLong(
+                html.chars().count(),
+                openplotva_telegram::RICH_MESSAGE_MAX_CHARS,
+            ));
+        }
+        Ok(())
+    } else {
+        openplotva_telegram::validate_text_message_text(answer, TELEGRAM_PARSE_MODE_HTML)
+    }
+}
+
 #[must_use]
 pub fn dialog_response_requires_rich(value: &str) -> bool {
     const RICH_ONLY_TAGS: &[&str] = &[
@@ -1934,7 +1885,7 @@ fn collapse_comparable_whitespace(input: &str) -> String {
     input.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-async fn persist_dialog_tool_calls<Store>(
+pub(crate) async fn persist_dialog_tool_calls<Store>(
     store: &Store,
     params: &DialogJobParams,
     tool_calls: &[ToolCall],
@@ -2359,57 +2310,67 @@ fn is_dialog_job(job: &StatelessJobItem) -> bool {
     job.data.job_type == JobType::Dialog
 }
 
-async fn mark_dialog_job_completed<Queue>(
-    queue: &Queue,
-    job_id: i64,
-    report: &mut DialogJobWorkerReport,
-) where
-    Queue: DialogJobWorkerQueue + Sync + ?Sized,
-{
-    match queue.complete_dialog_job(job_id).await {
-        Ok(()) => report.completed = true,
-        Err(error) => report.status_error = Some(error.to_string()),
-    }
+/// Ledger reason codes for one retryable failure class: the string recorded
+/// while attempts remain, and the string recorded on exhaustion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RetryReasonCodes {
+    pub scheduled: &'static str,
+    pub exhausted: &'static str,
 }
 
-async fn mark_dialog_job_failed<Queue>(
-    queue: &Queue,
-    job_id: i64,
-    error: &str,
-    report: &mut DialogJobWorkerReport,
-) where
-    Queue: DialogJobWorkerQueue + Sync + ?Sized,
-{
-    match queue.fail_dialog_job(job_id, error).await {
-        Ok(()) => report.failed = true,
-        Err(error) => report.status_error = Some(error.to_string()),
-    }
+/// Retryable provider error that escaped the routed walker.
+pub(crate) const PROVIDER_ERROR_RETRY_CODES: RetryReasonCodes = RetryReasonCodes {
+    scheduled: "provider_retryable",
+    exhausted: "retry_exhausted",
+};
+/// Raw text existed but collapsed during outbound sanitization.
+pub(crate) const SANITIZED_EMPTY_RETRY_CODES: RetryReasonCodes = RetryReasonCodes {
+    scheduled: "sanitized_empty",
+    exhausted: "sanitized_empty_exhausted",
+};
+/// Answer, response, and tool material were all empty.
+pub(crate) const PROVIDER_EMPTY_RETRY_CODES: RetryReasonCodes = RetryReasonCodes {
+    scheduled: "provider_empty",
+    exhausted: "provider_empty_exhausted",
+};
+/// The outbound boundary would reject the answer verbatim.
+pub(crate) const UNDELIVERABLE_RETRY_CODES: RetryReasonCodes = RetryReasonCodes {
+    scheduled: "undeliverable_answer",
+    exhausted: "undeliverable_answer_exhausted",
+};
+
+pub(crate) struct RetryableDialogProviderFailure<'a> {
+    pub queue_name: &'a str,
+    pub provider_name: &'a str,
+    pub reason: openplotva_llm::retry::FailureReason,
+    pub codes: RetryReasonCodes,
+    pub error: &'a str,
+    pub max_attempts: i32,
+    pub now: OffsetDateTime,
+    pub budget_deadline: OffsetDateTime,
 }
 
-struct RetryableDialogProviderFailure<'a> {
-    queue_name: &'a str,
-    provider_name: &'a str,
-    reason: openplotva_llm::retry::FailureReason,
-    error: &'a str,
-    max_attempts: i32,
-    now: OffsetDateTime,
-}
-
-async fn handle_retryable_dialog_provider_error<Queue>(
+/// Decide retry vs terminal for one retryable failure. Appends the retry job
+/// event (append failure never blocks the resolution — the job must not stick
+/// in `Processing`) and returns the resolution; `finalize_turn` applies it.
+pub(crate) async fn handle_retryable_dialog_provider_error<Queue>(
     queue: &Queue,
     item: &DialogJobWorkItem,
     params: &DialogJobParams,
     routing_events: Option<&crate::runtime_routing::RoutingEventReporter>,
     failure: RetryableDialogProviderFailure<'_>,
     report: &mut DialogJobWorkerReport,
-) where
+) -> crate::dialog_turn::TurnResolution
+where
     Queue: DialogJobWorkerQueue + Sync + ?Sized,
 {
     let attempt = next_dialog_llm_job_attempt(&item.events);
     let max_attempts = failure.max_attempts.max(1);
     let provider = infer_dialog_retry_provider(failure.provider_name, failure.queue_name);
     let target_queue = retryable_dialog_job_target_queue(failure.queue_name);
-    let exhausted = attempt >= max_attempts;
+    let attempts_exhausted = attempt >= max_attempts;
+    let budget_exhausted = failure.now >= failure.budget_deadline;
+    let exhausted = attempts_exhausted || budget_exhausted;
     let stage = if exhausted {
         LLM_JOB_RETRY_EXHAUSTED_STAGE
     } else {
@@ -2425,7 +2386,11 @@ async fn handle_retryable_dialog_provider_error<Queue>(
         failure.error,
     );
     if exhausted {
-        event.message = "retryable LLM provider error exhausted job attempts".to_owned();
+        event.message = if budget_exhausted && !attempts_exhausted {
+            "retryable LLM provider error exhausted the turn budget".to_owned()
+        } else {
+            "retryable LLM provider error exhausted job attempts".to_owned()
+        };
     }
 
     report.retryable_provider_error = Some(failure.reason.to_string());
@@ -2433,15 +2398,11 @@ async fn handle_retryable_dialog_provider_error<Queue>(
     report.retry_max_attempts = Some(max_attempts);
     report.retry_target_queue = Some(target_queue.clone());
 
-    match queue
+    if let Err(error) = queue
         .append_dialog_job_event(item.id, event, failure.now)
         .await
     {
-        Ok(()) => {}
-        Err(error) => {
-            report.status_error = Some(error.to_string());
-            return;
-        }
+        report.status_error = Some(error.to_string());
     }
 
     if exhausted {
@@ -2457,20 +2418,33 @@ async fn handle_retryable_dialog_provider_error<Queue>(
                 max_attempts,
             ));
         }
-        mark_dialog_job_failed(queue, item.id, failure.error, report).await;
-        return;
+        let reason = if budget_exhausted && !attempts_exhausted {
+            "budget_exhausted"
+        } else {
+            failure.codes.exhausted
+        };
+        return crate::dialog_turn::TurnResolution {
+            outcome: crate::dialog_turn::TurnOutcome::TerminalFailed {
+                reason,
+                error: failure.error.to_owned(),
+                user_signal: crate::dialog_turn::UserSignalPlan::React,
+            },
+            disposition: crate::dialog_turn::JobDisposition::Fail(failure.error.to_owned()),
+        };
     }
 
-    match queue
-        .requeue_retryable_dialog_job(item.id, target_queue.as_str())
-        .await
-    {
-        Ok(()) => report.retry_requeued = true,
-        Err(error) => report.status_error = Some(error.to_string()),
+    crate::dialog_turn::TurnResolution {
+        outcome: crate::dialog_turn::TurnOutcome::RetryScheduled {
+            reason: failure.codes.scheduled,
+            attempt,
+            max_attempts,
+            target_queue: target_queue.clone(),
+        },
+        disposition: crate::dialog_turn::JobDisposition::Requeue(target_queue),
     }
 }
 
-async fn record_dialog_fallback_event<Queue>(
+pub(crate) async fn record_dialog_fallback_event<Queue>(
     queue: &Queue,
     job_id: i64,
     output: &DialogOutput,
@@ -2517,7 +2491,7 @@ fn dialog_fallback_job_event(output: &DialogOutput) -> Option<TaskQueueJobEvent>
     })
 }
 
-fn next_dialog_llm_job_attempt(events: &[TaskQueueJobEvent]) -> i32 {
+pub(crate) fn next_dialog_llm_job_attempt(events: &[TaskQueueJobEvent]) -> i32 {
     events
         .iter()
         .filter(|event| {
@@ -2628,7 +2602,7 @@ fn trace_dialog_job_tick(tick: &DialogJobWorkerReport) {
         completed = tick.completed,
         failed = tick.failed,
         skipped_empty_payload = tick.skipped_empty_payload,
-        skipped_stale = tick.skipped_stale,
+        skipped_queue_backlog = tick.skipped_queue_backlog,
         content_blocked = tick.content_blocked,
         sent_answer = tick.sent_answer,
         suppressed_duplicate_message_id = tick.suppressed_duplicate_message_id,
@@ -2804,8 +2778,11 @@ mod tests {
         assert_eq!(report.dialog_fallback_event_error, None);
         assert!(report.completed);
         let record = queue.record(job_id).expect("job record");
-        assert_eq!(record.events.len(), 1);
-        let event = &record.events[0];
+        let event = record
+            .events
+            .iter()
+            .find(|event| event.stage == "dialog_fallback")
+            .expect("dialog fallback event");
         assert_eq!(event.at, "2026-05-19T12:30:00Z");
         assert_eq!(event.level, "warn");
         assert_eq!(event.stage, "dialog_fallback");
@@ -3056,6 +3033,10 @@ mod tests {
         });
         let effects = EffectsStub::default();
 
+        let outcomes = crate::dialog_turn::DialogTurnObserver::new(
+            crate::dialog_turn::RuntimeTurnOutcomeBuffer::new(8),
+            None,
+        );
         let report = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
             &queue,
             &provider,
@@ -3065,8 +3046,11 @@ mod tests {
             DialogJobProcessOptions {
                 queue_name: DIALOG_AIFARM_QUEUE_NAME,
                 max_llm_job_attempts: 1,
+                turn_budget_secs: DEFAULT_DIALOG_TURN_BUDGET_SECS,
+                turn_max_queue_age_secs: DEFAULT_DIALOG_TURN_MAX_QUEUE_AGE_SECS,
                 now,
                 routing_events: None,
+                turn_outcomes: Some(&outcomes),
             },
         )
         .await;
@@ -3081,6 +3065,11 @@ mod tests {
             Some("dialog answer became empty after sanitization".to_owned())
         );
         assert_eq!(record_status(&queue, job_id), JobStatus::Failed);
+        let rows = ledger_rows(&outcomes);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].outcome, "terminal_failed");
+        assert_eq!(rows[0].reason.as_deref(), Some("sanitized_empty_exhausted"));
+        assert_eq!(rows[0].user_signal.as_deref(), Some("none"));
         Ok(())
     }
 
@@ -3138,9 +3127,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dialog_worker_skips_stale_job_without_provider_call() -> Result<(), Box<dyn Error>> {
+    async fn dialog_worker_fails_expired_queue_backlog_job_without_provider_call()
+    -> Result<(), Box<dyn Error>> {
         let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
-        let created = now - TimeDuration::seconds(5 * 60);
+        let created = now - TimeDuration::seconds(11 * 60);
         let queue = InMemoryTaskQueue::new();
         let job_id = queue.assign(
             DIALOG_AIFARM_QUEUE_NAME,
@@ -3151,15 +3141,424 @@ mod tests {
             ..DialogOutput::default()
         });
         let effects = EffectsStub::default();
+        let outcomes = crate::dialog_turn::DialogTurnObserver::new(
+            crate::dialog_turn::RuntimeTurnOutcomeBuffer::new(8),
+            None,
+        );
+
+        let report = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+            &queue,
+            &provider,
+            &effects,
+            &BasicDialogInputMaterializer,
+            &NoopDialogToolCallHistoryStore,
+            DialogJobProcessOptions {
+                queue_name: DIALOG_AIFARM_QUEUE_NAME,
+                max_llm_job_attempts: DEFAULT_LLM_JOB_MAX_ATTEMPTS,
+                turn_budget_secs: DEFAULT_DIALOG_TURN_BUDGET_SECS,
+                turn_max_queue_age_secs: DEFAULT_DIALOG_TURN_MAX_QUEUE_AGE_SECS,
+                now,
+                routing_events: None,
+                turn_outcomes: Some(&outcomes),
+            },
+        )
+        .await;
+
+        assert_eq!(report.job_id, Some(job_id));
+        assert!(report.skipped_queue_backlog);
+        assert!(report.failed);
+        assert!(!report.completed);
+        assert!(provider.inputs().is_empty());
+        assert!(effects.sent().is_empty());
+        let record = queue.record(job_id).expect("job record");
+        assert_eq!(record.status, JobStatus::Failed);
+        // The turn never started: no anchor event, only the outcome event.
+        assert!(
+            record
+                .events
+                .iter()
+                .all(|event| event.stage != crate::dialog_turn::TURN_STARTED_STAGE)
+        );
+        let outcome_event = record
+            .events
+            .iter()
+            .find(|event| event.stage == crate::dialog_turn::TURN_OUTCOME_STAGE)
+            .expect("turn outcome event");
+        assert_eq!(outcome_event.data["outcome"], "skipped");
+        assert_eq!(outcome_event.data["reason"], "queue_backlog_expired");
+        let rows = ledger_rows(&outcomes);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].outcome, "skipped");
+        assert_eq!(rows[0].reason.as_deref(), Some("queue_backlog_expired"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dialog_worker_processes_old_job_that_already_started_processing()
+    -> Result<(), Box<dyn Error>> {
+        // A requeued retry older than the old 180s stale gate must keep answering:
+        // the budget is anchored at the recorded turn_started event, not job.created.
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let created = now - TimeDuration::seconds(11 * 60);
+        let queue = InMemoryTaskQueue::new();
+        let job_id = queue.assign(
+            DIALOG_AIFARM_QUEUE_NAME,
+            new_dialog_job_at(dialog_params("late retry"), created),
+        );
+        queue.append_job_event(
+            job_id,
+            TaskQueueJobEvent {
+                stage: crate::dialog_turn::TURN_STARTED_STAGE.to_owned(),
+                ..TaskQueueJobEvent::default()
+            },
+            now - TimeDuration::seconds(30),
+        )?;
+        let provider = ProviderStub::returning(DialogOutput {
+            answer: "pong".to_owned(),
+            ..DialogOutput::default()
+        });
+        let effects = EffectsStub::default();
 
         let report = process_dialog_job_once_at(&queue, &provider, &effects, now).await;
 
         assert_eq!(report.job_id, Some(job_id));
-        assert!(report.skipped_stale);
+        assert!(!report.skipped_queue_backlog);
+        assert!(report.sent_answer);
         assert!(report.completed);
+        assert_eq!(record_status(&queue, job_id), JobStatus::Completed);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dialog_worker_fails_turn_budget_exhausted_before_provider_call()
+    -> Result<(), Box<dyn Error>> {
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let queue = InMemoryTaskQueue::new();
+        let job_id = queue.assign(
+            DIALOG_AIFARM_QUEUE_NAME,
+            new_dialog_job_at(dialog_params("hello"), now - TimeDuration::seconds(200)),
+        );
+        queue.append_job_event(
+            job_id,
+            TaskQueueJobEvent {
+                stage: crate::dialog_turn::TURN_STARTED_STAGE.to_owned(),
+                ..TaskQueueJobEvent::default()
+            },
+            now - TimeDuration::seconds(115),
+        )?;
+        let provider = ProviderStub::returning(DialogOutput {
+            answer: "unused".to_owned(),
+            ..DialogOutput::default()
+        });
+        let effects = EffectsStub::default();
+        let outcomes = crate::dialog_turn::DialogTurnObserver::new(
+            crate::dialog_turn::RuntimeTurnOutcomeBuffer::new(8),
+            None,
+        );
+
+        let report = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+            &queue,
+            &provider,
+            &effects,
+            &BasicDialogInputMaterializer,
+            &NoopDialogToolCallHistoryStore,
+            DialogJobProcessOptions {
+                queue_name: DIALOG_AIFARM_QUEUE_NAME,
+                max_llm_job_attempts: DEFAULT_LLM_JOB_MAX_ATTEMPTS,
+                turn_budget_secs: DEFAULT_DIALOG_TURN_BUDGET_SECS,
+                turn_max_queue_age_secs: DEFAULT_DIALOG_TURN_MAX_QUEUE_AGE_SECS,
+                now,
+                routing_events: None,
+                turn_outcomes: Some(&outcomes),
+            },
+        )
+        .await;
+
+        assert!(report.failed);
         assert!(provider.inputs().is_empty());
         assert!(effects.sent().is_empty());
-        assert_eq!(record_status(&queue, job_id), JobStatus::Completed);
+        let record = queue.record(job_id).expect("job record");
+        assert_eq!(record.status, JobStatus::Failed);
+        assert!(
+            record
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("budget exhausted"))
+        );
+        let rows = ledger_rows(&outcomes);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].outcome, "terminal_failed");
+        assert_eq!(rows[0].reason.as_deref(), Some("budget_exhausted"));
+        assert_eq!(rows[0].user_signal.as_deref(), Some("none"));
+        assert_eq!(rows[0].budget_ms, Some(120_000));
+        assert_eq!(rows[0].elapsed_ms, Some(115_000));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dialog_worker_retries_provider_empty_output_and_fails_on_exhaustion()
+    -> Result<(), Box<dyn Error>> {
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let queue = InMemoryTaskQueue::new();
+        let job_id = queue.assign(
+            DIALOG_AIFARM_QUEUE_NAME,
+            new_dialog_job_at(dialog_params("hello"), now),
+        );
+        let provider = ProviderStub::returning(DialogOutput::default());
+        let effects = EffectsStub::default();
+        let outcomes = crate::dialog_turn::DialogTurnObserver::new(
+            crate::dialog_turn::RuntimeTurnOutcomeBuffer::new(8),
+            None,
+        );
+        let options = DialogJobProcessOptions {
+            queue_name: DIALOG_AIFARM_QUEUE_NAME,
+            max_llm_job_attempts: 2,
+            turn_budget_secs: DEFAULT_DIALOG_TURN_BUDGET_SECS,
+            turn_max_queue_age_secs: DEFAULT_DIALOG_TURN_MAX_QUEUE_AGE_SECS,
+            now,
+            routing_events: None,
+            turn_outcomes: Some(&outcomes),
+        };
+
+        let first = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+            &queue,
+            &provider,
+            &effects,
+            &BasicDialogInputMaterializer,
+            &NoopDialogToolCallHistoryStore,
+            options,
+        )
+        .await;
+
+        assert!(first.retry_requeued);
+        assert!(first.answer_empty_all_sources);
+        assert!(!first.completed);
+        assert!(!first.failed);
+        assert_eq!(first.retry_attempt, Some(1));
+        assert_eq!(record_status(&queue, job_id), JobStatus::Pending);
+
+        let second = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+            &queue,
+            &provider,
+            &effects,
+            &BasicDialogInputMaterializer,
+            &NoopDialogToolCallHistoryStore,
+            options,
+        )
+        .await;
+
+        assert!(second.retry_exhausted);
+        assert!(second.failed);
+        assert!(effects.sent().is_empty());
+        assert_eq!(record_status(&queue, job_id), JobStatus::Failed);
+        let rows = ledger_rows(&outcomes);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].outcome, "retry_scheduled");
+        assert_eq!(rows[1].reason.as_deref(), Some("provider_empty"));
+        assert_eq!(rows[1].attempt, 1);
+        assert_eq!(rows[0].outcome, "terminal_failed");
+        assert_eq!(rows[0].reason.as_deref(), Some("provider_empty_exhausted"));
+        assert_eq!(rows[0].attempt, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dialog_worker_requeues_undeliverable_answer_instead_of_failing_at_send()
+    -> Result<(), Box<dyn Error>> {
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let queue = InMemoryTaskQueue::new();
+        let job_id = queue.assign(
+            DIALOG_AIFARM_QUEUE_NAME,
+            new_dialog_job_at(dialog_params("напиши статью"), now),
+        );
+        let oversized_rich = format!("<p>{}</p>", "a".repeat(40_000));
+        let provider = ProviderStub::returning(DialogOutput {
+            answer: oversized_rich,
+            ..DialogOutput::default()
+        });
+        let effects = EffectsStub::default();
+        let outcomes = crate::dialog_turn::DialogTurnObserver::new(
+            crate::dialog_turn::RuntimeTurnOutcomeBuffer::new(8),
+            None,
+        );
+        let options = DialogJobProcessOptions {
+            queue_name: DIALOG_AIFARM_QUEUE_NAME,
+            max_llm_job_attempts: 2,
+            turn_budget_secs: DEFAULT_DIALOG_TURN_BUDGET_SECS,
+            turn_max_queue_age_secs: DEFAULT_DIALOG_TURN_MAX_QUEUE_AGE_SECS,
+            now,
+            routing_events: None,
+            turn_outcomes: Some(&outcomes),
+        };
+
+        let first = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+            &queue,
+            &provider,
+            &effects,
+            &BasicDialogInputMaterializer,
+            &NoopDialogToolCallHistoryStore,
+            options,
+        )
+        .await;
+
+        assert!(first.retry_requeued);
+        assert!(!first.failed);
+        assert!(!first.sent_answer);
+        assert!(effects.sent().is_empty());
+        assert!(
+            first
+                .empty_answer_error
+                .as_deref()
+                .is_some_and(|error| error.contains("rejected by outbound validation"))
+        );
+        assert_eq!(record_status(&queue, job_id), JobStatus::Pending);
+
+        let second = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+            &queue,
+            &provider,
+            &effects,
+            &BasicDialogInputMaterializer,
+            &NoopDialogToolCallHistoryStore,
+            options,
+        )
+        .await;
+
+        assert!(second.retry_exhausted);
+        assert!(second.failed);
+        assert_eq!(record_status(&queue, job_id), JobStatus::Failed);
+        let rows = ledger_rows(&outcomes);
+        assert_eq!(rows[1].reason.as_deref(), Some("undeliverable_answer"));
+        assert_eq!(
+            rows[0].reason.as_deref(),
+            Some("undeliverable_answer_exhausted")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retry_handler_exhausts_on_budget_deadline_despite_remaining_attempts()
+    -> Result<(), Box<dyn Error>> {
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let queue = InMemoryTaskQueue::new();
+        let job_id = queue.assign(
+            DIALOG_AIFARM_QUEUE_NAME,
+            new_dialog_job_at(dialog_params("hello"), now),
+        );
+        let item = queue
+            .dequeue_dialog_job(DIALOG_AIFARM_QUEUE_NAME)
+            .await?
+            .expect("work item");
+        let params = dialog_params("hello");
+        let mut report = DialogJobWorkerReport::default();
+
+        let resolution = handle_retryable_dialog_provider_error(
+            &queue,
+            &item,
+            &params,
+            None,
+            RetryableDialogProviderFailure {
+                queue_name: DIALOG_AIFARM_QUEUE_NAME,
+                provider_name: "aifarm",
+                reason: FailureReason::ProviderUnavailable,
+                codes: PROVIDER_ERROR_RETRY_CODES,
+                error: "status 503",
+                max_attempts: 5,
+                now: now + TimeDuration::seconds(130),
+                budget_deadline: now + TimeDuration::seconds(120),
+            },
+            &mut report,
+        )
+        .await;
+
+        assert!(report.retry_exhausted);
+        assert_eq!(report.retry_attempt, Some(1));
+        assert_eq!(
+            resolution.outcome,
+            crate::dialog_turn::TurnOutcome::TerminalFailed {
+                reason: "budget_exhausted",
+                error: "status 503".to_owned(),
+                user_signal: crate::dialog_turn::UserSignalPlan::React,
+            }
+        );
+        assert_eq!(
+            resolution.disposition,
+            crate::dialog_turn::JobDisposition::Fail("status 503".to_owned())
+        );
+        let record = queue.record(job_id).expect("job record");
+        let event = record.events.last().expect("retry event");
+        assert_eq!(event.stage, LLM_JOB_RETRY_EXHAUSTED_STAGE);
+        assert_eq!(
+            event.message,
+            "retryable LLM provider error exhausted the turn budget"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn event_append_failure_does_not_leave_job_processing() -> Result<(), Box<dyn Error>> {
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let queue = FailingEventQueue::new();
+        let job_id = queue.inner.assign(
+            DIALOG_AIFARM_QUEUE_NAME,
+            new_dialog_job_at(dialog_params("x"), now),
+        );
+        let provider =
+            RetryableProviderStub::new("aifarm", FailureReason::ProviderUnavailable, "status 503");
+        let effects = EffectsStub::default();
+
+        let report = process_dialog_job_once_in_queue_at(
+            &queue,
+            DIALOG_AIFARM_QUEUE_NAME,
+            &provider,
+            &effects,
+            now,
+        )
+        .await;
+
+        assert!(report.retry_requeued, "status write must win over events");
+        assert!(report.status_error.is_some(), "append failure is recorded");
+        assert!(!report.failed);
+        let record = queue
+            .inner
+            .records()
+            .into_iter()
+            .find(|record| record.id == job_id)
+            .expect("record");
+        assert_eq!(record.status, JobStatus::Pending);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dialog_worker_records_turn_started_anchor_on_first_attempt()
+    -> Result<(), Box<dyn Error>> {
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let queue = InMemoryTaskQueue::new();
+        let job_id = queue.assign(
+            DIALOG_AIFARM_QUEUE_NAME,
+            new_dialog_job_at(dialog_params("hello"), now - TimeDuration::seconds(30)),
+        );
+        let provider = ProviderStub::returning(DialogOutput {
+            answer: "pong".to_owned(),
+            ..DialogOutput::default()
+        });
+        let effects = EffectsStub::default();
+
+        let report = process_dialog_job_once_at(&queue, &provider, &effects, now).await;
+
+        assert!(report.sent_answer);
+        let record = queue.record(job_id).expect("job record");
+        let anchor = record
+            .events
+            .iter()
+            .find(|event| event.stage == crate::dialog_turn::TURN_STARTED_STAGE)
+            .expect("turn_started event");
+        assert_eq!(anchor.at, "2026-05-19T12:30:00Z");
+        let outcome_event = record
+            .events
+            .iter()
+            .find(|event| event.stage == crate::dialog_turn::TURN_OUTCOME_STAGE)
+            .expect("turn outcome event");
+        assert_eq!(outcome_event.data["outcome"], "sent");
         Ok(())
     }
 
@@ -3268,9 +3667,17 @@ mod tests {
         assert_eq!(record.worker_id, None);
         assert_eq!(record.started_at, None);
         assert_eq!(record.completed_at, None);
-        assert_eq!(record.events.len(), 1);
-        let event = &record.events[0];
-        assert_eq!(event.at, "2026-05-19T12:30:00Z");
+        let event = record
+            .events
+            .iter()
+            .find(|event| event.stage == LLM_JOB_RETRY_STAGE)
+            .expect("retry event");
+        // `at` carries the real generation wall time on top of the tick time.
+        assert!(
+            event.at.starts_with("2026-05-19T12:30:00"),
+            "unexpected retry event time: {}",
+            event.at
+        );
         assert_eq!(event.level, "warn");
         assert_eq!(event.stage, LLM_JOB_RETRY_STAGE);
         assert_eq!(event.attempt, 1);
@@ -3328,8 +3735,11 @@ mod tests {
             DialogJobProcessOptions {
                 queue_name: DIALOG_AIFARM_QUEUE_NAME,
                 max_llm_job_attempts: DEFAULT_LLM_JOB_MAX_ATTEMPTS,
+                turn_budget_secs: DEFAULT_DIALOG_TURN_BUDGET_SECS,
+                turn_max_queue_age_secs: DEFAULT_DIALOG_TURN_MAX_QUEUE_AGE_SECS,
                 now,
                 routing_events: Some(&reporter),
+                turn_outcomes: None,
             },
         )
         .await;
@@ -3343,8 +3753,15 @@ mod tests {
             record.error,
             Some("aifarm provider provider_unavailable: status 503".to_owned())
         );
-        assert_eq!(record.events.len(), DEFAULT_LLM_JOB_MAX_ATTEMPTS as usize);
-        let event = record.events.last().expect("exhausted event");
+        let retry_events: Vec<_> = record
+            .events
+            .iter()
+            .filter(|event| {
+                event.stage == LLM_JOB_RETRY_STAGE || event.stage == LLM_JOB_RETRY_EXHAUSTED_STAGE
+            })
+            .collect();
+        assert_eq!(retry_events.len(), DEFAULT_LLM_JOB_MAX_ATTEMPTS as usize);
+        let event = retry_events.last().expect("exhausted event");
         assert_eq!(event.stage, LLM_JOB_RETRY_EXHAUSTED_STAGE);
         assert_eq!(event.attempt, DEFAULT_LLM_JOB_MAX_ATTEMPTS);
         assert_eq!(
@@ -3391,8 +3808,11 @@ mod tests {
             DialogJobProcessOptions {
                 queue_name: DIALOG_AIFARM_QUEUE_NAME,
                 max_llm_job_attempts: 2,
+                turn_budget_secs: DEFAULT_DIALOG_TURN_BUDGET_SECS,
+                turn_max_queue_age_secs: DEFAULT_DIALOG_TURN_MAX_QUEUE_AGE_SECS,
                 now,
                 routing_events: None,
+                turn_outcomes: None,
             },
         )
         .await;
@@ -3408,8 +3828,11 @@ mod tests {
             DialogJobProcessOptions {
                 queue_name: DIALOG_AIFARM_QUEUE_NAME,
                 max_llm_job_attempts: 2,
+                turn_budget_secs: DEFAULT_DIALOG_TURN_BUDGET_SECS,
+                turn_max_queue_age_secs: DEFAULT_DIALOG_TURN_MAX_QUEUE_AGE_SECS,
                 now,
                 routing_events: None,
+                turn_outcomes: None,
             },
         )
         .await;
@@ -3419,9 +3842,16 @@ mod tests {
 
         let record = queue.record(job_id).expect("job");
         assert_eq!(record.status, JobStatus::Failed);
-        assert_eq!(record.events.len(), 2);
-        assert_eq!(record.events[1].stage, LLM_JOB_RETRY_EXHAUSTED_STAGE);
-        assert_eq!(record.events[1].data["max_attempts"], "2");
+        let retry_events: Vec<_> = record
+            .events
+            .iter()
+            .filter(|event| {
+                event.stage == LLM_JOB_RETRY_STAGE || event.stage == LLM_JOB_RETRY_EXHAUSTED_STAGE
+            })
+            .collect();
+        assert_eq!(retry_events.len(), 2);
+        assert_eq!(retry_events[1].stage, LLM_JOB_RETRY_EXHAUSTED_STAGE);
+        assert_eq!(retry_events[1].data["max_attempts"], "2");
         Ok(())
     }
 
@@ -3922,6 +4352,118 @@ mod tests {
                 input.history = self.history.clone();
                 input
             })
+        }
+    }
+
+    #[tokio::test]
+    async fn deliverable_validation_matches_outbound_acceptance() -> Result<(), Box<dyn Error>> {
+        let queue = Arc::new(DispatcherQueue::new(
+            openplotva_telegram::DispatcherConfig::default(),
+        ));
+        let effects = DialogDispatcherEffects::new(Arc::clone(&queue))
+            .with_virtual_id_factory(Arc::new(|| "dialog-v1".to_owned()));
+        let params = dialog_params("hello");
+        let corpus: Vec<String> = vec![
+            "hello".to_owned(),
+            "<b>hello</b>".to_owned(),
+            "<p>rich paragraph</p>".to_owned(),
+            "<b></b>".to_owned(),
+            "<b> </b>".to_owned(),
+            "\u{200b}\u{200c}".to_owned(),
+            "&#x200b;".to_owned(),
+            format!("<p>{}</p>", "a".repeat(40_000)),
+            format!("<h2>{}</h2>", "б".repeat(100)),
+        ];
+
+        for answer in corpus {
+            let validated = validate_dialog_answer_deliverable(&answer).is_ok();
+            let accepted = effects.send_dialog_answer(&params, &answer).await.is_ok();
+            assert_eq!(
+                validated,
+                accepted,
+                "validator and outbound boundary disagree on {:?}...",
+                answer.chars().take(40).collect::<String>()
+            );
+        }
+        Ok(())
+    }
+
+    fn ledger_rows(
+        outcomes: &crate::dialog_turn::DialogTurnObserver,
+    ) -> Vec<openplotva_server::RuntimeTurnOutcomeData> {
+        use openplotva_server::{RuntimeTurnOutcomeInspector, RuntimeTurnOutcomesFilter};
+        outcomes
+            .buffer()
+            .turn_outcomes(RuntimeTurnOutcomesFilter {
+                limit: 32,
+                ..RuntimeTurnOutcomesFilter::default()
+            })
+            .expect("turn outcomes")
+    }
+
+    /// Queue whose event appends always fail while status writes succeed,
+    /// probing the S13 invariant.
+    struct FailingEventQueue {
+        inner: InMemoryTaskQueue,
+    }
+
+    impl FailingEventQueue {
+        fn new() -> Self {
+            Self {
+                inner: InMemoryTaskQueue::new(),
+            }
+        }
+    }
+
+    impl DialogJobWorkerQueue for FailingEventQueue {
+        type Error = TaskQueueError;
+
+        fn dequeue_dialog_job<'a>(
+            &'a self,
+            queue_name: &'static str,
+        ) -> DialogJobWorkerFuture<'a, Option<DialogJobWorkItem>, Self::Error> {
+            self.inner.dequeue_dialog_job(queue_name)
+        }
+
+        fn pending_dialog_job_depth<'a>(
+            &'a self,
+            queue_name: &'static str,
+            priority: Priority,
+        ) -> DialogJobWorkerFuture<'a, usize, Self::Error> {
+            self.inner.pending_dialog_job_depth(queue_name, priority)
+        }
+
+        fn complete_dialog_job<'a>(
+            &'a self,
+            job_id: i64,
+        ) -> DialogJobWorkerFuture<'a, (), Self::Error> {
+            self.inner.complete_dialog_job(job_id)
+        }
+
+        fn fail_dialog_job<'a>(
+            &'a self,
+            job_id: i64,
+            error: &'a str,
+        ) -> DialogJobWorkerFuture<'a, (), Self::Error> {
+            self.inner.fail_dialog_job(job_id, error)
+        }
+
+        fn append_dialog_job_event<'a>(
+            &'a self,
+            _job_id: i64,
+            _event: TaskQueueJobEvent,
+            _at: OffsetDateTime,
+        ) -> DialogJobWorkerFuture<'a, (), Self::Error> {
+            Box::pin(async { Err(TaskQueueError::QueueNameRequired) })
+        }
+
+        fn requeue_retryable_dialog_job<'a>(
+            &'a self,
+            job_id: i64,
+            target_queue: &'a str,
+        ) -> DialogJobWorkerFuture<'a, (), Self::Error> {
+            self.inner
+                .requeue_retryable_dialog_job(job_id, target_queue)
         }
     }
 

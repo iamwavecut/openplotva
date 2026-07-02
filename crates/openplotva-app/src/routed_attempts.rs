@@ -117,6 +117,12 @@ impl RoutedAttemptWalker {
             if started.elapsed() > route.retry.wall_clock {
                 break;
             }
+            if context
+                .deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                break;
+            }
             let provider = table.provider(attempt.provider);
             let model = table.model(attempt.model);
             let routed = RoutedAttempt {
@@ -240,6 +246,9 @@ pub struct RoutedRequestContext {
     pub thread_id: Option<i32>,
     pub message_id: Option<i32>,
     pub vip: bool,
+    /// The walker will not start an attempt at or past this instant, so one
+    /// call cannot overshoot the caller's turn budget by a full attempt.
+    pub deadline: Option<Instant>,
     pub suppress_all_attempts_exhausted_admin_report: bool,
     pub suppressed_all_attempts_exhausted_reason: Option<String>,
 }
@@ -548,6 +557,34 @@ mod tests {
         assert_eq!(attempts[0].overrides.max_tokens, Some(40));
         assert_eq!(attempts[0].overrides.extra["enable_thinking"], json!(true));
         assert_eq!(attempts[0].overrides.extra["top_p"], json!(0.9));
+    }
+
+    #[tokio::test]
+    async fn walker_does_not_start_attempts_past_the_deadline() {
+        let walker = walker_for(snapshot(json!({}), json!({})));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let call_count = Arc::clone(&calls);
+
+        let result = walker
+            .run(
+                RoutedRequestContext {
+                    workflow_key: "dialog".to_owned(),
+                    deadline: Some(std::time::Instant::now()),
+                    ..RoutedRequestContext::default()
+                },
+                move |_attempt| {
+                    let call_count = Arc::clone(&call_count);
+                    async move {
+                        call_count.fetch_add(1, Ordering::Relaxed);
+                        Ok::<_, std::io::Error>("unused")
+                    }
+                },
+                |_error| None,
+            )
+            .await;
+
+        assert!(matches!(result, Err(RoutedAttemptRunError::Routing(_))));
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
