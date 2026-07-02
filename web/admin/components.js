@@ -831,6 +831,7 @@
                 this._resize = new ResizeObserver(() => {
                     if (this._data && !this._dragging
                         && Math.abs(this.clientWidth - (this._lastWidth || 0)) > 24) {
+                        this._sig = null;
                         this.render();
                     }
                 });
@@ -849,13 +850,108 @@
             if (this.isConnected) this.render();
         }
         get data() { return this._data; }
+        /* Everything except live state/engagement: while this matches, a poll
+           only patches attributes in place — no DOM rebuild, no scroll reset,
+           no layout jump. */
+        _signature(d) {
+            const nodes = (d.nodes || [])
+                .map((n) => [n.id, n.kind, String(n.label || ''), n.badge || '', n.color || ''])
+                .sort();
+            const edges = (d.edges || [])
+                .map((e) => [e.from, e.to, e.kind || '', e.weight == null ? '' : e.weight,
+                    e.order == null ? '' : e.order, e.color || ''])
+                .sort();
+            return JSON.stringify([nodes, edges]);
+        }
+        _patchLiveState() {
+            const d = this._data || {};
+            (d.nodes || []).forEach((n) => {
+                const g = this._nodeEls && this._nodeEls[n.id];
+                if (g) g.setAttribute('data-state', n.state || 'ok');
+            });
+            (d.edges || []).forEach((e) => {
+                if (e.kind !== 'overflow') return;
+                const path = this._edgeEls && this._edgeEls[e.from + '→' + e.to + '·overflow'];
+                if (!path) return;
+                if (e.engaged) {
+                    path.removeAttribute('stroke-dasharray');
+                    path.setAttribute('data-engaged', '');
+                } else {
+                    path.setAttribute('stroke-dasharray', '3 5');
+                    path.removeAttribute('data-engaged');
+                }
+            });
+        }
+        /* Force layout: edges pull their endpoints together, nodes repel, a
+           weak per-kind horizontal bias keeps the workflow→pool reading
+           direction. Connected clusters gravitate together; the seed and all
+           forces are deterministic, and user-dragged nodes stay pinned. */
+        _forceLayout(nodes, edges, seed, opts) {
+            const idx = {};
+            nodes.forEach((n, i) => { idx[n.id] = i; });
+            const xs = nodes.map((n) => seed[n.id].x);
+            const ys = nodes.map((n) => seed[n.id].y);
+            const pinned = nodes.map((n) => !!this._userPos[n.id]);
+            const links = [];
+            edges.forEach((e) => {
+                const a = idx[e.from], b = idx[e.to];
+                if (a == null || b == null) return;
+                links.push([a, b, opts.linkRest]);
+            });
+            const colTarget = nodes.map((n) => opts.colX[n.kind] != null ? opts.colX[n.kind] : xs[idx[n.id]]);
+            const N = nodes.length;
+            const ASPECT = 2.6;             // rectangles: horizontal space is dearer
+            const REP = 14000;              // pairwise repulsion strength
+            const SPRING = 0.015;           // edge attraction
+            const BIAS = 0.06;              // pull toward the kind column
+            const STEPS = 240;
+            for (let step = 0; step < STEPS; step++) {
+                const cool = 1 - step / STEPS;
+                const maxMove = 3 + 15 * cool;
+                const fx = new Array(N).fill(0);
+                const fy = new Array(N).fill(0);
+                for (let i = 0; i < N; i++) {
+                    for (let j = i + 1; j < N; j++) {
+                        let dx = (xs[i] - xs[j]) / ASPECT;
+                        let dy = ys[i] - ys[j];
+                        if (dx === 0 && dy === 0) { dx = 0.1 + (i % 7) * 0.05; dy = 0.1; }
+                        const d2 = dx * dx + dy * dy;
+                        if (d2 > 260000) continue;
+                        const f = REP / Math.max(d2, 900);
+                        const d = Math.sqrt(d2);
+                        fx[i] += (dx / d) * f; fy[i] += (dy / d) * f;
+                        fx[j] -= (dx / d) * f; fy[j] -= (dy / d) * f;
+                    }
+                }
+                links.forEach((l) => {
+                    const dx = xs[l[1]] - xs[l[0]];
+                    const dy = ys[l[1]] - ys[l[0]];
+                    const d = Math.sqrt(dx * dx + dy * dy) || 1;
+                    const f = SPRING * (d - l[2]);
+                    fx[l[0]] += (dx / d) * f; fy[l[0]] += (dy / d) * f;
+                    fx[l[1]] -= (dx / d) * f; fy[l[1]] -= (dy / d) * f;
+                });
+                for (let i = 0; i < N; i++) {
+                    if (pinned[i]) continue;
+                    fx[i] += BIAS * (colTarget[i] - xs[i]);
+                    const mag = Math.hypot(fx[i], fy[i]) || 1;
+                    const move = Math.min(mag, maxMove);
+                    xs[i] += (fx[i] / mag) * move;
+                    ys[i] += (fy[i] / mag) * move;
+                }
+            }
+            const out = {};
+            nodes.forEach((n, i) => { out[n.id] = { x: xs[i], y: ys[i] }; });
+            return out;
+        }
         /* Path between two node anchors at their current positions. */
         _edgeD(from, to) {
             const a = this._pos[from], b = this._pos[to];
             const nodeW = this._nodeW, nodeH = FLOW_NODE_H;
-            const x1 = a.x + nodeW, y1 = a.y + nodeH / 2;
-            const x2 = b.x, y2 = b.y + nodeH / 2;
-            const dx = Math.max(36, (x2 - x1) / 2);
+            const leftToRight = a.x + nodeW / 2 <= b.x + nodeW / 2;
+            const x1 = leftToRight ? a.x + nodeW : a.x, y1 = a.y + nodeH / 2;
+            const x2 = leftToRight ? b.x : b.x + nodeW, y2 = b.y + nodeH / 2;
+            const dx = Math.max(36, Math.abs(x2 - x1) / 2) * (leftToRight ? 1 : -1);
             return {
                 d: 'M ' + x1 + ' ' + y1 + ' C ' + (x1 + dx) + ' ' + y1 + ', '
                     + (x2 - dx) + ' ' + y2 + ', ' + x2 + ' ' + y2,
@@ -913,8 +1009,7 @@
                     if (this._pendingData) {
                         const pending = this._pendingData;
                         this._pendingData = null;
-                        this._data = pending;
-                        this.render();
+                        this.data = pending;
                     }
                 };
                 g.addEventListener('pointermove', onMove);
@@ -923,16 +1018,23 @@
             });
         }
         render() {
-            this.textContent = '';
             const d = this._data || {};
             const nodes = d.nodes || [];
             const edges = d.edges || [];
-            if (!nodes.length) return;
+            if (!nodes.length) { this.replaceChildren(); this._sig = null; return; }
+            // Same topology → patch live state in place, keep DOM and scroll.
+            const sig = this._signature(d);
+            if (sig === this._sig && this._nodeEls) {
+                this._patchLiveState();
+                return;
+            }
+            this._sig = sig;
             this._userPos = this._userPos || {};
+            const prevScroller = this.querySelector('.pl-flow-scroll');
+            const prevScrollLeft = prevScroller ? prevScroller.scrollLeft : 0;
             const kindsPresent = FLOW_KIND_ORDER.filter((k) => nodes.some((n) => n.kind === k));
             const byCol = kindsPresent.map((k) => nodes.filter((n) => n.kind === k));
             const cols = kindsPresent.length;
-            const maxRows = Math.max.apply(null, byCol.map((c) => c.length));
             const containerW = this.clientWidth || 1100;
             this._lastWidth = containerW;
             const nodeW = Math.max(180, Math.min(260,
@@ -940,24 +1042,48 @@
             this._nodeW = nodeW;
             const minW = FLOW_PAD * 2 + cols * nodeW + (cols - 1) * FLOW_MIN_COL_GAP;
             const W = Math.max(containerW, minW);
-            const H = FLOW_PAD * 2 + Math.max(1, maxRows) * FLOW_ROW_H;
-            // Columns spread edge-to-edge across the full width; a lone column
-            // sits centered.
             const colStep = cols > 1 ? (W - FLOW_PAD * 2 - nodeW) / (cols - 1) : 0;
-            const colX = (ci) => cols > 1
-                ? FLOW_PAD + ci * colStep
-                : FLOW_PAD + (W - FLOW_PAD * 2 - nodeW) / 2;
-            const pos = {};
-            byCol.forEach((col, ci) => {
+            const colXByKind = {};
+            kindsPresent.forEach((k, ci) => {
+                colXByKind[k] = cols > 1
+                    ? FLOW_PAD + ci * colStep
+                    : FLOW_PAD + (W - FLOW_PAD * 2 - nodeW) / 2;
+            });
+            // Seed: classic rows per column, then let the simulation cluster
+            // connected nodes and spread the rest.
+            const seed = {};
+            const seedH = FLOW_PAD * 2
+                + Math.max(1, Math.max.apply(null, byCol.map((c) => c.length))) * FLOW_ROW_H;
+            byCol.forEach((col) => {
                 const span = col.length * FLOW_ROW_H;
-                const top = FLOW_PAD + (H - FLOW_PAD * 2 - span) / 2;
+                const top = FLOW_PAD + (seedH - FLOW_PAD * 2 - span) / 2;
                 col.forEach((n, ri) => {
-                    pos[n.id] = this._userPos[n.id] || {
-                        x: colX(ci),
+                    seed[n.id] = this._userPos[n.id] || {
+                        x: colXByKind[n.kind],
                         y: top + ri * FLOW_ROW_H + (FLOW_ROW_H - FLOW_NODE_H) / 2
                     };
                 });
             });
+            const pos = this._forceLayout(nodes, edges, seed, {
+                colX: colXByKind,
+                linkRest: Math.max(colStep * 0.9, 220)
+            });
+            Object.keys(this._userPos).forEach((id) => {
+                if (pos[id]) pos[id] = this._userPos[id];
+            });
+            // Fit vertically: shift so the topmost node sits at the padding,
+            // clamp x into the canvas, and size the height to the result.
+            let minY = Infinity, maxY = -Infinity;
+            nodes.forEach((n) => {
+                minY = Math.min(minY, pos[n.id].y);
+                maxY = Math.max(maxY, pos[n.id].y);
+            });
+            const shiftY = FLOW_PAD - minY;
+            nodes.forEach((n) => {
+                pos[n.id].y += shiftY;
+                pos[n.id].x = Math.min(Math.max(pos[n.id].x, FLOW_PAD), W - FLOW_PAD - nodeW);
+            });
+            const H = Math.max(420, maxY - minY + FLOW_NODE_H + FLOW_PAD * 2);
             this._pos = pos;
             const svg = svgEl('svg', {
                 viewBox: '0 0 ' + W + ' ' + H, width: W, height: H,
@@ -972,6 +1098,8 @@
                 shadow: '6 6'
             };
             this._edgeIndex = [];
+            this._edgeEls = {};
+            this._nodeEls = {};
             let labelIndex = 0;
             edges.forEach((e) => {
                 if (!pos[e.from] || !pos[e.to]) return;
@@ -1010,6 +1138,7 @@
                     svg.appendChild(labelEl);
                 }
                 this._edgeIndex.push({ el: path, labelEl, t, from: e.from, to: e.to });
+                this._edgeEls[e.from + '→' + e.to + '·' + (e.kind || 'attach')] = path;
             });
             const maxLabelChars = Math.max(18, Math.floor((nodeW - 22) / 7.2));
             nodes.forEach((n) => {
@@ -1056,11 +1185,15 @@
                     if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); emit(); }
                 });
                 this._makeDraggable(g, n);
+                this._nodeEls[n.id] = g;
                 svg.appendChild(g);
             });
             const scroller = el('div', { class: 'pl-flow-scroll' });
             scroller.appendChild(svg);
-            this.appendChild(scroller);
+            // Swap in one operation: no zero-height moment, no page scroll
+            // jump; the horizontal scroll offset survives the rebuild.
+            this.replaceChildren(scroller);
+            if (prevScrollLeft) scroller.scrollLeft = prevScrollLeft;
         }
     }
 

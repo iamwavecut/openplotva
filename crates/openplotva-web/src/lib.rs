@@ -55,7 +55,7 @@ const ADMIN_ASSETS: &[StaticAsset] = &[
         path: "components.js",
         content_type: "text/javascript; charset=utf-8",
         bytes: include_bytes!("../../../web/admin/components.js"),
-        sha256: "550ea4bea2a70fb178df4e6b498b22e0a979cce7aa9225e1f3ac0704c9efa863",
+        sha256: "6fa51860405fb7fce5c86084fcea245917decfafb7d1f95b293253fb10a4a11c",
     },
     StaticAsset {
         path: "favicon.svg",
