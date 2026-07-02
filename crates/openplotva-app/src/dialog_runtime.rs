@@ -1209,6 +1209,8 @@ mod tests {
                 id: 1,
                 name: "aifarm".to_owned(),
                 kind: "chat".to_owned(),
+                protocol: None,
+                runtime_hint: None,
                 endpoint: None,
                 discovery_service_name: None,
                 discovery_endpoint_name: None,
@@ -1225,6 +1227,7 @@ mod tests {
                 base_url: None,
                 capabilities: vec!["chat".to_owned()],
                 embedding_dim: None,
+                pool_id: None,
                 enabled: true,
                 config: json!({}),
             }],
@@ -1251,6 +1254,7 @@ mod tests {
                 cb_cooldown_ms: 30_000,
             }],
             triggers: vec![],
+            pools: vec![],
         }
     }
 

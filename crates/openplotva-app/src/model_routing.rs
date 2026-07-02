@@ -40,6 +40,16 @@ pub async fn reload_router(handle: &RouterHandle, pool: &PgPool) -> Result<(), S
 
 const SEEDED_KEY: &str = "llm.routing.seeded";
 
+/// Wire-payload protocols a provider can speak. Discovery resolution stays
+/// orthogonal (presence of `discovery_service_name`); these name the request
+/// shape the runtime sends.
+pub const PROTOCOL_OPENAI_COMPAT: &str = "openai_compat";
+pub const PROTOCOL_GENKIT: &str = "genkit";
+pub const PROTOCOL_ACESTEP: &str = "acestep";
+pub const PROTOCOL_DISCOVERY_JOBS: &str = "discovery_jobs";
+pub const PROTOCOL_DISCOVERY_DRAW: &str = "discovery_draw";
+pub const PROTOCOL_PRIVACY_FILTER: &str = "privacy_filter";
+
 async fn app_setting_present(pool: &PgPool, key: &str) -> Result<bool, StorageError> {
     let row = sqlx::query("SELECT value FROM app_settings WHERE key = $1")
         .bind(key)
@@ -84,6 +94,7 @@ async fn seed_provider_model(
         base_url: base_url.map(str::to_owned),
         capabilities: capabilities.iter().map(|c| (*c).to_owned()).collect(),
         embedding_dim,
+        pool_id: None,
         enabled: true,
         config: json!({}),
     };
@@ -92,6 +103,7 @@ async fn seed_provider_model(
 
 fn chat_provider(
     name: &str,
+    protocol: &str,
     api_key_ref: &str,
     discovery: Option<(&str, &str, &str)>,
 ) -> ProviderInput {
@@ -106,6 +118,8 @@ fn chat_provider(
     ProviderInput {
         name: name.to_owned(),
         kind: "chat".to_owned(),
+        protocol: Some(protocol.to_owned()),
+        runtime_hint: None,
         endpoint,
         discovery_service_name: service,
         discovery_endpoint_name: ep,
@@ -166,6 +180,7 @@ pub async fn seed_routing_from_env(
         pool,
         chat_provider(
             "aifarm",
+            PROTOCOL_OPENAI_COMPAT,
             "DIALOG_API_KEY",
             Some((
                 discovery_base,
@@ -185,7 +200,7 @@ pub async fn seed_routing_from_env(
     let genkit_default = crate::memory_runtime::genkit_runtime_default_model(config);
     let genkit_model = seed_provider_model(
         pool,
-        chat_provider("genkit", "GOOGLEAI_KEY", None),
+        chat_provider("genkit", PROTOCOL_GENKIT, "GOOGLEAI_KEY", None),
         genkit_default.as_str(),
         None,
         &["chat", "tools"],
@@ -196,7 +211,7 @@ pub async fn seed_routing_from_env(
     // Proprietary Gemini overflow target, available for the operator to assign.
     let _gemini_model = seed_provider_model(
         pool,
-        chat_provider("gemini", "GOOGLEAI_KEY", None),
+        chat_provider("gemini", PROTOCOL_GENKIT, "GOOGLEAI_KEY", None),
         genkit_default.as_str(),
         None,
         &["chat", "tools"],
@@ -210,6 +225,8 @@ pub async fn seed_routing_from_env(
         ProviderInput {
             name: "aifarm-vision".to_owned(),
             kind: "vision".to_owned(),
+            protocol: Some(PROTOCOL_OPENAI_COMPAT.to_owned()),
+            runtime_hint: None,
             endpoint: Some(discovery_base.to_owned()),
             discovery_service_name: Some(config.vision.discovery_service_name.clone()),
             discovery_endpoint_name: Some(config.vision.discovery_endpoint_name.clone()),
@@ -230,6 +247,8 @@ pub async fn seed_routing_from_env(
         ProviderInput {
             name: "aifarm-embed".to_owned(),
             kind: "embedding".to_owned(),
+            protocol: Some(PROTOCOL_DISCOVERY_JOBS.to_owned()),
+            runtime_hint: None,
             endpoint: Some(discovery_base.to_owned()),
             discovery_service_name: Some(config.memory.embedder_service_name.clone()),
             discovery_endpoint_name: Some(config.memory.embedder_endpoint_name.clone()),
@@ -250,6 +269,8 @@ pub async fn seed_routing_from_env(
         ProviderInput {
             name: "acestep".to_owned(),
             kind: "music".to_owned(),
+            protocol: Some(PROTOCOL_ACESTEP.to_owned()),
+            runtime_hint: None,
             endpoint: Some(config.music.acestep.base_url.clone()),
             discovery_service_name: None,
             discovery_endpoint_name: None,
@@ -270,6 +291,8 @@ pub async fn seed_routing_from_env(
         ProviderInput {
             name: DRAW_API_PROVIDER.to_owned(),
             kind: "image".to_owned(),
+            protocol: Some(PROTOCOL_DISCOVERY_DRAW.to_owned()),
+            runtime_hint: None,
             endpoint: Some(config.llm.discovery.base_url.clone()),
             discovery_service_name: Some(
                 crate::image_jobs::AIFARM_DRAW_API_SERVICE_NAME.to_owned(),
@@ -399,6 +422,8 @@ pub async fn backfill_vram_cloud_from_env(
         &ProviderInput {
             name: VRAM_CLOUD_PROVIDER.to_owned(),
             kind: "chat".to_owned(),
+            protocol: Some(PROTOCOL_OPENAI_COMPAT.to_owned()),
+            runtime_hint: None,
             endpoint: dialog.aifarm_pool_base_urls.first().cloned(),
             discovery_service_name: None,
             discovery_endpoint_name: None,
@@ -425,6 +450,7 @@ pub async fn backfill_vram_cloud_from_env(
                 base_url,
                 capabilities: vec!["chat".to_owned(), "tools".to_owned()],
                 embedding_dim: None,
+                pool_id: None,
                 enabled: true,
                 config: json!({}),
             },
@@ -542,6 +568,8 @@ pub async fn backfill_gpu_models(pool: &PgPool, config: &AppConfig) -> Result<bo
                     &ProviderInput {
                         name: provider_name.clone(),
                         kind: "chat".to_owned(),
+                        protocol: Some(PROTOCOL_OPENAI_COMPAT.to_owned()),
+                        runtime_hint: Some("llama_cpp".to_owned()),
                         endpoint: None,
                         discovery_service_name: Some(service.clone()),
                         discovery_endpoint_name: Some(endpoint.clone()),
@@ -570,6 +598,7 @@ pub async fn backfill_gpu_models(pool: &PgPool, config: &AppConfig) -> Result<bo
                         base_url: None,
                         capabilities: vec!["chat".to_owned(), "tools".to_owned()],
                         embedding_dim: None,
+                        pool_id: None,
                         enabled: true,
                         config: json!({}),
                     },
@@ -628,6 +657,8 @@ pub async fn backfill_dialog_qwen_fallback(
         ProviderInput {
             name: provider_name,
             kind: "chat".to_owned(),
+            protocol: Some(PROTOCOL_OPENAI_COMPAT.to_owned()),
+            runtime_hint: Some("llama_cpp".to_owned()),
             endpoint: None,
             discovery_service_name: Some(reasoner.discovery_service_name),
             discovery_endpoint_name: Some(reasoner.discovery_endpoint_name),
@@ -648,6 +679,7 @@ pub async fn backfill_dialog_qwen_fallback(
             base_url: None,
             capabilities: vec!["chat".to_owned(), "tools".to_owned()],
             embedding_dim: None,
+            pool_id: None,
             enabled: true,
             config: json!({}),
         },
@@ -701,6 +733,7 @@ fn model_input_from_record(record: &ModelRecord, model_name: String) -> ModelInp
         base_url: record.base_url.clone(),
         capabilities: record.capabilities.clone(),
         embedding_dim: record.embedding_dim,
+        pool_id: record.pool_id,
         enabled: record.enabled,
         config: record.config.clone(),
     }
@@ -793,6 +826,8 @@ async fn ensure_provider(
         id,
         name: input.name,
         kind: input.kind,
+        protocol: input.protocol,
+        runtime_hint: input.runtime_hint,
         endpoint: input.endpoint,
         discovery_service_name: input.discovery_service_name,
         discovery_endpoint_name: input.discovery_endpoint_name,
@@ -821,6 +856,7 @@ async fn ensure_model(
         base_url: input.base_url,
         capabilities: input.capabilities,
         embedding_dim: input.embedding_dim,
+        pool_id: input.pool_id,
         enabled: input.enabled,
         config: input.config,
     });
@@ -893,6 +929,8 @@ async fn ensure_draw_api_provider(
     let provider_input = ProviderInput {
         name: DRAW_API_PROVIDER.to_owned(),
         kind: "image".to_owned(),
+        protocol: Some(PROTOCOL_DISCOVERY_DRAW.to_owned()),
+        runtime_hint: None,
         endpoint: Some(config.llm.discovery.base_url.clone()),
         discovery_service_name: Some(crate::image_jobs::AIFARM_DRAW_API_SERVICE_NAME.to_owned()),
         discovery_endpoint_name: Some(crate::image_jobs::AIFARM_DRAW_API_ENDPOINT_NAME.to_owned()),
@@ -912,6 +950,8 @@ async fn ensure_draw_api_provider(
     {
         provider.name = provider_input.name;
         provider.kind = provider_input.kind;
+        provider.protocol = provider_input.protocol;
+        provider.runtime_hint = provider_input.runtime_hint;
         provider.endpoint = provider_input.endpoint;
         provider.discovery_service_name = provider_input.discovery_service_name;
         provider.discovery_endpoint_name = provider_input.discovery_endpoint_name;
@@ -945,6 +985,7 @@ async fn ensure_draw_api_model(
         model.base_url = model_input.base_url;
         model.capabilities = model_input.capabilities;
         model.embedding_dim = model_input.embedding_dim;
+        model.pool_id = model_input.pool_id;
         model.enabled = model_input.enabled;
         model.config = model_input.config;
     }
@@ -964,6 +1005,7 @@ fn draw_api_model_input(
         base_url: None,
         capabilities: vec!["image".to_owned()],
         embedding_dim: None,
+        pool_id: None,
         enabled: true,
         config: json!({
             "service_name": crate::image_jobs::AIFARM_DRAW_API_SERVICE_NAME,
@@ -1102,6 +1144,8 @@ pub async fn backfill_declarative_v2(
             ProviderInput {
                 name: PRIVACY_FILTER_PROVIDER.to_owned(),
                 kind: "privacy_filter".to_owned(),
+                protocol: Some(PROTOCOL_PRIVACY_FILTER.to_owned()),
+                runtime_hint: None,
                 endpoint: Some(config.llm.discovery.base_url.clone()),
                 discovery_service_name: Some(redaction_service.to_owned()),
                 discovery_endpoint_name: Some(config.memory.redaction_endpoint_name.clone()),
@@ -1122,6 +1166,7 @@ pub async fn backfill_declarative_v2(
                 base_url: None,
                 capabilities: vec!["privacy_filter".to_owned()],
                 embedding_dim: None,
+                pool_id: None,
                 enabled: config.memory.redaction_enabled,
                 config: json!({}),
             },
@@ -1143,6 +1188,8 @@ pub async fn backfill_declarative_v2(
             ProviderInput {
                 name: OPENROUTER_PROVIDER.to_owned(),
                 kind: "chat".to_owned(),
+                protocol: Some(PROTOCOL_OPENAI_COMPAT.to_owned()),
+                runtime_hint: None,
                 endpoint: Some(OPENROUTER_CHAT_COMPLETIONS_URL.to_owned()),
                 discovery_service_name: None,
                 discovery_endpoint_name: None,
@@ -1163,6 +1210,7 @@ pub async fn backfill_declarative_v2(
                 base_url: Some(OPENROUTER_CHAT_COMPLETIONS_URL.to_owned()),
                 capabilities: vec!["chat".to_owned(), "tools".to_owned()],
                 embedding_dim: None,
+                pool_id: None,
                 enabled: !config.open_router.key.trim().is_empty(),
                 config: json!({
                     "request_timeout_seconds": config.open_router.request_timeout_seconds,
@@ -1677,6 +1725,8 @@ mod tests {
             id,
             name: name.to_owned(),
             kind: kind.to_owned(),
+            protocol: None,
+            runtime_hint: None,
             endpoint: None,
             discovery_service_name: None,
             discovery_endpoint_name: None,
@@ -1696,6 +1746,7 @@ mod tests {
             base_url: None,
             capabilities: vec!["chat".to_owned()],
             embedding_dim: None,
+            pool_id: None,
             enabled: true,
             config: json!({}),
         }
@@ -1761,6 +1812,7 @@ mod tests {
                 low_watermark: Some(20),
                 params: json!({}),
             }],
+            pools: vec![],
         }
     }
 
@@ -1906,6 +1958,7 @@ mod tests {
             }],
             assignments: vec![assignment(100, "embedding", "global", "primary", 10, None)],
             triggers: vec![],
+            pools: vec![],
         };
 
         let table = build_routing_table(&snapshot);
@@ -2030,6 +2083,7 @@ mod tests {
                 ),
             ],
             triggers: vec![],
+            pools: vec![],
         };
 
         let table = build_routing_table(&snapshot);

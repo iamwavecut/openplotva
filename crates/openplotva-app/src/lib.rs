@@ -7599,6 +7599,8 @@ fn provider_input_from_json(
     let mut input = openplotva_storage::llm_routing::ProviderInput {
         name: routing_json_str(value, "name").ok_or("name is required")?,
         kind: routing_json_str(value, "kind").unwrap_or_else(|| "chat".to_owned()),
+        protocol: routing_json_str(value, "protocol"),
+        runtime_hint: routing_json_str(value, "runtime_hint"),
         endpoint: routing_json_str(value, "endpoint"),
         discovery_service_name: routing_json_str(value, "discovery_service_name"),
         discovery_endpoint_name: routing_json_str(value, "discovery_endpoint_name"),
@@ -7632,6 +7634,7 @@ fn model_input_from_json(
         base_url: routing_json_str(value, "base_url"),
         capabilities: routing_capabilities(value),
         embedding_dim: routing_json_i32(value, "embedding_dim"),
+        pool_id: value.get("pool_id").and_then(serde_json::Value::as_i64),
         enabled: routing_json_bool(value, "enabled", true),
         config: value.get("config").cloned().unwrap_or_else(|| json!({})),
     })

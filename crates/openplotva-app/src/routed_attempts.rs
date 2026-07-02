@@ -404,6 +404,8 @@ mod tests {
             id,
             name: name.to_owned(),
             kind: "chat".to_owned(),
+            protocol: None,
+            runtime_hint: None,
             endpoint: None,
             discovery_service_name: None,
             discovery_endpoint_name: None,
@@ -423,6 +425,7 @@ mod tests {
             base_url: None,
             capabilities: vec!["chat".to_owned()],
             embedding_dim: None,
+            pool_id: None,
             enabled: true,
             config,
         }
@@ -462,6 +465,7 @@ mod tests {
             }],
             assignments: vec![assignment(assignment_overrides)],
             triggers: vec![],
+            pools: vec![],
         }
     }
 
