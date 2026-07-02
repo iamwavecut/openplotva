@@ -7,6 +7,30 @@
 //! are impossible — empty provider output is retryable. Phase 3 adds the
 //! terminal user signal (reaction with text fallback) and in-process
 //! duplicate-answer regeneration.
+//!
+//! # At-least-once turn semantics
+//!
+//! A turn's externally visible steps (tool side effects, user reaction, sent
+//! answer) happen before `finalize_turn` writes the terminal job status, so a
+//! crash — or a failed status write — re-runs the whole turn. The crash
+//! windows and their bounds:
+//!
+//! - **After a side-effect ticket is assigned / delivery obligation
+//!   inserted:** the re-run re-executes generation and its tools, so a second
+//!   generation job for the same trigger is possible. Duplicate inserts of
+//!   the *same* ticket are blocked by the obligation unique index; two
+//!   distinct tickets are accepted, pre-existing behavior that obligations
+//!   make visible.
+//! - **After the terminal user reaction:** the re-run may re-react —
+//!   `setMessageReaction` is replace-idempotent, so this is a visual no-op.
+//!   The `terminal_user_signal` job event marker gates only the
+//!   non-idempotent text fallback, which is sent at most once.
+//! - **After a sent answer, before the status write:** without a marker the
+//!   re-run would send a duplicate message. The `answer_sent` job event
+//!   marker (appended right after a successful send; append failure
+//!   non-fatal) makes the re-run resolve `Sent` with `resent_skipped`
+//!   instead of re-sending; a crash inside the marker window itself is
+//!   further bounded by the reply-scoped outbound debounce key.
 
 mod budget;
 mod engine;
@@ -18,7 +42,7 @@ mod signal;
 pub use budget::{
     TURN_DEADLINE, TURN_STARTED_STAGE, TurnBudget, current_turn_deadline, turn_started_at,
 };
-pub use engine::{DIALOG_TURN_REGENERATE_STAGE, TURN_OUTCOME_STAGE};
+pub use engine::{ANSWER_SENT_STAGE, DIALOG_TURN_REGENERATE_STAGE, TURN_OUTCOME_STAGE};
 pub(crate) use engine::{TurnContext, execute_dialog_turn, finalize_turn};
 pub use ledger::{
     DialogTurnObserver, DialogTurnOutcomeRecord, PostgresDialogTurnOutcomeRecorder,

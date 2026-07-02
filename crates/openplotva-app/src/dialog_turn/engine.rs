@@ -37,6 +37,11 @@ pub const TURN_OUTCOME_STAGE: &str = "turn_outcome";
 /// Job event stage appended per in-process duplicate-answer regeneration.
 pub const DIALOG_TURN_REGENERATE_STAGE: &str = "dialog_turn_regenerate";
 
+/// Job event stage appended right after a successfully queued dialog answer.
+/// On turn re-entry (crash between send and status write) the marker makes
+/// the turn resolve `Sent` without re-sending the answer.
+pub const ANSWER_SENT_STAGE: &str = "answer_sent";
+
 /// A turn never starts generation it cannot plausibly finish inside the budget.
 const MIN_GENERATION_BUDGET: TimeDuration = TimeDuration::seconds(15);
 
@@ -273,6 +278,26 @@ where
                 };
             }
             ReplyMaterial::Text { text, side_effects } => {
+                // At-least-once resend guard: a crash between a successful
+                // send and the status write re-runs the whole turn; the
+                // `answer_sent` marker resolves the re-run as `Sent` without
+                // re-sending (the regenerated text is discarded).
+                if ctx
+                    .item
+                    .events
+                    .iter()
+                    .any(|event| event.stage == ANSWER_SENT_STAGE)
+                {
+                    report.sent_answer = true;
+                    report.resent_skipped = true;
+                    return TurnResolution {
+                        outcome: TurnOutcome::Sent {
+                            parts: 1,
+                            side_effect_tickets: side_effect_tickets(&side_effects),
+                        },
+                        disposition: JobDisposition::Complete,
+                    };
+                }
                 let (duplicate_message_id, duplicate) =
                     should_suppress_duplicate_bot_reply(&duplicate_guard_history, &text);
                 if duplicate {
@@ -340,6 +365,10 @@ where
                 return match effects.send_dialog_answer(ctx.params, &text).await {
                     Ok(()) => {
                         report.sent_answer = true;
+                        let sent_now = ctx.now
+                            + TimeDuration::try_from(processing_started.elapsed())
+                                .unwrap_or_default();
+                        append_answer_sent_marker(queue, ctx.item.id, sent_now).await;
                         TurnResolution {
                             outcome: TurnOutcome::Sent {
                                 parts: 1,
@@ -407,6 +436,27 @@ async fn append_regeneration_event<Queue>(
             error = %error,
             job_id,
             "failed to append dialog regeneration event"
+        );
+    }
+}
+
+/// Marker append failure is non-fatal: a rerun may then re-send the answer,
+/// bounded by outbound dedup, which beats going silent.
+async fn append_answer_sent_marker<Queue>(queue: &Queue, job_id: i64, at: OffsetDateTime)
+where
+    Queue: DialogJobWorkerQueue + Sync + ?Sized,
+{
+    let event = TaskQueueJobEvent {
+        level: "info".to_owned(),
+        stage: ANSWER_SENT_STAGE.to_owned(),
+        message: "dialog answer accepted by the outbound queue".to_owned(),
+        ..TaskQueueJobEvent::default()
+    };
+    if let Err(error) = queue.append_dialog_job_event(job_id, event, at).await {
+        tracing::warn!(
+            error = %error,
+            job_id,
+            "failed to append answer_sent marker; a rerun may re-send the answer"
         );
     }
 }
@@ -721,6 +771,9 @@ fn resolution_detail(resolution: &TurnResolution, report: &DialogJobWorkerReport
     }
     if report.regenerations > 0 {
         detail.insert("regenerations".to_owned(), json!(report.regenerations));
+    }
+    if report.resent_skipped {
+        detail.insert("resent_skipped".to_owned(), json!(true));
     }
     if let Some(duplicate_message_id) = report.suppressed_duplicate_message_id {
         detail.insert(
