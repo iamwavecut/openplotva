@@ -746,6 +746,260 @@
         }
     }
 
+    /* ============================================================
+       pl-slotbar — pool slot occupancy (pure renderer)
+       attrs/props: capacity (int; absent = unlimited), busy, blocked,
+       size ("mini"|"card"|"cockpit"). Discrete cells when capacity <= 16,
+       continuous bar + "busy/capacity" text otherwise. role=img.
+       ============================================================ */
+    const SLOTBAR_ATTRS = ['capacity', 'busy', 'blocked', 'size'];
+    class PlSlotbar extends HTMLElement {
+        static get observedAttributes() { return SLOTBAR_ATTRS; }
+        connectedCallback() {
+            this.classList.add('pl-slotbar');
+            this._render();
+        }
+        attributeChangedCallback() { if (this.isConnected) this._render(); }
+        get capacity() {
+            const raw = this.getAttribute('capacity');
+            if (raw == null || raw === '' || raw === 'null') return null;
+            const n = Number(raw);
+            return isNaN(n) ? null : Math.max(0, Math.floor(n));
+        }
+        set capacity(v) {
+            if (v == null) this.removeAttribute('capacity');
+            else this.setAttribute('capacity', String(v));
+        }
+        get busy() { return Math.max(0, Number(this.getAttribute('busy')) || 0); }
+        set busy(v) { this.setAttribute('busy', String(v == null ? 0 : v)); }
+        get blocked() { return Math.max(0, Number(this.getAttribute('blocked')) || 0); }
+        set blocked(v) {
+            if (v == null) this.removeAttribute('blocked');
+            else this.setAttribute('blocked', String(v));
+        }
+        _render() {
+            const capacity = this.capacity;
+            const busy = this.busy;
+            const blocked = this.blocked;
+            this.setAttribute('data-size', this.getAttribute('size') || 'card');
+            this.setAttribute('role', 'img');
+            this.setAttribute('aria-label', capacity == null
+                ? busy + ' slots busy, unlimited capacity'
+                : busy + ' of ' + capacity + ' slots busy');
+            this.textContent = '';
+            if (capacity != null && capacity <= 16) {
+                const cells = el('div', { class: 'pl-slotbar-cells', 'aria-hidden': 'true' });
+                for (let i = 0; i < capacity; i++) {
+                    const state = i < Math.min(busy, capacity) ? 'busy'
+                        : (i < Math.min(busy + blocked, capacity) ? 'blocked' : 'free');
+                    cells.appendChild(el('span', { class: 'pl-slotbar-cell', dataset: { state: state } }));
+                }
+                this.appendChild(cells);
+                return;
+            }
+            const label = capacity == null ? busy + '/∞' : busy + '/' + capacity;
+            this.appendChild(el('span', { class: 'pl-slotbar-text', 'aria-hidden': 'true' }, label));
+            const track = el('div', { class: 'pl-slotbar-track', 'aria-hidden': 'true' });
+            const fill = el('span', { class: 'pl-slotbar-fill' });
+            const pct = capacity ? Math.min(100, (busy / capacity) * 100) : Math.min(100, busy * 8);
+            fill.style.width = pct.toFixed(1) + '%';
+            if (busy > 0) fill.setAttribute('data-active', '');
+            track.appendChild(fill);
+            this.appendChild(track);
+        }
+    }
+
+    /* ============================================================
+       pl-flow — layered routing DAG (pure renderer)
+       data prop: {
+         nodes: [{id, kind: workflow|model|provider|pool, label,
+                  state?: ok|breaker-open|disabled|capacity-blocked, badge?}],
+         edges: [{from, to, kind: primary|fallback|overflow|canary|shadow|attach,
+                  weight?, order?, engaged?}]
+       }
+       Deterministic layout: fixed columns by kind, vertical distribution,
+       cubic bezier edges. Nodes focusable; emits pl:node-click {id, kind}.
+       ============================================================ */
+    const FLOW_KIND_ORDER = ['workflow', 'model', 'provider', 'pool'];
+    const FLOW_NODE_W = 156, FLOW_NODE_H = 34, FLOW_ROW_H = 56, FLOW_COL_W = 232, FLOW_PAD = 18;
+    class PlFlow extends HTMLElement {
+        connectedCallback() { this.classList.add('pl-flow'); if (this._data) this.render(); }
+        set data(d) { this._data = d; if (this.isConnected) this.render(); }
+        get data() { return this._data; }
+        render() {
+            this.textContent = '';
+            const d = this._data || {};
+            const nodes = d.nodes || [];
+            const edges = d.edges || [];
+            if (!nodes.length) return;
+            const kindsPresent = FLOW_KIND_ORDER.filter((k) => nodes.some((n) => n.kind === k));
+            const colOf = {};
+            kindsPresent.forEach((k, i) => { colOf[k] = i; });
+            const byCol = kindsPresent.map((k) => nodes.filter((n) => n.kind === k));
+            const maxRows = Math.max.apply(null, byCol.map((c) => c.length));
+            const H = FLOW_PAD * 2 + Math.max(1, maxRows) * FLOW_ROW_H;
+            const W = FLOW_PAD * 2 + (kindsPresent.length - 1) * FLOW_COL_W + FLOW_NODE_W;
+            const pos = {};
+            byCol.forEach((col, ci) => {
+                const span = col.length * FLOW_ROW_H;
+                const top = FLOW_PAD + (H - FLOW_PAD * 2 - span) / 2;
+                col.forEach((n, ri) => {
+                    pos[n.id] = {
+                        x: FLOW_PAD + ci * FLOW_COL_W,
+                        y: top + ri * FLOW_ROW_H + (FLOW_ROW_H - FLOW_NODE_H) / 2
+                    };
+                });
+            });
+            const svg = svgEl('svg', {
+                viewBox: '0 0 ' + W + ' ' + H, width: W, height: H,
+                role: 'group', 'aria-label': 'Routing topology'
+            });
+            edges.forEach((e) => {
+                const a = pos[e.from], b = pos[e.to];
+                if (!a || !b) return;
+                const x1 = a.x + FLOW_NODE_W, y1 = a.y + FLOW_NODE_H / 2;
+                const x2 = b.x, y2 = b.y + FLOW_NODE_H / 2;
+                const dx = Math.max(28, (x2 - x1) / 2);
+                const attrs = {
+                    d: 'M ' + x1 + ' ' + y1 + ' C ' + (x1 + dx) + ' ' + y1 + ', ' + (x2 - dx) + ' ' + y2 + ', ' + x2 + ' ' + y2,
+                    class: 'pl-flow-edge',
+                    'data-ekind': e.kind || 'attach',
+                    fill: 'none',
+                    'stroke-width': (e.weight != null ? (1.2 + clamp01(e.weight / 100) * 3.6) : 1.5).toFixed(1)
+                };
+                if (e.kind === 'overflow' && !e.engaged) attrs['stroke-dasharray'] = '6 5';
+                if (e.engaged) attrs['data-engaged'] = '';
+                svg.appendChild(svgEl('path', attrs));
+                let tag = null;
+                if (e.kind === 'primary' && e.weight != null) tag = e.weight + '%';
+                else if (e.kind === 'fallback' && e.order != null) tag = '#' + e.order;
+                if (tag) {
+                    svg.appendChild(svgEl('text', {
+                        x: ((x1 + x2) / 2).toFixed(1), y: ((y1 + y2) / 2 - 5).toFixed(1),
+                        'text-anchor': 'middle', class: 'pl-flow-edge-label'
+                    }, tag));
+                }
+            });
+            nodes.forEach((n) => {
+                const p = pos[n.id];
+                if (!p) return;
+                const g = svgEl('g', {
+                    class: 'pl-flow-node',
+                    'data-kind': n.kind,
+                    'data-state': n.state || 'ok',
+                    tabindex: '0',
+                    role: 'button',
+                    'aria-label': n.kind + ' ' + String(n.label || n.id)
+                });
+                g.appendChild(svgEl('rect', {
+                    x: p.x, y: p.y, width: FLOW_NODE_W, height: FLOW_NODE_H, rx: 8,
+                    class: 'pl-flow-node-box'
+                }));
+                const lbl = String(n.label || n.id);
+                g.appendChild(svgEl('text', {
+                    x: p.x + 10, y: p.y + FLOW_NODE_H / 2 + 4, class: 'pl-flow-node-label'
+                }, lbl.length > 19 ? lbl.slice(0, 18) + '…' : lbl));
+                const badge = n.badge || (n.state === 'disabled' ? 'disabled' : null);
+                if (badge) {
+                    g.appendChild(svgEl('text', {
+                        x: p.x + FLOW_NODE_W - 6, y: p.y - 3, 'text-anchor': 'end',
+                        class: 'pl-flow-node-badge'
+                    }, badge));
+                }
+                const emit = () => this.dispatchEvent(new CustomEvent('pl:node-click', {
+                    bubbles: true, detail: { id: n.id, kind: n.kind }
+                }));
+                g.addEventListener('click', emit);
+                g.addEventListener('keydown', (e) => {
+                    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); emit(); }
+                });
+                svg.appendChild(g);
+            });
+            const scroller = el('div', { class: 'pl-flow-scroll' });
+            scroller.appendChild(svg);
+            this.appendChild(scroller);
+        }
+    }
+
+    /* ============================================================
+       pl-diff-list — grouped model diff with per-row selection
+       data prop: {groups: [{key: new|imported|gone, title,
+                             items: [{name, selected?, meta?}]}]}
+       "new" groups are selectable (pl-toggle per row + select-all);
+       other groups are informational. Emits pl:diff-change {selected}.
+       ============================================================ */
+    class PlDiffList extends HTMLElement {
+        connectedCallback() { this.classList.add('pl-diff-list'); if (this._data) this._render(); }
+        set data(d) {
+            this._data = d || {};
+            this._selected = new Set();
+            (this._data.groups || []).forEach((g) => {
+                if (g.key !== 'new') return;
+                (g.items || []).forEach((it) => { if (it.selected !== false) this._selected.add(it.name); });
+            });
+            if (this.isConnected) this._render();
+        }
+        get data() { return this._data; }
+        get selected() { return Array.from(this._selected || []); }
+        _emit() {
+            this.dispatchEvent(new CustomEvent('pl:diff-change', {
+                bubbles: true, detail: { selected: this.selected }
+            }));
+        }
+        _render() {
+            this.textContent = '';
+            const groups = (this._data && this._data.groups) || [];
+            groups.forEach((g) => {
+                const items = g.items || [];
+                const selectable = g.key === 'new';
+                const section = el('div', { class: 'pl-diff-group', dataset: { key: g.key } });
+                const head = el('div', { class: 'pl-diff-group-head' });
+                head.appendChild(el('span', { class: 'pl-diff-group-title' }, g.title || g.key));
+                head.appendChild(el('span', { class: 'badge badge-neutral' }, String(items.length)));
+                let rowToggles = [];
+                if (selectable && items.length) {
+                    const all = el('pl-toggle', { label: 'Select all' });
+                    if (items.every((it) => this._selected.has(it.name))) all.setAttribute('checked', '');
+                    all.addEventListener('pl:change', (e) => {
+                        e.stopPropagation();
+                        items.forEach((it, i) => {
+                            if (e.detail.checked) this._selected.add(it.name);
+                            else this._selected.delete(it.name);
+                            rowToggles[i].checked = e.detail.checked;
+                        });
+                        this._emit();
+                    });
+                    head.appendChild(all);
+                    this._allToggle = all;
+                }
+                section.appendChild(head);
+                if (!items.length) {
+                    section.appendChild(el('div', { class: 'pl-diff-empty' }, 'None'));
+                }
+                items.forEach((it) => {
+                    const row = el('div', { class: 'pl-diff-row' });
+                    row.appendChild(el('span', { class: 'pl-diff-name' }, it.name));
+                    if (it.meta) row.appendChild(el('span', { class: 'pl-diff-meta' }, it.meta));
+                    if (selectable) {
+                        const t = el('pl-toggle', { 'aria-label': 'Import ' + it.name });
+                        if (this._selected.has(it.name)) t.setAttribute('checked', '');
+                        t.addEventListener('pl:change', (e) => {
+                            e.stopPropagation();
+                            if (e.detail.checked) this._selected.add(it.name);
+                            else this._selected.delete(it.name);
+                            if (this._allToggle) this._allToggle.checked = items.every((x) => this._selected.has(x.name));
+                            this._emit();
+                        });
+                        rowToggles.push(t);
+                        row.appendChild(t);
+                    }
+                    section.appendChild(row);
+                });
+                this.appendChild(section);
+            });
+        }
+    }
+
     /* ---------- register ---------- */
     customElements.define('pl-button', PlButton);
     customElements.define('pl-button-group', PlButtonGroup);
@@ -761,4 +1015,7 @@
     customElements.define('pl-drawer', PlDrawer);
     customElements.define('pl-graph', PlGraph);
     customElements.define('pl-timeline', PlTimeline);
+    customElements.define('pl-slotbar', PlSlotbar);
+    customElements.define('pl-flow', PlFlow);
+    customElements.define('pl-diff-list', PlDiffList);
 })();

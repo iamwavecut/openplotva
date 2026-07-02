@@ -232,6 +232,24 @@
     --c-visibility-private_chat: var(--p-violet-400);
     --c-visibility-thread: var(--p-pink-400);
 
+    /* Routing Ops: entity hues (topology node categories) */
+    --c-ent-workflow: var(--p-indigo-500);
+    --c-ent-model: var(--p-cyan-400);
+    --c-ent-provider: var(--p-violet-400);
+    --c-ent-pool: var(--p-teal-400);
+
+    /* Routing Ops: assignment-role colors (traffic edges + role pills) */
+    --c-role-primary: var(--p-indigo-500);
+    --c-role-fallback: var(--p-sky-500);
+    --c-role-overflow: var(--p-amber-500);
+    --c-role-canary: var(--p-orange-400);
+    --c-role-shadow: var(--p-slate-400);
+
+    /* Routing Ops: pool slot occupancy */
+    --c-slot-busy: var(--p-indigo-500);
+    --c-slot-free: var(--p-slate-700);
+    --c-slot-blocked: var(--p-red-500);
+
     /* JSON syntax highlighting (One Dark palette) */
     --c-json-key: #e06c75;
     --c-json-string: #98c379;
@@ -276,4 +294,7 @@
     --elev-glow-brand: 0 10px 30px rgba(124, 123, 255, 0.18);
 
     --c-log-debug: #6b7280;
+
+    /* Routing Ops: free pool slots need a light-surface tint on light theme */
+    --c-slot-free: #d0d8e3;
 }

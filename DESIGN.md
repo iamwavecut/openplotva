@@ -5,7 +5,7 @@
 | **Status** | Adopted — shipped to production (`geta.moe`) |
 | **Scope** | `web/admin/` (the runtime admin console). The Settings WebApp (`web/settings/`, Framework7 + Telegram theme) is explicitly out of scope. |
 | **Owners** | OpenPlotva maintainers |
-| **Last updated** | 2026-06-23 |
+| **Last updated** | 2026-07-02 |
 | **Source of truth** | `web/admin/tokens.css`, `web/admin/components.css`, `web/admin/components.js` |
 | **Enforced by** | guard tests in `crates/openplotva-web/src/lib.rs`; the `openplotva-design-system-review` skill |
 | **Related** | `AGENTS.md` (§ Web UI / Design System), `docs/admin-ux-audit.md`, `skills/openplotva-design-system-review/SKILL.md` |
@@ -111,7 +111,7 @@ Three tiers. Components reference **only** the semantic/extended tiers.
 |---|---|---|---|
 | Primitive | `--p-*` | Raw, theme-agnostic palette. Never referenced by components. | `--p-slate-900`, `--p-indigo-500`, `--p-cyan-400`, `--p-red-500` |
 | Semantic | `--c-*`, `--sp-*`, `--rad-*`, `--fs-*`, `--fw-*`, `--lh-*`, `--elev-*`, `--dur-*`, `--ease-*`, `--z-*` | Meaning-based aliases — the vocabulary components use. | `--c-bg-card`, `--c-primary`, `--c-danger`, `--c-text-main`, `--c-focus-ring`, `--sp-4`, `--rad-md`, `--fs-base`, `--elev-2`, `--z-modal` |
-| Extended | `--c-json-*`, `--c-log-*`, `--c-status-*`, `--c-shield-*`, `--c-cardtype-*`, `--c-relation-*`, `--c-visibility-*`, `--grad-*` | Domain palettes (syntax highlighting, log levels, status dots, shield categories, memory card-type/relation/visibility categories, brand gradients). | `--c-log-error`, `--c-status-ok`, `--c-shield-red`, `--c-cardtype-event`, `--c-relation-contradicts`, `--grad-brand` |
+| Extended | `--c-json-*`, `--c-log-*`, `--c-status-*`, `--c-shield-*`, `--c-cardtype-*`, `--c-relation-*`, `--c-visibility-*`, `--c-ent-*`, `--c-role-*`, `--c-slot-*`, `--grad-*` | Domain palettes (syntax highlighting, log levels, status dots, shield categories, memory card-type/relation/visibility categories, routing entity/role/slot categories, brand gradients). | `--c-log-error`, `--c-status-ok`, `--c-shield-red`, `--c-cardtype-event`, `--c-relation-contradicts`, `--c-ent-pool`, `--c-role-overflow`, `--c-slot-busy`, `--grad-brand` |
 
 Token families:
 
@@ -153,6 +153,9 @@ working — tokens were only added, never renamed.
 | `pl-drawer` | ad-hoc detail panes | normal-flow slide-in panel (no `position:fixed`); `.open` get/set; emits `pl:close` | Esc closes when open; `.pl-drawer-head`/`-body` slots |
 | `pl-graph` | — (memory graph) | JS prop `data = {nodes:[{id,label,card_type,salience,competing}], edges:[{from,to,relation,confidence}], center}`; emits `pl:node-click {id}` | SVG one-hop neighbourhood; node fill `--c-cardtype-*`, r∝salience, competing ring; edge `--c-relation-*`, width∝confidence; `role=img` |
 | `pl-timeline` | — (bitemporal) | JS prop `data = {lanes:[{key,label}], items:[{id,lane,label,card_type,validFrom,validUntil,recordedAt,status,competing}], now, asOf}`; emits `pl:item-click {id}`, `pl:asof-change {date}` | SVG swimlanes; valid bars, recorded markers, superseded muted, competing ring, now + as-of lines; click-to-set as-of; `role=img` |
+| `pl-slotbar` | — (pool occupancy) | attrs/props `capacity` (int; absent = unlimited), `busy`, `blocked`, `size=mini\|card\|cockpit`; pure renderer, re-renders on attribute change | discrete cells (`--c-slot-busy/free/blocked`) when capacity ≤ 16, continuous bar + `busy/capacity` text otherwise; `role=img` + "N of M slots busy" label; busy pulse gated behind `prefers-reduced-motion: no-preference` |
+| `pl-flow` | — (routing DAG) | JS prop `data = {nodes:[{id,kind:workflow\|model\|provider\|pool,label,state?,badge?}], edges:[{from,to,kind:primary\|fallback\|overflow\|canary\|shadow\|attach,weight?,order?,engaged?}]}`; emits `pl:node-click {id,kind}` | deterministic layered layout (fixed columns by kind), cubic bezier edges stroked by `--c-role-*` (width ∝ weight, overflow dashed unless engaged), nodes tinted by `--c-ent-*` with breaker/capacity state rings; nodes focusable (`tabindex=0`, Enter activates); horizontal scroll container |
+| `pl-diff-list` | — (model import diff) | JS prop `data = {groups:[{key:new\|imported\|gone, title, items:[{name,selected?,meta?}]}]}`; `selected` getter; emits `pl:diff-change {selected}` | "new" groups selectable via per-row `pl-toggle` + a select-all toggle; other groups informational; sticky group headers |
 
 Actions are wired by **event delegation**: a single document listener maps `[data-action="fn"]`
 (optionally `data-args='[...]'`, `data-confirm="…"`) to a global function, awaiting promises and
