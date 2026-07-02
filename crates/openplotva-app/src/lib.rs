@@ -139,6 +139,7 @@ struct RuntimeWorkers {
     router_handle: Option<Arc<openplotva_llm::router::RouterHandle>>,
     router_breakers: Option<Arc<openplotva_llm::router::BreakerSet>>,
     router_triggers: Option<Arc<openplotva_llm::router::TriggerState>>,
+    router_pools: Option<Arc<openplotva_llm::router::PoolRegistry>>,
 }
 
 struct DispatcherRuntime {
@@ -448,6 +449,7 @@ struct StaticWebRoutes {
     router_handle: Option<Arc<openplotva_llm::router::RouterHandle>>,
     router_breakers: Option<Arc<openplotva_llm::router::BreakerSet>>,
     router_triggers: Option<Arc<openplotva_llm::router::TriggerState>>,
+    router_pools: Option<Arc<openplotva_llm::router::PoolRegistry>>,
 }
 
 #[derive(Clone)]
@@ -458,6 +460,7 @@ struct AdminMemoryOverrideRuntime {
     router_handle: Arc<openplotva_llm::router::RouterHandle>,
     router_breakers: Arc<openplotva_llm::router::BreakerSet>,
     router_triggers: Arc<openplotva_llm::router::TriggerState>,
+    router_pools: Arc<openplotva_llm::router::PoolRegistry>,
     routing_event_reporter: Option<runtime_routing::RoutingEventReporter>,
 }
 
@@ -512,6 +515,7 @@ fn static_web_routes(
         router_handle: None,
         router_breakers: None,
         router_triggers: None,
+        router_pools: None,
     }
 }
 
@@ -556,6 +560,7 @@ fn static_web_routes_from_config(
     routes.router_handle = runtime_workers.router_handle.clone();
     routes.router_breakers = runtime_workers.router_breakers.clone();
     routes.router_triggers = runtime_workers.router_triggers.clone();
+    routes.router_pools = runtime_workers.router_pools.clone();
     routes.shield_options = shield_options_from_config(&config.shield);
     if let Some(clients) = service_clients {
         routes.postgres = Some(clients.postgres.clone());
@@ -578,10 +583,16 @@ fn static_web_routes_from_config(
         let memory_store = PostgresMemoryStore::new(clients.postgres.clone());
         routes.memory_store = Some(memory_store.clone());
         if config.memory.enabled
-            && let (Some(router_handle), Some(router_breakers), Some(router_triggers)) = (
+            && let (
+                Some(router_handle),
+                Some(router_breakers),
+                Some(router_triggers),
+                Some(router_pools),
+            ) = (
                 routes.router_handle.clone(),
                 routes.router_breakers.clone(),
                 routes.router_triggers.clone(),
+                routes.router_pools.clone(),
             )
         {
             routes.memory_override_runtime = Some(AdminMemoryOverrideRuntime {
@@ -591,6 +602,7 @@ fn static_web_routes_from_config(
                 router_handle,
                 router_breakers,
                 router_triggers,
+                router_pools,
                 routing_event_reporter: routes.routing_event_reporter.clone(),
             });
         }
@@ -4116,6 +4128,7 @@ async fn admin_memory_restart_override_execute_response(
             Arc::clone(&runtime.router_handle),
             Arc::clone(&runtime.router_breakers),
             Arc::clone(&runtime.router_triggers),
+            Arc::clone(&runtime.router_pools),
         )
         .with_reporter_opt(runtime.routing_event_reporter.clone()),
     );
@@ -4129,6 +4142,7 @@ async fn admin_memory_restart_override_execute_response(
                     Arc::clone(&runtime.router_handle),
                     Arc::clone(&runtime.router_breakers),
                     Arc::clone(&runtime.router_triggers),
+                    Arc::clone(&runtime.router_pools),
                 )
                 .with_reporter_opt(runtime.routing_event_reporter.clone()),
                 client.config().clone(),
@@ -9092,6 +9106,7 @@ async fn start_runtime_workers(
         router_handle: None,
         router_breakers: None,
         router_triggers: None,
+        router_pools: None,
     };
     let routing_event_buffer = runtime_routing::RoutingEventBuffer::default();
     let (routing_event_recorder, routing_event_recorder_worker) =
@@ -9185,6 +9200,7 @@ async fn start_runtime_workers(
     }
     let router_breakers = Arc::new(openplotva_llm::router::BreakerSet::new());
     let router_triggers = Arc::new(openplotva_llm::router::TriggerState::new());
+    let router_pools = Arc::new(openplotva_llm::router::PoolRegistry::new());
     let router_handle = match model_routing::load_routing_table(&service_clients.postgres).await {
         Ok(table) => openplotva_llm::router::RouterHandle::new(table),
         Err(error) => {
@@ -9201,6 +9217,8 @@ async fn start_runtime_workers(
     workers.router_handle = Some(Arc::clone(&router_handle));
     workers.router_breakers = Some(Arc::clone(&router_breakers));
     workers.router_triggers = Some(Arc::clone(&router_triggers));
+    workers.router_pools = Some(Arc::clone(&router_pools));
+    router_pools.apply(&router_handle.snapshot().pool_specs());
     let update_queue =
         openplotva_updates::RedisUpdateQueue::new(service_clients.redis.client().clone());
     let update_queue_backend = config.update_queue.backend.as_str();
@@ -9522,6 +9540,7 @@ async fn start_runtime_workers(
                 Arc::clone(&router_handle),
                 Arc::clone(&router_breakers),
                 Arc::clone(&router_triggers),
+                Arc::clone(&router_pools),
             )
             .with_reporter(routing_event_reporter.clone()),
             embedder::DiscoveryEmbedderConfig {
@@ -9540,6 +9559,7 @@ async fn start_runtime_workers(
                 Arc::clone(&router_handle),
                 Arc::clone(&router_breakers),
                 Arc::clone(&router_triggers),
+                Arc::clone(&router_pools),
             )
             .with_reporter(routing_event_reporter.clone()),
         );
@@ -10084,6 +10104,7 @@ async fn start_runtime_workers(
                 Arc::clone(&router_handle),
                 Arc::clone(&router_breakers),
                 Arc::clone(&router_triggers),
+                Arc::clone(&router_pools),
             )
             .with_reporter(routing_event_reporter.clone()),
             embedder::DiscoveryEmbedderConfig {
@@ -10134,6 +10155,7 @@ async fn start_runtime_workers(
                     Arc::clone(&router_handle),
                     Arc::clone(&router_breakers),
                     Arc::clone(&router_triggers),
+                    Arc::clone(&router_pools),
                 )
                 .with_reporter(routing_event_reporter.clone()),
             );
@@ -10329,6 +10351,7 @@ async fn start_runtime_workers(
                     Arc::clone(&router_handle),
                     Arc::clone(&router_breakers),
                     Arc::clone(&router_triggers),
+                    Arc::clone(&router_pools),
                 )
                 .with_reporter(routing_event_reporter.clone()),
                 vision::aifarm_vision_captioner_config_from_app_config(config),
@@ -10346,6 +10369,7 @@ async fn start_runtime_workers(
                     Arc::clone(&router_handle),
                     Arc::clone(&router_breakers),
                     Arc::clone(&router_triggers),
+                    Arc::clone(&router_pools),
                 )
                 .with_reporter(routing_event_reporter.clone()),
                 vision::aifarm_vision_captioner_config_from_app_config(config),
@@ -10371,6 +10395,7 @@ async fn start_runtime_workers(
                 Arc::clone(&router_handle),
                 Arc::clone(&router_breakers),
                 Arc::clone(&router_triggers),
+                Arc::clone(&router_pools),
             )
             .with_reporter(routing_event_reporter.clone()),
         ),
@@ -10437,6 +10462,7 @@ async fn start_runtime_workers(
                 Arc::clone(&router_handle),
                 Arc::clone(&router_breakers),
                 Arc::clone(&router_triggers),
+                Arc::clone(&router_pools),
             )
             .with_reporter(routing_event_reporter.clone()),
         );
@@ -10564,6 +10590,7 @@ async fn start_runtime_workers(
         Arc::clone(&router_handle),
         Arc::clone(&router_breakers),
         Arc::clone(&router_triggers),
+        Arc::clone(&router_pools),
     )
     .with_reporter(routing_event_reporter.clone());
     let memory_query_embedder = if dialog_memory_context_enabled(config) {
@@ -10631,6 +10658,7 @@ async fn start_runtime_workers(
         Arc::clone(&router_handle),
         Arc::clone(&router_breakers),
         Arc::clone(&router_triggers),
+        Arc::clone(&router_pools),
         genkit_fallback,
         Some(routing_event_reporter.clone()),
     )) {
@@ -10709,6 +10737,7 @@ async fn start_runtime_workers(
                 Arc::clone(&router_handle),
                 Arc::clone(&router_breakers),
                 Arc::clone(&router_triggers),
+                Arc::clone(&router_pools),
                 safe_genkit_fallback,
                 Some(routing_event_reporter.clone()),
             );
@@ -10844,6 +10873,7 @@ async fn start_runtime_workers(
                 Arc::clone(&router_handle),
                 Arc::clone(&router_breakers),
                 Arc::clone(&router_triggers),
+                Arc::clone(&router_pools),
             )
             .with_reporter(routing_event_reporter.clone()),
             config,
@@ -10868,6 +10898,7 @@ async fn start_runtime_workers(
                 Arc::clone(&router_handle),
                 Arc::clone(&router_breakers),
                 Arc::clone(&router_triggers),
+                Arc::clone(&router_pools),
             )
             .with_reporter(routing_event_reporter.clone()),
         );
@@ -10911,6 +10942,7 @@ async fn start_runtime_workers(
         Arc::clone(&router_handle),
         Arc::clone(&router_breakers),
         Arc::clone(&router_triggers),
+        Arc::clone(&router_pools),
     )
     .with_reporter(routing_event_reporter.clone());
     let routed_vip_flux_image_generator = image_jobs::RoutedImageGenerator::new(
@@ -11053,6 +11085,7 @@ async fn start_runtime_workers(
                     Arc::clone(&router_handle),
                     Arc::clone(&router_breakers),
                     Arc::clone(&router_triggers),
+                    Arc::clone(&router_pools),
                 )
                 .with_reporter(routing_event_reporter.clone()),
                 config,
@@ -11073,6 +11106,7 @@ async fn start_runtime_workers(
                     Arc::clone(&router_handle),
                     Arc::clone(&router_breakers),
                     Arc::clone(&router_triggers),
+                    Arc::clone(&router_pools),
                 )
                 .with_reporter(routing_event_reporter.clone()),
             );
@@ -11107,6 +11141,7 @@ async fn start_runtime_workers(
             Arc::clone(&router_handle),
             Arc::clone(&router_breakers),
             Arc::clone(&router_triggers),
+            Arc::clone(&router_pools),
         )
         .with_reporter(routing_event_reporter.clone());
         let music_generator = music_jobs::RoutedMusicGenerator::new(
@@ -11813,6 +11848,7 @@ async fn shutdown_runtime_workers(workers: RuntimeWorkers) {
         router_handle: _,
         router_breakers: _,
         router_triggers: _,
+        router_pools: _,
     } = workers;
 
     if let Some(stop) = stop {

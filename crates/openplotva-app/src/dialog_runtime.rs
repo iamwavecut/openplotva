@@ -17,7 +17,7 @@ use openplotva_llm::{
         is_gemini_provider_model,
     },
     retry::retryable_reason,
-    router::{BreakerSet, RouterHandle, TriggerState},
+    router::{BreakerSet, PoolRegistry, RouterHandle, TriggerState},
     whitecircle::{WhiteCircleClientConfig, WhiteCirclePreToolConfig},
     with_fallback,
 };
@@ -56,11 +56,12 @@ impl RouterChatProvider {
         handle: Arc<RouterHandle>,
         breakers: Arc<BreakerSet>,
         triggers: Arc<TriggerState>,
+        pools: Arc<PoolRegistry>,
         clients: HashMap<String, DialogProviderHandle>,
         default_client: DialogProviderHandle,
     ) -> Self {
         Self {
-            walker: RoutedAttemptWalker::new(handle, breakers, triggers),
+            walker: RoutedAttemptWalker::new(handle, breakers, triggers, pools),
             clients,
             default_client,
             provider_name: "router".to_owned(),
@@ -158,6 +159,7 @@ pub fn router_dialog_provider(
     handle: Arc<RouterHandle>,
     breakers: Arc<BreakerSet>,
     triggers: Arc<TriggerState>,
+    pools: Arc<PoolRegistry>,
     genkit_fallback: Option<DialogProviderHandle>,
     routing_events: Option<crate::runtime_routing::RoutingEventReporter>,
 ) -> DialogProviderHandle {
@@ -184,7 +186,7 @@ pub fn router_dialog_provider(
         clients.insert(qwen_reasoner.provider_name().to_owned(), qwen_reasoner);
     }
 
-    let provider = RouterChatProvider::new(handle, breakers, triggers, clients, aifarm);
+    let provider = RouterChatProvider::new(handle, breakers, triggers, pools, clients, aifarm);
     let provider = match routing_events {
         Some(reporter) => provider.with_routing_event_reporter(reporter),
         None => provider,
@@ -832,6 +834,7 @@ mod tests {
             RouterHandle::new(crate::model_routing::build_routing_table(&snapshot)),
             Arc::new(BreakerSet::new()),
             Arc::clone(&triggers),
+            Arc::new(PoolRegistry::new()),
             clients,
             default_provider,
         )
@@ -1197,6 +1200,7 @@ mod tests {
             RouterHandle::new(crate::model_routing::build_routing_table(&snapshot)),
             Arc::new(BreakerSet::new()),
             Arc::new(TriggerState::new()),
+            Arc::new(PoolRegistry::new()),
             clients,
             default_provider,
         )
