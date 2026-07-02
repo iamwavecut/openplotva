@@ -122,6 +122,10 @@ pub const DEFAULT_PERSISTENT_QUEUE_TEXT_WORKERS: i32 = 4;
 
 pub const DEFAULT_PERSISTENT_QUEUE_DIALOG_AIFARM_WORKERS: i32 = 2;
 
+pub const DEFAULT_PERSISTENT_QUEUE_DIALOG_WORKERS_CAP: i32 = 24;
+
+pub const DEFAULT_PERSISTENT_QUEUE_DIALOG_UNPOOLED_SHARE: i32 = 2;
+
 pub const DEFAULT_PERSISTENT_QUEUE_DIALOG_AIFARM_FALLBACK_WORKERS: i32 = 1;
 
 pub const DEFAULT_PERSISTENT_QUEUE_DIALOG_AIFARM_FALLBACK_HIGH_WATERMARK: i32 = 30;
@@ -542,8 +546,14 @@ pub struct PersistentQueueConfig {
     pub control_workers: i32,
     /// Worker count for the `text` queue.
     pub text_workers: i32,
-    /// Worker count for the `dialog-aifarm` queue.
+    /// Worker count for the `dialog-aifarm` queue. With capacity pools active
+    /// this is only the fallback when the routing table has no dialog route.
     pub dialog_aifarm_workers: i32,
+    /// Upper bound for the pool-derived dialog worker count.
+    pub dialog_workers_cap: i32,
+    /// Slot contribution of an unpooled/unlimited-pool dialog model when
+    /// deriving the worker count.
+    pub dialog_unpooled_share: i32,
     pub dialog_aifarm_fallback_workers: i32,
     pub dialog_aifarm_fallback_high_watermark: i32,
     pub dialog_aifarm_fallback_low_watermark: i32,
@@ -1033,6 +1043,8 @@ pub struct RawConfig {
     pub persistent_queue_text_workers: Option<String>,
     /// `PERSISTENT_QUEUE_DIALOG_AIFARM_WORKERS`.
     pub persistent_queue_dialog_aifarm_workers: Option<String>,
+    pub persistent_queue_dialog_workers_cap: Option<String>,
+    pub persistent_queue_dialog_unpooled_share: Option<String>,
     /// `PERSISTENT_QUEUE_DIALOG_AIFARM_FALLBACK_WORKERS`.
     pub persistent_queue_dialog_aifarm_fallback_workers: Option<String>,
     /// Deprecated alias for `PERSISTENT_QUEUE_DIALOG_AIFARM_FALLBACK_WORKERS`.
@@ -1656,6 +1668,16 @@ impl AppConfig {
                 "PERSISTENT_QUEUE_DIALOG_AIFARM_WORKERS",
                 raw.persistent_queue_dialog_aifarm_workers,
                 DEFAULT_PERSISTENT_QUEUE_DIALOG_AIFARM_WORKERS,
+            )?,
+            dialog_workers_cap: parse_i32(
+                "PERSISTENT_QUEUE_DIALOG_WORKERS_CAP",
+                raw.persistent_queue_dialog_workers_cap,
+                DEFAULT_PERSISTENT_QUEUE_DIALOG_WORKERS_CAP,
+            )?,
+            dialog_unpooled_share: parse_i32(
+                "PERSISTENT_QUEUE_DIALOG_UNPOOLED_SHARE",
+                raw.persistent_queue_dialog_unpooled_share,
+                DEFAULT_PERSISTENT_QUEUE_DIALOG_UNPOOLED_SHARE,
             )?,
             dialog_aifarm_fallback_workers: parse_i32(
                 dialog_aifarm_fallback_workers_env_name(
@@ -2758,6 +2780,8 @@ impl RawConfig {
             persistent_queue_control_workers: env("PERSISTENT_QUEUE_CONTROL_WORKERS"),
             persistent_queue_text_workers: env("PERSISTENT_QUEUE_TEXT_WORKERS"),
             persistent_queue_dialog_aifarm_workers: env("PERSISTENT_QUEUE_DIALOG_AIFARM_WORKERS"),
+            persistent_queue_dialog_workers_cap: env("PERSISTENT_QUEUE_DIALOG_WORKERS_CAP"),
+            persistent_queue_dialog_unpooled_share: env("PERSISTENT_QUEUE_DIALOG_UNPOOLED_SHARE"),
             persistent_queue_dialog_aifarm_fallback_workers: env(
                 "PERSISTENT_QUEUE_DIALOG_AIFARM_FALLBACK_WORKERS",
             ),

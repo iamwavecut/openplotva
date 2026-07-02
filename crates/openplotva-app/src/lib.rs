@@ -18,6 +18,7 @@ pub mod dialog_messages;
 pub mod dialog_runtime;
 pub mod dialog_tools;
 pub mod dialog_turn;
+pub mod dialog_workers;
 pub mod edited;
 pub mod embedder;
 pub mod guest;
@@ -140,6 +141,8 @@ struct RuntimeWorkers {
     router_breakers: Option<Arc<openplotva_llm::router::BreakerSet>>,
     router_triggers: Option<Arc<openplotva_llm::router::TriggerState>>,
     router_pools: Option<Arc<openplotva_llm::router::PoolRegistry>>,
+    router_runtime: Option<Arc<model_routing::RouterRuntime>>,
+    dialog_worker_gauge: Option<Arc<dialog_workers::WorkerGauge>>,
 }
 
 struct DispatcherRuntime {
@@ -450,6 +453,8 @@ struct StaticWebRoutes {
     router_breakers: Option<Arc<openplotva_llm::router::BreakerSet>>,
     router_triggers: Option<Arc<openplotva_llm::router::TriggerState>>,
     router_pools: Option<Arc<openplotva_llm::router::PoolRegistry>>,
+    router_runtime: Option<Arc<model_routing::RouterRuntime>>,
+    dialog_worker_gauge: Option<Arc<dialog_workers::WorkerGauge>>,
 }
 
 #[derive(Clone)]
@@ -516,6 +521,8 @@ fn static_web_routes(
         router_breakers: None,
         router_triggers: None,
         router_pools: None,
+        router_runtime: None,
+        dialog_worker_gauge: None,
     }
 }
 
@@ -561,6 +568,8 @@ fn static_web_routes_from_config(
     routes.router_breakers = runtime_workers.router_breakers.clone();
     routes.router_triggers = runtime_workers.router_triggers.clone();
     routes.router_pools = runtime_workers.router_pools.clone();
+    routes.router_runtime = runtime_workers.router_runtime.clone();
+    routes.dialog_worker_gauge = runtime_workers.dialog_worker_gauge.clone();
     routes.shield_options = shield_options_from_config(&config.shield);
     if let Some(clients) = service_clients {
         routes.postgres = Some(clients.postgres.clone());
@@ -7976,23 +7985,27 @@ async fn admin_routing_apply_action(
             admin_upsert_app_setting(routes, "llm.routing.revision", &(revision + 1).to_string())
                 .await;
     }
-    if let Some(handle) = routes.router_handle.as_ref() {
-        match model_routing::reload_router(handle, pool).await {
-            Ok(()) => {
-                if let Some(pools) = routes.router_pools.as_ref() {
-                    pools.apply(&handle.snapshot().pool_specs());
-                }
-            }
-            Err(error) => {
-                if let Some(reporter) = routes.routing_event_reporter.as_ref() {
-                    reporter.record(runtime_routing::router_reload_failed_event(
-                        "admin_routing_reload",
-                        &error.to_string(),
-                    ));
-                }
-                tracing::warn!(%error, "failed to reload router after admin routing change");
-            }
+    let reload_result = if let Some(runtime) = routes.router_runtime.as_ref() {
+        model_routing::reload_router_runtime(runtime, pool).await
+    } else if let Some(handle) = routes.router_handle.as_ref() {
+        let reloaded = model_routing::reload_router(handle, pool).await;
+        if reloaded.is_ok()
+            && let Some(pools) = routes.router_pools.as_ref()
+        {
+            pools.apply(&handle.snapshot().pool_specs());
         }
+        reloaded
+    } else {
+        Ok(())
+    };
+    if let Err(error) = reload_result {
+        if let Some(reporter) = routes.routing_event_reporter.as_ref() {
+            reporter.record(runtime_routing::router_reload_failed_event(
+                "admin_routing_reload",
+                &error.to_string(),
+            ));
+        }
+        tracing::warn!(%error, "failed to reload router after admin routing change");
     }
     Ok(result)
 }
@@ -9114,6 +9127,8 @@ async fn start_runtime_workers(
         router_breakers: None,
         router_triggers: None,
         router_pools: None,
+        router_runtime: None,
+        dialog_worker_gauge: None,
     };
     let routing_event_buffer = runtime_routing::RoutingEventBuffer::default();
     let (routing_event_recorder, routing_event_recorder_worker) =
@@ -10817,66 +10832,126 @@ async fn start_runtime_workers(
             let dialog_terminal_reaction_emoji = config.llm.dialog.terminal_reaction_emoji.clone();
             let dialog_terminal_signal_max_age_secs =
                 config.llm.dialog.terminal_signal_max_age_secs;
-            let dialog_worker_count = config.persistent_queue.dialog_aifarm_workers.max(0);
-            for index in 0..dialog_worker_count {
-                let worker_queue = Arc::clone(&task_queue_for_updates);
-                let worker_provider = Arc::clone(&dialog_provider);
-                let worker_effects = dialog_effects.clone();
-                let worker_materializer = dialog_materializer.clone();
-                let worker_tool_history = dialog_tool_history.clone();
-                let worker_routing_events = routing_event_reporter.clone();
-                let worker_turn_outcomes = turn_outcome_observer.clone();
-                let worker_terminal_signal = dialog_terminal_signal.clone();
-                let worker_reaction_emoji = dialog_terminal_reaction_emoji.clone();
-                let worker_obligations = Arc::clone(&delivery_obligation_store);
-                let worker_stop = stop.subscribe();
-                let dialog_worker = tokio::spawn(async move {
-                    let report =
-                        dialog_jobs::run_dialog_job_worker_with_materializer_and_history_every_until(
-                            worker_queue.as_ref(),
-                            worker_provider.as_ref(),
-                            &worker_effects,
-                            dialog_jobs::DialogJobWorkerLoopOptions {
-                                materializer: &worker_materializer,
-                                tool_history: &worker_tool_history,
-                                routing_events: Some(&worker_routing_events),
-                                turn_outcomes: Some(&worker_turn_outcomes),
-                                queue_names: &dialog_jobs::DIALOG_JOB_WORKER_QUEUES,
-                                interval: dialog_jobs::DIALOG_JOB_POLL_INTERVAL,
-                                max_llm_job_attempts: dialog_max_llm_job_attempts,
-                                turn_budget_secs: dialog_turn_budget_secs,
-                                turn_max_queue_age_secs: dialog_turn_max_queue_age_secs,
-                                max_regenerations: dialog_turn_max_regenerations,
-                                terminal_signal: dialog_turn::TurnSignalPolicy::new(
-                                    Some(&worker_terminal_signal),
-                                    &worker_reaction_emoji,
-                                    dialog_terminal_signal_max_age_secs,
-                                ),
-                                obligations: Some(worker_obligations.as_ref()),
-                            },
-                            wait_for_runtime_stop(worker_stop),
-                        )
-                        .await;
+            // The dialog worker count derives from the capacity pools of the
+            // dialog workflow's models; the semaphores in the walker are the
+            // real limit, so extra workers just wait for a slot. The env knob
+            // is only the fallback when no dialog route exists.
+            let dialog_worker_fallback =
+                u32::try_from(config.persistent_queue.dialog_aifarm_workers.max(0)).unwrap_or(0);
+            let dialog_workers_cap =
+                u32::try_from(config.persistent_queue.dialog_workers_cap.max(1)).unwrap_or(1);
+            let dialog_unpooled_share =
+                u32::try_from(config.persistent_queue.dialog_unpooled_share.max(0)).unwrap_or(0);
+            let initial_dialog_workers = openplotva_llm::router::derived_worker_count(
+                &router_handle.snapshot(),
+                "dialog",
+                dialog_unpooled_share,
+                dialog_workers_cap,
+            )
+            .unwrap_or(dialog_worker_fallback);
+            let (dialog_scale_tx, dialog_scale_rx) =
+                tokio::sync::watch::channel(initial_dialog_workers);
+            let dialog_worker_gauge = Arc::new(dialog_workers::WorkerGauge::new());
 
-                    tracing::info!(?report, index, "dialog taskman worker stopped");
-                });
-                workers.handles.push(dialog_worker);
-            }
+            let dialog_worker_spawner = {
+                let queue = Arc::clone(&task_queue_for_updates);
+                let provider = Arc::clone(&dialog_provider);
+                let effects = dialog_effects.clone();
+                let materializer = dialog_materializer.clone();
+                let tool_history = dialog_tool_history.clone();
+                let routing_events = routing_event_reporter.clone();
+                let turn_outcomes = turn_outcome_observer.clone();
+                let terminal_signal = dialog_terminal_signal.clone();
+                let reaction_emoji = dialog_terminal_reaction_emoji.clone();
+                let obligations = Arc::clone(&delivery_obligation_store);
+                let stop_rx = stop.subscribe();
+                move |index: usize, retire: tokio::sync::oneshot::Receiver<()>| {
+                    let worker_queue = Arc::clone(&queue);
+                    let worker_provider = Arc::clone(&provider);
+                    let worker_effects = effects.clone();
+                    let worker_materializer = materializer.clone();
+                    let worker_tool_history = tool_history.clone();
+                    let worker_routing_events = routing_events.clone();
+                    let worker_turn_outcomes = turn_outcomes.clone();
+                    let worker_terminal_signal = terminal_signal.clone();
+                    let worker_reaction_emoji = reaction_emoji.clone();
+                    let worker_obligations = Arc::clone(&obligations);
+                    let worker_stop = stop_rx.clone();
+                    tokio::spawn(async move {
+                        // A retired worker finishes its current job and exits
+                        // at the next loop tick, exactly like a runtime stop.
+                        let stop_future = async move {
+                            tokio::select! {
+                                () = wait_for_runtime_stop(worker_stop) => {}
+                                _ = retire => {}
+                            }
+                        };
+                        let report =
+                            dialog_jobs::run_dialog_job_worker_with_materializer_and_history_every_until(
+                                worker_queue.as_ref(),
+                                worker_provider.as_ref(),
+                                &worker_effects,
+                                dialog_jobs::DialogJobWorkerLoopOptions {
+                                    materializer: &worker_materializer,
+                                    tool_history: &worker_tool_history,
+                                    routing_events: Some(&worker_routing_events),
+                                    turn_outcomes: Some(&worker_turn_outcomes),
+                                    queue_names: &dialog_jobs::DIALOG_JOB_WORKER_QUEUES,
+                                    interval: dialog_jobs::DIALOG_JOB_POLL_INTERVAL,
+                                    max_llm_job_attempts: dialog_max_llm_job_attempts,
+                                    turn_budget_secs: dialog_turn_budget_secs,
+                                    turn_max_queue_age_secs: dialog_turn_max_queue_age_secs,
+                                    max_regenerations: dialog_turn_max_regenerations,
+                                    terminal_signal: dialog_turn::TurnSignalPolicy::new(
+                                        Some(&worker_terminal_signal),
+                                        &worker_reaction_emoji,
+                                        dialog_terminal_signal_max_age_secs,
+                                    ),
+                                    obligations: Some(worker_obligations.as_ref()),
+                                },
+                                stop_future,
+                            )
+                            .await;
+
+                        tracing::info!(?report, index, "dialog taskman worker stopped");
+                    })
+                }
+            };
+            let dialog_supervisor = dialog_workers::spawn_dialog_worker_supervisor(
+                Arc::new(dialog_worker_spawner),
+                dialog_scale_rx,
+                Arc::clone(&dialog_worker_gauge),
+                stop.subscribe(),
+            );
+            workers.handles.push(dialog_supervisor);
+            workers.dialog_worker_gauge = Some(Arc::clone(&dialog_worker_gauge));
+            workers.router_runtime = Some(Arc::new(model_routing::RouterRuntime {
+                handle: Arc::clone(&router_handle),
+                pools: Arc::clone(&router_pools),
+                dialog_scale: Some(dialog_scale_tx),
+                dialog_unpooled_share,
+                dialog_worker_cap: dialog_workers_cap,
+            }));
+            tracing::info!(
+                initial_dialog_workers,
+                cap = dialog_workers_cap,
+                fallback = dialog_worker_fallback,
+                "dialog worker scale derived from capacity pools"
+            );
             readiness_checks.push(ReadinessCheck::ok(
                 "dialog_jobs",
                 format!(
-                    "Started {} routed dialog taskman workers with storage-backed input materialization",
-                    dialog_worker_count
+                    "Started dialog worker supervisor with {initial_dialog_workers} pool-derived workers (cap {dialog_workers_cap})"
                 ),
             ));
-            if dialog_worker_count > 0 {
+            if initial_dialog_workers > 0 {
                 shared_taskman_worker_counts.insert(
                     openplotva_taskman::TEXT_QUEUE_NAME.to_owned(),
-                    dialog_worker_count,
+                    initial_dialog_workers as i32,
                 );
                 shared_taskman_worker_counts.insert(
                     openplotva_taskman::DIALOG_AIFARM_QUEUE_NAME.to_owned(),
-                    dialog_worker_count,
+                    initial_dialog_workers as i32,
                 );
             }
         }
@@ -11875,6 +11950,8 @@ async fn shutdown_runtime_workers(workers: RuntimeWorkers) {
         router_breakers: _,
         router_triggers: _,
         router_pools: _,
+        router_runtime: _,
+        dialog_worker_gauge: _,
     } = workers;
 
     if let Some(stop) = stop {

@@ -789,7 +789,6 @@ mod tests {
         );
     }
 
-    use openplotva_llm::router::PoolSpec;
     use openplotva_storage::llm_routing::PoolRecord;
 
     /// Two chat primaries: model 10 draws from 1-slot pool 1, model 20 is
