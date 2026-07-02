@@ -829,7 +829,8 @@
             // to fill whatever space it is given.
             if (!this._resize && typeof ResizeObserver !== 'undefined') {
                 this._resize = new ResizeObserver(() => {
-                    if (this._data && Math.abs(this.clientWidth - (this._lastWidth || 0)) > 24) {
+                    if (this._data && !this._dragging
+                        && Math.abs(this.clientWidth - (this._lastWidth || 0)) > 24) {
                         this.render();
                     }
                 });
@@ -840,14 +841,94 @@
         disconnectedCallback() {
             if (this._resize) { this._resize.disconnect(); this._resize = null; }
         }
-        set data(d) { this._data = d; if (this.isConnected) this.render(); }
+        set data(d) {
+            // Live polls repaint the graph; never yank the DOM from under an
+            // active drag — the pending snapshot lands on pointer-up.
+            if (this._dragging) { this._pendingData = d; return; }
+            this._data = d;
+            if (this.isConnected) this.render();
+        }
         get data() { return this._data; }
+        /* Path between two node anchors at their current positions. */
+        _edgeD(from, to) {
+            const a = this._pos[from], b = this._pos[to];
+            const nodeW = this._nodeW, nodeH = FLOW_NODE_H;
+            const x1 = a.x + nodeW, y1 = a.y + nodeH / 2;
+            const x2 = b.x, y2 = b.y + nodeH / 2;
+            const dx = Math.max(36, (x2 - x1) / 2);
+            return {
+                d: 'M ' + x1 + ' ' + y1 + ' C ' + (x1 + dx) + ' ' + y1 + ', '
+                    + (x2 - dx) + ' ' + y2 + ', ' + x2 + ' ' + y2,
+                x1, y1, x2, y2, dx
+            };
+        }
+        _labelXY(seg, t) {
+            const bez = (p0, p1, p2, p3, tt) => {
+                const mt = 1 - tt;
+                return mt * mt * mt * p0 + 3 * mt * mt * tt * p1 + 3 * mt * tt * tt * p2 + tt * tt * tt * p3;
+            };
+            return {
+                x: bez(seg.x1, seg.x1 + seg.dx, seg.x2 - seg.dx, seg.x2, t),
+                y: bez(seg.y1, seg.y1, seg.y2, seg.y2, t) - 6
+            };
+        }
+        /* Redraw every edge touching a node (used live while dragging). */
+        _refreshEdges(nodeId) {
+            (this._edgeIndex || []).forEach((entry) => {
+                if (entry.from !== nodeId && entry.to !== nodeId) return;
+                const seg = this._edgeD(entry.from, entry.to);
+                entry.el.setAttribute('d', seg.d);
+                if (entry.labelEl) {
+                    const at = this._labelXY(seg, entry.t);
+                    entry.labelEl.setAttribute('x', at.x.toFixed(1));
+                    entry.labelEl.setAttribute('y', at.y.toFixed(1));
+                }
+            });
+        }
+        _makeDraggable(g, n) {
+            g.addEventListener('pointerdown', (ev) => {
+                if (ev.button !== 0) return;
+                const origin = { x: this._pos[n.id].x, y: this._pos[n.id].y };
+                const startX = ev.clientX, startY = ev.clientY;
+                let moved = false;
+                this._dragging = true;
+                g.setPointerCapture(ev.pointerId);
+                const onMove = (me) => {
+                    const dx = me.clientX - startX, dy = me.clientY - startY;
+                    if (!moved && Math.hypot(dx, dy) < 4) return;
+                    moved = true;
+                    const next = { x: origin.x + dx, y: origin.y + dy };
+                    this._pos[n.id] = next;
+                    this._userPos[n.id] = next;
+                    g.setAttribute('transform',
+                        'translate(' + (next.x - g._baseX) + ' ' + (next.y - g._baseY) + ')');
+                    this._refreshEdges(n.id);
+                };
+                const finish = () => {
+                    g.removeEventListener('pointermove', onMove);
+                    g.removeEventListener('pointerup', finish);
+                    g.removeEventListener('pointercancel', finish);
+                    this._dragging = false;
+                    this._suppressClick = moved;
+                    if (this._pendingData) {
+                        const pending = this._pendingData;
+                        this._pendingData = null;
+                        this._data = pending;
+                        this.render();
+                    }
+                };
+                g.addEventListener('pointermove', onMove);
+                g.addEventListener('pointerup', finish);
+                g.addEventListener('pointercancel', finish);
+            });
+        }
         render() {
             this.textContent = '';
             const d = this._data || {};
             const nodes = d.nodes || [];
             const edges = d.edges || [];
             if (!nodes.length) return;
+            this._userPos = this._userPos || {};
             const kindsPresent = FLOW_KIND_ORDER.filter((k) => nodes.some((n) => n.kind === k));
             const byCol = kindsPresent.map((k) => nodes.filter((n) => n.kind === k));
             const cols = kindsPresent.length;
@@ -856,6 +937,7 @@
             this._lastWidth = containerW;
             const nodeW = Math.max(180, Math.min(260,
                 Math.floor((containerW - FLOW_PAD * 2 - (cols - 1) * FLOW_MIN_COL_GAP) / Math.max(cols, 1))));
+            this._nodeW = nodeW;
             const minW = FLOW_PAD * 2 + cols * nodeW + (cols - 1) * FLOW_MIN_COL_GAP;
             const W = Math.max(containerW, minW);
             const H = FLOW_PAD * 2 + Math.max(1, maxRows) * FLOW_ROW_H;
@@ -870,52 +952,64 @@
                 const span = col.length * FLOW_ROW_H;
                 const top = FLOW_PAD + (H - FLOW_PAD * 2 - span) / 2;
                 col.forEach((n, ri) => {
-                    pos[n.id] = {
+                    pos[n.id] = this._userPos[n.id] || {
                         x: colX(ci),
                         y: top + ri * FLOW_ROW_H + (FLOW_ROW_H - FLOW_NODE_H) / 2
                     };
                 });
             });
+            this._pos = pos;
             const svg = svgEl('svg', {
                 viewBox: '0 0 ' + W + ' ' + H, width: W, height: H,
                 role: 'group', 'aria-label': 'Routing topology'
             });
-            // Sample the cubic bezier so each label sits at a different point
-            // of its own curve instead of every midpoint piling up together.
-            const bez = (p0, p1, p2, p3, t) => {
-                const mt = 1 - t;
-                return mt * mt * mt * p0 + 3 * mt * mt * t * p1 + 3 * mt * t * t * p2 + t * t * t * p3;
+            // Role reads from the line pattern; color identifies the entity
+            // the edge leaves. Labels sample staggered points along their own
+            // curve so converging edges keep their tags apart.
+            const roleDash = {
+                fallback: '10 5',
+                canary: '2 6',
+                shadow: '6 6'
             };
+            this._edgeIndex = [];
             let labelIndex = 0;
             edges.forEach((e) => {
-                const a = pos[e.from], b = pos[e.to];
-                if (!a || !b) return;
-                const x1 = a.x + nodeW, y1 = a.y + FLOW_NODE_H / 2;
-                const x2 = b.x, y2 = b.y + FLOW_NODE_H / 2;
-                const dx = Math.max(36, (x2 - x1) / 2);
+                if (!pos[e.from] || !pos[e.to]) return;
+                const seg = this._edgeD(e.from, e.to);
                 const attrs = {
-                    d: 'M ' + x1 + ' ' + y1 + ' C ' + (x1 + dx) + ' ' + y1 + ', ' + (x2 - dx) + ' ' + y2 + ', ' + x2 + ' ' + y2,
+                    d: seg.d,
                     class: 'pl-flow-edge',
                     'data-ekind': e.kind || 'attach',
                     fill: 'none',
-                    'stroke-width': (e.weight != null ? (1.2 + clamp01(e.weight / 100) * 3.6) : 1.5).toFixed(1)
+                    'stroke-width': e.kind === 'attach'
+                        ? '1.1'
+                        : (e.weight != null ? (1.2 + clamp01(e.weight / 100) * 3.6) : 1.6).toFixed(1)
                 };
-                if (e.kind === 'overflow' && !e.engaged) attrs['stroke-dasharray'] = '6 5';
+                if (e.kind === 'overflow' && !e.engaged) attrs['stroke-dasharray'] = '3 5';
+                else if (roleDash[e.kind]) attrs['stroke-dasharray'] = roleDash[e.kind];
                 if (e.engaged) attrs['data-engaged'] = '';
-                svg.appendChild(svgEl('path', attrs));
+                const path = svgEl('path', attrs);
+                if (e.color) path.style.stroke = e.color;
+                if (e.kind === 'shadow') path.style.opacity = '0.45';
+                if (e.kind === 'attach') path.style.opacity = '0.55';
+                svg.appendChild(path);
                 let tag = null;
                 if (e.kind === 'primary' && e.weight != null) tag = e.weight + '%';
                 else if (e.kind === 'fallback' && e.order != null) tag = '#' + e.order;
+                let labelEl = null;
+                let t = 0;
                 if (tag) {
-                    const t = 0.28 + (labelIndex % 5) * 0.11;
+                    t = 0.28 + (labelIndex % 5) * 0.11;
                     labelIndex += 1;
-                    const lx = bez(x1, x1 + dx, x2 - dx, x2, t);
-                    const ly = bez(y1, y1, y2, y2, t);
-                    svg.appendChild(svgEl('text', {
-                        x: lx.toFixed(1), y: (ly - 6).toFixed(1),
+                    const at = this._labelXY(seg, t);
+                    labelEl = svgEl('text', {
+                        x: at.x.toFixed(1), y: at.y.toFixed(1),
                         'text-anchor': 'middle', class: 'pl-flow-edge-label'
-                    }, tag));
+                    }, tag);
+                    if (e.color) labelEl.style.fill = e.color;
+                    svg.appendChild(labelEl);
                 }
+                this._edgeIndex.push({ el: path, labelEl, t, from: e.from, to: e.to });
             });
             const maxLabelChars = Math.max(18, Math.floor((nodeW - 22) / 7.2));
             nodes.forEach((n) => {
@@ -929,6 +1023,12 @@
                     role: 'button',
                     'aria-label': n.kind + ' ' + String(n.label || n.id)
                 });
+                if (n.color) {
+                    g.setAttribute('data-colored', '');
+                    g.style.setProperty('--pl-node-c', n.color);
+                }
+                g._baseX = p.x;
+                g._baseY = p.y;
                 g.appendChild(svgEl('rect', {
                     x: p.x, y: p.y, width: nodeW, height: FLOW_NODE_H, rx: 8,
                     class: 'pl-flow-node-box'
@@ -947,10 +1047,15 @@
                 const emit = () => this.dispatchEvent(new CustomEvent('pl:node-click', {
                     bubbles: true, detail: { id: n.id, kind: n.kind }
                 }));
-                g.addEventListener('click', emit);
+                g.addEventListener('click', () => {
+                    // A completed drag must not read as a navigation click.
+                    if (this._suppressClick) { this._suppressClick = false; return; }
+                    emit();
+                });
                 g.addEventListener('keydown', (e) => {
                     if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); emit(); }
                 });
+                this._makeDraggable(g, n);
                 svg.appendChild(g);
             });
             const scroller = el('div', { class: 'pl-flow-scroll' });

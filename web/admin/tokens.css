@@ -207,6 +207,75 @@
     --c-status-competing: var(--p-orange-400);
 
     /* Memory: card-type categories (names match DB enum spellings) */
+    /* Categorical identity palette: 64 distinct hues (golden-angle walk
+       across four lightness/chroma bands). Routing entities (workflows,
+       models, providers, pools) each claim one unique slot by stable id
+       hash, so a color always means the same thing across views. */
+    --c-cat-0: hsl(0 72% 62%);
+    --c-cat-1: hsl(138 62% 68%);
+    --c-cat-2: hsl(275 78% 55%);
+    --c-cat-3: hsl(53 55% 65%);
+    --c-cat-4: hsl(190 72% 62%);
+    --c-cat-5: hsl(328 62% 68%);
+    --c-cat-6: hsl(105 78% 55%);
+    --c-cat-7: hsl(243 55% 65%);
+    --c-cat-8: hsl(20 72% 62%);
+    --c-cat-9: hsl(158 62% 68%);
+    --c-cat-10: hsl(295 78% 55%);
+    --c-cat-11: hsl(73 55% 65%);
+    --c-cat-12: hsl(210 72% 62%);
+    --c-cat-13: hsl(348 62% 68%);
+    --c-cat-14: hsl(125 78% 55%);
+    --c-cat-15: hsl(263 55% 65%);
+    --c-cat-16: hsl(40 72% 62%);
+    --c-cat-17: hsl(178 62% 68%);
+    --c-cat-18: hsl(315 78% 55%);
+    --c-cat-19: hsl(93 55% 65%);
+    --c-cat-20: hsl(230 72% 62%);
+    --c-cat-21: hsl(8 62% 68%);
+    --c-cat-22: hsl(145 78% 55%);
+    --c-cat-23: hsl(283 55% 65%);
+    --c-cat-24: hsl(60 72% 62%);
+    --c-cat-25: hsl(198 62% 68%);
+    --c-cat-26: hsl(335 78% 55%);
+    --c-cat-27: hsl(113 55% 65%);
+    --c-cat-28: hsl(250 72% 62%);
+    --c-cat-29: hsl(28 62% 68%);
+    --c-cat-30: hsl(165 78% 55%);
+    --c-cat-31: hsl(303 55% 65%);
+    --c-cat-32: hsl(80 72% 62%);
+    --c-cat-33: hsl(218 62% 68%);
+    --c-cat-34: hsl(355 78% 55%);
+    --c-cat-35: hsl(133 55% 65%);
+    --c-cat-36: hsl(270 72% 62%);
+    --c-cat-37: hsl(48 62% 68%);
+    --c-cat-38: hsl(185 78% 55%);
+    --c-cat-39: hsl(323 55% 65%);
+    --c-cat-40: hsl(100 72% 62%);
+    --c-cat-41: hsl(238 62% 68%);
+    --c-cat-42: hsl(15 78% 55%);
+    --c-cat-43: hsl(153 55% 65%);
+    --c-cat-44: hsl(290 72% 62%);
+    --c-cat-45: hsl(68 62% 68%);
+    --c-cat-46: hsl(205 78% 55%);
+    --c-cat-47: hsl(343 55% 65%);
+    --c-cat-48: hsl(120 72% 62%);
+    --c-cat-49: hsl(258 62% 68%);
+    --c-cat-50: hsl(35 78% 55%);
+    --c-cat-51: hsl(173 55% 65%);
+    --c-cat-52: hsl(310 72% 62%);
+    --c-cat-53: hsl(88 62% 68%);
+    --c-cat-54: hsl(225 78% 55%);
+    --c-cat-55: hsl(3 55% 65%);
+    --c-cat-56: hsl(140 72% 62%);
+    --c-cat-57: hsl(278 62% 68%);
+    --c-cat-58: hsl(55 78% 55%);
+    --c-cat-59: hsl(193 55% 65%);
+    --c-cat-60: hsl(330 72% 62%);
+    --c-cat-61: hsl(108 62% 68%);
+    --c-cat-62: hsl(245 78% 55%);
+    --c-cat-63: hsl(23 55% 65%);
+
     --c-cardtype-preference: var(--p-indigo-500);
     --c-cardtype-identity: var(--p-cyan-400);
     --c-cardtype-project: var(--p-green-500);

@@ -1399,7 +1399,11 @@ pl-textarea.redis-value .pl-field {
 }
 
 .pl-flow .pl-flow-node {
-    cursor: pointer;
+    cursor: grab;
+}
+
+.pl-flow .pl-flow-node:active {
+    cursor: grabbing;
 }
 
 .pl-flow .pl-flow-node:focus-visible {
@@ -1436,6 +1440,13 @@ pl-textarea.redis-value .pl-field {
 .pl-flow .pl-flow-node[data-kind="pool"] .pl-flow-node-box {
     fill: color-mix(in srgb, var(--c-ent-pool) 14%, var(--c-bg-card));
     stroke: var(--c-ent-pool);
+}
+
+/* Per-entity identity color (set by the renderer as --pl-node-c): overrides
+   the generic kind tint; state rules below still win for warning rings. */
+.pl-flow .pl-flow-node[data-colored] .pl-flow-node-box {
+    fill: color-mix(in srgb, var(--pl-node-c) 14%, var(--c-bg-card));
+    stroke: var(--pl-node-c);
 }
 
 .pl-flow .pl-flow-node[data-state="breaker-open"] .pl-flow-node-box {

@@ -1409,19 +1409,20 @@ textarea.form-control {
     gap: var(--sp-2);
 }
 
+/* Legend shows the line PATTERN of each role; the line color in the graph
+   identifies the entity it leaves (per-entity --c-cat-* slots). */
 .mp-flow-legend .mp-legend-line {
     display: inline-block;
-    width: 22px;
-    height: 3px;
-    border-radius: var(--rad-full);
+    width: 26px;
+    height: 0;
+    border-top: 3px solid var(--c-text-sec);
 }
 
-.mp-flow-legend .mp-legend-line[data-ekind="primary"] { background: var(--c-role-primary); }
-.mp-flow-legend .mp-legend-line[data-ekind="fallback"] { background: var(--c-role-fallback); }
-.mp-flow-legend .mp-legend-line[data-ekind="overflow"] { background: var(--c-role-overflow); }
-.mp-flow-legend .mp-legend-line[data-ekind="canary"] { background: var(--c-role-canary); }
-.mp-flow-legend .mp-legend-line[data-ekind="shadow"] { background: var(--c-role-shadow); }
-.mp-flow-legend .mp-legend-line[data-ekind="attach"] { background: var(--c-border-light); }
+.mp-flow-legend .mp-legend-line[data-ekind="fallback"] { border-top-style: dashed; }
+.mp-flow-legend .mp-legend-line[data-ekind="overflow"] { border-top-style: dashed; border-top-width: 2px; }
+.mp-flow-legend .mp-legend-line[data-ekind="canary"] { border-top-style: dotted; }
+.mp-flow-legend .mp-legend-line[data-ekind="shadow"] { opacity: 0.45; }
+.mp-flow-legend .mp-legend-line[data-ekind="attach"] { border-top-width: 1px; opacity: 0.6; }
 
 .mp-hidden {
     display: none;

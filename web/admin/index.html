@@ -1400,7 +1400,7 @@
         function mpGet(path) { return apiCall(path); }
         async function mpReloadSnap() {
             const data = await mpGet('/routing');
-            if (data) mpState.snap = data;
+            if (data) { mpState.snap = data; mpColorSlots = null; }
             return data;
         }
         async function mpApply(action, fields, okMsg) {
@@ -1507,6 +1507,7 @@
                 return;
             }
             mpState.snap = data;
+            mpColorSlots = null;
             mpState.statusUnavailable = false;
             await mpFetchStatus();
             if (mpState.view === 'board') mpInitDraft(true);
@@ -1578,6 +1579,37 @@
             if (!mpState.statusUnavailable) chip.appendChild(mpSlotbarFor(poolId, size || 'mini'));
             return chip;
         }
+        // ---- Categorical entity colors ----
+        // Every workflow/model/provider/pool claims one unique slot out of the
+        // 64 --c-cat-* tokens: a stable id hash picks the seat, linear probing
+        // resolves collisions deterministically (entities are visited in a
+        // stable order), so a color always means the same entity everywhere.
+        let mpColorSlots = null;
+        function mpEntityColorVar(kind, id) {
+            if (!mpColorSlots) {
+                mpColorSlots = new Map();
+                const used = new Set();
+                const hash = key => {
+                    let h = 5381;
+                    for (let i = 0; i < key.length; i++) h = ((h * 33) ^ key.charCodeAt(i)) >>> 0;
+                    return h % 64;
+                };
+                const claim = key => {
+                    let slot = hash(key);
+                    for (let step = 0; step < 64 && used.has(slot); step++) slot = (slot + 1) % 64;
+                    used.add(slot);
+                    mpColorSlots.set(key, slot);
+                };
+                const snap = mpState.snap || {};
+                (snap.workflows || []).map(w => 'wf:' + w.key).sort().forEach(claim);
+                (snap.models || []).map(m => 'm:' + m.id).sort().forEach(claim);
+                (snap.providers || []).map(p => 'p:' + p.id).sort().forEach(claim);
+                (snap.pools || []).map(p => 'pool:' + p.id).sort().forEach(claim);
+            }
+            const slot = mpColorSlots.get(kind + ':' + id);
+            return slot == null ? 'var(--c-text-muted)' : 'var(--c-cat-' + slot + ')';
+        }
+
         // Mirrors policy.rs: the weighted permutation clamps every enabled
         // primary's weight to at least 1, so a sole NULL/0-weight primary
         // effectively serves 100% of the traffic, never 0%.
@@ -1591,7 +1623,8 @@
             const bar = mpEl('div', { class: big ? 'mp-alloc mp-alloc--lg' : 'mp-alloc mp-alloc--mini' });
             entries.forEach((e, i) => {
                 const pct = mpEffectiveSharePct(entries, e.weight);
-                const seg = mpEl('div', { class: 'mp-seg mp-seg-' + (i % 6) });
+                const seg = mpEl('div', { class: 'mp-seg' + (e.color ? '' : ' mp-seg-' + (i % 6)) });
+                if (e.color) seg.style.background = e.color;
                 seg.style.flexBasis = pct + '%';
                 seg.style.flexGrow = '0';
                 if (big && pct >= 14) seg.appendChild(mpEl('span', { text: e.label + ' · ' + Math.round(pct) + '%' }));
@@ -1689,7 +1722,7 @@
                     w.full_routing ? null : mpEl('span', { class: 'mp-tag mp-tag--muted', text: 'config-only' }),
                 ]),
                 primaries.length
-                    ? mpAllocBar(primaries.map(a => ({ label: mpModelLabel(a.provider_model_id), weight: a.weight })), false)
+                    ? mpAllocBar(primaries.map(a => ({ label: mpModelLabel(a.provider_model_id), weight: a.weight, color: mpEntityColorVar('m', a.provider_model_id) })), false)
                     : mpEl('div', { class: 'mp-empty', text: 'No models assigned' }),
                 mpEl('div', { class: 'mp-wf-meta', text: names || '' }),
                 badges,
@@ -1845,7 +1878,7 @@
             });
             const refresh = () => {
                 mpClear(allocWrap);
-                const entries = primaries.map(a => ({ label: mpModelLabel(a.provider_model_id), weight: d.weights[a.id] || 0 }));
+                const entries = primaries.map(a => ({ label: mpModelLabel(a.provider_model_id), weight: d.weights[a.id] || 0, color: mpEntityColorVar('m', a.provider_model_id) }));
                 if (entries.length) allocWrap.appendChild(mpAllocBar(entries, true));
                 primaries.forEach(a => {
                     const pct = Math.round(mpEffectiveSharePct(entries, d.weights[a.id] || 0));
@@ -2975,7 +3008,15 @@
             const addNode = (id, kind, label, state, badge) => {
                 if (seenNodes[id]) return;
                 seenNodes[id] = true;
-                nodes.push({ id, kind, label, state, badge });
+                const sep = id.indexOf(':');
+                const color = mpEntityColorVar(id.slice(0, sep) === 'wf' ? 'wf' : id.slice(0, sep), id.slice(sep + 1));
+                nodes.push({ id, kind, label, state, badge, color });
+            };
+            // Every edge inherits the color of the node it leaves, so the fan
+            // of lines out of a workflow (or into a pool) reads as one family.
+            const sourceColor = id => {
+                const sep = id.indexOf(':');
+                return mpEntityColorVar(id.slice(0, sep), id.slice(sep + 1));
             };
             const addEdgeOnce = (edge) => {
                 const key = edge.from + '→' + edge.to + '·' + edge.kind;
@@ -2997,7 +3038,7 @@
                     if (opts.activeOnly && !m.enabled) return;
                     const mId = 'm:' + m.id;
                     addNode(mId, 'model', mpModelLabel(m.id), mpModelFlowState(m));
-                    const edge = { from: wfId, to: mId, kind: a.role };
+                    const edge = { from: wfId, to: mId, kind: a.role, color: sourceColor(wfId) };
                     if (a.role === 'primary') edge.weight = Math.round(mpEffectiveSharePct(primaries, a.weight));
                     if (a.role === 'fallback') edge.order = (a.fallback_order || 0) + 1;
                     if (a.role === 'overflow') {
@@ -3009,12 +3050,12 @@
                     if (p) {
                         const pId = 'p:' + p.id;
                         addNode(pId, 'provider', p.name, mpProviderFlowState(p));
-                        addEdgeOnce({ from: mId, to: pId, kind: 'attach' });
+                        addEdgeOnce({ from: mId, to: pId, kind: 'attach', color: sourceColor(mId) });
                         if (m.pool_id != null) {
                             const pool = mpPoolById(m.pool_id);
                             if (pool) {
                                 addNode('pool:' + pool.id, 'pool', pool.name, mpPoolFlowState(pool));
-                                addEdgeOnce({ from: pId, to: 'pool:' + pool.id, kind: 'attach' });
+                                addEdgeOnce({ from: pId, to: 'pool:' + pool.id, kind: 'attach', color: sourceColor(pId) });
                             }
                         }
                     }
@@ -3056,16 +3097,17 @@
             section.appendChild(mpEl('div', { class: 'mp-hint', text: 'Workflows route to models, models belong to providers, providers draw slots from pools. Click a node to jump to it.' }));
             section.appendChild(mpEl('div', { class: 'mp-graph-controls' }, [wfSel, scopeGroup, activeToggle]));
             section.appendChild(mpEl('div', { class: 'mp-flow-legend' }, [
-                ['primary', 'primary (weight %)'],
-                ['fallback', 'fallback (#order)'],
-                ['overflow', 'overflow (dashed until engaged)'],
-                ['canary', 'canary'],
-                ['shadow', 'shadow'],
-                ['attach', 'belongs to'],
+                ['primary', 'primary — solid, width = share %'],
+                ['fallback', 'fallback — long dash, #order'],
+                ['overflow', 'overflow — short dash until engaged'],
+                ['canary', 'canary — dotted'],
+                ['shadow', 'shadow — faint'],
+                ['attach', 'belongs to — thin'],
             ].map(pair => mpEl('span', { class: 'mp-legend-item' }, [
                 mpEl('span', { class: 'mp-legend-line', 'data-ekind': pair[0] }),
                 mpEl('span', { text: pair[1] }),
             ]))));
+            section.appendChild(mpEl('div', { class: 'mp-hint', text: 'Line color = the entity it leaves. Drag nodes to untangle the picture.' }));
             if (mpState.statusUnavailable) section.appendChild(mpEl('div', { class: 'mp-hint', text: 'Live status unavailable — topology shows configuration only.' }));
             root.appendChild(section);
             const data = mpGraphFlowData();
