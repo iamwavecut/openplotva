@@ -131,16 +131,22 @@ struct ScopedRoutes {
     vip: Option<WorkflowRoute>,
 }
 
-/// A provider endpoint as seen by the control plane. Credentials are resolved by
-/// the app-built adapter registry, never stored in this pure table.
+/// A provider endpoint as seen by the control plane. Plaintext credentials
+/// never live here: `api_key_ref` names an env var and `api_key_encrypted`
+/// is an AES-GCM sealed blob the app-side client factory opens under the
+/// operator's master key.
 #[derive(Clone, Debug)]
 pub struct ProviderRow {
     pub id: ProviderId,
     pub name: String,
     pub kind: Kind,
+    /// Wire protocol (`openai_compat`, `genkit`, ...); `None` on legacy rows.
+    pub protocol: Option<String>,
     pub endpoint: Option<String>,
     pub discovery_service_name: Option<String>,
     pub discovery_endpoint_name: Option<String>,
+    pub api_key_ref: Option<String>,
+    pub api_key_encrypted: Option<Vec<u8>>,
     pub enabled: bool,
     pub config: Value,
 }

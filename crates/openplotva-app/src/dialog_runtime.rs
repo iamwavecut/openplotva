@@ -39,14 +39,182 @@ pub type DialogProviderHandle = Arc<dyn ChatProvider>;
 /// Workflow key the dialog worker routes through.
 const DIALOG_WORKFLOW_KEY: &str = "dialog";
 
+/// Builds and caches per-provider transport clients from DB provider rows, so
+/// a provider added in the admin panel is immediately routable without a
+/// restart. Env-built clients (aifarm, genkit, vram-cloud, the GPU reasoner)
+/// seed the static map and keep their toolbox wiring; everything else is
+/// constructed from the row's protocol + endpoint + key and cached under a
+/// fingerprint that invalidates when the row changes.
+pub struct ChatClientFactory {
+    handle: Arc<RouterHandle>,
+    toolbox: Arc<dyn DialogToolbox>,
+    template: AifarmDialogConfig,
+    static_clients: HashMap<String, DialogProviderHandle>,
+    default_client: DialogProviderHandle,
+    cache: std::sync::Mutex<HashMap<i64, (u64, DialogProviderHandle)>>,
+}
+
+impl ChatClientFactory {
+    #[must_use]
+    pub fn new(
+        handle: Arc<RouterHandle>,
+        toolbox: Arc<dyn DialogToolbox>,
+        template: AifarmDialogConfig,
+        static_clients: HashMap<String, DialogProviderHandle>,
+        default_client: DialogProviderHandle,
+    ) -> Self {
+        Self {
+            handle,
+            toolbox,
+            template,
+            static_clients,
+            default_client,
+            cache: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Resolve the transport client for one routed attempt. Static (env-built)
+    /// clients win by provider name; unknown providers are built from their
+    /// row when the protocol allows it. `Err` carries a retryable
+    /// `ProviderUnavailable`, so the walker moves on to the next candidate
+    /// instead of failing the whole run.
+    fn resolve(
+        &self,
+        attempt: &crate::routed_attempts::RoutedAttempt,
+    ) -> Result<DialogProviderHandle, openplotva_llm::retry::ProviderError> {
+        if let Some(client) = self.static_clients.get(&attempt.provider_name) {
+            return Ok(Arc::clone(client));
+        }
+        let table = self.handle.snapshot();
+        let Some(row) = table.provider(attempt.provider_id) else {
+            // The row vanished between selection and execution; the seeded
+            // default keeps legacy behavior for the built-in providers.
+            return Ok(Arc::clone(&self.default_client));
+        };
+        let fingerprint = provider_row_fingerprint(row);
+        {
+            let cache = self
+                .cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some((cached_fingerprint, client)) = cache.get(&row.id)
+                && *cached_fingerprint == fingerprint
+            {
+                return Ok(Arc::clone(client));
+            }
+        }
+        let client = self.build_client(row)?;
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.insert(row.id, (fingerprint, Arc::clone(&client)));
+        Ok(client)
+    }
+
+    fn build_client(
+        &self,
+        row: &openplotva_llm::router::ProviderRow,
+    ) -> Result<DialogProviderHandle, openplotva_llm::retry::ProviderError> {
+        let protocol = row.protocol.as_deref().unwrap_or(
+            // Legacy rows without a protocol: chat-kind non-genkit rows are
+            // OpenAI-compatible in this deployment.
+            "openai_compat",
+        );
+        if protocol != "openai_compat" {
+            return Err(openplotva_llm::retry::ProviderError::new(
+                row.name.clone(),
+                openplotva_llm::retry::FailureReason::ProviderUnavailable,
+                format!(
+                    "no transport client for provider {} (protocol {protocol} has no dynamic dialog adapter)",
+                    row.name
+                ),
+            ));
+        }
+        let mut cfg = self.template.clone();
+        cfg.provider_name = row.name.clone();
+        cfg.model = String::new();
+        cfg.client.default_model = String::new();
+        cfg.client.api_key =
+            resolve_provider_api_key(row.api_key_ref.as_deref(), row.api_key_encrypted.as_deref())
+                .unwrap_or_default();
+        match (&row.discovery_service_name, &row.endpoint) {
+            (Some(service), _) => {
+                cfg.client.service_name = service.clone();
+                cfg.client.endpoint_name = row
+                    .discovery_endpoint_name
+                    .clone()
+                    .unwrap_or_else(|| cfg.client.endpoint_name.clone());
+                cfg.client.direct_url = String::new();
+                if let Some(endpoint) = &row.endpoint
+                    && !endpoint.trim().is_empty()
+                {
+                    cfg.client.base_url = endpoint.clone();
+                }
+            }
+            (None, Some(endpoint)) if !endpoint.trim().is_empty() => {
+                cfg.client.direct_url = normalize_chat_completions_url(endpoint);
+            }
+            _ => {
+                return Err(openplotva_llm::retry::ProviderError::new(
+                    row.name.clone(),
+                    openplotva_llm::retry::FailureReason::ProviderUnavailable,
+                    format!(
+                        "provider {} has neither an endpoint nor a discovery service",
+                        row.name
+                    ),
+                ));
+            }
+        }
+        Ok(Arc::new(
+            AifarmDialogProvider::new(cfg).with_toolbox(Arc::clone(&self.toolbox)),
+        ))
+    }
+}
+
+/// Resolve a provider row's API key: an env-var reference wins, otherwise the
+/// AES-GCM sealed blob is opened under the operator's `MASTER_KEY`.
+fn resolve_provider_api_key(
+    api_key_ref: Option<&str>,
+    api_key_encrypted: Option<&[u8]>,
+) -> Option<String> {
+    if let Some(reference) = api_key_ref.filter(|reference| !reference.trim().is_empty()) {
+        return std::env::var(reference.trim()).ok();
+    }
+    let sealed = api_key_encrypted?;
+    let master = std::env::var("MASTER_KEY").unwrap_or_default();
+    match openplotva_storage::llm_routing::open_key(&master, sealed) {
+        Ok(key) => Some(key),
+        Err(error) => {
+            tracing::warn!(%error, "failed to open sealed provider api key");
+            None
+        }
+    }
+}
+
+/// Change-detection fingerprint over the client-relevant provider row fields.
+fn provider_row_fingerprint(row: &openplotva_llm::router::ProviderRow) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    row.name.hash(&mut hasher);
+    row.protocol.hash(&mut hasher);
+    row.endpoint.hash(&mut hasher);
+    row.discovery_service_name.hash(&mut hasher);
+    row.discovery_endpoint_name.hash(&mut hasher);
+    row.api_key_ref.hash(&mut hasher);
+    row.api_key_encrypted.hash(&mut hasher);
+    row.config.to_string().hash(&mut hasher);
+    hasher.finish()
+}
+
 /// Dialog provider that selects its concrete backend per request from the
 /// DB-backed routing table (weighted primaries, ordered fallback, trigger-engaged
-/// overflow), recording circuit-breaker outcomes. Underlying transport clients are
-/// reused from the existing per-provider factories, keyed by provider name.
+/// overflow), recording circuit-breaker outcomes. Transport clients come from
+/// the [`ChatClientFactory`]: env-built ones by name, admin-created ones built
+/// on demand from their provider row.
 pub struct RouterChatProvider {
     walker: RoutedAttemptWalker,
-    clients: HashMap<String, DialogProviderHandle>,
-    default_client: DialogProviderHandle,
+    factory: Arc<ChatClientFactory>,
     provider_name: String,
 }
 
@@ -57,13 +225,11 @@ impl RouterChatProvider {
         breakers: Arc<BreakerSet>,
         triggers: Arc<TriggerState>,
         pools: Arc<PoolRegistry>,
-        clients: HashMap<String, DialogProviderHandle>,
-        default_client: DialogProviderHandle,
+        factory: Arc<ChatClientFactory>,
     ) -> Self {
         Self {
             walker: RoutedAttemptWalker::new(handle, breakers, triggers, pools),
-            clients,
-            default_client,
+            factory,
             provider_name: "router".to_owned(),
         }
     }
@@ -86,8 +252,7 @@ impl ChatProvider for RouterChatProvider {
     fn run_dialog<'a>(&'a self, input: DialogInput) -> ChatProviderFuture<'a> {
         Box::pin(async move {
             let input_for_attempts = input.clone();
-            let clients = self.clients.clone();
-            let default_client = Arc::clone(&self.default_client);
+            let factory = Arc::clone(&self.factory);
             let result = self
                 .walker
                 .run(
@@ -102,10 +267,7 @@ impl ChatProvider for RouterChatProvider {
                         ..RoutedRequestContext::default()
                     },
                     move |attempt| {
-                        let client = clients
-                            .get(&attempt.provider_name)
-                            .cloned()
-                            .unwrap_or_else(|| Arc::clone(&default_client));
+                        let resolved = factory.resolve(&attempt);
                         let mut request = input_for_attempts.clone();
                         if !attempt.model_name.trim().is_empty() {
                             request.model = attempt.model_name.clone();
@@ -124,6 +286,13 @@ impl ChatProvider for RouterChatProvider {
                             request.enable_thinking = Some(enable_thinking);
                         }
                         async move {
+                            let client = match resolved {
+                                Ok(client) => client,
+                                Err(error) => {
+                                    let error: ChatProviderError = Box::new(error);
+                                    return Err(error);
+                                }
+                            };
                             match client.run_dialog(request).await {
                                 Ok(mut output) => {
                                     if output.provider.trim().is_empty() {
@@ -150,9 +319,11 @@ impl ChatProvider for RouterChatProvider {
     }
 }
 
-/// Build the DB-backed dialog provider, reusing the existing aifarm and genkit
-/// transport clients keyed by provider name (`gemini` overflow shares the Google
-/// AI / genkit client). Falls back to the aifarm primary when no route resolves.
+/// Build the DB-backed dialog provider. The env-built aifarm and genkit
+/// transport clients seed the factory's static map by provider name (`gemini`
+/// overflow shares the Google AI / genkit client); providers created in the
+/// admin panel are built on demand from their rows. Falls back to the aifarm
+/// primary when a selected row vanishes mid-request.
 pub fn router_dialog_provider(
     config: &AppConfig,
     toolbox: Arc<dyn DialogToolbox>,
@@ -167,7 +338,7 @@ pub fn router_dialog_provider(
     // `vram-cloud` client below, so admin weights control them without a hidden pool.
     let aifarm_cfg = aifarm_dialog_config_from_app_config(config);
     let aifarm: DialogProviderHandle =
-        Arc::new(AifarmDialogProvider::new(aifarm_cfg).with_toolbox(Arc::clone(&toolbox)));
+        Arc::new(AifarmDialogProvider::new(aifarm_cfg.clone()).with_toolbox(Arc::clone(&toolbox)));
 
     let genkit = genkit_fallback.or_else(|| {
         genkit_dialog_provider_from_app_config_with_toolbox(config, Some(Arc::clone(&toolbox)))
@@ -186,7 +357,14 @@ pub fn router_dialog_provider(
         clients.insert(qwen_reasoner.provider_name().to_owned(), qwen_reasoner);
     }
 
-    let provider = RouterChatProvider::new(handle, breakers, triggers, pools, clients, aifarm);
+    let factory = Arc::new(ChatClientFactory::new(
+        Arc::clone(&handle),
+        toolbox,
+        aifarm_cfg,
+        clients,
+        aifarm,
+    ));
+    let provider = RouterChatProvider::new(handle, breakers, triggers, pools, factory);
     let provider = match routing_events {
         Some(reporter) => provider.with_routing_event_reporter(reporter),
         None => provider,
@@ -830,13 +1008,13 @@ mod tests {
                 }),
             });
         let triggers = Arc::new(TriggerState::new());
+        let handle = RouterHandle::new(crate::model_routing::build_routing_table(&snapshot));
         let provider = RouterChatProvider::new(
-            RouterHandle::new(crate::model_routing::build_routing_table(&snapshot)),
+            Arc::clone(&handle),
             Arc::new(BreakerSet::new()),
             Arc::clone(&triggers),
             Arc::new(PoolRegistry::new()),
-            clients,
-            default_provider,
+            test_factory(handle, clients, default_provider),
         )
         .with_routing_event_reporter(reporter.clone());
 
@@ -1196,15 +1374,139 @@ mod tests {
         clients: HashMap<String, DialogProviderHandle>,
         reporter: crate::runtime_routing::RoutingEventReporter,
     ) -> RouterChatProvider {
+        let handle = RouterHandle::new(crate::model_routing::build_routing_table(&snapshot));
         RouterChatProvider::new(
-            RouterHandle::new(crate::model_routing::build_routing_table(&snapshot)),
+            Arc::clone(&handle),
             Arc::new(BreakerSet::new()),
             Arc::new(TriggerState::new()),
             Arc::new(PoolRegistry::new()),
-            clients,
-            default_provider,
+            test_factory(handle, clients, default_provider),
         )
         .with_routing_event_reporter(reporter)
+    }
+
+    fn test_factory(
+        handle: Arc<RouterHandle>,
+        clients: HashMap<String, DialogProviderHandle>,
+        default_provider: DialogProviderHandle,
+    ) -> Arc<ChatClientFactory> {
+        Arc::new(ChatClientFactory::new(
+            handle,
+            Arc::new(EmptyToolbox),
+            AifarmDialogConfig::default(),
+            clients,
+            default_provider,
+        ))
+    }
+
+    fn admin_created_provider_snapshot(protocol: &str, endpoint: &str) -> RoutingSnapshot {
+        let mut snapshot = routed_dialog_snapshot();
+        snapshot.providers[0].id = 5;
+        snapshot.providers[0].name = "my-sglang".to_owned();
+        snapshot.providers[0].protocol = Some(protocol.to_owned());
+        snapshot.providers[0].endpoint = Some(endpoint.to_owned());
+        snapshot.providers[0].api_key_ref = None;
+        snapshot.models[0].provider_id = 5;
+        snapshot
+    }
+
+    fn attempt_for(provider_id: i64, provider_name: &str) -> crate::routed_attempts::RoutedAttempt {
+        crate::routed_attempts::RoutedAttempt {
+            provider_id,
+            model_id: 10,
+            provider_name: provider_name.to_owned(),
+            model_name: "db/model".to_owned(),
+            provider_endpoint: None,
+            discovery_service_name: None,
+            discovery_endpoint_name: None,
+            model_base_url: None,
+            embedding_dim: None,
+            provider_config: json!({}),
+            model_config: json!({}),
+            overrides: Default::default(),
+            variant: None,
+        }
+    }
+
+    #[test]
+    fn factory_builds_client_for_admin_created_openai_provider() {
+        let snapshot = admin_created_provider_snapshot("openai_compat", "https://sglang.local/v1");
+        let handle = RouterHandle::new(crate::model_routing::build_routing_table(&snapshot));
+        let default_provider: DialogProviderHandle =
+            Arc::new(SequencedProvider::new("default", vec![]));
+        let factory = test_factory(handle, HashMap::new(), default_provider);
+
+        let client = factory
+            .resolve(&attempt_for(5, "my-sglang"))
+            .expect("dynamic client for an admin-created provider");
+        assert_eq!(
+            client.provider_name(),
+            "my-sglang",
+            "the request must go to the new provider, never the default"
+        );
+    }
+
+    #[test]
+    fn factory_reuses_cache_until_the_row_changes() {
+        let snapshot = admin_created_provider_snapshot("openai_compat", "https://sglang.local/v1");
+        let handle = RouterHandle::new(crate::model_routing::build_routing_table(&snapshot));
+        let default_provider: DialogProviderHandle =
+            Arc::new(SequencedProvider::new("default", vec![]));
+        let factory = test_factory(Arc::clone(&handle), HashMap::new(), default_provider);
+
+        let first = factory
+            .resolve(&attempt_for(5, "my-sglang"))
+            .expect("first");
+        let second = factory
+            .resolve(&attempt_for(5, "my-sglang"))
+            .expect("second");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "an unchanged row must reuse the cached client"
+        );
+
+        let changed = admin_created_provider_snapshot("openai_compat", "https://other.local/v1");
+        handle.store(crate::model_routing::build_routing_table(&changed));
+        let third = factory
+            .resolve(&attempt_for(5, "my-sglang"))
+            .expect("third");
+        assert!(
+            !Arc::ptr_eq(&first, &third),
+            "an endpoint change must invalidate the cached client"
+        );
+    }
+
+    #[test]
+    fn factory_rejects_protocols_without_a_dynamic_adapter_as_retryable() {
+        let snapshot = admin_created_provider_snapshot("acestep", "https://music.local");
+        let handle = RouterHandle::new(crate::model_routing::build_routing_table(&snapshot));
+        let default_provider: DialogProviderHandle =
+            Arc::new(SequencedProvider::new("default", vec![]));
+        let factory = test_factory(handle, HashMap::new(), default_provider);
+
+        let Err(error) = factory.resolve(&attempt_for(5, "my-sglang")) else {
+            panic!("acestep must have no dynamic dialog adapter");
+        };
+        assert_eq!(
+            openplotva_llm::retry::retryable_reason(&error),
+            Some(openplotva_llm::retry::FailureReason::ProviderUnavailable),
+            "the walker must skip to the next candidate, not fail the run"
+        );
+    }
+
+    #[test]
+    fn factory_prefers_static_clients_by_name() {
+        let snapshot = routed_dialog_snapshot();
+        let handle = RouterHandle::new(crate::model_routing::build_routing_table(&snapshot));
+        let aifarm: DialogProviderHandle = Arc::new(SequencedProvider::new("aifarm", vec![]));
+        let default_provider: DialogProviderHandle =
+            Arc::new(SequencedProvider::new("default", vec![]));
+        let mut clients = HashMap::new();
+        clients.insert("aifarm".to_owned(), Arc::clone(&aifarm));
+        let factory = test_factory(handle, clients, default_provider);
+
+        let resolved = factory.resolve(&attempt_for(1, "aifarm")).expect("static");
+        assert!(Arc::ptr_eq(&resolved, &aifarm));
     }
 
     fn routed_dialog_snapshot() -> RoutingSnapshot {
