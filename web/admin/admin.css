@@ -1363,6 +1363,66 @@ textarea.form-control {
     flex-wrap: wrap;
 }
 
+/* Segmented tab strip: the sidebar `nav` variant is full-width by design, so
+   inside these groups it is reshaped into inline pills. */
+.mp-tabs {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--sp-1);
+    background: var(--c-bg-card);
+    border: 1px solid var(--c-border);
+    border-radius: var(--rad-lg);
+    padding: var(--sp-1);
+    flex-wrap: nowrap;
+}
+
+.mp-tabs pl-button[variant="nav"] {
+    width: auto;
+    justify-content: center;
+    padding: var(--sp-2) var(--sp-4);
+    font-size: var(--fs-sm);
+    border-radius: var(--rad-md);
+    white-space: nowrap;
+}
+
+/* Graph section: the topology sits in a card like every other view section. */
+.mp-graph-section {
+    background: var(--c-bg-card);
+    border: 1px solid var(--c-border);
+    border-radius: var(--rad-lg);
+    padding: var(--sp-4) var(--sp-5);
+}
+
+.mp-flow-legend {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-4);
+    flex-wrap: wrap;
+    margin: var(--sp-2) 0 var(--sp-3);
+    font-size: var(--fs-xs);
+    color: var(--c-text-muted);
+}
+
+.mp-flow-legend .mp-legend-item {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--sp-2);
+}
+
+.mp-flow-legend .mp-legend-line {
+    display: inline-block;
+    width: 22px;
+    height: 3px;
+    border-radius: var(--rad-full);
+}
+
+.mp-flow-legend .mp-legend-line[data-ekind="primary"] { background: var(--c-role-primary); }
+.mp-flow-legend .mp-legend-line[data-ekind="fallback"] { background: var(--c-role-fallback); }
+.mp-flow-legend .mp-legend-line[data-ekind="overflow"] { background: var(--c-role-overflow); }
+.mp-flow-legend .mp-legend-line[data-ekind="canary"] { background: var(--c-role-canary); }
+.mp-flow-legend .mp-legend-line[data-ekind="shadow"] { background: var(--c-role-shadow); }
+.mp-flow-legend .mp-legend-line[data-ekind="attach"] { background: var(--c-border-light); }
+
 .mp-hidden {
     display: none;
 }

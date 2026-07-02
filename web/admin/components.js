@@ -821,9 +821,25 @@
        cubic bezier edges. Nodes focusable; emits pl:node-click {id, kind}.
        ============================================================ */
     const FLOW_KIND_ORDER = ['workflow', 'model', 'provider', 'pool'];
-    const FLOW_NODE_W = 156, FLOW_NODE_H = 34, FLOW_ROW_H = 56, FLOW_COL_W = 232, FLOW_PAD = 18;
+    const FLOW_NODE_H = 38, FLOW_ROW_H = 68, FLOW_PAD = 24, FLOW_MIN_COL_GAP = 110;
     class PlFlow extends HTMLElement {
-        connectedCallback() { this.classList.add('pl-flow'); if (this._data) this.render(); }
+        connectedCallback() {
+            this.classList.add('pl-flow');
+            // Re-layout when the container width changes: the graph stretches
+            // to fill whatever space it is given.
+            if (!this._resize && typeof ResizeObserver !== 'undefined') {
+                this._resize = new ResizeObserver(() => {
+                    if (this._data && Math.abs(this.clientWidth - (this._lastWidth || 0)) > 24) {
+                        this.render();
+                    }
+                });
+                this._resize.observe(this);
+            }
+            if (this._data) this.render();
+        }
+        disconnectedCallback() {
+            if (this._resize) { this._resize.disconnect(); this._resize = null; }
+        }
         set data(d) { this._data = d; if (this.isConnected) this.render(); }
         get data() { return this._data; }
         render() {
@@ -833,19 +849,29 @@
             const edges = d.edges || [];
             if (!nodes.length) return;
             const kindsPresent = FLOW_KIND_ORDER.filter((k) => nodes.some((n) => n.kind === k));
-            const colOf = {};
-            kindsPresent.forEach((k, i) => { colOf[k] = i; });
             const byCol = kindsPresent.map((k) => nodes.filter((n) => n.kind === k));
+            const cols = kindsPresent.length;
             const maxRows = Math.max.apply(null, byCol.map((c) => c.length));
+            const containerW = this.clientWidth || 1100;
+            this._lastWidth = containerW;
+            const nodeW = Math.max(180, Math.min(260,
+                Math.floor((containerW - FLOW_PAD * 2 - (cols - 1) * FLOW_MIN_COL_GAP) / Math.max(cols, 1))));
+            const minW = FLOW_PAD * 2 + cols * nodeW + (cols - 1) * FLOW_MIN_COL_GAP;
+            const W = Math.max(containerW, minW);
             const H = FLOW_PAD * 2 + Math.max(1, maxRows) * FLOW_ROW_H;
-            const W = FLOW_PAD * 2 + (kindsPresent.length - 1) * FLOW_COL_W + FLOW_NODE_W;
+            // Columns spread edge-to-edge across the full width; a lone column
+            // sits centered.
+            const colStep = cols > 1 ? (W - FLOW_PAD * 2 - nodeW) / (cols - 1) : 0;
+            const colX = (ci) => cols > 1
+                ? FLOW_PAD + ci * colStep
+                : FLOW_PAD + (W - FLOW_PAD * 2 - nodeW) / 2;
             const pos = {};
             byCol.forEach((col, ci) => {
                 const span = col.length * FLOW_ROW_H;
                 const top = FLOW_PAD + (H - FLOW_PAD * 2 - span) / 2;
                 col.forEach((n, ri) => {
                     pos[n.id] = {
-                        x: FLOW_PAD + ci * FLOW_COL_W,
+                        x: colX(ci),
                         y: top + ri * FLOW_ROW_H + (FLOW_ROW_H - FLOW_NODE_H) / 2
                     };
                 });
@@ -854,12 +880,19 @@
                 viewBox: '0 0 ' + W + ' ' + H, width: W, height: H,
                 role: 'group', 'aria-label': 'Routing topology'
             });
+            // Sample the cubic bezier so each label sits at a different point
+            // of its own curve instead of every midpoint piling up together.
+            const bez = (p0, p1, p2, p3, t) => {
+                const mt = 1 - t;
+                return mt * mt * mt * p0 + 3 * mt * mt * t * p1 + 3 * mt * t * t * p2 + t * t * t * p3;
+            };
+            let labelIndex = 0;
             edges.forEach((e) => {
                 const a = pos[e.from], b = pos[e.to];
                 if (!a || !b) return;
-                const x1 = a.x + FLOW_NODE_W, y1 = a.y + FLOW_NODE_H / 2;
+                const x1 = a.x + nodeW, y1 = a.y + FLOW_NODE_H / 2;
                 const x2 = b.x, y2 = b.y + FLOW_NODE_H / 2;
-                const dx = Math.max(28, (x2 - x1) / 2);
+                const dx = Math.max(36, (x2 - x1) / 2);
                 const attrs = {
                     d: 'M ' + x1 + ' ' + y1 + ' C ' + (x1 + dx) + ' ' + y1 + ', ' + (x2 - dx) + ' ' + y2 + ', ' + x2 + ' ' + y2,
                     class: 'pl-flow-edge',
@@ -874,12 +907,17 @@
                 if (e.kind === 'primary' && e.weight != null) tag = e.weight + '%';
                 else if (e.kind === 'fallback' && e.order != null) tag = '#' + e.order;
                 if (tag) {
+                    const t = 0.28 + (labelIndex % 5) * 0.11;
+                    labelIndex += 1;
+                    const lx = bez(x1, x1 + dx, x2 - dx, x2, t);
+                    const ly = bez(y1, y1, y2, y2, t);
                     svg.appendChild(svgEl('text', {
-                        x: ((x1 + x2) / 2).toFixed(1), y: ((y1 + y2) / 2 - 5).toFixed(1),
+                        x: lx.toFixed(1), y: (ly - 6).toFixed(1),
                         'text-anchor': 'middle', class: 'pl-flow-edge-label'
                     }, tag));
                 }
             });
+            const maxLabelChars = Math.max(18, Math.floor((nodeW - 22) / 7.2));
             nodes.forEach((n) => {
                 const p = pos[n.id];
                 if (!p) return;
@@ -892,17 +930,17 @@
                     'aria-label': n.kind + ' ' + String(n.label || n.id)
                 });
                 g.appendChild(svgEl('rect', {
-                    x: p.x, y: p.y, width: FLOW_NODE_W, height: FLOW_NODE_H, rx: 8,
+                    x: p.x, y: p.y, width: nodeW, height: FLOW_NODE_H, rx: 8,
                     class: 'pl-flow-node-box'
                 }));
                 const lbl = String(n.label || n.id);
                 g.appendChild(svgEl('text', {
                     x: p.x + 10, y: p.y + FLOW_NODE_H / 2 + 4, class: 'pl-flow-node-label'
-                }, lbl.length > 19 ? lbl.slice(0, 18) + '…' : lbl));
+                }, lbl.length > maxLabelChars ? lbl.slice(0, maxLabelChars - 1) + '…' : lbl));
                 const badge = n.badge || (n.state === 'disabled' ? 'disabled' : null);
                 if (badge) {
                     g.appendChild(svgEl('text', {
-                        x: p.x + FLOW_NODE_W - 6, y: p.y - 3, 'text-anchor': 'end',
+                        x: p.x + nodeW - 6, y: p.y - 3, 'text-anchor': 'end',
                         class: 'pl-flow-node-badge'
                     }, badge));
                 }

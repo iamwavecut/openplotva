@@ -1245,10 +1245,19 @@ pl-textarea.redis-value .pl-field {
     min-width: 0;
 }
 
+.pl-slotbar {
+    max-width: 100%;
+    min-width: 0;
+}
+
 .pl-slotbar .pl-slotbar-cells {
     display: flex;
     gap: 3px;
+    row-gap: 3px;
     align-items: center;
+    /* Big pools (16 slots) wrap onto extra rows instead of overflowing the tile. */
+    flex-wrap: wrap;
+    max-width: 100%;
 }
 
 .pl-slotbar .pl-slotbar-cell {
@@ -1379,9 +1388,14 @@ pl-textarea.redis-value .pl-field {
 }
 
 .pl-flow .pl-flow-edge-label {
-    fill: var(--c-text-muted);
+    fill: var(--c-text-sec);
     font-family: var(--font-mono);
     font-size: 10px;
+    /* Halo so the label stays readable where edges cross underneath it. */
+    paint-order: stroke fill;
+    stroke: var(--c-bg-main);
+    stroke-width: 4px;
+    stroke-linejoin: round;
 }
 
 .pl-flow .pl-flow-node {

@@ -1105,7 +1105,7 @@
 
                     <div id="providers" class="tab-pane">
                         <div class="mp-topbar">
-                            <pl-button-group class="mp-viewtabs" aria-label="Routing views">
+                            <pl-button-group class="mp-viewtabs mp-tabs" aria-label="Routing views">
                                 <pl-button id="mp-tab-cockpit" variant="nav" class="active" data-action="mpView" data-args='["cockpit"]'>Cockpit</pl-button>
                                 <pl-button id="mp-tab-catalog" variant="nav" data-action="mpView" data-args='["catalog"]'>Catalog</pl-button>
                                 <pl-button id="mp-tab-pools" variant="nav" data-action="mpView" data-args='["pools"]'>Pools</pl-button>
@@ -1788,7 +1788,7 @@
             const w = mpWorkflow(mpState.wf);
             if (!w) { PL.empty(root, { title: 'Workflow not found', desc: 'It may have been removed.' }); return; }
             if (!mpState.draft) mpInitDraft();
-            const scopeGroup = mpEl('pl-button-group', { 'aria-label': 'Scope' }, ['global', 'vip'].map(s =>
+            const scopeGroup = mpEl('pl-button-group', { class: 'mp-tabs', 'aria-label': 'Scope' }, ['global', 'vip'].map(s =>
                 mpBtn(s === 'vip' ? 'VIP' : 'Global',
                     { variant: 'nav', size: 'sm', class: mpState.scope === s ? 'active' : '' },
                     () => { mpState.scope = s; mpState.draft = null; mpRenderBoard(); })));
@@ -3045,23 +3045,38 @@
                     .concat((mpState.snap.workflows || []).map(w =>
                         mpEl('option', Object.assign({ value: w.key }, g.wf === w.key ? { selected: true } : {}), mpWfLabel(w.key)))));
             wfSel.addEventListener('pl:change', () => { g.wf = wfSel.value; mpRenderGraph(); });
-            const scopeGroup = mpEl('pl-button-group', { 'aria-label': 'Scope' }, ['global', 'vip'].map(s =>
+            const scopeGroup = mpEl('pl-button-group', { class: 'mp-tabs', 'aria-label': 'Scope' }, ['global', 'vip'].map(s =>
                 mpBtn(s === 'vip' ? 'VIP' : 'Global',
                     { variant: 'nav', size: 'sm', class: g.scope === s ? 'active' : '' },
                     () => { g.scope = s; mpRenderGraph(); })));
             const activeToggle = mpEl('pl-toggle', Object.assign({ label: 'Active paths only' }, g.activeOnly ? { checked: true } : {}));
             activeToggle.addEventListener('pl:change', ev => { g.activeOnly = !!ev.detail.checked; mpRenderGraph(); });
-            root.appendChild(mpEl('div', { class: 'mp-graph-controls' }, [wfSel, scopeGroup, activeToggle]));
-            if (mpState.statusUnavailable) root.appendChild(mpEl('div', { class: 'mp-hint', text: 'Live status unavailable — topology shows configuration only.' }));
+            const section = mpEl('div', { class: 'mp-graph-section' });
+            section.appendChild(mpEl('div', { class: 'mp-eyebrow', text: 'Topology' }));
+            section.appendChild(mpEl('div', { class: 'mp-hint', text: 'Workflows route to models, models belong to providers, providers draw slots from pools. Click a node to jump to it.' }));
+            section.appendChild(mpEl('div', { class: 'mp-graph-controls' }, [wfSel, scopeGroup, activeToggle]));
+            section.appendChild(mpEl('div', { class: 'mp-flow-legend' }, [
+                ['primary', 'primary (weight %)'],
+                ['fallback', 'fallback (#order)'],
+                ['overflow', 'overflow (dashed until engaged)'],
+                ['canary', 'canary'],
+                ['shadow', 'shadow'],
+                ['attach', 'belongs to'],
+            ].map(pair => mpEl('span', { class: 'mp-legend-item' }, [
+                mpEl('span', { class: 'mp-legend-line', 'data-ekind': pair[0] }),
+                mpEl('span', { text: pair[1] }),
+            ]))));
+            if (mpState.statusUnavailable) section.appendChild(mpEl('div', { class: 'mp-hint', text: 'Live status unavailable — topology shows configuration only.' }));
+            root.appendChild(section);
             const data = mpGraphFlowData();
             if (!data.nodes.length) {
-                PL.empty(root.appendChild(mpEl('div')), { title: 'Nothing to draw', desc: 'No assignments match this filter.' });
+                PL.empty(section.appendChild(mpEl('div')), { title: 'Nothing to draw', desc: 'No assignments match this filter.' });
                 return;
             }
             const flow = mpEl('pl-flow', { 'data-mp-graph-flow': '' });
             flow.data = data;
             flow.addEventListener('pl:node-click', e => mpFlowNav(e.detail));
-            root.appendChild(flow);
+            section.appendChild(flow);
         }
 
         // --- Settings ---
