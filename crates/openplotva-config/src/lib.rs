@@ -743,6 +743,16 @@ pub struct DialogConfig {
     /// Pending age in seconds beyond which a never-processed dialog job is
     /// resolved as expired backlog, from `DIALOG_TURN_MAX_QUEUE_AGE_SECS`.
     pub turn_max_queue_age_secs: i32,
+    /// In-process duplicate-answer regenerations per turn, from
+    /// `DIALOG_TURN_MAX_REGENERATIONS`.
+    pub turn_max_regenerations: i32,
+    /// Reaction emoji signalling a terminal dialog failure, from
+    /// `DIALOG_TERMINAL_REACTION_EMOJI`. Must be in the Bot API allowed set.
+    pub terminal_reaction_emoji: String,
+    /// Job age in seconds beyond which terminal failures skip the user signal
+    /// (prevents reaction storms on post-downtime backlogs), from
+    /// `DIALOG_TERMINAL_SIGNAL_MAX_AGE_SECS`.
+    pub terminal_signal_max_age_secs: i32,
     pub vmlx_url: String,
     pub vmlx_api_key: String,
     pub vmlx_model: String,
@@ -1141,6 +1151,12 @@ pub struct RawConfig {
     pub dialog_turn_budget_secs: Option<String>,
     /// `DIALOG_TURN_MAX_QUEUE_AGE_SECS`.
     pub dialog_turn_max_queue_age_secs: Option<String>,
+    /// `DIALOG_TURN_MAX_REGENERATIONS`.
+    pub dialog_turn_max_regenerations: Option<String>,
+    /// `DIALOG_TERMINAL_REACTION_EMOJI`.
+    pub dialog_terminal_reaction_emoji: Option<String>,
+    /// `DIALOG_TERMINAL_SIGNAL_MAX_AGE_SECS`.
+    pub dialog_terminal_signal_max_age_secs: Option<String>,
     /// `DIALOG_VMLX_URL`.
     pub dialog_vmlx_url: Option<String>,
     /// `DIALOG_VMLX_API_KEY`.
@@ -2211,6 +2227,21 @@ impl AppConfig {
                         raw.dialog_turn_max_queue_age_secs,
                         600,
                     )?,
+                    turn_max_regenerations: parse_i32(
+                        "DIALOG_TURN_MAX_REGENERATIONS",
+                        raw.dialog_turn_max_regenerations,
+                        2,
+                    )?,
+                    terminal_reaction_emoji: raw
+                        .dialog_terminal_reaction_emoji
+                        .map(|value| value.trim().to_owned())
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or_else(|| "🤔".to_owned()),
+                    terminal_signal_max_age_secs: parse_i32(
+                        "DIALOG_TERMINAL_SIGNAL_MAX_AGE_SECS",
+                        raw.dialog_terminal_signal_max_age_secs,
+                        600,
+                    )?,
                     vmlx_url: raw
                         .dialog_vmlx_url
                         .unwrap_or_else(|| DEFAULT_DIALOG_VMLX_URL.to_owned()),
@@ -2787,6 +2818,9 @@ impl RawConfig {
             ),
             dialog_turn_budget_secs: env("DIALOG_TURN_BUDGET_SECS"),
             dialog_turn_max_queue_age_secs: env("DIALOG_TURN_MAX_QUEUE_AGE_SECS"),
+            dialog_turn_max_regenerations: env("DIALOG_TURN_MAX_REGENERATIONS"),
+            dialog_terminal_reaction_emoji: env("DIALOG_TERMINAL_REACTION_EMOJI"),
+            dialog_terminal_signal_max_age_secs: env("DIALOG_TERMINAL_SIGNAL_MAX_AGE_SECS"),
             dialog_vmlx_url: env("DIALOG_VMLX_URL"),
             dialog_vmlx_api_key: env("DIALOG_VMLX_API_KEY"),
             dialog_vmlx_model: env("DIALOG_VMLX_MODEL"),

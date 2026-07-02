@@ -10579,6 +10579,10 @@ async fn start_runtime_workers(
             dialog_provider_for_updates = Some(Arc::clone(&dialog_provider));
             let dialog_effects =
                 dialog_jobs::DialogDispatcherEffects::new(Arc::clone(&dispatcher_queue));
+            let dialog_terminal_signal = dialog_turn::DispatcherTerminalUserSignal::new(
+                telegram.clone(),
+                Arc::clone(&dispatcher_queue),
+            );
             let mut dialog_materializer = dialog_jobs::PostgresDialogInputMaterializer::new(
                 chat_settings_store.clone(),
                 store.clone(),
@@ -10670,6 +10674,10 @@ async fn start_runtime_workers(
             let dialog_max_llm_job_attempts = config.persistent_queue.llm_job_max_attempts;
             let dialog_turn_budget_secs = config.llm.dialog.turn_budget_secs;
             let dialog_turn_max_queue_age_secs = config.llm.dialog.turn_max_queue_age_secs;
+            let dialog_turn_max_regenerations = config.llm.dialog.turn_max_regenerations;
+            let dialog_terminal_reaction_emoji = config.llm.dialog.terminal_reaction_emoji.clone();
+            let dialog_terminal_signal_max_age_secs =
+                config.llm.dialog.terminal_signal_max_age_secs;
             let dialog_worker_count = config.persistent_queue.dialog_aifarm_workers.max(0);
             for index in 0..dialog_worker_count {
                 let worker_queue = Arc::clone(&task_queue_for_updates);
@@ -10679,6 +10687,8 @@ async fn start_runtime_workers(
                 let worker_tool_history = dialog_tool_history.clone();
                 let worker_routing_events = routing_event_reporter.clone();
                 let worker_turn_outcomes = turn_outcome_observer.clone();
+                let worker_terminal_signal = dialog_terminal_signal.clone();
+                let worker_reaction_emoji = dialog_terminal_reaction_emoji.clone();
                 let worker_stop = stop.subscribe();
                 let dialog_worker = tokio::spawn(async move {
                     let report =
@@ -10696,6 +10706,12 @@ async fn start_runtime_workers(
                                 max_llm_job_attempts: dialog_max_llm_job_attempts,
                                 turn_budget_secs: dialog_turn_budget_secs,
                                 turn_max_queue_age_secs: dialog_turn_max_queue_age_secs,
+                                max_regenerations: dialog_turn_max_regenerations,
+                                terminal_signal: dialog_turn::TurnSignalPolicy::new(
+                                    Some(&worker_terminal_signal),
+                                    &worker_reaction_emoji,
+                                    dialog_terminal_signal_max_age_secs,
+                                ),
                             },
                             wait_for_runtime_stop(worker_stop),
                         )

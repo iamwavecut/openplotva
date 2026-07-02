@@ -40,8 +40,8 @@ pub enum TurnOutcome {
         max_attempts: i32,
         target_queue: String,
     },
-    /// The turn gave up. `user_signal` is the Phase 3 reaction plan; the
-    /// ledger records "none" until reactions ship.
+    /// The turn gave up. `user_signal` tells finalization how to signal the
+    /// user; the ledger records the real signal result.
     TerminalFailed {
         reason: &'static str,
         error: String,
