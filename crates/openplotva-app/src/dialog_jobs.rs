@@ -132,6 +132,17 @@ pub struct DialogJobWorkerReport {
     pub dialog_fallback_event_error: Option<String>,
     /// Completion/failure status write failed.
     pub status_error: Option<String>,
+    /// Chat the job answered (from decoded params).
+    pub chat_id: Option<i64>,
+    /// Forum thread of the trigger message, when present.
+    pub thread_id: Option<i32>,
+    /// User whose message triggered the job.
+    pub user_id: Option<i64>,
+    /// Trigger message ID.
+    pub message_id: Option<i32>,
+    /// answer, response, and queued tool material were all empty: the job
+    /// completed without any send attempt (the fully-silent branch).
+    pub answer_empty_all_sources: bool,
 }
 
 /// Aggregate report for a long-running dialog taskman worker.
@@ -213,6 +224,8 @@ pub struct DialogJobWorkerLoopOptions<'a, Materializer: ?Sized, ToolHistory: ?Si
     pub materializer: &'a Materializer,
     pub tool_history: &'a ToolHistory,
     pub routing_events: Option<&'a crate::runtime_routing::RoutingEventReporter>,
+    /// Reply-outcome ledger observer; every handled job records one outcome.
+    pub turn_outcomes: Option<&'a crate::dialog_turn::DialogTurnObserver>,
     /// Queue names to poll in order.
     pub queue_names: &'static [&'static str],
     /// Poll interval.
@@ -901,6 +914,10 @@ where
             return report;
         }
     };
+    report.chat_id = (params.chat_id != 0).then_some(params.chat_id);
+    report.thread_id = params.thread_id;
+    report.user_id = (params.user_id != 0).then_some(params.user_id);
+    report.message_id = (params.message_id != 0).then_some(params.message_id);
 
     if dialog_job_is_stale(&item.job, options.now) {
         report.skipped_stale = true;
@@ -998,6 +1015,11 @@ where
         .await;
         return report;
     }
+    if answer.is_empty() {
+        // The fully-silent branch: no text, no queued tool message. Phase 1
+        // only measures it; the turn engine will make it retryable.
+        report.answer_empty_all_sources = true;
+    }
     if !answer.is_empty() {
         let (duplicate_message_id, suppressed) =
             should_suppress_duplicate_bot_reply(&duplicate_guard_history, &answer);
@@ -1083,6 +1105,7 @@ where
             materializer,
             tool_history: &noop,
             routing_events: None,
+            turn_outcomes: None,
             queue_names,
             interval,
             max_llm_job_attempts: DEFAULT_LLM_JOB_MAX_ATTEMPTS,
@@ -1137,6 +1160,14 @@ where
                         },
                     ).await;
                     trace_dialog_job_tick(&tick);
+                    if let Some(observer) = options.turn_outcomes
+                        && let Some(record) = crate::dialog_turn::outcome_from_report(
+                            &tick,
+                            OffsetDateTime::now_utc(),
+                        )
+                    {
+                        observer.record(record);
+                    }
                     report.record_tick(&tick);
                 }
             }
@@ -1269,6 +1300,7 @@ where
             materializer,
             tool_history,
             routing_events: None,
+            turn_outcomes: None,
             queue_names: &DIALOG_JOB_WORKER_QUEUES,
             interval: DIALOG_JOB_POLL_INTERVAL,
             max_llm_job_attempts,

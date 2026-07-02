@@ -17,12 +17,14 @@ pub mod dialog_jobs;
 pub mod dialog_messages;
 pub mod dialog_runtime;
 pub mod dialog_tools;
+pub mod dialog_turn;
 pub mod edited;
 pub mod embedder;
 pub mod guest;
 pub mod help;
 pub mod history_summary;
 pub mod image_jobs;
+pub mod ingestion_telemetry;
 pub mod inline;
 pub mod media;
 pub mod members;
@@ -1122,7 +1124,7 @@ async fn admin_taskman_job(
     RawQuery(raw_query): RawQuery,
     Extension(routes): Extension<StaticWebRoutes>,
 ) -> Response {
-    admin_taskman_job_response(&routes, method, &headers, raw_query.as_deref())
+    admin_taskman_job_response(&routes, method, &headers, raw_query.as_deref()).await
 }
 
 async fn admin_taskman_job_cancel(
@@ -5003,7 +5005,7 @@ fn admin_taskman_jobs_clear_response(
     }
 }
 
-fn admin_taskman_job_response(
+async fn admin_taskman_job_response(
     routes: &StaticWebRoutes,
     method: Method,
     headers: &HeaderMap,
@@ -5025,7 +5027,7 @@ fn admin_taskman_job_response(
         Ok(job_id) => job_id,
         Err(response) => return *response,
     };
-    match openplotva_server::RuntimeTaskmanInspector::job(&routes.taskman_inspector, job_id) {
+    match openplotva_server::RuntimeTaskmanInspector::job(&routes.taskman_inspector, job_id).await {
         Ok(Some(details)) => {
             admin_json_no_cache_response(StatusCode::OK, admin_taskman_details_json(&details))
         }
@@ -6995,6 +6997,15 @@ fn admin_llm_requests_filter(
         user_id: values
             .get("user_id")
             .and_then(|value| value.trim().parse::<i64>().ok()),
+        message_id: values
+            .get("message_id")
+            .and_then(|value| value.trim().parse::<i32>().ok()),
+        error_only: values
+            .get("error_only")
+            .is_some_and(|value| value.trim() == "1" || value.trim() == "true"),
+        empty_only: values
+            .get("empty_only")
+            .is_some_and(|value| value.trim() == "1" || value.trim() == "true"),
         limit: parse_admin_positive_i32(values.get("limit").map(String::as_str), 1000, 1000),
     }
 }
@@ -9196,6 +9207,8 @@ async fn start_runtime_workers(
     let update_ingress_guard = Arc::new(openplotva_updates::UpdateIngressGuard::with_defaults());
     let updates_inspector =
         runtime_updates::RuntimeUpdatesInspectorHandle::new(update_queue.clone());
+    let ingestion_gate_counters = Arc::new(ingestion_telemetry::IngestionGateCounters::default());
+    updates_inspector.set_gate_counters(Arc::clone(&ingestion_gate_counters));
     let llm_trace_buffer = runtime_llm::RuntimeLlmTraceBuffer::default();
     let (llm_event_recorder, llm_event_recorder_worker) =
         runtime_llm::PostgresRuntimeLlmEventRecorder::spawn(
@@ -9203,6 +9216,45 @@ async fn start_runtime_workers(
             stop.subscribe(),
         );
     workers.handles.push(llm_event_recorder_worker);
+    let turn_outcome_buffer = dialog_turn::RuntimeTurnOutcomeBuffer::default();
+    let (turn_outcome_recorder, turn_outcome_recorder_worker) =
+        dialog_turn::PostgresDialogTurnOutcomeRecorder::spawn(
+            service_clients.postgres.clone(),
+            stop.subscribe(),
+        );
+    workers.handles.push(turn_outcome_recorder_worker);
+    let turn_outcome_observer = dialog_turn::DialogTurnObserver::new(
+        turn_outcome_buffer.clone(),
+        Some(turn_outcome_recorder),
+    );
+    let turn_outcome_cleanup_pool = service_clients.postgres.clone();
+    let turn_outcome_cleanup_stop = stop.subscribe();
+    let turn_outcome_cleanup_worker = tokio::spawn(async move {
+        let mut stop = std::pin::pin!(wait_for_runtime_stop(turn_outcome_cleanup_stop));
+        loop {
+            tokio::select! {
+                () = &mut stop => break,
+                () = tokio::time::sleep(std::time::Duration::from_secs(6 * 60 * 60)) => {
+                    match dialog_turn::delete_old_turn_outcomes_batch(
+                        &turn_outcome_cleanup_pool,
+                        30,
+                        5_000,
+                    )
+                    .await
+                    {
+                        Ok(deleted) if deleted > 0 => {
+                            tracing::info!(deleted, "deleted old dialog turn outcomes");
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            tracing::warn!(%error, "dialog turn outcome cleanup failed");
+                        }
+                    }
+                }
+            }
+        }
+    });
+    workers.handles.push(turn_outcome_cleanup_worker);
     let llm_request_events_retention_days = config.runtime_api.llm_request_events_retention_days;
     if llm_request_events_retention_days > 0 {
         let llm_event_cleanup_pool = service_clients.postgres.clone();
@@ -9388,6 +9440,7 @@ async fn start_runtime_workers(
                 ),
             )),
             llm_trace_inspector: Some(Arc::new(llm_trace_buffer.clone())),
+            turn_outcome_inspector: Some(Arc::new(turn_outcome_buffer.clone())),
             routing_event_inspector: Some(Arc::new(routing_event_buffer.clone())),
             llm_analytics_reader: Some(Arc::new(
                 runtime_llm_analytics::PostgresRuntimeLlmAnalyticsReader::new(
@@ -10623,6 +10676,7 @@ async fn start_runtime_workers(
                 let worker_materializer = dialog_materializer.clone();
                 let worker_tool_history = dialog_tool_history.clone();
                 let worker_routing_events = routing_event_reporter.clone();
+                let worker_turn_outcomes = turn_outcome_observer.clone();
                 let worker_stop = stop.subscribe();
                 let dialog_worker = tokio::spawn(async move {
                     let report =
@@ -10634,6 +10688,7 @@ async fn start_runtime_workers(
                                 materializer: &worker_materializer,
                                 tool_history: &worker_tool_history,
                                 routing_events: Some(&worker_routing_events),
+                                turn_outcomes: Some(&worker_turn_outcomes),
                                 queue_names: &dialog_jobs::DIALOG_JOB_WORKER_QUEUES,
                                 interval: dialog_jobs::DIALOG_JOB_POLL_INTERVAL,
                                 max_llm_job_attempts: dialog_max_llm_job_attempts,
@@ -10996,6 +11051,9 @@ async fn start_runtime_workers(
         Arc::clone(&task_queue_for_updates),
         shared_taskman_worker_counts,
     );
+    taskman_inspector.set_sql_store(Arc::new(openplotva_storage::PostgresTaskQueueStore::new(
+        service_clients.postgres.clone(),
+    )));
     let shared_task_queue_heartbeat_runtime = shared_task_queue.clone();
     let shared_task_queue_heartbeat_stop = stop.subscribe();
     let shared_task_queue_heartbeat_worker_ids = shared_taskman_worker_ids.clone();
@@ -11219,7 +11277,8 @@ async fn start_runtime_workers(
             )
             .with_image_scheduler(dialog_tool_adapter.clone())
             .with_song_scheduler(dialog_tool_adapter.clone())
-            .with_direct_draw_api_effects(direct_draw_api_effects),
+            .with_direct_draw_api_effects(direct_draw_api_effects)
+            .with_gate_counters(Arc::clone(&ingestion_gate_counters)),
         );
         let skipped = Arc::new(skipped::SkippedUpdateHandler::new(dialog_terminal));
         let mut guest_effects = guest::GuestRuntimeEffects::new(telegram.clone())
@@ -13333,7 +13392,8 @@ mod tests {
             Method::GET,
             &headers,
             Some(&format!("id={diagnostic_id}")),
-        );
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await?;
         let value: serde_json::Value = serde_json::from_slice(&body)?;
@@ -13546,7 +13606,7 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await?;
         assert_eq!(&body[..], b"{\"error\":\"task manager not configured\"}\n");
 
-        let response = admin_taskman_job_response(&routes, Method::GET, &headers, None);
+        let response = admin_taskman_job_response(&routes, Method::GET, &headers, None).await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let response =
             admin_taskman_jobs_response(&routes, Method::POST, &headers, Some("status=pending"));

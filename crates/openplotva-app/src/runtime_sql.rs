@@ -33,27 +33,68 @@ impl PostgresRuntimeSqlReader {
         let started = Instant::now();
 
         let mut tx = self.pool.begin().await?;
+        // Time out inside so the transaction object survives cancellation and
+        // hits the explicit rollback arm below instead of being dropped
+        // mid-statement.
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(timeout_ms as u64),
+            Self::read_in_tx(
+                &mut tx,
+                &sql,
+                &request.args,
+                timeout_ms,
+                row_limit,
+                result_bytes_limit,
+            ),
+        )
+        .await;
+        match outcome {
+            Ok(Ok(mut result)) => {
+                tx.commit().await?;
+                result.elapsed_ms = elapsed_millis_i32(started);
+                Ok(result)
+            }
+            Ok(Err(error)) => {
+                // Best-effort ROLLBACK; the original statement error wins.
+                let _ = tx.rollback().await;
+                Err(error)
+            }
+            Err(_) => {
+                let _ = tx.rollback().await;
+                Err(RuntimeSqlReadError::Timeout)
+            }
+        }
+    }
+
+    async fn read_in_tx(
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+        sql: &str,
+        args: &[Value],
+        timeout_ms: i32,
+        row_limit: i32,
+        result_bytes_limit: i32,
+    ) -> Result<RuntimeSqlReadResult, RuntimeSqlReadError> {
         sqlx::query("SET TRANSACTION READ ONLY")
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
         sqlx::query(AssertSqlSafe(format!(
             "SET LOCAL statement_timeout = {timeout_ms}"
         )))
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
 
-        let columns = describe_columns(&mut tx, &sql).await.unwrap_or_default();
-        let mut result = if is_explain_sql(&sql) {
-            execute_direct_sql(&mut tx, &sql, &request.args, row_limit, result_bytes_limit).await?
+        // A describe failure IS the caller's error (bad column, bad type) and
+        // it aborts the transaction; swallowing it used to make the follow-up
+        // SELECT fail with a masking "current transaction is aborted".
+        let columns = describe_columns(tx, sql).await?;
+        let mut result = if is_explain_sql(sql) {
+            execute_direct_sql(tx, sql, args, row_limit, result_bytes_limit).await?
         } else {
-            execute_wrapped_select_sql(&mut tx, &sql, &request.args, row_limit, result_bytes_limit)
-                .await?
+            execute_wrapped_select_sql(tx, sql, args, row_limit, result_bytes_limit).await?
         };
         if !columns.is_empty() {
             result.columns = columns;
         }
-        tx.commit().await?;
-        result.elapsed_ms = elapsed_millis_i32(started);
         Ok(result)
     }
 }
@@ -61,13 +102,15 @@ impl PostgresRuntimeSqlReader {
 impl RuntimeSqlReader for PostgresRuntimeSqlReader {
     fn read<'a>(&'a self, request: RuntimeSqlReadRequest) -> RuntimeSqlReaderFuture<'a> {
         Box::pin(async move {
-            let timeout_ms = positive_or_default(request.timeout_ms, 5_000) as u64;
+            // read_inner enforces the caller timeout itself (with an explicit
+            // rollback); this outer net only guards begin/commit overhead.
+            let timeout_ms = positive_or_default(request.timeout_ms, 5_000) as u64 + 500;
             match tokio::time::timeout(Duration::from_millis(timeout_ms), self.read_inner(request))
                 .await
             {
                 Ok(Ok(result)) => Ok(result),
                 Ok(Err(error)) => Err(error.to_string()),
-                Err(_) => Err("sql read timed out".to_owned()),
+                Err(_) => Err(RuntimeSqlReadError::Timeout.to_string()),
             }
         })
     }
@@ -570,6 +613,8 @@ enum RuntimeSqlReadError {
     Sqlx(#[from] sqlx::Error),
     #[error("marshal sql row: {source}")]
     RowJson { source: serde_json::Error },
+    #[error("sql read timed out")]
+    Timeout,
 }
 
 #[cfg(test)]

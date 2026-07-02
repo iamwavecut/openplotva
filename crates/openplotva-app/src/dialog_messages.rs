@@ -1283,6 +1283,7 @@ pub struct DialogMessageUpdateHandler<Scheduler, Settings, Effects, Rng, Next> {
     rng: Arc<Rng>,
     config: DialogMessageUpdateConfig,
     next: Arc<Next>,
+    gate_counters: Option<Arc<crate::ingestion_telemetry::IngestionGateCounters>>,
 }
 
 impl<Scheduler, Settings, Effects, Rng, Next> fmt::Debug
@@ -1340,7 +1341,17 @@ impl<Scheduler, Settings, Effects, Rng, Next>
             rng,
             config,
             next,
+            gate_counters: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_gate_counters(
+        mut self,
+        counters: Arc<crate::ingestion_telemetry::IngestionGateCounters>,
+    ) -> Self {
+        self.gate_counters = Some(counters);
+        self
     }
 
     #[must_use]
@@ -1375,7 +1386,7 @@ where
 
     fn handle_update<'a>(&'a self, update: TelegramUpdate) -> UpdateHandlerFuture<'a, Self::Error> {
         Box::pin(async move {
-            handle_dialog_or_random_message_update_or_else_with_image_and_direct_draw(
+            let route = handle_dialog_or_random_message_update_or_else_with_image_and_direct_draw(
                 (
                     self.scheduler.as_ref(),
                     self.image_scheduler.as_deref(),
@@ -1389,8 +1400,11 @@ where
                 update,
                 |update| self.next.handle_update(update),
             )
-            .await
-            .map(|_| ())
+            .await?;
+            if let Some(counters) = &self.gate_counters {
+                counters.record_route(&route);
+            }
+            Ok(())
         })
     }
 }

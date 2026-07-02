@@ -6268,6 +6268,24 @@ impl PostgresTaskQueueStore {
         Ok(task_queue_snapshot_from_records(records))
     }
 
+    /// Load one persisted taskman record by id. Used as the diagnostics
+    /// fallback when the in-memory queue no longer holds the row (restart,
+    /// eviction) while Postgres still does.
+    pub async fn load_task_queue_record(
+        &self,
+        id: i64,
+    ) -> Result<Option<TaskQueueRecord>, StorageError> {
+        let row =
+            sqlx::query("SELECT id, record FROM taskman_jobs WHERE id = $1 AND deleted_at IS NULL")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        task_queue_record_from_row(row).map(Some)
+    }
+
     pub async fn apply_task_queue_wal_batch(
         &self,
         batch: Vec<TaskQueueWalRecord>,

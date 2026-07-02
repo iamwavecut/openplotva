@@ -1010,6 +1010,30 @@ fn llm_trace_matches_filter(
         && filter
             .user_id
             .is_none_or(|user_id| trace.user.user_id == user_id)
+        && filter
+            .message_id
+            .is_none_or(|message_id| trace.message.message_id == message_id)
+        && (!filter.error_only
+            || trace
+                .result
+                .error
+                .as_deref()
+                .is_some_and(|error| !error.trim().is_empty()))
+        && (!filter.empty_only
+            || (trace
+                .result
+                .response_text_preview
+                .as_deref()
+                .unwrap_or_default()
+                .trim()
+                .is_empty()
+                && trace
+                    .result
+                    .error
+                    .as_deref()
+                    .unwrap_or_default()
+                    .trim()
+                    .is_empty()))
         && (filter.q.is_empty() || llm_trace_matches_query(trace, &filter.q))
 }
 
