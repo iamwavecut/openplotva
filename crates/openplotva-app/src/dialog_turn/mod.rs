@@ -4,17 +4,20 @@
 //! structural: every dequeued dialog turn resolves to exactly one
 //! [`TurnResolution`] and `finalize_turn` is the only writer of job status,
 //! the `turn_outcome` job event, and the ledger row. Fully-silent completions
-//! are impossible — empty provider output is retryable.
+//! are impossible — empty provider output is retryable. Phase 3 adds the
+//! terminal user signal (reaction with text fallback) and in-process
+//! duplicate-answer regeneration.
 
 mod budget;
 mod engine;
 mod ledger;
 mod outcome;
+mod signal;
 
 pub use budget::{
     TURN_DEADLINE, TURN_STARTED_STAGE, TurnBudget, current_turn_deadline, turn_started_at,
 };
-pub use engine::TURN_OUTCOME_STAGE;
+pub use engine::{DIALOG_TURN_REGENERATE_STAGE, TURN_OUTCOME_STAGE};
 pub(crate) use engine::{TurnContext, execute_dialog_turn, finalize_turn};
 pub use ledger::{
     DialogTurnObserver, DialogTurnOutcomeRecord, PostgresDialogTurnOutcomeRecorder,
@@ -24,4 +27,10 @@ pub use ledger::{
 };
 pub use outcome::{
     JobDisposition, REASON_QUEUE_BACKLOG_EXPIRED, TurnOutcome, TurnResolution, UserSignalPlan,
+};
+pub use signal::{
+    DEFAULT_DIALOG_TERMINAL_REACTION_EMOJI, DEFAULT_DIALOG_TERMINAL_SIGNAL_MAX_AGE_SECS,
+    DispatcherTerminalUserSignal, SignalTarget, TERMINAL_REACTION_TIMEOUT,
+    TERMINAL_USER_SIGNAL_STAGE, TerminalUserSignal, TurnSignalPolicy, UserSignalFuture,
+    UserSignalResult,
 };

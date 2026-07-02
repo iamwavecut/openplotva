@@ -47,5 +47,8 @@ tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sig
 tracing.workspace = true
 url.workspace = true
 
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
 [lints]
 workspace = true

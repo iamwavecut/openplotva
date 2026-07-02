@@ -16,6 +16,9 @@ pub const SIDE_EFFECT_KIND_MUSIC: &str = "music_generation_job";
 
 const SIDE_EFFECT_STATE_QUEUED: &str = "queued";
 
+/// Anti-loop nudge appended to `reference_context` on duplicate regeneration.
+pub const ANTI_LOOP_HINT: &str = "Твой прошлый ответ уже отправлен в чат. Не повторяй его дословно — ответь на текущее сообщение заново, другими словами и по сути.";
+
 /// What the provider round actually produced, after outbound sanitization.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ReplyMaterial {

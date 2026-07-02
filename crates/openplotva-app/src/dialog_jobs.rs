@@ -63,6 +63,9 @@ pub const DEFAULT_DIALOG_TURN_BUDGET_SECS: i32 = 120;
 /// Default pending age beyond which never-processed dialog jobs are dropped
 /// (`DIALOG_TURN_MAX_QUEUE_AGE_SECS`).
 pub const DEFAULT_DIALOG_TURN_MAX_QUEUE_AGE_SECS: i32 = 600;
+/// Default in-process duplicate-answer regenerations per turn
+/// (`DIALOG_TURN_MAX_REGENERATIONS`).
+pub const DEFAULT_DIALOG_TURN_MAX_REGENERATIONS: i32 = 2;
 
 pub const DIALOG_JOB_WORKER_QUEUES: [&str; 2] = [DIALOG_AIFARM_QUEUE_NAME, TEXT_QUEUE_NAME];
 
@@ -150,6 +153,10 @@ pub struct DialogJobWorkerReport {
     /// answer, response, and queued tool material were all empty; the turn
     /// engine retries this class instead of completing silently.
     pub answer_empty_all_sources: bool,
+    /// In-process duplicate-answer regenerations performed this tick.
+    pub regenerations: i32,
+    /// Terminal user signal failed after reaction and fallback attempts.
+    pub user_signal_error: Option<String>,
 }
 
 /// Aggregate report for a long-running dialog taskman worker.
@@ -242,6 +249,10 @@ pub struct DialogJobWorkerLoopOptions<'a, Materializer: ?Sized, ToolHistory: ?Si
     pub turn_budget_secs: i32,
     /// Pending age in seconds beyond which never-processed jobs are dropped.
     pub turn_max_queue_age_secs: i32,
+    /// In-process duplicate-answer regenerations per turn.
+    pub max_regenerations: i32,
+    /// Terminal-failure user signal wiring (reaction with text fallback).
+    pub terminal_signal: crate::dialog_turn::TurnSignalPolicy<'a>,
 }
 
 /// True when the current UTC time is inside the daily `[start, end)` minute window,
@@ -863,9 +874,11 @@ where
             max_llm_job_attempts: DEFAULT_LLM_JOB_MAX_ATTEMPTS,
             turn_budget_secs: DEFAULT_DIALOG_TURN_BUDGET_SECS,
             turn_max_queue_age_secs: DEFAULT_DIALOG_TURN_MAX_QUEUE_AGE_SECS,
+            max_regenerations: DEFAULT_DIALOG_TURN_MAX_REGENERATIONS,
             now,
             routing_events: None,
             turn_outcomes: None,
+            terminal_signal: crate::dialog_turn::TurnSignalPolicy::default(),
         },
     )
     .await
@@ -877,9 +890,11 @@ struct DialogJobProcessOptions<'a> {
     max_llm_job_attempts: i32,
     turn_budget_secs: i32,
     turn_max_queue_age_secs: i32,
+    max_regenerations: i32,
     now: OffsetDateTime,
     routing_events: Option<&'a crate::runtime_routing::RoutingEventReporter>,
     turn_outcomes: Option<&'a crate::dialog_turn::DialogTurnObserver>,
+    terminal_signal: crate::dialog_turn::TurnSignalPolicy<'a>,
 }
 
 async fn process_dialog_job_once_in_queue_with_materializer_history_and_retry_at<
@@ -946,6 +961,7 @@ where
                 &budget,
                 options.now,
                 options.turn_outcomes,
+                options.terminal_signal,
                 &mut report,
             )
             .await;
@@ -964,6 +980,7 @@ where
             queue_name: options.queue_name,
             max_llm_job_attempts: options.max_llm_job_attempts,
             max_queue_age: TimeDuration::seconds(i64::from(options.turn_max_queue_age_secs.max(1))),
+            max_regenerations: options.max_regenerations,
             budget,
             now: options.now,
             routing_events: options.routing_events,
@@ -984,6 +1001,7 @@ where
         &budget,
         options.now,
         options.turn_outcomes,
+        options.terminal_signal,
         &mut report,
     )
     .await;
@@ -1053,6 +1071,8 @@ where
             max_llm_job_attempts: DEFAULT_LLM_JOB_MAX_ATTEMPTS,
             turn_budget_secs: DEFAULT_DIALOG_TURN_BUDGET_SECS,
             turn_max_queue_age_secs: DEFAULT_DIALOG_TURN_MAX_QUEUE_AGE_SECS,
+            max_regenerations: DEFAULT_DIALOG_TURN_MAX_REGENERATIONS,
+            terminal_signal: crate::dialog_turn::TurnSignalPolicy::default(),
         },
         stop,
     )
@@ -1101,9 +1121,11 @@ where
                             max_llm_job_attempts: options.max_llm_job_attempts,
                             turn_budget_secs: options.turn_budget_secs,
                             turn_max_queue_age_secs: options.turn_max_queue_age_secs,
+                            max_regenerations: options.max_regenerations,
                             now: OffsetDateTime::now_utc(),
                             routing_events: options.routing_events,
                             turn_outcomes: options.turn_outcomes,
+                            terminal_signal: options.terminal_signal,
                         },
                     ).await;
                     trace_dialog_job_tick(&tick);
@@ -1245,6 +1267,8 @@ where
             max_llm_job_attempts,
             turn_budget_secs: DEFAULT_DIALOG_TURN_BUDGET_SECS,
             turn_max_queue_age_secs: DEFAULT_DIALOG_TURN_MAX_QUEUE_AGE_SECS,
+            max_regenerations: DEFAULT_DIALOG_TURN_MAX_REGENERATIONS,
+            terminal_signal: crate::dialog_turn::TurnSignalPolicy::default(),
         },
         stop,
     )
@@ -2590,6 +2614,7 @@ fn trace_dialog_job_tick(tick: &DialogJobWorkerReport) {
         && tick.empty_answer_error.is_none()
         && tick.dialog_fallback_event_error.is_none()
         && tick.status_error.is_none()
+        && tick.user_signal_error.is_none()
     {
         return;
     }
@@ -2622,6 +2647,8 @@ fn trace_dialog_job_tick(tick: &DialogJobWorkerReport) {
         tool_call_history_error = tick.tool_call_history_error.as_deref(),
         dialog_fallback_event_error = tick.dialog_fallback_event_error.as_deref(),
         status_error = tick.status_error.as_deref(),
+        regenerations = tick.regenerations,
+        user_signal_error = tick.user_signal_error.as_deref(),
         "processed dialog taskman worker tick"
     );
 
@@ -2957,21 +2984,8 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn dialog_worker_suppresses_duplicate_answer_and_completes_job()
-    -> Result<(), Box<dyn Error>> {
-        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
-        let queue = InMemoryTaskQueue::new();
-        let job_id = queue.assign(
-            DIALOG_AIFARM_QUEUE_NAME,
-            new_dialog_job_at(dialog_params("что нового"), now),
-        );
-        let provider = ProviderStub::returning(DialogOutput {
-            answer: "  <i>Привет,   мир &amp; день!</i>  ".to_owned(),
-            ..DialogOutput::default()
-        });
-        let effects = EffectsStub::default();
-        let materializer = MaterializerStub::with_history(vec![
+    fn duplicate_guard_history_fixture() -> Vec<HistoryMessage> {
+        vec![
             HistoryMessage {
                 message_id: 30,
                 role: ROLE_USER.to_owned(),
@@ -2994,26 +3008,435 @@ mod tests {
                 text: "older bot reply".to_owned(),
                 ..HistoryMessage::default()
             },
-        ]);
+        ]
+    }
 
-        let report = process_dialog_job_once_in_queue_with_materializer_and_history_at(
-            &queue,
+    fn duplicate_answer_output() -> DialogOutput {
+        DialogOutput {
+            answer: "  <i>Привет,   мир &amp; день!</i>  ".to_owned(),
+            ..DialogOutput::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn dialog_worker_regenerates_duplicate_answer_with_anti_loop_hint()
+    -> Result<(), Box<dyn Error>> {
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let queue = InMemoryTaskQueue::new();
+        let job_id = queue.assign(
             DIALOG_AIFARM_QUEUE_NAME,
+            new_dialog_job_at(dialog_params("что нового"), now),
+        );
+        let provider = SequenceProviderStub::returning(vec![
+            duplicate_answer_output(),
+            DialogOutput {
+                answer: "Свежий ответ".to_owned(),
+                ..DialogOutput::default()
+            },
+        ]);
+        let effects = EffectsStub::default();
+        let materializer = MaterializerStub::with_history(duplicate_guard_history_fixture());
+        let outcomes = crate::dialog_turn::DialogTurnObserver::new(
+            crate::dialog_turn::RuntimeTurnOutcomeBuffer::new(8),
+            None,
+        );
+
+        let report = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+            &queue,
             &provider,
             &effects,
             &materializer,
-            &ToolHistoryStub::default(),
-            now,
+            &NoopDialogToolCallHistoryStore,
+            DialogJobProcessOptions {
+                queue_name: DIALOG_AIFARM_QUEUE_NAME,
+                max_llm_job_attempts: DEFAULT_LLM_JOB_MAX_ATTEMPTS,
+                turn_budget_secs: DEFAULT_DIALOG_TURN_BUDGET_SECS,
+                turn_max_queue_age_secs: DEFAULT_DIALOG_TURN_MAX_QUEUE_AGE_SECS,
+                max_regenerations: DEFAULT_DIALOG_TURN_MAX_REGENERATIONS,
+                terminal_signal: crate::dialog_turn::TurnSignalPolicy::default(),
+                now,
+                routing_events: None,
+                turn_outcomes: Some(&outcomes),
+            },
         )
         .await;
 
         assert_eq!(report.job_id, Some(job_id));
-        assert_eq!(report.suppressed_duplicate_message_id, Some(29));
-        assert!(!report.sent_answer);
-        assert!(effects.sent().is_empty());
+        assert_eq!(report.regenerations, 1);
+        assert_eq!(report.suppressed_duplicate_message_id, None);
+        assert!(report.sent_answer);
         assert!(report.completed);
         assert!(!report.failed);
+        assert_eq!(
+            effects.sent(),
+            vec![("что нового".to_owned(), "Свежий ответ".to_owned())]
+        );
+        let inputs = provider.inputs();
+        assert_eq!(inputs.len(), 2);
+        assert!(inputs[0].reference_context.is_empty());
+        assert_eq!(
+            inputs[1].reference_context,
+            vec![openplotva_dialog::turn::ANTI_LOOP_HINT.to_owned()]
+        );
         assert_eq!(record_status(&queue, job_id), JobStatus::Completed);
+        let record = queue.record(job_id).expect("job record");
+        let regen_events: Vec<_> = record
+            .events
+            .iter()
+            .filter(|event| event.stage == crate::dialog_turn::DIALOG_TURN_REGENERATE_STAGE)
+            .collect();
+        assert_eq!(regen_events.len(), 1);
+        assert_eq!(regen_events[0].attempt, 1);
+        assert_eq!(regen_events[0].data["reason"], "dedup_regenerate");
+        assert_eq!(regen_events[0].data["duplicate_message_id"], "29");
+        let rows = ledger_rows(&outcomes);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].outcome, "sent");
+        assert_eq!(rows[0].detail["regenerations"], 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dialog_worker_exhausts_regenerations_on_permanent_duplicate_and_signals()
+    -> Result<(), Box<dyn Error>> {
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let queue = InMemoryTaskQueue::new();
+        let job_id = queue.assign(
+            DIALOG_AIFARM_QUEUE_NAME,
+            new_dialog_job_at(dialog_params("что нового"), now),
+        );
+        let provider = SequenceProviderStub::returning(vec![duplicate_answer_output()]);
+        let effects = EffectsStub::default();
+        let materializer = MaterializerStub::with_history(duplicate_guard_history_fixture());
+        let signal = FakeSignal::default();
+        let outcomes = crate::dialog_turn::DialogTurnObserver::new(
+            crate::dialog_turn::RuntimeTurnOutcomeBuffer::new(8),
+            None,
+        );
+
+        let report = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+            &queue,
+            &provider,
+            &effects,
+            &materializer,
+            &NoopDialogToolCallHistoryStore,
+            DialogJobProcessOptions {
+                queue_name: DIALOG_AIFARM_QUEUE_NAME,
+                max_llm_job_attempts: DEFAULT_LLM_JOB_MAX_ATTEMPTS,
+                turn_budget_secs: DEFAULT_DIALOG_TURN_BUDGET_SECS,
+                turn_max_queue_age_secs: DEFAULT_DIALOG_TURN_MAX_QUEUE_AGE_SECS,
+                max_regenerations: DEFAULT_DIALOG_TURN_MAX_REGENERATIONS,
+                terminal_signal: crate::dialog_turn::TurnSignalPolicy::new(
+                    Some(&signal),
+                    "🤔",
+                    600,
+                ),
+                now,
+                routing_events: None,
+                turn_outcomes: Some(&outcomes),
+            },
+        )
+        .await;
+
+        assert_eq!(report.regenerations, 2);
+        assert_eq!(report.suppressed_duplicate_message_id, Some(29));
+        assert!(report.failed);
+        assert!(!report.completed);
+        assert!(!report.sent_answer);
+        assert!(effects.sent().is_empty());
+        assert_eq!(
+            provider.inputs().len(),
+            3,
+            "initial round + 2 regenerations"
+        );
+        assert_eq!(record_status(&queue, job_id), JobStatus::Failed);
+        let calls = signal.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].emoji, "🤔");
+        assert!(calls[0].text_fallback_allowed);
+        let record = queue.record(job_id).expect("job record");
+        let regen_events: Vec<_> = record
+            .events
+            .iter()
+            .filter(|event| event.stage == crate::dialog_turn::DIALOG_TURN_REGENERATE_STAGE)
+            .collect();
+        assert_eq!(regen_events.len(), 2);
+        assert!(
+            record
+                .events
+                .iter()
+                .any(|event| event.stage == crate::dialog_turn::TERMINAL_USER_SIGNAL_STAGE)
+        );
+        let rows = ledger_rows(&outcomes);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].outcome, "terminal_failed");
+        assert_eq!(rows[0].reason.as_deref(), Some("duplicate_exhausted"));
+        assert_eq!(rows[0].user_signal.as_deref(), Some("reaction_sent"));
+        assert_eq!(rows[0].detail["regenerations"], 2);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dialog_worker_skips_regeneration_when_budget_nearly_exhausted()
+    -> Result<(), Box<dyn Error>> {
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let queue = InMemoryTaskQueue::new();
+        let job_id = queue.assign(
+            DIALOG_AIFARM_QUEUE_NAME,
+            new_dialog_job_at(dialog_params("что нового"), now),
+        );
+        // Generation eats all but ~9s of the 120s budget, below the 10s
+        // regeneration floor: the duplicate goes terminal without a retry.
+        let provider = SlowProviderStub::new(duplicate_answer_output(), Duration::from_secs(111));
+        let effects = EffectsStub::default();
+        let materializer = MaterializerStub::with_history(duplicate_guard_history_fixture());
+        let signal = FakeSignal::default();
+        let outcomes = crate::dialog_turn::DialogTurnObserver::new(
+            crate::dialog_turn::RuntimeTurnOutcomeBuffer::new(8),
+            None,
+        );
+
+        let report = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+            &queue,
+            &provider,
+            &effects,
+            &materializer,
+            &NoopDialogToolCallHistoryStore,
+            DialogJobProcessOptions {
+                queue_name: DIALOG_AIFARM_QUEUE_NAME,
+                max_llm_job_attempts: DEFAULT_LLM_JOB_MAX_ATTEMPTS,
+                turn_budget_secs: DEFAULT_DIALOG_TURN_BUDGET_SECS,
+                turn_max_queue_age_secs: DEFAULT_DIALOG_TURN_MAX_QUEUE_AGE_SECS,
+                max_regenerations: DEFAULT_DIALOG_TURN_MAX_REGENERATIONS,
+                terminal_signal: crate::dialog_turn::TurnSignalPolicy::new(
+                    Some(&signal),
+                    "🤔",
+                    600,
+                ),
+                now,
+                routing_events: None,
+                turn_outcomes: Some(&outcomes),
+            },
+        )
+        .await;
+
+        assert_eq!(report.regenerations, 0);
+        assert!(report.failed);
+        assert_eq!(provider.call_count(), 1);
+        assert!(effects.sent().is_empty());
+        assert_eq!(record_status(&queue, job_id), JobStatus::Failed);
+        assert_eq!(signal.calls().len(), 1);
+        let record = queue.record(job_id).expect("job record");
+        assert!(
+            record
+                .events
+                .iter()
+                .all(|event| event.stage != crate::dialog_turn::DIALOG_TURN_REGENERATE_STAGE)
+        );
+        let rows = ledger_rows(&outcomes);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].reason.as_deref(), Some("duplicate_exhausted"));
+        assert_eq!(rows[0].user_signal.as_deref(), Some("reaction_sent"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dialog_worker_signals_terminal_failure_with_configured_emoji()
+    -> Result<(), Box<dyn Error>> {
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let queue = InMemoryTaskQueue::new();
+        let job_id = queue.assign(
+            DIALOG_AIFARM_QUEUE_NAME,
+            new_dialog_job_at(dialog_params("hello"), now),
+        );
+        let provider = ProviderStub::failing(io::Error::other("provider down"));
+        let effects = EffectsStub::default();
+        let signal = FakeSignal::default();
+        let outcomes = crate::dialog_turn::DialogTurnObserver::new(
+            crate::dialog_turn::RuntimeTurnOutcomeBuffer::new(8),
+            None,
+        );
+
+        let report = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+            &queue,
+            &provider,
+            &effects,
+            &BasicDialogInputMaterializer,
+            &NoopDialogToolCallHistoryStore,
+            DialogJobProcessOptions {
+                queue_name: DIALOG_AIFARM_QUEUE_NAME,
+                max_llm_job_attempts: DEFAULT_LLM_JOB_MAX_ATTEMPTS,
+                turn_budget_secs: DEFAULT_DIALOG_TURN_BUDGET_SECS,
+                turn_max_queue_age_secs: DEFAULT_DIALOG_TURN_MAX_QUEUE_AGE_SECS,
+                max_regenerations: DEFAULT_DIALOG_TURN_MAX_REGENERATIONS,
+                terminal_signal: crate::dialog_turn::TurnSignalPolicy::new(
+                    Some(&signal),
+                    "🤔",
+                    600,
+                ),
+                now,
+                routing_events: None,
+                turn_outcomes: Some(&outcomes),
+            },
+        )
+        .await;
+
+        assert!(report.failed);
+        let calls = signal.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].chat_id, 42);
+        assert_eq!(calls[0].thread_id, Some(9));
+        assert_eq!(calls[0].message_id, 100);
+        assert_eq!(calls[0].emoji, "🤔");
+        assert!(calls[0].text_fallback_allowed);
+        let record = queue.record(job_id).expect("job record");
+        let marker = record
+            .events
+            .iter()
+            .find(|event| event.stage == crate::dialog_turn::TERMINAL_USER_SIGNAL_STAGE)
+            .expect("terminal user signal marker");
+        assert_eq!(marker.data["result"], "reaction_sent");
+        assert_eq!(marker.data["emoji"], "🤔");
+        let outcome_event = record
+            .events
+            .iter()
+            .find(|event| event.stage == crate::dialog_turn::TURN_OUTCOME_STAGE)
+            .expect("turn outcome event");
+        assert_eq!(outcome_event.data["user_signal"], "reaction_sent");
+        let rows = ledger_rows(&outcomes);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].outcome, "terminal_failed");
+        assert_eq!(rows[0].user_signal.as_deref(), Some("reaction_sent"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dialog_worker_skips_signal_for_job_older_than_max_signal_age()
+    -> Result<(), Box<dyn Error>> {
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        // Old enough to be past the signal age gate, with a recent processing
+        // anchor so the turn itself still runs (post-downtime backlog shape).
+        let created = now - TimeDuration::seconds(700);
+        let queue = InMemoryTaskQueue::new();
+        let job_id = queue.assign(
+            DIALOG_AIFARM_QUEUE_NAME,
+            new_dialog_job_at(dialog_params("hello"), created),
+        );
+        queue.append_job_event(
+            job_id,
+            TaskQueueJobEvent {
+                stage: crate::dialog_turn::TURN_STARTED_STAGE.to_owned(),
+                ..TaskQueueJobEvent::default()
+            },
+            now - TimeDuration::seconds(30),
+        )?;
+        let provider = ProviderStub::failing(io::Error::other("provider down"));
+        let effects = EffectsStub::default();
+        let signal = FakeSignal::default();
+        let outcomes = crate::dialog_turn::DialogTurnObserver::new(
+            crate::dialog_turn::RuntimeTurnOutcomeBuffer::new(8),
+            None,
+        );
+
+        let report = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+            &queue,
+            &provider,
+            &effects,
+            &BasicDialogInputMaterializer,
+            &NoopDialogToolCallHistoryStore,
+            DialogJobProcessOptions {
+                queue_name: DIALOG_AIFARM_QUEUE_NAME,
+                max_llm_job_attempts: DEFAULT_LLM_JOB_MAX_ATTEMPTS,
+                turn_budget_secs: DEFAULT_DIALOG_TURN_BUDGET_SECS,
+                turn_max_queue_age_secs: DEFAULT_DIALOG_TURN_MAX_QUEUE_AGE_SECS,
+                max_regenerations: DEFAULT_DIALOG_TURN_MAX_REGENERATIONS,
+                terminal_signal: crate::dialog_turn::TurnSignalPolicy::new(
+                    Some(&signal),
+                    "🤔",
+                    600,
+                ),
+                now,
+                routing_events: None,
+                turn_outcomes: Some(&outcomes),
+            },
+        )
+        .await;
+
+        assert!(report.failed);
+        assert!(signal.calls().is_empty(), "no reaction on stale backlog");
+        let record = queue.record(job_id).expect("job record");
+        assert!(
+            record
+                .events
+                .iter()
+                .all(|event| event.stage != crate::dialog_turn::TERMINAL_USER_SIGNAL_STAGE)
+        );
+        let rows = ledger_rows(&outcomes);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].user_signal.as_deref(), Some("skipped_too_old"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dialog_worker_still_reacts_but_gates_text_fallback_after_prior_signal()
+    -> Result<(), Box<dyn Error>> {
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let queue = InMemoryTaskQueue::new();
+        let job_id = queue.assign(
+            DIALOG_AIFARM_QUEUE_NAME,
+            new_dialog_job_at(dialog_params("hello"), now),
+        );
+        // A previous run delivered the signal before its status write failed.
+        queue.append_job_event(
+            job_id,
+            TaskQueueJobEvent {
+                stage: crate::dialog_turn::TERMINAL_USER_SIGNAL_STAGE.to_owned(),
+                ..TaskQueueJobEvent::default()
+            },
+            now - TimeDuration::seconds(5),
+        )?;
+        let provider = ProviderStub::failing(io::Error::other("provider down"));
+        let effects = EffectsStub::default();
+        let signal = FakeSignal::default();
+
+        let report = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+            &queue,
+            &provider,
+            &effects,
+            &BasicDialogInputMaterializer,
+            &NoopDialogToolCallHistoryStore,
+            DialogJobProcessOptions {
+                queue_name: DIALOG_AIFARM_QUEUE_NAME,
+                max_llm_job_attempts: DEFAULT_LLM_JOB_MAX_ATTEMPTS,
+                turn_budget_secs: DEFAULT_DIALOG_TURN_BUDGET_SECS,
+                turn_max_queue_age_secs: DEFAULT_DIALOG_TURN_MAX_QUEUE_AGE_SECS,
+                max_regenerations: DEFAULT_DIALOG_TURN_MAX_REGENERATIONS,
+                terminal_signal: crate::dialog_turn::TurnSignalPolicy::new(
+                    Some(&signal),
+                    "🤔",
+                    600,
+                ),
+                now,
+                routing_events: None,
+                turn_outcomes: None,
+            },
+        )
+        .await;
+
+        assert!(report.failed);
+        let calls = signal.calls();
+        assert_eq!(calls.len(), 1, "reaction is re-attempted (idempotent)");
+        assert!(
+            !calls[0].text_fallback_allowed,
+            "marker gates the non-idempotent text fallback"
+        );
+        let record = queue.record(job_id).expect("job record");
+        let markers = record
+            .events
+            .iter()
+            .filter(|event| event.stage == crate::dialog_turn::TERMINAL_USER_SIGNAL_STAGE)
+            .count();
+        assert_eq!(markers, 1, "marker is not duplicated");
         Ok(())
     }
 
@@ -3048,6 +3471,8 @@ mod tests {
                 max_llm_job_attempts: 1,
                 turn_budget_secs: DEFAULT_DIALOG_TURN_BUDGET_SECS,
                 turn_max_queue_age_secs: DEFAULT_DIALOG_TURN_MAX_QUEUE_AGE_SECS,
+                max_regenerations: DEFAULT_DIALOG_TURN_MAX_REGENERATIONS,
+                terminal_signal: crate::dialog_turn::TurnSignalPolicy::default(),
                 now,
                 routing_events: None,
                 turn_outcomes: Some(&outcomes),
@@ -3157,6 +3582,8 @@ mod tests {
                 max_llm_job_attempts: DEFAULT_LLM_JOB_MAX_ATTEMPTS,
                 turn_budget_secs: DEFAULT_DIALOG_TURN_BUDGET_SECS,
                 turn_max_queue_age_secs: DEFAULT_DIALOG_TURN_MAX_QUEUE_AGE_SECS,
+                max_regenerations: DEFAULT_DIALOG_TURN_MAX_REGENERATIONS,
+                terminal_signal: crate::dialog_turn::TurnSignalPolicy::default(),
                 now,
                 routing_events: None,
                 turn_outcomes: Some(&outcomes),
@@ -3267,6 +3694,8 @@ mod tests {
                 max_llm_job_attempts: DEFAULT_LLM_JOB_MAX_ATTEMPTS,
                 turn_budget_secs: DEFAULT_DIALOG_TURN_BUDGET_SECS,
                 turn_max_queue_age_secs: DEFAULT_DIALOG_TURN_MAX_QUEUE_AGE_SECS,
+                max_regenerations: DEFAULT_DIALOG_TURN_MAX_REGENERATIONS,
+                terminal_signal: crate::dialog_turn::TurnSignalPolicy::default(),
                 now,
                 routing_events: None,
                 turn_outcomes: Some(&outcomes),
@@ -3315,6 +3744,8 @@ mod tests {
             max_llm_job_attempts: 2,
             turn_budget_secs: DEFAULT_DIALOG_TURN_BUDGET_SECS,
             turn_max_queue_age_secs: DEFAULT_DIALOG_TURN_MAX_QUEUE_AGE_SECS,
+            max_regenerations: DEFAULT_DIALOG_TURN_MAX_REGENERATIONS,
+            terminal_signal: crate::dialog_turn::TurnSignalPolicy::default(),
             now,
             routing_events: None,
             turn_outcomes: Some(&outcomes),
@@ -3386,6 +3817,8 @@ mod tests {
             max_llm_job_attempts: 2,
             turn_budget_secs: DEFAULT_DIALOG_TURN_BUDGET_SECS,
             turn_max_queue_age_secs: DEFAULT_DIALOG_TURN_MAX_QUEUE_AGE_SECS,
+            max_regenerations: DEFAULT_DIALOG_TURN_MAX_REGENERATIONS,
+            terminal_signal: crate::dialog_turn::TurnSignalPolicy::default(),
             now,
             routing_events: None,
             turn_outcomes: Some(&outcomes),
@@ -3737,6 +4170,8 @@ mod tests {
                 max_llm_job_attempts: DEFAULT_LLM_JOB_MAX_ATTEMPTS,
                 turn_budget_secs: DEFAULT_DIALOG_TURN_BUDGET_SECS,
                 turn_max_queue_age_secs: DEFAULT_DIALOG_TURN_MAX_QUEUE_AGE_SECS,
+                max_regenerations: DEFAULT_DIALOG_TURN_MAX_REGENERATIONS,
+                terminal_signal: crate::dialog_turn::TurnSignalPolicy::default(),
                 now,
                 routing_events: Some(&reporter),
                 turn_outcomes: None,
@@ -3810,6 +4245,8 @@ mod tests {
                 max_llm_job_attempts: 2,
                 turn_budget_secs: DEFAULT_DIALOG_TURN_BUDGET_SECS,
                 turn_max_queue_age_secs: DEFAULT_DIALOG_TURN_MAX_QUEUE_AGE_SECS,
+                max_regenerations: DEFAULT_DIALOG_TURN_MAX_REGENERATIONS,
+                terminal_signal: crate::dialog_turn::TurnSignalPolicy::default(),
                 now,
                 routing_events: None,
                 turn_outcomes: None,
@@ -3830,6 +4267,8 @@ mod tests {
                 max_llm_job_attempts: 2,
                 turn_budget_secs: DEFAULT_DIALOG_TURN_BUDGET_SECS,
                 turn_max_queue_age_secs: DEFAULT_DIALOG_TURN_MAX_QUEUE_AGE_SECS,
+                max_regenerations: DEFAULT_DIALOG_TURN_MAX_REGENERATIONS,
+                terminal_signal: crate::dialog_turn::TurnSignalPolicy::default(),
                 now,
                 routing_events: None,
                 turn_outcomes: None,
@@ -4209,6 +4648,126 @@ mod tests {
                         Err(error)
                     }
                 }
+            })
+        }
+    }
+
+    /// Provider returning scripted outputs in order, repeating the last one.
+    #[derive(Clone)]
+    struct SequenceProviderStub {
+        state: Arc<Mutex<SequenceProviderState>>,
+    }
+
+    struct SequenceProviderState {
+        outputs: Vec<DialogOutput>,
+        inputs: Vec<DialogInput>,
+    }
+
+    impl SequenceProviderStub {
+        fn returning(outputs: Vec<DialogOutput>) -> Self {
+            assert!(!outputs.is_empty(), "sequence provider needs outputs");
+            Self {
+                state: Arc::new(Mutex::new(SequenceProviderState {
+                    outputs,
+                    inputs: Vec::new(),
+                })),
+            }
+        }
+
+        fn inputs(&self) -> Vec<DialogInput> {
+            self.state.lock().expect("provider state").inputs.clone()
+        }
+    }
+
+    impl ChatProvider for SequenceProviderStub {
+        fn provider_name(&self) -> &str {
+            "stub"
+        }
+
+        fn run_dialog<'a>(&'a self, input: DialogInput) -> ChatProviderFuture<'a> {
+            Box::pin(async move {
+                let mut state = self.state.lock().expect("provider state");
+                let round = state.inputs.len();
+                state.inputs.push(input);
+                let index = round.min(state.outputs.len() - 1);
+                Ok(state.outputs[index].clone())
+            })
+        }
+    }
+
+    /// Provider that consumes (paused) tokio time before answering, so tests
+    /// can drive the budget without real waiting.
+    struct SlowProviderStub {
+        output: DialogOutput,
+        delay: Duration,
+        calls: Arc<Mutex<usize>>,
+    }
+
+    impl SlowProviderStub {
+        fn new(output: DialogOutput, delay: Duration) -> Self {
+            Self {
+                output,
+                delay,
+                calls: Arc::new(Mutex::new(0)),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            *self.calls.lock().expect("slow provider calls")
+        }
+    }
+
+    impl ChatProvider for SlowProviderStub {
+        fn provider_name(&self) -> &str {
+            "stub"
+        }
+
+        fn run_dialog<'a>(&'a self, _input: DialogInput) -> ChatProviderFuture<'a> {
+            Box::pin(async move {
+                *self.calls.lock().expect("slow provider calls") += 1;
+                tokio::time::sleep(self.delay).await;
+                Ok(self.output.clone())
+            })
+        }
+    }
+
+    /// Recording terminal user signal with a scripted result.
+    #[derive(Clone)]
+    struct FakeSignal {
+        state: Arc<Mutex<FakeSignalState>>,
+    }
+
+    struct FakeSignalState {
+        calls: Vec<crate::dialog_turn::SignalTarget>,
+        result: crate::dialog_turn::UserSignalResult,
+    }
+
+    impl Default for FakeSignal {
+        fn default() -> Self {
+            Self {
+                state: Arc::new(Mutex::new(FakeSignalState {
+                    calls: Vec::new(),
+                    result: crate::dialog_turn::UserSignalResult::ReactionSent,
+                })),
+            }
+        }
+    }
+
+    impl FakeSignal {
+        fn calls(&self) -> Vec<crate::dialog_turn::SignalTarget> {
+            self.state.lock().expect("signal state").calls.clone()
+        }
+    }
+
+    impl crate::dialog_turn::TerminalUserSignal for FakeSignal {
+        fn signal_turn_failure<'a>(
+            &'a self,
+            target: crate::dialog_turn::SignalTarget,
+        ) -> crate::dialog_turn::UserSignalFuture<'a> {
+            Box::pin(async move {
+                let mut state = self.state.lock().expect("signal state");
+                state.calls.push(target);
+                state.result.clone()
             })
         }
     }
