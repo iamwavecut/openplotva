@@ -465,6 +465,7 @@ where
 /// terminal user signal. Delivery obligations were already inserted by the
 /// schedulers at ticket-assignment time; finalize only annotates them with the
 /// dialog job id (best-effort).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn finalize_turn<Queue>(
     queue: &Queue,
     item: &DialogJobWorkItem,

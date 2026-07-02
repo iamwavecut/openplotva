@@ -50,7 +50,7 @@ futures-util = "0.3.31"
 image = { version = "0.25.10", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 opentelemetry = "0.32.0"
 pgvector = "0.4.1"
-quick-xml = { version = "0.40.1", features = ["serialize"] }
+quick-xml = { version = "0.41.0", features = ["serialize"] }
 rand = "0.10.1"
 redis = "1.2.1"
 regex = "1.12.3"

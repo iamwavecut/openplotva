@@ -84,47 +84,7 @@ pub fn is_content_blocked_error(err: &(dyn Error + 'static)) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
-
     use super::*;
-
-    #[derive(Default)]
-    struct FakeProvider {
-        name: &'static str,
-        result: Mutex<Option<Result<DialogOutput, ChatProviderError>>>,
-    }
-
-    impl FakeProvider {
-        fn ok(name: &'static str, output: DialogOutput) -> Arc<Self> {
-            Arc::new(Self {
-                name,
-                result: Mutex::new(Some(Ok(output))),
-            })
-        }
-
-        fn err(name: &'static str, err: ChatProviderError) -> Arc<Self> {
-            Arc::new(Self {
-                name,
-                result: Mutex::new(Some(Err(err))),
-            })
-        }
-    }
-
-    impl ChatProvider for FakeProvider {
-        fn provider_name(&self) -> &str {
-            self.name
-        }
-
-        fn run_dialog<'a>(&'a self, _input: DialogInput) -> ChatProviderFuture<'a> {
-            Box::pin(async move {
-                self.result
-                    .lock()
-                    .expect("provider result lock")
-                    .take()
-                    .expect("provider result configured")
-            })
-        }
-    }
 
     #[test]
     fn content_blocked_error_matches_go_text_and_message_fallback() {
