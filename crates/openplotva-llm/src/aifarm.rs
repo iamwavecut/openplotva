@@ -194,9 +194,26 @@ pub struct ChatCompletionRequest {
     /// Chat template kwargs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_template_kwargs: Option<Value>,
+    /// Literal `extra_body` passthrough. OpenAI SDK clients flatten
+    /// `extra_body` before sending, but closedrouter-style gateways
+    /// (vram.cloud) strip unknown top-level keys and instead unwrap this key
+    /// server-side — mirroring `chat_template_kwargs` here is the only way
+    /// thinking control reaches their template engine. Plain llama.cpp and
+    /// SGLang backends ignore the unknown key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_body: Option<Value>,
     /// Trace metadata for low-level call observation. Never serialized to the wire.
     #[serde(skip)]
     pub trace: Option<crate::trace::LlmCallTrace>,
+}
+
+impl ChatCompletionRequest {
+    /// Set `chat_template_kwargs` and mirror them into `extra_body` so the
+    /// setting survives gateways that drop unknown top-level fields.
+    pub fn set_chat_template_kwargs(&mut self, kwargs: Value) {
+        self.extra_body = Some(json!({ "chat_template_kwargs": kwargs.clone() }));
+        self.chat_template_kwargs = Some(kwargs);
+    }
 }
 
 /// AIFarm completion error.
@@ -1807,6 +1824,9 @@ where
             temperature: Some(request.temperature),
             include_reasoning: Some(false),
             chat_template_kwargs: Some(json!({ "enable_thinking": false })),
+            extra_body: Some(json!({
+                "chat_template_kwargs": { "enable_thinking": false },
+            })),
             ..ChatCompletionRequest::default()
         }
     }
@@ -1901,7 +1921,7 @@ where
             ..ChatCompletionRequest::default()
         };
         if let Some(enable_thinking) = self.cfg.enable_thinking {
-            request.chat_template_kwargs = Some(json!({ "enable_thinking": enable_thinking }));
+            request.set_chat_template_kwargs(json!({ "enable_thinking": enable_thinking }));
         }
         request
     }
@@ -1968,7 +1988,7 @@ where
             ..ChatCompletionRequest::default()
         };
         if let Some(enable_thinking) = self.cfg.enable_thinking {
-            request.chat_template_kwargs = Some(json!({ "enable_thinking": enable_thinking }));
+            request.set_chat_template_kwargs(json!({ "enable_thinking": enable_thinking }));
         }
         request
     }
@@ -2377,7 +2397,7 @@ where
             request.parallel_tool_calls = Some(false);
         }
         if let Some(enable_thinking) = input.enable_thinking.or(self.cfg.enable_thinking) {
-            request.chat_template_kwargs = Some(json!({ "enable_thinking": enable_thinking }));
+            request.set_chat_template_kwargs(json!({ "enable_thinking": enable_thinking }));
         }
         let docs_chars = input
             .reference_context
@@ -5763,6 +5783,10 @@ mod tests {
         assert_eq!(body["temperature"], 0.2);
         assert_eq!(body["include_reasoning"], false);
         assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+        assert_eq!(
+            body["extra_body"]["chat_template_kwargs"]["enable_thinking"],
+            false
+        );
         assert_eq!(body["messages"][0]["role"], "system");
         assert!(
             body["messages"][0]["content"]
@@ -5966,6 +5990,10 @@ mod tests {
         assert_eq!(body["temperature"], 0.2);
         assert_eq!(body["include_reasoning"], false);
         assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+        assert_eq!(
+            body["extra_body"]["chat_template_kwargs"]["enable_thinking"],
+            false
+        );
         assert_eq!(body["response_format"]["type"], "json_schema");
         assert_eq!(
             body["response_format"]["json_schema"]["name"],
@@ -6097,6 +6125,10 @@ mod tests {
         assert_eq!(body["temperature"], 0.5);
         assert_eq!(body["include_reasoning"], false);
         assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+        assert_eq!(
+            body["extra_body"]["chat_template_kwargs"]["enable_thinking"],
+            false
+        );
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(body["messages"][0]["content"], "optimize");
         assert_eq!(body["messages"][1]["role"], "user");
@@ -6610,6 +6642,10 @@ mod tests {
         assert_eq!(body["max_tokens"], 256);
         assert_eq!(body["include_reasoning"], false);
         assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+        assert_eq!(
+            body["extra_body"]["chat_template_kwargs"]["enable_thinking"],
+            false
+        );
         assert!(body.get("tools").is_none());
         Ok(())
     }
@@ -8032,6 +8068,9 @@ mod tests {
             dry_allowed_length: 2,
             include_reasoning: Some(false),
             chat_template_kwargs: Some(json!({"enable_thinking": false})),
+            extra_body: Some(json!({
+                "chat_template_kwargs": {"enable_thinking": false},
+            })),
             ..ChatCompletionRequest::default()
         };
 
@@ -8059,6 +8098,10 @@ mod tests {
         assert_eq!(
             direct.chat_template_kwargs,
             Some(json!({ "enable_thinking": false }))
+        );
+        assert_eq!(
+            direct.extra_body,
+            Some(json!({ "chat_template_kwargs": {"enable_thinking": false} }))
         );
         let body = serde_json::to_value(&direct).expect("direct request JSON");
         assert_eq!(body["top_k"], json!(20.0));
