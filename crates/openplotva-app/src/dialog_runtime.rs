@@ -113,6 +113,14 @@ impl ChatProvider for RouterChatProvider {
                         {
                             request.max_output_tokens = max_tokens;
                         }
+                        if let Some(enable_thinking) = attempt
+                            .overrides
+                            .extra
+                            .get("enable_thinking")
+                            .and_then(serde_json::Value::as_bool)
+                        {
+                            request.enable_thinking = Some(enable_thinking);
+                        }
                         async move {
                             match client.run_dialog(request).await {
                                 Ok(mut output) => {
@@ -193,6 +201,13 @@ fn vram_cloud_dialog_provider(
     config: &AppConfig,
     toolbox: Arc<dyn DialogToolbox>,
 ) -> Option<DialogProviderHandle> {
+    let cfg = vram_cloud_dialog_config(config)?;
+    Some(Arc::new(
+        AifarmDialogProvider::new(cfg).with_toolbox(toolbox),
+    ))
+}
+
+fn vram_cloud_dialog_config(config: &AppConfig) -> Option<AifarmDialogConfig> {
     let dialog = &config.llm.dialog;
     let model = dialog.aifarm_pool_models.first()?;
     let base = dialog.aifarm_pool_base_urls.first()?;
@@ -205,9 +220,11 @@ fn vram_cloud_dialog_provider(
     cfg.client.api_key = dialog.aifarm_pool_api_key.clone();
     cfg.client.default_model = model.clone();
     cfg.model = model.clone();
-    Some(Arc::new(
-        AifarmDialogProvider::new(cfg).with_toolbox(toolbox),
-    ))
+    // Pool models are reasoning models: the client ceiling must leave room for
+    // thinking tokens, or max_tokens_for_input clamps routing overrides back to
+    // the primary's small budget and the answer never materializes.
+    cfg.max_tokens = dialog.aifarm_pool_max_tokens;
+    Some(cfg)
 }
 
 fn qwen_reasoner_dialog_provider(
@@ -873,6 +890,74 @@ mod tests {
         let inputs = routed_provider.inputs();
         assert_eq!(inputs[0].model, "openrouter/provider/model");
         assert_eq!(inputs[0].max_output_tokens, 123);
+    }
+
+    #[tokio::test]
+    async fn router_chat_provider_applies_enable_thinking_override() {
+        let default_provider = Arc::new(SequencedProvider::new("unused", vec![]));
+        let routed_provider = Arc::new(SequencedProvider::new(
+            "aifarm",
+            vec![Ok(DialogOutput {
+                provider: "aifarm".to_owned(),
+                answer: "ok".to_owned(),
+                ..DialogOutput::default()
+            })],
+        ));
+        let routed_provider_dyn: DialogProviderHandle = routed_provider.clone();
+        let mut clients = HashMap::new();
+        clients.insert("aifarm".to_owned(), routed_provider_dyn);
+        let mut snapshot = routed_dialog_snapshot();
+        snapshot.assignments[0].inference_overrides =
+            json!({ "max_tokens": 4096, "enable_thinking": false });
+        let provider = router_provider_for_test(
+            snapshot,
+            default_provider,
+            clients,
+            crate::runtime_routing::RoutingEventReporter::new(
+                crate::runtime_routing::RoutingEventBuffer::new(8),
+                None,
+                None,
+                std::time::Duration::from_secs(600),
+            ),
+        );
+
+        let output = provider
+            .run_dialog(DialogInput::default())
+            .await
+            .expect("dialog output");
+
+        assert_eq!(output.answer, "ok");
+        let inputs = routed_provider.inputs();
+        assert_eq!(inputs[0].max_output_tokens, 4096);
+        assert_eq!(inputs[0].enable_thinking, Some(false));
+    }
+
+    #[test]
+    fn vram_cloud_dialog_config_uses_pool_reasoning_token_ceiling() {
+        let config = AppConfig::from_raw(openplotva_config::RawConfig {
+            dialog_aifarm_max_tokens: Some("1024".to_owned()),
+            dialog_aifarm_pool_models: Some("qwen3.6-27b".to_owned()),
+            dialog_aifarm_pool_base_urls: Some("https://pool.test/v1".to_owned()),
+            ..openplotva_config::RawConfig::default()
+        })
+        .expect("config");
+
+        let cfg = vram_cloud_dialog_config(&config).expect("pool config");
+
+        assert_eq!(cfg.provider_name, VRAM_CLOUD_PROVIDER_NAME);
+        assert_eq!(cfg.max_tokens, 16384);
+
+        let config = AppConfig::from_raw(openplotva_config::RawConfig {
+            dialog_aifarm_pool_models: Some("qwen3.6-27b".to_owned()),
+            dialog_aifarm_pool_base_urls: Some("https://pool.test/v1".to_owned()),
+            dialog_aifarm_pool_max_tokens: Some("8192".to_owned()),
+            ..openplotva_config::RawConfig::default()
+        })
+        .expect("config");
+
+        let cfg = vram_cloud_dialog_config(&config).expect("pool config");
+
+        assert_eq!(cfg.max_tokens, 8192);
     }
 
     #[test]
