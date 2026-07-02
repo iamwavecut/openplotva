@@ -317,10 +317,13 @@ async fn flush(pool: &PgPool, pending: &mut Vec<DialogTurnOutcomeRecord>) {
     }
 }
 
+// `push_values` emits the `VALUES` keyword itself, so the prefix must stop at
+// the column list; a trailing `VALUES` here produced `VALUES VALUES` and every
+// ledger insert failed silently.
 const SQL_INSERT_TURN_OUTCOMES_PREFIX: &str = "INSERT INTO dialog_turn_outcomes \
     (created_at, job_id, queue_name, chat_id, thread_id, user_id, trigger_message_id, \
      attempt, outcome, reason, provider, model, elapsed_ms, budget_ms, user_signal, \
-     sent_message_parts, side_effect_ticket_id, detail) VALUES";
+     sent_message_parts, side_effect_ticket_id, detail)";
 
 async fn insert_turn_outcomes(
     pool: &PgPool,
@@ -329,6 +332,12 @@ async fn insert_turn_outcomes(
     if records.is_empty() {
         return Ok(());
     }
+    let mut builder = build_insert_turn_outcomes(records);
+    builder.build().execute(pool).await?;
+    Ok(())
+}
+
+fn build_insert_turn_outcomes(records: &[DialogTurnOutcomeRecord]) -> QueryBuilder<Postgres> {
     let mut builder: QueryBuilder<Postgres> = QueryBuilder::new(SQL_INSERT_TURN_OUTCOMES_PREFIX);
     builder.push(" ");
     builder.push_values(records.iter(), |mut row, record| {
@@ -351,8 +360,7 @@ async fn insert_turn_outcomes(
             .push_bind(record.side_effect_ticket_id)
             .push_bind(sqlx::types::Json(record.detail.clone()));
     });
-    builder.build().execute(pool).await?;
-    Ok(())
+    builder
 }
 
 /// Delete ledger rows older than the retention window, in bounded batches.
@@ -380,6 +388,46 @@ pub async fn delete_old_turn_outcomes_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::Execute;
+
+    fn sample_record(job_id: i64, outcome: &str) -> DialogTurnOutcomeRecord {
+        DialogTurnOutcomeRecord {
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            job_id,
+            queue_name: "dialog-aifarm".to_owned(),
+            chat_id: Some(5),
+            thread_id: None,
+            user_id: None,
+            trigger_message_id: None,
+            attempt: 1,
+            outcome: outcome.to_owned(),
+            reason: None,
+            provider: None,
+            model: None,
+            elapsed_ms: None,
+            budget_ms: None,
+            user_signal: None,
+            sent_message_parts: None,
+            side_effect_ticket_id: None,
+            detail: Value::Object(serde_json::Map::new()),
+        }
+    }
+
+    #[test]
+    fn insert_query_emits_values_keyword_exactly_once() {
+        let records = vec![
+            sample_record(1, TURN_OUTCOME_SENT),
+            sample_record(2, TURN_OUTCOME_TERMINAL_FAILED),
+        ];
+        let mut builder = build_insert_turn_outcomes(&records);
+        let sql = builder.build().sql().as_str().to_owned();
+        assert_eq!(
+            sql.matches("VALUES").count(),
+            1,
+            "insert must stay syntactically valid: {sql}"
+        );
+        assert_eq!(sql.matches("($").count(), 2, "one tuple per record: {sql}");
+    }
 
     #[test]
     fn buffer_serves_filtered_outcomes_most_recent_first() {
