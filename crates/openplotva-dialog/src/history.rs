@@ -243,6 +243,14 @@ pub struct DialogInput {
     /// Whether tools are disabled.
     #[serde(default, rename = "DisableTools", skip_serializing_if = "is_false")]
     pub disable_tools: bool,
+    /// Per-request thinking override (routing-assignment scoped); providers
+    /// fall back to their configured default when unset.
+    #[serde(
+        default,
+        rename = "EnableThinking",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub enable_thinking: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]

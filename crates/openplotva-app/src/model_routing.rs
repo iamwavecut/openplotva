@@ -752,6 +752,71 @@ pub async fn backfill_genkit_flash_model(
     Ok(true)
 }
 
+const POOL_REASONING_BUDGET_KEY: &str = "llm.routing.pool_reasoning_budget";
+const POOL_REASONING_BUDGET_MAX_TOKENS: i64 = 16384;
+
+/// The pool serves reasoning models that spend thousands of tokens on thinking
+/// before emitting answer text; dialog assignments without an explicit budget
+/// inherit the primary's small `max_tokens` and finish with
+/// `finish_reason="length"` and empty content. Give every vram-cloud dialog
+/// assignment that lacks a `max_tokens` override room for the reasoning phase.
+/// Idempotent via the `pool_reasoning_budget` flag once the provider exists;
+/// operators keep per-model control through the Studio assignments editor.
+pub async fn backfill_pool_reasoning_budget(pool: &PgPool) -> Result<bool, StorageError> {
+    if app_setting_present(pool, POOL_REASONING_BUDGET_KEY).await? {
+        return Ok(false);
+    }
+    let provider_ids: std::collections::HashSet<i64> = list_providers(pool)
+        .await?
+        .into_iter()
+        .filter(|p| p.name == VRAM_CLOUD_PROVIDER)
+        .map(|p| p.id)
+        .collect();
+    if provider_ids.is_empty() {
+        // Pool not seeded yet; retry on a later boot instead of burning the flag.
+        return Ok(false);
+    }
+    let model_ids: std::collections::HashSet<i64> = list_models(pool)
+        .await?
+        .into_iter()
+        .filter(|m| provider_ids.contains(&m.provider_id))
+        .map(|m| m.id)
+        .collect();
+    let mut updated = 0usize;
+    for assignment in list_assignments(pool).await? {
+        if assignment.workflow_key != "dialog"
+            || !model_ids.contains(&assignment.provider_model_id)
+            || assignment
+                .inference_overrides
+                .get("max_tokens")
+                .is_some_and(|v| !v.is_null())
+        {
+            continue;
+        }
+        let mut input = assignment_input_from_record(&assignment, assignment.provider_model_id);
+        match &mut input.inference_overrides {
+            Value::Object(map) => {
+                map.insert(
+                    "max_tokens".to_owned(),
+                    json!(POOL_REASONING_BUDGET_MAX_TOKENS),
+                );
+            }
+            other => {
+                *other = json!({ "max_tokens": POOL_REASONING_BUDGET_MAX_TOKENS });
+            }
+        }
+        update_assignment(pool, assignment.id, &input).await?;
+        updated += 1;
+    }
+    mark_app_setting(pool, POOL_REASONING_BUDGET_KEY).await?;
+    tracing::info!(
+        updated,
+        max_tokens = POOL_REASONING_BUDGET_MAX_TOKENS,
+        "backfilled reasoning token budget onto vram-cloud dialog assignments"
+    );
+    Ok(true)
+}
+
 fn existing_provider_id(providers: &[ProviderRecord], name: &str) -> Option<i64> {
     providers
         .iter()

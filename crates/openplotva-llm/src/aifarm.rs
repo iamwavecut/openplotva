@@ -299,6 +299,12 @@ pub enum AifarmDialogError {
     /// Upstream final answer looked pathological.
     #[error("chat completion returned pathological final text: {0}")]
     FinalAnswerPathological(String),
+    /// Reasoning model spent the whole token budget thinking and produced no
+    /// final content (`finish_reason="length"` with only `reasoning_content`).
+    #[error(
+        "chat completion returned reasoning without final content ({reasoning_chars} reasoning chars)"
+    )]
+    ReasoningBudgetExhausted { reasoning_chars: usize },
     /// Native tool definitions failed to serialize.
     #[error("encode dialog tool definition: {0}")]
     ToolDefinition(serde_json::Error),
@@ -2371,7 +2377,7 @@ where
             request.tool_choice = Some(Value::String("auto".to_owned()));
             request.parallel_tool_calls = Some(false);
         }
-        if let Some(enable_thinking) = self.cfg.enable_thinking {
+        if let Some(enable_thinking) = input.enable_thinking.or(self.cfg.enable_thinking) {
             request.chat_template_kwargs = Some(json!({ "enable_thinking": enable_thinking }));
         }
         let docs_chars = input
@@ -3048,12 +3054,17 @@ fn aifarm_trace_usage(response: &Value) -> Option<DialogTraceUsage> {
             .get("prompt_tokens_details")
             .map(|details| json_i32(details, "cached_tokens"))
             .unwrap_or_default(),
+        thoughts_tokens: usage
+            .get("completion_tokens_details")
+            .map(|details| json_i32(details, "reasoning_tokens"))
+            .unwrap_or_default(),
         ..DialogTraceUsage::default()
     };
     (out.input_tokens != 0
         || out.output_tokens != 0
         || out.total_tokens != 0
-        || out.cached_tokens != 0)
+        || out.cached_tokens != 0
+        || out.thoughts_tokens != 0)
         .then_some(out)
 }
 
@@ -4372,11 +4383,37 @@ fn first_choice_content(response: &Value) -> Result<String, AifarmDialogError> {
         .trim()
         .to_owned();
     if content.is_empty() {
+        // Reasoning output must never be promoted into the answer, but a
+        // reasoning-only completion is a budget problem, not a protocol one:
+        // classify it so retries reselect a backend with headroom.
+        let reasoning_chars = first_choice_reasoning_len(message);
+        if reasoning_chars > 0 || first_choice_finish_reason(response) == "length" {
+            return Err(AifarmDialogError::ReasoningBudgetExhausted { reasoning_chars });
+        }
         return Err(AifarmDialogError::Response(
             "chat completion returned empty final text".to_owned(),
         ));
     }
     Ok(content)
+}
+
+fn first_choice_reasoning_len(message: &Value) -> usize {
+    ["reasoning_content", "reasoning"]
+        .iter()
+        .filter_map(|key| message.get(key).and_then(Value::as_str))
+        .map(|text| text.trim().len())
+        .max()
+        .unwrap_or(0)
+}
+
+fn first_choice_finish_reason(response: &Value) -> &str {
+    response
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("finish_reason"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
 }
 
 fn first_choice_message_value(response: &Value) -> Result<&Value, AifarmDialogError> {
@@ -4670,6 +4707,7 @@ fn is_retryable_final_answer_error(err: &AifarmDialogError) -> bool {
         AifarmDialogError::FinalAnswerContextLeak
             | AifarmDialogError::FinalAnswerProtocolOnly
             | AifarmDialogError::FinalAnswerPathological(_)
+            | AifarmDialogError::ReasoningBudgetExhausted { .. }
     )
 }
 
@@ -7481,6 +7519,85 @@ mod tests {
             retryable_reason(err.as_ref()),
             Some(FailureReason::ProviderUnavailable)
         );
+    }
+
+    #[test]
+    fn reasoning_only_completion_is_retryable_budget_exhausted() {
+        let err = extract_final_answer_for_provider(
+            &json!({
+                "choices": [{
+                    "finish_reason": "length",
+                    "message": {
+                        "content": "\n\n",
+                        "reasoning_content": "The user wants an image. Let me think about the prompt..."
+                    }
+                }]
+            }),
+            PROVIDER_AIFARM,
+        )
+        .expect_err("reasoning budget exhausted");
+
+        assert_eq!(
+            retryable_reason(err.as_ref()),
+            Some(FailureReason::ProviderUnavailable)
+        );
+        assert!(
+            err.to_string().contains("reasoning without final content"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn length_truncated_empty_completion_is_retryable_budget_exhausted() {
+        // Some backends drop reasoning_content from the final payload; an empty
+        // content with finish_reason="length" is still a burnt budget, not a
+        // protocol violation.
+        let err = extract_final_answer(&json!({
+            "choices": [{
+                "finish_reason": "length",
+                "message": { "content": "" }
+            }]
+        }))
+        .expect_err("length truncation");
+
+        assert!(matches!(
+            err,
+            AifarmDialogError::ReasoningBudgetExhausted { reasoning_chars: 0 }
+        ));
+    }
+
+    #[test]
+    fn aifarm_trace_usage_extracts_reasoning_tokens() {
+        let usage = aifarm_trace_usage(&json!({
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 1024,
+                "total_tokens": 1034,
+                "completion_tokens_details": { "reasoning_tokens": 1000 }
+            }
+        }))
+        .expect("usage");
+
+        assert_eq!(usage.thoughts_tokens, 1000);
+        assert_eq!(usage.output_tokens, 1024);
+    }
+
+    #[test]
+    fn dialog_request_prefers_input_enable_thinking_over_config() -> Result<(), AifarmDialogError> {
+        let provider = AifarmDialogProvider::with_transport(
+            AifarmDialogConfig::default(),
+            FakeTransport::new(Vec::new()),
+        );
+        let mut input = base_input();
+        input.enable_thinking = Some(true);
+
+        let request = provider.iteration_request(&input, 1)?;
+
+        assert_eq!(
+            request.chat_template_kwargs,
+            Some(json!({ "enable_thinking": true }))
+        );
+        Ok(())
     }
 
     #[test]

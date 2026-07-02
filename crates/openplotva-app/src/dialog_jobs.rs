@@ -1293,8 +1293,14 @@ fn dialog_job_is_stale(job: &StatelessJobItem, now: OffsetDateTime) -> bool {
     now - job.created >= dialog_job_response_max_age()
 }
 
+/// Dialog jobs outlive the 60s update-side-effect window by design: retryable
+/// provider failures requeue the job, and observed recovered retries finish at
+/// p95 ≈ 114s from creation. Keep this above the retry envelope so late
+/// attempts answer instead of completing silently as stale.
+const DIALOG_JOB_RESPONSE_MAX_AGE_SECS: i64 = 180;
+
 fn dialog_job_response_max_age() -> TimeDuration {
-    TimeDuration::seconds(openplotva_updates::UPDATE_SIDE_EFFECT_MAX_AGE.as_secs() as i64)
+    TimeDuration::seconds(DIALOG_JOB_RESPONSE_MAX_AGE_SECS)
 }
 
 #[must_use]

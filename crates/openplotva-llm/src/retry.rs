@@ -117,6 +117,13 @@ pub fn retryable_reason(err: &(dyn Error + 'static)) -> Option<FailureReason> {
     if let Some(provider_error) = find_provider_error(err) {
         return Some(provider_error.reason());
     }
+    // reqwest transport failures (connect, TLS, mid-body disconnects) stringify
+    // in ways the message rules can't enumerate; the typed variant is authoritative.
+    if let Some(crate::aifarm::AifarmClientError::Transport(_)) =
+        find_error::<crate::aifarm::AifarmClientError>(err)
+    {
+        return Some(FailureReason::ProviderUnavailable);
+    }
     retryable_reason_from_message(&err.to_string())
 }
 
@@ -149,10 +156,14 @@ pub fn retryable_reason_from_message(message: &str) -> Option<FailureReason> {
 }
 
 fn find_provider_error<'a>(err: &'a (dyn Error + 'static)) -> Option<&'a ProviderError> {
-    if let Some(provider_error) = err.downcast_ref::<ProviderError>() {
-        return Some(provider_error);
+    find_error::<ProviderError>(err)
+}
+
+fn find_error<'a, T: Error + 'static>(err: &'a (dyn Error + 'static)) -> Option<&'a T> {
+    if let Some(found) = err.downcast_ref::<T>() {
+        return Some(found);
     }
-    err.source().and_then(find_provider_error)
+    err.source().and_then(find_error::<T>)
 }
 
 const RETRYABLE_REJECT_PHRASES: &[&str] = &[
@@ -206,6 +217,9 @@ const RETRYABLE_MESSAGE_RULES: &[(FailureReason, &[&str])] = &[
             "connection refused",
             "connection reset",
             "error sending request for url",
+            "error decoding response body",
+            "connection closed before message completed",
+            "incomplete message",
             "bad gateway",
             "gateway timeout",
             "error 503",
@@ -299,6 +313,34 @@ mod tests {
             err.to_string(),
             "gemini provider provider_overloaded: status 503"
         );
+    }
+
+    #[test]
+    fn transport_client_error_is_retryable_via_typed_source() {
+        // Message deliberately matches no phrase rule: the typed variant alone
+        // must classify reqwest transport failures.
+        let err =
+            crate::aifarm::AifarmClientError::Transport("tls handshake eof mid-frame".to_owned());
+
+        assert_eq!(
+            retryable_reason(&err),
+            Some(FailureReason::ProviderUnavailable)
+        );
+    }
+
+    #[test]
+    fn transport_body_decode_messages_are_retryable() {
+        for message in [
+            "error decoding response body",
+            "connection closed before message completed",
+            "incomplete message",
+        ] {
+            assert_eq!(
+                retryable_reason_from_message(message),
+                Some(FailureReason::ProviderUnavailable),
+                "{message}"
+            );
+        }
     }
 
     #[test]
