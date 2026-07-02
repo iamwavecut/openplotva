@@ -1254,7 +1254,6 @@ mod tests {
             dialog_aifarm_workers: 2,
             dialog_workers_cap: 24,
             dialog_unpooled_share: 2,
-            dialog_aifarm_fallback_workers: 1,
             dialog_aifarm_fallback_high_watermark: 30,
             dialog_aifarm_fallback_low_watermark: 20,
             dialog_aifarm_fallback_poll_interval_seconds: 1,

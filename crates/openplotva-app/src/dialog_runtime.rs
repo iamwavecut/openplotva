@@ -19,7 +19,6 @@ use openplotva_llm::{
     retry::retryable_reason,
     router::{BreakerSet, PoolRegistry, RouterHandle, TriggerState},
     whitecircle::{WhiteCircleClientConfig, WhiteCirclePreToolConfig},
-    with_fallback,
 };
 use thiserror::Error;
 
@@ -464,8 +463,6 @@ pub enum DialogProviderBuildError {
         /// Provider name used in the model prefix.
         provider: &'static str,
     },
-    #[error("genkit fallback provider handle is required")]
-    GenkitFallbackProviderRequired,
     #[error("unsupported dialog provider {provider:?}")]
     Unsupported {
         /// Raw provider name after trimming/lowercasing.
@@ -473,36 +470,14 @@ pub enum DialogProviderBuildError {
     },
 }
 
-/// Build the currently configured dialog provider.
+/// Build the env-configured dialog provider directly, bypassing the DB router.
+/// Off the production path (dialog runs through [`router_dialog_provider`]);
+/// kept for provider-construction tests and the live provider smokes.
 pub fn dialog_provider_from_app_config(
     config: &AppConfig,
     toolbox: Arc<dyn DialogToolbox>,
 ) -> Result<DialogProviderHandle, DialogProviderBuildError> {
     primary_dialog_provider_from_app_config(config, toolbox)
-}
-
-pub fn dialog_provider_from_app_config_with_fallback(
-    config: &AppConfig,
-    toolbox: Arc<dyn DialogToolbox>,
-    fallback: Option<DialogProviderHandle>,
-) -> Result<DialogProviderHandle, DialogProviderBuildError> {
-    let provider = configured_dialog_provider_name(config);
-    let primary = primary_dialog_provider_from_app_config(config, Arc::clone(&toolbox))?;
-    if provider != PROVIDER_GENKIT
-        && config
-            .llm
-            .dialog
-            .fallback_provider
-            .trim()
-            .eq_ignore_ascii_case(PROVIDER_GENKIT)
-    {
-        let Some(fallback) = fallback else {
-            return Err(DialogProviderBuildError::GenkitFallbackProviderRequired);
-        };
-        return Ok(with_fallback(Some(primary), Some(fallback))
-            .expect("primary and fallback providers were supplied"));
-    }
-    Ok(primary)
 }
 
 pub fn genkit_dialog_provider_from_app_config(config: &AppConfig) -> Option<DialogProviderHandle> {
@@ -832,26 +807,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn dialog_provider_factory_attaches_supplied_genkit_fallback_when_configured() {
-        let config = AppConfig::from_raw(openplotva_config::RawConfig {
-            dialog_provider: Some("nvidia".to_owned()),
-            dialog_fallback_provider: Some(" GENKIT ".to_owned()),
-            ..openplotva_config::RawConfig::default()
-        })
-        .expect("config");
-        let toolbox: Arc<dyn DialogToolbox> = Arc::new(EmptyToolbox);
-        let fallback: DialogProviderHandle = Arc::new(EmptyProvider {
-            name: PROVIDER_GENKIT,
-        });
-
-        let provider =
-            dialog_provider_from_app_config_with_fallback(&config, toolbox, Some(fallback))
-                .expect("provider");
-
-        assert_eq!(provider.provider_name(), "nvidia+fallback:genkit");
-    }
-
     #[tokio::test]
     async fn router_chat_provider_emits_route_unavailable_without_default_fallback() {
         let default_provider = Arc::new(SequencedProvider::new(
@@ -1168,23 +1123,6 @@ mod tests {
         assert_eq!(cfg.provider_name, VRAM_CLOUD_PROVIDER_NAME);
         assert_eq!(cfg.max_tokens, 1024);
         assert_eq!(cfg.enable_thinking, Some(false));
-    }
-
-    #[test]
-    fn dialog_provider_factory_requires_real_genkit_fallback_handle() {
-        let config = AppConfig::from_raw(openplotva_config::RawConfig {
-            dialog_provider: Some("nvidia".to_owned()),
-            ..openplotva_config::RawConfig::default()
-        })
-        .expect("config");
-        let toolbox: Arc<dyn DialogToolbox> = Arc::new(EmptyToolbox);
-
-        let error = dialog_provider_from_app_config_with_fallback(&config, toolbox, None).err();
-
-        assert_eq!(
-            error,
-            Some(DialogProviderBuildError::GenkitFallbackProviderRequired)
-        );
     }
 
     #[test]

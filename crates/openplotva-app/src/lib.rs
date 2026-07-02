@@ -11208,27 +11208,24 @@ async fn start_runtime_workers(
         Some(routing_event_reporter.clone()),
     )) {
         Ok(mut dialog_provider) => {
-            if dialog_runtime::white_circle_effective_enabled(config) {
-                let white_circle_client = openplotva_llm::whitecircle::WhiteCircleClient::new(
-                    dialog_runtime::white_circle_client_config_from_app_config(config),
-                );
-                let (white_circle_recorder, white_circle_recorder_worker) =
+            // One shared check-event recorder serves both the REAL and the
+            // SAFE (virtual-dialog) WhiteCircle wraps.
+            let white_circle_recorder: Option<
+                Arc<dyn openplotva_llm::whitecircle::WhiteCircleCheckEventRecorder>,
+            > = if dialog_runtime::white_circle_effective_enabled(config) {
+                let (recorder, recorder_worker) =
                     runtime_safety::PostgresWhiteCircleCheckEventRecorder::spawn(
                         service_clients.postgres.clone(),
                         stop.subscribe(),
                     );
-                workers.handles.push(white_circle_recorder_worker);
-                let white_circle_recorder: Arc<
-                    dyn openplotva_llm::whitecircle::WhiteCircleCheckEventRecorder,
-                > = Arc::new(white_circle_recorder);
-                dialog_provider = Arc::new(
-                    openplotva_llm::whitecircle::WhiteCirclePreToolChatProvider::new(
-                        dialog_provider,
-                        white_circle_client,
-                        Some(white_circle_recorder),
-                        dialog_runtime::white_circle_pre_tool_config_from_app_config(config),
-                    ),
-                );
+                workers.handles.push(recorder_worker);
+                Some(Arc::new(recorder))
+            } else {
+                None
+            };
+            if let Some(recorder) = white_circle_recorder.clone() {
+                dialog_provider =
+                    wrap_dialog_provider_with_white_circle(dialog_provider, config, recorder);
             }
             // Trace rows are now emitted at the low-level model clients via the registered
             // RuntimeLlmObserver; the dialog provider is used directly (no tracing wrap).
@@ -11286,27 +11283,9 @@ async fn start_runtime_workers(
                 safe_genkit_fallback,
                 Some(routing_event_reporter.clone()),
             );
-            if dialog_runtime::white_circle_effective_enabled(config) {
-                let white_circle_client = openplotva_llm::whitecircle::WhiteCircleClient::new(
-                    dialog_runtime::white_circle_client_config_from_app_config(config),
-                );
-                let (white_circle_recorder, white_circle_recorder_worker) =
-                    runtime_safety::PostgresWhiteCircleCheckEventRecorder::spawn(
-                        service_clients.postgres.clone(),
-                        stop.subscribe(),
-                    );
-                workers.handles.push(white_circle_recorder_worker);
-                let white_circle_recorder: Arc<
-                    dyn openplotva_llm::whitecircle::WhiteCircleCheckEventRecorder,
-                > = Arc::new(white_circle_recorder);
-                safe_dialog_provider = Arc::new(
-                    openplotva_llm::whitecircle::WhiteCirclePreToolChatProvider::new(
-                        safe_dialog_provider,
-                        white_circle_client,
-                        Some(white_circle_recorder),
-                        dialog_runtime::white_circle_pre_tool_config_from_app_config(config),
-                    ),
-                );
+            if let Some(recorder) = white_circle_recorder {
+                safe_dialog_provider =
+                    wrap_dialog_provider_with_white_circle(safe_dialog_provider, config, recorder);
             }
             virtual_dialog_manager.set_executor(Arc::new(
                 runtime_virtual_dialog::RuntimeVirtualDialogExecutor::new(
@@ -12575,6 +12554,25 @@ async fn persist_shared_task_queue_on_shutdown(queue: task_queue::SharedTaskQueu
             );
         }
     }
+}
+
+/// Wrap a dialog provider with the WhiteCircle pre-tool safety gate, sharing
+/// the caller's check-event recorder.
+fn wrap_dialog_provider_with_white_circle(
+    provider: openplotva_llm::ChatProviderHandle,
+    config: &AppConfig,
+    recorder: Arc<dyn openplotva_llm::whitecircle::WhiteCircleCheckEventRecorder>,
+) -> openplotva_llm::ChatProviderHandle {
+    Arc::new(
+        openplotva_llm::whitecircle::WhiteCirclePreToolChatProvider::new(
+            provider,
+            openplotva_llm::whitecircle::WhiteCircleClient::new(
+                dialog_runtime::white_circle_client_config_from_app_config(config),
+            ),
+            Some(recorder),
+            dialog_runtime::white_circle_pre_tool_config_from_app_config(config),
+        ),
+    )
 }
 
 async fn wait_for_runtime_stop(mut stop: watch::Receiver<bool>) {

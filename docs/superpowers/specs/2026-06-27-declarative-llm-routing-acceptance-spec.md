@@ -295,17 +295,14 @@ Production rows must be verified before deleting bespoke fallback code.
 
 ## Cleanup After Parity
 
-After routed parity is verified, remove the obsolete fallback stack:
-
-- `POOL_*` runtime configuration
-- `AifarmHttpPoolClient`
-- `PooledClient`
-- `AifarmPoolConfig`
-- `PoolGatedFallbackChatProvider`
-- `DialogAifarmFallbackGate`
-- separate `dialog-aifarm` worker family and queue routing
-- config-only resolver paths made obsolete by declarative routing
-- dashboard `/admin/api/aifarm/pool*` endpoints and controls
+Done as of 2026-07-02: the obsolete fallback stack (`POOL_*` runtime
+configuration, `AifarmHttpPoolClient`, `PooledClient`, `AifarmPoolConfig`,
+`PoolGatedFallbackChatProvider`, `DialogAifarmFallbackGate`,
+`FallbackChatProvider`/`with_fallback`, the
+`PERSISTENT_QUEUE_DIALOG_AIFARM_FALLBACK_WORKERS` knob) has been removed.
+Capacity pools (`llm_capacity_pools`, migration 146) now model per-model
+parallelism; see
+`docs/superpowers/specs/2026-07-02-model-providers-capacity-pools-design.md`.
 
 Keep one dialog queue and one routing studio control surface.
 
