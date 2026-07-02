@@ -733,9 +733,6 @@ pub struct DialogConfig {
     pub aifarm_pool_models: Vec<String>,
     pub aifarm_pool_base_urls: Vec<String>,
     pub aifarm_pool_api_key: String,
-    /// Client-side max_tokens ceiling for pool models; sized for reasoning
-    /// models that spend thousands of tokens on thinking before the answer.
-    pub aifarm_pool_max_tokens: i32,
     pub aifarm_pool_primary_capacity_wait_ms: i32,
     /// Per-turn wall-clock budget in seconds, anchored at the job's first
     /// processing start, from `DIALOG_TURN_BUDGET_SECS`.
@@ -1152,8 +1149,6 @@ pub struct RawConfig {
     pub dialog_aifarm_pool_base_urls: Option<String>,
     /// `DIALOG_AIFARM_POOL_API_KEY`.
     pub dialog_aifarm_pool_api_key: Option<String>,
-    /// `DIALOG_AIFARM_POOL_MAX_TOKENS`.
-    pub dialog_aifarm_pool_max_tokens: Option<String>,
     /// `DIALOG_AIFARM_POOL_PRIMARY_CAPACITY_WAIT_MS`.
     pub dialog_aifarm_pool_primary_capacity_wait_ms: Option<String>,
     /// `DIALOG_TURN_BUDGET_SECS`.
@@ -2222,11 +2217,6 @@ impl AppConfig {
                     aifarm_pool_models: dialog_aifarm_pool_models,
                     aifarm_pool_base_urls: dialog_aifarm_pool_base_urls,
                     aifarm_pool_api_key: raw.dialog_aifarm_pool_api_key.unwrap_or_default(),
-                    aifarm_pool_max_tokens: parse_i32(
-                        "DIALOG_AIFARM_POOL_MAX_TOKENS",
-                        raw.dialog_aifarm_pool_max_tokens,
-                        16384,
-                    )?,
                     aifarm_pool_primary_capacity_wait_ms: parse_i32(
                         "DIALOG_AIFARM_POOL_PRIMARY_CAPACITY_WAIT_MS",
                         raw.dialog_aifarm_pool_primary_capacity_wait_ms,
@@ -2842,7 +2832,6 @@ impl RawConfig {
             dialog_aifarm_pool_models: env("DIALOG_AIFARM_POOL_MODELS"),
             dialog_aifarm_pool_base_urls: env("DIALOG_AIFARM_POOL_BASE_URLS"),
             dialog_aifarm_pool_api_key: env("DIALOG_AIFARM_POOL_API_KEY"),
-            dialog_aifarm_pool_max_tokens: env("DIALOG_AIFARM_POOL_MAX_TOKENS"),
             dialog_aifarm_pool_primary_capacity_wait_ms: env(
                 "DIALOG_AIFARM_POOL_PRIMARY_CAPACITY_WAIT_MS",
             ),
