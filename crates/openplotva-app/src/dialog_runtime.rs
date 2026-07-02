@@ -221,10 +221,6 @@ fn vram_cloud_dialog_config(config: &AppConfig) -> Option<AifarmDialogConfig> {
     cfg.client.api_key = dialog.aifarm_pool_api_key.clone();
     cfg.client.default_model = model.clone();
     cfg.model = model.clone();
-    // Pool models are reasoning models: the client ceiling must leave room for
-    // thinking tokens, or max_tokens_for_input clamps routing overrides back to
-    // the primary's small budget and the answer never materializes.
-    cfg.max_tokens = dialog.aifarm_pool_max_tokens;
     Some(cfg)
 }
 
@@ -977,7 +973,7 @@ mod tests {
     }
 
     #[test]
-    fn vram_cloud_dialog_config_uses_pool_reasoning_token_ceiling() {
+    fn vram_cloud_dialog_config_uses_standard_dialog_ceiling() {
         let config = AppConfig::from_raw(openplotva_config::RawConfig {
             dialog_aifarm_max_tokens: Some("1024".to_owned()),
             dialog_aifarm_pool_models: Some("qwen3.6-27b".to_owned()),
@@ -989,19 +985,8 @@ mod tests {
         let cfg = vram_cloud_dialog_config(&config).expect("pool config");
 
         assert_eq!(cfg.provider_name, VRAM_CLOUD_PROVIDER_NAME);
-        assert_eq!(cfg.max_tokens, 16384);
-
-        let config = AppConfig::from_raw(openplotva_config::RawConfig {
-            dialog_aifarm_pool_models: Some("qwen3.6-27b".to_owned()),
-            dialog_aifarm_pool_base_urls: Some("https://pool.test/v1".to_owned()),
-            dialog_aifarm_pool_max_tokens: Some("8192".to_owned()),
-            ..openplotva_config::RawConfig::default()
-        })
-        .expect("config");
-
-        let cfg = vram_cloud_dialog_config(&config).expect("pool config");
-
-        assert_eq!(cfg.max_tokens, 8192);
+        assert_eq!(cfg.max_tokens, 1024);
+        assert_eq!(cfg.enable_thinking, Some(false));
     }
 
     #[test]
