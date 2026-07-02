@@ -588,6 +588,11 @@ pub struct MemoryConsolidationQueueWorkerConfig {
     pub worker_id: String,
     /// Queue poll interval.
     pub interval: Duration,
+    /// Desired number of in-flight consolidation jobs. Each productive tick
+    /// tops the queue up toward this, so a parallel worker fleet ramps up
+    /// (1 → 2 → 4 → …) while runs remain and collapses to zero when they dry
+    /// up. `1` reproduces the historical strictly-sequential chain.
+    pub pipeline_target: usize,
 }
 
 /// Runtime API memory restart mutation adapter.
@@ -669,6 +674,7 @@ impl Default for MemoryConsolidationQueueWorkerConfig {
             process: MemoryRunProcessConfig::default(),
             worker_id: format!("{MEMORY_CONSOLIDATION_JOB_WORKER_PREFIX}-0"),
             interval: MEMORY_CONSOLIDATION_JOB_POLL_INTERVAL,
+            pipeline_target: 1,
         }
     }
 }
@@ -719,6 +725,7 @@ impl MemoryConsolidationQueueWorkerConfig {
             } else {
                 self.interval
             },
+            pipeline_target: self.pipeline_target.max(1),
         }
     }
 }
@@ -1233,6 +1240,7 @@ pub async fn process_memory_consolidation_taskman_job_once_at<Extractor, Store, 
     embedder: Option<&Embedder>,
     cfg: MemoryRunProcessConfig,
     worker_id: &str,
+    pipeline_target: usize,
     now: OffsetDateTime,
 ) -> MemoryConsolidationQueueWorkerReport
 where
@@ -1272,6 +1280,22 @@ where
                 );
                 report.scheduled_followup = true;
                 report.followup_job_id = Some(followup);
+                // Pipeline amplification: while runs keep coming, each
+                // productive tick adds one extra job until enough are in
+                // flight to feed every parallel worker. Unproductive ticks
+                // schedule nothing, so the pipeline drains itself dry.
+                if pipeline_target > 1 {
+                    let depth = queue.queue_depth(
+                        MEMORY_CONSOLIDATION_QUEUE_NAME,
+                        openplotva_taskman::LOWEST_PRIORITY,
+                    );
+                    if depth < pipeline_target {
+                        queue.assign(
+                            MEMORY_CONSOLIDATION_QUEUE_NAME,
+                            new_memory_consolidation_job_at(now),
+                        );
+                    }
+                }
             }
         }
         Err(MemoryRunProcessError::Process { source, .. }) => {
@@ -1325,6 +1349,7 @@ where
                     embedder,
                     cfg.process.clone(),
                     &cfg.worker_id,
+                    cfg.pipeline_target,
                     OffsetDateTime::now_utc(),
                 ).await;
                 tracing::debug!(?tick, "memory-consolidation taskman worker tick");
@@ -4872,6 +4897,7 @@ mod tests {
             Option::<&FakeEmbedder>::None,
             MemoryRunProcessConfig::default(),
             "memory-consolidation-worker-0",
+            1,
             now,
         )
         .await;
@@ -4900,6 +4926,64 @@ mod tests {
         assert_eq!(
             queue.record(2).expect("followup job").status,
             openplotva_taskman::JobStatus::Pending
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_taskman_pipeline_amplifies_toward_target_while_runs_flow() {
+        let now = utc_test_time(3, 17);
+        let run = openplotva_memory::Run {
+            id: 92,
+            chat_id: -100,
+            prompt_version: openplotva_memory::PROMPT_VERSION.to_owned(),
+            message_count: 1,
+            ..openplotva_memory::Run::default()
+        };
+        let store = FakeMemoryWriteStore {
+            ids: vec![920],
+            run: Mutex::new(Some(run)),
+            messages: Mutex::new(vec![openplotva_memory::Message {
+                entry_id: "msg:12".to_owned(),
+                message_id: 12,
+                user_id: 7,
+                sender_type: openplotva_core::SENDER_TYPE_USER.to_owned(),
+                text: "Bob likes parallel queues".to_owned(),
+                occurred_at: now,
+                ..openplotva_memory::Message::default()
+            }]),
+            ..FakeMemoryWriteStore::default()
+        };
+        let extractor = FakeMemoryExtractor {
+            output: ExtractOutput::default(),
+            inputs: Mutex::new(Vec::new()),
+        };
+        let queue = openplotva_taskman::InMemoryTaskQueue::new();
+        queue.assign(
+            openplotva_taskman::MEMORY_CONSOLIDATION_QUEUE_NAME,
+            openplotva_taskman::new_memory_consolidation_job_at(now),
+        );
+
+        let report = process_memory_consolidation_taskman_job_once_at(
+            &queue,
+            &extractor,
+            &store,
+            Option::<&FakeEmbedder>::None,
+            MemoryRunProcessConfig::default(),
+            "memory-consolidation-worker-0",
+            4,
+            now,
+        )
+        .await;
+
+        assert!(report.processed_run);
+        assert!(report.scheduled_followup);
+        assert_eq!(
+            queue.queue_depth(
+                openplotva_taskman::MEMORY_CONSOLIDATION_QUEUE_NAME,
+                openplotva_taskman::LOWEST_PRIORITY,
+            ),
+            2,
+            "a productive tick adds the followup plus one amplification job"
         );
     }
 
@@ -4937,6 +5021,7 @@ mod tests {
             Option::<&FakeEmbedder>::None,
             MemoryRunProcessConfig::default(),
             "memory-consolidation-worker-0",
+            1,
             now,
         )
         .await;

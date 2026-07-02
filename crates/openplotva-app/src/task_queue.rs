@@ -1261,6 +1261,7 @@ mod tests {
             image_vip_workers: 1,
             music_vip_workers: 1,
             memory_consolidation_workers: 1,
+            memory_workers_cap: 8,
             placeholder_cleanup_interval_seconds: 3600,
             placeholder_max_age_seconds: 7200,
             llm_job_max_attempts: 5,

@@ -9023,8 +9023,26 @@ fn dialog_memory_context_enabled(config: &AppConfig) -> bool {
     config.memory.enabled
 }
 
-fn effective_memory_consolidation_workers(configured_workers: i32) -> i32 {
-    configured_workers.clamp(0, 1)
+/// Memory-consolidation parallelism. Runs are claimed with
+/// `FOR UPDATE SKIP LOCKED` under a lease (one run = one chat window), so
+/// parallel workers safely chew different chats. The effective count follows
+/// the workflow's capacity pools — a pooled route (e.g. the 16-slot
+/// vram.cloud pool) invites parallel workers up to the cap, while an unpooled
+/// route keeps the configured count (historically one). `0` disables workers.
+fn effective_memory_consolidation_workers(
+    configured_workers: i32,
+    pool_derived: Option<u32>,
+    cap: i32,
+) -> i32 {
+    if configured_workers <= 0 {
+        return 0;
+    }
+    let cap = cap.max(1);
+    let derived = pool_derived
+        .and_then(|derived| i32::try_from(derived).ok())
+        .unwrap_or(1)
+        .clamp(1, cap);
+    configured_workers.max(derived)
 }
 
 fn admin_queue_config_from_app_config(config: &AppConfig) -> admin::AdminQueueCommandConfig {
@@ -10684,13 +10702,24 @@ async fn start_runtime_workers(
         workers.handles.push(memory_scheduler);
 
         let configured_memory_worker_count = config.persistent_queue.memory_consolidation_workers;
-        let memory_worker_count =
-            effective_memory_consolidation_workers(configured_memory_worker_count);
-        if configured_memory_worker_count > memory_worker_count {
-            tracing::warn!(
+        let memory_workers_cap = config.persistent_queue.memory_workers_cap.max(1);
+        let derived_memory_workers = openplotva_llm::router::derived_worker_count(
+            &router_handle.snapshot(),
+            "memory_consolidation",
+            1,
+            u32::try_from(memory_workers_cap).unwrap_or(1),
+        );
+        let memory_worker_count = effective_memory_consolidation_workers(
+            configured_memory_worker_count,
+            derived_memory_workers,
+            memory_workers_cap,
+        );
+        if memory_worker_count != configured_memory_worker_count {
+            tracing::info!(
                 configured_workers = configured_memory_worker_count,
                 effective_workers = memory_worker_count,
-                "memory-consolidation worker count clamped to one"
+                cap = memory_workers_cap,
+                "memory-consolidation worker count derived from capacity pools"
             );
         }
         for index in 0..memory_worker_count {
@@ -10718,6 +10747,7 @@ async fn start_runtime_workers(
                 .process,
                 worker_id: memory_worker_id.clone(),
                 interval: memory_runtime::MEMORY_CONSOLIDATION_JOB_POLL_INTERVAL,
+                pipeline_target: usize::try_from(memory_worker_count).unwrap_or(1),
             };
             let memory_worker_stop = stop.subscribe();
             let memory_worker = tokio::spawn(async move {
@@ -13204,10 +13234,16 @@ mod tests {
     }
 
     #[test]
-    fn memory_consolidation_worker_count_is_clamped_to_one() {
-        assert_eq!(effective_memory_consolidation_workers(0), 0);
-        assert_eq!(effective_memory_consolidation_workers(1), 1);
-        assert_eq!(effective_memory_consolidation_workers(8), 1);
+    fn memory_consolidation_worker_count_follows_pools() {
+        // Explicit zero disables workers regardless of pools.
+        assert_eq!(effective_memory_consolidation_workers(0, Some(16), 8), 0);
+        // Unpooled route (no derivation) keeps the configured count.
+        assert_eq!(effective_memory_consolidation_workers(1, None, 8), 1);
+        // A pooled route scales up to the cap.
+        assert_eq!(effective_memory_consolidation_workers(1, Some(16), 8), 8);
+        assert_eq!(effective_memory_consolidation_workers(1, Some(3), 8), 3);
+        // An explicit operator count above the derivation wins.
+        assert_eq!(effective_memory_consolidation_workers(12, Some(16), 8), 12);
     }
 
     #[test]

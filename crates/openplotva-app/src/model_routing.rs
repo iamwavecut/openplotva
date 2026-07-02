@@ -1478,6 +1478,116 @@ pub async fn backfill_capacity_pools(
     Ok(true)
 }
 
+const MEMORY_VRAM_POOL_KEY: &str = "llm.routing.memory_vram_pool_v1";
+const MEMORY_CONSOLIDATION_WORKFLOW: &str = "memory_consolidation";
+
+/// Route memory consolidation through the vram.cloud pool: its 16 parallel
+/// slots chew per-chat runs far faster than the single GPU2 model, and runs
+/// parallelize safely (claimed with `FOR UPDATE SKIP LOCKED`). The existing
+/// primaries (vibethinker) are demoted to the fallback tail, so consolidation
+/// still proceeds when the pool is saturated by dialog traffic. Config-only
+/// workflows pick the first live candidate, and the walker's busy-skip moves
+/// past a full pool, so ordering is: vram models first, old primary last.
+pub async fn backfill_memory_vram_pool(pool: &PgPool) -> Result<bool, StorageError> {
+    if app_setting_present(pool, MEMORY_VRAM_POOL_KEY).await? {
+        return Ok(false);
+    }
+    let providers = list_providers(pool).await?;
+    let Some(vram_provider_id) = existing_provider_id(&providers, VRAM_CLOUD_PROVIDER) else {
+        return Ok(false);
+    };
+    let models = list_models(pool).await?;
+    let mut vram_models: Vec<&ModelRecord> = models
+        .iter()
+        .filter(|model| model.provider_id == vram_provider_id && model.enabled)
+        .collect();
+    if vram_models.is_empty() {
+        return Ok(false);
+    }
+    // Largest model first: config-only routing uses the chain head.
+    vram_models.sort_by(|a, b| b.model_name.cmp(&a.model_name));
+
+    let assignments = list_assignments(pool).await?;
+    let next_fallback_order = assignments
+        .iter()
+        .filter(|a| {
+            a.workflow_key == MEMORY_CONSOLIDATION_WORKFLOW
+                && a.scope == "global"
+                && a.role == "fallback"
+        })
+        .filter_map(|a| a.fallback_order)
+        .max()
+        .map_or(0, |order| order + 1);
+    let mut demoted = 0;
+    for assignment in assignments.iter().filter(|a| {
+        a.workflow_key == MEMORY_CONSOLIDATION_WORKFLOW
+            && a.scope == "global"
+            && a.role == "primary"
+    }) {
+        if vram_models
+            .iter()
+            .any(|model| model.id == assignment.provider_model_id)
+        {
+            continue;
+        }
+        update_assignment(
+            pool,
+            assignment.id,
+            &AssignmentInput {
+                workflow_key: assignment.workflow_key.clone(),
+                scope: assignment.scope.clone(),
+                role: "fallback".to_owned(),
+                provider_model_id: assignment.provider_model_id,
+                weight: None,
+                fallback_order: Some(next_fallback_order + demoted),
+                canary_percent: assignment.canary_percent,
+                enabled: assignment.enabled,
+                inference_overrides: assignment.inference_overrides.clone(),
+                cb_failure_threshold: assignment.cb_failure_threshold,
+                cb_cooldown_ms: assignment.cb_cooldown_ms,
+            },
+        )
+        .await?;
+        demoted += 1;
+    }
+    let mut added = 0;
+    for model in &vram_models {
+        if assignment_exists(
+            &assignments,
+            MEMORY_CONSOLIDATION_WORKFLOW,
+            "primary",
+            model.id,
+        ) {
+            continue;
+        }
+        insert_assignment(
+            pool,
+            &AssignmentInput {
+                workflow_key: MEMORY_CONSOLIDATION_WORKFLOW.to_owned(),
+                scope: "global".to_owned(),
+                role: "primary".to_owned(),
+                provider_model_id: model.id,
+                weight: None,
+                fallback_order: None,
+                canary_percent: None,
+                enabled: true,
+                inference_overrides: json!({}),
+                cb_failure_threshold: 5,
+                cb_cooldown_ms: 30_000,
+            },
+        )
+        .await?;
+        added += 1;
+    }
+    mark_app_setting(pool, MEMORY_VRAM_POOL_KEY).await?;
+    tracing::info!(
+        added,
+        demoted,
+        "backfilled memory consolidation onto the vram.cloud pool"
+    );
+    Ok(true)
+}
+
 /// Everything the runtime rebuilds when the routing configuration changes:
 /// the published table, the capacity-pool registry, and (once wired) the
 /// derived dialog worker scale. Breakers/triggers are deliberately absent —

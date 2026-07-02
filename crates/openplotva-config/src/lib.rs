@@ -126,6 +126,8 @@ pub const DEFAULT_PERSISTENT_QUEUE_DIALOG_WORKERS_CAP: i32 = 24;
 
 pub const DEFAULT_PERSISTENT_QUEUE_DIALOG_UNPOOLED_SHARE: i32 = 2;
 
+pub const DEFAULT_PERSISTENT_QUEUE_MEMORY_WORKERS_CAP: i32 = 8;
+
 pub const DEFAULT_PERSISTENT_QUEUE_DIALOG_AIFARM_FALLBACK_HIGH_WATERMARK: i32 = 30;
 
 pub const DEFAULT_PERSISTENT_QUEUE_DIALOG_AIFARM_FALLBACK_LOW_WATERMARK: i32 = 20;
@@ -563,6 +565,8 @@ pub struct PersistentQueueConfig {
     pub music_vip_workers: i32,
     /// Worker count for the `memory-consolidation` queue.
     pub memory_consolidation_workers: i32,
+    /// Upper bound for the pool-derived memory-consolidation worker count.
+    pub memory_workers_cap: i32,
     /// Placeholder cleanup interval in seconds, from `PERSISTENT_QUEUE_PLACEHOLDER_CLEANUP_INTERVAL_SECONDS`.
     pub placeholder_cleanup_interval_seconds: i32,
     /// Placeholder max age in seconds, from `PERSISTENT_QUEUE_PLACEHOLDER_MAX_AGE_SECONDS`.
@@ -1056,6 +1060,7 @@ pub struct RawConfig {
     pub persistent_queue_music_vip_workers: Option<String>,
     /// `PERSISTENT_QUEUE_MEMORY_CONSOLIDATION_WORKERS`.
     pub persistent_queue_memory_consolidation_workers: Option<String>,
+    pub persistent_queue_memory_workers_cap: Option<String>,
     /// `PERSISTENT_QUEUE_PLACEHOLDER_CLEANUP_INTERVAL_SECONDS`.
     pub persistent_queue_placeholder_cleanup_interval_seconds: Option<String>,
     /// `PERSISTENT_QUEUE_PLACEHOLDER_MAX_AGE_SECONDS`.
@@ -1706,6 +1711,11 @@ impl AppConfig {
                 "PERSISTENT_QUEUE_MEMORY_CONSOLIDATION_WORKERS",
                 raw.persistent_queue_memory_consolidation_workers,
                 DEFAULT_PERSISTENT_QUEUE_MEMORY_CONSOLIDATION_WORKERS,
+            )?,
+            memory_workers_cap: parse_i32(
+                "PERSISTENT_QUEUE_MEMORY_WORKERS_CAP",
+                raw.persistent_queue_memory_workers_cap,
+                DEFAULT_PERSISTENT_QUEUE_MEMORY_WORKERS_CAP,
             )?,
             placeholder_cleanup_interval_seconds: parse_i32(
                 "PERSISTENT_QUEUE_PLACEHOLDER_CLEANUP_INTERVAL_SECONDS",
@@ -2778,6 +2788,7 @@ impl RawConfig {
             persistent_queue_image_regular_workers: env("PERSISTENT_QUEUE_IMAGE_REGULAR_WORKERS"),
             persistent_queue_image_vip_workers: env("PERSISTENT_QUEUE_IMAGE_VIP_WORKERS"),
             persistent_queue_music_vip_workers: env("PERSISTENT_QUEUE_MUSIC_VIP_WORKERS"),
+            persistent_queue_memory_workers_cap: env("PERSISTENT_QUEUE_MEMORY_WORKERS_CAP"),
             persistent_queue_memory_consolidation_workers: env(
                 "PERSISTENT_QUEUE_MEMORY_CONSOLIDATION_WORKERS",
             ),
