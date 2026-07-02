@@ -16,6 +16,10 @@ use serde_json::{Value, json};
 /// so it is bounded only by the request deadline and this sanity cap.
 const DEFAULT_MAX_SLOT_WAIT: Duration = Duration::from_secs(300);
 
+/// Minimum share of the caller's budget an attempt must have received for a
+/// deadline cut to count against the provider's circuit breaker.
+const ATTEMPT_BREAKER_MIN_SLICE: Duration = Duration::from_secs(30);
+
 #[derive(Clone)]
 pub struct RoutedAttemptWalker {
     handle: Arc<RouterHandle>,
@@ -103,6 +107,7 @@ impl RoutedAttemptWalker {
         let mut last_provider_model = None;
         let mut failed_attempts = 0usize;
         let mut last_reason = None;
+        let mut deadline_cut = false;
 
         // Selection-pass loop: walk a fresh chain, skipping candidates whose
         // capacity pool is full. A busy skip touches neither the breaker nor
@@ -198,7 +203,50 @@ impl RoutedAttemptWalker {
                 started_attempts += 1;
                 executed_this_pass += 1;
 
-                let result = execute(routed).await;
+                // A started attempt must not outlive the caller's deadline
+                // either: a hung provider connection otherwise pins the worker
+                // long past the turn budget (2026-07-02 latency incident).
+                let result = match context.deadline {
+                    Some(deadline) => {
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        match tokio::time::timeout(remaining, execute(routed)).await {
+                            Ok(result) => result,
+                            Err(_) => {
+                                drop(permit);
+                                // Charge the breaker only when the provider had
+                                // a meaningful slice of the budget; a fallback
+                                // handed the last few seconds of a turn is not
+                                // unhealthy, and penalizing it opens its circuit
+                                // in lockstep with a degraded primary.
+                                let charged = remaining >= ATTEMPT_BREAKER_MIN_SLICE;
+                                if charged {
+                                    self.breakers.record_failure(
+                                        attempt.provider,
+                                        attempt.model,
+                                        attempt.breaker,
+                                    );
+                                }
+                                failed_attempts += 1;
+                                last_reason = Some("attempt_deadline_exceeded".to_owned());
+                                deadline_cut = true;
+                                self.record_event(routing_event(
+                                    "attempt_deadline_exceeded",
+                                    &context,
+                                    Some(attempt.provider),
+                                    Some(attempt.model),
+                                    "attempt aborted at the caller deadline",
+                                    json!({
+                                        "failed_attempts": failed_attempts,
+                                        "attempt_slice_ms": remaining.as_millis(),
+                                        "breaker_charged": charged,
+                                    }),
+                                ));
+                                break 'passes;
+                            }
+                        }
+                    }
+                    None => execute(routed).await,
+                };
                 drop(permit);
                 match result {
                     Ok(output) => {
@@ -315,6 +363,10 @@ impl RoutedAttemptWalker {
         ));
         match last_error {
             Some(error) => Err(RoutedAttemptRunError::Attempt(error)),
+            None if deadline_cut => Err(RoutedAttemptRunError::Routing(RoutedRoutingError::new(
+                RoutedRoutingErrorKind::DeadlineExceeded,
+                "routed attempt exceeded the caller deadline",
+            ))),
             None => Err(RoutedAttemptRunError::Routing(RoutedRoutingError::new(
                 RoutedRoutingErrorKind::Exhausted,
                 "routed attempts exhausted",
@@ -396,6 +448,9 @@ pub enum RoutedRoutingErrorKind {
     RouteUnavailable,
     NoCandidates,
     Exhausted,
+    /// The in-flight attempt was aborted at the caller's deadline (turn
+    /// budget); the worker is freed instead of pinned by a hung connection.
+    DeadlineExceeded,
     /// Every candidate's capacity pool stayed full for the whole slot-wait
     /// budget. The `Display` message contains the phrase "capacity
     /// unavailable" on purpose: `retry.rs` message rules classify it as
@@ -746,6 +801,91 @@ mod tests {
 
         assert!(matches!(result, Err(RoutedAttemptRunError::Routing(_))));
         assert_eq!(calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn walker_aborts_an_in_flight_attempt_at_the_deadline_without_charging_a_tiny_slice() {
+        let mut snap = snapshot(json!({}), json!({}));
+        snap.assignments[0].cb_failure_threshold = 1;
+        let breakers = Arc::new(BreakerSet::new());
+        let walker = walker_with_breakers(snap, Arc::clone(&breakers));
+
+        let result = walker
+            .run(
+                RoutedRequestContext {
+                    workflow_key: "dialog".to_owned(),
+                    deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(5)),
+                    ..RoutedRequestContext::default()
+                },
+                |_attempt| std::future::pending::<Result<&str, std::io::Error>>(),
+                |_error| None,
+            )
+            .await;
+
+        match result {
+            Err(RoutedAttemptRunError::Routing(error)) => {
+                assert_eq!(error.kind(), RoutedRoutingErrorKind::DeadlineExceeded);
+                assert!(error.to_string().contains("deadline"), "{error}");
+            }
+            other => panic!("expected a deadline routing error, got {other:?}"),
+        }
+        assert!(
+            breakers.is_live_at(1, 10, Instant::now()),
+            "a five-second slice must not charge the breaker"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn walker_charges_the_breaker_when_a_deadline_cut_attempt_had_a_real_slice() {
+        let mut snap = snapshot(json!({}), json!({}));
+        snap.assignments[0].cb_failure_threshold = 1;
+        let breakers = Arc::new(BreakerSet::new());
+        let walker = walker_with_breakers(snap, Arc::clone(&breakers));
+
+        let result = walker
+            .run(
+                RoutedRequestContext {
+                    workflow_key: "dialog".to_owned(),
+                    deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(40)),
+                    ..RoutedRequestContext::default()
+                },
+                |_attempt| std::future::pending::<Result<&str, std::io::Error>>(),
+                |_error| None,
+            )
+            .await;
+
+        assert!(matches!(result, Err(RoutedAttemptRunError::Routing(_))));
+        assert!(
+            !breakers.is_live_at(1, 10, Instant::now()),
+            "a forty-second slice that never returned must open the breaker"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deadline_cut_attempt_returns_its_pool_permit() {
+        let mut snapshot = pooled_snapshot(3);
+        snapshot.models.truncate(1);
+        snapshot.assignments.truncate(1);
+        let pools = Arc::new(PoolRegistry::new());
+        let walker = walker_with_pools(&snapshot, Arc::clone(&pools));
+
+        let result = walker
+            .run(
+                RoutedRequestContext {
+                    workflow_key: "dialog".to_owned(),
+                    deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(5)),
+                    ..RoutedRequestContext::default()
+                },
+                |_attempt| std::future::pending::<Result<&str, std::io::Error>>(),
+                |_error| None,
+            )
+            .await;
+
+        assert!(matches!(result, Err(RoutedAttemptRunError::Routing(_))));
+        assert!(
+            pools.try_acquire(Some(1)).is_some(),
+            "the aborted attempt must free its slot"
+        );
     }
 
     #[tokio::test]
