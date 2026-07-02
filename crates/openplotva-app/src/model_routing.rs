@@ -12,8 +12,8 @@ use openplotva_config::AppConfig;
 use openplotva_llm::router::table::Role;
 use openplotva_llm::router::triggers::{TriggerCondition, TriggerSpec};
 use openplotva_llm::router::{
-    BreakerConfig, Candidate, InferenceOverrides, Kind, ModelRow, ProviderRow, RetryBudget,
-    RouterHandle, RoutingTable, Scope, WorkflowRoute,
+    BreakerConfig, Candidate, InferenceOverrides, Kind, ModelRow, PoolSpec, ProviderRow,
+    RetryBudget, RouterHandle, RoutingTable, Scope, WorkflowRoute,
 };
 use openplotva_storage::StorageError;
 use openplotva_storage::llm_routing::{
@@ -1572,11 +1572,26 @@ pub fn build_routing_table(snapshot: &RoutingSnapshot) -> RoutingTable {
                 base_url: record.base_url.clone(),
                 capabilities: record.capabilities.clone(),
                 embedding_dim: record.embedding_dim,
+                pool_id: record.pool_id,
                 enabled: record.enabled,
                 config: record.config.clone(),
             },
         );
     }
+
+    let pool_specs: HashMap<i64, PoolSpec> = snapshot
+        .pools
+        .iter()
+        .map(|pool| {
+            (
+                pool.id,
+                PoolSpec {
+                    id: pool.id,
+                    max_concurrency: pool.max_concurrency.and_then(|max| u32::try_from(max).ok()),
+                },
+            )
+        })
+        .collect();
 
     let workflows: HashMap<&str, &WorkflowRecord> = snapshot
         .workflows
@@ -1607,6 +1622,7 @@ pub fn build_routing_table(snapshot: &RoutingSnapshot) -> RoutingTable {
     }
 
     let mut table = RoutingTable::new(providers.clone(), model_rows);
+    table.set_pools(pool_specs);
 
     for (&(workflow_key, scope_str), assignments) in &by_key_scope {
         let Some(workflow) = workflows.get(workflow_key) else {

@@ -90,6 +90,29 @@ impl TriggerState {
         self.lock().contains(&id)
     }
 
+    /// Sorted ids of currently-engaged triggers, for the admin status endpoint.
+    #[must_use]
+    pub fn engaged_ids(&self) -> Vec<TriggerId> {
+        let mut ids: Vec<TriggerId> = self.lock().iter().copied().collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Targets currently marked capacity-constrained, with the time left on
+    /// each cooldown. Expired entries are pruned.
+    #[must_use]
+    pub fn capacity_snapshot_at(&self, now: Instant) -> Vec<(ProviderId, ModelId, Duration)> {
+        let mut guard = self.lock_capacity();
+        guard.retain(|_, until| *until > now);
+        let mut out: Vec<(ProviderId, ModelId, Duration)> = guard
+            .iter()
+            .map(|((provider, model), until)| (*provider, *model, *until - now))
+            .collect();
+        drop(guard);
+        out.sort_by_key(|(provider, model, _)| (*provider, *model));
+        out
+    }
+
     pub fn mark_capacity_unavailable(
         &self,
         provider: ProviderId,

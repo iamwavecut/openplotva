@@ -6,16 +6,18 @@
 //! carries no sqlx, no vendor SDKs, and no async — only the selection decision.
 
 pub mod breaker;
+pub mod capacity;
 pub mod handle;
 pub mod policy;
 pub mod table;
 pub mod triggers;
 
-pub use breaker::{BreakerConfig, BreakerLiveness, BreakerSet};
+pub use breaker::{BreakerConfig, BreakerLiveness, BreakerSet, BreakerStateView};
+pub use capacity::{PoolOccupancy, PoolPermit, PoolRegistry, PoolSpec, derived_worker_count};
 pub use handle::RouterHandle;
-pub use policy::{Attempt, Liveness, RetryBudget, TriggerView, select};
+pub use policy::{Attempt, Liveness, RetryBudget, TriggerView, select, select_chain};
 pub use table::{
-    Candidate, InferenceOverrides, Kind, ModelId, ModelRow, ProviderId, ProviderRow, Role,
+    Candidate, InferenceOverrides, Kind, ModelId, ModelRow, PoolId, ProviderId, ProviderRow, Role,
     RoutingTable, Scope, WorkflowRoute,
 };
 pub use triggers::{TriggerCondition, TriggerId, TriggerSpec, TriggerState};

@@ -16,6 +16,8 @@ use super::triggers::TriggerSpec;
 pub type ProviderId = i64;
 /// Stable database id of a provider-model row.
 pub type ModelId = i64;
+/// Stable database id of a capacity-pool row.
+pub type PoolId = i64;
 
 /// Transport kind; selects the data-plane adapter the executor dispatches to.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
@@ -152,6 +154,8 @@ pub struct ModelRow {
     pub base_url: Option<String>,
     pub capabilities: Vec<String>,
     pub embedding_dim: Option<i32>,
+    /// Capacity pool this model draws slots from; `None` = unpooled/unlimited.
+    pub pool_id: Option<PoolId>,
     pub enabled: bool,
     pub config: Value,
 }
@@ -169,6 +173,7 @@ pub struct RoutingTable {
     routes: HashMap<String, ScopedRoutes>,
     providers: HashMap<ProviderId, ProviderRow>,
     models: HashMap<ModelId, ModelRow>,
+    pools: HashMap<PoolId, super::capacity::PoolSpec>,
 }
 
 impl RoutingTable {
@@ -181,7 +186,24 @@ impl RoutingTable {
             routes: HashMap::new(),
             providers,
             models,
+            pools: HashMap::new(),
         }
+    }
+
+    /// Replace the capacity-pool specs carried by this snapshot.
+    pub fn set_pools(&mut self, pools: HashMap<PoolId, super::capacity::PoolSpec>) {
+        self.pools = pools;
+    }
+
+    #[must_use]
+    pub fn pool(&self, id: PoolId) -> Option<&super::capacity::PoolSpec> {
+        self.pools.get(&id)
+    }
+
+    /// The pool specs to reconcile the live registry with after a reload.
+    #[must_use]
+    pub fn pool_specs(&self) -> Vec<super::capacity::PoolSpec> {
+        self.pools.values().copied().collect()
     }
 
     /// Insert or replace the route for a (workflow, scope) pair.

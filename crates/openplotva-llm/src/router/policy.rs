@@ -65,7 +65,25 @@ pub trait TriggerView {
     fn engaged(&self, id: TriggerId) -> bool;
 }
 
-/// Build the ordered attempt chain for one request.
+/// Build the ordered attempt chain for one request, truncated to
+/// `retry.max_hops`. See [`select_chain`] for the ordering rules.
+#[must_use]
+pub fn select(
+    route: &WorkflowRoute,
+    liveness: &dyn Liveness,
+    triggers: &dyn TriggerView,
+    rng: &mut impl RngExt,
+) -> Vec<Attempt> {
+    let mut attempts = select_chain(route, liveness, triggers, rng);
+    let cap = route.retry.max_hops.max(1) as usize;
+    attempts.truncate(cap);
+    attempts
+}
+
+/// Build the full ordered attempt chain for one request, without the
+/// `max_hops` truncation. The capacity-aware executor walks this chain and
+/// budgets hops by attempts actually started, so a busy (pool-exhausted)
+/// candidate can be skipped without hiding a free candidate further down.
 ///
 /// Full-routing workflows: an optional canary (rolled by `canary_percent`), then
 /// a weighted random permutation of the live primaries plus any engaged-and-live
@@ -73,9 +91,9 @@ pub trait TriggerView {
 /// proportionally to the remaining live weights), then the ordered fallback tail,
 /// then any dead targets as last-resort half-open probes. Config-only workflows:
 /// the single primary plus the ordered fallback tail (live first), no weighting,
-/// no triggers, no canary. The chain is truncated to `retry.max_hops`.
+/// no triggers, no canary.
 #[must_use]
-pub fn select(
+pub fn select_chain(
     route: &WorkflowRoute,
     liveness: &dyn Liveness,
     triggers: &dyn TriggerView,
@@ -150,8 +168,6 @@ pub fn select(
         }
     });
 
-    let cap = route.retry.max_hops.max(1) as usize;
-    attempts.truncate(cap);
     attempts
 }
 
