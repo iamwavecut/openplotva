@@ -9761,6 +9761,13 @@ async fn start_runtime_workers(
         ));
         tracing::warn!(%error, "failed to backfill capacity pools");
     }
+    if let Err(error) = model_routing::backfill_memory_vram_pool(&service_clients.postgres).await {
+        routing_event_reporter.record(runtime_routing::routing_backfill_failed_event(
+            "backfill_memory_vram_pool",
+            &error.to_string(),
+        ));
+        tracing::warn!(%error, "failed to route memory consolidation onto the vram pool");
+    }
     let router_breakers = Arc::new(openplotva_llm::router::BreakerSet::new());
     let router_triggers = Arc::new(openplotva_llm::router::TriggerState::new());
     let router_pools = Arc::new(openplotva_llm::router::PoolRegistry::new());
