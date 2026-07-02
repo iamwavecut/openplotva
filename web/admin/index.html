@@ -1578,12 +1578,19 @@
             if (!mpState.statusUnavailable) chip.appendChild(mpSlotbarFor(poolId, size || 'mini'));
             return chip;
         }
+        // Mirrors policy.rs: the weighted permutation clamps every enabled
+        // primary's weight to at least 1, so a sole NULL/0-weight primary
+        // effectively serves 100% of the traffic, never 0%.
+        function mpEffectiveWeight(weight) { return Math.max(1, weight || 0); }
+        function mpEffectiveSharePct(entries, weight) {
+            const total = entries.reduce((s, e) => s + mpEffectiveWeight(e.weight), 0) || 1;
+            return (mpEffectiveWeight(weight) / total) * 100;
+        }
         function mpAllocBar(entries, big) {
             // entries: [{label, weight}]
-            const total = entries.reduce((s, e) => s + Math.max(0, e.weight || 0), 0) || 1;
             const bar = mpEl('div', { class: big ? 'mp-alloc mp-alloc--lg' : 'mp-alloc mp-alloc--mini' });
             entries.forEach((e, i) => {
-                const pct = (Math.max(0, e.weight || 0) / total) * 100;
+                const pct = mpEffectiveSharePct(entries, e.weight);
                 const seg = mpEl('div', { class: 'mp-seg mp-seg-' + (i % 6) });
                 seg.style.flexBasis = pct + '%';
                 seg.style.flexGrow = '0';
@@ -1670,8 +1677,7 @@
         function mpWorkflowCard(w) {
             const primaries = mpAssignments(w.key, 'global', 'primary').filter(a => a.enabled);
             const names = primaries.map(a => {
-                const total = primaries.reduce((s, x) => s + Math.max(0, x.weight || 0), 0) || 1;
-                const pct = Math.round((Math.max(0, a.weight || 0) / total) * 100);
+                const pct = Math.round(mpEffectiveSharePct(primaries, a.weight));
                 return mpModelLabel(a.provider_model_id) + ' ' + pct + '%';
             }).join(' · ');
             const badges = mpEl('span', { class: 'mp-wf-meta', 'data-mp-wf-badges': w.key });
@@ -1841,14 +1847,16 @@
                 mpClear(allocWrap);
                 const entries = primaries.map(a => ({ label: mpModelLabel(a.provider_model_id), weight: d.weights[a.id] || 0 }));
                 if (entries.length) allocWrap.appendChild(mpAllocBar(entries, true));
-                const total = entries.reduce((s, e) => s + Math.max(0, e.weight || 0), 0);
                 primaries.forEach(a => {
-                    const pct = total > 0 ? Math.round((Math.max(0, d.weights[a.id] || 0) / total) * 100) : 0;
+                    const pct = Math.round(mpEffectiveSharePct(entries, d.weights[a.id] || 0));
                     if (pctEls[a.id]) pctEls[a.id].textContent = (d.weights[a.id] || 0) + ' → ' + pct + '%';
                 });
                 const sum = Object.keys(d.weights).reduce((s, id) => s + (d.weights[id] || 0), 0);
                 sumVal.textContent = 'Σ ' + sum;
-                if (sum !== 100) sumWrap.setAttribute('data-warn', ''); else sumWrap.removeAttribute('data-warn');
+                // Config-only workflows ignore weights entirely; a Σ≠100 warning
+                // there is noise. Zero-weight rows still serve (clamped to ≥1).
+                if (w.full_routing && sum !== 100 && sum !== 0) sumWrap.setAttribute('data-warn', '');
+                else sumWrap.removeAttribute('data-warn');
                 saveBtn.disabled = !mpWeightsDirty();
                 resetBtn.disabled = !mpWeightsDirty();
             };
@@ -2979,7 +2987,10 @@
                 const wfId = 'wf:' + w.key;
                 addNode(wfId, 'workflow', mpWfLabel(w.key), w.enabled ? 'ok' : 'disabled');
                 let asgs = (snap.assignments || []).filter(a => a.workflow_key === w.key && a.scope === opts.scope);
-                if (opts.activeOnly) asgs = asgs.filter(a => a.enabled && !(a.role === 'primary' && !(a.weight > 0)));
+                // A NULL/0-weight primary still serves (the router clamps its
+                // weight to ≥1), so "active only" must not hide it.
+                if (opts.activeOnly) asgs = asgs.filter(a => a.enabled);
+                const primaries = asgs.filter(a => a.role === 'primary');
                 asgs.forEach(a => {
                     const m = mpModelById(a.provider_model_id);
                     if (!m) return;
@@ -2987,7 +2998,7 @@
                     const mId = 'm:' + m.id;
                     addNode(mId, 'model', mpModelLabel(m.id), mpModelFlowState(m));
                     const edge = { from: wfId, to: mId, kind: a.role };
-                    if (a.role === 'primary') edge.weight = a.weight || 0;
+                    if (a.role === 'primary') edge.weight = Math.round(mpEffectiveSharePct(primaries, a.weight));
                     if (a.role === 'fallback') edge.order = (a.fallback_order || 0) + 1;
                     if (a.role === 'overflow') {
                         const trg = (snap.triggers || []).find(t => t.engage_assignment_id === a.id);
