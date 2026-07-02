@@ -634,6 +634,43 @@ where
         self
     }
 
+    /// Cap for one fast HTTP round-trip (direct completions, submits, status
+    /// polls). Without it a hung connection pinned a dialog worker for minutes
+    /// while the configured `request_timeout` sat unused.
+    fn request_limit(&self) -> StdDuration {
+        nonzero_duration(self.cfg.request_timeout, StdDuration::from_secs(30))
+    }
+
+    /// Cap for the blocking Discovery submit and for result polling: the farm
+    /// kills the job at `task_timeout` (sent as `timeout_ms`), so a connection
+    /// alive past that plus a transfer margin is dead, not slow.
+    fn task_limit(&self) -> StdDuration {
+        let task = nonzero_duration(self.cfg.task_timeout, StdDuration::from_secs(12 * 60));
+        task.saturating_add(task.min(StdDuration::from_secs(30)))
+    }
+
+    /// Total local budget for waiting out Discovery capacity, mirroring the
+    /// `wait_for_capacity_ms` the farm receives; previously this loop retried
+    /// forever at one-second intervals.
+    fn capacity_wait_limit(&self) -> StdDuration {
+        nonzero_duration(self.cfg.capacity_wait, StdDuration::from_secs(60))
+    }
+
+    async fn send_bounded(
+        &self,
+        request: AifarmHttpRequest,
+        limit: StdDuration,
+        what: &str,
+    ) -> Result<AifarmHttpResponse, CompletionError> {
+        match tokio::time::timeout(limit, self.transport.send(request)).await {
+            Ok(result) => result,
+            Err(_) => Err(Box::new(AifarmClientError::Transport(format!(
+                "{what} timed out after {}s",
+                limit.as_secs()
+            ))) as CompletionError),
+        }
+    }
+
     /// Complete using direct endpoint when configured, otherwise Discovery.
     pub async fn complete(
         &self,
@@ -797,14 +834,21 @@ where
                 ..StatusUpdate::default()
             },
         );
+        // For synchronous OpenAI-compatible endpoints this POST *is* the
+        // generation call and legitimately runs for minutes, so it gets the
+        // task budget, not the fast-round-trip budget; callers with a stricter
+        // wall clock (the dialog turn) cut the whole attempt at their deadline.
         let response = self
-            .transport
-            .send(AifarmHttpRequest {
-                method: AifarmHttpMethod::Post,
-                url: self.cfg.direct_url.clone(),
-                headers: direct_completion_headers(&self.cfg, &request),
-                body,
-            })
+            .send_bounded(
+                AifarmHttpRequest {
+                    method: AifarmHttpMethod::Post,
+                    url: self.cfg.direct_url.clone(),
+                    headers: direct_completion_headers(&self.cfg, &request),
+                    body,
+                },
+                self.task_limit(),
+                "direct dialog request",
+            )
             .await?;
         let raw_body = response_body_text(&response);
         if response.status_code == 202 {
@@ -857,6 +901,7 @@ where
         job_id: &str,
         on_status: &mut (dyn FnMut(StatusUpdate) + Send),
     ) -> Result<(String, StatusUpdate), CompletionError> {
+        let wait_deadline = tokio::time::Instant::now() + self.capacity_wait_limit();
         loop {
             match self.submit_discovery(request, job_id).await {
                 Ok(result) => return Ok(result),
@@ -864,7 +909,9 @@ where
                     if retryable_reason(err.as_ref()) != Some(FailureReason::CapacityUnavailable) {
                         return Err(err);
                     }
-                    if self.cfg.fail_fast_on_capacity_unavailable {
+                    if self.cfg.fail_fast_on_capacity_unavailable
+                        || tokio::time::Instant::now() >= wait_deadline
+                    {
                         return Err(err);
                     }
                     emit_status(
@@ -891,6 +938,7 @@ where
         job_id: &str,
         on_status: &mut (dyn FnMut(StatusUpdate) + Send),
     ) -> Result<(String, StatusUpdate), CompletionError> {
+        let wait_deadline = tokio::time::Instant::now() + self.capacity_wait_limit();
         loop {
             match self.submit_json_discovery(request, job_id).await {
                 Ok(result) => return Ok(result),
@@ -898,7 +946,9 @@ where
                     if retryable_reason(err.as_ref()) != Some(FailureReason::CapacityUnavailable) {
                         return Err(err);
                     }
-                    if self.cfg.fail_fast_on_capacity_unavailable {
+                    if self.cfg.fail_fast_on_capacity_unavailable
+                        || tokio::time::Instant::now() >= wait_deadline
+                    {
                         return Err(err);
                     }
                     emit_status(
@@ -930,13 +980,16 @@ where
             Box::new(AifarmClientError::Submit(err.to_string())) as CompletionError
         })?;
         let response = self
-            .transport
-            .send(AifarmHttpRequest {
-                method: AifarmHttpMethod::Post,
-                url: self.cfg.endpoint("/v1/jobs/blocking"),
-                headers: [("Content-Type".to_owned(), "application/json".to_owned())].into(),
-                body,
-            })
+            .send_bounded(
+                AifarmHttpRequest {
+                    method: AifarmHttpMethod::Post,
+                    url: self.cfg.endpoint("/v1/jobs/blocking"),
+                    headers: [("Content-Type".to_owned(), "application/json".to_owned())].into(),
+                    body,
+                },
+                self.task_limit(),
+                "discovery blocking submit",
+            )
             .await?;
         if !(200..300).contains(&response.status_code) {
             let body = response_body_text(&response);
@@ -989,13 +1042,16 @@ where
             Box::new(AifarmClientError::Submit(err.to_string())) as CompletionError
         })?;
         let response = self
-            .transport
-            .send(AifarmHttpRequest {
-                method: AifarmHttpMethod::Post,
-                url: self.cfg.endpoint("/v1/jobs/blocking"),
-                headers: [("Content-Type".to_owned(), "application/json".to_owned())].into(),
-                body,
-            })
+            .send_bounded(
+                AifarmHttpRequest {
+                    method: AifarmHttpMethod::Post,
+                    url: self.cfg.endpoint("/v1/jobs/blocking"),
+                    headers: [("Content-Type".to_owned(), "application/json".to_owned())].into(),
+                    body,
+                },
+                self.task_limit(),
+                "discovery blocking submit",
+            )
             .await?;
         if !(200..300).contains(&response.status_code) {
             let body = response_body_text(&response);
@@ -1044,7 +1100,22 @@ where
         on_status: &mut (dyn FnMut(StatusUpdate) + Send),
     ) -> Result<CompletionResult, CompletionError> {
         let mut last_status = normalize_status(&initial_status.status);
+        // The blocking submit returns at queue ADMISSION, so a job may still
+        // wait for a farm worker before its own task_timeout window starts.
+        // Allow the capacity budget for queueing, then re-anchor the task
+        // budget when the job is first seen running.
+        let mut running_seen = is_running_status(&last_status);
+        let mut poll_deadline = if running_seen {
+            tokio::time::Instant::now() + self.task_limit()
+        } else {
+            tokio::time::Instant::now() + self.capacity_wait_limit() + self.task_limit()
+        };
         loop {
+            if tokio::time::Instant::now() >= poll_deadline {
+                return Err(Box::new(AifarmClientError::Transport(format!(
+                    "discovery job {job_id} did not finish within the task timeout"
+                ))));
+            }
             tokio::time::sleep(nonzero_duration(
                 self.cfg.poll_interval,
                 StdDuration::from_secs(1),
@@ -1052,6 +1123,10 @@ where
             .await;
             let status = self.check_discovery_status(job_id).await?;
             let normalized = normalize_status(&status.status);
+            if !running_seen && is_running_status(&normalized) {
+                running_seen = true;
+                poll_deadline = tokio::time::Instant::now() + self.task_limit();
+            }
             if !normalized.is_empty() && normalized != last_status {
                 emit_status(on_status, status.as_update_with_status(&normalized));
                 last_status = normalized.clone();
@@ -1068,13 +1143,16 @@ where
         job_id: &str,
     ) -> Result<DiscoveryJobStatus, CompletionError> {
         let response = self
-            .transport
-            .send(AifarmHttpRequest {
-                method: AifarmHttpMethod::Get,
-                url: self.cfg.endpoint(&format!("/v1/jobs/{}", job_id.trim())),
-                headers: BTreeMap::new(),
-                body: Vec::new(),
-            })
+            .send_bounded(
+                AifarmHttpRequest {
+                    method: AifarmHttpMethod::Get,
+                    url: self.cfg.endpoint(&format!("/v1/jobs/{}", job_id.trim())),
+                    headers: BTreeMap::new(),
+                    body: Vec::new(),
+                },
+                self.request_limit(),
+                "discovery job status poll",
+            )
             .await?;
         if !(200..300).contains(&response.status_code) {
             return Err(Box::new(AifarmClientError::CheckStatus(format!(
@@ -1098,9 +1176,15 @@ where
         request_id: &str,
         on_status: &mut (dyn FnMut(StatusUpdate) + Send),
     ) -> Result<CompletionResult, CompletionError> {
+        let poll_deadline = tokio::time::Instant::now() + self.task_limit();
         loop {
             let response = self.check_direct_status(request_id).await?;
             if response.status_code == 202 {
+                if tokio::time::Instant::now() >= poll_deadline {
+                    return Err(Box::new(AifarmClientError::Transport(format!(
+                        "direct dialog request {request_id} did not finish within the task timeout"
+                    ))));
+                }
                 tokio::time::sleep(nonzero_duration(
                     self.cfg.poll_interval,
                     StdDuration::from_secs(1),
@@ -1139,13 +1223,16 @@ where
         request_id: &str,
     ) -> Result<AifarmHttpResponse, CompletionError> {
         let response = self
-            .transport
-            .send(AifarmHttpRequest {
-                method: AifarmHttpMethod::Get,
-                url: direct_status_endpoint(&self.cfg.direct_url, request_id),
-                headers: direct_status_headers(&self.cfg),
-                body: Vec::new(),
-            })
+            .send_bounded(
+                AifarmHttpRequest {
+                    method: AifarmHttpMethod::Get,
+                    url: direct_status_endpoint(&self.cfg.direct_url, request_id),
+                    headers: direct_status_headers(&self.cfg),
+                    body: Vec::new(),
+                },
+                self.request_limit(),
+                "direct dialog status poll",
+            )
             .await?;
         if response.status_code == 202 {
             return Ok(response);
@@ -5605,6 +5692,174 @@ mod tests {
                 })
             })
         }
+    }
+
+    #[derive(Clone, Debug)]
+    struct HangingTransport;
+
+    impl AifarmHttpTransport for HangingTransport {
+        fn send<'a>(&'a self, _request: AifarmHttpRequest) -> AifarmHttpFuture<'a> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct RepeatingTransport {
+        response: AifarmHttpResponse,
+    }
+
+    impl AifarmHttpTransport for RepeatingTransport {
+        fn send<'a>(&'a self, _request: AifarmHttpRequest) -> AifarmHttpFuture<'a> {
+            let response = self.response.clone();
+            Box::pin(async move { Ok(response) })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn direct_dialog_request_times_out_on_the_task_budget_not_the_request_budget() {
+        // The synchronous direct POST is the generation call: it must get the
+        // task budget (60s + 30s margin here), never the fast request budget.
+        let client = AifarmHttpClient::with_transport(
+            AifarmClientConfig {
+                direct_url: "https://llm.example/v1/chat/completions".to_owned(),
+                request_timeout: StdDuration::from_secs(5),
+                task_timeout: StdDuration::from_secs(60),
+                ..AifarmClientConfig::default()
+            },
+            HangingTransport,
+        );
+        let mut on_status = |_: StatusUpdate| {};
+        let err = client
+            .complete(ChatCompletionRequest::default(), &mut on_status)
+            .await
+            .expect_err("hung transport must time out");
+        assert!(err.to_string().contains("timed out after 90s"), "{err}");
+        assert_eq!(
+            retryable_reason(err.as_ref()),
+            Some(FailureReason::ProviderUnavailable)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn discovery_blocking_submit_times_out_on_the_task_budget_not_the_request_budget() {
+        let client = AifarmHttpClient::with_transport(
+            AifarmClientConfig {
+                request_timeout: StdDuration::from_secs(30),
+                task_timeout: StdDuration::from_secs(600),
+                ..AifarmClientConfig::default()
+            },
+            HangingTransport,
+        );
+        let mut on_status = |_: StatusUpdate| {};
+        let err = client
+            .complete(ChatCompletionRequest::default(), &mut on_status)
+            .await
+            .expect_err("hung blocking submit must time out");
+        assert!(err.to_string().contains("timed out after 630s"), "{err}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn discovery_poll_gives_up_on_the_task_budget_once_the_job_runs() {
+        let envelope = br#"{"id": "j1", "status": "JOB_STATE_RUNNING"}"#.to_vec();
+        let client = AifarmHttpClient::with_transport(
+            AifarmClientConfig {
+                task_timeout: StdDuration::from_secs(5),
+                poll_interval: StdDuration::from_secs(1),
+                capacity_wait: StdDuration::from_secs(60),
+                ..AifarmClientConfig::default()
+            },
+            RepeatingTransport {
+                response: AifarmHttpResponse {
+                    status_code: 200,
+                    status_text: "OK".to_owned(),
+                    body: envelope,
+                    ..AifarmHttpResponse::default()
+                },
+            },
+        );
+        let started = tokio::time::Instant::now();
+        let mut on_status = |_: StatusUpdate| {};
+        let err = client
+            .complete(ChatCompletionRequest::default(), &mut on_status)
+            .await
+            .expect_err("a job stuck in RUNNING must give up");
+        assert!(err.to_string().contains("did not finish"), "{err}");
+        // Once the job is running the task budget applies, not the extra
+        // capacity/queue allowance.
+        assert!(
+            started.elapsed() < StdDuration::from_secs(60),
+            "gave up after {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn direct_poll_gives_up_at_the_task_timeout() {
+        let client = AifarmHttpClient::with_transport(
+            AifarmClientConfig {
+                direct_url: "https://llm.example/v1/chat/completions".to_owned(),
+                task_timeout: StdDuration::from_secs(5),
+                poll_interval: StdDuration::from_secs(1),
+                ..AifarmClientConfig::default()
+            },
+            RepeatingTransport {
+                response: AifarmHttpResponse {
+                    status_code: 202,
+                    status_text: "Accepted".to_owned(),
+                    headers: [("X-Request-ID".to_owned(), "req-1".to_owned())].into(),
+                    body: Vec::new(),
+                },
+            },
+        );
+        let mut on_status = |_: StatusUpdate| {};
+        let err = client
+            .complete(ChatCompletionRequest::default(), &mut on_status)
+            .await
+            .expect_err("a request stuck on 202 must give up");
+        assert!(err.to_string().contains("did not finish"), "{err}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn capacity_wait_gives_up_only_after_the_configured_budget() {
+        let client = AifarmHttpClient::with_transport(
+            AifarmClientConfig {
+                capacity_wait: StdDuration::from_secs(3),
+                capacity_poll_interval: StdDuration::from_secs(1),
+                ..AifarmClientConfig::default()
+            },
+            RepeatingTransport {
+                response: AifarmHttpResponse {
+                    status_code: 503,
+                    status_text: "Service Unavailable".to_owned(),
+                    body: br#"{"error": "no capacity available"}"#.to_vec(),
+                    ..AifarmHttpResponse::default()
+                },
+            },
+        );
+        let started = tokio::time::Instant::now();
+        let mut queued = 0usize;
+        let mut on_status = |update: StatusUpdate| {
+            if update.status == STATUS_QUEUED {
+                queued += 1;
+            }
+        };
+        let err = client
+            .complete(ChatCompletionRequest::default(), &mut on_status)
+            .await
+            .expect_err("permanent capacity shortage must surface");
+        assert_eq!(
+            retryable_reason(err.as_ref()),
+            Some(FailureReason::CapacityUnavailable)
+        );
+        assert!(
+            started.elapsed() >= StdDuration::from_secs(3),
+            "gave up after {:?} without waiting out the capacity budget",
+            started.elapsed()
+        );
+        assert!(
+            queued >= 2,
+            "expected repeated capacity waits, got {queued}"
+        );
     }
 
     #[derive(Default)]
