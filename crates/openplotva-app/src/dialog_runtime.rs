@@ -323,6 +323,7 @@ impl ChatProvider for RouterChatProvider {
 /// overflow shares the Google AI / genkit client); providers created in the
 /// admin panel are built on demand from their rows. Falls back to the aifarm
 /// primary when a selected row vanishes mid-request.
+#[allow(clippy::too_many_arguments)]
 pub fn router_dialog_provider(
     config: &AppConfig,
     toolbox: Arc<dyn DialogToolbox>,
@@ -1287,23 +1288,6 @@ mod tests {
             .ok()
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty())
-    }
-
-    struct EmptyProvider {
-        name: &'static str,
-    }
-
-    impl ChatProvider for EmptyProvider {
-        fn provider_name(&self) -> &str {
-            self.name
-        }
-
-        fn run_dialog<'a>(
-            &'a self,
-            _input: openplotva_dialog::DialogInput,
-        ) -> openplotva_llm::ChatProviderFuture<'a> {
-            Box::pin(async move { Ok(openplotva_dialog::DialogOutput::default()) })
-        }
     }
 
     fn router_provider_for_test(
