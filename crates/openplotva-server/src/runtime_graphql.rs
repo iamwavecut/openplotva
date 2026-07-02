@@ -45,6 +45,11 @@ pub type RuntimeLlmAnalyticsReaderFuture<'a> =
 pub type RuntimeVirtualDialogFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, String>> + Send + 'a>>;
 
+/// Boxed future returned by the taskman job-detail lookup, which may fall back
+/// to persisted storage when the in-memory queue misses.
+pub type RuntimeTaskmanJobFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Option<RuntimeTaskmanJobDetailsData>, String>> + Send + 'a>>;
+
 /// Runtime API Redis diagnostics boundary.
 pub trait RuntimeRedisInspector: Send + Sync {
     fn prefix_groups<'a>(
@@ -116,6 +121,14 @@ pub trait RuntimeLlmTraceInspector: Send + Sync {
     ) -> Result<Vec<RuntimeLlmRequestData>, String>;
 }
 
+/// Runtime API dialog turn outcome read boundary.
+pub trait RuntimeTurnOutcomeInspector: Send + Sync {
+    fn turn_outcomes(
+        &self,
+        filter: RuntimeTurnOutcomesFilter,
+    ) -> Result<Vec<RuntimeTurnOutcomeData>, String>;
+}
+
 /// Runtime API LLM routing event read boundary.
 pub trait RuntimeRoutingEventInspector: Send + Sync {
     fn routing_events(
@@ -169,8 +182,9 @@ pub trait RuntimeTaskmanInspector: Send + Sync {
         filter: RuntimeTaskmanJobsFilter,
     ) -> Result<RuntimeTaskmanJobListResultData, String>;
 
-    /// Inspect one taskman job by ID.
-    fn job(&self, id: i64) -> Result<Option<RuntimeTaskmanJobDetailsData>, String>;
+    /// Inspect one taskman job by ID, falling back to persisted storage when
+    /// the in-memory queue no longer holds the row.
+    fn job<'a>(&'a self, id: i64) -> RuntimeTaskmanJobFuture<'a>;
 
     /// Return a live taskman queue diagnostic snapshot.
     fn queue_diagnostics(
@@ -215,6 +229,7 @@ pub struct RuntimeApiLiveDiagnostics {
     pub entity_reader: Option<Arc<dyn RuntimeEntityReader>>,
     pub safety_check_reader: Option<Arc<dyn RuntimeSafetyCheckReader>>,
     pub llm_trace_inspector: Option<Arc<dyn RuntimeLlmTraceInspector>>,
+    pub turn_outcome_inspector: Option<Arc<dyn RuntimeTurnOutcomeInspector>>,
     pub routing_event_inspector: Option<Arc<dyn RuntimeRoutingEventInspector>>,
     pub llm_analytics_reader: Option<Arc<dyn RuntimeLlmAnalyticsReader>>,
     pub log_inspector: Option<Arc<dyn RuntimeLogInspector>>,
@@ -504,6 +519,22 @@ pub struct RuntimeUpdatesRuntimeData {
     pub oldest_active_ms: i32,
     pub last_stall_at: Option<String>,
     pub tasks: Vec<RuntimeUpdatesTaskData>,
+    pub gates: Option<RuntimeIngestionGatesData>,
+}
+
+/// Process-lifetime counters for the ingestion gates that consume a message
+/// before any dialog job exists (rate limits, debounce coalescing, sampling).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeIngestionGatesData {
+    pub task_rate_limited: i64,
+    pub debounce_coalesced: i64,
+    pub bot_sampling_skipped: i64,
+    pub empty_trigger_skipped: i64,
+    pub invalid_message: i64,
+    pub random_skipped_roll: i64,
+    pub random_skipped_reactivity_off: i64,
+    pub random_skipped_gate: i64,
+    pub random_skipped_user_disabled: i64,
 }
 
 /// Runtime API decoded-update task row from a live inspector.
@@ -759,6 +790,12 @@ pub struct RuntimeLlmRequestsFilter {
     pub model: String,
     pub chat_id: Option<i64>,
     pub user_id: Option<i64>,
+    pub message_id: Option<i32>,
+    /// Only traces whose result carries a non-empty error.
+    pub error_only: bool,
+    /// Only traces with neither a response preview nor an error — the
+    /// silent-completion fingerprint.
+    pub empty_only: bool,
     pub limit: i32,
 }
 
@@ -860,6 +897,39 @@ pub struct RuntimeLlmRequestResultData {
     pub duration_ms: i32,
     pub error: Option<String>,
     pub response_text_preview: Option<String>,
+}
+
+/// Runtime API dialog turn outcome filter after GraphQL/default shaping.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeTurnOutcomesFilter {
+    pub chat_id: Option<i64>,
+    pub job_id: Option<i64>,
+    pub outcome: String,
+    pub limit: i32,
+}
+
+/// Runtime API dialog turn outcome row.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RuntimeTurnOutcomeData {
+    pub id: i64,
+    pub at: String,
+    pub job_id: i64,
+    pub queue_name: String,
+    pub chat_id: Option<i64>,
+    pub thread_id: Option<i32>,
+    pub user_id: Option<i64>,
+    pub trigger_message_id: Option<i32>,
+    pub attempt: i32,
+    pub outcome: String,
+    pub reason: Option<String>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub elapsed_ms: Option<i32>,
+    pub budget_ms: Option<i32>,
+    pub user_signal: Option<String>,
+    pub sent_message_parts: Option<i32>,
+    pub side_effect_ticket_id: Option<i64>,
+    pub detail: Value,
 }
 
 /// Runtime API LLM analytics summary.
@@ -1139,6 +1209,7 @@ pub fn runtime_api_graphql_schema_with_live_diagnostics(
             entity_reader: diagnostics.entity_reader,
             safety_check_reader: diagnostics.safety_check_reader,
             llm_trace_inspector: diagnostics.llm_trace_inspector,
+            turn_outcome_inspector: diagnostics.turn_outcome_inspector,
             routing_event_inspector: diagnostics.routing_event_inspector,
             llm_analytics_reader: diagnostics.llm_analytics_reader,
             log_inspector: diagnostics.log_inspector,
@@ -1165,6 +1236,7 @@ pub struct RuntimeQuery {
     entity_reader: Option<Arc<dyn RuntimeEntityReader>>,
     safety_check_reader: Option<Arc<dyn RuntimeSafetyCheckReader>>,
     llm_trace_inspector: Option<Arc<dyn RuntimeLlmTraceInspector>>,
+    turn_outcome_inspector: Option<Arc<dyn RuntimeTurnOutcomeInspector>>,
     routing_event_inspector: Option<Arc<dyn RuntimeRoutingEventInspector>>,
     llm_analytics_reader: Option<Arc<dyn RuntimeLlmAnalyticsReader>>,
     log_inspector: Option<Arc<dyn RuntimeLogInspector>>,
@@ -1215,7 +1287,17 @@ impl RuntimeQuery {
         HealthSnapshot {
             db: DependencyHealth::from_status(&self.snapshot.db_status),
             redis: DependencyHealth::from_status(&self.snapshot.redis_status),
-            dispatcher: DependencyHealth::from_status("disabled"),
+            dispatcher: match self.dispatcher_inspector.as_deref() {
+                None => DependencyHealth::from_status("disabled"),
+                Some(inspector) => {
+                    let stats = inspector.stats();
+                    DependencyHealth::from_status(if stats.oldest_regular_age_ms > 60_000 {
+                        "degraded"
+                    } else {
+                        "ok"
+                    })
+                }
+            },
             ai_handler: DependencyHealth::from_status("disabled"),
             shield: DependencyHealth::from_status("disabled"),
             rag: DependencyHealth::from_status("disabled"),
@@ -1323,6 +1405,7 @@ impl RuntimeQuery {
             .map_err(|error| async_graphql::Error::new(error.to_string()))?;
         inspector
             .job(id)
+            .await
             .map(|job| job.map(TaskmanJobDetails::from))
             .map_err(async_graphql::Error::new)
     }
@@ -1368,6 +1451,19 @@ impl RuntimeQuery {
         inspector
             .llm_requests(llm_requests_filter_from_input(filter)?)
             .map(|items| items.into_iter().map(LlmRequest::from).collect())
+            .map_err(async_graphql::Error::new)
+    }
+
+    async fn dialog_turn_outcomes(
+        &self,
+        filter: Option<DialogTurnOutcomesFilterInput>,
+    ) -> async_graphql::Result<Vec<DialogTurnOutcome>> {
+        let Some(inspector) = self.turn_outcome_inspector.as_deref() else {
+            return Ok(Vec::new());
+        };
+        inspector
+            .turn_outcomes(turn_outcomes_filter_from_input(filter)?)
+            .map(|items| items.into_iter().map(DialogTurnOutcome::from).collect())
             .map_err(async_graphql::Error::new)
     }
 
@@ -1600,6 +1696,26 @@ fn llm_requests_filter_from_input(
         model: trim_optional(input.model),
         chat_id: parse_optional_id(input.chat_id, "chatID")?,
         user_id: parse_optional_id(input.user_id, "userID")?,
+        message_id: input.message_id,
+        error_only: input.error_only.unwrap_or(false),
+        empty_only: input.empty_only.unwrap_or(false),
+        limit: clamp_positive_range_i32(input.limit.unwrap_or(0), 100, 1000),
+    })
+}
+
+fn turn_outcomes_filter_from_input(
+    input: Option<DialogTurnOutcomesFilterInput>,
+) -> async_graphql::Result<RuntimeTurnOutcomesFilter> {
+    let Some(input) = input else {
+        return Ok(RuntimeTurnOutcomesFilter {
+            limit: 100,
+            ..RuntimeTurnOutcomesFilter::default()
+        });
+    };
+    Ok(RuntimeTurnOutcomesFilter {
+        chat_id: parse_optional_id(input.chat_id, "chatID")?,
+        job_id: parse_optional_id(input.job_id, "jobID")?,
+        outcome: trim_optional(input.outcome),
         limit: clamp_positive_range_i32(input.limit.unwrap_or(0), 100, 1000),
     })
 }
@@ -1979,6 +2095,21 @@ struct LlmRequestsFilterInput {
     chat_id: Option<ID>,
     #[graphql(name = "userID")]
     user_id: Option<ID>,
+    #[graphql(name = "messageID")]
+    message_id: Option<i32>,
+    error_only: Option<bool>,
+    empty_only: Option<bool>,
+    limit: Option<i32>,
+}
+
+#[derive(InputObject)]
+#[allow(dead_code)]
+struct DialogTurnOutcomesFilterInput {
+    #[graphql(name = "chatID")]
+    chat_id: Option<ID>,
+    #[graphql(name = "jobID")]
+    job_id: Option<ID>,
+    outcome: Option<String>,
     limit: Option<i32>,
 }
 
@@ -2886,6 +3017,61 @@ impl From<RuntimeLlmRequestData> for LlmRequest {
 }
 
 #[derive(Clone, SimpleObject)]
+struct DialogTurnOutcome {
+    id: ID,
+    at: String,
+    #[graphql(name = "jobID")]
+    job_id: ID,
+    queue_name: String,
+    #[graphql(name = "chatID")]
+    chat_id: Option<ID>,
+    #[graphql(name = "threadID")]
+    thread_id: Option<i32>,
+    #[graphql(name = "userID")]
+    user_id: Option<ID>,
+    #[graphql(name = "triggerMessageID")]
+    trigger_message_id: Option<i32>,
+    attempt: i32,
+    outcome: String,
+    reason: Option<String>,
+    provider: Option<String>,
+    model: Option<String>,
+    elapsed_ms: Option<i32>,
+    budget_ms: Option<i32>,
+    user_signal: Option<String>,
+    sent_message_parts: Option<i32>,
+    #[graphql(name = "sideEffectTicketID")]
+    side_effect_ticket_id: Option<ID>,
+    detail: Json<Value>,
+}
+
+impl From<RuntimeTurnOutcomeData> for DialogTurnOutcome {
+    fn from(outcome: RuntimeTurnOutcomeData) -> Self {
+        Self {
+            id: ID(outcome.id.to_string()),
+            at: outcome.at,
+            job_id: ID(outcome.job_id.to_string()),
+            queue_name: outcome.queue_name,
+            chat_id: outcome.chat_id.map(|id| ID(id.to_string())),
+            thread_id: outcome.thread_id,
+            user_id: outcome.user_id.map(|id| ID(id.to_string())),
+            trigger_message_id: outcome.trigger_message_id,
+            attempt: outcome.attempt,
+            outcome: outcome.outcome,
+            reason: outcome.reason,
+            provider: outcome.provider,
+            model: outcome.model,
+            elapsed_ms: outcome.elapsed_ms,
+            budget_ms: outcome.budget_ms,
+            user_signal: outcome.user_signal,
+            sent_message_parts: outcome.sent_message_parts,
+            side_effect_ticket_id: outcome.side_effect_ticket_id.map(|id| ID(id.to_string())),
+            detail: Json(outcome.detail),
+        }
+    }
+}
+
+#[derive(Clone, SimpleObject)]
 struct RoutingEvent {
     id: ID,
     at: String,
@@ -3284,6 +3470,7 @@ struct UpdatesRuntime {
     oldest_active_ms: i32,
     last_stall_at: Option<String>,
     tasks: Vec<UpdatesTask>,
+    gates: Option<IngestionGates>,
 }
 
 impl From<RuntimeUpdatesRuntimeData> for UpdatesRuntime {
@@ -3300,6 +3487,36 @@ impl From<RuntimeUpdatesRuntimeData> for UpdatesRuntime {
             oldest_active_ms: runtime.oldest_active_ms,
             last_stall_at: runtime.last_stall_at,
             tasks: runtime.tasks.into_iter().map(UpdatesTask::from).collect(),
+            gates: runtime.gates.map(IngestionGates::from),
+        }
+    }
+}
+
+#[derive(Clone, SimpleObject)]
+struct IngestionGates {
+    task_rate_limited: i64,
+    debounce_coalesced: i64,
+    bot_sampling_skipped: i64,
+    empty_trigger_skipped: i64,
+    invalid_message: i64,
+    random_skipped_roll: i64,
+    random_skipped_reactivity_off: i64,
+    random_skipped_gate: i64,
+    random_skipped_user_disabled: i64,
+}
+
+impl From<RuntimeIngestionGatesData> for IngestionGates {
+    fn from(gates: RuntimeIngestionGatesData) -> Self {
+        Self {
+            task_rate_limited: gates.task_rate_limited,
+            debounce_coalesced: gates.debounce_coalesced,
+            bot_sampling_skipped: gates.bot_sampling_skipped,
+            empty_trigger_skipped: gates.empty_trigger_skipped,
+            invalid_message: gates.invalid_message,
+            random_skipped_roll: gates.random_skipped_roll,
+            random_skipped_reactivity_off: gates.random_skipped_reactivity_off,
+            random_skipped_gate: gates.random_skipped_gate,
+            random_skipped_user_disabled: gates.random_skipped_user_disabled,
         }
     }
 }

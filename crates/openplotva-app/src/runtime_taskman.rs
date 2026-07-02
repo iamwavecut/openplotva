@@ -6,9 +6,11 @@ use std::{
 
 use openplotva_server::{
     RuntimeTaskmanDiagnosticsData, RuntimeTaskmanInspector, RuntimeTaskmanJobData,
-    RuntimeTaskmanJobDetailsData, RuntimeTaskmanJobListEntryData, RuntimeTaskmanJobListResultData,
-    RuntimeTaskmanJobSummaryData, RuntimeTaskmanJobsFilter, RuntimeTaskmanQueueDiagnosticsData,
+    RuntimeTaskmanJobDetailsData, RuntimeTaskmanJobFuture, RuntimeTaskmanJobListEntryData,
+    RuntimeTaskmanJobListResultData, RuntimeTaskmanJobSummaryData, RuntimeTaskmanJobsFilter,
+    RuntimeTaskmanQueueDiagnosticsData,
 };
+use openplotva_storage::PostgresTaskQueueStore;
 use openplotva_taskman::{
     CONTROL_QUEUE_NAME, InMemoryTaskQueue, JobPayload, JobStatus, JobType, TaskQueueRecord,
     fallback_queue_time_estimate,
@@ -20,6 +22,7 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 pub(crate) struct RuntimeTaskmanInspectorHandle {
     shared_queue: Arc<Mutex<Option<Arc<InMemoryTaskQueue>>>>,
     worker_counts: Arc<Mutex<BTreeMap<String, i32>>>,
+    sql_store: Arc<Mutex<Option<Arc<PostgresTaskQueueStore>>>>,
 }
 
 impl RuntimeTaskmanInspectorHandle {
@@ -40,6 +43,20 @@ impl RuntimeTaskmanInspectorHandle {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .extend(worker_counts);
+    }
+
+    pub(crate) fn set_sql_store(&self, store: Arc<PostgresTaskQueueStore>) {
+        *self
+            .sql_store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(store);
+    }
+
+    fn sql_store_handle(&self) -> Option<Arc<PostgresTaskQueueStore>> {
+        self.sql_store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     fn records(&self) -> Option<Vec<RuntimeTaskmanRecord>> {
@@ -175,16 +192,32 @@ impl RuntimeTaskmanInspector for RuntimeTaskmanInspectorHandle {
         })
     }
 
-    fn job(&self, id: i64) -> Result<Option<RuntimeTaskmanJobDetailsData>, String> {
-        let Some(record) = self.shared_queue().ok().and_then(|queue| queue.record(id)) else {
-            return Ok(None);
-        };
-        let record = RuntimeTaskmanRecord::new(record);
-        Ok(Some(RuntimeTaskmanJobDetailsData {
-            job: taskman_job_from_record(&record),
-            messages: taskman_messages_from_record(&record),
-            events: taskman_events_from_record(&record),
-        }))
+    fn job<'a>(&'a self, id: i64) -> RuntimeTaskmanJobFuture<'a> {
+        Box::pin(async move {
+            let in_memory = self.shared_queue().ok().and_then(|queue| queue.record(id));
+            let record = match in_memory {
+                Some(record) => Some(record),
+                // The in-memory queue evicts terminal jobs while Postgres keeps
+                // them until retention purge; `taskmanJobs` must never list a
+                // job whose detail lookup then returns null.
+                None => match self.sql_store_handle() {
+                    Some(store) => store
+                        .load_task_queue_record(id)
+                        .await
+                        .map_err(|error| error.to_string())?,
+                    None => None,
+                },
+            };
+            let Some(record) = record else {
+                return Ok(None);
+            };
+            let record = RuntimeTaskmanRecord::new(record);
+            Ok(Some(RuntimeTaskmanJobDetailsData {
+                job: taskman_job_from_record(&record),
+                messages: taskman_messages_from_record(&record),
+                events: taskman_events_from_record(&record),
+            }))
+        })
     }
 
     fn queue_diagnostics(
@@ -867,12 +900,12 @@ mod tests {
         assert_eq!(diagnostics.queues[0].worker_count, 1);
         assert_eq!(diagnostics.queues[0].eta_seconds, 30);
 
-        let details = inspector.job(1).expect("job lookup").expect("job");
+        let details = inspector.job(1).await.expect("job lookup").expect("job");
         assert_eq!(details.job.payload.expect("payload")["type"], "control");
     }
 
-    #[test]
-    fn runtime_taskman_inspector_lists_shared_dialog_and_image_queue_records() {
+    #[tokio::test]
+    async fn runtime_taskman_inspector_lists_shared_dialog_and_image_queue_records() {
         let queue = Arc::new(InMemoryTaskQueue::new());
         let created = OffsetDateTime::parse("2026-05-21T10:00:00Z", &Rfc3339).expect("created");
         let dialog_id = queue.assign(
@@ -999,6 +1032,7 @@ mod tests {
 
         let details = inspector
             .job(image_id)
+            .await
             .expect("job lookup")
             .expect("shared job");
         assert_eq!(details.job.id, image_id);
@@ -1084,6 +1118,6 @@ mod tests {
 
         let restarted = inspector.restart_job(shared_id).expect("restart shared");
         assert_eq!(restarted, 3);
-        assert!(inspector.job(restarted).expect("lookup").is_some());
+        assert!(inspector.job(restarted).await.expect("lookup").is_some());
     }
 }

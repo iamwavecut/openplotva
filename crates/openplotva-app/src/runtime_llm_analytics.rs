@@ -376,7 +376,7 @@ impl PostgresRuntimeLlmAnalyticsReader {
         let inference_params = self.load_inference_params(&mut tx, spec.since_time).await?;
         let stage_metrics = self.load_stage_metrics(&mut tx, spec.since_time).await?;
         tx.commit().await?;
-        let (runtime_jobs, runtime_jobs_error) = self.load_runtime_jobs(&spec);
+        let (runtime_jobs, runtime_jobs_error) = self.load_runtime_jobs(&spec).await;
         let ai_farm_capacity = self.load_capacity().await;
 
         Ok(RuntimeLlmAnalyticsData {
@@ -516,14 +516,14 @@ impl PostgresRuntimeLlmAnalyticsReader {
         Ok(metrics)
     }
 
-    fn load_runtime_jobs(
+    async fn load_runtime_jobs(
         &self,
         spec: &AnalyticsRange,
     ) -> (Vec<RuntimeJobAnalyticsStatData>, Option<String>) {
         let Some(taskman) = self.taskman.as_deref() else {
             return (Vec::new(), None);
         };
-        match load_runtime_job_details(taskman) {
+        match load_runtime_job_details(taskman).await {
             Ok(jobs) => (
                 aggregate_runtime_job_analytics(&jobs, spec.since_time),
                 None,
@@ -682,7 +682,7 @@ fn first_nonzero_i32<const N: usize>(values: [i32; N]) -> i32 {
     values.into_iter().find(|value| *value != 0).unwrap_or(0)
 }
 
-fn load_runtime_job_details(
+async fn load_runtime_job_details(
     taskman: &dyn RuntimeTaskmanInspector,
 ) -> Result<Vec<RuntimeTaskmanJobDetails>, String> {
     let result = taskman.list_jobs(RuntimeTaskmanJobsFilter {
@@ -699,7 +699,7 @@ fn load_runtime_job_details(
     let mut jobs = Vec::with_capacity(result.items.len());
     for item in result.items {
         let job_type = item.job_type;
-        if let Some(details) = taskman.job(item.id)? {
+        if let Some(details) = taskman.job(item.id).await? {
             jobs.push(RuntimeTaskmanJobDetails {
                 job_type,
                 job: details.job,

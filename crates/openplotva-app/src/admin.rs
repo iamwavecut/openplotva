@@ -4380,11 +4380,8 @@ mod tests {
             })
         }
 
-        fn job(
-            &self,
-            _id: i64,
-        ) -> Result<Option<openplotva_server::RuntimeTaskmanJobDetailsData>, String> {
-            Ok(None)
+        fn job<'a>(&'a self, _id: i64) -> openplotva_server::RuntimeTaskmanJobFuture<'a> {
+            Box::pin(async { Ok(None) })
         }
 
         fn queue_diagnostics(

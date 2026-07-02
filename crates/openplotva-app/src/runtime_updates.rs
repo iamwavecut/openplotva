@@ -23,6 +23,7 @@ const UPDATE_STALL_LOG_INTERVAL: Duration = Duration::from_secs(60);
 pub(crate) struct RuntimeUpdatesInspectorHandle {
     queue: openplotva_updates::RedisUpdateQueue,
     tracker: RuntimeUpdateTracker,
+    gate_counters: Arc<Mutex<Option<Arc<crate::ingestion_telemetry::IngestionGateCounters>>>>,
 }
 
 impl RuntimeUpdatesInspectorHandle {
@@ -32,11 +33,30 @@ impl RuntimeUpdatesInspectorHandle {
             tracker: RuntimeUpdateTracker::with_worker_limit(
                 openplotva_updates::UpdateConsumerConfig::default().worker_limit,
             ),
+            gate_counters: Arc::new(Mutex::new(None)),
         }
     }
 
     pub(crate) fn stage_tracker(&self) -> RuntimeUpdateTracker {
         self.tracker.clone()
+    }
+
+    pub(crate) fn set_gate_counters(
+        &self,
+        counters: Arc<crate::ingestion_telemetry::IngestionGateCounters>,
+    ) {
+        *self
+            .gate_counters
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(counters);
+    }
+
+    fn gate_counters_snapshot(&self) -> Option<openplotva_server::RuntimeIngestionGatesData> {
+        self.gate_counters
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(|counters| counters.snapshot())
     }
 }
 
@@ -53,6 +73,7 @@ impl RuntimeUpdatesInspector for RuntimeUpdatesInspectorHandle {
                     snapshot.queue_error = Some(error.to_string());
                 }
             }
+            snapshot.gates = self.gate_counters_snapshot();
             Ok(snapshot)
         })
     }
