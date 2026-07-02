@@ -10668,6 +10668,8 @@ async fn start_runtime_workers(
             ));
             let dialog_tool_history = history_store.clone();
             let dialog_max_llm_job_attempts = config.persistent_queue.llm_job_max_attempts;
+            let dialog_turn_budget_secs = config.llm.dialog.turn_budget_secs;
+            let dialog_turn_max_queue_age_secs = config.llm.dialog.turn_max_queue_age_secs;
             let dialog_worker_count = config.persistent_queue.dialog_aifarm_workers.max(0);
             for index in 0..dialog_worker_count {
                 let worker_queue = Arc::clone(&task_queue_for_updates);
@@ -10692,6 +10694,8 @@ async fn start_runtime_workers(
                                 queue_names: &dialog_jobs::DIALOG_JOB_WORKER_QUEUES,
                                 interval: dialog_jobs::DIALOG_JOB_POLL_INTERVAL,
                                 max_llm_job_attempts: dialog_max_llm_job_attempts,
+                                turn_budget_secs: dialog_turn_budget_secs,
+                                turn_max_queue_age_secs: dialog_turn_max_queue_age_secs,
                             },
                             wait_for_runtime_stop(worker_stop),
                         )

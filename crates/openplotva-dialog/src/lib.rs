@@ -9,6 +9,7 @@ mod history;
 mod json_codec;
 mod persona;
 pub mod tool_telemetry;
+pub mod turn;
 
 pub use history::{
     DEFAULT_CONTEXT_HISTORY_LIMIT, DailyPersona, DialogContext, DialogInput, DialogMessage,

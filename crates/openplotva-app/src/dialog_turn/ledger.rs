@@ -11,15 +11,13 @@ use std::time::Duration;
 use openplotva_server::{
     RuntimeTurnOutcomeData, RuntimeTurnOutcomeInspector, RuntimeTurnOutcomesFilter,
 };
-use serde_json::{Value, json};
+use serde_json::Value;
 use sqlx::{PgPool, Postgres, QueryBuilder};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::{
     sync::{mpsc, watch},
     task::JoinHandle,
 };
-
-use crate::dialog_jobs::DialogJobWorkerReport;
 
 const TURN_OUTCOME_BUFFER_CAPACITY: usize = 2048;
 const TURN_OUTCOME_WRITER_CHANNEL_CAPACITY: usize = 1024;
@@ -36,10 +34,7 @@ pub const TURN_OUTCOME_NO_REPLY_INTENTIONAL: &str = "no_reply_intentional";
 pub const TURN_OUTCOME_RETRY_SCHEDULED: &str = "retry_scheduled";
 /// The turn gave up; the user-signal column records what they saw.
 pub const TURN_OUTCOME_TERMINAL_FAILED: &str = "terminal_failed";
-/// Completed with nothing delivered and no classified reason — the defect
-/// class this ledger exists to measure (eliminated by the turn engine).
-pub const TURN_OUTCOME_SILENT: &str = "silent";
-/// Pre-turn skip (decode error, stale, empty payload).
+/// Pre-turn skip (decode error, expired queue backlog, empty payload).
 pub const TURN_OUTCOME_SKIPPED: &str = "skipped";
 
 /// One classified dialog turn tick, ready for the ring buffer and Postgres.
@@ -92,116 +87,6 @@ impl DialogTurnOutcomeRecord {
             detail: self.detail.clone(),
         }
     }
-}
-
-/// Classify one worker tick into a ledger record. Returns `None` for ticks
-/// that never dequeued a job. Pure mapping over the legacy report flags so
-/// Phase 1 stays behavior-neutral.
-#[must_use]
-pub fn outcome_from_report(
-    report: &DialogJobWorkerReport,
-    now: OffsetDateTime,
-) -> Option<DialogTurnOutcomeRecord> {
-    let job_id = report.job_id?;
-    let (outcome, reason): (&str, Option<String>) = if report.decode_error.is_some() {
-        (TURN_OUTCOME_SKIPPED, Some("decode_error".to_owned()))
-    } else if report.skipped_stale {
-        (TURN_OUTCOME_SKIPPED, Some("stale".to_owned()))
-    } else if report.skipped_empty_payload {
-        (TURN_OUTCOME_SKIPPED, Some("empty_payload".to_owned()))
-    } else if report.content_blocked {
-        (
-            TURN_OUTCOME_NO_REPLY_INTENTIONAL,
-            Some("content_blocked".to_owned()),
-        )
-    } else if report.retry_requeued {
-        (TURN_OUTCOME_RETRY_SCHEDULED, Some(retry_reason(report)))
-    } else if report.failed {
-        (TURN_OUTCOME_TERMINAL_FAILED, Some(terminal_reason(report)))
-    } else if report.suppressed_duplicate_message_id.is_some() {
-        (
-            TURN_OUTCOME_NO_REPLY_INTENTIONAL,
-            Some("duplicate_suppressed".to_owned()),
-        )
-    } else if report.sent_answer {
-        (TURN_OUTCOME_SENT, None)
-    } else if report.answer_empty_all_sources {
-        let reason = if report.persisted_tool_call_history {
-            "tool_call_only"
-        } else {
-            "provider_empty"
-        };
-        (TURN_OUTCOME_SILENT, Some(reason.to_owned()))
-    } else {
-        (TURN_OUTCOME_SKIPPED, Some("unclassified".to_owned()))
-    };
-
-    Some(DialogTurnOutcomeRecord {
-        created_at: now,
-        job_id,
-        queue_name: report.queue_name.clone(),
-        chat_id: report.chat_id,
-        thread_id: report.thread_id,
-        user_id: report.user_id,
-        trigger_message_id: report.message_id,
-        attempt: report.retry_attempt.unwrap_or(1),
-        outcome: outcome.to_owned(),
-        reason,
-        provider: report.provider.clone(),
-        model: None,
-        elapsed_ms: None,
-        budget_ms: None,
-        user_signal: None,
-        sent_message_parts: report.sent_answer.then_some(1),
-        side_effect_ticket_id: None,
-        detail: report_detail(report),
-    })
-}
-
-fn retry_reason(report: &DialogJobWorkerReport) -> String {
-    if report.empty_answer_error.is_some() {
-        "sanitized_empty".to_owned()
-    } else {
-        "provider_retryable".to_owned()
-    }
-}
-
-fn terminal_reason(report: &DialogJobWorkerReport) -> String {
-    if report.send_error.is_some() {
-        "send_error".to_owned()
-    } else if report.retry_exhausted && report.empty_answer_error.is_some() {
-        "sanitized_empty_exhausted".to_owned()
-    } else if report.retry_exhausted {
-        "retry_exhausted".to_owned()
-    } else if report.provider_error.is_some() {
-        "provider_error".to_owned()
-    } else {
-        "unknown".to_owned()
-    }
-}
-
-fn report_detail(report: &DialogJobWorkerReport) -> Value {
-    let mut detail = serde_json::Map::new();
-    let mut put = |key: &str, value: Option<&String>| {
-        if let Some(value) = value {
-            detail.insert(key.to_owned(), json!(value));
-        }
-    };
-    put("provider_error", report.provider_error.as_ref());
-    put("send_error", report.send_error.as_ref());
-    put("empty_answer_error", report.empty_answer_error.as_ref());
-    put("status_error", report.status_error.as_ref());
-    put("retry_target_queue", report.retry_target_queue.as_ref());
-    if let Some(max_attempts) = report.retry_max_attempts {
-        detail.insert("retry_max_attempts".to_owned(), json!(max_attempts));
-    }
-    if let Some(duplicate_message_id) = report.suppressed_duplicate_message_id {
-        detail.insert(
-            "suppressed_duplicate_message_id".to_owned(),
-            json!(duplicate_message_id),
-        );
-    }
-    Value::Object(detail)
 }
 
 /// Live ring buffer of recent turn outcomes served over runtime GraphQL.
@@ -496,154 +381,10 @@ pub async fn delete_old_turn_outcomes_batch(
 mod tests {
     use super::*;
 
-    fn base_report() -> DialogJobWorkerReport {
-        DialogJobWorkerReport {
-            queue_name: "dialog-aifarm".to_owned(),
-            dequeued: true,
-            job_id: Some(42),
-            provider: Some("aifarm".to_owned()),
-            chat_id: Some(100),
-            user_id: Some(200),
-            message_id: Some(300),
-            ..DialogJobWorkerReport::default()
-        }
-    }
-
-    #[test]
-    fn no_job_means_no_record() {
-        let report = DialogJobWorkerReport::default();
-        assert!(outcome_from_report(&report, OffsetDateTime::UNIX_EPOCH).is_none());
-    }
-
-    #[test]
-    fn classifies_every_outcome_path() {
-        let now = OffsetDateTime::UNIX_EPOCH;
-        let cases: Vec<(DialogJobWorkerReport, &str, Option<&str>)> = vec![
-            (
-                DialogJobWorkerReport {
-                    sent_answer: true,
-                    completed: true,
-                    ..base_report()
-                },
-                TURN_OUTCOME_SENT,
-                None,
-            ),
-            (
-                DialogJobWorkerReport {
-                    decode_error: Some("bad".to_owned()),
-                    failed: true,
-                    ..base_report()
-                },
-                TURN_OUTCOME_SKIPPED,
-                Some("decode_error"),
-            ),
-            (
-                DialogJobWorkerReport {
-                    skipped_stale: true,
-                    completed: true,
-                    ..base_report()
-                },
-                TURN_OUTCOME_SKIPPED,
-                Some("stale"),
-            ),
-            (
-                DialogJobWorkerReport {
-                    skipped_empty_payload: true,
-                    completed: true,
-                    ..base_report()
-                },
-                TURN_OUTCOME_SKIPPED,
-                Some("empty_payload"),
-            ),
-            (
-                DialogJobWorkerReport {
-                    content_blocked: true,
-                    completed: true,
-                    ..base_report()
-                },
-                TURN_OUTCOME_NO_REPLY_INTENTIONAL,
-                Some("content_blocked"),
-            ),
-            (
-                DialogJobWorkerReport {
-                    retry_requeued: true,
-                    retry_attempt: Some(2),
-                    empty_answer_error: Some("empty".to_owned()),
-                    ..base_report()
-                },
-                TURN_OUTCOME_RETRY_SCHEDULED,
-                Some("sanitized_empty"),
-            ),
-            (
-                DialogJobWorkerReport {
-                    retry_requeued: true,
-                    retryable_provider_error: Some("503".to_owned()),
-                    ..base_report()
-                },
-                TURN_OUTCOME_RETRY_SCHEDULED,
-                Some("provider_retryable"),
-            ),
-            (
-                DialogJobWorkerReport {
-                    failed: true,
-                    retry_exhausted: true,
-                    ..base_report()
-                },
-                TURN_OUTCOME_TERMINAL_FAILED,
-                Some("retry_exhausted"),
-            ),
-            (
-                DialogJobWorkerReport {
-                    failed: true,
-                    send_error: Some("boom".to_owned()),
-                    ..base_report()
-                },
-                TURN_OUTCOME_TERMINAL_FAILED,
-                Some("send_error"),
-            ),
-            (
-                DialogJobWorkerReport {
-                    completed: true,
-                    suppressed_duplicate_message_id: Some(7),
-                    ..base_report()
-                },
-                TURN_OUTCOME_NO_REPLY_INTENTIONAL,
-                Some("duplicate_suppressed"),
-            ),
-            (
-                DialogJobWorkerReport {
-                    completed: true,
-                    answer_empty_all_sources: true,
-                    ..base_report()
-                },
-                TURN_OUTCOME_SILENT,
-                Some("provider_empty"),
-            ),
-            (
-                DialogJobWorkerReport {
-                    completed: true,
-                    answer_empty_all_sources: true,
-                    persisted_tool_call_history: true,
-                    ..base_report()
-                },
-                TURN_OUTCOME_SILENT,
-                Some("tool_call_only"),
-            ),
-        ];
-
-        for (report, outcome, reason) in cases {
-            let record = outcome_from_report(&report, now).expect("record");
-            assert_eq!(record.outcome, outcome, "report: {report:?}");
-            assert_eq!(record.reason.as_deref(), reason, "report: {report:?}");
-            assert_eq!(record.job_id, 42);
-            assert_eq!(record.chat_id, Some(100));
-        }
-    }
-
     #[test]
     fn buffer_serves_filtered_outcomes_most_recent_first() {
         let buffer = RuntimeTurnOutcomeBuffer::new(8);
-        for (job_id, outcome) in [(1, TURN_OUTCOME_SENT), (2, TURN_OUTCOME_SILENT)] {
+        for (job_id, outcome) in [(1, TURN_OUTCOME_SENT), (2, TURN_OUTCOME_TERMINAL_FAILED)] {
             let record = DialogTurnOutcomeRecord {
                 created_at: OffsetDateTime::UNIX_EPOCH,
                 job_id,
@@ -676,15 +417,15 @@ mod tests {
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].job_id, 2, "most recent first");
 
-        let silent = buffer
+        let failed = buffer
             .turn_outcomes(RuntimeTurnOutcomesFilter {
-                outcome: TURN_OUTCOME_SILENT.to_owned(),
+                outcome: TURN_OUTCOME_TERMINAL_FAILED.to_owned(),
                 limit: 10,
                 ..RuntimeTurnOutcomesFilter::default()
             })
             .expect("outcomes");
-        assert_eq!(silent.len(), 1);
-        assert_eq!(silent[0].job_id, 2);
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].job_id, 2);
 
         let other_chat = buffer
             .turn_outcomes(RuntimeTurnOutcomesFilter {

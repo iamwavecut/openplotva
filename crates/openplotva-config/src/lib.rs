@@ -737,6 +737,12 @@ pub struct DialogConfig {
     /// models that spend thousands of tokens on thinking before the answer.
     pub aifarm_pool_max_tokens: i32,
     pub aifarm_pool_primary_capacity_wait_ms: i32,
+    /// Per-turn wall-clock budget in seconds, anchored at the job's first
+    /// processing start, from `DIALOG_TURN_BUDGET_SECS`.
+    pub turn_budget_secs: i32,
+    /// Pending age in seconds beyond which a never-processed dialog job is
+    /// resolved as expired backlog, from `DIALOG_TURN_MAX_QUEUE_AGE_SECS`.
+    pub turn_max_queue_age_secs: i32,
     pub vmlx_url: String,
     pub vmlx_api_key: String,
     pub vmlx_model: String,
@@ -1131,6 +1137,10 @@ pub struct RawConfig {
     pub dialog_aifarm_pool_max_tokens: Option<String>,
     /// `DIALOG_AIFARM_POOL_PRIMARY_CAPACITY_WAIT_MS`.
     pub dialog_aifarm_pool_primary_capacity_wait_ms: Option<String>,
+    /// `DIALOG_TURN_BUDGET_SECS`.
+    pub dialog_turn_budget_secs: Option<String>,
+    /// `DIALOG_TURN_MAX_QUEUE_AGE_SECS`.
+    pub dialog_turn_max_queue_age_secs: Option<String>,
     /// `DIALOG_VMLX_URL`.
     pub dialog_vmlx_url: Option<String>,
     /// `DIALOG_VMLX_API_KEY`.
@@ -2191,6 +2201,16 @@ impl AppConfig {
                         raw.dialog_aifarm_pool_primary_capacity_wait_ms,
                         500,
                     )?,
+                    turn_budget_secs: parse_i32(
+                        "DIALOG_TURN_BUDGET_SECS",
+                        raw.dialog_turn_budget_secs,
+                        120,
+                    )?,
+                    turn_max_queue_age_secs: parse_i32(
+                        "DIALOG_TURN_MAX_QUEUE_AGE_SECS",
+                        raw.dialog_turn_max_queue_age_secs,
+                        600,
+                    )?,
                     vmlx_url: raw
                         .dialog_vmlx_url
                         .unwrap_or_else(|| DEFAULT_DIALOG_VMLX_URL.to_owned()),
@@ -2765,6 +2785,8 @@ impl RawConfig {
             dialog_aifarm_pool_primary_capacity_wait_ms: env(
                 "DIALOG_AIFARM_POOL_PRIMARY_CAPACITY_WAIT_MS",
             ),
+            dialog_turn_budget_secs: env("DIALOG_TURN_BUDGET_SECS"),
+            dialog_turn_max_queue_age_secs: env("DIALOG_TURN_MAX_QUEUE_AGE_SECS"),
             dialog_vmlx_url: env("DIALOG_VMLX_URL"),
             dialog_vmlx_api_key: env("DIALOG_VMLX_API_KEY"),
             dialog_vmlx_model: env("DIALOG_VMLX_MODEL"),
