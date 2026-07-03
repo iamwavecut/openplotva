@@ -467,10 +467,16 @@ test('admin LLM dialogs list and detail render agent runs', async ({ page, conte
 
   await page.locator('#llmd-list .llmd-row').first().click();
   await expect(page.locator('#llmd-detail')).toBeVisible();
+  await expect(page.locator('#llmd-browse')).toBeHidden();
   await expect(page.locator('#llmd-detail-body')).toContainText('Smoke Chat');
   await expect(page.locator('#llmd-detail-body')).toContainText('smoke final answer');
   await expect(page.locator('#llmd-detail-body')).toContainText('web_search');
   await expect(page.locator('#llmd-detail-body')).toContainText('rotated out');
+
+  await page.locator('#llmd-detail [data-action="llmdCloseDetail"]').first().click();
+  await expect(page.locator('#llmd-detail')).toBeHidden();
+  await expect(page.locator('#llmd-browse')).toBeVisible();
+  await expect(page.locator('#llmd-list')).toContainText('Smoke Chat');
 
   assertNoPageErrors();
 });
