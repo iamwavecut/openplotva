@@ -19,20 +19,18 @@ use url::Url;
 
 use openplotva_core::{ChatAttachment, ChatMessageMeta, ToolCall};
 use openplotva_dialog::{
-    DEFAULT_CONTEXT_HISTORY_LIMIT, DialogInput, DialogToolbox, DialogTraceArtifacts,
-    DialogTraceError, DialogTraceUsage, DrawRequest, HistoryMessage, HistorySearchRequest,
-    HistorySummaryRequest, MESSAGE_KIND_TEXT, MESSAGE_KIND_TOOL_REQUEST,
-    MESSAGE_KIND_TOOL_RESPONSE, NativeToolCall, PROVIDER_AIFARM, PROVIDER_NVIDIA, PROVIDER_VMLX,
-    ROLE_MODEL, ROLE_TOOL, ROLE_USER, RatesRequest, STEP_CANCEL_DRAWING, STEP_CHAT_HISTORY_SUMMARY,
-    STEP_CRAWL_URL, STEP_CURRENCY_RATES, STEP_DRAW_IMAGE, STEP_GENERATE_SONG, STEP_HISTORY_SEARCH,
-    STEP_QUEUE_STATUS, STEP_TRANSLATE_TEXT, STEP_VISION_IMAGE, STEP_WEB_SEARCH,
-    STEP_YOUTUBE_SUMMARY, SongRequest, TOOL_RESULT_STATUS_NOOP, TOOL_RESULT_STATUS_QUEUED,
-    ToolContext, ToolError, ToolParseDecision, ToolResult, ToolSpec, ToolStep, VisionRequest,
-    alternative_dialog_tool_names, alternative_dialog_tools, chat_completion_tools_for_names,
-    clone_history_messages, decode_plotva_final_response_with_salvage, extract_content_tool_step,
+    ChatStepOutput, ChatStepRequest, ChatStepToolCall, DEFAULT_CONTEXT_HISTORY_LIMIT, DialogInput,
+    DialogToolbox, DialogTraceArtifacts, DialogTraceError, DialogTraceUsage, HistoryMessage,
+    MESSAGE_KIND_TEXT, MESSAGE_KIND_TOOL_REQUEST, MESSAGE_KIND_TOOL_RESPONSE, NativeToolCall,
+    PROVIDER_AIFARM, PROVIDER_NVIDIA, PROVIDER_VMLX, ROLE_MODEL, ROLE_TOOL, ROLE_USER,
+    STEP_CANCEL_DRAWING, STEP_DRAW_IMAGE, STEP_GENERATE_SONG, SessionMessage,
+    TOOL_RESULT_STATUS_NOOP, TOOL_RESULT_STATUS_QUEUED, ToolContext, ToolError, ToolParseDecision,
+    ToolResult, ToolSpec, ToolStep, ToolsMode, alternative_dialog_tool_names,
+    alternative_dialog_tools, chat_completion_tools_for_names, clone_history_messages,
+    decode_plotva_final_response_with_salvage, extract_content_tool_step,
     has_leading_context_message, is_dialog_history_noise_tool_call_name, normalize_history_message,
-    parse_native_tool_step, sanitize_final_text, select_llm_history_messages_for_context,
-    tool_telemetry,
+    parse_native_tool_step, sanitize_final_text, sanitize_tool_text,
+    select_llm_history_messages_for_context, tool_telemetry,
 };
 use openplotva_history::{
     AIFARM_DEFAULT_HISTORY_SUMMARY_MODEL, HistorySummaryDecodeError, SummaryDocument, SummaryInput,
@@ -87,6 +85,16 @@ pub struct ChatMessage {
     /// Multimodal content parts. When non-empty these replace `content` at serialization time.
     #[serde(default, skip_serializing, skip_deserializing)]
     pub content_parts: Vec<ChatContentPart>,
+    /// Native tool calls of an in-session assistant message (pre-encoded
+    /// OpenAI `tool_calls` array).
+    #[serde(default)]
+    pub tool_calls: Option<Value>,
+    /// Tool-call id linking a `role: "tool"` result message to its call.
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
+    /// Tool name of a `role: "tool"` result message.
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 impl Serialize for ChatMessage {
@@ -96,12 +104,24 @@ impl Serialize for ChatMessage {
     {
         use serde::ser::SerializeStruct;
 
-        let mut state = serializer.serialize_struct("ChatMessage", 2)?;
+        let extra_fields = usize::from(self.tool_calls.is_some())
+            + usize::from(self.tool_call_id.is_some())
+            + usize::from(self.name.is_some());
+        let mut state = serializer.serialize_struct("ChatMessage", 2 + extra_fields)?;
         state.serialize_field("role", &self.role)?;
         if self.content_parts.is_empty() {
             state.serialize_field("content", &self.content)?;
         } else {
             state.serialize_field("content", &self.content_parts)?;
+        }
+        if let Some(tool_calls) = &self.tool_calls {
+            state.serialize_field("tool_calls", tool_calls)?;
+        }
+        if let Some(tool_call_id) = &self.tool_call_id {
+            state.serialize_field("tool_call_id", tool_call_id)?;
+        }
+        if let Some(name) = &self.name {
+            state.serialize_field("name", name)?;
         }
         state.end()
     }
@@ -1897,6 +1917,7 @@ where
                     role: message.role,
                     content: message.content,
                     content_parts: Vec::new(),
+                    ..ChatMessage::default()
                 })
                 .collect(),
             stream: false,
@@ -1993,11 +2014,13 @@ where
                     role: "system".to_owned(),
                     content: system_prompt.to_owned(),
                     content_parts: Vec::new(),
+                    ..ChatMessage::default()
                 },
                 ChatMessage {
                     role: "user".to_owned(),
                     content: payload.to_owned(),
                     content_parts: Vec::new(),
+                    ..ChatMessage::default()
                 },
             ],
             stream: false,
@@ -2060,11 +2083,13 @@ where
                     role: "system".to_owned(),
                     content: system_prompt.to_owned(),
                     content_parts: Vec::new(),
+                    ..ChatMessage::default()
                 },
                 ChatMessage {
                     role: "user".to_owned(),
                     content: payload.to_owned(),
                     content_parts: Vec::new(),
+                    ..ChatMessage::default()
                 },
             ],
             stream: false,
@@ -2143,11 +2168,13 @@ where
                     role: "system".to_owned(),
                     content: system_prompt,
                     content_parts: Vec::new(),
+                    ..ChatMessage::default()
                 },
                 ChatMessage {
                     role: "user".to_owned(),
                     content: payload,
                     content_parts: Vec::new(),
+                    ..ChatMessage::default()
                 },
             ],
             stream: false,
@@ -2267,11 +2294,13 @@ where
                     role: "system".to_owned(),
                     content: system_prompt,
                     content_parts: Vec::new(),
+                    ..ChatMessage::default()
                 },
                 ChatMessage {
                     role: "user".to_owned(),
                     content: payload,
                     content_parts: Vec::new(),
+                    ..ChatMessage::default()
                 },
             ],
             stream: false,
@@ -2299,11 +2328,13 @@ where
                             role: "system".to_owned(),
                             content: system_prompt.clone(),
                             content_parts: Vec::new(),
+                            ..ChatMessage::default()
                         },
                         ChatMessage {
                             role: "user".to_owned(),
                             content: payload,
                             content_parts: Vec::new(),
+                            ..ChatMessage::default()
                         },
                     ],
                     stream: false,
@@ -2440,6 +2471,221 @@ where
             self.cfg.max_iterations
         ))) as CompletionError;
         Err(aifarm_dialog_error_with_traces(error, &state))
+    }
+
+    /// Run one single-shot chat step: no tool execution, no iteration — the
+    /// dialog session engine owns the loop and calls this once per iteration.
+    pub async fn run_chat_step_with_status(
+        &self,
+        request: ChatStepRequest,
+        on_status: &mut (dyn FnMut(StatusUpdate) + Send),
+    ) -> Result<ChatStepOutput, CompletionError> {
+        let history = build_session_history_with_limit(&request.input, self.cfg.max_history);
+        let iteration = request.iteration.max(1);
+        let completion_request = self
+            .step_request_with_history(
+                &request.input,
+                &history,
+                &request.transcript,
+                &request.tools,
+                iteration,
+            )
+            .map_err(|error| Box::new(error) as CompletionError)?;
+        let model = completion_request.model.clone();
+        let trace_request = redacted_chat_completion_request(&completion_request);
+        let result = match self.client.complete(completion_request, on_status).await {
+            Ok(result) => result,
+            Err(error) => {
+                let message = error.to_string();
+                let mut trace = aifarm_dialog_trace_artifacts(
+                    &trace_request,
+                    &CompletionResult::default(),
+                    &request.input,
+                    self.provider(),
+                    iteration,
+                );
+                trace.error = message;
+                return Err(aifarm_step_error_with_trace(error, trace));
+            }
+        };
+        let trace = aifarm_dialog_trace_artifacts(
+            &trace_request,
+            &result,
+            &request.input,
+            self.provider(),
+            iteration,
+        );
+        let Some(response) = result.response.as_ref() else {
+            let error = Box::new(AifarmDialogError::Response(
+                "chat completion response is nil".to_owned(),
+            )) as CompletionError;
+            return Err(aifarm_step_error_with_trace(error, trace));
+        };
+
+        let tools_offered =
+            !request.input.disable_tools && !matches!(request.tools, ToolsMode::Disabled);
+        if !tools_offered {
+            let text = match extract_final_answer_for_provider(response, self.provider()) {
+                Ok(text) => text,
+                Err(error) => return Err(aifarm_step_error_with_trace(error, trace)),
+            };
+            return Ok(ChatStepOutput {
+                provider: self.provider().to_owned(),
+                model,
+                text,
+                tool_calls: Vec::new(),
+                trace: Some(trace),
+            });
+        }
+
+        match first_choice_tool_steps(response) {
+            Ok(ToolStepSelection::None(decision)) => {
+                self.record_step_parser_decision(&model, iteration, &decision);
+                let text = match extract_final_answer_for_provider(response, self.provider()) {
+                    Ok(text) => text,
+                    Err(error) => return Err(aifarm_step_error_with_trace(error, trace)),
+                };
+                Ok(ChatStepOutput {
+                    provider: self.provider().to_owned(),
+                    model,
+                    text,
+                    tool_calls: Vec::new(),
+                    trace: Some(trace),
+                })
+            }
+            Ok(ToolStepSelection::Steps(steps)) => {
+                let mut tool_calls = Vec::with_capacity(steps.len());
+                for (index, pending) in steps.into_iter().enumerate() {
+                    let PendingToolStep {
+                        step,
+                        decision,
+                        native_ref,
+                    } = pending;
+                    self.record_step_parser_decision(&model, iteration, &decision);
+                    let salvaged = native_ref.is_none();
+                    let id = native_ref
+                        .filter(|value| !value.trim().is_empty())
+                        .unwrap_or_else(|| format!("call-{iteration}-{index}"));
+                    tool_calls.push(ChatStepToolCall { id, step, salvaged });
+                }
+                // Native calls arrive in their own channel, so the content is
+                // deliberate intermediate text. Salvaged calls WERE the
+                // content — treating its remainder as chat text would leak
+                // protocol markup, so it is dropped.
+                let text = if tool_calls.iter().any(|call| call.salvaged) {
+                    String::new()
+                } else {
+                    sanitize_tool_text(&first_choice_content_lenient(response))
+                };
+                Ok(ChatStepOutput {
+                    provider: self.provider().to_owned(),
+                    model,
+                    text,
+                    tool_calls,
+                    trace: Some(trace),
+                })
+            }
+            Err(error) => Err(aifarm_step_error_with_trace(error, trace)),
+        }
+    }
+
+    fn step_request_with_history(
+        &self,
+        input: &DialogInput,
+        history: &[HistoryMessage],
+        transcript: &[SessionMessage],
+        tools: &ToolsMode,
+        iteration: usize,
+    ) -> Result<ChatCompletionRequest, AifarmDialogError> {
+        let model = self.cfg.model_for_input(input);
+        // The tool-aware system prompt stays constant across the whole session
+        // (including forced-final passes) so the prompt-cache prefix survives;
+        // only the request-level tools array varies.
+        let mode = if input.disable_tools || matches!(tools, ToolsMode::Disabled) {
+            ToolPromptMode::None
+        } else {
+            ToolPromptMode::Native
+        };
+        // The transcript wire form follows the actual tools offer: native
+        // roles only when the request carries a tools array (FinalOnly keeps
+        // the tool-aware prompt but renders tool activity as text blocks).
+        let native = matches!(tools, ToolsMode::Native(_));
+        let mut messages = build_initial_messages_with_tool_prompt(input, history, mode)?;
+        messages.extend(transcript_chat_messages(transcript, native));
+        let mut request = ChatCompletionRequest {
+            model,
+            messages,
+            stream: false,
+            max_tokens: self.cfg.max_tokens_for_input(input),
+            temperature: self.cfg.temperature,
+            top_p: self.cfg.top_p,
+            repeat_penalty: self.cfg.repeat_penalty,
+            frequency_penalty: self.cfg.frequency_penalty,
+            presence_penalty: self.cfg.presence_penalty,
+            dry_multiplier: self.cfg.dry_multiplier,
+            dry_base: self.cfg.dry_base,
+            dry_allowed_length: self.cfg.dry_allowed_length,
+            include_reasoning: self.cfg.include_reasoning,
+            ..ChatCompletionRequest::default()
+        };
+        if let ToolsMode::Native(tool_values) = tools
+            && !tool_values.is_empty()
+        {
+            request.tools = tool_values.clone();
+            request.tool_choice = Some(Value::String("auto".to_owned()));
+            request.parallel_tool_calls = Some(false);
+        }
+        if let Some(enable_thinking) = input.enable_thinking.or(self.cfg.enable_thinking) {
+            request.set_chat_template_kwargs(json!({ "enable_thinking": enable_thinking }));
+        }
+        let docs_chars = input
+            .reference_context
+            .iter()
+            .map(String::len)
+            .sum::<usize>()
+            .min(i32::MAX as usize) as i32;
+        let provider = self.provider().to_owned();
+        request.trace = Some(crate::trace::LlmCallTrace {
+            context: crate::trace::LlmCallContext {
+                chat_id: input.context.chat_id,
+                thread_id: input.context.thread_id,
+                chat_title: input.context.chat_title.clone(),
+                user_id: input.user.id,
+                full_name: input.user.full_name.clone(),
+                message_id: input.message.id,
+            },
+            tags: crate::trace::LlmCallTags {
+                provider: provider.clone(),
+                source: provider,
+                flow: "dialog".to_owned(),
+                mode: "session".to_owned(),
+                request_kind: "openai.chat.completions".to_owned(),
+                iteration,
+                docs_chars,
+            },
+        });
+        Ok(request)
+    }
+
+    fn record_step_parser_decision(
+        &self,
+        model: &str,
+        iteration: usize,
+        decision: &ToolParseDecision,
+    ) {
+        if decision.outcome.trim().is_empty() {
+            return;
+        }
+        tool_telemetry::record(tool_telemetry::ToolTelemetryEvent {
+            provider: self.provider().to_owned(),
+            model: model.trim().to_owned(),
+            tool: decision.tool.trim().to_owned(),
+            form: decision.form.trim().to_owned(),
+            outcome: decision.outcome.trim().to_owned(),
+            reason: decision.reason.trim().to_owned(),
+            iteration: i32::try_from(iteration).unwrap_or(i32::MAX),
+            ..tool_telemetry::ToolTelemetryEvent::default()
+        });
     }
 
     #[cfg(test)]
@@ -2700,134 +2946,7 @@ pub(crate) async fn execute_dialog_tool(
             provider_name.trim()
         ))) as CompletionError
     })?;
-    match step.step.as_str() {
-        STEP_DRAW_IMAGE => {
-            if step.prompt.trim().is_empty() {
-                return Ok(ToolResult::failed(
-                    "draw_image_prompt_empty",
-                    "draw_image prompt is empty",
-                ));
-            }
-            toolbox
-                .draw_image(DrawRequest {
-                    context: meta.clone(),
-                    prompt: step.prompt.clone(),
-                    negative_prompt: step.negative_prompt.clone(),
-                    aspect_ratio: step.aspect_ratio.clone(),
-                    seed: step.seed.clone(),
-                })
-                .await
-        }
-        STEP_GENERATE_SONG => {
-            if step.topic.trim().is_empty() {
-                return Ok(ToolResult::failed(
-                    "generate_song_topic_empty",
-                    "generate_song topic is empty",
-                ));
-            }
-            toolbox
-                .generate_song(SongRequest {
-                    context: meta.clone(),
-                    topic: step.topic.clone(),
-                })
-                .await
-        }
-        STEP_VISION_IMAGE => {
-            let file_id = match resolve_vision_tool_file_id(&step.file_id, meta) {
-                Ok(file_id) => file_id,
-                Err(error) => {
-                    return Ok(ToolResult::failed(
-                        "vision_image_file_empty",
-                        error.to_string(),
-                    ));
-                }
-            };
-            toolbox
-                .vision_image(VisionRequest {
-                    context: meta.clone(),
-                    file_id,
-                })
-                .await
-        }
-        STEP_CURRENCY_RATES => {
-            toolbox
-                .currency_rates(RatesRequest {
-                    context: meta.clone(),
-                    pairs: step.pairs.clone(),
-                })
-                .await
-        }
-        STEP_WEB_SEARCH => {
-            let query = default_string(&step.query, &meta.message_text);
-            if query.trim().is_empty() {
-                return Ok(ToolResult::failed(
-                    "web_search_query_empty",
-                    "web_search query is empty",
-                ));
-            }
-            toolbox.web_search(query).await
-        }
-        STEP_CRAWL_URL => {
-            if step.url.trim().is_empty() {
-                return Ok(ToolResult::failed(
-                    "crawl_url_url_empty",
-                    "crawl_url url is empty",
-                ));
-            }
-            toolbox.crawl_url(step.url.clone()).await
-        }
-        STEP_YOUTUBE_SUMMARY => {
-            if step.video.trim().is_empty() {
-                return Ok(ToolResult::failed(
-                    "youtube_summary_video_empty",
-                    "youtube_summary video is empty",
-                ));
-            }
-            toolbox.youtube_summary(step.video.clone()).await
-        }
-        STEP_QUEUE_STATUS => toolbox.queue_status(meta.user_id).await,
-        STEP_CANCEL_DRAWING => toolbox.cancel_drawing(meta.user_id, meta.chat_id).await,
-        STEP_TRANSLATE_TEXT => {
-            if step.text.trim().is_empty() {
-                return Ok(ToolResult::failed(
-                    "translate_text_empty",
-                    "translate_text text is empty",
-                ));
-            }
-            let target_lang = default_string(&step.target_lang, "ru");
-            toolbox.translate_text(step.text.clone(), target_lang).await
-        }
-        STEP_CHAT_HISTORY_SUMMARY => {
-            toolbox
-                .chat_history_summary(HistorySummaryRequest {
-                    context: meta.clone(),
-                    window: step.window.clone(),
-                    hours: step.hours,
-                    message_count: step.message_count,
-                    since: step.since.clone(),
-                    scope: step.scope.clone(),
-                })
-                .await
-        }
-        STEP_HISTORY_SEARCH => {
-            if step.query.trim().is_empty() {
-                return Ok(ToolResult::failed(
-                    "history_search_query_empty",
-                    "history_search query is empty",
-                ));
-            }
-            toolbox
-                .history_search(HistorySearchRequest {
-                    context: meta.clone(),
-                    query: step.query.clone(),
-                })
-                .await
-        }
-        other => Ok(ToolResult::failed(
-            "unsupported_tool",
-            format!("unsupported step {other:?}"),
-        )),
-    }
+    openplotva_dialog::dispatch_dialog_tool(toolbox.as_ref(), meta, step).await
 }
 
 impl<T> crate::ChatProvider for AifarmDialogProvider<T>
@@ -2842,6 +2961,31 @@ where
         Box::pin(async move {
             let mut ignore_status = |_| {};
             self.run_with_status(input, &mut ignore_status).await
+        })
+    }
+
+    fn as_chat_step(&self) -> Option<&dyn crate::ChatStepProvider> {
+        Some(self)
+    }
+}
+
+impl<T> crate::ChatStepProvider for AifarmDialogProvider<T>
+where
+    T: AifarmHttpTransport + Clone + Send + Sync,
+{
+    fn provider_name(&self) -> &str {
+        self.provider()
+    }
+
+    fn supports_native_tools(&self) -> bool {
+        self.cfg.use_tool_calls()
+    }
+
+    fn run_chat_step<'a>(&'a self, request: ChatStepRequest) -> crate::ChatStepFuture<'a> {
+        Box::pin(async move {
+            let mut ignore_status = |_| {};
+            self.run_chat_step_with_status(request, &mut ignore_status)
+                .await
         })
     }
 }
@@ -3044,6 +3188,125 @@ fn aifarm_dialog_error_with_traces(
         return error;
     }
     Box::new(DialogTraceError::new(error, state.trace_events.clone()))
+}
+
+fn aifarm_step_error_with_trace(
+    error: CompletionError,
+    trace: DialogTraceArtifacts,
+) -> CompletionError {
+    Box::new(DialogTraceError::new(error, vec![trace]))
+}
+
+/// Assistant content of the first choice, tolerating the empty content that
+/// legitimately accompanies a pure tool-call completion.
+fn first_choice_content_lenient(response: &Value) -> String {
+    first_choice_message_value(response)
+        .ok()
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_owned()
+}
+
+/// OpenAI wire form of a tool call's `arguments`: a JSON-encoded string.
+fn session_tool_call_arguments_wire(arguments: &Value) -> String {
+    match arguments {
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Map the in-session transcript onto wire messages. With `native` the
+/// assistant tool calls and tool results use real roles and ids (OpenAI tools
+/// protocol); otherwise tool activity renders as the same plain-text context
+/// blocks cross-turn history uses, so tool-less echelons still see prior work.
+pub(crate) fn transcript_chat_messages(
+    transcript: &[SessionMessage],
+    native: bool,
+) -> Vec<ChatMessage> {
+    let mut messages = Vec::with_capacity(transcript.len());
+    for entry in transcript {
+        match entry {
+            SessionMessage::Assistant { text, tool_calls } => {
+                if native {
+                    let calls = (!tool_calls.is_empty()).then(|| {
+                        Value::Array(
+                            tool_calls
+                                .iter()
+                                .map(|call| {
+                                    json!({
+                                        "id": call.id,
+                                        "type": "function",
+                                        "function": {
+                                            "name": call.name,
+                                            "arguments":
+                                                session_tool_call_arguments_wire(&call.arguments),
+                                        },
+                                    })
+                                })
+                                .collect(),
+                        )
+                    });
+                    messages.push(ChatMessage {
+                        role: "assistant".to_owned(),
+                        content: text.clone(),
+                        tool_calls: calls,
+                        ..ChatMessage::default()
+                    });
+                } else {
+                    if !text.trim().is_empty() {
+                        messages.push(ChatMessage {
+                            role: "assistant".to_owned(),
+                            content: text.clone(),
+                            ..ChatMessage::default()
+                        });
+                    }
+                    for call in tool_calls {
+                        messages.push(ChatMessage {
+                            role: "assistant".to_owned(),
+                            content: format!(
+                                "<tool_call name=\"{}\" ref=\"{}\"/>",
+                                call.name, call.id
+                            ),
+                            ..ChatMessage::default()
+                        });
+                    }
+                }
+            }
+            SessionMessage::ToolResult {
+                tool_call_id,
+                name,
+                content,
+            } => {
+                if native {
+                    messages.push(ChatMessage {
+                        role: "tool".to_owned(),
+                        content: content.clone(),
+                        tool_call_id: Some(tool_call_id.clone()),
+                        name: Some(name.clone()),
+                        ..ChatMessage::default()
+                    });
+                } else {
+                    messages.push(ChatMessage {
+                        role: "user".to_owned(),
+                        content: format!(
+                            "<tool_result name=\"{name}\" ref=\"{tool_call_id}\"><output>{content}</output></tool_result>"
+                        ),
+                        ..ChatMessage::default()
+                    });
+                }
+            }
+            SessionMessage::InjectedUser { rendered } => {
+                messages.push(ChatMessage {
+                    role: "user".to_owned(),
+                    content: rendered.clone(),
+                    ..ChatMessage::default()
+                });
+            }
+        }
+    }
+    messages
 }
 
 fn redacted_chat_completion_request(request: &ChatCompletionRequest) -> ChatCompletionRequest {
@@ -3607,11 +3870,13 @@ pub fn build_initial_messages_with_tool_prompt(
         role: "system".to_owned(),
         content: build_system_prompt_with_tool_prompt(input, mode)?,
         content_parts: Vec::new(),
+        ..ChatMessage::default()
     });
     messages.push(ChatMessage {
         role: "user".to_owned(),
         content: build_runtime_context(input),
         content_parts: Vec::new(),
+        ..ChatMessage::default()
     });
 
     for turn in history {
@@ -4284,39 +4549,6 @@ fn queued_tool_answer(result: &ToolResult) -> Option<String> {
         .trim()
         .eq_ignore_ascii_case(TOOL_RESULT_STATUS_QUEUED)
         .then(String::new)
-}
-
-fn resolve_vision_tool_file_id(
-    file_id: &str,
-    meta: &ToolContext,
-) -> Result<String, CompletionError> {
-    let file_id = file_id.trim();
-    if !file_id.is_empty() {
-        return Ok(file_id.to_owned());
-    }
-    single_current_image_file_id(&meta.message_meta).ok_or_else(|| {
-        Box::new(AifarmDialogError::Response(
-            "tool protocol error: vision_image file_id is empty".to_owned(),
-        )) as CompletionError
-    })
-}
-
-fn single_current_image_file_id(meta: &ChatMessageMeta) -> Option<String> {
-    let mut found = None;
-    for attachment in &meta.attachments {
-        if !attachment.kind.trim().eq_ignore_ascii_case("image") {
-            continue;
-        }
-        let file_id = attachment.file_unique_id.trim();
-        if file_id.is_empty() {
-            continue;
-        }
-        if found.is_some() {
-            return None;
-        }
-        found = Some(file_id.to_owned());
-    }
-    found
 }
 
 pub(crate) fn tool_names_for_iteration(
@@ -5125,6 +5357,7 @@ pub fn format_history_message(
                 role: "user".to_owned(),
                 content,
                 content_parts: Vec::new(),
+                ..ChatMessage::default()
             }))
         }
         _ => {
@@ -5144,6 +5377,7 @@ pub fn format_history_message(
                 role: "user".to_owned(),
                 content,
                 content_parts,
+                ..ChatMessage::default()
             }))
         }
     }
@@ -5606,8 +5840,10 @@ mod tests {
     use super::*;
     use openplotva_core::{ChatAttachment, SENDER_TYPE_USER, ToolCall};
     use openplotva_dialog::{
-        DailyPersona, DialogContext, DialogMessage, DialogUser, Persona, ROLE_TOOL,
-        TOOL_RESULT_STATUS_OK, ToolSideEffect,
+        DailyPersona, DialogContext, DialogMessage, DialogUser, DrawRequest, HistorySearchRequest,
+        HistorySummaryRequest, Persona, ROLE_TOOL, RatesRequest, STEP_CHAT_HISTORY_SUMMARY,
+        STEP_CURRENCY_RATES, STEP_HISTORY_SEARCH, STEP_VISION_IMAGE, STEP_WEB_SEARCH,
+        TOOL_RESULT_STATUS_OK, ToolSideEffect, VisionRequest,
     };
 
     fn at(hour: u8, minute: u8) -> OffsetDateTime {
@@ -8247,6 +8483,7 @@ mod tests {
                 role: "user".to_owned(),
                 content: "ping".to_owned(),
                 content_parts: Vec::new(),
+                ..ChatMessage::default()
             }],
             stream: false,
             ..ChatCompletionRequest::default()
@@ -8310,6 +8547,7 @@ mod tests {
                 role: "user".to_owned(),
                 content: "ping".to_owned(),
                 content_parts: Vec::new(),
+                ..ChatMessage::default()
             }],
             max_tokens: 2048,
             temperature: Some(0.2),
@@ -8435,6 +8673,7 @@ mod tests {
                     role: "system".to_owned(),
                     content: "test".to_owned(),
                     content_parts: Vec::new(),
+                    ..ChatMessage::default()
                 }],
                 response_format: Some(json!({
                     "type": "json_schema",
@@ -8539,6 +8778,7 @@ mod tests {
                         role: "system".to_owned(),
                         content: "test".to_owned(),
                         content_parts: Vec::new(),
+                        ..ChatMessage::default()
                     }],
                     ..ChatCompletionRequest::default()
                 },
@@ -9074,5 +9314,212 @@ mod tests {
         assert_eq!(history[0].message_id, 87);
         assert_eq!(history[history.len() - 2].message_id, 100);
         assert_eq!(history[history.len() - 1].message_id, 101);
+    }
+
+    #[tokio::test]
+    async fn chat_step_parses_native_tool_calls_with_ids_and_intermediate_text()
+    -> Result<(), CompletionError> {
+        let toolbox = FakeToolbox::new(Vec::new());
+        let (provider, transport, toolbox) = direct_dialog_provider_with_toolbox(
+            json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "щас гляну",
+                        "tool_calls": [{
+                            "id": "call-abc",
+                            "type": "function",
+                            "function": {
+                                "name": "web_search",
+                                "arguments": "{\"query\": \"когда солнцестояние\"}"
+                            }
+                        }]
+                    }
+                }]
+            }),
+            AifarmDialogConfig::default(),
+            toolbox,
+        );
+        let request = openplotva_dialog::ChatStepRequest {
+            input: base_input(),
+            transcript: Vec::new(),
+            tools: openplotva_dialog::ToolsMode::Native(
+                native_tool_values(&[STEP_WEB_SEARCH]).expect("tool defs"),
+            ),
+            iteration: 1,
+        };
+
+        let output = crate::ChatStepProvider::run_chat_step(&provider, request).await?;
+
+        assert_eq!(output.text, "щас гляну");
+        assert_eq!(output.tool_calls.len(), 1);
+        assert_eq!(output.tool_calls[0].id, "call-abc");
+        assert_eq!(output.tool_calls[0].step.step, STEP_WEB_SEARCH);
+        assert_eq!(output.tool_calls[0].step.query, "когда солнцестояние");
+        assert!(!output.tool_calls[0].salvaged);
+        assert!(output.trace.is_some());
+        // The step never executes tools — the loop belongs to the session engine.
+        assert!(toolbox.web_search_queries().is_empty());
+        let sent = transport.requests();
+        assert_eq!(sent.len(), 1);
+        let body: Value = serde_json::from_slice(&sent[0].body).expect("request json");
+        assert!(
+            body.get("tools")
+                .and_then(Value::as_array)
+                .is_some_and(|tools| !tools.is_empty()),
+            "native step carries the tools array"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn chat_step_final_only_keeps_the_system_prompt_and_drops_the_tools_array()
+    -> Result<(), CompletionError> {
+        let transcript = vec![
+            openplotva_dialog::SessionMessage::Assistant {
+                text: "щас гляну".to_owned(),
+                tool_calls: vec![openplotva_dialog::SessionToolCall {
+                    id: "call-abc".to_owned(),
+                    name: STEP_WEB_SEARCH.to_owned(),
+                    arguments: json!({"query": "солнцестояние"}),
+                }],
+            },
+            openplotva_dialog::SessionMessage::ToolResult {
+                tool_call_id: "call-abc".to_owned(),
+                name: STEP_WEB_SEARCH.to_owned(),
+                content: "{\"status\":\"ok\"}".to_owned(),
+            },
+            openplotva_dialog::SessionMessage::InjectedUser {
+                rendered: "<message id=\"7\">ну что там?</message>".to_owned(),
+            },
+        ];
+        let text_response = json!({
+            "choices": [{"message": {"role": "assistant", "content": "готово"}}]
+        });
+
+        let (native_provider, native_transport, _) = direct_dialog_provider_with_toolbox(
+            text_response.clone(),
+            AifarmDialogConfig::default(),
+            FakeToolbox::new(Vec::new()),
+        );
+        crate::ChatStepProvider::run_chat_step(
+            &native_provider,
+            openplotva_dialog::ChatStepRequest {
+                input: base_input(),
+                transcript: transcript.clone(),
+                tools: openplotva_dialog::ToolsMode::Native(
+                    native_tool_values(&[STEP_WEB_SEARCH]).expect("tool defs"),
+                ),
+                iteration: 2,
+            },
+        )
+        .await?;
+
+        let (final_provider, final_transport, _) = direct_dialog_provider_with_toolbox(
+            text_response,
+            AifarmDialogConfig::default(),
+            FakeToolbox::new(Vec::new()),
+        );
+        let output = crate::ChatStepProvider::run_chat_step(
+            &final_provider,
+            openplotva_dialog::ChatStepRequest {
+                input: base_input(),
+                transcript,
+                tools: openplotva_dialog::ToolsMode::FinalOnly,
+                iteration: 3,
+            },
+        )
+        .await?;
+        assert_eq!(output.text, "готово");
+        assert!(output.tool_calls.is_empty());
+
+        let native_body: Value =
+            serde_json::from_slice(&native_transport.requests()[0].body).expect("native json");
+        let final_body: Value =
+            serde_json::from_slice(&final_transport.requests()[0].body).expect("final json");
+        // Forced-final keeps the tool-aware system prompt byte-identical so the
+        // prompt-cache prefix survives; only the request-level tools differ.
+        assert_eq!(
+            native_body["messages"][0], final_body["messages"][0],
+            "system prompt must not change between native and final-only steps"
+        );
+        assert!(
+            final_body
+                .get("tools")
+                .and_then(Value::as_array)
+                .is_none_or(Vec::is_empty),
+            "final-only step omits the tools array"
+        );
+
+        // Native transcript tail: assistant tool_calls with preserved ids and
+        // string-encoded arguments, tool-role result, injected user message.
+        let native_messages = native_body["messages"].as_array().expect("messages");
+        let tail = &native_messages[native_messages.len() - 3..];
+        assert_eq!(tail[0]["role"], "assistant");
+        assert_eq!(tail[0]["content"], "щас гляну");
+        assert_eq!(tail[0]["tool_calls"][0]["id"], "call-abc");
+        assert_eq!(
+            tail[0]["tool_calls"][0]["function"]["arguments"],
+            "{\"query\":\"солнцестояние\"}"
+        );
+        assert_eq!(tail[1]["role"], "tool");
+        assert_eq!(tail[1]["tool_call_id"], "call-abc");
+        assert_eq!(tail[2]["role"], "user");
+
+        // Final-only transcript renders as plain-text context blocks instead.
+        let final_messages = final_body["messages"].as_array().expect("messages");
+        let rendered = final_messages
+            .iter()
+            .map(|message| message["content"].as_str().unwrap_or_default().to_owned())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("<tool_result name=\"web_search\" ref=\"call-abc\">"));
+        assert!(
+            final_messages
+                .iter()
+                .all(|message| message.get("tool_call_id").is_none()),
+            "no native tool roles without a tools array"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn chat_step_salvages_content_tool_calls_and_strips_them_from_text()
+    -> Result<(), CompletionError> {
+        let (provider, _transport, _) = direct_dialog_provider_with_toolbox(
+            json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "<tool_call>draw_image{prompt:\"cat\"}</tool_call>"
+                    }
+                }]
+            }),
+            AifarmDialogConfig::default(),
+            FakeToolbox::new(Vec::new()),
+        );
+        let output = crate::ChatStepProvider::run_chat_step(
+            &provider,
+            openplotva_dialog::ChatStepRequest {
+                input: base_input(),
+                transcript: Vec::new(),
+                tools: openplotva_dialog::ToolsMode::Native(
+                    native_tool_values(&[STEP_DRAW_IMAGE]).expect("tool defs"),
+                ),
+                iteration: 1,
+            },
+        )
+        .await?;
+
+        assert_eq!(output.tool_calls.len(), 1);
+        assert!(output.tool_calls[0].salvaged);
+        assert_eq!(output.tool_calls[0].step.step, STEP_DRAW_IMAGE);
+        assert_eq!(output.tool_calls[0].step.prompt, "cat");
+        assert!(!output.tool_calls[0].id.trim().is_empty());
+        assert_eq!(
+            output.text, "",
+            "salvaged tool markup must not leak into the chat text"
+        );
+        Ok(())
     }
 }

@@ -4,10 +4,11 @@ use std::{collections::HashMap, sync::Arc};
 
 use openplotva_config::AppConfig;
 use openplotva_dialog::{
-    DialogInput, DialogToolbox, PROVIDER_AIFARM, PROVIDER_GENKIT, PROVIDER_NVIDIA, PROVIDER_VMLX,
+    ChatStepRequest, DialogInput, DialogToolbox, PROVIDER_AIFARM, PROVIDER_GENKIT, PROVIDER_NVIDIA,
+    PROVIDER_VMLX, ToolsMode,
 };
 use openplotva_llm::{
-    ChatProvider, ChatProviderError, ChatProviderFuture,
+    ChatProvider, ChatProviderError, ChatProviderFuture, ChatStepFuture, ChatStepProvider,
     aifarm::{
         AifarmClientConfig, AifarmDialogConfig, AifarmDialogProvider, ReqwestAifarmTransport,
         normalize_chat_completions_url,
@@ -293,6 +294,108 @@ impl ChatProvider for RouterChatProvider {
                                 }
                             };
                             match client.run_dialog(request).await {
+                                Ok(mut output) => {
+                                    if output.provider.trim().is_empty() {
+                                        output.provider = client.provider_name().to_owned();
+                                    }
+                                    Ok(output)
+                                }
+                                Err(error) => Err(error),
+                            }
+                        }
+                    },
+                    |error| retryable_reason(error.as_ref()),
+                )
+                .await;
+            match result {
+                Ok(output) => Ok(output),
+                Err(RoutedAttemptRunError::Attempt(error)) => Err(error),
+                Err(RoutedAttemptRunError::Routing(error)) => {
+                    let error: ChatProviderError = Box::new(error);
+                    Err(error)
+                }
+            }
+        })
+    }
+
+    fn as_chat_step(&self) -> Option<&dyn ChatStepProvider> {
+        Some(self)
+    }
+}
+
+impl ChatStepProvider for RouterChatProvider {
+    fn provider_name(&self) -> &str {
+        &self.provider_name
+    }
+
+    /// Per-attempt: tool-less clients get `ToolsMode::FinalOnly` instead.
+    fn supports_native_tools(&self) -> bool {
+        true
+    }
+
+    fn run_chat_step<'a>(&'a self, request: ChatStepRequest) -> ChatStepFuture<'a> {
+        Box::pin(async move {
+            let request_for_attempts = request.clone();
+            let factory = Arc::clone(&self.factory);
+            let result = self
+                .walker
+                .run(
+                    RoutedRequestContext {
+                        workflow_key: DIALOG_WORKFLOW_KEY.to_owned(),
+                        queue_name: Some("dialog".to_owned()),
+                        chat_id: (request.input.context.chat_id != 0)
+                            .then_some(request.input.context.chat_id),
+                        thread_id: request.input.context.thread_id,
+                        message_id: (request.input.message.id != 0)
+                            .then_some(request.input.message.id),
+                        deadline: crate::dialog_turn::current_turn_deadline(),
+                        suppress_all_attempts_exhausted_admin_report: true,
+                        ..RoutedRequestContext::default()
+                    },
+                    move |attempt| {
+                        let resolved = factory.resolve(&attempt);
+                        let mut step_request = request_for_attempts.clone();
+                        if !attempt.model_name.trim().is_empty() {
+                            step_request.input.model = attempt.model_name.clone();
+                        }
+                        if let Some(max_tokens) = attempt.overrides.max_tokens
+                            && max_tokens > 0
+                        {
+                            step_request.input.max_output_tokens = max_tokens;
+                        }
+                        if let Some(enable_thinking) = attempt
+                            .overrides
+                            .extra
+                            .get("enable_thinking")
+                            .and_then(serde_json::Value::as_bool)
+                        {
+                            step_request.input.enable_thinking = Some(enable_thinking);
+                        }
+                        async move {
+                            let client = match resolved {
+                                Ok(client) => client,
+                                Err(error) => {
+                                    let error: ChatProviderError = Box::new(error);
+                                    return Err(error);
+                                }
+                            };
+                            let Some(step_client) = client.as_chat_step() else {
+                                // Retryable so the walker moves on to an
+                                // echelon that can serve session steps.
+                                let error: ChatProviderError =
+                                    Box::new(openplotva_llm::retry::ProviderError::new(
+                                        client.provider_name(),
+                                        openplotva_llm::retry::FailureReason::ProviderUnavailable,
+                                        "provider has no chat-step support",
+                                    ));
+                                return Err(error);
+                            };
+                            if !step_client.supports_native_tools()
+                                && matches!(step_request.tools, ToolsMode::Native(_))
+                            {
+                                step_request.tools = ToolsMode::FinalOnly;
+                            }
+                            match step_client.run_chat_step(step_request).await {
                                 Ok(mut output) => {
                                     if output.provider.trim().is_empty() {
                                         output.provider = client.provider_name().to_owned();
@@ -1532,5 +1635,163 @@ mod tests {
                     .unwrap_or_else(|| Ok(DialogOutput::default()))
             })
         }
+    }
+
+    struct StepStubProvider {
+        name: &'static str,
+        native_tools: bool,
+        received: Mutex<Vec<openplotva_dialog::ToolsMode>>,
+    }
+
+    impl StepStubProvider {
+        fn new(name: &'static str, native_tools: bool) -> Self {
+            Self {
+                name,
+                native_tools,
+                received: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn received(&self) -> Vec<openplotva_dialog::ToolsMode> {
+            self.received.lock().expect("received").clone()
+        }
+    }
+
+    impl ChatProvider for StepStubProvider {
+        fn provider_name(&self) -> &str {
+            self.name
+        }
+
+        fn run_dialog<'a>(&'a self, _input: DialogInput) -> openplotva_llm::ChatProviderFuture<'a> {
+            Box::pin(async move { panic!("step stub must be driven through run_chat_step") })
+        }
+
+        fn as_chat_step(&self) -> Option<&dyn ChatStepProvider> {
+            Some(self)
+        }
+    }
+
+    impl ChatStepProvider for StepStubProvider {
+        fn provider_name(&self) -> &str {
+            self.name
+        }
+
+        fn supports_native_tools(&self) -> bool {
+            self.native_tools
+        }
+
+        fn run_chat_step<'a>(
+            &'a self,
+            request: ChatStepRequest,
+        ) -> openplotva_llm::ChatStepFuture<'a> {
+            Box::pin(async move {
+                self.received.lock().expect("received").push(request.tools);
+                Ok(openplotva_dialog::ChatStepOutput {
+                    provider: self.name.to_owned(),
+                    text: "ok".to_owned(),
+                    ..openplotva_dialog::ChatStepOutput::default()
+                })
+            })
+        }
+    }
+
+    fn step_request() -> ChatStepRequest {
+        ChatStepRequest {
+            input: DialogInput::default(),
+            transcript: Vec::new(),
+            tools: ToolsMode::Native(vec![json!({"type": "function"})]),
+            iteration: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn router_chat_step_passes_native_tools_to_capable_clients() {
+        let default_provider = Arc::new(SequencedProvider::new("unused", vec![]));
+        let stub = Arc::new(StepStubProvider::new("aifarm", true));
+        let stub_dyn: DialogProviderHandle = stub.clone();
+        let mut clients = HashMap::new();
+        clients.insert("aifarm".to_owned(), stub_dyn);
+        let reporter = crate::runtime_routing::RoutingEventReporter::new(
+            crate::runtime_routing::RoutingEventBuffer::new(8),
+            None,
+            None,
+            std::time::Duration::from_secs(600),
+        );
+        let provider = router_provider_for_test(
+            routed_dialog_snapshot(),
+            default_provider,
+            clients,
+            reporter,
+        );
+
+        let output = provider
+            .run_chat_step(step_request())
+            .await
+            .expect("routed step");
+
+        assert_eq!(output.text, "ok");
+        assert!(matches!(stub.received()[0], ToolsMode::Native(_)));
+    }
+
+    #[tokio::test]
+    async fn router_chat_step_downgrades_tools_for_tool_less_clients() {
+        let default_provider = Arc::new(SequencedProvider::new("unused", vec![]));
+        let stub = Arc::new(StepStubProvider::new("aifarm", false));
+        let stub_dyn: DialogProviderHandle = stub.clone();
+        let mut clients = HashMap::new();
+        clients.insert("aifarm".to_owned(), stub_dyn);
+        let reporter = crate::runtime_routing::RoutingEventReporter::new(
+            crate::runtime_routing::RoutingEventBuffer::new(8),
+            None,
+            None,
+            std::time::Duration::from_secs(600),
+        );
+        let provider = router_provider_for_test(
+            routed_dialog_snapshot(),
+            default_provider,
+            clients,
+            reporter,
+        );
+
+        let output = provider
+            .run_chat_step(step_request())
+            .await
+            .expect("routed step");
+
+        assert_eq!(output.text, "ok");
+        assert_eq!(stub.received(), vec![ToolsMode::FinalOnly]);
+    }
+
+    #[tokio::test]
+    async fn router_chat_step_fails_retryably_without_step_support() {
+        let default_provider = Arc::new(SequencedProvider::new("unused", vec![]));
+        let routed_provider = Arc::new(SequencedProvider::new("aifarm", vec![]));
+        let routed_dyn: DialogProviderHandle = routed_provider.clone();
+        let mut clients = HashMap::new();
+        clients.insert("aifarm".to_owned(), routed_dyn);
+        let reporter = crate::runtime_routing::RoutingEventReporter::new(
+            crate::runtime_routing::RoutingEventBuffer::new(8),
+            None,
+            None,
+            std::time::Duration::from_secs(600),
+        );
+        let provider = router_provider_for_test(
+            routed_dialog_snapshot(),
+            default_provider,
+            clients,
+            reporter,
+        );
+
+        let error = provider
+            .run_chat_step(step_request())
+            .await
+            .expect_err("no step support");
+
+        assert_eq!(
+            retryable_reason(error.as_ref()),
+            Some(FailureReason::ProviderUnavailable),
+            "the walker (and job retry) must treat step-less providers as retryable"
+        );
+        assert_eq!(routed_provider.calls(), 0, "run_dialog is never invoked");
     }
 }

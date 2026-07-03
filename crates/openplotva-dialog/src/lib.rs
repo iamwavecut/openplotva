@@ -5,11 +5,15 @@ use std::{error::Error, fmt, future::Future, pin::Pin};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
+mod dispatch;
 mod history;
 mod json_codec;
 mod persona;
 pub mod tool_telemetry;
+pub mod transcript;
 pub mod turn;
+
+pub use dispatch::dispatch_dialog_tool;
 
 pub use history::{
     DEFAULT_CONTEXT_HISTORY_LIMIT, DailyPersona, DialogContext, DialogInput, DialogMessage,
@@ -27,6 +31,9 @@ pub use json_codec::{
     salvage_json_object_value,
 };
 pub use persona::{daily_persona_for_day, daily_persona_for_unix_timestamp};
+pub use transcript::{
+    ChatStepOutput, ChatStepRequest, ChatStepToolCall, SessionMessage, SessionToolCall, ToolsMode,
+};
 
 /// Human-readable crate purpose used by scaffold tests and docs.
 pub const PURPOSE: &str = "dialog";

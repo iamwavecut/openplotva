@@ -620,6 +620,115 @@ where
         Err(gemini_dialog_error_with_traces(error, &state))
     }
 
+    /// One tool-less single-shot step for the session engine: the in-session
+    /// transcript renders as plain-text context blocks (this echelon never
+    /// receives a native tools array), and the reply is final text only.
+    async fn run_step(
+        &self,
+        request: openplotva_dialog::ChatStepRequest,
+    ) -> Result<openplotva_dialog::ChatStepOutput, ChatProviderError> {
+        if self.cfg.api_key.trim().is_empty() {
+            return Err(Box::new(ProviderError::new(
+                PROVIDER_GENKIT,
+                FailureReason::ProviderUnavailable,
+                "google ai key is required",
+            )));
+        }
+        let input = &request.input;
+        let iteration = request.iteration.max(1);
+        let history = build_session_history_with_limit(input, self.cfg.max_history);
+        let model = self.cfg.model_for_input(input);
+        let mut messages = build_initial_messages_with_tool_prompt(
+            input,
+            &history,
+            crate::aifarm::ToolPromptMode::None,
+        )
+        .map_err(|error| Box::new(error) as ChatProviderError)?;
+        messages.extend(crate::aifarm::transcript_chat_messages(
+            &request.transcript,
+            false,
+        ));
+        let mut gemini_request = gemini_request_from_messages(
+            messages,
+            GeminiGenerationConfig {
+                max_output_tokens: self.cfg.max_output_tokens_for_input(input),
+                temperature: self.cfg.temperature,
+                top_p: self.cfg.top_p,
+                top_k: Some(self.cfg.top_k),
+            },
+            safety_settings_for_model(&model),
+        );
+        let cache_snapshot = self
+            .resolve_and_apply_generate_cache(&model, &mut gemini_request)
+            .await;
+        let started = std::time::Instant::now();
+        let response = match self.send_request(&model, &gemini_request).await {
+            Ok(response) => response,
+            Err(error) => {
+                let duration_ms = i32::try_from(started.elapsed().as_millis()).unwrap_or(i32::MAX);
+                let mut trace = gemini_dialog_trace_artifacts(
+                    &gemini_request,
+                    None,
+                    input,
+                    &model,
+                    iteration,
+                    cache_snapshot.as_ref(),
+                );
+                trace.error = error.to_string();
+                self.emit_call_trace(input, &trace, duration_ms);
+                return Err(Box::new(DialogTraceError::new(error, vec![trace])));
+            }
+        };
+        let duration_ms = i32::try_from(started.elapsed().as_millis()).unwrap_or(i32::MAX);
+        let decoded = decode_gemini_dialog_response(&response);
+        let mut trace = gemini_dialog_trace_artifacts(
+            &gemini_request,
+            Some(&response),
+            input,
+            &model,
+            iteration,
+            cache_snapshot.as_ref(),
+        );
+        if let Err(error) = &decoded {
+            trace.error = error.to_string();
+        }
+        self.emit_call_trace(input, &trace, duration_ms);
+        let text = match decoded {
+            Ok(GeminiDialogResponse::Text(text)) => text,
+            Ok(GeminiDialogResponse::FunctionCalls(_)) => {
+                let error: ChatProviderError = Box::new(ProviderError::new(
+                    PROVIDER_GENKIT,
+                    FailureReason::ProviderProtocolError,
+                    "tool-less step returned function calls",
+                ));
+                return Err(Box::new(DialogTraceError::new(error, vec![trace])));
+            }
+            Err(error) => return Err(Box::new(DialogTraceError::new(error, vec![trace]))),
+        };
+        let final_text = final_answer_text_with_content(&text);
+        let answer = final_text.answer;
+        if answer.trim().is_empty() {
+            let reason = if has_leading_context_message(&final_text.content) {
+                "chat completion returned only copied context messages"
+            } else {
+                "empty final text"
+            };
+            let error: ChatProviderError = Box::new(ProviderError::new(
+                PROVIDER_GENKIT,
+                FailureReason::ProviderProtocolError,
+                reason,
+            ));
+            return Err(Box::new(DialogTraceError::new(error, vec![trace])));
+        }
+        Ok(openplotva_dialog::ChatStepOutput {
+            provider: PROVIDER_GENKIT.to_owned(),
+            model,
+            text: answer,
+            tool_calls: Vec::new(),
+            trace: Some(trace),
+        })
+    }
+
     async fn handle_native_tool_call(
         &self,
         state: &mut GeminiDialogRunState,
@@ -1089,6 +1198,33 @@ where
 
     fn run_dialog<'a>(&'a self, input: DialogInput) -> ChatProviderFuture<'a> {
         Box::pin(async move { self.run(input).await })
+    }
+
+    fn as_chat_step(&self) -> Option<&dyn crate::ChatStepProvider> {
+        Some(self)
+    }
+}
+
+impl<T> crate::ChatStepProvider for GeminiDialogProvider<T>
+where
+    T: AifarmHttpTransport + Send + Sync,
+{
+    fn provider_name(&self) -> &str {
+        PROVIDER_GENKIT
+    }
+
+    /// The genkit echelon runs sessions tool-less (final-answer-only): the
+    /// routed step provider downgrades `Native` to `FinalOnly` before the
+    /// request reaches this client.
+    fn supports_native_tools(&self) -> bool {
+        false
+    }
+
+    fn run_chat_step<'a>(
+        &'a self,
+        request: openplotva_dialog::ChatStepRequest,
+    ) -> crate::ChatStepFuture<'a> {
+        Box::pin(async move { self.run_step(request).await })
     }
 }
 

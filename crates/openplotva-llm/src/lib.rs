@@ -2,7 +2,7 @@
 
 use std::{error::Error, fmt, future::Future, pin::Pin, sync::Arc};
 
-use openplotva_dialog::{DialogInput, DialogOutput};
+use openplotva_dialog::{ChatStepOutput, ChatStepRequest, DialogInput, DialogOutput};
 
 pub mod aifarm;
 pub mod gemini;
@@ -31,10 +31,38 @@ pub trait ChatProvider: Send + Sync {
 
     /// Run one provider-owned dialog request.
     fn run_dialog<'a>(&'a self, input: DialogInput) -> ChatProviderFuture<'a>;
+
+    /// The single-shot step view of this provider, when it has one. The
+    /// dialog session engine drives its own tool loop through this seam;
+    /// providers without it fail the routed attempt retryably so the walker
+    /// moves on to the next echelon.
+    fn as_chat_step(&self) -> Option<&dyn ChatStepProvider> {
+        None
+    }
 }
 
 /// Shared chat provider handle.
 pub type ChatProviderHandle = Arc<dyn ChatProvider>;
+
+/// Boxed async chat-step future.
+pub type ChatStepFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<ChatStepOutput, ChatProviderError>> + Send + 'a>>;
+
+/// Single-shot chat step: messages+tools in, assistant text and/or tool calls
+/// out. No tool execution, no iteration — the dialog session engine owns the
+/// loop and runs every step as its own routed attempt.
+pub trait ChatStepProvider: Send + Sync {
+    /// Stable provider name for logs and diagnostics.
+    fn provider_name(&self) -> &str;
+
+    /// Whether this provider accepts a native OpenAI tools array. Tool-less
+    /// echelons (genkit) return false and are driven with
+    /// [`openplotva_dialog::ToolsMode::FinalOnly`].
+    fn supports_native_tools(&self) -> bool;
+
+    /// Run one single-shot chat step.
+    fn run_chat_step<'a>(&'a self, request: ChatStepRequest) -> ChatStepFuture<'a>;
+}
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ContentBlockedError {
