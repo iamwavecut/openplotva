@@ -823,7 +823,7 @@ impl<Permissions, Files, Sender> TelegramMusicJobEffects<Permissions, Files, Sen
         }
     }
 
-    /// Enable the reaction-based lifecycle (`DIALOG_DRAW_UX=reactions`).
+    /// Enable the reaction-based lifecycle.
     #[must_use]
     pub fn with_reaction_ux(mut self, reactions: crate::reactions::GenerationReactions) -> Self {
         self.reactions = Some(reactions);

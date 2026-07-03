@@ -769,10 +769,6 @@ pub struct DialogConfig {
     /// Delivery-obligation watcher poll interval in seconds, from
     /// `DIALOG_OBLIGATION_WATCH_INTERVAL_SECS`.
     pub obligation_watch_interval_secs: i32,
-    /// Draw/music queue-wait UX, from `DIALOG_DRAW_UX`: `reactions` (default;
-    /// lifecycle reactions on the trigger message, gallery appears with the
-    /// first image) or `placeholder` (legacy ⏳ message edited in place).
-    pub draw_ux: String,
     /// LLM iterations per session, from `DIALOG_SESSION_MAX_ITERATIONS`.
     pub session_max_iterations: i32,
     /// Intermediate messages per session, from `DIALOG_SESSION_MAX_MESSAGES`.
@@ -1192,8 +1188,6 @@ pub struct RawConfig {
     pub dialog_music_delivery_timeout_secs: Option<String>,
     /// `DIALOG_OBLIGATION_WATCH_INTERVAL_SECS`.
     pub dialog_obligation_watch_interval_secs: Option<String>,
-    /// `DIALOG_DRAW_UX`.
-    pub dialog_draw_ux: Option<String>,
     /// `DIALOG_SESSION_MAX_ITERATIONS`.
     pub dialog_session_max_iterations: Option<String>,
     /// `DIALOG_SESSION_MAX_MESSAGES`.
@@ -1545,8 +1539,6 @@ pub enum ConfigError {
     PersistentQueueFallbackWatermarkRange,
     #[error("invalid UPDATE_QUEUE_BACKEND value {value:?}: expected list or stream")]
     InvalidUpdateQueueBackend { value: String },
-    #[error("invalid DIALOG_DRAW_UX value {value:?}: expected reactions or placeholder")]
-    InvalidDrawUx { value: String },
 }
 
 impl AppConfig {
@@ -2304,7 +2296,6 @@ impl AppConfig {
                         raw.dialog_obligation_watch_interval_secs,
                         15,
                     )?,
-                    draw_ux: parse_draw_ux(raw.dialog_draw_ux)?,
                     session_max_iterations: parse_i32(
                         "DIALOG_SESSION_MAX_ITERATIONS",
                         raw.dialog_session_max_iterations,
@@ -2912,7 +2903,6 @@ impl RawConfig {
             dialog_image_delivery_timeout_secs: env("DIALOG_IMAGE_DELIVERY_TIMEOUT_SECS"),
             dialog_music_delivery_timeout_secs: env("DIALOG_MUSIC_DELIVERY_TIMEOUT_SECS"),
             dialog_obligation_watch_interval_secs: env("DIALOG_OBLIGATION_WATCH_INTERVAL_SECS"),
-            dialog_draw_ux: env("DIALOG_DRAW_UX"),
             dialog_session_max_iterations: env("DIALOG_SESSION_MAX_ITERATIONS"),
             dialog_session_max_messages: env("DIALOG_SESSION_MAX_MESSAGES"),
             dialog_session_tool_extension_secs: env("DIALOG_SESSION_TOOL_EXTENSION_SECS"),
@@ -3167,22 +3157,6 @@ fn parse_update_queue_backend(value: Option<String>) -> Result<String, ConfigErr
     match backend.as_str() {
         "list" | "stream" => Ok(backend),
         _ => Err(ConfigError::InvalidUpdateQueueBackend { value: backend }),
-    }
-}
-
-/// Draw-UX selector value for the reaction-based lifecycle (default).
-pub const DRAW_UX_REACTIONS: &str = "reactions";
-
-/// Draw-UX selector value for the legacy ⏳ placeholder message.
-pub const DRAW_UX_PLACEHOLDER: &str = "placeholder";
-
-fn parse_draw_ux(value: Option<String>) -> Result<String, ConfigError> {
-    let ux = parse_scalar_value(value)
-        .unwrap_or_else(|| DRAW_UX_REACTIONS.to_owned())
-        .to_ascii_lowercase();
-    match ux.as_str() {
-        DRAW_UX_REACTIONS | DRAW_UX_PLACEHOLDER => Ok(ux),
-        _ => Err(ConfigError::InvalidDrawUx { value: ux }),
     }
 }
 

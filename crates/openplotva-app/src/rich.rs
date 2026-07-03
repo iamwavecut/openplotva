@@ -386,10 +386,6 @@ pub fn compose_gallery(
     sanitize_rich_html(&html)
 }
 
-/// Custom emoji statuses for the draw message. The literal `⏳`/`✨` inside the tag is the
-/// fallback when the custom emoji can't render. Each is sent as the sole message content so
-/// Telegram renders it large (full-line).
-const DRAW_WAITING_EMOJI_ID: &str = "5298571865969695917";
 const DRAW_PROGRESS_EMOJI_ID: &str = "5298651821080879865";
 
 /// Drawing start state, before any image is ready: the bare drawing emoji, sent as the sole
@@ -418,14 +414,6 @@ pub fn compose_draw_progress(image_urls: &[String], total: usize, caption_html: 
     );
     append_gallery_media(&mut html, image_urls, caption_html);
     sanitize_rich_html(&html)
-}
-
-/// Queue-wait state for the draw message: the bare waiting emoji.
-#[must_use]
-pub fn compose_draw_waiting() -> String {
-    sanitize_rich_html(&format!(
-        "<tg-emoji emoji-id=\"{DRAW_WAITING_EMOJI_ID}\">⏳</tg-emoji>"
-    ))
 }
 
 /// A plain notice for the draw message (safety block, failure), as one rich paragraph.
@@ -601,14 +589,6 @@ mod tests {
         assert!(many.contains("<tg-collage>"));
         assert!(many.contains(r#"<img src="https://h/b.png"/>"#));
         assert!(many.contains("<figcaption>автор</figcaption>"));
-    }
-
-    #[test]
-    fn draw_waiting_is_bare_emoji() {
-        assert_eq!(
-            compose_draw_waiting(),
-            "<tg-emoji emoji-id=\"5298571865969695917\">⏳</tg-emoji>"
-        );
     }
 
     #[test]

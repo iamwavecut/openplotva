@@ -10838,15 +10838,10 @@ async fn start_runtime_workers(
     let delivery_obligation_store = Arc::new(
         openplotva_storage::PostgresDeliveryObligationStore::new(service_clients.postgres.clone()),
     );
-    // DIALOG_DRAW_UX: `reactions` (default) swaps the ⏳ queue-placeholder
-    // message for lifecycle reactions on the trigger message; `placeholder`
-    // keeps the legacy flow. One shared signaler feeds the tool adapter,
-    // image/music workers, and the obligations watcher.
-    let generation_reactions: Option<reactions::GenerationReactions> =
-        (config.llm.dialog.draw_ux == openplotva_config::DRAW_UX_REACTIONS).then(|| {
-            Arc::new(reactions::GenerationReactionSignaler::new(telegram.clone()))
-                as reactions::GenerationReactions
-        });
+    // One shared reaction signaler feeds the tool adapter, image/music
+    // workers, and the obligations watcher.
+    let generation_reactions: reactions::GenerationReactions =
+        Arc::new(reactions::GenerationReactionSignaler::new(telegram.clone()));
     let dialog_tool_adapter =
         dialog_tools::TaskmanDialogToolAdapter::new(Arc::clone(&task_queue_for_updates))
             .with_draw_image_vip_status(vip_status_for_updates.clone())
@@ -10872,10 +10867,8 @@ async fn start_runtime_workers(
                     ),
                 ),
             ));
-    let dialog_tool_adapter = Arc::new(match &generation_reactions {
-        Some(reactions) => dialog_tool_adapter.with_generation_reactions(Arc::clone(reactions)),
-        None => dialog_tool_adapter.with_queue_position_rich(Arc::clone(&rich_sender)),
-    });
+    let dialog_tool_adapter =
+        Arc::new(dialog_tool_adapter.with_generation_reactions(Arc::clone(&generation_reactions)));
     {
         let watcher_store: Arc<dyn dialog_turn::DeliveryObligationStore> =
             Arc::clone(&delivery_obligation_store) as _;
@@ -10894,7 +10887,8 @@ async fn start_runtime_workers(
             Arc::clone(&dispatcher_queue),
             watcher_signal.clone(),
         );
-        if let Some(reactions) = &generation_reactions {
+        {
+            let reactions = &generation_reactions;
             obligation_notifier =
                 obligation_notifier.with_lifecycle_reactions(Arc::clone(reactions));
         }
@@ -11499,7 +11493,8 @@ async fn start_runtime_workers(
     let mut vip_image_effects =
         image_jobs::TelegramImageJobEffects::new(telegram.clone(), Arc::clone(&rich_sender))
             .with_chat_counter(Arc::clone(&draw_chat_counter));
-    if let Some(reactions) = &generation_reactions {
+    {
+        let reactions = &generation_reactions;
         vip_image_effects = vip_image_effects.with_reaction_ux(Arc::clone(reactions));
     }
     let vip_image_stop = stop.subscribe();
@@ -11540,7 +11535,8 @@ async fn start_runtime_workers(
     let mut vip_image_edit_effects =
         image_jobs::TelegramImageJobEffects::new(telegram.clone(), Arc::clone(&rich_sender))
             .with_chat_counter(Arc::clone(&draw_chat_counter));
-    if let Some(reactions) = &generation_reactions {
+    {
+        let reactions = &generation_reactions;
         vip_image_edit_effects = vip_image_edit_effects.with_reaction_ux(Arc::clone(reactions));
     }
     let vip_image_edit_stop = stop.subscribe();
@@ -11577,7 +11573,8 @@ async fn start_runtime_workers(
     let mut regular_image_effects =
         image_jobs::TelegramImageJobEffects::new(telegram.clone(), Arc::clone(&rich_sender))
             .with_chat_counter(Arc::clone(&draw_chat_counter));
-    if let Some(reactions) = &generation_reactions {
+    {
+        let reactions = &generation_reactions;
         regular_image_effects = regular_image_effects.with_reaction_ux(Arc::clone(reactions));
     }
     let regular_image_stop = stop.subscribe();
@@ -11689,7 +11686,8 @@ async fn start_runtime_workers(
             telegram.clone(),
             Arc::clone(&rich_sender),
         );
-        if let Some(reactions) = &generation_reactions {
+        {
+            let reactions = &generation_reactions;
             music_effects = music_effects.with_reaction_ux(Arc::clone(reactions));
         }
         let music_stop = stop.subscribe();
