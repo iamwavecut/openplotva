@@ -52,6 +52,8 @@ pub(crate) struct TurnContext<'a> {
     pub session: super::session::SessionTurnConfig<'a>,
     /// Live inbox for this turn when the worker claimed the session key.
     pub session_inbox: Option<std::sync::Arc<super::inbox::SessionInbox>>,
+    /// Agent-run buffer collecting tool results and sent markers.
+    pub llm_runs: Option<&'a crate::runtime_llm_runs::RuntimeLlmRunBuffer>,
 }
 
 pub(crate) async fn execute_dialog_turn<Queue, Provider, Effects, Materializer, ToolHistory>(
@@ -140,6 +142,7 @@ where
         routing_events: ctx.routing_events,
         item: ctx.item,
         inbox: ctx.session_inbox.clone(),
+        llm_runs: ctx.llm_runs,
     };
     super::session::run_dialog_session(
         session_ctx,

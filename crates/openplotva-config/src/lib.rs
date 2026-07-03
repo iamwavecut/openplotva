@@ -34,6 +34,14 @@ pub const DEFAULT_RUNTIME_API_SQL_RESULT_BYTES_LIMIT: i32 = 2_621_440;
 
 pub const DEFAULT_LLM_REQUEST_EVENTS_RETENTION_DAYS: i32 = 14;
 
+pub const DEFAULT_LLM_RUN_BUFFER_CAPACITY: i32 = 512;
+
+pub const DEFAULT_LLM_RAW_BODY_PERSIST_ENABLED: bool = true;
+
+pub const DEFAULT_LLM_RAW_BODY_MAX_BYTES: i32 = 65_536;
+
+pub const DEFAULT_LLM_RAW_BODY_RETENTION_HOURS: i32 = 48;
+
 pub const DEFAULT_CHAT_HISTORY_RETENTION_DAYS: i32 = 8;
 
 pub const DEFAULT_TELEGRAM_FILES_RETENTION_DAYS: i32 = 7;
@@ -387,6 +395,14 @@ pub struct RuntimeApiConfig {
     pub sql_result_bytes_limit: i32,
     /// Raw LLM request telemetry retention in days, from `LLM_REQUEST_EVENTS_RETENTION_DAYS`.
     pub llm_request_events_retention_days: i32,
+    /// Agent-run ring capacity for the admin LLM Dialogs section, from `LLM_RUN_BUFFER_CAPACITY`.
+    pub llm_run_buffer_capacity: i32,
+    /// Whether raw LLM bodies are persisted for the detail view, from `LLM_RAW_BODY_PERSIST_ENABLED`.
+    pub llm_raw_body_persist_enabled: bool,
+    /// Per-body persistence size cap in bytes, from `LLM_RAW_BODY_MAX_BYTES`.
+    pub llm_raw_body_max_bytes: i32,
+    /// Hours before persisted raw bodies are scrubbed to NULL, from `LLM_RAW_BODY_RETENTION_HOURS`.
+    pub llm_raw_body_retention_hours: i32,
     /// Optional certificate PEM file for the runtime TLS listener, from `RUNTIME_API_CERT_FILE`.
     pub cert_file: String,
     /// Optional private key PEM file for the runtime TLS listener, from `RUNTIME_API_KEY_FILE`.
@@ -945,6 +961,14 @@ pub struct RawConfig {
     pub runtime_api_sql_result_bytes_limit: Option<String>,
     /// `LLM_REQUEST_EVENTS_RETENTION_DAYS`.
     pub llm_request_events_retention_days: Option<String>,
+    /// `LLM_RUN_BUFFER_CAPACITY`.
+    pub llm_run_buffer_capacity: Option<String>,
+    /// `LLM_RAW_BODY_PERSIST_ENABLED`.
+    pub llm_raw_body_persist_enabled: Option<String>,
+    /// `LLM_RAW_BODY_MAX_BYTES`.
+    pub llm_raw_body_max_bytes: Option<String>,
+    /// `LLM_RAW_BODY_RETENTION_HOURS`.
+    pub llm_raw_body_retention_hours: Option<String>,
     /// `RUNTIME_API_CERT_FILE`.
     pub runtime_api_cert_file: Option<String>,
     /// `RUNTIME_API_KEY_FILE`.
@@ -1562,6 +1586,26 @@ impl AppConfig {
                 "LLM_REQUEST_EVENTS_RETENTION_DAYS",
                 raw.llm_request_events_retention_days,
                 DEFAULT_LLM_REQUEST_EVENTS_RETENTION_DAYS,
+            )?,
+            llm_run_buffer_capacity: parse_i32(
+                "LLM_RUN_BUFFER_CAPACITY",
+                raw.llm_run_buffer_capacity,
+                DEFAULT_LLM_RUN_BUFFER_CAPACITY,
+            )?,
+            llm_raw_body_persist_enabled: parse_bool(
+                "LLM_RAW_BODY_PERSIST_ENABLED",
+                raw.llm_raw_body_persist_enabled,
+                DEFAULT_LLM_RAW_BODY_PERSIST_ENABLED,
+            )?,
+            llm_raw_body_max_bytes: parse_i32(
+                "LLM_RAW_BODY_MAX_BYTES",
+                raw.llm_raw_body_max_bytes,
+                DEFAULT_LLM_RAW_BODY_MAX_BYTES,
+            )?,
+            llm_raw_body_retention_hours: parse_i32(
+                "LLM_RAW_BODY_RETENTION_HOURS",
+                raw.llm_raw_body_retention_hours,
+                DEFAULT_LLM_RAW_BODY_RETENTION_HOURS,
             )?,
             cert_file: raw
                 .runtime_api_cert_file
@@ -2688,6 +2732,10 @@ impl RawConfig {
             runtime_api_sql_row_limit: env("RUNTIME_API_SQL_ROW_LIMIT"),
             runtime_api_sql_result_bytes_limit: env("RUNTIME_API_SQL_RESULT_BYTES_LIMIT"),
             llm_request_events_retention_days: env("LLM_REQUEST_EVENTS_RETENTION_DAYS"),
+            llm_run_buffer_capacity: env("LLM_RUN_BUFFER_CAPACITY"),
+            llm_raw_body_persist_enabled: env("LLM_RAW_BODY_PERSIST_ENABLED"),
+            llm_raw_body_max_bytes: env("LLM_RAW_BODY_MAX_BYTES"),
+            llm_raw_body_retention_hours: env("LLM_RAW_BODY_RETENTION_HOURS"),
             runtime_api_cert_file: env("RUNTIME_API_CERT_FILE"),
             runtime_api_key_file: env("RUNTIME_API_KEY_FILE"),
             runtime_api_tls_public_key_pin: env("RUNTIME_API_TLS_PUBLIC_KEY_PIN"),
@@ -3144,6 +3192,12 @@ fn validate_runtime_api(config: &RuntimeApiConfig) -> Result<(), ConfigError> {
     validate_non_negative_i32(
         "LLM_REQUEST_EVENTS_RETENTION_DAYS",
         config.llm_request_events_retention_days,
+    )?;
+    validate_positive_i32("LLM_RUN_BUFFER_CAPACITY", config.llm_run_buffer_capacity)?;
+    validate_positive_i32("LLM_RAW_BODY_MAX_BYTES", config.llm_raw_body_max_bytes)?;
+    validate_non_negative_i32(
+        "LLM_RAW_BODY_RETENTION_HOURS",
+        config.llm_raw_body_retention_hours,
     )?;
 
     if !config.enabled {

@@ -189,6 +189,8 @@ pub(crate) struct SessionRunContext<'a> {
     pub item: &'a crate::dialog_jobs::DialogJobWorkItem,
     /// Live inbox of this session (injection enabled); drained per iteration.
     pub inbox: Option<std::sync::Arc<super::inbox::SessionInbox>>,
+    /// Agent-run buffer collecting tool results and sent markers.
+    pub llm_runs: Option<&'a crate::runtime_llm_runs::RuntimeLlmRunBuffer>,
 }
 
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
@@ -244,6 +246,7 @@ where
     };
 
     let processing_started = tokio::time::Instant::now();
+    let run_id = format!("job-{}", ctx.item_id);
     let mut transcript: Vec<SessionMessage> = Vec::new();
     let mut sent = SentLog::new();
     let mut side_effect_tickets: Vec<QueuedSideEffect> = Vec::new();
@@ -510,6 +513,9 @@ where
                 Ok(()) => {
                     sent.record(&sanitized, false);
                     report.sent_answer = true;
+                    if let Some(runs) = ctx.llm_runs {
+                        runs.mark_round_sent(&run_id, crate::runtime_llm_runs::RunRoundSent::Final);
+                    }
                     let sent_now = ctx.now
                         + TimeDuration::try_from(processing_started.elapsed()).unwrap_or_default();
                     append_session_sent_marker(queue, ctx.item_id, sent_now).await;
@@ -554,7 +560,7 @@ where
         if !step.text.trim().is_empty() {
             let announcement = prepare_dialog_chat_response(&step.text);
             if !announcement.trim().is_empty() {
-                try_send_intermediate(
+                let delivery = try_send_intermediate(
                     ctx.params,
                     effects,
                     queue,
@@ -565,6 +571,14 @@ where
                     failure_now,
                 )
                 .await;
+                if delivery.status == openplotva_dialog::TOOL_RESULT_STATUS_OK
+                    && let Some(runs) = ctx.llm_runs
+                {
+                    runs.mark_round_sent(
+                        &run_id,
+                        crate::runtime_llm_runs::RunRoundSent::Intermediate,
+                    );
+                }
             }
         }
 
@@ -603,6 +617,26 @@ where
                 ctx.now + TimeDuration::try_from(processing_started.elapsed()).unwrap_or_default(),
             )
             .await;
+            if let Some(runs) = ctx.llm_runs {
+                runs.record_tool_result(
+                    &run_id,
+                    crate::runtime_llm_runs::RunToolCall {
+                        name: call.step.step.clone(),
+                        status: result.status.clone(),
+                        duration_ms: i64::try_from(tool_started.elapsed().as_millis()).ok(),
+                        args_json: serde_json::to_string(&call.step).ok(),
+                        result_json: serde_json::to_string(&result).ok(),
+                    },
+                );
+                if call.step.step == STEP_SEND_MESSAGE
+                    && result.status == openplotva_dialog::TOOL_RESULT_STATUS_OK
+                {
+                    runs.mark_round_sent(
+                        &run_id,
+                        crate::runtime_llm_runs::RunRoundSent::Intermediate,
+                    );
+                }
+            }
             recorded_calls.push(recorded_session_tool_call(
                 &call.step, &result, &call.id, iteration,
             ));

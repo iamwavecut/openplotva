@@ -40,6 +40,8 @@ pub struct DialogJobWorkerLoopOptions<'a, Materializer: ?Sized, ToolHistory: ?Si
     pub obligations: Option<&'a dyn crate::dialog_turn::DeliveryObligationAnnotator>,
     /// Session-engine wiring: toolbox, reactor, registry, and session caps.
     pub session: &'a crate::dialog_turn::SessionWorkerWiring,
+    /// Agent-run buffer for the admin LLM Dialogs section.
+    pub llm_runs: Option<&'a crate::runtime_llm_runs::RuntimeLlmRunBuffer>,
 }
 
 /// True when the current UTC time is inside the daily `[start, end)` minute window,
@@ -160,6 +162,7 @@ pub(crate) struct DialogJobProcessOptions<'a> {
     pub(crate) terminal_signal: crate::dialog_turn::TurnSignalPolicy<'a>,
     pub(crate) obligations: Option<&'a dyn crate::dialog_turn::DeliveryObligationAnnotator>,
     pub(crate) session: &'a crate::dialog_turn::SessionWorkerWiring,
+    pub(crate) llm_runs: Option<&'a crate::runtime_llm_runs::RuntimeLlmRunBuffer>,
 }
 
 pub(crate) async fn process_dialog_job_once_in_queue_with_materializer_history_and_retry_at<
@@ -319,7 +322,28 @@ where
     // time into finalize's `now` so the ledger's elapsed_ms reflects the true
     // turn duration (terminal failures no longer record elapsed_ms=0).
     let processing_started = tokio::time::Instant::now();
-    let resolution = crate::dialog_turn::execute_dialog_turn(
+    let run_id = format!("job-{}", item.id);
+    if let Some(runs) = options.llm_runs {
+        runs.begin_run(
+            run_id.clone(),
+            "dialog",
+            crate::runtime_llm_runs::RunOrigin {
+                chat_id: params.chat_id,
+                thread_id: params.thread_id,
+                chat_title: None,
+                user_id: params.user_id,
+                user_full_name: (!params.user_full_name.trim().is_empty())
+                    .then(|| params.user_full_name.clone()),
+                trigger_message_id: params.message_id,
+                trigger_preview: (!params.message_text.trim().is_empty())
+                    .then(|| params.message_text.chars().take(120).collect::<String>()),
+                queue_name: Some(options.queue_name.to_owned()),
+                job_id: Some(item.id),
+            },
+            options.now,
+        );
+    }
+    let turn = crate::dialog_turn::execute_dialog_turn(
         crate::dialog_turn::TurnContext {
             item: &item,
             params: &params,
@@ -332,6 +356,7 @@ where
             routing_events: options.routing_events,
             session: options.session.turn_config(),
             session_inbox,
+            llm_runs: options.llm_runs,
         },
         queue,
         provider,
@@ -339,6 +364,13 @@ where
         materializer,
         tool_history,
         &mut report,
+    );
+    let resolution = openplotva_llm::with_run_scope(
+        openplotva_llm::LlmRunScope {
+            run_id,
+            run_kind: "dialog".to_owned(),
+        },
+        turn,
     )
     .await;
     let finalize_now =
@@ -441,6 +473,7 @@ where
                             terminal_signal: options.terminal_signal,
                             obligations: options.obligations,
                             session: options.session,
+                            llm_runs: options.llm_runs,
                         },
                     ).await;
                     trace_dialog_job_tick(&tick);

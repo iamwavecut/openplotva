@@ -121,6 +121,22 @@ pub trait RuntimeLlmTraceInspector: Send + Sync {
     ) -> Result<Vec<RuntimeLlmRequestData>, String>;
 }
 
+/// Runtime API agent-run read boundary (admin LLM Dialogs skeletons).
+#[derive(Clone, Debug, Default)]
+pub struct RuntimeLlmRunsFilter {
+    pub kind: String,
+    pub chat_id: Option<i64>,
+    pub errors_only: bool,
+    pub q: String,
+    pub limit: i32,
+}
+
+/// Serves in-memory agent-run skeletons (same JSON shape as the admin REST
+/// list) for operator diagnostics.
+pub trait RuntimeLlmRunInspector: Send + Sync {
+    fn llm_runs(&self, filter: RuntimeLlmRunsFilter) -> Result<Vec<Value>, String>;
+}
+
 /// Runtime API dialog turn outcome read boundary.
 pub trait RuntimeTurnOutcomeInspector: Send + Sync {
     fn turn_outcomes(
@@ -235,6 +251,7 @@ pub struct RuntimeApiLiveDiagnostics {
     pub entity_reader: Option<Arc<dyn RuntimeEntityReader>>,
     pub safety_check_reader: Option<Arc<dyn RuntimeSafetyCheckReader>>,
     pub llm_trace_inspector: Option<Arc<dyn RuntimeLlmTraceInspector>>,
+    pub llm_run_inspector: Option<Arc<dyn RuntimeLlmRunInspector>>,
     pub turn_outcome_inspector: Option<Arc<dyn RuntimeTurnOutcomeInspector>>,
     pub routing_event_inspector: Option<Arc<dyn RuntimeRoutingEventInspector>>,
     pub llm_analytics_reader: Option<Arc<dyn RuntimeLlmAnalyticsReader>>,
@@ -852,6 +869,10 @@ pub struct RuntimeRoutingEventData {
 pub struct RuntimeLlmRequestData {
     pub id: i64,
     pub at: String,
+    /// Agent-run correlation key (`job-…`, `song-…`, `console-…`).
+    pub run_id: Option<String>,
+    /// 1-based round ordinal within the run.
+    pub run_seq: Option<i32>,
     pub provider: Option<String>,
     pub request_kind: Option<String>,
     pub source: String,
@@ -1228,6 +1249,7 @@ pub fn runtime_api_graphql_schema_with_live_diagnostics(
             entity_reader: diagnostics.entity_reader,
             safety_check_reader: diagnostics.safety_check_reader,
             llm_trace_inspector: diagnostics.llm_trace_inspector,
+            llm_run_inspector: diagnostics.llm_run_inspector,
             turn_outcome_inspector: diagnostics.turn_outcome_inspector,
             routing_event_inspector: diagnostics.routing_event_inspector,
             llm_analytics_reader: diagnostics.llm_analytics_reader,
@@ -1256,6 +1278,7 @@ pub struct RuntimeQuery {
     entity_reader: Option<Arc<dyn RuntimeEntityReader>>,
     safety_check_reader: Option<Arc<dyn RuntimeSafetyCheckReader>>,
     llm_trace_inspector: Option<Arc<dyn RuntimeLlmTraceInspector>>,
+    llm_run_inspector: Option<Arc<dyn RuntimeLlmRunInspector>>,
     turn_outcome_inspector: Option<Arc<dyn RuntimeTurnOutcomeInspector>>,
     routing_event_inspector: Option<Arc<dyn RuntimeRoutingEventInspector>>,
     llm_analytics_reader: Option<Arc<dyn RuntimeLlmAnalyticsReader>>,
@@ -1472,6 +1495,19 @@ impl RuntimeQuery {
         inspector
             .llm_requests(llm_requests_filter_from_input(filter)?)
             .map(|items| items.into_iter().map(LlmRequest::from).collect())
+            .map_err(async_graphql::Error::new)
+    }
+
+    async fn llm_runs(
+        &self,
+        filter: Option<LlmRunsFilterInput>,
+    ) -> async_graphql::Result<Vec<Json<Value>>> {
+        let Some(inspector) = self.llm_run_inspector.as_deref() else {
+            return Ok(Vec::new());
+        };
+        inspector
+            .llm_runs(llm_runs_filter_from_input(filter)?)
+            .map(|items| items.into_iter().map(Json).collect())
             .map_err(async_graphql::Error::new)
     }
 
@@ -1715,6 +1751,29 @@ fn safety_checks_filter_from_input(
         offset: clamp_non_negative_i32(input.offset.unwrap_or(0)),
         limit: clamp_positive_range_i32(input.limit.unwrap_or(0), 100, 1000),
     }
+}
+
+fn llm_runs_filter_from_input(
+    filter: Option<LlmRunsFilterInput>,
+) -> async_graphql::Result<RuntimeLlmRunsFilter> {
+    let Some(filter) = filter else {
+        return Ok(RuntimeLlmRunsFilter::default());
+    };
+    let chat_id = filter
+        .chat_id
+        .map(|id| {
+            id.0.trim()
+                .parse::<i64>()
+                .map_err(|_| async_graphql::Error::new("chatID must be an integer id"))
+        })
+        .transpose()?;
+    Ok(RuntimeLlmRunsFilter {
+        kind: filter.kind.unwrap_or_default().trim().to_owned(),
+        chat_id,
+        errors_only: filter.errors_only.unwrap_or(false),
+        q: filter.q.unwrap_or_default().trim().to_owned(),
+        limit: filter.limit.unwrap_or(0),
+    })
 }
 
 fn llm_requests_filter_from_input(
@@ -2176,6 +2235,18 @@ struct DialogTurnOutcomesFilterInput {
     #[graphql(name = "jobID")]
     job_id: Option<ID>,
     outcome: Option<String>,
+    limit: Option<i32>,
+}
+
+#[derive(InputObject)]
+#[allow(dead_code)]
+struct LlmRunsFilterInput {
+    kind: Option<String>,
+    #[graphql(name = "chatID")]
+    chat_id: Option<ID>,
+    #[graphql(name = "errorsOnly")]
+    errors_only: Option<bool>,
+    q: Option<String>,
     limit: Option<i32>,
 }
 

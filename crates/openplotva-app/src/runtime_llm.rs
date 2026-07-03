@@ -67,7 +67,11 @@ const SQL_INSERT_LLM_REQUEST_EVENTS_PREFIX: &str = r#"INSERT INTO llm_request_ev
     tool_mode,
     response_format,
     inference_params,
-    error
+    error,
+    run_id,
+    run_seq,
+    raw_request,
+    raw_response
 )"#;
 const SQL_DELETE_OLD_LLM_REQUEST_EVENTS_BATCH: &str = r#"
 WITH doomed AS (
@@ -80,6 +84,20 @@ WITH doomed AS (
 )
 DELETE FROM llm_request_events e
 USING doomed
+WHERE e.id = doomed.id"#;
+const SQL_SCRUB_OLD_LLM_RAW_BODIES: &str = r#"
+WITH doomed AS (
+    SELECT id
+    FROM llm_request_events
+    WHERE (raw_request IS NOT NULL OR raw_response IS NOT NULL)
+      AND created_at < now() - ($1::int * interval '1 hour')
+    ORDER BY created_at ASC
+    LIMIT $2
+)
+UPDATE llm_request_events e
+SET raw_request = NULL,
+    raw_response = NULL
+FROM doomed
 WHERE e.id = doomed.id"#;
 const SQL_TRY_ANALYTICS_ROLLUP_LOCK: &str =
     "SELECT pg_try_advisory_xact_lock(hashtext('openplotva.analytics_rollup_cleanup'))";
@@ -339,19 +357,35 @@ impl RuntimeLlmTraceBuffer {
         }
     }
 
-    pub fn record(&self, mut trace: RuntimeLlmRequestData) {
-        trace.id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+    pub fn record(&self, mut trace: RuntimeLlmRequestData) -> i64 {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+        trace.id = id;
         let mut inner = self
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if inner.ring.is_empty() {
-            return;
+            return id;
         }
         let write = inner.write;
         inner.ring[write] = Some(trace);
         inner.write = (write + 1) % inner.ring.len();
         inner.count = inner.count.saturating_add(1).min(inner.ring.len());
+        id
+    }
+
+    /// Fetch one live trace by its ring id (admin raw-payload resolution).
+    pub fn get(&self, id: i64) -> Option<RuntimeLlmRequestData> {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner
+            .ring
+            .iter()
+            .flatten()
+            .find(|trace| trace.id == id)
+            .cloned()
     }
 
     pub fn prune_chat(&self, chat_id: i64) -> i32 {
@@ -416,6 +450,24 @@ impl RuntimeLlmTraceBuffer {
     }
 }
 
+/// Whether and how large raw request/response bodies are persisted alongside
+/// the analytics row (short-lived; an hourly scrub NULLs them after
+/// `LLM_RAW_BODY_RETENTION_HOURS`).
+#[derive(Clone, Copy, Debug)]
+pub struct RawBodyPolicy {
+    pub enabled: bool,
+    pub max_bytes: usize,
+}
+
+impl Default for RawBodyPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_bytes: 65_536,
+        }
+    }
+}
+
 /// SQLx-backed LLM analytics event recorder.
 #[derive(Clone, Debug)]
 pub struct PostgresRuntimeLlmEventRecorder {
@@ -424,7 +476,11 @@ pub struct PostgresRuntimeLlmEventRecorder {
 
 impl PostgresRuntimeLlmEventRecorder {
     /// Build a recorder and background buffered writer over an existing Postgres pool.
-    pub fn spawn(pool: PgPool, stop: watch::Receiver<bool>) -> (Self, JoinHandle<()>) {
+    pub fn spawn(
+        pool: PgPool,
+        stop: watch::Receiver<bool>,
+        raw_bodies: RawBodyPolicy,
+    ) -> (Self, JoinHandle<()>) {
         let (sender, receiver) = mpsc::channel(LLM_EVENT_WRITER_CHANNEL_CAPACITY);
         let handle = tokio::spawn(run_llm_request_event_writer(
             pool,
@@ -432,6 +488,7 @@ impl PostgresRuntimeLlmEventRecorder {
             stop,
             LLM_EVENT_WRITER_BATCH_SIZE,
             LLM_EVENT_WRITER_FLUSH_INTERVAL,
+            raw_bodies,
         ));
         (Self { sender }, handle)
     }
@@ -464,6 +521,7 @@ impl PostgresRuntimeLlmEventRecorder {
 pub struct RuntimeLlmObserver {
     buffer: RuntimeLlmTraceBuffer,
     recorder: Option<PostgresRuntimeLlmEventRecorder>,
+    runs: Option<crate::runtime_llm_runs::RuntimeLlmRunBuffer>,
 }
 
 impl RuntimeLlmObserver {
@@ -473,14 +531,103 @@ impl RuntimeLlmObserver {
         buffer: RuntimeLlmTraceBuffer,
         recorder: Option<PostgresRuntimeLlmEventRecorder>,
     ) -> Self {
-        Self { buffer, recorder }
+        Self {
+            buffer,
+            recorder,
+            runs: None,
+        }
+    }
+
+    /// Additionally fan every observation out into the agent-run buffer:
+    /// scoped calls become rounds of their run, unscoped calls become
+    /// single-round one-off records.
+    #[must_use]
+    pub fn with_run_buffer(mut self, runs: crate::runtime_llm_runs::RuntimeLlmRunBuffer) -> Self {
+        self.runs = Some(runs);
+        self
+    }
+}
+
+fn usage_i32(trace: &RuntimeLlmRequestData, key: &str) -> Option<i32> {
+    trace
+        .usage
+        .as_ref()
+        .and_then(|usage| usage.get(key))
+        .and_then(Value::as_i64)
+        .and_then(|value| i32::try_from(value).ok())
+        .filter(|value| *value > 0)
+}
+
+fn run_round_from_trace(
+    trace: &RuntimeLlmRequestData,
+    trace_id: i64,
+    is_aux: bool,
+) -> crate::runtime_llm_runs::RunRound {
+    let response_text = trace
+        .raw_response
+        .as_ref()
+        .and_then(trace_response_text)
+        .and_then(|text| non_empty(&text))
+        .or_else(|| trace.result.response_text_preview.clone());
+    crate::runtime_llm_runs::RunRound {
+        seq: 0,
+        trace_id,
+        at: trace.at.clone(),
+        provider: trace.provider.clone(),
+        model: trace.model.clone(),
+        flow: trace.flow.clone(),
+        is_aux,
+        iteration: trace.iteration,
+        duration_ms: trace.result.duration_ms.max(trace.duration_ms),
+        input_tokens: usage_i32(trace, "input_tokens"),
+        output_tokens: usage_i32(trace, "output_tokens"),
+        total_tokens: usage_i32(trace, "total_tokens"),
+        error: trace.result.error.clone(),
+        response_text,
+        sent: crate::runtime_llm_runs::RunRoundSent::No,
+        tool_calls: Vec::new(),
     }
 }
 
 impl openplotva_llm::LlmCallObserver for RuntimeLlmObserver {
     fn observe(&self, record: openplotva_llm::LlmCallRecord) {
-        let trace = trace_from_record(&record.context, &record.artifact, record.duration_ms);
-        self.buffer.record(trace.clone());
+        let mut trace = trace_from_record(
+            &record.context,
+            &record.artifact,
+            record.duration_ms,
+            record.run.as_ref(),
+        );
+        let trace_id = self.buffer.record(trace.clone());
+        if let Some(runs) = &self.runs {
+            match record.run.as_ref() {
+                Some(scope) => {
+                    // Inside a dialog session, non-dialog flows are nested
+                    // auxiliary calls (vision, history summaries, …).
+                    let is_aux = scope.run_kind == "dialog"
+                        && trace.flow.as_deref().is_some_and(|flow| flow != "dialog");
+                    let round = run_round_from_trace(&trace, trace_id, is_aux);
+                    trace.run_seq = runs.record_round(&scope.run_id, round);
+                }
+                None => {
+                    let kind = trace
+                        .flow
+                        .clone()
+                        .filter(|flow| !flow.is_empty())
+                        .unwrap_or_else(|| trace.source.clone());
+                    let origin = crate::runtime_llm_runs::RunOrigin {
+                        chat_id: record.context.chat_id,
+                        thread_id: record.context.thread_id,
+                        chat_title: non_empty(&record.context.chat_title),
+                        user_id: record.context.user_id,
+                        user_full_name: non_empty(&record.context.full_name),
+                        trigger_message_id: record.context.message_id,
+                        ..crate::runtime_llm_runs::RunOrigin::default()
+                    };
+                    let round = run_round_from_trace(&trace, trace_id, false);
+                    runs.record_one_off(&kind, origin, round, OffsetDateTime::now_utc());
+                }
+            }
+        }
         if let Some(recorder) = &self.recorder {
             recorder.enqueue(trace);
         }
@@ -491,6 +638,7 @@ fn trace_from_record(
     context: &openplotva_llm::LlmCallContext,
     artifact: &DialogTraceArtifacts,
     duration_ms: i32,
+    run: Option<&openplotva_llm::LlmRunScope>,
 ) -> RuntimeLlmRequestData {
     let mut trace = RuntimeLlmRequestData {
         at: format_ts(OffsetDateTime::now_utc()),
@@ -507,6 +655,7 @@ fn trace_from_record(
         message: RuntimeLlmRequestMessageData {
             message_id: context.message_id,
         },
+        run_id: run.map(|scope| scope.run_id.clone()),
         ..RuntimeLlmRequestData::default()
     };
     apply_dialog_trace_artifact(&mut trace, artifact);
@@ -549,6 +698,7 @@ async fn run_llm_request_event_writer(
     mut stop: watch::Receiver<bool>,
     batch_size: usize,
     flush_interval: Duration,
+    raw_bodies: RawBodyPolicy,
 ) {
     let batch_size = batch_size.max(1);
     let mut pending = Vec::with_capacity(batch_size);
@@ -562,6 +712,7 @@ async fn run_llm_request_event_writer(
                 &mut receiver,
                 &mut pending,
                 batch_size,
+                raw_bodies,
             )
             .await;
             break;
@@ -575,6 +726,7 @@ async fn run_llm_request_event_writer(
                         &mut receiver,
                         &mut pending,
                         batch_size,
+                        raw_bodies,
                     )
                     .await;
                     break;
@@ -582,16 +734,16 @@ async fn run_llm_request_event_writer(
             }
             maybe_trace = receiver.recv() => {
                 let Some(trace) = maybe_trace else {
-                    flush_llm_request_event_batch(&pool, &mut pending).await;
+                    flush_llm_request_event_batch(&pool, &mut pending, raw_bodies).await;
                     break;
                 };
                 pending.push(trace);
                 if pending.len() >= batch_size {
-                    flush_llm_request_event_batch(&pool, &mut pending).await;
+                    flush_llm_request_event_batch(&pool, &mut pending, raw_bodies).await;
                 }
             }
             _ = interval.tick() => {
-                flush_llm_request_event_batch(&pool, &mut pending).await;
+                flush_llm_request_event_batch(&pool, &mut pending, raw_bodies).await;
             }
         }
     }
@@ -602,13 +754,14 @@ async fn drain_and_flush_llm_request_event_batches(
     receiver: &mut mpsc::Receiver<RuntimeLlmRequestData>,
     pending: &mut Vec<RuntimeLlmRequestData>,
     batch_size: usize,
+    raw_bodies: RawBodyPolicy,
 ) {
     loop {
         drain_llm_request_event_channel(receiver, pending, batch_size);
         if pending.is_empty() {
             break;
         }
-        flush_llm_request_event_batch(pool, pending).await;
+        flush_llm_request_event_batch(pool, pending, raw_bodies).await;
     }
 }
 
@@ -627,12 +780,16 @@ fn drain_llm_request_event_channel(
     }
 }
 
-async fn flush_llm_request_event_batch(pool: &PgPool, pending: &mut Vec<RuntimeLlmRequestData>) {
+async fn flush_llm_request_event_batch(
+    pool: &PgPool,
+    pending: &mut Vec<RuntimeLlmRequestData>,
+    raw_bodies: RawBodyPolicy,
+) {
     if pending.is_empty() {
         return;
     }
     let batch = std::mem::take(pending);
-    if let Err(error) = insert_llm_request_events(pool, &batch).await {
+    if let Err(error) = insert_llm_request_events(pool, &batch, raw_bodies).await {
         let sources = batch
             .iter()
             .map(|trace| trace.source.as_str())
@@ -645,13 +802,14 @@ async fn flush_llm_request_event_batch(pool: &PgPool, pending: &mut Vec<RuntimeL
 async fn insert_llm_request_events(
     pool: &PgPool,
     traces: &[RuntimeLlmRequestData],
+    raw_bodies: RawBodyPolicy,
 ) -> Result<(), sqlx::Error> {
     if traces.is_empty() {
         return Ok(());
     }
     let events = traces
         .iter()
-        .map(LlmRequestEvent::from_trace)
+        .map(|trace| LlmRequestEvent::from_trace(trace, raw_bodies))
         .collect::<Vec<_>>();
     let mut builder = llm_request_event_insert_builder(&events);
     builder.build().execute(pool).await?;
@@ -751,6 +909,118 @@ where
     report
 }
 
+const SQL_SELECT_LLM_RAW_BODIES_FOR_RUN: &str = r#"
+SELECT run_seq, raw_request, raw_response
+FROM llm_request_events
+WHERE run_id = $1
+  AND run_seq IS NOT NULL
+  AND NOT is_rollup
+  AND (raw_request IS NOT NULL OR raw_response IS NOT NULL)"#;
+
+/// Persisted raw bodies of one run keyed by `run_seq` (admin detail fallback
+/// when the live trace ring already rotated the round out).
+type PersistedRawBodyRow = (
+    Option<i32>,
+    Option<sqlx::types::Json<Value>>,
+    Option<sqlx::types::Json<Value>>,
+);
+
+pub async fn fetch_llm_raw_bodies_for_run(
+    pool: &PgPool,
+    run_id: &str,
+) -> Result<std::collections::HashMap<i32, (Option<Value>, Option<Value>)>, sqlx::Error> {
+    let rows: Vec<PersistedRawBodyRow> = sqlx::query_as(SQL_SELECT_LLM_RAW_BODIES_FOR_RUN)
+        .bind(run_id)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(seq, request, response)| {
+            seq.map(|seq| {
+                (
+                    seq,
+                    (request.map(|json| json.0), response.map(|json| json.0)),
+                )
+            })
+        })
+        .collect())
+}
+
+/// NULL raw bodies older than the retention window, oldest first. Returns the
+/// number of scrubbed rows; call repeatedly until it returns less than
+/// `batch_size`.
+pub async fn scrub_old_llm_raw_bodies_batch(
+    pool: &PgPool,
+    retention_hours: i32,
+    batch_size: i64,
+) -> Result<u64, sqlx::Error> {
+    if retention_hours <= 0 || batch_size <= 0 {
+        return Ok(0);
+    }
+    let result = sqlx::query(SQL_SCRUB_OLD_LLM_RAW_BODIES)
+        .bind(retention_hours)
+        .bind(batch_size)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
+/// Hourly scrub worker keeping `llm_request_events` raw bodies short-lived.
+pub async fn run_llm_raw_body_scrub_worker_until<Stop>(
+    pool: PgPool,
+    interval: Duration,
+    retention_hours: i32,
+    batch_size: i64,
+    stop: Stop,
+) -> RuntimeLlmRequestEventCleanupReport
+where
+    Stop: std::future::Future<Output = ()>,
+{
+    let mut report = RuntimeLlmRequestEventCleanupReport {
+        enabled: retention_hours > 0,
+        ..RuntimeLlmRequestEventCleanupReport::default()
+    };
+    if !report.enabled {
+        return report;
+    }
+
+    let stop = stop;
+    tokio::pin!(stop);
+    loop {
+        loop {
+            match scrub_old_llm_raw_bodies_batch(&pool, retention_hours, batch_size).await {
+                Ok(scrubbed) => {
+                    report.deleted += scrubbed;
+                    if scrubbed > 0 {
+                        tracing::debug!(
+                            scrubbed,
+                            retention_hours,
+                            "scrubbed old llm raw bodies batch"
+                        );
+                    }
+                    if scrubbed < batch_size.max(1) as u64 {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    report.errors += 1;
+                    tracing::warn!(%error, retention_hours, "failed to scrub old llm raw bodies batch");
+                    break;
+                }
+            }
+        }
+        report.ticks += 1;
+
+        let sleep = tokio::time::sleep(interval);
+        tokio::pin!(sleep);
+        tokio::select! {
+            () = &mut stop => break,
+            () = &mut sleep => {}
+        }
+    }
+    report
+}
+
 fn llm_request_event_insert_builder(events: &[LlmRequestEvent]) -> QueryBuilder<Postgres> {
     let mut builder = QueryBuilder::new(SQL_INSERT_LLM_REQUEST_EVENTS_PREFIX);
     builder.push(" ");
@@ -792,7 +1062,11 @@ fn llm_request_event_insert_builder(events: &[LlmRequestEvent]) -> QueryBuilder<
             .push_bind(event.tool_mode.clone())
             .push_bind(event.response_format.clone())
             .push_bind(sqlx::types::Json(event.inference_params.clone()))
-            .push_bind(event.error.clone());
+            .push_bind(event.error.clone())
+            .push_bind(event.run_id.clone())
+            .push_bind(event.run_seq)
+            .push_bind(event.raw_request.clone().map(sqlx::types::Json))
+            .push_bind(event.raw_response.clone().map(sqlx::types::Json));
     });
     builder
 }
@@ -801,7 +1075,7 @@ fn llm_request_event_insert_builder(events: &[LlmRequestEvent]) -> QueryBuilder<
 fn llm_request_event_batch_insert_sql_for_test(traces: &[RuntimeLlmRequestData]) -> String {
     let events = traces
         .iter()
-        .map(LlmRequestEvent::from_trace)
+        .map(|trace| LlmRequestEvent::from_trace(trace, RawBodyPolicy::default()))
         .collect::<Vec<_>>();
     llm_request_event_insert_builder(&events).into_string()
 }
@@ -865,10 +1139,28 @@ struct LlmRequestEvent {
     response_format: Option<String>,
     inference_params: Value,
     error: Option<String>,
+    run_id: Option<String>,
+    run_seq: Option<i32>,
+    raw_request: Option<Value>,
+    raw_response: Option<Value>,
+}
+
+/// A raw body is persisted only under the policy and only when its serialized
+/// size fits the cap; oversized bodies degrade to NULL, not truncated JSON.
+fn raw_body_within_policy(value: Option<&Value>, policy: RawBodyPolicy) -> Option<Value> {
+    if !policy.enabled {
+        return None;
+    }
+    let value = value?;
+    if value.is_null() {
+        return None;
+    }
+    let size = serde_json::to_string(value).map(|json| json.len()).ok()?;
+    (size <= policy.max_bytes).then(|| value.clone())
 }
 
 impl LlmRequestEvent {
-    fn from_trace(trace: &RuntimeLlmRequestData) -> Self {
+    fn from_trace(trace: &RuntimeLlmRequestData, raw_bodies: RawBodyPolicy) -> Self {
         let inference_params = trace
             .inference_params
             .clone()
@@ -927,6 +1219,10 @@ impl LlmRequestEvent {
             response_format: string_json_field(&inference_params, "response_format"),
             inference_params,
             error: non_empty_opt(trace.result.error.as_deref()),
+            run_id: trace.run_id.clone(),
+            run_seq: trace.run_seq,
+            raw_request: raw_body_within_policy(trace.raw_request.as_ref(), raw_bodies),
+            raw_response: raw_body_within_policy(trace.raw_response.as_ref(), raw_bodies),
         }
     }
 }
@@ -1206,6 +1502,7 @@ mod tests {
                     ..openplotva_dialog::DialogTraceArtifacts::default()
                 },
                 duration_ms: 123,
+                run: None,
             },
         );
         let rows = buffer
@@ -1377,7 +1674,7 @@ mod tests {
             ..RuntimeLlmRequestData::default()
         };
 
-        let event = LlmRequestEvent::from_trace(&trace);
+        let event = LlmRequestEvent::from_trace(&trace, RawBodyPolicy::default());
 
         assert_eq!(
             event.created_at.format(&Rfc3339).unwrap_or_default(),
@@ -1416,10 +1713,84 @@ mod tests {
         };
 
         let sql = llm_request_event_batch_insert_sql_for_test(&[first, second]);
+        assert!(sql.contains("run_id"));
+        assert!(sql.contains("run_seq"));
+        assert!(sql.contains("raw_request"));
+        assert!(sql.contains("raw_response"));
 
         assert!(sql.starts_with("INSERT INTO llm_request_events"));
         assert!(sql.contains("), ("));
         assert!(!sql.contains("VALUES (\n    $1,"));
+    }
+
+    #[test]
+    fn raw_bodies_persist_only_within_policy() {
+        let body = json!({"messages": [{"role": "user", "content": "привет"}]});
+        let trace = RuntimeLlmRequestData {
+            source: "dialog".to_owned(),
+            raw_request: Some(body.clone()),
+            raw_response: Some(body.clone()),
+            ..RuntimeLlmRequestData::default()
+        };
+
+        let event = LlmRequestEvent::from_trace(&trace, RawBodyPolicy::default());
+        assert_eq!(event.raw_request.as_ref(), Some(&body));
+        assert_eq!(event.raw_response.as_ref(), Some(&body));
+
+        let disabled = LlmRequestEvent::from_trace(
+            &trace,
+            RawBodyPolicy {
+                enabled: false,
+                max_bytes: 65_536,
+            },
+        );
+        assert_eq!(disabled.raw_request, None);
+        assert_eq!(disabled.raw_response, None);
+
+        let capped = LlmRequestEvent::from_trace(
+            &trace,
+            RawBodyPolicy {
+                enabled: true,
+                max_bytes: 8,
+            },
+        );
+        assert_eq!(capped.raw_request, None, "oversized bodies degrade to NULL");
+        assert_eq!(capped.raw_response, None);
+    }
+
+    #[test]
+    fn raw_body_scrub_updates_only_aged_rows_with_bodies() {
+        assert!(SQL_SCRUB_OLD_LLM_RAW_BODIES.contains("UPDATE llm_request_events"));
+        assert!(!SQL_SCRUB_OLD_LLM_RAW_BODIES.contains("DELETE"));
+        assert!(
+            SQL_SCRUB_OLD_LLM_RAW_BODIES
+                .contains("raw_request IS NOT NULL OR raw_response IS NOT NULL")
+        );
+        assert!(SQL_SCRUB_OLD_LLM_RAW_BODIES.contains("interval '1 hour'"));
+        assert!(SQL_SCRUB_OLD_LLM_RAW_BODIES.contains("SET raw_request = NULL"));
+    }
+
+    #[test]
+    fn raw_body_run_lookup_skips_rollups_and_empty_rows() {
+        assert!(SQL_SELECT_LLM_RAW_BODIES_FOR_RUN.contains("NOT is_rollup"));
+        assert!(SQL_SELECT_LLM_RAW_BODIES_FOR_RUN.contains("run_seq IS NOT NULL"));
+        assert!(
+            SQL_SELECT_LLM_RAW_BODIES_FOR_RUN
+                .contains("raw_request IS NOT NULL OR raw_response IS NOT NULL")
+        );
+    }
+
+    #[test]
+    fn trace_ring_serves_raw_payloads_by_id() {
+        let buffer = RuntimeLlmTraceBuffer::new(4);
+        let id = buffer.record(RuntimeLlmRequestData {
+            source: "dialog".to_owned(),
+            raw_request: Some(json!({"q": 1})),
+            ..RuntimeLlmRequestData::default()
+        });
+        let trace = buffer.get(id).expect("live trace by id");
+        assert_eq!(trace.raw_request, Some(json!({"q": 1})));
+        assert!(buffer.get(id + 100).is_none());
     }
 
     #[test]

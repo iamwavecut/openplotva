@@ -753,6 +753,7 @@ where
             context: trace.context.clone(),
             artifact,
             duration_ms,
+            run: None,
         });
     }
 

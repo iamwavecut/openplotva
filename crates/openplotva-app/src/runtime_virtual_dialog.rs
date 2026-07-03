@@ -100,6 +100,7 @@ pub(crate) struct RuntimeVirtualDialogExecutor {
     real_toolbox: std::sync::Arc<dyn openplotva_dialog::DialogToolbox>,
     taskman: RuntimeTaskmanInspectorHandle,
     llm_trace_buffer: RuntimeLlmTraceBuffer,
+    llm_runs: Option<crate::runtime_llm_runs::RuntimeLlmRunBuffer>,
     bot: DialogBotIdentity,
 }
 
@@ -127,8 +128,19 @@ impl RuntimeVirtualDialogExecutor {
             real_toolbox,
             taskman,
             llm_trace_buffer,
+            llm_runs: None,
             bot,
         }
+    }
+
+    /// Record console sessions in the admin LLM Dialogs buffer.
+    #[must_use]
+    pub(crate) fn with_run_buffer(
+        mut self,
+        runs: crate::runtime_llm_runs::RuntimeLlmRunBuffer,
+    ) -> Self {
+        self.llm_runs = Some(runs);
+        self
     }
 
     async fn virtual_dialog(
@@ -231,28 +243,58 @@ impl RuntimeVirtualDialogExecutor {
             RuntimeVirtualDialogToolMode::Safe => &self.safe_toolbox,
             RuntimeVirtualDialogToolMode::Real => &self.real_toolbox,
         };
-        let (answer, session_tool_calls, output_provider) =
-            match crate::dialog_turn::run_captured_session(
-                step_provider,
-                toolbox.as_ref(),
-                input,
-                8,
-            )
-            .await
-            {
-                Ok(captured) => (
-                    captured.messages.join("\n\n"),
-                    captured.tool_calls,
-                    captured.provider,
+        let run_id = format!("console-{}-m{user_message_id}", record.session_id);
+        if let Some(runs) = &self.llm_runs {
+            runs.begin_run(
+                run_id.clone(),
+                "console",
+                crate::runtime_llm_runs::RunOrigin {
+                    chat_id: record.chat_id,
+                    thread_id: None,
+                    chat_title: Some(format!("console {}", record.session_id)),
+                    user_id: record.user_id,
+                    user_full_name: Some(virtual_user_name(&record.session_id)),
+                    trigger_message_id: user_message_id,
+                    trigger_preview: (!request.text.trim().is_empty())
+                        .then(|| request.text.chars().take(120).collect()),
+                    queue_name: None,
+                    job_id: None,
+                },
+                now,
+            );
+        }
+        let captured = openplotva_llm::with_run_scope(
+            openplotva_llm::LlmRunScope {
+                run_id: run_id.clone(),
+                run_kind: "console".to_owned(),
+            },
+            crate::dialog_turn::run_captured_session(step_provider, toolbox.as_ref(), input, 8),
+        )
+        .await;
+        if let Some(runs) = &self.llm_runs {
+            let (status, error) = match &captured {
+                Ok(_) => (crate::runtime_llm_runs::RunStatus::Completed, None),
+                Err(error) => (
+                    crate::runtime_llm_runs::RunStatus::Failed,
+                    Some(error.clone()),
                 ),
-                Err(error) => {
-                    let _ = self
-                        .history
-                        .delete_message_entries(record.chat_id, user_message_id)
-                        .await;
-                    return Err(error);
-                }
             };
+            runs.finish_run(&run_id, status, None, error, OffsetDateTime::now_utc());
+        }
+        let (answer, session_tool_calls, output_provider) = match captured {
+            Ok(captured) => (
+                captured.messages.join("\n\n"),
+                captured.tool_calls,
+                captured.provider,
+            ),
+            Err(error) => {
+                let _ = self
+                    .history
+                    .delete_message_entries(record.chat_id, user_message_id)
+                    .await;
+                return Err(error);
+            }
+        };
         self.history
             .upsert_tool_call_history(record.chat_id, user_message_id, &session_tool_calls)
             .await
@@ -487,7 +529,12 @@ impl RuntimeVirtualDialogExecutor {
     }
 
     fn cleanup_live_artifacts(&self, record: &RuntimeVirtualDialogRecord) -> LiveCleanupReport {
-        cleanup_runtime_virtual_live_artifacts(record, &self.taskman, &self.llm_trace_buffer)
+        cleanup_runtime_virtual_live_artifacts(
+            record,
+            &self.taskman,
+            &self.llm_trace_buffer,
+            self.llm_runs.as_ref(),
+        )
     }
 }
 
@@ -610,6 +657,7 @@ pub(crate) async fn run_runtime_virtual_dialog_cleanup_worker_until(
     history: PostgresHistoryStore,
     taskman: RuntimeTaskmanInspectorHandle,
     llm_trace_buffer: RuntimeLlmTraceBuffer,
+    llm_runs: Option<crate::runtime_llm_runs::RuntimeLlmRunBuffer>,
     interval: Duration,
     mut stop: watch::Receiver<bool>,
 ) -> i32 {
@@ -623,7 +671,7 @@ pub(crate) async fn run_runtime_virtual_dialog_cleanup_worker_until(
                 match store.expired_sessions(now).await {
                     Ok(records) => {
                         for record in &records {
-                            let _ = cleanup_runtime_virtual_live_artifacts(record, &taskman, &llm_trace_buffer);
+                            let _ = cleanup_runtime_virtual_live_artifacts(record, &taskman, &llm_trace_buffer, llm_runs.as_ref());
                             if let Err(error) = history.invalidate_chat_history_cache(record.chat_id).await {
                                 tracing::debug!(%error, chat_id = record.chat_id, "failed to invalidate expired runtime virtual dialog history cache");
                             }
@@ -650,6 +698,7 @@ fn cleanup_runtime_virtual_live_artifacts(
     record: &RuntimeVirtualDialogRecord,
     taskman: &RuntimeTaskmanInspectorHandle,
     llm_trace_buffer: &RuntimeLlmTraceBuffer,
+    llm_runs: Option<&crate::runtime_llm_runs::RuntimeLlmRunBuffer>,
 ) -> LiveCleanupReport {
     let taskman_deleted = taskman
         .delete_jobs(RuntimeTaskmanJobsFilter {
@@ -661,6 +710,9 @@ fn cleanup_runtime_virtual_live_artifacts(
         .map(|report| report.deleted)
         .unwrap_or_default();
     let llm_traces_deleted = llm_trace_buffer.prune_chat(record.chat_id);
+    if let Some(runs) = llm_runs {
+        runs.prune_chat(record.chat_id);
+    }
     LiveCleanupReport {
         taskman_deleted,
         llm_traces_deleted,

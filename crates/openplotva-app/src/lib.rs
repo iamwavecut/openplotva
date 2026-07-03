@@ -47,6 +47,7 @@ mod runtime_entities;
 mod runtime_gemini_cache;
 mod runtime_llm;
 mod runtime_llm_analytics;
+mod runtime_llm_runs;
 mod runtime_retention;
 mod runtime_routing;
 mod runtime_safety;
@@ -134,6 +135,7 @@ struct RuntimeWorkers {
     taskman_inspector: runtime_taskman::RuntimeTaskmanInspectorHandle,
     memory_restart_trigger: Option<Arc<tokio::sync::Notify>>,
     llm_trace_buffer: Option<runtime_llm::RuntimeLlmTraceBuffer>,
+    llm_run_buffer: Option<runtime_llm_runs::RuntimeLlmRunBuffer>,
     routing_event_buffer: Option<runtime_routing::RoutingEventBuffer>,
     routing_event_reporter: Option<runtime_routing::RoutingEventReporter>,
     runtime_api_tls_public_key_pin: Option<String>,
@@ -426,6 +428,7 @@ struct StaticWebRoutes {
     cache_inspector: runtime_cache::RuntimeCacheInspectorHandle,
     taskman_inspector: runtime_taskman::RuntimeTaskmanInspectorHandle,
     llm_trace_buffer: Option<runtime_llm::RuntimeLlmTraceBuffer>,
+    llm_run_buffer: Option<runtime_llm_runs::RuntimeLlmRunBuffer>,
     routing_event_buffer: Option<runtime_routing::RoutingEventBuffer>,
     routing_event_reporter: Option<runtime_routing::RoutingEventReporter>,
     llm_discovery_base_url: Arc<str>,
@@ -492,6 +495,7 @@ fn static_web_routes(
         cache_inspector: runtime_cache::RuntimeCacheInspectorHandle::default(),
         taskman_inspector: runtime_taskman::RuntimeTaskmanInspectorHandle::default(),
         llm_trace_buffer: None,
+        llm_run_buffer: None,
         routing_event_buffer: None,
         routing_event_reporter: None,
         llm_discovery_base_url: Arc::from(""),
@@ -549,6 +553,7 @@ fn static_web_routes_from_config(
     routes.cache_inspector = runtime_workers.cache_inspector.clone();
     routes.taskman_inspector = runtime_workers.taskman_inspector.clone();
     routes.llm_trace_buffer = runtime_workers.llm_trace_buffer.clone();
+    routes.llm_run_buffer = runtime_workers.llm_run_buffer.clone();
     routes.routing_event_buffer = runtime_workers.routing_event_buffer.clone();
     routes.routing_event_reporter = runtime_workers.routing_event_reporter.clone();
     routes.llm_discovery_base_url = Arc::from(config.llm.discovery.base_url.clone());
@@ -732,6 +737,12 @@ fn install_static_web_routes(router: axum::Router, static_web: StaticWebRoutes) 
             "/admin/api/analytics/llm/summary",
             any(admin_llm_analytics_summary),
         )
+        .route("/admin/api/llm/dialogs", any(admin_llm_dialogs))
+        .route(
+            "/admin/api/llm/dialogs/detail",
+            any(admin_llm_dialogs_detail),
+        )
+        .route("/admin/api/llm/dialogs/clear", any(admin_llm_dialogs_clear))
         .route("/admin/api/memory/cards", any(admin_memory_cards))
         .route("/admin/api/memory/runs", any(admin_memory_runs))
         .route("/admin/api/memory/restart", any(admin_memory_restart))
@@ -799,6 +810,9 @@ const GO_ADMIN_API_ROUTE_PATTERNS: &[&str] = &[
     "/admin/api/metrics",
     "/admin/api/safety/checks",
     "/admin/api/analytics/llm/summary",
+    "/admin/api/llm/dialogs",
+    "/admin/api/llm/dialogs/detail",
+    "/admin/api/llm/dialogs/clear",
     "/admin/api/memory/cards",
     "/admin/api/memory/runs",
     "/admin/api/memory/restart",
@@ -1025,6 +1039,32 @@ async fn admin_llm_analytics_summary(
     Extension(routes): Extension<StaticWebRoutes>,
 ) -> Response {
     admin_llm_analytics_summary_response(&routes, method, &headers, raw_query.as_deref()).await
+}
+
+async fn admin_llm_dialogs(
+    method: Method,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Extension(routes): Extension<StaticWebRoutes>,
+) -> Response {
+    admin_llm_dialogs_response(&routes, method, &headers, raw_query.as_deref())
+}
+
+async fn admin_llm_dialogs_detail(
+    method: Method,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Extension(routes): Extension<StaticWebRoutes>,
+) -> Response {
+    admin_llm_dialogs_detail_response(&routes, method, &headers, raw_query.as_deref()).await
+}
+
+async fn admin_llm_dialogs_clear(
+    method: Method,
+    headers: HeaderMap,
+    Extension(routes): Extension<StaticWebRoutes>,
+) -> Response {
+    admin_llm_dialogs_clear_response(&routes, method, &headers)
 }
 
 async fn admin_memory_cards(
@@ -6906,6 +6946,167 @@ async fn admin_llm_analytics_summary_response(
     }
 }
 
+fn admin_llm_dialogs_filter(raw_query: Option<&str>) -> runtime_llm_runs::RunListFilter {
+    let values = admin_auth_query_values(raw_query);
+    runtime_llm_runs::RunListFilter {
+        kind: values
+            .get("kind")
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty() && value != "all"),
+        chat_id: values
+            .get("chat_id")
+            .and_then(|value| value.trim().parse::<i64>().ok()),
+        errors_only: parse_admin_optional_bool(values.get("errors_only").map(String::as_str))
+            .unwrap_or(false),
+        q: values
+            .get("q")
+            .map(|value| value.trim().to_owned())
+            .unwrap_or_default(),
+        limit: parse_admin_positive_i32(values.get("limit").map(String::as_str), 200, 1000)
+            as usize,
+    }
+}
+
+fn admin_llm_dialogs_response(
+    routes: &StaticWebRoutes,
+    method: Method,
+    headers: &HeaderMap,
+    raw_query: Option<&str>,
+) -> Response {
+    if method != Method::GET {
+        return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+    }
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids, &routes.bot_token) {
+        return admin_auth_failure_response(error);
+    }
+    let Some(buffer) = routes.llm_run_buffer.as_ref() else {
+        return admin_json_no_cache_response(
+            StatusCode::OK,
+            serde_json::json!({ "count": 0, "runs": [] }),
+        );
+    };
+    let filter = admin_llm_dialogs_filter(raw_query);
+    let runs = buffer
+        .list(&filter, OffsetDateTime::now_utc())
+        .iter()
+        .map(runtime_llm_runs::RunRecord::skeleton_json)
+        .collect::<Vec<_>>();
+    admin_json_no_cache_response(
+        StatusCode::OK,
+        serde_json::json!({ "count": runs.len(), "runs": runs }),
+    )
+}
+
+async fn admin_llm_dialogs_detail_response(
+    routes: &StaticWebRoutes,
+    method: Method,
+    headers: &HeaderMap,
+    raw_query: Option<&str>,
+) -> Response {
+    if method != Method::GET {
+        return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+    }
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids, &routes.bot_token) {
+        return admin_auth_failure_response(error);
+    }
+    let id = admin_auth_query_values(raw_query)
+        .remove("id")
+        .and_then(|value| value.trim().parse::<i64>().ok());
+    let Some(id) = id else {
+        return admin_error_response(StatusCode::BAD_REQUEST, "id is required");
+    };
+    let record = routes
+        .llm_run_buffer
+        .as_ref()
+        .and_then(|buffer| buffer.get(id));
+    let Some(record) = record else {
+        return admin_json_no_cache_response(
+            StatusCode::OK,
+            serde_json::json!({ "run": serde_json::Value::Null }),
+        );
+    };
+    let mut run_json = record.detail_json();
+    let live_traces: Vec<Option<openplotva_server::RuntimeLlmRequestData>> = record
+        .rounds
+        .iter()
+        .map(|round| {
+            routes
+                .llm_trace_buffer
+                .as_ref()
+                .and_then(|traces| traces.get(round.trace_id))
+        })
+        .collect();
+    let mut persisted: std::collections::HashMap<
+        i32,
+        (Option<serde_json::Value>, Option<serde_json::Value>),
+    > = std::collections::HashMap::new();
+    if live_traces.iter().any(Option::is_none)
+        && let Some(pool) = routes.postgres.as_ref()
+    {
+        match runtime_llm::fetch_llm_raw_bodies_for_run(pool, &record.run_id).await {
+            Ok(bodies) => persisted = bodies,
+            Err(error) => {
+                tracing::warn!(%error, run_id = %record.run_id, "failed to load persisted llm raw bodies");
+            }
+        }
+    }
+    if let Some(rounds) = run_json["rounds"].as_array_mut() {
+        for (index, round_json) in rounds.iter_mut().enumerate() {
+            let Some(round) = record.rounds.get(index) else {
+                continue;
+            };
+            match live_traces.get(index).and_then(Option::as_ref) {
+                Some(trace) => {
+                    round_json["raw_source"] = serde_json::json!("live");
+                    round_json["raw_request"] =
+                        trace.raw_request.clone().unwrap_or(serde_json::Value::Null);
+                    round_json["raw_response"] = trace
+                        .raw_response
+                        .clone()
+                        .unwrap_or(serde_json::Value::Null);
+                    if let Some(usage) = trace.usage.clone() {
+                        round_json["usage"] = usage;
+                    }
+                    if let Some(timings) = trace.timings.clone() {
+                        round_json["timings"] = timings;
+                    }
+                    if let Some(params) = trace.inference_params.clone() {
+                        round_json["inference_params"] = params;
+                    }
+                }
+                None => match persisted.remove(&round.seq) {
+                    Some((request, response)) if request.is_some() || response.is_some() => {
+                        round_json["raw_source"] = serde_json::json!("db");
+                        round_json["raw_request"] = request.unwrap_or(serde_json::Value::Null);
+                        round_json["raw_response"] = response.unwrap_or(serde_json::Value::Null);
+                    }
+                    _ => {
+                        round_json["raw_source"] = serde_json::json!("rotated_out");
+                    }
+                },
+            }
+        }
+    }
+    admin_json_no_cache_response(StatusCode::OK, serde_json::json!({ "run": run_json }))
+}
+
+fn admin_llm_dialogs_clear_response(
+    routes: &StaticWebRoutes,
+    method: Method,
+    headers: &HeaderMap,
+) -> Response {
+    if method != Method::POST {
+        return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+    }
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids, &routes.bot_token) {
+        return admin_auth_failure_response(error);
+    }
+    if let Some(buffer) = routes.llm_run_buffer.as_ref() {
+        buffer.clear();
+    }
+    admin_json_no_cache_response(StatusCode::OK, serde_json::json!({ "ok": true }))
+}
+
 fn admin_llm_analytics_since_time(
     summary: &openplotva_server::RuntimeLlmAnalyticsData,
 ) -> OffsetDateTime {
@@ -9396,6 +9597,7 @@ async fn start_runtime_workers(
         taskman_inspector: taskman_inspector.clone(),
         memory_restart_trigger: None,
         llm_trace_buffer: None,
+        llm_run_buffer: None,
         routing_event_buffer: None,
         routing_event_reporter: None,
         runtime_api_tls_public_key_pin: None,
@@ -9556,6 +9758,11 @@ async fn start_runtime_workers(
         runtime_llm::PostgresRuntimeLlmEventRecorder::spawn(
             service_clients.postgres.clone(),
             stop.subscribe(),
+            runtime_llm::RawBodyPolicy {
+                enabled: config.runtime_api.llm_raw_body_persist_enabled,
+                max_bytes: usize::try_from(config.runtime_api.llm_raw_body_max_bytes)
+                    .unwrap_or(65_536),
+            },
         );
     workers.handles.push(llm_event_recorder_worker);
     let turn_outcome_buffer = dialog_turn::RuntimeTurnOutcomeBuffer::default();
@@ -9565,10 +9772,17 @@ async fn start_runtime_workers(
             stop.subscribe(),
         );
     workers.handles.push(turn_outcome_recorder_worker);
+    let llm_run_buffer = runtime_llm_runs::RuntimeLlmRunBuffer::new(
+        usize::try_from(config.runtime_api.llm_run_buffer_capacity)
+            .unwrap_or(runtime_llm_runs::DEFAULT_LLM_RUN_BUFFER_CAPACITY)
+            .max(1),
+    );
+    workers.llm_run_buffer = Some(llm_run_buffer.clone());
     let turn_outcome_observer = dialog_turn::DialogTurnObserver::new(
         turn_outcome_buffer.clone(),
         Some(turn_outcome_recorder),
-    );
+    )
+    .with_run_buffer(llm_run_buffer.clone());
     let turn_outcome_cleanup_pool = service_clients.postgres.clone();
     let turn_outcome_cleanup_stop = stop.subscribe();
     let turn_outcome_cleanup_worker = tokio::spawn(async move {
@@ -9648,6 +9862,33 @@ async fn start_runtime_workers(
         readiness_checks.push(ReadinessCheck::skipped(
             "llm_request_events_cleanup",
             "LLM raw request events cleanup disabled",
+        ));
+    }
+    let llm_raw_body_retention_hours = config.runtime_api.llm_raw_body_retention_hours;
+    if config.runtime_api.llm_raw_body_persist_enabled && llm_raw_body_retention_hours > 0 {
+        let llm_raw_scrub_pool = service_clients.postgres.clone();
+        let llm_raw_scrub_stop = stop.subscribe();
+        let llm_raw_scrub_worker = tokio::spawn(async move {
+            let report = runtime_llm::run_llm_raw_body_scrub_worker_until(
+                llm_raw_scrub_pool,
+                std::time::Duration::from_secs(60 * 60),
+                llm_raw_body_retention_hours,
+                runtime_llm::LLM_REQUEST_EVENTS_CLEANUP_BATCH_SIZE,
+                wait_for_runtime_stop(llm_raw_scrub_stop),
+            )
+            .await;
+
+            tracing::info!(?report, "llm raw body scrub worker stopped");
+        });
+        readiness_checks.push(ReadinessCheck::ok(
+            "llm_raw_body_scrub",
+            format!("LLM raw bodies scrubbed hourly, retention {llm_raw_body_retention_hours}h"),
+        ));
+        workers.handles.push(llm_raw_scrub_worker);
+    } else {
+        readiness_checks.push(ReadinessCheck::skipped(
+            "llm_raw_body_scrub",
+            "LLM raw body persistence disabled",
         ));
     }
     let chat_history_retention_days = config.llm.history_summary.chat_history_retention_days;
@@ -9767,11 +10008,13 @@ async fn start_runtime_workers(
         ));
     }
     workers.llm_trace_buffer = Some(llm_trace_buffer.clone());
-    let llm_observer: Arc<dyn openplotva_llm::LlmCallObserver> =
-        Arc::new(runtime_llm::RuntimeLlmObserver::new(
+    let llm_observer: Arc<dyn openplotva_llm::LlmCallObserver> = Arc::new(
+        runtime_llm::RuntimeLlmObserver::new(
             llm_trace_buffer.clone(),
             Some(llm_event_recorder.clone()),
-        ));
+        )
+        .with_run_buffer(llm_run_buffer.clone()),
+    );
     openplotva_llm::trace::set_observer(llm_observer);
     let memory_store = PostgresMemoryStore::new(service_clients.postgres.clone());
     let memory_restart_trigger = Arc::new(tokio::sync::Notify::new());
@@ -9803,6 +10046,7 @@ async fn start_runtime_workers(
                 ),
             )),
             llm_trace_inspector: Some(Arc::new(llm_trace_buffer.clone())),
+            llm_run_inspector: Some(Arc::new(llm_run_buffer.clone())),
             turn_outcome_inspector: Some(Arc::new(turn_outcome_buffer.clone())),
             routing_event_inspector: Some(Arc::new(routing_event_buffer.clone())),
             llm_analytics_reader: Some(Arc::new(
@@ -10018,6 +10262,7 @@ async fn start_runtime_workers(
         let cleanup_history = history_store.clone();
         let cleanup_taskman = taskman_inspector.clone();
         let cleanup_llm_traces = llm_trace_buffer.clone();
+        let cleanup_llm_runs = llm_run_buffer.clone();
         let cleanup_stop = stop.subscribe();
         let cleanup_interval = runtime_virtual_dialog::RUNTIME_VIRTUAL_DIALOG_CLEANUP_INTERVAL;
         let cleanup_worker = tokio::spawn(async move {
@@ -10026,6 +10271,7 @@ async fn start_runtime_workers(
                 cleanup_history,
                 cleanup_taskman,
                 cleanup_llm_traces,
+                Some(cleanup_llm_runs),
                 cleanup_interval,
                 cleanup_stop,
             )
@@ -10995,7 +11241,8 @@ async fn start_runtime_workers(
                         bot_identity.id,
                         bot_identity.first_name.clone(),
                     ),
-                ),
+                )
+                .with_run_buffer(llm_run_buffer.clone()),
             ));
             readiness_checks.push(ReadinessCheck::ok(
                 "runtime_virtual_dialogs",
@@ -11042,6 +11289,7 @@ async fn start_runtime_workers(
                 let reaction_emoji = dialog_terminal_reaction_emoji.clone();
                 let obligations = Arc::clone(&delivery_obligation_store);
                 let session_wiring = dialog_session_wiring.clone();
+                let llm_runs = llm_run_buffer.clone();
                 let stop_rx = stop.subscribe();
                 move |index: usize, retire: tokio::sync::oneshot::Receiver<()>| {
                     let worker_queue = Arc::clone(&queue);
@@ -11055,6 +11303,7 @@ async fn start_runtime_workers(
                     let worker_reaction_emoji = reaction_emoji.clone();
                     let worker_obligations = Arc::clone(&obligations);
                     let worker_session = session_wiring.clone();
+                    let worker_llm_runs = llm_runs.clone();
                     let worker_stop = stop_rx.clone();
                     tokio::spawn(async move {
                         // A retired worker finishes its current job and exits
@@ -11088,6 +11337,7 @@ async fn start_runtime_workers(
                                     ),
                                     obligations: Some(worker_obligations.as_ref()),
                                     session: worker_session.as_ref(),
+                                    llm_runs: Some(&worker_llm_runs),
                                 },
                                 stop_future,
                             )
@@ -11248,7 +11498,8 @@ async fn start_runtime_workers(
         image_agent_reasoner.clone(),
         image_agent_tools.clone(),
         image_agent_settings.clone(),
-    );
+    )
+    .with_run_buffer(llm_run_buffer.clone());
     let mut vip_image_effects =
         image_jobs::TelegramImageJobEffects::new(telegram.clone(), Arc::clone(&rich_sender));
     {
@@ -11326,7 +11577,8 @@ async fn start_runtime_workers(
         image_agent_reasoner,
         image_agent_tools,
         image_agent_settings,
-    );
+    )
+    .with_run_buffer(llm_run_buffer.clone());
     let mut regular_image_effects =
         image_jobs::TelegramImageJobEffects::new(telegram.clone(), Arc::clone(&rich_sender));
     {
@@ -11424,7 +11676,8 @@ async fn start_runtime_workers(
             song_agent_settings,
             song_agent_tools,
             base_song_material,
-        );
+        )
+        .with_run_buffer(llm_run_buffer.clone());
         let music_attempt_walker = routed_attempts::RoutedAttemptWalker::new(
             Arc::clone(&router_handle),
             Arc::clone(&router_breakers),
@@ -12134,6 +12387,7 @@ async fn shutdown_runtime_workers(workers: RuntimeWorkers) {
         taskman_inspector: _,
         memory_restart_trigger: _,
         llm_trace_buffer: _,
+        llm_run_buffer: _,
         routing_event_buffer: _,
         routing_event_reporter: _,
         runtime_api_tls_public_key_pin: _,
@@ -14706,6 +14960,25 @@ mod tests {
     }
 
     #[test]
+    fn admin_llm_dialogs_filter_parses_query_params() {
+        use crate::admin_llm_dialogs_filter;
+        let filter = admin_llm_dialogs_filter(Some(
+            "kind=dialog&chat_id=-100500&errors_only=true&q=%D0%BF%D1%80%D0%B8%D0%B2%D0%B5%D1%82&limit=50",
+        ));
+        assert_eq!(filter.kind.as_deref(), Some("dialog"));
+        assert_eq!(filter.chat_id, Some(-100_500));
+        assert!(filter.errors_only);
+        assert_eq!(filter.q, "привет");
+        assert_eq!(filter.limit, 50);
+
+        let defaults = admin_llm_dialogs_filter(Some("kind=all"));
+        assert_eq!(defaults.kind, None, "kind=all means no kind filter");
+        assert_eq!(defaults.chat_id, None);
+        assert!(!defaults.errors_only);
+        assert_eq!(defaults.limit, 200);
+    }
+
+    #[test]
     fn app_router_builds_with_admin_api_routes_before_static_wildcard() {
         assert_eq!(
             GO_ADMIN_API_ROUTE_PATTERNS,
@@ -14719,6 +14992,9 @@ mod tests {
                 "/admin/api/metrics",
                 "/admin/api/safety/checks",
                 "/admin/api/analytics/llm/summary",
+                "/admin/api/llm/dialogs",
+                "/admin/api/llm/dialogs/detail",
+                "/admin/api/llm/dialogs/clear",
                 "/admin/api/memory/cards",
                 "/admin/api/memory/runs",
                 "/admin/api/memory/restart",

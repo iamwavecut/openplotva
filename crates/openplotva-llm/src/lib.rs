@@ -14,7 +14,8 @@ pub mod trace;
 pub mod whitecircle;
 
 pub use trace::{
-    LlmCallContext, LlmCallObserver, LlmCallRecord, LlmCallTags, LlmCallTrace, LlmCallTraceRegistry,
+    LlmCallContext, LlmCallObserver, LlmCallRecord, LlmCallTags, LlmCallTrace,
+    LlmCallTraceRegistry, LlmRunScope, current_run_scope, with_run_scope,
 };
 
 /// Boxed LLM provider error.

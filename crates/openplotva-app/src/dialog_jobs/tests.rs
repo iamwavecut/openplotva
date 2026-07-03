@@ -115,6 +115,7 @@ async fn dialog_worker_skips_resend_when_answer_sent_marker_present() -> Result<
             routing_events: None,
             turn_outcomes: Some(&outcomes),
             session: leaked_session_wiring(),
+            llm_runs: None,
         },
     )
     .await;
@@ -307,6 +308,7 @@ async fn dialog_worker_completes_delegated_queued_song_without_sending_text()
             terminal_signal: crate::dialog_turn::TurnSignalPolicy::default(),
             obligations: None,
             session: &wiring,
+            llm_runs: None,
         },
     )
     .await;
@@ -453,6 +455,7 @@ async fn dialog_worker_regenerates_duplicate_answer_with_anti_loop_hint()
             routing_events: None,
             turn_outcomes: Some(&outcomes),
             session: leaked_session_wiring(),
+            llm_runs: None,
         },
     )
     .await;
@@ -528,6 +531,7 @@ async fn dialog_worker_exhausts_regenerations_on_permanent_duplicate_and_signals
             routing_events: None,
             turn_outcomes: Some(&outcomes),
             session: leaked_session_wiring(),
+            llm_runs: None,
         },
     )
     .await;
@@ -608,6 +612,7 @@ async fn dialog_worker_skips_regeneration_when_budget_nearly_exhausted()
             routing_events: None,
             turn_outcomes: Some(&outcomes),
             session: leaked_session_wiring(),
+            llm_runs: None,
         },
     )
     .await;
@@ -670,6 +675,7 @@ async fn dialog_worker_signals_terminal_failure_with_configured_emoji() -> Resul
             routing_events: None,
             turn_outcomes: Some(&outcomes),
             session: leaked_session_wiring(),
+            llm_runs: None,
         },
     )
     .await;
@@ -749,6 +755,7 @@ async fn dialog_worker_skips_signal_for_job_older_than_max_signal_age() -> Resul
             routing_events: None,
             turn_outcomes: Some(&outcomes),
             session: leaked_session_wiring(),
+            llm_runs: None,
         },
     )
     .await;
@@ -808,6 +815,7 @@ async fn dialog_worker_still_reacts_but_gates_text_fallback_after_prior_signal()
             routing_events: None,
             turn_outcomes: None,
             session: leaked_session_wiring(),
+            llm_runs: None,
         },
     )
     .await;
@@ -867,6 +875,7 @@ async fn dialog_worker_fails_when_answer_sanitizes_to_empty_after_attempts_exhau
             routing_events: None,
             turn_outcomes: Some(&outcomes),
             session: leaked_session_wiring(),
+            llm_runs: None,
         },
     )
     .await;
@@ -979,6 +988,7 @@ async fn dialog_worker_fails_expired_queue_backlog_job_without_provider_call()
             routing_events: None,
             turn_outcomes: Some(&outcomes),
             session: leaked_session_wiring(),
+            llm_runs: None,
         },
     )
     .await;
@@ -1093,6 +1103,7 @@ async fn dialog_worker_fails_turn_budget_exhausted_before_provider_call()
             routing_events: None,
             turn_outcomes: Some(&outcomes),
             session: leaked_session_wiring(),
+            llm_runs: None,
         },
     )
     .await;
@@ -1151,6 +1162,7 @@ async fn dialog_worker_retries_provider_empty_output_and_fails_on_exhaustion()
         routing_events: None,
         turn_outcomes: Some(&outcomes),
         session: leaked_session_wiring(),
+        llm_runs: None,
     };
 
     let first = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
@@ -1226,6 +1238,7 @@ async fn dialog_worker_requeues_undeliverable_answer_instead_of_failing_at_send(
         routing_events: None,
         turn_outcomes: Some(&outcomes),
         session: leaked_session_wiring(),
+        llm_runs: None,
     };
 
     let first = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
@@ -1579,6 +1592,7 @@ async fn dialog_worker_exhausts_retryable_provider_error_at_default_limit()
             routing_events: Some(&reporter),
             turn_outcomes: None,
             session: leaked_session_wiring(),
+            llm_runs: None,
         },
     )
     .await;
@@ -1656,6 +1670,7 @@ async fn dialog_worker_uses_configured_retry_attempt_limit() -> Result<(), Box<d
             routing_events: None,
             turn_outcomes: None,
             session: leaked_session_wiring(),
+            llm_runs: None,
         },
     )
     .await;
@@ -1680,6 +1695,7 @@ async fn dialog_worker_uses_configured_retry_attempt_limit() -> Result<(), Box<d
             routing_events: None,
             turn_outcomes: None,
             session: leaked_session_wiring(),
+            llm_runs: None,
         },
     )
     .await;
@@ -2990,6 +3006,7 @@ where
             routing_events: None,
             turn_outcomes: None,
             session,
+            llm_runs: None,
         },
     )
     .await
@@ -3012,6 +3029,7 @@ fn session_options<'a>(
         routing_events: None,
         turn_outcomes: Some(outcomes),
         session: wiring,
+        llm_runs: None,
     }
 }
 
@@ -3146,6 +3164,7 @@ async fn worker_loop_forwards_session_wiring_to_turns() -> Result<(), Box<dyn Er
             terminal_signal: crate::dialog_turn::TurnSignalPolicy::default(),
             obligations: None,
             session: &wiring,
+            llm_runs: None,
         },
         stop,
     )
@@ -3158,6 +3177,207 @@ async fn worker_loop_forwards_session_wiring_to_turns() -> Result<(), Box<dyn Er
     let rows = ledger_rows(&outcomes);
     assert_eq!(rows[0].outcome, "sent");
     assert_eq!(rows[0].detail["iterations"], serde_json::json!(2));
+    Ok(())
+}
+
+#[tokio::test]
+async fn turn_opens_and_closes_an_agent_run_with_origin_tools_and_outcome()
+-> Result<(), Box<dyn Error>> {
+    let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+    let queue = InMemoryTaskQueue::new();
+    let job_id = queue.assign(
+        DIALOG_AIFARM_QUEUE_NAME,
+        new_dialog_job_at(dialog_params("что там в мире?"), now),
+    );
+    let provider = StepProviderStub::with_steps(vec![
+        Ok(step_tools(
+            "",
+            vec![(
+                "call-1",
+                openplotva_dialog::ToolStep {
+                    step: openplotva_dialog::STEP_WEB_SEARCH.to_owned(),
+                    query: "новости".to_owned(),
+                    ..openplotva_dialog::ToolStep::default()
+                },
+            )],
+        )),
+        Ok(step_text("вот что нашлось")),
+    ]);
+    let toolbox: Arc<dyn openplotva_dialog::DialogToolbox> =
+        Arc::new(SessionToolboxStub::default());
+    let wiring = session_wiring(toolbox, None);
+    let effects = EffectsStub::default();
+    let runs = crate::runtime_llm_runs::RuntimeLlmRunBuffer::new(8);
+    let outcomes = crate::dialog_turn::DialogTurnObserver::new(
+        crate::dialog_turn::RuntimeTurnOutcomeBuffer::new(8),
+        None,
+    )
+    .with_run_buffer(runs.clone());
+
+    let report = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+        &queue,
+        &provider,
+        &effects,
+        &BasicDialogInputMaterializer,
+        &NoopDialogToolCallHistoryStore,
+        DialogJobProcessOptions {
+            llm_runs: Some(&runs),
+            ..session_options(now, &outcomes, &wiring)
+        },
+    )
+    .await;
+    assert!(report.sent_answer);
+
+    let records = runs.list(&crate::runtime_llm_runs::RunListFilter::default(), now);
+    assert_eq!(records.len(), 1);
+    let record = &records[0];
+    assert_eq!(record.run_id, format!("job-{job_id}"));
+    assert_eq!(record.kind, "dialog");
+    assert_eq!(record.status, crate::runtime_llm_runs::RunStatus::Completed);
+    assert_eq!(record.origin.chat_id, 42);
+    assert_eq!(record.origin.thread_id, Some(9));
+    assert_eq!(record.origin.user_id, 7);
+    assert_eq!(record.origin.user_full_name.as_deref(), Some("Ada"));
+    assert_eq!(record.origin.trigger_message_id, 100);
+    assert_eq!(
+        record.origin.trigger_preview.as_deref(),
+        Some("что там в мире?")
+    );
+    assert_eq!(
+        record.origin.queue_name.as_deref(),
+        Some(DIALOG_AIFARM_QUEUE_NAME)
+    );
+    assert_eq!(record.origin.job_id, Some(job_id));
+    let outcome = record.outcome.as_ref().expect("ledger outcome on the run");
+    assert_eq!(outcome.outcome, "sent");
+    assert_eq!(record.totals.tool_calls, 1, "session tool hook recorded");
+    assert!(record.ended_at.is_some());
+    Ok(())
+}
+
+/// The loop must forward `LoopOptions.llm_runs` into every tick — a dropped
+/// option silently ships an empty LLM Dialogs section (same failure mode the
+/// `session` option had before it got its loop test).
+#[tokio::test]
+async fn worker_loop_forwards_llm_runs_into_turns() -> Result<(), Box<dyn Error>> {
+    let now = OffsetDateTime::now_utc();
+    let queue = InMemoryTaskQueue::new();
+    let job_id = queue.assign(
+        DIALOG_AIFARM_QUEUE_NAME,
+        new_dialog_job_at(dialog_params("сколько время?"), now),
+    );
+    let provider = StepProviderStub::with_steps(vec![Ok(step_text("полдень"))]);
+    let toolbox: Arc<dyn openplotva_dialog::DialogToolbox> =
+        Arc::new(SessionToolboxStub::default());
+    let wiring = session_wiring(toolbox, None);
+    let effects = EffectsStub::default();
+    let runs = crate::runtime_llm_runs::RuntimeLlmRunBuffer::new(8);
+    let outcomes = crate::dialog_turn::DialogTurnObserver::new(
+        crate::dialog_turn::RuntimeTurnOutcomeBuffer::new(8),
+        None,
+    )
+    .with_run_buffer(runs.clone());
+
+    let stop = async {
+        for _ in 0..500 {
+            if record_status(&queue, job_id) == JobStatus::Completed {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    };
+    run_dialog_job_worker_with_materializer_and_history_every_until(
+        &queue,
+        &provider,
+        &effects,
+        DialogJobWorkerLoopOptions {
+            materializer: &BasicDialogInputMaterializer,
+            tool_history: &NoopDialogToolCallHistoryStore,
+            routing_events: None,
+            turn_outcomes: Some(&outcomes),
+            queue_names: &DIALOG_JOB_WORKER_QUEUES,
+            interval: std::time::Duration::from_millis(5),
+            max_llm_job_attempts: 2,
+            turn_budget_secs: DEFAULT_DIALOG_TURN_BUDGET_SECS,
+            turn_max_queue_age_secs: DEFAULT_DIALOG_TURN_MAX_QUEUE_AGE_SECS,
+            max_regenerations: DEFAULT_DIALOG_TURN_MAX_REGENERATIONS,
+            terminal_signal: crate::dialog_turn::TurnSignalPolicy::default(),
+            obligations: None,
+            session: &wiring,
+            llm_runs: Some(&runs),
+        },
+        stop,
+    )
+    .await;
+
+    assert_eq!(record_status(&queue, job_id), JobStatus::Completed);
+    let records = runs.list(
+        &crate::runtime_llm_runs::RunListFilter::default(),
+        OffsetDateTime::now_utc(),
+    );
+    assert_eq!(
+        records.len(),
+        1,
+        "the loop forwarded llm_runs into the turn"
+    );
+    assert_eq!(records[0].run_id, format!("job-{job_id}"));
+    assert_eq!(
+        records[0].status,
+        crate::runtime_llm_runs::RunStatus::Completed
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn merged_and_deferred_turns_do_not_open_agent_runs() -> Result<(), Box<dyn Error>> {
+    let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+    let registry = Arc::new(crate::dialog_turn::DialogSessionRegistry::new());
+    let key = crate::dialog_turn::SessionKey::new(42, Some(9));
+    let crate::dialog_turn::ClaimOutcome::Claimed(_inbox) = registry.claim(key, 999, 7) else {
+        panic!("pre-claimed");
+    };
+    let wiring = wiring_with_registry(Arc::clone(&registry));
+    let runs = crate::runtime_llm_runs::RuntimeLlmRunBuffer::new(8);
+    let outcomes = crate::dialog_turn::DialogTurnObserver::new(
+        crate::dialog_turn::RuntimeTurnOutcomeBuffer::new(8),
+        None,
+    )
+    .with_run_buffer(runs.clone());
+
+    let queue = InMemoryTaskQueue::new();
+    queue.assign(
+        DIALOG_AIFARM_QUEUE_NAME,
+        new_dialog_job_at(params_from(7, "и ещё вот что"), now),
+    );
+    queue.assign(
+        DIALOG_AIFARM_QUEUE_NAME,
+        new_dialog_job_at(params_from(8, "а можно мне тоже"), now),
+    );
+    let provider = StepProviderStub::with_steps(Vec::new());
+    let effects = EffectsStub::default();
+    for _ in 0..2 {
+        process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+            &queue,
+            &provider,
+            &effects,
+            &BasicDialogInputMaterializer,
+            &NoopDialogToolCallHistoryStore,
+            DialogJobProcessOptions {
+                llm_runs: Some(&runs),
+                ..session_options(now, &outcomes, &wiring)
+            },
+        )
+        .await;
+    }
+
+    let rows = ledger_rows(&outcomes);
+    assert_eq!(rows[0].outcome, "deferred_after_session");
+    assert_eq!(rows[1].outcome, "merged_into_session");
+    assert!(
+        runs.list(&crate::runtime_llm_runs::RunListFilter::default(), now)
+            .is_empty(),
+        "absorbed turns must not create run records"
+    );
     Ok(())
 }
 
