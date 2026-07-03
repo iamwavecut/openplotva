@@ -181,6 +181,8 @@ pub(crate) struct SessionRunContext<'a> {
     pub params: &'a openplotva_taskman::DialogJobParams,
     pub queue_name: &'static str,
     pub max_llm_job_attempts: i32,
+    /// In-process duplicate-answer regenerations allowed for this turn.
+    pub max_regenerations: i32,
     pub budget: TurnBudget,
     pub now: OffsetDateTime,
     pub routing_events: Option<&'a crate::runtime_routing::RoutingEventReporter>,
@@ -429,7 +431,7 @@ where
             let (duplicate_message_id, duplicate) =
                 should_suppress_duplicate_bot_reply(duplicate_guard_history, &sanitized);
             if duplicate || sent.contains(&sanitized) {
-                if regenerations < ctx_max_regenerations()
+                if regenerations < ctx.max_regenerations.max(0)
                     && budget.remaining(failure_now) >= MIN_REGENERATION_BUDGET
                 {
                     regenerations += 1;
@@ -626,12 +628,6 @@ where
             return session_delegated(&sent, &side_effect_tickets);
         }
     }
-}
-
-/// The legacy regeneration cap is intentionally shared with the session
-/// engine; it is small and prompt-driven regeneration rarely needs more.
-fn ctx_max_regenerations() -> i32 {
-    crate::dialog_jobs::DEFAULT_DIALOG_TURN_MAX_REGENERATIONS
 }
 
 fn session_delegated(sent: &SentLog, effects: &[QueuedSideEffect]) -> TurnResolution {

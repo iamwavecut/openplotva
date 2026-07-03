@@ -724,7 +724,6 @@ pub struct DialogConfig {
     /// Discovery endpoint name, from `DIALOG_DISCOVERY_ENDPOINT_NAME`.
     pub discovery_endpoint_name: String,
     pub aifarm_enable_thinking: bool,
-    pub aifarm_use_tool_calls: bool,
     pub aifarm_max_tokens: i32,
     pub aifarm_random_max_tokens: i32,
     pub aifarm_default_max_tokens: i32,
@@ -1137,8 +1136,6 @@ pub struct RawConfig {
     pub dialog_discovery_endpoint_name: Option<String>,
     /// `DIALOG_AIFARM_ENABLE_THINKING`.
     pub dialog_aifarm_enable_thinking: Option<String>,
-    /// `DIALOG_AIFARM_USE_TOOL_CALLS`.
-    pub dialog_aifarm_use_tool_calls: Option<String>,
     /// `DIALOG_AIFARM_MAX_TOKENS`.
     pub dialog_aifarm_max_tokens: Option<String>,
     /// `DIALOG_AIFARM_RANDOM_MAX_TOKENS`.
@@ -2174,11 +2171,6 @@ impl AppConfig {
                         raw.dialog_aifarm_enable_thinking,
                         false,
                     )?,
-                    aifarm_use_tool_calls: parse_bool(
-                        "DIALOG_AIFARM_USE_TOOL_CALLS",
-                        raw.dialog_aifarm_use_tool_calls,
-                        true,
-                    )?,
                     aifarm_max_tokens: parse_i32(
                         "DIALOG_AIFARM_MAX_TOKENS",
                         raw.dialog_aifarm_max_tokens,
@@ -2890,7 +2882,6 @@ impl RawConfig {
             dialog_discovery_service_name: env("DIALOG_DISCOVERY_SERVICE_NAME"),
             dialog_discovery_endpoint_name: env("DIALOG_DISCOVERY_ENDPOINT_NAME"),
             dialog_aifarm_enable_thinking: env("DIALOG_AIFARM_ENABLE_THINKING"),
-            dialog_aifarm_use_tool_calls: env("DIALOG_AIFARM_USE_TOOL_CALLS"),
             dialog_aifarm_max_tokens: env("DIALOG_AIFARM_MAX_TOKENS"),
             dialog_aifarm_random_max_tokens: env("DIALOG_AIFARM_RANDOM_MAX_TOKENS"),
             dialog_aifarm_default_max_tokens: env("DIALOG_AIFARM_DEFAULT_MAX_TOKENS"),

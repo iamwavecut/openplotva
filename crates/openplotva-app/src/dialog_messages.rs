@@ -8532,13 +8532,6 @@ mod tests {
             "stub"
         }
 
-        fn run_dialog<'a>(
-            &'a self,
-            _input: openplotva_dialog::DialogInput,
-        ) -> openplotva_llm::ChatProviderFuture<'a> {
-            Box::pin(async move { panic!("dialog turns run through the step seam") })
-        }
-
         fn as_chat_step(&self) -> Option<&dyn openplotva_llm::ChatStepProvider> {
             Some(self)
         }

@@ -21,9 +21,7 @@ use openplotva_dialog::{
     select_history_messages_for_context,
 };
 
-use crate::{
-    ChatProvider, ChatProviderFuture, ChatProviderHandle, ChatStepFuture, ChatStepProvider,
-};
+use crate::{ChatProvider, ChatProviderHandle, ChatStepFuture, ChatStepProvider};
 
 const WHITE_CIRCLE_ENDPOINT_DEFAULT: &str = "https://eu.whitecircle.ai/api/session/check";
 const WHITE_CIRCLE_VERSION_DEFAULT: &str = "2025-12-01";
@@ -944,13 +942,6 @@ where
         self.inner.provider_name()
     }
 
-    fn run_dialog<'a>(&'a self, input: DialogInput) -> ChatProviderFuture<'a> {
-        Box::pin(async move {
-            self.dispatch_pre_tool_check(input.clone());
-            self.inner.run_dialog(input).await
-        })
-    }
-
     fn as_chat_step(&self) -> Option<&dyn ChatStepProvider> {
         // The audit wrap must not hide the inner step seam: without this
         // passthrough the session engine silently falls back to the legacy
@@ -1456,10 +1447,6 @@ mod tests {
             "stepped-inner"
         }
 
-        fn run_dialog<'a>(&'a self, _input: DialogInput) -> ChatProviderFuture<'a> {
-            Box::pin(async move { Err("run_dialog not expected".into()) })
-        }
-
         fn as_chat_step(&self) -> Option<&dyn ChatStepProvider> {
             Some(self)
         }
@@ -1491,10 +1478,6 @@ mod tests {
     impl ChatProvider for SteplessInnerProvider {
         fn provider_name(&self) -> &str {
             "stepless-inner"
-        }
-
-        fn run_dialog<'a>(&'a self, _input: DialogInput) -> ChatProviderFuture<'a> {
-            Box::pin(async move { Err("run_dialog not expected".into()) })
         }
     }
 

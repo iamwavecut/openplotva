@@ -432,32 +432,25 @@ impl GuestMessageEffects for GuestRuntimeEffects {
             let dialog_input = dialog_input_from_guest_at(&input, OffsetDateTime::now_utc());
             // Guest turns are tool-less single shots by construction — the
             // chat-step seam is their natural home; the legacy run_dialog
-            // path remains only for providers without step support.
-            if let Some(step) = provider.as_chat_step() {
-                let step_request = openplotva_dialog::ChatStepRequest {
-                    input: dialog_input,
-                    transcript: Vec::new(),
-                    tools: openplotva_dialog::ToolsMode::Disabled,
-                    iteration: 1,
-                };
-                let output =
-                    tokio::time::timeout(GUEST_DIALOG_TIMEOUT, step.run_chat_step(step_request))
-                        .await
-                        .map_err(|_| GuestRuntimeEffectError::DialogTimeout)?
-                        .map_err(|error| GuestRuntimeEffectError::Dialog(error.to_string()))?;
-                return Ok(GuestDialogOutput {
-                    answer: output.text.clone(),
-                    response: output.text,
-                });
-            }
+            let Some(step) = provider.as_chat_step() else {
+                return Err(GuestRuntimeEffectError::Dialog(
+                    "guest dialog provider has no chat-step support".to_owned(),
+                ));
+            };
+            let step_request = openplotva_dialog::ChatStepRequest {
+                input: dialog_input,
+                transcript: Vec::new(),
+                tools: openplotva_dialog::ToolsMode::Disabled,
+                iteration: 1,
+            };
             let output =
-                tokio::time::timeout(GUEST_DIALOG_TIMEOUT, provider.run_dialog(dialog_input))
+                tokio::time::timeout(GUEST_DIALOG_TIMEOUT, step.run_chat_step(step_request))
                     .await
                     .map_err(|_| GuestRuntimeEffectError::DialogTimeout)?
                     .map_err(|error| GuestRuntimeEffectError::Dialog(error.to_string()))?;
             Ok(GuestDialogOutput {
-                answer: output.answer,
-                response: output.response,
+                answer: output.text.clone(),
+                response: output.text,
             })
         })
     }

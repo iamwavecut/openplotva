@@ -8742,17 +8742,10 @@ fn record_dialog_tool_mode_readiness(
     {
         return;
     }
-    if dialog.aifarm_use_tool_calls {
-        readiness_checks.push(ReadinessCheck::ok(
-            "dialog_tool_mode",
-            "AIFarm native dialog tool calls enabled",
-        ));
-    } else {
-        readiness_checks.push(ReadinessCheck::skipped(
-            "dialog_tool_mode",
-            "AIFarm dialog tools are configured but native tool calls are disabled",
-        ));
-    }
+    readiness_checks.push(ReadinessCheck::ok(
+        "dialog_tool_mode",
+        "AIFarm native dialog tool calls enabled",
+    ));
 }
 
 pub async fn run_long_poll_update_producer_after_delete_webhook<Startup, Source, Queue, Stop>(
@@ -11158,10 +11151,7 @@ async fn start_runtime_workers(
             .await;
         }));
     }
-    let genkit_fallback = dialog_runtime::genkit_dialog_provider_from_app_config_with_toolbox(
-        config,
-        Some(Arc::clone(&dialog_toolbox)),
-    );
+    let genkit_fallback = dialog_runtime::genkit_dialog_provider_from_app_config(config);
     let mut dialog_provider_for_updates: Option<openplotva_llm::ChatProviderHandle> = None;
     match Ok::<_, dialog_runtime::DialogProviderBuildError>(dialog_runtime::router_dialog_provider(
         config,
@@ -11235,32 +11225,12 @@ async fn start_runtime_workers(
                 runtime_virtual_dialog::RuntimeVirtualSafeToolbox::new(Arc::clone(&dialog_toolbox)),
             );
             let console_safe_toolbox = Arc::clone(&safe_dialog_toolbox);
-            let safe_genkit_fallback =
-                dialog_runtime::genkit_dialog_provider_from_app_config_with_toolbox(
-                    config,
-                    Some(Arc::clone(&safe_dialog_toolbox)),
-                );
-            let mut safe_dialog_provider = dialog_runtime::router_dialog_provider(
-                config,
-                safe_dialog_toolbox,
-                Arc::clone(&router_handle),
-                Arc::clone(&router_breakers),
-                Arc::clone(&router_triggers),
-                Arc::clone(&router_pools),
-                safe_genkit_fallback,
-                Some(routing_event_reporter.clone()),
-            );
-            if let Some(recorder) = white_circle_recorder {
-                safe_dialog_provider =
-                    wrap_dialog_provider_with_white_circle(safe_dialog_provider, config, recorder);
-            }
             virtual_dialog_manager.set_executor(Arc::new(
                 runtime_virtual_dialog::RuntimeVirtualDialogExecutor::new(
                     virtual_dialog_store.clone(),
                     store.clone(),
                     history_store.clone(),
                     dialog_materializer.clone(),
-                    safe_dialog_provider,
                     Arc::clone(&dialog_provider),
                     console_safe_toolbox,
                     Arc::clone(&dialog_toolbox),

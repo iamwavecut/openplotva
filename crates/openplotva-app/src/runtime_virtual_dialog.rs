@@ -29,9 +29,7 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::watch;
 
 use crate::{
-    dialog_jobs::{
-        self, DialogBotIdentity, DialogInputMaterializer, PostgresDialogInputMaterializer,
-    },
+    dialog_jobs::{DialogBotIdentity, DialogInputMaterializer, PostgresDialogInputMaterializer},
     runtime_llm::RuntimeLlmTraceBuffer,
     runtime_taskman::RuntimeTaskmanInspectorHandle,
 };
@@ -97,8 +95,7 @@ pub(crate) struct RuntimeVirtualDialogExecutor {
     identity: PostgresVirtualMessageStore,
     history: PostgresHistoryStore,
     materializer: PostgresDialogInputMaterializer,
-    safe_provider: ChatProviderHandle,
-    real_provider: ChatProviderHandle,
+    provider: ChatProviderHandle,
     safe_toolbox: std::sync::Arc<dyn openplotva_dialog::DialogToolbox>,
     real_toolbox: std::sync::Arc<dyn openplotva_dialog::DialogToolbox>,
     taskman: RuntimeTaskmanInspectorHandle,
@@ -113,8 +110,7 @@ impl RuntimeVirtualDialogExecutor {
         identity: PostgresVirtualMessageStore,
         history: PostgresHistoryStore,
         materializer: PostgresDialogInputMaterializer,
-        safe_provider: ChatProviderHandle,
-        real_provider: ChatProviderHandle,
+        provider: ChatProviderHandle,
         safe_toolbox: std::sync::Arc<dyn openplotva_dialog::DialogToolbox>,
         real_toolbox: std::sync::Arc<dyn openplotva_dialog::DialogToolbox>,
         taskman: RuntimeTaskmanInspectorHandle,
@@ -126,8 +122,7 @@ impl RuntimeVirtualDialogExecutor {
             identity,
             history,
             materializer,
-            safe_provider,
-            real_provider,
+            provider,
             safe_toolbox,
             real_toolbox,
             taskman,
@@ -224,58 +219,39 @@ impl RuntimeVirtualDialogExecutor {
             .await;
         // SAFE/REAL is a toolbox choice per message, not a provider property:
         // the console drives the same captured session loop the dialog worker
-        // uses, with the SAFE toolbox faking generation side effects. The
-        // legacy provider pair remains only for providers without the
-        // chat-step seam (e.g. a WhiteCircle-wrapped SAFE chain).
-        let provider = match request.tool_mode {
-            RuntimeVirtualDialogToolMode::Safe => &self.safe_provider,
-            RuntimeVirtualDialogToolMode::Real => &self.real_provider,
+        // uses, with the SAFE toolbox faking generation side effects.
+        let Some(step_provider) = self.provider.as_chat_step() else {
+            let _ = self
+                .history
+                .delete_message_entries(record.chat_id, user_message_id)
+                .await;
+            return Err("dialog provider has no chat-step support".to_owned());
+        };
+        let toolbox = match request.tool_mode {
+            RuntimeVirtualDialogToolMode::Safe => &self.safe_toolbox,
+            RuntimeVirtualDialogToolMode::Real => &self.real_toolbox,
         };
         let (answer, session_tool_calls, output_provider) =
-            if let Some(step_provider) = self.real_provider.as_chat_step() {
-                let toolbox = match request.tool_mode {
-                    RuntimeVirtualDialogToolMode::Safe => &self.safe_toolbox,
-                    RuntimeVirtualDialogToolMode::Real => &self.real_toolbox,
-                };
-                let captured = match crate::dialog_turn::run_captured_session(
-                    step_provider,
-                    toolbox.as_ref(),
-                    input,
-                    8,
-                )
-                .await
-                {
-                    Ok(captured) => captured,
-                    Err(error) => {
-                        let _ = self
-                            .history
-                            .delete_message_entries(record.chat_id, user_message_id)
-                            .await;
-                        return Err(error);
-                    }
-                };
-                (
+            match crate::dialog_turn::run_captured_session(
+                step_provider,
+                toolbox.as_ref(),
+                input,
+                8,
+            )
+            .await
+            {
+                Ok(captured) => (
                     captured.messages.join("\n\n"),
                     captured.tool_calls,
                     captured.provider,
-                )
-            } else {
-                let output = match provider.run_dialog(input).await {
-                    Ok(output) => output,
-                    Err(error) => {
-                        let _ = self
-                            .history
-                            .delete_message_entries(record.chat_id, user_message_id)
-                            .await;
-                        return Err(error.to_string());
-                    }
-                };
-                let raw_answer = dialog_jobs::dialog_job_answer(&output);
-                (
-                    dialog_jobs::prepare_dialog_chat_response(&raw_answer),
-                    output.tool_calls,
-                    output.provider,
-                )
+                ),
+                Err(error) => {
+                    let _ = self
+                        .history
+                        .delete_message_entries(record.chat_id, user_message_id)
+                        .await;
+                    return Err(error);
+                }
             };
         self.history
             .upsert_tool_call_history(record.chat_id, user_message_id, &session_tool_calls)

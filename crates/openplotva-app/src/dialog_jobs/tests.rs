@@ -9,7 +9,7 @@ use std::{
 use openplotva_core::{ChatAttachment, ChatMessageMeta, ChatSettings, ToolCall};
 use openplotva_dialog::{DialogOutput, HistoryMessage, MESSAGE_KIND_TEXT, ROLE_MODEL, ROLE_USER};
 use openplotva_llm::{
-    ChatProvider, ChatProviderError, ChatProviderFuture, ContentBlockedError,
+    ChatProvider, ChatProviderError, ContentBlockedError,
     retry::{FailureReason, ProviderError},
 };
 use openplotva_taskman::{
@@ -2110,10 +2110,6 @@ impl ChatProvider for ProviderStub {
         "stub"
     }
 
-    fn run_dialog<'a>(&'a self, _input: DialogInput) -> ChatProviderFuture<'a> {
-        Box::pin(async move { panic!("dialog turns run through the step seam") })
-    }
-
     fn as_chat_step(&self) -> Option<&dyn openplotva_llm::ChatStepProvider> {
         Some(self)
     }
@@ -2179,10 +2175,6 @@ impl ChatProvider for SequenceProviderStub {
         "stub"
     }
 
-    fn run_dialog<'a>(&'a self, _input: DialogInput) -> ChatProviderFuture<'a> {
-        Box::pin(async move { panic!("dialog turns run through the step seam") })
-    }
-
     fn as_chat_step(&self) -> Option<&dyn openplotva_llm::ChatStepProvider> {
         Some(self)
     }
@@ -2236,10 +2228,6 @@ impl SlowProviderStub {
 impl ChatProvider for SlowProviderStub {
     fn provider_name(&self) -> &str {
         "stub"
-    }
-
-    fn run_dialog<'a>(&'a self, _input: DialogInput) -> ChatProviderFuture<'a> {
-        Box::pin(async move { panic!("dialog turns run through the step seam") })
     }
 
     fn as_chat_step(&self) -> Option<&dyn openplotva_llm::ChatStepProvider> {
@@ -2328,10 +2316,6 @@ impl RetryableProviderStub {
 impl ChatProvider for RetryableProviderStub {
     fn provider_name(&self) -> &str {
         self.provider
-    }
-
-    fn run_dialog<'a>(&'a self, _input: DialogInput) -> ChatProviderFuture<'a> {
-        Box::pin(async move { panic!("dialog turns run through the step seam") })
     }
 
     fn as_chat_step(&self) -> Option<&dyn openplotva_llm::ChatStepProvider> {
@@ -2720,10 +2704,6 @@ fn step_tools(
 impl ChatProvider for StepProviderStub {
     fn provider_name(&self) -> &str {
         "step-stub"
-    }
-
-    fn run_dialog<'a>(&'a self, _input: DialogInput) -> ChatProviderFuture<'a> {
-        Box::pin(async move { panic!("session tests must go through the step seam") })
     }
 
     fn as_chat_step(&self) -> Option<&dyn openplotva_llm::ChatStepProvider> {

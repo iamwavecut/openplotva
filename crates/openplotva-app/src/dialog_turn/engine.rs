@@ -134,6 +134,7 @@ where
         params: ctx.params,
         queue_name: ctx.queue_name,
         max_llm_job_attempts: ctx.max_llm_job_attempts,
+        max_regenerations: ctx.max_regenerations,
         budget: ctx.budget,
         now: ctx.now,
         routing_events: ctx.routing_events,

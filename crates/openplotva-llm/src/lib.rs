@@ -2,7 +2,7 @@
 
 use std::{error::Error, fmt, future::Future, pin::Pin, sync::Arc};
 
-use openplotva_dialog::{ChatStepOutput, ChatStepRequest, DialogInput, DialogOutput};
+use openplotva_dialog::{ChatStepOutput, ChatStepRequest, DialogOutput};
 
 pub mod aifarm;
 pub mod gemini;
@@ -29,13 +29,9 @@ pub trait ChatProvider: Send + Sync {
     /// Stable provider name for logs and diagnostics.
     fn provider_name(&self) -> &str;
 
-    /// Run one provider-owned dialog request.
-    fn run_dialog<'a>(&'a self, input: DialogInput) -> ChatProviderFuture<'a>;
-
     /// The single-shot step view of this provider, when it has one. The
     /// dialog session engine drives its own tool loop through this seam;
-    /// providers without it fail the routed attempt retryably so the walker
-    /// moves on to the next echelon.
+    /// providers without it cannot serve dialog turns.
     fn as_chat_step(&self) -> Option<&dyn ChatStepProvider> {
         None
     }
