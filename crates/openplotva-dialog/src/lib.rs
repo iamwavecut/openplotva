@@ -494,7 +494,7 @@ const DRAW_IMAGE_ARGS: &[ToolArgSpec] = &[
     ToolArgSpec {
         name: "aspect_ratio",
         required: false,
-        description: "Optional target aspect ratio such as 1:1, 4:3, 16:9.",
+        description: "Optional. Target aspect ratio, one of 1:1, 2:3, 3:2, 3:4, 4:3, 9:16, 16:9, 1:2, 2:1. Omit unless the user asked for a specific shape or orientation; the image pipeline infers a ratio otherwise.",
     },
     ToolArgSpec {
         name: "seed",

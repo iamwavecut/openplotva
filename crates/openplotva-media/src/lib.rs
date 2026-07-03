@@ -19,6 +19,11 @@ static IMAGE_PROMPT_SEED_RE: LazyLock<Regex> =
 static REPLACE_WORD_RE: LazyLock<Regex> =
     LazyLock::new(|| compile_regex(r"(^|\s|[.,:;!?()])([\p{L}]+)($|\s|[.,:;!?()])"));
 
+/// Aspect ratios the image optimizer may return, each in both orientations.
+pub const IMAGE_ASPECT_RATIOS: [&str; 9] = [
+    "1:1", "2:3", "3:2", "3:4", "4:3", "9:16", "16:9", "1:2", "2:1",
+];
+
 pub const OPTIMIZE_PROMPT_TERMINATOR_TOOL_NAME: &str = "optimize_prompt_terminator";
 pub const OPTIMIZE_EDIT_PROMPT_TERMINATOR_TOOL_NAME: &str = "optimize_edit_prompt_terminator";
 pub const IMAGE_OPTIMIZER_PROMPT_NAME: &str = "image/optimizer";
@@ -30,7 +35,8 @@ pub struct ImageOptimize {
     pub input: String,
     /// Optimized prompt variants.
     pub outputs: Vec<String>,
-    /// Optional aspect ratio.
+    /// Target aspect ratio; empty when the optimizer omitted it.
+    #[serde(default)]
     pub aspect_ratio: String,
     /// NSFW classifier result.
     pub nsfw_result: NsfwResult,
@@ -447,13 +453,17 @@ fn optimizer_terminator_definition(
             }),
         ),
     ]);
+    let mut required = vec!["input", "outputs", "nsfw_result"];
     if include_aspect_ratio {
         properties.insert(
             "aspect_ratio".to_owned(),
             json!({
                 "type": "string",
+                "enum": IMAGE_ASPECT_RATIOS,
+                "description": "Target aspect ratio for the generated image. Use 1:1 when nothing in the request implies an orientation.",
             }),
         );
+        required.push("aspect_ratio");
     }
 
     OptimizerTerminatorDefinition {
@@ -462,7 +472,7 @@ fn optimizer_terminator_definition(
         input_schema: json!({
             "type": "object",
             "properties": properties,
-            "required": ["input", "outputs", "nsfw_result"],
+            "required": required,
         }),
     }
 }
@@ -586,10 +596,12 @@ mod tests {
     }
 
     #[test]
-    fn optimizer_prompt_rendering_and_tool_schemas_match_go_contract() {
+    fn optimizer_prompt_rendering_and_tool_schemas_match_contract() {
         let prompt = render_image_optimizer_prompt(2).expect("render image optimizer prompt");
         assert!(prompt.contains("optimize_prompt_terminator"));
         assert!(prompt.contains("must contain exactly `2` optimized prompts"));
+        assert!(prompt.contains("Aspect Ratio Selection"));
+        assert!(prompt.contains("`9:16`, `16:9`, `1:2`, `2:1`"));
         assert!(prompt.contains("Closed-gate decision tree"));
         assert!(prompt.contains("Both gates must be present for `forbidden`"));
         assert!(prompt.contains("adult-only nudity"));
@@ -613,11 +625,15 @@ mod tests {
         assert_eq!(tool.input_schema["properties"]["outputs"]["maxItems"], 2);
         assert_eq!(
             tool.input_schema["required"],
-            json!(["input", "outputs", "nsfw_result"])
+            json!(["input", "outputs", "nsfw_result", "aspect_ratio"])
         );
         assert_eq!(
             tool.input_schema["properties"]["aspect_ratio"]["type"],
             "string"
+        );
+        assert_eq!(
+            tool.input_schema["properties"]["aspect_ratio"]["enum"],
+            json!(IMAGE_ASPECT_RATIOS)
         );
         assert!(
             tool.input_schema["properties"]["nsfw_result"]["description"]
@@ -632,6 +648,10 @@ mod tests {
             1
         );
         assert!(edit_tool.input_schema["properties"]["aspect_ratio"].is_null());
+        assert_eq!(
+            edit_tool.input_schema["required"],
+            json!(["input", "outputs", "nsfw_result"])
+        );
         assert!(
             edit_tool.input_schema["properties"]["nsfw_result"]["description"]
                 .as_str()
@@ -657,6 +677,18 @@ mod tests {
         assert_eq!(got.outputs, vec!["plotva by river", "ignored"]);
         assert_eq!(got.aspect_ratio, "16:9");
         assert_eq!(got.nsfw_result, NsfwResult::Safe);
+
+        let missing_ratio = decode_image_optimize_payload(
+            r#"{
+                "input": "subject",
+                "outputs": ["prompt"],
+                "nsfw_result": "safe"
+            }"#,
+            "fallback",
+            1,
+        )
+        .expect("decode image optimizer without aspect_ratio");
+        assert_eq!(missing_ratio.aspect_ratio, "");
 
         let edit = decode_image_edit_optimize_payload(
             r#"<assistant_message><text>{
