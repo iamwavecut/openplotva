@@ -984,10 +984,11 @@ where
                 ));
                 return Err(error);
             };
-            // One fire-and-forget check per session (the transcript is empty
-            // only on the first step), matching the single per-turn check the
-            // legacy run_dialog path dispatches.
-            if request.transcript.is_empty() {
+            // One fire-and-forget check per session, matching the single
+            // per-turn check the legacy run_dialog path dispatches. Gate on
+            // the iteration counter, not the transcript: injected inbox
+            // messages can pre-populate the transcript before the first step.
+            if request.iteration <= 1 {
                 self.dispatch_pre_tool_check(request.input.clone());
             }
             step.run_chat_step(request).await
@@ -1575,10 +1576,14 @@ mod tests {
         let provider = pre_tool_provider_with_inner(inner, transport.clone());
         let seam = provider.as_chat_step().expect("step seam");
 
+        // Injected inbox messages can land in the transcript before the very
+        // first step; the audit must still dispatch for that turn.
         let first = seam
             .run_chat_step(ChatStepRequest {
                 input: step_check_input(),
-                transcript: Vec::new(),
+                transcript: vec![openplotva_dialog::SessionMessage::InjectedUser {
+                    rendered: "injected before the first step".to_owned(),
+                }],
                 tools: openplotva_dialog::ToolsMode::Disabled,
                 iteration: 1,
             })
