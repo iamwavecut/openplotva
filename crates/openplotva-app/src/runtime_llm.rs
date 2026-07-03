@@ -468,6 +468,7 @@ impl PostgresRuntimeLlmEventRecorder {
 pub struct RuntimeLlmObserver {
     buffer: RuntimeLlmTraceBuffer,
     recorder: Option<PostgresRuntimeLlmEventRecorder>,
+    runs: Option<crate::runtime_llm_runs::RuntimeLlmRunBuffer>,
 }
 
 impl RuntimeLlmObserver {
@@ -477,19 +478,103 @@ impl RuntimeLlmObserver {
         buffer: RuntimeLlmTraceBuffer,
         recorder: Option<PostgresRuntimeLlmEventRecorder>,
     ) -> Self {
-        Self { buffer, recorder }
+        Self {
+            buffer,
+            recorder,
+            runs: None,
+        }
+    }
+
+    /// Additionally fan every observation out into the agent-run buffer:
+    /// scoped calls become rounds of their run, unscoped calls become
+    /// single-round one-off records.
+    #[must_use]
+    pub fn with_run_buffer(mut self, runs: crate::runtime_llm_runs::RuntimeLlmRunBuffer) -> Self {
+        self.runs = Some(runs);
+        self
+    }
+}
+
+fn usage_i32(trace: &RuntimeLlmRequestData, key: &str) -> Option<i32> {
+    trace
+        .usage
+        .as_ref()
+        .and_then(|usage| usage.get(key))
+        .and_then(Value::as_i64)
+        .and_then(|value| i32::try_from(value).ok())
+        .filter(|value| *value > 0)
+}
+
+fn run_round_from_trace(
+    trace: &RuntimeLlmRequestData,
+    trace_id: i64,
+    is_aux: bool,
+) -> crate::runtime_llm_runs::RunRound {
+    let response_text = trace
+        .raw_response
+        .as_ref()
+        .and_then(trace_response_text)
+        .and_then(|text| non_empty(&text))
+        .or_else(|| trace.result.response_text_preview.clone());
+    crate::runtime_llm_runs::RunRound {
+        seq: 0,
+        trace_id,
+        at: trace.at.clone(),
+        provider: trace.provider.clone(),
+        model: trace.model.clone(),
+        flow: trace.flow.clone(),
+        is_aux,
+        iteration: trace.iteration,
+        duration_ms: trace.result.duration_ms.max(trace.duration_ms),
+        input_tokens: usage_i32(trace, "input_tokens"),
+        output_tokens: usage_i32(trace, "output_tokens"),
+        total_tokens: usage_i32(trace, "total_tokens"),
+        error: trace.result.error.clone(),
+        response_text,
+        sent: crate::runtime_llm_runs::RunRoundSent::No,
+        tool_calls: Vec::new(),
     }
 }
 
 impl openplotva_llm::LlmCallObserver for RuntimeLlmObserver {
     fn observe(&self, record: openplotva_llm::LlmCallRecord) {
-        let trace = trace_from_record(
+        let mut trace = trace_from_record(
             &record.context,
             &record.artifact,
             record.duration_ms,
             record.run.as_ref(),
         );
-        self.buffer.record(trace.clone());
+        let trace_id = self.buffer.record(trace.clone());
+        if let Some(runs) = &self.runs {
+            match record.run.as_ref() {
+                Some(scope) => {
+                    // Inside a dialog session, non-dialog flows are nested
+                    // auxiliary calls (vision, history summaries, …).
+                    let is_aux = scope.run_kind == "dialog"
+                        && trace.flow.as_deref().is_some_and(|flow| flow != "dialog");
+                    let round = run_round_from_trace(&trace, trace_id, is_aux);
+                    trace.run_seq = runs.record_round(&scope.run_id, round);
+                }
+                None => {
+                    let kind = trace
+                        .flow
+                        .clone()
+                        .filter(|flow| !flow.is_empty())
+                        .unwrap_or_else(|| trace.source.clone());
+                    let origin = crate::runtime_llm_runs::RunOrigin {
+                        chat_id: record.context.chat_id,
+                        thread_id: record.context.thread_id,
+                        chat_title: non_empty(&record.context.chat_title),
+                        user_id: record.context.user_id,
+                        user_full_name: non_empty(&record.context.full_name),
+                        trigger_message_id: record.context.message_id,
+                        ..crate::runtime_llm_runs::RunOrigin::default()
+                    };
+                    let round = run_round_from_trace(&trace, trace_id, false);
+                    runs.record_one_off(&kind, origin, round, OffsetDateTime::now_utc());
+                }
+            }
+        }
         if let Some(recorder) = &self.recorder {
             recorder.enqueue(trace);
         }

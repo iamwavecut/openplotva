@@ -135,6 +135,7 @@ struct RuntimeWorkers {
     taskman_inspector: runtime_taskman::RuntimeTaskmanInspectorHandle,
     memory_restart_trigger: Option<Arc<tokio::sync::Notify>>,
     llm_trace_buffer: Option<runtime_llm::RuntimeLlmTraceBuffer>,
+    llm_run_buffer: Option<runtime_llm_runs::RuntimeLlmRunBuffer>,
     routing_event_buffer: Option<runtime_routing::RoutingEventBuffer>,
     routing_event_reporter: Option<runtime_routing::RoutingEventReporter>,
     runtime_api_tls_public_key_pin: Option<String>,
@@ -427,6 +428,7 @@ struct StaticWebRoutes {
     cache_inspector: runtime_cache::RuntimeCacheInspectorHandle,
     taskman_inspector: runtime_taskman::RuntimeTaskmanInspectorHandle,
     llm_trace_buffer: Option<runtime_llm::RuntimeLlmTraceBuffer>,
+    llm_run_buffer: Option<runtime_llm_runs::RuntimeLlmRunBuffer>,
     routing_event_buffer: Option<runtime_routing::RoutingEventBuffer>,
     routing_event_reporter: Option<runtime_routing::RoutingEventReporter>,
     llm_discovery_base_url: Arc<str>,
@@ -493,6 +495,7 @@ fn static_web_routes(
         cache_inspector: runtime_cache::RuntimeCacheInspectorHandle::default(),
         taskman_inspector: runtime_taskman::RuntimeTaskmanInspectorHandle::default(),
         llm_trace_buffer: None,
+        llm_run_buffer: None,
         routing_event_buffer: None,
         routing_event_reporter: None,
         llm_discovery_base_url: Arc::from(""),
@@ -550,6 +553,7 @@ fn static_web_routes_from_config(
     routes.cache_inspector = runtime_workers.cache_inspector.clone();
     routes.taskman_inspector = runtime_workers.taskman_inspector.clone();
     routes.llm_trace_buffer = runtime_workers.llm_trace_buffer.clone();
+    routes.llm_run_buffer = runtime_workers.llm_run_buffer.clone();
     routes.routing_event_buffer = runtime_workers.routing_event_buffer.clone();
     routes.routing_event_reporter = runtime_workers.routing_event_reporter.clone();
     routes.llm_discovery_base_url = Arc::from(config.llm.discovery.base_url.clone());
@@ -9397,6 +9401,7 @@ async fn start_runtime_workers(
         taskman_inspector: taskman_inspector.clone(),
         memory_restart_trigger: None,
         llm_trace_buffer: None,
+        llm_run_buffer: None,
         routing_event_buffer: None,
         routing_event_reporter: None,
         runtime_api_tls_public_key_pin: None,
@@ -9768,11 +9773,17 @@ async fn start_runtime_workers(
         ));
     }
     workers.llm_trace_buffer = Some(llm_trace_buffer.clone());
-    let llm_observer: Arc<dyn openplotva_llm::LlmCallObserver> =
-        Arc::new(runtime_llm::RuntimeLlmObserver::new(
+    let llm_run_buffer = runtime_llm_runs::RuntimeLlmRunBuffer::new(
+        runtime_llm_runs::DEFAULT_LLM_RUN_BUFFER_CAPACITY,
+    );
+    workers.llm_run_buffer = Some(llm_run_buffer.clone());
+    let llm_observer: Arc<dyn openplotva_llm::LlmCallObserver> = Arc::new(
+        runtime_llm::RuntimeLlmObserver::new(
             llm_trace_buffer.clone(),
             Some(llm_event_recorder.clone()),
-        ));
+        )
+        .with_run_buffer(llm_run_buffer.clone()),
+    );
     openplotva_llm::trace::set_observer(llm_observer);
     let memory_store = PostgresMemoryStore::new(service_clients.postgres.clone());
     let memory_restart_trigger = Arc::new(tokio::sync::Notify::new());
@@ -12135,6 +12146,7 @@ async fn shutdown_runtime_workers(workers: RuntimeWorkers) {
         taskman_inspector: _,
         memory_restart_trigger: _,
         llm_trace_buffer: _,
+        llm_run_buffer: _,
         routing_event_buffer: _,
         routing_event_reporter: _,
         runtime_api_tls_public_key_pin: _,
