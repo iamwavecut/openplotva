@@ -60,6 +60,11 @@ pub(crate) struct TurnContext<'a> {
     pub budget: TurnBudget,
     pub now: OffsetDateTime,
     pub routing_events: Option<&'a crate::runtime_routing::RoutingEventReporter>,
+    /// Session-engine wiring (`DIALOG_AGENT_LOOP_ENABLED`); `None` keeps the
+    /// fully intact legacy provider-internal loop.
+    pub session: Option<super::session::SessionTurnConfig<'a>>,
+    /// Live inbox for this turn when the worker claimed the session key.
+    pub session_inbox: Option<std::sync::Arc<super::inbox::SessionInbox>>,
 }
 
 pub(crate) async fn execute_dialog_turn<Queue, Provider, Effects, Materializer, ToolHistory>(
@@ -119,6 +124,40 @@ where
         .materialize_dialog_input(ctx.params, ctx.now)
         .await;
     let duplicate_guard_history = base_input.history.clone();
+
+    // The session engine handles the whole turn when it is enabled for this
+    // chat and the provider exposes the single-shot step seam; otherwise the
+    // legacy provider-internal loop below runs unchanged (the rollback path).
+    if let Some(session) = ctx.session.as_ref()
+        && session.enabled_for_chat(ctx.params.chat_id)
+        && let Some(step_provider) = provider.as_chat_step()
+    {
+        let session_ctx = super::session::SessionRunContext {
+            item_id: ctx.item.id,
+            item_events: &ctx.item.events,
+            params: ctx.params,
+            queue_name: ctx.queue_name,
+            max_llm_job_attempts: ctx.max_llm_job_attempts,
+            budget: ctx.budget,
+            now: ctx.now,
+            routing_events: ctx.routing_events,
+            item: ctx.item,
+            inbox: ctx.session_inbox.clone(),
+        };
+        return super::session::run_dialog_session(
+            session_ctx,
+            session,
+            step_provider,
+            base_input,
+            &duplicate_guard_history,
+            queue,
+            effects,
+            tool_history,
+            report,
+        )
+        .await;
+    }
+
     // tokio Instant so paused-clock tests can advance generation time; in
     // production it is the monotonic clock.
     let processing_started = tokio::time::Instant::now();
@@ -773,6 +812,9 @@ fn resolution_detail(resolution: &TurnResolution, report: &DialogJobWorkerReport
     if report.regenerations > 0 {
         detail.insert("regenerations".to_owned(), json!(report.regenerations));
     }
+    if report.session_iterations > 0 {
+        detail.insert("iterations".to_owned(), json!(report.session_iterations));
+    }
     if report.resent_skipped {
         detail.insert("resent_skipped".to_owned(), json!(true));
     }
@@ -784,6 +826,11 @@ fn resolution_detail(resolution: &TurnResolution, report: &DialogJobWorkerReport
     }
     if let TurnOutcome::SideEffectDelegated { kinds, .. } = &resolution.outcome {
         detail.insert("side_effect_kinds".to_owned(), json!(kinds));
+    }
+    if let TurnOutcome::MergedIntoSession { session_job_id }
+    | TurnOutcome::DeferredAfterSession { session_job_id } = &resolution.outcome
+    {
+        detail.insert("merged_into_job_id".to_owned(), json!(session_job_id));
     }
     Value::Object(detail)
 }

@@ -2,7 +2,6 @@
 
 pub mod activity;
 pub mod admin;
-pub mod agent_jobs;
 pub mod agent_runtime;
 pub mod callbacks;
 pub mod checkin;
@@ -37,6 +36,7 @@ pub mod payments;
 pub mod permissions;
 pub mod rate_limits;
 pub mod rates;
+pub mod reactions;
 pub mod reset;
 pub mod rich;
 mod routed_attempts;
@@ -10845,9 +10845,17 @@ async fn start_runtime_workers(
     let delivery_obligation_store = Arc::new(
         openplotva_storage::PostgresDeliveryObligationStore::new(service_clients.postgres.clone()),
     );
-    let dialog_tool_adapter = Arc::new(
+    // DIALOG_DRAW_UX: `reactions` (default) swaps the ⏳ queue-placeholder
+    // message for lifecycle reactions on the trigger message; `placeholder`
+    // keeps the legacy flow. One shared signaler feeds the tool adapter,
+    // image/music workers, and the obligations watcher.
+    let generation_reactions: Option<reactions::GenerationReactions> =
+        (config.llm.dialog.draw_ux == openplotva_config::DRAW_UX_REACTIONS).then(|| {
+            Arc::new(reactions::GenerationReactionSignaler::new(telegram.clone()))
+                as reactions::GenerationReactions
+        });
+    let dialog_tool_adapter =
         dialog_tools::TaskmanDialogToolAdapter::new(Arc::clone(&task_queue_for_updates))
-            .with_queue_position_rich(Arc::clone(&rich_sender))
             .with_draw_image_vip_status(vip_status_for_updates.clone())
             .with_draw_image_rate_limit(Arc::new(dialog_tools::DrawImageRateLimitPolicy::new(
                 service_clients.redis.draw_rate_limit_store(),
@@ -10870,8 +10878,11 @@ async fn start_runtime_workers(
                         bot_key.to_owned(),
                     ),
                 ),
-            )),
-    );
+            ));
+    let dialog_tool_adapter = Arc::new(match &generation_reactions {
+        Some(reactions) => dialog_tool_adapter.with_generation_reactions(Arc::clone(reactions)),
+        None => dialog_tool_adapter.with_queue_position_rich(Arc::clone(&rich_sender)),
+    });
     {
         let watcher_store: Arc<dyn dialog_turn::DeliveryObligationStore> =
             Arc::clone(&delivery_obligation_store) as _;
@@ -10886,11 +10897,16 @@ async fn start_runtime_workers(
             telegram.clone(),
             Arc::clone(&dispatcher_queue),
         );
+        let mut obligation_notifier = dialog_turn::DispatcherDeliveryObligationNotifier::new(
+            Arc::clone(&dispatcher_queue),
+            watcher_signal.clone(),
+        );
+        if let Some(reactions) = &generation_reactions {
+            obligation_notifier =
+                obligation_notifier.with_lifecycle_reactions(Arc::clone(reactions));
+        }
         let watcher_notifier: Arc<dyn dialog_turn::DeliveryObligationNotifier> =
-            Arc::new(dialog_turn::DispatcherDeliveryObligationNotifier::new(
-                Arc::clone(&dispatcher_queue),
-                watcher_signal.clone(),
-            ));
+            Arc::new(obligation_notifier);
         let watcher_dispatch_failures = dialog_turn::DispatchFailureSignalScan {
             ring: Arc::clone(&dispatch_failure_ring),
             signal: Arc::new(watcher_signal),
@@ -11035,72 +11051,6 @@ async fn start_runtime_workers(
             None
         }
     };
-    // Build the search-agent machinery once (registry + settings), if enabled and
-    // the configured reasoner/writer providers resolve.
-    let agentic_search_setup = if config.llm.agentic.search.enabled {
-        let registry = agent_runtime::build_routed_agent_provider_registry(
-            config,
-            routed_attempts::RoutedAttemptWalker::new(
-                Arc::clone(&router_handle),
-                Arc::clone(&router_breakers),
-                Arc::clone(&router_triggers),
-                Arc::clone(&router_pools),
-            )
-            .with_reporter(routing_event_reporter.clone()),
-        );
-        let settings = agent_runtime::SearchAgentSettings::from_app_config(
-            config,
-            agent_runtime::SEARCH_SYSTEM_PROMPT.to_owned(),
-            agent_runtime::SEARCH_SYNTHESIS_PROMPT.to_owned(),
-        );
-        if registry.contains(&settings.reasoner_provider)
-            && registry.contains(&settings.writer_provider)
-        {
-            Some((registry, settings))
-        } else {
-            readiness_checks.push(ReadinessCheck::skipped(
-                "agent_jobs",
-                "Agentic search enabled but the reasoner/writer provider is missing from the registry",
-            ));
-            None
-        }
-    } else {
-        None
-    };
-    // The agent's own tools call raw Serper directly (never the conversational
-    // web_search tool — that would recurse). Requires Serper to be configured.
-    let agent_serper_tools: Option<Arc<dyn openplotva_agent::AgentTools>> =
-        serper_client.as_ref().map(|serper| {
-            let web: Arc<dyn dialog_tools::WebSearchProvider> = serper.clone();
-            let crawl: Arc<dyn dialog_tools::UrlCrawler> = serper.clone();
-            let history_searcher: Arc<dyn agent_runtime::HistorySearcher> = Arc::new(
-                agent_runtime::PostgresHistorySearch::new(history_store.clone()),
-            );
-            let memory_searcher: Arc<dyn agent_runtime::MemorySearcher> = Arc::new(
-                agent_runtime::PostgresMemorySearch::new(memory_store.clone()),
-            );
-            Arc::new(
-                agent_runtime::AppAgentTools::new(web, crawl)
-                    .with_history_searcher(history_searcher)
-                    .with_memory_searcher(memory_searcher),
-            ) as Arc<dyn openplotva_agent::AgentTools>
-        });
-    // Inline agentic web_search: when enabled + Serper present, the conversational
-    // web_search tool runs the research agent and returns a summary.
-    let inline_agentic_search: Option<Arc<dyn agent_runtime::AgenticWebSearch>> =
-        match (&agentic_search_setup, &agent_serper_tools) {
-            (Some((registry, settings)), Some(tools)) => {
-                registry.get(&settings.reasoner_provider).map(|reasoner| {
-                    Arc::new(agent_runtime::InlineSearchAgent::new(
-                        reasoner,
-                        settings.clone(),
-                        Arc::clone(tools),
-                    )) as Arc<dyn agent_runtime::AgenticWebSearch>
-                })
-            }
-            _ => None,
-        };
-
     let mut app_dialog_toolbox = dialog_tools::AppDialogToolbox::new(
         Some(Arc::clone(&rates_fetcher)),
         Some(rates_tool_dispatcher),
@@ -11128,46 +11078,32 @@ async fn start_runtime_workers(
             .with_web_searcher(web_searcher)
             .with_url_crawler(url_crawler);
     }
-    if let Some(agent) = inline_agentic_search.clone() {
-        app_dialog_toolbox = app_dialog_toolbox.with_agentic_search(agent);
-    }
     let dialog_toolbox: Arc<dyn openplotva_dialog::DialogToolbox> = Arc::new(app_dialog_toolbox);
-    // /search command worker: drives durable agent runs on the agent-qwen queue.
-    if let Some((registry, settings)) = agentic_search_setup {
-        match agent_serper_tools {
-            Some(agent_tools) => {
-                let agent_worker = agent_jobs::AgentJobWorker::new(
-                    Arc::clone(&task_queue_for_updates),
-                    registry,
-                    agent_tools,
-                    Arc::clone(&rich_sender),
-                    settings,
-                );
-                let agent_worker_stop = stop.subscribe();
-                let agent_worker_handle = tokio::spawn(async move {
-                    let report = agent_jobs::run_agent_job_worker_until(
-                        &agent_worker,
-                        wait_for_runtime_stop(agent_worker_stop),
-                    )
-                    .await;
-                    tracing::info!(?report, "agent taskman worker stopped");
-                });
-                shared_taskman_worker_counts
-                    .insert(openplotva_taskman::AGENT_QWEN_QUEUE_NAME.to_owned(), 1);
-                workers.handles.push(agent_worker_handle);
-                readiness_checks.push(ReadinessCheck::ok(
-                    "agent_jobs",
-                    "Agent search worker started on the agent-qwen queue",
-                ));
-            }
-            None => {
-                readiness_checks.push(ReadinessCheck::skipped(
-                    "agent_jobs",
-                    "Agentic search enabled but Serper (web search) is not configured",
-                ));
-            }
-        }
-    }
+    // DIALOG_AGENT_LOOP_ENABLED: the dialog session engine drives the turn
+    // (engine-owned tool loop, multi-message turns) instead of the legacy
+    // provider-internal loop; DIALOG_AGENT_LOOP_CHATS narrows it to canaries.
+    let dialog_session_wiring: Option<Arc<dialog_turn::SessionWorkerWiring>> =
+        config.llm.dialog.agent_loop_enabled.then(|| {
+            Arc::new(dialog_turn::SessionWorkerWiring {
+                toolbox: Arc::clone(&dialog_toolbox),
+                registry: config
+                    .llm
+                    .dialog
+                    .session_injection_enabled
+                    .then(|| Arc::new(dialog_turn::DialogSessionRegistry::new())),
+                reactor: Some(
+                    Arc::new(reactions::GenerationReactionSignaler::new(telegram.clone()))
+                        as Arc<dyn dialog_turn::SessionReactor>,
+                ),
+                enabled_chats: config.llm.dialog.agent_loop_chats.clone(),
+                max_iterations: config.llm.dialog.session_max_iterations,
+                max_messages: config.llm.dialog.session_max_messages,
+                tool_extension_secs: config.llm.dialog.session_tool_extension_secs,
+                hard_cap_secs: config.llm.dialog.session_hard_cap_secs,
+                max_draws: config.llm.dialog.session_max_draws,
+                max_songs: config.llm.dialog.session_max_songs,
+            })
+        });
     let embedding_attempt_walker = routed_attempts::RoutedAttemptWalker::new(
         Arc::clone(&router_handle),
         Arc::clone(&router_breakers),
@@ -11305,6 +11241,7 @@ async fn start_runtime_workers(
             let safe_dialog_toolbox: Arc<dyn openplotva_dialog::DialogToolbox> = Arc::new(
                 runtime_virtual_dialog::RuntimeVirtualSafeToolbox::new(Arc::clone(&dialog_toolbox)),
             );
+            let console_safe_toolbox = Arc::clone(&safe_dialog_toolbox);
             let safe_genkit_fallback =
                 dialog_runtime::genkit_dialog_provider_from_app_config_with_toolbox(
                     config,
@@ -11332,6 +11269,8 @@ async fn start_runtime_workers(
                     dialog_materializer.clone(),
                     safe_dialog_provider,
                     Arc::clone(&dialog_provider),
+                    console_safe_toolbox,
+                    Arc::clone(&dialog_toolbox),
                     taskman_inspector.clone(),
                     llm_trace_buffer.clone(),
                     dialog_jobs::DialogBotIdentity::new(
@@ -11384,6 +11323,7 @@ async fn start_runtime_workers(
                 let terminal_signal = dialog_terminal_signal.clone();
                 let reaction_emoji = dialog_terminal_reaction_emoji.clone();
                 let obligations = Arc::clone(&delivery_obligation_store);
+                let session_wiring = dialog_session_wiring.clone();
                 let stop_rx = stop.subscribe();
                 move |index: usize, retire: tokio::sync::oneshot::Receiver<()>| {
                     let worker_queue = Arc::clone(&queue);
@@ -11396,6 +11336,7 @@ async fn start_runtime_workers(
                     let worker_terminal_signal = terminal_signal.clone();
                     let worker_reaction_emoji = reaction_emoji.clone();
                     let worker_obligations = Arc::clone(&obligations);
+                    let worker_session = session_wiring.clone();
                     let worker_stop = stop_rx.clone();
                     tokio::spawn(async move {
                         // A retired worker finishes its current job and exits
@@ -11428,6 +11369,7 @@ async fn start_runtime_workers(
                                         dialog_terminal_signal_max_age_secs,
                                     ),
                                     obligations: Some(worker_obligations.as_ref()),
+                                    session: worker_session.as_deref(),
                                 },
                                 stop_future,
                             )
@@ -11591,9 +11533,12 @@ async fn start_runtime_workers(
     );
     let draw_chat_counter: Arc<dyn image_jobs::ChatMessageCounter> =
         Arc::new(PostgresHistoryStore::new(service_clients.postgres.clone()));
-    let vip_image_effects =
+    let mut vip_image_effects =
         image_jobs::TelegramImageJobEffects::new(telegram.clone(), Arc::clone(&rich_sender))
             .with_chat_counter(Arc::clone(&draw_chat_counter));
+    if let Some(reactions) = &generation_reactions {
+        vip_image_effects = vip_image_effects.with_reaction_ux(Arc::clone(reactions));
+    }
     let vip_image_stop = stop.subscribe();
     let vip_image_worker = tokio::spawn(async move {
         let report = image_jobs::run_image_gen_worker_every_until_with_max_attempts(
@@ -11629,9 +11574,12 @@ async fn start_runtime_workers(
         ),
         media_prompt_optimizer.clone(),
     );
-    let vip_image_edit_effects =
+    let mut vip_image_edit_effects =
         image_jobs::TelegramImageJobEffects::new(telegram.clone(), Arc::clone(&rich_sender))
             .with_chat_counter(Arc::clone(&draw_chat_counter));
+    if let Some(reactions) = &generation_reactions {
+        vip_image_edit_effects = vip_image_edit_effects.with_reaction_ux(Arc::clone(reactions));
+    }
     let vip_image_edit_stop = stop.subscribe();
     let vip_image_edit_worker = tokio::spawn(async move {
         let report = image_jobs::run_image_edit_worker_every_until_with_max_attempts(
@@ -11663,9 +11611,12 @@ async fn start_runtime_workers(
         image_agent_tools,
         image_agent_settings,
     );
-    let regular_image_effects =
+    let mut regular_image_effects =
         image_jobs::TelegramImageJobEffects::new(telegram.clone(), Arc::clone(&rich_sender))
             .with_chat_counter(Arc::clone(&draw_chat_counter));
+    if let Some(reactions) = &generation_reactions {
+        regular_image_effects = regular_image_effects.with_reaction_ux(Arc::clone(reactions));
+    }
     let regular_image_stop = stop.subscribe();
     let regular_image_worker = tokio::spawn(async move {
         let report = image_jobs::run_image_gen_worker_every_until_with_max_attempts(
@@ -11769,12 +11720,15 @@ async fn start_runtime_workers(
             music_attempt_walker,
             music_jobs::acestep_config_from_app_config(config),
         );
-        let music_effects = music_jobs::TelegramMusicJobEffects::new(
+        let mut music_effects = music_jobs::TelegramMusicJobEffects::new(
             Arc::clone(&permission_policy),
             PostgresTelegramFileStore::new(service_clients.postgres.clone()),
             telegram.clone(),
             Arc::clone(&rich_sender),
         );
+        if let Some(reactions) = &generation_reactions {
+            music_effects = music_effects.with_reaction_ux(Arc::clone(reactions));
+        }
         let music_stop = stop.subscribe();
         let music_worker = tokio::spawn(async move {
             let report = music_jobs::run_music_worker_every_until_with_max_attempts(

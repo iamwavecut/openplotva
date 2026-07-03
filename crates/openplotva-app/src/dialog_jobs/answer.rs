@@ -182,6 +182,10 @@ pub fn should_suppress_duplicate_bot_reply(
         return (0, false);
     }
 
+    // Multi-message turns put several bot messages between the candidate and
+    // the reply it could be repeating, so the guard scans a few recent bot
+    // messages instead of only the very last one.
+    let mut checked = 0;
     for entry in conversation_projection(history) {
         if entry.role != ROLE_MODEL {
             continue;
@@ -193,7 +197,10 @@ pub fn should_suppress_duplicate_bot_reply(
         if previous == normalized_candidate {
             return (entry.message_id, true);
         }
-        return (0, false);
+        checked += 1;
+        if checked >= 3 {
+            break;
+        }
     }
 
     (0, false)

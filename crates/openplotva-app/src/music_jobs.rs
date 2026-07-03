@@ -674,6 +674,32 @@ fn music_retryable_reason(error: &MusicGenerationError) -> Option<FailureReason>
 }
 
 pub trait MusicJobEffects {
+    /// Best-effort: mark the trigger message with the "generating" reaction.
+    fn signal_song_progress<'a>(
+        &'a self,
+        _chat_id: i64,
+        _trigger_message_id: i32,
+    ) -> MusicJobEffectFuture<'a, ()>
+    where
+        Self: Sync,
+    {
+        Box::pin(async {})
+    }
+
+    /// Best-effort: remove the lifecycle reaction from the trigger message.
+    /// Called only on the success path so a late clear can never erase the
+    /// obligations watcher's failure signal.
+    fn clear_song_signal<'a>(
+        &'a self,
+        _chat_id: i64,
+        _trigger_message_id: i32,
+    ) -> MusicJobEffectFuture<'a, ()>
+    where
+        Self: Sync,
+    {
+        Box::pin(async {})
+    }
+
     /// Return whether audio may be sent to this chat.
     fn can_send_audio<'a>(&'a self, chat_id: i64) -> MusicJobEffectFuture<'a, bool>;
 
@@ -776,6 +802,7 @@ pub struct TelegramMusicJobEffects<Permissions, Files, Sender> {
     files: Files,
     telegram: Sender,
     rich: Arc<dyn crate::rich::RichSender>,
+    reactions: Option<crate::reactions::GenerationReactions>,
 }
 
 impl<Permissions, Files, Sender> TelegramMusicJobEffects<Permissions, Files, Sender> {
@@ -792,7 +819,15 @@ impl<Permissions, Files, Sender> TelegramMusicJobEffects<Permissions, Files, Sen
             files,
             telegram,
             rich,
+            reactions: None,
         }
+    }
+
+    /// Enable the reaction-based lifecycle (`DIALOG_DRAW_UX=reactions`).
+    #[must_use]
+    pub fn with_reaction_ux(mut self, reactions: crate::reactions::GenerationReactions) -> Self {
+        self.reactions = Some(reactions);
+        self
     }
 }
 
@@ -803,6 +838,40 @@ where
     Files: MusicReferenceFileStore + Send + Sync,
     Sender: MusicTelegramSender + Clone + Send + Sync + 'static,
 {
+    fn signal_song_progress<'a>(
+        &'a self,
+        chat_id: i64,
+        trigger_message_id: i32,
+    ) -> MusicJobEffectFuture<'a, ()> {
+        Box::pin(async move {
+            if let Some(reactions) = self.reactions.as_deref() {
+                reactions
+                    .set_progress(crate::reactions::GenerationReactionTarget {
+                        chat_id,
+                        message_id: trigger_message_id,
+                    })
+                    .await;
+            }
+        })
+    }
+
+    fn clear_song_signal<'a>(
+        &'a self,
+        chat_id: i64,
+        trigger_message_id: i32,
+    ) -> MusicJobEffectFuture<'a, ()> {
+        Box::pin(async move {
+            if let Some(reactions) = self.reactions.as_deref() {
+                reactions
+                    .clear(crate::reactions::GenerationReactionTarget {
+                        chat_id,
+                        message_id: trigger_message_id,
+                    })
+                    .await;
+            }
+        })
+    }
+
     fn can_send_audio<'a>(&'a self, chat_id: i64) -> MusicJobEffectFuture<'a, bool> {
         Box::pin(async move {
             self.permissions
@@ -985,6 +1054,9 @@ where
             result_message_id: None,
         };
     }
+    effects
+        .signal_song_progress(params.chat_id, params.message_id)
+        .await;
     let material = match material_provider.build_song_material(&params, &topic).await {
         Ok(material) => material,
         Err(error) => {
@@ -1029,18 +1101,28 @@ where
         })
         .await
     {
-        Ok(Some(audio_message_id)) => MusicJobExecutionReport {
-            outcome: MusicJobExecutionOutcome::Completed,
-            topic,
-            error: None,
-            result_message_id: Some(audio_message_id),
-        },
-        Ok(None) => MusicJobExecutionReport {
-            outcome: MusicJobExecutionOutcome::Completed,
-            topic,
-            error: None,
-            result_message_id: None,
-        },
+        Ok(Some(audio_message_id)) => {
+            effects
+                .clear_song_signal(params.chat_id, params.message_id)
+                .await;
+            MusicJobExecutionReport {
+                outcome: MusicJobExecutionOutcome::Completed,
+                topic,
+                error: None,
+                result_message_id: Some(audio_message_id),
+            }
+        }
+        Ok(None) => {
+            effects
+                .clear_song_signal(params.chat_id, params.message_id)
+                .await;
+            MusicJobExecutionReport {
+                outcome: MusicJobExecutionOutcome::Completed,
+                topic,
+                error: None,
+                result_message_id: None,
+            }
+        }
         Err(error) => MusicJobExecutionReport {
             outcome: MusicJobExecutionOutcome::Failed,
             topic,
@@ -1883,6 +1965,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn music_lifecycle_reactions_mark_progress_and_clear_on_success() {
+        let material_provider = HeuristicSongMaterialProvider;
+        let generator = GeneratorStub::new(Ok(GeneratedSongAudio {
+            data: b"MP3".to_vec(),
+            file_name: "song.mp3".to_owned(),
+        }));
+        let effects = EffectsStub::allowed();
+        let report = execute_music_gen_job(
+            &material_provider,
+            &generator,
+            &effects,
+            MusicGenJobParams {
+                chat_id: 42,
+                message_id: 9,
+                user_id: 7,
+                user_full_name: "Alice".to_owned(),
+                topic: "ночной город".to_owned(),
+                ..MusicGenJobParams::default()
+            },
+        )
+        .await;
+
+        assert_eq!(report.outcome, MusicJobExecutionOutcome::Completed);
+        assert_eq!(
+            effects.reactions(),
+            vec![("progress", 42, 9), ("clear", 42, 9)]
+        );
+    }
+
+    #[tokio::test]
+    async fn music_lifecycle_reaction_stays_on_failure_for_the_watcher() {
+        let material_provider = HeuristicSongMaterialProvider;
+        let generator = GeneratorStub::new(Err(MusicGenerationError::Provider(
+            "acestep down".to_owned(),
+        )));
+        let effects = EffectsStub::allowed();
+        let report = execute_music_gen_job(
+            &material_provider,
+            &generator,
+            &effects,
+            MusicGenJobParams {
+                chat_id: 42,
+                message_id: 9,
+                user_id: 7,
+                user_full_name: "Alice".to_owned(),
+                topic: "ночной город".to_owned(),
+                ..MusicGenJobParams::default()
+            },
+        )
+        .await;
+
+        assert_eq!(report.outcome, MusicJobExecutionOutcome::Failed);
+        // The clear is success-only; the obligations watcher owns failure UX
+        // and swaps the standing reaction to the terminal signal itself.
+        assert_eq!(effects.reactions(), vec![("progress", 42, 9)]);
+    }
+
+    #[tokio::test]
     async fn music_queue_once_completes_permission_skip_like_go() -> Result<(), Box<dyn Error>> {
         let queue = openplotva_taskman::InMemoryTaskQueue::new();
         queue.assign(
@@ -2178,11 +2318,14 @@ mod tests {
         }
     }
 
+    type RecordedReactions = Arc<Mutex<Vec<(&'static str, i64, i32)>>>;
+
     #[derive(Clone, Debug)]
     struct EffectsStub {
         can_send: bool,
         sent: Arc<Mutex<Vec<GeneratedSongSendPlan>>>,
         refs: Arc<Mutex<VecDeque<Option<MusicReferenceAudio>>>>,
+        reactions: RecordedReactions,
     }
 
     impl EffectsStub {
@@ -2191,6 +2334,7 @@ mod tests {
                 can_send: true,
                 sent: Arc::new(Mutex::new(Vec::new())),
                 refs: Arc::new(Mutex::new(VecDeque::new())),
+                reactions: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -2204,9 +2348,31 @@ mod tests {
         fn sent(&self) -> Vec<GeneratedSongSendPlan> {
             lock(&self.sent).clone()
         }
+
+        fn reactions(&self) -> Vec<(&'static str, i64, i32)> {
+            lock(&self.reactions).clone()
+        }
     }
 
     impl MusicJobEffects for EffectsStub {
+        fn signal_song_progress<'a>(
+            &'a self,
+            chat_id: i64,
+            trigger_message_id: i32,
+        ) -> MusicJobEffectFuture<'a, ()> {
+            lock(&self.reactions).push(("progress", chat_id, trigger_message_id));
+            Box::pin(async {})
+        }
+
+        fn clear_song_signal<'a>(
+            &'a self,
+            chat_id: i64,
+            trigger_message_id: i32,
+        ) -> MusicJobEffectFuture<'a, ()> {
+            lock(&self.reactions).push(("clear", chat_id, trigger_message_id));
+            Box::pin(async {})
+        }
+
         fn can_send_audio<'a>(&'a self, _chat_id: i64) -> MusicJobEffectFuture<'a, bool> {
             Box::pin(async move { self.can_send })
         }

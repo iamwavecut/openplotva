@@ -2,6 +2,7 @@
 //! exactly one [`TurnResolution`], and only `finalize_turn` acts on it.
 
 use super::ledger::{
+    TURN_OUTCOME_DEFERRED_AFTER_SESSION, TURN_OUTCOME_MERGED_INTO_SESSION,
     TURN_OUTCOME_NO_REPLY_INTENTIONAL, TURN_OUTCOME_RETRY_SCHEDULED, TURN_OUTCOME_SENT,
     TURN_OUTCOME_SIDE_EFFECT_DELEGATED, TURN_OUTCOME_SKIPPED, TURN_OUTCOME_TERMINAL_FAILED,
 };
@@ -53,6 +54,12 @@ pub enum TurnOutcome {
     SkippedEmptyPayload,
     /// Never-processed job outlived `DIALOG_TURN_MAX_QUEUE_AGE_SECS`.
     SkippedQueueBacklog,
+    /// The trigger message was absorbed by the chat's running session (the
+    /// job completes here; the session answers it).
+    MergedIntoSession { session_job_id: i64 },
+    /// A third party's turn parked behind the chat's running session; a fresh
+    /// job respawns for it when the session releases.
+    DeferredAfterSession { session_job_id: i64 },
 }
 
 /// Taskman status transition finalize applies for a resolution.
@@ -85,6 +92,8 @@ impl TurnOutcome {
             Self::SkippedDecodeError { .. }
             | Self::SkippedEmptyPayload
             | Self::SkippedQueueBacklog => TURN_OUTCOME_SKIPPED,
+            Self::MergedIntoSession { .. } => TURN_OUTCOME_MERGED_INTO_SESSION,
+            Self::DeferredAfterSession { .. } => TURN_OUTCOME_DEFERRED_AFTER_SESSION,
         }
     }
 
@@ -92,7 +101,10 @@ impl TurnOutcome {
     #[must_use]
     pub(crate) fn ledger_reason(&self) -> Option<&'static str> {
         match self {
-            Self::Sent { .. } | Self::SideEffectDelegated { .. } => None,
+            Self::Sent { .. }
+            | Self::SideEffectDelegated { .. }
+            | Self::MergedIntoSession { .. }
+            | Self::DeferredAfterSession { .. } => None,
             Self::NoReplyIntentional { reason }
             | Self::RetryScheduled { reason, .. }
             | Self::TerminalFailed { reason, .. } => Some(reason),
@@ -168,6 +180,16 @@ mod tests {
                 TurnOutcome::SkippedQueueBacklog,
                 "skipped",
                 Some("queue_backlog_expired"),
+            ),
+            (
+                TurnOutcome::MergedIntoSession { session_job_id: 5 },
+                "merged_into_session",
+                None,
+            ),
+            (
+                TurnOutcome::DeferredAfterSession { session_job_id: 5 },
+                "deferred_after_session",
+                None,
             ),
         ];
         for (outcome, expected_outcome, expected_reason) in cases {

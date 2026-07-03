@@ -34,21 +34,29 @@
 
 mod budget;
 mod engine;
+mod inbox;
 mod ledger;
 mod obligations;
 mod outcome;
+mod session;
 mod signal;
 
 pub use budget::{
-    TURN_DEADLINE, TURN_STARTED_STAGE, TurnBudget, current_turn_deadline, turn_started_at,
+    SessionBudget, TURN_DEADLINE, TURN_STARTED_STAGE, TurnBudget, current_turn_deadline,
+    turn_started_at,
 };
 pub use engine::{ANSWER_SENT_STAGE, DIALOG_TURN_REGENERATE_STAGE, TURN_OUTCOME_STAGE};
 pub(crate) use engine::{TurnContext, execute_dialog_turn, finalize_turn};
+pub use inbox::{
+    ClaimOutcome, DialogSessionRegistry, InjectedMessage, ParkedJob, SessionInbox, SessionKey,
+    SessionRelease,
+};
 pub use ledger::{
     DialogTurnObserver, DialogTurnOutcomeRecord, PostgresDialogTurnOutcomeRecorder,
-    RuntimeTurnOutcomeBuffer, TURN_OUTCOME_NO_REPLY_INTENTIONAL, TURN_OUTCOME_RETRY_SCHEDULED,
-    TURN_OUTCOME_SENT, TURN_OUTCOME_SIDE_EFFECT_DELEGATED, TURN_OUTCOME_SKIPPED,
-    TURN_OUTCOME_TERMINAL_FAILED, delete_old_turn_outcomes_batch,
+    RuntimeTurnOutcomeBuffer, TURN_OUTCOME_DEFERRED_AFTER_SESSION,
+    TURN_OUTCOME_MERGED_INTO_SESSION, TURN_OUTCOME_NO_REPLY_INTENTIONAL,
+    TURN_OUTCOME_RETRY_SCHEDULED, TURN_OUTCOME_SENT, TURN_OUTCOME_SIDE_EFFECT_DELEGATED,
+    TURN_OUTCOME_SKIPPED, TURN_OUTCOME_TERMINAL_FAILED, delete_old_turn_outcomes_batch,
 };
 pub use obligations::{
     DEFAULT_DIALOG_IMAGE_DELIVERY_TIMEOUT_SECS, DEFAULT_DIALOG_MUSIC_DELIVERY_TIMEOUT_SECS,
@@ -63,6 +71,11 @@ pub use obligations::{
 };
 pub use outcome::{
     JobDisposition, REASON_QUEUE_BACKLOG_EXPIRED, TurnOutcome, TurnResolution, UserSignalPlan,
+};
+pub use session::{
+    CapturedSessionOutput, SESSION_ITERATION_STAGE, SESSION_MESSAGE_SENT_STAGE, SESSION_TOOL_STAGE,
+    SessionReactionFuture, SessionReactor, SessionTurnConfig, SessionWorkerWiring,
+    run_captured_session,
 };
 pub use signal::{
     DEFAULT_DIALOG_TERMINAL_REACTION_EMOJI, DEFAULT_DIALOG_TERMINAL_SIGNAL_MAX_AGE_SECS,

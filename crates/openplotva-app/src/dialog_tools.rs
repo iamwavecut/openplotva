@@ -27,7 +27,7 @@ use serde_json::json;
 use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 
 use crate::{
-    agent_runtime::{AgenticWebSearch, HistorySearcher},
+    agent_runtime::HistorySearcher,
     permissions::{ChatPermissionPolicy, ChatPermissionStore},
     rate_limits::TaskEnqueueRateLimit,
     rates::{RatesFetcher, RatesSideEffectDispatcher, currency_rates_tool},
@@ -896,6 +896,7 @@ pub struct TaskmanDialogToolAdapter {
     song_service_available: bool,
     song_audio_permission: Option<Arc<dyn SongAudioPermission>>,
     queue_position_rich: Option<Arc<dyn crate::rich::RichSender>>,
+    generation_reactions: Option<crate::reactions::GenerationReactions>,
     delivery_obligations: Option<Arc<dyn crate::dialog_turn::DeliveryObligationRecorder>>,
     image_delivery_timeout: time::Duration,
     music_delivery_timeout: time::Duration,
@@ -936,6 +937,10 @@ impl fmt::Debug for TaskmanDialogToolAdapter {
                 &self.queue_position_rich.as_ref().map(|_| "configured"),
             )
             .field(
+                "generation_reactions",
+                &self.generation_reactions.as_ref().map(|_| "configured"),
+            )
+            .field(
                 "delivery_obligations",
                 &self.delivery_obligations.as_ref().map(|_| "configured"),
             )
@@ -957,6 +962,7 @@ impl TaskmanDialogToolAdapter {
             song_service_available: true,
             song_audio_permission: None,
             queue_position_rich: None,
+            generation_reactions: None,
             delivery_obligations: None,
             image_delivery_timeout: time::Duration::seconds(i64::from(
                 crate::dialog_turn::DEFAULT_DIALOG_IMAGE_DELIVERY_TIMEOUT_SECS,
@@ -984,11 +990,49 @@ impl TaskmanDialogToolAdapter {
     }
 
     /// Configure the rich sender used to post and persist the live "waiting in queue"
-    /// message when an image job is enqueued.
+    /// message when an image job is enqueued (`DIALOG_DRAW_UX=placeholder`).
     #[must_use]
     pub fn with_queue_position_rich(mut self, rich: Arc<dyn crate::rich::RichSender>) -> Self {
         self.queue_position_rich = Some(rich);
         self
+    }
+
+    /// Acknowledge queued generations with a reaction on the trigger message
+    /// instead of the placeholder message (`DIALOG_DRAW_UX=reactions`). Takes
+    /// precedence over `with_queue_position_rich` when both are configured.
+    #[must_use]
+    pub fn with_generation_reactions(
+        mut self,
+        reactions: crate::reactions::GenerationReactions,
+    ) -> Self {
+        self.generation_reactions = Some(reactions);
+        self
+    }
+
+    /// Best-effort queued-generation acknowledgment: a 👀 reaction on the
+    /// trigger message when reactions are configured, otherwise the legacy
+    /// queue-position placeholder message (draw paths only).
+    async fn ack_queued_generation(
+        &self,
+        job_id: i64,
+        chat_id: i64,
+        message_id: i32,
+        thread_id: Option<i32>,
+        legacy_placeholder: bool,
+    ) {
+        if let Some(reactions) = self.generation_reactions.as_deref() {
+            reactions
+                .set_queued(crate::reactions::GenerationReactionTarget {
+                    chat_id,
+                    message_id,
+                })
+                .await;
+            return;
+        }
+        if legacy_placeholder {
+            self.announce_queue_position(job_id, chat_id, message_id, thread_id)
+                .await;
+        }
     }
 
     #[must_use]
@@ -1178,7 +1222,7 @@ impl ImageScheduler for TaskmanDialogToolAdapter {
                         message_id,
                     )
                     .await;
-                    self.announce_queue_position(job_id, chat_id, message_id, thread_id)
+                    self.ack_queued_generation(job_id, chat_id, message_id, thread_id, true)
                         .await;
                     Ok(DrawImageScheduleResult {
                         status: "scheduled".to_owned(),
@@ -1289,6 +1333,15 @@ impl SongScheduler for TaskmanDialogToolAdapter {
                         request.message_id,
                     )
                     .await;
+                    // Music never had a queue placeholder; the reaction is net-new parity.
+                    self.ack_queued_generation(
+                        job_id,
+                        chat_id,
+                        request.message_id,
+                        request.thread_id,
+                        false,
+                    )
+                    .await;
                     Ok(SongScheduleResult {
                         status: "scheduled".to_owned(),
                         queue_notice,
@@ -1375,7 +1428,7 @@ impl TaskmanDialogToolAdapter {
                     message_id,
                 )
                 .await;
-                self.announce_queue_position(job_id, chat_id, message_id, thread_id)
+                self.ack_queued_generation(job_id, chat_id, message_id, thread_id, true)
                     .await;
                 Ok(DrawImageScheduleResult {
                     status: "scheduled".to_owned(),
@@ -1987,7 +2040,6 @@ pub struct AppDialogToolbox<RatesFetcherT, RatesDispatcherT, TranslatorT> {
     drawing_canceller: Option<Arc<dyn DrawingJobCanceller>>,
     web_searcher: Option<Arc<dyn WebSearchProvider>>,
     url_crawler: Option<Arc<dyn UrlCrawler>>,
-    agentic_search: Option<Arc<dyn AgenticWebSearch>>,
     youtube_summarizer: Option<Arc<dyn YouTubeSummarizer>>,
     image_scheduler: Option<Arc<dyn ImageScheduler>>,
     song_scheduler: Option<Arc<dyn SongScheduler>>,
@@ -2013,7 +2065,6 @@ impl<RatesFetcherT, RatesDispatcherT, TranslatorT>
             drawing_canceller: None,
             web_searcher: None,
             url_crawler: None,
-            agentic_search: None,
             youtube_summarizer: None,
             image_scheduler: None,
             song_scheduler: None,
@@ -2050,14 +2101,6 @@ impl<RatesFetcherT, RatesDispatcherT, TranslatorT>
     #[must_use]
     pub fn with_url_crawler(mut self, url_crawler: Arc<dyn UrlCrawler>) -> Self {
         self.url_crawler = Some(url_crawler);
-        self
-    }
-
-    /// When set, the `web_search` tool runs the search agent (multi-step research
-    /// returning a summary) instead of a single-pass search.
-    #[must_use]
-    pub fn with_agentic_search(mut self, agentic_search: Arc<dyn AgenticWebSearch>) -> Self {
-        self.agentic_search = Some(agentic_search);
         self
     }
 
@@ -2227,16 +2270,6 @@ where
     fn web_search<'a>(&'a self, query: String) -> ToolboxFuture<'a> {
         Box::pin(async move {
             let query = sanitize_tool_text(&query);
-            // Prefer the search agent (multi-step research → summary). On failure,
-            // fall back to a single-pass search so the model still gets something.
-            if let Some(agent) = self.agentic_search.as_deref() {
-                match agent.search_summary(query.clone()).await {
-                    Ok(summary) => return Ok(dialog_web_search_tool_result(&query, &summary)),
-                    Err(error) => {
-                        tracing::warn!(%error, "agentic web_search failed; falling back to direct search");
-                    }
-                }
-            }
             let Some(searcher) = self.web_searcher.as_deref() else {
                 return Ok(ToolResult::failed(
                     "web_search_unavailable",
@@ -4466,6 +4499,77 @@ mod tests {
             sent[0].html,
             "<tg-emoji emoji-id=\"5298571865969695917\">⏳</tg-emoji>"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn taskman_dialog_tool_adapter_reacts_instead_of_placeholder_when_configured()
+    -> Result<(), ToolboxError> {
+        let queue = Arc::new(InMemoryTaskQueue::new());
+        let vip = Arc::new(DrawImageVipStatusStub::new(true));
+        let rich = Arc::new(crate::rich::MockRichSender::default());
+        let reactions = Arc::new(crate::reactions::test_support::RecordingReactionSink::default());
+        let adapter = TaskmanDialogToolAdapter::new(Arc::clone(&queue))
+            .with_queue_position_rich(rich.clone())
+            .with_generation_reactions(
+                Arc::clone(&reactions) as crate::reactions::GenerationReactions
+            )
+            .with_draw_image_vip_status(vip.clone());
+
+        let scheduled = adapter
+            .schedule_image(DrawImageScheduleRequest {
+                chat_id: -100,
+                message_id: 11,
+                user_id: 42,
+                user_full_name: "Alice".to_owned(),
+                prompt: "castle".to_owned(),
+                thread_id: Some(7),
+                ..DrawImageScheduleRequest::default()
+            })
+            .await?;
+
+        assert_eq!(scheduled.status, "scheduled");
+        // Reactions take precedence: no ⏳ placeholder message, a 👀 reaction
+        // on the trigger instead, and no queue-position id to reuse later.
+        assert!(rich.sent.lock().expect("rich sent").is_empty());
+        let job_id = queue.records()[0].id;
+        assert_eq!(queue.job_queue_position_message_id(job_id), None);
+        let calls = reactions.calls.lock().expect("reaction calls").clone();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "queued");
+        assert_eq!(calls[0].1.chat_id, -100);
+        assert_eq!(calls[0].1.message_id, 11);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn taskman_dialog_tool_adapter_reacts_on_song_schedule() -> Result<(), ToolboxError> {
+        let queue = Arc::new(InMemoryTaskQueue::new());
+        let vip = Arc::new(DrawImageVipStatusStub::new(true));
+        let reactions = Arc::new(crate::reactions::test_support::RecordingReactionSink::default());
+        let adapter = TaskmanDialogToolAdapter::new(Arc::clone(&queue))
+            .with_generation_reactions(
+                Arc::clone(&reactions) as crate::reactions::GenerationReactions
+            )
+            .with_draw_image_vip_status(vip.clone());
+
+        let scheduled = adapter
+            .schedule_song(SongScheduleRequest {
+                chat_id: -100,
+                message_id: 12,
+                user_id: 42,
+                user_full_name: "Alice".to_owned(),
+                topic: "night city".to_owned(),
+                ..SongScheduleRequest::default()
+            })
+            .await?;
+
+        assert_eq!(scheduled.status, "scheduled");
+        let calls = reactions.calls.lock().expect("reaction calls").clone();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "queued");
+        assert_eq!(calls[0].1.chat_id, -100);
+        assert_eq!(calls[0].1.message_id, 12);
         Ok(())
     }
 

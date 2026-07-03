@@ -770,6 +770,35 @@ pub struct DialogConfig {
     /// Delivery-obligation watcher poll interval in seconds, from
     /// `DIALOG_OBLIGATION_WATCH_INTERVAL_SECS`.
     pub obligation_watch_interval_secs: i32,
+    /// Draw/music queue-wait UX, from `DIALOG_DRAW_UX`: `reactions` (default;
+    /// lifecycle reactions on the trigger message, gallery appears with the
+    /// first image) or `placeholder` (legacy ⏳ message edited in place).
+    pub draw_ux: String,
+    /// Dialog session engine kill switch, from `DIALOG_AGENT_LOOP_ENABLED`
+    /// (default ON). Setting it to false reverts every turn to the legacy
+    /// provider-internal tool loop.
+    pub agent_loop_enabled: bool,
+    /// Canary allowlist for the session engine, from `DIALOG_AGENT_LOOP_CHATS`
+    /// (comma-separated chat ids; empty = all chats once the switch is on).
+    pub agent_loop_chats: Vec<i64>,
+    /// LLM iterations per session, from `DIALOG_SESSION_MAX_ITERATIONS`.
+    pub session_max_iterations: i32,
+    /// Intermediate messages per session, from `DIALOG_SESSION_MAX_MESSAGES`.
+    pub session_max_messages: i32,
+    /// Budget extension per started toolbox call in seconds, from
+    /// `DIALOG_SESSION_TOOL_EXTENSION_SECS`.
+    pub session_tool_extension_secs: i32,
+    /// Absolute session wall-clock ceiling in seconds, from
+    /// `DIALOG_SESSION_HARD_CAP_SECS`.
+    pub session_hard_cap_secs: i32,
+    /// Image generations per session, from `DIALOG_SESSION_MAX_DRAWS`.
+    pub session_max_draws: i32,
+    /// Song generations per session, from `DIALOG_SESSION_MAX_SONGS`.
+    pub session_max_songs: i32,
+    /// One active session per (chat, thread) with initiator-only injection,
+    /// from `DIALOG_SESSION_INJECTION_ENABLED` (default ON). Off = the old
+    /// parallel per-(chat, user, thread) turns.
+    pub session_injection_enabled: bool,
     pub vmlx_url: String,
     pub vmlx_api_key: String,
     pub vmlx_model: String,
@@ -1177,6 +1206,26 @@ pub struct RawConfig {
     pub dialog_music_delivery_timeout_secs: Option<String>,
     /// `DIALOG_OBLIGATION_WATCH_INTERVAL_SECS`.
     pub dialog_obligation_watch_interval_secs: Option<String>,
+    /// `DIALOG_DRAW_UX`.
+    pub dialog_draw_ux: Option<String>,
+    /// `DIALOG_AGENT_LOOP_ENABLED`.
+    pub dialog_agent_loop_enabled: Option<String>,
+    /// `DIALOG_AGENT_LOOP_CHATS`.
+    pub dialog_agent_loop_chats: Option<String>,
+    /// `DIALOG_SESSION_MAX_ITERATIONS`.
+    pub dialog_session_max_iterations: Option<String>,
+    /// `DIALOG_SESSION_MAX_MESSAGES`.
+    pub dialog_session_max_messages: Option<String>,
+    /// `DIALOG_SESSION_TOOL_EXTENSION_SECS`.
+    pub dialog_session_tool_extension_secs: Option<String>,
+    /// `DIALOG_SESSION_HARD_CAP_SECS`.
+    pub dialog_session_hard_cap_secs: Option<String>,
+    /// `DIALOG_SESSION_MAX_DRAWS`.
+    pub dialog_session_max_draws: Option<String>,
+    /// `DIALOG_SESSION_MAX_SONGS`.
+    pub dialog_session_max_songs: Option<String>,
+    /// `DIALOG_SESSION_INJECTION_ENABLED`.
+    pub dialog_session_injection_enabled: Option<String>,
     /// `DIALOG_VMLX_URL`.
     pub dialog_vmlx_url: Option<String>,
     /// `DIALOG_VMLX_API_KEY`.
@@ -1516,6 +1565,8 @@ pub enum ConfigError {
     PersistentQueueFallbackWatermarkRange,
     #[error("invalid UPDATE_QUEUE_BACKEND value {value:?}: expected list or stream")]
     InvalidUpdateQueueBackend { value: String },
+    #[error("invalid DIALOG_DRAW_UX value {value:?}: expected reactions or placeholder")]
+    InvalidDrawUx { value: String },
 }
 
 impl AppConfig {
@@ -2278,6 +2329,52 @@ impl AppConfig {
                         raw.dialog_obligation_watch_interval_secs,
                         15,
                     )?,
+                    draw_ux: parse_draw_ux(raw.dialog_draw_ux)?,
+                    agent_loop_enabled: parse_bool(
+                        "DIALOG_AGENT_LOOP_ENABLED",
+                        raw.dialog_agent_loop_enabled,
+                        true,
+                    )?,
+                    agent_loop_chats: parse_i64_list_or_default(
+                        "DIALOG_AGENT_LOOP_CHATS",
+                        raw.dialog_agent_loop_chats,
+                        "",
+                    )?,
+                    session_max_iterations: parse_i32(
+                        "DIALOG_SESSION_MAX_ITERATIONS",
+                        raw.dialog_session_max_iterations,
+                        8,
+                    )?,
+                    session_max_messages: parse_i32(
+                        "DIALOG_SESSION_MAX_MESSAGES",
+                        raw.dialog_session_max_messages,
+                        4,
+                    )?,
+                    session_tool_extension_secs: parse_i32(
+                        "DIALOG_SESSION_TOOL_EXTENSION_SECS",
+                        raw.dialog_session_tool_extension_secs,
+                        60,
+                    )?,
+                    session_hard_cap_secs: parse_i32(
+                        "DIALOG_SESSION_HARD_CAP_SECS",
+                        raw.dialog_session_hard_cap_secs,
+                        300,
+                    )?,
+                    session_max_draws: parse_i32(
+                        "DIALOG_SESSION_MAX_DRAWS",
+                        raw.dialog_session_max_draws,
+                        1,
+                    )?,
+                    session_max_songs: parse_i32(
+                        "DIALOG_SESSION_MAX_SONGS",
+                        raw.dialog_session_max_songs,
+                        1,
+                    )?,
+                    session_injection_enabled: parse_bool(
+                        "DIALOG_SESSION_INJECTION_ENABLED",
+                        raw.dialog_session_injection_enabled,
+                        true,
+                    )?,
                     vmlx_url: raw
                         .dialog_vmlx_url
                         .unwrap_or_else(|| DEFAULT_DIALOG_VMLX_URL.to_owned()),
@@ -2856,6 +2953,16 @@ impl RawConfig {
             dialog_image_delivery_timeout_secs: env("DIALOG_IMAGE_DELIVERY_TIMEOUT_SECS"),
             dialog_music_delivery_timeout_secs: env("DIALOG_MUSIC_DELIVERY_TIMEOUT_SECS"),
             dialog_obligation_watch_interval_secs: env("DIALOG_OBLIGATION_WATCH_INTERVAL_SECS"),
+            dialog_draw_ux: env("DIALOG_DRAW_UX"),
+            dialog_agent_loop_enabled: env("DIALOG_AGENT_LOOP_ENABLED"),
+            dialog_agent_loop_chats: env("DIALOG_AGENT_LOOP_CHATS"),
+            dialog_session_max_iterations: env("DIALOG_SESSION_MAX_ITERATIONS"),
+            dialog_session_max_messages: env("DIALOG_SESSION_MAX_MESSAGES"),
+            dialog_session_tool_extension_secs: env("DIALOG_SESSION_TOOL_EXTENSION_SECS"),
+            dialog_session_hard_cap_secs: env("DIALOG_SESSION_HARD_CAP_SECS"),
+            dialog_session_max_draws: env("DIALOG_SESSION_MAX_DRAWS"),
+            dialog_session_max_songs: env("DIALOG_SESSION_MAX_SONGS"),
+            dialog_session_injection_enabled: env("DIALOG_SESSION_INJECTION_ENABLED"),
             dialog_vmlx_url: env("DIALOG_VMLX_URL"),
             dialog_vmlx_api_key: env("DIALOG_VMLX_API_KEY"),
             dialog_vmlx_model: env("DIALOG_VMLX_MODEL"),
@@ -3104,6 +3211,22 @@ fn parse_update_queue_backend(value: Option<String>) -> Result<String, ConfigErr
     match backend.as_str() {
         "list" | "stream" => Ok(backend),
         _ => Err(ConfigError::InvalidUpdateQueueBackend { value: backend }),
+    }
+}
+
+/// Draw-UX selector value for the reaction-based lifecycle (default).
+pub const DRAW_UX_REACTIONS: &str = "reactions";
+
+/// Draw-UX selector value for the legacy ⏳ placeholder message.
+pub const DRAW_UX_PLACEHOLDER: &str = "placeholder";
+
+fn parse_draw_ux(value: Option<String>) -> Result<String, ConfigError> {
+    let ux = parse_scalar_value(value)
+        .unwrap_or_else(|| DRAW_UX_REACTIONS.to_owned())
+        .to_ascii_lowercase();
+    match ux.as_str() {
+        DRAW_UX_REACTIONS | DRAW_UX_PLACEHOLDER => Ok(ux),
+        _ => Err(ConfigError::InvalidDrawUx { value: ux }),
     }
 }
 

@@ -450,6 +450,7 @@ impl<DataUrl, Transport> AifarmVisionCaptioner<DataUrl, Transport> {
                     role: "system".to_owned(),
                     content: system_prompt.trim().to_owned(),
                     content_parts: Vec::new(),
+                    ..ChatMessage::default()
                 },
                 ChatMessage {
                     role: "user".to_owned(),
@@ -469,6 +470,7 @@ impl<DataUrl, Transport> AifarmVisionCaptioner<DataUrl, Transport> {
                             }),
                         },
                     ],
+                    ..ChatMessage::default()
                 },
             ],
             stream: false,

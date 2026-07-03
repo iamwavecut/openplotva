@@ -1233,6 +1233,7 @@ where
     report
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn process_memory_consolidation_taskman_job_once_at<Extractor, Store, Embedder>(
     queue: &InMemoryTaskQueue,
     extractor: &Extractor,
