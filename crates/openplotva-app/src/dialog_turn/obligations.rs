@@ -294,7 +294,7 @@ pub trait DeliveryObligationNotifier: Send + Sync {
 
     /// Best-effort: swap the trigger-message reaction to the terminal 🤔 after
     /// a failure resolution, replacing a stale 👀/✍ lifecycle reaction
-    /// (`DIALOG_DRAW_UX=reactions`). Default no-op keeps the legacy
+    /// Default no-op keeps the legacy
     /// placeholder UX untouched.
     fn signal_failure_reaction<'a>(
         &'a self,
@@ -352,7 +352,7 @@ impl DispatcherDeliveryObligationNotifier {
     }
 
     /// Enable lifecycle-reaction maintenance on obligation resolutions
-    /// (`DIALOG_DRAW_UX=reactions`): 🤔 swap on failures, backstop clear on
+    /// 🤔 swap on failures, backstop clear on
     /// delivered/cancelled. Without this the legacy placeholder UX applies.
     #[must_use]
     pub fn with_lifecycle_reactions(
@@ -1153,8 +1153,6 @@ mod tests {
             completed_at: None,
             error: None,
             progress_message_id: None,
-            queue_position_message_id: None,
-            queue_position_message_pending: false,
             result_message_id,
             messages: Vec::new(),
             events: Vec::new(),

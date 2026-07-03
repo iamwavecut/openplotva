@@ -895,7 +895,6 @@ pub struct TaskmanDialogToolAdapter {
     image_edit_file_resolver: Option<Arc<dyn ImageEditFileResolver>>,
     song_service_available: bool,
     song_audio_permission: Option<Arc<dyn SongAudioPermission>>,
-    queue_position_rich: Option<Arc<dyn crate::rich::RichSender>>,
     generation_reactions: Option<crate::reactions::GenerationReactions>,
     delivery_obligations: Option<Arc<dyn crate::dialog_turn::DeliveryObligationRecorder>>,
     image_delivery_timeout: time::Duration,
@@ -933,10 +932,6 @@ impl fmt::Debug for TaskmanDialogToolAdapter {
                 &self.song_audio_permission.as_ref().map(|_| "configured"),
             )
             .field(
-                "queue_position_rich",
-                &self.queue_position_rich.as_ref().map(|_| "configured"),
-            )
-            .field(
                 "generation_reactions",
                 &self.generation_reactions.as_ref().map(|_| "configured"),
             )
@@ -961,7 +956,6 @@ impl TaskmanDialogToolAdapter {
             image_edit_file_resolver: None,
             song_service_available: true,
             song_audio_permission: None,
-            queue_position_rich: None,
             generation_reactions: None,
             delivery_obligations: None,
             image_delivery_timeout: time::Duration::seconds(i64::from(
@@ -989,17 +983,7 @@ impl TaskmanDialogToolAdapter {
         self
     }
 
-    /// Configure the rich sender used to post and persist the live "waiting in queue"
-    /// message when an image job is enqueued (`DIALOG_DRAW_UX=placeholder`).
-    #[must_use]
-    pub fn with_queue_position_rich(mut self, rich: Arc<dyn crate::rich::RichSender>) -> Self {
-        self.queue_position_rich = Some(rich);
-        self
-    }
-
-    /// Acknowledge queued generations with a reaction on the trigger message
-    /// instead of the placeholder message (`DIALOG_DRAW_UX=reactions`). Takes
-    /// precedence over `with_queue_position_rich` when both are configured.
+    /// Acknowledge queued generations with a reaction on the trigger message.
     #[must_use]
     pub fn with_generation_reactions(
         mut self,
@@ -1012,25 +996,13 @@ impl TaskmanDialogToolAdapter {
     /// Best-effort queued-generation acknowledgment: a 👀 reaction on the
     /// trigger message when reactions are configured, otherwise the legacy
     /// queue-position placeholder message (draw paths only).
-    async fn ack_queued_generation(
-        &self,
-        job_id: i64,
-        chat_id: i64,
-        message_id: i32,
-        thread_id: Option<i32>,
-        legacy_placeholder: bool,
-    ) {
+    async fn ack_queued_generation(&self, chat_id: i64, message_id: i32) {
         if let Some(reactions) = self.generation_reactions.as_deref() {
             reactions
                 .set_queued(crate::reactions::GenerationReactionTarget {
                     chat_id,
                     message_id,
                 })
-                .await;
-            return;
-        }
-        if legacy_placeholder {
-            self.announce_queue_position(job_id, chat_id, message_id, thread_id)
                 .await;
         }
     }
@@ -1222,8 +1194,7 @@ impl ImageScheduler for TaskmanDialogToolAdapter {
                         message_id,
                     )
                     .await;
-                    self.ack_queued_generation(job_id, chat_id, message_id, thread_id, true)
-                        .await;
+                    self.ack_queued_generation(chat_id, message_id).await;
                     Ok(DrawImageScheduleResult {
                         status: "scheduled".to_owned(),
                         job_id: Some(job_id),
@@ -1333,15 +1304,8 @@ impl SongScheduler for TaskmanDialogToolAdapter {
                         request.message_id,
                     )
                     .await;
-                    // Music never had a queue placeholder; the reaction is net-new parity.
-                    self.ack_queued_generation(
-                        job_id,
-                        chat_id,
-                        request.message_id,
-                        request.thread_id,
-                        false,
-                    )
-                    .await;
+                    self.ack_queued_generation(chat_id, request.message_id)
+                        .await;
                     Ok(SongScheduleResult {
                         status: "scheduled".to_owned(),
                         queue_notice,
@@ -1428,8 +1392,7 @@ impl TaskmanDialogToolAdapter {
                     message_id,
                 )
                 .await;
-                self.ack_queued_generation(job_id, chat_id, message_id, thread_id, true)
-                    .await;
+                self.ack_queued_generation(chat_id, message_id).await;
                 Ok(DrawImageScheduleResult {
                     status: "scheduled".to_owned(),
                     job_id: Some(job_id),
@@ -1538,60 +1501,8 @@ impl TaskmanDialogToolAdapter {
         job: openplotva_taskman::StatelessJobItem,
         max_active_jobs: usize,
     ) -> Result<Option<i64>, openplotva_taskman::TaskQueueError> {
-        if self.queue_position_rich.is_some() {
-            return self
-                .queue
-                .assign_with_user_limit_and_queue_position_pending(
-                    queue_name,
-                    job,
-                    max_active_jobs,
-                );
-        }
         self.queue
             .assign_with_user_limit(queue_name, job, max_active_jobs)
-    }
-
-    /// Post the initial "waiting in queue" message (bare waiting emoji) for a freshly-enqueued
-    /// image job and persist its id so the worker can reuse or delete it when drawing starts.
-    async fn announce_queue_position(
-        &self,
-        job_id: i64,
-        chat_id: i64,
-        message_id: i32,
-        thread_id: Option<i32>,
-    ) {
-        let Some(rich) = self.queue_position_rich.as_deref() else {
-            return;
-        };
-        let options = openplotva_telegram::RichSendOptions {
-            message_thread_id: thread_id.map(i64::from),
-            reply_to_message_id: Some(i64::from(message_id)),
-            allow_sending_without_reply: true,
-            disable_notification: false,
-            reply_markup: None,
-        };
-        let html = crate::rich::compose_draw_waiting();
-        match rich.send_rich(chat_id, &html, &options).await {
-            Ok(message_id) => {
-                if let Ok(message_id) = i32::try_from(message_id) {
-                    let _ = self
-                        .queue
-                        .set_queue_position_message_id(job_id, Some(message_id));
-                } else {
-                    let _ = self.queue.set_queue_position_message_id(job_id, None);
-                    tracing::warn!(
-                        chat_id,
-                        job_id,
-                        message_id,
-                        "draw queue-position message id is out of range"
-                    );
-                }
-            }
-            Err(error) => {
-                let _ = self.queue.set_queue_position_message_id(job_id, None);
-                tracing::warn!(chat_id, job_id, %error, "failed to post draw queue-position message");
-            }
-        }
     }
 }
 
@@ -4463,46 +4374,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn taskman_dialog_tool_adapter_announces_queue_position_on_enqueue()
-    -> Result<(), ToolboxError> {
-        let queue = Arc::new(InMemoryTaskQueue::new());
-        let vip = Arc::new(DrawImageVipStatusStub::new(true));
-        let rich = Arc::new(crate::rich::MockRichSender::default());
-        let adapter = TaskmanDialogToolAdapter::new(Arc::clone(&queue))
-            .with_queue_position_rich(rich.clone())
-            .with_draw_image_vip_status(vip.clone());
-
-        let scheduled = adapter
-            .schedule_image(DrawImageScheduleRequest {
-                chat_id: -100,
-                message_id: 11,
-                user_id: 42,
-                user_full_name: "Alice".to_owned(),
-                prompt: "castle".to_owned(),
-                thread_id: Some(7),
-                ..DrawImageScheduleRequest::default()
-            })
-            .await?;
-
-        assert_eq!(scheduled.status, "scheduled");
-        let records = queue.records();
-        let job_id = records[0].id;
-        assert!(!records[0].queue_position_message_pending);
-        assert_eq!(queue.job_queue_position_message_id(job_id), Some(1001));
-        let sent = rich.sent.lock().expect("rich sent");
-        assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].chat_id, -100);
-        assert_eq!(sent[0].reply_to_message_id, Some(11));
-        assert_eq!(sent[0].message_thread_id, Some(7));
-        assert!(sent[0].allow_sending_without_reply);
-        assert_eq!(
-            sent[0].html,
-            "<tg-emoji emoji-id=\"5298571865969695917\">⏳</tg-emoji>"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn taskman_dialog_tool_adapter_reacts_instead_of_placeholder_when_configured()
     -> Result<(), ToolboxError> {
         let queue = Arc::new(InMemoryTaskQueue::new());
@@ -4510,7 +4381,6 @@ mod tests {
         let rich = Arc::new(crate::rich::MockRichSender::default());
         let reactions = Arc::new(crate::reactions::test_support::RecordingReactionSink::default());
         let adapter = TaskmanDialogToolAdapter::new(Arc::clone(&queue))
-            .with_queue_position_rich(rich.clone())
             .with_generation_reactions(
                 Arc::clone(&reactions) as crate::reactions::GenerationReactions
             )
@@ -4532,8 +4402,6 @@ mod tests {
         // Reactions take precedence: no ⏳ placeholder message, a 👀 reaction
         // on the trigger instead, and no queue-position id to reuse later.
         assert!(rich.sent.lock().expect("rich sent").is_empty());
-        let job_id = queue.records()[0].id;
-        assert_eq!(queue.job_queue_position_message_id(job_id), None);
         let calls = reactions.calls.lock().expect("reaction calls").clone();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "queued");

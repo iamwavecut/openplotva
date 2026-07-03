@@ -5352,7 +5352,6 @@ fn admin_taskman_list_entry_json(
         item.trigger_message_id,
         item.thread_message_id,
         item.progress_message_id,
-        item.queue_position_message_id,
         item.result_message_id,
         item.worker_id.as_deref(),
         &item.created_at,
@@ -5404,7 +5403,6 @@ fn admin_taskman_job_json(job: &openplotva_server::RuntimeTaskmanJobData) -> ser
         job.trigger_message_id,
         job.thread_message_id,
         job.progress_message_id,
-        job.queue_position_message_id,
         job.result_message_id,
         job.worker_id.as_deref(),
         &job.created_at,
@@ -5431,7 +5429,6 @@ fn admin_taskman_job_base_json(
     trigger_message_id: i32,
     thread_message_id: Option<i32>,
     progress_message_id: Option<i32>,
-    queue_position_message_id: Option<i32>,
     result_message_id: Option<i32>,
     worker_id: Option<&str>,
     created_at: &str,
@@ -5465,11 +5462,6 @@ fn admin_taskman_job_base_json(
     );
     admin_insert_i32_option(&mut value, "thread_message_id", thread_message_id);
     admin_insert_i32_option(&mut value, "progress_message_id", progress_message_id);
-    admin_insert_i32_option(
-        &mut value,
-        "queue_position_message_id",
-        queue_position_message_id,
-    );
     admin_insert_i32_option(&mut value, "result_message_id", result_message_id);
     admin_insert_str_option(&mut value, "worker_id", worker_id);
     value.insert("created_at".to_owned(), serde_json::json!(created_at));
@@ -8742,17 +8734,10 @@ fn record_dialog_tool_mode_readiness(
     {
         return;
     }
-    if dialog.aifarm_use_tool_calls {
-        readiness_checks.push(ReadinessCheck::ok(
-            "dialog_tool_mode",
-            "AIFarm native dialog tool calls enabled",
-        ));
-    } else {
-        readiness_checks.push(ReadinessCheck::skipped(
-            "dialog_tool_mode",
-            "AIFarm dialog tools are configured but native tool calls are disabled",
-        ));
-    }
+    readiness_checks.push(ReadinessCheck::ok(
+        "dialog_tool_mode",
+        "AIFarm native dialog tool calls enabled",
+    ));
 }
 
 pub async fn run_long_poll_update_producer_after_delete_webhook<Startup, Source, Queue, Stop>(
@@ -10845,15 +10830,10 @@ async fn start_runtime_workers(
     let delivery_obligation_store = Arc::new(
         openplotva_storage::PostgresDeliveryObligationStore::new(service_clients.postgres.clone()),
     );
-    // DIALOG_DRAW_UX: `reactions` (default) swaps the ⏳ queue-placeholder
-    // message for lifecycle reactions on the trigger message; `placeholder`
-    // keeps the legacy flow. One shared signaler feeds the tool adapter,
-    // image/music workers, and the obligations watcher.
-    let generation_reactions: Option<reactions::GenerationReactions> =
-        (config.llm.dialog.draw_ux == openplotva_config::DRAW_UX_REACTIONS).then(|| {
-            Arc::new(reactions::GenerationReactionSignaler::new(telegram.clone()))
-                as reactions::GenerationReactions
-        });
+    // One shared reaction signaler feeds the tool adapter, image/music
+    // workers, and the obligations watcher.
+    let generation_reactions: reactions::GenerationReactions =
+        Arc::new(reactions::GenerationReactionSignaler::new(telegram.clone()));
     let dialog_tool_adapter =
         dialog_tools::TaskmanDialogToolAdapter::new(Arc::clone(&task_queue_for_updates))
             .with_draw_image_vip_status(vip_status_for_updates.clone())
@@ -10879,10 +10859,8 @@ async fn start_runtime_workers(
                     ),
                 ),
             ));
-    let dialog_tool_adapter = Arc::new(match &generation_reactions {
-        Some(reactions) => dialog_tool_adapter.with_generation_reactions(Arc::clone(reactions)),
-        None => dialog_tool_adapter.with_queue_position_rich(Arc::clone(&rich_sender)),
-    });
+    let dialog_tool_adapter =
+        Arc::new(dialog_tool_adapter.with_generation_reactions(Arc::clone(&generation_reactions)));
     {
         let watcher_store: Arc<dyn dialog_turn::DeliveryObligationStore> =
             Arc::clone(&delivery_obligation_store) as _;
@@ -10901,7 +10879,8 @@ async fn start_runtime_workers(
             Arc::clone(&dispatcher_queue),
             watcher_signal.clone(),
         );
-        if let Some(reactions) = &generation_reactions {
+        {
+            let reactions = &generation_reactions;
             obligation_notifier =
                 obligation_notifier.with_lifecycle_reactions(Arc::clone(reactions));
         }
@@ -11079,30 +11058,23 @@ async fn start_runtime_workers(
             .with_url_crawler(url_crawler);
     }
     let dialog_toolbox: Arc<dyn openplotva_dialog::DialogToolbox> = Arc::new(app_dialog_toolbox);
-    // DIALOG_AGENT_LOOP_ENABLED: the dialog session engine drives the turn
-    // (engine-owned tool loop, multi-message turns) instead of the legacy
-    // provider-internal loop; DIALOG_AGENT_LOOP_CHATS narrows it to canaries.
-    let dialog_session_wiring: Option<Arc<dialog_turn::SessionWorkerWiring>> =
-        config.llm.dialog.agent_loop_enabled.then(|| {
-            Arc::new(dialog_turn::SessionWorkerWiring {
-                toolbox: Arc::clone(&dialog_toolbox),
-                registry: config
-                    .llm
-                    .dialog
-                    .session_injection_enabled
-                    .then(|| Arc::new(dialog_turn::DialogSessionRegistry::new())),
-                reactor: Some(
-                    Arc::new(reactions::GenerationReactionSignaler::new(telegram.clone()))
-                        as Arc<dyn dialog_turn::SessionReactor>,
-                ),
-                enabled_chats: config.llm.dialog.agent_loop_chats.clone(),
-                max_iterations: config.llm.dialog.session_max_iterations,
-                max_messages: config.llm.dialog.session_max_messages,
-                tool_extension_secs: config.llm.dialog.session_tool_extension_secs,
-                hard_cap_secs: config.llm.dialog.session_hard_cap_secs,
-                max_draws: config.llm.dialog.session_max_draws,
-                max_songs: config.llm.dialog.session_max_songs,
-            })
+    // The dialog session engine drives every turn: engine-owned tool loop,
+    // multi-message turns, per-(chat, thread) serialization with initiator
+    // injection.
+    let dialog_session_wiring: Arc<dialog_turn::SessionWorkerWiring> =
+        Arc::new(dialog_turn::SessionWorkerWiring {
+            toolbox: Arc::clone(&dialog_toolbox),
+            registry: Arc::new(dialog_turn::DialogSessionRegistry::new()),
+            reactor: Some(
+                Arc::new(reactions::GenerationReactionSignaler::new(telegram.clone()))
+                    as Arc<dyn dialog_turn::SessionReactor>,
+            ),
+            max_iterations: config.llm.dialog.session_max_iterations,
+            max_messages: config.llm.dialog.session_max_messages,
+            tool_extension_secs: config.llm.dialog.session_tool_extension_secs,
+            hard_cap_secs: config.llm.dialog.session_hard_cap_secs,
+            max_draws: config.llm.dialog.session_max_draws,
+            max_songs: config.llm.dialog.session_max_songs,
         });
     let embedding_attempt_walker = routed_attempts::RoutedAttemptWalker::new(
         Arc::clone(&router_handle),
@@ -11165,10 +11137,7 @@ async fn start_runtime_workers(
             .await;
         }));
     }
-    let genkit_fallback = dialog_runtime::genkit_dialog_provider_from_app_config_with_toolbox(
-        config,
-        Some(Arc::clone(&dialog_toolbox)),
-    );
+    let genkit_fallback = dialog_runtime::genkit_dialog_provider_from_app_config(config);
     let mut dialog_provider_for_updates: Option<openplotva_llm::ChatProviderHandle> = None;
     match Ok::<_, dialog_runtime::DialogProviderBuildError>(dialog_runtime::router_dialog_provider(
         config,
@@ -11242,32 +11211,12 @@ async fn start_runtime_workers(
                 runtime_virtual_dialog::RuntimeVirtualSafeToolbox::new(Arc::clone(&dialog_toolbox)),
             );
             let console_safe_toolbox = Arc::clone(&safe_dialog_toolbox);
-            let safe_genkit_fallback =
-                dialog_runtime::genkit_dialog_provider_from_app_config_with_toolbox(
-                    config,
-                    Some(Arc::clone(&safe_dialog_toolbox)),
-                );
-            let mut safe_dialog_provider = dialog_runtime::router_dialog_provider(
-                config,
-                safe_dialog_toolbox,
-                Arc::clone(&router_handle),
-                Arc::clone(&router_breakers),
-                Arc::clone(&router_triggers),
-                Arc::clone(&router_pools),
-                safe_genkit_fallback,
-                Some(routing_event_reporter.clone()),
-            );
-            if let Some(recorder) = white_circle_recorder {
-                safe_dialog_provider =
-                    wrap_dialog_provider_with_white_circle(safe_dialog_provider, config, recorder);
-            }
             virtual_dialog_manager.set_executor(Arc::new(
                 runtime_virtual_dialog::RuntimeVirtualDialogExecutor::new(
                     virtual_dialog_store.clone(),
                     store.clone(),
                     history_store.clone(),
                     dialog_materializer.clone(),
-                    safe_dialog_provider,
                     Arc::clone(&dialog_provider),
                     console_safe_toolbox,
                     Arc::clone(&dialog_toolbox),
@@ -11369,7 +11318,7 @@ async fn start_runtime_workers(
                                         dialog_terminal_signal_max_age_secs,
                                     ),
                                     obligations: Some(worker_obligations.as_ref()),
-                                    session: worker_session.as_deref(),
+                                    session: worker_session.as_ref(),
                                 },
                                 stop_future,
                             )
@@ -11531,12 +11480,10 @@ async fn start_runtime_workers(
         image_agent_tools.clone(),
         image_agent_settings.clone(),
     );
-    let draw_chat_counter: Arc<dyn image_jobs::ChatMessageCounter> =
-        Arc::new(PostgresHistoryStore::new(service_clients.postgres.clone()));
     let mut vip_image_effects =
-        image_jobs::TelegramImageJobEffects::new(telegram.clone(), Arc::clone(&rich_sender))
-            .with_chat_counter(Arc::clone(&draw_chat_counter));
-    if let Some(reactions) = &generation_reactions {
+        image_jobs::TelegramImageJobEffects::new(telegram.clone(), Arc::clone(&rich_sender));
+    {
+        let reactions = &generation_reactions;
         vip_image_effects = vip_image_effects.with_reaction_ux(Arc::clone(reactions));
     }
     let vip_image_stop = stop.subscribe();
@@ -11575,9 +11522,9 @@ async fn start_runtime_workers(
         media_prompt_optimizer.clone(),
     );
     let mut vip_image_edit_effects =
-        image_jobs::TelegramImageJobEffects::new(telegram.clone(), Arc::clone(&rich_sender))
-            .with_chat_counter(Arc::clone(&draw_chat_counter));
-    if let Some(reactions) = &generation_reactions {
+        image_jobs::TelegramImageJobEffects::new(telegram.clone(), Arc::clone(&rich_sender));
+    {
+        let reactions = &generation_reactions;
         vip_image_edit_effects = vip_image_edit_effects.with_reaction_ux(Arc::clone(reactions));
     }
     let vip_image_edit_stop = stop.subscribe();
@@ -11612,9 +11559,9 @@ async fn start_runtime_workers(
         image_agent_settings,
     );
     let mut regular_image_effects =
-        image_jobs::TelegramImageJobEffects::new(telegram.clone(), Arc::clone(&rich_sender))
-            .with_chat_counter(Arc::clone(&draw_chat_counter));
-    if let Some(reactions) = &generation_reactions {
+        image_jobs::TelegramImageJobEffects::new(telegram.clone(), Arc::clone(&rich_sender));
+    {
+        let reactions = &generation_reactions;
         regular_image_effects = regular_image_effects.with_reaction_ux(Arc::clone(reactions));
     }
     let regular_image_stop = stop.subscribe();
@@ -11726,7 +11673,8 @@ async fn start_runtime_workers(
             telegram.clone(),
             Arc::clone(&rich_sender),
         );
-        if let Some(reactions) = &generation_reactions {
+        {
+            let reactions = &generation_reactions;
             music_effects = music_effects.with_reaction_ux(Arc::clone(reactions));
         }
         let music_stop = stop.subscribe();

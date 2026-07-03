@@ -5,17 +5,13 @@ use std::{future::Future, sync::Arc, time::Duration};
 
 use openplotva_llm::ChatProvider;
 use openplotva_taskman::{
-    DEFAULT_LLM_JOB_MAX_ATTEMPTS, DIALOG_AIFARM_QUEUE_NAME, LOWEST_PRIORITY,
-    dialog_job_params_from_stateless_job,
+    DIALOG_AIFARM_QUEUE_NAME, LOWEST_PRIORITY, dialog_job_params_from_stateless_job,
 };
 use time::{Duration as TimeDuration, OffsetDateTime};
 
 use super::{
-    BasicDialogInputMaterializer, DEFAULT_DIALOG_TURN_BUDGET_SECS,
-    DEFAULT_DIALOG_TURN_MAX_QUEUE_AGE_SECS, DEFAULT_DIALOG_TURN_MAX_REGENERATIONS,
-    DIALOG_JOB_POLL_INTERVAL, DIALOG_JOB_WORKER_QUEUES, DialogInputMaterializer, DialogJobEffects,
-    DialogJobWorkerQueue, DialogJobWorkerReport, DialogJobWorkerRunReport,
-    DialogToolCallHistoryStore, NoopDialogToolCallHistoryStore, trace_dialog_job_tick,
+    DialogInputMaterializer, DialogJobEffects, DialogJobWorkerQueue, DialogJobWorkerReport,
+    DialogJobWorkerRunReport, DialogToolCallHistoryStore, trace_dialog_job_tick,
 };
 
 /// Shared loop controls for dialog taskman workers.
@@ -42,9 +38,8 @@ pub struct DialogJobWorkerLoopOptions<'a, Materializer: ?Sized, ToolHistory: ?Si
     /// Delivery-obligation annotator: finalize backfills the dialog job id on
     /// obligations recorded by the schedulers (annotation only, never creates).
     pub obligations: Option<&'a dyn crate::dialog_turn::DeliveryObligationAnnotator>,
-    /// Session-engine wiring (`DIALOG_AGENT_LOOP_ENABLED`); `None` keeps the
-    /// legacy provider-internal loop on every turn.
-    pub session: Option<&'a crate::dialog_turn::SessionWorkerWiring>,
+    /// Session-engine wiring: toolbox, reactor, registry, and session caps.
+    pub session: &'a crate::dialog_turn::SessionWorkerWiring,
 }
 
 /// True when the current UTC time is inside the daily `[start, end)` minute window,
@@ -152,123 +147,6 @@ pub async fn run_router_trigger_poller<Queue, Stop>(
     }
 }
 
-pub async fn process_dialog_job_once_at<Queue, Provider, Effects>(
-    queue: &Queue,
-    provider: &Provider,
-    effects: &Effects,
-    now: OffsetDateTime,
-) -> DialogJobWorkerReport
-where
-    Queue: DialogJobWorkerQueue + Sync + ?Sized,
-    Provider: ChatProvider + Sync + ?Sized,
-    Effects: DialogJobEffects + Sync + ?Sized,
-{
-    process_dialog_job_once_in_queue_at(queue, DIALOG_AIFARM_QUEUE_NAME, provider, effects, now)
-        .await
-}
-
-/// Process one dialog taskman job from a specific queue.
-pub async fn process_dialog_job_once_in_queue_at<Queue, Provider, Effects>(
-    queue: &Queue,
-    queue_name: &'static str,
-    provider: &Provider,
-    effects: &Effects,
-    now: OffsetDateTime,
-) -> DialogJobWorkerReport
-where
-    Queue: DialogJobWorkerQueue + Sync + ?Sized,
-    Provider: ChatProvider + Sync + ?Sized,
-    Effects: DialogJobEffects + Sync + ?Sized,
-{
-    process_dialog_job_once_in_queue_with_materializer_at(
-        queue,
-        queue_name,
-        provider,
-        effects,
-        &BasicDialogInputMaterializer,
-        now,
-    )
-    .await
-}
-
-/// Process one dialog taskman job from a specific queue with a custom input materializer.
-pub async fn process_dialog_job_once_in_queue_with_materializer_at<
-    Queue,
-    Provider,
-    Effects,
-    Materializer,
->(
-    queue: &Queue,
-    queue_name: &'static str,
-    provider: &Provider,
-    effects: &Effects,
-    materializer: &Materializer,
-    now: OffsetDateTime,
-) -> DialogJobWorkerReport
-where
-    Queue: DialogJobWorkerQueue + Sync + ?Sized,
-    Provider: ChatProvider + Sync + ?Sized,
-    Effects: DialogJobEffects + Sync + ?Sized,
-    Materializer: DialogInputMaterializer + Sync + ?Sized,
-{
-    process_dialog_job_once_in_queue_with_materializer_and_history_at(
-        queue,
-        queue_name,
-        provider,
-        effects,
-        materializer,
-        &NoopDialogToolCallHistoryStore,
-        now,
-    )
-    .await
-}
-
-/// Process one dialog taskman job with custom input materialization and tool-call history storage.
-pub async fn process_dialog_job_once_in_queue_with_materializer_and_history_at<
-    Queue,
-    Provider,
-    Effects,
-    Materializer,
-    ToolHistory,
->(
-    queue: &Queue,
-    queue_name: &'static str,
-    provider: &Provider,
-    effects: &Effects,
-    materializer: &Materializer,
-    tool_history: &ToolHistory,
-    now: OffsetDateTime,
-) -> DialogJobWorkerReport
-where
-    Queue: DialogJobWorkerQueue + Sync + ?Sized,
-    Provider: ChatProvider + Sync + ?Sized,
-    Effects: DialogJobEffects + Sync + ?Sized,
-    Materializer: DialogInputMaterializer + Sync + ?Sized,
-    ToolHistory: DialogToolCallHistoryStore + Sync + ?Sized,
-{
-    process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
-        queue,
-        provider,
-        effects,
-        materializer,
-        tool_history,
-        DialogJobProcessOptions {
-            queue_name,
-            max_llm_job_attempts: DEFAULT_LLM_JOB_MAX_ATTEMPTS,
-            turn_budget_secs: DEFAULT_DIALOG_TURN_BUDGET_SECS,
-            turn_max_queue_age_secs: DEFAULT_DIALOG_TURN_MAX_QUEUE_AGE_SECS,
-            max_regenerations: DEFAULT_DIALOG_TURN_MAX_REGENERATIONS,
-            now,
-            routing_events: None,
-            turn_outcomes: None,
-            terminal_signal: crate::dialog_turn::TurnSignalPolicy::default(),
-            obligations: None,
-            session: None,
-        },
-    )
-    .await
-}
-
 #[derive(Clone, Copy)]
 pub(crate) struct DialogJobProcessOptions<'a> {
     pub(crate) queue_name: &'static str,
@@ -281,7 +159,7 @@ pub(crate) struct DialogJobProcessOptions<'a> {
     pub(crate) turn_outcomes: Option<&'a crate::dialog_turn::DialogTurnObserver>,
     pub(crate) terminal_signal: crate::dialog_turn::TurnSignalPolicy<'a>,
     pub(crate) obligations: Option<&'a dyn crate::dialog_turn::DeliveryObligationAnnotator>,
-    pub(crate) session: Option<&'a crate::dialog_turn::SessionWorkerWiring>,
+    pub(crate) session: &'a crate::dialog_turn::SessionWorkerWiring,
 }
 
 pub(crate) async fn process_dialog_job_once_in_queue_with_materializer_history_and_retry_at<
@@ -366,14 +244,12 @@ where
     // complete here with their own ledger rows (single-exit holds). A release
     // race (claim finds Busy but inject/park misses) retries and, as bug
     // containment, degrades to today's parallel turn.
-    let session_registry = options
-        .session
-        .filter(|wiring| wiring.turn_config().enabled_for_chat(params.chat_id))
-        .and_then(|wiring| wiring.registry.as_ref());
+    let session_registry = &options.session.registry;
     let session_key = crate::dialog_turn::SessionKey::new(params.chat_id, params.thread_id);
     let mut session_claimed = false;
     let mut session_inbox: Option<std::sync::Arc<crate::dialog_turn::SessionInbox>> = None;
-    if let Some(registry) = session_registry {
+    {
+        let registry = session_registry.as_ref();
         for _containment in 0..3 {
             match registry.claim(session_key, item.id, params.user_id) {
                 crate::dialog_turn::ClaimOutcome::Claimed(inbox) => {
@@ -454,9 +330,7 @@ where
             budget,
             now: options.now,
             routing_events: options.routing_events,
-            session: options
-                .session
-                .map(crate::dialog_turn::SessionWorkerWiring::turn_config),
+            session: options.session.turn_config(),
             session_inbox,
         },
         queue,
@@ -486,7 +360,8 @@ where
     // Release the session key AFTER finalize so a Busy observer can never
     // start a parallel turn while this one still owns the outcome. Everything
     // the session left behind gets its own turn now.
-    if session_claimed && let Some(registry) = session_registry {
+    if session_claimed {
+        let registry = session_registry.as_ref();
         let release = registry.release(session_key, item.id);
         if let Some(newest) = release.leftover_injected.last() {
             // Older leftovers are already persisted chat history and will
@@ -515,79 +390,6 @@ where
         }
     }
     report
-}
-
-pub async fn run_dialog_job_worker_every_until<Queue, Provider, Effects, Stop>(
-    queue: &Queue,
-    provider: &Provider,
-    effects: &Effects,
-    queue_names: &'static [&'static str],
-    interval: Duration,
-    stop: Stop,
-) -> DialogJobWorkerRunReport
-where
-    Queue: DialogJobWorkerQueue + Sync + ?Sized,
-    Provider: ChatProvider + Sync + ?Sized,
-    Effects: DialogJobEffects + Sync + ?Sized,
-    Stop: Future<Output = ()>,
-{
-    run_dialog_job_worker_with_materializer_every_until(
-        queue,
-        provider,
-        effects,
-        &BasicDialogInputMaterializer,
-        queue_names,
-        interval,
-        stop,
-    )
-    .await
-}
-
-pub async fn run_dialog_job_worker_with_materializer_every_until<
-    Queue,
-    Provider,
-    Effects,
-    Materializer,
-    Stop,
->(
-    queue: &Queue,
-    provider: &Provider,
-    effects: &Effects,
-    materializer: &Materializer,
-    queue_names: &'static [&'static str],
-    interval: Duration,
-    stop: Stop,
-) -> DialogJobWorkerRunReport
-where
-    Queue: DialogJobWorkerQueue + Sync + ?Sized,
-    Provider: ChatProvider + Sync + ?Sized,
-    Effects: DialogJobEffects + Sync + ?Sized,
-    Materializer: DialogInputMaterializer + Sync + ?Sized,
-    Stop: Future<Output = ()>,
-{
-    let noop = NoopDialogToolCallHistoryStore;
-    run_dialog_job_worker_with_materializer_and_history_every_until(
-        queue,
-        provider,
-        effects,
-        DialogJobWorkerLoopOptions {
-            materializer,
-            tool_history: &noop,
-            routing_events: None,
-            turn_outcomes: None,
-            queue_names,
-            interval,
-            max_llm_job_attempts: DEFAULT_LLM_JOB_MAX_ATTEMPTS,
-            turn_budget_secs: DEFAULT_DIALOG_TURN_BUDGET_SECS,
-            turn_max_queue_age_secs: DEFAULT_DIALOG_TURN_MAX_QUEUE_AGE_SECS,
-            max_regenerations: DEFAULT_DIALOG_TURN_MAX_REGENERATIONS,
-            terminal_signal: crate::dialog_turn::TurnSignalPolicy::default(),
-            obligations: None,
-            session: None,
-        },
-        stop,
-    )
-    .await
 }
 
 /// Run dialog taskman workers with custom input materialization and tool-call history storage.
@@ -649,143 +451,4 @@ where
     }
 
     report
-}
-
-pub async fn run_dialog_job_worker_until<Queue, Provider, Effects, Stop>(
-    queue: &Queue,
-    provider: &Provider,
-    effects: &Effects,
-    stop: Stop,
-) -> DialogJobWorkerRunReport
-where
-    Queue: DialogJobWorkerQueue + Sync + ?Sized,
-    Provider: ChatProvider + Sync + ?Sized,
-    Effects: DialogJobEffects + Sync + ?Sized,
-    Stop: Future<Output = ()>,
-{
-    run_dialog_job_worker_every_until(
-        queue,
-        provider,
-        effects,
-        &DIALOG_JOB_WORKER_QUEUES,
-        DIALOG_JOB_POLL_INTERVAL,
-        stop,
-    )
-    .await
-}
-
-pub async fn run_dialog_job_worker_with_materializer_until<
-    Queue,
-    Provider,
-    Effects,
-    Materializer,
-    Stop,
->(
-    queue: &Queue,
-    provider: &Provider,
-    effects: &Effects,
-    materializer: &Materializer,
-    stop: Stop,
-) -> DialogJobWorkerRunReport
-where
-    Queue: DialogJobWorkerQueue + Sync + ?Sized,
-    Provider: ChatProvider + Sync + ?Sized,
-    Effects: DialogJobEffects + Sync + ?Sized,
-    Materializer: DialogInputMaterializer + Sync + ?Sized,
-    Stop: Future<Output = ()>,
-{
-    run_dialog_job_worker_with_materializer_every_until(
-        queue,
-        provider,
-        effects,
-        materializer,
-        &DIALOG_JOB_WORKER_QUEUES,
-        DIALOG_JOB_POLL_INTERVAL,
-        stop,
-    )
-    .await
-}
-
-pub async fn run_dialog_job_worker_with_materializer_and_history_until<
-    Queue,
-    Provider,
-    Effects,
-    Materializer,
-    ToolHistory,
-    Stop,
->(
-    queue: &Queue,
-    provider: &Provider,
-    effects: &Effects,
-    materializer: &Materializer,
-    tool_history: &ToolHistory,
-    stop: Stop,
-) -> DialogJobWorkerRunReport
-where
-    Queue: DialogJobWorkerQueue + Sync + ?Sized,
-    Provider: ChatProvider + Sync + ?Sized,
-    Effects: DialogJobEffects + Sync + ?Sized,
-    Materializer: DialogInputMaterializer + Sync + ?Sized,
-    ToolHistory: DialogToolCallHistoryStore + Sync + ?Sized,
-    Stop: Future<Output = ()>,
-{
-    run_dialog_job_worker_with_materializer_and_history_until_with_max_attempts(
-        queue,
-        provider,
-        effects,
-        materializer,
-        tool_history,
-        DEFAULT_LLM_JOB_MAX_ATTEMPTS,
-        stop,
-    )
-    .await
-}
-
-/// Run dialog taskman workers with configured retryable LLM attempt limit.
-pub async fn run_dialog_job_worker_with_materializer_and_history_until_with_max_attempts<
-    Queue,
-    Provider,
-    Effects,
-    Materializer,
-    ToolHistory,
-    Stop,
->(
-    queue: &Queue,
-    provider: &Provider,
-    effects: &Effects,
-    materializer: &Materializer,
-    tool_history: &ToolHistory,
-    max_llm_job_attempts: i32,
-    stop: Stop,
-) -> DialogJobWorkerRunReport
-where
-    Queue: DialogJobWorkerQueue + Sync + ?Sized,
-    Provider: ChatProvider + Sync + ?Sized,
-    Effects: DialogJobEffects + Sync + ?Sized,
-    Materializer: DialogInputMaterializer + Sync + ?Sized,
-    ToolHistory: DialogToolCallHistoryStore + Sync + ?Sized,
-    Stop: Future<Output = ()>,
-{
-    run_dialog_job_worker_with_materializer_and_history_every_until(
-        queue,
-        provider,
-        effects,
-        DialogJobWorkerLoopOptions {
-            materializer,
-            tool_history,
-            routing_events: None,
-            turn_outcomes: None,
-            queue_names: &DIALOG_JOB_WORKER_QUEUES,
-            interval: DIALOG_JOB_POLL_INTERVAL,
-            max_llm_job_attempts,
-            turn_budget_secs: DEFAULT_DIALOG_TURN_BUDGET_SECS,
-            turn_max_queue_age_secs: DEFAULT_DIALOG_TURN_MAX_QUEUE_AGE_SECS,
-            max_regenerations: DEFAULT_DIALOG_TURN_MAX_REGENERATIONS,
-            terminal_signal: crate::dialog_turn::TurnSignalPolicy::default(),
-            obligations: None,
-            session: None,
-        },
-        stop,
-    )
-    .await
 }

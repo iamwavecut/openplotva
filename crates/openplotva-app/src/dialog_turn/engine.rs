@@ -7,28 +7,20 @@
 //! the status write (S13).
 
 use std::collections::BTreeMap;
-use std::time::Instant;
 
-use openplotva_dialog::turn::{
-    ANTI_LOOP_HINT, EmptyReason, QueuedSideEffect, ReplyMaterial, classify_reply_material,
-};
 use openplotva_llm::ChatProvider;
 use openplotva_taskman::{DialogJobParams, TaskQueueJobEvent};
 use serde_json::{Value, json};
 use time::{Duration as TimeDuration, OffsetDateTime};
 
-use super::budget::{TURN_DEADLINE, TURN_STARTED_STAGE, TurnBudget, turn_started_at};
+use super::budget::{TURN_STARTED_STAGE, TurnBudget, turn_started_at};
 use super::ledger::{DialogTurnObserver, DialogTurnOutcomeRecord};
 use super::outcome::{JobDisposition, TurnOutcome, TurnResolution, UserSignalPlan};
 use super::signal::{SignalTarget, TERMINAL_USER_SIGNAL_STAGE, TurnSignalPolicy, UserSignalResult};
 use crate::dialog_jobs::{
     DialogInputMaterializer, DialogJobEffects, DialogJobWorkItem, DialogJobWorkerQueue,
-    DialogJobWorkerReport, DialogToolCallHistoryStore, PROVIDER_EMPTY_RETRY_CODES,
-    PROVIDER_ERROR_RETRY_CODES, RetryableDialogProviderFailure, SANITIZED_EMPTY_RETRY_CODES,
-    UNDELIVERABLE_RETRY_CODES, dialog_job_answer, dialog_job_has_payload,
-    handle_retryable_dialog_provider_error, next_dialog_llm_job_attempt, persist_dialog_tool_calls,
-    prepare_dialog_chat_response, record_dialog_fallback_event,
-    should_suppress_duplicate_bot_reply, validate_dialog_answer_deliverable,
+    DialogJobWorkerReport, DialogToolCallHistoryStore, dialog_job_has_payload,
+    next_dialog_llm_job_attempt,
 };
 
 /// Job event stage carrying the recorded outcome of every handled turn.
@@ -45,9 +37,6 @@ pub const ANSWER_SENT_STAGE: &str = "answer_sent";
 /// A turn never starts generation it cannot plausibly finish inside the budget.
 const MIN_GENERATION_BUDGET: TimeDuration = TimeDuration::seconds(15);
 
-/// A duplicate answer is regenerated only with this much budget left.
-const MIN_REGENERATION_BUDGET: TimeDuration = TimeDuration::seconds(10);
-
 /// Immutable inputs of one dialog turn attempt.
 pub(crate) struct TurnContext<'a> {
     pub item: &'a DialogJobWorkItem,
@@ -60,9 +49,7 @@ pub(crate) struct TurnContext<'a> {
     pub budget: TurnBudget,
     pub now: OffsetDateTime,
     pub routing_events: Option<&'a crate::runtime_routing::RoutingEventReporter>,
-    /// Session-engine wiring (`DIALOG_AGENT_LOOP_ENABLED`); `None` keeps the
-    /// fully intact legacy provider-internal loop.
-    pub session: Option<super::session::SessionTurnConfig<'a>>,
+    pub session: super::session::SessionTurnConfig<'a>,
     /// Live inbox for this turn when the worker claimed the session key.
     pub session_inbox: Option<std::sync::Arc<super::inbox::SessionInbox>>,
 }
@@ -125,379 +112,47 @@ where
         .await;
     let duplicate_guard_history = base_input.history.clone();
 
-    // The session engine handles the whole turn when it is enabled for this
-    // chat and the provider exposes the single-shot step seam; otherwise the
-    // legacy provider-internal loop below runs unchanged (the rollback path).
-    if let Some(session) = ctx.session.as_ref()
-        && session.enabled_for_chat(ctx.params.chat_id)
-        && let Some(step_provider) = provider.as_chat_step()
-    {
-        let session_ctx = super::session::SessionRunContext {
-            item_id: ctx.item.id,
-            item_events: &ctx.item.events,
-            params: ctx.params,
-            queue_name: ctx.queue_name,
-            max_llm_job_attempts: ctx.max_llm_job_attempts,
-            budget: ctx.budget,
-            now: ctx.now,
-            routing_events: ctx.routing_events,
-            item: ctx.item,
-            inbox: ctx.session_inbox.clone(),
-        };
-        return super::session::run_dialog_session(
-            session_ctx,
-            session,
-            step_provider,
-            base_input,
-            &duplicate_guard_history,
-            queue,
-            effects,
-            tool_history,
-            report,
-        )
-        .await;
-    }
-
-    // tokio Instant so paused-clock tests can advance generation time; in
-    // production it is the monotonic clock.
-    let processing_started = tokio::time::Instant::now();
-    let mut regenerations: i32 = 0;
-
-    loop {
-        let mut input = base_input.clone();
-        if regenerations > 0 {
-            input.reference_context.push(ANTI_LOOP_HINT.to_owned());
-        }
-        let round_now =
-            ctx.now + TimeDuration::try_from(processing_started.elapsed()).unwrap_or_default();
-        let provider_deadline = Instant::now()
-            + std::time::Duration::try_from(ctx.budget.remaining(round_now)).unwrap_or_default();
-        let result = TURN_DEADLINE
-            .scope(Some(provider_deadline), provider.run_dialog(input))
-            .await;
-        // Generation is the only long-running step of a tick: fold its real wall
-        // time into `now` so budget comparisons stay honest across rounds.
-        let failure_now =
-            ctx.now + TimeDuration::try_from(processing_started.elapsed()).unwrap_or_default();
-        let output = match result {
-            Ok(output) => output,
-            Err(error) if openplotva_llm::is_content_blocked_error(error.as_ref()) => {
-                report.content_blocked = true;
-                return TurnResolution {
-                    outcome: TurnOutcome::NoReplyIntentional {
-                        reason: "content_blocked",
-                    },
-                    disposition: JobDisposition::Complete,
-                };
-            }
-            Err(error) => {
-                let retryable_reason = openplotva_llm::retry::retryable_reason(error.as_ref());
-                let retry_provider =
-                    openplotva_llm::retry::provider_name(error.as_ref()).to_owned();
-                let error = error.to_string();
-                report.provider_error = Some(error.clone());
-                if let Some(reason) = retryable_reason {
-                    return handle_retryable_dialog_provider_error(
-                        queue,
-                        ctx.item,
-                        ctx.params,
-                        ctx.routing_events,
-                        RetryableDialogProviderFailure {
-                            queue_name: ctx.queue_name,
-                            provider_name: &retry_provider,
-                            reason,
-                            codes: PROVIDER_ERROR_RETRY_CODES,
-                            error: &error,
-                            max_attempts: ctx.max_llm_job_attempts.max(1),
-                            now: failure_now,
-                            budget_deadline: ctx.budget.deadline(),
-                        },
-                        report,
-                    )
-                    .await;
-                }
-                return TurnResolution {
-                    outcome: TurnOutcome::TerminalFailed {
-                        reason: "provider_error",
-                        error: error.clone(),
-                        user_signal: UserSignalPlan::React,
-                    },
-                    disposition: JobDisposition::Fail(error),
-                };
-            }
-        };
-
-        record_dialog_fallback_event(queue, ctx.item.id, &output, ctx.now, report).await;
-
-        match persist_dialog_tool_calls(tool_history, ctx.params, &output.tool_calls).await {
-            Ok(persisted) => report.persisted_tool_call_history = persisted,
-            Err(error) => {
-                let error = error.to_string();
-                tracing::debug!(
-                    %error,
-                    chat_id = ctx.params.chat_id,
-                    message_id = ctx.params.message_id,
-                    "failed to persist dialog tool-call history"
-                );
-                report.tool_call_history_error = Some(error);
-            }
-        }
-
-        let raw_answer = dialog_job_answer(&output);
-        let sanitized_answer = prepare_dialog_chat_response(&raw_answer);
-        match classify_reply_material(&output, &sanitized_answer, &raw_answer) {
-            ReplyMaterial::Empty {
-                reason: EmptyReason::SanitizedEmpty,
-            } => {
-                let error = "dialog answer became empty after sanitization".to_owned();
-                report.empty_answer_error = Some(error.clone());
-                return handle_retryable_dialog_provider_error(
-                    queue,
-                    ctx.item,
-                    ctx.params,
-                    ctx.routing_events,
-                    RetryableDialogProviderFailure {
-                        queue_name: ctx.queue_name,
-                        provider_name: output.provider.as_str(),
-                        reason: openplotva_llm::retry::FailureReason::ProviderProtocolError,
-                        codes: SANITIZED_EMPTY_RETRY_CODES,
-                        error: &error,
-                        max_attempts: ctx.max_llm_job_attempts.max(1),
-                        now: failure_now,
-                        budget_deadline: ctx.budget.deadline(),
-                    },
-                    report,
-                )
-                .await;
-            }
-            ReplyMaterial::Empty {
-                reason: EmptyReason::ProviderEmpty,
-            } => {
-                report.answer_empty_all_sources = true;
-                let error = "dialog provider returned no answer, response, or queued tool material"
-                    .to_owned();
-                report.empty_answer_error = Some(error.clone());
-                return handle_retryable_dialog_provider_error(
-                    queue,
-                    ctx.item,
-                    ctx.params,
-                    ctx.routing_events,
-                    RetryableDialogProviderFailure {
-                        queue_name: ctx.queue_name,
-                        provider_name: output.provider.as_str(),
-                        reason: openplotva_llm::retry::FailureReason::ProviderProtocolError,
-                        codes: PROVIDER_EMPTY_RETRY_CODES,
-                        error: &error,
-                        max_attempts: ctx.max_llm_job_attempts.max(1),
-                        now: failure_now,
-                        budget_deadline: ctx.budget.deadline(),
-                    },
-                    report,
-                )
-                .await;
-            }
-            ReplyMaterial::IntentionalSilence { reason } => {
-                return TurnResolution {
-                    outcome: TurnOutcome::NoReplyIntentional {
-                        reason: reason.as_str(),
-                    },
-                    disposition: JobDisposition::Complete,
-                };
-            }
-            ReplyMaterial::Delegated { side_effects } => {
-                return TurnResolution {
-                    outcome: TurnOutcome::SideEffectDelegated {
-                        tickets: side_effect_tickets(&side_effects),
-                        kinds: side_effects
-                            .iter()
-                            .map(|side_effect| side_effect.kind.clone())
-                            .collect(),
-                    },
-                    disposition: JobDisposition::Complete,
-                };
-            }
-            ReplyMaterial::Text { text, side_effects } => {
-                // At-least-once resend guard: a crash between a successful
-                // send and the status write re-runs the whole turn; the
-                // `answer_sent` marker resolves the re-run as `Sent` without
-                // re-sending (the regenerated text is discarded).
-                if ctx
-                    .item
-                    .events
-                    .iter()
-                    .any(|event| event.stage == ANSWER_SENT_STAGE)
-                {
-                    report.sent_answer = true;
-                    report.resent_skipped = true;
-                    return TurnResolution {
-                        outcome: TurnOutcome::Sent {
-                            parts: 1,
-                            side_effect_tickets: side_effect_tickets(&side_effects),
-                        },
-                        disposition: JobDisposition::Complete,
-                    };
-                }
-                let (duplicate_message_id, duplicate) =
-                    should_suppress_duplicate_bot_reply(&duplicate_guard_history, &text);
-                if duplicate {
-                    if regeneration_allowed(
-                        regenerations,
-                        ctx.max_regenerations,
-                        &ctx.budget,
-                        failure_now,
-                    ) {
-                        regenerations += 1;
-                        report.regenerations = regenerations;
-                        append_regeneration_event(
-                            queue,
-                            ctx.item.id,
-                            regenerations,
-                            duplicate_message_id,
-                            failure_now,
-                        )
-                        .await;
-                        tracing::info!(
-                            chat_id = ctx.params.chat_id,
-                            message_id = ctx.params.message_id,
-                            duplicate_message_id,
-                            regeneration = regenerations,
-                            "dialog answer duplicated the last bot reply; regenerating with anti-loop hint"
-                        );
-                        continue;
-                    }
-                    report.suppressed_duplicate_message_id = Some(duplicate_message_id);
-                    let error = format!(
-                        "dialog answer duplicated bot message {duplicate_message_id} after {regenerations} regeneration(s)"
-                    );
-                    return TurnResolution {
-                        outcome: TurnOutcome::TerminalFailed {
-                            reason: "duplicate_exhausted",
-                            error: error.clone(),
-                            user_signal: UserSignalPlan::React,
-                        },
-                        disposition: JobDisposition::Fail(error),
-                    };
-                }
-                if let Err(validation) = validate_dialog_answer_deliverable(&text) {
-                    let error =
-                        format!("dialog answer rejected by outbound validation: {validation}");
-                    report.empty_answer_error = Some(error.clone());
-                    return handle_retryable_dialog_provider_error(
-                        queue,
-                        ctx.item,
-                        ctx.params,
-                        ctx.routing_events,
-                        RetryableDialogProviderFailure {
-                            queue_name: ctx.queue_name,
-                            provider_name: output.provider.as_str(),
-                            reason: openplotva_llm::retry::FailureReason::ProviderProtocolError,
-                            codes: UNDELIVERABLE_RETRY_CODES,
-                            error: &error,
-                            max_attempts: ctx.max_llm_job_attempts.max(1),
-                            now: failure_now,
-                            budget_deadline: ctx.budget.deadline(),
-                        },
-                        report,
-                    )
-                    .await;
-                }
-                return match effects.send_dialog_answer(ctx.params, &text).await {
-                    Ok(()) => {
-                        report.sent_answer = true;
-                        let sent_now = ctx.now
-                            + TimeDuration::try_from(processing_started.elapsed())
-                                .unwrap_or_default();
-                        append_answer_sent_marker(queue, ctx.item.id, sent_now).await;
-                        TurnResolution {
-                            outcome: TurnOutcome::Sent {
-                                parts: 1,
-                                side_effect_tickets: side_effect_tickets(&side_effects),
-                            },
-                            disposition: JobDisposition::Complete,
-                        }
-                    }
-                    Err(error) => {
-                        let error = error.to_string();
-                        report.send_error = Some(error.clone());
-                        TurnResolution {
-                            outcome: TurnOutcome::TerminalFailed {
-                                reason: "send_error",
-                                error: error.clone(),
-                                user_signal: UserSignalPlan::React,
-                            },
-                            disposition: JobDisposition::Fail(error),
-                        }
-                    }
-                };
-            }
-        }
-    }
-}
-
-/// Duplicate regeneration is bounded by its own cap and the shared budget.
-fn regeneration_allowed(
-    regenerations_done: i32,
-    max_regenerations: i32,
-    budget: &TurnBudget,
-    now: OffsetDateTime,
-) -> bool {
-    regenerations_done < max_regenerations.max(0)
-        && budget.remaining(now) >= MIN_REGENERATION_BUDGET
-}
-
-/// Regenerations record their own event stage and deliberately do not consume
-/// `llm_job_retry` attempts. Append failure is non-fatal.
-async fn append_regeneration_event<Queue>(
-    queue: &Queue,
-    job_id: i64,
-    attempt: i32,
-    duplicate_message_id: i32,
-    at: OffsetDateTime,
-) where
-    Queue: DialogJobWorkerQueue + Sync + ?Sized,
-{
-    let mut data = BTreeMap::new();
-    data.insert(
-        "duplicate_message_id".to_owned(),
-        duplicate_message_id.to_string(),
-    );
-    data.insert("reason".to_owned(), "dedup_regenerate".to_owned());
-    let event = TaskQueueJobEvent {
-        level: "info".to_owned(),
-        stage: DIALOG_TURN_REGENERATE_STAGE.to_owned(),
-        attempt,
-        message: "dialog answer duplicated the last bot reply; regenerating".to_owned(),
-        data,
-        ..TaskQueueJobEvent::default()
-    };
-    if let Err(error) = queue.append_dialog_job_event(job_id, event, at).await {
-        tracing::debug!(
-            error = %error,
-            job_id,
-            "failed to append dialog regeneration event"
+    // The session engine is the only dialog path; a provider without the
+    // single-shot step seam cannot serve dialog turns.
+    let Some(step_provider) = provider.as_chat_step() else {
+        let error = format!(
+            "dialog provider {} has no chat-step support",
+            provider.provider_name()
         );
-    }
-}
-
-/// Marker append failure is non-fatal: a rerun may then re-send the answer,
-/// bounded by outbound dedup, which beats going silent.
-async fn append_answer_sent_marker<Queue>(queue: &Queue, job_id: i64, at: OffsetDateTime)
-where
-    Queue: DialogJobWorkerQueue + Sync + ?Sized,
-{
-    let event = TaskQueueJobEvent {
-        level: "info".to_owned(),
-        stage: ANSWER_SENT_STAGE.to_owned(),
-        message: "dialog answer accepted by the outbound queue".to_owned(),
-        ..TaskQueueJobEvent::default()
+        return TurnResolution {
+            outcome: TurnOutcome::TerminalFailed {
+                reason: "provider_error",
+                error: error.clone(),
+                user_signal: UserSignalPlan::React,
+            },
+            disposition: JobDisposition::Fail(error),
+        };
     };
-    if let Err(error) = queue.append_dialog_job_event(job_id, event, at).await {
-        tracing::warn!(
-            error = %error,
-            job_id,
-            "failed to append answer_sent marker; a rerun may re-send the answer"
-        );
-    }
+    let session_ctx = super::session::SessionRunContext {
+        item_id: ctx.item.id,
+        item_events: &ctx.item.events,
+        params: ctx.params,
+        queue_name: ctx.queue_name,
+        max_llm_job_attempts: ctx.max_llm_job_attempts,
+        max_regenerations: ctx.max_regenerations,
+        budget: ctx.budget,
+        now: ctx.now,
+        routing_events: ctx.routing_events,
+        item: ctx.item,
+        inbox: ctx.session_inbox.clone(),
+    };
+    super::session::run_dialog_session(
+        session_ctx,
+        &ctx.session,
+        step_provider,
+        base_input,
+        &duplicate_guard_history,
+        queue,
+        effects,
+        tool_history,
+        report,
+    )
+    .await
 }
 
 /// The single writer of job status, `turn_outcome` job event, ledger row, and
@@ -706,13 +361,6 @@ async fn append_terminal_signal_marker<Queue>(
             "failed to append terminal user signal marker; a rerun may re-send the text fallback"
         );
     }
-}
-
-fn side_effect_tickets(side_effects: &[QueuedSideEffect]) -> Vec<i64> {
-    side_effects
-        .iter()
-        .filter_map(|side_effect| side_effect.ticket_job_id)
-        .collect()
 }
 
 /// Backfill the dialog job id onto obligations recorded at schedule time.

@@ -17,17 +17,14 @@ use thiserror::Error;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use url::Url;
 
-use openplotva_core::{ChatAttachment, ChatMessageMeta, ToolCall};
+use openplotva_core::{ChatAttachment, ChatMessageMeta};
 use openplotva_dialog::{
     ChatStepOutput, ChatStepRequest, ChatStepToolCall, DEFAULT_CONTEXT_HISTORY_LIMIT, DialogInput,
-    DialogToolbox, DialogTraceArtifacts, DialogTraceError, DialogTraceUsage, HistoryMessage,
-    MESSAGE_KIND_TEXT, MESSAGE_KIND_TOOL_REQUEST, MESSAGE_KIND_TOOL_RESPONSE, NativeToolCall,
-    PROVIDER_AIFARM, PROVIDER_NVIDIA, PROVIDER_VMLX, ROLE_MODEL, ROLE_TOOL, ROLE_USER,
-    STEP_CANCEL_DRAWING, STEP_DRAW_IMAGE, STEP_GENERATE_SONG, SessionMessage,
-    TOOL_RESULT_STATUS_NOOP, TOOL_RESULT_STATUS_QUEUED, ToolContext, ToolError, ToolParseDecision,
-    ToolResult, ToolSpec, ToolStep, ToolsMode, alternative_dialog_tool_names,
-    alternative_dialog_tools, chat_completion_tools_for_names, clone_history_messages,
-    decode_plotva_final_response_with_salvage, extract_content_tool_step,
+    DialogTraceArtifacts, DialogTraceError, DialogTraceUsage, HistoryMessage, MESSAGE_KIND_TEXT,
+    MESSAGE_KIND_TOOL_REQUEST, MESSAGE_KIND_TOOL_RESPONSE, NativeToolCall, PROVIDER_AIFARM,
+    PROVIDER_NVIDIA, PROVIDER_VMLX, ROLE_MODEL, ROLE_USER, SessionMessage, ToolParseDecision,
+    ToolSpec, ToolStep, ToolsMode, alternative_dialog_tool_names, alternative_dialog_tools,
+    clone_history_messages, decode_plotva_final_response_with_salvage, extract_content_tool_step,
     has_leading_context_message, is_dialog_history_noise_tool_call_name, normalize_history_message,
     parse_native_tool_step, sanitize_final_text, sanitize_tool_text,
     select_llm_history_messages_for_context, tool_telemetry,
@@ -1276,7 +1273,6 @@ pub struct AifarmDialogConfig {
     /// Default model.
     pub model: String,
     /// Maximum tool-loop iterations.
-    pub max_iterations: usize,
     /// Maximum selected history turns including the current turn.
     pub max_history: usize,
     /// Configured max output tokens.
@@ -1298,7 +1294,6 @@ pub struct AifarmDialogConfig {
     /// DRY allowed length.
     pub dry_allowed_length: i32,
     /// Whether OpenAI-compatible native tool calls are enabled.
-    pub use_tool_calls: Option<bool>,
     /// Whether model thinking is enabled.
     pub enable_thinking: Option<bool>,
     /// Whether reasoning output is included.
@@ -1609,11 +1604,6 @@ impl AifarmDialogConfig {
     pub fn with_defaults(mut self) -> Self {
         self.provider_name = default_string(&self.provider_name, PROVIDER_AIFARM);
         self.model = default_string(&self.model, DEFAULT_MODEL_NAME);
-        self.max_iterations = if self.max_iterations == 0 {
-            8
-        } else {
-            self.max_iterations
-        };
         self.max_history = if self.max_history == 0 {
             DEFAULT_CONTEXT_HISTORY_LIMIT
         } else {
@@ -1630,14 +1620,6 @@ impl AifarmDialogConfig {
         }
         self.client.priority = DISCOVERY_PRIORITY_INTERACTIVE;
         self.client.workload = default_string(&self.client.workload, AIFARM_WORKLOAD_DIALOG);
-        if self.use_tool_calls.is_none()
-            && self
-                .provider_name
-                .trim()
-                .eq_ignore_ascii_case(PROVIDER_AIFARM)
-        {
-            self.use_tool_calls = Some(false);
-        }
         if self
             .provider_name
             .trim()
@@ -1666,10 +1648,6 @@ impl AifarmDialogConfig {
         }
         input.max_output_tokens.min(self.max_tokens)
     }
-
-    fn use_tool_calls(&self) -> bool {
-        self.use_tool_calls.unwrap_or(false)
-    }
 }
 
 /// HTTP-backed AIFarm dialog provider.
@@ -1678,7 +1656,6 @@ pub struct AifarmDialogProvider<T = ReqwestAifarmTransport> {
     cfg: AifarmDialogConfig,
     client: AifarmHttpClient<T>,
     provider_name: String,
-    toolbox: Option<Arc<dyn DialogToolbox>>,
 }
 
 /// HTTP-backed AIFarm history-summary generator.
@@ -2377,7 +2354,6 @@ impl AifarmDialogProvider<ReqwestAifarmTransport> {
             cfg,
             client,
             provider_name,
-            toolbox: None,
         }
     }
 }
@@ -2396,15 +2372,7 @@ where
             cfg,
             client,
             provider_name,
-            toolbox: None,
         }
-    }
-
-    /// Attach the provider-neutral local dialog toolbox.
-    #[must_use]
-    pub fn with_toolbox(mut self, toolbox: Arc<dyn DialogToolbox>) -> Self {
-        self.toolbox = Some(toolbox);
-        self
     }
 
     /// Stable provider name.
@@ -2414,65 +2382,6 @@ where
     }
 
     /// Run one HTTP-backed dialog request and return a provider-neutral output.
-    pub async fn run_with_status(
-        &self,
-        input: DialogInput,
-        on_status: &mut (dyn FnMut(StatusUpdate) + Send),
-    ) -> Result<openplotva_dialog::DialogOutput, CompletionError> {
-        self.validate_run()?;
-        let mut state = AifarmDialogRunState::new(&self.cfg, input);
-        for iteration in 1..=self.cfg.max_iterations {
-            let request = match self.iteration_request_with_history(
-                &state.input,
-                &state.session_history,
-                iteration,
-            ) {
-                Ok(request) => request,
-                Err(error) => {
-                    return Err(aifarm_dialog_error_with_traces(Box::new(error), &state));
-                }
-            };
-            let trace_request = redacted_chat_completion_request(&request);
-            let result = match self.client.complete(request, on_status).await {
-                Ok(result) => result,
-                Err(error) => {
-                    let message = error.to_string();
-                    let mut trace = aifarm_dialog_trace_artifacts(
-                        &trace_request,
-                        &CompletionResult::default(),
-                        &state.input,
-                        self.provider(),
-                        iteration,
-                    );
-                    trace.error = message;
-                    state.trace_events.push(trace);
-                    return Err(aifarm_dialog_error_with_traces(error, &state));
-                }
-            };
-            match self
-                .handle_completion_result(&mut state, iteration, trace_request, result)
-                .await
-            {
-                Ok(Some(output)) => return Ok(output),
-                Ok(None) => {}
-                Err(error) => {
-                    let message = error.to_string();
-                    if let Some(trace) = state.trace_events.last_mut()
-                        && trace.error.trim().is_empty()
-                    {
-                        trace.error = message;
-                    }
-                    return Err(aifarm_dialog_error_with_traces(error, &state));
-                }
-            }
-        }
-        let error = Box::new(AifarmDialogError::Response(format!(
-            "tool protocol error: final text was not produced within {} iterations",
-            self.cfg.max_iterations
-        ))) as CompletionError;
-        Err(aifarm_dialog_error_with_traces(error, &state))
-    }
-
     /// Run one single-shot chat step: no tool execution, no iteration — the
     /// dialog session engine owns the loop and calls this once per iteration.
     pub async fn run_chat_step_with_status(
@@ -2522,12 +2431,23 @@ where
             return Err(aifarm_step_error_with_trace(error, trace));
         };
 
+        // FinalOnly keeps the tool-aware prompt for cache stability but the
+        // engine executes nothing on that pass: parse tool calls only when a
+        // tools array was actually offered, so stray tool markup on the
+        // forced-final step degrades to sanitized text instead of an empty
+        // answer.
         let tools_offered =
-            !request.input.disable_tools && !matches!(request.tools, ToolsMode::Disabled);
+            !request.input.disable_tools && matches!(request.tools, ToolsMode::Native(_));
         if !tools_offered {
+            let strip_markup = !matches!(request.tools, ToolsMode::Disabled);
             let text = match extract_final_answer_for_provider(response, self.provider()) {
                 Ok(text) => text,
                 Err(error) => return Err(aifarm_step_error_with_trace(error, trace)),
+            };
+            let text = if strip_markup {
+                sanitize_tool_text(&text)
+            } else {
+                text
             };
             return Ok(ChatStepOutput {
                 provider: self.provider().to_owned(),
@@ -2687,266 +2607,6 @@ where
             ..tool_telemetry::ToolTelemetryEvent::default()
         });
     }
-
-    #[cfg(test)]
-    fn iteration_request(
-        &self,
-        input: &DialogInput,
-        iteration: usize,
-    ) -> Result<ChatCompletionRequest, AifarmDialogError> {
-        let history = build_session_history_with_limit(input, self.cfg.max_history);
-        self.iteration_request_with_history(input, &history, iteration)
-    }
-
-    fn iteration_request_with_history(
-        &self,
-        input: &DialogInput,
-        history: &[HistoryMessage],
-        iteration: usize,
-    ) -> Result<ChatCompletionRequest, AifarmDialogError> {
-        let model = self.cfg.model_for_input(input);
-        let tool_names = tool_names_for_iteration(input, iteration, self.cfg.max_iterations);
-        let mode = tool_prompt_mode_for_request(self.cfg.use_tool_calls(), &tool_names);
-        let messages = build_initial_messages_with_tool_prompt(input, history, mode)?;
-        let mut request = ChatCompletionRequest {
-            model,
-            messages,
-            stream: false,
-            max_tokens: self.cfg.max_tokens_for_input(input),
-            temperature: self.cfg.temperature,
-            top_p: self.cfg.top_p,
-            repeat_penalty: self.cfg.repeat_penalty,
-            frequency_penalty: self.cfg.frequency_penalty,
-            presence_penalty: self.cfg.presence_penalty,
-            dry_multiplier: self.cfg.dry_multiplier,
-            dry_base: self.cfg.dry_base,
-            dry_allowed_length: self.cfg.dry_allowed_length,
-            include_reasoning: self.cfg.include_reasoning,
-            ..ChatCompletionRequest::default()
-        };
-        if self.cfg.use_tool_calls() && !tool_names.is_empty() {
-            request.tools = native_tool_values(&tool_names)?;
-            request.tool_choice = Some(Value::String("auto".to_owned()));
-            request.parallel_tool_calls = Some(false);
-        }
-        if let Some(enable_thinking) = input.enable_thinking.or(self.cfg.enable_thinking) {
-            request.set_chat_template_kwargs(json!({ "enable_thinking": enable_thinking }));
-        }
-        let docs_chars = input
-            .reference_context
-            .iter()
-            .map(String::len)
-            .sum::<usize>()
-            .min(i32::MAX as usize) as i32;
-        let provider = self.provider().to_owned();
-        request.trace = Some(crate::trace::LlmCallTrace {
-            context: crate::trace::LlmCallContext {
-                chat_id: input.context.chat_id,
-                thread_id: input.context.thread_id,
-                chat_title: input.context.chat_title.clone(),
-                user_id: input.user.id,
-                full_name: input.user.full_name.clone(),
-                message_id: input.message.id,
-            },
-            tags: crate::trace::LlmCallTags {
-                provider: provider.clone(),
-                source: provider,
-                flow: "dialog".to_owned(),
-                mode: "tools".to_owned(),
-                request_kind: "openai.chat.completions".to_owned(),
-                iteration,
-                docs_chars,
-            },
-        });
-        Ok(request)
-    }
-
-    fn validate_run(&self) -> Result<(), CompletionError> {
-        if self.toolbox.is_none() {
-            return Err(Box::new(AifarmDialogError::Response(format!(
-                "{} dialog toolbox is not configured",
-                PROVIDER_AIFARM
-            ))));
-        }
-        Ok(())
-    }
-
-    async fn handle_completion_result(
-        &self,
-        state: &mut AifarmDialogRunState,
-        iteration: usize,
-        trace_request: ChatCompletionRequest,
-        result: CompletionResult,
-    ) -> Result<Option<openplotva_dialog::DialogOutput>, CompletionError> {
-        let trace = aifarm_dialog_trace_artifacts(
-            &trace_request,
-            &result,
-            &state.input,
-            self.provider(),
-            iteration,
-        );
-        state.trace_events.push(trace);
-        let Some(response) = result.response.as_ref() else {
-            return Err(Box::new(AifarmDialogError::Response(
-                "chat completion response is nil".to_owned(),
-            )));
-        };
-        if state.input.disable_tools {
-            return self.final_text_output(state, response).map(Some);
-        }
-        match first_choice_tool_steps(response)? {
-            ToolStepSelection::None(decision) => {
-                self.record_tool_parser_decision(state, iteration, &decision);
-                self.final_text_output(state, response).map(Some)
-            }
-            ToolStepSelection::Steps(steps) => {
-                for pending in steps {
-                    let PendingToolStep {
-                        step,
-                        decision,
-                        native_ref,
-                    } = pending;
-                    self.record_tool_parser_decision(state, iteration, &decision);
-                    if let Some(output) = self
-                        .execute_and_record_tool(
-                            state,
-                            iteration,
-                            step,
-                            decision.form.as_str(),
-                            native_ref.as_deref(),
-                        )
-                        .await?
-                    {
-                        return Ok(Some(output));
-                    }
-                }
-                Ok(None)
-            }
-        }
-    }
-
-    fn final_text_output(
-        &self,
-        state: &AifarmDialogRunState,
-        response: &Value,
-    ) -> Result<openplotva_dialog::DialogOutput, CompletionError> {
-        let answer = extract_final_answer_for_provider(response, self.provider())?;
-        Ok(openplotva_dialog::DialogOutput {
-            provider: self.provider().to_owned(),
-            response: answer.clone(),
-            answer,
-            tool_calls: state.tool_calls.clone(),
-            trace: state.trace_events.last().cloned(),
-            trace_events: state.trace_events.clone(),
-            ..openplotva_dialog::DialogOutput::default()
-        })
-    }
-
-    async fn execute_and_record_tool(
-        &self,
-        state: &mut AifarmDialogRunState,
-        iteration: usize,
-        step: ToolStep,
-        form: &str,
-        ref_hint: Option<&str>,
-    ) -> Result<Option<openplotva_dialog::DialogOutput>, CompletionError> {
-        let duplicate_first_ref = state.seen_single_effect_tool_request(&step)?;
-        let result = if let Some(first_ref) = duplicate_first_ref.as_deref() {
-            duplicate_tool_result(&step.step, first_ref)
-        } else {
-            match self.execute_tool(&state.meta, &step).await {
-                Ok(result) => result,
-                Err(error) => {
-                    self.record_tool_parser_decision(
-                        state,
-                        iteration,
-                        &ToolParseDecision {
-                            form: form.to_owned(),
-                            tool: step.step.clone(),
-                            outcome: "error".to_owned(),
-                            reason: error.to_string(),
-                        },
-                    );
-                    return Err(error);
-                }
-            }
-        };
-        self.record_tool_parser_decision(
-            state,
-            iteration,
-            &ToolParseDecision {
-                form: form.to_owned(),
-                tool: step.step.clone(),
-                outcome: "executed".to_owned(),
-                reason: String::new(),
-            },
-        );
-        let tool_call = recorded_tool_call_with_ref(&step, &result, ref_hint, iteration)?;
-        if duplicate_first_ref.is_none() {
-            let remembered_ref = ref_hint
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or(&tool_call.r#ref);
-            state.remember_single_effect_tool_request(&step, remembered_ref)?;
-        }
-        state.tool_calls.push(tool_call.clone());
-        if let Some(answer) = immediate_tool_answer(&step, &result) {
-            return Ok(Some(openplotva_dialog::DialogOutput {
-                provider: self.provider().to_owned(),
-                response: answer.clone(),
-                answer,
-                tool_calls: state.tool_calls.clone(),
-                trace: state.trace_events.last().cloned(),
-                trace_events: state.trace_events.clone(),
-                ..openplotva_dialog::DialogOutput::default()
-            }));
-        }
-        state.append_tool_history(tool_call);
-        Ok(None)
-    }
-
-    fn record_tool_parser_decision(
-        &self,
-        state: &AifarmDialogRunState,
-        iteration: usize,
-        decision: &ToolParseDecision,
-    ) {
-        if decision.outcome.trim().is_empty() {
-            return;
-        }
-        tool_telemetry::record(tool_telemetry::ToolTelemetryEvent {
-            provider: self.provider().to_owned(),
-            model: self.cfg.model_for_input(&state.input).trim().to_owned(),
-            tool: decision.tool.trim().to_owned(),
-            form: decision.form.trim().to_owned(),
-            outcome: decision.outcome.trim().to_owned(),
-            reason: decision.reason.trim().to_owned(),
-            iteration: i32::try_from(iteration).unwrap_or(i32::MAX),
-            ..tool_telemetry::ToolTelemetryEvent::default()
-        });
-    }
-
-    async fn execute_tool(
-        &self,
-        meta: &ToolContext,
-        step: &ToolStep,
-    ) -> Result<ToolResult, CompletionError> {
-        execute_dialog_tool(self.provider(), self.toolbox.as_ref(), meta, step).await
-    }
-}
-
-pub(crate) async fn execute_dialog_tool(
-    provider_name: &str,
-    toolbox: Option<&Arc<dyn DialogToolbox>>,
-    meta: &ToolContext,
-    step: &ToolStep,
-) -> Result<ToolResult, CompletionError> {
-    let toolbox = toolbox.ok_or_else(|| {
-        Box::new(AifarmDialogError::Response(format!(
-            "{} dialog toolbox is not configured",
-            provider_name.trim()
-        ))) as CompletionError
-    })?;
-    openplotva_dialog::dispatch_dialog_tool(toolbox.as_ref(), meta, step).await
 }
 
 impl<T> crate::ChatProvider for AifarmDialogProvider<T>
@@ -2955,13 +2615,6 @@ where
 {
     fn provider_name(&self) -> &str {
         self.provider()
-    }
-
-    fn run_dialog<'a>(&'a self, input: DialogInput) -> crate::ChatProviderFuture<'a> {
-        Box::pin(async move {
-            let mut ignore_status = |_| {};
-            self.run_with_status(input, &mut ignore_status).await
-        })
     }
 
     fn as_chat_step(&self) -> Option<&dyn crate::ChatStepProvider> {
@@ -2978,7 +2631,7 @@ where
     }
 
     fn supports_native_tools(&self) -> bool {
-        self.cfg.use_tool_calls()
+        true
     }
 
     fn run_chat_step<'a>(&'a self, request: ChatStepRequest) -> crate::ChatStepFuture<'a> {
@@ -2987,84 +2640,6 @@ where
             self.run_chat_step_with_status(request, &mut ignore_status)
                 .await
         })
-    }
-}
-
-struct AifarmDialogRunState {
-    input: DialogInput,
-    session_history: Vec<HistoryMessage>,
-    tool_calls: Vec<ToolCall>,
-    trace_events: Vec<DialogTraceArtifacts>,
-    meta: ToolContext,
-    seen_tool_requests: BTreeMap<String, String>,
-}
-
-impl AifarmDialogRunState {
-    fn new(cfg: &AifarmDialogConfig, input: DialogInput) -> Self {
-        let session_history = build_session_history_with_limit(&input, cfg.max_history);
-        let meta = tool_context_from_input(&input);
-        Self {
-            input,
-            session_history,
-            tool_calls: Vec::with_capacity(cfg.max_iterations.saturating_add(1)),
-            trace_events: Vec::with_capacity(cfg.max_iterations),
-            meta,
-            seen_tool_requests: BTreeMap::new(),
-        }
-    }
-
-    fn seen_single_effect_tool_request(
-        &self,
-        step: &ToolStep,
-    ) -> Result<Option<String>, CompletionError> {
-        let Some(key) = single_effect_tool_request_key(step)? else {
-            return Ok(None);
-        };
-        Ok(self.seen_tool_requests.get(&key).cloned())
-    }
-
-    fn remember_single_effect_tool_request(
-        &mut self,
-        step: &ToolStep,
-        r#ref: &str,
-    ) -> Result<(), CompletionError> {
-        let Some(key) = single_effect_tool_request_key(step)? else {
-            return Ok(());
-        };
-        self.seen_tool_requests.insert(key, r#ref.trim().to_owned());
-        Ok(())
-    }
-
-    fn append_tool_history(&mut self, tool_call: ToolCall) {
-        let now = OffsetDateTime::now_utc();
-        let thread_id = self.input.context.thread_id.unwrap_or_default();
-        self.session_history.push(HistoryMessage {
-            role: ROLE_MODEL.to_owned(),
-            kind: MESSAGE_KIND_TOOL_REQUEST.to_owned(),
-            name: self.input.context.bot_name.trim().to_owned(),
-            timestamp: Some(now),
-            message_id: self.input.message.id,
-            thread_id,
-            user_id: self.input.user.id,
-            tool_call: Some(ToolCall {
-                name: tool_call.name.clone(),
-                r#ref: tool_call.r#ref.clone(),
-                input: tool_call.input.clone(),
-                at: tool_call.at.clone(),
-                ..ToolCall::default()
-            }),
-            ..HistoryMessage::default()
-        });
-        self.session_history.push(HistoryMessage {
-            role: ROLE_TOOL.to_owned(),
-            kind: MESSAGE_KIND_TOOL_RESPONSE.to_owned(),
-            name: tool_call.name.clone(),
-            timestamp: Some(now),
-            message_id: self.input.message.id,
-            thread_id,
-            tool_call: Some(tool_call),
-            ..HistoryMessage::default()
-        });
     }
 }
 
@@ -3178,16 +2753,6 @@ mod call_trace_artifact_tests {
         assert_eq!(artifact.request_kind, "openai.chat.completions");
         assert_eq!(artifact.provider, "aifarm");
     }
-}
-
-fn aifarm_dialog_error_with_traces(
-    error: CompletionError,
-    state: &AifarmDialogRunState,
-) -> CompletionError {
-    if state.trace_events.is_empty() {
-        return error;
-    }
-    Box::new(DialogTraceError::new(error, state.trace_events.clone()))
 }
 
 fn aifarm_step_error_with_trace(
@@ -3829,8 +3394,6 @@ pub enum ToolPromptMode {
     None,
     /// Native OpenAI-compatible tools available.
     Native,
-    /// Plain text tool calls available.
-    Text,
 }
 
 impl ToolPromptMode {
@@ -3838,12 +3401,11 @@ impl ToolPromptMode {
         match self {
             Self::None => "none",
             Self::Native => "native",
-            Self::Text => "text",
         }
     }
 
     fn has_tools(self) -> bool {
-        matches!(self, Self::Native | Self::Text)
+        matches!(self, Self::Native)
     }
 }
 
@@ -4425,162 +3987,6 @@ fn decode_direct_completion_payload(
 
 fn response_body_text(response: &AifarmHttpResponse) -> String {
     String::from_utf8_lossy(&response.body).trim().to_owned()
-}
-
-pub(crate) fn tool_context_from_input(input: &DialogInput) -> ToolContext {
-    ToolContext {
-        chat_id: input.context.chat_id,
-        thread_id: input.context.thread_id,
-        message_id: input.message.id,
-        user_id: input.user.id,
-        user_full_name: input.user.full_name.clone(),
-        message_text: input.message.text.clone(),
-        message_meta: input.message.meta.clone(),
-    }
-}
-
-pub(crate) fn recorded_tool_call_with_ref(
-    step: &ToolStep,
-    result: &ToolResult,
-    ref_hint: Option<&str>,
-    iteration: usize,
-) -> Result<ToolCall, CompletionError> {
-    let at = OffsetDateTime::now_utc();
-    let r#ref = ref_hint
-        .filter(|value| !value.trim().is_empty())
-        .map(str::trim)
-        .map(str::to_owned)
-        .unwrap_or_else(|| format!("{}-{iteration}", step.step));
-    Ok(ToolCall {
-        name: step.step.clone(),
-        r#ref,
-        input: Some(serde_json::to_value(step).map_err(|err| {
-            Box::new(AifarmDialogError::Response(format!(
-                "encode tool input: {err}"
-            ))) as CompletionError
-        })?),
-        output: Some(serde_json::to_value(result).map_err(|err| {
-            Box::new(AifarmDialogError::Response(format!(
-                "encode tool result: {err}"
-            ))) as CompletionError
-        })?),
-        at: Some(format_timestamp(at)),
-    })
-}
-
-pub(crate) fn immediate_tool_answer(step: &ToolStep, result: &ToolResult) -> Option<String> {
-    if result
-        .error
-        .as_ref()
-        .is_some_and(|error| error.code == "duplicate_tool_request")
-    {
-        return None;
-    }
-    match step.step.as_str() {
-        STEP_DRAW_IMAGE | STEP_GENERATE_SONG => {
-            if result.no_reply {
-                return Some(String::new());
-            }
-            result.side_effect.as_ref()?;
-            queued_tool_answer(result)
-        }
-        _ => None,
-    }
-}
-
-pub(crate) fn single_effect_tool_request_key(
-    step: &ToolStep,
-) -> Result<Option<String>, CompletionError> {
-    if !single_effect_tool_name(&step.step) {
-        return Ok(None);
-    }
-    let input = serde_json::to_value(step).map_err(|err| {
-        Box::new(AifarmDialogError::Response(format!(
-            "encode tool input: {err}"
-        ))) as CompletionError
-    })?;
-    let encoded = serde_json::to_string(&input).map_err(|err| {
-        Box::new(AifarmDialogError::Response(format!(
-            "encode tool input: {err}"
-        ))) as CompletionError
-    })?;
-    Ok(Some(format!("{}:{encoded}", step.step.trim())))
-}
-
-fn single_effect_tool_name(name: &str) -> bool {
-    name.eq_ignore_ascii_case(STEP_GENERATE_SONG)
-        || name.eq_ignore_ascii_case(STEP_DRAW_IMAGE)
-        || name.eq_ignore_ascii_case(STEP_CANCEL_DRAWING)
-}
-
-pub(crate) fn duplicate_tool_result(tool_name: &str, first_ref: &str) -> ToolResult {
-    let message = "Duplicate tool request suppressed in the same turn. Use the previous result and continue with the final text answer.";
-    let tool = tool_name.trim().to_owned();
-    let mut data = serde_json::Map::new();
-    data.insert("duplicate".to_owned(), Value::Bool(true));
-    data.insert("tool".to_owned(), Value::String(tool));
-    if !first_ref.trim().is_empty() {
-        data.insert(
-            "first_ref".to_owned(),
-            Value::String(first_ref.trim().to_owned()),
-        );
-    }
-    ToolResult {
-        status: TOOL_RESULT_STATUS_NOOP.to_owned(),
-        message: message.to_owned(),
-        data: Some(Value::Object(data)),
-        error: Some(ToolError {
-            code: "duplicate_tool_request".to_owned(),
-            reason: "identical request already executed in this turn".to_owned(),
-            retryable: false,
-        }),
-        ..ToolResult::default()
-    }
-}
-
-/// QUEUED schedules short-circuit the tool loop with an empty answer: the
-/// generated artifact is the reply (silent-but-guaranteed), so the model never
-/// gets a chance to narrate the confirmation. Rejections (failed/noop) return
-/// None so the loop continues and the model composes the user-visible refusal
-/// from the tool result's message and `data.reason` code.
-fn queued_tool_answer(result: &ToolResult) -> Option<String> {
-    result
-        .status
-        .trim()
-        .eq_ignore_ascii_case(TOOL_RESULT_STATUS_QUEUED)
-        .then(String::new)
-}
-
-pub(crate) fn tool_names_for_iteration(
-    input: &DialogInput,
-    iteration: usize,
-    max_iterations: usize,
-) -> Vec<&'static str> {
-    if input.disable_tools || (max_iterations > 0 && iteration >= max_iterations) {
-        return Vec::new();
-    }
-    alternative_dialog_tool_names()
-}
-
-pub(crate) fn tool_prompt_mode_for_request(
-    use_tool_calls: bool,
-    tool_names: &[&str],
-) -> ToolPromptMode {
-    if tool_names.is_empty() {
-        return ToolPromptMode::None;
-    }
-    if use_tool_calls {
-        ToolPromptMode::Native
-    } else {
-        ToolPromptMode::Text
-    }
-}
-
-fn native_tool_values(tool_names: &[&str]) -> Result<Vec<Value>, AifarmDialogError> {
-    chat_completion_tools_for_names(tool_names)
-        .into_iter()
-        .map(|tool| serde_json::to_value(tool).map_err(AifarmDialogError::ToolDefinition))
-        .collect()
 }
 
 enum ToolStepSelection {
@@ -5842,8 +5248,8 @@ mod tests {
     use openplotva_dialog::{
         DailyPersona, DialogContext, DialogMessage, DialogUser, DrawRequest, HistorySearchRequest,
         HistorySummaryRequest, Persona, ROLE_TOOL, RatesRequest, STEP_CHAT_HISTORY_SUMMARY,
-        STEP_CURRENCY_RATES, STEP_HISTORY_SEARCH, STEP_VISION_IMAGE, STEP_WEB_SEARCH,
-        TOOL_RESULT_STATUS_OK, ToolSideEffect, VisionRequest,
+        STEP_CURRENCY_RATES, STEP_DRAW_IMAGE, STEP_HISTORY_SEARCH, STEP_VISION_IMAGE,
+        STEP_WEB_SEARCH, TOOL_RESULT_STATUS_OK, ToolResult, VisionRequest,
     };
 
     fn at(hour: u8, minute: u8) -> OffsetDateTime {
@@ -6886,24 +6292,8 @@ mod tests {
             }
         }
 
-        fn calls(&self) -> Vec<String> {
-            self.state().calls.clone()
-        }
-
-        fn draw_requests(&self) -> Vec<DrawRequest> {
-            self.state().draw_requests.clone()
-        }
-
-        fn vision_requests(&self) -> Vec<VisionRequest> {
-            self.state().vision_requests.clone()
-        }
-
         fn web_search_queries(&self) -> Vec<String> {
             self.state().web_search_queries.clone()
-        }
-
-        fn history_search_queries(&self) -> Vec<String> {
-            self.state().history_search_queries.clone()
         }
 
         fn record(
@@ -6927,7 +6317,7 @@ mod tests {
         }
     }
 
-    impl DialogToolbox for FakeToolbox {
+    impl openplotva_dialog::DialogToolbox for FakeToolbox {
         fn currency_rates<'a>(
             &'a self,
             _meta: RatesRequest,
@@ -7013,6 +6403,13 @@ mod tests {
         }
     }
 
+    fn native_tool_values(tool_names: &[&str]) -> Result<Vec<Value>, AifarmDialogError> {
+        openplotva_dialog::chat_completion_tools_for_names(tool_names)
+            .into_iter()
+            .map(|tool| serde_json::to_value(tool).map_err(AifarmDialogError::ToolDefinition))
+            .collect()
+    }
+
     fn direct_dialog_provider(
         response: Value,
         cfg: AifarmDialogConfig,
@@ -7021,124 +6418,14 @@ mod tests {
         FakeTransport,
         FakeToolbox,
     ) {
-        direct_dialog_provider_with_toolbox(response, cfg, FakeToolbox::new(Vec::new()))
-    }
-
-    fn direct_dialog_provider_with_toolbox(
-        response: Value,
-        cfg: AifarmDialogConfig,
-        toolbox: FakeToolbox,
-    ) -> (
-        AifarmDialogProvider<FakeTransport>,
-        FakeTransport,
-        FakeToolbox,
-    ) {
-        direct_dialog_provider_with_responses(vec![response], cfg, toolbox)
-    }
-
-    fn direct_dialog_provider_with_responses(
-        responses: Vec<Value>,
-        cfg: AifarmDialogConfig,
-        toolbox: FakeToolbox,
-    ) -> (
-        AifarmDialogProvider<FakeTransport>,
-        FakeTransport,
-        FakeToolbox,
-    ) {
-        let transport = FakeTransport::new(
-            responses
-                .into_iter()
-                .map(|response| Ok(json_response(response)))
-                .collect(),
-        );
+        let transport = FakeTransport::new(vec![Ok(json_response(response))]);
         let mut cfg = cfg;
         cfg.client.direct_url = "https://direct.test/v1/chat/completions".to_owned();
         (
-            AifarmDialogProvider::with_transport(cfg, transport.clone())
-                .with_toolbox(Arc::new(toolbox.clone())),
+            AifarmDialogProvider::with_transport(cfg, transport.clone()),
             transport,
-            toolbox,
+            FakeToolbox::new(Vec::new()),
         )
-    }
-
-    #[tokio::test]
-    async fn dialog_provider_runs_plain_http_completion() -> Result<(), CompletionError> {
-        let (provider, transport, _) = direct_dialog_provider(
-            json!({
-                "id": "cmpl-plain",
-                "usage": {
-                    "prompt_tokens": 12,
-                    "completion_tokens": 8,
-                    "total_tokens": 20,
-                    "prompt_tokens_details": {"cached_tokens": 4}
-                },
-                "timings": {
-                    "prompt_n": 12,
-                    "prompt_ms": 120.0,
-                    "prompt_per_second": 100.0,
-                    "predicted_n": 8,
-                    "predicted_ms": 200.0,
-                    "predicted_per_second": 40.0
-                },
-                "choices": [{
-                    "message": {
-                        "role": "assistant",
-                        "content": "<message id=\"1\"><text>old</text></message>\nНовый ответ."
-                    }
-                }]
-            }),
-            AifarmDialogConfig {
-                max_tokens: 256,
-                ..AifarmDialogConfig::default()
-            },
-        );
-        let mut input = base_input();
-        input.disable_tools = true;
-        input.max_output_tokens = 512;
-        input.message = DialogMessage {
-            id: 101,
-            text: "ответь коротко".to_owned(),
-            ..DialogMessage::default()
-        };
-
-        let output = crate::ChatProvider::run_dialog(&provider, input).await?;
-
-        assert_eq!(output.provider, PROVIDER_AIFARM);
-        assert_eq!(output.answer, "Новый ответ.");
-        assert_eq!(output.response, "Новый ответ.");
-        let trace = output.trace.as_ref().expect("trace artifacts");
-        assert_eq!(trace.request_kind, "openai.chat.completions");
-        assert_eq!(
-            trace.raw_request.as_ref().expect("raw request")["max_tokens"],
-            256
-        );
-        assert_eq!(
-            trace.inference_params.as_ref().expect("inference params")["tool_mode"],
-            "none"
-        );
-        assert_eq!(
-            trace.raw_response.as_ref().expect("raw response")["id"],
-            "cmpl-plain"
-        );
-        assert_eq!(trace.usage.as_ref().expect("usage").cached_tokens, 4);
-        assert_eq!(
-            trace.timings.as_ref().expect("timings")["generation_tps"],
-            40.0
-        );
-
-        let requests = transport.requests();
-        assert_eq!(requests.len(), 1);
-        let body: Value = serde_json::from_slice(&requests[0].body)?;
-        assert_eq!(body["model"], DEFAULT_MODEL_NAME);
-        assert_eq!(body["max_tokens"], 256);
-        assert_eq!(body["include_reasoning"], false);
-        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
-        assert_eq!(
-            body["extra_body"]["chat_template_kwargs"]["enable_thinking"],
-            false
-        );
-        assert!(body.get("tools").is_none());
-        Ok(())
     }
 
     #[test]
@@ -7180,923 +6467,6 @@ mod tests {
             value["messages"][0]["content"][1]["image_url"]["url"],
             "https://example.test/image.png"
         );
-    }
-
-    #[tokio::test]
-    async fn dialog_provider_executes_tool_then_continues_to_final_text()
-    -> Result<(), CompletionError> {
-        let toolbox = FakeToolbox::new(vec![ToolResult {
-            status: TOOL_RESULT_STATUS_OK.to_owned(),
-            message: "tool ok".to_owned(),
-            ..ToolResult::default()
-        }]);
-        let (provider, transport, toolbox) = direct_dialog_provider_with_responses(
-            vec![
-                json!({
-                    "choices": [{
-                        "message": {
-                            "role": "assistant",
-                            "content": "<tool_call>draw_image{prompt:\"cat\"}</tool_call>"
-                        }
-                    }]
-                }),
-                json!({
-                    "choices": [{
-                        "message": {
-                            "role": "assistant",
-                            "content": "готово после инструмента"
-                        }
-                    }]
-                }),
-            ],
-            AifarmDialogConfig::default(),
-            toolbox,
-        );
-        let mut input = base_input();
-        input.message = DialogMessage {
-            id: 102,
-            text: "нарисуй кота".to_owned(),
-            ..DialogMessage::default()
-        };
-
-        let output = crate::ChatProvider::run_dialog(&provider, input).await?;
-
-        assert_eq!(output.answer, "готово после инструмента");
-        assert_eq!(output.tool_calls.len(), 1);
-        assert_eq!(output.tool_calls[0].name, STEP_DRAW_IMAGE);
-        assert_eq!(output.trace_events.len(), 2);
-        assert_eq!(output.trace_events[0].iteration, 1);
-        assert_eq!(output.trace_events[0].source, PROVIDER_AIFARM);
-        assert_eq!(output.trace_events[0].mode, "tools");
-        assert_eq!(output.trace_events[0].flow, "dialog");
-        assert_eq!(output.trace_events[0].model, DEFAULT_MODEL_NAME);
-        assert_eq!(output.trace_events[1].iteration, 2);
-        assert!(output.trace_events[1].prompt_messages > output.trace_events[0].prompt_messages);
-        assert!(
-            output.trace_events[1]
-                .raw_request
-                .as_ref()
-                .expect("second raw request")["messages"]
-                .as_array()
-                .expect("messages")
-                .iter()
-                .any(|message| message["content"]
-                    .as_str()
-                    .is_some_and(|content| content.contains("<tool_result")))
-        );
-        assert_eq!(toolbox.calls(), vec![STEP_DRAW_IMAGE.to_owned()]);
-        assert_eq!(toolbox.draw_requests()[0].prompt, "cat");
-
-        let requests = transport.requests();
-        assert_eq!(requests.len(), 2);
-        let second_request: Value = serde_json::from_slice(&requests[1].body)?;
-        assert!(
-            second_request["messages"]
-                .as_array()
-                .expect("messages")
-                .iter()
-                .any(|message| message["content"]
-                    .as_str()
-                    .is_some_and(|content| content.contains("<tool_result")))
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn dialog_provider_executes_xml_wrapper_tool_call_then_continues_to_final_text()
-    -> Result<(), CompletionError> {
-        let toolbox = FakeToolbox::new(vec![ToolResult {
-            status: TOOL_RESULT_STATUS_OK.to_owned(),
-            message: "weather ready".to_owned(),
-            ..ToolResult::default()
-        }]);
-        let (provider, transport, toolbox) = direct_dialog_provider_with_responses(
-            vec![
-                json!({
-                    "choices": [{
-                        "message": {
-                            "role": "assistant",
-                            "content": "<tool_calls>\n  <tool_call>web_search{query: \"weather St. Petersburg June 2026 forecast\"}</tool_call>\n</tool_calls>"
-                        }
-                    }]
-                }),
-                json!({
-                    "choices": [{
-                        "message": {
-                            "role": "assistant",
-                            "content": "На ПМЭФ захвати зонт: прогноз уже в руках"
-                        }
-                    }]
-                }),
-            ],
-            AifarmDialogConfig::default(),
-            toolbox,
-        );
-        let mut input = base_input();
-        input.message = DialogMessage {
-            id: 104,
-            text: "Плотва, дай погоду на ПМЭФ на 4 дня".to_owned(),
-            ..DialogMessage::default()
-        };
-
-        let output = crate::ChatProvider::run_dialog(&provider, input).await?;
-
-        assert_eq!(output.answer, "На ПМЭФ захвати зонт: прогноз уже в руках");
-        assert!(!output.answer.contains("<tool_calls>"));
-        assert_eq!(output.tool_calls.len(), 1);
-        assert_eq!(output.tool_calls[0].name, STEP_WEB_SEARCH);
-        assert_eq!(
-            output.tool_calls[0].input.as_ref().expect("tool input")["query"],
-            "weather St. Petersburg June 2026 forecast"
-        );
-        assert_eq!(toolbox.calls(), vec![STEP_WEB_SEARCH.to_owned()]);
-        assert_eq!(
-            toolbox.web_search_queries(),
-            vec!["weather St. Petersburg June 2026 forecast".to_owned()]
-        );
-        assert_eq!(transport.requests().len(), 2);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn dialog_provider_executes_xml_attribute_history_search_then_continues_to_final_text()
-    -> Result<(), CompletionError> {
-        let toolbox = FakeToolbox::new(vec![ToolResult {
-            status: TOOL_RESULT_STATUS_OK.to_owned(),
-            message: "history ready".to_owned(),
-            data: Some(json!({
-                "query": "CherryCherry123",
-                "results": "- Cherry: hello",
-            })),
-            ..ToolResult::default()
-        }]);
-        let (provider, transport, toolbox) = direct_dialog_provider_with_responses(
-            vec![
-                json!({
-                    "choices": [{
-                        "message": {
-                            "role": "assistant",
-                            "content": "<tool_calls>\n  <tool_call name=\"history_search\" arg=\"query: CherryCherry123\"></tool_call>\n</tool_calls>"
-                        }
-                    }]
-                }),
-                json!({
-                    "choices": [{
-                        "message": {
-                            "role": "assistant",
-                            "content": "Cherry выглядит разговорчивой и живой."
-                        }
-                    }]
-                }),
-            ],
-            AifarmDialogConfig::default(),
-            toolbox,
-        );
-        let mut input = base_input();
-        input.message = DialogMessage {
-            id: 194564,
-            text: "Плотва, найди все сообщения в чате от @CherryCherry123 и дай ей характеристику"
-                .to_owned(),
-            ..DialogMessage::default()
-        };
-
-        let output = crate::ChatProvider::run_dialog(&provider, input).await?;
-
-        assert_eq!(output.answer, "Cherry выглядит разговорчивой и живой.");
-        assert_eq!(output.tool_calls.len(), 1);
-        assert_eq!(output.tool_calls[0].name, STEP_HISTORY_SEARCH);
-        assert_eq!(
-            output.tool_calls[0].input.as_ref().expect("tool input")["query"],
-            "CherryCherry123"
-        );
-        assert_eq!(toolbox.calls(), vec![STEP_HISTORY_SEARCH.to_owned()]);
-        assert_eq!(
-            toolbox.history_search_queries(),
-            vec!["CherryCherry123".to_owned()]
-        );
-        assert_eq!(transport.requests().len(), 2);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn dialog_provider_executes_entity_encoded_history_search_then_continues_to_final_text()
-    -> Result<(), CompletionError> {
-        let toolbox = FakeToolbox::new(vec![ToolResult {
-            status: TOOL_RESULT_STATUS_OK.to_owned(),
-            message: "history ready".to_owned(),
-            data: Some(json!({
-                "query": "CherryCherry123",
-                "results": "- Cherry: hello",
-            })),
-            ..ToolResult::default()
-        }]);
-        let (provider, transport, toolbox) = direct_dialog_provider_with_responses(
-            vec![
-                json!({
-                    "choices": [{
-                        "message": {
-                            "role": "assistant",
-                            "content": "&lt;tool_calls&gt;\n  &lt;tool_call name=\"history_search\" arg=\"query: CherryCherry123\"&gt;&lt;/tool_call&gt;\n&lt;/tool_calls&gt;"
-                        }
-                    }]
-                }),
-                json!({
-                    "choices": [{
-                        "message": {
-                            "role": "assistant",
-                            "content": "Cherry выглядит разговорчивой и живой."
-                        }
-                    }]
-                }),
-            ],
-            AifarmDialogConfig::default(),
-            toolbox,
-        );
-        let mut input = base_input();
-        input.message = DialogMessage {
-            id: 194565,
-            text: "Плотва, найди все сообщения в чате от @CherryCherry123 и дай ей характеристику"
-                .to_owned(),
-            ..DialogMessage::default()
-        };
-
-        let output = crate::ChatProvider::run_dialog(&provider, input).await?;
-
-        assert_eq!(output.answer, "Cherry выглядит разговорчивой и живой.");
-        assert_eq!(output.tool_calls.len(), 1);
-        assert_eq!(output.tool_calls[0].name, STEP_HISTORY_SEARCH);
-        assert_eq!(
-            output.tool_calls[0].input.as_ref().expect("tool input")["query"],
-            "CherryCherry123"
-        );
-        assert_eq!(toolbox.calls(), vec![STEP_HISTORY_SEARCH.to_owned()]);
-        assert_eq!(transport.requests().len(), 2);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn dialog_provider_feeds_data_tool_no_reply_result_to_llm() -> Result<(), CompletionError>
-    {
-        let toolbox = FakeToolbox::new(vec![ToolResult {
-            status: TOOL_RESULT_STATUS_QUEUED.to_owned(),
-            message: "rates ready".to_owned(),
-            no_reply: true,
-            ..ToolResult::default()
-        }]);
-        let (provider, transport, toolbox) = direct_dialog_provider_with_responses(
-            vec![
-                json!({
-                    "choices": [{
-                        "message": {
-                            "role": "assistant",
-                            "content": "<tool_call>currency_rates{pairs:\"BYN\"}</tool_call>"
-                        }
-                    }]
-                }),
-                json!({
-                    "choices": [{
-                        "message": {
-                            "role": "assistant",
-                            "content": "курс BYN уже в ответе"
-                        }
-                    }]
-                }),
-            ],
-            AifarmDialogConfig::default(),
-            toolbox,
-        );
-
-        let output = crate::ChatProvider::run_dialog(&provider, base_input()).await?;
-
-        assert_eq!(output.answer, "курс BYN уже в ответе");
-        assert_eq!(toolbox.calls(), vec![STEP_CURRENCY_RATES.to_owned()]);
-        assert_eq!(transport.requests().len(), 2);
-        let second_request: Value = serde_json::from_slice(&transport.requests()[1].body)?;
-        assert!(
-            second_request["messages"]
-                .as_array()
-                .expect("messages")
-                .iter()
-                .any(|message| message["content"]
-                    .as_str()
-                    .is_some_and(|content| content.contains("<tool_result")))
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn dialog_provider_feeds_chat_history_summary_to_llm() -> Result<(), CompletionError> {
-        let toolbox = FakeToolbox::new(vec![ToolResult {
-            status: TOOL_RESULT_STATUS_OK.to_owned(),
-            message: "summary ready".to_owned(),
-            ..ToolResult::default()
-        }]);
-        let (provider, transport, toolbox) = direct_dialog_provider_with_responses(
-            vec![
-                json!({
-                    "choices": [{
-                        "message": {
-                            "role": "assistant",
-                            "content": "<tool_call>chat_history_summary{window:\"hours\", hours:1}</tool_call>"
-                        }
-                    }]
-                }),
-                json!({
-                    "choices": [{
-                        "message": {
-                            "role": "assistant",
-                            "content": "пересказ на основе summary"
-                        }
-                    }]
-                }),
-            ],
-            AifarmDialogConfig::default(),
-            toolbox,
-        );
-
-        let output = crate::ChatProvider::run_dialog(&provider, base_input()).await?;
-
-        assert_eq!(output.answer, "пересказ на основе summary");
-        assert_eq!(toolbox.calls(), vec![STEP_CHAT_HISTORY_SUMMARY.to_owned()]);
-        assert_eq!(transport.requests().len(), 2);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn dialog_provider_feeds_empty_data_tool_arg_error_to_llm() -> Result<(), CompletionError>
-    {
-        let toolbox = FakeToolbox::new(Vec::new());
-        let (provider, transport, toolbox) = direct_dialog_provider_with_responses(
-            vec![
-                json!({
-                    "choices": [{
-                        "message": {
-                            "role": "assistant",
-                            "content": "<tool_call>web_search{query:\"\"}</tool_call>"
-                        }
-                    }]
-                }),
-                json!({
-                    "choices": [{
-                        "message": {
-                            "role": "assistant",
-                            "content": "не смогла поискать без запроса"
-                        }
-                    }]
-                }),
-            ],
-            AifarmDialogConfig::default(),
-            toolbox,
-        );
-        let mut input = base_input();
-        input.message.text = String::new();
-
-        let output = crate::ChatProvider::run_dialog(&provider, input).await?;
-
-        assert_eq!(output.answer, "не смогла поискать без запроса");
-        assert!(toolbox.calls().is_empty());
-        assert_eq!(transport.requests().len(), 2);
-        assert_eq!(
-            output.tool_calls[0].output.as_ref().expect("tool output")["error"]["code"],
-            "web_search_query_empty"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn dialog_provider_suppresses_duplicate_single_effect_tool_requests()
-    -> Result<(), CompletionError> {
-        let toolbox = FakeToolbox::new(vec![
-            ToolResult {
-                status: TOOL_RESULT_STATUS_OK.to_owned(),
-                message: "draw accepted".to_owned(),
-                ..ToolResult::default()
-            },
-            ToolResult {
-                status: TOOL_RESULT_STATUS_OK.to_owned(),
-                message: "should not execute".to_owned(),
-                ..ToolResult::default()
-            },
-        ]);
-        let (provider, _transport, toolbox) = direct_dialog_provider_with_responses(
-            vec![
-                json!({
-                    "choices": [{
-                        "message": {
-                            "role": "assistant",
-                            "content": "<tool_call>draw_image{prompt:\"cat\"}</tool_call>"
-                        }
-                    }]
-                }),
-                json!({
-                    "choices": [{
-                        "message": {
-                            "role": "assistant",
-                            "content": "<tool_call>draw_image{prompt:\"cat\"}</tool_call>"
-                        }
-                    }]
-                }),
-                json!({
-                    "choices": [{
-                        "message": {
-                            "role": "assistant",
-                            "content": "готово"
-                        }
-                    }]
-                }),
-            ],
-            AifarmDialogConfig::default(),
-            toolbox,
-        );
-
-        let output = crate::ChatProvider::run_dialog(&provider, base_input()).await?;
-
-        assert_eq!(output.answer, "готово");
-        assert_eq!(toolbox.calls(), vec![STEP_DRAW_IMAGE.to_owned()]);
-        assert_eq!(output.tool_calls.len(), 2);
-        assert_eq!(
-            output.tool_calls[1]
-                .output
-                .as_ref()
-                .expect("duplicate output")["error"]["code"],
-            "duplicate_tool_request"
-        );
-        assert_eq!(
-            output.tool_calls[1]
-                .output
-                .as_ref()
-                .expect("duplicate output")["data"]["duplicate"],
-            true
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn dialog_provider_executes_native_tool_call_batch_with_duplicate_guard()
-    -> Result<(), CompletionError> {
-        let toolbox = FakeToolbox::new(vec![
-            ToolResult {
-                status: TOOL_RESULT_STATUS_OK.to_owned(),
-                message: "draw accepted".to_owned(),
-                ..ToolResult::default()
-            },
-            ToolResult {
-                status: TOOL_RESULT_STATUS_OK.to_owned(),
-                message: "should not execute".to_owned(),
-                ..ToolResult::default()
-            },
-        ]);
-        let (provider, transport, toolbox) = direct_dialog_provider_with_responses(
-            vec![
-                json!({
-                    "choices": [{
-                        "message": {
-                            "role": "assistant",
-                            "tool_calls": [
-                                {
-                                    "id": "call-1",
-                                    "type": "function",
-                                    "function": {
-                                        "name": "draw_image",
-                                        "arguments": "{\"prompt\":\"cat\"}"
-                                    }
-                                },
-                                {
-                                    "id": "call-2",
-                                    "type": "function",
-                                    "function": {
-                                        "name": "draw_image",
-                                        "arguments": "{\"prompt\":\"cat\"}"
-                                    }
-                                }
-                            ]
-                        }
-                    }]
-                }),
-                json!({
-                    "choices": [{
-                        "message": {
-                            "role": "assistant",
-                            "content": "готово после native batch"
-                        }
-                    }]
-                }),
-            ],
-            AifarmDialogConfig {
-                use_tool_calls: Some(true),
-                ..AifarmDialogConfig::default()
-            },
-            toolbox,
-        );
-
-        let output = crate::ChatProvider::run_dialog(&provider, base_input()).await?;
-
-        assert_eq!(output.answer, "готово после native batch");
-        assert_eq!(toolbox.calls(), vec![STEP_DRAW_IMAGE.to_owned()]);
-        assert_eq!(toolbox.draw_requests()[0].prompt, "cat");
-        assert_eq!(output.tool_calls.len(), 2);
-        assert_eq!(output.tool_calls[0].r#ref, "call-1");
-        assert_eq!(output.tool_calls[1].r#ref, "call-2");
-        assert_eq!(
-            output.tool_calls[1]
-                .output
-                .as_ref()
-                .expect("duplicate output")["error"]["code"],
-            "duplicate_tool_request"
-        );
-        assert_eq!(
-            output.tool_calls[1]
-                .output
-                .as_ref()
-                .expect("duplicate output")["data"]["first_ref"],
-            "call-1"
-        );
-        assert_eq!(transport.requests().len(), 2);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn dialog_provider_records_tool_parser_telemetry_like_go() -> Result<(), CompletionError>
-    {
-        openplotva_dialog::tool_telemetry::clear_for_tests();
-        let since = OffsetDateTime::now_utc();
-        let toolbox = FakeToolbox::new(vec![ToolResult {
-            status: TOOL_RESULT_STATUS_QUEUED.to_owned(),
-            message: "queued".to_owned(),
-            side_effect: Some(ToolSideEffect {
-                kind: "image_generation_job".to_owned(),
-                state: TOOL_RESULT_STATUS_QUEUED.to_owned(),
-                ..ToolSideEffect::default()
-            }),
-            ..ToolResult::default()
-        }]);
-        let (provider, _transport, _) = direct_dialog_provider_with_toolbox(
-            json!({
-                "choices": [{
-                    "message": {
-                        "role": "assistant",
-                        "content": "```tool\ndraw_image{prompt:\"cat in space\"}\n```"
-                    }
-                }]
-            }),
-            AifarmDialogConfig {
-                model: "telemetry-model".to_owned(),
-                max_iterations: 2,
-                use_tool_calls: Some(false),
-                ..AifarmDialogConfig::default()
-            },
-            toolbox,
-        );
-        let mut input = base_input();
-        input.message = DialogMessage {
-            id: 103,
-            text: "нарисуй кота".to_owned(),
-            ..DialogMessage::default()
-        };
-
-        crate::ChatProvider::run_dialog(&provider, input).await?;
-
-        let snapshot = openplotva_dialog::tool_telemetry::snapshot_since(since, 1_000);
-        let events = snapshot
-            .recent
-            .iter()
-            .filter(|event| event.model == "telemetry-model")
-            .collect::<Vec<_>>();
-        assert_eq!(events.len(), 2);
-        assert!(events.iter().any(|event| event.outcome == "detected"
-            && event.form == "fenced"
-            && event.tool == STEP_DRAW_IMAGE));
-        assert!(events.iter().any(|event| event.outcome == "executed"
-            && event.form == "fenced"
-            && event.tool == STEP_DRAW_IMAGE));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn dialog_provider_short_circuits_queued_draw_with_empty_answer()
-    -> Result<(), CompletionError> {
-        let toolbox = FakeToolbox::new(vec![ToolResult {
-            status: TOOL_RESULT_STATUS_QUEUED.to_owned(),
-            side_effect: Some(ToolSideEffect {
-                kind: "image_generation_job".to_owned(),
-                ticket_id: "777".to_owned(),
-                state: TOOL_RESULT_STATUS_QUEUED.to_owned(),
-                ..ToolSideEffect::default()
-            }),
-            ..ToolResult::default()
-        }]);
-        let (provider, transport, _) = direct_dialog_provider_with_toolbox(
-            json!({
-                "choices": [{
-                    "message": {
-                        "role": "assistant",
-                        "content": "<tool_call>draw_image{prompt:\"cat\"}</tool_call>"
-                    }
-                }]
-            }),
-            AifarmDialogConfig::default(),
-            toolbox,
-        );
-        let mut input = base_input();
-        input.message = DialogMessage {
-            id: 103,
-            text: "нарисуй кота".to_owned(),
-            ..DialogMessage::default()
-        };
-
-        let output = crate::ChatProvider::run_dialog(&provider, input).await?;
-
-        assert_eq!(
-            output.answer, "",
-            "queued schedule is silent: the artifact is the reply"
-        );
-        assert_eq!(output.tool_calls.len(), 1);
-        let recorded: ToolResult =
-            serde_json::from_value(output.tool_calls[0].output.clone().expect("tool output"))
-                .expect("tool result");
-        let side_effect = recorded.side_effect.expect("side effect preserved");
-        assert_eq!(side_effect.kind, "image_generation_job");
-        assert_eq!(side_effect.ticket_id, "777");
-        assert_eq!(side_effect.state, TOOL_RESULT_STATUS_QUEUED);
-        assert_eq!(output.trace_events.len(), 1);
-        assert_eq!(output.trace_events[0].iteration, 1);
-        assert_eq!(
-            transport.requests().len(),
-            1,
-            "queued schedule still short-circuits the tool loop"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn dialog_provider_feeds_draw_rejection_back_to_model() -> Result<(), CompletionError> {
-        let toolbox = FakeToolbox::new(vec![ToolResult {
-            status: "failed".to_owned(),
-            message: "Генерация доступна только VIP-пользователям. Задача не поставлена в очередь."
-                .to_owned(),
-            side_effect: Some(ToolSideEffect {
-                kind: "image_generation_job".to_owned(),
-                state: "failed".to_owned(),
-                ..ToolSideEffect::default()
-            }),
-            data: Some(json!({"status": "not_scheduled", "reason": "vip_only"})),
-            ..ToolResult::default()
-        }]);
-        let (provider, transport, _) = direct_dialog_provider_with_responses(
-            vec![
-                json!({
-                    "choices": [{
-                        "message": {
-                            "role": "assistant",
-                            "content": "<tool_call>draw_image{prompt:\"cat\"}</tool_call>"
-                        }
-                    }]
-                }),
-                json!({
-                    "choices": [{
-                        "message": {
-                            "role": "assistant",
-                            "content": "Рисование сейчас только для VIP, извини 😿"
-                        }
-                    }]
-                }),
-            ],
-            AifarmDialogConfig::default(),
-            toolbox,
-        );
-        let mut input = base_input();
-        input.message = DialogMessage {
-            id: 103,
-            text: "нарисуй кота".to_owned(),
-            ..DialogMessage::default()
-        };
-
-        let output = crate::ChatProvider::run_dialog(&provider, input).await?;
-
-        assert_eq!(
-            transport.requests().len(),
-            2,
-            "rejection must not short-circuit: the model composes the refusal"
-        );
-        assert_eq!(output.answer, "Рисование сейчас только для VIP, извини 😿");
-        assert_eq!(output.tool_calls.len(), 1);
-        let recorded: ToolResult =
-            serde_json::from_value(output.tool_calls[0].output.clone().expect("tool output"))
-                .expect("tool result");
-        assert_eq!(recorded.status, "failed");
-        assert_eq!(
-            recorded.data.expect("data")["reason"],
-            json!("vip_only"),
-            "machine-readable reason code rides ToolResult.data"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn dialog_provider_short_circuits_queued_draw_from_direct_xml_element()
-    -> Result<(), CompletionError> {
-        let toolbox = FakeToolbox::new(vec![ToolResult {
-            status: TOOL_RESULT_STATUS_QUEUED.to_owned(),
-            side_effect: Some(ToolSideEffect {
-                kind: "image_generation_job".to_owned(),
-                state: TOOL_RESULT_STATUS_QUEUED.to_owned(),
-                ..ToolSideEffect::default()
-            }),
-            ..ToolResult::default()
-        }]);
-        let (provider, transport, toolbox) = direct_dialog_provider_with_toolbox(
-            json!({
-                "choices": [{
-                    "message": {
-                        "role": "assistant",
-                        "content": "<draw_image prompt=\"cat in space\" />"
-                    }
-                }]
-            }),
-            AifarmDialogConfig::default(),
-            toolbox,
-        );
-        let mut input = base_input();
-        input.message = DialogMessage {
-            id: 103,
-            text: "нарисуй кота".to_owned(),
-            ..DialogMessage::default()
-        };
-
-        let output = crate::ChatProvider::run_dialog(&provider, input).await?;
-
-        assert_eq!(
-            output.answer, "",
-            "queued schedule is silent: the artifact is the reply"
-        );
-        assert_eq!(output.tool_calls.len(), 1);
-        assert_eq!(output.tool_calls[0].name, STEP_DRAW_IMAGE);
-        assert_eq!(toolbox.draw_requests()[0].prompt, "cat in space");
-        assert_eq!(output.trace_events.len(), 1);
-        assert_eq!(transport.requests().len(), 1);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn dialog_provider_wraps_provider_error_with_trace_events() -> Result<(), CompletionError>
-    {
-        let transport = FakeTransport::new(vec![Err(Box::new(ProviderError::new(
-            PROVIDER_AIFARM,
-            FailureReason::ProviderUnavailable,
-            "capacity unavailable",
-        )) as CompletionError)]);
-        let mut cfg = AifarmDialogConfig::default();
-        cfg.client.direct_url = "https://direct.test/v1/chat/completions".to_owned();
-        let provider = AifarmDialogProvider::with_transport(cfg, transport.clone())
-            .with_toolbox(Arc::new(FakeToolbox::new(Vec::new())));
-        let mut input = base_input();
-        input.disable_tools = true;
-
-        let error = crate::ChatProvider::run_dialog(&provider, input)
-            .await
-            .expect_err("provider error");
-
-        assert_eq!(
-            retryable_reason(error.as_ref()),
-            Some(FailureReason::ProviderUnavailable)
-        );
-        let trace_error = error
-            .downcast_ref::<DialogTraceError>()
-            .expect("trace wrapper");
-        assert_eq!(trace_error.trace_events().len(), 1);
-        let trace = &trace_error.trace_events()[0];
-        assert_eq!(trace.provider, PROVIDER_AIFARM);
-        assert_eq!(trace.request_kind, "openai.chat.completions");
-        assert_eq!(trace.source, PROVIDER_AIFARM);
-        assert_eq!(trace.mode, "tools");
-        assert_eq!(trace.flow, "dialog");
-        assert_eq!(trace.iteration, 1);
-        assert!(trace.raw_request.is_some());
-        assert!(trace.raw_response.is_none());
-        assert!(trace.error.contains("capacity unavailable"));
-        assert_eq!(transport.requests().len(), 1);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn dialog_provider_suppresses_answer_for_no_reply_tool_result()
-    -> Result<(), CompletionError> {
-        let toolbox = FakeToolbox::new(vec![ToolResult {
-            status: TOOL_RESULT_STATUS_NOOP.to_owned(),
-            no_reply: true,
-            ..ToolResult::default()
-        }]);
-        let (provider, transport, _) = direct_dialog_provider_with_toolbox(
-            json!({
-                "choices": [{
-                    "message": {
-                        "role": "assistant",
-                        "content": "<tool_call>draw_image{prompt:\"cat\"}</tool_call>"
-                    }
-                }]
-            }),
-            AifarmDialogConfig::default(),
-            toolbox,
-        );
-        let mut input = base_input();
-        input.message = DialogMessage {
-            id: 104,
-            text: "нарисуй кота".to_owned(),
-            ..DialogMessage::default()
-        };
-
-        let output = crate::ChatProvider::run_dialog(&provider, input).await?;
-
-        assert_eq!(output.answer, "");
-        assert_eq!(output.tool_calls.len(), 1);
-        assert_eq!(transport.requests().len(), 1);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn dialog_provider_uses_current_single_image_for_vision_tool()
-    -> Result<(), CompletionError> {
-        let toolbox = FakeToolbox::new(vec![ToolResult {
-            status: TOOL_RESULT_STATUS_OK.to_owned(),
-            message: "на фото кот".to_owned(),
-            ..ToolResult::default()
-        }]);
-        let (provider, _transport, toolbox) = direct_dialog_provider_with_responses(
-            vec![
-                json!({
-                    "choices": [{
-                        "message": {
-                            "role": "assistant",
-                            "content": "<tool_call>vision_image{}</tool_call>"
-                        }
-                    }]
-                }),
-                json!({
-                    "choices": [{
-                        "message": {
-                            "role": "assistant",
-                            "content": "вижу кота"
-                        }
-                    }]
-                }),
-            ],
-            AifarmDialogConfig::default(),
-            toolbox,
-        );
-        let mut input = base_input();
-        input.message = DialogMessage {
-            id: 105,
-            text: "что на фото?".to_owned(),
-            meta: ChatMessageMeta {
-                attachments: vec![ChatAttachment {
-                    kind: "image".to_owned(),
-                    file_unique_id: "unique-image-1".to_owned(),
-                    ..ChatAttachment::default()
-                }],
-                ..ChatMessageMeta::default()
-            },
-            ..DialogMessage::default()
-        };
-
-        let output = crate::ChatProvider::run_dialog(&provider, input).await?;
-
-        assert_eq!(output.answer, "вижу кота");
-        assert_eq!(toolbox.calls(), vec![STEP_VISION_IMAGE.to_owned()]);
-        assert_eq!(toolbox.vision_requests()[0].file_id, "unique-image-1");
-        Ok(())
-    }
-
-    #[test]
-    fn dialog_provider_builds_native_tool_request_when_enabled() -> Result<(), AifarmDialogError> {
-        let provider = AifarmDialogProvider::with_transport(
-            AifarmDialogConfig {
-                use_tool_calls: Some(true),
-                ..AifarmDialogConfig::default()
-            },
-            FakeTransport::new(Vec::new()),
-        );
-        let mut input = base_input();
-        input.message = DialogMessage {
-            id: 103,
-            text: "что на картинке?".to_owned(),
-            ..DialogMessage::default()
-        };
-
-        let request = provider.iteration_request(&input, 1)?;
-
-        assert_eq!(request.tool_choice, Some(Value::String("auto".to_owned())));
-        assert_eq!(request.parallel_tool_calls, Some(false));
-        assert!(request.tools.iter().any(|tool| {
-            tool["function"]["name"]
-                .as_str()
-                .is_some_and(|name| name == "vision_image")
-        }));
-        assert_eq!(request.include_reasoning, Some(false));
-        assert_eq!(
-            request.chat_template_kwargs,
-            Some(json!({ "enable_thinking": false }))
-        );
-        Ok(())
     }
 
     #[test]
@@ -8178,24 +6548,6 @@ mod tests {
 
         assert_eq!(usage.thoughts_tokens, 1000);
         assert_eq!(usage.output_tokens, 1024);
-    }
-
-    #[test]
-    fn dialog_request_prefers_input_enable_thinking_over_config() -> Result<(), AifarmDialogError> {
-        let provider = AifarmDialogProvider::with_transport(
-            AifarmDialogConfig::default(),
-            FakeTransport::new(Vec::new()),
-        );
-        let mut input = base_input();
-        input.enable_thinking = Some(true);
-
-        let request = provider.iteration_request(&input, 1)?;
-
-        assert_eq!(
-            request.chat_template_kwargs,
-            Some(json!({ "enable_thinking": true }))
-        );
-        Ok(())
     }
 
     #[test]
@@ -9319,8 +7671,7 @@ mod tests {
     #[tokio::test]
     async fn chat_step_parses_native_tool_calls_with_ids_and_intermediate_text()
     -> Result<(), CompletionError> {
-        let toolbox = FakeToolbox::new(Vec::new());
-        let (provider, transport, toolbox) = direct_dialog_provider_with_toolbox(
+        let (provider, transport, toolbox) = direct_dialog_provider(
             json!({
                 "choices": [{
                     "message": {
@@ -9338,7 +7689,6 @@ mod tests {
                 }]
             }),
             AifarmDialogConfig::default(),
-            toolbox,
         );
         let request = openplotva_dialog::ChatStepRequest {
             input: base_input(),
@@ -9373,6 +7723,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chat_step_final_only_never_yields_tool_calls_or_empty_text()
+    -> Result<(), CompletionError> {
+        // The forced-final pass must not interpret tool-call markup: the
+        // session engine reads only `text` there, so salvaged calls with an
+        // emptied text would look like an empty provider answer.
+        let response = json!({
+            "choices": [{"message": {
+                "role": "assistant",
+                "content": "почти забыла <tool_call>{\"name\": \"web_search\", \"arguments\": {\"query\": \"солнцестояние\"}}</tool_call>"
+            }}]
+        });
+        let (provider, _transport, _) =
+            direct_dialog_provider(response, AifarmDialogConfig::default());
+
+        let output = crate::ChatStepProvider::run_chat_step(
+            &provider,
+            openplotva_dialog::ChatStepRequest {
+                input: base_input(),
+                transcript: Vec::new(),
+                tools: openplotva_dialog::ToolsMode::FinalOnly,
+                iteration: 3,
+            },
+        )
+        .await?;
+
+        assert!(output.tool_calls.is_empty(), "{:?}", output.tool_calls);
+        assert_eq!(output.text, "почти забыла");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn chat_step_final_only_keeps_the_system_prompt_and_drops_the_tools_array()
     -> Result<(), CompletionError> {
         let transcript = vec![
@@ -9397,11 +7778,8 @@ mod tests {
             "choices": [{"message": {"role": "assistant", "content": "готово"}}]
         });
 
-        let (native_provider, native_transport, _) = direct_dialog_provider_with_toolbox(
-            text_response.clone(),
-            AifarmDialogConfig::default(),
-            FakeToolbox::new(Vec::new()),
-        );
+        let (native_provider, native_transport, _) =
+            direct_dialog_provider(text_response.clone(), AifarmDialogConfig::default());
         crate::ChatStepProvider::run_chat_step(
             &native_provider,
             openplotva_dialog::ChatStepRequest {
@@ -9415,11 +7793,8 @@ mod tests {
         )
         .await?;
 
-        let (final_provider, final_transport, _) = direct_dialog_provider_with_toolbox(
-            text_response,
-            AifarmDialogConfig::default(),
-            FakeToolbox::new(Vec::new()),
-        );
+        let (final_provider, final_transport, _) =
+            direct_dialog_provider(text_response, AifarmDialogConfig::default());
         let output = crate::ChatStepProvider::run_chat_step(
             &final_provider,
             openplotva_dialog::ChatStepRequest {
@@ -9486,7 +7861,7 @@ mod tests {
     #[tokio::test]
     async fn chat_step_salvages_content_tool_calls_and_strips_them_from_text()
     -> Result<(), CompletionError> {
-        let (provider, _transport, _) = direct_dialog_provider_with_toolbox(
+        let (provider, _transport, _) = direct_dialog_provider(
             json!({
                 "choices": [{
                     "message": {
@@ -9496,7 +7871,6 @@ mod tests {
                 }]
             }),
             AifarmDialogConfig::default(),
-            FakeToolbox::new(Vec::new()),
         );
         let output = crate::ChatStepProvider::run_chat_step(
             &provider,
@@ -9519,6 +7893,31 @@ mod tests {
         assert_eq!(
             output.text, "",
             "salvaged tool markup must not leak into the chat text"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dialog_request_prefers_input_enable_thinking_over_config() -> Result<(), AifarmDialogError> {
+        let provider = AifarmDialogProvider::with_transport(
+            AifarmDialogConfig::default(),
+            FakeTransport::new(Vec::new()),
+        );
+        let mut input = base_input();
+        input.enable_thinking = Some(true);
+
+        let history = build_session_history_with_limit(&input, provider.cfg.max_history);
+        let request = provider.step_request_with_history(
+            &input,
+            &history,
+            &[],
+            &openplotva_dialog::ToolsMode::FinalOnly,
+            1,
+        )?;
+
+        assert_eq!(
+            request.chat_template_kwargs,
+            Some(json!({ "enable_thinking": true }))
         );
         Ok(())
     }

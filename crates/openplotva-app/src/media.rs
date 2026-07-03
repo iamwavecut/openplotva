@@ -562,7 +562,6 @@ pub fn aifarm_dialog_config_from_app_config(config: &AppConfig) -> AifarmDialogC
         dry_multiplier: Some(dialog.aifarm_dry_multiplier),
         dry_base: Some(dialog.aifarm_dry_base),
         dry_allowed_length: dialog.aifarm_dry_allowed_length,
-        use_tool_calls: Some(dialog.aifarm_use_tool_calls),
         enable_thinking: Some(dialog.aifarm_enable_thinking),
         include_reasoning: Some(false),
         ..AifarmDialogConfig::default()
@@ -898,7 +897,6 @@ mod tests {
             dialog_provider: Some("nvidia".to_owned()),
             dialog_url: Some("https://direct.test/v1/chat/completions".to_owned()),
             dialog_api_key: Some("key".to_owned()),
-            dialog_aifarm_use_tool_calls: Some("true".to_owned()),
             dialog_aifarm_enable_thinking: Some("true".to_owned()),
             dialog_aifarm_max_tokens: Some("2048".to_owned()),
             dialog_aifarm_temperature: Some("0.4".to_owned()),
@@ -934,7 +932,6 @@ mod tests {
         assert_eq!(cfg.dry_multiplier, Some(0.5));
         assert_eq!(cfg.dry_base, Some(1.5));
         assert_eq!(cfg.dry_allowed_length, 42);
-        assert_eq!(cfg.use_tool_calls, Some(true));
         assert_eq!(cfg.enable_thinking, Some(false));
         assert_eq!(cfg.include_reasoning, Some(false));
     }

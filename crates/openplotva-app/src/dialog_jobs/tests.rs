@@ -9,7 +9,7 @@ use std::{
 use openplotva_core::{ChatAttachment, ChatMessageMeta, ChatSettings, ToolCall};
 use openplotva_dialog::{DialogOutput, HistoryMessage, MESSAGE_KIND_TEXT, ROLE_MODEL, ROLE_USER};
 use openplotva_llm::{
-    ChatProvider, ChatProviderError, ChatProviderFuture, ContentBlockedError,
+    ChatProvider, ChatProviderError, ContentBlockedError,
     retry::{FailureReason, ProviderError},
 };
 use openplotva_taskman::{
@@ -62,8 +62,8 @@ async fn dialog_worker_runs_provider_sends_answer_and_completes_job() -> Result<
         record
             .events
             .iter()
-            .any(|event| event.stage == crate::dialog_turn::ANSWER_SENT_STAGE),
-        "successful send must append the answer_sent marker"
+            .any(|event| event.stage == crate::dialog_turn::SESSION_MESSAGE_SENT_STAGE),
+        "successful send must append the session sent marker"
     );
     Ok(())
 }
@@ -114,7 +114,7 @@ async fn dialog_worker_skips_resend_when_answer_sent_marker_present() -> Result<
             now,
             routing_events: None,
             turn_outcomes: Some(&outcomes),
-            session: None,
+            session: leaked_session_wiring(),
         },
     )
     .await;
@@ -207,109 +207,51 @@ async fn dialog_dispatcher_effects_routes_rich_only_html_to_rich_queue()
 }
 
 #[tokio::test]
-async fn dialog_worker_records_go_fallback_event_before_completion() -> Result<(), Box<dyn Error>> {
+async fn dialog_worker_persists_executed_tool_calls_before_answer() -> Result<(), Box<dyn Error>> {
     let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
     let queue = InMemoryTaskQueue::new();
     let job_id = queue.assign(
         DIALOG_AIFARM_QUEUE_NAME,
-        new_dialog_job_at(dialog_params("hello"), now),
+        new_dialog_job_at(dialog_params("когда солнцестояние?"), now),
     );
-    let provider = ProviderStub::returning(DialogOutput {
-        provider: "genkit".to_owned(),
-        fallback_from: "aifarm".to_owned(),
-        fallback_error: "aifarm provider provider_unavailable: status 503".to_owned(),
-        answer: "pong".to_owned(),
-        ..DialogOutput::default()
-    });
-    let effects = EffectsStub::default();
-
-    let report = process_dialog_job_once_in_queue_at(
-        &queue,
-        DIALOG_AIFARM_QUEUE_NAME,
-        &provider,
-        &effects,
-        now,
-    )
-    .await;
-
-    assert!(report.recorded_dialog_fallback_event);
-    assert_eq!(report.dialog_fallback_event_error, None);
-    assert!(report.completed);
-    let record = queue.record(job_id).expect("job record");
-    let event = record
-        .events
-        .iter()
-        .find(|event| event.stage == "dialog_fallback")
-        .expect("dialog fallback event");
-    assert_eq!(event.at, "2026-05-19T12:30:00Z");
-    assert_eq!(event.level, "warn");
-    assert_eq!(event.stage, "dialog_fallback");
-    assert_eq!(event.provider, "aifarm");
-    assert_eq!(
-        event.message,
-        "primary dialog backend failed, trying fallback"
-    );
-    assert_eq!(
-        event.error,
-        "aifarm provider provider_unavailable: status 503"
-    );
-    assert_eq!(event.data["fallback_provider"], "genkit");
-    assert_eq!(event.data["fallback_reason"], "provider_unavailable");
-    Ok(())
-}
-
-#[tokio::test]
-async fn dialog_worker_persists_filtered_tool_call_history_before_answer()
--> Result<(), Box<dyn Error>> {
-    let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
-    let queue = InMemoryTaskQueue::new();
-    let job_id = queue.assign(
-        DIALOG_AIFARM_QUEUE_NAME,
-        new_dialog_job_at(dialog_params("нарисуй кота"), now),
-    );
-    let provider = ProviderStub::returning(DialogOutput {
-        provider: "stub".to_owned(),
-        answer: "готово".to_owned(),
-        tool_calls: vec![
-            ToolCall {
-                name: "draw_image".to_owned(),
-                r#ref: "req-1".to_owned(),
-                input: Some(serde_json::json!({"prompt":"cat"})),
-                output: Some(serde_json::json!({"status":"queued"})),
-                ..ToolCall::default()
-            },
-            ToolCall {
-                name: "chat_history_summary".to_owned(),
-                ..ToolCall::default()
-            },
-            ToolCall {
-                name: "final_response".to_owned(),
-                ..ToolCall::default()
-            },
-        ],
-        ..DialogOutput::default()
-    });
+    let provider = StepProviderStub::with_steps(vec![
+        Ok(step_tools(
+            "",
+            vec![(
+                "call-1",
+                openplotva_dialog::ToolStep {
+                    step: openplotva_dialog::STEP_WEB_SEARCH.to_owned(),
+                    query: "солнцестояние".to_owned(),
+                    ..openplotva_dialog::ToolStep::default()
+                },
+            )],
+        )),
+        Ok(step_text("21 июня")),
+    ]);
+    let toolbox: Arc<dyn openplotva_dialog::DialogToolbox> =
+        Arc::new(SessionToolboxStub::default());
+    let wiring = session_wiring(toolbox, None);
     let effects = EffectsStub::default();
     let history = ToolHistoryStub::default();
 
-    let report = process_dialog_job_once_in_queue_with_materializer_and_history_at(
+    let report = process_dialog_job_once_in_queue_with_materializer_and_history_at_with_session(
         &queue,
         DIALOG_AIFARM_QUEUE_NAME,
         &provider,
         &effects,
         &BasicDialogInputMaterializer,
         &history,
+        &wiring,
         now,
     )
     .await;
 
     assert_eq!(report.job_id, Some(job_id));
     assert!(report.persisted_tool_call_history);
-    assert_eq!(history.calls().len(), 1);
-    assert_eq!(history.calls()[0].0, 42);
-    assert_eq!(history.calls()[0].1, 100);
-    assert_eq!(history.calls()[0].2.len(), 1);
-    assert_eq!(history.calls()[0].2[0].name, "draw_image");
+    let calls = history.calls();
+    assert!(!calls.is_empty());
+    assert_eq!(calls[0].0, 42);
+    assert_eq!(calls[0].2[0].name, openplotva_dialog::STEP_WEB_SEARCH);
     assert!(report.sent_answer);
     assert!(report.completed);
     assert!(!report.failed);
@@ -324,25 +266,22 @@ async fn dialog_worker_completes_delegated_queued_song_without_sending_text()
     let queue = InMemoryTaskQueue::new();
     let job_id = queue.assign(
         DIALOG_AIFARM_QUEUE_NAME,
-        new_dialog_job_at(dialog_params("напиши песню"), now),
+        new_dialog_job_at(dialog_params("спой про кота"), now),
     );
-    let provider = ProviderStub::returning(DialogOutput {
-        provider: "stub".to_owned(),
-        tool_calls: vec![ToolCall {
-            name: "generate_song".to_owned(),
-            r#ref: "generate_song-1".to_owned(),
-            output: Some(serde_json::json!({
-                "status": "queued",
-                "side_effect": {
-                    "kind": "music_generation_job",
-                    "ticket_id": "9001",
-                    "state": "queued"
-                }
-            })),
-            ..ToolCall::default()
-        }],
-        ..DialogOutput::default()
-    });
+    let provider = StepProviderStub::with_steps(vec![Ok(step_tools(
+        "",
+        vec![(
+            "call-1",
+            openplotva_dialog::ToolStep {
+                step: openplotva_dialog::STEP_GENERATE_SONG.to_owned(),
+                topic: "песня про кота".to_owned(),
+                ..openplotva_dialog::ToolStep::default()
+            },
+        )],
+    ))]);
+    let toolbox: Arc<dyn openplotva_dialog::DialogToolbox> =
+        Arc::new(SessionToolboxStub::with_queued_song("9001"));
+    let wiring = session_wiring(toolbox, None);
     let effects = EffectsStub::default();
     let history = ToolHistoryStub::default();
     let outcomes = crate::dialog_turn::DialogTurnObserver::new(
@@ -367,7 +306,7 @@ async fn dialog_worker_completes_delegated_queued_song_without_sending_text()
             turn_outcomes: Some(&outcomes),
             terminal_signal: crate::dialog_turn::TurnSignalPolicy::default(),
             obligations: None,
-            session: None,
+            session: &wiring,
         },
     )
     .await;
@@ -380,26 +319,11 @@ async fn dialog_worker_completes_delegated_queued_song_without_sending_text()
     );
     assert!(report.completed);
     assert!(!report.failed);
-    assert!(effects.sent().is_empty(), "no confirmation text is sent");
+    assert!(effects.sent().is_empty());
     assert_eq!(record_status(&queue, job_id), JobStatus::Completed);
-    use openplotva_server::{RuntimeTurnOutcomeInspector, RuntimeTurnOutcomesFilter};
-    let recorded = outcomes
-        .buffer()
-        .turn_outcomes(RuntimeTurnOutcomesFilter {
-            limit: 10,
-            ..RuntimeTurnOutcomesFilter::default()
-        })
-        .expect("turn outcomes");
-    assert_eq!(recorded.len(), 1);
-    assert_eq!(
-        recorded[0].outcome,
-        crate::dialog_turn::TURN_OUTCOME_SIDE_EFFECT_DELEGATED
-    );
-    assert_eq!(
-        recorded[0].side_effect_ticket_id,
-        Some(9001),
-        "delegated turn records the generation ticket"
-    );
+    let rows = ledger_rows(&outcomes);
+    assert_eq!(rows[0].outcome, "side_effect_delegated");
+    assert_eq!(rows[0].side_effect_ticket_id, Some(9001));
     Ok(())
 }
 
@@ -409,26 +333,36 @@ async fn dialog_worker_keeps_tool_call_history_failures_nonfatal() -> Result<(),
     let queue = InMemoryTaskQueue::new();
     let job_id = queue.assign(
         DIALOG_AIFARM_QUEUE_NAME,
-        new_dialog_job_at(dialog_params("нарисуй кота"), now),
+        new_dialog_job_at(dialog_params("когда солнцестояние?"), now),
     );
-    let provider = ProviderStub::returning(DialogOutput {
-        answer: "готово".to_owned(),
-        tool_calls: vec![ToolCall {
-            name: "draw_image".to_owned(),
-            ..ToolCall::default()
-        }],
-        ..DialogOutput::default()
-    });
+    let provider = StepProviderStub::with_steps(vec![
+        Ok(step_tools(
+            "",
+            vec![(
+                "call-1",
+                openplotva_dialog::ToolStep {
+                    step: openplotva_dialog::STEP_WEB_SEARCH.to_owned(),
+                    query: "солнцестояние".to_owned(),
+                    ..openplotva_dialog::ToolStep::default()
+                },
+            )],
+        )),
+        Ok(step_text("21 июня")),
+    ]);
+    let toolbox: Arc<dyn openplotva_dialog::DialogToolbox> =
+        Arc::new(SessionToolboxStub::default());
+    let wiring = session_wiring(toolbox, None);
     let effects = EffectsStub::default();
     let history = ToolHistoryStub::failing();
 
-    let report = process_dialog_job_once_in_queue_with_materializer_and_history_at(
+    let report = process_dialog_job_once_in_queue_with_materializer_and_history_at_with_session(
         &queue,
         DIALOG_AIFARM_QUEUE_NAME,
         &provider,
         &effects,
         &BasicDialogInputMaterializer,
         &history,
+        &wiring,
         now,
     )
     .await;
@@ -518,7 +452,7 @@ async fn dialog_worker_regenerates_duplicate_answer_with_anti_loop_hint()
             now,
             routing_events: None,
             turn_outcomes: Some(&outcomes),
-            session: None,
+            session: leaked_session_wiring(),
         },
     )
     .await;
@@ -593,7 +527,7 @@ async fn dialog_worker_exhausts_regenerations_on_permanent_duplicate_and_signals
             now,
             routing_events: None,
             turn_outcomes: Some(&outcomes),
-            session: None,
+            session: leaked_session_wiring(),
         },
     )
     .await;
@@ -673,7 +607,7 @@ async fn dialog_worker_skips_regeneration_when_budget_nearly_exhausted()
             now,
             routing_events: None,
             turn_outcomes: Some(&outcomes),
-            session: None,
+            session: leaked_session_wiring(),
         },
     )
     .await;
@@ -735,7 +669,7 @@ async fn dialog_worker_signals_terminal_failure_with_configured_emoji() -> Resul
             now,
             routing_events: None,
             turn_outcomes: Some(&outcomes),
-            session: None,
+            session: leaked_session_wiring(),
         },
     )
     .await;
@@ -814,7 +748,7 @@ async fn dialog_worker_skips_signal_for_job_older_than_max_signal_age() -> Resul
             now,
             routing_events: None,
             turn_outcomes: Some(&outcomes),
-            session: None,
+            session: leaked_session_wiring(),
         },
     )
     .await;
@@ -873,7 +807,7 @@ async fn dialog_worker_still_reacts_but_gates_text_fallback_after_prior_signal()
             now,
             routing_events: None,
             turn_outcomes: None,
-            session: None,
+            session: leaked_session_wiring(),
         },
     )
     .await;
@@ -932,7 +866,7 @@ async fn dialog_worker_fails_when_answer_sanitizes_to_empty_after_attempts_exhau
             now,
             routing_events: None,
             turn_outcomes: Some(&outcomes),
-            session: None,
+            session: leaked_session_wiring(),
         },
     )
     .await;
@@ -1044,7 +978,7 @@ async fn dialog_worker_fails_expired_queue_backlog_job_without_provider_call()
             now,
             routing_events: None,
             turn_outcomes: Some(&outcomes),
-            session: None,
+            session: leaked_session_wiring(),
         },
     )
     .await;
@@ -1158,7 +1092,7 @@ async fn dialog_worker_fails_turn_budget_exhausted_before_provider_call()
             now,
             routing_events: None,
             turn_outcomes: Some(&outcomes),
-            session: None,
+            session: leaked_session_wiring(),
         },
     )
     .await;
@@ -1216,7 +1150,7 @@ async fn dialog_worker_retries_provider_empty_output_and_fails_on_exhaustion()
         now,
         routing_events: None,
         turn_outcomes: Some(&outcomes),
-        session: None,
+        session: leaked_session_wiring(),
     };
 
     let first = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
@@ -1230,7 +1164,7 @@ async fn dialog_worker_retries_provider_empty_output_and_fails_on_exhaustion()
     .await;
 
     assert!(first.retry_requeued);
-    assert!(first.answer_empty_all_sources);
+    assert!(first.empty_answer_error.is_some());
     assert!(!first.completed);
     assert!(!first.failed);
     assert_eq!(first.retry_attempt, Some(1));
@@ -1291,7 +1225,7 @@ async fn dialog_worker_requeues_undeliverable_answer_instead_of_failing_at_send(
         now,
         routing_events: None,
         turn_outcomes: Some(&outcomes),
-        session: None,
+        session: leaked_session_wiring(),
     };
 
     let first = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
@@ -1644,7 +1578,7 @@ async fn dialog_worker_exhausts_retryable_provider_error_at_default_limit()
             now,
             routing_events: Some(&reporter),
             turn_outcomes: None,
-            session: None,
+            session: leaked_session_wiring(),
         },
     )
     .await;
@@ -1721,7 +1655,7 @@ async fn dialog_worker_uses_configured_retry_attempt_limit() -> Result<(), Box<d
             now,
             routing_events: None,
             turn_outcomes: None,
-            session: None,
+            session: leaked_session_wiring(),
         },
     )
     .await;
@@ -1745,7 +1679,7 @@ async fn dialog_worker_uses_configured_retry_attempt_limit() -> Result<(), Box<d
             now,
             routing_events: None,
             turn_outcomes: None,
-            session: None,
+            session: leaked_session_wiring(),
         },
     )
     .await;
@@ -2162,17 +2096,43 @@ impl ProviderStub {
     }
 }
 
+/// Legacy canned outputs adapt to the step seam as one text-only final step.
+fn step_output_from_dialog(output: &DialogOutput) -> openplotva_dialog::ChatStepOutput {
+    openplotva_dialog::ChatStepOutput {
+        provider: output.provider.clone(),
+        text: dialog_job_answer(output),
+        ..openplotva_dialog::ChatStepOutput::default()
+    }
+}
+
 impl ChatProvider for ProviderStub {
     fn provider_name(&self) -> &str {
         "stub"
     }
 
-    fn run_dialog<'a>(&'a self, input: DialogInput) -> ChatProviderFuture<'a> {
+    fn as_chat_step(&self) -> Option<&dyn openplotva_llm::ChatStepProvider> {
+        Some(self)
+    }
+}
+
+impl openplotva_llm::ChatStepProvider for ProviderStub {
+    fn provider_name(&self) -> &str {
+        "stub"
+    }
+
+    fn supports_native_tools(&self) -> bool {
+        true
+    }
+
+    fn run_chat_step<'a>(
+        &'a self,
+        request: openplotva_dialog::ChatStepRequest,
+    ) -> openplotva_llm::ChatStepFuture<'a> {
         Box::pin(async move {
             let mut state = self.state.lock().expect("provider state");
-            state.inputs.push(input);
+            state.inputs.push(request.input);
             match &state.result {
-                Ok(output) => Ok(output.clone()),
+                Ok(output) => Ok(step_output_from_dialog(output)),
                 Err(error) => {
                     let error: Box<dyn Error + Send + Sync + 'static> =
                         Box::new(io::Error::other(error.to_string()));
@@ -2215,13 +2175,30 @@ impl ChatProvider for SequenceProviderStub {
         "stub"
     }
 
-    fn run_dialog<'a>(&'a self, input: DialogInput) -> ChatProviderFuture<'a> {
+    fn as_chat_step(&self) -> Option<&dyn openplotva_llm::ChatStepProvider> {
+        Some(self)
+    }
+}
+
+impl openplotva_llm::ChatStepProvider for SequenceProviderStub {
+    fn provider_name(&self) -> &str {
+        "stub"
+    }
+
+    fn supports_native_tools(&self) -> bool {
+        true
+    }
+
+    fn run_chat_step<'a>(
+        &'a self,
+        request: openplotva_dialog::ChatStepRequest,
+    ) -> openplotva_llm::ChatStepFuture<'a> {
         Box::pin(async move {
             let mut state = self.state.lock().expect("provider state");
             let round = state.inputs.len();
-            state.inputs.push(input);
+            state.inputs.push(request.input);
             let index = round.min(state.outputs.len() - 1);
-            Ok(state.outputs[index].clone())
+            Ok(step_output_from_dialog(&state.outputs[index]))
         })
     }
 }
@@ -2253,11 +2230,28 @@ impl ChatProvider for SlowProviderStub {
         "stub"
     }
 
-    fn run_dialog<'a>(&'a self, _input: DialogInput) -> ChatProviderFuture<'a> {
+    fn as_chat_step(&self) -> Option<&dyn openplotva_llm::ChatStepProvider> {
+        Some(self)
+    }
+}
+
+impl openplotva_llm::ChatStepProvider for SlowProviderStub {
+    fn provider_name(&self) -> &str {
+        "stub"
+    }
+
+    fn supports_native_tools(&self) -> bool {
+        true
+    }
+
+    fn run_chat_step<'a>(
+        &'a self,
+        _request: openplotva_dialog::ChatStepRequest,
+    ) -> openplotva_llm::ChatStepFuture<'a> {
         Box::pin(async move {
             *self.calls.lock().expect("slow provider calls") += 1;
             tokio::time::sleep(self.delay).await;
-            Ok(self.output.clone())
+            Ok(step_output_from_dialog(&self.output))
         })
     }
 }
@@ -2324,7 +2318,24 @@ impl ChatProvider for RetryableProviderStub {
         self.provider
     }
 
-    fn run_dialog<'a>(&'a self, _input: DialogInput) -> ChatProviderFuture<'a> {
+    fn as_chat_step(&self) -> Option<&dyn openplotva_llm::ChatStepProvider> {
+        Some(self)
+    }
+}
+
+impl openplotva_llm::ChatStepProvider for RetryableProviderStub {
+    fn provider_name(&self) -> &str {
+        self.provider
+    }
+
+    fn supports_native_tools(&self) -> bool {
+        true
+    }
+
+    fn run_chat_step<'a>(
+        &'a self,
+        _request: openplotva_dialog::ChatStepRequest,
+    ) -> openplotva_llm::ChatStepFuture<'a> {
         Box::pin(async move {
             let error: Box<dyn Error + Send + Sync + 'static> =
                 Box::new(ProviderError::new(self.provider, self.reason, self.message));
@@ -2626,7 +2637,7 @@ fn record_status(queue: &InMemoryTaskQueue, job_id: i64) -> JobStatus {
         .status
 }
 
-// ---- Dialog session engine (DIALOG_AGENT_LOOP_ENABLED) ----
+// ---- Dialog session engine ----
 
 type StepHook = Box<dyn FnMut(usize) + Send>;
 
@@ -2695,10 +2706,6 @@ impl ChatProvider for StepProviderStub {
         "step-stub"
     }
 
-    fn run_dialog<'a>(&'a self, _input: DialogInput) -> ChatProviderFuture<'a> {
-        Box::pin(async move { panic!("session tests must go through the step seam") })
-    }
-
     fn as_chat_step(&self) -> Option<&dyn openplotva_llm::ChatStepProvider> {
         Some(self)
     }
@@ -2746,6 +2753,7 @@ struct SessionToolboxStub {
     web_search_queries: Mutex<Vec<String>>,
     draw_requests: Mutex<Vec<openplotva_dialog::DrawRequest>>,
     draw_result: Mutex<Option<openplotva_dialog::ToolResult>>,
+    song_result: Mutex<Option<openplotva_dialog::ToolResult>>,
 }
 
 impl SessionToolboxStub {
@@ -2757,6 +2765,21 @@ impl SessionToolboxStub {
                 kind: openplotva_dialog::turn::SIDE_EFFECT_KIND_IMAGE.to_owned(),
                 ticket_id: ticket.to_owned(),
                 eta: "~1 min".to_owned(),
+                state: "queued".to_owned(),
+            }),
+            ..openplotva_dialog::ToolResult::default()
+        });
+        stub
+    }
+
+    fn with_queued_song(ticket: &str) -> Self {
+        let stub = Self::default();
+        *stub.song_result.lock().expect("song result") = Some(openplotva_dialog::ToolResult {
+            status: "queued".to_owned(),
+            side_effect: Some(openplotva_dialog::ToolSideEffect {
+                kind: openplotva_dialog::turn::SIDE_EFFECT_KIND_MUSIC.to_owned(),
+                ticket_id: ticket.to_owned(),
+                eta: "~3 min".to_owned(),
                 state: "queued".to_owned(),
             }),
             ..openplotva_dialog::ToolResult::default()
@@ -2790,6 +2813,19 @@ impl openplotva_dialog::DialogToolbox for SessionToolboxStub {
             .unwrap_or_else(|| openplotva_dialog::ToolResult::failed("draw_down", "no drawing"));
         Box::pin(async move { Ok(result) })
     }
+
+    fn generate_song<'a>(
+        &'a self,
+        _req: openplotva_dialog::SongRequest,
+    ) -> openplotva_dialog::ToolboxFuture<'a> {
+        let result = self
+            .song_result
+            .lock()
+            .expect("song result")
+            .clone()
+            .unwrap_or_else(|| openplotva_dialog::ToolResult::failed("song_down", "no singing"));
+        Box::pin(async move { Ok(result) })
+    }
 }
 
 #[derive(Default)]
@@ -2819,8 +2855,7 @@ fn session_wiring(
     crate::dialog_turn::SessionWorkerWiring {
         toolbox,
         reactor,
-        registry: None,
-        enabled_chats: Vec::new(),
+        registry: std::sync::Arc::new(crate::dialog_turn::DialogSessionRegistry::new()),
         max_iterations: 8,
         max_messages: 4,
         tool_extension_secs: 60,
@@ -2828,6 +2863,136 @@ fn session_wiring(
         max_draws: 1,
         max_songs: 1,
     }
+}
+
+/// Test-only default wiring: leaked so inline `DialogJobProcessOptions`
+/// literals can borrow it for 'static.
+fn leaked_session_wiring() -> &'static crate::dialog_turn::SessionWorkerWiring {
+    Box::leak(Box::new(session_wiring(
+        Arc::new(SessionToolboxStub::default()),
+        None,
+    )))
+}
+
+async fn process_dialog_job_once_in_queue_at<Queue, Provider, Effects>(
+    queue: &Queue,
+    queue_name: &'static str,
+    provider: &Provider,
+    effects: &Effects,
+    now: OffsetDateTime,
+) -> DialogJobWorkerReport
+where
+    Queue: DialogJobWorkerQueue + Sync + ?Sized,
+    Provider: ChatProvider + Sync + ?Sized,
+    Effects: DialogJobEffects + Sync + ?Sized,
+{
+    process_dialog_job_once_in_queue_with_materializer_and_history_at(
+        queue,
+        queue_name,
+        provider,
+        effects,
+        &BasicDialogInputMaterializer,
+        &NoopDialogToolCallHistoryStore,
+        now,
+    )
+    .await
+}
+
+async fn process_dialog_job_once_at<Queue, Provider, Effects>(
+    queue: &Queue,
+    provider: &Provider,
+    effects: &Effects,
+    now: OffsetDateTime,
+) -> DialogJobWorkerReport
+where
+    Queue: DialogJobWorkerQueue + Sync + ?Sized,
+    Provider: ChatProvider + Sync + ?Sized,
+    Effects: DialogJobEffects + Sync + ?Sized,
+{
+    process_dialog_job_once_in_queue_at(queue, DIALOG_AIFARM_QUEUE_NAME, provider, effects, now)
+        .await
+}
+
+async fn process_dialog_job_once_in_queue_with_materializer_and_history_at<
+    Queue,
+    Provider,
+    Effects,
+    Materializer,
+    ToolHistory,
+>(
+    queue: &Queue,
+    queue_name: &'static str,
+    provider: &Provider,
+    effects: &Effects,
+    materializer: &Materializer,
+    tool_history: &ToolHistory,
+    now: OffsetDateTime,
+) -> DialogJobWorkerReport
+where
+    Queue: DialogJobWorkerQueue + Sync + ?Sized,
+    Provider: ChatProvider + Sync + ?Sized,
+    Effects: DialogJobEffects + Sync + ?Sized,
+    Materializer: DialogInputMaterializer + Sync + ?Sized,
+    ToolHistory: DialogToolCallHistoryStore + Sync + ?Sized,
+{
+    process_dialog_job_once_in_queue_with_materializer_and_history_at_with_session(
+        queue,
+        queue_name,
+        provider,
+        effects,
+        materializer,
+        tool_history,
+        leaked_session_wiring(),
+        now,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_dialog_job_once_in_queue_with_materializer_and_history_at_with_session<
+    Queue,
+    Provider,
+    Effects,
+    Materializer,
+    ToolHistory,
+>(
+    queue: &Queue,
+    queue_name: &'static str,
+    provider: &Provider,
+    effects: &Effects,
+    materializer: &Materializer,
+    tool_history: &ToolHistory,
+    session: &crate::dialog_turn::SessionWorkerWiring,
+    now: OffsetDateTime,
+) -> DialogJobWorkerReport
+where
+    Queue: DialogJobWorkerQueue + Sync + ?Sized,
+    Provider: ChatProvider + Sync + ?Sized,
+    Effects: DialogJobEffects + Sync + ?Sized,
+    Materializer: DialogInputMaterializer + Sync + ?Sized,
+    ToolHistory: DialogToolCallHistoryStore + Sync + ?Sized,
+{
+    process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+        queue,
+        provider,
+        effects,
+        materializer,
+        tool_history,
+        DialogJobProcessOptions {
+            queue_name,
+            max_llm_job_attempts: DEFAULT_LLM_JOB_MAX_ATTEMPTS,
+            turn_budget_secs: DEFAULT_DIALOG_TURN_BUDGET_SECS,
+            turn_max_queue_age_secs: DEFAULT_DIALOG_TURN_MAX_QUEUE_AGE_SECS,
+            max_regenerations: DEFAULT_DIALOG_TURN_MAX_REGENERATIONS,
+            terminal_signal: crate::dialog_turn::TurnSignalPolicy::default(),
+            obligations: None,
+            now,
+            routing_events: None,
+            turn_outcomes: None,
+            session,
+        },
+    )
+    .await
 }
 
 fn session_options<'a>(
@@ -2846,7 +3011,7 @@ fn session_options<'a>(
         now,
         routing_events: None,
         turn_outcomes: Some(outcomes),
-        session: Some(wiring),
+        session: wiring,
     }
 }
 
@@ -2980,7 +3145,7 @@ async fn worker_loop_forwards_session_wiring_to_turns() -> Result<(), Box<dyn Er
             max_regenerations: DEFAULT_DIALOG_TURN_MAX_REGENERATIONS,
             terminal_signal: crate::dialog_turn::TurnSignalPolicy::default(),
             obligations: None,
-            session: Some(&wiring),
+            session: &wiring,
         },
         stop,
     )
@@ -3415,7 +3580,7 @@ fn wiring_with_registry(
     let toolbox: Arc<dyn openplotva_dialog::DialogToolbox> =
         Arc::new(SessionToolboxStub::default());
     crate::dialog_turn::SessionWorkerWiring {
-        registry: Some(registry),
+        registry,
         ..session_wiring(toolbox, None)
     }
 }

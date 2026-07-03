@@ -170,7 +170,6 @@ query {
       completedAt
       errorMessage
       progressMessageID
-      queuePositionMessageID
       resultMessageID
     }
   }
@@ -192,7 +191,6 @@ query {
       completedAt
       errorMessage
       progressMessageID
-      queuePositionMessageID
       resultMessageID
     }
     messages { messageType status messageID createdAt }

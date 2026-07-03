@@ -69,7 +69,6 @@ const DRAW_FAILED_NOTICE_TEXT: &str =
 /// Reuse the queue placeholder as the draw target when at most this many chat messages have
 /// arrived since it was posted; otherwise delete it and send a fresh message so the result
 /// is not buried.
-const DRAW_PLACEHOLDER_REUSE_MAX_MESSAGES: i64 = 10;
 pub const IMAGE_JOB_POLL_INTERVAL: StdDuration = StdDuration::from_secs(1);
 pub const IMAGE_JOB_WORKER_QUEUES: [&str; 2] = [IMAGE_VIP_QUEUE_NAME, IMAGE_REGULAR_QUEUE_NAME];
 pub const IMAGE_VIP_JOB_WORKER_QUEUES: [&str; 1] = [IMAGE_VIP_QUEUE_NAME];
@@ -1890,57 +1889,7 @@ impl ImageJobTelegramSender for openplotva_telegram::TelegramClient {
     }
 }
 
-/// Counts how many chat messages arrived after a given message id, to decide whether a draw
-/// placeholder is still near the bottom of the chat.
-pub trait ChatMessageCounter: Send + Sync + std::fmt::Debug {
-    /// Number of chat messages with an id greater than `message_id`, or `None` if unknown.
-    fn count_chat_messages_after<'a>(
-        &'a self,
-        chat_id: i64,
-        message_id: i64,
-    ) -> ImageJobEffectFuture<'a, Option<i64>>;
-}
-
-impl ChatMessageCounter for openplotva_storage::PostgresHistoryStore {
-    fn count_chat_messages_after<'a>(
-        &'a self,
-        chat_id: i64,
-        message_id: i64,
-    ) -> ImageJobEffectFuture<'a, Option<i64>> {
-        Box::pin(async move {
-            // Probe one past the threshold so we only learn "<= max" vs "more".
-            self.count_chat_messages_after(
-                chat_id,
-                message_id,
-                DRAW_PLACEHOLDER_REUSE_MAX_MESSAGES + 1,
-            )
-            .await
-            .ok()
-        })
-    }
-}
-
-/// How the draw lifecycle talks to the chat before the first image exists
-/// (`DIALOG_DRAW_UX`).
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum DrawUxMode {
-    /// Legacy ⏳ placeholder message posted at queue time and reused/edited
-    /// from generation start. Trait default so existing test doubles keep
-    /// exercising the historical flow; production wires the config value.
-    #[default]
-    Placeholder,
-    /// Lifecycle reactions on the trigger message (👀 queued → ✍ drawing →
-    /// cleared on delivery); the draw message is created lazily with the
-    /// first published image or the final gallery.
-    Reactions,
-}
-
 pub trait ImageJobEffects {
-    /// Draw-UX mode this effects implementation delivers.
-    fn draw_ux(&self) -> DrawUxMode {
-        DrawUxMode::Placeholder
-    }
-
     /// Best-effort: mark the trigger message with the "drawing" reaction.
     fn signal_draw_progress<'a>(
         &'a self,
@@ -1969,19 +1918,6 @@ pub trait ImageJobEffects {
 
     /// Best-effort delete of a message (used to clear the queue-position message).
     fn delete_message<'a>(&'a self, chat_id: i64, message_id: i32) -> ImageJobEffectFuture<'a, ()>;
-
-    /// Count chat messages newer than `message_id` (the placeholder), or `None` if unknown.
-    /// Used to choose between reusing the queue placeholder and posting a fresh message.
-    fn chat_messages_after<'a>(
-        &'a self,
-        _chat_id: i64,
-        _message_id: i32,
-    ) -> ImageJobEffectFuture<'a, Option<i64>>
-    where
-        Self: Sync,
-    {
-        Box::pin(async { None })
-    }
 
     /// Send the initial rich draw placeholder; returns its Telegram message id.
     fn send_draw_placeholder<'a>(
@@ -2013,8 +1949,6 @@ pub trait ImageJobEffects {
 pub struct TelegramImageJobEffects<Sender> {
     telegram: Sender,
     rich: Arc<dyn crate::rich::RichSender>,
-    chat_counter: Option<Arc<dyn ChatMessageCounter>>,
-    draw_ux: DrawUxMode,
     reactions: Option<crate::reactions::GenerationReactions>,
 }
 
@@ -2025,23 +1959,13 @@ impl<Sender> TelegramImageJobEffects<Sender> {
         Self {
             telegram,
             rich,
-            chat_counter: None,
-            draw_ux: DrawUxMode::Placeholder,
             reactions: None,
         }
     }
 
-    /// Provide the chat-activity counter used to decide whether to reuse the queue placeholder.
-    #[must_use]
-    pub fn with_chat_counter(mut self, chat_counter: Arc<dyn ChatMessageCounter>) -> Self {
-        self.chat_counter = Some(chat_counter);
-        self
-    }
-
-    /// Switch to the reaction-based lifecycle (`DIALOG_DRAW_UX=reactions`).
+    /// Attach the reaction-based lifecycle signaler.
     #[must_use]
     pub fn with_reaction_ux(mut self, reactions: crate::reactions::GenerationReactions) -> Self {
-        self.draw_ux = DrawUxMode::Reactions;
         self.reactions = Some(reactions);
         self
     }
@@ -2051,10 +1975,6 @@ impl<Sender> ImageJobEffects for TelegramImageJobEffects<Sender>
 where
     Sender: ImageJobTelegramSender + Send + Sync,
 {
-    fn draw_ux(&self) -> DrawUxMode {
-        self.draw_ux
-    }
-
     fn signal_draw_progress<'a>(
         &'a self,
         chat_id: i64,
@@ -2086,19 +2006,6 @@ where
                     })
                     .await;
             }
-        })
-    }
-
-    fn chat_messages_after<'a>(
-        &'a self,
-        chat_id: i64,
-        message_id: i32,
-    ) -> ImageJobEffectFuture<'a, Option<i64>> {
-        Box::pin(async move {
-            let counter = self.chat_counter.as_ref()?;
-            counter
-                .count_chat_messages_after(chat_id, i64::from(message_id))
-                .await
         })
     }
 
@@ -2262,21 +2169,6 @@ pub struct ImageEditJobExecutionReport {
     pub result_message_id: Option<i32>,
     /// Failure text when the job should fail.
     pub error: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct DrawPlaceholderTarget {
-    reuse_message_id: Option<i32>,
-    delete_after_fresh_send_message_id: Option<i32>,
-}
-
-impl DrawPlaceholderTarget {
-    fn reuse(message_id: Option<i32>) -> Self {
-        Self {
-            reuse_message_id: message_id.filter(|id| *id > 0),
-            delete_after_fresh_send_message_id: None,
-        }
-    }
 }
 
 /// Result from one queue poll.
@@ -2471,26 +2363,6 @@ pub async fn execute_image_gen_job<Generator, Effects>(
     generator: &Generator,
     effects: &Effects,
     params: ImageGenJobParams,
-    reuse_message_id: Option<i32>,
-) -> ImageGenJobExecutionReport
-where
-    Generator: ImageGenerator + Sync,
-    Effects: ImageJobEffects + Sync,
-{
-    execute_image_gen_job_with_placeholder_target(
-        generator,
-        effects,
-        params,
-        DrawPlaceholderTarget::reuse(reuse_message_id),
-    )
-    .await
-}
-
-async fn execute_image_gen_job_with_placeholder_target<Generator, Effects>(
-    generator: &Generator,
-    effects: &Effects,
-    params: ImageGenJobParams,
-    placeholder_target: DrawPlaceholderTarget,
 ) -> ImageGenJobExecutionReport
 where
     Generator: ImageGenerator + Sync,
@@ -2509,52 +2381,13 @@ where
         params.is_nsfw,
     );
 
-    // Placeholder UX: reuse the queue placeholder in place when allowed,
-    // otherwise post a fresh message. Reaction UX: no message yet — mark the
-    // trigger with the "drawing" reaction; the draw message appears with the
-    // first published image (or the final gallery).
-    let draw_message_id: Option<i32> = match effects.draw_ux() {
-        DrawUxMode::Reactions => {
-            effects
-                .signal_draw_progress(params.chat_id, params.message_id)
-                .await;
-            None
-        }
-        DrawUxMode::Placeholder => match placeholder_target.reuse_message_id {
-            Some(reused) => {
-                let _ = effects
-                    .edit_draw_message(params.chat_id, reused, crate::rich::compose_draw_started())
-                    .await;
-                Some(reused)
-            }
-            None => match effects
-                .send_draw_placeholder(
-                    params.chat_id,
-                    params.message_id,
-                    params.thread_id,
-                    crate::rich::compose_draw_started(),
-                )
-                .await
-            {
-                Ok(draw_message_id) => Some(draw_message_id),
-                Err(error) => {
-                    return ImageGenJobExecutionReport {
-                        outcome: ImageGenJobExecutionOutcome::Failed,
-                        prompt,
-                        caption_text,
-                        image_url: None,
-                        image_urls: Vec::new(),
-                        result_message_id: None,
-                        error: Some(format!("send draw placeholder: {error}")),
-                    };
-                }
-            },
-        },
-    };
-    if let Some(stale) = placeholder_target.delete_after_fresh_send_message_id {
-        effects.delete_message(params.chat_id, stale).await;
-    }
-
+    // No message yet — mark the trigger with the "drawing" reaction; the
+    // draw message appears with the first published image (or the final
+    // gallery).
+    effects
+        .signal_draw_progress(params.chat_id, params.message_id)
+        .await;
+    let draw_message_id: Option<i32> = None;
     let request = ImageGenerationRequest {
         chat_id: params.chat_id,
         message_id: params.message_id,
@@ -2669,9 +2502,7 @@ where
             .await
             {
                 Ok(final_message_id) => {
-                    if effects.draw_ux() == DrawUxMode::Reactions {
-                        effects.clear_draw_signal(chat_id, params.message_id).await;
-                    }
+                    effects.clear_draw_signal(chat_id, params.message_id).await;
                     ImageGenJobExecutionReport {
                         outcome: ImageGenJobExecutionOutcome::Completed,
                         prompt,
@@ -2846,32 +2677,6 @@ where
     .await
 }
 
-/// Decide whether the queue placeholder becomes the draw target. If the chat moved on too far,
-/// send a fresh draw message first, then delete the stale waiting message.
-async fn draw_placeholder_reuse_target<Effects>(
-    effects: &Effects,
-    chat_id: i64,
-    queue_position_message_id: Option<i32>,
-) -> DrawPlaceholderTarget
-where
-    Effects: ImageJobEffects + Sync,
-{
-    let Some(placeholder) = queue_position_message_id.filter(|id| *id > 0) else {
-        return DrawPlaceholderTarget::default();
-    };
-    let quiet = effects
-        .chat_messages_after(chat_id, placeholder)
-        .await
-        .is_none_or(|count| count <= DRAW_PLACEHOLDER_REUSE_MAX_MESSAGES);
-    if quiet {
-        return DrawPlaceholderTarget::reuse(Some(placeholder));
-    }
-    DrawPlaceholderTarget {
-        reuse_message_id: None,
-        delete_after_fresh_send_message_id: Some(placeholder),
-    }
-}
-
 #[must_use]
 pub fn sanitize_image_edit_job_params(mut params: ImageEditJobParams) -> ImageEditJobParams {
     params.prompt = sanitize_tool_text(&params.prompt);
@@ -2882,26 +2687,6 @@ pub async fn execute_image_edit_job<Editor, Effects>(
     editor: &Editor,
     effects: &Effects,
     params: ImageEditJobParams,
-    reuse_message_id: Option<i32>,
-) -> ImageEditJobExecutionReport
-where
-    Editor: ImageEditor + Sync,
-    Effects: ImageJobEffects + Sync,
-{
-    execute_image_edit_job_with_placeholder_target(
-        editor,
-        effects,
-        params,
-        DrawPlaceholderTarget::reuse(reuse_message_id),
-    )
-    .await
-}
-
-async fn execute_image_edit_job_with_placeholder_target<Editor, Effects>(
-    editor: &Editor,
-    effects: &Effects,
-    params: ImageEditJobParams,
-    placeholder_target: DrawPlaceholderTarget,
 ) -> ImageEditJobExecutionReport
 where
     Editor: ImageEditor + Sync,
@@ -2914,46 +2699,10 @@ where
     // Placeholder UX: reuse the queue placeholder in place when allowed,
     // otherwise post a fresh message. Reaction UX: no message until the
     // edited gallery is ready; the trigger gets the "drawing" reaction.
-    let draw_message_id: Option<i32> = match effects.draw_ux() {
-        DrawUxMode::Reactions => {
-            effects
-                .signal_draw_progress(params.chat_id, params.message_id)
-                .await;
-            None
-        }
-        DrawUxMode::Placeholder => match placeholder_target.reuse_message_id {
-            Some(reused) => {
-                let _ = effects
-                    .edit_draw_message(params.chat_id, reused, crate::rich::compose_draw_started())
-                    .await;
-                Some(reused)
-            }
-            None => match effects
-                .send_draw_placeholder(
-                    params.chat_id,
-                    params.message_id,
-                    params.thread_id,
-                    crate::rich::compose_draw_started(),
-                )
-                .await
-            {
-                Ok(draw_message_id) => Some(draw_message_id),
-                Err(error) => {
-                    return ImageEditJobExecutionReport {
-                        outcome: ImageEditJobExecutionOutcome::Failed,
-                        prompt: params.prompt,
-                        image_urls: Vec::new(),
-                        result_message_id: None,
-                        error: Some(format!("send draw placeholder: {error}")),
-                    };
-                }
-            },
-        },
-    };
-    if let Some(stale) = placeholder_target.delete_after_fresh_send_message_id {
-        effects.delete_message(params.chat_id, stale).await;
-    }
-
+    effects
+        .signal_draw_progress(params.chat_id, params.message_id)
+        .await;
+    let draw_message_id: Option<i32> = None;
     let request = ImageEditRequest {
         chat_id: params.chat_id,
         message_id: params.message_id,
@@ -3014,11 +2763,9 @@ where
             .await
             {
                 Ok(final_message_id) => {
-                    if effects.draw_ux() == DrawUxMode::Reactions {
-                        effects
-                            .clear_draw_signal(params.chat_id, params.message_id)
-                            .await;
-                    }
+                    effects
+                        .clear_draw_signal(params.chat_id, params.message_id)
+                        .await;
                     ImageEditJobExecutionReport {
                         outcome: ImageEditJobExecutionOutcome::Completed,
                         prompt: params.prompt,
@@ -3160,12 +2907,7 @@ where
     };
 
     let _ = queue.set_execution_started(work.id, now);
-    let queue_position_message_id = queue.job_queue_position_message_id(work.id);
-    let reuse_target =
-        draw_placeholder_reuse_target(effects, params.chat_id, queue_position_message_id).await;
-    let execution =
-        execute_image_gen_job_with_placeholder_target(generator, effects, params, reuse_target)
-            .await;
+    let execution = execute_image_gen_job(generator, effects, params).await;
     match execution.outcome {
         ImageGenJobExecutionOutcome::Completed => {
             if !execution.image_urls.is_empty() {
@@ -3388,11 +3130,7 @@ where
     };
 
     let _ = queue.set_execution_started(work.id, now);
-    let queue_position_message_id = queue.job_queue_position_message_id(work.id);
-    let reuse_target =
-        draw_placeholder_reuse_target(effects, params.chat_id, queue_position_message_id).await;
-    let execution =
-        execute_image_edit_job_with_placeholder_target(editor, effects, params, reuse_target).await;
+    let execution = execute_image_edit_job(editor, effects, params).await;
     match execution.outcome {
         ImageEditJobExecutionOutcome::Completed => {
             if !execution.image_urls.is_empty() {
@@ -4562,7 +4300,6 @@ mod tests {
                 thread_id: Some(9),
                 ..ImageGenJobParams::default()
             },
-            None,
         )
         .await;
 
@@ -4589,15 +4326,13 @@ mod tests {
             }]
         );
         let calls = effects.calls();
-        assert_eq!(calls.len(), 3);
-        assert_eq!(
-            calls[0],
-            "placeholder:-100:20:9:<tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji>"
-        );
+        assert_eq!(calls.len(), 4);
+        assert_eq!(calls[0], "react-progress:-100:20");
         assert_eq!(calls[1], "publish:[Url(\"https://img.test/1.png\")]");
-        assert!(calls[2].starts_with("edit:-100:888:"));
+        assert!(calls[2].starts_with("placeholder:-100:20:9:"));
         assert!(calls[2].contains("<img src=\"https://img.test/1.png\"/>"));
         assert!(calls[2].contains("original caption"));
+        assert_eq!(calls[3], "react-clear:-100:20");
     }
 
     #[tokio::test]
@@ -4617,7 +4352,6 @@ mod tests {
                 thread_id: Some(9),
                 ..ImageGenJobParams::default()
             },
-            None,
         )
         .await;
 
@@ -4660,7 +4394,6 @@ mod tests {
                 original_text: "neon castle".to_owned(),
                 ..ImageGenJobParams::default()
             },
-            None,
         )
         .await;
 
@@ -4697,7 +4430,6 @@ mod tests {
                 original_text: "neon castle".to_owned(),
                 ..ImageGenJobParams::default()
             },
-            None,
         )
         .await;
 
@@ -4725,7 +4457,6 @@ mod tests {
                 original_text: "neon castle".to_owned(),
                 ..ImageGenJobParams::default()
             },
-            None,
         )
         .await;
 
@@ -4765,28 +4496,25 @@ mod tests {
                 thread_id: Some(9),
                 ..ImageGenJobParams::default()
             },
-            None,
         )
         .await;
 
         assert_eq!(report.outcome, ImageGenJobExecutionOutcome::Completed);
         assert_eq!(report.result_message_id, Some(888));
         let calls = effects.calls();
-        assert_eq!(calls.len(), 3);
-        assert_eq!(
-            calls[0],
-            "placeholder:-100:20:9:<tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji>"
-        );
+        assert_eq!(calls.len(), 4);
+        assert_eq!(calls[0], "react-progress:-100:20");
         assert_eq!(
             calls[1],
             "publish:[Url(\"https://img.test/1.png\"), Url(\"https://img.test/2.png\")]"
         );
         // A batch generator returns both images in one emission → no progress flicker, the
         // post goes straight to the final captioned gallery.
-        assert!(calls[2].starts_with("edit:-100:888:<tg-collage>"));
+        assert!(calls[2].starts_with("placeholder:-100:20:9:<tg-collage>"));
         assert!(calls[2].contains("<img src=\"https://img.test/1.png\"/>"));
         assert!(calls[2].contains("<img src=\"https://img.test/2.png\"/>"));
         assert!(calls[2].contains("original caption"));
+        assert_eq!(calls[3], "react-clear:-100:20");
     }
 
     #[test]
@@ -4828,20 +4556,17 @@ mod tests {
                 thread_id: Some(9),
                 ..ImageGenJobParams::default()
             },
-            None,
         )
         .await;
 
         assert_eq!(report.outcome, ImageGenJobExecutionOutcome::Completed);
         assert_eq!(report.result_message_id, Some(888));
         let calls = effects.calls();
-        assert_eq!(calls.len(), 5);
-        assert_eq!(
-            calls[0],
-            "placeholder:-100:20:9:<tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji>"
-        );
+        assert_eq!(calls.len(), 6);
+        assert_eq!(calls[0], "react-progress:-100:20");
         assert_eq!(calls[1], "publish:[Url(\"https://img.test/vip-1.png\")]");
-        // First image: progress line "1 из 2" + the full caption (prompt) already present.
+        // First image: fresh progress message "1 из 2" + the full caption already present.
+        assert!(calls[2].starts_with("placeholder:-100:20:9:"));
         assert!(
             calls[2].contains("<tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji> 1 из 2")
         );
@@ -4853,6 +4578,7 @@ mod tests {
         assert!(calls[4].contains("<img src=\"https://img.test/vip-1.png\"/>"));
         assert!(calls[4].contains("<img src=\"https://img.test/vip-2.png\"/>"));
         assert!(calls[4].contains("castle"));
+        assert_eq!(calls[5], "react-clear:-100:20");
     }
 
     #[tokio::test]
@@ -4876,15 +4602,16 @@ mod tests {
                 thread_id: Some(9),
                 ..ImageGenJobParams::default()
             },
-            None,
         )
         .await;
 
         assert_eq!(report.outcome, ImageGenJobExecutionOutcome::Completed);
         let calls = effects.calls();
-        assert_eq!(calls.len(), 5);
+        assert_eq!(calls.len(), 6);
+        assert_eq!(calls[0], "react-progress:-100:20");
         assert_eq!(calls[1], "publish:[Url(\"https://img.test/s1.png\")]");
-        // First slot lands → progress redraw "1 из 2" with the image so far.
+        // First slot lands → fresh progress message "1 из 2" with the image so far.
+        assert!(calls[2].starts_with("placeholder:-100:20:9:"));
         assert!(
             calls[2].contains("<tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji> 1 из 2")
         );
@@ -4894,6 +4621,7 @@ mod tests {
         assert!(calls[4].starts_with("edit:-100:888:<tg-collage>"));
         assert!(calls[4].contains("<img src=\"https://img.test/s1.png\"/>"));
         assert!(calls[4].contains("<img src=\"https://img.test/s2.png\"/>"));
+        assert_eq!(calls[5], "react-clear:-100:20");
     }
 
     #[tokio::test]
@@ -4913,7 +4641,6 @@ mod tests {
                 }),
                 ..ImageGenJobParams::default()
             },
-            None,
         )
         .await;
 
@@ -4923,11 +4650,8 @@ mod tests {
         assert_eq!(report.error, None);
         let calls = effects.calls();
         assert_eq!(calls.len(), 2);
-        assert_eq!(
-            calls[0],
-            "placeholder:-100:20:0:<tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji>"
-        );
-        assert!(calls[1].starts_with("edit:-100:888:"));
+        assert_eq!(calls[0], "react-progress:-100:20");
+        assert!(calls[1].starts_with("placeholder:-100:20:"));
         assert!(calls[1].contains(NSFW_BLOCKED_MESSAGE_TEXT));
     }
 
@@ -4952,7 +4676,6 @@ mod tests {
                 photo_urls: vec!["https://telegram.test/original.png".to_owned()],
                 thread_id: Some(9),
             },
-            None,
         )
         .await;
 
@@ -4980,19 +4703,17 @@ mod tests {
             }]
         );
         let calls = effects.calls();
-        assert_eq!(calls.len(), 3);
-        assert_eq!(
-            calls[0],
-            "placeholder:-100:20:9:<tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji>"
-        );
+        assert_eq!(calls.len(), 4);
+        assert_eq!(calls[0], "react-progress:-100:20");
         assert_eq!(
             calls[1],
             "publish:[Url(\"https://img.test/edit-1.png\"), Url(\"https://img.test/edit-2.png\")]"
         );
-        assert!(calls[2].starts_with("edit:-100:888:<tg-collage>"));
+        assert!(calls[2].starts_with("placeholder:-100:20:9:<tg-collage>"));
         assert!(calls[2].contains("<img src=\"https://img.test/edit-1.png\"/>"));
         assert!(calls[2].contains("<img src=\"https://img.test/edit-2.png\"/>"));
         assert!(calls[2].contains("make it night"));
+        assert_eq!(calls[3], "react-clear:-100:20");
     }
 
     #[tokio::test]
@@ -5013,7 +4734,6 @@ mod tests {
                 photo_urls: vec!["https://telegram.test/original.png".to_owned()],
                 thread_id: Some(9),
             },
-            None,
         )
         .await;
 
@@ -5044,7 +4764,6 @@ mod tests {
                 prompt: " edit ".to_owned(),
                 ..ImageEditJobParams::default()
             },
-            None,
         )
         .await;
 
@@ -5054,11 +4773,8 @@ mod tests {
         assert_eq!(report.error, None);
         let calls = effects.calls();
         assert_eq!(calls.len(), 2);
-        assert_eq!(
-            calls[0],
-            "placeholder:-100:20:0:<tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji>"
-        );
-        assert!(calls[1].starts_with("edit:-100:888:"));
+        assert_eq!(calls[0], "react-progress:-100:20");
+        assert!(calls[1].starts_with("placeholder:-100:20:"));
         assert!(calls[1].contains(NSFW_BLOCKED_MESSAGE_TEXT));
     }
 
@@ -5078,21 +4794,17 @@ mod tests {
                 thread_id: Some(9),
                 ..ImageEditJobParams::default()
             },
-            None,
         )
         .await;
 
         assert_eq!(report.outcome, ImageEditJobExecutionOutcome::Failed);
         assert_eq!(report.prompt, "make it night");
         assert_eq!(report.error, Some("draw api failed".to_owned()));
+        // The failure notice is the obligations watcher's job; the lifecycle
+        // reaction stays on the trigger for the watcher to overwrite.
         let calls = effects.calls();
-        assert_eq!(calls.len(), 2);
-        assert_eq!(
-            calls[0],
-            "placeholder:-100:20:9:<tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji>"
-        );
-        assert!(calls[1].starts_with("edit:-100:888:"));
-        assert!(calls[1].contains(DRAW_FAILED_NOTICE_TEXT));
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0], "react-progress:-100:20");
     }
 
     #[tokio::test]
@@ -5784,91 +5496,6 @@ mod tests {
                 .image_urls,
             vec!["https://img.test/1.png"]
         );
-    }
-
-    fn draw_reuse_test_job(queue: &InMemoryTaskQueue, now: OffsetDateTime) -> i64 {
-        let job = queue.assign(
-            IMAGE_REGULAR_QUEUE_NAME,
-            new_image_gen_job_at(
-                ImageGenJobParams {
-                    chat_id: -100,
-                    message_id: 20,
-                    user_id: 30,
-                    user_full_name: "Alice".to_owned(),
-                    prompt: "castle".to_owned(),
-                    ..ImageGenJobParams::default()
-                },
-                now,
-            ),
-        );
-        queue
-            .set_queue_position_message_id(job, Some(701))
-            .expect("position");
-        job
-    }
-
-    #[tokio::test]
-    async fn image_gen_queue_worker_reuses_placeholder_when_chat_is_quiet() {
-        let queue = InMemoryTaskQueue::new();
-        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800).expect("time");
-        draw_reuse_test_job(&queue, now);
-
-        // Default stub reports an unknown (quiet) chat → reuse the placeholder in place.
-        let effects = EffectsStub::new();
-        let report = run_image_gen_queue_once(
-            &queue,
-            IMAGE_REGULAR_QUEUE_NAME,
-            &GeneratorStub::success("https://img.test/1.png"),
-            &effects,
-            "image-worker-1",
-            now,
-        )
-        .await;
-        assert_eq!(report.outcome, ImageGenQueuePollOutcome::Completed);
-
-        let calls = effects.calls();
-        assert_eq!(calls.len(), 3);
-        // Placeholder 701 is edited in place to the drawing emoji (no delete, no fresh send),
-        // then turned into the gallery — still message 701.
-        assert_eq!(
-            calls[0],
-            "edit:-100:701:<tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji>"
-        );
-        assert_eq!(calls[1], "publish:[Url(\"https://img.test/1.png\")]");
-        assert!(calls[2].starts_with("edit:-100:701:"));
-        assert!(calls[2].contains("<img src=\"https://img.test/1.png\"/>"));
-    }
-
-    #[tokio::test]
-    async fn image_gen_queue_worker_reposts_placeholder_when_chat_is_busy() {
-        let queue = InMemoryTaskQueue::new();
-        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800).expect("time");
-        draw_reuse_test_job(&queue, now);
-
-        // More than the threshold of messages since the placeholder: surface the draw near
-        // the bottom, then delete the stale waiting message.
-        let effects =
-            EffectsStub::with_chat_messages_after(DRAW_PLACEHOLDER_REUSE_MAX_MESSAGES + 1);
-        let report = run_image_gen_queue_once(
-            &queue,
-            IMAGE_REGULAR_QUEUE_NAME,
-            &GeneratorStub::success("https://img.test/1.png"),
-            &effects,
-            "image-worker-1",
-            now,
-        )
-        .await;
-        assert_eq!(report.outcome, ImageGenQueuePollOutcome::Completed);
-
-        let calls = effects.calls();
-        assert_eq!(calls.len(), 4);
-        assert_eq!(
-            calls[0],
-            "placeholder:-100:20:0:<tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji>"
-        );
-        assert_eq!(calls[1], "delete:-100:701");
-        assert_eq!(calls[2], "publish:[Url(\"https://img.test/1.png\")]");
-        assert!(calls[3].starts_with("edit:-100:888:"));
     }
 
     #[tokio::test]
@@ -6740,25 +6367,22 @@ mod tests {
                 thread_id: Some(9),
                 ..ImageEditJobParams::default()
             },
-            None,
         )
         .await;
 
         assert_eq!(report.outcome, ImageEditJobExecutionOutcome::Completed);
         assert_eq!(report.result_message_id, Some(888));
         let calls = effects.calls();
-        assert_eq!(calls.len(), 3);
-        assert_eq!(
-            calls[0],
-            "placeholder:-100:20:9:<tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji>"
-        );
+        assert_eq!(calls.len(), 4);
+        assert_eq!(calls[0], "react-progress:-100:20");
         assert_eq!(
             calls[1],
             "publish:[Bytes { file_name: \"image.png\", bytes: [9, 8, 7] }]"
         );
-        assert!(calls[2].starts_with("edit:-100:888:"));
+        assert!(calls[2].starts_with("placeholder:-100:20:9:"));
         assert!(calls[2].contains("<img src=\"https://up.test/image.png\"/>"));
         assert!(calls[2].contains("make it night"));
+        assert_eq!(calls[3], "react-clear:-100:20");
     }
 
     #[tokio::test]
@@ -7454,21 +7078,12 @@ mod tests {
     #[derive(Debug, Default)]
     struct EffectsStub {
         calls: Mutex<Vec<String>>,
-        chat_messages_after: Option<i64>,
         edit_error: Option<String>,
-        draw_ux: DrawUxMode,
     }
 
     impl EffectsStub {
         fn new() -> Self {
             Self::default()
-        }
-
-        fn with_chat_messages_after(count: i64) -> Self {
-            Self {
-                chat_messages_after: Some(count),
-                ..Self::default()
-            }
         }
 
         fn with_edit_error(error: impl Into<String>) -> Self {
@@ -7479,10 +7094,7 @@ mod tests {
         }
 
         fn with_reaction_ux() -> Self {
-            Self {
-                draw_ux: DrawUxMode::Reactions,
-                ..Self::default()
-            }
+            Self { ..Self::default() }
         }
 
         fn calls(&self) -> Vec<String> {
@@ -7495,10 +7107,6 @@ mod tests {
     }
 
     impl ImageJobEffects for EffectsStub {
-        fn draw_ux(&self) -> DrawUxMode {
-            self.draw_ux
-        }
-
         fn signal_draw_progress<'a>(
             &'a self,
             chat_id: i64,
@@ -7517,15 +7125,6 @@ mod tests {
             self.call_log()
                 .push(format!("react-clear:{chat_id}:{trigger_message_id}"));
             Box::pin(async {})
-        }
-
-        fn chat_messages_after<'a>(
-            &'a self,
-            _chat_id: i64,
-            _message_id: i32,
-        ) -> ImageJobEffectFuture<'a, Option<i64>> {
-            let count = self.chat_messages_after;
-            Box::pin(async move { count })
         }
 
         fn delete_message<'a>(

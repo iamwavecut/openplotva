@@ -180,27 +180,11 @@ pub const DEFAULT_LLM_PROVIDER_MAX_TOKENS: i32 = 8192;
 
 pub const DEFAULT_LLM_PROVIDER_TASK_TIMEOUT_SECONDS: i32 = 600;
 
-/// Agentic search is on by default; the app auto-registers a `qwen-reasoner`
-/// provider so it works without any `LLM_PROVIDERS_*` configuration.
-pub const DEFAULT_AGENTIC_SEARCH_ENABLED: bool = true;
-
 pub const DEFAULT_AGENTIC_SONG_ENABLED: bool = true;
 
 pub const DEFAULT_AGENTIC_IMAGE_ENABLED: bool = true;
 
-pub const DEFAULT_AGENTIC_SEARCH_REASONER_PROVIDER: &str = "qwen-reasoner";
-
-pub const DEFAULT_AGENTIC_SEARCH_WRITER_PROVIDER: &str = "conversational";
-
-pub const DEFAULT_AGENTIC_SEARCH_MAX_SEARCHES: i32 = 3;
-
-pub const DEFAULT_AGENTIC_SEARCH_MAX_CRAWLS: i32 = 4;
-
-pub const DEFAULT_AGENTIC_SEARCH_MAX_STEPS: i32 = 8;
-
-pub const DEFAULT_AGENTIC_SEARCH_MAX_TOTAL_TOKENS: i32 = 60000;
-
-pub const DEFAULT_AGENTIC_SEARCH_WALL_TIMEOUT_SECONDS: i32 = 120;
+pub const DEFAULT_AGENT_REASONER_PROVIDER: &str = "qwen-reasoner";
 
 pub const DEFAULT_VISION_DISCOVERY_SERVICE_NAME: &str = DEFAULT_DIALOG_DISCOVERY_SERVICE_NAME;
 
@@ -674,25 +658,13 @@ pub struct NamedProviderConfig {
 /// Agentic-workflow configuration root.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AgenticConfig {
-    pub search: AgenticSearchConfig,
+    /// Named provider the song/image prompt agents reason with, from
+    /// `LLM_AGENT_REASONER_PROVIDER`.
+    pub reasoner_provider: String,
     /// When true, song requests are written by the multi-step song agent.
     pub song_enabled: bool,
     /// When true, draw requests are refined by the multi-step image-prompt agent.
     pub image_enabled: bool,
-}
-
-/// Search-agent profile configuration. Disabled by default so the existing naive
-/// `web_search` tool path is unchanged.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct AgenticSearchConfig {
-    pub enabled: bool,
-    pub reasoner_provider: String,
-    pub writer_provider: String,
-    pub max_searches: i32,
-    pub max_crawls: i32,
-    pub max_steps: i32,
-    pub max_total_tokens: i32,
-    pub wall_timeout_seconds: i32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -724,7 +696,6 @@ pub struct DialogConfig {
     /// Discovery endpoint name, from `DIALOG_DISCOVERY_ENDPOINT_NAME`.
     pub discovery_endpoint_name: String,
     pub aifarm_enable_thinking: bool,
-    pub aifarm_use_tool_calls: bool,
     pub aifarm_max_tokens: i32,
     pub aifarm_random_max_tokens: i32,
     pub aifarm_default_max_tokens: i32,
@@ -770,17 +741,6 @@ pub struct DialogConfig {
     /// Delivery-obligation watcher poll interval in seconds, from
     /// `DIALOG_OBLIGATION_WATCH_INTERVAL_SECS`.
     pub obligation_watch_interval_secs: i32,
-    /// Draw/music queue-wait UX, from `DIALOG_DRAW_UX`: `reactions` (default;
-    /// lifecycle reactions on the trigger message, gallery appears with the
-    /// first image) or `placeholder` (legacy ⏳ message edited in place).
-    pub draw_ux: String,
-    /// Dialog session engine kill switch, from `DIALOG_AGENT_LOOP_ENABLED`
-    /// (default ON). Setting it to false reverts every turn to the legacy
-    /// provider-internal tool loop.
-    pub agent_loop_enabled: bool,
-    /// Canary allowlist for the session engine, from `DIALOG_AGENT_LOOP_CHATS`
-    /// (comma-separated chat ids; empty = all chats once the switch is on).
-    pub agent_loop_chats: Vec<i64>,
     /// LLM iterations per session, from `DIALOG_SESSION_MAX_ITERATIONS`.
     pub session_max_iterations: i32,
     /// Intermediate messages per session, from `DIALOG_SESSION_MAX_MESSAGES`.
@@ -795,10 +755,6 @@ pub struct DialogConfig {
     pub session_max_draws: i32,
     /// Song generations per session, from `DIALOG_SESSION_MAX_SONGS`.
     pub session_max_songs: i32,
-    /// One active session per (chat, thread) with initiator-only injection,
-    /// from `DIALOG_SESSION_INJECTION_ENABLED` (default ON). Off = the old
-    /// parallel per-(chat, user, thread) turns.
-    pub session_injection_enabled: bool,
     pub vmlx_url: String,
     pub vmlx_api_key: String,
     pub vmlx_model: String,
@@ -1148,8 +1104,6 @@ pub struct RawConfig {
     pub dialog_discovery_endpoint_name: Option<String>,
     /// `DIALOG_AIFARM_ENABLE_THINKING`.
     pub dialog_aifarm_enable_thinking: Option<String>,
-    /// `DIALOG_AIFARM_USE_TOOL_CALLS`.
-    pub dialog_aifarm_use_tool_calls: Option<String>,
     /// `DIALOG_AIFARM_MAX_TOKENS`.
     pub dialog_aifarm_max_tokens: Option<String>,
     /// `DIALOG_AIFARM_RANDOM_MAX_TOKENS`.
@@ -1206,12 +1160,6 @@ pub struct RawConfig {
     pub dialog_music_delivery_timeout_secs: Option<String>,
     /// `DIALOG_OBLIGATION_WATCH_INTERVAL_SECS`.
     pub dialog_obligation_watch_interval_secs: Option<String>,
-    /// `DIALOG_DRAW_UX`.
-    pub dialog_draw_ux: Option<String>,
-    /// `DIALOG_AGENT_LOOP_ENABLED`.
-    pub dialog_agent_loop_enabled: Option<String>,
-    /// `DIALOG_AGENT_LOOP_CHATS`.
-    pub dialog_agent_loop_chats: Option<String>,
     /// `DIALOG_SESSION_MAX_ITERATIONS`.
     pub dialog_session_max_iterations: Option<String>,
     /// `DIALOG_SESSION_MAX_MESSAGES`.
@@ -1224,8 +1172,6 @@ pub struct RawConfig {
     pub dialog_session_max_draws: Option<String>,
     /// `DIALOG_SESSION_MAX_SONGS`.
     pub dialog_session_max_songs: Option<String>,
-    /// `DIALOG_SESSION_INJECTION_ENABLED`.
-    pub dialog_session_injection_enabled: Option<String>,
     /// `DIALOG_VMLX_URL`.
     pub dialog_vmlx_url: Option<String>,
     /// `DIALOG_VMLX_API_KEY`.
@@ -1274,26 +1220,12 @@ pub struct RawConfig {
     pub llm_provider_temperatures: Option<String>,
     /// `LLM_PROVIDERS_TASK_TIMEOUT_SECONDS`.
     pub llm_provider_task_timeout_seconds: Option<String>,
-    /// `LLM_AGENTIC_SEARCH_ENABLED`.
-    pub llm_agentic_search_enabled: Option<String>,
     /// `LLM_AGENTIC_SONG_ENABLED`.
     pub llm_agentic_song_enabled: Option<String>,
     /// `LLM_AGENTIC_IMAGE_ENABLED`.
     pub llm_agentic_image_enabled: Option<String>,
-    /// `LLM_AGENTIC_SEARCH_REASONER_PROVIDER`.
-    pub llm_agentic_search_reasoner_provider: Option<String>,
-    /// `LLM_AGENTIC_SEARCH_WRITER_PROVIDER`.
-    pub llm_agentic_search_writer_provider: Option<String>,
-    /// `LLM_AGENTIC_SEARCH_MAX_SEARCHES`.
-    pub llm_agentic_search_max_searches: Option<String>,
-    /// `LLM_AGENTIC_SEARCH_MAX_CRAWLS`.
-    pub llm_agentic_search_max_crawls: Option<String>,
-    /// `LLM_AGENTIC_SEARCH_MAX_STEPS`.
-    pub llm_agentic_search_max_steps: Option<String>,
-    /// `LLM_AGENTIC_SEARCH_MAX_TOTAL_TOKENS`.
-    pub llm_agentic_search_max_total_tokens: Option<String>,
-    /// `LLM_AGENTIC_SEARCH_WALL_TIMEOUT_SECONDS`.
-    pub llm_agentic_search_wall_timeout_seconds: Option<String>,
+    /// `LLM_AGENT_REASONER_PROVIDER`.
+    pub llm_agent_reasoner_provider: Option<String>,
     /// `GENKIT_DEFAULT_MODEL`.
     pub genkit_default_model: Option<String>,
     /// `GENKIT_HISTORY_SUMMARY_PROVIDER`.
@@ -1565,8 +1497,6 @@ pub enum ConfigError {
     PersistentQueueFallbackWatermarkRange,
     #[error("invalid UPDATE_QUEUE_BACKEND value {value:?}: expected list or stream")]
     InvalidUpdateQueueBackend { value: String },
-    #[error("invalid DIALOG_DRAW_UX value {value:?}: expected reactions or placeholder")]
-    InvalidDrawUx { value: String },
 }
 
 impl AppConfig {
@@ -2191,11 +2121,6 @@ impl AppConfig {
                         raw.dialog_aifarm_enable_thinking,
                         false,
                     )?,
-                    aifarm_use_tool_calls: parse_bool(
-                        "DIALOG_AIFARM_USE_TOOL_CALLS",
-                        raw.dialog_aifarm_use_tool_calls,
-                        true,
-                    )?,
                     aifarm_max_tokens: parse_i32(
                         "DIALOG_AIFARM_MAX_TOKENS",
                         raw.dialog_aifarm_max_tokens,
@@ -2329,17 +2254,6 @@ impl AppConfig {
                         raw.dialog_obligation_watch_interval_secs,
                         15,
                     )?,
-                    draw_ux: parse_draw_ux(raw.dialog_draw_ux)?,
-                    agent_loop_enabled: parse_bool(
-                        "DIALOG_AGENT_LOOP_ENABLED",
-                        raw.dialog_agent_loop_enabled,
-                        true,
-                    )?,
-                    agent_loop_chats: parse_i64_list_or_default(
-                        "DIALOG_AGENT_LOOP_CHATS",
-                        raw.dialog_agent_loop_chats,
-                        "",
-                    )?,
                     session_max_iterations: parse_i32(
                         "DIALOG_SESSION_MAX_ITERATIONS",
                         raw.dialog_session_max_iterations,
@@ -2369,11 +2283,6 @@ impl AppConfig {
                         "DIALOG_SESSION_MAX_SONGS",
                         raw.dialog_session_max_songs,
                         1,
-                    )?,
-                    session_injection_enabled: parse_bool(
-                        "DIALOG_SESSION_INJECTION_ENABLED",
-                        raw.dialog_session_injection_enabled,
-                        true,
                     )?,
                     vmlx_url: raw
                         .dialog_vmlx_url
@@ -2425,44 +2334,8 @@ impl AppConfig {
                 },
                 providers: llm_providers,
                 agentic: AgenticConfig {
-                    search: AgenticSearchConfig {
-                        enabled: parse_bool(
-                            "LLM_AGENTIC_SEARCH_ENABLED",
-                            raw.llm_agentic_search_enabled,
-                            DEFAULT_AGENTIC_SEARCH_ENABLED,
-                        )?,
-                        reasoner_provider: parse_scalar_value(
-                            raw.llm_agentic_search_reasoner_provider,
-                        )
-                        .unwrap_or_else(|| DEFAULT_AGENTIC_SEARCH_REASONER_PROVIDER.to_owned()),
-                        writer_provider: parse_scalar_value(raw.llm_agentic_search_writer_provider)
-                            .unwrap_or_else(|| DEFAULT_AGENTIC_SEARCH_WRITER_PROVIDER.to_owned()),
-                        max_searches: parse_i32(
-                            "LLM_AGENTIC_SEARCH_MAX_SEARCHES",
-                            raw.llm_agentic_search_max_searches,
-                            DEFAULT_AGENTIC_SEARCH_MAX_SEARCHES,
-                        )?,
-                        max_crawls: parse_i32(
-                            "LLM_AGENTIC_SEARCH_MAX_CRAWLS",
-                            raw.llm_agentic_search_max_crawls,
-                            DEFAULT_AGENTIC_SEARCH_MAX_CRAWLS,
-                        )?,
-                        max_steps: parse_i32(
-                            "LLM_AGENTIC_SEARCH_MAX_STEPS",
-                            raw.llm_agentic_search_max_steps,
-                            DEFAULT_AGENTIC_SEARCH_MAX_STEPS,
-                        )?,
-                        max_total_tokens: parse_i32(
-                            "LLM_AGENTIC_SEARCH_MAX_TOTAL_TOKENS",
-                            raw.llm_agentic_search_max_total_tokens,
-                            DEFAULT_AGENTIC_SEARCH_MAX_TOTAL_TOKENS,
-                        )?,
-                        wall_timeout_seconds: parse_i32(
-                            "LLM_AGENTIC_SEARCH_WALL_TIMEOUT_SECONDS",
-                            raw.llm_agentic_search_wall_timeout_seconds,
-                            DEFAULT_AGENTIC_SEARCH_WALL_TIMEOUT_SECONDS,
-                        )?,
-                    },
+                    reasoner_provider: parse_scalar_value(raw.llm_agent_reasoner_provider)
+                        .unwrap_or_else(|| DEFAULT_AGENT_REASONER_PROVIDER.to_owned()),
                     song_enabled: parse_bool(
                         "LLM_AGENTIC_SONG_ENABLED",
                         raw.llm_agentic_song_enabled,
@@ -2922,7 +2795,6 @@ impl RawConfig {
             dialog_discovery_service_name: env("DIALOG_DISCOVERY_SERVICE_NAME"),
             dialog_discovery_endpoint_name: env("DIALOG_DISCOVERY_ENDPOINT_NAME"),
             dialog_aifarm_enable_thinking: env("DIALOG_AIFARM_ENABLE_THINKING"),
-            dialog_aifarm_use_tool_calls: env("DIALOG_AIFARM_USE_TOOL_CALLS"),
             dialog_aifarm_max_tokens: env("DIALOG_AIFARM_MAX_TOKENS"),
             dialog_aifarm_random_max_tokens: env("DIALOG_AIFARM_RANDOM_MAX_TOKENS"),
             dialog_aifarm_default_max_tokens: env("DIALOG_AIFARM_DEFAULT_MAX_TOKENS"),
@@ -2953,16 +2825,12 @@ impl RawConfig {
             dialog_image_delivery_timeout_secs: env("DIALOG_IMAGE_DELIVERY_TIMEOUT_SECS"),
             dialog_music_delivery_timeout_secs: env("DIALOG_MUSIC_DELIVERY_TIMEOUT_SECS"),
             dialog_obligation_watch_interval_secs: env("DIALOG_OBLIGATION_WATCH_INTERVAL_SECS"),
-            dialog_draw_ux: env("DIALOG_DRAW_UX"),
-            dialog_agent_loop_enabled: env("DIALOG_AGENT_LOOP_ENABLED"),
-            dialog_agent_loop_chats: env("DIALOG_AGENT_LOOP_CHATS"),
             dialog_session_max_iterations: env("DIALOG_SESSION_MAX_ITERATIONS"),
             dialog_session_max_messages: env("DIALOG_SESSION_MAX_MESSAGES"),
             dialog_session_tool_extension_secs: env("DIALOG_SESSION_TOOL_EXTENSION_SECS"),
             dialog_session_hard_cap_secs: env("DIALOG_SESSION_HARD_CAP_SECS"),
             dialog_session_max_draws: env("DIALOG_SESSION_MAX_DRAWS"),
             dialog_session_max_songs: env("DIALOG_SESSION_MAX_SONGS"),
-            dialog_session_injection_enabled: env("DIALOG_SESSION_INJECTION_ENABLED"),
             dialog_vmlx_url: env("DIALOG_VMLX_URL"),
             dialog_vmlx_api_key: env("DIALOG_VMLX_API_KEY"),
             dialog_vmlx_model: env("DIALOG_VMLX_MODEL"),
@@ -2987,16 +2855,9 @@ impl RawConfig {
             llm_provider_max_tokens: env("LLM_PROVIDERS_MAX_TOKENS"),
             llm_provider_temperatures: env("LLM_PROVIDERS_TEMPERATURES"),
             llm_provider_task_timeout_seconds: env("LLM_PROVIDERS_TASK_TIMEOUT_SECONDS"),
-            llm_agentic_search_enabled: env("LLM_AGENTIC_SEARCH_ENABLED"),
             llm_agentic_song_enabled: env("LLM_AGENTIC_SONG_ENABLED"),
             llm_agentic_image_enabled: env("LLM_AGENTIC_IMAGE_ENABLED"),
-            llm_agentic_search_reasoner_provider: env("LLM_AGENTIC_SEARCH_REASONER_PROVIDER"),
-            llm_agentic_search_writer_provider: env("LLM_AGENTIC_SEARCH_WRITER_PROVIDER"),
-            llm_agentic_search_max_searches: env("LLM_AGENTIC_SEARCH_MAX_SEARCHES"),
-            llm_agentic_search_max_crawls: env("LLM_AGENTIC_SEARCH_MAX_CRAWLS"),
-            llm_agentic_search_max_steps: env("LLM_AGENTIC_SEARCH_MAX_STEPS"),
-            llm_agentic_search_max_total_tokens: env("LLM_AGENTIC_SEARCH_MAX_TOTAL_TOKENS"),
-            llm_agentic_search_wall_timeout_seconds: env("LLM_AGENTIC_SEARCH_WALL_TIMEOUT_SECONDS"),
+            llm_agent_reasoner_provider: env("LLM_AGENT_REASONER_PROVIDER"),
             genkit_default_model: env("GENKIT_DEFAULT_MODEL"),
             genkit_history_summary_provider: env("GENKIT_HISTORY_SUMMARY_PROVIDER"),
             genkit_history_summary_model: env("GENKIT_HISTORY_SUMMARY_MODEL"),
@@ -3211,22 +3072,6 @@ fn parse_update_queue_backend(value: Option<String>) -> Result<String, ConfigErr
     match backend.as_str() {
         "list" | "stream" => Ok(backend),
         _ => Err(ConfigError::InvalidUpdateQueueBackend { value: backend }),
-    }
-}
-
-/// Draw-UX selector value for the reaction-based lifecycle (default).
-pub const DRAW_UX_REACTIONS: &str = "reactions";
-
-/// Draw-UX selector value for the legacy ⏳ placeholder message.
-pub const DRAW_UX_PLACEHOLDER: &str = "placeholder";
-
-fn parse_draw_ux(value: Option<String>) -> Result<String, ConfigError> {
-    let ux = parse_scalar_value(value)
-        .unwrap_or_else(|| DRAW_UX_REACTIONS.to_owned())
-        .to_ascii_lowercase();
-    match ux.as_str() {
-        DRAW_UX_REACTIONS | DRAW_UX_PLACEHOLDER => Ok(ux),
-        _ => Err(ConfigError::InvalidDrawUx { value: ux }),
     }
 }
 
@@ -3698,12 +3543,10 @@ mod tests {
             config.vision.request_timeout_seconds,
             DEFAULT_VISION_REQUEST_TIMEOUT_SECONDS
         );
-        // Agentic search is on by default and points at the qwen reasoner; the
-        // qwen provider itself is auto-registered by the app, so the config-level
-        // providers list stays empty.
-        assert!(config.llm.agentic.search.enabled);
-        assert_eq!(config.llm.agentic.search.reasoner_provider, "qwen-reasoner");
-        assert_eq!(config.llm.agentic.search.writer_provider, "conversational");
+        // The song/image agents point at the qwen reasoner by default; the
+        // qwen provider itself is auto-registered by the app, so the
+        // config-level providers list stays empty.
+        assert_eq!(config.llm.agentic.reasoner_provider, "qwen-reasoner");
         assert!(config.llm.providers.is_empty());
         assert!(!config.music.acestep.enabled);
         assert_eq!(config.music.acestep.base_url, DEFAULT_ACESTEP_BASE_URL);

@@ -461,11 +461,11 @@ const INLINE_ARG_END_MARKERS: &[&str] = &[
 
 const TOOL_PROTOCOL_ARTIFACT_MARKERS: &[&str] = &[
     "<|tool_call",
-    "<tool_call|>",
+    "<tool_call",
     "</|tool_call",
     "</tool_call",
     "<|tool_response",
-    "<tool_response|>",
+    "<tool_response",
     "</|tool_response",
     "</tool_response",
     "<|channel>",

@@ -577,7 +577,6 @@ fn taskman_list_entry_from_record(record: RuntimeTaskmanRecord) -> RuntimeTaskma
         trigger_message_id,
         thread_message_id,
         progress_message_id: record.record.progress_message_id,
-        queue_position_message_id: record.record.queue_position_message_id,
         result_message_id: record.record.result_message_id,
         worker_id: record.record.worker_id,
         created_at,
@@ -605,7 +604,6 @@ fn taskman_job_from_record(record: &RuntimeTaskmanRecord) -> RuntimeTaskmanJobDa
         trigger_message_id: telegram_data(record).map_or(0, |data| data.message_id),
         thread_message_id: telegram_data(record).and_then(|data| data.thread_message_id),
         progress_message_id: record.record.progress_message_id,
-        queue_position_message_id: record.record.queue_position_message_id,
         result_message_id: record.record.result_message_id,
         worker_id: record.record.worker_id.clone(),
         created_at: format_time(record.record.job.created),
@@ -944,7 +942,7 @@ mod tests {
         assert_eq!(dialog_id, 1);
         assert_eq!(image_id, 2);
         queue
-            .update_job_messages(image_id, Some(31), Some(32), Some(33))
+            .update_job_messages(image_id, Some(31), Some(33))
             .expect("update job messages");
         let older = created - time::Duration::seconds(5);
         let first_message = queue
@@ -1038,7 +1036,6 @@ mod tests {
         assert_eq!(details.job.id, image_id);
         assert_eq!(details.job.queue_name, IMAGE_REGULAR_QUEUE_NAME);
         assert_eq!(details.job.progress_message_id, Some(31));
-        assert_eq!(details.job.queue_position_message_id, Some(32));
         assert_eq!(details.job.result_message_id, Some(33));
         assert_eq!(details.messages.len(), 2);
         assert_eq!(details.messages[0].id, second_message);

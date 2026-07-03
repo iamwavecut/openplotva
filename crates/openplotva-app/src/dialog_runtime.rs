@@ -4,11 +4,11 @@ use std::{collections::HashMap, sync::Arc};
 
 use openplotva_config::AppConfig;
 use openplotva_dialog::{
-    ChatStepRequest, DialogInput, DialogToolbox, PROVIDER_AIFARM, PROVIDER_GENKIT, PROVIDER_NVIDIA,
+    ChatStepRequest, DialogToolbox, PROVIDER_AIFARM, PROVIDER_GENKIT, PROVIDER_NVIDIA,
     PROVIDER_VMLX, ToolsMode,
 };
 use openplotva_llm::{
-    ChatProvider, ChatProviderError, ChatProviderFuture, ChatStepFuture, ChatStepProvider,
+    ChatProvider, ChatProviderError, ChatStepFuture, ChatStepProvider,
     aifarm::{
         AifarmClientConfig, AifarmDialogConfig, AifarmDialogProvider, ReqwestAifarmTransport,
         normalize_chat_completions_url,
@@ -47,7 +47,6 @@ const DIALOG_WORKFLOW_KEY: &str = "dialog";
 /// fingerprint that invalidates when the row changes.
 pub struct ChatClientFactory {
     handle: Arc<RouterHandle>,
-    toolbox: Arc<dyn DialogToolbox>,
     template: AifarmDialogConfig,
     static_clients: HashMap<String, DialogProviderHandle>,
     default_client: DialogProviderHandle,
@@ -58,14 +57,12 @@ impl ChatClientFactory {
     #[must_use]
     pub fn new(
         handle: Arc<RouterHandle>,
-        toolbox: Arc<dyn DialogToolbox>,
         template: AifarmDialogConfig,
         static_clients: HashMap<String, DialogProviderHandle>,
         default_client: DialogProviderHandle,
     ) -> Self {
         Self {
             handle,
-            toolbox,
             template,
             static_clients,
             default_client,
@@ -166,9 +163,7 @@ impl ChatClientFactory {
                 ));
             }
         }
-        Ok(Arc::new(
-            AifarmDialogProvider::new(cfg).with_toolbox(Arc::clone(&self.toolbox)),
-        ))
+        Ok(Arc::new(AifarmDialogProvider::new(cfg)))
     }
 }
 
@@ -247,75 +242,6 @@ impl RouterChatProvider {
 impl ChatProvider for RouterChatProvider {
     fn provider_name(&self) -> &str {
         &self.provider_name
-    }
-
-    fn run_dialog<'a>(&'a self, input: DialogInput) -> ChatProviderFuture<'a> {
-        Box::pin(async move {
-            let input_for_attempts = input.clone();
-            let factory = Arc::clone(&self.factory);
-            let result = self
-                .walker
-                .run(
-                    RoutedRequestContext {
-                        workflow_key: DIALOG_WORKFLOW_KEY.to_owned(),
-                        queue_name: Some("dialog".to_owned()),
-                        chat_id: (input.context.chat_id != 0).then_some(input.context.chat_id),
-                        thread_id: input.context.thread_id,
-                        message_id: (input.message.id != 0).then_some(input.message.id),
-                        deadline: crate::dialog_turn::current_turn_deadline(),
-                        suppress_all_attempts_exhausted_admin_report: true,
-                        ..RoutedRequestContext::default()
-                    },
-                    move |attempt| {
-                        let resolved = factory.resolve(&attempt);
-                        let mut request = input_for_attempts.clone();
-                        if !attempt.model_name.trim().is_empty() {
-                            request.model = attempt.model_name.clone();
-                        }
-                        if let Some(max_tokens) = attempt.overrides.max_tokens
-                            && max_tokens > 0
-                        {
-                            request.max_output_tokens = max_tokens;
-                        }
-                        if let Some(enable_thinking) = attempt
-                            .overrides
-                            .extra
-                            .get("enable_thinking")
-                            .and_then(serde_json::Value::as_bool)
-                        {
-                            request.enable_thinking = Some(enable_thinking);
-                        }
-                        async move {
-                            let client = match resolved {
-                                Ok(client) => client,
-                                Err(error) => {
-                                    let error: ChatProviderError = Box::new(error);
-                                    return Err(error);
-                                }
-                            };
-                            match client.run_dialog(request).await {
-                                Ok(mut output) => {
-                                    if output.provider.trim().is_empty() {
-                                        output.provider = client.provider_name().to_owned();
-                                    }
-                                    Ok(output)
-                                }
-                                Err(error) => Err(error),
-                            }
-                        }
-                    },
-                    |error| retryable_reason(error.as_ref()),
-                )
-                .await;
-            match result {
-                Ok(output) => Ok(output),
-                Err(RoutedAttemptRunError::Attempt(error)) => Err(error),
-                Err(RoutedAttemptRunError::Routing(error)) => {
-                    let error: ChatProviderError = Box::new(error);
-                    Err(error)
-                }
-            }
-        })
     }
 
     fn as_chat_step(&self) -> Option<&dyn ChatStepProvider> {
@@ -440,12 +366,9 @@ pub fn router_dialog_provider(
     // Env pool secondaries are first-class DB models routed through their own
     // `vram-cloud` client below, so admin weights control them without a hidden pool.
     let aifarm_cfg = aifarm_dialog_config_from_app_config(config);
-    let aifarm: DialogProviderHandle =
-        Arc::new(AifarmDialogProvider::new(aifarm_cfg.clone()).with_toolbox(Arc::clone(&toolbox)));
+    let aifarm: DialogProviderHandle = Arc::new(AifarmDialogProvider::new(aifarm_cfg.clone()));
 
-    let genkit = genkit_fallback.or_else(|| {
-        genkit_dialog_provider_from_app_config_with_toolbox(config, Some(Arc::clone(&toolbox)))
-    });
+    let genkit = genkit_fallback.or_else(|| genkit_dialog_provider_from_app_config(config));
 
     let mut clients: HashMap<String, DialogProviderHandle> = HashMap::new();
     clients.insert(PROVIDER_AIFARM.to_owned(), Arc::clone(&aifarm));
@@ -462,7 +385,6 @@ pub fn router_dialog_provider(
 
     let factory = Arc::new(ChatClientFactory::new(
         Arc::clone(&handle),
-        toolbox,
         aifarm_cfg,
         clients,
         aifarm,
@@ -483,12 +405,10 @@ pub const VRAM_CLOUD_PROVIDER_NAME: &str = "vram-cloud";
 /// override, so one client serves every model on that endpoint.
 fn vram_cloud_dialog_provider(
     config: &AppConfig,
-    toolbox: Arc<dyn DialogToolbox>,
+    _toolbox: Arc<dyn DialogToolbox>,
 ) -> Option<DialogProviderHandle> {
     let cfg = vram_cloud_dialog_config(config)?;
-    Some(Arc::new(
-        AifarmDialogProvider::new(cfg).with_toolbox(toolbox),
-    ))
+    Some(Arc::new(AifarmDialogProvider::new(cfg)))
 }
 
 fn vram_cloud_dialog_config(config: &AppConfig) -> Option<AifarmDialogConfig> {
@@ -509,15 +429,13 @@ fn vram_cloud_dialog_config(config: &AppConfig) -> Option<AifarmDialogConfig> {
 
 fn qwen_reasoner_dialog_provider(
     config: &AppConfig,
-    toolbox: Arc<dyn DialogToolbox>,
+    _toolbox: Arc<dyn DialogToolbox>,
 ) -> Option<DialogProviderHandle> {
     let cfg = qwen_reasoner_dialog_config_from_app_config(config);
     if cfg.provider_name.eq_ignore_ascii_case(PROVIDER_AIFARM) {
         return None;
     }
-    Some(Arc::new(
-        AifarmDialogProvider::new(cfg).with_toolbox(toolbox),
-    ))
+    Some(Arc::new(AifarmDialogProvider::new(cfg)))
 }
 
 fn qwen_reasoner_dialog_config_from_app_config(config: &AppConfig) -> AifarmDialogConfig {
@@ -531,7 +449,6 @@ fn qwen_reasoner_dialog_config_from_app_config(config: &AppConfig) -> AifarmDial
     cfg.model = spec.model.clone();
     cfg.max_tokens = spec.max_tokens;
     cfg.temperature = spec.temperature;
-    cfg.use_tool_calls = Some(true);
     cfg.enable_thinking = spec.enable_thinking;
     cfg.include_reasoning = spec.include_reasoning.or(Some(false));
     cfg.with_defaults()
@@ -579,39 +496,23 @@ pub enum DialogProviderBuildError {
 /// kept for provider-construction tests and the live provider smokes.
 pub fn dialog_provider_from_app_config(
     config: &AppConfig,
-    toolbox: Arc<dyn DialogToolbox>,
 ) -> Result<DialogProviderHandle, DialogProviderBuildError> {
-    primary_dialog_provider_from_app_config(config, toolbox)
+    primary_dialog_provider_from_app_config(config)
 }
 
 pub fn genkit_dialog_provider_from_app_config(config: &AppConfig) -> Option<DialogProviderHandle> {
-    genkit_dialog_provider_from_app_config_with_toolbox(config, None)
+    genkit_dialog_provider_result_from_app_config(config).ok()
 }
 
-/// Build the Rust-native direct Gemini provider with the app-owned toolbox attached.
-pub fn genkit_dialog_provider_from_app_config_with_toolbox(
+fn genkit_dialog_provider_result_from_app_config(
     config: &AppConfig,
-    toolbox: Option<Arc<dyn DialogToolbox>>,
-) -> Option<DialogProviderHandle> {
-    genkit_dialog_provider_result_from_app_config_with_toolbox(config, toolbox).ok()
-}
-
-fn genkit_dialog_provider_result_from_app_config_with_toolbox(
-    config: &AppConfig,
-    toolbox: Option<Arc<dyn DialogToolbox>>,
 ) -> Result<DialogProviderHandle, DialogProviderBuildError> {
     let api_key = resolve_google_ai_key(&config.google_ai);
     if api_key.trim().is_empty() {
         return Err(DialogProviderBuildError::GenkitGoogleAiKeyRequired);
     }
     if let Some(cfg) = genkit_openai_compatible_dialog_config_result_from_app_config(config)? {
-        let provider = AifarmDialogProvider::new(cfg);
-        let provider = if let Some(toolbox) = toolbox {
-            provider.with_toolbox(toolbox)
-        } else {
-            provider
-        };
-        return Ok(Arc::new(provider));
+        return Ok(Arc::new(AifarmDialogProvider::new(cfg)));
     }
     let model = genkit_dialog_model_from_app_config(config);
     let provider = GeminiDialogProvider::new(GeminiDialogConfig {
@@ -627,11 +528,6 @@ fn genkit_dialog_provider_result_from_app_config_with_toolbox(
         cache: GeminiExplicitCacheConfig::chat_core_multi_turn(),
         ..GeminiDialogConfig::default()
     });
-    let provider = if let Some(toolbox) = toolbox {
-        provider.with_toolbox(toolbox)
-    } else {
-        provider
-    };
     Ok(Arc::new(provider))
 }
 
@@ -680,7 +576,6 @@ fn genkit_openai_compatible_dialog_config_result_from_app_config(
         max_tokens: 8192,
         temperature: Some(0.9),
         top_p: Some(0.97),
-        use_tool_calls: Some(true),
         include_reasoning: Some(false),
         ..AifarmDialogConfig::default()
     }))
@@ -697,52 +592,40 @@ fn genkit_dialog_model_from_app_config(config: &AppConfig) -> String {
 
 fn primary_dialog_provider_from_app_config(
     config: &AppConfig,
-    toolbox: Arc<dyn DialogToolbox>,
 ) -> Result<DialogProviderHandle, DialogProviderBuildError> {
     match configured_dialog_provider_name(config).as_str() {
-        PROVIDER_AIFARM => Ok(Arc::new(aifarm_dialog_provider_from_app_config(
-            config, toolbox,
-        ))),
-        PROVIDER_NVIDIA => Ok(Arc::new(nvidia_dialog_provider_from_app_config(
-            config, toolbox,
-        ))),
-        PROVIDER_VMLX => Ok(Arc::new(vmlx_dialog_provider_from_app_config(
-            config, toolbox,
-        ))),
-        PROVIDER_GENKIT => {
-            genkit_dialog_provider_result_from_app_config_with_toolbox(config, Some(toolbox))
-        }
+        PROVIDER_AIFARM => Ok(Arc::new(aifarm_dialog_provider_from_app_config(config))),
+        PROVIDER_NVIDIA => Ok(Arc::new(nvidia_dialog_provider_from_app_config(config))),
+        PROVIDER_VMLX => Ok(Arc::new(vmlx_dialog_provider_from_app_config(config))),
+        PROVIDER_GENKIT => genkit_dialog_provider_result_from_app_config(config),
         provider => Err(DialogProviderBuildError::Unsupported {
             provider: provider.to_owned(),
         }),
     }
 }
 
-/// Build the reqwest-backed AIFarm provider with the app-owned toolbox attached.
+/// Build the reqwest-backed AIFarm provider.
 #[must_use]
 pub fn aifarm_dialog_provider_from_app_config(
     config: &AppConfig,
-    toolbox: Arc<dyn DialogToolbox>,
 ) -> AifarmDialogProvider<ReqwestAifarmTransport> {
-    AifarmDialogProvider::new(aifarm_dialog_config_from_app_config(config)).with_toolbox(toolbox)
+    AifarmDialogProvider::new(aifarm_dialog_config_from_app_config(config))
 }
 
-/// Build the reqwest-backed NVIDIA provider with the app-owned toolbox attached.
+/// Build the reqwest-backed NVIDIA provider.
 #[must_use]
 pub fn nvidia_dialog_provider_from_app_config(
     config: &AppConfig,
-    toolbox: Arc<dyn DialogToolbox>,
 ) -> AifarmDialogProvider<ReqwestAifarmTransport> {
-    AifarmDialogProvider::new(nvidia_dialog_config_from_app_config(config)).with_toolbox(toolbox)
+    AifarmDialogProvider::new(nvidia_dialog_config_from_app_config(config))
 }
 
-/// Build the reqwest-backed VMLX provider with the app-owned toolbox attached.
+/// Build the reqwest-backed VMLX provider.
 #[must_use]
 pub fn vmlx_dialog_provider_from_app_config(
     config: &AppConfig,
-    toolbox: Arc<dyn DialogToolbox>,
 ) -> AifarmDialogProvider<ReqwestAifarmTransport> {
-    AifarmDialogProvider::new(vmlx_dialog_config_from_app_config(config)).with_toolbox(toolbox)
+    AifarmDialogProvider::new(vmlx_dialog_config_from_app_config(config))
 }
 
 #[must_use]
@@ -832,9 +715,9 @@ mod tests {
     #[test]
     fn dialog_provider_factory_builds_aifarm_provider_from_default_config() {
         let config = AppConfig::from_raw(openplotva_config::RawConfig::default()).expect("config");
-        let toolbox: Arc<dyn DialogToolbox> = Arc::new(EmptyToolbox);
+        let _toolbox: Arc<dyn DialogToolbox> = Arc::new(EmptyToolbox);
 
-        let provider = dialog_provider_from_app_config(&config, toolbox).expect("provider");
+        let provider = dialog_provider_from_app_config(&config).expect("provider");
 
         assert_eq!(provider.provider_name(), PROVIDER_AIFARM);
     }
@@ -846,9 +729,9 @@ mod tests {
             ..openplotva_config::RawConfig::default()
         })
         .expect("config");
-        let toolbox: Arc<dyn DialogToolbox> = Arc::new(EmptyToolbox);
+        let _toolbox: Arc<dyn DialogToolbox> = Arc::new(EmptyToolbox);
 
-        let provider = dialog_provider_from_app_config(&config, toolbox).expect("nvidia provider");
+        let provider = dialog_provider_from_app_config(&config).expect("nvidia provider");
 
         assert_eq!(provider.provider_name(), PROVIDER_NVIDIA);
 
@@ -857,9 +740,9 @@ mod tests {
             ..openplotva_config::RawConfig::default()
         })
         .expect("config");
-        let toolbox: Arc<dyn DialogToolbox> = Arc::new(EmptyToolbox);
+        let _toolbox: Arc<dyn DialogToolbox> = Arc::new(EmptyToolbox);
 
-        let provider = dialog_provider_from_app_config(&config, toolbox).expect("vmlx provider");
+        let provider = dialog_provider_from_app_config(&config).expect("vmlx provider");
 
         assert_eq!(provider.provider_name(), PROVIDER_VMLX);
     }
@@ -872,9 +755,9 @@ mod tests {
             ..openplotva_config::RawConfig::default()
         })
         .expect("config");
-        let toolbox: Arc<dyn DialogToolbox> = Arc::new(EmptyToolbox);
+        let _toolbox: Arc<dyn DialogToolbox> = Arc::new(EmptyToolbox);
 
-        let provider = dialog_provider_from_app_config(&config, toolbox).expect("provider");
+        let provider = dialog_provider_from_app_config(&config).expect("provider");
 
         assert_eq!(provider.provider_name(), PROVIDER_GENKIT);
     }
@@ -890,7 +773,6 @@ mod tests {
         assert_eq!(cfg.client.endpoint_name, "chat_completions");
         assert_eq!(cfg.model, "qwen3.6-27b-moq");
         assert_eq!(cfg.client.default_model, "qwen3.6-27b-moq");
-        assert_eq!(cfg.use_tool_calls, Some(true));
         assert_eq!(cfg.include_reasoning, Some(false));
     }
 
@@ -901,9 +783,9 @@ mod tests {
             ..openplotva_config::RawConfig::default()
         })
         .expect("config");
-        let toolbox: Arc<dyn DialogToolbox> = Arc::new(EmptyToolbox);
+        let _toolbox: Arc<dyn DialogToolbox> = Arc::new(EmptyToolbox);
 
-        let error = dialog_provider_from_app_config(&config, toolbox).err();
+        let error = dialog_provider_from_app_config(&config).err();
 
         assert_eq!(
             error,
@@ -934,7 +816,12 @@ mod tests {
             reporter.clone(),
         );
 
-        let error = provider.run_dialog(DialogInput::default()).await.err();
+        let error = provider
+            .as_chat_step()
+            .expect("step seam")
+            .run_chat_step(default_step_request())
+            .await
+            .err();
 
         assert!(error.is_some());
         assert_eq!(default_provider.calls(), 0);
@@ -961,7 +848,12 @@ mod tests {
             reporter.clone(),
         );
 
-        let error = provider.run_dialog(DialogInput::default()).await.err();
+        let error = provider
+            .as_chat_step()
+            .expect("step seam")
+            .run_chat_step(default_step_request())
+            .await
+            .err();
 
         assert!(error.is_some());
         assert_eq!(default_provider.calls(), 0);
@@ -997,7 +889,12 @@ mod tests {
             reporter.clone(),
         );
 
-        let error = provider.run_dialog(DialogInput::default()).await.err();
+        let error = provider
+            .as_chat_step()
+            .expect("step seam")
+            .run_chat_step(default_step_request())
+            .await
+            .err();
 
         assert!(error.is_some());
         assert_eq!(routed_provider.calls(), 1);
@@ -1077,7 +974,12 @@ mod tests {
         )
         .with_routing_event_reporter(reporter.clone());
 
-        let error = provider.run_dialog(DialogInput::default()).await.err();
+        let error = provider
+            .as_chat_step()
+            .expect("step seam")
+            .run_chat_step(default_step_request())
+            .await
+            .err();
 
         assert!(error.is_some());
         assert!(triggers.provider_capacity_unavailable(1, 10));
@@ -1119,11 +1021,13 @@ mod tests {
         );
 
         let output = provider
-            .run_dialog(DialogInput::default())
+            .as_chat_step()
+            .expect("step seam")
+            .run_chat_step(default_step_request())
             .await
             .expect("dialog output");
 
-        assert_eq!(output.answer, "ok");
+        assert_eq!(output.text, "ok");
         let inputs = routed_provider.inputs();
         assert_eq!(inputs[0].model, "openrouter/provider/model");
         assert_eq!(inputs[0].max_output_tokens, 123);
@@ -1157,7 +1061,13 @@ mod tests {
 
         let expired = std::time::Instant::now();
         let error = crate::dialog_turn::TURN_DEADLINE
-            .scope(Some(expired), provider.run_dialog(DialogInput::default()))
+            .scope(
+                Some(expired),
+                provider
+                    .as_chat_step()
+                    .expect("step seam")
+                    .run_chat_step(default_step_request()),
+            )
             .await
             .err();
 
@@ -1165,10 +1075,12 @@ mod tests {
         assert_eq!(routed_provider.calls(), 0);
 
         let output = provider
-            .run_dialog(DialogInput::default())
+            .as_chat_step()
+            .expect("step seam")
+            .run_chat_step(default_step_request())
             .await
             .expect("dialog output without a deadline");
-        assert_eq!(output.answer, "should not run");
+        assert_eq!(output.text, "should not run");
         assert_eq!(routed_provider.calls(), 1);
     }
 
@@ -1202,11 +1114,13 @@ mod tests {
         );
 
         let output = provider
-            .run_dialog(DialogInput::default())
+            .as_chat_step()
+            .expect("step seam")
+            .run_chat_step(default_step_request())
             .await
             .expect("dialog output");
 
-        assert_eq!(output.answer, "ok");
+        assert_eq!(output.text, "ok");
         let inputs = routed_provider.inputs();
         assert_eq!(inputs[0].max_output_tokens, 4096);
         assert_eq!(inputs[0].enable_thinking, Some(false));
@@ -1271,9 +1185,8 @@ mod tests {
         assert_eq!(cfg.max_tokens, 8192);
         assert_eq!(cfg.temperature, Some(0.9));
         assert_eq!(cfg.top_p, Some(0.97));
-        assert_eq!(cfg.use_tool_calls, Some(true));
-        let toolbox: Arc<dyn DialogToolbox> = Arc::new(EmptyToolbox);
-        let provider = dialog_provider_from_app_config(&openrouter, toolbox).expect("provider");
+        let _toolbox: Arc<dyn DialogToolbox> = Arc::new(EmptyToolbox);
+        let provider = dialog_provider_from_app_config(&openrouter).expect("provider");
         assert_eq!(provider.provider_name(), PROVIDER_GENKIT);
 
         let openrouter_default = AppConfig::from_raw(openplotva_config::RawConfig {
@@ -1300,8 +1213,8 @@ mod tests {
         })
         .expect("config");
 
-        let toolbox: Arc<dyn DialogToolbox> = Arc::new(EmptyToolbox);
-        let error = dialog_provider_from_app_config(&config, toolbox).err();
+        let _toolbox: Arc<dyn DialogToolbox> = Arc::new(EmptyToolbox);
+        let error = dialog_provider_from_app_config(&config).err();
 
         assert_eq!(
             error,
@@ -1319,8 +1232,8 @@ mod tests {
         })
         .expect("config");
 
-        let toolbox: Arc<dyn DialogToolbox> = Arc::new(EmptyToolbox);
-        let error = dialog_provider_from_app_config(&config, toolbox).err();
+        let _toolbox: Arc<dyn DialogToolbox> = Arc::new(EmptyToolbox);
+        let error = dialog_provider_from_app_config(&config).err();
 
         assert_eq!(
             error,
@@ -1351,13 +1264,22 @@ mod tests {
             dialog_request_timeout_seconds: Some("60".to_owned()),
             ..openplotva_config::RawConfig::default()
         })?;
-        let toolbox: Arc<dyn DialogToolbox> = Arc::new(EmptyToolbox);
-        let provider = dialog_provider_from_app_config(&config, toolbox)?;
+        let _toolbox: Arc<dyn DialogToolbox> = Arc::new(EmptyToolbox);
+        let provider = dialog_provider_from_app_config(&config)?;
 
-        let output = provider.run_dialog(live_dialog_smoke_input()).await?;
+        let output = provider
+            .as_chat_step()
+            .expect("step seam")
+            .run_chat_step(openplotva_dialog::ChatStepRequest {
+                input: live_dialog_smoke_input(),
+                transcript: Vec::new(),
+                tools: openplotva_dialog::ToolsMode::Disabled,
+                iteration: 1,
+            })
+            .await?;
 
         assert!(
-            !output.answer.trim().is_empty(),
+            !output.text.trim().is_empty(),
             "OpenRouter dialog answer must be non-empty"
         );
         Ok(())
@@ -1417,7 +1339,6 @@ mod tests {
     ) -> Arc<ChatClientFactory> {
         Arc::new(ChatClientFactory::new(
             handle,
-            Arc::new(EmptyToolbox),
             AifarmDialogConfig::default(),
             clients,
             default_provider,
@@ -1624,16 +1545,55 @@ mod tests {
             self.name
         }
 
-        fn run_dialog<'a>(&'a self, input: DialogInput) -> openplotva_llm::ChatProviderFuture<'a> {
+        fn as_chat_step(&self) -> Option<&dyn ChatStepProvider> {
+            Some(self)
+        }
+    }
+
+    impl ChatStepProvider for SequencedProvider {
+        fn provider_name(&self) -> &str {
+            self.name
+        }
+
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+
+        fn run_chat_step<'a>(
+            &'a self,
+            request: openplotva_dialog::ChatStepRequest,
+        ) -> openplotva_llm::ChatStepFuture<'a> {
             Box::pin(async move {
                 *self.calls.lock().expect("calls") += 1;
-                self.inputs.lock().expect("inputs").push(input);
-                self.results
+                self.inputs.lock().expect("inputs").push(request.input);
+                match self
+                    .results
                     .lock()
                     .expect("results")
                     .pop()
                     .unwrap_or_else(|| Ok(DialogOutput::default()))
+                {
+                    Ok(output) => Ok(openplotva_dialog::ChatStepOutput {
+                        provider: output.provider.clone(),
+                        text: if output.answer.trim().is_empty() {
+                            output.response.clone()
+                        } else {
+                            output.answer.clone()
+                        },
+                        ..openplotva_dialog::ChatStepOutput::default()
+                    }),
+                    Err(error) => Err(error),
+                }
             })
+        }
+    }
+
+    fn default_step_request() -> openplotva_dialog::ChatStepRequest {
+        openplotva_dialog::ChatStepRequest {
+            input: DialogInput::default(),
+            transcript: Vec::new(),
+            tools: openplotva_dialog::ToolsMode::Disabled,
+            iteration: 1,
         }
     }
 
@@ -1660,10 +1620,6 @@ mod tests {
     impl ChatProvider for StepStubProvider {
         fn provider_name(&self) -> &str {
             self.name
-        }
-
-        fn run_dialog<'a>(&'a self, _input: DialogInput) -> openplotva_llm::ChatProviderFuture<'a> {
-            Box::pin(async move { panic!("step stub must be driven through run_chat_step") })
         }
 
         fn as_chat_step(&self) -> Option<&dyn ChatStepProvider> {
@@ -1764,9 +1720,16 @@ mod tests {
 
     #[tokio::test]
     async fn router_chat_step_fails_retryably_without_step_support() {
+        struct StepLessProvider;
+
+        impl ChatProvider for StepLessProvider {
+            fn provider_name(&self) -> &str {
+                "aifarm"
+            }
+        }
+
         let default_provider = Arc::new(SequencedProvider::new("unused", vec![]));
-        let routed_provider = Arc::new(SequencedProvider::new("aifarm", vec![]));
-        let routed_dyn: DialogProviderHandle = routed_provider.clone();
+        let routed_dyn: DialogProviderHandle = Arc::new(StepLessProvider);
         let mut clients = HashMap::new();
         clients.insert("aifarm".to_owned(), routed_dyn);
         let reporter = crate::runtime_routing::RoutingEventReporter::new(
@@ -1792,6 +1755,5 @@ mod tests {
             Some(FailureReason::ProviderUnavailable),
             "the walker (and job retry) must treat step-less providers as retryable"
         );
-        assert_eq!(routed_provider.calls(), 0, "run_dialog is never invoked");
     }
 }

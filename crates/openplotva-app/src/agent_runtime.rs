@@ -44,8 +44,6 @@ use crate::routed_attempts::{
     RoutedAttempt, RoutedAttemptRunError, RoutedAttemptWalker, RoutedRequestContext,
 };
 
-const AGENTIC_SEARCH_REASONER_WORKFLOW: &str = "agentic_search_reasoner";
-const AGENTIC_SEARCH_WRITER_WORKFLOW: &str = "agentic_search_writer";
 const AGENTIC_SONG_WORKFLOW: &str = "agentic_song";
 const AGENTIC_IMAGE_WORKFLOW: &str = "agentic_image";
 
@@ -143,8 +141,7 @@ pub fn build_agent_provider_registry(config: &AppConfig) -> AgentProviderRegistr
 
     // Auto-register the default qwen reasoner so the search agent works out of the
     // box; an explicit `LLM_PROVIDERS_*` entry of the same name takes precedence.
-    let default_reasoner =
-        normalize_name(openplotva_config::DEFAULT_AGENTIC_SEARCH_REASONER_PROVIDER);
+    let default_reasoner = normalize_name(openplotva_config::DEFAULT_AGENT_REASONER_PROVIDER);
     if let std::collections::hash_map::Entry::Vacant(entry) = by_name.entry(default_reasoner) {
         let spec = qwen_reasoner_named_provider_config(config);
         let client_config = agent_client_config_from_named_provider(config, &spec);
@@ -182,8 +179,7 @@ pub fn build_routed_agent_provider_registry(
 pub fn qwen_reasoner_named_provider_config(
     config: &AppConfig,
 ) -> openplotva_config::NamedProviderConfig {
-    let default_reasoner =
-        normalize_name(openplotva_config::DEFAULT_AGENTIC_SEARCH_REASONER_PROVIDER);
+    let default_reasoner = normalize_name(openplotva_config::DEFAULT_AGENT_REASONER_PROVIDER);
     config
         .llm
         .providers
@@ -191,7 +187,7 @@ pub fn qwen_reasoner_named_provider_config(
         .find(|spec| normalize_name(&spec.name) == default_reasoner)
         .cloned()
         .unwrap_or_else(|| openplotva_config::NamedProviderConfig {
-            name: openplotva_config::DEFAULT_AGENTIC_SEARCH_REASONER_PROVIDER.to_owned(),
+            name: openplotva_config::DEFAULT_AGENT_REASONER_PROVIDER.to_owned(),
             kind: openplotva_config::DEFAULT_LLM_PROVIDER_KIND.to_owned(),
             discovery_service_name: DEFAULT_QWEN_SERVICE_NAME.to_owned(),
             discovery_endpoint_name: config.llm.dialog.discovery_endpoint_name.clone(),
@@ -214,11 +210,6 @@ pub struct AifarmReasoner {
 }
 
 impl AifarmReasoner {
-    #[must_use]
-    pub fn new(provider: Arc<AgentProviderClient>) -> Self {
-        Self::for_workflow(provider, AGENTIC_SEARCH_REASONER_WORKFLOW)
-    }
-
     #[must_use]
     pub fn for_workflow(
         provider: Arc<AgentProviderClient>,
@@ -292,30 +283,6 @@ impl Reasoner for AifarmReasoner {
             parse_reply(&result)
         })
     }
-}
-
-/// Run a single no-tools completion on a writer provider to synthesize the final
-/// answer from the gathered evidence.
-pub async fn synthesize_answer(
-    provider: &AgentProviderClient,
-    model: &str,
-    max_tokens: i32,
-    system_prompt: &str,
-    user_content: &str,
-) -> Result<String, AgentError> {
-    let call = ReasonerCall {
-        model: model.to_owned(),
-        max_tokens,
-        messages: vec![
-            AgentMessage::new(AgentRole::System, system_prompt.to_owned()),
-            AgentMessage::new(AgentRole::User, user_content.to_owned()),
-        ],
-        tools: Vec::new(),
-    };
-    let reasoner =
-        AifarmReasoner::for_workflow(Arc::new(provider.clone()), AGENTIC_SEARCH_WRITER_WORKFLOW);
-    let reply = reasoner.complete(call).await?;
-    Ok(reply.text)
 }
 
 /// Boxed future returned by the context-gathering searchers.
@@ -634,17 +601,10 @@ pub struct SongAgentSettings {
 impl SongAgentSettings {
     #[must_use]
     pub fn from_app_config(config: &AppConfig, system_prompt: String) -> Self {
-        let reasoner_provider = if config
-            .llm
-            .agentic
-            .search
-            .reasoner_provider
-            .trim()
-            .is_empty()
-        {
-            openplotva_config::DEFAULT_AGENTIC_SEARCH_REASONER_PROVIDER.to_owned()
+        let reasoner_provider = if config.llm.agentic.reasoner_provider.trim().is_empty() {
+            openplotva_config::DEFAULT_AGENT_REASONER_PROVIDER.to_owned()
         } else {
-            config.llm.agentic.search.reasoner_provider.clone()
+            config.llm.agentic.reasoner_provider.clone()
         };
         Self {
             enabled: config.llm.agentic.song_enabled,
@@ -882,17 +842,10 @@ pub struct ImageAgentSettings {
 impl ImageAgentSettings {
     #[must_use]
     pub fn from_app_config(config: &AppConfig, system_prompt: String) -> Self {
-        let reasoner_provider = if config
-            .llm
-            .agentic
-            .search
-            .reasoner_provider
-            .trim()
-            .is_empty()
-        {
-            openplotva_config::DEFAULT_AGENTIC_SEARCH_REASONER_PROVIDER.to_owned()
+        let reasoner_provider = if config.llm.agentic.reasoner_provider.trim().is_empty() {
+            openplotva_config::DEFAULT_AGENT_REASONER_PROVIDER.to_owned()
         } else {
-            config.llm.agentic.search.reasoner_provider.clone()
+            config.llm.agentic.reasoner_provider.clone()
         };
         Self {
             enabled: config.llm.agentic.image_enabled,
@@ -1507,6 +1460,6 @@ mod tests {
                 .expect("default config");
         let registry = build_agent_provider_registry(&config);
         assert!(registry.contains(CONVERSATIONAL_PROVIDER));
-        assert!(registry.contains(openplotva_config::DEFAULT_AGENTIC_SEARCH_REASONER_PROVIDER));
+        assert!(registry.contains(openplotva_config::DEFAULT_AGENT_REASONER_PROVIDER));
     }
 }
