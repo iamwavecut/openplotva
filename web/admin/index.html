@@ -4756,6 +4756,11 @@
             }
             const drawer = document.getElementById('llmd-detail');
             if (drawer) drawer.addEventListener('pl:close', () => llmdCloseDetail());
+            document.addEventListener('keydown', event => {
+                if (event.key !== 'Escape') return;
+                const detail = document.getElementById('llmd-detail');
+                if (detail && detail.open) llmdCloseDetail();
+            });
             const list = document.getElementById('llmd-list');
             if (list) {
                 list.addEventListener('keydown', event => {
@@ -4806,8 +4811,8 @@
             llmdState.openRunId = null;
             const drawer = document.getElementById('llmd-detail');
             const browse = document.getElementById('llmd-browse');
-            if (drawer) drawer.removeAttribute('open');
-            if (browse) browse.classList.remove('hidden');
+            if (drawer) drawer.open = false;
+            if (browse) browse.hidden = false;
             const scroller = document.querySelector('.content-scroll');
             if (scroller) scroller.scrollTop = llmdState.browseScroll || 0;
             llmdRenderList();
@@ -4821,8 +4826,8 @@
             const browse = document.getElementById('llmd-browse');
             const body = document.getElementById('llmd-detail-body');
             if (!drawer || !body) return;
-            if (browse) browse.classList.add('hidden');
-            drawer.setAttribute('open', '');
+            if (browse) browse.hidden = true;
+            drawer.open = true;
             if (scroller) scroller.scrollTop = 0;
             PL.skeleton(body, { rows: 6 });
             const data = await apiCall(`/llm/dialogs/detail?id=${encodeURIComponent(id)}`);
