@@ -374,95 +374,103 @@ test('admin login gate and authenticated shell render', async ({ page, context }
   assertNoPageErrors();
 });
 
-test('admin LLM context detail renders trace artifacts', async ({ page, context }) => {
-  const assertNoPageErrors = watchPageErrors(page);
-  await stubAdminExternalScripts(page);
-
+test('admin LLM dialogs list and detail render agent runs', async ({ page, context }) => {
   await context.addCookies([{
     name: 'admin_session',
     value: '1001',
     url: baseURL,
   }]);
 
-  await page.route('**/admin/api/llm/requests', async (route) => {
+  const runSkeleton = {
+    id: 7,
+    run_id: 'job-8123',
+    kind: 'dialog',
+    status: 'completed',
+    started_at: '2026-05-25T12:34:56Z',
+    duration_ms: 5400,
+    preview: 'smoke final answer',
+    origin: {
+      chat_id: -100,
+      chat_title: 'Smoke Chat',
+      user_id: 42,
+      trigger_message_id: 20,
+      trigger_preview: 'когда солнцестояние?',
+      queue_name: 'dialog-aifarm',
+    },
+    totals: { rounds: 2, tool_calls: 1, total_tokens: 1234 },
+    tools: [{ name: 'web_search', status: 'ok', count: 1 }],
+    outcome: { outcome: 'sent', sent_message_parts: 1 },
+  };
+
+  await page.route('**/admin/api/llm/dialogs', async (route) => {
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({ count: 1, runs: [runSkeleton] }),
+    });
+  });
+  await page.route('**/admin/api/llm/dialogs/detail?id=7', async (route) => {
     await route.fulfill({
       contentType: 'application/json',
       body: JSON.stringify({
-        requests: [{
-          id: 101,
-          at: '2026-05-25T12:34:56Z',
-          provider: 'AI Farm',
-          request_kind: 'chat_completion',
-          source: 'aifarm',
-          mode: 'tools',
-          flow: 'chat_flow_dialog',
-          iteration: 2,
-          model: 'smoke-model-a',
-          chat: { chat_id: -100777, chat_title: 'Smoke Group' },
-          user: { user_id: 7, full_name: 'Owner User' },
-          message: { message_id: 5001 },
-          result: {
-            response_text_preview: 'smoke answer detail',
-            error: null,
-          },
-          raw_request: {
-            messages: [{
-              role: 'user',
-              content: [{ text: 'smoke user prompt with detail context' }],
-            }],
-            tools: [{ name: 'currency_rates' }],
-          },
-          resolved_cache_content: {
-            name: 'cachedContents/service-smoke',
-          },
-          raw_response: {
-            choices: [{
-              message: { content: 'smoke answer detail from provider' },
-            }],
-          },
-          usage: {
-            input_tokens: 100,
-            output_tokens: 40,
-            total_tokens: 140,
-          },
-          timings: {
-            generation_tps: 40,
-          },
-          inference_params: {
-            tool_mode: 'auto',
-            response_format: 'json',
-          },
-          transport: {
-            job_id: 'job-service-smoke',
-          },
-        }],
+        run: {
+          ...runSkeleton,
+          rounds: [
+            {
+              seq: 1,
+              provider: 'aifarm',
+              model: 'smoke-model-a',
+              duration_ms: 2600,
+              usage: { input_tokens: 900, output_tokens: 120 },
+              response_text: 'щас гляну',
+              tool_calls: [{
+                name: 'web_search',
+                status: 'ok',
+                duration_ms: 400,
+                args_json: { query: 'солнцестояние' },
+                result_json: { status: 'ok', message: 'June 21' },
+              }],
+              raw_source: 'live',
+              raw_request: { messages: [{ role: 'user', content: 'hi' }] },
+              raw_response: { choices: [] },
+            },
+            {
+              seq: 2,
+              provider: 'aifarm',
+              model: 'smoke-model-a',
+              duration_ms: 2800,
+              usage: { input_tokens: 1000, output_tokens: 90 },
+              response_text: 'smoke final answer',
+              sent: 'final',
+              tool_calls: [],
+              raw_source: 'rotated_out',
+            },
+          ],
+        },
       }),
     });
   });
 
   await page.goto('/admin/', { waitUntil: 'domcontentloaded' });
-  const llmResponse = page.waitForResponse((response) => {
-    return response.url().endsWith('/admin/api/llm/requests')
+  const listResponse = page.waitForResponse((response) => {
+    return response.url().endsWith('/admin/api/llm/dialogs')
       && response.request().method() === 'GET';
   });
   await page.locator('pl-button[data-tab="llm"]').click();
-  const payload = await (await llmResponse).json();
-  expect(payload.requests).toHaveLength(1);
+  const payload = await (await listResponse).json();
+  expect(payload.runs).toHaveLength(1);
 
-  await expect(page.locator('#page-title')).toHaveText('LLM Context');
-  await expect(page.locator('#llm-requests-list')).toContainText('smoke-model-a');
-  await expect(page.locator('#llm-requests-list')).toContainText('smoke answer detail');
+  await expect(page.locator('#page-title')).toHaveText('LLM Dialogs');
+  await expect(page.locator('#llmd-kpis')).toContainText('runs');
+  await expect(page.locator('#llmd-list')).toContainText('Smoke Chat');
+  await expect(page.locator('#llmd-list')).toContainText('smoke final answer');
+  await expect(page.locator('#llmd-list')).toContainText('web_search');
 
-  await page.locator('#llm-requests-list .list-item').first().click();
-  await expect(page.locator('#pane-llm-details')).toBeVisible();
-  await expect(page.locator('#llm-request-details')).toContainText('"provider": "AI Farm"');
-  await expect(page.locator('#llm-request-details')).toContainText('"model": "smoke-model-a"');
-  await expect(page.locator('#llm-context-json')).toContainText('llm_context');
-  await expect(page.locator('#llm-context-json')).toContainText('request');
-  await expect(page.locator('#llm-context-json')).toContainText('response');
-  await expect(page.locator('#llm-context-json')).toContainText('usage');
-  await expect(page.locator('#llm-context-json')).toContainText('inference_params');
-  await expect(page.locator('#llm-context-json')).toContainText('transport');
+  await page.locator('#llmd-list .llmd-row').first().click();
+  await expect(page.locator('#llmd-detail')).toBeVisible();
+  await expect(page.locator('#llmd-detail-body')).toContainText('Smoke Chat');
+  await expect(page.locator('#llmd-detail-body')).toContainText('smoke final answer');
+  await expect(page.locator('#llmd-detail-body')).toContainText('web_search');
+  await expect(page.locator('#llmd-detail-body')).toContainText('rotated out');
 
   assertNoPageErrors();
 });

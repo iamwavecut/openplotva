@@ -55,7 +55,7 @@
                 <div class="nav-group">
                     <div class="nav-group-label">Intelligence</div>
                     <pl-button variant="nav" data-tab="providers" data-action="switchTab" data-args='["providers"]'><i class="ti ti-route" aria-hidden="true"></i><span>Model Providers</span></pl-button>
-                    <pl-button variant="nav" data-tab="llm" data-action="switchTab" data-args='["llm"]'><i class="ti ti-message-code" aria-hidden="true"></i><span>LLM Context</span></pl-button>
+                    <pl-button variant="nav" data-tab="llm" data-action="switchTab" data-args='["llm"]'><i class="ti ti-message-code" aria-hidden="true"></i><span>LLM Dialogs</span></pl-button>
                     <pl-button variant="nav" data-tab="analytics" data-action="switchTab" data-args='["analytics"]'><i class="ti ti-chart-dots-3" aria-hidden="true"></i><span>Analytics</span></pl-button>
                 </div>
                 <div class="nav-group">
@@ -835,77 +835,51 @@
 
                     <!-- LLM Context Tab -->
                     <div id="llm" class="tab-pane">
-                        <div class="split-pane" id="pane-llm">
-                            <div class="pane-list">
-                                <form data-action="renderLLMRequests" role="search">
-                                    <div class="card llm-requests-card">
-                                        <div class="card-header">
-                                            <span>LLM Requests (last 1000)</span>
-                                            <pl-button-group>
-                                                <pl-button variant="outline" size="sm" data-action="loadLLMRequests"
-                                                    data-args="[true]" data-search-btn>Refresh</pl-button>
-                                                <pl-button variant="danger" size="sm"
-                                                    data-action="clearLLMRequests">Clear</pl-button>
-                                            </pl-button-group>
-                                        </div>
-                                        <div class="card-body">
-                                            <div class="field-inline mb-4">
-                                                <pl-field-group label="Search">
-                                                    <pl-input id="llm-search-input"
-                                                        placeholder="Search (chat/user/model/text)..."></pl-input>
-                                                </pl-field-group>
-                                                <pl-button type="submit" variant="outline"
-                                                    data-action="renderLLMRequests" data-search-btn>Apply</pl-button>
-                                            </div>
-                                            <div id="llm-requests-list" class="list-group"></div>
-                                        </div>
-                                    </div>
-                                </form>
+                        <div id="llmd-browse">
+                            <div class="llmd-topbar">
+                                <span id="llmd-meta" class="text-muted">Agent runs</span>
+                                <pl-button-group>
+                                    <pl-button variant="outline" size="sm" data-action="loadLLMDialogs"
+                                        data-args="[true]">Refresh</pl-button>
+                                    <pl-button variant="danger" size="sm"
+                                        data-action="clearLLMDialogs">Clear</pl-button>
+                                </pl-button-group>
                             </div>
-
-                            <div class="resizer hidden" id="resizer-llm"></div>
-
-                            <div class="pane-details hidden" id="pane-llm-details">
-                                <div class="card llm-details-card">
-                                    <div class="card-header">
-                                        <span>Request Details</span>
-                                        <pl-button-group>
-                                            <pl-button variant="outline" size="sm"
-                                                data-action="copySelectedLLMRequest">Copy JSON</pl-button>
-                                            <pl-button variant="outline" size="sm"
-                                                data-action="toggleLLMDetails">Close</pl-button>
-                                        </pl-button-group>
-                                    </div>
-                                    <div class="card-body">
-                                        <div id="llm-request-details" class="mono mb-4 text-muted llm-request-details">
-                                        </div>
-
-                                        <div class="card llm-context-card llm-context-bg">
-                                            <div class="card-header">
-                                                <span>Raw Provider Context</span>
-                                                <pl-button-group>
-                                                    <pl-button variant="outline" size="sm"
-                                                        data-action="expandLLMJSONTree">Expand</pl-button>
-                                                    <pl-button variant="outline" size="sm"
-                                                        data-action="collapseLLMJSONTree">Collapse</pl-button>
-                                                    <pl-button variant="outline" size="sm"
-                                                        data-action="copySelectedLLMRawRequest">Copy Context</pl-button>
-                                                </pl-button-group>
-                                            </div>
-                                            <div class="card-body">
-                                                <div class="llm-context-json-group">
-                                                    <div class="json-tree-wrap">
-                                                        <div id="llm-context-json" class="json-tree"></div>
-                                                        <div id="llm-context-json-empty"
-                                                            class="text-muted json-tree-empty"></div>
-                                                    </div>
-                                                </div>
-                                            </div>
-                                        </div>
-                                    </div>
+                            <div id="llmd-kpis" class="llmd-kpis"></div>
+                            <div class="card llmd-filter-card">
+                                <div class="card-body">
+                                    <div id="llmd-kind-chips" class="facet-bar"></div>
+                                    <form class="llmd-controls" data-action="llmdApplyFilters" role="search">
+                                        <pl-field-group label="Provider">
+                                            <pl-select id="llmd-provider"></pl-select>
+                                        </pl-field-group>
+                                        <pl-field-group label="Model">
+                                            <pl-select id="llmd-model"></pl-select>
+                                        </pl-field-group>
+                                        <pl-toggle id="llmd-errors" label="Errors only"></pl-toggle>
+                                        <pl-field-group label="Search">
+                                            <pl-input id="llmd-q"
+                                                placeholder="chat / user / model / tool / text..."></pl-input>
+                                        </pl-field-group>
+                                    </form>
+                                </div>
+                            </div>
+                            <div class="card">
+                                <div class="card-body">
+                                    <div id="llmd-list" class="list-group"></div>
                                 </div>
                             </div>
                         </div>
+                        <pl-drawer id="llmd-detail" class="card llmd-detail">
+                            <div class="llmd-detail-head">
+                                <pl-button variant="outline" size="sm"
+                                    data-action="llmdCloseDetail">← Runs</pl-button>
+                                <span id="llmd-detail-title" class="llmd-detail-title"></span>
+                                <pl-button variant="outline" size="sm"
+                                    data-action="llmdCopyRunJSON">Copy JSON</pl-button>
+                            </div>
+                            <div id="llmd-detail-body" class="llmd-detail-body"></div>
+                        </pl-drawer>
                     </div>
 
                     <!-- Safety Checks Tab -->
@@ -1204,7 +1178,7 @@
                 'vip': 'VIP',
                 'memory': 'Memory',
                 'shield': 'Shield',
-                'llm': 'LLM Context',
+                'llm': 'LLM Dialogs',
                 'providers': 'Model Providers',
                 'safety': 'Safety Checks',
                 'analytics': 'Analytics',
@@ -1220,7 +1194,7 @@
                 loadDashboard();
             }
             if (tabId === 'llm') {
-                loadLLMRequests(false);
+                loadLLMDialogs(false);
             }
             if (tabId === 'providers') {
                 loadRouting();
@@ -4401,22 +4375,802 @@
             document.getElementById('shield-test-result').textContent = formatShieldTestResult(result);
         }
 
-        // --- LLM Context ---
-        let llmRequests = [];
-        let llmRequestsLoaded = false;
-        let selectedLLMRequestID = null;
+        // --- LLM Dialogs ---
+        const LLMD_KIND_ORDER = ['dialog', 'song', 'image', 'console', 'memory', 'vision', 'shield', 'other'];
 
-        const LLM_TYPE_PALETTE = [
-            { bg: 'rgba(34, 211, 238, 0.16)', border: 'rgba(34, 211, 238, 0.42)', text: '#67e8f9' },
-            { bg: 'rgba(16, 185, 129, 0.16)', border: 'rgba(16, 185, 129, 0.42)', text: '#6ee7b7' },
-            { bg: 'rgba(245, 158, 11, 0.18)', border: 'rgba(245, 158, 11, 0.44)', text: '#fbbf24' },
-            { bg: 'rgba(239, 68, 68, 0.15)', border: 'rgba(239, 68, 68, 0.40)', text: '#fca5a5' },
-            { bg: 'rgba(168, 85, 247, 0.16)', border: 'rgba(168, 85, 247, 0.42)', text: '#d8b4fe' },
-            { bg: 'rgba(20, 184, 166, 0.16)', border: 'rgba(20, 184, 166, 0.42)', text: '#5eead4' },
-            { bg: 'rgba(244, 114, 182, 0.16)', border: 'rgba(244, 114, 182, 0.42)', text: '#f9a8d4' },
-            { bg: 'rgba(132, 204, 22, 0.16)', border: 'rgba(132, 204, 22, 0.42)', text: '#bef264' },
-        ];
+        let llmdState = {
+            loaded: false,
+            runs: [],
+            filters: { kind: 'all', provider: 'all', model: 'all', errorsOnly: false, q: '' },
+            openRunId: null,
+            browseScroll: 0,
+        };
 
+        function llmdKind(run) {
+            const kind = String(run && (run.kind || run.flow) || '').toLowerCase();
+            if (LLMD_KIND_ORDER.includes(kind)) return kind;
+            if (kind.includes('song')) return 'song';
+            if (kind.includes('image')) return 'image';
+            if (kind.includes('memory')) return 'memory';
+            if (kind.includes('vision')) return 'vision';
+            if (kind.includes('shield')) return 'shield';
+            return 'other';
+        }
+
+        function llmdRunFailed(run) {
+            if (!run) return false;
+            if (String(run.status || '').toLowerCase() === 'failed') return true;
+            if (run.error) return true;
+            const outcome = String(run.outcome && run.outcome.outcome || '').toLowerCase();
+            return outcome === 'terminal_failed';
+        }
+
+        function llmdProviders(run) {
+            const set = [];
+            for (const round of (run && run.rounds || [])) {
+                const label = [round.provider, round.model].filter(Boolean).join('@');
+                if (label && !set.includes(label)) set.push(label);
+            }
+            if (!set.length && run && run.provider) set.push(run.provider);
+            return set;
+        }
+
+        function llmdDuration(run) {
+            if (!run) return null;
+            if (typeof run.duration_ms === 'number') return run.duration_ms;
+            const totals = run.totals || {};
+            return typeof totals.wall_ms === 'number' ? totals.wall_ms : null;
+        }
+
+        function llmdMatchesFilters(run, skipKind) {
+            const f = llmdState.filters;
+            if (!skipKind && f.kind !== 'all' && llmdKind(run) !== f.kind) return false;
+            const providers = llmdProviders(run);
+            if (f.provider !== 'all' && !providers.some(p => p.split('@')[0] === f.provider)) return false;
+            if (f.model !== 'all' && !providers.some(p => (p.split('@')[1] || '') === f.model)) return false;
+            if (f.errorsOnly && !llmdRunFailed(run)) return false;
+            if (f.q) {
+                const q = f.q.toLowerCase();
+                const origin = run.origin || {};
+                const outcome = run.outcome || {};
+                const hay = [
+                    run.run_id, run.kind, run.flow, run.status, run.error,
+                    origin.chat_title, origin.chat_id, origin.thread_id, origin.user_id,
+                    origin.user_full_name, origin.trigger_message_id, origin.trigger_preview,
+                    outcome.outcome, outcome.reason, run.preview,
+                    providers.join(' '),
+                    ...(run.tools || []).map(t => t.name),
+                ].filter(v => v !== null && v !== undefined).join(' ').toLowerCase();
+                if (!hay.includes(q)) return false;
+            }
+            return true;
+        }
+
+        function llmdFilteredRuns(skipKind) {
+            return (llmdState.runs || []).filter(run => llmdMatchesFilters(run, skipKind));
+        }
+
+        function llmdFormatTime(at) {
+            if (!at) return '—';
+            const date = new Date(at);
+            if (Number.isNaN(date.getTime())) return String(at);
+            const now = new Date();
+            const sameDay = date.toDateString() === now.toDateString();
+            const hh = String(date.getHours()).padStart(2, '0');
+            const mm = String(date.getMinutes()).padStart(2, '0');
+            if (sameDay) {
+                const ss = String(date.getSeconds()).padStart(2, '0');
+                return `${hh}:${mm}:${ss}`;
+            }
+            const month = date.toLocaleString('en', { month: 'short' });
+            return `${month} ${date.getDate()} ${hh}:${mm}`;
+        }
+
+        function llmdFormatTokens(value) {
+            if (value === null || value === undefined || Number.isNaN(Number(value))) return null;
+            const n = Number(value);
+            if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
+            return String(n);
+        }
+
+        function llmdModelColorVar(model) {
+            const label = String(model || 'model');
+            let hash = 2166136261;
+            for (let i = 0; i < label.length; i++) {
+                hash ^= label.charCodeAt(i);
+                hash = Math.imul(hash, 16777619);
+            }
+            const slot = Math.abs(hash) % 64;
+            return `var(--c-cat-${slot})`;
+        }
+
+        // ---- KPI cockpit ----
+        function llmdRenderKPIs() {
+            const host = document.getElementById('llmd-kpis');
+            if (!host) return;
+            const runs = llmdFilteredRuns(false);
+            const total = llmdState.runs.length;
+            const failed = runs.filter(llmdRunFailed).length;
+            const running = runs.filter(r => String(r.status || '').toLowerCase() === 'running').length;
+            const rounds = runs.map(r => (r.totals && r.totals.rounds) || (r.rounds || []).length || 0);
+            const durations = runs.map(llmdDuration).filter(v => typeof v === 'number' && v > 0).sort((a, b) => a - b);
+            const tokens = runs.reduce((acc, r) => acc + Number((r.totals && r.totals.total_tokens) || 0), 0);
+            const toolCounts = new Map();
+            let toolTotal = 0;
+            for (const run of runs) {
+                for (const tool of (run.tools || [])) {
+                    toolTotal += Number(tool.count || 1);
+                    toolCounts.set(tool.name, (toolCounts.get(tool.name) || 0) + Number(tool.count || 1));
+                }
+            }
+            const topTool = [...toolCounts.entries()].sort((a, b) => b[1] - a[1])[0];
+            const avg = arr => (arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0);
+            const p95 = durations.length ? durations[Math.min(durations.length - 1, Math.floor(durations.length * 0.95))] : null;
+            const oldest = runs.length ? llmdFormatTime(runs[runs.length - 1].started_at) : '—';
+
+            const tile = (label, value, sub, danger) => PL.el('div', { class: 'metric-card' }, [
+                PL.el('div', { class: 'metric-label' }, label),
+                PL.el('div', { class: danger ? 'metric-value llmd-kpi-danger' : 'metric-value' }, value),
+                PL.el('div', { class: 'llmd-kpi-sub' }, sub),
+            ]);
+            host.replaceChildren(
+                tile('runs', String(runs.length), `of ${total} loaded · since ${oldest}`, false),
+                tile('errors', runs.length ? `${Math.round((failed / runs.length) * 100)}%` : '0%', `${failed} failed · ${running} running`, failed > 0),
+                tile('avg rounds', rounds.length ? avg(rounds).toFixed(1) : '0', `max ${rounds.length ? Math.max(...rounds) : 0}`, false),
+                tile('avg duration', durations.length ? formatAnalyticsMs(avg(durations)) : '—', p95 !== null ? `p95 ${formatAnalyticsMs(p95)}` : '—', false),
+                tile('tokens', llmdFormatTokens(tokens) || '0', runs.length ? `≈${llmdFormatTokens(tokens / runs.length) || 0} / run` : '—', false),
+                tile('tool calls', String(toolTotal), topTool ? `top: ${topTool[0]}` : '—', false),
+            );
+        }
+
+        // ---- Facets ----
+        function llmdRenderChips() {
+            const host = document.getElementById('llmd-kind-chips');
+            if (!host) return;
+            const counts = new Map();
+            for (const run of llmdFilteredRuns(true)) {
+                const kind = llmdKind(run);
+                counts.set(kind, (counts.get(kind) || 0) + 1);
+            }
+            const chips = [];
+            const chip = (kind, label, count) => {
+                const active = llmdState.filters.kind === kind;
+                const button = PL.el('pl-button', {
+                    class: 'filter-chip llmd-chip',
+                    'data-action': 'llmdSetKind',
+                    'data-args': JSON.stringify([kind]),
+                    'aria-pressed': active ? 'true' : 'false',
+                });
+                if (active) button.setAttribute('data-active', 'true');
+                if (kind !== 'all') {
+                    const dot = PL.el('span', { class: 'llmd-kind-dot' });
+                    dot.setAttribute('data-kind', kind);
+                    button.append(dot);
+                }
+                button.append(PL.el('span', {}, count === null ? label : `${label} ${count}`));
+                return button;
+            };
+            chips.push(chip('all', 'All', null));
+            for (const kind of LLMD_KIND_ORDER) {
+                const count = counts.get(kind) || 0;
+                if (!count && llmdState.filters.kind !== kind) continue;
+                chips.push(chip(kind, kind, count));
+            }
+            host.replaceChildren(...chips);
+        }
+
+        function llmdRenderSelectors() {
+            const providers = new Set();
+            const models = new Set();
+            for (const run of llmdState.runs) {
+                for (const label of llmdProviders(run)) {
+                    const [provider, model] = label.split('@');
+                    if (provider) providers.add(provider);
+                    if (model && (llmdState.filters.provider === 'all' || provider === llmdState.filters.provider)) {
+                        models.add(model);
+                    }
+                }
+            }
+            const fill = (id, values, current) => {
+                const select = document.getElementById(id);
+                if (!select) return;
+                const options = ['all', ...[...values].sort()];
+                select.replaceChildren(...options.map(value => {
+                    const option = document.createElement('option');
+                    option.value = value;
+                    option.textContent = value === 'all' ? 'all' : value;
+                    if (value === current) option.selected = true;
+                    return option;
+                }));
+            };
+            fill('llmd-provider', providers, llmdState.filters.provider);
+            fill('llmd-model', models, llmdState.filters.model);
+        }
+
+        function llmdApplyFilters() {
+            const providerEl = document.getElementById('llmd-provider');
+            const modelEl = document.getElementById('llmd-model');
+            const errorsEl = document.getElementById('llmd-errors');
+            const qEl = document.getElementById('llmd-q');
+            llmdState.filters.provider = providerEl && providerEl.value || 'all';
+            llmdState.filters.model = modelEl && modelEl.value || 'all';
+            llmdState.filters.errorsOnly = !!(errorsEl && errorsEl.hasAttribute('checked'));
+            llmdState.filters.q = (qEl && qEl.value || '').trim();
+            llmdRenderAll();
+        }
+
+        function llmdSetKind(kind) {
+            llmdState.filters.kind = (llmdState.filters.kind === kind) ? 'all' : kind;
+            llmdRenderAll();
+        }
+
+        function llmdResetFilters() {
+            llmdState.filters = { kind: 'all', provider: 'all', model: 'all', errorsOnly: false, q: '' };
+            const qEl = document.getElementById('llmd-q');
+            if (qEl) qEl.value = '';
+            const errorsEl = document.getElementById('llmd-errors');
+            if (errorsEl) errorsEl.removeAttribute('checked');
+            llmdRenderAll();
+        }
+
+        // ---- List ----
+        function llmdOutcomeBadge(run) {
+            const status = String(run.status || '').toLowerCase();
+            if (status === 'running') return { label: 'running', tone: 'info', pulse: true };
+            if (status === 'abandoned') return { label: 'abandoned', tone: 'warning', pulse: false };
+            const outcome = String(run.outcome && run.outcome.outcome || '').toLowerCase();
+            if (llmdRunFailed(run)) return { label: outcome || 'failed', tone: 'danger', pulse: false };
+            if (outcome === 'sent') return { label: 'replied', tone: 'success', pulse: false };
+            if (outcome === 'side_effect_delegated') return { label: 'delegated', tone: 'success', pulse: false };
+            if (outcome === 'no_reply_intentional') return { label: 'silent', tone: 'neutral', pulse: false };
+            if (outcome) return { label: outcome, tone: 'neutral', pulse: false };
+            return { label: 'ok', tone: 'success', pulse: false };
+        }
+
+        function llmdBuildRow(run) {
+            const kind = llmdKind(run);
+            const row = PL.el('div', {
+                class: 'list-item llmd-row',
+                role: 'button',
+                tabindex: '0',
+                'data-action': 'llmdOpenDetail',
+                'data-args': JSON.stringify([run.id !== undefined ? run.id : run.run_id]),
+            });
+            row.setAttribute('data-kind', kind);
+            if (llmdState.openRunId !== null && String(llmdState.openRunId) === String(run.id !== undefined ? run.id : run.run_id)) {
+                row.classList.add('active');
+            }
+
+            const top = PL.el('div', { class: 'llmd-row-top' });
+            const time = PL.el('span', { class: 'llmd-row-time mono' }, llmdFormatTime(run.started_at));
+            time.title = String(run.started_at || '');
+            top.append(time);
+            const kindBadge = PL.el('span', { class: 'llmd-kind' });
+            kindBadge.setAttribute('data-kind', kind);
+            kindBadge.append(PL.el('span', { class: 'llmd-kind-dot' }), PL.el('span', {}, kind));
+            top.append(kindBadge);
+            const badge = llmdOutcomeBadge(run);
+            const outcomeEl = PL.badge(badge.label, badge.tone);
+            outcomeEl.classList.add('llmd-outcome');
+            if (badge.pulse) outcomeEl.classList.add('llmd-pulse');
+            top.append(outcomeEl);
+            const providers = llmdProviders(run);
+            if (providers.length) {
+                const label = providers.length > 1 ? `${providers[0]} +${providers.length - 1}` : providers[0];
+                top.append(PL.el('span', { class: 'llmd-row-provider mono' }, label));
+            }
+            const right = PL.el('span', { class: 'llmd-row-right mono' });
+            const duration = llmdDuration(run);
+            if (duration !== null) right.append(PL.el('span', {}, formatAnalyticsMs(duration)));
+            const roundsCount = (run.totals && run.totals.rounds) || (run.rounds || []).length || 0;
+            right.append(PL.el('span', {}, `×${roundsCount}`));
+            top.append(right);
+            row.append(top);
+
+            const origin = run.origin || {};
+            const originParts = [];
+            originParts.push(origin.chat_title || (origin.chat_id ? `chat ${origin.chat_id}` : 'no chat'));
+            if (origin.thread_id) originParts.push(`thread ${origin.thread_id}`);
+            if (origin.user_id) originParts.push(`u:${origin.user_id}`);
+            const originLine = PL.el('div', { class: 'llmd-row-origin' }, originParts.join(' · '));
+            if (origin.trigger_preview) {
+                originLine.append(PL.el('span', { class: 'llmd-row-trigger' }, ` «${compactLLMText(origin.trigger_preview, 90)}»`));
+            }
+            row.append(originLine);
+
+            const chips = PL.el('div', { class: 'llmd-row-chips' });
+            for (const tool of (run.tools || [])) {
+                const chipEl = PL.el('span', { class: 'llmd-tool-chip' }, tool.count > 1 ? `${tool.name} ×${tool.count}` : tool.name);
+                chipEl.setAttribute('data-status', String(tool.status || 'ok'));
+                chips.append(chipEl);
+            }
+            const tokens = llmdFormatTokens(run.totals && run.totals.total_tokens);
+            if (tokens) chips.append(PL.el('span', { class: 'llmd-token-chip mono' }, `${tokens} tok`));
+            if (chips.childNodes.length) row.append(chips);
+
+            const failed = llmdRunFailed(run);
+            const previewText = failed
+                ? (run.error || (run.outcome && run.outcome.reason) || 'failed')
+                : (run.preview || '');
+            if (previewText) {
+                row.append(PL.el('div', {
+                    class: failed ? 'llmd-preview llmd-preview-error' : 'llmd-preview' }, compactLLMText(previewText, 160)));
+            }
+            return row;
+        }
+
+        function llmdRenderList() {
+            const list = document.getElementById('llmd-list');
+            if (!list) return;
+            const runs = llmdFilteredRuns(false);
+            const meta = document.getElementById('llmd-meta');
+            if (meta) meta.textContent = `Agent runs · ${llmdState.runs.length} loaded`;
+            if (!runs.length) {
+                const hasFilters = llmdState.filters.kind !== 'all' || llmdState.filters.provider !== 'all'
+                    || llmdState.filters.model !== 'all' || llmdState.filters.errorsOnly || llmdState.filters.q;
+                if (hasFilters && llmdState.runs.length) {
+                    PL.empty(list, {
+                        title: 'Nothing matches current filters',
+                        desc: 'Loosen the facets or clear the search.',
+                        action: PL.el(
+                            'pl-button',
+                            { variant: 'outline', size: 'sm', dataset: { action: 'llmdResetFilters', args: '[]' } },
+                            'Reset filters'
+                        ),
+                    });
+                } else {
+                    PL.empty(list, { title: 'No agent runs captured yet', desc: 'Runs appear as the bot handles traffic.' });
+                }
+                return;
+            }
+            list.replaceChildren(...runs.map(llmdBuildRow));
+        }
+
+        function llmdRenderAll() {
+            llmdRenderKPIs();
+            llmdRenderChips();
+            llmdRenderSelectors();
+            llmdRenderList();
+        }
+
+        let llmdWired = false;
+
+        function llmdWireOnce() {
+            if (llmdWired) return;
+            llmdWired = true;
+            const form = document.querySelector('#llmd-browse .llmd-controls');
+            if (form) {
+                form.addEventListener('pl:change', () => llmdApplyFilters());
+                let debounce = null;
+                form.addEventListener('pl:input', () => {
+                    if (debounce) clearTimeout(debounce);
+                    debounce = setTimeout(() => llmdApplyFilters(), 200);
+                });
+            }
+            const drawer = document.getElementById('llmd-detail');
+            if (drawer) drawer.addEventListener('pl:close', () => llmdCloseDetail());
+            const list = document.getElementById('llmd-list');
+            if (list) {
+                list.addEventListener('keydown', event => {
+                    if (event.key !== 'Enter' && event.key !== ' ') return;
+                    const row = event.target.closest('.llmd-row');
+                    if (!row) return;
+                    event.preventDefault();
+                    row.click();
+                });
+            }
+        }
+
+        async function loadLLMDialogs(force) {
+            llmdWireOnce();
+            if (llmdState.loaded && !force) {
+                llmdRenderAll();
+                return;
+            }
+            const list = document.getElementById('llmd-list');
+            if (list) PL.skeleton(list, { rows: 8 });
+            const data = await apiCall('/llm/dialogs');
+            if (!data) {
+                if (list) PL.error(list, { title: 'Failed to load agent runs', onRetry: () => loadLLMDialogs(true) });
+                return;
+            }
+            llmdState.runs = Array.isArray(data.runs) ? data.runs : [];
+            llmdState.loaded = true;
+            llmdRenderAll();
+        }
+
+        async function clearLLMDialogs() {
+            const confirmed = await PL.confirm({
+                title: 'Clear LLM dialogs',
+                body: 'Drops every captured agent run from the in-memory buffer.',
+                okLabel: 'Clear',
+                danger: true,
+            });
+            if (!confirmed) return;
+            const result = await apiCall('/llm/dialogs/clear', { method: 'POST' });
+            if (result === null) return;
+            PL.toast('Agent runs cleared', 'success');
+            llmdCloseDetail();
+            await loadLLMDialogs(true);
+        }
+
+        // ---- Detail ----
+        function llmdCloseDetail() {
+            llmdState.openRunId = null;
+            const drawer = document.getElementById('llmd-detail');
+            const browse = document.getElementById('llmd-browse');
+            if (drawer) drawer.removeAttribute('open');
+            if (browse) browse.classList.remove('hidden');
+            const scroller = document.querySelector('.content-scroll');
+            if (scroller) scroller.scrollTop = llmdState.browseScroll || 0;
+            llmdRenderList();
+        }
+
+        async function llmdOpenDetail(id) {
+            const scroller = document.querySelector('.content-scroll');
+            llmdState.browseScroll = scroller ? scroller.scrollTop : 0;
+            llmdState.openRunId = id;
+            const drawer = document.getElementById('llmd-detail');
+            const browse = document.getElementById('llmd-browse');
+            const body = document.getElementById('llmd-detail-body');
+            if (!drawer || !body) return;
+            if (browse) browse.classList.add('hidden');
+            drawer.setAttribute('open', '');
+            if (scroller) scroller.scrollTop = 0;
+            PL.skeleton(body, { rows: 6 });
+            const data = await apiCall(`/llm/dialogs/detail?id=${encodeURIComponent(id)}`);
+            if (!data || !data.run) {
+                if (data === null) {
+                    PL.error(body, { title: 'Failed to load the run', onRetry: () => llmdOpenDetail(id) });
+                } else {
+                    PL.empty(body, { title: 'Run not found', desc: 'The in-memory buffer may have rotated.' });
+                }
+                return;
+            }
+            llmdRenderDetail(data.run);
+        }
+
+        function llmdMetaGrid(run) {
+            const grid = PL.el('div', { class: 'llmd-meta' });
+            const cell = (label, value, danger) => {
+                if (value === null || value === undefined || value === '') return;
+                const box = PL.el('div', { class: 'llmd-meta-cell' });
+                box.append(PL.el('div', { class: 'llmd-meta-label' }, label));
+                box.append(PL.el('div', { class: danger ? 'llmd-meta-value llmd-kpi-danger' : 'llmd-meta-value' }, String(value)));
+                grid.append(box);
+            };
+            const origin = run.origin || {};
+            cell('chat', origin.chat_title ? `${origin.chat_title} (${origin.chat_id})` : origin.chat_id);
+            cell('thread', origin.thread_id);
+            cell('user', origin.user_full_name ? `${origin.user_full_name} (${origin.user_id})` : origin.user_id);
+            cell('trigger message', origin.trigger_message_id);
+            cell('queue', origin.queue_name);
+            cell('started', run.started_at);
+            const duration = llmdDuration(run);
+            cell('duration', duration !== null ? formatAnalyticsMs(duration) : null);
+            const totals = run.totals || {};
+            cell('rounds', totals.rounds || (run.rounds || []).length || null);
+            cell('tokens', llmdFormatTokens(totals.total_tokens));
+            cell('tool calls', totals.tool_calls);
+            const outcome = run.outcome || {};
+            cell('outcome', [outcome.outcome, outcome.reason].filter(Boolean).join(' · '));
+            cell('sent parts', outcome.sent_message_parts);
+            cell('error', run.error, true);
+            return grid;
+        }
+
+        function llmdFlowStrip(run) {
+            const strip = PL.el('div', { class: 'llmd-strip', role: 'group', 'aria-label': 'Run rounds' });
+            for (const [index, round] of (run.rounds || []).entries()) {
+                const pip = PL.el('pl-button', {
+                    class: 'llmd-pip',
+                    'data-action': 'llmdScrollToRound',
+                    'data-args': JSON.stringify([index]),
+                    'aria-label': `Round ${index + 1}`,
+                });
+                if (round.is_aux) pip.classList.add('llmd-pip-aux');
+                if (round.error) pip.classList.add('llmd-pip-error');
+                if (round.sent === 'final') pip.classList.add('llmd-pip-final');
+                pip.style.setProperty('--pip-c', llmdModelColorVar(round.model || round.provider));
+                pip.append(PL.el('span', {}, String(index + 1)));
+                strip.append(pip);
+                for (const tool of (round.tool_calls || [])) {
+                    const glyph = PL.el('span', { class: 'llmd-strip-tool' }, tool.name);
+                    glyph.setAttribute('data-status', String(tool.status || 'ok'));
+                    strip.append(glyph);
+                }
+            }
+            return strip;
+        }
+
+        function llmdScrollToRound(index) {
+            const card = document.querySelector(`.llmd-round[data-round="${index}"]`);
+            if (!card) return;
+            card.classList.add('open');
+            card.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }
+
+        function llmdCollapse(labelText, contentEl, extraClass) {
+            const box = PL.el('div', { class: extraClass ? `llmd-collapse ${extraClass}` : 'llmd-collapse' });
+            const toggle = PL.el('pl-button', { variant: 'ghost', size: 'sm', class: 'llmd-collapse-toggle' });
+            toggle.append(PL.el('span', {}, labelText));
+            const bodyEl = PL.el('div', { class: 'llmd-collapse-body hidden' });
+            bodyEl.append(contentEl);
+            toggle.addEventListener('click', () => {
+                bodyEl.classList.toggle('hidden');
+            });
+            box.append(toggle, bodyEl);
+            return box;
+        }
+
+        function llmdJSONPane(value) {
+            const pane = PL.el('div', { class: 'json-tree llmd-raw' });
+            pane.append(buildLazyJSONNode('root', normalizeRawJSONValue(value), 0));
+            bindJSONTree(pane);
+            return pane;
+        }
+
+        function llmdToolBlock(tool) {
+            const box = PL.el('div', { class: 'llmd-tool' });
+            const head = PL.el('div', { class: 'llmd-tool-head' });
+            const name = PL.el('span', { class: 'llmd-tool-chip' }, tool.name);
+            name.setAttribute('data-status', String(tool.status || 'ok'));
+            head.append(name);
+            if (typeof tool.duration_ms === 'number') {
+                head.append(PL.el('span', { class: 'mono llmd-dim' }, formatAnalyticsMs(tool.duration_ms)));
+            }
+            box.append(head);
+            const args = tool.args_json !== undefined ? tool.args_json : tool.args;
+            if (args !== undefined && args !== null) {
+                box.append(llmdCollapse('args', llmdJSONPane(args)));
+            }
+            const result = tool.result_json !== undefined ? tool.result_json : tool.result;
+            if (result !== undefined && result !== null) {
+                const rendered = typeof result === 'string' ? result : safeStringify(result);
+                const size = rendered.length > 1024 ? ` (${(rendered.length / 1024).toFixed(1)} KB)` : '';
+                if (rendered.length <= 400) {
+                    const pre = PL.el('pre', { class: 'llmd-tool-result' }, rendered);
+                    box.append(llmdCollapse('result', pre));
+                } else {
+                    const preview = PL.el('pre', { class: 'llmd-tool-result' }, `${rendered.slice(0, 400)}…`);
+                    box.append(preview);
+                    box.append(llmdCollapse(`Expand${size}`, llmdJSONPane(result), 'llmd-tool-full'));
+                }
+            }
+            return box;
+        }
+
+        function llmdTechPanel(round) {
+            const grid = PL.el('div', { class: 'llmd-meta llmd-tech-grid' });
+            const cell = (label, value) => {
+                if (value === null || value === undefined || value === '') return;
+                const box = PL.el('div', { class: 'llmd-meta-cell' });
+                box.append(PL.el('div', { class: 'llmd-meta-label' }, label));
+                box.append(PL.el('div', { class: 'llmd-meta-value mono' }, String(value)));
+                grid.append(box);
+            };
+            const usage = round.usage || {};
+            cell('input tok', usage.input_tokens);
+            cell('output tok', usage.output_tokens);
+            cell('total tok', usage.total_tokens);
+            cell('cached tok', usage.cached_tokens);
+            const timings = round.timings || {};
+            if (timings.prompt_eval_ms) cell('prompt eval', formatAnalyticsMs(timings.prompt_eval_ms));
+            if (timings.prompt_tps) cell('prompt tps', formatAnalyticsTPS(timings.prompt_tps));
+            if (timings.generation_ms) cell('generation', formatAnalyticsMs(timings.generation_ms));
+            if (timings.generation_tps) cell('gen tps', formatAnalyticsTPS(timings.generation_tps));
+            cell('at', round.at);
+            const wrap = PL.el('div', { class: 'llmd-tech' });
+            wrap.append(grid);
+            if (round.inference_params) {
+                wrap.append(llmdCollapse('inference params', llmdJSONPane(round.inference_params)));
+            }
+            const rawSource = String(round.raw_source || '');
+            if (rawSource === 'rotated_out') {
+                wrap.append(PL.el('div', { class: 'llmd-dim' }, 'raw payload rotated out of the buffer'));
+            } else {
+                if (round.raw_request !== undefined && round.raw_request !== null) {
+                    wrap.append(llmdCollapse('Raw request', llmdJSONPane(round.raw_request)));
+                }
+                if (round.raw_response !== undefined && round.raw_response !== null) {
+                    wrap.append(llmdCollapse('Raw response', llmdJSONPane(round.raw_response)));
+                }
+            }
+            const copyBtn = PL.el('pl-button', { variant: 'outline', size: 'sm' });
+            copyBtn.append(PL.el('span', {}, 'Copy round JSON'));
+            copyBtn.addEventListener('click', () => llmdCopyText(safeStringify(round)));
+            wrap.append(copyBtn);
+            return wrap;
+        }
+
+        function llmdRoundCard(round, index, expanded) {
+            const card = PL.el('div', { class: expanded ? 'llmd-round open' : 'llmd-round' });
+            card.setAttribute('data-round', String(index));
+            if (round.is_aux) card.classList.add('llmd-round-aux');
+            if (round.sent === 'final') card.classList.add('llmd-round-final');
+
+            const head = PL.el('div', { class: 'llmd-round-head', role: 'button', tabindex: '0' });
+            head.addEventListener('click', () => card.classList.toggle('open'));
+            head.addEventListener('keydown', event => {
+                if (event.key === 'Enter' || event.key === ' ') {
+                    event.preventDefault();
+                    card.classList.toggle('open');
+                }
+            });
+            head.append(PL.el('span', { class: 'llmd-round-num mono' }, `#${index + 1}`));
+            const dot = PL.el('span', { class: 'llmd-round-dot' });
+            dot.style.setProperty('--pip-c', llmdModelColorVar(round.model || round.provider));
+            head.append(dot);
+            head.append(PL.el('span', { class: 'mono llmd-round-model' }, [round.provider, round.model].filter(Boolean).join('@') || 'provider'));
+            if (typeof round.duration_ms === 'number') {
+                head.append(PL.el('span', { class: 'mono llmd-dim' }, formatAnalyticsMs(round.duration_ms)));
+            }
+            const usage = round.usage || {};
+            if (usage.input_tokens || usage.output_tokens) {
+                head.append(PL.el('span', {
+                    class: 'mono llmd-dim' }, `${llmdFormatTokens(usage.input_tokens) || 0}→${llmdFormatTokens(usage.output_tokens) || 0}`));
+            }
+            head.append(PL.el('span', { class: round.error ? 'llmd-round-status llmd-kpi-danger' : 'llmd-round-status' }, round.error ? '✕' : '✓'));
+            if (round.is_aux) head.append(PL.badge(`aux: ${round.flow || 'aux'}`, 'neutral'));
+            if (round.sent === 'final') head.append(PL.badge('final answer', 'success'));
+            else if (round.sent === 'intermediate') head.append(PL.badge('sent to chat', 'info'));
+            card.append(head);
+
+            const body = PL.el('div', { class: 'llmd-round-body' });
+            if (round.error) {
+                body.append(PL.el('div', { class: 'llmd-round-error' }, round.error));
+            }
+            const text = round.response_text || round.text || '';
+            if (text) {
+                const textEl = PL.el('div', { class: 'llmd-text clamped', text });
+                body.append(textEl);
+                if (text.length > 480) {
+                    const showAll = PL.el('pl-button', { variant: 'ghost', size: 'sm' });
+                    showAll.append(PL.el('span', {}, `Show all (${text.length} chars)`));
+                    showAll.addEventListener('click', () => {
+                        textEl.classList.remove('clamped');
+                        showAll.remove();
+                    });
+                    body.append(showAll);
+                }
+            } else if (!round.error) {
+                body.append(PL.el('div', { class: 'llmd-dim' }, 'no text response'));
+            }
+            for (const tool of (round.tool_calls || [])) {
+                body.append(llmdToolBlock(tool));
+            }
+            body.append(llmdCollapse('Stats & raw', llmdTechPanel(round)));
+            card.append(body);
+            return card;
+        }
+
+        function llmdRenderDetail(run) {
+            const body = document.getElementById('llmd-detail-body');
+            const title = document.getElementById('llmd-detail-title');
+            if (title) {
+                title.replaceChildren();
+                const kind = llmdKind(run);
+                const kindBadge = PL.el('span', { class: 'llmd-kind' });
+                kindBadge.setAttribute('data-kind', kind);
+                kindBadge.append(PL.el('span', { class: 'llmd-kind-dot' }), PL.el('span', {}, kind));
+                title.append(kindBadge);
+                const badge = llmdOutcomeBadge(run);
+                title.append(PL.badge(badge.label, badge.tone));
+                title.append(PL.el('span', { class: 'mono llmd-dim' }, String(run.run_id || run.id || '')));
+            }
+            if (!body) return;
+            const rounds = run.rounds || [];
+            const lastMainIndex = (() => {
+                for (let i = rounds.length - 1; i >= 0; i--) {
+                    if (!rounds[i].is_aux) return i;
+                }
+                return rounds.length - 1;
+            })();
+            body.replaceChildren(
+                llmdMetaGrid(run),
+                llmdFlowStrip(run),
+                PL.el('div', { class: 'llmd-rounds' }),
+            );
+            const feed = body.querySelector('.llmd-rounds');
+            rounds.forEach((round, index) => {
+                const expanded = index === lastMainIndex || !!round.error || rounds.length === 1;
+                feed.append(llmdRoundCard(round, index, expanded));
+            });
+        }
+
+        async function llmdCopyRunJSON() {
+            const id = llmdState.openRunId;
+            if (id === null) return;
+            const data = await apiCall(`/llm/dialogs/detail?id=${encodeURIComponent(id)}`);
+            if (!data || !data.run) {
+                PL.toast('Run unavailable', 'warning');
+                return;
+            }
+            await llmdCopyText(safeStringify(data.run));
+        }
+
+        async function llmdCopyText(text) {
+            try {
+                if (navigator.clipboard && window.isSecureContext) {
+                    await navigator.clipboard.writeText(text);
+                    PL.toast('Copied', 'success');
+                    return;
+                }
+                const ta = document.createElement('textarea');
+                ta.value = text;
+                ta.classList.add('visually-hidden-offscreen');
+                document.body.appendChild(ta);
+                ta.focus();
+                ta.select();
+                const ok = document.execCommand('copy');
+                document.body.removeChild(ta);
+                PL.toast(ok ? 'Copied' : 'Copy failed', ok ? 'success' : 'error');
+            } catch (e) {
+                PL.toast('Copy failed: ' + (e.message || e), 'error');
+            }
+        }
+
+        // ---- Lazy JSON tree (children materialize on first expand) ----
+        function buildLazyJSONNode(key, value, depth) {
+            const node = document.createElement('div');
+            node.className = depth > 0 ? 'json-node collapsed' : 'json-node';
+            const header = document.createElement('div');
+            header.className = 'json-node-header';
+            const kind = jsonNodeKind(value);
+            const hasChildren = (kind === 'object' || kind === 'array')
+                ? (kind === 'array' ? value.length > 0 : Object.keys(value).length > 0)
+                : (typeof value === 'string' && isExpandableJSONString(value));
+            const toggle = document.createElement('span');
+            toggle.className = 'json-node-toggle';
+            toggle.textContent = hasChildren ? (depth > 0 ? '▸' : '▾') : '';
+            header.appendChild(toggle);
+            const keyEl = document.createElement('span');
+            keyEl.className = 'json-node-key';
+            keyEl.textContent = key;
+            header.appendChild(keyEl);
+            const typeEl = document.createElement('span');
+            typeEl.className = 'json-node-type';
+            typeEl.textContent = kind;
+            header.appendChild(typeEl);
+            const summary = document.createElement('span');
+            summary.className = 'json-node-value';
+            summary.textContent = jsonNodeSummary(value);
+            header.appendChild(summary);
+            node.appendChild(header);
+            if (!hasChildren) return node;
+
+            let materialized = false;
+            const materialize = () => {
+                if (materialized) return;
+                materialized = true;
+                const children = document.createElement('div');
+                children.className = 'json-node-children';
+                if (kind === 'array') {
+                    value.forEach((item, index) => children.appendChild(buildLazyJSONNode(String(index), item, depth + 1)));
+                } else if (kind === 'object') {
+                    for (const [childKey, childValue] of Object.entries(value)) {
+                        children.appendChild(buildLazyJSONNode(childKey, childValue, depth + 1));
+                    }
+                } else {
+                    const pre = document.createElement('pre');
+                    pre.className = 'json-string-full';
+                    pre.textContent = value;
+                    children.appendChild(pre);
+                }
+                node.appendChild(children);
+            };
+            header.addEventListener('click', event => {
+                event.stopPropagation();
+                materialize();
+                const collapsed = node.classList.toggle('collapsed');
+                toggle.textContent = collapsed ? '▸' : '▾';
+            }, { capture: true });
+            if (depth === 0) materialize();
+            return node;
+        }
+
+
+        // ---- shared JSON helpers ----
         function safeStringify(obj) {
             try {
                 return JSON.stringify(obj, null, 2);
@@ -4431,316 +5185,6 @@
             return compact.slice(0, limit) + '…';
         }
 
-        function llmField(req, snake, camel) {
-            if (!req) return undefined;
-            if (req[snake] !== undefined && req[snake] !== null) return req[snake];
-            if (camel && req[camel] !== undefined && req[camel] !== null) return req[camel];
-            return undefined;
-        }
-
-        function humanizeLLMType(value) {
-            const raw = String(value || '').trim();
-            if (!raw) return 'unknown';
-            return raw
-                .replace(/^chat_flow_/, 'chat / ')
-                .replace(/^aifarm_/, 'aifarm / ')
-                .replace(/^geminiadapter$/, 'gemini adapter')
-                .replace(/[._-]+/g, ' ')
-                .replace(/\s+\/\s+/g, ' / ')
-                .replace(/\s+/g, ' ')
-                .trim();
-        }
-
-        function llmRequestType(req) {
-            const source = String(req?.source || '').trim();
-            const flow = String(req?.flow || '').trim();
-            const requestKind = String(llmField(req, 'request_kind', 'requestKind') || '').trim();
-            const provider = String(req?.provider || '').trim();
-            let key = source || flow || requestKind || provider || 'unknown';
-            if (source === 'aifarm' && flow) key = `${source}:${flow}`;
-            const label = humanizeLLMType(key);
-            return { key, label };
-        }
-
-        function llmTypePalette(key) {
-            const value = String(key || 'unknown');
-            let hash = 0;
-            for (let i = 0; i < value.length; i += 1) {
-                hash = ((hash << 5) - hash + value.charCodeAt(i)) | 0;
-            }
-            return LLM_TYPE_PALETTE[Math.abs(hash) % LLM_TYPE_PALETTE.length];
-        }
-
-        function llmTypeStyle(key) {
-            const palette = llmTypePalette(key);
-            return `--llm-type-bg: ${palette.bg}; --llm-type-border: ${palette.border}; --llm-type-text: ${palette.text};`;
-        }
-
-        function extractTextFromPart(part) {
-            if (!part) return '';
-            if (typeof part.text === 'string' && part.text.trim() !== '') return part.text;
-            if (typeof part.data === 'string' && part.data.trim() !== '') return part.data;
-            if (typeof part.reasoning === 'string' && part.reasoning.trim() !== '') return part.reasoning;
-
-            if (part.media && part.media.url) {
-                const ct = part.media.contentType || '';
-                return `[media${ct ? ':' + ct : ''}] ${part.media.url}`;
-            }
-            if (part.toolRequest) {
-                const name = part.toolRequest.name || 'tool';
-                const input = part.toolRequest.input !== undefined ? part.toolRequest.input : '';
-                const rendered = typeof input === 'string' ? input : safeStringify(input);
-                return `[toolRequest:${name}] ${rendered}`.trim();
-            }
-            if (part.toolResponse) {
-                const name = part.toolResponse.name || 'tool';
-                const output = part.toolResponse.output !== undefined ? part.toolResponse.output : '';
-                const rendered = typeof output === 'string' ? output : safeStringify(output);
-                return `[toolResponse:${name}] ${rendered}`.trim();
-            }
-            if (part.resource && part.resource.uri) {
-                return `[resource] ${part.resource.uri}`;
-            }
-            if (part.custom) {
-                return `[custom] ${safeStringify(part.custom)}`;
-            }
-            return '';
-        }
-
-        function extractTextFromMessage(message) {
-            if (!message || !Array.isArray(message.content)) return '';
-            return message.content.map(extractTextFromPart).filter(Boolean).join('\n');
-        }
-
-        function extractTextFromJSONValue(value) {
-            const chunks = [];
-            const visit = value => {
-                if (!value) return;
-                if (typeof value === 'string') {
-                    chunks.push(value);
-                    return;
-                }
-                if (Array.isArray(value)) {
-                    value.forEach(visit);
-                    return;
-                }
-                if (typeof value !== 'object') return;
-                if (typeof value.content === 'string') chunks.push(value.content);
-                if (typeof value.text === 'string') chunks.push(value.text);
-                Object.values(value).forEach(child => {
-                    if (child !== value.content && child !== value.text) visit(child);
-                });
-            };
-            visit(value);
-            return chunks.join('\n');
-        }
-
-        function extractTextFromRawLLMRequest(req) {
-            return extractTextFromJSONValue(llmRawRequestValue(req));
-        }
-
-        function extractTextFromRawLLMResponse(req) {
-            return extractTextFromJSONValue(llmRawResponseValue(req));
-        }
-
-        function llmResponsePreview(req) {
-            const direct = req?.result?.response_text_preview || req?.result?.responseTextPreview;
-            if (direct) return compactLLMText(direct, 180);
-            return compactLLMText(extractTextFromRawLLMResponse(req), 180);
-        }
-
-        function llmRequestMatchesQuery(req, q) {
-            if (!q) return true;
-            try {
-                const type = llmRequestType(req);
-                const hay = [
-                    req?.id,
-                    req?.provider,
-                    llmField(req, 'request_kind', 'requestKind'),
-                    req?.source,
-                    req?.flow,
-                    type.key,
-                    type.label,
-                    req?.model,
-                    req?.iteration,
-                    req?.chat?.chat_id,
-                    req?.user?.user_id,
-                    req?.message?.message_id,
-                    req?.result?.error,
-                    req?.result?.response_text_preview,
-                    req?.result?.responseTextPreview,
-                    req?.prompt_chars,
-                    req?.docs_chars,
-                ].join(' ').toLowerCase();
-                if (hay.includes(q)) return true;
-            } catch (_) { }
-
-            try {
-                const rawText = extractTextFromRawLLMRequest(req);
-                if (rawText && rawText.toLowerCase().includes(q)) return true;
-                const responseText = extractTextFromRawLLMResponse(req);
-                if (responseText && responseText.toLowerCase().includes(q)) return true;
-                if (Array.isArray(req?.messages)) {
-                    for (const msg of req.messages) {
-                        const text = extractTextFromMessage(msg);
-                        if (text && text.toLowerCase().includes(q)) return true;
-                    }
-                }
-            } catch (_) { }
-
-            return false;
-        }
-
-        function buildLLMRequestItem(req) {
-            const item = PL.el('div', { class: 'list-item', tabindex: '0', role: 'button' });
-            item.dataset.llmRequestId = String(req.id);
-            if (selectedLLMRequestID === req.id) item.classList.add('active');
-
-            const at = req.at ? new Date(req.at).toLocaleString() : '---';
-            const chatID = req.chat?.chat_id ?? '---';
-            const msgID = req.message?.message_id ?? '---';
-            const model = req.model || '---';
-            const iter = req.iteration || 0;
-            const err = req.result?.error ? 'ERROR' : '';
-            const type = llmRequestType(req);
-
-            let preview = llmResponsePreview(req);
-            const previewKind = preview ? 'response' : 'request';
-            if (!preview) preview = extractTextFromRawLLMRequest(req);
-            const userMsg = Array.isArray(req.messages) ? req.messages.find(m => m && m.role === 'user') : null;
-            if (!preview && userMsg) preview = extractTextFromMessage(userMsg);
-            if (!preview && Array.isArray(req.messages) && req.messages.length > 0) preview = extractTextFromMessage(req.messages[req.messages.length - 1]);
-            preview = compactLLMText(preview, 160);
-
-            const topline = PL.el('div', { class: 'llm-list-topline' }, [
-                PL.el('div', { class: 'llm-list-time' }, at),
-                PL.el('span', { class: 'badge llm-model-badge' }, model),
-            ]);
-
-            const typePill = PL.el('span', { class: 'llm-type-pill', title: type.key }, type.label);
-            typePill.style.cssText = llmTypeStyle(type.key);
-            const tags = PL.el('div', { class: 'llm-list-tags' }, [
-                typePill,
-                PL.el('span', { class: 'llm-preview-source' }, previewKind),
-            ]);
-
-            const meta = PL.el('div', { class: 'text-muted mono llm-list-meta' },
-                `chat:${chatID} msg:${msgID} iter:${iter}${err ? ' | ' + err : ''}`);
-
-            const previewEl = PL.el('div',
-                { class: 'llm-preview ' + (previewKind === 'response' ? 'llm-preview-answer' : 'text-muted') },
-                preview || '—');
-
-            item.appendChild(topline);
-            item.appendChild(tags);
-            item.appendChild(meta);
-            item.appendChild(previewEl);
-
-            item.addEventListener('click', () => selectLLMRequest(req.id));
-            item.addEventListener('keydown', (e) => {
-                if (e.key === 'Enter') { e.preventDefault(); selectLLMRequest(req.id); }
-            });
-            return item;
-        }
-
-        function renderLLMRequests() {
-            const list = document.getElementById('llm-requests-list');
-            if (!list) return;
-
-            const q = (document.getElementById('llm-search-input')?.value || '').toLowerCase().trim();
-            const filtered = (llmRequests || []).filter(r => llmRequestMatchesQuery(r, q));
-
-            if (filtered.length === 0) {
-                PL.empty(list, {
-                    title: 'No LLM requests',
-                    desc: q ? `Nothing matches “${q}”.` : 'No captured requests yet.',
-                });
-                return;
-            }
-
-            list.textContent = '';
-            filtered.forEach(req => list.appendChild(buildLLMRequestItem(req)));
-        }
-
-        function updateSelectedLLMRequestInList() {
-            const list = document.getElementById('llm-requests-list');
-            if (!list) return;
-            list.querySelectorAll('.list-item').forEach(el => {
-                const id = el.dataset.llmRequestId;
-                if (id && selectedLLMRequestID != null && id === String(selectedLLMRequestID)) {
-                    el.classList.add('active');
-                } else {
-                    el.classList.remove('active');
-                }
-            });
-        }
-
-        function clearLLMDetails() {
-            const details = document.getElementById('llm-request-details');
-            if (details) details.textContent = '';
-            clearLLMContextJSON();
-            selectedLLMRequestID = null;
-            updateSelectedLLMRequestInList();
-
-            const detailsPane = document.getElementById('pane-llm-details');
-            const resizer = document.getElementById('resizer-llm');
-            const listPane = document.querySelector('#pane-llm .pane-list');
-            if (detailsPane) detailsPane.classList.add('hidden');
-            if (resizer) resizer.classList.add('hidden');
-            if (listPane) listPane.style.flex = '1';
-        }
-
-        function selectLLMRequest(id) {
-            const detailsPane = document.getElementById('pane-llm-details');
-            const resizer = document.getElementById('resizer-llm');
-            const listPane = document.querySelector('#pane-llm .pane-list');
-
-            if (selectedLLMRequestID == id && detailsPane && !detailsPane.classList.contains('hidden')) {
-                toggleLLMDetails();
-                return;
-            }
-
-            selectedLLMRequestID = id;
-            updateSelectedLLMRequestInList();
-
-            const req = (llmRequests || []).find(r => r && r.id === id);
-            const details = document.getElementById('llm-request-details');
-
-            if (!req) {
-                clearLLMDetails();
-                return;
-            }
-
-            if (detailsPane) detailsPane.classList.remove('hidden');
-            if (resizer) resizer.classList.remove('hidden');
-            if (listPane) listPane.style.flex = '0 0 33%';
-
-            if (details) {
-                const meta = JSON.parse(JSON.stringify(req));
-                delete meta.messages;
-                delete meta.docs;
-                delete meta.raw_request;
-                delete meta.rawRequest;
-                delete meta.resolved_cache_content;
-                delete meta.resolvedCacheContent;
-                delete meta.raw_response;
-                delete meta.rawResponse;
-                details.textContent = JSON.stringify(meta, null, 2);
-            }
-
-            updateLLMContextJSON(req);
-        }
-
-        function clearLLMContextJSON() {
-            const container = document.getElementById('llm-context-json');
-            const empty = document.getElementById('llm-context-json-empty');
-            if (container) container.innerHTML = '';
-            if (empty) {
-                empty.textContent = '';
-                empty.style.display = 'none';
-            }
-        }
-
         function normalizeRawJSONValue(value) {
             if (typeof value !== 'string') return value;
             const trimmed = value.trim();
@@ -4750,69 +5194,6 @@
             } catch (_) {
                 return value;
             }
-        }
-
-        function llmResolvedCacheContentValue(req) {
-            if (!req) return null;
-            if (req.resolved_cache_content !== undefined && req.resolved_cache_content !== null) {
-                return normalizeRawJSONValue(req.resolved_cache_content);
-            }
-            if (req.resolvedCacheContent !== undefined && req.resolvedCacheContent !== null) {
-                return normalizeRawJSONValue(req.resolvedCacheContent);
-            }
-            return null;
-        }
-
-        function llmRawResponseValue(req) {
-            if (!req) return null;
-            if (req.raw_response !== undefined && req.raw_response !== null) return normalizeRawJSONValue(req.raw_response);
-            if (req.rawResponse !== undefined && req.rawResponse !== null) return normalizeRawJSONValue(req.rawResponse);
-            const transport = normalizeRawJSONValue(req.transport);
-            if (transport && typeof transport === 'object' && transport.response !== undefined && transport.response !== null) {
-                return normalizeRawJSONValue(transport.response);
-            }
-            return null;
-        }
-
-        function llmRawRequestValue(req) {
-            if (!req) return null;
-            const resolvedCacheContent = llmResolvedCacheContentValue(req);
-            const withResolvedCache = raw => {
-                if (resolvedCacheContent === null || resolvedCacheContent === undefined) return raw;
-                return {
-                    raw_provider_request: raw,
-                    resolved_cached_content: resolvedCacheContent,
-                };
-            };
-            if (req.raw_request !== undefined && req.raw_request !== null) return withResolvedCache(normalizeRawJSONValue(req.raw_request));
-            if (req.rawRequest !== undefined && req.rawRequest !== null) return withResolvedCache(normalizeRawJSONValue(req.rawRequest));
-            if (Array.isArray(req.messages) || Array.isArray(req.docs)) {
-                return withResolvedCache({ messages: req.messages || [], docs: req.docs || [] });
-            }
-            if (resolvedCacheContent !== null && resolvedCacheContent !== undefined) {
-                return { resolved_cached_content: resolvedCacheContent };
-            }
-            return null;
-        }
-
-        function llmContextValue(req) {
-            if (!req) return null;
-            const context = {
-                type: llmRequestType(req),
-                request: llmRawRequestValue(req),
-                response: llmRawResponseValue(req),
-                result: req.result || null,
-            };
-            if (req.usage) context.usage = normalizeRawJSONValue(req.usage);
-            if (req.timings) context.timings = normalizeRawJSONValue(req.timings);
-            if (req.inference_params || req.inferenceParams) {
-                context.inference_params = normalizeRawJSONValue(req.inference_params || req.inferenceParams);
-            }
-            if (req.transport) context.transport = normalizeRawJSONValue(req.transport);
-            Object.keys(context).forEach(key => {
-                if (context[key] === null || context[key] === undefined) delete context[key];
-            });
-            return Object.keys(context).length > 1 ? context : null;
         }
 
         function jsonNodeKind(value) {
@@ -4844,63 +5225,6 @@
                 trimmed.startsWith('<multi_turn_transport') ||
                 trimmed.startsWith('<tool_result') ||
                 trimmed.startsWith('<system_contract');
-        }
-
-        function buildJSONNode(key, value, depth) {
-            const kind = jsonNodeKind(value);
-            const isObject = value && typeof value === 'object';
-            const isExpandableString = isExpandableJSONString(value);
-            const hasChildren = isObject || isExpandableString;
-
-            const nodeEl = document.createElement('div');
-            nodeEl.className = 'json-node';
-            if (depth === 0) nodeEl.classList.add('root');
-            if (hasChildren && depth > 0) nodeEl.classList.add('collapsed');
-
-            const header = document.createElement('div');
-            header.className = 'json-node-header';
-            if (hasChildren) header.dataset.toggle = 'true';
-
-            const toggle = document.createElement('span');
-            toggle.className = 'json-node-toggle';
-            toggle.textContent = hasChildren ? (nodeEl.classList.contains('collapsed') ? '▸' : '▾') : '';
-            header.appendChild(toggle);
-
-            const keyEl = document.createElement('span');
-            keyEl.className = 'json-node-key';
-            keyEl.textContent = key;
-            header.appendChild(keyEl);
-
-            const typeEl = document.createElement('span');
-            typeEl.className = 'json-node-type';
-            typeEl.textContent = kind;
-            header.appendChild(typeEl);
-
-            const summary = document.createElement('span');
-            summary.className = 'json-node-value';
-            summary.textContent = jsonNodeSummary(value);
-            header.appendChild(summary);
-            nodeEl.appendChild(header);
-
-            if (hasChildren) {
-                const childrenEl = document.createElement('div');
-                childrenEl.className = 'json-node-children';
-                if (Array.isArray(value)) {
-                    value.forEach((item, index) => childrenEl.appendChild(buildJSONNode(`[${index}]`, item, depth + 1)));
-                } else if (isObject) {
-                    Object.keys(value).sort().forEach(childKey => {
-                        childrenEl.appendChild(buildJSONNode(childKey, value[childKey], depth + 1));
-                    });
-                } else {
-                    const textEl = document.createElement('pre');
-                    textEl.className = 'json-string-full';
-                    textEl.textContent = value;
-                    childrenEl.appendChild(textEl);
-                }
-                nodeEl.appendChild(childrenEl);
-            }
-
-            return nodeEl;
         }
 
         function bindJSONTree(container) {
@@ -4942,124 +5266,6 @@
                     parent.classList.add('is-active-ancestor');
                 }
                 parent = parent.parentElement;
-            }
-        }
-
-        function updateLLMContextJSON(req) {
-            const container = document.getElementById('llm-context-json');
-            const empty = document.getElementById('llm-context-json-empty');
-            if (!container || !empty) return;
-            container.innerHTML = '';
-            empty.textContent = '';
-            empty.style.display = 'none';
-
-            const context = llmContextValue(req);
-            if (context === null || context === undefined) {
-                empty.textContent = 'No raw provider context captured';
-                empty.style.display = 'block';
-                return;
-            }
-
-            container.appendChild(buildJSONNode('llm_context', context, 0));
-            bindJSONTree(container);
-        }
-
-        function setAllJSONNodesCollapsed(collapsed) {
-            const container = document.getElementById('llm-context-json');
-            if (!container) return;
-            container.querySelectorAll('.json-node').forEach(node => {
-                const header = node.querySelector(':scope > .json-node-header[data-toggle="true"]');
-                if (!header) return;
-                node.classList.toggle('collapsed', collapsed && !node.classList.contains('root'));
-                const toggle = header.querySelector('.json-node-toggle');
-                if (toggle) toggle.textContent = node.classList.contains('collapsed') ? '▸' : '▾';
-            });
-        }
-
-        function expandLLMJSONTree() {
-            setAllJSONNodesCollapsed(false);
-        }
-
-        function collapseLLMJSONTree() {
-            setAllJSONNodesCollapsed(true);
-        }
-
-        async function loadLLMRequests(force) {
-            if (!force && llmRequestsLoaded && Array.isArray(llmRequests) && llmRequests.length > 0) {
-                return;
-            }
-
-            const details = document.getElementById('llm-request-details');
-            if (details && (!llmRequestsLoaded || force)) {
-                details.textContent = 'Loading...';
-            }
-
-            const list = document.getElementById('llm-requests-list');
-            if (list && (!llmRequestsLoaded || force)) {
-                PL.skeleton(list, { rows: 6 });
-            }
-
-            const data = await apiCall('/llm/requests');
-            if (!data) {
-                if (list) PL.error(list, { message: 'Could not load LLM requests.', onRetry: () => loadLLMRequests(true) });
-                return;
-            }
-
-            llmRequests = data.requests || [];
-            llmRequestsLoaded = true;
-            clearLLMDetails();
-            renderLLMRequests();
-        }
-
-        async function clearLLMRequests() {
-            const ok = await PL.confirm({
-                title: 'Clear LLM requests',
-                body: 'Clear all LLM requests? This drops every captured request from the buffer.',
-                danger: true, okLabel: 'Clear'
-            });
-            if (!ok) return;
-            const data = await apiCall('/llm/requests/clear', { method: 'POST' });
-            if (data) {
-                PL.toast('Cleared', 'success');
-                loadLLMRequests();
-            }
-        }
-
-        async function copySelectedLLMRequest() {
-            const req = (llmRequests || []).find(r => r && r.id === selectedLLMRequestID);
-            if (!req) {
-                PL.toast('No request selected', 'warning');
-                return;
-            }
-
-            const text = JSON.stringify(req, null, 2);
-            try {
-                if (navigator.clipboard && window.isSecureContext) {
-                    await navigator.clipboard.writeText(text);
-                    PL.toast('Copied', 'success');
-                    return;
-                }
-                throw new Error('Clipboard API unavailable (insecure context)');
-            } catch (e) {
-                try {
-                    const ta = document.createElement('textarea');
-                    ta.value = text;
-                    ta.style.position = 'fixed';
-                    ta.style.left = '-9999px';
-                    ta.style.top = '0';
-                    document.body.appendChild(ta);
-                    ta.focus();
-                    ta.select();
-                    const ok = document.execCommand('copy');
-                    document.body.removeChild(ta);
-                    if (ok) {
-                        PL.toast('Copied', 'success');
-                        return;
-                    }
-                    throw new Error('execCommand returned false');
-                } catch (e2) {
-                    PL.toast('Copy failed: ' + (e2.message || e.message), 'error');
-                }
             }
         }
 
@@ -5265,36 +5471,6 @@
                 } catch (e2) {
                     PL.toast('Copy failed: ' + (e2.message || e.message), 'error');
                 }
-            }
-        }
-
-        async function copySelectedLLMRawRequest() {
-            const req = (llmRequests || []).find(r => r && r.id === selectedLLMRequestID);
-            const raw = llmContextValue(req);
-            if (raw === null || raw === undefined) {
-                PL.toast('No raw context selected', 'warning');
-                return;
-            }
-            const text = typeof raw === 'string' ? raw : JSON.stringify(raw, null, 2);
-            try {
-                if (navigator.clipboard && window.isSecureContext) {
-                    await navigator.clipboard.writeText(text);
-                    PL.toast('Copied', 'success');
-                    return;
-                }
-                const ta = document.createElement('textarea');
-                ta.value = text;
-                ta.style.position = 'fixed';
-                ta.style.left = '-9999px';
-                ta.style.top = '0';
-                document.body.appendChild(ta);
-                ta.focus();
-                ta.select();
-                const ok = document.execCommand('copy');
-                document.body.removeChild(ta);
-                if (ok) PL.toast('Copied', 'success');
-            } catch (e) {
-                PL.toast('Copy failed: ' + (e.message || e), 'error');
             }
         }
 
