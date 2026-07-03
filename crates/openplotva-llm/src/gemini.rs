@@ -2913,7 +2913,7 @@ mod tests {
         }
     }
 
-    impl DialogToolbox for RecordingToolbox {
+    impl openplotva_dialog::DialogToolbox for RecordingToolbox {
         fn draw_image<'a>(
             &'a self,
             req: openplotva_dialog::DrawRequest,

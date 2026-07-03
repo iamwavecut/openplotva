@@ -6325,7 +6325,7 @@ mod tests {
         }
     }
 
-    impl DialogToolbox for FakeToolbox {
+    impl openplotva_dialog::DialogToolbox for FakeToolbox {
         fn currency_rates<'a>(
             &'a self,
             _meta: RatesRequest,
