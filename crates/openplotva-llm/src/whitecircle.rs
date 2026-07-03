@@ -17,11 +17,13 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use openplotva_core::ChatAttachment;
 use openplotva_dialog::{
-    DEFAULT_CONTEXT_HISTORY_LIMIT, DialogInput, ROLE_MODEL, ROLE_USER,
+    ChatStepRequest, DEFAULT_CONTEXT_HISTORY_LIMIT, DialogInput, ROLE_MODEL, ROLE_USER,
     select_history_messages_for_context,
 };
 
-use crate::{ChatProvider, ChatProviderFuture, ChatProviderHandle};
+use crate::{
+    ChatProvider, ChatProviderFuture, ChatProviderHandle, ChatStepFuture, ChatStepProvider,
+};
 
 const WHITE_CIRCLE_ENDPOINT_DEFAULT: &str = "https://eu.whitecircle.ai/api/session/check";
 const WHITE_CIRCLE_VERSION_DEFAULT: &str = "2025-12-01";
@@ -948,6 +950,49 @@ where
             self.inner.run_dialog(input).await
         })
     }
+
+    fn as_chat_step(&self) -> Option<&dyn ChatStepProvider> {
+        // The audit wrap must not hide the inner step seam: without this
+        // passthrough the session engine silently falls back to the legacy
+        // loop whenever WhiteCircle is enabled.
+        self.inner.as_chat_step()?;
+        Some(self)
+    }
+}
+
+impl<T> ChatStepProvider for WhiteCirclePreToolChatProvider<T>
+where
+    T: WhiteCircleTransport,
+{
+    fn provider_name(&self) -> &str {
+        self.inner.provider_name()
+    }
+
+    fn supports_native_tools(&self) -> bool {
+        self.inner
+            .as_chat_step()
+            .is_some_and(ChatStepProvider::supports_native_tools)
+    }
+
+    fn run_chat_step<'a>(&'a self, request: ChatStepRequest) -> ChatStepFuture<'a> {
+        Box::pin(async move {
+            let Some(step) = self.inner.as_chat_step() else {
+                let error: crate::ChatProviderError = Box::new(crate::retry::ProviderError::new(
+                    self.inner.provider_name(),
+                    crate::retry::FailureReason::ProviderUnavailable,
+                    "provider has no chat-step support",
+                ));
+                return Err(error);
+            };
+            // One fire-and-forget check per session (the transcript is empty
+            // only on the first step), matching the single per-turn check the
+            // legacy run_dialog path dispatches.
+            if request.transcript.is_empty() {
+                self.dispatch_pre_tool_check(request.input.clone());
+            }
+            step.run_chat_step(request).await
+        })
+    }
 }
 
 async fn run_white_circle_pre_tool_check<T>(
@@ -1398,5 +1443,169 @@ mod tests {
         assert_eq!(event.external_session_id.as_deref(), Some("session-x"));
         assert_ne!(event.chat_id, Some(100));
         assert_ne!(event.user_id, Some(200));
+    }
+
+    #[derive(Default)]
+    struct SteppedInnerProvider {
+        step_calls: Arc<Mutex<usize>>,
+    }
+
+    impl ChatProvider for SteppedInnerProvider {
+        fn provider_name(&self) -> &str {
+            "stepped-inner"
+        }
+
+        fn run_dialog<'a>(&'a self, _input: DialogInput) -> ChatProviderFuture<'a> {
+            Box::pin(async move { Err("run_dialog not expected".into()) })
+        }
+
+        fn as_chat_step(&self) -> Option<&dyn ChatStepProvider> {
+            Some(self)
+        }
+    }
+
+    impl ChatStepProvider for SteppedInnerProvider {
+        fn provider_name(&self) -> &str {
+            "stepped-inner"
+        }
+
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+
+        fn run_chat_step<'a>(&'a self, _request: ChatStepRequest) -> ChatStepFuture<'a> {
+            Box::pin(async move {
+                *self.step_calls.lock().expect("step calls") += 1;
+                Ok(openplotva_dialog::ChatStepOutput {
+                    provider: "stepped-inner".to_owned(),
+                    text: "step reply".to_owned(),
+                    ..openplotva_dialog::ChatStepOutput::default()
+                })
+            })
+        }
+    }
+
+    struct SteplessInnerProvider;
+
+    impl ChatProvider for SteplessInnerProvider {
+        fn provider_name(&self) -> &str {
+            "stepless-inner"
+        }
+
+        fn run_dialog<'a>(&'a self, _input: DialogInput) -> ChatProviderFuture<'a> {
+            Box::pin(async move { Err("run_dialog not expected".into()) })
+        }
+    }
+
+    fn pre_tool_provider_with_inner(
+        inner: ChatProviderHandle,
+        transport: FakeTransport,
+    ) -> WhiteCirclePreToolChatProvider<FakeTransport> {
+        WhiteCirclePreToolChatProvider::new(
+            inner,
+            WhiteCircleClient::with_transport(
+                WhiteCircleClientConfig {
+                    enabled: true,
+                    api_key: "test-key".to_owned(),
+                    deployment_id: "deployment-1".to_owned(),
+                    endpoint: "https://whitecircle.test/check".to_owned(),
+                    version: "2025-12-01".to_owned(),
+                    request_timeout: Duration::from_secs(2),
+                },
+                transport,
+            ),
+            None,
+            WhiteCirclePreToolConfig::default(),
+        )
+    }
+
+    fn step_check_input() -> DialogInput {
+        DialogInput {
+            context: DialogContext {
+                chat_id: 100,
+                ..DialogContext::default()
+            },
+            user: DialogUser {
+                id: 200,
+                full_name: "tester".to_owned(),
+            },
+            message: DialogMessage {
+                id: 300,
+                normalized: "hello".to_owned(),
+                ..DialogMessage::default()
+            },
+            ..DialogInput::default()
+        }
+    }
+
+    async fn wait_for_dispatched_checks(transport: &FakeTransport, expected: usize) -> usize {
+        for _ in 0..100 {
+            let seen = transport.requests.lock().expect("requests").len();
+            if seen >= expected {
+                return seen;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        transport.requests.lock().expect("requests").len()
+    }
+
+    #[test]
+    fn whitecircle_wrapper_step_seam_mirrors_inner_provider() {
+        let stepped = pre_tool_provider_with_inner(
+            Arc::new(SteppedInnerProvider::default()),
+            FakeTransport::default(),
+        );
+        let seam = stepped.as_chat_step().expect("step seam passes through");
+        assert!(seam.supports_native_tools());
+
+        let stepless =
+            pre_tool_provider_with_inner(Arc::new(SteplessInnerProvider), FakeTransport::default());
+        assert!(stepless.as_chat_step().is_none());
+    }
+
+    #[tokio::test]
+    async fn whitecircle_step_delegates_and_checks_only_the_first_iteration() {
+        let inner = Arc::new(SteppedInnerProvider::default());
+        let step_calls = Arc::clone(&inner.step_calls);
+        let transport = FakeTransport::default();
+        *transport.response.lock().expect("response") = Some(Ok(WhiteCircleHttpResponse {
+            status: 200,
+            body: br#"{"flagged":false,"internal_session_id":"s","policies":{}}"#.to_vec(),
+        }));
+        let provider = pre_tool_provider_with_inner(inner, transport.clone());
+        let seam = provider.as_chat_step().expect("step seam");
+
+        let first = seam
+            .run_chat_step(ChatStepRequest {
+                input: step_check_input(),
+                transcript: Vec::new(),
+                tools: openplotva_dialog::ToolsMode::Disabled,
+                iteration: 1,
+            })
+            .await
+            .expect("first step");
+        assert_eq!(first.text, "step reply");
+        assert_eq!(wait_for_dispatched_checks(&transport, 1).await, 1);
+
+        let second = seam
+            .run_chat_step(ChatStepRequest {
+                input: step_check_input(),
+                transcript: vec![openplotva_dialog::SessionMessage::Assistant {
+                    text: "step reply".to_owned(),
+                    tool_calls: Vec::new(),
+                }],
+                tools: openplotva_dialog::ToolsMode::Disabled,
+                iteration: 2,
+            })
+            .await
+            .expect("second step");
+        assert_eq!(second.text, "step reply");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            transport.requests.lock().expect("requests").len(),
+            1,
+            "later iterations must not re-dispatch the audit check"
+        );
+        assert_eq!(*step_calls.lock().expect("step calls"), 2);
     }
 }
