@@ -2901,45 +2901,6 @@ mod tests {
         }
     }
 
-    #[derive(Clone, Default)]
-    struct RecordingToolbox {
-        draw_prompts: Arc<Mutex<Vec<String>>>,
-    }
-
-    impl RecordingToolbox {
-        fn draw_prompts(&self) -> Vec<String> {
-            self.draw_prompts.lock().expect("draw prompt state").clone()
-        }
-    }
-
-    impl openplotva_dialog::DialogToolbox for RecordingToolbox {
-        fn draw_image<'a>(
-            &'a self,
-            req: openplotva_dialog::DrawRequest,
-        ) -> openplotva_dialog::ToolboxFuture<'a> {
-            Box::pin(async move {
-                self.draw_prompts
-                    .lock()
-                    .expect("draw prompt state")
-                    .push(req.prompt);
-                Ok(openplotva_dialog::ToolResult {
-                    status: openplotva_dialog::TOOL_RESULT_STATUS_OK.to_owned(),
-                    message: "tool ok".to_owned(),
-                    ..openplotva_dialog::ToolResult::default()
-                })
-            })
-        }
-    }
-
-    #[derive(Default)]
-    struct GeminiRecordingObserver(Arc<Mutex<Vec<crate::trace::LlmCallRecord>>>);
-
-    impl crate::trace::LlmCallObserver for GeminiRecordingObserver {
-        fn observe(&self, record: crate::trace::LlmCallRecord) {
-            self.0.lock().expect("observer mutex").push(record);
-        }
-    }
-
     #[test]
     fn gemini_aux_trace_artifacts_tags_flow_and_model() {
         let request = GeminiGenerateContentRequest {
@@ -3413,20 +3374,6 @@ mod tests {
             crate::retry::retryable_reason(error.as_ref()),
             Some(FailureReason::ProviderOverloaded)
         );
-    }
-
-    fn sample_input() -> DialogInput {
-        let mut input = DialogInput::default();
-        input.context.bot_name = "Plotva".to_owned();
-        input.context.chat_title = "Test chat".to_owned();
-        input.context.locale = "ru".to_owned();
-        input.user.id = 42;
-        input.user.full_name = "User".to_owned();
-        input.message.id = 100;
-        input.message.text = "hello".to_owned();
-        input.message.normalized = "hello".to_owned();
-        input.max_output_tokens = 512;
-        input
     }
 
     fn json_response(value: Value) -> AifarmHttpResponse {

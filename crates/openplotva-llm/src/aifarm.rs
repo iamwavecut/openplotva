@@ -2431,12 +2431,23 @@ where
             return Err(aifarm_step_error_with_trace(error, trace));
         };
 
+        // FinalOnly keeps the tool-aware prompt for cache stability but the
+        // engine executes nothing on that pass: parse tool calls only when a
+        // tools array was actually offered, so stray tool markup on the
+        // forced-final step degrades to sanitized text instead of an empty
+        // answer.
         let tools_offered =
-            !request.input.disable_tools && !matches!(request.tools, ToolsMode::Disabled);
+            !request.input.disable_tools && matches!(request.tools, ToolsMode::Native(_));
         if !tools_offered {
+            let strip_markup = !matches!(request.tools, ToolsMode::Disabled);
             let text = match extract_final_answer_for_provider(response, self.provider()) {
                 Ok(text) => text,
                 Err(error) => return Err(aifarm_step_error_with_trace(error, trace)),
+            };
+            let text = if strip_markup {
+                sanitize_tool_text(&text)
+            } else {
+                text
             };
             return Ok(ChatStepOutput {
                 provider: self.provider().to_owned(),
@@ -6281,24 +6292,8 @@ mod tests {
             }
         }
 
-        fn calls(&self) -> Vec<String> {
-            self.state().calls.clone()
-        }
-
-        fn draw_requests(&self) -> Vec<DrawRequest> {
-            self.state().draw_requests.clone()
-        }
-
-        fn vision_requests(&self) -> Vec<VisionRequest> {
-            self.state().vision_requests.clone()
-        }
-
         fn web_search_queries(&self) -> Vec<String> {
             self.state().web_search_queries.clone()
-        }
-
-        fn history_search_queries(&self) -> Vec<String> {
-            self.state().history_search_queries.clone()
         }
 
         fn record(
@@ -7724,6 +7719,37 @@ mod tests {
                 .is_some_and(|tools| !tools.is_empty()),
             "native step carries the tools array"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn chat_step_final_only_never_yields_tool_calls_or_empty_text()
+    -> Result<(), CompletionError> {
+        // The forced-final pass must not interpret tool-call markup: the
+        // session engine reads only `text` there, so salvaged calls with an
+        // emptied text would look like an empty provider answer.
+        let response = json!({
+            "choices": [{"message": {
+                "role": "assistant",
+                "content": "почти забыла <tool_call>{\"name\": \"web_search\", \"arguments\": {\"query\": \"солнцестояние\"}}</tool_call>"
+            }}]
+        });
+        let (provider, _transport, _) =
+            direct_dialog_provider(response, AifarmDialogConfig::default());
+
+        let output = crate::ChatStepProvider::run_chat_step(
+            &provider,
+            openplotva_dialog::ChatStepRequest {
+                input: base_input(),
+                transcript: Vec::new(),
+                tools: openplotva_dialog::ToolsMode::FinalOnly,
+                iteration: 3,
+            },
+        )
+        .await?;
+
+        assert!(output.tool_calls.is_empty(), "{:?}", output.tool_calls);
+        assert_eq!(output.text, "почти забыла");
         Ok(())
     }
 
