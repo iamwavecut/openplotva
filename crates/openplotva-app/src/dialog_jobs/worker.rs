@@ -638,7 +638,7 @@ where
                             turn_outcomes: options.turn_outcomes,
                             terminal_signal: options.terminal_signal,
                             obligations: options.obligations,
-                            session: None,
+                            session: options.session,
                         },
                     ).await;
                     trace_dialog_job_tick(&tick);

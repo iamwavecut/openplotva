@@ -2920,6 +2920,82 @@ async fn session_runs_tool_round_then_final_text() -> Result<(), Box<dyn Error>>
     Ok(())
 }
 
+/// The production entry point is the worker LOOP, not the single-shot process
+/// call the other session tests use; this pins the loop forwarding
+/// `LoopOptions.session` into every tick (a dropped option silently reverts
+/// prod to the legacy provider loop — the stub's `run_dialog` panics on that).
+#[tokio::test]
+async fn worker_loop_forwards_session_wiring_to_turns() -> Result<(), Box<dyn Error>> {
+    let now = OffsetDateTime::now_utc();
+    let queue = InMemoryTaskQueue::new();
+    let job_id = queue.assign(
+        DIALOG_AIFARM_QUEUE_NAME,
+        new_dialog_job_at(dialog_params("когда солнцестояние?"), now),
+    );
+    let provider = StepProviderStub::with_steps(vec![
+        Ok(step_tools(
+            "",
+            vec![(
+                "call-1",
+                openplotva_dialog::ToolStep {
+                    step: openplotva_dialog::STEP_WEB_SEARCH.to_owned(),
+                    query: "солнцестояние 2026".to_owned(),
+                    ..openplotva_dialog::ToolStep::default()
+                },
+            )],
+        )),
+        Ok(step_text("21 июня, лови")),
+    ]);
+    let toolbox: Arc<dyn openplotva_dialog::DialogToolbox> =
+        Arc::new(SessionToolboxStub::default());
+    let wiring = session_wiring(toolbox, None);
+    let effects = EffectsStub::default();
+    let outcomes = crate::dialog_turn::DialogTurnObserver::new(
+        crate::dialog_turn::RuntimeTurnOutcomeBuffer::new(8),
+        None,
+    );
+
+    let stop = async {
+        for _ in 0..500 {
+            if record_status(&queue, job_id) == JobStatus::Completed {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    };
+    run_dialog_job_worker_with_materializer_and_history_every_until(
+        &queue,
+        &provider,
+        &effects,
+        DialogJobWorkerLoopOptions {
+            materializer: &BasicDialogInputMaterializer,
+            tool_history: &NoopDialogToolCallHistoryStore,
+            routing_events: None,
+            turn_outcomes: Some(&outcomes),
+            queue_names: &DIALOG_JOB_WORKER_QUEUES,
+            interval: std::time::Duration::from_millis(5),
+            max_llm_job_attempts: 2,
+            turn_budget_secs: DEFAULT_DIALOG_TURN_BUDGET_SECS,
+            turn_max_queue_age_secs: DEFAULT_DIALOG_TURN_MAX_QUEUE_AGE_SECS,
+            max_regenerations: DEFAULT_DIALOG_TURN_MAX_REGENERATIONS,
+            terminal_signal: crate::dialog_turn::TurnSignalPolicy::default(),
+            obligations: None,
+            session: Some(&wiring),
+        },
+        stop,
+    )
+    .await;
+
+    assert_eq!(record_status(&queue, job_id), JobStatus::Completed);
+    assert_eq!(effects.sent().len(), 1);
+    assert_eq!(effects.sent()[0].1, "21 июня, лови");
+    assert_eq!(provider.requests().len(), 2);
+    let rows = ledger_rows(&outcomes);
+    assert_eq!(rows[0].outcome, "sent");
+    assert_eq!(rows[0].detail["iterations"], serde_json::json!(2));
+    Ok(())
+}
+
 #[tokio::test]
 async fn session_sends_announcement_next_to_tool_calls() -> Result<(), Box<dyn Error>> {
     let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
