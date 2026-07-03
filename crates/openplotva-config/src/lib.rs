@@ -774,8 +774,9 @@ pub struct DialogConfig {
     /// lifecycle reactions on the trigger message, gallery appears with the
     /// first image) or `placeholder` (legacy ⏳ message edited in place).
     pub draw_ux: String,
-    /// Dialog session engine kill switch, from `DIALOG_AGENT_LOOP_ENABLED`.
-    /// Off = the legacy provider-internal tool loop handles every turn.
+    /// Dialog session engine kill switch, from `DIALOG_AGENT_LOOP_ENABLED`
+    /// (default ON). Setting it to false reverts every turn to the legacy
+    /// provider-internal tool loop.
     pub agent_loop_enabled: bool,
     /// Canary allowlist for the session engine, from `DIALOG_AGENT_LOOP_CHATS`
     /// (comma-separated chat ids; empty = all chats once the switch is on).
@@ -795,8 +796,8 @@ pub struct DialogConfig {
     /// Song generations per session, from `DIALOG_SESSION_MAX_SONGS`.
     pub session_max_songs: i32,
     /// One active session per (chat, thread) with initiator-only injection,
-    /// from `DIALOG_SESSION_INJECTION_ENABLED`. Off = today's parallel
-    /// per-(chat, user, thread) turns.
+    /// from `DIALOG_SESSION_INJECTION_ENABLED` (default ON). Off = the old
+    /// parallel per-(chat, user, thread) turns.
     pub session_injection_enabled: bool,
     pub vmlx_url: String,
     pub vmlx_api_key: String,
@@ -2332,7 +2333,7 @@ impl AppConfig {
                     agent_loop_enabled: parse_bool(
                         "DIALOG_AGENT_LOOP_ENABLED",
                         raw.dialog_agent_loop_enabled,
-                        false,
+                        true,
                     )?,
                     agent_loop_chats: parse_i64_list_or_default(
                         "DIALOG_AGENT_LOOP_CHATS",
@@ -2372,7 +2373,7 @@ impl AppConfig {
                     session_injection_enabled: parse_bool(
                         "DIALOG_SESSION_INJECTION_ENABLED",
                         raw.dialog_session_injection_enabled,
-                        false,
+                        true,
                     )?,
                     vmlx_url: raw
                         .dialog_vmlx_url
