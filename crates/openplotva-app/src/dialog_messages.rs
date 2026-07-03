@@ -3357,6 +3357,7 @@ mod tests {
                     routing_events: None,
                     turn_outcomes: None,
                     session: &wiring,
+                    llm_runs: None,
                 },
             )
             .await;
@@ -3531,6 +3532,7 @@ mod tests {
                     routing_events: None,
                     turn_outcomes: None,
                     session: &wiring,
+                    llm_runs: None,
                 },
             )
             .await;

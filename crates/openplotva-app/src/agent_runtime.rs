@@ -659,6 +659,82 @@ impl SongAgentSettings {
     }
 }
 
+static AGENT_RUN_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn next_agent_run_id(prefix: &str) -> String {
+    let counter = AGENT_RUN_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    format!("{prefix}-{}-{counter}", now_unix_ms())
+}
+
+fn agent_run_origin(
+    origin: &AgentOrigin,
+    trigger_preview: &str,
+) -> crate::runtime_llm_runs::RunOrigin {
+    crate::runtime_llm_runs::RunOrigin {
+        chat_id: origin.chat_id,
+        thread_id: origin.thread_id,
+        chat_title: None,
+        user_id: origin.user_id,
+        user_full_name: (!origin.user_full_name.trim().is_empty())
+            .then(|| origin.user_full_name.clone()),
+        trigger_message_id: origin.message_id,
+        trigger_preview: (!trigger_preview.trim().is_empty())
+            .then(|| trigger_preview.chars().take(120).collect()),
+        queue_name: None,
+        job_id: None,
+    }
+}
+
+fn finish_agent_run(
+    runs: Option<&crate::runtime_llm_runs::RuntimeLlmRunBuffer>,
+    run_id: &str,
+    result: &Result<AgentState, String>,
+) {
+    let Some(runs) = runs else {
+        return;
+    };
+    let (status, outcome, error) = match result {
+        Err(error) => (
+            crate::runtime_llm_runs::RunStatus::Failed,
+            None,
+            Some(error.clone()),
+        ),
+        Ok(state) => match &state.outcome {
+            Some(AgentOutcome::Completed { .. }) => (
+                crate::runtime_llm_runs::RunStatus::Completed,
+                Some(crate::runtime_llm_runs::RunOutcome {
+                    outcome: "completed".to_owned(),
+                    ..crate::runtime_llm_runs::RunOutcome::default()
+                }),
+                None,
+            ),
+            Some(AgentOutcome::Stopped { reason, .. }) => (
+                crate::runtime_llm_runs::RunStatus::Completed,
+                Some(crate::runtime_llm_runs::RunOutcome {
+                    outcome: "stopped".to_owned(),
+                    reason: Some(format!("{reason:?}")),
+                    ..crate::runtime_llm_runs::RunOutcome::default()
+                }),
+                None,
+            ),
+            Some(AgentOutcome::Failed { reason }) => (
+                crate::runtime_llm_runs::RunStatus::Failed,
+                None,
+                Some(reason.clone()),
+            ),
+            None => (
+                crate::runtime_llm_runs::RunStatus::Completed,
+                Some(crate::runtime_llm_runs::RunOutcome {
+                    outcome: "empty".to_owned(),
+                    ..crate::runtime_llm_runs::RunOutcome::default()
+                }),
+                None,
+            ),
+        },
+    };
+    runs.finish_run(run_id, status, outcome, error, OffsetDateTime::now_utc());
+}
+
 /// A `SongMaterialProvider` that writes lyrics with the multi-step song agent
 /// (gathering context via web/history/memory) and parses the structured result.
 /// Falls back to the wrapped provider (the single-pass reprompt) when the agent
@@ -668,6 +744,7 @@ pub struct SongAgentMaterialProvider {
     settings: SongAgentSettings,
     tools: Option<Arc<dyn AgentTools>>,
     fallback: Arc<dyn SongMaterialProvider + Send + Sync>,
+    llm_runs: Option<crate::runtime_llm_runs::RuntimeLlmRunBuffer>,
 }
 
 impl SongAgentMaterialProvider {
@@ -683,7 +760,15 @@ impl SongAgentMaterialProvider {
             settings,
             tools,
             fallback,
+            llm_runs: None,
         }
+    }
+
+    /// Record song-agent runs in the admin LLM Dialogs buffer.
+    #[must_use]
+    pub fn with_run_buffer(mut self, runs: crate::runtime_llm_runs::RuntimeLlmRunBuffer) -> Self {
+        self.llm_runs = Some(runs);
+        self
     }
 
     async fn run_agent(
@@ -712,28 +797,48 @@ impl SongAgentMaterialProvider {
                 ..RoutedRequestContext::default()
             },
         );
-        let mut state = AgentState::new("song", topic, origin, now_unix_ms());
-        loop {
-            match advance_one_step(
-                &profile,
-                &reasoner_adapter,
-                tools.as_ref(),
-                state,
-                now_unix_ms(),
-            )
-            .await
-            {
-                Ok(StepProgress::Continue(next)) => state = next,
-                Ok(StepProgress::Terminal(next)) => {
-                    state = next;
-                    break;
-                }
-                Err(error) => {
-                    tracing::warn!(%error, "song agent step failed");
-                    return None;
-                }
-            }
+        let run_id = next_agent_run_id("song");
+        if let Some(runs) = &self.llm_runs {
+            runs.begin_run(
+                run_id.clone(),
+                "song_optimizer",
+                agent_run_origin(&origin, topic),
+                OffsetDateTime::now_utc(),
+            );
         }
+        let result = openplotva_llm::with_run_scope(
+            openplotva_llm::LlmRunScope {
+                run_id: run_id.clone(),
+                run_kind: "song_optimizer".to_owned(),
+            },
+            async {
+                let mut state = AgentState::new("song", topic, origin, now_unix_ms());
+                loop {
+                    match advance_one_step(
+                        &profile,
+                        &reasoner_adapter,
+                        tools.as_ref(),
+                        state,
+                        now_unix_ms(),
+                    )
+                    .await
+                    {
+                        Ok(StepProgress::Continue(next)) => state = next,
+                        Ok(StepProgress::Terminal(next)) => return Ok(next),
+                        Err(error) => return Err(error.to_string()),
+                    }
+                }
+            },
+        )
+        .await;
+        finish_agent_run(self.llm_runs.as_ref(), &run_id, &result);
+        let state = match result {
+            Ok(state) => state,
+            Err(error) => {
+                tracing::warn!(%error, "song agent step failed");
+                return None;
+            }
+        };
         match &state.outcome {
             Some(AgentOutcome::Completed { answer }) => parse_song_material(answer),
             Some(AgentOutcome::Stopped { partial, .. }) => parse_song_material(partial),
@@ -911,6 +1016,7 @@ pub struct ImageAgentImageGenerator<Inner> {
     reasoner: Option<Arc<AgentProviderClient>>,
     tools: Option<Arc<dyn AgentTools>>,
     settings: ImageAgentSettings,
+    llm_runs: Option<crate::runtime_llm_runs::RuntimeLlmRunBuffer>,
 }
 
 impl<Inner> ImageAgentImageGenerator<Inner> {
@@ -926,7 +1032,15 @@ impl<Inner> ImageAgentImageGenerator<Inner> {
             reasoner,
             tools,
             settings,
+            llm_runs: None,
         }
+    }
+
+    /// Record image-agent runs in the admin LLM Dialogs buffer.
+    #[must_use]
+    pub fn with_run_buffer(mut self, runs: crate::runtime_llm_runs::RuntimeLlmRunBuffer) -> Self {
+        self.llm_runs = Some(runs);
+        self
     }
 }
 
@@ -960,28 +1074,49 @@ where
                 ..RoutedRequestContext::default()
             },
         );
-        let mut state = AgentState::new("image", request.prompt.as_str(), origin, now_unix_ms());
-        loop {
-            match advance_one_step(
-                &profile,
-                &reasoner_adapter,
-                tools.as_ref(),
-                state,
-                now_unix_ms(),
-            )
-            .await
-            {
-                Ok(StepProgress::Continue(next)) => state = next,
-                Ok(StepProgress::Terminal(next)) => {
-                    state = next;
-                    break;
-                }
-                Err(error) => {
-                    tracing::warn!(%error, "image agent step failed");
-                    return None;
-                }
-            }
+        let run_id = next_agent_run_id("image");
+        if let Some(runs) = &self.llm_runs {
+            runs.begin_run(
+                run_id.clone(),
+                "image_optimizer",
+                agent_run_origin(&origin, request.prompt.as_str()),
+                OffsetDateTime::now_utc(),
+            );
         }
+        let result = openplotva_llm::with_run_scope(
+            openplotva_llm::LlmRunScope {
+                run_id: run_id.clone(),
+                run_kind: "image_optimizer".to_owned(),
+            },
+            async {
+                let mut state =
+                    AgentState::new("image", request.prompt.as_str(), origin, now_unix_ms());
+                loop {
+                    match advance_one_step(
+                        &profile,
+                        &reasoner_adapter,
+                        tools.as_ref(),
+                        state,
+                        now_unix_ms(),
+                    )
+                    .await
+                    {
+                        Ok(StepProgress::Continue(next)) => state = next,
+                        Ok(StepProgress::Terminal(next)) => return Ok(next),
+                        Err(error) => return Err(error.to_string()),
+                    }
+                }
+            },
+        )
+        .await;
+        finish_agent_run(self.llm_runs.as_ref(), &run_id, &result);
+        let state = match result {
+            Ok(state) => state,
+            Err(error) => {
+                tracing::warn!(%error, "image agent step failed");
+                return None;
+            }
+        };
         match &state.outcome {
             Some(AgentOutcome::Completed { answer }) => parse_image_prompt(answer),
             Some(AgentOutcome::Stopped { partial, .. }) => parse_image_prompt(partial),

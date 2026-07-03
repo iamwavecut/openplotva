@@ -232,6 +232,7 @@ impl PostgresDialogTurnOutcomeRecorder {
 pub struct DialogTurnObserver {
     buffer: RuntimeTurnOutcomeBuffer,
     recorder: Option<PostgresDialogTurnOutcomeRecorder>,
+    runs: Option<crate::runtime_llm_runs::RuntimeLlmRunBuffer>,
 }
 
 impl DialogTurnObserver {
@@ -240,10 +241,49 @@ impl DialogTurnObserver {
         buffer: RuntimeTurnOutcomeBuffer,
         recorder: Option<PostgresDialogTurnOutcomeRecorder>,
     ) -> Self {
-        Self { buffer, recorder }
+        Self {
+            buffer,
+            recorder,
+            runs: None,
+        }
+    }
+
+    /// Close the matching agent-run record whenever a turn outcome lands.
+    #[must_use]
+    pub fn with_run_buffer(mut self, runs: crate::runtime_llm_runs::RuntimeLlmRunBuffer) -> Self {
+        self.runs = Some(runs);
+        self
     }
 
     pub fn record(&self, record: DialogTurnOutcomeRecord) {
+        if let Some(runs) = &self.runs {
+            let status = match record.outcome.as_str() {
+                TURN_OUTCOME_TERMINAL_FAILED | TURN_OUTCOME_SKIPPED => {
+                    crate::runtime_llm_runs::RunStatus::Failed
+                }
+                _ => crate::runtime_llm_runs::RunStatus::Completed,
+            };
+            let error = matches!(status, crate::runtime_llm_runs::RunStatus::Failed).then(|| {
+                record
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| record.outcome.clone())
+            });
+            runs.finish_run(
+                &format!("job-{}", record.job_id),
+                status,
+                Some(crate::runtime_llm_runs::RunOutcome {
+                    outcome: record.outcome.clone(),
+                    reason: record.reason.clone(),
+                    user_signal: record.user_signal.clone(),
+                    sent_message_parts: record.sent_message_parts,
+                    side_effect_ticket_id: record.side_effect_ticket_id,
+                    detail: record.detail.clone(),
+                }),
+                error,
+                record.created_at,
+            );
+        }
         self.buffer.record(&record);
         if let Some(recorder) = &self.recorder {
             recorder.enqueue(record);

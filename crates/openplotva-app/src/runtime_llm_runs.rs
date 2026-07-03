@@ -17,6 +17,9 @@ pub const DEFAULT_LLM_RUN_BUFFER_CAPACITY: usize = 512;
 /// Per-round response text kept on the skeleton.
 const RUN_ROUND_RESPONSE_TEXT_MAX_CHARS: usize = 8_000;
 
+/// Serialized tool args/results kept on the skeleton.
+const RUN_TOOL_JSON_MAX_CHARS: usize = 4_000;
+
 /// List-level preview length of the final response.
 const RUN_PREVIEW_MAX_CHARS: usize = 200;
 
@@ -66,6 +69,10 @@ pub struct RunToolCall {
     pub name: String,
     pub status: String,
     pub duration_ms: Option<i64>,
+    /// Serialized tool arguments, capped at [`RUN_TOOL_JSON_MAX_CHARS`].
+    pub args_json: Option<String>,
+    /// Serialized tool result, capped at [`RUN_TOOL_JSON_MAX_CHARS`].
+    pub result_json: Option<String>,
 }
 
 /// Whether a round's text reached the chat.
@@ -253,9 +260,6 @@ impl RuntimeLlmRunBuffer {
         round.response_text = round
             .response_text
             .map(|text| cap_chars(&text, RUN_ROUND_RESPONSE_TEXT_MAX_CHARS));
-        if record.origin.chat_title.is_none() {
-            record.origin.chat_title = round.flow.as_ref().and(None);
-        }
         record.totals.rounds += 1;
         if round.is_aux {
             record.totals.aux_rounds += 1;
@@ -271,7 +275,13 @@ impl RuntimeLlmRunBuffer {
     }
 
     /// Attach an executed tool result to the run's latest round.
-    pub fn record_tool_result(&self, run_id: &str, tool: RunToolCall) {
+    pub fn record_tool_result(&self, run_id: &str, mut tool: RunToolCall) {
+        tool.args_json = tool
+            .args_json
+            .map(|json| cap_chars(&json, RUN_TOOL_JSON_MAX_CHARS));
+        tool.result_json = tool
+            .result_json
+            .map(|json| cap_chars(&json, RUN_TOOL_JSON_MAX_CHARS));
         let mut inner = self.lock();
         let Some(record) = inner.open.get_mut(run_id) else {
             return;
@@ -375,7 +385,7 @@ impl RuntimeLlmRunBuffer {
         let limit = if filter.limit == 0 { 200 } else { filter.limit };
         let mut out: Vec<RunRecord> = Vec::new();
         let mut open: Vec<&RunRecord> = inner.open.values().collect();
-        open.sort_by(|a, b| b.id.cmp(&a.id));
+        open.sort_by_key(|record| std::cmp::Reverse(record.id));
         let ring_len = inner.ring.len().max(1);
         let closed = (0..inner.count.min(inner.ring.len())).filter_map(|offset| {
             let idx = (inner.write + ring_len - 1 - offset) % ring_len;
@@ -434,6 +444,174 @@ impl RuntimeLlmRunBuffer {
             }
         }
         pruned
+    }
+}
+
+impl RunOrigin {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "chat_id": self.chat_id,
+            "thread_id": self.thread_id,
+            "chat_title": self.chat_title,
+            "user_id": self.user_id,
+            "user_full_name": self.user_full_name,
+            "trigger_message_id": self.trigger_message_id,
+            "trigger_preview": self.trigger_preview,
+            "queue_name": self.queue_name,
+            "job_id": self.job_id,
+        })
+    }
+}
+
+impl RunToolCall {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "name": self.name,
+            "status": self.status,
+            "duration_ms": self.duration_ms,
+            "args_json": self.args_json,
+            "result_json": self.result_json,
+        })
+    }
+}
+
+impl RunRound {
+    /// Round JSON without raw payloads; the detail handler attaches
+    /// `raw_source`/`raw_request`/`raw_response` (and richer usage/timings)
+    /// after resolving the trace ring or the DB fallback.
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "seq": self.seq,
+            "trace_id": self.trace_id,
+            "at": self.at,
+            "provider": self.provider,
+            "model": self.model,
+            "flow": self.flow,
+            "is_aux": self.is_aux,
+            "iteration": self.iteration,
+            "duration_ms": self.duration_ms,
+            "usage": {
+                "input_tokens": self.input_tokens,
+                "output_tokens": self.output_tokens,
+                "total_tokens": self.total_tokens,
+            },
+            "error": self.error,
+            "response_text": self.response_text,
+            "sent": self.sent.as_str(),
+            "tool_calls": self.tool_calls.iter().map(RunToolCall::to_json).collect::<Vec<_>>(),
+        })
+    }
+}
+
+impl RunRecord {
+    fn base_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "id": self.id,
+            "run_id": self.run_id,
+            "kind": self.kind,
+            "status": self.status.as_str(),
+            "error": self.error,
+            "origin": self.origin.to_json(),
+            "started_at": self.started_at,
+            "ended_at": self.ended_at,
+            "duration_ms": self.totals.wall_ms,
+            "totals": {
+                "rounds": self.totals.rounds,
+                "aux_rounds": self.totals.aux_rounds,
+                "tool_calls": self.totals.tool_calls,
+                "errors": self.totals.errors,
+                "input_tokens": self.totals.input_tokens,
+                "output_tokens": self.totals.output_tokens,
+                "total_tokens": self.totals.total_tokens,
+                "wall_ms": self.totals.wall_ms,
+            },
+            "outcome": self.outcome.as_ref().map(|outcome| serde_json::json!({
+                "outcome": outcome.outcome,
+                "reason": outcome.reason,
+                "user_signal": outcome.user_signal,
+                "sent_message_parts": outcome.sent_message_parts,
+                "side_effect_ticket_id": outcome.side_effect_ticket_id,
+                "detail": outcome.detail,
+            })),
+            "tools": self.aggregate_tools(),
+            "preview": self.preview(),
+        })
+    }
+
+    /// Grouped per-tool chips for the list row: name, worst status, count.
+    fn aggregate_tools(&self) -> serde_json::Value {
+        let mut order: Vec<String> = Vec::new();
+        let mut by_name: BTreeMap<String, (String, i64)> = BTreeMap::new();
+        for round in &self.rounds {
+            for tool in &round.tool_calls {
+                let entry = by_name
+                    .entry(tool.name.clone())
+                    .or_insert_with(|| (tool.status.clone(), 0));
+                entry.1 += 1;
+                if tool.status != "ok" {
+                    entry.0 = tool.status.clone();
+                }
+                if !order.contains(&tool.name) {
+                    order.push(tool.name.clone());
+                }
+            }
+        }
+        serde_json::Value::Array(
+            order
+                .into_iter()
+                .filter_map(|name| {
+                    by_name.get(&name).map(|(status, count)| {
+                        serde_json::json!({ "name": name, "status": status, "count": count })
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    /// List-skeleton JSON: no per-round text or tool payloads, but thin
+    /// `rounds: [{provider, model}]` for the provider/model facets.
+    #[must_use]
+    pub fn skeleton_json(&self) -> serde_json::Value {
+        let mut json = self.base_json();
+        json["rounds"] = serde_json::Value::Array(
+            self.rounds
+                .iter()
+                .map(
+                    |round| serde_json::json!({ "provider": round.provider, "model": round.model }),
+                )
+                .collect(),
+        );
+        json
+    }
+
+    /// Detail JSON with full rounds (raw payloads are attached by the caller).
+    #[must_use]
+    pub fn detail_json(&self) -> serde_json::Value {
+        let mut json = self.base_json();
+        json["rounds"] =
+            serde_json::Value::Array(self.rounds.iter().map(RunRound::to_json).collect());
+        json
+    }
+}
+
+impl openplotva_server::RuntimeLlmRunInspector for RuntimeLlmRunBuffer {
+    fn llm_runs(
+        &self,
+        filter: openplotva_server::RuntimeLlmRunsFilter,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let kind = filter.kind.trim().to_lowercase();
+        let filter = RunListFilter {
+            kind: (!kind.is_empty() && kind != "all").then_some(kind),
+            chat_id: filter.chat_id,
+            errors_only: filter.errors_only,
+            q: filter.q,
+            limit: usize::try_from(filter.limit).unwrap_or(0),
+        };
+        Ok(self
+            .list(&filter, OffsetDateTime::now_utc())
+            .iter()
+            .map(RunRecord::skeleton_json)
+            .collect())
     }
 }
 
@@ -560,6 +738,7 @@ mod tests {
                 name: "web_search".to_owned(),
                 status: "ok".to_owned(),
                 duration_ms: Some(300),
+                ..RunToolCall::default()
             },
         );
         assert_eq!(buffer.record_round("job-1", round("готово")), Some(2));
