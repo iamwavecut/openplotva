@@ -5352,7 +5352,6 @@ fn admin_taskman_list_entry_json(
         item.trigger_message_id,
         item.thread_message_id,
         item.progress_message_id,
-        item.queue_position_message_id,
         item.result_message_id,
         item.worker_id.as_deref(),
         &item.created_at,
@@ -5404,7 +5403,6 @@ fn admin_taskman_job_json(job: &openplotva_server::RuntimeTaskmanJobData) -> ser
         job.trigger_message_id,
         job.thread_message_id,
         job.progress_message_id,
-        job.queue_position_message_id,
         job.result_message_id,
         job.worker_id.as_deref(),
         &job.created_at,
@@ -5431,7 +5429,6 @@ fn admin_taskman_job_base_json(
     trigger_message_id: i32,
     thread_message_id: Option<i32>,
     progress_message_id: Option<i32>,
-    queue_position_message_id: Option<i32>,
     result_message_id: Option<i32>,
     worker_id: Option<&str>,
     created_at: &str,
@@ -5465,11 +5462,6 @@ fn admin_taskman_job_base_json(
     );
     admin_insert_i32_option(&mut value, "thread_message_id", thread_message_id);
     admin_insert_i32_option(&mut value, "progress_message_id", progress_message_id);
-    admin_insert_i32_option(
-        &mut value,
-        "queue_position_message_id",
-        queue_position_message_id,
-    );
     admin_insert_i32_option(&mut value, "result_message_id", result_message_id);
     admin_insert_str_option(&mut value, "worker_id", worker_id);
     value.insert("created_at".to_owned(), serde_json::json!(created_at));

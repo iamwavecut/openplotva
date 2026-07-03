@@ -5579,9 +5579,6 @@ mod tests {
                 now,
             ),
         );
-        queue
-            .set_queue_position_message_id(job, Some(701))
-            .expect("position");
         job
     }
 

@@ -440,7 +440,6 @@ pub struct RuntimeTaskmanJobListEntryData {
     pub trigger_message_id: i32,
     pub thread_message_id: Option<i32>,
     pub progress_message_id: Option<i32>,
-    pub queue_position_message_id: Option<i32>,
     pub result_message_id: Option<i32>,
     pub worker_id: Option<String>,
     pub created_at: String,
@@ -476,7 +475,6 @@ pub struct RuntimeTaskmanJobData {
     pub trigger_message_id: i32,
     pub thread_message_id: Option<i32>,
     pub progress_message_id: Option<i32>,
-    pub queue_position_message_id: Option<i32>,
     pub result_message_id: Option<i32>,
     pub worker_id: Option<String>,
     pub created_at: String,
@@ -2725,8 +2723,6 @@ struct TaskmanJobListEntry {
     thread_message_id: Option<i32>,
     #[graphql(name = "progressMessageID")]
     progress_message_id: Option<i32>,
-    #[graphql(name = "queuePositionMessageID")]
-    queue_position_message_id: Option<i32>,
     #[graphql(name = "resultMessageID")]
     result_message_id: Option<i32>,
     #[graphql(name = "workerID")]
@@ -2756,7 +2752,6 @@ impl From<RuntimeTaskmanJobListEntryData> for TaskmanJobListEntry {
             trigger_message_id: entry.trigger_message_id,
             thread_message_id: entry.thread_message_id,
             progress_message_id: entry.progress_message_id,
-            queue_position_message_id: entry.queue_position_message_id,
             result_message_id: entry.result_message_id,
             worker_id: entry.worker_id,
             created_at: entry.created_at,
@@ -2811,8 +2806,6 @@ struct TaskmanJob {
     thread_message_id: Option<i32>,
     #[graphql(name = "progressMessageID")]
     progress_message_id: Option<i32>,
-    #[graphql(name = "queuePositionMessageID")]
-    queue_position_message_id: Option<i32>,
     #[graphql(name = "resultMessageID")]
     result_message_id: Option<i32>,
     #[graphql(name = "workerID")]
@@ -2841,7 +2834,6 @@ impl From<RuntimeTaskmanJobData> for TaskmanJob {
             trigger_message_id: job.trigger_message_id,
             thread_message_id: job.thread_message_id,
             progress_message_id: job.progress_message_id,
-            queue_position_message_id: job.queue_position_message_id,
             result_message_id: job.result_message_id,
             worker_id: job.worker_id,
             created_at: job.created_at,

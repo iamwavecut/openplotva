@@ -4433,7 +4433,6 @@ mod tests {
             trigger_message_id: 10,
             thread_message_id: None,
             progress_message_id: None,
-            queue_position_message_id: None,
             result_message_id: None,
             worker_id: None,
             created_at: timestamp.clone(),

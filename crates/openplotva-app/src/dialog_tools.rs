@@ -4407,7 +4407,6 @@ mod tests {
         // on the trigger instead, and no queue-position id to reuse later.
         assert!(rich.sent.lock().expect("rich sent").is_empty());
         let job_id = queue.records()[0].id;
-        assert_eq!(queue.job_queue_position_message_id(job_id), None);
         let calls = reactions.calls.lock().expect("reaction calls").clone();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "queued");
