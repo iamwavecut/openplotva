@@ -4572,16 +4572,23 @@
                 }
             }
             const fill = (id, values, current) => {
-                const select = document.getElementById(id);
-                if (!select) return;
+                const host = document.getElementById(id);
+                if (!host) return;
+                // pl-select upgrades in light DOM: the element found by id is
+                // either the inner native select (mirrored id) or the host.
+                const select = host.tagName === 'SELECT'
+                    ? host
+                    : (host.querySelector('select') || host);
                 const options = ['all', ...[...values].sort()];
+                const effective = options.includes(current) ? current : 'all';
                 select.replaceChildren(...options.map(value => {
                     const option = document.createElement('option');
                     option.value = value;
-                    option.textContent = value === 'all' ? 'all' : value;
-                    if (value === current) option.selected = true;
+                    option.textContent = value;
+                    if (value === effective) option.selected = true;
                     return option;
                 }));
+                select.value = effective;
             };
             fill('llmd-provider', providers, llmdState.filters.provider);
             fill('llmd-model', models, llmdState.filters.model);
@@ -4926,15 +4933,23 @@
             }
             const result = tool.result_json !== undefined ? tool.result_json : tool.result;
             if (result !== undefined && result !== null) {
-                const rendered = typeof result === 'string' ? result : safeStringify(result);
-                const size = rendered.length > 1024 ? ` (${(rendered.length / 1024).toFixed(1)} KB)` : '';
-                if (rendered.length <= 400) {
-                    const pre = PL.el('pre', { class: 'llmd-tool-result' }, rendered);
-                    box.append(llmdCollapse('result', pre));
+                if (typeof result === 'string') {
+                    if (result.length <= 400) {
+                        box.append(llmdCollapse('result', PL.el('pre', { class: 'llmd-tool-result' }, result)));
+                    } else {
+                        const size = ` (${(result.length / 1024).toFixed(1)} KB)`;
+                        box.append(PL.el('pre', { class: 'llmd-tool-result' }, `${result.slice(0, 400)}…`));
+                        box.append(llmdCollapse(
+                            `Expand${size}`,
+                            PL.el('pre', { class: 'llmd-tool-result llmd-tool-full-text' }, result),
+                            'llmd-tool-full'
+                        ));
+                    }
                 } else {
-                    const preview = PL.el('pre', { class: 'llmd-tool-result' }, `${rendered.slice(0, 400)}…`);
-                    box.append(preview);
-                    box.append(llmdCollapse(`Expand${size}`, llmdJSONPane(result), 'llmd-tool-full'));
+                    // Objects render lazily: a cheap summary line up front, the
+                    // tree materializes only when expanded.
+                    box.append(PL.el('pre', { class: 'llmd-tool-result' }, jsonNodeSummary(result)));
+                    box.append(llmdCollapse('Expand result', llmdJSONPane(result), 'llmd-tool-full'));
                 }
             }
             return box;
@@ -5022,7 +5037,7 @@
             }
             const text = round.response_text || round.text || '';
             if (text) {
-                const textEl = PL.el('div', { class: 'llmd-text clamped', text });
+                const textEl = PL.el('div', { class: 'llmd-text clamped' }, text);
                 body.append(textEl);
                 if (text.length > 480) {
                     const showAll = PL.el('pl-button', { variant: 'ghost', size: 'sm' });
