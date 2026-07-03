@@ -1920,7 +1920,53 @@ impl ChatMessageCounter for openplotva_storage::PostgresHistoryStore {
     }
 }
 
+/// How the draw lifecycle talks to the chat before the first image exists
+/// (`DIALOG_DRAW_UX`).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DrawUxMode {
+    /// Legacy ⏳ placeholder message posted at queue time and reused/edited
+    /// from generation start. Trait default so existing test doubles keep
+    /// exercising the historical flow; production wires the config value.
+    #[default]
+    Placeholder,
+    /// Lifecycle reactions on the trigger message (👀 queued → ✍ drawing →
+    /// cleared on delivery); the draw message is created lazily with the
+    /// first published image or the final gallery.
+    Reactions,
+}
+
 pub trait ImageJobEffects {
+    /// Draw-UX mode this effects implementation delivers.
+    fn draw_ux(&self) -> DrawUxMode {
+        DrawUxMode::Placeholder
+    }
+
+    /// Best-effort: mark the trigger message with the "drawing" reaction.
+    fn signal_draw_progress<'a>(
+        &'a self,
+        _chat_id: i64,
+        _trigger_message_id: i32,
+    ) -> ImageJobEffectFuture<'a, ()>
+    where
+        Self: Sync,
+    {
+        Box::pin(async {})
+    }
+
+    /// Best-effort: remove the lifecycle reaction from the trigger message.
+    /// Called only on the success path so a late clear can never erase the
+    /// obligations watcher's failure signal.
+    fn clear_draw_signal<'a>(
+        &'a self,
+        _chat_id: i64,
+        _trigger_message_id: i32,
+    ) -> ImageJobEffectFuture<'a, ()>
+    where
+        Self: Sync,
+    {
+        Box::pin(async {})
+    }
+
     /// Best-effort delete of a message (used to clear the queue-position message).
     fn delete_message<'a>(&'a self, chat_id: i64, message_id: i32) -> ImageJobEffectFuture<'a, ()>;
 
@@ -1968,6 +2014,8 @@ pub struct TelegramImageJobEffects<Sender> {
     telegram: Sender,
     rich: Arc<dyn crate::rich::RichSender>,
     chat_counter: Option<Arc<dyn ChatMessageCounter>>,
+    draw_ux: DrawUxMode,
+    reactions: Option<crate::reactions::GenerationReactions>,
 }
 
 impl<Sender> TelegramImageJobEffects<Sender> {
@@ -1978,6 +2026,8 @@ impl<Sender> TelegramImageJobEffects<Sender> {
             telegram,
             rich,
             chat_counter: None,
+            draw_ux: DrawUxMode::Placeholder,
+            reactions: None,
         }
     }
 
@@ -1987,12 +2037,58 @@ impl<Sender> TelegramImageJobEffects<Sender> {
         self.chat_counter = Some(chat_counter);
         self
     }
+
+    /// Switch to the reaction-based lifecycle (`DIALOG_DRAW_UX=reactions`).
+    #[must_use]
+    pub fn with_reaction_ux(mut self, reactions: crate::reactions::GenerationReactions) -> Self {
+        self.draw_ux = DrawUxMode::Reactions;
+        self.reactions = Some(reactions);
+        self
+    }
 }
 
 impl<Sender> ImageJobEffects for TelegramImageJobEffects<Sender>
 where
     Sender: ImageJobTelegramSender + Send + Sync,
 {
+    fn draw_ux(&self) -> DrawUxMode {
+        self.draw_ux
+    }
+
+    fn signal_draw_progress<'a>(
+        &'a self,
+        chat_id: i64,
+        trigger_message_id: i32,
+    ) -> ImageJobEffectFuture<'a, ()> {
+        Box::pin(async move {
+            if let Some(reactions) = self.reactions.as_deref() {
+                reactions
+                    .set_progress(crate::reactions::GenerationReactionTarget {
+                        chat_id,
+                        message_id: trigger_message_id,
+                    })
+                    .await;
+            }
+        })
+    }
+
+    fn clear_draw_signal<'a>(
+        &'a self,
+        chat_id: i64,
+        trigger_message_id: i32,
+    ) -> ImageJobEffectFuture<'a, ()> {
+        Box::pin(async move {
+            if let Some(reactions) = self.reactions.as_deref() {
+                reactions
+                    .clear(crate::reactions::GenerationReactionTarget {
+                        chat_id,
+                        message_id: trigger_message_id,
+                    })
+                    .await;
+            }
+        })
+    }
+
     fn chat_messages_after<'a>(
         &'a self,
         chat_id: i64,
@@ -2413,35 +2509,46 @@ where
         params.is_nsfw,
     );
 
-    // Reuse the queue placeholder in place when allowed, otherwise post a fresh message.
-    let draw_message_id = match placeholder_target.reuse_message_id {
-        Some(reused) => {
-            let _ = effects
-                .edit_draw_message(params.chat_id, reused, crate::rich::compose_draw_started())
+    // Placeholder UX: reuse the queue placeholder in place when allowed,
+    // otherwise post a fresh message. Reaction UX: no message yet — mark the
+    // trigger with the "drawing" reaction; the draw message appears with the
+    // first published image (or the final gallery).
+    let draw_message_id: Option<i32> = match effects.draw_ux() {
+        DrawUxMode::Reactions => {
+            effects
+                .signal_draw_progress(params.chat_id, params.message_id)
                 .await;
-            reused
+            None
         }
-        None => match effects
-            .send_draw_placeholder(
-                params.chat_id,
-                params.message_id,
-                params.thread_id,
-                crate::rich::compose_draw_started(),
-            )
-            .await
-        {
-            Ok(draw_message_id) => draw_message_id,
-            Err(error) => {
-                return ImageGenJobExecutionReport {
-                    outcome: ImageGenJobExecutionOutcome::Failed,
-                    prompt,
-                    caption_text,
-                    image_url: None,
-                    image_urls: Vec::new(),
-                    result_message_id: None,
-                    error: Some(format!("send draw placeholder: {error}")),
-                };
+        DrawUxMode::Placeholder => match placeholder_target.reuse_message_id {
+            Some(reused) => {
+                let _ = effects
+                    .edit_draw_message(params.chat_id, reused, crate::rich::compose_draw_started())
+                    .await;
+                Some(reused)
             }
+            None => match effects
+                .send_draw_placeholder(
+                    params.chat_id,
+                    params.message_id,
+                    params.thread_id,
+                    crate::rich::compose_draw_started(),
+                )
+                .await
+            {
+                Ok(draw_message_id) => Some(draw_message_id),
+                Err(error) => {
+                    return ImageGenJobExecutionReport {
+                        outcome: ImageGenJobExecutionOutcome::Failed,
+                        prompt,
+                        caption_text,
+                        image_url: None,
+                        image_urls: Vec::new(),
+                        result_message_id: None,
+                        error: Some(format!("send draw placeholder: {error}")),
+                    };
+                }
+            },
         },
     };
     if let Some(stale) = placeholder_target.delete_after_fresh_send_message_id {
@@ -2469,12 +2576,17 @@ where
     // emoji + "N из M". Single-image draws and the final slot skip the progress edit so the
     // last render is the clean final gallery without the progress line.
     let chat_id = params.chat_id;
+    let trigger_message_id = params.message_id;
+    let thread_id = params.thread_id;
     let progress_caption = caption_to_rich(&display_caption);
     let (progress_tx, mut progress_rx) =
         tokio::sync::mpsc::unbounded_channel::<ImageGenerationResult>();
     let generate = generator.generate_image_streaming(request, progress_tx);
     let consume = async move {
         let mut published_urls: Vec<String> = Vec::new();
+        // Reaction UX starts with no draw message; the first progress render
+        // creates it as a fresh reply and later slots edit it in place.
+        let mut draw_message_id = draw_message_id;
         while let Some(partial) = progress_rx.recv().await {
             let photos = image_generation_photo_sources(&partial)
                 .into_iter()
@@ -2488,45 +2600,56 @@ where
                     published_urls.extend(urls);
                     published_urls.truncate(TELEGRAM_MEDIA_GROUP_MAX_ITEMS);
                     if expected_image_count > 1 && published_urls.len() < expected_image_count {
-                        let _ = effects
-                            .edit_draw_message(
-                                chat_id,
-                                draw_message_id,
-                                crate::rich::compose_draw_progress(
-                                    &published_urls,
-                                    expected_image_count,
-                                    &progress_caption,
-                                ),
-                            )
-                            .await;
+                        let html = crate::rich::compose_draw_progress(
+                            &published_urls,
+                            expected_image_count,
+                            &progress_caption,
+                        );
+                        match draw_message_id {
+                            Some(existing) => {
+                                let _ = effects.edit_draw_message(chat_id, existing, html).await;
+                            }
+                            None => match effects
+                                .send_draw_placeholder(chat_id, trigger_message_id, thread_id, html)
+                                .await
+                            {
+                                Ok(sent) => draw_message_id = Some(sent),
+                                Err(error) => {
+                                    tracing::debug!(%error, "send draw progress message failed");
+                                }
+                            },
+                        }
                     }
                 }
                 Err(error) => tracing::debug!(%error, "publish draw image slot failed"),
             }
         }
-        published_urls
+        (published_urls, draw_message_id)
     };
-    let (result, published_urls) = tokio::join!(generate, consume);
+    let (result, (published_urls, draw_message_id)) = tokio::join!(generate, consume);
 
     match result {
         Ok(result) => {
             let image_urls = image_generation_urls(&result);
             let image_url = image_urls.first().cloned();
             if published_urls.is_empty() {
-                let _ = effects
-                    .edit_draw_message(
-                        chat_id,
-                        draw_message_id,
-                        crate::rich::compose_draw_notice(DRAW_FAILED_NOTICE_TEXT),
-                    )
-                    .await;
+                let notice_message_id = show_draw_notice(
+                    effects,
+                    chat_id,
+                    draw_message_id,
+                    params.message_id,
+                    params.thread_id,
+                    DRAW_FAILED_NOTICE_TEXT,
+                    false,
+                )
+                .await;
                 return ImageGenJobExecutionReport {
                     outcome: ImageGenJobExecutionOutcome::Failed,
                     prompt,
                     caption_text,
                     image_url: None,
                     image_urls,
-                    result_message_id: Some(draw_message_id),
+                    result_message_id: notice_message_id,
                     error: Some("image generation produced no image".to_owned()),
                 };
             }
@@ -2545,62 +2668,105 @@ where
             )
             .await
             {
-                Ok(final_message_id) => ImageGenJobExecutionReport {
-                    outcome: ImageGenJobExecutionOutcome::Completed,
-                    prompt,
-                    caption_text,
-                    image_url,
-                    image_urls,
-                    result_message_id: Some(final_message_id),
-                    error: None,
-                },
+                Ok(final_message_id) => {
+                    if effects.draw_ux() == DrawUxMode::Reactions {
+                        effects.clear_draw_signal(chat_id, params.message_id).await;
+                    }
+                    ImageGenJobExecutionReport {
+                        outcome: ImageGenJobExecutionOutcome::Completed,
+                        prompt,
+                        caption_text,
+                        image_url,
+                        image_urls,
+                        result_message_id: Some(final_message_id),
+                        error: None,
+                    }
+                }
                 Err(error) => ImageGenJobExecutionReport {
                     outcome: ImageGenJobExecutionOutcome::Failed,
                     prompt,
                     caption_text,
                     image_url,
                     image_urls,
-                    result_message_id: Some(draw_message_id),
+                    result_message_id: draw_message_id,
                     error: Some(format!("publish draw gallery: {error}")),
                 },
             }
         }
         Err(ImageGenerationError::Forbidden) => {
-            let _ = effects
-                .edit_draw_message(
-                    params.chat_id,
-                    draw_message_id,
-                    crate::rich::compose_draw_notice(NSFW_BLOCKED_MESSAGE_TEXT),
-                )
-                .await;
+            // The safety verdict is user-relevant detail the obligations
+            // watcher's generic failure notice cannot provide — always shown.
+            let notice_message_id = show_draw_notice(
+                effects,
+                params.chat_id,
+                draw_message_id,
+                params.message_id,
+                params.thread_id,
+                NSFW_BLOCKED_MESSAGE_TEXT,
+                true,
+            )
+            .await;
             ImageGenJobExecutionReport {
                 outcome: ImageGenJobExecutionOutcome::SafetyBlocked,
                 prompt,
                 caption_text,
                 image_url: None,
                 image_urls: Vec::new(),
-                result_message_id: Some(draw_message_id),
+                result_message_id: notice_message_id,
                 error: None,
             }
         }
         Err(error) => {
-            let _ = effects
-                .edit_draw_message(
-                    params.chat_id,
-                    draw_message_id,
-                    crate::rich::compose_draw_notice(DRAW_FAILED_NOTICE_TEXT),
-                )
-                .await;
+            let notice_message_id = show_draw_notice(
+                effects,
+                params.chat_id,
+                draw_message_id,
+                params.message_id,
+                params.thread_id,
+                DRAW_FAILED_NOTICE_TEXT,
+                false,
+            )
+            .await;
             ImageGenJobExecutionReport {
                 outcome: ImageGenJobExecutionOutcome::Failed,
                 prompt,
                 caption_text,
                 image_url: None,
                 image_urls: Vec::new(),
-                result_message_id: Some(draw_message_id),
+                result_message_id: notice_message_id,
                 error: Some(error.message()),
             }
         }
+    }
+}
+
+/// Show a draw failure/safety notice. With an existing draw message it is
+/// edited in place (legacy behavior); without one (reaction UX before the
+/// first image) the notice is sent as a fresh reply only when `force_fresh` —
+/// otherwise the obligations watcher owns the failure UX and nothing is sent.
+async fn show_draw_notice<Effects>(
+    effects: &Effects,
+    chat_id: i64,
+    draw_message_id: Option<i32>,
+    reply_to_message_id: i32,
+    thread_id: Option<i32>,
+    text: &str,
+    force_fresh: bool,
+) -> Option<i32>
+where
+    Effects: ImageJobEffects + Sync,
+{
+    let html = crate::rich::compose_draw_notice(text);
+    match draw_message_id {
+        Some(existing) => {
+            let _ = effects.edit_draw_message(chat_id, existing, html).await;
+            Some(existing)
+        }
+        None if force_fresh => effects
+            .send_draw_placeholder(chat_id, reply_to_message_id, thread_id, html)
+            .await
+            .ok(),
+        None => None,
     }
 }
 
@@ -2613,13 +2779,14 @@ fn draw_message_is_gone(error: &str) -> bool {
         || error.contains("message can't be edited")
 }
 
-/// Render the finished gallery on `draw_message_id`; if that message was deleted mid-flight,
-/// re-send the gallery as a fresh message so the result is never lost silently. Returns the id
-/// of the message that now holds the gallery.
+/// Render the finished gallery on `draw_message_id`; with no draw message yet
+/// (reaction UX) or when the message was deleted mid-flight, send the gallery
+/// as a fresh message so the result is never lost silently. Returns the id of
+/// the message that now holds the gallery.
 async fn render_final_gallery<Effects>(
     effects: &Effects,
     chat_id: i64,
-    draw_message_id: i32,
+    draw_message_id: Option<i32>,
     reply_to_message_id: i32,
     thread_id: Option<i32>,
     gallery_html: String,
@@ -2627,6 +2794,11 @@ async fn render_final_gallery<Effects>(
 where
     Effects: ImageJobEffects + Sync,
 {
+    let Some(draw_message_id) = draw_message_id else {
+        return effects
+            .send_draw_placeholder(chat_id, reply_to_message_id, thread_id, gallery_html)
+            .await;
+    };
     match effects
         .edit_draw_message(chat_id, draw_message_id, gallery_html.clone())
         .await
@@ -2649,7 +2821,7 @@ where
 async fn deliver_draw_gallery<Effects>(
     effects: &Effects,
     chat_id: i64,
-    draw_message_id: i32,
+    draw_message_id: Option<i32>,
     reply_to_message_id: i32,
     thread_id: Option<i32>,
     photos: Vec<PhotoSource>,
@@ -2739,33 +2911,43 @@ where
     let display_caption =
         build_image_generation_caption(&params.prompt, &params.user_full_name, true, false);
 
-    // Reuse the queue placeholder in place when allowed, otherwise post a fresh message.
-    let draw_message_id = match placeholder_target.reuse_message_id {
-        Some(reused) => {
-            let _ = effects
-                .edit_draw_message(params.chat_id, reused, crate::rich::compose_draw_started())
+    // Placeholder UX: reuse the queue placeholder in place when allowed,
+    // otherwise post a fresh message. Reaction UX: no message until the
+    // edited gallery is ready; the trigger gets the "drawing" reaction.
+    let draw_message_id: Option<i32> = match effects.draw_ux() {
+        DrawUxMode::Reactions => {
+            effects
+                .signal_draw_progress(params.chat_id, params.message_id)
                 .await;
-            reused
+            None
         }
-        None => match effects
-            .send_draw_placeholder(
-                params.chat_id,
-                params.message_id,
-                params.thread_id,
-                crate::rich::compose_draw_started(),
-            )
-            .await
-        {
-            Ok(draw_message_id) => draw_message_id,
-            Err(error) => {
-                return ImageEditJobExecutionReport {
-                    outcome: ImageEditJobExecutionOutcome::Failed,
-                    prompt: params.prompt,
-                    image_urls: Vec::new(),
-                    result_message_id: None,
-                    error: Some(format!("send draw placeholder: {error}")),
-                };
+        DrawUxMode::Placeholder => match placeholder_target.reuse_message_id {
+            Some(reused) => {
+                let _ = effects
+                    .edit_draw_message(params.chat_id, reused, crate::rich::compose_draw_started())
+                    .await;
+                Some(reused)
             }
+            None => match effects
+                .send_draw_placeholder(
+                    params.chat_id,
+                    params.message_id,
+                    params.thread_id,
+                    crate::rich::compose_draw_started(),
+                )
+                .await
+            {
+                Ok(draw_message_id) => Some(draw_message_id),
+                Err(error) => {
+                    return ImageEditJobExecutionReport {
+                        outcome: ImageEditJobExecutionOutcome::Failed,
+                        prompt: params.prompt,
+                        image_urls: Vec::new(),
+                        result_message_id: None,
+                        error: Some(format!("send draw placeholder: {error}")),
+                    };
+                }
+            },
         },
     };
     if let Some(stale) = placeholder_target.delete_after_fresh_send_message_id {
@@ -2802,18 +2984,21 @@ where
                 .take(TELEGRAM_MEDIA_GROUP_MAX_ITEMS)
                 .collect::<Vec<_>>();
             if photos.is_empty() {
-                let _ = effects
-                    .edit_draw_message(
-                        params.chat_id,
-                        draw_message_id,
-                        crate::rich::compose_draw_notice(DRAW_FAILED_NOTICE_TEXT),
-                    )
-                    .await;
+                let notice_message_id = show_draw_notice(
+                    effects,
+                    params.chat_id,
+                    draw_message_id,
+                    params.message_id,
+                    params.thread_id,
+                    DRAW_FAILED_NOTICE_TEXT,
+                    false,
+                )
+                .await;
                 return ImageEditJobExecutionReport {
                     outcome: ImageEditJobExecutionOutcome::Failed,
                     prompt: params.prompt,
                     image_urls,
-                    result_message_id: Some(draw_message_id),
+                    result_message_id: notice_message_id,
                     error: Some("image edit produced no image".to_owned()),
                 };
             }
@@ -2828,51 +3013,64 @@ where
             )
             .await
             {
-                Ok(final_message_id) => ImageEditJobExecutionReport {
-                    outcome: ImageEditJobExecutionOutcome::Completed,
-                    prompt: params.prompt,
-                    image_urls,
-                    result_message_id: Some(final_message_id),
-                    error: None,
-                },
+                Ok(final_message_id) => {
+                    if effects.draw_ux() == DrawUxMode::Reactions {
+                        effects
+                            .clear_draw_signal(params.chat_id, params.message_id)
+                            .await;
+                    }
+                    ImageEditJobExecutionReport {
+                        outcome: ImageEditJobExecutionOutcome::Completed,
+                        prompt: params.prompt,
+                        image_urls,
+                        result_message_id: Some(final_message_id),
+                        error: None,
+                    }
+                }
                 Err(error) => ImageEditJobExecutionReport {
                     outcome: ImageEditJobExecutionOutcome::Failed,
                     prompt: params.prompt,
                     image_urls,
-                    result_message_id: Some(draw_message_id),
+                    result_message_id: draw_message_id,
                     error: Some(format!("publish draw gallery: {error}")),
                 },
             }
         }
         Err(ImageEditError::Forbidden) => {
-            let _ = effects
-                .edit_draw_message(
-                    params.chat_id,
-                    draw_message_id,
-                    crate::rich::compose_draw_notice(NSFW_BLOCKED_MESSAGE_TEXT),
-                )
-                .await;
+            let notice_message_id = show_draw_notice(
+                effects,
+                params.chat_id,
+                draw_message_id,
+                params.message_id,
+                params.thread_id,
+                NSFW_BLOCKED_MESSAGE_TEXT,
+                true,
+            )
+            .await;
             ImageEditJobExecutionReport {
                 outcome: ImageEditJobExecutionOutcome::SafetyBlocked,
                 prompt: params.prompt,
                 image_urls: Vec::new(),
-                result_message_id: Some(draw_message_id),
+                result_message_id: notice_message_id,
                 error: None,
             }
         }
         Err(error) => {
-            let _ = effects
-                .edit_draw_message(
-                    params.chat_id,
-                    draw_message_id,
-                    crate::rich::compose_draw_notice(DRAW_FAILED_NOTICE_TEXT),
-                )
-                .await;
+            let notice_message_id = show_draw_notice(
+                effects,
+                params.chat_id,
+                draw_message_id,
+                params.message_id,
+                params.thread_id,
+                DRAW_FAILED_NOTICE_TEXT,
+                false,
+            )
+            .await;
             ImageEditJobExecutionReport {
                 outcome: ImageEditJobExecutionOutcome::Failed,
                 prompt: params.prompt,
                 image_urls: Vec::new(),
-                result_message_id: Some(draw_message_id),
+                result_message_id: notice_message_id,
                 error: Some(error.message()),
             }
         }
@@ -4400,6 +4598,150 @@ mod tests {
         assert!(calls[2].starts_with("edit:-100:888:"));
         assert!(calls[2].contains("<img src=\"https://img.test/1.png\"/>"));
         assert!(calls[2].contains("original caption"));
+    }
+
+    #[tokio::test]
+    async fn reaction_ux_single_image_sends_fresh_final_gallery_and_clears_reaction() {
+        let generator = GeneratorStub::success("https://img.test/1.png");
+        let effects = EffectsStub::with_reaction_ux();
+        let report = execute_image_gen_job(
+            &generator,
+            &effects,
+            ImageGenJobParams {
+                chat_id: -100,
+                message_id: 20,
+                user_id: 30,
+                user_full_name: "Alice".to_owned(),
+                prompt: "neon castle".to_owned(),
+                original_text: "neon castle".to_owned(),
+                thread_id: Some(9),
+                ..ImageGenJobParams::default()
+            },
+            None,
+        )
+        .await;
+
+        assert_eq!(report.outcome, ImageGenJobExecutionOutcome::Completed);
+        assert_eq!(report.result_message_id, Some(888));
+        let calls = effects.calls();
+        assert_eq!(calls[0], "react-progress:-100:20");
+        assert!(
+            calls.iter().all(|call| !call.starts_with("edit:")),
+            "no draw message exists before the gallery, nothing to edit: {calls:?}"
+        );
+        let gallery = calls
+            .iter()
+            .find(|call| call.starts_with("placeholder:-100:20:9:"))
+            .expect("fresh final gallery message");
+        assert!(gallery.contains("<img src=\"https://img.test/1.png\"/>"));
+        assert_eq!(
+            calls.last().map(String::as_str),
+            Some("react-clear:-100:20")
+        );
+    }
+
+    #[tokio::test]
+    async fn reaction_ux_multi_image_creates_progress_message_lazily() {
+        let generator = GeneratorStub::success_many(vec![
+            "https://img.test/1.png".to_owned(),
+            "https://img.test/2.png".to_owned(),
+        ])
+        .with_expected_image_count(2);
+        let effects = EffectsStub::with_reaction_ux();
+        let report = execute_image_gen_job(
+            &generator,
+            &effects,
+            ImageGenJobParams {
+                chat_id: -100,
+                message_id: 20,
+                user_id: 30,
+                user_full_name: "Alice".to_owned(),
+                prompt: "neon castle".to_owned(),
+                original_text: "neon castle".to_owned(),
+                ..ImageGenJobParams::default()
+            },
+            None,
+        )
+        .await;
+
+        assert_eq!(report.outcome, ImageGenJobExecutionOutcome::Completed);
+        let calls = effects.calls();
+        assert_eq!(calls[0], "react-progress:-100:20");
+        // The bare "started" placeholder must never appear in reaction UX; any
+        // message that shows up already carries images.
+        assert!(
+            calls
+                .iter()
+                .all(|call| !call.ends_with(&crate::rich::compose_draw_started())),
+            "reaction UX must not post the empty started message: {calls:?}"
+        );
+        assert_eq!(
+            calls.last().map(String::as_str),
+            Some("react-clear:-100:20")
+        );
+    }
+
+    #[tokio::test]
+    async fn reaction_ux_failure_leaves_notice_to_watcher_and_keeps_reaction() {
+        let generator = GeneratorStub::error("boom");
+        let effects = EffectsStub::with_reaction_ux();
+        let report = execute_image_gen_job(
+            &generator,
+            &effects,
+            ImageGenJobParams {
+                chat_id: -100,
+                message_id: 20,
+                user_id: 30,
+                user_full_name: "Alice".to_owned(),
+                prompt: "neon castle".to_owned(),
+                original_text: "neon castle".to_owned(),
+                ..ImageGenJobParams::default()
+            },
+            None,
+        )
+        .await;
+
+        assert_eq!(report.outcome, ImageGenJobExecutionOutcome::Failed);
+        assert_eq!(report.result_message_id, None);
+        // No draw message exists: the generic failure notice belongs to the
+        // obligations watcher, and the reaction is never cleared on errors
+        // (the watcher swaps it to the terminal signal).
+        assert_eq!(effects.calls(), vec!["react-progress:-100:20".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn reaction_ux_safety_block_still_sends_specific_notice() {
+        let generator = GeneratorStub::forbidden();
+        let effects = EffectsStub::with_reaction_ux();
+        let report = execute_image_gen_job(
+            &generator,
+            &effects,
+            ImageGenJobParams {
+                chat_id: -100,
+                message_id: 20,
+                user_id: 30,
+                user_full_name: "Alice".to_owned(),
+                prompt: "neon castle".to_owned(),
+                original_text: "neon castle".to_owned(),
+                ..ImageGenJobParams::default()
+            },
+            None,
+        )
+        .await;
+
+        assert_eq!(report.outcome, ImageGenJobExecutionOutcome::SafetyBlocked);
+        assert_eq!(report.result_message_id, Some(888));
+        let calls = effects.calls();
+        assert_eq!(calls[0], "react-progress:-100:20");
+        let notice = calls
+            .iter()
+            .find(|call| call.starts_with("placeholder:-100:20:"))
+            .expect("safety verdict is user-relevant and sent as a fresh notice");
+        assert!(notice.contains(NSFW_BLOCKED_MESSAGE_TEXT));
+        assert!(
+            calls.iter().all(|call| !call.starts_with("react-clear")),
+            "reaction is cleared only on success: {calls:?}"
+        );
     }
 
     #[tokio::test]
@@ -7114,6 +7456,7 @@ mod tests {
         calls: Mutex<Vec<String>>,
         chat_messages_after: Option<i64>,
         edit_error: Option<String>,
+        draw_ux: DrawUxMode,
     }
 
     impl EffectsStub {
@@ -7135,6 +7478,13 @@ mod tests {
             }
         }
 
+        fn with_reaction_ux() -> Self {
+            Self {
+                draw_ux: DrawUxMode::Reactions,
+                ..Self::default()
+            }
+        }
+
         fn calls(&self) -> Vec<String> {
             self.call_log().clone()
         }
@@ -7145,6 +7495,30 @@ mod tests {
     }
 
     impl ImageJobEffects for EffectsStub {
+        fn draw_ux(&self) -> DrawUxMode {
+            self.draw_ux
+        }
+
+        fn signal_draw_progress<'a>(
+            &'a self,
+            chat_id: i64,
+            trigger_message_id: i32,
+        ) -> ImageJobEffectFuture<'a, ()> {
+            self.call_log()
+                .push(format!("react-progress:{chat_id}:{trigger_message_id}"));
+            Box::pin(async {})
+        }
+
+        fn clear_draw_signal<'a>(
+            &'a self,
+            chat_id: i64,
+            trigger_message_id: i32,
+        ) -> ImageJobEffectFuture<'a, ()> {
+            self.call_log()
+                .push(format!("react-clear:{chat_id}:{trigger_message_id}"));
+            Box::pin(async {})
+        }
+
         fn chat_messages_after<'a>(
             &'a self,
             _chat_id: i64,

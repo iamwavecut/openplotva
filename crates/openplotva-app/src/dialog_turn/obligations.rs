@@ -277,12 +277,50 @@ pub enum ObligationNoticeResult {
     Failed(String),
 }
 
+/// Trigger message whose lifecycle reaction an obligation resolution updates.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ObligationReactionTarget {
+    pub chat_id: i64,
+    pub thread_id: Option<i32>,
+    pub trigger_message_id: i32,
+}
+
 /// Sends obligation notices to the user.
 pub trait DeliveryObligationNotifier: Send + Sync {
     fn notify<'a>(
         &'a self,
         target: ObligationNoticeTarget<'a>,
     ) -> Pin<Box<dyn Future<Output = ObligationNoticeResult> + Send + 'a>>;
+
+    /// Best-effort: swap the trigger-message reaction to the terminal 🤔 after
+    /// a failure resolution, replacing a stale 👀/✍ lifecycle reaction
+    /// (`DIALOG_DRAW_UX=reactions`). Default no-op keeps the legacy
+    /// placeholder UX untouched.
+    fn signal_failure_reaction<'a>(
+        &'a self,
+        _target: ObligationReactionTarget,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async {})
+    }
+
+    /// Best-effort backstop: clear the lifecycle reaction once the obligation
+    /// resolves without a failure (delivered or user-cancelled), covering a
+    /// worker that crashed after delivery but before its own clear. Default
+    /// no-op keeps the legacy placeholder UX untouched.
+    fn clear_lifecycle_reaction<'a>(
+        &'a self,
+        _target: ObligationReactionTarget,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async {})
+    }
+}
+
+fn obligation_reaction_target(obligation: &DeliveryObligationRecord) -> ObligationReactionTarget {
+    ObligationReactionTarget {
+        chat_id: obligation.chat_id,
+        thread_id: obligation.thread_id,
+        trigger_message_id: obligation.trigger_message_id,
+    }
 }
 
 /// Production notifier: a protected, reply-scoped-debounced text through the
@@ -293,6 +331,7 @@ pub struct DispatcherDeliveryObligationNotifier {
     queue: Arc<DispatcherQueue>,
     signal: DispatcherTerminalUserSignal,
     next_virtual_id: VirtualIdFactory,
+    lifecycle_reactions: Option<crate::reactions::GenerationReactions>,
 }
 
 impl DispatcherDeliveryObligationNotifier {
@@ -302,12 +341,25 @@ impl DispatcherDeliveryObligationNotifier {
             queue,
             signal,
             next_virtual_id: monotonic_virtual_id_factory("dialog-obligation"),
+            lifecycle_reactions: None,
         }
     }
 
     #[must_use]
     pub fn with_virtual_id_factory(mut self, next_virtual_id: VirtualIdFactory) -> Self {
         self.next_virtual_id = next_virtual_id;
+        self
+    }
+
+    /// Enable lifecycle-reaction maintenance on obligation resolutions
+    /// (`DIALOG_DRAW_UX=reactions`): 🤔 swap on failures, backstop clear on
+    /// delivered/cancelled. Without this the legacy placeholder UX applies.
+    #[must_use]
+    pub fn with_lifecycle_reactions(
+        mut self,
+        reactions: crate::reactions::GenerationReactions,
+    ) -> Self {
+        self.lifecycle_reactions = Some(reactions);
         self
     }
 }
@@ -379,6 +431,45 @@ impl DeliveryObligationNotifier for DispatcherDeliveryObligationNotifier {
                 other => ObligationNoticeResult::Failed(format!(
                     "notice text failed ({queue_error}); reaction fallback: {other:?}"
                 )),
+            }
+        })
+    }
+
+    fn signal_failure_reaction<'a>(
+        &'a self,
+        target: ObligationReactionTarget,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            // Reaction lifecycle disabled: the trigger carries no stale 👀/✍,
+            // and legacy behavior never reacted here — keep it that way.
+            if self.lifecycle_reactions.is_none() {
+                return;
+            }
+            let _ = self
+                .signal
+                .signal_turn_failure(SignalTarget {
+                    chat_id: target.chat_id,
+                    thread_id: target.thread_id,
+                    message_id: target.trigger_message_id,
+                    emoji: super::signal::DEFAULT_DIALOG_TERMINAL_REACTION_EMOJI.to_owned(),
+                    text_fallback_allowed: false,
+                })
+                .await;
+        })
+    }
+
+    fn clear_lifecycle_reaction<'a>(
+        &'a self,
+        target: ObligationReactionTarget,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            if let Some(reactions) = self.lifecycle_reactions.as_deref() {
+                reactions
+                    .clear(crate::reactions::GenerationReactionTarget {
+                        chat_id: target.chat_id,
+                        message_id: target.trigger_message_id,
+                    })
+                    .await;
             }
         })
     }
@@ -508,6 +599,9 @@ async fn resolve_obligation(
                 {
                     report.failed_notified += 1;
                     send_notice(notifier, obligation, OBLIGATION_FAILURE_NOTICE, report).await;
+                    notifier
+                        .signal_failure_reaction(obligation_reaction_target(obligation))
+                        .await;
                 }
             }
             JobStatus::Completed => {
@@ -517,6 +611,9 @@ async fn resolve_obligation(
                         .await?
                     {
                         report.delivered += 1;
+                        notifier
+                            .clear_lifecycle_reaction(obligation_reaction_target(obligation))
+                            .await;
                     }
                 } else if store
                     .mark_notified(
@@ -529,6 +626,9 @@ async fn resolve_obligation(
                 {
                     report.orphaned_notified += 1;
                     send_notice(notifier, obligation, OBLIGATION_FAILURE_NOTICE, report).await;
+                    notifier
+                        .signal_failure_reaction(obligation_reaction_target(obligation))
+                        .await;
                 }
             }
             // The user cancelled their own job; an error notice would be wrong.
@@ -538,6 +638,9 @@ async fn resolve_obligation(
                     .await?
                 {
                     report.delivered += 1;
+                    notifier
+                        .clear_lifecycle_reaction(obligation_reaction_target(obligation))
+                        .await;
                 }
             }
             JobStatus::Pending | JobStatus::Processing => {
@@ -557,6 +660,9 @@ async fn resolve_obligation(
             {
                 report.orphaned_notified += 1;
                 send_notice(notifier, obligation, OBLIGATION_FAILURE_NOTICE, report).await;
+                notifier
+                    .signal_failure_reaction(obligation_reaction_target(obligation))
+                    .await;
             }
         }
     }
@@ -599,6 +705,9 @@ async fn resolve_in_flight_deadline(
     {
         report.expired_notified += 1;
         send_notice(notifier, obligation, OBLIGATION_FAILURE_NOTICE, report).await;
+        notifier
+            .signal_failure_reaction(obligation_reaction_target(obligation))
+            .await;
     }
     Ok(())
 }
@@ -962,11 +1071,16 @@ mod tests {
     #[derive(Default)]
     struct FakeNotifier {
         notices: Mutex<Vec<(i64, i32, String)>>,
+        reactions: Mutex<Vec<(&'static str, i64, i32)>>,
     }
 
     impl FakeNotifier {
         fn notices(&self) -> Vec<(i64, i32, String)> {
             lock(&self.notices).clone()
+        }
+
+        fn reactions(&self) -> Vec<(&'static str, i64, i32)> {
+            lock(&self.reactions).clone()
         }
     }
 
@@ -981,6 +1095,22 @@ mod tests {
                 target.text.to_owned(),
             ));
             Box::pin(async move { ObligationNoticeResult::TextQueued })
+        }
+
+        fn signal_failure_reaction<'a>(
+            &'a self,
+            target: ObligationReactionTarget,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+            lock(&self.reactions).push(("fail", target.chat_id, target.trigger_message_id));
+            Box::pin(async {})
+        }
+
+        fn clear_lifecycle_reaction<'a>(
+            &'a self,
+            target: ObligationReactionTarget,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+            lock(&self.reactions).push(("clear", target.chat_id, target.trigger_message_id));
+            Box::pin(async {})
         }
     }
 
@@ -1045,6 +1175,9 @@ mod tests {
             ticket: Option<TaskQueueRecord>,
             expected_state: &'static str,
             expected_notice: Option<&'static str>,
+            /// Lifecycle-reaction hook fired by the transition winner:
+            /// "fail" swaps to 🤔, "clear" removes the standing 👀/✍.
+            expected_reaction: Option<&'static str>,
         }
         let cases = vec![
             Case {
@@ -1052,36 +1185,42 @@ mod tests {
                 ticket: Some(ticket(500, JobStatus::Completed, Some(9000))),
                 expected_state: DELIVERY_OBLIGATION_STATE_DELIVERED,
                 expected_notice: None,
+                expected_reaction: Some("clear"),
             },
             Case {
                 name: "failed ticket notifies even with placeholder result_message_id",
                 ticket: Some(ticket(500, JobStatus::Failed, Some(9000))),
                 expected_state: DELIVERY_OBLIGATION_STATE_FAILED_NOTIFIED,
                 expected_notice: Some(OBLIGATION_FAILURE_NOTICE),
+                expected_reaction: Some("fail"),
             },
             Case {
                 name: "completed without result message is orphaned",
                 ticket: Some(ticket(500, JobStatus::Completed, None)),
                 expected_state: DELIVERY_OBLIGATION_STATE_ORPHANED_NOTIFIED,
                 expected_notice: Some(OBLIGATION_FAILURE_NOTICE),
+                expected_reaction: Some("fail"),
             },
             Case {
                 name: "missing ticket record is orphaned",
                 ticket: None,
                 expected_state: DELIVERY_OBLIGATION_STATE_ORPHANED_NOTIFIED,
                 expected_notice: Some(OBLIGATION_FAILURE_NOTICE),
+                expected_reaction: Some("fail"),
             },
             Case {
                 name: "cancelled ticket resolves silently",
                 ticket: Some(ticket(500, JobStatus::Cancelled, None)),
                 expected_state: DELIVERY_OBLIGATION_STATE_DELIVERED,
                 expected_notice: None,
+                expected_reaction: Some("clear"),
             },
             Case {
                 name: "in-flight ticket before deadline is left open",
                 ticket: Some(ticket(500, JobStatus::Processing, None)),
                 expected_state: DELIVERY_OBLIGATION_STATE_PENDING,
                 expected_notice: None,
+                expected_reaction: None,
             },
         ];
         for case in cases {
@@ -1112,6 +1251,17 @@ mod tests {
                 }
                 None => assert!(notifier.notices().is_empty(), "case: {}", case.name),
             }
+            match case.expected_reaction {
+                Some(kind) => {
+                    assert_eq!(
+                        notifier.reactions(),
+                        vec![(kind, 42, 100)],
+                        "case: {}",
+                        case.name
+                    );
+                }
+                None => assert!(notifier.reactions().is_empty(), "case: {}", case.name),
+            }
         }
     }
 
@@ -1124,10 +1274,12 @@ mod tests {
             FakeTicketSource::with_records(vec![ticket(500, JobStatus::Processing, None)]);
         let notifier = FakeNotifier::default();
 
-        // First tick past deadline: extend once + one "taking longer" notice.
+        // First tick past deadline: extend once + one "taking longer" notice;
+        // the generation is still running, so the lifecycle reaction stays.
         let first =
             process_delivery_obligations_once(&store, &tickets, &notifier, timeouts(), now).await;
         assert_eq!(first.extended, 1);
+        assert!(notifier.reactions().is_empty(), "extension keeps ✍ intact");
         assert_eq!(store.state_of(1), DELIVERY_OBLIGATION_STATE_EXTENDED_ONCE);
         assert_eq!(
             store.row(1).deadline_at,
@@ -1158,6 +1310,7 @@ mod tests {
         );
         assert_eq!(notifier.notices().len(), 2);
         assert_eq!(notifier.notices()[1].2, OBLIGATION_FAILURE_NOTICE);
+        assert_eq!(notifier.reactions(), vec![("fail", 42, 100)]);
     }
 
     #[tokio::test]

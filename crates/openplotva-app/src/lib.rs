@@ -37,6 +37,7 @@ pub mod payments;
 pub mod permissions;
 pub mod rate_limits;
 pub mod rates;
+pub mod reactions;
 pub mod reset;
 pub mod rich;
 mod routed_attempts;
@@ -10845,9 +10846,17 @@ async fn start_runtime_workers(
     let delivery_obligation_store = Arc::new(
         openplotva_storage::PostgresDeliveryObligationStore::new(service_clients.postgres.clone()),
     );
-    let dialog_tool_adapter = Arc::new(
+    // DIALOG_DRAW_UX: `reactions` (default) swaps the ⏳ queue-placeholder
+    // message for lifecycle reactions on the trigger message; `placeholder`
+    // keeps the legacy flow. One shared signaler feeds the tool adapter,
+    // image/music workers, and the obligations watcher.
+    let generation_reactions: Option<reactions::GenerationReactions> =
+        (config.llm.dialog.draw_ux == openplotva_config::DRAW_UX_REACTIONS).then(|| {
+            Arc::new(reactions::GenerationReactionSignaler::new(telegram.clone()))
+                as reactions::GenerationReactions
+        });
+    let dialog_tool_adapter =
         dialog_tools::TaskmanDialogToolAdapter::new(Arc::clone(&task_queue_for_updates))
-            .with_queue_position_rich(Arc::clone(&rich_sender))
             .with_draw_image_vip_status(vip_status_for_updates.clone())
             .with_draw_image_rate_limit(Arc::new(dialog_tools::DrawImageRateLimitPolicy::new(
                 service_clients.redis.draw_rate_limit_store(),
@@ -10870,8 +10879,11 @@ async fn start_runtime_workers(
                         bot_key.to_owned(),
                     ),
                 ),
-            )),
-    );
+            ));
+    let dialog_tool_adapter = Arc::new(match &generation_reactions {
+        Some(reactions) => dialog_tool_adapter.with_generation_reactions(Arc::clone(reactions)),
+        None => dialog_tool_adapter.with_queue_position_rich(Arc::clone(&rich_sender)),
+    });
     {
         let watcher_store: Arc<dyn dialog_turn::DeliveryObligationStore> =
             Arc::clone(&delivery_obligation_store) as _;
@@ -10886,11 +10898,16 @@ async fn start_runtime_workers(
             telegram.clone(),
             Arc::clone(&dispatcher_queue),
         );
+        let mut obligation_notifier = dialog_turn::DispatcherDeliveryObligationNotifier::new(
+            Arc::clone(&dispatcher_queue),
+            watcher_signal.clone(),
+        );
+        if let Some(reactions) = &generation_reactions {
+            obligation_notifier =
+                obligation_notifier.with_lifecycle_reactions(Arc::clone(reactions));
+        }
         let watcher_notifier: Arc<dyn dialog_turn::DeliveryObligationNotifier> =
-            Arc::new(dialog_turn::DispatcherDeliveryObligationNotifier::new(
-                Arc::clone(&dispatcher_queue),
-                watcher_signal.clone(),
-            ));
+            Arc::new(obligation_notifier);
         let watcher_dispatch_failures = dialog_turn::DispatchFailureSignalScan {
             ring: Arc::clone(&dispatch_failure_ring),
             signal: Arc::new(watcher_signal),
@@ -11591,9 +11608,12 @@ async fn start_runtime_workers(
     );
     let draw_chat_counter: Arc<dyn image_jobs::ChatMessageCounter> =
         Arc::new(PostgresHistoryStore::new(service_clients.postgres.clone()));
-    let vip_image_effects =
+    let mut vip_image_effects =
         image_jobs::TelegramImageJobEffects::new(telegram.clone(), Arc::clone(&rich_sender))
             .with_chat_counter(Arc::clone(&draw_chat_counter));
+    if let Some(reactions) = &generation_reactions {
+        vip_image_effects = vip_image_effects.with_reaction_ux(Arc::clone(reactions));
+    }
     let vip_image_stop = stop.subscribe();
     let vip_image_worker = tokio::spawn(async move {
         let report = image_jobs::run_image_gen_worker_every_until_with_max_attempts(
@@ -11629,9 +11649,12 @@ async fn start_runtime_workers(
         ),
         media_prompt_optimizer.clone(),
     );
-    let vip_image_edit_effects =
+    let mut vip_image_edit_effects =
         image_jobs::TelegramImageJobEffects::new(telegram.clone(), Arc::clone(&rich_sender))
             .with_chat_counter(Arc::clone(&draw_chat_counter));
+    if let Some(reactions) = &generation_reactions {
+        vip_image_edit_effects = vip_image_edit_effects.with_reaction_ux(Arc::clone(reactions));
+    }
     let vip_image_edit_stop = stop.subscribe();
     let vip_image_edit_worker = tokio::spawn(async move {
         let report = image_jobs::run_image_edit_worker_every_until_with_max_attempts(
@@ -11663,9 +11686,12 @@ async fn start_runtime_workers(
         image_agent_tools,
         image_agent_settings,
     );
-    let regular_image_effects =
+    let mut regular_image_effects =
         image_jobs::TelegramImageJobEffects::new(telegram.clone(), Arc::clone(&rich_sender))
             .with_chat_counter(Arc::clone(&draw_chat_counter));
+    if let Some(reactions) = &generation_reactions {
+        regular_image_effects = regular_image_effects.with_reaction_ux(Arc::clone(reactions));
+    }
     let regular_image_stop = stop.subscribe();
     let regular_image_worker = tokio::spawn(async move {
         let report = image_jobs::run_image_gen_worker_every_until_with_max_attempts(
@@ -11769,12 +11795,15 @@ async fn start_runtime_workers(
             music_attempt_walker,
             music_jobs::acestep_config_from_app_config(config),
         );
-        let music_effects = music_jobs::TelegramMusicJobEffects::new(
+        let mut music_effects = music_jobs::TelegramMusicJobEffects::new(
             Arc::clone(&permission_policy),
             PostgresTelegramFileStore::new(service_clients.postgres.clone()),
             telegram.clone(),
             Arc::clone(&rich_sender),
         );
+        if let Some(reactions) = &generation_reactions {
+            music_effects = music_effects.with_reaction_ux(Arc::clone(reactions));
+        }
         let music_stop = stop.subscribe();
         let music_worker = tokio::spawn(async move {
             let report = music_jobs::run_music_worker_every_until_with_max_attempts(

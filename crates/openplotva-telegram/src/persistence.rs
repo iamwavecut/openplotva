@@ -424,9 +424,12 @@ fn replay_delete_method(value: &Value) -> Option<TelegramOutboundMethod> {
 fn replay_set_message_reaction_method(value: &Value) -> Option<TelegramOutboundMethod> {
     let chat_id = field_i64(value, &["ChatID", "chat_id"])?;
     let message_id = field_i64(value, &["MessageID", "message_id"])?;
-    let emoji = reaction_emoji(value)?;
-    let mut method =
-        SetMessageReaction::new(chat_id, message_id).with_reaction([ReactionType::Emoji(emoji)]);
+    // No reaction field means a clear (the Bot API removes the bot's reaction
+    // when the list is omitted), so it must replay as a clear, not be dropped.
+    let mut method = SetMessageReaction::new(chat_id, message_id);
+    if let Some(emoji) = reaction_emoji(value) {
+        method = method.with_reaction([ReactionType::Emoji(emoji)]);
+    }
     if field_bool(value, &["IsBig", "is_big"]).unwrap_or(false) {
         method = method.with_is_big(true);
     }
@@ -918,11 +921,11 @@ mod tests {
         MediaGroupMessagePlan, MediaGroupPhotoItem, MessageFingerprint, PersistentDispatcherItem,
         PersistentDispatcherReplay, PhotoMessagePlan, PhotoSource, ReplyParametersPlan,
         RichSendOptions, SendRichMessage, StickerMessagePlan, TELEGRAM_PARSE_MODE_HTML,
-        TelegramOutboundMethod, TelegramOutboundMethodKind, build_message_reaction_method,
-        fingerprint_message_reaction, hash_content, persistent_queue_from_drain,
-        persistent_queue_redis_value_from_items, persistent_queue_replay_from_json,
-        persistent_queue_replay_from_redis_value, replay_outbound_method,
-        restore_persistent_queue_replay, snapshot_outbound_method,
+        TelegramOutboundMethod, TelegramOutboundMethodKind, build_message_reaction_clear_method,
+        build_message_reaction_method, fingerprint_message_reaction, hash_content,
+        persistent_queue_from_drain, persistent_queue_redis_value_from_items,
+        persistent_queue_replay_from_json, persistent_queue_replay_from_redis_value,
+        replay_outbound_method, restore_persistent_queue_replay, snapshot_outbound_method,
     };
 
     fn text_message(chat_id: i64, text: &str, virtual_id: &str) -> DispatcherMessage {
@@ -1225,6 +1228,30 @@ mod tests {
         assert_eq!(
             replay.items[0].fingerprint,
             fingerprint_message_reaction(42, 7, "🤔")
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn reaction_clear_replays_as_clear_not_dropped() -> Result<(), Box<dyn std::error::Error>> {
+        let (kind, bytes) = snapshot_outbound_method(&build_message_reaction_clear_method(42, 7))
+            .expect("reaction clear snapshot");
+        assert_eq!(kind, TelegramOutboundMethodKind::SetMessageReaction);
+        let payload: Value = serde_json::from_slice(&bytes)?;
+        assert!(payload.get("reaction").is_none(), "clear omits reaction");
+
+        let TelegramOutboundMethod::SetMessageReaction(method) =
+            replay_outbound_method(kind, &bytes).expect("clear replay")
+        else {
+            panic!("expected setMessageReaction method");
+        };
+        let replayed = serde_json::to_value(method.as_ref())?;
+        assert_eq!(replayed["chat_id"], json!(42));
+        assert_eq!(replayed["message_id"], json!(7));
+        assert!(
+            replayed.get("reaction").is_none(),
+            "replayed clear must keep the reaction field omitted, got {replayed}"
         );
 
         Ok(())

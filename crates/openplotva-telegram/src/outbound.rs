@@ -1132,6 +1132,15 @@ pub fn build_message_reaction_method(
     )
 }
 
+/// Build an outbound `setMessageReaction` method that removes the bot's
+/// reaction: the Bot API clears reactions when the `reaction` field is omitted.
+pub fn build_message_reaction_clear_method(
+    chat_id: i64,
+    message_id: i64,
+) -> TelegramOutboundMethod {
+    TelegramOutboundMethod::from(SetMessageReaction::new(chat_id, message_id))
+}
+
 pub fn fingerprint_message_reaction(
     chat_id: i64,
     message_id: i64,
@@ -3342,6 +3351,32 @@ mod tests {
             })
             .err(),
             Some(OutboundBuildError::MessageIdRequired)
+        );
+    }
+
+    #[test]
+    fn build_message_reaction_methods_set_and_clear() {
+        let set = super::build_message_reaction_method(42, 100, "👀");
+        let crate::TelegramOutboundMethod::SetMessageReaction(method) = set else {
+            panic!("expected setMessageReaction method");
+        };
+        let value = serde_json::to_value(method.as_ref()).expect("set json");
+        assert_eq!(value["chat_id"], 42);
+        assert_eq!(value["message_id"], 100);
+        assert_eq!(value["reaction"][0]["emoji"], "👀");
+
+        // The Bot API removes the bot's reaction when the `reaction` field is
+        // omitted entirely; the clear builder must not serialize it at all.
+        let clear = super::build_message_reaction_clear_method(42, 100);
+        let crate::TelegramOutboundMethod::SetMessageReaction(method) = clear else {
+            panic!("expected setMessageReaction method");
+        };
+        let value = serde_json::to_value(method.as_ref()).expect("clear json");
+        assert_eq!(value["chat_id"], 42);
+        assert_eq!(value["message_id"], 100);
+        assert!(
+            value.get("reaction").is_none(),
+            "clear must omit the reaction field, got {value}"
         );
     }
 }
