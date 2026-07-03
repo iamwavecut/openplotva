@@ -361,6 +361,84 @@ where
     report.user_id = (params.user_id != 0).then_some(params.user_id);
     report.message_id = (params.message_id != 0).then_some(params.message_id);
 
+    // Per-(chat, thread) serialization: while a session runs, an initiator
+    // message merges into it and a third party's turn parks behind it; both
+    // complete here with their own ledger rows (single-exit holds). A release
+    // race (claim finds Busy but inject/park misses) retries and, as bug
+    // containment, degrades to today's parallel turn.
+    let session_registry = options
+        .session
+        .filter(|wiring| wiring.turn_config().enabled_for_chat(params.chat_id))
+        .and_then(|wiring| wiring.registry.as_ref());
+    let session_key = crate::dialog_turn::SessionKey::new(params.chat_id, params.thread_id);
+    let mut session_claimed = false;
+    let mut session_inbox: Option<std::sync::Arc<crate::dialog_turn::SessionInbox>> = None;
+    if let Some(registry) = session_registry {
+        for _containment in 0..3 {
+            match registry.claim(session_key, item.id, params.user_id) {
+                crate::dialog_turn::ClaimOutcome::Claimed(inbox) => {
+                    session_claimed = true;
+                    session_inbox = Some(inbox);
+                    break;
+                }
+                // The same job id re-delivered while its original run is
+                // still registered: proceed without self-injecting; the
+                // engine's sent-marker re-entry guard resolves it.
+                crate::dialog_turn::ClaimOutcome::AlreadyOwned => break,
+                crate::dialog_turn::ClaimOutcome::Busy {
+                    session_job_id,
+                    initiator_user_id,
+                } => {
+                    let absorbed = if params.user_id == initiator_user_id {
+                        registry.inject(
+                            session_key,
+                            session_job_id,
+                            crate::dialog_turn::InjectedMessage {
+                                params: params.clone(),
+                            },
+                        )
+                    } else {
+                        registry.park(
+                            session_key,
+                            session_job_id,
+                            crate::dialog_turn::ParkedJob {
+                                queue_name: options.queue_name.to_owned(),
+                                job: item.job.clone(),
+                            },
+                        )
+                    };
+                    if absorbed {
+                        let outcome = if params.user_id == initiator_user_id {
+                            report.merged_into_session = Some(session_job_id);
+                            crate::dialog_turn::TurnOutcome::MergedIntoSession { session_job_id }
+                        } else {
+                            report.deferred_after_session = Some(session_job_id);
+                            crate::dialog_turn::TurnOutcome::DeferredAfterSession { session_job_id }
+                        };
+                        let resolution = crate::dialog_turn::TurnResolution {
+                            outcome,
+                            disposition: crate::dialog_turn::JobDisposition::Complete,
+                        };
+                        crate::dialog_turn::finalize_turn(
+                            queue,
+                            &item,
+                            resolution,
+                            &budget,
+                            options.now,
+                            options.turn_outcomes,
+                            options.terminal_signal,
+                            options.obligations,
+                            &mut report,
+                        )
+                        .await;
+                        return report;
+                    }
+                    // Release race: the session just ended; retry the claim.
+                }
+            }
+        }
+    }
+
     // Generation is the only long-running step of a tick: fold its real wall
     // time into finalize's `now` so the ledger's elapsed_ms reflects the true
     // turn duration (terminal failures no longer record elapsed_ms=0).
@@ -379,6 +457,7 @@ where
             session: options
                 .session
                 .map(crate::dialog_turn::SessionWorkerWiring::turn_config),
+            session_inbox,
         },
         queue,
         provider,
@@ -403,6 +482,38 @@ where
         &mut report,
     )
     .await;
+
+    // Release the session key AFTER finalize so a Busy observer can never
+    // start a parallel turn while this one still owns the outcome. Everything
+    // the session left behind gets its own turn now.
+    if session_claimed && let Some(registry) = session_registry {
+        let release = registry.release(session_key, item.id);
+        if let Some(newest) = release.leftover_injected.last() {
+            // Older leftovers are already persisted chat history and will
+            // materialize as context for this follow-up.
+            let job = openplotva_taskman::new_dialog_job_at(newest.params.clone(), finalize_now);
+            match queue.respawn_dialog_job(options.queue_name, job).await {
+                Ok(follow_up_id) => report.followup_respawned = Some(follow_up_id),
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        chat_id = params.chat_id,
+                        "failed to respawn the follow-up turn for leftover injected messages"
+                    );
+                }
+            }
+        }
+        for parked in release.parked {
+            let crate::dialog_turn::ParkedJob { queue_name, job } = parked;
+            if let Err(error) = queue.respawn_dialog_job(&queue_name, job).await {
+                tracing::warn!(
+                    error = %error,
+                    chat_id = params.chat_id,
+                    "failed to respawn a deferred third-party turn"
+                );
+            }
+        }
+    }
     report
 }
 

@@ -62,6 +62,14 @@ pub trait DialogJobWorkerQueue {
         job_id: i64,
         target_queue: &'a str,
     ) -> DialogJobWorkerFuture<'a, (), Self::Error>;
+
+    /// Assign a fresh dialog job: follow-up turns for messages a released
+    /// session left unconsumed, and deferred third-party turns.
+    fn respawn_dialog_job<'a>(
+        &'a self,
+        queue_name: &'a str,
+        job: openplotva_taskman::StatelessJobItem,
+    ) -> DialogJobWorkerFuture<'a, i64, Self::Error>;
 }
 
 impl DialogJobWorkerQueue for InMemoryTaskQueue {
@@ -121,6 +129,14 @@ impl DialogJobWorkerQueue for InMemoryTaskQueue {
         target_queue: &'a str,
     ) -> DialogJobWorkerFuture<'a, (), Self::Error> {
         Box::pin(async move { self.requeue_job_to_queue(job_id, target_queue) })
+    }
+
+    fn respawn_dialog_job<'a>(
+        &'a self,
+        queue_name: &'a str,
+        job: openplotva_taskman::StatelessJobItem,
+    ) -> DialogJobWorkerFuture<'a, i64, Self::Error> {
+        Box::pin(async move { Ok(self.assign(queue_name, job)) })
     }
 }
 

@@ -107,6 +107,10 @@ impl SessionTurnConfig<'_> {
 pub struct SessionWorkerWiring {
     pub toolbox: std::sync::Arc<dyn DialogToolbox>,
     pub reactor: Option<std::sync::Arc<dyn SessionReactor>>,
+    /// Per-(chat, thread) serialization + injection
+    /// (`DIALOG_SESSION_INJECTION_ENABLED`); `None` keeps today's
+    /// per-(chat, user, thread) parallel turns.
+    pub registry: Option<std::sync::Arc<super::inbox::DialogSessionRegistry>>,
     pub enabled_chats: Vec<i64>,
     pub max_iterations: i32,
     pub max_messages: i32,
@@ -194,6 +198,8 @@ pub(crate) struct SessionRunContext<'a> {
     pub now: OffsetDateTime,
     pub routing_events: Option<&'a crate::runtime_routing::RoutingEventReporter>,
     pub item: &'a crate::dialog_jobs::DialogJobWorkItem,
+    /// Live inbox of this session (injection enabled); drained per iteration.
+    pub inbox: Option<std::sync::Arc<super::inbox::SessionInbox>>,
 }
 
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
@@ -262,6 +268,13 @@ where
     let mut iteration: i32 = 0;
     loop {
         iteration += 1;
+        if let Some(inbox) = ctx.inbox.as_ref() {
+            for injected in inbox.drain_open() {
+                transcript.push(SessionMessage::InjectedUser {
+                    rendered: render_injected_message(&injected),
+                });
+            }
+        }
         let round_now =
             ctx.now + TimeDuration::try_from(processing_started.elapsed()).unwrap_or_default();
         if budget.remaining(round_now) < MIN_GENERATION_BUDGET || iteration > max_iterations {
@@ -1015,4 +1028,22 @@ async fn append_session_tool_event<Queue>(
     if let Err(error) = queue.append_dialog_job_event(job_id, event, at).await {
         tracing::debug!(error = %error, job_id, "failed to append session tool event");
     }
+}
+
+/// Injected chat messages render with the same body format as history user
+/// turns so sender attribution stays coherent for the model.
+fn render_injected_message(injected: &super::inbox::InjectedMessage) -> String {
+    let params = &injected.params;
+    let turn = HistoryMessage {
+        message_id: params.message_id,
+        role: openplotva_dialog::ROLE_USER.to_owned(),
+        kind: openplotva_dialog::MESSAGE_KIND_TEXT.to_owned(),
+        name: params.user_full_name.clone(),
+        user_id: params.user_id,
+        text: params.message_text.clone(),
+        original_text: params.original_text.clone(),
+        meta: serde_json::from_value(params.meta.clone()).unwrap_or_default(),
+        ..HistoryMessage::default()
+    };
+    openplotva_llm::aifarm::format_message_body(&turn)
 }

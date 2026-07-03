@@ -794,6 +794,10 @@ pub struct DialogConfig {
     pub session_max_draws: i32,
     /// Song generations per session, from `DIALOG_SESSION_MAX_SONGS`.
     pub session_max_songs: i32,
+    /// One active session per (chat, thread) with initiator-only injection,
+    /// from `DIALOG_SESSION_INJECTION_ENABLED`. Off = today's parallel
+    /// per-(chat, user, thread) turns.
+    pub session_injection_enabled: bool,
     pub vmlx_url: String,
     pub vmlx_api_key: String,
     pub vmlx_model: String,
@@ -1219,6 +1223,8 @@ pub struct RawConfig {
     pub dialog_session_max_draws: Option<String>,
     /// `DIALOG_SESSION_MAX_SONGS`.
     pub dialog_session_max_songs: Option<String>,
+    /// `DIALOG_SESSION_INJECTION_ENABLED`.
+    pub dialog_session_injection_enabled: Option<String>,
     /// `DIALOG_VMLX_URL`.
     pub dialog_vmlx_url: Option<String>,
     /// `DIALOG_VMLX_API_KEY`.
@@ -2363,6 +2369,11 @@ impl AppConfig {
                         raw.dialog_session_max_songs,
                         1,
                     )?,
+                    session_injection_enabled: parse_bool(
+                        "DIALOG_SESSION_INJECTION_ENABLED",
+                        raw.dialog_session_injection_enabled,
+                        false,
+                    )?,
                     vmlx_url: raw
                         .dialog_vmlx_url
                         .unwrap_or_else(|| DEFAULT_DIALOG_VMLX_URL.to_owned()),
@@ -2950,6 +2961,7 @@ impl RawConfig {
             dialog_session_hard_cap_secs: env("DIALOG_SESSION_HARD_CAP_SECS"),
             dialog_session_max_draws: env("DIALOG_SESSION_MAX_DRAWS"),
             dialog_session_max_songs: env("DIALOG_SESSION_MAX_SONGS"),
+            dialog_session_injection_enabled: env("DIALOG_SESSION_INJECTION_ENABLED"),
             dialog_vmlx_url: env("DIALOG_VMLX_URL"),
             dialog_vmlx_api_key: env("DIALOG_VMLX_API_KEY"),
             dialog_vmlx_model: env("DIALOG_VMLX_MODEL"),

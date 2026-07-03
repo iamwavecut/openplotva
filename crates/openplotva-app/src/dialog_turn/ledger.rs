@@ -37,6 +37,12 @@ pub const TURN_OUTCOME_TERMINAL_FAILED: &str = "terminal_failed";
 /// Pre-turn skip (decode error, expired queue backlog, empty payload).
 pub const TURN_OUTCOME_SKIPPED: &str = "skipped";
 
+/// The trigger was absorbed by the chat's running session.
+pub const TURN_OUTCOME_MERGED_INTO_SESSION: &str = "merged_into_session";
+
+/// The turn parked behind the chat's running session and respawns after it.
+pub const TURN_OUTCOME_DEFERRED_AFTER_SESSION: &str = "deferred_after_session";
+
 /// One classified dialog turn tick, ready for the ring buffer and Postgres.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DialogTurnOutcomeRecord {

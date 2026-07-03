@@ -11156,6 +11156,11 @@ async fn start_runtime_workers(
         config.llm.dialog.agent_loop_enabled.then(|| {
             Arc::new(dialog_turn::SessionWorkerWiring {
                 toolbox: Arc::clone(&dialog_toolbox),
+                registry: config
+                    .llm
+                    .dialog
+                    .session_injection_enabled
+                    .then(|| Arc::new(dialog_turn::DialogSessionRegistry::new())),
                 reactor: Some(
                     Arc::new(reactions::GenerationReactionSignaler::new(telegram.clone()))
                         as Arc<dyn dialog_turn::SessionReactor>,

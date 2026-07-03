@@ -63,6 +63,8 @@ pub(crate) struct TurnContext<'a> {
     /// Session-engine wiring (`DIALOG_AGENT_LOOP_ENABLED`); `None` keeps the
     /// fully intact legacy provider-internal loop.
     pub session: Option<super::session::SessionTurnConfig<'a>>,
+    /// Live inbox for this turn when the worker claimed the session key.
+    pub session_inbox: Option<std::sync::Arc<super::inbox::SessionInbox>>,
 }
 
 pub(crate) async fn execute_dialog_turn<Queue, Provider, Effects, Materializer, ToolHistory>(
@@ -140,6 +142,7 @@ where
             now: ctx.now,
             routing_events: ctx.routing_events,
             item: ctx.item,
+            inbox: ctx.session_inbox.clone(),
         };
         return super::session::run_dialog_session(
             session_ctx,
@@ -823,6 +826,11 @@ fn resolution_detail(resolution: &TurnResolution, report: &DialogJobWorkerReport
     }
     if let TurnOutcome::SideEffectDelegated { kinds, .. } = &resolution.outcome {
         detail.insert("side_effect_kinds".to_owned(), json!(kinds));
+    }
+    if let TurnOutcome::MergedIntoSession { session_job_id }
+    | TurnOutcome::DeferredAfterSession { session_job_id } = &resolution.outcome
+    {
+        detail.insert("merged_into_job_id".to_owned(), json!(session_job_id));
     }
     Value::Object(detail)
 }

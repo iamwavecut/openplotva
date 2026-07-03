@@ -2544,6 +2544,14 @@ impl DialogJobWorkerQueue for FailingEventQueue {
         self.inner.dequeue_dialog_job(queue_name)
     }
 
+    fn respawn_dialog_job<'a>(
+        &'a self,
+        queue_name: &'a str,
+        job: openplotva_taskman::StatelessJobItem,
+    ) -> DialogJobWorkerFuture<'a, i64, Self::Error> {
+        self.inner.respawn_dialog_job(queue_name, job)
+    }
+
     fn pending_dialog_job_depth<'a>(
         &'a self,
         queue_name: &'static str,
@@ -2620,10 +2628,13 @@ fn record_status(queue: &InMemoryTaskQueue, job_id: i64) -> JobStatus {
 
 // ---- Dialog session engine (DIALOG_AGENT_LOOP_ENABLED) ----
 
+type StepHook = Box<dyn FnMut(usize) + Send>;
+
 struct StepProviderStub {
     steps: Mutex<VecDeque<Result<openplotva_dialog::ChatStepOutput, String>>>,
     requests: Mutex<Vec<openplotva_dialog::ChatStepRequest>>,
     retryable_errors: bool,
+    on_call: Mutex<Option<StepHook>>,
 }
 
 impl StepProviderStub {
@@ -2632,7 +2643,13 @@ impl StepProviderStub {
             steps: Mutex::new(steps.into_iter().collect()),
             requests: Mutex::new(Vec::new()),
             retryable_errors: true,
+            on_call: Mutex::new(None),
         }
+    }
+
+    fn with_on_call(self, hook: StepHook) -> Self {
+        *self.on_call.lock().expect("on_call") = Some(hook);
+        self
     }
 
     fn requests(&self) -> Vec<openplotva_dialog::ChatStepRequest> {
@@ -2701,7 +2718,14 @@ impl openplotva_llm::ChatStepProvider for StepProviderStub {
         request: openplotva_dialog::ChatStepRequest,
     ) -> openplotva_llm::ChatStepFuture<'a> {
         Box::pin(async move {
-            self.requests.lock().expect("step requests").push(request);
+            let call_index = {
+                let mut requests = self.requests.lock().expect("step requests");
+                requests.push(request);
+                requests.len()
+            };
+            if let Some(hook) = self.on_call.lock().expect("on_call").as_mut() {
+                hook(call_index);
+            }
             match self.steps.lock().expect("steps").pop_front() {
                 Some(Ok(step)) => Ok(step),
                 Some(Err(message)) if self.retryable_errors => Err(Box::new(ProviderError::new(
@@ -2795,6 +2819,7 @@ fn session_wiring(
     crate::dialog_turn::SessionWorkerWiring {
         toolbox,
         reactor,
+        registry: None,
         enabled_chats: Vec::new(),
         max_iterations: 8,
         max_messages: 4,
@@ -3305,5 +3330,170 @@ async fn session_reentry_marker_skips_replay() -> Result<(), Box<dyn Error>> {
     assert_eq!(provider.calls(), 0, "no LLM call on re-entry");
     assert!(effects.sent().is_empty());
     assert_eq!(record_status(&queue, job_id), JobStatus::Completed);
+    Ok(())
+}
+
+fn wiring_with_registry(
+    registry: Arc<crate::dialog_turn::DialogSessionRegistry>,
+) -> crate::dialog_turn::SessionWorkerWiring {
+    let toolbox: Arc<dyn openplotva_dialog::DialogToolbox> =
+        Arc::new(SessionToolboxStub::default());
+    crate::dialog_turn::SessionWorkerWiring {
+        registry: Some(registry),
+        ..session_wiring(toolbox, None)
+    }
+}
+
+fn params_from(user_id: i64, text: &str) -> DialogJobParams {
+    DialogJobParams {
+        user_id,
+        ..dialog_params(text)
+    }
+}
+
+#[tokio::test]
+async fn busy_session_absorbs_initiator_and_defers_third_party() -> Result<(), Box<dyn Error>> {
+    let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+    let registry = Arc::new(crate::dialog_turn::DialogSessionRegistry::new());
+    let key = crate::dialog_turn::SessionKey::new(42, Some(9));
+    // A running session owned by fake job 999, initiated by user 7.
+    let crate::dialog_turn::ClaimOutcome::Claimed(inbox) = registry.claim(key, 999, 7) else {
+        panic!("pre-claimed");
+    };
+    let wiring = wiring_with_registry(Arc::clone(&registry));
+    let outcomes = crate::dialog_turn::DialogTurnObserver::new(
+        crate::dialog_turn::RuntimeTurnOutcomeBuffer::new(8),
+        None,
+    );
+
+    // Initiator message → merged, no LLM work, job completes.
+    let queue = InMemoryTaskQueue::new();
+    let merged_id = queue.assign(
+        DIALOG_AIFARM_QUEUE_NAME,
+        new_dialog_job_at(params_from(7, "и ещё вот что"), now),
+    );
+    let provider = StepProviderStub::with_steps(Vec::new());
+    let effects = EffectsStub::default();
+    let report = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+        &queue,
+        &provider,
+        &effects,
+        &BasicDialogInputMaterializer,
+        &NoopDialogToolCallHistoryStore,
+        session_options(now, &outcomes, &wiring),
+    )
+    .await;
+    assert_eq!(report.merged_into_session, Some(999));
+    assert_eq!(provider.calls(), 0);
+    assert_eq!(record_status(&queue, merged_id), JobStatus::Completed);
+    assert_eq!(inbox.drain_open().len(), 1, "message reached the inbox");
+
+    // Third-party message → deferred, parked for release.
+    let deferred_id = queue.assign(
+        DIALOG_AIFARM_QUEUE_NAME,
+        new_dialog_job_at(params_from(8, "а можно мне тоже"), now),
+    );
+    let report = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+        &queue,
+        &provider,
+        &effects,
+        &BasicDialogInputMaterializer,
+        &NoopDialogToolCallHistoryStore,
+        session_options(now, &outcomes, &wiring),
+    )
+    .await;
+    assert_eq!(report.deferred_after_session, Some(999));
+    assert_eq!(record_status(&queue, deferred_id), JobStatus::Completed);
+
+    let release = registry.release(key, 999);
+    assert_eq!(release.parked.len(), 1);
+    let rows = ledger_rows(&outcomes);
+    assert_eq!(rows[0].outcome, "deferred_after_session");
+    assert_eq!(rows[1].outcome, "merged_into_session");
+    Ok(())
+}
+
+#[tokio::test]
+async fn injected_message_reaches_the_next_iteration_and_leftovers_respawn()
+-> Result<(), Box<dyn Error>> {
+    let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+    let registry = Arc::new(crate::dialog_turn::DialogSessionRegistry::new());
+    let key = crate::dialog_turn::SessionKey::new(42, Some(9));
+    let wiring = wiring_with_registry(Arc::clone(&registry));
+    let queue = InMemoryTaskQueue::new();
+    let job_id = queue.assign(
+        DIALOG_AIFARM_QUEUE_NAME,
+        new_dialog_job_at(params_from(7, "посчитай мне"), now),
+    );
+    // Iteration 1: the initiator sends a follow-up while the tool runs — the
+    // engine drains it before iteration 2. During the FINAL iteration another
+    // follow-up arrives; it stays in the inbox and respawns after release.
+    let inject_registry = Arc::clone(&registry);
+    let provider = StepProviderStub::with_steps(vec![
+        Ok(step_tools(
+            "",
+            vec![(
+                "c1",
+                openplotva_dialog::ToolStep {
+                    step: openplotva_dialog::STEP_WEB_SEARCH.to_owned(),
+                    query: "числа".to_owned(),
+                    ..openplotva_dialog::ToolStep::default()
+                },
+            )],
+        )),
+        Ok(step_text("готово: 4")),
+    ])
+    .with_on_call(Box::new(move |call_index| {
+        let text = if call_index == 1 {
+            "кстати умножь на два"
+        } else {
+            "и ещё раз на три"
+        };
+        assert!(inject_registry.inject(
+            key,
+            job_id,
+            crate::dialog_turn::InjectedMessage {
+                params: params_from(7, text),
+            },
+        ));
+    }));
+    let effects = EffectsStub::default();
+    let outcomes = crate::dialog_turn::DialogTurnObserver::new(
+        crate::dialog_turn::RuntimeTurnOutcomeBuffer::new(8),
+        None,
+    );
+
+    let report = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+        &queue,
+        &provider,
+        &effects,
+        &BasicDialogInputMaterializer,
+        &NoopDialogToolCallHistoryStore,
+        session_options(now, &outcomes, &wiring),
+    )
+    .await;
+
+    assert!(report.sent_answer, "{report:?}");
+    // The first injected message rendered as a user turn before iteration 2.
+    let requests = provider.requests();
+    let injected = requests[1]
+        .transcript
+        .iter()
+        .filter_map(|entry| match entry {
+            openplotva_dialog::SessionMessage::InjectedUser { rendered } => Some(rendered.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(injected.len(), 1, "{:?}", requests[1].transcript);
+    assert!(injected[0].contains("кстати умножь на два"));
+    // The second injected message was left in the inbox → a follow-up job.
+    assert!(report.followup_respawned.is_some(), "{report:?}");
+    assert_eq!(registry.active_count(), 0, "session released its key");
+    let follow_up = queue
+        .records()
+        .into_iter()
+        .find(|record| Some(record.id) == report.followup_respawned)
+        .expect("follow-up job");
+    assert_eq!(follow_up.status, JobStatus::Pending);
     Ok(())
 }
