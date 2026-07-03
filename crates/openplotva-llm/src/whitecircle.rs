@@ -975,8 +975,7 @@ where
                 ));
                 return Err(error);
             };
-            // One fire-and-forget check per session, matching the single
-            // per-turn check the legacy run_dialog path dispatches. Gate on
+            // One fire-and-forget check per session. Gate on
             // the iteration counter, not the transcript: injected inbox
             // messages can pre-populate the transcript before the first step.
             if request.iteration <= 1 {

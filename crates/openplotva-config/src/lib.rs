@@ -180,27 +180,11 @@ pub const DEFAULT_LLM_PROVIDER_MAX_TOKENS: i32 = 8192;
 
 pub const DEFAULT_LLM_PROVIDER_TASK_TIMEOUT_SECONDS: i32 = 600;
 
-/// Agentic search is on by default; the app auto-registers a `qwen-reasoner`
-/// provider so it works without any `LLM_PROVIDERS_*` configuration.
-pub const DEFAULT_AGENTIC_SEARCH_ENABLED: bool = true;
-
 pub const DEFAULT_AGENTIC_SONG_ENABLED: bool = true;
 
 pub const DEFAULT_AGENTIC_IMAGE_ENABLED: bool = true;
 
-pub const DEFAULT_AGENTIC_SEARCH_REASONER_PROVIDER: &str = "qwen-reasoner";
-
-pub const DEFAULT_AGENTIC_SEARCH_WRITER_PROVIDER: &str = "conversational";
-
-pub const DEFAULT_AGENTIC_SEARCH_MAX_SEARCHES: i32 = 3;
-
-pub const DEFAULT_AGENTIC_SEARCH_MAX_CRAWLS: i32 = 4;
-
-pub const DEFAULT_AGENTIC_SEARCH_MAX_STEPS: i32 = 8;
-
-pub const DEFAULT_AGENTIC_SEARCH_MAX_TOTAL_TOKENS: i32 = 60000;
-
-pub const DEFAULT_AGENTIC_SEARCH_WALL_TIMEOUT_SECONDS: i32 = 120;
+pub const DEFAULT_AGENT_REASONER_PROVIDER: &str = "qwen-reasoner";
 
 pub const DEFAULT_VISION_DISCOVERY_SERVICE_NAME: &str = DEFAULT_DIALOG_DISCOVERY_SERVICE_NAME;
 
@@ -674,25 +658,13 @@ pub struct NamedProviderConfig {
 /// Agentic-workflow configuration root.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AgenticConfig {
-    pub search: AgenticSearchConfig,
+    /// Named provider the song/image prompt agents reason with, from
+    /// `LLM_AGENT_REASONER_PROVIDER`.
+    pub reasoner_provider: String,
     /// When true, song requests are written by the multi-step song agent.
     pub song_enabled: bool,
     /// When true, draw requests are refined by the multi-step image-prompt agent.
     pub image_enabled: bool,
-}
-
-/// Search-agent profile configuration. Disabled by default so the existing naive
-/// `web_search` tool path is unchanged.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct AgenticSearchConfig {
-    pub enabled: bool,
-    pub reasoner_provider: String,
-    pub writer_provider: String,
-    pub max_searches: i32,
-    pub max_crawls: i32,
-    pub max_steps: i32,
-    pub max_total_tokens: i32,
-    pub wall_timeout_seconds: i32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1248,26 +1220,12 @@ pub struct RawConfig {
     pub llm_provider_temperatures: Option<String>,
     /// `LLM_PROVIDERS_TASK_TIMEOUT_SECONDS`.
     pub llm_provider_task_timeout_seconds: Option<String>,
-    /// `LLM_AGENTIC_SEARCH_ENABLED`.
-    pub llm_agentic_search_enabled: Option<String>,
     /// `LLM_AGENTIC_SONG_ENABLED`.
     pub llm_agentic_song_enabled: Option<String>,
     /// `LLM_AGENTIC_IMAGE_ENABLED`.
     pub llm_agentic_image_enabled: Option<String>,
-    /// `LLM_AGENTIC_SEARCH_REASONER_PROVIDER`.
-    pub llm_agentic_search_reasoner_provider: Option<String>,
-    /// `LLM_AGENTIC_SEARCH_WRITER_PROVIDER`.
-    pub llm_agentic_search_writer_provider: Option<String>,
-    /// `LLM_AGENTIC_SEARCH_MAX_SEARCHES`.
-    pub llm_agentic_search_max_searches: Option<String>,
-    /// `LLM_AGENTIC_SEARCH_MAX_CRAWLS`.
-    pub llm_agentic_search_max_crawls: Option<String>,
-    /// `LLM_AGENTIC_SEARCH_MAX_STEPS`.
-    pub llm_agentic_search_max_steps: Option<String>,
-    /// `LLM_AGENTIC_SEARCH_MAX_TOTAL_TOKENS`.
-    pub llm_agentic_search_max_total_tokens: Option<String>,
-    /// `LLM_AGENTIC_SEARCH_WALL_TIMEOUT_SECONDS`.
-    pub llm_agentic_search_wall_timeout_seconds: Option<String>,
+    /// `LLM_AGENT_REASONER_PROVIDER`.
+    pub llm_agent_reasoner_provider: Option<String>,
     /// `GENKIT_DEFAULT_MODEL`.
     pub genkit_default_model: Option<String>,
     /// `GENKIT_HISTORY_SUMMARY_PROVIDER`.
@@ -2376,44 +2334,8 @@ impl AppConfig {
                 },
                 providers: llm_providers,
                 agentic: AgenticConfig {
-                    search: AgenticSearchConfig {
-                        enabled: parse_bool(
-                            "LLM_AGENTIC_SEARCH_ENABLED",
-                            raw.llm_agentic_search_enabled,
-                            DEFAULT_AGENTIC_SEARCH_ENABLED,
-                        )?,
-                        reasoner_provider: parse_scalar_value(
-                            raw.llm_agentic_search_reasoner_provider,
-                        )
-                        .unwrap_or_else(|| DEFAULT_AGENTIC_SEARCH_REASONER_PROVIDER.to_owned()),
-                        writer_provider: parse_scalar_value(raw.llm_agentic_search_writer_provider)
-                            .unwrap_or_else(|| DEFAULT_AGENTIC_SEARCH_WRITER_PROVIDER.to_owned()),
-                        max_searches: parse_i32(
-                            "LLM_AGENTIC_SEARCH_MAX_SEARCHES",
-                            raw.llm_agentic_search_max_searches,
-                            DEFAULT_AGENTIC_SEARCH_MAX_SEARCHES,
-                        )?,
-                        max_crawls: parse_i32(
-                            "LLM_AGENTIC_SEARCH_MAX_CRAWLS",
-                            raw.llm_agentic_search_max_crawls,
-                            DEFAULT_AGENTIC_SEARCH_MAX_CRAWLS,
-                        )?,
-                        max_steps: parse_i32(
-                            "LLM_AGENTIC_SEARCH_MAX_STEPS",
-                            raw.llm_agentic_search_max_steps,
-                            DEFAULT_AGENTIC_SEARCH_MAX_STEPS,
-                        )?,
-                        max_total_tokens: parse_i32(
-                            "LLM_AGENTIC_SEARCH_MAX_TOTAL_TOKENS",
-                            raw.llm_agentic_search_max_total_tokens,
-                            DEFAULT_AGENTIC_SEARCH_MAX_TOTAL_TOKENS,
-                        )?,
-                        wall_timeout_seconds: parse_i32(
-                            "LLM_AGENTIC_SEARCH_WALL_TIMEOUT_SECONDS",
-                            raw.llm_agentic_search_wall_timeout_seconds,
-                            DEFAULT_AGENTIC_SEARCH_WALL_TIMEOUT_SECONDS,
-                        )?,
-                    },
+                    reasoner_provider: parse_scalar_value(raw.llm_agent_reasoner_provider)
+                        .unwrap_or_else(|| DEFAULT_AGENT_REASONER_PROVIDER.to_owned()),
                     song_enabled: parse_bool(
                         "LLM_AGENTIC_SONG_ENABLED",
                         raw.llm_agentic_song_enabled,
@@ -2933,16 +2855,9 @@ impl RawConfig {
             llm_provider_max_tokens: env("LLM_PROVIDERS_MAX_TOKENS"),
             llm_provider_temperatures: env("LLM_PROVIDERS_TEMPERATURES"),
             llm_provider_task_timeout_seconds: env("LLM_PROVIDERS_TASK_TIMEOUT_SECONDS"),
-            llm_agentic_search_enabled: env("LLM_AGENTIC_SEARCH_ENABLED"),
             llm_agentic_song_enabled: env("LLM_AGENTIC_SONG_ENABLED"),
             llm_agentic_image_enabled: env("LLM_AGENTIC_IMAGE_ENABLED"),
-            llm_agentic_search_reasoner_provider: env("LLM_AGENTIC_SEARCH_REASONER_PROVIDER"),
-            llm_agentic_search_writer_provider: env("LLM_AGENTIC_SEARCH_WRITER_PROVIDER"),
-            llm_agentic_search_max_searches: env("LLM_AGENTIC_SEARCH_MAX_SEARCHES"),
-            llm_agentic_search_max_crawls: env("LLM_AGENTIC_SEARCH_MAX_CRAWLS"),
-            llm_agentic_search_max_steps: env("LLM_AGENTIC_SEARCH_MAX_STEPS"),
-            llm_agentic_search_max_total_tokens: env("LLM_AGENTIC_SEARCH_MAX_TOTAL_TOKENS"),
-            llm_agentic_search_wall_timeout_seconds: env("LLM_AGENTIC_SEARCH_WALL_TIMEOUT_SECONDS"),
+            llm_agent_reasoner_provider: env("LLM_AGENT_REASONER_PROVIDER"),
             genkit_default_model: env("GENKIT_DEFAULT_MODEL"),
             genkit_history_summary_provider: env("GENKIT_HISTORY_SUMMARY_PROVIDER"),
             genkit_history_summary_model: env("GENKIT_HISTORY_SUMMARY_MODEL"),
@@ -3628,12 +3543,10 @@ mod tests {
             config.vision.request_timeout_seconds,
             DEFAULT_VISION_REQUEST_TIMEOUT_SECONDS
         );
-        // Agentic search is on by default and points at the qwen reasoner; the
-        // qwen provider itself is auto-registered by the app, so the config-level
-        // providers list stays empty.
-        assert!(config.llm.agentic.search.enabled);
-        assert_eq!(config.llm.agentic.search.reasoner_provider, "qwen-reasoner");
-        assert_eq!(config.llm.agentic.search.writer_provider, "conversational");
+        // The song/image agents point at the qwen reasoner by default; the
+        // qwen provider itself is auto-registered by the app, so the
+        // config-level providers list stays empty.
+        assert_eq!(config.llm.agentic.reasoner_provider, "qwen-reasoner");
         assert!(config.llm.providers.is_empty());
         assert!(!config.music.acestep.enabled);
         assert_eq!(config.music.acestep.base_url, DEFAULT_ACESTEP_BASE_URL);

@@ -2637,7 +2637,7 @@ fn record_status(queue: &InMemoryTaskQueue, job_id: i64) -> JobStatus {
         .status
 }
 
-// ---- Dialog session engine (DIALOG_AGENT_LOOP_ENABLED) ----
+// ---- Dialog session engine ----
 
 type StepHook = Box<dyn FnMut(usize) + Send>;
 

@@ -430,8 +430,7 @@ impl GuestMessageEffects for GuestRuntimeEffects {
                 return Err(GuestRuntimeEffectError::DialogUnavailable);
             };
             let dialog_input = dialog_input_from_guest_at(&input, OffsetDateTime::now_utc());
-            // Guest turns are tool-less single shots by construction — the
-            // chat-step seam is their natural home; the legacy run_dialog
+            // Guest turns are tool-less single shots by construction.
             let Some(step) = provider.as_chat_step() else {
                 return Err(GuestRuntimeEffectError::Dialog(
                     "guest dialog provider has no chat-step support".to_owned(),

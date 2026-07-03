@@ -379,8 +379,6 @@ pub async fn seed_routing_from_env(
     for workflow in [
         "memory_consolidation",
         "history_summary",
-        "agentic_search_reasoner",
-        "agentic_search_writer",
         "agentic_song",
         "agentic_image",
         "media_prompt_optimizer",
@@ -509,8 +507,8 @@ fn assignment_input_from_record(
 /// pipeline actually use into managed DB rows, and repoint those config-only workflows
 /// at them. The initial seed flattened these to the dialog Gemma model; this corrects an
 /// already-seeded database (idempotent via the `gpu_backfilled` flag) so the GPU2 models
-/// (`vibethinker-3b` for memory/history, `qwen3.6-27b-moq` for the search reasoner)
-/// show up in the admin and drive the right workflows. Values are read from config, so it
+/// (`vibethinker-3b` for memory/history) show up in the admin and drive the
+/// right workflows. Values are read from config, so it
 /// adapts to whatever each flow is configured to use.
 pub async fn backfill_gpu_models(pool: &PgPool, config: &AppConfig) -> Result<bool, StorageError> {
     if app_setting_present(pool, GPU_BACKFILL_KEY).await? {
@@ -518,7 +516,6 @@ pub async fn backfill_gpu_models(pool: &PgPool, config: &AppConfig) -> Result<bo
     }
 
     let memory = &config.memory;
-    let reasoner = crate::agent_runtime::qwen_reasoner_named_provider_config(config);
     // (workflow, discovery service, endpoint, model) each flow really resolves to.
     let targets: Vec<(&str, String, String, String)> = vec![
         (
@@ -532,12 +529,6 @@ pub async fn backfill_gpu_models(pool: &PgPool, config: &AppConfig) -> Result<bo
             memory.aifarm_service_name.clone(),
             memory.aifarm_endpoint_name.clone(),
             memory.consolidation_model.clone(),
-        ),
-        (
-            "agentic_search_reasoner",
-            reasoner.discovery_service_name.clone(),
-            reasoner.discovery_endpoint_name.clone(),
-            reasoner.model.clone(),
         ),
     ]
     .into_iter()

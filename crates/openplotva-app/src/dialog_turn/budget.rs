@@ -14,7 +14,7 @@ pub const TURN_STARTED_STAGE: &str = "turn_started";
 
 tokio::task_local! {
     /// Wall-clock deadline for the current turn's provider work, set by the
-    /// engine around `provider.run_dialog` and read by `RouterChatProvider`
+    /// engine around each chat step and read by `RouterChatProvider`
     /// when building the routed walker context.
     pub static TURN_DEADLINE: Option<Instant>;
 }

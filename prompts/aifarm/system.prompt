@@ -5,9 +5,6 @@
     {{#ifEquals toolMode "native"}}
     <tool_mode>OpenAI tools доступны. Вызывай tool только если последнее сообщение требует внешнего действия.</tool_mode>
     {{/ifEquals}}
-    {{#ifEquals toolMode "text"}}
-    <tool_mode>Нужен tool — пиши ровно один plain-text tool call и больше ничего.</tool_mode>
-    {{/ifEquals}}
     {{#ifEquals toolMode "none"}}
     <tool_mode>OpenAI tools в этом запросе недоступны. Верни финальный видимый пользователю ответ обычным текстом.</tool_mode>
     {{/ifEquals}}
@@ -23,10 +20,6 @@
   {{#if hasTools}}
   <tool_contract>
     <naming>Используй tool names и argument names ровно как ниже.</naming>
-    {{#ifEquals toolMode "text"}}
-    <plain_text_format>tool_name{arg:&lt;|&quot;|&gt;value&lt;|&quot;|&gt;,other_arg:&lt;|&quot;|&gt;value&lt;|&quot;|&gt;}</plain_text_format>
-    <plain_text_forbid>Не заворачивай plain-text tool call в JSON, Markdown, XML или поясняющий текст.</plain_text_forbid>
-    {{/ifEquals}}
 {{{toolCatalog}}}
   </tool_contract>
   {{/if}}
