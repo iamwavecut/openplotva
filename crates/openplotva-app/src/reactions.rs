@@ -95,6 +95,34 @@ impl fmt::Debug for GenerationReactionSignaler {
     }
 }
 
+impl crate::dialog_turn::SessionReactor for GenerationReactionSignaler {
+    /// `react_to_message`: one bounded `setMessageReaction`, error text back
+    /// to the model (the session engine already validated the emoji).
+    fn react<'a>(
+        &'a self,
+        chat_id: i64,
+        message_id: i64,
+        emoji: &'a str,
+    ) -> crate::dialog_turn::SessionReactionFuture<'a> {
+        Box::pin(async move {
+            let method = build_message_reaction_method(chat_id, message_id, emoji);
+            match tokio::time::timeout(
+                GENERATION_REACTION_TIMEOUT,
+                execute_telegram_method(&self.client, method),
+            )
+            .await
+            {
+                Ok(Ok(_)) => Ok(()),
+                Ok(Err(error)) => Err(error.to_string()),
+                Err(_) => Err(format!(
+                    "setMessageReaction timed out after {}s",
+                    GENERATION_REACTION_TIMEOUT.as_secs()
+                )),
+            }
+        })
+    }
+}
+
 impl GenerationReactionSink for GenerationReactionSignaler {
     fn set_queued<'a>(&'a self, target: GenerationReactionTarget) -> GenerationReactionFuture<'a> {
         Box::pin(async move {

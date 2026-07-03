@@ -11149,6 +11149,26 @@ async fn start_runtime_workers(
         app_dialog_toolbox = app_dialog_toolbox.with_agentic_search(agent);
     }
     let dialog_toolbox: Arc<dyn openplotva_dialog::DialogToolbox> = Arc::new(app_dialog_toolbox);
+    // DIALOG_AGENT_LOOP_ENABLED: the dialog session engine drives the turn
+    // (engine-owned tool loop, multi-message turns) instead of the legacy
+    // provider-internal loop; DIALOG_AGENT_LOOP_CHATS narrows it to canaries.
+    let dialog_session_wiring: Option<Arc<dialog_turn::SessionWorkerWiring>> =
+        config.llm.dialog.agent_loop_enabled.then(|| {
+            Arc::new(dialog_turn::SessionWorkerWiring {
+                toolbox: Arc::clone(&dialog_toolbox),
+                reactor: Some(
+                    Arc::new(reactions::GenerationReactionSignaler::new(telegram.clone()))
+                        as Arc<dyn dialog_turn::SessionReactor>,
+                ),
+                enabled_chats: config.llm.dialog.agent_loop_chats.clone(),
+                max_iterations: config.llm.dialog.session_max_iterations,
+                max_messages: config.llm.dialog.session_max_messages,
+                tool_extension_secs: config.llm.dialog.session_tool_extension_secs,
+                hard_cap_secs: config.llm.dialog.session_hard_cap_secs,
+                max_draws: config.llm.dialog.session_max_draws,
+                max_songs: config.llm.dialog.session_max_songs,
+            })
+        });
     // /search command worker: drives durable agent runs on the agent-qwen queue.
     if let Some((registry, settings)) = agentic_search_setup {
         match agent_serper_tools {
@@ -11401,6 +11421,7 @@ async fn start_runtime_workers(
                 let terminal_signal = dialog_terminal_signal.clone();
                 let reaction_emoji = dialog_terminal_reaction_emoji.clone();
                 let obligations = Arc::clone(&delivery_obligation_store);
+                let session_wiring = dialog_session_wiring.clone();
                 let stop_rx = stop.subscribe();
                 move |index: usize, retire: tokio::sync::oneshot::Receiver<()>| {
                     let worker_queue = Arc::clone(&queue);
@@ -11413,6 +11434,7 @@ async fn start_runtime_workers(
                     let worker_terminal_signal = terminal_signal.clone();
                     let worker_reaction_emoji = reaction_emoji.clone();
                     let worker_obligations = Arc::clone(&obligations);
+                    let worker_session = session_wiring.clone();
                     let worker_stop = stop_rx.clone();
                     tokio::spawn(async move {
                         // A retired worker finishes its current job and exits
@@ -11445,6 +11467,7 @@ async fn start_runtime_workers(
                                         dialog_terminal_signal_max_age_secs,
                                     ),
                                     obligations: Some(worker_obligations.as_ref()),
+                                    session: worker_session.as_deref(),
                                 },
                                 stop_future,
                             )

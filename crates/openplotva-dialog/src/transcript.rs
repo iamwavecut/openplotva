@@ -10,7 +10,21 @@
 
 use serde_json::Value;
 
-use crate::{DialogInput, DialogTraceArtifacts, ToolStep};
+use crate::{DialogInput, DialogTraceArtifacts, ToolContext, ToolStep};
+
+/// Tool execution context of one dialog turn.
+#[must_use]
+pub fn dialog_tool_context(input: &DialogInput) -> ToolContext {
+    ToolContext {
+        chat_id: input.context.chat_id,
+        thread_id: input.context.thread_id,
+        message_id: input.message.id,
+        user_id: input.user.id,
+        user_full_name: input.user.full_name.clone(),
+        message_text: input.message.text.clone(),
+        message_meta: input.message.meta.clone(),
+    }
+}
 
 /// One tool call as recorded in the session transcript. `arguments` is the
 /// JSON value the model produced (object or encoded string) so the call

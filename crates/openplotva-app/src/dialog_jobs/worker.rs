@@ -42,6 +42,9 @@ pub struct DialogJobWorkerLoopOptions<'a, Materializer: ?Sized, ToolHistory: ?Si
     /// Delivery-obligation annotator: finalize backfills the dialog job id on
     /// obligations recorded by the schedulers (annotation only, never creates).
     pub obligations: Option<&'a dyn crate::dialog_turn::DeliveryObligationAnnotator>,
+    /// Session-engine wiring (`DIALOG_AGENT_LOOP_ENABLED`); `None` keeps the
+    /// legacy provider-internal loop on every turn.
+    pub session: Option<&'a crate::dialog_turn::SessionWorkerWiring>,
 }
 
 /// True when the current UTC time is inside the daily `[start, end)` minute window,
@@ -260,6 +263,7 @@ where
             turn_outcomes: None,
             terminal_signal: crate::dialog_turn::TurnSignalPolicy::default(),
             obligations: None,
+            session: None,
         },
     )
     .await
@@ -277,6 +281,7 @@ pub(crate) struct DialogJobProcessOptions<'a> {
     pub(crate) turn_outcomes: Option<&'a crate::dialog_turn::DialogTurnObserver>,
     pub(crate) terminal_signal: crate::dialog_turn::TurnSignalPolicy<'a>,
     pub(crate) obligations: Option<&'a dyn crate::dialog_turn::DeliveryObligationAnnotator>,
+    pub(crate) session: Option<&'a crate::dialog_turn::SessionWorkerWiring>,
 }
 
 pub(crate) async fn process_dialog_job_once_in_queue_with_materializer_history_and_retry_at<
@@ -371,6 +376,9 @@ where
             budget,
             now: options.now,
             routing_events: options.routing_events,
+            session: options
+                .session
+                .map(crate::dialog_turn::SessionWorkerWiring::turn_config),
         },
         queue,
         provider,
@@ -464,6 +472,7 @@ where
             max_regenerations: DEFAULT_DIALOG_TURN_MAX_REGENERATIONS,
             terminal_signal: crate::dialog_turn::TurnSignalPolicy::default(),
             obligations: None,
+            session: None,
         },
         stop,
     )
@@ -518,6 +527,7 @@ where
                             turn_outcomes: options.turn_outcomes,
                             terminal_signal: options.terminal_signal,
                             obligations: options.obligations,
+                            session: None,
                         },
                     ).await;
                     trace_dialog_job_tick(&tick);
@@ -662,6 +672,7 @@ where
             max_regenerations: DEFAULT_DIALOG_TURN_MAX_REGENERATIONS,
             terminal_signal: crate::dialog_turn::TurnSignalPolicy::default(),
             obligations: None,
+            session: None,
         },
         stop,
     )

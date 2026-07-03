@@ -33,6 +33,7 @@ pub use json_codec::{
 pub use persona::{daily_persona_for_day, daily_persona_for_unix_timestamp};
 pub use transcript::{
     ChatStepOutput, ChatStepRequest, ChatStepToolCall, SessionMessage, SessionToolCall, ToolsMode,
+    dialog_tool_context,
 };
 
 /// Human-readable crate purpose used by scaffold tests and docs.
@@ -398,6 +399,15 @@ pub const STEP_CHAT_HISTORY_SUMMARY: &str = "chat_history_summary";
 pub const STEP_HISTORY_SEARCH: &str = "history_search";
 pub const STEP_MEMORY_SEARCH: &str = "memory_search";
 
+/// Session-engine tool: post an intermediate chat message without ending the
+/// turn. Never part of the shared catalog — the legacy provider loop must not
+/// advertise it (rollback safety); the session engine injects it itself.
+pub const STEP_SEND_MESSAGE: &str = "send_message";
+
+/// Session-engine tool: set a semantic emoji reaction on a chat message.
+/// Never part of the shared catalog, same as [`STEP_SEND_MESSAGE`].
+pub const STEP_REACT_TO_MESSAGE: &str = "react_to_message";
+
 const ALL_STEPS: &[&str] = &[
     STEP_DRAW_IMAGE,
     STEP_GENERATE_SONG,
@@ -412,6 +422,8 @@ const ALL_STEPS: &[&str] = &[
     STEP_CHAT_HISTORY_SUMMARY,
     STEP_HISTORY_SEARCH,
     STEP_MEMORY_SEARCH,
+    STEP_SEND_MESSAGE,
+    STEP_REACT_TO_MESSAGE,
 ];
 
 const INLINE_TOOL_ARG_KEYS: &[&str] = &[
@@ -604,14 +616,16 @@ const ALTERNATIVE_DIALOG_TOOL_CATALOG: &[ToolSpec] = &[
         name: STEP_DRAW_IMAGE,
         summary: "Create or edit an image from the user's request.",
         when_to_use: "Use when the latest user message asks to draw, generate, create, redraw, or edit an image.",
-        result: "Schedules image generation; the final image is delivered asynchronously.",
+        result: "Schedules image generation and ENDS your turn; the image arrives asynchronously. \
+                 Anything you want to tell the chat, say it before or together with this call.",
         args: DRAW_IMAGE_ARGS,
     },
     ToolSpec {
         name: STEP_GENERATE_SONG,
         summary: "Generate a song from a topic or idea.",
         when_to_use: "Use when the latest user message asks for a song, track, lyrics-based song, or music generation.",
-        result: "Schedules music generation; the result is delivered asynchronously.",
+        result: "Schedules music generation and ENDS your turn; the song arrives asynchronously. \
+                 Anything you want to tell the chat, say it before or together with this call.",
         args: GENERATE_SONG_ARGS,
     },
     ToolSpec {
@@ -632,14 +646,16 @@ const ALTERNATIVE_DIALOG_TOOL_CATALOG: &[ToolSpec] = &[
         name: STEP_WEB_SEARCH,
         summary: "Search the web for current or external information.",
         when_to_use: "Use when the latest user message asks for current facts, news, recent events, or anything outside reliable memory.",
-        result: "Returns aggregated search results for grounding the answer.",
+        result: "Returns search results with links; follow the promising ones with crawl_url when \
+                 the snippets are not enough.",
         args: WEB_SEARCH_ARGS,
     },
     ToolSpec {
         name: STEP_CRAWL_URL,
         summary: "Fetch and extract readable text from a URL.",
-        when_to_use: "Use when the latest user message asks to inspect, summarize, or quote a specific webpage.",
-        result: "Returns extracted page content.",
+        when_to_use: "Use to read a page found via web_search, or when the latest user message asks \
+                      to inspect, summarize, or quote a specific webpage.",
+        result: "Returns extracted page content — the natural follow-up to web_search links.",
         args: CRAWL_URL_ARGS,
     },
     ToolSpec {
@@ -718,6 +734,10 @@ pub fn is_dialog_history_noise_tool_call_name(name: &str) -> bool {
     let name = name.trim();
     name.eq_ignore_ascii_case(STEP_TRANSLATE_TEXT)
         || name.eq_ignore_ascii_case(STEP_CHAT_HISTORY_SUMMARY)
+        // Session mechanics: a sent message is already real history, and a
+        // reaction result carries nothing worth re-reading next turn.
+        || name.eq_ignore_ascii_case(STEP_SEND_MESSAGE)
+        || name.eq_ignore_ascii_case(STEP_REACT_TO_MESSAGE)
 }
 
 #[must_use]
@@ -753,9 +773,21 @@ pub struct ChatCompletionFunction {
 
 #[must_use]
 pub fn chat_completion_tools_for_names(names: &[&str]) -> Vec<ChatCompletionTool> {
-    ALTERNATIVE_DIALOG_TOOL_CATALOG
+    chat_completion_tools_for_specs(
+        &ALTERNATIVE_DIALOG_TOOL_CATALOG
+            .iter()
+            .filter(|spec| names.contains(&spec.name))
+            .copied()
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// Build native tool definitions from explicit specs — the session engine
+/// uses this to add its own tools without putting them in the shared catalog.
+#[must_use]
+pub fn chat_completion_tools_for_specs(specs: &[ToolSpec]) -> Vec<ChatCompletionTool> {
+    specs
         .iter()
-        .filter(|spec| names.contains(&spec.name))
         .map(|spec| ChatCompletionTool {
             tool_type: "function".to_owned(),
             function: ChatCompletionFunction {
@@ -766,6 +798,141 @@ pub fn chat_completion_tools_for_names(names: &[&str]) -> Vec<ChatCompletionTool
         })
         .collect()
 }
+
+/// Emoji the `react_to_message` tool may set: the Bot API bot-reaction list
+/// minus the service ones (👀 queued, ✍ generating, 🤔 failure) so a semantic
+/// reaction can never be mistaken for a lifecycle signal. Must stay in sync
+/// with the list embedded in [`SESSION_REACT_TO_MESSAGE_SPEC`].
+pub const SESSION_REACTION_ALLOWED_EMOJI: &[&str] = &[
+    "❤",
+    "👍",
+    "👎",
+    "🔥",
+    "🥰",
+    "👏",
+    "😁",
+    "🤯",
+    "😱",
+    "🤬",
+    "😢",
+    "🎉",
+    "🤩",
+    "🤮",
+    "💩",
+    "🙏",
+    "👌",
+    "🕊",
+    "🤡",
+    "🥱",
+    "🥴",
+    "😍",
+    "🐳",
+    "❤‍🔥",
+    "🌚",
+    "🌭",
+    "💯",
+    "🤣",
+    "⚡",
+    "🍌",
+    "🏆",
+    "💔",
+    "🤨",
+    "😐",
+    "🍓",
+    "🍾",
+    "💋",
+    "🖕",
+    "😈",
+    "😴",
+    "😭",
+    "🤓",
+    "👻",
+    "👨‍💻",
+    "🎃",
+    "🙈",
+    "😇",
+    "😨",
+    "🤝",
+    "🤗",
+    "🫡",
+    "🎅",
+    "🎄",
+    "☃",
+    "💅",
+    "🤪",
+    "🗿",
+    "🆒",
+    "💘",
+    "🙉",
+    "🦄",
+    "😘",
+    "💊",
+    "🙊",
+    "😎",
+    "👾",
+    "🤷‍♂",
+    "🤷",
+    "🤷‍♀",
+    "😡",
+];
+
+/// `send_message` spec, injected by the session engine only.
+pub const SESSION_SEND_MESSAGE_SPEC: ToolSpec = ToolSpec {
+    name: STEP_SEND_MESSAGE,
+    summary: "Send an intermediate message to the chat NOW, without ending your turn.",
+    when_to_use: "Use it for a short heads-up before slow work (a search, reading pages), or to \
+                  split a long reply into several messages sent back to back. Plain assistant \
+                  text WITHOUT tool calls always ends your turn — call send_message when you \
+                  intend to continue working or writing afterwards. Never repeat a message you \
+                  already sent this turn.",
+    result: "Delivers the message immediately; returns ok, or an error when the per-turn message \
+             limit is reached, the text duplicates an already-sent message, or the text is empty \
+             after sanitization.",
+    args: &[ToolArgSpec {
+        name: "text",
+        required: true,
+        description: "Message text (Telegram HTML, same format as your normal replies).",
+    }],
+};
+
+/// `react_to_message` spec, injected by the session engine only.
+pub const SESSION_REACT_TO_MESSAGE_SPEC: ToolSpec = ToolSpec {
+    name: STEP_REACT_TO_MESSAGE,
+    summary: "Set one emoji reaction on a chat message — usually the message you are answering, \
+              or another message visible in the conversation.",
+    when_to_use: "A semantic, occasional gesture: react when an emoji genuinely fits the message \
+                  (something funny, impressive, sad, or deserving a thumbs-up). Do not overuse \
+                  it. Exactly ONE emoji per message, and there is no point calling this more \
+                  than once for the same message — a new reaction only replaces the previous \
+                  one. Allowed emoji (nothing else is accepted): ❤ 👍 👎 🔥 🥰 👏 😁 🤯 😱 🤬 😢 \
+                  🎉 🤩 🤮 💩 🙏 👌 🕊 🤡 🥱 🥴 😍 🐳 ❤‍🔥 🌚 🌭 💯 🤣 ⚡ 🍌 🏆 💔 🤨 😐 🍓 🍾 💋 \
+                  🖕 😈 😴 😭 🤓 👻 👨‍💻 🎃 🙈 😇 😨 🤝 🤗 🫡 🎅 🎄 ☃ 💅 🤪 🗿 🆒 💘 🙉 🦄 😘 💊 \
+                  🙊 😎 👾 🤷‍♂ 🤷 🤷‍♀ 😡",
+    result: "Sets the reaction; returns ok, or an error for a disallowed emoji or a message you \
+             already reacted to this turn.",
+    args: &[
+        ToolArgSpec {
+            name: "chat_id",
+            required: true,
+            description: "Chat id of the target message (the current chat).",
+        },
+        ToolArgSpec {
+            name: "thread_id",
+            required: false,
+            description: "Forum thread id, when the chat uses topics.",
+        },
+        ToolArgSpec {
+            name: "message_id",
+            required: true,
+            description: "Id of the message to react to.",
+        },
+        ToolArgSpec {
+            name: "emoji",
+            required: true,
+            description: "One emoji from the allowed list.",
+        },
+    ],
+};
 
 fn join_tool_description(spec: &ToolSpec) -> String {
     let mut parts = Vec::with_capacity(3);
@@ -1033,6 +1200,23 @@ pub struct ToolStep {
     /// Image seed.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub seed: String,
+    /// Reaction emoji (`react_to_message`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub emoji: String,
+    /// Reaction target chat (`react_to_message`; the engine clamps it to the
+    /// session's chat regardless of what the model passes).
+    #[serde(default, rename = "chat_id", skip_serializing_if = "is_zero_i64")]
+    pub target_chat_id: i64,
+    /// Reaction target thread (`react_to_message`).
+    #[serde(default, rename = "thread_id", skip_serializing_if = "is_zero_i64")]
+    pub target_thread_id: i64,
+    /// Reaction target message (`react_to_message`).
+    #[serde(default, rename = "message_id", skip_serializing_if = "is_zero_i64")]
+    pub target_message_id: i64,
+}
+
+fn is_zero_i64(value: &i64) -> bool {
+    *value == 0
 }
 
 /// OpenAI-compatible native tool call.
@@ -1253,8 +1437,21 @@ fn populate_json_map_args(map: &Map<String, Value>, step: &mut ToolStep) {
             ("negative_prompt", Value::String(value)) => step.negative_prompt = value.clone(),
             ("aspect_ratio", Value::String(value)) => step.aspect_ratio = value.clone(),
             ("seed", Value::String(value)) => step.seed = value.clone(),
+            ("emoji", Value::String(value)) => step.emoji = value.clone(),
+            ("chat_id", value) => step.target_chat_id = json_i64(value),
+            ("thread_id", value) => step.target_thread_id = json_i64(value),
+            ("message_id", value) => step.target_message_id = json_i64(value),
             _ => {}
         }
+    }
+}
+
+/// Models pass ids as numbers or numeric strings interchangeably.
+fn json_i64(value: &Value) -> i64 {
+    match value {
+        Value::Number(number) => number.as_i64().unwrap_or(0),
+        Value::String(text) => text.trim().parse::<i64>().unwrap_or(0),
+        _ => 0,
     }
 }
 
@@ -2072,6 +2269,7 @@ fn normalize_and_validate_step(mut step: ToolStep) -> Result<ToolStep, ToolParse
     step.negative_prompt = sanitize_tool_text(&step.negative_prompt);
     step.aspect_ratio = sanitize_tool_text(&step.aspect_ratio);
     step.seed = sanitize_tool_text(&step.seed);
+    step.emoji = step.emoji.trim().to_owned();
 
     if !is_known_step(&step.step) {
         return Err(ToolParseError::new(format!("unknown step {:?}", step.step)));

@@ -1216,12 +1216,21 @@ impl DialogMessageUpdateConfig {
             aifarm_random_max_tokens: config.llm.dialog.aifarm_random_max_tokens,
             aifarm_default_max_tokens: config.llm.dialog.aifarm_default_max_tokens,
             aifarm_long_max_tokens: config.llm.dialog.aifarm_long_max_tokens,
+            // The session hard cap plus margin keeps taskman's expired-
+            // processing re-delivery from firing while a session is still
+            // legitimately running; clamped here so a low
+            // DIALOG_TASK_TIMEOUT_SECONDS cannot undercut it.
             processing_timeout_seconds: config
                 .llm
                 .dialog
                 .task_timeout_seconds
                 .max(300)
-                .max(config.llm.history_summary.timeout_seconds),
+                .max(config.llm.history_summary.timeout_seconds)
+                .max(if config.llm.dialog.agent_loop_enabled {
+                    config.llm.dialog.session_hard_cap_secs.saturating_add(120)
+                } else {
+                    0
+                }),
             agentic_search: AgenticSearchTrigger::from_app_config(config),
         }
     }

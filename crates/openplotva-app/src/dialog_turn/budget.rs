@@ -75,6 +75,64 @@ impl TurnBudget {
     }
 }
 
+/// Session budget: the plain turn budget plus a bounded extension per started
+/// toolbox call, hard-capped so a session can never outlive
+/// `DIALOG_SESSION_HARD_CAP_SECS`. Extensions are in-memory only — a crash
+/// re-run recomputes from the durable anchor with the base budget, which is
+/// strictly safer (and the sent-marker resolves re-runs without replay anyway).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SessionBudget {
+    base: TurnBudget,
+    extension: TimeDuration,
+    per_tool_extension: TimeDuration,
+    hard_cap: TimeDuration,
+}
+
+impl SessionBudget {
+    #[must_use]
+    pub fn new(base: TurnBudget, per_tool_extension_secs: i32, hard_cap_secs: i32) -> Self {
+        Self {
+            base,
+            extension: TimeDuration::ZERO,
+            per_tool_extension: TimeDuration::seconds(i64::from(per_tool_extension_secs.max(0))),
+            hard_cap: TimeDuration::seconds(i64::from(hard_cap_secs.max(1))).max(base.limit),
+        }
+    }
+
+    /// Grant the extension for one STARTED toolbox call. Tool-less turns never
+    /// extend, so they keep exactly the legacy budget behavior.
+    pub fn extend_for_tool_start(&mut self) {
+        self.extension =
+            (self.extension + self.per_tool_extension).min(self.hard_cap - self.base.limit);
+    }
+
+    #[must_use]
+    pub fn limit(&self) -> TimeDuration {
+        (self.base.limit + self.extension).min(self.hard_cap)
+    }
+
+    #[must_use]
+    pub fn deadline(&self) -> OffsetDateTime {
+        self.base.anchor + self.limit()
+    }
+
+    #[must_use]
+    pub fn remaining(&self, now: OffsetDateTime) -> TimeDuration {
+        (self.deadline() - now).max(TimeDuration::ZERO)
+    }
+
+    #[must_use]
+    pub fn elapsed(&self, now: OffsetDateTime) -> TimeDuration {
+        self.base.elapsed(now)
+    }
+
+    /// Milliseconds of granted extension, for the outcome ledger.
+    #[must_use]
+    pub fn extended_ms(&self) -> i64 {
+        self.extension.whole_milliseconds().max(0) as i64
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,6 +181,39 @@ mod tests {
             budget.elapsed(now - TimeDuration::seconds(5)),
             TimeDuration::ZERO
         );
+    }
+
+    #[test]
+    fn session_budget_extends_per_tool_and_hard_caps() {
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800).expect("timestamp");
+        let base = TurnBudget::from_events(&[], 120, now);
+        let mut budget = SessionBudget::new(base, 60, 300);
+
+        // Tool-less: exactly the legacy 120s.
+        assert_eq!(budget.limit(), TimeDuration::seconds(120));
+        assert_eq!(budget.remaining(now), TimeDuration::seconds(120));
+
+        budget.extend_for_tool_start();
+        assert_eq!(budget.limit(), TimeDuration::seconds(180));
+        budget.extend_for_tool_start();
+        assert_eq!(budget.limit(), TimeDuration::seconds(240));
+        budget.extend_for_tool_start();
+        assert_eq!(budget.limit(), TimeDuration::seconds(300));
+        // The hard cap holds no matter how many tools start.
+        budget.extend_for_tool_start();
+        budget.extend_for_tool_start();
+        assert_eq!(budget.limit(), TimeDuration::seconds(300));
+        assert_eq!(budget.extended_ms(), 180_000);
+        assert_eq!(budget.deadline(), now + TimeDuration::seconds(300));
+    }
+
+    #[test]
+    fn session_budget_hard_cap_never_shrinks_the_base() {
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800).expect("timestamp");
+        let base = TurnBudget::from_events(&[], 120, now);
+        // A misconfigured cap below the base clamps to the base.
+        let budget = SessionBudget::new(base, 60, 30);
+        assert_eq!(budget.limit(), TimeDuration::seconds(120));
     }
 
     #[tokio::test]

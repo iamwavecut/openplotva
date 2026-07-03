@@ -37,10 +37,12 @@ mod engine;
 mod ledger;
 mod obligations;
 mod outcome;
+mod session;
 mod signal;
 
 pub use budget::{
-    TURN_DEADLINE, TURN_STARTED_STAGE, TurnBudget, current_turn_deadline, turn_started_at,
+    SessionBudget, TURN_DEADLINE, TURN_STARTED_STAGE, TurnBudget, current_turn_deadline,
+    turn_started_at,
 };
 pub use engine::{ANSWER_SENT_STAGE, DIALOG_TURN_REGENERATE_STAGE, TURN_OUTCOME_STAGE};
 pub(crate) use engine::{TurnContext, execute_dialog_turn, finalize_turn};
@@ -63,6 +65,10 @@ pub use obligations::{
 };
 pub use outcome::{
     JobDisposition, REASON_QUEUE_BACKLOG_EXPIRED, TurnOutcome, TurnResolution, UserSignalPlan,
+};
+pub use session::{
+    SESSION_ITERATION_STAGE, SESSION_MESSAGE_SENT_STAGE, SESSION_TOOL_STAGE, SessionReactionFuture,
+    SessionReactor, SessionTurnConfig, SessionWorkerWiring,
 };
 pub use signal::{
     DEFAULT_DIALOG_TERMINAL_REACTION_EMOJI, DEFAULT_DIALOG_TERMINAL_SIGNAL_MAX_AGE_SECS,

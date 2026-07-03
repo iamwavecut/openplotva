@@ -67,6 +67,8 @@ pub struct DialogJobWorkerReport {
     /// Turn re-entry found the `answer_sent` marker and resolved `Sent`
     /// without re-sending the answer.
     pub resent_skipped: bool,
+    /// LLM iterations the session engine ran this tick (0 on the legacy path).
+    pub session_iterations: i32,
     /// Terminal user signal failed after reaction and fallback attempts.
     pub user_signal_error: Option<String>,
 }
