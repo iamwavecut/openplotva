@@ -47,6 +47,7 @@ mod runtime_entities;
 mod runtime_gemini_cache;
 mod runtime_llm;
 mod runtime_llm_analytics;
+mod runtime_llm_runs;
 mod runtime_retention;
 mod runtime_routing;
 mod runtime_safety;
