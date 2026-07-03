@@ -422,10 +422,9 @@ where
     }
 
     /// Attach the provider-neutral local dialog toolbox for text-mode tool calls.
-    #[must_use]
     /// Override the trace registry (production uses the global one; tests inject an
     /// isolated registry).
-
+    #[must_use]
     pub fn with_trace_registry(
         mut self,
         trace_registry: Arc<crate::trace::LlmCallTraceRegistry>,

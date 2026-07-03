@@ -69,7 +69,6 @@ const DRAW_FAILED_NOTICE_TEXT: &str =
 /// Reuse the queue placeholder as the draw target when at most this many chat messages have
 /// arrived since it was posted; otherwise delete it and send a fresh message so the result
 /// is not buried.
-const DRAW_PLACEHOLDER_REUSE_MAX_MESSAGES: i64 = 10;
 pub const IMAGE_JOB_POLL_INTERVAL: StdDuration = StdDuration::from_secs(1);
 pub const IMAGE_JOB_WORKER_QUEUES: [&str; 2] = [IMAGE_VIP_QUEUE_NAME, IMAGE_REGULAR_QUEUE_NAME];
 pub const IMAGE_VIP_JOB_WORKER_QUEUES: [&str; 1] = [IMAGE_VIP_QUEUE_NAME];
@@ -1890,36 +1889,6 @@ impl ImageJobTelegramSender for openplotva_telegram::TelegramClient {
     }
 }
 
-/// Counts how many chat messages arrived after a given message id, to decide whether a draw
-/// placeholder is still near the bottom of the chat.
-pub trait ChatMessageCounter: Send + Sync + std::fmt::Debug {
-    /// Number of chat messages with an id greater than `message_id`, or `None` if unknown.
-    fn count_chat_messages_after<'a>(
-        &'a self,
-        chat_id: i64,
-        message_id: i64,
-    ) -> ImageJobEffectFuture<'a, Option<i64>>;
-}
-
-impl ChatMessageCounter for openplotva_storage::PostgresHistoryStore {
-    fn count_chat_messages_after<'a>(
-        &'a self,
-        chat_id: i64,
-        message_id: i64,
-    ) -> ImageJobEffectFuture<'a, Option<i64>> {
-        Box::pin(async move {
-            // Probe one past the threshold so we only learn "<= max" vs "more".
-            self.count_chat_messages_after(
-                chat_id,
-                message_id,
-                DRAW_PLACEHOLDER_REUSE_MAX_MESSAGES + 1,
-            )
-            .await
-            .ok()
-        })
-    }
-}
-
 pub trait ImageJobEffects {
     /// Best-effort: mark the trigger message with the "drawing" reaction.
     fn signal_draw_progress<'a>(
@@ -1949,19 +1918,6 @@ pub trait ImageJobEffects {
 
     /// Best-effort delete of a message (used to clear the queue-position message).
     fn delete_message<'a>(&'a self, chat_id: i64, message_id: i32) -> ImageJobEffectFuture<'a, ()>;
-
-    /// Count chat messages newer than `message_id` (the placeholder), or `None` if unknown.
-    /// Used to choose between reusing the queue placeholder and posting a fresh message.
-    fn chat_messages_after<'a>(
-        &'a self,
-        _chat_id: i64,
-        _message_id: i32,
-    ) -> ImageJobEffectFuture<'a, Option<i64>>
-    where
-        Self: Sync,
-    {
-        Box::pin(async { None })
-    }
 
     /// Send the initial rich draw placeholder; returns its Telegram message id.
     fn send_draw_placeholder<'a>(
@@ -1993,7 +1949,6 @@ pub trait ImageJobEffects {
 pub struct TelegramImageJobEffects<Sender> {
     telegram: Sender,
     rich: Arc<dyn crate::rich::RichSender>,
-    chat_counter: Option<Arc<dyn ChatMessageCounter>>,
     reactions: Option<crate::reactions::GenerationReactions>,
 }
 
@@ -2004,16 +1959,8 @@ impl<Sender> TelegramImageJobEffects<Sender> {
         Self {
             telegram,
             rich,
-            chat_counter: None,
             reactions: None,
         }
-    }
-
-    /// Provide the chat-activity counter used to decide whether to reuse the queue placeholder.
-    #[must_use]
-    pub fn with_chat_counter(mut self, chat_counter: Arc<dyn ChatMessageCounter>) -> Self {
-        self.chat_counter = Some(chat_counter);
-        self
     }
 
     /// Attach the reaction-based lifecycle signaler.
@@ -2059,19 +2006,6 @@ where
                     })
                     .await;
             }
-        })
-    }
-
-    fn chat_messages_after<'a>(
-        &'a self,
-        chat_id: i64,
-        message_id: i32,
-    ) -> ImageJobEffectFuture<'a, Option<i64>> {
-        Box::pin(async move {
-            let counter = self.chat_counter.as_ref()?;
-            counter
-                .count_chat_messages_after(chat_id, i64::from(message_id))
-                .await
         })
     }
 
@@ -5564,24 +5498,6 @@ mod tests {
         );
     }
 
-    fn draw_reuse_test_job(queue: &InMemoryTaskQueue, now: OffsetDateTime) -> i64 {
-        let job = queue.assign(
-            IMAGE_REGULAR_QUEUE_NAME,
-            new_image_gen_job_at(
-                ImageGenJobParams {
-                    chat_id: -100,
-                    message_id: 20,
-                    user_id: 30,
-                    user_full_name: "Alice".to_owned(),
-                    prompt: "castle".to_owned(),
-                    ..ImageGenJobParams::default()
-                },
-                now,
-            ),
-        );
-        job
-    }
-
     #[tokio::test]
     async fn image_gen_queue_worker_requeues_retryable_provider_error_like_go() {
         let queue = InMemoryTaskQueue::new();
@@ -7162,20 +7078,12 @@ mod tests {
     #[derive(Debug, Default)]
     struct EffectsStub {
         calls: Mutex<Vec<String>>,
-        chat_messages_after: Option<i64>,
         edit_error: Option<String>,
     }
 
     impl EffectsStub {
         fn new() -> Self {
             Self::default()
-        }
-
-        fn with_chat_messages_after(count: i64) -> Self {
-            Self {
-                chat_messages_after: Some(count),
-                ..Self::default()
-            }
         }
 
         fn with_edit_error(error: impl Into<String>) -> Self {
@@ -7217,15 +7125,6 @@ mod tests {
             self.call_log()
                 .push(format!("react-clear:{chat_id}:{trigger_message_id}"));
             Box::pin(async {})
-        }
-
-        fn chat_messages_after<'a>(
-            &'a self,
-            _chat_id: i64,
-            _message_id: i32,
-        ) -> ImageJobEffectFuture<'a, Option<i64>> {
-            let count = self.chat_messages_after;
-            Box::pin(async move { count })
         }
 
         fn delete_message<'a>(

@@ -983,11 +983,7 @@ impl TaskmanDialogToolAdapter {
         self
     }
 
-    /// Configure the rich sender used to post and persist the live "waiting in queue"
-    /// message when an image job is enqueued.
-
-    /// Acknowledge queued generations with a reaction on the trigger message
-    /// on the trigger message.
+    /// Acknowledge queued generations with a reaction on the trigger message.
     #[must_use]
     pub fn with_generation_reactions(
         mut self,
@@ -4406,7 +4402,6 @@ mod tests {
         // Reactions take precedence: no ⏳ placeholder message, a 👀 reaction
         // on the trigger instead, and no queue-position id to reuse later.
         assert!(rich.sent.lock().expect("rich sent").is_empty());
-        let job_id = queue.records()[0].id;
         let calls = reactions.calls.lock().expect("reaction calls").clone();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "queued");

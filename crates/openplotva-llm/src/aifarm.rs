@@ -2375,10 +2375,8 @@ where
         }
     }
 
-    /// Attach the provider-neutral local dialog toolbox.
-    #[must_use]
     /// Stable provider name.
-
+    #[must_use]
     pub fn provider(&self) -> &str {
         &self.provider_name
     }
@@ -5239,9 +5237,8 @@ mod tests {
     use openplotva_dialog::{
         DailyPersona, DialogContext, DialogMessage, DialogUser, DrawRequest, HistorySearchRequest,
         HistorySummaryRequest, Persona, ROLE_TOOL, RatesRequest, STEP_CHAT_HISTORY_SUMMARY,
-        STEP_CURRENCY_RATES, STEP_DRAW_IMAGE, STEP_GENERATE_SONG, STEP_HISTORY_SEARCH,
-        STEP_VISION_IMAGE, STEP_WEB_SEARCH, TOOL_RESULT_STATUS_OK, TOOL_RESULT_STATUS_QUEUED,
-        ToolResult, ToolSideEffect, VisionRequest,
+        STEP_CURRENCY_RATES, STEP_DRAW_IMAGE, STEP_HISTORY_SEARCH, STEP_VISION_IMAGE,
+        STEP_WEB_SEARCH, TOOL_RESULT_STATUS_OK, ToolResult, VisionRequest,
     };
 
     fn at(hour: u8, minute: u8) -> OffsetDateTime {
@@ -7679,7 +7676,6 @@ mod tests {
     #[tokio::test]
     async fn chat_step_parses_native_tool_calls_with_ids_and_intermediate_text()
     -> Result<(), CompletionError> {
-        let toolbox = FakeToolbox::new(Vec::new());
         let (provider, transport, toolbox) = direct_dialog_provider(
             json!({
                 "choices": [{
