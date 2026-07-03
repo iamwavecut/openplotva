@@ -1047,3 +1047,135 @@ fn render_injected_message(injected: &super::inbox::InjectedMessage) -> String {
     };
     openplotva_llm::aifarm::format_message_body(&turn)
 }
+
+/// Output of one captured (non-dispatching) session run for the runtime
+/// virtual dialog console: texts in send order plus the recorded tool calls.
+pub struct CapturedSessionOutput {
+    pub messages: Vec<String>,
+    pub tool_calls: Vec<ToolCall>,
+    pub provider: String,
+}
+
+/// Drive the session loop for the admin console: the toolbox is an argument
+/// (SAFE/REAL is the caller's choice per message, not a provider property),
+/// send_message and text-next-to-tools are captured instead of dispatched,
+/// and errors surface directly — no retries, markers, or ledger.
+pub async fn run_captured_session(
+    step_provider: &dyn ChatStepProvider,
+    toolbox: &dyn DialogToolbox,
+    base_input: DialogInput,
+    max_iterations: i32,
+) -> Result<CapturedSessionOutput, String> {
+    let meta = dialog_tool_context(&base_input);
+    let native_tools = session_native_tools().map_err(|error| error.to_string())?;
+    let mut transcript: Vec<SessionMessage> = Vec::new();
+    let mut messages: Vec<String> = Vec::new();
+    let mut recorded: Vec<ToolCall> = Vec::new();
+    let mut provider = String::new();
+    let max_iterations = max_iterations.max(1);
+
+    for iteration in 1..=max_iterations {
+        let force_final = iteration == max_iterations;
+        let tools = if base_input.disable_tools {
+            ToolsMode::Disabled
+        } else if force_final {
+            ToolsMode::FinalOnly
+        } else {
+            ToolsMode::Native(native_tools.clone())
+        };
+        let step = step_provider
+            .run_chat_step(ChatStepRequest {
+                input: base_input.clone(),
+                transcript: transcript.clone(),
+                tools,
+                iteration: usize::try_from(iteration).unwrap_or(1),
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        provider = step.provider.clone();
+
+        if step.tool_calls.is_empty() || force_final {
+            let sanitized = prepare_dialog_chat_response(&step.text);
+            if !sanitized.trim().is_empty() {
+                messages.push(sanitized);
+            }
+            return Ok(CapturedSessionOutput {
+                messages,
+                tool_calls: recorded,
+                provider,
+            });
+        }
+
+        transcript.push(SessionMessage::Assistant {
+            text: step.text.clone(),
+            tool_calls: step
+                .tool_calls
+                .iter()
+                .map(|call| SessionToolCall {
+                    id: call.id.clone(),
+                    name: call.step.step.clone(),
+                    arguments: serde_json::to_value(&call.step).unwrap_or(Value::Null),
+                })
+                .collect(),
+        });
+        if !step.text.trim().is_empty() {
+            let announcement = prepare_dialog_chat_response(&step.text);
+            if !announcement.trim().is_empty() {
+                messages.push(announcement);
+            }
+        }
+
+        let mut terminal_side_effect = false;
+        for call in &step.tool_calls {
+            let step_def = &call.step;
+            let result = match step_def.step.as_str() {
+                STEP_SEND_MESSAGE => {
+                    let sanitized = prepare_dialog_chat_response(&step_def.text);
+                    if sanitized.trim().is_empty() {
+                        ToolResult::failed("empty_text", "message text is empty after sanitizing")
+                    } else {
+                        messages.push(sanitized);
+                        ToolResult {
+                            status: openplotva_dialog::TOOL_RESULT_STATUS_OK.to_owned(),
+                            message: "message sent".to_owned(),
+                            ..ToolResult::default()
+                        }
+                    }
+                }
+                STEP_REACT_TO_MESSAGE => ToolResult {
+                    status: openplotva_dialog::TOOL_RESULT_STATUS_OK.to_owned(),
+                    message: format!("reaction captured: {}", step_def.emoji),
+                    ..ToolResult::default()
+                },
+                _ => match dispatch_dialog_tool(toolbox, &meta, step_def).await {
+                    Ok(result) => result,
+                    Err(error) => ToolResult::failed("tool_error", error.to_string()),
+                },
+            };
+            if queued_generation_side_effect(&result).is_some() {
+                terminal_side_effect = true;
+            }
+            recorded.push(recorded_session_tool_call(
+                step_def, &result, &call.id, iteration,
+            ));
+            transcript.push(SessionMessage::ToolResult {
+                tool_call_id: call.id.clone(),
+                name: step_def.step.clone(),
+                content: serde_json::to_string(&result)
+                    .unwrap_or_else(|_| "{\"status\":\"failed\"}".to_owned()),
+            });
+        }
+        if terminal_side_effect {
+            return Ok(CapturedSessionOutput {
+                messages,
+                tool_calls: recorded,
+                provider,
+            });
+        }
+    }
+    Ok(CapturedSessionOutput {
+        messages,
+        tool_calls: recorded,
+        provider,
+    })
+}

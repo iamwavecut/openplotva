@@ -99,6 +99,8 @@ pub(crate) struct RuntimeVirtualDialogExecutor {
     materializer: PostgresDialogInputMaterializer,
     safe_provider: ChatProviderHandle,
     real_provider: ChatProviderHandle,
+    safe_toolbox: std::sync::Arc<dyn openplotva_dialog::DialogToolbox>,
+    real_toolbox: std::sync::Arc<dyn openplotva_dialog::DialogToolbox>,
     taskman: RuntimeTaskmanInspectorHandle,
     llm_trace_buffer: RuntimeLlmTraceBuffer,
     bot: DialogBotIdentity,
@@ -113,6 +115,8 @@ impl RuntimeVirtualDialogExecutor {
         materializer: PostgresDialogInputMaterializer,
         safe_provider: ChatProviderHandle,
         real_provider: ChatProviderHandle,
+        safe_toolbox: std::sync::Arc<dyn openplotva_dialog::DialogToolbox>,
+        real_toolbox: std::sync::Arc<dyn openplotva_dialog::DialogToolbox>,
         taskman: RuntimeTaskmanInspectorHandle,
         llm_trace_buffer: RuntimeLlmTraceBuffer,
         bot: DialogBotIdentity,
@@ -124,6 +128,8 @@ impl RuntimeVirtualDialogExecutor {
             materializer,
             safe_provider,
             real_provider,
+            safe_toolbox,
+            real_toolbox,
             taskman,
             llm_trace_buffer,
             bot,
@@ -216,32 +222,70 @@ impl RuntimeVirtualDialogExecutor {
             .materializer
             .materialize_dialog_input(&params, now)
             .await;
+        // SAFE/REAL is a toolbox choice per message, not a provider property:
+        // the console drives the same captured session loop the dialog worker
+        // uses, with the SAFE toolbox faking generation side effects. The
+        // legacy provider pair remains only for providers without the
+        // chat-step seam (e.g. a WhiteCircle-wrapped SAFE chain).
         let provider = match request.tool_mode {
             RuntimeVirtualDialogToolMode::Safe => &self.safe_provider,
             RuntimeVirtualDialogToolMode::Real => &self.real_provider,
         };
-        let output = match provider.run_dialog(input).await {
-            Ok(output) => output,
-            Err(error) => {
-                let _ = self
-                    .history
-                    .delete_message_entries(record.chat_id, user_message_id)
-                    .await;
-                return Err(error.to_string());
-            }
-        };
-
+        let (answer, session_tool_calls, output_provider) =
+            if let Some(step_provider) = self.real_provider.as_chat_step() {
+                let toolbox = match request.tool_mode {
+                    RuntimeVirtualDialogToolMode::Safe => &self.safe_toolbox,
+                    RuntimeVirtualDialogToolMode::Real => &self.real_toolbox,
+                };
+                let captured = match crate::dialog_turn::run_captured_session(
+                    step_provider,
+                    toolbox.as_ref(),
+                    input,
+                    8,
+                )
+                .await
+                {
+                    Ok(captured) => captured,
+                    Err(error) => {
+                        let _ = self
+                            .history
+                            .delete_message_entries(record.chat_id, user_message_id)
+                            .await;
+                        return Err(error);
+                    }
+                };
+                (
+                    captured.messages.join("\n\n"),
+                    captured.tool_calls,
+                    captured.provider,
+                )
+            } else {
+                let output = match provider.run_dialog(input).await {
+                    Ok(output) => output,
+                    Err(error) => {
+                        let _ = self
+                            .history
+                            .delete_message_entries(record.chat_id, user_message_id)
+                            .await;
+                        return Err(error.to_string());
+                    }
+                };
+                let raw_answer = dialog_jobs::dialog_job_answer(&output);
+                (
+                    dialog_jobs::prepare_dialog_chat_response(&raw_answer),
+                    output.tool_calls,
+                    output.provider,
+                )
+            };
         self.history
-            .upsert_tool_call_history(record.chat_id, user_message_id, &output.tool_calls)
+            .upsert_tool_call_history(record.chat_id, user_message_id, &session_tool_calls)
             .await
             .map_err(|error| error.to_string())?;
-        let raw_answer = dialog_jobs::dialog_job_answer(&output);
-        let answer = dialog_jobs::prepare_dialog_chat_response(&raw_answer);
         self.persist_model_message(
             &record,
             model_message_id,
             &answer,
-            &output.provider,
+            &output_provider,
             request.tool_mode,
             now,
         )
@@ -256,9 +300,9 @@ impl RuntimeVirtualDialogExecutor {
             role: ROLE_MODEL.to_owned(),
             text: answer,
             at: format_time(now),
-            provider: Some(output.provider),
+            provider: Some(output_provider),
             tool_mode: Some(request.tool_mode),
-            tool_calls: tool_calls_value(&output.tool_calls),
+            tool_calls: tool_calls_value(&session_tool_calls),
         })
     }
 

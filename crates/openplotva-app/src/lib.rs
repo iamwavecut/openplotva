@@ -11241,6 +11241,7 @@ async fn start_runtime_workers(
             let safe_dialog_toolbox: Arc<dyn openplotva_dialog::DialogToolbox> = Arc::new(
                 runtime_virtual_dialog::RuntimeVirtualSafeToolbox::new(Arc::clone(&dialog_toolbox)),
             );
+            let console_safe_toolbox = Arc::clone(&safe_dialog_toolbox);
             let safe_genkit_fallback =
                 dialog_runtime::genkit_dialog_provider_from_app_config_with_toolbox(
                     config,
@@ -11268,6 +11269,8 @@ async fn start_runtime_workers(
                     dialog_materializer.clone(),
                     safe_dialog_provider,
                     Arc::clone(&dialog_provider),
+                    console_safe_toolbox,
+                    Arc::clone(&dialog_toolbox),
                     taskman_inspector.clone(),
                     llm_trace_buffer.clone(),
                     dialog_jobs::DialogBotIdentity::new(
