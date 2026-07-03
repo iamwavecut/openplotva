@@ -302,6 +302,16 @@
     --c-visibility-thread: var(--p-pink-400);
 
     /* Routing Ops: entity hues (topology node categories) */
+    /* LLM Dialogs: agent-run kind categories */
+    --c-flow-dialog: var(--p-indigo-500);
+    --c-flow-song: var(--p-pink-400);
+    --c-flow-image: var(--p-violet-400);
+    --c-flow-console: var(--p-slate-400);
+    --c-flow-memory: var(--p-teal-400);
+    --c-flow-vision: var(--p-sky-500);
+    --c-flow-shield: var(--p-orange-400);
+    --c-flow-other: var(--p-slate-500);
+
     --c-ent-workflow: var(--p-indigo-500);
     --c-ent-model: var(--p-cyan-400);
     --c-ent-provider: var(--p-violet-400);

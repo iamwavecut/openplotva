@@ -727,11 +727,6 @@ fn install_static_web_routes(router: axum::Router, static_web: StaticWebRoutes) 
         .route("/admin/api/logs/stream", any(admin_logs_stream))
         .route("/admin/api/bootstrap", get(admin_bootstrap))
         .route("/admin/api/metrics", any(admin_state))
-        .route("/admin/api/llm/requests", any(admin_llm_requests))
-        .route(
-            "/admin/api/llm/requests/clear",
-            any(admin_llm_requests_clear),
-        )
         .route("/admin/api/safety/checks", any(admin_safety_checks))
         .route(
             "/admin/api/analytics/llm/summary",
@@ -802,8 +797,6 @@ const GO_ADMIN_API_ROUTE_PATTERNS: &[&str] = &[
     "/admin/api/logs/stream",
     "/admin/api/bootstrap",
     "/admin/api/metrics",
-    "/admin/api/llm/requests",
-    "/admin/api/llm/requests/clear",
     "/admin/api/safety/checks",
     "/admin/api/analytics/llm/summary",
     "/admin/api/memory/cards",
@@ -1014,23 +1007,6 @@ async fn admin_logs_stream(
                 .text("keep-alive"),
         )
         .into_response()
-}
-
-async fn admin_llm_requests(
-    method: Method,
-    headers: HeaderMap,
-    RawQuery(raw_query): RawQuery,
-    Extension(routes): Extension<StaticWebRoutes>,
-) -> Response {
-    admin_llm_requests_response(&routes, method, &headers, raw_query.as_deref())
-}
-
-async fn admin_llm_requests_clear(
-    method: Method,
-    headers: HeaderMap,
-    Extension(routes): Extension<StaticWebRoutes>,
-) -> Response {
-    admin_llm_requests_clear_response(&routes, method, &headers)
 }
 
 async fn admin_safety_checks(
@@ -6843,63 +6819,6 @@ async fn admin_loglevel_response(
     )
 }
 
-fn admin_llm_requests_response(
-    routes: &StaticWebRoutes,
-    method: Method,
-    headers: &HeaderMap,
-    raw_query: Option<&str>,
-) -> Response {
-    if method != Method::GET {
-        return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
-    }
-    if let Err(error) = require_admin_request(headers, &routes.admin_ids, &routes.bot_token) {
-        return admin_auth_failure_response(error);
-    }
-    let requests = match routes.llm_trace_buffer.as_ref() {
-        Some(buffer) => openplotva_server::RuntimeLlmTraceInspector::llm_requests(
-            buffer,
-            admin_llm_requests_filter(raw_query),
-        ),
-        None => Ok(Vec::new()),
-    };
-    match requests {
-        Ok(requests) => {
-            let requests = requests
-                .iter()
-                .map(admin_llm_request_json)
-                .collect::<Vec<_>>();
-            admin_json_no_cache_response(
-                StatusCode::OK,
-                serde_json::json!({
-                    "count": requests.len(),
-                    "requests": requests,
-                }),
-            )
-        }
-        Err(error) => {
-            tracing::warn!(%error, "failed to list admin llm requests");
-            admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed")
-        }
-    }
-}
-
-fn admin_llm_requests_clear_response(
-    routes: &StaticWebRoutes,
-    method: Method,
-    headers: &HeaderMap,
-) -> Response {
-    if method != Method::POST {
-        return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
-    }
-    if let Err(error) = require_admin_request(headers, &routes.admin_ids, &routes.bot_token) {
-        return admin_auth_failure_response(error);
-    }
-    if let Some(buffer) = &routes.llm_trace_buffer {
-        buffer.clear();
-    }
-    admin_json_response(StatusCode::OK, serde_json::json!({ "ok": true }))
-}
-
 async fn admin_safety_checks_response(
     routes: &StaticWebRoutes,
     method: Method,
@@ -6993,45 +6912,6 @@ fn admin_llm_analytics_since_time(
     OffsetDateTime::parse(&summary.since, &Rfc3339).unwrap_or_else(|_| OffsetDateTime::now_utc())
 }
 
-fn admin_llm_requests_filter(
-    raw_query: Option<&str>,
-) -> openplotva_server::RuntimeLlmRequestsFilter {
-    let values = admin_auth_query_values(raw_query);
-    openplotva_server::RuntimeLlmRequestsFilter {
-        q: values
-            .get("q")
-            .map(|value| value.trim())
-            .unwrap_or("")
-            .to_owned(),
-        source: values
-            .get("source")
-            .map(|value| value.trim())
-            .unwrap_or("")
-            .to_owned(),
-        model: values
-            .get("model")
-            .map(|value| value.trim())
-            .unwrap_or("")
-            .to_owned(),
-        chat_id: values
-            .get("chat_id")
-            .and_then(|value| value.trim().parse::<i64>().ok()),
-        user_id: values
-            .get("user_id")
-            .and_then(|value| value.trim().parse::<i64>().ok()),
-        message_id: values
-            .get("message_id")
-            .and_then(|value| value.trim().parse::<i32>().ok()),
-        error_only: values
-            .get("error_only")
-            .is_some_and(|value| value.trim() == "1" || value.trim() == "true"),
-        empty_only: values
-            .get("empty_only")
-            .is_some_and(|value| value.trim() == "1" || value.trim() == "true"),
-        limit: parse_admin_positive_i32(values.get("limit").map(String::as_str), 1000, 1000),
-    }
-}
-
 fn admin_safety_checks_filter(
     raw_query: Option<&str>,
 ) -> openplotva_server::RuntimeSafetyChecksFilter {
@@ -7074,117 +6954,6 @@ fn parse_admin_optional_bool(value: Option<&str>) -> Option<bool> {
         Some("false" | "0" | "no") => Some(false),
         _ => None,
     }
-}
-
-fn admin_llm_request_json(request: &openplotva_server::RuntimeLlmRequestData) -> serde_json::Value {
-    let mut root = serde_json::Map::new();
-    admin_insert(&mut root, "id", request.id);
-    admin_insert(&mut root, "at", &request.at);
-    admin_insert_opt(&mut root, "provider", request.provider.as_deref());
-    admin_insert_opt(&mut root, "request_kind", request.request_kind.as_deref());
-    admin_insert(&mut root, "source", &request.source);
-    admin_insert_opt(&mut root, "mode", request.mode.as_deref());
-    admin_insert_opt(&mut root, "flow", request.flow.as_deref());
-    admin_insert(&mut root, "iteration", request.iteration);
-    admin_insert_opt(&mut root, "model", request.model.as_deref());
-    admin_insert(&mut root, "chat", admin_llm_chat_json(&request.chat));
-    admin_insert(&mut root, "user", admin_llm_user_json(&request.user));
-    admin_insert(
-        &mut root,
-        "message",
-        admin_llm_message_json(&request.message),
-    );
-    admin_insert(
-        &mut root,
-        "gen_config",
-        admin_llm_gen_config_json(&request.gen_config),
-    );
-    admin_insert_opt_value(&mut root, "docs", request.docs.as_ref());
-    admin_insert_opt_value(&mut root, "messages", request.messages.as_ref());
-    admin_insert_opt_value(&mut root, "raw_request", request.raw_request.as_ref());
-    admin_insert_opt_value(
-        &mut root,
-        "resolved_cache_content",
-        request.resolved_cache_content.as_ref(),
-    );
-    admin_insert_opt_value(&mut root, "raw_response", request.raw_response.as_ref());
-    admin_insert_opt_value(&mut root, "transport", request.transport.as_ref());
-    admin_insert_opt_value(
-        &mut root,
-        "inference_params",
-        request.inference_params.as_ref(),
-    );
-    admin_insert_opt_value(&mut root, "usage", request.usage.as_ref());
-    admin_insert_opt_value(&mut root, "timings", request.timings.as_ref());
-    admin_insert(&mut root, "prompt_chars", request.prompt_chars);
-    if request.prompt_messages != 0 {
-        admin_insert(&mut root, "prompt_messages", request.prompt_messages);
-    }
-    admin_insert(&mut root, "docs_chars", request.docs_chars);
-    if request.duration_ms != 0 {
-        admin_insert(&mut root, "duration_ms", request.duration_ms);
-    }
-    admin_insert(&mut root, "result", admin_llm_result_json(&request.result));
-    serde_json::Value::Object(root)
-}
-
-fn admin_llm_chat_json(chat: &openplotva_server::RuntimeLlmRequestChatData) -> serde_json::Value {
-    let mut root = serde_json::Map::new();
-    admin_insert(&mut root, "chat_id", chat.chat_id);
-    admin_insert_opt(&mut root, "thread_id", chat.thread_id);
-    admin_insert_opt(&mut root, "chat_title", chat.chat_title.as_deref());
-    serde_json::Value::Object(root)
-}
-
-fn admin_llm_user_json(user: &openplotva_server::RuntimeLlmRequestUserData) -> serde_json::Value {
-    let mut root = serde_json::Map::new();
-    admin_insert(&mut root, "user_id", user.user_id);
-    admin_insert_opt(&mut root, "full_name", user.full_name.as_deref());
-    serde_json::Value::Object(root)
-}
-
-fn admin_llm_message_json(
-    message: &openplotva_server::RuntimeLlmRequestMessageData,
-) -> serde_json::Value {
-    serde_json::json!({ "message_id": message.message_id })
-}
-
-fn admin_llm_gen_config_json(
-    gen_config: &openplotva_server::RuntimeLlmGenConfigData,
-) -> serde_json::Value {
-    let mut root = serde_json::Map::new();
-    if gen_config.max_output_tokens != 0 {
-        admin_insert(&mut root, "max_output_tokens", gen_config.max_output_tokens);
-    }
-    if gen_config.temperature != 0.0 {
-        admin_insert(&mut root, "temperature", gen_config.temperature);
-    }
-    if gen_config.top_p != 0.0 {
-        admin_insert(&mut root, "top_p", gen_config.top_p);
-    }
-    if gen_config.top_k != 0 {
-        admin_insert(&mut root, "top_k", gen_config.top_k);
-    }
-    admin_insert_opt_value(
-        &mut root,
-        "safety_settings",
-        gen_config.safety_settings.as_ref(),
-    );
-    serde_json::Value::Object(root)
-}
-
-fn admin_llm_result_json(
-    result: &openplotva_server::RuntimeLlmRequestResultData,
-) -> serde_json::Value {
-    let mut root = serde_json::Map::new();
-    admin_insert(&mut root, "duration_ms", result.duration_ms);
-    admin_insert_opt(&mut root, "error", result.error.as_deref());
-    admin_insert_opt(
-        &mut root,
-        "response_text_preview",
-        result.response_text_preview.as_deref(),
-    );
-    serde_json::Value::Object(root)
 }
 
 fn admin_safety_check_json(check: &openplotva_server::RuntimeSafetyCheckData) -> serde_json::Value {
@@ -13052,9 +12821,8 @@ mod tests {
         WebhookShutdownCleanupReport, admin_auth_check, admin_auth_date_is_fresh,
         admin_auth_query_values, admin_auth_response, admin_auth_user_state, admin_bootstrap,
         admin_chat_get_response, admin_chats_search_by_member_response, admin_i64_from_json,
-        admin_llm_analytics_summary_json, admin_llm_requests_clear_response,
-        admin_llm_requests_filter, admin_llm_requests_response, admin_loglevel_response,
-        admin_memory_cards_response, admin_memory_resolve_override, admin_memory_restart_override,
+        admin_llm_analytics_summary_json, admin_loglevel_response, admin_memory_cards_response,
+        admin_memory_resolve_override, admin_memory_restart_override,
         admin_memory_restart_response, admin_memory_runs_response, admin_non_empty_string,
         admin_redis_prefix_groups_from_keys, admin_safety_check_json, admin_safety_checks_filter,
         admin_session_is_authorized, admin_shield_category_matched, admin_shield_document_input,
@@ -13933,80 +13701,6 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn admin_llm_requests_static_rest_lists_and_clears_live_trace_buffer()
-    -> Result<(), Box<dyn Error>> {
-        let mut routes = static_web_routes(vec![7], "123:ABC", "https://plotva.example", "", None);
-        let buffer = super::runtime_llm::RuntimeLlmTraceBuffer::new(4);
-        buffer.record(openplotva_server::RuntimeLlmRequestData {
-            at: "2026-05-21T00:00:00Z".to_owned(),
-            provider: Some("aifarm".to_owned()),
-            source: "dialog".to_owned(),
-            model: Some("model-a".to_owned()),
-            chat: openplotva_server::RuntimeLlmRequestChatData {
-                chat_id: -100,
-                chat_title: Some("Plotva Lab".to_owned()),
-                ..openplotva_server::RuntimeLlmRequestChatData::default()
-            },
-            user: openplotva_server::RuntimeLlmRequestUserData {
-                user_id: 7,
-                full_name: Some("Ada".to_owned()),
-            },
-            message: openplotva_server::RuntimeLlmRequestMessageData { message_id: 77 },
-            gen_config: openplotva_server::RuntimeLlmGenConfigData {
-                max_output_tokens: 128,
-                ..openplotva_server::RuntimeLlmGenConfigData::default()
-            },
-            raw_response: Some(json!({"content": "answer"})),
-            result: openplotva_server::RuntimeLlmRequestResultData {
-                duration_ms: 42,
-                response_text_preview: Some("answer".to_owned()),
-                ..openplotva_server::RuntimeLlmRequestResultData::default()
-            },
-            ..openplotva_server::RuntimeLlmRequestData::default()
-        });
-        routes.llm_trace_buffer = Some(buffer);
-        let mut headers = HeaderMap::new();
-        {
-            let signed = openplotva_web::admin_session_cookie(7, "123:ABC");
-            let value = signed.split(';').next().expect("cookie pair");
-            headers.insert(header::COOKIE, value.parse()?);
-        }
-
-        let response =
-            admin_llm_requests_response(&routes, Method::GET, &headers, Some("q=answer"));
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            response.headers().get(header::CACHE_CONTROL),
-            Some(&"no-cache".parse()?)
-        );
-        let body = to_bytes(response.into_body(), usize::MAX).await?;
-        let value: serde_json::Value = serde_json::from_slice(&body)?;
-        assert_eq!(value["count"], 1);
-        assert_eq!(value["requests"][0]["id"], 1);
-        assert_eq!(value["requests"][0]["provider"], "aifarm");
-        assert_eq!(value["requests"][0]["chat"]["chat_title"], "Plotva Lab");
-        assert_eq!(value["requests"][0]["gen_config"]["max_output_tokens"], 128);
-        assert_eq!(
-            value["requests"][0]["result"]["response_text_preview"],
-            "answer"
-        );
-
-        let response = admin_llm_requests_clear_response(&routes, Method::POST, &headers);
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), usize::MAX).await?;
-        assert_eq!(&body[..], b"{\"ok\":true}\n");
-
-        let response = admin_llm_requests_response(&routes, Method::GET, &headers, None);
-        let body = to_bytes(response.into_body(), usize::MAX).await?;
-        let value: serde_json::Value = serde_json::from_slice(&body)?;
-        assert_eq!(value, json!({"count": 0, "requests": []}));
-
-        let response = admin_llm_requests_response(&routes, Method::POST, &headers, None);
-        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
-        Ok(())
-    }
-
     #[test]
     fn admin_safety_query_and_row_mapping_match_go_contract() {
         let filter =
@@ -14549,19 +14243,6 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn admin_llm_request_filter_keeps_defaults_and_optional_ids() {
-        let filter = admin_llm_requests_filter(Some(
-            "limit=0&q=%20needle%20&source=dialog&model=m&chat_id=-100&user_id=bad",
-        ));
-        assert_eq!(filter.limit, 1000);
-        assert_eq!(filter.q, "needle");
-        assert_eq!(filter.source, "dialog");
-        assert_eq!(filter.model, "m");
-        assert_eq!(filter.chat_id, Some(-100));
-        assert_eq!(filter.user_id, None);
-    }
-
     #[tokio::test]
     async fn admin_chat_and_user_routes_keep_go_auth_method_and_param_errors()
     -> Result<(), Box<dyn Error>> {
@@ -15036,8 +14717,6 @@ mod tests {
                 "/admin/api/logs/stream",
                 "/admin/api/bootstrap",
                 "/admin/api/metrics",
-                "/admin/api/llm/requests",
-                "/admin/api/llm/requests/clear",
                 "/admin/api/safety/checks",
                 "/admin/api/analytics/llm/summary",
                 "/admin/api/memory/cards",

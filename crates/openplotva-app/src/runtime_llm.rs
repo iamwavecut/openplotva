@@ -354,16 +354,6 @@ impl RuntimeLlmTraceBuffer {
         inner.count = inner.count.saturating_add(1).min(inner.ring.len());
     }
 
-    pub fn clear(&self) {
-        let mut inner = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        inner.ring.fill(None);
-        inner.write = 0;
-        inner.count = 0;
-    }
-
     pub fn prune_chat(&self, chat_id: i64) -> i32 {
         let mut inner = self
             .inner
@@ -1285,17 +1275,6 @@ mod tests {
         assert_eq!(traces.len(), 1);
         assert_eq!(traces[0].model.as_deref(), Some("new"));
         assert_eq!(traces[0].id, 2);
-
-        buffer.clear();
-        assert!(
-            buffer
-                .llm_requests(RuntimeLlmRequestsFilter {
-                    limit: 100,
-                    ..RuntimeLlmRequestsFilter::default()
-                })
-                .expect("trace list after clear")
-                .is_empty()
-        );
 
         buffer.record(RuntimeLlmRequestData {
             source: "dialog".to_owned(),
