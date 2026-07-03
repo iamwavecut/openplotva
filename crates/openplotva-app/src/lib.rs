@@ -2,7 +2,6 @@
 
 pub mod activity;
 pub mod admin;
-pub mod agent_jobs;
 pub mod agent_runtime;
 pub mod callbacks;
 pub mod checkin;
@@ -11052,72 +11051,6 @@ async fn start_runtime_workers(
             None
         }
     };
-    // Build the search-agent machinery once (registry + settings), if enabled and
-    // the configured reasoner/writer providers resolve.
-    let agentic_search_setup = if config.llm.agentic.search.enabled {
-        let registry = agent_runtime::build_routed_agent_provider_registry(
-            config,
-            routed_attempts::RoutedAttemptWalker::new(
-                Arc::clone(&router_handle),
-                Arc::clone(&router_breakers),
-                Arc::clone(&router_triggers),
-                Arc::clone(&router_pools),
-            )
-            .with_reporter(routing_event_reporter.clone()),
-        );
-        let settings = agent_runtime::SearchAgentSettings::from_app_config(
-            config,
-            agent_runtime::SEARCH_SYSTEM_PROMPT.to_owned(),
-            agent_runtime::SEARCH_SYNTHESIS_PROMPT.to_owned(),
-        );
-        if registry.contains(&settings.reasoner_provider)
-            && registry.contains(&settings.writer_provider)
-        {
-            Some((registry, settings))
-        } else {
-            readiness_checks.push(ReadinessCheck::skipped(
-                "agent_jobs",
-                "Agentic search enabled but the reasoner/writer provider is missing from the registry",
-            ));
-            None
-        }
-    } else {
-        None
-    };
-    // The agent's own tools call raw Serper directly (never the conversational
-    // web_search tool — that would recurse). Requires Serper to be configured.
-    let agent_serper_tools: Option<Arc<dyn openplotva_agent::AgentTools>> =
-        serper_client.as_ref().map(|serper| {
-            let web: Arc<dyn dialog_tools::WebSearchProvider> = serper.clone();
-            let crawl: Arc<dyn dialog_tools::UrlCrawler> = serper.clone();
-            let history_searcher: Arc<dyn agent_runtime::HistorySearcher> = Arc::new(
-                agent_runtime::PostgresHistorySearch::new(history_store.clone()),
-            );
-            let memory_searcher: Arc<dyn agent_runtime::MemorySearcher> = Arc::new(
-                agent_runtime::PostgresMemorySearch::new(memory_store.clone()),
-            );
-            Arc::new(
-                agent_runtime::AppAgentTools::new(web, crawl)
-                    .with_history_searcher(history_searcher)
-                    .with_memory_searcher(memory_searcher),
-            ) as Arc<dyn openplotva_agent::AgentTools>
-        });
-    // Inline agentic web_search: when enabled + Serper present, the conversational
-    // web_search tool runs the research agent and returns a summary.
-    let inline_agentic_search: Option<Arc<dyn agent_runtime::AgenticWebSearch>> =
-        match (&agentic_search_setup, &agent_serper_tools) {
-            (Some((registry, settings)), Some(tools)) => {
-                registry.get(&settings.reasoner_provider).map(|reasoner| {
-                    Arc::new(agent_runtime::InlineSearchAgent::new(
-                        reasoner,
-                        settings.clone(),
-                        Arc::clone(tools),
-                    )) as Arc<dyn agent_runtime::AgenticWebSearch>
-                })
-            }
-            _ => None,
-        };
-
     let mut app_dialog_toolbox = dialog_tools::AppDialogToolbox::new(
         Some(Arc::clone(&rates_fetcher)),
         Some(rates_tool_dispatcher),
@@ -11145,9 +11078,6 @@ async fn start_runtime_workers(
             .with_web_searcher(web_searcher)
             .with_url_crawler(url_crawler);
     }
-    if let Some(agent) = inline_agentic_search.clone() {
-        app_dialog_toolbox = app_dialog_toolbox.with_agentic_search(agent);
-    }
     let dialog_toolbox: Arc<dyn openplotva_dialog::DialogToolbox> = Arc::new(app_dialog_toolbox);
     // DIALOG_AGENT_LOOP_ENABLED: the dialog session engine drives the turn
     // (engine-owned tool loop, multi-message turns) instead of the legacy
@@ -11174,42 +11104,6 @@ async fn start_runtime_workers(
                 max_songs: config.llm.dialog.session_max_songs,
             })
         });
-    // /search command worker: drives durable agent runs on the agent-qwen queue.
-    if let Some((registry, settings)) = agentic_search_setup {
-        match agent_serper_tools {
-            Some(agent_tools) => {
-                let agent_worker = agent_jobs::AgentJobWorker::new(
-                    Arc::clone(&task_queue_for_updates),
-                    registry,
-                    agent_tools,
-                    Arc::clone(&rich_sender),
-                    settings,
-                );
-                let agent_worker_stop = stop.subscribe();
-                let agent_worker_handle = tokio::spawn(async move {
-                    let report = agent_jobs::run_agent_job_worker_until(
-                        &agent_worker,
-                        wait_for_runtime_stop(agent_worker_stop),
-                    )
-                    .await;
-                    tracing::info!(?report, "agent taskman worker stopped");
-                });
-                shared_taskman_worker_counts
-                    .insert(openplotva_taskman::AGENT_QWEN_QUEUE_NAME.to_owned(), 1);
-                workers.handles.push(agent_worker_handle);
-                readiness_checks.push(ReadinessCheck::ok(
-                    "agent_jobs",
-                    "Agent search worker started on the agent-qwen queue",
-                ));
-            }
-            None => {
-                readiness_checks.push(ReadinessCheck::skipped(
-                    "agent_jobs",
-                    "Agentic search enabled but Serper (web search) is not configured",
-                ));
-            }
-        }
-    }
     let embedding_attempt_walker = routed_attempts::RoutedAttemptWalker::new(
         Arc::clone(&router_handle),
         Arc::clone(&router_breakers),

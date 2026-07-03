@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use openplotva_agent::{
     AgentBudgets, AgentError, AgentMessage, AgentOrigin, AgentOutcome, AgentProfile, AgentRole,
     AgentState, AgentTools, Reasoner, ReasonerCall, ReasonerFuture, ReasonerReply, StepProgress,
-    ToolDispatchFuture, advance_one_step, render_evidence,
+    ToolDispatchFuture, advance_one_step,
 };
 use openplotva_config::AppConfig;
 use openplotva_dialog::{
@@ -60,12 +60,6 @@ pub const DEFAULT_QWEN_SERVICE_NAME: &str = "llm-openai-qwen27b-gguf";
 /// higher bits-per-weight than the prior 35B-A3B Q3_K_XL at a comparable file size.)
 pub const DEFAULT_QWEN_MODEL: &str = "qwen3.6-27b-moq";
 
-/// Reasoner orchestration prompt for the search agent.
-pub const SEARCH_SYSTEM_PROMPT: &str =
-    include_str!("../../../prompts/agentic/search_system.prompt");
-/// Writer synthesis prompt for the search agent.
-pub const SEARCH_SYNTHESIS_PROMPT: &str =
-    include_str!("../../../prompts/agentic/search_synthesis.prompt");
 /// System prompt for the song-writing agent.
 pub const SONG_SYSTEM_PROMPT: &str = include_str!("../../../prompts/agentic/song_system.prompt");
 /// System prompt for the image-prompt agent.
@@ -211,80 +205,6 @@ pub fn qwen_reasoner_named_provider_config(
             temperature: None,
             task_timeout_seconds: openplotva_config::DEFAULT_LLM_PROVIDER_TASK_TIMEOUT_SECONDS,
         })
-}
-
-/// Resolved search-agent settings (prompts + budgets + default providers), built
-/// once from config so the worker needs no `AppConfig` reference.
-#[derive(Clone)]
-pub struct SearchAgentSettings {
-    pub enabled: bool,
-    pub system_prompt: String,
-    pub synthesis_prompt: String,
-    pub reasoner_provider: String,
-    pub writer_provider: String,
-    pub budgets: AgentBudgets,
-    pub reasoner_max_tokens: i32,
-    pub writer_max_tokens: i32,
-}
-
-impl SearchAgentSettings {
-    #[must_use]
-    pub fn from_app_config(
-        config: &AppConfig,
-        system_prompt: String,
-        synthesis_prompt: String,
-    ) -> Self {
-        let search = &config.llm.agentic.search;
-        let max_tool_calls = search.max_searches.saturating_add(search.max_crawls).max(1);
-        let reasoner_provider = if search.reasoner_provider.trim().is_empty() {
-            openplotva_config::DEFAULT_AGENTIC_SEARCH_REASONER_PROVIDER.to_owned()
-        } else {
-            search.reasoner_provider.clone()
-        };
-        let writer_provider = if search.writer_provider.trim().is_empty() {
-            CONVERSATIONAL_PROVIDER.to_owned()
-        } else {
-            search.writer_provider.clone()
-        };
-        Self {
-            enabled: search.enabled,
-            system_prompt,
-            synthesis_prompt,
-            reasoner_provider,
-            writer_provider,
-            budgets: AgentBudgets {
-                max_steps: u32::try_from(search.max_steps.max(1)).unwrap_or(8),
-                max_total_tokens: u64::try_from(search.max_total_tokens.max(0)).unwrap_or(0),
-                max_wall_ms: u64::try_from(search.wall_timeout_seconds.max(0))
-                    .unwrap_or(0)
-                    .saturating_mul(1000),
-                max_tool_calls: u32::try_from(max_tool_calls).unwrap_or(7),
-                max_tool_errors: 3,
-            },
-            reasoner_max_tokens: 2048,
-            writer_max_tokens: 4096,
-        }
-    }
-
-    /// Build the engine profile for one run with the resolved provider models.
-    #[must_use]
-    pub fn profile(&self, reasoner_model: String, writer_model: String) -> AgentProfile {
-        AgentProfile {
-            id: "search".to_owned(),
-            system_prompt: self.system_prompt.clone(),
-            allowed_tools: vec![
-                STEP_WEB_SEARCH.to_owned(),
-                STEP_CRAWL_URL.to_owned(),
-                STEP_HISTORY_SEARCH.to_owned(),
-                STEP_MEMORY_SEARCH.to_owned(),
-            ],
-            reasoner_model,
-            writer_model,
-            budgets: self.budgets,
-            reasoner_max_tokens: self.reasoner_max_tokens,
-            writer_max_tokens: self.writer_max_tokens,
-        }
-    }
 }
 
 /// `Reasoner` adapter that performs one chat round-trip via the AIFarm client.
@@ -698,90 +618,6 @@ fn format_memory(memory: &RetrievedMemory) -> String {
         "No relevant long-term memory found.".to_owned()
     } else {
         out.trim_end().to_owned()
-    }
-}
-
-/// Boxed future returned by [`AgenticWebSearch`].
-pub type AgenticWebSearchFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<String, AgentError>> + Send + 'a>>;
-
-/// Runs the search agent for a single query and returns a summarized answer text.
-/// The conversational `web_search` tool uses this so the bot's brain gets a
-/// researched summary instead of raw single-pass results.
-pub trait AgenticWebSearch: Send + Sync {
-    fn search_summary<'a>(&'a self, query: String) -> AgenticWebSearchFuture<'a>;
-}
-
-/// Synchronous (within one call) search-agent run: drive the engine loop to a
-/// terminal state and return the reasoner's summary (plus gathered evidence).
-/// No durable checkpointing — it lives inside one dialog tool call.
-pub struct InlineSearchAgent {
-    reasoner: Arc<AgentProviderClient>,
-    settings: SearchAgentSettings,
-    tools: Arc<dyn AgentTools>,
-}
-
-impl InlineSearchAgent {
-    #[must_use]
-    pub fn new(
-        reasoner: Arc<AgentProviderClient>,
-        settings: SearchAgentSettings,
-        tools: Arc<dyn AgentTools>,
-    ) -> Self {
-        Self {
-            reasoner,
-            settings,
-            tools,
-        }
-    }
-}
-
-impl AgenticWebSearch for InlineSearchAgent {
-    fn search_summary<'a>(&'a self, query: String) -> AgenticWebSearchFuture<'a> {
-        Box::pin(async move {
-            let model = self.reasoner.model.clone();
-            let profile = self.settings.profile(model.clone(), model);
-            let reasoner = AifarmReasoner::for_workflow(
-                Arc::clone(&self.reasoner),
-                AGENTIC_SEARCH_REASONER_WORKFLOW,
-            );
-            let mut state = AgentState::new("search", query, AgentOrigin::default(), now_unix_ms());
-            loop {
-                match advance_one_step(
-                    &profile,
-                    &reasoner,
-                    self.tools.as_ref(),
-                    state,
-                    now_unix_ms(),
-                )
-                .await?
-                {
-                    StepProgress::Continue(next) => state = next,
-                    StepProgress::Terminal(next) => {
-                        state = next;
-                        break;
-                    }
-                }
-            }
-            Ok(summarize_run(&state))
-        })
-    }
-}
-
-fn summarize_run(state: &AgentState) -> String {
-    let evidence = render_evidence(state);
-    let summary = match &state.outcome {
-        Some(AgentOutcome::Completed { answer }) if !answer.trim().is_empty() => answer.clone(),
-        Some(AgentOutcome::Stopped { partial, .. }) if !partial.trim().is_empty() => {
-            partial.clone()
-        }
-        _ => String::new(),
-    };
-    match (summary.trim().is_empty(), evidence.trim().is_empty()) {
-        (true, true) => "No relevant results were found.".to_owned(),
-        (true, false) => evidence,
-        (false, true) => summary,
-        (false, false) => format!("{summary}\n\nGathered evidence:\n{evidence}"),
     }
 }
 
