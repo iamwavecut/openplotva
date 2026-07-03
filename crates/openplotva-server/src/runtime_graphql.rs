@@ -852,6 +852,10 @@ pub struct RuntimeRoutingEventData {
 pub struct RuntimeLlmRequestData {
     pub id: i64,
     pub at: String,
+    /// Agent-run correlation key (`job-…`, `song-…`, `console-…`).
+    pub run_id: Option<String>,
+    /// 1-based round ordinal within the run.
+    pub run_seq: Option<i32>,
     pub provider: Option<String>,
     pub request_kind: Option<String>,
     pub source: String,

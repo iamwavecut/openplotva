@@ -451,6 +451,7 @@ where
             },
             artifact: artifact.clone(),
             duration_ms,
+            run: None,
         });
     }
 
@@ -2519,6 +2520,7 @@ fn emit_gemini_aux_trace(
         context: crate::trace::LlmCallContext::default(),
         artifact,
         duration_ms,
+        run: None,
     });
 }
 

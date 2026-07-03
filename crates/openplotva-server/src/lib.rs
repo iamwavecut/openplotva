@@ -1978,6 +1978,8 @@ mod tests {
                     }
                 );
                 Ok(vec![RuntimeLlmRequestData {
+                    run_id: None,
+                    run_seq: None,
                     id: 31,
                     at: "2026-05-21T00:00:00Z".to_owned(),
                     provider: Some("aifarm".to_owned()),

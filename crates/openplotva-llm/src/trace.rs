@@ -68,6 +68,36 @@ pub struct LlmCallRecord {
     pub artifact: DialogTraceArtifacts,
     /// Measured wall-clock duration in milliseconds.
     pub duration_ms: i32,
+    /// Agent run this call belongs to; stamped from the ambient
+    /// [`LlmRunScope`] task-local when the emitter left it unset.
+    pub run: Option<LlmRunScope>,
+}
+
+/// Correlates every model round-trip on the current task with one agent run
+/// (a dialog session, a song/image optimizer run, a console turn).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct LlmRunScope {
+    /// Stable run key, e.g. `job-8123`, `song-1783...-0`, `console-abc-m4`.
+    pub run_id: String,
+    /// Run kind, e.g. `dialog`, `song_optimizer`, `image_optimizer`, `console`.
+    pub run_kind: String,
+}
+
+tokio::task_local! {
+    static LLM_RUN_SCOPE: Option<LlmRunScope>;
+}
+
+/// Run `fut` with the given run scope ambient on the task: every
+/// [`LlmCallRecord`] observed inside (including nested aux calls such as
+/// vision materialization) is stamped with it.
+pub async fn with_run_scope<F: std::future::Future>(scope: LlmRunScope, fut: F) -> F::Output {
+    LLM_RUN_SCOPE.scope(Some(scope), fut).await
+}
+
+/// The ambient run scope of the current task, when inside [`with_run_scope`].
+#[must_use]
+pub fn current_run_scope() -> Option<LlmRunScope> {
+    LLM_RUN_SCOPE.try_with(Clone::clone).ok().flatten()
 }
 
 /// Sink for low-level model-call observations. Implemented in `openplotva-app`.
@@ -106,7 +136,10 @@ impl LlmCallTraceRegistry {
     }
 
     /// Forward a record to the registered observer; no-op when none is set.
-    pub fn observe(&self, record: LlmCallRecord) {
+    pub fn observe(&self, mut record: LlmCallRecord) {
+        if record.run.is_none() {
+            record.run = current_run_scope();
+        }
         if let Some(observer) = self.observer.get() {
             observer.observe(record);
         }
@@ -156,6 +189,7 @@ mod tests {
         let registry = LlmCallTraceRegistry::new();
         assert!(registry.set(Arc::new(CollectingObserver(Arc::clone(&sink)))));
         registry.observe(LlmCallRecord {
+            run: None,
             context: LlmCallContext {
                 chat_id: -100,
                 user_id: 7,
@@ -186,5 +220,88 @@ mod tests {
         let registry = LlmCallTraceRegistry::new();
         assert!(registry.set(Arc::new(CollectingObserver::default())));
         assert!(!registry.set(Arc::new(CollectingObserver::default())));
+    }
+
+    #[derive(Default)]
+    struct RunCollectingObserver {
+        runs: std::sync::Mutex<Vec<Option<LlmRunScope>>>,
+    }
+
+    impl LlmCallObserver for RunCollectingObserver {
+        fn observe(&self, record: LlmCallRecord) {
+            self.runs.lock().expect("runs").push(record.run);
+        }
+    }
+
+    #[tokio::test]
+    async fn observe_stamps_the_ambient_run_scope_and_keeps_explicit_ones() {
+        let registry = Arc::new(LlmCallTraceRegistry::new());
+        let observer = Arc::new(RunCollectingObserver::default());
+        assert!(registry.set(Arc::clone(&observer) as Arc<dyn LlmCallObserver>));
+
+        // Outside any scope: no run.
+        registry.observe(LlmCallRecord::default());
+
+        // Inside a scope: stamped, including nested awaits on the same task.
+        let scoped_registry = Arc::clone(&registry);
+        with_run_scope(
+            LlmRunScope {
+                run_id: "job-1".to_owned(),
+                run_kind: "dialog".to_owned(),
+            },
+            async move {
+                scoped_registry.observe(LlmCallRecord::default());
+                // A pre-stamped record wins over the ambient scope.
+                scoped_registry.observe(LlmCallRecord {
+                    run: Some(LlmRunScope {
+                        run_id: "song-9".to_owned(),
+                        run_kind: "song_optimizer".to_owned(),
+                    }),
+                    ..LlmCallRecord::default()
+                });
+            },
+        )
+        .await;
+
+        let runs = observer.runs.lock().expect("runs").clone();
+        assert_eq!(runs.len(), 3);
+        assert_eq!(runs[0], None);
+        assert_eq!(runs[1].as_ref().map(|s| s.run_id.as_str()), Some("job-1"));
+        assert_eq!(runs[2].as_ref().map(|s| s.run_id.as_str()), Some("song-9"));
+    }
+
+    #[tokio::test]
+    async fn parallel_run_scopes_do_not_bleed_across_tasks() {
+        let registry = Arc::new(LlmCallTraceRegistry::new());
+        let observer = Arc::new(RunCollectingObserver::default());
+        assert!(registry.set(Arc::clone(&observer) as Arc<dyn LlmCallObserver>));
+
+        let spawn_scoped = |run_id: &str| {
+            let registry = Arc::clone(&registry);
+            let scope = LlmRunScope {
+                run_id: run_id.to_owned(),
+                run_kind: "dialog".to_owned(),
+            };
+            tokio::spawn(async move {
+                with_run_scope(scope, async move {
+                    tokio::task::yield_now().await;
+                    registry.observe(LlmCallRecord::default());
+                })
+                .await;
+            })
+        };
+        let (a, b) = (spawn_scoped("job-a"), spawn_scoped("job-b"));
+        a.await.expect("task a");
+        b.await.expect("task b");
+
+        let mut ids: Vec<String> = observer
+            .runs
+            .lock()
+            .expect("runs")
+            .iter()
+            .map(|run| run.as_ref().expect("scoped").run_id.clone())
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec!["job-a".to_owned(), "job-b".to_owned()]);
     }
 }

@@ -233,7 +233,26 @@ impl AifarmReasoner {
 impl Reasoner for AifarmReasoner {
     fn complete<'a>(&'a self, call: ReasonerCall) -> ReasonerFuture<'a> {
         Box::pin(async move {
-            let request = build_request(&self.provider, &call, true);
+            let mut request = build_request(&self.provider, &call, true);
+            // Agent rounds report to the trace sink like every other model
+            // call; without this the optimizer runs are invisible to the
+            // trace ring, llm_request_events, and the run correlation.
+            request.trace = Some(openplotva_llm::LlmCallTrace {
+                context: openplotva_llm::LlmCallContext {
+                    chat_id: self.context.chat_id.unwrap_or_default(),
+                    thread_id: self.context.thread_id,
+                    message_id: self.context.message_id.unwrap_or_default(),
+                    ..openplotva_llm::LlmCallContext::default()
+                },
+                tags: openplotva_llm::LlmCallTags {
+                    provider: openplotva_dialog::PROVIDER_AIFARM.to_owned(),
+                    source: "aifarm_agent".to_owned(),
+                    flow: self.context.workflow_key.clone(),
+                    mode: "agent".to_owned(),
+                    request_kind: "openai.chat.completions".to_owned(),
+                    ..openplotva_llm::LlmCallTags::default()
+                },
+            });
             if let Some(routed) = self.provider.routed.clone() {
                 let base_provider = Arc::clone(&self.provider);
                 let base_request = request;

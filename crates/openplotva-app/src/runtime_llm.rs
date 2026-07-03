@@ -67,7 +67,9 @@ const SQL_INSERT_LLM_REQUEST_EVENTS_PREFIX: &str = r#"INSERT INTO llm_request_ev
     tool_mode,
     response_format,
     inference_params,
-    error
+    error,
+    run_id,
+    run_seq
 )"#;
 const SQL_DELETE_OLD_LLM_REQUEST_EVENTS_BATCH: &str = r#"
 WITH doomed AS (
@@ -339,19 +341,21 @@ impl RuntimeLlmTraceBuffer {
         }
     }
 
-    pub fn record(&self, mut trace: RuntimeLlmRequestData) {
-        trace.id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+    pub fn record(&self, mut trace: RuntimeLlmRequestData) -> i64 {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+        trace.id = id;
         let mut inner = self
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if inner.ring.is_empty() {
-            return;
+            return id;
         }
         let write = inner.write;
         inner.ring[write] = Some(trace);
         inner.write = (write + 1) % inner.ring.len();
         inner.count = inner.count.saturating_add(1).min(inner.ring.len());
+        id
     }
 
     pub fn prune_chat(&self, chat_id: i64) -> i32 {
@@ -479,7 +483,12 @@ impl RuntimeLlmObserver {
 
 impl openplotva_llm::LlmCallObserver for RuntimeLlmObserver {
     fn observe(&self, record: openplotva_llm::LlmCallRecord) {
-        let trace = trace_from_record(&record.context, &record.artifact, record.duration_ms);
+        let trace = trace_from_record(
+            &record.context,
+            &record.artifact,
+            record.duration_ms,
+            record.run.as_ref(),
+        );
         self.buffer.record(trace.clone());
         if let Some(recorder) = &self.recorder {
             recorder.enqueue(trace);
@@ -491,6 +500,7 @@ fn trace_from_record(
     context: &openplotva_llm::LlmCallContext,
     artifact: &DialogTraceArtifacts,
     duration_ms: i32,
+    run: Option<&openplotva_llm::LlmRunScope>,
 ) -> RuntimeLlmRequestData {
     let mut trace = RuntimeLlmRequestData {
         at: format_ts(OffsetDateTime::now_utc()),
@@ -507,6 +517,7 @@ fn trace_from_record(
         message: RuntimeLlmRequestMessageData {
             message_id: context.message_id,
         },
+        run_id: run.map(|scope| scope.run_id.clone()),
         ..RuntimeLlmRequestData::default()
     };
     apply_dialog_trace_artifact(&mut trace, artifact);
@@ -792,7 +803,9 @@ fn llm_request_event_insert_builder(events: &[LlmRequestEvent]) -> QueryBuilder<
             .push_bind(event.tool_mode.clone())
             .push_bind(event.response_format.clone())
             .push_bind(sqlx::types::Json(event.inference_params.clone()))
-            .push_bind(event.error.clone());
+            .push_bind(event.error.clone())
+            .push_bind(event.run_id.clone())
+            .push_bind(event.run_seq);
     });
     builder
 }
@@ -865,6 +878,8 @@ struct LlmRequestEvent {
     response_format: Option<String>,
     inference_params: Value,
     error: Option<String>,
+    run_id: Option<String>,
+    run_seq: Option<i32>,
 }
 
 impl LlmRequestEvent {
@@ -927,6 +942,8 @@ impl LlmRequestEvent {
             response_format: string_json_field(&inference_params, "response_format"),
             inference_params,
             error: non_empty_opt(trace.result.error.as_deref()),
+            run_id: trace.run_id.clone(),
+            run_seq: trace.run_seq,
         }
     }
 }
@@ -1206,6 +1223,7 @@ mod tests {
                     ..openplotva_dialog::DialogTraceArtifacts::default()
                 },
                 duration_ms: 123,
+                run: None,
             },
         );
         let rows = buffer
@@ -1416,6 +1434,8 @@ mod tests {
         };
 
         let sql = llm_request_event_batch_insert_sql_for_test(&[first, second]);
+        assert!(sql.contains("run_id"));
+        assert!(sql.contains("run_seq"));
 
         assert!(sql.starts_with("INSERT INTO llm_request_events"));
         assert!(sql.contains("), ("));
