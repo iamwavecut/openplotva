@@ -11079,30 +11079,23 @@ async fn start_runtime_workers(
             .with_url_crawler(url_crawler);
     }
     let dialog_toolbox: Arc<dyn openplotva_dialog::DialogToolbox> = Arc::new(app_dialog_toolbox);
-    // DIALOG_AGENT_LOOP_ENABLED: the dialog session engine drives the turn
-    // (engine-owned tool loop, multi-message turns) instead of the legacy
-    // provider-internal loop; DIALOG_AGENT_LOOP_CHATS narrows it to canaries.
-    let dialog_session_wiring: Option<Arc<dialog_turn::SessionWorkerWiring>> =
-        config.llm.dialog.agent_loop_enabled.then(|| {
-            Arc::new(dialog_turn::SessionWorkerWiring {
-                toolbox: Arc::clone(&dialog_toolbox),
-                registry: config
-                    .llm
-                    .dialog
-                    .session_injection_enabled
-                    .then(|| Arc::new(dialog_turn::DialogSessionRegistry::new())),
-                reactor: Some(
-                    Arc::new(reactions::GenerationReactionSignaler::new(telegram.clone()))
-                        as Arc<dyn dialog_turn::SessionReactor>,
-                ),
-                enabled_chats: config.llm.dialog.agent_loop_chats.clone(),
-                max_iterations: config.llm.dialog.session_max_iterations,
-                max_messages: config.llm.dialog.session_max_messages,
-                tool_extension_secs: config.llm.dialog.session_tool_extension_secs,
-                hard_cap_secs: config.llm.dialog.session_hard_cap_secs,
-                max_draws: config.llm.dialog.session_max_draws,
-                max_songs: config.llm.dialog.session_max_songs,
-            })
+    // The dialog session engine drives every turn: engine-owned tool loop,
+    // multi-message turns, per-(chat, thread) serialization with initiator
+    // injection.
+    let dialog_session_wiring: Arc<dialog_turn::SessionWorkerWiring> =
+        Arc::new(dialog_turn::SessionWorkerWiring {
+            toolbox: Arc::clone(&dialog_toolbox),
+            registry: Arc::new(dialog_turn::DialogSessionRegistry::new()),
+            reactor: Some(
+                Arc::new(reactions::GenerationReactionSignaler::new(telegram.clone()))
+                    as Arc<dyn dialog_turn::SessionReactor>,
+            ),
+            max_iterations: config.llm.dialog.session_max_iterations,
+            max_messages: config.llm.dialog.session_max_messages,
+            tool_extension_secs: config.llm.dialog.session_tool_extension_secs,
+            hard_cap_secs: config.llm.dialog.session_hard_cap_secs,
+            max_draws: config.llm.dialog.session_max_draws,
+            max_songs: config.llm.dialog.session_max_songs,
         });
     let embedding_attempt_walker = routed_attempts::RoutedAttemptWalker::new(
         Arc::clone(&router_handle),
@@ -11369,7 +11362,7 @@ async fn start_runtime_workers(
                                         dialog_terminal_signal_max_age_secs,
                                     ),
                                     obligations: Some(worker_obligations.as_ref()),
-                                    session: worker_session.as_deref(),
+                                    session: worker_session.as_ref(),
                                 },
                                 stop_future,
                             )

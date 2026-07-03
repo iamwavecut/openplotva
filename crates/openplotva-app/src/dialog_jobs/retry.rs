@@ -3,7 +3,6 @@
 
 use std::collections::BTreeMap;
 
-use openplotva_dialog::DialogOutput;
 use openplotva_taskman::{
     DIALOG_AIFARM_QUEUE_NAME, DialogJobParams, LLM_JOB_RETRY_EXHAUSTED_STAGE, LLM_JOB_RETRY_STAGE,
     TaskQueueJobEvent,
@@ -144,53 +143,6 @@ where
         },
         disposition: crate::dialog_turn::JobDisposition::Requeue(target_queue),
     }
-}
-
-pub(crate) async fn record_dialog_fallback_event<Queue>(
-    queue: &Queue,
-    job_id: i64,
-    output: &DialogOutput,
-    now: OffsetDateTime,
-    report: &mut DialogJobWorkerReport,
-) where
-    Queue: DialogJobWorkerQueue + Sync + ?Sized,
-{
-    let Some(event) = dialog_fallback_job_event(output) else {
-        return;
-    };
-    match queue.append_dialog_job_event(job_id, event, now).await {
-        Ok(()) => report.recorded_dialog_fallback_event = true,
-        Err(error) => {
-            let error = error.to_string();
-            tracing::debug!(%error, job_id, "failed to append dialog fallback event");
-            report.dialog_fallback_event_error = Some(error);
-        }
-    }
-}
-
-fn dialog_fallback_job_event(output: &DialogOutput) -> Option<TaskQueueJobEvent> {
-    let primary_provider = output.fallback_from.trim();
-    let primary_error = output.fallback_error.trim();
-    if primary_provider.is_empty() || primary_error.is_empty() {
-        return None;
-    }
-    let fallback_provider = output.provider.trim();
-    let fallback_reason = openplotva_llm::retry::retryable_reason_from_message(primary_error)
-        .map(|reason| reason.to_string())
-        .unwrap_or_default();
-    let mut data = BTreeMap::new();
-    data.insert("fallback_provider".to_owned(), fallback_provider.to_owned());
-    data.insert("fallback_reason".to_owned(), fallback_reason);
-
-    Some(TaskQueueJobEvent {
-        level: "warn".to_owned(),
-        stage: "dialog_fallback".to_owned(),
-        provider: primary_provider.to_owned(),
-        message: "primary dialog backend failed, trying fallback".to_owned(),
-        error: primary_error.to_owned(),
-        data,
-        ..TaskQueueJobEvent::default()
-    })
 }
 
 pub(crate) fn next_dialog_llm_job_attempt(events: &[TaskQueueJobEvent]) -> i32 {

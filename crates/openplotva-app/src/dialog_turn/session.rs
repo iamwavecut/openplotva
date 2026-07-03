@@ -85,8 +85,6 @@ pub struct SessionTurnConfig<'a> {
     pub toolbox: &'a dyn DialogToolbox,
     /// `react_to_message` executor; `None` fails the tool gracefully.
     pub reactor: Option<&'a dyn SessionReactor>,
-    /// Canary allowlist; empty = every chat once the engine flag is on.
-    pub enabled_chats: &'a [i64],
     pub max_iterations: i32,
     pub max_messages: i32,
     pub tool_extension_secs: i32,
@@ -95,23 +93,13 @@ pub struct SessionTurnConfig<'a> {
     pub max_songs: i32,
 }
 
-impl SessionTurnConfig<'_> {
-    #[must_use]
-    pub fn enabled_for_chat(&self, chat_id: i64) -> bool {
-        self.enabled_chats.is_empty() || self.enabled_chats.contains(&chat_id)
-    }
-}
-
 /// Owned session-engine wiring held by the worker composition root; each
 /// turn borrows a [`SessionTurnConfig`] view of it.
 pub struct SessionWorkerWiring {
     pub toolbox: std::sync::Arc<dyn DialogToolbox>,
     pub reactor: Option<std::sync::Arc<dyn SessionReactor>>,
-    /// Per-(chat, thread) serialization + injection
-    /// (`DIALOG_SESSION_INJECTION_ENABLED`); `None` keeps today's
-    /// per-(chat, user, thread) parallel turns.
-    pub registry: Option<std::sync::Arc<super::inbox::DialogSessionRegistry>>,
-    pub enabled_chats: Vec<i64>,
+    /// Per-(chat, thread) serialization + initiator injection.
+    pub registry: std::sync::Arc<super::inbox::DialogSessionRegistry>,
     pub max_iterations: i32,
     pub max_messages: i32,
     pub tool_extension_secs: i32,
@@ -126,7 +114,6 @@ impl SessionWorkerWiring {
         SessionTurnConfig {
             toolbox: self.toolbox.as_ref(),
             reactor: self.reactor.as_deref(),
-            enabled_chats: &self.enabled_chats,
             max_iterations: self.max_iterations,
             max_messages: self.max_messages,
             tool_extension_secs: self.tool_extension_secs,

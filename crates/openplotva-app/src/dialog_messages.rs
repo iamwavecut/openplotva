@@ -1152,11 +1152,7 @@ impl DialogMessageUpdateConfig {
                 .task_timeout_seconds
                 .max(300)
                 .max(config.llm.history_summary.timeout_seconds)
-                .max(if config.llm.dialog.agent_loop_enabled {
-                    config.llm.dialog.session_hard_cap_secs.saturating_add(120)
-                } else {
-                    0
-                }),
+                .max(config.llm.dialog.session_hard_cap_secs.saturating_add(120)),
         }
     }
 }
@@ -3340,14 +3336,30 @@ mod tests {
             openplotva_telegram::DispatcherConfig::default(),
         ));
         let effects = crate::dialog_jobs::DialogDispatcherEffects::new(Arc::clone(&outbound_queue));
-        let worker_report = crate::dialog_jobs::process_dialog_job_once_in_queue_at(
-            queue.as_ref(),
-            DIALOG_AIFARM_QUEUE_NAME,
-            &provider,
-            &effects,
-            OffsetDateTime::now_utc(),
-        )
-        .await;
+        let wiring = stub_session_wiring();
+        let worker_report =
+            crate::dialog_jobs::process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+                queue.as_ref(),
+                &provider,
+                &effects,
+                &crate::dialog_jobs::BasicDialogInputMaterializer,
+                &crate::dialog_jobs::NoopDialogToolCallHistoryStore,
+                crate::dialog_jobs::DialogJobProcessOptions {
+                    queue_name: DIALOG_AIFARM_QUEUE_NAME,
+                    max_llm_job_attempts: openplotva_taskman::DEFAULT_LLM_JOB_MAX_ATTEMPTS,
+                    turn_budget_secs: crate::dialog_jobs::DEFAULT_DIALOG_TURN_BUDGET_SECS,
+                    turn_max_queue_age_secs:
+                        crate::dialog_jobs::DEFAULT_DIALOG_TURN_MAX_QUEUE_AGE_SECS,
+                    max_regenerations: crate::dialog_jobs::DEFAULT_DIALOG_TURN_MAX_REGENERATIONS,
+                    terminal_signal: crate::dialog_turn::TurnSignalPolicy::default(),
+                    obligations: None,
+                    now: OffsetDateTime::now_utc(),
+                    routing_events: None,
+                    turn_outcomes: None,
+                    session: &wiring,
+                },
+            )
+            .await;
         assert_eq!(worker_report.job_id, Some(job_id));
         assert!(worker_report.dequeued);
         assert!(worker_report.sent_answer);
@@ -3498,14 +3510,30 @@ mod tests {
             openplotva_telegram::DispatcherConfig::default(),
         ));
         let effects = crate::dialog_jobs::DialogDispatcherEffects::new(Arc::clone(&outbound_queue));
-        let worker_report = crate::dialog_jobs::process_dialog_job_once_in_queue_at(
-            queue.as_ref(),
-            DIALOG_AIFARM_QUEUE_NAME,
-            &provider,
-            &effects,
-            OffsetDateTime::now_utc(),
-        )
-        .await;
+        let wiring = stub_session_wiring();
+        let worker_report =
+            crate::dialog_jobs::process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+                queue.as_ref(),
+                &provider,
+                &effects,
+                &crate::dialog_jobs::BasicDialogInputMaterializer,
+                &crate::dialog_jobs::NoopDialogToolCallHistoryStore,
+                crate::dialog_jobs::DialogJobProcessOptions {
+                    queue_name: DIALOG_AIFARM_QUEUE_NAME,
+                    max_llm_job_attempts: openplotva_taskman::DEFAULT_LLM_JOB_MAX_ATTEMPTS,
+                    turn_budget_secs: crate::dialog_jobs::DEFAULT_DIALOG_TURN_BUDGET_SECS,
+                    turn_max_queue_age_secs:
+                        crate::dialog_jobs::DEFAULT_DIALOG_TURN_MAX_QUEUE_AGE_SECS,
+                    max_regenerations: crate::dialog_jobs::DEFAULT_DIALOG_TURN_MAX_REGENERATIONS,
+                    terminal_signal: crate::dialog_turn::TurnSignalPolicy::default(),
+                    obligations: None,
+                    now: OffsetDateTime::now_utc(),
+                    routing_events: None,
+                    turn_outcomes: None,
+                    session: &wiring,
+                },
+            )
+            .await;
         assert_eq!(worker_report.job_id, Some(job_id));
         assert!(worker_report.dequeued);
         assert!(worker_report.sent_answer);
@@ -8506,11 +8534,57 @@ mod tests {
 
         fn run_dialog<'a>(
             &'a self,
-            input: openplotva_dialog::DialogInput,
+            _input: openplotva_dialog::DialogInput,
         ) -> openplotva_llm::ChatProviderFuture<'a> {
-            let output = self.output.clone();
-            lock(&self.inputs).push(input);
-            Box::pin(async move { Ok(output) })
+            Box::pin(async move { panic!("dialog turns run through the step seam") })
+        }
+
+        fn as_chat_step(&self) -> Option<&dyn openplotva_llm::ChatStepProvider> {
+            Some(self)
+        }
+    }
+
+    impl openplotva_llm::ChatStepProvider for DialogProviderStub {
+        fn provider_name(&self) -> &str {
+            "stub"
+        }
+
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+
+        fn run_chat_step<'a>(
+            &'a self,
+            request: openplotva_dialog::ChatStepRequest,
+        ) -> openplotva_llm::ChatStepFuture<'a> {
+            let answer = crate::dialog_jobs::dialog_job_answer(&self.output);
+            let provider = self.output.provider.clone();
+            lock(&self.inputs).push(request.input);
+            Box::pin(async move {
+                Ok(openplotva_dialog::ChatStepOutput {
+                    provider,
+                    text: answer,
+                    ..openplotva_dialog::ChatStepOutput::default()
+                })
+            })
+        }
+    }
+
+    struct NoToolbox;
+
+    impl openplotva_dialog::DialogToolbox for NoToolbox {}
+
+    fn stub_session_wiring() -> crate::dialog_turn::SessionWorkerWiring {
+        crate::dialog_turn::SessionWorkerWiring {
+            toolbox: Arc::new(NoToolbox),
+            reactor: None,
+            registry: Arc::new(crate::dialog_turn::DialogSessionRegistry::new()),
+            max_iterations: 8,
+            max_messages: 4,
+            tool_extension_secs: 60,
+            hard_cap_secs: 300,
+            max_draws: 1,
+            max_songs: 1,
         }
     }
 
