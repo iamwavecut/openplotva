@@ -95,6 +95,8 @@ jobs:
           docker run --rm \
             --entrypoint python \
             -e GITHUB_TOKEN \
+            -e "GITHUB.USER_TOKEN=$GITHUB_TOKEN" \
+            -e "GITHUB.DEPLOYMENT_TYPE=user" \
             -e OPENAI__KEY \
             -e OPENAI_KEY \
             -e OPENAI__API_BASE \
@@ -114,7 +116,7 @@ jobs:
           if (( status != 0 )); then
             exit "$status"
           fi
-          if grep -E "Failed to review PR|Failed to generate prediction|Error during LLM inference|BadRequestError|Unknown Model" "$log_file" >/dev/null; then
+          if grep -E "Traceback|ValueError|Exception|Failed to get git provider|GitHub token is required|Failed to review PR|Failed to generate prediction|Error during LLM inference|BadRequestError|Unknown Model" "$log_file" >/dev/null; then
             echo "PR-Agent reported an inference/review failure while exiting successfully." >&2
             exit 1
           fi
