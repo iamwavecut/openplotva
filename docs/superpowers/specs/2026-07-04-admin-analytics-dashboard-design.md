@@ -47,7 +47,7 @@ current page simply under-renders. The redesign supersedes the one-chart fix.
 |---|---|---|
 | LLM providers | `llm_request_events` (330k) | provider, model, flow, source, request_kind; `duration_ms`, `prompt_eval_ms` (**TTFT**), `generation_ms`; `prompt_tps`, `generation_tps`, `effective_output_tps`, `effective_total_tps`; `input_tokens`, `output_tokens`, `total_tokens`, `cached_tokens`, `thoughts_tokens`, `tool_use_prompt_tokens`; `prompt_chars`, `prompt_messages`, `docs_chars`; `error`; inference params; `run_id`/`run_seq`; rollup mirror (`is_rollup`, `*_sum`, `p50/p95_*`, `request_count`, `error_count`, `bucket_*`) |
 | Shield / moderation | `whitecircle_checks` (223k) | source, flow, mode, `duration_ms`, `flagged`, `error`, deployment_id |
-| Generation / job backends | `telemetry_rollups` (source=`taskman`, kind=`job`) | dimensions{job_type, queue_name, status}, metrics{job_count, completed/failed/cancelled_count, avg/p95_processing_ms, avg/p95_wait_ms}; raw `taskman_jobs` for live/status |
+| Generation / job backends | `taskman_jobs` (live: 56k completed/24h, all with started_at/completed_at) — compute wait=`started_at-created_at`, processing=`completed_at-started_at`, per job_type×status + p95. NOT `telemetry_rollups` (its taskman/job buckets are stale since 2026-07-02 13:00 — separate bug, spawned as its own task). |
 | Routing health | `llm_routing_events` (1.9k) | severity, event_type, workflow_key, provider_id, model_id, queue_name, summary |
 | Reply outcomes | `dialog_turn_outcomes` (10k) | outcome, reason, provider, model, `elapsed_ms`, `budget_ms`, user_signal |
 
