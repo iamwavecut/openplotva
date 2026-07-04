@@ -1589,6 +1589,33 @@ mod tests {
     }
 
     #[test]
+    fn migration_150_backfill_mirrors_the_canonical_provider_map() {
+        // The forward fix (this module) and the historical backfill (migration
+        // 150) must converge on the same provider names, or old and new rows
+        // disagree. Pin every canonical target the code emits into the migration.
+        const MIGRATION: &str = include_str!(
+            "../../../migrations/150_llm_request_events_provider_canonicalization.up.sql"
+        );
+        for (model, flow) in [
+            ("vram.cloud/qwen3.6-35b-a3b", "memory_extraction"),
+            ("vibethinker-3b", "memory_extraction"),
+            ("qwen3.6-27b-moq", "dialog"),
+            ("Gemma 4 26B Heretic", "dialog"),
+            ("Gemma 4 26B Heretic", "vision"),
+        ] {
+            let canonical = canonical_provider_for_model(model, flow)
+                .expect("registry model maps to a provider");
+            assert!(
+                MIGRATION.contains(canonical),
+                "migration 150 must backfill to {canonical} (model {model}, flow {flow})"
+            );
+        }
+        // Raw rows only, and idempotent on already-correct data.
+        assert!(MIGRATION.contains("NOT is_rollup"));
+        assert!(MIGRATION.contains("IS DISTINCT FROM"));
+    }
+
+    #[test]
     fn trace_canonicalizes_provider_from_model_for_every_path() {
         let buffer = RuntimeLlmTraceBuffer::new(8);
         let observer = RuntimeLlmObserver::new(buffer.clone(), None);
