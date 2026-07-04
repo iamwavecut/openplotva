@@ -1,3 +1,4 @@
+const fs = require("fs");
 const { danger, fail, warn, message } = require("danger");
 
 const pr = danger.github.pr;
@@ -57,14 +58,20 @@ if (touchesProdDeploy) {
 }
 
 if (touchesMigrations) {
+  const changedMigrationText = changedFiles
+    .filter((file) => file.startsWith("migrations/") && !deletedFiles.includes(file) && fs.existsSync(file))
+    .map((file) => fs.readFileSync(file, "utf8"))
+    .join("\n");
+  const migrationReviewText = `${bodyWithoutComments}\n${changedMigrationText}`;
+
   const hasCompatibilityNotes =
     /\b(up|forward|apply|backfill)\b[\s\S]{0,240}\b(down|rollback|revert|no-op|irreversible|not recoverable)\b/i.test(
-      bodyWithoutComments
+      migrationReviewText
     ) ||
     /\b(down|rollback|revert|no-op|irreversible|not recoverable)\b[\s\S]{0,240}\b(up|forward|apply|backfill)\b/i.test(
-      bodyWithoutComments
+      migrationReviewText
     ) ||
-    /\bcompatib(?:le|ility)\b/i.test(bodyWithoutComments);
+    /\bcompatib(?:le|ility)\b/i.test(migrationReviewText);
 
   const hasStorageVerification =
     /\b(sqlx|storage|migration)\b[\s\S]{0,240}\b(cargo test|checked|verified|smoke|psql|database|db)\b/i.test(
