@@ -52,3 +52,15 @@
 - Formatting: `cargo fmt --all`.
 - Focused Rust tests: `cargo test -p <crate> <filter>`.
 - Local/runtime smokes when relevant: `tools/local-smoke.sh`, `tools/service-smoke.sh`, `tools/provider-smoke.sh`, `tools/update-queue-smoke.sh`, `tools/live-update-injection-smoke.sh`, `tools/container-smoke.sh`.
+
+## Delivery & Review
+
+The default path to production for every feature or fix:
+
+- **Branch + PR.** Ship each change on its own `feat/...` or `fix/...` branch and open a PR into `main`. Never commit straight to `main`, and never self-attribute the work to Claude or any AI in branch names, commit messages, or PR text.
+- **Green locally first.** Before opening the PR, run `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`, and the relevant `cargo test`. For any `web/admin/` change, update the matching `sha256` in `crates/openplotva-web/src/lib.rs`, run `cargo test -p openplotva-web`, and run the `openplotva-design-system-review` skill.
+- **Watch the PR on a ~60s loop until checks settle.** On EVERY iteration poll both the CI check statuses AND the review artifacts — bot review threads and new PR comments. Reviewers (Qodo, PR-Agent code suggestions, Danger) usually post before CI finishes, so never gate artifact-handling on green CI; act as soon as anything actionable appears.
+- **Handle review artifacts objectively, not reflexively.** If a finding or code suggestion is valid, fix it (or apply the suggestion) and loop again. If it is wrong, harmful, or low-value churn, reply on the thread explaining why and resolve it — do not silently ignore it, and do not apply changes just because a bot suggested them. Address non-blocking warnings too (e.g. Danger asking migrations for up/down notes and a representative storage check).
+- **Merge only when fully green AND every thread/comment is handled** (fixed, applied, or resolved-with-reason): `gh pr merge <N> --merge`.
+- **Deploy only when the user asks.** Deploy is the `deploy-production.yml` workflow run against `main` (authorized by the repo owner). After it reports success, spend a couple of minutes verifying: the running image matches the merged commit, the service is healthy, and recent logs are error-free; spot-check the changed behavior against real data where you can. Report what you verified and any remaining risk. If a check is skipped, say so and name the risk.
+- **Migrations** ship as numbered up/down pairs with compatibility notes and a representative SQLx/storage check. Data backfills are one-way — say so in the down migration.
