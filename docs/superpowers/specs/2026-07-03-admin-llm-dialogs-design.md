@@ -326,15 +326,11 @@ outcome; song/image-run появляется после генерации; one-
 
 1. **Git/PR**: ветки и коммиты БЕЗ самоатрибуции ИИ. Коммиты — английские,
    содержательные, в стиле репо («Forward the session option through the dialog
-   worker loop»). PR: `gh pr create`; на PR автоматически прибегает ревью-бот
-   **Qodo** — его комментарии ЧИТАТЬ: багрепорты часто валидные (он поймал
-   реальный баг в PR #4). Согласен — чини и отвечай «fixed in <sha>»; не согласен
-   — аргументированно отвечай и резолвь тред (GraphQL
-   `addPullRequestReviewThreadReply` + `resolveReviewThread`). CI-джобы: Rust
-   workspace (5–9 мин, непредсказуемо), CodeQL, Semgrep ×2, Container image,
-   Rust dependencies. **Опрашивать `gh pr checks` раз в 60с фоновым циклом до
-   устаканивания** (не фиксированные слипы). Мердж: `gh pr merge N --merge`
-   (merge-коммит; сохраняет фазовые коммиты).
+   worker loop»). PR: `gh pr create`. CI-джобы: Rust workspace (5–9 мин,
+   непредсказуемо), CodeQL, Semgrep ×2, Container image, Rust dependencies.
+   **Опрашивать `gh pr checks` раз в 60с фоновым циклом до устаканивания** (не
+   фиксированные слипы). Мердж: `gh pr merge N --merge` (merge-коммит; сохраняет
+   фазовые коммиты).
 2. **Деплой**: `gh workflow run deploy-production.yml --ref main` → опрос
    `gh run view <id>` раз в 60с (сборка+выкат ~8 мин). Тег прод-образа = SHA
    коммита. Деплоить только когда владелец попросил.
@@ -365,9 +361,8 @@ outcome; song/image-run появляется после генерации; one-
    admin-UI — скилл `openplotva-design-system-review`.
 8. **Грязные изменения** в рабочей копии владельца — норма; не reset/clean.
    Prompt-файлы (`prompts/*.prompt`) — кэш-чувствительные контракты.
-9. **Definition of done**: все 4 фазы смержены с зелёным CI и нулём нерезолвленных
-   Qodo-тредов; прод задеплоен; прод-проверки §8 пройдены; старый эндпоинт и
-   мёртвый JS удалены (Phase D).
+9. **Definition of done**: все 4 фазы смержены с зелёным CI; прод задеплоен;
+   прод-проверки §8 пройдены; старый эндпоинт и мёртвый JS удалены (Phase D).
 
 ## 10. Вне скоупа этой задачи (не трогать, но знать)
 
