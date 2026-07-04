@@ -1,0 +1,12 @@
+[config]
+large_patch_policy = "clip"
+patch_extra_lines_before = 3
+patch_extra_lines_after = 1
+
+[pr_reviewer]
+require_tests_review = false
+extra_instructions = """
+Focus on correctness, security boundaries, async/concurrency hazards, external contracts,
+migrations, and production/runtime risks. Do not comment on formatting, style-only lint,
+dependency advisories, or SAST findings already handled by reviewdog and CI.
+"""

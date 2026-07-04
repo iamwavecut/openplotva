@@ -21,6 +21,10 @@ jobs:
   rust-workspace:
     name: Rust workspace
     runs-on: ubuntu-22.04
+    permissions:
+      checks: write
+      contents: read
+      pull-requests: read
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -38,10 +42,58 @@ jobs:
           rustup toolchain install "$RUST_VERSION" --profile minimal --component rustfmt --component clippy
           rustup default "$RUST_VERSION"
 
+      - name: Setup reviewdog
+        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
+        uses: reviewdog/action-setup@d8a7baabd7f3e8544ee4dbde3ee41d0011c3a93f # v1.5.0
+        with:
+          reviewdog_version: v0.21.0
+
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: rust-${{ runner.os }}-ubuntu-22.04-${{ env.RUST_VERSION }}-workspace
+
+      - name: Review Rust formatting
+        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
+        env:
+          REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +e
+          cargo fmt --all
+          fmt_status=$?
+          git diff -- . > rustfmt.diff
+          if [[ -s rustfmt.diff ]]; then
+            cat rustfmt.diff
+            reviewdog \
+              -name=rustfmt \
+              -f=diff \
+              -f.diff.strip=1 \
+              -reporter=github-pr-check \
+              -filter-mode=diff_context \
+              -level=error \
+              < rustfmt.diff || echo "reviewdog rustfmt report failed" >&2
+            exit 1
+          fi
+          exit "$fmt_status"
+
+      - name: Review Cargo diagnostics
+        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
+        env:
+          REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +e
+          cargo clippy --workspace --all-targets --all-features --message-format=json -- -D warnings > cargo-clippy.jsonl
+          clippy_status=$?
+          set -e
+          jq -r 'select(.reason == "compiler-message") | .message.rendered // empty' cargo-clippy.jsonl
+          jq -n -f tools/reviewdog-cargo-diagnostics.jq cargo-clippy.jsonl > cargo-clippy.rdjson
+          cat cargo-clippy.rdjson | reviewdog \
+            -name=cargo-clippy \
+            -f=rdjson \
+            -reporter=github-pr-check \
+            -filter-mode=diff_context \
+            -level=warning || echo "reviewdog cargo clippy report failed" >&2
+          exit "$clippy_status"
 
       - name: Run fast Rust quality gate
         run: tools/rust-fast-gate.sh
@@ -60,6 +112,10 @@ jobs:
   rust-dependencies:
     name: Rust dependencies
     runs-on: ubuntu-latest
+    permissions:
+      checks: write
+      contents: read
+      pull-requests: read
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -76,6 +132,12 @@ jobs:
         run: |
           rustup toolchain install "$RUST_VERSION" --profile minimal
           rustup default "$RUST_VERSION"
+
+      - name: Setup reviewdog
+        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
+        uses: reviewdog/action-setup@d8a7baabd7f3e8544ee4dbde3ee41d0011c3a93f # v1.5.0
+        with:
+          reviewdog_version: v0.21.0
 
       - name: Cache Rust dependency artifacts
         uses: Swatinem/rust-cache@v2
@@ -107,6 +169,26 @@ jobs:
           install_tool cargo-deny cargo-deny "$CARGO_DENY_VERSION"
           install_tool cargo-audit cargo-audit "$CARGO_AUDIT_VERSION"
           install_tool cargo-machete cargo-machete "$CARGO_MACHETE_VERSION"
+
+      - name: Review cargo deny diagnostics
+        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
+        env:
+          REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +e
+          cargo deny --format sarif check > cargo-deny.sarif
+          deny_status=$?
+          set -e
+          jq '(.runs[]?.results) |= map(select(.level == "error"))' cargo-deny.sarif > cargo-deny-errors.sarif
+          if jq -e 'any(.runs[]?.results[]?; true)' cargo-deny-errors.sarif >/dev/null; then
+            cat cargo-deny-errors.sarif | reviewdog \
+              -name=cargo-deny \
+              -f=sarif \
+              -reporter=github-pr-check \
+              -filter-mode=file \
+              -level=warning || echo "reviewdog cargo deny report failed" >&2
+          fi
+          exit "$deny_status"
 
       - name: Dependency gate
         run: tools/rust-dependency-gate.sh

@@ -1,0 +1,72 @@
+name: PR Automation
+
+on:
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - ready_for_review
+      - synchronize
+      - edited
+
+permissions:
+  contents: read
+
+jobs:
+  danger:
+    name: Danger PR rules
+    if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+      statuses: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Run Danger JS
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npx --yes danger@13.0.10 ci
+
+  pr-agent:
+    name: PR-Agent AI review
+    if: ${{ github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.draft == false && github.actor != 'github-actions[bot]' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+      checks: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Run PR-Agent
+        uses: docker://pragent/pr-agent:0.38.0-github_action
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OPENAI__KEY: ${{ secrets.PR_AGENT_OPENAI_KEY }}
+          OPENAI_KEY: ${{ secrets.PR_AGENT_OPENAI_KEY }}
+          OPENAI__API_BASE: ${{ secrets.PR_AGENT_OPENAI_BASE_URL }}
+          config.model: ${{ vars.PR_AGENT_MODEL || 'openai/glm-5.2[1m]' }}
+          config.fallback_models: ${{ vars.PR_AGENT_FALLBACK_MODELS || '["openai/glm-5.2[1m]"]' }}
+          config.custom_model_max_tokens: ${{ vars.PR_AGENT_CUSTOM_MODEL_MAX_TOKENS || '1000000' }}
+          config.max_model_tokens: ${{ vars.PR_AGENT_MAX_MODEL_TOKENS || '1000000' }}
+          litellm.drop_params: "true"
+          github_action_config.auto_review: "true"
+          github_action_config.auto_describe: "false"
+          github_action_config.auto_improve: "false"
+          pr_reviewer.require_tests_review: "false"
+          pr_reviewer.extra_instructions: >-
+            Focus on correctness, security boundaries, async/concurrency hazards,
+            external contracts, migrations, and production/runtime risks. Do not
+            comment on formatting, style-only lint, dependency advisories, or SAST
+            findings already handled by reviewdog and CI.

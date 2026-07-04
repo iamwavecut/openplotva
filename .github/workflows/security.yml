@@ -43,6 +43,12 @@ jobs:
   semgrep:
     name: Semgrep CE
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      checks: write
+      contents: read
+      pull-requests: read
+      security-events: write
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -75,6 +81,24 @@ jobs:
           if payload.get("version") != "2.1.0" or not isinstance(payload.get("runs"), list):
               raise SystemExit("semgrep.sarif is not a valid SARIF 2.1.0 payload")
           PY
+
+      - name: Setup reviewdog
+        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
+        uses: reviewdog/action-setup@d8a7baabd7f3e8544ee4dbde3ee41d0011c3a93f # v1.5.0
+        with:
+          reviewdog_version: v0.21.0
+
+      - name: Review Semgrep diagnostics
+        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
+        env:
+          REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cat semgrep.sarif | reviewdog \
+            -name=semgrep \
+            -f=sarif \
+            -reporter=github-pr-check \
+            -filter-mode=diff_context \
+            -level=warning || echo "reviewdog semgrep report failed" >&2
 
       - name: Upload Semgrep SARIF artifact
         uses: actions/upload-artifact@v7
