@@ -7,6 +7,7 @@ on:
       - reopened
       - ready_for_review
       - synchronize
+      - review_requested
       - edited
 
 permissions:
@@ -24,10 +25,10 @@ jobs:
       statuses: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
       - name: Setup Node
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
           node-version: 24
 
@@ -38,7 +39,7 @@ jobs:
 
   pr-agent:
     name: PR-Agent AI review
-    if: ${{ github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.draft == false && github.actor != 'github-actions[bot]' }}
+    if: ${{ github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.draft == false && github.event.action != 'edited' && github.actor != 'github-actions[bot]' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -47,10 +48,10 @@ jobs:
       checks: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
       - name: Run PR-Agent
-        uses: docker://pragent/pr-agent:0.38.0-github_action
+        uses: docker://pragent/pr-agent@sha256:ea2ea90f072fd97708755e59827a317272f66097a1ef349eca23d39160bb0baf # 0.38.0-github_action
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           OPENAI__KEY: ${{ secrets.PR_AGENT_OPENAI_KEY }}
@@ -64,6 +65,7 @@ jobs:
           github_action_config.auto_review: "true"
           github_action_config.auto_describe: "false"
           github_action_config.auto_improve: "false"
+          github_action_config.pr_actions: '["opened","reopened","ready_for_review","review_requested","synchronize"]'
           pr_reviewer.require_tests_review: "false"
           pr_reviewer.extra_instructions: >-
             Focus on correctness, security boundaries, async/concurrency hazards,

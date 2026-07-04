@@ -4,20 +4,27 @@ set -euo pipefail
 usage() {
   cat <<'USAGE'
 Usage:
-  tools/rust-fast-gate.sh
+  tools/rust-fast-gate.sh [--skip-clippy]
 
 Runs the fast blocking Rust quality gate used by CI and local development:
   - cargo fmt --all -- --check
-  - cargo check --workspace --all-targets --all-features
   - cargo clippy --workspace --all-targets --all-features -- -D warnings
   - cargo test --workspace
+
+Options:
+  --skip-clippy  Skip clippy when an earlier CI step already ran the same command.
 USAGE
 }
+
+skip_clippy=false
 
 case "${1:-}" in
   -h|--help)
     usage
     exit 0
+    ;;
+  --skip-clippy)
+    skip_clippy=true
     ;;
   "")
     ;;
@@ -41,8 +48,11 @@ run() {
 }
 
 run cargo fmt --all -- --check
-run cargo check --workspace --all-targets --all-features
-run cargo clippy --workspace --all-targets --all-features -- -D warnings
+if [[ "$skip_clippy" == false ]]; then
+  run cargo clippy --workspace --all-targets --all-features -- -D warnings
+else
+  echo "+ skip cargo clippy --workspace --all-targets --all-features -- -D warnings"
+fi
 run cargo test --workspace
 
 echo "rust-fast-gate-ok"

@@ -7,6 +7,8 @@ const deletedFiles = danger.git.deleted_files;
 const changedFiles = [...modifiedFiles, ...createdFiles, ...deletedFiles];
 const body = pr.body || "";
 const title = pr.title || "";
+const bodyWithoutComments = body.replace(/<!--[\s\S]*?-->/g, "");
+const normalizedBody = bodyWithoutComments.toLowerCase();
 
 const hasMeaningfulBody = body
   .replace(/<!--[\s\S]*?-->/g, "")
@@ -55,7 +57,30 @@ if (touchesProdDeploy) {
 }
 
 if (touchesMigrations) {
-  warn("Migration changes should include up/down compatibility notes and a representative SQLx/storage check.");
+  const hasCompatibilityNotes =
+    /\b(up|forward|apply|backfill)\b[\s\S]{0,240}\b(down|rollback|revert|no-op|irreversible|not recoverable)\b/i.test(
+      bodyWithoutComments
+    ) ||
+    /\b(down|rollback|revert|no-op|irreversible|not recoverable)\b[\s\S]{0,240}\b(up|forward|apply|backfill)\b/i.test(
+      bodyWithoutComments
+    ) ||
+    /\bcompatib(?:le|ility)\b/i.test(bodyWithoutComments);
+
+  const hasStorageVerification =
+    /\b(sqlx|storage|migration)\b[\s\S]{0,240}\b(cargo test|checked|verified|smoke|psql|database|db)\b/i.test(
+      bodyWithoutComments
+    ) ||
+    /\b(cargo test|checked|verified|smoke|psql|database|db)\b[\s\S]{0,240}\b(sqlx|storage|migration)\b/i.test(
+      bodyWithoutComments
+    );
+
+  if (!hasCompatibilityNotes) {
+    warn("Migration changes should explain forward/down compatibility, rollback/no-op behavior, or why rollback is impossible.");
+  }
+
+  if (!hasStorageVerification && !normalizedBody.includes("storage check not needed")) {
+    warn("Migration changes should mention a representative SQLx/storage/database check or explicitly justify why it is not needed.");
+  }
 }
 
 if (touchesPrompts) {

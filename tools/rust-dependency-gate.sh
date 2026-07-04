@@ -4,13 +4,16 @@ set -euo pipefail
 usage() {
   cat <<'USAGE'
 Usage:
-  tools/rust-dependency-gate.sh
+  tools/rust-dependency-gate.sh [--skip-deny]
 
 Runs the dependency, advisory, license, and supply-chain gate:
   - cargo deny check
   - cargo audit, with a documented sqlx optional-MySQL false-positive ignore
   - cargo machete
   - cargo vet --locked, only when supply-chain/ exists
+
+Options:
+  --skip-deny  Skip cargo deny when an earlier CI step already ran it.
 
 Required cargo subcommands:
   cargo install cargo-deny --locked --version 0.19.7
@@ -22,10 +25,15 @@ Optional when supply-chain/ exists:
 USAGE
 }
 
+skip_deny=false
+
 case "${1:-}" in
   -h|--help)
     usage
     exit 0
+    ;;
+  --skip-deny)
+    skip_deny=true
     ;;
   "")
     ;;
@@ -59,11 +67,15 @@ run() {
   "$@"
 }
 
-require_cargo_subcommand deny "cargo install cargo-deny --locked --version 0.19.7"
 require_cargo_subcommand audit "cargo install cargo-audit --locked --version 0.22.1"
 require_cargo_subcommand machete "cargo install cargo-machete --locked --version 0.9.2"
 
-run cargo deny check
+if [[ "$skip_deny" == false ]]; then
+  require_cargo_subcommand deny "cargo install cargo-deny --locked --version 0.19.7"
+  run cargo deny check
+else
+  echo "+ skip cargo deny check"
+fi
 # cargo audit scans every package recorded in Cargo.lock, including sqlx's
 # optional MySQL support. The workspace enables only Postgres sqlx features;
 # cargo deny checks that selected feature graph above.

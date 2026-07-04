@@ -24,16 +24,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@v4
+        uses: github/codeql-action/init@fb84f6228fd846d3c392887f22b18ce2d9139495 # v4
         with:
           languages: rust
           build-mode: none
 
       - name: Analyze
-        uses: github/codeql-action/analyze@v4
+        uses: github/codeql-action/analyze@fb84f6228fd846d3c392887f22b18ce2d9139495 # v4
         with:
           category: "/language:rust"
           upload: never
@@ -51,10 +51,10 @@ jobs:
       security-events: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
       - name: Cache Semgrep pip packages
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/.cache/pip
           key: semgrep-pip-${{ runner.os }}-${{ env.SEMGREP_VERSION }}
@@ -101,7 +101,7 @@ jobs:
             -level=warning || echo "reviewdog semgrep report failed" >&2
 
       - name: Upload Semgrep SARIF artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: semgrep-sarif
           path: semgrep.sarif
@@ -109,7 +109,7 @@ jobs:
 
       - name: Upload Semgrep SARIF to code scanning
         if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-        uses: github/codeql-action/upload-sarif@v4
+        uses: github/codeql-action/upload-sarif@fb84f6228fd846d3c392887f22b18ce2d9139495 # v4
         with:
           sarif_file: semgrep.sarif
           category: semgrep
