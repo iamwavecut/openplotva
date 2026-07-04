@@ -72,7 +72,7 @@ jobs:
           test -n "$pr_url"
           echo "pr_url=$pr_url" >> "$GITHUB_OUTPUT"
 
-      - name: Run PR-Agent
+      - name: Run PR-Agent review and improve
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           OPENAI__KEY: ${{ secrets.PR_AGENT_OPENAI_KEY }}
@@ -127,7 +127,11 @@ jobs:
               get_settings().set("CONFIG.CLI_MODE", True)
               get_settings().set("CONFIG.CONFIG_BRANCH", os.environ.get("PR_AGENT_CONFIG_BRANCH") or None)
               get_settings().set("CONFIG.EXTRA_CONFIG_URL", os.environ.get("PR_AGENT_EXTRA_CONFIG_URL"))
-              await PRAgent().handle_request(os.environ["PR_URL"], ["review"])
+              agent = PRAgent()
+              for command in ("review", "improve"):
+                  ok = await agent.handle_request(os.environ["PR_URL"], command)
+                  if not ok:
+                      raise RuntimeError(f"PR-Agent command failed: {command}")
               await asyncio.wait_for(GLOBAL_LOGGING_WORKER.flush(), timeout=15)
               await GLOBAL_LOGGING_WORKER.stop()
 

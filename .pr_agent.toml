@@ -10,3 +10,13 @@ Focus on correctness, security boundaries, async/concurrency hazards, external c
 migrations, and production/runtime risks. Do not comment on formatting, style-only lint,
 dependency advisories, or SAST findings already handled by reviewdog and CI.
 """
+
+[pr_code_suggestions]
+commitable_code_suggestions = true
+focus_only_on_problems = true
+num_code_suggestions_per_chunk = 3
+extra_instructions = """
+Suggest only actionable fixes for correctness, security boundaries, async/concurrency hazards,
+external contracts, migrations, and production/runtime risks. Avoid formatting, style-only,
+dependency advisory, or SAST suggestions already handled by reviewdog and CI.
+"""
