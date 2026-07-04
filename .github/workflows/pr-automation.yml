@@ -105,7 +105,7 @@ jobs:
             -e "config.custom_model_max_tokens=$PR_AGENT_CUSTOM_MODEL_MAX_TOKENS" \
             -e "config.max_model_tokens=$PR_AGENT_MAX_MODEL_TOKENS" \
             -e "litellm.drop_params=true" \
-            -e "github_action_config.enable_output=true" \
+            -e "github_action_config.enable_output=false" \
             -e "github.publish_as_check_run=true" \
             -e "pr_reviewer.require_tests_review=false" \
             -e "pr_reviewer.extra_instructions=$PR_AGENT_REVIEW_EXTRA_INSTRUCTIONS" \
@@ -116,7 +116,7 @@ jobs:
           if (( status != 0 )); then
             exit "$status"
           fi
-          if grep -E "Traceback|ValueError|Exception|Failed to get git provider|GitHub token is required|Failed to review PR|Failed to generate prediction|Error during LLM inference|BadRequestError|Unknown Model" "$log_file" >/dev/null; then
+          if grep -E "ERROR|RuntimeWarning|Traceback|ValueError|Exception|Failed to get git provider|GitHub token is required|Failed to review PR|Failed to generate prediction|Error during LLM inference|BadRequestError|Unknown Model" "$log_file" >/dev/null; then
             echo "PR-Agent reported an inference/review failure while exiting successfully." >&2
             exit 1
           fi
