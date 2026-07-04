@@ -93,6 +93,7 @@ jobs:
           log_file="$(mktemp)"
           set +e
           docker run --rm \
+            -i \
             --entrypoint python \
             -e GITHUB_TOKEN \
             -e "GITHUB.USER_TOKEN=$GITHUB_TOKEN" \
@@ -100,6 +101,7 @@ jobs:
             -e OPENAI__KEY \
             -e OPENAI_KEY \
             -e OPENAI__API_BASE \
+            -e PR_URL \
             -e "config.model=$PR_AGENT_MODEL" \
             -e "config.fallback_models=$PR_AGENT_FALLBACK_MODELS" \
             -e "config.custom_model_max_tokens=$PR_AGENT_CUSTOM_MODEL_MAX_TOKENS" \
@@ -110,7 +112,28 @@ jobs:
             -e "pr_reviewer.require_tests_review=false" \
             -e "pr_reviewer.extra_instructions=$PR_AGENT_REVIEW_EXTRA_INSTRUCTIONS" \
             pragent/pr-agent@sha256:ea2ea90f072fd97708755e59827a317272f66097a1ef349eca23d39160bb0baf \
-            -m pr_agent.cli --pr_url="$PR_URL" review 2>&1 | tee "$log_file"
+            - 2>&1 <<'PY' | tee "$log_file"
+          import asyncio
+          import os
+
+          from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
+          from pr_agent.agent.pr_agent import PRAgent
+          from pr_agent.config_loader import get_settings
+          from pr_agent.log import setup_logger
+
+
+          async def main():
+              setup_logger(os.environ.get("LOG_LEVEL", "INFO"))
+              get_settings().set("CONFIG.CLI_MODE", True)
+              get_settings().set("CONFIG.CONFIG_BRANCH", os.environ.get("PR_AGENT_CONFIG_BRANCH") or None)
+              get_settings().set("CONFIG.EXTRA_CONFIG_URL", os.environ.get("PR_AGENT_EXTRA_CONFIG_URL"))
+              await PRAgent().handle_request(os.environ["PR_URL"], ["review"])
+              await asyncio.wait_for(GLOBAL_LOGGING_WORKER.flush(), timeout=15)
+              await GLOBAL_LOGGING_WORKER.stop()
+
+
+          asyncio.run(main())
+          PY
           status="${PIPESTATUS[0]}"
           set -e
           if (( status != 0 )); then
