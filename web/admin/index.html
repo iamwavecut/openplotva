@@ -970,109 +970,88 @@
                         </div>
                     </div>
 
-                    <!-- Analytics Tab -->
+                    <!-- Analytics: External Requests dashboard -->
                     <div id="analytics" class="tab-pane">
-                        <div class="card">
-                            <div class="card-header">
-                                <span>LLM Analytics</span>
-                                <div class="d-flex gap-2 align-center">
-                                    <pl-select id="llm-analytics-range" class="w-range">
-                                        <option value="1h">1h</option>
-                                        <option value="6h">6h</option>
-                                        <option value="24h" selected>24h</option>
-                                        <option value="7d">7d</option>
-                                        <option value="30d">30d</option>
-                                    </pl-select>
-                                    <pl-button variant="outline" size="sm" data-action="loadLLMAnalytics"
-                                        data-search-btn>Refresh</pl-button>
-                                </div>
+                        <div class="an-topbar">
+                            <div>
+                                <span class="an-title">External Requests</span>
+                                <span id="an-updated" class="an-updated"></span>
                             </div>
+                            <div class="an-controls">
+                                <pl-select id="an-range" class="w-range" aria-label="Time range">
+                                    <option value="1h">1h</option>
+                                    <option value="6h">6h</option>
+                                    <option value="24h" selected>24h</option>
+                                    <option value="3d">3d</option>
+                                    <option value="7d">7d</option>
+                                    <option value="14d">14d</option>
+                                </pl-select>
+                                <pl-button variant="outline" size="sm" data-action="loadAnalytics" data-args='[true]'>Refresh</pl-button>
+                            </div>
+                        </div>
+
+                        <div id="an-health" class="an-health"></div>
+
+                        <h3 class="an-section-title">LLM &amp; providers</h3>
+                        <div class="an-grid">
+                            <div class="card an-card">
+                                <div class="card-header">Requests &amp; error rate</div>
+                                <div class="card-body"><div class="chart-box"><canvas id="an-llm-series"></canvas></div></div>
+                            </div>
+                            <div class="card an-card">
+                                <div class="card-header">Token economy</div>
+                                <div class="card-body"><div class="chart-box"><canvas id="an-llm-tokens"></canvas></div></div>
+                            </div>
+                        </div>
+                        <div class="an-grid">
+                            <div class="card an-card">
+                                <div class="card-header">Latency · TTFT / decode / e2e (p95)</div>
+                                <div class="card-body"><div class="chart-box"><canvas id="an-llm-latency"></canvas></div></div>
+                            </div>
+                            <div class="card an-card">
+                                <div class="card-header">Throughput (tokens/s)</div>
+                                <div class="card-body"><div class="chart-box"><canvas id="an-llm-tps"></canvas></div></div>
+                            </div>
+                        </div>
+                        <div class="an-grid">
+                            <div class="card an-card an-card--wide">
+                                <div class="card-header">Model leaderboard</div>
+                                <div class="card-body"><pl-table id="an-models" dense></pl-table></div>
+                            </div>
+                        </div>
+                        <div class="an-grid">
+                            <div class="card an-card">
+                                <div class="card-header">Providers</div>
+                                <div class="card-body"><pl-table id="an-providers" dense></pl-table></div>
+                            </div>
+                            <div class="card an-card">
+                                <div class="card-header">Flow mix</div>
+                                <div class="card-body"><div class="chart-box"><canvas id="an-flows"></canvas></div></div>
+                            </div>
+                        </div>
+                        <div class="an-grid">
+                            <div class="card an-card an-card--wide">
+                                <div class="card-header">Request shape</div>
+                                <div class="card-body"><pl-table id="an-shape" dense></pl-table></div>
+                            </div>
+                        </div>
+
+                        <h3 class="an-section-title">Shield · jobs · routing</h3>
+                        <div class="an-grid">
+                            <div class="card an-card">
+                                <div class="card-header">Shield / moderation</div>
+                                <div class="card-body"><div class="chart-box"><canvas id="an-shield"></canvas></div></div>
+                            </div>
+                            <div class="card an-card">
+                                <div class="card-header">Job pipeline</div>
+                                <div class="card-body"><pl-table id="an-jobs" dense></pl-table></div>
+                            </div>
+                        </div>
+                        <div class="card an-card">
+                            <div class="card-header">Routing incidents</div>
                             <div class="card-body">
-                                <div class="grid-2">
-                                    <div class="card card-sunken">
-                                        <div class="card-header">Load</div>
-                                        <div class="card-body">
-                                            <div class="chart-box">
-                                                <canvas id="llm-series-chart"></canvas>
-                                            </div>
-                                        </div>
-                                    </div>
-                                    <div class="card card-sunken">
-                                        <div class="card-header">Top Chats</div>
-                                        <div class="card-body">
-                                            <div class="chart-box">
-                                                <canvas id="llm-topchats-chart"></canvas>
-                                            </div>
-                                        </div>
-                                    </div>
-                                </div>
-
-                                <div class="grid-2">
-                                    <div class="card card-sunken">
-                                        <div class="card-header">Summary</div>
-                                        <div class="card-body">
-                                            <div id="llm-analytics-summary"
-                                                class="mono text-muted analytics-pre">—</div>
-                                        </div>
-                                    </div>
-                                    <div class="card card-sunken">
-                                        <div class="card-header">Hourly Models</div>
-                                        <div class="card-body">
-                                            <div class="chart-box">
-                                                <canvas id="llm-models-chart"></canvas>
-                                            </div>
-                                        </div>
-                                    </div>
-                                </div>
-
-                                <div class="grid-2">
-                                    <div class="card card-sunken">
-                                        <div class="card-header">LLM Providers</div>
-                                        <div class="card-body">
-                                            <pl-table id="llm-providers-table" dense></pl-table>
-                                        </div>
-                                    </div>
-                                    <div class="card card-sunken">
-                                        <div class="card-header">Model Performance</div>
-                                        <div class="card-body">
-                                            <pl-table id="llm-models-table" dense></pl-table>
-                                        </div>
-                                    </div>
-                                </div>
-
-                                <div class="card card-sunken">
-                                    <div class="card-header">Inference Params</div>
-                                    <div class="card-body">
-                                        <pl-table id="llm-inference-table" dense></pl-table>
-                                    </div>
-                                </div>
-
-                                <div class="card card-sunken">
-                                    <div class="card-header">Tool Calling Parser</div>
-                                    <div class="card-body">
-                                        <div id="tool-call-parser-summary"
-                                            class="mono text-muted mb-3 analytics-pre">—</div>
-                                        <pl-table id="tool-call-parser-table" dense></pl-table>
-                                    </div>
-                                </div>
-
-                                <div class="grid-2">
-                                    <div class="card card-sunken">
-                                        <div class="card-header">Image / Music Jobs</div>
-                                        <div class="card-body">
-                                            <pl-table id="runtime-jobs-table" dense></pl-table>
-                                            <div id="runtime-jobs-error" class="text-danger mt-2"></div>
-                                        </div>
-                                    </div>
-                                    <div class="card card-sunken">
-                                        <div class="card-header">Live AI Farm</div>
-                                        <div class="card-body">
-                                            <div id="llm-aifarm-capacity"
-                                                class="mono text-muted analytics-pre">—</div>
-                                        </div>
-                                    </div>
-                                </div>
-
+                                <div id="an-routing-summary" class="an-chips"></div>
+                                <pl-table id="an-routing" dense></pl-table>
                             </div>
                         </div>
                     </div>
@@ -1203,7 +1182,7 @@
                 loadSafetyChecks(false);
             }
             if (tabId === 'analytics') {
-                loadLLMAnalytics();
+                loadAnalytics(false);
             }
             if (tabId === 'taskman' && typeof loadTaskmanJobs === 'function') {
                 loadTaskmanJobs(false);
@@ -5495,31 +5474,21 @@
         }
 
         // --- Analytics ---
-        let llmSeriesChart = null;
-        let llmTopChatsChart = null;
-        let llmModelsChart = null;
+        // --- Analytics: External Requests dashboard ---
+        // Token-driven Chart.js factory. Every color resolves from tokens.css at
+        // runtime, so the palette is themeable and holds no color literals in JS.
+        const anCharts = {};
+        let anState = { loaded: false, wired: false };
 
         function destroyChart(chart) {
+            // Shared with the dashboard sparklines; keep the name stable.
             if (!chart) return null;
-            try {
-                chart.destroy();
-            } catch (_) { }
+            try { chart.destroy(); } catch (_) { }
             return null;
         }
 
         function formatChartLabel(ts) {
-            try {
-                return new Date(ts).toLocaleString();
-            } catch (_) {
-                return ts;
-            }
-        }
-
-        function buildTopChatLabel(row) {
-            if (!row) return 'chat';
-            if (row.title) return row.title;
-            if (row.username) return '@' + row.username;
-            return 'chat ' + row.chat_id;
+            try { return new Date(ts).toLocaleString(); } catch (_) { return ts; }
         }
 
         function formatAnalyticsCount(value) {
@@ -5531,7 +5500,7 @@
             if (!ms) return '—';
             if (ms >= 60000) return `${(ms / 60000).toFixed(1)}m`;
             if (ms >= 1000) return `${(ms / 1000).toFixed(1)}s`;
-            return `${ms}ms`;
+            return `${Math.round(ms)}ms`;
         }
 
         function formatAnalyticsTPS(value) {
@@ -5540,268 +5509,358 @@
             return `${tps.toFixed(tps >= 100 ? 0 : 1)}/s`;
         }
 
-        function formatAnalyticsMaybe(value, formatter) {
-            if (value === null || value === undefined || value === '') return '—';
-            return formatter ? formatter(value) : String(value);
+        function formatTokensShort(value) {
+            const n = Number(value || 0);
+            if (n >= 1e9) return (n / 1e9).toFixed(1) + 'B';
+            if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+            if (n >= 1e3) return (n / 1e3).toFixed(1) + 'k';
+            return String(Math.round(n));
         }
 
-        // Drive a <pl-table> from column descriptors + row objects (replaces the old string-built table builder).
-        function renderAnalyticsTable(tableID, columns, rows, emptyTitle) {
-            const table = document.getElementById(tableID);
+        function anToken(name) {
+            return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+        }
+        function anColor(name) { return anToken(name) || anToken('--p-slate-500'); }
+        function anPalette(n) {
+            const out = [];
+            for (let i = 0; i < n; i++) out.push(anToken('--c-cat-' + (i % 64)) || anColor('--c-accent'));
+            return out;
+        }
+        // Translucent fill from a hex token — avoids hardcoding rgba in JS.
+        function anAlpha(color, a) {
+            const v = String(color || '').trim();
+            if (v.startsWith('#') && (v.length === 7 || v.length === 4)) {
+                const h = v.length === 4 ? '#' + [...v.slice(1)].map(c => c + c).join('') : v;
+                const r = parseInt(h.slice(1, 3), 16), g = parseInt(h.slice(3, 5), 16), b = parseInt(h.slice(5, 7), 16);
+                return `rgba(${r},${g},${b},${a})`;
+            }
+            return v;
+        }
+        function anFlowColor(flow) {
+            const f = String(flow || '').toLowerCase();
+            let key = 'other';
+            if (f.includes('dialog')) key = 'dialog';
+            else if (f.includes('memory')) key = 'memory';
+            else if (f.includes('image')) key = 'image';
+            else if (f.includes('song') || f.includes('music')) key = 'song';
+            else if (f.includes('vision')) key = 'vision';
+            else if (f.includes('shield')) key = 'shield';
+            else if (f.includes('console')) key = 'console';
+            return anColor('--c-flow-' + key);
+        }
+
+        function anBuildChart(canvasId, config) {
+            const el = document.getElementById(canvasId);
+            if (!el || typeof Chart === 'undefined') return;
+            anCharts[canvasId] = destroyChart(anCharts[canvasId]);
+            anCharts[canvasId] = new Chart(el.getContext('2d'), config);
+        }
+        function anDestroyAll() {
+            for (const k of Object.keys(anCharts)) anCharts[k] = destroyChart(anCharts[k]);
+        }
+        function anMerge(a, b) {
+            const out = Array.isArray(a) ? a.slice() : Object.assign({}, a);
+            for (const k of Object.keys(b || {})) {
+                if (b[k] && typeof b[k] === 'object' && !Array.isArray(b[k]) && typeof out[k] === 'object') {
+                    out[k] = anMerge(out[k], b[k]);
+                } else out[k] = b[k];
+            }
+            return out;
+        }
+        function anAxis() { return { color: anColor('--c-text-muted'), font: { size: 11 } }; }
+        function anOptions(overrides) {
+            const grid = anAlpha(anColor('--c-border'), 0.55);
+            const base = {
+                responsive: true, maintainAspectRatio: false,
+                interaction: { mode: 'index', intersect: false },
+                plugins: {
+                    legend: { position: 'bottom', labels: { boxWidth: 10, boxHeight: 10, color: anColor('--c-text-muted'), font: { size: 11 } } },
+                },
+                scales: {
+                    x: { grid: { display: false }, ticks: anMerge(anAxis(), { maxRotation: 0, autoSkip: true, maxTicksLimit: 8 }) },
+                    y: { beginAtZero: true, grid: { color: grid }, ticks: anAxis() },
+                },
+            };
+            return anMerge(base, overrides || {});
+        }
+        function anTable(id, columns, rows, emptyTitle) {
+            const table = document.getElementById(id);
             if (!table) return;
             table.columns = columns;
-            table.emptyTitle = emptyTitle || 'No data';
+            table.emptyTitle = emptyTitle || 'No data in this window';
             table.rows = Array.isArray(rows) ? rows : [];
         }
+        const AN_TABLE_IDS = ['an-models', 'an-providers', 'an-shape', 'an-jobs', 'an-routing'];
+        const AN_CANVAS_IDS = ['an-llm-series', 'an-llm-tokens', 'an-llm-latency', 'an-llm-tps', 'an-flows', 'an-shield'];
 
-        function renderLLMProviderAnalytics(providers) {
-            renderAnalyticsTable('llm-providers-table', [
-                { key: 'provider', label: 'Provider', render: (r) => r.provider || 'unknown' },
-                { key: 'source', label: 'Source', mono: true, render: (r) => r.source || 'unknown' },
-                { key: 'request_count', label: 'Req', num: true, render: (r) => formatAnalyticsCount(r.request_count) },
-                { key: 'error_count', label: 'Err', num: true, render: (r) => formatAnalyticsCount(r.error_count) },
-                { key: 'avg_duration_ms', label: 'Avg', num: true, render: (r) => formatAnalyticsMs(r.avg_duration_ms) },
-                { key: 'p95_duration_ms', label: 'P95', num: true, render: (r) => formatAnalyticsMs(r.p95_duration_ms) },
-                { key: 'total_tokens', label: 'Tokens', num: true, render: (r) => formatAnalyticsCount(r.total_tokens) },
-                { key: 'tps', label: 'TPS', num: true, render: (r) => formatAnalyticsTPS(r.avg_generation_tps || r.avg_effective_output_tps) },
-            ], providers || [], 'No provider requests');
+        function anSetLoading() {
+            const health = document.getElementById('an-health');
+            if (health) PL.skeleton(health, { rows: 2 });
+            AN_TABLE_IDS.forEach(id => { const t = document.getElementById(id); if (t) t.state = 'loading'; });
+        }
+        function anShowError(retry) {
+            const health = document.getElementById('an-health');
+            if (health) PL.error(health, { title: 'Failed to load analytics', onRetry: retry });
+            AN_TABLE_IDS.forEach(id => { const t = document.getElementById(id); if (t) t.showError('Load failed'); });
         }
 
-        function renderLLMModelAnalytics(models) {
-            renderAnalyticsTable('llm-models-table', [
-                { key: 'model', label: 'Model', mono: true, render: (r) => r.model || 'unknown' },
-                { key: 'request_count', label: 'Req', num: true, render: (r) => formatAnalyticsCount(r.request_count) },
-                { key: 'error_count', label: 'Err', num: true, render: (r) => formatAnalyticsCount(r.error_count) },
-                { key: 'avg_duration_ms', label: 'Avg', num: true, render: (r) => formatAnalyticsMs(r.avg_duration_ms) },
-                { key: 'p95_duration_ms', label: 'P95', num: true, render: (r) => formatAnalyticsMs(r.p95_duration_ms) },
-                { key: 'input_tokens', label: 'In', num: true, render: (r) => formatAnalyticsCount(r.input_tokens) },
-                { key: 'output_tokens', label: 'Out', num: true, render: (r) => formatAnalyticsCount(r.output_tokens) },
-                { key: 'tps_avg', label: 'TPS avg', num: true, render: (r) => formatAnalyticsTPS(r.avg_generation_tps || r.avg_effective_output_tps) },
-                { key: 'tps_p95', label: 'TPS p95', num: true, render: (r) => formatAnalyticsTPS(r.p95_effective_output_tps) },
-            ], (models || []).slice(0, 20), 'No model requests');
+        async function loadAnalytics(force) {
+            anWireOnce();
+            if (anState.loaded && !force && anState.data) { anRenderAll(anState.data); return; }
+            anSetLoading();
+            const range = document.getElementById('an-range')?.value || '24h';
+            const data = await apiCall(`/analytics/overview?range=${encodeURIComponent(range)}`);
+            if (!data) { anShowError(() => loadAnalytics(true)); return; }
+            anState.loaded = true;
+            anState.data = data;
+            anRenderAll(data);
         }
 
-        function renderLLMInferenceAnalytics(rows) {
-            renderAnalyticsTable('llm-inference-table', [
-                { key: 'provider', label: 'Provider', render: (r) => r.provider || 'unknown' },
-                { key: 'model', label: 'Model', mono: true, render: (r) => r.model || 'unknown' },
-                { key: 'source', label: 'Source', mono: true, render: (r) => r.source || 'unknown' },
-                { key: 'request_count', label: 'Req', num: true, render: (r) => formatAnalyticsCount(r.request_count) },
-                { key: 'error_count', label: 'Err', num: true, render: (r) => formatAnalyticsCount(r.error_count) },
-                { key: 'max_tokens', label: 'Max', num: true, render: (r) => formatAnalyticsMaybe(r.max_tokens, formatAnalyticsCount) },
-                { key: 'temperature', label: 'Temp', num: true, render: (r) => formatAnalyticsMaybe(r.temperature, v => Number(v).toFixed(2)) },
-                { key: 'top_p', label: 'TopP', num: true, render: (r) => formatAnalyticsMaybe(r.top_p, v => Number(v).toFixed(2)) },
-                { key: 'top_k', label: 'TopK', num: true, render: (r) => formatAnalyticsMaybe(r.top_k, v => Number(v).toFixed(0)) },
-                { key: 'tool_mode', label: 'Tools', render: (r) => r.tool_mode || 'default' },
-                { key: 'response_format', label: 'Format', render: (r) => r.response_format || 'text' },
-                { key: 'avg_duration_ms', label: 'Avg', num: true, render: (r) => formatAnalyticsMs(r.avg_duration_ms) },
-                { key: 'tps', label: 'TPS', num: true, render: (r) => formatAnalyticsTPS(r.avg_effective_output_tps) },
-            ], rows || [], 'No inference params');
+        function anWireOnce() {
+            if (anState.wired) return;
+            anState.wired = true;
+            const range = document.getElementById('an-range');
+            if (range) range.addEventListener('pl:change', () => loadAnalytics(true));
         }
 
-        function renderRuntimeJobAnalytics(jobs, error) {
-            renderAnalyticsTable('runtime-jobs-table', [
-                { key: 'job_type', label: 'Type', mono: true, render: (r) => r.job_type || 'unknown' },
-                { key: 'queue_name', label: 'Queue', mono: true, render: (r) => r.queue_name || 'unknown' },
-                { key: 'provider', label: 'Provider', render: (r) => r.provider || 'unknown' },
-                { key: 'created_count', label: 'New', num: true, render: (r) => formatAnalyticsCount(r.created_count) },
-                { key: 'completed_count', label: 'Done', num: true, render: (r) => formatAnalyticsCount(r.completed_count) },
-                { key: 'failed_count', label: 'Fail', num: true, render: (r) => formatAnalyticsCount(r.failed_count) },
-                { key: 'avg_wait_ms', label: 'Wait avg', num: true, render: (r) => formatAnalyticsMs(r.avg_wait_ms) },
-                { key: 'p95_wait_ms', label: 'Wait p95', num: true, render: (r) => formatAnalyticsMs(r.p95_wait_ms) },
-                { key: 'avg_processing_ms', label: 'Run avg', num: true, render: (r) => formatAnalyticsMs(r.avg_processing_ms) },
-                { key: 'p95_processing_ms', label: 'Run p95', num: true, render: (r) => formatAnalyticsMs(r.p95_processing_ms) },
-            ], jobs || [], 'No image or music jobs');
-            const errNode = document.getElementById('runtime-jobs-error');
-            if (errNode) errNode.textContent = error || '';
-        }
-
-        function analyticsCounterValue(rows, key) {
-            const found = (rows || []).find(row => row && row.key === key);
-            return found ? Number(found.count || 0) : 0;
-        }
-
-        function renderAnalyticsCounters(rows, limit) {
-            return (rows || []).slice(0, limit || 6).map(row => {
-                if (!row) return '';
-                return `${row.key || 'unknown'}=${formatAnalyticsCount(row.count)}`;
-            }).filter(Boolean).join(', ') || '—';
-        }
-
-        function renderToolCallParserAnalytics(toolCalls) {
-            const summary = document.getElementById('tool-call-parser-summary');
-            const total = Number(toolCalls?.total || 0);
-            if (summary) {
-                const outcome = toolCalls?.by_outcome || [];
-                const lines = [
-                    `events: ${formatAnalyticsCount(total)}`,
-                    `detected: ${formatAnalyticsCount(analyticsCounterValue(outcome, 'detected'))}`,
-                    `executed: ${formatAnalyticsCount(analyticsCounterValue(outcome, 'executed'))}`,
-                    `ignored: ${formatAnalyticsCount(analyticsCounterValue(outcome, 'ignored'))}`,
-                    `errors: ${formatAnalyticsCount(analyticsCounterValue(outcome, 'error'))}`,
-                    `plain text: ${formatAnalyticsCount(analyticsCounterValue(outcome, 'none'))}`,
-                    `forms: ${renderAnalyticsCounters(toolCalls?.by_form || [], 8)}`,
-                    `tools: ${renderAnalyticsCounters(toolCalls?.by_tool || [], 8)}`,
-                ];
-                summary.textContent = lines.join('\n');
+        function anRenderAll(data) {
+            const updated = document.getElementById('an-updated');
+            if (updated && data.generated_at) {
+                const g = new Date(data.generated_at);
+                updated.textContent = 'updated ' + g.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
             }
-            renderAnalyticsTable('tool-call-parser-table', [
-                { key: 'at', label: 'Time', render: (r) => formatDateValue(r.at) },
-                { key: 'outcome', label: 'Outcome', render: (r) => r.outcome || 'unknown' },
-                { key: 'form', label: 'Form', mono: true, render: (r) => r.form || '—' },
-                { key: 'tool', label: 'Tool', mono: true, render: (r) => r.tool || '—' },
-                { key: 'reason', label: 'Reason', render: (r) => r.reason || '' },
-            ], (toolCalls?.recent || []).slice().reverse(), 'No tool parser events');
+            anRenderHealth(data.health || {});
+            const llm = data.llm || {};
+            anRenderLlmSeries(llm.series || []);
+            anRenderTokens(llm.tokens_series || []);
+            anRenderLatency(llm.latency || []);
+            anRenderTps(llm.tps || []);
+            anRenderModels(llm.models || []);
+            anRenderProviders(llm.providers || []);
+            anRenderFlows(llm.flows || []);
+            anRenderShape(llm.shape || []);
+            anRenderShield(data.shield || {});
+            anRenderJobs(data.jobs || []);
+            anRenderRouting(data.routing || {});
         }
 
-        function renderAIFarmCapacity(capacity) {
-            const container = document.getElementById('llm-aifarm-capacity');
-            if (!container) return;
-            if (!capacity) {
-                container.textContent = 'not configured';
-                return;
-            }
-            const lines = [
-                `service: ${capacity.service || 'unknown'}`,
-                `max jobs: ${capacity.max_concurrent_jobs ?? 0}`,
-                `running: ${capacity.running ?? 0}`,
-                `queued: ${capacity.queued ?? 0}`,
-                `available: ${capacity.available ?? 0}`,
-                `ready: ${capacity.ready === true}`,
-                `locked: ${capacity.locked === true}`,
-                `observed: ${formatDateValue(capacity.observed_at)}`,
-            ];
-            if (capacity.error) lines.push(`error: ${capacity.error}`);
-            container.textContent = lines.join('\n');
+        function anChip(label, value, sub, tone) {
+            const cls = tone ? 'metric-card an-chip an-chip-' + tone : 'metric-card an-chip';
+            return PL.el('div', { class: cls }, [
+                PL.el('div', { class: 'metric-label' }, label),
+                PL.el('div', { class: 'metric-value' }, value),
+                PL.el('div', { class: 'an-chip-sub' }, sub || ''),
+            ]);
+        }
+        function anRenderHealth(h) {
+            const host = document.getElementById('an-health');
+            if (!host) return;
+            const errTone = (h.error_pct || 0) >= 3 ? 'danger' : ((h.error_pct || 0) >= 1 ? 'warn' : null);
+            const routingTone = (h.routing_incidents_open || 0) > 0 ? 'warn' : null;
+            host.replaceChildren(
+                anChip('external calls', formatAnalyticsCount(h.external_calls), 'LLM in window', null),
+                anChip('errors', (h.error_pct || 0).toFixed(1) + '%', 'of all calls', errTone),
+                anChip('p95 latency', formatAnalyticsMs(h.p95_e2e_ms), 'end-to-end', null),
+                anChip('median TTFT', formatAnalyticsMs(h.ttft_p50_ms), 'time to first token', null),
+                anChip('gen speed', formatAnalyticsTPS(h.gen_tps_p50), 'median tokens/s', null),
+                anChip('tokens', formatTokensShort(h.tokens_in) + ' → ' + formatTokensShort(h.tokens_out), 'in → out', null),
+                anChip('cache hits', (h.cache_hit_pct || 0).toFixed(0) + '%', 'of input tokens', null),
+                anChip('shield flags', (h.shield_flag_pct || 0).toFixed(1) + '%', formatAnalyticsCount(h.shield_checks) + ' checks', null),
+                anChip('routing alerts', formatAnalyticsCount(h.routing_incidents_open), 'warn+ in window', routingTone),
+            );
         }
 
-        async function loadLLMAnalytics() {
-            const range = document.getElementById('llm-analytics-range')?.value || '24h';
-            const summary = document.getElementById('llm-analytics-summary');
-            if (summary) summary.textContent = 'Loading...';
-
-            const data = await apiCall(`/analytics/llm/summary?range=${encodeURIComponent(range)}`);
-            if (!data) return;
-
-            const totals = data.totals || {};
-            if (summary) {
-                const lines = [
-                    `range: ${data.range || range}`,
-                    `bucket: ${data.bucket || 'minute'}`,
-                    `since: ${data.since || ''}`,
-                    `total: ${totals.total_count ?? 0}`,
-                    `errors: ${totals.error_count ?? 0}`,
-                    `avg duration: ${totals.avg_duration_ms ?? 0}ms`,
-                    `tokens: in ${formatAnalyticsCount(totals.input_tokens)} / out ${formatAnalyticsCount(totals.output_tokens)} / total ${formatAnalyticsCount(totals.total_tokens)}`,
-                    `effective output TPS: ${formatAnalyticsTPS(totals.avg_effective_output_tps)}`,
-                ];
-                summary.textContent = lines.join('\n');
-            }
-
-            renderLLMProviderAnalytics(data.providers || []);
-            renderLLMModelAnalytics(data.models || []);
-            renderLLMInferenceAnalytics(data.inference_params || []);
-            renderToolCallParserAnalytics(data.tool_calls || null);
-            renderRuntimeJobAnalytics(data.runtime_jobs || [], data.runtime_jobs_error || '');
-            renderAIFarmCapacity(data.aifarm_capacity || null);
-
-            if (typeof Chart === 'undefined') return;
-
-            const series = data.series || [];
-            const labels = series.map(p => formatChartLabel(p.ts));
-            const counts = series.map(p => p.total_count || 0);
-            const errors = series.map(p => p.error_count || 0);
-
-            const seriesCanvas = document.getElementById('llm-series-chart');
-            if (seriesCanvas) {
-                const ctx = seriesCanvas.getContext('2d');
-                if (!llmSeriesChart) {
-                    llmSeriesChart = new Chart(ctx, {
-                        type: 'line',
-                        data: {
-                            labels,
-                            datasets: [
-                                { label: 'requests', data: counts, borderColor: '#6366f1', backgroundColor: 'rgba(99,102,241,0.12)', tension: 0.2, fill: true },
-                                { label: 'errors', data: errors, borderColor: '#ef4444', backgroundColor: 'rgba(239,68,68,0.12)', tension: 0.2, fill: false },
-                            ]
-                        },
-                        options: { responsive: true, maintainAspectRatio: false, scales: { y: { beginAtZero: true } } }
-                    });
-                } else {
-                    llmSeriesChart.data.labels = labels;
-                    llmSeriesChart.data.datasets[0].data = counts;
-                    llmSeriesChart.data.datasets[1].data = errors;
-                    llmSeriesChart.update();
-                }
-            }
-
-            const topChats = data.top_chats || [];
-            const topLabels = topChats.map(buildTopChatLabel);
-            const topCounts = topChats.map(r => r.request_count || 0);
-
-            const topCanvas = document.getElementById('llm-topchats-chart');
-            if (topCanvas) {
-                const ctx = topCanvas.getContext('2d');
-                if (!llmTopChatsChart) {
-                    llmTopChatsChart = new Chart(ctx, {
-                        type: 'bar',
-                        data: { labels: topLabels, datasets: [{ label: 'requests', data: topCounts, backgroundColor: 'rgba(16,185,129,0.35)', borderColor: '#10b981' }] },
-                        options: { responsive: true, maintainAspectRatio: false, scales: { y: { beginAtZero: true } } }
-                    });
-                } else {
-                    llmTopChatsChart.data.labels = topLabels;
-                    llmTopChatsChart.data.datasets[0].data = topCounts;
-                    llmTopChatsChart.update();
-                }
-            }
-
-            const modelSeries = data.model_series || [];
-            const modelLabels = Array.from(new Set(modelSeries.map(p => formatChartLabel(p.ts))));
-            const topModelNames = (data.models || []).slice(0, 8).map(m => m.model || 'unknown');
-            const palette = [
-                ['rgba(99,102,241,0.55)', '#6366f1'],
-                ['rgba(16,185,129,0.55)', '#10b981'],
-                ['rgba(245,158,11,0.55)', '#f59e0b'],
-                ['rgba(14,165,233,0.55)', '#0ea5e9'],
-                ['rgba(239,68,68,0.45)', '#ef4444'],
-                ['rgba(168,85,247,0.45)', '#a855f7'],
-                ['rgba(20,184,166,0.45)', '#14b8a6'],
-                ['rgba(100,116,139,0.45)', '#64748b'],
-            ];
-            const bucketKey = p => formatChartLabel(p.ts);
-            const modelDatasets = topModelNames.map((modelName, index) => {
-                const byBucket = new Map(modelSeries.filter(p => (p.model || 'unknown') === modelName).map(p => [bucketKey(p), p.request_count || 0]));
-                const colors = palette[index % palette.length];
-                return {
-                    label: modelName,
-                    data: modelLabels.map(label => byBucket.get(label) || 0),
-                    backgroundColor: colors[0],
-                    borderColor: colors[1],
-                    borderWidth: 1,
-                    stack: 'models',
-                };
+        function anRenderLlmSeries(series) {
+            const buckets = [...new Set(series.map(p => p.ts))].sort();
+            const labels = buckets.map(formatChartLabel);
+            const providers = [...new Set(series.map(p => p.provider))];
+            const pal = anPalette(providers.length);
+            const idx = new Map(buckets.map((b, i) => [b, i]));
+            const datasets = providers.map((prov, i) => {
+                const arr = new Array(buckets.length).fill(0);
+                series.filter(p => p.provider === prov).forEach(p => { arr[idx.get(p.ts)] = p.request_count; });
+                return { label: prov, data: arr, backgroundColor: anAlpha(pal[i], 0.78), borderColor: pal[i], borderWidth: 0, stack: 'req', yAxisID: 'y' };
             });
+            const totals = new Array(buckets.length).fill(0), errs = new Array(buckets.length).fill(0);
+            series.forEach(p => { const i = idx.get(p.ts); totals[i] += p.request_count; errs[i] += p.error_count; });
+            const errPct = totals.map((t, i) => t ? +(errs[i] / t * 100).toFixed(2) : 0);
+            datasets.push({ type: 'line', label: 'error %', data: errPct, borderColor: anColor('--c-danger'), backgroundColor: anColor('--c-danger'), borderWidth: 2, pointRadius: 0, tension: 0.3, yAxisID: 'y1' });
+            anBuildChart('an-llm-series', {
+                type: 'bar', data: { labels, datasets },
+                options: anOptions({
+                    scales: {
+                        x: { stacked: true }, y: { stacked: true },
+                        y1: { position: 'right', beginAtZero: true, grid: { display: false }, ticks: anMerge(anAxis(), { callback: v => v + '%' }) },
+                    },
+                }),
+            });
+        }
 
-            const modelsCanvas = document.getElementById('llm-models-chart');
-            if (modelsCanvas) {
-                const ctx = modelsCanvas.getContext('2d');
-                if (!llmModelsChart) {
-                    llmModelsChart = new Chart(ctx, {
-                        type: 'bar',
-                        data: { labels: modelLabels, datasets: modelDatasets },
-                        options: {
-                            responsive: true,
-                            maintainAspectRatio: false,
-                            scales: { x: { stacked: true }, y: { stacked: true, beginAtZero: true } },
-                            plugins: { tooltip: { mode: 'index', intersect: false } }
-                        }
-                    });
-                } else {
-                    llmModelsChart.data.labels = modelLabels;
-                    llmModelsChart.data.datasets = modelDatasets;
-                    llmModelsChart.update();
-                }
+        function anRenderTokens(rows) {
+            const labels = rows.map(p => formatChartLabel(p.ts));
+            const lanes = [
+                { key: 'input', label: 'input', color: anColor('--c-flow-dialog') },
+                { key: 'cached', label: 'cached', color: anColor('--c-flow-memory') },
+                { key: 'output', label: 'output', color: anColor('--c-success') },
+                { key: 'thoughts', label: 'thoughts', color: anColor('--c-flow-vision') },
+            ];
+            const datasets = lanes.map(l => ({
+                label: l.label, data: rows.map(p => p[l.key] || 0),
+                backgroundColor: anAlpha(l.color, 0.8), borderColor: l.color, borderWidth: 0, stack: 'tok',
+            }));
+            anBuildChart('an-llm-tokens', {
+                type: 'bar', data: { labels, datasets },
+                options: anOptions({
+                    scales: { x: { stacked: true }, y: { stacked: true, ticks: anMerge(anAxis(), { callback: v => formatTokensShort(v) }) } },
+                    plugins: { tooltip: { callbacks: { label: c => c.dataset.label + ': ' + formatTokensShort(c.parsed.y) } } },
+                }),
+            });
+        }
+
+        function anRenderLatency(rows) {
+            const top = rows.slice(0, 8);
+            const labels = top.map(r => r.provider);
+            const lanes = [
+                { key: 'ttft_p95', label: 'TTFT p95', color: anColor('--c-flow-image') },
+                { key: 'decode_p95', label: 'decode p95', color: anColor('--c-info') },
+                { key: 'e2e_p95', label: 'e2e p95', color: anColor('--c-accent') },
+            ];
+            const datasets = lanes.map(l => ({
+                label: l.label, data: top.map(r => r[l.key] || 0),
+                backgroundColor: anAlpha(l.color, 0.82), borderColor: l.color, borderWidth: 0,
+            }));
+            anBuildChart('an-llm-latency', {
+                type: 'bar', data: { labels, datasets },
+                options: anOptions({
+                    scales: { y: { ticks: anMerge(anAxis(), { callback: v => formatAnalyticsMs(v) }) } },
+                    plugins: { tooltip: { callbacks: { label: c => c.dataset.label + ': ' + formatAnalyticsMs(c.parsed.y) } } },
+                }),
+            });
+        }
+
+        function anRenderTps(rows) {
+            const top = rows.slice(0, 8);
+            const labels = top.map(r => r.model);
+            const c1 = anColor('--c-flow-dialog'), c2 = anColor('--c-flow-song');
+            anBuildChart('an-llm-tps', {
+                type: 'bar',
+                data: {
+                    labels, datasets: [
+                        { label: 'server TPS', data: top.map(r => +(r.gen_tps || 0).toFixed(1)), backgroundColor: anAlpha(c1, 0.82), borderColor: c1, borderWidth: 0 },
+                        { label: 'effective TPS', data: top.map(r => +(r.effective_tps || 0).toFixed(1)), backgroundColor: anAlpha(c2, 0.82), borderColor: c2, borderWidth: 0 },
+                    ],
+                },
+                options: anOptions({ scales: { y: { ticks: anMerge(anAxis(), { callback: v => v + '/s' }) } } }),
+            });
+        }
+
+        function anRenderFlows(rows) {
+            const labels = rows.map(r => r.flow);
+            anBuildChart('an-flows', {
+                type: 'doughnut',
+                data: { labels, datasets: [{ data: rows.map(r => r.request_count), backgroundColor: rows.map(r => anAlpha(anFlowColor(r.flow), 0.85)), borderColor: anColor('--c-bg-card'), borderWidth: 2 }] },
+                options: anMerge(anOptions({}), {
+                    cutout: '58%', scales: { x: { display: false }, y: { display: false } },
+                    plugins: { legend: { position: 'right' }, tooltip: { callbacks: { label: c => c.label + ': ' + formatAnalyticsCount(c.parsed) } } },
+                }),
+            });
+        }
+
+        function anRenderModels(models) {
+            anTable('an-models', [
+                { key: 'model', label: 'Model', mono: true, render: r => r.model || 'unknown' },
+                { key: 'provider', label: 'Provider', mono: true, render: r => r.provider || '—' },
+                { key: 'request_count', label: 'Req', num: true, render: r => formatAnalyticsCount(r.request_count) },
+                { key: 'err', label: 'Err%', num: true, render: r => r.request_count ? (r.error_count / r.request_count * 100).toFixed(1) + '%' : '—' },
+                { key: 'ttft_p50', label: 'TTFT p50', num: true, render: r => formatAnalyticsMs(r.ttft_p50) },
+                { key: 'ttft_p95', label: 'TTFT p95', num: true, render: r => formatAnalyticsMs(r.ttft_p95) },
+                { key: 'gen_tps', label: 'TPS', num: true, render: r => formatAnalyticsTPS(r.gen_tps) },
+                { key: 'tokens_in', label: 'Tok in', num: true, render: r => formatTokensShort(r.tokens_in) },
+                { key: 'tokens_out', label: 'Tok out', num: true, render: r => formatTokensShort(r.tokens_out) },
+                { key: 'cache', label: 'Cache', num: true, render: r => (r.cache_hit_pct || 0).toFixed(0) + '%' },
+                { key: 'iters', label: 'Iters', num: true, render: r => (r.avg_iterations || 0).toFixed(1) },
+            ], models, 'No model calls in this window');
+        }
+
+        function anRenderProviders(providers) {
+            anTable('an-providers', [
+                { key: 'provider', label: 'Provider', mono: true, render: r => r.provider || 'unknown' },
+                { key: 'request_count', label: 'Req', num: true, render: r => formatAnalyticsCount(r.request_count) },
+                { key: 'share', label: 'Share', num: true, render: r => (r.request_share || 0).toFixed(1) + '%' },
+                { key: 'err', label: 'Err%', num: true, render: r => r.request_count ? (r.error_count / r.request_count * 100).toFixed(1) + '%' : '—' },
+                { key: 'p95', label: 'p95 e2e', num: true, render: r => formatAnalyticsMs(r.p95_e2e_ms) },
+                { key: 'gen_tps', label: 'TPS', num: true, render: r => formatAnalyticsTPS(r.gen_tps) },
+            ], providers, 'No provider calls in this window');
+        }
+
+        function anRenderShape(rows) {
+            anTable('an-shape', [
+                { key: 'flow', label: 'Flow', mono: true, render: r => r.flow || 'other' },
+                { key: 'request_count', label: 'Req', num: true, render: r => formatAnalyticsCount(r.request_count) },
+                { key: 'avg_prompt_chars', label: 'Avg chars', num: true, render: r => formatAnalyticsCount(r.avg_prompt_chars) },
+                { key: 'p95_prompt_chars', label: 'p95 chars', num: true, render: r => formatAnalyticsCount(r.p95_prompt_chars) },
+                { key: 'avg_prompt_messages', label: 'Avg msgs', num: true, render: r => (r.avg_prompt_messages || 0).toFixed(1) },
+                { key: 'avg_docs_chars', label: 'Avg docs', num: true, render: r => formatAnalyticsCount(r.avg_docs_chars) },
+            ], rows, 'No requests in this window');
+        }
+
+        function anRenderShield(shield) {
+            const series = shield.series || [];
+            const labels = series.map(p => formatChartLabel(p.ts));
+            const cChecks = anColor('--c-flow-shield'), cFlag = anColor('--c-danger'), cLat = anColor('--c-info');
+            anBuildChart('an-shield', {
+                type: 'bar',
+                data: {
+                    labels, datasets: [
+                        { label: 'checks', data: series.map(p => p.checks), backgroundColor: anAlpha(cChecks, 0.7), borderColor: cChecks, borderWidth: 0, yAxisID: 'y' },
+                        { label: 'flagged', data: series.map(p => p.flagged), backgroundColor: anAlpha(cFlag, 0.85), borderColor: cFlag, borderWidth: 0, yAxisID: 'y' },
+                        { type: 'line', label: 'p95 ms', data: series.map(p => p.p95_duration_ms), borderColor: cLat, backgroundColor: cLat, borderWidth: 2, pointRadius: 0, tension: 0.3, yAxisID: 'y1' },
+                    ],
+                },
+                options: anOptions({
+                    scales: {
+                        y: { stacked: false },
+                        y1: { position: 'right', beginAtZero: true, grid: { display: false }, ticks: anMerge(anAxis(), { callback: v => formatAnalyticsMs(v) }) },
+                    },
+                }),
+            });
+        }
+
+        function anRenderJobs(jobs) {
+            anTable('an-jobs', [
+                { key: 'job_type', label: 'Job', mono: true, render: r => r.job_type || 'unknown' },
+                { key: 'queue_name', label: 'Queue', mono: true, render: r => r.queue_name || '—' },
+                { key: 'job_count', label: 'Total', num: true, render: r => formatAnalyticsCount(r.job_count) },
+                { key: 'completed', label: 'Done', num: true, render: r => formatAnalyticsCount(r.completed) },
+                { key: 'failed', label: 'Failed', num: true, render: r => formatAnalyticsCount(r.failed) },
+                { key: 'p95_wait_ms', label: 'p95 wait', num: true, render: r => formatAnalyticsMs(r.p95_wait_ms) },
+                { key: 'p95_processing_ms', label: 'p95 run', num: true, render: r => formatAnalyticsMs(r.p95_processing_ms) },
+            ], jobs, 'No jobs in this window');
+        }
+
+        function anRoutingTone(sev) {
+            const s = String(sev || '').toLowerCase();
+            if (s === 'error' || s === 'critical') return 'danger';
+            if (s === 'warn' || s === 'warning') return 'warning';
+            return 'info';
+        }
+        function anRenderRouting(routing) {
+            const summary = document.getElementById('an-routing-summary');
+            if (summary) {
+                summary.replaceChildren(...(routing.by_type || []).map(t => {
+                    const badge = PL.badge(t.event_type + ' · ' + formatAnalyticsCount(t.n), 'neutral');
+                    return badge;
+                }));
+                if (!(routing.by_type || []).length) summary.replaceChildren(PL.el('span', { class: 'an-chip-sub' }, 'No routing events in this window'));
             }
+            anTable('an-routing', [
+                { key: 'at', label: 'When', mono: true, render: r => formatChartLabel(r.at) },
+                { key: 'severity', label: 'Severity', render: r => { const b = PL.badge(r.severity || 'info', anRoutingTone(r.severity)); return b; } },
+                { key: 'event_type', label: 'Event', mono: true, render: r => r.event_type || '—' },
+                { key: 'provider_id', label: 'Provider', mono: true, render: r => r.provider_id || '—' },
+                { key: 'model_id', label: 'Model', mono: true, render: r => r.model_id || '—' },
+                { key: 'summary', label: 'Detail', render: r => r.summary || '' },
+            ], routing.recent || [], 'No routing incidents in this window');
         }
         // --- Logs ---
         let logsEventSource = null;
