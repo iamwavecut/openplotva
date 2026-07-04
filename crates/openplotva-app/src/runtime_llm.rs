@@ -659,6 +659,19 @@ fn trace_from_record(
         ..RuntimeLlmRequestData::default()
     };
     apply_dialog_trace_artifact(&mut trace, artifact);
+    // A client stamps the provider it happened to route through (the generic
+    // "aifarm" pool, a static client, a dynamic router client), so the same
+    // upstream model appears under different provider names across call paths.
+    // Re-derive the provider from the model (the authoritative field) so every
+    // path — dialog, memory extraction, optimizers — reports the same canonical
+    // provider. Mirrors provider_models; migration 150 backfills history the same
+    // way. Unknown models keep the client-stamped provider.
+    if let Some(canonical) = canonical_provider_for_model(
+        trace.model.as_deref().unwrap_or_default(),
+        trace.flow.as_deref().unwrap_or_default(),
+    ) {
+        trace.provider = Some(canonical.to_owned());
+    }
     let preview = artifact
         .raw_response
         .as_ref()
@@ -671,6 +684,28 @@ fn trace_from_record(
         response_text_preview: preview,
     };
     trace
+}
+
+/// Canonical routing provider for a model, mirroring the `provider_models`
+/// registry. Returns `None` for models not in the map so the client-stamped
+/// provider is left untouched (new models keep working until they are added).
+/// `flow` disambiguates models registered under more than one provider — only
+/// "Gemma 4 26B Heretic" today: vision calls belong to `aifarm-vision`, the rest
+/// to the vLLM chat provider. Migration 150 backfills history with this same map.
+fn canonical_provider_for_model(model: &str, flow: &str) -> Option<&'static str> {
+    let model = model.trim();
+    if model.to_ascii_lowercase().starts_with("vram.cloud/") {
+        return Some("vram-cloud");
+    }
+    match model {
+        "vibethinker-3b" | "qwen3.6-27b-moq" => Some("aifarm-llamacpp-gpu2"),
+        "Gemma 4 26B Heretic" => Some(if flow.eq_ignore_ascii_case("vision") {
+            "aifarm-vision"
+        } else {
+            "aifarm-vllm-gpu0"
+        }),
+        _ => None,
+    }
 }
 
 impl RuntimeLlmTraceInspector for RuntimeLlmTraceBuffer {
@@ -1520,6 +1555,91 @@ mod tests {
         );
         assert_eq!(rows[0].model.as_deref(), Some("Gemma"));
         assert_eq!(rows[0].result.duration_ms, 123);
+    }
+
+    #[test]
+    fn canonical_provider_maps_registry_models_and_flow() {
+        assert_eq!(
+            canonical_provider_for_model("vram.cloud/qwen3.6-35b-a3b", "memory_extraction"),
+            Some("vram-cloud")
+        );
+        assert_eq!(
+            canonical_provider_for_model("VRAM.CLOUD/qwen3.6-27b", "dialog"),
+            Some("vram-cloud")
+        );
+        assert_eq!(
+            canonical_provider_for_model("vibethinker-3b", "memory_extraction"),
+            Some("aifarm-llamacpp-gpu2")
+        );
+        // Gemma is registered under two providers; flow disambiguates.
+        assert_eq!(
+            canonical_provider_for_model("Gemma 4 26B Heretic", "dialog"),
+            Some("aifarm-vllm-gpu0")
+        );
+        assert_eq!(
+            canonical_provider_for_model("Gemma 4 26B Heretic", "vision"),
+            Some("aifarm-vision")
+        );
+        // Unknown models are left to the client-stamped provider.
+        assert_eq!(
+            canonical_provider_for_model("some-new-model", "dialog"),
+            None
+        );
+        assert_eq!(canonical_provider_for_model("", "dialog"), None);
+    }
+
+    #[test]
+    fn trace_canonicalizes_provider_from_model_for_every_path() {
+        let buffer = RuntimeLlmTraceBuffer::new(8);
+        let observer = RuntimeLlmObserver::new(buffer.clone(), None);
+        // The memory extractor stamps the generic "aifarm", but the model is
+        // owned by vram-cloud — the row must report the canonical provider.
+        openplotva_llm::LlmCallObserver::observe(
+            &observer,
+            openplotva_llm::LlmCallRecord {
+                context: openplotva_llm::LlmCallContext::default(),
+                artifact: openplotva_dialog::DialogTraceArtifacts {
+                    provider: "aifarm".to_owned(),
+                    source: "aifarm_memory_extractor".to_owned(),
+                    flow: "memory_extraction".to_owned(),
+                    model: "vram.cloud/qwen3.6-35b-a3b".to_owned(),
+                    request_kind: "openai.chat.completions".to_owned(),
+                    ..openplotva_dialog::DialogTraceArtifacts::default()
+                },
+                duration_ms: 10,
+                run: None,
+            },
+        );
+        // An unmapped model keeps whatever the client stamped.
+        openplotva_llm::LlmCallObserver::observe(
+            &observer,
+            openplotva_llm::LlmCallRecord {
+                context: openplotva_llm::LlmCallContext::default(),
+                artifact: openplotva_dialog::DialogTraceArtifacts {
+                    provider: "genkit".to_owned(),
+                    source: "genkit".to_owned(),
+                    flow: "dialog".to_owned(),
+                    model: "googleai/gemini-2.5-flash-lite".to_owned(),
+                    request_kind: "gemini.generateContent".to_owned(),
+                    ..openplotva_dialog::DialogTraceArtifacts::default()
+                },
+                duration_ms: 10,
+                run: None,
+            },
+        );
+        let rows = buffer
+            .llm_requests(RuntimeLlmRequestsFilter {
+                limit: 10,
+                ..RuntimeLlmRequestsFilter::default()
+            })
+            .expect("rows");
+        let by_model = |needle: &str| {
+            rows.iter()
+                .find(|row| row.model.as_deref().is_some_and(|m| m.contains(needle)))
+                .and_then(|row| row.provider.clone())
+        };
+        assert_eq!(by_model("vram.cloud").as_deref(), Some("vram-cloud"));
+        assert_eq!(by_model("gemini").as_deref(), Some("genkit"));
     }
 
     #[test]
