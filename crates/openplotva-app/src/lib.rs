@@ -40,6 +40,7 @@ pub mod reactions;
 pub mod reset;
 pub mod rich;
 mod routed_attempts;
+mod runtime_analytics_overview;
 pub mod runtime_api;
 mod runtime_cache;
 mod runtime_dispatcher;
@@ -737,6 +738,10 @@ fn install_static_web_routes(router: axum::Router, static_web: StaticWebRoutes) 
             "/admin/api/analytics/llm/summary",
             any(admin_llm_analytics_summary),
         )
+        .route(
+            "/admin/api/analytics/overview",
+            any(admin_analytics_overview),
+        )
         .route("/admin/api/llm/dialogs", any(admin_llm_dialogs))
         .route(
             "/admin/api/llm/dialogs/detail",
@@ -810,6 +815,7 @@ const GO_ADMIN_API_ROUTE_PATTERNS: &[&str] = &[
     "/admin/api/metrics",
     "/admin/api/safety/checks",
     "/admin/api/analytics/llm/summary",
+    "/admin/api/analytics/overview",
     "/admin/api/llm/dialogs",
     "/admin/api/llm/dialogs/detail",
     "/admin/api/llm/dialogs/clear",
@@ -1039,6 +1045,15 @@ async fn admin_llm_analytics_summary(
     Extension(routes): Extension<StaticWebRoutes>,
 ) -> Response {
     admin_llm_analytics_summary_response(&routes, method, &headers, raw_query.as_deref()).await
+}
+
+async fn admin_analytics_overview(
+    method: Method,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Extension(routes): Extension<StaticWebRoutes>,
+) -> Response {
+    admin_analytics_overview_response(&routes, method, &headers, raw_query.as_deref()).await
 }
 
 async fn admin_llm_dialogs(
@@ -7105,6 +7120,38 @@ fn admin_llm_dialogs_clear_response(
         buffer.clear();
     }
     admin_json_no_cache_response(StatusCode::OK, serde_json::json!({ "ok": true }))
+}
+
+async fn admin_analytics_overview_response(
+    routes: &StaticWebRoutes,
+    method: Method,
+    headers: &HeaderMap,
+    raw_query: Option<&str>,
+) -> Response {
+    if method != Method::GET {
+        return admin_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+    }
+    if let Err(error) = require_admin_request(headers, &routes.admin_ids, &routes.bot_token) {
+        return admin_auth_failure_response(error);
+    }
+    let Some(pool) = routes.postgres.clone() else {
+        return admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed");
+    };
+    let range = admin_auth_query_values(raw_query)
+        .remove("range")
+        .map(|value| value.trim().to_owned())
+        .unwrap_or_default();
+    let reader = runtime_analytics_overview::AnalyticsOverviewReader::new(
+        pool,
+        routes.runtime_sql_timeout_ms,
+    );
+    match reader.overview(&range).await {
+        Ok(value) => admin_json_no_cache_response(StatusCode::OK, value),
+        Err(error) => {
+            tracing::warn!(%error, "failed to build admin analytics overview");
+            admin_error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed")
+        }
+    }
 }
 
 fn admin_llm_analytics_since_time(
@@ -14992,6 +15039,7 @@ mod tests {
                 "/admin/api/metrics",
                 "/admin/api/safety/checks",
                 "/admin/api/analytics/llm/summary",
+                "/admin/api/analytics/overview",
                 "/admin/api/llm/dialogs",
                 "/admin/api/llm/dialogs/detail",
                 "/admin/api/llm/dialogs/clear",

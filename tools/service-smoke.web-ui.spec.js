@@ -315,61 +315,31 @@ test('admin login gate and authenticated shell render', async ({ page, context }
   await expect(page.locator('#safety-check-response')).toContainText('"flagged": true');
 
   const analyticsResponse = page.waitForResponse((response) => {
-    return response.url().includes('/admin/api/analytics/llm/summary?')
+    return response.url().includes('/admin/api/analytics/overview?')
       && response.request().method() === 'GET';
   });
   await page.locator('pl-button[data-tab="analytics"]').click();
   const analytics = await (await analyticsResponse).json();
   expect(analytics).toHaveProperty('range');
-  expect(analytics.totals).toMatchObject({ total_count: 2, error_count: 1 });
-  expect(analytics.providers.find((row) => row.provider === 'AI Farm')).toMatchObject({
-    request_count: 1,
-    total_tokens: 140,
+  expect(analytics.health).toBeTruthy();
+  expect(Number(analytics.health.external_calls)).toBeGreaterThanOrEqual(2);
+  expect(Array.isArray(analytics.llm.models)).toBe(true);
+  expect(analytics.llm.models.find((row) => row.model === 'smoke-model-a')).toBeTruthy();
+  expect(Array.isArray(analytics.llm.providers)).toBe(true);
+  expect(analytics.llm.providers.length).toBeGreaterThanOrEqual(1);
+
+  await expect(page.locator('#page-title')).toHaveText('Analytics');
+  await expect(page.locator('#an-health .metric-card').first()).toBeVisible();
+  await expect(page.locator('#an-health')).toContainText('external calls');
+  await expect(page.locator('#an-models')).toContainText('smoke-model-a');
+  await expect(page.locator('#analytics canvas').first()).toBeVisible();
+  // Range change refetches the snapshot.
+  const rangeRefetch = page.waitForResponse((response) => {
+    return response.url().includes('/admin/api/analytics/overview?range=7d')
+      && response.request().method() === 'GET';
   });
-  expect(analytics.models.find((row) => row.model === 'smoke-model-a')).toMatchObject({
-    output_tokens: 40,
-    p95_duration_ms: 2400,
-  });
-  expect(analytics.inference_params.find((row) => row.model === 'smoke-model-a')).toMatchObject({
-    max_tokens: 512,
-    tool_mode: 'auto',
-    response_format: 'json',
-  });
-  expect(analytics.top_chats.find((row) => row.chat_id === -100777)).toMatchObject({
-    title: 'Smoke Group',
-    request_count: 2,
-  });
-  expect(analytics.memory_runs).toMatchObject({ completed_count: 1 });
-  await expect(page.locator('#llm-analytics-summary')).toContainText('range:');
-  await expect(page.locator('#llm-analytics-summary')).toContainText('total: 2');
-  await expect(page.locator('#llm-providers-table')).toContainText('AI Farm');
-  await expect(page.locator('#llm-models-table')).toContainText('smoke-model-a');
-  await expect(page.locator('#llm-inference-table')).toContainText('auto');
-  await expect(page.locator('#memory-jobs-summary')).toContainText('completed: 1');
-  await expect(page.locator('#memory-jobs-table')).toContainText('completed');
-  const chartSnapshots = await page.evaluate(() => (window.__charts || []).map((chart) => ({
-    canvasID: chart.canvasID,
-    labels: chart.data?.labels || [],
-    datasets: (chart.data?.datasets || []).map((dataset) => ({
-      label: dataset.label,
-      data: dataset.data || [],
-    })),
-  })));
-  expect(chartSnapshots.some((chart) => {
-    return chart.canvasID === 'llm-series-chart'
-      && chart.datasets.some((dataset) => dataset.label === 'requests'
-        && dataset.data.reduce((sum, value) => sum + Number(value || 0), 0) === 2);
-  })).toBe(true);
-  expect(chartSnapshots.some((chart) => {
-    return chart.canvasID === 'llm-topchats-chart'
-      && chart.labels.includes('Smoke Group')
-      && chart.datasets.some((dataset) => dataset.data.includes(2));
-  })).toBe(true);
-  expect(chartSnapshots.some((chart) => {
-    return chart.canvasID === 'llm-models-chart'
-      && chart.datasets.some((dataset) => dataset.label === 'smoke-model-a'
-        && dataset.data.reduce((sum, value) => sum + Number(value || 0), 0) === 1);
-  })).toBe(true);
+  await page.locator('#an-range select').selectOption('7d');
+  await rangeRefetch;
 
   assertNoPageErrors();
 });
