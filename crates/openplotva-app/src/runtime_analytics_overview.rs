@@ -680,4 +680,27 @@ mod tests {
         assert_eq!(go_duration_string(Duration::days(7)), "7d");
         assert_eq!(go_duration_string(Duration::minutes(90)), "90m");
     }
+
+    #[test]
+    fn jobs_query_filter_matches_the_migration_151_index() {
+        // The dashboard reads taskman_jobs directly (the taskman rollup was
+        // retired). Its window filter must use the exact expression migration 151
+        // indexes, or the planner falls back to a full seq scan.
+        const MIGRATION: &str =
+            include_str!("../../../migrations/151_retire_taskman_job_rollup.up.sql");
+        let indexed_expr = "COALESCE(completed_at, updated_at, created_at)";
+        assert!(
+            SQL_JOBS.contains(indexed_expr),
+            "dashboard job filter must use the indexed terminal-time expression"
+        );
+        assert!(
+            MIGRATION.contains(indexed_expr),
+            "migration 151 must index the dashboard's terminal-time expression"
+        );
+        assert!(MIGRATION.contains("idx_taskman_jobs_terminal_time"));
+        assert!(
+            MIGRATION.contains("DELETE FROM telemetry_rollups WHERE source = 'taskman'"),
+            "migration 151 must drop the retired taskman job rollup rows"
+        );
+    }
 }
