@@ -2461,7 +2461,9 @@ where
         }
     }
     for (old_id, into_id, fact_text) in &merge_ops {
-        match store.supersede_card(*into_id, *old_id).await {
+        // Retire the folded card (old_id) into the survivor (into_id):
+        // supersede_card's first arg is the card that gets superseded.
+        match store.supersede_card(*old_id, *into_id).await {
             Ok(()) => {
                 report.stats.cards_superseded += 1;
                 report.merged.push((*old_id, *into_id));

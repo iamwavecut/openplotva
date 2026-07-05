@@ -4949,15 +4949,28 @@ impl PostgresMemoryStore {
             let keep_id: i64 = row.try_get("keep_id")?;
             let dup_ids: Vec<i64> = row.try_get("dup_ids")?;
             let total_obs: i64 = row.try_get("total_obs")?;
+            if dup_ids.is_empty() {
+                continue;
+            }
+            // Retire every duplicate into the surviving keep_id and carry the
+            // summed observation_count atomically per group, so a mid-group
+            // failure never leaves a half-collapsed cluster. superseded_by ($1)
+            // is the survivor; the retired card is matched by id ($2).
+            let mut tx = self.pool.begin().await?;
             for dup_id in &dup_ids {
-                self.supersede_card(*dup_id, keep_id).await?;
-                retired += 1;
+                sqlx::query(SQL_SUPERSEDE_MEMORY_CARD)
+                    .bind(keep_id)
+                    .bind(*dup_id)
+                    .execute(&mut *tx)
+                    .await?;
             }
             sqlx::query(SQL_SET_MEMORY_CARD_OBSERVATION_COUNT)
                 .bind(keep_id)
                 .bind(total_obs)
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await?;
+            tx.commit().await?;
+            retired += dup_ids.len() as u64;
         }
         Ok(retired)
     }
