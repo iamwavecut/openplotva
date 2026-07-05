@@ -19,6 +19,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: pr-automation-${{ github.event.pull_request.number || github.event.inputs.pr_number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   danger:
     name: Danger PR rules
@@ -44,9 +48,18 @@ jobs:
         run: npx --yes danger@13.0.10 ci
 
   pr-agent:
-    name: PR-Agent AI review
+    name: PR-Agent ${{ matrix.title }}
     if: ${{ (github.event_name == 'workflow_dispatch' && inputs.pr_number != '') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.draft == false && github.event.action != 'edited' && github.actor != 'github-actions[bot]') }}
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - command: review
+            title: AI review
+          - command: improve
+            title: code suggestions
     permissions:
       contents: read
       issues: write
@@ -72,7 +85,7 @@ jobs:
           test -n "$pr_url"
           echo "pr_url=$pr_url" >> "$GITHUB_OUTPUT"
 
-      - name: Run PR-Agent review and improve
+      - name: Run PR-Agent ${{ matrix.command }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           OPENAI__KEY: ${{ secrets.PR_AGENT_OPENAI_KEY }}
@@ -87,6 +100,7 @@ jobs:
             external contracts, migrations, and production/runtime risks. Do not
             comment on formatting, style-only lint, dependency advisories, or SAST
             findings already handled by reviewdog and CI.
+          PR_AGENT_COMMAND: ${{ matrix.command }}
           PR_URL: ${{ steps.target.outputs.pr_url }}
         run: |
           set -euo pipefail
@@ -127,11 +141,10 @@ jobs:
               get_settings().set("CONFIG.CLI_MODE", True)
               get_settings().set("CONFIG.CONFIG_BRANCH", os.environ.get("PR_AGENT_CONFIG_BRANCH") or None)
               get_settings().set("CONFIG.EXTRA_CONFIG_URL", os.environ.get("PR_AGENT_EXTRA_CONFIG_URL"))
-              agent = PRAgent()
-              for command in ("review", "improve"):
-                  ok = await agent.handle_request(os.environ["PR_URL"], command)
-                  if not ok:
-                      raise RuntimeError(f"PR-Agent command failed: {command}")
+              command = os.environ["PR_AGENT_COMMAND"]
+              ok = await PRAgent().handle_request(os.environ["PR_URL"], command)
+              if not ok:
+                  raise RuntimeError(f"PR-Agent command failed: {command}")
               await asyncio.wait_for(GLOBAL_LOGGING_WORKER.flush(), timeout=15)
               await GLOBAL_LOGGING_WORKER.stop()
 
@@ -144,6 +157,6 @@ jobs:
             exit "$status"
           fi
           if grep -E "ERROR|RuntimeWarning|Traceback|ValueError|Exception|Failed to get git provider|GitHub token is required|Failed to review PR|Failed to generate prediction|Error during LLM inference|BadRequestError|Unknown Model" "$log_file" >/dev/null; then
-            echo "PR-Agent reported an inference/review failure while exiting successfully." >&2
+            echo "PR-Agent reported an inference/command failure while exiting successfully." >&2
             exit 1
           fi
