@@ -92,7 +92,8 @@ jobs:
           OPENAI_KEY: ${{ secrets.PR_AGENT_OPENAI_KEY }}
           OPENAI__API_BASE: ${{ secrets.PR_AGENT_OPENAI_BASE_URL }}
           PR_AGENT_MODEL: ${{ vars.PR_AGENT_MODEL || 'openai/glm-5.2' }}
-          PR_AGENT_FALLBACK_MODELS: ${{ vars.PR_AGENT_FALLBACK_MODELS || '["openai/glm-5.2"]' }}
+          PR_AGENT_FALLBACK_MODELS: ${{ vars.PR_AGENT_FALLBACK_MODELS || '[]' }}
+          PR_AGENT_AI_TIMEOUT: ${{ vars.PR_AGENT_AI_TIMEOUT || '600' }}
           PR_AGENT_CUSTOM_MODEL_MAX_TOKENS: ${{ vars.PR_AGENT_CUSTOM_MODEL_MAX_TOKENS || '1000000' }}
           PR_AGENT_MAX_MODEL_TOKENS: ${{ vars.PR_AGENT_MAX_MODEL_TOKENS || '1000000' }}
           PR_AGENT_REVIEW_EXTRA_INSTRUCTIONS: >-
@@ -116,8 +117,10 @@ jobs:
             -e OPENAI_KEY \
             -e OPENAI__API_BASE \
             -e PR_URL \
+            -e PR_AGENT_COMMAND \
             -e "config.model=$PR_AGENT_MODEL" \
             -e "config.fallback_models=$PR_AGENT_FALLBACK_MODELS" \
+            -e "config.ai_timeout=$PR_AGENT_AI_TIMEOUT" \
             -e "config.custom_model_max_tokens=$PR_AGENT_CUSTOM_MODEL_MAX_TOKENS" \
             -e "config.max_model_tokens=$PR_AGENT_MAX_MODEL_TOKENS" \
             -e "litellm.drop_params=true" \
