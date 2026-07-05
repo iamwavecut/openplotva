@@ -431,6 +431,10 @@ pub struct CandidateCard {
     /// audiences (stable identity, language, long-term role). Defaults to false.
     #[serde(default, skip_serializing_if = "is_false")]
     pub portable: bool,
+    /// Semantic lifespan the model assigns: permanent|long|short|ephemeral.
+    /// Empty means "derive from card_type". Drives the card's expiry (forgetting).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub durability: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -452,6 +456,14 @@ pub enum ResolutionDecision {
     Supersede,
     /// Both facts are plausible yet contradictory; keep both as `competing`.
     Competing,
+    /// Rewrite the existing card's text in place, keeping its id, age and history.
+    Update,
+    /// Fold the existing card into a surviving card (`into_card_id`).
+    Merge,
+    /// Confirm the existing card again: raise its confidence/salience.
+    Reinforce,
+    /// Weaken the existing card: lower its confidence.
+    Demote,
 }
 
 /// A scored decision on how a freshly extracted fact relates to an existing card.
@@ -470,6 +482,9 @@ pub struct Resolution {
     /// Reasoning.
     #[serde(default)]
     pub reason: String,
+    /// For `merge`: the surviving card that `old_card_id` folds into.
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub into_card_id: i64,
 }
 
 impl Resolution {
@@ -706,6 +721,8 @@ pub struct CardInput {
     pub source_message_ids: Vec<i32>,
     /// Observation timestamp.
     pub observed_at: OffsetDateTime,
+    /// When this fact should be forgotten (archived); `None` means durable.
+    pub expires_at: Option<OffsetDateTime>,
 }
 
 impl Default for CardInput {
@@ -722,6 +739,7 @@ impl Default for CardInput {
             source_entry_ids: Vec::new(),
             source_message_ids: Vec::new(),
             observed_at: go_zero_time(),
+            expires_at: None,
         }
     }
 }
@@ -2468,6 +2486,39 @@ fn is_noisy_memory_forward_origin(origin_type: &str) -> bool {
     origin_type.eq_ignore_ascii_case("channel") || origin_type.eq_ignore_ascii_case("chat")
 }
 
+/// Semantic lifespan tiers a card can carry, controlling how fast it is forgotten.
+pub const DURABILITY_PERMANENT: &str = "permanent";
+/// Long-lived fact, kept effectively indefinitely.
+pub const DURABILITY_LONG: &str = "long";
+/// Short-lived fact (weeks).
+pub const DURABILITY_SHORT: &str = "short";
+/// Throwaway fact (a couple of days).
+pub const DURABILITY_EPHEMERAL: &str = "ephemeral";
+
+/// Days-to-live for a time-bounded fact; durable facts return `None` (no expiry).
+/// When the model gives no durability, only one-off events fade by default so we
+/// never silently drop durable identity/preference facts.
+#[must_use]
+pub fn durability_ttl_days(durability: &str, card_type: &str) -> Option<i64> {
+    match durability.trim().to_lowercase().as_str() {
+        DURABILITY_EPHEMERAL => Some(2),
+        DURABILITY_SHORT => Some(14),
+        DURABILITY_PERMANENT | DURABILITY_LONG => None,
+        _ if card_type == CARD_TYPE_EVENT => Some(14),
+        _ => None,
+    }
+}
+
+/// Compute a card's expiry instant from its durability, or `None` if durable.
+#[must_use]
+pub fn expires_at_from_durability(
+    durability: &str,
+    card_type: &str,
+    observed_at: OffsetDateTime,
+) -> Option<OffsetDateTime> {
+    durability_ttl_days(durability, card_type).map(|days| observed_at + time::Duration::days(days))
+}
+
 fn card_from_candidate(
     input: &ExtractInput,
     candidate: &CandidateCard,
@@ -2478,6 +2529,9 @@ fn card_from_candidate(
         return None;
     }
     let kind = candidate_scope_kind(input, candidate)?;
+    let card_type = normalize_card_type(&candidate.card_type);
+    let observed_at = observed_at_from_messages_at(&input.messages, fallback_observed_at);
+    let expires_at = expires_at_from_durability(&candidate.durability, &card_type, observed_at);
 
     Some(CardInput {
         observation_scope: ObservationScope {
@@ -2490,7 +2544,7 @@ fn card_from_candidate(
             kind,
             portable: candidate.portable,
         },
-        card_type: normalize_card_type(&candidate.card_type),
+        card_type,
         subject: candidate.subject.clone(),
         predicate: candidate.predicate.clone(),
         object: candidate.object.clone(),
@@ -2499,7 +2553,8 @@ fn card_from_candidate(
         salience: candidate.salience,
         source_entry_ids: candidate.source_entry_ids.clone(),
         source_message_ids: candidate.source_message_ids.clone(),
-        observed_at: observed_at_from_messages_at(&input.messages, fallback_observed_at),
+        observed_at,
+        expires_at,
     })
 }
 

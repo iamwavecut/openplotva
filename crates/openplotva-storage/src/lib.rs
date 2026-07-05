@@ -107,6 +107,8 @@ pub struct MemoryCardUpsertParams {
     pub last_observed_at: OffsetDateTime,
     /// Whether the card may travel across audiences (see `ObservationScope::portable`).
     pub portable: bool,
+    /// When the card should be forgotten (archived); `None` means durable.
+    pub expires_at: Option<OffsetDateTime>,
 }
 
 /// Rust storage-side wrapper for pgvector embeddings.
@@ -229,6 +231,7 @@ pub fn memory_card_upsert_params_at(
         user_id,
         last_observed_at,
         portable: card.observation_scope.portable,
+        expires_at: card.expires_at,
     })
 }
 
@@ -813,7 +816,7 @@ pub const SQL_INSERT_CHAT_HISTORY_EVENT: &str = "INSERT INTO chat_history_events
 
 pub const SQL_UPSERT_MEMORY_CARD_LEXICAL: &str = "INSERT INTO memory_cards (visibility, card_type, subject, predicate, object, fact_text, dedup_hash, confidence, salience, origin_chat_id, origin_thread_id, origin_user_id, chat_id, thread_id, user_id, last_observed_at, portable) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17) ON CONFLICT (visibility, user_id, chat_id, thread_id, dedup_hash) WHERE status = 'active' DO UPDATE SET confidence = GREATEST(memory_cards.confidence, EXCLUDED.confidence), salience = GREATEST(memory_cards.salience, EXCLUDED.salience), observation_count = memory_cards.observation_count + 1, last_observed_at = GREATEST(memory_cards.last_observed_at, EXCLUDED.last_observed_at), updated_at = CURRENT_TIMESTAMP RETURNING id, (xmax = 0) AS inserted";
 
-pub const SQL_UPSERT_MEMORY_CARD_WITH_EMBEDDING: &str = "INSERT INTO memory_cards (visibility, card_type, subject, predicate, object, fact_text, dedup_hash, confidence, salience, origin_chat_id, origin_thread_id, origin_user_id, chat_id, thread_id, user_id, last_observed_at, embedding, portable) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17::vector, $18) ON CONFLICT (visibility, user_id, chat_id, thread_id, dedup_hash) WHERE status = 'active' DO UPDATE SET confidence = GREATEST(memory_cards.confidence, EXCLUDED.confidence), salience = GREATEST(memory_cards.salience, EXCLUDED.salience), observation_count = memory_cards.observation_count + 1, last_observed_at = GREATEST(memory_cards.last_observed_at, EXCLUDED.last_observed_at), embedding = COALESCE(EXCLUDED.embedding, memory_cards.embedding), updated_at = CURRENT_TIMESTAMP RETURNING id, (xmax = 0) AS inserted";
+pub const SQL_UPSERT_MEMORY_CARD_WITH_EMBEDDING: &str = "INSERT INTO memory_cards (visibility, card_type, subject, predicate, object, fact_text, dedup_hash, confidence, salience, origin_chat_id, origin_thread_id, origin_user_id, chat_id, thread_id, user_id, last_observed_at, embedding, portable, expires_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17::vector, $18, $19) ON CONFLICT (visibility, user_id, chat_id, thread_id, dedup_hash) WHERE status = 'active' DO UPDATE SET confidence = GREATEST(memory_cards.confidence, EXCLUDED.confidence), salience = GREATEST(memory_cards.salience, EXCLUDED.salience), observation_count = memory_cards.observation_count + 1, last_observed_at = GREATEST(memory_cards.last_observed_at, EXCLUDED.last_observed_at), embedding = COALESCE(EXCLUDED.embedding, memory_cards.embedding), expires_at = CASE WHEN memory_cards.expires_at IS NULL THEN NULL ELSE GREATEST(memory_cards.expires_at, EXCLUDED.expires_at) END, updated_at = CURRENT_TIMESTAMP RETURNING id, (xmax = 0) AS inserted";
 
 pub const SQL_INSERT_MEMORY_SOURCES: &str = "WITH input AS (SELECT unnest($4::text[]) AS entry_id, unnest($5::integer[]) AS message_id) INSERT INTO memory_sources (card_id, chat_id, thread_id, entry_id, message_id, occurred_at, confidence) SELECT $1, $2, $3, input.entry_id, input.message_id, $6, $7 FROM input WHERE NOT EXISTS (SELECT 1 FROM memory_sources WHERE card_id = $1 AND entry_id = input.entry_id AND message_id = input.message_id)";
 
@@ -826,6 +829,14 @@ pub const SQL_UPSERT_MEMORY_LINKS: &str = "INSERT INTO memory_links (from_card_i
 pub const SQL_SUPERSEDE_MEMORY_CARD: &str = "UPDATE memory_cards SET status = 'superseded', valid_until = CURRENT_TIMESTAMP, superseded_by = $1, updated_at = CURRENT_TIMESTAMP, retracted_at = CURRENT_TIMESTAMP WHERE id = $2 AND status = 'active'";
 
 pub const SQL_MARK_COMPETING_MEMORY_CARDS: &str = "UPDATE memory_cards SET status = 'competing', conflict_group = LEAST($1, $2), updated_at = CURRENT_TIMESTAMP WHERE id IN ($1, $2) AND status IN ('active', 'competing')";
+
+pub const SQL_UPDATE_MEMORY_CARD_TEXT: &str = "UPDATE memory_cards SET fact_text = $2, subject = COALESCE(NULLIF(btrim($3), ''), subject), embedding = COALESCE($4::vector, embedding), updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND status IN ('active', 'competing')";
+
+pub const SQL_REINFORCE_MEMORY_CARD: &str = "UPDATE memory_cards SET confidence = LEAST(1.0, confidence + $2), salience = LEAST(1.0, salience + $3), observation_count = observation_count + 1, last_observed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND status IN ('active', 'competing')";
+
+pub const SQL_DEMOTE_MEMORY_CARD: &str = "UPDATE memory_cards SET confidence = GREATEST(0.0, confidence - $2), updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND status IN ('active', 'competing')";
+
+pub const SQL_ARCHIVE_EXPIRED_MEMORY_CARDS: &str = "UPDATE memory_cards SET status = 'expired', retracted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id IN (SELECT id FROM memory_cards WHERE status IN ('active', 'competing') AND expires_at IS NOT NULL AND expires_at <= now() ORDER BY expires_at LIMIT $1)";
 
 pub const SQL_MARK_EXHAUSTED_MEMORY_RUNS: &str = r#"UPDATE memory_runs
 SET status = 'failed',
@@ -1232,7 +1243,7 @@ WHERE e.chat_id = $1
 ORDER BY e.occurred_at ASC, e.message_id ASC, e.entry_id ASC
 LIMIT $8"#;
 
-pub const SQL_LIST_VISIBLE_MEMORY_CARDS: &str = "SELECT id, visibility, card_type, status, subject, predicate, object, fact_text, confidence, salience, observation_count, origin_chat_id, origin_user_id, chat_id, thread_id, user_id, valid_from, valid_until, last_observed_at, last_used_at, use_count, created_at, updated_at, origin_thread_id, decay_score, portable, conflict_group, recorded_at, retracted_at FROM memory_cards WHERE status IN ('active', 'competing') AND valid_until IS NULL AND ((visibility = 'chat' AND chat_id = $1 AND thread_id = 0) OR (visibility = 'thread' AND chat_id = $1 AND thread_id = $2 AND $2 <> 0) OR (visibility = 'chat_user' AND chat_id = $1 AND user_id = $3) OR (visibility = 'private_chat' AND chat_id = $1 AND user_id = $3) OR (visibility = 'public_user' AND user_id = $3 AND ($4::bool OR portable OR origin_chat_id = $1))) ORDER BY updated_at DESC LIMIT $5";
+pub const SQL_LIST_VISIBLE_MEMORY_CARDS: &str = "SELECT id, visibility, card_type, status, subject, predicate, object, fact_text, confidence, salience, observation_count, origin_chat_id, origin_user_id, chat_id, thread_id, user_id, valid_from, valid_until, last_observed_at, last_used_at, use_count, created_at, updated_at, origin_thread_id, decay_score, portable, conflict_group, recorded_at, retracted_at FROM memory_cards WHERE status IN ('active', 'competing') AND valid_until IS NULL AND (expires_at IS NULL OR expires_at > now()) AND ((visibility = 'chat' AND chat_id = $1 AND thread_id = 0) OR (visibility = 'thread' AND chat_id = $1 AND thread_id = $2 AND $2 <> 0) OR (visibility = 'chat_user' AND chat_id = $1 AND user_id = $3) OR (visibility = 'private_chat' AND chat_id = $1 AND user_id = $3) OR (visibility = 'public_user' AND user_id = $3 AND ($4::bool OR portable OR origin_chat_id = $1))) ORDER BY updated_at DESC LIMIT $5";
 
 pub const SQL_LIST_MEMORY_CARDS: &str = "SELECT id, visibility, card_type, status, subject, predicate, object, fact_text, confidence, salience, observation_count, origin_chat_id, origin_user_id, chat_id, thread_id, user_id, valid_from, valid_until, last_observed_at, last_used_at, use_count, created_at, updated_at, origin_thread_id, decay_score, portable, conflict_group, recorded_at, retracted_at FROM memory_cards WHERE ($1::bigint = 0 OR chat_id = $1 OR origin_chat_id = $1) AND ($2::integer IS NULL OR thread_id = $2 OR origin_thread_id = $2) AND ($3::bigint = 0 OR user_id = $3 OR origin_user_id = $3) AND ($4::text = '' OR status = $4) AND ($6::text = '' OR card_type = $6) AND ($7::text = '' OR visibility = $7) AND ($8::timestamptz IS NULL OR (recorded_at <= $8 AND (retracted_at IS NULL OR retracted_at > $8))) ORDER BY updated_at DESC, id DESC LIMIT $5";
 
@@ -1285,9 +1296,9 @@ pub const SQL_RESTORE_MEMORY_CARD: &str = "UPDATE memory_cards SET status = 'act
 
 pub const SQL_SOFT_DELETE_VISIBLE_MEMORY_CARD: &str = "UPDATE memory_cards SET status = 'deleted', deleted_at = CURRENT_TIMESTAMP, deleted_by_user_id = $1, updated_at = CURRENT_TIMESTAMP, retracted_at = CURRENT_TIMESTAMP WHERE id = $2 AND status <> 'deleted' AND ((visibility = 'chat' AND chat_id = $3 AND thread_id = 0) OR (visibility = 'thread' AND chat_id = $3 AND thread_id = $4 AND $4 <> 0) OR (visibility = 'chat_user' AND chat_id = $3 AND user_id = $5) OR (visibility = 'private_chat' AND chat_id = $3 AND user_id = $5) OR (visibility = 'public_user' AND user_id = $5 AND ($6::bool OR portable OR origin_chat_id = $3)))";
 
-pub const SQL_RETRIEVE_MEMORY_CARDS_LEXICAL: &str = "WITH q AS (SELECT websearch_to_tsquery('simple', $1) AS tsq) SELECT id, visibility, card_type, status, subject, predicate, object, fact_text, confidence, salience, observation_count, origin_chat_id, origin_user_id, chat_id, thread_id, user_id, valid_from, valid_until, last_observed_at, last_used_at, use_count, created_at, updated_at, origin_thread_id, decay_score, portable, conflict_group, recorded_at, retracted_at, (0.45 * ts_rank_cd(text_search, q.tsq) + 0.20 * salience + 0.20 * confidence + 0.15 * CASE WHEN updated_at > now() - interval '1 day' THEN 1 WHEN updated_at > now() - interval '7 days' THEN 0.75 WHEN updated_at > now() - interval '30 days' THEN 0.45 ELSE 0.2 END - 0.10 * decay_score)::double precision AS score FROM memory_cards, q WHERE status IN ('active', 'competing') AND valid_until IS NULL AND text_search @@ q.tsq AND ((visibility = 'chat' AND chat_id = $2 AND thread_id = 0) OR (visibility = 'thread' AND chat_id = $2 AND thread_id = $3 AND $3 <> 0) OR (visibility = 'chat_user' AND chat_id = $2 AND user_id = $4) OR (visibility = 'private_chat' AND chat_id = $2 AND user_id = $4) OR (visibility = 'public_user' AND user_id = $4 AND ($5::bool OR portable OR origin_chat_id = $2))) ORDER BY score DESC, updated_at DESC LIMIT $6";
+pub const SQL_RETRIEVE_MEMORY_CARDS_LEXICAL: &str = "WITH q AS (SELECT websearch_to_tsquery('simple', $1) AS tsq) SELECT id, visibility, card_type, status, subject, predicate, object, fact_text, confidence, salience, observation_count, origin_chat_id, origin_user_id, chat_id, thread_id, user_id, valid_from, valid_until, last_observed_at, last_used_at, use_count, created_at, updated_at, origin_thread_id, decay_score, portable, conflict_group, recorded_at, retracted_at, (0.45 * ts_rank_cd(text_search, q.tsq) + 0.20 * salience + 0.20 * confidence + 0.15 * CASE WHEN updated_at > now() - interval '1 day' THEN 1 WHEN updated_at > now() - interval '7 days' THEN 0.75 WHEN updated_at > now() - interval '30 days' THEN 0.45 ELSE 0.2 END - 0.10 * decay_score)::double precision AS score FROM memory_cards, q WHERE status IN ('active', 'competing') AND valid_until IS NULL AND (expires_at IS NULL OR expires_at > now()) AND text_search @@ q.tsq AND ((visibility = 'chat' AND chat_id = $2 AND thread_id = 0) OR (visibility = 'thread' AND chat_id = $2 AND thread_id = $3 AND $3 <> 0) OR (visibility = 'chat_user' AND chat_id = $2 AND user_id = $4) OR (visibility = 'private_chat' AND chat_id = $2 AND user_id = $4) OR (visibility = 'public_user' AND user_id = $4 AND ($5::bool OR portable OR origin_chat_id = $2))) ORDER BY score DESC, updated_at DESC LIMIT $6";
 
-pub const SQL_RETRIEVE_MEMORY_CARDS_VECTOR: &str = "WITH q AS (SELECT $1::vector AS embedding) SELECT id, visibility, card_type, status, subject, predicate, object, fact_text, confidence, salience, observation_count, origin_chat_id, origin_user_id, chat_id, thread_id, user_id, valid_from, valid_until, last_observed_at, last_used_at, use_count, created_at, updated_at, origin_thread_id, decay_score, portable, conflict_group, recorded_at, retracted_at, (0.50 * (1 - (memory_cards.embedding <=> q.embedding)) + 0.20 * salience + 0.20 * confidence + 0.10 * CASE WHEN updated_at > now() - interval '1 day' THEN 1 WHEN updated_at > now() - interval '7 days' THEN 0.75 WHEN updated_at > now() - interval '30 days' THEN 0.45 ELSE 0.2 END - 0.10 * decay_score)::double precision AS score FROM memory_cards, q WHERE status IN ('active', 'competing') AND valid_until IS NULL AND memory_cards.embedding IS NOT NULL AND ((visibility = 'chat' AND chat_id = $2 AND thread_id = 0) OR (visibility = 'thread' AND chat_id = $2 AND thread_id = $3 AND $3 <> 0) OR (visibility = 'chat_user' AND chat_id = $2 AND user_id = $4) OR (visibility = 'private_chat' AND chat_id = $2 AND user_id = $4) OR (visibility = 'public_user' AND user_id = $4 AND ($5::bool OR portable OR origin_chat_id = $2))) ORDER BY memory_cards.embedding <=> q.embedding LIMIT $6";
+pub const SQL_RETRIEVE_MEMORY_CARDS_VECTOR: &str = "WITH q AS (SELECT $1::vector AS embedding) SELECT id, visibility, card_type, status, subject, predicate, object, fact_text, confidence, salience, observation_count, origin_chat_id, origin_user_id, chat_id, thread_id, user_id, valid_from, valid_until, last_observed_at, last_used_at, use_count, created_at, updated_at, origin_thread_id, decay_score, portable, conflict_group, recorded_at, retracted_at, (0.50 * (1 - (memory_cards.embedding <=> q.embedding)) + 0.20 * salience + 0.20 * confidence + 0.10 * CASE WHEN updated_at > now() - interval '1 day' THEN 1 WHEN updated_at > now() - interval '7 days' THEN 0.75 WHEN updated_at > now() - interval '30 days' THEN 0.45 ELSE 0.2 END - 0.10 * decay_score)::double precision AS score FROM memory_cards, q WHERE status IN ('active', 'competing') AND valid_until IS NULL AND (expires_at IS NULL OR expires_at > now()) AND memory_cards.embedding IS NOT NULL AND ((visibility = 'chat' AND chat_id = $2 AND thread_id = 0) OR (visibility = 'thread' AND chat_id = $2 AND thread_id = $3 AND $3 <> 0) OR (visibility = 'chat_user' AND chat_id = $2 AND user_id = $4) OR (visibility = 'private_chat' AND chat_id = $2 AND user_id = $4) OR (visibility = 'public_user' AND user_id = $4 AND ($5::bool OR portable OR origin_chat_id = $2))) ORDER BY memory_cards.embedding <=> q.embedding LIMIT $6";
 
 pub const SQL_RETRIEVE_MEMORY_EPISODES: &str = "WITH q AS (SELECT websearch_to_tsquery('simple', $1) AS tsq) SELECT id, visibility, chat_id, thread_id, range_start_at, range_end_at, message_count, summary_text, topics, participants, created_at FROM memory_episodes, q WHERE chat_id = $2 AND (thread_id = 0 OR thread_id = $3) AND text_search @@ q.tsq ORDER BY ts_rank_cd(text_search, q.tsq) DESC, range_end_at DESC LIMIT $4";
 
@@ -4730,6 +4741,7 @@ impl PostgresMemoryStore {
                 .bind(params.last_observed_at)
                 .bind(embedding)
                 .bind(params.portable)
+                .bind(params.expires_at)
                 .fetch_one(&mut *tx)
                 .await?;
             let id: i64 = row.try_get("id")?;
@@ -4847,6 +4859,74 @@ impl PostgresMemoryStore {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    /// Rewrite a card's fact text (and optionally subject/embedding) in place,
+    /// keeping its id, age and observation history. Used for consolidation
+    /// `update`/`merge` refinements.
+    pub async fn update_card_text(
+        &self,
+        id: i64,
+        fact_text: &str,
+        subject: &str,
+        embedding: Option<&PgEmbeddingVector>,
+    ) -> Result<(), StorageError> {
+        let fact_text = fact_text.trim();
+        if id == 0 || fact_text.is_empty() {
+            return Ok(());
+        }
+        sqlx::query(SQL_UPDATE_MEMORY_CARD_TEXT)
+            .bind(id)
+            .bind(fact_text)
+            .bind(subject.trim())
+            .bind(pgvector_literal(embedding))
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Confirm an existing card again: raise its confidence/salience and bump its
+    /// observation count without creating a duplicate.
+    pub async fn reinforce_card(
+        &self,
+        id: i64,
+        confidence_delta: f64,
+        salience_delta: f64,
+    ) -> Result<(), StorageError> {
+        if id == 0 {
+            return Ok(());
+        }
+        sqlx::query(SQL_REINFORCE_MEMORY_CARD)
+            .bind(id)
+            .bind(confidence_delta.max(0.0))
+            .bind(salience_delta.max(0.0))
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Weaken an existing card by lowering its confidence (a soft demotion that
+    /// feeds forgetting without deleting).
+    pub async fn demote_card(&self, id: i64, confidence_delta: f64) -> Result<(), StorageError> {
+        if id == 0 {
+            return Ok(());
+        }
+        sqlx::query(SQL_DEMOTE_MEMORY_CARD)
+            .bind(id)
+            .bind(confidence_delta.max(0.0))
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Archive one batch of active cards whose TTL has elapsed (soft, restorable:
+    /// status='expired', retracted_at stamped). Returns the number archived.
+    pub async fn archive_expired_cards(&self, batch: i64) -> Result<u64, StorageError> {
+        Ok(sqlx::query(SQL_ARCHIVE_EXPIRED_MEMORY_CARDS)
+            .bind(batch.max(1))
+            .execute(&self.pool)
+            .await?
+            .rows_affected())
     }
 
     /// Mark exhausted processing memory runs before claiming fresh work.
@@ -9274,7 +9354,8 @@ mod tests {
                 .contains("($6::bool OR portable OR origin_chat_id = $3)")
         );
         assert!(
-            super::SQL_UPSERT_MEMORY_CARD_WITH_EMBEDDING.contains("embedding, portable) VALUES")
+            super::SQL_UPSERT_MEMORY_CARD_WITH_EMBEDDING
+                .contains("embedding, portable, expires_at) VALUES")
         );
         // Competing cards coexist with active ones and stay retrievable.
         assert!(
@@ -9300,6 +9381,28 @@ mod tests {
                 .contains("ORDER BY memory_cards.embedding <=> q.embedding")
         );
         assert!(super::SQL_RETRIEVE_MEMORY_EPISODES.contains("websearch_to_tsquery('simple'"));
+        // Durability TTL: retrieval hides expired cards; upsert carries expiry.
+        assert!(
+            super::SQL_RETRIEVE_MEMORY_CARDS_LEXICAL
+                .contains("(expires_at IS NULL OR expires_at > now())")
+        );
+        assert!(
+            super::SQL_RETRIEVE_MEMORY_CARDS_VECTOR
+                .contains("(expires_at IS NULL OR expires_at > now())")
+        );
+        assert!(
+            super::SQL_LIST_VISIBLE_MEMORY_CARDS
+                .contains("(expires_at IS NULL OR expires_at > now())")
+        );
+        assert!(super::SQL_UPSERT_MEMORY_CARD_WITH_EMBEDDING.contains("$17::vector, $18, $19)"));
+        // Consolidation op-set + archival exist and only touch live cards.
+        assert!(super::SQL_UPDATE_MEMORY_CARD_TEXT.contains("fact_text = $2"));
+        assert!(
+            super::SQL_REINFORCE_MEMORY_CARD.contains("observation_count = observation_count + 1")
+        );
+        assert!(super::SQL_DEMOTE_MEMORY_CARD.contains("GREATEST(0.0, confidence - $2)"));
+        assert!(super::SQL_ARCHIVE_EXPIRED_MEMORY_CARDS.contains("status = 'expired'"));
+        assert!(super::SQL_ARCHIVE_EXPIRED_MEMORY_CARDS.contains("expires_at <= now()"));
     }
 
     #[test]
@@ -9553,6 +9656,7 @@ mod tests {
                     source_entry_ids: vec!["msg:a".to_owned()],
                     source_message_ids: vec![10],
                     observed_at: observed,
+                    expires_at: None,
                 },
                 openplotva_memory::CardInput {
                     observation_scope: scope.clone(),
@@ -9566,6 +9670,7 @@ mod tests {
                     source_entry_ids: vec!["msg:b".to_owned()],
                     source_message_ids: vec![11],
                     observed_at: observed,
+                    expires_at: None,
                 },
             ];
             let (stats, ids) = store.upsert_cards_lexical(&cards).await?;
