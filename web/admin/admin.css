@@ -3042,3 +3042,104 @@ body:has(.pane-details:not(.hidden)) .drawer-scrim {
         grid-template-columns: 1fr;
     }
 }
+
+/* --- LLM Dialogs: Context X-ray --- */
+.llmd-xray {
+    margin-top: var(--sp-5);
+    padding-top: var(--sp-4);
+    border-top: 1px solid var(--c-border);
+}
+.llmd-xray-title {
+    font-size: var(--fs-md);
+    font-weight: 600;
+    color: var(--c-text-sec);
+    margin-bottom: var(--sp-3);
+}
+.llmd-xray-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--sp-2);
+    margin-bottom: var(--sp-4);
+}
+.llmd-xray-grid {
+    display: grid;
+    grid-template-columns: 1.4fr 1fr;
+    gap: var(--sp-4);
+    margin-bottom: var(--sp-4);
+    align-items: start;
+}
+.llmd-xray-card {
+    background: var(--c-bg-card);
+}
+.llmd-xray-graph pl-graph {
+    display: block;
+    width: 100%;
+}
+.llmd-xray-focus {
+    margin-top: var(--sp-2);
+    font-size: var(--fs-sm);
+    line-height: 1.4;
+}
+.llmd-xray-mem {
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-3);
+    max-height: 340px;
+    overflow-y: auto;
+}
+.llmd-xray-mem-row {
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-1);
+}
+.llmd-xray-mem-top {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+}
+.llmd-xray-type {
+    font-size: var(--fs-xs);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--type-c, var(--c-text-muted));
+    border: 1px solid var(--type-c, var(--c-border));
+    border-radius: var(--rad-sm);
+    padding: 0 var(--sp-1);
+}
+.llmd-xray-score {
+    margin-left: auto;
+}
+.llmd-xray-bar {
+    height: 6px;
+    border-radius: var(--rad-full);
+    background: var(--c-bg-input);
+    overflow: hidden;
+}
+.llmd-xray-bar-fill {
+    height: 100%;
+    width: var(--llmd-xray-fill, 0%);
+    background: var(--c-accent);
+    border-radius: var(--rad-full);
+}
+.llmd-xray-mem-text {
+    font-size: var(--fs-sm);
+    color: var(--c-text-sec);
+    line-height: 1.4;
+}
+.llmd-xray-kv {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: var(--sp-1) var(--sp-3);
+    font-size: var(--fs-sm);
+}
+.llmd-xray-kv-k {
+    color: var(--c-text-muted);
+}
+.llmd-xray-kv-v {
+    color: var(--c-text-main);
+}
+@media (max-width: 900px) {
+    .llmd-xray-grid {
+        grid-template-columns: 1fr;
+    }
+}

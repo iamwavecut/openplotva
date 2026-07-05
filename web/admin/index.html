@@ -5075,6 +5075,156 @@
                 const expanded = index === lastMainIndex || !!round.error || rounds.length === 1;
                 feed.append(llmdRoundCard(round, index, expanded));
             });
+            const xray = llmdContextXray(run);
+            if (xray) body.append(xray);
+        }
+
+        // The "Context X-ray": what actually fed this turn. The recalled-memory
+        // constellation is the one bold element — nodes sized by how strongly a
+        // memory surfaced, competing ones ringed, real relations drawn between
+        // them; everything else stays quiet.
+        function llmdContextXray(run) {
+            const ctx = run && run.context;
+            if (!ctx) return null;
+            const section = PL.el('div', { class: 'llmd-xray' });
+            section.append(PL.el('div', { class: 'llmd-xray-title' }, 'Context X-ray'));
+
+            const chips = PL.el('div', { class: 'llmd-xray-chips' });
+            const memories = (ctx.memories || []).slice()
+                .sort((a, b) => (b.salience || 0) - (a.salience || 0));
+            chips.append(PL.badge(memories.length + ' memories', 'neutral'));
+            chips.append(PL.badge('history ' + (ctx.history_len || 0), 'neutral'));
+            chips.append(PL.badge(ctx.tools_offered ? 'tools on' : 'tools off', ctx.tools_offered ? 'info' : 'neutral'));
+            chips.append(PL.badge(ctx.shield_on ? 'shield on' : 'shield off', ctx.shield_on ? 'success' : 'neutral'));
+            if (ctx.reference_context_chars) {
+                chips.append(PL.badge('injected ' + formatAnalyticsCount(ctx.reference_context_chars) + ' chars', 'neutral'));
+            }
+            section.append(chips);
+
+            const memGrid = PL.el('div', { class: 'llmd-xray-grid' });
+            const graphCard = PL.el('div', { class: 'card llmd-xray-card llmd-xray-graph' });
+            graphCard.append(PL.el('div', { class: 'card-header' }, 'Memories recalled · bigger surfaced stronger'));
+            const graphBody = PL.el('div', { class: 'card-body' });
+            if (!memories.length) {
+                graphBody.append(PL.el('div', { class: 'text-muted' }, 'No memories surfaced for this turn.'));
+            } else {
+                const graph = PL.el('pl-graph');
+                const center = memories.reduce((best, m) => (m.salience || 0) > (best.salience || 0) ? m : best, memories[0]);
+                graph.data = {
+                    nodes: memories.map(m => ({ id: m.card_id, label: m.preview, card_type: m.card_type, salience: m.salience, competing: m.competing })),
+                    edges: [],
+                    center: center.card_id,
+                };
+                const focus = PL.el('div', { class: 'llmd-xray-focus text-muted' }, 'Click a memory to read it in full.');
+                graph.addEventListener('pl:node-click', async (e) => {
+                    const id = e.detail && e.detail.id;
+                    const hit = memories.find(m => m.card_id === id);
+                    if (hit) focus.textContent = hit.preview;
+                    const data = await apiCall('/memory/card?id=' + encodeURIComponent(id));
+                    if (data && data.card && data.card.fact_text) focus.textContent = data.card.fact_text;
+                });
+                graphBody.append(graph, focus);
+                llmdXrayEnrichEdges(graph, memories);
+            }
+            graphCard.append(graphBody);
+            memGrid.append(graphCard);
+
+            const listCard = PL.el('div', { class: 'card llmd-xray-card' });
+            listCard.append(PL.el('div', { class: 'card-header' }, 'Recall ranking'));
+            const listBody = PL.el('div', { class: 'card-body llmd-xray-mem' });
+            if (!memories.length) {
+                listBody.append(PL.el('div', { class: 'text-muted' }, '—'));
+            } else {
+                memories.forEach(m => {
+                    const row = PL.el('div', { class: 'llmd-xray-mem-row' });
+                    const top = PL.el('div', { class: 'llmd-xray-mem-top' });
+                    const type = m.card_type || 'preference';
+                    const typeTag = PL.el('span', { class: 'llmd-xray-type' }, type.replace(/_/g, ' '));
+                    typeTag.style.setProperty('--type-c', 'var(--c-cardtype-' + type + ')');
+                    top.append(typeTag);
+                    if (m.competing) top.append(PL.badge('competing', 'warning'));
+                    top.append(PL.el('span', { class: 'mono llmd-dim llmd-xray-score' }, Math.round((m.salience || 0) * 100) + '%'));
+                    const bar = PL.el('div', { class: 'llmd-xray-bar' });
+                    const fill = PL.el('div', { class: 'llmd-xray-bar-fill' });
+                    fill.style.setProperty('--llmd-xray-fill', Math.max(3, Math.round((m.salience || 0) * 100)) + '%');
+                    bar.append(fill);
+                    row.append(top, bar, PL.el('div', { class: 'llmd-xray-mem-text' }, m.preview || ''));
+                    listBody.append(row);
+                });
+            }
+            listCard.append(listBody);
+            memGrid.append(listCard);
+            section.append(memGrid);
+
+            const ctxGrid = PL.el('div', { class: 'llmd-xray-grid' });
+            ctxGrid.append(llmdXrayPersona(ctx.persona), llmdXraySettings(ctx.settings));
+            section.append(ctxGrid);
+            return section;
+        }
+
+        async function llmdXrayEnrichEdges(graph, memories) {
+            const ids = new Set(memories.map(m => m.card_id));
+            const seen = new Set();
+            const edges = [];
+            await Promise.all(memories.map(async (m) => {
+                const data = await apiCall('/memory/card?id=' + encodeURIComponent(m.card_id));
+                ((data && data.links) || []).forEach(link => {
+                    if (!ids.has(link.peer_card_id)) return;
+                    const key = [Math.min(m.card_id, link.peer_card_id), Math.max(m.card_id, link.peer_card_id)].join('-') + ':' + link.relation;
+                    if (seen.has(key)) return;
+                    seen.add(key);
+                    edges.push({ from: m.card_id, to: link.peer_card_id, relation: link.relation, confidence: link.confidence });
+                });
+            }));
+            if (edges.length && graph.isConnected) {
+                const current = graph.data || {};
+                graph.data = { nodes: current.nodes, edges, center: current.center };
+            }
+        }
+
+        function llmdXrayPersona(persona) {
+            const card = PL.el('div', { class: 'card llmd-xray-card' });
+            card.append(PL.el('div', { class: 'card-header' }, 'Persona'));
+            const body = PL.el('div', { class: 'card-body' });
+            if (!persona) {
+                body.append(PL.el('div', { class: 'text-muted' }, 'default'));
+                card.append(body);
+                return card;
+            }
+            const grid = PL.el('div', { class: 'llmd-xray-kv' });
+            const kv = (label, value) => {
+                if (!value) return;
+                grid.append(PL.el('div', { class: 'llmd-xray-kv-k' }, label), PL.el('div', { class: 'llmd-xray-kv-v' }, value));
+            };
+            kv('name', persona.name);
+            kv('mood', persona.mood);
+            body.append(grid);
+            const flags = PL.el('div', { class: 'llmd-xray-chips' });
+            if (persona.custom) flags.append(PL.badge('custom persona', 'info'));
+            if (persona.profanity) flags.append(PL.badge('profanity', 'neutral'));
+            if (persona.obscenifier) flags.append(PL.badge('obscenifier', 'neutral'));
+            if (flags.children.length) body.append(flags);
+            card.append(body);
+            return card;
+        }
+
+        function llmdXraySettings(settings) {
+            const card = PL.el('div', { class: 'card llmd-xray-card' });
+            card.append(PL.el('div', { class: 'card-header' }, 'Settings that shaped this reply'));
+            const body = PL.el('div', { class: 'card-body' });
+            const list = settings || [];
+            if (!list.length) {
+                body.append(PL.el('div', { class: 'text-muted' }, 'defaults'));
+            } else {
+                const grid = PL.el('div', { class: 'llmd-xray-kv' });
+                list.forEach(kv => grid.append(
+                    PL.el('div', { class: 'llmd-xray-kv-k' }, kv.label),
+                    PL.el('div', { class: 'llmd-xray-kv-v' }, kv.value),
+                ));
+                body.append(grid);
+            }
+            card.append(body);
+            return card;
         }
 
         async function llmdCopyRunJSON() {

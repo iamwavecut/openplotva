@@ -384,6 +384,18 @@ test('admin LLM dialogs list and detail render agent runs', async ({ page, conte
       body: JSON.stringify({
         run: {
           ...runSkeleton,
+          context: {
+            memories: [
+              { card_id: 101, salience: 0.9, confidence: 0.8, card_type: 'preference', competing: false, preview: 'smoke prefers tea' },
+              { card_id: 102, salience: 0.5, confidence: 0.6, card_type: 'technical_fact', competing: true, preview: 'smoke writes rust' },
+            ],
+            persona: { name: 'Плотва', mood: 'playful', custom: true, profanity: false, obscenifier: false },
+            settings: [{ label: 'reactivity', value: '30%' }],
+            history_len: 12,
+            tools_offered: true,
+            shield_on: true,
+            reference_context_chars: 640,
+          },
           rounds: [
             {
               seq: 1,
@@ -420,6 +432,16 @@ test('admin LLM dialogs list and detail render agent runs', async ({ page, conte
     });
   });
 
+  await page.route('**/admin/api/memory/card?id=*', async (route) => {
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({
+        card: { id: 101, fact_text: 'smoke prefers strong tea', card_type: 'preference', salience: 0.9, status: 'active' },
+        links: [{ peer_card_id: 102, peer_fact_text: 'rust', peer_card_type: 'technical_fact', relation: 'same_topic', confidence: 0.6 }],
+      }),
+    });
+  });
+
   await page.goto('/admin/', { waitUntil: 'domcontentloaded' });
   const listResponse = page.waitForResponse((response) => {
     return response.url().endsWith('/admin/api/llm/dialogs')
@@ -442,6 +464,15 @@ test('admin LLM dialogs list and detail render agent runs', async ({ page, conte
   await expect(page.locator('#llmd-detail-body')).toContainText('smoke final answer');
   await expect(page.locator('#llmd-detail-body')).toContainText('web_search');
   await expect(page.locator('#llmd-detail-body')).toContainText('rotated out');
+
+  // Context X-ray: the recalled-memory constellation + persona/settings.
+  await expect(page.locator('#llmd-detail-body .llmd-xray')).toBeVisible();
+  await expect(page.locator('#llmd-detail-body')).toContainText('Context X-ray');
+  await expect(page.locator('.llmd-xray pl-graph svg')).toBeVisible();
+  await expect(page.locator('.llmd-xray-mem')).toContainText('smoke prefers tea');
+  await expect(page.locator('.llmd-xray')).toContainText('competing');
+  await expect(page.locator('.llmd-xray')).toContainText('playful');
+  await expect(page.locator('.llmd-xray')).toContainText('reactivity');
 
   await page.locator('#llmd-detail [data-action="llmdCloseDetail"]').first().click();
   await expect(page.locator('#llmd-detail')).toBeHidden();
