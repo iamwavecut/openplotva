@@ -2266,6 +2266,64 @@ where
     report
 }
 
+/// How often the duplicate-collapse worker runs (off-hours global cleanup).
+pub const MEMORY_DUP_COLLAPSE_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(6 * 60 * 60);
+/// Max exact-duplicate groups collapsed per sweep.
+pub const MEMORY_DUP_COLLAPSE_GROUP_LIMIT: i64 = 500;
+
+/// Outcome of the duplicate-collapse worker.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MemoryDuplicateCollapseReport {
+    /// Cards retired into a survivor.
+    pub retired: u64,
+    /// Sweep ticks executed.
+    pub ticks: u64,
+    /// Failed sweeps.
+    pub errors: u64,
+}
+
+/// Periodically collapse exact-fact_text duplicate cards across scopes — the
+/// off-hours global cleanup that catches duplicates accumulated across many
+/// extraction windows (which the per-window extractor never revisits). The
+/// online extractor handles semantic consolidation for actively-discussed
+/// subjects; this deterministically retires exact repeats. Runs until `stop`.
+pub async fn run_memory_duplicate_collapse_worker_until<Stop>(
+    store: PostgresMemoryStore,
+    interval: std::time::Duration,
+    group_limit: i64,
+    stop: Stop,
+) -> MemoryDuplicateCollapseReport
+where
+    Stop: std::future::Future<Output = ()>,
+{
+    let mut report = MemoryDuplicateCollapseReport::default();
+    tokio::pin!(stop);
+    loop {
+        match store.collapse_duplicate_cards(group_limit).await {
+            Ok(retired) => {
+                report.retired += retired;
+                if retired > 0 {
+                    tracing::debug!(retired, "collapsed duplicate memory cards");
+                }
+            }
+            Err(error) => {
+                report.errors += 1;
+                tracing::warn!(%error, "failed to collapse duplicate memory cards");
+            }
+        }
+        report.ticks += 1;
+
+        let sleep = tokio::time::sleep(interval);
+        tokio::pin!(sleep);
+        tokio::select! {
+            () = &mut stop => break,
+            () = &mut sleep => {}
+        }
+    }
+    report
+}
+
 async fn write_memory_extraction_cards<ExtractorError, Store, Embedder>(
     store: &Store,
     embedder: Option<&Embedder>,

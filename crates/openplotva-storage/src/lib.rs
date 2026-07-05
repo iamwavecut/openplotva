@@ -838,6 +838,10 @@ pub const SQL_DEMOTE_MEMORY_CARD: &str = "UPDATE memory_cards SET confidence = G
 
 pub const SQL_ARCHIVE_EXPIRED_MEMORY_CARDS: &str = "UPDATE memory_cards SET status = 'expired', retracted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id IN (SELECT id FROM memory_cards WHERE status IN ('active', 'competing') AND expires_at IS NOT NULL AND expires_at <= now() ORDER BY expires_at LIMIT $1)";
 
+pub const SQL_FIND_DUPLICATE_MEMORY_CARD_GROUPS: &str = "SELECT min(id) AS keep_id, array_remove(array_agg(id ORDER BY id), min(id)) AS dup_ids, sum(observation_count)::bigint AS total_obs FROM memory_cards WHERE status = 'active' AND btrim(fact_text) <> '' GROUP BY visibility, chat_id, thread_id, user_id, lower(btrim(fact_text)) HAVING count(*) > 1 LIMIT $1";
+
+pub const SQL_SET_MEMORY_CARD_OBSERVATION_COUNT: &str = "UPDATE memory_cards SET observation_count = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND status = 'active'";
+
 pub const SQL_MARK_EXHAUSTED_MEMORY_RUNS: &str = r#"UPDATE memory_runs
 SET status = 'failed',
     lease_owner = '',
@@ -4927,6 +4931,35 @@ impl PostgresMemoryStore {
             .execute(&self.pool)
             .await?
             .rows_affected())
+    }
+
+    /// Collapse exact-fact_text duplicate cards within each scope: keep the
+    /// oldest (min id), fold the rest into it (superseded), and carry the summed
+    /// observation_count onto the survivor. Deterministic backlog cleanup for
+    /// duplicates that slipped past the SPO-keyed active-dedup index (same fact
+    /// text under a different subject/predicate/object triple). Returns the
+    /// number of cards retired.
+    pub async fn collapse_duplicate_cards(&self, group_limit: i64) -> Result<u64, StorageError> {
+        let rows = sqlx::query(SQL_FIND_DUPLICATE_MEMORY_CARD_GROUPS)
+            .bind(group_limit.max(1))
+            .fetch_all(&self.pool)
+            .await?;
+        let mut retired = 0u64;
+        for row in &rows {
+            let keep_id: i64 = row.try_get("keep_id")?;
+            let dup_ids: Vec<i64> = row.try_get("dup_ids")?;
+            let total_obs: i64 = row.try_get("total_obs")?;
+            for dup_id in &dup_ids {
+                self.supersede_card(*dup_id, keep_id).await?;
+                retired += 1;
+            }
+            sqlx::query(SQL_SET_MEMORY_CARD_OBSERVATION_COUNT)
+                .bind(keep_id)
+                .bind(total_obs)
+                .execute(&self.pool)
+                .await?;
+        }
+        Ok(retired)
     }
 
     /// Mark exhausted processing memory runs before claiming fresh work.
@@ -9403,6 +9436,10 @@ mod tests {
         assert!(super::SQL_DEMOTE_MEMORY_CARD.contains("GREATEST(0.0, confidence - $2)"));
         assert!(super::SQL_ARCHIVE_EXPIRED_MEMORY_CARDS.contains("status = 'expired'"));
         assert!(super::SQL_ARCHIVE_EXPIRED_MEMORY_CARDS.contains("expires_at <= now()"));
+        // Off-hours exact-duplicate collapse groups by normalized fact_text per scope.
+        assert!(super::SQL_FIND_DUPLICATE_MEMORY_CARD_GROUPS.contains("lower(btrim(fact_text))"));
+        assert!(super::SQL_FIND_DUPLICATE_MEMORY_CARD_GROUPS.contains("HAVING count(*) > 1"));
+        assert!(super::SQL_SET_MEMORY_CARD_OBSERVATION_COUNT.contains("observation_count = $2"));
     }
 
     #[test]

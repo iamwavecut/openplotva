@@ -10227,6 +10227,24 @@ async fn start_runtime_workers(
             "Expired memory cards archived hourly (durability-based forgetting)",
         ));
         workers.handles.push(worker);
+
+        let collapse_store = memory_store.clone();
+        let collapse_stop = stop.subscribe();
+        let collapse_worker = tokio::spawn(async move {
+            let report = memory_runtime::run_memory_duplicate_collapse_worker_until(
+                collapse_store,
+                memory_runtime::MEMORY_DUP_COLLAPSE_INTERVAL,
+                memory_runtime::MEMORY_DUP_COLLAPSE_GROUP_LIMIT,
+                wait_for_runtime_stop(collapse_stop),
+            )
+            .await;
+            tracing::info!(?report, "memory duplicate collapse worker stopped");
+        });
+        readiness_checks.push(ReadinessCheck::ok(
+            "memory_dup_collapse",
+            "Exact-duplicate memory cards collapsed every 6h (off-hours backlog cleanup)",
+        ));
+        workers.handles.push(collapse_worker);
     }
 
     let Some(bot_key) = config.bot.key.as_deref() else {
