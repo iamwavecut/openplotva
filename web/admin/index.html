@@ -5162,24 +5162,38 @@
             return section;
         }
 
+        // Best-effort: fetch one-hop relations for the recalled cards and keep
+        // only edges between two recalled memories. Bounded concurrency so opening
+        // a detail view can't fan out one request per memory at once, and a single
+        // failed card lookup never discards the rest (or throws unhandled).
         async function llmdXrayEnrichEdges(graph, memories) {
-            const ids = new Set(memories.map(m => m.card_id));
-            const seen = new Set();
-            const edges = [];
-            await Promise.all(memories.map(async (m) => {
-                const data = await apiCall('/memory/card?id=' + encodeURIComponent(m.card_id));
-                ((data && data.links) || []).forEach(link => {
-                    if (!ids.has(link.peer_card_id)) return;
-                    const key = [Math.min(m.card_id, link.peer_card_id), Math.max(m.card_id, link.peer_card_id)].join('-') + ':' + link.relation;
-                    if (seen.has(key)) return;
-                    seen.add(key);
-                    edges.push({ from: m.card_id, to: link.peer_card_id, relation: link.relation, confidence: link.confidence });
-                });
-            }));
-            if (edges.length && graph.isConnected) {
-                const current = graph.data || {};
-                graph.data = { nodes: current.nodes, edges, center: current.center };
-            }
+            try {
+                const ids = new Set(memories.map(m => m.card_id));
+                const seen = new Set();
+                const edges = [];
+                const queue = memories.slice();
+                const worker = async () => {
+                    while (queue.length) {
+                        const m = queue.shift();
+                        let data = null;
+                        try {
+                            data = await apiCall('/memory/card?id=' + encodeURIComponent(m.card_id));
+                        } catch (_) { data = null; }
+                        ((data && data.links) || []).forEach(link => {
+                            if (!ids.has(link.peer_card_id)) return;
+                            const key = [Math.min(m.card_id, link.peer_card_id), Math.max(m.card_id, link.peer_card_id)].join('-') + ':' + link.relation;
+                            if (seen.has(key)) return;
+                            seen.add(key);
+                            edges.push({ from: m.card_id, to: link.peer_card_id, relation: link.relation, confidence: link.confidence });
+                        });
+                    }
+                };
+                await Promise.all(Array.from({ length: Math.min(6, memories.length) }, worker));
+                if (edges.length && graph.isConnected) {
+                    const current = graph.data || {};
+                    graph.data = { nodes: current.nodes, edges, center: current.center };
+                }
+            } catch (_) { /* the constellation stands alone without edges */ }
         }
 
         function llmdXrayPersona(persona) {
