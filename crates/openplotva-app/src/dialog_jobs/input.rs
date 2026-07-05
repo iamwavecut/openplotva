@@ -674,7 +674,7 @@ fn captured_memories_from_retrieval(
             card_id: card.id,
             salience: card.salience,
             confidence: card.confidence,
-            card_type: format!("{:?}", card.card_type).to_lowercase(),
+            card_type: card.card_type.trim().to_lowercase(),
             competing: card.status == CARD_STATUS_COMPETING,
             preview: card.fact_text.chars().take(120).collect(),
         })
