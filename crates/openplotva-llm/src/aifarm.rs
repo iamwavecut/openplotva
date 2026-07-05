@@ -2033,8 +2033,9 @@ where
         on_status: &mut (dyn FnMut(StatusUpdate) + Send),
     ) -> Result<ExtractOutput, AifarmMemoryExtractorError> {
         let system_prompt = openplotva_prompts::read("memory/extraction")?;
-        let payload =
-            serde_json::to_string_pretty(input).map_err(AifarmMemoryExtractorError::Input)?;
+        let payload = input
+            .to_prompt_payload()
+            .map_err(AifarmMemoryExtractorError::Input)?;
         let mut request = self.request(&system_prompt, &payload);
         request.trace = Some(aux_llm_call_trace(
             "memory_extraction",
@@ -2137,7 +2138,8 @@ where
         input: &ExtractInput,
     ) -> Result<ChatCompletionRequest, GenkitOpenAiCompatibleMemoryExtractorError> {
         let system_prompt = openplotva_prompts::read("memory/extraction")?;
-        let payload = serde_json::to_string_pretty(input)
+        let payload = input
+            .to_prompt_payload()
             .map_err(GenkitOpenAiCompatibleMemoryExtractorError::Input)?;
         Ok(ChatCompletionRequest {
             model: self.cfg.model.trim().to_owned(),

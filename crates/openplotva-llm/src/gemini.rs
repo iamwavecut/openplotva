@@ -1430,8 +1430,9 @@ where
         input: &ExtractInput,
     ) -> Result<GeminiGenerateContentRequest, GeminiMemoryExtractorError> {
         let system_prompt = openplotva_prompts::read("memory/extraction")?;
-        let payload =
-            serde_json::to_string_pretty(input).map_err(GeminiMemoryExtractorError::Input)?;
+        let payload = input
+            .to_prompt_payload()
+            .map_err(GeminiMemoryExtractorError::Input)?;
         Ok(GeminiGenerateContentRequest {
             cached_content: None,
             system_instruction: Some(GeminiContent {
