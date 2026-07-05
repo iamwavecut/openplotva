@@ -251,6 +251,52 @@ pub struct DialogInput {
         skip_serializing_if = "Option::is_none"
     )]
     pub enable_thinking: Option<bool>,
+    /// Capture-only X-ray of what fed this turn (memories recalled, persona,
+    /// settings). Never serialized into the LLM request; the runtime lifts it
+    /// onto the in-memory run record for the admin "Context X-ray".
+    #[serde(skip)]
+    pub context_capture: Option<TurnContextArtifact>,
+}
+
+/// One memory card that surfaced during recall for a turn — the scored skeleton
+/// kept for the admin X-ray, not the full card body.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct CapturedMemory {
+    pub card_id: i64,
+    pub salience: f64,
+    pub confidence: f64,
+    pub card_type: String,
+    pub competing: bool,
+    pub preview: String,
+}
+
+/// The persona resolved for a turn.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PersonaSnapshot {
+    pub name: String,
+    pub mood: String,
+    pub custom: bool,
+    pub profanity: bool,
+    pub obscenifier: bool,
+}
+
+/// One applied chat customization, as a display label/value pair.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SettingKv {
+    pub label: String,
+    pub value: String,
+}
+
+/// Light, in-memory X-ray of everything that shaped one dialog turn's request.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct TurnContextArtifact {
+    pub memories: Vec<CapturedMemory>,
+    pub persona: Option<PersonaSnapshot>,
+    pub settings: Vec<SettingKv>,
+    pub history_len: i32,
+    pub tools_offered: bool,
+    pub shield_on: bool,
+    pub reference_context_chars: i32,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
