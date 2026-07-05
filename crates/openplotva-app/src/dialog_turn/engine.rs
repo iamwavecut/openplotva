@@ -112,6 +112,10 @@ where
     let base_input = materializer
         .materialize_dialog_input(ctx.params, ctx.now)
         .await;
+    // Lift the capture-only context X-ray onto the open run (admin detail only).
+    if let (Some(runs), Some(context)) = (ctx.llm_runs, base_input.context_capture.clone()) {
+        runs.record_context(&format!("job-{}", ctx.item.id), context);
+    }
     let duplicate_guard_history = base_input.history.clone();
 
     // The session engine is the only dialog path; a provider without the

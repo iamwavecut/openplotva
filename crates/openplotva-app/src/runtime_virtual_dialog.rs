@@ -262,6 +262,9 @@ impl RuntimeVirtualDialogExecutor {
                 },
                 now,
             );
+            if let Some(context) = input.context_capture.clone() {
+                runs.record_context(&run_id, context);
+            }
         }
         let captured = openplotva_llm::with_run_scope(
             openplotva_llm::LlmRunScope {
