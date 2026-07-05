@@ -159,6 +159,9 @@ pub struct RunRecord {
     pub rounds: Vec<RunRound>,
     pub totals: RunTotals,
     pub outcome: Option<RunOutcome>,
+    /// Capture-only "Context X-ray" of what fed the turn (recalled memories,
+    /// persona, settings). Detail-only; never on the list skeleton.
+    pub context: Option<openplotva_dialog::TurnContextArtifact>,
 }
 
 impl RunRecord {
@@ -239,6 +242,7 @@ impl RuntimeLlmRunBuffer {
             rounds: Vec::new(),
             totals: RunTotals::default(),
             outcome: None,
+            context: None,
         };
         let mut inner = self.lock();
         sweep_stale_locked(&mut inner, now);
@@ -289,6 +293,16 @@ impl RuntimeLlmRunBuffer {
         record.totals.tool_calls += 1;
         if let Some(round) = record.rounds.last_mut() {
             round.tool_calls.push(tool);
+        }
+    }
+
+    /// Attach the captured turn-context artifact (recalled memories, persona,
+    /// settings) to an open run for the admin "Context X-ray". No-op for unknown
+    /// or already-closed runs.
+    pub fn record_context(&self, run_id: &str, context: openplotva_dialog::TurnContextArtifact) {
+        let mut inner = self.lock();
+        if let Some(record) = inner.open.get_mut(run_id) {
+            record.context = Some(context);
         }
     }
 
@@ -344,6 +358,7 @@ impl RuntimeLlmRunBuffer {
             },
             outcome: None,
             rounds: vec![round],
+            context: None,
         };
         let mut inner = self.lock();
         push_closed_locked(&mut inner, record);
@@ -590,6 +605,11 @@ impl RunRecord {
         let mut json = self.base_json();
         json["rounds"] =
             serde_json::Value::Array(self.rounds.iter().map(RunRound::to_json).collect());
+        json["context"] = self
+            .context
+            .as_ref()
+            .and_then(|context| serde_json::to_value(context).ok())
+            .unwrap_or(serde_json::Value::Null);
         json
     }
 }
@@ -715,6 +735,48 @@ mod tests {
             response_text: Some(text.to_owned()),
             ..RunRound::default()
         }
+    }
+
+    #[test]
+    fn record_context_attaches_to_open_run_and_shows_in_detail_only() {
+        let buffer = RuntimeLlmRunBuffer::new(4);
+        buffer.begin_run("job-1".to_owned(), "dialog", RunOrigin::default(), ts(0));
+        let artifact = openplotva_dialog::TurnContextArtifact {
+            memories: vec![openplotva_dialog::CapturedMemory {
+                card_id: 42,
+                salience: 0.9,
+                preview: "ada likes tea".to_owned(),
+                ..openplotva_dialog::CapturedMemory::default()
+            }],
+            persona: Some(openplotva_dialog::PersonaSnapshot {
+                mood: "playful".to_owned(),
+                ..openplotva_dialog::PersonaSnapshot::default()
+            }),
+            ..openplotva_dialog::TurnContextArtifact::default()
+        };
+        buffer.record_context("job-1", artifact);
+        // Unknown / closed run ids are a no-op.
+        buffer.record_context(
+            "job-does-not-exist",
+            openplotva_dialog::TurnContextArtifact::default(),
+        );
+
+        let record = buffer
+            .list(&RunListFilter::default(), ts(1))
+            .into_iter()
+            .next()
+            .expect("run present");
+        assert!(record.context.is_some());
+        assert_eq!(
+            record.detail_json()["context"]["memories"][0]["card_id"],
+            42
+        );
+        assert_eq!(
+            record.detail_json()["context"]["persona"]["mood"],
+            "playful"
+        );
+        // The list skeleton never carries the heavy context.
+        assert!(record.skeleton_json().get("context").is_none());
     }
 
     #[test]

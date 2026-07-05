@@ -8,12 +8,13 @@ use openplotva_core::{
     ToolCall, filter_non_terminator_tool_calls,
 };
 use openplotva_dialog::{
-    DialogContext, DialogInput, DialogMessage, DialogUser, HistoryMessage, MESSAGE_KIND_TEXT,
-    MESSAGE_KIND_TOOL_REQUEST, MESSAGE_KIND_TOOL_RESPONSE, Persona, ROLE_MODEL, ROLE_TOOL,
-    ROLE_USER, daily_persona_for_unix_timestamp, filter_dialog_tool_calls_for_history,
+    CapturedMemory, DialogContext, DialogInput, DialogMessage, DialogUser, HistoryMessage,
+    MESSAGE_KIND_TEXT, MESSAGE_KIND_TOOL_REQUEST, MESSAGE_KIND_TOOL_RESPONSE, Persona,
+    PersonaSnapshot, ROLE_MODEL, ROLE_TOOL, ROLE_USER, SettingKv, TurnContextArtifact,
+    daily_persona_for_unix_timestamp, filter_dialog_tool_calls_for_history,
     is_dialog_history_noise_tool_call_name,
 };
-use openplotva_memory::format_context as format_memory_context;
+use openplotva_memory::{CARD_STATUS_COMPETING, format_context as format_memory_context};
 use openplotva_shield::{Options as ShieldOptions, SearchRequest as ShieldSearchRequest};
 use openplotva_storage::{
     DialogMemoryChatMeta, PostgresChatSettingsStore, PostgresHistoryStore, PostgresMemoryStore,
@@ -280,7 +281,7 @@ impl PostgresDialogInputMaterializer {
         let chat = self.load_chat(params.chat_id).await;
         let user = self.load_user(params.user_id).await;
         let history = self.load_history(params, now).await;
-        let reference_context = self.load_reference_context(params).await;
+        let (reference_context, captured_memories) = self.load_reference_context(params).await;
         let shield_context = self.load_shield_context(params, &history).await;
         let mut input = dialog_input_from_materialized_context(
             params,
@@ -296,6 +297,7 @@ impl PostgresDialogInputMaterializer {
         if let Some(vision) = self.vision.as_ref() {
             input = vision.materialize_dialog_vision_input(input, now).await;
         }
+        input.context_capture = Some(turn_context_artifact(&input, &settings, captured_memories));
         input
     }
 
@@ -440,12 +442,15 @@ impl PostgresDialogInputMaterializer {
         merge_dialog_history_payloads(&chat_payloads, &thread_payloads, self.bot.id)
     }
 
-    async fn load_reference_context(&self, params: &DialogJobParams) -> Vec<String> {
+    async fn load_reference_context(
+        &self,
+        params: &DialogJobParams,
+    ) -> (Vec<String>, Vec<CapturedMemory>) {
         let Some(memory) = self.memory.as_ref() else {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         };
         if params.message_text.trim().is_empty() {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
 
         let meta = self.load_memory_chat_meta(params.chat_id).await;
@@ -455,7 +460,7 @@ impl PostgresDialogInputMaterializer {
             meta.username,
             meta.active_usernames,
         ) else {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         };
 
         let query_embedding = self.memory_query_embedding(&request.query, params).await;
@@ -463,7 +468,13 @@ impl PostgresDialogInputMaterializer {
             .retrieve_with_vector(&request, query_embedding.as_ref())
             .await
         {
-            Ok(memory) => dialog_reference_context_from_memory(&format_memory_context(&memory)),
+            Ok(memory) => {
+                let captured = captured_memories_from_retrieval(&memory);
+                (
+                    dialog_reference_context_from_memory(&format_memory_context(&memory)),
+                    captured,
+                )
+            }
             Err(error) => {
                 tracing::warn!(
                     %error,
@@ -471,7 +482,7 @@ impl PostgresDialogInputMaterializer {
                     user_id = params.user_id,
                     "memory retrieval failed for dialog input"
                 );
-                Vec::new()
+                (Vec::new(), Vec::new())
             }
         }
     }
@@ -648,6 +659,107 @@ fn dialog_meta_from_value(value: &serde_json::Value) -> ChatMessageMeta {
         return ChatMessageMeta::default();
     }
     serde_json::from_value(value.clone()).unwrap_or_default()
+}
+
+/// Map a recall result into the light, scored memory skeleton kept for the admin
+/// Context X-ray (capped; previews trimmed). Full card bodies are not retained.
+fn captured_memories_from_retrieval(
+    memory: &openplotva_memory::RetrievedMemory,
+) -> Vec<CapturedMemory> {
+    memory
+        .cards
+        .iter()
+        .take(40)
+        .map(|card| CapturedMemory {
+            card_id: card.id,
+            salience: card.salience,
+            confidence: card.confidence,
+            card_type: card.card_type.trim().to_lowercase(),
+            competing: card.status == CARD_STATUS_COMPETING,
+            preview: card.fact_text.chars().take(120).collect(),
+        })
+        .collect()
+}
+
+fn chat_settings_context_kv(settings: &ChatSettings) -> Vec<SettingKv> {
+    let yesno = |value: bool| if value { "yes" } else { "no" }.to_owned();
+    let mut kv = Vec::new();
+    if let Some(mood) = settings.mood_alignment.as_deref()
+        && !mood.trim().is_empty()
+    {
+        kv.push(SettingKv {
+            label: "mood".to_owned(),
+            value: mood.to_owned(),
+        });
+    }
+    kv.push(SettingKv {
+        label: "custom persona".to_owned(),
+        value: yesno(
+            settings
+                .custom_persona
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty()),
+        ),
+    });
+    kv.push(SettingKv {
+        label: "reactivity".to_owned(),
+        value: format!("{}%", settings.reactivity_percentage),
+    });
+    kv.push(SettingKv {
+        label: "proactivity".to_owned(),
+        value: format!("{}%", settings.proactivity_percentage),
+    });
+    kv.push(SettingKv {
+        label: "text reply".to_owned(),
+        value: yesno(settings.enable_global_text_reply),
+    });
+    kv.push(SettingKv {
+        label: "draw reply".to_owned(),
+        value: yesno(settings.enable_global_draw_reply),
+    });
+    kv.push(SettingKv {
+        label: "profanity".to_owned(),
+        value: yesno(settings.enable_profanity),
+    });
+    kv.push(SettingKv {
+        label: "obscenifier".to_owned(),
+        value: yesno(settings.enable_obscenifier),
+    });
+    kv
+}
+
+fn turn_context_artifact(
+    input: &DialogInput,
+    settings: &ChatSettings,
+    memories: Vec<CapturedMemory>,
+) -> TurnContextArtifact {
+    let persona = PersonaSnapshot {
+        name: input
+            .persona
+            .persona
+            .as_ref()
+            .map(|daily| daily.name.clone())
+            .unwrap_or_default(),
+        mood: input.persona.mood.clone(),
+        custom: !input.persona.custom_persona.trim().is_empty(),
+        profanity: input.persona.profanity,
+        obscenifier: input.persona.obscenifier,
+    };
+    let reference_context_chars = input
+        .reference_context
+        .iter()
+        .map(|line| line.chars().count())
+        .sum::<usize>()
+        .min(i32::MAX as usize) as i32;
+    TurnContextArtifact {
+        memories,
+        persona: Some(persona),
+        settings: chat_settings_context_kv(settings),
+        history_len: i32::try_from(input.history.len()).unwrap_or(i32::MAX),
+        tools_offered: !input.disable_tools,
+        shield_on: !input.shield_context.trim().is_empty(),
+        reference_context_chars,
+    }
 }
 
 fn dialog_locale(user: Option<&openplotva_core::UserState>) -> String {
@@ -1034,4 +1146,92 @@ fn nested_i64(
 
 fn non_zero_i64(value: i64) -> Option<i64> {
     (value != 0).then_some(value)
+}
+
+#[cfg(test)]
+mod context_artifact_tests {
+    use super::*;
+    use openplotva_memory::{Card, RetrievedMemory};
+
+    fn card(id: i64, salience: f64, competing: bool, fact: &str) -> Card {
+        Card {
+            id,
+            salience,
+            confidence: 0.7,
+            card_type: "fact".to_owned(),
+            status: if competing {
+                CARD_STATUS_COMPETING.to_owned()
+            } else {
+                "active".to_owned()
+            },
+            fact_text: fact.to_owned(),
+            ..Card::default()
+        }
+    }
+
+    #[test]
+    fn captured_memories_map_score_competing_and_trim_preview() {
+        let long = "a".repeat(300);
+        let memory = RetrievedMemory {
+            cards: vec![
+                card(1, 0.9, false, "ada likes tea"),
+                card(2, 0.4, true, &long),
+            ],
+            ..RetrievedMemory::default()
+        };
+        let captured = captured_memories_from_retrieval(&memory);
+        assert_eq!(captured.len(), 2);
+        assert_eq!(captured[0].card_id, 1);
+        assert_eq!(captured[0].salience, 0.9);
+        assert!(!captured[0].competing);
+        assert_eq!(captured[0].preview, "ada likes tea");
+        assert!(captured[1].competing);
+        assert_eq!(captured[1].preview.chars().count(), 120);
+    }
+
+    #[test]
+    fn captured_memories_cap_at_forty() {
+        let cards = (0..60).map(|i| card(i, 0.5, false, "f")).collect();
+        let memory = RetrievedMemory {
+            cards,
+            ..RetrievedMemory::default()
+        };
+        assert_eq!(captured_memories_from_retrieval(&memory).len(), 40);
+    }
+
+    #[test]
+    fn artifact_snapshots_persona_settings_and_counts() {
+        let mut input = DialogInput::default();
+        input.persona.mood = "playful".to_owned();
+        input.persona.custom_persona = "be terse".to_owned();
+        input.persona.profanity = true;
+        input.reference_context = vec!["mem a".to_owned(), "mem b".to_owned()];
+        input.disable_tools = false;
+        input.shield_context = "flag".to_owned();
+        let settings = ChatSettings {
+            reactivity_percentage: 30,
+            enable_profanity: true,
+            ..ChatSettings::defaults(-1)
+        };
+        let artifact = turn_context_artifact(&input, &settings, Vec::new());
+        let persona = artifact.persona.expect("persona snapshot");
+        assert_eq!(persona.mood, "playful");
+        assert!(persona.custom);
+        assert!(persona.profanity);
+        assert!(artifact.tools_offered);
+        assert!(artifact.shield_on);
+        assert_eq!(artifact.reference_context_chars, 10);
+        assert!(
+            artifact
+                .settings
+                .iter()
+                .any(|kv| kv.label == "reactivity" && kv.value == "30%")
+        );
+        assert!(
+            artifact
+                .settings
+                .iter()
+                .any(|kv| kv.label == "profanity" && kv.value == "yes")
+        );
+    }
 }

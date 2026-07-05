@@ -3255,6 +3255,84 @@ async fn turn_opens_and_closes_an_agent_run_with_origin_tools_and_outcome()
     Ok(())
 }
 
+/// A materializer that injects a captured context artifact, to prove the turn
+/// engine lifts it onto the run under the exact `job-{id}` run id.
+struct ContextStubMaterializer;
+
+impl crate::dialog_jobs::DialogInputMaterializer for ContextStubMaterializer {
+    fn materialize_dialog_input<'a>(
+        &'a self,
+        params: &'a openplotva_taskman::DialogJobParams,
+        now: OffsetDateTime,
+    ) -> crate::dialog_jobs::DialogInputMaterializerFuture<'a> {
+        Box::pin(async move {
+            let mut input = crate::dialog_jobs::BasicDialogInputMaterializer
+                .materialize_dialog_input(params, now)
+                .await;
+            input.context_capture = Some(openplotva_dialog::TurnContextArtifact {
+                memories: vec![openplotva_dialog::CapturedMemory {
+                    card_id: 7,
+                    salience: 0.8,
+                    preview: "ada likes tea".to_owned(),
+                    ..openplotva_dialog::CapturedMemory::default()
+                }],
+                persona: Some(openplotva_dialog::PersonaSnapshot {
+                    mood: "playful".to_owned(),
+                    ..openplotva_dialog::PersonaSnapshot::default()
+                }),
+                ..openplotva_dialog::TurnContextArtifact::default()
+            });
+            input
+        })
+    }
+}
+
+#[tokio::test]
+async fn turn_lifts_the_context_artifact_onto_the_run_detail() -> Result<(), Box<dyn Error>> {
+    let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+    let queue = InMemoryTaskQueue::new();
+    let job_id = queue.assign(
+        DIALOG_AIFARM_QUEUE_NAME,
+        new_dialog_job_at(dialog_params("что ты помнишь?"), now),
+    );
+    let provider = StepProviderStub::with_steps(vec![Ok(step_text("помню чай"))]);
+    let toolbox: Arc<dyn openplotva_dialog::DialogToolbox> =
+        Arc::new(SessionToolboxStub::default());
+    let wiring = session_wiring(toolbox, None);
+    let effects = EffectsStub::default();
+    let runs = crate::runtime_llm_runs::RuntimeLlmRunBuffer::new(8);
+    let outcomes = crate::dialog_turn::DialogTurnObserver::new(
+        crate::dialog_turn::RuntimeTurnOutcomeBuffer::new(8),
+        None,
+    )
+    .with_run_buffer(runs.clone());
+
+    let report = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+        &queue,
+        &provider,
+        &effects,
+        &ContextStubMaterializer,
+        &NoopDialogToolCallHistoryStore,
+        DialogJobProcessOptions {
+            llm_runs: Some(&runs),
+            ..session_options(now, &outcomes, &wiring)
+        },
+    )
+    .await;
+    assert!(report.sent_answer);
+
+    let record = runs
+        .list(&crate::runtime_llm_runs::RunListFilter::default(), now)
+        .into_iter()
+        .find(|record| record.run_id == format!("job-{job_id}"))
+        .expect("dialog run present");
+    let detail = record.detail_json();
+    assert_eq!(detail["context"]["memories"][0]["card_id"], 7);
+    assert_eq!(detail["context"]["memories"][0]["preview"], "ada likes tea");
+    assert_eq!(detail["context"]["persona"]["mood"], "playful");
+    Ok(())
+}
+
 /// The loop must forward `LoopOptions.llm_runs` into every tick — a dropped
 /// option silently ships an empty LLM Dialogs section (same failure mode the
 /// `session` option had before it got its loop test).
