@@ -75,15 +75,30 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ inputs.pr_number }}
           PULL_REQUEST_URL: ${{ github.event.pull_request.html_url }}
+          PULL_REQUEST_ADDITIONS: ${{ github.event.pull_request.additions || 0 }}
+          PULL_REQUEST_DELETIONS: ${{ github.event.pull_request.deletions || 0 }}
+          PULL_REQUEST_CHANGED_FILES: ${{ github.event.pull_request.changed_files || 0 }}
         run: |
           set -euo pipefail
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            pr_url="$(gh pr view "$PR_NUMBER" --json url --jq .url)"
+            pr_json="$(gh pr view "$PR_NUMBER" --json url,additions,deletions,changedFiles)"
+            pr_url="$(jq -r .url <<< "$pr_json")"
+            additions="$(jq -r .additions <<< "$pr_json")"
+            deletions="$(jq -r .deletions <<< "$pr_json")"
+            changed_files="$(jq -r .changedFiles <<< "$pr_json")"
           else
             pr_url="$PULL_REQUEST_URL"
+            additions="$PULL_REQUEST_ADDITIONS"
+            deletions="$PULL_REQUEST_DELETIONS"
+            changed_files="$PULL_REQUEST_CHANGED_FILES"
           fi
           test -n "$pr_url"
-          echo "pr_url=$pr_url" >> "$GITHUB_OUTPUT"
+          changed_lines="$(( additions + deletions ))"
+          {
+            echo "pr_url=$pr_url"
+            echo "changed_lines=$changed_lines"
+            echo "changed_files=$changed_files"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Run PR-Agent ${{ matrix.command }}
         env:
@@ -96,6 +111,8 @@ jobs:
           PR_AGENT_AI_TIMEOUT: ${{ vars.PR_AGENT_AI_TIMEOUT || '600' }}
           PR_AGENT_CUSTOM_MODEL_MAX_TOKENS: ${{ vars.PR_AGENT_CUSTOM_MODEL_MAX_TOKENS || '1000000' }}
           PR_AGENT_MAX_MODEL_TOKENS: ${{ vars.PR_AGENT_MAX_MODEL_TOKENS || '1000000' }}
+          PR_AGENT_IMPROVE_MAX_CHANGED_LINES: ${{ vars.PR_AGENT_IMPROVE_MAX_CHANGED_LINES || '800' }}
+          PR_AGENT_IMPROVE_MAX_CHANGED_FILES: ${{ vars.PR_AGENT_IMPROVE_MAX_CHANGED_FILES || '12' }}
           PR_AGENT_REVIEW_EXTRA_INSTRUCTIONS: >-
             Focus on correctness, security boundaries, async/concurrency hazards,
             external contracts, migrations, and production/runtime risks. Do not
@@ -103,8 +120,17 @@ jobs:
             findings already handled by reviewdog and CI.
           PR_AGENT_COMMAND: ${{ matrix.command }}
           PR_URL: ${{ steps.target.outputs.pr_url }}
+          PR_CHANGED_LINES: ${{ steps.target.outputs.changed_lines }}
+          PR_CHANGED_FILES: ${{ steps.target.outputs.changed_files }}
         run: |
           set -euo pipefail
+          if [[ "$PR_AGENT_COMMAND" == "improve" ]] && {
+            (( PR_CHANGED_LINES > PR_AGENT_IMPROVE_MAX_CHANGED_LINES )) ||
+            (( PR_CHANGED_FILES > PR_AGENT_IMPROVE_MAX_CHANGED_FILES ));
+          }; then
+            echo "::notice title=PR-Agent improve skipped::PR has ${PR_CHANGED_LINES} changed lines across ${PR_CHANGED_FILES} files; limits are ${PR_AGENT_IMPROVE_MAX_CHANGED_LINES} lines and ${PR_AGENT_IMPROVE_MAX_CHANGED_FILES} files."
+            exit 0
+          fi
           log_file="$(mktemp)"
           set +e
           docker run --rm \
