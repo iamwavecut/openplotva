@@ -153,6 +153,29 @@ pub trait MemoryWriteStore: std::fmt::Debug + Send + Sync {
         new_id: i64,
     ) -> MemoryWriteStoreFuture<'a, (), Self::Error>;
 
+    /// Rewrite a card's text in place (consolidation `update`/`merge` refinement).
+    fn update_card_text<'a>(
+        &'a self,
+        id: i64,
+        fact_text: &'a str,
+        subject: &'a str,
+    ) -> MemoryWriteStoreFuture<'a, (), Self::Error>;
+
+    /// Confirm an existing card again: raise confidence/salience, bump count.
+    fn reinforce_card<'a>(
+        &'a self,
+        id: i64,
+        confidence_delta: f64,
+        salience_delta: f64,
+    ) -> MemoryWriteStoreFuture<'a, (), Self::Error>;
+
+    /// Weaken an existing card by lowering its confidence.
+    fn demote_card<'a>(
+        &'a self,
+        id: i64,
+        confidence_delta: f64,
+    ) -> MemoryWriteStoreFuture<'a, (), Self::Error>;
+
     /// Insert the run episode and optional embedding.
     fn insert_episode_with_embedding<'a>(
         &'a self,
@@ -273,6 +296,36 @@ impl MemoryWriteStore for PostgresMemoryStore {
         Box::pin(
             async move { PostgresMemoryStore::mark_cards_competing(self, old_id, new_id).await },
         )
+    }
+
+    fn update_card_text<'a>(
+        &'a self,
+        id: i64,
+        fact_text: &'a str,
+        subject: &'a str,
+    ) -> MemoryWriteStoreFuture<'a, (), Self::Error> {
+        Box::pin(async move {
+            PostgresMemoryStore::update_card_text(self, id, fact_text, subject, None).await
+        })
+    }
+
+    fn reinforce_card<'a>(
+        &'a self,
+        id: i64,
+        confidence_delta: f64,
+        salience_delta: f64,
+    ) -> MemoryWriteStoreFuture<'a, (), Self::Error> {
+        Box::pin(async move {
+            PostgresMemoryStore::reinforce_card(self, id, confidence_delta, salience_delta).await
+        })
+    }
+
+    fn demote_card<'a>(
+        &'a self,
+        id: i64,
+        confidence_delta: f64,
+    ) -> MemoryWriteStoreFuture<'a, (), Self::Error> {
+        Box::pin(async move { PostgresMemoryStore::demote_card(self, id, confidence_delta).await })
     }
 
     fn insert_episode_with_embedding<'a>(
@@ -415,6 +468,10 @@ pub struct MemoryExtractionWriteReport {
     pub competing: Vec<(i64, i64)>,
     /// Non-fatal competing write failures.
     pub competing_errors: Vec<String>,
+    /// Cards folded into a survivor by a merge resolution (old, survivor).
+    pub merged: Vec<(i64, i64)>,
+    /// Non-fatal update/merge/reinforce/demote write failures.
+    pub resolution_errors: Vec<String>,
 }
 
 /// Result of one memory run processing tick.
@@ -2141,6 +2198,8 @@ struct CardExtractionWriteReport {
     supersession_errors: Vec<String>,
     competing: Vec<(i64, i64)>,
     competing_errors: Vec<String>,
+    merged: Vec<(i64, i64)>,
+    resolution_errors: Vec<String>,
 }
 
 async fn write_memory_extraction_cards<ExtractorError, Store, Embedder>(
@@ -2197,6 +2256,10 @@ where
     // Legacy `supersessions` are treated as supersede for backward compatibility.
     let mut supersede_inputs = output.supersessions.clone();
     let mut competing_inputs = Vec::new();
+    let mut update_ops: Vec<(i64, String)> = Vec::new();
+    let mut merge_ops: Vec<(i64, i64, String)> = Vec::new();
+    let mut reinforce_ids: Vec<i64> = Vec::new();
+    let mut demote_ids: Vec<i64> = Vec::new();
     for resolution in &output.resolutions {
         match resolution.decision {
             openplotva_memory::ResolutionDecision::Competing => {
@@ -2204,6 +2267,34 @@ where
             }
             openplotva_memory::ResolutionDecision::Supersede => {
                 supersede_inputs.push(resolution.as_supersession());
+            }
+            openplotva_memory::ResolutionDecision::Update => {
+                let text = resolution.new_fact_text.trim();
+                if resolution.old_card_id != 0 && !text.is_empty() {
+                    update_ops.push((resolution.old_card_id, text.to_owned()));
+                }
+            }
+            openplotva_memory::ResolutionDecision::Merge => {
+                if resolution.old_card_id != 0
+                    && resolution.into_card_id != 0
+                    && resolution.old_card_id != resolution.into_card_id
+                {
+                    merge_ops.push((
+                        resolution.old_card_id,
+                        resolution.into_card_id,
+                        resolution.new_fact_text.trim().to_owned(),
+                    ));
+                }
+            }
+            openplotva_memory::ResolutionDecision::Reinforce => {
+                if resolution.old_card_id != 0 {
+                    reinforce_ids.push(resolution.old_card_id);
+                }
+            }
+            openplotva_memory::ResolutionDecision::Demote => {
+                if resolution.old_card_id != 0 {
+                    demote_ids.push(resolution.old_card_id);
+                }
             }
         }
     }
@@ -2236,6 +2327,52 @@ where
         }
     }
 
+    // In-place consolidation ops operating directly on existing cards. No new
+    // card is created and embeddings are kept (the stored `text_search` column
+    // regenerates from the new fact_text, so lexical retrieval stays correct).
+    for (old_id, fact_text) in &update_ops {
+        match store.update_card_text(*old_id, fact_text, "").await {
+            Ok(()) => report.stats.cards_updated += 1,
+            Err(error) => report
+                .resolution_errors
+                .push(format!("update {old_id}: {error}")),
+        }
+    }
+    for (old_id, into_id, fact_text) in &merge_ops {
+        match store.supersede_card(*into_id, *old_id).await {
+            Ok(()) => {
+                report.stats.cards_superseded += 1;
+                report.merged.push((*old_id, *into_id));
+                if !fact_text.is_empty() {
+                    if let Err(error) = store.update_card_text(*into_id, fact_text, "").await {
+                        report
+                            .resolution_errors
+                            .push(format!("merge-update {into_id}: {error}"));
+                    }
+                }
+            }
+            Err(error) => report
+                .resolution_errors
+                .push(format!("merge {old_id}->{into_id}: {error}")),
+        }
+    }
+    for old_id in &reinforce_ids {
+        match store.reinforce_card(*old_id, 0.1, 0.05).await {
+            Ok(()) => report.stats.cards_updated += 1,
+            Err(error) => report
+                .resolution_errors
+                .push(format!("reinforce {old_id}: {error}")),
+        }
+    }
+    for old_id in &demote_ids {
+        match store.demote_card(*old_id, 0.15).await {
+            Ok(()) => report.stats.cards_updated += 1,
+            Err(error) => report
+                .resolution_errors
+                .push(format!("demote {old_id}: {error}")),
+        }
+    }
+
     Ok(report)
 }
 
@@ -2261,6 +2398,10 @@ fn merge_card_report(
         .supersession_errors
         .extend(card_report.supersession_errors);
     report.competing_errors.extend(card_report.competing_errors);
+    report.merged.extend(card_report.merged);
+    report
+        .resolution_errors
+        .extend(card_report.resolution_errors);
 }
 
 async fn insert_memory_episode<ExtractorError, Store, Embedder>(
@@ -3408,6 +3549,7 @@ mod tests {
         card_embedding_slots: Mutex<Vec<bool>>,
         links: Mutex<Vec<LinkInput>>,
         superseded: Mutex<Vec<(i64, i64)>>,
+        resolution_ops: Mutex<Vec<String>>,
         episodes: Mutex<Vec<Episode>>,
         episode_had_embedding: Mutex<bool>,
     }
@@ -3481,6 +3623,50 @@ mod tests {
             _new_id: i64,
         ) -> MemoryWriteStoreFuture<'a, (), Self::Error> {
             Box::pin(async move { Ok(()) })
+        }
+
+        fn update_card_text<'a>(
+            &'a self,
+            id: i64,
+            fact_text: &'a str,
+            _subject: &'a str,
+        ) -> MemoryWriteStoreFuture<'a, (), Self::Error> {
+            Box::pin(async move {
+                self.resolution_ops
+                    .lock()
+                    .expect("resolution ops")
+                    .push(format!("update:{id}:{fact_text}"));
+                Ok(())
+            })
+        }
+
+        fn reinforce_card<'a>(
+            &'a self,
+            id: i64,
+            _confidence_delta: f64,
+            _salience_delta: f64,
+        ) -> MemoryWriteStoreFuture<'a, (), Self::Error> {
+            Box::pin(async move {
+                self.resolution_ops
+                    .lock()
+                    .expect("resolution ops")
+                    .push(format!("reinforce:{id}"));
+                Ok(())
+            })
+        }
+
+        fn demote_card<'a>(
+            &'a self,
+            id: i64,
+            _confidence_delta: f64,
+        ) -> MemoryWriteStoreFuture<'a, (), Self::Error> {
+            Box::pin(async move {
+                self.resolution_ops
+                    .lock()
+                    .expect("resolution ops")
+                    .push(format!("demote:{id}"));
+                Ok(())
+            })
         }
 
         fn insert_episode_with_embedding<'a>(
@@ -4224,6 +4410,7 @@ mod tests {
                 decision: openplotva_memory::ResolutionDecision::Competing,
                 conflict_score: 0.5,
                 reason: "both plausible".to_owned(),
+                into_card_id: 0,
             }],
             input_tokens: 11,
             output_tokens: 12,
