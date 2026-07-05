@@ -23,7 +23,7 @@ pub const DEFAULT_MEMORY_MAX_QUEUED_RUNS: i32 = 5_000;
 pub const DEFAULT_MEMORY_MAX_DAILY_ENQUEUED_RUNS: i32 = 2_000;
 pub const DISCOVERY_PRIORITY_MEMORY: i32 = 10;
 pub const DEFAULT_MEMORY_CONSOLIDATION_MODEL: &str = "Gemma 4 26B Heretic";
-pub const PROMPT_VERSION: &str = "chat_memory_daily_v4";
+pub const PROMPT_VERSION: &str = "chat_memory_daily_v5";
 pub const DEFAULT_DISCOVERY_BASE_URL: &str = "http://127.0.0.1:50051";
 pub const DEFAULT_MEMORY_REDACTION_SERVICE_NAME: &str = "privacy-filter";
 pub const DEFAULT_MEMORY_REDACTION_ENDPOINT_NAME: &str = "redact";
@@ -267,6 +267,102 @@ pub struct ExtractInput {
     pub existing_cards: Vec<Card>,
 }
 
+impl ExtractInput {
+    /// Serialize this extraction input for the LLM prompt, projecting
+    /// `existing_cards` to their compact reasoning payload (id, type, subject,
+    /// fact, confidence, coarse age, disputed) instead of the full DB rows.
+    /// This keeps the prompt small and lets more cards fit the token budget; the
+    /// `id` is preserved so the model can still cite `old_card_id` in
+    /// resolutions. All other fields serialize exactly as before.
+    pub fn to_prompt_payload(&self) -> Result<String, serde_json::Error> {
+        let mut value = serde_json::to_value(self)?;
+        if !self.existing_cards.is_empty() {
+            let compact = compact_existing_cards(&self.existing_cards, self.run.range_end_at);
+            let compact = serde_json::to_value(&compact)?;
+            if let Some(object) = value.as_object_mut() {
+                object.insert("existing_cards".to_owned(), compact);
+            }
+        }
+        serde_json::to_string_pretty(&value)
+    }
+}
+
+/// Compact projection of an existing card for the extraction/consolidation
+/// prompt: only the payload the model reasons over, none of the storage meta.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct CompactExistingCard {
+    /// Card id — required so the model can reference it in a resolution.
+    pub id: i64,
+    /// Card type.
+    #[serde(rename = "type")]
+    pub card_type: String,
+    /// Subject the fact is about.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub subject: String,
+    /// The fact itself.
+    pub fact: String,
+    /// Confidence, rounded to two decimals.
+    pub conf: f64,
+    /// Coarse relative age ("today" | "3d" | "2w" | "4mo" | "old").
+    pub age: String,
+    /// Present only when the card is in a competing/disputed state.
+    #[serde(skip_serializing_if = "is_false")]
+    pub disputed: bool,
+}
+
+/// Project existing cards to their compact form, grouped by normalized subject
+/// so the model sees everything about one entity together.
+#[must_use]
+pub fn compact_existing_cards(cards: &[Card], as_of: OffsetDateTime) -> Vec<CompactExistingCard> {
+    let mut out: Vec<CompactExistingCard> = cards
+        .iter()
+        .map(|card| CompactExistingCard {
+            id: card.id,
+            card_type: card.card_type.clone(),
+            subject: card.subject.trim().to_owned(),
+            fact: card.fact_text.trim().to_owned(),
+            conf: round_two(card.confidence),
+            age: coarse_card_age(card.created_at.or(card.last_observed_at), as_of),
+            disputed: card.status == CARD_STATUS_COMPETING,
+        })
+        .collect();
+    out.sort_by(|left, right| {
+        normalize_subject(&left.subject)
+            .cmp(&normalize_subject(&right.subject))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    out
+}
+
+/// Normalize a card subject for clustering/identity: trimmed and lowercased.
+#[must_use]
+pub fn normalize_subject(subject: &str) -> String {
+    subject.trim().to_lowercase()
+}
+
+fn round_two(value: f64) -> f64 {
+    (value * 100.0).round() / 100.0
+}
+
+/// Coarse, token-cheap relative age of a card as of the given instant.
+fn coarse_card_age(created: Option<OffsetDateTime>, as_of: OffsetDateTime) -> String {
+    let Some(created) = created else {
+        return "unknown".to_owned();
+    };
+    let days = (as_of - created).whole_days();
+    if days < 1 {
+        "today".to_owned()
+    } else if days < 7 {
+        format!("{days}d")
+    } else if days < 30 {
+        format!("{}w", days / 7)
+    } else if days < 365 {
+        format!("{}mo", days / 30)
+    } else {
+        "old".to_owned()
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct ExtractOutput {
     /// Episode summary.
@@ -336,6 +432,10 @@ pub struct CandidateCard {
     /// audiences (stable identity, language, long-term role). Defaults to false.
     #[serde(default, skip_serializing_if = "is_false")]
     pub portable: bool,
+    /// Semantic lifespan the model assigns: permanent|long|short|ephemeral.
+    /// Empty means "derive from card_type". Drives the card's expiry (forgetting).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub durability: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -357,6 +457,14 @@ pub enum ResolutionDecision {
     Supersede,
     /// Both facts are plausible yet contradictory; keep both as `competing`.
     Competing,
+    /// Rewrite the existing card's text in place, keeping its id, age and history.
+    Update,
+    /// Fold the existing card into a surviving card (`into_card_id`).
+    Merge,
+    /// Confirm the existing card again: raise its confidence/salience.
+    Reinforce,
+    /// Weaken the existing card: lower its confidence.
+    Demote,
 }
 
 /// A scored decision on how a freshly extracted fact relates to an existing card.
@@ -375,6 +483,9 @@ pub struct Resolution {
     /// Reasoning.
     #[serde(default)]
     pub reason: String,
+    /// For `merge`: the surviving card that `old_card_id` folds into.
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub into_card_id: i64,
 }
 
 impl Resolution {
@@ -611,6 +722,8 @@ pub struct CardInput {
     pub source_message_ids: Vec<i32>,
     /// Observation timestamp.
     pub observed_at: OffsetDateTime,
+    /// When this fact should be forgotten (archived); `None` means durable.
+    pub expires_at: Option<OffsetDateTime>,
 }
 
 impl Default for CardInput {
@@ -627,6 +740,7 @@ impl Default for CardInput {
             source_entry_ids: Vec::new(),
             source_message_ids: Vec::new(),
             observed_at: go_zero_time(),
+            expires_at: None,
         }
     }
 }
@@ -2373,6 +2487,39 @@ fn is_noisy_memory_forward_origin(origin_type: &str) -> bool {
     origin_type.eq_ignore_ascii_case("channel") || origin_type.eq_ignore_ascii_case("chat")
 }
 
+/// Semantic lifespan tiers a card can carry, controlling how fast it is forgotten.
+pub const DURABILITY_PERMANENT: &str = "permanent";
+/// Long-lived fact, kept effectively indefinitely.
+pub const DURABILITY_LONG: &str = "long";
+/// Short-lived fact (weeks).
+pub const DURABILITY_SHORT: &str = "short";
+/// Throwaway fact (a couple of days).
+pub const DURABILITY_EPHEMERAL: &str = "ephemeral";
+
+/// Days-to-live for a time-bounded fact; durable facts return `None` (no expiry).
+/// When the model gives no durability, only one-off events fade by default so we
+/// never silently drop durable identity/preference facts.
+#[must_use]
+pub fn durability_ttl_days(durability: &str, card_type: &str) -> Option<i64> {
+    match durability.trim().to_lowercase().as_str() {
+        DURABILITY_EPHEMERAL => Some(2),
+        DURABILITY_SHORT => Some(14),
+        DURABILITY_PERMANENT | DURABILITY_LONG => None,
+        _ if card_type == CARD_TYPE_EVENT => Some(14),
+        _ => None,
+    }
+}
+
+/// Compute a card's expiry instant from its durability, or `None` if durable.
+#[must_use]
+pub fn expires_at_from_durability(
+    durability: &str,
+    card_type: &str,
+    observed_at: OffsetDateTime,
+) -> Option<OffsetDateTime> {
+    durability_ttl_days(durability, card_type).map(|days| observed_at + time::Duration::days(days))
+}
+
 fn card_from_candidate(
     input: &ExtractInput,
     candidate: &CandidateCard,
@@ -2383,6 +2530,9 @@ fn card_from_candidate(
         return None;
     }
     let kind = candidate_scope_kind(input, candidate)?;
+    let card_type = normalize_card_type(&candidate.card_type);
+    let observed_at = observed_at_from_messages_at(&input.messages, fallback_observed_at);
+    let expires_at = expires_at_from_durability(&candidate.durability, &card_type, observed_at);
 
     Some(CardInput {
         observation_scope: ObservationScope {
@@ -2395,7 +2545,7 @@ fn card_from_candidate(
             kind,
             portable: candidate.portable,
         },
-        card_type: normalize_card_type(&candidate.card_type),
+        card_type,
         subject: candidate.subject.clone(),
         predicate: candidate.predicate.clone(),
         object: candidate.object.clone(),
@@ -2404,7 +2554,8 @@ fn card_from_candidate(
         salience: candidate.salience,
         source_entry_ids: candidate.source_entry_ids.clone(),
         source_message_ids: candidate.source_message_ids.clone(),
-        observed_at: observed_at_from_messages_at(&input.messages, fallback_observed_at),
+        observed_at,
+        expires_at,
     })
 }
 
@@ -3903,5 +4054,77 @@ mod tests {
             ),
             vec![(7, 20)]
         );
+    }
+
+    #[test]
+    fn compact_extraction_payload_strips_meta_keeps_payload_and_clusters() {
+        let as_of = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("as_of");
+        let created = as_of - time::Duration::days(9);
+        let mut input = ExtractInput::default();
+        input.run.range_end_at = as_of;
+        input.messages = vec![Message {
+            entry_id: "e1".to_owned(),
+            text: "hello".to_owned(),
+            ..Message::default()
+        }];
+        input.existing_cards = vec![
+            Card {
+                id: 42,
+                card_type: CARD_TYPE_EVENT.to_owned(),
+                status: CARD_STATUS_ACTIVE.to_owned(),
+                subject: "  Bob  ".to_owned(),
+                predicate: "wrote".to_owned(),
+                object: "a word".to_owned(),
+                fact_text: "  Bob wrote a word.  ".to_owned(),
+                confidence: 0.9012,
+                salience: 0.3,
+                observation_count: 5,
+                origin_chat_id: -100,
+                created_at: Some(created),
+                ..Card::default()
+            },
+            Card {
+                id: 7,
+                card_type: CARD_TYPE_PREFERENCE.to_owned(),
+                status: CARD_STATUS_COMPETING.to_owned(),
+                subject: "Ada".to_owned(),
+                fact_text: "Ada likes tea.".to_owned(),
+                confidence: 0.5,
+                created_at: Some(as_of),
+                ..Card::default()
+            },
+        ];
+
+        let payload = input.to_prompt_payload().expect("payload");
+
+        for banned in [
+            "observation_count",
+            "salience",
+            "origin_chat_id",
+            "decay_score",
+            "\"visibility\"",
+            "\"predicate\"",
+            "\"object\"",
+            "\"valid_from\"",
+            "\"last_observed_at\"",
+        ] {
+            assert!(
+                !payload.contains(banned),
+                "compact payload leaked meta {banned}:\n{payload}"
+            );
+        }
+
+        assert!(payload.contains("\"id\": 42"));
+        assert!(payload.contains("\"type\": \"event\""));
+        assert!(payload.contains("\"subject\": \"Bob\""));
+        assert!(payload.contains("Bob wrote a word."));
+        assert!(payload.contains("\"conf\": 0.9"));
+        assert!(payload.contains("\"age\": \"today\""));
+        assert!(payload.contains("\"disputed\": true"));
+        assert!(payload.contains("\"entry_id\": \"e1\""));
+
+        let ada = payload.find("Ada likes tea").expect("ada present");
+        let bob = payload.find("Bob wrote a word").expect("bob present");
+        assert!(ada < bob, "expected Ada clustered before Bob:\n{payload}");
     }
 }

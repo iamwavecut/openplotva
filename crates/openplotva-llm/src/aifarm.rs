@@ -2033,8 +2033,9 @@ where
         on_status: &mut (dyn FnMut(StatusUpdate) + Send),
     ) -> Result<ExtractOutput, AifarmMemoryExtractorError> {
         let system_prompt = openplotva_prompts::read("memory/extraction")?;
-        let payload =
-            serde_json::to_string_pretty(input).map_err(AifarmMemoryExtractorError::Input)?;
+        let payload = input
+            .to_prompt_payload()
+            .map_err(AifarmMemoryExtractorError::Input)?;
         let mut request = self.request(&system_prompt, &payload);
         request.trace = Some(aux_llm_call_trace(
             "memory_extraction",
@@ -2137,7 +2138,8 @@ where
         input: &ExtractInput,
     ) -> Result<ChatCompletionRequest, GenkitOpenAiCompatibleMemoryExtractorError> {
         let system_prompt = openplotva_prompts::read("memory/extraction")?;
-        let payload = serde_json::to_string_pretty(input)
+        let payload = input
+            .to_prompt_payload()
             .map_err(GenkitOpenAiCompatibleMemoryExtractorError::Input)?;
         Ok(ChatCompletionRequest {
             model: self.cfg.model.trim().to_owned(),
@@ -4280,6 +4282,10 @@ fn memory_extraction_response_schema() -> Value {
                 "type": "array",
                 "items": memory_supersession_schema(),
             },
+            "resolutions": {
+                "type": "array",
+                "items": memory_resolution_schema(),
+            },
             "links": {
                 "type": "array",
                 "items": memory_link_schema(),
@@ -4314,6 +4320,8 @@ fn memory_candidate_card_schema() -> Value {
             "fact_text": {"type": "string"},
             "confidence": {"type": "number"},
             "salience": {"type": "number"},
+            "durability": {"type": "string"},
+            "portable": {"type": "boolean"},
             "source_entry_ids": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -4334,6 +4342,25 @@ fn memory_supersession_schema() -> Value {
         "properties": {
             "old_card_id": {"type": "integer"},
             "new_fact_text": {"type": "string"},
+            "reason": {"type": "string"},
+        },
+    })
+}
+
+fn memory_resolution_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["old_card_id", "decision"],
+        "properties": {
+            "old_card_id": {"type": "integer"},
+            "into_card_id": {"type": "integer"},
+            "new_fact_text": {"type": "string"},
+            "decision": {
+                "type": "string",
+                "enum": ["supersede", "competing", "update", "merge", "reinforce", "demote"],
+            },
+            "conflict_score": {"type": "number"},
             "reason": {"type": "string"},
         },
     })

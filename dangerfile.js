@@ -1,4 +1,3 @@
-const fs = require("fs");
 const { danger, fail, warn, message } = require("danger");
 
 const pr = danger.github.pr;
@@ -58,10 +57,19 @@ if (touchesProdDeploy) {
 }
 
 if (touchesMigrations) {
-  const changedMigrationText = changedFiles
-    .filter((file) => file.startsWith("migrations/") && !deletedFiles.includes(file) && fs.existsSync(file))
-    .map((file) => fs.readFileSync(file, "utf8"))
-    .join("\n");
+  // The Danger default runner strips top-level `require`, so `fs` must be
+  // required at point of use and guarded: if it is unavailable in the sandbox,
+  // fall back to reviewing the PR body alone instead of crashing the run.
+  let changedMigrationText = "";
+  try {
+    const fs = require("fs");
+    changedMigrationText = changedFiles
+      .filter((file) => file.startsWith("migrations/") && !deletedFiles.includes(file) && fs.existsSync(file))
+      .map((file) => fs.readFileSync(file, "utf8"))
+      .join("\n");
+  } catch (error) {
+    // fs unavailable in the Danger runner; the PR body carries the compat notes.
+  }
   const migrationReviewText = `${bodyWithoutComments}\n${changedMigrationText}`;
 
   const hasCompatibilityNotes =
