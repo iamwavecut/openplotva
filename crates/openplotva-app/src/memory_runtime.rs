@@ -2504,6 +2504,19 @@ where
         }
     }
     for (old_id, into_id, fact_text) in &merge_ops {
+        // Consume this op's re-embedding up front, keyed on the same
+        // `!is_empty` filter the producer used, so the index stays aligned with
+        // `resolution_texts` even when the supersede below fails.
+        let embedding = if fact_text.is_empty() {
+            None
+        } else {
+            let embedding = resolution_embeddings
+                .get(resolution_embed_idx)
+                .cloned()
+                .flatten();
+            resolution_embed_idx += 1;
+            embedding
+        };
         // Retire the folded card (old_id) into the survivor (into_id):
         // supersede_card's first arg is the card that gets superseded.
         match store.supersede_card(*old_id, *into_id).await {
@@ -2513,11 +2526,6 @@ where
                 let update = if fact_text.is_empty() {
                     Ok(())
                 } else {
-                    let embedding = resolution_embeddings
-                        .get(resolution_embed_idx)
-                        .cloned()
-                        .flatten();
-                    resolution_embed_idx += 1;
                     store
                         .update_card_text(*into_id, fact_text, "", embedding)
                         .await
