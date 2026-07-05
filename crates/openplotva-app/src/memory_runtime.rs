@@ -2465,12 +2465,15 @@ where
             Ok(()) => {
                 report.stats.cards_superseded += 1;
                 report.merged.push((*old_id, *into_id));
-                if !fact_text.is_empty() {
-                    if let Err(error) = store.update_card_text(*into_id, fact_text, "").await {
-                        report
-                            .resolution_errors
-                            .push(format!("merge-update {into_id}: {error}"));
-                    }
+                let update = if fact_text.is_empty() {
+                    Ok(())
+                } else {
+                    store.update_card_text(*into_id, fact_text, "").await
+                };
+                if let Err(error) = update {
+                    report
+                        .resolution_errors
+                        .push(format!("merge-update {into_id}: {error}"));
                 }
             }
             Err(error) => report
