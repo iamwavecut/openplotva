@@ -4282,6 +4282,10 @@ fn memory_extraction_response_schema() -> Value {
                 "type": "array",
                 "items": memory_supersession_schema(),
             },
+            "resolutions": {
+                "type": "array",
+                "items": memory_resolution_schema(),
+            },
             "links": {
                 "type": "array",
                 "items": memory_link_schema(),
@@ -4316,6 +4320,8 @@ fn memory_candidate_card_schema() -> Value {
             "fact_text": {"type": "string"},
             "confidence": {"type": "number"},
             "salience": {"type": "number"},
+            "durability": {"type": "string"},
+            "portable": {"type": "boolean"},
             "source_entry_ids": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -4336,6 +4342,25 @@ fn memory_supersession_schema() -> Value {
         "properties": {
             "old_card_id": {"type": "integer"},
             "new_fact_text": {"type": "string"},
+            "reason": {"type": "string"},
+        },
+    })
+}
+
+fn memory_resolution_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["old_card_id", "decision"],
+        "properties": {
+            "old_card_id": {"type": "integer"},
+            "into_card_id": {"type": "integer"},
+            "new_fact_text": {"type": "string"},
+            "decision": {
+                "type": "string",
+                "enum": ["supersede", "competing", "update", "merge", "reinforce", "demote"],
+            },
+            "conflict_score": {"type": "number"},
             "reason": {"type": "string"},
         },
     })
