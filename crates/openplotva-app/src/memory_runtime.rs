@@ -153,12 +153,14 @@ pub trait MemoryWriteStore: std::fmt::Debug + Send + Sync {
         new_id: i64,
     ) -> MemoryWriteStoreFuture<'a, (), Self::Error>;
 
-    /// Rewrite a card's text in place (consolidation `update`/`merge` refinement).
+    /// Rewrite a card's text in place (consolidation `update`/`merge` refinement),
+    /// refreshing the embedding when one is supplied.
     fn update_card_text<'a>(
         &'a self,
         id: i64,
         fact_text: &'a str,
         subject: &'a str,
+        embedding: Option<PgEmbeddingVector>,
     ) -> MemoryWriteStoreFuture<'a, (), Self::Error>;
 
     /// Confirm an existing card again: raise confidence/salience, bump count.
@@ -303,9 +305,11 @@ impl MemoryWriteStore for PostgresMemoryStore {
         id: i64,
         fact_text: &'a str,
         subject: &'a str,
+        embedding: Option<PgEmbeddingVector>,
     ) -> MemoryWriteStoreFuture<'a, (), Self::Error> {
         Box::pin(async move {
-            PostgresMemoryStore::update_card_text(self, id, fact_text, subject, None).await
+            PostgresMemoryStore::update_card_text(self, id, fact_text, subject, embedding.as_ref())
+                .await
         })
     }
 
@@ -2449,11 +2453,50 @@ where
         }
     }
 
-    // In-place consolidation ops operating directly on existing cards. No new
-    // card is created and embeddings are kept (the stored `text_search` column
-    // regenerates from the new fact_text, so lexical retrieval stays correct).
+    // In-place consolidation ops operating directly on existing cards. The
+    // rewritten text is re-embedded so vector retrieval matches the consolidated
+    // fact (the stored `text_search` column already regenerates for lexical
+    // retrieval); if the embedder is down we keep the old embedding.
+    let mut resolution_texts: Vec<String> = Vec::new();
+    for (_, fact_text) in &update_ops {
+        resolution_texts.push(fact_text.clone());
+    }
+    for (_, _, fact_text) in &merge_ops {
+        if !fact_text.is_empty() {
+            resolution_texts.push(fact_text.clone());
+        }
+    }
+    let resolution_embeddings: Vec<Option<PgEmbeddingVector>> = match embedder {
+        Some(provider) if !resolution_texts.is_empty() => match provider
+            .embed_batch(
+                &resolution_texts,
+                cfg.embedding_dimension,
+                MEMORY_CARD_EMBEDDING_TASK,
+            )
+            .await
+        {
+            Ok(embeddings) => embeddings,
+            Err(error) => {
+                report
+                    .card_embedding_error
+                    .get_or_insert_with(|| error.to_string());
+                vec![None; resolution_texts.len()]
+            }
+        },
+        _ => vec![None; resolution_texts.len()],
+    };
+    let mut resolution_embed_idx = 0usize;
+
     for (old_id, fact_text) in &update_ops {
-        match store.update_card_text(*old_id, fact_text, "").await {
+        let embedding = resolution_embeddings
+            .get(resolution_embed_idx)
+            .cloned()
+            .flatten();
+        resolution_embed_idx += 1;
+        match store
+            .update_card_text(*old_id, fact_text, "", embedding)
+            .await
+        {
             Ok(()) => report.stats.cards_updated += 1,
             Err(error) => report
                 .resolution_errors
@@ -2461,6 +2504,19 @@ where
         }
     }
     for (old_id, into_id, fact_text) in &merge_ops {
+        // Consume this op's re-embedding up front, keyed on the same
+        // `!is_empty` filter the producer used, so the index stays aligned with
+        // `resolution_texts` even when the supersede below fails.
+        let embedding = if fact_text.is_empty() {
+            None
+        } else {
+            let embedding = resolution_embeddings
+                .get(resolution_embed_idx)
+                .cloned()
+                .flatten();
+            resolution_embed_idx += 1;
+            embedding
+        };
         // Retire the folded card (old_id) into the survivor (into_id):
         // supersede_card's first arg is the card that gets superseded.
         match store.supersede_card(*old_id, *into_id).await {
@@ -2470,7 +2526,9 @@ where
                 let update = if fact_text.is_empty() {
                     Ok(())
                 } else {
-                    store.update_card_text(*into_id, fact_text, "").await
+                    store
+                        .update_card_text(*into_id, fact_text, "", embedding)
+                        .await
                 };
                 if let Err(error) = update {
                     report
@@ -3757,12 +3815,16 @@ mod tests {
             id: i64,
             fact_text: &'a str,
             _subject: &'a str,
+            embedding: Option<PgEmbeddingVector>,
         ) -> MemoryWriteStoreFuture<'a, (), Self::Error> {
             Box::pin(async move {
                 self.resolution_ops
                     .lock()
                     .expect("resolution ops")
-                    .push(format!("update:{id}:{fact_text}"));
+                    .push(format!(
+                        "update:{id}:{fact_text}:emb={}",
+                        embedding.is_some()
+                    ));
                 Ok(())
             })
         }
