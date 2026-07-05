@@ -2202,6 +2202,70 @@ struct CardExtractionWriteReport {
     resolution_errors: Vec<String>,
 }
 
+/// How often the archival worker sweeps for TTL-expired memory cards.
+pub const MEMORY_CARD_ARCHIVAL_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(60 * 60);
+/// Batch size per archival statement.
+pub const MEMORY_CARD_ARCHIVAL_BATCH: i64 = 10_000;
+
+/// Outcome of the memory-card archival worker.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MemoryCardArchivalReport {
+    /// Cards moved to `expired`.
+    pub archived: u64,
+    /// Sweep ticks executed.
+    pub ticks: u64,
+    /// Failed batches.
+    pub errors: u64,
+}
+
+/// Periodically archive memory cards whose durability TTL has elapsed
+/// (status -> 'expired', retracted_at stamped). Retrieval already hides expired
+/// cards via the TTL filter; this keeps the active set from growing unbounded.
+/// Runs until `stop` resolves; each tick drains in batches.
+pub async fn run_memory_card_archival_worker_until<Stop>(
+    store: PostgresMemoryStore,
+    interval: std::time::Duration,
+    batch: i64,
+    stop: Stop,
+) -> MemoryCardArchivalReport
+where
+    Stop: std::future::Future<Output = ()>,
+{
+    let mut report = MemoryCardArchivalReport::default();
+    let batch = batch.max(1);
+    tokio::pin!(stop);
+    loop {
+        loop {
+            match store.archive_expired_cards(batch).await {
+                Ok(archived) => {
+                    report.archived += archived;
+                    if archived > 0 {
+                        tracing::debug!(archived, "archived expired memory cards batch");
+                    }
+                    if archived < batch as u64 {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    report.errors += 1;
+                    tracing::warn!(%error, "failed to archive expired memory cards batch");
+                    break;
+                }
+            }
+        }
+        report.ticks += 1;
+
+        let sleep = tokio::time::sleep(interval);
+        tokio::pin!(sleep);
+        tokio::select! {
+            () = &mut stop => break,
+            () = &mut sleep => {}
+        }
+    }
+    report
+}
+
 async fn write_memory_extraction_cards<ExtractorError, Store, Embedder>(
     store: &Store,
     embedder: Option<&Embedder>,

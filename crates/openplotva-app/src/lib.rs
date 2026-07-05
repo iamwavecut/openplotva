@@ -10209,6 +10209,26 @@ async fn start_runtime_workers(
         ));
     }
 
+    if config.memory.enabled {
+        let archival_store = memory_store.clone();
+        let archival_stop = stop.subscribe();
+        let worker = tokio::spawn(async move {
+            let report = memory_runtime::run_memory_card_archival_worker_until(
+                archival_store,
+                memory_runtime::MEMORY_CARD_ARCHIVAL_INTERVAL,
+                memory_runtime::MEMORY_CARD_ARCHIVAL_BATCH,
+                wait_for_runtime_stop(archival_stop),
+            )
+            .await;
+            tracing::info!(?report, "memory card archival worker stopped");
+        });
+        readiness_checks.push(ReadinessCheck::ok(
+            "memory_card_archival",
+            "Expired memory cards archived hourly (durability-based forgetting)",
+        ));
+        workers.handles.push(worker);
+    }
+
     let Some(bot_key) = config.bot.key.as_deref() else {
         readiness_checks.push(ReadinessCheck::skipped("pending_ops", "BOT_KEY is not set"));
         readiness_checks.push(ReadinessCheck::skipped(
