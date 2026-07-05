@@ -277,9 +277,10 @@ impl ExtractInput {
     pub fn to_prompt_payload(&self) -> Result<String, serde_json::Error> {
         let mut value = serde_json::to_value(self)?;
         if !self.existing_cards.is_empty() {
+            let compact = compact_existing_cards(&self.existing_cards, self.run.range_end_at);
+            let compact = serde_json::to_value(&compact)?;
             if let Some(object) = value.as_object_mut() {
-                let compact = compact_existing_cards(&self.existing_cards, self.run.range_end_at);
-                object.insert("existing_cards".to_owned(), serde_json::to_value(&compact)?);
+                object.insert("existing_cards".to_owned(), compact);
             }
         }
         serde_json::to_string_pretty(&value)
