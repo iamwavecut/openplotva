@@ -2650,17 +2650,17 @@ impl AppConfig {
                 subject_merge_min_cards: parse_i32(
                     "MEMORY_SUBJECT_MERGE_MIN_CARDS",
                     raw.memory_subject_merge_min_cards,
-                    6,
+                    3,
                 )?,
                 subject_merge_cooldown_hours: parse_f64(
                     "MEMORY_SUBJECT_MERGE_COOLDOWN_HOURS",
                     raw.memory_subject_merge_cooldown_hours,
-                    168.0,
+                    72.0,
                 )?,
                 subject_merge_interval_seconds: parse_i32(
                     "MEMORY_SUBJECT_MERGE_INTERVAL_SECONDS",
                     raw.memory_subject_merge_interval_seconds,
-                    45,
+                    30,
                 )?,
                 redaction_enabled: parse_bool(
                     "MEMORY_REDACTION_ENABLED",
