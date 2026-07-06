@@ -188,6 +188,7 @@ const RETRYABLE_MESSAGE_RULES: &[(FailureReason, &[&str])] = &[
             "empty final text",
             "no tool calls",
             "decode chat completion payload",
+            "decode memory extractor response",
             "response body is empty",
         ],
     ),
@@ -287,6 +288,10 @@ mod tests {
             ),
             (
                 "tool protocol error: empty final text on iteration 2".to_owned(),
+                FailureReason::ProviderProtocolError,
+            ),
+            (
+                "extract memory batch: decode memory extractor response".to_owned(),
                 FailureReason::ProviderProtocolError,
             ),
         ];
