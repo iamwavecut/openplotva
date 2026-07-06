@@ -1524,12 +1524,11 @@ impl AifarmMemoryExtractorConfig {
         } else {
             self.max_output_tokens
         };
-        if self.frequency_penalty.is_none() {
-            self.frequency_penalty = Some(0.3);
-        }
-        if self.presence_penalty.is_none() {
-            self.presence_penalty = Some(0.3);
-        }
+        // Apply the anti-repetition default, then clamp to the [-2.0, 2.0] range
+        // the OpenAI-compatible backend enforces so an out-of-range or non-finite
+        // operator override cannot 400 every extraction request.
+        self.frequency_penalty = Some(clamp_penalty(self.frequency_penalty.unwrap_or(0.3)));
+        self.presence_penalty = Some(clamp_penalty(self.presence_penalty.unwrap_or(0.3)));
         if self.client.default_model.trim().is_empty() {
             self.client.default_model = self.model.clone();
         }
@@ -4527,6 +4526,14 @@ fn default_string(value: &str, fallback: &str) -> String {
     }
 }
 
+fn clamp_penalty(value: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(-2.0, 2.0)
+    } else {
+        0.3
+    }
+}
+
 fn default_duration(value: StdDuration, fallback: StdDuration) -> StdDuration {
     if value.is_zero() { fallback } else { value }
 }
@@ -5796,6 +5803,27 @@ mod tests {
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(body["messages"][1]["role"], "user");
         Ok(())
+    }
+
+    #[test]
+    fn with_defaults_clamps_penalties_to_openai_range() {
+        let cfg = AifarmMemoryExtractorConfig {
+            frequency_penalty: Some(7.5),
+            presence_penalty: Some(-9.0),
+            ..AifarmMemoryExtractorConfig::default()
+        }
+        .with_defaults();
+        assert_eq!(cfg.frequency_penalty, Some(2.0));
+        assert_eq!(cfg.presence_penalty, Some(-2.0));
+
+        let non_finite = AifarmMemoryExtractorConfig {
+            frequency_penalty: Some(f64::NAN),
+            presence_penalty: Some(f64::INFINITY),
+            ..AifarmMemoryExtractorConfig::default()
+        }
+        .with_defaults();
+        assert_eq!(non_finite.frequency_penalty, Some(0.3));
+        assert_eq!(non_finite.presence_penalty, Some(0.3));
     }
 
     #[tokio::test]
