@@ -892,6 +892,10 @@ pub struct MemoryConfig {
     pub aifarm_frequency_penalty: f64,
     pub aifarm_presence_penalty: f64,
     pub aifarm_enable_thinking: bool,
+    pub subject_merge_enabled: bool,
+    pub subject_merge_min_cards: i32,
+    pub subject_merge_cooldown_hours: f64,
+    pub subject_merge_interval_seconds: i32,
     pub redaction_enabled: bool,
     pub redaction_service_name: String,
     pub redaction_endpoint_name: String,
@@ -1390,6 +1394,14 @@ pub struct RawConfig {
     pub memory_aifarm_presence_penalty: Option<String>,
     /// `MEMORY_AIFARM_ENABLE_THINKING`.
     pub memory_aifarm_enable_thinking: Option<String>,
+    /// `MEMORY_SUBJECT_MERGE_ENABLED`.
+    pub memory_subject_merge_enabled: Option<String>,
+    /// `MEMORY_SUBJECT_MERGE_MIN_CARDS`.
+    pub memory_subject_merge_min_cards: Option<String>,
+    /// `MEMORY_SUBJECT_MERGE_COOLDOWN_HOURS`.
+    pub memory_subject_merge_cooldown_hours: Option<String>,
+    /// `MEMORY_SUBJECT_MERGE_INTERVAL_SECONDS`.
+    pub memory_subject_merge_interval_seconds: Option<String>,
     /// `MEMORY_REDACTION_ENABLED`.
     pub memory_redaction_enabled: Option<String>,
     /// `MEMORY_REDACTION_SERVICE_NAME`.
@@ -2630,6 +2642,26 @@ impl AppConfig {
                     raw.memory_aifarm_enable_thinking,
                     false,
                 )?,
+                subject_merge_enabled: parse_bool(
+                    "MEMORY_SUBJECT_MERGE_ENABLED",
+                    raw.memory_subject_merge_enabled,
+                    true,
+                )?,
+                subject_merge_min_cards: parse_i32(
+                    "MEMORY_SUBJECT_MERGE_MIN_CARDS",
+                    raw.memory_subject_merge_min_cards,
+                    6,
+                )?,
+                subject_merge_cooldown_hours: parse_f64(
+                    "MEMORY_SUBJECT_MERGE_COOLDOWN_HOURS",
+                    raw.memory_subject_merge_cooldown_hours,
+                    168.0,
+                )?,
+                subject_merge_interval_seconds: parse_i32(
+                    "MEMORY_SUBJECT_MERGE_INTERVAL_SECONDS",
+                    raw.memory_subject_merge_interval_seconds,
+                    45,
+                )?,
                 redaction_enabled: parse_bool(
                     "MEMORY_REDACTION_ENABLED",
                     raw.memory_redaction_enabled,
@@ -3005,6 +3037,10 @@ impl RawConfig {
             memory_aifarm_frequency_penalty: env("MEMORY_AIFARM_FREQUENCY_PENALTY"),
             memory_aifarm_presence_penalty: env("MEMORY_AIFARM_PRESENCE_PENALTY"),
             memory_aifarm_enable_thinking: env("MEMORY_AIFARM_ENABLE_THINKING"),
+            memory_subject_merge_enabled: env("MEMORY_SUBJECT_MERGE_ENABLED"),
+            memory_subject_merge_min_cards: env("MEMORY_SUBJECT_MERGE_MIN_CARDS"),
+            memory_subject_merge_cooldown_hours: env("MEMORY_SUBJECT_MERGE_COOLDOWN_HOURS"),
+            memory_subject_merge_interval_seconds: env("MEMORY_SUBJECT_MERGE_INTERVAL_SECONDS"),
             memory_redaction_enabled: env("MEMORY_REDACTION_ENABLED"),
             memory_redaction_service_name: env("MEMORY_REDACTION_SERVICE_NAME"),
             memory_redaction_endpoint_name: env("MEMORY_REDACTION_ENDPOINT_NAME"),
