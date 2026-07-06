@@ -2682,6 +2682,39 @@ async fn embed_merge_survivors<Embedder>(
     }
 }
 
+async fn process_one_merge_group<Merger, Embedder>(
+    merger: &Merger,
+    store: &PostgresMemoryStore,
+    embedder: Option<&Embedder>,
+    cfg: &MemorySubjectMergeConfig,
+    now: OffsetDateTime,
+    group: &openplotva_storage::SubjectMergeCandidateGroup,
+) -> Result<Option<openplotva_storage::SubjectMergeApplyCounts>, Box<dyn StdError + Send + Sync>>
+where
+    Merger: openplotva_memory::SubjectMerger + Send + Sync,
+    Embedder: EmbeddingProvider,
+{
+    let mut ids = group.card_ids.clone();
+    ids.truncate(cfg.max_group_cards.max(2));
+    let cards = store.load_active_cards_by_ids(&ids).await?;
+    if cards.len() < 2 {
+        return Ok(None);
+    }
+    let group_ids: Vec<i64> = cards.iter().map(|card| card.id).collect();
+    let input = openplotva_memory::SubjectMergeInput {
+        subject: group.subject.clone(),
+        cards: openplotva_memory::subject_merge_cards(&cards, now),
+    };
+    let plan = merger
+        .merge_subject(&input)
+        .await
+        .map_err(|source| Box::new(source) as Box<dyn StdError + Send + Sync>)?;
+    let mut apply =
+        plan_to_subject_merge_apply(&plan, &cards, &group_ids, cfg.demote_confidence_delta);
+    embed_merge_survivors(&mut apply, embedder, cfg.embedding_dimension).await;
+    Ok(Some(store.apply_subject_merge(&apply).await?))
+}
+
 async fn run_memory_subject_merge_tick<Merger, Embedder>(
     merger: &Merger,
     store: &PostgresMemoryStore,
@@ -2699,29 +2732,21 @@ where
         .await?;
     for group in groups {
         tick.groups_considered += 1;
-        let mut ids = group.card_ids.clone();
-        ids.truncate(cfg.max_group_cards.max(2));
-        let cards = store.load_active_cards_by_ids(&ids).await?;
-        if cards.len() < 2 {
-            continue;
-        }
-        let group_ids: Vec<i64> = cards.iter().map(|card| card.id).collect();
-        let input = openplotva_memory::SubjectMergeInput {
-            subject: group.subject.clone(),
-            cards: openplotva_memory::subject_merge_cards(&cards, now),
-        };
-        let plan = merger
-            .merge_subject(&input)
-            .await
-            .map_err(|source| Box::new(source) as Box<dyn StdError + Send + Sync>)?;
-        let mut apply =
-            plan_to_subject_merge_apply(&plan, &cards, &group_ids, cfg.demote_confidence_delta);
-        embed_merge_survivors(&mut apply, embedder, cfg.embedding_dimension).await;
-        let counts = store.apply_subject_merge(&apply).await?;
-        tick.cards_superseded += counts.superseded;
-        tick.cards_demoted += counts.demoted;
-        if counts.superseded > 0 || counts.demoted > 0 {
-            tick.groups_merged += 1;
+        // One group's failure (LLM, embed, store) must not abort the rest of the
+        // batch — a persistently-failing group would otherwise starve every other
+        // group each tick. Log and move on; the group is retried next pass.
+        match process_one_merge_group(merger, store, embedder, cfg, now, &group).await {
+            Ok(Some(counts)) => {
+                tick.cards_superseded += counts.superseded;
+                tick.cards_demoted += counts.demoted;
+                if counts.superseded > 0 || counts.demoted > 0 {
+                    tick.groups_merged += 1;
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(%error, subject = %group.subject, "subject merge-pass group failed; skipping");
+            }
         }
     }
     Ok(tick)
