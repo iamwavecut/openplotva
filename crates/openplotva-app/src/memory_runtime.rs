@@ -52,6 +52,8 @@ const MEMORY_MAX_EXTRACTION_BATCH_INPUT_TOKENS: i32 = 10_000;
 const EXISTING_CARDS_LIMIT: i32 = 80;
 const EXISTING_USER_CARDS_LIMIT: i32 = 20;
 const EXISTING_PARTICIPANT_CARDS_MAX_USER: usize = 20;
+const RELATED_CARDS_LIMIT: i32 = 24;
+const RELATED_QUERY_MAX_CHARS: usize = 320;
 const OPENROUTER_MODEL_PREFIX: &str = "openrouter/";
 const OPENROUTER_CHAT_COMPLETIONS_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 
@@ -223,6 +225,18 @@ pub trait MemoryRunStore: MemoryWriteStore {
         scope: &'a openplotva_memory::RetrievalScope,
         limit: i32,
     ) -> MemoryWriteStoreFuture<'a, Vec<Card>, Self::Error>;
+
+    /// Hybrid (lexical + optional vector) retrieval of cards related to what the
+    /// run's window is about, so consolidation can merge into existing facts
+    /// instead of only seeing the most recent cards. Defaults to none.
+    fn retrieve_related_cards<'a>(
+        &'a self,
+        req: &'a openplotva_memory::RetrievalRequest,
+        query_embedding: Option<&'a PgEmbeddingVector>,
+    ) -> MemoryWriteStoreFuture<'a, Vec<Card>, Self::Error> {
+        let _ = (req, query_embedding);
+        Box::pin(async { Ok(Vec::new()) })
+    }
 
     /// Queue the next continuation cursor.
     fn enqueue_run_continuation<'a>(
@@ -397,6 +411,18 @@ impl MemoryRunStore for PostgresMemoryStore {
         limit: i32,
     ) -> MemoryWriteStoreFuture<'a, Vec<Card>, Self::Error> {
         Box::pin(async move { PostgresMemoryStore::list_visible_cards(self, scope, limit).await })
+    }
+
+    fn retrieve_related_cards<'a>(
+        &'a self,
+        req: &'a openplotva_memory::RetrievalRequest,
+        query_embedding: Option<&'a PgEmbeddingVector>,
+    ) -> MemoryWriteStoreFuture<'a, Vec<Card>, Self::Error> {
+        Box::pin(async move {
+            PostgresMemoryStore::retrieve_with_vector(self, req, query_embedding)
+                .await
+                .map(|retrieved| retrieved.cards)
+        })
     }
 
     fn enqueue_run_continuation<'a>(
@@ -1527,7 +1553,7 @@ where
         .await
         .unwrap_or_default()
         .unwrap_or_default();
-    let selection = select_run_input(store, run, &chat, &loaded, cfg).await;
+    let selection = select_run_input(store, run, &chat, &loaded, cfg, embedder).await;
     report.selected_messages = selection.messages.len();
     if let Some(after) = selection.continuation.as_ref() {
         store
@@ -1552,7 +1578,7 @@ where
         return Ok(report);
     }
 
-    let batches = split_extraction_batches(store, run, &chat, &filtered, cfg).await;
+    let batches = split_extraction_batches(store, run, &chat, &filtered, cfg, embedder).await;
     let mut state = RunExtractionState::with_batch_count(batches.len());
     let fallback_observed_at = OffsetDateTime::now_utc();
     for batch in &batches {
@@ -1678,15 +1704,17 @@ impl RunExtractionState {
     }
 }
 
-async fn select_run_input<Store>(
+async fn select_run_input<Store, Embedder>(
     store: &Store,
     run: &openplotva_memory::Run,
     chat: &DialogMemoryChatMeta,
     loaded: &[openplotva_memory::Message],
     cfg: &MemoryRunProcessConfig,
+    embedder: Option<&Embedder>,
 ) -> RunInputSelection
 where
     Store: MemoryRunStore,
+    Embedder: EmbeddingProvider,
 {
     if loaded.is_empty() {
         return RunInputSelection::default();
@@ -1699,7 +1727,15 @@ where
         return RunInputSelection::default();
     }
 
-    let existing = existing_cards_for_run(store, run, chat, candidates).await;
+    let existing = existing_cards_for_run(
+        store,
+        run,
+        chat,
+        candidates,
+        embedder.map(|value| value as &dyn EmbeddingProvider),
+        cfg.embedding_dimension,
+    )
+    .await;
     let best_count = best_run_input_count(run, chat, candidates, &existing, cfg.max_input_tokens);
     let selected = candidates[..best_count].to_vec();
     let continuation = (best_count < loaded.len())
@@ -1712,15 +1748,17 @@ where
     }
 }
 
-async fn split_extraction_batches<Store>(
+async fn split_extraction_batches<Store, Embedder>(
     store: &Store,
     run: &openplotva_memory::Run,
     chat: &DialogMemoryChatMeta,
     messages: &[openplotva_memory::Message],
     cfg: &MemoryRunProcessConfig,
+    embedder: Option<&Embedder>,
 ) -> Vec<ExtractionBatch>
 where
     Store: MemoryRunStore,
+    Embedder: EmbeddingProvider,
 {
     if messages.is_empty() {
         return Vec::new();
@@ -1734,8 +1772,17 @@ where
         if !current.is_empty() {
             let mut candidate = current.clone();
             candidate.push(message.clone());
-            let candidate_batch =
-                build_extraction_batch(store, run, chat, &candidate, None, limit).await;
+            let candidate_batch = build_extraction_batch(
+                store,
+                run,
+                chat,
+                &candidate,
+                None,
+                limit,
+                embedder.map(|value| value as &dyn EmbeddingProvider),
+                cfg.embedding_dimension,
+            )
+            .await;
             if candidate_batch.input_tokens <= limit {
                 current.push(message.clone());
                 current_batch = Some(candidate_batch);
@@ -1749,16 +1796,47 @@ where
                 &mut current,
                 &mut current_batch,
                 limit,
+                embedder.map(|value| value as &dyn EmbeddingProvider),
+                cfg.embedding_dimension,
             )
             .await;
         }
 
         let single = vec![message.clone()];
-        let existing = existing_cards_for_run(store, run, chat, &single).await;
-        let single_batch =
-            build_extraction_batch(store, run, chat, &single, Some(existing.clone()), limit).await;
+        let existing = existing_cards_for_run(
+            store,
+            run,
+            chat,
+            &single,
+            embedder.map(|value| value as &dyn EmbeddingProvider),
+            cfg.embedding_dimension,
+        )
+        .await;
+        let single_batch = build_extraction_batch(
+            store,
+            run,
+            chat,
+            &single,
+            Some(existing.clone()),
+            limit,
+            embedder.map(|value| value as &dyn EmbeddingProvider),
+            cfg.embedding_dimension,
+        )
+        .await;
         if single_batch.input_tokens > limit {
-            out.extend(split_oversized_message(store, run, chat, message, &existing, limit).await);
+            out.extend(
+                split_oversized_message(
+                    store,
+                    run,
+                    chat,
+                    message,
+                    &existing,
+                    limit,
+                    embedder.map(|value| value as &dyn EmbeddingProvider),
+                    cfg.embedding_dimension,
+                )
+                .await,
+            );
             continue;
         }
         current.push(message.clone());
@@ -1773,11 +1851,14 @@ where
         &mut current,
         &mut current_batch,
         limit,
+        embedder.map(|value| value as &dyn EmbeddingProvider),
+        cfg.embedding_dimension,
     )
     .await;
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn flush_extraction_batch<Store>(
     store: &Store,
     run: &openplotva_memory::Run,
@@ -1786,6 +1867,8 @@ async fn flush_extraction_batch<Store>(
     current: &mut Vec<openplotva_memory::Message>,
     current_batch: &mut Option<ExtractionBatch>,
     limit: i32,
+    embedder: Option<&dyn EmbeddingProvider>,
+    embedding_dimension: i32,
 ) where
     Store: MemoryRunStore,
 {
@@ -1795,12 +1878,23 @@ async fn flush_extraction_batch<Store>(
     let batch = if let Some(batch) = current_batch.take() {
         batch
     } else {
-        build_extraction_batch(store, run, chat, current, None, limit).await
+        build_extraction_batch(
+            store,
+            run,
+            chat,
+            current,
+            None,
+            limit,
+            embedder,
+            embedding_dimension,
+        )
+        .await
     };
     out.push(batch);
     current.clear();
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn build_extraction_batch<Store>(
     store: &Store,
     run: &openplotva_memory::Run,
@@ -1808,6 +1902,8 @@ async fn build_extraction_batch<Store>(
     messages: &[openplotva_memory::Message],
     existing: Option<Vec<Card>>,
     limit: i32,
+    embedder: Option<&dyn EmbeddingProvider>,
+    embedding_dimension: i32,
 ) -> ExtractionBatch
 where
     Store: MemoryRunStore,
@@ -1815,7 +1911,17 @@ where
     let batch_messages = messages.to_vec();
     let mut existing_cards = match existing {
         Some(cards) => cards,
-        None => existing_cards_for_run(store, run, chat, &batch_messages).await,
+        None => {
+            existing_cards_for_run(
+                store,
+                run,
+                chat,
+                &batch_messages,
+                embedder,
+                embedding_dimension,
+            )
+            .await
+        }
     };
     let mut input_tokens = estimate_extraction_tokens(run, chat, &batch_messages, &existing_cards);
     if limit > 0 && input_tokens > limit && !existing_cards.is_empty() {
@@ -1845,6 +1951,7 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn split_oversized_message<Store>(
     store: &Store,
     run: &openplotva_memory::Run,
@@ -1852,6 +1959,8 @@ async fn split_oversized_message<Store>(
     message: &openplotva_memory::Message,
     existing: &[Card],
     limit: i32,
+    embedder: Option<&dyn EmbeddingProvider>,
+    embedding_dimension: i32,
 ) -> Vec<ExtractionBatch>
 where
     Store: MemoryRunStore,
@@ -1866,6 +1975,8 @@ where
                 std::slice::from_ref(message),
                 Some(existing.to_vec()),
                 limit,
+                embedder,
+                embedding_dimension,
             )
             .await,
         ];
@@ -1906,6 +2017,8 @@ where
                     std::slice::from_ref(&chunk),
                     Some(existing.to_vec()),
                     limit,
+                    embedder,
+                    embedding_dimension,
                 )
                 .await,
             );
@@ -1986,6 +2099,8 @@ async fn existing_cards_for_run<Store>(
     run: &openplotva_memory::Run,
     chat: &DialogMemoryChatMeta,
     messages: &[openplotva_memory::Message],
+    embedder: Option<&dyn EmbeddingProvider>,
+    embedding_dimension: i32,
 ) -> Vec<Card>
 where
     Store: MemoryRunStore,
@@ -1993,6 +2108,32 @@ where
     let mut out = Vec::new();
     let mut seen = Vec::new();
     let scope = retrieval_scope_for_run(run, chat, 0);
+    // Cards related to what this window is about come first, so the model merges
+    // into existing facts instead of inserting duplicates the recency window
+    // would hide (finding A). Best-effort: retrieval failures or an embedder-down
+    // query embedding degrade to lexical-only, or to the recency baseline below.
+    if let Some(query) = consolidation_retrieval_query(messages) {
+        let query_embedding = match embedder {
+            Some(provider) => provider
+                .embed_one(&query, embedding_dimension, MEMORY_CARD_EMBEDDING_TASK)
+                .await
+                .ok()
+                .flatten(),
+            None => None,
+        };
+        let request = openplotva_memory::RetrievalRequest {
+            scope: scope.clone(),
+            query,
+            card_limit: RELATED_CARDS_LIMIT,
+            episode_limit: 0,
+        };
+        if let Ok(cards) = store
+            .retrieve_related_cards(&request, query_embedding.as_ref())
+            .await
+        {
+            add_existing_cards(&mut out, &mut seen, cards, EXISTING_CARDS_LIMIT as usize);
+        }
+    }
     if let Ok(cards) = store.list_visible_cards(&scope, EXISTING_CARDS_LIMIT).await {
         add_existing_cards(&mut out, &mut seen, cards, EXISTING_CARDS_LIMIT as usize);
     }
@@ -2009,6 +2150,36 @@ where
         }
     }
     out
+}
+
+fn consolidation_retrieval_query(messages: &[openplotva_memory::Message]) -> Option<String> {
+    let mut names: Vec<&str> = Vec::new();
+    let mut body = String::new();
+    for message in messages {
+        if message.sender_is_bot {
+            continue;
+        }
+        let name = message.sender_name.trim();
+        if !name.is_empty() && !names.contains(&name) {
+            names.push(name);
+        }
+        let text = message.text.trim();
+        if !text.is_empty() && body.len() < RELATED_QUERY_MAX_CHARS * 4 {
+            if !body.is_empty() {
+                body.push(' ');
+            }
+            body.push_str(text);
+        }
+    }
+    let mut query = names.join(" ");
+    if !body.is_empty() {
+        if !query.is_empty() {
+            query.push(' ');
+        }
+        query.push_str(&body);
+    }
+    let query: String = query.trim().chars().take(RELATED_QUERY_MAX_CHARS).collect();
+    if query.is_empty() { None } else { Some(query) }
 }
 
 fn add_existing_cards(out: &mut Vec<Card>, seen: &mut Vec<i64>, cards: Vec<Card>, limit: usize) {
@@ -4074,6 +4245,35 @@ mod tests {
                 Ok(self.output.clone())
             })
         }
+    }
+
+    #[test]
+    fn consolidation_retrieval_query_uses_participants_and_skips_bots() {
+        let messages = vec![
+            openplotva_memory::Message {
+                sender_name: "Alice".to_owned(),
+                text: "loves Rust".to_owned(),
+                ..openplotva_memory::Message::default()
+            },
+            openplotva_memory::Message {
+                sender_name: "Alice".to_owned(),
+                text: "and coffee".to_owned(),
+                ..openplotva_memory::Message::default()
+            },
+            openplotva_memory::Message {
+                sender_name: "spambot".to_owned(),
+                sender_is_bot: true,
+                text: "buy now".to_owned(),
+                ..openplotva_memory::Message::default()
+            },
+        ];
+        let query = consolidation_retrieval_query(&messages).expect("query");
+        assert!(query.contains("Alice"), "query: {query}");
+        assert!(query.contains("loves Rust"), "query: {query}");
+        assert!(query.contains("and coffee"), "query: {query}");
+        assert!(!query.contains("spambot"), "query: {query}");
+        assert!(!query.contains("buy now"), "query: {query}");
+        assert!(consolidation_retrieval_query(&[]).is_none());
     }
 
     #[test]
