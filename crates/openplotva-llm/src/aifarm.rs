@@ -1328,6 +1328,10 @@ pub struct AifarmMemoryExtractorConfig {
     pub max_output_tokens: i32,
     /// Temperature.
     pub temperature: Option<f64>,
+    /// Frequency penalty (breaks self-questioning repetition loops); 0 disables.
+    pub frequency_penalty: Option<f64>,
+    /// Presence penalty; 0 disables.
+    pub presence_penalty: Option<f64>,
     /// Whether model thinking is enabled.
     pub enable_thinking: Option<bool>,
     /// Whether reasoning output is included.
@@ -1520,6 +1524,12 @@ impl AifarmMemoryExtractorConfig {
         } else {
             self.max_output_tokens
         };
+        if self.frequency_penalty.is_none() {
+            self.frequency_penalty = Some(0.6);
+        }
+        if self.presence_penalty.is_none() {
+            self.presence_penalty = Some(0.3);
+        }
         if self.client.default_model.trim().is_empty() {
             self.client.default_model = self.model.clone();
         }
@@ -2076,8 +2086,8 @@ where
             temperature: self.cfg.temperature,
             // Break the self-questioning loops the extractor otherwise falls into
             // inside the JSON (repeating "but wait…" until it hits the output cap).
-            frequency_penalty: Some(0.6),
-            presence_penalty: Some(0.3),
+            frequency_penalty: self.cfg.frequency_penalty,
+            presence_penalty: self.cfg.presence_penalty,
             include_reasoning: self.cfg.include_reasoning,
             ..ChatCompletionRequest::default()
         };
