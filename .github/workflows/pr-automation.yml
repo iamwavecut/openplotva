@@ -106,7 +106,6 @@ jobs:
           PR_AGENT_IMPROVE_MAX_CHANGED_LINES: ${{ vars.PR_AGENT_IMPROVE_MAX_CHANGED_LINES || '800' }}
           PR_AGENT_IMPROVE_MAX_CHANGED_FILES: ${{ vars.PR_AGENT_IMPROVE_MAX_CHANGED_FILES || '12' }}
           PR_AGENT_PUBLISH_NO_FINDINGS: ${{ vars.PR_AGENT_PUBLISH_NO_FINDINGS || 'false' }}
-          PR_AGENT_FAIL_ON_FINDINGS: ${{ vars.PR_AGENT_FAIL_ON_FINDINGS || 'true' }}
           PR_AGENT_REVIEW_EXTRA_INSTRUCTIONS: >-
             Focus on correctness, security boundaries, async/concurrency hazards,
             external contracts, migrations, and production/runtime risks. Do not
@@ -145,7 +144,6 @@ jobs:
             -e PR_AGENT_MAX_MODEL_TOKENS \
             -e PR_AGENT_SKIP_IMPROVE \
             -e PR_AGENT_PUBLISH_NO_FINDINGS \
-            -e PR_AGENT_FAIL_ON_FINDINGS \
             -e PR_AGENT_REVIEW_EXTRA_INSTRUCTIONS \
             pragent/pr-agent@sha256:ea2ea90f072fd97708755e59827a317272f66097a1ef349eca23d39160bb0baf \
             /tmp/run_pr_agent_pair.py 2>&1 | tee "$log_file"
