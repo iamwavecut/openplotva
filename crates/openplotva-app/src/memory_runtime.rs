@@ -2383,6 +2383,19 @@ pub const MEMORY_CARD_ARCHIVAL_INTERVAL: std::time::Duration =
 /// Batch size per archival statement.
 pub const MEMORY_CARD_ARCHIVAL_BATCH: i64 = 10_000;
 
+/// How often the cold-card decay worker gives stale never-expiring cards a TTL.
+pub const MEMORY_CARD_DECAY_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(6 * 60 * 60);
+/// Batch size per cold-card decay statement.
+pub const MEMORY_CARD_DECAY_BATCH: i64 = 10_000;
+/// Grace period a cold card gets before it forgets, so a late reinforcement can
+/// still rescue it (reinforcement clears the TTL).
+pub const MEMORY_CARD_DECAY_GRACE_DAYS: i32 = 30;
+/// Only cards below this salience are eligible for cold decay.
+pub const MEMORY_CARD_DECAY_SALIENCE_MAX: f64 = 0.35;
+/// A card must be at least this old and unused this long to count as cold.
+pub const MEMORY_CARD_DECAY_COLD_DAYS: i32 = 45;
+
 /// Outcome of the memory-card archival worker.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MemoryCardArchivalReport {
@@ -2425,6 +2438,72 @@ where
                 Err(error) => {
                     report.errors += 1;
                     tracing::warn!(%error, "failed to archive expired memory cards batch");
+                    break;
+                }
+            }
+        }
+        report.ticks += 1;
+
+        let sleep = tokio::time::sleep(interval);
+        tokio::pin!(sleep);
+        tokio::select! {
+            () = &mut stop => break,
+            () = &mut sleep => {}
+        }
+    }
+    report
+}
+
+/// Outcome of the cold-card decay worker.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MemoryCardDecayReport {
+    /// Cards given a grace TTL this run.
+    pub decayed: u64,
+    /// Sweep ticks executed.
+    pub ticks: u64,
+    /// Failed batches.
+    pub errors: u64,
+}
+
+/// Periodically give cold, never-expiring cards a grace TTL so the active set
+/// stays bounded even when extraction over-marked facts as permanent. Only
+/// low-salience, non-portable, old-and-unused cards are touched, and a
+/// reinforcement before the grace elapses clears the TTL again, so only truly
+/// stale facts forget. Runs until `stop` resolves; each tick drains in batches.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_memory_card_decay_worker_until<Stop>(
+    store: PostgresMemoryStore,
+    interval: std::time::Duration,
+    batch: i64,
+    grace_days: i32,
+    salience_max: f64,
+    cold_days: i32,
+    stop: Stop,
+) -> MemoryCardDecayReport
+where
+    Stop: std::future::Future<Output = ()>,
+{
+    let mut report = MemoryCardDecayReport::default();
+    let batch = batch.max(1);
+    tokio::pin!(stop);
+    loop {
+        loop {
+            match store
+                .expire_cold_cards(grace_days, salience_max, cold_days, batch)
+                .await
+            {
+                Ok(decayed) => {
+                    report.decayed += decayed;
+                    if decayed > 0 {
+                        tracing::debug!(decayed, "gave cold memory cards a grace TTL");
+                    }
+                    if decayed < batch as u64 {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    report.errors += 1;
+                    tracing::warn!(%error, "failed to decay cold memory cards batch");
                     break;
                 }
             }

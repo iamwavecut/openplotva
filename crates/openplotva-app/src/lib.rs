@@ -10228,6 +10228,27 @@ async fn start_runtime_workers(
         ));
         workers.handles.push(worker);
 
+        let decay_store = memory_store.clone();
+        let decay_stop = stop.subscribe();
+        let decay_worker = tokio::spawn(async move {
+            let report = memory_runtime::run_memory_card_decay_worker_until(
+                decay_store,
+                memory_runtime::MEMORY_CARD_DECAY_INTERVAL,
+                memory_runtime::MEMORY_CARD_DECAY_BATCH,
+                memory_runtime::MEMORY_CARD_DECAY_GRACE_DAYS,
+                memory_runtime::MEMORY_CARD_DECAY_SALIENCE_MAX,
+                memory_runtime::MEMORY_CARD_DECAY_COLD_DAYS,
+                wait_for_runtime_stop(decay_stop),
+            )
+            .await;
+            tracing::info!(?report, "memory card decay worker stopped");
+        });
+        readiness_checks.push(ReadinessCheck::ok(
+            "memory_card_decay",
+            "Cold never-expiring cards given a grace TTL (bounded forgetting)",
+        ));
+        workers.handles.push(decay_worker);
+
         let collapse_store = memory_store.clone();
         let collapse_stop = stop.subscribe();
         let collapse_worker = tokio::spawn(async move {
