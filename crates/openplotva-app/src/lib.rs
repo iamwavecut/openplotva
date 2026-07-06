@@ -10878,6 +10878,38 @@ async fn start_runtime_workers(
             });
             workers.handles.push(memory_worker);
         }
+        if config.memory.subject_merge_enabled {
+            let merge_merger = memory_runtime::subject_merger_from_app_config(config);
+            let merge_store = memory_store.clone();
+            let merge_embedder = memory_write_embedder.clone();
+            let merge_cfg = memory_runtime::MemorySubjectMergeConfig {
+                interval: std::time::Duration::from_secs(
+                    u64::try_from(config.memory.subject_merge_interval_seconds.max(1))
+                        .unwrap_or(45),
+                ),
+                cooldown_hours: config.memory.subject_merge_cooldown_hours,
+                min_cards: i64::from(config.memory.subject_merge_min_cards),
+                embedding_dimension: config.memory.embedding_dim,
+                ..memory_runtime::MemorySubjectMergeConfig::default()
+            };
+            let merge_stop = stop.subscribe();
+            let merge_worker = tokio::spawn(async move {
+                let report = memory_runtime::run_memory_subject_merge_worker_until(
+                    &merge_merger,
+                    merge_store,
+                    merge_embedder.as_ref(),
+                    merge_cfg,
+                    wait_for_runtime_stop(merge_stop),
+                )
+                .await;
+                tracing::info!(?report, "memory subject merge-pass worker stopped");
+            });
+            readiness_checks.push(ReadinessCheck::ok(
+                "memory_subject_merge",
+                "Backlog over-extracted (scope,subject) card groups consolidated 24/7 via the LLM merge-pass",
+            ));
+            workers.handles.push(merge_worker);
+        }
         readiness_checks.push(ReadinessCheck::ok(
             "memory_service",
             format!(

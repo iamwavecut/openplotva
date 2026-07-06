@@ -89,6 +89,23 @@ pub trait MemoryExtractor {
     fn extract<'a>(&'a self, input: &'a ExtractInput) -> MemoryExtractorFuture<'a, Self::Error>;
 }
 
+/// Future returned by subject mergers.
+pub type SubjectMergerFuture<'a, E> =
+    Pin<Box<dyn Future<Output = Result<SubjectMergePlan, E>> + Send + 'a>>;
+
+/// Backlog subject merge-pass boundary: consolidate one over-extracted
+/// (scope, subject) group of existing cards.
+pub trait SubjectMerger {
+    /// Merger error.
+    type Error: StdError + Send + Sync + 'static;
+
+    /// Fold near-duplicate cards in one subject group into survivors.
+    fn merge_subject<'a>(
+        &'a self,
+        input: &'a SubjectMergeInput,
+    ) -> SubjectMergerFuture<'a, Self::Error>;
+}
+
 /// Future returned by text redactors.
 pub type TextRedactorFuture<'a, E> = Pin<Box<dyn Future<Output = Result<String, E>> + Send + 'a>>;
 
@@ -1577,7 +1594,7 @@ pub fn decode_extraction_json(raw: &str) -> Result<ExtractOutput, DecodeExtracti
     salvage_truncated_json(&trimmed[start..]).ok_or(DecodeExtractionError::Decode)
 }
 
-fn salvage_truncated_json(fragment: &str) -> Option<ExtractOutput> {
+fn salvage_truncated_json<T: serde::de::DeserializeOwned>(fragment: &str) -> Option<T> {
     let mut closers: Vec<u8> = Vec::new();
     let mut in_string = false;
     let mut escaped = false;
@@ -1613,6 +1630,168 @@ fn salvage_truncated_json(fragment: &str) -> Option<ExtractOutput> {
         repaired.push(char::from(*closer));
     }
     serde_json::from_str(&repaired).ok()
+}
+
+/// One card projected for the subject merge-pass prompt: the payload the model
+/// folds over, plus salience/observation weight so it can pick the survivor.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct SubjectMergeCard {
+    pub id: i64,
+    #[serde(rename = "type")]
+    pub card_type: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub predicate: String,
+    pub fact: String,
+    pub salience: f64,
+    pub obs: i32,
+    pub age: String,
+}
+
+/// Input to the subject merge-pass: every active card in one (scope, subject)
+/// group, presented for card-on-card consolidation (no chat messages).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct SubjectMergeInput {
+    pub subject: String,
+    pub cards: Vec<SubjectMergeCard>,
+}
+
+/// One consolidation cluster from the model: fold `absorbed_ids` into
+/// `survivor_id`, rewriting the survivor to `merged_fact_text`.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct SubjectMergeCluster {
+    pub survivor_id: i64,
+    #[serde(default)]
+    pub absorbed_ids: Vec<i64>,
+    #[serde(default)]
+    pub merged_fact_text: String,
+}
+
+/// The model's raw plan for one subject group (ids unverified).
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct SubjectMergePlan {
+    #[serde(default)]
+    pub clusters: Vec<SubjectMergeCluster>,
+    #[serde(default)]
+    pub demote_ids: Vec<i64>,
+    #[serde(default)]
+    pub keep_ids: Vec<i64>,
+}
+
+/// A cluster whose ids are all confirmed present in the group, with a non-empty
+/// absorbed set disjoint from every other cluster/demote id.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ValidatedMergeCluster {
+    pub survivor_id: i64,
+    pub absorbed_ids: Vec<i64>,
+    pub merged_fact_text: String,
+}
+
+/// The plan after checking every id against real group membership: ids the model
+/// invented or referenced twice are dropped, so apply only ever touches real
+/// cards in this group exactly once.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ValidatedSubjectMerge {
+    pub clusters: Vec<ValidatedMergeCluster>,
+    pub demote_ids: Vec<i64>,
+}
+
+/// Project a group's cards for the merge prompt, strongest-salience first so the
+/// model sees the likeliest survivors at the top.
+#[must_use]
+pub fn subject_merge_cards(cards: &[Card], as_of: OffsetDateTime) -> Vec<SubjectMergeCard> {
+    let mut out: Vec<SubjectMergeCard> = cards
+        .iter()
+        .map(|card| SubjectMergeCard {
+            id: card.id,
+            card_type: card.card_type.clone(),
+            predicate: card.predicate.trim().to_owned(),
+            fact: card.fact_text.trim().to_owned(),
+            salience: round_two(card.salience),
+            obs: card.observation_count,
+            age: coarse_card_age(card.created_at.or(card.last_observed_at), as_of),
+        })
+        .collect();
+    out.sort_by(|left, right| {
+        right
+            .salience
+            .total_cmp(&left.salience)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    out
+}
+
+/// Decode the merge-pass model response, salvaging a response truncated at the
+/// output cap the same way extraction does.
+pub fn decode_subject_merge_plan(raw: &str) -> Result<SubjectMergePlan, DecodeExtractionError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(DecodeExtractionError::Empty);
+    }
+    if trimmed == "null" {
+        return Ok(SubjectMergePlan::default());
+    }
+    let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}')) else {
+        return Err(DecodeExtractionError::Decode);
+    };
+    if end <= start {
+        return Err(DecodeExtractionError::Decode);
+    }
+    if let Ok(parsed) = serde_json::from_str(&trimmed[start..=end]) {
+        return Ok(parsed);
+    }
+    salvage_truncated_json(&trimmed[start..]).ok_or(DecodeExtractionError::Decode)
+}
+
+/// Validate a raw plan against the group's real card ids. Every id must be a
+/// real group member used at most once; a cluster keeps only its valid absorbed
+/// ids and is dropped if none survive or the survivor/text is invalid. This is
+/// the guard that makes apply safe against hallucinated or repeated ids.
+#[must_use]
+pub fn validate_subject_merge_plan(
+    plan: &SubjectMergePlan,
+    group_ids: &[i64],
+) -> ValidatedSubjectMerge {
+    let group: std::collections::HashSet<i64> =
+        group_ids.iter().copied().filter(|id| *id != 0).collect();
+    let mut used: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    let mut clusters = Vec::new();
+    for cluster in &plan.clusters {
+        let survivor = cluster.survivor_id;
+        let text = cluster.merged_fact_text.trim();
+        if !group.contains(&survivor) || used.contains(&survivor) || text.is_empty() {
+            continue;
+        }
+        let mut absorbed = Vec::new();
+        for id in &cluster.absorbed_ids {
+            if *id != survivor && group.contains(id) && !used.contains(id) && !absorbed.contains(id)
+            {
+                absorbed.push(*id);
+            }
+        }
+        if absorbed.is_empty() {
+            continue;
+        }
+        used.insert(survivor);
+        for id in &absorbed {
+            used.insert(*id);
+        }
+        clusters.push(ValidatedMergeCluster {
+            survivor_id: survivor,
+            absorbed_ids: absorbed,
+            merged_fact_text: text.to_owned(),
+        });
+    }
+    let mut demote_ids = Vec::new();
+    for id in &plan.demote_ids {
+        if group.contains(id) && !used.contains(id) && !demote_ids.contains(id) {
+            demote_ids.push(*id);
+            used.insert(*id);
+        }
+    }
+    ValidatedSubjectMerge {
+        clusters,
+        demote_ids,
+    }
 }
 
 #[must_use]
@@ -3098,6 +3277,87 @@ mod tests {
     use super::*;
     use std::fmt;
     use std::sync::{Arc, Mutex as StdMutex};
+
+    #[test]
+    fn validate_subject_merge_plan_drops_hallucinated_and_repeated_ids() {
+        let plan = SubjectMergePlan {
+            clusters: vec![
+                SubjectMergeCluster {
+                    survivor_id: 1,
+                    // 99 is hallucinated; 1 is the survivor itself; both dropped.
+                    absorbed_ids: vec![2, 3, 99, 1],
+                    merged_fact_text: "merged".to_owned(),
+                },
+                SubjectMergeCluster {
+                    // survivor already consumed as an absorbed id above -> whole cluster dropped.
+                    survivor_id: 2,
+                    absorbed_ids: vec![4],
+                    merged_fact_text: "x".to_owned(),
+                },
+                SubjectMergeCluster {
+                    // only self as absorbed -> empty -> dropped, and survivor 4 stays free.
+                    survivor_id: 4,
+                    absorbed_ids: vec![4],
+                    merged_fact_text: "y".to_owned(),
+                },
+            ],
+            demote_ids: vec![4, 2, 88],
+            keep_ids: vec![5],
+        };
+        let validated = validate_subject_merge_plan(&plan, &[1, 2, 3, 4, 5]);
+        assert_eq!(
+            validated.clusters,
+            vec![ValidatedMergeCluster {
+                survivor_id: 1,
+                absorbed_ids: vec![2, 3],
+                merged_fact_text: "merged".to_owned(),
+            }]
+        );
+        // 4 is the only demote id in-group and not already used; 2 used, 88 hallucinated.
+        assert_eq!(validated.demote_ids, vec![4]);
+    }
+
+    #[test]
+    fn validate_subject_merge_plan_requires_nonempty_absorbed_and_text() {
+        let plan = SubjectMergePlan {
+            clusters: vec![
+                SubjectMergeCluster {
+                    survivor_id: 1,
+                    absorbed_ids: vec![2],
+                    merged_fact_text: "   ".to_owned(),
+                },
+                SubjectMergeCluster {
+                    survivor_id: 3,
+                    absorbed_ids: vec![],
+                    merged_fact_text: "kept but nothing to fold".to_owned(),
+                },
+            ],
+            demote_ids: vec![],
+            keep_ids: vec![],
+        };
+        let validated = validate_subject_merge_plan(&plan, &[1, 2, 3]);
+        assert!(validated.clusters.is_empty());
+        assert!(validated.demote_ids.is_empty());
+    }
+
+    #[test]
+    fn decode_subject_merge_plan_parses_and_salvages() {
+        let full = r#"{"clusters":[{"survivor_id":1,"absorbed_ids":[2,3],"merged_fact_text":"m"}],"demote_ids":[4],"keep_ids":[5]}"#;
+        let parsed = decode_subject_merge_plan(full).expect("parse");
+        assert_eq!(parsed.clusters.len(), 1);
+        assert_eq!(parsed.demote_ids, vec![4]);
+
+        // Truncated at the output cap mid-"demote_ids": salvage keeps the clusters.
+        let truncated = r#"{"clusters":[{"survivor_id":1,"absorbed_ids":[2,3],"merged_fact_text":"m"}],"demote_i"#;
+        let salvaged = decode_subject_merge_plan(truncated).expect("salvage");
+        assert_eq!(salvaged.clusters.len(), 1);
+        assert_eq!(salvaged.clusters[0].survivor_id, 1);
+
+        assert!(matches!(
+            decode_subject_merge_plan("   "),
+            Err(DecodeExtractionError::Empty)
+        ));
+    }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
     struct TestError(&'static str);

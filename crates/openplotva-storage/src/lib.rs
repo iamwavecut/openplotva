@@ -180,6 +180,51 @@ pub struct ScoredMemoryCard {
     pub score: f64,
 }
 
+/// One over-extracted (scope, subject) group the merge-pass should consider.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SubjectMergeCandidateGroup {
+    pub visibility: String,
+    pub user_id: i64,
+    pub chat_id: i64,
+    pub thread_id: i32,
+    pub subject: String,
+    /// Every active card id in the group (worker caps how many it feeds).
+    pub card_ids: Vec<i64>,
+}
+
+/// One survivor cluster ready to apply: fold `absorbed_ids` into `survivor_id`,
+/// rewrite it to `merged_fact_text`, and carry `observation_count` (the summed
+/// count of survivor + absorbed).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SubjectMergeApplyCluster {
+    pub survivor_id: i64,
+    pub absorbed_ids: Vec<i64>,
+    pub merged_fact_text: String,
+    pub observation_count: i64,
+    /// Fresh embedding of the merged text; `None` keeps the survivor's prior
+    /// embedding (the merge changed the text, so the caller should supply one).
+    pub embedding: Option<PgEmbeddingVector>,
+}
+
+/// A validated, ready-to-apply plan for one subject group. Applied atomically so
+/// a mid-group failure never leaves a half-collapsed cluster.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SubjectMergeApply {
+    pub clusters: Vec<SubjectMergeApplyCluster>,
+    pub demote_ids: Vec<i64>,
+    /// Every card in the group; all get their merge-review timestamp stamped.
+    pub group_ids: Vec<i64>,
+    pub demote_confidence_delta: f64,
+}
+
+/// What one merge-group apply changed.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SubjectMergeApplyCounts {
+    pub superseded: u64,
+    pub survivors_rewritten: u64,
+    pub demoted: u64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MemoryRetrievalLimits {
     /// Card limit.
@@ -843,6 +888,21 @@ pub const SQL_EXPIRE_COLD_MEMORY_CARDS: &str = "UPDATE memory_cards SET expires_
 pub const SQL_FIND_DUPLICATE_MEMORY_CARD_GROUPS: &str = "SELECT min(id) AS keep_id, array_remove(array_agg(id ORDER BY id), min(id)) AS dup_ids, sum(observation_count)::bigint AS total_obs FROM memory_cards WHERE status = 'active' AND btrim(fact_text) <> '' GROUP BY visibility, chat_id, thread_id, user_id, lower(btrim(fact_text)) HAVING count(*) > 1 LIMIT $1";
 
 pub const SQL_SET_MEMORY_CARD_OBSERVATION_COUNT: &str = "UPDATE memory_cards SET observation_count = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND status = 'active'";
+
+// Candidate (scope, subject) groups for the backlog merge-pass: active cards
+// grouped by full scope + subject, qualifying when at least $2 of them have not
+// been merge-reviewed within the last $1 hours. `card_ids` is every active card
+// in the group (the worker feeds the whole group to the model, capping size).
+pub const SQL_SELECT_SUBJECT_MERGE_CANDIDATE_GROUPS: &str = "SELECT visibility, user_id, chat_id, thread_id, subject, array_agg(id ORDER BY (last_merge_pass_at IS NOT NULL), id) AS card_ids FROM memory_cards WHERE status = 'active' AND btrim(subject) <> '' GROUP BY visibility, user_id, chat_id, thread_id, subject HAVING count(*) FILTER (WHERE last_merge_pass_at IS NULL OR last_merge_pass_at < now() - ($1 * interval '1 hour')) >= $2 ORDER BY count(*) DESC LIMIT $3";
+
+// Load the full cards of a merge group by id (active only), same column shape as
+// SQL_GET_MEMORY_CARD so `memory_card_from_row` maps them.
+pub const SQL_LOAD_MERGE_CARDS: &str = "SELECT id, visibility, card_type, status, subject, predicate, object, fact_text, confidence, salience, observation_count, origin_chat_id, origin_user_id, chat_id, thread_id, user_id, valid_from, valid_until, last_observed_at, last_used_at, use_count, created_at, updated_at, origin_thread_id, decay_score, portable, conflict_group, recorded_at, retracted_at FROM memory_cards WHERE id = ANY($1::bigint[]) AND status = 'active' ORDER BY id";
+
+// Stamp a group's cards as merge-reviewed so a group the model already
+// consolidated (and left large) is skipped until the cooldown elapses.
+pub const SQL_MARK_MEMORY_CARDS_MERGE_PASSED: &str =
+    "UPDATE memory_cards SET last_merge_pass_at = now() WHERE id = ANY($1::bigint[])";
 
 pub const SQL_MARK_EXHAUSTED_MEMORY_RUNS: &str = r#"UPDATE memory_runs
 SET status = 'failed',
@@ -4997,6 +5057,133 @@ impl PostgresMemoryStore {
             retired += dup_ids.len() as u64;
         }
         Ok(retired)
+    }
+
+    /// Select over-extracted (scope, subject) groups for the LLM merge-pass:
+    /// active cards grouped by full scope + subject, qualifying when at least
+    /// `min_cards` of them have not been merge-reviewed within `cooldown_hours`.
+    pub async fn select_subject_merge_candidate_groups(
+        &self,
+        cooldown_hours: f64,
+        min_cards: i64,
+        group_limit: i64,
+    ) -> Result<Vec<SubjectMergeCandidateGroup>, StorageError> {
+        let rows = sqlx::query(SQL_SELECT_SUBJECT_MERGE_CANDIDATE_GROUPS)
+            .bind(cooldown_hours.max(0.0))
+            .bind(min_cards.max(2))
+            .bind(group_limit.max(1))
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(SubjectMergeCandidateGroup {
+                    visibility: row.try_get("visibility")?,
+                    user_id: row.try_get("user_id")?,
+                    chat_id: row.try_get("chat_id")?,
+                    thread_id: row.try_get("thread_id")?,
+                    subject: row.try_get("subject")?,
+                    card_ids: row.try_get("card_ids")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Load the full active cards for a merge group by id.
+    pub async fn load_active_cards_by_ids(
+        &self,
+        ids: &[i64],
+    ) -> Result<Vec<openplotva_memory::Card>, StorageError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(SQL_LOAD_MERGE_CARDS)
+            .bind(ids)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter().map(memory_card_from_row).collect()
+    }
+
+    /// Stamp a set of cards as merge-reviewed without applying any merge — used to
+    /// put a group that failed to process on the cooldown so it retries at the
+    /// cooldown cadence instead of every tick.
+    pub async fn mark_cards_merge_passed(&self, ids: &[i64]) -> Result<(), StorageError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        sqlx::query(SQL_MARK_MEMORY_CARDS_MERGE_PASSED)
+            .bind(ids)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Apply one validated merge plan for a subject group atomically: fold each
+    /// cluster's absorbed cards into its survivor (supersede + rewrite text +
+    /// carry the summed observation_count), demote the weak-but-kept cards, and
+    /// stamp every group card as merge-reviewed. All-or-nothing per group so a
+    /// mid-apply failure never leaves a half-collapsed cluster.
+    pub async fn apply_subject_merge(
+        &self,
+        apply: &SubjectMergeApply,
+    ) -> Result<SubjectMergeApplyCounts, StorageError> {
+        let mut counts = SubjectMergeApplyCounts::default();
+        let mut tx = self.pool.begin().await?;
+        for cluster in &apply.clusters {
+            if cluster.survivor_id == 0 || cluster.absorbed_ids.is_empty() {
+                continue;
+            }
+            for absorbed in &cluster.absorbed_ids {
+                if *absorbed == 0 || *absorbed == cluster.survivor_id {
+                    continue;
+                }
+                sqlx::query(SQL_SUPERSEDE_MEMORY_CARD)
+                    .bind(cluster.survivor_id)
+                    .bind(*absorbed)
+                    .execute(&mut *tx)
+                    .await?;
+                counts.superseded += 1;
+            }
+            let text = cluster.merged_fact_text.trim();
+            if !text.is_empty() {
+                // SQL_UPDATE_MEMORY_CARD_TEXT sets `embedding = COALESCE($4::vector,
+                // embedding)`, so a None here (embed unavailable) preserves the survivor's
+                // prior vector rather than nulling it — never a wipe, at worst briefly stale.
+                sqlx::query(SQL_UPDATE_MEMORY_CARD_TEXT)
+                    .bind(cluster.survivor_id)
+                    .bind(text)
+                    .bind("")
+                    .bind(pgvector_literal(cluster.embedding.as_ref()))
+                    .execute(&mut *tx)
+                    .await?;
+                counts.survivors_rewritten += 1;
+            }
+            if cluster.observation_count > 0 {
+                sqlx::query(SQL_SET_MEMORY_CARD_OBSERVATION_COUNT)
+                    .bind(cluster.survivor_id)
+                    .bind(cluster.observation_count)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
+        for id in &apply.demote_ids {
+            if *id == 0 {
+                continue;
+            }
+            sqlx::query(SQL_DEMOTE_MEMORY_CARD)
+                .bind(*id)
+                .bind(apply.demote_confidence_delta.max(0.0))
+                .execute(&mut *tx)
+                .await?;
+            counts.demoted += 1;
+        }
+        if !apply.group_ids.is_empty() {
+            sqlx::query(SQL_MARK_MEMORY_CARDS_MERGE_PASSED)
+                .bind(apply.group_ids.as_slice())
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(counts)
     }
 
     /// Mark exhausted processing memory runs before claiming fresh work.

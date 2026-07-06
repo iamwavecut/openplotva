@@ -2095,6 +2095,68 @@ where
         }
         request
     }
+
+    /// Run the backlog subject merge-pass over one (scope, subject) group: the
+    /// model folds over-extracted near-duplicates into survivors. Same transport,
+    /// config and decode/salvage as extraction, a dedicated card-on-card prompt.
+    pub async fn merge_subject(
+        &self,
+        input: &openplotva_memory::SubjectMergeInput,
+        on_status: &mut (dyn FnMut(StatusUpdate) + Send),
+    ) -> Result<openplotva_memory::SubjectMergePlan, AifarmMemoryExtractorError> {
+        let system_prompt = openplotva_prompts::read("memory/subject_merge")?;
+        let payload = serde_json::to_string(input).map_err(AifarmMemoryExtractorError::Input)?;
+        let mut request = self.subject_merge_request(&system_prompt, &payload);
+        request.trace = Some(aux_llm_call_trace(
+            "memory_subject_merge",
+            "aifarm_memory_extractor",
+        ));
+        let result = self
+            .client
+            .complete(request, on_status)
+            .await
+            .map_err(|source| AifarmMemoryExtractorError::Completion { source })?;
+        let Some(response) = result.response.as_ref() else {
+            return Err(AifarmMemoryExtractorError::Response(
+                "chat completion returned no response".to_owned(),
+            ));
+        };
+        let content = first_choice_content(response)
+            .map_err(|err| AifarmMemoryExtractorError::Response(err.to_string()))?;
+        Ok(openplotva_memory::decode_subject_merge_plan(&content)?)
+    }
+
+    fn subject_merge_request(&self, system_prompt: &str, payload: &str) -> ChatCompletionRequest {
+        let mut request = ChatCompletionRequest {
+            model: self.cfg.model.trim().to_owned(),
+            messages: vec![
+                ChatMessage {
+                    role: "system".to_owned(),
+                    content: system_prompt.to_owned(),
+                    content_parts: Vec::new(),
+                    ..ChatMessage::default()
+                },
+                ChatMessage {
+                    role: "user".to_owned(),
+                    content: payload.to_owned(),
+                    content_parts: Vec::new(),
+                    ..ChatMessage::default()
+                },
+            ],
+            stream: false,
+            response_format: Some(subject_merge_response_format()),
+            max_tokens: self.cfg.max_output_tokens,
+            temperature: self.cfg.temperature,
+            frequency_penalty: self.cfg.frequency_penalty,
+            presence_penalty: self.cfg.presence_penalty,
+            include_reasoning: self.cfg.include_reasoning,
+            ..ChatCompletionRequest::default()
+        };
+        if let Some(enable_thinking) = self.cfg.enable_thinking {
+            request.set_chat_template_kwargs(json!({ "enable_thinking": enable_thinking }));
+        }
+        request
+    }
 }
 
 impl<T> MemoryExtractor for AifarmMemoryExtractor<T>
@@ -2107,6 +2169,23 @@ where
         Box::pin(async move {
             let mut on_status = |_status: StatusUpdate| {};
             AifarmMemoryExtractor::extract(self, input, &mut on_status).await
+        })
+    }
+}
+
+impl<T> openplotva_memory::SubjectMerger for AifarmMemoryExtractor<T>
+where
+    T: AifarmHttpTransport + Clone,
+{
+    type Error = AifarmMemoryExtractorError;
+
+    fn merge_subject<'a>(
+        &'a self,
+        input: &'a openplotva_memory::SubjectMergeInput,
+    ) -> openplotva_memory::SubjectMergerFuture<'a, Self::Error> {
+        Box::pin(async move {
+            let mut on_status = |_status: StatusUpdate| {};
+            AifarmMemoryExtractor::merge_subject(self, input, &mut on_status).await
         })
     }
 }
@@ -4256,6 +4335,41 @@ fn history_summary_response_schema() -> Value {
     })
 }
 
+fn subject_merge_response_format() -> Value {
+    json!({
+        "type": "json_schema",
+        "json_schema": {
+            "name": "memory_subject_merge",
+            "schema": subject_merge_response_schema(),
+        },
+    })
+}
+
+fn subject_merge_response_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["clusters", "demote_ids", "keep_ids"],
+        "properties": {
+            "clusters": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["survivor_id", "absorbed_ids", "merged_fact_text"],
+                    "properties": {
+                        "survivor_id": {"type": "integer"},
+                        "absorbed_ids": {"type": "array", "items": {"type": "integer"}},
+                        "merged_fact_text": {"type": "string"},
+                    },
+                },
+            },
+            "demote_ids": {"type": "array", "items": {"type": "integer"}},
+            "keep_ids": {"type": "array", "items": {"type": "integer"}},
+        },
+    })
+}
+
 fn memory_extraction_response_format() -> Value {
     json!({
         "type": "json_schema",
@@ -5803,6 +5917,29 @@ mod tests {
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(body["messages"][1]["role"], "user");
         Ok(())
+    }
+
+    #[test]
+    fn subject_merge_request_carries_schema_and_penalties() {
+        let extractor = AifarmMemoryExtractor::with_transport(
+            AifarmMemoryExtractorConfig {
+                frequency_penalty: Some(0.3),
+                presence_penalty: Some(0.3),
+                ..AifarmMemoryExtractorConfig::default()
+            }
+            .with_defaults(),
+            FakeTransport::new(vec![]),
+        );
+        let request = extractor.subject_merge_request("system", "payload");
+        let body = serde_json::to_value(&request).expect("serialize");
+        assert_eq!(
+            body["response_format"]["json_schema"]["name"],
+            "memory_subject_merge"
+        );
+        assert_eq!(body["frequency_penalty"], 0.3);
+        assert_eq!(body["presence_penalty"], 0.3);
+        assert_eq!(body["stream"], false);
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
     }
 
     #[test]

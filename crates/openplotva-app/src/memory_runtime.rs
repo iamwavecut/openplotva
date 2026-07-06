@@ -2541,6 +2541,284 @@ where
     report
 }
 
+pub const MEMORY_SUBJECT_MERGE_INTERVAL: Duration = Duration::from_secs(45);
+pub const MEMORY_SUBJECT_MERGE_COOLDOWN_HOURS: f64 = 168.0;
+pub const MEMORY_SUBJECT_MERGE_MIN_CARDS: i64 = 6;
+pub const MEMORY_SUBJECT_MERGE_GROUP_BATCH: i64 = 4;
+pub const MEMORY_SUBJECT_MERGE_MAX_GROUP_CARDS: usize = 80;
+pub const MEMORY_SUBJECT_MERGE_DEMOTE_DELTA: f64 = 0.2;
+
+/// Tuning for the backlog subject merge-pass worker.
+#[derive(Clone, Copy, Debug)]
+pub struct MemorySubjectMergeConfig {
+    pub interval: Duration,
+    /// Skip a group whose cards were merge-reviewed within this many hours.
+    pub cooldown_hours: f64,
+    /// Only consider a group with at least this many un-reviewed active cards.
+    pub min_cards: i64,
+    /// Candidate groups processed per tick.
+    pub group_batch: i64,
+    /// Cap on cards fed to the model per group (un-reviewed first); oversized
+    /// groups converge across successive ticks.
+    pub max_group_cards: usize,
+    /// Confidence lost by a demoted (weak-but-kept) card.
+    pub demote_confidence_delta: f64,
+    /// Embedding dimension for regenerating a rewritten survivor's vector.
+    pub embedding_dimension: i32,
+}
+
+impl Default for MemorySubjectMergeConfig {
+    fn default() -> Self {
+        Self {
+            interval: MEMORY_SUBJECT_MERGE_INTERVAL,
+            cooldown_hours: MEMORY_SUBJECT_MERGE_COOLDOWN_HOURS,
+            min_cards: MEMORY_SUBJECT_MERGE_MIN_CARDS,
+            group_batch: MEMORY_SUBJECT_MERGE_GROUP_BATCH,
+            max_group_cards: MEMORY_SUBJECT_MERGE_MAX_GROUP_CARDS,
+            demote_confidence_delta: MEMORY_SUBJECT_MERGE_DEMOTE_DELTA,
+            embedding_dimension: 512,
+        }
+    }
+}
+
+/// What the subject merge-pass worker did over its lifetime.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct MemorySubjectMergeReport {
+    pub ticks: u64,
+    pub groups_considered: u64,
+    pub groups_merged: u64,
+    pub cards_superseded: u64,
+    pub cards_demoted: u64,
+    pub skipped_unavailable: u64,
+    pub errors: u64,
+}
+
+/// Build the storage apply plan from the model's raw plan: validate every id
+/// against the real group, then carry the summed observation_count (survivor +
+/// absorbed) onto each survivor. Pure so the id-safety and count math are unit
+/// tested without a transport.
+#[must_use]
+fn plan_to_subject_merge_apply(
+    plan: &openplotva_memory::SubjectMergePlan,
+    cards: &[openplotva_memory::Card],
+    group_ids: &[i64],
+    demote_confidence_delta: f64,
+) -> openplotva_storage::SubjectMergeApply {
+    let obs: std::collections::HashMap<i64, i64> = cards
+        .iter()
+        .map(|card| (card.id, i64::from(card.observation_count).max(0)))
+        .collect();
+    let validated = openplotva_memory::validate_subject_merge_plan(plan, group_ids);
+    let clusters = validated
+        .clusters
+        .into_iter()
+        .map(|cluster| {
+            let summed = obs.get(&cluster.survivor_id).copied().unwrap_or(0)
+                + cluster
+                    .absorbed_ids
+                    .iter()
+                    .map(|id| obs.get(id).copied().unwrap_or(0))
+                    .sum::<i64>();
+            openplotva_storage::SubjectMergeApplyCluster {
+                survivor_id: cluster.survivor_id,
+                absorbed_ids: cluster.absorbed_ids,
+                merged_fact_text: cluster.merged_fact_text,
+                observation_count: summed,
+                // Filled by embed_merge_survivors in the tick (async); None here
+                // keeps the pure mapping synchronous and testable.
+                embedding: None,
+            }
+        })
+        .collect();
+    openplotva_storage::SubjectMergeApply {
+        clusters,
+        demote_ids: validated.demote_ids,
+        group_ids: group_ids.to_vec(),
+        demote_confidence_delta,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SubjectMergeTick {
+    groups_considered: u64,
+    groups_merged: u64,
+    cards_superseded: u64,
+    cards_demoted: u64,
+}
+
+/// Regenerate each survivor's embedding from its merged text so vector retrieval
+/// matches the rewritten card. Best-effort: on embedder failure the cluster keeps
+/// `None`, which leaves the prior embedding in place rather than blocking the merge.
+async fn embed_merge_survivors<Embedder>(
+    apply: &mut openplotva_storage::SubjectMergeApply,
+    embedder: Option<&Embedder>,
+    dimension: i32,
+) where
+    Embedder: EmbeddingProvider,
+{
+    let Some(provider) = embedder else {
+        return;
+    };
+    let texts: Vec<String> = apply
+        .clusters
+        .iter()
+        .map(|cluster| cluster.merged_fact_text.clone())
+        .collect();
+    if texts.is_empty() {
+        return;
+    }
+    match provider
+        .embed_batch(&texts, dimension, MEMORY_CARD_EMBEDDING_TASK)
+        .await
+    {
+        Ok(embeddings) => {
+            for (cluster, embedding) in apply.clusters.iter_mut().zip(embeddings) {
+                cluster.embedding = embedding;
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, "subject merge-pass failed to embed survivors; keeping prior embeddings");
+        }
+    }
+}
+
+async fn process_one_merge_group<Merger, Embedder>(
+    merger: &Merger,
+    store: &PostgresMemoryStore,
+    embedder: Option<&Embedder>,
+    cfg: &MemorySubjectMergeConfig,
+    now: OffsetDateTime,
+    group: &openplotva_storage::SubjectMergeCandidateGroup,
+) -> Result<Option<openplotva_storage::SubjectMergeApplyCounts>, Box<dyn StdError + Send + Sync>>
+where
+    Merger: openplotva_memory::SubjectMerger + Send + Sync,
+    Embedder: EmbeddingProvider,
+{
+    let mut ids = group.card_ids.clone();
+    ids.truncate(cfg.max_group_cards.max(2));
+    let cards = store.load_active_cards_by_ids(&ids).await?;
+    if cards.len() < 2 {
+        return Ok(None);
+    }
+    let group_ids: Vec<i64> = cards.iter().map(|card| card.id).collect();
+    let input = openplotva_memory::SubjectMergeInput {
+        subject: group.subject.clone(),
+        cards: openplotva_memory::subject_merge_cards(&cards, now),
+    };
+    let plan = merger
+        .merge_subject(&input)
+        .await
+        .map_err(|source| Box::new(source) as Box<dyn StdError + Send + Sync>)?;
+    let mut apply =
+        plan_to_subject_merge_apply(&plan, &cards, &group_ids, cfg.demote_confidence_delta);
+    embed_merge_survivors(&mut apply, embedder, cfg.embedding_dimension).await;
+    Ok(Some(store.apply_subject_merge(&apply).await?))
+}
+
+async fn run_memory_subject_merge_tick<Merger, Embedder>(
+    merger: &Merger,
+    store: &PostgresMemoryStore,
+    embedder: Option<&Embedder>,
+    cfg: &MemorySubjectMergeConfig,
+    now: OffsetDateTime,
+) -> Result<SubjectMergeTick, Box<dyn StdError + Send + Sync>>
+where
+    Merger: openplotva_memory::SubjectMerger + Send + Sync,
+    Embedder: EmbeddingProvider,
+{
+    let mut tick = SubjectMergeTick::default();
+    let groups = store
+        .select_subject_merge_candidate_groups(cfg.cooldown_hours, cfg.min_cards, cfg.group_batch)
+        .await?;
+    for group in groups {
+        tick.groups_considered += 1;
+        // One group's failure (LLM, embed, store) must not abort the rest of the
+        // batch. Log, put the failed group on the cooldown (so a persistently
+        // failing group retries at the cooldown cadence instead of burning a model
+        // call every tick and starving the others), and move on.
+        match process_one_merge_group(merger, store, embedder, cfg, now, &group).await {
+            Ok(Some(counts)) => {
+                tick.cards_superseded += counts.superseded;
+                tick.cards_demoted += counts.demoted;
+                if counts.superseded > 0 || counts.demoted > 0 {
+                    tick.groups_merged += 1;
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(%error, subject = %group.subject, "subject merge-pass group failed; deferring to cooldown");
+                if let Err(mark_error) = store.mark_cards_merge_passed(&group.card_ids).await {
+                    tracing::warn!(%mark_error, "failed to defer errored merge group to cooldown");
+                }
+            }
+        }
+    }
+    Ok(tick)
+}
+
+/// Continuously consolidate the backlog of over-extracted (scope, subject) card
+/// groups with the LLM merge-pass, mirroring the decay/dup-collapse workers.
+/// Gated on embedder (vram-cloud) availability so it never burns model calls
+/// while the backend is down. Runs until `stop`.
+pub async fn run_memory_subject_merge_worker_until<Merger, Embedder, Stop>(
+    merger: &Merger,
+    store: PostgresMemoryStore,
+    embedder: Option<&Embedder>,
+    cfg: MemorySubjectMergeConfig,
+    stop: Stop,
+) -> MemorySubjectMergeReport
+where
+    Merger: openplotva_memory::SubjectMerger + Send + Sync,
+    Embedder: EmbeddingProvider,
+    Stop: std::future::Future<Output = ()>,
+{
+    let mut report = MemorySubjectMergeReport::default();
+    tokio::pin!(stop);
+    loop {
+        if embedder.is_some_and(|provider| !provider.is_available()) {
+            report.skipped_unavailable += 1;
+        } else {
+            match run_memory_subject_merge_tick(
+                merger,
+                &store,
+                embedder,
+                &cfg,
+                OffsetDateTime::now_utc(),
+            )
+            .await
+            {
+                Ok(tick) => {
+                    report.groups_considered += tick.groups_considered;
+                    report.groups_merged += tick.groups_merged;
+                    report.cards_superseded += tick.cards_superseded;
+                    report.cards_demoted += tick.cards_demoted;
+                    if tick.cards_superseded > 0 || tick.cards_demoted > 0 {
+                        tracing::debug!(
+                            groups = tick.groups_merged,
+                            superseded = tick.cards_superseded,
+                            demoted = tick.cards_demoted,
+                            "subject merge-pass consolidated cards"
+                        );
+                    }
+                }
+                Err(error) => {
+                    report.errors += 1;
+                    tracing::warn!(%error, "subject merge-pass tick failed");
+                }
+            }
+        }
+        report.ticks += 1;
+
+        let sleep = tokio::time::sleep(cfg.interval);
+        tokio::pin!(sleep);
+        tokio::select! {
+            () = &mut stop => break,
+            () = &mut sleep => {}
+        }
+    }
+    report
+}
+
 async fn write_memory_extraction_cards<ExtractorError, Store, Embedder>(
     store: &Store,
     embedder: Option<&Embedder>,
@@ -3068,6 +3346,18 @@ pub fn aifarm_memory_extractor_config_from_app_config(
     config: &AppConfig,
 ) -> AifarmMemoryExtractorConfig {
     aifarm_memory_extractor_config_from_app_config_with_model(config, None)
+}
+
+/// Build a raw aifarm extractor for the backlog subject merge-pass, targeting the
+/// consolidation model (vram-cloud) directly. Raw rather than routed: the pass is
+/// gated on vram-cloud availability, so it wants the vram model or nothing.
+#[must_use]
+pub fn subject_merger_from_app_config(
+    config: &AppConfig,
+) -> AifarmMemoryExtractor<ReqwestAifarmTransport> {
+    AifarmMemoryExtractor::new(aifarm_memory_extractor_config_from_app_config_with_model(
+        config, None,
+    ))
 }
 
 #[must_use]
@@ -3911,6 +4201,46 @@ fn runtime_memory_restart_model(model: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plan_to_subject_merge_apply_sums_observations_and_validates_ids() {
+        let cards = vec![
+            openplotva_memory::Card {
+                id: 1,
+                observation_count: 3,
+                ..openplotva_memory::Card::default()
+            },
+            openplotva_memory::Card {
+                id: 2,
+                observation_count: 5,
+                ..openplotva_memory::Card::default()
+            },
+            openplotva_memory::Card {
+                id: 3,
+                observation_count: 2,
+                ..openplotva_memory::Card::default()
+            },
+        ];
+        let plan = openplotva_memory::SubjectMergePlan {
+            clusters: vec![openplotva_memory::SubjectMergeCluster {
+                survivor_id: 1,
+                // 99 is not in the group -> dropped by validation before apply.
+                absorbed_ids: vec![2, 99],
+                merged_fact_text: "merged".to_owned(),
+            }],
+            demote_ids: vec![3],
+            keep_ids: vec![],
+        };
+        let apply = plan_to_subject_merge_apply(&plan, &cards, &[1, 2, 3], 0.2);
+        assert_eq!(apply.clusters.len(), 1);
+        assert_eq!(apply.clusters[0].survivor_id, 1);
+        assert_eq!(apply.clusters[0].absorbed_ids, vec![2]);
+        // observation_count carries survivor(3) + absorbed(5); the dropped 99 adds nothing.
+        assert_eq!(apply.clusters[0].observation_count, 8);
+        assert_eq!(apply.demote_ids, vec![3]);
+        assert_eq!(apply.group_ids, vec![1, 2, 3]);
+        assert_eq!(apply.demote_confidence_delta, 0.2);
+    }
     use openplotva_storage::pg_embedding_vector;
     use std::sync::Mutex;
 
