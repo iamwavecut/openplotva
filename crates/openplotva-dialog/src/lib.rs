@@ -1166,10 +1166,11 @@ fn strip_leading_channel_label(value: &str) -> &str {
 
 #[must_use]
 pub fn reply_has_residual_leak(value: &str) -> bool {
-    let lower = value.to_lowercase();
+    // Only a leak that *opens* the reply — a tag quoted mid-text is fine.
+    let lower = value.trim_start().to_lowercase();
     REPLY_LEAK_MARKERS
         .iter()
-        .any(|marker| lower.contains(marker))
+        .any(|marker| lower.starts_with(marker))
 }
 
 fn is_cyrillic(ch: char) -> bool {
@@ -2538,6 +2539,11 @@ mod tests {
         assert_eq!(
             finalize_dialog_reply("Моя кастомная персона важнее, base_voice не при чём."),
             Reply("Моя кастомная персона важнее, base_voice не при чём.".to_owned())
+        );
+        // A tag quoted mid-reply is not a leak — the marker must open the reply.
+        assert_eq!(
+            finalize_dialog_reply("Оберни мысли в <think> теги, чтобы их скрыть."),
+            Reply("Оберни мысли в <think> теги, чтобы их скрыть.".to_owned())
         );
 
         // Copied context echo → context leak; blank → empty.
