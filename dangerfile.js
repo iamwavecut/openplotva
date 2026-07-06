@@ -27,8 +27,13 @@ if (aiAttributionPattern.test(`${title}\n${body}`)) {
   fail("Remove AI self-attribution from the PR title/body; describe the engineering change instead.");
 }
 
-const secretLikeFiles = changedFiles.filter((file) =>
-  /(^|\/)(\.env($|\.)|.*\.pem$|.*\.key$|.*\.p12$|.*\.pfx$|id_rsa$|id_ed25519$)/i.test(file)
+// `.example`/`.sample`/`.template`/`.dist` files are committed placeholders by
+// convention, not real secrets, so they must not trip the secret-file guard.
+const templatePlaceholder = /\.(example|sample|template|dist)$/i;
+const secretLikeFiles = changedFiles.filter(
+  (file) =>
+    /(^|\/)(\.env($|\.)|.*\.pem$|.*\.key$|.*\.p12$|.*\.pfx$|id_rsa$|id_ed25519$)/i.test(file) &&
+    !templatePlaceholder.test(file)
 );
 
 if (secretLikeFiles.length > 0) {
