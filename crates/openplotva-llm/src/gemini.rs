@@ -16,7 +16,6 @@ use url::Url;
 use openplotva_dialog::{
     DialogInput, DialogTraceArtifacts, DialogTraceError, DialogTraceUsage, NativeToolCall,
     NativeToolFunction, PROVIDER_GENKIT, decode_plotva_final_response_with_salvage,
-    has_leading_context_message,
 };
 use openplotva_history::{
     HISTORY_SUMMARY_GENERATE_MAX_ATTEMPTS, HISTORY_SUMMARY_GENERATE_RETRY_DELAY_SECONDS,
@@ -540,21 +539,17 @@ where
             }
             Err(error) => return Err(Box::new(DialogTraceError::new(error, vec![trace]))),
         };
-        let final_text = final_answer_text_with_content(&text);
-        let answer = final_text.answer;
-        if answer.trim().is_empty() {
-            let reason = if has_leading_context_message(&final_text.content) {
-                "chat completion returned only copied context messages"
-            } else {
-                "empty final text"
-            };
-            let error: ChatProviderError = Box::new(ProviderError::new(
-                PROVIDER_GENKIT,
-                FailureReason::ProviderProtocolError,
-                reason,
-            ));
-            return Err(Box::new(DialogTraceError::new(error, vec![trace])));
-        }
+        let answer = match gemini_final_answer(&text) {
+            GeminiFinalAnswer::Reply(answer) => answer,
+            GeminiFinalAnswer::Suppressed(reason) => {
+                let error: ChatProviderError = Box::new(ProviderError::new(
+                    PROVIDER_GENKIT,
+                    FailureReason::ProviderProtocolError,
+                    reason,
+                ));
+                return Err(Box::new(DialogTraceError::new(error, vec![trace])));
+            }
+        };
         Ok(openplotva_dialog::ChatStepOutput {
             provider: PROVIDER_GENKIT.to_owned(),
             model,
@@ -2629,25 +2624,37 @@ fn gemini_error_message(body: &str) -> Option<String> {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-struct FinalAnswerText {
-    answer: String,
-    content: String,
+enum GeminiFinalAnswer {
+    Reply(String),
+    Suppressed(String),
 }
 
-fn final_answer_text_with_content(raw: &str) -> FinalAnswerText {
+fn gemini_final_answer(raw: &str) -> GeminiFinalAnswer {
     let content = decode_plotva_final_response_with_salvage(raw)
         .map(|decoded| decoded.answer.trim().to_owned())
         .unwrap_or_else(|_| raw.trim().to_owned());
     match openplotva_dialog::finalize_dialog_reply(&content) {
-        openplotva_dialog::DialogReplyOutcome::Reply(answer) => FinalAnswerText {
-            answer: sanitize_genkit_final_answer(&answer),
-            content,
-        },
-        // Drop the leaked content too, so no downstream reader can surface it.
-        openplotva_dialog::DialogReplyOutcome::Suppressed(_) => FinalAnswerText {
-            answer: String::new(),
-            content: String::new(),
-        },
+        openplotva_dialog::DialogReplyOutcome::Reply(answer) => {
+            let sanitized = sanitize_genkit_final_answer(&answer);
+            if sanitized.trim().is_empty() {
+                GeminiFinalAnswer::Suppressed("empty final text".to_owned())
+            } else {
+                GeminiFinalAnswer::Reply(sanitized)
+            }
+        }
+        openplotva_dialog::DialogReplyOutcome::Suppressed(reason) => {
+            GeminiFinalAnswer::Suppressed(gemini_suppression_message(&reason))
+        }
+    }
+}
+
+fn gemini_suppression_message(reason: &openplotva_dialog::DialogReplySuppression) -> String {
+    use openplotva_dialog::DialogReplySuppression as Reason;
+    match reason {
+        Reason::ContextLeak => "chat completion returned only copied context messages".to_owned(),
+        Reason::Pathological(detail) => format!("pathological final answer: {detail}"),
+        Reason::ReasoningLeak => "final answer leaked reasoning or protocol scaffolding".to_owned(),
+        Reason::Empty | Reason::ProtocolOnly => "empty final text".to_owned(),
     }
 }
 
@@ -2909,6 +2916,41 @@ mod tests {
                 state.responses.remove(0)
             })
         }
+    }
+
+    #[test]
+    fn gemini_final_answer_maps_suppression_reasons() {
+        use openplotva_dialog::DialogReplySuppression as Reason;
+
+        assert_eq!(
+            gemini_final_answer("Привет, как дела?"),
+            GeminiFinalAnswer::Reply("Привет, как дела?".to_owned())
+        );
+        assert!(matches!(
+            gemini_final_answer(&"а".repeat(30)),
+            GeminiFinalAnswer::Suppressed(_)
+        ));
+
+        assert_eq!(
+            gemini_suppression_message(&Reason::ContextLeak),
+            "chat completion returned only copied context messages"
+        );
+        assert_eq!(
+            gemini_suppression_message(&Reason::Pathological("repeated character run".to_owned())),
+            "pathological final answer: repeated character run"
+        );
+        assert_eq!(
+            gemini_suppression_message(&Reason::ReasoningLeak),
+            "final answer leaked reasoning or protocol scaffolding"
+        );
+        assert_eq!(
+            gemini_suppression_message(&Reason::Empty),
+            "empty final text"
+        );
+        assert_eq!(
+            gemini_suppression_message(&Reason::ProtocolOnly),
+            "empty final text"
+        );
     }
 
     #[test]
