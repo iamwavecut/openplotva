@@ -1099,18 +1099,13 @@ fn strip_leading_context_messages(value: &str) -> String {
     }
 }
 
-/// Harmony/channel framing some served models (qwen3.6, Gemma variants) emit
-/// around a reasoning ("thought") channel and the answer channel. When the
-/// framing collapses, the channel label and/or reasoning body leak into
-/// `content` ahead of the real answer.
+// Harmony/channel framing (qwen3.6, Gemma variants) labels its reasoning channel
+// "thought"; when the framing collapses the label/reasoning leaks ahead of the answer.
 const REASONING_CHANNEL_MARKERS: &[&str] =
     &["<|channel|>", "<|channel>", "<channel|>", "</|channel>"];
 
-/// Bare channel labels that leak as the first line when the framing is dropped.
 const REASONING_CHANNEL_LABELS: &[&str] = &["thought", "analysis", "commentary"];
 
-/// High-signal internal markers that must never reach a user; if any survives
-/// sanitization the reply is treated as leaked and suppressed for regeneration.
 const REPLY_LEAK_MARKERS: &[&str] = &[
     "<|channel",
     "<channel|",
@@ -1134,10 +1129,6 @@ const REPLY_LEAK_MARKERS: &[&str] = &[
     "daily persona",
 ];
 
-/// Recover the real answer from harmony/channel-framed output: the answer is the
-/// text of the final channel (after the last channel marker). Reasoning-only
-/// output (a bare "thought" label with no answer channel) collapses to empty so
-/// the caller regenerates instead of sending leaked reasoning.
 #[must_use]
 pub fn strip_reasoning_channels(content: &str) -> String {
     let trimmed = content.trim();
@@ -1156,8 +1147,7 @@ pub fn strip_reasoning_channels(content: &str) -> String {
     if let Some(end) = last_end {
         return strip_leading_channel_label(trimmed[end..].trim()).to_owned();
     }
-    // No channel markers: a leading bare reasoning label means the whole output
-    // is a leaked reasoning channel with no separate answer — suppress it.
+    // A leading bare reasoning label with no answer channel is a reasoning-only leak.
     if strip_leading_channel_label(trimmed).len() != trimmed.len() {
         return String::new();
     }
@@ -1168,8 +1158,7 @@ fn strip_leading_channel_label(value: &str) -> &str {
     let value = value.trim_start();
     for label in REASONING_CHANNEL_LABELS {
         if let Some(rest) = value.strip_prefix(label) {
-            // Only a label on its own line is a channel label; "thought " or
-            // "thought:" mid-reply stays, so real answers are never mangled.
+            // Only when the label is on its own line — "thought" mid-reply stays.
             if rest.is_empty() || rest.starts_with('\n') || rest.starts_with('\r') {
                 return rest.trim_start();
             }
@@ -1178,9 +1167,6 @@ fn strip_leading_channel_label(value: &str) -> &str {
     value
 }
 
-/// Whether a sanitized reply still carries an internal marker that must never be
-/// sent (channel/reasoning/tool framing, context scaffolding, persona/system
-/// identifiers).
 #[must_use]
 pub fn reply_has_residual_leak(value: &str) -> bool {
     let lower = value.to_lowercase();
@@ -1195,8 +1181,6 @@ fn is_cyrillic(ch: char) -> bool {
         || ('\u{a640}'..='\u{a69f}').contains(&ch)
 }
 
-/// Detect a degenerate final answer (a long single-character run, or a wall of
-/// spaceless Cyrillic) that indicates the model looped or lost structure.
 #[must_use]
 pub fn pathological_final_answer_reason(value: &str) -> Option<String> {
     let mut max_run = 0;
@@ -1228,34 +1212,23 @@ pub fn pathological_final_answer_reason(value: &str) -> Option<String> {
     None
 }
 
-/// Why a model reply was suppressed instead of sent.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DialogReplySuppression {
-    /// No content at all.
     Empty,
-    /// The reply only echoed copied prompt context.
     ContextLeak,
-    /// The reply only contained protocol/reasoning artifacts.
     ProtocolOnly,
-    /// A residual internal marker survived sanitization (reasoning/system leak).
     ReasoningLeak,
-    /// The reply looked degenerate (looping / lost structure).
     Pathological(String),
 }
 
-/// Outcome of turning a raw model completion into a user-facing reply.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DialogReplyOutcome {
-    /// A clean reply ready to send.
     Reply(String),
-    /// The generation was not usable; the caller should regenerate.
     Suppressed(DialogReplySuppression),
 }
 
-/// Provider-agnostic reply finalization: recover the answer from channel
-/// framing, strip context/tool/protocol artifacts, and refuse to emit anything
-/// that still leaks internal scaffolding. Every LLM provider funnels its raw
-/// assistant content through this one operational place.
+// Provider-agnostic reply finalization: every LLM provider funnels raw assistant
+// content through here to recover the answer and refuse to emit internal leaks.
 #[must_use]
 pub fn finalize_dialog_reply(content: &str) -> DialogReplyOutcome {
     if content.trim().is_empty() {
