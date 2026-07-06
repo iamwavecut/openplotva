@@ -5103,6 +5103,20 @@ impl PostgresMemoryStore {
         rows.into_iter().map(memory_card_from_row).collect()
     }
 
+    /// Stamp a set of cards as merge-reviewed without applying any merge — used to
+    /// put a group that failed to process on the cooldown so it retries at the
+    /// cooldown cadence instead of every tick.
+    pub async fn mark_cards_merge_passed(&self, ids: &[i64]) -> Result<(), StorageError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        sqlx::query(SQL_MARK_MEMORY_CARDS_MERGE_PASSED)
+            .bind(ids)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// Apply one validated merge plan for a subject group atomically: fold each
     /// cluster's absorbed cards into its survivor (supersede + rewrite text +
     /// carry the summed observation_count), demote the weak-but-kept cards, and

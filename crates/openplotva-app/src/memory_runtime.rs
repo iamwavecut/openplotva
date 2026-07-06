@@ -2733,8 +2733,9 @@ where
     for group in groups {
         tick.groups_considered += 1;
         // One group's failure (LLM, embed, store) must not abort the rest of the
-        // batch — a persistently-failing group would otherwise starve every other
-        // group each tick. Log and move on; the group is retried next pass.
+        // batch. Log, put the failed group on the cooldown (so a persistently
+        // failing group retries at the cooldown cadence instead of burning a model
+        // call every tick and starving the others), and move on.
         match process_one_merge_group(merger, store, embedder, cfg, now, &group).await {
             Ok(Some(counts)) => {
                 tick.cards_superseded += counts.superseded;
@@ -2745,7 +2746,10 @@ where
             }
             Ok(None) => {}
             Err(error) => {
-                tracing::warn!(%error, subject = %group.subject, "subject merge-pass group failed; skipping");
+                tracing::warn!(%error, subject = %group.subject, "subject merge-pass group failed; deferring to cooldown");
+                if let Err(mark_error) = store.mark_cards_merge_passed(&group.card_ids).await {
+                    tracing::warn!(%mark_error, "failed to defer errored merge group to cooldown");
+                }
             }
         }
     }
