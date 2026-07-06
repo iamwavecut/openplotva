@@ -25,9 +25,8 @@ use openplotva_dialog::{
     PROVIDER_NVIDIA, PROVIDER_VMLX, ROLE_MODEL, ROLE_USER, SessionMessage, ToolParseDecision,
     ToolSpec, ToolStep, ToolsMode, alternative_dialog_tool_names, alternative_dialog_tools,
     clone_history_messages, decode_plotva_final_response_with_salvage, extract_content_tool_step,
-    has_leading_context_message, is_dialog_history_noise_tool_call_name, normalize_history_message,
-    parse_native_tool_step, sanitize_final_text, sanitize_tool_text,
-    select_llm_history_messages_for_context, tool_telemetry,
+    is_dialog_history_noise_tool_call_name, normalize_history_message, parse_native_tool_step,
+    sanitize_tool_text, select_llm_history_messages_for_context, tool_telemetry,
 };
 use openplotva_history::{
     AIFARM_DEFAULT_HISTORY_SUMMARY_MODEL, HistorySummaryDecodeError, SummaryDocument, SummaryInput,
@@ -4091,23 +4090,25 @@ fn extract_final_answer_for_provider(
 fn extract_final_answer(response: &Value) -> Result<String, AifarmDialogError> {
     let content = first_choice_content(response)?;
     let content = legacy_final_response_answer(&content).unwrap_or(content);
-    if content.trim().is_empty() {
-        return Err(AifarmDialogError::Response(
-            "chat completion returned empty final text".to_owned(),
-        ));
-    }
-
-    let answer = sanitize_final_text(&content);
-    if answer.trim().is_empty() {
-        if has_leading_context_message(&content) {
-            return Err(AifarmDialogError::FinalAnswerContextLeak);
+    match openplotva_dialog::finalize_dialog_reply(&content) {
+        openplotva_dialog::DialogReplyOutcome::Reply(answer) => Ok(answer),
+        openplotva_dialog::DialogReplyOutcome::Suppressed(reason) => {
+            Err(final_answer_error_from_suppression(reason))
         }
-        return Err(AifarmDialogError::FinalAnswerProtocolOnly);
     }
-    if let Some(reason) = pathological_final_answer_reason(&answer) {
-        return Err(AifarmDialogError::FinalAnswerPathological(reason));
+}
+
+fn final_answer_error_from_suppression(
+    reason: openplotva_dialog::DialogReplySuppression,
+) -> AifarmDialogError {
+    use openplotva_dialog::DialogReplySuppression as Suppression;
+    match reason {
+        Suppression::ContextLeak => AifarmDialogError::FinalAnswerContextLeak,
+        Suppression::Pathological(reason) => AifarmDialogError::FinalAnswerPathological(reason),
+        Suppression::Empty | Suppression::ProtocolOnly | Suppression::ReasoningLeak => {
+            AifarmDialogError::FinalAnswerProtocolOnly
+        }
     }
-    Ok(answer)
 }
 
 fn first_choice_content(response: &Value) -> Result<String, AifarmDialogError> {
@@ -4470,44 +4471,6 @@ fn is_retryable_final_answer_error(err: &AifarmDialogError) -> bool {
             | AifarmDialogError::FinalAnswerPathological(_)
             | AifarmDialogError::ReasoningBudgetExhausted { .. }
     )
-}
-
-fn pathological_final_answer_reason(value: &str) -> Option<String> {
-    let mut max_run = 0;
-    let mut current_run = 0;
-    let mut previous = '\0';
-    let mut cyrillic = 0;
-    let mut spaces = 0;
-
-    for ch in value.trim().chars() {
-        if ch.is_whitespace() {
-            spaces += 1;
-        }
-        if is_cyrillic(ch) {
-            cyrillic += 1;
-        }
-        if ch == previous && ch.is_alphanumeric() {
-            current_run += 1;
-        } else {
-            current_run = 1;
-            previous = ch;
-        }
-        max_run = max_run.max(current_run);
-    }
-
-    if max_run >= 24 {
-        return Some("repeated character run".to_owned());
-    }
-    if cyrillic >= 80 && spaces <= 1 {
-        return Some("missing word spaces".to_owned());
-    }
-    None
-}
-
-fn is_cyrillic(ch: char) -> bool {
-    ('\u{0400}'..='\u{052f}').contains(&ch)
-        || ('\u{2de0}'..='\u{2dff}').contains(&ch)
-        || ('\u{a640}'..='\u{a69f}').contains(&ch)
 }
 
 fn canonical_provider_name(provider: &str) -> String {

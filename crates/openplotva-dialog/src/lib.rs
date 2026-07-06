@@ -1099,6 +1099,160 @@ fn strip_leading_context_messages(value: &str) -> String {
     }
 }
 
+// Harmony/channel framing (qwen3.6, Gemma variants) labels its reasoning channel
+// "thought"; when the framing collapses the label/reasoning leaks ahead of the answer.
+const REASONING_CHANNEL_MARKERS: &[&str] =
+    &["<|channel|>", "<|channel>", "<channel|>", "</|channel>"];
+
+const REASONING_CHANNEL_LABELS: &[&str] = &["thought", "analysis", "commentary"];
+
+const REPLY_LEAK_MARKERS: &[&str] = &[
+    "<|channel",
+    "<channel|",
+    "</|channel",
+    "<think",
+    "</think",
+    "<|tool_call",
+    "<tool_call",
+    "<|tool_response",
+    "<tool_response",
+    "tool_request\n",
+    "tool_result\n",
+    "<chat_context",
+    "<reference_context",
+    "relevant memory (read-only",
+    "<message id=",
+    "<last_message",
+    "<assistant_message",
+];
+
+#[must_use]
+pub fn strip_reasoning_channels(content: &str) -> String {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let mut last_end: Option<usize> = None;
+    for marker in REASONING_CHANNEL_MARKERS {
+        let mut from = 0;
+        while let Some(rel) = trimmed[from..].find(marker) {
+            let end = from + rel + marker.len();
+            last_end = Some(last_end.map_or(end, |prev| prev.max(end)));
+            from = end;
+        }
+    }
+    if let Some(end) = last_end {
+        return strip_leading_channel_label(trimmed[end..].trim()).to_owned();
+    }
+    // A leading bare reasoning label with no answer channel is a reasoning-only leak.
+    if strip_leading_channel_label(trimmed).len() != trimmed.len() {
+        return String::new();
+    }
+    content.to_owned()
+}
+
+fn strip_leading_channel_label(value: &str) -> &str {
+    let value = value.trim_start();
+    for label in REASONING_CHANNEL_LABELS {
+        let Some(head) = value.get(..label.len()) else {
+            continue;
+        };
+        if head.eq_ignore_ascii_case(label) {
+            let rest = &value[label.len()..];
+            // Only when the label is on its own line — "thought" mid-reply stays.
+            if rest.is_empty() || rest.starts_with('\n') || rest.starts_with('\r') {
+                return rest.trim_start();
+            }
+        }
+    }
+    value
+}
+
+#[must_use]
+pub fn reply_has_residual_leak(value: &str) -> bool {
+    // Only a leak that *opens* the reply — a tag quoted mid-text is fine.
+    let lower = value.trim_start().to_lowercase();
+    REPLY_LEAK_MARKERS
+        .iter()
+        .any(|marker| lower.starts_with(marker))
+}
+
+fn is_cyrillic(ch: char) -> bool {
+    ('\u{0400}'..='\u{052f}').contains(&ch)
+        || ('\u{2de0}'..='\u{2dff}').contains(&ch)
+        || ('\u{a640}'..='\u{a69f}').contains(&ch)
+}
+
+#[must_use]
+pub fn pathological_final_answer_reason(value: &str) -> Option<String> {
+    let mut max_run = 0;
+    let mut current_run = 0;
+    let mut previous = '\0';
+    let mut cyrillic = 0;
+    let mut spaces = 0;
+    for ch in value.trim().chars() {
+        if ch.is_whitespace() {
+            spaces += 1;
+        }
+        if is_cyrillic(ch) {
+            cyrillic += 1;
+        }
+        if ch == previous && ch.is_alphanumeric() {
+            current_run += 1;
+        } else {
+            current_run = 1;
+            previous = ch;
+        }
+        max_run = max_run.max(current_run);
+    }
+    if max_run >= 24 {
+        return Some("repeated character run".to_owned());
+    }
+    if cyrillic >= 80 && spaces <= 1 {
+        return Some("missing word spaces".to_owned());
+    }
+    None
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DialogReplySuppression {
+    Empty,
+    ContextLeak,
+    ProtocolOnly,
+    ReasoningLeak,
+    Pathological(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DialogReplyOutcome {
+    Reply(String),
+    Suppressed(DialogReplySuppression),
+}
+
+// Provider-agnostic reply finalization: every LLM provider funnels raw assistant
+// content through here to recover the answer and refuse to emit internal leaks.
+#[must_use]
+pub fn finalize_dialog_reply(content: &str) -> DialogReplyOutcome {
+    if content.trim().is_empty() {
+        return DialogReplyOutcome::Suppressed(DialogReplySuppression::Empty);
+    }
+    let recovered = strip_reasoning_channels(content);
+    let answer = sanitize_final_text(&recovered);
+    if answer.trim().is_empty() {
+        if has_leading_context_message(&recovered) || has_leading_context_message(content) {
+            return DialogReplyOutcome::Suppressed(DialogReplySuppression::ContextLeak);
+        }
+        return DialogReplyOutcome::Suppressed(DialogReplySuppression::ProtocolOnly);
+    }
+    if reply_has_residual_leak(&answer) {
+        return DialogReplyOutcome::Suppressed(DialogReplySuppression::ReasoningLeak);
+    }
+    if let Some(reason) = pathological_final_answer_reason(&answer) {
+        return DialogReplyOutcome::Suppressed(DialogReplySuppression::Pathological(reason));
+    }
+    DialogReplyOutcome::Reply(answer)
+}
+
 fn trim_protocol_boundary_suffix(value: &str) -> String {
     let mut cleaned = value.trim().to_owned();
     loop {
@@ -2347,6 +2501,88 @@ fn is_zero_i32(value: &i32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finalize_dialog_reply_recovers_channels_and_suppresses_leaks() {
+        use DialogReplyOutcome::{Reply, Suppressed};
+        use DialogReplySuppression::{
+            ContextLeak, Empty, Pathological, ProtocolOnly, ReasoningLeak,
+        };
+
+        // Harmony/channel framing: the answer is the final channel; the leaked
+        // "thought" reasoning label must not survive.
+        assert_eq!(
+            finalize_dialog_reply("thought\n<channel|>😂"),
+            Reply("😂".to_owned())
+        );
+        assert_eq!(
+            finalize_dialog_reply("<|channel>thought\n<channel|>Как это понимать?"),
+            Reply("Как это понимать?".to_owned())
+        );
+        assert_eq!(
+            finalize_dialog_reply("<channel|><|channel>thought\n<channel|>ответ"),
+            Reply("ответ".to_owned())
+        );
+
+        // Bare reasoning label with no answer channel → suppressed for regen.
+        assert_eq!(
+            finalize_dialog_reply("thought\n\n"),
+            Suppressed(ProtocolOnly)
+        );
+        assert_eq!(
+            finalize_dialog_reply("thought\nМне нужно просто ответить, но я зациклился."),
+            Suppressed(ProtocolOnly)
+        );
+        // The reasoning label is matched case-insensitively.
+        assert_eq!(
+            finalize_dialog_reply("Thought\n\n"),
+            Suppressed(ProtocolOnly)
+        );
+        assert_eq!(
+            finalize_dialog_reply("ANALYSIS\nСначала подумаю."),
+            Suppressed(ProtocolOnly)
+        );
+
+        // Structural scaffolding that survives sanitization → suppressed.
+        assert_eq!(
+            finalize_dialog_reply("<chat_context><reference_context>leaked</reference_context>"),
+            Suppressed(ReasoningLeak)
+        );
+        // Persona terms in prose must NOT be suppressed (false-positive guard).
+        assert_eq!(
+            finalize_dialog_reply("Моя кастомная персона важнее, base_voice не при чём."),
+            Reply("Моя кастомная персона важнее, base_voice не при чём.".to_owned())
+        );
+        // A tag quoted mid-reply is not a leak — the marker must open the reply.
+        assert_eq!(
+            finalize_dialog_reply("Оберни мысли в <think> теги, чтобы их скрыть."),
+            Reply("Оберни мысли в <think> теги, чтобы их скрыть.".to_owned())
+        );
+
+        // Copied context echo → context leak; blank → empty.
+        assert_eq!(
+            finalize_dialog_reply("<message id=\"1\"><text>old</text></message>"),
+            Suppressed(ContextLeak)
+        );
+        assert_eq!(finalize_dialog_reply("   "), Suppressed(Empty));
+
+        // Degenerate loop → pathological.
+        assert!(matches!(
+            finalize_dialog_reply(&"а".repeat(30)),
+            Suppressed(Pathological(_))
+        ));
+
+        // Real replies are untouched — including ones that merely mention
+        // "thought" mid-sentence.
+        assert_eq!(
+            finalize_dialog_reply("Логично."),
+            Reply("Логично.".to_owned())
+        );
+        assert_eq!(
+            finalize_dialog_reply("I thought so too."),
+            Reply("I thought so too.".to_owned())
+        );
+    }
 
     #[test]
     fn tool_catalog_matches_go_names_and_schema() {
