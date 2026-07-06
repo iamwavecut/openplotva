@@ -2,9 +2,13 @@
 large_patch_policy = "clip"
 patch_extra_lines_before = 3
 patch_extra_lines_after = 1
+publish_output_progress = false
 
 [pr_reviewer]
 require_tests_review = false
+persistent_comment = false
+final_update_message = false
+publish_output_no_suggestions = false
 extra_instructions = """
 Focus on correctness, security boundaries, async/concurrency hazards, external contracts,
 migrations, and production/runtime risks. Do not comment on formatting, style-only lint,
@@ -15,6 +19,8 @@ dependency advisories, or SAST findings already handled by reviewdog and CI.
 commitable_code_suggestions = true
 focus_only_on_problems = true
 num_code_suggestions_per_chunk = 3
+persistent_comment = false
+publish_output_no_suggestions = false
 extra_instructions = """
 Suggest only actionable fixes for correctness, security boundaries, async/concurrency hazards,
 external contracts, migrations, and production/runtime risks. Avoid formatting, style-only,

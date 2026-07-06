@@ -48,18 +48,10 @@ jobs:
         run: npx --yes danger@13.0.10 ci
 
   pr-agent:
-    name: PR-Agent ${{ matrix.title }}
+    name: PR-Agent review and suggestions
     if: ${{ (github.event_name == 'workflow_dispatch' && inputs.pr_number != '') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.draft == false && github.event.action != 'edited' && github.actor != 'github-actions[bot]') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - command: review
-            title: AI review
-          - command: improve
-            title: code suggestions
     permissions:
       contents: read
       issues: write
@@ -100,7 +92,7 @@ jobs:
             echo "changed_files=$changed_files"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Run PR-Agent ${{ matrix.command }}
+      - name: Run PR-Agent review and suggestions
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           OPENAI__KEY: ${{ secrets.PR_AGENT_OPENAI_KEY }}
@@ -113,29 +105,32 @@ jobs:
           PR_AGENT_MAX_MODEL_TOKENS: ${{ vars.PR_AGENT_MAX_MODEL_TOKENS || '1000000' }}
           PR_AGENT_IMPROVE_MAX_CHANGED_LINES: ${{ vars.PR_AGENT_IMPROVE_MAX_CHANGED_LINES || '800' }}
           PR_AGENT_IMPROVE_MAX_CHANGED_FILES: ${{ vars.PR_AGENT_IMPROVE_MAX_CHANGED_FILES || '12' }}
+          PR_AGENT_PUBLISH_NO_FINDINGS: ${{ vars.PR_AGENT_PUBLISH_NO_FINDINGS || 'false' }}
+          PR_AGENT_FAIL_ON_FINDINGS: ${{ vars.PR_AGENT_FAIL_ON_FINDINGS || 'true' }}
           PR_AGENT_REVIEW_EXTRA_INSTRUCTIONS: >-
             Focus on correctness, security boundaries, async/concurrency hazards,
             external contracts, migrations, and production/runtime risks. Do not
             comment on formatting, style-only lint, dependency advisories, or SAST
             findings already handled by reviewdog and CI.
-          PR_AGENT_COMMAND: ${{ matrix.command }}
           PR_URL: ${{ steps.target.outputs.pr_url }}
           PR_CHANGED_LINES: ${{ steps.target.outputs.changed_lines }}
           PR_CHANGED_FILES: ${{ steps.target.outputs.changed_files }}
         run: |
           set -euo pipefail
-          if [[ "$PR_AGENT_COMMAND" == "improve" ]] && {
+          export PR_AGENT_SKIP_IMPROVE=false
+          if {
             (( PR_CHANGED_LINES > PR_AGENT_IMPROVE_MAX_CHANGED_LINES )) ||
             (( PR_CHANGED_FILES > PR_AGENT_IMPROVE_MAX_CHANGED_FILES ));
           }; then
             echo "::notice title=PR-Agent improve skipped::PR has ${PR_CHANGED_LINES} changed lines across ${PR_CHANGED_FILES} files; limits are ${PR_AGENT_IMPROVE_MAX_CHANGED_LINES} lines and ${PR_AGENT_IMPROVE_MAX_CHANGED_FILES} files."
-            exit 0
+            export PR_AGENT_SKIP_IMPROVE=true
           fi
           log_file="$(mktemp)"
           set +e
           docker run --rm \
             -i \
             --entrypoint python \
+            -v "$PWD/.github/scripts/run_pr_agent_pair.py:/tmp/run_pr_agent_pair.py:ro" \
             -e GITHUB_TOKEN \
             -e "GITHUB.USER_TOKEN=$GITHUB_TOKEN" \
             -e "GITHUB.DEPLOYMENT_TYPE=user" \
@@ -143,43 +138,17 @@ jobs:
             -e OPENAI_KEY \
             -e OPENAI__API_BASE \
             -e PR_URL \
-            -e PR_AGENT_COMMAND \
-            -e "config.model=$PR_AGENT_MODEL" \
-            -e "config.fallback_models=$PR_AGENT_FALLBACK_MODELS" \
-            -e "config.ai_timeout=$PR_AGENT_AI_TIMEOUT" \
-            -e "config.custom_model_max_tokens=$PR_AGENT_CUSTOM_MODEL_MAX_TOKENS" \
-            -e "config.max_model_tokens=$PR_AGENT_MAX_MODEL_TOKENS" \
-            -e "litellm.drop_params=true" \
-            -e "github_action_config.enable_output=false" \
-            -e "github.publish_as_check_run=true" \
-            -e "pr_reviewer.require_tests_review=false" \
-            -e "pr_reviewer.extra_instructions=$PR_AGENT_REVIEW_EXTRA_INSTRUCTIONS" \
+            -e PR_AGENT_MODEL \
+            -e PR_AGENT_FALLBACK_MODELS \
+            -e PR_AGENT_AI_TIMEOUT \
+            -e PR_AGENT_CUSTOM_MODEL_MAX_TOKENS \
+            -e PR_AGENT_MAX_MODEL_TOKENS \
+            -e PR_AGENT_SKIP_IMPROVE \
+            -e PR_AGENT_PUBLISH_NO_FINDINGS \
+            -e PR_AGENT_FAIL_ON_FINDINGS \
+            -e PR_AGENT_REVIEW_EXTRA_INSTRUCTIONS \
             pragent/pr-agent@sha256:ea2ea90f072fd97708755e59827a317272f66097a1ef349eca23d39160bb0baf \
-            - 2>&1 <<'PY' | tee "$log_file"
-          import asyncio
-          import os
-
-          from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
-          from pr_agent.agent.pr_agent import PRAgent
-          from pr_agent.config_loader import get_settings
-          from pr_agent.log import setup_logger
-
-
-          async def main():
-              setup_logger(os.environ.get("LOG_LEVEL", "INFO"))
-              get_settings().set("CONFIG.CLI_MODE", True)
-              get_settings().set("CONFIG.CONFIG_BRANCH", os.environ.get("PR_AGENT_CONFIG_BRANCH") or None)
-              get_settings().set("CONFIG.EXTRA_CONFIG_URL", os.environ.get("PR_AGENT_EXTRA_CONFIG_URL"))
-              command = os.environ["PR_AGENT_COMMAND"]
-              ok = await PRAgent().handle_request(os.environ["PR_URL"], command)
-              if not ok:
-                  raise RuntimeError(f"PR-Agent command failed: {command}")
-              await asyncio.wait_for(GLOBAL_LOGGING_WORKER.flush(), timeout=15)
-              await GLOBAL_LOGGING_WORKER.stop()
-
-
-          asyncio.run(main())
-          PY
+            /tmp/run_pr_agent_pair.py 2>&1 | tee "$log_file"
           status="${PIPESTATUS[0]}"
           set -e
           if (( status != 0 )); then
