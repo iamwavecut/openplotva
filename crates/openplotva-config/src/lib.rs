@@ -2206,16 +2206,22 @@ impl AppConfig {
                     // temperature alone encourages. Temperature stays low on purpose so
                     // tool-calling remains reliable; DRY carries the anti-repetition load and
                     // the backend's default DRY sequence breakers spare structural tokens.
-                    aifarm_frequency_penalty: clamp_penalty(parse_f64(
-                        "DIALOG_AIFARM_FREQUENCY_PENALTY",
-                        raw.dialog_aifarm_frequency_penalty,
+                    aifarm_frequency_penalty: clamp_penalty(
+                        parse_f64(
+                            "DIALOG_AIFARM_FREQUENCY_PENALTY",
+                            raw.dialog_aifarm_frequency_penalty,
+                            0.3,
+                        )?,
                         0.3,
-                    )?),
-                    aifarm_presence_penalty: clamp_penalty(parse_f64(
-                        "DIALOG_AIFARM_PRESENCE_PENALTY",
-                        raw.dialog_aifarm_presence_penalty,
+                    ),
+                    aifarm_presence_penalty: clamp_penalty(
+                        parse_f64(
+                            "DIALOG_AIFARM_PRESENCE_PENALTY",
+                            raw.dialog_aifarm_presence_penalty,
+                            0.2,
+                        )?,
                         0.2,
-                    )?),
+                    ),
                     aifarm_dry_multiplier: parse_f64(
                         "DIALOG_AIFARM_DRY_MULTIPLIER",
                         raw.dialog_aifarm_dry_multiplier,
@@ -2603,16 +2609,22 @@ impl AppConfig {
                     raw.memory_aifarm_temperature,
                     0.2,
                 )?,
-                aifarm_frequency_penalty: clamp_penalty(parse_f64(
-                    "MEMORY_AIFARM_FREQUENCY_PENALTY",
-                    raw.memory_aifarm_frequency_penalty,
+                aifarm_frequency_penalty: clamp_penalty(
+                    parse_f64(
+                        "MEMORY_AIFARM_FREQUENCY_PENALTY",
+                        raw.memory_aifarm_frequency_penalty,
+                        0.3,
+                    )?,
                     0.3,
-                )?),
-                aifarm_presence_penalty: clamp_penalty(parse_f64(
-                    "MEMORY_AIFARM_PRESENCE_PENALTY",
-                    raw.memory_aifarm_presence_penalty,
+                ),
+                aifarm_presence_penalty: clamp_penalty(
+                    parse_f64(
+                        "MEMORY_AIFARM_PRESENCE_PENALTY",
+                        raw.memory_aifarm_presence_penalty,
+                        0.3,
+                    )?,
                     0.3,
-                )?),
+                ),
                 aifarm_enable_thinking: parse_bool(
                     "MEMORY_AIFARM_ENABLE_THINKING",
                     raw.memory_aifarm_enable_thinking,
@@ -3118,12 +3130,12 @@ fn parse_f64(name: &'static str, value: Option<String>, default: f64) -> Result<
 
 // vLLM's OpenAI-compatible layer rejects repetition penalties outside
 // [-2.0, 2.0] with a 400, so clamp operator overrides; a non-finite value
-// falls back to the neutral default rather than breaking every request.
-fn clamp_penalty(value: f64) -> f64 {
+// falls back to the call site's own default rather than breaking every request.
+fn clamp_penalty(value: f64, fallback: f64) -> f64 {
     if value.is_finite() {
         value.clamp(-2.0, 2.0)
     } else {
-        0.3
+        fallback
     }
 }
 
@@ -4288,14 +4300,16 @@ mod tests {
 
     #[test]
     fn clamp_penalty_enforces_openai_range() {
-        assert_eq!(super::clamp_penalty(0.3), 0.3);
-        assert_eq!(super::clamp_penalty(2.0), 2.0);
-        assert_eq!(super::clamp_penalty(-2.0), -2.0);
-        assert_eq!(super::clamp_penalty(5.0), 2.0);
-        assert_eq!(super::clamp_penalty(-9.0), -2.0);
-        assert_eq!(super::clamp_penalty(f64::NAN), 0.3);
-        assert_eq!(super::clamp_penalty(f64::INFINITY), 0.3);
-        assert_eq!(super::clamp_penalty(f64::NEG_INFINITY), 0.3);
+        assert_eq!(super::clamp_penalty(0.3, 0.3), 0.3);
+        assert_eq!(super::clamp_penalty(2.0, 0.3), 2.0);
+        assert_eq!(super::clamp_penalty(-2.0, 0.3), -2.0);
+        assert_eq!(super::clamp_penalty(5.0, 0.3), 2.0);
+        assert_eq!(super::clamp_penalty(-9.0, 0.3), -2.0);
+        // Non-finite degrades to the call site's own default, not a hardcoded one.
+        assert_eq!(super::clamp_penalty(f64::NAN, 0.3), 0.3);
+        assert_eq!(super::clamp_penalty(f64::NAN, 0.2), 0.2);
+        assert_eq!(super::clamp_penalty(f64::INFINITY, 0.2), 0.2);
+        assert_eq!(super::clamp_penalty(f64::NEG_INFINITY, 0.3), 0.3);
     }
 
     #[test]

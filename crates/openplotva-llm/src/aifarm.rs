@@ -1527,8 +1527,8 @@ impl AifarmMemoryExtractorConfig {
         // Apply the anti-repetition default, then clamp to the [-2.0, 2.0] range
         // the OpenAI-compatible backend enforces so an out-of-range or non-finite
         // operator override cannot 400 every extraction request.
-        self.frequency_penalty = Some(clamp_penalty(self.frequency_penalty.unwrap_or(0.3)));
-        self.presence_penalty = Some(clamp_penalty(self.presence_penalty.unwrap_or(0.3)));
+        self.frequency_penalty = Some(clamp_penalty(self.frequency_penalty.unwrap_or(0.3), 0.3));
+        self.presence_penalty = Some(clamp_penalty(self.presence_penalty.unwrap_or(0.3), 0.3));
         if self.client.default_model.trim().is_empty() {
             self.client.default_model = self.model.clone();
         }
@@ -4526,11 +4526,11 @@ fn default_string(value: &str, fallback: &str) -> String {
     }
 }
 
-fn clamp_penalty(value: f64) -> f64 {
+fn clamp_penalty(value: f64, fallback: f64) -> f64 {
     if value.is_finite() {
         value.clamp(-2.0, 2.0)
     } else {
-        0.3
+        fallback
     }
 }
 
