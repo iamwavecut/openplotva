@@ -5131,6 +5131,9 @@ impl PostgresMemoryStore {
             }
             let text = cluster.merged_fact_text.trim();
             if !text.is_empty() {
+                // SQL_UPDATE_MEMORY_CARD_TEXT sets `embedding = COALESCE($4::vector,
+                // embedding)`, so a None here (embed unavailable) preserves the survivor's
+                // prior vector rather than nulling it — never a wipe, at worst briefly stale.
                 sqlx::query(SQL_UPDATE_MEMORY_CARD_TEXT)
                     .bind(cluster.survivor_id)
                     .bind(text)
