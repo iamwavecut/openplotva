@@ -2563,6 +2563,8 @@ pub struct MemorySubjectMergeConfig {
     pub max_group_cards: usize,
     /// Confidence lost by a demoted (weak-but-kept) card.
     pub demote_confidence_delta: f64,
+    /// Embedding dimension for regenerating a rewritten survivor's vector.
+    pub embedding_dimension: i32,
 }
 
 impl Default for MemorySubjectMergeConfig {
@@ -2574,6 +2576,7 @@ impl Default for MemorySubjectMergeConfig {
             group_batch: MEMORY_SUBJECT_MERGE_GROUP_BATCH,
             max_group_cards: MEMORY_SUBJECT_MERGE_MAX_GROUP_CARDS,
             demote_confidence_delta: MEMORY_SUBJECT_MERGE_DEMOTE_DELTA,
+            embedding_dimension: 512,
         }
     }
 }
@@ -2621,6 +2624,9 @@ fn plan_to_subject_merge_apply(
                 absorbed_ids: cluster.absorbed_ids,
                 merged_fact_text: cluster.merged_fact_text,
                 observation_count: summed,
+                // Filled by embed_merge_survivors in the tick (async); None here
+                // keeps the pure mapping synchronous and testable.
+                embedding: None,
             }
         })
         .collect();
@@ -2640,14 +2646,52 @@ struct SubjectMergeTick {
     cards_demoted: u64,
 }
 
-async fn run_memory_subject_merge_tick<Merger>(
+/// Regenerate each survivor's embedding from its merged text so vector retrieval
+/// matches the rewritten card. Best-effort: on embedder failure the cluster keeps
+/// `None`, which leaves the prior embedding in place rather than blocking the merge.
+async fn embed_merge_survivors<Embedder>(
+    apply: &mut openplotva_storage::SubjectMergeApply,
+    embedder: Option<&Embedder>,
+    dimension: i32,
+) where
+    Embedder: EmbeddingProvider,
+{
+    let Some(provider) = embedder else {
+        return;
+    };
+    let texts: Vec<String> = apply
+        .clusters
+        .iter()
+        .map(|cluster| cluster.merged_fact_text.clone())
+        .collect();
+    if texts.is_empty() {
+        return;
+    }
+    match provider
+        .embed_batch(&texts, dimension, MEMORY_CARD_EMBEDDING_TASK)
+        .await
+    {
+        Ok(embeddings) => {
+            for (cluster, embedding) in apply.clusters.iter_mut().zip(embeddings) {
+                cluster.embedding = embedding;
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, "subject merge-pass failed to embed survivors; keeping prior embeddings");
+        }
+    }
+}
+
+async fn run_memory_subject_merge_tick<Merger, Embedder>(
     merger: &Merger,
     store: &PostgresMemoryStore,
+    embedder: Option<&Embedder>,
     cfg: &MemorySubjectMergeConfig,
     now: OffsetDateTime,
 ) -> Result<SubjectMergeTick, Box<dyn StdError + Send + Sync>>
 where
     Merger: openplotva_memory::SubjectMerger + Send + Sync,
+    Embedder: EmbeddingProvider,
 {
     let mut tick = SubjectMergeTick::default();
     let groups = store
@@ -2670,8 +2714,9 @@ where
             .merge_subject(&input)
             .await
             .map_err(|source| Box::new(source) as Box<dyn StdError + Send + Sync>)?;
-        let apply =
+        let mut apply =
             plan_to_subject_merge_apply(&plan, &cards, &group_ids, cfg.demote_confidence_delta);
+        embed_merge_survivors(&mut apply, embedder, cfg.embedding_dimension).await;
         let counts = store.apply_subject_merge(&apply).await?;
         tick.cards_superseded += counts.superseded;
         tick.cards_demoted += counts.demoted;
@@ -2704,8 +2749,14 @@ where
         if embedder.is_some_and(|provider| !provider.is_available()) {
             report.skipped_unavailable += 1;
         } else {
-            match run_memory_subject_merge_tick(merger, &store, &cfg, OffsetDateTime::now_utc())
-                .await
+            match run_memory_subject_merge_tick(
+                merger,
+                &store,
+                embedder,
+                &cfg,
+                OffsetDateTime::now_utc(),
+            )
+            .await
             {
                 Ok(tick) => {
                     report.groups_considered += tick.groups_considered;

@@ -201,6 +201,9 @@ pub struct SubjectMergeApplyCluster {
     pub absorbed_ids: Vec<i64>,
     pub merged_fact_text: String,
     pub observation_count: i64,
+    /// Fresh embedding of the merged text; `None` keeps the survivor's prior
+    /// embedding (the merge changed the text, so the caller should supply one).
+    pub embedding: Option<PgEmbeddingVector>,
 }
 
 /// A validated, ready-to-apply plan for one subject group. Applied atomically so
@@ -5132,7 +5135,7 @@ impl PostgresMemoryStore {
                     .bind(cluster.survivor_id)
                     .bind(text)
                     .bind("")
-                    .bind(pgvector_literal(None))
+                    .bind(pgvector_literal(cluster.embedding.as_ref()))
                     .execute(&mut *tx)
                     .await?;
                 counts.survivors_rewritten += 1;

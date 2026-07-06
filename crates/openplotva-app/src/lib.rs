@@ -10889,6 +10889,7 @@ async fn start_runtime_workers(
                 ),
                 cooldown_hours: config.memory.subject_merge_cooldown_hours,
                 min_cards: i64::from(config.memory.subject_merge_min_cards),
+                embedding_dimension: config.memory.embedding_dim,
                 ..memory_runtime::MemorySubjectMergeConfig::default()
             };
             let merge_stop = stop.subscribe();

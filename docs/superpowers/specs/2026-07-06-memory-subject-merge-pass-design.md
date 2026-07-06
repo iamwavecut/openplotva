@@ -75,8 +75,10 @@ prose (same anti-runaway discipline as extraction.prompt); low max_tokens.
 ## Apply (reuse existing primitives)
 
 Per cluster: for each `absorbed_id` → `supersede_card(absorbed_id, survivor_id)`; then
-`update_card_text(survivor_id, merged_fact_text, "", None)`; then set survivor
-`observation_count = sum(obs of survivor + absorbed)` via the existing
+`update_card_text(survivor_id, merged_fact_text, "", <fresh embedding>)` — the merge
+rewrites the text, so the worker re-embeds `merged_fact_text` (best-effort via the same
+embedder; on failure the prior embedding stays) so vector retrieval matches the new card;
+then set survivor `observation_count = sum(obs of survivor + absorbed)` via the existing
 `SQL_SET_MEMORY_CARD_OBSERVATION_COUNT` (the dup-collapse summation pattern). `demote_ids`
 → `demote_card(id, delta)`. `keep_ids` → no-op. Finally
 `mark_cards_merge_passed(all_group_ids, now)`. Validate LLM output against the group's real
@@ -86,9 +88,10 @@ applying — never trust ids the model invents.
 ## Touchpoints
 
 - **Migration 153** `153_memory_cards_merge_pass`: `ALTER TABLE memory_cards ADD COLUMN
-  last_merge_pass_at TIMESTAMPTZ;` + partial index
-  `(visibility,user_id,chat_id,thread_id,subject) WHERE status='active'` to back the
-  grouped selection; down drops both. One-way note: the column is additive/nullable.
+  last_merge_pass_at TIMESTAMPTZ;` (additive/nullable, metadata-only).
+- **Migration 154** `154_create_idx_memory_cards_subject_merge`: partial index
+  `(visibility,user_id,chat_id,thread_id,subject) WHERE status='active'` built
+  `CONCURRENTLY` (no-transaction) to back the grouped candidate scan on the hot table.
 - **openplotva-storage**: `select_subject_merge_candidates`, `load_active_cards_by_ids`,
   `mark_cards_merge_passed`, expose `set_card_observation_count` (reuse
   supersede/update/demote already public).
