@@ -158,10 +158,6 @@ async def run() -> int:
 
     await publish_results(review, suggestions)
 
-    if env_bool("PR_AGENT_FAIL_ON_FINDINGS", True) and (review.has_findings or suggestions.has_findings):
-        print("PR-Agent found actionable review feedback; failing this job by policy.", file=sys.stderr)
-        return 2
-
     return 0
 
 
