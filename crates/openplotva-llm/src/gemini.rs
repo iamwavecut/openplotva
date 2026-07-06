@@ -16,7 +16,7 @@ use url::Url;
 use openplotva_dialog::{
     DialogInput, DialogTraceArtifacts, DialogTraceError, DialogTraceUsage, NativeToolCall,
     NativeToolFunction, PROVIDER_GENKIT, decode_plotva_final_response_with_salvage,
-    has_leading_context_message, sanitize_final_text,
+    has_leading_context_message,
 };
 use openplotva_history::{
     HISTORY_SUMMARY_GENERATE_MAX_ATTEMPTS, HISTORY_SUMMARY_GENERATE_RETRY_DELAY_SECONDS,
@@ -2638,10 +2638,13 @@ fn final_answer_text_with_content(raw: &str) -> FinalAnswerText {
     let content = decode_plotva_final_response_with_salvage(raw)
         .map(|decoded| decoded.answer.trim().to_owned())
         .unwrap_or_else(|_| raw.trim().to_owned());
-    FinalAnswerText {
-        answer: sanitize_genkit_final_answer(&sanitize_final_text(&content)),
-        content,
-    }
+    let answer = match openplotva_dialog::finalize_dialog_reply(&content) {
+        openplotva_dialog::DialogReplyOutcome::Reply(answer) => {
+            sanitize_genkit_final_answer(&answer)
+        }
+        openplotva_dialog::DialogReplyOutcome::Suppressed(_) => String::new(),
+    };
+    FinalAnswerText { answer, content }
 }
 
 fn sanitize_genkit_final_answer(raw: &str) -> String {
