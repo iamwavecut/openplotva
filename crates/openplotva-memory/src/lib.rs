@@ -17,7 +17,7 @@ use url::Url;
 /// Human-readable crate purpose used by scaffold tests and docs.
 pub const PURPOSE: &str = "memory";
 
-pub const DEFAULT_MEMORY_MAX_OUTPUT_TOKENS: i32 = 4096;
+pub const DEFAULT_MEMORY_MAX_OUTPUT_TOKENS: i32 = 4000;
 pub const DEFAULT_MEMORY_MIN_MESSAGES_PER_RUN: i32 = 20;
 pub const DEFAULT_MEMORY_MAX_QUEUED_RUNS: i32 = 5_000;
 pub const DEFAULT_MEMORY_MAX_DAILY_ENQUEUED_RUNS: i32 = 2_000;

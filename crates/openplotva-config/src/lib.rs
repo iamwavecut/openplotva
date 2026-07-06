@@ -2565,7 +2565,7 @@ impl AppConfig {
                 aifarm_max_output_tokens: parse_i32(
                     "MEMORY_AIFARM_MAX_OUTPUT_TOKENS",
                     raw.memory_aifarm_max_output_tokens,
-                    4096,
+                    4000,
                 )?,
                 aifarm_request_timeout_seconds: parse_i32(
                     "MEMORY_AIFARM_REQUEST_TIMEOUT_SECONDS",
@@ -3666,7 +3666,7 @@ mod tests {
         assert_eq!(config.memory.embedding_dim, 512);
         assert_eq!(config.memory.aifarm_service_name, "llm-openai");
         assert_eq!(config.memory.aifarm_endpoint_name, "chat_completions");
-        assert_eq!(config.memory.aifarm_max_output_tokens, 4096);
+        assert_eq!(config.memory.aifarm_max_output_tokens, 4000);
         assert_eq!(config.memory.aifarm_request_timeout_seconds, 660);
         assert_eq!(config.memory.aifarm_poll_interval_seconds, 1);
         assert_eq!(config.memory.aifarm_task_timeout_seconds, 720);

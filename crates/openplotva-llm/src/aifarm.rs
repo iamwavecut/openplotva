@@ -2074,6 +2074,10 @@ where
             response_format: Some(memory_extraction_response_format()),
             max_tokens: self.cfg.max_output_tokens,
             temperature: self.cfg.temperature,
+            // Break the self-questioning loops the extractor otherwise falls into
+            // inside the JSON (repeating "but wait…" until it hits the output cap).
+            frequency_penalty: Some(0.6),
+            presence_penalty: Some(0.3),
             include_reasoning: self.cfg.include_reasoning,
             ..ChatCompletionRequest::default()
         };
@@ -5876,6 +5880,8 @@ mod tests {
         assert_eq!(body["model"], "default");
         assert_eq!(body["max_tokens"], DEFAULT_MEMORY_MAX_OUTPUT_TOKENS);
         assert_eq!(body["temperature"], 0.2);
+        assert_eq!(body["frequency_penalty"], 0.6);
+        assert_eq!(body["presence_penalty"], 0.3);
         assert_eq!(body["include_reasoning"], false);
         assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
         assert_eq!(
