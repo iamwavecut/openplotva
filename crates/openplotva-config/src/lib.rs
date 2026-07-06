@@ -889,6 +889,8 @@ pub struct MemoryConfig {
     pub aifarm_capacity_wait_seconds: i32,
     pub aifarm_capacity_poll_seconds: i32,
     pub aifarm_temperature: f64,
+    pub aifarm_frequency_penalty: f64,
+    pub aifarm_presence_penalty: f64,
     pub aifarm_enable_thinking: bool,
     pub redaction_enabled: bool,
     pub redaction_service_name: String,
@@ -1382,6 +1384,10 @@ pub struct RawConfig {
     pub memory_aifarm_capacity_poll_seconds: Option<String>,
     /// `MEMORY_AIFARM_TEMPERATURE`.
     pub memory_aifarm_temperature: Option<String>,
+    /// `MEMORY_AIFARM_FREQUENCY_PENALTY`.
+    pub memory_aifarm_frequency_penalty: Option<String>,
+    /// `MEMORY_AIFARM_PRESENCE_PENALTY`.
+    pub memory_aifarm_presence_penalty: Option<String>,
     /// `MEMORY_AIFARM_ENABLE_THINKING`.
     pub memory_aifarm_enable_thinking: Option<String>,
     /// `MEMORY_REDACTION_ENABLED`.
@@ -2597,6 +2603,16 @@ impl AppConfig {
                     raw.memory_aifarm_temperature,
                     0.2,
                 )?,
+                aifarm_frequency_penalty: parse_f64(
+                    "MEMORY_AIFARM_FREQUENCY_PENALTY",
+                    raw.memory_aifarm_frequency_penalty,
+                    0.3,
+                )?,
+                aifarm_presence_penalty: parse_f64(
+                    "MEMORY_AIFARM_PRESENCE_PENALTY",
+                    raw.memory_aifarm_presence_penalty,
+                    0.3,
+                )?,
                 aifarm_enable_thinking: parse_bool(
                     "MEMORY_AIFARM_ENABLE_THINKING",
                     raw.memory_aifarm_enable_thinking,
@@ -2974,6 +2990,8 @@ impl RawConfig {
             memory_aifarm_capacity_wait_seconds: env("MEMORY_AIFARM_CAPACITY_WAIT_SECONDS"),
             memory_aifarm_capacity_poll_seconds: env("MEMORY_AIFARM_CAPACITY_POLL_SECONDS"),
             memory_aifarm_temperature: env("MEMORY_AIFARM_TEMPERATURE"),
+            memory_aifarm_frequency_penalty: env("MEMORY_AIFARM_FREQUENCY_PENALTY"),
+            memory_aifarm_presence_penalty: env("MEMORY_AIFARM_PRESENCE_PENALTY"),
             memory_aifarm_enable_thinking: env("MEMORY_AIFARM_ENABLE_THINKING"),
             memory_redaction_enabled: env("MEMORY_REDACTION_ENABLED"),
             memory_redaction_service_name: env("MEMORY_REDACTION_SERVICE_NAME"),

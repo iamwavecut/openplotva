@@ -1525,7 +1525,7 @@ impl AifarmMemoryExtractorConfig {
             self.max_output_tokens
         };
         if self.frequency_penalty.is_none() {
-            self.frequency_penalty = Some(0.6);
+            self.frequency_penalty = Some(0.3);
         }
         if self.presence_penalty.is_none() {
             self.presence_penalty = Some(0.3);
@@ -5890,7 +5890,7 @@ mod tests {
         assert_eq!(body["model"], "default");
         assert_eq!(body["max_tokens"], DEFAULT_MEMORY_MAX_OUTPUT_TOKENS);
         assert_eq!(body["temperature"], 0.2);
-        assert_eq!(body["frequency_penalty"], 0.6);
+        assert_eq!(body["frequency_penalty"], 0.3);
         assert_eq!(body["presence_penalty"], 0.3);
         assert_eq!(body["include_reasoning"], false);
         assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
