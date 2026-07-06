@@ -1568,7 +1568,51 @@ pub fn decode_extraction_json(raw: &str) -> Result<ExtractOutput, DecodeExtracti
     if end <= start {
         return Err(DecodeExtractionError::Decode);
     }
-    serde_json::from_str(&trimmed[start..=end]).map_err(|_| DecodeExtractionError::Decode)
+    if let Ok(parsed) = serde_json::from_str(&trimmed[start..=end]) {
+        return Ok(parsed);
+    }
+    // A response truncated at the model's output cap ends mid-structure. Keep the
+    // longest prefix that closes cleanly (dropping the incomplete trailing element)
+    // rather than losing the whole batch; fall back to Decode if nothing parses.
+    salvage_truncated_json(&trimmed[start..]).ok_or(DecodeExtractionError::Decode)
+}
+
+fn salvage_truncated_json(fragment: &str) -> Option<ExtractOutput> {
+    let mut closers: Vec<u8> = Vec::new();
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut best: Option<(usize, Vec<u8>)> = None;
+    for (index, byte) in fragment.bytes().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'{' => closers.push(b'}'),
+            b'[' => closers.push(b']'),
+            b'}' | b']' => {
+                closers.pop();
+                best = Some((index + 1, closers.clone()));
+            }
+            _ => {}
+        }
+    }
+    let (cut, open) = best?;
+    if open.is_empty() {
+        return None;
+    }
+    let mut repaired = fragment[..cut].to_owned();
+    for closer in open.iter().rev() {
+        repaired.push(char::from(*closer));
+    }
+    serde_json::from_str(&repaired).ok()
 }
 
 #[must_use]
@@ -3150,6 +3194,26 @@ mod tests {
         );
         assert_eq!(
             decode_extraction_json("this is not json").err(),
+            Some(DecodeExtractionError::Decode)
+        );
+    }
+
+    #[test]
+    fn decode_extraction_json_salvages_truncated_response() {
+        // Cut mid-way through the second card (output cap): keep the complete prefix
+        // (summary + first card), drop the incomplete trailing element.
+        let truncated = r#"{"episode_summary":"частичный","candidate_cards":[{"subject":"Алиса","fact_text":"любит Python"},{"subject":"Боб","fact_text":"лю"#;
+        let salvaged = decode_extraction_json(truncated).expect("salvaged");
+        assert_eq!(salvaged.episode_summary, "частичный");
+        assert_eq!(salvaged.candidate_cards.len(), 1);
+        assert_eq!(salvaged.candidate_cards[0].subject, "Алиса");
+
+        // Truncated before any element completes → nothing to salvage → Decode.
+        assert_eq!(
+            decode_extraction_json(
+                r#"{"episode_summary":"нет","candidate_cards":[{"subject":"обр"#
+            )
+            .err(),
             Some(DecodeExtractionError::Decode)
         );
     }

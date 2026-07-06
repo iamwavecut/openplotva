@@ -52,6 +52,8 @@ const MEMORY_MAX_EXTRACTION_BATCH_INPUT_TOKENS: i32 = 10_000;
 const EXISTING_CARDS_LIMIT: i32 = 80;
 const EXISTING_USER_CARDS_LIMIT: i32 = 20;
 const EXISTING_PARTICIPANT_CARDS_MAX_USER: usize = 20;
+const RELATED_CARDS_LIMIT: i32 = 24;
+const RELATED_QUERY_MAX_CHARS: usize = 320;
 const OPENROUTER_MODEL_PREFIX: &str = "openrouter/";
 const OPENROUTER_CHAT_COMPLETIONS_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 
@@ -223,6 +225,18 @@ pub trait MemoryRunStore: MemoryWriteStore {
         scope: &'a openplotva_memory::RetrievalScope,
         limit: i32,
     ) -> MemoryWriteStoreFuture<'a, Vec<Card>, Self::Error>;
+
+    /// Hybrid (lexical + optional vector) retrieval of cards related to what the
+    /// run's window is about, so consolidation can merge into existing facts
+    /// instead of only seeing the most recent cards. Defaults to none.
+    fn retrieve_related_cards<'a>(
+        &'a self,
+        req: &'a openplotva_memory::RetrievalRequest,
+        query_embedding: Option<&'a PgEmbeddingVector>,
+    ) -> MemoryWriteStoreFuture<'a, Vec<Card>, Self::Error> {
+        let _ = (req, query_embedding);
+        Box::pin(async { Ok(Vec::new()) })
+    }
 
     /// Queue the next continuation cursor.
     fn enqueue_run_continuation<'a>(
@@ -397,6 +411,18 @@ impl MemoryRunStore for PostgresMemoryStore {
         limit: i32,
     ) -> MemoryWriteStoreFuture<'a, Vec<Card>, Self::Error> {
         Box::pin(async move { PostgresMemoryStore::list_visible_cards(self, scope, limit).await })
+    }
+
+    fn retrieve_related_cards<'a>(
+        &'a self,
+        req: &'a openplotva_memory::RetrievalRequest,
+        query_embedding: Option<&'a PgEmbeddingVector>,
+    ) -> MemoryWriteStoreFuture<'a, Vec<Card>, Self::Error> {
+        Box::pin(async move {
+            PostgresMemoryStore::retrieve_with_vector(self, req, query_embedding)
+                .await
+                .map(|retrieved| retrieved.cards)
+        })
     }
 
     fn enqueue_run_continuation<'a>(
@@ -1527,7 +1553,16 @@ where
         .await
         .unwrap_or_default()
         .unwrap_or_default();
-    let selection = select_run_input(store, run, &chat, &loaded, cfg).await;
+    let related = related_cards_for_window(
+        store,
+        run,
+        &chat,
+        &loaded,
+        embedder.map(|value| value as &dyn EmbeddingProvider),
+        cfg.embedding_dimension,
+    )
+    .await;
+    let selection = select_run_input(store, run, &chat, &loaded, cfg, &related).await;
     report.selected_messages = selection.messages.len();
     if let Some(after) = selection.continuation.as_ref() {
         store
@@ -1552,7 +1587,7 @@ where
         return Ok(report);
     }
 
-    let batches = split_extraction_batches(store, run, &chat, &filtered, cfg).await;
+    let batches = split_extraction_batches(store, run, &chat, &filtered, cfg, &related).await;
     let mut state = RunExtractionState::with_batch_count(batches.len());
     let fallback_observed_at = OffsetDateTime::now_utc();
     for batch in &batches {
@@ -1684,6 +1719,7 @@ async fn select_run_input<Store>(
     chat: &DialogMemoryChatMeta,
     loaded: &[openplotva_memory::Message],
     cfg: &MemoryRunProcessConfig,
+    related: &[Card],
 ) -> RunInputSelection
 where
     Store: MemoryRunStore,
@@ -1699,7 +1735,7 @@ where
         return RunInputSelection::default();
     }
 
-    let existing = existing_cards_for_run(store, run, chat, candidates).await;
+    let existing = existing_cards_for_run(store, run, chat, candidates, related).await;
     let best_count = best_run_input_count(run, chat, candidates, &existing, cfg.max_input_tokens);
     let selected = candidates[..best_count].to_vec();
     let continuation = (best_count < loaded.len())
@@ -1718,6 +1754,7 @@ async fn split_extraction_batches<Store>(
     chat: &DialogMemoryChatMeta,
     messages: &[openplotva_memory::Message],
     cfg: &MemoryRunProcessConfig,
+    related: &[Card],
 ) -> Vec<ExtractionBatch>
 where
     Store: MemoryRunStore,
@@ -1735,7 +1772,7 @@ where
             let mut candidate = current.clone();
             candidate.push(message.clone());
             let candidate_batch =
-                build_extraction_batch(store, run, chat, &candidate, None, limit).await;
+                build_extraction_batch(store, run, chat, &candidate, None, limit, related).await;
             if candidate_batch.input_tokens <= limit {
                 current.push(message.clone());
                 current_batch = Some(candidate_batch);
@@ -1749,16 +1786,27 @@ where
                 &mut current,
                 &mut current_batch,
                 limit,
+                related,
             )
             .await;
         }
 
         let single = vec![message.clone()];
-        let existing = existing_cards_for_run(store, run, chat, &single).await;
-        let single_batch =
-            build_extraction_batch(store, run, chat, &single, Some(existing.clone()), limit).await;
+        let existing = existing_cards_for_run(store, run, chat, &single, related).await;
+        let single_batch = build_extraction_batch(
+            store,
+            run,
+            chat,
+            &single,
+            Some(existing.clone()),
+            limit,
+            related,
+        )
+        .await;
         if single_batch.input_tokens > limit {
-            out.extend(split_oversized_message(store, run, chat, message, &existing, limit).await);
+            out.extend(
+                split_oversized_message(store, run, chat, message, &existing, limit, related).await,
+            );
             continue;
         }
         current.push(message.clone());
@@ -1773,11 +1821,13 @@ where
         &mut current,
         &mut current_batch,
         limit,
+        related,
     )
     .await;
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn flush_extraction_batch<Store>(
     store: &Store,
     run: &openplotva_memory::Run,
@@ -1786,6 +1836,7 @@ async fn flush_extraction_batch<Store>(
     current: &mut Vec<openplotva_memory::Message>,
     current_batch: &mut Option<ExtractionBatch>,
     limit: i32,
+    related: &[Card],
 ) where
     Store: MemoryRunStore,
 {
@@ -1795,12 +1846,13 @@ async fn flush_extraction_batch<Store>(
     let batch = if let Some(batch) = current_batch.take() {
         batch
     } else {
-        build_extraction_batch(store, run, chat, current, None, limit).await
+        build_extraction_batch(store, run, chat, current, None, limit, related).await
     };
     out.push(batch);
     current.clear();
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn build_extraction_batch<Store>(
     store: &Store,
     run: &openplotva_memory::Run,
@@ -1808,6 +1860,7 @@ async fn build_extraction_batch<Store>(
     messages: &[openplotva_memory::Message],
     existing: Option<Vec<Card>>,
     limit: i32,
+    related: &[Card],
 ) -> ExtractionBatch
 where
     Store: MemoryRunStore,
@@ -1815,7 +1868,7 @@ where
     let batch_messages = messages.to_vec();
     let mut existing_cards = match existing {
         Some(cards) => cards,
-        None => existing_cards_for_run(store, run, chat, &batch_messages).await,
+        None => existing_cards_for_run(store, run, chat, &batch_messages, related).await,
     };
     let mut input_tokens = estimate_extraction_tokens(run, chat, &batch_messages, &existing_cards);
     if limit > 0 && input_tokens > limit && !existing_cards.is_empty() {
@@ -1845,6 +1898,7 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn split_oversized_message<Store>(
     store: &Store,
     run: &openplotva_memory::Run,
@@ -1852,6 +1906,7 @@ async fn split_oversized_message<Store>(
     message: &openplotva_memory::Message,
     existing: &[Card],
     limit: i32,
+    related: &[Card],
 ) -> Vec<ExtractionBatch>
 where
     Store: MemoryRunStore,
@@ -1866,6 +1921,7 @@ where
                 std::slice::from_ref(message),
                 Some(existing.to_vec()),
                 limit,
+                related,
             )
             .await,
         ];
@@ -1906,6 +1962,7 @@ where
                     std::slice::from_ref(&chunk),
                     Some(existing.to_vec()),
                     limit,
+                    related,
                 )
                 .await,
             );
@@ -1986,12 +2043,23 @@ async fn existing_cards_for_run<Store>(
     run: &openplotva_memory::Run,
     chat: &DialogMemoryChatMeta,
     messages: &[openplotva_memory::Message],
+    related: &[Card],
 ) -> Vec<Card>
 where
     Store: MemoryRunStore,
 {
     let mut out = Vec::new();
     let mut seen = Vec::new();
+    // Cards related to what this window is about come first, so the model merges
+    // into existing facts instead of inserting duplicates the recency window
+    // would hide (finding A). Retrieved once per run in `related_cards_for_window`
+    // and passed in, because this runs many times per run during batch sizing.
+    add_existing_cards(
+        &mut out,
+        &mut seen,
+        related.to_vec(),
+        EXISTING_CARDS_LIMIT as usize,
+    );
     let scope = retrieval_scope_for_run(run, chat, 0);
     if let Ok(cards) = store.list_visible_cards(&scope, EXISTING_CARDS_LIMIT).await {
         add_existing_cards(&mut out, &mut seen, cards, EXISTING_CARDS_LIMIT as usize);
@@ -2009,6 +2077,72 @@ where
         }
     }
     out
+}
+
+async fn related_cards_for_window<Store>(
+    store: &Store,
+    run: &openplotva_memory::Run,
+    chat: &DialogMemoryChatMeta,
+    messages: &[openplotva_memory::Message],
+    embedder: Option<&dyn EmbeddingProvider>,
+    embedding_dimension: i32,
+) -> Vec<Card>
+where
+    Store: MemoryRunStore,
+{
+    let Some(query) = consolidation_retrieval_query(messages) else {
+        return Vec::new();
+    };
+    // Best-effort: an embedder-down query degrades to lexical-only, and a
+    // retrieval failure degrades to the recency baseline in existing_cards_for_run.
+    let query_embedding = match embedder {
+        Some(provider) => provider
+            .embed_one(&query, embedding_dimension, MEMORY_CARD_EMBEDDING_TASK)
+            .await
+            .ok()
+            .flatten(),
+        None => None,
+    };
+    let request = openplotva_memory::RetrievalRequest {
+        scope: retrieval_scope_for_run(run, chat, 0),
+        query,
+        card_limit: RELATED_CARDS_LIMIT,
+        episode_limit: 0,
+    };
+    store
+        .retrieve_related_cards(&request, query_embedding.as_ref())
+        .await
+        .unwrap_or_default()
+}
+
+fn consolidation_retrieval_query(messages: &[openplotva_memory::Message]) -> Option<String> {
+    let mut names: Vec<&str> = Vec::new();
+    let mut body = String::new();
+    for message in messages {
+        if message.sender_is_bot {
+            continue;
+        }
+        let name = message.sender_name.trim();
+        if !name.is_empty() && !names.contains(&name) {
+            names.push(name);
+        }
+        let text = message.text.trim();
+        if !text.is_empty() && body.len() < RELATED_QUERY_MAX_CHARS * 4 {
+            if !body.is_empty() {
+                body.push(' ');
+            }
+            body.push_str(text);
+        }
+    }
+    let mut query = names.join(" ");
+    if !body.is_empty() {
+        if !query.is_empty() {
+            query.push(' ');
+        }
+        query.push_str(&body);
+    }
+    let query: String = query.trim().chars().take(RELATED_QUERY_MAX_CHARS).collect();
+    if query.is_empty() { None } else { Some(query) }
 }
 
 fn add_existing_cards(out: &mut Vec<Card>, seen: &mut Vec<i64>, cards: Vec<Card>, limit: usize) {
@@ -2212,6 +2346,19 @@ pub const MEMORY_CARD_ARCHIVAL_INTERVAL: std::time::Duration =
 /// Batch size per archival statement.
 pub const MEMORY_CARD_ARCHIVAL_BATCH: i64 = 10_000;
 
+/// How often the cold-card decay worker gives stale never-expiring cards a TTL.
+pub const MEMORY_CARD_DECAY_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(6 * 60 * 60);
+/// Batch size per cold-card decay statement.
+pub const MEMORY_CARD_DECAY_BATCH: i64 = 10_000;
+/// Grace period a cold card gets before it forgets, so a late reinforcement can
+/// still rescue it (reinforcement clears the TTL).
+pub const MEMORY_CARD_DECAY_GRACE_DAYS: i32 = 30;
+/// Only cards below this salience are eligible for cold decay.
+pub const MEMORY_CARD_DECAY_SALIENCE_MAX: f64 = 0.35;
+/// A card must be at least this old and unused this long to count as cold.
+pub const MEMORY_CARD_DECAY_COLD_DAYS: i32 = 45;
+
 /// Outcome of the memory-card archival worker.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MemoryCardArchivalReport {
@@ -2254,6 +2401,72 @@ where
                 Err(error) => {
                     report.errors += 1;
                     tracing::warn!(%error, "failed to archive expired memory cards batch");
+                    break;
+                }
+            }
+        }
+        report.ticks += 1;
+
+        let sleep = tokio::time::sleep(interval);
+        tokio::pin!(sleep);
+        tokio::select! {
+            () = &mut stop => break,
+            () = &mut sleep => {}
+        }
+    }
+    report
+}
+
+/// Outcome of the cold-card decay worker.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MemoryCardDecayReport {
+    /// Cards given a grace TTL this run.
+    pub decayed: u64,
+    /// Sweep ticks executed.
+    pub ticks: u64,
+    /// Failed batches.
+    pub errors: u64,
+}
+
+/// Periodically give cold, never-expiring cards a grace TTL so the active set
+/// stays bounded even when extraction over-marked facts as permanent. Only
+/// low-salience, non-portable, old-and-unused cards are touched, and a
+/// reinforcement before the grace elapses clears the TTL again, so only truly
+/// stale facts forget. Runs until `stop` resolves; each tick drains in batches.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_memory_card_decay_worker_until<Stop>(
+    store: PostgresMemoryStore,
+    interval: std::time::Duration,
+    batch: i64,
+    grace_days: i32,
+    salience_max: f64,
+    cold_days: i32,
+    stop: Stop,
+) -> MemoryCardDecayReport
+where
+    Stop: std::future::Future<Output = ()>,
+{
+    let mut report = MemoryCardDecayReport::default();
+    let batch = batch.max(1);
+    tokio::pin!(stop);
+    loop {
+        loop {
+            match store
+                .expire_cold_cards(grace_days, salience_max, cold_days, batch)
+                .await
+            {
+                Ok(decayed) => {
+                    report.decayed += decayed;
+                    if decayed > 0 {
+                        tracing::debug!(decayed, "gave cold memory cards a grace TTL");
+                    }
+                    if decayed < batch as u64 {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    report.errors += 1;
+                    tracing::warn!(%error, "failed to decay cold memory cards batch");
                     break;
                 }
             }
@@ -4074,6 +4287,35 @@ mod tests {
                 Ok(self.output.clone())
             })
         }
+    }
+
+    #[test]
+    fn consolidation_retrieval_query_uses_participants_and_skips_bots() {
+        let messages = vec![
+            openplotva_memory::Message {
+                sender_name: "Alice".to_owned(),
+                text: "loves Rust".to_owned(),
+                ..openplotva_memory::Message::default()
+            },
+            openplotva_memory::Message {
+                sender_name: "Alice".to_owned(),
+                text: "and coffee".to_owned(),
+                ..openplotva_memory::Message::default()
+            },
+            openplotva_memory::Message {
+                sender_name: "spambot".to_owned(),
+                sender_is_bot: true,
+                text: "buy now".to_owned(),
+                ..openplotva_memory::Message::default()
+            },
+        ];
+        let query = consolidation_retrieval_query(&messages).expect("query");
+        assert!(query.contains("Alice"), "query: {query}");
+        assert!(query.contains("loves Rust"), "query: {query}");
+        assert!(query.contains("and coffee"), "query: {query}");
+        assert!(!query.contains("spambot"), "query: {query}");
+        assert!(!query.contains("buy now"), "query: {query}");
+        assert!(consolidation_retrieval_query(&[]).is_none());
     }
 
     #[test]

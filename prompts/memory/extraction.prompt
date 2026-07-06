@@ -18,13 +18,15 @@ Existing cards are provided compactly as {id, type, subject, fact, conf, age, di
 - decision=demote: the existing fact is losing relevance or was weakly contradicted — lower its confidence.
 Set conflict_score to how close a conflict is. Consolidate only within the same durability tier: never fold a long-lived fact (identity, preference) together with a one-off, short-lived fact.
 
-For every candidate_card set durability, the fact's expected lifespan:
-- permanent or long: stable facts that stay true for a long time (names, identity, language, long-term roles, lasting preferences, relationships, standing decisions).
-- short: facts useful for a few weeks (a current project state, a temporary plan).
-- ephemeral: one-off or today-only facts (a single event that happened, a throwaway joke). These are forgotten automatically, so keep them out of durable cards.
+For every candidate_card set durability, the fact's expected lifespan. Prefer the shortest tier that fits: durable facts earn their place by being reinforced later, and shorter tiers are forgotten automatically so memory stays lean.
+- permanent or long: only identity-grade facts that stay true for a long time (names, identity, language, long-term roles, lasting preferences, relationships, standing decisions). Reserve this tier; do not use it merely because a fact seems useful.
+- short: the default for time-bound facts — a current project state, a plan, a temporary situation, a role or opinion that may still change within weeks.
+- ephemeral: one-off or today-only facts (a single event that happened, a throwaway joke).
+When unsure between long and short, choose short.
 
 Bind shared group memory to the chat, not to one person: use scope_type=chat for events, decisions, recurring jokes/topics, and group-wide warnings. Use scope_type=user only for a single participant's preference or identity, and set user_id for those. A relationship describes a pair and is always scope_type=chat.
 For scope_type=user cards, set portable=true only for stable facts a person clearly carries across every chat (their name, language, long-term role); leave portable=false (the default) to keep a user fact inside the group where it was said.
+When two candidate_cards you create in this window are genuinely related, add a link between them by their exact fact_text — link only your own candidate_cards, never the existing cards. Relations: supports, contradicts, same_topic, supersedes, mentions_same_entity. Add a link only when the relation is clearly true; most windows need none.
 Return exactly one JSON object with:
 {
   "episode_summary": "short daily summary",
@@ -48,5 +50,5 @@ Return exactly one JSON object with:
     }
   ],
   "resolutions": [{"old_card_id": 1, "into_card_id": 0, "new_fact_text": "exact fact_text of the replacement or consolidated card", "decision": "supersede|competing|update|merge|reinforce|demote", "conflict_score": 0.0, "reason": "..."}],
-  "links": []
+  "links": [{"from_fact_text": "exact fact_text of one candidate_card", "to_fact_text": "exact fact_text of another candidate_card", "relation": "supports|contradicts|same_topic|supersedes|mentions_same_entity", "confidence": 0.0}]
 }

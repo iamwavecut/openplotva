@@ -838,6 +838,8 @@ pub const SQL_DEMOTE_MEMORY_CARD: &str = "UPDATE memory_cards SET confidence = G
 
 pub const SQL_ARCHIVE_EXPIRED_MEMORY_CARDS: &str = "UPDATE memory_cards SET status = 'expired', retracted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id IN (SELECT id FROM memory_cards WHERE status IN ('active', 'competing') AND expires_at IS NOT NULL AND expires_at <= now() ORDER BY expires_at LIMIT $1)";
 
+pub const SQL_EXPIRE_COLD_MEMORY_CARDS: &str = "UPDATE memory_cards SET expires_at = now() + ($1 * interval '1 day'), updated_at = CURRENT_TIMESTAMP WHERE id IN (SELECT id FROM memory_cards WHERE status IN ('active', 'competing') AND expires_at IS NULL AND NOT portable AND valid_until IS NULL AND salience < $2 AND created_at < now() - ($3 * interval '1 day') AND (last_used_at IS NULL OR last_used_at < now() - ($3 * interval '1 day')) ORDER BY salience ASC, created_at ASC LIMIT $4)";
+
 pub const SQL_FIND_DUPLICATE_MEMORY_CARD_GROUPS: &str = "SELECT min(id) AS keep_id, array_remove(array_agg(id ORDER BY id), min(id)) AS dup_ids, sum(observation_count)::bigint AS total_obs FROM memory_cards WHERE status = 'active' AND btrim(fact_text) <> '' GROUP BY visibility, chat_id, thread_id, user_id, lower(btrim(fact_text)) HAVING count(*) > 1 LIMIT $1";
 
 pub const SQL_SET_MEMORY_CARD_OBSERVATION_COUNT: &str = "UPDATE memory_cards SET observation_count = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND status = 'active'";
@@ -4927,6 +4929,28 @@ impl PostgresMemoryStore {
     /// status='expired', retracted_at stamped). Returns the number archived.
     pub async fn archive_expired_cards(&self, batch: i64) -> Result<u64, StorageError> {
         Ok(sqlx::query(SQL_ARCHIVE_EXPIRED_MEMORY_CARDS)
+            .bind(batch.max(1))
+            .execute(&self.pool)
+            .await?
+            .rows_affected())
+    }
+
+    /// Give cold cards a grace TTL so forgetting is bounded even when extraction
+    /// marked them permanent: low-salience, non-portable, never-expiring cards
+    /// that are old and unused get `expires_at = now + grace_days`. Reinforcing
+    /// such a card before then clears the TTL again, so only truly stale facts
+    /// forget. Returns the number of cards given a TTL this batch.
+    pub async fn expire_cold_cards(
+        &self,
+        grace_days: i32,
+        salience_max: f64,
+        cold_days: i32,
+        batch: i64,
+    ) -> Result<u64, StorageError> {
+        Ok(sqlx::query(SQL_EXPIRE_COLD_MEMORY_CARDS)
+            .bind(grace_days.max(1))
+            .bind(salience_max)
+            .bind(cold_days.max(1))
             .bind(batch.max(1))
             .execute(&self.pool)
             .await?
@@ -9449,6 +9473,15 @@ mod tests {
         assert!(super::SQL_DEMOTE_MEMORY_CARD.contains("GREATEST(0.0, confidence - $2)"));
         assert!(super::SQL_ARCHIVE_EXPIRED_MEMORY_CARDS.contains("status = 'expired'"));
         assert!(super::SQL_ARCHIVE_EXPIRED_MEMORY_CARDS.contains("expires_at <= now()"));
+        // Cold-card decay only touches never-expiring, non-portable, low-salience,
+        // old-and-unused cards, giving them a grace TTL rather than deleting.
+        assert!(super::SQL_EXPIRE_COLD_MEMORY_CARDS.contains("expires_at IS NULL"));
+        assert!(super::SQL_EXPIRE_COLD_MEMORY_CARDS.contains("NOT portable"));
+        assert!(super::SQL_EXPIRE_COLD_MEMORY_CARDS.contains("salience < $2"));
+        assert!(
+            super::SQL_EXPIRE_COLD_MEMORY_CARDS.contains("last_used_at IS NULL OR last_used_at <")
+        );
+        assert!(super::SQL_EXPIRE_COLD_MEMORY_CARDS.contains("SET expires_at = now() +"));
         // Durability promotion (ephemeral -> durable) clears the TTL on re-observation,
         // and the lexical fallback carries expires_at too (no NULL-expiry escape).
         for upsert in [
