@@ -1154,7 +1154,11 @@ pub fn strip_reasoning_channels(content: &str) -> String {
 fn strip_leading_channel_label(value: &str) -> &str {
     let value = value.trim_start();
     for label in REASONING_CHANNEL_LABELS {
-        if let Some(rest) = value.strip_prefix(label) {
+        let Some(head) = value.get(..label.len()) else {
+            continue;
+        };
+        if head.eq_ignore_ascii_case(label) {
+            let rest = &value[label.len()..];
             // Only when the label is on its own line — "thought" mid-reply stays.
             if rest.is_empty() || rest.starts_with('\n') || rest.starts_with('\r') {
                 return rest.trim_start();
@@ -2527,6 +2531,15 @@ mod tests {
         );
         assert_eq!(
             finalize_dialog_reply("thought\nМне нужно просто ответить, но я зациклился."),
+            Suppressed(ProtocolOnly)
+        );
+        // The reasoning label is matched case-insensitively.
+        assert_eq!(
+            finalize_dialog_reply("Thought\n\n"),
+            Suppressed(ProtocolOnly)
+        );
+        assert_eq!(
+            finalize_dialog_reply("ANALYSIS\nСначала подумаю."),
             Suppressed(ProtocolOnly)
         );
 
