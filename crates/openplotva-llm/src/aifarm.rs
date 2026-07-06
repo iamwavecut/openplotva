@@ -1328,6 +1328,10 @@ pub struct AifarmMemoryExtractorConfig {
     pub max_output_tokens: i32,
     /// Temperature.
     pub temperature: Option<f64>,
+    /// Frequency penalty (breaks self-questioning repetition loops); 0 disables.
+    pub frequency_penalty: Option<f64>,
+    /// Presence penalty; 0 disables.
+    pub presence_penalty: Option<f64>,
     /// Whether model thinking is enabled.
     pub enable_thinking: Option<bool>,
     /// Whether reasoning output is included.
@@ -1520,6 +1524,11 @@ impl AifarmMemoryExtractorConfig {
         } else {
             self.max_output_tokens
         };
+        // Apply the anti-repetition default, then clamp to the [-2.0, 2.0] range
+        // the OpenAI-compatible backend enforces so an out-of-range or non-finite
+        // operator override cannot 400 every extraction request.
+        self.frequency_penalty = Some(clamp_penalty(self.frequency_penalty.unwrap_or(0.3), 0.3));
+        self.presence_penalty = Some(clamp_penalty(self.presence_penalty.unwrap_or(0.3), 0.3));
         if self.client.default_model.trim().is_empty() {
             self.client.default_model = self.model.clone();
         }
@@ -2074,6 +2083,10 @@ where
             response_format: Some(memory_extraction_response_format()),
             max_tokens: self.cfg.max_output_tokens,
             temperature: self.cfg.temperature,
+            // Break the self-questioning loops the extractor otherwise falls into
+            // inside the JSON (repeating "but wait…" until it hits the output cap).
+            frequency_penalty: self.cfg.frequency_penalty,
+            presence_penalty: self.cfg.presence_penalty,
             include_reasoning: self.cfg.include_reasoning,
             ..ChatCompletionRequest::default()
         };
@@ -4513,6 +4526,14 @@ fn default_string(value: &str, fallback: &str) -> String {
     }
 }
 
+fn clamp_penalty(value: f64, fallback: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(-2.0, 2.0)
+    } else {
+        fallback
+    }
+}
+
 fn default_duration(value: StdDuration, fallback: StdDuration) -> StdDuration {
     if value.is_zero() { fallback } else { value }
 }
@@ -5784,6 +5805,27 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn with_defaults_clamps_penalties_to_openai_range() {
+        let cfg = AifarmMemoryExtractorConfig {
+            frequency_penalty: Some(7.5),
+            presence_penalty: Some(-9.0),
+            ..AifarmMemoryExtractorConfig::default()
+        }
+        .with_defaults();
+        assert_eq!(cfg.frequency_penalty, Some(2.0));
+        assert_eq!(cfg.presence_penalty, Some(-2.0));
+
+        let non_finite = AifarmMemoryExtractorConfig {
+            frequency_penalty: Some(f64::NAN),
+            presence_penalty: Some(f64::INFINITY),
+            ..AifarmMemoryExtractorConfig::default()
+        }
+        .with_defaults();
+        assert_eq!(non_finite.frequency_penalty, Some(0.3));
+        assert_eq!(non_finite.presence_penalty, Some(0.3));
+    }
+
     #[tokio::test]
     async fn aifarm_memory_extractor_matches_go_request_and_decode() -> Result<(), Box<dyn Error>> {
         let completion_payload = serde_json::to_string(&json!({
@@ -5876,6 +5918,8 @@ mod tests {
         assert_eq!(body["model"], "default");
         assert_eq!(body["max_tokens"], DEFAULT_MEMORY_MAX_OUTPUT_TOKENS);
         assert_eq!(body["temperature"], 0.2);
+        assert_eq!(body["frequency_penalty"], 0.3);
+        assert_eq!(body["presence_penalty"], 0.3);
         assert_eq!(body["include_reasoning"], false);
         assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
         assert_eq!(

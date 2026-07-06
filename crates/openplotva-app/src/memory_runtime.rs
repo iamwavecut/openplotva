@@ -3093,6 +3093,8 @@ pub fn aifarm_memory_extractor_config_from_app_config_with_model(
         model,
         max_output_tokens: memory.aifarm_max_output_tokens,
         temperature: Some(memory.aifarm_temperature),
+        frequency_penalty: Some(memory.aifarm_frequency_penalty),
+        presence_penalty: Some(memory.aifarm_presence_penalty),
         enable_thinking: Some(memory.aifarm_enable_thinking),
         include_reasoning: Some(false),
     }

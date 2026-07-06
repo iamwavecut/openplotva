@@ -889,6 +889,8 @@ pub struct MemoryConfig {
     pub aifarm_capacity_wait_seconds: i32,
     pub aifarm_capacity_poll_seconds: i32,
     pub aifarm_temperature: f64,
+    pub aifarm_frequency_penalty: f64,
+    pub aifarm_presence_penalty: f64,
     pub aifarm_enable_thinking: bool,
     pub redaction_enabled: bool,
     pub redaction_service_name: String,
@@ -1382,6 +1384,10 @@ pub struct RawConfig {
     pub memory_aifarm_capacity_poll_seconds: Option<String>,
     /// `MEMORY_AIFARM_TEMPERATURE`.
     pub memory_aifarm_temperature: Option<String>,
+    /// `MEMORY_AIFARM_FREQUENCY_PENALTY`.
+    pub memory_aifarm_frequency_penalty: Option<String>,
+    /// `MEMORY_AIFARM_PRESENCE_PENALTY`.
+    pub memory_aifarm_presence_penalty: Option<String>,
     /// `MEMORY_AIFARM_ENABLE_THINKING`.
     pub memory_aifarm_enable_thinking: Option<String>,
     /// `MEMORY_REDACTION_ENABLED`.
@@ -2200,16 +2206,22 @@ impl AppConfig {
                     // temperature alone encourages. Temperature stays low on purpose so
                     // tool-calling remains reliable; DRY carries the anti-repetition load and
                     // the backend's default DRY sequence breakers spare structural tokens.
-                    aifarm_frequency_penalty: parse_f64(
-                        "DIALOG_AIFARM_FREQUENCY_PENALTY",
-                        raw.dialog_aifarm_frequency_penalty,
+                    aifarm_frequency_penalty: clamp_penalty(
+                        parse_f64(
+                            "DIALOG_AIFARM_FREQUENCY_PENALTY",
+                            raw.dialog_aifarm_frequency_penalty,
+                            0.3,
+                        )?,
                         0.3,
-                    )?,
-                    aifarm_presence_penalty: parse_f64(
-                        "DIALOG_AIFARM_PRESENCE_PENALTY",
-                        raw.dialog_aifarm_presence_penalty,
+                    ),
+                    aifarm_presence_penalty: clamp_penalty(
+                        parse_f64(
+                            "DIALOG_AIFARM_PRESENCE_PENALTY",
+                            raw.dialog_aifarm_presence_penalty,
+                            0.2,
+                        )?,
                         0.2,
-                    )?,
+                    ),
                     aifarm_dry_multiplier: parse_f64(
                         "DIALOG_AIFARM_DRY_MULTIPLIER",
                         raw.dialog_aifarm_dry_multiplier,
@@ -2565,7 +2577,7 @@ impl AppConfig {
                 aifarm_max_output_tokens: parse_i32(
                     "MEMORY_AIFARM_MAX_OUTPUT_TOKENS",
                     raw.memory_aifarm_max_output_tokens,
-                    4096,
+                    4000,
                 )?,
                 aifarm_request_timeout_seconds: parse_i32(
                     "MEMORY_AIFARM_REQUEST_TIMEOUT_SECONDS",
@@ -2597,6 +2609,22 @@ impl AppConfig {
                     raw.memory_aifarm_temperature,
                     0.2,
                 )?,
+                aifarm_frequency_penalty: clamp_penalty(
+                    parse_f64(
+                        "MEMORY_AIFARM_FREQUENCY_PENALTY",
+                        raw.memory_aifarm_frequency_penalty,
+                        0.3,
+                    )?,
+                    0.3,
+                ),
+                aifarm_presence_penalty: clamp_penalty(
+                    parse_f64(
+                        "MEMORY_AIFARM_PRESENCE_PENALTY",
+                        raw.memory_aifarm_presence_penalty,
+                        0.3,
+                    )?,
+                    0.3,
+                ),
                 aifarm_enable_thinking: parse_bool(
                     "MEMORY_AIFARM_ENABLE_THINKING",
                     raw.memory_aifarm_enable_thinking,
@@ -2974,6 +3002,8 @@ impl RawConfig {
             memory_aifarm_capacity_wait_seconds: env("MEMORY_AIFARM_CAPACITY_WAIT_SECONDS"),
             memory_aifarm_capacity_poll_seconds: env("MEMORY_AIFARM_CAPACITY_POLL_SECONDS"),
             memory_aifarm_temperature: env("MEMORY_AIFARM_TEMPERATURE"),
+            memory_aifarm_frequency_penalty: env("MEMORY_AIFARM_FREQUENCY_PENALTY"),
+            memory_aifarm_presence_penalty: env("MEMORY_AIFARM_PRESENCE_PENALTY"),
             memory_aifarm_enable_thinking: env("MEMORY_AIFARM_ENABLE_THINKING"),
             memory_redaction_enabled: env("MEMORY_REDACTION_ENABLED"),
             memory_redaction_service_name: env("MEMORY_REDACTION_SERVICE_NAME"),
@@ -3096,6 +3126,17 @@ fn parse_f64(name: &'static str, value: Option<String>, default: f64) -> Result<
             value,
             source,
         })
+}
+
+// vLLM's OpenAI-compatible layer rejects repetition penalties outside
+// [-2.0, 2.0] with a 400, so clamp operator overrides; a non-finite value
+// falls back to the call site's own default rather than breaking every request.
+fn clamp_penalty(value: f64, fallback: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(-2.0, 2.0)
+    } else {
+        fallback
+    }
 }
 
 fn parse_bool(
@@ -3666,7 +3707,7 @@ mod tests {
         assert_eq!(config.memory.embedding_dim, 512);
         assert_eq!(config.memory.aifarm_service_name, "llm-openai");
         assert_eq!(config.memory.aifarm_endpoint_name, "chat_completions");
-        assert_eq!(config.memory.aifarm_max_output_tokens, 4096);
+        assert_eq!(config.memory.aifarm_max_output_tokens, 4000);
         assert_eq!(config.memory.aifarm_request_timeout_seconds, 660);
         assert_eq!(config.memory.aifarm_poll_interval_seconds, 1);
         assert_eq!(config.memory.aifarm_task_timeout_seconds, 720);
@@ -4255,6 +4296,20 @@ mod tests {
                 value: 0,
             })
         ));
+    }
+
+    #[test]
+    fn clamp_penalty_enforces_openai_range() {
+        assert_eq!(super::clamp_penalty(0.3, 0.3), 0.3);
+        assert_eq!(super::clamp_penalty(2.0, 0.3), 2.0);
+        assert_eq!(super::clamp_penalty(-2.0, 0.3), -2.0);
+        assert_eq!(super::clamp_penalty(5.0, 0.3), 2.0);
+        assert_eq!(super::clamp_penalty(-9.0, 0.3), -2.0);
+        // Non-finite degrades to the call site's own default, not a hardcoded one.
+        assert_eq!(super::clamp_penalty(f64::NAN, 0.3), 0.3);
+        assert_eq!(super::clamp_penalty(f64::NAN, 0.2), 0.2);
+        assert_eq!(super::clamp_penalty(f64::INFINITY, 0.2), 0.2);
+        assert_eq!(super::clamp_penalty(f64::NEG_INFINITY, 0.3), 0.3);
     }
 
     #[test]
