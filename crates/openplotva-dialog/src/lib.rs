@@ -1124,9 +1124,6 @@ const REPLY_LEAK_MARKERS: &[&str] = &[
     "<message id=",
     "<last_message",
     "<assistant_message",
-    "base_voice",
-    "custom persona",
-    "daily persona",
 ];
 
 #[must_use]
@@ -2532,14 +2529,15 @@ mod tests {
             Suppressed(ProtocolOnly)
         );
 
-        // System-prompt / persona reasoning leak → suppressed by the guard.
-        assert_eq!(
-            finalize_dialog_reply("Тут base_voice важнее, а daily persona нет."),
-            Suppressed(ReasoningLeak)
-        );
+        // Structural scaffolding that survives sanitization → suppressed.
         assert_eq!(
             finalize_dialog_reply("<chat_context><reference_context>leaked</reference_context>"),
             Suppressed(ReasoningLeak)
+        );
+        // Persona terms in prose must NOT be suppressed (false-positive guard).
+        assert_eq!(
+            finalize_dialog_reply("Моя кастомная персона важнее, base_voice не при чём."),
+            Reply("Моя кастомная персона важнее, base_voice не при чём.".to_owned())
         );
 
         // Copied context echo → context leak; blank → empty.

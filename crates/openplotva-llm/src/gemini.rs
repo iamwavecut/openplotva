@@ -2638,13 +2638,17 @@ fn final_answer_text_with_content(raw: &str) -> FinalAnswerText {
     let content = decode_plotva_final_response_with_salvage(raw)
         .map(|decoded| decoded.answer.trim().to_owned())
         .unwrap_or_else(|_| raw.trim().to_owned());
-    let answer = match openplotva_dialog::finalize_dialog_reply(&content) {
-        openplotva_dialog::DialogReplyOutcome::Reply(answer) => {
-            sanitize_genkit_final_answer(&answer)
-        }
-        openplotva_dialog::DialogReplyOutcome::Suppressed(_) => String::new(),
-    };
-    FinalAnswerText { answer, content }
+    match openplotva_dialog::finalize_dialog_reply(&content) {
+        openplotva_dialog::DialogReplyOutcome::Reply(answer) => FinalAnswerText {
+            answer: sanitize_genkit_final_answer(&answer),
+            content,
+        },
+        // Drop the leaked content too, so no downstream reader can surface it.
+        openplotva_dialog::DialogReplyOutcome::Suppressed(_) => FinalAnswerText {
+            answer: String::new(),
+            content: String::new(),
+        },
+    }
 }
 
 fn sanitize_genkit_final_answer(raw: &str) -> String {
