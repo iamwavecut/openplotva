@@ -8954,6 +8954,7 @@ fn vip_event_list_from_row(row: PgRow) -> Result<VipEventListRecord, sqlx::Error
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::BTreeMap,
         env,
         error::Error,
         time::{Duration, SystemTime, UNIX_EPOCH},
@@ -9207,6 +9208,23 @@ mod tests {
             assert_eq!(
                 statement_count, 1,
                 "migration {} must contain exactly one statement because SQLx executes each no_tx file as one query",
+                migration.version
+            );
+        }
+    }
+
+    #[test]
+    fn sqlx_up_migration_versions_are_unique() {
+        let mut versions = BTreeMap::new();
+        for migration in super::MIGRATOR
+            .iter()
+            .filter(|migration| migration.migration_type.is_up_migration())
+        {
+            assert!(
+                versions
+                    .insert(migration.version, migration.description.to_string())
+                    .is_none(),
+                "duplicate SQLx up migration version {}",
                 migration.version
             );
         }
