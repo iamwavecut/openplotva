@@ -940,18 +940,14 @@ pub fn managed_assignment_plan(
             .collect::<Vec<_>>();
         compatible.sort_by_key(|candidate| candidate.source_rank);
 
+        let mut seen_models = HashSet::new();
         let mut fallback_models = compatible
             .iter()
             .map(|candidate| candidate.id.clone())
+            .filter(|model| model != &config.fallback_model)
+            .filter(|model| seen_models.insert(model.clone()))
             .collect::<Vec<_>>();
-        if !fallback_models
-            .iter()
-            .any(|model| model == &config.fallback_model)
-        {
-            fallback_models.push(config.fallback_model.clone());
-        }
-        let mut seen_models = HashSet::new();
-        fallback_models.retain(|model| seen_models.insert(model.clone()));
+        fallback_models.push(config.fallback_model.clone());
 
         for (index, model_name) in fallback_models.into_iter().enumerate() {
             out.push(ManagedAssignmentPlan {
@@ -1210,7 +1206,7 @@ mod tests {
                 id: FALLBACK_MODEL.to_owned(),
                 display_name: None,
                 score: None,
-                source_rank: 3,
+                source_rank: 1,
                 context_length: None,
                 max_completion_tokens: None,
                 supports_tools: true,
