@@ -13,5 +13,6 @@ WHERE name = 'openrouter-free'
   AND config ->> 'managed_by' = 'openrouter_free_pool';
 
 -- Preserve shared schema/data that may have pre-existed this migration. The up
--- migration uses IF NOT EXISTS / ON CONFLICT DO NOTHING for these objects, so
--- rollback only removes rows marked as OpenRouter Free managed data.
+-- migration uses IF NOT EXISTS for the config column, ON CONFLICT DO NOTHING for
+-- youtube_summary, and ON CONFLICT DO UPDATE for OpenRouter-managed seed rows.
+-- Rollback only removes rows explicitly marked as OpenRouter Free managed data.
