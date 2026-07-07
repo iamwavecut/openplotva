@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::Mutex,
     time::{Duration, Instant},
 };
@@ -697,7 +697,6 @@ async fn apply_sync(
     }
     let disabled_models = disable_stale_models(&mut tx, context.provider_id, &model_names).await?;
     delete_managed_assignments(&mut tx, &workflow_keys).await?;
-    demote_operator_primaries(&mut tx, &workflow_keys).await?;
 
     let mut assignment_config = context.pool_config.clone();
     assignment_config.target_workflows = workflow_keys;
@@ -834,37 +833,6 @@ async fn delete_managed_assignments(
     Ok(())
 }
 
-async fn demote_operator_primaries(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    workflow_keys: &[String],
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        r#"
-        WITH ranked AS (
-            SELECT
-                id,
-                10000 + row_number() OVER (PARTITION BY workflow_key, scope ORDER BY id ASC) AS fallback_order
-            FROM workflow_assignments
-            WHERE workflow_key = ANY($1)
-              AND scope = 'global'
-              AND role = 'primary'
-              AND COALESCE(inference_overrides ->> 'managed_by', '') <> $2
-        )
-        UPDATE workflow_assignments AS assignment
-        SET role = 'fallback',
-            weight = NULL,
-            fallback_order = ranked.fallback_order
-        FROM ranked
-        WHERE assignment.id = ranked.id
-        "#,
-    )
-    .bind(workflow_keys)
-    .bind(MANAGED_BY)
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
-}
-
 async fn insert_managed_assignment(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     assignment: &ManagedAssignmentPlan,
@@ -890,11 +858,7 @@ async fn insert_managed_assignment(
     .bind(&assignment.workflow_key)
     .bind(&assignment.role)
     .bind(model_id)
-    .bind(if assignment.role == "primary" {
-        Some(100)
-    } else {
-        None
-    })
+    .bind(None::<i32>)
     .bind(assignment.fallback_order)
     .bind(
         json!({
@@ -975,28 +939,24 @@ pub fn managed_assignment_plan(
             .take(config.max_models)
             .collect::<Vec<_>>();
         compatible.sort_by_key(|candidate| candidate.source_rank);
-        if let Some(primary) = compatible.first() {
+
+        let mut seen_models = HashSet::new();
+        let mut fallback_models = compatible
+            .iter()
+            .map(|candidate| candidate.id.clone())
+            .filter(|model| model != &config.fallback_model)
+            .filter(|model| seen_models.insert(model.clone()))
+            .collect::<Vec<_>>();
+        fallback_models.push(config.fallback_model.clone());
+
+        for (index, model_name) in fallback_models.into_iter().enumerate() {
             out.push(ManagedAssignmentPlan {
                 workflow_key: workflow.clone(),
-                model_name: primary.id.clone(),
-                role: "primary".to_owned(),
-                fallback_order: None,
+                model_name,
+                role: "fallback".to_owned(),
+                fallback_order: Some(i32::try_from(index + 1).unwrap_or(i32::MAX)),
             });
-            for (index, candidate) in compatible.iter().skip(1).enumerate() {
-                out.push(ManagedAssignmentPlan {
-                    workflow_key: workflow.clone(),
-                    model_name: candidate.id.clone(),
-                    role: "fallback".to_owned(),
-                    fallback_order: Some(i32::try_from(index + 1).unwrap_or(i32::MAX)),
-                });
-            }
         }
-        out.push(ManagedAssignmentPlan {
-            workflow_key: workflow.clone(),
-            model_name: config.fallback_model.clone(),
-            role: "fallback".to_owned(),
-            fallback_order: Some(i32::try_from(compatible.len() + 1).unwrap_or(i32::MAX)),
-        });
     }
     out
 }
@@ -1214,7 +1174,7 @@ mod tests {
     }
 
     #[test]
-    fn assignment_plan_uses_best_candidate_primary_and_excludes_dialog() {
+    fn assignment_plan_uses_only_fallback_candidates_and_excludes_dialog() {
         let candidates = vec![
             OpenRouterFreeCandidate {
                 id: "top/no-json:free".to_owned(),
@@ -1242,6 +1202,19 @@ mod tests {
                 supports_reasoning: true,
                 health_status: None,
             },
+            OpenRouterFreeCandidate {
+                id: FALLBACK_MODEL.to_owned(),
+                display_name: None,
+                score: None,
+                source_rank: 1,
+                context_length: None,
+                max_completion_tokens: None,
+                supports_tools: true,
+                supports_structured_outputs: true,
+                supports_response_format: true,
+                supports_reasoning: true,
+                health_status: None,
+            },
         ];
         let config = OpenRouterFreePoolConfig {
             target_workflows: vec!["dialog".to_owned(), "memory_consolidation".to_owned()],
@@ -1261,8 +1234,21 @@ mod tests {
             .filter(|assignment| assignment.workflow_key == "memory_consolidation")
             .collect::<Vec<_>>();
         assert_eq!(memory[0].model_name, "structured/model:free");
-        assert_eq!(memory[0].role, "primary");
+        assert_eq!(memory[0].role, "fallback");
+        assert_eq!(memory[0].fallback_order, Some(1));
         assert_eq!(memory.last().expect("fallback").model_name, FALLBACK_MODEL);
+        assert_eq!(
+            memory
+                .iter()
+                .filter(|assignment| assignment.model_name == FALLBACK_MODEL)
+                .count(),
+            1
+        );
+        assert!(
+            memory
+                .iter()
+                .all(|assignment| assignment.role == "fallback")
+        );
     }
 
     #[test]
