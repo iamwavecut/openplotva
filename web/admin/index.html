@@ -2841,6 +2841,7 @@
         }
         function mpPoolCard(p) {
             const card = mpEl('div', { class: 'mp-pool-card' });
+            const isOpenRouterFree = p.config && p.config.managed_by === 'openrouter_free_pool';
             const nameIn = mpEl('pl-input', { value: p.name, 'aria-label': 'Pool name' });
             const descIn = mpEl('pl-input', { value: p.description || '', placeholder: 'description', 'aria-label': 'Pool description' });
             const unlimited = mpEl('pl-toggle', Object.assign({ label: 'Unlimited' }, p.max_concurrency == null ? { checked: true } : {}));
@@ -2870,6 +2871,33 @@
             card.appendChild(mpEl('pl-field-group', { label: 'Name' }, [nameIn]));
             card.appendChild(mpEl('pl-field-group', { label: 'Description' }, [descIn]));
             card.appendChild(mpEl('div', { class: 'mp-pool-actions' }, [unlimited, slider]));
+            if (isOpenRouterFree) {
+                const status = mpStatus().openrouter_free || {};
+                card.appendChild(mpEl('div', { class: 'mp-hint' }, [
+                    'OpenRouter Free · ',
+                    mpEl('span', { text: status.ranking_version || 'not refreshed' }),
+                    status.active_models != null ? mpEl('span', { text: ' · ' + status.active_models + ' active models' }) : null,
+                    status.updated_at ? mpEl('span', { text: ' · ' + status.updated_at }) : null,
+                ].filter(Boolean)));
+                const quota = status.quota || {};
+                const quotaBits = [];
+                if (status.key_status_error) quotaBits.push('key status failed');
+                if (quota.minute_count != null) quotaBits.push('minute ' + quota.minute_count + '/' + (quota.rpm_limit != null ? quota.rpm_limit : '—'));
+                if (quota.day_count != null) quotaBits.push('day ' + quota.day_count + '/' + (quota.daily_request_limit != null ? quota.daily_request_limit : '—'));
+                if (quota.pool_cooldown_remaining_ms) quotaBits.push('pool cooldown ' + Math.ceil(quota.pool_cooldown_remaining_ms / 1000) + 's');
+                const modelCooldowns = quota.model_cooldowns || [];
+                if (modelCooldowns.length) quotaBits.push(modelCooldowns.length + ' model cooldowns');
+                if (quota.redis_available === false) quotaBits.push('Redis unavailable');
+                if (status.updated_at && quota.refresh_interval_seconds) {
+                    const next = new Date(Date.parse(status.updated_at) + quota.refresh_interval_seconds * 1000);
+                    if (!Number.isNaN(next.getTime())) quotaBits.push('next ' + next.toISOString());
+                }
+                if (quotaBits.length) {
+                    card.appendChild(mpEl('div', { class: 'mp-hint', text: 'Quota · ' + quotaBits.join(' · ') }));
+                }
+            }
+            const advanced = mpAdvancedJsonField(p.config || {}, []);
+            card.appendChild(advanced.node);
             const attached = (mpState.snap.models || []).filter(m => m.pool_id === p.id);
             const chips = mpEl('div', { class: 'mp-pool-chips' });
             attached.forEach(m => {
@@ -2900,11 +2928,19 @@
                     });
                     if (!ok) return;
                 }
-                await mpApply('update_pool', { id: p.id, name: nm, max_concurrency: max, description: descIn.value.trim() || null }, 'Pool saved.');
+                let config;
+                try { config = advanced.parse(); } catch (_) { return; }
+                await mpApply('update_pool', { id: p.id, name: nm, max_concurrency: max, description: descIn.value.trim() || null, config }, 'Pool saved.');
             });
             card.appendChild(mpEl('div', { class: 'mp-pool-actions' }, [
                 attachSel,
-                mpEl('div', { class: 'mp-pool-actions-end' }, [save]),
+                mpEl('div', { class: 'mp-pool-actions-end' }, [
+                    isOpenRouterFree ? mpBtn('Refresh free models now', { variant: 'outline', size: 'sm' }, async () => {
+                        const r = await mpApply('refresh_openrouter_free_pool', {}, 'OpenRouter Free refresh completed.');
+                        if (r && r.message) PL.toast(r.message, 'success');
+                    }) : null,
+                    save,
+                ].filter(Boolean)),
             ]));
             return card;
         }
@@ -2916,18 +2952,23 @@
             const unlimited = mpEl('pl-toggle', { label: 'Unlimited' });
             const slider = mpEl('pl-slider', { min: '1', max: '32', step: '1', value: '1', label: 'slots', 'aria-label': 'Max concurrency for new pool' });
             unlimited.addEventListener('pl:change', ev => mpSetSliderDisabled(slider, !!ev.detail.checked));
+            const advanced = mpAdvancedJsonField({}, []);
             card.appendChild(mpEl('pl-field-group', { label: 'Name', required: true }, [nameIn]));
             card.appendChild(mpEl('pl-field-group', { label: 'Description' }, [descIn]));
             card.appendChild(mpEl('div', { class: 'mp-pool-actions' }, [unlimited, slider]));
+            card.appendChild(advanced.node);
             card.appendChild(mpEl('div', { class: 'mp-pool-actions' }, [
                 mpEl('div', { class: 'mp-pool-actions-end' }, [
                     mpBtn('Create pool', { variant: 'primary', size: 'sm' }, async () => {
                         const nm = nameIn.value.trim();
                         if (!nm) { PL.toast('Pool name is required.', 'warning'); return; }
+                        let config;
+                        try { config = advanced.parse(); } catch (_) { return; }
                         await mpApply('create_pool', {
                             name: nm,
                             max_concurrency: unlimited.checked ? null : Number(slider.value),
                             description: descIn.value.trim() || null,
+                            config,
                         }, 'Pool created.');
                     }),
                 ]),

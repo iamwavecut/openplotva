@@ -26,6 +26,7 @@ pub struct RoutedAttemptWalker {
     breakers: Arc<BreakerSet>,
     triggers: Arc<TriggerState>,
     pools: Arc<PoolRegistry>,
+    openrouter_free_gate: Option<Arc<crate::openrouter_free_pool::OpenRouterFreeQuotaGate>>,
     max_slot_wait: Duration,
     reporter: Option<crate::runtime_routing::RoutingEventReporter>,
 }
@@ -43,6 +44,7 @@ impl RoutedAttemptWalker {
             breakers,
             triggers,
             pools,
+            openrouter_free_gate: None,
             max_slot_wait: DEFAULT_MAX_SLOT_WAIT,
             reporter: None,
         }
@@ -51,6 +53,24 @@ impl RoutedAttemptWalker {
     #[must_use]
     pub fn with_reporter(mut self, reporter: crate::runtime_routing::RoutingEventReporter) -> Self {
         self.reporter = Some(reporter);
+        self
+    }
+
+    #[must_use]
+    pub fn with_openrouter_free_gate(
+        mut self,
+        gate: Arc<crate::openrouter_free_pool::OpenRouterFreeQuotaGate>,
+    ) -> Self {
+        self.openrouter_free_gate = Some(gate);
+        self
+    }
+
+    #[must_use]
+    pub fn with_openrouter_free_gate_opt(
+        mut self,
+        gate: Option<Arc<crate::openrouter_free_pool::OpenRouterFreeQuotaGate>>,
+    ) -> Self {
+        self.openrouter_free_gate = gate;
         self
     }
 
@@ -76,7 +96,7 @@ impl RoutedAttemptWalker {
         retryable: Retry,
     ) -> Result<T, RoutedAttemptRunError<E>>
     where
-        E: Send + Sync + 'static,
+        E: std::fmt::Debug + Send + Sync + 'static,
         F: FnMut(RoutedAttempt) -> Fut + Send,
         Fut: Future<Output = Result<T, E>> + Send,
         Retry: Fn(&E) -> Option<FailureReason> + Send,
@@ -154,6 +174,7 @@ impl RoutedAttemptWalker {
             first_pass = false;
 
             let mut busy_skips = 0usize;
+            let mut quota_skips = 0usize;
             let mut executed_this_pass = 0usize;
             for attempt in attempts {
                 if started.elapsed().saturating_sub(total_slot_wait) > route.retry.wall_clock {
@@ -174,6 +195,30 @@ impl RoutedAttemptWalker {
                     busy_skips += 1;
                     continue;
                 };
+                if let (Some(gate), Some(model)) = (&self.openrouter_free_gate, model) {
+                    match gate.check_model(&model.model_name, &model.config).await {
+                        crate::openrouter_free_pool::OpenRouterFreeQuotaDecision::Allowed => {}
+                        crate::openrouter_free_pool::OpenRouterFreeQuotaDecision::Denied {
+                            reason,
+                            retry_after,
+                        } => {
+                            quota_skips += 1;
+                            self.record_event(routing_event_with_severity(
+                                "openrouter_free_quota_limited",
+                                "warn",
+                                &context,
+                                Some(attempt.provider),
+                                Some(attempt.model),
+                                "OpenRouter Free pool unavailable; skipping to fallback",
+                                json!({
+                                    "reason": reason,
+                                    "retry_after_ms": retry_after.map(|duration| duration.as_millis()),
+                                }),
+                            ));
+                            continue;
+                        }
+                    }
+                }
                 let routed = RoutedAttempt {
                     provider_id: attempt.provider,
                     model_id: attempt.model,
@@ -184,6 +229,9 @@ impl RoutedAttemptWalker {
                         .and_then(|row| row.discovery_service_name.clone()),
                     discovery_endpoint_name: provider
                         .and_then(|row| row.discovery_endpoint_name.clone()),
+                    provider_api_key_ref: provider.and_then(|row| row.api_key_ref.clone()),
+                    provider_api_key_encrypted: provider
+                        .and_then(|row| row.api_key_encrypted.clone()),
                     model_base_url: model.and_then(|row| row.base_url.clone()),
                     embedding_dim: model.and_then(|row| row.embedding_dim),
                     provider_config: provider
@@ -284,6 +332,56 @@ impl RoutedAttemptWalker {
                                 }),
                             ));
                         }
+                        if let (Some(gate), Some(model)) = (&self.openrouter_free_gate, model)
+                            && model.config.get("managed_by").and_then(Value::as_str)
+                                == Some(crate::openrouter_free_pool::MANAGED_BY)
+                        {
+                            let message = format!("{error:?}");
+                            if crate::openrouter_free_pool::message_indicates_openrouter_pool_cooldown(
+                                &message,
+                            ) {
+                                let cooldown = match crate::openrouter_free_pool::retry_after_from_error_message(
+                                    &message,
+                                ) {
+                                    Some(cooldown) => cooldown,
+                                    None => gate.default_pool_cooldown().await,
+                                };
+                                gate.mark_pool_cooldown(cooldown);
+                                self.record_event(routing_event(
+                                    "openrouter_free_pool_cooldown",
+                                    &context,
+                                    Some(attempt.provider),
+                                    Some(attempt.model),
+                                    "OpenRouter Free pool entered cooldown after provider error",
+                                    json!({
+                                        "cooldown_ms": cooldown.as_millis(),
+                                        "retryable_reason": reason.as_str(),
+                                    }),
+                                ));
+                            } else if reason == FailureReason::CapacityUnavailable
+                                || crate::openrouter_free_pool::message_indicates_openrouter_model_cooldown(&message)
+                            {
+                                let cooldown = match crate::openrouter_free_pool::retry_after_from_error_message(
+                                    &message,
+                                ) {
+                                    Some(cooldown) => cooldown,
+                                    None => gate.default_model_cooldown().await,
+                                };
+                                gate.mark_model_cooldown(&model.model_name, cooldown);
+                                self.record_event(routing_event(
+                                    "openrouter_free_model_cooldown",
+                                    &context,
+                                    Some(attempt.provider),
+                                    Some(attempt.model),
+                                    "OpenRouter Free model entered cooldown after provider error",
+                                    json!({
+                                        "model": model.model_name,
+                                        "cooldown_ms": cooldown.as_millis(),
+                                        "retryable_reason": reason.as_str(),
+                                    }),
+                                ));
+                            }
+                        }
                         failed_attempts += 1;
                         last_reason = Some(reason.as_str().to_owned());
                         last_error = Some(error);
@@ -319,6 +417,7 @@ impl RoutedAttemptWalker {
                     "all candidate capacity pools are busy; waiting for a slot",
                     json!({
                         "busy_candidates": busy_skips,
+                        "quota_skips": quota_skips,
                         "wait_budget_ms": wait_budget.as_millis(),
                     }),
                 ));
@@ -428,6 +527,8 @@ pub struct RoutedAttempt {
     pub provider_endpoint: Option<String>,
     pub discovery_service_name: Option<String>,
     pub discovery_endpoint_name: Option<String>,
+    pub provider_api_key_ref: Option<String>,
+    pub provider_api_key_encrypted: Option<Vec<u8>>,
     pub model_base_url: Option<String>,
     pub embedding_dim: Option<i32>,
     pub provider_config: Value,
@@ -967,6 +1068,7 @@ mod tests {
                 name: "gpu".to_owned(),
                 max_concurrency: Some(1),
                 description: None,
+                config: serde_json::json!({}),
             }],
         }
     }

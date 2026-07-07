@@ -6232,6 +6232,8 @@ mod tests {
             provider_endpoint: None,
             discovery_service_name: Some(AIFARM_DRAW_API_SERVICE_NAME.to_owned()),
             discovery_endpoint_name: Some(AIFARM_DRAW_API_ENDPOINT_NAME.to_owned()),
+            provider_api_key_ref: None,
+            provider_api_key_encrypted: None,
             model_base_url: None,
             embedding_dim: None,
             provider_config: json!({

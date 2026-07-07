@@ -3962,11 +3962,39 @@ fn direct_http_status_error(
     if (200..300).contains(&response.status_code) {
         return Ok(());
     }
+    let hints = direct_status_error_hints(response, raw_body);
+    let suffix = if hints.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", hints.join(" "))
+    };
     Err(Box::new(AifarmClientError::Upstream(format!(
-        "{prefix}: status {}: {}",
+        "{prefix}: status {}: {}{}",
         response.status_code,
-        direct_error_message(raw_body, &response.status_text)
+        direct_error_message(raw_body, &response.status_text),
+        suffix
     ))))
+}
+
+fn direct_status_error_hints(response: &AifarmHttpResponse, raw_body: &str) -> Vec<String> {
+    let mut hints = Vec::new();
+    if let Some(retry_after) = header_value(&response.headers, "retry-after")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        hints.push(format!("retry_after_seconds={retry_after}"));
+    }
+    if let Ok(value) = serde_json::from_str::<Value>(raw_body)
+        && let Some(error_type) = value
+            .get("error")
+            .and_then(|error| error.get("metadata"))
+            .and_then(|metadata| metadata.get("error_type"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+    {
+        hints.push(format!("openrouter_error_type={}", error_type.trim()));
+    }
+    hints
 }
 
 fn decode_direct_completion_payload(
@@ -6392,6 +6420,27 @@ mod tests {
             headers: BTreeMap::new(),
             body: serde_json::to_vec(&value).expect("json response"),
         }
+    }
+
+    #[test]
+    fn direct_status_error_preserves_openrouter_retry_metadata() {
+        let response = AifarmHttpResponse {
+            status_code: 429,
+            status_text: "Too Many Requests".to_owned(),
+            headers: BTreeMap::from([("retry-after".to_owned(), "3600".to_owned())]),
+            body: Vec::new(),
+        };
+        let raw_body = r#"{"error":{"code":429,"message":"Rate limited","metadata":{"error_type":"rate_limit_exceeded"}}}"#;
+
+        let error = direct_http_status_error("direct dialog request", &response, raw_body)
+            .expect_err("429 should be an upstream error");
+        let message = error.to_string();
+
+        assert!(message.contains("retry_after_seconds=3600"), "{message}");
+        assert!(
+            message.contains("openrouter_error_type=rate_limit_exceeded"),
+            "{message}"
+        );
     }
 
     fn native_tool_values(tool_names: &[&str]) -> Result<Vec<Value>, AifarmDialogError> {
