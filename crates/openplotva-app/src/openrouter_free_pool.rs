@@ -13,6 +13,7 @@ pub const MANAGED_BY: &str = "openrouter_free_pool";
 pub const PROVIDER_NAME: &str = "openrouter-free";
 pub const POOL_NAME: &str = "openrouter-free";
 pub const FALLBACK_MODEL: &str = "openrouter/free";
+const POOL_CONFIG_CACHE_TTL: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct OpenRouterFreeSource {
@@ -114,6 +115,13 @@ pub struct OpenRouterFreeQuotaGate {
     postgres: PgPool,
     pool_cooldown_until: Mutex<Option<Instant>>,
     model_cooldowns_until: Mutex<HashMap<String, Instant>>,
+    pool_config_cache: Mutex<Option<CachedOpenRouterFreePoolConfig>>,
+}
+
+#[derive(Clone, Debug)]
+struct CachedOpenRouterFreePoolConfig {
+    config: OpenRouterFreePoolConfig,
+    expires_at: Instant,
 }
 
 impl OpenRouterFreeQuotaGate {
@@ -124,6 +132,7 @@ impl OpenRouterFreeQuotaGate {
             postgres,
             pool_cooldown_until: Mutex::new(None),
             model_cooldowns_until: Mutex::new(HashMap::new()),
+            pool_config_cache: Mutex::new(None),
         }
     }
 
@@ -147,7 +156,7 @@ impl OpenRouterFreeQuotaGate {
                 retry_after: Some(retry_after),
             };
         }
-        let config = match load_pool_config(&self.postgres).await {
+        let config = match self.cached_pool_config().await {
             Ok(config) => config,
             Err(error) => {
                 return OpenRouterFreeQuotaDecision::Denied {
@@ -166,11 +175,7 @@ impl OpenRouterFreeQuotaGate {
             }
         };
         let now = OffsetDateTime::now_utc();
-        let minute_key = format!(
-            "openrouter_free:minute:{}",
-            now.unix_timestamp().div_euclid(60)
-        );
-        let day_key = format!("openrouter_free:day:{}", now.date());
+        let (minute_key, day_key) = quota_counter_keys(model_name, now);
         let minute_count = match incr_with_ttl(&mut connection, &minute_key, 90).await {
             Ok(count) => count,
             Err(error) => {
@@ -191,18 +196,18 @@ impl OpenRouterFreeQuotaGate {
         };
         if minute_count > u64::from(config.rpm_limit) {
             let retry_after = Duration::from_secs(60);
-            self.mark_pool_cooldown(retry_after);
+            self.mark_model_cooldown(model_name, retry_after);
             return OpenRouterFreeQuotaDecision::Denied {
-                reason: "openrouter_free_rpm_limit".to_owned(),
+                reason: "openrouter_free_model_rpm_limit".to_owned(),
                 retry_after: Some(retry_after),
             };
         }
         if day_count > u64::from(config.daily_request_limit) {
             let retry_after = seconds_until_next_utc_day(now)
                 .unwrap_or_else(|| Duration::from_secs(config.default_pool_cooldown_seconds));
-            self.mark_pool_cooldown(retry_after);
+            self.mark_model_cooldown(model_name, retry_after);
             return OpenRouterFreeQuotaDecision::Denied {
-                reason: "openrouter_free_daily_limit".to_owned(),
+                reason: "openrouter_free_model_daily_limit".to_owned(),
                 retry_after: Some(retry_after),
             };
         }
@@ -261,14 +266,14 @@ impl OpenRouterFreeQuotaGate {
     }
 
     pub async fn default_pool_cooldown(&self) -> Duration {
-        load_pool_config(&self.postgres)
+        self.cached_pool_config()
             .await
             .map(|config| Duration::from_secs(config.default_pool_cooldown_seconds))
             .unwrap_or_else(|_| Duration::from_secs(3_600))
     }
 
     pub async fn default_model_cooldown(&self) -> Duration {
-        load_pool_config(&self.postgres)
+        self.cached_pool_config()
             .await
             .map(|config| Duration::from_secs(config.model_cooldown_seconds))
             .unwrap_or_else(|_| Duration::from_secs(900))
@@ -277,7 +282,8 @@ impl OpenRouterFreeQuotaGate {
     pub async fn status_snapshot(&self) -> Value {
         let now = OffsetDateTime::now_utc();
         let mut status = serde_json::Map::new();
-        if let Ok(config) = load_pool_config(&self.postgres).await {
+        status.insert("quota_scope".to_owned(), json!("per_model"));
+        if let Ok(config) = self.cached_pool_config().await {
             status.insert("rpm_limit".to_owned(), json!(config.rpm_limit));
             status.insert(
                 "daily_request_limit".to_owned(),
@@ -303,39 +309,12 @@ impl OpenRouterFreeQuotaGate {
             "model_cooldowns".to_owned(),
             json!(self.model_cooldowns_snapshot()),
         );
-        let minute_key = format!(
-            "openrouter_free:minute:{}",
-            now.unix_timestamp().div_euclid(60)
-        );
-        let day_key = format!("openrouter_free:day:{}", now.date());
         match self.redis.get_multiplexed_async_connection().await {
-            Ok(mut connection) => {
+            Ok(_) => {
                 status.insert("redis_available".to_owned(), json!(true));
                 status.insert(
-                    "minute_count".to_owned(),
-                    json!(
-                        redis_get_u64(&mut connection, &minute_key)
-                            .await
-                            .ok()
-                            .flatten()
-                    ),
-                );
-                status.insert(
-                    "day_count".to_owned(),
-                    json!(
-                        redis_get_u64(&mut connection, &day_key)
-                            .await
-                            .ok()
-                            .flatten()
-                    ),
-                );
-                status.insert(
-                    "minute_ttl_seconds".to_owned(),
-                    json!(redis_ttl(&mut connection, &minute_key).await.ok()),
-                );
-                status.insert(
-                    "day_ttl_seconds".to_owned(),
-                    json!(redis_ttl(&mut connection, &day_key).await.ok()),
+                    "status_checked_at_unix".to_owned(),
+                    json!(now.unix_timestamp()),
                 );
             }
             Err(error) => {
@@ -344,6 +323,33 @@ impl OpenRouterFreeQuotaGate {
             }
         }
         Value::Object(status)
+    }
+
+    async fn cached_pool_config(
+        &self,
+    ) -> Result<OpenRouterFreePoolConfig, OpenRouterFreePoolError> {
+        let now = Instant::now();
+        {
+            let guard = self
+                .pool_config_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(cached) = guard.as_ref()
+                && cached.expires_at > now
+            {
+                return Ok(cached.config.clone());
+            }
+        }
+        let config = load_pool_config(&self.postgres).await?;
+        let mut guard = self
+            .pool_config_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = Some(CachedOpenRouterFreePoolConfig {
+            config: config.clone(),
+            expires_at: Instant::now() + POOL_CONFIG_CACHE_TTL,
+        });
+        Ok(config)
     }
 
     fn model_cooldowns_snapshot(&self) -> Vec<Value> {
@@ -371,29 +377,36 @@ async fn incr_with_ttl(
     ttl_seconds: usize,
 ) -> redis::RedisResult<u64> {
     let count: u64 = redis::cmd("INCR").arg(key).query_async(connection).await?;
-    if count == 1 {
-        let _: () = redis::cmd("EXPIRE")
-            .arg(key)
-            .arg(ttl_seconds)
-            .query_async(connection)
-            .await?;
-    }
+    let _: () = redis::cmd("EXPIRE")
+        .arg(key)
+        .arg(ttl_seconds)
+        .query_async(connection)
+        .await?;
     Ok(count)
 }
 
-async fn redis_get_u64(
-    connection: &mut redis::aio::MultiplexedConnection,
-    key: &str,
-) -> redis::RedisResult<Option<u64>> {
-    let value: Option<String> = redis::cmd("GET").arg(key).query_async(connection).await?;
-    Ok(value.and_then(|value| value.parse::<u64>().ok()))
+fn quota_counter_keys(model_name: &str, now: OffsetDateTime) -> (String, String) {
+    let model = quota_model_key(model_name);
+    (
+        format!(
+            "openrouter_free:model:{model}:minute:{}",
+            now.unix_timestamp().div_euclid(60)
+        ),
+        format!("openrouter_free:model:{model}:day:{}", now.date()),
+    )
 }
 
-async fn redis_ttl(
-    connection: &mut redis::aio::MultiplexedConnection,
-    key: &str,
-) -> redis::RedisResult<i64> {
-    redis::cmd("TTL").arg(key).query_async(connection).await
+fn quota_model_key(model_name: &str) -> String {
+    let trimmed = model_name.trim();
+    if trimmed.is_empty() {
+        return "empty".to_owned();
+    }
+    let mut out = String::with_capacity(trimmed.len() * 2);
+    for byte in trimmed.as_bytes() {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 fn seconds_until_next_utc_day(now: OffsetDateTime) -> Option<Duration> {
@@ -1273,5 +1286,17 @@ mod tests {
         );
         assert!(!message_indicates_openrouter_pool_cooldown(message));
         assert!(message_indicates_openrouter_model_cooldown(message));
+    }
+
+    #[test]
+    fn quota_counter_keys_are_scoped_per_model() {
+        let now = OffsetDateTime::from_unix_timestamp(1_789_000_000).expect("valid test timestamp");
+
+        let first = quota_counter_keys("cohere/north-mini-code:free", now);
+        let second = quota_counter_keys("tencent/hy3:free", now);
+
+        assert_ne!(first, second);
+        assert!(first.0.starts_with("openrouter_free:model:"));
+        assert!(first.1.starts_with("openrouter_free:model:"));
     }
 }
