@@ -1454,6 +1454,7 @@ pub async fn backfill_capacity_pools(
                 name: pool_name.to_owned(),
                 max_concurrency: Some(slots),
                 description: Some(description.to_owned()),
+                config: serde_json::json!({}),
             },
         )
         .await?;
@@ -2144,12 +2145,14 @@ mod tests {
                 name: "aifarm-dialog".to_owned(),
                 max_concurrency: Some(2),
                 description: None,
+                config: serde_json::json!({}),
             },
             openplotva_storage::llm_routing::PoolRecord {
                 id: 8,
                 name: "unlimited".to_owned(),
                 max_concurrency: None,
                 description: None,
+                config: serde_json::json!({}),
             },
         ];
 

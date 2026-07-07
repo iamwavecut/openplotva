@@ -32,6 +32,7 @@ pub mod memory_runtime;
 pub mod message_gate;
 pub mod model_routing;
 pub mod music_jobs;
+pub mod openrouter_free_pool;
 pub mod payments;
 pub mod permissions;
 pub mod rate_limits;
@@ -144,6 +145,7 @@ struct RuntimeWorkers {
     router_breakers: Option<Arc<openplotva_llm::router::BreakerSet>>,
     router_triggers: Option<Arc<openplotva_llm::router::TriggerState>>,
     router_pools: Option<Arc<openplotva_llm::router::PoolRegistry>>,
+    openrouter_free_gate: Option<Arc<openrouter_free_pool::OpenRouterFreeQuotaGate>>,
     router_runtime: Option<Arc<model_routing::RouterRuntime>>,
     dialog_worker_gauge: Option<Arc<dialog_workers::WorkerGauge>>,
 }
@@ -457,6 +459,7 @@ struct StaticWebRoutes {
     router_breakers: Option<Arc<openplotva_llm::router::BreakerSet>>,
     router_triggers: Option<Arc<openplotva_llm::router::TriggerState>>,
     router_pools: Option<Arc<openplotva_llm::router::PoolRegistry>>,
+    openrouter_free_gate: Option<Arc<openrouter_free_pool::OpenRouterFreeQuotaGate>>,
     router_runtime: Option<Arc<model_routing::RouterRuntime>>,
     dialog_worker_gauge: Option<Arc<dialog_workers::WorkerGauge>>,
 }
@@ -470,6 +473,7 @@ struct AdminMemoryOverrideRuntime {
     router_breakers: Arc<openplotva_llm::router::BreakerSet>,
     router_triggers: Arc<openplotva_llm::router::TriggerState>,
     router_pools: Arc<openplotva_llm::router::PoolRegistry>,
+    openrouter_free_gate: Option<Arc<openrouter_free_pool::OpenRouterFreeQuotaGate>>,
     routing_event_reporter: Option<runtime_routing::RoutingEventReporter>,
 }
 
@@ -526,6 +530,7 @@ fn static_web_routes(
         router_breakers: None,
         router_triggers: None,
         router_pools: None,
+        openrouter_free_gate: None,
         router_runtime: None,
         dialog_worker_gauge: None,
     }
@@ -574,6 +579,7 @@ fn static_web_routes_from_config(
     routes.router_breakers = runtime_workers.router_breakers.clone();
     routes.router_triggers = runtime_workers.router_triggers.clone();
     routes.router_pools = runtime_workers.router_pools.clone();
+    routes.openrouter_free_gate = runtime_workers.openrouter_free_gate.clone();
     routes.router_runtime = runtime_workers.router_runtime.clone();
     routes.dialog_worker_gauge = runtime_workers.dialog_worker_gauge.clone();
     routes.shield_options = shield_options_from_config(&config.shield);
@@ -618,6 +624,7 @@ fn static_web_routes_from_config(
                 router_breakers,
                 router_triggers,
                 router_pools,
+                openrouter_free_gate: routes.openrouter_free_gate.clone(),
                 routing_event_reporter: routes.routing_event_reporter.clone(),
             });
         }
@@ -4172,6 +4179,7 @@ async fn admin_memory_restart_override_execute_response(
             Arc::clone(&runtime.router_triggers),
             Arc::clone(&runtime.router_pools),
         )
+        .with_openrouter_free_gate_opt(runtime.openrouter_free_gate.clone())
         .with_reporter_opt(runtime.routing_event_reporter.clone()),
     );
     let embedder = match memory_runtime::memory_write_embedder_from_config(
@@ -4186,6 +4194,7 @@ async fn admin_memory_restart_override_execute_response(
                     Arc::clone(&runtime.router_triggers),
                     Arc::clone(&runtime.router_pools),
                 )
+                .with_openrouter_free_gate_opt(runtime.openrouter_free_gate.clone())
                 .with_reporter_opt(runtime.routing_event_reporter.clone()),
                 client.config().clone(),
             )
@@ -7693,6 +7702,43 @@ fn model_input_from_json(
     })
 }
 
+fn pool_input_from_json(
+    value: &serde_json::Value,
+) -> Result<openplotva_storage::llm_routing::PoolInput, String> {
+    let config = value.get("config").cloned().unwrap_or_else(|| json!({}));
+    if !config.is_object() {
+        return Err("config must be a JSON object".to_owned());
+    }
+    Ok(openplotva_storage::llm_routing::PoolInput {
+        name: routing_json_str(value, "name").ok_or("name is required")?,
+        max_concurrency: routing_json_i32(value, "max_concurrency"),
+        description: routing_json_str(value, "description"),
+        config,
+    })
+}
+
+fn record_openrouter_free_key_status_failed(
+    reporter: &runtime_routing::RoutingEventReporter,
+    source: &str,
+    error: &str,
+) {
+    reporter.record(runtime_routing::RoutingEvent {
+        severity: "warn".to_owned(),
+        event_type: "openrouter_free_key_status_failed".to_owned(),
+        workflow_key: "routing".to_owned(),
+        provider_id: None,
+        model_id: None,
+        queue_name: None,
+        job_id: None,
+        chat_id: None,
+        thread_id: None,
+        message_id: None,
+        dedupe_key: format!("openrouter_free_key_status_failed:{source}"),
+        summary: "OpenRouter Free key status check failed".to_owned(),
+        detail: json!({ "error": error, "source": source }),
+    });
+}
+
 fn assignment_input_from_json(
     value: &serde_json::Value,
 ) -> Result<openplotva_storage::llm_routing::AssignmentInput, String> {
@@ -7932,6 +7978,7 @@ async fn admin_routing_snapshot_json(pool: &PgPool) -> Result<serde_json::Value,
                 "name": pool.name,
                 "max_concurrency": pool.max_concurrency,
                 "description": pool.description,
+                "config": pool.config,
             })
         })
         .collect();
@@ -8129,12 +8176,7 @@ async fn admin_routing_apply_action(
             json!({ "ok": true })
         }
         "create_pool" => {
-            let name = routing_json_str(body, "name").ok_or(bad("name is required".to_owned()))?;
-            let input = openplotva_storage::llm_routing::PoolInput {
-                name,
-                max_concurrency: routing_json_i32(body, "max_concurrency"),
-                description: routing_json_str(body, "description"),
-            };
+            let input = pool_input_from_json(body).map_err(bad)?;
             if input.max_concurrency.is_some_and(|max| max < 1) {
                 return Err(bad("max_concurrency must be positive or null".to_owned()));
             }
@@ -8145,12 +8187,7 @@ async fn admin_routing_apply_action(
         }
         "update_pool" => {
             let id = id_of(body).ok_or(bad("id is required".to_owned()))?;
-            let name = routing_json_str(body, "name").ok_or(bad("name is required".to_owned()))?;
-            let input = openplotva_storage::llm_routing::PoolInput {
-                name,
-                max_concurrency: routing_json_i32(body, "max_concurrency"),
-                description: routing_json_str(body, "description"),
-            };
+            let input = pool_input_from_json(body).map_err(bad)?;
             if input.max_concurrency.is_some_and(|max| max < 1) {
                 return Err(bad("max_concurrency must be positive or null".to_owned()));
             }
@@ -8288,6 +8325,88 @@ async fn admin_routing_apply_action(
                 created.push(id);
             }
             json!({ "ok": true, "created_ids": created })
+        }
+        "refresh_openrouter_free_pool" => {
+            if let Some(reporter) = routes.routing_event_reporter.as_ref() {
+                reporter.record(runtime_routing::RoutingEvent {
+                    severity: "info".to_owned(),
+                    event_type: "openrouter_free_refresh_started".to_owned(),
+                    workflow_key: "routing".to_owned(),
+                    provider_id: None,
+                    model_id: None,
+                    queue_name: None,
+                    job_id: None,
+                    chat_id: None,
+                    thread_id: None,
+                    message_id: None,
+                    dedupe_key: "openrouter_free_refresh_started:manual".to_owned(),
+                    summary: "OpenRouter Free refresh started".to_owned(),
+                    detail: json!({ "source": "admin" }),
+                });
+            }
+            let http = reqwest::Client::new();
+            match openrouter_free_pool::refresh_openrouter_free_pool(pool, &http).await {
+                Ok(report) => {
+                    if let Some(reporter) = routes.routing_event_reporter.as_ref() {
+                        reporter.record(runtime_routing::RoutingEvent {
+                            severity: "info".to_owned(),
+                            event_type: "openrouter_free_refresh_succeeded".to_owned(),
+                            workflow_key: "routing".to_owned(),
+                            provider_id: None,
+                            model_id: None,
+                            queue_name: None,
+                            job_id: None,
+                            chat_id: None,
+                            thread_id: None,
+                            message_id: None,
+                            dedupe_key: "openrouter_free_refresh_succeeded:manual".to_owned(),
+                            summary: "OpenRouter Free refresh succeeded".to_owned(),
+                            detail: json!({
+                                "active_models": report.active_models,
+                                "disabled_models": report.disabled_models,
+                                "assignments": report.assignments,
+                                "ranking_version": report.ranking_version,
+                                "source_updated_at": report.source_updated_at,
+                                "key_status_error": report.key_status_error.clone(),
+                            }),
+                        });
+                        if let Some(error) = report.key_status_error.as_deref() {
+                            record_openrouter_free_key_status_failed(reporter, "manual", error);
+                        }
+                    }
+                    json!({
+                        "ok": true,
+                        "refreshed": report.refreshed,
+                        "active_models": report.active_models,
+                        "disabled_models": report.disabled_models,
+                        "assignments": report.assignments,
+                        "ranking_version": report.ranking_version,
+                        "source_updated_at": report.source_updated_at,
+                        "key_status_error": report.key_status_error,
+                        "message": report.message,
+                    })
+                }
+                Err(error) => {
+                    if let Some(reporter) = routes.routing_event_reporter.as_ref() {
+                        reporter.record(runtime_routing::RoutingEvent {
+                            severity: "warn".to_owned(),
+                            event_type: "openrouter_free_refresh_failed".to_owned(),
+                            workflow_key: "routing".to_owned(),
+                            provider_id: None,
+                            model_id: None,
+                            queue_name: None,
+                            job_id: None,
+                            chat_id: None,
+                            thread_id: None,
+                            message_id: None,
+                            dedupe_key: "openrouter_free_refresh_failed:manual".to_owned(),
+                            summary: "OpenRouter Free refresh failed".to_owned(),
+                            detail: json!({ "error": error.to_string(), "source": "admin" }),
+                        });
+                    }
+                    return Err((StatusCode::BAD_GATEWAY, error.to_string()));
+                }
+            }
         }
         "reload" => json!({ "ok": true }),
         other => return Err(bad(format!("unknown action {other}"))),
@@ -8447,6 +8566,16 @@ async fn admin_routing_status(
         .await
         .and_then(|value| value.parse::<i64>().ok())
         .unwrap_or(0);
+    let mut openrouter_free = admin_app_setting(&routes, "llm.routing.openrouter_free.status")
+        .await
+        .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok());
+    if let Some(gate) = routes.openrouter_free_gate.as_ref() {
+        let quota = gate.status_snapshot().await;
+        let value = openrouter_free.get_or_insert_with(|| json!({}));
+        if let Some(object) = value.as_object_mut() {
+            object.insert("quota".to_owned(), quota);
+        }
+    }
     admin_json_no_cache_response(
         StatusCode::OK,
         json!({
@@ -8457,6 +8586,7 @@ async fn admin_routing_status(
             "capacity_cooldowns": capacity_cooldowns,
             "workers": workers,
             "recent_events": recent_events,
+            "openrouter_free": openrouter_free,
         }),
     )
 }
@@ -9652,6 +9782,7 @@ async fn start_runtime_workers(
         router_breakers: None,
         router_triggers: None,
         router_pools: None,
+        openrouter_free_gate: None,
         router_runtime: None,
         dialog_worker_gauge: None,
     };
@@ -9771,9 +9902,78 @@ async fn start_runtime_workers(
         ));
         tracing::warn!(%error, "failed to route memory consolidation onto the vram pool");
     }
+    match openrouter_free_pool::load_pool_config(&service_clients.postgres).await {
+        Ok(pool_config) if pool_config.refresh_on_startup => {
+            let http = reqwest::Client::new();
+            match openrouter_free_pool::refresh_openrouter_free_pool(
+                &service_clients.postgres,
+                &http,
+            )
+            .await
+            {
+                Ok(report) => {
+                    routing_event_reporter.record(runtime_routing::RoutingEvent {
+                        severity: "info".to_owned(),
+                        event_type: "openrouter_free_refresh_succeeded".to_owned(),
+                        workflow_key: "routing".to_owned(),
+                        provider_id: None,
+                        model_id: None,
+                        queue_name: None,
+                        job_id: None,
+                        chat_id: None,
+                        thread_id: None,
+                        message_id: None,
+                        dedupe_key: "openrouter_free_refresh_succeeded:startup".to_owned(),
+                        summary: "OpenRouter Free startup refresh succeeded".to_owned(),
+                        detail: json!({
+                            "active_models": report.active_models,
+                            "disabled_models": report.disabled_models,
+                            "assignments": report.assignments,
+                            "ranking_version": report.ranking_version,
+                            "source_updated_at": report.source_updated_at,
+                            "key_status_error": report.key_status_error.clone(),
+                        }),
+                    });
+                    if let Some(error) = report.key_status_error.as_deref() {
+                        record_openrouter_free_key_status_failed(
+                            &routing_event_reporter,
+                            "startup",
+                            error,
+                        );
+                    }
+                }
+                Err(error) => {
+                    routing_event_reporter.record(runtime_routing::RoutingEvent {
+                        severity: "warn".to_owned(),
+                        event_type: "openrouter_free_refresh_failed".to_owned(),
+                        workflow_key: "routing".to_owned(),
+                        provider_id: None,
+                        model_id: None,
+                        queue_name: None,
+                        job_id: None,
+                        chat_id: None,
+                        thread_id: None,
+                        message_id: None,
+                        dedupe_key: "openrouter_free_refresh_failed:startup".to_owned(),
+                        summary: "OpenRouter Free startup refresh failed".to_owned(),
+                        detail: json!({ "error": error.to_string(), "source": "startup" }),
+                    });
+                    tracing::warn!(%error, "failed to refresh OpenRouter Free pool on startup");
+                }
+            }
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::debug!(%error, "OpenRouter Free pool config unavailable; startup refresh skipped");
+        }
+    }
     let router_breakers = Arc::new(openplotva_llm::router::BreakerSet::new());
     let router_triggers = Arc::new(openplotva_llm::router::TriggerState::new());
     let router_pools = Arc::new(openplotva_llm::router::PoolRegistry::new());
+    let openrouter_free_gate = Arc::new(openrouter_free_pool::OpenRouterFreeQuotaGate::new(
+        service_clients.redis.client().clone(),
+        service_clients.postgres.clone(),
+    ));
     let router_handle = match model_routing::load_routing_table(&service_clients.postgres).await {
         Ok(table) => openplotva_llm::router::RouterHandle::new(table),
         Err(error) => {
@@ -9791,7 +9991,107 @@ async fn start_runtime_workers(
     workers.router_breakers = Some(Arc::clone(&router_breakers));
     workers.router_triggers = Some(Arc::clone(&router_triggers));
     workers.router_pools = Some(Arc::clone(&router_pools));
+    workers.openrouter_free_gate = Some(Arc::clone(&openrouter_free_gate));
     router_pools.apply(&router_handle.snapshot().pool_specs());
+    {
+        let pool = service_clients.postgres.clone();
+        let handle = Arc::clone(&router_handle);
+        let pools = Arc::clone(&router_pools);
+        let reporter = routing_event_reporter.clone();
+        let mut stop_rx = stop.subscribe();
+        workers.handles.push(tokio::spawn(async move {
+            loop {
+                let pool_config = match openrouter_free_pool::load_pool_config(&pool).await {
+                    Ok(config) => config,
+                    Err(error) => {
+                        tracing::debug!(%error, "OpenRouter Free daily refresh skipped; managed pool config unavailable");
+                        let interval = Duration::from_secs(86_400);
+                        tokio::select! {
+                            changed = stop_rx.changed() => {
+                                if changed.is_err() || *stop_rx.borrow() {
+                                    break;
+                                }
+                            }
+                            () = tokio::time::sleep(interval) => {}
+                        }
+                        continue;
+                    }
+                };
+                let interval = Duration::from_secs(pool_config.refresh_interval_seconds.max(60));
+                tokio::select! {
+                    changed = stop_rx.changed() => {
+                        if changed.is_err() || *stop_rx.borrow() {
+                            break;
+                        }
+                    }
+                    () = tokio::time::sleep(interval) => {
+                        if !pool_config.auto_refresh_enabled {
+                            continue;
+                        }
+                        let http = reqwest::Client::new();
+                        match openrouter_free_pool::refresh_openrouter_free_pool(&pool, &http).await {
+                            Ok(report) => {
+                                if let Err(error) = model_routing::reload_router(&handle, &pool).await {
+                                    reporter.record(runtime_routing::router_reload_failed_event(
+                                        "openrouter_free_daily_refresh",
+                                        &error.to_string(),
+                                    ));
+                                } else {
+                                    pools.apply(&handle.snapshot().pool_specs());
+                                }
+                                reporter.record(runtime_routing::RoutingEvent {
+                                    severity: "info".to_owned(),
+                                    event_type: "openrouter_free_refresh_succeeded".to_owned(),
+                                    workflow_key: "routing".to_owned(),
+                                    provider_id: None,
+                                    model_id: None,
+                                    queue_name: None,
+                                    job_id: None,
+                                    chat_id: None,
+                                    thread_id: None,
+                                    message_id: None,
+                                    dedupe_key: "openrouter_free_refresh_succeeded:daily".to_owned(),
+                                    summary: "OpenRouter Free daily refresh succeeded".to_owned(),
+                                    detail: json!({
+                                        "active_models": report.active_models,
+                                        "disabled_models": report.disabled_models,
+                                        "assignments": report.assignments,
+                                        "ranking_version": report.ranking_version,
+                                        "source_updated_at": report.source_updated_at,
+                                        "key_status_error": report.key_status_error.clone(),
+                                    }),
+                                });
+                                if let Some(error) = report.key_status_error.as_deref() {
+                                    record_openrouter_free_key_status_failed(
+                                        &reporter,
+                                        "daily",
+                                        error,
+                                    );
+                                }
+                            }
+                            Err(error) => {
+                                reporter.record(runtime_routing::RoutingEvent {
+                                    severity: "warn".to_owned(),
+                                    event_type: "openrouter_free_refresh_failed".to_owned(),
+                                    workflow_key: "routing".to_owned(),
+                                    provider_id: None,
+                                    model_id: None,
+                                    queue_name: None,
+                                    job_id: None,
+                                    chat_id: None,
+                                    thread_id: None,
+                                    message_id: None,
+                                    dedupe_key: "openrouter_free_refresh_failed:daily".to_owned(),
+                                    summary: "OpenRouter Free daily refresh failed".to_owned(),
+                                    detail: json!({ "error": error.to_string(), "source": "daily" }),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }));
+    }
     let update_queue =
         openplotva_updates::RedisUpdateQueue::new(service_clients.redis.client().clone());
     let update_queue_backend = config.update_queue.backend.as_str();
@@ -10157,6 +10457,7 @@ async fn start_runtime_workers(
                 Arc::clone(&router_triggers),
                 Arc::clone(&router_pools),
             )
+            .with_openrouter_free_gate(Arc::clone(&openrouter_free_gate))
             .with_reporter(routing_event_reporter.clone()),
             embedder::DiscoveryEmbedderConfig {
                 base_url: config.llm.discovery.base_url.clone(),
@@ -10176,6 +10477,7 @@ async fn start_runtime_workers(
                 Arc::clone(&router_triggers),
                 Arc::clone(&router_pools),
             )
+            .with_openrouter_free_gate(Arc::clone(&openrouter_free_gate))
             .with_reporter(routing_event_reporter.clone()),
         );
         let memory_worker_store = memory_store.clone();
@@ -10782,6 +11084,7 @@ async fn start_runtime_workers(
                 Arc::clone(&router_triggers),
                 Arc::clone(&router_pools),
             )
+            .with_openrouter_free_gate(Arc::clone(&openrouter_free_gate))
             .with_reporter(routing_event_reporter.clone()),
             embedder::DiscoveryEmbedderConfig {
                 base_url: config.llm.discovery.base_url.clone(),
@@ -10844,6 +11147,7 @@ async fn start_runtime_workers(
                     Arc::clone(&router_triggers),
                     Arc::clone(&router_pools),
                 )
+                .with_openrouter_free_gate(Arc::clone(&openrouter_free_gate))
                 .with_reporter(routing_event_reporter.clone()),
             );
             let memory_worker_store = memory_store.clone();
@@ -11083,6 +11387,7 @@ async fn start_runtime_workers(
                     Arc::clone(&router_triggers),
                     Arc::clone(&router_pools),
                 )
+                .with_openrouter_free_gate(Arc::clone(&openrouter_free_gate))
                 .with_reporter(routing_event_reporter.clone()),
                 vision::aifarm_vision_captioner_config_from_app_config(config),
                 vision_data_urls.clone(),
@@ -11101,6 +11406,7 @@ async fn start_runtime_workers(
                     Arc::clone(&router_triggers),
                     Arc::clone(&router_pools),
                 )
+                .with_openrouter_free_gate(Arc::clone(&openrouter_free_gate))
                 .with_reporter(routing_event_reporter.clone()),
                 vision::aifarm_vision_captioner_config_from_app_config(config),
                 vision_data_urls.clone(),
@@ -11127,6 +11433,7 @@ async fn start_runtime_workers(
                 Arc::clone(&router_triggers),
                 Arc::clone(&router_pools),
             )
+            .with_openrouter_free_gate(Arc::clone(&openrouter_free_gate))
             .with_reporter(routing_event_reporter.clone()),
         ),
     ) as Arc<dyn dialog_tools::ChatHistorySummarizer>);
@@ -11134,7 +11441,17 @@ async fn start_runtime_workers(
         "history_summary",
         "Chat history summary dialog tool wired to Postgres history store and routed provider",
     ));
-    let youtube_summarizer = match youtube::RuntimeYouTubeSummarizer::from_app_config(config) {
+    let youtube_summarizer = match youtube::RuntimeYouTubeSummarizer::routed_from_app_config(
+        config,
+        routed_attempts::RoutedAttemptWalker::new(
+            Arc::clone(&router_handle),
+            Arc::clone(&router_breakers),
+            Arc::clone(&router_triggers),
+            Arc::clone(&router_pools),
+        )
+        .with_openrouter_free_gate(Arc::clone(&openrouter_free_gate))
+        .with_reporter(routing_event_reporter.clone()),
+    ) {
         Ok(Some(summarizer)) => {
             let provider = summarizer.provider_label();
             readiness_checks.push(ReadinessCheck::ok(
@@ -11235,6 +11552,7 @@ async fn start_runtime_workers(
         Arc::clone(&router_triggers),
         Arc::clone(&router_pools),
     )
+    .with_openrouter_free_gate(Arc::clone(&openrouter_free_gate))
     .with_reporter(routing_event_reporter.clone());
     let memory_query_embedder = if dialog_memory_context_enabled(config) {
         Some(Arc::new(embedder::RoutedDiscoveryEmbedder::new(
@@ -11544,6 +11862,7 @@ async fn start_runtime_workers(
                 Arc::clone(&router_triggers),
                 Arc::clone(&router_pools),
             )
+            .with_openrouter_free_gate(Arc::clone(&openrouter_free_gate))
             .with_reporter(routing_event_reporter.clone()),
             config,
         ),
@@ -11569,6 +11888,7 @@ async fn start_runtime_workers(
                 Arc::clone(&router_triggers),
                 Arc::clone(&router_pools),
             )
+            .with_openrouter_free_gate(Arc::clone(&openrouter_free_gate))
             .with_reporter(routing_event_reporter.clone()),
         );
         let reasoner = registry.get(&image_agent_settings.reasoner_provider);
@@ -11613,6 +11933,7 @@ async fn start_runtime_workers(
         Arc::clone(&router_triggers),
         Arc::clone(&router_pools),
     )
+    .with_openrouter_free_gate(Arc::clone(&openrouter_free_gate))
     .with_reporter(routing_event_reporter.clone());
     let routed_vip_flux_image_generator = image_jobs::RoutedImageGenerator::new(
         image_attempt_walker.clone(),
@@ -11765,6 +12086,7 @@ async fn start_runtime_workers(
                     Arc::clone(&router_triggers),
                     Arc::clone(&router_pools),
                 )
+                .with_openrouter_free_gate(Arc::clone(&openrouter_free_gate))
                 .with_reporter(routing_event_reporter.clone()),
                 config,
             ));
@@ -11786,6 +12108,7 @@ async fn start_runtime_workers(
                     Arc::clone(&router_triggers),
                     Arc::clone(&router_pools),
                 )
+                .with_openrouter_free_gate(Arc::clone(&openrouter_free_gate))
                 .with_reporter(routing_event_reporter.clone()),
             );
             let reasoner = registry.get(&song_agent_settings.reasoner_provider);
@@ -11822,6 +12145,7 @@ async fn start_runtime_workers(
             Arc::clone(&router_triggers),
             Arc::clone(&router_pools),
         )
+        .with_openrouter_free_gate(Arc::clone(&openrouter_free_gate))
         .with_reporter(routing_event_reporter.clone());
         let music_generator = music_jobs::RoutedMusicGenerator::new(
             music_attempt_walker,
@@ -12533,6 +12857,7 @@ async fn shutdown_runtime_workers(workers: RuntimeWorkers) {
         router_breakers: _,
         router_triggers: _,
         router_pools: _,
+        openrouter_free_gate: _,
         router_runtime: _,
         dialog_worker_gauge: _,
     } = workers;
@@ -13110,7 +13435,10 @@ mod tests {
     mod routing_admin_inputs {
         use serde_json::json;
 
-        use crate::{model_input_from_json, provider_input_from_json, routing_param_descriptors};
+        use crate::{
+            model_input_from_json, pool_input_from_json, provider_input_from_json,
+            routing_param_descriptors,
+        };
 
         #[test]
         fn provider_input_accepts_typed_protocol_and_hint() {
@@ -13173,6 +13501,25 @@ mod tests {
             }))
             .expect_err("out-of-range temperature must be rejected");
             assert!(error.contains("temperature"));
+        }
+
+        #[test]
+        fn pool_input_parses_config_as_json_object() {
+            let input = pool_input_from_json(&json!({
+                "name": "openrouter-free",
+                "max_concurrency": 1,
+                "description": "free pool",
+                "config": { "managed_by": "openrouter_free_pool" },
+            }))
+            .expect("valid pool input");
+            assert_eq!(input.config["managed_by"], json!("openrouter_free_pool"));
+
+            let error = pool_input_from_json(&json!({
+                "name": "openrouter-free",
+                "config": "not an object",
+            }))
+            .expect_err("scalar pool config must be rejected");
+            assert!(error.contains("config"));
         }
 
         #[test]

@@ -58,6 +58,7 @@ pub struct PoolRecord {
     pub name: String,
     pub max_concurrency: Option<i32>,
     pub description: Option<String>,
+    pub config: Value,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -133,6 +134,7 @@ pub struct PoolInput {
     pub name: String,
     pub max_concurrency: Option<i32>,
     pub description: Option<String>,
+    pub config: Value,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -231,13 +233,11 @@ const SQL_PATCH_MODEL_CONFIG: &str =
     "UPDATE provider_models SET config = COALESCE(config, '{}'::jsonb) || $2::jsonb WHERE id = $1";
 const SQL_DELETE_MODEL: &str = "DELETE FROM provider_models WHERE id = $1";
 
-const SQL_LIST_POOLS: &str =
-    "SELECT id, name, max_concurrency, description FROM llm_capacity_pools ORDER BY id ASC";
-const SQL_INSERT_POOL: &str = "INSERT INTO llm_capacity_pools (name, max_concurrency, description) VALUES ($1, $2, $3) RETURNING id";
-const SQL_INSERT_POOL_IF_MISSING: &str = "INSERT INTO llm_capacity_pools (name, max_concurrency, description) VALUES ($1, $2, $3) ON CONFLICT (name) DO NOTHING";
-const SQL_GET_POOL_BY_NAME: &str =
-    "SELECT id, name, max_concurrency, description FROM llm_capacity_pools WHERE name = $1";
-const SQL_UPDATE_POOL: &str = "UPDATE llm_capacity_pools SET name = $2, max_concurrency = $3, description = $4, updated_at = now() WHERE id = $1";
+const SQL_LIST_POOLS: &str = "SELECT id, name, max_concurrency, description, config::text AS config FROM llm_capacity_pools ORDER BY id ASC";
+const SQL_INSERT_POOL: &str = "INSERT INTO llm_capacity_pools (name, max_concurrency, description, config) VALUES ($1, $2, $3, $4::jsonb) RETURNING id";
+const SQL_INSERT_POOL_IF_MISSING: &str = "INSERT INTO llm_capacity_pools (name, max_concurrency, description, config) VALUES ($1, $2, $3, $4::jsonb) ON CONFLICT (name) DO NOTHING";
+const SQL_GET_POOL_BY_NAME: &str = "SELECT id, name, max_concurrency, description, config::text AS config FROM llm_capacity_pools WHERE name = $1";
+const SQL_UPDATE_POOL: &str = "UPDATE llm_capacity_pools SET name = $2, max_concurrency = $3, description = $4, config = $5::jsonb, updated_at = now() WHERE id = $1";
 const SQL_DELETE_POOL: &str = "DELETE FROM llm_capacity_pools WHERE id = $1";
 
 const SQL_LIST_WORKFLOWS: &str = "SELECT key, kind, full_routing, retry_max_hops, retry_wall_ms, enabled FROM workflows ORDER BY key ASC";
@@ -368,6 +368,7 @@ fn pool_from_row(row: PgRow) -> Result<PoolRecord, StorageError> {
         name: row.try_get("name")?,
         max_concurrency: row.try_get("max_concurrency")?,
         description: row.try_get("description")?,
+        config: parse_json(row.try_get("config")?)?,
     })
 }
 
@@ -686,6 +687,7 @@ pub async fn insert_pool(pool: &PgPool, input: &PoolInput) -> Result<i64, Storag
         .bind(&input.name)
         .bind(input.max_concurrency)
         .bind(input.description.as_deref())
+        .bind(input.config.to_string())
         .fetch_one(pool)
         .await?;
     Ok(row.try_get::<i64, _>("id")?)
@@ -698,6 +700,7 @@ pub async fn insert_pool_if_missing(pool: &PgPool, input: &PoolInput) -> Result<
         .bind(&input.name)
         .bind(input.max_concurrency)
         .bind(input.description.as_deref())
+        .bind(input.config.to_string())
         .execute(pool)
         .await?;
     let row = sqlx::query(SQL_GET_POOL_BY_NAME)
@@ -713,6 +716,7 @@ pub async fn update_pool(pool: &PgPool, id: i64, input: &PoolInput) -> Result<()
         .bind(&input.name)
         .bind(input.max_concurrency)
         .bind(input.description.as_deref())
+        .bind(input.config.to_string())
         .execute(pool)
         .await?;
     Ok(())
@@ -1267,9 +1271,13 @@ mod tests {
     #[test]
     fn pool_sql_targets_capacity_pools_table() {
         assert!(SQL_LIST_POOLS.contains("FROM llm_capacity_pools"));
+        assert!(SQL_LIST_POOLS.contains("config::text AS config"));
         assert!(SQL_INSERT_POOL.contains("INSERT INTO llm_capacity_pools"));
+        assert!(SQL_INSERT_POOL.contains("$4::jsonb"));
         assert!(SQL_INSERT_POOL_IF_MISSING.contains("ON CONFLICT (name) DO NOTHING"));
+        assert!(SQL_INSERT_POOL_IF_MISSING.contains("$4::jsonb"));
         assert!(SQL_UPDATE_POOL.contains("max_concurrency = $3"));
+        assert!(SQL_UPDATE_POOL.contains("config = $5::jsonb"));
         assert!(SQL_DELETE_POOL.contains("DELETE FROM llm_capacity_pools"));
     }
 

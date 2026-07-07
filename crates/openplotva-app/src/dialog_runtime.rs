@@ -1365,6 +1365,8 @@ mod tests {
             provider_endpoint: None,
             discovery_service_name: None,
             discovery_endpoint_name: None,
+            provider_api_key_ref: None,
+            provider_api_key_encrypted: None,
             model_base_url: None,
             embedding_dim: None,
             provider_config: json!({}),
