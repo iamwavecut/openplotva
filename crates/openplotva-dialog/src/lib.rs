@@ -2684,6 +2684,10 @@ mod tests {
         assert_eq!(decision.outcome, "detected");
         assert_eq!(step.step, STEP_CURRENCY_RATES);
         assert_eq!(step.pairs, "btc eth");
+
+        let error = extract_content_tool_step(r#"<currency_rates pairs="final_response" />"#)
+            .expect_err("pairs sentinel rejected");
+        assert!(error.to_string().contains("protocol sentinel"));
         Ok(())
     }
 
