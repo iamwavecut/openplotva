@@ -5406,9 +5406,10 @@ mod tests {
     use openplotva_core::{ChatAttachment, SENDER_TYPE_USER, ToolCall};
     use openplotva_dialog::{
         DailyPersona, DialogContext, DialogMessage, DialogUser, DrawRequest, HistorySearchRequest,
-        HistorySummaryRequest, Persona, ROLE_TOOL, RatesRequest, STEP_CHAT_HISTORY_SUMMARY,
-        STEP_CURRENCY_RATES, STEP_DRAW_IMAGE, STEP_HISTORY_SEARCH, STEP_VISION_IMAGE,
-        STEP_WEB_SEARCH, TOOL_RESULT_STATUS_OK, ToolResult, VisionRequest,
+        HistorySummaryRequest, Persona, ROLE_TOOL, RatesRequest, SESSION_REACT_TO_MESSAGE_SPEC,
+        STEP_CHAT_HISTORY_SUMMARY, STEP_CURRENCY_RATES, STEP_DRAW_IMAGE, STEP_HISTORY_SEARCH,
+        STEP_REACT_TO_MESSAGE, STEP_VISION_IMAGE, STEP_WEB_SEARCH, TOOL_RESULT_STATUS_OK,
+        ToolResult, VisionRequest,
     };
 
     fn at(hour: u8, minute: u8) -> OffsetDateTime {
@@ -8186,6 +8187,51 @@ mod tests {
         assert_eq!(
             output.text, "",
             "salvaged tool markup must not leak into the chat text"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn chat_step_salvages_direct_session_tool_tags() -> Result<(), CompletionError> {
+        let (provider, _transport, _) = direct_dialog_provider(
+            json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "<react_to_message chat_id=\"-1001680667629\" emoji=\"🤣\" message_id=\"316691\" />"
+                    }
+                }]
+            }),
+            AifarmDialogConfig::default(),
+        );
+        let output = crate::ChatStepProvider::run_chat_step(
+            &provider,
+            openplotva_dialog::ChatStepRequest {
+                input: base_input(),
+                transcript: Vec::new(),
+                tools: openplotva_dialog::ToolsMode::Native(
+                    openplotva_dialog::chat_completion_tools_for_specs(&[
+                        SESSION_REACT_TO_MESSAGE_SPEC,
+                    ])
+                    .into_iter()
+                    .map(serde_json::to_value)
+                    .collect::<Result<Vec<_>, _>>()
+                    .expect("tool defs"),
+                ),
+                iteration: 1,
+            },
+        )
+        .await?;
+
+        assert_eq!(output.tool_calls.len(), 1);
+        assert!(output.tool_calls[0].salvaged);
+        assert_eq!(output.tool_calls[0].step.step, STEP_REACT_TO_MESSAGE);
+        assert_eq!(output.tool_calls[0].step.emoji, "🤣");
+        assert_eq!(output.tool_calls[0].step.target_chat_id, -1001680667629);
+        assert_eq!(output.tool_calls[0].step.target_message_id, 316691);
+        assert_eq!(
+            output.text, "",
+            "salvaged session tool markup must not leak into the chat text"
         );
         Ok(())
     }

@@ -444,6 +444,10 @@ const INLINE_TOOL_ARG_KEYS: &[&str] = &[
     "negative_prompt",
     "aspect_ratio",
     "seed",
+    "emoji",
+    "chat_id",
+    "thread_id",
+    "message_id",
 ];
 
 const INLINE_ARG_END_MARKERS: &[&str] = &[
@@ -2268,6 +2272,18 @@ fn populate_tool_args(mut lookup: impl FnMut(&str) -> Option<String>, step: &mut
     if let Some(value) = lookup("seed") {
         step.seed = value;
     }
+    if let Some(value) = lookup("emoji") {
+        step.emoji = value;
+    }
+    if let Some(value) = lookup("chat_id").and_then(|value| value.trim().parse::<i64>().ok()) {
+        step.target_chat_id = value;
+    }
+    if let Some(value) = lookup("thread_id").and_then(|value| value.trim().parse::<i64>().ok()) {
+        step.target_thread_id = value;
+    }
+    if let Some(value) = lookup("message_id").and_then(|value| value.trim().parse::<i64>().ok()) {
+        step.target_message_id = value;
+    }
 }
 
 fn extract_inline_tool_arg(args: &str, key: &str) -> Option<String> {
@@ -2820,6 +2836,26 @@ mod tests {
                     step: STEP_DRAW_IMAGE.to_owned(),
                     prompt: "cat in space".to_owned(),
                     negative_prompt: "blur".to_owned(),
+                    ..ToolStep::default()
+                },
+                "xmlish",
+            ),
+            (
+                r#"<send_message text="Working on it." />"#.to_owned(),
+                ToolStep {
+                    step: STEP_SEND_MESSAGE.to_owned(),
+                    text: "Working on it.".to_owned(),
+                    ..ToolStep::default()
+                },
+                "xmlish",
+            ),
+            (
+                r#"<react_to_message chat_id="-1001680667629" emoji="🤣" message_id="316691" />"#.to_owned(),
+                ToolStep {
+                    step: STEP_REACT_TO_MESSAGE.to_owned(),
+                    emoji: "🤣".to_owned(),
+                    target_chat_id: -1001680667629,
+                    target_message_id: 316691,
                     ..ToolStep::default()
                 },
                 "xmlish",
