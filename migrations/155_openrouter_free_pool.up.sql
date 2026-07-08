@@ -65,6 +65,7 @@ openrouter_pool AS (
           "model_cooldown_seconds": 900,
           "fallback_model": "openrouter/free",
           "target_workflows": [
+            "memory_consolidation",
             "history_summary",
             "agentic_search_reasoner",
             "agentic_search_writer",
@@ -122,6 +123,7 @@ target_workflows AS (
     SELECT key, row_number() OVER (ORDER BY key) AS fallback_order
     FROM workflows
     WHERE key IN (
+        'memory_consolidation',
         'history_summary',
         'agentic_search_reasoner',
         'agentic_search_writer',
