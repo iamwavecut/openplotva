@@ -4130,16 +4130,14 @@ fn first_choice_tool_steps(response: &Value) -> Result<ToolStepSelection, Comple
     {
         let calls =
             serde_json::from_value::<Vec<NativeToolCall>>(tool_calls.clone()).map_err(|err| {
-                Box::new(AifarmDialogError::Response(format!(
-                    "decode native tool calls: {err}"
-                ))) as CompletionError
+                tool_protocol_completion_error(format!("decode native tool calls: {err}"))
             })?;
         let mut steps = Vec::with_capacity(calls.len());
         for call in calls {
             let native_ref = Some(call.id.clone());
             let decision = native_tool_parse_decision(std::slice::from_ref(&call), None);
-            let step =
-                parse_native_tool_step(&[call]).map_err(|err| Box::new(err) as CompletionError)?;
+            let step = parse_native_tool_step(&[call])
+                .map_err(|err| tool_protocol_completion_error(err.to_string()))?;
             steps.push(PendingToolStep {
                 step,
                 decision,
@@ -4154,8 +4152,8 @@ fn first_choice_tool_steps(response: &Value) -> Result<ToolStepSelection, Comple
         .and_then(Value::as_str)
         .unwrap_or_default()
         .trim();
-    let (step, decision) =
-        extract_content_tool_step(content).map_err(|err| Box::new(err) as CompletionError)?;
+    let (step, decision) = extract_content_tool_step(content)
+        .map_err(|err| tool_protocol_completion_error(err.to_string()))?;
     if let Some(step) = step {
         Ok(ToolStepSelection::Steps(vec![PendingToolStep {
             step,
@@ -4165,6 +4163,13 @@ fn first_choice_tool_steps(response: &Value) -> Result<ToolStepSelection, Comple
     } else {
         Ok(ToolStepSelection::None(decision))
     }
+}
+
+fn tool_protocol_completion_error(message: impl Into<String>) -> CompletionError {
+    Box::new(AifarmDialogError::Response(format!(
+        "tool protocol error: {}",
+        message.into()
+    ))) as CompletionError
 }
 
 fn native_tool_parse_decision(
@@ -5993,12 +5998,25 @@ mod tests {
 
     #[tokio::test]
     async fn aifarm_memory_extractor_matches_go_request_and_decode() -> Result<(), Box<dyn Error>> {
+        let content = serde_json::to_string(&json!({
+            "episode_summary": "summary",
+            "topics": ["infra"],
+            "participants": [],
+            "candidate_cards": [],
+            "supersessions": [],
+            "resolutions": [{
+                "old_card_id": 10,
+                "decision": "reinforce",
+                "reason": "confirmed again"
+            }],
+            "links": []
+        }))?;
         let completion_payload = serde_json::to_string(&json!({
             "usage": {"prompt_tokens": 111, "completion_tokens": 22},
             "choices": [{
                 "message": {
                     "role": "assistant",
-                    "content": "{\"episode_summary\":\"summary\",\"topics\":[\"infra\"],\"participants\":[],\"candidate_cards\":[],\"supersessions\":[],\"links\":[]}"
+                    "content": content
                 }
             }]
         }))?;
@@ -6065,6 +6083,12 @@ mod tests {
 
         assert_eq!(out.episode_summary, "summary");
         assert_eq!(out.topics, vec!["infra"]);
+        assert_eq!(out.resolutions.len(), 1);
+        assert_eq!(
+            out.resolutions[0].decision,
+            openplotva_memory::ResolutionDecision::Reinforce
+        );
+        assert_eq!(out.resolutions[0].new_fact_text, "");
         assert_eq!(out.input_tokens, 111);
         assert_eq!(out.output_tokens, 22);
         let requests = transport.requests();
@@ -6106,6 +6130,11 @@ mod tests {
                 "supersessions",
                 "links"
             ])
+        );
+        assert_eq!(
+            body["response_format"]["json_schema"]["schema"]["properties"]["resolutions"]["items"]
+                ["required"],
+            json!(["old_card_id", "decision"])
         );
         assert_eq!(body["messages"][0]["role"], "system");
         assert!(
@@ -7941,6 +7970,49 @@ mod tests {
             "native step carries the tools array"
         );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn chat_step_native_tool_parse_errors_are_retryable_protocol_failures() {
+        let (provider, _transport, _toolbox) = direct_dialog_provider(
+            json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{
+                            "id": "call-bad",
+                            "type": "function",
+                            "function": {
+                                "name": "history_search (retry with shorter query)",
+                                "arguments": "{\"query\": \"CherryCherry123\"}"
+                            }
+                        }]
+                    }
+                }]
+            }),
+            AifarmDialogConfig::default(),
+        );
+
+        let error = crate::ChatStepProvider::run_chat_step(
+            &provider,
+            openplotva_dialog::ChatStepRequest {
+                input: base_input(),
+                transcript: Vec::new(),
+                tools: openplotva_dialog::ToolsMode::Native(
+                    native_tool_values(&[STEP_HISTORY_SEARCH]).expect("tool defs"),
+                ),
+                iteration: 1,
+            },
+        )
+        .await
+        .expect_err("malformed native tool call should be retryable provider protocol error");
+
+        assert_eq!(
+            crate::retry::retryable_reason(error.as_ref()),
+            Some(FailureReason::ProviderProtocolError)
+        );
+        assert!(error.to_string().contains("tool protocol error"), "{error}");
     }
 
     #[tokio::test]
