@@ -2484,7 +2484,6 @@ fn step_contains_protocol_sentinel_argument(step: &ToolStep) -> bool {
         step.query.as_str(),
         step.url.as_str(),
         step.video.as_str(),
-        step.pairs.as_str(),
         step.text.as_str(),
         step.target_lang.as_str(),
         step.window.as_str(),
@@ -2494,6 +2493,7 @@ fn step_contains_protocol_sentinel_argument(step: &ToolStep) -> bool {
         step.aspect_ratio.as_str(),
         step.seed.as_str(),
         step.emoji.as_str(),
+        step.pairs.as_str(),
     ]
     .iter()
     .any(|value| is_protocol_sentinel_value(value))
