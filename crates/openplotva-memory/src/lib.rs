@@ -489,7 +489,8 @@ pub enum ResolutionDecision {
 pub struct Resolution {
     /// Existing card being reconciled.
     pub old_card_id: i64,
-    /// Exact fact_text of the replacement candidate card.
+    /// Replacement/consolidated fact text when the chosen decision needs one.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub new_fact_text: String,
     /// Chosen reconciliation.
     #[serde(default)]
@@ -3456,6 +3457,23 @@ mod tests {
             decode_extraction_json("this is not json").err(),
             Some(DecodeExtractionError::Decode)
         );
+    }
+
+    #[test]
+    fn decode_extraction_json_accepts_resolution_decisions_without_new_fact_text() {
+        let decoded = decode_extraction_json(
+            r#"{"episode_summary":"ok","topics":[],"participants":[],"candidate_cards":[],"supersessions":[],"resolutions":[{"old_card_id":10,"decision":"reinforce","conflict_score":0.2,"reason":"confirmed"},{"old_card_id":11,"decision":"demote","reason":"weaker signal"}],"links":[]}"#,
+        )
+        .expect("decode resolutions without replacement text");
+
+        assert_eq!(decoded.resolutions.len(), 2);
+        assert_eq!(
+            decoded.resolutions[0].decision,
+            ResolutionDecision::Reinforce
+        );
+        assert_eq!(decoded.resolutions[0].new_fact_text, "");
+        assert_eq!(decoded.resolutions[1].decision, ResolutionDecision::Demote);
+        assert_eq!(decoded.resolutions[1].new_fact_text, "");
     }
 
     #[test]
