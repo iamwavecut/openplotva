@@ -434,6 +434,7 @@ const INLINE_TOOL_ARG_KEYS: &[&str] = &[
     "query",
     "url",
     "video",
+    "pairs",
     "text",
     "target_lang",
     "window",
@@ -1462,9 +1463,18 @@ pub fn parse_native_tool_step(calls: &[NativeToolCall]) -> Result<ToolStep, Tool
 pub fn extract_content_tool_step(
     raw_content: &str,
 ) -> Result<(Option<ToolStep>, ToolParseDecision), ToolParseError> {
+    let (steps, decision) = extract_content_tool_steps(raw_content)?;
+    Ok((steps.into_iter().next(), decision))
+}
+
+/// Parse model content for one or more XML-ish, inline, normalized, JSON, or
+/// bare tool calls.
+pub fn extract_content_tool_steps(
+    raw_content: &str,
+) -> Result<(Vec<ToolStep>, ToolParseDecision), ToolParseError> {
     let raw_content = raw_content.trim();
-    if let Some((step, decision)) = detect_tool_step_in(raw_content)? {
-        return Ok((Some(step), decision));
+    if let Some((steps, decision)) = detect_tool_steps_in(raw_content)? {
+        return Ok((steps, decision));
     }
     // Some backends leak a tool call as HTML-entity-encoded markup in the
     // assistant text (e.g. `&lt;tool_calls&gt;web_search{...}&lt;/tool_calls&gt;`).
@@ -1472,21 +1482,43 @@ pub fn extract_content_tool_step(
     // the markup reach the send boundary, where sanitization strips it to empty.
     let decoded = unescape_xmlish(raw_content);
     if decoded.trim() != raw_content
-        && let Some((step, decision)) = detect_tool_step_in(decoded.trim())?
+        && let Some((steps, decision)) = detect_tool_steps_in(decoded.trim())?
     {
-        return Ok((Some(step), decision));
+        return Ok((steps, decision));
     }
     if let Some(decision) = detect_ignored_tool_call(raw_content) {
-        return Ok((None, decision));
+        return Ok((Vec::new(), decision));
     }
     Ok((
-        None,
+        Vec::new(),
         ToolParseDecision {
             outcome: "none".to_owned(),
             reason: "no_tool_call".to_owned(),
             ..ToolParseDecision::default()
         },
     ))
+}
+
+fn detect_tool_steps_in(
+    content: &str,
+) -> Result<Option<(Vec<ToolStep>, ToolParseDecision)>, ToolParseError> {
+    let direct_steps = parse_xmlish_direct_tool_tag_steps(content)?;
+    if !direct_steps.is_empty() {
+        let decision = ToolParseDecision {
+            form: "xmlish".to_owned(),
+            tool: direct_steps
+                .iter()
+                .map(|step| step.step.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+            outcome: "detected".to_owned(),
+            reason: String::new(),
+        };
+        return Ok(Some((direct_steps, decision)));
+    }
+
+    detect_tool_step_in(content)
+        .map(|maybe_step| maybe_step.map(|(step, decision)| (vec![step], decision)))
 }
 
 fn detect_tool_step_in(
@@ -1567,50 +1599,18 @@ fn populate_jsonish_or_inline_args(raw: &str, step: &mut ToolStep) -> Result<(),
 }
 
 fn populate_json_map_args(map: &Map<String, Value>, step: &mut ToolStep) {
-    for (key, value) in map {
-        match (key.as_str(), value) {
-            ("step", Value::String(value)) => step.step = value.trim().to_owned(),
-            ("prompt", Value::String(value)) => step.prompt = value.clone(),
-            ("topic", Value::String(value)) => step.topic = value.clone(),
-            ("file_id", Value::String(value)) => step.file_id = value.clone(),
-            ("query", Value::String(value)) => step.query = value.clone(),
-            ("url", Value::String(value)) => step.url = value.clone(),
-            ("video", Value::String(value)) => step.video = value.clone(),
-            ("text", Value::String(value)) => step.text = value.clone(),
-            ("target_lang", Value::String(value)) => step.target_lang = value.clone(),
-            ("window", Value::String(value)) => step.window = value.clone(),
-            ("hours", Value::Number(value)) => {
-                step.hours = value
-                    .as_i64()
-                    .and_then(|value| i32::try_from(value).ok())
-                    .unwrap_or(0);
-            }
-            ("message_count", Value::Number(value)) => {
-                step.message_count = value
-                    .as_i64()
-                    .and_then(|value| i32::try_from(value).ok())
-                    .unwrap_or(0);
-            }
-            ("since", Value::String(value)) => step.since = value.clone(),
-            ("scope", Value::String(value)) => step.scope = value.clone(),
-            ("negative_prompt", Value::String(value)) => step.negative_prompt = value.clone(),
-            ("aspect_ratio", Value::String(value)) => step.aspect_ratio = value.clone(),
-            ("seed", Value::String(value)) => step.seed = value.clone(),
-            ("emoji", Value::String(value)) => step.emoji = value.clone(),
-            ("chat_id", value) => step.target_chat_id = json_i64(value),
-            ("thread_id", value) => step.target_thread_id = json_i64(value),
-            ("message_id", value) => step.target_message_id = json_i64(value),
-            _ => {}
-        }
+    if let Some(Value::String(value)) = map.get("step") {
+        step.step = value.trim().to_owned();
     }
+    populate_tool_args(|key| json_scalar_arg(map.get(key)), step);
 }
 
-/// Models pass ids as numbers or numeric strings interchangeably.
-fn json_i64(value: &Value) -> i64 {
-    match value {
-        Value::Number(number) => number.as_i64().unwrap_or(0),
-        Value::String(text) => text.trim().parse::<i64>().unwrap_or(0),
-        _ => 0,
+fn json_scalar_arg(value: Option<&Value>) -> Option<String> {
+    match value? {
+        Value::String(text) => Some(text.clone()),
+        Value::Number(number) => Some(number.to_string()),
+        Value::Bool(value) => Some(value.to_string()),
+        _ => None,
     }
 }
 
@@ -2030,21 +2030,40 @@ fn parse_xmlish_direct_tool_tag(raw: &str) -> Result<Option<ToolStep>, ToolParse
     let Some(tag) = first_xmlish_direct_tool_tag(raw) else {
         return Ok(None);
     };
-    let Some(name) = canonical_known_step(&xmlish_tool_tag_name(&tag)) else {
+    parse_xmlish_direct_tool_tag_step(&tag)
+}
+
+fn parse_xmlish_direct_tool_tag_steps(raw: &str) -> Result<Vec<ToolStep>, ToolParseError> {
+    let mut steps = Vec::new();
+    for tag in xmlish_direct_tool_tags(raw) {
+        if let Some(step) = parse_xmlish_direct_tool_tag_step(&tag)? {
+            steps.push(step);
+        }
+    }
+    Ok(steps)
+}
+
+fn parse_xmlish_direct_tool_tag_step(tag: &str) -> Result<Option<ToolStep>, ToolParseError> {
+    let Some(name) = canonical_known_step(&xmlish_tool_tag_name(tag)) else {
         return Ok(None);
     };
-    if !xmlish_direct_tool_tag_has_args(&tag, name) {
+    if !xmlish_direct_tool_tag_has_args(tag, name) {
         return Ok(None);
     }
     let mut step = ToolStep {
         step: name.to_owned(),
         ..ToolStep::default()
     };
-    populate_xmlish_tool_attrs(&tag, &mut step)?;
+    populate_xmlish_tool_attrs(tag, &mut step)?;
     normalize_and_validate_step(step).map(Some)
 }
 
 fn first_xmlish_direct_tool_tag(raw: &str) -> Option<String> {
+    xmlish_direct_tool_tags(raw).into_iter().next()
+}
+
+fn xmlish_direct_tool_tags(raw: &str) -> Vec<String> {
+    let mut tags = Vec::new();
     let mut offset = 0;
     while let Some(idx) = raw[offset..].find('<') {
         let start = offset + idx;
@@ -2052,14 +2071,16 @@ fn first_xmlish_direct_tool_tag(raw: &str) -> Option<String> {
             offset = start + 2;
             continue;
         }
-        let end = raw[start..].find('>')?;
+        let Some(end) = raw[start..].find('>') else {
+            break;
+        };
         let tag = &raw[start..start + end + 1];
         if canonical_known_step(&xmlish_tool_tag_name(tag)).is_some() {
-            return Some(tag.to_owned());
+            tags.push(tag.to_owned());
         }
-        offset = start + 1;
+        offset = start + end + 1;
     }
-    None
+    tags
 }
 
 fn xmlish_direct_tool_tag_has_args(tag: &str, step: &str) -> bool {
@@ -2432,6 +2453,7 @@ fn normalize_and_validate_step(mut step: ToolStep) -> Result<ToolStep, ToolParse
     step.query = sanitize_tool_text(&step.query);
     step.url = sanitize_tool_text(&step.url);
     step.video = sanitize_tool_text(&step.video);
+    step.pairs = sanitize_tool_text(&step.pairs);
     step.text = sanitize_tool_text(&step.text);
     step.target_lang = sanitize_tool_text(&step.target_lang);
     step.window = sanitize_tool_text(&step.window);
@@ -2462,7 +2484,6 @@ fn step_contains_protocol_sentinel_argument(step: &ToolStep) -> bool {
         step.query.as_str(),
         step.url.as_str(),
         step.video.as_str(),
-        step.pairs.as_str(),
         step.text.as_str(),
         step.target_lang.as_str(),
         step.window.as_str(),
@@ -2471,6 +2492,8 @@ fn step_contains_protocol_sentinel_argument(step: &ToolStep) -> bool {
         step.negative_prompt.as_str(),
         step.aspect_ratio.as_str(),
         step.seed.as_str(),
+        step.emoji.as_str(),
+        step.pairs.as_str(),
     ]
     .iter()
     .any(|value| is_protocol_sentinel_value(value))
@@ -2661,6 +2684,82 @@ mod tests {
         assert_eq!(decision.outcome, "detected");
         assert_eq!(step.step, STEP_CURRENCY_RATES);
         assert_eq!(step.pairs, "btc eth");
+
+        let error = extract_content_tool_step(r#"<currency_rates pairs="final_response" />"#)
+            .expect_err("pairs sentinel rejected");
+        assert!(error.to_string().contains("protocol sentinel"));
+        Ok(())
+    }
+
+    #[test]
+    fn tool_schema_args_are_recognized_by_inline_and_xmlish_arg_scanners() {
+        let mut missing = Vec::new();
+        for spec in alternative_dialog_tools()
+            .into_iter()
+            .chain([SESSION_SEND_MESSAGE_SPEC, SESSION_REACT_TO_MESSAGE_SPEC])
+        {
+            for arg in spec.args {
+                if !INLINE_TOOL_ARG_KEYS.contains(&arg.name) {
+                    missing.push(format!("{}.{}", spec.name, arg.name));
+                }
+            }
+        }
+
+        assert!(
+            missing.is_empty(),
+            "tool schema args missing from inline/xmlish scanner keys: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn tool_argument_decoders_keep_json_xmlish_and_native_shapes_in_parity()
+    -> Result<(), ToolParseError> {
+        for raw in [
+            r#"<currency_rates pairs="btc eth" />"#,
+            r#"{"tool":"currency_rates","pairs":"btc eth"}"#,
+            r#"{"tool":"currency_rates","arguments":{"pairs":"btc eth"}}"#,
+        ] {
+            let (step, decision) = extract_content_tool_step(raw)?;
+            let step = step.expect("currency_rates tool step");
+            assert_eq!(decision.outcome, "detected");
+            assert_eq!(step.step, STEP_CURRENCY_RATES);
+            assert_eq!(step.pairs, "btc eth", "raw={raw}");
+        }
+
+        let native_rates = parse_native_tool_step(&[NativeToolCall {
+            id: "call-rates".to_owned(),
+            call_type: "function".to_owned(),
+            function: NativeToolFunction {
+                name: STEP_CURRENCY_RATES.to_owned(),
+                arguments: json!({"pairs": "btc eth"}),
+            },
+        }])?;
+        assert_eq!(native_rates.pairs, "btc eth");
+
+        let (summary, _) = extract_content_tool_step(
+            r#"{"tool":"chat_history_summary","arguments":{"window":"hours","hours":"6","message_count":"120"}}"#,
+        )?;
+        let summary = summary.expect("summary tool step");
+        assert_eq!(summary.step, STEP_CHAT_HISTORY_SUMMARY);
+        assert_eq!(summary.window, "hours");
+        assert_eq!(summary.hours, 6);
+        assert_eq!(summary.message_count, 120);
+
+        let native_summary = parse_native_tool_step(&[NativeToolCall {
+            id: "call-summary".to_owned(),
+            call_type: "function".to_owned(),
+            function: NativeToolFunction {
+                name: STEP_CHAT_HISTORY_SUMMARY.to_owned(),
+                arguments: json!({
+                    "window": "hours",
+                    "hours": "6",
+                    "message_count": "120"
+                }),
+            },
+        }])?;
+        assert_eq!(native_summary.window, "hours");
+        assert_eq!(native_summary.hours, 6);
+        assert_eq!(native_summary.message_count, 120);
         Ok(())
     }
 

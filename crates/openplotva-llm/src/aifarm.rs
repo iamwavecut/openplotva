@@ -24,7 +24,7 @@ use openplotva_dialog::{
     MESSAGE_KIND_TOOL_REQUEST, MESSAGE_KIND_TOOL_RESPONSE, NativeToolCall, PROVIDER_AIFARM,
     PROVIDER_NVIDIA, PROVIDER_VMLX, ROLE_MODEL, ROLE_USER, SessionMessage, ToolParseDecision,
     ToolSpec, ToolStep, ToolsMode, alternative_dialog_tool_names, alternative_dialog_tools,
-    clone_history_messages, decode_plotva_final_response_with_salvage, extract_content_tool_step,
+    clone_history_messages, decode_plotva_final_response_with_salvage, extract_content_tool_steps,
     is_dialog_history_noise_tool_call_name, normalize_history_message, parse_native_tool_step,
     sanitize_tool_text, select_llm_history_messages_for_context, tool_telemetry,
 };
@@ -4152,14 +4152,23 @@ fn first_choice_tool_steps(response: &Value) -> Result<ToolStepSelection, Comple
         .and_then(Value::as_str)
         .unwrap_or_default()
         .trim();
-    let (step, decision) = extract_content_tool_step(content)
+    let (steps, decision) = extract_content_tool_steps(content)
         .map_err(|err| tool_protocol_completion_error(err.to_string()))?;
-    if let Some(step) = step {
-        Ok(ToolStepSelection::Steps(vec![PendingToolStep {
-            step,
-            decision,
-            native_ref: None,
-        }]))
+    if !steps.is_empty() {
+        Ok(ToolStepSelection::Steps(
+            steps
+                .into_iter()
+                .map(|step| {
+                    let mut decision = decision.clone();
+                    decision.tool = step.step.clone();
+                    PendingToolStep {
+                        step,
+                        decision,
+                        native_ref: None,
+                    }
+                })
+                .collect(),
+        ))
     } else {
         Ok(ToolStepSelection::None(decision))
     }
@@ -5407,9 +5416,9 @@ mod tests {
     use openplotva_dialog::{
         DailyPersona, DialogContext, DialogMessage, DialogUser, DrawRequest, HistorySearchRequest,
         HistorySummaryRequest, Persona, ROLE_TOOL, RatesRequest, SESSION_REACT_TO_MESSAGE_SPEC,
-        STEP_CHAT_HISTORY_SUMMARY, STEP_CURRENCY_RATES, STEP_DRAW_IMAGE, STEP_HISTORY_SEARCH,
-        STEP_REACT_TO_MESSAGE, STEP_VISION_IMAGE, STEP_WEB_SEARCH, TOOL_RESULT_STATUS_OK,
-        ToolResult, VisionRequest,
+        SESSION_SEND_MESSAGE_SPEC, STEP_CHAT_HISTORY_SUMMARY, STEP_CURRENCY_RATES, STEP_DRAW_IMAGE,
+        STEP_HISTORY_SEARCH, STEP_REACT_TO_MESSAGE, STEP_SEND_MESSAGE, STEP_VISION_IMAGE,
+        STEP_WEB_SEARCH, TOOL_RESULT_STATUS_OK, ToolResult, VisionRequest,
     };
 
     fn at(hour: u8, minute: u8) -> OffsetDateTime {
@@ -8229,6 +8238,53 @@ mod tests {
         assert_eq!(output.tool_calls[0].step.emoji, "🤣");
         assert_eq!(output.tool_calls[0].step.target_chat_id, -1001680667629);
         assert_eq!(output.tool_calls[0].step.target_message_id, 316691);
+        assert_eq!(
+            output.text, "",
+            "salvaged session tool markup must not leak into the chat text"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn chat_step_salvages_multiple_direct_session_tool_tags() -> Result<(), CompletionError> {
+        let (provider, _transport, _) = direct_dialog_provider(
+            json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "<react_to_message chat_id=\"-1001680667629\" emoji=\"🤣\" message_id=\"316691\" />\n<send_message text=\"Проверяю.\" />"
+                    }
+                }]
+            }),
+            AifarmDialogConfig::default(),
+        );
+        let output = crate::ChatStepProvider::run_chat_step(
+            &provider,
+            openplotva_dialog::ChatStepRequest {
+                input: base_input(),
+                transcript: Vec::new(),
+                tools: openplotva_dialog::ToolsMode::Native(
+                    openplotva_dialog::chat_completion_tools_for_specs(&[
+                        SESSION_REACT_TO_MESSAGE_SPEC,
+                        SESSION_SEND_MESSAGE_SPEC,
+                    ])
+                    .into_iter()
+                    .map(serde_json::to_value)
+                    .collect::<Result<Vec<_>, _>>()
+                    .expect("tool defs"),
+                ),
+                iteration: 1,
+            },
+        )
+        .await?;
+
+        assert_eq!(output.tool_calls.len(), 2);
+        assert!(output.tool_calls.iter().all(|call| call.salvaged));
+        assert_eq!(output.tool_calls[0].step.step, STEP_REACT_TO_MESSAGE);
+        assert_eq!(output.tool_calls[0].step.emoji, "🤣");
+        assert_eq!(output.tool_calls[0].step.target_message_id, 316691);
+        assert_eq!(output.tool_calls[1].step.step, STEP_SEND_MESSAGE);
+        assert_eq!(output.tool_calls[1].step.text, "Проверяю.");
         assert_eq!(
             output.text, "",
             "salvaged session tool markup must not leak into the chat text"
