@@ -68,7 +68,6 @@ impl Default for OpenRouterFreePoolConfig {
             model_cooldown_seconds: 900,
             fallback_model: FALLBACK_MODEL.to_owned(),
             target_workflows: vec![
-                "memory_consolidation".to_owned(),
                 "history_summary".to_owned(),
                 "agentic_search_reasoner".to_owned(),
                 "agentic_search_writer".to_owned(),
@@ -1248,6 +1247,18 @@ mod tests {
             memory
                 .iter()
                 .all(|assignment| assignment.role == "fallback")
+        );
+    }
+
+    #[test]
+    fn default_config_does_not_auto_target_memory_consolidation() {
+        let config = OpenRouterFreePoolConfig::default();
+
+        assert!(
+            !config
+                .target_workflows
+                .iter()
+                .any(|workflow| workflow == "memory_consolidation")
         );
     }
 

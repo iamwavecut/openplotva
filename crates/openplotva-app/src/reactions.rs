@@ -6,7 +6,14 @@
 //! custom-emoji reactions depend on per-chat admin settings, so they are
 //! deliberately out of scope here.
 
-use std::{fmt, future::Future, pin::Pin, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    fmt,
+    future::Future,
+    pin::Pin,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 use openplotva_telegram::{
     TelegramClient, TelegramOutboundMethod, build_message_reaction_clear_method,
@@ -26,7 +33,7 @@ pub const GENERATION_REACTION_TIMEOUT: Duration = Duration::from_secs(3);
 pub type GenerationReactionFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
 /// Trigger message a generation lifecycle reaction lands on.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct GenerationReactionTarget {
     pub chat_id: i64,
     pub message_id: i32,
@@ -51,12 +58,18 @@ pub type GenerationReactions = Arc<dyn GenerationReactionSink>;
 /// and replace-idempotent, so dedup/rate machinery would only add latency).
 pub struct GenerationReactionSignaler {
     client: TelegramClient,
+    suppressed_chats: Mutex<HashMap<i64, Instant>>,
+    suppressed_targets: Mutex<HashMap<GenerationReactionTarget, Instant>>,
 }
 
 impl GenerationReactionSignaler {
     #[must_use]
     pub fn new(client: TelegramClient) -> Self {
-        Self { client }
+        Self {
+            client,
+            suppressed_chats: Mutex::new(HashMap::new()),
+            suppressed_targets: Mutex::new(HashMap::new()),
+        }
     }
 
     async fn execute(
@@ -65,6 +78,9 @@ impl GenerationReactionSignaler {
         phase: &'static str,
         method: TelegramOutboundMethod,
     ) {
+        if self.is_suppressed(target, Instant::now()) {
+            return;
+        }
         let result = tokio::time::timeout(
             GENERATION_REACTION_TIMEOUT,
             execute_telegram_method(&self.client, method),
@@ -78,14 +94,125 @@ impl GenerationReactionSignaler {
                 GENERATION_REACTION_TIMEOUT.as_secs()
             ),
         };
-        tracing::warn!(
-            chat_id = target.chat_id,
-            message_id = target.message_id,
-            phase,
-            %error,
-            "generation reaction update failed"
-        );
+        match classify_generation_reaction_error(phase, &error) {
+            GenerationReactionFailureAction::Ignore => {
+                tracing::debug!(
+                    chat_id = target.chat_id,
+                    message_id = target.message_id,
+                    phase,
+                    %error,
+                    "generation reaction update ignored"
+                );
+            }
+            GenerationReactionFailureAction::SuppressTarget => {
+                self.suppress_target(target, Instant::now());
+                tracing::warn!(
+                    chat_id = target.chat_id,
+                    message_id = target.message_id,
+                    phase,
+                    %error,
+                    "generation reaction target suppressed after terminal error"
+                );
+            }
+            GenerationReactionFailureAction::SuppressChat => {
+                self.suppress_chat(target.chat_id, Instant::now());
+                tracing::warn!(
+                    chat_id = target.chat_id,
+                    message_id = target.message_id,
+                    phase,
+                    %error,
+                    "generation reaction chat suppressed after terminal error"
+                );
+            }
+            GenerationReactionFailureAction::Warn => {
+                tracing::warn!(
+                    chat_id = target.chat_id,
+                    message_id = target.message_id,
+                    phase,
+                    %error,
+                    "generation reaction update failed"
+                );
+            }
+        }
     }
+
+    fn is_suppressed(&self, target: GenerationReactionTarget, now: Instant) -> bool {
+        let cutoff = now.checked_sub(GENERATION_REACTION_SUPPRESS_FOR);
+        let chat_suppressed = {
+            let mut suppressed = self
+                .suppressed_chats
+                .lock()
+                .expect("reaction chat suppression lock");
+            prune_suppressed(&mut suppressed, cutoff);
+            suppressed.contains_key(&target.chat_id)
+        };
+        if chat_suppressed {
+            return true;
+        }
+
+        let mut suppressed = self
+            .suppressed_targets
+            .lock()
+            .expect("reaction target suppression lock");
+        prune_suppressed(&mut suppressed, cutoff);
+        suppressed.contains_key(&target)
+    }
+
+    fn suppress_chat(&self, chat_id: i64, now: Instant) {
+        self.suppressed_chats
+            .lock()
+            .expect("reaction chat suppression lock")
+            .insert(chat_id, now);
+    }
+
+    fn suppress_target(&self, target: GenerationReactionTarget, now: Instant) {
+        self.suppressed_targets
+            .lock()
+            .expect("reaction target suppression lock")
+            .insert(target, now);
+    }
+}
+
+const GENERATION_REACTION_SUPPRESS_FOR: Duration = Duration::from_secs(10 * 60);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GenerationReactionFailureAction {
+    Warn,
+    Ignore,
+    SuppressTarget,
+    SuppressChat,
+}
+
+fn classify_generation_reaction_error(
+    phase: &'static str,
+    error: &str,
+) -> GenerationReactionFailureAction {
+    if error.contains("CHAT_WRITE_FORBIDDEN") || error.contains("REACTION_INVALID") {
+        return GenerationReactionFailureAction::SuppressChat;
+    }
+    if contains_ascii_fold(error, "message to react not found") {
+        return GenerationReactionFailureAction::SuppressTarget;
+    }
+    if phase == "clear" && error.contains("REACTION_EMPTY") {
+        return GenerationReactionFailureAction::Ignore;
+    }
+    GenerationReactionFailureAction::Warn
+}
+
+fn prune_suppressed<K>(suppressed: &mut HashMap<K, Instant>, cutoff: Option<Instant>)
+where
+    K: Eq + std::hash::Hash,
+{
+    let Some(cutoff) = cutoff else {
+        return;
+    };
+    suppressed.retain(|_, seen_at| *seen_at >= cutoff);
+}
+
+fn contains_ascii_fold(haystack: &str, needle: &str) -> bool {
+    haystack
+        .to_ascii_lowercase()
+        .contains(&needle.to_ascii_lowercase())
 }
 
 impl fmt::Debug for GenerationReactionSignaler {
@@ -247,5 +374,41 @@ mod tests {
         // edit does not swap in an emoji Telegram will reject.
         assert_eq!(GENERATION_QUEUED_REACTION_EMOJI, "👀");
         assert_eq!(GENERATION_PROGRESS_REACTION_EMOJI, "✍");
+    }
+
+    #[test]
+    fn reaction_error_classifier_suppresses_terminal_telegram_rejections() {
+        assert_eq!(
+            classify_generation_reaction_error(
+                "queued",
+                "failed to execute method: description=Bad Request: CHAT_WRITE_FORBIDDEN"
+            ),
+            GenerationReactionFailureAction::SuppressChat
+        );
+        assert_eq!(
+            classify_generation_reaction_error(
+                "progress",
+                "failed to execute method: description=Bad Request: REACTION_INVALID"
+            ),
+            GenerationReactionFailureAction::SuppressChat
+        );
+        assert_eq!(
+            classify_generation_reaction_error(
+                "progress",
+                "failed to execute method: description=Bad Request: message to react not found"
+            ),
+            GenerationReactionFailureAction::SuppressTarget
+        );
+        assert_eq!(
+            classify_generation_reaction_error(
+                "clear",
+                "failed to execute method: description=Bad Request: REACTION_EMPTY"
+            ),
+            GenerationReactionFailureAction::Ignore
+        );
+        assert_eq!(
+            classify_generation_reaction_error("progress", "setMessageReaction timed out after 3s"),
+            GenerationReactionFailureAction::Warn
+        );
     }
 }

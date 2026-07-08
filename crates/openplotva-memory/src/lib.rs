@@ -383,6 +383,7 @@ fn coarse_card_age(created: Option<OffsetDateTime>, as_of: OffsetDateTime) -> St
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct ExtractOutput {
     /// Episode summary.
+    #[serde(default)]
     pub episode_summary: String,
     /// Topic labels.
     #[serde(default)]
@@ -3494,6 +3495,20 @@ mod tests {
             .err(),
             Some(DecodeExtractionError::Decode)
         );
+    }
+
+    #[test]
+    fn decode_extraction_json_salvages_truncated_cards_without_summary() {
+        // Some structured-output backends return an object clipped inside
+        // candidate_cards before episode_summary is emitted. Keep the complete
+        // card prefix instead of rejecting the whole batch.
+        let truncated = r#"{"candidate_cards":[{"card_type":"preference","confidence":0.8,"fact_text":"Участник C△stor Troy купил матрасик для сна в машине.","object":"event","predicate":"occurred","salience":0.0,"scope_type":"chat","source_entry_ids":[],"source_message_ids":[38845],"subject":"C△stor Troy","user_id":123456789},{"card_type":"preference","confidence":0.8,"fact_text":"Участник C△stor Troy планирует стать таксистом.","object":"preference","predicate":"future","salience":0.0,"scope_type":"chat","source_entry_ids":[],"source_message_ids":[39250],"subject":"C△stor Troy","user_id":123456789}"#;
+        let salvaged = decode_extraction_json(truncated).expect("salvaged");
+
+        assert_eq!(salvaged.episode_summary, "");
+        assert_eq!(salvaged.candidate_cards.len(), 2);
+        assert_eq!(salvaged.candidate_cards[0].subject, "C△stor Troy");
+        assert_eq!(salvaged.candidate_cards[1].source_message_ids, vec![39250]);
     }
 
     #[test]

@@ -20,10 +20,12 @@ use openplotva_taskman::{
     StatelessJobItem, control_job_params_from_stateless_job, new_control_job_at,
 };
 use openplotva_telegram::{
-    ChatRef, DispatcherConfig, DispatcherQueue, InlineKeyboardMarkup, OutboundBuildError,
-    ReplyMarkup, ReplyMessageRef, RichMessageRequest, TELEGRAM_PARSE_MODE_HTML,
-    TelegramOutboundMethod, TextMessageRequest, build_checkin_theme_selection_keyboard,
-    format_rich_html,
+    ChatRef, DispatcherConfig, DispatcherQueue, InlineKeyboardMarkup, OUTBOUND_SEND_MAX_ATTEMPTS,
+    OutboundBuildError, OutboundSendErrorClass, ReplyMarkup, ReplyMessageRef, RichMessageRequest,
+    TELEGRAM_PARSE_MODE_HTML, TelegramOutboundExecuteError, TelegramOutboundMethod,
+    TelegramOutboundResponse, TextMessageRequest, build_checkin_theme_selection_keyboard,
+    execute_telegram_method_with_rich, format_rich_html, replay_outbound_method,
+    snapshot_outbound_method,
 };
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -51,6 +53,7 @@ const MAX_ANIMATION_JITTER_MS: usize = 3000;
 const DEFAULT_THEME_KEY: &str = "king";
 const CHECKIN_EPHEMERAL_TIMEOUT: Duration = Duration::from_secs(30);
 const NEW_CHAT_WARMUP_WINDOW: time::Duration = time::Duration::hours(24);
+const CHECKIN_DIRECT_RETRY_AFTER_INLINE_CAP_SECS: u64 = 15;
 
 /// Boxed future returned by check-in control-job queue calls.
 pub type CheckinControlJobQueueFuture<'a, E> =
@@ -862,20 +865,33 @@ async fn send_queued_checkin_items(
         .dequeue_immediate()
         .or_else(|| queue.dequeue_regular());
     while let Some(item) = next {
+        let metadata = item.metadata();
+        let virtual_id = metadata.virtual_id.clone();
+        let chat_id = metadata.chat_id;
         let report = if let Some(ephemeral) = ephemeral {
             send_work_item_with_ephemeral(
                 ephemeral,
                 item,
                 OffsetDateTime::now_utc(),
                 |method| async move {
-                    openplotva_telegram::execute_telegram_method_with_rich(telegram, rich, method)
-                        .await
+                    send_checkin_method_with_retry(
+                        method,
+                        &virtual_id,
+                        chat_id,
+                        |method| async move {
+                            execute_telegram_method_with_rich(telegram, rich, method).await
+                        },
+                    )
+                    .await
                 },
             )
             .await
         } else {
             send_work_item(item, |method| async move {
-                openplotva_telegram::execute_telegram_method_with_rich(telegram, rich, method).await
+                send_checkin_method_with_retry(method, &virtual_id, chat_id, |method| async move {
+                    execute_telegram_method_with_rich(telegram, rich, method).await
+                })
+                .await
             })
             .await
         };
@@ -890,6 +906,59 @@ async fn send_queued_checkin_items(
             .or_else(|| queue.dequeue_regular());
     }
     Ok(first_message_id)
+}
+
+async fn send_checkin_method_with_retry<Send, SendFuture>(
+    method: TelegramOutboundMethod,
+    virtual_id: &str,
+    chat_id: i64,
+    mut send: Send,
+) -> Result<TelegramOutboundResponse, TelegramOutboundExecuteError>
+where
+    Send: FnMut(TelegramOutboundMethod) -> SendFuture,
+    SendFuture: Future<Output = Result<TelegramOutboundResponse, TelegramOutboundExecuteError>>,
+{
+    let snapshot = snapshot_outbound_method(&method);
+    let mut current = method;
+    let mut attempt: u32 = 1;
+    loop {
+        let error = match send(current).await {
+            Ok(response) => return Ok(response),
+            Err(error) => error,
+        };
+        let class = error.classification();
+        let delay = match class {
+            OutboundSendErrorClass::RetryableRateLimited { retry_after_secs }
+                if retry_after_secs <= CHECKIN_DIRECT_RETRY_AFTER_INLINE_CAP_SECS =>
+            {
+                Duration::from_secs(retry_after_secs)
+            }
+            OutboundSendErrorClass::RetryableTransient => {
+                Duration::from_millis(500).saturating_mul(attempt)
+            }
+            _ => return Err(error),
+        };
+        if attempt >= OUTBOUND_SEND_MAX_ATTEMPTS {
+            return Err(error);
+        }
+        let Some(replayed) = snapshot
+            .as_ref()
+            .and_then(|(kind, bytes)| replay_outbound_method(*kind, bytes))
+        else {
+            return Err(error);
+        };
+        tracing::warn!(
+            virtual_id,
+            chat_id,
+            attempt,
+            class = class.as_str(),
+            error = %error,
+            "retrying direct check-in Telegram send"
+        );
+        tokio::time::sleep(delay).await;
+        current = replayed;
+        attempt += 1;
+    }
 }
 
 fn checkin_chat_ref(message: CheckinGameMessage) -> ChatRef {
@@ -3384,6 +3453,60 @@ mod tests {
         assert!(sender.sent_html()[0].contains("🏁 Сегодня мы играли в <b>Чиновник дня</b>"));
         assert!(sender.sent_html()[0].contains("<a href='tg://user?id=101'>@alice</a>"));
         Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn direct_checkin_send_retries_telegram_retry_after_within_cap() {
+        let attempts = Arc::new(Mutex::new(0usize));
+        let sent_texts = Arc::new(Mutex::new(Vec::new()));
+        let method = openplotva_telegram::TelegramOutboundMethod::from(
+            carapax::types::SendMessage::new(42, "today winner"),
+        );
+
+        let result = send_checkin_method_with_retry(method, "checkin-vmsg-test", 42, {
+            let attempts = Arc::clone(&attempts);
+            let sent_texts = Arc::clone(&sent_texts);
+            move |method| {
+                let attempts = Arc::clone(&attempts);
+                let sent_texts = Arc::clone(&sent_texts);
+                async move {
+                    let openplotva_telegram::TelegramOutboundMethod::SendMessage(send) = &method
+                    else {
+                        panic!("expected sendMessage method");
+                    };
+                    let payload = serde_json::to_value(send.as_ref()).expect("send payload");
+                    sent_texts
+                        .lock()
+                        .expect("sent texts")
+                        .push(payload["text"].as_str().unwrap_or_default().to_owned());
+
+                    let mut attempts = attempts.lock().expect("attempts");
+                    *attempts += 1;
+                    if *attempts == 1 {
+                        Err(openplotva_telegram::TelegramOutboundExecuteError::from(
+                            openplotva_telegram::RichApiError::Api {
+                                code: 429,
+                                description: "Too Many Requests: retry after 14".to_owned(),
+                                retry_after: Some(14),
+                            },
+                        ))
+                    } else {
+                        Ok(openplotva_telegram::TelegramOutboundResponse::Boolean(true))
+                    }
+                }
+            }
+        })
+        .await;
+
+        assert!(matches!(
+            result,
+            Ok(openplotva_telegram::TelegramOutboundResponse::Boolean(true))
+        ));
+        assert_eq!(*attempts.lock().expect("attempts"), 2);
+        assert_eq!(
+            *sent_texts.lock().expect("sent texts"),
+            vec!["today winner".to_owned(), "today winner".to_owned()]
+        );
     }
 
     #[tokio::test]

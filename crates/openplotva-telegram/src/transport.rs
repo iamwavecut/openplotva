@@ -591,6 +591,7 @@ fn is_empty_text_send_error(message: &str) -> bool {
 fn is_permission_send_error(message: &str) -> bool {
     message.contains("not enough rights")
         || message.contains("CHAT_WRITE_FORBIDDEN")
+        || (message.contains("CHAT_SEND_") && message.contains("_FORBIDDEN"))
         || message.contains("have no rights to send a message")
 }
 
@@ -1152,6 +1153,11 @@ mod tests {
                 true,
             ),
             (
+                response_error(400, "Bad Request: CHAT_SEND_PHOTOS_FORBIDDEN")?,
+                "insufficient rights",
+                true,
+            ),
+            (
                 response_error(400, "Bad Request: message text is empty")?,
                 "bad request: text must be non-empty",
                 false,
@@ -1266,6 +1272,15 @@ mod tests {
                 RichApiError::Api {
                     code: 403,
                     description: "Forbidden: bot was blocked by the user".to_owned(),
+                    retry_after: None,
+                }
+                .into(),
+                OutboundSendErrorClass::TerminalPermission,
+            ),
+            (
+                RichApiError::Api {
+                    code: 400,
+                    description: "Bad Request: CHAT_SEND_PHOTOS_FORBIDDEN".to_owned(),
                     retry_after: None,
                 }
                 .into(),
