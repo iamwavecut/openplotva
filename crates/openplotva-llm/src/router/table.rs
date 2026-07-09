@@ -28,6 +28,7 @@ pub enum Kind {
     Image,
     Music,
     PrivacyFilter,
+    Asr,
 }
 
 impl Kind {
@@ -42,8 +43,19 @@ impl Kind {
             "image" => Some(Self::Image),
             "music" => Some(Self::Music),
             "privacy_filter" => Some(Self::PrivacyFilter),
+            "asr" => Some(Self::Asr),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Kind;
+
+    #[test]
+    fn parses_asr_kind_from_database_value() {
+        assert_eq!(Kind::from_db("asr"), Some(Kind::Asr));
     }
 }
 

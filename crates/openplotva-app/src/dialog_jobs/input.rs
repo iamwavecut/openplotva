@@ -24,6 +24,7 @@ use openplotva_taskman::DialogJobParams;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::{
+    asr::DialogAsrInputMaterializer,
     dialog_context::{
         build_dialog_shield_query_text, dialog_memory_retrieval_request,
         dialog_reference_context_from_memory,
@@ -119,6 +120,7 @@ pub struct PostgresDialogInputMaterializer {
     shield_embedder: Option<Arc<dyn EmbeddingProvider>>,
     shield_options: ShieldOptions,
     shield_history_tail_messages: usize,
+    asr: Option<Arc<dyn DialogAsrInputMaterializer>>,
     vision: Option<Arc<dyn DialogVisionInputMaterializer>>,
     bot: DialogBotIdentity,
 }
@@ -143,6 +145,7 @@ impl PostgresDialogInputMaterializer {
             shield_embedder: None,
             shield_options: ShieldOptions::default(),
             shield_history_tail_messages: 0,
+            asr: None,
             vision: None,
             bot,
         }
@@ -190,6 +193,12 @@ impl PostgresDialogInputMaterializer {
         vision: Arc<dyn DialogVisionInputMaterializer>,
     ) -> Self {
         self.vision = Some(vision);
+        self
+    }
+
+    #[must_use]
+    pub fn with_asr_materializer(mut self, asr: Arc<dyn DialogAsrInputMaterializer>) -> Self {
+        self.asr = Some(asr);
         self
     }
 }
@@ -294,6 +303,9 @@ impl PostgresDialogInputMaterializer {
         );
         input.reference_context = reference_context;
         input.shield_context = shield_context;
+        if let Some(asr) = self.asr.as_ref() {
+            input = asr.materialize_dialog_asr_input(input, now).await;
+        }
         if let Some(vision) = self.vision.as_ref() {
             input = vision.materialize_dialog_vision_input(input, now).await;
         }

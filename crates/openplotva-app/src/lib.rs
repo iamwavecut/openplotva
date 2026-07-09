@@ -3,6 +3,7 @@
 pub mod activity;
 pub mod admin;
 pub mod agent_runtime;
+pub mod asr;
 pub mod callbacks;
 pub mod checkin;
 pub mod control_jobs;
@@ -9876,6 +9877,14 @@ async fn start_runtime_workers(
         ));
         tracing::warn!(%error, "failed to backfill Boogu image slot workflows");
     }
+    if let Err(error) = model_routing::backfill_asr_routing(&service_clients.postgres, config).await
+    {
+        routing_event_reporter.record(runtime_routing::routing_backfill_failed_event(
+            "backfill_asr_routing",
+            &error.to_string(),
+        ));
+        tracing::warn!(%error, "failed to backfill ASR routing rows");
+    }
     if let Err(error) = model_routing::backfill_provider_protocols(&service_clients.postgres).await
     {
         routing_event_reporter.record(runtime_routing::routing_backfill_failed_event(
@@ -11417,6 +11426,30 @@ async fn start_runtime_workers(
         vision_data_urls.clone(),
         dialog_context::dialog_vision_direct_image_limit(Some(config.vision.direct_image_limit)),
     ));
+    let asr_budget = Duration::from_secs(120);
+    let dialog_context_asr: Arc<dyn asr::DialogAsrInputMaterializer> =
+        Arc::new(asr::TelegramDialogAsrInputMaterializer::new(
+            PostgresTelegramFileStore::new(service_clients.postgres.clone()),
+            asr::TelegramClientVoiceDownloader::new(telegram.clone()),
+            asr::RoutedAsrTranscriber::new(
+                routed_attempts::RoutedAttemptWalker::new(
+                    Arc::clone(&router_handle),
+                    Arc::clone(&router_breakers),
+                    Arc::clone(&router_triggers),
+                    Arc::clone(&router_pools),
+                )
+                .with_reporter(routing_event_reporter.clone()),
+                asr::DiscoveryAsrConfig {
+                    base_url: config.llm.discovery.base_url.clone(),
+                    service_name: asr::DEFAULT_ASR_DISCOVERY_SERVICE_NAME.to_owned(),
+                    endpoint_name: asr::DEFAULT_ASR_DISCOVERY_ENDPOINT_NAME.to_owned(),
+                    request_timeout: asr_budget,
+                    task_timeout: asr_budget,
+                    poll_interval: Duration::from_millis(100),
+                    capacity_wait: Duration::from_secs(2),
+                },
+            ),
+        ));
     let rates_fetcher = Arc::new(
         rates::MarketRatesClient::from_config(&config.market_rates)
             .context("failed to initialize market rates provider")?,
@@ -11676,6 +11709,8 @@ async fn start_runtime_workers(
                     dialog_materializer = dialog_materializer.with_shield_embedder(embedder);
                 }
             }
+            dialog_materializer =
+                dialog_materializer.with_asr_materializer(Arc::clone(&dialog_context_asr));
             dialog_materializer =
                 dialog_materializer.with_vision_materializer(dialog_context_vision);
             let safe_dialog_toolbox: Arc<dyn openplotva_dialog::DialogToolbox> = Arc::new(
