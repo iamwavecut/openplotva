@@ -945,6 +945,13 @@ mod tests {
         calls: Arc<Mutex<Vec<Vec<u8>>>>,
     }
 
+    fn is_fresh_processing_record(record: &TelegramFileRecord, now: OffsetDateTime) -> bool {
+        record.asr_status == TELEGRAM_FILE_ASR_STATUS_PROCESSING
+            && record
+                .asr_requested_at
+                .is_some_and(|requested_at| requested_at >= now - time::Duration::minutes(10))
+    }
+
     impl TelegramFileAsrStore for FakeStore {
         type Error = String;
 
@@ -966,10 +973,8 @@ mod tests {
             Box::pin(async move {
                 let mut record = self.record.lock().expect("lock");
                 if record.file_unique_id != file_unique_id
-                    || matches!(
-                        record.asr_status.as_str(),
-                        TELEGRAM_FILE_ASR_STATUS_PROCESSING | TELEGRAM_FILE_ASR_STATUS_COMPLETED
-                    )
+                    || record.asr_status == TELEGRAM_FILE_ASR_STATUS_COMPLETED
+                    || is_fresh_processing_record(&record, requested_at)
                 {
                     return Ok(None);
                 }
@@ -1160,6 +1165,7 @@ mod tests {
         let now = OffsetDateTime::from_unix_timestamp(1_770_000_000).expect("timestamp");
         let mut record = voice_record(now);
         record.asr_status = TELEGRAM_FILE_ASR_STATUS_PROCESSING.to_owned();
+        record.asr_requested_at = Some(now);
         let store = FakeStore {
             record: Arc::new(Mutex::new(record)),
             updates: Arc::new(Mutex::new(Vec::new())),
@@ -1183,6 +1189,47 @@ mod tests {
         assert!(store.updates.lock().expect("lock").is_empty());
         assert!(downloader.calls.lock().expect("lock").is_empty());
         assert!(transcriber.calls.lock().expect("lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn materializer_reclaims_stale_processing_claim() {
+        let now = OffsetDateTime::from_unix_timestamp(1_770_000_000).expect("timestamp");
+        let mut record = voice_record(now);
+        record.asr_status = TELEGRAM_FILE_ASR_STATUS_PROCESSING.to_owned();
+        record.asr_requested_at = Some(now - time::Duration::minutes(11));
+        let store = FakeStore {
+            record: Arc::new(Mutex::new(record)),
+            updates: Arc::new(Mutex::new(Vec::new())),
+        };
+        let downloader = FakeDownloader::default();
+        let transcriber = FakeTranscriber {
+            result: Ok(transcript("reclaimed voice text")),
+            calls: Arc::new(Mutex::new(Vec::new())),
+        };
+        let materializer = TelegramDialogAsrInputMaterializer::new(
+            store.clone(),
+            downloader.clone(),
+            transcriber.clone(),
+        );
+
+        let input = materializer
+            .materialize_dialog_asr_input(dialog_input_with_voice(), now)
+            .await;
+
+        assert_eq!(input.message.text, "reclaimed voice text");
+        assert_eq!(
+            downloader.calls.lock().expect("lock").as_slice(),
+            ["voice-file"]
+        );
+        assert_eq!(
+            transcriber.calls.lock().expect("lock").as_slice(),
+            [vec![1, 2, 3]]
+        );
+        let updates = store.updates.lock().expect("lock").clone();
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[0].asr_status, "processing");
+        assert_eq!(updates[0].asr_requested_at, Some(now));
+        assert_eq!(updates[1].asr_status, "completed");
     }
 
     #[tokio::test]
