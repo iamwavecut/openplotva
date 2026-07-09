@@ -771,6 +771,8 @@ pub const SQL_UPDATE_TELEGRAM_FILE_VISION: &str = "UPDATE telegram_files SET vis
 
 pub const SQL_UPDATE_TELEGRAM_FILE_ASR: &str = "UPDATE telegram_files SET asr_status = $2, asr_text = COALESCE($3, asr_text), asr_provider = COALESCE($4, asr_provider), asr_model = COALESCE($5, asr_model), asr_latency_ms = COALESCE($6, asr_latency_ms), asr_error = $7, asr_requested_at = COALESCE($8, asr_requested_at), asr_completed_at = COALESCE($9, asr_completed_at), updated_at = CURRENT_TIMESTAMP WHERE file_unique_id = $1 RETURNING file_unique_id, latest_file_id, media_kind, mime_type, width, height, file_size, first_seen_chat_id, first_seen_message_id, last_seen_chat_id, last_seen_message_id, last_seen_at, vision_status, vision_caption, vision_model, vision_latency_ms, recognition_requested_at, recognition_completed_at, asr_status, asr_text, asr_provider, asr_model, asr_latency_ms, asr_error, asr_requested_at, asr_completed_at, COALESCE(extra::text, '{}') AS extra, created_at, updated_at";
 
+pub const SQL_CLAIM_TELEGRAM_FILE_ASR_PROCESSING: &str = "UPDATE telegram_files SET asr_status = 'processing', asr_error = NULL, asr_requested_at = COALESCE($2, asr_requested_at), updated_at = CURRENT_TIMESTAMP WHERE file_unique_id = $1 AND asr_status NOT IN ('processing', 'completed') RETURNING file_unique_id, latest_file_id, media_kind, mime_type, width, height, file_size, first_seen_chat_id, first_seen_message_id, last_seen_chat_id, last_seen_message_id, last_seen_at, vision_status, vision_caption, vision_model, vision_latency_ms, recognition_requested_at, recognition_completed_at, asr_status, asr_text, asr_provider, asr_model, asr_latency_ms, asr_error, asr_requested_at, asr_completed_at, COALESCE(extra::text, '{}') AS extra, created_at, updated_at";
+
 pub const SQL_GET_CHAT_DISCOVERED: &str = "SELECT discovered FROM chats WHERE id = $1";
 
 pub const SQL_RECORD_CHAT_DAILY_WINNER: &str = "INSERT INTO chat_game_results (chat_id, user_id, theme) VALUES ($1, $2, $3) RETURNING id, chat_id, user_id, theme, won_at, won_on_date";
@@ -4108,6 +4110,19 @@ impl PostgresTelegramFileStore {
             .fetch_one(&self.pool)
             .await?;
         telegram_file_from_row(row)
+    }
+
+    pub async fn claim_asr_processing(
+        &self,
+        file_unique_id: &str,
+        requested_at: OffsetDateTime,
+    ) -> Result<Option<TelegramFileRecord>, StorageError> {
+        let row = sqlx::query(SQL_CLAIM_TELEGRAM_FILE_ASR_PROCESSING)
+            .bind(file_unique_id)
+            .bind(requested_at)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(telegram_file_from_row).transpose()
     }
 }
 
@@ -9933,6 +9948,11 @@ mod tests {
                 && super::SQL_GET_TELEGRAM_FILE.contains("asr_text")
         );
         assert!(super::SQL_UPDATE_TELEGRAM_FILE_ASR.contains("asr_text = COALESCE($3, asr_text)"));
+        assert!(
+            super::SQL_CLAIM_TELEGRAM_FILE_ASR_PROCESSING
+                .contains("asr_status NOT IN ('processing', 'completed')")
+        );
+        assert!(super::SQL_CLAIM_TELEGRAM_FILE_ASR_PROCESSING.contains("RETURNING file_unique_id"));
     }
 
     #[test]

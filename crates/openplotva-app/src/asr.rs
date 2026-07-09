@@ -21,7 +21,7 @@ use openplotva_llm::{
 pub use openplotva_storage::TelegramFileAsrUpdate;
 use openplotva_storage::{
     PostgresTelegramFileStore, TELEGRAM_FILE_ASR_STATUS_COMPLETED, TELEGRAM_FILE_ASR_STATUS_FAILED,
-    TELEGRAM_FILE_ASR_STATUS_PROCESSING, TelegramFileRecord,
+    TelegramFileRecord,
 };
 use openplotva_telegram::TelegramClient;
 use serde::{Deserialize, Serialize};
@@ -40,6 +40,8 @@ const ASR_DISCOVERY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const ASR_DISCOVERY_CAPACITY_WAIT: Duration = Duration::from_secs(2);
 
 pub type TelegramFileAsrGetFuture<'a, Error> =
+    Pin<Box<dyn Future<Output = Result<Option<TelegramFileRecord>, Error>> + Send + 'a>>;
+pub type TelegramFileAsrClaimFuture<'a, Error> =
     Pin<Box<dyn Future<Output = Result<Option<TelegramFileRecord>, Error>> + Send + 'a>>;
 pub type TelegramFileAsrUpdateFuture<'a, Error> =
     Pin<Box<dyn Future<Output = Result<TelegramFileRecord, Error>> + Send + 'a>>;
@@ -63,6 +65,12 @@ pub trait TelegramFileAsrStore {
     fn get_file<'a>(&'a self, file_unique_id: &'a str)
     -> TelegramFileAsrGetFuture<'a, Self::Error>;
 
+    fn claim_asr_processing<'a>(
+        &'a self,
+        file_unique_id: &'a str,
+        requested_at: OffsetDateTime,
+    ) -> TelegramFileAsrClaimFuture<'a, Self::Error>;
+
     fn update_asr<'a>(
         &'a self,
         params: &'a TelegramFileAsrUpdate,
@@ -77,6 +85,18 @@ impl TelegramFileAsrStore for PostgresTelegramFileStore {
         file_unique_id: &'a str,
     ) -> TelegramFileAsrGetFuture<'a, Self::Error> {
         Box::pin(PostgresTelegramFileStore::get_file(self, file_unique_id))
+    }
+
+    fn claim_asr_processing<'a>(
+        &'a self,
+        file_unique_id: &'a str,
+        requested_at: OffsetDateTime,
+    ) -> TelegramFileAsrClaimFuture<'a, Self::Error> {
+        Box::pin(PostgresTelegramFileStore::claim_asr_processing(
+            self,
+            file_unique_id,
+            requested_at,
+        ))
     }
 
     fn update_asr<'a>(
@@ -678,13 +698,14 @@ where
                 return input;
             }
 
-            if let Err(error) = self.mark_processing(&record, now).await {
-                tracing::warn!(
-                    error = error.to_string(),
-                    file_unique_id = record.file_unique_id,
-                    "failed to mark Telegram voice ASR as processing"
-                );
-            }
+            let Some(record) = self.claim_processing(&record, now).await else {
+                if let Some(record) = self.lookup_record(&candidate.file_unique_id).await
+                    && let Some(text) = cached_asr_text(&record)
+                {
+                    apply_transcript(&mut input, candidate.attachment_index, &text);
+                }
+                return input;
+            };
 
             let latest_file_id = record.latest_file_id.trim();
             if latest_file_id.is_empty() {
@@ -748,19 +769,26 @@ where
         }
     }
 
-    async fn mark_processing(
+    async fn claim_processing(
         &self,
         record: &TelegramFileRecord,
         now: OffsetDateTime,
-    ) -> Result<TelegramFileRecord, Store::Error> {
-        self.store
-            .update_asr(&TelegramFileAsrUpdate {
-                file_unique_id: record.file_unique_id.clone(),
-                asr_status: TELEGRAM_FILE_ASR_STATUS_PROCESSING.to_owned(),
-                asr_requested_at: Some(now),
-                ..TelegramFileAsrUpdate::default()
-            })
+    ) -> Option<TelegramFileRecord> {
+        match self
+            .store
+            .claim_asr_processing(&record.file_unique_id, now)
             .await
+        {
+            Ok(record) => record,
+            Err(error) => {
+                tracing::warn!(
+                    error = error.to_string(),
+                    file_unique_id = record.file_unique_id,
+                    "failed to claim Telegram voice ASR processing"
+                );
+                None
+            }
+        }
     }
 
     async fn mark_failed_best_effort(&self, record: &TelegramFileRecord, error: &str) {
@@ -863,11 +891,24 @@ fn cached_asr_text(record: &TelegramFileRecord) -> Option<String> {
 }
 
 fn apply_transcript(input: &mut DialogInput, attachment_index: usize, text: &str) {
-    input.message.text = text.to_owned();
-    input.message.normalized = text.to_owned();
+    let materialized = merge_existing_text_with_transcript(&input.message.text, text);
+    input.message.text.clone_from(&materialized);
+    input.message.normalized = materialized;
     if let Some(attachment) = input.message.meta.attachments.get_mut(attachment_index) {
         attachment.content = text.to_owned();
     }
+}
+
+fn merge_existing_text_with_transcript(existing: &str, transcript: &str) -> String {
+    let existing = existing.trim();
+    let transcript = transcript.trim();
+    if existing.is_empty() || existing == transcript {
+        return transcript.to_owned();
+    }
+    if transcript.is_empty() {
+        return existing.to_owned();
+    }
+    format!("{existing}\n\n{transcript}")
 }
 
 #[cfg(test)]
@@ -880,7 +921,8 @@ mod tests {
     use openplotva_core::{ChatAttachment, ChatMessageMeta};
     use openplotva_dialog::{DialogContext, DialogInput, DialogMessage};
     use openplotva_storage::{
-        TELEGRAM_FILE_ASR_STATUS_COMPLETED, TELEGRAM_FILE_ASR_STATUS_PENDING, TelegramFileRecord,
+        TELEGRAM_FILE_ASR_STATUS_COMPLETED, TELEGRAM_FILE_ASR_STATUS_PENDING,
+        TELEGRAM_FILE_ASR_STATUS_PROCESSING, TelegramFileRecord,
     };
     use time::OffsetDateTime;
 
@@ -913,6 +955,35 @@ mod tests {
             Box::pin(async move {
                 let record = self.record.lock().expect("lock").clone();
                 Ok((record.file_unique_id == file_unique_id).then_some(record))
+            })
+        }
+
+        fn claim_asr_processing<'a>(
+            &'a self,
+            file_unique_id: &'a str,
+            requested_at: OffsetDateTime,
+        ) -> TelegramFileAsrClaimFuture<'a, Self::Error> {
+            Box::pin(async move {
+                let mut record = self.record.lock().expect("lock");
+                if record.file_unique_id != file_unique_id
+                    || matches!(
+                        record.asr_status.as_str(),
+                        TELEGRAM_FILE_ASR_STATUS_PROCESSING | TELEGRAM_FILE_ASR_STATUS_COMPLETED
+                    )
+                {
+                    return Ok(None);
+                }
+                record.asr_status = TELEGRAM_FILE_ASR_STATUS_PROCESSING.to_owned();
+                record.asr_error = None;
+                record.asr_requested_at = Some(requested_at);
+                let update = TelegramFileAsrUpdate {
+                    file_unique_id: record.file_unique_id.clone(),
+                    asr_status: record.asr_status.clone(),
+                    asr_requested_at: record.asr_requested_at,
+                    ..TelegramFileAsrUpdate::default()
+                };
+                self.updates.lock().expect("lock").push(update);
+                Ok(Some(record.clone()))
             })
         }
 
@@ -1053,6 +1124,65 @@ mod tests {
         assert_eq!(updates[1].asr_text.as_deref(), Some("fresh voice text"));
         assert_eq!(updates[1].asr_provider.as_deref(), Some("gigaam"));
         assert_eq!(updates[1].asr_model.as_deref(), Some("gigaam-v3"));
+    }
+
+    #[tokio::test]
+    async fn materializer_preserves_existing_message_caption_with_transcript() {
+        let now = OffsetDateTime::from_unix_timestamp(1_770_000_000).expect("timestamp");
+        let store = FakeStore {
+            record: Arc::new(Mutex::new(voice_record(now))),
+            updates: Arc::new(Mutex::new(Vec::new())),
+        };
+        let materializer = TelegramDialogAsrInputMaterializer::new(
+            store,
+            FakeDownloader::default(),
+            FakeTranscriber {
+                result: Ok(transcript("fresh voice text")),
+                calls: Arc::new(Mutex::new(Vec::new())),
+            },
+        );
+        let mut input = dialog_input_with_voice();
+        input.message.text = "caption text".to_owned();
+        input.message.normalized = "caption text".to_owned();
+
+        let input = materializer.materialize_dialog_asr_input(input, now).await;
+
+        assert_eq!(input.message.text, "caption text\n\nfresh voice text");
+        assert_eq!(input.message.normalized, "caption text\n\nfresh voice text");
+        assert_eq!(
+            input.message.meta.attachments[0].content,
+            "fresh voice text"
+        );
+    }
+
+    #[tokio::test]
+    async fn materializer_does_not_duplicate_work_when_processing_claim_is_lost() {
+        let now = OffsetDateTime::from_unix_timestamp(1_770_000_000).expect("timestamp");
+        let mut record = voice_record(now);
+        record.asr_status = TELEGRAM_FILE_ASR_STATUS_PROCESSING.to_owned();
+        let store = FakeStore {
+            record: Arc::new(Mutex::new(record)),
+            updates: Arc::new(Mutex::new(Vec::new())),
+        };
+        let downloader = FakeDownloader::default();
+        let transcriber = FakeTranscriber {
+            result: Ok(transcript("unused")),
+            calls: Arc::new(Mutex::new(Vec::new())),
+        };
+        let materializer = TelegramDialogAsrInputMaterializer::new(
+            store.clone(),
+            downloader.clone(),
+            transcriber.clone(),
+        );
+
+        let input = materializer
+            .materialize_dialog_asr_input(dialog_input_with_voice(), now)
+            .await;
+
+        assert!(input.message.text.is_empty());
+        assert!(store.updates.lock().expect("lock").is_empty());
+        assert!(downloader.calls.lock().expect("lock").is_empty());
+        assert!(transcriber.calls.lock().expect("lock").is_empty());
     }
 
     #[tokio::test]
