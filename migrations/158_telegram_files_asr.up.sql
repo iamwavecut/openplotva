@@ -1,6 +1,9 @@
+-- Forward compatibility: all ASR fields are nullable except asr_status, which
+-- defaults to 'pending', so existing telegram_files rows remain readable and
+-- inserts that do not know about ASR keep working.
 ALTER TABLE telegram_files
-    ADD COLUMN IF NOT EXISTS asr_status TEXT NOT NULL DEFAULT 'pending',
-    ADD COLUMN IF NOT EXISTS asr_text TEXT,
+  ADD COLUMN IF NOT EXISTS asr_status TEXT NOT NULL DEFAULT 'pending',
+  ADD COLUMN IF NOT EXISTS asr_text TEXT,
     ADD COLUMN IF NOT EXISTS asr_provider TEXT,
     ADD COLUMN IF NOT EXISTS asr_model TEXT,
     ADD COLUMN IF NOT EXISTS asr_latency_ms INTEGER,
