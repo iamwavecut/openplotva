@@ -98,7 +98,8 @@ pub const DEFAULT_BOT_WEBHOOK_UPDATE_BUFFER_SIZE: usize = 10_000;
 
 pub const DEFAULT_TELEGRAM_ACTIVITY_PULSE_ENABLED: bool = true;
 
-pub const DEFAULT_TELEGRAM_ACTIVITY_PULSE_INTERVAL_MS: i32 = 4_000;
+/// Product-tuned Telegram chat-action cadence: one Bot API action every 8s.
+pub const DEFAULT_TELEGRAM_ACTIVITY_PULSE_INTERVAL_MS: i32 = 8_000;
 
 pub const DEFAULT_TELEGRAM_ACTIVITY_PULSE_INITIAL_DELAY_MS: i32 = 0;
 
@@ -3877,6 +3878,15 @@ mod tests {
             MIN_TELEGRAM_ACTIVITY_PULSE_INTERVAL_MS
         );
         assert_eq!(config.bot.activity_pulse.initial_delay_ms, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn telegram_activity_pulse_default_interval_is_eight_seconds() -> Result<(), super::ConfigError>
+    {
+        let config = AppConfig::from_raw(RawConfig::default())?;
+
+        assert_eq!(config.bot.activity_pulse.interval_ms, 8_000);
         Ok(())
     }
 
