@@ -282,23 +282,57 @@ impl DiscoveryAsrClient {
             wait_for_capacity_ms: duration_ms(self.cfg.capacity_wait),
             capacity_poll_ms: duration_ms(self.cfg.poll_interval),
         };
-        let envelope = self.submit(&job_request).await?;
+        let deadline = Instant::now() + self.cfg.task_timeout.max(Duration::from_secs(1));
+        let envelope = self
+            .with_deadline(self.submit(&job_request), deadline, &job_id)
+            .await?;
         let mut job = envelope.resolve_job();
         let resolved_id = first_non_empty(&job.resolved_id(), &job_id);
-        let deadline = Instant::now() + self.cfg.task_timeout.max(Duration::from_secs(1));
         loop {
             if let Some(response) = terminal_response(&job)? {
                 return decode_asr_response(&response);
             }
-            if Instant::now() >= deadline {
-                return Err(AsrClientError::Discovery(format!(
-                    "discovery job {resolved_id} did not complete within {:?}",
-                    self.cfg.task_timeout
-                )));
-            }
-            tokio::time::sleep(self.cfg.poll_interval).await;
-            job = self.poll(&resolved_id).await?.resolve_job();
+            let remaining = self.remaining_budget(deadline, &resolved_id)?;
+            tokio::time::sleep(self.cfg.poll_interval.min(remaining)).await;
+            job = self
+                .with_deadline(self.poll(&resolved_id), deadline, &resolved_id)
+                .await?
+                .resolve_job();
         }
+    }
+
+    async fn with_deadline<T, Fut>(
+        &self,
+        future: Fut,
+        deadline: Instant,
+        job_id: &str,
+    ) -> Result<T, AsrClientError>
+    where
+        Fut: Future<Output = Result<T, AsrClientError>>,
+    {
+        let remaining = self.remaining_budget(deadline, job_id)?;
+        match tokio::time::timeout(remaining, future).await {
+            Ok(result) => result,
+            Err(_) => Err(self.deadline_error(job_id)),
+        }
+    }
+
+    fn remaining_budget(
+        &self,
+        deadline: Instant,
+        job_id: &str,
+    ) -> Result<Duration, AsrClientError> {
+        deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| self.deadline_error(job_id))
+    }
+
+    fn deadline_error(&self, job_id: &str) -> AsrClientError {
+        AsrClientError::Discovery(format!(
+            "discovery job {job_id} did not complete within {:?}",
+            self.cfg.task_timeout
+        ))
     }
 
     async fn submit(
@@ -654,6 +688,8 @@ where
 
             let latest_file_id = record.latest_file_id.trim();
             if latest_file_id.is_empty() {
+                self.mark_failed_best_effort(&record, "missing latest Telegram file id")
+                    .await;
                 return input;
             }
             let audio = match self.downloader.download_voice(latest_file_id).await {
@@ -836,7 +872,10 @@ fn apply_transcript(input: &mut DialogInput, attachment_index: usize, text: &str
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::{
+        future,
+        sync::{Arc, Mutex},
+    };
 
     use openplotva_core::{ChatAttachment, ChatMessageMeta};
     use openplotva_dialog::{DialogContext, DialogInput, DialogMessage};
@@ -1042,6 +1081,72 @@ mod tests {
         assert_eq!(updates.len(), 2);
         assert_eq!(updates[1].asr_status, "failed");
         assert_eq!(updates[1].asr_error.as_deref(), Some("asr down"));
+    }
+
+    #[tokio::test]
+    async fn materializer_marks_missing_latest_file_id_as_failed() {
+        let now = OffsetDateTime::from_unix_timestamp(1_770_000_000).expect("timestamp");
+        let mut record = voice_record(now);
+        record.latest_file_id.clear();
+        let store = FakeStore {
+            record: Arc::new(Mutex::new(record)),
+            updates: Arc::new(Mutex::new(Vec::new())),
+        };
+        let downloader = FakeDownloader::default();
+        let transcriber = FakeTranscriber {
+            result: Ok(transcript("unused")),
+            calls: Arc::new(Mutex::new(Vec::new())),
+        };
+        let materializer = TelegramDialogAsrInputMaterializer::new(
+            store.clone(),
+            downloader.clone(),
+            transcriber.clone(),
+        );
+
+        let input = materializer
+            .materialize_dialog_asr_input(dialog_input_with_voice(), now)
+            .await;
+
+        assert!(input.message.text.is_empty());
+        assert!(downloader.calls.lock().expect("lock").is_empty());
+        assert!(transcriber.calls.lock().expect("lock").is_empty());
+        let updates = store.updates.lock().expect("lock").clone();
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[0].asr_status, "processing");
+        assert_eq!(updates[1].asr_status, "failed");
+        assert_eq!(
+            updates[1].asr_error.as_deref(),
+            Some("missing latest Telegram file id")
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_client_deadline_wraps_pending_work() {
+        let client = DiscoveryAsrClient::new(DiscoveryAsrConfig {
+            base_url: "http://127.0.0.1:1".to_owned(),
+            service_name: DEFAULT_ASR_DISCOVERY_SERVICE_NAME.to_owned(),
+            endpoint_name: DEFAULT_ASR_DISCOVERY_ENDPOINT_NAME.to_owned(),
+            request_timeout: Duration::from_secs(5),
+            task_timeout: Duration::from_millis(1),
+            poll_interval: Duration::from_millis(1),
+            capacity_wait: Duration::from_millis(1),
+        })
+        .expect("client");
+
+        let error = client
+            .with_deadline(
+                future::pending::<Result<(), AsrClientError>>(),
+                Instant::now() + Duration::from_millis(1),
+                "asr-job",
+            )
+            .await
+            .expect_err("deadline");
+
+        assert!(
+            error
+                .to_string()
+                .contains("discovery job asr-job did not complete")
+        );
     }
 
     fn dialog_input_with_voice() -> DialogInput {
