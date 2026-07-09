@@ -4110,10 +4110,9 @@ fn evaluate_draw_api_status(status: &DrawApiJobStatus) -> DrawApiWaitDecision {
     }
     if is_failure_status(&status.status) {
         return DrawApiWaitDecision::Failed(
-            status
-                .error
-                .clone()
-                .unwrap_or_else(|| "job failed".to_owned()),
+            status.error.clone().unwrap_or_else(|| {
+                "draw job failed without detail: service unavailable".to_owned()
+            }),
         );
     }
     if is_queued_status(&status.status) || is_running_status(&status.status) {
@@ -6086,6 +6085,24 @@ mod tests {
         assert_eq!(images.images, vec![vec![1, 2, 3]]);
         assert_eq!(urls.urls, vec!["https://img.test/1.png"]);
         assert_eq!(string_image.images, vec![vec![4, 5]]);
+    }
+
+    #[test]
+    fn draw_api_failed_without_detail_is_retryable_provider_failure() {
+        let status = DrawApiJobStatus {
+            status: "failed".to_owned(),
+            error: None,
+            result: None,
+        };
+
+        let DrawApiWaitDecision::Failed(message) = evaluate_draw_api_status(&status) else {
+            panic!("terminal failed status must fail");
+        };
+
+        assert_eq!(
+            openplotva_llm::retry::retryable_reason_from_message(&format!("job failed: {message}")),
+            Some(openplotva_llm::retry::FailureReason::ProviderUnavailable)
+        );
     }
 
     #[tokio::test]
