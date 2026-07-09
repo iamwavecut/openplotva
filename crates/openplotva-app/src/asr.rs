@@ -14,7 +14,7 @@ use openplotva_dialog::DialogInput;
 use openplotva_llm::{
     aifarm::{
         DiscoveryInvocation, DiscoveryJob, DiscoveryJobEnvelope, DiscoveryJobRequest,
-        DiscoveryJobResponse,
+        DiscoveryJobResponse, decode_discovery_body,
     },
     retry::FailureReason,
 };
@@ -608,8 +608,7 @@ fn terminal_response(job: &DiscoveryJob) -> Result<Option<DiscoveryJobResponse>,
 
 fn decode_asr_response(response: &DiscoveryJobResponse) -> Result<AsrTranscript, AsrClientError> {
     if response.status_code != 0 && response.status_code != 200 {
-        let body = general_purpose::STANDARD
-            .decode(response.body.as_bytes())
+        let body = decode_discovery_body(&response.body)
             .ok()
             .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
             .unwrap_or_else(|| response.body.clone());
@@ -618,8 +617,7 @@ fn decode_asr_response(response: &DiscoveryJobResponse) -> Result<AsrTranscript,
             detail: body,
         });
     }
-    let raw = general_purpose::STANDARD
-        .decode(response.body.as_bytes())
+    let raw = decode_discovery_body(&response.body)
         .map_err(|error| AsrClientError::Discovery(format!("decode response body: {error}")))?;
     let decoded: AsrServiceResponse = serde_json::from_slice(&raw)
         .map_err(|error| AsrClientError::Discovery(format!("decode ASR response: {error}")))?;
@@ -1324,6 +1322,23 @@ mod tests {
                 .to_string()
                 .contains("discovery job asr-job did not complete")
         );
+    }
+
+    #[test]
+    fn decode_asr_response_accepts_url_safe_discovery_body() {
+        let payload = r#"{"text":"Процесс биологической экспансии завершён.","engine":"gigaam","model":"gigaam-v3","latency_ms":123}"#;
+        let response = DiscoveryJobResponse {
+            status_code: 200,
+            body: general_purpose::URL_SAFE_NO_PAD.encode(payload),
+            content_type: "application/json".to_owned(),
+        };
+
+        let decoded = decode_asr_response(&response).expect("decode url-safe ASR body");
+
+        assert_eq!(decoded.text, "Процесс биологической экспансии завершён.");
+        assert_eq!(decoded.provider, "gigaam");
+        assert_eq!(decoded.model, "gigaam-v3");
+        assert_eq!(decoded.latency_ms, 123);
     }
 
     fn dialog_input_with_voice() -> DialogInput {
