@@ -36,6 +36,9 @@ use crate::permissions::{ChatPermissionPolicy, ChatPermissionStore};
 use crate::routed_attempts::{
     RoutedAttempt, RoutedAttemptRunError, RoutedAttemptWalker, RoutedRequestContext,
 };
+use crate::telegram_activity::{
+    TelegramActivityAction, TelegramActivityPulse, TelegramActivitySnapshot,
+};
 
 pub const MUSIC_JOB_POLL_INTERVAL: StdDuration = StdDuration::from_secs(1);
 pub const MUSIC_JOB_WORKER_QUEUES: [&str; 1] = [MUSIC_VIP_QUEUE_NAME];
@@ -988,6 +991,7 @@ pub struct MusicQueuePollReport {
     pub job_id: Option<i64>,
     pub outcome: MusicQueuePollOutcome,
     pub error: Option<String>,
+    pub activity: TelegramActivitySnapshot,
 }
 
 /// Aggregate report from music worker.
@@ -1003,6 +1007,45 @@ pub struct MusicWorkerRunReport {
     pub decode_failed: u64,
     pub idle: u64,
     pub errors: u64,
+    pub activity_pulses_sent: u64,
+    pub activity_pulse_failures: u64,
+    pub activity_pulse_skips: u64,
+}
+
+#[derive(Clone, Copy)]
+pub struct MusicQueuePollOptions<'a> {
+    pub max_llm_job_attempts: i32,
+    pub activity_pulse: Option<&'a TelegramActivityPulse>,
+    pub now: OffsetDateTime,
+}
+
+impl MusicQueuePollOptions<'_> {
+    #[must_use]
+    pub const fn at(now: OffsetDateTime) -> Self {
+        Self {
+            max_llm_job_attempts: DEFAULT_LLM_JOB_MAX_ATTEMPTS,
+            activity_pulse: None,
+            now,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct MusicWorkerRunOptions<'a> {
+    pub interval: StdDuration,
+    pub max_llm_job_attempts: i32,
+    pub activity_pulse: Option<&'a TelegramActivityPulse>,
+}
+
+impl MusicWorkerRunOptions<'_> {
+    #[must_use]
+    pub const fn every(interval: StdDuration) -> Self {
+        Self {
+            interval,
+            max_llm_job_attempts: DEFAULT_LLM_JOB_MAX_ATTEMPTS,
+            activity_pulse: None,
+        }
+    }
 }
 
 impl MusicWorkerRunReport {
@@ -1023,6 +1066,9 @@ impl MusicWorkerRunReport {
         if report.error.is_some() {
             self.errors += 1;
         }
+        self.activity_pulses_sent += report.activity.sent;
+        self.activity_pulse_failures += report.activity.failed;
+        self.activity_pulse_skips += report.activity.skipped;
     }
 }
 
@@ -1152,8 +1198,7 @@ where
         material_provider,
         generator,
         effects,
-        DEFAULT_LLM_JOB_MAX_ATTEMPTS,
-        now,
+        MusicQueuePollOptions::at(now),
     )
     .await
 }
@@ -1165,15 +1210,14 @@ pub async fn run_music_queue_once_with_max_attempts<MaterialProvider, Generator,
     material_provider: &MaterialProvider,
     generator: &Generator,
     effects: &Effects,
-    max_llm_job_attempts: i32,
-    now: OffsetDateTime,
+    options: MusicQueuePollOptions<'_>,
 ) -> MusicQueuePollReport
 where
     MaterialProvider: SongMaterialProvider + Sync,
     Generator: MusicGenerator + Sync,
     Effects: MusicJobEffects + Sync,
 {
-    let Some(work) = queue.dequeue_matching(queue_name, MUSIC_WORKER_ID, now, |job| {
+    let Some(work) = queue.dequeue_matching(queue_name, MUSIC_WORKER_ID, options.now, |job| {
         job.data.job_type == JobType::MusicGen
     }) else {
         return MusicQueuePollReport {
@@ -1181,6 +1225,7 @@ where
             job_id: None,
             outcome: MusicQueuePollOutcome::Idle,
             error: None,
+            activity: TelegramActivitySnapshot::default(),
         };
     };
 
@@ -1188,18 +1233,30 @@ where
         Ok(params) => params,
         Err(error) => {
             let error = error.to_string();
-            let _ = queue.fail(work.id, error.clone(), now);
+            let _ = queue.fail(work.id, error.clone(), options.now);
             return MusicQueuePollReport {
                 queue_name: queue_name.to_owned(),
                 job_id: Some(work.id),
                 outcome: MusicQueuePollOutcome::DecodeFailed,
                 error: Some(error),
+                activity: TelegramActivitySnapshot::default(),
             };
         }
     };
 
-    let _ = queue.set_execution_started(work.id, now);
+    let _ = queue.set_execution_started(work.id, options.now);
+    let activity_guard = options.activity_pulse.map(|pulse| {
+        pulse.start(
+            params.chat_id,
+            params.thread_id,
+            TelegramActivityAction::UploadDocumentForAudio,
+        )
+    });
     let execution = execute_music_gen_job(material_provider, generator, effects, params).await;
+    let activity = activity_guard
+        .as_ref()
+        .map_or_else(TelegramActivitySnapshot::default, |guard| guard.snapshot());
+    drop(activity_guard);
     let finished_at = OffsetDateTime::now_utc();
     match execution.outcome {
         MusicJobExecutionOutcome::Completed => {
@@ -1209,6 +1266,7 @@ where
                 work.id,
                 queue_name,
                 MusicQueuePollOutcome::Completed,
+                activity,
                 finished_at,
             )
         }
@@ -1217,6 +1275,7 @@ where
             work.id,
             queue_name,
             MusicQueuePollOutcome::SkippedPermission,
+            activity,
             finished_at,
         ),
         MusicJobExecutionOutcome::Failed => {
@@ -1228,7 +1287,8 @@ where
                 &work,
                 queue_name,
                 &error,
-                max_llm_job_attempts,
+                options.max_llm_job_attempts,
+                activity.clone(),
                 finished_at,
             ) {
                 return report;
@@ -1239,6 +1299,7 @@ where
                 job_id: Some(work.id),
                 outcome: MusicQueuePollOutcome::Failed,
                 error: Some(error),
+                activity,
             }
         }
     }
@@ -1250,6 +1311,7 @@ fn retry_or_exhaust_music_job(
     queue_name: &str,
     error: &str,
     max_llm_job_attempts: i32,
+    activity: TelegramActivitySnapshot,
     now: OffsetDateTime,
 ) -> Option<MusicQueuePollReport> {
     let reason = openplotva_llm::retry::retryable_reason_from_message(error)?;
@@ -1282,6 +1344,7 @@ fn retry_or_exhaust_music_job(
             job_id: Some(work.id),
             outcome: MusicQueuePollOutcome::RetryExhausted,
             error: Some(error.to_owned()),
+            activity,
         });
     }
     queue.requeue_job_to_queue(work.id, &target_queue).ok()?;
@@ -1290,6 +1353,7 @@ fn retry_or_exhaust_music_job(
         job_id: Some(work.id),
         outcome: MusicQueuePollOutcome::RetryRequeued,
         error: None,
+        activity,
     })
 }
 
@@ -1373,8 +1437,7 @@ where
         material_provider,
         generator,
         effects,
-        interval,
-        DEFAULT_LLM_JOB_MAX_ATTEMPTS,
+        MusicWorkerRunOptions::every(interval),
         stop,
     )
     .await
@@ -1391,8 +1454,7 @@ pub async fn run_music_worker_every_until_with_max_attempts<
     material_provider: &MaterialProvider,
     generator: &Generator,
     effects: &Effects,
-    interval: StdDuration,
-    max_llm_job_attempts: i32,
+    options: MusicWorkerRunOptions<'_>,
     stop: Stop,
 ) -> MusicWorkerRunReport
 where
@@ -1406,7 +1468,7 @@ where
     loop {
         tokio::select! {
             () = &mut stop => break,
-            () = tokio::time::sleep(interval) => {
+            () = tokio::time::sleep(options.interval) => {
                 for queue_name in MUSIC_JOB_WORKER_QUEUES {
                     let tick = run_music_queue_once_with_max_attempts(
                         queue,
@@ -1414,8 +1476,11 @@ where
                         material_provider,
                         generator,
                         effects,
-                        max_llm_job_attempts,
-                        OffsetDateTime::now_utc(),
+                        MusicQueuePollOptions {
+                            max_llm_job_attempts: options.max_llm_job_attempts,
+                            activity_pulse: options.activity_pulse,
+                            now: OffsetDateTime::now_utc(),
+                        },
                     ).await;
                     trace_music_queue_tick(&tick);
                     report.record_poll(&tick);
@@ -1661,6 +1726,7 @@ fn finalize_music_completed(
     job_id: i64,
     queue_name: &str,
     outcome: MusicQueuePollOutcome,
+    activity: TelegramActivitySnapshot,
     now: OffsetDateTime,
 ) -> MusicQueuePollReport {
     let error = queue
@@ -1672,6 +1738,7 @@ fn finalize_music_completed(
         job_id: Some(job_id),
         outcome,
         error,
+        activity,
     }
 }
 
@@ -1683,6 +1750,14 @@ fn trace_music_queue_tick(tick: &MusicQueuePollReport) {
         queue_name = tick.queue_name,
         job_id = tick.job_id,
         outcome = ?tick.outcome,
+        activity_action = tick
+            .activity
+            .action
+            .map(|action| action.as_telegram_action()),
+        activity_pulses_sent = tick.activity.sent,
+        activity_pulse_failures = tick.activity.failed,
+        activity_pulse_skips = tick.activity.skipped,
+        activity_pulse_last_error = tick.activity.last_error.as_deref(),
         error = tick.error.as_deref(),
         "processed music generation taskman worker tick"
     );
@@ -1744,8 +1819,9 @@ mod tests {
     };
 
     use openplotva_taskman::{
-        HIGHEST_PRIORITY, JobStatus, LLM_JOB_RETRY_EXHAUSTED_STAGE, LLM_JOB_RETRY_STAGE,
-        MUSIC_VIP_QUEUE_NAME, MusicGenJobParams, TaskQueueJobEvent, new_music_gen_job_at,
+        DEFAULT_LLM_JOB_MAX_ATTEMPTS, HIGHEST_PRIORITY, JobStatus, LLM_JOB_RETRY_EXHAUSTED_STAGE,
+        LLM_JOB_RETRY_STAGE, MUSIC_VIP_QUEUE_NAME, MusicGenJobParams, TaskQueueJobEvent,
+        new_music_gen_job_at,
     };
     use serde_json::json;
     use time::OffsetDateTime;
@@ -1754,12 +1830,69 @@ mod tests {
         AifarmSongMaterialProvider, FallbackSongPromptGenerator, GeneratedSongAudio,
         GeneratedSongSendPlan, HeuristicSongMaterialProvider, MusicGenerationError,
         MusicGenerationFuture, MusicGenerationRequest, MusicGenerator, MusicJobEffectFuture,
-        MusicJobEffects, MusicJobExecutionOutcome, MusicQueuePollOutcome, MusicReferenceAudio,
-        NoSongLanguageHintStore, SongLanguageHintFuture, SongLanguageHintStore,
-        SongMaterialProvider, SongPromptFuture, SongPromptGenerator,
+        MusicJobEffects, MusicJobExecutionOutcome, MusicQueuePollOptions, MusicQueuePollOutcome,
+        MusicReferenceAudio, NoSongLanguageHintStore, SongLanguageHintFuture,
+        SongLanguageHintStore, SongMaterialProvider, SongPromptFuture, SongPromptGenerator,
         build_song_caption_with_support, build_song_release_prompt, execute_music_gen_job,
         music_job_topic, run_music_queue_once, run_music_queue_once_with_max_attempts,
     };
+
+    #[derive(Debug)]
+    struct RecordingActivityEffects {
+        report: crate::telegram_activity::TelegramActivityReport,
+        calls: Mutex<
+            Vec<(
+                i64,
+                Option<i32>,
+                crate::telegram_activity::TelegramActivityAction,
+            )>,
+        >,
+    }
+
+    impl RecordingActivityEffects {
+        fn new(report: crate::telegram_activity::TelegramActivityReport) -> Self {
+            Self {
+                report,
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(
+            &self,
+        ) -> Vec<(
+            i64,
+            Option<i32>,
+            crate::telegram_activity::TelegramActivityAction,
+        )> {
+            self.calls.lock().expect("activity calls").clone()
+        }
+    }
+
+    impl crate::telegram_activity::TelegramActivityEffects for RecordingActivityEffects {
+        fn send_activity_action<'a>(
+            &'a self,
+            chat_id: i64,
+            thread_id: Option<i32>,
+            action: crate::telegram_activity::TelegramActivityAction,
+        ) -> crate::telegram_activity::TelegramActivityFuture<'a> {
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .expect("activity calls")
+                    .push((chat_id, thread_id, action));
+                self.report.clone()
+            })
+        }
+    }
+
+    fn activity_pulse(
+        effects: Arc<RecordingActivityEffects>,
+    ) -> crate::telegram_activity::TelegramActivityPulse {
+        crate::telegram_activity::TelegramActivityPulse::new(
+            crate::telegram_activity::TelegramActivityPulseSettings::from_millis(true, 1_000, 0),
+            effects,
+        )
+    }
 
     #[test]
     fn song_topic_prefers_explicit_then_annotation() {
@@ -2108,6 +2241,95 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn music_queue_once_pulses_upload_document_for_audio_during_active_job()
+    -> Result<(), Box<dyn Error>> {
+        let queue = openplotva_taskman::InMemoryTaskQueue::new();
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800).expect("time");
+        let job_id = queue.assign(
+            MUSIC_VIP_QUEUE_NAME,
+            new_music_gen_job_at(
+                MusicGenJobParams {
+                    chat_id: 42,
+                    message_id: 9,
+                    user_id: 7,
+                    user_full_name: "Alice".to_owned(),
+                    topic: "city".to_owned(),
+                    thread_id: Some(77),
+                    ..MusicGenJobParams::default()
+                },
+                now,
+            )
+            .with_name("music")
+            .with_priority(HIGHEST_PRIORITY),
+        );
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let generator = WaitingGeneratorStub::new(
+            GeneratedSongAudio {
+                data: b"MP3".to_vec(),
+                file_name: "song.mp3".to_owned(),
+            },
+            Arc::clone(&notify),
+        );
+        let effects = EffectsStub::allowed();
+        let activity_effects = Arc::new(RecordingActivityEffects::new(
+            crate::telegram_activity::TelegramActivityReport::Sent,
+        ));
+        let pulse = activity_pulse(Arc::clone(&activity_effects));
+
+        let poll = run_music_queue_once_with_max_attempts(
+            &queue,
+            MUSIC_VIP_QUEUE_NAME,
+            &HeuristicSongMaterialProvider,
+            &generator,
+            &effects,
+            MusicQueuePollOptions {
+                max_llm_job_attempts: DEFAULT_LLM_JOB_MAX_ATTEMPTS,
+                activity_pulse: Some(&pulse),
+                now,
+            },
+        );
+        tokio::pin!(poll);
+        tokio::select! {
+            _ = &mut poll => panic!("waiting generator should keep the job active"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => {}
+        }
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            activity_effects.calls().first().copied(),
+            Some((
+                42,
+                Some(77),
+                crate::telegram_activity::TelegramActivityAction::UploadDocumentForAudio,
+            )),
+            "Bot API has no upload_audio chat action; generated songs use upload_document"
+        );
+        notify.notify_one();
+        let report = poll.await;
+
+        assert_eq!(report.job_id, Some(job_id));
+        assert_eq!(report.outcome, MusicQueuePollOutcome::Completed);
+        assert!(
+            report.activity.sent >= 1,
+            "active music generation must report a file-upload pulse"
+        );
+        assert_eq!(
+            report
+                .activity
+                .action
+                .expect("activity action")
+                .as_telegram_action(),
+            "upload_document"
+        );
+        assert_eq!(
+            queue.records()[0].status,
+            openplotva_taskman::JobStatus::Completed
+        );
+        assert_eq!(generator.requests().len(), 1);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn music_queue_once_requeues_retryable_provider_error_like_go()
     -> Result<(), Box<dyn Error>> {
@@ -2215,8 +2437,11 @@ mod tests {
                 "aifarm provider provider_unavailable: status 503".to_owned(),
             ))),
             &effects,
-            2,
-            now,
+            MusicQueuePollOptions {
+                max_llm_job_attempts: 2,
+                activity_pulse: None,
+                now,
+            },
         )
         .await;
 
@@ -2314,6 +2539,40 @@ mod tests {
             Box::pin(async move {
                 lock(&self.requests).push(request);
                 lock(&self.result).clone()
+            })
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct WaitingGeneratorStub {
+        audio: GeneratedSongAudio,
+        notify: Arc<tokio::sync::Notify>,
+        requests: Arc<Mutex<Vec<MusicGenerationRequest>>>,
+    }
+
+    impl WaitingGeneratorStub {
+        fn new(audio: GeneratedSongAudio, notify: Arc<tokio::sync::Notify>) -> Self {
+            Self {
+                audio,
+                notify,
+                requests: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn requests(&self) -> Vec<MusicGenerationRequest> {
+            lock(&self.requests).clone()
+        }
+    }
+
+    impl MusicGenerator for WaitingGeneratorStub {
+        fn generate_song<'a>(
+            &'a self,
+            request: MusicGenerationRequest,
+        ) -> MusicGenerationFuture<'a> {
+            Box::pin(async move {
+                lock(&self.requests).push(request);
+                self.notify.notified().await;
+                Ok(self.audio.clone())
             })
         }
     }

@@ -63,6 +63,7 @@ pub mod settings;
 pub mod skipped;
 pub mod subscription_sync;
 pub mod task_queue;
+pub mod telegram_activity;
 pub mod translate;
 pub mod updates;
 pub mod virtual_messages;
@@ -10752,6 +10753,15 @@ async fn start_runtime_workers(
     let permission_policy = Arc::new(permissions::ChatPermissionPolicy::new(
         PostgresChatSettingsStore::new(service_clients.postgres.clone()),
     ));
+    let telegram_activity_effects =
+        Arc::new(telegram_activity::TelegramActivityRuntimeEffects::new(
+            telegram.clone(),
+            Arc::clone(&permission_policy),
+        ));
+    let telegram_activity_pulse = Arc::new(telegram_activity::TelegramActivityPulse::new(
+        (&config.bot.activity_pulse).into(),
+        telegram_activity_effects,
+    ));
     cache_inspector.set_policy_caches(
         Arc::clone(&rate_limit_policy),
         Arc::clone(&permission_policy),
@@ -11781,6 +11791,7 @@ async fn start_runtime_workers(
                 let obligations = Arc::clone(&delivery_obligation_store);
                 let session_wiring = dialog_session_wiring.clone();
                 let llm_runs = llm_run_buffer.clone();
+                let activity_pulse = Arc::clone(&telegram_activity_pulse);
                 let stop_rx = stop.subscribe();
                 move |index: usize, retire: tokio::sync::oneshot::Receiver<()>| {
                     let worker_queue = Arc::clone(&queue);
@@ -11795,6 +11806,7 @@ async fn start_runtime_workers(
                     let worker_obligations = Arc::clone(&obligations);
                     let worker_session = session_wiring.clone();
                     let worker_llm_runs = llm_runs.clone();
+                    let worker_activity_pulse = Arc::clone(&activity_pulse);
                     let worker_stop = stop_rx.clone();
                     tokio::spawn(async move {
                         // A retired worker finishes its current job and exits
@@ -11829,6 +11841,7 @@ async fn start_runtime_workers(
                                     obligations: Some(worker_obligations.as_ref()),
                                     session: worker_session.as_ref(),
                                     llm_runs: Some(&worker_llm_runs),
+                                    activity_pulse: Some(worker_activity_pulse.as_ref()),
                                 },
                                 stop_future,
                             )
@@ -12001,14 +12014,18 @@ async fn start_runtime_workers(
         vip_image_effects = vip_image_effects.with_reaction_ux(Arc::clone(reactions));
     }
     let vip_image_stop = stop.subscribe();
+    let vip_image_activity_pulse = Arc::clone(&telegram_activity_pulse);
     let vip_image_worker = tokio::spawn(async move {
         let report = image_jobs::run_image_gen_worker_every_until_with_max_attempts(
             vip_image_queue.as_ref(),
             &vip_image_generator,
             &vip_image_effects,
             &image_jobs::IMAGE_VIP_JOB_WORKER_QUEUES,
-            image_jobs::IMAGE_JOB_POLL_INTERVAL,
-            media_max_llm_job_attempts,
+            image_jobs::ImageWorkerRunOptions {
+                interval: image_jobs::IMAGE_JOB_POLL_INTERVAL,
+                max_llm_job_attempts: media_max_llm_job_attempts,
+                activity_pulse: Some(vip_image_activity_pulse.as_ref()),
+            },
             wait_for_runtime_stop(vip_image_stop),
         )
         .await;
@@ -12042,14 +12059,18 @@ async fn start_runtime_workers(
         vip_image_edit_effects = vip_image_edit_effects.with_reaction_ux(Arc::clone(reactions));
     }
     let vip_image_edit_stop = stop.subscribe();
+    let vip_image_edit_activity_pulse = Arc::clone(&telegram_activity_pulse);
     let vip_image_edit_worker = tokio::spawn(async move {
         let report = image_jobs::run_image_edit_worker_every_until_with_max_attempts(
             vip_image_edit_queue.as_ref(),
             &vip_image_edit_provider,
             &vip_image_edit_effects,
             &image_jobs::IMAGE_VIP_JOB_WORKER_QUEUES,
-            image_jobs::IMAGE_JOB_POLL_INTERVAL,
-            media_max_llm_job_attempts,
+            image_jobs::ImageWorkerRunOptions {
+                interval: image_jobs::IMAGE_JOB_POLL_INTERVAL,
+                max_llm_job_attempts: media_max_llm_job_attempts,
+                activity_pulse: Some(vip_image_edit_activity_pulse.as_ref()),
+            },
             wait_for_runtime_stop(vip_image_edit_stop),
         )
         .await;
@@ -12080,14 +12101,18 @@ async fn start_runtime_workers(
         regular_image_effects = regular_image_effects.with_reaction_ux(Arc::clone(reactions));
     }
     let regular_image_stop = stop.subscribe();
+    let regular_image_activity_pulse = Arc::clone(&telegram_activity_pulse);
     let regular_image_worker = tokio::spawn(async move {
         let report = image_jobs::run_image_gen_worker_every_until_with_max_attempts(
             regular_image_queue.as_ref(),
             &regular_image_generator,
             &regular_image_effects,
             &image_jobs::IMAGE_REGULAR_JOB_WORKER_QUEUES,
-            image_jobs::IMAGE_JOB_POLL_INTERVAL,
-            media_max_llm_job_attempts,
+            image_jobs::ImageWorkerRunOptions {
+                interval: image_jobs::IMAGE_JOB_POLL_INTERVAL,
+                max_llm_job_attempts: media_max_llm_job_attempts,
+                activity_pulse: Some(regular_image_activity_pulse.as_ref()),
+            },
             wait_for_runtime_stop(regular_image_stop),
         )
         .await;
@@ -12197,14 +12222,18 @@ async fn start_runtime_workers(
             music_effects = music_effects.with_reaction_ux(Arc::clone(reactions));
         }
         let music_stop = stop.subscribe();
+        let music_activity_pulse = Arc::clone(&telegram_activity_pulse);
         let music_worker = tokio::spawn(async move {
             let report = music_jobs::run_music_worker_every_until_with_max_attempts(
                 music_queue.as_ref(),
                 &music_material_provider,
                 &music_generator,
                 &music_effects,
-                music_jobs::MUSIC_JOB_POLL_INTERVAL,
-                media_max_llm_job_attempts,
+                music_jobs::MusicWorkerRunOptions {
+                    interval: music_jobs::MUSIC_JOB_POLL_INTERVAL,
+                    max_llm_job_attempts: media_max_llm_job_attempts,
+                    activity_pulse: Some(music_activity_pulse.as_ref()),
+                },
                 wait_for_runtime_stop(music_stop),
             )
             .await;

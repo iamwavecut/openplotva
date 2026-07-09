@@ -9,6 +9,8 @@ use openplotva_taskman::{
 };
 use time::{Duration as TimeDuration, OffsetDateTime};
 
+use crate::telegram_activity::{TelegramActivityAction, TelegramActivityPulse};
+
 use super::{
     DialogInputMaterializer, DialogJobEffects, DialogJobWorkerQueue, DialogJobWorkerReport,
     DialogJobWorkerRunReport, DialogToolCallHistoryStore, trace_dialog_job_tick,
@@ -42,6 +44,8 @@ pub struct DialogJobWorkerLoopOptions<'a, Materializer: ?Sized, ToolHistory: ?Si
     pub session: &'a crate::dialog_turn::SessionWorkerWiring,
     /// Agent-run buffer for the admin LLM Dialogs section.
     pub llm_runs: Option<&'a crate::runtime_llm_runs::RuntimeLlmRunBuffer>,
+    /// Best-effort Telegram activity indicator while the active turn runs.
+    pub activity_pulse: Option<&'a TelegramActivityPulse>,
 }
 
 /// True when the current UTC time is inside the daily `[start, end)` minute window,
@@ -163,6 +167,7 @@ pub(crate) struct DialogJobProcessOptions<'a> {
     pub(crate) obligations: Option<&'a dyn crate::dialog_turn::DeliveryObligationAnnotator>,
     pub(crate) session: &'a crate::dialog_turn::SessionWorkerWiring,
     pub(crate) llm_runs: Option<&'a crate::runtime_llm_runs::RuntimeLlmRunBuffer>,
+    pub(crate) activity_pulse: Option<&'a TelegramActivityPulse>,
 }
 
 pub(crate) async fn process_dialog_job_once_in_queue_with_materializer_history_and_retry_at<
@@ -343,6 +348,13 @@ where
             options.now,
         );
     }
+    let activity_guard = options.activity_pulse.map(|pulse| {
+        pulse.start(
+            params.chat_id,
+            params.thread_id,
+            TelegramActivityAction::Typing,
+        )
+    });
     let turn = crate::dialog_turn::execute_dialog_turn(
         crate::dialog_turn::TurnContext {
             item: &item,
@@ -373,6 +385,10 @@ where
         turn,
     )
     .await;
+    if let Some(guard) = activity_guard.as_ref() {
+        report.activity = guard.snapshot();
+    }
+    drop(activity_guard);
     let finalize_now =
         options.now + TimeDuration::try_from(processing_started.elapsed()).unwrap_or_default();
 
@@ -474,6 +490,7 @@ where
                             obligations: options.obligations,
                             session: options.session,
                             llm_runs: options.llm_runs,
+                            activity_pulse: options.activity_pulse,
                         },
                     ).await;
                     trace_dialog_job_tick(&tick);
