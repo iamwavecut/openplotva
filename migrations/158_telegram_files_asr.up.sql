@@ -1,0 +1,9 @@
+ALTER TABLE telegram_files
+    ADD COLUMN IF NOT EXISTS asr_status TEXT NOT NULL DEFAULT 'pending',
+    ADD COLUMN IF NOT EXISTS asr_text TEXT,
+    ADD COLUMN IF NOT EXISTS asr_provider TEXT,
+    ADD COLUMN IF NOT EXISTS asr_model TEXT,
+    ADD COLUMN IF NOT EXISTS asr_latency_ms INTEGER,
+    ADD COLUMN IF NOT EXISTS asr_error TEXT,
+    ADD COLUMN IF NOT EXISTS asr_requested_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS asr_completed_at TIMESTAMPTZ;

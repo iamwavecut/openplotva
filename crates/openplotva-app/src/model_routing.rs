@@ -49,6 +49,7 @@ pub const PROTOCOL_GENKIT: &str = "genkit";
 pub const PROTOCOL_ACESTEP: &str = "acestep";
 pub const PROTOCOL_DISCOVERY_JOBS: &str = "discovery_jobs";
 pub const PROTOCOL_DISCOVERY_DRAW: &str = "discovery_draw";
+pub const PROTOCOL_DISCOVERY_ASR: &str = "discovery_asr";
 pub const PROTOCOL_PRIVACY_FILTER: &str = "privacy_filter";
 
 async fn app_setting_present(pool: &PgPool, key: &str) -> Result<bool, StorageError> {
@@ -1359,9 +1360,153 @@ pub async fn backfill_boogu_image_slots(
     Ok(true)
 }
 
+async fn ensure_asr_model(
+    pool: &PgPool,
+    providers: &mut Vec<ProviderRecord>,
+    models: &mut Vec<ModelRecord>,
+    config: &AppConfig,
+) -> Result<i64, StorageError> {
+    let provider_input = ProviderInput {
+        name: ASR_PROVIDER.to_owned(),
+        kind: "asr".to_owned(),
+        protocol: Some(PROTOCOL_DISCOVERY_ASR.to_owned()),
+        runtime_hint: None,
+        endpoint: Some(config.llm.discovery.base_url.clone()),
+        discovery_service_name: Some(crate::asr::DEFAULT_ASR_DISCOVERY_SERVICE_NAME.to_owned()),
+        discovery_endpoint_name: Some(crate::asr::DEFAULT_ASR_DISCOVERY_ENDPOINT_NAME.to_owned()),
+        api_key_ref: None,
+        api_key_encrypted: None,
+        enabled: true,
+        config: json!({
+            "service_name": crate::asr::DEFAULT_ASR_DISCOVERY_SERVICE_NAME,
+            "endpoint_name": crate::asr::DEFAULT_ASR_DISCOVERY_ENDPOINT_NAME,
+        }),
+    };
+    let provider_id = ensure_provider(pool, providers, provider_input.clone()).await?;
+    update_provider(pool, provider_id, &provider_input).await?;
+    if let Some(provider) = providers
+        .iter_mut()
+        .find(|provider| provider.id == provider_id)
+    {
+        provider.name = provider_input.name;
+        provider.kind = provider_input.kind;
+        provider.protocol = provider_input.protocol;
+        provider.runtime_hint = provider_input.runtime_hint;
+        provider.endpoint = provider_input.endpoint;
+        provider.discovery_service_name = provider_input.discovery_service_name;
+        provider.discovery_endpoint_name = provider_input.discovery_endpoint_name;
+        provider.api_key_ref = provider_input.api_key_ref;
+        provider.api_key_encrypted = provider_input.api_key_encrypted;
+        provider.enabled = provider_input.enabled;
+        provider.config = provider_input.config;
+    }
+
+    let model_input = ModelInput {
+        provider_id,
+        model_name: ASR_MODEL.to_owned(),
+        display_name: Some("GigaAM v3 with Vosk fallback".to_owned()),
+        base_url: None,
+        capabilities: vec!["asr".to_owned()],
+        embedding_dim: None,
+        pool_id: None,
+        enabled: true,
+        config: json!({
+            "service_name": crate::asr::DEFAULT_ASR_DISCOVERY_SERVICE_NAME,
+            "endpoint_name": crate::asr::DEFAULT_ASR_DISCOVERY_ENDPOINT_NAME,
+        }),
+    };
+    let model_id = ensure_model(pool, models, model_input.clone()).await?;
+    update_model(pool, model_id, &model_input).await?;
+    if let Some(model) = models.iter_mut().find(|model| model.id == model_id) {
+        model.provider_id = model_input.provider_id;
+        model.model_name = model_input.model_name;
+        model.display_name = model_input.display_name;
+        model.base_url = model_input.base_url;
+        model.capabilities = model_input.capabilities;
+        model.embedding_dim = model_input.embedding_dim;
+        model.pool_id = model_input.pool_id;
+        model.enabled = model_input.enabled;
+        model.config = model_input.config;
+    }
+    Ok(model_id)
+}
+
+async fn ensure_draw_asr_gpu_pool(
+    pool: &PgPool,
+    providers: &[ProviderRecord],
+) -> Result<i64, StorageError> {
+    let pool_input = openplotva_storage::llm_routing::PoolInput {
+        name: DRAW_ASR_GPU_POOL.to_owned(),
+        max_concurrency: Some(1),
+        description: Some(DRAW_ASR_GPU_POOL_DESCRIPTION.to_owned()),
+        config: serde_json::json!({}),
+    };
+    let pool_id =
+        openplotva_storage::llm_routing::insert_pool_if_missing(pool, &pool_input).await?;
+    openplotva_storage::llm_routing::update_pool(pool, pool_id, &pool_input).await?;
+    for provider_name in [DRAW_API_PROVIDER, ASR_PROVIDER] {
+        let Some(provider_id) = existing_provider_id(providers, provider_name) else {
+            continue;
+        };
+        let attached = openplotva_storage::llm_routing::attach_provider_models_to_pool_if_unpooled(
+            pool,
+            provider_id,
+            pool_id,
+        )
+        .await?;
+        tracing::info!(
+            pool = DRAW_ASR_GPU_POOL,
+            provider = provider_name,
+            attached,
+            "attached GPU-1 provider models to shared pool"
+        );
+    }
+    Ok(pool_id)
+}
+
+pub async fn backfill_asr_routing(pool: &PgPool, config: &AppConfig) -> Result<bool, StorageError> {
+    if app_setting_present(pool, ASR_ROUTING_KEY).await? {
+        return Ok(false);
+    }
+
+    insert_workflow_if_missing(
+        pool,
+        crate::asr::ASR_WORKFLOW_KEY,
+        "asr",
+        false,
+        2,
+        120_000,
+        true,
+    )
+    .await?;
+    let mut providers = list_providers(pool).await?;
+    let mut models = list_models(pool).await?;
+    let mut assignments = list_assignments(pool).await?;
+    let asr_model_id = ensure_asr_model(pool, &mut providers, &mut models, config).await?;
+    ensure_draw_asr_gpu_pool(pool, &providers).await?;
+    ensure_primary_assignment(
+        pool,
+        &mut assignments,
+        crate::asr::ASR_WORKFLOW_KEY,
+        asr_model_id,
+        None,
+    )
+    .await?;
+
+    mark_app_setting(pool, ASR_ROUTING_KEY).await?;
+    tracing::info!("backfilled ASR routing rows");
+    Ok(true)
+}
+
 const CAPACITY_POOLS_KEY: &str = "llm.routing.capacity_pools_v1";
 const PROVIDER_PROTOCOL_KEY: &str = "llm.routing.provider_protocol_v1";
 const VRAM_CLOUD_POOL_SLOTS: i32 = 16;
+const ASR_ROUTING_KEY: &str = "llm.routing.asr_v1";
+const ASR_PROVIDER: &str = "aifarm-asr";
+const ASR_MODEL: &str = "gigaam-v3-vosk-fallback";
+const DRAW_ASR_GPU_POOL: &str = "boogu-gpu";
+const DRAW_ASR_GPU_POOL_DESCRIPTION: &str =
+    "Draw/ASR GPU: flux + Boogu render and voice transcription strictly one at a time";
 
 /// Classify a provider row's wire protocol from its seeded shape. Pure so it
 /// is table-testable; used only to fill NULL protocols, never to overwrite an
@@ -1370,6 +1515,7 @@ fn derive_protocol(kind: &str, name: &str, has_discovery: bool) -> &'static str 
     match kind {
         "embedding" => PROTOCOL_DISCOVERY_JOBS,
         "image" => PROTOCOL_DISCOVERY_DRAW,
+        "asr" => PROTOCOL_DISCOVERY_ASR,
         "music" => PROTOCOL_ACESTEP,
         "privacy_filter" => PROTOCOL_PRIVACY_FILTER,
         // chat / vision: genkit-family providers speak the Google AI API;
@@ -1438,26 +1584,31 @@ pub async fn backfill_capacity_pools(
             VRAM_CLOUD_PROVIDER,
         ),
         (
-            "boogu-gpu",
+            DRAW_ASR_GPU_POOL,
             1,
-            "Draw GPU: flux + Boogu turbo/edit render strictly one at a time",
+            DRAW_ASR_GPU_POOL_DESCRIPTION,
             DRAW_API_PROVIDER,
+        ),
+        (
+            DRAW_ASR_GPU_POOL,
+            1,
+            DRAW_ASR_GPU_POOL_DESCRIPTION,
+            ASR_PROVIDER,
         ),
     ];
     for (pool_name, slots, description, provider_name) in targets {
         let Some(provider_id) = existing_provider_id(&providers, provider_name) else {
             continue;
         };
-        let pool_id = openplotva_storage::llm_routing::insert_pool_if_missing(
-            pool,
-            &openplotva_storage::llm_routing::PoolInput {
-                name: pool_name.to_owned(),
-                max_concurrency: Some(slots),
-                description: Some(description.to_owned()),
-                config: serde_json::json!({}),
-            },
-        )
-        .await?;
+        let pool_input = openplotva_storage::llm_routing::PoolInput {
+            name: pool_name.to_owned(),
+            max_concurrency: Some(slots),
+            description: Some(description.to_owned()),
+            config: serde_json::json!({}),
+        };
+        let pool_id =
+            openplotva_storage::llm_routing::insert_pool_if_missing(pool, &pool_input).await?;
+        openplotva_storage::llm_routing::update_pool(pool, pool_id, &pool_input).await?;
         let attached = openplotva_storage::llm_routing::attach_provider_models_to_pool_if_unpooled(
             pool,
             provider_id,
@@ -1697,6 +1848,7 @@ fn model_matches_kind(model: &ModelRecord, kind: Kind) -> bool {
         Kind::Image => "image",
         Kind::Music => "music",
         Kind::PrivacyFilter => "privacy_filter",
+        Kind::Asr => "asr",
     };
     if !model.capabilities.iter().any(|c| c == capability) {
         return false;
@@ -2125,6 +2277,7 @@ mod tests {
                 true,
                 PROTOCOL_PRIVACY_FILTER,
             ),
+            ("asr", "aifarm-asr", true, PROTOCOL_DISCOVERY_ASR),
         ];
         for (kind, name, has_discovery, expected) in cases {
             assert_eq!(
@@ -2133,6 +2286,17 @@ mod tests {
                 "provider {name} (kind {kind})"
             );
         }
+    }
+
+    #[test]
+    fn asr_models_match_only_asr_capability() {
+        let mut model = model(10, 1, "gigaam-v3-vosk-fallback");
+        assert!(!model_matches_kind(&model, Kind::Asr));
+
+        model.capabilities = vec!["asr".to_owned()];
+        assert!(model_matches_kind(&model, Kind::Asr));
+
+        assert!(!model_matches_kind(&model, Kind::Image));
     }
 
     #[test]
@@ -2318,6 +2482,62 @@ mod tests {
         let table = build_routing_table(&snapshot);
         let route = table.resolve("embedding", false).expect("embedding route");
         assert_eq!(route.primary.len(), 1);
+    }
+
+    #[test]
+    fn asr_workflow_routes_to_asr_capability_model() {
+        let snapshot = RoutingSnapshot {
+            providers: vec![ProviderRecord {
+                api_key_ref: None,
+                protocol: Some(PROTOCOL_DISCOVERY_ASR.to_owned()),
+                discovery_service_name: Some(
+                    crate::asr::DEFAULT_ASR_DISCOVERY_SERVICE_NAME.to_owned(),
+                ),
+                discovery_endpoint_name: Some(
+                    crate::asr::DEFAULT_ASR_DISCOVERY_ENDPOINT_NAME.to_owned(),
+                ),
+                config: json!({
+                    "service_name": crate::asr::DEFAULT_ASR_DISCOVERY_SERVICE_NAME,
+                    "endpoint_name": crate::asr::DEFAULT_ASR_DISCOVERY_ENDPOINT_NAME,
+                }),
+                ..provider(1, ASR_PROVIDER, "asr")
+            }],
+            models: vec![ModelRecord {
+                capabilities: vec!["asr".to_owned()],
+                config: json!({
+                    "service_name": crate::asr::DEFAULT_ASR_DISCOVERY_SERVICE_NAME,
+                    "endpoint_name": crate::asr::DEFAULT_ASR_DISCOVERY_ENDPOINT_NAME,
+                }),
+                ..model(10, 1, ASR_MODEL)
+            }],
+            workflows: vec![WorkflowRecord {
+                key: crate::asr::ASR_WORKFLOW_KEY.to_owned(),
+                kind: "asr".to_owned(),
+                full_routing: false,
+                retry_max_hops: 2,
+                retry_wall_ms: 120_000,
+                enabled: true,
+            }],
+            assignments: vec![assignment(
+                100,
+                crate::asr::ASR_WORKFLOW_KEY,
+                "global",
+                "primary",
+                10,
+                None,
+            )],
+            triggers: vec![],
+            pools: vec![],
+        };
+
+        let table = build_routing_table(&snapshot);
+        let route = table
+            .resolve(crate::asr::ASR_WORKFLOW_KEY, false)
+            .expect("ASR route");
+
+        assert_eq!(route.kind, Kind::Asr);
+        assert_eq!(route.primary[0].provider, 1);
+        assert_eq!(route.primary[0].model, 10);
     }
 
     #[test]
