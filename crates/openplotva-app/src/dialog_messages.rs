@@ -1738,7 +1738,9 @@ where
         return Ok(DialogMessageUpdateRoute::Delegated);
     }
 
-    if dialog_trigger_text(message, &parsed.first_word, &parsed.rest_text).is_empty() {
+    if dialog_trigger_text(message, &parsed.first_word, &parsed.rest_text).is_empty()
+        && !message_is_voice(message)
+    {
         return Ok(DialogMessageUpdateRoute::SkippedEmptyDialogTrigger);
     }
 
@@ -2717,6 +2719,10 @@ fn dialog_trigger_text(
         return first_word_lower.to_owned();
     }
     fetcher_message_text(message)
+}
+
+fn message_is_voice(message: &carapax::types::Message) -> bool {
+    matches!(&message.data, TelegramMessageData::Voice(_))
 }
 
 fn message_user_full_name(sender: &MessageSender) -> String {
@@ -4435,11 +4441,16 @@ mod tests {
                 "{label}"
             );
             assert!(!report.skipped_handle, "{label}");
-            assert_eq!(
-                *lock(&route),
-                Some(DialogMessageUpdateRoute::SkippedEmptyDialogTrigger),
-                "{label}"
-            );
+            let expected_route = if label == "voice" {
+                DialogMessageUpdateRoute::Scheduled {
+                    queue_name: DIALOG_AIFARM_QUEUE_NAME.to_owned(),
+                    delay: Duration::ZERO,
+                    replaced: false,
+                }
+            } else {
+                DialogMessageUpdateRoute::SkippedEmptyDialogTrigger
+            };
+            assert_eq!(*lock(&route), Some(expected_route), "{label}");
         }
         let state_calls = state_store.calls();
         assert_eq!(
@@ -4469,7 +4480,7 @@ mod tests {
                 "file:captionless-sticker-1".to_owned(),
             ]
         );
-        assert!(scheduler.calls().is_empty());
+        assert_eq!(scheduler.calls(), vec![String::new()]);
         assert!(image_scheduler.calls().is_empty());
         assert!(effects.sent_texts().is_empty());
         assert!(effects.sent_song_notices().is_empty());
@@ -7667,6 +7678,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn captionless_private_voice_schedules_dialog_for_asr_but_audio_does_not()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let scheduler = SchedulerStub::default();
+        let settings = SettingsStoreStub::default();
+        let effects = EffectsStub::default();
+        let rng = RngStub {
+            random_response: 99,
+            obscenifier: 1,
+            obscenify_variant: 0,
+        };
+
+        let route = handle_dialog_or_random_message_update_or_else_with_image(
+            (&scheduler, None, None),
+            &settings,
+            &effects,
+            &rng,
+            &test_config(),
+            private_captionless_voice_update_at(1_710_000_000)?,
+            |_update| async { Err("voice should not delegate") },
+        )
+        .await?;
+
+        assert_eq!(
+            route,
+            DialogMessageUpdateRoute::Scheduled {
+                queue_name: DIALOG_AIFARM_QUEUE_NAME.to_owned(),
+                delay: Duration::ZERO,
+                replaced: false,
+            }
+        );
+        assert_eq!(scheduler.calls(), vec![String::new()]);
+        let metas = scheduler.metas();
+        assert_eq!(metas.len(), 1);
+        assert_eq!(metas[0].message_type, "voice");
+        assert_eq!(metas[0].attachments.len(), 1);
+        assert_eq!(metas[0].attachments[0].kind, "voice");
+        assert_eq!(
+            metas[0].attachments[0].file_unique_id,
+            "captionless-voice-1"
+        );
+
+        let audio_scheduler = SchedulerStub::default();
+        let audio_route = handle_dialog_or_random_message_update_or_else_with_image(
+            (&audio_scheduler, None, None),
+            &settings,
+            &effects,
+            &rng,
+            &test_config(),
+            private_media_payload_update_at(32362, 96, 1_710_000_000, media_audio_empty_json())?,
+            |_update| async { Err("audio should not delegate") },
+        )
+        .await?;
+
+        assert_eq!(
+            audio_route,
+            DialogMessageUpdateRoute::SkippedEmptyDialogTrigger
+        );
+        assert!(audio_scheduler.calls().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn image_edit_command_without_prompt_sends_go_error_notice()
     -> Result<(), Box<dyn std::error::Error>> {
         let image_scheduler = ImageSchedulerCaptureStub::scheduled();
@@ -8015,11 +8088,16 @@ mod tests {
     #[derive(Default)]
     struct SchedulerStub {
         calls: Mutex<Vec<String>>,
+        metas: Mutex<Vec<ChatMessageMeta>>,
     }
 
     impl SchedulerStub {
         fn calls(&self) -> Vec<String> {
             lock(&self.calls).clone()
+        }
+
+        fn metas(&self) -> Vec<ChatMessageMeta> {
+            lock(&self.metas).clone()
         }
     }
 
@@ -8032,6 +8110,7 @@ mod tests {
         ) -> DialogMessageFuture<'a, DialogMessageScheduleReport, Self::Error> {
             Box::pin(async move {
                 lock(&self.calls).push(schedule.message_text.to_owned());
+                lock(&self.metas).push(schedule.meta.clone());
                 Ok(DialogMessageScheduleReport {
                     queue_name: schedule.queue_name.to_owned(),
                     delay: Duration::ZERO,
