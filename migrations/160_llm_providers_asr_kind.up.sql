@@ -11,7 +11,6 @@ ALTER TABLE llm_providers
   VALIDATE CONSTRAINT llm_providers_kind_check;
 
 UPDATE llm_providers
-SET kind = 'asr',
-    enabled = TRUE
-WHERE name = 'aifarm-asr'
+SET kind = 'asr'
+WHERE protocol = 'discovery_asr'
   AND kind <> 'asr';
