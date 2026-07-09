@@ -1,9 +1,8 @@
 -- Rollback compatibility: the pre-ASR schema cannot represent the ASR kind.
--- Preserve related rows by disabling ASR workflows and recategorizing them as
--- chat before restoring the older kind constraint.
+-- Preserve related rows and their operator-managed enabled state by
+-- recategorizing them as chat before restoring the older kind constraint.
 UPDATE workflows
-SET kind = 'chat',
-    enabled = FALSE
+SET kind = 'chat'
 WHERE kind = 'asr';
 
 ALTER TABLE workflows
