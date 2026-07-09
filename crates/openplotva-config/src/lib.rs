@@ -96,6 +96,14 @@ pub const DEFAULT_BOT_WEBHOOK_ENABLED: bool = false;
 
 pub const DEFAULT_BOT_WEBHOOK_UPDATE_BUFFER_SIZE: usize = 10_000;
 
+pub const DEFAULT_TELEGRAM_ACTIVITY_PULSE_ENABLED: bool = true;
+
+pub const DEFAULT_TELEGRAM_ACTIVITY_PULSE_INTERVAL_MS: i32 = 4_000;
+
+pub const DEFAULT_TELEGRAM_ACTIVITY_PULSE_INITIAL_DELAY_MS: i32 = 0;
+
+pub const MIN_TELEGRAM_ACTIVITY_PULSE_INTERVAL_MS: i32 = 1_000;
+
 pub const DEFAULT_ADMINS_ADMIN_IDS: &str = "";
 
 pub const DEFAULT_VIP_CHAT_ID: i64 = -1001998670656;
@@ -483,7 +491,16 @@ pub struct BotConfig {
     /// Optional Telegram Bot API base URL for local loopback proof.
     pub api_base_url: String,
     pub webhook: BotWebhookConfig,
+    pub activity_pulse: TelegramActivityPulseConfig,
     pub debug: bool,
+}
+
+/// Telegram chat-action pulse configuration for long-running active jobs.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TelegramActivityPulseConfig {
+    pub enabled: bool,
+    pub interval_ms: i32,
+    pub initial_delay_ms: i32,
 }
 
 /// Telegram webhook configuration.
@@ -1019,6 +1036,12 @@ pub struct RawConfig {
     pub bot_webhook_secret_token: Option<String>,
     /// `BOT_WEBHOOK_UPDATE_BUFFER_SIZE`.
     pub bot_webhook_update_buffer_size: Option<String>,
+    /// `TELEGRAM_ACTIVITY_PULSE_ENABLED`.
+    pub telegram_activity_pulse_enabled: Option<String>,
+    /// `TELEGRAM_ACTIVITY_PULSE_INTERVAL_MS`.
+    pub telegram_activity_pulse_interval_ms: Option<String>,
+    /// `TELEGRAM_ACTIVITY_PULSE_INITIAL_DELAY_MS`.
+    pub telegram_activity_pulse_initial_delay_ms: Option<String>,
     /// `BOT_DEBUG`.
     pub bot_debug: Option<String>,
     /// `ADMINS_ADMIN_IDS`.
@@ -2060,6 +2083,25 @@ impl AppConfig {
                         DEFAULT_BOT_WEBHOOK_UPDATE_BUFFER_SIZE,
                     )?,
                 },
+                activity_pulse: TelegramActivityPulseConfig {
+                    enabled: parse_bool(
+                        "TELEGRAM_ACTIVITY_PULSE_ENABLED",
+                        raw.telegram_activity_pulse_enabled,
+                        DEFAULT_TELEGRAM_ACTIVITY_PULSE_ENABLED,
+                    )?,
+                    interval_ms: parse_i32(
+                        "TELEGRAM_ACTIVITY_PULSE_INTERVAL_MS",
+                        raw.telegram_activity_pulse_interval_ms,
+                        DEFAULT_TELEGRAM_ACTIVITY_PULSE_INTERVAL_MS,
+                    )?
+                    .max(MIN_TELEGRAM_ACTIVITY_PULSE_INTERVAL_MS),
+                    initial_delay_ms: parse_i32(
+                        "TELEGRAM_ACTIVITY_PULSE_INITIAL_DELAY_MS",
+                        raw.telegram_activity_pulse_initial_delay_ms,
+                        DEFAULT_TELEGRAM_ACTIVITY_PULSE_INITIAL_DELAY_MS,
+                    )?
+                    .max(0),
+                },
                 debug: parse_bool("BOT_DEBUG", raw.bot_debug, DEFAULT_BOT_DEBUG)?,
             },
             admins: AdminConfig {
@@ -2818,6 +2860,11 @@ impl RawConfig {
             bot_webhook_key_file: env("BOT_WEBHOOK_KEY_FILE"),
             bot_webhook_secret_token: env("BOT_WEBHOOK_SECRET_TOKEN"),
             bot_webhook_update_buffer_size: env("BOT_WEBHOOK_UPDATE_BUFFER_SIZE"),
+            telegram_activity_pulse_enabled: env("TELEGRAM_ACTIVITY_PULSE_ENABLED"),
+            telegram_activity_pulse_interval_ms: env("TELEGRAM_ACTIVITY_PULSE_INTERVAL_MS"),
+            telegram_activity_pulse_initial_delay_ms: env(
+                "TELEGRAM_ACTIVITY_PULSE_INITIAL_DELAY_MS",
+            ),
             bot_debug: env("BOT_DEBUG"),
             admins_admin_ids: env("ADMINS_ADMIN_IDS"),
             vip_chat_id: env("VIP_CHAT_ID"),
@@ -3443,9 +3490,12 @@ mod tests {
         DEFAULT_RUNTIME_API_SQL_TIMEOUT_MS, DEFAULT_SERPER_TIMEOUT_SECONDS,
         DEFAULT_SHIELD_EMBEDDING_DIM, DEFAULT_SHIELD_LEXICAL_MIN_SCORE, DEFAULT_SHIELD_MAX_MATCHES,
         DEFAULT_SHIELD_QUERY_MAX_CHARS, DEFAULT_SHIELD_RETRIEVAL_TIMEOUT_SECONDS,
-        DEFAULT_SHIELD_VECTOR_MIN_SCORE, DEFAULT_UPDATE_QUEUE_BACKEND, DEFAULT_VIP_CHAT_ID,
-        DEFAULT_VISION_DIRECT_IMAGE_LIMIT, DEFAULT_VISION_MAX_TOKENS, DEFAULT_VISION_MODEL,
-        DEFAULT_VISION_REQUEST_TIMEOUT_SECONDS, DEFAULT_WEBAPP_PORT, DEFAULT_WEBAPP_URL, RawConfig,
+        DEFAULT_SHIELD_VECTOR_MIN_SCORE, DEFAULT_TELEGRAM_ACTIVITY_PULSE_ENABLED,
+        DEFAULT_TELEGRAM_ACTIVITY_PULSE_INITIAL_DELAY_MS,
+        DEFAULT_TELEGRAM_ACTIVITY_PULSE_INTERVAL_MS, DEFAULT_UPDATE_QUEUE_BACKEND,
+        DEFAULT_VIP_CHAT_ID, DEFAULT_VISION_DIRECT_IMAGE_LIMIT, DEFAULT_VISION_MAX_TOKENS,
+        DEFAULT_VISION_MODEL, DEFAULT_VISION_REQUEST_TIMEOUT_SECONDS, DEFAULT_WEBAPP_PORT,
+        DEFAULT_WEBAPP_URL, MIN_TELEGRAM_ACTIVITY_PULSE_INTERVAL_MS, RawConfig,
         parse_string_list_or_default,
     };
 
@@ -3503,6 +3553,18 @@ mod tests {
         assert_eq!(
             config.bot.webhook.update_buffer_size,
             DEFAULT_BOT_WEBHOOK_UPDATE_BUFFER_SIZE
+        );
+        assert_eq!(
+            config.bot.activity_pulse.enabled,
+            DEFAULT_TELEGRAM_ACTIVITY_PULSE_ENABLED
+        );
+        assert_eq!(
+            config.bot.activity_pulse.interval_ms,
+            DEFAULT_TELEGRAM_ACTIVITY_PULSE_INTERVAL_MS
+        );
+        assert_eq!(
+            config.bot.activity_pulse.initial_delay_ms,
+            DEFAULT_TELEGRAM_ACTIVITY_PULSE_INITIAL_DELAY_MS
         );
         assert!(config.admins.admin_ids.is_empty());
         assert!(config.persistent_queue.enabled);
@@ -3797,6 +3859,24 @@ mod tests {
         assert!(config.service_probe.produce_updates);
         assert!(config.service_probe.consume_updates);
 
+        Ok(())
+    }
+
+    #[test]
+    fn telegram_activity_pulse_env_overrides_and_clamps() -> Result<(), super::ConfigError> {
+        let config = AppConfig::from_raw(RawConfig {
+            telegram_activity_pulse_enabled: Some("false".to_owned()),
+            telegram_activity_pulse_interval_ms: Some("250".to_owned()),
+            telegram_activity_pulse_initial_delay_ms: Some("-10".to_owned()),
+            ..RawConfig::default()
+        })?;
+
+        assert!(!config.bot.activity_pulse.enabled);
+        assert_eq!(
+            config.bot.activity_pulse.interval_ms,
+            MIN_TELEGRAM_ACTIVITY_PULSE_INTERVAL_MS
+        );
+        assert_eq!(config.bot.activity_pulse.initial_delay_ms, 0);
         Ok(())
     }
 

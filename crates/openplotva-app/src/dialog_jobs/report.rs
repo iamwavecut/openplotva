@@ -1,5 +1,7 @@
 //! Per-tick and per-run worker reports, plus the tick trace line.
 
+use crate::telegram_activity::TelegramActivitySnapshot;
+
 /// Result of one dialog taskman worker tick.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DialogJobWorkerReport {
@@ -77,6 +79,8 @@ pub struct DialogJobWorkerReport {
     pub followup_respawned: Option<i64>,
     /// Terminal user signal failed after reaction and fallback attempts.
     pub user_signal_error: Option<String>,
+    /// Best-effort Telegram activity pulse report for this active turn.
+    pub activity: TelegramActivitySnapshot,
 }
 
 /// Aggregate report for a long-running dialog taskman worker.
@@ -108,6 +112,12 @@ pub struct DialogJobWorkerRunReport {
     pub dequeue_errors: u64,
     /// Number of completion/failure write errors.
     pub status_errors: u64,
+    /// Number of accepted Telegram activity pulse sends.
+    pub activity_pulses_sent: u64,
+    /// Number of failed Telegram activity pulse sends.
+    pub activity_pulse_failures: u64,
+    /// Number of skipped Telegram activity pulse sends.
+    pub activity_pulse_skips: u64,
 }
 
 impl DialogJobWorkerRunReport {
@@ -149,6 +159,9 @@ impl DialogJobWorkerRunReport {
         if tick.status_error.is_some() {
             self.status_errors += 1;
         }
+        self.activity_pulses_sent += tick.activity.sent;
+        self.activity_pulse_failures += tick.activity.failed;
+        self.activity_pulse_skips += tick.activity.skipped;
     }
 }
 
@@ -162,6 +175,7 @@ pub(crate) fn trace_dialog_job_tick(tick: &DialogJobWorkerReport) {
         && tick.dialog_fallback_event_error.is_none()
         && tick.status_error.is_none()
         && tick.user_signal_error.is_none()
+        && !tick.activity.has_activity()
     {
         return;
     }
@@ -185,6 +199,14 @@ pub(crate) fn trace_dialog_job_tick(tick: &DialogJobWorkerReport) {
         retry_attempt = tick.retry_attempt,
         retry_max_attempts = tick.retry_max_attempts,
         retry_target_queue = tick.retry_target_queue.as_deref(),
+        activity_action = tick
+            .activity
+            .action
+            .map(|action| action.as_telegram_action()),
+        activity_pulses_sent = tick.activity.sent,
+        activity_pulse_failures = tick.activity.failed,
+        activity_pulse_skips = tick.activity.skipped,
+        activity_pulse_last_error = tick.activity.last_error.as_deref(),
         dequeue_error = tick.dequeue_error.as_deref(),
         decode_error = tick.decode_error.as_deref(),
         retryable_provider_error = tick.retryable_provider_error.as_deref(),

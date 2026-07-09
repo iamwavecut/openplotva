@@ -42,6 +42,9 @@ use crate::media::{MediaPromptOptimizer, MediaPromptOptimizerService};
 use crate::routed_attempts::{
     RoutedAttempt, RoutedAttemptRunError, RoutedAttemptWalker, RoutedRequestContext,
 };
+use crate::telegram_activity::{
+    TelegramActivityAction, TelegramActivityPulse, TelegramActivitySnapshot,
+};
 use crate::vision::TelegramVisionDataUrlProvider;
 
 /// Boxed future returned by image generation providers.
@@ -2201,6 +2204,8 @@ pub struct ImageGenQueuePollReport {
     pub outcome: ImageGenQueuePollOutcome,
     /// Error text stored on failed jobs.
     pub error: Option<String>,
+    /// Best-effort Telegram activity pulse report for this active job.
+    pub activity: TelegramActivitySnapshot,
 }
 
 /// Result from one image-edit queue poll.
@@ -2233,6 +2238,8 @@ pub struct ImageEditQueuePollReport {
     pub outcome: ImageEditQueuePollOutcome,
     /// Error text stored on failed jobs.
     pub error: Option<String>,
+    /// Best-effort Telegram activity pulse report for this active job.
+    pub activity: TelegramActivitySnapshot,
 }
 
 /// Aggregate report from a long-running image taskman worker.
@@ -2258,6 +2265,9 @@ pub struct ImageGenWorkerRunReport {
     pub idle: u64,
     /// Number of poll reports carrying a status/failure error.
     pub errors: u64,
+    pub activity_pulses_sent: u64,
+    pub activity_pulse_failures: u64,
+    pub activity_pulse_skips: u64,
 }
 
 impl ImageGenWorkerRunReport {
@@ -2278,6 +2288,9 @@ impl ImageGenWorkerRunReport {
         if report.error.is_some() {
             self.errors += 1;
         }
+        self.activity_pulses_sent += report.activity.sent;
+        self.activity_pulse_failures += report.activity.failed;
+        self.activity_pulse_skips += report.activity.skipped;
     }
 }
 
@@ -2304,6 +2317,9 @@ pub struct ImageEditWorkerRunReport {
     pub idle: u64,
     /// Number of poll reports carrying a status/failure error.
     pub errors: u64,
+    pub activity_pulses_sent: u64,
+    pub activity_pulse_failures: u64,
+    pub activity_pulse_skips: u64,
 }
 
 impl ImageEditWorkerRunReport {
@@ -2323,6 +2339,45 @@ impl ImageEditWorkerRunReport {
         }
         if report.error.is_some() {
             self.errors += 1;
+        }
+        self.activity_pulses_sent += report.activity.sent;
+        self.activity_pulse_failures += report.activity.failed;
+        self.activity_pulse_skips += report.activity.skipped;
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct ImageQueuePollOptions<'a> {
+    pub max_llm_job_attempts: i32,
+    pub activity_pulse: Option<&'a TelegramActivityPulse>,
+    pub now: OffsetDateTime,
+}
+
+impl ImageQueuePollOptions<'_> {
+    #[must_use]
+    pub const fn at(now: OffsetDateTime) -> Self {
+        Self {
+            max_llm_job_attempts: DEFAULT_LLM_JOB_MAX_ATTEMPTS,
+            activity_pulse: None,
+            now,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct ImageWorkerRunOptions<'a> {
+    pub interval: StdDuration,
+    pub max_llm_job_attempts: i32,
+    pub activity_pulse: Option<&'a TelegramActivityPulse>,
+}
+
+impl ImageWorkerRunOptions<'_> {
+    #[must_use]
+    pub const fn every(interval: StdDuration) -> Self {
+        Self {
+            interval,
+            max_llm_job_attempts: DEFAULT_LLM_JOB_MAX_ATTEMPTS,
+            activity_pulse: None,
         }
     }
 }
@@ -2861,8 +2916,7 @@ where
         generator,
         effects,
         worker_id,
-        DEFAULT_LLM_JOB_MAX_ATTEMPTS,
-        now,
+        ImageQueuePollOptions::at(now),
     )
     .await
 }
@@ -2874,14 +2928,13 @@ pub async fn run_image_gen_queue_once_with_max_attempts<Generator, Effects>(
     generator: &Generator,
     effects: &Effects,
     worker_id: &str,
-    max_llm_job_attempts: i32,
-    now: OffsetDateTime,
+    options: ImageQueuePollOptions<'_>,
 ) -> ImageGenQueuePollReport
 where
     Generator: ImageGenerator + Sync,
     Effects: ImageJobEffects + Sync,
 {
-    let Some(work) = queue.dequeue_matching(queue_name, worker_id, now, |job| {
+    let Some(work) = queue.dequeue_matching(queue_name, worker_id, options.now, |job| {
         job.data.job_type == JobType::ImageGen
     }) else {
         return ImageGenQueuePollReport {
@@ -2889,6 +2942,7 @@ where
             job_id: None,
             outcome: ImageGenQueuePollOutcome::Idle,
             error: None,
+            activity: TelegramActivitySnapshot::default(),
         };
     };
 
@@ -2896,18 +2950,30 @@ where
         Ok(params) => params,
         Err(error) => {
             let error = error.to_string();
-            let _ = queue.fail(work.id, error.clone(), now);
+            let _ = queue.fail(work.id, error.clone(), options.now);
             return ImageGenQueuePollReport {
                 queue_name: queue_name.to_owned(),
                 job_id: Some(work.id),
                 outcome: ImageGenQueuePollOutcome::DecodeFailed,
                 error: Some(error),
+                activity: TelegramActivitySnapshot::default(),
             };
         }
     };
 
-    let _ = queue.set_execution_started(work.id, now);
+    let _ = queue.set_execution_started(work.id, options.now);
+    let activity_guard = options.activity_pulse.map(|pulse| {
+        pulse.start(
+            params.chat_id,
+            params.thread_id,
+            TelegramActivityAction::UploadPhoto,
+        )
+    });
     let execution = execute_image_gen_job(generator, effects, params).await;
+    let activity = activity_guard
+        .as_ref()
+        .map_or_else(TelegramActivitySnapshot::default, |guard| guard.snapshot());
+    drop(activity_guard);
     match execution.outcome {
         ImageGenJobExecutionOutcome::Completed => {
             if !execution.image_urls.is_empty() {
@@ -2921,7 +2987,8 @@ where
                 work.id,
                 queue_name,
                 ImageGenQueuePollOutcome::Completed,
-                now,
+                activity,
+                options.now,
             )
         }
         ImageGenJobExecutionOutcome::SafetyBlocked => finalize_completed(
@@ -2929,7 +2996,8 @@ where
             work.id,
             queue_name,
             ImageGenQueuePollOutcome::SafetyBlocked,
-            now,
+            activity,
+            options.now,
         ),
         ImageGenJobExecutionOutcome::Failed => {
             let error = execution
@@ -2940,17 +3008,19 @@ where
                 &work,
                 queue_name,
                 &error,
-                max_llm_job_attempts,
-                now,
+                options.max_llm_job_attempts,
+                activity.clone(),
+                options.now,
             ) {
                 return report;
             }
-            let _ = queue.fail(work.id, error.clone(), now);
+            let _ = queue.fail(work.id, error.clone(), options.now);
             ImageGenQueuePollReport {
                 queue_name: queue_name.to_owned(),
                 job_id: Some(work.id),
                 outcome: ImageGenQueuePollOutcome::Failed,
                 error: Some(error),
+                activity,
             }
         }
     }
@@ -2962,6 +3032,7 @@ fn retry_or_exhaust_image_gen_job(
     queue_name: &str,
     error: &str,
     max_llm_job_attempts: i32,
+    activity: TelegramActivitySnapshot,
     now: OffsetDateTime,
 ) -> Option<ImageGenQueuePollReport> {
     let reason = openplotva_llm::retry::retryable_reason_from_message(error)?;
@@ -2994,6 +3065,7 @@ fn retry_or_exhaust_image_gen_job(
             job_id: Some(work.id),
             outcome: ImageGenQueuePollOutcome::RetryExhausted,
             error: Some(error.to_owned()),
+            activity,
         });
     }
     queue.requeue_job_to_queue(work.id, &target_queue).ok()?;
@@ -3002,6 +3074,7 @@ fn retry_or_exhaust_image_gen_job(
         job_id: Some(work.id),
         outcome: ImageGenQueuePollOutcome::RetryRequeued,
         error: None,
+        activity,
     })
 }
 
@@ -3084,8 +3157,7 @@ where
         editor,
         effects,
         worker_id,
-        DEFAULT_LLM_JOB_MAX_ATTEMPTS,
-        now,
+        ImageQueuePollOptions::at(now),
     )
     .await
 }
@@ -3097,14 +3169,13 @@ pub async fn run_image_edit_queue_once_with_max_attempts<Editor, Effects>(
     editor: &Editor,
     effects: &Effects,
     worker_id: &str,
-    max_llm_job_attempts: i32,
-    now: OffsetDateTime,
+    options: ImageQueuePollOptions<'_>,
 ) -> ImageEditQueuePollReport
 where
     Editor: ImageEditor + Sync,
     Effects: ImageJobEffects + Sync,
 {
-    let Some(work) = queue.dequeue_matching(queue_name, worker_id, now, |job| {
+    let Some(work) = queue.dequeue_matching(queue_name, worker_id, options.now, |job| {
         job.data.job_type == JobType::ImageEdit
     }) else {
         return ImageEditQueuePollReport {
@@ -3112,6 +3183,7 @@ where
             job_id: None,
             outcome: ImageEditQueuePollOutcome::Idle,
             error: None,
+            activity: TelegramActivitySnapshot::default(),
         };
     };
 
@@ -3119,18 +3191,30 @@ where
         Ok(params) => params,
         Err(error) => {
             let error = error.to_string();
-            let _ = queue.fail(work.id, error.clone(), now);
+            let _ = queue.fail(work.id, error.clone(), options.now);
             return ImageEditQueuePollReport {
                 queue_name: queue_name.to_owned(),
                 job_id: Some(work.id),
                 outcome: ImageEditQueuePollOutcome::DecodeFailed,
                 error: Some(error),
+                activity: TelegramActivitySnapshot::default(),
             };
         }
     };
 
-    let _ = queue.set_execution_started(work.id, now);
+    let _ = queue.set_execution_started(work.id, options.now);
+    let activity_guard = options.activity_pulse.map(|pulse| {
+        pulse.start(
+            params.chat_id,
+            params.thread_id,
+            TelegramActivityAction::UploadPhoto,
+        )
+    });
     let execution = execute_image_edit_job(editor, effects, params).await;
+    let activity = activity_guard
+        .as_ref()
+        .map_or_else(TelegramActivitySnapshot::default, |guard| guard.snapshot());
+    drop(activity_guard);
     match execution.outcome {
         ImageEditJobExecutionOutcome::Completed => {
             if !execution.image_urls.is_empty() {
@@ -3142,7 +3226,8 @@ where
                 work.id,
                 queue_name,
                 ImageEditQueuePollOutcome::Completed,
-                now,
+                activity,
+                options.now,
             )
         }
         ImageEditJobExecutionOutcome::SafetyBlocked => finalize_image_edit_completed(
@@ -3150,7 +3235,8 @@ where
             work.id,
             queue_name,
             ImageEditQueuePollOutcome::SafetyBlocked,
-            now,
+            activity,
+            options.now,
         ),
         ImageEditJobExecutionOutcome::Failed => {
             let error = execution
@@ -3161,17 +3247,19 @@ where
                 &work,
                 queue_name,
                 &error,
-                max_llm_job_attempts,
-                now,
+                options.max_llm_job_attempts,
+                activity.clone(),
+                options.now,
             ) {
                 return report;
             }
-            let _ = queue.fail(work.id, error.clone(), now);
+            let _ = queue.fail(work.id, error.clone(), options.now);
             ImageEditQueuePollReport {
                 queue_name: queue_name.to_owned(),
                 job_id: Some(work.id),
                 outcome: ImageEditQueuePollOutcome::Failed,
                 error: Some(error),
+                activity,
             }
         }
     }
@@ -3183,6 +3271,7 @@ fn retry_or_exhaust_image_edit_job(
     queue_name: &str,
     error: &str,
     max_llm_job_attempts: i32,
+    activity: TelegramActivitySnapshot,
     now: OffsetDateTime,
 ) -> Option<ImageEditQueuePollReport> {
     let reason = openplotva_llm::retry::retryable_reason_from_message(error)?;
@@ -3215,6 +3304,7 @@ fn retry_or_exhaust_image_edit_job(
             job_id: Some(work.id),
             outcome: ImageEditQueuePollOutcome::RetryExhausted,
             error: Some(error.to_owned()),
+            activity,
         });
     }
     queue.requeue_job_to_queue(work.id, &target_queue).ok()?;
@@ -3223,6 +3313,7 @@ fn retry_or_exhaust_image_edit_job(
         job_id: Some(work.id),
         outcome: ImageEditQueuePollOutcome::RetryRequeued,
         error: None,
+        activity,
     })
 }
 
@@ -3267,8 +3358,7 @@ where
         generator,
         effects,
         queue_names,
-        interval,
-        DEFAULT_LLM_JOB_MAX_ATTEMPTS,
+        ImageWorkerRunOptions::every(interval),
         stop,
     )
     .await
@@ -3280,8 +3370,7 @@ pub async fn run_image_gen_worker_every_until_with_max_attempts<Generator, Effec
     generator: &Generator,
     effects: &Effects,
     queue_names: &'static [&'static str],
-    interval: StdDuration,
-    max_llm_job_attempts: i32,
+    options: ImageWorkerRunOptions<'_>,
     stop: Stop,
 ) -> ImageGenWorkerRunReport
 where
@@ -3295,7 +3384,7 @@ where
     loop {
         tokio::select! {
             () = &mut stop => break,
-            () = tokio::time::sleep(interval) => {
+            () = tokio::time::sleep(options.interval) => {
                 for queue_name in queue_names {
                     let tick = run_image_gen_queue_once_with_max_attempts(
                         queue,
@@ -3303,8 +3392,11 @@ where
                         generator,
                         effects,
                         image_worker_id(queue_name),
-                        max_llm_job_attempts,
-                        OffsetDateTime::now_utc(),
+                        ImageQueuePollOptions {
+                            max_llm_job_attempts: options.max_llm_job_attempts,
+                            activity_pulse: options.activity_pulse,
+                            now: OffsetDateTime::now_utc(),
+                        },
                     ).await;
                     trace_image_gen_queue_tick(&tick);
                     report.record_poll(&tick);
@@ -3357,8 +3449,7 @@ where
         editor,
         effects,
         queue_names,
-        interval,
-        DEFAULT_LLM_JOB_MAX_ATTEMPTS,
+        ImageWorkerRunOptions::every(interval),
         stop,
     )
     .await
@@ -3370,8 +3461,7 @@ pub async fn run_image_edit_worker_every_until_with_max_attempts<Editor, Effects
     editor: &Editor,
     effects: &Effects,
     queue_names: &'static [&'static str],
-    interval: StdDuration,
-    max_llm_job_attempts: i32,
+    options: ImageWorkerRunOptions<'_>,
     stop: Stop,
 ) -> ImageEditWorkerRunReport
 where
@@ -3385,7 +3475,7 @@ where
     loop {
         tokio::select! {
             () = &mut stop => break,
-            () = tokio::time::sleep(interval) => {
+            () = tokio::time::sleep(options.interval) => {
                 for queue_name in queue_names {
                     let tick = run_image_edit_queue_once_with_max_attempts(
                         queue,
@@ -3393,8 +3483,11 @@ where
                         editor,
                         effects,
                         image_worker_id(queue_name),
-                        max_llm_job_attempts,
-                        OffsetDateTime::now_utc(),
+                        ImageQueuePollOptions {
+                            max_llm_job_attempts: options.max_llm_job_attempts,
+                            activity_pulse: options.activity_pulse,
+                            now: OffsetDateTime::now_utc(),
+                        },
                     ).await;
                     trace_image_edit_queue_tick(&tick);
                     report.record_poll(&tick);
@@ -3411,6 +3504,7 @@ fn finalize_completed(
     job_id: i64,
     queue_name: &str,
     outcome: ImageGenQueuePollOutcome,
+    activity: TelegramActivitySnapshot,
     now: OffsetDateTime,
 ) -> ImageGenQueuePollReport {
     let error = queue
@@ -3422,6 +3516,7 @@ fn finalize_completed(
         job_id: Some(job_id),
         outcome,
         error,
+        activity,
     }
 }
 
@@ -3430,6 +3525,7 @@ fn finalize_image_edit_completed(
     job_id: i64,
     queue_name: &str,
     outcome: ImageEditQueuePollOutcome,
+    activity: TelegramActivitySnapshot,
     now: OffsetDateTime,
 ) -> ImageEditQueuePollReport {
     let error = queue
@@ -3441,6 +3537,7 @@ fn finalize_image_edit_completed(
         job_id: Some(job_id),
         outcome,
         error,
+        activity,
     }
 }
 
@@ -3465,6 +3562,14 @@ fn trace_image_gen_queue_tick(tick: &ImageGenQueuePollReport) {
         queue_name = tick.queue_name,
         job_id = tick.job_id,
         outcome = ?tick.outcome,
+        activity_action = tick
+            .activity
+            .action
+            .map(|action| action.as_telegram_action()),
+        activity_pulses_sent = tick.activity.sent,
+        activity_pulse_failures = tick.activity.failed,
+        activity_pulse_skips = tick.activity.skipped,
+        activity_pulse_last_error = tick.activity.last_error.as_deref(),
         error = tick.error.as_deref(),
         "processed image generation taskman worker tick"
     );
@@ -3647,6 +3752,14 @@ fn trace_image_edit_queue_tick(tick: &ImageEditQueuePollReport) {
                 queue_name = tick.queue_name,
                 job_id = tick.job_id,
                 outcome = ?tick.outcome,
+                activity_action = tick
+                    .activity
+                    .action
+                    .map(|action| action.as_telegram_action()),
+                activity_pulses_sent = tick.activity.sent,
+                activity_pulse_failures = tick.activity.failed,
+                activity_pulse_skips = tick.activity.skipped,
+                activity_pulse_last_error = tick.activity.last_error.as_deref(),
                 "processed image edit taskman worker tick"
             );
         }
@@ -3657,6 +3770,14 @@ fn trace_image_edit_queue_tick(tick: &ImageEditQueuePollReport) {
                 queue_name = tick.queue_name,
                 job_id = tick.job_id,
                 outcome = ?tick.outcome,
+                activity_action = tick
+                    .activity
+                    .action
+                    .map(|action| action.as_telegram_action()),
+                activity_pulses_sent = tick.activity.sent,
+                activity_pulse_failures = tick.activity.failed,
+                activity_pulse_skips = tick.activity.skipped,
+                activity_pulse_last_error = tick.activity.last_error.as_deref(),
                 error = tick.error.as_deref().unwrap_or_default(),
                 "image edit taskman job failed"
             );
@@ -4273,6 +4394,63 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[derive(Debug)]
+    struct RecordingActivityEffects {
+        report: crate::telegram_activity::TelegramActivityReport,
+        calls: Mutex<
+            Vec<(
+                i64,
+                Option<i32>,
+                crate::telegram_activity::TelegramActivityAction,
+            )>,
+        >,
+    }
+
+    impl RecordingActivityEffects {
+        fn new(report: crate::telegram_activity::TelegramActivityReport) -> Self {
+            Self {
+                report,
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(
+            &self,
+        ) -> Vec<(
+            i64,
+            Option<i32>,
+            crate::telegram_activity::TelegramActivityAction,
+        )> {
+            self.calls.lock().expect("activity calls").clone()
+        }
+    }
+
+    impl crate::telegram_activity::TelegramActivityEffects for RecordingActivityEffects {
+        fn send_activity_action<'a>(
+            &'a self,
+            chat_id: i64,
+            thread_id: Option<i32>,
+            action: crate::telegram_activity::TelegramActivityAction,
+        ) -> crate::telegram_activity::TelegramActivityFuture<'a> {
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .expect("activity calls")
+                    .push((chat_id, thread_id, action));
+                self.report.clone()
+            })
+        }
+    }
+
+    fn activity_pulse(
+        effects: Arc<RecordingActivityEffects>,
+    ) -> crate::telegram_activity::TelegramActivityPulse {
+        crate::telegram_activity::TelegramActivityPulse::new(
+            crate::telegram_activity::TelegramActivityPulseSettings::from_millis(true, 1_000, 0),
+            effects,
+        )
+    }
 
     #[tokio::test]
     async fn execute_image_gen_job_matches_go_sanitize_prompt_caption_and_effect_order() {
@@ -5480,6 +5658,7 @@ mod tests {
                 job_id: Some(job_id),
                 outcome: ImageGenQueuePollOutcome::Completed,
                 error: None,
+                activity: TelegramActivitySnapshot::default(),
             }
         );
         let record = &queue.records()[0];
@@ -5495,6 +5674,73 @@ mod tests {
                 .image_urls,
             vec!["https://img.test/1.png"]
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn image_gen_queue_once_pulses_upload_photo_during_active_job() {
+        let queue = InMemoryTaskQueue::new();
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800).expect("time");
+        let job_id = queue.assign(
+            IMAGE_REGULAR_QUEUE_NAME,
+            new_image_gen_job_at(
+                ImageGenJobParams {
+                    chat_id: -100,
+                    message_id: 20,
+                    user_id: 30,
+                    user_full_name: "Alice".to_owned(),
+                    prompt: "castle".to_owned(),
+                    thread_id: Some(9),
+                    ..ImageGenJobParams::default()
+                },
+                now,
+            ),
+        );
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let generator =
+            WaitingGeneratorStub::success("https://img.test/slow.png", Arc::clone(&notify));
+        let effects = EffectsStub::new();
+        let activity_effects = Arc::new(RecordingActivityEffects::new(
+            crate::telegram_activity::TelegramActivityReport::Sent,
+        ));
+        let pulse = activity_pulse(Arc::clone(&activity_effects));
+
+        let poll = run_image_gen_queue_once_with_max_attempts(
+            &queue,
+            IMAGE_REGULAR_QUEUE_NAME,
+            &generator,
+            &effects,
+            "image-worker-1",
+            ImageQueuePollOptions {
+                max_llm_job_attempts: DEFAULT_LLM_JOB_MAX_ATTEMPTS,
+                activity_pulse: Some(&pulse),
+                now,
+            },
+        );
+        tokio::pin!(poll);
+        tokio::select! {
+            _ = &mut poll => panic!("waiting generator should keep the job active"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => {}
+        }
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            activity_effects.calls().first().copied(),
+            Some((
+                -100,
+                Some(9),
+                crate::telegram_activity::TelegramActivityAction::UploadPhoto,
+            ))
+        );
+        notify.notify_one();
+        let report = poll.await;
+
+        assert_eq!(report.job_id, Some(job_id));
+        assert_eq!(report.outcome, ImageGenQueuePollOutcome::Completed);
+        assert!(
+            report.activity.sent >= 1,
+            "active image generation must report upload_photo pulse"
+        );
+        assert_eq!(queue.records()[0].status, JobStatus::Completed);
     }
 
     #[tokio::test]
@@ -5595,6 +5841,7 @@ mod tests {
                 job_id: Some(job_id),
                 outcome: ImageEditQueuePollOutcome::Completed,
                 error: None,
+                activity: TelegramActivitySnapshot::default(),
             }
         );
         let record = &queue.records()[0];
@@ -5609,6 +5856,79 @@ mod tests {
                 .image_urls,
             vec!["https://img.test/edit.png"]
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn image_edit_queue_once_pulses_upload_photo_during_active_job() {
+        let queue = InMemoryTaskQueue::new();
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800).expect("time");
+        let job_id = queue.assign(
+            IMAGE_VIP_QUEUE_NAME,
+            new_image_edit_job_at(
+                ImageEditJobParams {
+                    chat_id: -100,
+                    message_id: 20,
+                    user_id: 30,
+                    user_full_name: "Alice".to_owned(),
+                    prompt: "make it night".to_owned(),
+                    photo_file_id: "photo-file".to_owned(),
+                    photo_urls: vec!["https://telegram.test/original.png".to_owned()],
+                    thread_id: Some(9),
+                },
+                now,
+            )
+            .with_name("image_edit")
+            .with_priority(HIGHEST_PRIORITY),
+        );
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let editor = WaitingEditorStub::success(
+            vec!["https://img.test/edit-slow.png".to_owned()],
+            Arc::clone(&notify),
+        );
+        let effects = EffectsStub::new();
+        let activity_effects = Arc::new(RecordingActivityEffects::new(
+            crate::telegram_activity::TelegramActivityReport::Sent,
+        ));
+        let pulse = activity_pulse(Arc::clone(&activity_effects));
+
+        let poll = run_image_edit_queue_once_with_max_attempts(
+            &queue,
+            IMAGE_VIP_QUEUE_NAME,
+            &editor,
+            &effects,
+            "image-edit-worker-1",
+            ImageQueuePollOptions {
+                max_llm_job_attempts: DEFAULT_LLM_JOB_MAX_ATTEMPTS,
+                activity_pulse: Some(&pulse),
+                now,
+            },
+        );
+        tokio::pin!(poll);
+        tokio::select! {
+            _ = &mut poll => panic!("waiting editor should keep the job active"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => {}
+        }
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            activity_effects.calls().first().copied(),
+            Some((
+                -100,
+                Some(9),
+                crate::telegram_activity::TelegramActivityAction::UploadPhoto,
+            ))
+        );
+        notify.notify_one();
+        let report = poll.await;
+
+        assert_eq!(report.job_id, Some(job_id));
+        assert_eq!(report.outcome, ImageEditQueuePollOutcome::Completed);
+        assert!(
+            report.activity.sent >= 1,
+            "active image edit must report upload_photo pulse"
+        );
+        assert_eq!(queue.records()[0].status, JobStatus::Completed);
+        assert_eq!(editor.requests().len(), 1);
     }
 
     #[tokio::test]
@@ -5711,8 +6031,11 @@ mod tests {
             &GeneratorStub::error("aifarm provider provider_unavailable: status 503"),
             &EffectsStub::new(),
             "image-worker-1",
-            2,
-            now,
+            ImageQueuePollOptions {
+                max_llm_job_attempts: 2,
+                activity_pulse: None,
+                now,
+            },
         )
         .await;
 
@@ -5761,8 +6084,11 @@ mod tests {
             &EditorStub::error("aifarm provider provider_unavailable: status 503"),
             &EffectsStub::new(),
             "image-edit-worker-1",
-            2,
-            now,
+            ImageQueuePollOptions {
+                max_llm_job_attempts: 2,
+                activity_pulse: None,
+                now,
+            },
         )
         .await;
 
@@ -5987,18 +6313,21 @@ mod tests {
             job_id: Some(1),
             outcome: ImageGenQueuePollOutcome::SafetyBlocked,
             error: None,
+            activity: TelegramActivitySnapshot::default(),
         });
         report.record_poll(&ImageGenQueuePollReport {
             queue_name: IMAGE_REGULAR_QUEUE_NAME.to_owned(),
             job_id: Some(2),
             outcome: ImageGenQueuePollOutcome::Failed,
             error: Some("provider down".to_owned()),
+            activity: TelegramActivitySnapshot::default(),
         });
         report.record_poll(&ImageGenQueuePollReport {
             queue_name: IMAGE_REGULAR_QUEUE_NAME.to_owned(),
             job_id: None,
             outcome: ImageGenQueuePollOutcome::Idle,
             error: None,
+            activity: TelegramActivitySnapshot::default(),
         });
 
         assert_eq!(
@@ -6014,6 +6343,9 @@ mod tests {
                 decode_failed: 0,
                 idle: 1,
                 errors: 1,
+                activity_pulses_sent: 0,
+                activity_pulse_failures: 0,
+                activity_pulse_skips: 0,
             }
         );
     }
@@ -7004,6 +7336,45 @@ mod tests {
                 .expect("image edit requests")
                 .push(request);
             Box::pin(async move { result })
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct WaitingEditorStub {
+        image_urls: Vec<String>,
+        notify: Arc<tokio::sync::Notify>,
+        requests: Arc<Mutex<Vec<ImageEditRequest>>>,
+    }
+
+    impl WaitingEditorStub {
+        fn success(image_urls: Vec<String>, notify: Arc<tokio::sync::Notify>) -> Self {
+            Self {
+                image_urls,
+                notify,
+                requests: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn requests(&self) -> Vec<ImageEditRequest> {
+            self.requests.lock().expect("image edit requests").clone()
+        }
+    }
+
+    impl ImageEditor for WaitingEditorStub {
+        fn edit_image<'a>(&'a self, request: ImageEditRequest) -> ImageEditFuture<'a> {
+            self.requests
+                .lock()
+                .expect("image edit requests")
+                .push(request);
+            let image_urls = self.image_urls.clone();
+            let notify = Arc::clone(&self.notify);
+            Box::pin(async move {
+                notify.notified().await;
+                Ok(ImageEditResult {
+                    image_urls,
+                    ..ImageEditResult::default()
+                })
+            })
         }
     }
 

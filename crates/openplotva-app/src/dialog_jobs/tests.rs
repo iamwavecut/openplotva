@@ -22,6 +22,63 @@ use time::{Duration as TimeDuration, OffsetDateTime};
 
 use super::*;
 
+#[derive(Debug)]
+struct RecordingActivityEffects {
+    report: crate::telegram_activity::TelegramActivityReport,
+    calls: Mutex<
+        Vec<(
+            i64,
+            Option<i32>,
+            crate::telegram_activity::TelegramActivityAction,
+        )>,
+    >,
+}
+
+impl RecordingActivityEffects {
+    fn new(report: crate::telegram_activity::TelegramActivityReport) -> Self {
+        Self {
+            report,
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn calls(
+        &self,
+    ) -> Vec<(
+        i64,
+        Option<i32>,
+        crate::telegram_activity::TelegramActivityAction,
+    )> {
+        self.calls.lock().expect("activity calls").clone()
+    }
+}
+
+impl crate::telegram_activity::TelegramActivityEffects for RecordingActivityEffects {
+    fn send_activity_action<'a>(
+        &'a self,
+        chat_id: i64,
+        thread_id: Option<i32>,
+        action: crate::telegram_activity::TelegramActivityAction,
+    ) -> crate::telegram_activity::TelegramActivityFuture<'a> {
+        Box::pin(async move {
+            self.calls
+                .lock()
+                .expect("activity calls")
+                .push((chat_id, thread_id, action));
+            self.report.clone()
+        })
+    }
+}
+
+fn activity_pulse(
+    effects: Arc<RecordingActivityEffects>,
+) -> crate::telegram_activity::TelegramActivityPulse {
+    crate::telegram_activity::TelegramActivityPulse::new(
+        crate::telegram_activity::TelegramActivityPulseSettings::from_millis(true, 1_000, 0),
+        effects,
+    )
+}
+
 #[tokio::test]
 async fn dialog_worker_runs_provider_sends_answer_and_completes_job() -> Result<(), Box<dyn Error>>
 {
@@ -65,6 +122,114 @@ async fn dialog_worker_runs_provider_sends_answer_and_completes_job() -> Result<
             .any(|event| event.stage == crate::dialog_turn::SESSION_MESSAGE_SENT_STAGE),
         "successful send must append the session sent marker"
     );
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn dialog_worker_pulses_typing_during_active_turn() -> Result<(), Box<dyn Error>> {
+    let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+    let queue = InMemoryTaskQueue::new();
+    let job_id = queue.assign(
+        DIALOG_AIFARM_QUEUE_NAME,
+        new_dialog_job_at(dialog_params("долго подумай"), now),
+    );
+    let provider = SlowProviderStub::new(
+        DialogOutput {
+            answer: "готово".to_owned(),
+            ..DialogOutput::default()
+        },
+        Duration::from_millis(2_500),
+    );
+    let effects = EffectsStub::default();
+    let activity_effects = Arc::new(RecordingActivityEffects::new(
+        crate::telegram_activity::TelegramActivityReport::Sent,
+    ));
+    let pulse = activity_pulse(Arc::clone(&activity_effects));
+    let outcomes = crate::dialog_turn::DialogTurnObserver::new(
+        crate::dialog_turn::RuntimeTurnOutcomeBuffer::new(8),
+        None,
+    );
+
+    let report = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+        &queue,
+        &provider,
+        &effects,
+        &BasicDialogInputMaterializer,
+        &NoopDialogToolCallHistoryStore,
+        DialogJobProcessOptions {
+            activity_pulse: Some(&pulse),
+            ..session_options(now, &outcomes, leaked_session_wiring())
+        },
+    )
+    .await;
+
+    assert!(report.sent_answer, "{report:?}");
+    assert_eq!(record_status(&queue, job_id), JobStatus::Completed);
+    assert!(
+        report.activity.sent >= 2,
+        "long active turns must refresh typing, got {report:?}"
+    );
+    assert!(
+        activity_effects.calls().iter().all(|call| {
+            *call
+                == (
+                    42,
+                    Some(9),
+                    crate::telegram_activity::TelegramActivityAction::Typing,
+                )
+        }),
+        "typing pulse must target the dialog chat/thread"
+    );
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn dialog_worker_ignores_activity_error() -> Result<(), Box<dyn Error>> {
+    let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+    let queue = InMemoryTaskQueue::new();
+    let job_id = queue.assign(
+        DIALOG_AIFARM_QUEUE_NAME,
+        new_dialog_job_at(dialog_params("ответь даже если typing упал"), now),
+    );
+    let provider = SlowProviderStub::new(
+        DialogOutput {
+            answer: "ответ".to_owned(),
+            ..DialogOutput::default()
+        },
+        Duration::from_millis(1_000),
+    );
+    let effects = EffectsStub::default();
+    let activity_effects = Arc::new(RecordingActivityEffects::new(
+        crate::telegram_activity::TelegramActivityReport::SendFailed {
+            message: "telegram unavailable".to_owned(),
+        },
+    ));
+    let pulse = activity_pulse(Arc::clone(&activity_effects));
+    let outcomes = crate::dialog_turn::DialogTurnObserver::new(
+        crate::dialog_turn::RuntimeTurnOutcomeBuffer::new(8),
+        None,
+    );
+
+    let report = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+        &queue,
+        &provider,
+        &effects,
+        &BasicDialogInputMaterializer,
+        &NoopDialogToolCallHistoryStore,
+        DialogJobProcessOptions {
+            activity_pulse: Some(&pulse),
+            ..session_options(now, &outcomes, leaked_session_wiring())
+        },
+    )
+    .await;
+
+    assert!(report.sent_answer, "{report:?}");
+    assert_eq!(record_status(&queue, job_id), JobStatus::Completed);
+    assert!(
+        report.activity.failed >= 1,
+        "activity failures must be recorded without failing the dialog"
+    );
+    assert_eq!(effects.sent()[0].1, "ответ");
     Ok(())
 }
 
@@ -116,6 +281,7 @@ async fn dialog_worker_skips_resend_when_answer_sent_marker_present() -> Result<
             turn_outcomes: Some(&outcomes),
             session: leaked_session_wiring(),
             llm_runs: None,
+            activity_pulse: None,
         },
     )
     .await;
@@ -309,6 +475,7 @@ async fn dialog_worker_completes_delegated_queued_song_without_sending_text()
             obligations: None,
             session: &wiring,
             llm_runs: None,
+            activity_pulse: None,
         },
     )
     .await;
@@ -456,6 +623,7 @@ async fn dialog_worker_regenerates_duplicate_answer_with_anti_loop_hint()
             turn_outcomes: Some(&outcomes),
             session: leaked_session_wiring(),
             llm_runs: None,
+            activity_pulse: None,
         },
     )
     .await;
@@ -532,6 +700,7 @@ async fn dialog_worker_exhausts_regenerations_on_permanent_duplicate_and_signals
             turn_outcomes: Some(&outcomes),
             session: leaked_session_wiring(),
             llm_runs: None,
+            activity_pulse: None,
         },
     )
     .await;
@@ -613,6 +782,7 @@ async fn dialog_worker_skips_regeneration_when_budget_nearly_exhausted()
             turn_outcomes: Some(&outcomes),
             session: leaked_session_wiring(),
             llm_runs: None,
+            activity_pulse: None,
         },
     )
     .await;
@@ -676,6 +846,7 @@ async fn dialog_worker_signals_terminal_failure_with_configured_emoji() -> Resul
             turn_outcomes: Some(&outcomes),
             session: leaked_session_wiring(),
             llm_runs: None,
+            activity_pulse: None,
         },
     )
     .await;
@@ -756,6 +927,7 @@ async fn dialog_worker_skips_signal_for_job_older_than_max_signal_age() -> Resul
             turn_outcomes: Some(&outcomes),
             session: leaked_session_wiring(),
             llm_runs: None,
+            activity_pulse: None,
         },
     )
     .await;
@@ -816,6 +988,7 @@ async fn dialog_worker_still_reacts_but_gates_text_fallback_after_prior_signal()
             turn_outcomes: None,
             session: leaked_session_wiring(),
             llm_runs: None,
+            activity_pulse: None,
         },
     )
     .await;
@@ -876,6 +1049,7 @@ async fn dialog_worker_fails_when_answer_sanitizes_to_empty_after_attempts_exhau
             turn_outcomes: Some(&outcomes),
             session: leaked_session_wiring(),
             llm_runs: None,
+            activity_pulse: None,
         },
     )
     .await;
@@ -989,6 +1163,7 @@ async fn dialog_worker_fails_expired_queue_backlog_job_without_provider_call()
             turn_outcomes: Some(&outcomes),
             session: leaked_session_wiring(),
             llm_runs: None,
+            activity_pulse: None,
         },
     )
     .await;
@@ -1104,6 +1279,7 @@ async fn dialog_worker_fails_turn_budget_exhausted_before_provider_call()
             turn_outcomes: Some(&outcomes),
             session: leaked_session_wiring(),
             llm_runs: None,
+            activity_pulse: None,
         },
     )
     .await;
@@ -1163,6 +1339,7 @@ async fn dialog_worker_retries_provider_empty_output_and_fails_on_exhaustion()
         turn_outcomes: Some(&outcomes),
         session: leaked_session_wiring(),
         llm_runs: None,
+        activity_pulse: None,
     };
 
     let first = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
@@ -1239,6 +1416,7 @@ async fn dialog_worker_requeues_undeliverable_answer_instead_of_failing_at_send(
         turn_outcomes: Some(&outcomes),
         session: leaked_session_wiring(),
         llm_runs: None,
+        activity_pulse: None,
     };
 
     let first = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
@@ -1593,6 +1771,7 @@ async fn dialog_worker_exhausts_retryable_provider_error_at_default_limit()
             turn_outcomes: None,
             session: leaked_session_wiring(),
             llm_runs: None,
+            activity_pulse: None,
         },
     )
     .await;
@@ -1671,6 +1850,7 @@ async fn dialog_worker_uses_configured_retry_attempt_limit() -> Result<(), Box<d
             turn_outcomes: None,
             session: leaked_session_wiring(),
             llm_runs: None,
+            activity_pulse: None,
         },
     )
     .await;
@@ -1696,6 +1876,7 @@ async fn dialog_worker_uses_configured_retry_attempt_limit() -> Result<(), Box<d
             turn_outcomes: None,
             session: leaked_session_wiring(),
             llm_runs: None,
+            activity_pulse: None,
         },
     )
     .await;
@@ -3007,6 +3188,7 @@ where
             turn_outcomes: None,
             session,
             llm_runs: None,
+            activity_pulse: None,
         },
     )
     .await
@@ -3030,6 +3212,7 @@ fn session_options<'a>(
         turn_outcomes: Some(outcomes),
         session: wiring,
         llm_runs: None,
+        activity_pulse: None,
     }
 }
 
@@ -3165,6 +3348,7 @@ async fn worker_loop_forwards_session_wiring_to_turns() -> Result<(), Box<dyn Er
             obligations: None,
             session: &wiring,
             llm_runs: None,
+            activity_pulse: None,
         },
         stop,
     )
@@ -3222,6 +3406,7 @@ async fn turn_opens_and_closes_an_agent_run_with_origin_tools_and_outcome()
         &NoopDialogToolCallHistoryStore,
         DialogJobProcessOptions {
             llm_runs: Some(&runs),
+            activity_pulse: None,
             ..session_options(now, &outcomes, &wiring)
         },
     )
@@ -3315,6 +3500,7 @@ async fn turn_lifts_the_context_artifact_onto_the_run_detail() -> Result<(), Box
         &NoopDialogToolCallHistoryStore,
         DialogJobProcessOptions {
             llm_runs: Some(&runs),
+            activity_pulse: None,
             ..session_options(now, &outcomes, &wiring)
         },
     )
@@ -3383,6 +3569,7 @@ async fn worker_loop_forwards_llm_runs_into_turns() -> Result<(), Box<dyn Error>
             obligations: None,
             session: &wiring,
             llm_runs: Some(&runs),
+            activity_pulse: None,
         },
         stop,
     )
@@ -3442,6 +3629,7 @@ async fn merged_and_deferred_turns_do_not_open_agent_runs() -> Result<(), Box<dy
             &NoopDialogToolCallHistoryStore,
             DialogJobProcessOptions {
                 llm_runs: Some(&runs),
+                activity_pulse: None,
                 ..session_options(now, &outcomes, &wiring)
             },
         )
@@ -3913,16 +4101,24 @@ async fn busy_session_absorbs_initiator_and_defers_third_party() -> Result<(), B
     );
     let provider = StepProviderStub::with_steps(Vec::new());
     let effects = EffectsStub::default();
+    let activity_effects = Arc::new(RecordingActivityEffects::new(
+        crate::telegram_activity::TelegramActivityReport::Sent,
+    ));
+    let pulse = activity_pulse(Arc::clone(&activity_effects));
     let report = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
         &queue,
         &provider,
         &effects,
         &BasicDialogInputMaterializer,
         &NoopDialogToolCallHistoryStore,
-        session_options(now, &outcomes, &wiring),
+        DialogJobProcessOptions {
+            activity_pulse: Some(&pulse),
+            ..session_options(now, &outcomes, &wiring)
+        },
     )
     .await;
     assert_eq!(report.merged_into_session, Some(999));
+    assert_eq!(report.activity.sent, 0);
     assert_eq!(provider.calls(), 0);
     assert_eq!(record_status(&queue, merged_id), JobStatus::Completed);
     assert_eq!(inbox.drain_open().len(), 1, "message reached the inbox");
@@ -3938,11 +4134,19 @@ async fn busy_session_absorbs_initiator_and_defers_third_party() -> Result<(), B
         &effects,
         &BasicDialogInputMaterializer,
         &NoopDialogToolCallHistoryStore,
-        session_options(now, &outcomes, &wiring),
+        DialogJobProcessOptions {
+            activity_pulse: Some(&pulse),
+            ..session_options(now, &outcomes, &wiring)
+        },
     )
     .await;
     assert_eq!(report.deferred_after_session, Some(999));
+    assert_eq!(report.activity.sent, 0);
     assert_eq!(record_status(&queue, deferred_id), JobStatus::Completed);
+    assert!(
+        activity_effects.calls().is_empty(),
+        "absorbed/deferred jobs must not start an independent activity pulse"
+    );
 
     let release = registry.release(key, 999);
     assert_eq!(release.parked.len(), 1);

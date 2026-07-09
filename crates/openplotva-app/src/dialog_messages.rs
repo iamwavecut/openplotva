@@ -11,16 +11,15 @@ use openplotva_core::{
     ChatMessageMeta, ChatSettings, MessageSender, SENDER_TYPE_USER, UserSettings,
 };
 use openplotva_dialog::PROVIDER_AIFARM;
-use openplotva_server::ACTION_SEND_TEXT;
 use openplotva_taskman::{
     DIALOG_AIFARM_QUEUE_NAME, DialogJobParams, HIGH_PRIORITY, InMemoryTaskQueue, TEXT_QUEUE_NAME,
     new_dialog_job_at,
 };
 use openplotva_telegram::{
-    ChatActionRequest, ChatRef, DispatcherQueue, OutboundBuildError, PhotoMessageRequest,
-    PhotoSource, ReplyMessageRef, ReplyParametersPlan, StickerMessageRequest,
-    TELEGRAM_PARSE_MODE_HTML, TelegramClient, TelegramOutboundMethod, TelegramOutboundMethodKind,
-    TelegramOutboundResponse, TextMessageRequest,
+    ChatRef, DispatcherQueue, OutboundBuildError, PhotoMessageRequest, PhotoSource,
+    ReplyMessageRef, ReplyParametersPlan, StickerMessageRequest, TELEGRAM_PARSE_MODE_HTML,
+    TelegramClient, TelegramOutboundMethod, TelegramOutboundMethodKind, TelegramOutboundResponse,
+    TextMessageRequest,
 };
 use openplotva_updates::{
     FetcherMessageContext, HistoryTextEntry, build_fetcher_message_context,
@@ -44,6 +43,10 @@ use crate::{
     },
     permissions::{self, ChatPermissionPolicy, ChatPermissionStore},
     rate_limits::{self, ChatRateLimitPolicy, RateLimitStore, TaskEnqueueRateLimit},
+    telegram_activity::{
+        TelegramActivityAction, TelegramActivityEffects, TelegramActivityReport,
+        TelegramActivityRuntimeEffects,
+    },
     updates::{UpdateHandler, UpdateHandlerFuture},
     virtual_messages::{
         QueueStickerRequest, QueueTextRequest, VirtualIdFactory, monotonic_virtual_id_factory,
@@ -821,8 +824,7 @@ impl DialogTypingActionEffects for NoopDialogTypingActionEffects {
 /// Runtime typing effects backed by direct Telegram `sendChatAction`.
 #[derive(Clone)]
 pub struct DialogTypingActionRuntimeEffects<Store> {
-    telegram: openplotva_telegram::TelegramClient,
-    permissions: Arc<ChatPermissionPolicy<Store>>,
+    activity: TelegramActivityRuntimeEffects<Store>,
 }
 
 impl<Store> DialogTypingActionRuntimeEffects<Store> {
@@ -832,8 +834,7 @@ impl<Store> DialogTypingActionRuntimeEffects<Store> {
         permissions: Arc<ChatPermissionPolicy<Store>>,
     ) -> Self {
         Self {
-            telegram,
-            permissions,
+            activity: TelegramActivityRuntimeEffects::new(telegram, permissions),
         }
     }
 }
@@ -855,69 +856,21 @@ where
         thread_id: Option<i32>,
     ) -> Pin<Box<dyn Future<Output = DialogTypingActionReport> + Send + 'a>> {
         Box::pin(async move {
-            if chat_id == 0 {
-                return DialogTypingActionReport::SkippedInvalidRequest;
-            }
-            let report = self
-                .permissions
-                .can_perform_action_at(chat_id, None, ACTION_SEND_TEXT, OffsetDateTime::now_utc())
-                .await;
-            if let Some(load_error) = report.load_error.as_deref() {
-                tracing::debug!(
-                    chat_id,
-                    %load_error,
-                    "failed to load Telegram permission state before dialog typing action"
-                );
-            }
-            if !report.allowed {
-                return DialogTypingActionReport::SkippedPermission;
-            }
-
-            let request = ChatActionRequest {
-                chat: ChatRef {
-                    id: chat_id,
-                    is_forum: thread_id.is_some(),
-                },
-                message_thread_id: i64::from(thread_id.unwrap_or_default()),
-                action: "typing".to_owned(),
-            };
-            let Ok(method) = openplotva_telegram::build_chat_action_method(&request) else {
-                return DialogTypingActionReport::SkippedInvalidRequest;
-            };
-            match openplotva_telegram::execute_telegram_method(
-                &self.telegram,
-                TelegramOutboundMethod::from(method),
-            )
-            .await
+            match self
+                .activity
+                .send_activity_action(chat_id, thread_id, TelegramActivityAction::Typing)
+                .await
             {
-                Ok(_) => DialogTypingActionReport::Sent,
-                Err(error) => {
-                    if permissions::telegram_execute_error_is_permission_error(&error) {
-                        let update = self
-                            .permissions
-                            .record_send_permission_error(
-                                chat_id,
-                                TelegramOutboundMethodKind::SendChatAction,
-                            )
-                            .await;
-                        if let Some(load_error) = update.load_error.as_deref() {
-                            tracing::warn!(
-                                chat_id,
-                                %load_error,
-                                "failed to load chat permission state after dialog typing permission error"
-                            );
-                        }
-                        if let Some(save_error) = update.save_error.as_deref() {
-                            tracing::warn!(
-                                chat_id,
-                                %save_error,
-                                "failed to persist chat permission state after dialog typing permission error"
-                            );
-                        }
-                    }
-                    DialogTypingActionReport::SendFailed {
-                        message: error.to_string(),
-                    }
+                TelegramActivityReport::SkippedDisabled
+                | TelegramActivityReport::SkippedInvalidRequest => {
+                    DialogTypingActionReport::SkippedInvalidRequest
+                }
+                TelegramActivityReport::SkippedPermission => {
+                    DialogTypingActionReport::SkippedPermission
+                }
+                TelegramActivityReport::Sent => DialogTypingActionReport::Sent,
+                TelegramActivityReport::SendFailed { message } => {
+                    DialogTypingActionReport::SendFailed { message }
                 }
             }
         })
@@ -3364,6 +3317,7 @@ mod tests {
                     turn_outcomes: None,
                     session: &wiring,
                     llm_runs: None,
+                    activity_pulse: None,
                 },
             )
             .await;
@@ -3539,6 +3493,7 @@ mod tests {
                     turn_outcomes: None,
                     session: &wiring,
                     llm_runs: None,
+                    activity_pulse: None,
                 },
             )
             .await;
@@ -5067,6 +5022,7 @@ mod tests {
                 job_id: Some(job_id),
                 outcome: crate::image_jobs::ImageGenQueuePollOutcome::Completed,
                 error: None,
+                activity: crate::telegram_activity::TelegramActivitySnapshot::default(),
             }
         );
         assert_eq!(
@@ -6394,6 +6350,7 @@ mod tests {
                 job_id: Some(job_id),
                 outcome: crate::music_jobs::MusicQueuePollOutcome::Completed,
                 error: None,
+                activity: crate::telegram_activity::TelegramActivitySnapshot::default(),
             }
         );
         assert_eq!(material_provider.calls(), vec!["99:neon rain".to_owned()]);
@@ -7169,6 +7126,7 @@ mod tests {
                 job_id: Some(job_id),
                 outcome: crate::image_jobs::ImageEditQueuePollOutcome::Completed,
                 error: None,
+                activity: crate::telegram_activity::TelegramActivitySnapshot::default(),
             }
         );
         assert_eq!(
