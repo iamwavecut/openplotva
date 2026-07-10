@@ -688,6 +688,7 @@ fn taskman_search_haystack(record: &RuntimeTaskmanRecord) -> String {
 fn job_type_name(job_type: JobType) -> &'static str {
     match job_type {
         JobType::Dialog => "dialog",
+        JobType::Asr => "asr",
         JobType::ImageGen => "image_gen",
         JobType::ImageEdit => "image_edit",
         JobType::MusicGen => "music_gen",
@@ -706,6 +707,10 @@ fn job_preview(payload: &JobPayload) -> Option<String> {
                 control_kind_name(data.kind).unwrap_or_default(),
             ])
         }),
+        JobType::Asr => payload
+            .asr_data
+            .as_ref()
+            .and_then(|data| first_preview([data.file_unique_id.as_str(), ""])),
         JobType::ImageGen | JobType::ImageEdit => payload
             .image_data
             .as_ref()

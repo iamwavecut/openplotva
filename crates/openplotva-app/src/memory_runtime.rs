@@ -1507,6 +1507,7 @@ fn mark_memory_consolidation_taskman_job_failed(
 fn taskman_job_type_string(job_type: JobType) -> &'static str {
     match job_type {
         JobType::Dialog => "dialog",
+        JobType::Asr => "asr",
         JobType::ImageGen => "image_gen",
         JobType::ImageEdit => "image_edit",
         JobType::MusicGen => "music_gen",

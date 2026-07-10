@@ -1402,10 +1402,6 @@ async fn ensure_asr_model(
         provider.config = provider_input.config;
     }
 
-    let existing_pool_id = models
-        .iter()
-        .find(|model| model.provider_id == provider_id && model.model_name == ASR_MODEL)
-        .and_then(|model| model.pool_id);
     let model_input = ModelInput {
         provider_id,
         model_name: ASR_MODEL.to_owned(),
@@ -1413,7 +1409,7 @@ async fn ensure_asr_model(
         base_url: None,
         capabilities: vec!["asr".to_owned()],
         embedding_dim: None,
-        pool_id: existing_pool_id,
+        pool_id: None,
         enabled: true,
         config: json!({
             "service_name": crate::asr::DEFAULT_ASR_DISCOVERY_SERVICE_NAME,
@@ -1436,7 +1432,7 @@ async fn ensure_asr_model(
     Ok(model_id)
 }
 
-async fn ensure_draw_asr_gpu_pool(
+async fn ensure_draw_gpu_pool_with_unpooled_asr(
     pool: &PgPool,
     providers: &[ProviderRecord],
     models: &[ModelRecord],
@@ -1452,9 +1448,9 @@ async fn ensure_draw_asr_gpu_pool(
     let pool_input = openplotva_storage::llm_routing::PoolInput {
         name: existing_pool
             .map(|record| record.name.clone())
-            .unwrap_or_else(|| DEFAULT_DRAW_ASR_GPU_POOL.to_owned()),
+            .unwrap_or_else(|| DEFAULT_DRAW_GPU_POOL.to_owned()),
         max_concurrency: Some(1),
-        description: Some(DRAW_ASR_GPU_POOL_DESCRIPTION.to_owned()),
+        description: Some(DRAW_GPU_POOL_DESCRIPTION.to_owned()),
         config: existing_pool
             .map(|record| record.config.clone())
             .unwrap_or_else(|| serde_json::json!({})),
@@ -1464,28 +1460,39 @@ async fn ensure_draw_asr_gpu_pool(
         None => openplotva_storage::llm_routing::insert_pool_if_missing(pool, &pool_input).await?,
     };
     openplotva_storage::llm_routing::update_pool(pool, pool_id, &pool_input).await?;
-    let mut attached = 0_u64;
+    let mut draw_attached = 0_u64;
+    let mut asr_detached = 0_u64;
     for provider_name in [DRAW_API_PROVIDER, ASR_PROVIDER] {
         let Some(provider_id) = existing_provider_id(providers, provider_name) else {
             continue;
         };
+        let target_pool_id = gpu_pool_target(provider_name, pool_id);
         for model in models
             .iter()
             .filter(|model| model.provider_id == provider_id)
         {
-            if model.pool_id != Some(pool_id) {
-                set_model_pool(pool, model.id, Some(pool_id)).await?;
-                attached += 1;
+            if model.pool_id != target_pool_id {
+                set_model_pool(pool, model.id, target_pool_id).await?;
+                if target_pool_id.is_some() {
+                    draw_attached += 1;
+                } else {
+                    asr_detached += 1;
+                }
             }
         }
     }
     tracing::info!(
         pool = pool_input.name,
         pool_id,
-        attached,
-        "attached draw and ASR models to shared GPU-1 pool"
+        draw_attached,
+        asr_detached,
+        "configured draw capacity pool with Taskman-prioritized ASR bypass"
     );
     Ok(pool_id)
+}
+
+fn gpu_pool_target(provider_name: &str, pool_id: i64) -> Option<i64> {
+    (provider_name == DRAW_API_PROVIDER).then_some(pool_id)
 }
 
 fn preferred_provider_pool_id(
@@ -1511,25 +1518,25 @@ fn preferred_provider_pool_id(
         })
 }
 
-fn draw_asr_providers_ready(providers: &[ProviderRecord], models: &[ModelRecord]) -> bool {
+fn draw_and_asr_models_ready(providers: &[ProviderRecord], models: &[ModelRecord]) -> bool {
     [DRAW_API_PROVIDER, ASR_PROVIDER].into_iter().all(|name| {
         existing_provider_id(providers, name)
             .is_some_and(|provider_id| models.iter().any(|model| model.provider_id == provider_id))
     })
 }
 
-async fn repair_draw_asr_gpu_pool(pool: &PgPool) -> Result<bool, StorageError> {
-    if app_setting_present(pool, ASR_SHARED_DRAW_POOL_KEY).await? {
+async fn repair_draw_gpu_pool_for_asr_priority(pool: &PgPool) -> Result<bool, StorageError> {
+    if app_setting_present(pool, ASR_TASKMAN_PRIORITY_KEY).await? {
         return Ok(false);
     }
     let providers = list_providers(pool).await?;
     let models = list_models(pool).await?;
-    if !draw_asr_providers_ready(&providers, &models) {
-        tracing::warn!("draw/ASR shared GPU pool repair deferred until both providers have models");
+    if !draw_and_asr_models_ready(&providers, &models) {
+        tracing::warn!("ASR priority repair deferred until draw and ASR providers have models");
         return Ok(false);
     }
-    ensure_draw_asr_gpu_pool(pool, &providers, &models).await?;
-    mark_app_setting(pool, ASR_SHARED_DRAW_POOL_KEY).await?;
+    ensure_draw_gpu_pool_with_unpooled_asr(pool, &providers, &models).await?;
+    mark_app_setting(pool, ASR_TASKMAN_PRIORITY_KEY).await?;
     Ok(true)
 }
 
@@ -1564,7 +1571,7 @@ pub async fn backfill_asr_routing(pool: &PgPool, config: &AppConfig) -> Result<b
         tracing::info!("backfilled ASR routing rows");
         true
     };
-    repair_draw_asr_gpu_pool(pool).await?;
+    repair_draw_gpu_pool_for_asr_priority(pool).await?;
     Ok(seeded)
 }
 
@@ -1572,12 +1579,12 @@ const CAPACITY_POOLS_KEY: &str = "llm.routing.capacity_pools_v1";
 const PROVIDER_PROTOCOL_KEY: &str = "llm.routing.provider_protocol_v1";
 const VRAM_CLOUD_POOL_SLOTS: i32 = 16;
 const ASR_ROUTING_KEY: &str = "llm.routing.asr_v1";
-const ASR_SHARED_DRAW_POOL_KEY: &str = "llm.routing.asr_shared_draw_pool_v1";
+const ASR_TASKMAN_PRIORITY_KEY: &str = "llm.routing.asr_taskman_priority_v1";
 const ASR_PROVIDER: &str = "aifarm-asr";
 const ASR_MODEL: &str = "gigaam-v3-vosk-fallback";
-const DEFAULT_DRAW_ASR_GPU_POOL: &str = "boogu-gpu";
-const DRAW_ASR_GPU_POOL_DESCRIPTION: &str =
-    "Draw/ASR GPU: flux + Boogu render and voice transcription strictly one at a time";
+const DEFAULT_DRAW_GPU_POOL: &str = "boogu-gpu";
+const DRAW_GPU_POOL_DESCRIPTION: &str =
+    "Draw GPU capacity; ASR uses Taskman priority and CPU fallback while draw is active";
 
 /// Classify a provider row's wire protocol from its seeded shape. Pure so it
 /// is table-testable; used only to fill NULL protocols, never to overwrite an
@@ -2360,7 +2367,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_gpu_pool_follows_existing_primary_draw_model_pool() {
+    fn draw_gpu_pool_follows_existing_primary_draw_model_pool() {
         let providers = vec![
             provider(1, DRAW_API_PROVIDER, "image"),
             provider(2, ASR_PROVIDER, "asr"),
@@ -2383,7 +2390,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_gpu_pool_uses_any_existing_draw_pool_when_primary_is_unpooled() {
+    fn draw_gpu_pool_uses_any_existing_draw_pool_when_primary_is_unpooled() {
         let providers = vec![provider(1, DRAW_API_PROVIDER, "image")];
         let primary_draw = model(10, 1, DRAW_API_MODEL);
         let mut alternate_draw = model(11, 1, BOOGU_TURBO_MODEL);
@@ -2400,21 +2407,27 @@ mod tests {
     }
 
     #[test]
-    fn shared_gpu_pool_repair_waits_for_both_provider_models() {
+    fn taskman_priority_keeps_draw_pooled_and_asr_unpooled() {
+        assert_eq!(gpu_pool_target(DRAW_API_PROVIDER, 3), Some(3));
+        assert_eq!(gpu_pool_target(ASR_PROVIDER, 3), None);
+    }
+
+    #[test]
+    fn asr_priority_repair_waits_for_draw_and_asr_models() {
         let draw = provider(1, DRAW_API_PROVIDER, "image");
         let asr = provider(2, ASR_PROVIDER, "asr");
         let draw_model = model(10, draw.id, DRAW_API_MODEL);
         let asr_model = model(20, asr.id, ASR_MODEL);
 
-        assert!(!draw_asr_providers_ready(
+        assert!(!draw_and_asr_models_ready(
             std::slice::from_ref(&draw),
             std::slice::from_ref(&draw_model),
         ));
-        assert!(!draw_asr_providers_ready(
+        assert!(!draw_and_asr_models_ready(
             &[draw.clone(), asr.clone()],
             std::slice::from_ref(&draw_model),
         ));
-        assert!(draw_asr_providers_ready(
+        assert!(draw_and_asr_models_ready(
             &[draw, asr],
             &[draw_model, asr_model],
         ));

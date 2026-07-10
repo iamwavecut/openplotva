@@ -11437,8 +11437,8 @@ async fn start_runtime_workers(
         dialog_context::dialog_vision_direct_image_limit(Some(config.vision.direct_image_limit)),
     ));
     let asr_budget = Duration::from_secs(120);
-    let dialog_context_asr: Arc<dyn asr::DialogAsrInputMaterializer> =
-        Arc::new(asr::TelegramDialogAsrInputMaterializer::new(
+    let dialog_context_asr_runtime = Arc::new(
+        asr::TelegramDialogAsrInputMaterializer::new(
             PostgresTelegramFileStore::new(service_clients.postgres.clone()),
             asr::TelegramClientVoiceDownloader::new(telegram.clone()),
             asr::RoutedAsrTranscriber::new(
@@ -11459,7 +11459,30 @@ async fn start_runtime_workers(
                     capacity_wait: Duration::from_secs(2),
                 },
             ),
-        ));
+        )
+        .with_taskman_queue(Arc::clone(&task_queue_for_updates)),
+    );
+    let dialog_context_asr: Arc<dyn asr::DialogAsrInputMaterializer> =
+        dialog_context_asr_runtime.clone();
+    let asr_task_queue = Arc::clone(&task_queue_for_updates);
+    let asr_task_processor = Arc::clone(&dialog_context_asr_runtime);
+    let asr_task_stop = stop.subscribe();
+    let asr_task_worker = tokio::spawn(async move {
+        let report = asr::run_asr_worker_every_until(
+            asr_task_queue.as_ref(),
+            asr_task_processor.as_ref(),
+            asr::ASR_TASKMAN_POLL_INTERVAL,
+            wait_for_runtime_stop(asr_task_stop),
+        )
+        .await;
+        tracing::info!(?report, "priority ASR taskman worker stopped");
+    });
+    workers.handles.push(asr_task_worker);
+    shared_taskman_worker_counts.insert(openplotva_taskman::ASR_GPU1_QUEUE_NAME.to_owned(), 1);
+    readiness_checks.push(ReadinessCheck::ok(
+        "asr_jobs",
+        "Priority ASR taskman worker blocks new draw claims and uses CPU fallback for active draw",
+    ));
     let rates_fetcher = Arc::new(
         rates::MarketRatesClient::from_config(&config.market_rates)
             .context("failed to initialize market rates provider")?,
@@ -14785,6 +14808,7 @@ mod tests {
                     image_data: None,
                     music_data: None,
                     dialog_data: None,
+                    asr_data: None,
                     control_data: None,
                     agent_data: None,
                 },
