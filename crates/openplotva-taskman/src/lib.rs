@@ -3322,11 +3322,11 @@ mod tests {
         TEXT_QUEUE_NAME, TaskQueueError, TaskQueueJobEvent, TaskQueueJobMessageParams,
         TaskQueueWalRecord, TaskQueueWalSink, asr_job_params_from_stateless_job,
         decode_task_queue_snapshot, encode_task_queue_snapshot, fallback_queue_time_estimate,
-        format_duration_ru,
-        image_edit_job_params_from_stateless_job, image_gen_job_params_from_stateless_job,
-        music_gen_job_params_from_stateless_job, new_agent_job_at, new_asr_job_at,
-        new_control_job_at, new_dialog_job_at, new_image_edit_job_at, new_image_gen_job_at,
-        new_memory_consolidation_job_at, new_music_gen_job_at, replay_task_queue_wal_records,
+        format_duration_ru, image_edit_job_params_from_stateless_job,
+        image_gen_job_params_from_stateless_job, music_gen_job_params_from_stateless_job,
+        new_agent_job_at, new_asr_job_at, new_control_job_at, new_dialog_job_at,
+        new_image_edit_job_at, new_image_gen_job_at, new_memory_consolidation_job_at,
+        new_music_gen_job_at, replay_task_queue_wal_records,
     };
 
     #[derive(Default)]
