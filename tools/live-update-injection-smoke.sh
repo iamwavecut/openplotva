@@ -12,7 +12,7 @@ production, injects a known Telegram update into Redis, then waits for the
 observable live artifact.
 
 Default cases:
-  bang_draw                 enqueues !draw and waits for a drawing-sticker artifact
+  bang_draw                 enqueues !draw and waits for the album delivery record (last_gen)
   percent_draw              enqueues addressed % and waits for image history artifact
   image_edit_missing_prompt enqueues captioned edit verb without prompt and waits for ephemeral notice
   song_notice               enqueues !song and waits for an ephemeral scheduling notice
@@ -422,6 +422,14 @@ def result_for(path, method, params):
         return [{"status": "creator", "user": {"id": int(os.environ.get("OPENPLOTVA_SMOKE_USER_ID", "424242")), "is_bot": False, "first_name": "OpenPlotva"}, "is_anonymous": False}]
     if method.startswith("editMessage"):
         return True
+    if method == "sendMediaGroup":
+        media = params.get("media") or "[]"
+        if isinstance(media, str):
+            try:
+                media = json.loads(media)
+            except ValueError:
+                media = []
+        return [next_message(params, "sendPhoto") for _ in range(max(len(media), 1))]
     if method in {"sendMessage", "sendRichMessage", "sendSticker", "sendPhoto", "sendAudio"}:
         return next_message(params, method)
     return True
@@ -1176,17 +1184,20 @@ wait_telegram_file_cached() {
 wait_loopback_image_edit_artifacts() {
   local photo_file_unique_id="$1"
   local before_get_file="$2"
-  local before_send_sticker="$3"
+  local before_send_photo="$3"
   local before_blocking="$4"
   local before_jobs="$5"
-  local before_delete_message="$6"
+  local before_edit_media="$6"
+  local before_last_gen="$7"
   wait_telegram_file_cached "$photo_file_unique_id"
   wait_loopback_telegram_method_count_at_least getFile "$((before_get_file + 1))"
-  wait_loopback_telegram_method_count_at_least sendSticker "$((before_send_sticker + 1))"
   wait_loopback_telegram_method_count_at_least blocking "$((before_blocking + 1))"
   wait_loopback_telegram_method_count_at_least jobs "$((before_jobs + 1))"
-  wait_loopback_telegram_method_count_at_least deleteMessage "$((before_delete_message + 1))"
-  echo "+ image-edit loopback file/provider/Telegram artifacts observed"
+  wait_loopback_telegram_method_count_at_least sendPhoto "$((before_send_photo + 1))"
+  wait_loopback_telegram_method_count_at_least editMessageMedia "$((before_edit_media + 1))"
+  wait_scan_count "last_gen:${OPENPLOTVA_SMOKE_CHAT_ID}:${OPENPLOTVA_SMOKE_USER_ID}" \
+    "$((before_last_gen + 1))" >/dev/null
+  echo "+ image-edit loopback file/provider/album artifacts observed"
 }
 
 append_case_unique() {
@@ -1524,7 +1535,7 @@ wait_telegram_file_vision_completed() {
 run_bang_draw_case() {
   local update_json="${log_dir}/bang-draw-update.json"
   local prompt="${OPENPLOTVA_LIVE_UPDATE_SMOKE_PROMPT:-openplotva live smoke}"
-  local pattern="ephemeral_messages:${OPENPLOTVA_SMOKE_CHAT_ID}:*"
+  local pattern="last_gen:${OPENPLOTVA_SMOKE_CHAT_ID}:${OPENPLOTVA_SMOKE_USER_ID}"
   local before
   local enqueue_result
   before="$(scan_count "$pattern")"
@@ -1539,7 +1550,7 @@ run_bang_draw_case() {
   wait_queue_empty >/dev/null
   echo "+ update queue drained"
   wait_scan_count "$pattern" "$((before + 1))" >/dev/null
-  echo "+ bang_draw live artifact observed under ${pattern}"
+  echo "+ bang_draw album delivery artifact observed under ${pattern}"
 }
 
 run_percent_draw_case() {
@@ -1619,15 +1630,17 @@ run_image_edit_file_case() {
   local photo_file_unique_id="${OPENPLOTVA_SMOKE_PHOTO_FILE_UNIQUE_ID:-openplotva-smoke-image-edit-$(date +%s)-${update_sequence}}"
   local enqueue_result
   local before_get_file
-  local before_send_sticker
+  local before_send_photo
   local before_blocking
   local before_jobs
-  local before_delete_message
+  local before_edit_media
+  local before_last_gen
   before_get_file="$(telegram_api_method_count getFile)"
-  before_send_sticker="$(telegram_api_method_count sendSticker)"
+  before_send_photo="$(telegram_api_method_count sendPhoto)"
   before_blocking="$(telegram_api_method_count blocking)"
   before_jobs="$(telegram_api_method_count jobs)"
-  before_delete_message="$(telegram_api_method_count deleteMessage)"
+  before_edit_media="$(telegram_api_method_count editMessageMedia)"
+  before_last_gen="$(scan_count "last_gen:${OPENPLOTVA_SMOKE_CHAT_ID}:${OPENPLOTVA_SMOKE_USER_ID}")"
   seed_vip_for_smoke_user
   write_photo_caption_update \
     "$update_json" \
@@ -1647,10 +1660,11 @@ run_image_edit_file_case() {
     wait_loopback_image_edit_artifacts \
       "$photo_file_unique_id" \
       "$before_get_file" \
-      "$before_send_sticker" \
+      "$before_send_photo" \
       "$before_blocking" \
       "$before_jobs" \
-      "$before_delete_message"
+      "$before_edit_media" \
+      "$before_last_gen"
   else
     wait_image_edit_job_completed
   fi

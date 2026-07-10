@@ -503,15 +503,6 @@ pub struct TaskQueueRecord {
     pub agent_state: Option<AgentRunStateBlob>,
 }
 
-/// One pending image job's Telegram coordinates and queue-position placeholder,
-/// used to keep the "waiting in queue" message current as the queue drains.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PendingImageQueueEntry {
-    pub job_id: i64,
-    pub chat_id: i64,
-    pub thread_message_id: Option<i32>,
-}
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TaskQueueJobMessage {
     pub id: i64,
@@ -1486,6 +1477,83 @@ impl InMemoryTaskQueue {
             .count()
     }
 
+    /// Clean completion-time stats for queue ETA estimates: the most recent
+    /// `sample_size` completed jobs with p5/p95 outliers trimmed. Go
+    /// GetCleanQueueStats parity: the window spans enqueue to completion and
+    /// only image/text queues are eligible.
+    #[must_use]
+    pub fn clean_queue_stats(
+        &self,
+        queue_name: &str,
+        sample_size: usize,
+    ) -> Option<CleanQueueStats> {
+        if !(queue_name.starts_with("image-") || queue_name == TEXT_QUEUE_NAME) {
+            return None;
+        }
+        let mut samples: Vec<(OffsetDateTime, f64)> = self
+            .lock()
+            .records
+            .iter()
+            .filter(|record| {
+                record.queue_name == queue_name && record.status == JobStatus::Completed
+            })
+            .filter_map(|record| {
+                let completed_at = record.completed_at?;
+                let total_seconds = (completed_at - record.job.created).whole_seconds();
+                Some((completed_at, total_seconds as f64))
+            })
+            .collect();
+        samples.sort_by_key(|(completed_at, _)| std::cmp::Reverse(*completed_at));
+        samples.truncate(sample_size);
+        if samples.is_empty() {
+            return None;
+        }
+        let mut times: Vec<f64> = samples.into_iter().map(|(_, seconds)| seconds).collect();
+        times.sort_by(f64::total_cmp);
+        let p5_threshold = percentile_cont(&times, 0.05);
+        let p95_threshold = percentile_cont(&times, 0.95);
+        let trimmed: Vec<f64> = times
+            .into_iter()
+            .filter(|seconds| *seconds >= p5_threshold && *seconds <= p95_threshold)
+            .collect();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let avg_clean_time_seconds = trimmed.iter().sum::<f64>() / trimmed.len() as f64;
+        Some(CleanQueueStats {
+            sample_count: trimmed.len(),
+            avg_clean_time_seconds,
+            p5_threshold,
+            p95_threshold,
+        })
+    }
+
+    /// Estimated wait for a job entering a queue that already holds `depth`
+    /// jobs (measured before the caller's own job was assigned): clean-stats
+    /// average × depth ÷ active workers with 30s–4h clamps, falling back to
+    /// the static per-queue estimate when history is insufficient (Go
+    /// EstimateQueueTime parity).
+    #[must_use]
+    pub fn estimate_queue_time_for_depth(
+        &self,
+        queue_name: &str,
+        depth: usize,
+    ) -> std::time::Duration {
+        if depth == 0 {
+            return std::time::Duration::ZERO;
+        }
+        match self.clean_queue_stats(queue_name, QUEUE_ESTIMATE_DEFAULT_SAMPLE_SIZE) {
+            Some(stats) if stats.sample_count >= QUEUE_ESTIMATE_MIN_SAMPLE_SIZE => {
+                let workers = self.active_worker_count_for_queue(queue_name);
+                let estimated_secs =
+                    (stats.avg_clean_time_seconds * depth as f64 / workers as f64).max(0.0);
+                std::time::Duration::from_secs_f64(estimated_secs)
+                    .clamp(QUEUE_ESTIMATE_MIN_TIME, QUEUE_ESTIMATE_MAX_TIME)
+            }
+            _ => fallback_queue_time_estimate(queue_name, depth),
+        }
+    }
+
     /// Count active jobs in one queue.
     #[must_use]
     pub fn active_count(&self, queue_name: &str) -> usize {
@@ -1678,37 +1746,6 @@ impl InMemoryTaskQueue {
         self.append_wal_record(task_queue_wal_upsert(record));
         drop(state);
         Ok(())
-    }
-
-    /// Pending image jobs on one queue in dispatch order (front of queue first).
-    /// The `ahead` count for entry `i` is exactly `i`.
-    #[must_use]
-    pub fn pending_image_queue_entries(&self, queue_name: &str) -> Vec<PendingImageQueueEntry> {
-        let state = self.lock();
-        let mut pending: Vec<&TaskQueueRecord> = state
-            .records
-            .iter()
-            .filter(|record| {
-                record.queue_name == queue_name
-                    && record.status == JobStatus::Pending
-                    && matches!(
-                        record.job.data.job_type,
-                        JobType::ImageGen | JobType::ImageEdit
-                    )
-            })
-            .collect();
-        pending.sort_by(|left, right| compare_go_queue_records(left, right));
-        pending
-            .into_iter()
-            .map(|record| {
-                let telegram = record.job.data.telegram_data.as_ref();
-                PendingImageQueueEntry {
-                    job_id: record.id,
-                    chat_id: telegram.map_or(0, |telegram| telegram.chat_id),
-                    thread_message_id: telegram.and_then(|telegram| telegram.thread_message_id),
-                }
-            })
-            .collect()
     }
 
     pub fn update_job_result_message(
@@ -3153,6 +3190,31 @@ fn task_queue_record_terminal_before(record: &TaskQueueRecord, cutoff: OffsetDat
     }
 }
 
+/// Sample window for clean queue-time stats (Go queueEstimateDefaultSampleSize).
+pub const QUEUE_ESTIMATE_DEFAULT_SAMPLE_SIZE: usize = 20;
+/// Minimum trimmed sample count before clean stats are trusted (Go queueEstimateMinSampleSize).
+pub const QUEUE_ESTIMATE_MIN_SAMPLE_SIZE: usize = 5;
+const QUEUE_ESTIMATE_MIN_TIME: std::time::Duration = std::time::Duration::from_secs(30);
+const QUEUE_ESTIMATE_MAX_TIME: std::time::Duration = std::time::Duration::from_secs(4 * 3600);
+
+/// Completion-time statistics over the recent clean (p5–p95) sample of one queue.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CleanQueueStats {
+    pub sample_count: usize,
+    pub avg_clean_time_seconds: f64,
+    pub p5_threshold: f64,
+    pub p95_threshold: f64,
+}
+
+/// Postgres PERCENTILE_CONT interpolation over an ascending-sorted, non-empty sample.
+fn percentile_cont(sorted: &[f64], fraction: f64) -> f64 {
+    let last = sorted.len() - 1;
+    let position = last as f64 * fraction;
+    let low = position.floor() as usize;
+    let high = (low + 1).min(last);
+    sorted[low] + (position - low as f64) * (sorted[high] - sorted[low])
+}
+
 #[must_use]
 pub fn fallback_queue_time_estimate(queue_name: &str, depth: usize) -> std::time::Duration {
     if depth == 0 {
@@ -3184,6 +3246,33 @@ fn go_duration_string(duration: std::time::Duration) -> String {
 #[must_use]
 pub fn format_go_duration(duration: std::time::Duration) -> String {
     go_duration_string(duration)
+}
+
+/// Russian human-readable duration for queue notices (Go utils.FormatDuration
+/// parity, including its rough hour declensions).
+#[must_use]
+pub fn format_duration_ru(duration: std::time::Duration) -> String {
+    let total_seconds = duration.as_secs();
+    let hours = total_seconds / 3600;
+    let minutes = (total_seconds % 3600) / 60;
+    let seconds = total_seconds % 60;
+    let mut parts = Vec::new();
+    match hours {
+        0 => {}
+        1 => parts.push("1 час".to_owned()),
+        2..=4 => parts.push(format!("{hours} часа")),
+        _ => parts.push(format!("{hours} часов")),
+    }
+    if minutes > 0 {
+        parts.push(format!("{minutes} мин."));
+    }
+    if seconds > 0 && hours == 0 {
+        parts.push(format!("{seconds} сек."));
+    }
+    if parts.is_empty() {
+        return "меньше минуты".to_owned();
+    }
+    parts.join(" ")
 }
 
 fn job_telegram_data(job: &StatelessJobItem) -> Option<&TelegramData> {
@@ -3228,14 +3317,16 @@ mod tests {
         ImageJobData, InMemoryTaskQueue, JobPayload, JobStatus, JobType, LOWEST_PRIORITY,
         MAX_JOB_EVENTS, MESSAGE_STATUS_COMPLETED, MESSAGE_STATUS_FAILED,
         MESSAGE_STATUS_PLACEHOLDER, MESSAGE_TYPE_RESULT, MUSIC_VIP_QUEUE_NAME, MusicGenJobParams,
-        MusicGenJobPayloadError, PendingImageQueueEntry, STUCK_JOB_ERROR_MESSAGE,
-        TASK_QUEUE_SNAPSHOT_FORMAT, TEXT_QUEUE_NAME, TaskQueueError, TaskQueueJobEvent,
-        TaskQueueJobMessageParams, TaskQueueWalRecord, TaskQueueWalSink,
-        asr_job_params_from_stateless_job, decode_task_queue_snapshot, encode_task_queue_snapshot,
-        image_edit_job_params_from_stateless_job, image_gen_job_params_from_stateless_job,
-        music_gen_job_params_from_stateless_job, new_agent_job_at, new_asr_job_at,
-        new_control_job_at, new_dialog_job_at, new_image_edit_job_at, new_image_gen_job_at,
-        new_memory_consolidation_job_at, new_music_gen_job_at, replay_task_queue_wal_records,
+        MusicGenJobPayloadError, QUEUE_ESTIMATE_DEFAULT_SAMPLE_SIZE,
+        QUEUE_ESTIMATE_MIN_SAMPLE_SIZE, STUCK_JOB_ERROR_MESSAGE, TASK_QUEUE_SNAPSHOT_FORMAT,
+        TEXT_QUEUE_NAME, TaskQueueError, TaskQueueJobEvent, TaskQueueJobMessageParams,
+        TaskQueueWalRecord, TaskQueueWalSink, asr_job_params_from_stateless_job,
+        decode_task_queue_snapshot, encode_task_queue_snapshot, fallback_queue_time_estimate,
+        format_duration_ru, image_edit_job_params_from_stateless_job,
+        image_gen_job_params_from_stateless_job, music_gen_job_params_from_stateless_job,
+        new_agent_job_at, new_asr_job_at, new_control_job_at, new_dialog_job_at,
+        new_image_edit_job_at, new_image_gen_job_at, new_memory_consolidation_job_at,
+        new_music_gen_job_at, replay_task_queue_wal_records,
     };
 
     #[derive(Default)]
@@ -4201,74 +4292,143 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn pending_image_queue_entries_track_positions_as_queue_drains()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let queue = InMemoryTaskQueue::new();
-        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
-        let image_job = |chat: i64, thread: Option<i32>, created| {
+    fn complete_image_job(
+        queue: &InMemoryTaskQueue,
+        queue_name: &str,
+        base: OffsetDateTime,
+        index: i64,
+        run_seconds: i64,
+    ) -> Result<(), TaskQueueError> {
+        let created = base + time::Duration::seconds(index);
+        let job_id = queue.assign(
+            queue_name,
             new_image_gen_job_at(
                 ImageGenJobParams {
-                    chat_id: chat,
+                    chat_id: -100,
                     message_id: 20,
                     user_id: 30,
                     user_full_name: "Alice".to_owned(),
                     prompt: "draw".to_owned(),
-                    thread_id: thread,
                     ..ImageGenJobParams::default()
                 },
                 created,
-            )
-            .with_name("image")
-            .with_priority(DEFAULT_PRIORITY)
-        };
-
-        let first = queue.assign(IMAGE_REGULAR_QUEUE_NAME, image_job(-100, Some(7), now));
-        let second = queue.assign(
-            IMAGE_REGULAR_QUEUE_NAME,
-            image_job(-200, None, now + time::Duration::seconds(1)),
+            ),
         );
-        let third = queue.assign(
-            IMAGE_REGULAR_QUEUE_NAME,
-            image_job(-300, None, now + time::Duration::seconds(2)),
-        );
+        queue.complete(job_id, created + time::Duration::seconds(run_seconds))
+    }
 
-        assert_eq!(
-            queue.pending_image_queue_entries(IMAGE_REGULAR_QUEUE_NAME),
-            vec![
-                PendingImageQueueEntry {
-                    job_id: first,
-                    chat_id: -100,
-                    thread_message_id: Some(7),
-                },
-                PendingImageQueueEntry {
-                    job_id: second,
-                    chat_id: -200,
-                    thread_message_id: None,
-                },
-                PendingImageQueueEntry {
-                    job_id: third,
-                    chat_id: -300,
-                    thread_message_id: None,
-                },
-            ]
-        );
+    #[test]
+    fn clean_queue_stats_trims_p5_p95_outliers_like_go_percentile_cont()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let queue = InMemoryTaskQueue::new();
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        for index in 0..20i64 {
+            let run_seconds = if index == 19 { 10_000 } else { 100 };
+            complete_image_job(&queue, IMAGE_REGULAR_QUEUE_NAME, now, index, run_seconds)?;
+        }
 
-        assert_eq!(
+        let stats = queue
+            .clean_queue_stats(IMAGE_REGULAR_QUEUE_NAME, QUEUE_ESTIMATE_DEFAULT_SAMPLE_SIZE)
+            .expect("clean stats");
+        // PERCENTILE_CONT over [100 ×19, 10000]: p5 = 100, p95 = 100 + 0.05·9900 = 595;
+        // the 10000s outlier is trimmed away.
+        assert_eq!(stats.p5_threshold, 100.0);
+        assert!((stats.p95_threshold - 595.0).abs() < 1e-9);
+        assert_eq!(stats.sample_count, 19);
+        assert_eq!(stats.avg_clean_time_seconds, 100.0);
+        assert!(
             queue
-                .dequeue_matching(IMAGE_REGULAR_QUEUE_NAME, "worker", now, |job| job
-                    .data
-                    .job_type
-                    == JobType::ImageGen)
-                .map(|item| item.id),
-            Some(first)
-        );
-        let entries = queue.pending_image_queue_entries(IMAGE_REGULAR_QUEUE_NAME);
-        assert_eq!(
-            entries.iter().map(|entry| entry.job_id).collect::<Vec<_>>(),
-            vec![second, third]
+                .clean_queue_stats(MUSIC_VIP_QUEUE_NAME, QUEUE_ESTIMATE_DEFAULT_SAMPLE_SIZE)
+                .is_none()
         );
         Ok(())
+    }
+
+    #[test]
+    fn estimate_queue_time_for_depth_uses_clean_stats_divided_by_active_workers()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let queue = InMemoryTaskQueue::new();
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        for index in 0..QUEUE_ESTIMATE_MIN_SAMPLE_SIZE as i64 {
+            complete_image_job(&queue, IMAGE_VIP_QUEUE_NAME, now, index, 120)?;
+        }
+        queue.update_worker_heartbeat("image-vip-worker-0", now);
+        queue.update_worker_heartbeat("image-vip-worker-1", now);
+
+        assert_eq!(
+            queue.estimate_queue_time_for_depth(IMAGE_VIP_QUEUE_NAME, 11),
+            std::time::Duration::from_secs(660)
+        );
+        assert_eq!(
+            queue.estimate_queue_time_for_depth(IMAGE_VIP_QUEUE_NAME, 300),
+            std::time::Duration::from_secs(4 * 3600)
+        );
+        assert_eq!(
+            queue.estimate_queue_time_for_depth(IMAGE_VIP_QUEUE_NAME, 0),
+            std::time::Duration::ZERO
+        );
+
+        let floor_queue = InMemoryTaskQueue::new();
+        for index in 0..QUEUE_ESTIMATE_MIN_SAMPLE_SIZE as i64 {
+            complete_image_job(&floor_queue, IMAGE_REGULAR_QUEUE_NAME, now, index, 4)?;
+        }
+        assert_eq!(
+            floor_queue.estimate_queue_time_for_depth(IMAGE_REGULAR_QUEUE_NAME, 1),
+            std::time::Duration::from_secs(30)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn estimate_queue_time_for_depth_falls_back_below_min_sample_size()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let queue = InMemoryTaskQueue::new();
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        for index in 0..(QUEUE_ESTIMATE_MIN_SAMPLE_SIZE as i64 - 1) {
+            complete_image_job(&queue, IMAGE_REGULAR_QUEUE_NAME, now, index, 100)?;
+        }
+
+        assert_eq!(
+            queue.estimate_queue_time_for_depth(IMAGE_REGULAR_QUEUE_NAME, 11),
+            fallback_queue_time_estimate(IMAGE_REGULAR_QUEUE_NAME, 11)
+        );
+        assert_eq!(
+            InMemoryTaskQueue::new().estimate_queue_time_for_depth(IMAGE_VIP_QUEUE_NAME, 11),
+            fallback_queue_time_estimate(IMAGE_VIP_QUEUE_NAME, 11)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn format_duration_ru_matches_go_declensions() {
+        assert_eq!(
+            format_duration_ru(std::time::Duration::ZERO),
+            "меньше минуты"
+        );
+        assert_eq!(
+            format_duration_ru(std::time::Duration::from_secs(45)),
+            "45 сек."
+        );
+        assert_eq!(
+            format_duration_ru(std::time::Duration::from_secs(90)),
+            "1 мин. 30 сек."
+        );
+        assert_eq!(
+            format_duration_ru(std::time::Duration::from_secs(120)),
+            "2 мин."
+        );
+        assert_eq!(
+            format_duration_ru(std::time::Duration::from_secs(3600)),
+            "1 час"
+        );
+        assert_eq!(
+            format_duration_ru(std::time::Duration::from_secs(2 * 3600 + 300)),
+            "2 часа 5 мин."
+        );
+        assert_eq!(
+            format_duration_ru(std::time::Duration::from_secs(5 * 3600 + 30)),
+            "5 часов"
+        );
     }
 
     #[test]

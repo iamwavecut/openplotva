@@ -11335,8 +11335,15 @@ async fn start_runtime_workers(
                     ),
                 ),
             ));
-    let dialog_tool_adapter =
-        Arc::new(dialog_tool_adapter.with_generation_reactions(Arc::clone(&generation_reactions)));
+    let dialog_tool_adapter = Arc::new(
+        dialog_tool_adapter
+            .with_generation_reactions(Arc::clone(&generation_reactions))
+            .with_draw_queue_notice_sender(Arc::new(
+                dialog_messages::DrawQueueNoticeDispatcherSender::new(Arc::clone(
+                    &dispatcher_queue,
+                )),
+            )),
+    );
     {
         let watcher_store: Arc<dyn dialog_turn::DeliveryObligationStore> =
             Arc::clone(&delivery_obligation_store) as _;
@@ -12030,8 +12037,8 @@ async fn start_runtime_workers(
         image_agent_settings.clone(),
     )
     .with_run_buffer(llm_run_buffer.clone());
-    let mut vip_image_effects =
-        image_jobs::TelegramImageJobEffects::new(telegram.clone(), Arc::clone(&rich_sender));
+    let mut vip_image_effects = image_jobs::TelegramImageJobEffects::new(telegram.clone())
+        .with_last_generation_writer(Arc::new(service_clients.redis.last_generation_store()));
     {
         let reactions = &generation_reactions;
         vip_image_effects = vip_image_effects.with_reaction_ux(Arc::clone(reactions));
@@ -12075,8 +12082,8 @@ async fn start_runtime_workers(
         ),
         media_prompt_optimizer.clone(),
     );
-    let mut vip_image_edit_effects =
-        image_jobs::TelegramImageJobEffects::new(telegram.clone(), Arc::clone(&rich_sender));
+    let mut vip_image_edit_effects = image_jobs::TelegramImageJobEffects::new(telegram.clone())
+        .with_last_generation_writer(Arc::new(service_clients.redis.last_generation_store()));
     {
         let reactions = &generation_reactions;
         vip_image_edit_effects = vip_image_edit_effects.with_reaction_ux(Arc::clone(reactions));
@@ -12117,8 +12124,8 @@ async fn start_runtime_workers(
         image_agent_settings,
     )
     .with_run_buffer(llm_run_buffer.clone());
-    let mut regular_image_effects =
-        image_jobs::TelegramImageJobEffects::new(telegram.clone(), Arc::clone(&rich_sender));
+    let mut regular_image_effects = image_jobs::TelegramImageJobEffects::new(telegram.clone())
+        .with_last_generation_writer(Arc::new(service_clients.redis.last_generation_store()));
     {
         let reactions = &generation_reactions;
         regular_image_effects = regular_image_effects.with_reaction_ux(Arc::clone(reactions));

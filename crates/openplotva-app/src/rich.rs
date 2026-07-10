@@ -3,9 +3,9 @@
 //! [`RichMessenger`] is the single send facade for Telegram Rich Messages: it sanitizes
 //! HTML at the boundary and delegates to the raw rich Bot API client, the streaming-draft
 //! path (private chats), and the media uploader. The free `compose_*` functions build the
-//! approved rich layouts (currency table, song, gallery, draw progress, leaderboard) as
-//! sanitized rich HTML; they are pure and unit-tested so the visual contract is pinned
-//! independently of the send path.
+//! approved rich layouts (currency table, song, leaderboard) as sanitized rich HTML; they
+//! are pure and unit-tested so the visual contract is pinned independently of the send
+//! path.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -339,89 +339,6 @@ pub fn compose_song_message(song: &SongMessage<'_>) -> String {
     sanitize_rich_html(&html)
 }
 
-/// Append the gallery media body: a single `<img>` for one image, a `<tg-collage>` for
-/// several, with the caption inlined (`<p>` for one, `<figcaption>` for many). Shared by the
-/// final gallery and the progressive draw message so they render identically below the
-/// progress line.
-fn append_gallery_media(html: &mut String, image_urls: &[String], caption_html: &str) {
-    match image_urls {
-        [] => {}
-        [single] => {
-            html.push_str(&format!("<img src=\"{}\"/>", esc(single)));
-            if !caption_html.trim().is_empty() {
-                html.push_str(&format!("<p>{caption_html}</p>"));
-            }
-        }
-        many => {
-            html.push_str("<tg-collage>");
-            for url in many {
-                html.push_str(&format!("<img src=\"{}\"/>", esc(url)));
-            }
-            if !caption_html.trim().is_empty() {
-                html.push_str(&format!("<figcaption>{caption_html}</figcaption>"));
-            }
-            html.push_str("</tg-collage>");
-        }
-    }
-}
-
-/// Compose a finished image result: a single `<img>` for one image, a `<tg-collage>`
-/// for several. `caption_html` is pre-built rich HTML; `prompt_spoiler` is plain text.
-#[must_use]
-pub fn compose_gallery(
-    image_urls: &[String],
-    caption_html: &str,
-    prompt_spoiler: Option<&str>,
-) -> String {
-    let mut html = String::new();
-    append_gallery_media(&mut html, image_urls, caption_html);
-    if let Some(prompt) = prompt_spoiler
-        && !prompt.trim().is_empty()
-    {
-        html.push_str(&format!(
-            "<p><b>Промпт:</b> <tg-spoiler>{}</tg-spoiler></p>",
-            esc(prompt),
-        ));
-    }
-    sanitize_rich_html(&html)
-}
-
-const DRAW_PROGRESS_EMOJI_ID: &str = "5298651821080879865";
-
-/// Drawing start state, before any image is ready: the bare drawing emoji, sent as the sole
-/// message content so Telegram renders it large (full-line).
-#[must_use]
-pub fn compose_draw_started() -> String {
-    sanitize_rich_html(&format!(
-        "<tg-emoji emoji-id=\"{DRAW_PROGRESS_EMOJI_ID}\">✨</tg-emoji>"
-    ))
-}
-
-/// Progressive draw state, once images start arriving: a progress line (the drawing emoji
-/// followed by "N из M") above the exact same gallery layout the final message uses, so the
-/// only visible difference from the finished result is this leading progress line. The full
-/// caption is shown from the first image. With no images yet this falls back to the bare
-/// drawing emoji.
-#[must_use]
-pub fn compose_draw_progress(image_urls: &[String], total: usize, caption_html: &str) -> String {
-    if image_urls.is_empty() {
-        return compose_draw_started();
-    }
-    let mut html = format!(
-        "<p><tg-emoji emoji-id=\"{DRAW_PROGRESS_EMOJI_ID}\">✨</tg-emoji> {} из {}</p>",
-        image_urls.len(),
-        total.max(image_urls.len()),
-    );
-    append_gallery_media(&mut html, image_urls, caption_html);
-    sanitize_rich_html(&html)
-}
-
-/// A plain notice for the draw message (safety block, failure), as one rich paragraph.
-#[must_use]
-pub fn compose_draw_notice(text: &str) -> String {
-    sanitize_rich_html(&format!("<p>{}</p>", esc_multiline(text)))
-}
-
 /// One leaderboard standing for [`compose_leaderboard`].
 #[derive(Clone, Debug)]
 pub struct LeaderboardRow {
@@ -536,65 +453,6 @@ mod tests {
         assert!(html.contains(r#"<audio src="https://plotva.geta.moe/x.mp3"></audio>"#));
         assert!(html.contains("<blockquote>строка 1<br/>строка 2</blockquote>"));
         assert!(html.contains("<footer>за авторством <i>Автор</i></footer>"));
-    }
-
-    #[test]
-    fn gallery_one_image_is_inline_many_is_collage() {
-        let one = compose_gallery(&["https://h/a.png".to_owned()], "cap", None);
-        assert_eq!(one, r#"<img src="https://h/a.png"/><p>cap</p>"#);
-        let many = compose_gallery(
-            &["https://h/a.png".to_owned(), "https://h/b.png".to_owned()],
-            "cap",
-            Some("prompt"),
-        );
-        assert!(many.starts_with("<tg-collage>"));
-        assert!(many.contains("<figcaption>cap</figcaption>"));
-        assert!(many.contains("<tg-spoiler>prompt</tg-spoiler>"));
-    }
-
-    #[test]
-    fn draw_started_is_bare_emoji() {
-        assert_eq!(
-            compose_draw_started(),
-            "<tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji>"
-        );
-    }
-
-    #[test]
-    fn draw_progress_has_count_line_then_gallery_with_caption() {
-        // No images yet → falls back to the bare drawing emoji (renders large).
-        assert_eq!(compose_draw_progress(&[], 2, "cap"), compose_draw_started());
-
-        // First of two → "1 из 2" line above the image, with the full caption already shown.
-        let one = compose_draw_progress(&["https://h/a.png".to_owned()], 2, "автор");
-        assert!(
-            one.starts_with(
-                "<p><tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji> 1 из 2</p>"
-            )
-        );
-        assert!(one.contains(r#"<img src="https://h/a.png"/>"#));
-        assert!(one.contains("автор"));
-
-        // Several → the same collage layout as the final gallery, below the progress line.
-        let many = compose_draw_progress(
-            &["https://h/a.png".to_owned(), "https://h/b.png".to_owned()],
-            2,
-            "автор",
-        );
-        assert!(
-            many.starts_with(
-                "<p><tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji> 2 из 2</p>"
-            )
-        );
-        assert!(many.contains("<tg-collage>"));
-        assert!(many.contains(r#"<img src="https://h/b.png"/>"#));
-        assert!(many.contains("<figcaption>автор</figcaption>"));
-    }
-
-    #[test]
-    fn draw_notice_escapes_and_breaks_lines() {
-        let html = compose_draw_notice("сбой <x>\nповтор");
-        assert_eq!(html, "<p>сбой &lt;x&gt;<br/>повтор</p>");
     }
 
     #[test]

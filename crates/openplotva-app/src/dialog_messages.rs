@@ -643,6 +643,81 @@ impl<Generator, Sender> DirectDrawApiRuntimeEffects<Generator, Sender> {
     }
 }
 
+/// Dispatcher-backed sender for the ephemeral draw queue-position notice: the
+/// dispatcher tracks the sent message in the ephemeral store, and the existing
+/// cleanup worker deletes it after the notice TTL.
+#[derive(Clone)]
+pub struct DrawQueueNoticeDispatcherSender {
+    queue: Arc<DispatcherQueue>,
+    next_virtual_id: VirtualIdFactory,
+}
+
+impl DrawQueueNoticeDispatcherSender {
+    #[must_use]
+    pub fn new(queue: Arc<DispatcherQueue>) -> Self {
+        Self {
+            queue,
+            next_virtual_id: monotonic_virtual_id_factory("draw-queue-notice-vmsg"),
+        }
+    }
+}
+
+impl fmt::Debug for DrawQueueNoticeDispatcherSender {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DrawQueueNoticeDispatcherSender")
+            .finish_non_exhaustive()
+    }
+}
+
+impl crate::dialog_tools::DrawQueueNoticeSender for DrawQueueNoticeDispatcherSender {
+    fn send_draw_queue_notice<'a>(
+        &'a self,
+        notice: crate::dialog_tools::DrawQueueNotice,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            let chat_id = notice.chat_id;
+            let message_thread_id = i64::from(notice.thread_id.unwrap_or_default());
+            let is_topic_message = notice.thread_id.is_some();
+            let chat = ChatRef {
+                id: chat_id,
+                is_forum: is_topic_message,
+            };
+            let request = TextMessageRequest {
+                chat: Some(chat),
+                message_thread_id,
+                disable_notification: false,
+                allow_sending_without_reply: Some(true),
+                text: notice.text,
+                render_as: notice.render_as,
+                reply_markup: None,
+            };
+            let reply_to = ReplyMessageRef {
+                message_id: i64::from(notice.reply_to_message_id),
+                chat,
+                is_topic_message,
+                message_thread_id,
+            };
+            let result = queue_text_message_parts(
+                &self.queue,
+                QueueTextRequest {
+                    protected: false,
+                    debounce_key: None,
+                    message: &request,
+                    reply_to: Some(&reply_to),
+                    immediate_first: true,
+                    bypass_chat_restrictions: false,
+                    ephemeral_delete_after: Some(notice.delete_after),
+                },
+                || (self.next_virtual_id)(),
+            )
+            .await;
+            if let Err(error) = result {
+                tracing::warn!(chat_id, %error, "failed to queue draw queue-position notice");
+            }
+        })
+    }
+}
+
 /// Dispatcher-backed random-response effects.
 #[derive(Clone)]
 pub struct RandomDialogDispatcherEffects {
@@ -5000,12 +5075,16 @@ mod tests {
             image_urls: vec!["https://img.test/fallback.png".to_owned()],
             image_bytes: vec![b"png".to_vec()],
         });
-        let image_sender = ImageTelegramSenderCapture::new(Vec::new());
-        let image_rich = Arc::new(crate::rich::MockRichSender::default());
-        let image_effects = crate::image_jobs::TelegramImageJobEffects::new(
-            image_sender.clone(),
-            image_rich.clone(),
-        );
+        let placeholder_message: carapax::types::Message = serde_json::from_value(json!({
+            "message_id": 555,
+            "date": 0,
+            "chat": {"type": "supergroup", "id": -100, "title": "Group"},
+            "from": {"id": 1, "is_bot": true, "first_name": "Plotva"},
+        }))?;
+        let image_sender = ImageTelegramSenderCapture::new(vec![Ok(
+            TelegramOutboundResponse::Message(Box::new(placeholder_message)),
+        )]);
+        let image_effects = crate::image_jobs::TelegramImageJobEffects::new(image_sender.clone());
         let worker_report = crate::image_jobs::run_image_gen_queue_once(
             &queue,
             IMAGE_REGULAR_QUEUE_NAME,
@@ -5042,39 +5121,16 @@ mod tests {
                 seed: String::new(),
             }]
         );
-        assert!(image_sender.methods().is_empty());
-        {
-            let sent = image_rich.sent.lock().expect("rich sent");
-            assert_eq!(sent.len(), 1);
-            assert_eq!(sent[0].chat_id, -100);
-            assert_eq!(sent[0].reply_to_message_id, Some(78));
-            assert_eq!(
-                sent[0].html,
-                "<tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji>"
-            );
-        }
-        {
-            let edited = image_rich.edited.lock().expect("rich edited");
-            assert_eq!(edited.len(), 1);
-            assert_eq!(edited[0].0, -100);
-            assert_eq!(edited[0].1, 1001);
-            assert!(edited[0].2.starts_with("<tg-collage>"));
-            assert!(
-                edited[0]
-                    .2
-                    .contains("<img src=\"https://img.test/neon-cat.png\"/>")
-            );
-            assert!(
-                edited[0]
-                    .2
-                    .contains("<img src=\"https://img.test/fallback.png\"/>")
-            );
-            assert!(
-                edited[0]
-                    .2
-                    .contains("<img src=\"https://plotva.geta.moe/media/mock.bin\"/>")
-            );
-        }
+        // Album delivery: the classic placeholder photo goes out first, then the
+        // provider image is edited into it (bytes-first source).
+        let methods = image_sender.methods();
+        assert_eq!(
+            methods.iter().map(|(kind, _)| *kind).collect::<Vec<_>>(),
+            vec![
+                TelegramOutboundMethodKind::SendPhoto,
+                TelegramOutboundMethodKind::EditMessageMedia,
+            ]
+        );
         let records = queue.records();
         assert_eq!(records[0].status, JobStatus::Completed);
         assert_eq!(
@@ -7104,12 +7160,16 @@ mod tests {
             String::new(),
             "https://img.test/edit-2.png".to_owned(),
         ]);
-        let image_sender = ImageTelegramSenderCapture::new(Vec::new());
-        let image_rich = Arc::new(crate::rich::MockRichSender::default());
-        let image_effects = crate::image_jobs::TelegramImageJobEffects::new(
-            image_sender.clone(),
-            image_rich.clone(),
-        );
+        let placeholder_message: carapax::types::Message = serde_json::from_value(json!({
+            "message_id": 555,
+            "date": 0,
+            "chat": {"type": "private", "id": 42, "first_name": "Ada"},
+            "from": {"id": 1, "is_bot": true, "first_name": "Plotva"},
+        }))?;
+        let image_sender = ImageTelegramSenderCapture::new(vec![Ok(
+            TelegramOutboundResponse::Message(Box::new(placeholder_message)),
+        )]);
+        let image_effects = crate::image_jobs::TelegramImageJobEffects::new(image_sender.clone());
         let worker_report = crate::image_jobs::run_image_edit_queue_once(
             &queue,
             IMAGE_VIP_QUEUE_NAME,
@@ -7142,34 +7202,16 @@ mod tests {
                 photo_urls: vec!["https://files.test/photo.png".to_owned()],
             }]
         );
-        assert!(image_sender.methods().is_empty());
-        {
-            let sent = image_rich.sent.lock().expect("rich sent");
-            assert_eq!(sent.len(), 1);
-            assert_eq!(sent[0].chat_id, 42);
-            assert_eq!(sent[0].reply_to_message_id, Some(77));
-            assert_eq!(
-                sent[0].html,
-                "<tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji>"
-            );
-        }
-        {
-            let edited = image_rich.edited.lock().expect("rich edited");
-            assert_eq!(edited.len(), 1);
-            assert_eq!(edited[0].0, 42);
-            assert_eq!(edited[0].1, 1001);
-            assert!(edited[0].2.starts_with("<tg-collage>"));
-            assert!(
-                edited[0]
-                    .2
-                    .contains("<img src=\"https://img.test/edit-1.png\"/>")
-            );
-            assert!(
-                edited[0]
-                    .2
-                    .contains("<img src=\"https://img.test/edit-2.png\"/>")
-            );
-        }
+        // Album delivery: one placeholder frame (single editor) filled with the
+        // first edit result via editMessageMedia.
+        let methods = image_sender.methods();
+        assert_eq!(
+            methods.iter().map(|(kind, _)| *kind).collect::<Vec<_>>(),
+            vec![
+                TelegramOutboundMethodKind::SendPhoto,
+                TelegramOutboundMethodKind::EditMessageMedia,
+            ]
+        );
         let records = queue.records();
         assert_eq!(records[0].status, JobStatus::Completed);
         assert_eq!(
@@ -8314,6 +8356,33 @@ mod tests {
         fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
             formatter.write_str(self.0)
         }
+    }
+
+    #[tokio::test]
+    async fn draw_queue_notice_dispatcher_sender_queues_ephemeral_reply() {
+        let queue = Arc::new(DispatcherQueue::new(DispatcherConfig::default()));
+        let sender = DrawQueueNoticeDispatcherSender::new(Arc::clone(&queue));
+
+        crate::dialog_tools::DrawQueueNoticeSender::send_draw_queue_notice(
+            &sender,
+            crate::dialog_tools::DrawQueueNotice {
+                chat_id: -100,
+                thread_id: Some(7),
+                reply_to_message_id: 78,
+                text: "Заказ записан в очередь".to_owned(),
+                render_as: TELEGRAM_PARSE_MODE_HTML.to_owned(),
+                delete_after: Duration::from_secs(300),
+            },
+        )
+        .await;
+
+        let snapshot = queue.snapshot();
+        assert!(snapshot.regular.is_empty());
+        assert_eq!(snapshot.immediate.len(), 1);
+        let item = &snapshot.immediate[0];
+        assert_eq!(item.chat_id, -100);
+        assert!(item.virtual_id.starts_with("draw-queue-notice-vmsg-"));
+        assert_eq!(item.ephemeral_delete_after, Some(Duration::from_secs(300)));
     }
 
     type ImageTelegramSenderCapture = TelegramMethodCapture;
