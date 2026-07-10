@@ -647,7 +647,7 @@ Postgres 17 + pgvector (`vector(512)` for memory/shield, `vector(1024)` legacy)
 - **Task queue (v2)**: `taskman_jobs` (JSONB record + typed columns), `taskman_job_history`. (Legacy `job_queue` dropped in mig 19/140.)
 - **LLM telemetry & routing**: `llm_request_events` (raw + rollup dual-purpose, `run_id`/`run_seq` correlation, short-lived raw bodies scrubbed), `telemetry_rollups`, `llm_providers`/`provider_models`/`llm_capacity_pools`/`workflows`/`workflow_assignments`/`workflow_triggers`/`llm_routing_events`.
 - **Dialog lifecycle**: `runtime_virtual_dialogs`, `dialog_turn_outcomes`, `dialog_delivery_obligations`.
-- **Files/media cache**: `telegram_files` (vision pipeline state).
+- **Files/media cache**: `telegram_files` (vision and ASR pipeline state, including ASR fallback diagnostics).
 - **Daily game**: `chat_game_stats`, `chat_game_results` (per-chat/day unique).
 
 Memory migration timeline: `100` (pipeline) → `126` (portable) → `127`

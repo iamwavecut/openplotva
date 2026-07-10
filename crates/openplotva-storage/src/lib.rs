@@ -759,19 +759,19 @@ pub const SQL_LIST_ACTIVE_PARTICIPANTS: &str = "SELECT user_id FROM chat_members
 
 pub const SQL_LIST_ACTIVE_PARTICIPANTS_FROM_TABLE: &str = "SELECT user_id FROM chat_active_users WHERE chat_id = $1 AND last_active_at >= (CURRENT_TIMESTAMP - INTERVAL '24 hours') ORDER BY last_active_at DESC LIMIT $2";
 
-pub const SQL_UPSERT_TELEGRAM_FILE_METADATA: &str = "INSERT INTO telegram_files (file_unique_id, latest_file_id, media_kind, mime_type, width, height, file_size, first_seen_chat_id, first_seen_message_id, last_seen_chat_id, last_seen_message_id, last_seen_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, CURRENT_TIMESTAMP) ON CONFLICT (file_unique_id) DO UPDATE SET latest_file_id = EXCLUDED.latest_file_id, media_kind = EXCLUDED.media_kind, mime_type = COALESCE(EXCLUDED.mime_type, telegram_files.mime_type), width = COALESCE(EXCLUDED.width, telegram_files.width), height = COALESCE(EXCLUDED.height, telegram_files.height), file_size = COALESCE(EXCLUDED.file_size, telegram_files.file_size), last_seen_chat_id = EXCLUDED.last_seen_chat_id, last_seen_message_id = EXCLUDED.last_seen_message_id, last_seen_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP RETURNING file_unique_id, latest_file_id, media_kind, mime_type, width, height, file_size, first_seen_chat_id, first_seen_message_id, last_seen_chat_id, last_seen_message_id, last_seen_at, vision_status, vision_caption, vision_model, vision_latency_ms, recognition_requested_at, recognition_completed_at, asr_status, asr_text, asr_provider, asr_model, asr_latency_ms, asr_error, asr_requested_at, asr_completed_at, COALESCE(extra::text, '{}') AS extra, created_at, updated_at";
+pub const SQL_UPSERT_TELEGRAM_FILE_METADATA: &str = "INSERT INTO telegram_files (file_unique_id, latest_file_id, media_kind, mime_type, width, height, file_size, first_seen_chat_id, first_seen_message_id, last_seen_chat_id, last_seen_message_id, last_seen_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, CURRENT_TIMESTAMP) ON CONFLICT (file_unique_id) DO UPDATE SET latest_file_id = EXCLUDED.latest_file_id, media_kind = EXCLUDED.media_kind, mime_type = COALESCE(EXCLUDED.mime_type, telegram_files.mime_type), width = COALESCE(EXCLUDED.width, telegram_files.width), height = COALESCE(EXCLUDED.height, telegram_files.height), file_size = COALESCE(EXCLUDED.file_size, telegram_files.file_size), last_seen_chat_id = EXCLUDED.last_seen_chat_id, last_seen_message_id = EXCLUDED.last_seen_message_id, last_seen_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP RETURNING file_unique_id, latest_file_id, media_kind, mime_type, width, height, file_size, first_seen_chat_id, first_seen_message_id, last_seen_chat_id, last_seen_message_id, last_seen_at, vision_status, vision_caption, vision_model, vision_latency_ms, recognition_requested_at, recognition_completed_at, asr_status, asr_text, asr_provider, asr_model, asr_latency_ms, asr_fallback_used, asr_chunks, asr_warnings, asr_error, asr_requested_at, asr_completed_at, COALESCE(extra::text, '{}') AS extra, created_at, updated_at";
 
-pub const SQL_GET_TELEGRAM_FILE: &str = "SELECT file_unique_id, latest_file_id, media_kind, mime_type, width, height, file_size, first_seen_chat_id, first_seen_message_id, last_seen_chat_id, last_seen_message_id, last_seen_at, vision_status, vision_caption, vision_model, vision_latency_ms, recognition_requested_at, recognition_completed_at, asr_status, asr_text, asr_provider, asr_model, asr_latency_ms, asr_error, asr_requested_at, asr_completed_at, COALESCE(extra::text, '{}') AS extra, created_at, updated_at FROM telegram_files WHERE file_unique_id = $1 LIMIT 1";
+pub const SQL_GET_TELEGRAM_FILE: &str = "SELECT file_unique_id, latest_file_id, media_kind, mime_type, width, height, file_size, first_seen_chat_id, first_seen_message_id, last_seen_chat_id, last_seen_message_id, last_seen_at, vision_status, vision_caption, vision_model, vision_latency_ms, recognition_requested_at, recognition_completed_at, asr_status, asr_text, asr_provider, asr_model, asr_latency_ms, asr_fallback_used, asr_chunks, asr_warnings, asr_error, asr_requested_at, asr_completed_at, COALESCE(extra::text, '{}') AS extra, created_at, updated_at FROM telegram_files WHERE file_unique_id = $1 LIMIT 1";
 
-pub const SQL_LIST_TELEGRAM_FILES_BY_UNIQUE_IDS: &str = "SELECT file_unique_id, latest_file_id, media_kind, mime_type, width, height, file_size, first_seen_chat_id, first_seen_message_id, last_seen_chat_id, last_seen_message_id, last_seen_at, vision_status, vision_caption, vision_model, vision_latency_ms, recognition_requested_at, recognition_completed_at, asr_status, asr_text, asr_provider, asr_model, asr_latency_ms, asr_error, asr_requested_at, asr_completed_at, COALESCE(extra::text, '{}') AS extra, created_at, updated_at FROM telegram_files WHERE file_unique_id = ANY($1::text[])";
+pub const SQL_LIST_TELEGRAM_FILES_BY_UNIQUE_IDS: &str = "SELECT file_unique_id, latest_file_id, media_kind, mime_type, width, height, file_size, first_seen_chat_id, first_seen_message_id, last_seen_chat_id, last_seen_message_id, last_seen_at, vision_status, vision_caption, vision_model, vision_latency_ms, recognition_requested_at, recognition_completed_at, asr_status, asr_text, asr_provider, asr_model, asr_latency_ms, asr_fallback_used, asr_chunks, asr_warnings, asr_error, asr_requested_at, asr_completed_at, COALESCE(extra::text, '{}') AS extra, created_at, updated_at FROM telegram_files WHERE file_unique_id = ANY($1::text[])";
 
-pub const SQL_GET_TELEGRAM_FILE_BY_LATEST_FILE_ID: &str = "SELECT file_unique_id, latest_file_id, media_kind, mime_type, width, height, file_size, first_seen_chat_id, first_seen_message_id, last_seen_chat_id, last_seen_message_id, last_seen_at, vision_status, vision_caption, vision_model, vision_latency_ms, recognition_requested_at, recognition_completed_at, asr_status, asr_text, asr_provider, asr_model, asr_latency_ms, asr_error, asr_requested_at, asr_completed_at, COALESCE(extra::text, '{}') AS extra, created_at, updated_at FROM telegram_files WHERE latest_file_id = $1 ORDER BY last_seen_at DESC LIMIT 1";
+pub const SQL_GET_TELEGRAM_FILE_BY_LATEST_FILE_ID: &str = "SELECT file_unique_id, latest_file_id, media_kind, mime_type, width, height, file_size, first_seen_chat_id, first_seen_message_id, last_seen_chat_id, last_seen_message_id, last_seen_at, vision_status, vision_caption, vision_model, vision_latency_ms, recognition_requested_at, recognition_completed_at, asr_status, asr_text, asr_provider, asr_model, asr_latency_ms, asr_fallback_used, asr_chunks, asr_warnings, asr_error, asr_requested_at, asr_completed_at, COALESCE(extra::text, '{}') AS extra, created_at, updated_at FROM telegram_files WHERE latest_file_id = $1 ORDER BY last_seen_at DESC LIMIT 1";
 
-pub const SQL_UPDATE_TELEGRAM_FILE_VISION: &str = "UPDATE telegram_files SET vision_status = $2, vision_caption = COALESCE($3, vision_caption), vision_model = COALESCE($4, vision_model), vision_latency_ms = COALESCE($5, vision_latency_ms), recognition_requested_at = COALESCE($6, recognition_requested_at), recognition_completed_at = COALESCE($7, recognition_completed_at), updated_at = CURRENT_TIMESTAMP WHERE file_unique_id = $1 RETURNING file_unique_id, latest_file_id, media_kind, mime_type, width, height, file_size, first_seen_chat_id, first_seen_message_id, last_seen_chat_id, last_seen_message_id, last_seen_at, vision_status, vision_caption, vision_model, vision_latency_ms, recognition_requested_at, recognition_completed_at, asr_status, asr_text, asr_provider, asr_model, asr_latency_ms, asr_error, asr_requested_at, asr_completed_at, COALESCE(extra::text, '{}') AS extra, created_at, updated_at";
+pub const SQL_UPDATE_TELEGRAM_FILE_VISION: &str = "UPDATE telegram_files SET vision_status = $2, vision_caption = COALESCE($3, vision_caption), vision_model = COALESCE($4, vision_model), vision_latency_ms = COALESCE($5, vision_latency_ms), recognition_requested_at = COALESCE($6, recognition_requested_at), recognition_completed_at = COALESCE($7, recognition_completed_at), updated_at = CURRENT_TIMESTAMP WHERE file_unique_id = $1 RETURNING file_unique_id, latest_file_id, media_kind, mime_type, width, height, file_size, first_seen_chat_id, first_seen_message_id, last_seen_chat_id, last_seen_message_id, last_seen_at, vision_status, vision_caption, vision_model, vision_latency_ms, recognition_requested_at, recognition_completed_at, asr_status, asr_text, asr_provider, asr_model, asr_latency_ms, asr_fallback_used, asr_chunks, asr_warnings, asr_error, asr_requested_at, asr_completed_at, COALESCE(extra::text, '{}') AS extra, created_at, updated_at";
 
-pub const SQL_UPDATE_TELEGRAM_FILE_ASR: &str = "UPDATE telegram_files SET asr_status = $2, asr_text = COALESCE($3, asr_text), asr_provider = COALESCE($4, asr_provider), asr_model = COALESCE($5, asr_model), asr_latency_ms = COALESCE($6, asr_latency_ms), asr_error = $7, asr_requested_at = COALESCE($8, asr_requested_at), asr_completed_at = COALESCE($9, asr_completed_at), updated_at = CURRENT_TIMESTAMP WHERE file_unique_id = $1 RETURNING file_unique_id, latest_file_id, media_kind, mime_type, width, height, file_size, first_seen_chat_id, first_seen_message_id, last_seen_chat_id, last_seen_message_id, last_seen_at, vision_status, vision_caption, vision_model, vision_latency_ms, recognition_requested_at, recognition_completed_at, asr_status, asr_text, asr_provider, asr_model, asr_latency_ms, asr_error, asr_requested_at, asr_completed_at, COALESCE(extra::text, '{}') AS extra, created_at, updated_at";
+pub const SQL_UPDATE_TELEGRAM_FILE_ASR: &str = "UPDATE telegram_files SET asr_status = $2, asr_text = COALESCE($3, asr_text), asr_provider = COALESCE($4, asr_provider), asr_model = COALESCE($5, asr_model), asr_latency_ms = COALESCE($6, asr_latency_ms), asr_fallback_used = COALESCE($7, asr_fallback_used), asr_chunks = COALESCE($8, asr_chunks), asr_warnings = COALESCE($9, asr_warnings), asr_error = $10, asr_requested_at = COALESCE($11, asr_requested_at), asr_completed_at = COALESCE($12, asr_completed_at), updated_at = CURRENT_TIMESTAMP WHERE file_unique_id = $1 RETURNING file_unique_id, latest_file_id, media_kind, mime_type, width, height, file_size, first_seen_chat_id, first_seen_message_id, last_seen_chat_id, last_seen_message_id, last_seen_at, vision_status, vision_caption, vision_model, vision_latency_ms, recognition_requested_at, recognition_completed_at, asr_status, asr_text, asr_provider, asr_model, asr_latency_ms, asr_fallback_used, asr_chunks, asr_warnings, asr_error, asr_requested_at, asr_completed_at, COALESCE(extra::text, '{}') AS extra, created_at, updated_at";
 
-pub const SQL_CLAIM_TELEGRAM_FILE_ASR_PROCESSING: &str = "UPDATE telegram_files SET asr_status = 'processing', asr_error = NULL, asr_requested_at = $2, updated_at = CURRENT_TIMESTAMP WHERE file_unique_id = $1 AND asr_status <> 'completed' AND (asr_status <> 'processing' OR asr_requested_at IS NULL OR asr_requested_at < ($2 - INTERVAL '10 minutes')) RETURNING file_unique_id, latest_file_id, media_kind, mime_type, width, height, file_size, first_seen_chat_id, first_seen_message_id, last_seen_chat_id, last_seen_message_id, last_seen_at, vision_status, vision_caption, vision_model, vision_latency_ms, recognition_requested_at, recognition_completed_at, asr_status, asr_text, asr_provider, asr_model, asr_latency_ms, asr_error, asr_requested_at, asr_completed_at, COALESCE(extra::text, '{}') AS extra, created_at, updated_at";
+pub const SQL_CLAIM_TELEGRAM_FILE_ASR_PROCESSING: &str = "UPDATE telegram_files SET asr_status = 'processing', asr_fallback_used = NULL, asr_chunks = NULL, asr_warnings = NULL, asr_error = NULL, asr_requested_at = $2, updated_at = CURRENT_TIMESTAMP WHERE file_unique_id = $1 AND asr_status <> 'completed' AND (asr_status <> 'processing' OR asr_requested_at IS NULL OR asr_requested_at < ($2 - INTERVAL '10 minutes')) RETURNING file_unique_id, latest_file_id, media_kind, mime_type, width, height, file_size, first_seen_chat_id, first_seen_message_id, last_seen_chat_id, last_seen_message_id, last_seen_at, vision_status, vision_caption, vision_model, vision_latency_ms, recognition_requested_at, recognition_completed_at, asr_status, asr_text, asr_provider, asr_model, asr_latency_ms, asr_fallback_used, asr_chunks, asr_warnings, asr_error, asr_requested_at, asr_completed_at, COALESCE(extra::text, '{}') AS extra, created_at, updated_at";
 
 pub const SQL_GET_CHAT_DISCOVERED: &str = "SELECT discovered FROM chats WHERE id = $1";
 
@@ -1655,6 +1655,9 @@ pub struct TelegramFileAsrUpdate {
     pub asr_provider: Option<String>,
     pub asr_model: Option<String>,
     pub asr_latency_ms: Option<i32>,
+    pub asr_fallback_used: Option<bool>,
+    pub asr_chunks: Option<i32>,
+    pub asr_warnings: Option<Vec<String>>,
     pub asr_error: Option<String>,
     pub asr_requested_at: Option<OffsetDateTime>,
     pub asr_completed_at: Option<OffsetDateTime>,
@@ -1707,6 +1710,12 @@ pub struct TelegramFileRecord {
     pub asr_model: Option<String>,
     /// ASR latency in milliseconds.
     pub asr_latency_ms: Option<i32>,
+    /// Whether the service used its fallback engine.
+    pub asr_fallback_used: Option<bool>,
+    /// Number of ASR chunks processed.
+    pub asr_chunks: Option<i32>,
+    /// Non-fatal engine warnings, including the primary fallback reason.
+    pub asr_warnings: Option<Vec<String>>,
     /// Last ASR error.
     pub asr_error: Option<String>,
     /// ASR request timestamp.
@@ -4104,6 +4113,9 @@ impl PostgresTelegramFileStore {
             .bind(params.asr_provider.as_deref())
             .bind(params.asr_model.as_deref())
             .bind(params.asr_latency_ms)
+            .bind(params.asr_fallback_used)
+            .bind(params.asr_chunks)
+            .bind(params.asr_warnings.as_deref())
             .bind(params.asr_error.as_deref())
             .bind(params.asr_requested_at)
             .bind(params.asr_completed_at)
@@ -8473,6 +8485,9 @@ fn telegram_file_from_row(row: PgRow) -> Result<TelegramFileRecord, StorageError
         asr_provider: row.try_get("asr_provider")?,
         asr_model: row.try_get("asr_model")?,
         asr_latency_ms: row.try_get("asr_latency_ms")?,
+        asr_fallback_used: row.try_get("asr_fallback_used")?,
+        asr_chunks: row.try_get("asr_chunks")?,
+        asr_warnings: row.try_get("asr_warnings")?,
         asr_error: row.try_get("asr_error")?,
         asr_requested_at: row.try_get("asr_requested_at")?,
         asr_completed_at: row.try_get("asr_completed_at")?,
@@ -9949,6 +9964,11 @@ mod tests {
         );
         assert!(super::SQL_UPDATE_TELEGRAM_FILE_ASR.contains("asr_text = COALESCE($3, asr_text)"));
         assert!(
+            super::SQL_UPDATE_TELEGRAM_FILE_ASR
+                .contains("asr_fallback_used = COALESCE($7, asr_fallback_used)")
+        );
+        assert!(super::SQL_CLAIM_TELEGRAM_FILE_ASR_PROCESSING.contains("asr_warnings = NULL"));
+        assert!(
             super::SQL_CLAIM_TELEGRAM_FILE_ASR_PROCESSING.contains("asr_status <> 'completed'")
         );
         assert!(
@@ -9986,6 +10006,9 @@ mod tests {
             asr_provider: None,
             asr_model: None,
             asr_latency_ms: None,
+            asr_fallback_used: None,
+            asr_chunks: None,
+            asr_warnings: None,
             asr_error: None,
             asr_requested_at: None,
             asr_completed_at: None,
@@ -10233,6 +10256,7 @@ mod tests {
             .max_connections(2)
             .connect(&dsn)
             .await?;
+        super::run_migrations_on(&pool).await?;
         let store = super::PostgresTelegramFileStore::new(pool.clone());
         let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let unique_id = format!("openplotva-file-{suffix}");
@@ -10310,6 +10334,31 @@ mod tests {
             assert_eq!(vision.vision_latency_ms, Some(2000));
             assert_eq!(vision.recognition_requested_at, Some(requested_at));
             assert_eq!(vision.recognition_completed_at, Some(completed_at));
+
+            let asr = store
+                .update_asr(&super::TelegramFileAsrUpdate {
+                    file_unique_id: unique_id.clone(),
+                    asr_status: super::TELEGRAM_FILE_ASR_STATUS_COMPLETED.to_owned(),
+                    asr_text: Some("voice transcript".to_owned()),
+                    asr_provider: Some("vosk".to_owned()),
+                    asr_model: Some("vosk-model".to_owned()),
+                    asr_latency_ms: Some(321),
+                    asr_fallback_used: Some(true),
+                    asr_chunks: Some(1),
+                    asr_warnings: Some(vec!["primary_failed:gigaam:GPU lock is busy".to_owned()]),
+                    asr_error: None,
+                    asr_requested_at: Some(requested_at),
+                    asr_completed_at: Some(completed_at),
+                })
+                .await?;
+            assert_eq!(asr.asr_status, super::TELEGRAM_FILE_ASR_STATUS_COMPLETED);
+            assert_eq!(asr.asr_provider.as_deref(), Some("vosk"));
+            assert_eq!(asr.asr_fallback_used, Some(true));
+            assert_eq!(asr.asr_chunks, Some(1));
+            assert_eq!(
+                asr.asr_warnings.as_deref(),
+                Some(["primary_failed:gigaam:GPU lock is busy".to_owned()].as_slice())
+            );
             Ok(())
         }
         .await;
