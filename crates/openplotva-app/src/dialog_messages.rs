@@ -5000,12 +5000,16 @@ mod tests {
             image_urls: vec!["https://img.test/fallback.png".to_owned()],
             image_bytes: vec![b"png".to_vec()],
         });
-        let image_sender = ImageTelegramSenderCapture::new(Vec::new());
-        let image_rich = Arc::new(crate::rich::MockRichSender::default());
-        let image_effects = crate::image_jobs::TelegramImageJobEffects::new(
-            image_sender.clone(),
-            image_rich.clone(),
-        );
+        let placeholder_message: carapax::types::Message = serde_json::from_value(json!({
+            "message_id": 555,
+            "date": 0,
+            "chat": {"type": "supergroup", "id": -100, "title": "Group"},
+            "from": {"id": 1, "is_bot": true, "first_name": "Plotva"},
+        }))?;
+        let image_sender = ImageTelegramSenderCapture::new(vec![Ok(
+            TelegramOutboundResponse::Message(Box::new(placeholder_message)),
+        )]);
+        let image_effects = crate::image_jobs::TelegramImageJobEffects::new(image_sender.clone());
         let worker_report = crate::image_jobs::run_image_gen_queue_once(
             &queue,
             IMAGE_REGULAR_QUEUE_NAME,
@@ -5042,39 +5046,16 @@ mod tests {
                 seed: String::new(),
             }]
         );
-        assert!(image_sender.methods().is_empty());
-        {
-            let sent = image_rich.sent.lock().expect("rich sent");
-            assert_eq!(sent.len(), 1);
-            assert_eq!(sent[0].chat_id, -100);
-            assert_eq!(sent[0].reply_to_message_id, Some(78));
-            assert_eq!(
-                sent[0].html,
-                "<tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji>"
-            );
-        }
-        {
-            let edited = image_rich.edited.lock().expect("rich edited");
-            assert_eq!(edited.len(), 1);
-            assert_eq!(edited[0].0, -100);
-            assert_eq!(edited[0].1, 1001);
-            assert!(edited[0].2.starts_with("<tg-collage>"));
-            assert!(
-                edited[0]
-                    .2
-                    .contains("<img src=\"https://img.test/neon-cat.png\"/>")
-            );
-            assert!(
-                edited[0]
-                    .2
-                    .contains("<img src=\"https://img.test/fallback.png\"/>")
-            );
-            assert!(
-                edited[0]
-                    .2
-                    .contains("<img src=\"https://plotva.geta.moe/media/mock.bin\"/>")
-            );
-        }
+        // Album delivery: the classic placeholder photo goes out first, then the
+        // provider image is edited into it (bytes-first source).
+        let methods = image_sender.methods();
+        assert_eq!(
+            methods.iter().map(|(kind, _)| *kind).collect::<Vec<_>>(),
+            vec![
+                TelegramOutboundMethodKind::SendPhoto,
+                TelegramOutboundMethodKind::EditMessageMedia,
+            ]
+        );
         let records = queue.records();
         assert_eq!(records[0].status, JobStatus::Completed);
         assert_eq!(
@@ -7104,12 +7085,16 @@ mod tests {
             String::new(),
             "https://img.test/edit-2.png".to_owned(),
         ]);
-        let image_sender = ImageTelegramSenderCapture::new(Vec::new());
-        let image_rich = Arc::new(crate::rich::MockRichSender::default());
-        let image_effects = crate::image_jobs::TelegramImageJobEffects::new(
-            image_sender.clone(),
-            image_rich.clone(),
-        );
+        let placeholder_message: carapax::types::Message = serde_json::from_value(json!({
+            "message_id": 555,
+            "date": 0,
+            "chat": {"type": "private", "id": 42, "first_name": "Ada"},
+            "from": {"id": 1, "is_bot": true, "first_name": "Plotva"},
+        }))?;
+        let image_sender = ImageTelegramSenderCapture::new(vec![Ok(
+            TelegramOutboundResponse::Message(Box::new(placeholder_message)),
+        )]);
+        let image_effects = crate::image_jobs::TelegramImageJobEffects::new(image_sender.clone());
         let worker_report = crate::image_jobs::run_image_edit_queue_once(
             &queue,
             IMAGE_VIP_QUEUE_NAME,
@@ -7142,34 +7127,16 @@ mod tests {
                 photo_urls: vec!["https://files.test/photo.png".to_owned()],
             }]
         );
-        assert!(image_sender.methods().is_empty());
-        {
-            let sent = image_rich.sent.lock().expect("rich sent");
-            assert_eq!(sent.len(), 1);
-            assert_eq!(sent[0].chat_id, 42);
-            assert_eq!(sent[0].reply_to_message_id, Some(77));
-            assert_eq!(
-                sent[0].html,
-                "<tg-emoji emoji-id=\"5298651821080879865\">✨</tg-emoji>"
-            );
-        }
-        {
-            let edited = image_rich.edited.lock().expect("rich edited");
-            assert_eq!(edited.len(), 1);
-            assert_eq!(edited[0].0, 42);
-            assert_eq!(edited[0].1, 1001);
-            assert!(edited[0].2.starts_with("<tg-collage>"));
-            assert!(
-                edited[0]
-                    .2
-                    .contains("<img src=\"https://img.test/edit-1.png\"/>")
-            );
-            assert!(
-                edited[0]
-                    .2
-                    .contains("<img src=\"https://img.test/edit-2.png\"/>")
-            );
-        }
+        // Album delivery: one placeholder frame (single editor) filled with the
+        // first edit result via editMessageMedia.
+        let methods = image_sender.methods();
+        assert_eq!(
+            methods.iter().map(|(kind, _)| *kind).collect::<Vec<_>>(),
+            vec![
+                TelegramOutboundMethodKind::SendPhoto,
+                TelegramOutboundMethodKind::EditMessageMedia,
+            ]
+        );
         let records = queue.records();
         assert_eq!(records[0].status, JobStatus::Completed);
         assert_eq!(
