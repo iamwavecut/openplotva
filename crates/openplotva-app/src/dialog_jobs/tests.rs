@@ -125,6 +125,77 @@ async fn dialog_worker_runs_provider_sends_answer_and_completes_job() -> Result<
     Ok(())
 }
 
+#[tokio::test]
+async fn existing_unresolved_outbox_batch_skips_provider_and_waits_for_delivery()
+-> Result<(), Box<dyn Error>> {
+    let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+    let queue = InMemoryTaskQueue::new();
+    let job_id = queue.assign(
+        TEXT_QUEUE_NAME,
+        new_dialog_job_at(dialog_params("hello"), now).with_priority(HIGH_PRIORITY),
+    );
+    let provider = ProviderStub::returning(DialogOutput {
+        answer: "must not run".to_owned(),
+        ..DialogOutput::default()
+    });
+    let effects = EffectsStub::with_queued_answer(QueuedBatchReceipt::durable_outbox(
+        format!("dialog-answer:v1:99:{job_id}"),
+        vec!["tgop:v1:one".to_owned(), "tgop:v1:two".to_owned()],
+        false,
+    ));
+
+    let report =
+        process_dialog_job_once_in_queue_at(&queue, TEXT_QUEUE_NAME, &provider, &effects, now)
+            .await;
+
+    assert!(
+        provider.inputs().is_empty(),
+        "preflight must run before LLM"
+    );
+    assert!(effects.sent().is_empty());
+    assert!(report.queued_answer);
+    assert!(report.waiting_delivery);
+    assert!(!report.sent_answer);
+    assert!(!report.completed);
+    assert_eq!(record_status(&queue, job_id), JobStatus::WaitingDelivery);
+    Ok(())
+}
+
+#[tokio::test]
+async fn existing_delivered_outbox_batch_skips_provider_and_completes_job()
+-> Result<(), Box<dyn Error>> {
+    let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+    let queue = InMemoryTaskQueue::new();
+    let job_id = queue.assign(
+        TEXT_QUEUE_NAME,
+        new_dialog_job_at(dialog_params("hello"), now).with_priority(HIGH_PRIORITY),
+    );
+    let provider = ProviderStub::returning(DialogOutput {
+        answer: "must not run".to_owned(),
+        ..DialogOutput::default()
+    });
+    let effects = EffectsStub::with_queued_answer(QueuedBatchReceipt::durable_outbox(
+        format!("dialog-answer:v1:99:{job_id}"),
+        vec!["tgop:v1:one".to_owned()],
+        true,
+    ));
+
+    let report =
+        process_dialog_job_once_in_queue_at(&queue, TEXT_QUEUE_NAME, &provider, &effects, now)
+            .await;
+
+    assert!(
+        provider.inputs().is_empty(),
+        "preflight must run before LLM"
+    );
+    assert!(effects.sent().is_empty());
+    assert!(report.sent_answer);
+    assert!(report.completed);
+    assert!(!report.waiting_delivery);
+    assert_eq!(record_status(&queue, job_id), JobStatus::Completed);
+    Ok(())
+}
+
 #[tokio::test(start_paused = true)]
 async fn dialog_worker_pulses_typing_during_active_turn() -> Result<(), Box<dyn Error>> {
     let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
@@ -311,7 +382,7 @@ async fn dialog_dispatcher_effects_allow_sending_without_deleted_reply_target()
         .with_virtual_id_factory(Arc::new(|| "dialog-v1".to_owned()));
 
     effects
-        .send_dialog_answer(&dialog_params("hello"), "pong")
+        .send_dialog_answer(1, None, &dialog_params("hello"), "pong")
         .await?;
 
     let item = queue.dequeue_immediate().expect("queued dialog answer");
@@ -353,7 +424,7 @@ async fn dialog_dispatcher_effects_routes_rich_only_html_to_rich_queue()
         .with_virtual_id_factory(Arc::new(|| "dialog-v1".to_owned()));
 
     effects
-        .send_dialog_answer(&dialog_params("hello"), "<h2>pong</h2>")
+        .send_dialog_answer(1, None, &dialog_params("hello"), "<h2>pong</h2>")
         .await?;
 
     let item = queue.dequeue_immediate().expect("queued dialog answer");
@@ -2550,6 +2621,7 @@ struct EffectsStub {
 struct EffectsState {
     sent: Vec<(String, String)>,
     intermediates: Vec<(String, u32, bool)>,
+    queued_answer: Option<QueuedBatchReceipt>,
     fail: bool,
 }
 
@@ -2562,6 +2634,12 @@ impl EffectsStub {
 
     fn sent(&self) -> Vec<(String, String)> {
         self.state.lock().expect("effects state").sent.clone()
+    }
+
+    fn with_queued_answer(receipt: QueuedBatchReceipt) -> Self {
+        let this = Self::default();
+        this.state.lock().expect("effects state").queued_answer = Some(receipt);
+        this
     }
 
     #[allow(dead_code)]
@@ -2579,9 +2657,11 @@ impl DialogJobEffects for EffectsStub {
 
     fn send_dialog_answer<'a>(
         &'a self,
+        dialog_job_id: i64,
+        _causation_update_id: Option<i64>,
         params: &'a DialogJobParams,
         answer: &'a str,
-    ) -> DialogJobEffectFuture<'a, Self::Error> {
+    ) -> DialogJobReceiptFuture<'a, Self::Error> {
         Box::pin(async move {
             let mut state = self.state.lock().expect("effects state");
             if state.fail {
@@ -2590,7 +2670,10 @@ impl DialogJobEffects for EffectsStub {
             state
                 .sent
                 .push((params.message_text.clone(), answer.to_owned()));
-            Ok(())
+            Ok(QueuedBatchReceipt::dispatcher(
+                format!("test-dialog-answer:{dialog_job_id}"),
+                vec![format!("test-operation:{dialog_job_id}")],
+            ))
         })
     }
 
@@ -2610,6 +2693,20 @@ impl DialogJobEffects for EffectsStub {
                 .intermediates
                 .push((text.to_owned(), seq, reply_to_trigger));
             Ok(())
+        })
+    }
+
+    fn queued_dialog_answer<'a>(
+        &'a self,
+        _dialog_job_id: i64,
+    ) -> DialogJobReceiptLookupFuture<'a, Self::Error> {
+        Box::pin(async move {
+            Ok(self
+                .state
+                .lock()
+                .expect("effects state")
+                .queued_answer
+                .clone())
         })
     }
 }
@@ -2704,7 +2801,10 @@ async fn deliverable_validation_matches_outbound_acceptance() -> Result<(), Box<
 
     for answer in corpus {
         let validated = validate_dialog_answer_deliverable(&answer).is_ok();
-        let accepted = effects.send_dialog_answer(&params, &answer).await.is_ok();
+        let accepted = effects
+            .send_dialog_answer(1, None, &params, &answer)
+            .await
+            .is_ok();
         assert_eq!(
             validated,
             accepted,
@@ -2773,6 +2873,13 @@ impl DialogJobWorkerQueue for FailingEventQueue {
         job_id: i64,
     ) -> DialogJobWorkerFuture<'a, (), Self::Error> {
         self.inner.complete_dialog_job(job_id)
+    }
+
+    fn wait_for_dialog_delivery<'a>(
+        &'a self,
+        job_id: i64,
+    ) -> DialogJobWorkerFuture<'a, bool, Self::Error> {
+        self.inner.wait_for_dialog_delivery(job_id)
     }
 
     fn fail_dialog_job<'a>(

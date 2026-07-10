@@ -5,8 +5,11 @@ use std::{
     fmt,
     future::Future,
     pin::Pin,
-    sync::Arc,
-    time::{Duration, SystemTime},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicI64, Ordering},
+    },
+    time::{Duration, Instant, SystemTime},
 };
 
 use carapax::types::{
@@ -14,16 +17,21 @@ use carapax::types::{
     Update as TelegramUpdate, UpdateType as TelegramUpdateType,
 };
 use openplotva_core::{ChatMessageMeta, ChatState, UserState};
-use openplotva_storage::TelegramFileMetadataUpsert;
+use openplotva_storage::{
+    ClaimedTelegramUpdate, PostgresTelegramDeliveryStore, TelegramFileMetadataUpsert,
+};
 use openplotva_updates::{
     HistoryTextEntry, NoopUpdateStageTracker, UpdateConsumerConfig, UpdateProcessReport,
-    UpdateStageOutcome, UpdateStageTracker, build_fetcher_message_context,
-    build_history_text_entry, extract_update_state, fetcher_message_text,
-    should_skip_side_effects_at,
+    UpdateStage, UpdateStageOutcome, UpdateStageReport, UpdateStageTracker,
+    build_fetcher_message_context, build_history_text_entry, extract_update_state,
+    fetcher_message_text, should_skip_side_effects_at,
 };
 use thiserror::Error;
 use time::{Date, OffsetDateTime};
-use tokio::{sync::Semaphore, task::JoinSet};
+use tokio::{
+    sync::{Semaphore, watch},
+    task::JoinSet,
+};
 
 /// Boxed future returned by update sources.
 pub type UpdateSourceFuture<'a, E> =
@@ -104,7 +112,7 @@ impl UpdateSource for openplotva_updates::RedisUpdateQueue {
 
 pub trait UpdateHandler {
     /// Error returned by the concrete handler.
-    type Error: fmt::Display;
+    type Error: fmt::Display + Send;
 
     /// Handle one decoded update after the state stage has been scheduled.
     fn handle_update<'a>(&'a self, update: TelegramUpdate) -> UpdateHandlerFuture<'a, Self::Error>;
@@ -875,6 +883,518 @@ pub struct UpdateConsumerRunReport {
     pub coalesced_member_updates: usize,
     /// Worker task join failures.
     pub join_errors: Vec<String>,
+}
+
+/// Durable outcome recorded against a materialized Telegram update.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UpdateDisposition {
+    Handled,
+    Ignored { reason: String },
+    Retry { error_class: String, error: String },
+    DeadLetter { error_class: String, error: String },
+}
+
+/// Summary for the Postgres inbox consumer. A claim is terminal only after its
+/// fenced transition commits.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MaterializedUpdateConsumerRunReport {
+    pub claimed: usize,
+    pub handled: usize,
+    pub ignored: usize,
+    pub retried: usize,
+    pub dead_lettered: usize,
+    pub lease_lost: usize,
+    pub claim_errors: Vec<String>,
+    pub transition_errors: Vec<String>,
+    pub join_errors: Vec<String>,
+}
+
+enum ClaimedUpdateProcessResult {
+    Transitioned(UpdateDisposition),
+    LeaseLost,
+    TransitionError(String),
+}
+
+const MATERIALIZED_UPDATE_CLAIM_LIMIT: usize = 64;
+const MATERIALIZED_UPDATE_CLAIM_POLL: Duration = Duration::from_millis(100);
+const MATERIALIZED_UPDATE_CLAIM_TIMEOUT: Duration = Duration::from_secs(5);
+const MATERIALIZED_UPDATE_LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(20);
+const MATERIALIZED_UPDATE_LEASE_RETRY_INTERVAL: Duration = Duration::from_secs(3);
+const MATERIALIZED_UPDATE_MAX_ATTEMPTS: i32 = 8;
+
+/// Consume only committed inbox rows. Unlike the legacy Redis List consumer,
+/// this path intentionally does not use Telegram event time as an admission
+/// decision: an old addressed message remains processable after a long outage.
+pub async fn run_materialized_update_consumer_until<S, H, Tracker, Stop>(
+    delivery_store: PostgresTelegramDeliveryStore,
+    config: UpdateConsumerConfig,
+    state_store: Arc<S>,
+    handler: Arc<H>,
+    tracker: Arc<Tracker>,
+    stop: Stop,
+) -> MaterializedUpdateConsumerRunReport
+where
+    S: UpdateStateStore + Send + Sync + 'static,
+    H: UpdateHandler + Send + Sync + 'static,
+    Tracker: UpdateStageTracker + Send + Sync + 'static,
+    Stop: Future<Output = ()> + Send,
+{
+    let worker_limit = config
+        .worker_limit
+        .clamp(1, MATERIALIZED_UPDATE_CLAIM_LIMIT);
+    let worker_id = format!(
+        "updates-{}-{}",
+        std::process::id(),
+        OffsetDateTime::now_utc().unix_timestamp_nanos()
+    );
+    let mut workers = JoinSet::new();
+    let mut report = MaterializedUpdateConsumerRunReport::default();
+    tokio::pin!(stop);
+
+    'consume: loop {
+        while workers.len() >= worker_limit {
+            tokio::select! {
+                _ = &mut stop => break 'consume,
+                joined = workers.join_next() => {
+                    if let Some(joined) = joined {
+                        record_claimed_update_result(joined, &mut report);
+                    }
+                }
+            }
+        }
+
+        let available = worker_limit.saturating_sub(workers.len()).max(1);
+        let claimed = tokio::select! {
+            _ = &mut stop => break,
+            claimed = tokio::time::timeout(
+                MATERIALIZED_UPDATE_CLAIM_TIMEOUT,
+                delivery_store.claim_updates(&worker_id, available),
+            ) => claimed,
+            joined = workers.join_next(), if !workers.is_empty() => {
+                if let Some(joined) = joined {
+                    record_claimed_update_result(joined, &mut report);
+                }
+                continue;
+            }
+        };
+
+        let claimed = match claimed {
+            Ok(Ok(claimed)) => claimed,
+            Ok(Err(error)) => {
+                report.claim_errors.push(error.to_string());
+                tokio::select! {
+                    _ = &mut stop => break,
+                    () = tokio::time::sleep(MATERIALIZED_UPDATE_CLAIM_POLL) => {}
+                }
+                continue;
+            }
+            Err(_) => {
+                report
+                    .claim_errors
+                    .push("claim materialized Telegram updates timed out".to_owned());
+                continue;
+            }
+        };
+
+        if claimed.is_empty() {
+            tokio::select! {
+                _ = &mut stop => break,
+                joined = workers.join_next(), if !workers.is_empty() => {
+                    if let Some(joined) = joined {
+                        record_claimed_update_result(joined, &mut report);
+                    }
+                }
+                () = tokio::time::sleep(MATERIALIZED_UPDATE_CLAIM_POLL) => {}
+            }
+            continue;
+        }
+
+        report.claimed = report.claimed.saturating_add(claimed.len());
+        for claim in claimed {
+            let delivery_store = delivery_store.clone();
+            let state_store = Arc::clone(&state_store);
+            let handler = Arc::clone(&handler);
+            let tracker = Arc::clone(&tracker);
+            workers.spawn(async move {
+                process_claimed_update(delivery_store, claim, config, state_store, handler, tracker)
+                    .await
+            });
+        }
+    }
+
+    while let Some(joined) = workers.join_next().await {
+        record_claimed_update_result(joined, &mut report);
+    }
+    report
+}
+
+async fn process_claimed_update<S, H, Tracker>(
+    delivery_store: PostgresTelegramDeliveryStore,
+    claim: ClaimedTelegramUpdate,
+    config: UpdateConsumerConfig,
+    state_store: Arc<S>,
+    handler: Arc<H>,
+    tracker: Arc<Tracker>,
+) -> ClaimedUpdateProcessResult
+where
+    S: UpdateStateStore + Send + Sync + 'static,
+    H: UpdateHandler + Send + Sync + 'static,
+    Tracker: UpdateStageTracker + Send + Sync + 'static,
+{
+    let lease_lost = Arc::new(AtomicBool::new(false));
+    let lease_deadline = Arc::new(AtomicI64::new(claim.leased_until.unix_timestamp()));
+    let (renew_stop, renew_stop_rx) = watch::channel(false);
+    let renewal = tokio::spawn(renew_claim_lease_until(
+        delivery_store.clone(),
+        claim.id,
+        claim.lease_token,
+        Arc::clone(&lease_lost),
+        Arc::clone(&lease_deadline),
+        renew_stop_rx,
+    ));
+
+    let result = process_claimed_update_inner(
+        &delivery_store,
+        &claim,
+        config,
+        state_store.as_ref(),
+        handler.as_ref(),
+        tracker.as_ref(),
+        lease_lost.as_ref(),
+    )
+    .await;
+    let _ = renew_stop.send(true);
+    let _ = renewal.await;
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_claimed_update_inner<S, H, Tracker>(
+    delivery_store: &PostgresTelegramDeliveryStore,
+    claim: &ClaimedTelegramUpdate,
+    config: UpdateConsumerConfig,
+    state_store: &S,
+    handler: &H,
+    tracker: &Tracker,
+    lease_lost: &AtomicBool,
+) -> ClaimedUpdateProcessResult
+where
+    S: UpdateStateStore + Sync,
+    H: UpdateHandler + Sync,
+    Tracker: UpdateStageTracker + ?Sized,
+{
+    let update = match claim.decode_payload::<TelegramUpdate>() {
+        Ok(update) => update,
+        Err(error) => {
+            return transition_claimed_update(
+                delivery_store,
+                claim,
+                UpdateDisposition::DeadLetter {
+                    error_class: "payload_decode".to_owned(),
+                    error: error.to_string(),
+                },
+                lease_lost,
+            )
+            .await;
+        }
+    };
+
+    if claim.needs_state_application() {
+        let started_at = SystemTime::now();
+        let started = Instant::now();
+        let token = tracker.stage_started(&update, UpdateStage::State, started_at);
+        let state = tokio::time::timeout(
+            config.state_timeout,
+            persist_update_state(state_store, &update),
+        )
+        .await;
+        let outcome = match &state {
+            Ok(Ok(_)) => UpdateStageOutcome::Completed,
+            Ok(Err(error)) => UpdateStageOutcome::Failed(error.to_string()),
+            Err(_) => UpdateStageOutcome::TimedOut,
+        };
+        finish_tracked_stage(tracker, token, UpdateStage::State, outcome, started);
+
+        match state {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                return transition_retry_or_dead_letter(
+                    delivery_store,
+                    claim,
+                    "state_persistence",
+                    &error.to_string(),
+                    lease_lost,
+                )
+                .await;
+            }
+            Err(_) => {
+                return transition_retry_or_dead_letter(
+                    delivery_store,
+                    claim,
+                    "state_timeout",
+                    "update state stage timed out",
+                    lease_lost,
+                )
+                .await;
+            }
+        }
+
+        if lease_lost.load(Ordering::Acquire) {
+            return ClaimedUpdateProcessResult::LeaseLost;
+        }
+        match delivery_store
+            .mark_update_state_applied(claim.id, claim.lease_token)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => return ClaimedUpdateProcessResult::LeaseLost,
+            Err(error) => {
+                return ClaimedUpdateProcessResult::TransitionError(error.to_string());
+            }
+        }
+    }
+
+    if matches!(&update.update_type, TelegramUpdateType::Unknown(_)) {
+        return transition_claimed_update(
+            delivery_store,
+            claim,
+            UpdateDisposition::Ignored {
+                reason: "unsupported_type".to_owned(),
+            },
+            lease_lost,
+        )
+        .await;
+    }
+
+    let started_at = SystemTime::now();
+    let started = Instant::now();
+    let token = tracker.stage_started(&update, UpdateStage::Handle, started_at);
+    let handled =
+        tokio::time::timeout(config.handle_timeout, handler.handle_update(update.clone())).await;
+    let outcome = match &handled {
+        Ok(Ok(())) => UpdateStageOutcome::Completed,
+        Ok(Err(error)) => UpdateStageOutcome::Failed(error.to_string()),
+        Err(_) => UpdateStageOutcome::TimedOut,
+    };
+    finish_tracked_stage(tracker, token, UpdateStage::Handle, outcome, started);
+
+    let disposition = match handled {
+        Ok(Ok(())) => UpdateDisposition::Handled,
+        Ok(Err(error)) => {
+            let error = error.to_string();
+            if error.starts_with("unported fetcher route for ") {
+                UpdateDisposition::Ignored {
+                    reason: format!(
+                        "unsupported_type:{}",
+                        openplotva_updates::update_name(&update)
+                    ),
+                }
+            } else if claim.attempt >= MATERIALIZED_UPDATE_MAX_ATTEMPTS {
+                UpdateDisposition::DeadLetter {
+                    error_class: "handler_error".to_owned(),
+                    error,
+                }
+            } else {
+                UpdateDisposition::Retry {
+                    error_class: "handler_error".to_owned(),
+                    error,
+                }
+            }
+        }
+        Err(_) if claim.attempt >= MATERIALIZED_UPDATE_MAX_ATTEMPTS => {
+            UpdateDisposition::DeadLetter {
+                error_class: "handler_timeout".to_owned(),
+                error: "update handler timed out".to_owned(),
+            }
+        }
+        Err(_) => UpdateDisposition::Retry {
+            error_class: "handler_timeout".to_owned(),
+            error: "update handler timed out".to_owned(),
+        },
+    };
+    transition_claimed_update(delivery_store, claim, disposition, lease_lost).await
+}
+
+async fn transition_retry_or_dead_letter(
+    delivery_store: &PostgresTelegramDeliveryStore,
+    claim: &ClaimedTelegramUpdate,
+    error_class: &str,
+    error: &str,
+    lease_lost: &AtomicBool,
+) -> ClaimedUpdateProcessResult {
+    let disposition = if claim.attempt >= MATERIALIZED_UPDATE_MAX_ATTEMPTS {
+        UpdateDisposition::DeadLetter {
+            error_class: error_class.to_owned(),
+            error: error.to_owned(),
+        }
+    } else {
+        UpdateDisposition::Retry {
+            error_class: error_class.to_owned(),
+            error: error.to_owned(),
+        }
+    };
+    transition_claimed_update(delivery_store, claim, disposition, lease_lost).await
+}
+
+async fn transition_claimed_update(
+    delivery_store: &PostgresTelegramDeliveryStore,
+    claim: &ClaimedTelegramUpdate,
+    disposition: UpdateDisposition,
+    lease_lost: &AtomicBool,
+) -> ClaimedUpdateProcessResult {
+    if lease_lost.load(Ordering::Acquire) {
+        return ClaimedUpdateProcessResult::LeaseLost;
+    }
+    let disposition = sanitize_update_disposition(disposition);
+    let transitioned = match &disposition {
+        UpdateDisposition::Handled => {
+            delivery_store
+                .complete_update(claim.id, claim.lease_token)
+                .await
+        }
+        UpdateDisposition::Ignored { reason } => {
+            delivery_store
+                .ignore_update(claim.id, claim.lease_token, reason)
+                .await
+        }
+        UpdateDisposition::Retry { error_class, error } => {
+            delivery_store
+                .retry_update(
+                    claim.id,
+                    claim.lease_token,
+                    retry_available_at(claim.update_id, claim.attempt),
+                    error_class,
+                    error,
+                )
+                .await
+        }
+        UpdateDisposition::DeadLetter { error_class, error } => {
+            delivery_store
+                .dead_letter_update(claim.id, claim.lease_token, error_class, error)
+                .await
+        }
+    };
+    match transitioned {
+        Ok(true) => ClaimedUpdateProcessResult::Transitioned(disposition),
+        Ok(false) => ClaimedUpdateProcessResult::LeaseLost,
+        Err(error) => ClaimedUpdateProcessResult::TransitionError(error.to_string()),
+    }
+}
+
+fn sanitize_update_disposition(disposition: UpdateDisposition) -> UpdateDisposition {
+    match disposition {
+        UpdateDisposition::Retry { error_class, error } => UpdateDisposition::Retry {
+            error_class,
+            error: openplotva_telegram::sanitize_telegram_transport_diagnostic(&error),
+        },
+        UpdateDisposition::DeadLetter { error_class, error } => UpdateDisposition::DeadLetter {
+            error_class,
+            error: openplotva_telegram::sanitize_telegram_transport_diagnostic(&error),
+        },
+        disposition @ (UpdateDisposition::Handled | UpdateDisposition::Ignored { .. }) => {
+            disposition
+        }
+    }
+}
+
+fn retry_available_at(update_id: i64, attempt: i32) -> OffsetDateTime {
+    let exponent = u32::try_from(attempt.clamp(0, 6)).unwrap_or(6);
+    let backoff_seconds = 1_i64.checked_shl(exponent).unwrap_or(60).min(60);
+    let jitter_millis = update_id.unsigned_abs().wrapping_add(attempt as u64) % 1_000;
+    OffsetDateTime::now_utc()
+        + time::Duration::seconds(backoff_seconds)
+        + time::Duration::milliseconds(i64::try_from(jitter_millis).unwrap_or(999))
+}
+
+fn finish_tracked_stage<Tracker: UpdateStageTracker + ?Sized>(
+    tracker: &Tracker,
+    token: u64,
+    stage: UpdateStage,
+    outcome: UpdateStageOutcome,
+    started: Instant,
+) {
+    tracker.stage_finished(
+        token,
+        &UpdateStageReport {
+            stage,
+            outcome,
+            elapsed: started.elapsed(),
+        },
+        SystemTime::now(),
+    );
+}
+
+async fn renew_claim_lease_until(
+    delivery_store: PostgresTelegramDeliveryStore,
+    inbox_id: i64,
+    lease_token: i64,
+    lease_lost: Arc<AtomicBool>,
+    lease_deadline: Arc<AtomicI64>,
+    mut stop: watch::Receiver<bool>,
+) {
+    let mut next_wait = MATERIALIZED_UPDATE_LEASE_RENEW_INTERVAL;
+    loop {
+        tokio::select! {
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() {
+                    break;
+                }
+            }
+            () = tokio::time::sleep(next_wait) => {
+                match delivery_store.renew_update_lease(inbox_id, lease_token).await {
+                    Ok(true) => {
+                        lease_deadline.store(
+                            OffsetDateTime::now_utc().unix_timestamp()
+                                + openplotva_storage::UPDATE_PROCESSING_LEASE_SECONDS,
+                            Ordering::Release,
+                        );
+                        next_wait = MATERIALIZED_UPDATE_LEASE_RENEW_INTERVAL;
+                    }
+                    Ok(false) => {
+                        lease_lost.store(true, Ordering::Release);
+                        break;
+                    }
+                    Err(error) => {
+                        tracing::warn!(inbox_id, lease_token, %error, "failed to renew Telegram update lease");
+                        if OffsetDateTime::now_utc().unix_timestamp()
+                            >= lease_deadline.load(Ordering::Acquire)
+                        {
+                            lease_lost.store(true, Ordering::Release);
+                            break;
+                        }
+                        next_wait = MATERIALIZED_UPDATE_LEASE_RETRY_INTERVAL;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn record_claimed_update_result(
+    joined: Result<ClaimedUpdateProcessResult, tokio::task::JoinError>,
+    report: &mut MaterializedUpdateConsumerRunReport,
+) {
+    match joined {
+        Ok(ClaimedUpdateProcessResult::Transitioned(UpdateDisposition::Handled)) => {
+            report.handled = report.handled.saturating_add(1);
+        }
+        Ok(ClaimedUpdateProcessResult::Transitioned(UpdateDisposition::Ignored { .. })) => {
+            report.ignored = report.ignored.saturating_add(1);
+        }
+        Ok(ClaimedUpdateProcessResult::Transitioned(UpdateDisposition::Retry { .. })) => {
+            report.retried = report.retried.saturating_add(1);
+        }
+        Ok(ClaimedUpdateProcessResult::Transitioned(UpdateDisposition::DeadLetter { .. })) => {
+            report.dead_lettered = report.dead_lettered.saturating_add(1);
+        }
+        Ok(ClaimedUpdateProcessResult::LeaseLost) => {
+            report.lease_lost = report.lease_lost.saturating_add(1);
+        }
+        Ok(ClaimedUpdateProcessResult::TransitionError(error)) => {
+            report.transition_errors.push(error);
+        }
+        Err(error) => report.join_errors.push(error.to_string()),
+    }
 }
 
 /// Run the app-level update consumer until `stop` resolves, then wait for in-flight work.

@@ -1060,32 +1060,77 @@ run_update_queue_helper() {
 enqueue_update() {
   local update_json="$1"
   run_update_queue_helper \
-    enqueue \
+    enqueue-stream \
     --redis-url "$redis_url" \
-    --json-file "$update_json" \
-    --allowed-only
+    --bot-id "$bot_id" \
+    --json-file "$update_json"
 }
 
 enqueue_update_unfiltered() {
   local update_json="$1"
   run_update_queue_helper \
-    enqueue \
+    enqueue-stream \
     --redis-url "$redis_url" \
+    --bot-id "$bot_id" \
     --json-file "$update_json"
 }
 
 queue_len() {
   run_update_queue_helper \
-    len \
-    --redis-url "$redis_url"
+    stream-len \
+    --redis-url "$redis_url" \
+    --bot-id "$bot_id"
 }
 
 wait_queue_empty() {
   run_update_queue_helper \
-    wait-len \
+    wait-stream-len \
     --redis-url "$redis_url" \
+    --bot-id "$bot_id" \
     --expected 0 \
     --timeout-seconds "$timeout_seconds"
+}
+
+run_bulk_materialization_probe() {
+  local count=512
+  local base_update_id
+  local template="${log_dir}/bulk-materialization-template.json"
+  local deadline=$((SECONDS + timeout_seconds))
+  local materialized
+  local quarantined
+  base_update_id="$(( $(date +%s) * 100000 + RANDOM ))"
+  jq -n --argjson update_id "$base_update_id" \
+    '{update_id: $update_id, future_bulk_probe: {kind: "materialization"}}' >"$template"
+
+  echo "+ enqueue ${count}-row atomic Stream batch for bulk materialization"
+  local appended
+  appended="$(run_update_queue_helper \
+    enqueue-stream-batch \
+    --redis-url "$redis_url" \
+    --bot-id "$bot_id" \
+    --json-file "$template" \
+    --count "$count")"
+  if [[ "$appended" != "$count" ]]; then
+    echo "bulk Stream append returned ${appended}, expected ${count}" >&2
+    exit 1
+  fi
+
+  while true; do
+    materialized="$(compose exec -T postgres psql -v ON_ERROR_STOP=1 -U plotva -d plotva -Atc \
+      "SELECT count(*) FROM telegram_update_inbox WHERE bot_id = ${bot_id} AND update_id >= ${base_update_id} AND update_id < $((base_update_id + count))")"
+    quarantined="$(compose exec -T postgres psql -v ON_ERROR_STOP=1 -U plotva -d plotva -Atc \
+      "SELECT count(*) FROM telegram_update_quarantine WHERE bot_id = ${bot_id} AND created_at >= now() - interval '10 minutes'")"
+    if [[ "$materialized" == "$count" && "$quarantined" == "0" && "$(queue_len)" == "0" ]]; then
+      echo "+ ${count} updates bulk-materialized without quarantine; Stream ACK/Delete complete"
+      return 0
+    fi
+    if [[ "$SECONDS" -ge "$deadline" ]]; then
+      echo "bulk materialization timed out: inbox=${materialized}, quarantine=${quarantined}, stream=$(queue_len)" >&2
+      tail -n 200 "$app_log" >&2 || true
+      exit 1
+    fi
+    sleep 1
+  done
 }
 
 wait_log_contains() {
@@ -2324,6 +2369,7 @@ fi
 echo "+ Telegram getMe preflight"
 telegram_get_me "$telegram_getme_file"
 bot_username="$(jq -r '.result.username // ""' "$telegram_getme_file")"
+bot_id="$(jq -r '.result.id' "$telegram_getme_file")"
 
 echo "+ starting disposable Postgres/Dragonfly project=${project}"
 compose up -d postgres dragonfly
@@ -2348,6 +2394,8 @@ echo "+ starting openplotva-app with update production disabled"
   export REDIS_HOST=127.0.0.1
   export REDIS_PORT="$redis_port"
   export REDIS_DB=0
+  export UPDATE_QUEUE_BACKEND=stream
+  export UPDATE_STREAM_REDIS_URL="$redis_url"
   export OPENPLOTVA_CONNECT_SERVICES=true
   export OPENPLOTVA_RUN_MIGRATIONS=true
   export OPENPLOTVA_PRODUCE_UPDATES=false
@@ -2371,6 +2419,7 @@ wait_for_http "${base_url}/api/ready" "$ready_file"
 jq -e '.checks[] | select(.name == "telegram_update_producer" and .status == "skipped") | (.message // .detail // "") | contains("OPENPLOTVA_PRODUCE_UPDATES=false")' "$ready_file" >/dev/null
 jq -e '.checks[] | select(.name == "telegram_update_consumer" and .status == "ok")' "$ready_file" >/dev/null
 echo "+ runtime ready with producer disabled and consumer enabled"
+run_bulk_materialization_probe
 enable_aifarm_pool_if_requested
 
 selected_cases="$(configured_smoke_cases)"

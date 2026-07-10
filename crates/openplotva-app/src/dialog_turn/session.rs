@@ -36,7 +36,7 @@ use serde_json::Value;
 use time::{Duration as TimeDuration, OffsetDateTime, format_description::well_known::Rfc3339};
 
 use super::budget::{SessionBudget, TURN_DEADLINE, TurnBudget};
-use super::engine::{ANSWER_SENT_STAGE, DIALOG_TURN_REGENERATE_STAGE};
+use super::engine::{ANSWER_QUEUED_STAGE, ANSWER_SENT_STAGE, DIALOG_TURN_REGENERATE_STAGE};
 use super::outcome::{JobDisposition, TurnOutcome, TurnResolution, UserSignalPlan};
 use crate::dialog_jobs::{
     DialogJobEffects, DialogJobWorkerQueue, DialogJobWorkerReport, DialogToolCallHistoryStore,
@@ -509,8 +509,41 @@ where
                 .await;
             }
 
-            return match effects.send_dialog_answer(ctx.params, &sanitized).await {
-                Ok(()) => {
+            return match effects
+                .send_dialog_answer(
+                    ctx.item_id,
+                    ctx.item.latest_update_id,
+                    ctx.params,
+                    &sanitized,
+                )
+                .await
+            {
+                Ok(receipt) if receipt.requires_delivery_wait() => {
+                    report.queued_answer = true;
+                    let queued_now = ctx.now
+                        + TimeDuration::try_from(processing_started.elapsed()).unwrap_or_default();
+                    append_session_queued_marker(queue, ctx.item_id, &receipt, queued_now).await;
+                    if receipt.delivery_complete() {
+                        report.sent_answer = true;
+                        TurnResolution {
+                            outcome: TurnOutcome::Sent {
+                                parts: receipt.operation_ids.len(),
+                                side_effect_tickets: ticket_ids(&side_effect_tickets),
+                            },
+                            disposition: JobDisposition::Complete,
+                        }
+                    } else {
+                        TurnResolution {
+                            outcome: TurnOutcome::QueuedForDelivery {
+                                batch_id: receipt.batch_id,
+                                operation_ids: receipt.operation_ids,
+                                side_effect_tickets: ticket_ids(&side_effect_tickets),
+                            },
+                            disposition: JobDisposition::WaitForDelivery,
+                        }
+                    }
+                }
+                Ok(_receipt) => {
                     sent.record(&sanitized, false);
                     report.sent_answer = true;
                     if let Some(runs) = ctx.llm_runs {
@@ -956,6 +989,33 @@ where
             error = %error,
             job_id,
             "failed to append session_message_sent marker; a rerun may re-send"
+        );
+    }
+}
+
+async fn append_session_queued_marker<Queue>(
+    queue: &Queue,
+    job_id: i64,
+    receipt: &crate::dialog_jobs::QueuedBatchReceipt,
+    at: OffsetDateTime,
+) where
+    Queue: DialogJobWorkerQueue + Sync + ?Sized,
+{
+    let mut data = BTreeMap::new();
+    data.insert("batch_id".to_owned(), receipt.batch_id.clone());
+    data.insert("operation_ids".to_owned(), receipt.operation_ids.join(","));
+    let event = TaskQueueJobEvent {
+        level: "info".to_owned(),
+        stage: ANSWER_QUEUED_STAGE.to_owned(),
+        message: "final dialog answer committed to Telegram outbox".to_owned(),
+        data,
+        ..TaskQueueJobEvent::default()
+    };
+    if let Err(error) = queue.append_dialog_job_event(job_id, event, at).await {
+        tracing::warn!(
+            error = %error,
+            job_id,
+            "failed to append answer_queued marker; durable outbox preflight remains authoritative"
         );
     }
 }

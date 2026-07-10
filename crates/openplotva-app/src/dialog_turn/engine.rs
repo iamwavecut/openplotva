@@ -34,6 +34,10 @@ pub const DIALOG_TURN_REGENERATE_STAGE: &str = "dialog_turn_regenerate";
 /// the turn resolve `Sent` without re-sending the answer.
 pub const ANSWER_SENT_STAGE: &str = "answer_sent";
 
+/// A final answer batch was committed to Postgres and taskman is waiting for
+/// the outbox worker to record actual Telegram receipts.
+pub const ANSWER_QUEUED_STAGE: &str = "answer_queued";
+
 /// A turn never starts generation it cannot plausibly finish inside the budget.
 const MIN_GENERATION_BUDGET: TimeDuration = TimeDuration::seconds(15);
 
@@ -107,6 +111,53 @@ where
             outcome: TurnOutcome::SkippedEmptyPayload,
             disposition: JobDisposition::Complete,
         };
+    }
+
+    // Authoritative crash-reentry guard. The outbox transaction can commit
+    // before taskman reaches `WaitingDelivery`; startup then requeues the
+    // still-Processing job. Looking up the deterministic batch here, before
+    // input materialization or any provider call, prevents a second LLM run.
+    match effects.queued_dialog_answer(ctx.item.id).await {
+        Ok(Some(receipt)) if receipt.delivery_complete() => {
+            report.sent_answer = true;
+            report.resent_skipped = true;
+            return TurnResolution {
+                outcome: TurnOutcome::Sent {
+                    parts: receipt.operation_ids.len(),
+                    side_effect_tickets: Vec::new(),
+                },
+                disposition: JobDisposition::Complete,
+            };
+        }
+        Ok(Some(receipt)) => {
+            report.queued_answer = true;
+            report.resent_skipped = true;
+            return TurnResolution {
+                outcome: TurnOutcome::QueuedForDelivery {
+                    batch_id: receipt.batch_id,
+                    operation_ids: receipt.operation_ids,
+                    side_effect_tickets: Vec::new(),
+                },
+                disposition: JobDisposition::WaitForDelivery,
+            };
+        }
+        Ok(None) => {}
+        Err(error) => {
+            // On lookup uncertainty the safe action is to retry the preflight,
+            // never to run the provider and risk creating another answer.
+            let error = format!("check durable dialog answer: {error}");
+            report.send_error = Some(error);
+            let attempt = next_dialog_llm_job_attempt(&ctx.item.events);
+            return TurnResolution {
+                outcome: TurnOutcome::RetryScheduled {
+                    reason: "outbox_preflight",
+                    attempt,
+                    max_attempts: ctx.max_llm_job_attempts.max(1),
+                    target_queue: ctx.queue_name.to_owned(),
+                },
+                disposition: JobDisposition::Requeue(ctx.queue_name.to_owned()),
+            };
+        }
     }
 
     let base_input = materializer
@@ -217,6 +268,14 @@ pub(crate) async fn finalize_turn<Queue>(
     match &resolution.disposition {
         JobDisposition::Complete => match queue.complete_dialog_job(item.id).await {
             Ok(()) => report.completed = true,
+            Err(error) => report.status_error = Some(error.to_string()),
+        },
+        JobDisposition::WaitForDelivery => match queue.wait_for_dialog_delivery(item.id).await {
+            Ok(true) => report.waiting_delivery = true,
+            Ok(false) => {
+                report.status_error =
+                    Some("dialog job was not Processing while entering WaitingDelivery".to_owned());
+            }
             Err(error) => report.status_error = Some(error.to_string()),
         },
         JobDisposition::Fail(error) => match queue.fail_dialog_job(item.id, error).await {
@@ -383,6 +442,10 @@ async fn annotate_delegated_obligations(
             side_effect_tickets,
             ..
         } => side_effect_tickets,
+        TurnOutcome::QueuedForDelivery {
+            side_effect_tickets,
+            ..
+        } => side_effect_tickets,
         _ => return,
     };
     for ticket_job_id in tickets {
@@ -420,6 +483,10 @@ fn record_from_resolution(
             side_effect_tickets.first().copied(),
         ),
         TurnOutcome::SideEffectDelegated { tickets, .. } => (None, tickets.first().copied()),
+        TurnOutcome::QueuedForDelivery {
+            side_effect_tickets,
+            ..
+        } => (None, side_effect_tickets.first().copied()),
         _ => (None, None),
     };
     DialogTurnOutcomeRecord {
@@ -481,6 +548,15 @@ fn resolution_detail(resolution: &TurnResolution, report: &DialogJobWorkerReport
     }
     if let TurnOutcome::SideEffectDelegated { kinds, .. } = &resolution.outcome {
         detail.insert("side_effect_kinds".to_owned(), json!(kinds));
+    }
+    if let TurnOutcome::QueuedForDelivery {
+        batch_id,
+        operation_ids,
+        ..
+    } = &resolution.outcome
+    {
+        detail.insert("outbox_batch_id".to_owned(), json!(batch_id));
+        detail.insert("outbox_operation_ids".to_owned(), json!(operation_ids));
     }
     if let TurnOutcome::MergedIntoSession { session_job_id }
     | TurnOutcome::DeferredAfterSession { session_job_id } = &resolution.outcome

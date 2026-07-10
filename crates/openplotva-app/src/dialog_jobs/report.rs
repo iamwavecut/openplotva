@@ -18,10 +18,14 @@ pub struct DialogJobWorkerReport {
     pub skipped_queue_backlog: bool,
     pub content_blocked: bool,
     pub sent_answer: bool,
+    /// Final answer was committed to Postgres and awaits Telegram receipts.
+    pub queued_answer: bool,
     /// Dialog answer matched the latest comparable bot reply and was suppressed.
     pub suppressed_duplicate_message_id: Option<i32>,
     /// Job was finalized as completed.
     pub completed: bool,
+    /// Job transitioned to taskman's active `WaitingDelivery` state.
+    pub waiting_delivery: bool,
     /// Job was finalized as failed.
     pub failed: bool,
     /// Queue dequeue failed.
@@ -102,6 +106,8 @@ pub struct DialogJobWorkerRunReport {
     pub content_blocked: u64,
     /// Number of answers queued.
     pub sent_answers: u64,
+    /// Number of answers committed to the durable Telegram outbox.
+    pub queued_answers: u64,
     /// Number of duplicate answers suppressed before send.
     pub suppressed_duplicate_answers: u64,
     /// Number of retryable provider errors requeued.
@@ -143,6 +149,9 @@ impl DialogJobWorkerRunReport {
         }
         if tick.sent_answer {
             self.sent_answers += 1;
+        }
+        if tick.queued_answer {
+            self.queued_answers += 1;
         }
         if tick.suppressed_duplicate_message_id.is_some() {
             self.suppressed_duplicate_answers += 1;
@@ -191,6 +200,8 @@ pub(crate) fn trace_dialog_job_tick(tick: &DialogJobWorkerReport) {
         skipped_queue_backlog = tick.skipped_queue_backlog,
         content_blocked = tick.content_blocked,
         sent_answer = tick.sent_answer,
+        queued_answer = tick.queued_answer,
+        waiting_delivery = tick.waiting_delivery,
         suppressed_duplicate_message_id = tick.suppressed_duplicate_message_id,
         persisted_tool_call_history = tick.persisted_tool_call_history,
         recorded_dialog_fallback_event = tick.recorded_dialog_fallback_event,

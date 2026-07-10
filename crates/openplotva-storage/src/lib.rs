@@ -38,6 +38,23 @@ use time::OffsetDateTime;
 use tokio::sync::OnceCell;
 
 pub mod llm_routing;
+pub mod telegram_delivery;
+pub mod telegram_outbox;
+
+pub use telegram_delivery::{
+    ClaimedTelegramUpdate, MATERIALIZED_UPDATE_BINDS_PER_ROW, MaterializationReport,
+    MaterializedUpdateInput, PostgresTelegramDeliveryStore, QuarantinedUpdateInput,
+    TelegramUpdateAttempt, TelegramUpdateInboxItem, TelegramUpdateInboxStats,
+    UPDATE_PROCESSING_LEASE_SECONDS,
+};
+pub use telegram_outbox::{
+    ClaimedTelegramOutboxBlob, ClaimedTelegramOutboxOperation, OUTBOX_LEASE_SECONDS,
+    OUTBOX_OPERATION_BINDS_PER_ROW, PostgresTelegramOutboxStore, QueuedTelegramOutboxBatch,
+    QueuedTelegramOutboxPart, TelegramDeliveryPolicy, TelegramOutboxAttempt,
+    TelegramOutboxBatchInput, TelegramOutboxBlobInput, TelegramOutboxItem, TelegramOutboxPartInput,
+    TelegramOutboxRecoveryReport, TelegramOutboxStats, deterministic_telegram_operation_id,
+    enqueue_telegram_outbox_batch,
+};
 
 /// Human-readable crate purpose used by scaffold tests and docs.
 pub const PURPOSE: &str = "storage";
@@ -1484,6 +1501,11 @@ pub const CHAT_MEMBER_STATUS_LEFT: &str = "left";
 pub const CHAT_MEMBER_STATUS_KICKED: &str = "kicked";
 
 pub static MIGRATOR: Migrator = sqlx::migrate!("../../migrations");
+// SQLx's database advisory lock serializes normal transactional migrations, but
+// concurrent-index migrations must release the transaction. Serialize callers
+// inside one process as well, otherwise parallel integration tests can deadlock
+// an advisory-lock waiter against CREATE INDEX CONCURRENTLY's virtual-xact wait.
+static MIGRATION_RUN_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 const LEGACY_MIGRATION_TABLE_EXISTS_SQL: &str = "SELECT to_regclass('gorp_migrations') IS NOT NULL";
 const SQL_LIST_LEGACY_MIGRATION_IDS: &str =
@@ -7082,13 +7104,19 @@ async fn upsert_task_queue_record(
     // projection is checked by the compiler against the record struct (a field rename
     // breaks the build) and timestamps project via sqlx's native encoding.
     let (chat_id, user_id) = task_queue_record_chat_user(record);
+    let available_at = record.available_at.unwrap_or(record.job.created);
     sqlx::query(
         r#"
         INSERT INTO taskman_jobs (
             id, record, updated_at, deleted_at, queue_name, status, job_type,
-            priority, chat_id, user_id, created_at, started_at, completed_at
+            priority, chat_id, user_id, created_at, started_at, completed_at,
+            available_at, debounce_key, lane_key, source_update_ids,
+            latest_update_id, pending_dialog_inputs
         )
-        VALUES ($1, $2, now(), NULL, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        VALUES (
+            $1, $2, now(), NULL, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+            $12, $13, $14, $15, $16, $17
+        )
         ON CONFLICT (id) DO UPDATE SET
             record = EXCLUDED.record,
             updated_at = now(),
@@ -7101,7 +7129,13 @@ async fn upsert_task_queue_record(
             user_id = EXCLUDED.user_id,
             created_at = EXCLUDED.created_at,
             started_at = EXCLUDED.started_at,
-            completed_at = EXCLUDED.completed_at
+            completed_at = EXCLUDED.completed_at,
+            available_at = EXCLUDED.available_at,
+            debounce_key = EXCLUDED.debounce_key,
+            lane_key = EXCLUDED.lane_key,
+            source_update_ids = EXCLUDED.source_update_ids,
+            latest_update_id = EXCLUDED.latest_update_id,
+            pending_dialog_inputs = EXCLUDED.pending_dialog_inputs
         "#,
     )
     .bind(record.id)
@@ -7115,6 +7149,12 @@ async fn upsert_task_queue_record(
     .bind(record.job.created)
     .bind(record.started_at)
     .bind(record.completed_at)
+    .bind(available_at)
+    .bind(&record.debounce_key)
+    .bind(&record.lane_key)
+    .bind(&record.source_update_ids)
+    .bind(record.latest_update_id)
+    .bind(sqlx::types::Json(&record.pending_dialog_inputs))
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -7269,6 +7309,38 @@ pub enum StorageError {
         /// JSON codec error.
         source: serde_json::Error,
     },
+    /// A materialization batch exceeded the conservative Postgres bind budget.
+    #[error("Telegram update materialization batch has {rows} rows; maximum is {max_rows}")]
+    TelegramMaterializationBatchTooLarge { rows: usize, max_rows: usize },
+    /// A materialized Telegram update could not be decoded for processing.
+    #[error("decode materialized Telegram update payload: {source}")]
+    TelegramUpdateCodec {
+        /// JSON codec error.
+        source: serde_json::Error,
+    },
+    /// An outbound batch contained no operations.
+    #[error("Telegram outbox batch must contain at least one operation")]
+    TelegramOutboxEmptyBatch,
+    /// An outbound batch exceeded the conservative Postgres bind budget.
+    #[error("Telegram outbox batch has {rows} rows; maximum is {max_rows}")]
+    TelegramOutboxBatchTooLarge { rows: usize, max_rows: usize },
+    /// A media blob did not carry its SHA-256 digest.
+    #[error("Telegram outbox blob SHA-256 must be exactly 32 bytes")]
+    TelegramOutboxInvalidBlobHash,
+    /// Identical SHA-256 keys referred to different media bytes.
+    #[error("Telegram outbox blob hash conflicts with different bytes")]
+    TelegramOutboxBlobConflict,
+    /// A deterministic operation ID was reused with a different immutable payload.
+    #[error("Telegram outbox operation idempotency conflict in batch {batch_id}")]
+    TelegramOutboxIdempotencyConflict { batch_id: String },
+    /// Retrying an ambiguous create may duplicate a Telegram message.
+    #[error(
+        "retrying ambiguous Telegram operation {operation_id} requires duplicate-risk acceptance"
+    )]
+    TelegramOutboxDuplicateRiskConfirmationRequired { operation_id: String },
+    /// The requested manual transition is not valid for the current state.
+    #[error("Telegram outbox operation {operation_id} is not retryable from state {state}")]
+    TelegramOutboxNotRetryable { operation_id: String, state: String },
     /// Chat-admin ID list JSON codec failed.
     #[error("decode chat admin ids: {source}")]
     ChatAdminIdsCodec {
@@ -8306,6 +8378,7 @@ pub async fn connect_postgres(config: &PostgresConfig) -> Result<PgPool, Storage
 
 /// Apply all pending SQLx migrations to an already connected Postgres pool.
 pub async fn run_migrations_on(pool: &PgPool) -> Result<(), StorageError> {
+    let _guard = MIGRATION_RUN_LOCK.lock().await;
     bridge_existing_migration_history(pool).await?;
     MIGRATOR.run(pool).await.map_err(StorageError::from)
 }
@@ -10411,6 +10484,12 @@ mod tests {
                 },
                 created,
             ),
+            available_at: None,
+            debounce_key: None,
+            lane_key: None,
+            source_update_ids: Vec::new(),
+            latest_update_id: None,
+            pending_dialog_inputs: Vec::new(),
             worker_id: None,
             started_at: None,
             execution_started_at: None,

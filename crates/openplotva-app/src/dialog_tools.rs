@@ -31,6 +31,7 @@ use crate::{
     permissions::{ChatPermissionPolicy, ChatPermissionStore},
     rate_limits::TaskEnqueueRateLimit,
     rates::{RatesFetcher, RatesSideEffectDispatcher, currency_rates_tool},
+    task_queue::TaskQueueDurabilityBarrier,
     translate::{TextTranslator, TranslationResult, translate_text_tool},
 };
 use openplotva_server::{ACTION_SEND_AUDIO, ACTION_SEND_IMAGE};
@@ -888,6 +889,7 @@ impl ChatHistorySummaryResult {
 #[derive(Clone)]
 pub struct TaskmanDialogToolAdapter {
     queue: Arc<InMemoryTaskQueue>,
+    durability: Option<Arc<dyn TaskQueueDurabilityBarrier>>,
     draw_image_vip_status: Option<Arc<dyn DrawImageVipStatus>>,
     draw_image_rate_limit: Option<Arc<dyn DrawImageRateLimit>>,
     task_enqueue_rate_limit: Option<Arc<dyn TaskEnqueueRateLimit>>,
@@ -907,6 +909,10 @@ impl fmt::Debug for TaskmanDialogToolAdapter {
         formatter
             .debug_struct("TaskmanDialogToolAdapter")
             .field("queue", &self.queue)
+            .field(
+                "durability",
+                &self.durability.as_ref().map(|_| "configured"),
+            )
             .field(
                 "draw_image_vip_status",
                 &self.draw_image_vip_status.as_ref().map(|_| "configured"),
@@ -954,6 +960,7 @@ impl TaskmanDialogToolAdapter {
     pub fn new(queue: Arc<InMemoryTaskQueue>) -> Self {
         Self {
             queue,
+            durability: None,
             draw_image_vip_status: None,
             draw_image_rate_limit: None,
             task_enqueue_rate_limit: None,
@@ -971,6 +978,17 @@ impl TaskmanDialogToolAdapter {
                 crate::dialog_turn::DEFAULT_DIALOG_MUSIC_DELIVERY_TIMEOUT_SECS,
             )),
         }
+    }
+
+    /// Require each newly assigned user-visible job to reach Postgres before
+    /// its obligation, reaction, notice, or scheduled result is emitted.
+    #[must_use]
+    pub fn with_durability_barrier(
+        mut self,
+        durability: Arc<dyn TaskQueueDurabilityBarrier>,
+    ) -> Self {
+        self.durability = Some(durability);
+        self
     }
 
     /// Configure delivery-obligation recording: every successfully assigned
@@ -1246,6 +1264,7 @@ impl ImageScheduler for TaskmanDialogToolAdapter {
             let queue_position = self.image_queue_position(plan);
             match self.assign_image_job(plan.queue_name, job, plan.max_active_jobs) {
                 Ok(Some(job_id)) => {
+                    self.persist_generation_handoff(job_id).await?;
                     self.grow_task_enqueue(plan.queue_name, chat_id, user_id)
                         .await;
                     if let Some(rate_limit) = self.draw_image_rate_limit.as_deref() {
@@ -1370,6 +1389,7 @@ impl SongScheduler for TaskmanDialogToolAdapter {
                 .assign_with_user_limit(MUSIC_VIP_QUEUE_NAME, job, 2)
             {
                 Ok(Some(job_id)) => {
+                    self.persist_generation_handoff(job_id).await?;
                     self.grow_task_enqueue(MUSIC_VIP_QUEUE_NAME, chat_id, user_id)
                         .await;
                     self.record_delivery_obligation(
@@ -1398,6 +1418,30 @@ impl SongScheduler for TaskmanDialogToolAdapter {
 }
 
 impl TaskmanDialogToolAdapter {
+    async fn persist_generation_handoff(&self, job_id: i64) -> Result<(), ToolboxError> {
+        let Some(durability) = self.durability.as_deref() else {
+            return Ok(());
+        };
+        let Err(error) = durability.durability_barrier(job_id).await else {
+            return Ok(());
+        };
+        let reason = format!("retryable taskman durability failure: {error}");
+        if let Err(cancel_error) =
+            self.queue
+                .cancel(job_id, reason.clone(), OffsetDateTime::now_utc())
+        {
+            tracing::warn!(job_id, %cancel_error, "failed to cancel non-durable generation job");
+        }
+        if let Err(cancel_flush_error) = durability.durability_barrier(job_id).await {
+            tracing::warn!(
+                job_id,
+                %cancel_flush_error,
+                "failed to persist cancellation after generation durability failure"
+            );
+        }
+        Err(Box::new(std::io::Error::other(reason)))
+    }
+
     async fn schedule_image_edit(
         &self,
         request: DrawImageScheduleRequest,
@@ -1459,6 +1503,7 @@ impl TaskmanDialogToolAdapter {
         let queue_position = self.image_queue_position(plan);
         match self.assign_image_job(plan.queue_name, job, plan.max_active_jobs) {
             Ok(Some(job_id)) => {
+                self.persist_generation_handoff(job_id).await?;
                 self.grow_task_enqueue(plan.queue_name, chat_id, user_id)
                     .await;
                 self.record_delivery_obligation(
@@ -2766,6 +2811,7 @@ fn format_dialog_translation(result: &TranslationResult) -> String {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::VecDeque,
         error::Error,
         fmt,
         sync::{Arc, Mutex, MutexGuard},
@@ -2801,6 +2847,41 @@ mod tests {
     }
 
     impl Error for TestError {}
+
+    #[derive(Debug)]
+    struct TaskDurabilityStub {
+        outcomes: Mutex<VecDeque<Result<(), String>>>,
+        calls: Mutex<Vec<i64>>,
+    }
+
+    impl TaskDurabilityStub {
+        fn new(outcomes: impl IntoIterator<Item = Result<(), String>>) -> Self {
+            Self {
+                outcomes: Mutex::new(outcomes.into_iter().collect()),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<i64> {
+            self.calls.lock().expect("durability calls").clone()
+        }
+    }
+
+    impl TaskQueueDurabilityBarrier for TaskDurabilityStub {
+        fn durability_barrier<'a>(
+            &'a self,
+            job_id: i64,
+        ) -> crate::task_queue::TaskQueueDurabilityFuture<'a> {
+            self.calls.lock().expect("durability calls").push(job_id);
+            let outcome = self
+                .outcomes
+                .lock()
+                .expect("durability outcomes")
+                .pop_front()
+                .unwrap_or(Ok(()));
+            Box::pin(async move { outcome })
+        }
+    }
 
     #[derive(Clone, Debug, Default)]
     struct RatesFetcherStub;
@@ -4538,6 +4619,48 @@ mod tests {
         assert_eq!(calls[0].0, "queued");
         assert_eq!(calls[0].1.chat_id, -100);
         assert_eq!(calls[0].1.message_id, 11);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn generation_handoff_is_not_exposed_before_postgres_durability()
+    -> Result<(), ToolboxError> {
+        let queue = Arc::new(InMemoryTaskQueue::new());
+        let vip = Arc::new(DrawImageVipStatusStub::new(true));
+        let reactions = Arc::new(crate::reactions::test_support::RecordingReactionSink::default());
+        let durability = Arc::new(TaskDurabilityStub::new([
+            Err("postgres unavailable".to_owned()),
+            Ok(()),
+        ]));
+        let adapter = TaskmanDialogToolAdapter::new(Arc::clone(&queue))
+            .with_durability_barrier(durability.clone())
+            .with_generation_reactions(
+                Arc::clone(&reactions) as crate::reactions::GenerationReactions
+            )
+            .with_draw_image_vip_status(vip);
+
+        let error = adapter
+            .schedule_image(DrawImageScheduleRequest {
+                chat_id: -100,
+                message_id: 11,
+                user_id: 42,
+                user_full_name: "Alice".to_owned(),
+                prompt: "castle".to_owned(),
+                thread_id: Some(7),
+                ..DrawImageScheduleRequest::default()
+            })
+            .await
+            .expect_err("failed durability barrier must reject the handoff");
+
+        assert!(error.to_string().contains("postgres unavailable"));
+        let records = queue.records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].status, openplotva_taskman::JobStatus::Cancelled);
+        assert_eq!(durability.calls(), vec![records[0].id, records[0].id]);
+        assert!(
+            reactions.calls.lock().expect("reaction calls").is_empty(),
+            "queued reaction must not precede the durability barrier"
+        );
         Ok(())
     }
 

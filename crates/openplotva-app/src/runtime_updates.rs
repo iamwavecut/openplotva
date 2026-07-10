@@ -15,6 +15,7 @@ use openplotva_updates::{
     UPDATE_STALL_AGE, UpdateStage, UpdateStageOutcome, UpdateStageReport, UpdateStageTracker,
     extract_update_state, update_name,
 };
+use sqlx::{PgPool, Row};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 const UPDATE_STALL_LOG_INTERVAL: Duration = Duration::from_secs(60);
@@ -24,6 +25,14 @@ pub(crate) struct RuntimeUpdatesInspectorHandle {
     queue: openplotva_updates::RedisUpdateQueue,
     tracker: RuntimeUpdateTracker,
     gate_counters: Arc<Mutex<Option<Arc<crate::ingestion_telemetry::IngestionGateCounters>>>>,
+    stream_plane: Arc<Mutex<Option<RuntimeUpdateStreamPlane>>>,
+}
+
+#[derive(Clone)]
+struct RuntimeUpdateStreamPlane {
+    stream: openplotva_updates::RedisUpdateStream,
+    postgres: PgPool,
+    materializer: crate::update_materializer::UpdateMaterializerMetrics,
 }
 
 impl RuntimeUpdatesInspectorHandle {
@@ -34,6 +43,7 @@ impl RuntimeUpdatesInspectorHandle {
                 openplotva_updates::UpdateConsumerConfig::default().worker_limit,
             ),
             gate_counters: Arc::new(Mutex::new(None)),
+            stream_plane: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -51,6 +61,22 @@ impl RuntimeUpdatesInspectorHandle {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(counters);
     }
 
+    pub(crate) fn set_stream_plane(
+        &self,
+        stream: openplotva_updates::RedisUpdateStream,
+        postgres: PgPool,
+        materializer: crate::update_materializer::UpdateMaterializerMetrics,
+    ) {
+        *self
+            .stream_plane
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(RuntimeUpdateStreamPlane {
+            stream,
+            postgres,
+            materializer,
+        });
+    }
+
     fn gate_counters_snapshot(&self) -> Option<openplotva_server::RuntimeIngestionGatesData> {
         self.gate_counters
             .lock()
@@ -64,19 +90,186 @@ impl RuntimeUpdatesInspector for RuntimeUpdatesInspectorHandle {
     fn snapshot<'a>(&'a self) -> RuntimeUpdatesInspectorFuture<'a> {
         Box::pin(async move {
             let mut snapshot = self.tracker.snapshot(SystemTime::now());
-            match self.queue.len().await {
-                Ok(queue_len) => {
-                    snapshot.queue_len = queue_len.clamp(0, i32::MAX as i64) as i32;
+            let stream_plane = self
+                .stream_plane
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            if let Some(stream_plane) = stream_plane {
+                match stream_plane.stream.stats().await {
+                    Ok(stats) => {
+                        snapshot.stream_len = usize_to_i64(stats.length);
+                        snapshot.queue_len = stats.length.min(i32::MAX as usize) as i32;
+                        if let Some(group) = &stats.group {
+                            snapshot.stream_pending = usize_to_i64(group.pending);
+                            snapshot.stream_group_lag = group.lag.map_or(-1, usize_to_i64);
+                        } else {
+                            snapshot.stream_group_lag = -1;
+                        }
+                        let now_unix_ms = OffsetDateTime::now_utc()
+                            .unix_timestamp_nanos()
+                            .div_euclid(1_000_000)
+                            .max(0) as u128;
+                        snapshot.oldest_unmaterialized_ms = stats
+                            .oldest_entry_age_at(u64::try_from(now_unix_ms).unwrap_or(u64::MAX))
+                            .map_or(0, duration_millis_i64);
+                    }
+                    Err(error) => {
+                        snapshot.queue_len = -1;
+                        snapshot.queue_error = Some(error.to_string());
+                    }
                 }
-                Err(error) => {
-                    snapshot.queue_len = -1;
-                    snapshot.queue_error = Some(error.to_string());
+                match stream_plane.stream.durability_stats().await {
+                    Ok(durability) => {
+                        snapshot.ingress_used_memory_bytes =
+                            u64_to_i64(durability.used_memory_bytes);
+                        snapshot.ingress_maxmemory_bytes = u64_to_i64(durability.maxmemory_bytes);
+                        snapshot.ingress_maxmemory_policy = durability.maxmemory_policy;
+                        snapshot.ingress_aof_enabled = durability.aof_enabled;
+                        snapshot.ingress_aof_current_size_bytes =
+                            u64_to_i64(durability.aof_current_size_bytes);
+                        snapshot.ingress_aof_rewrite_in_progress =
+                            durability.aof_rewrite_in_progress;
+                        snapshot.ingress_aof_last_write_status = durability.aof_last_write_status;
+                        snapshot.ingress_aof_last_rewrite_status =
+                            durability.aof_last_rewrite_status;
+                    }
+                    Err(error) => {
+                        let error = format!("Redis ingress durability stats: {error}");
+                        snapshot.queue_error = Some(match snapshot.queue_error.take() {
+                            Some(existing) => format!("{existing}; {error}"),
+                            None => error,
+                        });
+                    }
+                }
+                let materializer = stream_plane.materializer.snapshot();
+                snapshot.materializer_batch_rows =
+                    materializer.batch_rows.min(i32::MAX as usize) as i32;
+                snapshot.materializer_batch_bytes = usize_to_i64(materializer.batch_bytes);
+                snapshot.materializer_batch_fill_ratio = materializer.batch_fill_ratio;
+                snapshot.bulk_transaction_latency_ms = materializer
+                    .last_transaction_latency
+                    .map_or(0, duration_millis_i64);
+                snapshot.materialized_batches = u64_to_i64(materializer.materialized_batches);
+                snapshot.inbox_insert_statements = u64_to_i64(materializer.inbox_insert_statements);
+                snapshot.quarantine_insert_statements =
+                    u64_to_i64(materializer.quarantine_insert_statements);
+                snapshot.materialized_inserted = u64_to_i64(materializer.inserted);
+                snapshot.materialized_duplicates = u64_to_i64(materializer.duplicates);
+                snapshot.materialized_conflicted = u64_to_i64(materializer.conflicted);
+                snapshot.materialized_quarantined = u64_to_i64(materializer.quarantined);
+                snapshot.materializer_reclaims = u64_to_i64(materializer.reclaims);
+                snapshot.ack_delete_mismatches = u64_to_i64(materializer.ack_delete_mismatches);
+                snapshot.materializer_db_failures = u64_to_i64(materializer.db_failures);
+                snapshot.materializer_redis_failures = u64_to_i64(materializer.redis_failures);
+                match postgres_update_runtime_stats(&stream_plane.postgres).await {
+                    Ok(postgres) => postgres.apply_to(&mut snapshot),
+                    Err(error) => {
+                        let error = format!("Postgres update inbox stats: {error}");
+                        snapshot.queue_error = Some(match snapshot.queue_error.take() {
+                            Some(existing) => format!("{existing}; {error}"),
+                            None => error,
+                        });
+                    }
+                }
+            } else {
+                match self.queue.len().await {
+                    Ok(queue_len) => {
+                        snapshot.queue_len = queue_len.clamp(0, i32::MAX as i64) as i32;
+                    }
+                    Err(error) => {
+                        snapshot.queue_len = -1;
+                        snapshot.queue_error = Some(error.to_string());
+                    }
                 }
             }
             snapshot.gates = self.gate_counters_snapshot();
             Ok(snapshot)
         })
     }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PostgresUpdateRuntimeStats {
+    pending: i64,
+    retry_wait: i64,
+    dead_letter: i64,
+    event_to_redis_avg_ms: i64,
+    redis_to_postgres_avg_ms: i64,
+    materialization_to_claim_avg_ms: i64,
+    claim_to_taskman_avg_ms: i64,
+}
+
+impl PostgresUpdateRuntimeStats {
+    fn apply_to(self, snapshot: &mut RuntimeUpdatesRuntimeData) {
+        snapshot.postgres_pending = self.pending;
+        snapshot.postgres_retry_wait = self.retry_wait;
+        snapshot.postgres_dead_letter = self.dead_letter;
+        snapshot.event_to_redis_avg_ms = self.event_to_redis_avg_ms;
+        snapshot.redis_to_postgres_avg_ms = self.redis_to_postgres_avg_ms;
+        snapshot.materialization_to_claim_avg_ms = self.materialization_to_claim_avg_ms;
+        snapshot.claim_to_taskman_avg_ms = self.claim_to_taskman_avg_ms;
+    }
+}
+
+async fn postgres_update_runtime_stats(
+    pool: &PgPool,
+) -> Result<PostgresUpdateRuntimeStats, sqlx::Error> {
+    let row = sqlx::query(
+        r#"
+        SELECT
+            count(*) FILTER (WHERE status = 'pending')::bigint AS pending,
+            count(*) FILTER (WHERE status = 'retry_wait')::bigint AS retry_wait,
+            count(*) FILTER (WHERE status = 'dead_letter')::bigint AS dead_letter,
+            COALESCE(avg(GREATEST(0, EXTRACT(EPOCH FROM
+                (first_received_at - telegram_event_at)) * 1000))
+                FILTER (WHERE telegram_event_at IS NOT NULL), 0)::bigint AS event_to_redis_avg_ms,
+            COALESCE(avg(GREATEST(0, EXTRACT(EPOCH FROM
+                (materialized_at - first_received_at)) * 1000)), 0)::bigint AS redis_to_postgres_avg_ms,
+            COALESCE(avg(GREATEST(0, EXTRACT(EPOCH FROM
+                (processing_started_at - materialized_at)) * 1000))
+                FILTER (WHERE processing_started_at IS NOT NULL), 0)::bigint
+                AS materialization_to_claim_avg_ms,
+            COALESCE((
+                SELECT avg(GREATEST(0, EXTRACT(EPOCH FROM
+                    (task.created_at - inbox.processing_started_at)) * 1000))::bigint
+                FROM telegram_update_inbox AS inbox
+                JOIN LATERAL (
+                    SELECT created_at
+                    FROM taskman_jobs
+                    WHERE deleted_at IS NULL
+                      AND inbox.update_id = ANY(source_update_ids)
+                    ORDER BY created_at
+                    LIMIT 1
+                ) AS task ON true
+                WHERE inbox.processing_started_at IS NOT NULL
+            ), 0)::bigint AS claim_to_taskman_avg_ms
+        FROM telegram_update_inbox
+        "#,
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(PostgresUpdateRuntimeStats {
+        pending: row.try_get("pending")?,
+        retry_wait: row.try_get("retry_wait")?,
+        dead_letter: row.try_get("dead_letter")?,
+        event_to_redis_avg_ms: row.try_get("event_to_redis_avg_ms")?,
+        redis_to_postgres_avg_ms: row.try_get("redis_to_postgres_avg_ms")?,
+        materialization_to_claim_avg_ms: row.try_get("materialization_to_claim_avg_ms")?,
+        claim_to_taskman_avg_ms: row.try_get("claim_to_taskman_avg_ms")?,
+    })
+}
+
+fn usize_to_i64(value: usize) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+fn u64_to_i64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+fn duration_millis_i64(value: Duration) -> i64 {
+    i64::try_from(value.as_millis()).unwrap_or(i64::MAX)
 }
 
 #[derive(Clone)]

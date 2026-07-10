@@ -58,14 +58,20 @@ pub use runtime_graphql::{
     RuntimeTaskmanInspector, RuntimeTaskmanJobData, RuntimeTaskmanJobDetailsData,
     RuntimeTaskmanJobFuture, RuntimeTaskmanJobListEntryData, RuntimeTaskmanJobListResultData,
     RuntimeTaskmanJobMessageData, RuntimeTaskmanJobSummaryData, RuntimeTaskmanJobsFilter,
-    RuntimeTaskmanQueueDiagnosticsData, RuntimeTurnOutcomeData, RuntimeTurnOutcomeInspector,
-    RuntimeTurnOutcomesFilter, RuntimeUpdatesInspector, RuntimeUpdatesInspectorFuture,
-    RuntimeUpdatesRuntimeData, RuntimeUpdatesTaskData, RuntimeUserConnectionData, RuntimeUserData,
-    RuntimeUserDetailsData, RuntimeUserLookup, RuntimeUsersFilter, RuntimeVipCacheData,
-    RuntimeVipEventData, RuntimeVipSummaryData, RuntimeVirtualDialogData,
-    RuntimeVirtualDialogDeleteResultData, RuntimeVirtualDialogFuture, RuntimeVirtualDialogManager,
-    RuntimeVirtualDialogMessageData, RuntimeVirtualDialogSendRequest,
-    RuntimeVirtualDialogStartRequest, RuntimeVirtualDialogToolMode, runtime_api_graphql_schema,
+    RuntimeTaskmanQueueDiagnosticsData, RuntimeTelegramDeliveryFuture,
+    RuntimeTelegramDeliveryInspector, RuntimeTelegramDeliveryListFilter,
+    RuntimeTelegramOutboxAttemptData, RuntimeTelegramOutboxItemData,
+    RuntimeTelegramOutboxMutationResultData, RuntimeTelegramOutboxRetryRequest,
+    RuntimeTelegramOutboxStatsData, RuntimeTelegramUpdateAttemptData,
+    RuntimeTelegramUpdateInboxItemData, RuntimeTelegramUpdateInboxStatsData,
+    RuntimeTurnOutcomeData, RuntimeTurnOutcomeInspector, RuntimeTurnOutcomesFilter,
+    RuntimeUpdatesInspector, RuntimeUpdatesInspectorFuture, RuntimeUpdatesRuntimeData,
+    RuntimeUpdatesTaskData, RuntimeUserConnectionData, RuntimeUserData, RuntimeUserDetailsData,
+    RuntimeUserLookup, RuntimeUsersFilter, RuntimeVipCacheData, RuntimeVipEventData,
+    RuntimeVipSummaryData, RuntimeVirtualDialogData, RuntimeVirtualDialogDeleteResultData,
+    RuntimeVirtualDialogFuture, RuntimeVirtualDialogManager, RuntimeVirtualDialogMessageData,
+    RuntimeVirtualDialogSendRequest, RuntimeVirtualDialogStartRequest,
+    RuntimeVirtualDialogToolMode, runtime_api_graphql_schema,
     runtime_api_graphql_schema_with_diagnostics, runtime_api_graphql_schema_with_live_diagnostics,
     runtime_api_graphql_schema_with_redis,
 };
@@ -895,11 +901,17 @@ mod tests {
         RuntimeTaskmanJobData, RuntimeTaskmanJobDetailsData, RuntimeTaskmanJobFuture,
         RuntimeTaskmanJobListEntryData, RuntimeTaskmanJobListResultData,
         RuntimeTaskmanJobMessageData, RuntimeTaskmanJobSummaryData, RuntimeTaskmanJobsFilter,
-        RuntimeTaskmanQueueDiagnosticsData, RuntimeTokenParseError, RuntimeUpdatesInspector,
-        RuntimeUpdatesInspectorFuture, RuntimeUpdatesRuntimeData, RuntimeUpdatesTaskData,
-        RuntimeUserConnectionData, RuntimeUserData, RuntimeUserDetailsData, RuntimeUserLookup,
-        RuntimeUsersFilter, RuntimeVipCacheData, RuntimeVipEventData, RuntimeVipSummaryData,
-        RuntimeVirtualDialogData, RuntimeVirtualDialogDeleteResultData, RuntimeVirtualDialogFuture,
+        RuntimeTaskmanQueueDiagnosticsData, RuntimeTelegramDeliveryFuture,
+        RuntimeTelegramDeliveryInspector, RuntimeTelegramDeliveryListFilter,
+        RuntimeTelegramOutboxAttemptData, RuntimeTelegramOutboxItemData,
+        RuntimeTelegramOutboxMutationResultData, RuntimeTelegramOutboxRetryRequest,
+        RuntimeTelegramOutboxStatsData, RuntimeTelegramUpdateAttemptData,
+        RuntimeTelegramUpdateInboxItemData, RuntimeTelegramUpdateInboxStatsData,
+        RuntimeTokenParseError, RuntimeUpdatesInspector, RuntimeUpdatesInspectorFuture,
+        RuntimeUpdatesRuntimeData, RuntimeUpdatesTaskData, RuntimeUserConnectionData,
+        RuntimeUserData, RuntimeUserDetailsData, RuntimeUserLookup, RuntimeUsersFilter,
+        RuntimeVipCacheData, RuntimeVipEventData, RuntimeVipSummaryData, RuntimeVirtualDialogData,
+        RuntimeVirtualDialogDeleteResultData, RuntimeVirtualDialogFuture,
         RuntimeVirtualDialogManager, RuntimeVirtualDialogMessageData,
         RuntimeVirtualDialogSendRequest, RuntimeVirtualDialogStartRequest,
         RuntimeVirtualDialogToolMode, can_perform_action, format_runtime_token,
@@ -1379,6 +1391,7 @@ mod tests {
                             user_id: Some(7),
                             update: "message".to_owned(),
                         }],
+                        ..RuntimeUpdatesRuntimeData::default()
                     })
                 })
             }
@@ -1428,6 +1441,326 @@ mod tests {
             "redis unavailable"
         );
         assert_eq!(payload["data"]["updatesRuntime"]["tasks"][0]["chatID"], "9");
+    }
+
+    #[tokio::test]
+    async fn runtime_api_graphql_delegates_telegram_delivery_queries_and_mutations() {
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct DeliveryInspector {
+            actions: Mutex<Vec<(String, bool)>>,
+        }
+
+        fn inbox_item() -> RuntimeTelegramUpdateInboxItemData {
+            RuntimeTelegramUpdateInboxItemData {
+                id: 41,
+                bot_id: 7,
+                update_id: 901,
+                schema_version: 1,
+                source: "webhook".to_owned(),
+                stream_ms: 1_700_000_000_000,
+                stream_seq: 4,
+                last_stream_ms: 1_700_000_000_001,
+                last_stream_seq: 1,
+                payload_size_bytes: 321,
+                payload_sha256: "abcd".to_owned(),
+                payload_conflict: true,
+                update_type: Some("message".to_owned()),
+                first_received_at: "2026-07-11T10:00:00Z".to_owned(),
+                last_received_at: "2026-07-11T10:00:01Z".to_owned(),
+                materialized_at: "2026-07-11T10:00:02Z".to_owned(),
+                delivery_count: 2,
+                ordering_key: "dialog:7:9:0".to_owned(),
+                chat_id: Some(9),
+                user_id: Some(8),
+                status: "retry_wait".to_owned(),
+                available_at: "2026-07-11T10:00:03Z".to_owned(),
+                attempt_count: 1,
+                last_error_class: Some("temporary".to_owned()),
+                last_error: Some(format!(
+                    "request https://api.telegram.org/bot123456:THIS_IS_A_SECRET_SENTINEL/sendMessage failed {}",
+                    "x".repeat(3_000)
+                )),
+                created_at: "2026-07-11T10:00:02Z".to_owned(),
+                updated_at: "2026-07-11T10:00:03Z".to_owned(),
+                ..RuntimeTelegramUpdateInboxItemData::default()
+            }
+        }
+
+        fn outbox_item() -> RuntimeTelegramOutboxItemData {
+            RuntimeTelegramOutboxItemData {
+                id: 51,
+                operation_id: "op-1".to_owned(),
+                batch_id: "batch-1".to_owned(),
+                part_index: 0,
+                bot_id: 7,
+                chat_id: Some(9),
+                ordering_key: "dialog:7:9:0".to_owned(),
+                causation_update_id: Some(901),
+                dialog_job_id: Some(77),
+                trigger_message_id: Some(88),
+                method_kind: "sendMessage".to_owned(),
+                delivery_policy: "create".to_owned(),
+                protected: true,
+                state: "ambiguous".to_owned(),
+                available_at: "2026-07-11T10:00:03Z".to_owned(),
+                attempt_count: 1,
+                last_error_class: Some("request_ambiguous".to_owned()),
+                telegram_message_ids: vec![101, 102],
+                has_receipt: false,
+                created_at: "2026-07-11T10:00:02Z".to_owned(),
+                updated_at: "2026-07-11T10:00:03Z".to_owned(),
+                ..RuntimeTelegramOutboxItemData::default()
+            }
+        }
+
+        impl RuntimeTelegramDeliveryInspector for DeliveryInspector {
+            fn update_inbox_stats<'a>(
+                &'a self,
+            ) -> RuntimeTelegramDeliveryFuture<'a, RuntimeTelegramUpdateInboxStatsData>
+            {
+                Box::pin(async {
+                    Ok(RuntimeTelegramUpdateInboxStatsData {
+                        pending: 2,
+                        retry_wait: 1,
+                        payload_conflicts: 1,
+                        quarantined: 3,
+                        total_deliveries: 12,
+                        oldest_pending_at: Some("2026-07-11T09:59:00Z".to_owned()),
+                        ..RuntimeTelegramUpdateInboxStatsData::default()
+                    })
+                })
+            }
+
+            fn update_inbox_item<'a>(
+                &'a self,
+                id: i64,
+            ) -> RuntimeTelegramDeliveryFuture<'a, Option<RuntimeTelegramUpdateInboxItemData>>
+            {
+                assert_eq!(id, 41);
+                Box::pin(async { Ok(Some(inbox_item())) })
+            }
+
+            fn update_inbox_items<'a>(
+                &'a self,
+                filter: RuntimeTelegramDeliveryListFilter,
+            ) -> RuntimeTelegramDeliveryFuture<'a, Vec<RuntimeTelegramUpdateInboxItemData>>
+            {
+                assert_eq!(filter.before_id, Some(99));
+                assert_eq!(filter.state.as_deref(), Some("pending"));
+                assert_eq!(filter.limit, 500);
+                Box::pin(async { Ok(vec![inbox_item()]) })
+            }
+
+            fn update_inbox_attempts<'a>(
+                &'a self,
+                inbox_id: i64,
+                limit: i32,
+            ) -> RuntimeTelegramDeliveryFuture<'a, Vec<RuntimeTelegramUpdateAttemptData>>
+            {
+                assert_eq!((inbox_id, limit), (41, 2));
+                Box::pin(async {
+                    Ok(vec![RuntimeTelegramUpdateAttemptData {
+                        attempt: 1,
+                        lease_token: 5,
+                        worker_id: "updates-1".to_owned(),
+                        claimed_at: "2026-07-11T10:00:02Z".to_owned(),
+                        outcome: Some("retry".to_owned()),
+                        ..RuntimeTelegramUpdateAttemptData::default()
+                    }])
+                })
+            }
+
+            fn outbox_stats<'a>(
+                &'a self,
+            ) -> RuntimeTelegramDeliveryFuture<'a, RuntimeTelegramOutboxStatsData> {
+                Box::pin(async {
+                    Ok(RuntimeTelegramOutboxStatsData {
+                        pending: 4,
+                        ambiguous: 1,
+                        protected_unresolved: 1,
+                        ..RuntimeTelegramOutboxStatsData::default()
+                    })
+                })
+            }
+
+            fn outbox_item<'a>(
+                &'a self,
+                operation_id: &'a str,
+            ) -> RuntimeTelegramDeliveryFuture<'a, Option<RuntimeTelegramOutboxItemData>>
+            {
+                assert_eq!(operation_id, "op-1");
+                Box::pin(async { Ok(Some(outbox_item())) })
+            }
+
+            fn outbox_items<'a>(
+                &'a self,
+                filter: RuntimeTelegramDeliveryListFilter,
+            ) -> RuntimeTelegramDeliveryFuture<'a, Vec<RuntimeTelegramOutboxItemData>> {
+                assert_eq!(filter.before_id, None);
+                assert_eq!(filter.state.as_deref(), Some("ambiguous"));
+                assert_eq!(filter.limit, 100);
+                Box::pin(async { Ok(vec![outbox_item()]) })
+            }
+
+            fn outbox_attempts<'a>(
+                &'a self,
+                outbox_id: i64,
+                limit: i32,
+            ) -> RuntimeTelegramDeliveryFuture<'a, Vec<RuntimeTelegramOutboxAttemptData>>
+            {
+                assert_eq!((outbox_id, limit), (51, 3));
+                Box::pin(async {
+                    Ok(vec![RuntimeTelegramOutboxAttemptData {
+                        attempt: 1,
+                        lease_token: 6,
+                        worker_id: "outbox-1".to_owned(),
+                        claimed_at: "2026-07-11T10:00:02Z".to_owned(),
+                        http_status: Some(503),
+                        latency_ms: Some(123),
+                        outcome: Some("ambiguous".to_owned()),
+                        ..RuntimeTelegramOutboxAttemptData::default()
+                    }])
+                })
+            }
+
+            fn retry_outbox<'a>(
+                &'a self,
+                request: RuntimeTelegramOutboxRetryRequest,
+            ) -> RuntimeTelegramDeliveryFuture<'a, RuntimeTelegramOutboxMutationResultData>
+            {
+                self.actions
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push((request.operation_id.clone(), request.accept_duplicate_risk));
+                Box::pin(async move {
+                    Ok(RuntimeTelegramOutboxMutationResultData {
+                        operation_id: request.operation_id,
+                        changed: true,
+                        state: Some("pending".to_owned()),
+                    })
+                })
+            }
+
+            fn cancel_outbox<'a>(
+                &'a self,
+                operation_id: String,
+            ) -> RuntimeTelegramDeliveryFuture<'a, RuntimeTelegramOutboxMutationResultData>
+            {
+                self.actions
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push((operation_id.clone(), false));
+                Box::pin(async move {
+                    Ok(RuntimeTelegramOutboxMutationResultData {
+                        operation_id,
+                        changed: true,
+                        state: Some("cancelled".to_owned()),
+                    })
+                })
+            }
+        }
+
+        let inspector = Arc::new(DeliveryInspector::default());
+        let schema = runtime_api_graphql_schema_with_live_diagnostics(
+            RuntimeApiGraphqlSnapshot::default(),
+            RuntimeApiLiveDiagnostics {
+                telegram_delivery_inspector: Some(inspector.clone()),
+                ..RuntimeApiLiveDiagnostics::default()
+            },
+        );
+        let query = schema
+            .execute(
+                r#"
+                query {
+                    telegramUpdateInboxStats {
+                        pending retryWait payloadConflicts quarantined totalDeliveries oldestPendingAt
+                    }
+                    telegramUpdateInbox(id: "41") {
+                        id botID updateID source streamMs streamSeq payloadSizeBytes payloadSha256
+                        payloadConflict deliveryCount orderingKey chatID userID status lastError
+                    }
+                    telegramUpdateInboxItems(beforeID: "99", state: " pending ", limit: 900) {
+                        id status
+                    }
+                    telegramUpdateInboxAttempts(inboxID: "41", limit: 2) {
+                        attempt leaseToken workerID outcome
+                    }
+                    telegramOutboxStats { pending ambiguous protectedUnresolved }
+                    telegramOutbox(operationID: " op-1 ") {
+                        id operationID batchID botID causationUpdateID dialogJobID triggerMessageID
+                        methodKind deliveryPolicy protected state telegramMessageIDs hasReceipt
+                    }
+                    telegramOutboxItems(state: " ambiguous ") { id operationID state }
+                    telegramOutboxAttempts(outboxID: "51", limit: 3) {
+                        attempt leaseToken workerID outcome httpStatus latencyMs
+                    }
+                }
+                "#,
+            )
+            .await;
+        assert!(
+            query.errors.is_empty(),
+            "Telegram delivery GraphQL query returned errors: {:?}",
+            query.errors
+        );
+        let query_payload = serde_json::to_value(&query)
+            .unwrap_or_else(|error| panic!("serialize GraphQL response: {error}"));
+        assert_eq!(
+            query_payload["data"]["telegramUpdateInboxStats"]["pending"],
+            2
+        );
+        assert_eq!(
+            query_payload["data"]["telegramUpdateInbox"]["updateID"],
+            "901"
+        );
+        assert_eq!(
+            query_payload["data"]["telegramOutbox"]["operationID"],
+            "op-1"
+        );
+        assert_eq!(
+            query_payload["data"]["telegramOutboxAttempts"][0]["httpStatus"],
+            503
+        );
+        let serialized_query = query_payload.to_string();
+        assert!(!serialized_query.contains("THIS_IS_A_SECRET_SENTINEL"));
+        assert!(
+            query_payload["data"]["telegramUpdateInbox"]["lastError"]
+                .as_str()
+                .is_some_and(|error| error.chars().count() <= 2_048)
+        );
+
+        let mutation = schema
+            .execute(
+                r#"
+                mutation {
+                    retried: retryTelegramOutbox(operationID: " op-1 ", acceptDuplicateRisk: true) {
+                        operationID changed state
+                    }
+                    cancelled: cancelTelegramOutbox(operationID: "op-2") {
+                        operationID changed state
+                    }
+                }
+                "#,
+            )
+            .await;
+        assert!(
+            mutation.errors.is_empty(),
+            "Telegram delivery GraphQL mutation returned errors: {:?}",
+            mutation.errors
+        );
+        let mutation_payload = serde_json::to_value(&mutation)
+            .unwrap_or_else(|error| panic!("serialize GraphQL response: {error}"));
+        assert_eq!(mutation_payload["data"]["retried"]["state"], "pending");
+        assert_eq!(mutation_payload["data"]["cancelled"]["state"], "cancelled");
+        assert_eq!(
+            *inspector
+                .actions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            vec![("op-1".to_owned(), true), ("op-2".to_owned(), false)]
+        );
     }
 
     #[tokio::test]

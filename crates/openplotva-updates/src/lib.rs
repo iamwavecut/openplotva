@@ -1,19 +1,19 @@
 //! Telegram update ingestion, classification, and replay.
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::HashSet,
     fmt,
     future::Future,
     io,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use carapax::types::{
-    AllowedUpdate as TelegramAllowedUpdate, Chat as TelegramChat, MaybeInaccessibleMessage,
-    Message as TelegramMessage, MessageData as TelegramMessageData, PollAnswerVoter,
-    ReplyTo as TelegramReplyTo, Text as TelegramText, TextEntity as TelegramTextEntity,
+    Chat as TelegramChat, MaybeInaccessibleMessage, Message as TelegramMessage,
+    MessageData as TelegramMessageData, PollAnswerVoter, ReplyTo as TelegramReplyTo,
+    Text as TelegramText, TextEntity as TelegramTextEntity,
     TextEntityPosition as TelegramTextEntityPosition, Update as TelegramUpdate,
     UpdateType as TelegramUpdateType, User as TelegramUser,
 };
@@ -31,6 +31,10 @@ use thiserror::Error;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::OnceCell;
 
+mod redis_stream;
+
+pub use redis_stream::*;
+
 /// Human-readable crate purpose used by scaffold tests and docs.
 pub const PURPOSE: &str = "updates";
 
@@ -42,32 +46,6 @@ pub const NATIVE_UPDATE_CODEC: &str = "openplotva.update.v1+carapax-json.zstd";
 pub const NATIVE_UPDATE_FORMAT_VERSION: u16 = 1;
 
 pub const DEFAULT_UPDATE_DEQUEUE_TIMEOUT: Duration = Duration::from_secs(5);
-
-pub const GO_ALLOWED_UPDATE_NAMES: &[&str] = &[
-    "message",
-    "edited_message",
-    "guest_message",
-    "inline_query",
-    "chosen_inline_result",
-    "callback_query",
-    "my_chat_member",
-    "chat_member",
-    "chat_join_request",
-    "pre_checkout_query",
-];
-
-pub const GO_ALLOWED_UPDATES: &[TelegramAllowedUpdate] = &[
-    TelegramAllowedUpdate::Message,
-    TelegramAllowedUpdate::EditedMessage,
-    TelegramAllowedUpdate::GuestMessage,
-    TelegramAllowedUpdate::InlineQuery,
-    TelegramAllowedUpdate::ChosenInlineResult,
-    TelegramAllowedUpdate::CallbackQuery,
-    TelegramAllowedUpdate::BotStatus,
-    TelegramAllowedUpdate::UserStatus,
-    TelegramAllowedUpdate::ChatJoinRequest,
-    TelegramAllowedUpdate::PreCheckoutQuery,
-];
 
 pub const TELEGRAM_FILE_MEDIA_KIND_PHOTO: &str = "photo";
 pub const TELEGRAM_FILE_MEDIA_KIND_DOCUMENT: &str = "document";
@@ -174,23 +152,6 @@ impl GoUpdateType {
             Self::MessageReaction => "message_reaction",
             Self::MessageReactionCount => "message_reaction_count",
         }
-    }
-
-    #[must_use]
-    pub const fn is_allowed(self) -> bool {
-        matches!(
-            self,
-            Self::Message
-                | Self::EditedMessage
-                | Self::GuestMessage
-                | Self::InlineQuery
-                | Self::ChosenInlineResult
-                | Self::CallbackQuery
-                | Self::PreCheckoutQuery
-                | Self::MyChatMember
-                | Self::ChatMember
-                | Self::ChatJoinRequest
-        )
     }
 }
 
@@ -376,11 +337,11 @@ impl RedisUpdateConnections {
 
     /// Blocking reads use a dedicated connection per call: dropping it on
     /// caller cancellation or timeout closes the socket, which cancels the
-    /// server-side `BLPOP`. A shared multiplexed connection must never carry
-    /// blocking commands - an abandoned `BLPOP` keeps blocking server-side
-    /// and delivers any popped update to a dropped receiver, silently losing
-    /// it. The client-side response timeout stays above the `BLPOP` timeout
-    /// so the server always answers first.
+    /// server-side `BLPOP` or `XREADGROUP`. A shared multiplexed connection
+    /// must never carry blocking commands: an abandoned read keeps blocking
+    /// server-side and can deliver an update to a dropped receiver. The
+    /// client-side response timeout stays above the Redis block timeout so
+    /// the server always answers first.
     async fn blocking_connection(
         &self,
         timeout: Duration,
@@ -433,20 +394,6 @@ impl RedisUpdateQueue {
     pub async fn enqueue_update(&self, update: &TelegramUpdate) -> Result<(), UpdateQueueError> {
         let update = EncodedUpdate::from_update(update)?;
         self.enqueue_encoded(&update).await
-    }
-
-    /// Enqueue an update only when producer policy allows its update type.
-    /// Returns `Ok(true)` when the update was pushed and `Ok(false)` when the
-    /// update type is intentionally ignored.
-    pub async fn enqueue_allowed_update(
-        &self,
-        update: &TelegramUpdate,
-    ) -> Result<bool, UpdateQueueError> {
-        if !is_allowed_producer_update(update) {
-            return Ok(false);
-        }
-        self.enqueue_update(update).await?;
-        Ok(true)
     }
 
     /// Dequeue one encoded update with Redis `BLPOP` semantics.
@@ -572,12 +519,12 @@ pub trait UpdateProducerSource {
     fn next_update<'a>(&'a self) -> UpdateProducerSourceFuture<'a>;
 }
 
-/// Queue sink used by the update producer after filtering allowed updates.
+/// Queue sink used by the update producer.
 pub trait UpdateProducerQueue {
     /// Error returned by the concrete queue.
     type Error: fmt::Display;
 
-    /// Enqueue one already-approved Telegram update.
+    /// Enqueue one Telegram update without ingress policy filtering.
     fn enqueue_update<'a>(
         &'a self,
         update: &'a TelegramUpdate,
@@ -600,8 +547,6 @@ pub struct UpdateProducerRunReport {
     /// Updates received from the source.
     pub received: usize,
     pub enqueued: usize,
-    pub skipped: usize,
-    pub dropped_by_ingress_guard: usize,
     pub enqueue_errors: Vec<String>,
     /// Count of enqueue errors that occurred beyond `MAX_ENQUEUE_ERRORS` and were not
     /// retained in `enqueue_errors`.
@@ -628,35 +573,6 @@ where
     Q: UpdateProducerQueue + Sync,
     Stop: Future<Output = ()>,
 {
-    run_update_producer_with_optional_ingress_guard_until(source, queue, None, stop).await
-}
-
-pub async fn run_update_producer_with_ingress_guard_until<S, Q, Stop>(
-    source: &S,
-    queue: &Q,
-    ingress_guard: &UpdateIngressGuard,
-    stop: Stop,
-) -> UpdateProducerRunReport
-where
-    S: UpdateProducerSource + Sync,
-    Q: UpdateProducerQueue + Sync,
-    Stop: Future<Output = ()>,
-{
-    run_update_producer_with_optional_ingress_guard_until(source, queue, Some(ingress_guard), stop)
-        .await
-}
-
-async fn run_update_producer_with_optional_ingress_guard_until<S, Q, Stop>(
-    source: &S,
-    queue: &Q,
-    ingress_guard: Option<&UpdateIngressGuard>,
-    stop: Stop,
-) -> UpdateProducerRunReport
-where
-    S: UpdateProducerSource + Sync,
-    Q: UpdateProducerQueue + Sync,
-    Stop: Future<Output = ()>,
-{
     let mut report = UpdateProducerRunReport::default();
     tokio::pin!(stop);
 
@@ -672,24 +588,6 @@ where
                 };
 
                 report.received += 1;
-                if !is_allowed_producer_update(&update) {
-                    report.skipped += 1;
-                    continue;
-                }
-                if let Some(ingress_guard) = ingress_guard {
-                    let decision = ingress_guard.check_update(&update);
-                    if decision.is_dropped() {
-                        report.dropped_by_ingress_guard += 1;
-                        tracing::warn!(
-                            chat_id = decision.chat_id(),
-                            update_id = update.id,
-                            update_name = producer_update_name(&update),
-                            "dropped Telegram update by ingress flood guard"
-                        );
-                        continue;
-                    }
-                }
-
                 let queued = queue.enqueue_update(&update);
                 tokio::pin!(queued);
                 tokio::select! {
@@ -987,165 +885,6 @@ pub fn producer_update_type(update: &TelegramUpdate) -> GoUpdateType {
 #[must_use]
 pub fn producer_update_name(update: &TelegramUpdate) -> &'static str {
     producer_update_type(update).as_str()
-}
-
-#[must_use]
-pub fn is_allowed_producer_update(update: &TelegramUpdate) -> bool {
-    producer_update_type(update).is_allowed()
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct UpdateIngressGuardConfig {
-    pub short_window: Duration,
-    pub short_limit: usize,
-    pub long_window: Duration,
-    pub long_limit: usize,
-    pub block_duration: Duration,
-}
-
-impl Default for UpdateIngressGuardConfig {
-    fn default() -> Self {
-        Self {
-            short_window: Duration::from_secs(10),
-            short_limit: 200,
-            long_window: Duration::from_secs(60),
-            long_limit: 600,
-            block_duration: Duration::from_secs(5 * 60),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum UpdateIngressDecision {
-    Allowed {
-        chat_id: Option<i64>,
-    },
-    DroppedBlocked {
-        chat_id: i64,
-        blocked_until: SystemTime,
-    },
-    DroppedFlood {
-        chat_id: i64,
-        blocked_until: SystemTime,
-    },
-}
-
-impl UpdateIngressDecision {
-    #[must_use]
-    pub const fn is_allowed(self) -> bool {
-        matches!(self, Self::Allowed { .. })
-    }
-
-    #[must_use]
-    pub const fn is_dropped(self) -> bool {
-        !self.is_allowed()
-    }
-
-    #[must_use]
-    pub const fn chat_id(self) -> Option<i64> {
-        match self {
-            Self::Allowed { chat_id } => chat_id,
-            Self::DroppedBlocked { chat_id, .. } | Self::DroppedFlood { chat_id, .. } => {
-                Some(chat_id)
-            }
-        }
-    }
-}
-
-#[derive(Debug, Default)]
-pub struct UpdateIngressGuard {
-    config: UpdateIngressGuardConfig,
-    chats: Mutex<HashMap<i64, ChatIngressState>>,
-}
-
-#[derive(Debug, Default)]
-struct ChatIngressState {
-    samples: VecDeque<SystemTime>,
-    blocked_until: Option<SystemTime>,
-}
-
-impl UpdateIngressGuard {
-    #[must_use]
-    pub fn new(config: UpdateIngressGuardConfig) -> Self {
-        Self {
-            config,
-            chats: Mutex::new(HashMap::new()),
-        }
-    }
-
-    #[must_use]
-    pub fn with_defaults() -> Self {
-        Self::new(UpdateIngressGuardConfig::default())
-    }
-
-    #[must_use]
-    pub fn check_update(&self, update: &TelegramUpdate) -> UpdateIngressDecision {
-        self.check_update_at(update, SystemTime::now())
-    }
-
-    #[must_use]
-    pub fn check_update_at(
-        &self,
-        update: &TelegramUpdate,
-        now: SystemTime,
-    ) -> UpdateIngressDecision {
-        let Some(chat_id) = update_chat_id(update).filter(|chat_id| *chat_id != 0) else {
-            return UpdateIngressDecision::Allowed { chat_id: None };
-        };
-        let mut chats = self
-            .chats
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let state = chats.entry(chat_id).or_default();
-        if let Some(blocked_until) = state.blocked_until {
-            if now < blocked_until {
-                return UpdateIngressDecision::DroppedBlocked {
-                    chat_id,
-                    blocked_until,
-                };
-            }
-            state.blocked_until = None;
-        }
-
-        retain_recent_samples(&mut state.samples, now, self.config.long_window);
-        let short_count = recent_sample_count(&state.samples, now, self.config.short_window) + 1;
-        let long_count = state.samples.len() + 1;
-        if short_count >= self.config.short_limit || long_count >= self.config.long_limit {
-            let blocked_until = now + self.config.block_duration;
-            state.blocked_until = Some(blocked_until);
-            state.samples.clear();
-            return UpdateIngressDecision::DroppedFlood {
-                chat_id,
-                blocked_until,
-            };
-        }
-
-        state.samples.push_back(now);
-        UpdateIngressDecision::Allowed {
-            chat_id: Some(chat_id),
-        }
-    }
-}
-
-#[must_use]
-pub fn update_chat_id(update: &TelegramUpdate) -> Option<i64> {
-    extract_update_chat(update).map(|chat| chat.get_id().into())
-}
-
-fn retain_recent_samples(samples: &mut VecDeque<SystemTime>, now: SystemTime, window: Duration) {
-    while samples
-        .front()
-        .is_some_and(|sample| now.duration_since(*sample).is_ok_and(|age| age >= window))
-    {
-        samples.pop_front();
-    }
-}
-
-fn recent_sample_count(samples: &VecDeque<SystemTime>, now: SystemTime, window: Duration) -> usize {
-    samples
-        .iter()
-        .filter(|sample| now.duration_since(**sample).is_ok_and(|age| age < window))
-        .count()
 }
 
 pub fn extract_update_state(update: &TelegramUpdate) -> Option<UpdateState> {
@@ -3348,21 +3087,20 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        DEFAULT_UPDATE_QUEUE_KEY, EncodedUpdate, GO_ALLOWED_UPDATE_NAMES, GO_ALLOWED_UPDATES,
-        GoUpdateType, GuestChainMessage, GuestChainRole, MAX_ENQUEUE_ERRORS, RedisUpdateQueue,
-        TelegramMessageAttachmentOptions, UpdateCodecError, UpdateConsumerConfig,
-        UpdateProducerQueue, UpdateProducerQueueFuture, UpdateProducerSource,
+        DEFAULT_UPDATE_QUEUE_KEY, EncodedUpdate, GoUpdateType, GuestChainMessage, GuestChainRole,
+        MAX_ENQUEUE_ERRORS, RedisUpdateQueue, TelegramMessageAttachmentOptions, UpdateCodecError,
+        UpdateConsumerConfig, UpdateProducerQueue, UpdateProducerQueueFuture, UpdateProducerSource,
         UpdateProducerSourceFuture, UpdateStage, UpdateStageOutcome, UpdateStageReport,
         UpdateStageTracker, blocking_response_timeout, blpop_timeout_arg, build_guest_dialog_text,
         build_guest_shield_query_text, command_connection_config, compose_image_prompt,
         edited_image_prompt_update, extract_update_state, fetcher_message_text,
         format_guest_chain_for_prompt, guest_current_request_text, guest_has_other_bot_mention,
         guest_message_reject_reason, guest_request_has_visible_text, guest_visible_text,
-        is_allowed_producer_update, is_guest_unsupported_feature_request,
-        is_settings_command_message, looks_like_guest_history_summary_request,
-        normalize_guest_command_word, parse_edit_command, parse_if_addressed, process_update_at,
-        process_update_with_stage_tracker_at, producer_update_name, producer_update_type,
-        react_message_words, resolve_draw_prompt_from_message, run_update_producer_until,
+        is_guest_unsupported_feature_request, is_settings_command_message,
+        looks_like_guest_history_summary_request, normalize_guest_command_word, parse_edit_command,
+        parse_if_addressed, process_update_at, process_update_with_stage_tracker_at,
+        producer_update_name, producer_update_type, react_message_words,
+        resolve_draw_prompt_from_message, run_update_producer_until,
         should_handle_addressed_message, should_handle_random_response, strip_guest_address_prefix,
         telegram_message_attachments, update_name,
     };
@@ -3405,93 +3143,6 @@ mod tests {
 
         assert_eq!(config.response_timeout(), Some(Duration::from_secs(3)));
         assert!(config.response_timeout() > Some(Duration::from_millis(500)));
-    }
-
-    #[test]
-    fn ingress_guard_blocks_chat_at_balanced_short_window_without_blocking_other_chats()
-    -> Result<(), Box<dyn Error>> {
-        let guard = super::UpdateIngressGuard::new(super::UpdateIngressGuardConfig {
-            short_window: Duration::from_secs(10),
-            short_limit: 3,
-            long_window: Duration::from_secs(60),
-            long_limit: 100,
-            block_duration: Duration::from_secs(300),
-        });
-        let now = UNIX_EPOCH + Duration::from_secs(1_710_000_000);
-        let update = sample_message_update()?;
-
-        assert!(guard.check_update_at(&update, now).is_allowed());
-        assert!(
-            guard
-                .check_update_at(&update, now + Duration::from_secs(1))
-                .is_allowed()
-        );
-
-        let blocked = guard.check_update_at(&update, now + Duration::from_secs(2));
-        assert!(blocked.is_dropped());
-        assert_eq!(blocked.chat_id(), Some(42));
-
-        assert!(
-            guard
-                .check_update_at(
-                    &sample_message_update_for_chat(1001)?,
-                    now + Duration::from_secs(3)
-                )
-                .is_allowed()
-        );
-        assert!(
-            guard
-                .check_update_at(&update, now + Duration::from_secs(299))
-                .is_dropped()
-        );
-        assert!(
-            guard
-                .check_update_at(&update, now + Duration::from_secs(303))
-                .is_allowed()
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn ingress_guard_enforces_flood_limit_after_mutex_poison() -> Result<(), Box<dyn Error>> {
-        // Poison the mutex by panicking inside a thread while holding it, then verify
-        // that check_update_at still enforces flood limits (does not fail open).
-        // This mirrors the file-wide unwrap_or_else(|p| p.into_inner()) convention.
-        let guard = std::sync::Arc::new(super::UpdateIngressGuard::new(
-            super::UpdateIngressGuardConfig {
-                short_window: Duration::from_secs(10),
-                short_limit: 3,
-                long_window: Duration::from_secs(60),
-                long_limit: 100,
-                block_duration: Duration::from_secs(300),
-            },
-        ));
-        let guard_clone = std::sync::Arc::clone(&guard);
-        // Poison the inner mutex via a thread that panics while holding the lock.
-        let _ = std::thread::spawn(move || {
-            let _hold = guard_clone.chats.lock().expect("lock for poisoning");
-            panic!("intentional poison");
-        })
-        .join();
-        assert!(guard.chats.is_poisoned(), "mutex must be poisoned");
-
-        let now = UNIX_EPOCH + Duration::from_secs(1_710_000_000);
-        let update = sample_message_update()?;
-
-        // Two allowed, third triggers flood — guard must enforce limits even with
-        // a poisoned mutex, not return Allowed unconditionally.
-        assert!(guard.check_update_at(&update, now).is_allowed());
-        assert!(
-            guard
-                .check_update_at(&update, now + Duration::from_secs(1))
-                .is_allowed()
-        );
-        let decision = guard.check_update_at(&update, now + Duration::from_secs(2));
-        assert!(
-            decision.is_dropped(),
-            "expected DroppedFlood after poison; got: {decision:?}"
-        );
-        Ok(())
     }
 
     #[test]
@@ -3631,333 +3282,25 @@ mod tests {
     }
 
     #[test]
-    fn allowed_update_names_match_go_fetcher_startup_contract() -> Result<(), Box<dyn Error>> {
-        assert_eq!(
-            GO_ALLOWED_UPDATE_NAMES,
-            &[
-                "message",
-                "edited_message",
-                "guest_message",
-                "inline_query",
-                "chosen_inline_result",
-                "callback_query",
-                "my_chat_member",
-                "chat_member",
-                "chat_join_request",
-                "pre_checkout_query",
-            ]
-        );
+    fn producer_update_type_classifies_without_ingress_filtering() -> Result<(), Box<dyn Error>> {
+        let message = sample_message_update()?;
+        let poll = sample_poll_update_with_id(101)?;
+        let unknown = sample_update_json(json!({
+            "update_id": 102,
+            "future_update_shape": { "value": true }
+        }))?;
 
-        let serialized_updates: Vec<String> = GO_ALLOWED_UPDATES
-            .iter()
-            .map(|update| serde_json::from_value(serde_json::to_value(update)?))
-            .collect::<Result<_, _>>()?;
-
-        assert_eq!(serialized_updates, GO_ALLOWED_UPDATE_NAMES);
-        Ok(())
-    }
-
-    #[test]
-    fn producer_update_type_matches_go_fetcher_classification() -> Result<(), Box<dyn Error>> {
-        let cases = [
-            (
-                "message",
-                sample_message_update()?,
-                GoUpdateType::Message,
-                true,
-            ),
-            (
-                "edited_message",
-                sample_update_json(json!({
-                    "update_id": 1,
-                    "edited_message": sample_message_json(2, 1_710_000_000, "edited")
-                }))?,
-                GoUpdateType::EditedMessage,
-                true,
-            ),
-            (
-                "guest_message",
-                sample_update_json(json!({
-                    "update_id": 2,
-                    "guest_message": {
-                        "message_id": 3,
-                        "date": 1_710_000_000,
-                        "chat": {
-                            "id": -100,
-                            "type": "supergroup",
-                            "title": "Team",
-                            "is_forum": true
-                        },
-                        "guest_query_id": "guest-query",
-                        "text": "hello"
-                    }
-                }))?,
-                GoUpdateType::GuestMessage,
-                true,
-            ),
-            (
-                "channel_post",
-                sample_update_json(json!({
-                    "update_id": 3,
-                    "channel_post": sample_channel_message_json(4, 1_710_000_000, "post")
-                }))?,
-                GoUpdateType::ChannelPost,
-                false,
-            ),
-            (
-                "edited_channel_post",
-                sample_update_json(json!({
-                    "update_id": 4,
-                    "edited_channel_post": sample_channel_message_json(5, 1_710_000_000, "post")
-                }))?,
-                GoUpdateType::EditedChannelPost,
-                false,
-            ),
-            (
-                "inline_query",
-                sample_update_json(json!({
-                    "update_id": 5,
-                    "inline_query": {
-                        "from": sample_user_json(),
-                        "id": "query-id",
-                        "offset": "query offset",
-                        "query": "query query"
-                    }
-                }))?,
-                GoUpdateType::InlineQuery,
-                true,
-            ),
-            (
-                "chosen_inline_result",
-                sample_update_json(json!({
-                    "update_id": 6,
-                    "chosen_inline_result": {
-                        "from": sample_user_json(),
-                        "query": "q",
-                        "result_id": "chosen-inline-result-id"
-                    }
-                }))?,
-                GoUpdateType::ChosenInlineResult,
-                true,
-            ),
-            (
-                "callback_query",
-                sample_update_json(json!({
-                    "update_id": 7,
-                    "callback_query": {
-                        "id": "callback-id",
-                        "from": sample_user_json(),
-                        "message": sample_message_json(8, 1_710_000_000, "callback")
-                    }
-                }))?,
-                GoUpdateType::CallbackQuery,
-                true,
-            ),
-            (
-                "shipping_query",
-                sample_update_json(json!({
-                    "update_id": 8,
-                    "shipping_query": {
-                        "id": "query-id",
-                        "from": sample_user_json(),
-                        "invoice_payload": "payload",
-                        "shipping_address": {
-                            "city": "Gudermes",
-                            "country_code": "RU",
-                            "post_code": "366200",
-                            "state": "Chechen Republic",
-                            "street_line1": "Nuradilov st., 12",
-                            "street_line2": ""
-                        }
-                    }
-                }))?,
-                GoUpdateType::ShippingQuery,
-                false,
-            ),
-            (
-                "pre_checkout_query",
-                sample_update_json(json!({
-                    "update_id": 9,
-                    "pre_checkout_query": {
-                        "currency": "GEL",
-                        "from": sample_user_json(),
-                        "id": "query-id",
-                        "invoice_payload": "invoice payload",
-                        "total_amount": 100
-                    }
-                }))?,
-                GoUpdateType::PreCheckoutQuery,
-                true,
-            ),
-            (
-                "poll",
-                sample_update_json(json!({
-                    "update_id": 10,
-                    "poll": {
-                        "type": "regular",
-                        "allows_multiple_answers": false,
-                        "allows_revoting": false,
-                        "id": "poll-id",
-                        "is_anonymous": true,
-                        "is_closed": true,
-                        "members_only": false,
-                        "options": [
-                            {
-                                "persistent_id": "1",
-                                "text": "Yes",
-                                "voter_count": 1000
-                            },
-                            {
-                                "persistent_id": "2",
-                                "text": "No",
-                                "voter_count": 0
-                            }
-                        ],
-                        "question": "Rust?",
-                        "total_voter_count": 1000
-                    }
-                }))?,
-                GoUpdateType::Poll,
-                false,
-            ),
-            (
-                "poll_answer",
-                sample_update_json(json!({
-                    "update_id": 11,
-                    "poll_answer": {
-                        "option_ids": [0],
-                        "option_persistent_ids": [],
-                        "poll_id": "poll-id",
-                        "user": sample_user_json()
-                    }
-                }))?,
-                GoUpdateType::PollAnswer,
-                false,
-            ),
-            (
-                "my_chat_member",
-                sample_update_json(json!({
-                    "update_id": 12,
-                    "my_chat_member": sample_chat_member_updated_json(true)
-                }))?,
-                GoUpdateType::MyChatMember,
-                true,
-            ),
-            (
-                "chat_member",
-                sample_update_json(json!({
-                    "update_id": 13,
-                    "chat_member": sample_chat_member_updated_json(false)
-                }))?,
-                GoUpdateType::ChatMember,
-                true,
-            ),
-            (
-                "chat_join_request",
-                sample_update_json(json!({
-                    "update_id": 14,
-                    "chat_join_request": {
-                        "chat": {
-                            "type": "group",
-                            "id": 1,
-                            "title": "Group"
-                        },
-                        "date": 0,
-                        "from": sample_user_json()
-                    }
-                }))?,
-                GoUpdateType::ChatJoinRequest,
-                true,
-            ),
-            (
-                "message_reaction",
-                sample_update_json(json!({
-                    "update_id": 15,
-                    "message_reaction": {
-                        "chat": {
-                            "type": "private",
-                            "id": 1,
-                            "first_name": "Ada"
-                        },
-                        "date": 0,
-                        "message_id": 1,
-                        "new_reaction": [
-                            {
-                                "type": "emoji",
-                                "emoji": "\u{1f44d}"
-                            }
-                        ],
-                        "old_reaction": [
-                            {
-                                "type": "emoji",
-                                "emoji": "\u{1f44e}"
-                            }
-                        ]
-                    }
-                }))?,
-                GoUpdateType::MessageReaction,
-                false,
-            ),
-            (
-                "message_reaction_count",
-                sample_update_json(json!({
-                    "update_id": 16,
-                    "message_reaction_count": {
-                        "chat": {
-                            "type": "private",
-                            "id": 1,
-                            "first_name": "Ada"
-                        },
-                        "date": 0,
-                        "message_id": 1,
-                        "reactions": [
-                            {
-                                "type": {
-                                    "type": "emoji",
-                                    "emoji": "\u{1f44d}"
-                                },
-                                "total_count": 1
-                            }
-                        ]
-                    }
-                }))?,
-                GoUpdateType::MessageReactionCount,
-                false,
-            ),
-            (
-                "unknown",
-                sample_update_json(json!({
-                    "update_id": 17,
-                    "future_update_shape": {
-                        "value": true
-                    }
-                }))?,
-                GoUpdateType::Unknown,
-                false,
-            ),
-        ];
-
-        for (name, update, want_type, want_allowed) in cases {
-            assert_eq!(producer_update_type(&update), want_type, "{name}");
-            assert_eq!(producer_update_name(&update), want_type.as_str(), "{name}");
-            assert_eq!(is_allowed_producer_update(&update), want_allowed, "{name}");
-        }
-
-        for (name, update) in sample_sdk_known_go_unknown_update_cases()? {
-            assert_eq!(
-                producer_update_type(&update),
-                GoUpdateType::Unknown,
-                "{name}"
-            );
-            assert_eq!(producer_update_name(&update), "unknown", "{name}");
-            assert!(!is_allowed_producer_update(&update), "{name}");
-        }
-
+        assert_eq!(producer_update_type(&message), GoUpdateType::Message);
+        assert_eq!(producer_update_name(&message), "message");
+        assert_eq!(producer_update_type(&poll), GoUpdateType::Poll);
+        assert_eq!(producer_update_name(&poll), "poll");
+        assert_eq!(producer_update_type(&unknown), GoUpdateType::Unknown);
+        assert_eq!(producer_update_name(&unknown), "unknown");
         Ok(())
     }
 
     #[tokio::test]
-    async fn update_producer_enqueues_allowed_updates_and_skips_disallowed()
+    async fn update_producer_enqueues_every_update_type_without_ingress_drops()
     -> Result<(), Box<dyn Error>> {
         let source = ProducerSourceStub::new(vec![
             sample_message_update_with_id(100)?,
@@ -3969,11 +3312,10 @@ mod tests {
         let report = run_update_producer_until(&source, &queue, std::future::pending()).await;
 
         assert_eq!(report.received, 3);
-        assert_eq!(report.enqueued, 2);
-        assert_eq!(report.skipped, 1);
+        assert_eq!(report.enqueued, 3);
         assert!(report.source_closed);
         assert!(report.enqueue_errors.is_empty());
-        assert_eq!(queue.enqueued_ids(), vec![100, 102]);
+        assert_eq!(queue.enqueued_ids(), vec![100, 101, 102]);
         Ok(())
     }
 
@@ -3990,7 +3332,6 @@ mod tests {
 
         assert_eq!(report.received, 2);
         assert_eq!(report.enqueued, 1);
-        assert_eq!(report.skipped, 0);
         assert!(report.source_closed);
         assert_eq!(report.enqueue_errors, vec!["redis unavailable".to_owned()]);
         assert_eq!(queue.enqueued_ids(), vec![101]);
@@ -4029,7 +3370,6 @@ mod tests {
 
         assert_eq!(report.received, 0);
         assert_eq!(report.enqueued, 0);
-        assert_eq!(report.skipped, 0);
         assert!(!report.source_closed);
         assert!(queue.enqueued_ids().is_empty());
         Ok(())
@@ -6875,112 +6215,8 @@ mod tests {
         }))
     }
 
-    fn sample_message_update_for_chat(chat_id: i64) -> Result<TelegramUpdate, serde_json::Error> {
-        let mut message = sample_message_json(77, 1_710_000_000, "/start hello");
-        message["chat"]["id"] = json!(chat_id);
-        serde_json::from_value(json!({
-            "update_id": 12345,
-            "message": message
-        }))
-    }
-
     fn sample_update_json(value: serde_json::Value) -> Result<TelegramUpdate, serde_json::Error> {
         serde_json::from_value(value)
-    }
-
-    fn sample_sdk_known_go_unknown_update_cases()
-    -> Result<Vec<(&'static str, TelegramUpdate)>, serde_json::Error> {
-        Ok(vec![
-            (
-                "business_connection",
-                sample_update_json(json!({
-                    "update_id": 18,
-                    "business_connection": {
-                        "id": "business-1",
-                        "user": sample_user_json(),
-                        "user_chat_id": 42,
-                        "date": 1_710_000_000,
-                        "is_enabled": true
-                    }
-                }))?,
-            ),
-            (
-                "business_message",
-                sample_update_json(json!({
-                    "update_id": 19,
-                    "business_message": sample_business_message_json(19)
-                }))?,
-            ),
-            (
-                "edited_business_message",
-                sample_update_json(json!({
-                    "update_id": 20,
-                    "edited_business_message": sample_business_message_json(20)
-                }))?,
-            ),
-            (
-                "deleted_business_messages",
-                sample_update_json(json!({
-                    "update_id": 21,
-                    "deleted_business_messages": {
-                        "business_connection_id": "business-1",
-                        "chat": sample_private_chat_json(),
-                        "message_ids": [1, 2]
-                    }
-                }))?,
-            ),
-            (
-                "chat_boost",
-                sample_update_json(json!({
-                    "update_id": 22,
-                    "chat_boost": {
-                        "chat": sample_channel_chat_json(),
-                        "boost": {
-                            "boost_id": "boost-1",
-                            "add_date": 1_710_000_000,
-                            "expiration_date": 1_710_086_400,
-                            "source": sample_boost_source_json()
-                        }
-                    }
-                }))?,
-            ),
-            (
-                "removed_chat_boost",
-                sample_update_json(json!({
-                    "update_id": 23,
-                    "removed_chat_boost": {
-                        "boost_id": "boost-1",
-                        "chat": sample_channel_chat_json(),
-                        "remove_date": 1_710_086_400,
-                        "source": sample_boost_source_json()
-                    }
-                }))?,
-            ),
-            (
-                "managed_bot",
-                sample_update_json(json!({
-                    "update_id": 24,
-                    "managed_bot": {
-                        "bot": {
-                            "id": 777,
-                            "is_bot": true,
-                            "first_name": "ManagedBot"
-                        },
-                        "user": sample_user_json()
-                    }
-                }))?,
-            ),
-            (
-                "purchased_paid_media",
-                sample_update_json(json!({
-                    "update_id": 25,
-                    "purchased_paid_media": {
-                        "from": sample_user_json(),
-                        "paid_media_payload": "paid-media-payload"
-                    }
-                }))?,
-            ),
-        ])
     }
 
     fn sample_message_json(message_id: i64, date: i64, text: &str) -> serde_json::Value {
@@ -7052,77 +6288,6 @@ mod tests {
             (got - want).abs() < 0.00001,
             "float value {got} differs from {want}"
         );
-    }
-
-    fn sample_channel_message_json(message_id: i64, date: i64, text: &str) -> serde_json::Value {
-        json!({
-            "message_id": message_id,
-            "date": date,
-            "chat": {
-                "id": -100,
-                "type": "channel",
-                "title": "Channel",
-                "username": "channel_name"
-            },
-            "sender_chat": {
-                "id": -100,
-                "type": "channel",
-                "title": "Channel",
-                "username": "channel_name"
-            },
-            "text": text
-        })
-    }
-
-    fn sample_business_message_json(message_id: i64) -> serde_json::Value {
-        let mut value = sample_message_json(message_id, 1_710_000_000, "business text");
-        value["business_connection_id"] = json!("business-1");
-        value
-    }
-
-    fn sample_channel_chat_json() -> serde_json::Value {
-        json!({
-            "id": -100,
-            "type": "channel",
-            "title": "Channel",
-            "username": "channel_name"
-        })
-    }
-
-    fn sample_boost_source_json() -> serde_json::Value {
-        json!({
-            "source": "gift_code",
-            "user": sample_user_json()
-        })
-    }
-
-    fn sample_chat_member_updated_json(is_bot_member: bool) -> serde_json::Value {
-        json!({
-            "chat": {
-                "type": "group",
-                "id": 1,
-                "title": "Group"
-            },
-            "date": 0,
-            "from": sample_user_json(),
-            "new_chat_member": {
-                "status": "kicked",
-                "until_date": 0,
-                "user": {
-                    "first_name": "Bot",
-                    "id": 2,
-                    "is_bot": is_bot_member
-                }
-            },
-            "old_chat_member": {
-                "status": "member",
-                "user": {
-                    "first_name": "Bot",
-                    "id": 2,
-                    "is_bot": is_bot_member
-                }
-            }
-        })
     }
 
     fn sample_user_json() -> serde_json::Value {

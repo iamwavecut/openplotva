@@ -26,6 +26,8 @@ const TURN_OUTCOME_WRITER_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 
 /// A text answer was accepted by the outbound queue.
 pub const TURN_OUTCOME_SENT: &str = "sent";
+/// A final answer is durable but still awaits real Telegram receipts.
+pub const TURN_OUTCOME_QUEUED_FOR_DELIVERY: &str = "queued_for_delivery";
 /// A generation side effect is the reply (delivery watched separately).
 pub const TURN_OUTCOME_SIDE_EFFECT_DELEGATED: &str = "side_effect_delegated";
 /// The turn deliberately produced no reply, with a classified reason.

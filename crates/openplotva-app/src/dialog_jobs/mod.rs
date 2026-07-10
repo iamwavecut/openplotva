@@ -50,6 +50,14 @@ pub type DialogJobWorkerFuture<'a, T, E> = Pin<Box<dyn Future<Output = Result<T,
 /// Boxed future returned by dialog side effects.
 pub type DialogJobEffectFuture<'a, E> = Pin<Box<dyn Future<Output = Result<(), E>> + Send + 'a>>;
 
+/// Boxed future returned after a final dialog answer has been durably queued.
+pub type DialogJobReceiptFuture<'a, E> =
+    Pin<Box<dyn Future<Output = Result<QueuedBatchReceipt, E>> + Send + 'a>>;
+
+/// Boxed future used to detect a previously committed final-answer batch.
+pub type DialogJobReceiptLookupFuture<'a, E> =
+    Pin<Box<dyn Future<Output = Result<Option<QueuedBatchReceipt>, E>> + Send + 'a>>;
+
 /// Boxed future returned by dialog tool-call history storage.
 pub type DialogToolCallHistoryFuture<'a, E> =
     Pin<Box<dyn Future<Output = Result<bool, E>> + Send + 'a>>;

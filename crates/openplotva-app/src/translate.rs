@@ -1984,18 +1984,21 @@ mod tests {
             .dequeue_regular()
             .ok_or_else(|| io::Error::other("expected translation result payload"))?;
         assert_eq!(item.metadata().virtual_id, "translate-live-redis-vmsg-1");
+        assert_eq!(
+            item.method_kind(),
+            Some(TelegramOutboundMethodKind::SendRichMessage)
+        );
         let value = method_as_value(
             item.into_method()
-                .ok_or_else(|| io::Error::other("expected sendMessage method"))?,
+                .ok_or_else(|| io::Error::other("expected sendRichMessage method"))?,
         )?;
         assert_eq!(value["chat_id"], json!(-10042));
-        assert_eq!(value["text"], json!("[en] hello"));
-        assert_eq!(value["reply_parameters"]["message_id"], json!(85));
-        assert_eq!(value["reply_parameters"]["chat_id"], json!(-10042));
         assert_eq!(
-            value["reply_parameters"]["allow_sending_without_reply"],
-            json!(true)
+            value["html"],
+            json!("<h3>Перевод</h3>\n\n<p>[en] hello</p>\n\n<footer>Язык: en</footer>")
         );
+        assert_eq!(value["options"]["reply_to_message_id"], json!(85));
+        assert_eq!(value["options"]["allow_sending_without_reply"], json!(true));
         assert_eq!(update_queue.len().await?, 0);
 
         let _: i64 = redis::cmd("DEL").arg(&key).query_async(&mut redis).await?;

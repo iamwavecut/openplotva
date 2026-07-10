@@ -6,8 +6,8 @@ usage() {
 Usage:
   tools/update-queue-smoke.sh
 
-Runs the decoded Telegram update Redis/Dragonfly replay smoke against a
-disposable Dragonfly service, then removes the scratch container and volume.
+Runs the legacy decoded queue checks against Dragonfly and the production
+Redis Streams ingress checks against disposable Valkey with AOF enabled.
 
 Checks:
   - Update queue uses Redis list semantics: RPUSH producer, BLPOP consumer,
@@ -121,12 +121,14 @@ Checks:
     shaping, and ephemeral chain remember
   - one decoded `inline_query` update can cross Redis, state stage,
     answerInlineQuery method capture, and no downstream delegation
+  - Redis Stream fan-in uses untrimmed XADD, consumer groups, XAUTOCLAIM,
+    atomic XACK+XDEL, and atomic long-poll batch+cursor commits
 
 Optional env:
   OPENPLOTVA_UPDATE_QUEUE_SMOKE_REDIS_URL    use an existing scratch Redis URL
+  OPENPLOTVA_UPDATE_QUEUE_SMOKE_STREAM_REDIS_URL use an existing Streams Redis URL
   OPENPLOTVA_UPDATE_QUEUE_SMOKE_REDIS_PORT   Dragonfly host port, default first free from 56579
   OPENPLOTVA_UPDATE_QUEUE_SMOKE_KEEP         keep disposable Dragonfly when set to 1
-  OPENPLOTVA_UPDATE_QUEUE_STREAM_SMOKE       run Dragonfly Streams protocol spike when set to 1
 USAGE
 }
 
@@ -165,23 +167,27 @@ wait_for_tcp() {
 }
 
 redis_url="${OPENPLOTVA_UPDATE_QUEUE_SMOKE_REDIS_URL:-}"
+stream_redis_url="${OPENPLOTVA_UPDATE_QUEUE_SMOKE_STREAM_REDIS_URL:-}"
 redis_port=""
+stream_redis_port=""
 project="openplotva-update-queue-smoke-$$"
 started_compose=0
 
 compose() {
-  OPENPLOTVA_DEV_REDIS_PORT="$redis_port" docker compose -p "$project" "$@"
+  OPENPLOTVA_DEV_REDIS_PORT="$redis_port" \
+    OPENPLOTVA_DEV_UPDATE_STREAM_REDIS_PORT="$stream_redis_port" \
+    docker compose -p "$project" "$@"
 }
 
-redis_cli() {
+stream_redis_cli() {
   if [[ "$started_compose" -eq 1 ]]; then
-    compose exec -T dragonfly redis-cli "$@"
+    compose exec -T redis-ingress valkey-cli "$@"
   else
     command -v redis-cli >/dev/null 2>&1 || {
-      echo "redis-cli is required when OPENPLOTVA_UPDATE_QUEUE_STREAM_SMOKE=1 uses an external Redis URL" >&2
+      echo "redis-cli is required when an external Streams Redis URL is used" >&2
       exit 1
     }
-    redis-cli -u "$redis_url" "$@"
+    redis-cli -u "$stream_redis_url" "$@"
   fi
 }
 
@@ -193,20 +199,20 @@ run_stream_smoke() {
   local read_output
   local claim_output
 
-  echo "+ Dragonfly Streams protocol spike smoke"
-  redis_cli DEL "$key" >/dev/null
-  redis_cli XGROUP CREATE "$key" "$group" 0 MKSTREAM >/dev/null
-  id1="$(redis_cli XADD "$key" "*" payload one | tr -d '\r')"
-  id2="$(redis_cli XADD "$key" "*" payload two | tr -d '\r')"
-  read_output="$(redis_cli XREADGROUP GROUP "$group" consumer-a COUNT 2 BLOCK 100 STREAMS "$key" ">" | tr -d '\r')"
+  echo "+ Valkey Streams durability protocol smoke"
+  stream_redis_cli DEL "$key" >/dev/null
+  stream_redis_cli XGROUP CREATE "$key" "$group" 0 MKSTREAM >/dev/null
+  id1="$(stream_redis_cli XADD "$key" "*" payload one | tr -d '\r')"
+  id2="$(stream_redis_cli XADD "$key" "*" payload two | tr -d '\r')"
+  read_output="$(stream_redis_cli XREADGROUP GROUP "$group" consumer-a COUNT 2 BLOCK 100 STREAMS "$key" ">" | tr -d '\r')"
   grep -Fq "$id1" <<<"$read_output"
   grep -Fq "$id2" <<<"$read_output"
-  redis_cli XACK "$key" "$group" "$id1" >/dev/null
-  redis_cli XPENDING "$key" "$group" >/dev/null
-  claim_output="$(redis_cli XAUTOCLAIM "$key" "$group" consumer-b 0 0-0 COUNT 10 | tr -d '\r')"
+  stream_redis_cli XACK "$key" "$group" "$id1" >/dev/null
+  stream_redis_cli XPENDING "$key" "$group" >/dev/null
+  claim_output="$(stream_redis_cli XAUTOCLAIM "$key" "$group" consumer-b 0 0-0 COUNT 10 | tr -d '\r')"
   grep -Fq "$id2" <<<"$claim_output"
-  redis_cli XACK "$key" "$group" "$id2" >/dev/null
-  redis_cli DEL "$key" >/dev/null
+  stream_redis_cli XACK "$key" "$group" "$id2" >/dev/null
+  stream_redis_cli DEL "$key" >/dev/null
   echo "stream-smoke-ok"
 }
 
@@ -221,7 +227,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if [[ -z "$redis_url" ]]; then
+if [[ -z "$redis_url" || -z "$stream_redis_url" ]]; then
   if ! command -v docker >/dev/null 2>&1 || ! docker compose version >/dev/null 2>&1; then
     echo "docker compose is required for update queue smoke" >&2
     exit 1
@@ -232,19 +238,31 @@ if [[ -z "$redis_url" ]]; then
   fi
 
   redis_port="$(free_port_from "${OPENPLOTVA_UPDATE_QUEUE_SMOKE_REDIS_PORT:-56579}")"
+  stream_redis_port="$(free_port_from "$((redis_port + 1))")"
   redis_url="redis://127.0.0.1:${redis_port}/0"
+  stream_redis_url="redis://127.0.0.1:${stream_redis_port}/0"
 
-  echo "+ docker compose up dragonfly (${project})"
-  compose up -d dragonfly >/dev/null
+  echo "+ docker compose up dragonfly redis-ingress (${project})"
+  compose up -d dragonfly redis-ingress >/dev/null
   started_compose=1
   wait_for_tcp "dragonfly" "$redis_port"
+  wait_for_tcp "redis-ingress" "$stream_redis_port"
 else
-  echo "+ using existing Redis URL for update queue smoke"
+  echo "+ using existing legacy and Streams Redis URLs"
 fi
 
-if [[ "${OPENPLOTVA_UPDATE_QUEUE_STREAM_SMOKE:-0}" == "1" ]]; then
-  run_stream_smoke
-fi
+run_stream_smoke
+
+echo "+ Redis Stream envelope/group/reclaim/long-poll cursor smoke"
+OPENPLOTVA_TEST_REDIS_URL="$stream_redis_url" \
+  cargo test -p openplotva-updates \
+  live_redis_stream_ \
+  -- --nocapture
+
+OPENPLOTVA_TEST_REDIS_URL="$stream_redis_url" \
+  cargo test -p openplotva-updates \
+  live_long_poll_batch_ \
+  -- --nocapture
 
 echo "+ Redis update queue FIFO/native-codec smoke"
 OPENPLOTVA_TEST_REDIS_URL="$redis_url" \
