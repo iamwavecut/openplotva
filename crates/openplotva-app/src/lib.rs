@@ -11335,8 +11335,15 @@ async fn start_runtime_workers(
                     ),
                 ),
             ));
-    let dialog_tool_adapter =
-        Arc::new(dialog_tool_adapter.with_generation_reactions(Arc::clone(&generation_reactions)));
+    let dialog_tool_adapter = Arc::new(
+        dialog_tool_adapter
+            .with_generation_reactions(Arc::clone(&generation_reactions))
+            .with_draw_queue_notice_sender(Arc::new(
+                dialog_messages::DrawQueueNoticeDispatcherSender::new(Arc::clone(
+                    &dispatcher_queue,
+                )),
+            )),
+    );
     {
         let watcher_store: Arc<dyn dialog_turn::DeliveryObligationStore> =
             Arc::clone(&delivery_obligation_store) as _;

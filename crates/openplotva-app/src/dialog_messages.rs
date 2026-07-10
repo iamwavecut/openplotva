@@ -643,6 +643,81 @@ impl<Generator, Sender> DirectDrawApiRuntimeEffects<Generator, Sender> {
     }
 }
 
+/// Dispatcher-backed sender for the ephemeral draw queue-position notice: the
+/// dispatcher tracks the sent message in the ephemeral store, and the existing
+/// cleanup worker deletes it after the notice TTL.
+#[derive(Clone)]
+pub struct DrawQueueNoticeDispatcherSender {
+    queue: Arc<DispatcherQueue>,
+    next_virtual_id: VirtualIdFactory,
+}
+
+impl DrawQueueNoticeDispatcherSender {
+    #[must_use]
+    pub fn new(queue: Arc<DispatcherQueue>) -> Self {
+        Self {
+            queue,
+            next_virtual_id: monotonic_virtual_id_factory("draw-queue-notice-vmsg"),
+        }
+    }
+}
+
+impl fmt::Debug for DrawQueueNoticeDispatcherSender {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DrawQueueNoticeDispatcherSender")
+            .finish_non_exhaustive()
+    }
+}
+
+impl crate::dialog_tools::DrawQueueNoticeSender for DrawQueueNoticeDispatcherSender {
+    fn send_draw_queue_notice<'a>(
+        &'a self,
+        notice: crate::dialog_tools::DrawQueueNotice,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            let chat_id = notice.chat_id;
+            let message_thread_id = i64::from(notice.thread_id.unwrap_or_default());
+            let is_topic_message = notice.thread_id.is_some();
+            let chat = ChatRef {
+                id: chat_id,
+                is_forum: is_topic_message,
+            };
+            let request = TextMessageRequest {
+                chat: Some(chat),
+                message_thread_id,
+                disable_notification: false,
+                allow_sending_without_reply: Some(true),
+                text: notice.text,
+                render_as: notice.render_as,
+                reply_markup: None,
+            };
+            let reply_to = ReplyMessageRef {
+                message_id: i64::from(notice.reply_to_message_id),
+                chat,
+                is_topic_message,
+                message_thread_id,
+            };
+            let result = queue_text_message_parts(
+                &self.queue,
+                QueueTextRequest {
+                    protected: false,
+                    debounce_key: None,
+                    message: &request,
+                    reply_to: Some(&reply_to),
+                    immediate_first: true,
+                    bypass_chat_restrictions: false,
+                    ephemeral_delete_after: Some(notice.delete_after),
+                },
+                || (self.next_virtual_id)(),
+            )
+            .await;
+            if let Err(error) = result {
+                tracing::warn!(chat_id, %error, "failed to queue draw queue-position notice");
+            }
+        })
+    }
+}
+
 /// Dispatcher-backed random-response effects.
 #[derive(Clone)]
 pub struct RandomDialogDispatcherEffects {
@@ -8281,6 +8356,33 @@ mod tests {
         fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
             formatter.write_str(self.0)
         }
+    }
+
+    #[tokio::test]
+    async fn draw_queue_notice_dispatcher_sender_queues_ephemeral_reply() {
+        let queue = Arc::new(DispatcherQueue::new(DispatcherConfig::default()));
+        let sender = DrawQueueNoticeDispatcherSender::new(Arc::clone(&queue));
+
+        crate::dialog_tools::DrawQueueNoticeSender::send_draw_queue_notice(
+            &sender,
+            crate::dialog_tools::DrawQueueNotice {
+                chat_id: -100,
+                thread_id: Some(7),
+                reply_to_message_id: 78,
+                text: "Заказ записан в очередь".to_owned(),
+                render_as: TELEGRAM_PARSE_MODE_HTML.to_owned(),
+                delete_after: Duration::from_secs(300),
+            },
+        )
+        .await;
+
+        let snapshot = queue.snapshot();
+        assert!(snapshot.regular.is_empty());
+        assert_eq!(snapshot.immediate.len(), 1);
+        let item = &snapshot.immediate[0];
+        assert_eq!(item.chat_id, -100);
+        assert!(item.virtual_id.starts_with("draw-queue-notice-vmsg-"));
+        assert_eq!(item.ephemeral_delete_after, Some(Duration::from_secs(300)));
     }
 
     type ImageTelegramSenderCapture = TelegramMethodCapture;

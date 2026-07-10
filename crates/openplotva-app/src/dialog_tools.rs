@@ -20,8 +20,8 @@ use openplotva_history::{StoredSummary, SummaryContent};
 use openplotva_taskman::{
     DEFAULT_PRIORITY, HIGHEST_PRIORITY, IMAGE_REGULAR_QUEUE_NAME, IMAGE_VIP_QUEUE_NAME,
     ImageEditJobParams, ImageGenJobParams, InMemoryTaskQueue, MUSIC_VIP_QUEUE_NAME,
-    MusicGenJobParams, fallback_queue_time_estimate, format_go_duration, new_image_edit_job_at,
-    new_image_gen_job_at, new_music_gen_job_at,
+    MusicGenJobParams, fallback_queue_time_estimate, format_duration_ru, format_go_duration,
+    new_image_edit_job_at, new_image_gen_job_at, new_music_gen_job_at,
 };
 use serde_json::json;
 use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
@@ -897,6 +897,7 @@ pub struct TaskmanDialogToolAdapter {
     song_audio_permission: Option<Arc<dyn SongAudioPermission>>,
     generation_reactions: Option<crate::reactions::GenerationReactions>,
     delivery_obligations: Option<Arc<dyn crate::dialog_turn::DeliveryObligationRecorder>>,
+    draw_queue_notice: Option<Arc<dyn DrawQueueNoticeSender>>,
     image_delivery_timeout: time::Duration,
     music_delivery_timeout: time::Duration,
 }
@@ -939,6 +940,10 @@ impl fmt::Debug for TaskmanDialogToolAdapter {
                 "delivery_obligations",
                 &self.delivery_obligations.as_ref().map(|_| "configured"),
             )
+            .field(
+                "draw_queue_notice",
+                &self.draw_queue_notice.as_ref().map(|_| "configured"),
+            )
             .finish()
     }
 }
@@ -958,6 +963,7 @@ impl TaskmanDialogToolAdapter {
             song_audio_permission: None,
             generation_reactions: None,
             delivery_obligations: None,
+            draw_queue_notice: None,
             image_delivery_timeout: time::Duration::seconds(i64::from(
                 crate::dialog_turn::DEFAULT_DIALOG_IMAGE_DELIVERY_TIMEOUT_SECS,
             )),
@@ -1005,6 +1011,67 @@ impl TaskmanDialogToolAdapter {
                 })
                 .await;
         }
+    }
+
+    /// Send ephemeral queue-position notices for scheduled draw jobs.
+    #[must_use]
+    pub fn with_draw_queue_notice_sender(mut self, sender: Arc<dyn DrawQueueNoticeSender>) -> Self {
+        self.draw_queue_notice = Some(sender);
+        self
+    }
+
+    /// Queue position the next job would take, measured before it is assigned
+    /// (Go imageQueuePosition parity: VIP counts only top-priority jobs ahead).
+    fn image_queue_position(&self, plan: ImageGenQueuePlan) -> usize {
+        let depth = if plan.priority == HIGHEST_PRIORITY {
+            self.queue.queue_depth(plan.queue_name, HIGHEST_PRIORITY)
+        } else {
+            self.queue
+                .queue_depth_for_priority_or_higher(plan.queue_name, plan.priority)
+        };
+        depth + 1
+    }
+
+    /// Best-effort ephemeral "you are Nth in queue" notice, sent only after a
+    /// successful assignment and only when the queue is long (position > 10).
+    async fn maybe_send_draw_queue_notice(
+        &self,
+        kind: DrawQueueNoticeKind,
+        plan: ImageGenQueuePlan,
+        position: usize,
+        chat_id: i64,
+        reply_to_message_id: i32,
+        thread_id: Option<i32>,
+    ) {
+        let Some(sender) = self.draw_queue_notice.as_deref() else {
+            return;
+        };
+        if position <= DRAW_QUEUE_NOTICE_POSITION_THRESHOLD {
+            return;
+        }
+        let estimated_wait = format_duration_ru(
+            self.queue
+                .estimate_queue_time_for_depth(plan.queue_name, position - 1),
+        );
+        let notice = match kind {
+            DrawQueueNoticeKind::Generation => DrawQueueNotice {
+                chat_id,
+                thread_id,
+                reply_to_message_id,
+                text: draw_queue_gen_notice_text(position - 1, &estimated_wait),
+                render_as: openplotva_telegram::TELEGRAM_PARSE_MODE_HTML.to_owned(),
+                delete_after: DRAW_QUEUE_GEN_NOTICE_DELETE_AFTER,
+            },
+            DrawQueueNoticeKind::Edit => DrawQueueNotice {
+                chat_id,
+                thread_id,
+                reply_to_message_id,
+                text: draw_queue_edit_notice_text(position, &estimated_wait),
+                render_as: String::new(),
+                delete_after: DRAW_QUEUE_EDIT_NOTICE_DELETE_AFTER,
+            },
+        };
+        sender.send_draw_queue_notice(notice).await;
     }
 
     #[must_use]
@@ -1176,6 +1243,7 @@ impl ImageScheduler for TaskmanDialogToolAdapter {
                     DrawImageScheduleRejection::EnqueueRateLimited,
                 ));
             }
+            let queue_position = self.image_queue_position(plan);
             match self.assign_image_job(plan.queue_name, job, plan.max_active_jobs) {
                 Ok(Some(job_id)) => {
                     self.grow_task_enqueue(plan.queue_name, chat_id, user_id)
@@ -1195,6 +1263,15 @@ impl ImageScheduler for TaskmanDialogToolAdapter {
                     )
                     .await;
                     self.ack_queued_generation(chat_id, message_id).await;
+                    self.maybe_send_draw_queue_notice(
+                        DrawQueueNoticeKind::Generation,
+                        plan,
+                        queue_position,
+                        chat_id,
+                        message_id,
+                        thread_id,
+                    )
+                    .await;
                     Ok(DrawImageScheduleResult {
                         status: "scheduled".to_owned(),
                         job_id: Some(job_id),
@@ -1379,6 +1456,7 @@ impl TaskmanDialogToolAdapter {
                 DrawImageScheduleRejection::EnqueueRateLimited,
             ));
         }
+        let queue_position = self.image_queue_position(plan);
         match self.assign_image_job(plan.queue_name, job, plan.max_active_jobs) {
             Ok(Some(job_id)) => {
                 self.grow_task_enqueue(plan.queue_name, chat_id, user_id)
@@ -1393,6 +1471,15 @@ impl TaskmanDialogToolAdapter {
                 )
                 .await;
                 self.ack_queued_generation(chat_id, message_id).await;
+                self.maybe_send_draw_queue_notice(
+                    DrawQueueNoticeKind::Edit,
+                    plan,
+                    queue_position,
+                    chat_id,
+                    message_id,
+                    thread_id,
+                )
+                .await;
                 Ok(DrawImageScheduleResult {
                     status: "scheduled".to_owned(),
                     job_id: Some(job_id),
@@ -1504,6 +1591,50 @@ impl TaskmanDialogToolAdapter {
         self.queue
             .assign_with_user_limit(queue_name, job, max_active_jobs)
     }
+}
+
+/// Outbound sink for the ephemeral draw queue-position notice.
+pub trait DrawQueueNoticeSender: Send + Sync {
+    fn send_draw_queue_notice<'a>(
+        &'a self,
+        notice: DrawQueueNotice,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+}
+
+/// One queue-position notice: an ephemeral reply on the trigger message.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DrawQueueNotice {
+    pub chat_id: i64,
+    pub thread_id: Option<i32>,
+    pub reply_to_message_id: i32,
+    pub text: String,
+    pub render_as: String,
+    pub delete_after: std::time::Duration,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DrawQueueNoticeKind {
+    Generation,
+    Edit,
+}
+
+/// Go-parity gate: silent at position ≤ 10, notice from the 11th slot on.
+const DRAW_QUEUE_NOTICE_POSITION_THRESHOLD: usize = 10;
+const DRAW_QUEUE_GEN_NOTICE_DELETE_AFTER: std::time::Duration =
+    std::time::Duration::from_secs(5 * 60);
+const DRAW_QUEUE_EDIT_NOTICE_DELETE_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn draw_queue_gen_notice_text(ahead: usize, estimated_wait: &str) -> String {
+    format!(
+        "Заказ записан в очередь, перед вами <u>{ahead}</u> заказов. Примерное время ожидания: <u>{estimated_wait}</u> (<a href=\"{}\">жми</a>, если не хочешь ждать)",
+        crate::image_jobs::DRAW_VIP_URL
+    )
+}
+
+fn draw_queue_edit_notice_text(position: usize, estimated_wait: &str) -> String {
+    format!(
+        "Задание редактирования изображения добавлено в очередь. Ваша позиция: {position}. Примерное время ожидания: {estimated_wait}"
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4408,6 +4539,170 @@ mod tests {
         assert_eq!(calls[0].1.chat_id, -100);
         assert_eq!(calls[0].1.message_id, 11);
         Ok(())
+    }
+
+    #[derive(Debug, Default)]
+    struct DrawQueueNoticeSenderStub {
+        notices: Mutex<Vec<DrawQueueNotice>>,
+    }
+
+    impl DrawQueueNoticeSenderStub {
+        fn notices(&self) -> Vec<DrawQueueNotice> {
+            self.notices.lock().expect("notices").clone()
+        }
+    }
+
+    impl DrawQueueNoticeSender for DrawQueueNoticeSenderStub {
+        fn send_draw_queue_notice<'a>(
+            &'a self,
+            notice: DrawQueueNotice,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+            self.notices.lock().expect("notices").push(notice);
+            Box::pin(async {})
+        }
+    }
+
+    fn seed_pending_image_job(
+        queue: &InMemoryTaskQueue,
+        queue_name: &str,
+        priority: openplotva_taskman::Priority,
+        index: i64,
+    ) {
+        queue.assign(
+            queue_name,
+            new_image_gen_job_at(
+                ImageGenJobParams {
+                    chat_id: -500 - index,
+                    message_id: 1,
+                    user_id: 1_000 + index,
+                    user_full_name: "Seed".to_owned(),
+                    prompt: "seed".to_owned(),
+                    ..ImageGenJobParams::default()
+                },
+                OffsetDateTime::from_unix_timestamp(1_779_193_800).expect("timestamp")
+                    + time::Duration::seconds(index),
+            )
+            .with_name("image")
+            .with_priority(priority),
+        );
+    }
+
+    #[tokio::test]
+    async fn schedule_image_sends_queue_notice_only_above_threshold_after_assignment()
+    -> Result<(), ToolboxError> {
+        let queue = Arc::new(InMemoryTaskQueue::new());
+        let vip = Arc::new(DrawImageVipStatusStub::new(false));
+        let notices = Arc::new(DrawQueueNoticeSenderStub::default());
+        let adapter = TaskmanDialogToolAdapter::new(Arc::clone(&queue))
+            .with_draw_image_vip_status(vip.clone())
+            .with_draw_queue_notice_sender(Arc::clone(&notices) as Arc<dyn DrawQueueNoticeSender>);
+
+        // Nine jobs ahead → position 10 → at the Go threshold, still silent.
+        for index in 0..9 {
+            seed_pending_image_job(&queue, IMAGE_REGULAR_QUEUE_NAME, DEFAULT_PRIORITY, index);
+        }
+        let scheduled = adapter
+            .schedule_image(DrawImageScheduleRequest {
+                chat_id: -100,
+                message_id: 11,
+                user_id: 42,
+                user_full_name: "Alice".to_owned(),
+                prompt: "castle".to_owned(),
+                thread_id: Some(7),
+                ..DrawImageScheduleRequest::default()
+            })
+            .await?;
+        assert_eq!(scheduled.status, "scheduled");
+        assert!(notices.notices().is_empty());
+
+        // Ten jobs ahead now → position 11 → the honest jobs-ahead count is 10
+        // and the fallback ETA for a 10-deep image queue is 8 minutes.
+        let scheduled = adapter
+            .schedule_image(DrawImageScheduleRequest {
+                chat_id: -100,
+                message_id: 12,
+                user_id: 42,
+                user_full_name: "Alice".to_owned(),
+                prompt: "castle".to_owned(),
+                thread_id: Some(7),
+                ..DrawImageScheduleRequest::default()
+            })
+            .await?;
+        assert_eq!(scheduled.status, "scheduled");
+        let sent = notices.notices();
+        assert_eq!(sent.len(), 1);
+        let notice = &sent[0];
+        assert_eq!(notice.chat_id, -100);
+        assert_eq!(notice.reply_to_message_id, 12);
+        assert_eq!(notice.thread_id, Some(7));
+        assert_eq!(
+            notice.render_as,
+            openplotva_telegram::TELEGRAM_PARSE_MODE_HTML
+        );
+        assert_eq!(notice.delete_after, std::time::Duration::from_secs(300));
+        assert_eq!(
+            notice.text,
+            "Заказ записан в очередь, перед вами <u>10</u> заказов. Примерное время ожидания: <u>8 мин.</u> (<a href=\"https://t.me/PlotvoBot?start=vip\">жми</a>, если не хочешь ждать)"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn schedule_image_edit_sends_edit_queue_notice_with_position_and_plain_text()
+    -> Result<(), ToolboxError> {
+        let queue = Arc::new(InMemoryTaskQueue::new());
+        let vip = Arc::new(DrawImageVipStatusStub::new(true));
+        let notices = Arc::new(DrawQueueNoticeSenderStub::default());
+        let resolver = Arc::new(ImageEditFileResolverStub::successful(
+            ImageEditFileSelection {
+                photo_file_id: "edit-file".to_owned(),
+                photo_urls: vec!["https://files.test/photo.png".to_owned()],
+            },
+        ));
+        let adapter = TaskmanDialogToolAdapter::new(Arc::clone(&queue))
+            .with_draw_image_vip_status(vip.clone())
+            .with_image_edit_file_resolver(resolver)
+            .with_draw_queue_notice_sender(Arc::clone(&notices) as Arc<dyn DrawQueueNoticeSender>);
+
+        for index in 0..10 {
+            seed_pending_image_job(&queue, IMAGE_VIP_QUEUE_NAME, HIGHEST_PRIORITY, index);
+        }
+        let scheduled = adapter
+            .schedule_image_edit(DrawImageScheduleRequest {
+                chat_id: -100,
+                message_id: 13,
+                user_id: 42,
+                user_full_name: "Alice".to_owned(),
+                prompt: "make it night".to_owned(),
+                thread_id: None,
+                ..DrawImageScheduleRequest::default()
+            })
+            .await?;
+
+        assert_eq!(scheduled.status, "scheduled");
+        let sent = notices.notices();
+        assert_eq!(sent.len(), 1);
+        let notice = &sent[0];
+        assert_eq!(notice.reply_to_message_id, 13);
+        assert_eq!(notice.render_as, "");
+        assert_eq!(notice.delete_after, std::time::Duration::from_secs(60));
+        assert_eq!(
+            notice.text,
+            "Задание редактирования изображения добавлено в очередь. Ваша позиция: 11. Примерное время ожидания: 8 мин."
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn draw_queue_notice_texts_match_go_contract() {
+        assert_eq!(
+            draw_queue_gen_notice_text(11, "1 мин. 30 сек."),
+            "Заказ записан в очередь, перед вами <u>11</u> заказов. Примерное время ожидания: <u>1 мин. 30 сек.</u> (<a href=\"https://t.me/PlotvoBot?start=vip\">жми</a>, если не хочешь ждать)"
+        );
+        assert_eq!(
+            draw_queue_edit_notice_text(12, "2 мин."),
+            "Задание редактирования изображения добавлено в очередь. Ваша позиция: 12. Примерное время ожидания: 2 мин."
+        );
     }
 
     #[tokio::test]
