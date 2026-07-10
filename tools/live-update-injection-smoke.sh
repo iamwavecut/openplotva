@@ -12,7 +12,7 @@ production, injects a known Telegram update into Redis, then waits for the
 observable live artifact.
 
 Default cases:
-  bang_draw                 enqueues !draw and waits for a drawing-sticker artifact
+  bang_draw                 enqueues !draw and waits for the album delivery record (last_gen)
   percent_draw              enqueues addressed % and waits for image history artifact
   image_edit_missing_prompt enqueues captioned edit verb without prompt and waits for ephemeral notice
   song_notice               enqueues !song and waits for an ephemeral scheduling notice
@@ -1532,7 +1532,7 @@ wait_telegram_file_vision_completed() {
 run_bang_draw_case() {
   local update_json="${log_dir}/bang-draw-update.json"
   local prompt="${OPENPLOTVA_LIVE_UPDATE_SMOKE_PROMPT:-openplotva live smoke}"
-  local pattern="ephemeral_messages:${OPENPLOTVA_SMOKE_CHAT_ID}:*"
+  local pattern="last_gen:${OPENPLOTVA_SMOKE_CHAT_ID}:${OPENPLOTVA_SMOKE_USER_ID}"
   local before
   local enqueue_result
   before="$(scan_count "$pattern")"
@@ -1547,7 +1547,7 @@ run_bang_draw_case() {
   wait_queue_empty >/dev/null
   echo "+ update queue drained"
   wait_scan_count "$pattern" "$((before + 1))" >/dev/null
-  echo "+ bang_draw live artifact observed under ${pattern}"
+  echo "+ bang_draw album delivery artifact observed under ${pattern}"
 }
 
 run_percent_draw_case() {
