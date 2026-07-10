@@ -422,6 +422,14 @@ def result_for(path, method, params):
         return [{"status": "creator", "user": {"id": int(os.environ.get("OPENPLOTVA_SMOKE_USER_ID", "424242")), "is_bot": False, "first_name": "OpenPlotva"}, "is_anonymous": False}]
     if method.startswith("editMessage"):
         return True
+    if method == "sendMediaGroup":
+        media = params.get("media") or "[]"
+        if isinstance(media, str):
+            try:
+                media = json.loads(media)
+            except ValueError:
+                media = []
+        return [next_message(params, "sendPhoto") for _ in range(max(len(media), 1))]
     if method in {"sendMessage", "sendRichMessage", "sendSticker", "sendPhoto", "sendAudio"}:
         return next_message(params, method)
     return True

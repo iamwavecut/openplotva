@@ -298,7 +298,7 @@ job-event markers (re-runs resolve `Sent` with `resent_skipped`).
 |------|---------|
 | `dialog_tools.rs` (~5.5k) | `AppDialogToolbox`: adapts `DialogToolbox` trait onto runtime services. Read-only tools (rates/translate/vision/web_search/crawl/youtube/summary/history_search/queue_status) return `OK`; side-effecting tools (draw_image/generate_song/cancel_drawing) return `QUEUED` + `ToolSideEffect{kind,ticket_id}` or a rejection. Records a `DeliveryObligation` per scheduled ticket at schedule time. |
 | `routed_attempts.rs` (~1.2k) | `RoutedAttemptWalker`: capacity- and breaker-aware retry harness for any routed call (dialog/vision/media/memory). Walks `select_chain` output; pool-busy skips don't consume hops or trip breakers; deadline-cut charges breaker only if `remaining ≥ 30s`. |
-| `rich.rs` (~600) | Rich-message composition (`compose_rates_table`/`compose_song_message`/`compose_gallery`/`compose_draw_*`) + `RichSender` facade (send/edit/draft/upload). |
+| `rich.rs` (~500) | Rich-message composition (`compose_rates_table`/`compose_song_message`/`compose_leaderboard`) + `RichSender` facade (send/edit/draft/upload). Image draws deliver via classic albums in `image_jobs.rs`, not rich messages. |
 | `runtime_virtual_dialog.rs` (~1k) | Runtime-API admin console: real dialog execution with `SAFE` (synthetic side effects) or `REAL` toolbox; 24h session TTL + hourly cleanup worker. |
 
 #### 1.3 Command & callback handlers
