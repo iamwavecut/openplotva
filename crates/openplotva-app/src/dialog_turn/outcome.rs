@@ -3,8 +3,9 @@
 
 use super::ledger::{
     TURN_OUTCOME_DEFERRED_AFTER_SESSION, TURN_OUTCOME_MERGED_INTO_SESSION,
-    TURN_OUTCOME_NO_REPLY_INTENTIONAL, TURN_OUTCOME_RETRY_SCHEDULED, TURN_OUTCOME_SENT,
-    TURN_OUTCOME_SIDE_EFFECT_DELEGATED, TURN_OUTCOME_SKIPPED, TURN_OUTCOME_TERMINAL_FAILED,
+    TURN_OUTCOME_NO_REPLY_INTENTIONAL, TURN_OUTCOME_QUEUED_FOR_DELIVERY,
+    TURN_OUTCOME_RETRY_SCHEDULED, TURN_OUTCOME_SENT, TURN_OUTCOME_SIDE_EFFECT_DELEGATED,
+    TURN_OUTCOME_SKIPPED, TURN_OUTCOME_TERMINAL_FAILED,
 };
 
 /// Ledger reason recorded when a never-processed job outlived the queue-age gate.
@@ -25,6 +26,13 @@ pub enum TurnOutcome {
     /// A text answer was accepted by the outbound queue.
     Sent {
         parts: usize,
+        side_effect_tickets: Vec<i64>,
+    },
+    /// Final answer committed to Postgres; Telegram has not acknowledged all
+    /// mandatory parts yet.
+    QueuedForDelivery {
+        batch_id: String,
+        operation_ids: Vec<String>,
         side_effect_tickets: Vec<i64>,
     },
     /// Generation job(s) are the reply; no text was produced.
@@ -66,6 +74,7 @@ pub enum TurnOutcome {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum JobDisposition {
     Complete,
+    WaitForDelivery,
     Fail(String),
     /// Requeue into the named queue for another attempt.
     Requeue(String),
@@ -85,6 +94,7 @@ impl TurnOutcome {
     pub(crate) fn ledger_outcome(&self) -> &'static str {
         match self {
             Self::Sent { .. } => TURN_OUTCOME_SENT,
+            Self::QueuedForDelivery { .. } => TURN_OUTCOME_QUEUED_FOR_DELIVERY,
             Self::SideEffectDelegated { .. } => TURN_OUTCOME_SIDE_EFFECT_DELEGATED,
             Self::NoReplyIntentional { .. } => TURN_OUTCOME_NO_REPLY_INTENTIONAL,
             Self::RetryScheduled { .. } => TURN_OUTCOME_RETRY_SCHEDULED,
@@ -102,6 +112,7 @@ impl TurnOutcome {
     pub(crate) fn ledger_reason(&self) -> Option<&'static str> {
         match self {
             Self::Sent { .. }
+            | Self::QueuedForDelivery { .. }
             | Self::SideEffectDelegated { .. }
             | Self::MergedIntoSession { .. }
             | Self::DeferredAfterSession { .. } => None,
@@ -128,6 +139,15 @@ mod tests {
                     side_effect_tickets: vec![7],
                 },
                 "sent",
+                None,
+            ),
+            (
+                TurnOutcome::QueuedForDelivery {
+                    batch_id: "batch-1".to_owned(),
+                    operation_ids: vec!["op-1".to_owned()],
+                    side_effect_tickets: Vec::new(),
+                },
+                "queued_for_delivery",
                 None,
             ),
             (

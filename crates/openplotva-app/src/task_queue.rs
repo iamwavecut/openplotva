@@ -28,6 +28,14 @@ pub const TASK_QUEUE_DB_SYNC_INTERVAL: Duration = Duration::from_secs(1);
 pub const TASK_QUEUE_DB_SYNC_MUTATION_THRESHOLD: usize = 1_000;
 
 pub type TaskQueueStoreFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+pub type TaskQueueDurabilityFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+
+/// Synchronous per-job boundary used before a caller exposes a successful
+/// handoff to a user-visible taskman worker.
+pub trait TaskQueueDurabilityBarrier: Send + Sync {
+    fn durability_barrier<'a>(&'a self, job_id: i64) -> TaskQueueDurabilityFuture<'a>;
+}
 
 pub trait SharedTaskQueueDurableStore: Clone + Send + Sync + 'static {
     type Error: fmt::Display + Send + Sync + 'static;
@@ -151,6 +159,24 @@ impl<S> BufferedTaskQueueJournal<S> {
         Ok(batch.len())
     }
 
+    /// Wait until the latest buffered mutation for one job is applied without
+    /// forcing unrelated dirty jobs out of the normal batching window.
+    pub async fn flush_job(&self, job_id: i64) -> Result<bool, S::Error>
+    where
+        S: SharedTaskQueueDurableStore,
+    {
+        let _flush_guard = self.flush_lock.lock().await;
+        let Some(record) = self.lock().dirty.get(&job_id).cloned() else {
+            return Ok(false);
+        };
+        if let Err(error) = self.store.apply_wal_batch(vec![record.clone()]).await {
+            self.mark_flush_failed(1);
+            return Err(error);
+        }
+        self.mark_job_flushed(&record);
+        Ok(true)
+    }
+
     fn mark_flush_failed(&self, _flushing_mutation_count: usize) {
         // Nothing was persisted, so keep dirty_since and mutation_count intact: both
         // triggers must keep reflecting the true unpersisted backlog. The worker
@@ -175,6 +201,26 @@ impl<S> BufferedTaskQueueJournal<S> {
         } else {
             state.dirty_since = Some(Instant::now());
             state.mutation_count = state.mutation_count.saturating_sub(flushing_mutation_count);
+            self.notify.notify_one();
+        }
+    }
+
+    fn mark_job_flushed(&self, flushed: &TaskQueueWalRecord) {
+        let mut state = self.lock();
+        if state
+            .dirty
+            .get(&flushed.job_id)
+            .is_some_and(|current| current == flushed)
+        {
+            state.dirty.remove(&flushed.job_id);
+        }
+        if state.dirty.is_empty() {
+            state.dirty_since = None;
+            state.mutation_count = 0;
+        } else {
+            // Per-job barriers do not know how many coalesced mutations belong
+            // to the remaining records. Preserve both pressure signals rather
+            // than delaying or suppressing the background flush.
             self.notify.notify_one();
         }
     }
@@ -527,6 +573,28 @@ impl SharedTaskQueueRuntime {
                 .map_err(|error| error.to_string()),
             None => Ok(0),
         }
+    }
+
+    /// Flush the latest buffered mutation for one job and wait for PostgreSQL.
+    pub async fn flush_job(&self, job_id: i64) -> Result<bool, String> {
+        match &self.db_journal {
+            Some(journal) => journal
+                .flush_job(job_id)
+                .await
+                .map_err(|error| error.to_string()),
+            None => Ok(false),
+        }
+    }
+
+    /// Durability barrier for callers that only need success or failure.
+    pub async fn durability_barrier(&self, job_id: i64) -> Result<(), String> {
+        self.flush_job(job_id).await.map(|_| ())
+    }
+}
+
+impl TaskQueueDurabilityBarrier for SharedTaskQueueRuntime {
+    fn durability_barrier<'a>(&'a self, job_id: i64) -> TaskQueueDurabilityFuture<'a> {
+        Box::pin(async move { SharedTaskQueueRuntime::durability_barrier(self, job_id).await })
     }
 }
 
@@ -1194,6 +1262,34 @@ mod tests {
         assert_eq!(store.batches().len(), 0);
     }
 
+    #[tokio::test]
+    async fn buffered_task_queue_journal_flush_job_is_a_per_job_durability_barrier()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store = TaskQueueDurableStoreStub::default();
+        let journal = BufferedTaskQueueJournal::new(store.clone());
+        let now = OffsetDateTime::now_utc();
+        let first = task_queue_record(1, now, "first");
+        let second = task_queue_record(2, now, "second");
+        journal.append_task_queue_wal_record(&task_queue_wal_upsert(first.clone()));
+        journal.append_task_queue_wal_record(&task_queue_wal_upsert(second.clone()));
+
+        assert!(journal.flush_job(first.id).await?);
+        assert_eq!(journal.dirty_len(), 1);
+        assert!(!journal.flush_job(first.id).await?);
+
+        let batches = store.batches();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].len(), 1);
+        assert_eq!(batches[0][0].record.as_ref(), Some(&first));
+
+        journal.flush_dirty().await?;
+        let batches = store.batches();
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[1].len(), 1);
+        assert_eq!(batches[1][0].record.as_ref(), Some(&second));
+        Ok(())
+    }
+
     fn dialog_params(message_text: &str) -> DialogJobParams {
         DialogJobParams {
             chat_id: 100,
@@ -1214,6 +1310,12 @@ mod tests {
             queue_name: TEXT_QUEUE_NAME.to_owned(),
             status: openplotva_taskman::JobStatus::Pending,
             job: new_dialog_job_at(dialog_params(title), created).with_name(title),
+            available_at: None,
+            debounce_key: None,
+            lane_key: None,
+            source_update_ids: Vec::new(),
+            latest_update_id: None,
+            pending_dialog_inputs: Vec::new(),
             worker_id: None,
             started_at: None,
             execution_started_at: None,

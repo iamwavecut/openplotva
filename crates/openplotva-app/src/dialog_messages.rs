@@ -13,7 +13,7 @@ use openplotva_core::{
 use openplotva_dialog::PROVIDER_AIFARM;
 use openplotva_taskman::{
     DIALOG_AIFARM_QUEUE_NAME, DialogJobParams, HIGH_PRIORITY, InMemoryTaskQueue, TEXT_QUEUE_NAME,
-    new_dialog_job_at,
+    TaskQueueSchedule, clean_unicode_non_printables, new_dialog_job_at,
 };
 use openplotva_telegram::{
     ChatRef, DispatcherQueue, OutboundBuildError, PhotoMessageRequest, PhotoSource,
@@ -84,6 +84,7 @@ pub struct DialogMessageSchedule<'payload> {
     pub queue_name: &'payload str,
     pub max_output_tokens: i32,
     pub processing_timeout_seconds: i32,
+    pub source_update_id: Option<i64>,
 }
 
 /// Result of one dialog scheduling effect.
@@ -102,6 +103,30 @@ pub trait DialogMessageScheduler {
         &'a self,
         schedule: DialogMessageSchedule<'a>,
     ) -> DialogMessageFuture<'a, DialogMessageScheduleReport, Self::Error>;
+}
+
+pub type DialogTaskDurabilityFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+
+pub trait DialogTaskDurabilityBarrier: Send + Sync {
+    fn durability_barrier(&self, task_id: i64) -> DialogTaskDurabilityFuture<'_>;
+}
+
+impl DialogTaskDurabilityBarrier for crate::task_queue::SharedTaskQueueRuntime {
+    fn durability_barrier(&self, task_id: i64) -> DialogTaskDurabilityFuture<'_> {
+        Box::pin(async move {
+            crate::task_queue::SharedTaskQueueRuntime::durability_barrier(self, task_id).await
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoopDialogTaskDurabilityBarrier;
+
+impl DialogTaskDurabilityBarrier for NoopDialogTaskDurabilityBarrier {
+    fn durability_barrier(&self, _task_id: i64) -> DialogTaskDurabilityFuture<'_> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 pub trait RandomDialogSettingsStore {
@@ -874,6 +899,8 @@ pub enum DialogTypingActionReport {
     },
 }
 
+const DIALOG_TYPING_ACTION_TIMEOUT: Duration = Duration::from_secs(3);
+
 pub trait DialogTypingActionEffects {
     fn send_dialog_typing_action<'a>(
         &'a self,
@@ -959,6 +986,7 @@ pub struct TaskmanDialogMessageScheduler {
     debounce: Arc<InMemoryDialogDebounce>,
     debounce_delay: Duration,
     typing: Arc<dyn DialogTypingActionEffects + Send + Sync>,
+    durability: Arc<dyn DialogTaskDurabilityBarrier>,
     task_enqueue_rate_limit: Option<Arc<dyn TaskEnqueueRateLimit>>,
 }
 
@@ -968,12 +996,14 @@ impl TaskmanDialogMessageScheduler {
         queue: Arc<InMemoryTaskQueue>,
         debounce: Arc<InMemoryDialogDebounce>,
         debounce_delay: Duration,
+        durability: Arc<dyn DialogTaskDurabilityBarrier>,
     ) -> Self {
         Self {
             queue,
             debounce,
             debounce_delay,
             typing: Arc::new(NoopDialogTypingActionEffects),
+            durability,
             task_enqueue_rate_limit: None,
         }
     }
@@ -1038,6 +1068,8 @@ impl fmt::Debug for TaskmanDialogMessageScheduler {
 pub enum TaskmanDialogMessageSchedulerError {
     #[error("serialize dialog metadata: {0}")]
     SerializeMeta(#[from] serde_json::Error),
+    #[error("persist dialog task {task_id} before Telegram activity: {message}")]
+    Durability { task_id: i64, message: String },
 }
 
 impl DialogMessageScheduler for TaskmanDialogMessageScheduler {
@@ -1078,57 +1110,70 @@ impl DialogMessageScheduler for TaskmanDialogMessageScheduler {
                     });
                 }
             }
-            let mut job = new_dialog_job_at(
-                DialogJobParams {
-                    chat_id: schedule.chat_id,
-                    message_id: schedule.message_id,
-                    user_id: schedule.sender_id,
-                    user_full_name: schedule.user_full_name.clone(),
-                    message_text: schedule.message_text.to_owned(),
-                    original_text: String::new(),
-                    meta: serde_json::Value::Null,
-                    max_output_tokens: 0,
-                    thread_id: schedule.thread_id,
-                },
-                OffsetDateTime::now_utc(),
-            )
-            .with_name(schedule.title)
-            .with_priority(schedule.priority)
-            .with_processing_timeout_seconds(schedule.processing_timeout_seconds)
-            .with_dialog_max_output_tokens(schedule.max_output_tokens);
-
-            if let Some(dialog_data) = job.data.dialog_data.as_mut() {
-                dialog_data.original_text = schedule.original_text.trim().to_owned();
-                dialog_data.meta = serde_json::to_value(schedule.meta)?;
-            }
-
-            let typing_report = self
-                .typing
-                .send_dialog_typing_action(schedule.chat_id, schedule.thread_id)
-                .await;
-            if let DialogTypingActionReport::SendFailed { message } = typing_report {
-                tracing::debug!(
-                    chat_id = schedule.chat_id,
-                    message_id = schedule.message_id,
-                    %message,
-                    "failed to send dialog typing action"
-                );
-            }
+            let now = OffsetDateTime::now_utc();
+            let delay = InMemoryDialogDebounce::delay_or_default(self.debounce_delay);
+            let params = DialogJobParams {
+                chat_id: schedule.chat_id,
+                message_id: schedule.message_id,
+                user_id: schedule.sender_id,
+                user_full_name: schedule.user_full_name.clone(),
+                message_text: clean_unicode_non_printables(schedule.message_text),
+                original_text: schedule.original_text.trim().to_owned(),
+                meta: serde_json::to_value(schedule.meta)?,
+                max_output_tokens: schedule.max_output_tokens,
+                thread_id: schedule.thread_id,
+            };
+            let job = new_dialog_job_at(params.clone(), now)
+                .with_name(schedule.title)
+                .with_priority(schedule.priority)
+                .with_processing_timeout_seconds(schedule.processing_timeout_seconds)
+                .with_dialog_max_output_tokens(schedule.max_output_tokens);
 
             let assign_observer = self.task_enqueue_rate_limit.as_ref().map(|rate_limit| {
                 Arc::new(TaskEnqueueGrowObserver {
                     rate_limit: Arc::clone(rate_limit),
                 }) as Arc<dyn crate::dialog_debounce::DialogDebounceAssignObserver>
             });
-            let report = self.debounce.schedule_with_assign_observer(
+            let source_update_ids = schedule.source_update_id.into_iter().collect::<Vec<_>>();
+            let report = self.debounce.schedule(
                 key,
                 schedule.message_id,
                 schedule.queue_name,
                 job,
+                TaskQueueSchedule {
+                    available_at: Some(
+                        now.checked_add(
+                            time::Duration::try_from(delay)
+                                .expect("dialog debounce delay fits time::Duration"),
+                        )
+                        .expect("dialog debounce availability fits OffsetDateTime"),
+                    ),
+                    debounce_key: Some(key.durable_debounce_key()),
+                    lane_key: Some(key.durable_lane_key()),
+                    source_update_ids,
+                    latest_update_id: schedule.source_update_id,
+                    pending_dialog_inputs: vec![params],
+                },
                 self.queue.as_ref().clone(),
-                self.debounce_delay,
-                assign_observer,
+                delay,
             );
+            self.durability
+                .durability_barrier(report.task_id)
+                .await
+                .map_err(|message| TaskmanDialogMessageSchedulerError::Durability {
+                    task_id: report.task_id,
+                    message,
+                })?;
+            self.debounce.arm_timer(key, &report, assign_observer);
+
+            if !report.reused {
+                spawn_dialog_typing_action(
+                    Arc::clone(&self.typing),
+                    schedule.chat_id,
+                    schedule.message_id,
+                    schedule.thread_id,
+                );
+            }
 
             Ok(DialogMessageScheduleReport {
                 queue_name: schedule.queue_name.to_owned(),
@@ -1138,6 +1183,44 @@ impl DialogMessageScheduler for TaskmanDialogMessageScheduler {
             })
         })
     }
+}
+
+fn spawn_dialog_typing_action(
+    typing: Arc<dyn DialogTypingActionEffects + Send + Sync>,
+    chat_id: i64,
+    message_id: i32,
+    thread_id: Option<i32>,
+) {
+    tokio::spawn(async move {
+        match tokio::time::timeout(
+            DIALOG_TYPING_ACTION_TIMEOUT,
+            typing.send_dialog_typing_action(chat_id, thread_id),
+        )
+        .await
+        {
+            Ok(DialogTypingActionReport::SendFailed { message }) => {
+                tracing::debug!(
+                    chat_id,
+                    message_id,
+                    %message,
+                    "failed to send dialog typing action"
+                );
+            }
+            Err(_) => {
+                tracing::debug!(
+                    chat_id,
+                    message_id,
+                    timeout_ms = DIALOG_TYPING_ACTION_TIMEOUT.as_millis(),
+                    "timed out sending detached dialog typing action"
+                );
+            }
+            Ok(
+                DialogTypingActionReport::SkippedInvalidRequest
+                | DialogTypingActionReport::SkippedPermission
+                | DialogTypingActionReport::Sent,
+            ) => {}
+        }
+    });
 }
 
 /// Runtime config for addressed-dialog message scheduling.
@@ -1545,7 +1628,16 @@ where
         .await;
     }
 
-    handle_random_dialog_message(schedulers.0, settings, effects, rng, config, message).await
+    handle_random_dialog_message(
+        schedulers.0,
+        settings,
+        effects,
+        rng,
+        config,
+        message,
+        update.id,
+    )
+    .await
 }
 
 pub async fn handle_dialog_message_update_or_else<Scheduler, HandleFn, HandleFuture, HandleError>(
@@ -1804,6 +1896,7 @@ where
             queue_name: &config.queue_name,
             max_output_tokens,
             processing_timeout_seconds: config.processing_timeout_seconds,
+            source_update_id: Some(update.id),
         })
         .await
         .map_err(|error| DialogMessageUpdateError::Schedule {
@@ -2597,6 +2690,7 @@ async fn handle_random_dialog_message<Scheduler, Settings, Effects, Rng>(
     rng: &Rng,
     config: &DialogMessageUpdateConfig,
     message: &carapax::types::Message,
+    source_update_id: i64,
 ) -> Result<DialogMessageUpdateRoute, DialogMessageUpdateError>
 where
     Scheduler: DialogMessageScheduler + Sync,
@@ -2670,6 +2764,7 @@ where
             queue_name: &config.queue_name,
             max_output_tokens,
             processing_timeout_seconds: config.processing_timeout_seconds,
+            source_update_id: Some(source_update_id),
         })
         .await
         .map_err(|error| DialogMessageUpdateError::Schedule {
@@ -3057,6 +3152,7 @@ mod tests {
             Arc::clone(&queue),
             Arc::clone(&debounce),
             Duration::from_millis(1),
+            Arc::new(NoopDialogTaskDurabilityBarrier),
         );
         let typing = Arc::new(TypingEffectsStub::default());
         let scheduler = scheduler.with_typing_effects(typing.clone());
@@ -3097,6 +3193,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dialog_task_is_durable_before_typing_and_carries_update_identity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let queue = Arc::new(InMemoryTaskQueue::new());
+        let debounce = Arc::new(InMemoryDialogDebounce::new());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let durability = Arc::new(DurabilityOrderStub {
+            queue: Arc::clone(&queue),
+            events: Arc::clone(&events),
+        });
+        let typing = Arc::new(TypingOrderStub {
+            events: Arc::clone(&events),
+        });
+        let scheduler = TaskmanDialogMessageScheduler::new(
+            Arc::clone(&queue),
+            debounce,
+            crate::dialog_debounce::GO_DIALOG_DEBOUNCE_INTERVAL,
+            durability,
+        )
+        .with_typing_effects(typing);
+
+        let route = handle_dialog_message_update_or_else(
+            &scheduler,
+            &test_config(),
+            message_update("durable first")?,
+            |_update| async { Err("should not delegate") },
+        )
+        .await?;
+
+        assert!(matches!(route, DialogMessageUpdateRoute::Scheduled { .. }));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while lock(&events).len() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached typing action");
+        assert_eq!(lock(&events).as_slice(), ["barrier:1", "typing"]);
+        let record = queue.record(1).expect("dialog task");
+        assert_eq!(record.source_update_ids, vec![12_345]);
+        assert_eq!(record.latest_update_id, Some(12_345));
+        assert_eq!(record.pending_dialog_inputs.len(), 1);
+        assert_eq!(record.debounce_key.as_deref(), Some("dialog:42:99:0"));
+        assert_eq!(record.lane_key.as_deref(), Some("dialog:42:0"));
+        assert!(
+            record
+                .available_at
+                .is_some_and(|at| at > record.job.created)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn typing_action_is_detached_from_durable_dialog_handoff()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let queue = Arc::new(InMemoryTaskQueue::new());
+        let scheduler = TaskmanDialogMessageScheduler::new(
+            Arc::clone(&queue),
+            Arc::new(InMemoryDialogDebounce::new()),
+            crate::dialog_debounce::GO_DIALOG_DEBOUNCE_INTERVAL,
+            Arc::new(NoopDialogTaskDurabilityBarrier),
+        )
+        .with_typing_effects(Arc::new(PendingTypingStub));
+
+        let route = tokio::time::timeout(
+            Duration::from_millis(100),
+            handle_dialog_message_update_or_else(
+                &scheduler,
+                &test_config(),
+                message_update("detached typing")?,
+                |_update| async { Err("should not delegate") },
+            ),
+        )
+        .await
+        .expect("pending Telegram typing must not block scheduling")?;
+
+        assert!(matches!(route, DialogMessageUpdateRoute::Scheduled { .. }));
+        assert_eq!(queue.records().len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn search_command_schedules_a_normal_dialog_turn()
     -> Result<(), Box<dyn std::error::Error>> {
         let queue = Arc::new(InMemoryTaskQueue::new());
@@ -3105,6 +3282,7 @@ mod tests {
             Arc::clone(&queue),
             Arc::clone(&debounce),
             Duration::from_millis(1),
+            Arc::new(NoopDialogTaskDurabilityBarrier),
         );
 
         // The dedicated search agent is retired: `/search <запрос>` rides the
@@ -3138,6 +3316,7 @@ mod tests {
             Arc::clone(&queue),
             Arc::clone(&debounce),
             Duration::from_millis(1),
+            Arc::new(NoopDialogTaskDurabilityBarrier),
         )
         .with_typing_effects(typing.clone())
         .with_task_enqueue_rate_limit(limiter.clone());
@@ -3168,6 +3347,7 @@ mod tests {
             Arc::clone(&queue),
             Arc::clone(&debounce),
             Duration::from_millis(1),
+            Arc::new(NoopDialogTaskDurabilityBarrier),
         )
         .with_task_enqueue_rate_limit(limiter.clone());
 
@@ -3290,6 +3470,7 @@ mod tests {
             Arc::clone(&queue),
             Arc::clone(&debounce),
             Duration::from_millis(1),
+            Arc::new(NoopDialogTaskDurabilityBarrier),
         );
         let route = Arc::new(Mutex::new(None));
         let captured_route = Arc::clone(&route);
@@ -3455,6 +3636,7 @@ mod tests {
             Arc::clone(&queue),
             Arc::clone(&debounce),
             Duration::from_millis(1),
+            Arc::new(NoopDialogTaskDurabilityBarrier),
         );
         let settings = SettingsStoreStub::with_chat(random_chat_settings(100, false));
         let effects = EffectsStub::default();
@@ -6481,7 +6663,7 @@ mod tests {
             audio_allowed: true,
             expected_route: DialogMessageUpdateRoute::SongScheduled {
                 status: "not_scheduled".to_owned(),
-                no_reply: true,
+                no_reply: false,
             },
             expected_text: DIRECT_SONG_VIP_ONLY_NOTICE,
             expected_parse_mode: Some(TELEGRAM_PARSE_MODE_HTML),
@@ -6497,7 +6679,7 @@ mod tests {
             audio_allowed: true,
             expected_route: DialogMessageUpdateRoute::SongScheduled {
                 status: "not_scheduled".to_owned(),
-                no_reply: true,
+                no_reply: false,
             },
             expected_text: DIRECT_SONG_SERVICE_UNAVAILABLE_NOTICE,
             expected_parse_mode: None,
@@ -6513,7 +6695,7 @@ mod tests {
             audio_allowed: false,
             expected_route: DialogMessageUpdateRoute::SongScheduled {
                 status: "not_scheduled".to_owned(),
-                no_reply: true,
+                no_reply: false,
             },
             expected_text: DIRECT_SONG_AUDIO_NOT_ALLOWED_NOTICE,
             expected_parse_mode: None,
@@ -7924,6 +8106,7 @@ mod tests {
             Arc::clone(&queue),
             Arc::clone(&debounce),
             Duration::from_millis(1),
+            Arc::new(NoopDialogTaskDurabilityBarrier),
         );
         let settings = SettingsStoreStub::with_chat(random_chat_settings(100, false));
         let effects = EffectsStub::default();
@@ -9164,6 +9347,52 @@ mod tests {
                 lock(&self.calls).push((chat_id, thread_id));
                 DialogTypingActionReport::Sent
             })
+        }
+    }
+
+    struct DurabilityOrderStub {
+        queue: Arc<InMemoryTaskQueue>,
+        events: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl DialogTaskDurabilityBarrier for DurabilityOrderStub {
+        fn durability_barrier(&self, task_id: i64) -> DialogTaskDurabilityFuture<'_> {
+            Box::pin(async move {
+                if self.queue.record(task_id).is_none() {
+                    return Err("task missing before barrier".to_owned());
+                }
+                lock(&self.events).push(format!("barrier:{task_id}"));
+                Ok(())
+            })
+        }
+    }
+
+    struct TypingOrderStub {
+        events: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl DialogTypingActionEffects for TypingOrderStub {
+        fn send_dialog_typing_action<'a>(
+            &'a self,
+            _chat_id: i64,
+            _thread_id: Option<i32>,
+        ) -> Pin<Box<dyn Future<Output = DialogTypingActionReport> + Send + 'a>> {
+            Box::pin(async move {
+                lock(&self.events).push("typing".to_owned());
+                DialogTypingActionReport::Sent
+            })
+        }
+    }
+
+    struct PendingTypingStub;
+
+    impl DialogTypingActionEffects for PendingTypingStub {
+        fn send_dialog_typing_action<'a>(
+            &'a self,
+            _chat_id: i64,
+            _thread_id: Option<i32>,
+        ) -> Pin<Box<dyn Future<Output = DialogTypingActionReport> + Send + 'a>> {
+            Box::pin(std::future::pending())
         }
     }
 

@@ -1770,7 +1770,9 @@ fn payment_records_from_taskman(
 fn payment_status_from_taskman(status: JobStatus) -> InMemoryPaymentControlJobStatus {
     match status {
         JobStatus::Pending => InMemoryPaymentControlJobStatus::Pending,
-        JobStatus::Processing => InMemoryPaymentControlJobStatus::Processing,
+        JobStatus::Processing | JobStatus::WaitingDelivery => {
+            InMemoryPaymentControlJobStatus::Processing
+        }
         JobStatus::Completed => InMemoryPaymentControlJobStatus::Completed,
         JobStatus::Failed | JobStatus::Cancelled => InMemoryPaymentControlJobStatus::Failed,
     }
@@ -10319,9 +10321,7 @@ mod tests {
             return Ok(());
         };
         let processor_now = UNIX_EPOCH + StdDuration::from_secs(1_710_000_000);
-        let active_status_now = time::Date::from_calendar_date(2026, time::Month::June, 16)?
-            .with_hms(9, 30, 0)?
-            .assume_utc();
+        let active_status_now = OffsetDateTime::now_utc();
 
         let redis_client = redis::Client::open(redis_url.as_str())?;
         let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();

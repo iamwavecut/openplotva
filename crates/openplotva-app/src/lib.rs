@@ -56,6 +56,7 @@ mod runtime_routing;
 mod runtime_safety;
 mod runtime_sql;
 mod runtime_taskman;
+mod runtime_telegram_delivery;
 mod runtime_updates;
 mod runtime_virtual_dialog;
 pub mod serper;
@@ -64,7 +65,10 @@ pub mod skipped;
 pub mod subscription_sync;
 pub mod task_queue;
 pub mod telegram_activity;
+pub mod telegram_outbox;
 pub mod translate;
+pub mod update_importer;
+pub mod update_materializer;
 pub mod updates;
 pub mod virtual_messages;
 pub mod vision;
@@ -88,7 +92,7 @@ use std::{
 use anyhow::Context as _;
 use axum::{
     body::Bytes,
-    extract::{Extension, Path, RawQuery},
+    extract::{DefaultBodyLimit, Extension, Path, RawQuery},
     http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     response::{
         IntoResponse, Response,
@@ -121,6 +125,7 @@ const GO_DISPATCHER_MAX_QUEUE_SIZE: usize = 10_000;
 const GO_DISPATCHER_DEBOUNCE_WINDOW: Duration = Duration::from_secs(3);
 const GO_DISPATCHER_DEBOUNCE_CACHE_SIZE: usize = 1_000;
 const GO_WEBHOOK_DELETE_ON_STOP_TIMEOUT: Duration = Duration::from_secs(10);
+const TELEGRAM_WEBHOOK_BODY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Default)]
 struct RuntimeWorkers {
@@ -386,17 +391,6 @@ pub enum BotCommandSetupError {
         /// Display form of the Telegram client error.
         message: String,
     },
-}
-
-/// Report from the app-level long-polling update producer startup task.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct TelegramUpdateProducerStartupReport {
-    /// `deleteWebhook` error that stopped the producer before polling.
-    pub delete_webhook_error: Option<String>,
-    /// `setWebhook` error that stopped the producer before accepting webhook updates.
-    pub set_webhook_error: Option<String>,
-    /// Report from the producer loop when startup succeeded.
-    pub producer: Option<openplotva_updates::UpdateProducerRunReport>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -707,7 +701,7 @@ fn router_with_readiness_static_web_and_telegram_webhook_route(
     router_with_readiness_and_static_web(readiness, static_web)
         .route(
             openplotva_telegram::TELEGRAM_WEBHOOK_PATH,
-            any(telegram_webhook),
+            any(telegram_webhook).layer(DefaultBodyLimit::max(TELEGRAM_WEBHOOK_BODY_LIMIT_BYTES)),
         )
         .layer(Extension(route))
 }
@@ -8889,102 +8883,6 @@ fn record_dialog_tool_mode_readiness(
     ));
 }
 
-pub async fn run_long_poll_update_producer_after_delete_webhook<Startup, Source, Queue, Stop>(
-    startup: &Startup,
-    source: &Source,
-    queue: &Queue,
-    stop: Stop,
-) -> TelegramUpdateProducerStartupReport
-where
-    Startup: DeleteWebhookExecutor + Sync,
-    Source: openplotva_updates::UpdateProducerSource + Sync,
-    Queue: openplotva_updates::UpdateProducerQueue + Sync,
-    Stop: Future<Output = ()>,
-{
-    if let Err(error) = startup.delete_webhook().await {
-        return TelegramUpdateProducerStartupReport {
-            delete_webhook_error: Some(error.to_string()),
-            set_webhook_error: None,
-            producer: None,
-        };
-    }
-
-    TelegramUpdateProducerStartupReport {
-        delete_webhook_error: None,
-        set_webhook_error: None,
-        producer: Some(openplotva_updates::run_update_producer_until(source, queue, stop).await),
-    }
-}
-
-pub async fn run_long_poll_update_producer_with_ingress_guard_after_delete_webhook<
-    Startup,
-    Source,
-    Queue,
-    Stop,
->(
-    startup: &Startup,
-    source: &Source,
-    queue: &Queue,
-    ingress_guard: &openplotva_updates::UpdateIngressGuard,
-    stop: Stop,
-) -> TelegramUpdateProducerStartupReport
-where
-    Startup: DeleteWebhookExecutor + Sync,
-    Source: openplotva_updates::UpdateProducerSource + Sync,
-    Queue: openplotva_updates::UpdateProducerQueue + Sync,
-    Stop: Future<Output = ()>,
-{
-    if let Err(error) = startup.delete_webhook().await {
-        return TelegramUpdateProducerStartupReport {
-            delete_webhook_error: Some(error.to_string()),
-            set_webhook_error: None,
-            producer: None,
-        };
-    }
-
-    TelegramUpdateProducerStartupReport {
-        delete_webhook_error: None,
-        set_webhook_error: None,
-        producer: Some(
-            openplotva_updates::run_update_producer_with_ingress_guard_until(
-                source,
-                queue,
-                ingress_guard,
-                stop,
-            )
-            .await,
-        ),
-    }
-}
-
-pub async fn run_webhook_update_producer_after_set_webhook<Startup, Source, Queue, Stop>(
-    startup: &Startup,
-    setup: &openplotva_telegram::WebhookSetup,
-    source: &Source,
-    queue: &Queue,
-    stop: Stop,
-) -> TelegramUpdateProducerStartupReport
-where
-    Startup: SetWebhookExecutor + Sync,
-    Source: openplotva_updates::UpdateProducerSource + Sync,
-    Queue: openplotva_updates::UpdateProducerQueue + Sync,
-    Stop: Future<Output = ()>,
-{
-    if let Err(error) = startup.set_webhook(setup).await {
-        return TelegramUpdateProducerStartupReport {
-            delete_webhook_error: None,
-            set_webhook_error: Some(error.to_string()),
-            producer: None,
-        };
-    }
-
-    TelegramUpdateProducerStartupReport {
-        delete_webhook_error: None,
-        set_webhook_error: None,
-        producer: Some(openplotva_updates::run_update_producer_until(source, queue, stop).await),
-    }
-}
-
 pub async fn delete_webhook_on_shutdown_if_enabled<Startup>(
     enabled: bool,
     startup: &Startup,
@@ -9073,10 +8971,7 @@ pub async fn telegram_webhook_response(
         Err(error) => {
             let status = StatusCode::from_u16(error.http_status())
                 .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-            match error.error_body() {
-                Some(body) => (status, body).into_response(),
-                None => status.into_response(),
-            }
+            status.into_response()
         }
     }
 }
@@ -9106,10 +9001,15 @@ pub fn telegram_webhook_multipart_plan(
         .certificate
         .clone()
         .ok_or(TelegramWebhookMultipartPlanError::MissingCertificate)?;
+    let mut allowed_updates = openplotva_telegram::go_allowed_update_set()
+        .into_iter()
+        .map(|update| serde_json::to_value(update).and_then(serde_json::from_value::<String>))
+        .collect::<Result<Vec<_>, _>>()?;
+    allowed_updates.sort_unstable();
     let mut fields = vec![
         (
             "allowed_updates".to_owned(),
-            serde_json::to_string(openplotva_updates::GO_ALLOWED_UPDATE_NAMES)?,
+            serde_json::to_string(&allowed_updates)?,
         ),
         ("url".to_owned(), setup.url.clone()),
     ];
@@ -9719,6 +9619,10 @@ async fn start_runtime_workers(
             "OPENPLOTVA_CONNECT_SERVICES=false",
         ));
         readiness_checks.push(ReadinessCheck::skipped(
+            "telegram_outbox",
+            "OPENPLOTVA_CONNECT_SERVICES=false",
+        ));
+        readiness_checks.push(ReadinessCheck::skipped(
             "telegram_commands",
             "OPENPLOTVA_CONNECT_SERVICES=false",
         ));
@@ -10104,8 +10008,12 @@ async fn start_runtime_workers(
     }
     let update_queue =
         openplotva_updates::RedisUpdateQueue::new(service_clients.redis.client().clone());
-    let update_queue_backend = config.update_queue.backend.as_str();
-    let update_ingress_guard = Arc::new(openplotva_updates::UpdateIngressGuard::with_defaults());
+    let update_stream_redis_client = if config.update_queue.stream_redis_url.is_empty() {
+        service_clients.redis.client().clone()
+    } else {
+        redis::Client::open(config.update_queue.stream_redis_url.as_str())
+            .context("create dedicated Telegram ingress Redis client")?
+    };
     let updates_inspector =
         runtime_updates::RuntimeUpdatesInspectorHandle::new(update_queue.clone());
     let ingestion_gate_counters = Arc::new(ingestion_telemetry::IngestionGateCounters::default());
@@ -10420,6 +10328,11 @@ async fn start_runtime_workers(
             log_inspector: Some(Arc::new(RuntimeLogInspector::new(Arc::clone(&log_buffer)))),
             taskman_inspector: Some(runtime_taskman_reader),
             updates_inspector: Some(Arc::new(updates_inspector.clone())),
+            telegram_delivery_inspector: Some(Arc::new(
+                runtime_telegram_delivery::PostgresRuntimeTelegramDeliveryInspector::new(
+                    service_clients.postgres.clone(),
+                ),
+            )),
             dispatcher_inspector: Some(Arc::new(dispatcher_inspector.clone())),
             dispatcher_failure_inspector: Some(Arc::clone(&dispatch_failure_ring)
                 as Arc<dyn openplotva_server::RuntimeDispatcherFailureInspector>),
@@ -10599,6 +10512,10 @@ async fn start_runtime_workers(
             "BOT_KEY is not set",
         ));
         readiness_checks.push(ReadinessCheck::skipped(
+            "telegram_outbox",
+            "BOT_KEY is not set",
+        ));
+        readiness_checks.push(ReadinessCheck::skipped(
             "telegram_commands",
             "BOT_KEY is not set",
         ));
@@ -10662,6 +10579,59 @@ async fn start_runtime_workers(
     workers.bot_id = Some(bot_identity.id);
     workers.telegram = Some(telegram.clone());
     workers.delete_webhook_on_shutdown = config.bot.webhook.enabled;
+    let update_stream = {
+        let schema_ready = sqlx::query_scalar::<_, bool>(
+            "SELECT to_regclass('public.telegram_update_inbox') IS NOT NULL \
+                AND to_regclass('public.telegram_update_quarantine') IS NOT NULL \
+                AND to_regclass('public.telegram_update_attempts') IS NOT NULL \
+                AND to_regclass('public.telegram_outbox') IS NOT NULL \
+                AND to_regclass('public.telegram_outbox_attempts') IS NOT NULL \
+                AND to_regclass('public.telegram_outbox_blobs') IS NOT NULL",
+        )
+        .fetch_one(&service_clients.postgres)
+        .await
+        .context("check Telegram delivery durability schema")?;
+        if !schema_ready {
+            anyhow::bail!(
+                "UPDATE_QUEUE_BACKEND=stream requires Telegram inbox, quarantine, attempts, and outbox migrations"
+            );
+        }
+        readiness_checks.push(ReadinessCheck::ok(
+            "telegram_update_schema",
+            "durable Telegram update inbox schema is available",
+        ));
+        let stream = openplotva_updates::RedisUpdateStream::new(
+            update_stream_redis_client.clone(),
+            bot_identity.id,
+        );
+        let created = stream
+            .ensure_consumer_group()
+            .await
+            .context("ensure Telegram update materializer Redis consumer group")?;
+        readiness_checks.push(ReadinessCheck::ok(
+            "telegram_update_stream",
+            if created {
+                "durable Telegram ingress Stream and consumer group created"
+            } else {
+                "durable Telegram ingress Stream and consumer group are available"
+            },
+        ));
+        let import_report = update_importer::import_legacy_update_list(
+            service_clients.redis.client().clone(),
+            &stream,
+            bot_identity.id,
+        )
+        .await
+        .context("import legacy Redis List updates into the durable Stream")?;
+        readiness_checks.push(ReadinessCheck::ok(
+            "telegram_update_legacy_import",
+            format!(
+                "legacy Redis List drained through crash-safe staging ({} appended, {} quarantinable)",
+                import_report.appended, import_report.malformed
+            ),
+        ));
+        stream
+    };
     let command_report = configure_telegram_bot_commands(&telegram)
         .await
         .context("configure Telegram bot commands")?;
@@ -11093,6 +11063,33 @@ async fn start_runtime_workers(
     ));
     workers.handles.push(shared_task_queue_placeholder_worker);
     workers.shared_task_queue = Some(shared_task_queue.clone());
+    let telegram_outbox_store =
+        openplotva_storage::PostgresTelegramOutboxStore::new(service_clients.postgres.clone());
+    let telegram_outbox_transport =
+        telegram_outbox::TelegramApiOutboxTransport::new(telegram.clone(), rich_api.clone());
+    let telegram_outbox_jobs = shared_task_queue.clone();
+    let telegram_outbox_worker_id =
+        format!("telegram-outbox-{}-{}", bot_identity.id, std::process::id());
+    let telegram_outbox_bot_id = bot_identity.id;
+    let telegram_outbox_stop = stop.subscribe();
+    let telegram_outbox_worker = tokio::spawn(async move {
+        let report = telegram_outbox::run_telegram_outbox_worker_until(
+            telegram_outbox_store,
+            telegram_outbox_transport,
+            telegram_outbox_jobs,
+            &telegram_outbox_worker_id,
+            telegram_outbox_bot_id,
+            telegram_outbox::TelegramOutboxWorkerConfig::default(),
+            wait_for_runtime_stop(telegram_outbox_stop),
+        )
+        .await;
+        tracing::info!(?report, "durable Telegram outbox worker stopped");
+    });
+    workers.handles.push(telegram_outbox_worker);
+    readiness_checks.push(ReadinessCheck::ok(
+        "telegram_outbox",
+        "durable Telegram outbox worker started with fenced leases and real receipt tracking",
+    ));
     let mut shared_taskman_worker_counts = BTreeMap::new();
     shared_taskman_worker_counts.insert(openplotva_taskman::CONTROL_QUEUE_NAME.to_owned(), 1);
     if config.memory.enabled {
@@ -11312,6 +11309,7 @@ async fn start_runtime_workers(
         Arc::new(reactions::GenerationReactionSignaler::new(telegram.clone()));
     let dialog_tool_adapter =
         dialog_tools::TaskmanDialogToolAdapter::new(Arc::clone(&task_queue_for_updates))
+            .with_durability_barrier(Arc::new(shared_task_queue.clone()))
             .with_draw_image_vip_status(vip_status_for_updates.clone())
             .with_draw_image_rate_limit(Arc::new(dialog_tools::DrawImageRateLimitPolicy::new(
                 service_clients.redis.draw_rate_limit_store(),
@@ -11467,7 +11465,8 @@ async fn start_runtime_workers(
                 },
             ),
         )
-        .with_taskman_queue(Arc::clone(&task_queue_for_updates)),
+        .with_taskman_queue(Arc::clone(&task_queue_for_updates))
+        .with_taskman_durability(Arc::new(shared_task_queue.clone())),
     );
     let dialog_context_asr: Arc<dyn asr::DialogAsrInputMaterializer> =
         dialog_context_asr_runtime.clone();
@@ -11718,7 +11717,13 @@ async fn start_runtime_workers(
             let dialog_provider: openplotva_llm::ChatProviderHandle = dialog_provider;
             dialog_provider_for_updates = Some(Arc::clone(&dialog_provider));
             let dialog_effects =
-                dialog_jobs::DialogDispatcherEffects::new(Arc::clone(&dispatcher_queue));
+                dialog_jobs::DialogDispatcherEffects::new(Arc::clone(&dispatcher_queue))
+                    .with_durable_outbox(
+                        openplotva_storage::PostgresTelegramOutboxStore::new(
+                            service_clients.postgres.clone(),
+                        ),
+                        bot_identity.id,
+                    );
             let dialog_terminal_signal = dialog_turn::DispatcherTerminalUserSignal::new(
                 telegram.clone(),
                 Arc::clone(&dispatcher_queue),
@@ -12374,109 +12379,113 @@ async fn start_runtime_workers(
         tracing::info!(?outcome, "outbound immediate dispatcher worker stopped");
     });
 
-    if update_queue_backend != "list" {
-        readiness_checks.push(ReadinessCheck::skipped(
-            "telegram_update_producer",
-            format!("UPDATE_QUEUE_BACKEND={update_queue_backend} is spike-only; production default remains list"),
-        ));
-    } else if !config.service_probe.produce_updates {
+    if !config.service_probe.produce_updates {
         readiness_checks.push(ReadinessCheck::skipped(
             "telegram_update_producer",
             "OPENPLOTVA_PRODUCE_UPDATES=false",
         ));
     } else if config.bot.webhook.enabled {
         if config.bot.webhook.url.is_empty() {
-            tracing::warn!("BOT_WEBHOOK_URL is required when webhook updates are enabled");
-            readiness_checks.push(ReadinessCheck::skipped(
-                "telegram_update_producer",
-                "BOT_WEBHOOK_URL is not set",
-            ));
-        } else {
-            let (webhook_sender, webhook_source) =
-                openplotva_telegram::webhook_update_channel(config.bot.webhook.update_buffer_size);
-            let webhook_sender =
-                webhook_sender.with_ingress_guard(Arc::clone(&update_ingress_guard));
-            let webhook_setup = match webhook_setup_from_config(&config.bot.webhook) {
-                Ok(setup) => Some(setup),
-                Err(error) => {
-                    tracing::warn!(%error, "failed to load Telegram webhook certificate");
-                    readiness_checks.push(ReadinessCheck::skipped(
-                        "telegram_update_producer",
-                        "failed to load BOT_WEBHOOK_CERT_FILE",
-                    ));
-                    None
-                }
-            };
-            if let Some(webhook_setup) = webhook_setup {
-                let webhook_startup =
-                    TelegramWebhookSetupClient::new(bot_key.to_owned(), telegram.clone());
-                let update_queue = update_queue.clone();
-                let update_stop = stop.subscribe();
-                let update_producer_worker = tokio::spawn(async move {
-                    let report = run_webhook_update_producer_after_set_webhook(
-                        &webhook_startup,
-                        &webhook_setup,
-                        &webhook_source,
-                        &update_queue,
-                        wait_for_runtime_stop(update_stop),
-                    )
-                    .await;
-
-                    if let Some(error) = report.set_webhook_error.as_deref() {
-                        tracing::warn!(
-                            %error,
-                            "Telegram webhook update producer stopped before accepting updates"
-                        );
-                    } else {
-                        tracing::info!(?report, "Telegram webhook update producer stopped");
-                    }
-                });
-                workers.webhook_route = Some(TelegramWebhookRoute {
-                    sender: webhook_sender,
-                    secret_token: Arc::from(config.bot.webhook.secret_token.clone()),
-                });
-                workers.handles.push(update_producer_worker);
-                readiness_checks.push(ReadinessCheck::ok(
-                    "telegram_update_producer",
-                    "Telegram webhook update producer worker started",
-                ));
-            }
+            anyhow::bail!("BOT_WEBHOOK_URL is required when webhook updates are enabled");
         }
+        let webhook_setup = webhook_setup_from_config(&config.bot.webhook)
+            .context("load Telegram webhook certificate")?;
+        let webhook_startup = TelegramWebhookSetupClient::new(bot_key.to_owned(), telegram.clone());
+        webhook_startup
+            .set_webhook(&webhook_setup)
+            .await
+            .map_err(|error| anyhow::anyhow!("set Telegram webhook: {error}"))?;
+        workers.webhook_route = Some(TelegramWebhookRoute {
+            sender: openplotva_telegram::webhook_update_stream(
+                update_stream.clone(),
+                bot_identity.id,
+            ),
+            secret_token: Arc::from(config.bot.webhook.secret_token.clone()),
+        });
+        readiness_checks.push(ReadinessCheck::ok(
+            "telegram_update_producer",
+            "Telegram webhook appends raw updates directly to the durable Redis Stream",
+        ));
     } else {
         let update_startup = telegram.clone();
-        let update_source = openplotva_telegram::LongPollUpdateSource::new(telegram.clone());
-        let update_queue = update_queue.clone();
-        let update_ingress_guard = Arc::clone(&update_ingress_guard);
+        let update_source = telegram.clone();
+        let update_stream = update_stream.clone();
         let update_stop = stop.subscribe();
+        let update_bot_id = bot_identity.id;
         let update_producer_worker = tokio::spawn(async move {
-            let report = run_long_poll_update_producer_with_ingress_guard_after_delete_webhook(
-                &update_startup,
+            if let Err(error) = update_startup.delete_webhook().await {
+                tracing::warn!(%error, "Telegram long-poll Stream producer stopped before polling");
+                return;
+            }
+            let report = openplotva_telegram::run_long_poll_stream_producer_until(
                 &update_source,
-                &update_queue,
-                update_ingress_guard.as_ref(),
+                &update_stream,
+                update_bot_id,
                 wait_for_runtime_stop(update_stop),
             )
             .await;
-
-            if let Some(error) = report.delete_webhook_error.as_deref() {
-                tracing::warn!(%error, "Telegram long-poll update producer stopped before polling");
-            } else {
-                tracing::info!(?report, "Telegram long-poll update producer stopped");
-            }
+            tracing::info!(?report, "Telegram long-poll Stream producer stopped");
         });
         workers.handles.push(update_producer_worker);
         readiness_checks.push(ReadinessCheck::ok(
             "telegram_update_producer",
-            "Telegram long-poll update producer worker started",
+            "Telegram long polling atomically appends batches and cursors to the durable Redis Stream",
         ));
     }
 
-    if update_queue_backend != "list" {
-        readiness_checks.push(ReadinessCheck::skipped(
-            "telegram_update_consumer",
-            format!("UPDATE_QUEUE_BACKEND={update_queue_backend} is spike-only; production default remains list"),
+    {
+        let materializer_config = openplotva_updates::UpdateStreamMaterializerConfig {
+            batch_max_rows: config.update_queue.materializer_batch_max_rows,
+            batch_max_bytes: config.update_queue.materializer_batch_max_bytes,
+            batch_max_wait: Duration::from_millis(
+                u64::try_from(config.update_queue.materializer_batch_max_wait_ms).unwrap_or(50),
+            ),
+            db_timeout: Duration::from_millis(
+                u64::try_from(config.update_queue.materializer_db_timeout_ms).unwrap_or(5_000),
+            ),
+            ..openplotva_updates::UpdateStreamMaterializerConfig::default()
+        };
+        let materializer_stream = update_stream.clone();
+        let materializer_store = openplotva_storage::PostgresTelegramDeliveryStore::new(
+            service_clients.postgres.clone(),
+        );
+        let materializer_metrics = update_materializer::UpdateMaterializerMetrics::default();
+        updates_inspector.set_stream_plane(
+            update_stream.clone(),
+            service_clients.postgres.clone(),
+            materializer_metrics.clone(),
+        );
+        let materializer_bot_id = bot_identity.id;
+        let materializer_stop = stop.subscribe();
+        let materializer_worker = tokio::spawn(async move {
+            match update_materializer::run_update_materializer_with_metrics_until(
+                materializer_stream,
+                materializer_store,
+                materializer_bot_id,
+                materializer_config,
+                materializer_metrics,
+                wait_for_runtime_stop(materializer_stop),
+            )
+            .await
+            {
+                Ok(report) => tracing::info!(?report, "Telegram update bulk materializer stopped"),
+                Err(error) => {
+                    tracing::error!(%error, "Telegram update bulk materializer configuration rejected")
+                }
+            }
+        });
+        workers.handles.push(materializer_worker);
+        readiness_checks.push(ReadinessCheck::ok(
+            "telegram_update_materializer",
+            format!(
+                "Redis Stream bulk materializer started ({} rows, {} bytes)",
+                config.update_queue.materializer_batch_max_rows,
+                config.update_queue.materializer_batch_max_bytes,
+            ),
         ));
-    } else if config.service_probe.consume_updates {
+    }
+
+    if config.service_probe.consume_updates {
         let dialog_debounce = Arc::new(dialog_debounce::InMemoryDialogDebounce::new());
         workers.dialog_debounce = Some(Arc::clone(&dialog_debounce));
         let dialog_scheduler = Arc::new(
@@ -12484,6 +12493,7 @@ async fn start_runtime_workers(
                 Arc::clone(&task_queue_for_updates),
                 Arc::clone(&dialog_debounce),
                 dialog_debounce::GO_DIALOG_DEBOUNCE_INTERVAL,
+                Arc::new(shared_task_queue.clone()),
             )
             .with_typing_effects(Arc::new(
                 dialog_messages::DialogTypingActionRuntimeEffects::new(
@@ -12810,8 +12820,11 @@ async fn start_runtime_workers(
             member_state,
         ));
         let edited_effects = Arc::new(
-            edited::TaskmanEditedMessageEffects::new(Arc::clone(&task_queue_for_updates))
-                .with_dialog_debounce(dialog_debounce),
+            edited::TaskmanEditedMessageEffects::new(
+                Arc::clone(&task_queue_for_updates),
+                Arc::new(shared_task_queue.clone()),
+            )
+            .with_dialog_debounce(dialog_debounce),
         );
         let edited = Arc::new(edited::EditedMessageUpdateHandler::new(
             edited_effects,
@@ -12830,30 +12843,27 @@ async fn start_runtime_workers(
             bot_identity.username.clone(),
             history_handler,
         ));
-        let update_consumer_queue = Arc::new(update_queue.clone());
         let update_stage_tracker = Arc::new(updates_inspector.stage_tracker());
-        let update_history_store = Arc::clone(&history_store_for_updates);
-        let update_bot_id = bot_identity.id;
         let update_consumer_stop = stop.subscribe();
+        let delivery_store = openplotva_storage::PostgresTelegramDeliveryStore::new(
+            service_clients.postgres.clone(),
+        );
         let update_consumer_worker = tokio::spawn(async move {
-            let report = updates::run_update_consumer_with_history_stage_tracker_until(
-                update_consumer_queue,
+            let report = updates::run_materialized_update_consumer_until(
+                delivery_store,
                 openplotva_updates::UpdateConsumerConfig::default(),
                 store_for_updates,
-                update_history_store,
-                update_bot_id,
                 handler,
                 update_stage_tracker,
                 wait_for_runtime_stop(update_consumer_stop),
             )
             .await;
-
-            tracing::info!(?report, "Telegram decoded update consumer stopped");
+            tracing::info!(?report, "Postgres Telegram inbox consumer stopped");
         });
         workers.handles.push(update_consumer_worker);
         readiness_checks.push(ReadinessCheck::ok(
             "telegram_update_consumer",
-            "Telegram decoded update consumer worker started for ported fetcher slices",
+            "Postgres Telegram inbox consumer started with leased, fenced claims",
         ));
     } else {
         readiness_checks.push(ReadinessCheck::skipped(
@@ -13274,6 +13284,8 @@ where
             let permissions = Arc::clone(&permissions);
             async move {
                 let method_kind = method.kind();
+                let reply_missing_fallback =
+                    openplotva_telegram::replay_outbound_method_without_reply(&method);
                 match openplotva_telegram::send_outbound_method_with_bounded_retry(
                     &send,
                     method,
@@ -13283,7 +13295,7 @@ where
                 .await
                 {
                     Ok(response) => Ok(response),
-                    Err(error) => {
+                    Err(mut error) => {
                         if matches!(
                             method_kind,
                             openplotva_telegram::TelegramOutboundMethodKind::SendMessage
@@ -13292,9 +13304,21 @@ where
                         {
                             tracing::warn!(
                                 chat_id,
-                                "reply target missing for Telegram send"
+                                "reply target missing; retrying Telegram send without reply parameters"
                             );
-                            return Ok(openplotva_telegram::TelegramOutboundResponse::Boolean(true));
+                            if let Some(fallback) = reply_missing_fallback {
+                                match openplotva_telegram::send_outbound_method_with_bounded_retry(
+                                    &send,
+                                    fallback,
+                                    &retry_virtual_id,
+                                    chat_id,
+                                )
+                                .await
+                                {
+                                    Ok(response) => return Ok(response),
+                                    Err(fallback_error) => error = fallback_error,
+                                }
+                            }
                         }
                         if let Some(retry_after) =
                             rate_limits::telegram_retry_after_from_outbound_error(&error)
@@ -13519,7 +13543,7 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::{BTreeMap, VecDeque},
+        collections::BTreeMap,
         error::Error,
         fmt,
         sync::{Arc, Mutex, MutexGuard},
@@ -13633,16 +13657,14 @@ mod tests {
         extract::Extension,
         http::{HeaderMap, Method, StatusCode, header},
     };
-    use carapax::types::{InputFile, SendMessage, SendPhoto, Update as TelegramUpdate};
+    use carapax::types::{
+        InputFile, ReplyParameters, SendMessage, SendPhoto, Update as TelegramUpdate,
+    };
     use openplotva_core::{ChatSettings, ChatSettingsUpdate};
     use openplotva_telegram::{
         DispatcherConfig, DispatcherMessage, DispatcherQueue, DispatcherSendStatus,
         DispatcherWorkItem, MessageFingerprint, TelegramMessage, TelegramOutboundExecuteError,
         TelegramOutboundMethod, TelegramOutboundResponse,
-    };
-    use openplotva_updates::{
-        UpdateProducerQueue, UpdateProducerQueueFuture, UpdateProducerSource,
-        UpdateProducerSourceFuture,
     };
     use serde_json::json;
     use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -13675,8 +13697,7 @@ mod tests {
         parse_admin_positive_i32, parse_deputy_candidates_limit, parse_deputy_update_request,
         parse_memory_limit, parse_optional_i32, parse_settings_get_access,
         parse_settings_memory_access, parse_settings_update_request, parse_shield_limit,
-        routing_json_config_patch, run_long_poll_update_producer_after_delete_webhook,
-        run_webhook_update_producer_after_set_webhook, runtime_api_graphql_snapshot,
+        routing_json_config_patch, runtime_api_graphql_snapshot,
         runtime_redis_prefix_groups_from_keys, runtime_redis_value_from_bytes,
         send_dispatcher_work_item_with_transport,
         send_dispatcher_work_item_with_transport_and_history, settings_chat_display,
@@ -14061,7 +14082,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatcher_send_consumes_reply_missing_send_message_like_go_dialog_response()
+    async fn dispatcher_send_retries_reply_missing_without_reply_target()
     -> Result<(), Box<dyn Error>> {
         let rate_limits = Arc::new(ChatRateLimitPolicy::new(RateLimitStoreStub));
         let permission_store = PermissionStoreStub::with_context(ChatPermissionContext {
@@ -14069,139 +14090,49 @@ mod tests {
             settings: Some(ChatSettings::defaults(42)),
         });
         let permissions = Arc::new(ChatPermissionPolicy::new(permission_store.clone()));
-        let item = queued_method_item(TelegramOutboundMethod::from(SendMessage::new(42, "hello")));
+        let item = queued_method_item(TelegramOutboundMethod::from(
+            SendMessage::new(42, "hello").with_reply_parameters(
+                ReplyParameters::new(100)
+                    .with_chat_id(42)
+                    .with_allow_sending_without_reply(true),
+            ),
+        ));
+        let calls = Arc::new(Mutex::new(Vec::new()));
 
-        let status =
-            send_dispatcher_work_item_with_transport(rate_limits, permissions, item, |_| async {
-                Err::<TelegramOutboundResponse, _>(reply_missing_error())
-            })
-            .await;
+        let status = send_dispatcher_work_item_with_transport(rate_limits, permissions, item, {
+            let calls = Arc::clone(&calls);
+            move |method| {
+                let calls = Arc::clone(&calls);
+                async move {
+                    let has_reply = match &method {
+                        TelegramOutboundMethod::SendMessage(method) => {
+                            serde_json::to_value(method.as_ref())
+                                .expect("sendMessage JSON")
+                                .get("reply_parameters")
+                                .is_some()
+                        }
+                        _ => false,
+                    };
+                    let call_number = {
+                        let mut calls = calls.lock().expect("send calls");
+                        calls.push(has_reply);
+                        calls.len()
+                    };
+                    if call_number == 1 {
+                        Err(reply_missing_error())
+                    } else {
+                        Ok(TelegramOutboundResponse::Message(Box::new(
+                            telegram_message(42, 101),
+                        )))
+                    }
+                }
+            }
+        })
+        .await;
 
         assert_eq!(status, DispatcherSendStatus::Sent);
+        assert_eq!(*calls.lock().expect("send calls"), vec![true, false]);
         assert!(permission_store.saved_updates().is_empty());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn long_poll_update_startup_deletes_webhook_before_producing_updates_like_go()
-    -> Result<(), Box<dyn Error>> {
-        let startup = DeleteWebhookStub::default();
-        let source = ProducerSourceStub::new(vec![Some(sample_message_update(10)?), None]);
-        let queue = ProducerQueueStub::default();
-
-        let report = run_long_poll_update_producer_after_delete_webhook(
-            &startup,
-            &source,
-            &queue,
-            std::future::pending(),
-        )
-        .await;
-
-        assert_eq!(startup.calls(), 1);
-        assert!(report.delete_webhook_error.is_none());
-        let producer = report.producer.expect("producer report");
-        assert_eq!(producer.received, 1);
-        assert_eq!(producer.enqueued, 1);
-        assert!(producer.source_closed);
-        assert_eq!(queue.enqueued_ids(), vec![10]);
-        assert_eq!(source.calls(), 2);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn long_poll_update_startup_stops_before_producer_when_delete_webhook_fails_like_go()
-    -> Result<(), Box<dyn Error>> {
-        let startup = DeleteWebhookStub::failing("delete webhook failed");
-        let source = ProducerSourceStub::new(vec![Some(sample_message_update(10)?), None]);
-        let queue = ProducerQueueStub::default();
-
-        let report = run_long_poll_update_producer_after_delete_webhook(
-            &startup,
-            &source,
-            &queue,
-            std::future::pending(),
-        )
-        .await;
-
-        assert_eq!(startup.calls(), 1);
-        assert_eq!(
-            report.delete_webhook_error.as_deref(),
-            Some("delete webhook failed")
-        );
-        assert!(report.producer.is_none());
-        assert!(queue.enqueued_ids().is_empty());
-        assert_eq!(source.calls(), 0);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn webhook_update_startup_sets_webhook_before_producing_updates_like_go()
-    -> Result<(), Box<dyn Error>> {
-        let startup = SetWebhookStub::default();
-        let setup = openplotva_telegram::WebhookSetup::new(
-            "https://example.test/telegram/webhook",
-            Some("secret".to_owned()),
-        );
-        let source = ProducerSourceStub::new(vec![Some(sample_message_update(20)?), None]);
-        let queue = ProducerQueueStub::default();
-
-        let report = run_webhook_update_producer_after_set_webhook(
-            &startup,
-            &setup,
-            &source,
-            &queue,
-            std::future::pending(),
-        )
-        .await;
-
-        assert_eq!(startup.calls(), 1);
-        assert!(report.set_webhook_error.is_none());
-        let producer = report.producer.expect("producer report");
-        assert_eq!(producer.received, 1);
-        assert_eq!(producer.enqueued, 1);
-        assert_eq!(queue.enqueued_ids(), vec![20]);
-        let payload = startup.payloads().pop().expect("setWebhook payload");
-        assert_eq!(payload["url"], "https://example.test/telegram/webhook");
-        assert_eq!(payload["secret_token"], "secret");
-        assert!(
-            payload
-                .get("allowed_updates")
-                .and_then(serde_json::Value::as_array)
-                .is_some_and(
-                    |updates| updates.len() == openplotva_updates::GO_ALLOWED_UPDATE_NAMES.len()
-                )
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn webhook_update_startup_stops_before_producer_when_set_webhook_fails_like_go()
-    -> Result<(), Box<dyn Error>> {
-        let startup = SetWebhookStub::failing("set webhook failed");
-        let setup = openplotva_telegram::WebhookSetup::new(
-            "https://example.test/telegram/webhook",
-            Some("secret".to_owned()),
-        );
-        let source = ProducerSourceStub::new(vec![Some(sample_message_update(20)?), None]);
-        let queue = ProducerQueueStub::default();
-
-        let report = run_webhook_update_producer_after_set_webhook(
-            &startup,
-            &setup,
-            &source,
-            &queue,
-            std::future::pending(),
-        )
-        .await;
-
-        assert_eq!(startup.calls(), 1);
-        assert_eq!(
-            report.set_webhook_error.as_deref(),
-            Some("set webhook failed")
-        );
-        assert!(report.producer.is_none());
-        assert!(queue.enqueued_ids().is_empty());
-        assert_eq!(source.calls(), 0);
         Ok(())
     }
 
@@ -14228,29 +14159,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn telegram_webhook_response_accepts_update_and_maps_go_errors()
+    async fn telegram_webhook_response_maps_security_and_redis_failures()
     -> Result<(), Box<dyn Error>> {
-        let (sender, source) = openplotva_telegram::webhook_update_channel(1);
+        let redis = redis::Client::open("redis://127.0.0.1:1/0")?;
+        let stream = openplotva_updates::RedisUpdateStream::with_key(
+            redis,
+            "openplotva:webhook-response-test",
+        );
+        let sender = openplotva_telegram::webhook_update_stream(stream, 77)
+            .with_send_timeout(Duration::ZERO);
         let body = serde_json::to_vec(&sample_message_update(30)?)?;
         let mut headers = HeaderMap::new();
         headers.insert(
             openplotva_telegram::TELEGRAM_WEBHOOK_SECRET_HEADER,
             "secret".parse()?,
-        );
-
-        let response = telegram_webhook_response(
-            &sender,
-            Method::POST,
-            headers.clone(),
-            "secret",
-            Bytes::from(body.clone()),
-        )
-        .await;
-
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            source.next_update_now().await.expect("accepted update").id,
-            30
         );
 
         let response =
@@ -14280,9 +14202,7 @@ mod tests {
             Bytes::from_static(b"not-json"),
         )
         .await;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let body = to_bytes(response.into_body(), usize::MAX).await?;
-        assert_eq!(&body[..], br#"{"error":"invalid update"}"#);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         Ok(())
     }
 
@@ -15624,7 +15544,6 @@ mod tests {
             cert_file: cert_path.to_string_lossy().into_owned(),
             key_file: "/unused-key.pem".to_owned(),
             secret_token: "secret".to_owned(),
-            update_buffer_size: openplotva_config::DEFAULT_BOT_WEBHOOK_UPDATE_BUFFER_SIZE,
         };
 
         let setup = super::webhook_setup_from_config(&config)?;
@@ -15649,7 +15568,6 @@ mod tests {
             cert_file: cert_path.to_string_lossy().into_owned(),
             key_file: String::new(),
             secret_token: String::new(),
-            update_buffer_size: openplotva_config::DEFAULT_BOT_WEBHOOK_UPDATE_BUFFER_SIZE,
         };
 
         let setup = super::webhook_setup_from_config(&config)?;
@@ -15676,12 +15594,17 @@ mod tests {
 
         assert_eq!(plan.certificate_name, "cert.pem");
         assert_eq!(plan.certificate_bytes, b"cert-bytes");
+        let mut allowed_updates = openplotva_telegram::go_allowed_update_set()
+            .into_iter()
+            .map(serde_json::to_value)
+            .collect::<Result<Vec<_>, _>>()?;
+        allowed_updates.sort_by_key(serde_json::Value::to_string);
         assert_eq!(
             plan.fields,
             vec![
                 (
                     "allowed_updates".to_owned(),
-                    serde_json::to_string(openplotva_updates::GO_ALLOWED_UPDATE_NAMES)?
+                    serde_json::to_string(&allowed_updates)?
                 ),
                 ("secret_token".to_owned(), "secret".to_owned()),
                 (
@@ -15761,13 +15684,6 @@ mod tests {
     }
 
     impl DeleteWebhookStub {
-        fn failing(error: &'static str) -> Self {
-            Self {
-                calls: Arc::new(Mutex::new(0)),
-                error: Some(error),
-            }
-        }
-
         fn calls(&self) -> usize {
             *self.calls.lock().expect("delete webhook calls")
         }
@@ -15778,48 +15694,6 @@ mod tests {
 
         fn delete_webhook<'a>(&'a self) -> super::DeleteWebhookFuture<'a, Self::Error> {
             *self.calls.lock().expect("delete webhook calls") += 1;
-            let result = self
-                .error
-                .map_or(Ok(()), |message| Err(StartupError(message)));
-            Box::pin(async move { result })
-        }
-    }
-
-    #[derive(Clone, Default)]
-    struct SetWebhookStub {
-        requests: Arc<Mutex<Vec<serde_json::Value>>>,
-        error: Option<&'static str>,
-    }
-
-    impl SetWebhookStub {
-        fn failing(error: &'static str) -> Self {
-            Self {
-                error: Some(error),
-                ..Self::default()
-            }
-        }
-
-        fn calls(&self) -> usize {
-            self.requests.lock().expect("setWebhook requests").len()
-        }
-
-        fn payloads(&self) -> Vec<serde_json::Value> {
-            self.requests.lock().expect("setWebhook requests").clone()
-        }
-    }
-
-    impl super::SetWebhookExecutor for SetWebhookStub {
-        type Error = StartupError;
-
-        fn set_webhook<'a>(
-            &'a self,
-            setup: &'a openplotva_telegram::WebhookSetup,
-        ) -> super::SetWebhookFuture<'a, Self::Error> {
-            let method = openplotva_telegram::build_set_webhook_method(setup);
-            self.requests
-                .lock()
-                .expect("setWebhook requests")
-                .push(serde_json::to_value(method).expect("setWebhook JSON"));
             let result = self
                 .error
                 .map_or(Ok(()), |message| Err(StartupError(message)));
@@ -15932,64 +15806,6 @@ mod tests {
                 Ok(())
             };
             Box::pin(async move { result })
-        }
-    }
-
-    #[derive(Clone)]
-    struct ProducerSourceStub {
-        updates: Arc<Mutex<VecDeque<Option<TelegramUpdate>>>>,
-        calls: Arc<Mutex<usize>>,
-    }
-
-    impl ProducerSourceStub {
-        fn new(updates: Vec<Option<TelegramUpdate>>) -> Self {
-            Self {
-                updates: Arc::new(Mutex::new(updates.into())),
-                calls: Arc::new(Mutex::new(0)),
-            }
-        }
-
-        fn calls(&self) -> usize {
-            *self.calls.lock().expect("source calls")
-        }
-    }
-
-    impl UpdateProducerSource for ProducerSourceStub {
-        fn next_update<'a>(&'a self) -> UpdateProducerSourceFuture<'a> {
-            *self.calls.lock().expect("source calls") += 1;
-            let update = self.updates.lock().expect("updates").pop_front().flatten();
-            Box::pin(async move { update })
-        }
-    }
-
-    #[derive(Clone, Default)]
-    struct ProducerQueueStub {
-        updates: Arc<Mutex<Vec<TelegramUpdate>>>,
-    }
-
-    impl ProducerQueueStub {
-        fn enqueued_ids(&self) -> Vec<i64> {
-            self.updates
-                .lock()
-                .expect("enqueued updates")
-                .iter()
-                .map(|update| update.id)
-                .collect()
-        }
-    }
-
-    impl UpdateProducerQueue for ProducerQueueStub {
-        type Error = StartupError;
-
-        fn enqueue_update<'a>(
-            &'a self,
-            update: &'a TelegramUpdate,
-        ) -> UpdateProducerQueueFuture<'a, Self::Error> {
-            self.updates
-                .lock()
-                .expect("enqueued updates")
-                .push(update.clone());
-            Box::pin(async { Ok(()) })
         }
     }
 

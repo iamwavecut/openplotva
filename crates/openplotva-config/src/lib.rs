@@ -79,7 +79,17 @@ pub const DEFAULT_REDIS_PORT: u16 = 6379;
 
 pub const DEFAULT_REDIS_DB: i64 = 0;
 
-pub const DEFAULT_UPDATE_QUEUE_BACKEND: &str = "list";
+pub const DEFAULT_UPDATE_QUEUE_BACKEND: &str = "stream";
+
+pub const DEFAULT_UPDATE_STREAM_REDIS_URL: &str = "";
+
+pub const DEFAULT_UPDATE_MATERIALIZER_BATCH_MAX_ROWS: usize = 512;
+
+pub const DEFAULT_UPDATE_MATERIALIZER_BATCH_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+pub const DEFAULT_UPDATE_MATERIALIZER_BATCH_MAX_WAIT_MS: i32 = 50;
+
+pub const DEFAULT_UPDATE_MATERIALIZER_DB_TIMEOUT_MS: i32 = 5_000;
 
 pub const DEFAULT_CONNECT_SERVICES: bool = true;
 
@@ -93,8 +103,6 @@ pub const DEFAULT_PRODUCE_UPDATES: bool = true;
 pub const DEFAULT_BOT_DEBUG: bool = false;
 
 pub const DEFAULT_BOT_WEBHOOK_ENABLED: bool = false;
-
-pub const DEFAULT_BOT_WEBHOOK_UPDATE_BUFFER_SIZE: usize = 10_000;
 
 pub const DEFAULT_TELEGRAM_ACTIVITY_PULSE_ENABLED: bool = true;
 
@@ -439,6 +447,17 @@ pub struct DatabaseConfig {
 pub struct UpdateQueueConfig {
     /// Telegram update queue backend, from `UPDATE_QUEUE_BACKEND`.
     pub backend: String,
+    /// Dedicated Redis/Valkey URL for the ingress stream. Empty reuses the
+    /// primary Redis client, which keeps local development simple.
+    pub stream_redis_url: String,
+    /// Maximum updates materialized by one Postgres transaction.
+    pub materializer_batch_max_rows: usize,
+    /// Maximum raw payload bytes materialized by one Postgres transaction.
+    pub materializer_batch_max_bytes: usize,
+    /// Maximum dwell after the first stream entry while filling a bulk batch.
+    pub materializer_batch_max_wait_ms: i32,
+    /// Timeout for the complete Postgres bulk transaction.
+    pub materializer_db_timeout_ms: i32,
 }
 
 /// Postgres configuration.
@@ -517,8 +536,6 @@ pub struct BotWebhookConfig {
     pub key_file: String,
     /// Secret-token header value, from `BOT_WEBHOOK_SECRET_TOKEN`.
     pub secret_token: String,
-    /// In-memory webhook update channel capacity, from `BOT_WEBHOOK_UPDATE_BUFFER_SIZE`.
-    pub update_buffer_size: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1021,6 +1038,16 @@ pub struct RawConfig {
     pub redis_db: Option<String>,
     /// `UPDATE_QUEUE_BACKEND`.
     pub update_queue_backend: Option<String>,
+    /// `UPDATE_STREAM_REDIS_URL`.
+    pub update_stream_redis_url: Option<String>,
+    /// `UPDATE_MATERIALIZER_BATCH_MAX_ROWS`.
+    pub update_materializer_batch_max_rows: Option<String>,
+    /// `UPDATE_MATERIALIZER_BATCH_MAX_BYTES`.
+    pub update_materializer_batch_max_bytes: Option<String>,
+    /// `UPDATE_MATERIALIZER_BATCH_MAX_WAIT_MS`.
+    pub update_materializer_batch_max_wait_ms: Option<String>,
+    /// `UPDATE_MATERIALIZER_DB_TIMEOUT_MS`.
+    pub update_materializer_db_timeout_ms: Option<String>,
     /// `BOT_KEY`.
     pub bot_key: Option<String>,
     /// `BOT_API_BASE_URL`.
@@ -1035,8 +1062,6 @@ pub struct RawConfig {
     pub bot_webhook_key_file: Option<String>,
     /// `BOT_WEBHOOK_SECRET_TOKEN`.
     pub bot_webhook_secret_token: Option<String>,
-    /// `BOT_WEBHOOK_UPDATE_BUFFER_SIZE`.
-    pub bot_webhook_update_buffer_size: Option<String>,
     /// `TELEGRAM_ACTIVITY_PULSE_ENABLED`.
     pub telegram_activity_pulse_enabled: Option<String>,
     /// `TELEGRAM_ACTIVITY_PULSE_INTERVAL_MS`.
@@ -1557,11 +1582,18 @@ pub enum ConfigError {
         /// Maximum accepted value.
         max: i32,
     },
+    #[error("{name} must be between {min} and {max}, got {value}")]
+    UnsignedIntegerOutsideRange {
+        name: &'static str,
+        value: usize,
+        min: usize,
+        max: usize,
+    },
     #[error(
         "PERSISTENT_QUEUE_DIALOG_AIFARM_FALLBACK_LOW_WATERMARK cannot exceed PERSISTENT_QUEUE_DIALOG_AIFARM_FALLBACK_HIGH_WATERMARK"
     )]
     PersistentQueueFallbackWatermarkRange,
-    #[error("invalid UPDATE_QUEUE_BACKEND value {value:?}: expected list or stream")]
+    #[error("invalid UPDATE_QUEUE_BACKEND value {value:?}: expected stream")]
     InvalidUpdateQueueBackend { value: String },
 }
 
@@ -2064,6 +2096,47 @@ impl AppConfig {
             },
             update_queue: UpdateQueueConfig {
                 backend: parse_update_queue_backend(raw.update_queue_backend)?,
+                stream_redis_url: raw
+                    .update_stream_redis_url
+                    .and_then(|value| parse_scalar_value(Some(value)))
+                    .unwrap_or_else(|| DEFAULT_UPDATE_STREAM_REDIS_URL.to_owned()),
+                materializer_batch_max_rows: validate_usize_range(
+                    "UPDATE_MATERIALIZER_BATCH_MAX_ROWS",
+                    parse_usize(
+                        "UPDATE_MATERIALIZER_BATCH_MAX_ROWS",
+                        raw.update_materializer_batch_max_rows,
+                        DEFAULT_UPDATE_MATERIALIZER_BATCH_MAX_ROWS,
+                    )?,
+                    1,
+                    1_000,
+                )?,
+                materializer_batch_max_bytes: validate_usize_range(
+                    "UPDATE_MATERIALIZER_BATCH_MAX_BYTES",
+                    parse_usize(
+                        "UPDATE_MATERIALIZER_BATCH_MAX_BYTES",
+                        raw.update_materializer_batch_max_bytes,
+                        DEFAULT_UPDATE_MATERIALIZER_BATCH_MAX_BYTES,
+                    )?,
+                    1024 * 1024,
+                    32 * 1024 * 1024,
+                )?,
+                materializer_batch_max_wait_ms: validate_positive_i32_returning_at_most(
+                    "UPDATE_MATERIALIZER_BATCH_MAX_WAIT_MS",
+                    parse_i32(
+                        "UPDATE_MATERIALIZER_BATCH_MAX_WAIT_MS",
+                        raw.update_materializer_batch_max_wait_ms,
+                        DEFAULT_UPDATE_MATERIALIZER_BATCH_MAX_WAIT_MS,
+                    )?,
+                    1_000,
+                )?,
+                materializer_db_timeout_ms: validate_positive_i32(
+                    "UPDATE_MATERIALIZER_DB_TIMEOUT_MS",
+                    parse_i32(
+                        "UPDATE_MATERIALIZER_DB_TIMEOUT_MS",
+                        raw.update_materializer_db_timeout_ms,
+                        DEFAULT_UPDATE_MATERIALIZER_DB_TIMEOUT_MS,
+                    )?,
+                )?,
             },
             bot: BotConfig {
                 key: raw.bot_key.filter(|value| !value.is_empty()),
@@ -2078,11 +2151,6 @@ impl AppConfig {
                     cert_file: raw.bot_webhook_cert_file.unwrap_or_default(),
                     key_file: raw.bot_webhook_key_file.unwrap_or_default(),
                     secret_token: raw.bot_webhook_secret_token.unwrap_or_default(),
-                    update_buffer_size: parse_usize(
-                        "BOT_WEBHOOK_UPDATE_BUFFER_SIZE",
-                        raw.bot_webhook_update_buffer_size,
-                        DEFAULT_BOT_WEBHOOK_UPDATE_BUFFER_SIZE,
-                    )?,
                 },
                 activity_pulse: TelegramActivityPulseConfig {
                     enabled: parse_bool(
@@ -2853,6 +2921,11 @@ impl RawConfig {
             redis_password: env("REDIS_PASSWORD"),
             redis_db: env("REDIS_DB"),
             update_queue_backend: env("UPDATE_QUEUE_BACKEND"),
+            update_stream_redis_url: env("UPDATE_STREAM_REDIS_URL"),
+            update_materializer_batch_max_rows: env("UPDATE_MATERIALIZER_BATCH_MAX_ROWS"),
+            update_materializer_batch_max_bytes: env("UPDATE_MATERIALIZER_BATCH_MAX_BYTES"),
+            update_materializer_batch_max_wait_ms: env("UPDATE_MATERIALIZER_BATCH_MAX_WAIT_MS"),
+            update_materializer_db_timeout_ms: env("UPDATE_MATERIALIZER_DB_TIMEOUT_MS"),
             bot_key: env("BOT_KEY"),
             bot_api_base_url: env("BOT_API_BASE_URL"),
             bot_webhook_enabled: env("BOT_WEBHOOK_ENABLED"),
@@ -2860,7 +2933,6 @@ impl RawConfig {
             bot_webhook_cert_file: env("BOT_WEBHOOK_CERT_FILE"),
             bot_webhook_key_file: env("BOT_WEBHOOK_KEY_FILE"),
             bot_webhook_secret_token: env("BOT_WEBHOOK_SECRET_TOKEN"),
-            bot_webhook_update_buffer_size: env("BOT_WEBHOOK_UPDATE_BUFFER_SIZE"),
             telegram_activity_pulse_enabled: env("TELEGRAM_ACTIVITY_PULSE_ENABLED"),
             telegram_activity_pulse_interval_ms: env("TELEGRAM_ACTIVITY_PULSE_INTERVAL_MS"),
             telegram_activity_pulse_initial_delay_ms: env(
@@ -3243,7 +3315,7 @@ fn parse_update_queue_backend(value: Option<String>) -> Result<String, ConfigErr
         .unwrap_or_else(|| DEFAULT_UPDATE_QUEUE_BACKEND.to_owned())
         .to_ascii_lowercase();
     match backend.as_str() {
-        "list" | "stream" => Ok(backend),
+        "stream" => Ok(backend),
         _ => Err(ConfigError::InvalidUpdateQueueBackend { value: backend }),
     }
 }
@@ -3444,6 +3516,32 @@ fn validate_positive_i32_at_most(
     Ok(())
 }
 
+fn validate_positive_i32_returning_at_most(
+    name: &'static str,
+    value: i32,
+    max: i32,
+) -> Result<i32, ConfigError> {
+    validate_positive_i32_at_most(name, value, max)?;
+    Ok(value)
+}
+
+fn validate_usize_range(
+    name: &'static str,
+    value: usize,
+    min: usize,
+    max: usize,
+) -> Result<usize, ConfigError> {
+    if !(min..=max).contains(&value) {
+        return Err(ConfigError::UnsignedIntegerOutsideRange {
+            name,
+            value,
+            min,
+            max,
+        });
+    }
+    Ok(value)
+}
+
 fn validate_non_negative_i32(name: &'static str, value: i32) -> Result<i32, ConfigError> {
     if value < 0 {
         return Err(ConfigError::NegativeInteger { name, value });
@@ -3464,11 +3562,11 @@ mod tests {
         DEFAULT_BOOGU_IMAGE_TURBO_BASE_URL, DEFAULT_BOOGU_IMAGE_TURBO_ENABLED,
         DEFAULT_BOOGU_IMAGE_TURBO_HEIGHT, DEFAULT_BOOGU_IMAGE_TURBO_RESOLUTION,
         DEFAULT_BOOGU_IMAGE_TURBO_STEPS, DEFAULT_BOOGU_IMAGE_TURBO_WIDTH,
-        DEFAULT_BOT_WEBHOOK_UPDATE_BUFFER_SIZE, DEFAULT_DIALOG_AIFARM_POOL_BASE_URLS,
-        DEFAULT_DIALOG_AIFARM_POOL_MODELS, DEFAULT_DIALOG_MODEL, DEFAULT_DISCOVERY_BASE_URL,
-        DEFAULT_HISTORY_SUMMARY_PROVIDER, DEFAULT_HISTORY_SUMMARY_TIMEOUT_SECONDS,
-        DEFAULT_LLM_JOB_MAX_ATTEMPTS, DEFAULT_LOG_FILTER, DEFAULT_MARKET_RATES_TIMEOUT_SECONDS,
-        DEFAULT_MEMORY_CONSOLIDATION_MODEL, DEFAULT_OPENROUTER_REQUEST_TIMEOUT_SECONDS,
+        DEFAULT_DIALOG_AIFARM_POOL_BASE_URLS, DEFAULT_DIALOG_AIFARM_POOL_MODELS,
+        DEFAULT_DIALOG_MODEL, DEFAULT_DISCOVERY_BASE_URL, DEFAULT_HISTORY_SUMMARY_PROVIDER,
+        DEFAULT_HISTORY_SUMMARY_TIMEOUT_SECONDS, DEFAULT_LLM_JOB_MAX_ATTEMPTS, DEFAULT_LOG_FILTER,
+        DEFAULT_MARKET_RATES_TIMEOUT_SECONDS, DEFAULT_MEMORY_CONSOLIDATION_MODEL,
+        DEFAULT_OPENROUTER_REQUEST_TIMEOUT_SECONDS,
         DEFAULT_PERSISTENT_QUEUE_CLEANUP_INTERVAL_SECONDS,
         DEFAULT_PERSISTENT_QUEUE_COMPLETED_JOB_RETENTION_DAYS,
         DEFAULT_PERSISTENT_QUEUE_CONTROL_WORKERS,
@@ -3493,7 +3591,9 @@ mod tests {
         DEFAULT_SHIELD_QUERY_MAX_CHARS, DEFAULT_SHIELD_RETRIEVAL_TIMEOUT_SECONDS,
         DEFAULT_SHIELD_VECTOR_MIN_SCORE, DEFAULT_TELEGRAM_ACTIVITY_PULSE_ENABLED,
         DEFAULT_TELEGRAM_ACTIVITY_PULSE_INITIAL_DELAY_MS,
-        DEFAULT_TELEGRAM_ACTIVITY_PULSE_INTERVAL_MS, DEFAULT_UPDATE_QUEUE_BACKEND,
+        DEFAULT_TELEGRAM_ACTIVITY_PULSE_INTERVAL_MS, DEFAULT_UPDATE_MATERIALIZER_BATCH_MAX_BYTES,
+        DEFAULT_UPDATE_MATERIALIZER_BATCH_MAX_ROWS, DEFAULT_UPDATE_MATERIALIZER_BATCH_MAX_WAIT_MS,
+        DEFAULT_UPDATE_MATERIALIZER_DB_TIMEOUT_MS, DEFAULT_UPDATE_QUEUE_BACKEND,
         DEFAULT_VIP_CHAT_ID, DEFAULT_VISION_DIRECT_IMAGE_LIMIT, DEFAULT_VISION_MAX_TOKENS,
         DEFAULT_VISION_MODEL, DEFAULT_VISION_REQUEST_TIMEOUT_SECONDS, DEFAULT_WEBAPP_PORT,
         DEFAULT_WEBAPP_URL, MIN_TELEGRAM_ACTIVITY_PULSE_INTERVAL_MS, RawConfig,
@@ -3541,6 +3641,23 @@ mod tests {
         assert_eq!(config.redis.password, "");
         assert_eq!(config.redis.db, 0);
         assert_eq!(config.update_queue.backend, DEFAULT_UPDATE_QUEUE_BACKEND);
+        assert!(config.update_queue.stream_redis_url.is_empty());
+        assert_eq!(
+            config.update_queue.materializer_batch_max_rows,
+            DEFAULT_UPDATE_MATERIALIZER_BATCH_MAX_ROWS
+        );
+        assert_eq!(
+            config.update_queue.materializer_batch_max_bytes,
+            DEFAULT_UPDATE_MATERIALIZER_BATCH_MAX_BYTES
+        );
+        assert_eq!(
+            config.update_queue.materializer_batch_max_wait_ms,
+            DEFAULT_UPDATE_MATERIALIZER_BATCH_MAX_WAIT_MS
+        );
+        assert_eq!(
+            config.update_queue.materializer_db_timeout_ms,
+            DEFAULT_UPDATE_MATERIALIZER_DB_TIMEOUT_MS
+        );
         assert_eq!(config.translation.deepl.key, "");
         assert_eq!(config.translation.deepl.url, "");
         assert_eq!(config.bot.key, None);
@@ -3551,10 +3668,6 @@ mod tests {
         assert_eq!(config.bot.webhook.cert_file, "");
         assert_eq!(config.bot.webhook.key_file, "");
         assert_eq!(config.bot.webhook.secret_token, "");
-        assert_eq!(
-            config.bot.webhook.update_buffer_size,
-            DEFAULT_BOT_WEBHOOK_UPDATE_BUFFER_SIZE
-        );
         assert_eq!(
             config.bot.activity_pulse.enabled,
             DEFAULT_TELEGRAM_ACTIVITY_PULSE_ENABLED
@@ -4768,6 +4881,16 @@ mod tests {
         })?;
         assert_eq!(stream_config.update_queue.backend, "stream");
 
+        let legacy_list_error = AppConfig::from_raw(RawConfig {
+            update_queue_backend: Some("list".to_owned()),
+            ..RawConfig::default()
+        })
+        .err();
+        assert!(matches!(
+            legacy_list_error,
+            Some(super::ConfigError::InvalidUpdateQueueBackend { .. })
+        ));
+
         let error = AppConfig::from_raw(RawConfig {
             update_queue_backend: Some("sorted-set".to_owned()),
             ..RawConfig::default()
@@ -4776,6 +4899,56 @@ mod tests {
         assert!(matches!(
             error,
             Some(super::ConfigError::InvalidUpdateQueueBackend { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn update_stream_materializer_limits_are_validated() -> Result<(), super::ConfigError> {
+        let config = AppConfig::from_raw(RawConfig {
+            update_stream_redis_url: Some("redis://redis-ingress:6379/0".to_owned()),
+            update_materializer_batch_max_rows: Some("1000".to_owned()),
+            update_materializer_batch_max_bytes: Some((32 * 1024 * 1024).to_string()),
+            update_materializer_batch_max_wait_ms: Some("1000".to_owned()),
+            update_materializer_db_timeout_ms: Some("7000".to_owned()),
+            ..RawConfig::default()
+        })?;
+        assert_eq!(
+            config.update_queue.stream_redis_url,
+            "redis://redis-ingress:6379/0"
+        );
+        assert_eq!(config.update_queue.materializer_batch_max_rows, 1000);
+        assert_eq!(
+            config.update_queue.materializer_batch_max_bytes,
+            32 * 1024 * 1024
+        );
+        assert_eq!(config.update_queue.materializer_batch_max_wait_ms, 1000);
+        assert_eq!(config.update_queue.materializer_db_timeout_ms, 7000);
+
+        let error = AppConfig::from_raw(RawConfig {
+            update_materializer_batch_max_rows: Some("1001".to_owned()),
+            ..RawConfig::default()
+        })
+        .err();
+        assert!(matches!(
+            error,
+            Some(super::ConfigError::UnsignedIntegerOutsideRange {
+                name: "UPDATE_MATERIALIZER_BATCH_MAX_ROWS",
+                ..
+            })
+        ));
+
+        let error = AppConfig::from_raw(RawConfig {
+            update_materializer_batch_max_wait_ms: Some("1001".to_owned()),
+            ..RawConfig::default()
+        })
+        .err();
+        assert!(matches!(
+            error,
+            Some(super::ConfigError::IntegerExceedsMaximum {
+                name: "UPDATE_MATERIALIZER_BATCH_MAX_WAIT_MS",
+                ..
+            })
         ));
         Ok(())
     }
@@ -4897,7 +5070,6 @@ mod tests {
             bot_webhook_cert_file: Some("/cert.pem".to_owned()),
             bot_webhook_key_file: Some("/key.pem".to_owned()),
             bot_webhook_secret_token: Some("webhook-secret".to_owned()),
-            bot_webhook_update_buffer_size: Some("256".to_owned()),
             admins_admin_ids: Some(" 1001, 42 ".to_owned()),
             ..RawConfig::default()
         })?;
@@ -4913,7 +5085,6 @@ mod tests {
         assert_eq!(config.bot.webhook.cert_file, "/cert.pem");
         assert_eq!(config.bot.webhook.key_file, "/key.pem");
         assert_eq!(config.bot.webhook.secret_token, "webhook-secret");
-        assert_eq!(config.bot.webhook.update_buffer_size, 256);
         assert_eq!(config.admins.admin_ids, vec![1_001, 42]);
 
         Ok(())

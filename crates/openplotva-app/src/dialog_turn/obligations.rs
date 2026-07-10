@@ -643,7 +643,7 @@ async fn resolve_obligation(
                         .await;
                 }
             }
-            JobStatus::Pending | JobStatus::Processing => {
+            JobStatus::Pending | JobStatus::Processing | JobStatus::WaitingDelivery => {
                 resolve_in_flight_deadline(store, notifier, timeouts, now, obligation, report)
                     .await?;
             }
@@ -1147,6 +1147,12 @@ mod tests {
             queue_name: "image".to_owned(),
             status,
             job: new_image_gen_job_at(ImageGenJobParams::default(), base_time()),
+            available_at: None,
+            debounce_key: None,
+            lane_key: None,
+            source_update_ids: Vec::new(),
+            latest_update_id: None,
+            pending_dialog_inputs: Vec::new(),
             worker_id: None,
             started_at: None,
             execution_started_at: None,

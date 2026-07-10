@@ -8,6 +8,11 @@ pub type RuntimeApiSchema = Schema<RuntimeQuery, RuntimeMutation, EmptySubscript
 
 const RUNTIME_TASKMAN_LOWEST_PRIORITY: i32 = -4;
 const RUNTIME_VIRTUAL_DIALOG_SESSION_ID_MAX_CHARS: usize = 128;
+const RUNTIME_TELEGRAM_DELIVERY_LIST_DEFAULT: i32 = 100;
+const RUNTIME_TELEGRAM_DELIVERY_LIST_MAX: i32 = 500;
+const RUNTIME_TELEGRAM_OPERATION_ID_MAX_CHARS: usize = 512;
+const RUNTIME_TELEGRAM_DIAGNOSTIC_MAX_CHARS: usize = 2_048;
+const RUNTIME_TELEGRAM_LABEL_MAX_CHARS: usize = 512;
 
 /// Boxed future returned by runtime Redis diagnostic inspectors.
 pub type RuntimeRedisInspectorFuture<'a, T> =
@@ -28,6 +33,10 @@ pub type RuntimeSafetyCheckReaderFuture<'a> =
 /// Boxed future returned by runtime update diagnostic inspectors.
 pub type RuntimeUpdatesInspectorFuture<'a> =
     Pin<Box<dyn Future<Output = Result<RuntimeUpdatesRuntimeData, String>> + Send + 'a>>;
+
+/// Boxed future returned by durable Telegram ingress/outbox inspectors.
+pub type RuntimeTelegramDeliveryFuture<'a, T> =
+    Pin<Box<dyn Future<Output = Result<T, String>> + Send + 'a>>;
 
 /// Boxed future returned by runtime memory restart mutations.
 pub type RuntimeMemoryRestartFuture<'a> =
@@ -185,6 +194,60 @@ pub trait RuntimeUpdatesInspector: Send + Sync {
     fn snapshot<'a>(&'a self) -> RuntimeUpdatesInspectorFuture<'a>;
 }
 
+/// Runtime API boundary for durable Telegram inbox/outbox diagnostics and
+/// explicit operator recovery actions.
+pub trait RuntimeTelegramDeliveryInspector: Send + Sync {
+    fn update_inbox_stats<'a>(
+        &'a self,
+    ) -> RuntimeTelegramDeliveryFuture<'a, RuntimeTelegramUpdateInboxStatsData>;
+
+    fn update_inbox_item<'a>(
+        &'a self,
+        id: i64,
+    ) -> RuntimeTelegramDeliveryFuture<'a, Option<RuntimeTelegramUpdateInboxItemData>>;
+
+    fn update_inbox_items<'a>(
+        &'a self,
+        filter: RuntimeTelegramDeliveryListFilter,
+    ) -> RuntimeTelegramDeliveryFuture<'a, Vec<RuntimeTelegramUpdateInboxItemData>>;
+
+    fn update_inbox_attempts<'a>(
+        &'a self,
+        inbox_id: i64,
+        limit: i32,
+    ) -> RuntimeTelegramDeliveryFuture<'a, Vec<RuntimeTelegramUpdateAttemptData>>;
+
+    fn outbox_stats<'a>(
+        &'a self,
+    ) -> RuntimeTelegramDeliveryFuture<'a, RuntimeTelegramOutboxStatsData>;
+
+    fn outbox_item<'a>(
+        &'a self,
+        operation_id: &'a str,
+    ) -> RuntimeTelegramDeliveryFuture<'a, Option<RuntimeTelegramOutboxItemData>>;
+
+    fn outbox_items<'a>(
+        &'a self,
+        filter: RuntimeTelegramDeliveryListFilter,
+    ) -> RuntimeTelegramDeliveryFuture<'a, Vec<RuntimeTelegramOutboxItemData>>;
+
+    fn outbox_attempts<'a>(
+        &'a self,
+        outbox_id: i64,
+        limit: i32,
+    ) -> RuntimeTelegramDeliveryFuture<'a, Vec<RuntimeTelegramOutboxAttemptData>>;
+
+    fn retry_outbox<'a>(
+        &'a self,
+        request: RuntimeTelegramOutboxRetryRequest,
+    ) -> RuntimeTelegramDeliveryFuture<'a, RuntimeTelegramOutboxMutationResultData>;
+
+    fn cancel_outbox<'a>(
+        &'a self,
+        operation_id: String,
+    ) -> RuntimeTelegramDeliveryFuture<'a, RuntimeTelegramOutboxMutationResultData>;
+}
+
 /// Runtime API memory restart mutation boundary.
 pub trait RuntimeMemoryRestarter: Send + Sync {
     /// Retry failed memory runs and trigger the memory worker.
@@ -258,6 +321,7 @@ pub struct RuntimeApiLiveDiagnostics {
     pub log_inspector: Option<Arc<dyn RuntimeLogInspector>>,
     pub taskman_inspector: Option<Arc<dyn RuntimeTaskmanInspector>>,
     pub updates_inspector: Option<Arc<dyn RuntimeUpdatesInspector>>,
+    pub telegram_delivery_inspector: Option<Arc<dyn RuntimeTelegramDeliveryInspector>>,
     pub dispatcher_inspector: Option<Arc<dyn RuntimeDispatcherInspector>>,
     pub dispatcher_failure_inspector: Option<Arc<dyn RuntimeDispatcherFailureInspector>>,
     pub cache_inspector: Option<Arc<dyn RuntimeCacheInspector>>,
@@ -542,7 +606,7 @@ pub struct RuntimeTaskmanQueueDiagnosticsData {
 }
 
 /// Runtime API decoded-update runtime snapshot from a live inspector.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct RuntimeUpdatesRuntimeData {
     pub active: i32,
     pub state_active: i32,
@@ -556,6 +620,40 @@ pub struct RuntimeUpdatesRuntimeData {
     pub last_stall_at: Option<String>,
     pub tasks: Vec<RuntimeUpdatesTaskData>,
     pub gates: Option<RuntimeIngestionGatesData>,
+    pub stream_len: i64,
+    pub stream_group_lag: i64,
+    pub stream_pending: i64,
+    pub oldest_unmaterialized_ms: i64,
+    pub ingress_used_memory_bytes: i64,
+    pub ingress_maxmemory_bytes: i64,
+    pub ingress_maxmemory_policy: String,
+    pub ingress_aof_enabled: bool,
+    pub ingress_aof_current_size_bytes: i64,
+    pub ingress_aof_rewrite_in_progress: bool,
+    pub ingress_aof_last_write_status: String,
+    pub ingress_aof_last_rewrite_status: String,
+    pub materializer_batch_rows: i32,
+    pub materializer_batch_bytes: i64,
+    pub materializer_batch_fill_ratio: f64,
+    pub bulk_transaction_latency_ms: i64,
+    pub materialized_batches: i64,
+    pub inbox_insert_statements: i64,
+    pub quarantine_insert_statements: i64,
+    pub materialized_inserted: i64,
+    pub materialized_duplicates: i64,
+    pub materialized_conflicted: i64,
+    pub materialized_quarantined: i64,
+    pub materializer_reclaims: i64,
+    pub ack_delete_mismatches: i64,
+    pub materializer_db_failures: i64,
+    pub materializer_redis_failures: i64,
+    pub postgres_pending: i64,
+    pub postgres_retry_wait: i64,
+    pub postgres_dead_letter: i64,
+    pub event_to_redis_avg_ms: i64,
+    pub redis_to_postgres_avg_ms: i64,
+    pub materialization_to_claim_avg_ms: i64,
+    pub claim_to_taskman_avg_ms: i64,
 }
 
 /// Process-lifetime counters for the ingestion gates that consume a message
@@ -582,6 +680,176 @@ pub struct RuntimeUpdatesTaskData {
     pub chat_id: Option<i64>,
     pub user_id: Option<i64>,
     pub update: String,
+}
+
+/// Shared cursor filter for durable Telegram inbox/outbox lists.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeTelegramDeliveryListFilter {
+    pub before_id: Option<i64>,
+    pub state: Option<String>,
+    pub limit: i32,
+}
+
+/// Aggregate durable update-inbox diagnostics.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeTelegramUpdateInboxStatsData {
+    pub pending: i64,
+    pub processing: i64,
+    pub retry_wait: i64,
+    pub completed: i64,
+    pub ignored: i64,
+    pub dead_letter: i64,
+    pub payload_conflicts: i64,
+    pub quarantined: i64,
+    pub total_deliveries: i64,
+    pub oldest_pending_at: Option<String>,
+    pub oldest_retry_at: Option<String>,
+    pub oldest_lease_expiry: Option<String>,
+}
+
+/// One operator-visible durable update row. Raw update bytes are deliberately
+/// excluded from this API; payload identity and size are sufficient for
+/// correlation without exposing user content or credentials.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeTelegramUpdateInboxItemData {
+    pub id: i64,
+    pub bot_id: i64,
+    pub update_id: i64,
+    pub schema_version: i32,
+    pub source: String,
+    pub stream_ms: i64,
+    pub stream_seq: i64,
+    pub last_stream_ms: i64,
+    pub last_stream_seq: i64,
+    pub payload_size_bytes: i64,
+    pub payload_sha256: String,
+    pub payload_conflict: bool,
+    pub update_type: Option<String>,
+    pub telegram_event_at: Option<String>,
+    pub first_received_at: String,
+    pub last_received_at: String,
+    pub materialized_at: String,
+    pub delivery_count: i64,
+    pub ordering_key: String,
+    pub priority: i32,
+    pub chat_id: Option<i64>,
+    pub thread_id: Option<i32>,
+    pub user_id: Option<i64>,
+    pub status: String,
+    pub available_at: String,
+    pub attempt_count: i32,
+    pub lease_owner: Option<String>,
+    pub leased_until: Option<String>,
+    pub processing_started_at: Option<String>,
+    pub state_applied_at: Option<String>,
+    pub handler_completed_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub outcome: Option<String>,
+    pub ignored_reason: Option<String>,
+    pub last_error_class: Option<String>,
+    pub last_error: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// One durable update handler attempt.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeTelegramUpdateAttemptData {
+    pub attempt: i32,
+    pub lease_token: i64,
+    pub worker_id: String,
+    pub claimed_at: String,
+    pub state_started_at: Option<String>,
+    pub state_completed_at: Option<String>,
+    pub handler_started_at: Option<String>,
+    pub handler_completed_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub outcome: Option<String>,
+    pub error_class: Option<String>,
+    pub error: Option<String>,
+}
+
+/// Aggregate durable Telegram outbox diagnostics.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeTelegramOutboxStatsData {
+    pub pending: i64,
+    pub leased: i64,
+    pub retry_wait: i64,
+    pub delivered: i64,
+    pub ambiguous: i64,
+    pub dead_letter: i64,
+    pub expired: i64,
+    pub cancelled: i64,
+    pub protected_unresolved: i64,
+    pub oldest_pending_at: Option<String>,
+    pub oldest_lease_expiry: Option<String>,
+}
+
+/// One operator-visible durable outbound operation. Telegram request payloads,
+/// media bytes, and raw receipts are deliberately excluded from GraphQL.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeTelegramOutboxItemData {
+    pub id: i64,
+    pub operation_id: String,
+    pub batch_id: String,
+    pub part_index: i32,
+    pub bot_id: i64,
+    pub chat_id: Option<i64>,
+    pub thread_id: Option<i32>,
+    pub ordering_key: String,
+    pub causation_update_id: Option<i64>,
+    pub dialog_job_id: Option<i64>,
+    pub trigger_message_id: Option<i64>,
+    pub method_kind: String,
+    pub delivery_policy: String,
+    pub protected: bool,
+    pub priority: i32,
+    pub state: String,
+    pub available_at: String,
+    pub expires_at: Option<String>,
+    pub attempt_count: i32,
+    pub lease_owner: Option<String>,
+    pub leased_until: Option<String>,
+    pub last_error_class: Option<String>,
+    pub last_error: Option<String>,
+    pub response_kind: Option<String>,
+    pub telegram_message_ids: Vec<i64>,
+    pub has_receipt: bool,
+    pub confirmed_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// One durable outbound network attempt.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeTelegramOutboxAttemptData {
+    pub attempt: i32,
+    pub lease_token: i64,
+    pub worker_id: String,
+    pub claimed_at: String,
+    pub request_started_at: Option<String>,
+    pub response_received_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub outcome: Option<String>,
+    pub http_status: Option<i32>,
+    pub latency_ms: Option<i64>,
+    pub error_class: Option<String>,
+    pub error: Option<String>,
+}
+
+/// Operator-confirmed manual outbox retry request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeTelegramOutboxRetryRequest {
+    pub operation_id: String,
+    pub accept_duplicate_risk: bool,
+}
+
+/// Result of an explicit outbox operator action.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeTelegramOutboxMutationResultData {
+    pub operation_id: String,
+    pub changed: bool,
+    pub state: Option<String>,
 }
 
 /// Runtime API SQL read request after GraphQL/default shaping.
@@ -1256,6 +1524,7 @@ pub fn runtime_api_graphql_schema_with_live_diagnostics(
             log_inspector: diagnostics.log_inspector,
             taskman_inspector: diagnostics.taskman_inspector,
             updates_inspector: diagnostics.updates_inspector,
+            telegram_delivery_inspector: diagnostics.telegram_delivery_inspector.clone(),
             dispatcher_inspector: diagnostics.dispatcher_inspector,
             dispatcher_failure_inspector: diagnostics.dispatcher_failure_inspector,
             cache_inspector: diagnostics.cache_inspector,
@@ -1265,6 +1534,7 @@ pub fn runtime_api_graphql_schema_with_live_diagnostics(
             memory_restarter: diagnostics.memory_restarter,
             gemini_cache_purger: diagnostics.gemini_cache_purger,
             virtual_dialog_manager: diagnostics.virtual_dialog_manager,
+            telegram_delivery_inspector: diagnostics.telegram_delivery_inspector,
         },
         EmptySubscription,
     )
@@ -1285,6 +1555,7 @@ pub struct RuntimeQuery {
     log_inspector: Option<Arc<dyn RuntimeLogInspector>>,
     taskman_inspector: Option<Arc<dyn RuntimeTaskmanInspector>>,
     updates_inspector: Option<Arc<dyn RuntimeUpdatesInspector>>,
+    telegram_delivery_inspector: Option<Arc<dyn RuntimeTelegramDeliveryInspector>>,
     dispatcher_inspector: Option<Arc<dyn RuntimeDispatcherInspector>>,
     dispatcher_failure_inspector: Option<Arc<dyn RuntimeDispatcherFailureInspector>>,
     cache_inspector: Option<Arc<dyn RuntimeCacheInspector>>,
@@ -1295,6 +1566,7 @@ pub struct RuntimeMutation {
     memory_restarter: Option<Arc<dyn RuntimeMemoryRestarter>>,
     gemini_cache_purger: Option<Arc<dyn RuntimeGeminiCachePurger>>,
     virtual_dialog_manager: Option<Arc<dyn RuntimeVirtualDialogManager>>,
+    telegram_delivery_inspector: Option<Arc<dyn RuntimeTelegramDeliveryInspector>>,
 }
 
 #[Object]
@@ -1589,6 +1861,114 @@ impl RuntimeQuery {
             .map_err(async_graphql::Error::new)
     }
 
+    async fn telegram_update_inbox_stats(&self) -> async_graphql::Result<TelegramUpdateInboxStats> {
+        let inspector = self.telegram_delivery_inspector()?;
+        inspector
+            .update_inbox_stats()
+            .await
+            .map(TelegramUpdateInboxStats::from)
+            .map_err(async_graphql::Error::new)
+    }
+
+    async fn telegram_update_inbox(
+        &self,
+        id: ID,
+    ) -> async_graphql::Result<Option<TelegramUpdateInboxItem>> {
+        let inspector = self.telegram_delivery_inspector()?;
+        inspector
+            .update_inbox_item(parse_positive_id(id, "id")?)
+            .await
+            .map(|item| item.map(TelegramUpdateInboxItem::from))
+            .map_err(async_graphql::Error::new)
+    }
+
+    async fn telegram_update_inbox_items(
+        &self,
+        #[graphql(name = "beforeID")] before_id: Option<ID>,
+        state: Option<String>,
+        limit: Option<i32>,
+    ) -> async_graphql::Result<Vec<TelegramUpdateInboxItem>> {
+        let inspector = self.telegram_delivery_inspector()?;
+        inspector
+            .update_inbox_items(telegram_delivery_list_filter(before_id, state, limit)?)
+            .await
+            .map(|items| {
+                items
+                    .into_iter()
+                    .map(TelegramUpdateInboxItem::from)
+                    .collect()
+            })
+            .map_err(async_graphql::Error::new)
+    }
+
+    async fn telegram_update_inbox_attempts(
+        &self,
+        #[graphql(name = "inboxID")] inbox_id: ID,
+        limit: Option<i32>,
+    ) -> async_graphql::Result<Vec<TelegramUpdateAttempt>> {
+        let inspector = self.telegram_delivery_inspector()?;
+        inspector
+            .update_inbox_attempts(
+                parse_positive_id(inbox_id, "inboxID")?,
+                telegram_delivery_limit(limit),
+            )
+            .await
+            .map(|items| items.into_iter().map(TelegramUpdateAttempt::from).collect())
+            .map_err(async_graphql::Error::new)
+    }
+
+    async fn telegram_outbox_stats(&self) -> async_graphql::Result<TelegramOutboxStats> {
+        let inspector = self.telegram_delivery_inspector()?;
+        inspector
+            .outbox_stats()
+            .await
+            .map(TelegramOutboxStats::from)
+            .map_err(async_graphql::Error::new)
+    }
+
+    async fn telegram_outbox(
+        &self,
+        #[graphql(name = "operationID")] operation_id: ID,
+    ) -> async_graphql::Result<Option<TelegramOutboxItem>> {
+        let inspector = self.telegram_delivery_inspector()?;
+        let operation_id = normalize_telegram_operation_id(operation_id)?;
+        inspector
+            .outbox_item(&operation_id)
+            .await
+            .map(|item| item.map(TelegramOutboxItem::from))
+            .map_err(async_graphql::Error::new)
+    }
+
+    async fn telegram_outbox_items(
+        &self,
+        #[graphql(name = "beforeID")] before_id: Option<ID>,
+        state: Option<String>,
+        limit: Option<i32>,
+    ) -> async_graphql::Result<Vec<TelegramOutboxItem>> {
+        let inspector = self.telegram_delivery_inspector()?;
+        inspector
+            .outbox_items(telegram_delivery_list_filter(before_id, state, limit)?)
+            .await
+            .map(|items| items.into_iter().map(TelegramOutboxItem::from).collect())
+            .map_err(async_graphql::Error::new)
+    }
+
+    async fn telegram_outbox_attempts(
+        &self,
+        #[graphql(name = "outboxID")] outbox_id: ID,
+        limit: Option<i32>,
+    ) -> async_graphql::Result<Vec<TelegramOutboxAttempt>> {
+        let inspector = self.telegram_delivery_inspector()?;
+        inspector
+            .outbox_attempts(
+                parse_positive_id(outbox_id, "outboxID")?,
+                telegram_delivery_limit(limit),
+            )
+            .await
+            .map(|items| items.into_iter().map(TelegramOutboxAttempt::from).collect())
+            .map_err(async_graphql::Error::new)
+    }
+
     async fn logs(
         &self,
         after_seq: Option<ID>,
@@ -1687,6 +2067,16 @@ impl RuntimeQuery {
             elapsed_ms: result.elapsed_ms,
             truncated: result.truncated,
         })
+    }
+}
+
+impl RuntimeQuery {
+    fn telegram_delivery_inspector(
+        &self,
+    ) -> async_graphql::Result<&dyn RuntimeTelegramDeliveryInspector> {
+        self.telegram_delivery_inspector
+            .as_deref()
+            .ok_or_else(|| "telegram delivery inspector is not configured".into())
     }
 }
 
@@ -1880,6 +2270,50 @@ fn parse_id(value: ID, name: &str) -> async_graphql::Result<i64> {
         .map_err(|error| async_graphql::Error::new(format!("invalid {name}: {error}")))
 }
 
+fn parse_positive_id(value: ID, name: &str) -> async_graphql::Result<i64> {
+    let value = parse_id(value, name)?;
+    if value <= 0 {
+        return Err(format!("{name} must be positive").into());
+    }
+    Ok(value)
+}
+
+fn telegram_delivery_limit(limit: Option<i32>) -> i32 {
+    clamp_positive_range_i32(
+        limit.unwrap_or_default(),
+        RUNTIME_TELEGRAM_DELIVERY_LIST_DEFAULT,
+        RUNTIME_TELEGRAM_DELIVERY_LIST_MAX,
+    )
+}
+
+fn telegram_delivery_list_filter(
+    before_id: Option<ID>,
+    state: Option<String>,
+    limit: Option<i32>,
+) -> async_graphql::Result<RuntimeTelegramDeliveryListFilter> {
+    Ok(RuntimeTelegramDeliveryListFilter {
+        before_id: before_id
+            .map(|id| parse_positive_id(id, "beforeID"))
+            .transpose()?,
+        state: trim_nonempty(state).map(|state| bounded_text(&state, 64)),
+        limit: telegram_delivery_limit(limit),
+    })
+}
+
+fn normalize_telegram_operation_id(value: ID) -> async_graphql::Result<String> {
+    let value = value.as_str().trim();
+    if value.is_empty() {
+        return Err("operationID is required".into());
+    }
+    if value.chars().count() > RUNTIME_TELEGRAM_OPERATION_ID_MAX_CHARS {
+        return Err(format!(
+            "operationID must be at most {RUNTIME_TELEGRAM_OPERATION_ID_MAX_CHARS} characters"
+        )
+        .into());
+    }
+    Ok(value.to_owned())
+}
+
 fn trim_optional(value: Option<String>) -> String {
     value.unwrap_or_default().trim().to_owned()
 }
@@ -1917,6 +2351,38 @@ fn normalize_virtual_dialog_text(value: String) -> async_graphql::Result<String>
 
 #[Object]
 impl RuntimeMutation {
+    async fn retry_telegram_outbox(
+        &self,
+        #[graphql(name = "operationID")] operation_id: ID,
+        #[graphql(name = "acceptDuplicateRisk")] accept_duplicate_risk: Option<bool>,
+    ) -> async_graphql::Result<TelegramOutboxMutationResult> {
+        let inspector = self.telegram_delivery_inspector.as_deref().ok_or_else(|| {
+            async_graphql::Error::new("telegram delivery inspector is not configured")
+        })?;
+        inspector
+            .retry_outbox(RuntimeTelegramOutboxRetryRequest {
+                operation_id: normalize_telegram_operation_id(operation_id)?,
+                accept_duplicate_risk: accept_duplicate_risk.unwrap_or(false),
+            })
+            .await
+            .map(TelegramOutboxMutationResult::from)
+            .map_err(async_graphql::Error::new)
+    }
+
+    async fn cancel_telegram_outbox(
+        &self,
+        #[graphql(name = "operationID")] operation_id: ID,
+    ) -> async_graphql::Result<TelegramOutboxMutationResult> {
+        let inspector = self.telegram_delivery_inspector.as_deref().ok_or_else(|| {
+            async_graphql::Error::new("telegram delivery inspector is not configured")
+        })?;
+        inspector
+            .cancel_outbox(normalize_telegram_operation_id(operation_id)?)
+            .await
+            .map(TelegramOutboxMutationResult::from)
+            .map_err(async_graphql::Error::new)
+    }
+
     async fn restart_memory(
         &self,
         #[graphql(name = "runID")] run_id: Option<ID>,
@@ -3602,6 +4068,40 @@ struct UpdatesRuntime {
     last_stall_at: Option<String>,
     tasks: Vec<UpdatesTask>,
     gates: Option<IngestionGates>,
+    stream_len: i64,
+    stream_group_lag: i64,
+    stream_pending: i64,
+    oldest_unmaterialized_ms: i64,
+    ingress_used_memory_bytes: i64,
+    ingress_maxmemory_bytes: i64,
+    ingress_maxmemory_policy: String,
+    ingress_aof_enabled: bool,
+    ingress_aof_current_size_bytes: i64,
+    ingress_aof_rewrite_in_progress: bool,
+    ingress_aof_last_write_status: String,
+    ingress_aof_last_rewrite_status: String,
+    materializer_batch_rows: i32,
+    materializer_batch_bytes: i64,
+    materializer_batch_fill_ratio: f64,
+    bulk_transaction_latency_ms: i64,
+    materialized_batches: i64,
+    inbox_insert_statements: i64,
+    quarantine_insert_statements: i64,
+    materialized_inserted: i64,
+    materialized_duplicates: i64,
+    materialized_conflicted: i64,
+    materialized_quarantined: i64,
+    materializer_reclaims: i64,
+    ack_delete_mismatches: i64,
+    materializer_db_failures: i64,
+    materializer_redis_failures: i64,
+    postgres_pending: i64,
+    postgres_retry_wait: i64,
+    postgres_dead_letter: i64,
+    event_to_redis_avg_ms: i64,
+    redis_to_postgres_avg_ms: i64,
+    materialization_to_claim_avg_ms: i64,
+    claim_to_taskman_avg_ms: i64,
 }
 
 impl From<RuntimeUpdatesRuntimeData> for UpdatesRuntime {
@@ -3619,6 +4119,40 @@ impl From<RuntimeUpdatesRuntimeData> for UpdatesRuntime {
             last_stall_at: runtime.last_stall_at,
             tasks: runtime.tasks.into_iter().map(UpdatesTask::from).collect(),
             gates: runtime.gates.map(IngestionGates::from),
+            stream_len: runtime.stream_len,
+            stream_group_lag: runtime.stream_group_lag,
+            stream_pending: runtime.stream_pending,
+            oldest_unmaterialized_ms: runtime.oldest_unmaterialized_ms,
+            ingress_used_memory_bytes: runtime.ingress_used_memory_bytes,
+            ingress_maxmemory_bytes: runtime.ingress_maxmemory_bytes,
+            ingress_maxmemory_policy: runtime.ingress_maxmemory_policy,
+            ingress_aof_enabled: runtime.ingress_aof_enabled,
+            ingress_aof_current_size_bytes: runtime.ingress_aof_current_size_bytes,
+            ingress_aof_rewrite_in_progress: runtime.ingress_aof_rewrite_in_progress,
+            ingress_aof_last_write_status: runtime.ingress_aof_last_write_status,
+            ingress_aof_last_rewrite_status: runtime.ingress_aof_last_rewrite_status,
+            materializer_batch_rows: runtime.materializer_batch_rows,
+            materializer_batch_bytes: runtime.materializer_batch_bytes,
+            materializer_batch_fill_ratio: runtime.materializer_batch_fill_ratio,
+            bulk_transaction_latency_ms: runtime.bulk_transaction_latency_ms,
+            materialized_batches: runtime.materialized_batches,
+            inbox_insert_statements: runtime.inbox_insert_statements,
+            quarantine_insert_statements: runtime.quarantine_insert_statements,
+            materialized_inserted: runtime.materialized_inserted,
+            materialized_duplicates: runtime.materialized_duplicates,
+            materialized_conflicted: runtime.materialized_conflicted,
+            materialized_quarantined: runtime.materialized_quarantined,
+            materializer_reclaims: runtime.materializer_reclaims,
+            ack_delete_mismatches: runtime.ack_delete_mismatches,
+            materializer_db_failures: runtime.materializer_db_failures,
+            materializer_redis_failures: runtime.materializer_redis_failures,
+            postgres_pending: runtime.postgres_pending,
+            postgres_retry_wait: runtime.postgres_retry_wait,
+            postgres_dead_letter: runtime.postgres_dead_letter,
+            event_to_redis_avg_ms: runtime.event_to_redis_avg_ms,
+            redis_to_postgres_avg_ms: runtime.redis_to_postgres_avg_ms,
+            materialization_to_claim_avg_ms: runtime.materialization_to_claim_avg_ms,
+            claim_to_taskman_avg_ms: runtime.claim_to_taskman_avg_ms,
         }
     }
 }
@@ -3673,6 +4207,348 @@ impl From<RuntimeUpdatesTaskData> for UpdatesTask {
             chat_id: task.chat_id.map(|id| ID(id.to_string())),
             user_id: task.user_id.map(|id| ID(id.to_string())),
             update: task.update,
+        }
+    }
+}
+
+#[derive(Clone, Default, SimpleObject)]
+struct TelegramUpdateInboxStats {
+    pending: i64,
+    processing: i64,
+    retry_wait: i64,
+    completed: i64,
+    ignored: i64,
+    dead_letter: i64,
+    payload_conflicts: i64,
+    quarantined: i64,
+    total_deliveries: i64,
+    oldest_pending_at: Option<String>,
+    oldest_retry_at: Option<String>,
+    oldest_lease_expiry: Option<String>,
+}
+
+impl From<RuntimeTelegramUpdateInboxStatsData> for TelegramUpdateInboxStats {
+    fn from(stats: RuntimeTelegramUpdateInboxStatsData) -> Self {
+        Self {
+            pending: stats.pending,
+            processing: stats.processing,
+            retry_wait: stats.retry_wait,
+            completed: stats.completed,
+            ignored: stats.ignored,
+            dead_letter: stats.dead_letter,
+            payload_conflicts: stats.payload_conflicts,
+            quarantined: stats.quarantined,
+            total_deliveries: stats.total_deliveries,
+            oldest_pending_at: bounded_optional_label(stats.oldest_pending_at),
+            oldest_retry_at: bounded_optional_label(stats.oldest_retry_at),
+            oldest_lease_expiry: bounded_optional_label(stats.oldest_lease_expiry),
+        }
+    }
+}
+
+#[derive(Clone, SimpleObject)]
+struct TelegramUpdateInboxItem {
+    id: ID,
+    #[graphql(name = "botID")]
+    bot_id: ID,
+    #[graphql(name = "updateID")]
+    update_id: ID,
+    schema_version: i32,
+    source: String,
+    stream_ms: ID,
+    stream_seq: ID,
+    last_stream_ms: ID,
+    last_stream_seq: ID,
+    payload_size_bytes: i64,
+    payload_sha256: String,
+    payload_conflict: bool,
+    update_type: Option<String>,
+    telegram_event_at: Option<String>,
+    first_received_at: String,
+    last_received_at: String,
+    materialized_at: String,
+    delivery_count: i64,
+    ordering_key: String,
+    priority: i32,
+    #[graphql(name = "chatID")]
+    chat_id: Option<ID>,
+    #[graphql(name = "threadID")]
+    thread_id: Option<i32>,
+    #[graphql(name = "userID")]
+    user_id: Option<ID>,
+    status: String,
+    available_at: String,
+    attempt_count: i32,
+    lease_owner: Option<String>,
+    leased_until: Option<String>,
+    processing_started_at: Option<String>,
+    state_applied_at: Option<String>,
+    handler_completed_at: Option<String>,
+    completed_at: Option<String>,
+    outcome: Option<String>,
+    ignored_reason: Option<String>,
+    last_error_class: Option<String>,
+    last_error: Option<String>,
+    created_at: String,
+    updated_at: String,
+}
+
+impl From<RuntimeTelegramUpdateInboxItemData> for TelegramUpdateInboxItem {
+    fn from(item: RuntimeTelegramUpdateInboxItemData) -> Self {
+        Self {
+            id: ID(item.id.to_string()),
+            bot_id: ID(item.bot_id.to_string()),
+            update_id: ID(item.update_id.to_string()),
+            schema_version: item.schema_version,
+            source: bounded_text(&item.source, 64),
+            stream_ms: ID(item.stream_ms.to_string()),
+            stream_seq: ID(item.stream_seq.to_string()),
+            last_stream_ms: ID(item.last_stream_ms.to_string()),
+            last_stream_seq: ID(item.last_stream_seq.to_string()),
+            payload_size_bytes: item.payload_size_bytes.max(0),
+            payload_sha256: bounded_text(&item.payload_sha256, 128),
+            payload_conflict: item.payload_conflict,
+            update_type: bounded_optional_label(item.update_type),
+            telegram_event_at: bounded_optional_label(item.telegram_event_at),
+            first_received_at: bounded_text(&item.first_received_at, 128),
+            last_received_at: bounded_text(&item.last_received_at, 128),
+            materialized_at: bounded_text(&item.materialized_at, 128),
+            delivery_count: item.delivery_count.max(0),
+            ordering_key: bounded_text(&item.ordering_key, RUNTIME_TELEGRAM_LABEL_MAX_CHARS),
+            priority: item.priority,
+            chat_id: item.chat_id.map(|id| ID(id.to_string())),
+            thread_id: item.thread_id,
+            user_id: item.user_id.map(|id| ID(id.to_string())),
+            status: bounded_text(&item.status, 64),
+            available_at: bounded_text(&item.available_at, 128),
+            attempt_count: item.attempt_count.max(0),
+            lease_owner: bounded_optional_label(item.lease_owner),
+            leased_until: bounded_optional_label(item.leased_until),
+            processing_started_at: bounded_optional_label(item.processing_started_at),
+            state_applied_at: bounded_optional_label(item.state_applied_at),
+            handler_completed_at: bounded_optional_label(item.handler_completed_at),
+            completed_at: bounded_optional_label(item.completed_at),
+            outcome: bounded_optional_label(item.outcome),
+            ignored_reason: bounded_optional_diagnostic(item.ignored_reason),
+            last_error_class: bounded_optional_label(item.last_error_class),
+            last_error: bounded_optional_diagnostic(item.last_error),
+            created_at: bounded_text(&item.created_at, 128),
+            updated_at: bounded_text(&item.updated_at, 128),
+        }
+    }
+}
+
+#[derive(Clone, SimpleObject)]
+struct TelegramUpdateAttempt {
+    attempt: i32,
+    lease_token: ID,
+    #[graphql(name = "workerID")]
+    worker_id: String,
+    claimed_at: String,
+    state_started_at: Option<String>,
+    state_completed_at: Option<String>,
+    handler_started_at: Option<String>,
+    handler_completed_at: Option<String>,
+    finished_at: Option<String>,
+    outcome: Option<String>,
+    error_class: Option<String>,
+    error: Option<String>,
+}
+
+impl From<RuntimeTelegramUpdateAttemptData> for TelegramUpdateAttempt {
+    fn from(attempt: RuntimeTelegramUpdateAttemptData) -> Self {
+        Self {
+            attempt: attempt.attempt.max(0),
+            lease_token: ID(attempt.lease_token.to_string()),
+            worker_id: bounded_text(&attempt.worker_id, RUNTIME_TELEGRAM_LABEL_MAX_CHARS),
+            claimed_at: bounded_text(&attempt.claimed_at, 128),
+            state_started_at: bounded_optional_label(attempt.state_started_at),
+            state_completed_at: bounded_optional_label(attempt.state_completed_at),
+            handler_started_at: bounded_optional_label(attempt.handler_started_at),
+            handler_completed_at: bounded_optional_label(attempt.handler_completed_at),
+            finished_at: bounded_optional_label(attempt.finished_at),
+            outcome: bounded_optional_label(attempt.outcome),
+            error_class: bounded_optional_label(attempt.error_class),
+            error: bounded_optional_diagnostic(attempt.error),
+        }
+    }
+}
+
+#[derive(Clone, Default, SimpleObject)]
+struct TelegramOutboxStats {
+    pending: i64,
+    leased: i64,
+    retry_wait: i64,
+    delivered: i64,
+    ambiguous: i64,
+    dead_letter: i64,
+    expired: i64,
+    cancelled: i64,
+    protected_unresolved: i64,
+    oldest_pending_at: Option<String>,
+    oldest_lease_expiry: Option<String>,
+}
+
+impl From<RuntimeTelegramOutboxStatsData> for TelegramOutboxStats {
+    fn from(stats: RuntimeTelegramOutboxStatsData) -> Self {
+        Self {
+            pending: stats.pending,
+            leased: stats.leased,
+            retry_wait: stats.retry_wait,
+            delivered: stats.delivered,
+            ambiguous: stats.ambiguous,
+            dead_letter: stats.dead_letter,
+            expired: stats.expired,
+            cancelled: stats.cancelled,
+            protected_unresolved: stats.protected_unresolved,
+            oldest_pending_at: bounded_optional_label(stats.oldest_pending_at),
+            oldest_lease_expiry: bounded_optional_label(stats.oldest_lease_expiry),
+        }
+    }
+}
+
+#[derive(Clone, SimpleObject)]
+struct TelegramOutboxItem {
+    id: ID,
+    #[graphql(name = "operationID")]
+    operation_id: ID,
+    #[graphql(name = "batchID")]
+    batch_id: ID,
+    part_index: i32,
+    #[graphql(name = "botID")]
+    bot_id: ID,
+    #[graphql(name = "chatID")]
+    chat_id: Option<ID>,
+    #[graphql(name = "threadID")]
+    thread_id: Option<i32>,
+    ordering_key: String,
+    #[graphql(name = "causationUpdateID")]
+    causation_update_id: Option<ID>,
+    #[graphql(name = "dialogJobID")]
+    dialog_job_id: Option<ID>,
+    #[graphql(name = "triggerMessageID")]
+    trigger_message_id: Option<ID>,
+    method_kind: String,
+    delivery_policy: String,
+    protected: bool,
+    priority: i32,
+    state: String,
+    available_at: String,
+    expires_at: Option<String>,
+    attempt_count: i32,
+    lease_owner: Option<String>,
+    leased_until: Option<String>,
+    last_error_class: Option<String>,
+    last_error: Option<String>,
+    response_kind: Option<String>,
+    #[graphql(name = "telegramMessageIDs")]
+    telegram_message_ids: Vec<ID>,
+    has_receipt: bool,
+    confirmed_at: Option<String>,
+    created_at: String,
+    updated_at: String,
+}
+
+impl From<RuntimeTelegramOutboxItemData> for TelegramOutboxItem {
+    fn from(item: RuntimeTelegramOutboxItemData) -> Self {
+        Self {
+            id: ID(item.id.to_string()),
+            operation_id: ID(bounded_text(
+                &item.operation_id,
+                RUNTIME_TELEGRAM_OPERATION_ID_MAX_CHARS,
+            )),
+            batch_id: ID(bounded_text(
+                &item.batch_id,
+                RUNTIME_TELEGRAM_OPERATION_ID_MAX_CHARS,
+            )),
+            part_index: item.part_index.max(0),
+            bot_id: ID(item.bot_id.to_string()),
+            chat_id: item.chat_id.map(|id| ID(id.to_string())),
+            thread_id: item.thread_id,
+            ordering_key: bounded_text(&item.ordering_key, RUNTIME_TELEGRAM_LABEL_MAX_CHARS),
+            causation_update_id: item.causation_update_id.map(|id| ID(id.to_string())),
+            dialog_job_id: item.dialog_job_id.map(|id| ID(id.to_string())),
+            trigger_message_id: item.trigger_message_id.map(|id| ID(id.to_string())),
+            method_kind: bounded_text(&item.method_kind, 128),
+            delivery_policy: bounded_text(&item.delivery_policy, 64),
+            protected: item.protected,
+            priority: item.priority,
+            state: bounded_text(&item.state, 64),
+            available_at: bounded_text(&item.available_at, 128),
+            expires_at: bounded_optional_label(item.expires_at),
+            attempt_count: item.attempt_count.max(0),
+            lease_owner: bounded_optional_label(item.lease_owner),
+            leased_until: bounded_optional_label(item.leased_until),
+            last_error_class: bounded_optional_label(item.last_error_class),
+            last_error: bounded_optional_diagnostic(item.last_error),
+            response_kind: bounded_optional_label(item.response_kind),
+            telegram_message_ids: item
+                .telegram_message_ids
+                .into_iter()
+                .map(|id| ID(id.to_string()))
+                .collect(),
+            has_receipt: item.has_receipt,
+            confirmed_at: bounded_optional_label(item.confirmed_at),
+            created_at: bounded_text(&item.created_at, 128),
+            updated_at: bounded_text(&item.updated_at, 128),
+        }
+    }
+}
+
+#[derive(Clone, SimpleObject)]
+struct TelegramOutboxAttempt {
+    attempt: i32,
+    lease_token: ID,
+    #[graphql(name = "workerID")]
+    worker_id: String,
+    claimed_at: String,
+    request_started_at: Option<String>,
+    response_received_at: Option<String>,
+    finished_at: Option<String>,
+    outcome: Option<String>,
+    #[graphql(name = "httpStatus")]
+    http_status: Option<i32>,
+    latency_ms: Option<i64>,
+    error_class: Option<String>,
+    error: Option<String>,
+}
+
+impl From<RuntimeTelegramOutboxAttemptData> for TelegramOutboxAttempt {
+    fn from(attempt: RuntimeTelegramOutboxAttemptData) -> Self {
+        Self {
+            attempt: attempt.attempt.max(0),
+            lease_token: ID(attempt.lease_token.to_string()),
+            worker_id: bounded_text(&attempt.worker_id, RUNTIME_TELEGRAM_LABEL_MAX_CHARS),
+            claimed_at: bounded_text(&attempt.claimed_at, 128),
+            request_started_at: bounded_optional_label(attempt.request_started_at),
+            response_received_at: bounded_optional_label(attempt.response_received_at),
+            finished_at: bounded_optional_label(attempt.finished_at),
+            outcome: bounded_optional_label(attempt.outcome),
+            http_status: attempt.http_status,
+            latency_ms: attempt.latency_ms.map(|value| value.max(0)),
+            error_class: bounded_optional_label(attempt.error_class),
+            error: bounded_optional_diagnostic(attempt.error),
+        }
+    }
+}
+
+#[derive(Clone, SimpleObject)]
+struct TelegramOutboxMutationResult {
+    #[graphql(name = "operationID")]
+    operation_id: ID,
+    changed: bool,
+    state: Option<String>,
+}
+
+impl From<RuntimeTelegramOutboxMutationResultData> for TelegramOutboxMutationResult {
+    fn from(result: RuntimeTelegramOutboxMutationResultData) -> Self {
+        Self {
+            operation_id: ID(bounded_text(
+                &result.operation_id,
+                RUNTIME_TELEGRAM_OPERATION_ID_MAX_CHARS,
+            )),
+            changed: result.changed,
+            state: bounded_optional_label(result.state),
         }
     }
 }
@@ -3791,4 +4667,55 @@ fn trim_nonempty(value: Option<String>) -> Option<String> {
     value
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
+}
+
+fn bounded_text(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
+}
+
+fn bounded_optional_label(value: Option<String>) -> Option<String> {
+    value.map(|value| bounded_text(&value, RUNTIME_TELEGRAM_LABEL_MAX_CHARS))
+}
+
+fn bounded_optional_diagnostic(value: Option<String>) -> Option<String> {
+    value.map(|value| {
+        bounded_text(
+            &redact_telegram_bot_api_token(&value),
+            RUNTIME_TELEGRAM_DIAGNOSTIC_MAX_CHARS,
+        )
+    })
+}
+
+fn redact_telegram_bot_api_token(value: &str) -> String {
+    const MARKER: &str = "api.telegram.org/bot";
+    let mut redacted = value.to_owned();
+    let mut search_from = 0;
+    while let Some(relative) = redacted[search_from..].find(MARKER) {
+        let token_start = search_from + relative + MARKER.len();
+        let token_end = redacted[token_start..]
+            .find(|character: char| {
+                character == '/'
+                    || character == '?'
+                    || character == '#'
+                    || character.is_whitespace()
+                    || matches!(character, '"' | '\'' | ')' | ']')
+            })
+            .map_or(redacted.len(), |end| token_start + end);
+        let candidate = &redacted[token_start..token_end];
+        let looks_like_token = candidate.split_once(':').is_some_and(|(bot_id, secret)| {
+            !bot_id.is_empty()
+                && bot_id.bytes().all(|byte| byte.is_ascii_digit())
+                && secret.len() >= 16
+        });
+        if looks_like_token {
+            redacted.replace_range(token_start..token_end, "<redacted>");
+            search_from = token_start + "<redacted>".len();
+        } else {
+            search_from = token_start;
+        }
+        if search_from >= redacted.len() {
+            break;
+        }
+    }
+    redacted
 }

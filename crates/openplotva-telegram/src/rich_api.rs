@@ -100,6 +100,7 @@ impl RichApiClient {
     ) -> Result<Self, RichApiError> {
         let http = reqwest::Client::builder()
             .tls_backend_rustls()
+            .no_proxy()
             .connect_timeout(TELEGRAM_HTTP_CONNECT_TIMEOUT)
             .timeout(TELEGRAM_HTTP_REQUEST_TIMEOUT)
             .build()?;
@@ -178,7 +179,17 @@ impl RichApiClient {
         body: Value,
     ) -> Result<T, RichApiError> {
         let url = format!("{}/bot{}/{}", self.base_url, self.token, method);
-        let text = self.http.post(url).json(&body).send().await?.text().await?;
+        let response = self
+            .http
+            .post(url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|error| RichApiError::Http(error.without_url()))?;
+        let text = response
+            .text()
+            .await
+            .map_err(|error| RichApiError::Http(error.without_url()))?;
         parse_api_response::<T>(&text)
     }
 }
@@ -365,5 +376,24 @@ mod tests {
         .expect_err("not-modified API error should be surfaced");
         assert!(err.is_not_modified());
         assert_eq!(err.retry_after(), None);
+    }
+
+    #[tokio::test]
+    async fn transport_error_never_contains_bot_token_url() {
+        const SECRET: &str = "123456:super-secret-token";
+        let client = RichApiClient::with_base_url(SECRET, "http://127.0.0.1:1")
+            .expect("client construction");
+
+        let error = client
+            .send_rich_message(42, "hello", &RichSendOptions::default())
+            .await
+            .expect_err("closed loopback port must fail");
+        let rendered = error.to_string();
+
+        assert!(!rendered.contains(SECRET), "secret leaked: {rendered}");
+        assert!(
+            !rendered.contains("/bot"),
+            "credential URL leaked: {rendered}"
+        );
     }
 }

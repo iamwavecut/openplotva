@@ -3,19 +3,80 @@
 
 use std::{fmt, sync::Arc};
 
-use openplotva_taskman::DialogJobParams;
+use openplotva_storage::{
+    PostgresTelegramOutboxStore, TelegramDeliveryPolicy, TelegramOutboxBatchInput,
+    TelegramOutboxPartInput,
+};
+use openplotva_taskman::{DEFAULT_PRIORITY, DialogJobParams};
 use openplotva_telegram::{
     ChatRef, DispatcherQueue, ReplyMessageRef, RichMessageRequest, TELEGRAM_PARSE_MODE_HTML,
-    TextMessageRequest,
+    TelegramOutboundMethod, TextMessageRequest, build_rich_message_method,
+    build_text_message_methods, snapshot_outbound_method,
 };
+use sqlx::Row;
 use thiserror::Error;
+use time::OffsetDateTime;
 
 use crate::virtual_messages::{
     QueueRichRequest, QueueTextRequest, VirtualIdFactory, monotonic_virtual_id_factory,
     queue_rich_message, queue_text_message_parts,
 };
 
-use super::{DialogJobEffectFuture, dialog_response_requires_rich};
+use super::{
+    DialogJobEffectFuture, DialogJobReceiptFuture, DialogJobReceiptLookupFuture,
+    dialog_response_requires_rich,
+};
+
+/// Identity returned after all final-answer parts were accepted by one queue.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueuedBatchReceipt {
+    pub batch_id: String,
+    pub operation_ids: Vec<String>,
+    delivery: QueuedDelivery,
+    delivery_complete: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QueuedDelivery {
+    Dispatcher,
+    DurableOutbox,
+}
+
+impl QueuedBatchReceipt {
+    pub(crate) fn dispatcher(batch_id: String, operation_ids: Vec<String>) -> Self {
+        Self {
+            batch_id,
+            operation_ids,
+            delivery: QueuedDelivery::Dispatcher,
+            delivery_complete: false,
+        }
+    }
+
+    pub(crate) fn durable_outbox(
+        batch_id: String,
+        operation_ids: Vec<String>,
+        delivery_complete: bool,
+    ) -> Self {
+        Self {
+            batch_id,
+            operation_ids,
+            delivery: QueuedDelivery::DurableOutbox,
+            delivery_complete,
+        }
+    }
+
+    /// Whether taskman must wait for real Telegram receipts before completion.
+    #[must_use]
+    pub fn requires_delivery_wait(&self) -> bool {
+        self.delivery == QueuedDelivery::DurableOutbox
+    }
+
+    /// Whether every durable part already has a real Telegram receipt.
+    #[must_use]
+    pub fn delivery_complete(&self) -> bool {
+        self.requires_delivery_wait() && self.delivery_complete
+    }
+}
 
 /// Side effects performed after a provider returns a dialog answer.
 pub trait DialogJobEffects {
@@ -24,9 +85,21 @@ pub trait DialogJobEffects {
 
     fn send_dialog_answer<'a>(
         &'a self,
+        dialog_job_id: i64,
+        causation_update_id: Option<i64>,
         params: &'a DialogJobParams,
         answer: &'a str,
-    ) -> DialogJobEffectFuture<'a, Self::Error>;
+    ) -> DialogJobReceiptFuture<'a, Self::Error>;
+
+    /// Return the already committed final-answer batch, if a crash happened
+    /// after its Postgres transaction but before taskman entered
+    /// `WaitingDelivery`. The default keeps legacy/test effects compatible.
+    fn queued_dialog_answer<'a>(
+        &'a self,
+        _dialog_job_id: i64,
+    ) -> DialogJobReceiptLookupFuture<'a, Self::Error> {
+        Box::pin(async { Ok(None) })
+    }
 
     /// Queue one intermediate session message (`send_message` tool or text
     /// alongside tool calls). `seq` is the 1-based per-session send counter;
@@ -45,6 +118,13 @@ pub trait DialogJobEffects {
 pub struct DialogDispatcherEffects {
     queue: Arc<DispatcherQueue>,
     next_virtual_id: VirtualIdFactory,
+    durable_outbox: Option<DurableDialogOutbox>,
+}
+
+#[derive(Clone)]
+struct DurableDialogOutbox {
+    store: PostgresTelegramOutboxStore,
+    bot_id: i64,
 }
 
 impl DialogDispatcherEffects {
@@ -53,7 +133,17 @@ impl DialogDispatcherEffects {
         Self {
             queue,
             next_virtual_id: monotonic_virtual_id_factory("dialog-vmsg"),
+            durable_outbox: None,
         }
+    }
+
+    /// Route final answers through the Postgres outbox. Intermediate session
+    /// messages remain on the dispatcher until their own durable operation
+    /// families are migrated.
+    #[must_use]
+    pub fn with_durable_outbox(mut self, store: PostgresTelegramOutboxStore, bot_id: i64) -> Self {
+        self.durable_outbox = Some(DurableDialogOutbox { store, bot_id });
+        self
     }
 
     #[must_use]
@@ -68,6 +158,12 @@ impl DialogDispatcherEffects {
 pub enum DialogDispatchEffectError {
     #[error("failed to queue dialog answer: {0}")]
     Queue(#[from] openplotva_telegram::OutboundBuildError),
+    #[error("failed to persist dialog answer in Telegram outbox: {0}")]
+    Outbox(#[from] openplotva_storage::StorageError),
+    #[error("failed to encode dialog answer for Telegram outbox: {0}")]
+    Encode(#[from] serde_json::Error),
+    #[error("Telegram method {0} cannot be persisted in the durable outbox")]
+    UnsupportedMethod(&'static str),
 }
 
 impl DialogJobEffects for DialogDispatcherEffects {
@@ -75,9 +171,11 @@ impl DialogJobEffects for DialogDispatcherEffects {
 
     fn send_dialog_answer<'a>(
         &'a self,
+        dialog_job_id: i64,
+        causation_update_id: Option<i64>,
         params: &'a DialogJobParams,
         answer: &'a str,
-    ) -> DialogJobEffectFuture<'a, Self::Error> {
+    ) -> DialogJobReceiptFuture<'a, Self::Error> {
         Box::pin(async move {
             let chat = ChatRef {
                 id: params.chat_id,
@@ -89,12 +187,24 @@ impl DialogJobEffects for DialogDispatcherEffects {
                 is_topic_message: params.thread_id.is_some(),
                 message_thread_id: params.thread_id.map(i64::from).unwrap_or_default(),
             };
+            if let Some(outbox) = &self.durable_outbox {
+                return enqueue_durable_dialog_answer(
+                    outbox,
+                    dialog_job_id,
+                    causation_update_id,
+                    params,
+                    answer,
+                    chat,
+                    &reply_to,
+                )
+                .await;
+            }
             // Dialog answers must survive queue trims, and the reply-scoped
             // debounce key stops identical answers to different trigger
             // messages from deduping each other (a duplicate reply to the
             // same message is still suppressed).
             let debounce_key = format!("r{}", params.message_id);
-            if dialog_response_requires_rich(answer) {
+            let report = if dialog_response_requires_rich(answer) {
                 let request = RichMessageRequest {
                     chat: Some(chat),
                     message_thread_id: params.thread_id.map(i64::from).unwrap_or_default(),
@@ -116,7 +226,7 @@ impl DialogJobEffects for DialogDispatcherEffects {
                     },
                     || (self.next_virtual_id)(),
                 )
-                .await?;
+                .await?
             } else {
                 let request = TextMessageRequest {
                     chat: Some(chat),
@@ -140,9 +250,57 @@ impl DialogJobEffects for DialogDispatcherEffects {
                     },
                     || (self.next_virtual_id)(),
                 )
-                .await?;
+                .await?
+            };
+            Ok(QueuedBatchReceipt::dispatcher(
+                format!("dispatcher:dialog-answer:{dialog_job_id}"),
+                report
+                    .parts
+                    .into_iter()
+                    .map(|part| part.virtual_id)
+                    .collect(),
+            ))
+        })
+    }
+
+    fn queued_dialog_answer<'a>(
+        &'a self,
+        dialog_job_id: i64,
+    ) -> DialogJobReceiptLookupFuture<'a, Self::Error> {
+        Box::pin(async move {
+            let Some(outbox) = &self.durable_outbox else {
+                return Ok(None);
+            };
+            let batch_id = dialog_answer_batch_id(outbox.bot_id, dialog_job_id);
+            let rows = sqlx::query(
+                "SELECT operation_id, state FROM telegram_outbox \
+                 WHERE batch_id = $1 AND dialog_job_id = $2 \
+                 ORDER BY part_index",
+            )
+            .bind(&batch_id)
+            .bind(dialog_job_id)
+            .fetch_all(outbox.store.pool())
+            .await
+            .map_err(openplotva_storage::StorageError::from)?;
+            if rows.is_empty() {
+                return Ok(None);
             }
-            Ok(())
+            let delivery_complete = rows.iter().all(|row| {
+                matches!(
+                    row.try_get::<String, _>("state").as_deref(),
+                    Ok("delivered")
+                )
+            });
+            let operation_ids = rows
+                .into_iter()
+                .map(|row| row.try_get("operation_id"))
+                .collect::<Result<Vec<String>, sqlx::Error>>()
+                .map_err(openplotva_storage::StorageError::from)?;
+            Ok(Some(QueuedBatchReceipt::durable_outbox(
+                batch_id,
+                operation_ids,
+                delivery_complete,
+            )))
         })
     }
 
@@ -223,4 +381,96 @@ impl DialogJobEffects for DialogDispatcherEffects {
             Ok(())
         })
     }
+}
+
+fn dialog_answer_batch_id(bot_id: i64, dialog_job_id: i64) -> String {
+    format!("dialog-answer:v1:{bot_id}:{dialog_job_id}")
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn enqueue_durable_dialog_answer(
+    outbox: &DurableDialogOutbox,
+    dialog_job_id: i64,
+    causation_update_id: Option<i64>,
+    params: &DialogJobParams,
+    answer: &str,
+    chat: ChatRef,
+    reply_to: &ReplyMessageRef,
+) -> Result<QueuedBatchReceipt, DialogDispatchEffectError> {
+    let methods = if dialog_response_requires_rich(answer) {
+        let request = RichMessageRequest {
+            chat: Some(chat),
+            message_thread_id: params.thread_id.map(i64::from).unwrap_or_default(),
+            disable_notification: false,
+            allow_sending_without_reply: None,
+            html: answer.to_owned(),
+            reply_markup: None,
+        };
+        vec![TelegramOutboundMethod::from(build_rich_message_method(
+            &request,
+            chat,
+            Some(reply_to),
+        )?)]
+    } else {
+        let request = TextMessageRequest {
+            chat: Some(chat),
+            message_thread_id: params.thread_id.map(i64::from).unwrap_or_default(),
+            disable_notification: false,
+            allow_sending_without_reply: None,
+            text: answer.to_owned(),
+            render_as: TELEGRAM_PARSE_MODE_HTML.to_owned(),
+            reply_markup: None,
+        };
+        build_text_message_methods(&request, Some(reply_to))?
+            .into_iter()
+            .map(TelegramOutboundMethod::from)
+            .collect()
+    };
+    let now = OffsetDateTime::now_utc();
+    let mut parts = Vec::with_capacity(methods.len());
+    for method in &methods {
+        let method_kind = method.method_name();
+        let Some((_kind, payload)) = snapshot_outbound_method(method) else {
+            return Err(DialogDispatchEffectError::UnsupportedMethod(method_kind));
+        };
+        parts.push(TelegramOutboxPartInput {
+            method_kind: method_kind.to_owned(),
+            payload_version: 1,
+            payload: serde_json::from_slice(&payload)?,
+            blob: None,
+            available_at: now,
+            expires_at: None,
+        });
+    }
+    let batch_id = dialog_answer_batch_id(outbox.bot_id, dialog_job_id);
+    let batch = TelegramOutboxBatchInput {
+        batch_id: batch_id.clone(),
+        bot_id: outbox.bot_id,
+        chat_id: Some(params.chat_id),
+        thread_id: params.thread_id,
+        ordering_key: format!(
+            "dialog:{}:{}:{}",
+            outbox.bot_id,
+            params.chat_id,
+            params.thread_id.unwrap_or_default()
+        ),
+        causation_update_id,
+        dialog_job_id: Some(dialog_job_id),
+        trigger_message_id: Some(i64::from(params.message_id)),
+        delivery_policy: TelegramDeliveryPolicy::Create,
+        protected: true,
+        priority: DEFAULT_PRIORITY,
+        parts,
+    };
+    let queued = outbox.store.enqueue_batch(&batch).await?;
+    let delivery_complete = queued.parts.iter().all(|part| part.state == "delivered");
+    Ok(QueuedBatchReceipt::durable_outbox(
+        queued.batch_id,
+        queued
+            .parts
+            .into_iter()
+            .map(|part| part.operation_id)
+            .collect(),
+        delivery_complete,
+    ))
 }

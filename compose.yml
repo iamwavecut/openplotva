@@ -4,6 +4,7 @@ services:
   openplotva:
     build:
       context: .
+      target: runtime
     environment:
       WEBAPP_HOST: 0.0.0.0
       WEBAPP_PORT: 8080
@@ -17,6 +18,12 @@ services:
       REDIS_HOST: dragonfly
       REDIS_PORT: 6379
       REDIS_DB: ${REDIS_DB:-0}
+      UPDATE_QUEUE_BACKEND: ${UPDATE_QUEUE_BACKEND:-stream}
+      UPDATE_STREAM_REDIS_URL: redis://redis-ingress:6379/0
+      UPDATE_MATERIALIZER_BATCH_MAX_ROWS: ${UPDATE_MATERIALIZER_BATCH_MAX_ROWS:-512}
+      UPDATE_MATERIALIZER_BATCH_MAX_BYTES: ${UPDATE_MATERIALIZER_BATCH_MAX_BYTES:-8388608}
+      UPDATE_MATERIALIZER_BATCH_MAX_WAIT_MS: ${UPDATE_MATERIALIZER_BATCH_MAX_WAIT_MS:-50}
+      UPDATE_MATERIALIZER_DB_TIMEOUT_MS: ${UPDATE_MATERIALIZER_DB_TIMEOUT_MS:-5000}
       OPENPLOTVA_CONNECT_SERVICES: "true"
       OPENPLOTVA_RUN_MIGRATIONS: "true"
       OPENPLOTVA_CONSUME_UPDATES: "false"
@@ -37,6 +44,8 @@ services:
         condition: service_healthy
       dragonfly:
         condition: service_started
+      redis-ingress:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/api/health"]
       interval: 10s
@@ -72,6 +81,30 @@ services:
     volumes:
       - dragonfly-data:/data
 
+  redis-ingress:
+    image: valkey/valkey:8.1-alpine
+    command:
+      - valkey-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - always
+      - --maxmemory
+      - ${UPDATE_STREAM_MAXMEMORY:-716mb}
+      - --maxmemory-policy
+      - noeviction
+    mem_limit: ${UPDATE_STREAM_CONTAINER_MEMORY:-1g}
+    ports:
+      - "${OPENPLOTVA_DEV_UPDATE_STREAM_REDIS_PORT:-56380}:6379"
+    volumes:
+      - redis-ingress-data:/data
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
 volumes:
   postgres-data:
   dragonfly-data:
+  redis-ingress-data:

@@ -35,8 +35,11 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use time::OffsetDateTime;
 
-use crate::routed_attempts::{
-    RoutedAttempt, RoutedAttemptRunError, RoutedAttemptWalker, RoutedRequestContext,
+use crate::{
+    routed_attempts::{
+        RoutedAttempt, RoutedAttemptRunError, RoutedAttemptWalker, RoutedRequestContext,
+    },
+    task_queue::TaskQueueDurabilityBarrier,
 };
 
 pub const ASR_WORKFLOW_KEY: &str = "voice_transcription";
@@ -764,12 +767,25 @@ fn next_asr_job_id() -> String {
     format!("asr-{nanos}-{counter}")
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct TelegramDialogAsrInputMaterializer<Store, Downloader, Transcriber> {
     store: Store,
     downloader: Downloader,
     transcriber: Transcriber,
     task_queue: Option<Arc<InMemoryTaskQueue>>,
+    task_durability: Option<Arc<dyn TaskQueueDurabilityBarrier>>,
+}
+
+impl<Store, Downloader, Transcriber> fmt::Debug
+    for TelegramDialogAsrInputMaterializer<Store, Downloader, Transcriber>
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TelegramDialogAsrInputMaterializer")
+            .field("task_queue", &self.task_queue.is_some())
+            .field("task_durability", &self.task_durability.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl<Store, Downloader, Transcriber>
@@ -782,12 +798,22 @@ impl<Store, Downloader, Transcriber>
             downloader,
             transcriber,
             task_queue: None,
+            task_durability: None,
         }
     }
 
     #[must_use]
     pub fn with_taskman_queue(mut self, task_queue: Arc<InMemoryTaskQueue>) -> Self {
         self.task_queue = Some(task_queue);
+        self
+    }
+
+    #[must_use]
+    pub fn with_taskman_durability(
+        mut self,
+        task_durability: Arc<dyn TaskQueueDurabilityBarrier>,
+    ) -> Self {
+        self.task_durability = Some(task_durability);
         self
     }
 }
@@ -818,37 +844,63 @@ where
             }
 
             if let Some(queue) = self.task_queue.as_ref() {
-                let job_id =
-                    if self.claim_processing(&record, now).await.is_some() {
-                        let job_id = queue.assign(
-                            ASR_GPU1_QUEUE_NAME,
-                            new_asr_job_at(
-                                AsrJobParams {
-                                    chat_id: input.context.chat_id,
-                                    message_id: input.message.id,
-                                    user_id: input.user.id,
-                                    user_full_name: input.user.full_name.clone(),
-                                    thread_id: input.context.thread_id,
-                                    file_unique_id: record.file_unique_id.clone(),
-                                    duration_seconds: candidate.duration_seconds,
-                                },
-                                now,
-                            ),
-                        );
-                        tracing::debug!(
-                            job_id,
-                            file_unique_id = record.file_unique_id,
-                            "queued priority ASR taskman job"
-                        );
-                        Some(job_id)
+                let job_id = if let Some(claimed) = self.claim_processing(&record, now).await {
+                    let job_id = queue.assign(
+                        ASR_GPU1_QUEUE_NAME,
+                        new_asr_job_at(
+                            AsrJobParams {
+                                chat_id: input.context.chat_id,
+                                message_id: input.message.id,
+                                user_id: input.user.id,
+                                user_full_name: input.user.full_name.clone(),
+                                thread_id: input.context.thread_id,
+                                file_unique_id: record.file_unique_id.clone(),
+                                duration_seconds: candidate.duration_seconds,
+                            },
+                            now,
+                        ),
+                    );
+                    tracing::debug!(
+                        job_id,
+                        file_unique_id = record.file_unique_id,
+                        "queued priority ASR taskman job"
+                    );
+                    if let Some(durability) = self.task_durability.as_deref()
+                        && let Err(error) = durability.durability_barrier(job_id).await
+                    {
+                        let reason = format!("taskman durability failure: {error}");
+                        if let Err(cancel_error) =
+                            queue.cancel(job_id, reason.clone(), OffsetDateTime::now_utc())
+                        {
+                            tracing::warn!(
+                                job_id,
+                                %cancel_error,
+                                "failed to cancel non-durable ASR taskman job"
+                            );
+                        }
+                        if let Err(cancel_flush_error) = durability.durability_barrier(job_id).await
+                        {
+                            tracing::warn!(
+                                job_id,
+                                %cancel_flush_error,
+                                "failed to persist ASR cancellation after durability failure"
+                            );
+                        }
+                        self.mark_failed_best_effort(&claimed, &reason).await;
+                        None
                     } else {
-                        queue.active_job_id_matching(ASR_GPU1_QUEUE_NAME, |job| {
-                            job.data.job_type == JobType::Asr
-                                && job.data.asr_data.as_ref().is_some_and(|data| {
-                                    data.file_unique_id == candidate.file_unique_id
-                                })
-                        })
-                    };
+                        Some(job_id)
+                    }
+                } else {
+                    queue.active_job_id_matching(ASR_GPU1_QUEUE_NAME, |job| {
+                        job.data.job_type == JobType::Asr
+                            && job
+                                .data
+                                .asr_data
+                                .as_ref()
+                                .is_some_and(|data| data.file_unique_id == candidate.file_unique_id)
+                    })
+                };
                 if let Some(text) = self
                     .wait_for_taskman_transcript(&candidate.file_unique_id, job_id)
                     .await
@@ -1352,6 +1404,27 @@ mod tests {
         calls: Arc<Mutex<Vec<Vec<u8>>>>,
     }
 
+    #[derive(Debug, Default)]
+    struct FailingTaskDurability {
+        calls: AtomicUsize,
+    }
+
+    impl TaskQueueDurabilityBarrier for FailingTaskDurability {
+        fn durability_barrier<'a>(
+            &'a self,
+            _job_id: i64,
+        ) -> crate::task_queue::TaskQueueDurabilityFuture<'a> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                if call == 0 {
+                    Err("postgres unavailable".to_owned())
+                } else {
+                    Ok(())
+                }
+            })
+        }
+    }
+
     fn is_fresh_processing_record(record: &TelegramFileRecord, now: OffsetDateTime) -> bool {
         record.asr_status == TELEGRAM_FILE_ASR_STATUS_PROCESSING
             && record
@@ -1597,6 +1670,46 @@ mod tests {
         assert_eq!(
             queue.record(record.id).map(|record| record.status),
             Some(openplotva_taskman::JobStatus::Completed)
+        );
+    }
+
+    #[tokio::test]
+    async fn priority_asr_handoff_cancels_when_postgres_barrier_fails() {
+        let now = OffsetDateTime::from_unix_timestamp(1_770_000_000).expect("timestamp");
+        let store = FakeStore {
+            record: Arc::new(Mutex::new(voice_record(now))),
+            updates: Arc::new(Mutex::new(Vec::new())),
+        };
+        let queue = Arc::new(InMemoryTaskQueue::new());
+        let durability = Arc::new(FailingTaskDurability::default());
+        let materializer = TelegramDialogAsrInputMaterializer::new(
+            store.clone(),
+            FakeDownloader::default(),
+            FakeTranscriber {
+                result: Ok(transcript("must not run")),
+                calls: Arc::new(Mutex::new(Vec::new())),
+            },
+        )
+        .with_taskman_queue(Arc::clone(&queue))
+        .with_taskman_durability(durability.clone());
+
+        let input = materializer
+            .materialize_dialog_asr_input(dialog_input_with_voice(), now)
+            .await;
+
+        assert!(input.message.text.is_empty());
+        let records = queue.records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].status, openplotva_taskman::JobStatus::Cancelled);
+        assert_eq!(durability.calls.load(Ordering::SeqCst), 2);
+        let updates = store.updates.lock().expect("updates").clone();
+        assert_eq!(updates[0].asr_status, TELEGRAM_FILE_ASR_STATUS_PROCESSING);
+        assert_eq!(updates[1].asr_status, TELEGRAM_FILE_ASR_STATUS_FAILED);
+        assert!(
+            updates[1]
+                .asr_error
+                .as_deref()
+                .is_some_and(|error| error.contains("postgres unavailable"))
         );
     }
 

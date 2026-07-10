@@ -4,7 +4,10 @@ use std::{fmt, future::Future, pin::Pin, sync::Arc};
 
 use carapax::types::{Update as TelegramUpdate, UpdateType, User as TelegramUser};
 use openplotva_core::ChatMessageMeta;
-use openplotva_taskman::InMemoryTaskQueue;
+use openplotva_taskman::{
+    DialogJobParams, InMemoryTaskQueue, JobStatus, JobType, TaskQueueRecord, TaskQueueSchedule,
+    clean_unicode_non_printables,
+};
 use openplotva_updates::{
     build_fetcher_message_context, edited_image_prompt_update, parse_if_addressed,
 };
@@ -12,6 +15,7 @@ use thiserror::Error;
 
 use crate::{
     dialog_debounce::InMemoryDialogDebounce,
+    dialog_messages::DialogTaskDurabilityBarrier,
     updates::{UpdateHandler, UpdateHandlerFuture},
 };
 
@@ -32,6 +36,7 @@ pub struct EditedDialogJobUpdate<'payload> {
     /// Original `Message.Text` before fallback extraction.
     pub original_text: &'payload str,
     pub meta: &'payload ChatMessageMeta,
+    pub source_update_id: i64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -68,6 +73,12 @@ pub trait EditedMessageEffects {
         &'a self,
         update: EditedImageJobUpdate<'a>,
     ) -> EditedMessageFuture<'a, bool, Self::Error>;
+
+    /// Durability failures must escape the edited-message best-effort boundary
+    /// so the durable update consumer retries instead of acknowledging loss.
+    fn should_retry_error(&self, _error: &Self::Error) -> bool {
+        false
+    }
 }
 
 /// Route chosen by the edited-message update wrapper.
@@ -96,6 +107,8 @@ pub enum EditedMessageUpdateError {
         /// Display form of the downstream error.
         message: String,
     },
+    #[error("durable edited-message effect: {message}")]
+    Durability { message: String },
 }
 
 #[derive(Clone, Debug)]
@@ -106,19 +119,24 @@ pub struct EditedMessageUpdateHandler<Effects, Next> {
 }
 
 /// Concrete edited-message effects backed by the shared taskman queue core.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct TaskmanEditedMessageEffects {
     queue: Arc<InMemoryTaskQueue>,
     dialog_debounce: Option<Arc<InMemoryDialogDebounce>>,
+    durability: Arc<dyn DialogTaskDurabilityBarrier>,
 }
 
 impl TaskmanEditedMessageEffects {
     /// Build taskman-backed edited-message effects.
     #[must_use]
-    pub fn new(queue: Arc<InMemoryTaskQueue>) -> Self {
+    pub fn new(
+        queue: Arc<InMemoryTaskQueue>,
+        durability: Arc<dyn DialogTaskDurabilityBarrier>,
+    ) -> Self {
         Self {
             queue,
             dialog_debounce: None,
+            durability,
         }
     }
 
@@ -129,12 +147,42 @@ impl TaskmanEditedMessageEffects {
     }
 }
 
+impl fmt::Debug for TaskmanEditedMessageEffects {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TaskmanEditedMessageEffects")
+            .finish_non_exhaustive()
+    }
+}
+
 /// Error returned by taskman-backed edited-message effects.
 #[derive(Debug, Error)]
 pub enum TaskmanEditedMessageEffectsError {
     /// Chat metadata could not be converted into taskman JSON.
     #[error("serialize edited-message metadata: {0}")]
     SerializeMeta(#[from] serde_json::Error),
+    #[error("persist edited dialog task {task_id}: {message}")]
+    Durability { task_id: i64, message: String },
+}
+
+fn pending_dialog_record(
+    queue: &InMemoryTaskQueue,
+    chat_id: i64,
+    message_id: i32,
+) -> Option<TaskQueueRecord> {
+    queue.records().into_iter().find(|record| {
+        record.status == JobStatus::Pending
+            && record.job.data.job_type == JobType::Dialog
+            && record
+                .job
+                .data
+                .telegram_data
+                .as_ref()
+                .is_some_and(|telegram| {
+                    telegram.chat_id == chat_id && telegram.message_id == message_id
+                })
+            && record.job.data.dialog_data.is_some()
+    })
 }
 
 impl EditedMessageEffects for TaskmanEditedMessageEffects {
@@ -148,9 +196,7 @@ impl EditedMessageEffects for TaskmanEditedMessageEffects {
             let Some(dialog_debounce) = self.dialog_debounce.as_ref() else {
                 return Ok(false);
             };
-            dialog_debounce
-                .update(update)
-                .map_err(TaskmanEditedMessageEffectsError::SerializeMeta)
+            Ok(dialog_debounce.update(update))
         })
     }
 
@@ -159,14 +205,80 @@ impl EditedMessageEffects for TaskmanEditedMessageEffects {
         update: EditedDialogJobUpdate<'a>,
     ) -> EditedMessageFuture<'a, bool, Self::Error> {
         Box::pin(async move {
+            let Some(record) =
+                pending_dialog_record(&self.queue, update.chat_id, update.message_id)
+            else {
+                return Ok(false);
+            };
             let meta = serde_json::to_value(update.meta)?;
-            Ok(self.queue.update_pending_dialog_job_by_message_id(
-                update.chat_id,
-                update.message_id,
-                update.message_text,
-                update.original_text,
-                meta,
-            ))
+            let task_id = if record.debounce_key.is_some() {
+                let telegram = record
+                    .job
+                    .data
+                    .telegram_data
+                    .as_ref()
+                    .expect("matched dialog record has Telegram data");
+                let dialog = record
+                    .job
+                    .data
+                    .dialog_data
+                    .as_ref()
+                    .expect("matched dialog record has dialog data");
+                let params = DialogJobParams {
+                    chat_id: update.chat_id,
+                    message_id: update.message_id,
+                    user_id: telegram.user_id,
+                    user_full_name: telegram.user_full_name.clone(),
+                    message_text: clean_unicode_non_printables(update.message_text),
+                    original_text: update.original_text.trim().to_owned(),
+                    meta: meta.clone(),
+                    max_output_tokens: dialog.max_output_tokens,
+                    thread_id: update.thread_id.or(telegram.thread_message_id),
+                };
+                let mut job = record.job.clone();
+                let dialog = job
+                    .data
+                    .dialog_data
+                    .as_mut()
+                    .expect("matched dialog record has dialog data");
+                dialog.message_text = params.message_text.clone();
+                dialog.original_text = params.original_text.clone();
+                dialog.meta = meta;
+                let Some(report) = self.queue.update_pending_schedule(
+                    record.id,
+                    job,
+                    TaskQueueSchedule {
+                        available_at: record.available_at,
+                        debounce_key: record.debounce_key,
+                        lane_key: record.lane_key,
+                        source_update_ids: vec![update.source_update_id],
+                        latest_update_id: Some(update.source_update_id),
+                        pending_dialog_inputs: vec![params],
+                    },
+                ) else {
+                    return Ok(false);
+                };
+                report.task_id
+            } else {
+                if !self.queue.update_pending_dialog_job_by_message_id(
+                    update.chat_id,
+                    update.message_id,
+                    update.message_text,
+                    update.original_text,
+                    meta,
+                ) {
+                    return Ok(false);
+                }
+                record.id
+            };
+            self.durability
+                .durability_barrier(task_id)
+                .await
+                .map_err(|message| TaskmanEditedMessageEffectsError::Durability {
+                    task_id,
+                    message,
+                })?;
+            Ok(true)
         })
     }
 
@@ -184,6 +296,10 @@ impl EditedMessageEffects for TaskmanEditedMessageEffects {
                 meta,
             ))
         })
+    }
+
+    fn should_retry_error(&self, error: &Self::Error) -> bool {
+        matches!(error, TaskmanEditedMessageEffectsError::Durability { .. })
     }
 }
 
@@ -262,6 +378,7 @@ where
         message_text: &parsed.message_text,
         original_text: &context.original_text,
         meta: &context.meta,
+        source_update_id: update.id,
     };
 
     let mut suppressed_errors = Vec::new();
@@ -272,13 +389,22 @@ where
     )
     .await
     .unwrap_or(false);
-    let pending_dialog_updated = suppress_edited_effect(
-        effects.update_pending_dialog_job(dialog_update),
-        &mut suppressed_errors,
-        "update pending dialog job from edited message",
-    )
-    .await
-    .unwrap_or(false);
+    let pending_dialog_updated = match effects.update_pending_dialog_job(dialog_update).await {
+        Ok(updated) => updated,
+        Err(error) if effects.should_retry_error(&error) => {
+            return Err(EditedMessageUpdateError::Durability {
+                message: error.to_string(),
+            });
+        }
+        Err(error) => {
+            suppress_edited_error(
+                error,
+                &mut suppressed_errors,
+                "update pending dialog job from edited message",
+            );
+            false
+        }
+    };
 
     let pending_image_updated = if let Some(image) = edited_image_prompt_update(
         message,
@@ -323,12 +449,20 @@ where
     match effect.await {
         Ok(value) => Some(value),
         Err(error) => {
-            let message = error.to_string();
-            tracing::warn!(message, context, "edited-message effect failed");
-            suppressed_errors.push(message);
+            suppress_edited_error(error, suppressed_errors, context);
             None
         }
     }
+}
+
+fn suppress_edited_error(
+    error: impl fmt::Display,
+    suppressed_errors: &mut Vec<String>,
+    context: &'static str,
+) {
+    let message = error.to_string();
+    tracing::warn!(message, context, "edited-message effect failed");
+    suppressed_errors.push(message);
 }
 
 #[cfg(test)]
@@ -344,8 +478,9 @@ mod tests {
     use openplotva_core::{ChatMessageMeta, ChatState, UserState};
     use openplotva_storage::TelegramFileMetadataUpsert;
     use openplotva_taskman::{
-        DEFAULT_PRIORITY, DIALOG_AIFARM_QUEUE_NAME, DialogJobData, IMAGE_REGULAR_QUEUE_NAME,
-        ImageJobData, InMemoryTaskQueue, JobPayload, JobType, StatelessJobItem, TelegramData,
+        DEFAULT_PRIORITY, DIALOG_AIFARM_QUEUE_NAME, DialogJobData, DialogJobParams,
+        IMAGE_REGULAR_QUEUE_NAME, ImageJobData, InMemoryTaskQueue, JobPayload, JobType,
+        StatelessJobItem, TaskQueueSchedule, TelegramData,
     };
     use openplotva_updates::{UpdateConsumerConfig, UpdateStageOutcome};
     use serde_json::json;
@@ -508,7 +643,10 @@ mod tests {
             IMAGE_REGULAR_QUEUE_NAME,
             taskman_image_job("old prompt", now, 111, 42, 77),
         );
-        let effects = TaskmanEditedMessageEffects::new(queue.clone());
+        let effects = TaskmanEditedMessageEffects::new(
+            queue.clone(),
+            Arc::new(crate::dialog_messages::NoopDialogTaskDurabilityBarrier),
+        );
         let meta = ChatMessageMeta {
             sender_id: 111,
             sender_type: "user".to_owned(),
@@ -526,6 +664,7 @@ mod tests {
                     message_text: "\u{200f}new\ttext ",
                     original_text: " original text ",
                     meta: &meta,
+                    source_update_id: 200,
                 })
                 .await?
         );
@@ -563,7 +702,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn taskman_edited_effects_update_dialog_debounce_before_assignment()
+    async fn taskman_edited_effects_update_the_durable_debounced_task_in_place()
     -> Result<(), Box<dyn Error>> {
         let queue = Arc::new(InMemoryTaskQueue::new());
         let debounce = Arc::new(InMemoryDialogDebounce::new());
@@ -572,14 +711,35 @@ mod tests {
             user_id: 111,
             thread_id: 9,
         };
-        debounce.register(
-            key,
-            77,
+        let initial_input = DialogJobParams {
+            chat_id: 42,
+            message_id: 77,
+            user_id: 111,
+            user_full_name: "Ada".to_owned(),
+            message_text: "old dialog".to_owned(),
+            original_text: "old dialog".to_owned(),
+            meta: json!({}),
+            max_output_tokens: 0,
+            thread_id: Some(9),
+        };
+        let scheduled = queue.schedule_or_replace(
             DIALOG_AIFARM_QUEUE_NAME,
             taskman_dialog_job("old dialog", OffsetDateTime::UNIX_EPOCH, 111, 42, 77),
+            TaskQueueSchedule {
+                available_at: Some(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(5)),
+                debounce_key: Some(key.durable_debounce_key()),
+                lane_key: Some(key.durable_lane_key()),
+                source_update_ids: vec![200],
+                latest_update_id: Some(200),
+                pending_dialog_inputs: vec![initial_input],
+            },
         );
-        let effects = TaskmanEditedMessageEffects::new(Arc::clone(&queue))
-            .with_dialog_debounce(debounce.clone());
+        debounce.track(key, 77, DIALOG_AIFARM_QUEUE_NAME, scheduled.task_id);
+        let effects = TaskmanEditedMessageEffects::new(
+            Arc::clone(&queue),
+            Arc::new(crate::dialog_messages::NoopDialogTaskDurabilityBarrier),
+        )
+        .with_dialog_debounce(debounce.clone());
         let meta = ChatMessageMeta {
             sender_id: 111,
             sender_type: "user".to_owned(),
@@ -587,27 +747,80 @@ mod tests {
             ..ChatMessageMeta::default()
         };
 
-        assert!(
-            effects
-                .update_dialog_debounce(EditedDialogJobUpdate {
-                    chat_id: 42,
-                    message_id: 77,
-                    sender_id: 111,
-                    thread_id: Some(9),
-                    message_text: "\u{200f}new\ttext ",
-                    original_text: " original text ",
-                    meta: &meta,
-                })
-                .await?
-        );
-        let assigned = debounce.assign_due(key, &queue).expect("assigned");
+        let update = EditedDialogJobUpdate {
+            chat_id: 42,
+            message_id: 77,
+            sender_id: 111,
+            thread_id: Some(9),
+            message_text: "\u{200f}new\ttext ",
+            original_text: " original text ",
+            meta: &meta,
+            source_update_id: 201,
+        };
+        assert!(effects.update_dialog_debounce(update).await?);
+        assert!(effects.update_pending_dialog_job(update).await?);
 
-        assert_eq!(assigned.queue_name, DIALOG_AIFARM_QUEUE_NAME);
         let records = queue.records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id, scheduled.task_id);
+        assert_eq!(records[0].source_update_ids, vec![200, 201]);
+        assert_eq!(records[0].latest_update_id, Some(201));
+        assert_eq!(records[0].pending_dialog_inputs.len(), 1);
+        assert_eq!(records[0].pending_dialog_inputs[0].message_text, "new text");
         let dialog = records[0].job.data.dialog_data.as_ref().expect("dialog");
         assert_eq!(dialog.message_text, "new text");
         assert_eq!(dialog.original_text, "original text");
         assert_eq!(dialog.meta["sender_name"], "Ada");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn edited_dialog_durability_failure_escapes_for_update_retry()
+    -> Result<(), Box<dyn Error>> {
+        let queue = Arc::new(InMemoryTaskQueue::new());
+        let key = DialogDebounceKey {
+            chat_id: 42,
+            user_id: 111,
+            thread_id: 0,
+        };
+        let initial_input = DialogJobParams {
+            chat_id: 42,
+            message_id: 77,
+            user_id: 111,
+            user_full_name: "Ada".to_owned(),
+            message_text: "old".to_owned(),
+            original_text: "old".to_owned(),
+            meta: json!({}),
+            max_output_tokens: 0,
+            thread_id: None,
+        };
+        queue.schedule_or_replace(
+            DIALOG_AIFARM_QUEUE_NAME,
+            taskman_dialog_job("old", OffsetDateTime::UNIX_EPOCH, 111, 42, 77),
+            TaskQueueSchedule {
+                available_at: Some(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(5)),
+                debounce_key: Some(key.durable_debounce_key()),
+                lane_key: Some(key.durable_lane_key()),
+                source_update_ids: vec![100],
+                latest_update_id: Some(100),
+                pending_dialog_inputs: vec![initial_input],
+            },
+        );
+        let effects = TaskmanEditedMessageEffects::new(queue, Arc::new(FailingDurabilityBarrier));
+
+        let error = handle_edited_message_update_or_else(
+            &effects,
+            &sample_bot_user()?,
+            edited_text_update("new")?,
+            |_update| async { Err::<(), _>(io::Error::other("should not delegate")) },
+        )
+        .await
+        .expect_err("durability failure must retry the update");
+
+        assert!(matches!(
+            error,
+            super::EditedMessageUpdateError::Durability { .. }
+        ));
         Ok(())
     }
 
@@ -639,7 +852,7 @@ mod tests {
         let queue = Arc::new(InMemoryTaskQueue::new());
         let debounce = Arc::new(InMemoryDialogDebounce::new());
         let created = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
-        queue.assign(
+        let dialog_id = queue.assign(
             DIALOG_AIFARM_QUEUE_NAME,
             taskman_dialog_job("old dialog", created, 111, 42, 77),
         );
@@ -652,14 +865,12 @@ mod tests {
             user_id: 111,
             thread_id: 9,
         };
-        debounce.register(
-            debounce_key,
-            77,
-            DIALOG_AIFARM_QUEUE_NAME,
-            taskman_dialog_job("old debounce", created, 111, 42, 77),
-        );
-        let effects = TaskmanEditedMessageEffects::new(Arc::clone(&queue))
-            .with_dialog_debounce(debounce.clone());
+        debounce.track(debounce_key, 77, DIALOG_AIFARM_QUEUE_NAME, dialog_id);
+        let effects = TaskmanEditedMessageEffects::new(
+            Arc::clone(&queue),
+            Arc::new(crate::dialog_messages::NoopDialogTaskDurabilityBarrier),
+        )
+        .with_dialog_debounce(debounce.clone());
         let next = UpdateHandlerStub::default();
         let route = Arc::new(Mutex::new(None));
         let captured_route = Arc::clone(&route);
@@ -734,19 +945,6 @@ mod tests {
         assert!(image.prompt_variants.is_empty());
         assert_eq!(image.meta["sender_name"], "Ada");
 
-        let assigned = debounce
-            .assign_due(debounce_key, &queue)
-            .ok_or_else(|| io::Error::other("expected edited debounce assignment"))?;
-        assert_eq!(assigned.queue_name, DIALOG_AIFARM_QUEUE_NAME);
-        let assigned_dialog = queue
-            .records()
-            .into_iter()
-            .find(|record| record.id == assigned.task_id)
-            .and_then(|record| record.job.data.dialog_data)
-            .ok_or_else(|| io::Error::other("expected assigned dialog data"))?;
-        assert_eq!(assigned_dialog.message_text, "нарисуй кота");
-        assert_eq!(assigned_dialog.original_text, "нарисуй кота");
-        assert_eq!(assigned_dialog.meta["sender_name"], "Ada");
         assert_eq!(update_queue.len().await?, 0);
 
         let _: i64 = redis::cmd("DEL").arg(&key).query_async(&mut redis).await?;
@@ -840,6 +1038,7 @@ mod tests {
         message_text: String,
         original_text: String,
         meta: ChatMessageMeta,
+        source_update_id: i64,
     }
 
     impl From<EditedDialogJobUpdate<'_>> for OwnedDialogJobUpdate {
@@ -852,6 +1051,7 @@ mod tests {
                 message_text: update.message_text.to_owned(),
                 original_text: update.original_text.to_owned(),
                 meta: update.meta.clone(),
+                source_update_id: update.source_update_id,
             }
         }
     }
@@ -874,6 +1074,17 @@ mod tests {
                 original_prompt: update.original_prompt.to_owned(),
                 meta: update.meta.clone(),
             }
+        }
+    }
+
+    struct FailingDurabilityBarrier;
+
+    impl crate::dialog_messages::DialogTaskDurabilityBarrier for FailingDurabilityBarrier {
+        fn durability_barrier(
+            &self,
+            _task_id: i64,
+        ) -> crate::dialog_messages::DialogTaskDurabilityFuture<'_> {
+            Box::pin(async { Err("database unavailable".to_owned()) })
         }
     }
 

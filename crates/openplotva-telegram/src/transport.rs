@@ -183,6 +183,13 @@ impl OutboundSendErrorClass {
 }
 
 impl TelegramOutboundExecuteError {
+    /// Diagnostic text safe for persistence and operator APIs. Reqwest errors
+    /// may include the Bot API URL, whose `/bot<token>/` path embeds the token.
+    #[must_use]
+    pub fn diagnostic_message(&self) -> String {
+        sanitize_telegram_transport_diagnostic(&self.to_string())
+    }
+
     pub fn classification(&self) -> OutboundSendErrorClass {
         match self {
             Self::Telegram(ExecuteError::Response(response))
@@ -257,6 +264,31 @@ impl TelegramOutboundExecuteError {
             Self::Rich(_) => false,
         }
     }
+}
+
+/// Remove Bot API tokens embedded in request URLs before a message reaches
+/// logs, Postgres diagnostics, or runtime GraphQL.
+#[must_use]
+pub fn sanitize_telegram_transport_diagnostic(message: &str) -> String {
+    const MARKER: &str = "/bot";
+    const REDACTED: &str = "<redacted>";
+
+    let mut sanitized = message.to_owned();
+    let mut offset = 0;
+    while let Some(relative) = sanitized[offset..].find(MARKER) {
+        let token_start = offset + relative + MARKER.len();
+        let Some(token_end_relative) = sanitized[token_start..].find('/') else {
+            break;
+        };
+        let token_end = token_start + token_end_relative;
+        if sanitized[token_start..token_end].contains(':') {
+            sanitized.replace_range(token_start..token_end, REDACTED);
+            offset = token_start + REDACTED.len();
+        } else {
+            offset = token_start;
+        }
+    }
+    sanitized
 }
 
 impl TelegramOutboundMethod {
@@ -765,8 +797,8 @@ mod tests {
     use super::{
         OutboundSendErrorClass, TelegramOutboundExecuteError, TelegramOutboundMethod,
         TelegramOutboundMethodKind, TelegramOutboundResponse, TelegramOutboundResponseKind,
-        classify_telegram_send_error, send_outbound_method_with_bounded_retry,
-        telegram_execute_error_is_reply_missing,
+        classify_telegram_send_error, sanitize_telegram_transport_diagnostic,
+        send_outbound_method_with_bounded_retry, telegram_execute_error_is_reply_missing,
     };
     use crate::{
         AudioMessageRequest, AudioSource, CallbackAnswerRequest, ChatActionRequest, ChatRef,
@@ -792,6 +824,21 @@ mod tests {
             id,
             is_forum: false,
         }
+    }
+
+    #[test]
+    fn transport_diagnostic_redacts_bot_token_url_segments() {
+        let sentinel = "123456:SECRET_SENTINEL";
+        let diagnostic =
+            format!("request failed for https://api.telegram.org/bot{sentinel}/sendMessage");
+
+        let sanitized = sanitize_telegram_transport_diagnostic(&diagnostic);
+
+        assert!(!sanitized.contains(sentinel));
+        assert_eq!(
+            sanitized,
+            "request failed for https://api.telegram.org/bot<redacted>/sendMessage"
+        );
     }
 
     fn photo_item(file_id: &str) -> MediaGroupPhotoItem {

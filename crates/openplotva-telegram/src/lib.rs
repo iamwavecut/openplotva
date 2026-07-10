@@ -87,7 +87,8 @@ pub use persistence::{
     PersistentDispatcherRestoreReport, RedisDispatcherQueueStore, persistent_queue_from_drain,
     persistent_queue_redis_value_from_items, persistent_queue_replay_from_items,
     persistent_queue_replay_from_json, persistent_queue_replay_from_redis_value,
-    replay_outbound_method, restore_persistent_queue_replay, snapshot_outbound_method,
+    replay_outbound_method, replay_outbound_method_without_reply, restore_persistent_queue_replay,
+    snapshot_outbound_method,
 };
 pub use rate_limit::{ChatLimiters, DEFAULT_DISPATCH_INTERVAL, DEFAULT_RATE_LIMITER_MAX_IDLE};
 pub use rich_api::{RichApiClient, RichApiError, RichMessage, RichSendOptions, SendRichMessage};
@@ -104,16 +105,18 @@ pub use transport::{
     TelegramOutboundExecuteError, TelegramOutboundMethod, TelegramOutboundMethodKind,
     TelegramOutboundResponse, TelegramOutboundResponseKind, TelegramSendErrorClassification,
     classify_telegram_send_error, execute_telegram_method, execute_telegram_method_with_rich,
-    send_outbound_method_with_bounded_retry, send_telegram_method_status,
-    send_telegram_method_status_with_rich, telegram_execute_error_is_reply_missing,
+    sanitize_telegram_transport_diagnostic, send_outbound_method_with_bounded_retry,
+    send_telegram_method_status, send_telegram_method_status_with_rich,
+    telegram_execute_error_is_reply_missing,
 };
 pub use update_startup::{
-    GO_LONG_POLL_RETRY_DELAY, GO_LONG_POLL_TIMEOUT, GO_WEBHOOK_UPDATE_BUFFER_SIZE,
-    GO_WEBHOOK_UPDATE_SEND_TIMEOUT, GetUpdatesExecutor, GetUpdatesFuture, LongPollUpdateSource,
-    TELEGRAM_WEBHOOK_PATH, TELEGRAM_WEBHOOK_SECRET_HEADER, WebhookCertificate, WebhookSetup,
-    WebhookUpdateRequestError, WebhookUpdateSendError, WebhookUpdateSender, WebhookUpdateSource,
+    GO_LONG_POLL_RETRY_DELAY, GO_LONG_POLL_TIMEOUT, GetUpdatesExecutor, GetUpdatesFuture,
+    LongPollStreamRunReport, LongPollUpdateSource, TELEGRAM_WEBHOOK_PATH,
+    TELEGRAM_WEBHOOK_SECRET_HEADER, WEBHOOK_STREAM_APPEND_TIMEOUT, WebhookCertificate,
+    WebhookSetup, WebhookUpdateRequestError, WebhookUpdateSendError, WebhookUpdateSender,
     build_delete_webhook_method, build_get_updates_method, build_get_updates_method_with_offset,
-    build_set_webhook_method, go_allowed_update_set, webhook_update_channel,
+    build_set_webhook_method, go_allowed_update_set, run_long_poll_stream_producer_until,
+    webhook_update_stream,
 };
 
 pub const INTEGRATION_CRATE: &str = "carapax";

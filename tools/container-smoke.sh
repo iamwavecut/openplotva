@@ -7,7 +7,8 @@ Usage:
   tools/container-smoke.sh
 
 Builds and boots the release container through compose with disposable
-Postgres/Dragonfly services, and verifies HTTP health/readiness.
+Postgres/Dragonfly/Valkey services, verifies HTTP health/readiness, and proves
+an acknowledged ingress Stream entry survives a Valkey restart through AOF.
 
 Optional env:
   OPENPLOTVA_CONTAINER_SMOKE_LOG_DIR      log directory, default OPENPLOTVA_SMOKE_LOG_DIR or mktemp
@@ -18,6 +19,7 @@ Optional env:
   OPENPLOTVA_CONTAINER_SMOKE_RUNTIME_PORT host runtime API port, default free port
   OPENPLOTVA_CONTAINER_SMOKE_POSTGRES_PORT host Postgres port, default free port
   OPENPLOTVA_CONTAINER_SMOKE_REDIS_PORT   host Dragonfly port, default free port
+  OPENPLOTVA_CONTAINER_SMOKE_INGRESS_REDIS_PORT host Valkey port, default free port
 USAGE
 }
 
@@ -65,6 +67,7 @@ export OPENPLOTVA_DEV_APP_PORT="${OPENPLOTVA_CONTAINER_SMOKE_APP_PORT:-$(free_po
 export OPENPLOTVA_DEV_RUNTIME_API_PORT="${OPENPLOTVA_CONTAINER_SMOKE_RUNTIME_PORT:-$(free_port)}"
 export OPENPLOTVA_DEV_POSTGRES_PORT="${OPENPLOTVA_CONTAINER_SMOKE_POSTGRES_PORT:-$(free_port)}"
 export OPENPLOTVA_DEV_REDIS_PORT="${OPENPLOTVA_CONTAINER_SMOKE_REDIS_PORT:-$(free_port)}"
+export OPENPLOTVA_DEV_UPDATE_STREAM_REDIS_PORT="${OPENPLOTVA_CONTAINER_SMOKE_INGRESS_REDIS_PORT:-$(free_port)}"
 export WEBAPP_URL="${WEBAPP_URL:-http://127.0.0.1:${OPENPLOTVA_DEV_APP_PORT}}"
 export RUNTIME_API_ENABLED="${RUNTIME_API_ENABLED:-false}"
 
@@ -75,7 +78,7 @@ ready_file="${log_dir}/ready.json"
 dump_logs() {
   echo "+ compose project: ${project}" >&2
   "${compose[@]}" ps >&2 || true
-  "${compose[@]}" logs --no-color --tail=200 openplotva postgres dragonfly >&2 || true
+  "${compose[@]}" logs --no-color --tail=200 openplotva postgres dragonfly redis-ingress >&2 || true
 }
 
 cleanup() {
@@ -121,6 +124,26 @@ echo "+ /api/health ok"
 curl -fsS "${base_url}/api/ready" >"$ready_file"
 expect_body_contains "$ready_file" '"status":"ok"'
 echo "+ /api/ready ok"
+
+stream_key="openplotva:container-smoke:aof:${project}"
+stream_id="$("${compose[@]}" exec -T redis-ingress valkey-cli XADD "$stream_key" "*" payload acknowledged | tr -d '\r')"
+"${compose[@]}" exec -T redis-ingress valkey-cli INFO persistence \
+  | tr -d '\r' \
+  | grep -Fq 'aof_enabled:1'
+"${compose[@]}" restart redis-ingress >/dev/null
+for _ in $(seq 1 60); do
+  if "${compose[@]}" exec -T redis-ingress valkey-cli PING 2>/dev/null | grep -Fq PONG; then
+    break
+  fi
+  sleep 1
+done
+persisted="$("${compose[@]}" exec -T redis-ingress valkey-cli XRANGE "$stream_key" "$stream_id" "$stream_id" | tr -d '\r')"
+if ! grep -Fq "$stream_id" <<<"$persisted" || ! grep -Fq acknowledged <<<"$persisted"; then
+  echo "acknowledged Redis Stream entry did not survive AOF restart" >&2
+  exit 1
+fi
+"${compose[@]}" exec -T redis-ingress valkey-cli DEL "$stream_key" >/dev/null
+echo "+ redis-ingress AOF restart durability ok"
 
 echo "container-smoke-ok"
 echo "log: ${log_dir}"

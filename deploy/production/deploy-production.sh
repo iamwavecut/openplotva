@@ -7,6 +7,7 @@ env_file="${deploy_root}/.env.production"
 project="${OPENPLOTVA_COMPOSE_PROJECT:-openplotva}"
 image="${OPENPLOTVA_DEPLOY_IMAGE:?OPENPLOTVA_DEPLOY_IMAGE is required}"
 dragonfly_image="${DRAGONFLY_IMAGE:-docker.dragonflydb.io/dragonflydb/dragonfly:v1.38.1}"
+update_stream_redis_image="${UPDATE_STREAM_REDIS_IMAGE:-valkey/valkey:8.1-alpine}"
 alpine_image="${OPENPLOTVA_DEPLOY_ALPINE_IMAGE:-alpine:3.20}"
 
 log() {
@@ -21,7 +22,7 @@ fail() {
 compose() {
   local db_password
   db_password="$(effective_db_postgres_password)"
-  OPENPLOTVA_IMAGE="$image" DRAGONFLY_IMAGE="$dragonfly_image" DB_POSTGRES_PASSWORD="$db_password" docker compose --env-file "$env_file" -p "$project" -f "$compose_file" "$@"
+  OPENPLOTVA_IMAGE="$image" DRAGONFLY_IMAGE="$dragonfly_image" UPDATE_STREAM_REDIS_IMAGE="$update_stream_redis_image" DB_POSTGRES_PASSWORD="$db_password" docker compose --env-file "$env_file" -p "$project" -f "$compose_file" "$@"
 }
 
 env_file_has_key() {
@@ -80,7 +81,7 @@ docker_login_and_pull() {
   [[ -n "${GHCR_USERNAME:-}" ]] || fail "GHCR_USERNAME is required"
   printf '%s' "$GHCR_PULL_TOKEN" | docker login ghcr.io -u "$GHCR_USERNAME" --password-stdin >/dev/null
   docker pull "$image"
-  compose pull dragonfly
+  compose pull dragonfly redis-ingress
 }
 
 compose_config() {
@@ -239,6 +240,17 @@ ensure_dragonfly() {
   log_dragonfly_info
 }
 
+verify_update_stream_persistence() {
+  local container
+  local persistence
+  container="$(compose ps -q redis-ingress)"
+  [[ -n "$container" ]] || fail "redis-ingress container is missing"
+  persistence="$(docker exec "$container" valkey-cli INFO persistence 2>/dev/null | tr -d '\r')"
+  grep -q '^aof_enabled:1$' <<<"$persistence" || fail "redis-ingress AOF is disabled"
+  grep -q '^aof_last_write_status:ok$' <<<"$persistence" || fail "redis-ingress AOF last write failed"
+  log "redis-ingress AOF enabled and writable"
+}
+
 wait_for_service_health() {
   local service="$1"
   local container
@@ -310,6 +322,9 @@ start_dependencies() {
   fi
 
   ensure_dragonfly
+  ensure_service redis-ingress
+  wait_for_service_health redis-ingress
+  verify_update_stream_persistence
   ensure_service token-estimator
   wait_for_service_health token-estimator
 }
@@ -342,6 +357,58 @@ verify_app() {
   compose ps openplotva
 }
 
+verify_telegram_delivery_plane() {
+  local redis_container
+  local stream_key
+  local stream_id
+  local bot_id
+  local update_id
+  local received_at_ms
+  local payload
+  local db_user
+  local db_name
+  redis_container="$(compose ps -q redis-ingress)"
+  [[ -n "$redis_container" ]] || fail "redis-ingress container is missing"
+  stream_key="$(docker exec "$redis_container" valkey-cli --scan --pattern 'plotva:updates:stream:v1:*' | head -n 1 | tr -d '\r')"
+  [[ -n "$stream_key" ]] || fail "Telegram update Stream was not created at startup"
+  bot_id="${stream_key##*:}"
+  [[ "$bot_id" =~ ^-?[0-9]+$ ]] || fail "cannot parse bot id from Stream key"
+  received_at_ms="$(( $(date +%s) * 1000 ))"
+  update_id="$(( received_at_ms * 1000 + RANDOM ))"
+  payload="{\"update_id\":${update_id},\"openplotva_cutover_probe\":true}"
+  command -v openssl >/dev/null 2>&1 || fail "openssl is required for the cutover probe"
+
+  stream_id="$(printf '%s' "$payload" | openssl dgst -sha256 -binary | docker exec -i "$redis_container" \
+    valkey-cli -x XADD "$stream_key" '*' \
+      schema_version 1 \
+      bot_id "$bot_id" \
+      update_id "$update_id" \
+      source webhook \
+      received_at "$received_at_ms" \
+      payload "$payload" \
+      payload_sha256 | tr -d '\r')"
+
+  db_user="$(env_file_value DB_POSTGRES_USER)"
+  db_user="${db_user:-plotva}"
+  db_name="$(env_file_value DB_POSTGRES_DB)"
+  db_name="${db_name:-plotva}"
+  for _ in $(seq 1 60); do
+    local row
+    local stream_entry
+    row="$(compose exec -T postgresql psql -U "$db_user" -d "$db_name" -Atc \
+      "SELECT status FROM telegram_update_inbox WHERE bot_id = ${bot_id} AND update_id = ${update_id}" 2>/dev/null || true)"
+    stream_entry="$(docker exec "$redis_container" valkey-cli XRANGE "$stream_key" "$stream_id" "$stream_id" COUNT 1 | tr -d '\r')"
+    if [[ "$row" == "ignored" && -z "$stream_entry" ]]; then
+      compose exec -T postgresql psql -U "$db_user" -d "$db_name" -Atc \
+        "DELETE FROM telegram_update_inbox WHERE bot_id = ${bot_id} AND update_id = ${update_id}" >/dev/null
+      log "Telegram delivery plane verified: XADD, inbox materialization, handler outcome, ACK/Delete"
+      return 0
+    fi
+    sleep 1
+  done
+  fail "Telegram delivery plane cutover probe did not reach ignored + ACK/Delete"
+}
+
 main() {
   install_layout
   bootstrap_env
@@ -359,6 +426,7 @@ main() {
   start_dependencies "$postgres_mode"
   start_app
   verify_app
+  verify_telegram_delivery_plane
   log "production deployment applied"
 }
 

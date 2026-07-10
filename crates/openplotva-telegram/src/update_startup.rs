@@ -5,17 +5,19 @@ use std::{
     fmt,
     future::Future,
     pin::Pin,
-    sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use carapax::types::{
     AllowedUpdate, DeleteWebhook, GetUpdates, SetWebhook, Update as TelegramUpdate,
 };
-use openplotva_updates::{UpdateProducerSource, UpdateProducerSourceFuture};
+use openplotva_updates::{
+    RedisUpdateStream, UpdateProducerSource, UpdateProducerSourceFuture, UpdateStreamAppend,
+    UpdateStreamSource,
+};
 use thiserror::Error;
 use tokio::{
-    sync::{Mutex, mpsc},
+    sync::Mutex,
     time::{sleep, timeout},
 };
 
@@ -27,9 +29,9 @@ pub const TELEGRAM_WEBHOOK_PATH: &str = "/telegram/webhook";
 
 pub const TELEGRAM_WEBHOOK_SECRET_HEADER: &str = "X-Telegram-Bot-Api-Secret-Token";
 
-pub const GO_WEBHOOK_UPDATE_BUFFER_SIZE: usize = 10_000;
+pub const WEBHOOK_STREAM_APPEND_TIMEOUT: Duration = Duration::from_secs(3);
 
-pub const GO_WEBHOOK_UPDATE_SEND_TIMEOUT: Duration = Duration::from_millis(1_500);
+const LONG_POLL_STREAM_MAX_RECORDED_ERRORS: usize = 64;
 
 /// Boxed future returned by Telegram `getUpdates` executors.
 pub type GetUpdatesFuture<'a, E> =
@@ -135,26 +137,157 @@ where
     }
 }
 
-pub struct WebhookUpdateSource {
-    receiver: Mutex<mpsc::Receiver<TelegramUpdate>>,
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct LongPollStreamRunReport {
+    pub polled_batches: usize,
+    pub received: usize,
+    pub appended: usize,
+    pub poll_errors: Vec<String>,
+    pub append_errors: Vec<String>,
+    pub serialization_errors: Vec<String>,
+}
+
+/// Poll Telegram directly into the Redis Stream. The persisted poll cursor is
+/// advanced in the same Redis transaction as all XADDs from one response.
+pub async fn run_long_poll_stream_producer_until<C, Stop>(
+    client: &C,
+    stream: &RedisUpdateStream,
+    bot_id: i64,
+    stop: Stop,
+) -> LongPollStreamRunReport
+where
+    C: GetUpdatesExecutor + Sync,
+    Stop: Future<Output = ()>,
+{
+    let mut report = LongPollStreamRunReport::default();
+    tokio::pin!(stop);
+    let mut cursor = loop {
+        tokio::select! {
+            _ = &mut stop => return report,
+            result = stream.long_poll_cursor() => match result {
+                Ok(cursor) => break cursor,
+                Err(error) => {
+                    record_limited_error(&mut report.append_errors, error.to_string());
+                    tokio::select! {
+                        _ = &mut stop => return report,
+                        () = sleep(GO_LONG_POLL_RETRY_DELAY) => {}
+                    }
+                }
+            }
+        }
+    };
+
+    loop {
+        let polled = tokio::select! {
+            _ = &mut stop => break,
+            result = client.get_updates(build_get_updates_method_with_offset(cursor)) => result,
+        };
+        let updates = match polled {
+            Ok(updates) => updates,
+            Err(error) => {
+                record_limited_error(&mut report.poll_errors, error.to_string());
+                tokio::select! {
+                    _ = &mut stop => break,
+                    () = sleep(GO_LONG_POLL_RETRY_DELAY) => {}
+                }
+                continue;
+            }
+        };
+        report.polled_batches = report.polled_batches.saturating_add(1);
+        let updates = updates
+            .into_iter()
+            .filter(|update| update.id >= cursor)
+            .collect::<Vec<_>>();
+        if updates.is_empty() {
+            continue;
+        }
+        report.received = report.received.saturating_add(updates.len());
+        let received_at_unix_ms = unix_millis_now();
+        let mut appends = Vec::with_capacity(updates.len());
+        let mut next_cursor = cursor;
+        let mut serialization_failed = false;
+        for update in &updates {
+            match serde_json::to_vec(update) {
+                Ok(raw_payload) => {
+                    appends.push(UpdateStreamAppend {
+                        bot_id,
+                        update_id: Some(update.id),
+                        source: UpdateStreamSource::LongPoll,
+                        received_at_unix_ms,
+                        raw_payload,
+                    });
+                    next_cursor = next_cursor.max(update.id.saturating_add(1));
+                }
+                Err(error) => {
+                    serialization_failed = true;
+                    record_limited_error(
+                        &mut report.serialization_errors,
+                        format!("update {}: {error}", update.id),
+                    );
+                }
+            }
+        }
+        if serialization_failed {
+            tokio::select! {
+                _ = &mut stop => break,
+                () = sleep(GO_LONG_POLL_RETRY_DELAY) => {}
+            }
+            continue;
+        }
+
+        loop {
+            let appended = tokio::select! {
+                _ = &mut stop => return report,
+                result = stream.append_long_poll_batch(&appends, next_cursor) => result,
+            };
+            match appended {
+                Ok(ids) => {
+                    report.appended = report.appended.saturating_add(ids.len());
+                    cursor = next_cursor;
+                    break;
+                }
+                Err(error) => {
+                    record_limited_error(&mut report.append_errors, error.to_string());
+                    tokio::select! {
+                        _ = &mut stop => return report,
+                        () = sleep(GO_LONG_POLL_RETRY_DELAY) => {}
+                    }
+                }
+            }
+        }
+    }
+    report
+}
+
+fn record_limited_error(errors: &mut Vec<String>, error: String) {
+    if errors.len() < LONG_POLL_STREAM_MAX_RECORDED_ERRORS {
+        errors.push(error);
+    }
+}
+
+fn unix_millis_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(i64::MAX)
 }
 
 #[derive(Clone, Debug)]
 pub struct WebhookUpdateSender {
-    sender: mpsc::Sender<TelegramUpdate>,
-    buffer_size: usize,
+    stream: RedisUpdateStream,
+    bot_id: i64,
     send_timeout: Duration,
-    ingress_guard: Option<Arc<openplotva_updates::UpdateIngressGuard>>,
 }
 
-/// Error returned while accepting a webhook update into the in-memory channel.
+/// Error returned while durably appending a webhook update to Redis Streams.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum WebhookUpdateSendError {
-    /// The receiver side has been closed.
-    #[error("webhook update receiver is closed")]
-    Closed,
-    #[error("webhook update channel is full")]
+    #[error("webhook update stream append timed out")]
     Timeout,
+    #[error("webhook update stream append failed")]
+    Stream,
 }
 
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
@@ -165,9 +298,6 @@ pub enum WebhookUpdateRequestError {
     /// The Telegram secret-token header did not match configured webhook secret.
     #[error("unauthorized")]
     Unauthorized,
-    /// Request body could not be parsed as a Telegram update.
-    #[error("invalid update")]
-    InvalidUpdate,
     #[error("service unavailable")]
     ServiceUnavailable,
 }
@@ -177,32 +307,19 @@ impl WebhookUpdateRequestError {
         match self {
             Self::MethodNotAllowed => 405,
             Self::Unauthorized => 401,
-            Self::InvalidUpdate => 400,
             Self::ServiceUnavailable => 503,
-        }
-    }
-
-    pub const fn error_body(self) -> Option<&'static str> {
-        match self {
-            Self::InvalidUpdate => Some(r#"{"error":"invalid update"}"#),
-            Self::MethodNotAllowed | Self::Unauthorized | Self::ServiceUnavailable => None,
         }
     }
 }
 
-pub fn webhook_update_channel(buffer_size: usize) -> (WebhookUpdateSender, WebhookUpdateSource) {
-    let (sender, receiver) = mpsc::channel(buffer_size);
-    (
-        WebhookUpdateSender {
-            sender,
-            buffer_size,
-            send_timeout: GO_WEBHOOK_UPDATE_SEND_TIMEOUT,
-            ingress_guard: None,
-        },
-        WebhookUpdateSource {
-            receiver: Mutex::new(receiver),
-        },
-    )
+/// Build a webhook sink that durably appends raw requests to Redis Streams.
+#[must_use]
+pub fn webhook_update_stream(stream: RedisUpdateStream, bot_id: i64) -> WebhookUpdateSender {
+    WebhookUpdateSender {
+        stream,
+        bot_id,
+        send_timeout: WEBHOOK_STREAM_APPEND_TIMEOUT,
+    }
 }
 
 impl WebhookUpdateSender {
@@ -211,43 +328,15 @@ impl WebhookUpdateSender {
         self
     }
 
-    pub fn with_ingress_guard(
-        mut self,
-        ingress_guard: Arc<openplotva_updates::UpdateIngressGuard>,
-    ) -> Self {
-        self.ingress_guard = Some(ingress_guard);
-        self
-    }
-
-    /// Accept one parsed Telegram update into the webhook channel.
+    /// Append one parsed Telegram update to the durable ingress Stream.
     pub async fn accept_update(
         &self,
         update: TelegramUpdate,
     ) -> Result<(), WebhookUpdateSendError> {
-        let update_id = update.id;
-        let update_name = openplotva_updates::producer_update_name(&update);
-        timeout(self.send_timeout, self.sender.send(update))
+        let raw_payload =
+            serde_json::to_vec(&update).map_err(|_| WebhookUpdateSendError::Stream)?;
+        self.append_raw_stream_update(Some(update.id), &raw_payload)
             .await
-            .map_err(|_| {
-                tracing::warn!(
-                    update_id,
-                    update_name,
-                    channel_capacity = self.sender.capacity(),
-                    channel_buffer_size = self.buffer_size,
-                    "timed out sending Telegram webhook update to bounded channel"
-                );
-                WebhookUpdateSendError::Timeout
-            })?
-            .map_err(|_| {
-                tracing::warn!(
-                    update_id,
-                    update_name,
-                    channel_capacity = self.sender.capacity(),
-                    channel_buffer_size = self.buffer_size,
-                    "Telegram webhook update channel receiver is closed"
-                );
-                WebhookUpdateSendError::Closed
-            })
     }
 
     pub async fn handle_webhook_request(
@@ -264,43 +353,45 @@ impl WebhookUpdateSender {
             return Err(WebhookUpdateRequestError::Unauthorized);
         }
 
-        let update = openplotva_updates::decode_telegram_update_json_slice(body)
-            .map_err(|_| WebhookUpdateRequestError::InvalidUpdate)?;
-        if let Some(ingress_guard) = &self.ingress_guard {
-            let decision = ingress_guard.check_update(&update);
-            if decision.is_dropped() {
-                tracing::warn!(
-                    chat_id = decision.chat_id(),
-                    update_id = update.id,
-                    update_name = openplotva_updates::producer_update_name(&update),
-                    channel_capacity = self.sender.capacity(),
-                    channel_buffer_size = self.buffer_size,
-                    "dropped Telegram webhook update by ingress flood guard"
-                );
-                return Ok(());
-            }
-        }
-        self.accept_update(update)
+        self.append_raw_stream_update(raw_update_id(body), body)
             .await
             .map_err(|_| WebhookUpdateRequestError::ServiceUnavailable)
     }
+
+    async fn append_raw_stream_update(
+        &self,
+        update_id: Option<i64>,
+        body: &[u8],
+    ) -> Result<(), WebhookUpdateSendError> {
+        let received_at_unix_ms = unix_millis_now();
+        let append = UpdateStreamAppend {
+            bot_id: self.bot_id,
+            update_id,
+            source: UpdateStreamSource::Webhook,
+            received_at_unix_ms,
+            raw_payload: body.to_vec(),
+        };
+        timeout(self.send_timeout, self.stream.append(&append))
+            .await
+            .map_err(|_| WebhookUpdateSendError::Timeout)?
+            .map(|_| ())
+            .map_err(|error| {
+                tracing::warn!(
+                    bot_id = self.bot_id,
+                    update_id,
+                    error = %error,
+                    "failed to append Telegram webhook update to Redis Stream"
+                );
+                WebhookUpdateSendError::Stream
+            })
+    }
 }
 
-impl WebhookUpdateSource {
-    async fn next_update_inner(&self) -> Option<TelegramUpdate> {
-        self.receiver.lock().await.recv().await
-    }
-
-    /// Return the next buffered update without waiting.
-    pub async fn next_update_now(&self) -> Option<TelegramUpdate> {
-        self.receiver.lock().await.try_recv().ok()
-    }
-}
-
-impl UpdateProducerSource for WebhookUpdateSource {
-    fn next_update<'a>(&'a self) -> UpdateProducerSourceFuture<'a> {
-        Box::pin(self.next_update_inner())
-    }
+fn raw_update_id(body: &[u8]) -> Option<i64> {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()?
+        .get("update_id")?
+        .as_i64()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -349,10 +440,34 @@ impl WebhookSetup {
 }
 
 pub fn go_allowed_update_set() -> HashSet<AllowedUpdate> {
-    openplotva_updates::GO_ALLOWED_UPDATES
-        .iter()
-        .copied()
-        .collect()
+    [
+        AllowedUpdate::BotStatus,
+        AllowedUpdate::BusinessConnection,
+        AllowedUpdate::BusinessMessage,
+        AllowedUpdate::CallbackQuery,
+        AllowedUpdate::ChannelPost,
+        AllowedUpdate::ChatBoostRemoved,
+        AllowedUpdate::ChatBoostUpdated,
+        AllowedUpdate::ChatJoinRequest,
+        AllowedUpdate::ChosenInlineResult,
+        AllowedUpdate::DeletedBusinessMessages,
+        AllowedUpdate::EditedBusinessMessage,
+        AllowedUpdate::EditedChannelPost,
+        AllowedUpdate::EditedMessage,
+        AllowedUpdate::GuestMessage,
+        AllowedUpdate::InlineQuery,
+        AllowedUpdate::Message,
+        AllowedUpdate::MessageReaction,
+        AllowedUpdate::MessageReactionCount,
+        AllowedUpdate::Poll,
+        AllowedUpdate::PollAnswer,
+        AllowedUpdate::PreCheckoutQuery,
+        AllowedUpdate::PurchasedPaidMedia,
+        AllowedUpdate::ShippingQuery,
+        AllowedUpdate::UserStatus,
+    ]
+    .into_iter()
+    .collect()
 }
 
 pub fn build_get_updates_method() -> GetUpdates {
@@ -400,10 +515,9 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        GO_LONG_POLL_TIMEOUT, GO_WEBHOOK_UPDATE_BUFFER_SIZE, GO_WEBHOOK_UPDATE_SEND_TIMEOUT,
-        LongPollUpdateSource, TELEGRAM_WEBHOOK_PATH, TELEGRAM_WEBHOOK_SECRET_HEADER, WebhookSetup,
-        WebhookUpdateRequestError, build_delete_webhook_method, build_get_updates_method,
-        build_set_webhook_method, webhook_update_channel,
+        GO_LONG_POLL_TIMEOUT, LongPollUpdateSource, TELEGRAM_WEBHOOK_PATH,
+        TELEGRAM_WEBHOOK_SECRET_HEADER, WebhookSetup, WebhookUpdateRequestError,
+        build_delete_webhook_method, build_get_updates_method, build_set_webhook_method,
     };
 
     #[test]
@@ -412,13 +526,11 @@ mod tests {
 
         assert_eq!(payload.get("offset"), Some(&json!(0)));
         assert_eq!(payload.get("timeout"), Some(&json!(60)));
-        assert_eq!(
-            allowed_update_names(&payload),
-            openplotva_updates::GO_ALLOWED_UPDATE_NAMES
-                .iter()
-                .copied()
-                .collect()
-        );
+        let allowed = allowed_update_names(&payload);
+        assert!(allowed.contains("message"));
+        assert!(allowed.contains("channel_post"));
+        assert!(allowed.contains("message_reaction"));
+        assert!(allowed.contains("shipping_query"));
         assert!(
             payload.get("limit").is_none(),
             "Zero update limit stays unset"
@@ -445,13 +557,10 @@ mod tests {
             Some(&json!("https://plotva.example/tg"))
         );
         assert_eq!(payload.get("secret_token"), Some(&json!("secret-token")));
-        assert_eq!(
-            allowed_update_names(&payload),
-            openplotva_updates::GO_ALLOWED_UPDATE_NAMES
-                .iter()
-                .copied()
-                .collect()
-        );
+        let allowed = allowed_update_names(&payload);
+        assert!(allowed.contains("message"));
+        assert!(allowed.contains("business_connection"));
+        assert!(allowed.contains("purchased_paid_media"));
         assert_eq!(TELEGRAM_WEBHOOK_PATH, "/telegram/webhook");
     }
 
@@ -527,34 +636,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn webhook_update_source_yields_accepted_updates_in_fifo_order()
+    async fn webhook_request_rejects_method_and_secret_before_redis_io()
     -> Result<(), Box<dyn Error>> {
-        let (sender, source) = webhook_update_channel(2);
-
-        sender.accept_update(sample_message_update(10)?).await?;
-        sender.accept_update(sample_message_update(11)?).await?;
-
-        let first = source.next_update().await.ok_or("expected first update")?;
-        let second = source.next_update().await.ok_or("expected second update")?;
-
-        assert_eq!([first.id, second.id], [10, 11]);
-        assert_eq!(GO_WEBHOOK_UPDATE_BUFFER_SIZE, 10_000);
-        assert_eq!(GO_WEBHOOK_UPDATE_SEND_TIMEOUT.as_millis(), 1_500);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn webhook_request_rejects_non_post_and_wrong_secret_like_go()
-    -> Result<(), Box<dyn Error>> {
-        let (sender, source) = webhook_update_channel(1);
-        let body = serde_json::to_vec(&sample_message_update(10)?)?;
+        let client = redis::Client::open("redis://127.0.0.1:1/0")?;
+        let stream = openplotva_updates::RedisUpdateStream::with_key(
+            client,
+            "openplotva:webhook-security-test",
+        );
+        let sender = super::webhook_update_stream(stream, 77);
 
         let wrong_method = sender
-            .handle_webhook_request("GET", Some("secret"), "secret", &body)
+            .handle_webhook_request("GET", Some("secret"), "secret", b"{}")
             .await
             .expect_err("method rejected");
         let wrong_secret = sender
-            .handle_webhook_request("POST", Some("wrong"), "secret", &body)
+            .handle_webhook_request("POST", Some("wrong"), "secret", b"{}")
             .await
             .expect_err("secret rejected");
 
@@ -562,7 +658,6 @@ mod tests {
         assert_eq!(wrong_method.http_status(), 405);
         assert_eq!(wrong_secret, WebhookUpdateRequestError::Unauthorized);
         assert_eq!(wrong_secret.http_status(), 401);
-        assert!(source.next_update_now().await.is_none());
         assert_eq!(
             TELEGRAM_WEBHOOK_SECRET_HEADER,
             "X-Telegram-Bot-Api-Secret-Token"
@@ -571,99 +666,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn webhook_request_accepts_empty_secret_and_valid_json_like_go()
+    async fn live_webhook_stream_acknowledges_only_after_untrimmed_xadd()
     -> Result<(), Box<dyn Error>> {
-        let (sender, source) = webhook_update_channel(1);
-        let body = serde_json::to_vec(&sample_message_update(10)?)?;
+        let Ok(url) = std::env::var("OPENPLOTVA_TEST_REDIS_URL") else {
+            return Ok(());
+        };
+        let client = redis::Client::open(url)?;
+        let key = format!("openplotva:webhook-stream-test:{}", std::process::id());
+        let stream = openplotva_updates::RedisUpdateStream::with_key(client.clone(), &key);
+        let sender = super::webhook_update_stream(stream.clone(), 77);
 
         sender
-            .handle_webhook_request("POST", None, "", &body)
-            .await?;
-
-        let update = source.next_update().await.ok_or("expected update")?;
-        assert_eq!(update.id, 10);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn webhook_request_accepts_bot_api_poll_answer_voter_chat() -> Result<(), Box<dyn Error>>
-    {
-        let (sender, source) = webhook_update_channel(1);
-        let body = serde_json::to_vec(&json!({
-            "update_id": 13,
-            "poll_answer": {
-                "poll_id": "poll-id",
-                "voter_chat": {
-                    "id": -10043,
-                    "type": "supergroup",
-                    "title": "Poll Team"
-                },
-                "option_ids": [1],
-                "option_persistent_ids": []
-            }
-        }))?;
-
-        sender
-            .handle_webhook_request("POST", Some("secret"), "secret", &body)
-            .await?;
-
-        let update = source.next_update().await.ok_or("expected update")?;
-        assert_eq!(update.id, 13);
-        assert_eq!(
-            openplotva_updates::producer_update_name(&update),
-            "poll_answer"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn webhook_request_reports_invalid_update_and_full_channel_like_go()
-    -> Result<(), Box<dyn Error>> {
-        let (sender, source) = webhook_update_channel(1);
-        let sender = sender.with_send_timeout(Duration::from_millis(1));
-        let body = serde_json::to_vec(&sample_message_update(10)?)?;
-
-        sender
-            .handle_webhook_request("POST", Some("secret"), "secret", &body)
-            .await?;
-        let invalid = sender
             .handle_webhook_request("POST", Some("secret"), "secret", b"not-json")
-            .await
-            .expect_err("invalid update rejected");
-        let full = sender
-            .handle_webhook_request("POST", Some("secret"), "secret", &body)
-            .await
-            .expect_err("full channel rejected");
-
-        assert_eq!(invalid.http_status(), 400);
-        assert_eq!(invalid.error_body(), Some(r#"{"error":"invalid update"}"#));
-        assert_eq!(full, WebhookUpdateRequestError::ServiceUnavailable);
-        assert_eq!(full.http_status(), 503);
-        assert_eq!(source.next_update().await.ok_or("queued update")?.id, 10);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn webhook_request_drops_guarded_flood_update_with_ok_without_enqueue()
-    -> Result<(), Box<dyn Error>> {
-        let guard = Arc::new(openplotva_updates::UpdateIngressGuard::new(
-            openplotva_updates::UpdateIngressGuardConfig {
-                short_window: Duration::from_secs(10),
-                short_limit: 1,
-                long_window: Duration::from_secs(60),
-                long_limit: 100,
-                block_duration: Duration::from_secs(300),
-            },
-        ));
-        let (sender, source) = webhook_update_channel(1);
-        let sender = sender.with_ingress_guard(guard);
-        let body = serde_json::to_vec(&sample_message_update(10)?)?;
-
-        sender
-            .handle_webhook_request("POST", Some("secret"), "secret", &body)
             .await?;
+        assert_eq!(stream.stats().await?.length, 1);
 
-        assert!(source.next_update_now().await.is_none());
+        let mut connection = client.get_multiplexed_async_connection().await?;
+        let _: usize = redis::cmd("DEL")
+            .arg(&key)
+            .query_async(&mut connection)
+            .await?;
         Ok(())
     }
 

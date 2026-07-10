@@ -15,8 +15,12 @@ services:
       REDIS_HOST: dragonfly
       REDIS_PORT: 6379
       REDIS_DB: ${REDIS_DB:-0}
-      UPDATE_QUEUE_BACKEND: ${UPDATE_QUEUE_BACKEND:-list}
-      BOT_WEBHOOK_UPDATE_BUFFER_SIZE: ${BOT_WEBHOOK_UPDATE_BUFFER_SIZE:-10000}
+      UPDATE_QUEUE_BACKEND: stream
+      UPDATE_STREAM_REDIS_URL: redis://redis-ingress:6379/0
+      UPDATE_MATERIALIZER_BATCH_MAX_ROWS: ${UPDATE_MATERIALIZER_BATCH_MAX_ROWS:-512}
+      UPDATE_MATERIALIZER_BATCH_MAX_BYTES: ${UPDATE_MATERIALIZER_BATCH_MAX_BYTES:-8388608}
+      UPDATE_MATERIALIZER_BATCH_MAX_WAIT_MS: ${UPDATE_MATERIALIZER_BATCH_MAX_WAIT_MS:-50}
+      UPDATE_MATERIALIZER_DB_TIMEOUT_MS: ${UPDATE_MATERIALIZER_DB_TIMEOUT_MS:-5000}
       MEMORY_TOKEN_ESTIMATOR_URL: http://token-estimator:12600
       RUNTIME_API_ENABLED: "true"
       RUNTIME_API_HOST: 0.0.0.0
@@ -34,6 +38,8 @@ services:
       postgresql:
         condition: service_healthy
       dragonfly:
+        condition: service_healthy
+      redis-ingress:
         condition: service_healthy
       token-estimator:
         condition: service_healthy
@@ -116,6 +122,36 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  redis-ingress:
+    image: ${UPDATE_STREAM_REDIS_IMAGE:-valkey/valkey:8.1-alpine}
+    command:
+      - valkey-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - always
+      - --maxmemory
+      - ${UPDATE_STREAM_MAXMEMORY:-2867mb}
+      - --maxmemory-policy
+      - noeviction
+    mem_limit: ${UPDATE_STREAM_CONTAINER_MEMORY:-4g}
+    volumes:
+      - redis-ingress-data:/data
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - plotva-net
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
+
   token-estimator:
     build:
       context: ./tools/token-estimator
@@ -149,4 +185,5 @@ volumes:
   openplotva-state:
   postgres-data:
   dragonfly-data:
+  redis-ingress-data:
   token-estimator-cache:

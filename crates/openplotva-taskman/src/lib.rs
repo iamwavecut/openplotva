@@ -80,6 +80,8 @@ pub enum JobStatus {
     Pending,
     /// Job has been dequeued by a worker.
     Processing,
+    /// Executor finished, but durable outbound delivery is still pending.
+    WaitingDelivery,
     /// Job completed without executor failure.
     Completed,
     /// Job failed and carries an error string.
@@ -94,6 +96,7 @@ impl JobStatus {
         match self {
             Self::Pending => "pending",
             Self::Processing => "processing",
+            Self::WaitingDelivery => "waiting_delivery",
             Self::Completed => "completed",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
@@ -102,7 +105,10 @@ impl JobStatus {
 
     #[must_use]
     pub const fn is_active(self) -> bool {
-        matches!(self, Self::Pending | Self::Processing)
+        matches!(
+            self,
+            Self::Pending | Self::Processing | Self::WaitingDelivery
+        )
     }
 }
 
@@ -362,7 +368,7 @@ pub struct ControlJobParams {
     pub data: ControlJobData,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DialogJobParams {
     pub chat_id: i64,
     pub message_id: i32,
@@ -373,6 +379,37 @@ pub struct DialogJobParams {
     pub meta: serde_json::Value,
     pub max_output_tokens: i32,
     pub thread_id: Option<i32>,
+}
+
+/// Optional scheduling and debounce metadata stored atomically with a new job.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+pub struct TaskQueueSchedule {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub available_at: Option<OffsetDateTime>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub debounce_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lane_key: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub source_update_ids: Vec<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_update_id: Option<i64>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub pending_dialog_inputs: Vec<DialogJobParams>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TaskQueueScheduleDisposition {
+    Assigned,
+    Replaced,
+    Reused,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TaskQueueScheduleReport {
+    pub task_id: i64,
+    pub disposition: TaskQueueScheduleDisposition,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -474,6 +511,18 @@ pub struct TaskQueueRecord {
     pub queue_name: String,
     pub status: JobStatus,
     pub job: StatelessJobItem,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_at: Option<OffsetDateTime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub debounce_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_update_ids: Vec<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_update_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_dialog_inputs: Vec<DialogJobParams>,
     /// Worker ID that dequeued this job.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worker_id: Option<String>,
@@ -982,6 +1031,16 @@ impl InMemoryTaskQueue {
 
     /// Assign a job to a named queue and return its taskman ID.
     pub fn assign(&self, queue_name: impl Into<String>, job: StatelessJobItem) -> i64 {
+        self.assign_with_schedule(queue_name, job, TaskQueueSchedule::default())
+    }
+
+    /// Assign a job together with its durable scheduling and debounce metadata.
+    pub fn assign_with_schedule(
+        &self,
+        queue_name: impl Into<String>,
+        job: StatelessJobItem,
+        schedule: TaskQueueSchedule,
+    ) -> i64 {
         let mut state = self.lock();
         let id = self.next_job_id(&mut state);
         let record = TaskQueueRecord {
@@ -989,6 +1048,12 @@ impl InMemoryTaskQueue {
             queue_name: queue_name.into(),
             status: JobStatus::Pending,
             job,
+            available_at: schedule.available_at,
+            debounce_key: schedule.debounce_key,
+            lane_key: schedule.lane_key,
+            source_update_ids: schedule.source_update_ids,
+            latest_update_id: schedule.latest_update_id,
+            pending_dialog_inputs: schedule.pending_dialog_inputs,
             worker_id: None,
             started_at: None,
             execution_started_at: None,
@@ -1004,6 +1069,107 @@ impl InMemoryTaskQueue {
         self.append_wal_record(task_queue_wal_upsert(record));
         drop(state);
         id
+    }
+
+    /// Atomically assign a scheduled job or replace the pending job with the
+    /// same queue/debounce key. A retry at or below `latest_update_id` reuses
+    /// the existing record instead of overwriting newer dialog input.
+    pub fn schedule_or_replace(
+        &self,
+        queue_name: impl Into<String>,
+        job: StatelessJobItem,
+        schedule: TaskQueueSchedule,
+    ) -> TaskQueueScheduleReport {
+        let queue_name = queue_name.into();
+        let mut state = self.lock();
+
+        if let Some(source_update_id) = schedule.latest_update_id
+            && let Some(record) = state.records.iter().find(|record| {
+                record.queue_name == queue_name
+                    && record.job.data.job_type == job.data.job_type
+                    && record.debounce_key == schedule.debounce_key
+                    && record.source_update_ids.contains(&source_update_id)
+            })
+        {
+            return TaskQueueScheduleReport {
+                task_id: record.id,
+                disposition: TaskQueueScheduleDisposition::Reused,
+            };
+        }
+
+        let pending_index = schedule.debounce_key.as_deref().and_then(|debounce_key| {
+            state.records.iter().position(|record| {
+                record.queue_name == queue_name
+                    && record.status == JobStatus::Pending
+                    && record.debounce_key.as_deref() == Some(debounce_key)
+            })
+        });
+        if let Some(index) = pending_index {
+            let record = &mut state.records[index];
+            let disposition = apply_schedule_to_pending_record(record, job, schedule);
+            let record = record.clone();
+            self.append_wal_record(task_queue_wal_upsert(record.clone()));
+            drop(state);
+            return TaskQueueScheduleReport {
+                task_id: record.id,
+                disposition,
+            };
+        }
+
+        let id = self.next_job_id(&mut state);
+        let record = TaskQueueRecord {
+            id,
+            queue_name,
+            status: JobStatus::Pending,
+            job,
+            available_at: schedule.available_at,
+            debounce_key: schedule.debounce_key,
+            lane_key: schedule.lane_key,
+            source_update_ids: schedule.source_update_ids,
+            latest_update_id: schedule.latest_update_id,
+            pending_dialog_inputs: schedule.pending_dialog_inputs,
+            worker_id: None,
+            started_at: None,
+            execution_started_at: None,
+            completed_at: None,
+            error: None,
+            progress_message_id: None,
+            result_message_id: None,
+            messages: Vec::new(),
+            events: Vec::new(),
+            agent_state: None,
+        };
+        state.records.push(record.clone());
+        self.append_wal_record(task_queue_wal_upsert(record));
+        drop(state);
+        TaskQueueScheduleReport {
+            task_id: id,
+            disposition: TaskQueueScheduleDisposition::Assigned,
+        }
+    }
+
+    /// Atomically update one known pending scheduled job. Returns `None` when
+    /// the job was already claimed or removed, so edited-message handling does
+    /// not create a second job at the dequeue boundary.
+    pub fn update_pending_schedule(
+        &self,
+        job_id: i64,
+        job: StatelessJobItem,
+        schedule: TaskQueueSchedule,
+    ) -> Option<TaskQueueScheduleReport> {
+        let mut state = self.lock();
+        let record = state
+            .records
+            .iter_mut()
+            .find(|record| record.id == job_id && record.status == JobStatus::Pending)?;
+        let disposition = apply_schedule_to_pending_record(record, job, schedule);
+        let record = record.clone();
+        self.append_wal_record(task_queue_wal_upsert(record.clone()));
+        drop(state);
+        Some(TaskQueueScheduleReport {
+            task_id: record.id,
+            disposition,
+        })
     }
 
     /// Assign a job only when the user has fewer than `max_active_jobs` active jobs.
@@ -1032,7 +1198,7 @@ impl InMemoryTaskQueue {
         started_at: OffsetDateTime,
     ) -> Option<TaskQueueWorkItem> {
         let mut state = self.lock();
-        let index = next_pending_index(&state.records, queue_name)?;
+        let index = next_pending_index(&state.records, queue_name, started_at)?;
         let worker_id = worker_id.into();
         let (id, job, events, record) = {
             let record = &mut state.records[index];
@@ -1063,7 +1229,9 @@ impl InMemoryTaskQueue {
         mut predicate: impl FnMut(&StatelessJobItem) -> bool,
     ) -> Option<TaskQueueWorkItem> {
         let mut state = self.lock();
-        let index = next_pending_index_matching(&state.records, queue_name, |job| predicate(job))?;
+        let index = next_pending_index_matching(&state.records, queue_name, started_at, |job| {
+            predicate(job)
+        })?;
         let worker_id = worker_id.into();
         let (id, job, events, record) = {
             let record = &mut state.records[index];
@@ -1097,7 +1265,7 @@ impl InMemoryTaskQueue {
     ) -> Option<TaskQueueAgentWorkItem> {
         let mut state = self.lock();
         let worker_id = worker_id.into();
-        let (index, resumed) = match next_pending_index(&state.records, queue_name) {
+        let (index, resumed) = match next_pending_index(&state.records, queue_name, started_at) {
             Some(index) => (index, false),
             None => (next_orphaned_agent_index(&state.records, queue_name)?, true),
         };
@@ -1185,6 +1353,26 @@ impl InMemoryTaskQueue {
         self.append_wal_records(records.into_iter().map(task_queue_wal_upsert));
         drop(state);
         report
+    }
+
+    /// Hand a processed job off to durable outbound delivery. Startup recovery
+    /// intentionally leaves this active state untouched.
+    pub fn wait_for_delivery(&self, job_id: i64) -> Result<bool, TaskQueueError> {
+        let mut state = self.lock();
+        let record = state
+            .records
+            .iter_mut()
+            .find(|record| record.id == job_id)
+            .ok_or(TaskQueueError::JobNotFound(job_id))?;
+        if record.status != JobStatus::Processing {
+            return Ok(false);
+        }
+        record.status = JobStatus::WaitingDelivery;
+        record.worker_id = None;
+        let record = record.clone();
+        self.append_wal_record(task_queue_wal_upsert(record));
+        drop(state);
+        Ok(true)
     }
 
     /// Mark a job completed.
@@ -1282,6 +1470,12 @@ impl InMemoryTaskQueue {
             queue_name,
             status: JobStatus::Pending,
             job,
+            available_at: None,
+            debounce_key: None,
+            lane_key: None,
+            source_update_ids: Vec::new(),
+            latest_update_id: None,
+            pending_dialog_inputs: Vec::new(),
             worker_id: None,
             started_at: None,
             execution_started_at: None,
@@ -2941,8 +3135,67 @@ fn clean_unicode_char(ch: char) -> Option<char> {
     }
 }
 
-fn next_pending_index(records: &[TaskQueueRecord], queue_name: &str) -> Option<usize> {
-    next_pending_index_matching(records, queue_name, |_| true)
+fn schedule_is_newer(existing: Option<i64>, incoming: Option<i64>) -> bool {
+    match (existing, incoming) {
+        (Some(existing), Some(incoming)) => incoming > existing,
+        (None, Some(_)) | (None, None) => true,
+        (Some(_), None) => false,
+    }
+}
+
+fn apply_schedule_to_pending_record(
+    record: &mut TaskQueueRecord,
+    job: StatelessJobItem,
+    schedule: TaskQueueSchedule,
+) -> TaskQueueScheduleDisposition {
+    merge_source_update_ids(&mut record.source_update_ids, &schedule.source_update_ids);
+    if !schedule_is_newer(record.latest_update_id, schedule.latest_update_id) {
+        return TaskQueueScheduleDisposition::Reused;
+    }
+    merge_pending_dialog_inputs(
+        &mut record.pending_dialog_inputs,
+        schedule.pending_dialog_inputs,
+    );
+    record.job = job;
+    record.available_at = schedule.available_at;
+    record.debounce_key = schedule.debounce_key;
+    record.lane_key = schedule.lane_key;
+    record.latest_update_id = schedule.latest_update_id;
+    TaskQueueScheduleDisposition::Replaced
+}
+
+fn merge_source_update_ids(existing: &mut Vec<i64>, incoming: &[i64]) {
+    for source_update_id in incoming {
+        if !existing.contains(source_update_id) {
+            existing.push(*source_update_id);
+        }
+    }
+}
+
+fn merge_pending_dialog_inputs(
+    existing: &mut Vec<DialogJobParams>,
+    incoming: Vec<DialogJobParams>,
+) {
+    for input in incoming {
+        if let Some(index) = existing.iter().position(|candidate| {
+            candidate.chat_id == input.chat_id
+                && candidate.message_id == input.message_id
+                && candidate.user_id == input.user_id
+                && candidate.thread_id == input.thread_id
+        }) {
+            existing[index] = input;
+        } else {
+            existing.push(input);
+        }
+    }
+}
+
+fn next_pending_index(
+    records: &[TaskQueueRecord],
+    queue_name: &str,
+    now: OffsetDateTime,
+) -> Option<usize> {
+    next_pending_index_matching(records, queue_name, now, |_| true)
 }
 
 fn is_agent_record(record: &TaskQueueRecord) -> bool {
@@ -2968,20 +3221,22 @@ fn next_orphaned_agent_index(records: &[TaskQueueRecord], queue_name: &str) -> O
 fn next_pending_index_matching(
     records: &[TaskQueueRecord],
     queue_name: &str,
+    now: OffsetDateTime,
     mut predicate: impl FnMut(&StatelessJobItem) -> bool,
 ) -> Option<usize> {
     let lane_blockers =
-        (queue_name == DIALOG_AIFARM_QUEUE_NAME).then(|| dialog_lane_blockers(records));
+        (queue_name == DIALOG_AIFARM_QUEUE_NAME).then(|| dialog_lane_blockers(records, now));
     records
         .iter()
         .enumerate()
         .filter(|(_index, record)| {
             record.queue_name == queue_name && record.status == JobStatus::Pending
         })
+        .filter(|(_index, record)| task_queue_record_is_available(record, now))
         .filter(|(index, record)| {
             !dialog_lane_blocked(lane_blockers.as_ref(), records, *index, record)
         })
-        .filter(|(_index, record)| !image_work_blocked_by_active_asr(records, record))
+        .filter(|(_index, record)| !image_work_blocked_by_active_asr(records, record, now))
         .filter(|(_index, record)| predicate(&record.job))
         .min_by(|(_left_index, left), (_right_index, right)| compare_go_queue_records(left, right))
         .map(|(index, _record)| index)
@@ -2993,6 +3248,7 @@ fn next_pending_index_matching(
 fn image_work_blocked_by_active_asr(
     records: &[TaskQueueRecord],
     candidate: &TaskQueueRecord,
+    now: OffsetDateTime,
 ) -> bool {
     if !matches!(
         candidate.job.data.job_type,
@@ -3001,10 +3257,17 @@ fn image_work_blocked_by_active_asr(
         return false;
     }
     records.iter().any(|record| {
-        record.status.is_active()
+        (record.status == JobStatus::Processing
+            || (record.status == JobStatus::Pending && task_queue_record_is_available(record, now)))
             && record.job.data.job_type == JobType::Asr
             && record.job.priority > candidate.job.priority
     })
+}
+
+fn task_queue_record_is_available(record: &TaskQueueRecord, now: OffsetDateTime) -> bool {
+    record
+        .available_at
+        .is_none_or(|available_at| available_at <= now)
 }
 
 fn compare_go_queue_records(left: &TaskQueueRecord, right: &TaskQueueRecord) -> std::cmp::Ordering {
@@ -3047,7 +3310,10 @@ struct DialogLaneBlocker {
     best_pending_index: Option<usize>,
 }
 
-fn dialog_lane_blockers(records: &[TaskQueueRecord]) -> BTreeMap<(i64, i32), DialogLaneBlocker> {
+fn dialog_lane_blockers(
+    records: &[TaskQueueRecord],
+    now: OffsetDateTime,
+) -> BTreeMap<(i64, i32), DialogLaneBlocker> {
     let mut blockers: BTreeMap<(i64, i32), DialogLaneBlocker> = BTreeMap::new();
     for (index, record) in records.iter().enumerate() {
         if !indexes_dialog_lane(record) {
@@ -3055,8 +3321,8 @@ fn dialog_lane_blockers(records: &[TaskQueueRecord]) -> BTreeMap<(i64, i32), Dia
         }
         let blocker = blockers.entry(dialog_lane_key(record)).or_default();
         match record.status {
-            JobStatus::Processing => blocker.processing = true,
-            JobStatus::Pending => {
+            JobStatus::Processing | JobStatus::WaitingDelivery => blocker.processing = true,
+            JobStatus::Pending if task_queue_record_is_available(record, now) => {
                 let replace = blocker.best_pending_index.is_none_or(|best_index| {
                     compare_go_queue_records(record, &records[best_index]).is_lt()
                 });
@@ -3320,13 +3586,13 @@ mod tests {
         MusicGenJobPayloadError, QUEUE_ESTIMATE_DEFAULT_SAMPLE_SIZE,
         QUEUE_ESTIMATE_MIN_SAMPLE_SIZE, STUCK_JOB_ERROR_MESSAGE, TASK_QUEUE_SNAPSHOT_FORMAT,
         TEXT_QUEUE_NAME, TaskQueueError, TaskQueueJobEvent, TaskQueueJobMessageParams,
-        TaskQueueWalRecord, TaskQueueWalSink, asr_job_params_from_stateless_job,
-        decode_task_queue_snapshot, encode_task_queue_snapshot, fallback_queue_time_estimate,
-        format_duration_ru, image_edit_job_params_from_stateless_job,
-        image_gen_job_params_from_stateless_job, music_gen_job_params_from_stateless_job,
-        new_agent_job_at, new_asr_job_at, new_control_job_at, new_dialog_job_at,
-        new_image_edit_job_at, new_image_gen_job_at, new_memory_consolidation_job_at,
-        new_music_gen_job_at, replay_task_queue_wal_records,
+        TaskQueueRecord, TaskQueueSchedule, TaskQueueScheduleDisposition, TaskQueueWalRecord,
+        TaskQueueWalSink, asr_job_params_from_stateless_job, decode_task_queue_snapshot,
+        encode_task_queue_snapshot, fallback_queue_time_estimate, format_duration_ru,
+        image_edit_job_params_from_stateless_job, image_gen_job_params_from_stateless_job,
+        music_gen_job_params_from_stateless_job, new_agent_job_at, new_asr_job_at,
+        new_control_job_at, new_dialog_job_at, new_image_edit_job_at, new_image_gen_job_at,
+        new_memory_consolidation_job_at, new_music_gen_job_at, replay_task_queue_wal_records,
     };
 
     #[derive(Default)]
@@ -5289,6 +5555,209 @@ mod tests {
     }
 
     #[test]
+    fn task_queue_record_scheduling_fields_are_backward_compatible_and_round_trip()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let queue = InMemoryTaskQueue::new();
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let legacy_id = queue.assign(
+            DIALOG_AIFARM_QUEUE_NAME,
+            dialog_job_at("legacy", now, 7, 10, 20),
+        );
+        let mut legacy_value = serde_json::to_value(queue.record(legacy_id).expect("record"))?;
+        let legacy_object = legacy_value.as_object_mut().expect("record object");
+        for field in [
+            "available_at",
+            "debounce_key",
+            "lane_key",
+            "source_update_ids",
+            "latest_update_id",
+            "pending_dialog_inputs",
+        ] {
+            legacy_object.remove(field);
+        }
+
+        let legacy: TaskQueueRecord = serde_json::from_value(legacy_value)?;
+        assert_eq!(legacy.available_at, None);
+        assert_eq!(legacy.debounce_key, None);
+        assert_eq!(legacy.lane_key, None);
+        assert!(legacy.source_update_ids.is_empty());
+        assert_eq!(legacy.latest_update_id, None);
+        assert!(legacy.pending_dialog_inputs.is_empty());
+
+        let pending_input = DialogJobParams {
+            chat_id: 10,
+            message_id: 21,
+            user_id: 7,
+            user_full_name: "User 7".to_owned(),
+            message_text: "second".to_owned(),
+            original_text: "second".to_owned(),
+            meta: json!({"source": "telegram"}),
+            max_output_tokens: 1_024,
+            thread_id: Some(5),
+        };
+        let scheduled_id = queue.assign_with_schedule(
+            DIALOG_AIFARM_QUEUE_NAME,
+            dialog_job_at("scheduled", now, 7, 10, 22),
+            TaskQueueSchedule {
+                available_at: Some(now + TimeDuration::seconds(8)),
+                debounce_key: Some("dialog:10:5".to_owned()),
+                lane_key: Some("10:5".to_owned()),
+                source_update_ids: vec![100, 101],
+                latest_update_id: Some(101),
+                pending_dialog_inputs: vec![pending_input],
+            },
+        );
+        let scheduled = queue.record(scheduled_id).expect("scheduled record");
+        let decoded: TaskQueueRecord = serde_json::from_slice(&serde_json::to_vec(&scheduled)?)?;
+
+        assert_eq!(decoded, scheduled);
+        Ok(())
+    }
+
+    #[test]
+    fn dequeue_ignores_future_jobs_until_their_availability_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let queue = InMemoryTaskQueue::new();
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let available_at = now + TimeDuration::seconds(8);
+        let future = queue.assign_with_schedule(
+            DIALOG_AIFARM_QUEUE_NAME,
+            dialog_job_at("future", now, 7, 10, 20).with_priority(HIGHEST_PRIORITY),
+            TaskQueueSchedule {
+                available_at: Some(available_at),
+                ..TaskQueueSchedule::default()
+            },
+        );
+        let ready = queue.assign(
+            DIALOG_AIFARM_QUEUE_NAME,
+            dialog_job_at("ready", now, 7, 10, 21),
+        );
+
+        let claimed = queue
+            .dequeue(DIALOG_AIFARM_QUEUE_NAME, "worker", now)
+            .expect("ready job");
+        assert_eq!(claimed.id, ready);
+        queue.complete(ready, now)?;
+        assert!(
+            queue
+                .dequeue(
+                    DIALOG_AIFARM_QUEUE_NAME,
+                    "worker",
+                    available_at - TimeDuration::nanoseconds(1),
+                )
+                .is_none()
+        );
+        assert_eq!(
+            queue
+                .dequeue(DIALOG_AIFARM_QUEUE_NAME, "worker", available_at)
+                .map(|work| work.id),
+            Some(future)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn schedule_or_replace_is_atomic_and_rejects_stale_update_retries()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let queue = InMemoryTaskQueue::new();
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let first_input = DialogJobParams {
+            chat_id: 10,
+            message_id: 20,
+            user_id: 7,
+            user_full_name: "User 7".to_owned(),
+            message_text: "first".to_owned(),
+            original_text: "first".to_owned(),
+            meta: json!({}),
+            max_output_tokens: 1_024,
+            thread_id: None,
+        };
+        let first = queue.schedule_or_replace(
+            DIALOG_AIFARM_QUEUE_NAME,
+            new_dialog_job_at(first_input.clone(), now),
+            TaskQueueSchedule {
+                available_at: Some(now + TimeDuration::seconds(5)),
+                debounce_key: Some("dialog:10:7:0".to_owned()),
+                lane_key: Some("dialog:10:0".to_owned()),
+                source_update_ids: vec![100],
+                latest_update_id: Some(100),
+                pending_dialog_inputs: vec![first_input.clone()],
+            },
+        );
+        assert_eq!(first.disposition, TaskQueueScheduleDisposition::Assigned);
+
+        let second_input = DialogJobParams {
+            message_id: 21,
+            message_text: "second".to_owned(),
+            original_text: "second".to_owned(),
+            ..first_input.clone()
+        };
+        let second_available_at = now + TimeDuration::seconds(8);
+        let second = queue.schedule_or_replace(
+            DIALOG_AIFARM_QUEUE_NAME,
+            new_dialog_job_at(second_input.clone(), now),
+            TaskQueueSchedule {
+                available_at: Some(second_available_at),
+                debounce_key: Some("dialog:10:7:0".to_owned()),
+                lane_key: Some("dialog:10:0".to_owned()),
+                source_update_ids: vec![101],
+                latest_update_id: Some(101),
+                pending_dialog_inputs: vec![second_input],
+            },
+        );
+        assert_eq!(second.task_id, first.task_id);
+        assert_eq!(second.disposition, TaskQueueScheduleDisposition::Replaced);
+
+        let stale = queue.schedule_or_replace(
+            DIALOG_AIFARM_QUEUE_NAME,
+            new_dialog_job_at(first_input.clone(), now),
+            TaskQueueSchedule {
+                available_at: Some(now + TimeDuration::seconds(20)),
+                debounce_key: Some("dialog:10:7:0".to_owned()),
+                lane_key: Some("dialog:10:0".to_owned()),
+                source_update_ids: vec![99],
+                latest_update_id: Some(99),
+                pending_dialog_inputs: vec![first_input],
+            },
+        );
+        assert_eq!(stale.task_id, first.task_id);
+        assert_eq!(stale.disposition, TaskQueueScheduleDisposition::Reused);
+
+        let records = queue.records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].available_at, Some(second_available_at));
+        assert_eq!(records[0].source_update_ids, vec![100, 101, 99]);
+        assert_eq!(records[0].latest_update_id, Some(101));
+        assert_eq!(records[0].pending_dialog_inputs.len(), 2);
+        assert_eq!(
+            records[0]
+                .job
+                .data
+                .dialog_data
+                .as_ref()
+                .expect("dialog")
+                .message_text,
+            "second"
+        );
+
+        let restored = InMemoryTaskQueue::from_snapshot(queue.snapshot());
+        let retry = restored.schedule_or_replace(
+            DIALOG_AIFARM_QUEUE_NAME,
+            dialog_job_at("ignored", now, 7, 10, 21),
+            TaskQueueSchedule {
+                debounce_key: Some("dialog:10:7:0".to_owned()),
+                source_update_ids: vec![101],
+                latest_update_id: Some(101),
+                ..TaskQueueSchedule::default()
+            },
+        );
+        assert_eq!(retry.task_id, first.task_id);
+        assert_eq!(retry.disposition, TaskQueueScheduleDisposition::Reused);
+        assert_eq!(restored.records().len(), 1);
+        Ok(())
+    }
+
+    #[test]
     fn task_queue_wal_replays_final_job_state_without_gob_bytes()
     -> Result<(), Box<dyn std::error::Error>> {
         let journal = Arc::new(WalSinkStub::default());
@@ -5347,12 +5816,53 @@ mod tests {
     fn task_queue_status_strings_match_go_status_constants() {
         assert_eq!(JobStatus::Pending.as_str(), "pending");
         assert_eq!(JobStatus::Processing.as_str(), "processing");
+        assert_eq!(JobStatus::WaitingDelivery.as_str(), "waiting_delivery");
         assert_eq!(JobStatus::Completed.as_str(), "completed");
         assert_eq!(JobStatus::Failed.as_str(), "failed");
         assert_eq!(JobStatus::Cancelled.as_str(), "cancelled");
         assert!(JobStatus::Pending.is_active());
         assert!(JobStatus::Processing.is_active());
+        assert!(JobStatus::WaitingDelivery.is_active());
         assert!(!JobStatus::Completed.is_active());
+    }
+
+    #[test]
+    fn waiting_delivery_is_wal_persisted_and_not_requeued_on_startup()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let journal = Arc::new(WalSinkStub::default());
+        let queue = InMemoryTaskQueue::new_with_journal(journal.clone());
+        let now = OffsetDateTime::now_utc();
+        let job_id = queue.assign(
+            DIALOG_AIFARM_QUEUE_NAME,
+            dialog_job_at("deliver", now, 7, 10, 20),
+        );
+        queue
+            .dequeue(DIALOG_AIFARM_QUEUE_NAME, "worker", now)
+            .expect("claim");
+
+        assert!(queue.wait_for_delivery(job_id)?);
+        assert!(!queue.wait_for_delivery(job_id)?);
+        let record = queue.record(job_id).expect("record");
+        assert_eq!(record.status, JobStatus::WaitingDelivery);
+        assert_eq!(record.worker_id, None);
+        assert_eq!(
+            queue.release_orphaned_processing_for_startup(),
+            super::StartupReleaseReport::default()
+        );
+        assert_eq!(queue.requeue_processing_for_startup(), 0);
+        assert_eq!(
+            queue.record(job_id).expect("record").status,
+            JobStatus::WaitingDelivery
+        );
+        assert_eq!(
+            journal
+                .records()
+                .last()
+                .and_then(|wal| wal.record.as_ref())
+                .map(|record| record.status),
+            Some(JobStatus::WaitingDelivery)
+        );
+        Ok(())
     }
 
     #[test]

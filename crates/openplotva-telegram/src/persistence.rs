@@ -366,6 +366,31 @@ pub fn replay_outbound_method(
     replay_method_from_value(kind, &value)
 }
 
+/// Rebuild a create-message operation without its reply target. This is used
+/// only after Telegram explicitly rejects the target as missing, so the first
+/// request is known not to have created a message.
+pub fn replay_outbound_method_without_reply(
+    method: &TelegramOutboundMethod,
+) -> Option<TelegramOutboundMethod> {
+    let (kind, bytes) = snapshot_outbound_method(method)?;
+    if !matches!(
+        kind,
+        TelegramOutboundMethodKind::SendMessage | TelegramOutboundMethodKind::SendRichMessage
+    ) {
+        return None;
+    }
+    let mut value: Value = serde_json::from_slice(&bytes).ok()?;
+    if let Some(object) = value.as_object_mut() {
+        object.remove("ReplyParameters");
+        object.remove("reply_parameters");
+        if let Some(options) = object.get_mut("options").and_then(Value::as_object_mut) {
+            options.remove("reply_to_message_id");
+            options.insert("allow_sending_without_reply".to_owned(), Value::Bool(false));
+        }
+    }
+    replay_method_from_value(kind, &value)
+}
+
 fn replay_rich_method(value: &Value) -> Option<TelegramOutboundMethod> {
     serde_json::from_value::<SendRichMessage>(value.clone())
         .ok()
@@ -925,7 +950,8 @@ mod tests {
         build_message_reaction_method, fingerprint_message_reaction, hash_content,
         persistent_queue_from_drain, persistent_queue_redis_value_from_items,
         persistent_queue_replay_from_json, persistent_queue_replay_from_redis_value,
-        replay_outbound_method, restore_persistent_queue_replay, snapshot_outbound_method,
+        replay_outbound_method, replay_outbound_method_without_reply,
+        restore_persistent_queue_replay, snapshot_outbound_method,
     };
 
     fn text_message(chat_id: i64, text: &str, virtual_id: &str) -> DispatcherMessage {
@@ -1288,6 +1314,35 @@ mod tests {
 
         assert!(snapshot_outbound_method(&sticker_method(42, "sticker-file-id")).is_none());
 
+        Ok(())
+    }
+
+    #[test]
+    fn reply_missing_fallback_replays_create_methods_without_reply_target()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let text = carapax::types::SendMessage::new(42, "hello").with_reply_parameters(
+            carapax::types::ReplyParameters::new(9)
+                .with_chat_id(42)
+                .with_allow_sending_without_reply(true),
+        );
+        let TelegramOutboundMethod::SendMessage(text) =
+            replay_outbound_method_without_reply(&TelegramOutboundMethod::from(text))
+                .expect("text fallback")
+        else {
+            panic!("expected sendMessage fallback");
+        };
+        let text_payload = serde_json::to_value(text.as_ref())?;
+        assert!(text_payload.get("reply_parameters").is_none());
+
+        let TelegramOutboundMethod::SendRichMessage(rich) =
+            replay_outbound_method_without_reply(&rich_method(42, "<b>hello</b>"))
+                .expect("rich fallback")
+        else {
+            panic!("expected sendRichMessage fallback");
+        };
+        assert_eq!(rich.options.reply_to_message_id, None);
+        assert!(!rich.options.allow_sending_without_reply);
+        assert_eq!(rich.options.message_thread_id, Some(77));
         Ok(())
     }
 
