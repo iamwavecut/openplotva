@@ -20,6 +20,7 @@ pub type Priority = i32;
 pub const DEFAULT_PRIORITY: Priority = 0;
 pub const HIGH_PRIORITY: Priority = 2;
 pub const HIGHEST_PRIORITY: Priority = 4;
+pub const ASR_PRIORITY: Priority = HIGHEST_PRIORITY + 2;
 pub const LOW_PRIORITY: Priority = -2;
 pub const LOWEST_PRIORITY: Priority = -4;
 
@@ -27,6 +28,7 @@ pub const TEXT_QUEUE_NAME: &str = "text";
 pub const IMAGE_REGULAR_QUEUE_NAME: &str = "image-regular";
 pub const IMAGE_VIP_QUEUE_NAME: &str = "image-vip";
 pub const MUSIC_VIP_QUEUE_NAME: &str = "music-vip";
+pub const ASR_GPU1_QUEUE_NAME: &str = "asr-gpu1";
 pub const DIALOG_AIFARM_QUEUE_NAME: &str = "dialog-aifarm";
 pub const MEMORY_CONSOLIDATION_QUEUE_NAME: &str = "memory-consolidation";
 /// Dedicated queue for agent-loop runs routed to the single-slot Qwen reasoner.
@@ -35,6 +37,7 @@ pub const AGENT_QWEN_QUEUE_NAME: &str = "agent-qwen";
 pub const LLM_JOB_RETRY_STAGE: &str = "llm_job_retry";
 pub const LLM_JOB_RETRY_EXHAUSTED_STAGE: &str = "llm_job_retry_exhausted";
 pub const DEFAULT_LLM_JOB_MAX_ATTEMPTS: i32 = 5;
+pub const ASR_PROCESSING_TIMEOUT_SECONDS: i32 = 180;
 /// Audit-only event stage written once per committed agent step.
 pub const AGENT_STEP_STAGE: &str = "agent_step";
 /// Serialized agent-state codec marker stored in `AgentRunStateBlob.format`.
@@ -59,6 +62,7 @@ pub const STUCK_JOB_ERROR_MESSAGE: &str = "Job stuck in processing state for too
 #[serde(rename_all = "snake_case")]
 pub enum JobType {
     Dialog,
+    Asr,
     ImageGen,
     ImageEdit,
     MusicGen,
@@ -135,12 +139,22 @@ pub struct JobPayload {
     /// Dialog-job-specific payload.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dialog_data: Option<DialogJobData>,
+    /// Voice-transcription-specific payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asr_data: Option<AsrJobData>,
     /// Control-job-specific payload.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub control_data: Option<ControlJobData>,
     /// Agent-loop-job-specific payload.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_data: Option<AgentJobData>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+pub struct AsrJobData {
+    pub file_unique_id: String,
+    pub duration_seconds: i64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -359,6 +373,17 @@ pub struct DialogJobParams {
     pub meta: serde_json::Value,
     pub max_output_tokens: i32,
     pub thread_id: Option<i32>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AsrJobParams {
+    pub chat_id: i64,
+    pub message_id: i32,
+    pub user_id: i64,
+    pub user_full_name: String,
+    pub thread_id: Option<i32>,
+    pub file_unique_id: String,
+    pub duration_seconds: i64,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -1471,6 +1496,24 @@ impl InMemoryTaskQueue {
             .count()
     }
 
+    /// Find one active job in a queue without cloning the full taskman snapshot.
+    #[must_use]
+    pub fn active_job_id_matching(
+        &self,
+        queue_name: &str,
+        mut predicate: impl FnMut(&StatelessJobItem) -> bool,
+    ) -> Option<i64> {
+        self.lock()
+            .records
+            .iter()
+            .find(|record| {
+                record.queue_name == queue_name
+                    && record.status.is_active()
+                    && predicate(&record.job)
+            })
+            .map(|record| record.id)
+    }
+
     /// Count active jobs in one queue for one user.
     #[must_use]
     pub fn user_active_count(&self, queue_name: &str, user_id: i64) -> usize {
@@ -2014,6 +2057,27 @@ impl fmt::Display for DialogJobPayloadError {
 impl Error for DialogJobPayloadError {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AsrJobPayloadError {
+    InvalidJobType { actual: JobType },
+    MissingTelegramData,
+    MissingAsrData,
+}
+
+impl fmt::Display for AsrJobPayloadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidJobType { actual } => {
+                write!(f, "invalid job type for ASR executor: {actual:?}")
+            }
+            Self::MissingTelegramData => f.write_str("missing Telegram data for ASR job"),
+            Self::MissingAsrData => f.write_str("missing ASR data for ASR job"),
+        }
+    }
+}
+
+impl Error for AsrJobPayloadError {}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ImageGenJobPayloadError {
     /// The payload is not an image generation job.
     InvalidJobType {
@@ -2163,6 +2227,7 @@ pub fn new_control_job_at(params: ControlJobParams, created: OffsetDateTime) -> 
             image_data: None,
             music_data: None,
             dialog_data: None,
+            asr_data: None,
             control_data: Some(params.data),
             agent_data: None,
         },
@@ -2194,6 +2259,7 @@ pub fn new_dialog_job_at(params: DialogJobParams, created: OffsetDateTime) -> St
                 meta: non_null_json_object(params.meta),
                 max_output_tokens: params.max_output_tokens,
             }),
+            asr_data: None,
             control_data: None,
             agent_data: None,
         },
@@ -2203,6 +2269,41 @@ pub fn new_dialog_job_at(params: DialogJobParams, created: OffsetDateTime) -> St
 #[must_use]
 pub fn new_dialog_job(params: DialogJobParams) -> StatelessJobItem {
     new_dialog_job_at(params, OffsetDateTime::now_utc())
+}
+
+#[must_use]
+pub fn new_asr_job_at(params: AsrJobParams, created: OffsetDateTime) -> StatelessJobItem {
+    StatelessJobItem {
+        title: "asr".to_owned(),
+        created,
+        priority: ASR_PRIORITY,
+        processing_timeout_seconds: ASR_PROCESSING_TIMEOUT_SECONDS,
+        data: JobPayload {
+            job_type: JobType::Asr,
+            telegram_data: Some(TelegramData {
+                chat_id: params.chat_id,
+                user_id: params.user_id,
+                message_id: params.message_id,
+                thread_message_id: params.thread_id,
+                user_full_name: clean_unicode_non_printables(&params.user_full_name),
+                chat_title: String::new(),
+            }),
+            image_data: None,
+            music_data: None,
+            dialog_data: None,
+            asr_data: Some(AsrJobData {
+                file_unique_id: params.file_unique_id.trim().to_owned(),
+                duration_seconds: params.duration_seconds.max(0),
+            }),
+            control_data: None,
+            agent_data: None,
+        },
+    }
+}
+
+#[must_use]
+pub fn new_asr_job(params: AsrJobParams) -> StatelessJobItem {
+    new_asr_job_at(params, OffsetDateTime::now_utc())
 }
 
 #[must_use]
@@ -2225,6 +2326,7 @@ pub fn new_agent_job_at(params: AgentJobParams, created: OffsetDateTime) -> Stat
             image_data: None,
             music_data: None,
             dialog_data: None,
+            asr_data: None,
             control_data: None,
             agent_data: Some(AgentJobData {
                 profile_id: params.profile_id,
@@ -2282,6 +2384,7 @@ pub fn new_image_gen_job_at(
             }),
             music_data: None,
             dialog_data: None,
+            asr_data: None,
             control_data: None,
             agent_data: None,
         },
@@ -2326,6 +2429,7 @@ pub fn new_image_edit_job_at(
             }),
             music_data: None,
             dialog_data: None,
+            asr_data: None,
             control_data: None,
             agent_data: None,
         },
@@ -2370,6 +2474,7 @@ pub fn new_music_gen_job_at(
                 meta: non_null_json_object(params.meta),
             }),
             dialog_data: None,
+            asr_data: None,
             control_data: None,
             agent_data: None,
         },
@@ -2394,6 +2499,7 @@ pub fn new_memory_consolidation_job_at(created: OffsetDateTime) -> StatelessJobI
             image_data: None,
             music_data: None,
             dialog_data: None,
+            asr_data: None,
             control_data: None,
             agent_data: None,
         },
@@ -2585,6 +2691,40 @@ pub fn dialog_job_params_from_payload(
         meta: dialog_data.meta.clone(),
         max_output_tokens: dialog_data.max_output_tokens,
         thread_id: telegram_data.thread_message_id,
+    })
+}
+
+pub fn asr_job_params_from_stateless_job(
+    job: &StatelessJobItem,
+) -> Result<AsrJobParams, AsrJobPayloadError> {
+    asr_job_params_from_payload(&job.data)
+}
+
+pub fn asr_job_params_from_payload(
+    payload: &JobPayload,
+) -> Result<AsrJobParams, AsrJobPayloadError> {
+    if payload.job_type != JobType::Asr {
+        return Err(AsrJobPayloadError::InvalidJobType {
+            actual: payload.job_type,
+        });
+    }
+    let telegram_data = payload
+        .telegram_data
+        .as_ref()
+        .ok_or(AsrJobPayloadError::MissingTelegramData)?;
+    let asr_data = payload
+        .asr_data
+        .as_ref()
+        .ok_or(AsrJobPayloadError::MissingAsrData)?;
+
+    Ok(AsrJobParams {
+        chat_id: telegram_data.chat_id,
+        message_id: telegram_data.message_id,
+        user_id: telegram_data.user_id,
+        user_full_name: telegram_data.user_full_name.clone(),
+        thread_id: telegram_data.thread_message_id,
+        file_unique_id: asr_data.file_unique_id.clone(),
+        duration_seconds: asr_data.duration_seconds,
     })
 }
 
@@ -2804,9 +2944,30 @@ fn next_pending_index_matching(
         .filter(|(index, record)| {
             !dialog_lane_blocked(lane_blockers.as_ref(), records, *index, record)
         })
+        .filter(|(_index, record)| !image_work_blocked_by_active_asr(records, record))
         .filter(|(_index, record)| predicate(&record.job))
         .min_by(|(_left_index, left), (_right_index, right)| compare_go_queue_records(left, right))
         .map(|(index, _record)| index)
+}
+
+/// Preserve GPU-1 priority across separate ASR and draw worker queues. This is
+/// evaluated while the queue state is locked, so a draw claim cannot race an
+/// already assigned ASR job.
+fn image_work_blocked_by_active_asr(
+    records: &[TaskQueueRecord],
+    candidate: &TaskQueueRecord,
+) -> bool {
+    if !matches!(
+        candidate.job.data.job_type,
+        JobType::ImageGen | JobType::ImageEdit
+    ) {
+        return false;
+    }
+    records.iter().any(|record| {
+        record.status.is_active()
+            && record.job.data.job_type == JobType::Asr
+            && record.job.priority > candidate.job.priority
+    })
 }
 
 fn compare_go_queue_records(left: &TaskQueueRecord, right: &TaskQueueRecord) -> std::cmp::Ordering {
@@ -2943,7 +3104,9 @@ fn processing_record_expired(record: &TaskQueueRecord, now: OffsetDateTime) -> b
 
 fn processing_record_timeout_start_at(record: &TaskQueueRecord) -> Option<OffsetDateTime> {
     match record.job.data.job_type {
-        JobType::ImageGen | JobType::ImageEdit | JobType::MusicGen => record.execution_started_at,
+        JobType::Asr | JobType::ImageGen | JobType::ImageEdit | JobType::MusicGen => {
+            record.execution_started_at
+        }
         _ => record.started_at,
     }
 }
@@ -3056,8 +3219,9 @@ mod tests {
     use time::{Duration as TimeDuration, OffsetDateTime};
 
     use super::{
-        AGENT_QWEN_QUEUE_NAME, AgentJobParams, AgentRunStateBlob, CONTROL_QUEUE_NAME,
-        ControlJobData, ControlJobParams, ControlJobPayloadError, ControlKind, DEFAULT_PRIORITY,
+        AGENT_QWEN_QUEUE_NAME, ASR_GPU1_QUEUE_NAME, ASR_PRIORITY, ASR_PROCESSING_TIMEOUT_SECONDS,
+        AgentJobParams, AgentRunStateBlob, AsrJobParams, CONTROL_QUEUE_NAME, ControlJobData,
+        ControlJobParams, ControlJobPayloadError, ControlKind, DEFAULT_PRIORITY,
         DIALOG_AIFARM_QUEUE_NAME, DialogJobData, DialogJobParams, DialogJobPayloadError,
         HIGH_PRIORITY, HIGHEST_PRIORITY, IMAGE_REGULAR_QUEUE_NAME, IMAGE_VIP_QUEUE_NAME,
         ImageEditJobParams, ImageEditJobPayloadError, ImageGenJobParams, ImageGenJobPayloadError,
@@ -3067,10 +3231,10 @@ mod tests {
         MusicGenJobPayloadError, PendingImageQueueEntry, STUCK_JOB_ERROR_MESSAGE,
         TASK_QUEUE_SNAPSHOT_FORMAT, TEXT_QUEUE_NAME, TaskQueueError, TaskQueueJobEvent,
         TaskQueueJobMessageParams, TaskQueueWalRecord, TaskQueueWalSink,
-        decode_task_queue_snapshot, encode_task_queue_snapshot,
+        asr_job_params_from_stateless_job, decode_task_queue_snapshot, encode_task_queue_snapshot,
         image_edit_job_params_from_stateless_job, image_gen_job_params_from_stateless_job,
-        music_gen_job_params_from_stateless_job, new_agent_job_at, new_control_job_at,
-        new_dialog_job_at, new_image_edit_job_at, new_image_gen_job_at,
+        music_gen_job_params_from_stateless_job, new_agent_job_at, new_asr_job_at,
+        new_control_job_at, new_dialog_job_at, new_image_edit_job_at, new_image_gen_job_at,
         new_memory_consolidation_job_at, new_music_gen_job_at, replay_task_queue_wal_records,
     };
 
@@ -3500,6 +3664,36 @@ mod tests {
     }
 
     #[test]
+    fn asr_job_payload_is_durable_and_higher_priority_than_draw()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let created = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let params = AsrJobParams {
+            chat_id: -100,
+            message_id: 20,
+            user_id: 30,
+            user_full_name: "Alice".to_owned(),
+            thread_id: Some(7),
+            file_unique_id: "voice-u".to_owned(),
+            duration_seconds: 4,
+        };
+
+        let job = new_asr_job_at(params.clone(), created);
+
+        assert_eq!(job.data.job_type, JobType::Asr);
+        assert_eq!(job.priority, ASR_PRIORITY);
+        assert!(job.priority > HIGHEST_PRIORITY);
+        assert_eq!(
+            job.processing_timeout_seconds,
+            ASR_PROCESSING_TIMEOUT_SECONDS
+        );
+        assert_eq!(asr_job_params_from_stateless_job(&job)?, params);
+        let payload = serde_json::to_value(&job)?;
+        assert_eq!(payload["data"]["type"], "asr");
+        assert_eq!(payload["data"]["asr_data"]["file_unique_id"], "voice-u");
+        Ok(())
+    }
+
+    #[test]
     fn image_gen_job_decoder_rejects_non_image_payload() {
         let job = new_dialog_job_at(
             DialogJobParams {
@@ -3579,6 +3773,7 @@ mod tests {
                 message_text: "hello".to_owned(),
                 ..DialogJobData::default()
             }),
+            asr_data: None,
             control_data: None,
             agent_data: None,
         };
@@ -3600,6 +3795,7 @@ mod tests {
             image_data: None,
             music_data: None,
             dialog_data: None,
+            asr_data: None,
             control_data: None,
             agent_data: None,
         };
@@ -3761,6 +3957,7 @@ mod tests {
             image_data: None,
             music_data: None,
             dialog_data: None,
+            asr_data: None,
             control_data: Some(ControlJobData {
                 kind: ControlKind::VipInvoice,
                 ..ControlJobData::default()
@@ -3785,6 +3982,7 @@ mod tests {
             image_data: None,
             music_data: None,
             dialog_data: None,
+            asr_data: None,
             control_data: None,
             agent_data: None,
         };
@@ -3845,6 +4043,105 @@ mod tests {
             Some(low)
         );
         assert!(queue.dequeue(TEXT_QUEUE_NAME, "worker", now).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn active_asr_blocks_new_vip_and_regular_draw_claims() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let queue = InMemoryTaskQueue::new();
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let regular = queue.assign(
+            IMAGE_REGULAR_QUEUE_NAME,
+            new_image_gen_job_at(
+                ImageGenJobParams {
+                    chat_id: 1,
+                    message_id: 10,
+                    user_id: 2,
+                    prompt: "regular".to_owned(),
+                    ..ImageGenJobParams::default()
+                },
+                now,
+            ),
+        );
+        let vip = queue.assign(
+            IMAGE_VIP_QUEUE_NAME,
+            new_image_edit_job_at(
+                ImageEditJobParams {
+                    chat_id: 1,
+                    message_id: 11,
+                    user_id: 2,
+                    prompt: "vip".to_owned(),
+                    photo_file_id: "photo".to_owned(),
+                    ..ImageEditJobParams::default()
+                },
+                now,
+            )
+            .with_priority(HIGHEST_PRIORITY),
+        );
+        let asr = queue.assign(
+            ASR_GPU1_QUEUE_NAME,
+            new_asr_job_at(
+                AsrJobParams {
+                    chat_id: 1,
+                    message_id: 12,
+                    user_id: 2,
+                    file_unique_id: "voice".to_owned(),
+                    duration_seconds: 4,
+                    ..AsrJobParams::default()
+                },
+                now,
+            ),
+        );
+
+        assert!(
+            queue
+                .dequeue_matching(IMAGE_REGULAR_QUEUE_NAME, "regular-worker", now, |job| {
+                    job.data.job_type == JobType::ImageGen
+                })
+                .is_none()
+        );
+        assert!(
+            queue
+                .dequeue_matching(IMAGE_VIP_QUEUE_NAME, "vip-worker", now, |job| {
+                    job.data.job_type == JobType::ImageEdit
+                })
+                .is_none()
+        );
+        assert_eq!(
+            queue
+                .dequeue_matching(ASR_GPU1_QUEUE_NAME, "asr-worker", now, |job| {
+                    job.data.job_type == JobType::Asr
+                })
+                .map(|work| work.id),
+            Some(asr)
+        );
+        assert!(
+            queue
+                .dequeue_matching(IMAGE_REGULAR_QUEUE_NAME, "regular-worker", now, |job| {
+                    job.data.job_type == JobType::ImageGen
+                })
+                .is_none(),
+            "processing ASR must keep blocking draw"
+        );
+
+        queue.complete(asr, now)?;
+        assert_eq!(
+            queue
+                .dequeue_matching(IMAGE_REGULAR_QUEUE_NAME, "regular-worker", now, |job| {
+                    job.data.job_type == JobType::ImageGen
+                })
+                .map(|work| work.id),
+            Some(regular)
+        );
+        assert_eq!(
+            queue
+                .dequeue_matching(IMAGE_VIP_QUEUE_NAME, "vip-worker", now, |job| {
+                    job.data.job_type == JobType::ImageEdit
+                })
+                .map(|work| work.id),
+            Some(vip)
+        );
         Ok(())
     }
 
@@ -4909,6 +5206,7 @@ mod tests {
                     message_text: message_text.to_owned(),
                     ..DialogJobData::default()
                 }),
+                asr_data: None,
                 control_data: None,
                 agent_data: None,
             },
@@ -4969,6 +5267,7 @@ mod tests {
                 }),
                 music_data: None,
                 dialog_data: None,
+                asr_data: None,
                 control_data: None,
                 agent_data: None,
             },

@@ -3,7 +3,10 @@ use std::{
     fmt,
     future::Future,
     pin::Pin,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -21,7 +24,11 @@ use openplotva_llm::{
 pub use openplotva_storage::TelegramFileAsrUpdate;
 use openplotva_storage::{
     PostgresTelegramFileStore, TELEGRAM_FILE_ASR_STATUS_COMPLETED, TELEGRAM_FILE_ASR_STATUS_FAILED,
-    TelegramFileRecord,
+    TELEGRAM_FILE_ASR_STATUS_PROCESSING, TelegramFileRecord,
+};
+use openplotva_taskman::{
+    ASR_GPU1_QUEUE_NAME, AsrJobParams, InMemoryTaskQueue, JobType,
+    asr_job_params_from_stateless_job, new_asr_job_at,
 };
 use openplotva_telegram::TelegramClient;
 use serde::{Deserialize, Serialize};
@@ -41,6 +48,9 @@ const ASR_DISCOVERY_CAPACITY_WAIT: Duration = Duration::from_secs(2);
 const ASR_DISCOVERY_RETRY_BACKOFF: Duration = Duration::from_millis(200);
 const ASR_DISCOVERY_REQUEST_RETRIES: u8 = 5;
 const ASR_TERMINAL_PAYLOAD_RETRIES: u8 = 2;
+pub const ASR_TASKMAN_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const ASR_TASKMAN_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
+const ASR_TASKMAN_WORKER_ID: &str = "asr-gpu1-worker-0";
 
 pub type TelegramFileAsrGetFuture<'a, Error> =
     Pin<Box<dyn Future<Output = Result<Option<TelegramFileRecord>, Error>> + Send + 'a>>;
@@ -759,6 +769,7 @@ pub struct TelegramDialogAsrInputMaterializer<Store, Downloader, Transcriber> {
     store: Store,
     downloader: Downloader,
     transcriber: Transcriber,
+    task_queue: Option<Arc<InMemoryTaskQueue>>,
 }
 
 impl<Store, Downloader, Transcriber>
@@ -770,7 +781,14 @@ impl<Store, Downloader, Transcriber>
             store,
             downloader,
             transcriber,
+            task_queue: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_taskman_queue(mut self, task_queue: Arc<InMemoryTaskQueue>) -> Self {
+        self.task_queue = Some(task_queue);
+        self
     }
 }
 
@@ -799,6 +817,47 @@ where
                 return input;
             }
 
+            if let Some(queue) = self.task_queue.as_ref() {
+                let job_id =
+                    if self.claim_processing(&record, now).await.is_some() {
+                        let job_id = queue.assign(
+                            ASR_GPU1_QUEUE_NAME,
+                            new_asr_job_at(
+                                AsrJobParams {
+                                    chat_id: input.context.chat_id,
+                                    message_id: input.message.id,
+                                    user_id: input.user.id,
+                                    user_full_name: input.user.full_name.clone(),
+                                    thread_id: input.context.thread_id,
+                                    file_unique_id: record.file_unique_id.clone(),
+                                    duration_seconds: candidate.duration_seconds,
+                                },
+                                now,
+                            ),
+                        );
+                        tracing::debug!(
+                            job_id,
+                            file_unique_id = record.file_unique_id,
+                            "queued priority ASR taskman job"
+                        );
+                        Some(job_id)
+                    } else {
+                        queue.active_job_id_matching(ASR_GPU1_QUEUE_NAME, |job| {
+                            job.data.job_type == JobType::Asr
+                                && job.data.asr_data.as_ref().is_some_and(|data| {
+                                    data.file_unique_id == candidate.file_unique_id
+                                })
+                        })
+                    };
+                if let Some(text) = self
+                    .wait_for_taskman_transcript(&candidate.file_unique_id, job_id)
+                    .await
+                {
+                    apply_transcript(&mut input, candidate.attachment_index, &text);
+                }
+                return input;
+            }
+
             let Some(record) = self.claim_processing(&record, now).await else {
                 if let Some(record) = self.lookup_record(&candidate.file_unique_id).await
                     && let Some(text) = cached_asr_text(&record)
@@ -808,20 +867,6 @@ where
                 return input;
             };
 
-            let latest_file_id = record.latest_file_id.trim();
-            if latest_file_id.is_empty() {
-                self.mark_failed_best_effort(&record, "missing latest Telegram file id")
-                    .await;
-                return input;
-            }
-            let audio = match self.downloader.download_voice(latest_file_id).await {
-                Ok(audio) => audio,
-                Err(error) => {
-                    self.mark_failed_best_effort(&record, &error.to_string())
-                        .await;
-                    return input;
-                }
-            };
             let request = AsrRequest {
                 chat_id: input.context.chat_id,
                 message_id: input.message.id,
@@ -830,30 +875,141 @@ where
                 duration_seconds: (candidate.duration_seconds > 0)
                     .then_some(candidate.duration_seconds),
             };
-            let transcript = match self.transcriber.transcribe_voice(&audio, request).await {
-                Ok(transcript) => transcript,
-                Err(error) => {
-                    self.mark_failed_best_effort(&record, &error.to_string())
-                        .await;
-                    return input;
-                }
-            };
-            let text = transcript.text.trim().to_owned();
-            if text.is_empty() {
-                self.mark_failed_best_effort(&record, "empty transcript")
-                    .await;
+            let Ok((text, _stored)) = self.transcribe_record(&record, request).await else {
                 return input;
-            }
-            if let Err(error) = self.store_completed(&record, &text, &transcript, now).await {
-                tracing::warn!(
-                    error = error.to_string(),
-                    file_unique_id = record.file_unique_id,
-                    "failed to store Telegram voice ASR transcript"
-                );
-            }
+            };
             apply_transcript(&mut input, candidate.attachment_index, &text);
             input
         })
+    }
+
+    async fn wait_for_taskman_transcript(
+        &self,
+        file_unique_id: &str,
+        job_id: Option<i64>,
+    ) -> Option<String> {
+        let wait = async {
+            loop {
+                let record = self.lookup_record(file_unique_id).await?;
+                if let Some(text) = cached_asr_text(&record) {
+                    return Some(text);
+                }
+                if record.asr_status != TELEGRAM_FILE_ASR_STATUS_PROCESSING {
+                    return None;
+                }
+                if !job_id.is_some_and(|job_id| {
+                    self.task_queue
+                        .as_ref()
+                        .and_then(|queue| queue.record(job_id))
+                        .is_some_and(|record| record.status.is_active())
+                }) {
+                    return None;
+                }
+                tokio::time::sleep(ASR_TASKMAN_POLL_INTERVAL).await;
+            }
+        };
+        match tokio::time::timeout(ASR_TASKMAN_WAIT_TIMEOUT, wait).await {
+            Ok(text) => text,
+            Err(_) => {
+                tracing::warn!(
+                    file_unique_id,
+                    "timed out waiting for priority ASR taskman job"
+                );
+                None
+            }
+        }
+    }
+
+    async fn process_taskman_job(&self, params: AsrJobParams) -> Result<(), String> {
+        let record = self
+            .lookup_record(&params.file_unique_id)
+            .await
+            .ok_or_else(|| "Telegram voice file metadata not found".to_owned())?;
+        if cached_asr_text(&record).is_some() {
+            return Ok(());
+        }
+        let record = if record.asr_status == TELEGRAM_FILE_ASR_STATUS_PROCESSING {
+            record
+        } else {
+            self.claim_processing(&record, OffsetDateTime::now_utc())
+                .await
+                .ok_or_else(|| "Telegram voice ASR processing claim unavailable".to_owned())?
+        };
+        let (_text, stored) = self
+            .transcribe_record(
+                &record,
+                AsrRequest {
+                    chat_id: params.chat_id,
+                    message_id: params.message_id,
+                    file_unique_id: params.file_unique_id,
+                    mime_type: record.mime_type.clone(),
+                    duration_seconds: (params.duration_seconds > 0)
+                        .then_some(params.duration_seconds),
+                },
+            )
+            .await?;
+        if stored {
+            Ok(())
+        } else {
+            Err("failed to store Telegram voice ASR transcript".to_owned())
+        }
+    }
+
+    async fn transcribe_record(
+        &self,
+        record: &TelegramFileRecord,
+        request: AsrRequest,
+    ) -> Result<(String, bool), String> {
+        let latest_file_id = record.latest_file_id.trim();
+        if latest_file_id.is_empty() {
+            let error = "missing latest Telegram file id".to_owned();
+            self.mark_failed_best_effort(record, &error).await;
+            return Err(error);
+        }
+        let audio = self
+            .downloader
+            .download_voice(latest_file_id)
+            .await
+            .map_err(|error| error.to_string());
+        let audio = match audio {
+            Ok(audio) => audio,
+            Err(error) => {
+                self.mark_failed_best_effort(record, &error).await;
+                return Err(error);
+            }
+        };
+        let transcript = self
+            .transcriber
+            .transcribe_voice(&audio, request)
+            .await
+            .map_err(|error| error.to_string());
+        let transcript = match transcript {
+            Ok(transcript) => transcript,
+            Err(error) => {
+                self.mark_failed_best_effort(record, &error).await;
+                return Err(error);
+            }
+        };
+        let text = transcript.text.trim().to_owned();
+        if text.is_empty() {
+            let error = "empty transcript".to_owned();
+            self.mark_failed_best_effort(record, &error).await;
+            return Err(error);
+        }
+        let stored = if let Err(error) = self
+            .store_completed(record, &text, &transcript, OffsetDateTime::now_utc())
+            .await
+        {
+            tracing::warn!(
+                error = error.to_string(),
+                file_unique_id = record.file_unique_id,
+                "failed to store Telegram voice ASR transcript"
+            );
+            false
+        } else {
+            true
+        };
+        Ok((text, stored))
     }
 
     async fn lookup_record(&self, file_unique_id: &str) -> Option<TelegramFileRecord> {
@@ -935,6 +1091,143 @@ where
             })
             .await
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AsrQueuePollOutcome {
+    Idle,
+    Completed,
+    Failed,
+    DecodeFailed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AsrQueuePollReport {
+    pub job_id: Option<i64>,
+    pub outcome: AsrQueuePollOutcome,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AsrWorkerRunReport {
+    pub ticks: u64,
+    pub dequeued: u64,
+    pub completed: u64,
+    pub failed: u64,
+    pub decode_failed: u64,
+    pub idle: u64,
+}
+
+impl AsrWorkerRunReport {
+    fn record(&mut self, report: &AsrQueuePollReport) {
+        self.ticks += 1;
+        if report.job_id.is_some() {
+            self.dequeued += 1;
+        }
+        match report.outcome {
+            AsrQueuePollOutcome::Idle => self.idle += 1,
+            AsrQueuePollOutcome::Completed => self.completed += 1,
+            AsrQueuePollOutcome::Failed => self.failed += 1,
+            AsrQueuePollOutcome::DecodeFailed => self.decode_failed += 1,
+        }
+    }
+}
+
+pub async fn run_asr_queue_once<Store, Downloader, Transcriber>(
+    queue: &InMemoryTaskQueue,
+    processor: &TelegramDialogAsrInputMaterializer<Store, Downloader, Transcriber>,
+    now: OffsetDateTime,
+) -> AsrQueuePollReport
+where
+    Store: TelegramFileAsrStore + Send + Sync,
+    Downloader: TelegramVoiceDownloader + Send + Sync,
+    Transcriber: AsrTranscriber + Send + Sync,
+{
+    let Some(work) =
+        queue.dequeue_matching(ASR_GPU1_QUEUE_NAME, ASR_TASKMAN_WORKER_ID, now, |job| {
+            job.data.job_type == JobType::Asr
+        })
+    else {
+        return AsrQueuePollReport {
+            job_id: None,
+            outcome: AsrQueuePollOutcome::Idle,
+            error: None,
+        };
+    };
+    let params = match asr_job_params_from_stateless_job(&work.job) {
+        Ok(params) => params,
+        Err(error) => {
+            let error = error.to_string();
+            let _ = queue.fail(work.id, error.clone(), now);
+            return AsrQueuePollReport {
+                job_id: Some(work.id),
+                outcome: AsrQueuePollOutcome::DecodeFailed,
+                error: Some(error),
+            };
+        }
+    };
+    let _ = queue.set_execution_started(work.id, now);
+    match processor.process_taskman_job(params).await {
+        Ok(()) => {
+            let completed_at = OffsetDateTime::now_utc();
+            let error = queue
+                .complete(work.id, completed_at)
+                .err()
+                .map(|error| error.to_string());
+            AsrQueuePollReport {
+                job_id: Some(work.id),
+                outcome: if error.is_some() {
+                    AsrQueuePollOutcome::Failed
+                } else {
+                    AsrQueuePollOutcome::Completed
+                },
+                error,
+            }
+        }
+        Err(error) => {
+            let _ = queue.fail(work.id, error.clone(), OffsetDateTime::now_utc());
+            AsrQueuePollReport {
+                job_id: Some(work.id),
+                outcome: AsrQueuePollOutcome::Failed,
+                error: Some(error),
+            }
+        }
+    }
+}
+
+pub async fn run_asr_worker_every_until<Store, Downloader, Transcriber, Stop>(
+    queue: &InMemoryTaskQueue,
+    processor: &TelegramDialogAsrInputMaterializer<Store, Downloader, Transcriber>,
+    interval: Duration,
+    stop: Stop,
+) -> AsrWorkerRunReport
+where
+    Store: TelegramFileAsrStore + Send + Sync,
+    Downloader: TelegramVoiceDownloader + Send + Sync,
+    Transcriber: AsrTranscriber + Send + Sync,
+    Stop: Future<Output = ()>,
+{
+    let mut report = AsrWorkerRunReport::default();
+    let mut stop = std::pin::pin!(stop);
+    loop {
+        tokio::select! {
+            () = &mut stop => break,
+            () = tokio::time::sleep(interval) => {
+                let tick = run_asr_queue_once(queue, processor, OffsetDateTime::now_utc()).await;
+                match tick.outcome {
+                    AsrQueuePollOutcome::Failed | AsrQueuePollOutcome::DecodeFailed => {
+                        tracing::warn!(?tick, "priority ASR taskman job failed");
+                    }
+                    AsrQueuePollOutcome::Completed => {
+                        tracing::debug!(?tick, "processed priority ASR taskman job");
+                    }
+                    AsrQueuePollOutcome::Idle => {}
+                }
+                report.record(&tick);
+            }
+        }
+    }
+    report
 }
 
 impl<Store, Downloader, Transcriber> DialogAsrInputMaterializer
@@ -1252,6 +1545,134 @@ mod tests {
         assert_eq!(updates[1].asr_fallback_used, Some(false));
         assert_eq!(updates[1].asr_chunks, Some(1));
         assert_eq!(updates[1].asr_warnings.as_deref(), Some([].as_slice()));
+    }
+
+    #[tokio::test]
+    async fn taskman_materializer_queues_priority_asr_and_waits_for_worker() {
+        let now = OffsetDateTime::from_unix_timestamp(1_770_000_000).expect("timestamp");
+        let store = FakeStore {
+            record: Arc::new(Mutex::new(voice_record(now))),
+            updates: Arc::new(Mutex::new(Vec::new())),
+        };
+        let queue = Arc::new(InMemoryTaskQueue::new());
+        let processor = Arc::new(
+            TelegramDialogAsrInputMaterializer::new(
+                store,
+                FakeDownloader::default(),
+                FakeTranscriber {
+                    result: Ok(transcript("priority voice text")),
+                    calls: Arc::new(Mutex::new(Vec::new())),
+                },
+            )
+            .with_taskman_queue(Arc::clone(&queue)),
+        );
+        let materialize = {
+            let processor = Arc::clone(&processor);
+            tokio::spawn(async move {
+                processor
+                    .materialize_dialog_asr_input(dialog_input_with_voice(), now)
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while queue.active_count(ASR_GPU1_QUEUE_NAME) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("ASR job queued");
+
+        let record = queue
+            .records()
+            .into_iter()
+            .find(|record| record.queue_name == ASR_GPU1_QUEUE_NAME)
+            .expect("ASR queue record");
+        assert_eq!(record.job.data.job_type, JobType::Asr);
+        assert_eq!(record.job.priority, openplotva_taskman::ASR_PRIORITY);
+        let poll = run_asr_queue_once(queue.as_ref(), processor.as_ref(), now).await;
+        assert_eq!(poll.outcome, AsrQueuePollOutcome::Completed);
+
+        let input = materialize.await.expect("materializer join");
+        assert_eq!(input.message.text, "priority voice text");
+        assert_eq!(
+            queue.record(record.id).map(|record| record.status),
+            Some(openplotva_taskman::JobStatus::Completed)
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_taskman_asr_fails_open_and_releases_draw_barrier() {
+        let now = OffsetDateTime::from_unix_timestamp(1_770_000_000).expect("timestamp");
+        let store = FakeStore {
+            record: Arc::new(Mutex::new(voice_record(now))),
+            updates: Arc::new(Mutex::new(Vec::new())),
+        };
+        let queue = Arc::new(InMemoryTaskQueue::new());
+        let draw_id = queue.assign(
+            openplotva_taskman::IMAGE_REGULAR_QUEUE_NAME,
+            openplotva_taskman::new_image_gen_job_at(
+                openplotva_taskman::ImageGenJobParams {
+                    chat_id: -100,
+                    message_id: 43,
+                    user_id: 1,
+                    prompt: "draw after voice".to_owned(),
+                    ..openplotva_taskman::ImageGenJobParams::default()
+                },
+                now,
+            ),
+        );
+        let processor = Arc::new(
+            TelegramDialogAsrInputMaterializer::new(
+                store,
+                FakeDownloader::default(),
+                FakeTranscriber {
+                    result: Err("asr down".to_owned()),
+                    calls: Arc::new(Mutex::new(Vec::new())),
+                },
+            )
+            .with_taskman_queue(Arc::clone(&queue)),
+        );
+        let materialize = {
+            let processor = Arc::clone(&processor);
+            tokio::spawn(async move {
+                processor
+                    .materialize_dialog_asr_input(dialog_input_with_voice(), now)
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while queue.active_count(ASR_GPU1_QUEUE_NAME) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("ASR job queued");
+        assert!(
+            queue
+                .dequeue_matching(
+                    openplotva_taskman::IMAGE_REGULAR_QUEUE_NAME,
+                    "draw-worker",
+                    now,
+                    |job| job.data.job_type == JobType::ImageGen,
+                )
+                .is_none()
+        );
+
+        let poll = run_asr_queue_once(queue.as_ref(), processor.as_ref(), now).await;
+        assert_eq!(poll.outcome, AsrQueuePollOutcome::Failed);
+        let input = materialize.await.expect("materializer join");
+        assert!(input.message.text.is_empty());
+        assert_eq!(
+            queue
+                .dequeue_matching(
+                    openplotva_taskman::IMAGE_REGULAR_QUEUE_NAME,
+                    "draw-worker",
+                    now,
+                    |job| job.data.job_type == JobType::ImageGen,
+                )
+                .map(|work| work.id),
+            Some(draw_id)
+        );
     }
 
     #[tokio::test]

@@ -1037,6 +1037,7 @@ mod tests {
                     message_text: message_text.to_owned(),
                     ..DialogJobData::default()
                 }),
+                asr_data: None,
                 control_data: None,
                 agent_data: None,
             },
@@ -1066,6 +1067,7 @@ mod tests {
                 }),
                 music_data: None,
                 dialog_data: None,
+                asr_data: None,
                 control_data: None,
                 agent_data: None,
             },

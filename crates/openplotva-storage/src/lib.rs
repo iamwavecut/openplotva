@@ -7212,6 +7212,7 @@ fn task_queue_record_chat_user(record: &TaskQueueRecord) -> (Option<i64>, Option
 const fn task_queue_job_type_name(job_type: JobType) -> &'static str {
     match job_type {
         JobType::Dialog => "dialog",
+        JobType::Asr => "asr",
         JobType::ImageGen => "image_gen",
         JobType::ImageEdit => "image_edit",
         JobType::MusicGen => "music_gen",
@@ -9061,6 +9062,14 @@ mod tests {
     use openplotva_config::{DEFAULT_REDIS_DB, RedisConfig};
     use redis::ConnectionAddr;
     use sqlx::postgres::PgPoolOptions;
+
+    #[test]
+    fn taskman_asr_job_type_is_persisted_with_stable_name() {
+        assert_eq!(
+            super::task_queue_job_type_name(openplotva_taskman::JobType::Asr),
+            "asr"
+        );
+    }
 
     #[test]
     fn redis_store_derived_stores_share_connection_pool() -> Result<(), Box<dyn Error>> {
