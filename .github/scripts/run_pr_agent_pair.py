@@ -67,6 +67,7 @@ def configure_settings(pr_url: str) -> None:
     settings.set("CONFIG.MODEL", os.environ.get("PR_AGENT_MODEL", "openai/glm-5.2"))
     settings.set("CONFIG.FALLBACK_MODELS", env_json_list("PR_AGENT_FALLBACK_MODELS", []))
     settings.set("CONFIG.AI_TIMEOUT", env_int("PR_AGENT_AI_TIMEOUT", 600))
+    settings.set("CONFIG.REASONING_EFFORT", os.environ.get("PR_AGENT_REASONING_EFFORT", "low"))
     settings.set("CONFIG.CUSTOM_MODEL_MAX_TOKENS", env_int("PR_AGENT_CUSTOM_MODEL_MAX_TOKENS", 1000000))
     settings.set("CONFIG.MAX_MODEL_TOKENS", env_int("PR_AGENT_MAX_MODEL_TOKENS", 1000000))
     settings.set("CONFIG.PUBLISH_OUTPUT", False)
@@ -85,10 +86,12 @@ def configure_settings(pr_url: str) -> None:
 
     settings.set("PR_CODE_SUGGESTIONS.PERSISTENT_COMMENT", False)
     settings.set("PR_CODE_SUGGESTIONS.PUBLISH_OUTPUT_NO_SUGGESTIONS", False)
+    settings.set("PR_CODE_SUGGESTIONS.FOCUS_ONLY_ON_PROBLEMS", True)
 
     review_instructions = os.environ.get("PR_AGENT_REVIEW_EXTRA_INSTRUCTIONS")
     if review_instructions:
         settings.set("PR_REVIEWER.EXTRA_INSTRUCTIONS", review_instructions)
+        settings.set("PR_CODE_SUGGESTIONS.EXTRA_INSTRUCTIONS", review_instructions)
 
 
 async def generate_review(pr_url: str) -> ReviewResult:
@@ -151,10 +154,8 @@ async def run() -> int:
     pr_url = os.environ["PR_URL"]
     configure_settings(pr_url)
 
-    review, suggestions = await asyncio.gather(
-        generate_review(pr_url),
-        generate_suggestions(pr_url),
-    )
+    review = await generate_review(pr_url)
+    suggestions = await generate_suggestions(pr_url)
 
     await publish_results(review, suggestions)
 

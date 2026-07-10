@@ -38,6 +38,9 @@ pub const DEFAULT_ASR_DISCOVERY_ENDPOINT_NAME: &str = "transcribe";
 const ASR_DISCOVERY_CONTENT_TYPE: &str = "application/json";
 const ASR_DISCOVERY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const ASR_DISCOVERY_CAPACITY_WAIT: Duration = Duration::from_secs(2);
+const ASR_DISCOVERY_RETRY_BACKOFF: Duration = Duration::from_millis(200);
+const ASR_DISCOVERY_REQUEST_RETRIES: u8 = 5;
+const ASR_TERMINAL_PAYLOAD_RETRIES: u8 = 2;
 
 pub type TelegramFileAsrGetFuture<'a, Error> =
     Pin<Box<dyn Future<Output = Result<Option<TelegramFileRecord>, Error>> + Send + 'a>>;
@@ -212,6 +215,9 @@ pub struct AsrTranscript {
     pub provider: String,
     pub model: String,
     pub latency_ms: i32,
+    pub fallback_used: bool,
+    pub chunks: i32,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -304,21 +310,87 @@ impl DiscoveryAsrClient {
         };
         let deadline = Instant::now() + self.cfg.task_timeout.max(Duration::from_secs(1));
         let envelope = self
-            .with_deadline(self.submit(&job_request), deadline, &job_id)
+            .submit_with_retry(&job_request, deadline, &job_id)
             .await?;
         let mut job = envelope.resolve_job();
         let resolved_id = first_non_empty(&job.resolved_id(), &job_id);
+        let mut terminal_payload_retries = 0_u8;
         loop {
             if let Some(response) = terminal_response(&job)? {
-                return decode_asr_response(&response);
+                match decode_asr_response(&response) {
+                    Ok(transcript) => return Ok(transcript),
+                    Err(error)
+                        if terminal_payload_retries < ASR_TERMINAL_PAYLOAD_RETRIES
+                            && retryable_terminal_payload_error(&error) =>
+                    {
+                        terminal_payload_retries += 1;
+                    }
+                    Err(error) => return Err(error),
+                }
             }
             let remaining = self.remaining_budget(deadline, &resolved_id)?;
             tokio::time::sleep(self.cfg.poll_interval.min(remaining)).await;
             job = self
-                .with_deadline(self.poll(&resolved_id), deadline, &resolved_id)
+                .poll_with_retry(&resolved_id, deadline)
                 .await?
                 .resolve_job();
         }
+    }
+
+    async fn submit_with_retry(
+        &self,
+        job: &DiscoveryJobRequest,
+        deadline: Instant,
+        job_id: &str,
+    ) -> Result<DiscoveryJobEnvelope, AsrClientError> {
+        let mut retries = 0_u8;
+        loop {
+            match self.with_deadline(self.submit(job), deadline, job_id).await {
+                Ok(envelope) => return Ok(envelope),
+                Err(error)
+                    if retries < ASR_DISCOVERY_REQUEST_RETRIES
+                        && retryable_discovery_request_error(&error) =>
+                {
+                    retries += 1;
+                    self.sleep_before_retry(deadline, job_id).await?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    async fn poll_with_retry(
+        &self,
+        job_id: &str,
+        deadline: Instant,
+    ) -> Result<DiscoveryJobEnvelope, AsrClientError> {
+        let mut retries = 0_u8;
+        loop {
+            match self
+                .with_deadline(self.poll(job_id), deadline, job_id)
+                .await
+            {
+                Ok(envelope) => return Ok(envelope),
+                Err(error)
+                    if retries < ASR_DISCOVERY_REQUEST_RETRIES
+                        && retryable_discovery_request_error(&error) =>
+                {
+                    retries += 1;
+                    self.sleep_before_retry(deadline, job_id).await?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    async fn sleep_before_retry(
+        &self,
+        deadline: Instant,
+        job_id: &str,
+    ) -> Result<(), AsrClientError> {
+        let remaining = self.remaining_budget(deadline, job_id)?;
+        tokio::time::sleep(ASR_DISCOVERY_RETRY_BACKOFF.min(remaining)).await;
+        self.remaining_budget(deadline, job_id).map(|_| ())
     }
 
     async fn with_deadline<T, Fut>(
@@ -510,6 +582,12 @@ struct AsrServiceResponse {
     engine: String,
     model: String,
     latency_ms: i32,
+    #[serde(default)]
+    fallback_used: bool,
+    #[serde(default)]
+    chunks: i32,
+    #[serde(default)]
+    warnings: Vec<String>,
 }
 
 fn routed_asr_client(
@@ -578,6 +656,28 @@ fn asr_retryable_reason(error: &AsrClientError) -> Option<FailureReason> {
     }
 }
 
+fn retryable_discovery_request_error(error: &AsrClientError) -> bool {
+    match error {
+        AsrClientError::Request(_) => true,
+        AsrClientError::Status { status, .. } => *status >= 500,
+        AsrClientError::Discovery(message) => {
+            message.starts_with("submit body:")
+                || message.starts_with("poll body:")
+                || message.starts_with("decode submit:")
+                || message.starts_with("decode poll:")
+        }
+    }
+}
+
+fn retryable_terminal_payload_error(error: &AsrClientError) -> bool {
+    matches!(
+        error,
+        AsrClientError::Discovery(message)
+            if message.starts_with("decode response body:")
+                || message.starts_with("decode ASR response:")
+    )
+}
+
 fn terminal_response(job: &DiscoveryJob) -> Result<Option<DiscoveryJobResponse>, AsrClientError> {
     let state = job.resolved_status().to_ascii_uppercase();
     if state.contains("SUCC") {
@@ -626,6 +726,9 @@ fn decode_asr_response(response: &DiscoveryJobResponse) -> Result<AsrTranscript,
         provider: decoded.engine,
         model: decoded.model,
         latency_ms: decoded.latency_ms,
+        fallback_used: decoded.fallback_used,
+        chunks: decoded.chunks,
+        warnings: decoded.warnings,
     })
 }
 
@@ -823,6 +926,9 @@ where
                 asr_provider: Some(transcript.provider.clone()),
                 asr_model: Some(transcript.model.clone()),
                 asr_latency_ms: Some(transcript.latency_ms),
+                asr_fallback_used: Some(transcript.fallback_used),
+                asr_chunks: Some(transcript.chunks),
+                asr_warnings: Some(transcript.warnings.clone()),
                 asr_error: None,
                 asr_completed_at: Some(now),
                 ..TelegramFileAsrUpdate::default()
@@ -913,9 +1019,19 @@ fn merge_existing_text_with_transcript(existing: &str, transcript: &str) -> Stri
 mod tests {
     use std::{
         future,
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
     };
 
+    use axum::{
+        Json, Router,
+        extract::State,
+        http::StatusCode,
+        response::{IntoResponse, Response},
+        routing::{get, post},
+    };
     use openplotva_core::{ChatAttachment, ChatMessageMeta};
     use openplotva_dialog::{DialogContext, DialogInput, DialogMessage};
     use openplotva_storage::{
@@ -1010,6 +1126,12 @@ mod tests {
                     .clone()
                     .or_else(|| record.asr_model.clone());
                 record.asr_latency_ms = params.asr_latency_ms.or(record.asr_latency_ms);
+                record.asr_fallback_used = params.asr_fallback_used.or(record.asr_fallback_used);
+                record.asr_chunks = params.asr_chunks.or(record.asr_chunks);
+                record.asr_warnings = params
+                    .asr_warnings
+                    .clone()
+                    .or_else(|| record.asr_warnings.clone());
                 record.asr_error = params.asr_error.clone();
                 record.asr_requested_at = params.asr_requested_at.or(record.asr_requested_at);
                 record.asr_completed_at = params.asr_completed_at.or(record.asr_completed_at);
@@ -1127,6 +1249,9 @@ mod tests {
         assert_eq!(updates[1].asr_text.as_deref(), Some("fresh voice text"));
         assert_eq!(updates[1].asr_provider.as_deref(), Some("gigaam"));
         assert_eq!(updates[1].asr_model.as_deref(), Some("gigaam-v3"));
+        assert_eq!(updates[1].asr_fallback_used, Some(false));
+        assert_eq!(updates[1].asr_chunks, Some(1));
+        assert_eq!(updates[1].asr_warnings.as_deref(), Some([].as_slice()));
     }
 
     #[tokio::test]
@@ -1324,6 +1449,109 @@ mod tests {
         );
     }
 
+    #[derive(Clone, Default)]
+    struct RetryServerState {
+        polls: Arc<AtomicUsize>,
+    }
+
+    async fn retry_server_submit() -> Json<serde_json::Value> {
+        Json(serde_json::json!({
+            "job_id": "retry-job",
+            "state": "JOB_STATE_RUNNING"
+        }))
+    }
+
+    async fn retry_server_poll(State(state): State<RetryServerState>) -> Response {
+        let poll = state.polls.fetch_add(1, Ordering::SeqCst);
+        if poll == 0 {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "temporary"})),
+            )
+                .into_response();
+        }
+        let body = if poll == 1 {
+            "not valid base64!".to_owned()
+        } else {
+            general_purpose::URL_SAFE_NO_PAD.encode(
+                serde_json::json!({
+                    "text": "recovered transcript",
+                    "engine": "vosk",
+                    "model": "vosk-model",
+                    "fallback_used": true,
+                    "chunks": 1,
+                    "latency_ms": 321,
+                    "warnings": ["primary_failed:gigaam:GPU lock is busy"]
+                })
+                .to_string(),
+            )
+        };
+        Json(serde_json::json!({
+            "job_id": "retry-job",
+            "state": "JOB_STATE_SUCCEEDED",
+            "result": {
+                "response": {
+                    "status_code": 200,
+                    "body": body,
+                    "content_type": "application/json"
+                }
+            }
+        }))
+        .into_response()
+    }
+
+    #[tokio::test]
+    async fn discovery_client_retries_poll_and_terminal_payload_failures() {
+        let state = RetryServerState::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind retry server");
+        let address = listener.local_addr().expect("retry server address");
+        let app = Router::new()
+            .route("/v1/jobs/blocking", post(retry_server_submit))
+            .route("/v1/jobs/{job_id}", get(retry_server_poll))
+            .with_state(state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve retry server");
+        });
+        let client = DiscoveryAsrClient::new(DiscoveryAsrConfig {
+            base_url: format!("http://{address}"),
+            service_name: DEFAULT_ASR_DISCOVERY_SERVICE_NAME.to_owned(),
+            endpoint_name: DEFAULT_ASR_DISCOVERY_ENDPOINT_NAME.to_owned(),
+            request_timeout: Duration::from_secs(2),
+            task_timeout: Duration::from_secs(2),
+            poll_interval: Duration::from_millis(1),
+            capacity_wait: Duration::from_millis(1),
+        })
+        .expect("client");
+
+        let transcript = client
+            .transcribe_bytes(
+                &[1, 2, 3],
+                AsrRequest {
+                    chat_id: 1,
+                    message_id: 2,
+                    file_unique_id: "voice".to_owned(),
+                    mime_type: Some("audio/ogg".to_owned()),
+                    duration_seconds: Some(1),
+                },
+            )
+            .await
+            .expect("transcript after retries");
+
+        server.abort();
+        assert_eq!(state.polls.load(Ordering::SeqCst), 3);
+        assert_eq!(transcript.text, "recovered transcript");
+        assert!(transcript.fallback_used);
+        assert_eq!(transcript.chunks, 1);
+        assert_eq!(
+            transcript.warnings,
+            ["primary_failed:gigaam:GPU lock is busy"]
+        );
+    }
+
     #[test]
     fn decode_asr_response_accepts_url_safe_discovery_body() {
         let payload = r#"{"text":"Процесс биологической экспансии завершён.","engine":"gigaam","model":"gigaam-v3","latency_ms":123}"#;
@@ -1339,6 +1567,9 @@ mod tests {
         assert_eq!(decoded.provider, "gigaam");
         assert_eq!(decoded.model, "gigaam-v3");
         assert_eq!(decoded.latency_ms, 123);
+        assert!(!decoded.fallback_used);
+        assert_eq!(decoded.chunks, 0);
+        assert!(decoded.warnings.is_empty());
     }
 
     fn dialog_input_with_voice() -> DialogInput {
@@ -1390,6 +1621,9 @@ mod tests {
             asr_provider: None,
             asr_model: None,
             asr_latency_ms: None,
+            asr_fallback_used: None,
+            asr_chunks: None,
+            asr_warnings: None,
             asr_error: None,
             asr_requested_at: None,
             asr_completed_at: None,
@@ -1405,6 +1639,9 @@ mod tests {
             provider: "gigaam".to_owned(),
             model: "gigaam-v3".to_owned(),
             latency_ms: 1200,
+            fallback_used: false,
+            chunks: 1,
+            warnings: Vec::new(),
         }
     }
 }
