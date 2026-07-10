@@ -1503,7 +1503,7 @@ impl InMemoryTaskQueue {
                 Some((completed_at, total_seconds as f64))
             })
             .collect();
-        samples.sort_by(|left, right| right.0.cmp(&left.0));
+        samples.sort_by_key(|(completed_at, _)| std::cmp::Reverse(*completed_at));
         samples.truncate(sample_size);
         if samples.is_empty() {
             return None;
