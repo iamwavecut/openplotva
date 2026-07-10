@@ -4146,6 +4146,62 @@ mod tests {
     }
 
     #[test]
+    fn processing_draw_does_not_block_asr_claim() -> Result<(), Box<dyn std::error::Error>> {
+        let queue = InMemoryTaskQueue::new();
+        let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+        let draw = queue.assign(
+            IMAGE_REGULAR_QUEUE_NAME,
+            new_image_gen_job_at(
+                ImageGenJobParams {
+                    chat_id: 1,
+                    message_id: 10,
+                    user_id: 2,
+                    prompt: "already drawing".to_owned(),
+                    ..ImageGenJobParams::default()
+                },
+                now,
+            ),
+        );
+        assert_eq!(
+            queue
+                .dequeue_matching(IMAGE_REGULAR_QUEUE_NAME, "draw-worker", now, |job| {
+                    job.data.job_type == JobType::ImageGen
+                })
+                .map(|work| work.id),
+            Some(draw)
+        );
+        let asr = queue.assign(
+            ASR_GPU1_QUEUE_NAME,
+            new_asr_job_at(
+                AsrJobParams {
+                    chat_id: 1,
+                    message_id: 11,
+                    user_id: 2,
+                    file_unique_id: "voice-during-draw".to_owned(),
+                    duration_seconds: 4,
+                    ..AsrJobParams::default()
+                },
+                now,
+            ),
+        );
+
+        assert_eq!(
+            queue
+                .dequeue_matching(ASR_GPU1_QUEUE_NAME, "asr-worker", now, |job| {
+                    job.data.job_type == JobType::Asr
+                })
+                .map(|work| work.id),
+            Some(asr)
+        );
+        assert_eq!(
+            queue.record(draw).map(|record| record.status),
+            Some(JobStatus::Processing),
+            "ASR priority must not cancel an already-running draw"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn pending_image_queue_entries_track_positions_as_queue_drains()
     -> Result<(), Box<dyn std::error::Error>> {
         let queue = InMemoryTaskQueue::new();
