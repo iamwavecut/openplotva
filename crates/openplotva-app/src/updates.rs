@@ -951,7 +951,13 @@ where
     tokio::pin!(stop);
 
     'consume: loop {
-        while workers.len() >= worker_limit {
+        loop {
+            while let Some(joined) = workers.try_join_next() {
+                record_claimed_update_result(joined, &mut report);
+            }
+            if workers.len() < worker_limit {
+                break;
+            }
             tokio::select! {
                 _ = &mut stop => break 'consume,
                 joined = workers.join_next() => {
