@@ -39,6 +39,7 @@ pub const TELEGRAM_OUTBOX_WORKER_DEFAULT_IDLE_POLL_INTERVAL: Duration = Duration
 pub const TELEGRAM_OUTBOX_WORKER_DEFAULT_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(30);
 
 const OUTBOX_MAINTENANCE_LIMIT: usize = 1_000;
+const DIALOG_DELIVERY_RECONCILE_LIMIT: i64 = 250;
 const AMBIGUITY_REACTION_EMOJI: &str = "🤔";
 const AMBIGUITY_REACTION_BATCH_PREFIX: &str = "tgamb:v1:";
 
@@ -118,6 +119,42 @@ impl TelegramOutboxJobResolver for SharedTaskQueueRuntime {
     }
 }
 
+#[derive(Clone)]
+pub struct RunAwareTelegramOutboxJobResolver {
+    jobs: SharedTaskQueueRuntime,
+    runs: crate::runtime_llm_runs::RuntimeLlmRunBuffer,
+}
+
+impl RunAwareTelegramOutboxJobResolver {
+    #[must_use]
+    pub fn new(
+        jobs: SharedTaskQueueRuntime,
+        runs: crate::runtime_llm_runs::RuntimeLlmRunBuffer,
+    ) -> Self {
+        Self { jobs, runs }
+    }
+}
+
+impl TelegramOutboxJobResolver for RunAwareTelegramOutboxJobResolver {
+    type Error = String;
+
+    fn complete_job<'a>(&'a self, job_id: i64) -> TelegramOutboxJobFuture<'a, Self::Error> {
+        Box::pin(async move {
+            self.jobs.complete_job(job_id).await?;
+            self.runs.mark_job_delivered(job_id);
+            Ok(())
+        })
+    }
+
+    fn fail_job<'a>(
+        &'a self,
+        job_id: i64,
+        error: &'a str,
+    ) -> TelegramOutboxJobFuture<'a, Self::Error> {
+        self.jobs.fail_job(job_id, error)
+    }
+}
+
 /// Resolver for deployments that do not attach outbox rows to taskman jobs.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NoopTelegramOutboxJobResolver;
@@ -175,6 +212,7 @@ pub struct TelegramOutboxWorkerReport {
     pub ambiguity_reactions_queued: u64,
     pub jobs_completed: u64,
     pub jobs_failed: u64,
+    pub delivery_outcomes_reconciled: u64,
     pub errors: u64,
     pub last_error: Option<String>,
 }
@@ -209,10 +247,13 @@ where
             last_maintenance = Some(Instant::now());
         }
 
-        let claimed = tokio::select! {
-            () = &mut stop => break,
-            result = store.claim_operations(worker_id, config.claim_limit) => result,
-        };
+        if stop_requested_now(&mut stop).await {
+            break;
+        }
+        // Claiming commits fenced leases in PostgreSQL. Await the mutation so
+        // shutdown cannot discard successfully claimed rows and hide them
+        // until lease expiry.
+        let claimed = store.claim_operations(worker_id, config.claim_limit).await;
         let operations = match claimed {
             Ok(operations) => operations,
             Err(error) => {
@@ -948,6 +989,7 @@ async fn run_outbox_maintenance<Jobs>(
     }
 
     reconcile_ambiguity_reactions(store, report).await;
+    reconcile_dialog_turn_delivery_states(store, report).await;
     reconcile_resolved_taskman_batches(store, jobs, report).await;
 }
 
@@ -1008,6 +1050,94 @@ async fn reconcile_ambiguity_reactions(
                 format!("reconcile ambiguous-create reaction: {error}"),
             ),
         }
+    }
+}
+
+async fn reconcile_dialog_turn_delivery_states(
+    store: &PostgresTelegramOutboxStore,
+    report: &mut TelegramOutboxWorkerReport,
+) {
+    let reconciled = sqlx::query(
+        "WITH candidates AS ( \
+             SELECT outcome.id, outcome.job_id, \
+                    count(*) AS operation_count, \
+                    count(*) FILTER (WHERE operation.state = 'delivered') = count(*) \
+                        AS all_delivered, \
+                    count(*) FILTER (WHERE operation.state = 'delivered') > 0 \
+                        AS any_delivered, \
+                    bool_or(operation.state = 'ambiguous') AS any_ambiguous, \
+                    max(operation.confirmed_at) FILTER (WHERE operation.state = 'delivered') \
+                        AS delivered_at, \
+                    string_agg(DISTINCT operation.state, ',' ORDER BY operation.state) AS states \
+             FROM dialog_turn_outcomes AS outcome \
+             JOIN telegram_outbox AS operation ON operation.dialog_job_id = outcome.job_id \
+             WHERE outcome.outcome = 'queued_for_delivery' \
+               AND outcome.delivery_state IN ('legacy_unverified', 'queued') \
+               AND outcome.created_at >= statement_timestamp() - interval '1 day' \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM telegram_outbox AS unresolved \
+                   WHERE unresolved.dialog_job_id = outcome.job_id \
+                     AND unresolved.state IN ('pending', 'leased', 'retry_wait') \
+               ) \
+             GROUP BY outcome.id, outcome.job_id \
+             ORDER BY outcome.id DESC \
+             LIMIT $1 \
+         ) \
+         UPDATE dialog_turn_outcomes AS outcome \
+         SET delivery_state = CASE \
+                 WHEN candidates.all_delivered THEN 'delivered' \
+                 WHEN candidates.any_ambiguous THEN 'ambiguous' \
+                 WHEN candidates.any_delivered THEN 'partial' \
+                 ELSE 'dead_letter' \
+             END, \
+             outbox_operation_ids = ARRAY( \
+                 SELECT operation.operation_id \
+                 FROM telegram_outbox AS operation \
+                 WHERE operation.dialog_job_id = candidates.job_id \
+                 ORDER BY operation.batch_id, operation.part_index \
+             ), \
+             telegram_message_ids = ARRAY( \
+                 SELECT DISTINCT message.message_id \
+                 FROM telegram_outbox AS operation \
+                 CROSS JOIN LATERAL unnest(operation.telegram_message_ids) AS message(message_id) \
+                 WHERE operation.dialog_job_id = candidates.job_id \
+                 ORDER BY message.message_id \
+             ), \
+             sent_message_parts = CASE \
+                 WHEN candidates.all_delivered \
+                 THEN LEAST(candidates.operation_count, 2147483647)::integer \
+                 ELSE outcome.sent_message_parts \
+             END, \
+             delivered_at = CASE \
+                 WHEN candidates.all_delivered THEN candidates.delivered_at \
+                 ELSE outcome.delivered_at \
+             END, \
+             delivery_error_class = CASE \
+                 WHEN candidates.all_delivered THEN NULL \
+                 WHEN candidates.any_ambiguous THEN 'ambiguous' \
+                 WHEN candidates.any_delivered THEN 'partial' \
+                 ELSE 'dead_letter' \
+             END, \
+             delivery_error = CASE \
+                 WHEN candidates.all_delivered THEN NULL \
+                 ELSE 'Telegram outbox reached terminal state(s): ' || candidates.states \
+             END \
+         FROM candidates \
+         WHERE outcome.id = candidates.id",
+    )
+    .bind(DIALOG_DELIVERY_RECONCILE_LIMIT)
+    .execute(store.pool())
+    .await;
+    match reconciled {
+        Ok(result) => {
+            report.delivery_outcomes_reconciled = report
+                .delivery_outcomes_reconciled
+                .saturating_add(result.rows_affected());
+        }
+        Err(error) => record_worker_error(
+            report,
+            format!("reconcile dialog turn delivery states: {error}"),
+        ),
     }
 }
 
@@ -1130,6 +1260,17 @@ fn record_worker_error(report: &mut TelegramOutboxWorkerReport, error: String) {
     tracing::warn!(%error, "Telegram outbox worker error");
 }
 
+async fn stop_requested_now<Stop>(stop: &mut Pin<&mut Stop>) -> bool
+where
+    Stop: Future<Output = ()>,
+{
+    tokio::select! {
+        biased;
+        () = stop.as_mut() => true,
+        () = std::future::ready(()) => false,
+    }
+}
+
 fn merge_worker_report(
     aggregate: &mut TelegramOutboxWorkerReport,
     report: TelegramOutboxWorkerReport,
@@ -1160,6 +1301,9 @@ fn merge_worker_report(
         .jobs_completed
         .saturating_add(report.jobs_completed);
     aggregate.jobs_failed = aggregate.jobs_failed.saturating_add(report.jobs_failed);
+    aggregate.delivery_outcomes_reconciled = aggregate
+        .delivery_outcomes_reconciled
+        .saturating_add(report.delivery_outcomes_reconciled);
     aggregate.errors = aggregate.errors.saturating_add(report.errors);
     if report.last_error.is_some() {
         aggregate.last_error = report.last_error;

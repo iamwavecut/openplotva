@@ -22,6 +22,8 @@ const RUN_TOOL_JSON_MAX_CHARS: usize = 4_000;
 
 /// List-level preview length of the final response.
 const RUN_PREVIEW_MAX_CHARS: usize = 200;
+const RUN_OUTCOME_QUEUED_FOR_DELIVERY: &str = "queued_for_delivery";
+const RUN_OUTCOME_SENT: &str = "sent";
 
 /// Open runs older than this are swept into the ring as `Abandoned` (crashed
 /// callers, lost finishes).
@@ -318,6 +320,26 @@ impl RuntimeLlmRunBuffer {
         }
     }
 
+    /// Reconcile a dialog run after every mandatory Telegram outbox part has
+    /// a real receipt. This updates both open runs (delivery can win the small
+    /// finalization race) and closed ring entries shown by the admin UI.
+    pub fn mark_job_delivered(&self, job_id: i64) {
+        let run_id = format!("job-{job_id}");
+        let mut inner = self.lock();
+        if let Some(record) = inner.open.get_mut(&run_id) {
+            mark_record_delivered(record);
+            return;
+        }
+        if let Some(record) = inner
+            .ring
+            .iter_mut()
+            .flatten()
+            .find(|record| record.origin.job_id == Some(job_id) || record.run_id == run_id)
+        {
+            mark_record_delivered(record);
+        }
+    }
+
     /// Record an unscoped LLM call as a closed single-round run (kind = flow).
     pub fn record_one_off(
         &self,
@@ -371,7 +393,7 @@ impl RuntimeLlmRunBuffer {
         &self,
         run_id: &str,
         status: RunStatus,
-        outcome: Option<RunOutcome>,
+        mut outcome: Option<RunOutcome>,
         error: Option<String>,
         now: OffsetDateTime,
     ) {
@@ -379,6 +401,13 @@ impl RuntimeLlmRunBuffer {
         let Some(mut record) = inner.open.remove(run_id) else {
             return;
         };
+        if record
+            .rounds
+            .last()
+            .is_some_and(|round| round.sent == RunRoundSent::Final)
+        {
+            mark_queued_outcome_delivered(outcome.as_mut());
+        }
         record.status = status;
         record.outcome = outcome;
         if record.error.is_none() {
@@ -459,6 +488,31 @@ impl RuntimeLlmRunBuffer {
             }
         }
         pruned
+    }
+}
+
+fn mark_record_delivered(record: &mut RunRecord) {
+    if let Some(round) = record.rounds.last_mut() {
+        round.sent = RunRoundSent::Final;
+    }
+    mark_queued_outcome_delivered(record.outcome.as_mut());
+}
+
+fn mark_queued_outcome_delivered(outcome: Option<&mut RunOutcome>) {
+    let Some(outcome) = outcome.filter(|outcome| {
+        outcome
+            .outcome
+            .eq_ignore_ascii_case(RUN_OUTCOME_QUEUED_FOR_DELIVERY)
+    }) else {
+        return;
+    };
+    outcome.outcome = RUN_OUTCOME_SENT.to_owned();
+    if outcome.sent_message_parts.is_none() {
+        outcome.sent_message_parts = outcome
+            .detail
+            .get("outbox_operation_ids")
+            .and_then(serde_json::Value::as_array)
+            .map(|parts| i32::try_from(parts.len()).unwrap_or(i32::MAX));
     }
 }
 
@@ -832,6 +886,82 @@ mod tests {
             buffer.get(run.id).map(|r| r.run_id),
             Some("job-1".to_owned())
         );
+    }
+
+    #[test]
+    fn delivered_outbox_reconciles_closed_queued_run() {
+        let buffer = RuntimeLlmRunBuffer::new(4);
+        buffer.begin_run(
+            "job-42".to_owned(),
+            "dialog",
+            RunOrigin {
+                job_id: Some(42),
+                ..RunOrigin::default()
+            },
+            ts(0),
+        );
+        assert_eq!(buffer.record_round("job-42", round("готово")), Some(1));
+        buffer.finish_run(
+            "job-42",
+            RunStatus::Completed,
+            Some(RunOutcome {
+                outcome: RUN_OUTCOME_QUEUED_FOR_DELIVERY.to_owned(),
+                detail: serde_json::json!({"outbox_operation_ids": ["a", "b"]}),
+                ..RunOutcome::default()
+            }),
+            None,
+            ts(1),
+        );
+
+        buffer.mark_job_delivered(42);
+
+        let run = buffer
+            .list(&RunListFilter::default(), ts(2))
+            .into_iter()
+            .next()
+            .expect("closed run");
+        assert_eq!(run.rounds[0].sent, RunRoundSent::Final);
+        let outcome = run.outcome.expect("run outcome");
+        assert_eq!(outcome.outcome, RUN_OUTCOME_SENT);
+        assert_eq!(outcome.sent_message_parts, Some(2));
+    }
+
+    #[test]
+    fn delivered_outbox_wins_race_with_run_finalization() {
+        let buffer = RuntimeLlmRunBuffer::new(4);
+        buffer.begin_run(
+            "job-43".to_owned(),
+            "dialog",
+            RunOrigin {
+                job_id: Some(43),
+                ..RunOrigin::default()
+            },
+            ts(0),
+        );
+        assert_eq!(buffer.record_round("job-43", round("готово")), Some(1));
+
+        buffer.mark_job_delivered(43);
+        buffer.finish_run(
+            "job-43",
+            RunStatus::Completed,
+            Some(RunOutcome {
+                outcome: RUN_OUTCOME_QUEUED_FOR_DELIVERY.to_owned(),
+                detail: serde_json::json!({"outbox_operation_ids": ["a"]}),
+                ..RunOutcome::default()
+            }),
+            None,
+            ts(1),
+        );
+
+        let run = buffer
+            .list(&RunListFilter::default(), ts(2))
+            .into_iter()
+            .next()
+            .expect("closed run");
+        assert_eq!(run.rounds[0].sent, RunRoundSent::Final);
+        let outcome = run.outcome.expect("run outcome");
+        assert_eq!(outcome.outcome, RUN_OUTCOME_SENT);
+        assert_eq!(outcome.sent_message_parts, Some(1));
     }
 
     #[test]

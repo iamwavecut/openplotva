@@ -66,6 +66,9 @@ pub struct DialogTurnOutcomeRecord {
     pub sent_message_parts: Option<i32>,
     pub side_effect_ticket_id: Option<i64>,
     pub detail: Value,
+    pub delivery_state: String,
+    pub outbox_operation_ids: Vec<String>,
+    pub delivered_at: Option<OffsetDateTime>,
 }
 
 impl DialogTurnOutcomeRecord {
@@ -371,7 +374,8 @@ async fn flush(pool: &PgPool, pending: &mut Vec<DialogTurnOutcomeRecord>) {
 const SQL_INSERT_TURN_OUTCOMES_PREFIX: &str = "INSERT INTO dialog_turn_outcomes \
     (created_at, job_id, queue_name, chat_id, thread_id, user_id, trigger_message_id, \
      attempt, outcome, reason, provider, model, elapsed_ms, budget_ms, user_signal, \
-     sent_message_parts, side_effect_ticket_id, detail)";
+     sent_message_parts, side_effect_ticket_id, detail, delivery_state, \
+     outbox_operation_ids, delivered_at)";
 
 async fn insert_turn_outcomes(
     pool: &PgPool,
@@ -406,7 +410,10 @@ fn build_insert_turn_outcomes(records: &[DialogTurnOutcomeRecord]) -> QueryBuild
             .push_bind(record.user_signal.clone())
             .push_bind(record.sent_message_parts)
             .push_bind(record.side_effect_ticket_id)
-            .push_bind(sqlx::types::Json(record.detail.clone()));
+            .push_bind(sqlx::types::Json(record.detail.clone()))
+            .push_bind(record.delivery_state.clone())
+            .push_bind(record.outbox_operation_ids.clone())
+            .push_bind(record.delivered_at);
     });
     builder
 }
@@ -458,6 +465,9 @@ mod tests {
             sent_message_parts: None,
             side_effect_ticket_id: None,
             detail: Value::Object(serde_json::Map::new()),
+            delivery_state: "legacy_unverified".to_owned(),
+            outbox_operation_ids: Vec::new(),
+            delivered_at: None,
         }
     }
 
@@ -475,6 +485,9 @@ mod tests {
             "insert must stay syntactically valid: {sql}"
         );
         assert_eq!(sql.matches("($").count(), 2, "one tuple per record: {sql}");
+        assert!(sql.contains("delivery_state"));
+        assert!(sql.contains("outbox_operation_ids"));
+        assert!(sql.contains("delivered_at"));
     }
 
     #[test]
@@ -500,6 +513,9 @@ mod tests {
                 sent_message_parts: None,
                 side_effect_ticket_id: None,
                 detail: Value::Object(serde_json::Map::new()),
+                delivery_state: "legacy_unverified".to_owned(),
+                outbox_operation_ids: Vec::new(),
+                delivered_at: None,
             };
             buffer.record(&record);
         }
