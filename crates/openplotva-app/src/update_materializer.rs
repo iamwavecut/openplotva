@@ -313,6 +313,10 @@ where
 
     let mut pending = VecDeque::with_capacity(max_rows);
     let mut reclaim_cursor = UpdateStreamId::MIN;
+    // The lease is exclusive, so every pre-existing PEL owner is abandoned at
+    // this point. Adopt the whole PEL without an extra idle wait once; later
+    // reclaim scans retain the configured crash-recovery threshold.
+    let mut startup_reclaim = true;
 
     loop {
         if pending.is_empty() {
@@ -321,18 +325,17 @@ where
             }
             // XAUTOCLAIM changes PEL ownership. Once started, its response must
             // be observed so a graceful stop can drain every claimed entry.
+            let reclaim_idle = reclaim_idle_for_pass(startup_reclaim, config.reclaim_idle);
             let reclaimed = stream
-                .reclaim_pending(
-                    &owner_consumer_id,
-                    config.reclaim_idle,
-                    reclaim_cursor,
-                    max_rows,
-                )
+                .reclaim_pending(&owner_consumer_id, reclaim_idle, reclaim_cursor, max_rows)
                 .await;
             match reclaimed {
                 Ok(claim) => {
                     consecutive_redis_failures = 0;
                     reclaim_cursor = claim.next_start;
+                    if startup_reclaim && reclaim_cursor == UpdateStreamId::MIN {
+                        startup_reclaim = false;
+                    }
                     if claim.invalid_entries {
                         tracing::warn!(
                             stream_key = stream.key(),
@@ -1069,6 +1072,14 @@ fn retry_backoff(consecutive_failures: u32) -> Duration {
     Duration::from_millis(half_millis + rand::random::<u64>() % half_millis.saturating_add(1))
 }
 
+fn reclaim_idle_for_pass(startup_reclaim: bool, configured: Duration) -> Duration {
+    if startup_reclaim {
+        Duration::ZERO
+    } else {
+        configured
+    }
+}
+
 async fn stop_requested_now<Stop>(stop: &mut Pin<&mut Stop>) -> bool
 where
     Stop: Future<Output = ()>,
@@ -1108,7 +1119,7 @@ mod tests {
 
     use super::{
         MATERIALIZER_LEASE_RENEW_INTERVAL, MATERIALIZER_LEASE_TTL, UpdateMaterializerMetrics,
-        batch_prefix, materializer_owner_consumer_id, preprocess_batch,
+        batch_prefix, materializer_owner_consumer_id, preprocess_batch, reclaim_idle_for_pass,
         run_materializer_lease_heartbeat, stop_requested_now, take_batch,
         wait_for_materializer_lease_loss,
     };
@@ -1124,6 +1135,14 @@ mod tests {
         assert!(!stop_requested_now(&mut stop).await);
         stop_tx.send(()).expect("send shutdown");
         assert!(stop_requested_now(&mut stop).await);
+    }
+
+    #[test]
+    fn first_reclaim_pass_immediately_adopts_abandoned_pel_entries() {
+        let configured = Duration::from_secs(60);
+
+        assert_eq!(reclaim_idle_for_pass(true, configured), Duration::ZERO);
+        assert_eq!(reclaim_idle_for_pass(false, configured), configured);
     }
 
     #[test]
