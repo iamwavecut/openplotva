@@ -69,6 +69,7 @@ pub mod telegram_outbox;
 pub mod translate;
 pub mod update_importer;
 pub mod update_materializer;
+mod update_reconciler;
 pub mod updates;
 pub mod virtual_messages;
 pub mod vision;
@@ -10584,6 +10585,8 @@ async fn start_runtime_workers(
             "SELECT to_regclass('public.telegram_update_inbox') IS NOT NULL \
                 AND to_regclass('public.telegram_update_quarantine') IS NOT NULL \
                 AND to_regclass('public.telegram_update_attempts') IS NOT NULL \
+                AND to_regclass('public.telegram_update_lanes') IS NOT NULL \
+                AND to_regclass('public.telegram_update_startup_jobs') IS NOT NULL \
                 AND to_regclass('public.telegram_outbox') IS NOT NULL \
                 AND to_regclass('public.telegram_outbox_attempts') IS NOT NULL \
                 AND to_regclass('public.telegram_outbox_blobs') IS NOT NULL",
@@ -10599,6 +10602,35 @@ async fn start_runtime_workers(
         readiness_checks.push(ReadinessCheck::ok(
             "telegram_update_schema",
             "durable Telegram update inbox schema is available",
+        ));
+        let reconcile_report = update_reconciler::reconcile_update_backlog_once(
+            &openplotva_storage::PostgresTelegramDeliveryStore::new(
+                service_clients.postgres.clone(),
+            ),
+            bot_identity.id,
+            &bot_user_from_get_me(&bot_identity),
+        )
+        .await
+        .context("reconcile Telegram update inbox backlog")?;
+        tracing::info!(
+            ?reconcile_report,
+            "Telegram update startup backlog reconciliation finished"
+        );
+        readiness_checks.push(ReadinessCheck::ok(
+            "telegram_update_startup_reconcile",
+            format!(
+                "startup bulk reconciliation {} ({} scanned, {} ignored, {} decode failures, {} attempts repaired, {} lanes)",
+                if reconcile_report.storage.already_completed {
+                    "already completed"
+                } else {
+                    "completed"
+                },
+                reconcile_report.scanned_rows,
+                reconcile_report.storage.ignored_rows,
+                reconcile_report.decode_failures,
+                reconcile_report.storage.repaired_attempt_rows,
+                reconcile_report.storage.lane_rows,
+            ),
         ));
         let stream = openplotva_updates::RedisUpdateStream::new(
             update_stream_redis_client.clone(),
@@ -12379,6 +12411,8 @@ async fn start_runtime_workers(
         tracing::info!(?outcome, "outbound immediate dispatcher worker stopped");
     });
 
+    let update_ingress_guard = Arc::new(openplotva_updates::UpdateIngressGuard::with_defaults());
+
     if !config.service_probe.produce_updates {
         readiness_checks.push(ReadinessCheck::skipped(
             "telegram_update_producer",
@@ -12399,7 +12433,8 @@ async fn start_runtime_workers(
             sender: openplotva_telegram::webhook_update_stream(
                 update_stream.clone(),
                 bot_identity.id,
-            ),
+            )
+            .with_ingress_guard(Arc::clone(&update_ingress_guard)),
             secret_token: Arc::from(config.bot.webhook.secret_token.clone()),
         });
         readiness_checks.push(ReadinessCheck::ok(
@@ -12410,6 +12445,7 @@ async fn start_runtime_workers(
         let update_startup = telegram.clone();
         let update_source = telegram.clone();
         let update_stream = update_stream.clone();
+        let update_ingress_guard = Arc::clone(&update_ingress_guard);
         let update_stop = stop.subscribe();
         let update_bot_id = bot_identity.id;
         let update_producer_worker = tokio::spawn(async move {
@@ -12417,13 +12453,15 @@ async fn start_runtime_workers(
                 tracing::warn!(%error, "Telegram long-poll Stream producer stopped before polling");
                 return;
             }
-            let report = openplotva_telegram::run_long_poll_stream_producer_until(
-                &update_source,
-                &update_stream,
-                update_bot_id,
-                wait_for_runtime_stop(update_stop),
-            )
-            .await;
+            let report =
+                openplotva_telegram::run_long_poll_stream_producer_with_ingress_guard_until(
+                    &update_source,
+                    &update_stream,
+                    update_bot_id,
+                    update_ingress_guard.as_ref(),
+                    wait_for_runtime_stop(update_stop),
+                )
+                .await;
             tracing::info!(?report, "Telegram long-poll Stream producer stopped");
         });
         workers.handles.push(update_producer_worker);

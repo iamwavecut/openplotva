@@ -13,12 +13,13 @@ use std::{
 
 use carapax::types::{Update as TelegramUpdate, UpdateType as TelegramUpdateType};
 use openplotva_storage::{
-    MATERIALIZED_UPDATE_BINDS_PER_ROW, MaterializationReport, MaterializedUpdateInput,
-    PostgresTelegramDeliveryStore, QuarantinedUpdateInput,
+    MATERIALIZED_UPDATE_BINDS_PER_ROW, MaterializationReport, MaterializedUpdateDisposition,
+    MaterializedUpdateInput, PostgresTelegramDeliveryStore, QuarantinedUpdateInput,
 };
 use openplotva_updates::{
     RawUpdateStreamEntry, RedisUpdateStream, UpdateStreamConfigError, UpdateStreamEntry,
-    UpdateStreamId, UpdateStreamMaterializerConfig, decode_telegram_update_json_slice, update_name,
+    UpdateStreamId, UpdateStreamMaterializerConfig, decode_telegram_update_json_slice,
+    is_passive_update, update_name,
 };
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
@@ -806,6 +807,7 @@ fn materialized_input(
         .and_then(|message| message.message_thread_id)
         .and_then(|thread_id| i32::try_from(thread_id).ok());
     let ordering_key = ordering_key(expected_bot_id, update.id, chat_id, thread_id, user_id);
+    let disposition = materialized_disposition(&update);
 
     Ok(MaterializedUpdateInput {
         bot_id: entry.bot_id,
@@ -829,7 +831,22 @@ fn materialized_input(
         chat_id,
         thread_id,
         user_id,
+        disposition,
     })
+}
+
+fn materialized_disposition(update: &TelegramUpdate) -> MaterializedUpdateDisposition {
+    if is_passive_update(update) {
+        MaterializedUpdateDisposition::Ignored {
+            reason: if matches!(&update.update_type, TelegramUpdateType::Unknown(_)) {
+                "unsupported_type".to_owned()
+            } else {
+                format!("passive_type:{}", update_name(update))
+            },
+        }
+    } else {
+        MaterializedUpdateDisposition::Pending
+    }
 }
 
 fn aggregate_duplicate(
@@ -1306,6 +1323,25 @@ mod tests {
         assert!(prepared.quarantine.is_empty());
         assert_eq!(prepared.updates.len(), 1);
         assert_eq!(prepared.updates[0].update_type.as_deref(), Some("unknown"));
+        assert!(matches!(
+            prepared.updates[0].disposition,
+            openplotva_storage::MaterializedUpdateDisposition::Ignored { .. }
+        ));
+    }
+
+    #[test]
+    fn payment_update_is_never_terminalized_during_materialization() {
+        let payload = br#"{"update_id":43,"pre_checkout_query":{"id":"checkout","from":{"id":9,"is_bot":false,"first_name":"Ada"},"currency":"XTR","total_amount":10,"invoice_payload":"vip"}}"#;
+        let payment = stream_entry(1_700_000_000_001, 0, 43, 1_700_000_000_010, payload);
+
+        let prepared = preprocess_batch(&[payment], 123);
+
+        assert!(prepared.quarantine.is_empty());
+        assert_eq!(prepared.updates.len(), 1);
+        assert_eq!(
+            prepared.updates[0].disposition,
+            openplotva_storage::MaterializedUpdateDisposition::Pending
+        );
     }
 
     fn stream_entry(

@@ -15,17 +15,17 @@ use crate::StorageError;
 /// Conservative bind budget below PostgreSQL's protocol limit.
 pub const POSTGRES_MATERIALIZATION_BIND_BUDGET: usize = 60_000;
 /// Number of parameters emitted for one inbox row.
-pub const MATERIALIZED_UPDATE_BINDS_PER_ROW: usize = 21;
+pub const MATERIALIZED_UPDATE_BINDS_PER_ROW: usize = 25;
 /// Number of parameters emitted for one quarantine row.
 pub const QUARANTINED_UPDATE_BINDS_PER_ROW: usize = 12;
 /// Longest claim lifetime before another worker may reclaim an update.
 pub const UPDATE_PROCESSING_LEASE_SECONDS: i64 = 90;
 
-const SQL_INSERT_UPDATES_PREFIX: &str = "INSERT INTO telegram_update_inbox (\
+const SQL_INSERT_UPDATES_PREFIX: &str = "WITH materialized AS (INSERT INTO telegram_update_inbox (\
     bot_id, update_id, schema_version, source, stream_ms, stream_seq, last_stream_ms, \
     last_stream_seq, raw_payload, payload_sha256, payload_conflict, update_type, \
     telegram_event_at, first_received_at, last_received_at, delivery_count, ordering_key, \
-    priority, chat_id, thread_id, user_id)";
+    priority, chat_id, thread_id, user_id, status, completed_at, outcome, ignored_reason)";
 
 const SQL_INSERT_UPDATES_SUFFIX: &str = " ON CONFLICT (bot_id, update_id) DO UPDATE SET \
     delivery_count = telegram_update_inbox.delivery_count + CASE \
@@ -46,7 +46,24 @@ const SQL_INSERT_UPDATES_SUFFIX: &str = " ON CONFLICT (bot_id, update_id) DO UPD
         OR EXCLUDED.payload_conflict \
         OR telegram_update_inbox.payload_sha256 <> EXCLUDED.payload_sha256, \
     updated_at = now() \
-    RETURNING (xmax = 0) AS inserted, payload_conflict";
+    RETURNING id, bot_id, ordering_key, stream_ms, stream_seq, status, \
+        (xmax = 0) AS inserted, payload_conflict), \
+lane_heads AS (\
+    SELECT DISTINCT ON (bot_id, ordering_key) \
+        bot_id, ordering_key, id AS head_inbox_id \
+    FROM materialized \
+    WHERE inserted AND status IN ('pending', 'processing', 'retry_wait') \
+    ORDER BY bot_id, ordering_key, stream_ms, stream_seq, id\
+), lane_upsert AS (\
+    INSERT INTO telegram_update_lanes (bot_id, ordering_key, head_inbox_id) \
+    SELECT bot_id, ordering_key, head_inbox_id FROM lane_heads \
+    ON CONFLICT (bot_id, ordering_key) DO UPDATE SET \
+        head_inbox_id = COALESCE(telegram_update_lanes.head_inbox_id, EXCLUDED.head_inbox_id), \
+        updated_at = now() \
+    RETURNING head_inbox_id\
+) \
+SELECT inserted, payload_conflict FROM materialized \
+WHERE (SELECT count(*) FROM lane_upsert) >= 0";
 
 const SQL_INSERT_QUARANTINE_PREFIX: &str = "INSERT INTO telegram_update_quarantine (\
     bot_id, stream_ms, stream_seq, schema_version, source, raw_payload, payload_sha256, \
@@ -61,25 +78,18 @@ const SQL_INSERT_QUARANTINE_SUFFIX: &str = " ON CONFLICT (bot_id, stream_ms, str
 const SQL_CLAIM_UPDATES: &str = r#"
 WITH candidates AS (
     SELECT inbox.id
-    FROM telegram_update_inbox AS inbox
-    WHERE (
+    FROM telegram_update_lanes AS lane
+    JOIN telegram_update_inbox AS inbox ON inbox.id = lane.head_inbox_id
+    WHERE lane.head_inbox_id IS NOT NULL
+    AND (
         (inbox.status IN ('pending', 'retry_wait') AND inbox.available_at <= statement_timestamp())
         OR (
             inbox.status = 'processing'
             AND (inbox.leased_until IS NULL OR inbox.leased_until <= statement_timestamp())
         )
     )
-    AND NOT EXISTS (
-        SELECT 1
-        FROM telegram_update_inbox AS earlier
-        WHERE earlier.bot_id = inbox.bot_id
-          AND earlier.ordering_key = inbox.ordering_key
-          AND (earlier.stream_ms, earlier.stream_seq, earlier.id)
-              < (inbox.stream_ms, inbox.stream_seq, inbox.id)
-          AND earlier.status IN ('pending', 'processing', 'retry_wait')
-    )
     ORDER BY inbox.stream_ms, inbox.stream_seq, inbox.bot_id, inbox.id
-    FOR UPDATE OF inbox SKIP LOCKED
+    FOR UPDATE OF lane, inbox SKIP LOCKED
     LIMIT $1
 ), claimed AS (
     UPDATE telegram_update_inbox AS inbox
@@ -93,6 +103,16 @@ WITH candidates AS (
     FROM candidates
     WHERE inbox.id = candidates.id
     RETURNING inbox.*
+), abandoned_attempts AS (
+    UPDATE telegram_update_attempts AS attempt
+    SET finished_at = statement_timestamp(),
+        outcome = 'lease_expired',
+        error_class = 'lease_expired',
+        error = 'processing lease expired before a terminal transition'
+    FROM claimed
+    WHERE attempt.inbox_id = claimed.id
+      AND attempt.finished_at IS NULL
+    RETURNING attempt.inbox_id
 ), attempts AS (
     INSERT INTO telegram_update_attempts (
         inbox_id, attempt, lease_token, worker_id, claimed_at,
@@ -108,6 +128,7 @@ WITH candidates AS (
         CASE WHEN claimed.state_applied_at IS NOT NULL THEN statement_timestamp() END,
         CASE WHEN claimed.state_applied_at IS NOT NULL THEN statement_timestamp() END
     FROM claimed
+    CROSS JOIN (SELECT count(*) FROM abandoned_attempts) AS abandonment_barrier
     RETURNING inbox_id
 )
 SELECT claimed.*
@@ -150,8 +171,13 @@ SELECT EXISTS(SELECT 1 FROM attempt_checkpoint)
 "#;
 
 const SQL_COMPLETE_UPDATE: &str = r#"
-WITH finished AS (
-    UPDATE telegram_update_inbox
+WITH locked_lane AS MATERIALIZED (
+    SELECT bot_id, ordering_key, head_inbox_id
+    FROM telegram_update_lanes
+    WHERE head_inbox_id = $1
+    FOR UPDATE
+), finished AS (
+    UPDATE telegram_update_inbox AS inbox
     SET status = 'completed',
         handler_completed_at = statement_timestamp(),
         completed_at = statement_timestamp(),
@@ -159,12 +185,13 @@ WITH finished AS (
         lease_owner = NULL,
         leased_until = NULL,
         updated_at = statement_timestamp()
-    WHERE id = $1
-      AND lease_token = $2
-      AND status = 'processing'
-      AND state_applied_at IS NOT NULL
-      AND leased_until > statement_timestamp()
-    RETURNING id, attempt_count
+    FROM locked_lane
+    WHERE inbox.id = $1
+      AND inbox.lease_token = $2
+      AND inbox.status = 'processing'
+      AND inbox.state_applied_at IS NOT NULL
+      AND inbox.leased_until > statement_timestamp()
+    RETURNING inbox.id, inbox.bot_id, inbox.ordering_key, inbox.attempt_count
 ), attempt_finished AS (
     UPDATE telegram_update_attempts AS attempt
     SET handler_completed_at = statement_timestamp(),
@@ -174,8 +201,27 @@ WITH finished AS (
     WHERE attempt.inbox_id = finished.id
       AND attempt.attempt = finished.attempt_count
     RETURNING attempt.inbox_id
+), lane_advanced AS (
+    UPDATE telegram_update_lanes AS lane
+    SET head_inbox_id = (
+            SELECT next.id
+            FROM telegram_update_inbox AS next
+            WHERE next.bot_id = finished.bot_id
+              AND next.ordering_key = finished.ordering_key
+              AND next.id <> finished.id
+              AND next.status IN ('pending', 'processing', 'retry_wait')
+            ORDER BY next.stream_ms, next.stream_seq, next.id
+            LIMIT 1
+        ),
+        updated_at = statement_timestamp()
+    FROM finished
+    WHERE lane.bot_id = finished.bot_id
+      AND lane.ordering_key = finished.ordering_key
+      AND lane.head_inbox_id = finished.id
+    RETURNING lane.head_inbox_id
 )
 SELECT EXISTS(SELECT 1 FROM attempt_finished)
+FROM (SELECT count(*) FROM lane_advanced) AS lane_barrier
 "#;
 
 const SQL_RETRY_UPDATE: &str = r#"
@@ -209,8 +255,13 @@ SELECT EXISTS(SELECT 1 FROM attempt_finished)
 "#;
 
 const SQL_IGNORE_UPDATE: &str = r#"
-WITH finished AS (
-    UPDATE telegram_update_inbox
+WITH locked_lane AS MATERIALIZED (
+    SELECT bot_id, ordering_key, head_inbox_id
+    FROM telegram_update_lanes
+    WHERE head_inbox_id = $1
+    FOR UPDATE
+), finished AS (
+    UPDATE telegram_update_inbox AS inbox
     SET status = 'ignored',
         handler_completed_at = statement_timestamp(),
         completed_at = statement_timestamp(),
@@ -219,11 +270,12 @@ WITH finished AS (
         lease_owner = NULL,
         leased_until = NULL,
         updated_at = statement_timestamp()
-    WHERE id = $1
-      AND lease_token = $2
-      AND status = 'processing'
-      AND leased_until > statement_timestamp()
-    RETURNING id, attempt_count
+    FROM locked_lane
+    WHERE inbox.id = $1
+      AND inbox.lease_token = $2
+      AND inbox.status = 'processing'
+      AND inbox.leased_until > statement_timestamp()
+    RETURNING inbox.id, inbox.bot_id, inbox.ordering_key, inbox.attempt_count
 ), attempt_finished AS (
     UPDATE telegram_update_attempts AS attempt
     SET handler_completed_at = statement_timestamp(),
@@ -233,13 +285,37 @@ WITH finished AS (
     WHERE attempt.inbox_id = finished.id
       AND attempt.attempt = finished.attempt_count
     RETURNING attempt.inbox_id
+), lane_advanced AS (
+    UPDATE telegram_update_lanes AS lane
+    SET head_inbox_id = (
+            SELECT next.id
+            FROM telegram_update_inbox AS next
+            WHERE next.bot_id = finished.bot_id
+              AND next.ordering_key = finished.ordering_key
+              AND next.id <> finished.id
+              AND next.status IN ('pending', 'processing', 'retry_wait')
+            ORDER BY next.stream_ms, next.stream_seq, next.id
+            LIMIT 1
+        ),
+        updated_at = statement_timestamp()
+    FROM finished
+    WHERE lane.bot_id = finished.bot_id
+      AND lane.ordering_key = finished.ordering_key
+      AND lane.head_inbox_id = finished.id
+    RETURNING lane.head_inbox_id
 )
 SELECT EXISTS(SELECT 1 FROM attempt_finished)
+FROM (SELECT count(*) FROM lane_advanced) AS lane_barrier
 "#;
 
 const SQL_DEAD_LETTER_UPDATE: &str = r#"
-WITH finished AS (
-    UPDATE telegram_update_inbox
+WITH locked_lane AS MATERIALIZED (
+    SELECT bot_id, ordering_key, head_inbox_id
+    FROM telegram_update_lanes
+    WHERE head_inbox_id = $1
+    FOR UPDATE
+), finished AS (
+    UPDATE telegram_update_inbox AS inbox
     SET status = 'dead_letter',
         handler_completed_at = statement_timestamp(),
         completed_at = statement_timestamp(),
@@ -249,11 +325,12 @@ WITH finished AS (
         lease_owner = NULL,
         leased_until = NULL,
         updated_at = statement_timestamp()
-    WHERE id = $1
-      AND lease_token = $2
-      AND status = 'processing'
-      AND leased_until > statement_timestamp()
-    RETURNING id, attempt_count
+    FROM locked_lane
+    WHERE inbox.id = $1
+      AND inbox.lease_token = $2
+      AND inbox.status = 'processing'
+      AND inbox.leased_until > statement_timestamp()
+    RETURNING inbox.id, inbox.bot_id, inbox.ordering_key, inbox.attempt_count
 ), attempt_finished AS (
     UPDATE telegram_update_attempts AS attempt
     SET handler_completed_at = statement_timestamp(),
@@ -265,8 +342,27 @@ WITH finished AS (
     WHERE attempt.inbox_id = finished.id
       AND attempt.attempt = finished.attempt_count
     RETURNING attempt.inbox_id
+), lane_advanced AS (
+    UPDATE telegram_update_lanes AS lane
+    SET head_inbox_id = (
+            SELECT next.id
+            FROM telegram_update_inbox AS next
+            WHERE next.bot_id = finished.bot_id
+              AND next.ordering_key = finished.ordering_key
+              AND next.id <> finished.id
+              AND next.status IN ('pending', 'processing', 'retry_wait')
+            ORDER BY next.stream_ms, next.stream_seq, next.id
+            LIMIT 1
+        ),
+        updated_at = statement_timestamp()
+    FROM finished
+    WHERE lane.bot_id = finished.bot_id
+      AND lane.ordering_key = finished.ordering_key
+      AND lane.head_inbox_id = finished.id
+    RETURNING lane.head_inbox_id
 )
 SELECT EXISTS(SELECT 1 FROM attempt_finished)
+FROM (SELECT count(*) FROM lane_advanced) AS lane_barrier
 "#;
 
 const SQL_INBOX_STATS: &str = r#"
@@ -331,6 +427,63 @@ ORDER BY attempt DESC
 LIMIT $2
 "#;
 
+const SQL_STARTUP_RECONCILE_CANDIDATES: &str = r#"
+SELECT id, raw_payload
+FROM telegram_update_inbox
+WHERE bot_id = $1
+  AND id > $2
+  AND materialized_at < $3
+  AND (
+      status IN ('pending', 'retry_wait')
+      OR (
+          status = 'processing'
+          AND (leased_until IS NULL OR leased_until <= statement_timestamp())
+      )
+  )
+ORDER BY id
+LIMIT $4
+"#;
+
+const SQL_STARTUP_BULK_IGNORE: &str = r#"
+UPDATE telegram_update_inbox
+SET status = 'ignored',
+    handler_completed_at = statement_timestamp(),
+    completed_at = statement_timestamp(),
+    outcome = 'ignored',
+    ignored_reason = 'startup_backlog_reconciled',
+    lease_owner = NULL,
+    leased_until = NULL,
+    updated_at = statement_timestamp()
+WHERE id = ANY($1::bigint[])
+  AND bot_id = $2
+  AND (
+      status IN ('pending', 'retry_wait')
+      OR (
+          status = 'processing'
+          AND (leased_until IS NULL OR leased_until <= statement_timestamp())
+      )
+  )
+"#;
+
+const SQL_REBUILD_UPDATE_LANES: &str = r#"
+INSERT INTO telegram_update_lanes (bot_id, ordering_key, head_inbox_id)
+SELECT DISTINCT ON (bot_id, ordering_key)
+    bot_id, ordering_key, id
+FROM telegram_update_inbox
+WHERE bot_id = $1
+  AND status IN ('pending', 'processing', 'retry_wait')
+ORDER BY bot_id, ordering_key, stream_ms, stream_seq, id
+"#;
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum MaterializedUpdateDisposition {
+    #[default]
+    Pending,
+    Ignored {
+        reason: String,
+    },
+}
+
 /// One already-validated Redis Stream entry ready for Postgres.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MaterializedUpdateInput {
@@ -357,6 +510,26 @@ pub struct MaterializedUpdateInput {
     pub chat_id: Option<i64>,
     pub thread_id: Option<i32>,
     pub user_id: Option<i64>,
+    pub disposition: MaterializedUpdateDisposition,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TelegramUpdateReconcileCandidate {
+    pub id: i64,
+    pub raw_payload: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TelegramUpdateStartupReconcileReport {
+    pub already_completed: bool,
+    pub ignored_rows: u64,
+    pub repaired_attempt_rows: u64,
+    pub lane_rows: u64,
+}
+
+pub struct TelegramUpdateStartupReconcileGuard {
+    job_name: String,
+    transaction: sqlx::Transaction<'static, Postgres>,
 }
 
 /// One Stream entry that cannot be converted into an inbox update.
@@ -543,6 +716,139 @@ impl PostgresTelegramDeliveryStore {
         quarantine: &[QuarantinedUpdateInput],
     ) -> Result<MaterializationReport, StorageError> {
         materialize_update_batch(&self.pool, updates, quarantine).await
+    }
+
+    pub async fn begin_startup_reconciliation(
+        &self,
+        job_name: &str,
+    ) -> Result<Option<TelegramUpdateStartupReconcileGuard>, StorageError> {
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(job_name)
+            .execute(&mut *transaction)
+            .await?;
+        let completed = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM telegram_update_startup_jobs WHERE job_name = $1)",
+        )
+        .bind(job_name)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if completed {
+            transaction.commit().await?;
+            return Ok(None);
+        }
+        Ok(Some(TelegramUpdateStartupReconcileGuard {
+            job_name: job_name.to_owned(),
+            transaction,
+        }))
+    }
+
+    pub async fn startup_reconcile_candidates(
+        &self,
+        guard: &mut TelegramUpdateStartupReconcileGuard,
+        bot_id: i64,
+        before: OffsetDateTime,
+        after_id: i64,
+        limit: usize,
+    ) -> Result<Vec<TelegramUpdateReconcileCandidate>, StorageError> {
+        let limit = i64::try_from(limit.clamp(1, 5_000)).unwrap_or(5_000);
+        sqlx::query(SQL_STARTUP_RECONCILE_CANDIDATES)
+            .bind(bot_id)
+            .bind(after_id)
+            .bind(before)
+            .bind(limit)
+            .fetch_all(&mut *guard.transaction)
+            .await?
+            .into_iter()
+            .map(|row| {
+                Ok(TelegramUpdateReconcileCandidate {
+                    id: row.try_get("id")?,
+                    raw_payload: row.try_get("raw_payload")?,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn complete_startup_reconciliation(
+        &self,
+        guard: TelegramUpdateStartupReconcileGuard,
+        bot_id: i64,
+        ignored_ids: &[i64],
+    ) -> Result<TelegramUpdateStartupReconcileReport, StorageError> {
+        let TelegramUpdateStartupReconcileGuard {
+            job_name,
+            transaction: mut tx,
+        } = guard;
+
+        let ignored_rows = if ignored_ids.is_empty() {
+            0
+        } else {
+            let ignored = sqlx::query(SQL_STARTUP_BULK_IGNORE)
+                .bind(ignored_ids)
+                .bind(bot_id)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+            sqlx::query(
+                "UPDATE telegram_update_attempts SET \
+                    handler_completed_at = COALESCE(handler_completed_at, statement_timestamp()), \
+                    finished_at = COALESCE(finished_at, statement_timestamp()), \
+                    outcome = COALESCE(outcome, 'ignored') \
+                 WHERE inbox_id = ANY($1::bigint[]) AND finished_at IS NULL",
+            )
+            .bind(ignored_ids)
+            .execute(&mut *tx)
+            .await?;
+            ignored
+        };
+
+        let repaired_attempt_rows = sqlx::query(
+            "UPDATE telegram_update_attempts AS attempt SET \
+                handler_completed_at = COALESCE(attempt.handler_completed_at, inbox.completed_at), \
+                finished_at = COALESCE(attempt.finished_at, inbox.completed_at, statement_timestamp()), \
+                outcome = COALESCE(attempt.outcome, 'abandoned'), \
+                error_class = COALESCE(attempt.error_class, 'terminal_reconciled'), \
+                error = COALESCE(attempt.error, 'attempt was unfinished after inbox reached a terminal state') \
+             FROM telegram_update_inbox AS inbox \
+             WHERE attempt.inbox_id = inbox.id \
+               AND inbox.bot_id = $1 \
+               AND inbox.status IN ('completed', 'ignored', 'dead_letter') \
+               AND attempt.finished_at IS NULL",
+        )
+        .bind(bot_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+
+        sqlx::query("DELETE FROM telegram_update_lanes WHERE bot_id = $1")
+            .bind(bot_id)
+            .execute(&mut *tx)
+            .await?;
+        let lane_rows = sqlx::query(SQL_REBUILD_UPDATE_LANES)
+            .bind(bot_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        sqlx::query(
+            "INSERT INTO telegram_update_startup_jobs \
+                (job_name, bot_id, ignored_rows, repaired_attempt_rows, lane_rows) \
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(&job_name)
+        .bind(bot_id)
+        .bind(i64::try_from(ignored_rows).unwrap_or(i64::MAX))
+        .bind(i64::try_from(repaired_attempt_rows).unwrap_or(i64::MAX))
+        .bind(i64::try_from(lane_rows).unwrap_or(i64::MAX))
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+
+        Ok(TelegramUpdateStartupReconcileReport {
+            already_completed: false,
+            ignored_rows,
+            repaired_attempt_rows,
+            lane_rows,
+        })
     }
 
     /// Claim the earliest processable entry per ordering key.
@@ -883,6 +1189,15 @@ fn materialized_update_insert_builder(updates: &[PreparedUpdate]) -> QueryBuilde
     builder.push(" ");
     builder.push_values(updates.iter(), |mut row, update| {
         let canonical = &update.canonical;
+        let (status, completed_at, outcome, ignored_reason) = match &canonical.disposition {
+            MaterializedUpdateDisposition::Pending => ("pending", None, None, None),
+            MaterializedUpdateDisposition::Ignored { reason } => (
+                "ignored",
+                Some(OffsetDateTime::now_utc()),
+                Some("ignored"),
+                Some(reason.clone()),
+            ),
+        };
         row.push_bind(canonical.bot_id)
             .push_bind(canonical.update_id)
             .push_bind(canonical.schema_version)
@@ -903,7 +1218,11 @@ fn materialized_update_insert_builder(updates: &[PreparedUpdate]) -> QueryBuilde
             .push_bind(canonical.priority)
             .push_bind(canonical.chat_id)
             .push_bind(canonical.thread_id)
-            .push_bind(canonical.user_id);
+            .push_bind(canonical.user_id)
+            .push_bind(status)
+            .push_bind(completed_at)
+            .push_bind(outcome)
+            .push_bind(ignored_reason);
     });
     builder.push(SQL_INSERT_UPDATES_SUFFIX);
     builder
@@ -1065,6 +1384,7 @@ mod tests {
             chat_id: Some(42),
             thread_id: Some(0),
             user_id: Some(7),
+            disposition: MaterializedUpdateDisposition::Pending,
         }
     }
 
@@ -1104,7 +1424,8 @@ mod tests {
         let sql = builder.build().sql().as_ref().to_owned();
 
         assert_eq!(sql.matches("INSERT INTO telegram_update_inbox").count(), 1);
-        assert_eq!(sql.matches("ON CONFLICT").count(), 1);
+        assert_eq!(sql.matches("ON CONFLICT").count(), 2);
+        assert_eq!(sql.matches("INSERT INTO telegram_update_lanes").count(), 1);
         assert_eq!(
             sql.matches('$').count(),
             512 * MATERIALIZED_UPDATE_BINDS_PER_ROW
@@ -1176,11 +1497,12 @@ mod tests {
 
     #[test]
     fn claim_sql_is_ordered_fenced_and_skip_locked() {
-        assert!(SQL_CLAIM_UPDATES.contains("FOR UPDATE OF inbox SKIP LOCKED"));
+        assert!(SQL_CLAIM_UPDATES.contains("FROM telegram_update_lanes AS lane"));
+        assert!(SQL_CLAIM_UPDATES.contains("FOR UPDATE OF lane, inbox SKIP LOCKED"));
         assert!(SQL_CLAIM_UPDATES.contains("ORDER BY inbox.stream_ms, inbox.stream_seq"));
         assert!(SQL_CLAIM_UPDATES.contains("lease_token = inbox.lease_token + 1"));
         assert!(SQL_CLAIM_UPDATES.contains("interval '90 seconds'"));
-        assert!(SQL_CLAIM_UPDATES.contains("NOT EXISTS"));
+        assert!(!SQL_CLAIM_UPDATES.contains("NOT EXISTS"));
     }
 
     /// Release-mode transaction benchmark for the configured materializer sizes.
@@ -1238,6 +1560,10 @@ mod tests {
                 assert_eq!(report.inserted, u64::try_from(rows).unwrap_or(u64::MAX));
 
                 sqlx::query("DELETE FROM telegram_update_inbox WHERE bot_id = $1")
+                    .bind(bot_id)
+                    .execute(&pool)
+                    .await?;
+                sqlx::query("DELETE FROM telegram_update_lanes WHERE bot_id = $1")
                     .bind(bot_id)
                     .execute(&pool)
                     .await?;
@@ -1412,7 +1738,7 @@ mod tests {
                 .retry_update(
                     third_claim[0].id,
                     third_claim[0].lease_token,
-                    OffsetDateTime::now_utc(),
+                    OffsetDateTime::now_utc() - time::Duration::seconds(1),
                     "transient",
                     "retry from integration test",
                 )
@@ -1431,6 +1757,36 @@ mod tests {
                     "deterministic",
                     "dead letter from integration test",
                 )
+                .await?
+        );
+
+        let abandoned = update(bot_id, 10, 5, br#"{"update_id":10}"#, 5);
+        store.materialize_update_batch(&[abandoned], &[]).await?;
+        let abandoned_claim = store.claim_updates("storage-test", 10).await?;
+        assert_eq!(abandoned_claim.len(), 1);
+        sqlx::query(
+            "UPDATE telegram_update_inbox SET leased_until = statement_timestamp() - interval '1 second' WHERE id = $1",
+        )
+        .bind(abandoned_claim[0].id)
+        .execute(&pool)
+        .await?;
+        let reclaimed = store.claim_updates("storage-test-reclaimer", 10).await?;
+        assert_eq!(reclaimed.len(), 1);
+        assert_eq!(reclaimed[0].attempt, 2);
+        let abandoned_attempts = store.attempts(reclaimed[0].id, 10).await?;
+        assert_eq!(abandoned_attempts.len(), 2);
+        assert_eq!(
+            abandoned_attempts[1].outcome.as_deref(),
+            Some("lease_expired")
+        );
+        assert!(
+            store
+                .mark_update_state_applied(reclaimed[0].id, reclaimed[0].lease_token)
+                .await?
+        );
+        assert!(
+            store
+                .complete_update(reclaimed[0].id, reclaimed[0].lease_token)
                 .await?
         );
 
@@ -1453,7 +1809,143 @@ mod tests {
             .bind(bot_id)
             .execute(&pool)
             .await?;
+        sqlx::query("DELETE FROM telegram_update_lanes WHERE bot_id = $1")
+            .bind(bot_id)
+            .execute(&pool)
+            .await?;
         sqlx::query("DELETE FROM telegram_update_quarantine WHERE bot_id = $1")
+            .bind(bot_id)
+            .execute(&pool)
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn startup_reconciliation_bulk_ignores_once_and_rebuilds_lane_heads()
+    -> Result<(), Box<dyn Error>> {
+        let Ok(dsn) = env::var("OPENPLOTVA_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&dsn)
+            .await?;
+        crate::run_migrations_on(&pool).await?;
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let bot_id = -i64::try_from(unique.min(i64::MAX as u128)).unwrap_or(i64::MAX);
+        let job_name = format!("storage-startup-reconcile:{bot_id}");
+        let store = PostgresTelegramDeliveryStore::new(pool.clone());
+        store
+            .materialize_update_batch(
+                &[
+                    update(bot_id, 20, 1, br#"{"update_id":20}"#, 1),
+                    update(bot_id, 21, 2, br#"{"update_id":21}"#, 2),
+                ],
+                &[],
+            )
+            .await?;
+        let mut terminal_with_orphan = update(bot_id, 22, 3, br#"{"update_id":22}"#, 3);
+        terminal_with_orphan.ordering_key = format!("dialog:{bot_id}:99:0");
+        terminal_with_orphan.chat_id = Some(99);
+        store
+            .materialize_update_batch(&[terminal_with_orphan], &[])
+            .await?;
+        let orphan_inbox_id: i64 = sqlx::query_scalar(
+            "UPDATE telegram_update_inbox SET status = 'completed', completed_at = statement_timestamp(), outcome = 'handled', attempt_count = 1, lease_token = 1 WHERE bot_id = $1 AND update_id = 22 RETURNING id",
+        )
+        .bind(bot_id)
+        .fetch_one(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO telegram_update_attempts (inbox_id, attempt, lease_token, worker_id) VALUES ($1, 1, 1, 'orphaned-worker')",
+        )
+        .bind(orphan_inbox_id)
+        .execute(&pool)
+        .await?;
+        let mut passive = update(bot_id, 23, 4, br#"{"update_id":23}"#, 4);
+        passive.ordering_key = format!("dialog:{bot_id}:100:0");
+        passive.chat_id = Some(100);
+        passive.disposition = MaterializedUpdateDisposition::Ignored {
+            reason: "passive_type:test".to_owned(),
+        };
+        store.materialize_update_batch(&[passive], &[]).await?;
+        let passive_status: String = sqlx::query_scalar(
+            "SELECT status FROM telegram_update_inbox WHERE bot_id = $1 AND update_id = 23",
+        )
+        .bind(bot_id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(passive_status, "ignored");
+        let passive_lane_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM telegram_update_lanes WHERE bot_id = $1 AND ordering_key = $2",
+        )
+        .bind(bot_id)
+        .bind(format!("dialog:{bot_id}:100:0"))
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(passive_lane_count, 0);
+
+        let mut guard = store
+            .begin_startup_reconciliation(&job_name)
+            .await?
+            .ok_or("startup reconciliation guard missing")?;
+        let candidates = store
+            .startup_reconcile_candidates(
+                &mut guard,
+                bot_id,
+                OffsetDateTime::now_utc() + time::Duration::seconds(1),
+                0,
+                10,
+            )
+            .await?;
+        assert_eq!(candidates.len(), 2);
+        let report = store
+            .complete_startup_reconciliation(guard, bot_id, &[candidates[0].id])
+            .await?;
+        assert_eq!(report.ignored_rows, 1);
+        assert_eq!(report.repaired_attempt_rows, 1);
+        assert_eq!(report.lane_rows, 1);
+        let repaired_finished_at: Option<OffsetDateTime> = sqlx::query_scalar(
+            "SELECT finished_at FROM telegram_update_attempts WHERE inbox_id = $1 AND attempt = 1",
+        )
+        .bind(orphan_inbox_id)
+        .fetch_one(&pool)
+        .await?;
+        assert!(repaired_finished_at.is_some());
+
+        let claim = store.claim_updates("startup-reconcile-test", 10).await?;
+        assert_eq!(claim.len(), 1);
+        assert_eq!(claim[0].update_id, 21);
+        assert!(
+            store
+                .mark_update_state_applied(claim[0].id, claim[0].lease_token)
+                .await?
+        );
+        assert!(
+            store
+                .complete_update(claim[0].id, claim[0].lease_token)
+                .await?
+        );
+
+        assert!(
+            store
+                .begin_startup_reconciliation(&job_name)
+                .await?
+                .is_none()
+        );
+
+        sqlx::query("DELETE FROM telegram_update_startup_jobs WHERE job_name = $1")
+            .bind(&job_name)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM telegram_update_lanes WHERE bot_id = $1")
+            .bind(bot_id)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM telegram_update_inbox WHERE bot_id = $1")
             .bind(bot_id)
             .execute(&pool)
             .await?;

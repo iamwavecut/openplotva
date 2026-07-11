@@ -1,12 +1,12 @@
 //! Telegram update ingestion, classification, and replay.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet, VecDeque},
     fmt,
     future::Future,
     io,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -887,6 +887,261 @@ pub fn producer_update_name(update: &TelegramUpdate) -> &'static str {
     producer_update_type(update).as_str()
 }
 
+#[must_use]
+pub fn is_payment_update(update: &TelegramUpdate) -> bool {
+    match &update.update_type {
+        TelegramUpdateType::ShippingQuery(_)
+        | TelegramUpdateType::PreCheckoutQuery(_)
+        | TelegramUpdateType::PurchasedPaidMedia(_) => true,
+        TelegramUpdateType::Message(message)
+        | TelegramUpdateType::EditedMessage(message)
+        | TelegramUpdateType::GuestMessage(message)
+        | TelegramUpdateType::ChannelPost(message)
+        | TelegramUpdateType::EditedChannelPost(message)
+        | TelegramUpdateType::BusinessMessage(message)
+        | TelegramUpdateType::EditedBusinessMessage(message) => {
+            matches!(
+                message.data,
+                TelegramMessageData::DirectMessagePriceChanged(_)
+                    | TelegramMessageData::Invoice(_)
+                    | TelegramMessageData::PaidMedia(_)
+                    | TelegramMessageData::PaidMessagePriceChanged(_)
+                    | TelegramMessageData::RefundedPayment(_)
+                    | TelegramMessageData::SuggestedPostPaid(_)
+                    | TelegramMessageData::SuggestedPostRefunded(_)
+                    | TelegramMessageData::SuccessfulPayment(_)
+            )
+        }
+        _ => false,
+    }
+}
+
+#[must_use]
+pub fn is_passive_update(update: &TelegramUpdate) -> bool {
+    !is_payment_update(update)
+        && matches!(
+            &update.update_type,
+            TelegramUpdateType::ChannelPost(_)
+                | TelegramUpdateType::EditedChannelPost(_)
+                | TelegramUpdateType::ChosenInlineResult(_)
+                | TelegramUpdateType::Poll(_)
+                | TelegramUpdateType::PollAnswer(_)
+                | TelegramUpdateType::MessageReaction(_)
+                | TelegramUpdateType::MessageReactionCount(_)
+                | TelegramUpdateType::BusinessConnection(_)
+                | TelegramUpdateType::BusinessMessage(_)
+                | TelegramUpdateType::ChatBoostRemoved(_)
+                | TelegramUpdateType::ChatBoostUpdated(_)
+                | TelegramUpdateType::DeletedBusinessMessages(_)
+                | TelegramUpdateType::EditedBusinessMessage(_)
+                | TelegramUpdateType::ManagedBot(_)
+                | TelegramUpdateType::Unknown(_)
+        )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UpdateIngressGuardConfig {
+    pub short_window: Duration,
+    pub short_limit: usize,
+    pub long_window: Duration,
+    pub long_limit: usize,
+    pub block_duration: Duration,
+}
+
+impl Default for UpdateIngressGuardConfig {
+    fn default() -> Self {
+        Self {
+            short_window: Duration::from_secs(10),
+            short_limit: 200,
+            long_window: Duration::from_secs(60),
+            long_limit: 600,
+            block_duration: Duration::from_secs(5 * 60),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UpdateIngressDecision {
+    Allowed {
+        chat_id: Option<i64>,
+        payment: bool,
+    },
+    DroppedBlocked {
+        chat_id: i64,
+        blocked_until: SystemTime,
+    },
+    DroppedFlood {
+        chat_id: i64,
+        blocked_until: SystemTime,
+    },
+}
+
+impl UpdateIngressDecision {
+    #[must_use]
+    pub const fn is_allowed(self) -> bool {
+        matches!(self, Self::Allowed { .. })
+    }
+
+    #[must_use]
+    pub const fn is_dropped(self) -> bool {
+        !self.is_allowed()
+    }
+
+    #[must_use]
+    pub const fn chat_id(self) -> Option<i64> {
+        match self {
+            Self::Allowed { chat_id, .. } => chat_id,
+            Self::DroppedBlocked { chat_id, .. } | Self::DroppedFlood { chat_id, .. } => {
+                Some(chat_id)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct UpdateIngressGuard {
+    config: UpdateIngressGuardConfig,
+    chats: Mutex<HashMap<i64, ChatIngressState>>,
+}
+
+#[derive(Debug, Default)]
+struct ChatIngressState {
+    samples: VecDeque<SystemTime>,
+    blocked_until: Option<SystemTime>,
+}
+
+impl UpdateIngressGuard {
+    #[must_use]
+    pub fn new(config: UpdateIngressGuardConfig) -> Self {
+        Self {
+            config,
+            chats: Mutex::new(HashMap::new()),
+        }
+    }
+
+    #[must_use]
+    pub fn with_defaults() -> Self {
+        Self::new(UpdateIngressGuardConfig::default())
+    }
+
+    #[must_use]
+    pub fn check_update(&self, update: &TelegramUpdate) -> UpdateIngressDecision {
+        self.check_update_at(update, SystemTime::now())
+    }
+
+    #[must_use]
+    pub fn check_update_at(
+        &self,
+        update: &TelegramUpdate,
+        now: SystemTime,
+    ) -> UpdateIngressDecision {
+        if is_payment_update(update) {
+            return UpdateIngressDecision::Allowed {
+                chat_id: update_chat_id(update),
+                payment: true,
+            };
+        }
+        let Some(chat_id) = flood_guard_chat_id(update).filter(|chat_id| *chat_id != 0) else {
+            return UpdateIngressDecision::Allowed {
+                chat_id: None,
+                payment: false,
+            };
+        };
+        let mut chats = self
+            .chats
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if chats.len() >= 4_096 && chats.len().is_power_of_two() && !chats.contains_key(&chat_id) {
+            chats.retain(|_, state| {
+                state
+                    .blocked_until
+                    .is_some_and(|blocked_until| blocked_until > now)
+                    || state.samples.back().is_some_and(|sample| {
+                        sample
+                            .checked_add(self.config.long_window)
+                            .is_some_and(|expiry| expiry > now)
+                    })
+            });
+        }
+        let state = chats.entry(chat_id).or_default();
+        if let Some(blocked_until) = state.blocked_until {
+            if now < blocked_until {
+                return UpdateIngressDecision::DroppedBlocked {
+                    chat_id,
+                    blocked_until,
+                };
+            }
+            state.blocked_until = None;
+        }
+
+        retain_recent_samples(&mut state.samples, now, self.config.long_window);
+        let short_count = recent_sample_count(&state.samples, now, self.config.short_window) + 1;
+        let long_count = state.samples.len() + 1;
+        if short_count >= self.config.short_limit || long_count >= self.config.long_limit {
+            let blocked_until = now + self.config.block_duration;
+            state.blocked_until = Some(blocked_until);
+            state.samples.clear();
+            return UpdateIngressDecision::DroppedFlood {
+                chat_id,
+                blocked_until,
+            };
+        }
+
+        state.samples.push_back(now);
+        UpdateIngressDecision::Allowed {
+            chat_id: Some(chat_id),
+            payment: false,
+        }
+    }
+}
+
+fn flood_guard_chat_id(update: &TelegramUpdate) -> Option<i64> {
+    let guarded = matches!(
+        &update.update_type,
+        TelegramUpdateType::Message(_)
+            | TelegramUpdateType::EditedMessage(_)
+            | TelegramUpdateType::GuestMessage(_)
+            | TelegramUpdateType::BusinessMessage(_)
+            | TelegramUpdateType::EditedBusinessMessage(_)
+            | TelegramUpdateType::DeletedBusinessMessages(_)
+            | TelegramUpdateType::CallbackQuery(_)
+            | TelegramUpdateType::BotStatus(_)
+            | TelegramUpdateType::UserStatus(_)
+            | TelegramUpdateType::ChatJoinRequest(_)
+            | TelegramUpdateType::ChatBoostRemoved(_)
+            | TelegramUpdateType::ChatBoostUpdated(_)
+            | TelegramUpdateType::MessageReaction(_)
+            | TelegramUpdateType::MessageReactionCount(_)
+            | TelegramUpdateType::PollAnswer(_)
+    );
+    if !guarded || update.get_user().is_some_and(|user| user.is_bot) {
+        return None;
+    }
+    update_chat_id(update)
+}
+
+fn retain_recent_samples(samples: &mut VecDeque<SystemTime>, now: SystemTime, window: Duration) {
+    while samples.front().is_some_and(|sample| {
+        sample
+            .checked_add(window)
+            .is_some_and(|expiry| expiry <= now)
+    }) {
+        samples.pop_front();
+    }
+}
+
+fn recent_sample_count(samples: &VecDeque<SystemTime>, now: SystemTime, window: Duration) -> usize {
+    samples
+        .iter()
+        .rev()
+        .take_while(|sample| {
+            sample
+                .checked_add(window)
+                .is_some_and(|expiry| expiry > now)
+        })
+        .count()
+}
+
 pub fn extract_update_state(update: &TelegramUpdate) -> Option<UpdateState> {
     if matches!(update.update_type, TelegramUpdateType::GuestMessage(_)) {
         return None;
@@ -1554,6 +1809,11 @@ fn extract_update_chat(update: &TelegramUpdate) -> Option<&TelegramChat> {
         },
         _ => None,
     })
+}
+
+#[must_use]
+pub fn update_chat_id(update: &TelegramUpdate) -> Option<i64> {
+    extract_update_chat(update).map(|chat| chat.get_id().into())
 }
 
 fn chat_state(chat: &TelegramChat) -> ChatState {
@@ -3089,7 +3349,8 @@ mod tests {
     use super::{
         DEFAULT_UPDATE_QUEUE_KEY, EncodedUpdate, GoUpdateType, GuestChainMessage, GuestChainRole,
         MAX_ENQUEUE_ERRORS, RedisUpdateQueue, TelegramMessageAttachmentOptions, UpdateCodecError,
-        UpdateConsumerConfig, UpdateProducerQueue, UpdateProducerQueueFuture, UpdateProducerSource,
+        UpdateConsumerConfig, UpdateIngressDecision, UpdateIngressGuard, UpdateIngressGuardConfig,
+        UpdateProducerQueue, UpdateProducerQueueFuture, UpdateProducerSource,
         UpdateProducerSourceFuture, UpdateStage, UpdateStageOutcome, UpdateStageReport,
         UpdateStageTracker, blocking_response_timeout, blpop_timeout_arg, build_guest_dialog_text,
         build_guest_shield_query_text, command_connection_config, compose_image_prompt,
@@ -3296,6 +3557,56 @@ mod tests {
         assert_eq!(producer_update_name(&poll), "poll");
         assert_eq!(producer_update_type(&unknown), GoUpdateType::Unknown);
         assert_eq!(producer_update_name(&unknown), "unknown");
+        Ok(())
+    }
+
+    #[test]
+    fn ingress_guard_is_per_chat_covers_user_events_and_never_blocks_payments()
+    -> Result<(), Box<dyn Error>> {
+        let guard = UpdateIngressGuard::new(UpdateIngressGuardConfig {
+            short_window: Duration::from_secs(10),
+            short_limit: 3,
+            long_window: Duration::from_secs(60),
+            long_limit: 100,
+            block_duration: Duration::from_secs(300),
+        });
+        let now = UNIX_EPOCH + Duration::from_secs(1_710_000_000);
+        let message = sample_message_update_with_id(100)?;
+        let callback = sample_callback_update_with_id(101)?;
+        let reaction = sample_update_json(json!({
+            "update_id": 102,
+            "message_reaction": {
+                "chat": sample_private_chat_json(),
+                "message_id": 77,
+                "date": 1_710_000_000,
+                "user": sample_user_json(),
+                "old_reaction": [],
+                "new_reaction": [{"type": "emoji", "emoji": "👍"}]
+            }
+        }))?;
+        let other_chat = sample_update_json(json!({
+            "update_id": 103,
+            "message": {
+                "message_id": 78,
+                "date": 1_710_000_000,
+                "chat": {"id": 9001, "type": "private", "first_name": "Other"},
+                "from": {"id": 9001, "is_bot": false, "first_name": "Other"},
+                "text": "hello"
+            }
+        }))?;
+        let payment = sample_successful_payment_update_with_date(1_710_000_000)?;
+
+        assert!(guard.check_update_at(&message, now).is_allowed());
+        assert!(guard.check_update_at(&callback, now).is_allowed());
+        assert!(guard.check_update_at(&reaction, now).is_dropped());
+        assert!(guard.check_update_at(&other_chat, now).is_allowed());
+        assert_eq!(
+            guard.check_update_at(&payment, now),
+            UpdateIngressDecision::Allowed {
+                chat_id: Some(42),
+                payment: true,
+            }
+        );
         Ok(())
     }
 

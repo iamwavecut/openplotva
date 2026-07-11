@@ -43,8 +43,10 @@ pub mod telegram_outbox;
 
 pub use telegram_delivery::{
     ClaimedTelegramUpdate, MATERIALIZED_UPDATE_BINDS_PER_ROW, MaterializationReport,
-    MaterializedUpdateInput, PostgresTelegramDeliveryStore, QuarantinedUpdateInput,
-    TelegramUpdateAttempt, TelegramUpdateInboxItem, TelegramUpdateInboxStats,
+    MaterializedUpdateDisposition, MaterializedUpdateInput, PostgresTelegramDeliveryStore,
+    QuarantinedUpdateInput, TelegramUpdateAttempt, TelegramUpdateInboxItem,
+    TelegramUpdateInboxStats, TelegramUpdateReconcileCandidate,
+    TelegramUpdateStartupReconcileGuard, TelegramUpdateStartupReconcileReport,
     UPDATE_PROCESSING_LEASE_SECONDS,
 };
 pub use telegram_outbox::{
