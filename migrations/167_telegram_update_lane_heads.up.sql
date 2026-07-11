@@ -1,4 +1,7 @@
 -- Compact, durable lane heads replace the inbox-wide anti-join used by claims.
+-- This migration is additive: older binaries ignore both tables. The new
+-- binary checks for them at readiness and populates lane heads through a
+-- versioned startup reconciliation before it starts update consumers.
 CREATE TABLE telegram_update_lanes (
     bot_id BIGINT NOT NULL,
     ordering_key TEXT NOT NULL,
@@ -13,6 +16,8 @@ CREATE INDEX telegram_update_lanes_active_idx
     WHERE head_inbox_id IS NOT NULL;
 
 -- Versioned startup jobs are committed only after their whole bulk repair.
+-- Losing this marker during a later rollback is safe: a future upgrade simply
+-- reruns the idempotent inbox reconciliation.
 CREATE TABLE telegram_update_startup_jobs (
     job_name TEXT PRIMARY KEY,
     bot_id BIGINT NOT NULL,
