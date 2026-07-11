@@ -358,7 +358,9 @@ verify_app() {
 }
 
 verify_telegram_delivery_plane() {
+  local candidate
   local redis_container
+  local stream_keys
   local stream_key
   local stream_id
   local bot_id
@@ -369,7 +371,14 @@ verify_telegram_delivery_plane() {
   local db_name
   redis_container="$(compose ps -q redis-ingress)"
   [[ -n "$redis_container" ]] || fail "redis-ingress container is missing"
-  stream_key="$(docker exec "$redis_container" valkey-cli --scan --pattern 'plotva:updates:stream:v1:*' | head -n 1 | tr -d '\r')"
+  stream_keys="$(docker exec "$redis_container" valkey-cli --scan --pattern 'plotva:updates:stream:v1:*' | tr -d '\r')"
+  stream_key=""
+  while IFS= read -r candidate; do
+    if [[ "$candidate" =~ ^plotva:updates:stream:v1:-?[0-9]+$ ]]; then
+      stream_key="$candidate"
+      break
+    fi
+  done <<<"$stream_keys"
   [[ -n "$stream_key" ]] || fail "Telegram update Stream was not created at startup"
   bot_id="${stream_key##*:}"
   [[ "$bot_id" =~ ^-?[0-9]+$ ]] || fail "cannot parse bot id from Stream key"
