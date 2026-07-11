@@ -75,6 +75,19 @@ const SQL_INSERT_QUARANTINE_SUFFIX: &str = " ON CONFLICT (bot_id, stream_ms, str
     last_received_at = GREATEST(telegram_update_quarantine.last_received_at, EXCLUDED.last_received_at), \
     updated_at = now()";
 
+const SQL_LOCK_UPDATE_LANES: &str = r#"
+SELECT pg_advisory_xact_lock(hashtextextended(lane_key, 0))
+FROM unnest($1::text[]) AS lane_keys(lane_key)
+"#;
+
+const SQL_LOCK_INBOX_LANE: &str = r#"
+SELECT pg_advisory_xact_lock(
+    hashtextextended(inbox.bot_id::text || ':' || inbox.ordering_key, 0)
+)
+FROM telegram_update_inbox AS inbox
+WHERE inbox.id = $1
+"#;
+
 const SQL_CLAIM_UPDATES: &str = r#"
 WITH candidates AS (
     SELECT inbox.id
@@ -895,7 +908,7 @@ impl PostgresTelegramDeliveryStore {
         inbox_id: i64,
         lease_token: i64,
     ) -> Result<bool, StorageError> {
-        fenced_transition(&self.pool, SQL_COMPLETE_UPDATE, inbox_id, lease_token).await
+        terminal_fenced_transition(&self.pool, SQL_COMPLETE_UPDATE, inbox_id, lease_token).await
     }
 
     /// Release a failed attempt for retry at a caller-selected time.
@@ -925,13 +938,16 @@ impl PostgresTelegramDeliveryStore {
         lease_token: i64,
         reason: &str,
     ) -> Result<bool, StorageError> {
-        sqlx::query_scalar::<_, bool>(SQL_IGNORE_UPDATE)
+        let mut tx = self.pool.begin().await?;
+        lock_inbox_lane(&mut tx, inbox_id).await?;
+        let transitioned = sqlx::query_scalar::<_, bool>(SQL_IGNORE_UPDATE)
             .bind(inbox_id)
             .bind(lease_token)
             .bind(reason)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(StorageError::from)
+            .fetch_one(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(transitioned)
     }
 
     /// Finish a deterministic or exhausted failure in the durable dead letter queue.
@@ -942,14 +958,17 @@ impl PostgresTelegramDeliveryStore {
         error_class: &str,
         error: &str,
     ) -> Result<bool, StorageError> {
-        sqlx::query_scalar::<_, bool>(SQL_DEAD_LETTER_UPDATE)
+        let mut tx = self.pool.begin().await?;
+        lock_inbox_lane(&mut tx, inbox_id).await?;
+        let transitioned = sqlx::query_scalar::<_, bool>(SQL_DEAD_LETTER_UPDATE)
             .bind(inbox_id)
             .bind(lease_token)
             .bind(error_class)
             .bind(error)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(StorageError::from)
+            .fetch_one(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(transitioned)
     }
 
     /// Keyset-paginated operator view without raw update bodies.
@@ -1069,6 +1088,7 @@ pub async fn materialize_update_batch(
     };
 
     if !prepared_updates.is_empty() {
+        lock_materialization_lanes(&mut tx, &prepared_updates).await?;
         let mut builder = materialized_update_insert_builder(&prepared_updates);
         let rows = builder.build().fetch_all(&mut *tx).await?;
         for row in rows {
@@ -1103,6 +1123,70 @@ async fn fenced_transition(
         .fetch_one(pool)
         .await
         .map_err(StorageError::from)
+}
+
+async fn terminal_fenced_transition(
+    pool: &PgPool,
+    statement: &'static str,
+    inbox_id: i64,
+    lease_token: i64,
+) -> Result<bool, StorageError> {
+    let mut tx = pool.begin().await?;
+    lock_inbox_lane(&mut tx, inbox_id).await?;
+    let transitioned = sqlx::query_scalar::<_, bool>(statement)
+        .bind(inbox_id)
+        .bind(lease_token)
+        .fetch_one(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(transitioned)
+}
+
+async fn lock_inbox_lane(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    inbox_id: i64,
+) -> Result<(), StorageError> {
+    sqlx::query(SQL_LOCK_INBOX_LANE)
+        .bind(inbox_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+async fn lock_materialization_lanes(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    updates: &[PreparedUpdate],
+) -> Result<(), StorageError> {
+    let lane_keys = materialization_lane_lock_keys(updates);
+    if lane_keys.is_empty() {
+        return Ok(());
+    }
+    sqlx::query(SQL_LOCK_UPDATE_LANES)
+        .bind(&lane_keys)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+fn materialization_lane_lock_keys(updates: &[PreparedUpdate]) -> Vec<String> {
+    let mut lane_keys = updates
+        .iter()
+        .filter(|update| {
+            matches!(
+                &update.canonical.disposition,
+                MaterializedUpdateDisposition::Pending
+            )
+        })
+        .map(|update| {
+            format!(
+                "{}:{}",
+                update.canonical.bot_id, update.canonical.ordering_key
+            )
+        })
+        .collect::<Vec<_>>();
+    lane_keys.sort_unstable();
+    lane_keys.dedup();
+    lane_keys
 }
 
 fn prepare_updates(updates: &[MaterializedUpdateInput]) -> Vec<PreparedUpdate> {
@@ -1505,6 +1589,23 @@ mod tests {
         assert!(!SQL_CLAIM_UPDATES.contains("NOT EXISTS"));
     }
 
+    #[test]
+    fn materialization_lane_locks_are_bulk_deduplicated_and_skip_terminal_rows() {
+        let pending = update(1, 1, 1, br#"{"update_id":1}"#, 1);
+        let duplicate_lane = update(1, 2, 2, br#"{"update_id":2}"#, 2);
+        let mut terminal = update(2, 3, 3, br#"{"update_id":3}"#, 3);
+        terminal.disposition = MaterializedUpdateDisposition::Ignored {
+            reason: "passive_type:test".to_owned(),
+        };
+
+        let prepared = prepare_updates(&[pending, duplicate_lane, terminal]);
+
+        assert_eq!(
+            materialization_lane_lock_keys(&prepared),
+            vec!["1:dialog:1:42:0"]
+        );
+    }
+
     /// Release-mode transaction benchmark for the configured materializer sizes.
     ///
     /// Run with:
@@ -1814,6 +1915,88 @@ mod tests {
             .execute(&pool)
             .await?;
         sqlx::query("DELETE FROM telegram_update_quarantine WHERE bot_id = $1")
+            .bind(bot_id)
+            .execute(&pool)
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concurrent_materialization_and_terminal_transition_keep_lane_head()
+    -> Result<(), Box<dyn Error>> {
+        let Ok(dsn) = env::var("OPENPLOTVA_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&dsn)
+            .await?;
+        crate::run_migrations_on(&pool).await?;
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let bot_id = -i64::try_from(unique.min(i64::MAX as u128)).unwrap_or(i64::MAX);
+        let store = PostgresTelegramDeliveryStore::new(pool.clone());
+        let first = update(bot_id, 30, 1, br#"{"update_id":30}"#, 1);
+        store.materialize_update_batch(&[first], &[]).await?;
+        let claim = store.claim_updates("lane-race-test", 1).await?;
+        assert_eq!(claim.len(), 1);
+        assert!(
+            store
+                .mark_update_state_applied(claim[0].id, claim[0].lease_token)
+                .await?
+        );
+
+        let next = update(bot_id, 31, 2, br#"{"update_id":31}"#, 2);
+        let prepared = prepare_updates(&[next]);
+        let mut materializer_tx = pool.begin().await?;
+        lock_materialization_lanes(&mut materializer_tx, &prepared).await?;
+
+        let completion_store = store.clone();
+        let inbox_id = claim[0].id;
+        let lease_token = claim[0].lease_token;
+        let completion = tokio::spawn(async move {
+            completion_store
+                .complete_update(inbox_id, lease_token)
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !completion.is_finished(),
+            "terminal transition must wait for the materializer lane lock"
+        );
+
+        let mut builder = materialized_update_insert_builder(&prepared);
+        builder.build().fetch_all(&mut *materializer_tx).await?;
+        materializer_tx.commit().await?;
+        assert!(completion.await??);
+
+        let next_head_update_id: i64 = sqlx::query_scalar(
+            "SELECT inbox.update_id FROM telegram_update_lanes AS lane \
+             JOIN telegram_update_inbox AS inbox ON inbox.id = lane.head_inbox_id \
+             WHERE lane.bot_id = $1 AND lane.ordering_key = $2",
+        )
+        .bind(bot_id)
+        .bind(format!("dialog:{bot_id}:42:0"))
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(next_head_update_id, 31);
+
+        let next_claim = store.claim_updates("lane-race-test", 1).await?;
+        assert_eq!(next_claim.len(), 1);
+        assert_eq!(next_claim[0].update_id, 31);
+        assert!(
+            store
+                .ignore_update(next_claim[0].id, next_claim[0].lease_token, "test_cleanup",)
+                .await?
+        );
+
+        sqlx::query("DELETE FROM telegram_update_lanes WHERE bot_id = $1")
+            .bind(bot_id)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM telegram_update_inbox WHERE bot_id = $1")
             .bind(bot_id)
             .execute(&pool)
             .await?;
