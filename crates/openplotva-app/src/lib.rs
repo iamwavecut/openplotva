@@ -127,6 +127,7 @@ const GO_DISPATCHER_DEBOUNCE_WINDOW: Duration = Duration::from_secs(3);
 const GO_DISPATCHER_DEBOUNCE_CACHE_SIZE: usize = 1_000;
 const GO_WEBHOOK_DELETE_ON_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 const TELEGRAM_WEBHOOK_BODY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
+const DURABLE_UPDATE_CONSUMER_WORKER_MULTIPLIER: usize = 2;
 
 #[derive(Default)]
 struct RuntimeWorkers {
@@ -12886,10 +12887,14 @@ async fn start_runtime_workers(
         let delivery_store = openplotva_storage::PostgresTelegramDeliveryStore::new(
             service_clients.postgres.clone(),
         );
+        let mut update_consumer_config = openplotva_updates::UpdateConsumerConfig::default();
+        update_consumer_config.worker_limit = update_consumer_config
+            .worker_limit
+            .saturating_mul(DURABLE_UPDATE_CONSUMER_WORKER_MULTIPLIER);
         let update_consumer_worker = tokio::spawn(async move {
             let report = updates::run_materialized_update_consumer_until(
                 delivery_store,
-                openplotva_updates::UpdateConsumerConfig::default(),
+                update_consumer_config,
                 store_for_updates,
                 handler,
                 update_stage_tracker,
