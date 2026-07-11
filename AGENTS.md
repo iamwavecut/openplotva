@@ -17,6 +17,7 @@ For detailed architecture, module-by-module guide, data-flow diagrams, schema ov
 - Favor broad product progress over auxiliary scaffolding. Avoid placeholders, provenance notes, and speculative abstractions.
 - Dirty user changes are normal in this migrated repository; account for them and continue unless they directly conflict with the task. Never reset, clean, push, deploy, restart services, or rewrite history unless explicitly asked in the current request.
 - Never commit secrets: live `.env` values, Telegram tokens, provider keys, database dumps, Redis snapshots, private file IDs, or smoke inputs.
+- After completing local build or container smokes, remove task-owned disposable containers, images, volumes, and BuildKit cache. Never prune shared or user-owned caches indiscriminately.
 - Report exact verification commands and results. If checks are skipped, say so and name the risk.
 
 ## Code Style

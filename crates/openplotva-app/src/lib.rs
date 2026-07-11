@@ -11100,7 +11100,10 @@ async fn start_runtime_workers(
         openplotva_storage::PostgresTelegramOutboxStore::new(service_clients.postgres.clone());
     let telegram_outbox_transport =
         telegram_outbox::TelegramApiOutboxTransport::new(telegram.clone(), rich_api.clone());
-    let telegram_outbox_jobs = shared_task_queue.clone();
+    let telegram_outbox_jobs = telegram_outbox::RunAwareTelegramOutboxJobResolver::new(
+        shared_task_queue.clone(),
+        llm_run_buffer.clone(),
+    );
     let telegram_outbox_worker_id =
         format!("telegram-outbox-{}-{}", bot_identity.id, std::process::id());
     let telegram_outbox_bot_id = bot_identity.id;

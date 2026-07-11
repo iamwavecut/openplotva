@@ -246,13 +246,15 @@ where
     let owner_consumer_id = materializer_owner_consumer_id(bot_id);
     let mut waiting_for_lease = false;
     loop {
-        let acquired = tokio::select! {
-            () = external_stop.as_mut() => return Ok(report),
-            result = stream.acquire_materializer_lease(
-                &owner_consumer_id,
-                MATERIALIZER_LEASE_TTL,
-            ) => result,
-        };
+        if stop_requested_now(&mut external_stop).await {
+            return Ok(report);
+        }
+        // Acquiring the lease mutates Redis. Await it to completion so a
+        // concurrent shutdown cannot discard a successful acquisition and
+        // strand the next materializer behind the full lease TTL.
+        let acquired = stream
+            .acquire_materializer_lease(&owner_consumer_id, MATERIALIZER_LEASE_TTL)
+            .await;
         match acquired {
             Ok(true) => break,
             Ok(false) => {
@@ -314,15 +316,19 @@ where
 
     loop {
         if pending.is_empty() {
-            let reclaimed = tokio::select! {
-                () = stop.as_mut() => break,
-                result = stream.reclaim_pending(
+            if stop_requested_now(&mut stop).await {
+                break;
+            }
+            // XAUTOCLAIM changes PEL ownership. Once started, its response must
+            // be observed so a graceful stop can drain every claimed entry.
+            let reclaimed = stream
+                .reclaim_pending(
                     &owner_consumer_id,
                     config.reclaim_idle,
                     reclaim_cursor,
                     max_rows,
-                ) => result,
-            };
+                )
+                .await;
             match reclaimed {
                 Ok(claim) => {
                     consecutive_redis_failures = 0;
@@ -399,14 +405,16 @@ where
                     continue;
                 }
 
-                let entries = tokio::select! {
-                    () = stop.as_mut() => break,
-                    result = stream.read_group(
-                        &owner_consumer_id,
-                        config.read_block_timeout,
-                        max_rows,
-                    ) => result,
-                };
+                if stop_requested_now(&mut stop).await {
+                    break;
+                }
+                // XREADGROUP commits entries to the PEL. Never race this future
+                // with shutdown: a winning stop branch can otherwise discard
+                // the claimed rows and force the next process to wait for
+                // XAUTOCLAIM's idle threshold.
+                let entries = stream
+                    .read_group(&owner_consumer_id, config.read_block_timeout, max_rows)
+                    .await;
                 match entries {
                     Ok(entries) => {
                         consecutive_redis_failures = 0;
@@ -427,6 +435,9 @@ where
                     }
                 }
 
+                let mut batch_lease_lost = lease_lost_observer.clone();
+                let batch_stop = wait_for_materializer_lease_loss(&mut batch_lease_lost);
+                tokio::pin!(batch_stop);
                 if fill_new_batch_until_deadline(
                     &stream,
                     &owner_consumer_id,
@@ -434,7 +445,7 @@ where
                     max_rows,
                     config.batch_max_bytes,
                     config.batch_max_wait,
-                    &mut stop,
+                    &mut batch_stop,
                     &mut report,
                     &metrics,
                 )
@@ -455,13 +466,16 @@ where
             max_rows,
             config.batch_max_bytes,
         );
+        let mut batch_lease_lost = lease_lost_observer.clone();
+        let batch_stop = wait_for_materializer_lease_loss(&mut batch_lease_lost);
+        tokio::pin!(batch_stop);
         if !materialize_and_ack_batch(
             &stream,
             &store,
             bot_id,
             &batch,
             config.db_timeout,
-            &mut stop,
+            &mut batch_stop,
             &mut report,
             &metrics,
         )
@@ -1055,6 +1069,17 @@ fn retry_backoff(consecutive_failures: u32) -> Duration {
     Duration::from_millis(half_millis + rand::random::<u64>() % half_millis.saturating_add(1))
 }
 
+async fn stop_requested_now<Stop>(stop: &mut Pin<&mut Stop>) -> bool
+where
+    Stop: Future<Output = ()>,
+{
+    tokio::select! {
+        biased;
+        () = stop.as_mut() => true,
+        () = std::future::ready(()) => false,
+    }
+}
+
 async fn sleep_or_stop<Stop>(stop: &mut Pin<&mut Stop>, duration: Duration) -> bool
 where
     Stop: Future<Output = ()>,
@@ -1084,8 +1109,22 @@ mod tests {
     use super::{
         MATERIALIZER_LEASE_RENEW_INTERVAL, MATERIALIZER_LEASE_TTL, UpdateMaterializerMetrics,
         batch_prefix, materializer_owner_consumer_id, preprocess_batch,
-        run_materializer_lease_heartbeat, take_batch, wait_for_materializer_lease_loss,
+        run_materializer_lease_heartbeat, stop_requested_now, take_batch,
+        wait_for_materializer_lease_loss,
     };
+
+    #[tokio::test]
+    async fn stop_probe_is_nonblocking_and_observes_shutdown() {
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let stop = async move {
+            let _ = stop_rx.await;
+        };
+        tokio::pin!(stop);
+
+        assert!(!stop_requested_now(&mut stop).await);
+        stop_tx.send(()).expect("send shutdown");
+        assert!(stop_requested_now(&mut stop).await);
+    }
 
     #[test]
     fn materializer_owner_consumer_ids_are_unique_and_renew_before_expiry() {

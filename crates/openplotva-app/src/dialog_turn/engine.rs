@@ -474,20 +474,42 @@ fn record_from_resolution(
     let attempt = report
         .retry_attempt
         .unwrap_or_else(|| next_dialog_llm_job_attempt(&item.events));
-    let (sent_message_parts, side_effect_ticket_id) = match &resolution.outcome {
+    let (
+        sent_message_parts,
+        side_effect_ticket_id,
+        delivery_state,
+        outbox_operation_ids,
+        delivered_at,
+    ) = match &resolution.outcome {
         TurnOutcome::Sent {
             parts,
             side_effect_tickets,
         } => (
             Some(i32::try_from(*parts).unwrap_or(i32::MAX)),
             side_effect_tickets.first().copied(),
+            "delivered".to_owned(),
+            Vec::new(),
+            Some(now),
         ),
-        TurnOutcome::SideEffectDelegated { tickets, .. } => (None, tickets.first().copied()),
+        TurnOutcome::SideEffectDelegated { tickets, .. } => (
+            None,
+            tickets.first().copied(),
+            "legacy_unverified".to_owned(),
+            Vec::new(),
+            None,
+        ),
         TurnOutcome::QueuedForDelivery {
+            operation_ids,
             side_effect_tickets,
             ..
-        } => (None, side_effect_tickets.first().copied()),
-        _ => (None, None),
+        } => (
+            None,
+            side_effect_tickets.first().copied(),
+            "queued".to_owned(),
+            operation_ids.clone(),
+            None,
+        ),
+        _ => (None, None, "legacy_unverified".to_owned(), Vec::new(), None),
     };
     DialogTurnOutcomeRecord {
         created_at: now,
@@ -508,6 +530,9 @@ fn record_from_resolution(
         sent_message_parts,
         side_effect_ticket_id,
         detail: resolution_detail(resolution, report),
+        delivery_state,
+        outbox_operation_ids,
+        delivered_at,
     }
 }
 
