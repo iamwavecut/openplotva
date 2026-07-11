@@ -915,7 +915,7 @@ enum ClaimedUpdateProcessResult {
     TransitionError(String),
 }
 
-const MATERIALIZED_UPDATE_CLAIM_LIMIT: usize = 64;
+const MATERIALIZED_UPDATE_CLAIM_LIMIT: usize = 96;
 const MATERIALIZED_UPDATE_CLAIM_POLL: Duration = Duration::from_millis(100);
 const MATERIALIZED_UPDATE_CLAIM_TIMEOUT: Duration = Duration::from_secs(5);
 const MATERIALIZED_UPDATE_LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(20);
