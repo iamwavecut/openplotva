@@ -917,7 +917,6 @@ enum ClaimedUpdateProcessResult {
 
 const MATERIALIZED_UPDATE_CLAIM_LIMIT: usize = 96;
 const MATERIALIZED_UPDATE_CLAIM_POLL: Duration = Duration::from_millis(100);
-const MATERIALIZED_UPDATE_CLAIM_TIMEOUT: Duration = Duration::from_secs(5);
 const MATERIALIZED_UPDATE_LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(20);
 const MATERIALIZED_UPDATE_LEASE_RETRY_INTERVAL: Duration = Duration::from_secs(3);
 const MATERIALIZED_UPDATE_MAX_ATTEMPTS: i32 = 8;
@@ -963,35 +962,27 @@ where
             }
         }
 
-        let available = worker_limit.saturating_sub(workers.len()).max(1);
-        let claimed = tokio::select! {
-            _ = &mut stop => break,
-            claimed = tokio::time::timeout(
-                MATERIALIZED_UPDATE_CLAIM_TIMEOUT,
-                delivery_store.claim_updates(&worker_id, available),
-            ) => claimed,
-            joined = workers.join_next(), if !workers.is_empty() => {
-                if let Some(joined) = joined {
-                    record_claimed_update_result(joined, &mut report);
-                }
-                continue;
-            }
+        let stop_requested = tokio::select! {
+            biased;
+            _ = &mut stop => true,
+            () = std::future::ready(()) => false,
         };
+        if stop_requested {
+            break;
+        }
 
-        let claimed = match claimed {
-            Ok(Ok(claimed)) => claimed,
-            Ok(Err(error)) => {
+        let available = worker_limit.saturating_sub(workers.len()).max(1);
+        // A claim commits leased rows in PostgreSQL. Dropping this future after
+        // the commit can discard the returned rows and leave them unprocessed
+        // until lease expiry, so it must never race a worker join or shutdown.
+        let claimed = match delivery_store.claim_updates(&worker_id, available).await {
+            Ok(claimed) => claimed,
+            Err(error) => {
                 report.claim_errors.push(error.to_string());
                 tokio::select! {
                     _ = &mut stop => break,
                     () = tokio::time::sleep(MATERIALIZED_UPDATE_CLAIM_POLL) => {}
                 }
-                continue;
-            }
-            Err(_) => {
-                report
-                    .claim_errors
-                    .push("claim materialized Telegram updates timed out".to_owned());
                 continue;
             }
         };
