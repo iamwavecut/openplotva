@@ -506,9 +506,6 @@ impl RedisUpdateStream {
         updates: &[UpdateStreamAppend],
         next_cursor: i64,
     ) -> Result<Vec<UpdateStreamId>, UpdateStreamError> {
-        if updates.is_empty() {
-            return Ok(Vec::new());
-        }
         let mut pipeline = redis::pipe();
         pipeline.atomic();
         for update in updates {
@@ -1195,6 +1192,11 @@ mod tests {
         assert_eq!(ids.len(), 2);
         assert!(ids[0] < ids[1]);
         assert_eq!(stream.long_poll_cursor().await?, 202);
+        assert_eq!(stream.stats().await?.length, 2);
+
+        let dropped = stream.append_long_poll_batch(&[], 250).await?;
+        assert!(dropped.is_empty());
+        assert_eq!(stream.long_poll_cursor().await?, 250);
         assert_eq!(stream.stats().await?.length, 2);
 
         let _: usize = redis::cmd("DEL")

@@ -5,6 +5,7 @@ use std::{
     fmt,
     future::Future,
     pin::Pin,
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -142,6 +143,7 @@ pub struct LongPollStreamRunReport {
     pub polled_batches: usize,
     pub received: usize,
     pub appended: usize,
+    pub dropped_by_ingress_guard: usize,
     pub poll_errors: Vec<String>,
     pub append_errors: Vec<String>,
     pub serialization_errors: Vec<String>,
@@ -153,6 +155,44 @@ pub async fn run_long_poll_stream_producer_until<C, Stop>(
     client: &C,
     stream: &RedisUpdateStream,
     bot_id: i64,
+    stop: Stop,
+) -> LongPollStreamRunReport
+where
+    C: GetUpdatesExecutor + Sync,
+    Stop: Future<Output = ()>,
+{
+    run_long_poll_stream_producer_with_optional_ingress_guard_until(
+        client, stream, bot_id, None, stop,
+    )
+    .await
+}
+
+pub async fn run_long_poll_stream_producer_with_ingress_guard_until<C, Stop>(
+    client: &C,
+    stream: &RedisUpdateStream,
+    bot_id: i64,
+    ingress_guard: &openplotva_updates::UpdateIngressGuard,
+    stop: Stop,
+) -> LongPollStreamRunReport
+where
+    C: GetUpdatesExecutor + Sync,
+    Stop: Future<Output = ()>,
+{
+    run_long_poll_stream_producer_with_optional_ingress_guard_until(
+        client,
+        stream,
+        bot_id,
+        Some(ingress_guard),
+        stop,
+    )
+    .await
+}
+
+async fn run_long_poll_stream_producer_with_optional_ingress_guard_until<C, Stop>(
+    client: &C,
+    stream: &RedisUpdateStream,
+    bot_id: i64,
+    ingress_guard: Option<&openplotva_updates::UpdateIngressGuard>,
     stop: Stop,
 ) -> LongPollStreamRunReport
 where
@@ -207,6 +247,34 @@ where
         let mut next_cursor = cursor;
         let mut serialization_failed = false;
         for update in &updates {
+            next_cursor = next_cursor.max(update.id.saturating_add(1));
+            if let Some(ingress_guard) = ingress_guard {
+                let decision = ingress_guard.check_update(update);
+                if decision.is_dropped() {
+                    report.dropped_by_ingress_guard =
+                        report.dropped_by_ingress_guard.saturating_add(1);
+                    match decision {
+                        openplotva_updates::UpdateIngressDecision::DroppedFlood { .. } => {
+                            tracing::warn!(
+                                chat_id = decision.chat_id(),
+                                update_id = update.id,
+                                update_name = openplotva_updates::producer_update_name(update),
+                                "blocked flooded Telegram chat at ingress"
+                            );
+                        }
+                        openplotva_updates::UpdateIngressDecision::DroppedBlocked { .. } => {
+                            tracing::debug!(
+                                chat_id = decision.chat_id(),
+                                update_id = update.id,
+                                update_name = openplotva_updates::producer_update_name(update),
+                                "dropped Telegram update from an ingress-blocked chat"
+                            );
+                        }
+                        openplotva_updates::UpdateIngressDecision::Allowed { .. } => {}
+                    }
+                    continue;
+                }
+            }
             match serde_json::to_vec(update) {
                 Ok(raw_payload) => {
                     appends.push(UpdateStreamAppend {
@@ -216,7 +284,6 @@ where
                         received_at_unix_ms,
                         raw_payload,
                     });
-                    next_cursor = next_cursor.max(update.id.saturating_add(1));
                 }
                 Err(error) => {
                     serialization_failed = true;
@@ -279,6 +346,7 @@ pub struct WebhookUpdateSender {
     stream: RedisUpdateStream,
     bot_id: i64,
     send_timeout: Duration,
+    ingress_guard: Option<Arc<openplotva_updates::UpdateIngressGuard>>,
 }
 
 /// Error returned while durably appending a webhook update to Redis Streams.
@@ -319,6 +387,7 @@ pub fn webhook_update_stream(stream: RedisUpdateStream, bot_id: i64) -> WebhookU
         stream,
         bot_id,
         send_timeout: WEBHOOK_STREAM_APPEND_TIMEOUT,
+        ingress_guard: None,
     }
 }
 
@@ -328,11 +397,23 @@ impl WebhookUpdateSender {
         self
     }
 
+    #[must_use]
+    pub fn with_ingress_guard(
+        mut self,
+        ingress_guard: Arc<openplotva_updates::UpdateIngressGuard>,
+    ) -> Self {
+        self.ingress_guard = Some(ingress_guard);
+        self
+    }
+
     /// Append one parsed Telegram update to the durable ingress Stream.
     pub async fn accept_update(
         &self,
         update: TelegramUpdate,
     ) -> Result<(), WebhookUpdateSendError> {
+        if self.drop_by_ingress_guard(&update) {
+            return Ok(());
+        }
         let raw_payload =
             serde_json::to_vec(&update).map_err(|_| WebhookUpdateSendError::Stream)?;
         self.append_raw_stream_update(Some(update.id), &raw_payload)
@@ -353,9 +434,50 @@ impl WebhookUpdateSender {
             return Err(WebhookUpdateRequestError::Unauthorized);
         }
 
-        self.append_raw_stream_update(raw_update_id(body), body)
+        let decoded = openplotva_updates::decode_telegram_update_json_slice(body).ok();
+        if decoded
+            .as_ref()
+            .is_some_and(|update| self.drop_by_ingress_guard(update))
+        {
+            return Ok(());
+        }
+        let update_id = decoded
+            .as_ref()
+            .map(|update| update.id)
+            .or_else(|| raw_update_id(body));
+        self.append_raw_stream_update(update_id, body)
             .await
             .map_err(|_| WebhookUpdateRequestError::ServiceUnavailable)
+    }
+
+    fn drop_by_ingress_guard(&self, update: &TelegramUpdate) -> bool {
+        let Some(ingress_guard) = &self.ingress_guard else {
+            return false;
+        };
+        let decision = ingress_guard.check_update(update);
+        if !decision.is_dropped() {
+            return false;
+        }
+        match decision {
+            openplotva_updates::UpdateIngressDecision::DroppedFlood { .. } => {
+                tracing::warn!(
+                    chat_id = decision.chat_id(),
+                    update_id = update.id,
+                    update_name = openplotva_updates::producer_update_name(update),
+                    "blocked flooded Telegram chat at ingress"
+                );
+            }
+            openplotva_updates::UpdateIngressDecision::DroppedBlocked { .. } => {
+                tracing::debug!(
+                    chat_id = decision.chat_id(),
+                    update_id = update.id,
+                    update_name = openplotva_updates::producer_update_name(update),
+                    "dropped Telegram update from an ingress-blocked chat"
+                );
+            }
+            openplotva_updates::UpdateIngressDecision::Allowed { .. } => {}
+        }
+        true
     }
 
     async fn append_raw_stream_update(
@@ -662,6 +784,32 @@ mod tests {
             TELEGRAM_WEBHOOK_SECRET_HEADER,
             "X-Telegram-Bot-Api-Secret-Token"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn webhook_flood_drop_returns_success_without_touching_redis()
+    -> Result<(), Box<dyn Error>> {
+        let client = redis::Client::open("redis://127.0.0.1:1/0")?;
+        let stream = openplotva_updates::RedisUpdateStream::with_key(
+            client,
+            "openplotva:webhook-flood-test",
+        );
+        let guard = Arc::new(openplotva_updates::UpdateIngressGuard::new(
+            openplotva_updates::UpdateIngressGuardConfig {
+                short_window: Duration::from_secs(10),
+                short_limit: 1,
+                long_window: Duration::from_secs(60),
+                long_limit: 100,
+                block_duration: Duration::from_secs(300),
+            },
+        ));
+        let sender = super::webhook_update_stream(stream, 77).with_ingress_guard(guard);
+        let body = serde_json::to_vec(&sample_message_update(10)?)?;
+
+        sender
+            .handle_webhook_request("POST", Some("secret"), "secret", &body)
+            .await?;
         Ok(())
     }
 
