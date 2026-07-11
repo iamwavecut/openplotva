@@ -127,7 +127,7 @@ const GO_DISPATCHER_DEBOUNCE_WINDOW: Duration = Duration::from_secs(3);
 const GO_DISPATCHER_DEBOUNCE_CACHE_SIZE: usize = 1_000;
 const GO_WEBHOOK_DELETE_ON_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 const TELEGRAM_WEBHOOK_BODY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
-const DURABLE_UPDATE_CONSUMER_WORKER_MULTIPLIER: usize = 2;
+const DURABLE_UPDATE_CONSUMER_WORKER_MULTIPLIER: usize = 3;
 
 #[derive(Default)]
 struct RuntimeWorkers {
