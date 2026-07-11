@@ -10185,6 +10185,29 @@ async fn start_runtime_workers(
             "chat_history partition retention disabled",
         ));
     }
+    let telegram_update_retention_store =
+        openplotva_storage::PostgresTelegramDeliveryStore::new(service_clients.postgres.clone());
+    let telegram_update_retention_stop = stop.subscribe();
+    let telegram_update_retention_worker = tokio::spawn(async move {
+        let report = runtime_retention::run_telegram_update_retention_worker_until(
+            telegram_update_retention_store,
+            runtime_retention::RETENTION_CLEANUP_INTERVAL,
+            runtime_retention::RETENTION_DELETE_BATCH_SIZE,
+            runtime_retention::RETENTION_INTER_BATCH_PAUSE,
+            wait_for_runtime_stop(telegram_update_retention_stop),
+        )
+        .await;
+        tracing::info!(?report, "Telegram update retention worker stopped");
+    });
+    readiness_checks.push(ReadinessCheck::ok(
+        "telegram_update_retention",
+        format!(
+            "terminal inbox and quarantine rows before the current UTC day deleted every {}s in batches of {}",
+            runtime_retention::RETENTION_CLEANUP_INTERVAL.as_secs(),
+            runtime_retention::RETENTION_DELETE_BATCH_SIZE
+        ),
+    ));
+    workers.handles.push(telegram_update_retention_worker);
     let telegram_files_retention_days = config.vision.telegram_files_retention_days;
     if telegram_files_retention_days > 0 {
         let pool = service_clients.postgres.clone();

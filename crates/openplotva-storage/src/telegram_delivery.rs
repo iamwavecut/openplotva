@@ -488,6 +488,40 @@ WHERE bot_id = $1
 ORDER BY bot_id, ordering_key, stream_ms, stream_seq, id
 "#;
 
+const SQL_DELETE_TERMINAL_UPDATES_BEFORE: &str = r#"
+WITH doomed AS MATERIALIZED (
+    SELECT inbox.id
+    FROM telegram_update_inbox AS inbox
+    WHERE inbox.status IN ('completed', 'ignored', 'dead_letter')
+      AND inbox.completed_at < $1
+      AND NOT EXISTS (
+          SELECT 1
+          FROM telegram_update_lanes AS lane
+          WHERE lane.head_inbox_id = inbox.id
+      )
+    ORDER BY inbox.completed_at, inbox.id
+    LIMIT $2
+    FOR UPDATE OF inbox SKIP LOCKED
+)
+DELETE FROM telegram_update_inbox AS inbox
+USING doomed
+WHERE inbox.id = doomed.id
+"#;
+
+const SQL_DELETE_QUARANTINED_UPDATES_BEFORE: &str = r#"
+WITH doomed AS MATERIALIZED (
+    SELECT quarantine.id
+    FROM telegram_update_quarantine AS quarantine
+    WHERE quarantine.created_at < $1
+    ORDER BY quarantine.created_at, quarantine.id
+    LIMIT $2
+    FOR UPDATE OF quarantine SKIP LOCKED
+)
+DELETE FROM telegram_update_quarantine AS quarantine
+USING doomed
+WHERE quarantine.id = doomed.id
+"#;
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub enum MaterializedUpdateDisposition {
     #[default]
@@ -538,6 +572,13 @@ pub struct TelegramUpdateStartupReconcileReport {
     pub ignored_rows: u64,
     pub repaired_attempt_rows: u64,
     pub lane_rows: u64,
+}
+
+/// Rows removed by one bounded Telegram update retention transaction.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TelegramUpdateRetentionBatchReport {
+    pub inbox_deleted: u64,
+    pub quarantine_deleted: u64,
 }
 
 pub struct TelegramUpdateStartupReconcileGuard {
@@ -729,6 +770,39 @@ impl PostgresTelegramDeliveryStore {
         quarantine: &[QuarantinedUpdateInput],
     ) -> Result<MaterializationReport, StorageError> {
         materialize_update_batch(&self.pool, updates, quarantine).await
+    }
+
+    /// Delete one bounded batch of terminal inbox rows and quarantined updates
+    /// older than `cutoff`. Processing rows are never eligible; attempt rows
+    /// follow terminal inbox deletion through their `ON DELETE CASCADE` key.
+    pub async fn delete_update_artifacts_before(
+        &self,
+        cutoff: OffsetDateTime,
+        batch_size: i64,
+    ) -> Result<TelegramUpdateRetentionBatchReport, StorageError> {
+        if batch_size <= 0 {
+            return Ok(TelegramUpdateRetentionBatchReport::default());
+        }
+
+        let mut tx = self.pool.begin().await?;
+        let inbox_deleted = sqlx::query(SQL_DELETE_TERMINAL_UPDATES_BEFORE)
+            .bind(cutoff)
+            .bind(batch_size)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        let quarantine_deleted = sqlx::query(SQL_DELETE_QUARANTINED_UPDATES_BEFORE)
+            .bind(cutoff)
+            .bind(batch_size)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        tx.commit().await?;
+
+        Ok(TelegramUpdateRetentionBatchReport {
+            inbox_deleted,
+            quarantine_deleted,
+        })
     }
 
     pub async fn begin_startup_reconciliation(
@@ -1590,6 +1664,21 @@ mod tests {
     }
 
     #[test]
+    fn retention_sql_is_bounded_and_terminal_only() {
+        assert!(
+            SQL_DELETE_TERMINAL_UPDATES_BEFORE
+                .contains("status IN ('completed', 'ignored', 'dead_letter')")
+        );
+        assert!(SQL_DELETE_TERMINAL_UPDATES_BEFORE.contains("completed_at < $1"));
+        assert!(SQL_DELETE_TERMINAL_UPDATES_BEFORE.contains("LIMIT $2"));
+        assert!(SQL_DELETE_TERMINAL_UPDATES_BEFORE.contains("SKIP LOCKED"));
+        assert!(SQL_DELETE_TERMINAL_UPDATES_BEFORE.contains("lane.head_inbox_id = inbox.id"));
+        assert!(SQL_DELETE_QUARANTINED_UPDATES_BEFORE.contains("created_at < $1"));
+        assert!(SQL_DELETE_QUARANTINED_UPDATES_BEFORE.contains("LIMIT $2"));
+        assert!(SQL_DELETE_QUARANTINED_UPDATES_BEFORE.contains("SKIP LOCKED"));
+    }
+
+    #[test]
     fn materialization_lane_locks_are_bulk_deduplicated_and_skip_terminal_rows() {
         let pending = update(1, 1, 1, br#"{"update_id":1}"#, 1);
         let duplicate_lane = update(1, 2, 2, br#"{"update_id":2}"#, 2);
@@ -1725,6 +1814,140 @@ mod tests {
             Envelope { update_id: 42 }
         );
         assert!(claim.needs_state_application());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_retention_deletes_only_old_terminal_artifacts_in_bounded_batches()
+    -> Result<(), Box<dyn Error>> {
+        let Ok(dsn) = env::var("OPENPLOTVA_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&dsn)
+            .await?;
+        crate::run_migrations_on(&pool).await?;
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let bot_id = -i64::try_from(unique.min((i64::MAX - 2) as u128)).unwrap_or(i64::MAX - 2);
+        let old_quarantine_bot_id = bot_id - 1;
+        let fresh_quarantine_bot_id = bot_id - 2;
+        let store = PostgresTelegramDeliveryStore::new(pool.clone());
+        let cutoff = OffsetDateTime::now_utc().date().midnight().assume_utc();
+        let old = cutoff - time::Duration::seconds(1);
+        let fresh = cutoff + time::Duration::seconds(1);
+
+        let mut old_terminal = update(bot_id, 1, 1, br#"{"update_id":1}"#, 1);
+        old_terminal.disposition = MaterializedUpdateDisposition::Ignored {
+            reason: "retention_test".to_owned(),
+        };
+        let mut fresh_terminal = update(bot_id, 2, 2, br#"{"update_id":2}"#, 2);
+        fresh_terminal.disposition = MaterializedUpdateDisposition::Ignored {
+            reason: "retention_test".to_owned(),
+        };
+        let old_pending = update(bot_id, 3, 3, br#"{"update_id":3}"#, 3);
+        store
+            .materialize_update_batch(
+                &[old_terminal, fresh_terminal, old_pending],
+                &[
+                    quarantine(old_quarantine_bot_id),
+                    quarantine(fresh_quarantine_bot_id),
+                ],
+            )
+            .await?;
+
+        let old_inbox_id: i64 = sqlx::query_scalar(
+            "UPDATE telegram_update_inbox SET completed_at = $2 \
+             WHERE bot_id = $1 AND update_id = 1 RETURNING id",
+        )
+        .bind(bot_id)
+        .bind(old)
+        .fetch_one(&pool)
+        .await?;
+        sqlx::query(
+            "UPDATE telegram_update_inbox SET completed_at = CASE update_id \
+                 WHEN 2 THEN $2 ELSE $3 END \
+             WHERE bot_id = $1 AND update_id IN (2, 3)",
+        )
+        .bind(bot_id)
+        .bind(fresh)
+        .bind(old)
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO telegram_update_attempts \
+             (inbox_id, attempt, lease_token, worker_id) VALUES ($1, 1, 1, 'retention-test')",
+        )
+        .bind(old_inbox_id)
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "UPDATE telegram_update_quarantine \
+             SET created_at = CASE bot_id WHEN $1 THEN $3 ELSE $4 END \
+             WHERE bot_id IN ($1, $2)",
+        )
+        .bind(old_quarantine_bot_id)
+        .bind(fresh_quarantine_bot_id)
+        .bind(old)
+        .bind(fresh)
+        .execute(&pool)
+        .await?;
+
+        let deleted = store.delete_update_artifacts_before(cutoff, 1).await?;
+        assert_eq!(
+            deleted,
+            TelegramUpdateRetentionBatchReport {
+                inbox_deleted: 1,
+                quarantine_deleted: 1,
+            }
+        );
+        let remaining_updates: Vec<i64> = sqlx::query_scalar(
+            "SELECT update_id FROM telegram_update_inbox \
+             WHERE bot_id = $1 ORDER BY update_id",
+        )
+        .bind(bot_id)
+        .fetch_all(&pool)
+        .await?;
+        assert_eq!(remaining_updates, vec![2, 3]);
+        let old_attempt_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM telegram_update_attempts WHERE inbox_id = $1)",
+        )
+        .bind(old_inbox_id)
+        .fetch_one(&pool)
+        .await?;
+        assert!(
+            !old_attempt_exists,
+            "attempt rows must cascade with the inbox row"
+        );
+        let remaining_quarantine_bots: Vec<i64> = sqlx::query_scalar(
+            "SELECT bot_id FROM telegram_update_quarantine \
+             WHERE bot_id IN ($1, $2) ORDER BY bot_id",
+        )
+        .bind(old_quarantine_bot_id)
+        .bind(fresh_quarantine_bot_id)
+        .fetch_all(&pool)
+        .await?;
+        assert_eq!(remaining_quarantine_bots, vec![fresh_quarantine_bot_id]);
+        assert_eq!(
+            store.delete_update_artifacts_before(cutoff, 1).await?,
+            TelegramUpdateRetentionBatchReport::default()
+        );
+
+        sqlx::query("DELETE FROM telegram_update_lanes WHERE bot_id = $1")
+            .bind(bot_id)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM telegram_update_inbox WHERE bot_id = $1")
+            .bind(bot_id)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM telegram_update_quarantine WHERE bot_id = $1")
+            .bind(fresh_quarantine_bot_id)
+            .execute(&pool)
+            .await?;
         Ok(())
     }
 

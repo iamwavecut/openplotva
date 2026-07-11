@@ -45,7 +45,7 @@ pub use telegram_delivery::{
     ClaimedTelegramUpdate, MATERIALIZED_UPDATE_BINDS_PER_ROW, MaterializationReport,
     MaterializedUpdateDisposition, MaterializedUpdateInput, PostgresTelegramDeliveryStore,
     QuarantinedUpdateInput, TelegramUpdateAttempt, TelegramUpdateInboxItem,
-    TelegramUpdateInboxStats, TelegramUpdateReconcileCandidate,
+    TelegramUpdateInboxStats, TelegramUpdateReconcileCandidate, TelegramUpdateRetentionBatchReport,
     TelegramUpdateStartupReconcileGuard, TelegramUpdateStartupReconcileReport,
     UPDATE_PROCESSING_LEASE_SECONDS,
 };
