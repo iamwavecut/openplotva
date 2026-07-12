@@ -15,10 +15,10 @@ use openplotva_llm::aifarm::{
 use openplotva_llm::retry::{FailureReason, retryable_reason_from_message};
 use openplotva_storage::{
     PostgresHistoryStore, PostgresTelegramFileStore, TELEGRAM_FILE_ASR_STATUS_COMPLETED,
-    TELEGRAM_FILE_ASR_STATUS_FAILED, TELEGRAM_FILE_VISION_REQUEST_TIMEOUT,
-    TELEGRAM_FILE_VISION_STATUS_COMPLETED, TELEGRAM_FILE_VISION_STATUS_FAILED,
-    TELEGRAM_FILE_VISION_STATUS_PROCESSING, TelegramFileRecord, TelegramFileVisionUpdate,
-    VisionDescriptionUpdate,
+    TELEGRAM_FILE_ASR_STATUS_FAILED, TELEGRAM_FILE_ASR_STATUS_UNAVAILABLE,
+    TELEGRAM_FILE_VISION_REQUEST_TIMEOUT, TELEGRAM_FILE_VISION_STATUS_COMPLETED,
+    TELEGRAM_FILE_VISION_STATUS_FAILED, TELEGRAM_FILE_VISION_STATUS_PROCESSING, TelegramFileRecord,
+    TelegramFileVisionUpdate, VisionDescriptionUpdate,
 };
 use openplotva_telegram::TelegramClient;
 use thiserror::Error;
@@ -1207,6 +1207,10 @@ impl VisionDescriber for TelegramMediaDescriber {
                         .asr_error
                         .unwrap_or_else(|| "ASR failed without diagnostic".to_owned());
                 }
+                Ok(Some(record)) if record.asr_status == TELEGRAM_FILE_ASR_STATUS_UNAVAILABLE => {
+                    result.transcript_note =
+                        "В медиа нет доступной для распознавания аудиодорожки.".to_owned();
+                }
                 Ok(Some(record)) => {
                     result.transcript_error = format!(
                         "ASR did not complete during media analysis (status={})",
@@ -1333,6 +1337,7 @@ fn vision_describe_result(
             .filter(|text| !text.is_empty())
             .unwrap_or_default()
             .to_owned(),
+        transcript_note: String::new(),
         transcript_error: String::new(),
         media_kind: match record.media_kind.trim().to_lowercase().as_str() {
             "photo" => "image".to_owned(),
@@ -1588,6 +1593,7 @@ mod tests {
             VisionDescribeResult {
                 caption: "cached cat".to_owned(),
                 transcript: String::new(),
+                transcript_note: String::new(),
                 transcript_error: String::new(),
                 media_kind: "image".to_owned(),
                 source: "cache".to_owned(),

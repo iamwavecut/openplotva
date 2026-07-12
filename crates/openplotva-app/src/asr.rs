@@ -24,7 +24,7 @@ use openplotva_llm::{
 pub use openplotva_storage::TelegramFileAsrUpdate;
 use openplotva_storage::{
     PostgresTelegramFileStore, TELEGRAM_FILE_ASR_STATUS_COMPLETED, TELEGRAM_FILE_ASR_STATUS_FAILED,
-    TELEGRAM_FILE_ASR_STATUS_PROCESSING, TelegramFileRecord,
+    TELEGRAM_FILE_ASR_STATUS_PROCESSING, TELEGRAM_FILE_ASR_STATUS_UNAVAILABLE, TelegramFileRecord,
 };
 use openplotva_taskman::{
     ASR_GPU1_QUEUE_NAME, AsrJobParams, InMemoryTaskQueue, JobType,
@@ -664,6 +664,7 @@ fn routed_asr_client(
 
 fn asr_retryable_reason(error: &AsrClientError) -> Option<FailureReason> {
     match error {
+        AsrClientError::Status { detail, .. } if asr_audio_unavailable_error(detail) => None,
         AsrClientError::Status { status, .. } if *status >= 500 => {
             Some(FailureReason::ProviderUnavailable)
         }
@@ -936,10 +937,9 @@ where
                 duration_seconds: (candidate.duration_seconds > 0)
                     .then_some(candidate.duration_seconds),
             };
-            let Ok((text, _stored)) = self.transcribe_record(&record, request).await else {
-                return input;
-            };
-            apply_transcript(&mut input, candidate.attachment_index, &text);
+            if let Ok(Some((text, _stored))) = self.transcribe_record(&record, request).await {
+                apply_transcript(&mut input, candidate.attachment_index, &text);
+            }
             input
         })
     }
@@ -996,7 +996,7 @@ where
                 .await
                 .ok_or_else(|| "Telegram voice ASR processing claim unavailable".to_owned())?
         };
-        let (_text, stored) = self
+        let outcome = self
             .transcribe_record(
                 &record,
                 AsrRequest {
@@ -1009,7 +1009,7 @@ where
                 },
             )
             .await?;
-        if stored {
+        if outcome.is_none() || outcome.is_some_and(|(_, stored)| stored) {
             Ok(())
         } else {
             Err("failed to store Telegram voice ASR transcript".to_owned())
@@ -1020,7 +1020,7 @@ where
         &self,
         record: &TelegramFileRecord,
         request: AsrRequest,
-    ) -> Result<(String, bool), String> {
+    ) -> Result<Option<(String, bool)>, String> {
         let latest_file_id = record.latest_file_id.trim();
         if latest_file_id.is_empty() {
             let error = "missing latest Telegram file id".to_owned();
@@ -1046,6 +1046,16 @@ where
             .map_err(|error| error.to_string());
         let transcript = match transcript {
             Ok(transcript) => transcript,
+            Err(error) if asr_audio_unavailable_error(&error) => {
+                self.store_unavailable(record, &error, OffsetDateTime::now_utc())
+                    .await
+                    .map_err(|store_error| {
+                        format!(
+                            "failed to store unavailable Telegram media ASR state: {store_error}"
+                        )
+                    })?;
+                return Ok(None);
+            }
             Err(error) => {
                 self.mark_failed_best_effort(record, &error).await;
                 return Err(error);
@@ -1070,7 +1080,7 @@ where
         } else {
             true
         };
-        Ok((text, stored))
+        Ok(Some((text, stored)))
     }
 
     async fn lookup_record(&self, file_unique_id: &str) -> Option<TelegramFileRecord> {
@@ -1126,6 +1136,23 @@ where
                 "failed to mark Telegram voice ASR as failed"
             );
         }
+    }
+
+    async fn store_unavailable(
+        &self,
+        record: &TelegramFileRecord,
+        reason: &str,
+        now: OffsetDateTime,
+    ) -> Result<TelegramFileRecord, Store::Error> {
+        self.store
+            .update_asr(&TelegramFileAsrUpdate {
+                file_unique_id: record.file_unique_id.clone(),
+                asr_status: TELEGRAM_FILE_ASR_STATUS_UNAVAILABLE.to_owned(),
+                asr_error: Some(reason.to_owned()),
+                asr_completed_at: Some(now),
+                ..TelegramFileAsrUpdate::default()
+            })
+            .await
     }
 
     async fn store_completed(
@@ -1350,6 +1377,12 @@ fn cached_asr_text(record: &TelegramFileRecord) -> Option<String> {
         .map(str::to_owned)
 }
 
+fn asr_audio_unavailable_error(error: &str) -> bool {
+    error
+        .to_ascii_lowercase()
+        .contains("failed to decode audio with ffmpeg")
+}
+
 fn apply_transcript(input: &mut DialogInput, attachment_index: usize, text: &str) {
     let is_video = input
         .message
@@ -1415,7 +1448,8 @@ mod tests {
     use openplotva_dialog::{DialogContext, DialogInput, DialogMessage};
     use openplotva_storage::{
         TELEGRAM_FILE_ASR_STATUS_COMPLETED, TELEGRAM_FILE_ASR_STATUS_PENDING,
-        TELEGRAM_FILE_ASR_STATUS_PROCESSING, TelegramFileRecord,
+        TELEGRAM_FILE_ASR_STATUS_PROCESSING, TELEGRAM_FILE_ASR_STATUS_UNAVAILABLE,
+        TelegramFileRecord,
     };
     use time::OffsetDateTime;
 
@@ -1487,7 +1521,10 @@ mod tests {
             Box::pin(async move {
                 let mut record = self.record.lock().expect("lock");
                 if record.file_unique_id != file_unique_id
-                    || record.asr_status == TELEGRAM_FILE_ASR_STATUS_COMPLETED
+                    || matches!(
+                        record.asr_status.as_str(),
+                        TELEGRAM_FILE_ASR_STATUS_COMPLETED | TELEGRAM_FILE_ASR_STATUS_UNAVAILABLE
+                    )
                     || is_fresh_processing_record(&record, requested_at)
                 {
                     return Ok(None);
@@ -2013,6 +2050,55 @@ mod tests {
         assert_eq!(updates.len(), 2);
         assert_eq!(updates[1].asr_status, "failed");
         assert_eq!(updates[1].asr_error.as_deref(), Some("asr down"));
+    }
+
+    #[tokio::test]
+    async fn materializer_terminally_skips_media_without_decodable_audio() {
+        let now = OffsetDateTime::from_unix_timestamp(1_770_000_000).expect("timestamp");
+        let store = FakeStore {
+            record: Arc::new(Mutex::new(voice_record(now))),
+            updates: Arc::new(Mutex::new(Vec::new())),
+        };
+        let downloader = FakeDownloader::default();
+        let transcriber = FakeTranscriber {
+            result: Err(
+                "asr upstream status 503: {\"detail\":\"failed to decode audio with ffmpeg\"}"
+                    .to_owned(),
+            ),
+            calls: Arc::new(Mutex::new(Vec::new())),
+        };
+        let materializer = TelegramDialogAsrInputMaterializer::new(
+            store.clone(),
+            downloader.clone(),
+            transcriber.clone(),
+        );
+
+        let first = materializer
+            .materialize_dialog_asr_input(dialog_input_with_voice(), now)
+            .await;
+        let second = materializer
+            .materialize_dialog_asr_input(dialog_input_with_voice(), now)
+            .await;
+
+        assert!(first.message.text.is_empty());
+        assert!(second.message.text.is_empty());
+        assert_eq!(downloader.calls.lock().expect("lock").len(), 1);
+        assert_eq!(transcriber.calls.lock().expect("lock").len(), 1);
+        let updates = store.updates.lock().expect("lock").clone();
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[0].asr_status, TELEGRAM_FILE_ASR_STATUS_PROCESSING);
+        assert_eq!(updates[1].asr_status, TELEGRAM_FILE_ASR_STATUS_UNAVAILABLE);
+        assert!(updates[1].asr_completed_at.is_some());
+    }
+
+    #[test]
+    fn no_audio_response_does_not_trigger_provider_failover() {
+        let error = AsrClientError::Status {
+            status: 503,
+            detail: r#"{"detail":"failed to decode audio with ffmpeg"}"#.to_owned(),
+        };
+
+        assert_eq!(asr_retryable_reason(&error), None);
     }
 
     #[tokio::test]

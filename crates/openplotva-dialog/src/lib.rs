@@ -640,7 +640,7 @@ const ALTERNATIVE_DIALOG_TOOL_CATALOG: &[ToolSpec] = &[
         name: STEP_UNDERSTAND_MEDIA,
         summary: "Understand visual media and spoken audio from chat context.",
         when_to_use: "Use when the latest user message asks about an image, animation, video, or video note, including what is shown and what is said.",
-        result: "Returns the visual description and, for video media, the spoken-audio transcript together. If either modality fails, returns an explicit partial-result error instead of silently claiming complete analysis.",
+        result: "Returns the visual description and, for video media, the spoken-audio transcript together. Media without a decodable audio track is reported explicitly without failing the visual result. If either modality actually fails, returns an explicit partial-result error instead of silently claiming complete analysis.",
         args: VISION_IMAGE_ARGS,
     },
     ToolSpec {
