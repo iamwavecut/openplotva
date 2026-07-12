@@ -73,9 +73,9 @@ pub use outcome::{
     JobDisposition, REASON_QUEUE_BACKLOG_EXPIRED, TurnOutcome, TurnResolution, UserSignalPlan,
 };
 pub use session::{
-    CapturedSessionOutput, SESSION_ITERATION_STAGE, SESSION_MESSAGE_SENT_STAGE, SESSION_TOOL_STAGE,
-    SessionReactionFuture, SessionReactor, SessionTurnConfig, SessionWorkerWiring,
-    run_captured_session,
+    CapturedSessionOutput, SESSION_INTERMEDIATE_QUEUED_STAGE, SESSION_ITERATION_STAGE,
+    SESSION_MESSAGE_SENT_STAGE, SESSION_TOOL_STAGE, SessionReactionFuture, SessionReactor,
+    SessionTurnConfig, SessionWorkerWiring, run_captured_session,
 };
 pub use signal::{
     DEFAULT_DIALOG_TERMINAL_REACTION_EMOJI, DEFAULT_DIALOG_TERMINAL_SIGNAL_MAX_AGE_SECS,

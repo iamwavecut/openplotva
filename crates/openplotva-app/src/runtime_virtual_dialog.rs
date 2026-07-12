@@ -228,7 +228,8 @@ impl RuntimeVirtualDialogExecutor {
         let input = self
             .materializer
             .materialize_dialog_input(&params, now)
-            .await;
+            .await
+            .map_err(|error| error.to_string())?;
         // SAFE/REAL is a toolbox choice per message, not a provider property:
         // the console drives the same captured session loop the dialog worker
         // uses, with the SAFE toolbox faking generation side effects.

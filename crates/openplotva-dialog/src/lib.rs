@@ -537,7 +537,7 @@ const GENERATE_SONG_ARGS: &[ToolArgSpec] = &[ToolArgSpec {
 const VISION_IMAGE_ARGS: &[ToolArgSpec] = &[ToolArgSpec {
     name: "file_id",
     required: false,
-    description: "Image attachment handle from attachments, for example message_123_image_1. Prefer the handle over opaque Telegram file_unique_id values. Omit only when the latest message has exactly one image.",
+    description: "Image or video attachment handle from attachments, for example message_123_image_1 or message_123_video_1. Prefer the handle over opaque Telegram file_unique_id values. Omit only when the latest message has exactly one supported media attachment.",
 }];
 
 const CURRENCY_RATES_ARGS: &[ToolArgSpec] = &[ToolArgSpec {
@@ -636,9 +636,9 @@ const ALTERNATIVE_DIALOG_TOOL_CATALOG: &[ToolSpec] = &[
     },
     ToolSpec {
         name: STEP_VISION_IMAGE,
-        summary: "Describe an image from chat context.",
-        when_to_use: "Use when the latest user message asks what is shown in an image or requires understanding an attached image.",
-        result: "Returns a text description of the image.",
+        summary: "Understand an image or video from chat context.",
+        when_to_use: "Use when the latest user message asks what is shown in an image or video, or what is said in attached video media.",
+        result: "Returns the visual description and, for video, the available spoken-audio transcript together.",
         args: VISION_IMAGE_ARGS,
     },
     ToolSpec {
@@ -1131,6 +1131,8 @@ const REPLY_LEAK_MARKERS: &[&str] = &[
     "<assistant_message",
 ];
 
+const LEADING_REASONING_MARKUP: &[&str] = &["<thought", "<analysis", "<type:"];
+
 #[must_use]
 pub fn strip_reasoning_channels(content: &str) -> String {
     let trimmed = content.trim();
@@ -1216,6 +1218,22 @@ pub fn pathological_final_answer_reason(value: &str) -> Option<String> {
     if cyrillic >= 80 && spaces <= 1 {
         return Some("missing word spaces".to_owned());
     }
+    let mut repeated_segments = std::collections::HashMap::<String, usize>::new();
+    for segment in value.split(['\n', '.', '!', '?']) {
+        let normalized = segment
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase();
+        if normalized.chars().count() < 8 {
+            continue;
+        }
+        let count = repeated_segments.entry(normalized).or_default();
+        *count += 1;
+        if *count >= 3 {
+            return Some("repeated phrase".to_owned());
+        }
+    }
     None
 }
 
@@ -1240,6 +1258,13 @@ pub enum DialogReplyOutcome {
 pub fn finalize_dialog_reply(content: &str) -> DialogReplyOutcome {
     if content.trim().is_empty() {
         return DialogReplyOutcome::Suppressed(DialogReplySuppression::Empty);
+    }
+    let lower = content.trim_start().to_lowercase();
+    if LEADING_REASONING_MARKUP
+        .iter()
+        .any(|marker| lower.starts_with(marker))
+    {
+        return DialogReplyOutcome::Suppressed(DialogReplySuppression::ReasoningLeak);
     }
     let recovered = strip_reasoning_channels(content);
     let answer = sanitize_final_text(&recovered);
@@ -2035,12 +2060,73 @@ fn parse_xmlish_direct_tool_tag(raw: &str) -> Result<Option<ToolStep>, ToolParse
 
 fn parse_xmlish_direct_tool_tag_steps(raw: &str) -> Result<Vec<ToolStep>, ToolParseError> {
     let mut steps = Vec::new();
-    for tag in xmlish_direct_tool_tags(raw) {
+    for (tag, body) in xmlish_direct_tool_elements(raw)? {
         if let Some(step) = parse_xmlish_direct_tool_tag_step(&tag)? {
             steps.push(step);
+            continue;
         }
+        let Some(name) = canonical_known_step(&xmlish_tool_tag_name(&tag)) else {
+            continue;
+        };
+        let Some(body) = body else {
+            continue;
+        };
+        let mut arguments = serde_json::Map::new();
+        for key in INLINE_TOOL_ARG_KEYS {
+            if let Some(value) = xmlish_child_text(&body, key) {
+                arguments.insert((*key).to_owned(), Value::String(value));
+            }
+        }
+        steps.push(decode_tool_call_arguments(name, &Value::Object(arguments))?);
     }
     Ok(steps)
+}
+
+fn xmlish_direct_tool_elements(raw: &str) -> Result<Vec<(String, Option<String>)>, ToolParseError> {
+    let mut elements = Vec::new();
+    let mut offset = 0;
+    while let Some(idx) = raw[offset..].find('<') {
+        let start = offset + idx;
+        if raw[start..].starts_with("</") {
+            offset = start + 2;
+            continue;
+        }
+        let Some(relative_end) = raw[start..].find('>') else {
+            return Err(ToolParseError::new("unterminated XML-ish tool tag"));
+        };
+        let open_end = start + relative_end;
+        let tag = raw[start..=open_end].to_owned();
+        let name = xmlish_tool_tag_name(&tag);
+        if canonical_known_step(&name).is_none() {
+            offset = open_end + 1;
+            continue;
+        }
+        if tag.trim_end().ends_with("/>") || xmlish_direct_tool_tag_has_args(&tag, &name) {
+            elements.push((tag, None));
+            offset = open_end + 1;
+            continue;
+        }
+        let close_tag = format!("</{name}>");
+        let body_start = open_end + 1;
+        let Some(relative_body_end) = index_fold(&raw[body_start..], &close_tag) else {
+            return Err(ToolParseError::new(format!(
+                "unterminated XML-ish {name} tool element"
+            )));
+        };
+        let body_end = body_start + relative_body_end;
+        elements.push((tag, Some(unescape_xmlish(raw[body_start..body_end].trim()))));
+        offset = body_end + close_tag.len();
+    }
+    Ok(elements)
+}
+
+fn xmlish_child_text(body: &str, name: &str) -> Option<String> {
+    let open = format!("<{name}>");
+    let start = index_fold(body, &open)? + open.len();
+    let close = format!("</{name}>");
+    let end = index_fold(&body[start..], &close)? + start;
+    let value = unescape_xmlish(body[start..end].trim());
+    if value.is_empty() { None } else { Some(value) }
 }
 
 fn parse_xmlish_direct_tool_tag_step(tag: &str) -> Result<Option<ToolStep>, ToolParseError> {
@@ -2587,6 +2673,14 @@ mod tests {
             finalize_dialog_reply("<chat_context><reference_context>leaked</reference_context>"),
             Suppressed(ReasoningLeak)
         );
+        assert_eq!(
+            finalize_dialog_reply("<thought>сначала рассуждение</thought>\nОтвет"),
+            Suppressed(ReasoningLeak)
+        );
+        assert_eq!(
+            finalize_dialog_reply("<type:analysis>внутренний протокол\nОтвет"),
+            Suppressed(ReasoningLeak)
+        );
         // Persona terms in prose must NOT be suppressed (false-positive guard).
         assert_eq!(
             finalize_dialog_reply("Моя кастомная персона важнее, base_voice не при чём."),
@@ -2610,6 +2704,12 @@ mod tests {
             finalize_dialog_reply(&"а".repeat(30)),
             Suppressed(Pathological(_))
         ));
+        assert_eq!(
+            finalize_dialog_reply(
+                "Ничего не вижу на экране. Ничего не вижу на экране. Ничего не вижу на экране."
+            ),
+            Suppressed(Pathological("repeated phrase".to_owned()))
+        );
 
         // Real replies are untouched — including ones that merely mention
         // "thought" mid-sentence.
@@ -3024,6 +3124,22 @@ mod tests {
             assert_eq!(decision.form, form);
             assert_eq!(decision.outcome, "detected");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn content_parser_preserves_nested_preamble_then_video_tool_order() -> Result<(), ToolParseError>
+    {
+        let raw = "<send_message><text>Так, сейчас гляну, что там за видео</text></send_message><vision_image><file_id>message_1110901_video_1</file_id></vision_image>";
+
+        let (steps, decision) = extract_content_tool_steps(raw)?;
+
+        assert_eq!(decision.outcome, "detected");
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0].step, STEP_SEND_MESSAGE);
+        assert_eq!(steps[0].text, "Так, сейчас гляну, что там за видео");
+        assert_eq!(steps[1].step, STEP_VISION_IMAGE);
+        assert_eq!(steps[1].file_id, "message_1110901_video_1");
         Ok(())
     }
 

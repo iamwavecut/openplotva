@@ -1233,6 +1233,13 @@ fn vision_describe_result(
 ) -> VisionDescribeResult {
     VisionDescribeResult {
         caption,
+        transcript: record
+            .asr_text
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .unwrap_or_default()
+            .to_owned(),
         source: source.to_owned(),
         file_unique_id: record.file_unique_id.clone(),
         history_updated,
@@ -1482,6 +1489,7 @@ mod tests {
             result,
             VisionDescribeResult {
                 caption: "cached cat".to_owned(),
+                transcript: String::new(),
                 source: "cache".to_owned(),
                 file_unique_id: "photo-u".to_owned(),
                 history_updated: false,
@@ -1700,12 +1708,15 @@ mod tests {
             },
             message: DialogMessage {
                 id: 77,
+                text: "Аудиодорожка видео (ASR): добрый вечер".to_owned(),
+                normalized: "Аудиодорожка видео (ASR): добрый вечер".to_owned(),
                 meta: ChatMessageMeta {
                     attachments: vec![ChatAttachment {
                         kind: "video".to_owned(),
                         source: "message".to_owned(),
                         file_unique_id: "video-u".to_owned(),
                         mime_type: "video/mp4".to_owned(),
+                        content: "Аудиодорожка видео (ASR): добрый вечер".to_owned(),
                         ..ChatAttachment::default()
                     }],
                     ..ChatMessageMeta::default()
@@ -1722,6 +1733,15 @@ mod tests {
         assert_eq!(
             input.message.meta.vision_description,
             "message_77_video_1: 00:00 человек входит в комнату"
+        );
+        assert_eq!(input.message.text, "Аудиодорожка видео (ASR): добрый вечер");
+        assert_eq!(
+            input.message.meta.attachments[0].content,
+            "Аудиодорожка видео (ASR): добрый вечер"
+        );
+        assert_eq!(
+            input.message.meta.attachments[0].caption,
+            "00:00 человек входит в комнату"
         );
         assert!(input.multimodal_images.is_empty());
         assert!(data_urls.calls().is_empty());

@@ -31,6 +31,8 @@ pub struct DialogJobWorkerReport {
     /// Queue dequeue failed.
     pub dequeue_error: Option<String>,
     pub decode_error: Option<String>,
+    /// Required canonical dialog context could not be loaded.
+    pub materialization_error: Option<String>,
     /// Provider failure reason classified as retryable by the LLM layer.
     pub retryable_provider_error: Option<String>,
     /// Retryable LLM failure attempt number.

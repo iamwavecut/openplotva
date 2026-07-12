@@ -828,6 +828,8 @@ pub struct VisionDescribeRequest {
 pub struct VisionDescribeResult {
     /// Generated caption.
     pub caption: String,
+    /// Spoken audio transcribed from video media, when available.
+    pub transcript: String,
     /// Caption source label.
     pub source: String,
     /// Telegram file unique ID.
@@ -2585,14 +2587,26 @@ fn scheduled_generation_tool_result(args: GenerationToolResultArgs<'_>) -> ToolR
 }
 
 fn dialog_vision_image_tool_result(result: &VisionDescribeResult) -> ToolResult {
+    let caption = result.caption.trim();
+    let transcript = result.transcript.trim();
+    let message = match (caption.is_empty(), transcript.is_empty()) {
+        (false, false) => {
+            format!("Визуальное описание:\n{caption}\n\nРечь и аудио (ASR):\n{transcript}")
+        }
+        (false, true) => caption.to_owned(),
+        (true, false) => format!("Речь и аудио (ASR):\n{transcript}"),
+        (true, true) => String::new(),
+    };
     ToolResult {
         status: TOOL_RESULT_STATUS_OK.to_owned(),
-        message: result.caption.trim().to_owned(),
+        message,
         no_reply: false,
         side_effect: None,
         data: Some(json!({
             "source": result.source,
             "file_unique_id": result.file_unique_id,
+            "visual_description": result.caption,
+            "transcript": result.transcript,
             "history_updated": result.history_updated,
         })),
         error: None,
@@ -4147,6 +4161,7 @@ mod tests {
     async fn app_dialog_toolbox_formats_vision_result() -> Result<(), ToolboxError> {
         let describer = Arc::new(VisionDescriberStub::successful(VisionDescribeResult {
             caption: "  cat on table  ".to_owned(),
+            transcript: "  hello from video  ".to_owned(),
             source: "vision".to_owned(),
             file_unique_id: "file-unique".to_owned(),
             history_updated: true,
@@ -4170,12 +4185,17 @@ mod tests {
         let result = toolbox.vision_image(request).await?;
 
         assert_eq!(result.status, TOOL_RESULT_STATUS_OK);
-        assert_eq!(result.message, "cat on table");
+        assert_eq!(
+            result.message,
+            "Визуальное описание:\ncat on table\n\nРечь и аудио (ASR):\nhello from video"
+        );
         assert_eq!(
             result.data,
             Some(json!({
                 "source": "vision",
                 "file_unique_id": "file-unique",
+                "visual_description": "  cat on table  ",
+                "transcript": "  hello from video  ",
                 "history_updated": true,
             }))
         );

@@ -7,6 +7,7 @@ use std::{future::Future, pin::Pin, time::Duration};
 
 use openplotva_dialog::DialogInput;
 use openplotva_taskman::{DIALOG_AIFARM_QUEUE_NAME, TEXT_QUEUE_NAME};
+use thiserror::Error;
 use time::Duration as TimeDuration;
 
 mod answer;
@@ -62,5 +63,13 @@ pub type DialogJobReceiptLookupFuture<'a, E> =
 pub type DialogToolCallHistoryFuture<'a, E> =
     Pin<Box<dyn Future<Output = Result<bool, E>> + Send + 'a>>;
 
+/// Required dialog input could not be materialized safely.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum DialogInputMaterializationError {
+    #[error("load canonical chat history: {message}")]
+    History { message: String },
+}
+
 /// Boxed future returned by dialog input materializers.
-pub type DialogInputMaterializerFuture<'a> = Pin<Box<dyn Future<Output = DialogInput> + Send + 'a>>;
+pub type DialogInputMaterializerFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<DialogInput, DialogInputMaterializationError>> + Send + 'a>>;

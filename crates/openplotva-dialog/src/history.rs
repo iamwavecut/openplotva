@@ -471,9 +471,7 @@ pub fn select_history_messages_for_context(
         return selected;
     }
 
-    let filtered =
-        filter_history_messages_for_reply_ancestors(turns, trigger_message_id, thread_id);
-    let by_id = index_history_messages_by_id(&filtered);
+    let by_id = index_history_messages_by_id(turns);
     let ancestors =
         collect_history_reply_ancestors(&by_id, trigger_message_id, REPLY_CHAIN_EXTRA_DEPTH);
     if ancestors.is_empty() {
@@ -606,21 +604,6 @@ fn append_missing_history_messages(
         out.push(turn.clone());
     }
     out
-}
-
-fn filter_history_messages_for_reply_ancestors(
-    turns: &[HistoryMessage],
-    trigger_message_id: i32,
-    thread_id: i32,
-) -> Vec<HistoryMessage> {
-    if turns.is_empty() || thread_id == 0 {
-        return turns.to_vec();
-    }
-    turns
-        .iter()
-        .filter(|turn| turn.message_id == trigger_message_id || turn.thread_id == thread_id)
-        .cloned()
-        .collect()
 }
 
 fn index_history_messages_by_id(turns: &[HistoryMessage]) -> HashMap<i32, HistoryMessage> {
@@ -893,6 +876,41 @@ mod tests {
             vec![3, 4]
         );
         assert_eq!(got[0].original_text, "");
+    }
+
+    #[test]
+    fn select_history_messages_for_context_includes_non_topic_reply_root() {
+        let turns = vec![
+            HistoryMessage {
+                message_id: 5,
+                thread_id: 3,
+                text: "trigger".to_owned(),
+                reply_to_id: 3,
+                timestamp: ts(105),
+                ..HistoryMessage::default()
+            },
+            HistoryMessage {
+                message_id: 4,
+                thread_id: 3,
+                text: "recent".to_owned(),
+                timestamp: ts(104),
+                ..HistoryMessage::default()
+            },
+            HistoryMessage {
+                message_id: 3,
+                thread_id: 0,
+                text: "video root".to_owned(),
+                timestamp: ts(103),
+                ..HistoryMessage::default()
+            },
+        ];
+
+        let got = select_history_messages_for_context(&turns, 1, 5, 3);
+
+        assert_eq!(
+            got.iter().map(|turn| turn.message_id).collect::<Vec<_>>(),
+            vec![3, 4]
+        );
     }
 
     #[test]

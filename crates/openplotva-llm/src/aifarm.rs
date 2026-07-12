@@ -22,11 +22,12 @@ use openplotva_dialog::{
     ChatStepOutput, ChatStepRequest, ChatStepToolCall, DEFAULT_CONTEXT_HISTORY_LIMIT, DialogInput,
     DialogTraceArtifacts, DialogTraceError, DialogTraceUsage, HistoryMessage, MESSAGE_KIND_TEXT,
     MESSAGE_KIND_TOOL_REQUEST, MESSAGE_KIND_TOOL_RESPONSE, NativeToolCall, PROVIDER_AIFARM,
-    PROVIDER_NVIDIA, PROVIDER_VMLX, ROLE_MODEL, ROLE_USER, SessionMessage, ToolParseDecision,
-    ToolSpec, ToolStep, ToolsMode, alternative_dialog_tool_names, alternative_dialog_tools,
-    clone_history_messages, decode_plotva_final_response_with_salvage, extract_content_tool_steps,
-    is_dialog_history_noise_tool_call_name, normalize_history_message, parse_native_tool_step,
-    sanitize_tool_text, select_llm_history_messages_for_context, tool_telemetry,
+    PROVIDER_NVIDIA, PROVIDER_VMLX, ROLE_MODEL, ROLE_USER, STEP_SEND_MESSAGE, SessionMessage,
+    ToolParseDecision, ToolSpec, ToolStep, ToolsMode, alternative_dialog_tool_names,
+    alternative_dialog_tools, clone_history_messages, decode_plotva_final_response_with_salvage,
+    extract_content_tool_steps, is_dialog_history_noise_tool_call_name, normalize_history_message,
+    parse_native_tool_step, sanitize_tool_text, select_llm_history_messages_for_context,
+    tool_telemetry,
 };
 use openplotva_history::{
     AIFARM_DEFAULT_HISTORY_SUMMARY_MODEL, HistorySummaryDecodeError, SummaryDocument, SummaryInput,
@@ -4146,9 +4147,35 @@ fn first_choice_tool_steps(response: &Value) -> Result<ToolStepSelection, Comple
             serde_json::from_value::<Vec<NativeToolCall>>(tool_calls.clone()).map_err(|err| {
                 tool_protocol_completion_error(format!("decode native tool calls: {err}"))
             })?;
-        let mut steps = Vec::with_capacity(calls.len());
+        let content = message
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let (content_steps, _) = extract_content_tool_steps(content)
+            .map_err(|err| tool_protocol_completion_error(err.to_string()))?;
+        let mut steps = Vec::with_capacity(calls.len() + content_steps.len());
+        for step in content_steps
+            .into_iter()
+            .filter(|step| step.step == STEP_SEND_MESSAGE)
+        {
+            steps.push(PendingToolStep {
+                decision: ToolParseDecision {
+                    form: "content_preamble".to_owned(),
+                    tool: step.step.clone(),
+                    outcome: "detected".to_owned(),
+                    reason: String::new(),
+                },
+                step,
+                native_ref: None,
+            });
+        }
+        let mut seen_ids = std::collections::BTreeSet::new();
         for call in calls {
-            let native_ref = Some(call.id.clone());
+            let native_ref = if call.id.trim().is_empty() || !seen_ids.insert(call.id.clone()) {
+                Some(String::new())
+            } else {
+                Some(call.id.clone())
+            };
             let decision = native_tool_parse_decision(std::slice::from_ref(&call), None);
             let step = parse_native_tool_step(&[call])
                 .map_err(|err| tool_protocol_completion_error(err.to_string()))?;
@@ -4261,6 +4288,11 @@ fn final_answer_error_from_suppression(
 
 fn first_choice_content(response: &Value) -> Result<String, AifarmDialogError> {
     let message = first_choice_message_value(response)?;
+    if first_choice_finish_reason(response).eq_ignore_ascii_case("length") {
+        return Err(AifarmDialogError::ReasoningBudgetExhausted {
+            reasoning_chars: first_choice_reasoning_len(message),
+        });
+    }
     let content = message
         .get("content")
         .and_then(Value::as_str)
@@ -4272,7 +4304,7 @@ fn first_choice_content(response: &Value) -> Result<String, AifarmDialogError> {
         // reasoning-only completion is a budget problem, not a protocol one:
         // classify it so retries reselect a backend with headroom.
         let reasoning_chars = first_choice_reasoning_len(message);
-        if reasoning_chars > 0 || first_choice_finish_reason(response) == "length" {
+        if reasoning_chars > 0 {
             return Err(AifarmDialogError::ReasoningBudgetExhausted { reasoning_chars });
         }
         return Err(AifarmDialogError::Response(
@@ -8321,6 +8353,51 @@ mod tests {
             output.text, "",
             "salvaged session tool markup must not leak into the chat text"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn chat_step_salvages_production_nested_video_preamble_sequence()
+    -> Result<(), CompletionError> {
+        let (provider, _transport, _) = direct_dialog_provider(
+            json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "<send_message><text>Так, сейчас гляну, что там за видео</text></send_message><vision_image><file_id>message_1110901_video_1</file_id></vision_image>"
+                    }
+                }]
+            }),
+            AifarmDialogConfig::default(),
+        );
+        let output = crate::ChatStepProvider::run_chat_step(
+            &provider,
+            openplotva_dialog::ChatStepRequest {
+                input: base_input(),
+                transcript: Vec::new(),
+                tools: openplotva_dialog::ToolsMode::Native(
+                    openplotva_dialog::chat_completion_tools_for_specs(&[
+                        SESSION_SEND_MESSAGE_SPEC,
+                        alternative_dialog_tools()
+                            .into_iter()
+                            .find(|tool| tool.name == STEP_VISION_IMAGE)
+                            .expect("vision tool"),
+                    ])
+                    .into_iter()
+                    .map(serde_json::to_value)
+                    .collect::<Result<Vec<_>, _>>()
+                    .expect("tool defs"),
+                ),
+                iteration: 1,
+            },
+        )
+        .await?;
+
+        assert_eq!(output.text, "");
+        assert_eq!(output.tool_calls.len(), 2);
+        assert_eq!(output.tool_calls[0].step.step, STEP_SEND_MESSAGE);
+        assert_eq!(output.tool_calls[1].step.step, STEP_VISION_IMAGE);
+        assert!(output.tool_calls.iter().all(|call| call.salvaged));
         Ok(())
     }
 
