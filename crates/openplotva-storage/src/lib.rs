@@ -54,8 +54,8 @@ pub use telegram_outbox::{
     OUTBOX_OPERATION_BINDS_PER_ROW, PostgresTelegramOutboxStore, QueuedTelegramOutboxBatch,
     QueuedTelegramOutboxPart, TelegramDeliveryPolicy, TelegramOutboxAttempt,
     TelegramOutboxBatchInput, TelegramOutboxBlobInput, TelegramOutboxItem, TelegramOutboxPartInput,
-    TelegramOutboxRecoveryReport, TelegramOutboxStats, deterministic_telegram_operation_id,
-    enqueue_telegram_outbox_batch,
+    TelegramOutboxRecoveryReport, TelegramOutboxStats, TelegramReceiptHistoryEntry,
+    deterministic_telegram_operation_id, enqueue_telegram_outbox_batch,
 };
 
 /// Human-readable crate purpose used by scaffold tests and docs.
