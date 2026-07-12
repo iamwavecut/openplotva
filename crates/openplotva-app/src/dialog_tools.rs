@@ -830,6 +830,10 @@ pub struct VisionDescribeResult {
     pub caption: String,
     /// Spoken audio transcribed from video media, when available.
     pub transcript: String,
+    /// ASR failure or incomplete status for video media.
+    pub transcript_error: String,
+    /// Resolved Telegram media kind.
+    pub media_kind: String,
     /// Caption source label.
     pub source: String,
     /// Telegram file unique ID.
@@ -2334,11 +2338,11 @@ where
         })
     }
 
-    fn vision_image<'a>(&'a self, req: VisionRequest) -> ToolboxFuture<'a> {
+    fn understand_media<'a>(&'a self, req: VisionRequest) -> ToolboxFuture<'a> {
         Box::pin(async move {
             let Some(describer) = self.vision_describer.as_deref() else {
                 return Ok(ToolResult::failed(
-                    "vision_image_unavailable",
+                    "understand_media_unavailable",
                     "vision service unavailable",
                 ));
             };
@@ -2350,8 +2354,11 @@ where
                 message_meta: req.context.message_meta,
             };
             match describer.describe_image(request).await {
-                Ok(result) => Ok(dialog_vision_image_tool_result(&result)),
-                Err(error) => Ok(ToolResult::failed("vision_image_failed", error.to_string())),
+                Ok(result) => Ok(dialog_understand_media_tool_result(&result)),
+                Err(error) => Ok(ToolResult::failed(
+                    "understand_media_failed",
+                    error.to_string(),
+                )),
             }
         })
     }
@@ -2586,10 +2593,10 @@ fn scheduled_generation_tool_result(args: GenerationToolResultArgs<'_>) -> ToolR
     }
 }
 
-fn dialog_vision_image_tool_result(result: &VisionDescribeResult) -> ToolResult {
+fn dialog_understand_media_tool_result(result: &VisionDescribeResult) -> ToolResult {
     let caption = result.caption.trim();
     let transcript = result.transcript.trim();
-    let message = match (caption.is_empty(), transcript.is_empty()) {
+    let mut message = match (caption.is_empty(), transcript.is_empty()) {
         (false, false) => {
             format!("Визуальное описание:\n{caption}\n\nРечь и аудио (ASR):\n{transcript}")
         }
@@ -2597,8 +2604,20 @@ fn dialog_vision_image_tool_result(result: &VisionDescribeResult) -> ToolResult 
         (true, false) => format!("Речь и аудио (ASR):\n{transcript}"),
         (true, true) => String::new(),
     };
+    let transcript_error = result.transcript_error.trim();
+    if !transcript_error.is_empty() {
+        if !message.is_empty() {
+            message.push_str("\n\n");
+        }
+        message.push_str("Речь и аудио не распознаны: ");
+        message.push_str(transcript_error);
+    }
     ToolResult {
-        status: TOOL_RESULT_STATUS_OK.to_owned(),
+        status: if transcript_error.is_empty() {
+            TOOL_RESULT_STATUS_OK.to_owned()
+        } else {
+            TOOL_RESULT_STATUS_FAILED.to_owned()
+        },
         message,
         no_reply: false,
         side_effect: None,
@@ -2607,9 +2626,15 @@ fn dialog_vision_image_tool_result(result: &VisionDescribeResult) -> ToolResult 
             "file_unique_id": result.file_unique_id,
             "visual_description": result.caption,
             "transcript": result.transcript,
+            "transcript_error": result.transcript_error,
+            "media_kind": result.media_kind,
             "history_updated": result.history_updated,
         })),
-        error: None,
+        error: (!transcript_error.is_empty()).then(|| ToolError {
+            code: "understand_media_asr_incomplete".to_owned(),
+            reason: transcript_error.to_owned(),
+            retryable: true,
+        }),
     }
 }
 
@@ -4162,6 +4187,8 @@ mod tests {
         let describer = Arc::new(VisionDescriberStub::successful(VisionDescribeResult {
             caption: "  cat on table  ".to_owned(),
             transcript: "  hello from video  ".to_owned(),
+            transcript_error: String::new(),
+            media_kind: "video".to_owned(),
             source: "vision".to_owned(),
             file_unique_id: "file-unique".to_owned(),
             history_updated: true,
@@ -4182,7 +4209,7 @@ mod tests {
         }))
         .with_vision_describer(describer.clone());
 
-        let result = toolbox.vision_image(request).await?;
+        let result = toolbox.understand_media(request).await?;
 
         assert_eq!(result.status, TOOL_RESULT_STATUS_OK);
         assert_eq!(
@@ -4196,6 +4223,8 @@ mod tests {
                 "file_unique_id": "file-unique",
                 "visual_description": "  cat on table  ",
                 "transcript": "  hello from video  ",
+                "transcript_error": "",
+                "media_kind": "video",
                 "history_updated": true,
             }))
         );
@@ -4208,6 +4237,39 @@ mod tests {
                 thread_id: Some(7),
                 message_meta: meta,
             }]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn app_dialog_toolbox_reports_partial_video_analysis() -> Result<(), ToolboxError> {
+        let describer = Arc::new(VisionDescriberStub::successful(VisionDescribeResult {
+            caption: "person enters a room".to_owned(),
+            transcript: String::new(),
+            transcript_error: "Telegram file is too big".to_owned(),
+            media_kind: "video".to_owned(),
+            source: "vision".to_owned(),
+            file_unique_id: "video-unique".to_owned(),
+            history_updated: true,
+        }));
+        let toolbox = toolbox(Some(TranslatorStub {
+            result: Ok("ignored".to_owned()),
+        }))
+        .with_vision_describer(describer);
+
+        let result = toolbox
+            .understand_media(VisionRequest {
+                context: context(),
+                file_id: "message_11_video_1".to_owned(),
+            })
+            .await?;
+
+        assert_eq!(result.status, TOOL_RESULT_STATUS_FAILED);
+        assert!(result.message.contains("person enters a room"));
+        assert!(result.message.contains("Telegram file is too big"));
+        assert_eq!(
+            result.error.as_ref().map(|error| error.code.as_str()),
+            Some("understand_media_asr_incomplete")
         );
         Ok(())
     }
@@ -4382,7 +4444,7 @@ mod tests {
             result: Ok("ignored".to_owned()),
         }))
         .with_vision_describer(Arc::new(VisionDescriberStub::failed("vision down")))
-        .vision_image(VisionRequest {
+        .understand_media(VisionRequest {
             context: context(),
             file_id: "file".to_owned(),
         })
@@ -4393,7 +4455,7 @@ mod tests {
         assert_eq!(
             vision_result.error,
             Some(ToolError {
-                code: "vision_image_failed".to_owned(),
+                code: "understand_media_failed".to_owned(),
                 reason: "vision down".to_owned(),
                 retryable: true,
             })

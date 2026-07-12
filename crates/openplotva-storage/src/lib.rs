@@ -829,7 +829,7 @@ pub const SQL_SELECT_RECENT_CHAT_HISTORY_ENTRY_PAYLOADS: &str = "SELECT payload:
 
 pub const SQL_SELECT_RECENT_THREAD_HISTORY_ENTRY_PAYLOADS: &str = "SELECT payload::text AS payload FROM chat_history_entries WHERE chat_id = $1 AND thread_id = $2 AND occurred_at > $3 ORDER BY occurred_at DESC, message_id DESC, CASE kind WHEN 'text' THEN 1 WHEN 'tool_request' THEN 2 WHEN 'tool_response' THEN 3 ELSE 4 END DESC, entry_id DESC LIMIT $4";
 
-pub const SQL_SELECT_CHAT_HISTORY_MESSAGE_PAYLOADS: &str = "SELECT payload::text AS payload FROM chat_history_entries WHERE chat_id = $1 AND message_id = $2 ORDER BY CASE kind WHEN 'text' THEN 1 WHEN 'tool_request' THEN 2 WHEN 'tool_response' THEN 3 ELSE 4 END ASC, entry_id ASC";
+pub const SQL_SELECT_CHAT_HISTORY_MESSAGE_PAYLOADS: &str = "SELECT payload::text AS payload FROM chat_history_entries WHERE chat_id = $1 AND message_id = $2 AND occurred_at > $3 AND ($4::integer = 0 OR thread_id <> $4 OR occurred_at > $5) ORDER BY CASE kind WHEN 'text' THEN 1 WHEN 'tool_request' THEN 2 WHEN 'tool_response' THEN 3 ELSE 4 END ASC, entry_id ASC";
 
 /// Keyword (ILIKE) search over a chat's recent text history. Scoped by chat and
 /// optional thread; bounded by a time cutoff and a row limit so the scan stays cheap.
@@ -4616,6 +4616,9 @@ impl PostgresHistoryStore {
         &self,
         chat_id: i64,
         message_id: i32,
+        chat_cutoff: OffsetDateTime,
+        thread_id: i32,
+        thread_cutoff: OffsetDateTime,
     ) -> Result<Vec<Vec<u8>>, StorageError> {
         if chat_id == 0 || message_id == 0 {
             return Ok(Vec::new());
@@ -4623,6 +4626,9 @@ impl PostgresHistoryStore {
         let rows = sqlx::query(SQL_SELECT_CHAT_HISTORY_MESSAGE_PAYLOADS)
             .bind(chat_id)
             .bind(message_id)
+            .bind(chat_cutoff)
+            .bind(thread_id)
+            .bind(thread_cutoff)
             .fetch_all(&self.pool)
             .await?;
         summary_payload_rows_to_bytes(rows)
@@ -11930,6 +11936,36 @@ mod tests {
                 .await?;
             assert!(wrong_sender_payloads.is_empty());
 
+            assert_eq!(
+                store
+                    .history_message_payloads(chat_id, message_id, range_start, 77, range_start)
+                    .await?
+                    .len(),
+                1
+            );
+            assert!(
+                store
+                    .history_message_payloads(chat_id, message_id, range_end, 77, range_start)
+                    .await?
+                    .is_empty(),
+                "global reset/TTL cutoff must exclude reply ancestors"
+            );
+            assert!(
+                store
+                    .history_message_payloads(chat_id, message_id, range_start, 77, range_end)
+                    .await?
+                    .is_empty(),
+                "thread reset cutoff must exclude ancestors in the active thread"
+            );
+            assert_eq!(
+                store
+                    .history_message_payloads(chat_id, message_id, range_start, 78, range_end)
+                    .await?
+                    .len(),
+                1,
+                "a reset in another topic must not hide the explicit ancestor"
+            );
+
             assert!(store
                 .update_text_entry(chat_id, message_id, "new text")
                 .await?);
@@ -12164,8 +12200,8 @@ mod tests {
         let store = super::PostgresHistoryStore::new(pool.clone());
         let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
         let chat_id = -9_001_333_444_555_i64 - i64::try_from(suffix % 1_000_000)?;
-        let start = time::OffsetDateTime::from_unix_timestamp(1_800_000_000)?;
-        let end = start + time::Duration::minutes(15);
+        let end = time::OffsetDateTime::now_utc();
+        let start = end - time::Duration::minutes(15);
         let event_at = start + time::Duration::minutes(5);
         let event_at_text = event_at.format(&time::format_description::well_known::Rfc3339)?;
         let input = openplotva_history::SummaryInput {

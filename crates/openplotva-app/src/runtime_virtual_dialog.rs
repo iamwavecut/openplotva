@@ -595,8 +595,8 @@ impl DialogToolbox for RuntimeVirtualSafeToolbox {
         })
     }
 
-    fn vision_image<'a>(&'a self, req: VisionRequest) -> ToolboxFuture<'a> {
-        self.inner.vision_image(req)
+    fn understand_media<'a>(&'a self, req: VisionRequest) -> ToolboxFuture<'a> {
+        self.inner.understand_media(req)
     }
 
     fn web_search<'a>(&'a self, query: String) -> ToolboxFuture<'a> {

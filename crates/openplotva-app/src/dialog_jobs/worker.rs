@@ -367,7 +367,7 @@ where
             now: options.now,
             routing_events: options.routing_events,
             session: options.session.turn_config(),
-            session_inbox,
+            session_inbox: session_inbox.clone(),
             llm_runs: options.llm_runs,
         },
         queue,
@@ -377,7 +377,7 @@ where
         tool_history,
         &mut report,
     );
-    let resolution = openplotva_llm::with_run_scope(
+    let mut resolution = openplotva_llm::with_run_scope(
         openplotva_llm::LlmRunScope {
             run_id,
             run_kind: "dialog".to_owned(),
@@ -385,6 +385,27 @@ where
         turn,
     )
     .await;
+    let retry_with_consumed_injected = session_inbox.as_ref().is_some_and(|inbox| {
+        inbox.has_consumed()
+            && matches!(
+                resolution.disposition,
+                crate::dialog_turn::JobDisposition::Requeue(_)
+            )
+    });
+    if retry_with_consumed_injected {
+        resolution = crate::dialog_turn::TurnResolution {
+            outcome: crate::dialog_turn::TurnOutcome::NoReplyIntentional {
+                reason: "injected_followup_retry",
+            },
+            disposition: crate::dialog_turn::JobDisposition::Complete,
+        };
+    }
+    let commit_consumed_injected = !retry_with_consumed_injected
+        && matches!(
+            resolution.disposition,
+            crate::dialog_turn::JobDisposition::Complete
+                | crate::dialog_turn::JobDisposition::WaitForDelivery
+        );
     if let Some(guard) = activity_guard.as_ref() {
         report.activity = guard.snapshot();
     }
@@ -410,7 +431,7 @@ where
     // the session left behind gets its own turn now.
     if session_claimed {
         let registry = session_registry.as_ref();
-        let release = registry.release(session_key, item.id);
+        let release = registry.release(session_key, item.id, commit_consumed_injected);
         if let Some(newest) = release.leftover_injected.last() {
             // Older leftovers are already persisted chat history and will
             // materialize as context for this follow-up.

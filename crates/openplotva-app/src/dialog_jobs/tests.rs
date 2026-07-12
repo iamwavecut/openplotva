@@ -2859,6 +2859,30 @@ struct MaterializerStub {
     history: Vec<HistoryMessage>,
 }
 
+#[derive(Clone, Default)]
+struct FailingInjectedMaterializer {
+    calls: Arc<Mutex<usize>>,
+}
+
+impl DialogInputMaterializer for FailingInjectedMaterializer {
+    fn materialize_dialog_input<'a>(
+        &'a self,
+        params: &'a DialogJobParams,
+        now: OffsetDateTime,
+    ) -> DialogInputMaterializerFuture<'a> {
+        Box::pin(async move {
+            let mut calls = self.calls.lock().expect("materializer calls");
+            *calls += 1;
+            if *calls > 1 {
+                return Err(DialogInputMaterializationError::History {
+                    message: "temporary history failure".to_owned(),
+                });
+            }
+            Ok(dialog_input_from_job_params_at(params, now))
+        })
+    }
+}
+
 impl MaterializerStub {
     fn with_history(history: Vec<HistoryMessage>) -> Self {
         Self { history }
@@ -4420,7 +4444,7 @@ async fn busy_session_absorbs_initiator_and_defers_third_party() -> Result<(), B
         "absorbed/deferred jobs must not start an independent activity pulse"
     );
 
-    let release = registry.release(key, 999);
+    let release = registry.release(key, 999, true);
     assert_eq!(release.parked.len(), 1);
     let rows = ledger_rows(&outcomes);
     assert_eq!(rows[0].outcome, "deferred_after_session");
@@ -4489,7 +4513,8 @@ async fn injected_message_reaches_the_next_iteration_and_leftovers_respawn()
     .await;
 
     assert!(report.sent_answer, "{report:?}");
-    // The first injected message rendered as a user turn before iteration 2.
+    // The first injected message is the rematerialized current input and is
+    // not repeated in the session transcript.
     let requests = provider.requests();
     let injected = requests[1]
         .transcript
@@ -4499,8 +4524,7 @@ async fn injected_message_reaches_the_next_iteration_and_leftovers_respawn()
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(injected.len(), 1, "{:?}", requests[1].transcript);
-    assert!(injected[0].contains("кстати умножь на два"));
+    assert!(injected.is_empty(), "{:?}", requests[1].transcript);
     assert_eq!(
         requests[1].input.message.text, "кстати умножь на два",
         "the newest injected message is fully rematerialized"
@@ -4519,5 +4543,73 @@ async fn injected_message_reaches_the_next_iteration_and_leftovers_respawn()
         .find(|record| Some(record.id) == report.followup_respawned)
         .expect("follow-up job");
     assert_eq!(follow_up.status, JobStatus::Pending);
+    Ok(())
+}
+
+#[tokio::test]
+async fn injected_materialization_failure_respawns_consumed_message() -> Result<(), Box<dyn Error>>
+{
+    let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+    let registry = Arc::new(crate::dialog_turn::DialogSessionRegistry::new());
+    let key = crate::dialog_turn::SessionKey::new(42, Some(9));
+    let wiring = wiring_with_registry(Arc::clone(&registry));
+    let queue = InMemoryTaskQueue::new();
+    let job_id = queue.assign(
+        DIALOG_AIFARM_QUEUE_NAME,
+        new_dialog_job_at(params_from(7, "first"), now),
+    );
+    let inject_registry = Arc::clone(&registry);
+    let provider = StepProviderStub::with_steps(vec![Ok(step_tools(
+        "",
+        vec![(
+            "c1",
+            openplotva_dialog::ToolStep {
+                step: openplotva_dialog::STEP_WEB_SEARCH.to_owned(),
+                query: "first".to_owned(),
+                ..openplotva_dialog::ToolStep::default()
+            },
+        )],
+    ))])
+    .with_on_call(Box::new(move |_| {
+        assert!(inject_registry.inject(
+            key,
+            job_id,
+            crate::dialog_turn::InjectedMessage {
+                params: params_from(7, "must survive"),
+            },
+        ));
+    }));
+    let effects = EffectsStub::default();
+    let outcomes = crate::dialog_turn::DialogTurnObserver::new(
+        crate::dialog_turn::RuntimeTurnOutcomeBuffer::new(8),
+        None,
+    );
+
+    let report = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+        &queue,
+        &provider,
+        &effects,
+        &FailingInjectedMaterializer::default(),
+        &NoopDialogToolCallHistoryStore,
+        session_options(now, &outcomes, &wiring),
+    )
+    .await;
+
+    assert!(report.failed, "{report:?}");
+    let follow_up_id = report.followup_respawned.expect("follow-up job");
+    let follow_up = queue
+        .records()
+        .into_iter()
+        .find(|record| record.id == follow_up_id)
+        .expect("follow-up record");
+    assert_eq!(
+        follow_up
+            .job
+            .data
+            .dialog_data
+            .expect("dialog params")
+            .message_text,
+        "must survive"
+    );
     Ok(())
 }

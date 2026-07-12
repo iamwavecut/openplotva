@@ -68,6 +68,7 @@ pub fn vision_attachment_file_id_candidates(
             image.index,
             &image.source,
             image.source_index,
+            &image.media_kind,
         ) {
             return vec![image.file_unique_id.clone()];
         }
@@ -212,6 +213,7 @@ struct IndexedVisionAttachment {
     index: usize,
     source_index: usize,
     source: String,
+    media_kind: String,
     file_unique_id: String,
 }
 
@@ -244,6 +246,7 @@ fn indexed_vision_attachments(meta: &ChatMessageMeta) -> Vec<IndexedVisionAttach
             index: images.len() + 1,
             source_index,
             source,
+            media_kind: attachment.kind.trim().to_lowercase(),
             file_unique_id: file_unique_id.to_owned(),
         });
     }
@@ -274,10 +277,16 @@ fn matches_vision_attachment_alias(
     image_index: usize,
     source: &str,
     source_index: usize,
+    media_kind: &str,
 ) -> bool {
     matches_global_vision_attachment_alias(input, image_index)
-        || matches_message_scoped_vision_attachment_alias(input, message_id, image_index)
-        || matches_source_vision_attachment_alias(input, source, source_index)
+        || matches_message_scoped_vision_attachment_alias(
+            input,
+            message_id,
+            image_index,
+            media_kind,
+        )
+        || matches_source_vision_attachment_alias(input, source, source_index, media_kind)
 }
 
 fn matches_global_vision_attachment_alias(input: &str, image_index: usize) -> bool {
@@ -291,35 +300,56 @@ fn matches_message_scoped_vision_attachment_alias(
     input: &str,
     message_id: i32,
     image_index: usize,
+    media_kind: &str,
 ) -> bool {
     message_id > 0
-        && (matches_message_image_alias(input, "message_", message_id, image_index)
-            || matches_message_image_alias(input, "msg_", message_id, image_index))
+        && (matches_message_media_alias(input, "message_", message_id, media_kind, image_index)
+            || matches_message_media_alias(input, "msg_", message_id, media_kind, image_index))
 }
 
-fn matches_source_vision_attachment_alias(input: &str, source: &str, source_index: usize) -> bool {
+fn matches_source_vision_attachment_alias(
+    input: &str,
+    source: &str,
+    source_index: usize,
+    media_kind: &str,
+) -> bool {
     match source {
         ATTACHMENT_SOURCE_MESSAGE => {
-            matches_message_source_vision_attachment_alias(input, source_index)
+            matches_message_source_vision_attachment_alias(input, source_index, media_kind)
         }
         ATTACHMENT_SOURCE_QUOTED => {
-            matches_quoted_source_vision_attachment_alias(input, source_index)
+            matches_quoted_source_vision_attachment_alias(input, source_index, media_kind)
         }
         _ => false,
     }
 }
 
-fn matches_message_source_vision_attachment_alias(input: &str, source_index: usize) -> bool {
+fn matches_message_source_vision_attachment_alias(
+    input: &str,
+    source_index: usize,
+    media_kind: &str,
+) -> bool {
     matches_indexed_alias(input, "message_image_", source_index)
         || matches_indexed_alias(input, "current_image_", source_index)
+        || matches_indexed_alias(input, &format!("message_{media_kind}_"), source_index)
+        || matches_indexed_alias(input, &format!("current_{media_kind}_"), source_index)
         || source_index == 1
             && (input.eq_ignore_ascii_case("message_image")
-                || input.eq_ignore_ascii_case("current_image"))
+                || input.eq_ignore_ascii_case("current_image")
+                || input.eq_ignore_ascii_case(&format!("message_{media_kind}"))
+                || input.eq_ignore_ascii_case(&format!("current_{media_kind}")))
 }
 
-fn matches_quoted_source_vision_attachment_alias(input: &str, source_index: usize) -> bool {
+fn matches_quoted_source_vision_attachment_alias(
+    input: &str,
+    source_index: usize,
+    media_kind: &str,
+) -> bool {
     matches_indexed_alias(input, "quoted_image_", source_index)
-        || source_index == 1 && input.eq_ignore_ascii_case("quoted_image")
+        || matches_indexed_alias(input, &format!("quoted_{media_kind}_"), source_index)
+        || source_index == 1
+            && (input.eq_ignore_ascii_case("quoted_image")
+                || input.eq_ignore_ascii_case(&format!("quoted_{media_kind}")))
 }
 
 fn matches_indexed_alias(input: &str, prefix: &str, want: usize) -> bool {
@@ -329,17 +359,19 @@ fn matches_indexed_alias(input: &str, prefix: &str, want: usize) -> bool {
     parse_positive_usize(&input[prefix.len()..]).is_some_and(|got| got == want)
 }
 
-fn matches_message_image_alias(
+fn matches_message_media_alias(
     input: &str,
     prefix: &str,
     message_id: i32,
+    media_kind: &str,
     image_index: usize,
 ) -> bool {
     if !has_prefix_fold(input, prefix) {
         return false;
     }
     let rest = &input[prefix.len()..];
-    let Some((message_part, image_part)) = rest.split_once("_image_") else {
+    let separator = format!("_{media_kind}_");
+    let Some((message_part, image_part)) = rest.split_once(&separator) else {
         return false;
     };
     parse_positive_i32(message_part).is_some_and(|got| got == message_id)
@@ -559,6 +591,24 @@ mod tests {
         assert_eq!(
             vision_attachment_file_id_candidates("", 42, &meta),
             vec!["only-image"]
+        );
+    }
+
+    #[test]
+    fn vision_attachment_file_id_candidates_resolve_video_handle() {
+        let meta = ChatMessageMeta {
+            attachments: vec![ChatAttachment {
+                kind: "video".to_owned(),
+                source: "message".to_owned(),
+                file_unique_id: "video-only".to_owned(),
+                ..ChatAttachment::default()
+            }],
+            ..ChatMessageMeta::default()
+        };
+
+        assert_eq!(
+            vision_attachment_file_id_candidates("message_42_video_1", 42, &meta),
+            vec!["video-only"]
         );
     }
 

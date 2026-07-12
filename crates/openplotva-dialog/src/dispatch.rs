@@ -10,7 +10,7 @@ use crate::{
     DialogToolbox, DrawRequest, HistorySearchRequest, HistorySummaryRequest, RatesRequest,
     STEP_CANCEL_DRAWING, STEP_CHAT_HISTORY_SUMMARY, STEP_CRAWL_URL, STEP_CURRENCY_RATES,
     STEP_DRAW_IMAGE, STEP_GENERATE_SONG, STEP_HISTORY_SEARCH, STEP_QUEUE_STATUS,
-    STEP_TRANSLATE_TEXT, STEP_VISION_IMAGE, STEP_WEB_SEARCH, STEP_YOUTUBE_SUMMARY, SongRequest,
+    STEP_TRANSLATE_TEXT, STEP_UNDERSTAND_MEDIA, STEP_WEB_SEARCH, STEP_YOUTUBE_SUMMARY, SongRequest,
     ToolContext, ToolResult, ToolStep, ToolboxError, VisionRequest,
 };
 
@@ -52,15 +52,15 @@ pub async fn dispatch_dialog_tool(
                 })
                 .await
         }
-        STEP_VISION_IMAGE => {
+        STEP_UNDERSTAND_MEDIA => {
             let Some(file_id) = vision_tool_file_id(&step.file_id, meta) else {
                 return Ok(ToolResult::failed(
-                    "vision_image_file_empty",
-                    "tool protocol error: vision_image file_id is empty",
+                    "understand_media_file_empty",
+                    "tool protocol error: understand_media file_id is empty",
                 ));
             };
             toolbox
-                .vision_image(VisionRequest {
+                .understand_media(VisionRequest {
                     context: meta.clone(),
                     file_id,
                 })

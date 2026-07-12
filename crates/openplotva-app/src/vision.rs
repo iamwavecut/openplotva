@@ -1,11 +1,12 @@
 //! App-level Telegram vision caption service.
 
-use std::{fmt, future::Future, io::Cursor, pin::Pin, time::Duration};
+use std::{fmt, future::Future, io::Cursor, pin::Pin, sync::Arc, time::Duration};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use futures_util::StreamExt;
 use image::{GenericImageView, ImageFormat, ImageReader, imageops::FilterType};
 use openplotva_config::AppConfig;
+use openplotva_core::ChatAttachment;
 use openplotva_dialog::{DialogInput, MultimodalImage, ToolboxError};
 use openplotva_llm::aifarm::{
     AifarmClientConfig, AifarmHttpClient, AifarmHttpTransport, ChatCompletionRequest,
@@ -13,7 +14,8 @@ use openplotva_llm::aifarm::{
 };
 use openplotva_llm::retry::{FailureReason, retryable_reason_from_message};
 use openplotva_storage::{
-    PostgresHistoryStore, PostgresTelegramFileStore, TELEGRAM_FILE_VISION_REQUEST_TIMEOUT,
+    PostgresHistoryStore, PostgresTelegramFileStore, TELEGRAM_FILE_ASR_STATUS_COMPLETED,
+    TELEGRAM_FILE_ASR_STATUS_FAILED, TELEGRAM_FILE_VISION_REQUEST_TIMEOUT,
     TELEGRAM_FILE_VISION_STATUS_COMPLETED, TELEGRAM_FILE_VISION_STATUS_FAILED,
     TELEGRAM_FILE_VISION_STATUS_PROCESSING, TelegramFileRecord, TelegramFileVisionUpdate,
     VisionDescriptionUpdate,
@@ -23,6 +25,7 @@ use thiserror::Error;
 use time::OffsetDateTime;
 
 use crate::{
+    asr::DialogAsrInputMaterializer,
     dialog_context::{
         apply_materialized_dialog_vision_context, select_dialog_vision_candidates,
         update_dialog_vision_attachment_caption, vision_attachment_file_id_candidates,
@@ -727,7 +730,7 @@ impl VisionHistoryStore for PostgresHistoryStore {
     }
 }
 
-/// App-level `vision_image` implementation over Telegram file metadata.
+/// App-level `understand_media` implementation over Telegram file metadata.
 #[derive(Clone, Debug)]
 pub struct TelegramVisionDescriber<Store, Captioner, History = NoopVisionHistoryStore> {
     store: Store,
@@ -1133,6 +1136,96 @@ where
     }
 }
 
+#[derive(Clone)]
+pub struct TelegramMediaDescriber {
+    vision: Arc<dyn VisionDescriber>,
+    asr: Arc<dyn DialogAsrInputMaterializer>,
+    files: PostgresTelegramFileStore,
+}
+
+impl fmt::Debug for TelegramMediaDescriber {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TelegramMediaDescriber")
+            .finish_non_exhaustive()
+    }
+}
+
+impl TelegramMediaDescriber {
+    #[must_use]
+    pub fn new(
+        vision: Arc<dyn VisionDescriber>,
+        asr: Arc<dyn DialogAsrInputMaterializer>,
+        files: PostgresTelegramFileStore,
+    ) -> Self {
+        Self { vision, asr, files }
+    }
+}
+
+impl VisionDescriber for TelegramMediaDescriber {
+    fn describe_image<'a>(&'a self, request: VisionDescribeRequest) -> VisionImageFuture<'a> {
+        Box::pin(async move {
+            let mut result = self.vision.describe_image(request.clone()).await?;
+            let mut attachment = request
+                .message_meta
+                .attachments
+                .iter()
+                .find(|attachment| attachment.file_unique_id == result.file_unique_id)
+                .cloned()
+                .unwrap_or_else(|| ChatAttachment {
+                    kind: result.media_kind.clone(),
+                    source: "message".to_owned(),
+                    file_unique_id: result.file_unique_id.clone(),
+                    ..ChatAttachment::default()
+                });
+            result.media_kind = attachment.kind.trim().to_lowercase();
+            if !matches!(result.media_kind.as_str(), "video" | "video_note") {
+                return Ok(result);
+            }
+
+            attachment.source = "message".to_owned();
+            let mut input = DialogInput::default();
+            input.context.chat_id = request.chat_id;
+            input.context.thread_id = request.thread_id;
+            input.message.id = request.message_id;
+            input.message.meta.attachments = vec![attachment];
+            let _ = self
+                .asr
+                .materialize_dialog_asr_input(input, OffsetDateTime::now_utc())
+                .await;
+
+            match self.files.get_file(&result.file_unique_id).await {
+                Ok(Some(record)) if record.asr_status == TELEGRAM_FILE_ASR_STATUS_COMPLETED => {
+                    result.transcript = record.asr_text.unwrap_or_default().trim().to_owned();
+                    if result.transcript.is_empty() {
+                        result.transcript_error =
+                            "ASR completed without transcript text".to_owned();
+                    }
+                }
+                Ok(Some(record)) if record.asr_status == TELEGRAM_FILE_ASR_STATUS_FAILED => {
+                    result.transcript_error = record
+                        .asr_error
+                        .unwrap_or_else(|| "ASR failed without diagnostic".to_owned());
+                }
+                Ok(Some(record)) => {
+                    result.transcript_error = format!(
+                        "ASR did not complete during media analysis (status={})",
+                        record.asr_status
+                    );
+                }
+                Ok(None) => {
+                    result.transcript_error =
+                        "Telegram media metadata disappeared during ASR".to_owned();
+                }
+                Err(error) => {
+                    result.transcript_error = format!("load ASR result: {error}");
+                }
+            }
+            Ok(result)
+        })
+    }
+}
+
 /// Error returned by the app-level Telegram vision describer.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum VisionDescribeError {
@@ -1240,6 +1333,11 @@ fn vision_describe_result(
             .filter(|text| !text.is_empty())
             .unwrap_or_default()
             .to_owned(),
+        transcript_error: String::new(),
+        media_kind: match record.media_kind.trim().to_lowercase().as_str() {
+            "photo" => "image".to_owned(),
+            kind => kind.to_owned(),
+        },
         source: source.to_owned(),
         file_unique_id: record.file_unique_id.clone(),
         history_updated,
@@ -1252,8 +1350,8 @@ pub fn telegram_vision_data_url_from_bytes(
     if data.is_empty() {
         return Err(TelegramVisionDataUrlBuildError::EmptyImageData);
     }
-    let data = normalize_vision_image(data)?;
-    let mime = telegram_vision_image_mime(&data).unwrap_or("image/jpeg");
+    let data = normalize_understand_media(data)?;
+    let mime = telegram_understand_media_mime(&data).unwrap_or("image/jpeg");
     Ok(format!(
         "data:{mime};base64,{}",
         BASE64_STANDARD.encode(data)
@@ -1293,7 +1391,7 @@ fn vision_media_is_video(media_kind: &str, mime_type: Option<&str>) -> bool {
         .is_some_and(|mime| mime.starts_with("video/"))
 }
 
-fn telegram_vision_image_mime(data: &[u8]) -> Option<&'static str> {
+fn telegram_understand_media_mime(data: &[u8]) -> Option<&'static str> {
     if data.starts_with(&[0xff, 0xd8, 0xff]) {
         return Some("image/jpeg");
     }
@@ -1309,7 +1407,7 @@ fn telegram_vision_image_mime(data: &[u8]) -> Option<&'static str> {
     None
 }
 
-fn normalize_vision_image(data: &[u8]) -> Result<Vec<u8>, TelegramVisionDataUrlBuildError> {
+fn normalize_understand_media(data: &[u8]) -> Result<Vec<u8>, TelegramVisionDataUrlBuildError> {
     let reader = ImageReader::new(Cursor::new(data))
         .with_guessed_format()
         .map_err(|_| TelegramVisionDataUrlBuildError::UnsupportedImageData)?;
@@ -1334,13 +1432,13 @@ fn normalize_vision_image(data: &[u8]) -> Result<Vec<u8>, TelegramVisionDataUrlB
         return Ok(data.to_vec());
     }
     let resized = img.resize_exact(new_width, new_height, FilterType::CatmullRom);
-    encode_normalized_vision_image(&resized, format)
+    encode_normalized_understand_media(&resized, format)
 }
 
 fn normalized_vision_dimensions(width: u32, height: u32) -> (u32, u32) {
     let width = width.max(1);
     let height = height.max(1);
-    if vision_image_fits(width, height) {
+    if understand_media_fits(width, height) {
         return (width, height);
     }
     let scale = (f64::from(VISION_MAX_SIDE) / f64::from(width))
@@ -1352,7 +1450,7 @@ fn normalized_vision_dimensions(width: u32, height: u32) -> (u32, u32) {
     )
 }
 
-fn vision_image_fits(width: u32, height: u32) -> bool {
+fn understand_media_fits(width: u32, height: u32) -> bool {
     width <= VISION_MAX_SIDE
         && height <= VISION_MAX_SIDE
         && u64::from(width) * u64::from(height) <= VISION_MAX_PIXELS
@@ -1369,7 +1467,7 @@ fn clamp_vision_dimension(value: f64) -> u32 {
     }
 }
 
-fn encode_normalized_vision_image(
+fn encode_normalized_understand_media(
     img: &image::DynamicImage,
     format: ImageFormat,
 ) -> Result<Vec<u8>, TelegramVisionDataUrlBuildError> {
@@ -1490,6 +1588,8 @@ mod tests {
             VisionDescribeResult {
                 caption: "cached cat".to_owned(),
                 transcript: String::new(),
+                transcript_error: String::new(),
+                media_kind: "image".to_owned(),
                 source: "cache".to_owned(),
                 file_unique_id: "photo-u".to_owned(),
                 history_updated: false,
@@ -1777,17 +1877,17 @@ mod tests {
     }
 
     #[test]
-    fn telegram_vision_image_mime_accepts_go_registered_signatures() {
-        let jpeg = telegram_vision_image_mime(&[0xff, 0xd8, 0xff, 0x00]).expect("jpeg mime");
+    fn telegram_understand_media_mime_accepts_go_registered_signatures() {
+        let jpeg = telegram_understand_media_mime(&[0xff, 0xd8, 0xff, 0x00]).expect("jpeg mime");
         assert_eq!(jpeg, "image/jpeg");
 
-        let png = telegram_vision_image_mime(b"\x89PNG\r\n\x1a\nbody").expect("png mime");
+        let png = telegram_understand_media_mime(b"\x89PNG\r\n\x1a\nbody").expect("png mime");
         assert_eq!(png, "image/png");
 
-        let gif = telegram_vision_image_mime(b"GIF89abody").expect("gif mime");
+        let gif = telegram_understand_media_mime(b"GIF89abody").expect("gif mime");
         assert_eq!(gif, "image/gif");
 
-        let webp = telegram_vision_image_mime(b"RIFF----WEBPbody").expect("webp mime");
+        let webp = telegram_understand_media_mime(b"RIFF----WEBPbody").expect("webp mime");
         assert_eq!(webp, "image/webp");
     }
 

@@ -336,9 +336,9 @@ pub trait DialogToolbox: Send + Sync {
         unsupported_tool_future(STEP_GENERATE_SONG)
     }
 
-    /// Vision image tool.
-    fn vision_image<'a>(&'a self, _req: VisionRequest) -> ToolboxFuture<'a> {
-        unsupported_tool_future(STEP_VISION_IMAGE)
+    /// Understand an image or video attachment.
+    fn understand_media<'a>(&'a self, _req: VisionRequest) -> ToolboxFuture<'a> {
+        unsupported_tool_future(STEP_UNDERSTAND_MEDIA)
     }
 
     /// Web search tool.
@@ -388,7 +388,8 @@ fn unsupported_tool_future<'a>(tool: &'static str) -> ToolboxFuture<'a> {
 
 pub const STEP_DRAW_IMAGE: &str = "draw_image";
 pub const STEP_GENERATE_SONG: &str = "generate_song";
-pub const STEP_VISION_IMAGE: &str = "vision_image";
+pub const STEP_UNDERSTAND_MEDIA: &str = "understand_media";
+const LEGACY_STEP_VISION_IMAGE: &str = "vision_image";
 pub const STEP_CURRENCY_RATES: &str = "currency_rates";
 pub const STEP_WEB_SEARCH: &str = "web_search";
 pub const STEP_CRAWL_URL: &str = "crawl_url";
@@ -412,7 +413,8 @@ pub const STEP_REACT_TO_MESSAGE: &str = "react_to_message";
 const ALL_STEPS: &[&str] = &[
     STEP_DRAW_IMAGE,
     STEP_GENERATE_SONG,
-    STEP_VISION_IMAGE,
+    STEP_UNDERSTAND_MEDIA,
+    LEGACY_STEP_VISION_IMAGE,
     STEP_CURRENCY_RATES,
     STEP_WEB_SEARCH,
     STEP_CRAWL_URL,
@@ -537,7 +539,7 @@ const GENERATE_SONG_ARGS: &[ToolArgSpec] = &[ToolArgSpec {
 const VISION_IMAGE_ARGS: &[ToolArgSpec] = &[ToolArgSpec {
     name: "file_id",
     required: false,
-    description: "Image or video attachment handle from attachments, for example message_123_image_1 or message_123_video_1. Prefer the handle over opaque Telegram file_unique_id values. Omit only when the latest message has exactly one supported media attachment.",
+    description: "Image, animation, video, or video-note attachment handle from the rendered attachments block, for example message_123_image_1 or message_123_video_1. For video media the tool analyzes the visuals and transcribes spoken audio in the same call. Prefer the handle over opaque Telegram file_unique_id values. Omit only when the latest message has exactly one supported media attachment.",
 }];
 
 const CURRENCY_RATES_ARGS: &[ToolArgSpec] = &[ToolArgSpec {
@@ -635,10 +637,10 @@ const ALTERNATIVE_DIALOG_TOOL_CATALOG: &[ToolSpec] = &[
         args: GENERATE_SONG_ARGS,
     },
     ToolSpec {
-        name: STEP_VISION_IMAGE,
-        summary: "Understand an image or video from chat context.",
-        when_to_use: "Use when the latest user message asks what is shown in an image or video, or what is said in attached video media.",
-        result: "Returns the visual description and, for video, the available spoken-audio transcript together.",
+        name: STEP_UNDERSTAND_MEDIA,
+        summary: "Understand visual media and spoken audio from chat context.",
+        when_to_use: "Use when the latest user message asks about an image, animation, video, or video note, including what is shown and what is said.",
+        result: "Returns the visual description and, for video media, the spoken-audio transcript together. If either modality fails, returns an explicit partial-result error instead of silently claiming complete analysis.",
         args: VISION_IMAGE_ARGS,
     },
     ToolSpec {
@@ -2533,6 +2535,9 @@ fn inline_arg_starts_with_known_key(rest: &str) -> bool {
 
 fn normalize_and_validate_step(mut step: ToolStep) -> Result<ToolStep, ToolParseError> {
     step.step = step.step.trim().to_owned();
+    if step.step.eq_ignore_ascii_case(LEGACY_STEP_VISION_IMAGE) {
+        step.step = STEP_UNDERSTAND_MEDIA.to_owned();
+    }
     step.prompt = sanitize_tool_text(&step.prompt);
     step.topic = sanitize_tool_text(&step.topic);
     step.file_id = sanitize_tool_text(&step.file_id);
@@ -2731,7 +2736,7 @@ mod tests {
             vec![
                 STEP_DRAW_IMAGE,
                 STEP_GENERATE_SONG,
-                STEP_VISION_IMAGE,
+                STEP_UNDERSTAND_MEDIA,
                 STEP_CURRENCY_RATES,
                 STEP_WEB_SEARCH,
                 STEP_CRAWL_URL,
@@ -2958,9 +2963,9 @@ mod tests {
                 "bare_start",
             ),
             (
-                "Сначала текст.\n\nvision_image{file_id:\"message_177154_image_1\"}".to_owned(),
+                "Сначала текст.\n\nunderstand_media{file_id:\"message_177154_image_1\"}".to_owned(),
                 ToolStep {
-                    step: STEP_VISION_IMAGE.to_owned(),
+                    step: STEP_UNDERSTAND_MEDIA.to_owned(),
                     file_id: "message_177154_image_1".to_owned(),
                     ..ToolStep::default()
                 },
@@ -3012,18 +3017,18 @@ mod tests {
                 "json",
             ),
             (
-                r#"<tool call="vision_image{file_id: 'message_11989713_image_1'}"/>"#.to_owned(),
+                r#"<tool call="understand_media{file_id: 'message_11989713_image_1'}"/>"#.to_owned(),
                 ToolStep {
-                    step: STEP_VISION_IMAGE.to_owned(),
+                    step: STEP_UNDERSTAND_MEDIA.to_owned(),
                     file_id: "message_11989713_image_1".to_owned(),
                     ..ToolStep::default()
                 },
                 "xmlish",
             ),
             (
-                r#"<tool:vision_image{file_id:"message_177164_image_1"}>"#.to_owned(),
+                r#"<tool:understand_media{file_id:"message_177164_image_1"}>"#.to_owned(),
                 ToolStep {
-                    step: STEP_VISION_IMAGE.to_owned(),
+                    step: STEP_UNDERSTAND_MEDIA.to_owned(),
                     file_id: "message_177164_image_1".to_owned(),
                     ..ToolStep::default()
                 },
@@ -3130,7 +3135,7 @@ mod tests {
     #[test]
     fn content_parser_preserves_nested_preamble_then_video_tool_order() -> Result<(), ToolParseError>
     {
-        let raw = "<send_message><text>Так, сейчас гляну, что там за видео</text></send_message><vision_image><file_id>message_1110901_video_1</file_id></vision_image>";
+        let raw = "<send_message><text>Так, сейчас гляну, что там за видео</text></send_message><understand_media><file_id>message_1110901_video_1</file_id></understand_media>";
 
         let (steps, decision) = extract_content_tool_steps(raw)?;
 
@@ -3138,8 +3143,19 @@ mod tests {
         assert_eq!(steps.len(), 2);
         assert_eq!(steps[0].step, STEP_SEND_MESSAGE);
         assert_eq!(steps[0].text, "Так, сейчас гляну, что там за видео");
-        assert_eq!(steps[1].step, STEP_VISION_IMAGE);
+        assert_eq!(steps[1].step, STEP_UNDERSTAND_MEDIA);
         assert_eq!(steps[1].file_id, "message_1110901_video_1");
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_vision_image_call_canonicalizes_to_understand_media() -> Result<(), ToolParseError> {
+        let (step, decision) = extract_content_tool_step(
+            "<vision_image><file_id>message_1110901_video_1</file_id></vision_image>",
+        )?;
+
+        assert_eq!(decision.outcome, "detected");
+        assert_eq!(step.expect("legacy call").step, STEP_UNDERSTAND_MEDIA);
         Ok(())
     }
 

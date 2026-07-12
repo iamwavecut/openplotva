@@ -5223,9 +5223,9 @@ fn write_attachment_elements(out: &mut String, turn: &HistoryMessage) {
         return;
     }
     out.push_str("  <attachments>\n");
-    let mut image_index = 0;
+    let mut media_index = 0;
     for attachment in &turn.meta.attachments {
-        image_index = write_attachment_element(out, turn.message_id, image_index, attachment);
+        media_index = write_attachment_element(out, turn.message_id, media_index, attachment);
     }
     out.push_str("  </attachments>\n");
 }
@@ -5233,10 +5233,10 @@ fn write_attachment_elements(out: &mut String, turn: &HistoryMessage) {
 fn write_attachment_element(
     out: &mut String,
     message_id: i32,
-    image_index: i32,
+    media_index: i32,
     attachment: &ChatAttachment,
 ) -> i32 {
-    let mut image_index = image_index;
+    let mut media_index = media_index;
     let kind = attachment.kind.trim();
     out.push_str("    <attachment");
     if !kind.is_empty() {
@@ -5246,10 +5246,10 @@ fn write_attachment_element(
         write_string_attr(out, "source", &attachment.source);
     }
     out.push('>');
-    image_index = write_attachment_file_id(
+    media_index = write_attachment_file_id(
         out,
         message_id,
-        image_index,
+        media_index,
         kind,
         &attachment.file_unique_id,
     );
@@ -5257,32 +5257,35 @@ fn write_attachment_element(
         write_inline_text_element(out, "content", &attachment.content);
     }
     out.push_str("</attachment>\n");
-    image_index
+    media_index
 }
 
 fn write_attachment_file_id(
     out: &mut String,
     message_id: i32,
-    image_index: i32,
+    media_index: i32,
     kind: &str,
     file_unique_id: &str,
 ) -> i32 {
     let file_unique_id = file_unique_id.trim();
     if file_unique_id.is_empty() {
-        return image_index;
+        return media_index;
     }
-    if !kind.eq_ignore_ascii_case("image") {
+    if !matches!(
+        kind.to_ascii_lowercase().as_str(),
+        "image" | "video" | "animation" | "video_note"
+    ) {
         write_inline_text_element(out, "file_id", file_unique_id);
-        return image_index;
+        return media_index;
     }
-    let image_index = image_index + 1;
+    let media_index = media_index + 1;
     if message_id > 0 {
         out.push_str("<file_id>");
-        write_vision_attachment_handle(out, message_id, image_index);
+        write_vision_attachment_handle(out, message_id, kind, media_index);
         out.push_str("</file_id>");
     }
     write_inline_text_element(out, "file_unique_id", file_unique_id);
-    image_index
+    media_index
 }
 
 fn fallback_string(value: &str, fallback: &str) -> String {
@@ -5368,11 +5371,13 @@ fn write_inline_text_element(out: &mut String, name: &str, value: &str) {
     out.push('>');
 }
 
-fn write_vision_attachment_handle(out: &mut String, message_id: i32, image_index: i32) {
+fn write_vision_attachment_handle(out: &mut String, message_id: i32, kind: &str, index: i32) {
     out.push_str("message_");
     let _ = write!(out, "{message_id}");
-    out.push_str("_image_");
-    let _ = write!(out, "{image_index}");
+    out.push('_');
+    out.push_str(&kind.trim().to_ascii_lowercase());
+    out.push('_');
+    let _ = write!(out, "{index}");
 }
 
 fn format_timestamp(timestamp: OffsetDateTime) -> String {
@@ -5466,7 +5471,7 @@ mod tests {
         DailyPersona, DialogContext, DialogMessage, DialogUser, DrawRequest, HistorySearchRequest,
         HistorySummaryRequest, Persona, ROLE_TOOL, RatesRequest, SESSION_REACT_TO_MESSAGE_SPEC,
         SESSION_SEND_MESSAGE_SPEC, STEP_CHAT_HISTORY_SUMMARY, STEP_CURRENCY_RATES, STEP_DRAW_IMAGE,
-        STEP_HISTORY_SEARCH, STEP_REACT_TO_MESSAGE, STEP_SEND_MESSAGE, STEP_VISION_IMAGE,
+        STEP_HISTORY_SEARCH, STEP_REACT_TO_MESSAGE, STEP_SEND_MESSAGE, STEP_UNDERSTAND_MEDIA,
         STEP_WEB_SEARCH, TOOL_RESULT_STATUS_OK, ToolResult, VisionRequest,
     };
 
@@ -6628,10 +6633,13 @@ mod tests {
             Box::pin(async move { result })
         }
 
-        fn vision_image<'a>(&'a self, req: VisionRequest) -> openplotva_dialog::ToolboxFuture<'a> {
+        fn understand_media<'a>(
+            &'a self,
+            req: VisionRequest,
+        ) -> openplotva_dialog::ToolboxFuture<'a> {
             let result = {
                 let mut state = self.state();
-                state.calls.push(STEP_VISION_IMAGE.to_owned());
+                state.calls.push(STEP_UNDERSTAND_MEDIA.to_owned());
                 state.vision_requests.push(req);
                 Ok(state.results.pop_front().unwrap_or_else(|| ToolResult {
                     status: TOOL_RESULT_STATUS_OK.to_owned(),
@@ -7830,18 +7838,27 @@ mod tests {
             text: "Что тут?".to_owned(),
             meta: ChatMessageMeta {
                 message_type: "image".to_owned(),
-                attachments: vec![ChatAttachment {
-                    kind: "image".to_owned(),
-                    source: "quoted".to_owned(),
-                    file_unique_id: "AQADnRJrGyADoEt8".to_owned(),
-                    ..ChatAttachment::default()
-                }],
+                attachments: vec![
+                    ChatAttachment {
+                        kind: "image".to_owned(),
+                        source: "quoted".to_owned(),
+                        file_unique_id: "AQADnRJrGyADoEt8".to_owned(),
+                        ..ChatAttachment::default()
+                    },
+                    ChatAttachment {
+                        kind: "video".to_owned(),
+                        source: "message".to_owned(),
+                        file_unique_id: "video-unique".to_owned(),
+                        ..ChatAttachment::default()
+                    },
+                ],
                 ..ChatMessageMeta::default()
             },
             ..HistoryMessage::default()
         });
 
         assert!(body.contains("<file_id>message_11951604_image_1</file_id>"));
+        assert!(body.contains("<file_id>message_11951604_video_2</file_id>"));
         assert!(body.contains("<file_unique_id>AQADnRJrGyADoEt8</file_unique_id>"));
     }
 
@@ -8364,7 +8381,7 @@ mod tests {
                 "choices": [{
                     "message": {
                         "role": "assistant",
-                        "content": "<send_message><text>Так, сейчас гляну, что там за видео</text></send_message><vision_image><file_id>message_1110901_video_1</file_id></vision_image>"
+                        "content": "<send_message><text>Так, сейчас гляну, что там за видео</text></send_message><understand_media><file_id>message_1110901_video_1</file_id></understand_media>"
                     }
                 }]
             }),
@@ -8380,7 +8397,7 @@ mod tests {
                         SESSION_SEND_MESSAGE_SPEC,
                         alternative_dialog_tools()
                             .into_iter()
-                            .find(|tool| tool.name == STEP_VISION_IMAGE)
+                            .find(|tool| tool.name == STEP_UNDERSTAND_MEDIA)
                             .expect("vision tool"),
                     ])
                     .into_iter()
@@ -8396,7 +8413,7 @@ mod tests {
         assert_eq!(output.text, "");
         assert_eq!(output.tool_calls.len(), 2);
         assert_eq!(output.tool_calls[0].step.step, STEP_SEND_MESSAGE);
-        assert_eq!(output.tool_calls[1].step.step, STEP_VISION_IMAGE);
+        assert_eq!(output.tool_calls[1].step.step, STEP_UNDERSTAND_MEDIA);
         assert!(output.tool_calls.iter().all(|call| call.salvaged));
         Ok(())
     }
