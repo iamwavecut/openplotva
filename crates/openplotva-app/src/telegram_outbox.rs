@@ -17,8 +17,9 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use carapax::{api::ExecuteError, types::EditMessageResult};
 use futures_util::{StreamExt, stream};
 use openplotva_storage::{
-    ClaimedTelegramOutboxOperation, PostgresTelegramOutboxStore, TelegramDeliveryPolicy,
-    TelegramOutboxBatchInput, TelegramOutboxPartInput,
+    ClaimedTelegramOutboxOperation, PostgresHistoryStore, PostgresTelegramOutboxStore,
+    TelegramDeliveryPolicy, TelegramOutboxBatchInput, TelegramOutboxPartInput,
+    TelegramReceiptHistoryEntry,
 };
 use openplotva_telegram::{
     OutboundSendErrorClass, RichApiClient, RichApiError, TelegramClient,
@@ -31,6 +32,7 @@ use sqlx::Row;
 use time::OffsetDateTime;
 
 use crate::task_queue::SharedTaskQueueRuntime;
+use openplotva_updates::{build_fetcher_message_context, build_history_text_entry};
 
 pub const TELEGRAM_OUTBOX_WORKER_DEFAULT_CLAIM_LIMIT: usize = 32;
 pub const TELEGRAM_OUTBOX_WORKER_DEFAULT_MAX_ATTEMPTS: i32 = 8;
@@ -222,8 +224,10 @@ pub struct TelegramOutboxWorkerReport {
 /// Shutdown is observed between operations. Once `request_started_at` is
 /// durable, the current network request is allowed to reach a durable outcome;
 /// cancelling it at that point would manufacture an avoidable ambiguity.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_telegram_outbox_worker_until<Transport, Jobs>(
     store: PostgresTelegramOutboxStore,
+    history: PostgresHistoryStore,
     transport: Transport,
     jobs: Jobs,
     worker_id: &str,
@@ -283,6 +287,7 @@ where
                 let transport = &transport;
                 let jobs = &jobs;
                 let config = &config;
+                let history = history.clone();
                 async move {
                     let mut operation_report = TelegramOutboxWorkerReport::default();
                     if operation.bot_id != expected_bot_id {
@@ -315,6 +320,7 @@ where
                     } else {
                         process_claimed_operation(
                             store,
+                            &history,
                             transport,
                             jobs,
                             operation,
@@ -339,6 +345,7 @@ where
 
 async fn process_claimed_operation<Transport, Jobs>(
     store: &PostgresTelegramOutboxStore,
+    history: &PostgresHistoryStore,
     transport: &Transport,
     jobs: &Jobs,
     operation: ClaimedTelegramOutboxOperation,
@@ -407,18 +414,37 @@ async fn process_claimed_operation<Transport, Jobs>(
             report.lease_lost = report.lease_lost.saturating_add(1);
         }
         LeasedExecution::Response(Ok(response)) => {
+            let history_entries = telegram_response_history_entries(&response, operation.bot_id);
             let receipt = telegram_response_receipt(response);
             match store
-                .mark_delivered(
+                .mark_delivered_with_history(
                     operation.id,
                     operation.lease_token,
                     response_kind,
                     &receipt.message_ids,
                     &receipt.value,
+                    &history_entries,
                 )
                 .await
             {
                 Ok(true) => {
+                    let mut invalidated_chats = Vec::new();
+                    for entry in &history_entries {
+                        if invalidated_chats.contains(&entry.chat_id) {
+                            continue;
+                        }
+                        invalidated_chats.push(entry.chat_id);
+                        if let Err(error) =
+                            history.invalidate_chat_history_cache(entry.chat_id).await
+                        {
+                            tracing::warn!(
+                                %error,
+                                chat_id = entry.chat_id,
+                                outbox_id = operation.id,
+                                "Telegram receipt history committed but cache invalidation failed"
+                            );
+                        }
+                    }
                     report.delivered = report.delivered.saturating_add(1);
                     resolve_batch(store, jobs, &operation.batch_id, report).await;
                 }
@@ -652,6 +678,40 @@ fn deterministic_retry_jitter_ms(operation_id: &str) -> u64 {
 struct TelegramReceipt {
     message_ids: Vec<i64>,
     value: Value,
+}
+
+fn telegram_response_history_entries(
+    response: &TelegramOutboundResponse,
+    bot_id: i64,
+) -> Vec<TelegramReceiptHistoryEntry> {
+    let messages: Vec<_> = match response {
+        TelegramOutboundResponse::Message(message) => vec![message.as_ref()],
+        TelegramOutboundResponse::Messages(messages) => messages.iter().collect(),
+        TelegramOutboundResponse::EditMessage(_)
+        | TelegramOutboundResponse::Boolean(_)
+        | TelegramOutboundResponse::SentGuestMessage(_)
+        | TelegramOutboundResponse::String(_) => Vec::new(),
+    };
+    messages
+        .into_iter()
+        .filter_map(|message| {
+            let context = build_fetcher_message_context(message);
+            build_history_text_entry(message, &context.original_text, context.meta, bot_id)
+        })
+        .map(|entry| TelegramReceiptHistoryEntry {
+            bucket_day: entry.occurred_at.date(),
+            chat_id: entry.chat_id,
+            thread_id: entry.thread_id,
+            message_id: entry.message_id,
+            entry_id: entry.entry_id,
+            kind: entry.kind,
+            role: entry.role,
+            occurred_at: entry.occurred_at,
+            sender_id: entry.sender_id,
+            payload: serde_json::from_slice(&entry.payload)
+                .expect("history text entry payload is serialized JSON"),
+        })
+        .collect()
 }
 
 fn telegram_response_receipt(response: TelegramOutboundResponse) -> TelegramReceipt {
@@ -1387,5 +1447,27 @@ mod tests {
 
         assert_eq!(receipt.message_ids, vec![91]);
         assert_eq!(receipt.value["kind"], "message");
+    }
+
+    #[test]
+    fn message_receipt_builds_model_history_from_confirmed_telegram_message() {
+        let message: carapax::types::Message = serde_json::from_value(json!({
+            "message_id": 92,
+            "from": {"id": 7, "is_bot": true, "first_name": "Plotva"},
+            "date": 1,
+            "chat": {"id": 42, "type": "private", "first_name": "Test"},
+            "text": "confirmed text"
+        }))
+        .expect("message");
+        let response = TelegramOutboundResponse::Message(Box::new(message));
+
+        let entries = telegram_response_history_entries(&response, 7);
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].chat_id, 42);
+        assert_eq!(entries[0].message_id, 92);
+        assert_eq!(entries[0].entry_id, "msg:92");
+        assert_eq!(entries[0].role, "model");
+        assert_eq!(entries[0].payload["text"], "confirmed text");
     }
 }

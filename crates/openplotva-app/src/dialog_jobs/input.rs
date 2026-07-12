@@ -34,9 +34,11 @@ use crate::{
 };
 
 use super::{
-    DIALOG_HISTORY_FETCH_LIMIT, DIALOG_HISTORY_TTL, DialogInputMaterializerFuture,
-    DialogToolCallHistoryFuture,
+    DIALOG_HISTORY_FETCH_LIMIT, DIALOG_HISTORY_TTL, DialogInputMaterializationError,
+    DialogInputMaterializerFuture, DialogToolCallHistoryFuture,
 };
+
+const DIALOG_REPLY_CHAIN_DEPTH: usize = 4;
 
 pub trait DialogToolCallHistoryStore {
     /// Error returned by concrete storage.
@@ -56,7 +58,7 @@ pub trait DialogToolCallHistoryStore {
 pub struct NoopDialogToolCallHistoryStore;
 
 pub trait DialogInputMaterializer {
-    /// Materialize one provider input. Errors should be fail-open inside the implementation,
+    /// Materialize one provider input. Canonical history failures are propagated.
     fn materialize_dialog_input<'a>(
         &'a self,
         params: &'a DialogJobParams,
@@ -74,7 +76,7 @@ impl DialogInputMaterializer for BasicDialogInputMaterializer {
         params: &'a DialogJobParams,
         now: OffsetDateTime,
     ) -> DialogInputMaterializerFuture<'a> {
-        Box::pin(async move { dialog_input_from_job_params_at(params, now) })
+        Box::pin(async move { Ok(dialog_input_from_job_params_at(params, now)) })
     }
 }
 
@@ -285,11 +287,15 @@ pub fn dialog_input_from_job_params_at(
 }
 
 impl PostgresDialogInputMaterializer {
-    async fn materialize(&self, params: &DialogJobParams, now: OffsetDateTime) -> DialogInput {
+    async fn materialize(
+        &self,
+        params: &DialogJobParams,
+        now: OffsetDateTime,
+    ) -> Result<DialogInput, DialogInputMaterializationError> {
         let settings = self.load_settings(params.chat_id).await;
         let chat = self.load_chat(params.chat_id).await;
         let user = self.load_user(params.user_id).await;
-        let history = self.load_history(params, now).await;
+        let history = self.load_history(params, now).await?;
         let (reference_context, captured_memories) = self.load_reference_context(params).await;
         let shield_context = self.load_shield_context(params, &history).await;
         let mut input = dialog_input_from_materialized_context(
@@ -309,8 +315,78 @@ impl PostgresDialogInputMaterializer {
         if let Some(vision) = self.vision.as_ref() {
             input = vision.materialize_dialog_vision_input(input, now).await;
         }
+        self.materialize_reply_media(&mut input, now).await;
         input.context_capture = Some(turn_context_artifact(&input, &settings, captured_memories));
-        input
+        Ok(input)
+    }
+
+    async fn materialize_reply_media(&self, input: &mut DialogInput, now: OffsetDateTime) {
+        let mut ancestor_ids = Vec::new();
+        let mut current_id = input.message.reply_to_id;
+        while current_id != 0 && ancestor_ids.len() < DIALOG_REPLY_CHAIN_DEPTH {
+            if ancestor_ids.contains(&current_id) {
+                break;
+            }
+            ancestor_ids.push(current_id);
+            current_id = input
+                .history
+                .iter()
+                .find(|message| message.message_id == current_id)
+                .map(|message| message.reply_to_id)
+                .unwrap_or_default();
+        }
+
+        for message_id in ancestor_ids {
+            let Some(index) = input
+                .history
+                .iter()
+                .position(|message| message.message_id == message_id)
+            else {
+                continue;
+            };
+            if input.history[index].meta.attachments.is_empty() {
+                continue;
+            }
+            let history_message = input.history[index].clone();
+            let history_text = history_message.text;
+            let mut media_input = DialogInput {
+                context: input.context.clone(),
+                user: input.user.clone(),
+                message: DialogMessage {
+                    id: history_message.message_id,
+                    text: history_text.clone(),
+                    normalized: history_text,
+                    original_text: history_message.original_text,
+                    timestamp: history_message.timestamp,
+                    reply_to_id: history_message.reply_to_id,
+                    reply_to_name: history_message.reply_to_name,
+                    meta: history_message.meta,
+                },
+                timestamp: Some(now),
+                ..DialogInput::default()
+            };
+            if let Some(asr) = self.asr.as_ref() {
+                media_input = asr.materialize_dialog_asr_input(media_input, now).await;
+            }
+            if let Some(vision) = self.vision.as_ref() {
+                media_input = vision
+                    .materialize_dialog_vision_input(media_input, now)
+                    .await;
+            }
+            input.history[index].text = media_input.message.text;
+            input.history[index].original_text = media_input.message.original_text;
+            input.history[index].meta = media_input.message.meta;
+            for image in media_input.multimodal_images {
+                if input
+                    .multimodal_images
+                    .iter()
+                    .any(|existing| existing.label == image.label)
+                {
+                    continue;
+                }
+                input.multimodal_images.push(image);
+            }
+        }
     }
 
     async fn load_settings(&self, chat_id: i64) -> ChatSettings {
@@ -381,30 +457,34 @@ impl PostgresDialogInputMaterializer {
         &self,
         params: &DialogJobParams,
         now: OffsetDateTime,
-    ) -> Vec<HistoryMessage> {
+    ) -> Result<Vec<HistoryMessage>, DialogInputMaterializationError> {
         if params.chat_id == 0 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         let thread_id = params.thread_id.unwrap_or_default();
         let chat_reset_at = self
             .history_reset_at(params.chat_id, 0)
             .await
-            .unwrap_or(None)
+            .map_err(|error| DialogInputMaterializationError::History {
+                message: format!("chat {} reset: {error}", params.chat_id),
+            })?
             .unwrap_or(OffsetDateTime::UNIX_EPOCH);
         let thread_reset_at = if thread_id == 0 {
             OffsetDateTime::UNIX_EPOCH
         } else {
             self.history_reset_at(params.chat_id, thread_id)
                 .await
-                .unwrap_or(None)
+                .map_err(|error| DialogInputMaterializationError::History {
+                    message: format!("chat {} thread {thread_id} reset: {error}", params.chat_id),
+                })?
                 .unwrap_or(OffsetDateTime::UNIX_EPOCH)
         };
         let ttl_cutoff = now - DIALOG_HISTORY_TTL;
         let chat_cutoff = max_offset_datetime(ttl_cutoff, chat_reset_at);
         let thread_cutoff = max_offset_datetime(ttl_cutoff, thread_reset_at);
 
-        let chat_payloads = match self
+        let mut chat_payloads = self
             .history
             .recent_chat_history_payloads(
                 params.chat_id,
@@ -414,22 +494,18 @@ impl PostgresDialogInputMaterializer {
                 DIALOG_HISTORY_FETCH_LIMIT,
             )
             .await
-        {
-            Ok(payloads) => payloads,
-            Err(error) => {
-                tracing::debug!(
-                    %error,
-                    chat_id = params.chat_id,
-                    "failed to load chat history payloads for dialog input"
-                );
-                Vec::new()
-            }
-        };
+            .map_err(|error| DialogInputMaterializationError::History {
+                message: format!("chat {} tail: {error}", params.chat_id),
+            })?;
+
+        let reply_payloads = self
+            .load_reply_chain_payloads(params.chat_id, params.message_id)
+            .await?;
+        chat_payloads.extend(reply_payloads);
         let thread_payloads = if thread_id == 0 {
             Vec::new()
         } else {
-            match self
-                .history
+            self.history
                 .recent_thread_history_payloads(
                     params.chat_id,
                     thread_id,
@@ -437,21 +513,46 @@ impl PostgresDialogInputMaterializer {
                     DIALOG_HISTORY_FETCH_LIMIT,
                 )
                 .await
-            {
-                Ok(payloads) => payloads,
-                Err(error) => {
-                    tracing::debug!(
-                        %error,
-                        chat_id = params.chat_id,
-                        thread_id,
-                        "failed to load thread history payloads for dialog input"
-                    );
-                    Vec::new()
-                }
-            }
+                .map_err(|error| DialogInputMaterializationError::History {
+                    message: format!("chat {} thread {thread_id}: {error}", params.chat_id),
+                })?
         };
 
-        merge_dialog_history_payloads(&chat_payloads, &thread_payloads, self.bot.id)
+        Ok(merge_dialog_history_payloads(
+            &chat_payloads,
+            &thread_payloads,
+            self.bot.id,
+        ))
+    }
+
+    async fn load_reply_chain_payloads(
+        &self,
+        chat_id: i64,
+        message_id: i32,
+    ) -> Result<Vec<Vec<u8>>, DialogInputMaterializationError> {
+        let mut payloads = Vec::new();
+        let mut current_id = message_id;
+        let mut seen = HashSet::new();
+        for _ in 0..=DIALOG_REPLY_CHAIN_DEPTH {
+            if current_id == 0 || !seen.insert(current_id) {
+                break;
+            }
+            let current_payloads = self
+                .history
+                .history_message_payloads(chat_id, current_id)
+                .await
+                .map_err(|error| DialogInputMaterializationError::History {
+                    message: format!("chat {chat_id} reply message {current_id}: {error}"),
+                })?;
+            let reply_to_id = current_payloads
+                .iter()
+                .find_map(|payload| history_message_from_payload(payload, self.bot.id))
+                .map(|message| message.reply_to_id)
+                .unwrap_or_default();
+            payloads.extend(current_payloads);
+            current_id = reply_to_id;
+        }
+        Ok(payloads)
     }
 
     async fn load_reference_context(

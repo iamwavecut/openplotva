@@ -498,6 +498,61 @@ async fn dialog_worker_persists_executed_tool_calls_before_answer() -> Result<()
 }
 
 #[tokio::test]
+async fn dialog_session_persists_cumulative_tool_history_across_iterations()
+-> Result<(), Box<dyn Error>> {
+    let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+    let queue = InMemoryTaskQueue::new();
+    queue.assign(
+        DIALOG_AIFARM_QUEUE_NAME,
+        new_dialog_job_at(dialog_params("сравни два источника"), now),
+    );
+    let search = |id: &str, query: &str| {
+        step_tools(
+            "",
+            vec![(
+                id,
+                openplotva_dialog::ToolStep {
+                    step: openplotva_dialog::STEP_WEB_SEARCH.to_owned(),
+                    query: query.to_owned(),
+                    ..openplotva_dialog::ToolStep::default()
+                },
+            )],
+        )
+    };
+    let provider = StepProviderStub::with_steps(vec![
+        Ok(search("call-1", "первый")),
+        Ok(search("call-2", "второй")),
+        Ok(step_text("готово")),
+    ]);
+    let toolbox: Arc<dyn openplotva_dialog::DialogToolbox> =
+        Arc::new(SessionToolboxStub::default());
+    let wiring = session_wiring(toolbox, None);
+    let effects = EffectsStub::default();
+    let history = ToolHistoryStub::default();
+
+    let report = process_dialog_job_once_in_queue_with_materializer_and_history_at_with_session(
+        &queue,
+        DIALOG_AIFARM_QUEUE_NAME,
+        &provider,
+        &effects,
+        &BasicDialogInputMaterializer,
+        &history,
+        &wiring,
+        now,
+    )
+    .await;
+
+    assert!(report.sent_answer, "{report:?}");
+    let snapshots = history.calls();
+    assert_eq!(snapshots.len(), 2);
+    assert_eq!(snapshots[0].2.len(), 1);
+    assert_eq!(snapshots[1].2.len(), 2);
+    assert_eq!(snapshots[1].2[0].r#ref, "call-1");
+    assert_eq!(snapshots[1].2[1].r#ref, "call-2");
+    Ok(())
+}
+
+#[tokio::test]
 async fn dialog_worker_completes_delegated_queued_song_without_sending_text()
 -> Result<(), Box<dyn Error>> {
     let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
@@ -2310,6 +2365,50 @@ fn dialog_history_payload_merge_matches_go_dedupe_order_and_reply_context()
 }
 
 #[test]
+fn dialog_history_context_matches_confirmed_telegram_message_order() -> Result<(), Box<dyn Error>> {
+    let payload = |id: i32, sender_id: i64, role: &str, text: &str| {
+        serde_json::to_vec(&serde_json::json!({
+            "entry_id": format!("msg:{id}"),
+            "kind": "text",
+            "role": role,
+            "timestamp": "2026-07-12T19:42:00Z",
+            "message_id": id,
+            "text": text,
+            "from": {"id": sender_id, "first_name": if sender_id == 99 {"Plotva"} else {"Ada"}},
+            "meta": {"sender_id": sender_id}
+        }))
+    };
+    let history = merge_dialog_history_payloads(
+        &[
+            payload(1110915, 7, "user", "посмотри видео")?,
+            payload(1110914, 99, "model", "что именно?")?,
+            payload(1110913, 7, "user", "и шо?")?,
+            payload(1110912, 99, "model", "сейчас посмотрю")?,
+            payload(1110911, 7, "user", "опиши")?,
+        ],
+        &[],
+        99,
+    );
+
+    let selected =
+        openplotva_dialog::select_llm_history_messages_for_context(&history, 10, 1110915, 0);
+
+    assert_eq!(
+        selected
+            .iter()
+            .map(|message| (message.message_id, message.role.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            (1110911, ROLE_USER),
+            (1110912, ROLE_MODEL),
+            (1110913, ROLE_USER),
+            (1110914, ROLE_MODEL),
+        ]
+    );
+    Ok(())
+}
+
+#[test]
 fn dialog_persona_uses_go_daily_catalogue_without_custom_persona() -> Result<(), Box<dyn Error>> {
     let now = OffsetDateTime::from_unix_timestamp(12_345 * 86_400)?;
     let settings = ChatSettings {
@@ -2679,6 +2778,7 @@ impl DialogJobEffects for EffectsStub {
 
     fn send_dialog_intermediate<'a>(
         &'a self,
+        _dialog_job_id: i64,
         _params: &'a DialogJobParams,
         text: &'a str,
         seq: u32,
@@ -2774,7 +2874,7 @@ impl DialogInputMaterializer for MaterializerStub {
         Box::pin(async move {
             let mut input = dialog_input_from_job_params_at(params, now);
             input.history = self.history.clone();
-            input
+            Ok(input)
         })
     }
 }
@@ -3560,7 +3660,7 @@ impl crate::dialog_jobs::DialogInputMaterializer for ContextStubMaterializer {
         Box::pin(async move {
             let mut input = crate::dialog_jobs::BasicDialogInputMaterializer
                 .materialize_dialog_input(params, now)
-                .await;
+                .await?;
             input.context_capture = Some(openplotva_dialog::TurnContextArtifact {
                 memories: vec![openplotva_dialog::CapturedMemory {
                     card_id: 7,
@@ -3574,7 +3674,7 @@ impl crate::dialog_jobs::DialogInputMaterializer for ContextStubMaterializer {
                 }),
                 ..openplotva_dialog::TurnContextArtifact::default()
             });
-            input
+            Ok(input)
         })
     }
 }
@@ -3980,6 +4080,71 @@ async fn session_send_message_tool_respects_cap_and_dedup() -> Result<(), Box<dy
 }
 
 #[tokio::test]
+async fn session_intermediate_without_final_answer_is_terminal_failure()
+-> Result<(), Box<dyn Error>> {
+    let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
+    let queue = InMemoryTaskQueue::new();
+    let job_id = queue.assign(
+        DIALOG_AIFARM_QUEUE_NAME,
+        new_dialog_job_at(dialog_params("посмотри видео"), now),
+    );
+    let send = || {
+        step_tools(
+            "",
+            vec![(
+                "send-1",
+                openplotva_dialog::ToolStep {
+                    step: openplotva_dialog::STEP_SEND_MESSAGE.to_owned(),
+                    text: "сейчас посмотрю".to_owned(),
+                    ..openplotva_dialog::ToolStep::default()
+                },
+            )],
+        )
+    };
+    let provider = StepProviderStub::with_steps(vec![Ok(send()), Ok(send())]);
+    let toolbox: Arc<dyn openplotva_dialog::DialogToolbox> =
+        Arc::new(SessionToolboxStub::default());
+    let mut wiring = session_wiring(toolbox, None);
+    wiring.max_iterations = 2;
+    let effects = EffectsStub::default();
+    let outcomes = crate::dialog_turn::DialogTurnObserver::new(
+        crate::dialog_turn::RuntimeTurnOutcomeBuffer::new(8),
+        None,
+    );
+
+    let report = process_dialog_job_once_in_queue_with_materializer_history_and_retry_at(
+        &queue,
+        &provider,
+        &effects,
+        &BasicDialogInputMaterializer,
+        &NoopDialogToolCallHistoryStore,
+        session_options(now, &outcomes, &wiring),
+    )
+    .await;
+
+    assert!(report.failed, "{report:?}");
+    assert!(
+        !report.sent_answer,
+        "intermediate text is not a final answer"
+    );
+    assert_eq!(record_status(&queue, job_id), JobStatus::Failed);
+    let record = queue.record(job_id).expect("job record");
+    assert!(
+        record
+            .events
+            .iter()
+            .any(|event| { event.stage == crate::dialog_turn::SESSION_INTERMEDIATE_QUEUED_STAGE })
+    );
+    assert!(
+        !record
+            .events
+            .iter()
+            .any(|event| { event.stage == crate::dialog_turn::SESSION_MESSAGE_SENT_STAGE })
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn session_react_to_message_validates_emoji_and_repeats() -> Result<(), Box<dyn Error>> {
     let now = OffsetDateTime::from_unix_timestamp(1_779_193_800)?;
     let queue = InMemoryTaskQueue::new();
@@ -4336,6 +4501,15 @@ async fn injected_message_reaches_the_next_iteration_and_leftovers_respawn()
         .collect::<Vec<_>>();
     assert_eq!(injected.len(), 1, "{:?}", requests[1].transcript);
     assert!(injected[0].contains("кстати умножь на два"));
+    assert_eq!(
+        requests[1].input.message.text, "кстати умножь на два",
+        "the newest injected message is fully rematerialized"
+    );
+    assert_eq!(
+        effects.sent()[0].0,
+        "кстати умножь на два",
+        "the final answer targets the newest injected trigger"
+    );
     // The second injected message was left in the inbox → a follow-up job.
     assert!(report.followup_respawned.is_some(), "{report:?}");
     assert_eq!(registry.active_count(), 0, "session released its key");

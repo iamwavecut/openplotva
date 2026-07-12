@@ -11130,10 +11130,12 @@ async fn start_runtime_workers(
     let telegram_outbox_worker_id =
         format!("telegram-outbox-{}-{}", bot_identity.id, std::process::id());
     let telegram_outbox_bot_id = bot_identity.id;
+    let telegram_outbox_history = history_store.clone();
     let telegram_outbox_stop = stop.subscribe();
     let telegram_outbox_worker = tokio::spawn(async move {
         let report = telegram_outbox::run_telegram_outbox_worker_until(
             telegram_outbox_store,
+            telegram_outbox_history,
             telegram_outbox_transport,
             telegram_outbox_jobs,
             &telegram_outbox_worker_id,
@@ -12896,17 +12898,17 @@ async fn start_runtime_workers(
             bot_user_from_get_me(&bot_identity),
             activity,
         ));
-        let history_handler = Arc::new(updates::UpdateHandlerWithHistory::new(
-            Arc::clone(&history_store_for_updates),
-            edited,
-            bot_identity.id,
-        ));
-        let handler = Arc::new(message_gate::MessageGateUpdateHandler::new(
+        let gated_handler = Arc::new(message_gate::MessageGateUpdateHandler::new(
             Arc::clone(&rate_limit_policy),
             permission_policy_for_updates,
             Arc::new(service_clients.redis.blocked_chat_store()),
             bot_identity.username.clone(),
-            history_handler,
+            edited,
+        ));
+        let handler = Arc::new(updates::UpdateHandlerWithHistory::new(
+            Arc::clone(&history_store_for_updates),
+            gated_handler,
+            bot_identity.id,
         ));
         let update_stage_tracker = Arc::new(updates_inspector.stage_tracker());
         let update_consumer_stop = stop.subscribe();

@@ -107,6 +107,7 @@ pub trait DialogJobEffects {
     /// message so groups do not get a quote header on every part.
     fn send_dialog_intermediate<'a>(
         &'a self,
+        dialog_job_id: i64,
         params: &'a DialogJobParams,
         text: &'a str,
         seq: u32,
@@ -306,6 +307,7 @@ impl DialogJobEffects for DialogDispatcherEffects {
 
     fn send_dialog_intermediate<'a>(
         &'a self,
+        dialog_job_id: i64,
         params: &'a DialogJobParams,
         text: &'a str,
         seq: u32,
@@ -323,6 +325,19 @@ impl DialogJobEffects for DialogDispatcherEffects {
                 message_thread_id: params.thread_id.map(i64::from).unwrap_or_default(),
             };
             let reply_to = reply_to_trigger.then_some(&reply_to);
+            if let Some(outbox) = &self.durable_outbox {
+                enqueue_durable_dialog_intermediate(
+                    outbox,
+                    dialog_job_id,
+                    params,
+                    text,
+                    seq,
+                    chat,
+                    reply_to,
+                )
+                .await?;
+                return Ok(());
+            }
             // Per-send deterministic key: distinct sends of one session never
             // dedupe each other, while a crash replay of the same seq+text is
             // absorbed by the outbound window. Intermediates deliberately go
@@ -381,6 +396,87 @@ impl DialogJobEffects for DialogDispatcherEffects {
             Ok(())
         })
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn enqueue_durable_dialog_intermediate(
+    outbox: &DurableDialogOutbox,
+    dialog_job_id: i64,
+    params: &DialogJobParams,
+    text: &str,
+    seq: u32,
+    chat: ChatRef,
+    reply_to: Option<&ReplyMessageRef>,
+) -> Result<(), DialogDispatchEffectError> {
+    let methods = if dialog_response_requires_rich(text) {
+        let request = RichMessageRequest {
+            chat: Some(chat),
+            message_thread_id: params.thread_id.map(i64::from).unwrap_or_default(),
+            disable_notification: false,
+            allow_sending_without_reply: None,
+            html: text.to_owned(),
+            reply_markup: None,
+        };
+        vec![TelegramOutboundMethod::from(build_rich_message_method(
+            &request, chat, reply_to,
+        )?)]
+    } else {
+        let request = TextMessageRequest {
+            chat: Some(chat),
+            message_thread_id: params.thread_id.map(i64::from).unwrap_or_default(),
+            disable_notification: false,
+            allow_sending_without_reply: None,
+            text: text.to_owned(),
+            render_as: TELEGRAM_PARSE_MODE_HTML.to_owned(),
+            reply_markup: None,
+        };
+        build_text_message_methods(&request, reply_to)?
+            .into_iter()
+            .map(TelegramOutboundMethod::from)
+            .collect()
+    };
+    let now = OffsetDateTime::now_utc();
+    let mut parts = Vec::with_capacity(methods.len());
+    for method in &methods {
+        let method_kind = method.method_name();
+        let Some((_kind, payload)) = snapshot_outbound_method(method) else {
+            return Err(DialogDispatchEffectError::UnsupportedMethod(method_kind));
+        };
+        parts.push(TelegramOutboxPartInput {
+            method_kind: method_kind.to_owned(),
+            payload_version: 1,
+            payload: serde_json::from_slice(&payload)?,
+            blob: None,
+            available_at: now,
+            expires_at: None,
+        });
+    }
+    outbox
+        .store
+        .enqueue_batch(&TelegramOutboxBatchInput {
+            batch_id: format!(
+                "dialog-intermediate:v1:{}:{dialog_job_id}:{seq}",
+                outbox.bot_id
+            ),
+            bot_id: outbox.bot_id,
+            chat_id: Some(params.chat_id),
+            thread_id: params.thread_id,
+            ordering_key: format!(
+                "dialog:{}:{}:{}",
+                outbox.bot_id,
+                params.chat_id,
+                params.thread_id.unwrap_or_default()
+            ),
+            causation_update_id: None,
+            dialog_job_id: None,
+            trigger_message_id: Some(i64::from(params.message_id)),
+            delivery_policy: TelegramDeliveryPolicy::Create,
+            protected: true,
+            priority: 0,
+            parts,
+        })
+        .await?;
+    Ok(())
 }
 
 fn dialog_answer_batch_id(bot_id: i64, dialog_job_id: i64) -> String {

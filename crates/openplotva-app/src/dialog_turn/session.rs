@@ -50,6 +50,7 @@ use crate::dialog_jobs::{
 /// re-entry (crash between a send and the status write) the turn resolves
 /// `Sent` without replaying anything.
 pub const SESSION_MESSAGE_SENT_STAGE: &str = "session_message_sent";
+pub const SESSION_INTERMEDIATE_QUEUED_STAGE: &str = "session_intermediate_queued";
 
 /// Job event stage recorded per session LLM iteration (audit only).
 pub const SESSION_ITERATION_STAGE: &str = "session_iteration";
@@ -194,7 +195,7 @@ pub(crate) struct SessionRunContext<'a> {
 }
 
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
-pub(crate) async fn run_dialog_session<Queue, Effects, ToolHistory>(
+pub(crate) async fn run_dialog_session<Queue, Effects, Materializer, ToolHistory>(
     ctx: SessionRunContext<'_>,
     cfg: &SessionTurnConfig<'_>,
     step_provider: &dyn ChatStepProvider,
@@ -202,16 +203,18 @@ pub(crate) async fn run_dialog_session<Queue, Effects, ToolHistory>(
     duplicate_guard_history: &[HistoryMessage],
     queue: &Queue,
     effects: &Effects,
+    materializer: &Materializer,
     tool_history: &ToolHistory,
     report: &mut DialogJobWorkerReport,
 ) -> TurnResolution
 where
     Queue: DialogJobWorkerQueue + Sync + ?Sized,
     Effects: DialogJobEffects + Sync + ?Sized,
+    Materializer: crate::dialog_jobs::DialogInputMaterializer + Sync + ?Sized,
     ToolHistory: DialogToolCallHistoryStore + Sync + ?Sized,
 {
-    // Re-entry guard: a crash between an accepted send and the status write
-    // re-delivers the job; a partially-sent session is NEVER replayed.
+    // Re-entry guard applies only to a terminal answer. Durable intermediate
+    // batches are idempotent and must not prematurely complete the session.
     if ctx
         .item_events
         .iter()
@@ -229,7 +232,9 @@ where
     }
 
     let mut budget = SessionBudget::new(ctx.budget, cfg.tool_extension_secs, cfg.hard_cap_secs);
-    let meta = dialog_tool_context(&base_input);
+    let mut base_input = base_input;
+    let mut active_params = ctx.params.clone();
+    let mut meta = dialog_tool_context(&base_input);
     let native_tools = match session_native_tools() {
         Ok(tools) => tools,
         Err(error) => {
@@ -250,6 +255,7 @@ where
     let mut transcript: Vec<SessionMessage> = Vec::new();
     let mut sent = SentLog::new();
     let mut side_effect_tickets: Vec<QueuedSideEffect> = Vec::new();
+    let mut recorded_tool_calls: Vec<ToolCall> = Vec::new();
     let mut regenerations: i32 = 0;
     let mut anti_loop = false;
     let mut draws_scheduled: i32 = 0;
@@ -262,9 +268,32 @@ where
         iteration += 1;
         if let Some(inbox) = ctx.inbox.as_ref() {
             for injected in inbox.drain_open() {
+                let injected_params = injected.params;
                 transcript.push(SessionMessage::InjectedUser {
-                    rendered: render_injected_message(&injected),
+                    rendered: render_injected_params(&injected_params),
                 });
+                match materializer
+                    .materialize_dialog_input(&injected_params, OffsetDateTime::now_utc())
+                    .await
+                {
+                    Ok(input) => {
+                        active_params = injected_params;
+                        meta = dialog_tool_context(&input);
+                        base_input = input;
+                    }
+                    Err(error) => {
+                        let error = format!("materialize injected dialog input: {error}");
+                        report.materialization_error = Some(error.clone());
+                        return TurnResolution {
+                            outcome: TurnOutcome::TerminalFailed {
+                                reason: "injected_input_materialization",
+                                error: error.clone(),
+                                user_signal: UserSignalPlan::React,
+                            },
+                            disposition: JobDisposition::Fail(error),
+                        };
+                    }
+                }
             }
         }
         let round_now =
@@ -336,7 +365,7 @@ where
                     return handle_retryable_dialog_provider_error(
                         queue,
                         ctx.item,
-                        ctx.params,
+                        &active_params,
                         ctx.routing_events,
                         RetryableDialogProviderFailure {
                             queue_name: ctx.queue_name,
@@ -389,14 +418,16 @@ where
                     return session_delegated(&sent, &side_effect_tickets);
                 }
                 if sent.any() {
-                    // The model said everything it wanted via intermediates.
-                    report.sent_answer = true;
+                    let error =
+                        "dialog provider returned no final answer after intermediate messages"
+                            .to_owned();
                     return TurnResolution {
-                        outcome: TurnOutcome::Sent {
-                            parts: sent.total_count,
-                            side_effect_tickets: ticket_ids(&side_effect_tickets),
+                        outcome: TurnOutcome::TerminalFailed {
+                            reason: "empty_final_after_partial",
+                            error: error.clone(),
+                            user_signal: UserSignalPlan::React,
                         },
-                        disposition: JobDisposition::Complete,
+                        disposition: JobDisposition::Fail(error),
                     };
                 }
                 let (codes, error) = if raw_answer.trim().is_empty() {
@@ -414,7 +445,7 @@ where
                 return handle_retryable_dialog_provider_error(
                     queue,
                     ctx.item,
-                    ctx.params,
+                    &active_params,
                     ctx.routing_events,
                     RetryableDialogProviderFailure {
                         queue_name: ctx.queue_name,
@@ -455,15 +486,13 @@ where
                     "dialog answer duplicated bot message {duplicate_message_id} after {regenerations} regeneration(s)"
                 );
                 if sent.any() {
-                    // The user already has content; a 🤔 would misread as a
-                    // total failure.
-                    report.sent_answer = true;
                     return TurnResolution {
-                        outcome: TurnOutcome::Sent {
-                            parts: sent.total_count,
-                            side_effect_tickets: ticket_ids(&side_effect_tickets),
+                        outcome: TurnOutcome::TerminalFailed {
+                            reason: "duplicate_exhausted_after_partial",
+                            error: error.clone(),
+                            user_signal: UserSignalPlan::React,
                         },
-                        disposition: JobDisposition::Complete,
+                        disposition: JobDisposition::Fail(error),
                     };
                 }
                 return TurnResolution {
@@ -492,7 +521,7 @@ where
                 return handle_retryable_dialog_provider_error(
                     queue,
                     ctx.item,
-                    ctx.params,
+                    &active_params,
                     ctx.routing_events,
                     RetryableDialogProviderFailure {
                         queue_name: ctx.queue_name,
@@ -513,7 +542,7 @@ where
                 .send_dialog_answer(
                     ctx.item_id,
                     ctx.item.latest_update_id,
-                    ctx.params,
+                    &active_params,
                     &sanitized,
                 )
                 .await
@@ -594,7 +623,7 @@ where
             let announcement = prepare_dialog_chat_response(&step.text);
             if !announcement.trim().is_empty() {
                 let delivery = try_send_intermediate(
-                    ctx.params,
+                    &active_params,
                     effects,
                     queue,
                     ctx.item_id,
@@ -615,7 +644,6 @@ where
             }
         }
 
-        let mut recorded_calls: Vec<ToolCall> = Vec::with_capacity(step.tool_calls.len());
         let mut batch_side_effects: Vec<QueuedSideEffect> = Vec::new();
         for call in &step.tool_calls {
             let tool_started = tokio::time::Instant::now();
@@ -624,7 +652,7 @@ where
                     call,
                     cfg,
                     meta: &meta,
-                    params: ctx.params,
+                    params: &active_params,
                     budget: &mut budget,
                     sent: &mut sent,
                     draws_scheduled: &mut draws_scheduled,
@@ -670,7 +698,7 @@ where
                     );
                 }
             }
-            recorded_calls.push(recorded_session_tool_call(
+            recorded_tool_calls.push(recorded_session_tool_call(
                 &call.step, &result, &call.id, iteration,
             ));
             transcript.push(SessionMessage::ToolResult {
@@ -681,7 +709,7 @@ where
             });
         }
 
-        match persist_dialog_tool_calls(tool_history, ctx.params, &recorded_calls).await {
+        match persist_dialog_tool_calls(tool_history, &active_params, &recorded_tool_calls).await {
             Ok(persisted) => report.persisted_tool_call_history = persisted,
             Err(error) => {
                 report.tool_call_history_error = Some(error.to_string());
@@ -725,13 +753,17 @@ fn session_exhausted(
     now: OffsetDateTime,
 ) -> TurnResolution {
     if sent.any() {
-        // The user got content; a terminal signal would misread as failure.
+        let error = format!(
+            "dialog session exhausted after {}s with intermediate messages but no final answer",
+            budget.elapsed(now).whole_seconds()
+        );
         TurnResolution {
-            outcome: TurnOutcome::Sent {
-                parts: sent.total_count,
-                side_effect_tickets: ticket_ids(side_effects),
+            outcome: TurnOutcome::TerminalFailed {
+                reason: "session_exhausted_after_partial",
+                error: error.clone(),
+                user_signal: UserSignalPlan::React,
             },
-            disposition: JobDisposition::Complete,
+            disposition: JobDisposition::Fail(error),
         }
     } else if !side_effects.is_empty() {
         session_delegated(sent, side_effects)
@@ -933,13 +965,13 @@ where
     let first_send = !sent.any();
     let seq = sent.intermediate_count + 1;
     match effects
-        .send_dialog_intermediate(params, sanitized, seq, first_send)
+        .send_dialog_intermediate(item_id, params, sanitized, seq, first_send)
         .await
     {
         Ok(()) => {
             sent.record(sanitized, true);
             if first_send {
-                append_session_sent_marker(queue, item_id, now).await;
+                append_session_intermediate_marker(queue, item_id, now).await;
             }
             ToolResult {
                 status: openplotva_dialog::TOOL_RESULT_STATUS_OK.to_owned(),
@@ -990,6 +1022,20 @@ where
             job_id,
             "failed to append session_message_sent marker; a rerun may re-send"
         );
+    }
+}
+
+async fn append_session_intermediate_marker<Queue>(queue: &Queue, job_id: i64, at: OffsetDateTime)
+where
+    Queue: DialogJobWorkerQueue + Sync + ?Sized,
+{
+    let event = TaskQueueJobEvent {
+        stage: SESSION_INTERMEDIATE_QUEUED_STAGE.to_owned(),
+        message: "accepted by durable outbound queue".to_owned(),
+        ..TaskQueueJobEvent::default()
+    };
+    if let Err(error) = queue.append_dialog_job_event(job_id, event, at).await {
+        tracing::warn!(%error, job_id, "failed to append intermediate queued marker");
     }
 }
 
@@ -1109,8 +1155,7 @@ async fn append_session_tool_event<Queue>(
 
 /// Injected chat messages render with the same body format as history user
 /// turns so sender attribution stays coherent for the model.
-fn render_injected_message(injected: &super::inbox::InjectedMessage) -> String {
-    let params = &injected.params;
+fn render_injected_params(params: &openplotva_taskman::DialogJobParams) -> String {
     let turn = HistoryMessage {
         message_id: params.message_id,
         role: openplotva_dialog::ROLE_USER.to_owned(),

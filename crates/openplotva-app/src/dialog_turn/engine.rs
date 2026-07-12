@@ -160,9 +160,25 @@ where
         }
     }
 
-    let base_input = materializer
+    let base_input = match materializer
         .materialize_dialog_input(ctx.params, ctx.now)
-        .await;
+        .await
+    {
+        Ok(input) => input,
+        Err(error) => {
+            let error = error.to_string();
+            report.materialization_error = Some(error);
+            return TurnResolution {
+                outcome: TurnOutcome::RetryScheduled {
+                    reason: "input_materialization",
+                    attempt: next_dialog_llm_job_attempt(&ctx.item.events),
+                    max_attempts: ctx.max_llm_job_attempts.max(1),
+                    target_queue: ctx.queue_name.to_owned(),
+                },
+                disposition: JobDisposition::Requeue(ctx.queue_name.to_owned()),
+            };
+        }
+    };
     // Lift the capture-only context X-ray onto the open run (admin detail only).
     if let (Some(runs), Some(context)) = (ctx.llm_runs, base_input.context_capture.clone()) {
         runs.record_context(&format!("job-{}", ctx.item.id), context);
@@ -207,6 +223,7 @@ where
         &duplicate_guard_history,
         queue,
         effects,
+        materializer,
         tool_history,
         report,
     )

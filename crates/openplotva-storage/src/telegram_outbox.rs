@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, QueryBuilder, Row, postgres::PgRow};
 use time::OffsetDateTime;
 
-use crate::StorageError;
+use crate::{SQL_ENSURE_CHAT_HISTORY_PARTITION, SQL_UPSERT_HISTORY_ENTRY, StorageError};
 
 /// Conservative bind budget below PostgreSQL's protocol maximum.
 pub const POSTGRES_OUTBOX_BIND_BUDGET: usize = 60_000;
@@ -166,6 +166,21 @@ pub struct TelegramOutboxPartInput {
     pub blob: Option<TelegramOutboxBlobInput>,
     pub available_at: OffsetDateTime,
     pub expires_at: Option<OffsetDateTime>,
+}
+
+/// Canonical history row derived from a Telegram delivery receipt.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TelegramReceiptHistoryEntry {
+    pub bucket_day: time::Date,
+    pub chat_id: i64,
+    pub thread_id: i32,
+    pub message_id: i32,
+    pub entry_id: String,
+    pub kind: String,
+    pub role: String,
+    pub occurred_at: OffsetDateTime,
+    pub sender_id: i64,
+    pub payload: Value,
 }
 
 /// Immutable batch metadata plus ordered parts.
@@ -741,6 +756,56 @@ impl PostgresTelegramOutboxStore {
             .fetch_one(&self.pool)
             .await
             .map_err(StorageError::from)
+    }
+
+    /// Record the Telegram acknowledgement and its canonical history rows in one transaction.
+    pub async fn mark_delivered_with_history(
+        &self,
+        outbox_id: i64,
+        lease_token: i64,
+        response_kind: &str,
+        telegram_message_ids: &[i64],
+        receipt: &Value,
+        history_entries: &[TelegramReceiptHistoryEntry],
+    ) -> Result<bool, StorageError> {
+        let mut transaction = self.pool.begin().await?;
+        let delivered = sqlx::query_scalar::<_, bool>(SQL_DELIVER_OPERATION)
+            .bind(outbox_id)
+            .bind(lease_token)
+            .bind(response_kind)
+            .bind(telegram_message_ids)
+            .bind(sqlx::types::Json(receipt))
+            .fetch_one(&mut *transaction)
+            .await?;
+        if !delivered {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
+        let mut ensured_days = Vec::new();
+        for entry in history_entries {
+            if !ensured_days.contains(&entry.bucket_day) {
+                sqlx::query(SQL_ENSURE_CHAT_HISTORY_PARTITION)
+                    .bind(entry.bucket_day)
+                    .execute(&mut *transaction)
+                    .await?;
+                ensured_days.push(entry.bucket_day);
+            }
+            sqlx::query(SQL_UPSERT_HISTORY_ENTRY)
+                .bind(entry.bucket_day)
+                .bind(entry.chat_id)
+                .bind(entry.thread_id)
+                .bind(entry.message_id)
+                .bind(&entry.entry_id)
+                .bind(&entry.kind)
+                .bind(&entry.role)
+                .bind(entry.occurred_at)
+                .bind(entry.sender_id)
+                .bind(sqlx::types::Json(&entry.payload))
+                .execute(&mut *transaction)
+                .await?;
+        }
+        transaction.commit().await?;
+        Ok(true)
     }
 
     /// Release a definitive transient failure. `replacement_payload` supports
@@ -1550,15 +1615,34 @@ mod tests {
         );
         assert!(
             store
-                .mark_delivered(
+                .mark_delivered_with_history(
                     first[0].id,
                     first[0].lease_token,
                     "message",
                     &[11],
                     &serde_json::json!({"message_id": 11}),
+                    &[TelegramReceiptHistoryEntry {
+                        bucket_day: OffsetDateTime::now_utc().date(),
+                        chat_id: 42,
+                        thread_id: 0,
+                        message_id: 11,
+                        entry_id: format!("outbox-history:{suffix}"),
+                        kind: "text".to_owned(),
+                        role: "model".to_owned(),
+                        occurred_at: OffsetDateTime::now_utc(),
+                        sender_id: 7,
+                        payload: serde_json::json!({"text": "confirmed"}),
+                    }],
                 )
                 .await?
         );
+        let history_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM chat_history_entries WHERE chat_id = 42 AND entry_id = $1",
+        )
+        .bind(format!("outbox-history:{suffix}"))
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(history_count, 1);
 
         let second = store.claim_operations("outbox-test", 10).await?;
         assert_eq!(second.len(), 1);
@@ -1661,6 +1745,10 @@ mod tests {
             .await?;
         sqlx::query("DELETE FROM telegram_outbox_blobs WHERE sha256 = $1")
             .bind(blob_hash)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM chat_history_entries WHERE chat_id = 42 AND entry_id = $1")
+            .bind(format!("outbox-history:{suffix}"))
             .execute(&pool)
             .await?;
         Ok(())

@@ -479,20 +479,24 @@ fn trace_update_history_error(update: &TelegramUpdate, error: &str) {
     );
 }
 
-/// Error returned by a handler wrapped with non-fatal history persistence.
+/// Error returned by a handler wrapped with mandatory history persistence.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum UpdateHandleWithHistoryError {
-    /// The injected handler failed after history side effects were attempted.
+    /// Canonical history could not be persisted, so routing was not attempted.
+    #[error("persist update history: {message}")]
+    History {
+        /// Display form of the persistence error.
+        message: String,
+    },
+    /// The injected handler failed after history was persisted.
     #[error("handle update: {message}")]
     Handler {
         /// Display form of the handler error.
         message: String,
-        /// History side-effect outcome observed before the handler error.
-        history: UpdateHistorySideEffectReport,
     },
 }
 
-/// Adapter that adds non-fatal history persistence to an existing update handler.
+/// Adapter that durably records canonical history before routing an update.
 #[derive(Clone, Debug)]
 pub struct UpdateHandlerWithHistory<History, Handler> {
     history_store: Arc<History>,
@@ -633,8 +637,8 @@ where
     }
 }
 
-/// Persist update history before and after invoking the update handler.
-/// History failures are logged and returned in the report but do not prevent
+/// Persist update history before invoking the update handler.
+/// History failures prevent routing so the durable inbox retries the update.
 pub async fn handle_update_with_history<S, HandleFn, HandleFuture, HandleError>(
     store: &S,
     update: TelegramUpdate,
@@ -647,21 +651,25 @@ where
     HandleFuture: Future<Output = Result<(), HandleError>>,
     HandleError: fmt::Display,
 {
-    let history = UpdateHistorySideEffectReport::from_persistence_result(
-        persist_update_history(store, &update, bot_id).await,
-    );
-    if let Some(error) = history.error.as_deref() {
-        trace_update_history_error(&update, error);
-    }
+    let history = persist_update_history(store, &update, bot_id)
+        .await
+        .map_err(|error| {
+            trace_update_history_error(&update, &error.to_string());
+            UpdateHandleWithHistoryError::History {
+                message: error.to_string(),
+            }
+        })?;
 
     handle(update)
         .await
         .map_err(|error| UpdateHandleWithHistoryError::Handler {
             message: error.to_string(),
-            history: history.clone(),
         })?;
 
-    Ok(history)
+    Ok(UpdateHistorySideEffectReport {
+        persistence: history,
+        error: None,
+    })
 }
 
 /// Process one decoded update with app-owned state persistence and an injected handler.
@@ -2364,7 +2372,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_update_consumer_until_can_wrap_handler_with_nonfatal_history()
+    async fn run_update_consumer_until_retries_when_canonical_history_fails()
     -> Result<(), Box<dyn Error>> {
         let source = Arc::new(SourceStub::new(vec![SourceAction::Update(Box::new(
             sample_message_update()?,
@@ -2391,14 +2399,16 @@ mod tests {
             },
             store,
             handler,
-            inner_handler.wait_for_calls(1),
+            async {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            },
         )
         .await;
 
         assert_eq!(report.dequeued, 1);
         assert_eq!(report.processed, 1);
-        assert_eq!(report.handle_failures, 0);
-        assert_eq!(inner_handler.calls(), vec![12345]);
+        assert_eq!(report.handle_failures, 1);
+        assert!(inner_handler.calls().is_empty());
         assert!(history.entries().is_empty());
         Ok(())
     }
