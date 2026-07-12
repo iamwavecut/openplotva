@@ -52,6 +52,9 @@ pub const TELEGRAM_FILE_MEDIA_KIND_DOCUMENT: &str = "document";
 pub const TELEGRAM_FILE_MEDIA_KIND_AUDIO: &str = "audio";
 pub const TELEGRAM_FILE_MEDIA_KIND_VOICE: &str = "voice";
 pub const TELEGRAM_FILE_MEDIA_KIND_STICKER: &str = "sticker";
+pub const TELEGRAM_FILE_MEDIA_KIND_VIDEO: &str = "video";
+pub const TELEGRAM_FILE_MEDIA_KIND_ANIMATION: &str = "animation";
+pub const TELEGRAM_FILE_MEDIA_KIND_VIDEO_NOTE: &str = "video_note";
 
 pub const UPDATE_STATE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -1220,6 +1223,45 @@ pub fn telegram_message_file_metadata_refs(
             voice.data.file_size.unwrap_or_default(),
         ));
     }
+    if let TelegramMessageData::Video(video) = &message.data {
+        refs.push(
+            base.clone()
+                .with_file(
+                    &video.data.file_id,
+                    &video.data.file_unique_id,
+                    TELEGRAM_FILE_MEDIA_KIND_VIDEO,
+                    video.data.mime_type.as_deref().unwrap_or("video/mp4"),
+                    video.data.file_size.unwrap_or_default(),
+                )
+                .with_dimensions(video.data.width, video.data.height),
+        );
+    }
+    if let TelegramMessageData::Animation(animation) = &message.data {
+        refs.push(
+            base.clone()
+                .with_file(
+                    &animation.file_id,
+                    &animation.file_unique_id,
+                    TELEGRAM_FILE_MEDIA_KIND_ANIMATION,
+                    animation.mime_type.as_deref().unwrap_or("video/mp4"),
+                    animation.file_size.unwrap_or_default(),
+                )
+                .with_dimensions(animation.width, animation.height),
+        );
+    }
+    if let TelegramMessageData::VideoNote(video_note) = &message.data {
+        refs.push(
+            base.clone()
+                .with_file(
+                    &video_note.file_id,
+                    &video_note.file_unique_id,
+                    TELEGRAM_FILE_MEDIA_KIND_VIDEO_NOTE,
+                    "video/mp4",
+                    video_note.file_size.unwrap_or_default(),
+                )
+                .with_dimensions(video_note.length, video_note.length),
+        );
+    }
     if let Some(ref_data) = sticker_file_metadata_ref(&base, &message.data) {
         refs.push(ref_data);
     }
@@ -1244,6 +1286,7 @@ pub fn telegram_message_attachments(
     );
     append_telegram_file_attachments(&mut out, &message.data, &source, caption);
     append_telegram_contact_attachments(&mut out, &message.data, &source);
+    append_telegram_payload_attachments(&mut out, &message.data, &source);
 
     out
 }
@@ -1656,14 +1699,11 @@ pub fn should_handle_addressed_message(
 
 #[must_use]
 pub fn should_handle_random_response(
-    message: Option<&TelegramMessage>,
-    original_text: &str,
+    _message: Option<&TelegramMessage>,
+    _original_text: &str,
     sender: &MessageSender,
 ) -> bool {
-    if sender.is_bot {
-        return false;
-    }
-    !is_captionless_media_only_random_message(message, original_text)
+    !sender.is_bot
 }
 
 #[must_use]
@@ -1892,11 +1932,18 @@ fn telegram_message_type(message: Option<&TelegramMessage>) -> Option<&'static s
     match &message.data {
         TelegramMessageData::Voice(_) => Some("voice"),
         TelegramMessageData::Video(_) => Some("video"),
+        TelegramMessageData::Animation(_) => Some("animation"),
+        TelegramMessageData::VideoNote(_) => Some("video_note"),
         TelegramMessageData::Audio(_) => Some("audio"),
         TelegramMessageData::Document(_) => Some("document"),
         TelegramMessageData::Location(_) | TelegramMessageData::Venue(_) => Some("location"),
         TelegramMessageData::Contact(_) => Some("contact"),
         TelegramMessageData::Photo(_) | TelegramMessageData::Sticker(_) => Some("image"),
+        TelegramMessageData::Dice(_) => Some("dice"),
+        TelegramMessageData::Checklist(_) => Some("checklist"),
+        TelegramMessageData::Story(_) => Some("story"),
+        TelegramMessageData::PaidMedia(_) => Some("paid_media"),
+        TelegramMessageData::Poll(_) => Some("poll"),
         TelegramMessageData::Text(text) if !text.data.trim().is_empty() => Some("text"),
         _ => None,
     }
@@ -2046,6 +2093,33 @@ fn append_telegram_file_attachments(
             mime_type: video.data.mime_type.clone().unwrap_or_default(),
             caption: caption.to_owned(),
             duration_seconds: video.data.duration,
+            width: video.data.width,
+            height: video.data.height,
+            ..ChatAttachment::default()
+        }),
+        TelegramMessageData::Animation(animation) => out.push(ChatAttachment {
+            kind: "animation".to_owned(),
+            source: source.to_owned(),
+            file_unique_id: animation.file_unique_id.clone(),
+            file_name: animation.file_name.clone().unwrap_or_default(),
+            mime_type: animation
+                .mime_type
+                .clone()
+                .unwrap_or_else(|| "video/mp4".to_owned()),
+            caption: caption.to_owned(),
+            duration_seconds: animation.duration,
+            width: animation.width,
+            height: animation.height,
+            ..ChatAttachment::default()
+        }),
+        TelegramMessageData::VideoNote(video_note) => out.push(ChatAttachment {
+            kind: "video_note".to_owned(),
+            source: source.to_owned(),
+            file_unique_id: video_note.file_unique_id.clone(),
+            mime_type: "video/mp4".to_owned(),
+            duration_seconds: video_note.duration,
+            width: video_note.length,
+            height: video_note.length,
             ..ChatAttachment::default()
         }),
         TelegramMessageData::Audio(audio) => out.push(ChatAttachment {
@@ -2068,7 +2142,15 @@ fn append_telegram_file_attachments(
             ..ChatAttachment::default()
         }),
         TelegramMessageData::Document(document) => out.push(ChatAttachment {
-            kind: "document".to_owned(),
+            kind: if has_mime_prefix(
+                document.data.mime_type.as_deref().unwrap_or_default(),
+                "video/",
+            ) {
+                "video"
+            } else {
+                "document"
+            }
+            .to_owned(),
             source: source.to_owned(),
             file_unique_id: document.data.file_unique_id.clone(),
             file_name: document.data.file_name.clone().unwrap_or_default(),
@@ -2085,6 +2167,57 @@ fn append_telegram_file_attachments(
         }),
         _ => {}
     }
+}
+
+fn append_telegram_payload_attachments(
+    out: &mut Vec<ChatAttachment>,
+    data: &TelegramMessageData,
+    source: &str,
+) {
+    let (kind, content) = match data {
+        TelegramMessageData::Dice(dice) => {
+            let emoji = char::from(dice.dice_type());
+            ("dice", format!("{emoji} result: {}", dice.value()))
+        }
+        TelegramMessageData::Checklist(checklist) => {
+            let tasks = checklist
+                .tasks
+                .iter()
+                .map(|task| task.text.trim())
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join("; ");
+            (
+                "checklist",
+                format!("{}: {}", checklist.title.trim(), tasks)
+                    .trim_matches([' ', ':'])
+                    .to_owned(),
+            )
+        }
+        TelegramMessageData::Story(story) => ("story", format!("story id {}", story.id)),
+        TelegramMessageData::PaidMedia(media) => (
+            "paid_media",
+            format!(
+                "{} paid media item(s), {} Telegram Stars",
+                media.paid_media.len(),
+                media.star_count
+            ),
+        ),
+        TelegramMessageData::Poll(poll) => {
+            let question = match poll {
+                carapax::types::Poll::Regular(poll) => poll.question.data.trim(),
+                carapax::types::Poll::Quiz(poll) => poll.question.data.trim(),
+            };
+            ("poll", question.to_owned())
+        }
+        _ => return,
+    };
+    out.push(ChatAttachment {
+        kind: kind.to_owned(),
+        source: source.to_owned(),
+        content,
+        ..ChatAttachment::default()
+    });
 }
 
 fn append_telegram_contact_attachments(
@@ -2210,7 +2343,7 @@ fn document_file_metadata_ref(
         return None;
     };
     let mime_type = document.data.mime_type.as_deref().unwrap_or_default();
-    if has_mime_prefix(mime_type, "image/") {
+    if has_mime_prefix(mime_type, "image/") || has_mime_prefix(mime_type, "video/") {
         let mut file = base.clone().with_file(
             &document.data.file_id,
             &document.data.file_unique_id,
@@ -2797,60 +2930,6 @@ fn add_image_prompt_part(parts: &mut Vec<String>, seen: &mut HashSet<String>, va
         return;
     }
     parts.push(trimmed.to_owned());
-}
-
-fn is_captionless_media_only_random_message(
-    message: Option<&TelegramMessage>,
-    original_text: &str,
-) -> bool {
-    let Some(message) = message else {
-        return true;
-    };
-    if !original_text.trim().is_empty() || !message_caption_text(message).trim().is_empty() {
-        return false;
-    }
-
-    match &message.data {
-        TelegramMessageData::Animation(_)
-        | TelegramMessageData::Audio(_)
-        | TelegramMessageData::Document(_)
-        | TelegramMessageData::PaidMedia(_)
-        | TelegramMessageData::Photo(_)
-        | TelegramMessageData::Sticker(_)
-        | TelegramMessageData::Story(_)
-        | TelegramMessageData::Video(_)
-        | TelegramMessageData::VideoNote(_)
-        | TelegramMessageData::Voice(_)
-        | TelegramMessageData::Contact(_)
-        | TelegramMessageData::Dice(_)
-        | TelegramMessageData::Location(_)
-        | TelegramMessageData::Venue(_)
-        | TelegramMessageData::Checklist(_) => true,
-        TelegramMessageData::Unknown(value) => is_go_premium_animation_message_data(value),
-        _ => false,
-    }
-}
-
-fn is_go_premium_animation_message_data(value: &Value) -> bool {
-    value
-        .as_object()
-        .is_some_and(|object| object.contains_key("premium_animation"))
-}
-
-fn message_caption_text(message: &TelegramMessage) -> String {
-    match &message.data {
-        TelegramMessageData::Audio(audio) => text_option_to_string(audio.caption.as_ref()),
-        TelegramMessageData::Document(document) => text_option_to_string(document.caption.as_ref()),
-        TelegramMessageData::Photo(photo) => text_option_to_string(photo.caption.as_ref()),
-        TelegramMessageData::Video(video) => text_option_to_string(video.caption.as_ref()),
-        TelegramMessageData::Voice(voice) => text_option_to_string(voice.caption.as_ref()),
-        _ => String::new(),
-    }
-}
-
-fn text_option_to_string(text: Option<&TelegramText>) -> String {
-    text.map(|text| text.as_ref().to_owned())
-        .unwrap_or_default()
 }
 
 fn addressed_bot_response_bucket(chat_id: i64, message_id: i64) -> u64 {
@@ -4836,6 +4915,80 @@ mod tests {
     }
 
     #[test]
+    fn telegram_video_payloads_preserve_download_and_dialog_metadata() -> Result<(), Box<dyn Error>>
+    {
+        let cases = [
+            (
+                "video",
+                json!({
+                    "file_id": "video-file",
+                    "file_unique_id": "video-u",
+                    "duration": 12,
+                    "width": 1280,
+                    "height": 720,
+                    "mime_type": "video/mp4",
+                    "file_size": 1000
+                }),
+                super::TELEGRAM_FILE_MEDIA_KIND_VIDEO,
+            ),
+            (
+                "animation",
+                json!({
+                    "file_id": "animation-file",
+                    "file_unique_id": "animation-u",
+                    "duration": 4,
+                    "width": 320,
+                    "height": 240,
+                    "mime_type": "video/mp4",
+                    "file_size": 500
+                }),
+                super::TELEGRAM_FILE_MEDIA_KIND_ANIMATION,
+            ),
+            (
+                "video_note",
+                json!({
+                    "file_id": "note-file",
+                    "file_unique_id": "note-u",
+                    "duration": 9,
+                    "length": 384,
+                    "file_size": 700
+                }),
+                super::TELEGRAM_FILE_MEDIA_KIND_VIDEO_NOTE,
+            ),
+        ];
+
+        for (field, media, expected_kind) in cases {
+            let mut message = json!({
+                "message_id": 80,
+                "date": 1_710_000_000,
+                "chat": sample_private_chat_json(),
+                "from": sample_user_json()
+            });
+            message[field] = media;
+            let update: TelegramUpdate = serde_json::from_value(json!({
+                "update_id": 180,
+                "message": message
+            }))?;
+            let message = update_message(&update)?;
+            let refs = super::update_file_metadata_refs(&update);
+            let attachments = super::telegram_message_attachments(
+                message,
+                TelegramMessageAttachmentOptions::default(),
+            );
+
+            assert_eq!(refs.len(), 1, "{field}");
+            assert_eq!(refs[0].media_kind, expected_kind, "{field}");
+            assert_eq!(refs[0].mime_type, "video/mp4", "{field}");
+            assert_eq!(attachments.len(), 1, "{field}");
+            assert_eq!(attachments[0].kind, field, "{field}");
+            assert!(!attachments[0].file_unique_id.is_empty(), "{field}");
+            assert!(attachments[0].duration_seconds > 0, "{field}");
+        }
+
+        Ok(())
+    }
+
+    #[test]
     fn collect_media_attachments_skips_existing_attachment_like_go_fetcher()
     -> Result<(), Box<dyn Error>> {
         let update = serde_json::from_value(json!({
@@ -5977,7 +6130,7 @@ mod tests {
             &human_sender
         ));
         assert!(!should_handle_random_response(None, "", &bot_sender));
-        assert!(!should_handle_random_response(
+        assert!(should_handle_random_response(
             Some(&document_message),
             "",
             &human_sender
@@ -5987,7 +6140,7 @@ mod tests {
             "",
             &human_sender
         ));
-        assert!(!should_handle_random_response(
+        assert!(should_handle_random_response(
             Some(&animation_message),
             "",
             &human_sender
@@ -5999,7 +6152,7 @@ mod tests {
                     .as_object()
                     .is_some_and(|object| object.contains_key("premium_animation"))
         ));
-        assert!(!should_handle_random_response(
+        assert!(should_handle_random_response(
             Some(&premium_animation_message),
             "",
             &human_sender

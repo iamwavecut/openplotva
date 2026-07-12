@@ -24,6 +24,8 @@ pub struct DialogVisionCandidate {
     pub file_unique_id: String,
     /// Stable label injected into prompt/image context.
     pub label: String,
+    /// Normalized attachment kind.
+    pub media_kind: String,
 }
 
 #[must_use]
@@ -177,11 +179,8 @@ fn add_dialog_vision_candidates_for_source(
 ) {
     let mut source_count = 0;
     for (idx, attachment) in meta.attachments.iter().enumerate() {
-        if !attachment
-            .kind
-            .trim()
-            .eq_ignore_ascii_case(ATTACHMENT_KIND_IMAGE)
-        {
+        let media_kind = attachment.kind.trim().to_lowercase();
+        if !is_vision_attachment_kind(&media_kind) {
             continue;
         }
         if !attachment.source.trim().eq_ignore_ascii_case(source) {
@@ -194,15 +193,16 @@ fn add_dialog_vision_candidates_for_source(
 
         source_count += 1;
         let label = if source == ATTACHMENT_SOURCE_MESSAGE && message_id > 0 {
-            format!("message_{message_id}_image_{source_count}")
+            format!("message_{message_id}_{media_kind}_{source_count}")
         } else {
-            format!("{source}_image_{source_count}")
+            format!("{source}_{media_kind}_{source_count}")
         };
         candidates.push(DialogVisionCandidate {
             attachment_index: idx,
             source: source.to_owned(),
             file_unique_id: file_unique_id.to_owned(),
             label,
+            media_kind,
         });
     }
 }
@@ -220,11 +220,7 @@ fn indexed_vision_attachments(meta: &ChatMessageMeta) -> Vec<IndexedVisionAttach
     let mut message_source_count = 0;
     let mut quoted_source_count = 0;
     for attachment in &meta.attachments {
-        if !attachment
-            .kind
-            .trim()
-            .eq_ignore_ascii_case(ATTACHMENT_KIND_IMAGE)
-        {
+        if !is_vision_attachment_kind(&attachment.kind.trim().to_lowercase()) {
             continue;
         }
         let file_unique_id = attachment.file_unique_id.trim();
@@ -252,6 +248,13 @@ fn indexed_vision_attachments(meta: &ChatMessageMeta) -> Vec<IndexedVisionAttach
         });
     }
     images
+}
+
+fn is_vision_attachment_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        ATTACHMENT_KIND_IMAGE | "video" | "animation" | "video_note"
+    )
 }
 
 fn normalize_vision_attachment_source(source: &str) -> String {
@@ -458,18 +461,21 @@ mod tests {
                     source: "message".to_owned(),
                     file_unique_id: "current-1".to_owned(),
                     label: "message_42_image_1".to_owned(),
+                    media_kind: "image".to_owned(),
                 },
                 DialogVisionCandidate {
                     attachment_index: 0,
                     source: "quoted".to_owned(),
                     file_unique_id: "quoted-1".to_owned(),
                     label: "quoted_image_1".to_owned(),
+                    media_kind: "image".to_owned(),
                 },
                 DialogVisionCandidate {
                     attachment_index: 3,
                     source: "quoted".to_owned(),
                     file_unique_id: "quoted-2".to_owned(),
                     label: "quoted_image_2".to_owned(),
+                    media_kind: "image".to_owned(),
                 },
             ]
         );

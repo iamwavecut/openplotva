@@ -632,7 +632,7 @@ where
         }
         let data_url = self
             .data_urls
-            .telegram_file_data_url(photo_file_id)
+            .telegram_file_data_url(photo_file_id, "photo", None)
             .await
             .map_err(|error| ImageEditError::Provider(format!("boogu provider {error}")))?;
         let session_hash =
@@ -1237,7 +1237,7 @@ where
             {
                 let data_url = self
                     .data_urls
-                    .telegram_file_data_url(&request.photo_file_id)
+                    .telegram_file_data_url(&request.photo_file_id, "photo", None)
                     .await
                     .map_err(|error| {
                         ImageEditError::Provider(format!("resolve image edit file: {error}"))
@@ -7420,6 +7420,8 @@ mod tests {
         fn telegram_file_data_url<'a>(
             &'a self,
             latest_file_id: &'a str,
+            _media_kind: &'a str,
+            _mime_type: Option<&'a str>,
         ) -> crate::vision::TelegramVisionDataUrlFuture<'a, Self::Error> {
             self.requested
                 .lock()

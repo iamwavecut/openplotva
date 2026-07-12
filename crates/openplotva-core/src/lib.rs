@@ -295,6 +295,12 @@ pub struct ChatAttachment {
     /// Audio/video/voice duration in seconds.
     #[serde(default, skip_serializing_if = "is_zero_i64")]
     pub duration_seconds: i64,
+    /// Media width in pixels when Telegram provides it.
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub width: i64,
+    /// Media height in pixels when Telegram provides it.
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub height: i64,
     /// Audio performer.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub performer: String,

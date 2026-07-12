@@ -1858,13 +1858,10 @@ where
         return Ok(DialogMessageUpdateRoute::Delegated);
     }
 
-    if dialog_trigger_text(message, &parsed.first_word, &parsed.rest_text).is_empty()
-        && !message_is_voice(message)
-    {
+    let context = build_fetcher_message_context(message);
+    if !dialog_context_has_payload(&context) {
         return Ok(DialogMessageUpdateRoute::SkippedEmptyDialogTrigger);
     }
-
-    let context = build_fetcher_message_context(message);
     let thread_id = message
         .message_thread_id
         .and_then(|thread_id| i32::try_from(thread_id).ok())
@@ -2715,6 +2712,9 @@ where
 
     let sender = resolve_message_sender(Some(message));
     let context = build_fetcher_message_context(message);
+    if !dialog_context_has_payload(&context) {
+        return Ok(DialogMessageUpdateRoute::RandomSkippedGate);
+    }
     if !should_handle_random_response(Some(message), &context.original_text, &sender) {
         return Ok(DialogMessageUpdateRoute::RandomSkippedGate);
     }
@@ -2830,22 +2830,12 @@ fn is_bang_draw_shortcut(first_word: &str) -> bool {
     matches!(first_word.trim(), "!рис" | "!draw")
 }
 
-fn dialog_trigger_text(
-    message: &carapax::types::Message,
-    first_word_lower: &str,
-    rest_text: &str,
-) -> String {
-    if !rest_text.is_empty() {
-        return rest_text.to_owned();
-    }
-    if !first_word_lower.is_empty() {
-        return first_word_lower.to_owned();
-    }
-    fetcher_message_text(message)
-}
-
-fn message_is_voice(message: &carapax::types::Message) -> bool {
-    matches!(&message.data, TelegramMessageData::Voice(_))
+fn dialog_context_has_payload(context: &openplotva_updates::FetcherMessageContext) -> bool {
+    !context.text.trim().is_empty()
+        || !context.original_text.trim().is_empty()
+        || !context.meta.annotation.trim().is_empty()
+        || !context.meta.vision_description.trim().is_empty()
+        || !context.meta.attachments.is_empty()
 }
 
 fn message_user_full_name(sender: &MessageSender) -> String {
@@ -4653,14 +4643,14 @@ mod tests {
                 "{label}"
             );
             assert!(!report.skipped_handle, "{label}");
-            let expected_route = if label == "voice" {
+            let expected_route = if label == "premium-animation" {
+                DialogMessageUpdateRoute::SkippedEmptyDialogTrigger
+            } else {
                 DialogMessageUpdateRoute::Scheduled {
                     queue_name: DIALOG_AIFARM_QUEUE_NAME.to_owned(),
                     delay: Duration::ZERO,
                     replaced: false,
                 }
-            } else {
-                DialogMessageUpdateRoute::SkippedEmptyDialogTrigger
             };
             assert_eq!(*lock(&route), Some(expected_route), "{label}");
         }
@@ -4689,10 +4679,14 @@ mod tests {
                 "file:captionless-photo-1".to_owned(),
                 "file:captionless-voice-1".to_owned(),
                 "file:captionless-audio-1".to_owned(),
+                "file:captionless-video-1".to_owned(),
                 "file:captionless-sticker-1".to_owned(),
+                "file:captionless-animation-1".to_owned(),
+                "file:captionless-video-note-1".to_owned(),
             ]
         );
-        assert_eq!(scheduler.calls(), vec![String::new()]);
+        assert_eq!(scheduler.calls().len(), expected_case_count - 1);
+        assert!(scheduler.calls().iter().all(String::is_empty));
         assert!(image_scheduler.calls().is_empty());
         assert!(effects.sent_texts().is_empty());
         assert!(effects.sent_song_notices().is_empty());
@@ -5677,10 +5671,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_member_service_messages_use_random_path_not_terminal_delegate()
+    async fn non_member_service_messages_never_schedule_random_dialog()
     -> Result<(), Box<dyn std::error::Error>> {
         let scheduler = SchedulerStub::default();
-        let settings = SettingsStoreStub::with_chat(random_chat_settings(0, false));
+        let settings = SettingsStoreStub::with_chat(random_chat_settings(100, false));
         let effects = EffectsStub::default();
         let rng = RngStub {
             random_response: 99,
@@ -5832,7 +5826,7 @@ mod tests {
 
             assert_eq!(
                 route,
-                DialogMessageUpdateRoute::RandomSkippedReactivityOff,
+                DialogMessageUpdateRoute::RandomSkippedGate,
                 "{label}"
             );
         }
@@ -5843,7 +5837,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn addressed_captionless_media_consumes_like_go_without_terminal_delegate()
+    async fn addressed_captionless_media_schedules_dialog_with_attachment_context()
     -> Result<(), Box<dyn std::error::Error>> {
         let scheduler = SchedulerStub::default();
         let image_scheduler = ImageSchedulerCaptureStub::scheduled();
@@ -5866,11 +5860,71 @@ mod tests {
         )
         .await?;
 
-        assert_eq!(route, DialogMessageUpdateRoute::SkippedEmptyDialogTrigger);
-        assert!(scheduler.calls().is_empty());
+        assert_eq!(
+            route,
+            DialogMessageUpdateRoute::Scheduled {
+                queue_name: DIALOG_AIFARM_QUEUE_NAME.to_owned(),
+                delay: Duration::ZERO,
+                replaced: false,
+            }
+        );
+        assert_eq!(scheduler.calls(), vec![String::new()]);
+        assert_eq!(scheduler.metas()[0].attachments[0].kind, "image");
         assert!(image_scheduler.calls().is_empty());
         assert!(effects.sent_texts().is_empty());
         assert!(effects.sent_song_notices().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn captionless_group_media_obeys_random_reactivity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let effects = EffectsStub::default();
+        let rng = RngStub {
+            random_response: 99,
+            obscenifier: 1,
+            obscenify_variant: 0,
+        };
+
+        let disabled_scheduler = SchedulerStub::default();
+        let disabled_settings = SettingsStoreStub::with_chat(random_chat_settings(0, false));
+        let disabled = handle_dialog_or_random_message_update_or_else_with_image(
+            (&disabled_scheduler, None, None),
+            &disabled_settings,
+            &effects,
+            &rng,
+            &test_config(),
+            group_captionless_photo_update()?,
+            |_update| async { Err("captionless group media should not delegate") },
+        )
+        .await?;
+        assert_eq!(
+            disabled,
+            DialogMessageUpdateRoute::RandomSkippedReactivityOff
+        );
+        assert!(disabled_scheduler.calls().is_empty());
+
+        let enabled_scheduler = SchedulerStub::default();
+        let enabled_settings = SettingsStoreStub::with_chat(random_chat_settings(100, false));
+        let enabled = handle_dialog_or_random_message_update_or_else_with_image(
+            (&enabled_scheduler, None, None),
+            &enabled_settings,
+            &effects,
+            &rng,
+            &test_config(),
+            group_captionless_photo_update()?,
+            |_update| async { Err("captionless group media should be handled") },
+        )
+        .await?;
+        assert_eq!(
+            enabled,
+            DialogMessageUpdateRoute::Scheduled {
+                queue_name: DIALOG_AIFARM_QUEUE_NAME.to_owned(),
+                delay: Duration::ZERO,
+                replaced: false,
+            }
+        );
+        assert_eq!(enabled_scheduler.calls(), vec![String::new()]);
         Ok(())
     }
 
@@ -7860,7 +7914,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn captionless_private_voice_schedules_dialog_for_asr_but_audio_does_not()
+    async fn captionless_private_voice_and_audio_schedule_dialog_with_media_context()
     -> Result<(), Box<dyn std::error::Error>> {
         let scheduler = SchedulerStub::default();
         let settings = SettingsStoreStub::default();
@@ -7915,9 +7969,14 @@ mod tests {
 
         assert_eq!(
             audio_route,
-            DialogMessageUpdateRoute::SkippedEmptyDialogTrigger
+            DialogMessageUpdateRoute::Scheduled {
+                queue_name: DIALOG_AIFARM_QUEUE_NAME.to_owned(),
+                delay: Duration::ZERO,
+                replaced: false,
+            }
         );
-        assert!(audio_scheduler.calls().is_empty());
+        assert_eq!(audio_scheduler.calls(), vec![String::new()]);
+        assert_eq!(audio_scheduler.metas()[0].message_type, "audio");
         Ok(())
     }
 
@@ -10074,6 +10133,33 @@ mod tests {
 
     fn private_captionless_photo_update() -> Result<TelegramUpdate, serde_json::Error> {
         private_captionless_photo_update_at(1_710_000_000)
+    }
+
+    fn group_captionless_photo_update() -> Result<TelegramUpdate, serde_json::Error> {
+        serde_json::from_value(json!({
+            "update_id": 32370,
+            "message": {
+                "message_id": 110,
+                "date": 1_710_000_000,
+                "chat": {
+                    "id": -10042,
+                    "type": "supergroup",
+                    "title": "Group"
+                },
+                "from": {
+                    "id": 99,
+                    "is_bot": false,
+                    "first_name": "Ada",
+                    "username": "ada_l"
+                },
+                "photo": [{
+                    "file_id": "group-captionless-photo-file",
+                    "file_unique_id": "group-captionless-photo-u",
+                    "height": 512,
+                    "width": 512
+                }]
+            }
+        }))
     }
 
     fn private_captionless_photo_update_at(date: i64) -> Result<TelegramUpdate, serde_json::Error> {

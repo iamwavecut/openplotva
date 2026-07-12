@@ -54,6 +54,7 @@ const ASR_TERMINAL_PAYLOAD_RETRIES: u8 = 2;
 pub const ASR_TASKMAN_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const ASR_TASKMAN_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
 const ASR_TASKMAN_WORKER_ID: &str = "asr-gpu1-worker-0";
+const ASR_MAX_MEDIA_BYTES: usize = 20 * 1024 * 1024;
 
 pub type TelegramFileAsrGetFuture<'a, Error> =
     Pin<Box<dyn Future<Output = Result<Option<TelegramFileRecord>, Error>> + Send + 'a>>;
@@ -189,6 +190,9 @@ impl TelegramVoiceDownloader for TelegramClientVoiceDownloader {
             let mut data = Vec::new();
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.map_err(TelegramVoiceDownloadError::DownloadChunk)?;
+                if data.len().saturating_add(chunk.len()) > ASR_MAX_MEDIA_BYTES {
+                    return Err(TelegramVoiceDownloadError::FileTooLarge);
+                }
                 data.extend_from_slice(&chunk);
             }
             if data.is_empty() {
@@ -211,6 +215,8 @@ pub enum TelegramVoiceDownloadError {
     DownloadChunk(#[source] reqwest::Error),
     #[error("empty telegram voice file")]
     EmptyFile,
+    #[error("telegram media exceeds 20 MiB")]
+    FileTooLarge,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -294,12 +300,15 @@ impl DiscoveryAsrClient {
     ) -> Result<AsrTranscript, AsrClientError> {
         let payload = AsrServiceRequest {
             request_id: format!(
-                "voice-{}-{}-{}",
+                "media-{}-{}-{}",
                 request.chat_id, request.message_id, request.file_unique_id
             ),
             audio_b64: general_purpose::STANDARD.encode(audio),
+            file_name: Some(asr_file_name(
+                &request.file_unique_id,
+                request.mime_type.as_deref(),
+            )),
             mime_type: request.mime_type,
-            file_name: Some(format!("{}.ogg", request.file_unique_id)),
             duration_seconds: request.duration_seconds,
             language: Some("ru".to_owned()),
         };
@@ -1313,7 +1322,9 @@ fn select_voice_candidate(meta: &ChatMessageMeta) -> Option<VoiceCandidate> {
 }
 
 fn voice_candidate(index: usize, attachment: &ChatAttachment) -> Option<VoiceCandidate> {
-    if attachment.kind.trim() != "voice" || attachment.source.trim() != "message" {
+    if !matches!(attachment.kind.trim(), "voice" | "video" | "video_note")
+        || attachment.source.trim() != "message"
+    {
         return None;
     }
     let file_unique_id = attachment.file_unique_id.trim();
@@ -1340,12 +1351,35 @@ fn cached_asr_text(record: &TelegramFileRecord) -> Option<String> {
 }
 
 fn apply_transcript(input: &mut DialogInput, attachment_index: usize, text: &str) {
-    let materialized = merge_existing_text_with_transcript(&input.message.text, text);
+    let is_video = input
+        .message
+        .meta
+        .attachments
+        .get(attachment_index)
+        .is_some_and(|attachment| matches!(attachment.kind.trim(), "video" | "video_note"));
+    let transcript = if is_video {
+        format!("Аудиодорожка видео (ASR): {}", text.trim())
+    } else {
+        text.trim().to_owned()
+    };
+    let materialized = merge_existing_text_with_transcript(&input.message.text, &transcript);
     input.message.text.clone_from(&materialized);
     input.message.normalized = materialized;
     if let Some(attachment) = input.message.meta.attachments.get_mut(attachment_index) {
-        attachment.content = text.to_owned();
+        attachment.content = transcript;
     }
+}
+
+fn asr_file_name(file_unique_id: &str, mime_type: Option<&str>) -> String {
+    let extension = match mime_type.map(str::trim).unwrap_or_default() {
+        "video/mp4" => "mp4",
+        "video/webm" => "webm",
+        "audio/mpeg" => "mp3",
+        "audio/wav" | "audio/x-wav" => "wav",
+        "audio/webm" => "webm",
+        _ => "ogg",
+    };
+    format!("{file_unique_id}.{extension}")
 }
 
 fn merge_existing_text_with_transcript(existing: &str, transcript: &str) -> String {
@@ -1573,6 +1607,70 @@ mod tests {
         assert!(store.updates.lock().expect("lock").is_empty());
         assert!(downloader.calls.lock().expect("lock").is_empty());
         assert!(transcriber.calls.lock().expect("lock").is_empty());
+    }
+
+    #[test]
+    fn video_and_video_note_are_asr_candidates_but_animation_is_not() {
+        for kind in ["voice", "video", "video_note"] {
+            let candidate = voice_candidate(
+                2,
+                &ChatAttachment {
+                    kind: kind.to_owned(),
+                    source: "message".to_owned(),
+                    file_unique_id: format!("{kind}-u"),
+                    duration_seconds: 8,
+                    ..ChatAttachment::default()
+                },
+            )
+            .expect("speech-bearing media candidate");
+            assert_eq!(candidate.attachment_index, 2);
+            assert_eq!(candidate.duration_seconds, 8);
+        }
+        assert!(
+            voice_candidate(
+                0,
+                &ChatAttachment {
+                    kind: "animation".to_owned(),
+                    source: "message".to_owned(),
+                    file_unique_id: "animation-u".to_owned(),
+                    ..ChatAttachment::default()
+                },
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn video_transcript_is_labeled_separately_from_visual_context() {
+        let mut input = DialogInput {
+            message: openplotva_dialog::DialogMessage {
+                meta: ChatMessageMeta {
+                    attachments: vec![ChatAttachment {
+                        kind: "video".to_owned(),
+                        source: "message".to_owned(),
+                        file_unique_id: "video-u".to_owned(),
+                        ..ChatAttachment::default()
+                    }],
+                    vision_description: "00:00 видна комната".to_owned(),
+                    ..ChatMessageMeta::default()
+                },
+                ..openplotva_dialog::DialogMessage::default()
+            },
+            ..DialogInput::default()
+        };
+
+        apply_transcript(&mut input, 0, "человек говорит привет");
+
+        assert_eq!(
+            input.message.text,
+            "Аудиодорожка видео (ASR): человек говорит привет"
+        );
+        assert_eq!(
+            input.message.meta.attachments[0].content,
+            "Аудиодорожка видео (ASR): человек говорит привет"
+        );
+        assert_eq!(input.message.meta.vision_description, "00:00 видна комната");
+        assert_eq!(asr_file_name("video-u", Some("video/mp4")), "video-u.mp4");
     }
 
     #[tokio::test]
