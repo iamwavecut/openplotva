@@ -40,6 +40,46 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use time::{Duration as TimeDuration, OffsetDateTime, format_description::well_known::Rfc3339};
 
+/// Fixed cryptocurrency donation destinations shared by every donation-help surface.
+pub const CRYPTO_DONATION_ADDRESSES: [(&str, &str); 3] = [
+    ("BTC", "bc1qyv0lvyr4g5gnulqszyapuqrdycppt49p26re0v"),
+    ("Ethereum EVM", "0x4fc711f4aa1744012b31911c1d5c451026ec2191"),
+    ("Solana", "GJdwsdhp8pxEUc5g3mjigcp1BpCAnPuThTmyD3FFSTz1"),
+];
+
+/// Render cryptocurrency destinations for Telegram Rich Messages.
+#[must_use]
+pub fn crypto_donation_rich_html() -> String {
+    let rows = CRYPTO_DONATION_ADDRESSES
+        .iter()
+        .map(|(network, address)| {
+            format!("<tr><td>{network}</td><td><code>{address}</code></td></tr>")
+        })
+        .collect::<String>();
+    format!(
+        "<h3>Донат в криптовалюте</h3>\n\n\
+         <table bordered><tr><th>Сеть</th><th>Адрес</th></tr>{rows}</table>"
+    )
+}
+
+fn crypto_donation_html() -> String {
+    let addresses = CRYPTO_DONATION_ADDRESSES
+        .iter()
+        .map(|(network, address)| format!("{network}: <code>{address}</code>"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("<b>Донат в криптовалюте:</b>\n{addresses}")
+}
+
+fn crypto_donation_plain_text() -> String {
+    let addresses = CRYPTO_DONATION_ADDRESSES
+        .iter()
+        .map(|(network, address)| format!("{network}: {address}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("Донат в криптовалюте:\n{addresses}")
+}
+
 /// Boxed future returned by payment storage calls.
 pub type PaymentStoreFuture<'a, T, E> = Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'a>>;
 
@@ -2313,12 +2353,14 @@ pub fn donation_redirect_message(
         chat_id,
         reply_to_message_id,
         message_thread_id,
-        text: "💖 Для отправки доната, пожалуйста, перейдите в личные сообщения с ботом.\n\n\
-              Ваша поддержка:\n\
-              ❤️ Согреет сердце разработчика\n\
-              🚀 Поможет развивать бота\n\
-              ✨ Добавит мотивацию на создание новых функций"
-            .to_owned(),
+        text: format!(
+            "💖 Для отправки доната, пожалуйста, перейдите в личные сообщения с ботом.\n\n\
+             Ваша поддержка:\n\
+             ❤️ Согреет сердце разработчика\n\
+             🚀 Поможет развивать бота\n\
+             ✨ Добавит мотивацию на создание новых функций\n\n{}",
+            crypto_donation_plain_text()
+        ),
         button_text: "💝 Сделать донат".to_owned(),
         url: format!("https://t.me/{bot_username}?start={start_param}"),
     }
@@ -6607,13 +6649,15 @@ pub fn subscription_invoice_message_text() -> String {
 }
 
 fn donation_invoice_message_text() -> String {
-    "💖 Нажмите на кнопку ниже, чтобы поддержать разработчика!\n\n\
-     Ваша поддержка:\n\
-     ❤️ Согревает сердце разработчика\n\
-     🚀 Помогает развивать бота\n\
-     ✨ Вдохновляет на создание новых функций\n\n\
-     <i>Чтобы установить другую сумму - используйте формат <code>/donate XXX</code>, где <code>XXX</code> - сумма в звездах.</i>"
-        .to_owned()
+    format!(
+        "💖 Нажмите на кнопку ниже, чтобы поддержать разработчика!\n\n\
+         Ваша поддержка:\n\
+         ❤️ Согревает сердце разработчика\n\
+         🚀 Помогает развивать бота\n\
+         ✨ Вдохновляет на создание новых функций\n\n{}\n\n\
+         <i>Чтобы установить другую сумму - используйте формат <code>/donate XXX</code>, где <code>XXX</code> - сумма в звездах.</i>",
+        crypto_donation_html()
+    )
 }
 
 fn donation_invoice_button_text(amount_stars: i64) -> String {
@@ -6727,19 +6771,21 @@ mod tests {
 
     use super::{
         AdminVipCommandUpdateHandler, AdminVipCommandUpdateOutcome, AdminVipCommandUpdateRuntime,
-        InMemoryPaymentControlJobQueue, InMemoryPaymentControlJobStatus, InvoiceButtonMessage,
-        InvoiceControlJobOutcome, InvoiceControlJobReport, PaymentControlJobOutcome,
-        PaymentControlJobQueue, PaymentControlJobQueueFuture, PaymentControlJobReport,
-        PaymentControlJobWorkItem, PaymentControlJobWorkerFuture, PaymentControlJobWorkerQueue,
-        PaymentEffectsFuture, PaymentInvoiceCommandUpdateRoute, PaymentInvoiceControlJobBuild,
-        PaymentInvoiceEffects, PaymentInvoiceLinkFuture, PaymentRedirectMessage,
-        PaymentRuntimeEffects, PaymentStoreFuture, PaymentTextMessage, PaymentUpdateHandler,
-        PaymentUpdateRoute, PreCheckoutOutcome, PreCheckoutPaymentEffects, PreCheckoutUpdateRoute,
-        SuccessfulPayment, SuccessfulPaymentControlJobUpdateRoute,
+        CRYPTO_DONATION_ADDRESSES, InMemoryPaymentControlJobQueue, InMemoryPaymentControlJobStatus,
+        InvoiceButtonMessage, InvoiceControlJobOutcome, InvoiceControlJobReport,
+        PaymentControlJobOutcome, PaymentControlJobQueue, PaymentControlJobQueueFuture,
+        PaymentControlJobReport, PaymentControlJobWorkItem, PaymentControlJobWorkerFuture,
+        PaymentControlJobWorkerQueue, PaymentEffectsFuture, PaymentInvoiceCommandUpdateRoute,
+        PaymentInvoiceControlJobBuild, PaymentInvoiceEffects, PaymentInvoiceLinkFuture,
+        PaymentRedirectMessage, PaymentRuntimeEffects, PaymentStoreFuture, PaymentTextMessage,
+        PaymentUpdateHandler, PaymentUpdateRoute, PreCheckoutOutcome, PreCheckoutPaymentEffects,
+        PreCheckoutUpdateRoute, SuccessfulPayment, SuccessfulPaymentControlJobUpdateRoute,
         SuccessfulPaymentDispatcherEffects, SuccessfulPaymentEffects, SuccessfulPaymentMessage,
         SuccessfulPaymentOutcome, SuccessfulPaymentStore, SuccessfulPaymentUpdateRoute,
         VipCancellationCallbackOutcome, VipCancellationEffectFuture, VipCancellationEffects,
-        VipCancellationStore, enqueue_payment_invoice_command_update_or_else_at,
+        VipCancellationStore, crypto_donation_html, crypto_donation_plain_text,
+        crypto_donation_rich_html, donation_invoice_message_text,
+        enqueue_payment_invoice_command_update_or_else_at,
         enqueue_payment_invoice_command_update_with_vip_status_or_else_at,
         enqueue_successful_payment_update_or_else_at, execute_donate_invoice_control_job,
         execute_payment_control_job_at, execute_vip_invoice_control_job,
@@ -9898,11 +9944,14 @@ mod tests {
         assert_eq!(message.url, "https://t.me/PlotvaBot?start=donate_777");
         assert_eq!(
             message.text,
-            "💖 Для отправки доната, пожалуйста, перейдите в личные сообщения с ботом.\n\n\
-             Ваша поддержка:\n\
-             ❤️ Согреет сердце разработчика\n\
-             🚀 Поможет развивать бота\n\
-             ✨ Добавит мотивацию на создание новых функций"
+            format!(
+                "💖 Для отправки доната, пожалуйста, перейдите в личные сообщения с ботом.\n\n\
+                 Ваша поддержка:\n\
+                 ❤️ Согреет сердце разработчика\n\
+                 🚀 Поможет развивать бота\n\
+                 ✨ Добавит мотивацию на создание новых функций\n\n{}",
+                crypto_donation_plain_text()
+            )
         );
 
         let payload = serde_json::to_value(super::payment_redirect_send_message_method(&message)?)?;
@@ -9918,6 +9967,29 @@ mod tests {
         let message = super::donation_redirect_message("", -10042, 555, None, "10001");
 
         assert_eq!(message.url, "https://t.me/?start=donate");
+    }
+
+    #[test]
+    fn crypto_donation_addresses_are_fixed_and_shared_by_all_formats() {
+        assert_eq!(
+            CRYPTO_DONATION_ADDRESSES,
+            [
+                ("BTC", "bc1qyv0lvyr4g5gnulqszyapuqrdycppt49p26re0v"),
+                ("Ethereum EVM", "0x4fc711f4aa1744012b31911c1d5c451026ec2191"),
+                ("Solana", "GJdwsdhp8pxEUc5g3mjigcp1BpCAnPuThTmyD3FFSTz1"),
+            ]
+        );
+
+        let rich = crypto_donation_rich_html();
+        let html = crypto_donation_html();
+        let plain = crypto_donation_plain_text();
+        for (network, address) in CRYPTO_DONATION_ADDRESSES {
+            assert!(rich.contains(network));
+            assert!(rich.contains(address));
+            assert!(html.contains(address));
+            assert!(plain.contains(address));
+        }
+        assert_eq!(openplotva_telegram::sanitize_rich_html(&rich), rich);
     }
 
     #[test]
@@ -11471,18 +11543,15 @@ mod tests {
             effects.invoice_messages(),
             vec![InvoiceButtonMessage {
                 chat_id: 1000,
-                text: "💖 Нажмите на кнопку ниже, чтобы поддержать разработчика!\n\n\
-                      Ваша поддержка:\n\
-                      ❤️ Согревает сердце разработчика\n\
-                      🚀 Помогает развивать бота\n\
-                      ✨ Вдохновляет на создание новых функций\n\n\
-                      <i>Чтобы установить другую сумму - используйте формат <code>/donate XXX</code>, где <code>XXX</code> - сумма в звездах.</i>"
-                    .to_owned(),
+                text: donation_invoice_message_text(),
                 button_text: "🌟 Отправить донат 777 звезд?".to_owned(),
                 url: "https://t.me/invoice-donation".to_owned(),
                 parse_mode: "HTML".to_owned(),
             }]
         );
+        for (_, address) in CRYPTO_DONATION_ADDRESSES {
+            assert!(effects.invoice_messages()[0].text.contains(address));
+        }
         assert!(effects.invoice_error_texts().is_empty());
         Ok(())
     }

@@ -399,7 +399,11 @@ pub fn render_help_intro_text(bot: &HelpBotIdentity) -> String {
 
 #[must_use]
 pub fn render_help_message_html(bot: &HelpBotIdentity) -> String {
-    render_help_template(HELP_MESSAGE_TEMPLATE, bot)
+    format!(
+        "{}\n\n{}",
+        render_help_template(HELP_MESSAGE_TEMPLATE, bot),
+        crate::payments::crypto_donation_rich_html()
+    )
 }
 
 #[must_use]
@@ -840,6 +844,11 @@ mod tests {
                 .text
                 .contains("Поддержать меня можно через <code>/donate</code>.")
         );
+        assert!(plan.message.text.contains("<h3>Донат в криптовалюте</h3>"));
+        assert!(plan.message.text.contains("<table bordered>"));
+        for (_, address) in crate::payments::CRYPTO_DONATION_ADDRESSES {
+            assert!(plan.message.text.contains(address));
+        }
         assert_eq!(
             openplotva_telegram::sanitize_rich_html(&plan.message.text),
             plan.message.text
