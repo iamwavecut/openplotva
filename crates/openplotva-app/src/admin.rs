@@ -320,13 +320,28 @@ fn admin_text_should_use_rich(plan: &AdminTextPlan) -> bool {
 
 fn admin_text_rich_html(message: &TextMessageRequest) -> String {
     if message.render_as == TELEGRAM_PARSE_MODE_HTML {
-        message.text.clone()
+        admin_rich_double_line_breaks(&message.text)
     } else {
         format!(
             "<p>{}</p>",
-            escape_telegram_html_text(&message.text).replace('\n', "<br>")
+            admin_rich_double_line_breaks(&escape_telegram_html_text(&message.text))
+                .replace('\n', "<br>")
         )
     }
+}
+
+fn admin_rich_double_line_breaks(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\n' {
+            out.push(ch);
+            continue;
+        }
+        while chars.next_if_eq(&'\n').is_some() {}
+        out.push_str("\n\n");
+    }
+    out
 }
 
 /// Recoverable errors from concrete admin effects.
@@ -2887,6 +2902,32 @@ mod tests {
         assert!(text.contains("🗑️ Удалено: 2"));
         assert!(text.contains("⚠️ Ошибок удаления: 1"));
         assert!(text.contains("Локальный индекс explicit cache очищен"));
+    }
+
+    #[test]
+    fn admin_rich_messages_use_double_breaks_between_logical_lines() {
+        let mut message = TextMessageRequest {
+            chat: None,
+            message_thread_id: 0,
+            disable_notification: false,
+            allow_sending_without_reply: None,
+            text: "<b>Runtime API token</b>\n<code>prt_abc.secret</code>\n\n<b>ID:</b> abc"
+                .to_owned(),
+            render_as: TELEGRAM_PARSE_MODE_HTML.to_owned(),
+            reply_markup: None,
+        };
+
+        assert_eq!(
+            admin_text_rich_html(&message),
+            "<b>Runtime API token</b>\n\n<code>prt_abc.secret</code>\n\n<b>ID:</b> abc"
+        );
+
+        message.text = "Queue: 1\nWorkers: 2".to_owned();
+        message.render_as.clear();
+        assert_eq!(
+            admin_text_rich_html(&message),
+            "<p>Queue: 1<br><br>Workers: 2</p>"
+        );
     }
 
     #[test]
